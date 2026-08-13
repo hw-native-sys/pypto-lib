@@ -548,6 +548,291 @@ def golden_qkv_proj_rope(tensors):
     tensors["qr_scale"][:] = qr_scale
 
 
+def _reference_q_from_quantized_qr(
+    qr,
+    qr_scale,
+    wq_b,
+    wq_b_scale,
+    rope_cos,
+    rope_sin,
+):
+    """Recompute the Q path downstream of the emitted INT8 QR boundary."""
+    import torch
+
+    t_dim = qr.shape[0]
+    q_i32 = torch.matmul(qr.to(torch.int32), wq_b.to(torch.int32))
+    q_full = (
+        q_i32.float()
+        * qr_scale.float()
+        * wq_b_scale.float().view(1, -1)
+    ).view(t_dim, H, HEAD_DIM)
+    q_full = q_full * torch.rsqrt(
+        q_full.square().mean(dim=-1, keepdim=True) + EPS
+    )
+
+    q_pair = q_full[..., NOPE_DIM:].unflatten(-1, (-1, 2))
+    q_even, q_odd = q_pair[..., 0], q_pair[..., 1]
+    cos = rope_cos.float()[..., :ROPE_HALF].unsqueeze(-2)
+    sin = rope_sin.float()[..., :ROPE_HALF].unsqueeze(-2)
+    y_even = (q_even * cos - q_odd * sin).to(torch.bfloat16)
+    y_odd = (q_even * sin + q_odd * cos).to(torch.bfloat16)
+    q_rope = torch.stack([y_even, y_odd], dim=-1).flatten(-2)
+    return torch.cat([q_full[..., :NOPE_DIM], q_rope], dim=-1).to(torch.bfloat16)
+
+
+def quantized_qr_compare(
+    *,
+    max_code_step=1,
+    max_changed_ratio=0.005,
+    max_changed_per_row_ratio=0.005,
+    max_show=10,
+):
+    """Bound both the magnitude and population of QR quantization-boundary changes."""
+    import torch
+
+    if max_code_step < 0:
+        raise ValueError(f"max_code_step must be non-negative, got {max_code_step}")
+    if not 0.0 <= max_changed_ratio <= 1.0:
+        raise ValueError(
+            f"max_changed_ratio must be in [0, 1], got {max_changed_ratio}"
+        )
+    if not 0.0 <= max_changed_per_row_ratio <= 1.0:
+        raise ValueError(
+            "max_changed_per_row_ratio must be in [0, 1], got "
+            f"{max_changed_per_row_ratio}"
+        )
+
+    def compare(
+        actual,
+        expected,
+        *,
+        actual_outputs,
+        expected_outputs,
+        inputs,
+        rtol,
+        atol,
+    ):
+        del actual_outputs, expected_outputs, inputs, rtol, atol
+        actual = actual.cpu()
+        expected = expected.cpu()
+        if actual.shape != expected.shape:
+            return False, (
+                f"    QR shape mismatch: {tuple(actual.shape)} vs "
+                f"{tuple(expected.shape)}"
+            )
+        if actual.dtype != torch.int8 or expected.dtype != torch.int8:
+            return False, (
+                f"    QR comparator requires int8 tensors, got "
+                f"{actual.dtype} and {expected.dtype}"
+            )
+        diff = (actual.to(torch.int16) - expected.to(torch.int16)).abs()
+        changed = diff != 0
+        changed_count = int(changed.count_nonzero().item())
+        changed_limit = round(max_changed_ratio * diff.numel())
+        changed_per_row = changed.reshape(-1, changed.shape[-1]).sum(dim=-1)
+        row_limit = int(max_changed_per_row_ratio * changed.shape[-1])
+        overfull_rows = changed_per_row > row_limit
+        overfull_row_count = int(overfull_rows.count_nonzero().item())
+        too_large = diff > max_code_step
+        too_large_count = int(too_large.count_nonzero().item())
+        if (
+            changed_count <= changed_limit
+            and overfull_row_count == 0
+            and too_large_count == 0
+        ):
+            return True, ""
+
+        changed_indices = changed.flatten().nonzero(as_tuple=False).flatten()
+        flat_actual = actual.flatten()
+        flat_expected = expected.flatten()
+        flat_diff = diff.flatten()
+        lines = []
+        for index in changed_indices[:max_show].tolist():
+            lines.append(
+                f"      [{index}] actual={int(flat_actual[index])} "
+                f"expected={int(flat_expected[index])} "
+                f"code_step={int(flat_diff[index])}"
+            )
+        return False, (
+            f"    QR quantization-boundary mismatch: changed={changed_count}/"
+            f"{diff.numel()} (allowed<={max_changed_ratio:.4%}, "
+            f"threshold={changed_limit}), code_step>{max_code_step}: "
+            f"{too_large_count}, rows>{row_limit} changed codes: "
+            f"{overfull_row_count}\n"
+            + "\n".join(lines)
+        )
+
+    compare.__name__ = (
+        f"quantized_qr_compare(max_code_step={max_code_step},"
+        f"max_changed_ratio={max_changed_ratio},"
+        f"max_changed_per_row_ratio={max_changed_per_row_ratio})"
+    )
+    return compare
+
+
+def qr_scale_compare(
+    *,
+    atol=2.5e-5,
+    rtol=5e-3,
+    max_error_ratio=0.0,
+    max_show=10,
+):
+    """Validate QR dequant scales with ratio and per-row bounds.
+
+    A scale is a whole-row quantization boundary: one bad value affects every
+    downstream channel for that token. Keep the aggregate ratio for parity
+    with the numeric harness, but also reject any individual scale outside a
+    small absolute/relative cap so conditioned Q validation cannot hide it.
+    """
+    import torch
+
+    if atol < 0 or rtol < 0:
+        raise ValueError("QR scale tolerances must be non-negative")
+    if not 0.0 <= max_error_ratio <= 1.0:
+        raise ValueError(
+            f"max_error_ratio must be in [0, 1], got {max_error_ratio}"
+        )
+    scale_atol = atol
+    scale_rtol = rtol
+
+    def compare(
+        actual,
+        expected,
+        *,
+        actual_outputs,
+        expected_outputs,
+        inputs,
+        rtol,
+        atol,
+    ):
+        del actual_outputs, expected_outputs, inputs, rtol, atol
+        actual = actual.cpu().to(torch.float32)
+        expected = expected.cpu().to(torch.float32)
+        if actual.shape != expected.shape:
+            return False, (
+                f"    QR scale shape mismatch: {tuple(actual.shape)} vs "
+                f"{tuple(expected.shape)}"
+            )
+        if not torch.isfinite(actual).all().item() or not torch.isfinite(expected).all().item():
+            return False, "    QR scales contain NaN or Inf"
+        if (actual <= 0).any().item() or (expected <= 0).any().item():
+            return False, "    QR scales must be positive"
+
+        diff = (actual - expected).abs()
+        tolerance = scale_atol + scale_rtol * expected.abs()
+        bad = diff > tolerance
+        bad_count = int(bad.count_nonzero().item())
+        threshold = round(max_error_ratio * actual.numel())
+        # Even if a caller opts into an aggregate budget, no individual scale
+        # may exceed a modest 2x cap.
+        hard_bad = diff > (2.0 * tolerance)
+        hard_bad_count = int(hard_bad.count_nonzero().item())
+        if bad_count <= threshold and hard_bad_count == 0:
+            return True, ""
+
+        bad_indices = bad.flatten().nonzero(as_tuple=False).flatten()
+        flat_actual = actual.flatten()
+        flat_expected = expected.flatten()
+        flat_diff = diff.flatten()
+        flat_tolerance = tolerance.flatten()
+        lines = []
+        for index in bad_indices[:max_show].tolist():
+            lines.append(
+                f"      [{index}] actual={float(flat_actual[index]):.8g} "
+                f"expected={float(flat_expected[index]):.8g} "
+                f"diff={float(flat_diff[index]):.4g} "
+                f"tol={float(flat_tolerance[index]):.4g}"
+            )
+        return False, (
+            f"    QR scale mismatch: bad={bad_count}/{actual.numel()} "
+            f"(allowed<={max_error_ratio:.4%}, threshold={threshold}), "
+            f"hard_bad={hard_bad_count}, atol={scale_atol}, rtol={scale_rtol}\n"
+            + "\n".join(lines)
+        )
+
+    compare.__name__ = (
+        f"qr_scale_compare(atol={scale_atol},rtol={scale_rtol},"
+        f"max_error_ratio={max_error_ratio})"
+    )
+    return compare
+
+
+def q_from_runtime_qr_compare(
+    *,
+    atol=1e-4,
+    rtol=1.0 / 128,
+    max_error_ratio=0.005,
+):
+    """Validate Q after conditioning the reference on the emitted QR codes.
+
+    CPU and A5 split-K reductions can place a few QR values on opposite sides
+    of an INT8 rounding boundary. Comparing Q against the CPU QR path amplifies
+    one legal code-step across an entire projected token. QR and QR scale are
+    validated independently, so the downstream Q reference must start from the
+    device-emitted quantized boundary to isolate Q projection/RMS/RoPE accuracy.
+    """
+    from golden import ratio_allclose
+
+    base_compare = ratio_allclose(
+        atol=atol,
+        rtol=rtol,
+        max_error_ratio=max_error_ratio,
+    )
+
+    def compare(
+        actual,
+        expected,
+        *,
+        actual_outputs,
+        expected_outputs,
+        inputs,
+        rtol,
+        atol,
+    ):
+        del expected
+        required_outputs = ("qr", "qr_scale")
+        required_inputs = ("wq_b", "wq_b_scale", "rope_cos", "rope_sin")
+        missing_outputs = [name for name in required_outputs if name not in actual_outputs]
+        missing_inputs = [name for name in required_inputs if name not in inputs]
+        if missing_outputs or missing_inputs:
+            return False, (
+                "    conditioned Q comparator is missing "
+                f"outputs={missing_outputs}, inputs={missing_inputs}"
+            )
+
+        conditioned = _reference_q_from_quantized_qr(
+            actual_outputs["qr"].cpu(),
+            actual_outputs["qr_scale"].cpu(),
+            inputs["wq_b"].cpu(),
+            inputs["wq_b_scale"].cpu(),
+            inputs["rope_cos"].cpu(),
+            inputs["rope_sin"].cpu(),
+        )
+        if actual.shape != conditioned.shape:
+            return False, (
+                f"    conditioned Q shape mismatch: actual={tuple(actual.shape)} "
+                f"reference={tuple(conditioned.shape)}"
+            )
+        ok, detail = base_compare(
+            actual,
+            conditioned,
+            actual_outputs=actual_outputs,
+            expected_outputs=expected_outputs,
+            inputs=inputs,
+            rtol=rtol,
+            atol=atol,
+        )
+        if ok:
+            return True, ""
+        return False, "    Q downstream of emitted QR does not match:\n" + detail
+
+    compare.__name__ = (
+        f"q_from_runtime_qr_compare(atol={atol},rtol={rtol},"
+        f"max_error_ratio={max_error_ratio})"
+    )
+    return compare
+
+
 def build_tensor_specs(B, S):
     import torch
     from golden import TensorSpec
@@ -641,10 +926,14 @@ if __name__ == "__main__":
             # Precision reference: pypto mla_prolog —
             # cann-recipes-infer/ops/pypto_python/example/test_mla_prolog_pypto.py
             compare_fn={
-                "q":        ratio_allclose(atol=1e-4, rtol=1.0 / 128),
+                "q":        q_from_runtime_qr_compare(atol=1e-4, rtol=1.0 / 128),
                 "kv":       ratio_allclose(atol=1e-4, rtol=1.0 / 128),
-                "qr":       ratio_allclose(atol=1, rtol=0, max_error_ratio=0),
-                "qr_scale": ratio_allclose(atol=2.5e-5, rtol=5e-3),
+                "qr":       quantized_qr_compare(max_code_step=1, max_changed_ratio=0.005),
+                "qr_scale": qr_scale_compare(
+                    atol=2.5e-5,
+                    rtol=5e-3,
+                    max_error_ratio=0.0,
+                ),
             },
             runtime_dir=args.runtime_dir,
             golden_data=args.golden_data,

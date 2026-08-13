@@ -348,6 +348,25 @@ def _per_token_int8_quant(x_bf16):
     return x_i8, scale_dq
 
 
+def _golden_gate_scores(tensors):
+    """Recompute the host router scores from the immutable gate inputs."""
+    import torch
+
+    x_f = tensors["x_mixed"].cpu().float().view(T, D)
+    norm_w = tensors["norm_w"].cpu().float()
+    sq_sum = (x_f * x_f).sum(dim=-1, keepdim=True)
+    inv_rms = torch.rsqrt(sq_sum * (1.0 / D) + NORM_EPS)
+    xg = x_f * norm_w.view(1, D)
+
+    gate_w = tensors["gate_w"].cpu().float()
+    gate_bias = tensors["gate_bias"].cpu().float()
+    logits = inv_rms * (xg @ gate_w.T)
+    softplus = logits.clamp(min=0) + torch.log1p(torch.exp(-logits.abs()))
+    scores = softplus.sqrt()
+    biased = scores + gate_bias.view(1, -1)
+    return xg, inv_rms, scores, biased
+
+
 def golden_gate_core(tensors):
     import torch
 
@@ -355,27 +374,12 @@ def golden_gate_core(tensors):
 
     # FFN RMSNorm, deferred (qwen3-style): xg = bf16(x * gamma), with the
     # per-token inv_rms scalar folded downstream instead of applied per-element.
-    x_f = tensors["x_mixed"].float().view(T, D)
-    norm_w = tensors["norm_w"].float()
-    sq_sum = (x_f * x_f).sum(dim=-1, keepdim=True)
-    inv_rms = torch.rsqrt(sq_sum * (1.0 / D) + NORM_EPS)   # [T,1]
-    xg = x_f * norm_w.view(1, D)
+    xg, inv_rms, scores, biased = _golden_gate_scores(tensors)
 
     # Symmetric INT8 quant of xg: inv_rms cancels in the int8 values (a positive
     # per-token scalar), so it rides only the dequant scale.
     x_norm_i8, scale_dq_g = _per_token_int8_quant(xg)
     x_norm_scale = scale_dq_g.reshape(T, 1) * inv_rms   # inv_rms * amax(xg)/127
-
-    # Gate matmul + sqrtsoftplus router score. logits = inv_rms * (xg @ gate_w.T).
-    # Use the log1p stable form, which equals F.softplus while keeping the
-    # negative-logit tail alive: the naive log(exp(-|x|)+1) rounds 1+tiny back to
-    # 1.0 in fp32 and zeros the tail for logits below ~-16.
-    gate_w = tensors["gate_w"].float()
-    gate_bias = tensors["gate_bias"].float()
-    logits = inv_rms * (xg.float() @ gate_w.T)
-    softplus = logits.clamp(min=0) + torch.log1p(torch.exp(-logits.abs()))
-    scores = softplus.sqrt()
-    biased = scores + gate_bias.view(1, -1)
 
     # Choose TOPK ids: hash layers take ids from tid2eid[input_ids]; score
     # layers argsort biased (stable to match NPU sort32 deterministic order).
@@ -400,6 +404,266 @@ def golden_gate_core(tensors):
     tensors["x_norm_scale"][:] = x_norm_scale.reshape(T, 1)
     tensors["indices"][:] = indices.to(torch.int32)
     tensors["weights"][:] = weights.to(torch.float32)
+
+
+def gate_indices_compare(
+    layer_id,
+    num_tokens,
+    *,
+    score_atol=1e-4,
+    score_rtol=2e-5,
+    max_show=10,
+):
+    """Validate router ids while allowing FP32 top-k boundary ambiguity.
+
+    The AIC Cube matmul and torch GEMM reduce the 7168-wide K dimension in
+    different orders. Their scores can consequently differ by a few 1e-4,
+    which makes an exact id comparison invalid when the CPU top-k cutoff is
+    inside that error band. A device route is legal only when every selected
+    expert lies inside the CPU cutoff band, ids are unique and in range, and
+    their CPU scores preserve device order modulo the same band.
+
+    Hash-routed layers do not perform a floating-point top-k and remain exact.
+    """
+    import torch
+
+    active_tokens = max(0, min(T, int(num_tokens)))
+
+    def cmp(
+        actual,
+        expected,
+        *,
+        actual_outputs,
+        expected_outputs,
+        inputs,
+        rtol,
+        atol,
+    ):
+        del actual_outputs, expected_outputs, rtol, atol
+        actual = actual.cpu()
+        expected = expected.cpu()
+        if actual.shape != expected.shape:
+            return False, (
+                f"    index shape mismatch: {tuple(actual.shape)} vs "
+                f"{tuple(expected.shape)}"
+            )
+
+        inactive = actual[active_tokens:]
+        inactive_nonzero = int(inactive.count_nonzero().item())
+        if inactive_nonzero:
+            return False, (
+                f"    inactive index tail contains {inactive_nonzero} nonzero values"
+            )
+
+        actual = actual[:active_tokens].to(torch.int64)
+        expected = expected[:active_tokens].to(torch.int64)
+        if actual.numel() == 0:
+            return True, ""
+
+        mismatch = actual != expected
+        if int(layer_id) < N_HASH_LAYERS:
+            if not mismatch.any().item():
+                return True, ""
+            bad = mismatch.nonzero(as_tuple=False)
+            lines = [
+                f"    hash route ids must match exactly: {bad.shape[0]} mismatch(es)"
+            ]
+            for row, pos in bad[:max_show].tolist():
+                lines.append(
+                    f"      [{row},{pos}] actual={int(actual[row, pos])} "
+                    f"expected={int(expected[row, pos])}"
+                )
+            return False, "\n".join(lines)
+
+        invalid = (actual < 0) | (actual >= N_EXPERTS)
+        if invalid.any().item():
+            bad = invalid.nonzero(as_tuple=False)
+            lines = [
+                f"    score route contains {bad.shape[0]} out-of-range id(s); "
+                f"valid range is [0, {N_EXPERTS})"
+            ]
+            for row, pos in bad[:max_show].tolist():
+                lines.append(f"      [{row},{pos}] actual={int(actual[row, pos])}")
+            return False, "\n".join(lines)
+
+        sorted_ids = torch.sort(actual, dim=-1).values
+        duplicate = sorted_ids[:, 1:] == sorted_ids[:, :-1]
+        if duplicate.any().item():
+            rows = duplicate.any(dim=-1).nonzero(as_tuple=False).flatten()
+            lines = [f"    score route contains duplicate ids in {rows.numel()} row(s)"]
+            for row in rows[:max_show].tolist():
+                lines.append(f"      row {row}: ids={actual[row].tolist()}")
+            return False, "\n".join(lines)
+
+        _, _, scores, biased = _golden_gate_scores(inputs)
+        scores = scores[:active_tokens]
+        biased = biased[:active_tokens]
+        if not torch.isfinite(biased).all().item():
+            return False, "    CPU router reference contains NaN or Inf"
+
+        score_error = score_atol + score_rtol * scores.abs()
+        actual_biased = torch.gather(biased, dim=-1, index=actual)
+        actual_error = torch.gather(score_error, dim=-1, index=actual)
+        selected_mask = torch.zeros_like(biased, dtype=torch.bool)
+        selected_mask.scatter_(dim=-1, index=actual, value=True)
+        omitted_lower = (biased - score_error).masked_fill(
+            selected_mask,
+            float("-inf"),
+        )
+        best_omitted_lower, best_omitted_id = omitted_lower.max(dim=-1, keepdim=True)
+        selected_upper = actual_biased + actual_error
+        selected_floor_upper, selected_floor_pos = selected_upper.min(
+            dim=-1,
+            keepdim=True,
+        )
+        omitted_better = best_omitted_lower > selected_floor_upper
+
+        # A near tie may reorder any pair, not only adjacent positions. Verify
+        # every earlier/later pair against its candidate-specific score band.
+        earlier_upper = selected_upper.unsqueeze(-1)
+        later_lower = (actual_biased - actual_error).unsqueeze(-2)
+        order_matrix = later_lower > earlier_upper
+        order_bad = torch.triu(order_matrix, diagonal=1)
+        if not omitted_better.any().item() and not order_bad.any().item():
+            return True, ""
+
+        lines = [
+            "    score route exceeds the calibrated FP32 top-k ambiguity band "
+            f"(score_atol={score_atol:g}, score_rtol={score_rtol:g})"
+        ]
+        bad_rows = omitted_better.nonzero(as_tuple=False)[:max_show, 0].tolist()
+        for row in bad_rows:
+            omitted_id = int(best_omitted_id[row, 0])
+            selected_pos = int(selected_floor_pos[row, 0])
+            selected_id = int(actual[row, selected_pos])
+            regret = float(biased[row, omitted_id] - biased[row, selected_id])
+            budget = float(score_error[row, omitted_id] + actual_error[row, selected_pos])
+            lines.append(
+                f"      row {row}: omitted id={omitted_id} beats selected "
+                f"id={selected_id}; raw_regret={regret:.8g} budget={budget:.8g}"
+            )
+        shown = len(bad_rows)
+        remaining = max_show - shown
+        if remaining:
+            for row, earlier, later in order_bad.nonzero(as_tuple=False)[:remaining].tolist():
+                lines.append(
+                    f"      row {row} order [{earlier},{later}]: "
+                    f"id={int(actual[row, later])} is unambiguously above "
+                    f"id={int(actual[row, earlier])}"
+                )
+        return False, "\n".join(lines)
+
+    cmp.__name__ = (
+        f"gate_indices_compare(score_atol={score_atol},score_rtol={score_rtol})"
+    )
+    return cmp
+
+
+def gate_weights_compare(
+    num_tokens,
+    *,
+    score_atol=1e-4,
+    score_rtol=2e-5,
+    weight_math_atol=2e-5,
+    weight_sum_atol=2e-5,
+    max_show=10,
+):
+    """Validate weights against unbiased CPU scores at the device-selected ids."""
+    import torch
+
+    active_tokens = max(0, min(T, int(num_tokens)))
+
+    def cmp(
+        actual,
+        expected,
+        *,
+        actual_outputs,
+        expected_outputs,
+        inputs,
+        rtol,
+        atol,
+    ):
+        del expected_outputs, rtol, atol
+        actual = actual.cpu().to(torch.float32)
+        if actual.shape != expected.shape:
+            return False, (
+                f"    weight shape mismatch: {tuple(actual.shape)} vs "
+                f"{tuple(expected.shape)}"
+            )
+        if "indices" not in actual_outputs:
+            return False, "    compare_fn misconfigured: actual indices output is missing"
+
+        inactive = actual[active_tokens:]
+        inactive_nonzero = int(inactive.count_nonzero().item())
+        if inactive_nonzero:
+            return False, (
+                f"    inactive weight tail contains {inactive_nonzero} nonzero values"
+            )
+        actual = actual[:active_tokens]
+        if actual.numel() == 0:
+            return True, ""
+        if not torch.isfinite(actual).all().item():
+            return False, "    device router weights contain NaN or Inf"
+        if (actual <= 0).any().item():
+            return False, "    active device router weights must be positive"
+        weight_sum = actual.sum(dim=-1)
+        sum_bad = (weight_sum - ROUTE_SCALE).abs() > weight_sum_atol
+        if sum_bad.any().item():
+            rows = sum_bad.nonzero(as_tuple=False).flatten()
+            lines = [
+                f"    router weight sum differs from ROUTE_SCALE={ROUTE_SCALE} "
+                f"in {rows.numel()} row(s), atol={weight_sum_atol}"
+            ]
+            for row in rows[:max_show].tolist():
+                lines.append(f"      row {row}: sum={float(weight_sum[row]):.8g}")
+            return False, "\n".join(lines)
+
+        indices = actual_outputs["indices"].cpu()[:active_tokens].to(torch.int64)
+        if indices.shape != actual.shape:
+            return False, (
+                f"    index/weight shape mismatch: indices={tuple(indices.shape)} "
+                f"weights={tuple(actual.shape)}"
+            )
+        invalid = (indices < 0) | (indices >= N_EXPERTS)
+        if invalid.any().item():
+            return False, "    cannot validate weights: device route contains invalid ids"
+        sorted_ids = torch.sort(indices, dim=-1).values
+        if (sorted_ids[:, 1:] == sorted_ids[:, :-1]).any().item():
+            return False, "    cannot validate weights: device route contains duplicate ids"
+
+        _, _, scores, _ = _golden_gate_scores(inputs)
+        selected_scores = torch.gather(scores[:active_tokens], dim=-1, index=indices)
+        selected_error = score_atol + score_rtol * selected_scores.abs()
+        score_sum = selected_scores.sum(dim=-1, keepdim=True)
+        error_sum = selected_error.sum(dim=-1, keepdim=True)
+        if (score_sum <= error_sum).any().item():
+            return False, "    router score uncertainty is larger than selected score sum"
+        reference = selected_scores / score_sum
+        reference = reference * ROUTE_SCALE
+        tolerance = ROUTE_SCALE * (
+            score_sum * selected_error + selected_scores * error_sum
+        ) / (score_sum * (score_sum - error_sum))
+        tolerance = tolerance + weight_math_atol
+        close = (actual - reference).abs() <= tolerance
+        if close.all().item():
+            return True, ""
+
+        bad = (~close).nonzero(as_tuple=False)
+        lines = [
+            f"    weights do not match unbiased CPU scores at device-selected ids: "
+            f"{bad.shape[0]}/{actual.numel()} mismatch(es)"
+        ]
+        for row, pos in bad[:max_show].tolist():
+            lines.append(
+                f"      [{row},{pos}] id={int(indices[row, pos])} "
+                f"actual={float(actual[row, pos]):.8g} "
+                f"expected_for_id={float(reference[row, pos]):.8g} "
+                f"tol={float(tolerance[row, pos]):.8g}"
+            )
+        return False, "\n".join(lines)
+
+    cmp.__name__ = "gate_weights_compare"
+    return cmp
 
 
 def build_tensor_specs(layer_id=0, num_tokens=T):
@@ -441,9 +705,24 @@ def gate_active_rows(num_tokens):
     return min(T, ((active_count + GATE_M_TILE - 1) // GATE_M_TILE) * GATE_M_TILE)
 
 
+def gate_x_norm_scale_compare(num_tokens):
+    """Validate active scales numerically and require an exact-zero inactive tail."""
+    from golden import ratio_allclose
+
+    active_tokens = max(0, min(T, int(num_tokens)))
+    return ratio_allclose(
+        atol=1e-3,
+        rtol=1e-3,
+        max_error_ratio=0.0,
+        valid_rows=active_tokens,
+        zero_tail=True,
+    )
+
+
 if __name__ == "__main__":
     import argparse
-    from golden import ratio_allclose, run_jit, topk_pair_compare
+    import torch
+    from golden import ratio_allclose, run_jit
 
     parser = argparse.ArgumentParser()
     parser.add_argument("-p", "--platform", type=str, default="a2a3",
@@ -451,9 +730,11 @@ if __name__ == "__main__":
     parser.add_argument("-d", "--device", type=int, default=0)
     parser.add_argument("--layer-id", type=int, default=10)
     parser.add_argument("--num-tokens", type=int, default=T)
+    parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--enable-l2-swimlane", type=int, nargs="?", const=1, default=0, choices=(0, 1, 2))
     parser.add_argument("--dump-passes", action="store_true", default=False)
     args = parser.parse_args()
+    torch.manual_seed(args.seed)
 
     result = run_jit(
         fn=gate_test,
@@ -470,7 +751,9 @@ if __name__ == "__main__":
         compare_fn={
             "x_norm_i8": ratio_allclose(atol=1, rtol=0, max_error_ratio=0.001,
                                         valid_rows=gate_active_rows(args.num_tokens)),
-            "indices": topk_pair_compare("weights"),
+            "x_norm_scale": gate_x_norm_scale_compare(args.num_tokens),
+            "indices": gate_indices_compare(args.layer_id, args.num_tokens),
+            "weights": gate_weights_compare(args.num_tokens),
         },
     )
     if not result.passed:

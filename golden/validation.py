@@ -49,6 +49,26 @@ def _valid_prefix(
     )
 
 
+def _nonfinite_error(actual: torch.Tensor, expected: torch.Tensor) -> str:
+    """Describe non-finite values on either side of a comparison."""
+    actual_nan_count = int(torch.isnan(actual).sum().item())
+    actual_inf_count = int(torch.isinf(actual).sum().item())
+    expected_nan_count = int(torch.isnan(expected).sum().item())
+    expected_inf_count = int(torch.isinf(expected).sum().item())
+    if not (
+        actual_nan_count
+        or actual_inf_count
+        or expected_nan_count
+        or expected_inf_count
+    ):
+        return ""
+    return (
+        "    illegal values in comparison: "
+        f"actual: NaN={actual_nan_count} Inf={actual_inf_count}; "
+        f"expected: NaN={expected_nan_count} Inf={expected_inf_count}"
+    )
+
+
 def validate_golden(
     outputs: dict[str, torch.Tensor],
     golden: dict[str, torch.Tensor],
@@ -309,7 +329,8 @@ def ratio_allclose(
     from the FP reference due to INT8 round-off, while the bulk of the output
     stays within a tight per-point tolerance.
 
-    NaN / Inf in ``actual`` always fail (hard check, independent of the ratio).
+    NaN / Inf in ``actual`` or ``expected`` always fail (hard check,
+    independent of the ratio).
 
     Upstream reference: ``compare()`` in cann-recipes-infer ``ops/pypto_python/example/compare.py``.
 
@@ -366,12 +387,9 @@ def ratio_allclose(
         actual_f = actual.cpu().to(torch.float32)
         expected_f = expected.cpu().to(torch.float32)
 
-        nan_count = int(torch.isnan(actual_f).sum().item())
-        inf_count = int(torch.isinf(actual_f).sum().item())
-        if nan_count or inf_count:
-            return False, (
-                f"    illegal values in actual: NaN={nan_count} Inf={inf_count}"
-            )
+        nonfinite_error = _nonfinite_error(actual_f, expected_f)
+        if nonfinite_error:
+            return False, nonfinite_error
 
         diff_abs = (actual_f - expected_f).abs()
         tolerance = eff_atol + eff_rtol * expected_f.abs()
@@ -421,6 +439,191 @@ def ratio_allclose(
     return cmp
 
 
+def mapped_pool_ratio_allclose(
+    mapping_name: str,
+    *,
+    mapping_shape: tuple[int, ...],
+    block_size: int,
+    leading_rank_axis: bool = False,
+    pool_name: str = "pool",
+    atol: float | None = None,
+    rtol: float | None = None,
+    max_error_ratio: float = 0.005,
+) -> Callable:
+    """Compare mapped rows of a block-major pool and preserve all other rows.
+
+    ``mapping_shape`` makes the mapping contract explicit instead of relying on
+    model globals captured by a caller.  A non-ranked pool has layout
+    ``[blocks, block_size, ...]``.  With ``leading_rank_axis=True``, the layout
+    is ``[ranks, blocks, block_size, ...]`` and duplicate mappings are checked
+    independently for every rank.
+
+    Only allocator-mapped rows use the ratio-based numerical comparison and
+    floating-point finiteness checks.  Every unmapped row must remain exactly
+    equal to its golden snapshot, which detects writes outside the mapping.
+    """
+    if not mapping_shape or any(dim <= 0 for dim in mapping_shape):
+        raise ValueError(f"mapping_shape must contain positive dimensions, got {mapping_shape}")
+    if block_size <= 0:
+        raise ValueError(f"block_size must be positive, got {block_size}")
+    if leading_rank_axis and len(mapping_shape) < 2:
+        raise ValueError(
+            "leading_rank_axis requires mapping_shape to include a rank axis "
+            f"and at least one mapped-item axis, got {mapping_shape}"
+        )
+
+    mapped_compare = ratio_allclose(
+        atol=atol,
+        rtol=rtol,
+        max_error_ratio=max_error_ratio,
+    )
+    integer_dtypes = (
+        torch.int8,
+        torch.int16,
+        torch.int32,
+        torch.int64,
+        torch.uint8,
+    )
+
+    def compare(actual: torch.Tensor, expected: torch.Tensor, **kwargs) -> tuple[bool, str]:
+        if actual.shape != expected.shape:
+            return False, (
+                f"    {pool_name} shape mismatch: actual={tuple(actual.shape)} "
+                f"expected={tuple(expected.shape)}"
+            )
+
+        block_axis = 2 if leading_rank_axis else 1
+        minimum_rank = block_axis + 1
+        if actual.ndim < minimum_rank or actual.shape[block_axis] != block_size:
+            layout = (
+                "[ranks, blocks, block_size, ...]"
+                if leading_rank_axis
+                else "[blocks, block_size, ...]"
+            )
+            return False, (
+                f"    expected block-major {pool_name} layout {layout} with "
+                f"block_size={block_size}, got {tuple(actual.shape)}"
+            )
+
+        mapping = kwargs.get("inputs", {}).get(mapping_name)
+        if mapping is None:
+            return False, f"    compare_fn misconfigured: missing input '{mapping_name}'"
+        if mapping.dtype not in integer_dtypes:
+            return False, f"    '{mapping_name}' must have an integer dtype, got {mapping.dtype}"
+        if tuple(mapping.shape) != mapping_shape:
+            return False, (
+                f"    '{mapping_name}' must have shape {mapping_shape}, "
+                f"got {tuple(mapping.shape)}"
+            )
+
+        actual_cpu = actual.cpu()
+        expected_cpu = expected.cpu()
+        mapping = mapping.cpu().to(torch.int64)
+        if leading_rank_axis:
+            rank_count = mapping_shape[0]
+            if actual.shape[0] != rank_count:
+                return False, (
+                    f"    leading rank count of {pool_name} must be {rank_count}, "
+                    f"got {actual.shape[0]}"
+                )
+            row_count = actual.shape[1] * block_size
+            actual_rows = actual_cpu.reshape(rank_count, row_count, -1)
+            expected_rows = expected_cpu.reshape(rank_count, row_count, -1)
+            mapping_rows = mapping.reshape(rank_count, -1)
+        else:
+            rank_count = 1
+            row_count = actual.shape[0] * block_size
+            actual_rows = actual_cpu.reshape(1, row_count, -1)
+            expected_rows = expected_cpu.reshape(1, row_count, -1)
+            mapping_rows = mapping.reshape(1, -1)
+
+        invalid_negative = mapping_rows < -1
+        if invalid_negative.any().item():
+            first = invalid_negative.nonzero(as_tuple=False)[0]
+            rank = int(first[0].item())
+            item = int(first[1].item())
+            value = int(mapping_rows[rank, item].item())
+            location = f"[{rank}, {item}]" if leading_rank_axis else f"[{item}]"
+            return False, (
+                f"    '{mapping_name}'{location}={value} is invalid; "
+                "only -1 is a negative sentinel"
+            )
+
+        valid = mapping_rows >= 0
+        out_of_range = valid & (mapping_rows >= row_count)
+        if out_of_range.any().item():
+            first = out_of_range.nonzero(as_tuple=False)[0]
+            rank = int(first[0].item())
+            item = int(first[1].item())
+            value = int(mapping_rows[rank, item].item())
+            location = f"[{rank}, {item}]" if leading_rank_axis else f"[{item}]"
+            return False, (
+                f"    '{mapping_name}'{location}={value} is outside "
+                f"physical row range [0, {row_count})"
+            )
+
+        written_rows = torch.zeros((rank_count, row_count), dtype=torch.bool)
+        for rank in range(rank_count):
+            rank_mapping = mapping_rows[rank, valid[rank]]
+            if rank_mapping.numel() > 1:
+                unique_rows, counts = torch.unique(rank_mapping, return_counts=True)
+                duplicates = counts > 1
+                if duplicates.any().item():
+                    duplicate_row = int(unique_rows[duplicates][0].item())
+                    if leading_rank_axis:
+                        return False, (
+                            f"    '{mapping_name}' contains duplicate physical row "
+                            f"{duplicate_row} on rank {rank}"
+                        )
+                    return False, (
+                        f"    '{mapping_name}' contains duplicate physical row {duplicate_row}"
+                    )
+            written_rows[rank, rank_mapping] = True
+
+        equal_rows = (actual_rows == expected_rows).all(dim=-1)
+        stray_rows = ~written_rows & ~equal_rows
+        if stray_rows.any().item():
+            first = stray_rows.nonzero(as_tuple=False)[0]
+            rank = int(first[0].item())
+            row = int(first[1].item())
+            changed_values = int(
+                (actual_rows[rank, row] != expected_rows[rank, row])
+                .count_nonzero()
+                .item()
+            )
+            rank_detail = f" rank={rank}" if leading_rank_axis else ""
+            return False, (
+                f"    unmapped physical {pool_name} row changed:{rank_detail} "
+                f"row={row} changed_values={changed_values} mapping='{mapping_name}'"
+            )
+
+        if not written_rows.any().item():
+            return True, ""
+
+        mapped_actual = actual_rows[written_rows]
+        mapped_expected = expected_rows[written_rows]
+        for label, rows in (("actual", mapped_actual), ("expected", mapped_expected)):
+            if torch.is_floating_point(rows):
+                nonfinite = ~torch.isfinite(rows)
+                if nonfinite.any().item():
+                    return False, (
+                        f"    {label} mapped rows in {pool_name} from '{mapping_name}' "
+                        f"contain {int(nonfinite.count_nonzero().item())} non-finite value(s)"
+                    )
+
+        ok, detail = mapped_compare(mapped_actual, mapped_expected, **kwargs)
+        if ok:
+            return True, ""
+        return False, f"    mapped rows in {pool_name} from '{mapping_name}':\n{detail}"
+
+    compare.__name__ = (
+        f"mapped_pool_ratio_allclose(mapping={mapping_name}, shape={mapping_shape}, "
+        f"block_size={block_size}, leading_rank_axis={leading_rank_axis}, "
+        f"atol={atol}, rtol={rtol}, max_error_ratio={max_error_ratio})"
+    )
+    return compare
+
+
 def ratio_reldiff(
     diff_thd: float = 0.01,
     pct_thd: float = 0.05,
@@ -443,7 +646,7 @@ def ratio_reldiff(
 
     The denominator floor ``(1 / 2^14) / diff_thd`` keeps rdiff well-defined
     for near-zero values (capped via the ``a < diff_thd`` early-return).
-    NaN / Inf in ``actual`` always fail.
+    NaN / Inf in ``actual`` or ``expected`` always fail.
 
     Upstream reference: ``data_compare()`` in cann-recipes-infer.
 
@@ -490,12 +693,9 @@ def ratio_reldiff(
         actual_f = actual.cpu().to(torch.float32)
         expected_f = expected.cpu().to(torch.float32)
 
-        nan_count = int(torch.isnan(actual_f).sum().item())
-        inf_count = int(torch.isinf(actual_f).sum().item())
-        if nan_count or inf_count:
-            return False, (
-                f"    illegal values in actual: NaN={nan_count} Inf={inf_count}"
-            )
+        nonfinite_error = _nonfinite_error(actual_f, expected_f)
+        if nonfinite_error:
+            return False, nonfinite_error
 
         diff_abs = (actual_f - expected_f).abs()
         small_value_floor = (1.0 / (1 << 14)) / diff_thd

@@ -29,6 +29,11 @@ from config import (
     PREFILL_SEQ,
 )
 
+# Dynamic physical cache-view dimensions used by sparse attention.
+ORI_BLOCK_NUM_DYN = pl.dynamic("PREFILL_ORI_BLOCK_NUM_DYN")
+SPARSE_CMP_BLOCK_NUM_DYN = pl.dynamic("PREFILL_SPARSE_CMP_BLOCK_NUM_DYN")
+
+
 # Prefill target shape. T is fixed at 128.
 B = PREFILL_BATCH
 S = PREFILL_SEQ
@@ -111,9 +116,9 @@ SPARSE_CMP_BIAS_COLS = max(0, SPARSE_BIAS_COLS - WIN)
 @pl.jit.inline
 def prefill_sparse_attn(
     q: pl.Tensor[[T, H, HEAD_DIM], pl.BF16],
-    ori_kv: pl.Tensor[[ORI_MAX_BLOCKS, BLOCK_SIZE, 1, HEAD_DIM], pl.BF16],
+    ori_kv: pl.Tensor[[ORI_BLOCK_NUM_DYN, BLOCK_SIZE, 1, HEAD_DIM], pl.BF16],
     swa_indices: pl.Tensor[[T, WIN], pl.INT32],
-    cmp_kv: pl.Tensor[[CMP_BLOCK_NUM, BLOCK_SIZE, 1, HEAD_DIM], pl.BF16],
+    cmp_kv: pl.Tensor[[SPARSE_CMP_BLOCK_NUM_DYN, BLOCK_SIZE, 1, HEAD_DIM], pl.BF16],
     cmp_block_table: pl.Tensor[[CMP_MAX_BLOCKS], pl.INT32],
     cmp_indices: pl.Tensor[[T, IDX_TOPK], pl.INT32],
     attn_sink: pl.Tensor[[H], pl.FP32],
@@ -130,19 +135,15 @@ def prefill_sparse_attn(
     # the head-invariant cos_il / sign-folded sin once, then rotate each head's rope segment
     # in the `rope` stage below (no rope_buf round-trip).
     #
-    # This only reads freqs_cos/freqs_sin, so it may sit anywhere before `rope` -- but it must
-    # NOT sit next to `rope`, in the merge_norm..rope window where it used to live. Dispatched
-    # from there its two tasks go resident alongside merge_norm, and that pairing trips an
-    # on-device "the address for VEC to access UB is out of bounds" fault (AICore errcode 341)
-    # which stalls the schedule at completed=3/312 with merge_norm + rope_cs both running.
-    # Neither task is individually out of bounds -- every tile fits a5's 245760 B vector
-    # budget (merge_norm 98816, rope_cs 98304) and the fault flips on pure timing (raising
-    # log_level alone makes it pass), so the defect is below pypto-lib. Measured from the old
-    # position: 16 faults / 18 runs. From here: 0 / 13. Hoisting overlaps the tables with
-    # gather_kv instead, which is also strictly better for latency.
+    # Keep this stage isolated from the other root tasks. Concurrent dispatch of rope_cs with
+    # either merge_norm or the initial gather/bias work intermittently trips an on-device
+    # "the address for VEC to access UB is out of bounds" fault (AICore errcode 341), even
+    # though each tile is individually within the vector UB budget. Explicit dependencies on
+    # rope_cs below trade a small amount of launch overlap for deterministic execution.
     rope_cos_il = pl.create_tensor([T, ROPE_DIM], dtype=pl.FP32)
     rope_sin_signed = pl.create_tensor([T, ROPE_DIM], dtype=pl.FP32)
-    for cp in pl.spmd(ROPE_HALF // ROPE_TILE, name_hint="rope_cs"):
+    with pl.spmd(ROPE_HALF // ROPE_TILE, name_hint="rope_cs") as rope_cs_tid:
+        cp = pl.tile.get_block_idx()
         cp_r0 = cp * ROPE_TILE
         cp_c0 = 2 * cp_r0
         cs_col = pl.col_expand_mul(
@@ -161,10 +162,19 @@ def prefill_sparse_attn(
     # Gather KV per token: each (token, block) of PREFILL_ATTN_TILE slots is staged into one
     # UB tile (scattered 1-row loads on MTE2, invalid slots stay zero) then flushed with a
     # single wide MTE3 store. Invalid slots are carried by -1 padding.
-    ori_kv_flat = pl.reshape(ori_kv, [ORI_MAX_BLOCKS * BLOCK_SIZE, HEAD_DIM])
-    cmp_kv_flat = pl.reshape(cmp_kv, [CMP_BLOCK_NUM * BLOCK_SIZE, HEAD_DIM])
+    ori_block_num = pl.tensor.dim(ori_kv, 0)
+    ori_cache_rows = ori_block_num * BLOCK_SIZE
+    ori_kv_flat = pl.reshape(ori_kv, [ori_cache_rows, HEAD_DIM])
+    cmp_block_num = pl.tensor.dim(cmp_kv, 0)
+    cmp_cache_rows = cmp_block_num * BLOCK_SIZE
+    cmp_kv_flat = pl.reshape(cmp_kv, [cmp_cache_rows, HEAD_DIM])
     sparse_kv = pl.create_tensor([T * PREFILL_SPARSE_PAD, HEAD_DIM], dtype=pl.BF16)
-    for gather_block in pl.spmd(((T + GATHER_TOKEN_TILE - 1) // GATHER_TOKEN_TILE) * PREFILL_ATTN_BLOCKS, name_hint="gather_kv"):
+    with pl.spmd(
+        ((T + GATHER_TOKEN_TILE - 1) // GATHER_TOKEN_TILE) * PREFILL_ATTN_BLOCKS,
+        name_hint="gather_kv",
+        deps=[rope_cs_tid],
+    ) as _gather_tid:
+        gather_block = pl.tile.get_block_idx()
         gather_token_block = gather_block // PREFILL_ATTN_BLOCKS
         gather_sb = gather_block - gather_token_block * PREFILL_ATTN_BLOCKS
         gather_t0 = gather_token_block * GATHER_TOKEN_TILE
@@ -199,7 +209,8 @@ def prefill_sparse_attn(
     # masks invalid slots without rescanning validity per head. A slot is valid when its raw
     # index is >= 0; the [TOPK, PREFILL_SPARSE_PAD) tail is always masked.
     sparse_bias = pl.create_tensor([T, PREFILL_SPARSE_PAD], dtype=pl.FP32)
-    for bias_blk in pl.spmd(T // BIAS_TOKEN_TILE, name_hint="build_bias"):
+    with pl.spmd(T // BIAS_TOKEN_TILE, name_hint="build_bias", deps=[rope_cs_tid]) as _bias_tid:
+        bias_blk = pl.tile.get_block_idx()
         bias_t0 = bias_blk * BIAS_TOKEN_TILE
         bias_win_idx = pl.cast(swa_indices[bias_t0:bias_t0 + BIAS_TOKEN_TILE, 0:WIN], target_type=pl.FP32)
         bias_win_raw_flag = pl.minimum(pl.maximum(pl.add(bias_win_idx, 1.0), 0.0), 1.0)
@@ -445,9 +456,9 @@ def prefill_sparse_attn(
 @pl.jit
 def prefill_sparse_attn_test(
     q: pl.Tensor[[T, H, HEAD_DIM], pl.BF16],
-    ori_kv: pl.Tensor[[ORI_MAX_BLOCKS, BLOCK_SIZE, 1, HEAD_DIM], pl.BF16],
+    ori_kv: pl.Tensor[[ORI_BLOCK_NUM_DYN, BLOCK_SIZE, 1, HEAD_DIM], pl.BF16],
     swa_indices: pl.Tensor[[T, WIN], pl.INT32],
-    cmp_kv: pl.Tensor[[CMP_BLOCK_NUM, BLOCK_SIZE, 1, HEAD_DIM], pl.BF16],
+    cmp_kv: pl.Tensor[[SPARSE_CMP_BLOCK_NUM_DYN, BLOCK_SIZE, 1, HEAD_DIM], pl.BF16],
     cmp_block_table: pl.Tensor[[CMP_MAX_BLOCKS], pl.INT32],
     cmp_indices: pl.Tensor[[T, IDX_TOPK], pl.INT32],
     attn_sink: pl.Tensor[[H], pl.FP32],

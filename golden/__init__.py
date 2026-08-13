@@ -46,6 +46,7 @@ from .runner import RunResult, run, run_jit
 from .spec import ScalarSpec, TensorSpec
 from .validation import (
     error_distribution,
+    mapped_pool_ratio_allclose,
     ratio_allclose,
     ratio_reldiff,
     topk_pair_compare,
@@ -57,6 +58,7 @@ __all__ = [
     "ScalarSpec",
     "validate_golden",
     "ratio_allclose",
+    "mapped_pool_ratio_allclose",
     "ratio_reldiff",
     "error_distribution",
     "topk_pair_compare",

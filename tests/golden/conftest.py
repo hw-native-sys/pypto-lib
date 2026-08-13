@@ -43,8 +43,21 @@ def _install_pypto_stubs() -> None:
         Ascend910B = "Ascend910B"
         Ascend950 = "Ascend950"
 
+    class _TypeSpec:
+        @classmethod
+        def __class_getitem__(cls, _item):
+            return cls
+
+    def _identity_jit(fn=None, **_kwargs):
+        if fn is None:
+            return lambda wrapped: wrapped
+        return fn
+
+    _identity_jit.inline = _identity_jit
+
     pypto = types.ModuleType("pypto")
     pypto.__path__ = []  # mark as package so submodule imports resolve
+    language = types.ModuleType("pypto.language")
     ir = types.ModuleType("pypto.ir")
     runtime = types.ModuleType("pypto.runtime")
     runtime.__path__ = []
@@ -54,6 +67,13 @@ def _install_pypto_stubs() -> None:
     replay = types.ModuleType("pypto.runtime.debug.replay")
     pto_rebuild = types.ModuleType("pypto.runtime.debug.pto_rebuild")
     backend = types.ModuleType("pypto.backend")
+
+    for name in ("Tensor", "Scalar", "Array", "InOut", "Out"):
+        setattr(language, name, _TypeSpec)
+    for name in ("BF16", "FP32", "INT8", "INT32", "INT64", "TASK_ID"):
+        setattr(language, name, object())
+    language.dynamic = lambda name: name
+    language.jit = _identity_jit
 
     # Tests that observe these patch them; the stub defaults are silent
     # no-ops so the runtime_dir replay path can flow through without
@@ -66,6 +86,7 @@ def _install_pypto_stubs() -> None:
     backend.BackendType = BackendType
 
     pypto.ir = ir
+    pypto.language = language
     pypto.runtime = runtime
     pypto.backend = backend
     runtime.log_config = log_config
@@ -74,6 +95,7 @@ def _install_pypto_stubs() -> None:
     debug.pto_rebuild = pto_rebuild
 
     sys.modules["pypto"] = pypto
+    sys.modules["pypto.language"] = language
     sys.modules["pypto.ir"] = ir
     sys.modules["pypto.runtime"] = runtime
     sys.modules["pypto.runtime.log_config"] = log_config

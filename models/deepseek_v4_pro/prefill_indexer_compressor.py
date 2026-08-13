@@ -21,6 +21,11 @@ from config import (
     INT8_AMAX_EPS,
 )
 
+# Runtime-sized global state pool.  Physical ownership comes from the request's
+# block table and slot mapping, not from a fixed per-request tensor slice.
+STATE_BLOCK_NUM_DYN = pl.dynamic("PREFILL_INNER_STATE_BLOCK_NUM_DYN")
+IDX_BLOCK_NUM_DYN = pl.dynamic("PREFILL_IDX_BLOCK_NUM_DYN")
+
 # model config (mirrors decode_indexer_compressor)
 EPS = M.rms_norm_eps
 D = M.hidden_size
@@ -64,7 +69,9 @@ PACKED_RMS_TILE = 16
 @pl.jit.inline
 def prefill_indexer_compressor(
     x: pl.Tensor[[T, D], pl.BF16],
-    compress_state: pl.Tensor[[INNER_STATE_BLOCK_NUM, INNER_STATE_BLOCK_SIZE, COMPRESS_STATE_DIM], pl.FP32],
+    compress_state: pl.InOut[
+        pl.Tensor[[STATE_BLOCK_NUM_DYN, INNER_STATE_BLOCK_SIZE, COMPRESS_STATE_DIM], pl.FP32]
+    ],
     inner_compress_state_block_table: pl.Tensor[[INNER_STATE_MAX_BLOCKS], pl.INT32],
     wkv: pl.Tensor[[OUT_DIM, D], pl.BF16],
     wgate: pl.Tensor[[OUT_DIM, D], pl.BF16],
@@ -74,22 +81,25 @@ def prefill_indexer_compressor(
     freqs_sin: pl.Tensor[[MAX_SEQ_LEN, ROPE_HEAD_DIM], pl.BF16],
     hadamard: pl.Tensor[[HEAD_DIM, HEAD_DIM], pl.BF16],
     # C8 indexer cache: INT8 KV (quant-on-write) + per-position FP32 dequant scale; no bf16 cache.
-    idx_kv_cache: pl.Out[pl.Tensor[[PREFILL_IDX_BLOCK_NUM, BLOCK_SIZE, 1, HEAD_DIM], pl.INT8]],
-    idx_kv_scale: pl.Out[pl.Tensor[[PREFILL_IDX_BLOCK_NUM, BLOCK_SIZE, 1, 1], pl.FP32]],
+    idx_kv_cache: pl.Tensor[[IDX_BLOCK_NUM_DYN, BLOCK_SIZE, 1, HEAD_DIM], pl.INT8],
+    idx_kv_scale: pl.Tensor[[IDX_BLOCK_NUM_DYN, BLOCK_SIZE, 1, 1], pl.FP32],
     idx_block_table: pl.Tensor[[IDX_CACHE_MAX_BLOCKS], pl.INT32],
     position_ids: pl.Tensor[[T], pl.INT32],
     num_tokens: pl.Scalar[pl.INT32],
     idx_slot_mapping: pl.Tensor[[T], pl.INT64],
     inner_state_slot_mapping: pl.Tensor[[T], pl.INT64],
+    completion: pl.Array[1, pl.TASK_ID],
 ):
+    state_block_num = pl.tensor.dim(compress_state, 0)
+    idx_block_num = pl.tensor.dim(idx_kv_cache, 0)
     kv_proj_scratch = pl.create_tensor([T, OUT_DIM], dtype=pl.FP32)
     score_proj_scratch = pl.create_tensor([T, OUT_DIM], dtype=pl.FP32)
     compress_state_flat = pl.reshape(
         compress_state,
-        [INNER_STATE_BLOCK_NUM * INNER_STATE_BLOCK_SIZE, COMPRESS_STATE_DIM],
+        [state_block_num * INNER_STATE_BLOCK_SIZE, COMPRESS_STATE_DIM],
     )
-    idx_kv_cache_flat = pl.reshape(idx_kv_cache, [PREFILL_IDX_BLOCK_NUM * BLOCK_SIZE, HEAD_DIM])
-    idx_kv_scale_flat = pl.reshape(idx_kv_scale, [PREFILL_IDX_BLOCK_NUM * BLOCK_SIZE, 1])
+    idx_kv_cache_flat = pl.reshape(idx_kv_cache, [idx_block_num * BLOCK_SIZE, HEAD_DIM])
+    idx_kv_scale_flat = pl.reshape(idx_kv_scale, [idx_block_num * BLOCK_SIZE, 1])
     pooled_kv = pl.create_tensor([MAX_CMP_WRITES, HEAD_DIM], dtype=pl.FP32)
     normed_kv = pl.create_tensor([MAX_CMP_WRITES, HEAD_DIM], dtype=pl.BF16)
     final_kv = pl.create_tensor([MAX_CMP_WRITES, HEAD_DIM], dtype=pl.FP32)
@@ -137,7 +147,8 @@ def prefill_indexer_compressor(
     # A contiguous active prefix can close at most ceil(num_tokens / ratio)
     # compressed rows, regardless of the absolute start-position alignment.
     active_pool_blocks = ((num_tokens + COMPRESS_RATIO - 1) // COMPRESS_RATIO) * HEAD_BLOCKS
-    for pool_idx in pl.spmd(active_pool_blocks, name_hint="prefill_idx_c4_softmax_pool"):
+    with pl.spmd(active_pool_blocks, name_hint="prefill_idx_c4_softmax_pool") as pool_tid:
+        pool_idx = pl.tile.get_block_idx()
         write_i = pool_idx // HEAD_BLOCKS
         hb = pool_idx - write_i * HEAD_BLOCKS
         h0 = hb * HEAD_CHUNK
@@ -342,7 +353,11 @@ def prefill_indexer_compressor(
             )
             final_kv[final_base : final_base + PACKED_RMS_TILE, o0 : o0 + OUT_TILE] = final_acc
 
-    for final_block in pl.spmd(MAX_CMP_WRITES // PACKED_RMS_TILE, name_hint="prefill_idx_c4_cache_write"):
+    with pl.spmd(
+        MAX_CMP_WRITES // PACKED_RMS_TILE,
+        name_hint="prefill_idx_c4_cache_write",
+    ) as cache_write_tid:
+        final_block = pl.tile.get_block_idx()
         final_base = final_block * PACKED_RMS_TILE
         # C8 quant-on-write: per-row INT8 quant of the bf16-rounded block + per-position dequant scale
         kv_blk_f32 = pl.cast(
@@ -366,15 +381,13 @@ def prefill_indexer_compressor(
                 idx_kv_cache_flat[dst_row : dst_row + 1, 0:HEAD_DIM] = kv_i8_blk[final_dt : final_dt + 1, :]
                 # scale is one value per position; a [1,1] tile store is sub-32B, so scalar-write it
                 pl.write(idx_kv_scale_flat, [dst_row, 0], pl.read(kv_scale_dq_col, [final_dt, 0]))
-            else:
-                keepalive_row = PREFILL_IDX_BLOCK_NUM * BLOCK_SIZE - MAX_CMP_WRITES + final_i
-                idx_kv_cache_flat[keepalive_row : keepalive_row + 1, 0:HEAD_DIM] = idx_kv_cache_flat[
-                    keepalive_row : keepalive_row + 1,
-                    0:HEAD_DIM,
-                ]
-                pl.write(idx_kv_scale_flat, [keepalive_row, 0], pl.read(idx_kv_scale_flat, [keepalive_row, 0]))
 
-    for update_idx in pl.spmd(T * PACKED_PROJ_BLOCKS, name_hint="prefill_idx_c4_state_update"):
+    with pl.spmd(
+        T * PACKED_PROJ_BLOCKS,
+        name_hint="prefill_idx_c4_state_update",
+        deps=[pool_tid],
+    ) as state_update_tid:
+        update_idx = pl.tile.get_block_idx()
         update_ob = update_idx % PACKED_PROJ_BLOCKS
         update_t = update_idx // PACKED_PROJ_BLOCKS
         update_o0 = update_ob * OUT_TILE
@@ -385,31 +398,24 @@ def prefill_indexer_compressor(
                 update_pos = pl.read(position_ids, [update_t])
                 ape_slot = pl.cast(update_pos % COMPRESS_RATIO, pl.INDEX)
                 ape_row = ape[ape_slot : ape_slot + 1, update_o0 : update_o0 + OUT_TILE]
-                pool_dep = pl.mul(pooled_kv[0:1, 0:OUT_TILE], 0.0)
-                compress_state_flat[state_row : state_row + 1, update_o0 : update_o0 + OUT_TILE] = pl.add(
+                compress_state_flat[state_row : state_row + 1, update_o0 : update_o0 + OUT_TILE] = (
                     kv_proj_scratch[
                         update_t : update_t + 1,
                         update_o0 : update_o0 + OUT_TILE,
-                    ],
-                    pool_dep,
+                    ]
                 )
                 compress_state_flat[
                     state_row : state_row + 1,
                     OUT_DIM + update_o0 : OUT_DIM + update_o0 + OUT_TILE,
                 ] = pl.add(
-                    pl.add(
-                        score_proj_scratch[update_t : update_t + 1, update_o0 : update_o0 + OUT_TILE],
-                        ape_row,
-                    ),
-                    pool_dep,
+                    score_proj_scratch[update_t : update_t + 1, update_o0 : update_o0 + OUT_TILE],
+                    ape_row,
                 )
 
-    idx_kv_cache = pl.reshape(idx_kv_cache_flat, [PREFILL_IDX_BLOCK_NUM, BLOCK_SIZE, 1, HEAD_DIM])
-    idx_kv_scale = pl.reshape(idx_kv_scale_flat, [PREFILL_IDX_BLOCK_NUM, BLOCK_SIZE, 1, 1])
-    compress_state = pl.reshape(
-        compress_state_flat,
-        [INNER_STATE_BLOCK_NUM, INNER_STATE_BLOCK_SIZE, COMPRESS_STATE_DIM],
-    )
+    completion[0] = pl.system.task_dummy(deps=[cache_write_tid, state_update_tid])
+
+    # The flattened views write through to the caller-owned roots. Returning the
+    # roots preserves their runtime-sized global-pool metadata in nested callers.
     return idx_kv_cache, idx_kv_scale, compress_state
 
 
@@ -418,7 +424,7 @@ def prefill_indexer_compressor_test(
     x: pl.Tensor[[T, D], pl.BF16],
     kv: pl.Out[pl.Tensor[[MAX_CMP_WRITES, HEAD_DIM], pl.INT8]],
     compress_state: pl.InOut[
-        pl.Tensor[[INNER_STATE_BLOCK_NUM, INNER_STATE_BLOCK_SIZE, COMPRESS_STATE_DIM], pl.FP32]
+        pl.Tensor[[STATE_BLOCK_NUM_DYN, INNER_STATE_BLOCK_SIZE, COMPRESS_STATE_DIM], pl.FP32]
     ],
     inner_compress_state_block_table: pl.Tensor[[INNER_STATE_MAX_BLOCKS], pl.INT32],
     wkv: pl.Tensor[[OUT_DIM, D], pl.BF16],
@@ -428,21 +434,28 @@ def prefill_indexer_compressor_test(
     freqs_cos: pl.Tensor[[MAX_SEQ_LEN, ROPE_HEAD_DIM], pl.BF16],
     freqs_sin: pl.Tensor[[MAX_SEQ_LEN, ROPE_HEAD_DIM], pl.BF16],
     hadamard: pl.Tensor[[HEAD_DIM, HEAD_DIM], pl.BF16],
-    idx_kv_cache: pl.InOut[pl.Tensor[[PREFILL_IDX_BLOCK_NUM, BLOCK_SIZE, 1, HEAD_DIM], pl.INT8]],
-    idx_kv_scale: pl.InOut[pl.Tensor[[PREFILL_IDX_BLOCK_NUM, BLOCK_SIZE, 1, 1], pl.FP32]],
+    idx_kv_cache: pl.InOut[pl.Tensor[[IDX_BLOCK_NUM_DYN, BLOCK_SIZE, 1, HEAD_DIM], pl.INT8]],
+    idx_kv_scale: pl.InOut[pl.Tensor[[IDX_BLOCK_NUM_DYN, BLOCK_SIZE, 1, 1], pl.FP32]],
     idx_block_table: pl.Tensor[[IDX_CACHE_MAX_BLOCKS], pl.INT32],
     position_ids: pl.Tensor[[T], pl.INT32],
     num_tokens: pl.Scalar[pl.INT32],
     idx_slot_mapping: pl.Tensor[[T], pl.INT64],
     inner_state_slot_mapping: pl.Tensor[[T], pl.INT64],
 ):
+    idx_block_num = pl.tensor.dim(idx_kv_cache, 0)
+    completion = pl.array.create(1, pl.TASK_ID)
     prefill_indexer_compressor(
         x, compress_state, inner_compress_state_block_table, wkv, wgate, ape, norm_w, freqs_cos, freqs_sin,
         hadamard, idx_kv_cache, idx_kv_scale, idx_block_table, position_ids, num_tokens,
-        idx_slot_mapping, inner_state_slot_mapping,
+        idx_slot_mapping, inner_state_slot_mapping, completion,
     )
-    idx_kv_cache_flat = pl.reshape(idx_kv_cache, [PREFILL_IDX_BLOCK_NUM * BLOCK_SIZE, HEAD_DIM])
-    for kv_block in pl.spmd(MAX_CMP_WRITES // PACKED_RMS_TILE, name_hint="prefill_idx_c4_kv_test_extract"):
+    idx_kv_cache_flat = pl.reshape(idx_kv_cache, [idx_block_num * BLOCK_SIZE, HEAD_DIM])
+    with pl.spmd(
+        MAX_CMP_WRITES // PACKED_RMS_TILE,
+        name_hint="prefill_idx_c4_kv_test_extract",
+        deps=[completion[0]],
+    ) as _extract_tid:
+        kv_block = pl.tile.get_block_idx()
         kv_base = kv_block * PACKED_RMS_TILE
         for kv_dt in pl.range(PACKED_RMS_TILE):
             kv_i = kv_base + kv_dt
@@ -473,7 +486,7 @@ def golden_prefill_indexer_compressor(tensors):
     kv_proj = tensors["x"].float() @ tensors["wkv"].float().t()   # wkv stored [OUT_DIM, D] for b_trans
     score_proj = tensors["x"].float() @ tensors["wgate"].float().t()
     compress_state_flat = tensors["compress_state"].view(
-        INNER_STATE_BLOCK_NUM * INNER_STATE_BLOCK_SIZE,
+        tensors["compress_state"].shape[0] * INNER_STATE_BLOCK_SIZE,
         COMPRESS_STATE_DIM,
     )
     kv_state_flat = compress_state_flat[:, :OUT_DIM]
@@ -593,17 +606,394 @@ def golden_prefill_indexer_compressor(tensors):
     tensors["idx_kv_scale"][:] = idx_kv_scale
 
 
-def build_tensor_specs(start_pos: int = START_POS):
+def _prefill_mapping_contract(
+    mapping_name,
+    physical_row_size,
+    physical_row_count,
+    num_tokens,
+    inputs,
+):
+    """Validate a packed prefill slot mapping and return its mapped rows."""
+    import torch
+
+    mapping = inputs.get(mapping_name)
+    if mapping is None:
+        return f"    compare_fn misconfigured: missing input '{mapping_name}'", None
+    position_ids = inputs.get("position_ids")
+    if position_ids is None:
+        return "    compare_fn misconfigured: missing input 'position_ids'", None
+
+    mapping = mapping.cpu().to(torch.int64)
+    position_ids = position_ids.cpu().to(torch.int64)
+    if mapping.shape != (T,):
+        return f"    {mapping_name} must have shape {(T,)}, got {tuple(mapping.shape)}", None
+    if position_ids.shape != (T,):
+        return f"    position_ids must have shape {(T,)}, got {tuple(position_ids.shape)}", None
+    if hasattr(num_tokens, "numel") and num_tokens.numel() != 1:
+        return (
+            "    num_tokens must be scalar, "
+            f"got shape {tuple(num_tokens.shape)}"
+        ), None
+    num_tokens = int(
+        num_tokens.item() if hasattr(num_tokens, "item") else num_tokens
+    )
+    if not 0 <= num_tokens <= T:
+        return f"    num_tokens={num_tokens} is outside [0, {T}]", None
+
+    inactive_mapping = mapping[num_tokens:]
+    inactive_non_padding = inactive_mapping != -1
+    if inactive_non_padding.any().item():
+        suffix_token = int(inactive_non_padding.nonzero(as_tuple=False)[0, 0].item())
+        token = num_tokens + suffix_token
+        return (
+            f"    inactive {mapping_name}[{token}]={int(mapping[token].item())}; "
+            "expected -1"
+        ), None
+
+    active_mapping = mapping[:num_tokens]
+    active_positions = position_ids[:num_tokens]
+    invalid_negative = active_mapping < -1
+    if invalid_negative.any().item():
+        token = int(invalid_negative.nonzero(as_tuple=False)[0, 0].item())
+        return (
+            f"    {mapping_name}[{token}]={int(active_mapping[token].item())} is invalid; "
+            "only -1 is a negative sentinel"
+        ), None
+
+    if mapping_name == "idx_slot_mapping":
+        block_table_name = "idx_block_table"
+        required = (active_positions + 1) % COMPRESS_RATIO == 0
+        logical_rows = (active_positions + 1) // COMPRESS_RATIO - 1
+        logical_block_size = BLOCK_SIZE
+    elif mapping_name == "inner_state_slot_mapping":
+        block_table_name = "inner_compress_state_block_table"
+        required = torch.ones(num_tokens, dtype=torch.bool)
+        logical_rows = active_positions
+        logical_block_size = INNER_STATE_BLOCK_SIZE
+    else:
+        return f"    unsupported prefill mapping '{mapping_name}'", None
+
+    missing = required & (active_mapping == -1)
+    if missing.any().item():
+        token = int(missing.nonzero(as_tuple=False)[0, 0].item())
+        return (
+            f"    active logical row at token {token} is missing from {mapping_name}"
+        ), None
+    unexpected = ~required & (active_mapping != -1)
+    if unexpected.any().item():
+        token = int(unexpected.nonzero(as_tuple=False)[0, 0].item())
+        return (
+            f"    {mapping_name}[{token}]={int(active_mapping[token].item())}; "
+            "this token does not complete a compressed row and must be -1"
+        ), None
+
+    mapped = active_mapping[required]
+    if mapped.numel() == 0:
+        return "", mapped
+    out_of_range = mapped >= physical_row_count
+    if out_of_range.any().item():
+        mapped_i = int(out_of_range.nonzero(as_tuple=False)[0, 0].item())
+        token = int(required.nonzero(as_tuple=False)[mapped_i, 0].item())
+        return (
+            f"    {mapping_name}[{token}]={int(active_mapping[token].item())} is outside "
+            f"physical row range [0, {physical_row_count})"
+        ), None
+
+    block_table = inputs.get(block_table_name)
+    if block_table is None:
+        return f"    compare_fn misconfigured: missing input '{block_table_name}'", None
+    block_table = block_table.cpu().to(torch.int64)
+    if block_table.ndim != 1:
+        return f"    {block_table_name} must be 1-D, got {tuple(block_table.shape)}", None
+
+    required_logical_rows = logical_rows[required]
+    invalid_logical = required_logical_rows < 0
+    if invalid_logical.any().item():
+        mapped_i = int(invalid_logical.nonzero(as_tuple=False)[0, 0].item())
+        token = int(required.nonzero(as_tuple=False)[mapped_i, 0].item())
+        return (
+            f"    position_ids[{token}]={int(active_positions[token].item())} does not "
+            f"identify a legal logical row for {mapping_name}"
+        ), None
+    logical_blocks = required_logical_rows // logical_block_size
+    table_out_of_range = logical_blocks >= block_table.numel()
+    if table_out_of_range.any().item():
+        mapped_i = int(table_out_of_range.nonzero(as_tuple=False)[0, 0].item())
+        token = int(required.nonzero(as_tuple=False)[mapped_i, 0].item())
+        return (
+            f"    logical block {int(logical_blocks[mapped_i].item())} for token {token} "
+            f"is outside {block_table_name} length {block_table.numel()}"
+        ), None
+    physical_blocks = block_table[logical_blocks]
+    unallocated = physical_blocks < 0
+    if unallocated.any().item():
+        mapped_i = int(unallocated.nonzero(as_tuple=False)[0, 0].item())
+        token = int(required.nonzero(as_tuple=False)[mapped_i, 0].item())
+        return (
+            f"    active logical row at token {token} uses unallocated "
+            f"{block_table_name}[{int(logical_blocks[mapped_i].item())}]"
+        ), None
+    expected_rows = (
+        physical_blocks * physical_row_size
+        + required_logical_rows % logical_block_size
+    )
+    expected_out_of_range = expected_rows >= physical_row_count
+    if expected_out_of_range.any().item():
+        mapped_i = int(expected_out_of_range.nonzero(as_tuple=False)[0, 0].item())
+        token = int(required.nonzero(as_tuple=False)[mapped_i, 0].item())
+        return (
+            f"    {block_table_name} maps token {token} to physical row "
+            f"{int(expected_rows[mapped_i].item())}, outside [0, {physical_row_count})"
+        ), None
+    wrong_row = mapped != expected_rows
+    if wrong_row.any().item():
+        mapped_i = int(wrong_row.nonzero(as_tuple=False)[0, 0].item())
+        token = int(required.nonzero(as_tuple=False)[mapped_i, 0].item())
+        return (
+            f"    {mapping_name}[{token}]={int(mapped[mapped_i].item())}; "
+            f"expected physical row {int(expected_rows[mapped_i].item())} from "
+            f"{block_table_name}"
+        ), None
+
+    mapped_values, mapped_counts = torch.unique(mapped, return_counts=True)
+    duplicates = mapped_counts > 1
+    if duplicates.any().item():
+        duplicate_i = int(duplicates.nonzero(as_tuple=False)[0, 0].item())
+        duplicate_row = int(mapped_values[duplicate_i].item())
+        duplicate_count = int(mapped_counts[duplicate_i].item())
+        return (
+            f"    active {mapping_name} repeats physical row "
+            f"{duplicate_row} {duplicate_count} times"
+        ), None
+    return "", mapped
+
+
+def _mapped_slot_rows_ratio_allclose(
+    mapping_name,
+    physical_row_size,
+    pool_name,
+    *,
+    num_tokens,
+    atol,
+    rtol,
+    max_error_ratio,
+):
+    """Compare active slot-mapped rows and require every other physical row to stay exact."""
+    import torch
+
+    from golden import ratio_allclose
+
+    mapped_compare = ratio_allclose(
+        atol=atol,
+        rtol=rtol,
+        max_error_ratio=max_error_ratio,
+    )
+
+    def compare(actual, expected, **kwargs):
+        if actual.shape != expected.shape:
+            return False, (
+                f"    {pool_name} shape mismatch: actual={tuple(actual.shape)} "
+                f"expected={tuple(expected.shape)}"
+            )
+        if actual.ndim < 2 or actual.shape[1] != physical_row_size:
+            return False, (
+                f"    expected block-major {pool_name} with physical row size "
+                f"{physical_row_size}, "
+                f"got {tuple(actual.shape)}"
+            )
+
+        row_count = actual.shape[0] * physical_row_size
+        actual_rows = actual.cpu().reshape(row_count, -1)
+        expected_rows = expected.cpu().reshape(row_count, -1)
+        for label, rows in (("actual", actual_rows), ("expected", expected_rows)):
+            if torch.is_floating_point(rows):
+                nonfinite = ~torch.isfinite(rows)
+                if nonfinite.any().item():
+                    return False, (
+                        f"    {label} {pool_name} contains "
+                        f"{int(nonfinite.count_nonzero().item())} non-finite value(s)"
+                    )
+
+        contract_error, mapped = _prefill_mapping_contract(
+            mapping_name,
+            physical_row_size,
+            row_count,
+            num_tokens,
+            kwargs.get("inputs", {}),
+        )
+        if contract_error:
+            return False, contract_error
+
+        mapped_rows = torch.zeros(row_count, dtype=torch.bool)
+        if mapped.numel():
+            mapped_rows[mapped] = True
+        equal_rows = (actual_rows == expected_rows).all(dim=-1)
+        stray_rows = ~mapped_rows & ~equal_rows
+        if stray_rows.any().item():
+            row = int(stray_rows.nonzero(as_tuple=False)[0, 0].item())
+            changed_values = int(
+                (actual_rows[row] != expected_rows[row]).count_nonzero().item()
+            )
+            return False, (
+                f"    unmapped physical {pool_name} row {row} changed "
+                f"({changed_values} value(s))"
+            )
+        if not mapped_rows.any().item():
+            return True, ""
+
+        ok, detail = mapped_compare(
+            actual_rows[mapped_rows],
+            expected_rows[mapped_rows],
+            **kwargs,
+        )
+        if ok:
+            return True, ""
+        return False, f"    active {mapping_name} rows in {pool_name}:\n{detail}"
+
+    compare.__name__ = (
+        f"mapped_slot_rows_ratio_allclose(mapping={mapping_name}, pool={pool_name}, "
+        f"num_tokens={num_tokens}, atol={atol}, rtol={rtol}, "
+        f"max_error_ratio={max_error_ratio})"
+    )
+    return compare
+
+
+def active_compressed_rows_ratio_allclose(*, num_tokens, atol, rtol, max_error_ratio):
+    """Compare only produced compact rows and require the 32-row tail to stay exact."""
+    import torch
+
+    from golden import ratio_allclose
+
+    active_compare = ratio_allclose(
+        atol=atol,
+        rtol=rtol,
+        max_error_ratio=max_error_ratio,
+    )
+
+    def compare(actual, expected, **kwargs):
+        if actual.shape != expected.shape:
+            return False, (
+                f"    compact KV shape mismatch: actual={tuple(actual.shape)} "
+                f"expected={tuple(expected.shape)}"
+            )
+        if actual.shape != (MAX_CMP_WRITES, HEAD_DIM):
+            return False, (
+                f"    compact KV must have shape {(MAX_CMP_WRITES, HEAD_DIM)}, "
+                f"got {tuple(actual.shape)}"
+            )
+        inputs = kwargs.get("inputs", {})
+        actual_outputs = kwargs.get("actual_outputs", {})
+        expected_outputs = kwargs.get("expected_outputs", {})
+        actual_cache = actual_outputs.get("idx_kv_cache")
+        expected_cache = expected_outputs.get("idx_kv_cache")
+        for label, cache in (("actual", actual_cache), ("expected", expected_cache)):
+            if cache is None or cache.ndim < 2 or cache.shape[1] != BLOCK_SIZE:
+                return False, (
+                    f"    compare_fn requires block-major {label} output "
+                    f"'idx_kv_cache' with physical row size {BLOCK_SIZE}"
+                )
+        if actual_cache.shape != expected_cache.shape:
+            return False, (
+                "    idx_kv_cache shape mismatch: "
+                f"actual={tuple(actual_cache.shape)} "
+                f"expected={tuple(expected_cache.shape)}"
+            )
+        physical_row_count = actual_cache.shape[0] * BLOCK_SIZE
+        contract_error, mapped = _prefill_mapping_contract(
+            "idx_slot_mapping",
+            BLOCK_SIZE,
+            physical_row_count,
+            num_tokens,
+            inputs,
+        )
+        if contract_error:
+            return False, contract_error
+
+        actual_rows = actual.cpu()
+        expected_rows = expected.cpu()
+        for label, rows in (("actual", actual_rows), ("expected", expected_rows)):
+            if torch.is_floating_point(rows):
+                nonfinite = ~torch.isfinite(rows)
+                if nonfinite.any().item():
+                    return False, (
+                        f"    {label} compact KV contains "
+                        f"{int(nonfinite.count_nonzero().item())} non-finite value(s)"
+                    )
+
+        active_rows = mapped.numel()
+        if active_rows > MAX_CMP_WRITES:
+            return False, (
+                f"    active compact KV rows={active_rows} exceeds cap {MAX_CMP_WRITES}"
+            )
+        inactive_equal = (actual_rows[active_rows:] == expected_rows[active_rows:]).all()
+        if not inactive_equal.item():
+            changed = int(
+                (actual_rows[active_rows:] != expected_rows[active_rows:])
+                .count_nonzero()
+                .item()
+            )
+            return False, (
+                f"    inactive compact KV rows [{active_rows}, {MAX_CMP_WRITES}) "
+                f"changed ({changed} value(s))"
+            )
+        if active_rows == 0:
+            return True, ""
+        ok, detail = active_compare(
+            actual_rows[:active_rows],
+            expected_rows[:active_rows],
+            **kwargs,
+        )
+        if ok:
+            return True, ""
+        return False, f"    active compact KV rows [0, {active_rows}):\n{detail}"
+
+    compare.__name__ = (
+        "active_compressed_rows_ratio_allclose("
+        f"num_tokens={num_tokens}, atol={atol}, rtol={rtol}, "
+        f"max_error_ratio={max_error_ratio})"
+    )
+    return compare
+
+
+def mapped_idx_cache_ratio_allclose(*, num_tokens, atol, rtol, max_error_ratio):
+    """Compare active index-cache rows and require every other row to stay exact."""
+    return _mapped_slot_rows_ratio_allclose(
+        "idx_slot_mapping",
+        BLOCK_SIZE,
+        "index cache",
+        num_tokens=num_tokens,
+        atol=atol,
+        rtol=rtol,
+        max_error_ratio=max_error_ratio,
+    )
+
+
+def mapped_inner_state_ratio_allclose(*, num_tokens, atol, rtol, max_error_ratio):
+    """Compare active inner-state rows and require every other row to stay exact."""
+    return _mapped_slot_rows_ratio_allclose(
+        "inner_state_slot_mapping",
+        INNER_STATE_BLOCK_SIZE,
+        "inner compressor state",
+        num_tokens=num_tokens,
+        atol=atol,
+        rtol=rtol,
+        max_error_ratio=max_error_ratio,
+    )
+
+
+def build_tensor_specs(start_pos: int = START_POS, num_tokens: int = T):
     import torch
     from golden import ScalarSpec, TensorSpec
     from rope_tables import build_deepseek_v4_rope_tables
 
     shared_freqs_cos, shared_freqs_sin = build_deepseek_v4_rope_tables(M, COMPRESS_RATIO, dtype=torch.bfloat16)
 
+    if not 1 <= num_tokens <= T:
+        raise ValueError(f"num_tokens must satisfy 1 <= num_tokens <= {T}, got {num_tokens}")
     if start_pos < 0 or start_pos + T > MAX_SEQ_LEN:
         raise ValueError(f"start_pos must satisfy 0 <= start_pos <= {MAX_SEQ_LEN - T}, got {start_pos}")
 
-    write_count = sum(1 for t in range(T) if (start_pos + t + 1) % COMPRESS_RATIO == 0)
+    write_count = sum(1 for t in range(num_tokens) if (start_pos + t + 1) % COMPRESS_RATIO == 0)
     if write_count > MAX_CMP_WRITES:
         raise ValueError(f"fixture generated {write_count} compressed writes, cap is {MAX_CMP_WRITES}")
 
@@ -673,7 +1063,7 @@ def build_tensor_specs(start_pos: int = START_POS):
         return torch.arange(start_pos, start_pos + T, dtype=torch.int32)
     def init_idx_slot_mapping():
         mapping = torch.full((T,), -1, dtype=torch.int64)
-        for t in range(T):
+        for t in range(num_tokens):
             pos = start_pos + t
             if (pos + 1) % COMPRESS_RATIO == 0:
                 dst_row = idx_row((pos + 1) // COMPRESS_RATIO - 1)
@@ -683,7 +1073,7 @@ def build_tensor_specs(start_pos: int = START_POS):
         return mapping
     def init_inner_state_slot_mapping():
         mapping = torch.full((T,), -1, dtype=torch.int64)
-        for t in range(T):
+        for t in range(num_tokens):
             mapping[t] = state_row(start_pos + t)
         return mapping
 
@@ -703,7 +1093,7 @@ def build_tensor_specs(start_pos: int = START_POS):
         TensorSpec("idx_kv_scale", [PREFILL_IDX_BLOCK_NUM, BLOCK_SIZE, 1, 1], torch.float32, init_value=init_idx_kv_scale, is_output=True),
         TensorSpec("idx_block_table", [IDX_CACHE_MAX_BLOCKS], torch.int32, init_value=init_idx_block_table),
         TensorSpec("position_ids", [T], torch.int32, init_value=init_position_ids),
-        ScalarSpec("num_tokens", torch.int32, T),
+        ScalarSpec("num_tokens", torch.int32, num_tokens),
         TensorSpec("idx_slot_mapping", [T], torch.int64, init_value=init_idx_slot_mapping),
         TensorSpec("inner_state_slot_mapping", [T], torch.int64, init_value=init_inner_state_slot_mapping),
     ]
@@ -711,7 +1101,7 @@ def build_tensor_specs(start_pos: int = START_POS):
 
 if __name__ == "__main__":
     import argparse
-    from golden import ratio_allclose, run_jit
+    from golden import run_jit
 
     parser = argparse.ArgumentParser(description="Standalone token-major DeepSeek V4 prefill indexer compressor validation.")
     parser.add_argument("-p", "--platform", type=str, default="a2a3",
@@ -725,24 +1115,31 @@ if __name__ == "__main__":
     )
     parser.add_argument("--start-pos", type=int, default=START_POS,
                         help="Fixture-only absolute position for token 0; lowered into position_ids and dense idx_slot_mapping.")
+    parser.add_argument("--num-tokens", type=int, default=T,
+                        help="Active token prefix; inactive slot mappings remain -1.")
     parser.add_argument("--enable-l2-swimlane", action="store_true", default=False)
     parser.add_argument("--dump-passes", action="store_true", default=False)
     args = parser.parse_args()
 
     result = run_jit(
         fn=prefill_indexer_compressor_test,
-        specs=build_tensor_specs(args.start_pos),
+        specs=build_tensor_specs(args.start_pos, args.num_tokens),
         golden_fn=golden_prefill_indexer_compressor,
         compile_cfg=dict(dump_passes=args.dump_passes),
         runtime_cfg=dict(platform=args.platform, device_id=args.device, enable_l2_swimlane=args.enable_l2_swimlane),
         compile_only=args.compile_only,
         compare_fn={
             # C8: raw INT8 compressed rows (+/-1 LSB on the boundary rows the compressor rewrote).
-            "kv": ratio_allclose(atol=1, rtol=0, max_error_ratio=0.01),
-            "compress_state": ratio_allclose(atol=1e-3, rtol=1e-3, max_error_ratio=0.0),
-            # C8 cache: INT8 rows exact bar the <=B boundary rows the compressor rewrote (+/-1 LSB).
-            "idx_kv_cache": ratio_allclose(atol=1, rtol=0, max_error_ratio=0.01),
-            "idx_kv_scale": ratio_allclose(atol=1e-4, rtol=1.0 / 128, max_error_ratio=0.01),
+            "kv": active_compressed_rows_ratio_allclose(
+                num_tokens=args.num_tokens, atol=1, rtol=0, max_error_ratio=0.01),
+            "compress_state": mapped_inner_state_ratio_allclose(
+                num_tokens=args.num_tokens, atol=1e-3, rtol=1e-3, max_error_ratio=0.0),
+            # Apply the ratio budget only to rows written by the active mapping;
+            # every historical/unallocated row must remain bitwise exact.
+            "idx_kv_cache": mapped_idx_cache_ratio_allclose(
+                num_tokens=args.num_tokens, atol=1, rtol=0, max_error_ratio=0.01),
+            "idx_kv_scale": mapped_idx_cache_ratio_allclose(
+                num_tokens=args.num_tokens, atol=1e-4, rtol=1.0 / 128, max_error_ratio=0.01),
         },
     )
     if not result.passed:

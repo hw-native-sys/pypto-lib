@@ -41,6 +41,10 @@ from prefill_sparse_attn import (
 )
 
 
+# Dynamic original-KV physical-pool dimension shared by the packed prefill ABI.
+BLOCK_NUM_DYN = pl.dynamic("PREFILL_ORI_BLOCK_NUM_DYN")
+
+
 # model config
 B = PREFILL_BATCH
 S = PREFILL_SEQ
@@ -133,7 +137,7 @@ def prefill_attention_swa(
     gamma_ckv: pl.Tensor[[HEAD_DIM], pl.BF16],
     freqs_cos: pl.Tensor[[MAX_SEQ_LEN, ROPE_HEAD_DIM], pl.BF16],
     freqs_sin: pl.Tensor[[MAX_SEQ_LEN, ROPE_HEAD_DIM], pl.BF16],
-    kv_cache: pl.InOut[pl.Tensor[[BLOCK_NUM, BLOCK_SIZE, 1, HEAD_DIM], pl.BF16]],
+    kv_cache: pl.InOut[pl.Tensor[[BLOCK_NUM_DYN, BLOCK_SIZE, 1, HEAD_DIM], pl.BF16]],
     block_table: pl.Tensor[[BLOCK_NUM], pl.INT32],
     ori_slot_mapping: pl.Tensor[[T], pl.INT64],
     position_ids: pl.Tensor[[T], pl.INT32],
@@ -178,7 +182,9 @@ def prefill_attention_swa(
         q, kv, qr, qr_scale, late_dep,
     )
 
-    kv_cache_flat = pl.reshape(kv_cache, [BLOCK_NUM * BLOCK_SIZE, HEAD_DIM])
+    block_num = pl.tensor.dim(kv_cache, 0)
+    cache_rows = block_num * BLOCK_SIZE
+    kv_cache_flat = pl.reshape(kv_cache, [cache_rows, HEAD_DIM])
     with pl.at(level=pl.Level.CORE_GROUP, name_hint="prefill_swa_cache_write"):
         for write_t in pl.range(T):
             if write_t < num_tokens:
@@ -244,7 +250,7 @@ def prefill_attention_swa_test(
     gamma_ckv: pl.Tensor[[HEAD_DIM], pl.BF16],
     freqs_cos: pl.Tensor[[MAX_SEQ_LEN, ROPE_HEAD_DIM], pl.BF16],
     freqs_sin: pl.Tensor[[MAX_SEQ_LEN, ROPE_HEAD_DIM], pl.BF16],
-    kv_cache: pl.InOut[pl.Tensor[[BLOCK_NUM, BLOCK_SIZE, 1, HEAD_DIM], pl.BF16]],
+    kv_cache: pl.InOut[pl.Tensor[[BLOCK_NUM_DYN, BLOCK_SIZE, 1, HEAD_DIM], pl.BF16]],
     block_table: pl.Tensor[[BLOCK_NUM], pl.INT32],
     ori_slot_mapping: pl.Tensor[[T], pl.INT64],
     position_ids: pl.Tensor[[T], pl.INT32],
@@ -327,7 +333,7 @@ def golden_prefill_attention_swa(tensors):
     })
 
     kv_cache_in = tensors["kv_cache"].clone()
-    kv_cache_flat = kv_cache_in.view(BLOCK_NUM * BLOCK_SIZE, HEAD_DIM)
+    kv_cache_flat = kv_cache_in.view(kv_cache_in.shape[0] * BLOCK_SIZE, HEAD_DIM)
     for t in range(num_tokens):
         dst_row = int(tensors["ori_slot_mapping"][t].item())
         if dst_row >= 0:
@@ -385,6 +391,144 @@ def golden_prefill_attention_swa(tensors):
         "num_tokens": tensors["num_tokens"],
     })
     tensors["x_out"][:] = y
+
+
+def _mapped_pool_ratio_allclose(
+    mapping_name,
+    *,
+    num_tokens,
+    atol,
+    rtol,
+    max_error_ratio,
+):
+    """Compare active mapped rows and require the rest of a physical pool to stay exact."""
+    import torch
+
+    from golden import ratio_allclose
+
+    if num_tokens < 0:
+        raise ValueError(f"num_tokens must be non-negative, got {num_tokens}")
+    mapped_compare = ratio_allclose(
+        atol=atol,
+        rtol=rtol,
+        max_error_ratio=max_error_ratio,
+    )
+
+    def compare(actual, expected, **kwargs):
+        if actual.shape != expected.shape:
+            return False, (
+                f"    pool shape mismatch: actual={tuple(actual.shape)} "
+                f"expected={tuple(expected.shape)}"
+            )
+        if actual.ndim < 2:
+            return False, f"    mapped pool must have rank >= 2, got {tuple(actual.shape)}"
+
+        inputs = kwargs.get("inputs", {})
+        mapping = inputs.get(mapping_name)
+        if mapping is None:
+            return False, f"    compare_fn misconfigured: missing input '{mapping_name}'"
+        if mapping.dtype not in (
+            torch.int8,
+            torch.int16,
+            torch.int32,
+            torch.int64,
+            torch.uint8,
+        ):
+            return False, (
+                f"    '{mapping_name}' must have an integer dtype, got {mapping.dtype}"
+            )
+        mapping = mapping.cpu().to(torch.int64)
+        if mapping.ndim != 1:
+            return False, f"    '{mapping_name}' must be 1-D, got {tuple(mapping.shape)}"
+        if num_tokens > mapping.numel():
+            return False, (
+                f"    num_tokens={num_tokens} exceeds '{mapping_name}' length "
+                f"{mapping.numel()}"
+            )
+
+        actual_rows = actual.cpu().reshape(-1, actual.shape[-1])
+        expected_rows = expected.cpu().reshape(-1, expected.shape[-1])
+        row_count = actual_rows.shape[0]
+        for label, rows in (("actual", actual_rows), ("expected", expected_rows)):
+            if torch.is_floating_point(rows):
+                nonfinite = ~torch.isfinite(rows)
+                if nonfinite.any().item():
+                    return False, (
+                        f"    {label} pool contains "
+                        f"{int(nonfinite.count_nonzero().item())} non-finite value(s)"
+                    )
+
+        invalid_negative = mapping < -1
+        if invalid_negative.any().item():
+            token = int(invalid_negative.nonzero(as_tuple=False)[0, 0].item())
+            return False, (
+                f"    '{mapping_name}'[{token}]={int(mapping[token].item())} is invalid; "
+                "only -1 is a negative sentinel"
+            )
+        inactive_non_sentinel = mapping[num_tokens:] != -1
+        if inactive_non_sentinel.any().item():
+            tail_offset = int(
+                inactive_non_sentinel.nonzero(as_tuple=False)[0, 0].item()
+            )
+            token = num_tokens + tail_offset
+            return False, (
+                f"    inactive '{mapping_name}'[{token}]={int(mapping[token].item())}; "
+                "inactive entries must be -1"
+            )
+
+        active_mapping = mapping[:num_tokens]
+        valid = active_mapping >= 0
+        out_of_range = valid & (active_mapping >= row_count)
+        if out_of_range.any().item():
+            token = int(out_of_range.nonzero(as_tuple=False)[0, 0].item())
+            return False, (
+                f"    '{mapping_name}'[{token}]={int(active_mapping[token].item())} "
+                f"is outside physical row range [0, {row_count})"
+            )
+
+        valid_rows = active_mapping[valid]
+        if valid_rows.numel() > 1:
+            unique_rows, counts = torch.unique(valid_rows, return_counts=True)
+            duplicate = counts > 1
+            if duplicate.any().item():
+                row = int(unique_rows[duplicate][0].item())
+                tokens = (active_mapping == row).nonzero(as_tuple=False).flatten().tolist()
+                return False, (
+                    f"    '{mapping_name}' maps multiple active tokens {tokens} "
+                    f"to physical row {row}"
+                )
+
+        mapped_rows = torch.zeros(row_count, dtype=torch.bool)
+        if valid_rows.numel() > 0:
+            mapped_rows[valid_rows] = True
+        equal_rows = (actual_rows == expected_rows).all(dim=-1)
+        stray_rows = ~mapped_rows & ~equal_rows
+        if stray_rows.any().item():
+            row = int(stray_rows.nonzero(as_tuple=False)[0, 0].item())
+            changed_values = int(
+                (actual_rows[row] != expected_rows[row]).count_nonzero().item()
+            )
+            return False, (
+                f"    unmapped physical row {row} changed "
+                f"({changed_values} value(s)); mapping='{mapping_name}'"
+            )
+        if not mapped_rows.any().item():
+            return True, ""
+
+        ok, detail = mapped_compare(
+            actual_rows[mapped_rows],
+            expected_rows[mapped_rows],
+            **kwargs,
+        )
+        if ok:
+            return True, ""
+        return False, f"    mapped rows from '{mapping_name}':\n{detail}"
+
+    compare.__name__ = (
+        f"mapped_pool_ratio_allclose(mapping={mapping_name}, num_tokens={num_tokens}, "
+        f"atol={atol}, rtol={rtol}, max_error_ratio={max_error_ratio})"
+    )
+    return compare
 
 
 def build_tensor_specs(
@@ -530,7 +674,7 @@ def build_tensor_specs(
 
 if __name__ == "__main__":
     import argparse
-    from golden import ratio_allclose, ratio_reldiff, run_jit
+    from golden import ratio_reldiff, run_jit
 
     parser = argparse.ArgumentParser(description="Standalone DeepSeek V4 packed prefill SWA correctness test.")
     parser.add_argument("-p", "--platform", type=str, default="a2a3",
@@ -567,7 +711,13 @@ if __name__ == "__main__":
         compare_fn={
             "x_out": ratio_reldiff(diff_thd=3e-3, pct_thd=0.005, max_diff_hd=1,
                                    valid_rows=compare_tokens, zero_tail=True),
-            "kv_cache": ratio_allclose(atol=1e-4, rtol=1e-2),
+            "kv_cache": _mapped_pool_ratio_allclose(
+                "ori_slot_mapping",
+                num_tokens=compare_tokens,
+                atol=1e-4,
+                rtol=1e-2,
+                max_error_ratio=0.005,
+            ),
         },
     )
     if not result.passed:

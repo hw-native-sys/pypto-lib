@@ -66,6 +66,7 @@ from moe import (
     RECV_MAX,
     TOPK as MOE_TOPK,
     VOCAB as MOE_VOCAB,
+    _token_partition_ratio_reldiff,
     build_tensor_specs as build_moe_tensor_specs,
     golden_moe,
     moe,
@@ -147,7 +148,7 @@ def mtp_decode_layer(
     arrived: pld.DistributedTensor[[N_RANKS, 1], pl.INT32],
     data_arrived: pld.DistributedTensor[[N_RANKS, 1], pl.INT32],
     routed_y_buf: pld.DistributedTensor[[N_ROUTES, D], pl.BF16],
-    combine_arrived: pld.DistributedTensor[[N_RANKS, 1], pl.INT32],
+    combine_arrived: pl.InOut[pld.DistributedTensor[[N_RANKS, 1], pl.INT32]],
     my_rank: pl.Scalar[pl.INT32],
     num_tokens: pl.Scalar[pl.INT32],
 ) -> pl.Tensor[[T, HC_MULT, D], pl.BF16]:
@@ -623,8 +624,115 @@ def golden_mtp_decode_layer(tensors):
         tensors["hidden_out"][rank] = golden_rms_norm(x_head, tensors["mtp_norm_w"][rank])
 
 
+def _mapped_pool_ratio_reldiff(
+    mapping_name,
+    *,
+    diff_thd,
+    pct_thd,
+):
+    """Apply a relative-diff budget only to allocator-mapped cache rows."""
+    import torch
+
+    from golden import ratio_reldiff
+
+    mapped_compare = ratio_reldiff(diff_thd=diff_thd, pct_thd=pct_thd)
+
+    def compare(actual, expected, **kwargs):
+        if actual.shape != expected.shape:
+            return False, (
+                f"    pool shape mismatch: actual={tuple(actual.shape)} "
+                f"expected={tuple(expected.shape)}"
+            )
+        if actual.ndim < 3:
+            return False, f"    mapped pool must have rank >= 3, got {tuple(actual.shape)}"
+
+        rank_count = actual.shape[0]
+        actual_rows = actual.cpu().reshape(rank_count, -1, actual.shape[-1])
+        expected_rows = expected.cpu().reshape(rank_count, -1, expected.shape[-1])
+        row_count = actual_rows.shape[1]
+        for label, rows in (("actual", actual_rows), ("expected", expected_rows)):
+            if torch.is_floating_point(rows):
+                nonfinite = ~torch.isfinite(rows)
+                if nonfinite.any().item():
+                    return False, (
+                        f"    {label} pool contains "
+                        f"{int(nonfinite.count_nonzero().item())} non-finite value(s)"
+                    )
+
+        mapping = kwargs.get("inputs", {}).get(mapping_name)
+        if mapping is None:
+            return False, f"    compare_fn misconfigured: missing input '{mapping_name}'"
+        mapping = mapping.cpu().to(torch.int64)
+        if mapping.ndim != 2 or mapping.shape[0] != rank_count:
+            return False, (
+                f"    '{mapping_name}' shape {tuple(mapping.shape)} does not match "
+                f"ranked pool shape {tuple(actual.shape)}"
+            )
+
+        invalid_negative = mapping < -1
+        if invalid_negative.any().item():
+            first = invalid_negative.nonzero(as_tuple=False)[0]
+            rank, token = (int(first[0].item()), int(first[1].item()))
+            return False, (
+                f"    '{mapping_name}'[{rank}, {token}]="
+                f"{int(mapping[rank, token].item())} is invalid; "
+                "only -1 is a negative sentinel"
+            )
+        valid = mapping >= 0
+        out_of_range = valid & (mapping >= row_count)
+        if out_of_range.any().item():
+            first = out_of_range.nonzero(as_tuple=False)[0]
+            rank, token = (int(first[0].item()), int(first[1].item()))
+            return False, (
+                f"    '{mapping_name}'[{rank}, {token}]="
+                f"{int(mapping[rank, token].item())} is outside "
+                f"physical row range [0, {row_count})"
+            )
+
+        written_rows = torch.zeros((rank_count, row_count), dtype=torch.bool)
+        for rank in range(rank_count):
+            rank_mapping = mapping[rank, valid[rank]]
+            if rank_mapping.numel() != torch.unique(rank_mapping).numel():
+                return False, f"    '{mapping_name}' contains duplicate rows on rank {rank}"
+            written_rows[rank, rank_mapping] = True
+
+        equal_rows = (actual_rows == expected_rows).all(dim=-1)
+        stray_rows = ~written_rows & ~equal_rows
+        if stray_rows.any().item():
+            first = stray_rows.nonzero(as_tuple=False)[0]
+            rank, row = (int(first[0].item()), int(first[1].item()))
+            changed = int(
+                (actual_rows[rank, row] != expected_rows[rank, row])
+                .count_nonzero()
+                .item()
+            )
+            return False, (
+                f"    unmapped physical row changed: rank={rank} row={row} "
+                f"changed_values={changed} mapping='{mapping_name}'"
+            )
+
+        if not written_rows.any().item():
+            return True, ""
+        ok, detail = mapped_compare(
+            actual_rows[written_rows],
+            expected_rows[written_rows],
+            **kwargs,
+        )
+        if ok:
+            return True, ""
+        return False, f"    mapped rows from '{mapping_name}':\n{detail}"
+
+    compare.__name__ = (
+        f"mapped_pool_ratio_reldiff(mapping={mapping_name}, "
+        f"diff_thd={diff_thd}, pct_thd={pct_thd})"
+    )
+    return compare
+
+
 def main():
-    from golden import ratio_reldiff, run_jit
+    import torch
+
+    from golden import run_jit
 
     parser = argparse.ArgumentParser(description="DeepSeek-V4 MTP decode layer driver.")
     parser.add_argument("-p", "--platform", type=str, default="a2a3",
@@ -638,8 +746,12 @@ def main():
     parser.add_argument("--enable-l2-swimlane", type=int, nargs="?", const=1, default=0, choices=(0, 1, 2))
     parser.add_argument("--compile-only", action="store_true", default=False)
     parser.add_argument("--runtime-dir", type=str, default=None)
+    parser.add_argument("--seed", type=int, default=0,
+                        help="RNG seed for reproducible inputs and golden")
     parser.add_argument("--dump-passes", action="store_true", default=False)
     args = parser.parse_args()
+
+    torch.manual_seed(args.seed)
 
     device_ids = [int(d) for d in args.device.split(",")]
     assert len(device_ids) >= N_RANKS, f"need at least {N_RANKS} devices, got {device_ids}"
@@ -661,9 +773,28 @@ def main():
         rtol=1e-3,
         atol=1e-3,
         compare_fn={
-            "hidden_out": ratio_reldiff(diff_thd=0.02, pct_thd=0.10),
-            "next_pre_hc_hidden": ratio_reldiff(diff_thd=0.02, pct_thd=0.05),
-            "kv_cache": ratio_reldiff(diff_thd=0.01, pct_thd=0.05),
+            "hidden_out": _token_partition_ratio_reldiff(
+                args.num_tokens,
+                diff_thd=0.02,
+                pct_thd=0.10,
+                max_abs_diff=float("inf"),
+            ),
+            # This FP32 state follows the composed BF16 attention and MoE path.
+            # Seeded EP2 measurements place 3.88-4.95% of points above 2%
+            # relative difference, with rel-L2 near 1% and max absolute error
+            # below 0.17. Keep the per-point threshold, add modest distribution
+            # margin and a meaningful absolute guard for near-zero crossings.
+            "next_pre_hc_hidden": _token_partition_ratio_reldiff(
+                args.num_tokens,
+                diff_thd=0.02,
+                pct_thd=0.06,
+                max_abs_diff=0.25,
+            ),
+            "kv_cache": _mapped_pool_ratio_reldiff(
+                "swa_slot_mapping",
+                diff_thd=0.01,
+                pct_thd=0.05,
+            ),
         },
     )
     if not result.passed:

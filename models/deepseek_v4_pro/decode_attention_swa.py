@@ -17,6 +17,8 @@ Companion files: attention_csa_draft.py (ratio=4)
 
 import pypto.language as pl
 
+from golden import mapped_pool_ratio_allclose
+
 from config import (
     PRO_KERNEL as M,
     DECODE_BATCH,
@@ -207,7 +209,7 @@ def attention_swa_test(
         wo_a, wo_b, wo_b_scale,
         x_out,
     )
-    return x_out
+    return kv_cache, x_out
 
 
 def golden_attention_swa(tensors):
@@ -462,7 +464,7 @@ def build_tensor_specs(start_pos=None):
 
 if __name__ == "__main__":
     import argparse
-    from golden import ratio_allclose, ratio_reldiff, run_jit
+    from golden import ratio_reldiff, run_jit
 
     parser = argparse.ArgumentParser()
     parser.add_argument("-p", "--platform", type=str, default="a2a3",
@@ -495,7 +497,15 @@ if __name__ == "__main__":
             # Tightened from CANN's 1e-2 bar: realistic hc_attn gates keep x_out
             # well-conditioned (0% over 3e-3 across seeds; worst rdiff ~0.16).
             "x_out": ratio_reldiff(diff_thd=3e-3, pct_thd=0.008, max_diff_hd=1),
-            "kv_cache": ratio_allclose(atol=1e-4, rtol=1.0 / 128),
+            "kv_cache": mapped_pool_ratio_allclose(
+                "swa_slot_mapping",
+                mapping_shape=(T,),
+                block_size=BLOCK_SIZE,
+                pool_name="KV cache",
+                atol=1e-4,
+                rtol=1.0 / 128,
+                max_error_ratio=0.005,
+            ),
         },
     )
     if not result.passed:

@@ -18,7 +18,8 @@ rows back into the packed output.
 
 Coordinate system (shared by JIT and golden, see issue #591):
   * packed token buffers : global packed row (``chunk_offsets[r] + tile_id*T + t``)
-  * cache/state/tables   : request-local (each request owns a contiguous slice)
+  * cache/state pools    : global physical rows allocated through request metadata
+  * block tables         : request-local views containing global physical block ids
   * sparse-index overlay : tile-local (``WIN + t`` for the current tile's tokens)
   * position_ids         : absolute position (``chunk_start + tile_id*T + t``)
 
@@ -28,6 +29,8 @@ num_tokens=valid)`` builders, which already encode the absolute-position ring /
 overlay / compressed / state formulas for a single ``[T]`` tile. The kernel just
 gathers the precomputed packed metadata per tile.
 """
+
+import itertools
 
 import pypto.language as pl
 import pypto.language.distributed as pld
@@ -122,9 +125,9 @@ PREFILL_CHUNK_TOKENS = T
 DEFAULT_CHUNK_LENS = (T, T + T // 2)
 DEFAULT_USER_BATCH = len(DEFAULT_CHUNK_LENS)
 
-# Per-request contiguous block/state counts (each request owns one such slice; the
-# packed buffer dim0 is ``user_batch * <count>``). The cache/state block tables are
-# request-local so the children see block ids starting at 0 inside their slice.
+# Standalone fixture capacities used to size the self-contained global pools.
+# Cache/state tensors keep the production global-pool ABI; request-local block
+# tables carry allocator-assigned physical ids into those pools.
 ORI_CACHE_BLOCKS = CSA_ORI_BLOCK_NUM
 CMP_CACHE_BLOCKS = CSA_CMP_BLOCK_NUM
 IDX_CACHE_BLOCKS = PREFILL_IDX_BLOCK_NUM
@@ -157,22 +160,23 @@ assert all(r == (4 if (i - FIRST_CSA_LAYER) % 2 == 0 else 128)
            for i, r in enumerate(_MAIN_RATIOS) if i >= FIRST_CSA_LAYER), \
     "compress_ratios must alternate CSA(4)/HCA(128) from FIRST_CSA_LAYER onwards"
 
-# Dynamic (batch-dependent) kernel-signature dims. Kept local to this file so
-# config.py and the fixed-T child kernels stay untouched (issue #591 §1).
+# Dynamic (batch-dependent) kernel-signature dims. Global-pool symbols use the
+# same names as the fixed-T children so a packed allocator capacity propagates
+# through every inlined cache/state consumer (issue #591 §1).
 USER_BATCH_DYN = pl.dynamic("DEEPSEEK_PREFILL_USER_BATCH_DYN")
 PREFILL_TOKENS_DYN = pl.dynamic("DEEPSEEK_PREFILL_TOKENS_DYN")
 
-PREFILL_ORI_CACHE_BLOCKS_DYN = pl.dynamic("DEEPSEEK_PREFILL_ORI_CACHE_BLOCKS_DYN")
-PREFILL_CMP_CACHE_BLOCKS_DYN = pl.dynamic("DEEPSEEK_PREFILL_CMP_CACHE_BLOCKS_DYN")
-PREFILL_IDX_CACHE_BLOCKS_DYN = pl.dynamic("DEEPSEEK_PREFILL_IDX_CACHE_BLOCKS_DYN")
+PREFILL_ORI_CACHE_BLOCKS_DYN = pl.dynamic("PREFILL_ORI_BLOCK_NUM_DYN")
+PREFILL_CMP_CACHE_BLOCKS_DYN = pl.dynamic("PREFILL_CMP_BLOCK_NUM_DYN")
+PREFILL_IDX_CACHE_BLOCKS_DYN = pl.dynamic("PREFILL_IDX_BLOCK_NUM_DYN")
 
 PREFILL_ORI_BLOCK_TABLE_DYN = pl.dynamic("DEEPSEEK_PREFILL_ORI_BLOCK_TABLE_DYN")
 PREFILL_CMP_BLOCK_TABLE_DYN = pl.dynamic("DEEPSEEK_PREFILL_CMP_BLOCK_TABLE_DYN")
 PREFILL_IDX_BLOCK_TABLE_DYN = pl.dynamic("DEEPSEEK_PREFILL_IDX_BLOCK_TABLE_DYN")
 
-PREFILL_HCA_STATE_BLOCKS_DYN = pl.dynamic("DEEPSEEK_PREFILL_HCA_STATE_BLOCKS_DYN")
-PREFILL_CSA_STATE_BLOCKS_DYN = pl.dynamic("DEEPSEEK_PREFILL_CSA_STATE_BLOCKS_DYN")
-PREFILL_INNER_STATE_BLOCKS_DYN = pl.dynamic("DEEPSEEK_PREFILL_INNER_STATE_BLOCKS_DYN")
+PREFILL_HCA_STATE_BLOCKS_DYN = pl.dynamic("PREFILL_HCA_STATE_BLOCK_NUM_DYN")
+PREFILL_CSA_STATE_BLOCKS_DYN = pl.dynamic("PREFILL_CSA_STATE_BLOCK_NUM_DYN")
+PREFILL_INNER_STATE_BLOCKS_DYN = pl.dynamic("PREFILL_INNER_STATE_BLOCK_NUM_DYN")
 PREFILL_HCA_STATE_TABLE_DYN = pl.dynamic("DEEPSEEK_PREFILL_HCA_STATE_TABLE_DYN")
 PREFILL_CSA_STATE_TABLE_DYN = pl.dynamic("DEEPSEEK_PREFILL_CSA_STATE_TABLE_DYN")
 PREFILL_INNER_STATE_TABLE_DYN = pl.dynamic("DEEPSEEK_PREFILL_INNER_STATE_TABLE_DYN")
@@ -273,7 +277,7 @@ def prefill_layer_core(
     arrived: pld.DistributedTensor[[N_RANKS, 1], pl.INT32],
     data_arrived: pld.DistributedTensor[[N_RANKS, 1], pl.INT32],
     routed_y_buf: pld.DistributedTensor[[N_ROUTES, D], pl.BF16],
-    combine_arrived: pld.DistributedTensor[[N_RANKS, 1], pl.INT32],
+    combine_arrived: pl.InOut[pld.DistributedTensor[[N_RANKS, 1], pl.INT32]],
     layer_id: pl.Scalar[pl.INT32],
     my_rank: pl.Scalar[pl.INT32],
 ) -> pl.Tensor[[PREFILL_TOKENS_DYN, HC_MULT, D], pl.FP32]:
@@ -699,9 +703,21 @@ _PACKED_CACHE_SPECS = {
     "csa_inner_compress_state_block_table": ("csa", "inner_compress_state_block_table"),
 }
 
-_HISTORY_CACHE_NAMES = {
+_GLOBAL_POOL_NAMES = {
     "kv_cache", "cmp_kv", "idx_kv_cache", "idx_kv_scale",
     "hca_compress_state", "csa_compress_state", "csa_inner_compress_state",
+}
+
+# Standalone builders allocate one fixed-capacity physical pool. The packed
+# fixture concatenates those capacities into one allocator-owned global pool;
+# every request's table and direct slot mapping is rebased into its own range.
+_GLOBAL_TABLE_BLOCK_STRIDES = {
+    "ori_block_table": ORI_CACHE_BLOCKS,
+    "cmp_block_table": CMP_CACHE_BLOCKS,
+    "idx_block_table": IDX_CACHE_BLOCKS,
+    "hca_compress_state_block_table": HCA_STATE_BLOCK_NUM,
+    "csa_compress_state_block_table": CSA_STATE_BLOCK_NUM,
+    "csa_inner_compress_state_block_table": INNER_STATE_BLOCK_NUM,
 }
 
 
@@ -780,7 +796,7 @@ assert all(_kernel_attention_kind(i) == _attention_kind_for_layer(i)
     "prefill_layer_core dispatch disagrees with MODEL_CONFIG.compress_ratios"
 
 
-def _tile_token_meta(kind, context_len, valid_tok, torch):
+def _tile_token_meta(kind, context_len, valid_tok, torch, request_specs=None):
     """Child-local [T] token metadata for one tile, via the fixed-T child builder.
 
     Reuses the existing single-tile builders, which already encode the
@@ -789,8 +805,14 @@ def _tile_token_meta(kind, context_len, valid_tok, torch):
     """
     from golden import TensorSpec
 
-    specs = {s.name: s for s in _KIND_BUILDER[kind](start_pos=context_len, num_tokens=valid_tok)
-             if isinstance(s, TensorSpec)}
+    if request_specs is None:
+        specs = {
+            s.name: s
+            for s in _KIND_BUILDER[kind](start_pos=context_len, num_tokens=valid_tok)
+            if isinstance(s, TensorSpec)
+        }
+    else:
+        specs = request_specs(kind, context_len, valid_tok)
     meta = {name: _spec_value(specs[name], torch) for name in specs if name in _TOKEN_META_NAMES}
     return meta
 
@@ -809,7 +831,43 @@ def _iter_request_tiles(seq_lens_v, chunk_lens_v, chunk_offsets_v):
             yield r, tile_id, chunk_start + p0, valid, base + p0
 
 
-def _packed_token_metadata(kind, seq_lens_v, chunk_lens_v, chunk_offsets_v, total_tokens, torch):
+def _check_allocator_range(name, values, lower, upper):
+    """Reject invalid sentinels or physical ids outside one request's allocation."""
+    invalid_negative = values < -1
+    if bool(invalid_negative.any()):
+        bad = int(values[invalid_negative].min())
+        raise ValueError(f"{name} contains invalid negative physical id {bad}; only -1 is a sentinel")
+    valid = values >= 0
+    if not bool(valid.any()):
+        return
+    valid_values = values[valid]
+    actual_min = int(valid_values.min())
+    actual_max = int(valid_values.max())
+    if actual_min < lower or actual_max >= upper:
+        raise ValueError(
+            f"{name} physical ids [{actual_min}, {actual_max}] escape "
+            f"request allocation [{lower}, {upper})"
+        )
+
+
+def _rebase_nonnegative(values, offset, *, extent, name):
+    """Clone and shift valid physical ids into one request allocation."""
+    rebased = values.clone()
+    valid = rebased >= 0
+    rebased[valid] += offset
+    _check_allocator_range(name, rebased, offset, offset + extent)
+    return rebased
+
+
+def _packed_token_metadata(
+    kind,
+    seq_lens_v,
+    chunk_lens_v,
+    chunk_offsets_v,
+    total_tokens,
+    torch,
+    request_specs=None,
+):
     """Assemble rank-shared padded-physical [total_tokens, ...] metadata tensors."""
     pos = torch.zeros(total_tokens, dtype=torch.int32)
     ori_slot = torch.full((total_tokens,), -1, dtype=torch.int64)
@@ -820,18 +878,55 @@ def _packed_token_metadata(kind, seq_lens_v, chunk_lens_v, chunk_offsets_v, tota
     csa_state = torch.full((total_tokens,), -1, dtype=torch.int64)
     csa_inner = torch.full((total_tokens,), -1, dtype=torch.int64)
 
-    for _r, _tid, ctx, valid, base in _iter_request_tiles(seq_lens_v, chunk_lens_v, chunk_offsets_v):
-        m = _tile_token_meta(kind, ctx, valid, torch)
+    for request_id, _tid, ctx, valid, base in _iter_request_tiles(
+        seq_lens_v, chunk_lens_v, chunk_offsets_v
+    ):
+        m = _tile_token_meta(kind, ctx, valid, torch, request_specs=request_specs)
         pos[base:base + T] = m["position_ids"][:T]
-        ori_slot[base:base + T] = m["ori_slot_mapping"][:T]
+        ori_slot[base:base + T] = _rebase_nonnegative(
+            m["ori_slot_mapping"][:T],
+            request_id * ORI_CACHE_BLOCKS * BLOCK_SIZE,
+            extent=ORI_CACHE_BLOCKS * BLOCK_SIZE,
+            name=f"request {request_id} ori_slot_mapping",
+        )
         if kind == "hca":
-            hca_cmp[base:base + T] = m["cmp_slot_mapping"][:T]
-            hca_state[base:base + T] = m["state_slot_mapping"][:T]
+            hca_cmp[base:base + T] = _rebase_nonnegative(
+                m["cmp_slot_mapping"][:T],
+                request_id * CMP_CACHE_BLOCKS * BLOCK_SIZE,
+                extent=CMP_CACHE_BLOCKS * BLOCK_SIZE,
+                name=f"request {request_id} hca_cmp_slot_mapping",
+            )
+            hca_state[base:base + T] = _rebase_nonnegative(
+                m["state_slot_mapping"][:T],
+                request_id * HCA_STATE_BLOCK_NUM * HCA_STATE_BLOCK_SIZE,
+                extent=HCA_STATE_BLOCK_NUM * HCA_STATE_BLOCK_SIZE,
+                name=f"request {request_id} hca_state_slot_mapping",
+            )
         elif kind == "csa":
-            csa_cmp[base:base + T] = m["cmp_slot_mapping"][:T]
-            csa_idx[base:base + T] = m["idx_slot_mapping"][:T]
-            csa_state[base:base + T] = m["state_slot_mapping"][:T]
-            csa_inner[base:base + T] = m["inner_state_slot_mapping"][:T]
+            csa_cmp[base:base + T] = _rebase_nonnegative(
+                m["cmp_slot_mapping"][:T],
+                request_id * CMP_CACHE_BLOCKS * BLOCK_SIZE,
+                extent=CMP_CACHE_BLOCKS * BLOCK_SIZE,
+                name=f"request {request_id} csa_cmp_slot_mapping",
+            )
+            csa_idx[base:base + T] = _rebase_nonnegative(
+                m["idx_slot_mapping"][:T],
+                request_id * IDX_CACHE_BLOCKS * BLOCK_SIZE,
+                extent=IDX_CACHE_BLOCKS * BLOCK_SIZE,
+                name=f"request {request_id} csa_idx_slot_mapping",
+            )
+            csa_state[base:base + T] = _rebase_nonnegative(
+                m["state_slot_mapping"][:T],
+                request_id * CSA_STATE_BLOCK_NUM * CSA_STATE_BLOCK_SIZE,
+                extent=CSA_STATE_BLOCK_NUM * CSA_STATE_BLOCK_SIZE,
+                name=f"request {request_id} csa_state_slot_mapping",
+            )
+            csa_inner[base:base + T] = _rebase_nonnegative(
+                m["inner_state_slot_mapping"][:T],
+                request_id * INNER_STATE_BLOCK_NUM * INNER_STATE_BLOCK_SIZE,
+                extent=INNER_STATE_BLOCK_NUM * INNER_STATE_BLOCK_SIZE,
+                name=f"request {request_id} csa_inner_state_slot_mapping",
+            )
 
     return {
         "position_ids": pos,
@@ -848,6 +943,8 @@ def _packed_token_metadata(kind, seq_lens_v, chunk_lens_v, chunk_offsets_v, tota
 def _resolve_batch(chunk_lens, start_positions, torch):
     """Normalize batch config into logical lengths and padded physical offsets."""
     chunk_lens_v = [int(c) for c in chunk_lens]
+    if not chunk_lens_v:
+        raise ValueError("chunk_lens must contain at least one request")
     for c in chunk_lens_v:
         if c <= 0:
             raise ValueError(f"chunk_lens must be positive, got {chunk_lens_v}")
@@ -859,7 +956,14 @@ def _resolve_batch(chunk_lens, start_positions, torch):
             f"start_positions length must match chunk_lens length, "
             f"got {len(start_positions)} and {len(chunk_lens_v)}"
         )
+    if any(s < 0 for s in start_positions):
+        raise ValueError(f"start_positions must be non-negative, got {start_positions}")
     seq_lens_v = [start_positions[i] + chunk_lens_v[i] for i in range(len(chunk_lens_v))]
+    if any(seq_len > MAX_SEQ_LEN for seq_len in seq_lens_v):
+        raise ValueError(
+            f"start_position + chunk_len must not exceed MAX_SEQ_LEN={MAX_SEQ_LEN}, "
+            f"got seq_lens={seq_lens_v}"
+        )
     tile_counts_v = [(c + T - 1) // T for c in chunk_lens_v]
     padded_lens_v = [tc * T for tc in tile_counts_v]
     chunk_offsets_v, acc = [], 0
@@ -867,10 +971,15 @@ def _resolve_batch(chunk_lens, start_positions, torch):
         chunk_offsets_v.append(acc)
         acc += c
     total_tokens = acc
+    int32_max = torch.iinfo(torch.int32).max
+    if total_tokens > int32_max:
+        raise ValueError(f"padded token count {total_tokens} exceeds INT32 capacity {int32_max}")
     tile_offsets_v, tacc = [], 0
     for tc in tile_counts_v:
         tile_offsets_v.append(tacc)
         tacc += tc
+    if tacc > int32_max:
+        raise ValueError(f"packed tile count {tacc} exceeds INT32 capacity {int32_max}")
     return (torch.tensor(seq_lens_v, dtype=torch.int32),
             torch.tensor(chunk_lens_v, dtype=torch.int32),
             torch.tensor(chunk_offsets_v, dtype=torch.int32),
@@ -884,10 +993,10 @@ def build_tensor_specs(layer_id=2, chunk_lens=DEFAULT_CHUNK_LENS, start_position
     ``chunk_lens`` lists the current-chunk length per request;
     the default covers ``DEFAULT_USER_BATCH`` requests with chunk lengths
     ``T`` and ``T + T//2``.
-    ``start_positions`` the prior context length per request (default 0 = fresh
-    prefill, no cache history). Token tensors are physically padded to whole
-    ``T`` tiles; cache/state/tables are ``user_batch``-concatenated
-    request-local slices.
+    ``start_positions`` is the prior context length per request (default 0 =
+    fresh prefill, no cache history). Token tensors are physically padded to
+    whole ``T`` tiles. Mutable cache/state storage is global; block tables are
+    concatenated request-local views containing global physical block ids.
     """
     import torch
     from golden import ScalarSpec, TensorSpec
@@ -899,12 +1008,28 @@ def build_tensor_specs(layer_id=2, chunk_lens=DEFAULT_CHUNK_LENS, start_position
     seq_lens_list = [int(v) for v in seq_lens_t]
     chunk_lens_list = [int(v) for v in chunk_lens_t]
 
-    def kind_specs(build_fn):
-        return {s.name: s for s in build_fn(start_pos=0, num_tokens=T) if isinstance(s, TensorSpec)}
+    # Reuse one child builder per request geometry. In particular, CSA's INT8
+    # index cache and FP32 scale specs close over one shared historical sample;
+    # rebuilding them independently produces a cache/scale pair from different
+    # random draws.
+    request_spec_cache = {}
 
-    swa = kind_specs(build_swa_attention_tensor_specs)
-    hca = kind_specs(build_hca_attention_tensor_specs)
-    csa = kind_specs(build_csa_attention_tensor_specs)
+    def request_specs(request_kind, context_len, valid_tokens=T):
+        key = (request_kind, int(context_len), int(valid_tokens))
+        if key not in request_spec_cache:
+            request_spec_cache[key] = {
+                s.name: s
+                for s in _KIND_BUILDER[request_kind](
+                    start_pos=int(context_len),
+                    num_tokens=int(valid_tokens),
+                )
+                if isinstance(s, TensorSpec)
+            }
+        return request_spec_cache[key]
+
+    swa = request_specs("swa", 0)
+    hca = request_specs("hca", 0)
+    csa = request_specs("csa", 0)
     active = {"swa": swa, "hca": hca, "csa": csa}[kind]
     src_by_kind = {"swa": swa, "hca": hca, "csa": csa}
 
@@ -960,20 +1085,25 @@ def build_tensor_specs(layer_id=2, chunk_lens=DEFAULT_CHUNK_LENS, start_position
 
     # Packed token tensors. Metadata is rank-shared; x_hc/input_ids carry per-rank data.
     meta = _packed_token_metadata(kind, seq_lens_list, chunk_lens_list,
-                                  [int(c) for c in chunk_offsets_t], total_tokens, torch)
+                                  [int(c) for c in chunk_offsets_t], total_tokens, torch,
+                                  request_specs=request_specs)
     chunk_offsets_list = [int(c) for c in chunk_offsets_t]
 
     def init_x_hc():
-        x = torch.zeros(N_RANKS, total_tokens, HC_MULT, D, dtype=torch.bfloat16)
-        for base, chunk_len in zip(chunk_offsets_list, chunk_lens_list):
-            x[:, base:base + chunk_len] = ((torch.rand(N_RANKS, chunk_len, HC_MULT, D) - 0.5) / 10.0).to(
-                torch.bfloat16)
+        x = torch.zeros(N_RANKS, total_tokens, HC_MULT, D, dtype=torch.float32)
+        for base, chunk_len in zip(chunk_offsets_list, chunk_lens_list, strict=True):
+            # Keep active rows at the same O(1) scale as the standalone
+            # attention fixtures. A tiny residual makes the expected MX
+            # quantization error dominate the layer-composition comparison.
+            x[:, base:base + chunk_len] = torch.empty(
+                N_RANKS, chunk_len, HC_MULT, D, dtype=torch.float32
+            ).uniform_(-1.0, 1.0)
         return x
 
     def init_input_ids():
         ids = torch.zeros(N_RANKS, total_tokens, dtype=torch.int64)
         for rank in range(N_RANKS):
-            for base, chunk_len in zip(chunk_offsets_list, chunk_lens_list):
+            for base, chunk_len in zip(chunk_offsets_list, chunk_lens_list, strict=True):
                 ids[rank, base:base + chunk_len] = (torch.arange(chunk_len, dtype=torch.int64) + base + rank) % VOCAB
         return ids.contiguous()
 
@@ -1001,86 +1131,45 @@ def build_tensor_specs(layer_id=2, chunk_lens=DEFAULT_CHUNK_LENS, start_position
             return csa[cn], kind, cn
         return active[cn], kind, cn  # kv_cache
 
-    # Fixed-capacity global cache/state pools plus request-local block tables.
-    # With start_positions=0 the mutable pools are zero (no history).
+    # Allocator-owned global cache/state pools plus request-local block tables.
+    # The standalone fixture capacity is repeated per request, and all physical
+    # ids are rebased into the corresponding segment of the one global tensor.
     for packed_name, info in _PACKED_CACHE_SPECS.items():
-        if isinstance(info, tuple) and len(info) == 3:
-            src_kind, kv_name, score_name = info
-            kv_src = src_by_kind[src_kind][kv_name]
-            score_src = src_by_kind[src_kind][score_name]
-
-            def make_merged_init(
-                src_kind=src_kind,
-                kv_name=kv_name,
-                score_name=score_name,
-                kv_src=kv_src,
-                score_src=score_src,
-            ):
-                def init():
-                    blocks = []
-                    for r in range(batch):
-                        cs = seq_lens_list[r] - chunk_lens_list[r]
-                        kv_spec, score_spec = kv_src, score_src
-                        if cs > 0:
-                            rspecs = {
-                                s.name: s
-                                for s in _KIND_BUILDER[src_kind](start_pos=cs, num_tokens=T)
-                                if isinstance(s, TensorSpec)
-                            }
-                            kv_spec = rspecs[kv_name]
-                            score_spec = rspecs[score_name]
-                        blocks.append(
-                            torch.cat(
-                                [_spec_value(kv_spec, torch), _spec_value(score_spec, torch)],
-                                dim=-1,
-                            )
-                        )
-                    # One fixed global pool, independent from user batch. The
-                    # fixture starts from the first request's seeded state;
-                    # request separation is provided by the block tables.
-                    pool = blocks[0].contiguous()
-                    return torch.stack([pool.clone() for _ in range(N_RANKS)], dim=0).contiguous()
-
-                return init
-
-            merged_dim = kv_src.shape[-1] + score_src.shape[-1]
-            tensor_specs.append(
-                TensorSpec(
-                    packed_name,
-                    [N_RANKS, kv_src.shape[0], *kv_src.shape[1:-1], merged_dim],
-                    kv_src.dtype,
-                    init_value=make_merged_init(),
-                    is_output=True,
-                )
-            )
-            continue
-
         src, src_kind, child_name = resolve_cache_src(packed_name, info)
         per_req = _spec_value(src, torch)
-        is_history = packed_name in _HISTORY_CACHE_NAMES
+        is_global_pool = packed_name in _GLOBAL_POOL_NAMES
 
-        def make_init(per_req=per_req, is_history=is_history, src_kind=src_kind, child_name=child_name):
+        def make_init(
+            packed_name=packed_name,
+            per_req=per_req,
+            is_global_pool=is_global_pool,
+            src_kind=src_kind,
+            child_name=child_name,
+        ):
             def init():
                 blocks = []
                 for r in range(batch):
                     cs = seq_lens_list[r] - chunk_lens_list[r]
-                    rspec = None
-                    if is_history and cs > 0:
-                        rspecs = {s.name: s for s in _KIND_BUILDER[src_kind](start_pos=cs, num_tokens=T)
-                                  if isinstance(s, TensorSpec)}
-                        rspec = rspecs.get(child_name)
-                    blocks.append(_spec_value(rspec, torch) if rspec is not None else per_req.clone())
-                if is_history:
-                    pool = blocks[0].contiguous()
-                else:
-                    pool = torch.cat(blocks, dim=0).contiguous()
+                    first_tile_tokens = min(T, chunk_lens_list[r])
+                    rspec = request_specs(src_kind, cs, first_tile_tokens).get(child_name)
+                    block = _spec_value(rspec, torch) if rspec is not None else per_req.clone()
+                    if packed_name in _GLOBAL_TABLE_BLOCK_STRIDES:
+                        block_stride = _GLOBAL_TABLE_BLOCK_STRIDES[packed_name]
+                        block = _rebase_nonnegative(
+                            block,
+                            r * block_stride,
+                            extent=block_stride,
+                            name=f"request {r} {packed_name}",
+                        )
+                    blocks.append(block)
+                pool = torch.cat(blocks, dim=0).contiguous()
                 return torch.stack([pool.clone() for _ in range(N_RANKS)], dim=0).contiguous()
             return init
 
-        dim0 = src.shape[0] if is_history else batch * src.shape[0]
+        dim0 = batch * src.shape[0]
         tensor_specs.append(TensorSpec(packed_name, [N_RANKS, dim0, *src.shape[1:]],
                                        src.dtype, init_value=make_init(),
-                                       is_output=packed_name in _HISTORY_CACHE_NAMES))
+                                       is_output=is_global_pool))
 
     # Batch metadata.
     tensor_specs.append(TensorSpec("seq_lens", [N_RANKS, batch], torch.int32, init_value=replicate(seq_lens_t)))
@@ -1208,11 +1297,12 @@ def golden_prefill_layer(tensors):
         # Global mutable pool views plus request-local table views.
         req_views = {}
         for packed_name, info in _PACKED_CACHE_SPECS.items():
-            if packed_name in _HISTORY_CACHE_NAMES:
+            if packed_name in _GLOBAL_POOL_NAMES:
                 req_views[packed_name] = tensors[packed_name]
                 continue
             child_name = info[1] if isinstance(info, tuple) else info
-            cnt = _req_block_count(kind, child_name)
+            source_kind = info[0] if isinstance(info, tuple) else kind
+            cnt = _req_block_count(source_kind, child_name)
             req_views[packed_name] = tensors[packed_name][:, request_id * cnt:(request_id + 1) * cnt]
 
         for tile_id in range(tok_blocks):
@@ -1248,42 +1338,241 @@ def golden_prefill_layer(tensors):
             input_ids_tile[:, :valid] = tensors["input_ids"][:, base:base + valid]
             moe_tensors["input_ids"] = input_ids_tile
             moe_tensors["num_tokens"] = valid
-            x_next_tile = torch.zeros(N_RANKS, T, HC_MULT, D, dtype=torch.bfloat16)
+            # Match the FP32 device-side MoE output tile. Staging this buffer as
+            # BF16 truncates the golden result before it is scattered to x_next.
+            x_next_tile = torch.zeros_like(x_attn_tile)
             moe_tensors["x_next"] = x_next_tile
             golden_moe(moe_tensors)
 
             x_next[:, base:base + valid] = x_next_tile[:, :valid]
 
 
-def valid_ratio_reldiff(diff_thd, pct_thd):
-    """Relative-diff comparator over logical token rows, ignoring padded tails."""
+def valid_ratio_reldiff(
+    diff_thd,
+    pct_thd,
+    *,
+    max_abs_diff=float("inf"),
+):
+    """Validate logical token rows and require padded physical rows to stay exact."""
     import torch
     from golden import ratio_reldiff
 
     base_cmp = ratio_reldiff(diff_thd=diff_thd, pct_thd=pct_thd)
 
     def cmp(actual, expected, **kwargs):
+        if actual.shape != expected.shape or actual.ndim < 2:
+            return False, (
+                f"    output shape mismatch: actual={tuple(actual.shape)} "
+                f"expected={tuple(expected.shape)}"
+            )
+        actual_f = actual.cpu().to(torch.float32)
+        expected_f = expected.cpu().to(torch.float32)
+        for label, values in (("actual", actual_f), ("expected", expected_f)):
+            nonfinite = ~torch.isfinite(values)
+            if nonfinite.any().item():
+                return False, (
+                    f"    illegal values in {label}: "
+                    f"count={int(nonfinite.count_nonzero().item())}"
+                )
+
         inputs = kwargs.get("inputs", {})
         chunk_lens = inputs.get("chunk_lens")
         chunk_offsets = inputs.get("chunk_offsets")
         if chunk_lens is None or chunk_offsets is None:
-            return base_cmp(actual, expected, **kwargs)
+            return False, "    compare_fn requires chunk_lens and chunk_offsets inputs"
+        chunk_lens = chunk_lens.cpu().to(torch.int64)
+        chunk_offsets = chunk_offsets.cpu().to(torch.int64)
+        rank_count, physical_rows = actual.shape[:2]
+        if (
+            chunk_lens.ndim != 2
+            or chunk_offsets.shape != chunk_lens.shape
+            or chunk_lens.shape[0] != rank_count
+            or chunk_lens.shape[1] == 0
+        ):
+            return False, (
+                f"    invalid packed metadata shapes: chunk_lens={tuple(chunk_lens.shape)} "
+                f"chunk_offsets={tuple(chunk_offsets.shape)} ranks={rank_count}"
+            )
+        if not torch.equal(chunk_lens, chunk_lens[:1].expand_as(chunk_lens)):
+            return False, "    chunk_lens differ across ranks, but golden uses shared metadata"
+        if not torch.equal(chunk_offsets, chunk_offsets[:1].expand_as(chunk_offsets)):
+            return False, "    chunk_offsets differ across ranks, but golden uses shared metadata"
 
-        lens = chunk_lens[0].cpu().to(torch.int64)
-        offsets = chunk_offsets[0].cpu().to(torch.int64)
-        mask = torch.zeros(actual.shape[1], dtype=torch.bool)
-        for chunk_len, base in zip(lens.tolist(), offsets.tolist()):
-            mask[base:base + chunk_len] = True
-        return base_cmp(actual[:, mask], expected[:, mask], **kwargs)
+        lens = chunk_lens[0]
+        offsets = chunk_offsets[0]
+        invalid_lens = lens <= 0
+        invalid_offsets = offsets < 0
+        ends = offsets + lens
+        out_of_range = ends > physical_rows
+        if invalid_lens.any().item() or invalid_offsets.any().item() or out_of_range.any().item():
+            return False, (
+                f"    invalid packed metadata for physical_rows={physical_rows}: "
+                f"chunk_lens={lens.tolist()} chunk_offsets={offsets.tolist()}"
+            )
+
+        intervals = sorted(zip(offsets.tolist(), ends.tolist(), strict=True))
+        for (_, previous_end), (next_start, _) in itertools.pairwise(intervals):
+            if next_start < previous_end:
+                return False, f"    overlapping packed token intervals: {intervals}"
+
+        mask = torch.zeros(physical_rows, dtype=torch.bool)
+        for base, end in intervals:
+            mask[base:end] = True
+        if not torch.equal(actual[:, ~mask], expected[:, ~mask]):
+            changed = int((actual[:, ~mask] != expected[:, ~mask]).count_nonzero().item())
+            return False, f"    padded physical token rows changed: changed_values={changed}"
+
+        actual_valid = actual[:, mask]
+        expected_valid = expected[:, mask]
+        ok, detail = base_cmp(actual_valid, expected_valid, **kwargs)
+        if not ok:
+            return ok, detail
+        if actual_valid.numel() > 0:
+            worst_abs = float(
+                (actual_valid.float() - expected_valid.float()).abs().max().item()
+            )
+            if worst_abs > max_abs_diff:
+                return False, (
+                    f"    worst absolute diff={worst_abs:.6g} exceeds "
+                    f"max_abs_diff={max_abs_diff:.6g}"
+                )
+        return True, ""
 
     cmp.__name__ = "valid_ratio_reldiff"
     return cmp
 
 
+def mapped_pool_ratio_allclose(
+    mapping_names,
+    *,
+    atol,
+    rtol,
+    max_error_ratio,
+):
+    """Validate allocator-mapped rows without a whole-pool ratio budget.
+
+    Cache/state pools grow with the request batch, while each layer only writes
+    rows selected by its slot mappings. Numerical tolerance is therefore
+    applied to the union of those rows. Every other physical row must remain
+    exactly equal to golden, which also detects writes outside the allocation.
+    """
+    import torch
+
+    from golden import ratio_allclose
+
+    if isinstance(mapping_names, str):
+        mapping_names = (mapping_names,)
+    else:
+        mapping_names = tuple(mapping_names)
+    written_compare = ratio_allclose(
+        atol=atol,
+        rtol=rtol,
+        max_error_ratio=max_error_ratio,
+    )
+
+    def compare(actual, expected, **kwargs):
+        if actual.shape != expected.shape:
+            return False, (
+                f"    pool shape mismatch: actual={tuple(actual.shape)} "
+                f"expected={tuple(expected.shape)}"
+            )
+        if actual.ndim < 3:
+            return False, f"    mapped pool must have rank >= 3, got {tuple(actual.shape)}"
+
+        rank_count = actual.shape[0]
+        actual_rows = actual.reshape(rank_count, -1, actual.shape[-1])
+        expected_rows = expected.reshape(rank_count, -1, expected.shape[-1])
+        row_count = actual_rows.shape[1]
+        for label, rows in (("actual", actual_rows), ("expected", expected_rows)):
+            if torch.is_floating_point(rows):
+                nonfinite = ~torch.isfinite(rows)
+                if nonfinite.any().item():
+                    return False, (
+                        f"    {label} pool contains "
+                        f"{int(nonfinite.count_nonzero().item())} non-finite value(s)"
+                    )
+        written_rows = torch.zeros((rank_count, row_count), dtype=torch.bool)
+        inputs = kwargs.get("inputs", {})
+
+        for mapping_name in mapping_names:
+            mapping = inputs.get(mapping_name)
+            if mapping is None:
+                return False, f"    compare_fn misconfigured: missing input '{mapping_name}'"
+            mapping = mapping.cpu().to(torch.int64)
+            if mapping.ndim != 2 or mapping.shape[0] != rank_count:
+                return False, (
+                    f"    '{mapping_name}' shape {tuple(mapping.shape)} does not match "
+                    f"ranked pool shape {tuple(actual.shape)}"
+                )
+            invalid_negative = mapping < -1
+            if invalid_negative.any().item():
+                first = invalid_negative.nonzero(as_tuple=False)[0]
+                rank = int(first[0].item())
+                token = int(first[1].item())
+                row = int(mapping[rank, token].item())
+                return False, (
+                    f"    '{mapping_name}'[{rank}, {token}]={row} is invalid; "
+                    "only -1 is a negative sentinel"
+                )
+            valid = mapping >= 0
+            out_of_range = valid & (mapping >= row_count)
+            if out_of_range.any().item():
+                first = out_of_range.nonzero(as_tuple=False)[0]
+                rank = int(first[0].item())
+                token = int(first[1].item())
+                row = int(mapping[rank, token].item())
+                return False, (
+                    f"    '{mapping_name}'[{rank}, {token}]={row} is outside "
+                    f"physical row range [0, {row_count})"
+                )
+            for rank in range(rank_count):
+                rank_mapping = mapping[rank, valid[rank]]
+                if rank_mapping.numel() != torch.unique(rank_mapping).numel():
+                    return False, (
+                        f"    '{mapping_name}' contains duplicate rows on rank {rank}"
+                    )
+                already_written = written_rows[rank, rank_mapping]
+                if already_written.any().item():
+                    return False, (
+                        f"    mappings {mapping_names} overlap on rank {rank}"
+                    )
+                written_rows[rank, rank_mapping] = True
+
+        equal_rows = (actual_rows == expected_rows).all(dim=-1)
+        stray_rows = ~written_rows & ~equal_rows
+        if stray_rows.any().item():
+            first = stray_rows.nonzero(as_tuple=False)[0]
+            rank = int(first[0].item())
+            row = int(first[1].item())
+            changed_values = int(
+                (actual_rows[rank, row] != expected_rows[rank, row]).sum().item()
+            )
+            return False, (
+                f"    unmapped physical row changed: rank={rank} row={row} "
+                f"changed_values={changed_values} mappings={mapping_names}"
+            )
+
+        ok, detail = written_compare(
+            actual_rows[written_rows],
+            expected_rows[written_rows],
+            **kwargs,
+        )
+        if ok:
+            return True, ""
+        return False, f"    mapped rows from {mapping_names}:\n{detail}"
+
+    compare.__name__ = (
+        f"mapped_pool_ratio_allclose(mappings={mapping_names}, atol={atol}, "
+        f"rtol={rtol}, max_error_ratio={max_error_ratio})"
+    )
+    return compare
+
+
 if __name__ == "__main__":
     import argparse
+    import torch
 
-    from golden import ratio_allclose, run_jit
+    from golden import run_jit
 
     parser = argparse.ArgumentParser()
     parser.add_argument("-p", "--platform", type=str, default="a2a3",
@@ -1301,13 +1590,75 @@ if __name__ == "__main__":
                         help="Comma-separated per-request prior context lengths; defaults to all zeros.")
     parser.add_argument("--enable-l2-swimlane", action="store_true", default=False)
     parser.add_argument("--compile-only", action="store_true", default=False)
+    parser.add_argument("--save-data", action="store_true", default=False,
+                        help="persist inputs and golden outputs for replay")
+    parser.add_argument("--golden-data", type=str, default=None,
+                        help="directory containing cached in/ and out/ tensors")
+    parser.add_argument("--seed", type=int, default=0,
+                        help="RNG seed for reproducible inputs and golden")
     parser.add_argument("--dump-passes", action="store_true", default=False)
     args = parser.parse_args()
+
+    torch.manual_seed(args.seed)
 
     device_ids = [int(d) for d in args.device.split(",")]
     assert len(device_ids) >= N_RANKS, f"need at least {N_RANKS} devices, got {device_ids}"
     chunk_lens = tuple(int(x) for x in args.chunk_lens.split(","))
     start_positions = None if args.start_positions is None else tuple(int(x) for x in args.start_positions.split(","))
+    compare_fn = {
+        # Pro EP2 measurements place 3.3-5.1% of the composed HCA/CSA output
+        # above 1e-2 across packed chunk boundaries. Keep less than one point
+        # of margin while child kernels retain their stricter precision gates.
+        "x_next": valid_ratio_reldiff(
+            diff_thd=0.01,
+            pct_thd=0.06,
+            max_abs_diff=0.25,
+        ),
+        # Apply ratio budgets only to allocator-mapped writes. Unmapped rows
+        # must remain exact, so expanding a global pool cannot hide an error.
+        "kv_cache": mapped_pool_ratio_allclose(
+            "ori_slot_mapping",
+            atol=1e-4,
+            rtol=1.0 / 128,
+            max_error_ratio=0.005,
+        ),
+        "cmp_kv": mapped_pool_ratio_allclose(
+            ("hca_cmp_slot_mapping", "csa_cmp_slot_mapping"),
+            atol=1e-4,
+            rtol=1.0 / 128,
+            max_error_ratio=0.005,
+        ),
+        "idx_kv_cache": mapped_pool_ratio_allclose(
+            "csa_idx_slot_mapping",
+            atol=1,
+            rtol=0,
+            max_error_ratio=0.01,
+        ),
+        "idx_kv_scale": mapped_pool_ratio_allclose(
+            "csa_idx_slot_mapping",
+            atol=1e-4,
+            rtol=1.0 / 128,
+            max_error_ratio=0.01,
+        ),
+        "hca_compress_state": mapped_pool_ratio_allclose(
+            "hca_state_slot_mapping",
+            atol=1e-3,
+            rtol=1e-3,
+            max_error_ratio=0.005,
+        ),
+        "csa_compress_state": mapped_pool_ratio_allclose(
+            "csa_state_slot_mapping",
+            atol=1e-3,
+            rtol=1e-3,
+            max_error_ratio=0.005,
+        ),
+        "csa_inner_compress_state": mapped_pool_ratio_allclose(
+            "csa_inner_state_slot_mapping",
+            atol=1e-3,
+            rtol=1e-3,
+            max_error_ratio=0.005,
+        ),
+    }
 
     result = run_jit(
         fn=l3_prefill_layer,
@@ -1317,6 +1668,8 @@ if __name__ == "__main__":
             start_positions=start_positions,
         ),
         golden_fn=golden_prefill_layer,
+        golden_data=args.golden_data,
+        save_data=args.save_data,
         compile_only=args.compile_only,
         compile_cfg=dict(
             dump_passes=args.dump_passes,
@@ -1331,28 +1684,7 @@ if __name__ == "__main__":
         ),
         rtol=1e-3,
         atol=1e-3,
-        compare_fn={
-            # Real-weight x_next over-thd fractions (frac>5e-3 / frac>1e-2):
-            # --chunk-lens 128,192
-            # TODO: re-measure on Pro real weights. The numbers below are the
-            # Flash measurements (2 SWA layers, 256 experts, routed_scaling 1.5)
-            # and do not describe Pro, whose layer 0 is HCA, not SWA:
-            #   swa(L0) 0.15% / 0.0006%, hca(L9) 1.1% / 0.45%, csa(L8) 3.89% / 0.63%.
-            "x_next": valid_ratio_reldiff(diff_thd=0.01, pct_thd=0.05),
-            "kv_cache": ratio_allclose(atol=1e-4, rtol=1.0 / 128),
-            # Packed CSA runs preserve the standalone child-kernel precision
-            # contracts: sparse BF16 cache rows may differ by one ULP, C8 rows
-            # by one LSB, and only a small fraction of recurrent-state values
-            # cross the strict pointwise FP32 threshold.
-            "csa_compress_state": ratio_allclose(
-                atol=1e-3, rtol=1e-3, max_error_ratio=0.005
-            ),
-            "csa_inner_compress_state": ratio_allclose(
-                atol=1e-3, rtol=1e-3, max_error_ratio=0.005
-            ),
-            "cmp_kv": ratio_allclose(atol=1e-4, rtol=1.0 / 128, max_error_ratio=0.005),
-            "idx_kv_cache": ratio_allclose(atol=1, rtol=0, max_error_ratio=0.01),
-        },
+        compare_fn=compare_fn,
     )
     if not result.passed:
         if result.error:

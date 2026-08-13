@@ -11,6 +11,8 @@
 
 import pypto.language as pl
 
+from golden import mapped_pool_ratio_allclose
+
 from config import (
     PRO_KERNEL as M,
     DECODE_BATCH,
@@ -75,7 +77,12 @@ assert B <= RMS_PAD_TILE
 def indexer_compressor(
     x: pl.Tensor[[B, S, D], pl.BF16],
     kv: pl.Tensor[[B, S, HEAD_DIM], pl.FP32],
-    compress_state: pl.Tensor[[COMPRESS_STATE_BLOCK_NUM, COMPRESS_STATE_BLOCK_SIZE, COMPRESS_STATE_DIM], pl.FP32],
+    compress_state: pl.InOut[
+        pl.Tensor[
+            [COMPRESS_STATE_BLOCK_NUM, COMPRESS_STATE_BLOCK_SIZE, COMPRESS_STATE_DIM],
+            pl.FP32,
+        ]
+    ],
     compress_state_block_table: pl.Tensor[[B, COMPRESS_STATE_MAX_BLOCKS], pl.INT32],
     wkv: pl.Tensor[[OUT_DIM, D], pl.BF16],
     wgate: pl.Tensor[[OUT_DIM, D], pl.BF16],
@@ -84,8 +91,12 @@ def indexer_compressor(
     cos: pl.Tensor[[B, ROPE_HEAD_DIM // 2], pl.FP32],
     sin: pl.Tensor[[B, ROPE_HEAD_DIM // 2], pl.FP32],
     hadamard: pl.Tensor[[HEAD_DIM, HEAD_DIM], pl.BF16],
-    idx_kv_cache: pl.Tensor[[IDX_CACHE_BLOCK_NUM, BLOCK_SIZE, 1, HEAD_DIM], pl.INT8],
-    idx_kv_scale: pl.Tensor[[IDX_CACHE_BLOCK_NUM, BLOCK_SIZE, 1, 1], pl.FP32],
+    idx_kv_cache: pl.InOut[
+        pl.Tensor[[IDX_CACHE_BLOCK_NUM, BLOCK_SIZE, 1, HEAD_DIM], pl.INT8]
+    ],
+    idx_kv_scale: pl.InOut[
+        pl.Tensor[[IDX_CACHE_BLOCK_NUM, BLOCK_SIZE, 1, 1], pl.FP32]
+    ],
     position_ids: pl.Tensor[[B, S], pl.INT32],
     idx_slot_mapping: pl.Tensor[[B, S], pl.INT64],
     inner_state_slot_mapping: pl.Tensor[[B, S], pl.INT64],
@@ -332,7 +343,7 @@ def indexer_compressor(
                     pl.write(idx_kv_scale_flat, [cache_row, 0], pl.read(kv_scale_dq_col, [inner, 0]))
 
     kv = pl.reshape(kv_flat, [B, S, HEAD_DIM])
-    return kv
+    return kv, compress_state, idx_kv_cache, idx_kv_scale
 
 
 @pl.jit
@@ -521,6 +532,32 @@ def golden_compressor(tensors):
     tensors["idx_kv_scale"][:] = idx_kv_scale
 
 
+def mapped_idx_cache_ratio_allclose(*, atol, rtol, max_error_ratio):
+    """Compare index-cache writes selected by ``idx_slot_mapping``."""
+    return mapped_pool_ratio_allclose(
+        "idx_slot_mapping",
+        mapping_shape=(B, S),
+        block_size=BLOCK_SIZE,
+        pool_name="index cache",
+        atol=atol,
+        rtol=rtol,
+        max_error_ratio=max_error_ratio,
+    )
+
+
+def mapped_inner_state_ratio_allclose(*, atol, rtol, max_error_ratio):
+    """Compare inner-state writes selected by ``inner_state_slot_mapping``."""
+    return mapped_pool_ratio_allclose(
+        "inner_state_slot_mapping",
+        mapping_shape=(B, S),
+        block_size=COMPRESS_STATE_BLOCK_SIZE,
+        pool_name="inner compressor state",
+        atol=atol,
+        rtol=rtol,
+        max_error_ratio=max_error_ratio,
+    )
+
+
 def build_tensor_specs(start_pos=None):
     import torch  # type: ignore[import]
     from decode_metadata import (
@@ -660,9 +697,14 @@ if __name__ == "__main__":
         atol=1e-3,
         compare_fn={
             "kv":          ratio_allclose(atol=1e-4, rtol=1.0 / 128, max_error_ratio=0.0),
-            "compress_state": ratio_allclose(atol=1e-3, rtol=1e-3, max_error_ratio=0.0),
-            "idx_kv_cache": ratio_allclose(atol=1, rtol=0, max_error_ratio=0.01),
-            "idx_kv_scale": ratio_allclose(atol=1e-4, rtol=1.0 / 128, max_error_ratio=0.01),
+            "compress_state": mapped_inner_state_ratio_allclose(
+                atol=1e-3, rtol=1e-3, max_error_ratio=0.0),
+            # Ratio budgets apply only to rows written by the current slot mappings;
+            # every historical/unallocated physical row must remain bitwise exact.
+            "idx_kv_cache": mapped_idx_cache_ratio_allclose(
+                atol=1, rtol=0, max_error_ratio=0.01),
+            "idx_kv_scale": mapped_idx_cache_ratio_allclose(
+                atol=1e-4, rtol=1.0 / 128, max_error_ratio=0.01),
         },
     )
     if not result.passed:

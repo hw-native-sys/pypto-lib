@@ -57,6 +57,10 @@ INNER_STATE_DIM = 2 * INNER_OUT_DIM
 IDX_KV_LEN = MAX_SEQ_LEN // COMPRESS_RATIO
 IDX_CACHE_BLOCK_NUM = DECODE_IDX_BLOCK_NUM
 SCORE_LEN = IDX_KV_LEN
+SCORE_ATOL = 1e-4
+SCORE_RTOL = 1.0 / 128
+SCORE_HARD_MULTIPLIER = 4.0
+SCORE_HARD_ATOL = 5e-3
 
 # tiling
 CACHE_TILE = 64
@@ -125,7 +129,12 @@ def indexer(
     sin: pl.Tensor[[B, ROPE_HEAD_DIM // 2], pl.FP32],
     hadamard: pl.Tensor[[IDX_HEAD_DIM, IDX_HEAD_DIM], pl.BF16],  # shared by q rotation and inner Compressor
     inner_kv: pl.Tensor[[B, S, INNER_HEAD_DIM], pl.FP32],
-    inner_compress_state: pl.Tensor[[INNER_STATE_BLOCK_NUM, INNER_STATE_BLOCK_SIZE, INNER_STATE_DIM], pl.FP32],
+    inner_compress_state: pl.InOut[
+        pl.Tensor[
+            [INNER_STATE_BLOCK_NUM, INNER_STATE_BLOCK_SIZE, INNER_STATE_DIM],
+            pl.FP32,
+        ]
+    ],
     inner_compress_state_block_table: pl.Tensor[[B, INNER_STATE_MAX_BLOCKS], pl.INT32],
     inner_wkv: pl.Tensor[[INNER_OUT_DIM, D], pl.BF16],
     inner_wgate: pl.Tensor[[INNER_OUT_DIM, D], pl.BF16],
@@ -411,7 +420,7 @@ def indexer(
             topk_idxs_valid = pl.set_validshape(topk_idxs_tile, 1, valid_topk)
             topk_idxs_flat[t : t + 1, 0:IDX_TOPK] = pl.add(topk_idxs_valid, offset_i32)
 
-    return score, topk_idxs
+    return idx_kv_cache, idx_kv_scale, inner_compress_state, score, topk_idxs
 
 
 @pl.jit
@@ -426,7 +435,12 @@ def indexer_test(
     sin: pl.Tensor[[B, ROPE_HEAD_DIM // 2], pl.FP32],
     hadamard: pl.Tensor[[IDX_HEAD_DIM, IDX_HEAD_DIM], pl.BF16],
     inner_kv: pl.Tensor[[B, S, INNER_HEAD_DIM], pl.FP32],
-    inner_compress_state: pl.Tensor[[INNER_STATE_BLOCK_NUM, INNER_STATE_BLOCK_SIZE, INNER_STATE_DIM], pl.FP32],
+    inner_compress_state: pl.InOut[
+        pl.Tensor[
+            [INNER_STATE_BLOCK_NUM, INNER_STATE_BLOCK_SIZE, INNER_STATE_DIM],
+            pl.FP32,
+        ]
+    ],
     inner_compress_state_block_table: pl.Tensor[[B, INNER_STATE_MAX_BLOCKS], pl.INT32],
     inner_wkv: pl.Tensor[[INNER_OUT_DIM, D], pl.BF16],
     inner_wgate: pl.Tensor[[INNER_OUT_DIM, D], pl.BF16],
@@ -474,7 +488,7 @@ def indexer_test(
         offset,
         late_dep,
     )
-    return score, idx_kv_cache, idx_kv_scale, topk_idxs
+    return score, inner_compress_state, idx_kv_cache, idx_kv_scale, topk_idxs
 
 
 def _int8_quant_per_row(x):
@@ -625,6 +639,385 @@ def golden_indexer(tensors):
     tensors["topk_idxs"][:] = topk_idxs.view(B, S, SCORE_LEN)
 
 
+def _scalar_input_as_int(value, name):
+    """Decode a scalar harness input and return either its value or an error string."""
+    if hasattr(value, "numel") and value.numel() != 1:
+        return None, f"{name} must be scalar, got shape {tuple(value.shape)}"
+    if hasattr(value, "item"):
+        value = value.item()
+    elif hasattr(value, "value"):
+        value = value.value
+    try:
+        return int(value), None
+    except (TypeError, ValueError):
+        return None, f"{name} must be integer-like, got {value!r}"
+
+
+def topk_prefix_contract_error(
+    topk_indices,
+    position_ids,
+    kv_seq_lens,
+    offset,
+):
+    """Return an error string for an invalid decode top-k prefix or ``-1`` tail."""
+    import torch
+
+    if topk_indices.ndim != 3 or topk_indices.shape != (B, S, SCORE_LEN):
+        return (
+            f"top-k tensor must have shape {(B, S, SCORE_LEN)}, "
+            f"got {tuple(topk_indices.shape)}"
+        )
+    if position_ids.ndim != 2 or position_ids.shape != (B, S):
+        return f"position_ids must have shape {(B, S)}, got {tuple(position_ids.shape)}"
+    if kv_seq_lens.ndim != 1 or kv_seq_lens.shape[0] != B:
+        return f"kv_seq_lens must have shape {(B,)}, got {tuple(kv_seq_lens.shape)}"
+
+    for b in range(B):
+        cache_len = max(int(kv_seq_lens[b].item()) // COMPRESS_RATIO, 0)
+        for s in range(S):
+            row = topk_indices[b, s]
+            position_visible = max(
+                (int(position_ids[b, s].item()) + 1) // COMPRESS_RATIO,
+                0,
+            )
+            visible = min(cache_len, position_visible, SCORE_LEN)
+            prefix_len = min(IDX_TOPK, visible)
+            prefix = row[:prefix_len]
+            if prefix_len:
+                out_of_range = (prefix < offset) | (prefix >= offset + visible)
+                if out_of_range.any().item():
+                    return (
+                        f"top-k row [{b},{s}] has "
+                        f"{int(out_of_range.count_nonzero().item())} entries outside "
+                        f"[{offset}, {offset + visible}) in its active prefix"
+                    )
+                unique_count = int(torch.unique(prefix).numel())
+                if unique_count != prefix_len:
+                    return (
+                        f"top-k row [{b},{s}] active prefix has "
+                        f"{unique_count}/{prefix_len} unique entries"
+                    )
+            tail_non_padding = int((row[prefix_len:] != -1).count_nonzero().item())
+            if tail_non_padding:
+                return (
+                    f"top-k row [{b},{s}] tail contains "
+                    f"{tail_non_padding} non--1 entries"
+                )
+    return None
+
+
+def decode_topk_compare(
+    actual,
+    expected,
+    *,
+    actual_outputs,
+    expected_outputs,
+    inputs,
+    rtol,
+    atol,
+):
+    """Validate decode top-k structure and allow only score-bounded tie changes."""
+    import torch
+
+    max_show = 10
+
+    position_ids = inputs.get("position_ids")
+    kv_seq_lens = inputs.get("kv_seq_lens")
+    offset_raw = inputs.get("offset", OFFSET)
+    if position_ids is None or kv_seq_lens is None:
+        return False, (
+            "    compare_fn requires position_ids and kv_seq_lens inputs"
+        )
+    offset, scalar_error = _scalar_input_as_int(offset_raw, "offset")
+    if scalar_error:
+        return False, f"    {scalar_error}"
+
+    actual = actual.cpu()
+    expected = expected.cpu()
+    position_ids = position_ids.cpu()
+    kv_seq_lens = kv_seq_lens.cpu()
+    for label, indices in (("actual", actual), ("expected", expected)):
+        contract_error = topk_prefix_contract_error(
+            indices,
+            position_ids,
+            kv_seq_lens,
+            offset,
+        )
+        if contract_error:
+            return False, f"    {label} {contract_error}"
+
+    scores = {}
+    for label, outputs in (("actual", actual_outputs), ("expected", expected_outputs)):
+        score = outputs.get("score")
+        if score is None:
+            return False, f"    compare_fn misconfigured: missing {label} output 'score'"
+        score = score.cpu().to(torch.float32)
+        if score.shape != (B, S, SCORE_LEN):
+            return False, (
+                f"    {label} score must have shape {(B, S, SCORE_LEN)}, "
+                f"got {tuple(score.shape)}"
+            )
+        nonfinite = ~torch.isfinite(score)
+        if nonfinite.any().item():
+            return False, (
+                f"    {label} score contains "
+                f"{int(nonfinite.count_nonzero().item())} non-finite value(s)"
+            )
+        scores[label] = score
+
+    actual_score = scores["actual"]
+    expected_score = scores["expected"]
+    failures = []
+    failure_count = 0
+
+    def record_failure(detail):
+        nonlocal failure_count
+        failure_count += 1
+        if len(failures) < max_show:
+            failures.append(detail)
+
+    for b in range(B):
+        cache_len = max(int(kv_seq_lens[b].item()) // COMPRESS_RATIO, 0)
+        for s in range(S):
+            position_visible = max(
+                (int(position_ids[b, s].item()) + 1) // COMPRESS_RATIO,
+                0,
+            )
+            visible = min(cache_len, position_visible, SCORE_LEN)
+            k = min(IDX_TOPK, visible)
+            if k <= 0:
+                continue
+
+            actual_order = actual[b, s, :k].to(torch.int64) - offset
+            expected_order = expected[b, s, :k].to(torch.int64) - offset
+            mismatch = actual_order != expected_order
+            if not mismatch.any().item():
+                continue
+
+            actual_row = actual_score[b, s, :visible]
+            expected_row = expected_score[b, s, :visible]
+            candidate_tolerance = SCORE_ATOL + SCORE_RTOL * torch.maximum(
+                actual_row.abs(),
+                expected_row.abs(),
+            )
+            candidate_hard_tolerance = torch.maximum(
+                SCORE_HARD_MULTIPLIER * candidate_tolerance,
+                torch.full_like(candidate_tolerance, SCORE_HARD_ATOL),
+            )
+            candidate_error = (actual_row - expected_row).abs()
+
+            # A score outlier that fits the score tensor's global ratio budget
+            # must not justify a changed selection or order.
+            displaced = torch.unique(
+                torch.cat((actual_order[mismatch], expected_order[mismatch]))
+            )
+            bad_candidates = displaced[
+                candidate_error[displaced]
+                > candidate_hard_tolerance[displaced]
+            ]
+            for candidate_tensor in bad_candidates:
+                candidate = int(candidate_tensor.item())
+                record_failure(
+                    f"row=[{b},{s}] candidate={candidate} score error "
+                    f"{float(candidate_error[candidate].item()):.6g} exceeds "
+                    f"candidate hard bound "
+                    f"{float(candidate_hard_tolerance[candidate].item()):.6g} "
+                    f"(actual={float(actual_row[candidate].item()):.6g}, "
+                    f"expected={float(expected_row[candidate].item()):.6g})"
+                )
+
+            # Every earlier/later pair emitted by the kernel must remain
+            # descending under its own score uncertainty. A prefix minimum of
+            # the earlier upper bounds checks all pairs in O(k), without
+            # constructing a 1024-by-1024 rank-inversion matrix.
+            if k >= 2:
+                for label, row in (
+                    ("expected", expected_row),
+                    ("actual", actual_row),
+                ):
+                    selected_lower = (
+                        row[actual_order]
+                        - candidate_hard_tolerance[actual_order]
+                    )
+                    selected_upper = (
+                        row[actual_order]
+                        + candidate_hard_tolerance[actual_order]
+                    )
+                    prior_min_upper = torch.cummin(
+                        selected_upper[:-1],
+                        dim=0,
+                    ).values
+                    clear_reverse = (
+                        selected_lower[1:] > prior_min_upper
+                    ).nonzero(as_tuple=False).flatten()
+                    for position_tensor in clear_reverse:
+                        later_position = int(position_tensor.item()) + 1
+                        earlier_position = int(
+                            selected_upper[:later_position].argmin().item()
+                        )
+                        earlier_candidate = int(
+                            actual_order[earlier_position].item()
+                        )
+                        later_candidate = int(
+                            actual_order[later_position].item()
+                        )
+                        reverse_gap = float(
+                            (
+                                row[later_candidate]
+                                - row[earlier_candidate]
+                            ).item()
+                        )
+                        joint_bound = float(
+                            (
+                                candidate_hard_tolerance[earlier_candidate]
+                                + candidate_hard_tolerance[later_candidate]
+                            ).item()
+                        )
+                        record_failure(
+                            f"row=[{b},{s}] clear inversion on {label} "
+                            f"scores at positions {earlier_position}/"
+                            f"{later_position}: candidate "
+                            f"{earlier_candidate} precedes {later_candidate}; "
+                            f"reverse_gap={reverse_gap:.6g}, "
+                            f"joint_bound={joint_bound:.6g}"
+                        )
+
+            # When visible > k, an internally sorted but wholly inferior set
+            # would pass an order-only check. Compare candidates crossing the
+            # top-k boundary using both the reference and emitted score grids.
+            if visible > k:
+                missing_mask = ~torch.isin(expected_order, actual_order)
+                added_mask = ~torch.isin(actual_order, expected_order)
+                missing = expected_order[missing_mask]
+                added = actual_order[added_mask]
+                if missing.numel() and added.numel():
+                    for label, row in (
+                        ("expected", expected_row),
+                        ("actual", actual_row),
+                    ):
+                        missing_lower = (
+                            row[missing] - candidate_hard_tolerance[missing]
+                        )
+                        added_upper = (
+                            row[added] + candidate_hard_tolerance[added]
+                        )
+                        best_missing_pos = int(missing_lower.argmax().item())
+                        worst_added_pos = int(added_upper.argmin().item())
+                        boundary_gap = float(
+                            (
+                                missing_lower[best_missing_pos]
+                                - added_upper[worst_added_pos]
+                            ).item()
+                        )
+                        if boundary_gap > 0:
+                            missing_candidate = int(missing[best_missing_pos].item())
+                            added_candidate = int(added[worst_added_pos].item())
+                            record_failure(
+                                f"row=[{b},{s}] clear top-k boundary miss on "
+                                f"{label} scores: omitted candidate "
+                                f"{missing_candidate}, selected candidate "
+                                f"{added_candidate}, uncertainty-adjusted "
+                                f"gap={boundary_gap:.6g}"
+                            )
+
+    if not failure_count:
+        return True, ""
+    lines = [
+        "    decode top-k differs outside candidate-specific score bounds: "
+        f"{failure_count} failure(s) "
+        f"(score_atol={SCORE_ATOL} score_rtol={SCORE_RTOL} "
+        f"score_hard_multiplier={SCORE_HARD_MULTIPLIER} "
+        f"score_hard_atol={SCORE_HARD_ATOL})"
+    ]
+    lines.extend(f"      {detail}" for detail in failures)
+    if failure_count > len(failures):
+        lines.append(f"      ... and {failure_count - len(failures)} more")
+    return False, "\n".join(lines)
+
+
+decode_topk_compare.__name__ = "decode_topk_pair_compare"
+
+
+def score_valid_compare(
+    actual,
+    expected,
+    *,
+    actual_outputs,
+    expected_outputs,
+    inputs,
+    rtol,
+    atol,
+):
+    """Compare visible scores with a ratio budget and hard pointwise ceiling."""
+    import torch
+
+    from golden import ratio_allclose
+
+    if actual.shape != expected.shape:
+        return False, (
+            f"    score shape mismatch: actual={tuple(actual.shape)} "
+            f"expected={tuple(expected.shape)}"
+        )
+    actual_f = actual.cpu().to(torch.float32)
+    expected_f = expected.cpu().to(torch.float32)
+    for label, value in (("actual", actual_f), ("expected", expected_f)):
+        nonfinite = ~torch.isfinite(value)
+        if nonfinite.any().item():
+            return False, (
+                f"    {label} score contains "
+                f"{int(nonfinite.count_nonzero().item())} non-finite value(s)"
+            )
+    valid = expected_f != FP32_NEG_INF
+    actual_valid = actual_f[valid]
+    expected_valid = expected_f[valid]
+    base_ok, base_detail = ratio_allclose(atol=SCORE_ATOL, rtol=SCORE_RTOL)(
+        actual_valid,
+        expected_valid,
+        actual_outputs=actual_outputs,
+        expected_outputs=expected_outputs,
+        inputs=inputs,
+        rtol=rtol,
+        atol=atol,
+    )
+    if not base_ok or actual_valid.numel() == 0:
+        return base_ok, base_detail
+
+    diff = (actual_valid - expected_valid).abs()
+    hard_tolerance = torch.maximum(
+        SCORE_HARD_MULTIPLIER * (
+            SCORE_ATOL
+            + SCORE_RTOL * torch.maximum(
+                actual_valid.abs(),
+                expected_valid.abs(),
+            )
+        ),
+        torch.full_like(actual_valid, SCORE_HARD_ATOL),
+    )
+    hard_bad = diff > hard_tolerance
+    hard_bad_count = int(hard_bad.count_nonzero().item())
+    if not hard_bad_count:
+        return True, ""
+
+    flat_bad = hard_bad.nonzero(as_tuple=False).flatten()
+    lines = []
+    for index in flat_bad[:10].tolist():
+        lines.append(
+            f"      [{index}] actual={float(actual_valid[index]):.8g} "
+            f"expected={float(expected_valid[index]):.8g} "
+            f"diff={float(diff[index]):.4g} "
+            f"hard_tol={float(hard_tolerance[index]):.4g}"
+        )
+    return False, (
+        f"    score hard bound exceeded at {hard_bad_count} point(s): "
+        f"hard_multiplier={SCORE_HARD_MULTIPLIER}, score_atol={SCORE_ATOL}, "
+        f"score_rtol={SCORE_RTOL}, hard_atol={SCORE_HARD_ATOL}\n"
+        + "\n".join(lines)
+    )
+
+
+score_valid_compare.__name__ = "score_valid_region_compare"
+
+
 def build_tensor_specs(start_pos=None):
     import torch  # type: ignore[import]
     from decode_metadata import (
@@ -740,7 +1133,7 @@ def build_tensor_specs(start_pos=None):
         TensorSpec("sin", [B, ROPE_HEAD_DIM // 2], torch.float32, init_value=init_sin),
         TensorSpec("hadamard", [IDX_HEAD_DIM, IDX_HEAD_DIM], torch.bfloat16, init_value=init_hadamard),
         TensorSpec("inner_kv", [B, S, INNER_HEAD_DIM], torch.float32),
-        TensorSpec("inner_compress_state", [INNER_STATE_BLOCK_NUM, INNER_STATE_BLOCK_SIZE, INNER_STATE_DIM], torch.float32, init_value=init_inner_compress_state),
+        TensorSpec("inner_compress_state", [INNER_STATE_BLOCK_NUM, INNER_STATE_BLOCK_SIZE, INNER_STATE_DIM], torch.float32, init_value=init_inner_compress_state, is_output=True),
         TensorSpec("inner_compress_state_block_table", [B, INNER_STATE_MAX_BLOCKS], torch.int32, init_value=init_inner_compress_state_block_table),
         TensorSpec("inner_wkv", [INNER_OUT_DIM, D], torch.bfloat16, init_value=init_inner_wkv),
         TensorSpec("inner_wgate", [INNER_OUT_DIM, D], torch.bfloat16, init_value=init_inner_wgate),
@@ -762,8 +1155,11 @@ def build_tensor_specs(start_pos=None):
 
 if __name__ == "__main__":
     import argparse
-    import torch
-    from golden import ratio_allclose, run_jit, topk_pair_compare
+    from decode_indexer_compressor import (
+        mapped_idx_cache_ratio_allclose,
+        mapped_inner_state_ratio_allclose,
+    )
+    from golden import run_jit
 
     parser = argparse.ArgumentParser()
     parser.add_argument("-p", "--platform", type=str, default="a2a3",
@@ -777,41 +1173,6 @@ if __name__ == "__main__":
                              "default (unset) uses the canonical per-batch CSA set that includes the 8k point.")
     parser.add_argument("--dump-passes", action="store_true", default=False)
     args = parser.parse_args()
-
-    # topk_pair_compare expects a tensor whose [..., i] entry is the score paired
-    # with idx[..., i] (sorted along the top-k axis). Here `score` is per-key
-    # (input-space) so it isn't pre-sorted; recover the paired scores on the fly
-    # by gathering `score[topk_idxs - OFFSET]` over the valid first IDX_TOPK
-    # slots, then delegate.
-    def topk_idxs_compare(actual, expected, *, actual_outputs, expected_outputs, inputs, rtol, atol):
-        score = actual_outputs["score"]
-        a_top = actual[..., :IDX_TOPK]
-        e_top = expected[..., :IDX_TOPK]
-        a_orig = (a_top.long() - OFFSET).clamp(min=0, max=score.shape[-1] - 1)
-        paired = torch.gather(score, dim=-1, index=a_orig)
-        synth_actual = {**actual_outputs, "_topk_paired_scores": paired}
-        return topk_pair_compare("_topk_paired_scores")(
-            a_top, e_top,
-            actual_outputs=synth_actual,
-            expected_outputs=expected_outputs,
-            inputs=inputs,
-            rtol=rtol, atol=atol,
-        )
-    topk_idxs_compare.__name__ = "topk_pair_compare"
-
-    # Compare `score` only over the valid region (golden pads the tail with FP32_NEG_INF).
-    def score_valid_compare(actual, expected, *, actual_outputs, expected_outputs, inputs, rtol, atol):
-        expected_f = expected.cpu().to(torch.float32)
-        valid = expected_f != FP32_NEG_INF
-        return ratio_allclose(atol=1e-4, rtol=1.0 / 128)(
-            actual.cpu().to(torch.float32)[valid],
-            expected_f[valid],
-            actual_outputs=actual_outputs,
-            expected_outputs=expected_outputs,
-            inputs=inputs,
-            rtol=rtol, atol=atol,
-        )
-    score_valid_compare.__name__ = "score_valid_region_compare"
 
     result = run_jit(
         fn=indexer_test,
@@ -828,11 +1189,15 @@ if __name__ == "__main__":
         atol=1e-3,
         compare_fn={
             "score":        score_valid_compare,
-            "topk_idxs":    topk_idxs_compare,
-            # C8 cache: history is exact; only the <=B boundary rows the compressor rewrote may
-            # differ by +/-1 LSB from the bf16 round of a fresh position.
-            "idx_kv_cache": ratio_allclose(atol=1, rtol=0, max_error_ratio=0.01),
-            "idx_kv_scale": ratio_allclose(atol=1e-4, rtol=1.0 / 128, max_error_ratio=0.01),
+            "topk_idxs":    decode_topk_compare,
+            "inner_compress_state": mapped_inner_state_ratio_allclose(
+                atol=1e-3, rtol=1e-3, max_error_ratio=0.0),
+            # Ratio budgets apply only to rows written by the current slot mappings;
+            # every historical/unallocated physical row must remain bitwise exact.
+            "idx_kv_cache": mapped_idx_cache_ratio_allclose(
+                atol=1, rtol=0, max_error_ratio=0.01),
+            "idx_kv_scale": mapped_idx_cache_ratio_allclose(
+                atol=1e-4, rtol=1.0 / 128, max_error_ratio=0.01),
         },
     )
     if not result.passed:
