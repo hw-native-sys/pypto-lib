@@ -332,9 +332,9 @@ def combine(
     # Rows are src-major, so the per-(e, src) base is a loop-carried prefix sum over
     # src inside the block (same shape as dispatch_gather). Each route maps to a
     # unique (dst, loc_e) and r_route, so the blocks' puts are write-disjoint.
-    # allow_early_resolve: shared_routed pre-stages only when every producer of its
-    # fanin is flagged, and combine_wait already is.
-    with pl.spmd(N_LOCAL, name_hint="combine", allow_early_resolve=True) as _combine_tid:
+    # Keep the scatter TaskId so the arrival handshake cannot occupy AIV cores
+    # until every routed_y_buf put from this rank has completed.
+    with pl.spmd(N_LOCAL, name_hint="combine") as _combine_tid:
         e = pl.tile.get_block_idx()
         e_base_row = e * RECV_MAX
         b = pl.cast(0, pl.INDEX)
@@ -353,11 +353,14 @@ def combine(
                 )
             b = b + n
 
-        # Payload-arrival notify folded into the scatter (mirrors dispatch_push):
-        # each block signals every peer after its own puts, so the wait below expects
-        # N_LOCAL * moe_epoch. Saves a task launch on the cross-rank critical path.
-        # The [1, D] puts above are single-shot TPUTs, which drain themselves before
-        # this notify issues.
+    # Publish only after the complete scatter grid. Keeping this cross-rank wait
+    # out of the speculative early-dispatch chain prevents it and shared_routed
+    # from reserving the AIV cores needed by the scatter itself.
+    with pl.at(
+        level=pl.Level.CORE_GROUP,
+        name_hint="combine_wait",
+        deps=[_combine_tid, dispatch_push_tid],
+    ) as _cwait_tid:
         for peer in pl.range(N_RANKS):
             if peer != my_rank:
                 pld.system.notify(
@@ -368,25 +371,12 @@ def combine(
                     op=pld.NotifyOp.AtomicAdd,
                 )
 
-    # Wait only (the notify rides inside the scatter), so it spins on the peers'
-    # counters while our own scatter runs. The recv_y_flat read is an anchor, not
-    # data: it auto-deps this task on exp_w2_act, starting the wait when the scatter
-    # starts. Anchor it to something -- a wait with no dep at all is dispatched the
-    # moment the scheduler reaches it and spins holding a core group, so pipelined
-    # layers stack up spinners that starve the scatters they wait on.
-    with pl.at(
-        level=pl.Level.CORE_GROUP,
-        name_hint="combine_wait",
-        deps=[_combine_tid, dispatch_push_tid],
-        allow_early_resolve=True,
-    ) as _cwait_tid:
-        _recv_y_anchor = pl.read(recv_y_flat, [0, 0])
         for src in pl.range(N_RANKS):
             if src != my_rank:
                 pld.system.wait(
                     signal=combine_arrived,
                     offsets=[src, 0],
-                    expected=pl.cast(moe_epoch * N_LOCAL, pl.INT32),
+                    expected=moe_epoch,
                     cmp=pld.WaitCmp.Ge,
                 )
 
@@ -402,7 +392,6 @@ def combine(
         T,
         name_hint="shared_routed",
         deps=[_cwait_tid],
-        allow_early_resolve=True,
     ) as _reduce_tid:
         t = pl.tile.get_block_idx()
         if t < active_tokens:
