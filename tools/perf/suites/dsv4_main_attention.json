@@ -1,0 +1,112 @@
+{
+  "schema_version": 1,
+  "suite_id": "dsv4-main-attention",
+  "lane_id": "lib-main-attention",
+  "contract_id": "dsv4-main-attention-v1",
+  "platform": "a2a3",
+  "ordered_devices": [4],
+  "sampling": {
+    "seed": 1807,
+    "rounds": 100,
+    "warmup": 5,
+    "raw": true
+  },
+  "workload": {
+    "batch": 4,
+    "sequence": 2,
+    "tokens": 8,
+    "start_pos": 8192,
+    "enable_l2_swimlane": 0
+  },
+  "environment": {
+    "PTO2_RING_TASK_WINDOW": "262144",
+    "PTO2_RING_DEP_POOL": "262144",
+    "PTO2_RING_HEAP": "2147483648",
+    "PYPTO_BENCH": "1",
+    "PYPTO_BENCH_RAW": "1",
+    "PYPTO_BENCH_ROUNDS": "100",
+    "PYPTO_BENCH_WARMUP": "5",
+    "PYPTO_RUNTIME_LOG": "error",
+    "SIMPLER_DEVICE_STRACE_ENABLE": "1"
+  },
+  "cases": [
+    {
+      "case_id": "attention-csa",
+      "entrypoint": "models/deepseek_v4_flash_mtp/decode_csa.py",
+      "arguments": [
+        "-p", "a2a3", "-d", "4", "--start-pos", "8192",
+        "--enable-l2-swimlane", "0"
+      ],
+      "metric": {
+        "name": "effective_us",
+        "unit": "us",
+        "aggregation": "median",
+        "rank_policy": "single_rank"
+      },
+      "validation_outputs": [
+        {
+          "name": "kv_cache",
+          "shape": [128, 128, 1, 512],
+          "dtype": "torch.bfloat16"
+        },
+        {
+          "name": "x_out",
+          "shape": [8, 4, 4096],
+          "dtype": "torch.float32"
+        }
+      ]
+    },
+    {
+      "case_id": "attention-hca",
+      "entrypoint": "models/deepseek_v4_flash_mtp/decode_hca.py",
+      "arguments": [
+        "-p", "a2a3", "-d", "4", "--start-pos", "8192",
+        "--enable-l2-swimlane", "0"
+      ],
+      "metric": {
+        "name": "effective_us",
+        "unit": "us",
+        "aggregation": "median",
+        "rank_policy": "single_rank"
+      },
+      "validation_outputs": [
+        {
+          "name": "kv_cache",
+          "shape": [128, 128, 1, 512],
+          "dtype": "torch.bfloat16"
+        },
+        {
+          "name": "x_out",
+          "shape": [8, 4, 4096],
+          "dtype": "torch.float32"
+        }
+      ]
+    },
+    {
+      "case_id": "attention-swa",
+      "entrypoint": "models/deepseek_v4_flash_mtp/decode_swa.py",
+      "arguments": [
+        "-p", "a2a3", "-d", "4", "--start-pos", "8192",
+        "--enable-l2-swimlane", "0"
+      ],
+      "metric": {
+        "name": "effective_us",
+        "unit": "us",
+        "aggregation": "median",
+        "rank_policy": "single_rank"
+      },
+      "validation_outputs": [
+        {
+          "name": "kv_cache",
+          "shape": [128, 128, 1, 512],
+          "dtype": "torch.bfloat16"
+        },
+        {
+          "name": "x_out",
+          "shape": [8, 4, 4096],
+          "dtype": "torch.float32"
+        }
+      ]
+    }
+  ]
+}
