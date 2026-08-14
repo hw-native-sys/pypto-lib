@@ -1597,6 +1597,9 @@ if __name__ == "__main__":
     parser.add_argument("--seed", type=int, default=0,
                         help="RNG seed for reproducible inputs and golden")
     parser.add_argument("--dump-passes", action="store_true", default=False)
+    parser.add_argument("--weights", type=str, default=None,
+                        help="HF checkpoint dir: inject this layer's real DeepSeek-V4-Flash weights "
+                             "(golden recomputes with them, so validation runs on real weights).")
     args = parser.parse_args()
 
     torch.manual_seed(args.seed)
@@ -1660,13 +1663,20 @@ if __name__ == "__main__":
         ),
     }
 
+    specs = build_tensor_specs(
+        layer_id=args.layer_id,
+        chunk_lens=chunk_lens,
+        start_positions=start_positions,
+    )
+    if args.weights is not None:
+        from weights_flash import apply_real_layer_weights
+
+        count = apply_real_layer_weights(specs, args.weights, layer_id=args.layer_id, ep=N_RANKS)
+        print(f"[RUN] real weights: layer {args.layer_id}, {count} tensors from {args.weights}", flush=True)
+
     result = run_jit(
         fn=l3_prefill_layer,
-        specs=build_tensor_specs(
-            layer_id=args.layer_id,
-            chunk_lens=chunk_lens,
-            start_positions=start_positions,
-        ),
+        specs=specs,
         golden_fn=golden_prefill_layer,
         golden_data=args.golden_data,
         save_data=args.save_data,

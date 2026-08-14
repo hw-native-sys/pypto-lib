@@ -122,6 +122,46 @@ prefill_mtp     mtp_projection → prefill_attention_swa → moe → hc_head →
 
 `prefill_mtp` reuses `prefill_fwd`'s driver for the main-model pass.
 
+## Real weights (Flash)
+
+`weights_flash.py` converts the released DeepSeek-V4-Flash checkpoint (hybrid
+MXFP4 routed experts + block-FP8 attention/shared-expert linears) into the
+host-tensor ABI of the two forward drivers: FP4/FP8 tensors are dequantized
+and re-quantized to the kernels' INT8 + per-output-channel FP32-scale form,
+per-layer tensors are stacked and EP/TP-sharded exactly like the fixture
+specs. Convert once offline, then point the drivers at the cache:
+
+```bash
+python models/deepseek_v4_pro/weights_flash.py --variant flash --ep 8 --tp 2 \
+    --ckpt /path/to/DeepSeek-V4-Flash --out build_output/flash_weights_ep8_tp2
+python models/deepseek_v4_pro/prefill_fwd.py --variant flash --ep 8 --tp 2 \
+    -p a5 -d 0,1,2,3,4,5,6,7 --weights build_output/flash_weights_ep8_tp2
+```
+
+`--weights` also accepts the raw checkpoint directory (converted on the fly;
+slower and RAM-hungry — the cache is the recommended path). Only EP8 deploys
+the full 256-expert model: the kernel programs keep 32 local experts per rank
+(`moe.py` shrinks the global routing space to `32*EP`), so an EP4/EP2
+real-weight run uses the first `32*EP` checkpoint experts with reduced router
+tables — a smoke configuration, not the true model output.
+
+Numeric validation on real weights:
+
+- `decode_layer.py` / `prefill_layer.py` accept `--weights <ckpt_dir>` to
+  inject one layer's real weights (converted on demand); the layer golden then
+  recomputes with the same weights, so the existing per-layer validation runs
+  on real dynamic ranges.
+- `prefill_fwd.py --validate` enables a full-network torch golden
+  (`golden_fwd.py`: embed → 43 chained layer goldens → hc_head → final norm →
+  LM head). End-of-network gates are cosine/rel-L2 on the selected logit rows
+  plus greedy-sample agreement; per-element gates on deep hidden states and
+  compressor state pools accumulate cross-layer drift and are expected to
+  need looser budgets than the single-layer drivers. RoPE tables, the
+indexer Hadamard, caches, and per-step metadata keep their fixture
+initializers. The drivers stay smoke-only (`golden_fn=None`): a real-weight
+run validates that the network executes with real dynamic ranges and produces
+finite logits/sensible tokens, not a golden comparison.
+
 ## Files
 
 | Group | Files |
@@ -136,6 +176,7 @@ prefill_mtp     mtp_projection → prefill_attention_swa → moe → hc_head →
 | Shared transforms | [rmsnorm.py](../../models/deepseek_v4_pro/rmsnorm.py), [qkv_proj_rope.py](../../models/deepseek_v4_pro/qkv_proj_rope.py), [hc_pre.py](../../models/deepseek_v4_pro/hc_pre.py), [hc_post.py](../../models/deepseek_v4_pro/hc_post.py), [hc_head.py](../../models/deepseek_v4_pro/hc_head.py) |
 | MoE and output | [moe.py](../../models/deepseek_v4_pro/moe.py), [gate.py](../../models/deepseek_v4_pro/gate.py), [expert_shared.py](../../models/deepseek_v4_pro/expert_shared.py), [expert_routed.py](../../models/deepseek_v4_pro/expert_routed.py), [lm_head.py](../../models/deepseek_v4_pro/lm_head.py) |
 | Metadata and host helpers | [config.py](../../models/deepseek_v4_pro/config.py), [decode_metadata.py](../../models/deepseek_v4_pro/decode_metadata.py), [rope_tables.py](../../models/deepseek_v4_pro/rope_tables.py) |
+| Real-weight loading | [weights_flash.py](../../models/deepseek_v4_pro/weights_flash.py) |
 
 `config.py`, `decode_metadata.py`, and `rope_tables.py` have no `__main__`
 block and are imported rather than run. Which entry points CI schedules is

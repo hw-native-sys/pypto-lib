@@ -1592,6 +1592,9 @@ def main():
     parser.add_argument("--compile-only", action="store_true", default=False)
     parser.add_argument("--dump-passes", action="store_true", default=False)
     parser.add_argument("--runtime-dir", type=str, default=None)
+    parser.add_argument("--weights", type=str, default=None,
+                        help="Load real DeepSeek-V4-Flash weights: an HF checkpoint dir (converted on "
+                             "the fly) or a .pt cache dir written by weights_flash.py (must match --ep/--tp).")
     args = parser.parse_args()
 
     device_ids = [int(d) for d in args.device.split(",")]
@@ -1599,6 +1602,11 @@ def main():
     assert args.tp == LM_HEAD_TP_SIZE and N_RANKS % args.tp == 0
 
     specs = build_tensor_specs(start_pos=args.start_pos, num_tokens=args.num_tokens)
+    if args.weights is not None:
+        from weights_flash import apply_real_weights
+
+        count = apply_real_weights(specs, args.weights, ep=N_RANKS, tp=LM_HEAD_TP_SIZE)
+        print(f"[RUN] real weights: {count} tensors from {args.weights}", flush=True)
 
     result = run_jit(
         fn=l3_decode_fwd,

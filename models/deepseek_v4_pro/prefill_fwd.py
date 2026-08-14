@@ -19,8 +19,10 @@ layer schedule and calls ``prefill_attention_{swa,hca,csa}`` + ``moe`` directly
 ``pl.scope`` under ``auto_scope=False`` (matching ``decode_fwd``), and the final
 hidden state passes ``hc_head`` -> final ``rms_norm`` to produce the normalized
 ``[T, D]`` hidden state.  A distributed ``lm_head`` then projects selected rows
-to logits and greedily samples the next token.  This is a device smoke driver:
-it does not run a golden comparison.
+to logits and greedily samples the next token.  By default this is a device
+smoke driver (no golden comparison); ``--validate`` chains the leaf goldens
+into a full-network torch reference (``golden_fwd.golden_prefill_fwd``) and
+validates every output, including the resident caches.
 """
 
 import argparse
@@ -1561,6 +1563,12 @@ def main():
     parser.add_argument("--compile-only", action="store_true", default=False)
     parser.add_argument("--dump-passes", action="store_true", default=False)
     parser.add_argument("--runtime-dir", type=str, default=None)
+    parser.add_argument("--weights", type=str, default=None,
+                        help="Load real DeepSeek-V4-Flash weights: an HF checkpoint dir (converted on "
+                             "the fly) or a .pt cache dir written by weights_flash.py (must match --ep/--tp).")
+    parser.add_argument("--validate", action="store_true", default=False,
+                        help="Run the full-network torch golden (golden_fwd.golden_prefill_fwd) and "
+                             "validate hidden states, logits, sampled ids, and the resident caches.")
     args = parser.parse_args()
 
     device_ids = [int(d) for d in args.device.split(",")]
@@ -1568,11 +1576,28 @@ def main():
     assert args.tp == LM_HEAD_TP_SIZE and N_RANKS % args.tp == 0
 
     specs = build_tensor_specs(start_pos=args.start_pos, num_tokens=args.num_tokens)
+    if args.weights is not None:
+        from weights_flash import apply_real_weights
+
+        count = apply_real_weights(specs, args.weights, ep=N_RANKS, tp=LM_HEAD_TP_SIZE)
+        print(f"[RUN] real weights: {count} tensors from {args.weights}", flush=True)
+
+    golden_fn = None
+    compare_fn = None
+    if args.validate:
+        # Deferred import: the golden chain is only needed when validating.
+        from golden_fwd import build_validate_compare_fn, golden_prefill_fwd
+
+        golden_fn = golden_prefill_fwd
+        compare_fn = build_validate_compare_fn(args.num_tokens)
 
     result = run_jit(
         fn=l3_prefill_fwd,
         specs=specs,
-        golden_fn=None,
+        golden_fn=golden_fn,
+        compare_fn=compare_fn,
+        rtol=1e-2,
+        atol=1e-2,
         compile_only=args.compile_only,
         runtime_dir=args.runtime_dir,
         save_data=False,

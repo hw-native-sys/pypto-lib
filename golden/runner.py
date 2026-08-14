@@ -249,6 +249,7 @@ def _prepare_inputs(
     data_dir: Path | None,
     work_dir: Path,
     save_data: bool = True,
+    need_snapshot: bool = True,
 ) -> tuple[dict[str, torch.Tensor], dict[str, ScalarSpec], dict[str, torch.Tensor]]:
     """Build inputs for the runtime stage.
 
@@ -258,18 +259,22 @@ def _prepare_inputs(
     when *save_data* is True, persist into ``{work_dir}/data/in/``. Set
     *save_data* False to skip the on-disk ``.pt`` snapshot (validation still
     works via the in-memory ``input_snapshot``); useful when inputs are large
-    (e.g. full-model weights) and golden replay is not needed.
+    (e.g. full-model weights) and golden replay is not needed. Set
+    *need_snapshot* False as well (no ``golden_fn``) to skip the in-memory
+    input clone entirely — halves peak host RAM on full-model-weight runs.
 
     Raises ``ValueError`` on missing files or scalar dtype mismatch.
     """
     if data_dir is None:
         tensors = {spec.name: spec.create_tensor() for spec in tensor_specs}
         scalar_specs_eff = {s.name: s for s in scalar_specs}
-        input_snapshot = {
-            spec.name: tensors[spec.name].clone()
-            for spec in tensor_specs
-            if not spec.is_output or spec.init_value is not None
-        }
+        input_snapshot = {}
+        if need_snapshot or save_data:
+            input_snapshot = {
+                spec.name: tensors[spec.name].clone()
+                for spec in tensor_specs
+                if not spec.is_output or spec.init_value is not None
+            }
         if save_data:
             in_dir = work_dir / "data" / "in"
             _save_tensors(in_dir, input_snapshot)
@@ -1295,6 +1300,7 @@ def run(
         with _Stage("generate inputs"):
             tensors, scalar_specs_eff, input_snapshot = _prepare_inputs(
                 specs, tensor_specs, scalar_specs, data_dir, work_dir, save_data,
+                need_snapshot=golden_fn is not None,
             )
     except ValueError as e:
         return _fail(str(e))
@@ -1485,6 +1491,7 @@ def run_jit(
         with _Stage("generate inputs"):
             tensors, scalar_specs_eff, input_snapshot = _prepare_inputs(
                 specs, tensor_specs, scalar_specs, data_dir, work_dir, save_data,
+                need_snapshot=golden_fn is not None,
             )
     except ValueError as e:
         return _fail(str(e))
