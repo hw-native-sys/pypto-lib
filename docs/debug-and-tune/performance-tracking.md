@@ -125,6 +125,33 @@ Treat an empty or partially valid result set as a failed collection. A
 successful orchestration exit without the required case coverage must not
 republish an older report as though a new measurement succeeded.
 
+## Supplied reference reporting
+
+Use the `Supplied snapshot` in
+`docs/models/deepseek_v4_flash_w8a8_performance.md` as the presentation
+reference for DeepSeek-V4 Flash W8A8 reports. Every performance table uses the
+same five columns and order:
+
+| Operator | Supplied PyPTO | This test | AscendC | This test / AscendC |
+|----------|----------------:|----------:|--------:|---------------------:|
+
+Calculate the ratio from the unrounded official metric after converting both
+values to the same unit, then round only the quotient to three decimal places.
+A value below 1 means the current test is faster than AscendC. Put source,
+device, validation, and status provenance outside the performance table.
+
+The supplied PyPTO and AscendC values are reporting references only. They do
+not replace the previous compatible result, the frozen lane anchor, or the
+regression thresholds. Pin the reference snapshot and its content digest in
+the reporting system without adding it to the benchmark suite contract; a
+presentation-only change must not schedule a device rerun.
+
+The supplied snapshot does not identify its source revision, test time, exact
+command, or aggregation statistic. Its stated EP16/TP1 configuration also
+differs from the maintained EPLB EP8 workload and its TP4 decode cases. Report
+the ratio as a supplied-reference comparison, not as a strict
+same-configuration regression.
+
 ## Regression confirmation
 
 Begin a new lane or epoch in shadow mode. Collect at least ten independent
