@@ -213,6 +213,27 @@ def attention_csa(
 
     x_normed_t = pl.create_tensor([T, D], dtype=pl.BF16)
     rms_tid = rms_norm(x_mixed, attn_norm_w, x_normed_t)
+    # SDMA CMO L2 warm of this layer's attention weights, in deadline order.
+    wq_a_flat = pl.reshape(wq_a, [D * Q_LORA])
+    wkv_flat = pl.reshape(wkv, [D * HEAD_DIM])
+    idx_wq_b_flat = pl.reshape(idx_wq_b, [Q_LORA * IDX_N_HEADS * IDX_HEAD_DIM])
+    weights_proj_flat = pl.reshape(weights_proj, [D * IDX_N_HEADS])
+    inner_wkv_flat = pl.reshape(inner_wkv, [INNER_OUT_DIM * D])
+    inner_wgate_flat = pl.reshape(inner_wgate, [INNER_OUT_DIM * D])
+    wq_b_flat = pl.reshape(wq_b, [Q_LORA * H * HEAD_DIM])
+    wo_a_flat = pl.reshape(wo_a, [O_GROUPS * O_LORA * O_GROUP_IN])
+    wo_b_flat = pl.reshape(wo_b, [D * O_GROUPS * O_LORA])
+    with pl.at(level=pl.Level.CORE_GROUP, name_hint="prefetch_attn_w", deps=[rms_tid]):
+        warm_ctx = pl.prefetch.make_context()
+        pl.prefetch.async_prefetch(wq_a_flat, warm_ctx)
+        pl.prefetch.async_prefetch(wkv_flat, warm_ctx)
+        pl.prefetch.async_prefetch(idx_wq_b_flat, warm_ctx)
+        pl.prefetch.async_prefetch(weights_proj_flat, warm_ctx)
+        pl.prefetch.async_prefetch(inner_wkv_flat, warm_ctx)
+        pl.prefetch.async_prefetch(inner_wgate_flat, warm_ctx)
+        pl.prefetch.async_prefetch(wq_b_flat, warm_ctx)
+        pl.prefetch.async_prefetch(wo_a_flat, warm_ctx)
+        pl.prefetch.async_prefetch(wo_b_flat, warm_ctx)
     # rms_norm fans out to qr_proj_matmul (critical path), kv_proj_matmul, kv_score_proj
     # and weights_proj. The latter three take this barrier instead of racing the first:
     # the dummy resolves one hop after rms_norm, so qr_proj_matmul is dispatched first.
