@@ -21,42 +21,67 @@ from pathlib import Path
 from typing import Sequence
 
 
-METRIC_CONTRACT_VERSION = "dsv4-eplb-v1"
 CANONICAL_DEVICE_IDS = (0, 2, 4, 6, 8, 10, 12, 14)
 OFFICIAL_ROUNDS = 100
 OFFICIAL_WARMUP = 5
+OFFICIAL_SEED = 1807
 SELECTION_POLICY = "minimum_rank_median"
 MAPPING_BASIS = "ordered_pid_to_ordered_device_set"
 
 
 @dataclass(frozen=True)
 class CaseConfig:
+    metric_contract_version: str
     metric_scope: str
     kernel: str
     dispatches_per_round: int
-    baseline_median_us: float
+    baseline_median_us: float | None
     metric_source: str
+    primary_task: str
+    validation_mode: str
     slot_tasks: tuple[str, ...]
     required_validation_outputs: tuple[str, ...] = ()
+    required_seed: int | None = None
 
 
 CASE_CONFIGS = {
+    "moe-ep8": CaseConfig(
+        metric_contract_version="dsv4-moe-ep8-v1",
+        metric_scope="moe_ep8_fastest_rank",
+        kernel="_jit_l3_moe",
+        dispatches_per_round=1,
+        baseline_median_us=None,
+        metric_source="raw_all",
+        primary_task="moe",
+        validation_mode="numeric_golden",
+        slot_tasks=(),
+        required_validation_outputs=("x_next",),
+        required_seed=OFFICIAL_SEED,
+    ),
     "decode-logits": CaseConfig(
+        metric_contract_version="dsv4-eplb-v2",
         metric_scope="compare3_fastest_rank",
         kernel="_jit_l3_eplb_decode_logits",
         dispatches_per_round=1,
-        baseline_median_us=36144.680,
+        baseline_median_us=None,
         metric_source="raw_all",
+        primary_task="eplb_decode_logits",
+        validation_mode="runtime_only",
         slot_tasks=(),
+        required_seed=OFFICIAL_SEED,
     ),
     "mtp-core": CaseConfig(
+        metric_contract_version="dsv4-eplb-v2",
         metric_scope="compare4_fastest_rank_compute_only",
         kernel="_jit_l3_eplb_mtp_core",
         dispatches_per_round=2,
-        baseline_median_us=1162.050,
+        baseline_median_us=None,
         metric_source="raw_even_with_slot_validation",
+        primary_task="eplb_mtp_core_logits",
+        validation_mode="finite_only",
         slot_tasks=("eplb_mtp_core_logits", "eplb_mtp_core_cleanup"),
         required_validation_outputs=("kv_cache", "hidden_out", "next_pre_hc_hidden", "logits"),
+        required_seed=OFFICIAL_SEED,
     ),
 }
 
@@ -100,6 +125,7 @@ class RankMetric:
 @dataclass(frozen=True)
 class MetricResult:
     case: str
+    metric_contract_version: str
     rounds: int
     warmup: int
     dispatches_per_round: int
@@ -108,23 +134,34 @@ class MetricResult:
     selected_pid: int
     selected_stats: SampleStats
     cleanup_median_us: float | None
-    baseline_median_us: float
+    baseline_median_us: float | None
     metric_scope: str
     metric_source: str
+    validation_mode: str
+    validation_outputs: tuple[tuple[str, str], ...]
     rank_metrics: tuple[RankMetric, ...]
 
     @property
-    def delta_us(self) -> float:
+    def delta_us(self) -> float | None:
+        if self.baseline_median_us is None:
+            return None
         return self.selected_stats.median - self.baseline_median_us
 
     @property
-    def delta_pct(self) -> float:
+    def delta_pct(self) -> float | None:
+        if self.delta_us is None or self.baseline_median_us is None:
+            return None
         return self.delta_us / self.baseline_median_us * 100.0
 
     def summary_tsv_fields(self) -> str:
         cleanup = "-" if self.cleanup_median_us is None else f"{self.cleanup_median_us:.3f}"
+        baseline = (
+            "-" if self.baseline_median_us is None else f"{self.baseline_median_us:.3f}"
+        )
+        delta_us = "-" if self.delta_us is None else f"{self.delta_us:.3f}"
+        delta_pct = "-" if self.delta_pct is None else f"{self.delta_pct:.3f}"
         fields = (
-            METRIC_CONTRACT_VERSION,
+            self.metric_contract_version,
             self.metric_scope,
             SELECTION_POLICY,
             str(self.rounds),
@@ -140,9 +177,9 @@ class MetricResult:
             f"{self.selected_stats.mean:.3f}",
             f"{self.selected_stats.maximum:.3f}",
             cleanup,
-            f"{self.baseline_median_us:.3f}",
-            f"{self.delta_us:.3f}",
-            f"{self.delta_pct:.3f}",
+            baseline,
+            delta_us,
+            delta_pct,
             self.metric_source,
             MAPPING_BASIS,
         )
@@ -189,6 +226,10 @@ _SLOT_SUMMARY_RE = re.compile(
     rf"^\[RUN\]\s+slot (?P<slot>\d+) \((?P<task>[^)]+)\): {_STATS_PATTERN}$"
 )
 _VALIDATION_RE = re.compile(r"^\[RUN\]\s+'(?P<name>[^']+)' (?P<status>PASS|FAIL)\b")
+_FIXTURE_SEED_RE = re.compile(
+    r"^\[RUN\]\s+fixture seed=(?P<seed>-?\d+) python_hash_seed=(?P<hash_seed>\S+)$"
+)
+_RUN_PASS_RE = re.compile(r"^\[RUN\]\s+PASS\s+\(.*\)$")
 
 
 def _parse_device_ids(device_set: str) -> tuple[int, ...]:
@@ -308,7 +349,28 @@ def _require_reported_stats(
             )
 
 
-def _require_validation(lines: Sequence[str], config: CaseConfig) -> None:
+def _require_completed_run(lines: Sequence[str], config: CaseConfig) -> None:
+    if any("Traceback (most recent call last):" in line for line in lines):
+        raise MetricParseError("benchmark log contains a Python traceback")
+    failed_run_lines = [line for line in lines if line.startswith("[RUN]") and "FAIL" in line]
+    if failed_run_lines:
+        raise MetricParseError(f"benchmark log contains a failed RUN line: {failed_run_lines[0]}")
+    passes = [line for line in lines if _RUN_PASS_RE.match(line)]
+    if len(passes) != 1:
+        raise MetricParseError(f"expected exactly one completed RUN PASS line, found {len(passes)}")
+    run_lines = [line for line in lines if line.startswith("[RUN]")]
+    if not run_lines or run_lines[-1] != passes[0]:
+        raise MetricParseError("RUN PASS must be the final RUN line")
+    has_runtime_only_note = "validation skipped: no golden_fn or golden_data" in passes[0]
+    if config.validation_mode == "runtime_only" and not has_runtime_only_note:
+        raise MetricParseError("runtime-only case must report validation skipped")
+    if config.validation_mode != "runtime_only" and has_runtime_only_note:
+        raise MetricParseError("validated case unexpectedly reports validation skipped")
+
+
+def _require_validation(
+    lines: Sequence[str], config: CaseConfig
+) -> tuple[tuple[str, str], ...]:
     validation: dict[str, list[str]] = {}
     for line in lines:
         if match := _VALIDATION_RE.match(line):
@@ -322,6 +384,32 @@ def _require_validation(lines: Sequence[str], config: CaseConfig) -> None:
             raise MetricParseError(
                 f"expected exactly one finite-output PASS for {name!r}, found {statuses}"
             )
+    return tuple((name, statuses[0]) for name, statuses in sorted(validation.items()))
+
+
+def _require_fixture_seed(lines: Sequence[str], config: CaseConfig, seed: int | None) -> None:
+    if config.required_seed is None:
+        if seed is not None:
+            raise MetricParseError("--seed is only valid for a seeded metric contract")
+        return
+    if seed != config.required_seed:
+        raise MetricParseError(
+            f"official {config.metric_contract_version} metrics require "
+            f"seed={config.required_seed}, got {seed}"
+        )
+    matches = [match for line in lines if (match := _FIXTURE_SEED_RE.match(line))]
+    if len(matches) != 1:
+        raise MetricParseError(
+            f"expected exactly one fixture-seed line, found {len(matches)}"
+        )
+    actual_seed = int(matches[0].group("seed"))
+    actual_hash_seed = matches[0].group("hash_seed")
+    if actual_seed != config.required_seed or actual_hash_seed != str(config.required_seed):
+        raise MetricParseError(
+            "fixture-seed mismatch: "
+            f"expected seed/python_hash_seed={config.required_seed}, "
+            f"got {actual_seed}/{actual_hash_seed}"
+        )
 
 
 def parse_perf_log(
@@ -331,6 +419,7 @@ def parse_perf_log(
     rounds: int,
     warmup: int,
     device_set: str,
+    seed: int | None = OFFICIAL_SEED,
 ) -> MetricResult:
     """Parse one completed EPLB benchmark log using the official case contract."""
 
@@ -350,9 +439,11 @@ def parse_perf_log(
         raise MetricParseError("fallback_flattened=1 cannot produce an official EPLB metric")
 
     config = CASE_CONFIGS[case]
+    _require_completed_run(lines, config)
     _require_single_raw_header(lines, rounds=rounds, warmup=warmup)
     _require_context(lines, config, rounds=rounds)
-    _require_validation(lines, config)
+    validation_outputs = _require_validation(lines, config)
+    _require_fixture_seed(lines, config, seed)
 
     raw_by_pid: dict[int, tuple[float, ...]] = {}
     for line in lines:
@@ -393,7 +484,7 @@ def parse_perf_log(
         if unexpected_slot_pids:
             raise MetricParseError(f"slot summaries have no raw rank: {unexpected_slot_pids}")
     elif slots_by_pid:
-        raise MetricParseError("Compare3 must remain one top-level dispatch per rank")
+        raise MetricParseError("single-dispatch cases must not contain slot summaries")
 
     ordered_pids = sorted(raw_by_pid)
     primary_by_pid: dict[int, SampleStats] = {}
@@ -430,7 +521,7 @@ def parse_perf_log(
                 device_id=device_id,
                 pid=pid,
                 slot=0,
-                task=config.slot_tasks[0] if config.slot_tasks else "eplb_decode_logits",
+                task=config.primary_task,
                 selected=pid == selected_pid,
                 stats=primary_by_pid[pid],
             )
@@ -453,6 +544,7 @@ def parse_perf_log(
         cleanup_median = cleanup_by_pid[selected_pid].median
     return MetricResult(
         case=case,
+        metric_contract_version=config.metric_contract_version,
         rounds=rounds,
         warmup=warmup,
         dispatches_per_round=config.dispatches_per_round,
@@ -464,6 +556,8 @@ def parse_perf_log(
         baseline_median_us=config.baseline_median_us,
         metric_scope=config.metric_scope,
         metric_source=config.metric_source,
+        validation_mode=config.validation_mode,
+        validation_outputs=validation_outputs,
         rank_metrics=tuple(rank_metrics),
     )
 
@@ -484,6 +578,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     parser.add_argument("--rounds", required=True, type=int)
     parser.add_argument("--warmup", required=True, type=int)
     parser.add_argument("--device", required=True)
+    parser.add_argument("--seed", type=int, default=OFFICIAL_SEED)
     parser.add_argument("--rank-output", type=Path)
     args = parser.parse_args(argv)
 
@@ -494,6 +589,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             rounds=args.rounds,
             warmup=args.warmup,
             device_set=args.device,
+            seed=args.seed,
         )
         if args.rank_output is not None:
             _append_rank_rows(args.rank_output, result)
