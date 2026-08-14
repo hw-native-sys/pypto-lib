@@ -42,9 +42,8 @@ def rope_profile_for_compress_ratio(config: Any, compress_ratio: int) -> tuple[f
 
 
 def _linear_ramp_factor(low: int, high: int, dim: int, *, device: torch.device | None = None) -> torch.Tensor:
-    if low == high:
-        high = high + 0.001
-    ramp = (torch.arange(dim, dtype=torch.float32, device=device) - low) / (high - low)
+    high_bound = float(high) + 0.001 if low == high else float(high)
+    ramp = (torch.arange(dim, dtype=torch.float32, device=device) - low) / (high_bound - low)
     return torch.clamp(ramp, 0, 1)
 
 

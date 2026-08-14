@@ -248,6 +248,8 @@ def _build_io(compiled, resident_names, vocab_size):
 
 
 def _session_table(batch, table_blocks, physical_blocks):
+    # This synthetic control-path fixture intentionally aliases logical blocks
+    # when its compact physical cache has fewer rows than the logical table.
     row = torch.arange(table_blocks, dtype=torch.int32).remainder(physical_blocks)
     return row.unsqueeze(0).expand(batch, -1).contiguous()
 

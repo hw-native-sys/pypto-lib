@@ -980,6 +980,7 @@ def l3_prefill_fwd(
     logit_row_indices: pl.Tensor[[N_RANKS, MAX_LOGIT_ROWS], pl.INT32],
     num_tokens: pl.Scalar[pl.INT32],
 ):
+    embed_weight.bind_dynamic(1, EMBED_VOCAB_DYN)
     recv_meta_buf = pld.alloc_window_buffer([N_RANKS, N_LOCAL], dtype=pl.INT32)
     recv_x_buf = pld.alloc_window_buffer([N_LOCAL * RECV_MAX, D], dtype=pl.INT8)
     recv_aux_buf = pld.alloc_window_buffer([N_LOCAL * RECV_MAX, AUX_PAD], dtype=pl.FP32)
@@ -1544,6 +1545,7 @@ def main():
         default=ACTIVE_VARIANT,
         help="Architecture preset selected before module import (default: pro).",
     )
+    # This full multi-card forward is device-only (see ``ci: no-sim`` above).
     parser.add_argument("-p", "--platform", type=str, default="a2a3", choices=["a2a3", "a5"])
     parser.add_argument("--ep", type=int, default=N_RANKS, choices=[2, 4, 8],
                         help="EP world size / rank count (parsed at import by moe).")

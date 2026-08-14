@@ -33,6 +33,7 @@ def pack_x_hc(
 ) -> pl.Tensor[[TOKEN_DYN, HC_MULT, D], pl.FP32]:
     """Look up token embeddings and replicate them across the HC lanes."""
     token_count = pl.tensor.dim(input_ids, 0)
+    vocab_rows = pl.tensor.dim(embed_weight, 0)
     x_hc_flat = pl.reshape(x_hc, [token_count * HC_MULT, D])
     work_items = token_count * (D // HIDDEN_TILE)
     for block in pl.spmd(SPMD_BLOCKS, name_hint="pack_x_hc"):
@@ -40,7 +41,8 @@ def pack_x_hc(
             token_idx = work_idx // (D // HIDDEN_TILE)
             hidden_offset = (work_idx % (D // HIDDEN_TILE)) * HIDDEN_TILE
             token_id = pl.tensor.read(input_ids, [token_idx])
-            token_row = pl.cast(token_id, target_type=pl.INDEX)
+            safe_token_id = pl.max(pl.min(token_id, vocab_rows - 1), 0)
+            token_row = pl.cast(safe_token_id, target_type=pl.INDEX)
             hidden_chunk = pl.cast(
                 embed_weight[
                     token_row : token_row + 1,
@@ -70,7 +72,9 @@ def pack_x_hc_test(
 
 
 def golden_pack_x_hc(tensors):
-    hidden = tensors["embed_weight"].index_select(0, tensors["input_ids"].long()).float()
+    vocab_size = tensors["embed_weight"].shape[0]
+    safe_ids = tensors["input_ids"].long().clamp(0, vocab_size - 1)
+    hidden = tensors["embed_weight"].index_select(0, safe_ids).float()
     tensors["x_hc"][:] = hidden.unsqueeze(1).expand(-1, HC_MULT, -1)
 
 
@@ -80,7 +84,7 @@ def build_tensor_specs(token_count, vocab_size):
 
     def init_input_ids():
         samples = torch.tensor(
-            [0, 1, 17, vocab_size - 1, 17, 2, vocab_size // 2, 1],
+            [-1, 0, 17, vocab_size - 1, vocab_size, vocab_size + 7, 2, 1],
             dtype=torch.int64,
         )
         repeats = (token_count + samples.numel() - 1) // samples.numel()
