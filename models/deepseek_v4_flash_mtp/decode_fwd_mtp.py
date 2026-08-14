@@ -6,16 +6,29 @@
 # INCLUDING BUT NOT LIMITED TO NON-INFRINGEMENT, MERCHANTABILITY, OR FITNESS FOR A PARTICULAR PURPOSE.
 # See LICENSE in the root of the software repository for the full text of the License.
 # -----------------------------------------------------------------------------------------------------------
+# ci: devices=2  # CI: EP2/TP2 fused serving-step run
+# ci: no-sim    # CI marker: full multi-layer / multi-card forward — device-only, skip on *sim
 """Fused DeepSeek-V4 main decode, token verification, and MTP decode orchestration."""
 # ruff: noqa: F403,F405
 
+import argparse
+from dataclasses import replace
+
 import pypto.language as pl
 import pypto.language.distributed as pld
+from pypto.ir.distributed_compiled_program import DistributedConfig
 
 from decode_fwd import *
+from decode_fwd import build_tensor_specs as build_decode_fwd_tensor_specs
 from decode_device_state import (
+    STATE_COMMITTED_COUNT,
+    STATE_DRAFT_TOKEN,
+    STATE_GENERATION,
     STATE_META_WIDTH,
+    STATE_TAIL_POSITION,
+    STATE_TAIL_TOKEN,
     STATE_TOKEN_WIDTH,
+    STATE_VALID,
     advance_decode_device_state,
     prepare_decode_from_device_state,
 )
@@ -23,6 +36,7 @@ from decode_mtp import (
     MOE_TOPK,
     MOE_VOCAB,
     ORI_BLOCK_NUM_DYN as MTP_ORI_BLOCK_NUM_DYN,
+    build_tensor_specs as build_decode_mtp_tensor_specs,
     mtp_decode_layer_inline,
 )
 from decode_mtp_verify import verify_and_pack_mtp_tokens
@@ -706,3 +720,289 @@ def l3_decode_fwd_mtp(
             mtp_num_tokens,
             device=rank,
         )
+
+
+def build_tensor_specs(
+    start_pos=DECODE_START_POS,
+    num_tokens=T,
+    ori_block_num=ORI_BLOCK_NUM,
+    cmp_block_num=CSA_CMP_BLOCK_NUM,
+    idx_block_num=CSA_IDX_CACHE_BLOCK_NUM,
+    hca_state_block_num=HCA_COMPRESS_STATE_BLOCK_NUM,
+    csa_state_block_num=CSA_MAIN_STATE_BLOCK_NUM,
+    inner_state_block_num=CSA_INNER_STATE_BLOCK_NUM,
+):
+    import torch
+    from golden import ScalarSpec, TensorSpec
+
+    forward_specs = {
+        spec.name: spec
+        for spec in build_decode_fwd_tensor_specs(
+            start_pos=start_pos,
+            num_tokens=num_tokens,
+            ori_block_num=ori_block_num,
+            cmp_block_num=cmp_block_num,
+            idx_block_num=idx_block_num,
+            hca_state_block_num=hca_state_block_num,
+            csa_state_block_num=csa_state_block_num,
+            inner_state_block_num=inner_state_block_num,
+        )
+    }
+    mtp_specs = {
+        spec.name: spec
+        for spec in build_decode_mtp_tensor_specs(
+            start_pos=start_pos,
+            num_tokens=num_tokens,
+            ori_block_num=ori_block_num,
+        )
+    }
+
+    specs = dict(forward_specs)
+    for name in ("input_ids", "position_ids", "kv_seq_lens"):
+        specs[name] = replace(specs[name], is_output=True)
+
+    def init_tail_token_ids():
+        tokens = torch.arange(B, dtype=torch.int64) + 10
+        return tokens.unsqueeze(0).expand(N_RANKS, -1).contiguous()
+
+    def init_tail_positions():
+        return torch.full((N_RANKS, B), start_pos - 1, dtype=torch.int32)
+
+    def init_tail_slot_ids():
+        slots = torch.arange(B, dtype=torch.int32)
+        return slots.unsqueeze(0).expand(N_RANKS, -1).contiguous()
+
+    def init_state_generations():
+        return torch.ones(N_RANKS, B, dtype=torch.int32)
+
+    def init_state_tokens():
+        tokens = torch.empty(N_RANKS, B, STATE_TOKEN_WIDTH, dtype=torch.int64)
+        tokens[:, :, STATE_TAIL_TOKEN] = torch.arange(B, dtype=torch.int64) + 10
+        tokens[:, :, STATE_DRAFT_TOKEN] = torch.arange(B, dtype=torch.int64) + 20
+        return tokens
+
+    def init_state_meta():
+        meta = torch.zeros(N_RANKS, B, STATE_META_WIDTH, dtype=torch.int32)
+        meta[:, :, STATE_VALID] = 1
+        meta[:, :, STATE_GENERATION] = 1
+        meta[:, :, STATE_TAIL_POSITION] = start_pos - 1
+        meta[:, :, STATE_COMMITTED_COUNT] = 0
+        return meta
+
+    specs.update(
+        {
+            "mtp_tail_token_ids": TensorSpec(
+                "mtp_tail_token_ids",
+                [N_RANKS, B],
+                torch.int64,
+                init_value=init_tail_token_ids,
+                is_output=True,
+            ),
+            "mtp_tail_positions": TensorSpec(
+                "mtp_tail_positions",
+                [N_RANKS, B],
+                torch.int32,
+                init_value=init_tail_positions,
+                is_output=True,
+            ),
+            "mtp_tail_slot_ids": TensorSpec(
+                "mtp_tail_slot_ids",
+                [N_RANKS, B],
+                torch.int32,
+                init_value=init_tail_slot_ids,
+            ),
+            "mtp_state_generations": TensorSpec(
+                "mtp_state_generations",
+                [N_RANKS, B],
+                torch.int32,
+                init_value=init_state_generations,
+            ),
+            "mtp_state_tokens": TensorSpec(
+                "mtp_state_tokens",
+                [N_RANKS, B, STATE_TOKEN_WIDTH],
+                torch.int64,
+                init_value=init_state_tokens,
+                is_output=True,
+                resident="stacked",
+            ),
+            "mtp_state_meta": TensorSpec(
+                "mtp_state_meta",
+                [N_RANKS, B, STATE_META_WIDTH],
+                torch.int32,
+                init_value=init_state_meta,
+                is_output=True,
+                resident="stacked",
+            ),
+            "mtp_input_ids": replace(
+                mtp_specs["input_ids"],
+                name="mtp_input_ids",
+                init_value=None,
+                is_output=True,
+            ),
+            "mtp_position_ids": replace(
+                mtp_specs["position_ids"],
+                name="mtp_position_ids",
+                init_value=None,
+                is_output=True,
+            ),
+            "mtp_accepted_counts": replace(
+                mtp_specs["accepted_counts"],
+                name="mtp_accepted_counts",
+                init_value=None,
+                is_output=True,
+            ),
+            "mtp_tail_pre_hc_pool": replace(
+                mtp_specs["tail_pre_hc_pool"],
+                name="mtp_tail_pre_hc_pool",
+            ),
+            "mtp_hidden_out": replace(mtp_specs["hidden_out"], name="mtp_hidden_out"),
+            "mtp_next_pre_hc_hidden": replace(
+                mtp_specs["next_pre_hc_hidden"],
+                name="mtp_next_pre_hc_hidden",
+            ),
+            "mtp_logits": replace(mtp_specs["logits"], name="mtp_logits"),
+            "mtp_sampled_ids": replace(mtp_specs["sampled_ids"], name="mtp_sampled_ids"),
+            "mtp_logit_row_indices": replace(
+                mtp_specs["logit_row_indices"],
+                name="mtp_logit_row_indices",
+            ),
+            "mtp_num_tokens": ScalarSpec("mtp_num_tokens", torch.int32, num_tokens),
+        }
+    )
+
+    shared_mtp_names = {
+        "embed_weight",
+        "freqs_cos",
+        "freqs_sin",
+        "lm_head_weight",
+        "main_pre_hc_hidden",
+        "num_tokens",
+        "ori_block_table",
+    }
+    custom_mtp_names = {
+        "accepted_counts",
+        "hidden_out",
+        "input_ids",
+        "logit_row_indices",
+        "logits",
+        "next_pre_hc_hidden",
+        "position_ids",
+        "sampled_ids",
+        "tail_pre_hc_pool",
+        "tail_slot_ids",
+    }
+    for name, spec in mtp_specs.items():
+        if name in shared_mtp_names or name in custom_mtp_names:
+            continue
+        specs[f"mtp_{name}"] = replace(spec, name=f"mtp_{name}")
+
+    param_names = l3_decode_fwd_mtp._param_names()
+    missing = set(param_names) - specs.keys()
+    extra = specs.keys() - set(param_names)
+    if missing or extra:
+        raise ValueError(
+            f"decode_fwd_mtp fixture mismatch: missing={sorted(missing)}, extra={sorted(extra)}"
+        )
+    return [specs[name] for name in param_names]
+
+
+def main():
+    from golden import run_jit
+
+    parser = argparse.ArgumentParser(
+        description="DeepSeek-V4 fused main-decode, verification, and MTP decode driver."
+    )
+    parser.add_argument("-p", "--platform", type=str, default="a2a3", choices=["a2a3", "a5"])
+    parser.add_argument(
+        "--ep",
+        type=int,
+        default=N_RANKS,
+        choices=[2, 4, 8],
+        help="EP world size / rank count (parsed at import by moe).",
+    )
+    parser.add_argument(
+        "--tp",
+        type=int,
+        default=LM_HEAD_TP_SIZE,
+        choices=[2, 4, 8, 16],
+        help="LM-head TP world size (parsed at import by lm_head); must divide --ep.",
+    )
+    parser.add_argument(
+        "-d",
+        "--device",
+        type=str,
+        default=",".join(str(i) for i in range(N_RANKS)),
+        help=f"comma-separated device ids; need at least {N_RANKS}",
+    )
+    parser.add_argument("--start-pos", type=int, default=DECODE_START_POS)
+    parser.add_argument("--num-tokens", type=int, default=T)
+    parser.add_argument("--ori-block-num", type=int, default=ORI_BLOCK_NUM)
+    parser.add_argument("--cmp-block-num", type=int, default=CSA_CMP_BLOCK_NUM)
+    parser.add_argument("--idx-block-num", type=int, default=CSA_IDX_CACHE_BLOCK_NUM)
+    parser.add_argument("--hca-state-block-num", type=int, default=HCA_COMPRESS_STATE_BLOCK_NUM)
+    parser.add_argument("--csa-state-block-num", type=int, default=CSA_MAIN_STATE_BLOCK_NUM)
+    parser.add_argument("--inner-state-block-num", type=int, default=CSA_INNER_STATE_BLOCK_NUM)
+    parser.add_argument(
+        "--enable-l2-swimlane",
+        type=int,
+        nargs="?",
+        const=1,
+        default=0,
+        choices=(0, 1, 2),
+    )
+    parser.add_argument("--enable-scope-stats", action="store_true", default=False)
+    parser.add_argument("--compile-only", action="store_true", default=False)
+    parser.add_argument("--dump-passes", action="store_true", default=False)
+    parser.add_argument("--runtime-dir", type=str, default=None)
+    args = parser.parse_args()
+
+    assert args.tp <= args.ep, f"fused decode requires --tp <= --ep, got tp={args.tp}, ep={args.ep}"
+    assert args.ep % args.tp == 0, (
+        f"grouped LM head needs --ep % --tp == 0, got ep={args.ep}, tp={args.tp}"
+    )
+    assert LM_HEAD_TP_SIZE == args.tp, (
+        f"import-time LM_HEAD_TP_SIZE must match --tp, got {LM_HEAD_TP_SIZE} vs {args.tp}"
+    )
+    assert N_RANKS == args.ep, f"import-time N_RANKS must match --ep, got {N_RANKS} vs {args.ep}"
+    assert args.start_pos >= 1, f"--start-pos must be at least 1, got {args.start_pos}"
+
+    device_ids = [int(device) for device in args.device.split(",")]
+    assert len(device_ids) >= N_RANKS, f"need at least {N_RANKS} devices, got {device_ids}"
+
+    result = run_jit(
+        fn=l3_decode_fwd_mtp,
+        specs=build_tensor_specs(
+            start_pos=args.start_pos,
+            num_tokens=args.num_tokens,
+            ori_block_num=args.ori_block_num,
+            cmp_block_num=args.cmp_block_num,
+            idx_block_num=args.idx_block_num,
+            hca_state_block_num=args.hca_state_block_num,
+            csa_state_block_num=args.csa_state_block_num,
+            inner_state_block_num=args.inner_state_block_num,
+        ),
+        golden_fn=None,
+        compile_only=args.compile_only,
+        runtime_dir=args.runtime_dir,
+        save_data=False,
+        compile_cfg=dict(
+            dump_passes=args.dump_passes,
+            distributed_config=DistributedConfig(
+                device_ids=device_ids[:N_RANKS],
+                num_sub_workers=0,
+            ),
+        ),
+        runtime_cfg=dict(
+            platform=args.platform,
+            enable_l2_swimlane=args.enable_l2_swimlane,
+            enable_scope_stats=args.enable_scope_stats,
+        ),
+    )
+    if not result.passed:
+        if result.error:
+            print(result.error)
+        raise SystemExit(1)
+
+
+if __name__ == "__main__":
+    main()

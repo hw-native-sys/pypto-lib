@@ -94,8 +94,10 @@ hidden rows.
 
 [decode_fwd_mtp.py](../../models/deepseek_v4_flash_mtp/decode_fwd_mtp.py) is
 the third top-level composition: it chains the main decode forward, the draft
-verification, and the MTP decode layer into one serving step. It has no CLI of
-its own — see [the MTP path](#mtp-path) below.
+verification, and the MTP decode layer into one serving step. Its device-only
+CLI fixture composes the standalone forward and MTP tensor fixtures with a
+persistent recurrent-state pool. Daily CI runs the default EP2/TP2 fixture on
+two devices; component-level golden checks remain with the standalone paths.
 
 ### One layer
 
@@ -185,7 +187,7 @@ host-side torch counterpart used by the test fixtures.
 | MoE and output | [moe.py](../../models/deepseek_v4_flash_mtp/moe.py), [gate.py](../../models/deepseek_v4_flash_mtp/gate.py), [expert_shared.py](../../models/deepseek_v4_flash_mtp/expert_shared.py), [expert_routed.py](../../models/deepseek_v4_flash_mtp/expert_routed.py), [lm_head.py](../../models/deepseek_v4_flash_mtp/lm_head.py) |
 | Metadata and host helpers | [decode_metadata.py](../../models/deepseek_v4_flash_mtp/decode_metadata.py), [decode_input_pack.py](../../models/deepseek_v4_flash_mtp/decode_input_pack.py), [config.py](../../models/deepseek_v4_flash_mtp/config.py), [utils.py](../../models/deepseek_v4_flash_mtp/utils.py) |
 
-`config.py`, `utils.py`, `rope_interleave.py`, `decode_input_pack.py`, and the
-`decode_fwd_mtp.py` composition have no `__main__` block: they are imported
-rather than run. Which entry points CI schedules is defined by the
+`config.py`, `utils.py`, `rope_interleave.py`, and `decode_input_pack.py` have
+no `__main__` block: they are imported rather than run. Executable compositions,
+including `decode_fwd_mtp.py`, are scheduled by the
 [daily model workflow](../../.github/workflows/daily_ci.yml).
