@@ -972,8 +972,20 @@ def build_tensor_specs(layer_id=0, num_tokens=T, balanced_routing=False):
     return specs
 
 
+def _seed_fixture_generators(seed):
+    import random
+
+    import numpy as np
+    import torch
+
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+
+
 if __name__ == "__main__":
     import argparse
+    import os
 
     from golden import ratio_reldiff, run_jit
 
@@ -991,6 +1003,8 @@ if __name__ == "__main__":
                         help=f"active token count for MoE dispatch/combine (0..{T})")
     parser.add_argument("--balanced-routing", action="store_true", default=False,
                         help="use deterministic hash routes balanced evenly across all experts")
+    parser.add_argument("--seed", type=int, default=None,
+                        help="seed Python, NumPy, and Torch fixture generators")
     parser.add_argument("--enable-l2-swimlane", type=int, nargs="?", const=1, default=0, choices=range(5))
     parser.add_argument("--compile-only", action="store_true", default=False)
     parser.add_argument("--runtime-dir", type=str, default=None)
@@ -1005,6 +1019,14 @@ if __name__ == "__main__":
 
     device_ids = [int(d) for d in args.device.split(",")]
     assert len(device_ids) == N_RANKS, f"need exactly {N_RANKS} devices, got {device_ids}"
+
+    if args.seed is not None:
+        _seed_fixture_generators(args.seed)
+        print(
+            f"[RUN] fixture seed={args.seed} "
+            f"python_hash_seed={os.environ.get('PYTHONHASHSEED', 'unset')}",
+            flush=True,
+        )
 
     golden_data = args.golden_data
 
