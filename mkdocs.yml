@@ -90,6 +90,7 @@ nav:
       - Overview: models/index.md
       - Qwen3-14B: models/qwen3_14b.md
       - DeepSeek V4-Flash (MTP): models/deepseek_v4_flash_mtp.md
+      - DeepSeek V4-Flash W8A8 performance: models/deepseek_v4_flash_w8a8_performance.md
       - DeepSeek V4-Pro: models/deepseek_v4_pro.md
   - Debug and Tune:
       - Overview: debug-and-tune/index.md
