@@ -6,10 +6,10 @@ set -euo pipefail
 readonly SCRIPT_PATH="$(realpath "${BASH_SOURCE[0]}")"
 readonly REPO_ROOT="$(git -C "$(dirname "$SCRIPT_PATH")/.." rev-parse --show-toplevel)"
 readonly METRIC_PARSER="$REPO_ROOT/tools/dsv4_eplb_perf_metrics.py"
+readonly SEED_LAUNCHER="$REPO_ROOT/tools/run_seeded_python.py"
 readonly CANONICAL_DEVICE_SET="0,2,4,6,8,10,12,14"
-readonly METRIC_CONTRACT_VERSION="dsv4-eplb-v1"
-readonly DECODE_LOGITS_BASELINE_US="36144.680"
-readonly MTP_CORE_BASELINE_US="1162.050"
+readonly METRIC_CONTRACT_VERSION="dsv4-eplb-v2"
+readonly OFFICIAL_SEED="1807"
 readonly RING_TASK_WINDOW="262144"
 readonly RING_DEP_POOL="262144"
 readonly RING_HEAP="2147483648"
@@ -21,6 +21,7 @@ SELECTED_CASE="all"
 PYTHON_BIN="${PYPTO_PERF_PYTHON:-python}"
 BENCH_ROUNDS="${PYPTO_BENCH_ROUNDS:-100}"
 BENCH_WARMUP="${PYPTO_BENCH_WARMUP:-5}"
+FIXTURE_SEED="${PYPTO_PERF_SEED:-$OFFICIAL_SEED}"
 COMPILE_ONLY=0
 DRY_RUN=0
 
@@ -42,6 +43,7 @@ Options:
   --python PATH         Python executable (default: python).
   --rounds N            Must be 100 for measured runs (default: 100).
   --warmup N            Must be 5 for measured runs (default: 5).
+  --seed N              Must be 1807 for measured runs (default: 1807).
   --compile-only        Compile each case without requiring timing metrics.
   --dry-run             Print resolved commands without writing or running.
   -h, --help            Show this help.
@@ -99,6 +101,11 @@ while [[ "$#" -gt 0 ]]; do
             BENCH_WARMUP="$2"
             shift 2
             ;;
+        --seed)
+            [[ "$#" -ge 2 ]] || die "--seed requires a value"
+            FIXTURE_SEED="$2"
+            shift 2
+            ;;
         --compile-only)
             COMPILE_ONLY=1
             shift
@@ -124,6 +131,7 @@ esac
 
 require_uint "--rounds" "$BENCH_ROUNDS"
 require_uint "--warmup" "$BENCH_WARMUP"
+require_uint "--seed" "$FIXTURE_SEED"
 [[ "$BENCH_ROUNDS" -gt 0 ]] || die "--rounds must be greater than zero"
 [[ -n "$DEVICE_SET" ]] || die "--device is required outside a task-submit allocation"
 [[ "$DEVICE_SET" == "$CANONICAL_DEVICE_SET" ]] || \
@@ -132,6 +140,8 @@ if [[ "$COMPILE_ONLY" -eq 0 ]]; then
     [[ "$PLATFORM" == "a2a3" ]] || die "official EPLB metrics require --platform a2a3"
     [[ "$BENCH_ROUNDS" == "100" ]] || die "official EPLB metrics require --rounds 100"
     [[ "$BENCH_WARMUP" == "5" ]] || die "official EPLB metrics require --warmup 5"
+    [[ "$FIXTURE_SEED" == "$OFFICIAL_SEED" ]] || \
+        die "official EPLB metrics require --seed $OFFICIAL_SEED"
 fi
 
 IFS=',' read -r -a DEVICE_IDS <<<"$DEVICE_SET"
@@ -170,6 +180,9 @@ build_case_command() {
     local script="$1"
     CASE_COMMAND_ARGS=(
         "$PYTHON_BIN"
+        "$SEED_LAUNCHER"
+        --seed "$FIXTURE_SEED"
+        --
         "$REPO_ROOT/models/deepseek_v4_flash_mtp/$script"
         -p "$PLATFORM"
         -d "$DEVICE_SET"
@@ -191,10 +204,9 @@ build_case_command() {
 if [[ "$DRY_RUN" -eq 1 ]]; then
     printf 'Repository SHA: %s\n' "$(git -C "$REPO_ROOT" rev-parse HEAD)"
     printf 'Output: %s\n' "$OUTPUT_DIR"
-    printf 'Metric contract: %s (Compare3=%s us, Compare4=%s us)\n' \
-        "$METRIC_CONTRACT_VERSION" "$DECODE_LOGITS_BASELINE_US" "$MTP_CORE_BASELINE_US"
-    printf 'Benchmark environment: PYPTO_BENCH=1 PYPTO_BENCH_RAW=1 PYPTO_BENCH_ROUNDS=%s PYPTO_BENCH_WARMUP=%s\n' \
-        "$BENCH_ROUNDS" "$BENCH_WARMUP"
+    printf 'Metric contract: %s\n' "$METRIC_CONTRACT_VERSION"
+    printf 'Benchmark environment: PYTHONHASHSEED=%s PYPTO_BENCH=1 PYPTO_BENCH_RAW=1 PYPTO_BENCH_ROUNDS=%s PYPTO_BENCH_WARMUP=%s\n' \
+        "$FIXTURE_SEED" "$BENCH_ROUNDS" "$BENCH_WARMUP"
     if [[ "$SELECTED_CASE" == "all" || "$SELECTED_CASE" == "decode-logits" ]]; then
         printf 'decode-logits:\n'
         build_case_command "eplb_decode_logits.py"
@@ -210,6 +222,7 @@ fi
 
 command -v "$PYTHON_BIN" >/dev/null 2>&1 || die "Python executable not found: $PYTHON_BIN"
 [[ -f "$METRIC_PARSER" ]] || die "metric parser not found: $METRIC_PARSER"
+[[ -f "$SEED_LAUNCHER" ]] || die "seed launcher not found: $SEED_LAUNCHER"
 [[ ! -e "$OUTPUT_DIR" ]] || die "output directory already exists: $OUTPUT_DIR"
 mkdir -p "$OUTPUT_DIR"
 OUTPUT_DIR="$(realpath "$OUTPUT_DIR")"
@@ -231,8 +244,6 @@ git -C "$REPO_ROOT" status --short >"$OUTPUT_DIR/source-status.txt"
     printf 'commits_ahead\t%s\n' "$COMMITS_AHEAD"
     printf 'commits_behind\t%s\n' "$COMMITS_BEHIND"
     printf 'metric_contract_version\t%s\n' "$METRIC_CONTRACT_VERSION"
-    printf 'decode_logits_baseline_us\t%s\n' "$DECODE_LOGITS_BASELINE_US"
-    printf 'mtp_core_baseline_us\t%s\n' "$MTP_CORE_BASELINE_US"
     printf 'platform\t%s\n' "$PLATFORM"
     printf 'device_set\t%s\n' "$DEVICE_SET"
     printf 'ep_size\t8\n'
@@ -242,6 +253,7 @@ git -C "$REPO_ROOT" status --short >"$OUTPUT_DIR/source-status.txt"
     printf 'num_tokens\t8\n'
     printf 'rounds\t%s\n' "$BENCH_ROUNDS"
     printf 'warmup\t%s\n' "$BENCH_WARMUP"
+    printf 'fixture_seed\t%s\n' "$FIXTURE_SEED"
     printf 'pto2_ring_task_window\t%s\n' "$RING_TASK_WINDOW"
     printf 'pto2_ring_dep_pool\t%s\n' "$RING_DEP_POOL"
     printf 'pto2_ring_heap\t%s\n' "$RING_HEAP"
@@ -280,7 +292,7 @@ run_case() {
     local rc
 
     build_case_command "$script"
-    [[ -f "${CASE_COMMAND_ARGS[1]}" ]] || die "benchmark script not found: ${CASE_COMMAND_ARGS[1]}"
+    [[ -f "${CASE_COMMAND_ARGS[5]}" ]] || die "benchmark script not found: ${CASE_COMMAND_ARGS[5]}"
 
     printf '[RUN] %s\n' "$label"
     print_command "${CASE_COMMAND_ARGS[@]}"
@@ -290,6 +302,7 @@ run_case() {
         PYPTO_BENCH_ROUNDS="$BENCH_ROUNDS" \
         PYPTO_BENCH_WARMUP="$BENCH_WARMUP" \
         PYPTO_RUNTIME_LOG=error \
+        PYTHONHASHSEED="$FIXTURE_SEED" \
         SIMPLER_DEVICE_STRACE_ENABLE=1 \
         PTO2_RING_TASK_WINDOW="$RING_TASK_WINDOW" \
         PTO2_RING_DEP_POOL="$RING_DEP_POOL" \
@@ -313,6 +326,7 @@ run_case() {
                 --rounds "$BENCH_ROUNDS" \
                 --warmup "$BENCH_WARMUP" \
                 --device "$DEVICE_SET" \
+                --seed "$FIXTURE_SEED" \
                 --rank-output "$OUTPUT_DIR/rank-results.tsv" \
                 2>"$metric_error_file"
         )"
