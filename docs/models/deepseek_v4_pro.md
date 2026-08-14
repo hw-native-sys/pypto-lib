@@ -1,12 +1,12 @@
-# DeepSeek V4
+# DeepSeek V4-Pro
 
-`models/deepseek_v4/` is the shared Ascend 950 (A5) implementation for the
-DeepSeek-V4 Pro and Flash architecture presets. Select the preset at import and
-compile time with `DEEPSEEK_V4_VARIANT=pro|flash` or `--variant pro|flash`.
+`models/deepseek_v4_pro/` is the Ascend 950 (A5) implementation for DeepSeek-V4
+Pro, with an optional Flash architecture preset. Select the preset at import
+and compile time with `DEEPSEEK_V4_VARIANT=pro|flash` or `--variant pro|flash`.
 
 ## Deployment configuration
 
-The `PRO` and `FLASH` presets in [config.py](../../models/deepseek_v4/config.py)
+The `PRO` and `FLASH` presets in [config.py](../../models/deepseek_v4_pro/config.py)
 define the architecture-specific shapes and layer schedules. Pro remains the
 default so existing operator entry points and DailyCI keep their prior behavior.
 
@@ -16,7 +16,7 @@ default so existing operator entry points and DailyCI keep their prior behavior.
 | Decode batch per card | 4 requests → 8 token rows per step |
 | Decode context length | up to 16,384 positions (`KERNEL_MAX_SEQ_LEN`), 128-token pages |
 | Prefill shape | one request of 128 tokens per program |
-| Platform | Ascend A5 (`-p a5`); the parsers also accept A2/A3 and both simulators |
+| Platform | Ascend A5 (`-p a5`); full forwards are device-only |
 | Expert parallelism | `--ep 2/4/8`, `384 / ep` routed experts per rank |
 | LM-head parallelism | `--tp 2/4/8` vocab shards; `LM_HEAD_TP_SIZE = 8` is the deployment value |
 | Other components | no tensor parallelism — attention is data-parallel, MoE is expert-parallel |
@@ -33,7 +33,7 @@ constant if a case needs a longer context.
 Native MXFP8-MXFP4 is not implemented yet. The tracked kernels run an INT8
 stand-in with the same tensor split as
 [V4-Flash](deepseek_v4_flash_mtp.md#what-is-quantized): `gen_routed_weight` in
-[expert_routed.py](../../models/deepseek_v4/expert_routed.py) re-quantizes
+[expert_routed.py](../../models/deepseek_v4_pro/expert_routed.py) re-quantizes
 off the MXFP4 grid into INT8 rather than feeding the cube MXFP4 weights.
 
 ### Model shape and layer schedule
@@ -75,7 +75,7 @@ prefill_fwd    same schedule with prefill_attention_{hca,csa} → moe,
 ```
 
 Both forwards finish with the final norm and LM-head sampling. The standalone
-[lm_head.py](../../models/deepseek_v4/lm_head.py) entry point validates that
+[lm_head.py](../../models/deepseek_v4_pro/lm_head.py) entry point validates that
 distributed tail separately.
 
 ### One layer
@@ -126,16 +126,16 @@ prefill_mtp     mtp_projection → prefill_attention_swa → moe → hc_head →
 
 | Group | Files |
 | --- | --- |
-| Full forward | [decode_fwd.py](../../models/deepseek_v4/decode_fwd.py), [prefill_fwd.py](../../models/deepseek_v4/prefill_fwd.py) |
-| Layer composition | [decode_layer.py](../../models/deepseek_v4/decode_layer.py), [prefill_layer.py](../../models/deepseek_v4/prefill_layer.py) |
-| MTP | [decode_mtp.py](../../models/deepseek_v4/decode_mtp.py), [prefill_mtp.py](../../models/deepseek_v4/prefill_mtp.py), [mtp_projection.py](../../models/deepseek_v4/mtp_projection.py) |
-| Decode attention orchestration | [decode_attention_swa.py](../../models/deepseek_v4/decode_attention_swa.py), [decode_attention_csa.py](../../models/deepseek_v4/decode_attention_csa.py), [decode_attention_hca.py](../../models/deepseek_v4/decode_attention_hca.py) |
-| Decode sparse attention (fused o-proj) | [decode_sparse_attn.py](../../models/deepseek_v4/decode_sparse_attn.py), [decode_sparse_attn_swa.py](../../models/deepseek_v4/decode_sparse_attn_swa.py), [decode_sparse_attn_hca.py](../../models/deepseek_v4/decode_sparse_attn_hca.py) |
-| Decode compressors and indexer | [decode_compressor_ratio4.py](../../models/deepseek_v4/decode_compressor_ratio4.py), [decode_compressor_ratio128.py](../../models/deepseek_v4/decode_compressor_ratio128.py), [decode_indexer.py](../../models/deepseek_v4/decode_indexer.py), [decode_indexer_compressor.py](../../models/deepseek_v4/decode_indexer_compressor.py) |
-| Prefill attention and cache | [prefill_attention_swa.py](../../models/deepseek_v4/prefill_attention_swa.py), [prefill_attention_csa.py](../../models/deepseek_v4/prefill_attention_csa.py), [prefill_attention_hca.py](../../models/deepseek_v4/prefill_attention_hca.py), [prefill_sparse_attn.py](../../models/deepseek_v4/prefill_sparse_attn.py), [prefill_compressor_ratio4.py](../../models/deepseek_v4/prefill_compressor_ratio4.py), [prefill_compressor_ratio128.py](../../models/deepseek_v4/prefill_compressor_ratio128.py), [prefill_indexer.py](../../models/deepseek_v4/prefill_indexer.py), [prefill_indexer_compressor.py](../../models/deepseek_v4/prefill_indexer_compressor.py) |
-| Shared transforms | [rmsnorm.py](../../models/deepseek_v4/rmsnorm.py), [qkv_proj_rope.py](../../models/deepseek_v4/qkv_proj_rope.py), [hc_pre.py](../../models/deepseek_v4/hc_pre.py), [hc_post.py](../../models/deepseek_v4/hc_post.py), [hc_head.py](../../models/deepseek_v4/hc_head.py) |
-| MoE and output | [moe.py](../../models/deepseek_v4/moe.py), [gate.py](../../models/deepseek_v4/gate.py), [expert_shared.py](../../models/deepseek_v4/expert_shared.py), [expert_routed.py](../../models/deepseek_v4/expert_routed.py), [lm_head.py](../../models/deepseek_v4/lm_head.py) |
-| Metadata and host helpers | [config.py](../../models/deepseek_v4/config.py), [decode_metadata.py](../../models/deepseek_v4/decode_metadata.py), [rope_tables.py](../../models/deepseek_v4/rope_tables.py) |
+| Full forward | [decode_fwd.py](../../models/deepseek_v4_pro/decode_fwd.py), [prefill_fwd.py](../../models/deepseek_v4_pro/prefill_fwd.py) |
+| Layer composition | [decode_layer.py](../../models/deepseek_v4_pro/decode_layer.py), [prefill_layer.py](../../models/deepseek_v4_pro/prefill_layer.py) |
+| MTP | [decode_mtp.py](../../models/deepseek_v4_pro/decode_mtp.py), [prefill_mtp.py](../../models/deepseek_v4_pro/prefill_mtp.py), [mtp_projection.py](../../models/deepseek_v4_pro/mtp_projection.py) |
+| Decode attention orchestration | [decode_attention_swa.py](../../models/deepseek_v4_pro/decode_attention_swa.py), [decode_attention_csa.py](../../models/deepseek_v4_pro/decode_attention_csa.py), [decode_attention_hca.py](../../models/deepseek_v4_pro/decode_attention_hca.py) |
+| Decode sparse attention (fused o-proj) | [decode_sparse_attn.py](../../models/deepseek_v4_pro/decode_sparse_attn.py), [decode_sparse_attn_swa.py](../../models/deepseek_v4_pro/decode_sparse_attn_swa.py), [decode_sparse_attn_hca.py](../../models/deepseek_v4_pro/decode_sparse_attn_hca.py) |
+| Decode compressors and indexer | [decode_compressor_ratio4.py](../../models/deepseek_v4_pro/decode_compressor_ratio4.py), [decode_compressor_ratio128.py](../../models/deepseek_v4_pro/decode_compressor_ratio128.py), [decode_indexer.py](../../models/deepseek_v4_pro/decode_indexer.py), [decode_indexer_compressor.py](../../models/deepseek_v4_pro/decode_indexer_compressor.py) |
+| Prefill attention and cache | [prefill_attention_swa.py](../../models/deepseek_v4_pro/prefill_attention_swa.py), [prefill_attention_csa.py](../../models/deepseek_v4_pro/prefill_attention_csa.py), [prefill_attention_hca.py](../../models/deepseek_v4_pro/prefill_attention_hca.py), [prefill_sparse_attn.py](../../models/deepseek_v4_pro/prefill_sparse_attn.py), [prefill_compressor_ratio4.py](../../models/deepseek_v4_pro/prefill_compressor_ratio4.py), [prefill_compressor_ratio128.py](../../models/deepseek_v4_pro/prefill_compressor_ratio128.py), [prefill_indexer.py](../../models/deepseek_v4_pro/prefill_indexer.py), [prefill_indexer_compressor.py](../../models/deepseek_v4_pro/prefill_indexer_compressor.py) |
+| Shared transforms | [rmsnorm.py](../../models/deepseek_v4_pro/rmsnorm.py), [qkv_proj_rope.py](../../models/deepseek_v4_pro/qkv_proj_rope.py), [hc_pre.py](../../models/deepseek_v4_pro/hc_pre.py), [hc_post.py](../../models/deepseek_v4_pro/hc_post.py), [hc_head.py](../../models/deepseek_v4_pro/hc_head.py) |
+| MoE and output | [moe.py](../../models/deepseek_v4_pro/moe.py), [gate.py](../../models/deepseek_v4_pro/gate.py), [expert_shared.py](../../models/deepseek_v4_pro/expert_shared.py), [expert_routed.py](../../models/deepseek_v4_pro/expert_routed.py), [lm_head.py](../../models/deepseek_v4_pro/lm_head.py) |
+| Metadata and host helpers | [config.py](../../models/deepseek_v4_pro/config.py), [decode_metadata.py](../../models/deepseek_v4_pro/decode_metadata.py), [rope_tables.py](../../models/deepseek_v4_pro/rope_tables.py) |
 
 `config.py`, `decode_metadata.py`, and `rope_tables.py` have no `__main__`
 block and are imported rather than run. Which entry points CI schedules is

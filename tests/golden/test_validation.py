@@ -25,7 +25,7 @@ from golden.validation import (
 )
 
 
-_MODEL_DIR = Path(__file__).resolve().parents[2] / "models" / "deepseek_v4"
+_MODEL_DIR = Path(__file__).resolve().parents[2] / "models" / "deepseek_v4_pro"
 _MISSING = object()
 
 
@@ -68,22 +68,22 @@ def _load_model_module(module_name, filename, dependencies=()):
 
 
 _DECODE_INDEXER, _ = _load_model_module(
-    "_test_deepseek_v4_decode_indexer",
+    "_test_deepseek_v4_pro_decode_indexer",
     "decode_indexer.py",
     dependencies=("decode_indexer_compressor",),
 )
 _GATE, _ = _load_model_module(
-    "_test_deepseek_v4_gate",
+    "_test_deepseek_v4_pro_gate",
     "gate.py",
 )
 _PREFILL_INDEXER, _PREFILL_DEPS = _load_model_module(
-    "_test_deepseek_v4_prefill_indexer",
+    "_test_deepseek_v4_pro_prefill_indexer",
     "prefill_indexer.py",
     dependencies=("prefill_indexer_compressor",),
 )
 _PREFILL_COMPRESSOR = _PREFILL_DEPS["prefill_indexer_compressor"]
 _QKV, _ = _load_model_module(
-    "_test_deepseek_v4_qkv_proj_rope",
+    "_test_deepseek_v4_pro_qkv_proj_rope",
     "qkv_proj_rope.py",
 )
 
