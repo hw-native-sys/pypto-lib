@@ -28,7 +28,7 @@ MAX_LOGIT_ROWS = DECODE_TOKENS
 
 # parallelism
 _TP_CHOICES = (2, 4, 8, 16)
-_DP_CHOICES = (2, 4, 8, 16)
+_DP_CHOICES = (1, 2, 4, 8, 16)
 _TP_DEFAULT = 2
 
 
@@ -42,8 +42,10 @@ def _parse_int_argv(name, default=None):
 
 
 TP_SIZE: int = _parse_int_argv("--tp") or _TP_DEFAULT
-# --dp sizes the standalone fixture; the kernel carries no DP extent.
-DP_SIZE: int = _parse_int_argv("--dp") or TP_SIZE
+# --dp sizes the standalone fixture: DP groups of TP ranks each; the
+# kernel carries no DP extent.
+DP_SIZE: int = _parse_int_argv("--dp") or 1
+WORLD_SIZE = TP_SIZE * DP_SIZE
 VOCAB_PER_TP = VOCAB // TP_SIZE
 GROUP_LOGIT_ROWS = TP_SIZE * MAX_LOGIT_ROWS
 TEST_TOKENS = 2 * MAX_LOGIT_ROWS  # standalone fixture: hidden rows per card
@@ -435,11 +437,11 @@ def lm_head_with_sampling_test(
 
 @pl.jit.host
 def l3_lm_head(
-    hidden_states: pl.Tensor[[DP_SIZE, TEST_TOKENS, D], pl.BF16],
-    lm_head_weight: pl.Tensor[[DP_SIZE, VOCAB_PER_TP, D], pl.BF16],
-    logits: pl.Out[pl.Tensor[[DP_SIZE, MAX_LOGIT_ROWS, VOCAB], pl.FP32]],
-    sampled_ids: pl.Out[pl.Tensor[[DP_SIZE, MAX_LOGIT_ROWS, SAMPLED_IDS_PAD], pl.INT32]],
-    logit_row_indices: pl.Tensor[[DP_SIZE, MAX_LOGIT_ROWS], pl.INT32],
+    hidden_states: pl.Tensor[[WORLD_SIZE, TEST_TOKENS, D], pl.BF16],
+    lm_head_weight: pl.Tensor[[WORLD_SIZE, VOCAB_PER_TP, D], pl.BF16],
+    logits: pl.Out[pl.Tensor[[WORLD_SIZE, MAX_LOGIT_ROWS, VOCAB], pl.FP32]],
+    sampled_ids: pl.Out[pl.Tensor[[WORLD_SIZE, MAX_LOGIT_ROWS, SAMPLED_IDS_PAD], pl.INT32]],
+    logit_row_indices: pl.Tensor[[WORLD_SIZE, MAX_LOGIT_ROWS], pl.INT32],
 ):
     # Windows are group-local: hidden_window holds one row slot per group member,
     # and every card receives only its own full-vocabulary logits.
@@ -470,7 +472,7 @@ def golden_lm_head(tensors):
     weight = tensors["lm_head_weight"].float()
     full_weight = torch.cat([weight[tp] for tp in range(TP_SIZE)], dim=0)
     full_logits = []
-    for owner_rank in range(DP_SIZE):
+    for owner_rank in range(WORLD_SIZE):
         selected = torch.zeros((MAX_LOGIT_ROWS, D), dtype=torch.float32)
         for row in range(MAX_LOGIT_ROWS):
             source_row = int(tensors["logit_row_indices"][owner_rank, row])
@@ -491,29 +493,29 @@ def build_tensor_specs(num_tokens=TEST_TOKENS):
     active = max(min(num_tokens, MAX_LOGIT_ROWS), 0)
 
     def init_hidden_states():
-        return (torch.randn(DP_SIZE, TEST_TOKENS, D) * 0.1).to(torch.bfloat16)
+        return (torch.randn(WORLD_SIZE, TEST_TOKENS, D) * 0.1).to(torch.bfloat16)
 
     def init_lm_head_weight():
         shards = (torch.randn(TP_SIZE, VOCAB_PER_TP, D) / D ** 0.5).to(torch.bfloat16)
-        return torch.stack([shards[r % TP_SIZE] for r in range(DP_SIZE)], dim=0)
+        return torch.stack([shards[r % TP_SIZE] for r in range(WORLD_SIZE)], dim=0)
 
     def init_logit_row_indices():
-        indices = torch.full((DP_SIZE, MAX_LOGIT_ROWS), -1, dtype=torch.int32)
+        indices = torch.full((WORLD_SIZE, MAX_LOGIT_ROWS), -1, dtype=torch.int32)
         indices[:, :active] = torch.arange(active, dtype=torch.int32)
         return indices
 
     return [
-        TensorSpec("hidden_states", [DP_SIZE, TEST_TOKENS, D], torch.bfloat16, init_value=init_hidden_states),
+        TensorSpec("hidden_states", [WORLD_SIZE, TEST_TOKENS, D], torch.bfloat16, init_value=init_hidden_states),
         # One vocab shard per DP rank: card r carries a copy of shard
         # r % TP_SIZE, matching how resident args are handed out per rank. Keep
         # each rank-local shard on its consuming card across dispatches.
         TensorSpec(
-            "lm_head_weight", [DP_SIZE, VOCAB_PER_TP, D], torch.bfloat16,
+            "lm_head_weight", [WORLD_SIZE, VOCAB_PER_TP, D], torch.bfloat16,
             init_value=init_lm_head_weight, resident="stacked",
         ),
-        TensorSpec("logits", [DP_SIZE, MAX_LOGIT_ROWS, VOCAB], torch.float32, is_output=True),
-        TensorSpec("sampled_ids", [DP_SIZE, MAX_LOGIT_ROWS, SAMPLED_IDS_PAD], torch.int32, is_output=True),
-        TensorSpec("logit_row_indices", [DP_SIZE, MAX_LOGIT_ROWS], torch.int32, init_value=init_logit_row_indices),
+        TensorSpec("logits", [WORLD_SIZE, MAX_LOGIT_ROWS, VOCAB], torch.float32, is_output=True),
+        TensorSpec("sampled_ids", [WORLD_SIZE, MAX_LOGIT_ROWS, SAMPLED_IDS_PAD], torch.int32, is_output=True),
+        TensorSpec("logit_row_indices", [WORLD_SIZE, MAX_LOGIT_ROWS], torch.int32, init_value=init_logit_row_indices),
     ]
 
 
@@ -561,10 +563,10 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("-p", "--platform", type=str, default="a2a3", choices=["a2a3", "a2a3sim", "a5", "a5sim"])
     parser.add_argument("--tp", type=int, default=TP_SIZE, choices=list(_TP_CHOICES), help="LM-head tensor-parallel world size")
-    parser.add_argument("--dp", type=int, default=DP_SIZE, choices=list(_DP_CHOICES), help="Attention-DP world size (hidden-row owners)")
+    parser.add_argument("--dp", type=int, default=DP_SIZE, choices=list(_DP_CHOICES), help="DP groups (world size = tp * dp)")
     parser.add_argument("--num-tokens", type=int, default=TEST_TOKENS, help="Active hidden rows each owner projects")
-    device_default = ",".join(str(i) for i in range(DP_SIZE))
-    parser.add_argument("-d", "--device", type=str, default=device_default, help=f"comma-separated device ids; need at least {DP_SIZE}")
+    device_default = ",".join(str(i) for i in range(WORLD_SIZE))
+    parser.add_argument("-d", "--device", type=str, default=device_default, help=f"comma-separated device ids; need at least {WORLD_SIZE}")
     parser.add_argument("--enable-l2-swimlane", type=int, nargs="?", const=1, default=0,
                         choices=(0, 1, 2, 4))
     parser.add_argument("--enable-scope-stats", action="store_true", default=False)
@@ -574,7 +576,7 @@ if __name__ == "__main__":
     args = parser.parse_args()
 
     device_ids = [int(d) for d in args.device.split(",")]
-    required_devices = DP_SIZE
+    required_devices = WORLD_SIZE
     assert len(device_ids) >= required_devices, f"need at least {required_devices} devices, got {device_ids}"
     assert args.tp == TP_SIZE and args.dp == DP_SIZE
     assert 1 <= args.num_tokens <= TEST_TOKENS

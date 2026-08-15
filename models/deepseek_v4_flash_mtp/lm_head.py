@@ -11,7 +11,7 @@
 
 Hidden states must already have passed the final RMSNorm.
 
-The DP world is cut into ``--dp // --tp`` groups. Every card is both an owner and
+The DP world is ``--dp`` groups of ``--tp`` TP ranks each. Every card is both an owner and
 a TP rank: it holds vocab shard ``rank % TP_SIZE`` and serves only its own group,
 so every ``peer`` is ``group_base + tp_rank``.
 
@@ -43,7 +43,7 @@ VOCAB = M.vocab_size
 
 # Parallelism. Static in the frontend, so both worlds are parsed off argv here.
 _TP_CHOICES = (2, 4, 8, 16)
-_DP_CHOICES = (2, 4, 8, 16)
+_DP_CHOICES = (1, 2, 4, 8, 16)
 _TP_DEFAULT = 2
 
 
@@ -57,10 +57,11 @@ def _parse_int_argv(name, default=None):
 
 
 TP_SIZE: int = _parse_int_argv("--tp") or _TP_DEFAULT
-# --dp only sizes the standalone l3_lm_head fixture: how many DP ranks it builds.
+# --dp sizes the standalone l3_lm_head fixture: how many DP groups it builds.
 # The kernel itself carries no DP extent, so composed callers never pass it.
-DP_SIZE: int = _parse_int_argv("--dp") or TP_SIZE
+DP_SIZE: int = _parse_int_argv("--dp") or 1
 VOCAB_PER_TP = VOCAB // TP_SIZE
+WORLD_SIZE = TP_SIZE * DP_SIZE
 
 # Rows. Decode specializations override DECODE_TOKENS before importing this
 # module; standalone and prefill callers retain the checked-in eight-row tile.
@@ -132,7 +133,6 @@ assert GREEDY_NUM_VOCAB_CHUNKS <= GREEDY_CHUNK_PAD
 assert GROUP_LOGIT_ROWS % 16 == 0, "matmul M extent must be a multiple of 16"
 assert TP_SIZE in _TP_CHOICES, f"--tp must be one of {_TP_CHOICES} (got {TP_SIZE})"
 assert DP_SIZE in _DP_CHOICES, f"--dp must be one of {_DP_CHOICES} (got {DP_SIZE})"
-assert DP_SIZE % TP_SIZE == 0, f"--dp must be a multiple of --tp, got dp={DP_SIZE}, tp={TP_SIZE}"
 
 
 @pl.jit.inline(auto_scope=False)
@@ -536,13 +536,13 @@ def lm_head_with_sampling_test(
 
 @pl.jit.host
 def l3_lm_head(
-    hidden_states: pl.Tensor[[DP_SIZE, TEST_TOKENS, D], pl.BF16],
-    lm_head_weight: pl.Tensor[[DP_SIZE, VOCAB_PER_TP, D], pl.BF16],
-    logits: pl.Out[pl.Tensor[[DP_SIZE, MAX_LOGIT_ROWS, VOCAB], pl.FP32]],
+    hidden_states: pl.Tensor[[WORLD_SIZE, TEST_TOKENS, D], pl.BF16],
+    lm_head_weight: pl.Tensor[[WORLD_SIZE, VOCAB_PER_TP, D], pl.BF16],
+    logits: pl.Out[pl.Tensor[[WORLD_SIZE, MAX_LOGIT_ROWS, VOCAB], pl.FP32]],
     sampled_ids: pl.Out[
-        pl.Tensor[[DP_SIZE, MAX_LOGIT_ROWS, SAMPLED_IDS_PAD], pl.INT32]
+        pl.Tensor[[WORLD_SIZE, MAX_LOGIT_ROWS, SAMPLED_IDS_PAD], pl.INT32]
     ],
-    logit_row_indices: pl.Tensor[[DP_SIZE, MAX_LOGIT_ROWS], pl.INT32],
+    logit_row_indices: pl.Tensor[[WORLD_SIZE, MAX_LOGIT_ROWS], pl.INT32],
 ):
     # Windows are group-local: hidden_window holds one row slot per group member,
     # and every card receives only its own full-vocabulary logits.
@@ -573,7 +573,7 @@ def golden_lm_head(tensors):
     weight = tensors["lm_head_weight"].float()
     full_weight = torch.cat([weight[tp] for tp in range(TP_SIZE)], dim=0)
     full_logits = []
-    for owner_rank in range(DP_SIZE):
+    for owner_rank in range(WORLD_SIZE):
         selected = torch.zeros((MAX_LOGIT_ROWS, D), dtype=torch.float32)
         for row in range(MAX_LOGIT_ROWS):
             source_row = int(tensors["logit_row_indices"][owner_rank, row])
@@ -597,21 +597,21 @@ def build_tensor_specs(num_tokens=TEST_TOKENS):
     active = max(min(num_tokens, MAX_LOGIT_ROWS), 0)
 
     def init_hidden_states():
-        return (torch.randn(DP_SIZE, TEST_TOKENS, D) * 0.1).to(torch.bfloat16)
+        return (torch.randn(WORLD_SIZE, TEST_TOKENS, D) * 0.1).to(torch.bfloat16)
 
     def init_lm_head_weight():
         shards = (torch.randn(TP_SIZE, VOCAB_PER_TP, D) / D ** 0.5).to(torch.bfloat16)
-        return torch.stack([shards[r % TP_SIZE] for r in range(DP_SIZE)], dim=0)
+        return torch.stack([shards[r % TP_SIZE] for r in range(WORLD_SIZE)], dim=0)
 
     def init_logit_row_indices():
-        indices = torch.full((DP_SIZE, MAX_LOGIT_ROWS), -1, dtype=torch.int32)
+        indices = torch.full((WORLD_SIZE, MAX_LOGIT_ROWS), -1, dtype=torch.int32)
         indices[:, :active] = torch.arange(active, dtype=torch.int32)
         return indices
 
     return [
         TensorSpec(
             "hidden_states",
-            [DP_SIZE, TEST_TOKENS, D],
+            [WORLD_SIZE, TEST_TOKENS, D],
             torch.bfloat16,
             init_value=init_hidden_states,
         ),
@@ -620,26 +620,26 @@ def build_tensor_specs(num_tokens=TEST_TOKENS):
         # each rank-local shard on its consuming card across dispatches.
         TensorSpec(
             "lm_head_weight",
-            [DP_SIZE, VOCAB_PER_TP, D],
+            [WORLD_SIZE, VOCAB_PER_TP, D],
             torch.bfloat16,
             init_value=init_lm_head_weight,
             resident="stacked",
         ),
         TensorSpec(
             "logits",
-            [DP_SIZE, MAX_LOGIT_ROWS, VOCAB],
+            [WORLD_SIZE, MAX_LOGIT_ROWS, VOCAB],
             torch.float32,
             is_output=True,
         ),
         TensorSpec(
             "sampled_ids",
-            [DP_SIZE, MAX_LOGIT_ROWS, SAMPLED_IDS_PAD],
+            [WORLD_SIZE, MAX_LOGIT_ROWS, SAMPLED_IDS_PAD],
             torch.int32,
             is_output=True,
         ),
         TensorSpec(
             "logit_row_indices",
-            [DP_SIZE, MAX_LOGIT_ROWS],
+            [WORLD_SIZE, MAX_LOGIT_ROWS],
             torch.int32,
             init_value=init_logit_row_indices,
         ),
@@ -694,11 +694,11 @@ if __name__ == "__main__":
     parser.add_argument("--tp", type=int, default=TP_SIZE, choices=list(_TP_CHOICES),
                         help="LM-head tensor-parallel world size")
     parser.add_argument("--dp", type=int, default=DP_SIZE, choices=list(_DP_CHOICES),
-                        help="Attention-DP world size (hidden-row owners)")
+                        help="DP groups (world size = tp * dp)")
     parser.add_argument("--num-tokens", type=int, default=TEST_TOKENS,
                         help="Active hidden rows each owner projects")
-    parser.add_argument("-d", "--device", type=str, default=",".join(str(i) for i in range(DP_SIZE)),
-                        help=f"comma-separated device ids; need at least {DP_SIZE}")
+    parser.add_argument("-d", "--device", type=str, default=",".join(str(i) for i in range(WORLD_SIZE)),
+                        help=f"comma-separated device ids; need at least {WORLD_SIZE}")
     parser.add_argument("--enable-l2-swimlane", type=int, nargs="?", const=1, default=0,
                         choices=(0, 1, 2, 4))
     parser.add_argument("--compile-only", action="store_true", default=False)
@@ -707,7 +707,7 @@ if __name__ == "__main__":
     args = parser.parse_args()
 
     device_ids = [int(d) for d in args.device.split(",")]
-    required_devices = DP_SIZE
+    required_devices = WORLD_SIZE
     assert len(device_ids) >= required_devices, (
         f"need at least {required_devices} devices, got {device_ids}"
     )
