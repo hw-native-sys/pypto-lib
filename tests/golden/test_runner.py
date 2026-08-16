@@ -1352,6 +1352,9 @@ class TestResidentPath:
                 assert handle is state_handle
                 calls["events"].append(("free", handle))
 
+            def release_inherited_host_tensor_refs(self):
+                pass
+
             def __call__(self, *args, config=None):
                 assert config == "RUNCFG"
                 assert len(args) == 1
@@ -1413,10 +1416,11 @@ class TestResidentPath:
             )
 
         assert result is None
-        assert calls["prepare"] == (
-            ("RUNCFG",),
-            {"persistent": True, "reset_persistent_windows": False},
-        )
+        prepare_args, prepare_kwargs = calls["prepare"]
+        assert prepare_args == ("RUNCFG",)
+        assert prepare_kwargs["persistent"] is True
+        assert prepare_kwargs["reset_persistent_windows"] is False
+        assert prepare_kwargs["inherited_host_tensors"] == [state_init]
         assert [kind for kind, _ in calls["events"]] == [
             "alloc", "dispatch", "dispatch", "dispatch", "dispatch", "dispatch", "free",
         ]
@@ -1480,11 +1484,14 @@ class TestResidentPath:
             def free_tensor(self, _h):
                 raise AssertionError("stacked handle must be freed via free_stacked_tensor")
 
+            def release_inherited_host_tensor_refs(self):
+                pass
+
             def __call__(self, *_args, config=None):
                 calls["dispatched"] += 1
 
         class _FakeDCP:
-            def prepare(self):
+            def prepare(self, **_kwargs):
                 return _FakeRT()
 
         fake_mod = types.ModuleType("pypto.ir.distributed_compiled_program")
@@ -1554,11 +1561,14 @@ class TestResidentPath:
             def free_tensor(self, _h, *, worker_id=0):
                 raise AssertionError(f"successful stacked handle must be freed as a stack: {worker_id}")
 
+            def release_inherited_host_tensor_refs(self):
+                pass
+
             def __call__(self, *_args, config=None):
                 calls["dispatched"] += 1
 
         class _FakeDCP:
-            def prepare(self):
+            def prepare(self, **_kwargs):
                 return _FakeRT()
 
         fake_mod = types.ModuleType("pypto.ir.distributed_compiled_program")
@@ -1620,6 +1630,9 @@ class TestResidentPath:
             def free_stacked_tensor(self, _h):
                 pass
 
+            def release_inherited_host_tensor_refs(self):
+                pass
+
             def __call__(self, *_args, config=None):
                 pass
 
@@ -1628,7 +1641,7 @@ class TestResidentPath:
                 host.fill_(7.0)  # simulate the device's final in-place-updated state
 
         class _FakeDCP:
-            def prepare(self):
+            def prepare(self, **_kwargs):
                 return _FakeRT()
 
         fake_mod = types.ModuleType("pypto.ir.distributed_compiled_program")

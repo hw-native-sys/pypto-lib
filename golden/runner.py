@@ -249,6 +249,7 @@ def _prepare_inputs(
     data_dir: Path | None,
     work_dir: Path,
     save_data: bool = True,
+    snapshot_inputs: bool = True,
 ) -> tuple[dict[str, torch.Tensor], dict[str, ScalarSpec], dict[str, torch.Tensor]]:
     """Build inputs for the runtime stage.
 
@@ -265,11 +266,15 @@ def _prepare_inputs(
     if data_dir is None:
         tensors = {spec.name: spec.create_tensor() for spec in tensor_specs}
         scalar_specs_eff = {s.name: s for s in scalar_specs}
-        input_snapshot = {
-            spec.name: tensors[spec.name].clone()
-            for spec in tensor_specs
-            if not spec.is_output or spec.init_value is not None
-        }
+        input_snapshot = (
+            {
+                spec.name: tensors[spec.name].clone()
+                for spec in tensor_specs
+                if not spec.is_output or spec.init_value is not None
+            }
+            if snapshot_inputs or save_data
+            else {}
+        )
         if save_data:
             in_dir = work_dir / "data" / "in"
             _save_tensors(in_dir, input_snapshot)
@@ -919,13 +924,29 @@ def _run_l3_resident(
             "(a @pl.jit.host kernel compiled with distributed_config)."
         )
 
-    # Per-call IO + resident upload sources must be shared memory before prepare().
-    _share_in_place(tensors)
-
     ordered_names = _l3_ordered_names(compiled)
     pure_out_names = _l3_pure_out_names(compiled)
     run_config = _l3_run_config(runtime_cfg)
     resident_specs = [s for s in tensor_specs if s.is_resident]
+    resident_names = {s.name for s in resident_specs}
+
+    # Per-call IO must be shared so forked workers can read/write it directly.
+    # Large read-only resident upload sources can instead remain ordinary
+    # contiguous CPU tensors registered through inherited_host_tensors. Keep a
+    # resident output shared only when golden validation needs a D2H read-back.
+    shared_tensors = {
+        name: tensor
+        for name, tensor in tensors.items()
+        if name not in resident_names
+        or (golden_outputs is not None and any(s.name == name and s.is_output for s in resident_specs))
+    }
+    _share_in_place(shared_tensors)
+    tensors.update(shared_tensors)
+    inherited_host_tensors = [
+        tensors[s.name]
+        for s in resident_specs
+        if s.name not in pure_out_names and not tensors[s.name].is_shared()
+    ]
     bench = _bench_enabled()
 
     def _dispatch_resident(
@@ -949,9 +970,12 @@ def _run_l3_resident(
                 run_config,
                 persistent=True,
                 reset_persistent_windows=False,
+                inherited_host_tensors=inherited_host_tensors,
             )
         else:
-            prepared = compiled.prepare()
+            prepared = compiled.prepare(
+                inherited_host_tensors=inherited_host_tensors,
+            )
         with prepared as rt:
             # (name, handle, is_stacked, worker_id) — is_stacked picks the matching
             # free below; worker_id is the card a whole-tensor buffer was allocated on.
@@ -981,6 +1005,7 @@ def _run_l3_resident(
                             tuple(s.shape), s.dtype, init=init, worker_id=wid
                         )
                         resident_handles.append((s.name, handle, False, wid))
+                rt.release_inherited_host_tensor_refs()
                 resident_args = {name: handle for name, handle, _, _ in resident_handles}
 
                 def _arg(name: str) -> Any:
@@ -1295,6 +1320,7 @@ def run(
         with _Stage("generate inputs"):
             tensors, scalar_specs_eff, input_snapshot = _prepare_inputs(
                 specs, tensor_specs, scalar_specs, data_dir, work_dir, save_data,
+                snapshot_inputs=golden_fn is not None,
             )
     except ValueError as e:
         return _fail(str(e))
@@ -1485,6 +1511,7 @@ def run_jit(
         with _Stage("generate inputs"):
             tensors, scalar_specs_eff, input_snapshot = _prepare_inputs(
                 specs, tensor_specs, scalar_specs, data_dir, work_dir, save_data,
+                snapshot_inputs=golden_fn is not None,
             )
     except ValueError as e:
         return _fail(str(e))

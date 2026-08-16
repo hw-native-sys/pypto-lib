@@ -51,13 +51,24 @@ from moe import (
     N_RANKS,
     N_ROUTES,
     RECV_MAX,
+    ROUTED_N_TILE,
+    ROUTED_W13_SCALE_ROWS,
+    ROUTED_W2_SCALE_ROWS,
+    SHARED_N_TILE,
+    SHARED_W13_SCALE_ROWS,
+    SHARED_W2_SCALE_ROWS,
     TOPK,
     VOCAB,
     build_tensor_specs as build_moe_tensor_specs,
     golden_moe,
     moe,
 )
-from mtp_projection import _quantize_weight_per_out, golden_mtp_projection, mtp_projection
+from mtp_projection import (
+    MX_SCALE_ROWS as MTP_MX_SCALE_ROWS,
+    OUT_CHUNK as MTP_OUT_CHUNK,
+    golden_mtp_projection,
+    mtp_projection,
+)
 from prefill_attention_swa import (
     BLOCK_NUM,
     BLOCK_SIZE,
@@ -67,12 +78,19 @@ from prefill_attention_swa import (
     O_GROUP_IN,
     O_GROUPS,
     O_LORA,
+    O_MX_N_TILE,
     Q_LORA,
+    QKV_MX_N_TILE,
     ROPE_HEAD_DIM,
+    WO_A_SCALE_ROWS,
+    WO_B_SCALE_ROWS,
+    WQA_SCALE_ROWS,
+    WQB_SCALE_ROWS,
+    WKV_SCALE_ROWS,
+    build_tensor_specs as build_attention_tensor_specs,
     golden_prefill_attention_swa,
     prefill_attention_swa,
 )
-from prefill_fwd import build_single_layer_tensor_specs
 from rmsnorm import golden_rms_norm, rms_norm
 
 
@@ -87,20 +105,22 @@ def mtp_prefill_fwd(
     prev_hidden_states: pl.Tensor[[T, HC_MULT, D], pl.FP32],
     enorm_w: pl.Tensor[[D], pl.FP32],
     hnorm_w: pl.Tensor[[D], pl.FP32],
-    e_proj_w: pl.Tensor[[D, D], pl.INT8],
-    e_proj_w_scale: pl.Tensor[[D], pl.FP32],
+    e_proj_w: pl.Tensor[[D, D], pl.FP8E4M3FN],
+    e_proj_w_scale: pl.Tensor[[MTP_MX_SCALE_ROWS, MTP_OUT_CHUNK], pl.FP8E8M0],
     e_proj_smooth: pl.Tensor[[D], pl.FP32],
-    h_proj_w: pl.Tensor[[D, D], pl.INT8],
-    h_proj_w_scale: pl.Tensor[[D], pl.FP32],
+    h_proj_w: pl.Tensor[[D, D], pl.FP8E4M3FN],
+    h_proj_w_scale: pl.Tensor[[MTP_MX_SCALE_ROWS, MTP_OUT_CHUNK], pl.FP8E8M0],
     h_proj_smooth: pl.Tensor[[D], pl.FP32],
     hc_attn_fn: pl.Tensor[[MIX_HC, HC_DIM], pl.FP32],
     hc_attn_scale: pl.Tensor[[3], pl.FP32],
     hc_attn_base: pl.Tensor[[MIX_HC], pl.FP32],
     attn_norm_w: pl.Tensor[[D], pl.BF16],
-    wq_a: pl.Tensor[[D, Q_LORA], pl.BF16],
-    wq_b: pl.Tensor[[Q_LORA, H * HEAD_DIM], pl.INT8],
-    wq_b_scale: pl.Tensor[[H * HEAD_DIM], pl.FP32],
-    wkv: pl.Tensor[[D, HEAD_DIM], pl.BF16],
+    wq_a: pl.Tensor[[D, Q_LORA], pl.FP8E4M3FN],
+    wq_a_scale: pl.Tensor[[WQA_SCALE_ROWS, QKV_MX_N_TILE], pl.FP8E8M0],
+    wq_b: pl.Tensor[[Q_LORA, H * HEAD_DIM], pl.FP8E4M3FN],
+    wq_b_scale: pl.Tensor[[WQB_SCALE_ROWS, QKV_MX_N_TILE], pl.FP8E8M0],
+    wkv: pl.Tensor[[D, HEAD_DIM], pl.FP8E4M3FN],
+    wkv_scale: pl.Tensor[[WKV_SCALE_ROWS, QKV_MX_N_TILE], pl.FP8E8M0],
     gamma_cq: pl.Tensor[[Q_LORA], pl.BF16],
     gamma_ckv: pl.Tensor[[HEAD_DIM], pl.BF16],
     freqs_cos: pl.Tensor[[MAX_SEQ_LEN, ROPE_HEAD_DIM], pl.BF16],
@@ -110,9 +130,10 @@ def mtp_prefill_fwd(
     ori_slot_mapping: pl.Tensor[[T], pl.INT64],
     position_ids: pl.Tensor[[T], pl.INT32],
     attn_sink: pl.Tensor[[H], pl.FP32],
-    wo_a: pl.Tensor[[O_GROUPS, O_LORA, O_GROUP_IN], pl.BF16],
-    wo_b: pl.Tensor[[D, O_GROUPS * O_LORA], pl.INT8],
-    wo_b_scale: pl.Tensor[[D], pl.FP32],
+    wo_a: pl.Tensor[[O_GROUPS, O_GROUP_IN, O_LORA], pl.FP8E4M3FN],
+    wo_a_scale: pl.Tensor[[WO_A_SCALE_ROWS, O_MX_N_TILE], pl.FP8E8M0],
+    wo_b: pl.Tensor[[O_GROUPS * O_LORA, D], pl.FP8E4M3FN],
+    wo_b_scale: pl.Tensor[[WO_B_SCALE_ROWS, O_MX_N_TILE], pl.FP8E8M0],
     hc_ffn_fn: pl.Tensor[[MIX_HC, HC_DIM], pl.FP32],
     hc_ffn_scale: pl.Tensor[[3], pl.FP32],
     hc_ffn_base: pl.Tensor[[MIX_HC], pl.FP32],
@@ -121,18 +142,18 @@ def mtp_prefill_fwd(
     gate_bias: pl.Tensor[[N_EXPERTS_GLOBAL], pl.FP32],
     tid2eid: pl.Tensor[[VOCAB, TOPK], pl.INT32],
     input_ids: pl.Tensor[[T], pl.INT64],
-    routed_w1: pl.Tensor[[N_LOCAL, MOE_INTER, D], pl.INT8],
-    routed_w1_scale: pl.Tensor[[N_LOCAL, MOE_INTER], pl.FP32],
-    routed_w3: pl.Tensor[[N_LOCAL, MOE_INTER, D], pl.INT8],
-    routed_w3_scale: pl.Tensor[[N_LOCAL, MOE_INTER], pl.FP32],
-    routed_w2: pl.Tensor[[N_LOCAL, D, MOE_INTER], pl.INT8],
-    routed_w2_scale: pl.Tensor[[N_LOCAL, D], pl.FP32],
-    shared_w1: pl.Tensor[[MOE_INTER, D], pl.INT8],
-    shared_w1_scale: pl.Tensor[[MOE_INTER], pl.FP32],
-    shared_w3: pl.Tensor[[MOE_INTER, D], pl.INT8],
-    shared_w3_scale: pl.Tensor[[MOE_INTER], pl.FP32],
-    shared_w2: pl.Tensor[[D, MOE_INTER], pl.INT8],
-    shared_w2_scale: pl.Tensor[[D], pl.FP32],
+    routed_w1: pl.Tensor[[N_LOCAL * D, MOE_INTER], pl.FP4],
+    routed_w1_scale: pl.Tensor[[ROUTED_W13_SCALE_ROWS, ROUTED_N_TILE], pl.FP8E8M0],
+    routed_w3: pl.Tensor[[N_LOCAL * D, MOE_INTER], pl.FP4],
+    routed_w3_scale: pl.Tensor[[ROUTED_W13_SCALE_ROWS, ROUTED_N_TILE], pl.FP8E8M0],
+    routed_w2: pl.Tensor[[N_LOCAL * MOE_INTER, D], pl.FP4],
+    routed_w2_scale: pl.Tensor[[ROUTED_W2_SCALE_ROWS, ROUTED_N_TILE], pl.FP8E8M0],
+    shared_w1: pl.Tensor[[D, MOE_INTER], pl.FP8E4M3FN],
+    shared_w1_scale: pl.Tensor[[SHARED_W13_SCALE_ROWS, SHARED_N_TILE], pl.FP8E8M0],
+    shared_w3: pl.Tensor[[D, MOE_INTER], pl.FP8E4M3FN],
+    shared_w3_scale: pl.Tensor[[SHARED_W13_SCALE_ROWS, SHARED_N_TILE], pl.FP8E8M0],
+    shared_w2: pl.Tensor[[MOE_INTER, D], pl.FP8E4M3FN],
+    shared_w2_scale: pl.Tensor[[SHARED_W2_SCALE_ROWS, SHARED_N_TILE], pl.FP8E8M0],
     mtp_hc_head_fn: pl.Tensor[[HC_MULT, HC_DIM], pl.FP32],
     mtp_hc_head_scale: pl.Tensor[[1], pl.FP32],
     mtp_hc_head_base: pl.Tensor[[HC_MULT], pl.FP32],
@@ -165,11 +186,11 @@ def mtp_prefill_fwd(
     prefill_attention_swa(
         projected,
         hc_attn_fn, hc_attn_scale, hc_attn_base, attn_norm_w,
-        wq_a, wq_b, wq_b_scale, wkv, gamma_cq, gamma_ckv,
+        wq_a, wq_a_scale, wq_b, wq_b_scale, wkv, wkv_scale, gamma_cq, gamma_ckv,
         freqs_cos, freqs_sin,
         kv_cache, ori_block_table, ori_slot_mapping,
         position_ids,
-        attn_sink, wo_a, wo_b, wo_b_scale,
+        attn_sink, wo_a, wo_a_scale, wo_b, wo_b_scale,
         x_attn, nt,
     )
 
@@ -199,20 +220,22 @@ def l3_mtp_prefill_fwd(
     prev_hidden_states: pl.Tensor[[N_RANKS, T, HC_MULT, D], pl.FP32],
     enorm_w: pl.Tensor[[N_RANKS, D], pl.FP32],
     hnorm_w: pl.Tensor[[N_RANKS, D], pl.FP32],
-    e_proj_w: pl.Tensor[[N_RANKS, D, D], pl.INT8],
-    e_proj_w_scale: pl.Tensor[[N_RANKS, D], pl.FP32],
+    e_proj_w: pl.Tensor[[N_RANKS, D, D], pl.FP8E4M3FN],
+    e_proj_w_scale: pl.Tensor[[N_RANKS, MTP_MX_SCALE_ROWS, MTP_OUT_CHUNK], pl.FP8E8M0],
     e_proj_smooth: pl.Tensor[[N_RANKS, D], pl.FP32],
-    h_proj_w: pl.Tensor[[N_RANKS, D, D], pl.INT8],
-    h_proj_w_scale: pl.Tensor[[N_RANKS, D], pl.FP32],
+    h_proj_w: pl.Tensor[[N_RANKS, D, D], pl.FP8E4M3FN],
+    h_proj_w_scale: pl.Tensor[[N_RANKS, MTP_MX_SCALE_ROWS, MTP_OUT_CHUNK], pl.FP8E8M0],
     h_proj_smooth: pl.Tensor[[N_RANKS, D], pl.FP32],
     hc_attn_fn: pl.Tensor[[N_RANKS, MIX_HC, HC_DIM], pl.FP32],
     hc_attn_scale: pl.Tensor[[N_RANKS, 3], pl.FP32],
     hc_attn_base: pl.Tensor[[N_RANKS, MIX_HC], pl.FP32],
     attn_norm_w: pl.Tensor[[N_RANKS, D], pl.BF16],
-    wq_a: pl.Tensor[[N_RANKS, D, Q_LORA], pl.BF16],
-    wq_b: pl.Tensor[[N_RANKS, Q_LORA, H * HEAD_DIM], pl.INT8],
-    wq_b_scale: pl.Tensor[[N_RANKS, H * HEAD_DIM], pl.FP32],
-    wkv: pl.Tensor[[N_RANKS, D, HEAD_DIM], pl.BF16],
+    wq_a: pl.Tensor[[N_RANKS, D, Q_LORA], pl.FP8E4M3FN],
+    wq_a_scale: pl.Tensor[[N_RANKS, WQA_SCALE_ROWS, QKV_MX_N_TILE], pl.FP8E8M0],
+    wq_b: pl.Tensor[[N_RANKS, Q_LORA, H * HEAD_DIM], pl.FP8E4M3FN],
+    wq_b_scale: pl.Tensor[[N_RANKS, WQB_SCALE_ROWS, QKV_MX_N_TILE], pl.FP8E8M0],
+    wkv: pl.Tensor[[N_RANKS, D, HEAD_DIM], pl.FP8E4M3FN],
+    wkv_scale: pl.Tensor[[N_RANKS, WKV_SCALE_ROWS, QKV_MX_N_TILE], pl.FP8E8M0],
     gamma_cq: pl.Tensor[[N_RANKS, Q_LORA], pl.BF16],
     gamma_ckv: pl.Tensor[[N_RANKS, HEAD_DIM], pl.BF16],
     freqs_cos: pl.Tensor[[N_RANKS, MAX_SEQ_LEN, ROPE_HEAD_DIM], pl.BF16],
@@ -222,9 +245,10 @@ def l3_mtp_prefill_fwd(
     ori_slot_mapping: pl.Tensor[[N_RANKS, T], pl.INT64],
     position_ids: pl.Tensor[[N_RANKS, T], pl.INT32],
     attn_sink: pl.Tensor[[N_RANKS, H], pl.FP32],
-    wo_a: pl.Tensor[[N_RANKS, O_GROUPS, O_LORA, O_GROUP_IN], pl.BF16],
-    wo_b: pl.Tensor[[N_RANKS, D, O_GROUPS * O_LORA], pl.INT8],
-    wo_b_scale: pl.Tensor[[N_RANKS, D], pl.FP32],
+    wo_a: pl.Tensor[[N_RANKS, O_GROUPS, O_GROUP_IN, O_LORA], pl.FP8E4M3FN],
+    wo_a_scale: pl.Tensor[[N_RANKS, WO_A_SCALE_ROWS, O_MX_N_TILE], pl.FP8E8M0],
+    wo_b: pl.Tensor[[N_RANKS, O_GROUPS * O_LORA, D], pl.FP8E4M3FN],
+    wo_b_scale: pl.Tensor[[N_RANKS, WO_B_SCALE_ROWS, O_MX_N_TILE], pl.FP8E8M0],
     hc_ffn_fn: pl.Tensor[[N_RANKS, MIX_HC, HC_DIM], pl.FP32],
     hc_ffn_scale: pl.Tensor[[N_RANKS, 3], pl.FP32],
     hc_ffn_base: pl.Tensor[[N_RANKS, MIX_HC], pl.FP32],
@@ -233,18 +257,18 @@ def l3_mtp_prefill_fwd(
     gate_bias: pl.Tensor[[N_RANKS, N_EXPERTS_GLOBAL], pl.FP32],
     tid2eid: pl.Tensor[[N_RANKS, VOCAB, TOPK], pl.INT32],
     input_ids: pl.Tensor[[N_RANKS, T], pl.INT64],
-    routed_w1: pl.Tensor[[N_RANKS, N_LOCAL, MOE_INTER, D], pl.INT8],
-    routed_w1_scale: pl.Tensor[[N_RANKS, N_LOCAL, MOE_INTER], pl.FP32],
-    routed_w3: pl.Tensor[[N_RANKS, N_LOCAL, MOE_INTER, D], pl.INT8],
-    routed_w3_scale: pl.Tensor[[N_RANKS, N_LOCAL, MOE_INTER], pl.FP32],
-    routed_w2: pl.Tensor[[N_RANKS, N_LOCAL, D, MOE_INTER], pl.INT8],
-    routed_w2_scale: pl.Tensor[[N_RANKS, N_LOCAL, D], pl.FP32],
-    shared_w1: pl.Tensor[[N_RANKS, MOE_INTER, D], pl.INT8],
-    shared_w1_scale: pl.Tensor[[N_RANKS, MOE_INTER], pl.FP32],
-    shared_w3: pl.Tensor[[N_RANKS, MOE_INTER, D], pl.INT8],
-    shared_w3_scale: pl.Tensor[[N_RANKS, MOE_INTER], pl.FP32],
-    shared_w2: pl.Tensor[[N_RANKS, D, MOE_INTER], pl.INT8],
-    shared_w2_scale: pl.Tensor[[N_RANKS, D], pl.FP32],
+    routed_w1: pl.Tensor[[N_RANKS, N_LOCAL * D, MOE_INTER], pl.FP4],
+    routed_w1_scale: pl.Tensor[[N_RANKS, ROUTED_W13_SCALE_ROWS, ROUTED_N_TILE], pl.FP8E8M0],
+    routed_w3: pl.Tensor[[N_RANKS, N_LOCAL * D, MOE_INTER], pl.FP4],
+    routed_w3_scale: pl.Tensor[[N_RANKS, ROUTED_W13_SCALE_ROWS, ROUTED_N_TILE], pl.FP8E8M0],
+    routed_w2: pl.Tensor[[N_RANKS, N_LOCAL * MOE_INTER, D], pl.FP4],
+    routed_w2_scale: pl.Tensor[[N_RANKS, ROUTED_W2_SCALE_ROWS, ROUTED_N_TILE], pl.FP8E8M0],
+    shared_w1: pl.Tensor[[N_RANKS, D, MOE_INTER], pl.FP8E4M3FN],
+    shared_w1_scale: pl.Tensor[[N_RANKS, SHARED_W13_SCALE_ROWS, SHARED_N_TILE], pl.FP8E8M0],
+    shared_w3: pl.Tensor[[N_RANKS, D, MOE_INTER], pl.FP8E4M3FN],
+    shared_w3_scale: pl.Tensor[[N_RANKS, SHARED_W13_SCALE_ROWS, SHARED_N_TILE], pl.FP8E8M0],
+    shared_w2: pl.Tensor[[N_RANKS, MOE_INTER, D], pl.FP8E4M3FN],
+    shared_w2_scale: pl.Tensor[[N_RANKS, SHARED_W2_SCALE_ROWS, SHARED_N_TILE], pl.FP8E8M0],
     mtp_hc_head_fn: pl.Tensor[[N_RANKS, HC_MULT, HC_DIM], pl.FP32],
     mtp_hc_head_scale: pl.Tensor[[N_RANKS, 1], pl.FP32],
     mtp_hc_head_base: pl.Tensor[[N_RANKS, HC_MULT], pl.FP32],
@@ -278,11 +302,12 @@ def l3_mtp_prefill_fwd(
             e_proj_w[r], e_proj_w_scale[r], e_proj_smooth[r],
             h_proj_w[r], h_proj_w_scale[r], h_proj_smooth[r],
             hc_attn_fn[r], hc_attn_scale[r], hc_attn_base[r], attn_norm_w[r],
-            wq_a[r], wq_b[r], wq_b_scale[r], wkv[r], gamma_cq[r], gamma_ckv[r],
+            wq_a[r], wq_a_scale[r], wq_b[r], wq_b_scale[r], wkv[r], wkv_scale[r],
+            gamma_cq[r], gamma_ckv[r],
             freqs_cos[r], freqs_sin[r],
             kv_cache[r], ori_block_table[r], ori_slot_mapping[r],
             position_ids[r],
-            attn_sink[r], wo_a[r], wo_b[r], wo_b_scale[r],
+            attn_sink[r], wo_a[r], wo_a_scale[r], wo_b[r], wo_b_scale[r],
             hc_ffn_fn[r], hc_ffn_scale[r], hc_ffn_base[r], norm_w[r],
             gate_w[r], gate_bias[r], tid2eid[r], input_ids[r],
             routed_w1[r], routed_w1_scale[r], routed_w3[r], routed_w3_scale[r],
@@ -310,8 +335,28 @@ def _ranked(spec, torch, is_output=False):
     )
 
 
+def _rank_single_spec(spec, *, replicated=False, name=None):
+    import torch
+    from golden import TensorSpec
+
+    def init():
+        if replicated:
+            value = spec.create_tensor()
+            return value.unsqueeze(0).expand(N_RANKS, *value.shape).contiguous()
+        return torch.stack([spec.create_tensor() for _ in range(N_RANKS)], dim=0)
+
+    return TensorSpec(
+        name or spec.name,
+        [N_RANKS, *spec.shape],
+        spec.dtype,
+        init_value=init,
+        is_output=spec.is_output,
+    )
+
+
 def _projection_specs():
     import torch
+    from expert_shared import _gen_mxfp8_weight_kn
     from golden import TensorSpec
 
     e_proj_cache = None
@@ -321,10 +366,11 @@ def _projection_specs():
         weights = []
         scales = []
         for _ in range(N_RANKS):
-            w = (torch.rand(D, D) / D ** 0.5).to(torch.bfloat16)
-            w_i8, scale = _quantize_weight_per_out(w)
-            weights.append(w_i8)
-            scales.append(scale.float())
+            weight, scale = _gen_mxfp8_weight_kn(
+                (D, D), dequant_std=0.25 / D ** 0.5, chan_cv=0.25
+            )
+            weights.append(weight)
+            scales.append(scale)
         return torch.stack(weights, dim=0).contiguous(), torch.stack(scales, dim=0).contiguous()
 
     def init_e_proj_w():
@@ -355,11 +401,11 @@ def _projection_specs():
                    init_value=lambda: torch.randn(N_RANKS, T, HC_MULT, D).to(torch.bfloat16)),
         TensorSpec("enorm_w", [N_RANKS, D], torch.float32, init_value=lambda: torch.ones(N_RANKS, D)),
         TensorSpec("hnorm_w", [N_RANKS, D], torch.float32, init_value=lambda: torch.ones(N_RANKS, D)),
-        TensorSpec("e_proj_w", [N_RANKS, D, D], torch.int8, init_value=init_e_proj_w),
-        TensorSpec("e_proj_w_scale", [N_RANKS, D], torch.float32, init_value=init_e_proj_w_scale),
+        TensorSpec("e_proj_w", [N_RANKS, D, D], torch.float8_e4m3fn, init_value=init_e_proj_w),
+        TensorSpec("e_proj_w_scale", [N_RANKS, MTP_MX_SCALE_ROWS, MTP_OUT_CHUNK], torch.float8_e8m0fnu, init_value=init_e_proj_w_scale),
         TensorSpec("e_proj_smooth", [N_RANKS, D], torch.float32, init_value=lambda: torch.ones(N_RANKS, D)),
-        TensorSpec("h_proj_w", [N_RANKS, D, D], torch.int8, init_value=init_h_proj_w),
-        TensorSpec("h_proj_w_scale", [N_RANKS, D], torch.float32, init_value=init_h_proj_w_scale),
+        TensorSpec("h_proj_w", [N_RANKS, D, D], torch.float8_e4m3fn, init_value=init_h_proj_w),
+        TensorSpec("h_proj_w_scale", [N_RANKS, MTP_MX_SCALE_ROWS, MTP_OUT_CHUNK], torch.float8_e8m0fnu, init_value=init_h_proj_w_scale),
         TensorSpec("h_proj_smooth", [N_RANKS, D], torch.float32, init_value=lambda: torch.ones(N_RANKS, D)),
     ]
 
@@ -385,24 +431,46 @@ def build_tensor_specs(start_pos=0, num_tokens=T):
     import torch
     from golden import ScalarSpec, TensorSpec
 
-    base = {
+    attention = {
         spec.name: spec
-        for spec in build_single_layer_tensor_specs(start_pos=start_pos, num_tokens=num_tokens, layer_id=MTP_LAYER_ID)
+        for spec in build_attention_tensor_specs(start_pos=start_pos, num_tokens=num_tokens)
         if isinstance(spec, TensorSpec)
     }
+    attention["ori_block_table"] = attention["block_table"]
     projection = {spec.name: spec for spec in _projection_specs()}
     mtp_head = {spec.name: spec for spec in _mtp_head_specs()}
     moe_specs = {spec.name: spec for spec in build_moe_tensor_specs(layer_id=MTP_LAYER_ID, num_tokens=num_tokens) if isinstance(spec, TensorSpec)}
+    # Keep score-routing stable under the expected MX attention drift. With an
+    # all-zero synthetic bias, many experts are nearly tied and tiny QKV/O-proj
+    # differences change top-k ids, making the end-to-end comparison measure a
+    # different expert path instead of numerical accuracy. Spread the six
+    # preferred experts across both EP ranks and leave their unbiased weights
+    # input-dependent, exactly as the real gate does after selection.
+    preferred_experts = [0, N_LOCAL // 2, N_LOCAL - 1,
+                         N_LOCAL, N_LOCAL + N_LOCAL // 2, N_EXPERTS_GLOBAL - 1]
+
+    def init_stable_gate_bias():
+        bias = torch.zeros(N_EXPERTS_GLOBAL, dtype=torch.float32)
+        bias[preferred_experts] = 4.0
+        return bias.unsqueeze(0).expand(N_RANKS, -1).contiguous()
+
+    moe_specs["gate_bias"] = TensorSpec(
+        "gate_bias",
+        [N_RANKS, N_EXPERTS_GLOBAL],
+        torch.float32,
+        init_value=init_stable_gate_bias,
+    )
 
     ordered_names = [
         "hidden_states", "prev_hidden_states",
         "enorm_w", "hnorm_w", "e_proj_w", "e_proj_w_scale", "e_proj_smooth",
         "h_proj_w", "h_proj_w_scale", "h_proj_smooth",
         "hc_attn_fn", "hc_attn_scale", "hc_attn_base", "attn_norm_w",
-        "wq_a", "wq_b", "wq_b_scale", "wkv", "gamma_cq", "gamma_ckv",
+        "wq_a", "wq_a_scale", "wq_b", "wq_b_scale", "wkv", "wkv_scale",
+        "gamma_cq", "gamma_ckv",
         "freqs_cos", "freqs_sin", "kv_cache", "ori_block_table", "ori_slot_mapping",
         "position_ids",
-        "attn_sink", "wo_a", "wo_b", "wo_b_scale",
+        "attn_sink", "wo_a", "wo_a_scale", "wo_b", "wo_b_scale",
         "hc_ffn_fn", "hc_ffn_scale", "hc_ffn_base", "norm_w",
         "gate_w", "gate_bias", "tid2eid", "input_ids",
         "routed_w1", "routed_w1_scale", "routed_w3", "routed_w3_scale",
@@ -418,10 +486,18 @@ def build_tensor_specs(start_pos=0, num_tokens=T):
             specs.append(projection[name])
         elif name in mtp_head:
             specs.append(mtp_head[name])
-        elif name in moe_specs and name not in base:
+        elif name in moe_specs:
             specs.append(_ranked(moe_specs[name], torch))
         else:
-            specs.append(_ranked(base[name], torch))
+            specs.append(
+                _rank_single_spec(
+                    attention[name],
+                    name=name,
+                    replicated=name not in {
+                        "kv_cache", "ori_block_table", "ori_slot_mapping", "position_ids"
+                    },
+                )
+            )
 
     specs.append(TensorSpec("hidden_out", [N_RANKS, T, D], torch.bfloat16, is_output=True))
     specs.append(TensorSpec("pre_hc_hidden_out", [N_RANKS, T, HC_MULT, D], torch.float32, is_output=True))
@@ -502,9 +578,11 @@ def golden_mtp_prefill_fwd(tensors):
             "hc_attn_base": tensors["hc_attn_base"][rank],
             "attn_norm_w": tensors["attn_norm_w"][rank],
             "wq_a": tensors["wq_a"][rank],
+            "wq_a_scale": tensors["wq_a_scale"][rank],
             "wq_b": tensors["wq_b"][rank],
             "wq_b_scale": tensors["wq_b_scale"][rank],
             "wkv": tensors["wkv"][rank],
+            "wkv_scale": tensors["wkv_scale"][rank],
             "gamma_cq": tensors["gamma_cq"][rank],
             "gamma_ckv": tensors["gamma_ckv"][rank],
             "freqs_cos": tensors["freqs_cos"][rank],
@@ -515,6 +593,7 @@ def golden_mtp_prefill_fwd(tensors):
             "position_ids": tensors["position_ids"][rank],
             "attn_sink": tensors["attn_sink"][rank],
             "wo_a": tensors["wo_a"][rank],
+            "wo_a_scale": tensors["wo_a_scale"][rank],
             "wo_b": tensors["wo_b"][rank],
             "wo_b_scale": tensors["wo_b_scale"][rank],
             "x_out": x_attn[rank],
@@ -539,6 +618,8 @@ def golden_mtp_prefill_fwd(tensors):
 
 
 def main():
+    from golden import ratio_allclose
+
     parser = argparse.ArgumentParser(description="DeepSeek-V4 MTP packed-prefill forward driver.")
     parser.add_argument("-p", "--platform", type=str, default="a2a3", choices=["a2a3", "a5"])
     parser.add_argument("--ep", type=int, default=N_RANKS, choices=[2, 4, 8],
@@ -576,6 +657,11 @@ def main():
         rtol=1e-3,
         atol=1e-3,
         compare_fn={
+            "kv_cache": ratio_allclose(
+                atol=1e-4,
+                rtol=1.0 / 128,
+                max_error_ratio=0.005,
+            ),
             "hidden_out": ratio_reldiff(diff_thd=0.02, pct_thd=0.05,
                                         valid_rows=args.num_tokens, valid_axis=1),
             "pre_hc_hidden_out": ratio_reldiff(diff_thd=0.02, pct_thd=0.05,
