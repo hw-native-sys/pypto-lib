@@ -475,29 +475,6 @@ def build_tensor_specs(num_tokens=TEST_TOKENS):
     ]
 
 
-def compare_logits(actual, expected, **_):
-    import torch
-
-    close = torch.isclose(actual, expected, rtol=1e-3, atol=1e-3)
-    if bool(close.all()):
-        return True, ""
-    lines = []
-    for owner in range(actual.shape[0]):
-        for shard in range(TP_SIZE):
-            start = shard * VOCAB_PER_TP
-            end = start + VOCAB_PER_TP
-            shard_actual = actual[owner, :, start:end]
-            shard_close = close[owner, :, start:end]
-            bad_count = int((~shard_close).sum())
-            zero_count = int((shard_actual == 0).sum())
-            lines.append(
-                f"    owner={owner} shard={shard}: "
-                f"bad={bad_count}/{MAX_LOGIT_ROWS * VOCAB_PER_TP} "
-                f"zeros={zero_count}"
-            )
-    return False, "\n".join(lines)
-
-
 if __name__ == "__main__":
     import argparse
     from golden import run_jit
@@ -526,13 +503,11 @@ if __name__ == "__main__":
     fn = l3_lm_head
     specs = build_tensor_specs(args.num_tokens)
     golden_fn = golden_lm_head
-    compare_fn = {"logits": compare_logits}
 
     result = run_jit(
         fn=fn,
         specs=specs,
         golden_fn=golden_fn,
-        compare_fn=compare_fn,
         compile_only=args.compile_only,
         runtime_dir=args.runtime_dir,
         compile_cfg=dict(
