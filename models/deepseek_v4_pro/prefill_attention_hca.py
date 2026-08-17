@@ -25,8 +25,6 @@ from config import (
     BLOCK_SIZE,
     ACTIVE as M,
     HCA_STATE_PHYSICAL_BLOCKS,
-    INT8_AMAX_EPS,
-    INT8_SCALE_MAX,
     PREFILL_BATCH,
     PREFILL_CMP_BLOCK_NUM,
     PREFILL_CMP_MAX_BLOCKS,
@@ -44,12 +42,22 @@ from prefill_compressor_ratio128 import (
     prefill_compressor_ratio128,
 )
 from prefill_attention_swa import _mapped_pool_ratio_allclose
-from qkv_proj_rope import golden_qkv_proj_rope, materialize_rope_rows, qkv_proj_rope
+from qkv_proj_rope import (
+    MX_N_TILE as QKV_MX_N_TILE,
+    WQA_SCALE_ROWS,
+    WQB_SCALE_ROWS,
+    WKV_SCALE_ROWS,
+    golden_qkv_proj_rope,
+    materialize_rope_rows,
+    qkv_proj_rope,
+)
 from rmsnorm import golden_rms_norm, rms_norm
-from prefill_sparse_attn import (
-    _quant_w_per_channel,
-    golden_prefill_sparse_attn,
-    prefill_sparse_attn,
+from prefill_sparse_attn import golden_prefill_sparse_attn, prefill_sparse_attn
+from prefill_mxfp8_o_proj import (
+    MX_K_TILE as O_MX_K_TILE,
+    MX_N_TILE as O_MX_N_TILE,
+    WO_A_SCALE_ROWS,
+    WO_B_SCALE_ROWS,
 )
 
 
@@ -128,10 +136,12 @@ def prefill_attention_hca(
     hc_attn_scale: pl.Tensor[[3], pl.FP32],
     hc_attn_base: pl.Tensor[[MIX_HC], pl.FP32],
     attn_norm_w: pl.Tensor[[D], pl.BF16],
-    wq_a: pl.Tensor[[D, Q_LORA], pl.BF16],
-    wq_b: pl.Tensor[[Q_LORA, H * HEAD_DIM], pl.INT8],
-    wq_b_scale: pl.Tensor[[H * HEAD_DIM], pl.FP32],
-    wkv: pl.Tensor[[D, HEAD_DIM], pl.BF16],
+    wq_a: pl.Tensor[[D, Q_LORA], pl.FP8E4M3FN],
+    wq_a_scale: pl.Tensor[[WQA_SCALE_ROWS, QKV_MX_N_TILE], pl.FP8E8M0],
+    wq_b: pl.Tensor[[Q_LORA, H * HEAD_DIM], pl.FP8E4M3FN],
+    wq_b_scale: pl.Tensor[[WQB_SCALE_ROWS, QKV_MX_N_TILE], pl.FP8E8M0],
+    wkv: pl.Tensor[[D, HEAD_DIM], pl.FP8E4M3FN],
+    wkv_scale: pl.Tensor[[WKV_SCALE_ROWS, QKV_MX_N_TILE], pl.FP8E8M0],
     gamma_cq: pl.Tensor[[Q_LORA], pl.BF16],
     gamma_ckv: pl.Tensor[[HEAD_DIM], pl.BF16],
     freqs_cos: pl.Tensor[[MAX_SEQ_LEN, ROPE_HEAD_DIM], pl.BF16],
@@ -154,9 +164,10 @@ def prefill_attention_hca(
     cmp_slot_mapping: pl.Tensor[[T], pl.INT64],
     state_slot_mapping: pl.Tensor[[T], pl.INT64],
     attn_sink: pl.Tensor[[H], pl.FP32],
-    wo_a: pl.Tensor[[O_GROUPS, O_LORA, O_GROUP_IN], pl.BF16],
-    wo_b: pl.Tensor[[D, O_GROUPS * O_LORA], pl.INT8],
-    wo_b_scale: pl.Tensor[[D], pl.FP32],
+    wo_a: pl.Tensor[[O_GROUPS, O_GROUP_IN, O_LORA], pl.FP8E4M3FN],
+    wo_a_scale: pl.Tensor[[WO_A_SCALE_ROWS, O_MX_N_TILE], pl.FP8E8M0],
+    wo_b: pl.Tensor[[O_GROUPS * O_LORA, D], pl.FP8E4M3FN],
+    wo_b_scale: pl.Tensor[[WO_B_SCALE_ROWS, O_MX_N_TILE], pl.FP8E8M0],
     x_out: pl.Out[pl.Tensor[[T, HC_MULT, D], pl.FP32]],
     num_tokens: pl.Scalar[pl.INT32],
 ):
@@ -186,7 +197,7 @@ def prefill_attention_hca(
     qr = pl.create_tensor([T, Q_LORA], dtype=pl.INT8)
     qr_scale = pl.create_tensor([T, 1], dtype=pl.FP32)
     qkv_proj_rope(
-        x_normed, wq_a, wq_b, wq_b_scale, wkv,
+        x_normed, wq_a, wq_a_scale, wq_b, wq_b_scale, wkv, wkv_scale,
         rope_cos_t, rope_sin_t, gamma_cq, gamma_ckv,
         q, kv, qr, qr_scale, late_dep,
     )
@@ -244,7 +255,7 @@ def prefill_attention_hca(
         cmp_indices,
         attn_sink, num_tokens,
         rope_cos_t, rope_sin_t,
-        wo_a, wo_b, wo_b_scale, attn_out,
+        wo_a, wo_a_scale, wo_b, wo_b_scale, attn_out,
     )
 
     hc_post_prefill(attn_out, x_hc, post, comb, x_out, num_tokens)
@@ -258,10 +269,12 @@ def prefill_attention_hca_test(
     hc_attn_scale: pl.Tensor[[3], pl.FP32],
     hc_attn_base: pl.Tensor[[MIX_HC], pl.FP32],
     attn_norm_w: pl.Tensor[[D], pl.BF16],
-    wq_a: pl.Tensor[[D, Q_LORA], pl.BF16],
-    wq_b: pl.Tensor[[Q_LORA, H * HEAD_DIM], pl.INT8],
-    wq_b_scale: pl.Tensor[[H * HEAD_DIM], pl.FP32],
-    wkv: pl.Tensor[[D, HEAD_DIM], pl.BF16],
+    wq_a: pl.Tensor[[D, Q_LORA], pl.FP8E4M3FN],
+    wq_a_scale: pl.Tensor[[WQA_SCALE_ROWS, QKV_MX_N_TILE], pl.FP8E8M0],
+    wq_b: pl.Tensor[[Q_LORA, H * HEAD_DIM], pl.FP8E4M3FN],
+    wq_b_scale: pl.Tensor[[WQB_SCALE_ROWS, QKV_MX_N_TILE], pl.FP8E8M0],
+    wkv: pl.Tensor[[D, HEAD_DIM], pl.FP8E4M3FN],
+    wkv_scale: pl.Tensor[[WKV_SCALE_ROWS, QKV_MX_N_TILE], pl.FP8E8M0],
     gamma_cq: pl.Tensor[[Q_LORA], pl.BF16],
     gamma_ckv: pl.Tensor[[HEAD_DIM], pl.BF16],
     freqs_cos: pl.Tensor[[MAX_SEQ_LEN, ROPE_HEAD_DIM], pl.BF16],
@@ -286,38 +299,27 @@ def prefill_attention_hca_test(
     cmp_slot_mapping: pl.Tensor[[T], pl.INT64],
     state_slot_mapping: pl.Tensor[[T], pl.INT64],
     attn_sink: pl.Tensor[[H], pl.FP32],
-    wo_a: pl.Tensor[[O_GROUPS, O_LORA, O_GROUP_IN], pl.BF16],
-    wo_b: pl.Tensor[[D, O_GROUPS * O_LORA], pl.INT8],
-    wo_b_scale: pl.Tensor[[D], pl.FP32],
+    wo_a: pl.Tensor[[O_GROUPS, O_GROUP_IN, O_LORA], pl.FP8E4M3FN],
+    wo_a_scale: pl.Tensor[[WO_A_SCALE_ROWS, O_MX_N_TILE], pl.FP8E8M0],
+    wo_b: pl.Tensor[[O_GROUPS * O_LORA, D], pl.FP8E4M3FN],
+    wo_b_scale: pl.Tensor[[WO_B_SCALE_ROWS, O_MX_N_TILE], pl.FP8E8M0],
     x_out: pl.Out[pl.Tensor[[T, HC_MULT, D], pl.FP32]],
     num_tokens: pl.Scalar[pl.INT32],
 ):
     prefill_attention_hca(
         x_hc,
         hc_attn_fn, hc_attn_scale, hc_attn_base,
-        attn_norm_w, wq_a, wq_b, wq_b_scale, wkv, gamma_cq, gamma_ckv,
+        attn_norm_w, wq_a, wq_a_scale, wq_b, wq_b_scale, wkv, wkv_scale, gamma_cq, gamma_ckv,
         freqs_cos, freqs_sin,
         cmp_wkv, cmp_wgate, cmp_ape, cmp_norm_w,
         compress_state, compress_state_block_table,
         kv_cache, ori_slot_mapping, ori_block_table,
         cmp_kv, cmp_block_table,
         position_ids, cmp_slot_mapping, state_slot_mapping,
-        attn_sink, wo_a, wo_b, wo_b_scale,
+        attn_sink, wo_a, wo_a_scale, wo_b, wo_b_scale,
         x_out, num_tokens,
     )
     return x_out
-
-
-def _quant_w_per_output_channel(w):
-    import torch
-
-    amax = w.float().abs().amax(dim=0).clamp_min(INT8_AMAX_EPS)
-    scale_quant = INT8_SCALE_MAX / amax
-    scaled = w.float() * scale_quant.view(1, -1)
-    w_i32 = torch.round(scaled).to(torch.int32)
-    w_i32 = torch.clamp(w_i32, -int(INT8_SCALE_MAX), int(INT8_SCALE_MAX))
-    w_i8 = w_i32.to(torch.float16).to(torch.int8)
-    return w_i8, (1.0 / scale_quant).float()
 
 
 def golden_prefill_attention_hca(tensors):
@@ -352,9 +354,11 @@ def golden_prefill_attention_hca(tensors):
     golden_qkv_proj_rope({
         "x": x_normed.view(T, D),
         "wq_a": tensors["wq_a"],
+        "wq_a_scale": tensors["wq_a_scale"],
         "wq_b": tensors["wq_b"],
         "wq_b_scale": tensors["wq_b_scale"],
         "wkv": tensors["wkv"],
+        "wkv_scale": tensors["wkv_scale"],
         "rope_cos": rope_cos_t,
         "rope_sin": rope_sin_t,
         "gamma_cq": tensors["gamma_cq"],
@@ -431,6 +435,7 @@ def golden_prefill_attention_hca(tensors):
         "freqs_cos": rope_cos_t,
         "freqs_sin": rope_sin_t,
         "wo_a": tensors["wo_a"],
+        "wo_a_scale": tensors["wo_a_scale"],
         "wo_b": tensors["wo_b"],
         "wo_b_scale": tensors["wo_b_scale"],
         "attn_out": attn_out,
@@ -630,15 +635,38 @@ def build_tensor_specs(
         return mapping
     def init_attn_sink():
         return torch.zeros(H)
-    def init_wo_a():
-        return (torch.rand(O_GROUPS, O_LORA, O_GROUP_IN) - 0.5) * O_GROUP_IN ** -0.5
-    def init_wo_b():
-        return (torch.rand(D, O_GROUPS * O_LORA) - 0.5) * (O_GROUPS * O_LORA) ** -0.5
+    from expert_shared import _gen_mxfp8_weight_kn
 
-    wq_b_bf16 = init_wq_b().to(torch.bfloat16)
-    wq_b_i8, wq_b_scale = _quant_w_per_output_channel(wq_b_bf16)
-    wo_b_bf16 = init_wo_b().to(torch.bfloat16)
-    wo_b_i8, wo_b_scale = _quant_w_per_channel(wo_b_bf16)
+    wq_a_fp8, wq_a_scale = _gen_mxfp8_weight_kn(
+        (D, Q_LORA), dequant_std=0.058, chan_cv=0.25
+    )
+    wq_b_fp8, wq_b_scale = _gen_mxfp8_weight_kn(
+        (Q_LORA, H * HEAD_DIM), dequant_std=0.058, chan_cv=0.25
+    )
+    wkv_fp8, wkv_scale = _gen_mxfp8_weight_kn(
+        (D, HEAD_DIM), dequant_std=0.058, chan_cv=0.25
+    )
+    wo_a_values = []
+    wo_a_scales = []
+    for _ in range(O_GROUPS):
+        value, scale = _gen_mxfp8_weight_kn(
+            (O_GROUP_IN, O_LORA),
+            dequant_std=0.25 / O_GROUP_IN ** 0.5,
+            chan_cv=0.25,
+            k_tile=O_MX_K_TILE,
+            n_tile=O_MX_N_TILE,
+        )
+        wo_a_values.append(value)
+        wo_a_scales.append(scale)
+    wo_a_fp8 = torch.stack(wo_a_values)
+    wo_a_scale = torch.cat(wo_a_scales, dim=0)
+    wo_b_fp8, wo_b_scale = _gen_mxfp8_weight_kn(
+        (O_GROUPS * O_LORA, D),
+        dequant_std=0.25 / (O_GROUPS * O_LORA) ** 0.5,
+        chan_cv=0.25,
+        k_tile=O_MX_K_TILE,
+        n_tile=O_MX_N_TILE,
+    )
 
     return [
         TensorSpec("x_hc", [T, HC_MULT, D], torch.float32, init_value=init_x_hc),
@@ -646,10 +674,12 @@ def build_tensor_specs(
         TensorSpec("hc_attn_scale", [3], torch.float32, init_value=init_hc_attn_scale),
         TensorSpec("hc_attn_base", [MIX_HC], torch.float32, init_value=init_hc_attn_base),
         TensorSpec("attn_norm_w", [D], torch.bfloat16, init_value=init_attn_norm_w),
-        TensorSpec("wq_a", [D, Q_LORA], torch.bfloat16, init_value=init_wq_a),
-        TensorSpec("wq_b", [Q_LORA, H * HEAD_DIM], torch.int8, init_value=lambda: wq_b_i8),
-        TensorSpec("wq_b_scale", [H * HEAD_DIM], torch.float32, init_value=lambda: wq_b_scale),
-        TensorSpec("wkv", [D, HEAD_DIM], torch.bfloat16, init_value=init_wkv),
+        TensorSpec("wq_a", [D, Q_LORA], torch.float8_e4m3fn, init_value=lambda: wq_a_fp8),
+        TensorSpec("wq_a_scale", [WQA_SCALE_ROWS, QKV_MX_N_TILE], torch.float8_e8m0fnu, init_value=lambda: wq_a_scale),
+        TensorSpec("wq_b", [Q_LORA, H * HEAD_DIM], torch.float8_e4m3fn, init_value=lambda: wq_b_fp8),
+        TensorSpec("wq_b_scale", [WQB_SCALE_ROWS, QKV_MX_N_TILE], torch.float8_e8m0fnu, init_value=lambda: wq_b_scale),
+        TensorSpec("wkv", [D, HEAD_DIM], torch.float8_e4m3fn, init_value=lambda: wkv_fp8),
+        TensorSpec("wkv_scale", [WKV_SCALE_ROWS, QKV_MX_N_TILE], torch.float8_e8m0fnu, init_value=lambda: wkv_scale),
         TensorSpec("gamma_cq", [Q_LORA], torch.bfloat16, init_value=init_gamma_cq),
         TensorSpec("gamma_ckv", [HEAD_DIM], torch.bfloat16, init_value=init_gamma_ckv),
         TensorSpec("freqs_cos", [MAX_SEQ_LEN, ROPE_DIM], torch.bfloat16, init_value=init_freqs_cos),
@@ -687,9 +717,10 @@ def build_tensor_specs(
         TensorSpec("cmp_slot_mapping", [T], torch.int64, init_value=init_cmp_slot_mapping),
         TensorSpec("state_slot_mapping", [T], torch.int64, init_value=init_state_slot_mapping),
         TensorSpec("attn_sink", [H], torch.float32, init_value=init_attn_sink),
-        TensorSpec("wo_a", [O_GROUPS, O_LORA, O_GROUP_IN], torch.bfloat16, init_value=init_wo_a),
-        TensorSpec("wo_b", [D, O_GROUPS * O_LORA], torch.int8, init_value=lambda: wo_b_i8),
-        TensorSpec("wo_b_scale", [D], torch.float32, init_value=lambda: wo_b_scale),
+        TensorSpec("wo_a", [O_GROUPS, O_GROUP_IN, O_LORA], torch.float8_e4m3fn, init_value=lambda: wo_a_fp8),
+        TensorSpec("wo_a_scale", [WO_A_SCALE_ROWS, O_MX_N_TILE], torch.float8_e8m0fnu, init_value=lambda: wo_a_scale),
+        TensorSpec("wo_b", [O_GROUPS * O_LORA, D], torch.float8_e4m3fn, init_value=lambda: wo_b_fp8),
+        TensorSpec("wo_b_scale", [WO_B_SCALE_ROWS, O_MX_N_TILE], torch.float8_e8m0fnu, init_value=lambda: wo_b_scale),
         TensorSpec("x_out", [T, HC_MULT, D], torch.float32, is_output=True),
         ScalarSpec("num_tokens", torch.int32, num_tokens),
     ]
@@ -700,7 +731,7 @@ if __name__ == "__main__":
     from golden import ratio_reldiff, run_jit
 
     parser = argparse.ArgumentParser(description="Standalone DeepSeek V4 packed prefill HCA correctness test.")
-    parser.add_argument("-p", "--platform", type=str, default="a2a3",
+    parser.add_argument("-p", "--platform", type=str, default="a5",
                         choices=["a2a3", "a2a3sim", "a5", "a5sim"])
     parser.add_argument("-d", "--device", type=int, default=0)
     parser.add_argument("--compile-only", action="store_true", default=False)

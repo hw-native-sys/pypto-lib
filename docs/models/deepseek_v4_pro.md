@@ -30,11 +30,12 @@ therefore replaces it with `KERNEL_MAX_SEQ_LEN = 16384` — an 8k prompt plus 51
 decode steps, the budget the Flash cases already exercise. Raise that one
 constant if a case needs a longer context.
 
-Native MXFP8-MXFP4 is not implemented yet. The tracked kernels run an INT8
-stand-in with the same tensor split as
-[V4-Flash](deepseek_v4_flash_mtp.md#what-is-quantized): `gen_routed_weight` in
-[expert_routed.py](../../models/deepseek_v4_pro/expert_routed.py) re-quantizes
-off the MXFP4 grid into INT8 rather than feeding the cube MXFP4 weights.
+The dense attention, projection, gate, and shared-expert paths use MXFP8 data
+with E8M0 block scales. Routed-expert weights are stored as packed MXFP4 with
+E8M0 scales; each routed kernel materializes the selected FP4 weight tile as
+FP8 in GM before `matmul_mx`, matching the current PyPTO contract. Dynamic
+`quant_mx` and `matmul_mx` are therefore separate tasks connected through GM.
+Putting both operations in one mixed InCore task is not supported yet.
 
 ### Model shape and layer schedule
 

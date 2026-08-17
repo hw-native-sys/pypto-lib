@@ -111,6 +111,7 @@ def gate(
     input_ids: pl.Tensor[[T], pl.INT64],
     x_norm_i8: pl.Tensor[[T, D], pl.INT8],
     x_norm_scale: pl.Tensor[[T, 1], pl.FP32],
+    x_norm_bf16: pl.Tensor[[T, D], pl.BF16],
     indices: pl.Tensor[[T, TOPK], pl.INT32],
     weights: pl.Tensor[[T, TOPK], pl.FP32],
 ):
@@ -178,6 +179,11 @@ def gate(
         x_norm_dequant_scale = pl.mul(xg_dequant_scale, inv_rms)
         pl.tile.store(x_norm_dequant_scale, [tok, 0], x_norm_scale, shapes=[1, 1])
         pl.tile.store(xg_sq, [tok, 0], xn_scale_buf, shapes=[1, 1])
+        # Shared experts follow AscendC's W8A8 MXFP8 path and dynamically
+        # quantize the real RMSNorm result, not the routed INT8 payload.
+        x_norm = pl.mul(xg, pl.read(inv_rms, [0, 0]))
+        x_norm = pl.cast(x_norm, target_type=pl.BF16, mode="rint")
+        pl.tile.store(x_norm, [tok, 0], x_norm_bf16, shapes=[1, D])
 
     # Per-token symmetric INT8 quant of xg: scale precomputed in ffn_norm. inv_rms
     # cancels here (symmetric quant is invariant to a positive per-token scalar),
@@ -207,6 +213,7 @@ def gate(
         for zt in pl.range(T):
             if zt >= active_tokens:
                 pl.write(x_norm_scale, [zt, 0], pl.cast(0.0, pl.FP32))
+                x_norm_bf16[zt : zt + 1, :] = pl.full([1, D], dtype=pl.BF16, value=0.0)
                 for zk in pl.range(TOPK):
                     pl.write(indices, [zt, zk], pl.cast(0, pl.INT32))
                     pl.write(weights, [zt, zk], pl.cast(0.0, pl.FP32))
@@ -347,6 +354,7 @@ def gate_test(
     input_ids: pl.Tensor[[T], pl.INT64],
     x_norm_i8: pl.Out[pl.Tensor[[T, D], pl.INT8]],
     x_norm_scale: pl.Out[pl.Tensor[[T, 1], pl.FP32]],
+    x_norm_bf16: pl.Out[pl.Tensor[[T, D], pl.BF16]],
     indices: pl.Out[pl.Tensor[[T, TOPK], pl.INT32]],
     weights: pl.Out[pl.Tensor[[T, TOPK], pl.FP32]],
 ):
@@ -355,9 +363,9 @@ def gate_test(
         norm_w, gate_w, gate_bias,
         layer_id, num_tokens,
         tid2eid, input_ids,
-        x_norm_i8, x_norm_scale, indices, weights,
+        x_norm_i8, x_norm_scale, x_norm_bf16, indices, weights,
     )
-    return x_norm_i8, x_norm_scale, indices, weights
+    return x_norm_i8, x_norm_scale, x_norm_bf16, indices, weights
 
 
 def _per_token_int8_quant(x_bf16):
@@ -420,11 +428,16 @@ def golden_gate_core(tensors):
     weights = (topk_vals / denom) * ROUTE_SCALE
     if num_tokens < T:
         x_norm_scale[num_tokens:] = 0
+        x_norm_bf16 = (xg * inv_rms).to(torch.bfloat16)
+        x_norm_bf16[num_tokens:] = 0
         indices[num_tokens:] = 0
         weights[num_tokens:] = 0
+    else:
+        x_norm_bf16 = (xg * inv_rms).to(torch.bfloat16)
 
     tensors["x_norm_i8"][:] = x_norm_i8
     tensors["x_norm_scale"][:] = x_norm_scale.reshape(T, 1)
+    tensors["x_norm_bf16"][:] = x_norm_bf16
     tensors["indices"][:] = indices.to(torch.int32)
     tensors["weights"][:] = weights.to(torch.float32)
 
@@ -717,6 +730,7 @@ def build_tensor_specs(layer_id=0, num_tokens=T):
         TensorSpec("input_ids", [T], torch.int64, init_value=init_input_ids),
         TensorSpec("x_norm_i8", [T, D], torch.int8, is_output=True),
         TensorSpec("x_norm_scale", [T, 1], torch.float32, is_output=True),
+        TensorSpec("x_norm_bf16", [T, D], torch.bfloat16, is_output=True),
         TensorSpec("indices", [T, TOPK], torch.int32, is_output=True),
         TensorSpec("weights", [T, TOPK], torch.float32, is_output=True),
     ]
