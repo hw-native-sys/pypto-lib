@@ -483,8 +483,8 @@ def golden_compressor(tensors):
             # Kernel writes committed pooled result only to kv[:, 0, :]; leave
             # speculative-boundary rows and kv[:, 1:, :] zero-initialized.
             tensors["kv"][b : b + 1, 0:1, :] = kv_b
-            blk_id = cache_row // BLOCK_SIZE
-            intra = cache_row % BLOCK_SIZE
+            blk_id = cache_row // IDX_STORAGE_BLOCK_SIZE
+            intra = cache_row % IDX_STORAGE_BLOCK_SIZE
             # C8 quant-on-write: quantize the bf16-rounded compressed row to int8 + per-position scale
             row_bf16 = kv_b[0, 0].to(torch.bfloat16).float()
             amax = row_bf16.abs().amax().clamp_min(INT8_AMAX_EPS)
@@ -545,14 +545,14 @@ def build_tensor_specs(start_pos=None):
     def init_hadamard():
         return torch.rand(HEAD_DIM, HEAD_DIM) * (HEAD_DIM ** -0.5)
     def init_idx_kv_cache():
-        return torch.zeros(IDX_CACHE_BLOCK_NUM, BLOCK_SIZE, 1, HEAD_DIM, dtype=torch.int8)
+        return torch.zeros(IDX_CACHE_BLOCK_NUM, IDX_STORAGE_BLOCK_SIZE, 1, HEAD_DIM, dtype=torch.int8)
     def init_idx_kv_scale():
-        return torch.zeros(IDX_CACHE_BLOCK_NUM, BLOCK_SIZE, 1, 1)
+        return torch.zeros(IDX_CACHE_BLOCK_NUM, IDX_STORAGE_BLOCK_SIZE, 1, 1)
     def init_idx_block_table():
         return block_table(
             batch=B,
             table_blocks=IDX_CACHE_MAX_BLOCKS,
-            physical_blocks=IDX_CACHE_MAX_BLOCKS,
+            physical_blocks=IDX_CACHE_BLOCK_NUM,
         )
     def init_default_start_pos():
         # Canonical CSA start-position set (ratio-4 compressor + indexer + sliding-window + 8k).
@@ -581,7 +581,7 @@ def build_tensor_specs(start_pos=None):
             positions,
             init_idx_block_table(),
             compress_ratio=COMPRESS_RATIO,
-            block_size=BLOCK_SIZE,
+            block_size=IDX_STORAGE_BLOCK_SIZE,
         )
 
     return [
@@ -596,8 +596,8 @@ def build_tensor_specs(start_pos=None):
         TensorSpec("cos", [B, ROPE_HEAD_DIM // 2], torch.float32, init_value=init_cos),
         TensorSpec("sin", [B, ROPE_HEAD_DIM // 2], torch.float32, init_value=init_sin),
         TensorSpec("hadamard", [HEAD_DIM, HEAD_DIM], torch.bfloat16, init_value=init_hadamard),
-        TensorSpec("idx_kv_cache", [IDX_CACHE_BLOCK_NUM, BLOCK_SIZE, 1, HEAD_DIM], torch.int8, init_value=init_idx_kv_cache, is_output=True),
-        TensorSpec("idx_kv_scale", [IDX_CACHE_BLOCK_NUM, BLOCK_SIZE, 1, 1], torch.float32, init_value=init_idx_kv_scale, is_output=True),
+        TensorSpec("idx_kv_cache", [IDX_CACHE_BLOCK_NUM, IDX_STORAGE_BLOCK_SIZE, 1, HEAD_DIM], torch.int8, init_value=init_idx_kv_cache, is_output=True),
+        TensorSpec("idx_kv_scale", [IDX_CACHE_BLOCK_NUM, IDX_STORAGE_BLOCK_SIZE, 1, 1], torch.float32, init_value=init_idx_kv_scale, is_output=True),
         TensorSpec("position_ids", [B, S], torch.int32, init_value=init_position_ids),
         TensorSpec("idx_slot_mapping", [B, S], torch.int64, init_value=init_idx_slot_mapping),
         TensorSpec("inner_state_slot_mapping", [B, S], torch.int64, init_value=init_inner_state_slot_mapping),

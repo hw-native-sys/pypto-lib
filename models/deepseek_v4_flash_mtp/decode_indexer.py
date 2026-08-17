@@ -609,8 +609,11 @@ def build_tensor_specs(start_pos=None):
     def init_inner_norm_w():
         return 0.6850 + 0.2610 * torch.randn(INNER_HEAD_DIM)
     def init_idx_block_table():
-        rows = torch.arange(IDX_CACHE_MAX_BLOCKS, dtype=torch.int32)
-        return rows.unsqueeze(0).expand(B, -1).clone()
+        return block_table(
+            batch=B,
+            table_blocks=IDX_CACHE_MAX_BLOCKS,
+            physical_blocks=IDX_CACHE_BLOCK_NUM,
+        )
     def init_default_start_pos():
         # Canonical CSA start-position set (ratio-4 compressor + indexer + sliding-window + 8k).
         return csa_decode_start_set(
@@ -640,7 +643,7 @@ def build_tensor_specs(start_pos=None):
             positions,
             init_idx_block_table(),
             compress_ratio=COMPRESS_RATIO,
-            block_size=BLOCK_SIZE,
+            block_size=IDX_STORAGE_BLOCK_SIZE,
         )
 
     # idx wq_b: simulate the real MXFP8 (e4m3 + 128x128-block E8M0) grid (~200 levels, scaleCV
@@ -652,11 +655,18 @@ def build_tensor_specs(start_pos=None):
     qr_i8, qr_scale = int8_quant_per_row(init_qr())
 
     # C8 indexer cache fixture: INT8 + scale from one bf16-rounded random draw
-    idx_kv_cache_bf16 = torch.rand(IDX_CACHE_BLOCK_NUM, BLOCK_SIZE, 1, IDX_HEAD_DIM).to(torch.bfloat16)
+    idx_kv_cache_bf16 = torch.rand(
+        IDX_CACHE_BLOCK_NUM, IDX_STORAGE_BLOCK_SIZE, 1, IDX_HEAD_DIM
+    ).to(torch.bfloat16)
     idx_kv_i8, idx_kv_sc = int8_quant_per_row(
-        idx_kv_cache_bf16.float().reshape(IDX_CACHE_BLOCK_NUM * BLOCK_SIZE, IDX_HEAD_DIM))
-    idx_kv_i8 = idx_kv_i8.view(IDX_CACHE_BLOCK_NUM, BLOCK_SIZE, 1, IDX_HEAD_DIM)
-    idx_kv_sc = idx_kv_sc.view(IDX_CACHE_BLOCK_NUM, BLOCK_SIZE, 1, 1)
+        idx_kv_cache_bf16.float().reshape(
+            IDX_CACHE_BLOCK_NUM * IDX_STORAGE_BLOCK_SIZE, IDX_HEAD_DIM
+        )
+    )
+    idx_kv_i8 = idx_kv_i8.view(
+        IDX_CACHE_BLOCK_NUM, IDX_STORAGE_BLOCK_SIZE, 1, IDX_HEAD_DIM
+    )
+    idx_kv_sc = idx_kv_sc.view(IDX_CACHE_BLOCK_NUM, IDX_STORAGE_BLOCK_SIZE, 1, 1)
 
     return [
         TensorSpec("x", [B, S, D], torch.bfloat16, init_value=init_x),
@@ -675,8 +685,8 @@ def build_tensor_specs(start_pos=None):
         TensorSpec("inner_wgate", [INNER_OUT_DIM, D], torch.bfloat16, init_value=init_inner_wgate),
         TensorSpec("inner_ape", [COMPRESS_RATIO, INNER_OUT_DIM], torch.float32, init_value=init_inner_ape),
         TensorSpec("inner_norm_w", [INNER_HEAD_DIM], torch.bfloat16, init_value=init_inner_norm_w),
-        TensorSpec("idx_kv_cache", [IDX_CACHE_BLOCK_NUM, BLOCK_SIZE, 1, IDX_HEAD_DIM], torch.int8, init_value=lambda: idx_kv_i8, is_output=True),
-        TensorSpec("idx_kv_scale", [IDX_CACHE_BLOCK_NUM, BLOCK_SIZE, 1, 1], torch.float32, init_value=lambda: idx_kv_sc, is_output=True),
+        TensorSpec("idx_kv_cache", [IDX_CACHE_BLOCK_NUM, IDX_STORAGE_BLOCK_SIZE, 1, IDX_HEAD_DIM], torch.int8, init_value=lambda: idx_kv_i8, is_output=True),
+        TensorSpec("idx_kv_scale", [IDX_CACHE_BLOCK_NUM, IDX_STORAGE_BLOCK_SIZE, 1, 1], torch.float32, init_value=lambda: idx_kv_sc, is_output=True),
         TensorSpec("idx_block_table", [B, IDX_CACHE_MAX_BLOCKS], torch.int32, init_value=init_idx_block_table),
         # Outputs are fixed to SCORE_LEN; positions past cache_len are -inf for score and -1 for topk_idxs.
         TensorSpec("score", [B, S, SCORE_LEN], torch.float32, is_output=True),

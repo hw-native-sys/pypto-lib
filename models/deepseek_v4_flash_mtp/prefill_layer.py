@@ -55,6 +55,7 @@ from prefill_swa import (
 )
 from prefill_hca import (
     COMPRESS_RATIO as HCA_COMPRESS_RATIO,
+    CMP_STORAGE_BLOCK_SIZE as HCA_CMP_STORAGE_BLOCK_SIZE,
     HCA_CMP_BLOCK_NUM,
     HCA_ORI_BLOCK_NUM,
     HCA_STATE_BLOCK_NUM,
@@ -68,6 +69,7 @@ from prefill_hca import (
 from prefill_csa import (
     BLOCK_SIZE,
     COMPRESS_RATIO as CSA_COMPRESS_RATIO,
+    CMP_STORAGE_BLOCK_SIZE as CSA_CMP_STORAGE_BLOCK_SIZE,
     CSA_CMP_BLOCK_NUM,
     CSA_ORI_BLOCK_NUM,
     CSA_STATE_BLOCK_NUM,
@@ -98,7 +100,6 @@ from prefill_csa import (
 )
 assert SWA_BLOCK_SIZE == BLOCK_SIZE, "SWA/HCA/CSA must share the PyPTO block size"
 assert SWA_ORI_BLOCK_NUM == HCA_ORI_BLOCK_NUM == CSA_ORI_BLOCK_NUM
-assert HCA_CMP_BLOCK_NUM == CSA_CMP_BLOCK_NUM
 
 # The standalone layer is deliberately fixed to one full child-kernel tile.
 TOK_TILE = T
@@ -109,7 +110,8 @@ assert PREFILL_SEQ == TOK_TILE == 128, "prefill_layer requires S=128"
 
 # Fixed cache/state/table capacities for the one supported request.
 ORI_CACHE_BLOCKS = CSA_ORI_BLOCK_NUM
-CMP_CACHE_BLOCKS = CSA_CMP_BLOCK_NUM
+HCA_CMP_CACHE_BLOCKS = HCA_CMP_BLOCK_NUM
+CSA_CMP_CACHE_BLOCKS = CSA_CMP_BLOCK_NUM
 IDX_CACHE_BLOCKS = PREFILL_IDX_BLOCK_NUM
 ORI_TABLE_BLOCKS = SPARSE_ORI_MAX_BLOCKS
 CMP_TABLE_BLOCKS = SPARSE_CMP_MAX_BLOCKS
@@ -162,11 +164,20 @@ def prefill_layer_core(
     kv_cache: pl.InOut[pl.Tensor[[ORI_CACHE_BLOCKS, BLOCK_SIZE, 1, HEAD_DIM], pl.BF16]],
     ori_block_table: pl.Tensor[[ORI_TABLE_BLOCKS], pl.INT32],
     ori_slot_mapping: pl.Tensor[[T], pl.INT64],
-    cmp_kv: pl.InOut[pl.Tensor[[CMP_CACHE_BLOCKS, BLOCK_SIZE, 1, HEAD_DIM], pl.BF16]],
+    hca_cmp_kv: pl.InOut[
+        pl.Tensor[[HCA_CMP_CACHE_BLOCKS, HCA_CMP_STORAGE_BLOCK_SIZE, 1, HEAD_DIM], pl.BF16]
+    ],
+    csa_cmp_kv: pl.InOut[
+        pl.Tensor[[CSA_CMP_CACHE_BLOCKS, CSA_CMP_STORAGE_BLOCK_SIZE, 1, HEAD_DIM], pl.BF16]
+    ],
     hca_cmp_block_table: pl.Tensor[[CMP_TABLE_BLOCKS], pl.INT32],
     csa_cmp_block_table: pl.Tensor[[CMP_TABLE_BLOCKS], pl.INT32],
-    idx_kv_cache: pl.InOut[pl.Tensor[[IDX_CACHE_BLOCKS, BLOCK_SIZE, 1, IDX_HEAD_DIM], pl.INT8]],
-    idx_kv_scale: pl.InOut[pl.Tensor[[IDX_CACHE_BLOCKS, BLOCK_SIZE, 1, 1], pl.FP32]],
+    idx_kv_cache: pl.InOut[
+        pl.Tensor[[IDX_CACHE_BLOCKS, CSA_CMP_STORAGE_BLOCK_SIZE, 1, IDX_HEAD_DIM], pl.INT8]
+    ],
+    idx_kv_scale: pl.InOut[
+        pl.Tensor[[IDX_CACHE_BLOCKS, CSA_CMP_STORAGE_BLOCK_SIZE, 1, 1], pl.FP32]
+    ],
     idx_block_table: pl.Tensor[[IDX_TABLE_BLOCKS], pl.INT32],
     position_ids: pl.Tensor[[T], pl.INT32],
     hca_cmp_slot_mapping: pl.Tensor[[T], pl.INT64],
@@ -217,7 +228,8 @@ def prefill_layer_core(
         # The single request addresses the fixed-capacity physical pools.
         kv_cache_req = kv_cache
         ori_block_table_req = pl.slice(ori_block_table, [ORI_TABLE_BLOCKS], [ridx * ORI_TABLE_BLOCKS])
-        cmp_kv_req = cmp_kv
+        hca_cmp_kv_req = hca_cmp_kv
+        csa_cmp_kv_req = csa_cmp_kv
         hca_cmp_block_table_req = pl.slice(
             hca_cmp_block_table, [CMP_TABLE_BLOCKS], [ridx * CMP_TABLE_BLOCKS]
         )
@@ -273,7 +285,7 @@ def prefill_layer_core(
                     hca_cmp_wkv, hca_cmp_wgate, hca_cmp_ape, hca_cmp_norm_w,
                     hca_compress_state_req, hca_state_table_req,
                     kv_cache_req, ori_slot_tile, ori_block_table_req,
-                    cmp_kv_req, hca_cmp_block_table_req,
+                    hca_cmp_kv_req, hca_cmp_block_table_req,
                     position_ids_tile, hca_cmp_slot_tile, hca_state_slot_tile,
                     attn_sink, wo_a, wo_b, wo_b_scale,
                     x_attn_tile, valid_n,
@@ -290,7 +302,7 @@ def prefill_layer_core(
                     csa_inner_wkv, csa_inner_wgate, csa_inner_ape, csa_inner_norm_w,
                     csa_inner_compress_state_req, csa_inner_state_table_req,
                     kv_cache_req, ori_block_table_req, ori_slot_tile,
-                    cmp_kv_req, csa_cmp_block_table_req,
+                    csa_cmp_kv_req, csa_cmp_block_table_req,
                     idx_kv_cache_req, idx_kv_scale_req, idx_block_table_req,
                     position_ids_tile, csa_cmp_slot_tile, csa_idx_slot_tile,
                     csa_state_slot_tile, csa_inner_state_slot_tile,
@@ -366,11 +378,26 @@ def l3_prefill_layer(
     kv_cache: pl.InOut[pl.Tensor[[N_RANKS, ORI_CACHE_BLOCKS, BLOCK_SIZE, 1, HEAD_DIM], pl.BF16]],
     ori_block_table: pl.Tensor[[N_RANKS, ORI_TABLE_BLOCKS], pl.INT32],
     ori_slot_mapping: pl.Tensor[[N_RANKS, T], pl.INT64],
-    cmp_kv: pl.InOut[pl.Tensor[[N_RANKS, CMP_CACHE_BLOCKS, BLOCK_SIZE, 1, HEAD_DIM], pl.BF16]],
+    hca_cmp_kv: pl.InOut[
+        pl.Tensor[
+            [N_RANKS, HCA_CMP_CACHE_BLOCKS, HCA_CMP_STORAGE_BLOCK_SIZE, 1, HEAD_DIM], pl.BF16
+        ]
+    ],
+    csa_cmp_kv: pl.InOut[
+        pl.Tensor[
+            [N_RANKS, CSA_CMP_CACHE_BLOCKS, CSA_CMP_STORAGE_BLOCK_SIZE, 1, HEAD_DIM], pl.BF16
+        ]
+    ],
     hca_cmp_block_table: pl.Tensor[[N_RANKS, CMP_TABLE_BLOCKS], pl.INT32],
     csa_cmp_block_table: pl.Tensor[[N_RANKS, CMP_TABLE_BLOCKS], pl.INT32],
-    idx_kv_cache: pl.InOut[pl.Tensor[[N_RANKS, IDX_CACHE_BLOCKS, BLOCK_SIZE, 1, IDX_HEAD_DIM], pl.INT8]],
-    idx_kv_scale: pl.InOut[pl.Tensor[[N_RANKS, IDX_CACHE_BLOCKS, BLOCK_SIZE, 1, 1], pl.FP32]],
+    idx_kv_cache: pl.InOut[
+        pl.Tensor[
+            [N_RANKS, IDX_CACHE_BLOCKS, CSA_CMP_STORAGE_BLOCK_SIZE, 1, IDX_HEAD_DIM], pl.INT8
+        ]
+    ],
+    idx_kv_scale: pl.InOut[
+        pl.Tensor[[N_RANKS, IDX_CACHE_BLOCKS, CSA_CMP_STORAGE_BLOCK_SIZE, 1, 1], pl.FP32]
+    ],
     idx_block_table: pl.Tensor[[N_RANKS, IDX_TABLE_BLOCKS], pl.INT32],
     position_ids: pl.Tensor[[N_RANKS, T], pl.INT32],
     hca_cmp_slot_mapping: pl.Tensor[[N_RANKS, T], pl.INT64],
@@ -439,7 +466,8 @@ def l3_prefill_layer(
             csa_inner_compress_state[rank],
             csa_inner_compress_state_block_table[rank],
             kv_cache[rank], ori_block_table[rank], ori_slot_mapping[rank],
-            cmp_kv[rank], hca_cmp_block_table[rank], csa_cmp_block_table[rank],
+            hca_cmp_kv[rank], csa_cmp_kv[rank],
+            hca_cmp_block_table[rank], csa_cmp_block_table[rank],
             idx_kv_cache[rank], idx_kv_scale[rank], idx_block_table[rank],
             position_ids[rank],
             hca_cmp_slot_mapping[rank], hca_state_slot_mapping[rank],
@@ -499,7 +527,8 @@ HOST_TENSOR_ORDER = (
     "kv_cache",
     "ori_block_table",
     "ori_slot_mapping",
-    "cmp_kv",
+    "hca_cmp_kv",
+    "csa_cmp_kv",
     "hca_cmp_block_table",
     "csa_cmp_block_table",
     "idx_kv_cache",
@@ -567,7 +596,8 @@ _CACHE_STATE_NAMES = {
 _PACKED_CACHE_SPECS = {
     "kv_cache": "kv_cache",
     "ori_block_table": "ori_block_table",
-    "cmp_kv": "cmp_kv",
+    "hca_cmp_kv": ("hca", "cmp_kv"),
+    "csa_cmp_kv": ("csa", "cmp_kv"),
     "hca_cmp_block_table": ("hca", "cmp_block_table"),
     "csa_cmp_block_table": ("csa", "cmp_block_table"),
     "idx_kv_cache": "idx_kv_cache",
@@ -582,7 +612,7 @@ _PACKED_CACHE_SPECS = {
 }
 
 _HISTORY_CACHE_NAMES = {
-    "kv_cache", "cmp_kv", "idx_kv_cache", "idx_kv_scale",
+    "kv_cache", "hca_cmp_kv", "csa_cmp_kv", "idx_kv_cache", "idx_kv_scale",
     "hca_compress_state", "csa_compress_state", "csa_inner_compress_state",
 }
 
@@ -594,7 +624,7 @@ def _req_block_count(kind, child_name):
     if child_name in ("block_table", "ori_block_table"):
         return ORI_TABLE_BLOCKS
     if child_name == "cmp_kv":
-        return CMP_CACHE_BLOCKS
+        return HCA_CMP_CACHE_BLOCKS if kind == "hca" else CSA_CMP_CACHE_BLOCKS
     if child_name == "cmp_block_table":
         return CMP_TABLE_BLOCKS
     if child_name in ("idx_kv_cache", "idx_kv_scale"):
@@ -618,7 +648,9 @@ def _child_to_packed(kind, child_name):
         return "ori_block_table"
     if child_name == "cmp_block_table":
         return ("hca_" if kind == "hca" else "csa_") + child_name
-    if child_name in ("kv_cache", "cmp_kv", "idx_kv_cache", "idx_kv_scale", "idx_block_table"):
+    if child_name == "cmp_kv":
+        return ("hca_" if kind == "hca" else "csa_") + child_name
+    if child_name in ("kv_cache", "idx_kv_cache", "idx_kv_scale", "idx_block_table"):
         return child_name
     prefix = "hca_" if kind == "hca" else "csa_"
     return prefix + child_name
@@ -1021,7 +1053,8 @@ if __name__ == "__main__":
             "csa_inner_compress_state": ratio_allclose(
                 atol=1e-3, rtol=1e-3, max_error_ratio=0.005
             ),
-            "cmp_kv": ratio_allclose(atol=1e-4, rtol=1.0 / 128, max_error_ratio=0.005),
+            "hca_cmp_kv": ratio_allclose(atol=1e-4, rtol=1.0 / 128, max_error_ratio=0.005),
+            "csa_cmp_kv": ratio_allclose(atol=1e-4, rtol=1.0 / 128, max_error_ratio=0.005),
             "idx_kv_cache": ratio_allclose(atol=1, rtol=0, max_error_ratio=0.01),
         },
     )

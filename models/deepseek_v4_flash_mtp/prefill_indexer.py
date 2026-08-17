@@ -693,8 +693,12 @@ def golden_prefill_indexer_core(tensors):
 
     # C8: the compressor already stored INT8 KV + a per-position dequant scale. Gather both in
     # compressed-position order through the paged block table (no score-time re-quant).
-    cache_flat_i8 = tensors["idx_kv_cache"].reshape(PREFILL_IDX_BLOCK_NUM * BLOCK_SIZE, IDX_HEAD_DIM)
-    scale_flat = tensors["idx_kv_scale"].float().reshape(PREFILL_IDX_BLOCK_NUM * BLOCK_SIZE, 1)
+    cache_flat_i8 = tensors["idx_kv_cache"].reshape(
+        PREFILL_IDX_BLOCK_NUM * IDX_STORAGE_BLOCK_SIZE, IDX_HEAD_DIM
+    )
+    scale_flat = tensors["idx_kv_scale"].float().reshape(
+        PREFILL_IDX_BLOCK_NUM * IDX_STORAGE_BLOCK_SIZE, 1
+    )
     idx_block_table = tensors["idx_block_table"]
     rows = [
         int(idx_block_table[c // CACHE_TILE].item()) * IDX_STORAGE_BLOCK_SIZE + (c % CACHE_TILE)
@@ -880,14 +884,16 @@ def build_tensor_specs(start_pos: int = START_POS, num_tokens: int = T):
     def _build_idx_hist():
         if "cache" in _idx_hist:
             return
-        cache_i8 = torch.zeros(PREFILL_IDX_BLOCK_NUM, BLOCK_SIZE, 1, IDX_HEAD_DIM, dtype=torch.int8)
-        scale = torch.zeros(PREFILL_IDX_BLOCK_NUM, BLOCK_SIZE, 1, 1)
-        c_flat = cache_i8.view(PREFILL_IDX_BLOCK_NUM * BLOCK_SIZE, IDX_HEAD_DIM)
-        s_flat = scale.view(PREFILL_IDX_BLOCK_NUM * BLOCK_SIZE, 1)
+        cache_i8 = torch.zeros(
+            PREFILL_IDX_BLOCK_NUM, IDX_STORAGE_BLOCK_SIZE, 1, IDX_HEAD_DIM, dtype=torch.int8
+        )
+        scale = torch.zeros(PREFILL_IDX_BLOCK_NUM, IDX_STORAGE_BLOCK_SIZE, 1, 1)
+        c_flat = cache_i8.view(PREFILL_IDX_BLOCK_NUM * IDX_STORAGE_BLOCK_SIZE, IDX_HEAD_DIM)
+        s_flat = scale.view(PREFILL_IDX_BLOCK_NUM * IDX_STORAGE_BLOCK_SIZE, 1)
         completed = start_pos // COMPRESS_RATIO
         for cmp_slot in range(completed):
             row = idx_row(cmp_slot)
-            if row >= PREFILL_IDX_BLOCK_NUM * BLOCK_SIZE:
+            if row >= PREFILL_IDX_BLOCK_NUM * IDX_STORAGE_BLOCK_SIZE:
                 raise ValueError("fixture historical compressed slot exceeds standalone idx_kv_cache capacity")
             if row >= 0:
                 hist_bf16 = ((torch.rand(IDX_HEAD_DIM) - 0.5) * 0.05).to(torch.bfloat16)
@@ -909,12 +915,12 @@ def build_tensor_specs(start_pos: int = START_POS, num_tokens: int = T):
         return table
     def idx_row(cmp_slot):
         table = init_idx_block_table()
-        block = cmp_slot // BLOCK_SIZE
-        intra = cmp_slot % BLOCK_SIZE
+        block = cmp_slot // IDX_STORAGE_BLOCK_SIZE
+        intra = cmp_slot % IDX_STORAGE_BLOCK_SIZE
         phys_block = int(table[block].item())
         if phys_block < 0:
             return -1
-        return phys_block * BLOCK_SIZE + intra
+        return phys_block * IDX_STORAGE_BLOCK_SIZE + intra
     def init_position_ids():
         return torch.arange(start_pos, start_pos + T, dtype=torch.int32)
     def init_idx_slot_mapping():
@@ -923,7 +929,7 @@ def build_tensor_specs(start_pos: int = START_POS, num_tokens: int = T):
             pos = start_pos + t
             if (pos + 1) % COMPRESS_RATIO == 0:
                 dst_row = idx_row((pos + 1) // COMPRESS_RATIO - 1)
-                if dst_row >= PREFILL_IDX_BLOCK_NUM * BLOCK_SIZE:
+                if dst_row >= PREFILL_IDX_BLOCK_NUM * IDX_STORAGE_BLOCK_SIZE:
                     raise ValueError("fixture compressed slot exceeds standalone idx_kv_cache capacity")
                 mapping[t] = dst_row
         return mapping
@@ -964,8 +970,8 @@ def build_tensor_specs(start_pos: int = START_POS, num_tokens: int = T):
         TensorSpec("inner_wgate", [INNER_OUT_DIM, D], torch.bfloat16, init_value=init_inner_wgate),
         TensorSpec("inner_ape", [COMPRESS_RATIO, INNER_OUT_DIM], torch.float32, init_value=init_inner_ape),
         TensorSpec("inner_norm_w", [INNER_HEAD_DIM], torch.bfloat16, init_value=init_inner_norm_w),
-        TensorSpec("idx_kv_cache", [PREFILL_IDX_BLOCK_NUM, BLOCK_SIZE, 1, IDX_HEAD_DIM], torch.int8, init_value=init_idx_kv_cache, is_output=True),
-        TensorSpec("idx_kv_scale", [PREFILL_IDX_BLOCK_NUM, BLOCK_SIZE, 1, 1], torch.float32, init_value=init_idx_kv_scale, is_output=True),
+        TensorSpec("idx_kv_cache", [PREFILL_IDX_BLOCK_NUM, IDX_STORAGE_BLOCK_SIZE, 1, IDX_HEAD_DIM], torch.int8, init_value=init_idx_kv_cache, is_output=True),
+        TensorSpec("idx_kv_scale", [PREFILL_IDX_BLOCK_NUM, IDX_STORAGE_BLOCK_SIZE, 1, 1], torch.float32, init_value=init_idx_kv_scale, is_output=True),
         TensorSpec("idx_block_table", [IDX_CACHE_MAX_BLOCKS], torch.int32, init_value=init_idx_block_table),
         TensorSpec("score", [T, INDEXER_SCORE_CAP], torch.float32, is_output=True),
         TensorSpec("topk_idxs", [T, INDEXER_TOPK_CAP], torch.int32, is_output=True),

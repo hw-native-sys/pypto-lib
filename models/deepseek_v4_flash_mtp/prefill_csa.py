@@ -119,7 +119,7 @@ CSA_TOPK_TOKEN_TILE = 2
 assert S == WIN, "packed CSA prefill currently assumes one static window page"
 assert COMPRESS_RATIO == INDEXER_COMPRESS_RATIO
 assert PREFILL_ATTN_BLOCKS <= VALID_BLOCK_MASK_COLS
-assert INDEXER_TOPK_CAP <= SPARSE_CMP_MAX_BLOCKS * BLOCK_SIZE
+assert INDEXER_TOPK_CAP <= SPARSE_CMP_MAX_BLOCKS * CMP_STORAGE_BLOCK_SIZE
 
 
 @pl.jit.inline
@@ -310,7 +310,7 @@ def prefill_attention_csa(
     attn_out = pl.create_tensor([T, D], dtype=pl.BF16)
     sparse_attn(
         q, kv_cache, swa_indices,
-        cmp_kv, cmp_block_table, pl.cast(BLOCK_SIZE // COMPRESS_RATIO, pl.INT32),
+        cmp_kv, cmp_block_table, pl.cast(CMP_STORAGE_BLOCK_SIZE, pl.INT32),
         cmp_topk_indices,
         valid_block_mask,
         attn_sink, num_tokens,
@@ -543,7 +543,7 @@ def golden_prefill_attention_csa(tensors):
         "swa_indices": swa_indices,
         "cmp_kv": tensors["cmp_kv"],
         "cmp_block_table": tensors["cmp_block_table"],
-        "cmp_storage_block_size": BLOCK_SIZE // COMPRESS_RATIO,
+        "cmp_storage_block_size": CMP_STORAGE_BLOCK_SIZE,
         "cmp_indices": cmp_indices,
         "attn_sink": tensors["attn_sink"],
         "num_tokens": tensors["num_tokens"],
@@ -609,10 +609,10 @@ def build_tensor_specs(
         raise ValueError(
             f"needs {max_sparse_rows} sparse rows; current packed sparse CSA cap is {SPARSE_PREFILL_SPARSE_PAD}"
         )
-    if max_visible_cmp > SPARSE_CMP_MAX_BLOCKS * BLOCK_SIZE:
+    if max_visible_cmp > SPARSE_CMP_MAX_BLOCKS * CMP_STORAGE_BLOCK_SIZE:
         raise ValueError(
             f"needs {max_visible_cmp} compressed slots; current cmp cache cap is "
-            f"{SPARSE_CMP_MAX_BLOCKS * BLOCK_SIZE}"
+            f"{SPARSE_CMP_MAX_BLOCKS * CMP_STORAGE_BLOCK_SIZE}"
         )
     def token_pos():
         # Single-request absolute positions: pos[t] = context_len + local_idx
@@ -741,16 +741,18 @@ def build_tensor_specs(
     def _build_idx_hist():
         if "cache" in _idx_hist:
             return
-        cache_i8 = torch.zeros(PREFILL_IDX_BLOCK_NUM, BLOCK_SIZE, 1, IDX_HEAD_DIM, dtype=torch.int8)
-        scale = torch.zeros(PREFILL_IDX_BLOCK_NUM, BLOCK_SIZE, 1, 1)
-        c_flat = cache_i8.view(PREFILL_IDX_BLOCK_NUM * BLOCK_SIZE, IDX_HEAD_DIM)
-        s_flat = scale.view(PREFILL_IDX_BLOCK_NUM * BLOCK_SIZE, 1)
+        cache_i8 = torch.zeros(
+            PREFILL_IDX_BLOCK_NUM, CMP_STORAGE_BLOCK_SIZE, 1, IDX_HEAD_DIM, dtype=torch.int8
+        )
+        scale = torch.zeros(PREFILL_IDX_BLOCK_NUM, CMP_STORAGE_BLOCK_SIZE, 1, 1)
+        c_flat = cache_i8.view(PREFILL_IDX_BLOCK_NUM * CMP_STORAGE_BLOCK_SIZE, IDX_HEAD_DIM)
+        s_flat = scale.view(PREFILL_IDX_BLOCK_NUM * CMP_STORAGE_BLOCK_SIZE, 1)
         table = init_idx_block_table()
         completed = context_len // COMPRESS_RATIO
         for cmp_slot in range(completed):
-            if cmp_slot >= SPARSE_CMP_MAX_BLOCKS * BLOCK_SIZE:
+            if cmp_slot >= SPARSE_CMP_MAX_BLOCKS * CMP_STORAGE_BLOCK_SIZE:
                 break
-            row = cache_row_from_table(table, cmp_slot)
+            row = cache_row_from_table(table, cmp_slot, block_size=CMP_STORAGE_BLOCK_SIZE)
             if row >= 0:
                 hist_bf16 = ((torch.rand(IDX_HEAD_DIM,) - 0.5) * 0.05).to(torch.bfloat16)
                 hi8, hsc = int8_quant_per_row(hist_bf16.float().view(1, IDX_HEAD_DIM))
@@ -788,14 +790,14 @@ def build_tensor_specs(
             mapping[t] = cache_row_from_table(table, int(pos[t].item()))
         return mapping
     def init_cmp_kv():
-        cache = torch.zeros(CSA_CMP_BLOCK_NUM, BLOCK_SIZE, 1, HEAD_DIM)
-        cache_flat = cache.view(CSA_CMP_BLOCK_NUM * BLOCK_SIZE, HEAD_DIM)
+        cache = torch.zeros(CSA_CMP_BLOCK_NUM, CMP_STORAGE_BLOCK_SIZE, 1, HEAD_DIM)
+        cache_flat = cache.view(CSA_CMP_BLOCK_NUM * CMP_STORAGE_BLOCK_SIZE, HEAD_DIM)
         table = init_cmp_block_table()
         completed = context_len // COMPRESS_RATIO
         for cmp_slot in range(completed):
-            if cmp_slot >= SPARSE_CMP_MAX_BLOCKS * BLOCK_SIZE:
+            if cmp_slot >= SPARSE_CMP_MAX_BLOCKS * CMP_STORAGE_BLOCK_SIZE:
                 break
-            row = cache_row_from_table(table, cmp_slot)
+            row = cache_row_from_table(table, cmp_slot, block_size=CMP_STORAGE_BLOCK_SIZE)
             value = (torch.rand(HEAD_DIM,) - 0.5) * 0.1
             if row >= 0:
                 cache_flat[row] = value.to(torch.bfloat16)
@@ -817,14 +819,18 @@ def build_tensor_specs(
         table = init_cmp_block_table()
         records = cmp_write_records()
         for token_id, cmp_slot in records:
-            mapping[token_id] = cache_row_from_table(table, cmp_slot)
+            mapping[token_id] = cache_row_from_table(
+                table, cmp_slot, block_size=CMP_STORAGE_BLOCK_SIZE
+            )
         return mapping
     def init_idx_slot_mapping():
         mapping = torch.full((T,), -1, dtype=torch.int64)
         table = init_idx_block_table()
         records = cmp_write_records()
         for token_id, cmp_slot in records:
-            mapping[token_id] = cache_row_from_table(table, cmp_slot)
+            mapping[token_id] = cache_row_from_table(
+                table, cmp_slot, block_size=CMP_STORAGE_BLOCK_SIZE
+            )
         return mapping
     def init_state_slot_mapping():
         mapping = torch.full((T,), -1, dtype=torch.int64)
@@ -902,20 +908,20 @@ def build_tensor_specs(
         # prefill_indexer tests cover them.
         TensorSpec(
             "cmp_kv",
-            [CSA_CMP_BLOCK_NUM, BLOCK_SIZE, 1, HEAD_DIM],
+            [CSA_CMP_BLOCK_NUM, CMP_STORAGE_BLOCK_SIZE, 1, HEAD_DIM],
             torch.bfloat16,
             init_value=init_cmp_kv,
         ),
         TensorSpec("cmp_block_table", [SPARSE_CMP_MAX_BLOCKS], torch.int32, init_value=init_cmp_block_table),
         TensorSpec(
             "idx_kv_cache",
-            [PREFILL_IDX_BLOCK_NUM, BLOCK_SIZE, 1, IDX_HEAD_DIM],
+            [PREFILL_IDX_BLOCK_NUM, CMP_STORAGE_BLOCK_SIZE, 1, IDX_HEAD_DIM],
             torch.int8,
             init_value=init_idx_kv_cache,
         ),
         TensorSpec(
             "idx_kv_scale",
-            [PREFILL_IDX_BLOCK_NUM, BLOCK_SIZE, 1, 1],
+            [PREFILL_IDX_BLOCK_NUM, CMP_STORAGE_BLOCK_SIZE, 1, 1],
             torch.float32,
             init_value=init_idx_kv_scale,
         ),

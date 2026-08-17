@@ -715,23 +715,27 @@ def build_tensor_specs(start_pos=None):
         return block_table(batch=B, table_blocks=ORI_TABLE_MAX_BLOCKS, physical_blocks=ORI_MAX_BLOCKS)
 
     def init_cmp_kv():
-        return init_normalized_cache((CMP_BLOCK_NUM, BLOCK_SIZE, 1, HEAD_DIM))
+        return init_normalized_cache(
+            (CMP_BLOCK_NUM, CMP_STORAGE_BLOCK_SIZE, 1, HEAD_DIM)
+        )
 
     def init_cmp_block_table():
         return block_table(
             batch=B,
             table_blocks=CMP_MAX_BLOCKS,
-            physical_blocks=CMP_MAX_BLOCKS,
+            physical_blocks=CMP_BLOCK_NUM,
         )
 
     def init_idx_kv_cache():
-        return init_normalized_cache((IDX_CACHE_BLOCK_NUM, BLOCK_SIZE, 1, IDX_HEAD_DIM))
+        return init_normalized_cache(
+            (IDX_CACHE_BLOCK_NUM, CMP_STORAGE_BLOCK_SIZE, 1, IDX_HEAD_DIM)
+        )
 
     def init_idx_block_table():
         return block_table(
             batch=B,
             table_blocks=IDX_CACHE_MAX_BLOCKS,
-            physical_blocks=IDX_CACHE_MAX_BLOCKS,
+            physical_blocks=IDX_CACHE_BLOCK_NUM,
         )
 
     def init_attn_sink():
@@ -784,7 +788,7 @@ def build_tensor_specs(start_pos=None):
             positions,
             init_cmp_block_table(),
             compress_ratio=COMPRESS_RATIO,
-            block_size=BLOCK_SIZE,
+            block_size=CMP_STORAGE_BLOCK_SIZE,
         ).reshape(-1).contiguous()
 
     def init_idx_slot_mapping():
@@ -793,7 +797,7 @@ def build_tensor_specs(start_pos=None):
             positions,
             init_idx_block_table(),
             compress_ratio=COMPRESS_RATIO,
-            block_size=BLOCK_SIZE,
+            block_size=CMP_STORAGE_BLOCK_SIZE,
         ).reshape(-1).contiguous()
 
     def init_state_slot_mapping():
@@ -850,9 +854,16 @@ def build_tensor_specs(start_pos=None):
     # C8 indexer cache: INT8 + per-position scale from the bf16-rounded draw
     from utils import int8_quant_per_row
     _idx_kv_i8, _idx_kv_sc = int8_quant_per_row(
-        shared_idx_kv_cache.float().reshape(IDX_CACHE_BLOCK_NUM * BLOCK_SIZE, IDX_HEAD_DIM))
-    shared_idx_kv_cache_i8 = _idx_kv_i8.view(IDX_CACHE_BLOCK_NUM, BLOCK_SIZE, 1, IDX_HEAD_DIM)
-    shared_idx_kv_scale = _idx_kv_sc.view(IDX_CACHE_BLOCK_NUM, BLOCK_SIZE, 1, 1)
+        shared_idx_kv_cache.float().reshape(
+            IDX_CACHE_BLOCK_NUM * CMP_STORAGE_BLOCK_SIZE, IDX_HEAD_DIM
+        )
+    )
+    shared_idx_kv_cache_i8 = _idx_kv_i8.view(
+        IDX_CACHE_BLOCK_NUM, CMP_STORAGE_BLOCK_SIZE, 1, IDX_HEAD_DIM
+    )
+    shared_idx_kv_scale = _idx_kv_sc.view(
+        IDX_CACHE_BLOCK_NUM, CMP_STORAGE_BLOCK_SIZE, 1, 1
+    )
 
     wq_b_bf16 = init_wq_b().to(torch.bfloat16)
     wq_b_i8, wq_b_scale = quant_w_per_output_channel(wq_b_bf16)
@@ -890,10 +901,10 @@ def build_tensor_specs(start_pos=None):
         TensorSpec("inner_compress_state", [INNER_STATE_BLOCK_NUM, INNER_STATE_BLOCK_SIZE, INNER_STATE_DIM], torch.float32, init_value=init_inner_compress_state),
         TensorSpec("inner_compress_state_block_table", [B, INNER_STATE_MAX_BLOCKS], torch.int32, init_value=init_inner_compress_state_block_table),
         TensorSpec("kv_cache", [ORI_BLOCK_NUM, BLOCK_SIZE, 1, HEAD_DIM], torch.bfloat16, init_value=init_kv_cache, is_output=True),
-        TensorSpec("cmp_kv", [CMP_BLOCK_NUM, BLOCK_SIZE, 1, HEAD_DIM], torch.bfloat16, init_value=init_cmp_kv),
+        TensorSpec("cmp_kv", [CMP_BLOCK_NUM, CMP_STORAGE_BLOCK_SIZE, 1, HEAD_DIM], torch.bfloat16, init_value=init_cmp_kv),
         TensorSpec("cmp_block_table", [B, CMP_MAX_BLOCKS], torch.int32, init_value=init_cmp_block_table),
-        TensorSpec("idx_kv_cache", [IDX_CACHE_BLOCK_NUM, BLOCK_SIZE, 1, IDX_HEAD_DIM], torch.int8, init_value=lambda: shared_idx_kv_cache_i8.clone()),
-        TensorSpec("idx_kv_scale", [IDX_CACHE_BLOCK_NUM, BLOCK_SIZE, 1, 1], torch.float32, init_value=lambda: shared_idx_kv_scale.clone()),
+        TensorSpec("idx_kv_cache", [IDX_CACHE_BLOCK_NUM, CMP_STORAGE_BLOCK_SIZE, 1, IDX_HEAD_DIM], torch.int8, init_value=lambda: shared_idx_kv_cache_i8.clone()),
+        TensorSpec("idx_kv_scale", [IDX_CACHE_BLOCK_NUM, CMP_STORAGE_BLOCK_SIZE, 1, 1], torch.float32, init_value=lambda: shared_idx_kv_scale.clone()),
         TensorSpec("idx_block_table", [B, IDX_CACHE_MAX_BLOCKS], torch.int32, init_value=init_idx_block_table),
         TensorSpec("ori_slot_mapping", [T], torch.int64, init_value=init_ori_slot_mapping),
         TensorSpec("window_swa_indices", [T, WIN], torch.int32, init_value=init_window_swa_indices),

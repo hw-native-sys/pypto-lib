@@ -51,6 +51,10 @@ GROUP_HCA_STATE = 4
 GROUP_CSA_STATE = 5
 GROUP_CSA_INNER_STATE = 6
 N_CACHE_GROUPS = 7
+HCA_COMPRESS_RATIO = 128
+CSA_COMPRESS_RATIO = 4
+HCA_CMP_STORAGE_BLOCK_SIZE = BLOCK_SIZE // HCA_COMPRESS_RATIO
+CSA_CMP_STORAGE_BLOCK_SIZE = BLOCK_SIZE // CSA_COMPRESS_RATIO
 
 # tiling
 X_HC_HIDDEN_TILE = 512
@@ -168,28 +172,32 @@ def build_decode_metadata(
             )
 
             hca_cmp_slot = pl.cast(-1, pl.INT64)
-            if (position + 1) % 128 == 0:
+            if (position + 1) % HCA_COMPRESS_RATIO == 0:
                 source_block = position // BLOCK_SIZE
+                storage_offset = position % BLOCK_SIZE // HCA_COMPRESS_RATIO
                 count = pl.read(block_counts, [request, GROUP_HCA_CMP])
                 physical_block = pl.read(
                     hca_cmp_block_table,
                     [request, pl.cast(source_block % count, pl.INDEX)],
                 )
-                hca_cmp_slot = pl.cast(physical_block, pl.INT64)
+                hca_cmp_slot = pl.cast(
+                    physical_block * HCA_CMP_STORAGE_BLOCK_SIZE + storage_offset,
+                    pl.INT64,
+                )
             pl.write(hca_cmp_slot_mapping, [token], hca_cmp_slot)
 
             csa_cmp_slot = pl.cast(-1, pl.INT64)
             csa_idx_slot = pl.cast(-1, pl.INT64)
-            if (position + 1) % 4 == 0:
+            if (position + 1) % CSA_COMPRESS_RATIO == 0:
                 source_block = position // BLOCK_SIZE
-                storage_offset = position % BLOCK_SIZE // 4
+                storage_offset = position % BLOCK_SIZE // CSA_COMPRESS_RATIO
                 cmp_count = pl.read(block_counts, [request, GROUP_CSA_CMP])
                 cmp_physical_block = pl.read(
                     csa_cmp_block_table,
                     [request, pl.cast(source_block % cmp_count, pl.INDEX)],
                 )
                 csa_cmp_slot = pl.cast(
-                    cmp_physical_block * 32 + storage_offset,
+                    cmp_physical_block * CSA_CMP_STORAGE_BLOCK_SIZE + storage_offset,
                     pl.INT64,
                 )
                 idx_count = pl.read(block_counts, [request, GROUP_IDX])
@@ -198,7 +206,7 @@ def build_decode_metadata(
                     [request, pl.cast(source_block % idx_count, pl.INDEX)],
                 )
                 csa_idx_slot = pl.cast(
-                    idx_physical_block * 32 + storage_offset,
+                    idx_physical_block * CSA_CMP_STORAGE_BLOCK_SIZE + storage_offset,
                     pl.INT64,
                 )
             pl.write(csa_cmp_slot_mapping, [token], csa_cmp_slot)

@@ -544,7 +544,7 @@ def golden_prefill_sparse_attn(tensors):
             gathered.append(ori_kv.reshape(-1, HEAD_DIM)[row])
         for raw_i in cmp_indices[t].tolist():
             cmp_slot = int(raw_i)
-            if cmp_slot < 0 or cmp_slot >= CMP_MAX_BLOCKS * BLOCK_SIZE:
+            if cmp_slot < 0 or cmp_slot >= CMP_MAX_BLOCKS * cmp_storage_block_size:
                 continue
             block_id = int(cmp_block_table[cmp_slot // cmp_storage_block_size].item())
             if block_id >= 0:
@@ -615,7 +615,12 @@ def get_prefill_cmp_valid(compress_ratio: int) -> int:
     if compress_ratio == 0:
         return 0
     if compress_ratio in (4, 128):
-        return min(IDX_TOPK, S // compress_ratio, CMP_MAX_BLOCKS * BLOCK_SIZE)
+        storage_block_size = BLOCK_SIZE // compress_ratio
+        return min(
+            IDX_TOPK,
+            S // compress_ratio,
+            CMP_MAX_BLOCKS * storage_block_size,
+        )
     raise ValueError(f"Unsupported compress_ratio={compress_ratio}; expected one of {SUPPORTED_COMPRESS_RATIOS}")
 
 def build_tensor_specs(
@@ -643,12 +648,14 @@ def build_tensor_specs(
     def init_ori_kv():
         return ((torch.rand(ori_block_num, BLOCK_SIZE, 1, HEAD_DIM) - 0.5) * 0.05).to(torch.bfloat16)
     def init_cmp_kv():
-        return ((torch.rand(cmp_block_num, BLOCK_SIZE, 1, HEAD_DIM) - 0.5) * 0.05).to(torch.bfloat16)
+        return (
+            (torch.rand(cmp_block_num, storage_block_size, 1, HEAD_DIM) - 0.5)
+            * 0.05
+        ).to(torch.bfloat16)
     def init_cmp_block_table():
         table = torch.zeros(CMP_MAX_BLOCKS, dtype=torch.int32)
-        scheduler_blocks = max(1, cmp_block_num * BLOCK_SIZE // storage_block_size)
         for blk in range(CMP_MAX_BLOCKS):
-            table[blk] = blk % scheduler_blocks * storage_block_size
+            table[blk] = blk % cmp_block_num
         return table
     def init_swa_indices():
         idx = torch.full((T, WIN), -1, dtype=torch.int32)
@@ -704,7 +711,12 @@ def build_tensor_specs(
         TensorSpec("q", [T, H, HEAD_DIM], torch.bfloat16, init_value=init_q),
         TensorSpec("ori_kv", [ori_block_num, BLOCK_SIZE, 1, HEAD_DIM], torch.bfloat16, init_value=init_ori_kv),
         TensorSpec("swa_indices", [T, WIN], torch.int32, init_value=init_swa_indices),
-        TensorSpec("cmp_kv", [cmp_block_num, BLOCK_SIZE, 1, HEAD_DIM], torch.bfloat16, init_value=init_cmp_kv),
+        TensorSpec(
+            "cmp_kv",
+            [cmp_block_num, storage_block_size, 1, HEAD_DIM],
+            torch.bfloat16,
+            init_value=init_cmp_kv,
+        ),
         TensorSpec("cmp_block_table", [CMP_MAX_BLOCKS], torch.int32, init_value=init_cmp_block_table),
         ScalarSpec("cmp_storage_block_size", torch.int32, storage_block_size),
         TensorSpec("cmp_indices", [T, IDX_TOPK], torch.int32, init_value=init_cmp_indices),
