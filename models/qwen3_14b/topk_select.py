@@ -149,10 +149,18 @@ def topk_select_fwd(
                     token_id = chunk_base + local_token
                     if token_id >= pl.cast(REAL_VOCAB, target_type=pl.INT32):
                         token_id = pl.cast(0, pl.INT32)
-                    topk_values[b : b + 1, :] = pl.full([1, TOPK], dtype=pl.FP32, value=FP32_NEG_INF)
-                    topk_indices[b : b + 1, :] = pl.full([1, TOPK], dtype=pl.INT32, value=0)
-                    pl.write(topk_values, [b, 0], best_val)
-                    pl.write(topk_indices, [b, 0], token_id)
+                    # One GM store path per output tensor: stage the row in UB
+                    # tiles, patch the winning column scalar, then store the
+                    # whole row once (mixing MTE3 stores with scalar GM writes
+                    # breaks D-cache coherence, which pypto rejects).
+                    greedy_vals = pl.create_tensor([1, TOPK], dtype=pl.FP32)
+                    greedy_vals[:, :] = pl.full([1, TOPK], dtype=pl.FP32, value=FP32_NEG_INF)
+                    greedy_ids = pl.create_tensor([1, TOPK], dtype=pl.INT32)
+                    greedy_ids[:, :] = pl.full([1, TOPK], dtype=pl.INT32, value=0)
+                    pl.write(greedy_vals, [0, 0], best_val)
+                    pl.write(greedy_ids, [0, 0], token_id)
+                    topk_values[b : b + 1, :] = greedy_vals
+                    topk_indices[b : b + 1, :] = greedy_ids
             else:
                 with pl.at(level=pl.Level.CORE_GROUP, name_hint="topk_select"):
                     candidate_vals = pl.create_tensor([1, TOPK_CANDIDATE_PAD], dtype=pl.FP32)
@@ -239,13 +247,20 @@ def topk_select_fwd(
                         mask_pattern=pl.tile.MaskPattern.P1010,
                         output_dtype=pl.INT32,
                     )
+                    # Gather token ids scalar-wise into a UB row, then issue the
+                    # single GM store (same one-path rule as the greedy branch).
+                    selected_ids = pl.create_tensor([1, TOPK], dtype=pl.INT32)
                     for k in pl.range(TOPK):
                         candidate_pos = pl.read(selected_positions, [0, k])
-                        token_id = pl.read(
-                            candidate_ids,
-                            [0, pl.cast(candidate_pos, target_type=pl.INDEX)],
+                        pl.write(
+                            selected_ids,
+                            [0, k],
+                            pl.read(
+                                candidate_ids,
+                                [0, pl.cast(candidate_pos, target_type=pl.INDEX)],
+                            ),
                         )
-                        pl.write(topk_indices, [b, k], token_id)
+                    topk_indices[b : b + 1, :] = selected_ids
         else:
             with pl.at(level=pl.Level.CORE_GROUP, name_hint="topk_select_inactive"):
                 topk_values[b : b + 1, :] = pl.full([1, TOPK], dtype=pl.FP32, value=FP32_NEG_INF)
