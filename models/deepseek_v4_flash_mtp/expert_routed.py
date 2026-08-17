@@ -43,7 +43,7 @@ D_OUT_TILE = 256
 # line (perf_hint PH001 flagged the prior 256B store as sub-line).
 QUANT_TILE = 512
 D_OUT_TILE_ACT = 512
-W2_INNER = 4
+W2_INNER = 2
 W2_ACT_INNER = 8
 TILES_PER_EXPERT = RECV_MAX // RECV_TILE
 
