@@ -23,6 +23,10 @@ from config import (
     BLOCK_SIZE,
     KV_ORI_BLOCK_NUM,
     KV_ORI_MAX_BLOCKS,
+    SWA_SOURCE_INVALID,
+    SWA_SOURCE_OVERLAY_BASE,
+    INT8_SCALE_MAX,
+    INT8_AMAX_EPS,
 )
 
 
@@ -77,12 +81,14 @@ assert WIN == ATTN_K_TILE, f"SWA decode expects WIN ({WIN}) == ATTN_K_TILE ({ATT
 def sparse_attn_swa(
     q: pl.Tensor[[T_DYN, H, HEAD_DIM], pl.BF16],
     ori_kv: pl.Tensor[[ORI_BLOCK_NUM_DYN, BLOCK_SIZE, 1, HEAD_DIM], pl.BF16],
-    swa_indices: pl.Tensor[[T_DYN, WIN], pl.INT32],
+    current_kv: pl.Tensor[[T_DYN, HEAD_DIM], pl.BF16],
+    swa_sources: pl.Tensor[[T_DYN, WIN], pl.INT32],
     sparse_bias: pl.Tensor[[T_DYN, PADDED_TOPK], pl.FP32],
     attn_sink: pl.Tensor[[H], pl.FP32],
     freqs_cos: pl.Tensor[[T_DYN, ROPE_DIM], pl.BF16],
     freqs_sin: pl.Tensor[[T_DYN, ROPE_DIM], pl.BF16],
     o_packed_heads: pl.Tensor[[O_GROUPS * T_PAD * HEADS_PER_GROUP, HEAD_DIM], pl.BF16],
+    ready_dep: pl.Scalar[pl.TASK_ID],
 ) -> tuple[pl.Tensor, pl.Scalar[pl.TASK_ID]]:
     """Write SWA heads as ``[group, T_PAD, head-in-group, dim]`` slabs.
 
@@ -98,13 +104,9 @@ def sparse_attn_swa(
     rope_cs_blocks = t_dim // ROPE_CS_T_TILE
     ori_block_num = pl.tensor.dim(ori_kv, 0)
     ori_kv_flat = pl.reshape(ori_kv, [ori_block_num * BLOCK_SIZE, HEAD_DIM])
-    # SWA metadata already lowered each logical window row to a physical cache
-    # slot. Current decode tokens must be inserted into ori_kv by the caller
-    # before this function runs; there is no speculative overlay path here.
-
     swa_kv_flat = pl.create_tensor([t_win, HEAD_DIM], dtype=pl.BF16)
     gather_tids = pl.array.create(1, pl.TASK_ID)
-    with pl.spmd(t_gather, name_hint="swa_gather_kv") as gather_tid:
+    with pl.spmd(t_gather, name_hint="swa_gather_kv", deps=[ready_dep]) as gather_tid:
         g_task = pl.tile.get_block_idx()
         g_t = g_task // GATHER_SPLITS
         g_split = g_task - g_t * GATHER_SPLITS
@@ -115,8 +117,8 @@ def sparse_attn_swa(
         for g_sub in pl.range(GATHER_ROWS_PER_TASK // GATHER_RUN):
             g_sr0 = g_r0 + g_sub * GATHER_RUN
             g_sdst = g_base + g_sr0
-            g_first = pl.read(swa_indices, [g_t, g_sr0])
-            g_last = pl.read(swa_indices, [g_t, g_sr0 + GATHER_RUN - 1])
+            g_first = pl.read(swa_sources, [g_t, g_sr0])
+            g_last = pl.read(swa_sources, [g_t, g_sr0 + GATHER_RUN - 1])
             # A -1 slot anywhere in the run pins g_run_ok below the match value,
             # so an invalid or block-straddling run takes the per-row path.
             g_run_ok = (g_last - g_first) + pl.min(g_first, 0) * GATHER_RUN
@@ -128,10 +130,15 @@ def sparse_attn_swa(
             else:
                 for g_dr in pl.range(GATHER_RUN):
                     g_dst = g_sdst + g_dr
-                    g_slot_i32 = pl.read(swa_indices, [g_t, g_sr0 + g_dr])
-                    if g_slot_i32 >= 0:
-                        g_slot = pl.cast(g_slot_i32, pl.INDEX)
+                    g_source = pl.read(swa_sources, [g_t, g_sr0 + g_dr])
+                    if g_source >= 0:
+                        g_slot = pl.cast(g_source, pl.INDEX)
                         swa_kv_flat[g_dst : g_dst + 1, 0 : HEAD_DIM] = ori_kv_flat[g_slot : g_slot + 1, 0 : HEAD_DIM]
+                    elif g_source <= SWA_SOURCE_OVERLAY_BASE:
+                        g_overlay = pl.cast(SWA_SOURCE_OVERLAY_BASE - g_source, pl.INDEX)
+                        swa_kv_flat[g_dst : g_dst + 1, 0 : HEAD_DIM] = current_kv[
+                            g_overlay : g_overlay + 1, 0 : HEAD_DIM
+                        ]
                     else:
                         swa_kv_flat[g_dst : g_dst + 1, 0 : HEAD_DIM] = pl.full(
                             [1, HEAD_DIM], dtype=pl.BF16, value=0.0)
@@ -145,7 +152,12 @@ def sparse_attn_swa(
     sparse_blk_li = pl.create_tensor([t_blk, 1], dtype=pl.FP32)
     sparse_blk_oi = pl.create_tensor([t_blk, HEAD_DIM], dtype=pl.FP32)
 
-    with pl.spmd(t_dim, name_hint="qk_pv", deps=[gather_tids[0]], allow_early_resolve=True) as qk_tid:
+    with pl.spmd(
+        t_dim,
+        name_hint="qk_pv",
+        deps=[gather_tids[0], ready_dep],
+        allow_early_resolve=True,
+    ) as qk_tid:
         qk_t = pl.tile.get_block_idx()
         qk_token_base = qk_t * (H // H_TILE) * SPARSE_BLOCKS * H_TILE
         for qk_sb in pl.unroll(SPARSE_BLOCKS):
@@ -275,7 +287,8 @@ def sparse_attn_swa(
 def sparse_attn_swa_test(
     q: pl.Tensor[[T_DYN, H, HEAD_DIM], pl.BF16],
     ori_kv: pl.Tensor[[ORI_BLOCK_NUM_DYN, BLOCK_SIZE, 1, HEAD_DIM], pl.BF16],
-    swa_indices: pl.Tensor[[T_DYN, WIN], pl.INT32],
+    current_kv: pl.Tensor[[T_DYN, HEAD_DIM], pl.BF16],
+    swa_sources: pl.Tensor[[T_DYN, WIN], pl.INT32],
     swa_lens: pl.Tensor[[T_DYN], pl.INT32],
     attn_sink: pl.Tensor[[H], pl.FP32],
     freqs_cos: pl.Tensor[[T_DYN, ROPE_DIM], pl.BF16],
@@ -283,14 +296,15 @@ def sparse_attn_swa_test(
     o_packed_heads: pl.Out[pl.Tensor[[O_GROUPS, T_PAD * HEADS_PER_GROUP, HEAD_DIM], pl.BF16]],
 ):
     q.bind_dynamic(0, T_DYN)
-    swa_indices.bind_dynamic(0, T_DYN)
+    current_kv.bind_dynamic(0, T_DYN)
+    swa_sources.bind_dynamic(0, T_DYN)
     swa_lens.bind_dynamic(0, T_DYN)
     freqs_cos.bind_dynamic(0, T_DYN)
     freqs_sin.bind_dynamic(0, T_DYN)
     t_dim = pl.tensor.dim(q, 0)
     bias_blocks = t_dim // BIAS_T_TILE
     sparse_bias = pl.create_tensor([t_dim, PADDED_TOPK], dtype=pl.FP32)
-    with pl.at(level=pl.Level.CORE_GROUP, name_hint="swa_valid_bias"):
+    with pl.at(level=pl.Level.CORE_GROUP, name_hint="swa_valid_bias") as bias_tid:
         v_col = pl.cast(pl.arange(0, [1, ATTN_K_TILE], dtype=pl.INT32), target_type=pl.FP32)
         for vb in pl.range(bias_blocks):
             v_t0 = vb * BIAS_T_TILE
@@ -303,9 +317,10 @@ def sparse_attn_swa_test(
             sparse_bias[v_t0 : v_t0 + BIAS_T_TILE, 0:ATTN_K_TILE] = pl.mul(pl.sub(v_valid, 1.0), -NEG_INF)
     o_packed_flat = pl.reshape(o_packed_heads, [O_GROUPS * T_PAD * HEADS_PER_GROUP, HEAD_DIM])
     o_packed_flat, _ = sparse_attn_swa(
-        q, ori_kv, swa_indices, sparse_bias,
+        q, ori_kv, current_kv, swa_sources, sparse_bias,
         attn_sink, freqs_cos, freqs_sin,
         o_packed_flat,
+        bias_tid,
     )
     return o_packed_heads
 
@@ -317,7 +332,8 @@ def golden_sparse_attn(tensors):
     q = tensors["q"].float()
     ori_kv = tensors["ori_kv"].float()
     ori_kv_flat = ori_kv.reshape(ori_kv.shape[0] * BLOCK_SIZE, HEAD_DIM)
-    swa_indices = tensors["swa_indices"]
+    current_kv = tensors["current_kv"].float()
+    swa_sources = tensors["swa_sources"]
     swa_lens = tensors["swa_lens"]
     attn_sink = tensors["attn_sink"].float()
     cos = tensors["freqs_cos"].float()
@@ -326,13 +342,19 @@ def golden_sparse_attn(tensors):
     tokens = q.shape[0]
     o = torch.zeros(tokens, H, HEAD_DIM)
 
-    # Per-query-token attention. swa_indices is the authoritative physical
-    # cache-row list; invalid tail columns are -1 and swa_lens gives the valid
-    # prefix length.
+    def source_row(source):
+        source = int(source)
+        if source >= 0:
+            return ori_kv_flat[source]
+        if source <= SWA_SOURCE_OVERLAY_BASE:
+            return current_kv[SWA_SOURCE_OVERLAY_BASE - source]
+        return None
+
+    # Per-query-token attention. Three-state sources select persistent cache,
+    # current-step overlay, or invalid/padding respectively.
     for t in range(tokens):
         valid_len = int(swa_lens[t].item())
-        valid_slots = [int(v) for v in swa_indices[t, :valid_len].tolist() if int(v) >= 0]
-        if not valid_slots:
+        if valid_len <= 0:
             continue
 
         q_t = q[t]
@@ -343,9 +365,12 @@ def golden_sparse_attn(tensors):
         for sb in range(SPARSE_BLOCKS):
             start = sb * ATTN_K_TILE
             end = min(start + ATTN_K_TILE, WIN)
-            slots = swa_indices[t, start:end].tolist()
+            sources = swa_sources[t, start:end].tolist()
             valid_tile = torch.tensor(
-                [start + i < valid_len and int(slot) >= 0 for i, slot in enumerate(slots)],
+                [
+                    start + i < valid_len and int(source) != SWA_SOURCE_INVALID
+                    for i, source in enumerate(sources)
+                ],
                 dtype=torch.bool,
             )
             if end - start < ATTN_K_TILE:
@@ -355,12 +380,12 @@ def golden_sparse_attn(tensors):
                 ])
             valid_tile = valid_tile.to(device=ori_kv.device)
             kv_tile = torch.zeros(ATTN_K_TILE, HEAD_DIM, dtype=ori_kv.dtype, device=ori_kv.device)
-            for r, slot in enumerate(slots):
+            for r, source in enumerate(sources):
                 if r >= ATTN_K_TILE:
                     break
-                slot_i = int(slot)
-                if slot_i >= 0:
-                    kv_tile[r] = ori_kv_flat[slot_i]
+                row = source_row(source)
+                if row is not None:
+                    kv_tile[r] = row
             scores = (q_t @ kv_tile.T) * SOFTMAX_SCALE
             scores = scores.masked_fill(~valid_tile.unsqueeze(0), NEG_INF)
             mi = scores.max(dim=-1, keepdim=True).values
@@ -395,11 +420,28 @@ def golden_sparse_attn(tensors):
     o_rope = torch.stack([inv_even, inv_odd], dim=-1).flatten(-2)
     o = torch.cat([o[..., :NOPE_DIM], o_rope], dim=-1).to(torch.bfloat16)
 
-    # Pack as [group, T_PAD, head-in-group, dim]; rows past the runtime token
-    # count are capacity padding the kernel never writes.
-    packed = tensors["o_packed_heads"].view(O_GROUPS, T_PAD, HEADS_PER_GROUP, HEAD_DIM)
-    o_grouped = o.view(tokens, O_GROUPS, HEADS_PER_GROUP, HEAD_DIM)
-    packed[:, :tokens] = o_grouped.permute(1, 0, 2, 3).to(torch.bfloat16)
+    if "attn_out" in tensors:
+        wo_a = tensors["wo_a"].float()
+        wo_b = tensors["wo_b"].to(torch.int32)
+        wo_b_scale = tensors["wo_b_scale"].float()
+        o_model = o.view(tokens, O_GROUPS, O_GROUP_IN)
+        o_r = torch.einsum("tgd,gld->tgl", o_model, wo_a)
+        o_r = o_r.reshape(tokens, O_GROUPS, O_LORA)
+        amax = o_r.abs().amax(dim=-1, keepdim=True).clamp_min(INT8_AMAX_EPS)
+        scale_q = INT8_SCALE_MAX / amax
+        o_i8 = torch.round(o_r * scale_q).to(torch.int32).to(torch.float16).to(torch.int8)
+        scale_dq = 1.0 / scale_q
+        wo_b_grouped = wo_b.reshape(D, O_GROUPS, O_LORA)
+        out = torch.zeros(tokens, D, dtype=torch.float32)
+        for group in range(O_GROUPS):
+            out += (
+                o_i8[:, group].to(torch.int32) @ wo_b_grouped[:, group].to(torch.int32).T
+            ).float() * scale_dq[:, group]
+        tensors["attn_out"][:] = out * wo_b_scale.unsqueeze(0)
+    else:
+        packed = tensors["o_packed_heads"].view(O_GROUPS, T_PAD, HEADS_PER_GROUP, HEAD_DIM)
+        o_grouped = o.view(tokens, O_GROUPS, HEADS_PER_GROUP, HEAD_DIM)
+        packed[:, :tokens] = o_grouped.permute(1, 0, 2, 3).to(torch.bfloat16)
 
 def build_tensor_specs(
     causal_regression_fixture: bool = False,
@@ -456,6 +498,9 @@ def build_tensor_specs(
                     indices[t, w] = blk * BLOCK_SIZE + intra
         return indices
 
+    def init_current_kv():
+        return torch.zeros(tokens, HEAD_DIM, dtype=torch.bfloat16)
+
     def init_cos():
         """Build the split-half cosine table used by the inverse-RoPE reference."""
         angles = torch.arange(tokens * HALF_ROPE).reshape(tokens, HALF_ROPE) * 1e-3
@@ -471,7 +516,8 @@ def build_tensor_specs(
     return [
         TensorSpec("q", [tokens, H, HEAD_DIM], torch.bfloat16, init_value=init_q),
         TensorSpec("ori_kv", [ORI_BLOCK_NUM, BLOCK_SIZE, 1, HEAD_DIM], torch.bfloat16, init_value=init_ori_kv),
-        TensorSpec("swa_indices", [tokens, WIN], torch.int32, init_value=init_swa_indices),
+        TensorSpec("current_kv", [tokens, HEAD_DIM], torch.bfloat16, init_value=init_current_kv),
+        TensorSpec("swa_sources", [tokens, WIN], torch.int32, init_value=init_swa_indices),
         TensorSpec("swa_lens", [tokens], torch.int32, init_value=init_swa_lens),
         TensorSpec("attn_sink", [H], torch.float32, init_value=init_attn_sink),
         TensorSpec("freqs_cos", [tokens, ROPE_DIM], torch.bfloat16, init_value=init_cos),

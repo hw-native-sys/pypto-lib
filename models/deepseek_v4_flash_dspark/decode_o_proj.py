@@ -76,7 +76,15 @@ PROJ_A_MM_N_TILE = 128
 MM_T_TILE = T_PAD
 PROJ_A_ROW_TILE = 16
 B_K_TILE = 256
-PROJ_B_MM_N_TILE = 256
+# Keep the local INT32 accumulator below the A2/A3 vector-buffer limit for
+# every supported TP specialization.  The previous fixed N=256 produced a
+# [256, 256] INT32 tile (256 KiB) at TP=2, above the 188416-byte capacity.
+if T_PAD <= 128:
+    PROJ_B_MM_N_TILE = 256
+elif T_PAD <= 256:
+    PROJ_B_MM_N_TILE = 128
+else:
+    PROJ_B_MM_N_TILE = 64
 PROJ_B_ACT_N_TILE = 512
 QUANT_TOKEN_TILE = 8
 PROJ_B_D_TILE = 512
