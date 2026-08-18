@@ -61,11 +61,12 @@ from decode_o_proj import (
     LOCAL_T,
     LOCAL_T_PAD,
     O_WINDOW_ROWS,
-    attention_token_head_all_to_all_step,
-    decode_sharded_o_projection,
-    o_projection_reduce_scatter_step,
+    decode_o_proj,
+    decode_o_proj_tp1,
+    o_group_a2a,
+    o_proj_reduce_scatter,
 )
-from decode_sparse_attn_swa import ATTN_K_TILE, PADDED_TOPK, T_PAD, sparse_attn_swa, sparse_attn_swa_heads
+from decode_sparse_attn_swa import ATTN_K_TILE, PADDED_TOPK, T_PAD, sparse_attn_swa
 
 # Dynamic shape variables.
 T_DYN = pl.dynamic("T_DYN")  # T = B * S
@@ -121,8 +122,125 @@ if T_PAD != LOCAL_T_PAD:
 if TP_FIXTURE_WINDOW_BLOCKS > ORI_BLOCK_NUM:
     raise ValueError("SWA fixture window exceeds the original KV cache capacity")
 
+@pl.jit
+def decode_swa(
+    q: pl.Tensor[[T_DYN, H, HEAD_DIM], pl.BF16],
+    ori_kv: pl.Tensor[[ORI_BLOCK_NUM_DYN, BLOCK_SIZE, 1, HEAD_DIM], pl.BF16],
+    swa_indices: pl.Tensor[[T_DYN, WIN], pl.INT32],
+    swa_lens: pl.Tensor[[T_DYN], pl.INT32],
+    attn_sink: pl.Tensor[[H], pl.FP32],
+    freqs_cos: pl.Tensor[[T_DYN, ROPE_HEAD_DIM], pl.BF16],
+    freqs_sin: pl.Tensor[[T_DYN, ROPE_HEAD_DIM], pl.BF16],
+    wo_a: pl.Tensor[[LOCAL_O_GROUPS, O_LORA, O_GROUP_IN], pl.BF16],
+    wo_b: pl.Tensor[[D, LOCAL_O_WIDTH], pl.INT8],
+    wo_b_scale: pl.Tensor[[D], pl.FP32],
+    o_local: pl.InOut[pl.Tensor[[LOCAL_T_PAD, D], pl.BF16]],
+    attention_window: pld.DistributedTensor[[ATTENTION_WINDOW_ROWS, O_GROUP_IN], pl.BF16],
+    attention_signal: pld.DistributedTensor[[TP_SIZE, 1], pl.INT32],
+    o_window: pld.DistributedTensor[[O_WINDOW_ROWS, D], pl.FP32],
+    o_signal: pld.DistributedTensor[[TP_SIZE, 1], pl.INT32],
+    group_base: pl.Scalar[pl.INT32],
+    tp_rank: pl.Scalar[pl.INT32],
+    local_t: pl.Scalar[pl.INT32],
+):
+    """Run rank-local SWA heads, output A2A, sharded O projection, and RS."""
+    q.bind_dynamic(0, T_DYN)
+    swa_indices.bind_dynamic(0, T_DYN)
+    swa_lens.bind_dynamic(0, T_DYN)
+    freqs_cos.bind_dynamic(0, T_DYN)
+    freqs_sin.bind_dynamic(0, T_DYN)
+
+    t_dim = pl.tensor.dim(q, 0)
+    sparse_bias = pl.create_tensor([t_dim, PADDED_TOPK], dtype=pl.FP32)
+    with pl.at(level=pl.Level.CORE_GROUP, name_hint="swa_valid_bias"):
+        valid_col = pl.cast(pl.arange(0, [1, ATTN_K_TILE], dtype=pl.INT32), target_type=pl.FP32)
+        for bias_block in pl.range(t_dim // BIAS_T_TILE):
+            token_start = bias_block * BIAS_T_TILE
+            zero_rows = pl.full([BIAS_T_TILE, ATTN_K_TILE], dtype=pl.FP32, value=0.0)
+            valid_cols = pl.col_expand(zero_rows, valid_col)
+            lens_slice = swa_lens[token_start : token_start + BIAS_T_TILE]
+            lens_col = pl.reshape(lens_slice, [BIAS_T_TILE, 1])
+            lens_fp32 = pl.cast(lens_col, target_type=pl.FP32)
+            valid = pl.neg(pl.row_expand_sub(valid_cols, lens_fp32))
+            valid = pl.maximum(valid, 0.0)
+            valid = pl.minimum(valid, 1.0)
+            invalid = pl.sub(valid, 1.0)
+            sparse_bias[token_start : token_start + BIAS_T_TILE, 0:ATTN_K_TILE] = pl.mul(invalid, -NEG_INF)
+
+    o_packed_heads = pl.create_tensor([O_GROUPS * T_PAD * HEADS_PER_GROUP, HEAD_DIM], dtype=pl.BF16)
+    o_packed_heads, _ = sparse_attn_swa(
+        q, ori_kv, swa_indices, sparse_bias,
+        attn_sink, freqs_cos, freqs_sin,
+        o_packed_heads,
+    )
+
+    attention_grouped = pl.reshape(o_packed_heads, [O_GROUPS * LOCAL_T_PAD, O_GROUP_IN])
+    attention_local_flat = pl.create_tensor([ATTENTION_WINDOW_ROWS, O_GROUP_IN], dtype=pl.BF16)
+    attention_local_flat, attention_signal = o_group_a2a(
+        attention_grouped, attention_local_flat,
+        attention_window, attention_signal,
+        group_base, tp_rank, local_t,
+    )
+
+    attention_local_groups = pl.reshape(attention_local_flat, [LOCAL_O_GROUPS, GROUP_T_PAD, O_GROUP_IN])
+    o_partial = pl.create_tensor([GROUP_T_PAD, D], dtype=pl.FP32)
+    o_partial, projection_tid = decode_o_proj(
+        attention_local_groups,
+        wo_a, wo_b, wo_b_scale,
+        local_t, o_partial,
+    )
+
+    o_local, o_signal = o_proj_reduce_scatter(
+        o_partial, o_local,
+        o_window, o_signal,
+        group_base, tp_rank, local_t, projection_tid,
+    )
+    return o_local, attention_signal, o_signal
+
+
+@pl.jit.host
+def l3_decode_swa(
+    q: pl.Tensor[[TP_SIZE, T_DYN, H, HEAD_DIM], pl.BF16],
+    ori_kv: pl.Tensor[[TP_SIZE, ORI_BLOCK_NUM, BLOCK_SIZE, 1, HEAD_DIM], pl.BF16],
+    swa_indices: pl.Tensor[[TP_SIZE, T_DYN, WIN], pl.INT32],
+    swa_lens: pl.Tensor[[TP_SIZE, T_DYN], pl.INT32],
+    attn_sink: pl.Tensor[[TP_SIZE, H], pl.FP32],
+    freqs_cos: pl.Tensor[[TP_SIZE, T_DYN, ROPE_HEAD_DIM], pl.BF16],
+    freqs_sin: pl.Tensor[[TP_SIZE, T_DYN, ROPE_HEAD_DIM], pl.BF16],
+    wo_a: pl.Tensor[[TP_SIZE, LOCAL_O_GROUPS, O_LORA, O_GROUP_IN], pl.BF16],
+    wo_b: pl.Tensor[[TP_SIZE, D, LOCAL_O_WIDTH], pl.INT8],
+    wo_b_scale: pl.Tensor[[TP_SIZE, D], pl.FP32],
+    o_local: pl.InOut[pl.Tensor[[TP_SIZE, LOCAL_T_PAD, D], pl.BF16]],
+    local_t: pl.Scalar[pl.INT32],
+):
+    """Launch the SWA output half on one physical TP group."""
+    q.bind_dynamic(1, T_DYN)
+    swa_indices.bind_dynamic(1, T_DYN)
+    swa_lens.bind_dynamic(1, T_DYN)
+    freqs_cos.bind_dynamic(1, T_DYN)
+    freqs_sin.bind_dynamic(1, T_DYN)
+
+    attention_window_buf = pld.alloc_window_buffer([ATTENTION_WINDOW_ROWS, O_GROUP_IN], dtype=pl.BF16)
+    attention_signal_buf = pld.alloc_window_buffer([TP_SIZE, 1], dtype=pl.INT32)
+    o_window_buf = pld.alloc_window_buffer([O_WINDOW_ROWS, D], dtype=pl.FP32)
+    o_signal_buf = pld.alloc_window_buffer([TP_SIZE, 1], dtype=pl.INT32)
+
+    for rank in pl.range(pld.world_size()):
+        attention_window = pld.window(attention_window_buf, [ATTENTION_WINDOW_ROWS, O_GROUP_IN], dtype=pl.BF16)
+        attention_signal = pld.window(attention_signal_buf, [TP_SIZE, 1], dtype=pl.INT32)
+        o_window = pld.window(o_window_buf, [O_WINDOW_ROWS, D], dtype=pl.FP32)
+        o_signal = pld.window(o_signal_buf, [TP_SIZE, 1], dtype=pl.INT32)
+        decode_swa(
+            q[rank], ori_kv[rank], swa_indices[rank], swa_lens[rank],
+            attn_sink[rank], freqs_cos[rank], freqs_sin[rank],
+            wo_a[rank], wo_b[rank], wo_b_scale[rank], o_local[rank],
+            attention_window, attention_signal, o_window, o_signal,
+            0, rank, local_t, device=rank,
+        )
+
+
 @pl.jit.inline
-def attention_swa(
+def decode_swa_tp1(
     x_hc: pl.Tensor[[T_DYN, HC_MULT, D], pl.FP32],
     # hc_pre weights
     hc_attn_fn: pl.Tensor[[MIX_HC, HC_DIM], pl.FP32],
@@ -209,10 +327,17 @@ def attention_swa(
             )
             sparse_bias[v_t0 : v_t0 + BIAS_T_TILE, 0:WIN] = pl.mul(pl.sub(v_valid, 1.0), -NEG_INF)
     attn_out = pl.create_tensor([t_dim, D], dtype=pl.BF16)
-    sparse_attn_swa(
+    o_packed_heads = pl.create_tensor([O_GROUPS * T_PAD * HEADS_PER_GROUP, HEAD_DIM], dtype=pl.BF16)
+    o_packed_heads, heads_dep = sparse_attn_swa(
         q, kv_cache, swa_indices, sparse_bias,
         attn_sink, rope_cos_t, rope_sin_t,
-        wo_a, wo_b, wo_b_scale, attn_out,
+        o_packed_heads,
+    )
+    o_packed = pl.reshape(o_packed_heads, [O_GROUPS * T_PAD, O_GROUP_IN])
+    attn_out = decode_o_proj_tp1(
+        o_packed,
+        wo_a, wo_b, wo_b_scale,
+        attn_out, heads_dep,
     )
 
     hc_post(attn_out, x_hc, post_t, comb_t, x_out)
@@ -220,7 +345,7 @@ def attention_swa(
 
 
 @pl.jit
-def attention_swa_test(
+def decode_swa_tp1_test(
     x_hc: pl.Tensor[[T_DYN, HC_MULT, D], pl.FP32],
     # hc_pre weights
     hc_attn_fn: pl.Tensor[[MIX_HC, HC_DIM], pl.FP32],
@@ -257,7 +382,7 @@ def attention_swa_test(
     position_ids.bind_dynamic(0, T_DYN)
     x_out.bind_dynamic(0, T_DYN)
 
-    attention_swa(
+    decode_swa_tp1(
         x_hc,
         hc_attn_fn, hc_attn_scale, hc_attn_base,
         attn_norm_w, wq_a, wq_b, wq_b_scale, wkv,
@@ -271,125 +396,162 @@ def attention_swa_test(
     return x_out
 
 
-@pl.jit
-def decode_swa_output(
-    q: pl.Tensor[[T_DYN, H, HEAD_DIM], pl.BF16],
-    ori_kv: pl.Tensor[[ORI_BLOCK_NUM_DYN, BLOCK_SIZE, 1, HEAD_DIM], pl.BF16],
-    swa_indices: pl.Tensor[[T_DYN, WIN], pl.INT32],
-    swa_lens: pl.Tensor[[T_DYN], pl.INT32],
-    attn_sink: pl.Tensor[[H], pl.FP32],
-    freqs_cos: pl.Tensor[[T_DYN, ROPE_HEAD_DIM], pl.BF16],
-    freqs_sin: pl.Tensor[[T_DYN, ROPE_HEAD_DIM], pl.BF16],
-    wo_a: pl.Tensor[[LOCAL_O_GROUPS, O_LORA, O_GROUP_IN], pl.BF16],
-    wo_b: pl.Tensor[[D, LOCAL_O_WIDTH], pl.INT8],
-    wo_b_scale: pl.Tensor[[D], pl.FP32],
-    o_local: pl.InOut[pl.Tensor[[LOCAL_T_PAD, D], pl.BF16]],
-    attention_window: pld.DistributedTensor[[ATTENTION_WINDOW_ROWS, O_GROUP_IN], pl.BF16],
-    attention_signal: pld.DistributedTensor[[TP_SIZE, 1], pl.INT32],
-    o_window: pld.DistributedTensor[[O_WINDOW_ROWS, D], pl.FP32],
-    o_signal: pld.DistributedTensor[[TP_SIZE, 1], pl.INT32],
-    group_base: pl.Scalar[pl.INT32],
-    tp_rank: pl.Scalar[pl.INT32],
-    local_t: pl.Scalar[pl.INT32],
-):
-    """Run rank-local SWA heads, output A2A, sharded O projection, and RS."""
-    q.bind_dynamic(0, T_DYN)
-    swa_indices.bind_dynamic(0, T_DYN)
-    swa_lens.bind_dynamic(0, T_DYN)
-    freqs_cos.bind_dynamic(0, T_DYN)
-    freqs_sin.bind_dynamic(0, T_DYN)
+def build_tp_tensor_specs(local_t):
+    """Build deterministic tensor-parallel SWA output-half inputs."""
+    import torch
 
-    t_dim = pl.tensor.dim(q, 0)
-    sparse_bias = pl.create_tensor([t_dim, PADDED_TOPK], dtype=pl.FP32)
-    with pl.at(level=pl.Level.CORE_GROUP, name_hint="swa_valid_bias"):
-        valid_col = pl.cast(pl.arange(0, [1, ATTN_K_TILE], dtype=pl.INT32), target_type=pl.FP32)
-        for bias_block in pl.range(t_dim // BIAS_T_TILE):
-            token_start = bias_block * BIAS_T_TILE
-            zero_rows = pl.full([BIAS_T_TILE, ATTN_K_TILE], dtype=pl.FP32, value=0.0)
-            valid_cols = pl.col_expand(zero_rows, valid_col)
-            lens_slice = swa_lens[token_start : token_start + BIAS_T_TILE]
-            lens_col = pl.reshape(lens_slice, [BIAS_T_TILE, 1])
-            lens_fp32 = pl.cast(lens_col, target_type=pl.FP32)
-            valid = pl.neg(pl.row_expand_sub(valid_cols, lens_fp32))
-            valid = pl.maximum(valid, 0.0)
-            valid = pl.minimum(valid, 1.0)
-            invalid = pl.sub(valid, 1.0)
-            sparse_bias[token_start : token_start + BIAS_T_TILE, 0:ATTN_K_TILE] = pl.mul(invalid, -NEG_INF)
+    from golden import ScalarSpec, TensorSpec
 
-    o_packed_heads = pl.create_tensor([O_GROUPS * T_PAD * HEADS_PER_GROUP, HEAD_DIM], dtype=pl.BF16)
-    o_packed_heads, _ = sparse_attn_swa_heads(
-        q, ori_kv, swa_indices, sparse_bias,
-        attn_sink, freqs_cos, freqs_sin,
-        o_packed_heads,
+    if local_t < BIAS_T_TILE or local_t > LOCAL_T or local_t % BIAS_T_TILE != 0 or local_t % S != 0:
+        raise ValueError(f"local_t must be a multiple of {BIAS_T_TILE} in [{BIAS_T_TILE}, {LOCAL_T}], got {local_t}")
+
+    def init_q():
+        q = torch.zeros(TP_SIZE, local_t, H, HEAD_DIM, dtype=torch.bfloat16)
+        rank = torch.arange(TP_SIZE, dtype=torch.float32).reshape(TP_SIZE, 1, 1)
+        token = torch.arange(local_t, dtype=torch.float32).reshape(1, local_t, 1)
+        head = torch.arange(H, dtype=torch.float32).reshape(1, 1, H)
+        q[..., 0] = (rank + token * 0.25 + head * 0.0625).to(torch.bfloat16)
+        return q
+
+    def init_ori_kv():
+        shape = (ORI_BLOCK_NUM, BLOCK_SIZE, 1, HEAD_DIM)
+        cache = torch.full(shape, float("nan"), dtype=torch.bfloat16)
+        cache[:TP_FIXTURE_WINDOW_BLOCKS, :, 0, :] = 0.0
+        cache[:TP_FIXTURE_WINDOW_BLOCKS, :, 0, 0] = 0.25
+        return cache.unsqueeze(0).expand(TP_SIZE, *shape).clone()
+
+    def init_swa_indices():
+        window_row = torch.arange(WIN, dtype=torch.int32)
+        return window_row.reshape(1, 1, WIN).expand(TP_SIZE, local_t, WIN).clone()
+
+    def init_swa_lens():
+        return torch.full((TP_SIZE, local_t), WIN, dtype=torch.int32)
+
+    def init_attn_sink():
+        head = torch.arange(H, dtype=torch.int32).remainder(HEADS_PER_GROUP).to(torch.float32)
+        sink = 4.0 + head * 0.125
+        return sink.reshape(1, H).expand(TP_SIZE, H).clone()
+
+    def init_freqs_cos():
+        cos = torch.ones(local_t, ROPE_HEAD_DIM, dtype=torch.bfloat16)
+        return cos.unsqueeze(0).expand(TP_SIZE, local_t, ROPE_HEAD_DIM).clone()
+
+    def init_freqs_sin():
+        sin = torch.zeros(local_t, ROPE_HEAD_DIM, dtype=torch.bfloat16)
+        return sin.unsqueeze(0).expand(TP_SIZE, local_t, ROPE_HEAD_DIM).clone()
+
+    def init_wo_a():
+        wo_a = torch.zeros(TP_SIZE, LOCAL_O_GROUPS, O_LORA, O_GROUP_IN, dtype=torch.bfloat16)
+        for rank in range(TP_SIZE):
+            for local_group in range(LOCAL_O_GROUPS):
+                shard_scale = (rank + 1) * (local_group + 1) * 0.125
+                for head in range(HEADS_PER_GROUP):
+                    wo_a[rank, local_group, head, head * HEAD_DIM] = shard_scale * (head + 1)
+        return wo_a
+
+    def init_wo_b():
+        base = torch.arange(D * LOCAL_O_WIDTH, dtype=torch.int32).reshape(D, LOCAL_O_WIDTH)
+        rank = torch.arange(TP_SIZE, dtype=torch.int32).reshape(TP_SIZE, 1, 1)
+        return (base.unsqueeze(0) + rank).remainder(7).sub(3).to(torch.int8)
+
+    def init_wo_b_scale():
+        channel_scale = torch.arange(D, dtype=torch.int32).remainder(4).to(torch.float32) * 0.25 + 0.5
+        return channel_scale.reshape(1, D).expand(TP_SIZE, D).clone()
+
+    return [
+        TensorSpec("q", [TP_SIZE, local_t, H, HEAD_DIM], torch.bfloat16, init_value=init_q),
+        TensorSpec("ori_kv", [TP_SIZE, ORI_BLOCK_NUM, BLOCK_SIZE, 1, HEAD_DIM], torch.bfloat16, init_value=init_ori_kv),
+        TensorSpec("swa_indices", [TP_SIZE, local_t, WIN], torch.int32, init_value=init_swa_indices),
+        TensorSpec("swa_lens", [TP_SIZE, local_t], torch.int32, init_value=init_swa_lens),
+        TensorSpec("attn_sink", [TP_SIZE, H], torch.float32, init_value=init_attn_sink),
+        TensorSpec("freqs_cos", [TP_SIZE, local_t, ROPE_HEAD_DIM], torch.bfloat16, init_value=init_freqs_cos),
+        TensorSpec("freqs_sin", [TP_SIZE, local_t, ROPE_HEAD_DIM], torch.bfloat16, init_value=init_freqs_sin),
+        TensorSpec("wo_a", [TP_SIZE, LOCAL_O_GROUPS, O_LORA, O_GROUP_IN], torch.bfloat16, init_value=init_wo_a),
+        TensorSpec("wo_b", [TP_SIZE, D, LOCAL_O_WIDTH], torch.int8, init_value=init_wo_b),
+        TensorSpec("wo_b_scale", [TP_SIZE, D], torch.float32, init_value=init_wo_b_scale),
+        TensorSpec(
+            "o_local", [TP_SIZE, LOCAL_T_PAD, D], torch.bfloat16,
+            init_value=TP_FIXTURE_OUTPUT_SENTINEL, is_output=True,
+        ),
+        ScalarSpec("local_t", torch.int32, local_t),
+    ]
+
+
+def golden_decode_swa(tensors):
+    """Compute the controlled SWA heads, sharded O projection, and reduced rows."""
+    import torch
+
+    local_t = tensors["q"].shape[1]
+    group_t = TP_SIZE * local_t
+    q0 = tensors["q"][..., 0].float()
+    kv0 = tensors["ori_kv"][:, 0, 0, 0, 0].float()
+    sink = tensors["attn_sink"].float()
+    score = q0 * kv0.reshape(TP_SIZE, 1, 1) * M.softmax_scale
+    numerator = WIN * kv0.reshape(TP_SIZE, 1, 1)
+    head_value = numerator / (WIN + torch.exp(sink.reshape(TP_SIZE, 1, H) - score))
+    head_value = head_value.to(torch.bfloat16)
+
+    attention_grouped = torch.zeros(TP_SIZE, O_GROUPS, local_t, O_GROUP_IN, dtype=torch.bfloat16)
+    for group in range(O_GROUPS):
+        for head in range(HEADS_PER_GROUP):
+            global_head = group * HEADS_PER_GROUP + head
+            group_col = head * HEAD_DIM
+            attention_grouped[:, group, :, group_col] = head_value[:, :, global_head]
+
+    attention_local = torch.zeros(TP_SIZE, LOCAL_O_GROUPS, group_t, O_GROUP_IN, dtype=torch.bfloat16)
+    for destination_rank in range(TP_SIZE):
+        for local_group in range(LOCAL_O_GROUPS):
+            global_group = destination_rank * LOCAL_O_GROUPS + local_group
+            group_rows = attention_grouped[:, global_group].reshape(group_t, O_GROUP_IN)
+            attention_local[destination_rank, local_group] = group_rows
+
+    partials = torch.zeros(TP_SIZE, group_t, D, dtype=torch.float32)
+    for rank in range(TP_SIZE):
+        attention = attention_local[rank].float()
+        o_a = torch.einsum("gti,gri->gtr", attention, tensors["wo_a"][rank].float())
+        row_amax = o_a.abs().amax(dim=-1, keepdim=True).clamp_min(INT8_AMAX_EPS)
+        scale_q = INT8_SCALE_MAX / row_amax
+        o_a_i8 = torch.round(o_a * scale_q).to(torch.int32).to(torch.float16).to(torch.int8)
+        scale_dq = 1.0 / scale_q
+        wo_b = tensors["wo_b"][rank].reshape(D, LOCAL_O_GROUPS, O_LORA)
+        for local_group in range(LOCAL_O_GROUPS):
+            group_i32 = o_a_i8[local_group].to(torch.int32)
+            weight_i32 = wo_b[:, local_group].to(torch.int32)
+            group_partial = group_i32 @ weight_i32.T
+            partials[rank] += group_partial.float() * scale_dq[local_group]
+        partials[rank] *= tensors["wo_b_scale"][rank].float().reshape(1, D)
+
+    reduced = partials.sum(dim=0)
+    tensors["o_local"].fill_(TP_FIXTURE_OUTPUT_SENTINEL)
+    for rank in range(TP_SIZE):
+        row_start = rank * local_t
+        tensors["o_local"][rank, :local_t] = reduced[row_start : row_start + local_t].to(torch.bfloat16)
+
+
+def build_o_local_compare(local_t):
+    """Compare valid token rows and require the poisoned capacity tail to survive."""
+    import torch
+
+    from golden import ratio_allclose
+
+    prefix_compare = ratio_allclose(
+        atol=1e-4, rtol=1.0 / 128, max_error_ratio=0.0,
+        valid_rows=local_t, valid_axis=1,
     )
 
-    attention_grouped = pl.reshape(o_packed_heads, [O_GROUPS * LOCAL_T_PAD, O_GROUP_IN])
-    attention_local_flat = pl.create_tensor([ATTENTION_WINDOW_ROWS, O_GROUP_IN], dtype=pl.BF16)
-    attention_local_flat, attention_signal = attention_token_head_all_to_all_step(
-        attention_grouped, attention_local_flat,
-        attention_window, attention_signal,
-        group_base, tp_rank, local_t,
-    )
+    def compare(actual, expected, **kwargs):
+        actual_tail = actual[:, local_t:]
+        expected_tail = expected[:, local_t:]
+        if not torch.equal(actual_tail, expected_tail):
+            mismatch_count = int((actual_tail != expected_tail).sum().item())
+            return False, f"    inactive token tail mismatch count={mismatch_count}"
+        return prefix_compare(actual, expected, **kwargs)
 
-    attention_local_groups = pl.reshape(attention_local_flat, [LOCAL_O_GROUPS, GROUP_T_PAD, O_GROUP_IN])
-    o_partial = pl.create_tensor([GROUP_T_PAD, D], dtype=pl.FP32)
-    o_partial, projection_tid = decode_sharded_o_projection(
-        attention_local_groups,
-        wo_a, wo_b, wo_b_scale,
-        local_t, o_partial,
-    )
-
-    with pl.spmd(1, name_hint="tp_o_reduce_scatter", deps=[projection_tid]) as _reduce_scatter_tid:
-        o_local, o_signal = o_projection_reduce_scatter_step(
-            o_partial, o_local,
-            o_window, o_signal,
-            group_base, tp_rank, local_t,
-        )
-    return o_local, attention_signal, o_signal
+    compare.__name__ = f"swa_output_prefix_and_tail(local_t={local_t})"
+    return compare
 
 
-@pl.jit.host
-def l3_decode_swa_output(
-    q: pl.Tensor[[TP_SIZE, T_DYN, H, HEAD_DIM], pl.BF16],
-    ori_kv: pl.Tensor[[TP_SIZE, ORI_BLOCK_NUM, BLOCK_SIZE, 1, HEAD_DIM], pl.BF16],
-    swa_indices: pl.Tensor[[TP_SIZE, T_DYN, WIN], pl.INT32],
-    swa_lens: pl.Tensor[[TP_SIZE, T_DYN], pl.INT32],
-    attn_sink: pl.Tensor[[TP_SIZE, H], pl.FP32],
-    freqs_cos: pl.Tensor[[TP_SIZE, T_DYN, ROPE_HEAD_DIM], pl.BF16],
-    freqs_sin: pl.Tensor[[TP_SIZE, T_DYN, ROPE_HEAD_DIM], pl.BF16],
-    wo_a: pl.Tensor[[TP_SIZE, LOCAL_O_GROUPS, O_LORA, O_GROUP_IN], pl.BF16],
-    wo_b: pl.Tensor[[TP_SIZE, D, LOCAL_O_WIDTH], pl.INT8],
-    wo_b_scale: pl.Tensor[[TP_SIZE, D], pl.FP32],
-    o_local: pl.InOut[pl.Tensor[[TP_SIZE, LOCAL_T_PAD, D], pl.BF16]],
-    local_t: pl.Scalar[pl.INT32],
-):
-    """Launch the SWA output half on one physical TP group."""
-    q.bind_dynamic(1, T_DYN)
-    swa_indices.bind_dynamic(1, T_DYN)
-    swa_lens.bind_dynamic(1, T_DYN)
-    freqs_cos.bind_dynamic(1, T_DYN)
-    freqs_sin.bind_dynamic(1, T_DYN)
-
-    attention_window_buf = pld.alloc_window_buffer([ATTENTION_WINDOW_ROWS, O_GROUP_IN], dtype=pl.BF16)
-    attention_signal_buf = pld.alloc_window_buffer([TP_SIZE, 1], dtype=pl.INT32)
-    o_window_buf = pld.alloc_window_buffer([O_WINDOW_ROWS, D], dtype=pl.FP32)
-    o_signal_buf = pld.alloc_window_buffer([TP_SIZE, 1], dtype=pl.INT32)
-
-    for rank in pl.range(pld.world_size()):
-        attention_window = pld.window(attention_window_buf, [ATTENTION_WINDOW_ROWS, O_GROUP_IN], dtype=pl.BF16)
-        attention_signal = pld.window(attention_signal_buf, [TP_SIZE, 1], dtype=pl.INT32)
-        o_window = pld.window(o_window_buf, [O_WINDOW_ROWS, D], dtype=pl.FP32)
-        o_signal = pld.window(o_signal_buf, [TP_SIZE, 1], dtype=pl.INT32)
-        decode_swa_output(
-            q[rank], ori_kv[rank], swa_indices[rank], swa_lens[rank],
-            attn_sink[rank], freqs_cos[rank], freqs_sin[rank],
-            wo_a[rank], wo_b[rank], wo_b_scale[rank], o_local[rank],
-            attention_window, attention_signal, o_window, o_signal,
-            0, rank, local_t, device=rank,
-        )
-
-
-def golden_attention_swa(tensors):
+def golden_decode_swa_tp1(tensors):
     """End-to-end orchestration for the ratio=0 (SWA) layers.
     Mirrors Block.hc_pre + Attention.forward (decode branch, ratio==0 path: no compressor,
     no indexer, no cmp_kv) + Block.hc_post."""
@@ -640,161 +802,6 @@ def build_tensor_specs(start_pos=None, batch=B):
     ]
 
 
-def build_tp_tensor_specs(local_t):
-    """Build deterministic tensor-parallel SWA output-half inputs."""
-    import torch
-
-    from golden import ScalarSpec, TensorSpec
-
-    if local_t < BIAS_T_TILE or local_t > LOCAL_T or local_t % BIAS_T_TILE != 0 or local_t % S != 0:
-        raise ValueError(f"local_t must be a multiple of {BIAS_T_TILE} in [{BIAS_T_TILE}, {LOCAL_T}], got {local_t}")
-
-    def init_q():
-        q = torch.zeros(TP_SIZE, local_t, H, HEAD_DIM, dtype=torch.bfloat16)
-        rank = torch.arange(TP_SIZE, dtype=torch.float32).reshape(TP_SIZE, 1, 1)
-        token = torch.arange(local_t, dtype=torch.float32).reshape(1, local_t, 1)
-        head = torch.arange(H, dtype=torch.float32).reshape(1, 1, H)
-        q[..., 0] = (rank + token * 0.25 + head * 0.0625).to(torch.bfloat16)
-        return q
-
-    def init_ori_kv():
-        shape = (ORI_BLOCK_NUM, BLOCK_SIZE, 1, HEAD_DIM)
-        cache = torch.full(shape, float("nan"), dtype=torch.bfloat16)
-        cache[:TP_FIXTURE_WINDOW_BLOCKS, :, 0, :] = 0.0
-        cache[:TP_FIXTURE_WINDOW_BLOCKS, :, 0, 0] = 0.25
-        return cache.unsqueeze(0).expand(TP_SIZE, *shape).clone()
-
-    def init_swa_indices():
-        window_row = torch.arange(WIN, dtype=torch.int32)
-        return window_row.reshape(1, 1, WIN).expand(TP_SIZE, local_t, WIN).clone()
-
-    def init_swa_lens():
-        return torch.full((TP_SIZE, local_t), WIN, dtype=torch.int32)
-
-    def init_attn_sink():
-        head = torch.arange(H, dtype=torch.int32).remainder(HEADS_PER_GROUP).to(torch.float32)
-        sink = 4.0 + head * 0.125
-        return sink.reshape(1, H).expand(TP_SIZE, H).clone()
-
-    def init_freqs_cos():
-        cos = torch.ones(local_t, ROPE_HEAD_DIM, dtype=torch.bfloat16)
-        return cos.unsqueeze(0).expand(TP_SIZE, local_t, ROPE_HEAD_DIM).clone()
-
-    def init_freqs_sin():
-        sin = torch.zeros(local_t, ROPE_HEAD_DIM, dtype=torch.bfloat16)
-        return sin.unsqueeze(0).expand(TP_SIZE, local_t, ROPE_HEAD_DIM).clone()
-
-    def init_wo_a():
-        wo_a = torch.zeros(TP_SIZE, LOCAL_O_GROUPS, O_LORA, O_GROUP_IN, dtype=torch.bfloat16)
-        for rank in range(TP_SIZE):
-            for local_group in range(LOCAL_O_GROUPS):
-                shard_scale = (rank + 1) * (local_group + 1) * 0.125
-                for head in range(HEADS_PER_GROUP):
-                    wo_a[rank, local_group, head, head * HEAD_DIM] = shard_scale * (head + 1)
-        return wo_a
-
-    def init_wo_b():
-        base = torch.arange(D * LOCAL_O_WIDTH, dtype=torch.int32).reshape(D, LOCAL_O_WIDTH)
-        rank = torch.arange(TP_SIZE, dtype=torch.int32).reshape(TP_SIZE, 1, 1)
-        return (base.unsqueeze(0) + rank).remainder(7).sub(3).to(torch.int8)
-
-    def init_wo_b_scale():
-        channel_scale = torch.arange(D, dtype=torch.int32).remainder(4).to(torch.float32) * 0.25 + 0.5
-        return channel_scale.reshape(1, D).expand(TP_SIZE, D).clone()
-
-    return [
-        TensorSpec("q", [TP_SIZE, local_t, H, HEAD_DIM], torch.bfloat16, init_value=init_q),
-        TensorSpec("ori_kv", [TP_SIZE, ORI_BLOCK_NUM, BLOCK_SIZE, 1, HEAD_DIM], torch.bfloat16, init_value=init_ori_kv),
-        TensorSpec("swa_indices", [TP_SIZE, local_t, WIN], torch.int32, init_value=init_swa_indices),
-        TensorSpec("swa_lens", [TP_SIZE, local_t], torch.int32, init_value=init_swa_lens),
-        TensorSpec("attn_sink", [TP_SIZE, H], torch.float32, init_value=init_attn_sink),
-        TensorSpec("freqs_cos", [TP_SIZE, local_t, ROPE_HEAD_DIM], torch.bfloat16, init_value=init_freqs_cos),
-        TensorSpec("freqs_sin", [TP_SIZE, local_t, ROPE_HEAD_DIM], torch.bfloat16, init_value=init_freqs_sin),
-        TensorSpec("wo_a", [TP_SIZE, LOCAL_O_GROUPS, O_LORA, O_GROUP_IN], torch.bfloat16, init_value=init_wo_a),
-        TensorSpec("wo_b", [TP_SIZE, D, LOCAL_O_WIDTH], torch.int8, init_value=init_wo_b),
-        TensorSpec("wo_b_scale", [TP_SIZE, D], torch.float32, init_value=init_wo_b_scale),
-        TensorSpec(
-            "o_local", [TP_SIZE, LOCAL_T_PAD, D], torch.bfloat16,
-            init_value=TP_FIXTURE_OUTPUT_SENTINEL, is_output=True,
-        ),
-        ScalarSpec("local_t", torch.int32, local_t),
-    ]
-
-
-def golden_decode_swa_output(tensors):
-    """Compute the controlled SWA heads, sharded O projection, and reduced rows."""
-    import torch
-
-    local_t = tensors["q"].shape[1]
-    group_t = TP_SIZE * local_t
-    q0 = tensors["q"][..., 0].float()
-    kv0 = tensors["ori_kv"][:, 0, 0, 0, 0].float()
-    sink = tensors["attn_sink"].float()
-    score = q0 * kv0.reshape(TP_SIZE, 1, 1) * M.softmax_scale
-    numerator = WIN * kv0.reshape(TP_SIZE, 1, 1)
-    head_value = numerator / (WIN + torch.exp(sink.reshape(TP_SIZE, 1, H) - score))
-    head_value = head_value.to(torch.bfloat16)
-
-    attention_grouped = torch.zeros(TP_SIZE, O_GROUPS, local_t, O_GROUP_IN, dtype=torch.bfloat16)
-    for group in range(O_GROUPS):
-        for head in range(HEADS_PER_GROUP):
-            global_head = group * HEADS_PER_GROUP + head
-            group_col = head * HEAD_DIM
-            attention_grouped[:, group, :, group_col] = head_value[:, :, global_head]
-
-    attention_local = torch.zeros(TP_SIZE, LOCAL_O_GROUPS, group_t, O_GROUP_IN, dtype=torch.bfloat16)
-    for destination_rank in range(TP_SIZE):
-        for local_group in range(LOCAL_O_GROUPS):
-            global_group = destination_rank * LOCAL_O_GROUPS + local_group
-            group_rows = attention_grouped[:, global_group].reshape(group_t, O_GROUP_IN)
-            attention_local[destination_rank, local_group] = group_rows
-
-    partials = torch.zeros(TP_SIZE, group_t, D, dtype=torch.float32)
-    for rank in range(TP_SIZE):
-        attention = attention_local[rank].float()
-        o_a = torch.einsum("gti,gri->gtr", attention, tensors["wo_a"][rank].float())
-        row_amax = o_a.abs().amax(dim=-1, keepdim=True).clamp_min(INT8_AMAX_EPS)
-        scale_q = INT8_SCALE_MAX / row_amax
-        o_a_i8 = torch.round(o_a * scale_q).to(torch.int32).to(torch.float16).to(torch.int8)
-        scale_dq = 1.0 / scale_q
-        wo_b = tensors["wo_b"][rank].reshape(D, LOCAL_O_GROUPS, O_LORA)
-        for local_group in range(LOCAL_O_GROUPS):
-            group_i32 = o_a_i8[local_group].to(torch.int32)
-            weight_i32 = wo_b[:, local_group].to(torch.int32)
-            group_partial = group_i32 @ weight_i32.T
-            partials[rank] += group_partial.float() * scale_dq[local_group]
-        partials[rank] *= tensors["wo_b_scale"][rank].float().reshape(1, D)
-
-    reduced = partials.sum(dim=0)
-    tensors["o_local"].fill_(TP_FIXTURE_OUTPUT_SENTINEL)
-    for rank in range(TP_SIZE):
-        row_start = rank * local_t
-        tensors["o_local"][rank, :local_t] = reduced[row_start : row_start + local_t].to(torch.bfloat16)
-
-
-def build_o_local_compare(local_t):
-    """Compare valid token rows and require the poisoned capacity tail to survive."""
-    import torch
-
-    from golden import ratio_allclose
-
-    prefix_compare = ratio_allclose(
-        atol=1e-4, rtol=1.0 / 128, max_error_ratio=0.0,
-        valid_rows=local_t, valid_axis=1,
-    )
-
-    def compare(actual, expected, **kwargs):
-        actual_tail = actual[:, local_t:]
-        expected_tail = expected[:, local_t:]
-        if not torch.equal(actual_tail, expected_tail):
-            mismatch_count = int((actual_tail != expected_tail).sum().item())
-            return False, f"    inactive token tail mismatch count={mismatch_count}"
-        return prefix_compare(actual, expected, **kwargs)
-
-    compare.__name__ = f"swa_output_prefix_and_tail(local_t={local_t})"
-    return compare
-
-
 if __name__ == "__main__":
     import argparse
 
@@ -831,9 +838,9 @@ if __name__ == "__main__":
     for case in selected_cases:
         local_t = case_local_t[case]
         result = run_jit(
-            fn=l3_decode_swa_output,
+            fn=l3_decode_swa,
             specs=build_tp_tensor_specs(local_t),
-            golden_fn=golden_decode_swa_output,
+            golden_fn=golden_decode_swa,
             compile_only=args.compile_only,
             compile_cfg=dict(
                 dump_passes=args.dump_passes,

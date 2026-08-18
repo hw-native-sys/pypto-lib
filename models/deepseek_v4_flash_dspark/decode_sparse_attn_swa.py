@@ -77,7 +77,7 @@ assert WIN == ATTN_K_TILE, f"SWA decode expects WIN ({WIN}) == ATTN_K_TILE ({ATT
 
 
 @pl.jit.inline
-def sparse_attn_swa_heads(
+def sparse_attn_swa(
     q: pl.Tensor[[T_DYN, H, HEAD_DIM], pl.BF16],
     ori_kv: pl.Tensor[[ORI_BLOCK_NUM_DYN, BLOCK_SIZE, 1, HEAD_DIM], pl.BF16],
     swa_indices: pl.Tensor[[T_DYN, WIN], pl.INT32],
@@ -274,38 +274,8 @@ def sparse_attn_swa_heads(
     return o_packed_heads, merge_tid
 
 
-@pl.jit.inline
-def sparse_attn_swa(
-    q: pl.Tensor[[T_DYN, H, HEAD_DIM], pl.BF16],
-    ori_kv: pl.Tensor[[ORI_BLOCK_NUM_DYN, BLOCK_SIZE, 1, HEAD_DIM], pl.BF16],
-    swa_indices: pl.Tensor[[T_DYN, WIN], pl.INT32],
-    sparse_bias: pl.Tensor[[T_DYN, PADDED_TOPK], pl.FP32],
-    attn_sink: pl.Tensor[[H], pl.FP32],
-    freqs_cos: pl.Tensor[[T_DYN, ROPE_DIM], pl.BF16],
-    freqs_sin: pl.Tensor[[T_DYN, ROPE_DIM], pl.BF16],
-    wo_a: pl.Tensor[[O_GROUPS, O_LORA, O_GROUP_IN], pl.BF16],
-    wo_b: pl.Tensor[[D, O_GROUPS * O_LORA], pl.INT8],
-    wo_b_scale: pl.Tensor[[D], pl.FP32],
-    attn_out: pl.Tensor[[T_DYN, D], pl.BF16],
-):
-    """Compute SWA sparse attention and the grouped output projection."""
-    o_packed_heads = pl.create_tensor([O_GROUPS * T_PAD * HEADS_PER_GROUP, HEAD_DIM], dtype=pl.BF16)
-    o_packed_heads, heads_dep = sparse_attn_swa_heads(
-        q, ori_kv, swa_indices, sparse_bias,
-        attn_sink, freqs_cos, freqs_sin,
-        o_packed_heads,
-    )
-    o_packed = pl.reshape(o_packed_heads, [O_GROUPS * T_PAD, O_GROUP_IN])
-    attn_out = decode_o_proj_tp1(
-        o_packed,
-        wo_a, wo_b, wo_b_scale,
-        attn_out, heads_dep,
-    )
-    return attn_out
-
-
 @pl.jit
-def sparse_attn_test(
+def sparse_attn_swa_test(
     q: pl.Tensor[[T_DYN, H, HEAD_DIM], pl.BF16],
     ori_kv: pl.Tensor[[ORI_BLOCK_NUM_DYN, BLOCK_SIZE, 1, HEAD_DIM], pl.BF16],
     swa_indices: pl.Tensor[[T_DYN, WIN], pl.INT32],
@@ -338,18 +308,17 @@ def sparse_attn_test(
                 1.0,
             )
             sparse_bias[v_t0 : v_t0 + BIAS_T_TILE, 0:ATTN_K_TILE] = pl.mul(pl.sub(v_valid, 1.0), -NEG_INF)
-    sparse_attn_swa(
-        q,
-        ori_kv,
-        swa_indices,
-        sparse_bias,
-        attn_sink,
-        freqs_cos,
-        freqs_sin,
-        wo_a,
-        wo_b,
-        wo_b_scale,
-        attn_out,
+    o_packed_heads = pl.create_tensor([O_GROUPS * T_PAD * HEADS_PER_GROUP, HEAD_DIM], dtype=pl.BF16)
+    o_packed_heads, heads_dep = sparse_attn_swa(
+        q, ori_kv, swa_indices, sparse_bias,
+        attn_sink, freqs_cos, freqs_sin,
+        o_packed_heads,
+    )
+    o_packed = pl.reshape(o_packed_heads, [O_GROUPS * T_PAD, O_GROUP_IN])
+    attn_out = decode_o_proj_tp1(
+        o_packed,
+        wo_a, wo_b, wo_b_scale,
+        attn_out, heads_dep,
     )
     return attn_out
 
@@ -591,7 +560,7 @@ if __name__ == "__main__":
     print(f"TOPK={TOPK} SPARSE_BLOCKS={SPARSE_BLOCKS} PADDED_TOPK={PADDED_TOPK}", flush=True)
 
     result = run_jit(
-        fn=sparse_attn_test,
+        fn=sparse_attn_swa_test,
         specs=build_tensor_specs(
             args.causal_regression_fixture,
             args.short_window_fixture,
