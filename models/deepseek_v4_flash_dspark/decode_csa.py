@@ -71,8 +71,7 @@ from decode_o_proj import (
     LOCAL_T_PAD,
     O_WINDOW_ROWS,
     attention_token_head_all_to_all_step,
-    decode_sharded_o_projection,
-    o_projection_reduce_scatter_step,
+    decode_sharded_o_projection_reduce_scatter,
 )
 from decode_sparse_attn_csa import (
     ATTN_K_TILE,
@@ -503,19 +502,13 @@ def decode_csa_output(
     )
 
     attention_local_groups = pl.reshape(attention_local_flat, [LOCAL_O_GROUPS, GROUP_T_PAD, O_GROUP_IN])
-    o_partial = pl.create_tensor([GROUP_T_PAD, D], dtype=pl.FP32)
-    o_partial, projection_tid = decode_sharded_o_projection(
+    o_local, o_signal = decode_sharded_o_projection_reduce_scatter(
         attention_local_groups,
         wo_a, wo_b, wo_b_scale,
-        local_t, o_partial,
+        local_t, o_local,
+        o_window, o_signal,
+        group_base, tp_rank,
     )
-
-    with pl.spmd(1, name_hint="tp_o_reduce_scatter", deps=[projection_tid]) as _reduce_scatter_tid:
-        o_local, o_signal = o_projection_reduce_scatter_step(
-            o_partial, o_local,
-            o_window, o_signal,
-            group_base, tp_rank, local_t,
-        )
     return o_local, attention_signal, o_signal
 
 
@@ -1421,8 +1414,22 @@ if __name__ == "__main__":
     parser.add_argument("--case", choices=("all", "max", "subcapacity"), default="all")
     parser.add_argument("--compile-only", action="store_true", default=False)
     parser.add_argument("--dump-passes", action="store_true", default=False)
+    parser.add_argument(
+        "--save-data",
+        action="store_true",
+        default=False,
+        help="persist inputs and golden outputs for replay",
+    )
+    parser.add_argument(
+        "--golden-data",
+        type=str,
+        default=None,
+        help="directory containing cached in/ and out/ tensors",
+    )
     args = parser.parse_args()
 
+    if args.case == "all" and args.golden_data is not None:
+        parser.error("--golden-data requires --case max or --case subcapacity")
     if args.tp != TP_SIZE:
         parser.error(f"--tp must remain {TP_SIZE} after import-time specialization")
     try:
@@ -1444,6 +1451,8 @@ if __name__ == "__main__":
             fn=l3_decode_csa_output,
             specs=build_tp_tensor_specs(local_t),
             golden_fn=golden_decode_csa_output,
+            golden_data=args.golden_data,
+            save_data=args.save_data,
             compile_only=args.compile_only,
             compile_cfg=dict(
                 dump_passes=args.dump_passes,
