@@ -29,7 +29,17 @@ from config import (
     INT8_AMAX_EPS,
     INT8_SCALE_MAX,
 )
-from decode_indexer_topk import active_score_topk_forest
+from decode_indexer_topk import (
+    IDX_ROW_DYN,
+    LEAF_DYN,
+    PAGE_DYN,
+    PAIR_GROUP_DYN,
+    REQUEST_DYN as B_DYN,
+    REQUEST_OFFSET_DYN,
+    SINGLETON_DYN,
+    UPPER_MERGE_DYN,
+    active_score_topk_forest,
+)
 from decode_metadata import (
     PHASE_D_LEAF_BEGIN,
     PHASE_D_LEAF_FIELDS,
@@ -43,21 +53,21 @@ from decode_metadata import (
 from rope_interleave import _rope_interleave_active_body
 
 # Dynamic shape variables. S stays static: the score/topk scopes divide by it.
-B_DYN = pl.dynamic("B_DYN")
 # Keep the indexer's local chunk extent separate from the enclosing CSA
 # attention's active-token dynamic.  ``indexer`` is invoked once per 16-row
 # chunk from ``decode_csa``; sharing the symbol made inline expansion bind the
 # enclosing T to 16 and left later HC-pre rows unwritten.
 T_DYN = pl.dynamic("IDX_T_DYN")  # local indexer query count
-PAGE_DYN = pl.dynamic("PAGE_DYN")
-REQUEST_OFFSET_DYN = pl.dynamic("REQUEST_OFFSET_DYN")
+# Padded query-extent for the InOut query tensors.  The forest's fixed
+# 16-row pl.slice views require the query output tensors to be allocated at a
+# CSA_INDEXER_CHUNK_T multiple.  Input tensors (x, qr, qr_scale, cos_il,
+# sin_signed) stay on T_DYN: the projection SPMD keys on ``query_count``
+# from x.dim(0).  Padded rows are excluded by the descriptor counts and are
+# never published by the commit guard.  See ``build_tensor_specs`` for the
+# spec-layer pad.
+T_PAD_DYN = pl.dynamic("IDX_T_PAD_DYN")
 # Forest descriptors are chunk-major because the exact forest has a fixed
 # 16-query task-array bound. The ragged descriptor count is bound at axis 1.
-LEAF_DYN = pl.dynamic("LEAF_DYN")
-PAIR_GROUP_DYN = pl.dynamic("PAIR_GROUP_DYN")
-SINGLETON_DYN = pl.dynamic("SINGLETON_DYN")
-UPPER_MERGE_DYN = pl.dynamic("UPPER_MERGE_DYN")
-IDX_ROW_DYN = pl.dynamic("IDX_ROW_DYN")
 # The pair arena is a compile-time [4080, 1024] tensor created inside each
 # chunk's pl.scope(); it never appears in the indexer ABI.
 
@@ -125,13 +135,13 @@ def indexer(
     sin_signed: pl.Tensor[[T_DYN, ROPE_HEAD_DIM], pl.FP32],
     hadamard: pl.Tensor[[IDX_HEAD_DIM, IDX_HEAD_DIM], pl.BF16],
     query_vectors: pl.InOut[pl.Tensor[
-        [T_DYN, IDX_N_HEADS, IDX_HEAD_DIM], pl.INT8
+        [T_PAD_DYN, IDX_N_HEADS, IDX_HEAD_DIM], pl.INT8
     ]],
-    query_scales: pl.InOut[pl.Tensor[[T_DYN, IDX_N_HEADS], pl.FP32]],
-    query_weights: pl.InOut[pl.Tensor[[T_DYN, IDX_N_HEADS], pl.FP32]],
+    query_scales: pl.InOut[pl.Tensor[[T_PAD_DYN, IDX_N_HEADS], pl.FP32]],
+    query_weights: pl.InOut[pl.Tensor[[T_PAD_DYN, IDX_N_HEADS], pl.FP32]],
     idx_kv_cache_flat: pl.Tensor[[IDX_ROW_DYN, IDX_HEAD_DIM], pl.INT8],
     idx_kv_scale_flat: pl.Tensor[[IDX_ROW_DYN, 1], pl.FP32],
-    query_request_ids: pl.Tensor[[T_DYN], pl.INT32],
+    query_request_ids: pl.Tensor[[T_PAD_DYN], pl.INT32],
     idx_pages: pl.Tensor[[PAGE_DYN, 2], pl.INT32],
     idx_page_offsets: pl.Tensor[[REQUEST_OFFSET_DYN], pl.INT32],
     idx_windows: pl.Tensor[[B_DYN, 3], pl.INT32],
@@ -513,66 +523,22 @@ def indexer(
     for chunk, (commit_tids_iter,) in pl.range(
         chunk_count, init_values=(commit_tids,)
     ):
+        # The forest owns its inner manual scope.  Keep this chunk boundary an
+        # ordinary scope: the updated frontend rejects nested manual scopes,
+        # while an automatic scope may contain the forest's manual region.
         with pl.scope():
             chunk_pair_arena = pl.create_tensor(
                 [CSA_INDEXER_ARENA_ROWS, CSA_PAIR_WIDTH], dtype=pl.FP32
             )
             chunk_t0 = chunk * CSA_INDEXER_CHUNK_T
             descriptor_chunk = descriptor_chunk_offset + chunk
-            chunk_query_vectors = pl.create_tensor(
-                [CSA_INDEXER_CHUNK_T, IDX_N_HEADS, IDX_HEAD_DIM],
-                dtype=pl.INT8,
-            )
-            chunk_query_scales = pl.create_tensor(
-                [CSA_INDEXER_CHUNK_T, IDX_N_HEADS], dtype=pl.FP32
-            )
-            chunk_query_weights = pl.create_tensor(
-                [CSA_INDEXER_CHUNK_T, IDX_N_HEADS], dtype=pl.FP32
-            )
-            chunk_query_request_ids = pl.create_tensor(
-                [CSA_INDEXER_CHUNK_T], dtype=pl.INT32
-            )
-            with pl.spmd(
-                CSA_INDEXER_CHUNK_T,
-                name_hint="csa_idx_forest_chunk_inputs",
-                deps=[index_commit_dep, late_dep, projection_done],
-            ) as chunk_inputs_tid:
-                row = pl.tile.get_block_idx()
-                global_row = chunk_t0 + row
-                chunk_query_scales[row : row + 1, :] = pl.full(
-                    [1, IDX_N_HEADS], dtype=pl.FP32, value=0.0
-                )
-                chunk_query_weights[row : row + 1, :] = pl.full(
-                    [1, IDX_N_HEADS], dtype=pl.FP32, value=0.0
-                )
-                pl.write(
-                    chunk_query_request_ids,
-                    [row],
-                    pl.cast(-1, pl.INT32),
-                )
-                if global_row < query_count:
-                    chunk_query_vectors[
-                        row : row + 1, :, :
-                    ] = query_vectors[global_row : global_row + 1, :, :]
-                    chunk_query_scales[
-                        row : row + 1, :
-                    ] = query_scales[global_row : global_row + 1, :]
-                    chunk_query_weights[
-                        row : row + 1, :
-                    ] = query_weights[global_row : global_row + 1, :]
-                    pl.write(
-                        chunk_query_request_ids,
-                        [row],
-                        pl.read(query_request_ids, [global_row]),
-                    )
-            # Pass views of the full-T projection directly to the forest.  A
-            # local chunk tensor is populated correctly by the copy task, but
-            # PyPTO's inlined task lowering can bind that local 3-D INT8 view
-            # to the following FP32/INT32 argument (or omit it) in the
-            # generated host ABI.  External projection views retain the
-            # original tensor handle and therefore preserve the kernel
-            # argument order.  The descriptor counts ensure padded rows in
-            # the final chunk are never submitted.
+            # Pass views of the full-T projection directly to the forest.
+            # PyPTO's inlined task lowering can bind a local 3-D INT8 view to
+            # the following FP32/INT32 argument (or omit it) in the generated
+            # host ABI.  External projection views retain the original tensor
+            # handle and therefore preserve the kernel argument order.  The
+            # descriptor counts ensure padded rows in the final chunk are
+            # never submitted.
             forest_query_vectors = pl.slice(
                 query_vectors,
                 [CSA_INDEXER_CHUNK_T, IDX_N_HEADS, IDX_HEAD_DIM],
@@ -598,7 +564,7 @@ def indexer(
                 [chunk_t0],
             )
             forest_ready = pl.system.task_dummy(
-                deps=[chunk_inputs_tid, index_commit_dep, late_dep]
+                deps=[index_commit_dep, late_dep, projection_done]
             )
             chunk_topk_scores = pl.create_tensor(
                 [CSA_INDEXER_CHUNK_T, CSA_TOPK], dtype=pl.FP32
@@ -609,43 +575,46 @@ def indexer(
             # Global page list + request offsets are full-active and reused per
             # chunk: the forest reads only its own candidates via the
             # leaf descriptors, so the whole global list is passed unchanged.
+            chunk_leaf_view = pl.slice(
+                leaf_descriptors,
+                [1, leaf_rows, PHASE_D_LEAF_FIELDS],
+                [descriptor_chunk, 0, 0],
+            )
             chunk_leaf = pl.reshape(
-                pl.slice(
-                    leaf_descriptors, [1, leaf_rows, PHASE_D_LEAF_FIELDS],
-                    [descriptor_chunk, 0, 0],
-                ),
-                [leaf_rows, PHASE_D_LEAF_FIELDS],
+                chunk_leaf_view, [leaf_rows, PHASE_D_LEAF_FIELDS]
+            )
+            chunk_pair_view = pl.slice(
+                pair_descriptors,
+                [1, pair_rows, PHASE_D_PAIR_FIELDS],
+                [descriptor_chunk, 0, 0],
             )
             chunk_pair = pl.reshape(
-                pl.slice(
-                    pair_descriptors, [1, pair_rows, PHASE_D_PAIR_FIELDS],
-                    [descriptor_chunk, 0, 0],
-                ),
-                [pair_rows, PHASE_D_PAIR_FIELDS],
+                chunk_pair_view, [pair_rows, PHASE_D_PAIR_FIELDS]
+            )
+            chunk_singleton_view = pl.slice(
+                singleton_descriptors,
+                [1, singleton_rows, PHASE_D_SINGLETON_FIELDS],
+                [descriptor_chunk, 0, 0],
             )
             chunk_singleton = pl.reshape(
-                pl.slice(
-                    singleton_descriptors,
-                    [1, singleton_rows, PHASE_D_SINGLETON_FIELDS],
-                    [descriptor_chunk, 0, 0],
-                ),
+                chunk_singleton_view,
                 [singleton_rows, PHASE_D_SINGLETON_FIELDS],
             )
+            chunk_upper_view = pl.slice(
+                upper_descriptors,
+                [1, upper_rows, PHASE_D_UPPER_FIELDS],
+                [descriptor_chunk, 0, 0],
+            )
             chunk_upper = pl.reshape(
-                pl.slice(
-                    upper_descriptors,
-                    [1, upper_rows, PHASE_D_UPPER_FIELDS],
-                    [descriptor_chunk, 0, 0],
-                ),
-                [upper_rows, PHASE_D_UPPER_FIELDS],
+                chunk_upper_view, [upper_rows, PHASE_D_UPPER_FIELDS]
+            )
+            chunk_root_view = pl.slice(
+                root_descriptors,
+                [1, CSA_INDEXER_CHUNK_T, PHASE_D_ROOT_FIELDS],
+                [descriptor_chunk, 0, 0],
             )
             chunk_root = pl.reshape(
-                pl.slice(
-                    root_descriptors,
-                    [1, CSA_INDEXER_CHUNK_T, PHASE_D_ROOT_FIELDS],
-                    [descriptor_chunk, 0, 0],
-                ),
-                [CSA_INDEXER_CHUNK_T, PHASE_D_ROOT_FIELDS],
+                chunk_root_view, [CSA_INDEXER_CHUNK_T, PHASE_D_ROOT_FIELDS]
             )
             pair_group_actual_count = pl.read(
                 pair_group_chunk_counts, [descriptor_chunk]
@@ -701,8 +670,8 @@ def indexer(
             # Record this chunk's commit TaskId in the fan-in buffer and yield
             # the updated array for the next iteration / post-loop join.  This
             # mirrors the HCA-precedent pattern (decode_indexer_topk.py
-            # ``root_tids_iter``/``root_tids_after_roots``): the spmd TaskId and
-            # the array record+yield live in the same scope level.
+            # ``root_tids_iter``/``root_tids_after_roots``): the spmd TaskId
+            # and the array record+yield live inside the loop scope.
             commit_tids_iter[chunk] = topk_commit_tid
             commit_tids_after = pl.yield_(commit_tids_iter)
 
@@ -732,13 +701,13 @@ def indexer_test(
     sin: pl.Tensor[[T_DYN, HALF_ROPE], pl.FP32],
     hadamard: pl.Tensor[[IDX_HEAD_DIM, IDX_HEAD_DIM], pl.BF16],
     query_vectors: pl.InOut[pl.Tensor[
-        [T_DYN, IDX_N_HEADS, IDX_HEAD_DIM], pl.INT8
+        [T_PAD_DYN, IDX_N_HEADS, IDX_HEAD_DIM], pl.INT8
     ]],
-    query_scales: pl.InOut[pl.Tensor[[T_DYN, IDX_N_HEADS], pl.FP32]],
-    query_weights: pl.InOut[pl.Tensor[[T_DYN, IDX_N_HEADS], pl.FP32]],
+    query_scales: pl.InOut[pl.Tensor[[T_PAD_DYN, IDX_N_HEADS], pl.FP32]],
+    query_weights: pl.InOut[pl.Tensor[[T_PAD_DYN, IDX_N_HEADS], pl.FP32]],
     idx_kv_cache_flat: pl.Tensor[[IDX_ROW_DYN, IDX_HEAD_DIM], pl.INT8],
     idx_kv_scale_flat: pl.Tensor[[IDX_ROW_DYN, 1], pl.FP32],
-    query_request_ids: pl.Tensor[[T_DYN], pl.INT32],
+    query_request_ids: pl.Tensor[[T_PAD_DYN], pl.INT32],
     idx_pages: pl.Tensor[[PAGE_DYN, 2], pl.INT32],
     idx_page_offsets: pl.Tensor[[REQUEST_OFFSET_DYN], pl.INT32],
     idx_windows: pl.Tensor[[B_DYN, 3], pl.INT32],
@@ -782,12 +751,12 @@ def indexer_test(
     qr_scale.bind_dynamic(0, T_DYN)
     cos.bind_dynamic(0, T_DYN)
     sin.bind_dynamic(0, T_DYN)
-    query_vectors.bind_dynamic(0, T_DYN)
-    query_scales.bind_dynamic(0, T_DYN)
-    query_weights.bind_dynamic(0, T_DYN)
+    query_vectors.bind_dynamic(0, T_PAD_DYN)
+    query_scales.bind_dynamic(0, T_PAD_DYN)
+    query_weights.bind_dynamic(0, T_PAD_DYN)
     idx_kv_cache_flat.bind_dynamic(0, IDX_ROW_DYN)
     idx_kv_scale_flat.bind_dynamic(0, IDX_ROW_DYN)
-    query_request_ids.bind_dynamic(0, T_DYN)
+    query_request_ids.bind_dynamic(0, T_PAD_DYN)
     idx_pages.bind_dynamic(0, PAGE_DYN)
     idx_page_offsets.bind_dynamic(0, REQUEST_OFFSET_DYN)
     idx_windows.bind_dynamic(0, B_DYN)
@@ -797,9 +766,12 @@ def indexer_test(
     singleton_descriptors.bind_dynamic(1, SINGLETON_DYN)
     upper_descriptors.bind_dynamic(1, UPPER_MERGE_DYN)
     topk_indices.bind_dynamic(0, T_DYN)
-    # Derive the interleaved/sign-folded token-local RoPE rows once.
-    cos_il = pl.create_tensor([T, ROPE_HEAD_DIM], dtype=pl.FP32)
-    sin_signed = pl.create_tensor([T, ROPE_HEAD_DIM], dtype=pl.FP32)
+    # Derive the interleaved/sign-folded token-local RoPE rows once.  Keep the
+    # scratch extent tied to the runtime query count; using the compile-time
+    # upper bound here conflicts with indexer's dynamic T_DYN for B < B_MAX.
+    query_count = pl.tensor.dim(x, 0)
+    cos_il = pl.create_tensor([query_count, ROPE_HEAD_DIM], dtype=pl.FP32)
+    sin_signed = pl.create_tensor([query_count, ROPE_HEAD_DIM], dtype=pl.FP32)
     rope_completion = pl.array.create(1, pl.TASK_ID)
     _rope_interleave_active_body(cos, sin, cos_il, sin_signed, rope_completion)
     index_commit_dep = pl.system.task_dummy(deps=[])
@@ -908,8 +880,11 @@ def golden_indexer(tensors):
         query = qr_proj.view(query_count, IDX_N_HEADS, IDX_HEAD_DIM)
         rope_dim = ROPE_HEAD_DIM
         rope = query[..., -rope_dim:]
-        cos = tensors["cos"].float()
-        sin = tensors["sin"].float()
+        # cos/sin carry token-local rows followed by event-local rows
+        # (appended by decode_csa's spec); the indexer only consumes the
+        # token-local prefix.
+        cos = tensors["cos"][:query_count].float()
+        sin = tensors["sin"][:query_count].float()
         dup = torch.arange(rope_dim, device=cos.device, dtype=torch.long) // 2
         sign = torch.where(
             torch.arange(rope_dim, device=cos.device) % 2 == 0,
@@ -1070,6 +1045,19 @@ def build_tensor_specs(start_pos=None, batch=B):
     )
 
     tokens = batch * S
+    # Pad the query output tensors to a CSA_INDEXER_CHUNK_T multiple so the
+    # forest's fixed 16-row pl.slice views never read out-of-bounds memory
+    # in the final partial chunk.  For B=1/S=8: tokens=8 -> padded_tokens=16.
+    # Input tensors (x, qr, qr_scale, cos, sin) stay at ``tokens``: the
+    # projection SPMD keys on ``query_count`` from x.dim(0), not the padded
+    # extent.  Padding rows [tokens:padded_tokens] carry spec-init zeros (or
+    # -1 for request IDs) and are never written by the device projection.
+    # The forest scores them deterministically (zero query -> zero score ->
+    # harmless Top-K output) and the commit SPMD discards them via
+    # ``if global_row < query_count``.
+    padded_tokens = (
+        (tokens + CSA_INDEXER_CHUNK_T - 1) // CSA_INDEXER_CHUNK_T
+    ) * CSA_INDEXER_CHUNK_T
     if batch <= 0 or batch > B:
         raise ValueError(
             f"--batch must be in [1, {B}], got {batch}"
@@ -1269,10 +1257,34 @@ def build_tensor_specs(start_pos=None, batch=B):
             chunk_singleton_counts.append(len(singleton_rows))
             chunk_upper_counts.append(len(upper_rows))
 
-        max_leaf = max((len(r) for r in chunk_leaf), default=0)
-        max_pair = max((len(r) for r in chunk_pair), default=0)
-        max_singleton = max((len(r) for r in chunk_singleton), default=0)
-        max_upper = max((len(r) for r in chunk_upper), default=0)
+        # The public ABI keeps a fixed leading chunk axis even when the
+        # runtime query count uses fewer than the compile-time eight chunks.
+        # Fill inactive chunks with invalid descriptors and zero counts so
+        # B=1/4 fixtures bind the same tensor rank and extent as B=16.
+        invalid_root_chunk = [
+            [-1, invalid_slot] for _ in range(CSA_INDEXER_CHUNK_T)
+        ]
+        while len(chunk_leaf) < CSA_INDEXER_MAX_CHUNKS:
+            chunk_leaf.append([])
+            chunk_pair.append([])
+            chunk_singleton.append([])
+            chunk_upper.append([])
+            chunk_root.append([list(row) for row in invalid_root_chunk])
+            chunk_pair_counts.append(0)
+            chunk_singleton_counts.append(0)
+            chunk_upper_counts.append(0)
+
+        # Runtime tensor handles must have a non-null base address.  A short
+        # request can legitimately have no pair or upper-merge descriptors
+        # (for example B=1 at start_pos=120), but exposing a zero-row tensor
+        # would produce a null BufferDescriptor before the device is launched.
+        # Keep one invalid sentinel row for every empty descriptor family;
+        # the corresponding actual-count scalar remains zero, so no task
+        # consumes the sentinel.
+        max_leaf = max(1, max((len(r) for r in chunk_leaf), default=0))
+        max_pair = max(1, max((len(r) for r in chunk_pair), default=0))
+        max_singleton = max(1, max((len(r) for r in chunk_singleton), default=0))
+        max_upper = max(1, max((len(r) for r in chunk_upper), default=0))
 
         def pad_chunk(rows, max_rows, width):
             padded = [list(r) for r in rows]
@@ -1282,7 +1294,9 @@ def build_tensor_specs(start_pos=None, batch=B):
 
         def stack(chunk_rows, max_rows, width):
             if max_rows == 0:
-                return torch.empty(chunk_count, 0, width, dtype=torch.int32)
+                return torch.empty(
+                    CSA_INDEXER_MAX_CHUNKS, 0, width, dtype=torch.int32
+                )
             return torch.tensor(
                 [pad_chunk(rows, max_rows, width) for rows in chunk_rows],
                 dtype=torch.int32,
@@ -1295,7 +1309,11 @@ def build_tensor_specs(start_pos=None, batch=B):
             "upper_descriptors": stack(chunk_upper, max_upper, PHASE_D_UPPER_FIELDS),
             "root_descriptors": torch.tensor(
                 chunk_root, dtype=torch.int32
-            ).reshape(chunk_count, CSA_INDEXER_CHUNK_T, PHASE_D_ROOT_FIELDS),
+            ).reshape(
+                CSA_INDEXER_MAX_CHUNKS,
+                CSA_INDEXER_CHUNK_T,
+                PHASE_D_ROOT_FIELDS,
+            ),
             "pair_group_chunk_counts": torch.tensor(chunk_pair_counts, dtype=torch.int32),
             "singleton_chunk_counts": torch.tensor(chunk_singleton_counts, dtype=torch.int32),
             "upper_merge_chunk_counts": torch.tensor(chunk_upper_counts, dtype=torch.int32),
@@ -1349,7 +1367,19 @@ def build_tensor_specs(start_pos=None, batch=B):
     wq_b_i8 = wq_b_i8_T.t().contiguous()
     qr_i8, qr_scale = int8_quant_per_row(torch.rand(tokens, Q_LORA))
 
-    identity = torch.eye(IDX_HEAD_DIM, dtype=torch.bfloat16)
+    # Real Hadamard matrix (Sylvester construction), matching the full
+    # CSA fixture.  An identity stand-in left the score landscape flat
+    # and made boundary candidates hypersensitive to the BF16 tiling
+    # difference between the device's per-query Hadamard matmul and
+    # golden's batched matmul, producing spurious Top-512 mismatches
+    # that never occur in the full pipeline.
+    _h = torch.ones((1, 1))
+    while _h.shape[0] < IDX_HEAD_DIM:
+        _h = torch.cat([
+            torch.cat([_h, _h], dim=1),
+            torch.cat([_h, -_h], dim=1),
+        ], dim=0)
+    hadamard_init = (_h / (IDX_HEAD_DIM ** 0.5)).to(torch.bfloat16)
     x_init = torch.rand(tokens, D).to(torch.bfloat16)
     weights_proj_init = torch.randn(D, IDX_N_HEADS) * 0.2218
     idx_kv_bf16 = torch.randn(total_pages * BLOCK_SIZE, IDX_HEAD_DIM).to(torch.bfloat16)
@@ -1365,15 +1395,23 @@ def build_tensor_specs(start_pos=None, batch=B):
                    init_value=lambda: weights_proj_init),
         TensorSpec("cos", [tokens, HALF_ROPE], torch.float32, init_value=lambda: cos_half),
         TensorSpec("sin", [tokens, HALF_ROPE], torch.float32, init_value=lambda: sin_half),
-        TensorSpec("hadamard", [IDX_HEAD_DIM, IDX_HEAD_DIM], torch.bfloat16, init_value=lambda: identity),
-        TensorSpec("query_vectors", [tokens, IDX_N_HEADS, IDX_HEAD_DIM], torch.int8),
-        TensorSpec("query_scales", [tokens, IDX_N_HEADS], torch.float32),
-        TensorSpec("query_weights", [tokens, IDX_N_HEADS], torch.float32),
+        TensorSpec("hadamard", [IDX_HEAD_DIM, IDX_HEAD_DIM], torch.bfloat16, init_value=lambda: hadamard_init),
+        TensorSpec("query_vectors", [padded_tokens, IDX_N_HEADS, IDX_HEAD_DIM], torch.int8),
+        TensorSpec("query_scales", [padded_tokens, IDX_N_HEADS], torch.float32),
+        TensorSpec("query_weights", [padded_tokens, IDX_N_HEADS], torch.float32),
         TensorSpec("idx_kv_cache_flat", [total_pages * BLOCK_SIZE, IDX_HEAD_DIM],
                    torch.int8, init_value=lambda: idx_kv_i8),
         TensorSpec("idx_kv_scale_flat", [total_pages * BLOCK_SIZE, 1],
                    torch.float32, init_value=lambda: idx_kv_scale),
-        TensorSpec("query_request_ids", [tokens], torch.int32, init_value=lambda: torch.tensor(query_request_ids, dtype=torch.int32)),
+        TensorSpec(
+            "query_request_ids",
+            [padded_tokens],
+            torch.int32,
+            init_value=lambda: torch.tensor(
+                query_request_ids + [-1] * (padded_tokens - tokens),
+                dtype=torch.int32,
+            ),
+        ),
         TensorSpec("idx_pages", list(pages.shape), torch.int32, init_value=lambda: pages),
         TensorSpec("idx_page_offsets", [len(page_offsets)], torch.int32, init_value=lambda: page_offsets_t),
         TensorSpec("idx_windows", list(windows.shape), torch.int32, init_value=lambda: windows),
@@ -1451,12 +1489,13 @@ if __name__ == "__main__":
 
         This wrapper no longer publishes a second score output because the
         PyPTO two-``pl.Out`` loop carry has a known phi bug.  Reconstruct the
-        paired reference scores only for rows whose indices differ, then apply
-        the same local monotonicity check as baseline ``topk_pair_compare``.
-        This tolerates BF16 cutoff swaps without weakening any output-value
-        threshold or accepting an unsorted/garbage Top-K row.
+        paired reference scores only for rows whose index multiset differs.
+        A set difference is accepted only when the actual and expected
+        difference scores are equivalent within the comparison tolerance;
+        this preserves legitimate cutoff ties without accepting an arbitrary
+        valid-looking candidate subset.
         """
-        del actual_outputs, expected_outputs, rtol, atol
+        del actual_outputs, expected_outputs
         if actual.shape != expected.shape:
             return False, (
                 f"    topk shape mismatch: {tuple(actual.shape)} "
@@ -1466,12 +1505,14 @@ if __name__ == "__main__":
             return False, "    topk contains an invalid candidate index"
         actual_sorted = torch.sort(actual.to(torch.int64), dim=-1).values
         expected_sorted = torch.sort(expected.to(torch.int64), dim=-1).values
-        mismatch = torch.nonzero(
+        set_mismatch = torch.nonzero(
             actual_sorted != expected_sorted,
             as_tuple=False,
         )
-        if mismatch.numel():
-            row = int(mismatch[0, 0].item())
+        position_mismatch = torch.nonzero(actual != expected, as_tuple=False)
+        if set_mismatch.numel() or position_mismatch.numel():
+            row_source = set_mismatch if set_mismatch.numel() else position_mismatch
+            row = int(row_source[0, 0].item())
             from collections import Counter
 
             actual_counts = Counter(actual[row].tolist())
@@ -1479,55 +1520,91 @@ if __name__ == "__main__":
             actual_only = sorted(
                 (candidate, count)
                 for candidate, count in (actual_counts - expected_counts).items()
-                for _ in range(count)
             )
             expected_only = sorted(
                 (candidate, count)
                 for candidate, count in (expected_counts - actual_counts).items()
-                for _ in range(count)
             )
 
+            # A Top-K tie may replace one candidate with another candidate at
+            # the same cutoff score, but it may not change the number of
+            # padding entries or emit duplicate/out-of-domain candidates.
+            if actual_counts.get(-1, 0) != expected_counts.get(-1, 0):
+                return False, (
+                    f"    topk padding count mismatch at row {row}: "
+                    f"actual={actual_counts.get(-1, 0)} "
+                    f"expected={expected_counts.get(-1, 0)}"
+                )
+            actual_valid_ids = [
+                int(candidate) for candidate in actual[row].tolist() if candidate >= 0
+            ]
+            if len(actual_valid_ids) != len(set(actual_valid_ids)):
+                return False, f"    topk contains duplicate candidates at row {row}"
+
+            chunk = row // CSA_INDEXER_CHUNK_T
+            local_query = row % CSA_INDEXER_CHUNK_T
+            valid_ids = set()
+            leaf_rows = inputs["leaf_descriptors"][chunk]
+            for leaf in leaf_rows:
+                if int(leaf[PHASE_D_LEAF_QUERY].item()) != local_query:
+                    continue
+                begin = int(leaf[PHASE_D_LEAF_BEGIN].item())
+                valid = int(leaf[PHASE_D_LEAF_VALID].item())
+                if begin >= 0 and valid > 0:
+                    valid_ids.update(range(begin, begin + valid))
+            if not all(candidate in valid_ids for candidate in actual_valid_ids):
+                return False, (
+                    f"    topk contains a candidate outside the row domain at {row}"
+                )
+
+            # Reconstruct the per-candidate reference score using the same
+            # batched Hadamard projection as golden_indexer.  An earlier
+            # version computed the query projection per-candidate with a
+            # single-row matmul (qr[q:q+1] @ wq_b); that BF16 reduction
+            # diverges from golden's batched (qr @ wq_b) reduction by enough
+            # to flip int8 quantization on boundary candidates, mislabeling
+            # legitimate device Top-512 selections as monotonicity
+            # violations.  Project all queries once, then slice.
+            from utils import int8_quant_per_row
+
+            x = inputs["x"].float()
+            qr = inputs["qr"].to(torch.int32)
+            qr_scale = inputs["qr_scale"].float()
+            wq_b = inputs["wq_b"].to(torch.int32)
+            wq_b_scale = inputs["wq_b_scale"].float()
+            qc = x.shape[0]
+            qp = qr @ wq_b
+            qp = qp.float() * qr_scale * wq_b_scale.view(1, -1)
+            q = qp.view(qc, IDX_N_HEADS, IDX_HEAD_DIM)
+            cos = inputs["cos"].float()[:qc]
+            sin = inputs["sin"].float()[:qc]
+            dup = torch.arange(ROPE_HEAD_DIM, dtype=torch.long) // 2
+            sign = torch.where(
+                torch.arange(ROPE_HEAD_DIM) % 2 == 0, -1.0, 1.0
+            ).to(torch.float32)
+            rope = q[..., -ROPE_HEAD_DIM:]
+            rot = (
+                rope * cos[:, None, dup]
+                + rope[..., torch.arange(ROPE_HEAD_DIM) ^ 1]
+                * sin[:, None, dup]
+                * sign
+            )
+            q = torch.cat([q[..., :IDX_NOPE_HEAD_DIM], rot], dim=-1)
+            q = q.to(torch.bfloat16).float() @ inputs[
+                "hadamard"
+            ].to(torch.bfloat16).float()
+            qi8_all, qsc_all = int8_quant_per_row(q)
+            qi8_all = qi8_all.view(qc, IDX_N_HEADS, IDX_HEAD_DIM)
+            qsc_all = qsc_all.view(qc, IDX_N_HEADS, 1)
+            qw_all = (
+                x.to(torch.bfloat16).float()
+                @ inputs["weights_proj"].to(torch.bfloat16).float()
+            ) * WEIGHTS_SCALE
+
             def candidate_score(query_id, logical_id):
-                from utils import int8_quant_per_row
-
-                x = inputs["x"].float()
-                qr = inputs["qr"].to(torch.int32)
-                qr_scale = inputs["qr_scale"].float()
-                wq_b = inputs["wq_b"].to(torch.int32)
-                wq_b_scale = inputs["wq_b_scale"].float()
-                query = qr[query_id : query_id + 1] @ wq_b
-                query = query.float() * qr_scale[query_id : query_id + 1]
-                query = query * wq_b_scale.view(1, -1)
-                query = query.view(1, IDX_N_HEADS, IDX_HEAD_DIM)
-                cos = inputs["cos"].float()[query_id]
-                sin = inputs["sin"].float()[query_id]
-                dup = torch.arange(ROPE_HEAD_DIM, dtype=torch.long) // 2
-                sign = torch.where(
-                    torch.arange(ROPE_HEAD_DIM) % 2 == 0,
-                    -1.0,
-                    1.0,
-                )
-                rope = query[..., -ROPE_HEAD_DIM:]
-                rotated = (
-                    rope * cos[dup]
-                    + rope[..., torch.arange(ROPE_HEAD_DIM) ^ 1]
-                    * sin[dup]
-                    * sign
-                )
-                query = torch.cat(
-                    [query[..., :IDX_NOPE_HEAD_DIM], rotated], dim=-1
-                )
-                query = query.to(torch.bfloat16).float() @ inputs[
-                    "hadamard"
-                ].to(torch.bfloat16).float()
-                query_i8, query_scale = int8_quant_per_row(query)
-                query_i8 = query_i8.view(IDX_N_HEADS, IDX_HEAD_DIM)
-                query_scale = query_scale.view(IDX_N_HEADS, 1)
-                query_weight = (
-                    x[query_id : query_id + 1].to(torch.bfloat16).float()
-                    @ inputs["weights_proj"].to(torch.bfloat16).float()
-                ).view(IDX_N_HEADS) * WEIGHTS_SCALE
-
+                qi8 = qi8_all[query_id]
+                qsc = qsc_all[query_id]
+                qw = qw_all[query_id]
                 request = int(inputs["query_request_ids"][query_id].item())
                 page_begin = int(inputs["idx_page_offsets"][request].item())
                 page_end = int(inputs["idx_page_offsets"][request + 1].item())
@@ -1542,8 +1619,8 @@ if __name__ == "__main__":
                 source_row = physical_page * BLOCK_SIZE + logical_id % BLOCK_SIZE
                 kv = inputs["idx_kv_cache_flat"][source_row].to(torch.int32)
                 scale = inputs["idx_kv_scale_flat"][source_row, 0].float()
-                score = (query_i8 * kv).sum(dim=-1).float() * query_scale
-                score = torch.relu(score) * query_weight.view(-1, 1)
+                score = (qi8 * kv).sum(dim=-1).float() * qsc.squeeze(-1)
+                score = torch.relu(score) * qw
                 return float((score.sum() * scale).item())
 
             actual_scores = [
@@ -1552,62 +1629,74 @@ if __name__ == "__main__":
                 else candidate_score(row, candidate)
                 for candidate in actual[row].tolist()
             ]
-            mismatch_positions = [
-                position
-                for position, (actual_id, expected_id) in enumerate(
-                    zip(actual[row].tolist(), expected[row].tolist())
-                )
-                if actual_id != expected_id
+            expected_scores = [
+                FP32_NEG_INF
+                if candidate < 0
+                else candidate_score(row, candidate)
+                for candidate in expected[row].tolist()
             ]
-            bad_positions = []
-            for position in mismatch_positions:
-                if position > 0 and actual_scores[position - 1] < actual_scores[position]:
-                    bad_positions.append(position)
-                if (
-                    position + 1 < len(actual_scores)
-                    and actual_scores[position] < actual_scores[position + 1]
+            score_rtol = max(float(rtol), 1e-5)
+            score_atol = max(float(atol), 1e-5)
+
+            def scores_are_descending(scores):
+                if any(
+                    not torch.isfinite(torch.tensor(score)) for score in scores
                 ):
-                    bad_positions.append(position)
-            if not bad_positions:
-                return True, ""
-            # The paired device scores are intentionally not public because
-            # publishing a second Out reintroduces PyPTO's two-Out phi bug.
-            # If the reconstructed CPU score order disagrees with the device
-            # reduction, retain the structural part of the baseline gate:
-            # every non-padding index must belong to this query's valid leaf
-            # domain and must be unique.  Full CSA still validates the actual
-            # sparse result, while this prevents stale/garbage arena indices
-            # from being hidden by the reference-only fallback.
-            chunk = row // CSA_INDEXER_CHUNK_T
-            local_query = row % CSA_INDEXER_CHUNK_T
-            valid_ids = set()
-            leaf_rows = inputs["leaf_descriptors"][chunk]
-            for leaf in leaf_rows:
-                if int(leaf[PHASE_D_LEAF_QUERY].item()) != local_query:
-                    continue
-                begin = int(leaf[PHASE_D_LEAF_BEGIN].item())
-                valid = int(leaf[PHASE_D_LEAF_VALID].item())
-                if begin >= 0 and valid > 0:
-                    valid_ids.update(range(begin, begin + valid))
-            actual_valid_ids = [
+                    return False
+                for previous, current in zip(scores, scores[1:]):
+                    if current > previous and not torch.isclose(
+                        torch.tensor(current),
+                        torch.tensor(previous),
+                        rtol=score_rtol,
+                        atol=score_atol,
+                    ):
+                        return False
+                return True
+
+            if not scores_are_descending(actual_scores):
+                return False, (
+                    f"    topk score order mismatch at row {row}: "
+                    f"actual_scores={actual_scores[:8]}"
+                )
+
+            actual_only_ids = [
                 int(candidate)
-                for candidate in actual[row].tolist()
-                if int(candidate) >= 0
+                for candidate, count in actual_only
+                for _ in range(count)
+                if candidate >= 0
             ]
-            if (
-                len(actual_valid_ids) == len(set(actual_valid_ids))
-                and all(candidate in valid_ids for candidate in actual_valid_ids)
-            ):
-                return True, ""
-            score_text = (
-                f" actual_scores={[actual_scores[p] for p in bad_positions[:4]]}"
-            )
-            return False, (
-                f"    topk candidate validation mismatch at row {row}: "
-                f"actual-only={[candidate for candidate, _ in actual_only[:8]]}, "
-                f"expected-only={[candidate for candidate, _ in expected_only[:8]]}"
-                f"{score_text}"
-            )
+            expected_only_ids = [
+                int(candidate)
+                for candidate, count in expected_only
+                for _ in range(count)
+                if candidate >= 0
+            ]
+            if len(actual_only_ids) != len(expected_only_ids):
+                return False, (
+                    f"    topk candidate count mismatch at row {row}: "
+                    f"actual-only={len(actual_only_ids)} "
+                    f"expected-only={len(expected_only_ids)}"
+                )
+            if actual_only_ids:
+                actual_only_scores = sorted(
+                    candidate_score(row, candidate) for candidate in actual_only_ids
+                )
+                expected_only_scores = sorted(
+                    candidate_score(row, candidate) for candidate in expected_only_ids
+                )
+                if not torch.allclose(
+                    torch.tensor(actual_only_scores, dtype=torch.float64),
+                    torch.tensor(expected_only_scores, dtype=torch.float64),
+                    rtol=score_rtol,
+                    atol=score_atol,
+                ):
+                    return False, (
+                        f"    topk candidate validation mismatch at row {row}: "
+                        f"actual-only={[candidate for candidate, _ in actual_only[:8]]}, "
+                        f"expected-only={[candidate for candidate, _ in expected_only[:8]]} "
+                        f"actual-only-scores={actual_only_scores[:4]} "
+                        f"expected-only-scores={expected_only_scores[:4]}"
+                    )
         return True, ""
 
     result = run_jit(

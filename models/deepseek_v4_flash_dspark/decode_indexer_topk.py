@@ -348,7 +348,6 @@ def active_score_topk_forest(
             )
 
         pair_wave_tids = pl.array.create(CSA_TOPK_MAX_PAIR_WAVES, pl.TASK_ID)
-        pair_wave_tids_after = pl.system.task_dummy(deps=[index_commit_dep])
         for pair_wave, (pair_wave_tids_iter,) in pl.range(
             (pair_group_count + CSA_TOPK_PAIR_GRID_W - 1)
             // CSA_TOPK_PAIR_GRID_W,
@@ -359,9 +358,12 @@ def active_score_topk_forest(
                 CSA_TOPK_PAIR_GRID_W,
                 pair_group_count - pair_begin,
             )
+            wave_ready = pl.system.task_dummy(
+                deps=[index_commit_dep, pair_wave_tids_iter]
+            )
             with pl.spmd(
                 pair_grid_count,
-                deps=[pair_wave_tids_after],
+                deps=[wave_ready],
             ) as left_wave_tid:
                 group = pair_begin + pl.tile.get_block_idx()
                 left_leaf_id = pl.cast(
@@ -442,8 +444,10 @@ def active_score_topk_forest(
                     merged_pairs[:, 0:CSA_PAIR_WIDTH]
                 )
             pair_wave_tids_iter[pair_wave] = pair_wave_tid
-            pair_wave_tids_after = pl.yield_(pair_wave_tids_iter)
-        pair_tid = pl.system.task_dummy(deps=[pair_wave_tids_after])
+            _pair_wave_tids_after = pl.yield_(pair_wave_tids_iter)
+        pair_tid = pl.system.task_dummy(
+            deps=[pair_wave_tids, index_commit_dep]
+        )
 
         singleton_grid_count = pl.max(singleton_count, 1)
         with pl.spmd(
