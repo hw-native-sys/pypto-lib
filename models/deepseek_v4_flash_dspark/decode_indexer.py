@@ -203,10 +203,12 @@ def indexer(
         [T_PAD, IDX_N_HEADS * IDX_HEAD_DIM],
         dtype=pl.INT32,
     )
-    for qr_unit in pl.spmd(
+    with pl.spmd(
         QR_OT_COUNT * row_blocks,
         name_hint="phase_d_idx_qr_proj_matmul",
-    ):
+        deps=[late_dep],
+    ) as qr_proj_matmul_tid:
+        qr_unit = pl.tile.get_block_idx()
         qr_rb = qr_unit // QR_OT_COUNT
         ot = qr_unit - qr_rb * QR_OT_COUNT
         qr_r0 = qr_rb * MM_ROW_TILE
@@ -242,6 +244,7 @@ def indexer(
     with pl.spmd(
         (query_count // DEQUANT_T_TILE) * QR_OT_COUNT,
         name_hint="phase_d_idx_qr_proj_dequant",
+        deps=[qr_proj_matmul_tid],
     ) as qr_proj_tid:
         unit = pl.tile.get_block_idx()
         query_block = unit // QR_OT_COUNT
