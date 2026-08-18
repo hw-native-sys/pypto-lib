@@ -95,7 +95,6 @@ import config
 config.MOE_TOKENS = config.PREFILL_TOKENS
 
 from moe import (
-    COMB_PAD,
     AUX_PAD,
     D,
     HC_DIM,
@@ -485,7 +484,7 @@ def _fwd_moe_tail(
     arrived: pld.DistributedTensor[[N_RANKS, 1], pl.INT32],
     data_arrived: pld.DistributedTensor[[N_RANKS, 1], pl.INT32],
     routed_y_buf: pld.DistributedTensor[[N_ROUTES, D], pl.BF16],
-    combine_arrived: pld.DistributedTensor[[N_RANKS, COMB_PAD], pl.INT32],
+    combine_arrived: pld.DistributedTensor[[N_RANKS, 1], pl.INT32],
     stage_done: pld.DistributedTensor[[CP_SIZE, 1], pl.INT32],
     hidden_out: pl.Out[
         pl.Tensor[
@@ -861,7 +860,7 @@ def prefill_cp_fwd(
     arrived: pld.DistributedTensor[[N_RANKS, 1], pl.INT32],
     data_arrived: pld.DistributedTensor[[N_RANKS, 1], pl.INT32],
     routed_y_buf: pld.DistributedTensor[[N_ROUTES, D], pl.BF16],
-    combine_arrived: pld.DistributedTensor[[N_RANKS, COMB_PAD], pl.INT32],
+    combine_arrived: pld.DistributedTensor[[N_RANKS, 1], pl.INT32],
     # Layer stage synchronization window.
     stage_done: pld.DistributedTensor[[CP_SIZE, 1], pl.INT32],
     # Phase 3 final-tail weights (HC head + final RMSNorm). The HC head
@@ -1941,7 +1940,7 @@ def l3_prefill_cp_fwd(
     arrived_buf = pld.alloc_window_buffer([N_RANKS, 1], dtype=pl.INT32)
     data_arrived_buf = pld.alloc_window_buffer([N_RANKS, 1], dtype=pl.INT32)
     routed_y_buf_buf = pld.alloc_window_buffer([N_ROUTES, D], dtype=pl.BF16)
-    combine_arrived_buf = pld.alloc_window_buffer([N_RANKS, COMB_PAD], dtype=pl.INT32)
+    combine_arrived_buf = pld.alloc_window_buffer([N_RANKS, 1], dtype=pl.INT32)
 
     # Domain 3: layer stage synchronization (monotonic counter, 1..20).
     stage_done_buf = pld.alloc_window_buffer([CP_SIZE, 1], dtype=pl.INT32)
@@ -2052,7 +2051,7 @@ def l3_prefill_cp_fwd(
         )
         routed_y_buf = pld.window(routed_y_buf_buf, [N_ROUTES, D], dtype=pl.BF16)
         combine_arrived = pld.window(
-            combine_arrived_buf, [N_RANKS, COMB_PAD], dtype=pl.INT32
+            combine_arrived_buf, [N_RANKS, 1], dtype=pl.INT32
         )
         stage_done = pld.window(stage_done_buf, [CP_SIZE, 1], dtype=pl.INT32)
         # Domain 4: HCA compact windows.

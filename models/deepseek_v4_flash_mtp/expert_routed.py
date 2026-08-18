@@ -6,25 +6,17 @@
 # INCLUDING BUT NOT LIMITED TO NON-INFRINGEMENT, MERCHANTABILITY, OR FITNESS FOR A PARTICULAR PURPOSE.
 # See LICENSE in the root of the software repository for the full text of the License.
 # -----------------------------------------------------------------------------------------------------------
-# ci: devices=1  # CI: single-rank L3 run; the fused scatter needs a window
-"""DeepSeek-V4 MoE routed local expert compute (decode, EP).
+"""DeepSeek-V4 MoE routed local expert compute (decode, EP single-card).
 
 Only the routed-expert path lives here. The shared expert was split out
 into ``expert_shared.py``; both kernels are composed in ``moe.py``.
-
-The MoE combine scatter is fused into this kernel: ``exp_w2_act`` pushes each
-activated row to its origin rank's ``routed_y_buf`` and bumps that rank's
-arrival counter, so a row starts crossing the fabric while the rest of the
-expert grid is still in the W2 GEMM. ``moe.combine`` keeps only the arrival
-wait and the dense reduce.
 """
 
 
 import pypto.language as pl
-import pypto.language.distributed as pld
 
 from config import (FLASH as M, DECODE_BATCH, DECODE_SEQ, INT8_SCALE_MAX, INT8_AMAX_EPS,
-                    EP_WORLD_SIZE, MOE_TOKENS, RECV_MAX)
+                    EP_WORLD_SIZE, RECV_MAX)
 
 
 # model config
@@ -55,44 +47,35 @@ W2_INNER = 2
 W2_ACT_INNER = 8
 TILES_PER_EXPERT = RECV_MAX // RECV_TILE
 
-# Fused-combine route ids index routed_y_buf, which is one route row per (token,
-# topk slot) on the origin rank.
-N_ROUTES = MOE_TOKENS * M.num_experts_per_tok
-
-# combine_arrived columns. The scatter's pushes live in tasks nested in two
-# pl.parallel loops and so have no single TaskId a barrier could depend on; the
-# handshake therefore counts ROWS, not tasks. COMB_ARRIVED is bumped once per row
-# a peer pushes here; COMB_EXPECT is how many rows this rank expects back. Every
-# row dispatched to a peer returns from that peer, so the expectation is the
-# dispatcher's own per-destination route count -- known locally, before any
-# expert runs. Both columns are cumulative across moe_epoch (cleared once per
-# forward). Defined here rather than in moe because this file writes
-# COMB_ARRIVED on peers and moe imports this module, not the other way round.
-COMB_ARRIVED = 0
-COMB_EXPECT = 1
-COMB_PAD = 2
-
 assert RECV_MAX % RECV_TILE == 0, "RECV_MAX must be a whole number of RECV_TILE row-tiles"
-# The fused scatter pushes whole [1, D] rows, so one exp_w2_act block must own
-# the full row width; a column-split grid would scatter partial rows instead.
-assert D == W2_ACT_INNER * D_OUT_TILE_ACT, \
-    "fused combine needs a single exp_w2_act column block spanning D"
 
 
 @pl.jit.inline(auto_scope=False)
-def _expert_h_quant(
-    recv_x_flat: pl.Tensor[[N_LOCAL_EXPERTS * RECV_MAX, D], pl.INT8],
+def expert_routed(
+    recv_x: pl.Tensor[[N_LOCAL_EXPERTS, RECV_MAX, D], pl.INT8],
     recv_scale_dq: pl.Tensor[[N_LOCAL_EXPERTS, RECV_MAX], pl.FP32],
+    recv_weights: pl.Tensor[[N_LOCAL_EXPERTS, RECV_MAX], pl.FP32],
     recv_expert_count: pl.Tensor[[N_LOCAL_EXPERTS, 1], pl.INT32],
     routed_w1: pl.Tensor[[N_LOCAL_EXPERTS, MOE_INTER, D], pl.INT8],
     routed_w1_scale: pl.Tensor[[N_LOCAL_EXPERTS, MOE_INTER], pl.FP32],
     routed_w3: pl.Tensor[[N_LOCAL_EXPERTS, MOE_INTER, D], pl.INT8],
     routed_w3_scale: pl.Tensor[[N_LOCAL_EXPERTS, MOE_INTER], pl.FP32],
-    h_i8: pl.Tensor[[N_LOCAL_EXPERTS * RECV_MAX, MOE_INTER], pl.INT8],
-    h_scale_dq: pl.Tensor[[N_LOCAL_EXPERTS * RECV_MAX, 1], pl.FP32],
+    routed_w2: pl.Tensor[[N_LOCAL_EXPERTS, D, MOE_INTER], pl.INT8],
+    routed_w2_scale: pl.Tensor[[N_LOCAL_EXPERTS, D], pl.FP32],
+    recv_y: pl.Tensor[[N_LOCAL_EXPERTS, RECV_MAX, D], pl.BF16],
 ):
-    """W1/W3 GEMMs, SwiGLU, and the A8 requant feeding the W2 phase."""
+    recv_y_flat = pl.reshape(recv_y, [N_LOCAL_EXPERTS * RECV_MAX, D])
+    recv_x_flat = pl.reshape(recv_x, [N_LOCAL_EXPERTS * RECV_MAX, D])
+
     with pl.scope():
+        # Keep only the requantized SwiGLU result across the W1/W3 and W2 phases.
+        # The full INT32 gate/up tensors would occupy 512 MiB at EP8; h_i8 and its
+        # per-row dequant scale occupy about 64 MiB instead.
+        h_i8 = pl.create_tensor([N_LOCAL_EXPERTS * RECV_MAX, MOE_INTER], dtype=pl.INT8)
+        h_scale_dq = pl.create_tensor(
+            [N_LOCAL_EXPERTS * RECV_MAX, 1], dtype=pl.FP32, manual_dep=True
+        )
+
         # Produce one gate/up row tile at a time, immediately activate and quantize
         # it, then release the INT32/FP32 temporaries at the tile scope boundary.
         for local_i in pl.parallel(N_LOCAL_EXPERTS):
@@ -216,164 +199,62 @@ def _expert_h_quant(
                                 eh_q_half, target_type=pl.INT8, mode="trunc"
                             )
 
+        with pl.scope():
+            for local_e in pl.parallel(N_LOCAL_EXPERTS):
+                e_flat_base = local_e * RECV_MAX
 
-@pl.jit.inline(auto_scope=False)
-def _expert_w2(
-    h_i8: pl.Tensor[[N_LOCAL_EXPERTS * RECV_MAX, MOE_INTER], pl.INT8],
-    h_scale_dq: pl.Tensor[[N_LOCAL_EXPERTS * RECV_MAX, 1], pl.FP32],
-    recv_weights: pl.Tensor[[N_LOCAL_EXPERTS, RECV_MAX], pl.FP32],
-    recv_expert_count: pl.Tensor[[N_LOCAL_EXPERTS, 1], pl.INT32],
-    recv_r_route: pl.Tensor[[N_LOCAL_EXPERTS, RECV_MAX], pl.INT32],
-    recv_src: pl.Tensor[[N_LOCAL_EXPERTS, RECV_MAX], pl.INT32],
-    routed_w2: pl.Tensor[[N_LOCAL_EXPERTS, D, MOE_INTER], pl.INT8],
-    routed_w2_scale: pl.Tensor[[N_LOCAL_EXPERTS, D], pl.FP32],
-    recv_y_flat: pl.Tensor[[N_LOCAL_EXPERTS * RECV_MAX, D], pl.BF16],
-    routed_y_buf: pld.DistributedTensor[[N_ROUTES, D], pl.BF16],
-    combine_arrived: pld.DistributedTensor[[EP_WORLD_SIZE, COMB_PAD], pl.INT32],
-    my_rank: pl.Scalar[pl.INT32],
-):
-    """W2 GEMM, routing-weight-scaled dequant, and the fused combine scatter.
+                e_rows = pl.read(recv_expert_count, [local_e, 0])
+                e_tiles = (e_rows + RECV_TILE - 1) // RECV_TILE
 
-    Each activated row goes straight from on-core memory to the origin rank's
-    routed_y_buf slot, so it starts crossing the fabric while the rest of the
-    expert grid is still in the W2 GEMM. recv_y is written too: it is this
-    kernel's declared output and what the standalone test validates, but moe
-    never reads it."""
-    with pl.scope():
-        for local_e in pl.parallel(N_LOCAL_EXPERTS):
-            e_flat_base = local_e * RECV_MAX
+                for tt in pl.parallel(e_tiles):
+                    tt0 = tt * RECV_TILE
+                    flat_tt0 = e_flat_base + tt0
+                    h_tile_i8 = h_i8[flat_tt0 : flat_tt0 + RECV_TILE]
+                    h_tile_scale_dq = h_scale_dq[flat_tt0 : flat_tt0 + RECV_TILE]
 
-            e_rows = pl.read(recv_expert_count, [local_e, 0])
-            e_tiles = (e_rows + RECV_TILE - 1) // RECV_TILE
+                    y_i32 = pl.create_tensor([RECV_TILE, D], dtype=pl.INT32)
+                    with pl.spmd(
+                        D // (W2_INNER * D_OUT_TILE),
+                        name_hint="exp_w2_mm",
+                        allow_early_resolve=True,
+                    ):
+                        wb_idx = pl.tile.get_block_idx()
+                        d_base = wb_idx * (W2_INNER * D_OUT_TILE)
+                        for dg in pl.range(W2_INNER):
+                            d0 = d_base + dg * D_OUT_TILE
+                            y_acc = pl.create_tensor([1, RECV_TILE, D_OUT_TILE], dtype=pl.INT32)
+                            for k0 in pl.pipeline(0, MOE_INTER, INTER_K, stage=2):
+                                h_k = h_tile_i8[:, k0 : k0 + INTER_K]
+                                w2_k = routed_w2[local_e : local_e + 1, d0 : d0 + D_OUT_TILE, k0 : k0 + INTER_K]
+                                if k0 == 0:
+                                    y_acc = pl.matmul(h_k, w2_k, b_trans=True, out_dtype=pl.INT32)
+                                else:
+                                    y_acc = pl.matmul_acc(y_acc, h_k, w2_k, b_trans=True)
+                            y_i32[:, d0 : d0 + D_OUT_TILE] = pl.reshape(y_acc, [RECV_TILE, D_OUT_TILE])
 
-            for tt in pl.parallel(e_tiles):
-                tt0 = tt * RECV_TILE
-                flat_tt0 = e_flat_base + tt0
-                valid_rows = pl.min(RECV_TILE, e_rows - tt0)
-                h_tile_i8 = h_i8[flat_tt0 : flat_tt0 + RECV_TILE]
-                h_tile_scale_dq = h_scale_dq[flat_tt0 : flat_tt0 + RECV_TILE]
-
-                y_i32 = pl.create_tensor([RECV_TILE, D], dtype=pl.INT32)
-                with pl.spmd(
-                    D // (W2_INNER * D_OUT_TILE),
-                    name_hint="exp_w2_mm",
-                    allow_early_resolve=True,
-                ):
-                    wb_idx = pl.tile.get_block_idx()
-                    d_base = wb_idx * (W2_INNER * D_OUT_TILE)
-                    for dg in pl.range(W2_INNER):
-                        d0 = d_base + dg * D_OUT_TILE
-                        y_acc = pl.create_tensor([1, RECV_TILE, D_OUT_TILE], dtype=pl.INT32)
-                        for k0 in pl.pipeline(0, MOE_INTER, INTER_K, stage=2):
-                            h_k = h_tile_i8[:, k0 : k0 + INTER_K]
-                            w2_k = routed_w2[local_e : local_e + 1, d0 : d0 + D_OUT_TILE, k0 : k0 + INTER_K]
-                            if k0 == 0:
-                                y_acc = pl.matmul(h_k, w2_k, b_trans=True, out_dtype=pl.INT32)
-                            else:
-                                y_acc = pl.matmul_acc(y_acc, h_k, w2_k, b_trans=True)
-                        y_i32[:, d0 : d0 + D_OUT_TILE] = pl.reshape(y_acc, [RECV_TILE, D_OUT_TILE])
-
-                recv_y_tile = pl.create_tensor([RECV_TILE, D], dtype=pl.BF16)
-                with pl.spmd(
-                    D // (W2_ACT_INNER * D_OUT_TILE_ACT),
-                    name_hint="exp_w2_act",
-                    allow_early_resolve=True,
-                ):
-                    db_idx = pl.tile.get_block_idx()
-                    act_d_base = db_idx * (W2_ACT_INNER * D_OUT_TILE_ACT)
-                    w_col_blk = pl.reshape(
-                        recv_weights[local_e : local_e + 1, tt0 : tt0 + RECV_TILE],
-                        [RECV_TILE, 1],
-                    )
-                    row_scale_blk = pl.mul(h_tile_scale_dq, w_col_blk)
-                    for dg in pl.pipeline(W2_ACT_INNER, stage=2):
-                        act_d0 = act_d_base + dg * D_OUT_TILE_ACT
-                        y_2d_i32 = y_i32[:, act_d0 : act_d0 + D_OUT_TILE_ACT]
-                        w2_scale_chunk = routed_w2_scale[local_e : local_e + 1, act_d0 : act_d0 + D_OUT_TILE_ACT]
-                        y_2d = pl.cast(y_2d_i32, target_type=pl.FP32, mode="none")
-                        y_2d = pl.col_expand_mul(pl.row_expand_mul(y_2d, row_scale_blk), w2_scale_chunk)
-                        recv_y_tile[:, act_d0 : act_d0 + D_OUT_TILE_ACT] = pl.cast(
-                            y_2d, target_type=pl.BF16, mode="rint"
+                    recv_y_tile = pl.create_tensor([RECV_TILE, D], dtype=pl.BF16)
+                    with pl.spmd(
+                        D // (W2_ACT_INNER * D_OUT_TILE_ACT),
+                        name_hint="exp_w2_act",
+                        allow_early_resolve=True,
+                    ):
+                        db_idx = pl.tile.get_block_idx()
+                        act_d_base = db_idx * (W2_ACT_INNER * D_OUT_TILE_ACT)
+                        w_col_blk = pl.reshape(
+                            recv_weights[local_e : local_e + 1, tt0 : tt0 + RECV_TILE],
+                            [RECV_TILE, 1],
                         )
-                    # Rows in one tile belong to different origin ranks, so the
-                    # scatter is per row: lane (local_e, tt0 + i) carries the origin
-                    # rank and its r_route slot in routed_y_buf. Tail rows
-                    # (i >= valid_rows) hold no route and are never pushed. Pushing
-                    # whole [1, D] rows after the column loop rather than each
-                    # D_OUT_TILE_ACT chunk keeps the transfer at one row per store --
-                    # per-chunk stores cost ~10us/task in fragmentation alone.
-                    #
-                    # put, not remote_store: remote_store does not drain before the
-                    # notify issues (PTOAS#872), so the peer could satisfy its row
-                    # count and let shared_routed read a row still in flight. Program
-                    # order within the task does not supply the missing fence -- only
-                    # the draining transfer does. deepseek_v4_pro/lm_head.py makes the
-                    # same choice for the same reason. Rows bound for this rank skip
-                    # the notify: combine_wait ignores its own slot and they ride the
-                    # local RAW edge on routed_y_buf instead.
-                    for i in pl.range(valid_rows):
-                        r_route = pl.cast(pl.read(recv_r_route, [local_e, tt0 + i]), pl.INDEX)
-                        origin = pl.read(recv_src, [local_e, tt0 + i])
-                        pld.tensor.put(
-                            dst=routed_y_buf,
-                            peer=origin,
-                            src=recv_y_tile,
-                            dst_offsets=[r_route, 0],
-                            src_offsets=[i, 0],
-                            shape=[1, D],
-                        )
-                        if origin != my_rank:
-                            pld.system.notify(
-                                target=combine_arrived,
-                                peer=origin,
-                                offsets=[my_rank, COMB_ARRIVED],
-                                value=1,
-                                op=pld.NotifyOp.AtomicAdd,
+                        row_scale_blk = pl.mul(h_tile_scale_dq, w_col_blk)
+                        for dg in pl.pipeline(W2_ACT_INNER, stage=2):
+                            act_d0 = act_d_base + dg * D_OUT_TILE_ACT
+                            y_2d_i32 = y_i32[:, act_d0 : act_d0 + D_OUT_TILE_ACT]
+                            w2_scale_chunk = routed_w2_scale[local_e : local_e + 1, act_d0 : act_d0 + D_OUT_TILE_ACT]
+                            y_2d = pl.cast(y_2d_i32, target_type=pl.FP32, mode="none")
+                            y_2d = pl.col_expand_mul(pl.row_expand_mul(y_2d, row_scale_blk), w2_scale_chunk)
+                            recv_y_tile[:, act_d0 : act_d0 + D_OUT_TILE_ACT] = pl.cast(
+                                y_2d, target_type=pl.BF16, mode="rint"
                             )
-                recv_y_flat = pl.assemble(recv_y_flat, recv_y_tile, [flat_tt0, 0])
-
-
-@pl.jit.inline(auto_scope=False)
-def expert_routed(
-    recv_x: pl.Tensor[[N_LOCAL_EXPERTS, RECV_MAX, D], pl.INT8],
-    recv_scale_dq: pl.Tensor[[N_LOCAL_EXPERTS, RECV_MAX], pl.FP32],
-    recv_weights: pl.Tensor[[N_LOCAL_EXPERTS, RECV_MAX], pl.FP32],
-    recv_expert_count: pl.Tensor[[N_LOCAL_EXPERTS, 1], pl.INT32],
-    recv_r_route: pl.Tensor[[N_LOCAL_EXPERTS, RECV_MAX], pl.INT32],
-    recv_src: pl.Tensor[[N_LOCAL_EXPERTS, RECV_MAX], pl.INT32],
-    routed_w1: pl.Tensor[[N_LOCAL_EXPERTS, MOE_INTER, D], pl.INT8],
-    routed_w1_scale: pl.Tensor[[N_LOCAL_EXPERTS, MOE_INTER], pl.FP32],
-    routed_w3: pl.Tensor[[N_LOCAL_EXPERTS, MOE_INTER, D], pl.INT8],
-    routed_w3_scale: pl.Tensor[[N_LOCAL_EXPERTS, MOE_INTER], pl.FP32],
-    routed_w2: pl.Tensor[[N_LOCAL_EXPERTS, D, MOE_INTER], pl.INT8],
-    routed_w2_scale: pl.Tensor[[N_LOCAL_EXPERTS, D], pl.FP32],
-    recv_y: pl.Tensor[[N_LOCAL_EXPERTS, RECV_MAX, D], pl.BF16],
-    routed_y_buf: pld.DistributedTensor[[N_ROUTES, D], pl.BF16],
-    combine_arrived: pld.DistributedTensor[[EP_WORLD_SIZE, COMB_PAD], pl.INT32],
-    my_rank: pl.Scalar[pl.INT32],
-):
-    recv_y_flat = pl.reshape(recv_y, [N_LOCAL_EXPERTS * RECV_MAX, D])
-    recv_x_flat = pl.reshape(recv_x, [N_LOCAL_EXPERTS * RECV_MAX, D])
-
-    with pl.scope():
-        # Keep only the requantized SwiGLU result across the W1/W3 and W2 phases.
-        # The full INT32 gate/up tensors would occupy 512 MiB at EP8; h_i8 and its
-        # per-row dequant scale occupy about 64 MiB instead.
-        h_i8 = pl.create_tensor([N_LOCAL_EXPERTS * RECV_MAX, MOE_INTER], dtype=pl.INT8)
-        h_scale_dq = pl.create_tensor(
-            [N_LOCAL_EXPERTS * RECV_MAX, 1], dtype=pl.FP32, manual_dep=True
-        )
-        _expert_h_quant(
-            recv_x_flat, recv_scale_dq, recv_expert_count,
-            routed_w1, routed_w1_scale, routed_w3, routed_w3_scale,
-            h_i8, h_scale_dq,
-        )
-        _expert_w2(
-            h_i8, h_scale_dq, recv_weights, recv_expert_count,
-            recv_r_route, recv_src,
-            routed_w2, routed_w2_scale, recv_y_flat,
-            routed_y_buf, combine_arrived, my_rank,
-        )
+                    recv_y_flat = pl.assemble(recv_y_flat, recv_y_tile, [flat_tt0, 0])
 
     return recv_y
 
@@ -384,8 +265,6 @@ def expert_routed_test(
     recv_scale_dq: pl.Tensor[[N_LOCAL_EXPERTS, RECV_MAX], pl.FP32],
     recv_weights: pl.Tensor[[N_LOCAL_EXPERTS, RECV_MAX], pl.FP32],
     recv_expert_count: pl.Tensor[[N_LOCAL_EXPERTS, 1], pl.INT32],
-    recv_r_route: pl.Tensor[[N_LOCAL_EXPERTS, RECV_MAX], pl.INT32],
-    recv_src: pl.Tensor[[N_LOCAL_EXPERTS, RECV_MAX], pl.INT32],
     routed_w1: pl.Tensor[[N_LOCAL_EXPERTS, MOE_INTER, D], pl.INT8],
     routed_w1_scale: pl.Tensor[[N_LOCAL_EXPERTS, MOE_INTER], pl.FP32],
     routed_w3: pl.Tensor[[N_LOCAL_EXPERTS, MOE_INTER, D], pl.INT8],
@@ -393,60 +272,14 @@ def expert_routed_test(
     routed_w2: pl.Tensor[[N_LOCAL_EXPERTS, D, MOE_INTER], pl.INT8],
     routed_w2_scale: pl.Tensor[[N_LOCAL_EXPERTS, D], pl.FP32],
     recv_y: pl.Out[pl.Tensor[[N_LOCAL_EXPERTS, RECV_MAX, D], pl.BF16]],
-    routed_y_buf: pld.DistributedTensor[[N_ROUTES, D], pl.BF16],
-    combine_arrived: pld.DistributedTensor[[EP_WORLD_SIZE, COMB_PAD], pl.INT32],
-    my_rank: pl.Scalar[pl.INT32],
 ):
     expert_routed(
         recv_x, recv_scale_dq, recv_weights, recv_expert_count,
-        recv_r_route, recv_src,
         routed_w1, routed_w1_scale, routed_w3, routed_w3_scale,
         routed_w2, routed_w2_scale,
-        recv_y, routed_y_buf, combine_arrived, my_rank,
+        recv_y,
     )
     return recv_y
-
-
-@pl.jit.host
-def l3_expert_routed(
-    recv_x: pl.Tensor[[1, N_LOCAL_EXPERTS, RECV_MAX, D], pl.INT8],
-    recv_scale_dq: pl.Tensor[[1, N_LOCAL_EXPERTS, RECV_MAX], pl.FP32],
-    recv_weights: pl.Tensor[[1, N_LOCAL_EXPERTS, RECV_MAX], pl.FP32],
-    recv_expert_count: pl.Tensor[[1, N_LOCAL_EXPERTS, 1], pl.INT32],
-    recv_r_route: pl.Tensor[[1, N_LOCAL_EXPERTS, RECV_MAX], pl.INT32],
-    recv_src: pl.Tensor[[1, N_LOCAL_EXPERTS, RECV_MAX], pl.INT32],
-    routed_w1: pl.Tensor[[1, N_LOCAL_EXPERTS, MOE_INTER, D], pl.INT8],
-    routed_w1_scale: pl.Tensor[[1, N_LOCAL_EXPERTS, MOE_INTER], pl.FP32],
-    routed_w3: pl.Tensor[[1, N_LOCAL_EXPERTS, MOE_INTER, D], pl.INT8],
-    routed_w3_scale: pl.Tensor[[1, N_LOCAL_EXPERTS, MOE_INTER], pl.FP32],
-    routed_w2: pl.Tensor[[1, N_LOCAL_EXPERTS, D, MOE_INTER], pl.INT8],
-    routed_w2_scale: pl.Tensor[[1, N_LOCAL_EXPERTS, D], pl.FP32],
-    recv_y: pl.Out[pl.Tensor[[1, N_LOCAL_EXPERTS, RECV_MAX, D], pl.BF16]],
-):
-    """Single-rank harness for the routed expert.
-
-    Validates recv_y -- the routing-weight-scaled SwiGLU output -- and runs the
-    fused scatter for its compile and lowering coverage. It cannot check where
-    the scatter LANDS: with one rank every push targets peer == my_rank, so no
-    arrival notify fires and combine_wait's `src != my_rank` loop is empty. A
-    readback of routed_y_buf here would be asserting on local store ordering that
-    nothing guarantees. Scatter placement is covered by moe.py's EP8 test, which
-    has real peers and a real arrival handshake.
-    """
-    routed_y_buf_buf = pld.alloc_window_buffer([N_ROUTES, D], dtype=pl.BF16)
-    combine_arrived_buf = pld.alloc_window_buffer([EP_WORLD_SIZE, COMB_PAD], dtype=pl.INT32)
-
-    for r in pl.range(pld.world_size()):
-        routed_y_buf = pld.window(routed_y_buf_buf, [N_ROUTES, D], dtype=pl.BF16)
-        combine_arrived = pld.window(combine_arrived_buf, [EP_WORLD_SIZE, COMB_PAD], dtype=pl.INT32)
-        expert_routed_test(
-            recv_x[r], recv_scale_dq[r], recv_weights[r], recv_expert_count[r],
-            recv_r_route[r], recv_src[r],
-            routed_w1[r], routed_w1_scale[r], routed_w3[r], routed_w3_scale[r],
-            routed_w2[r], routed_w2_scale[r],
-            recv_y[r], routed_y_buf, combine_arrived, r,
-            device=r,
-        )
 
 
 def golden_expert_routed(tensors):
@@ -492,19 +325,6 @@ def golden_expert_routed(tensors):
         recv_y[e, :n_rows, :] = h @ w2[e].T
 
     tensors["recv_y"][:] = recv_y.to(torch.bfloat16)
-
-
-def golden_l3_expert_routed(tensors):
-    """Rank-dim wrapper for the single-rank harness.
-
-    golden_expert_routed itself stays un-batched: moe.py's golden calls it
-    per destination rank with plain [E, ...] tensors.
-    """
-    unbatched = {k: (v[0] if hasattr(v, "ndim") and v.ndim > 1 else v)
-                 for k, v in tensors.items()}
-    unbatched["recv_y"] = tensors["recv_y"][0]
-    golden_expert_routed(unbatched)
-    tensors["recv_y"][0] = unbatched["recv_y"]
 
 
 def gen_routed_weight(shape, dequant_std):
@@ -611,92 +431,47 @@ def build_tensor_specs():
     def init_recv_weights():
         return recv_weights_pre
 
-    # Route ids for the fused scatter: every valid row gets a distinct
-    # routed_y_buf slot, matching dispatch's one-route-per-(token, topk) layout.
-    # Tail rows keep route 0 and are never pushed (the kernel stops at
-    # recv_expert_count). Single rank, so every row's origin is rank 0.
-    recv_r_route_pre = torch.zeros(N_LOCAL_EXPERTS, RECV_MAX, dtype=torch.int32)
-    next_route = 0
-    for e in range(N_LOCAL_EXPERTS):
-        for slot in range(int(counts[e].item())):
-            recv_r_route_pre[e, slot] = next_route
-            next_route += 1
-    assert next_route <= N_ROUTES, f"fixture needs {next_route} routes, buffer holds {N_ROUTES}"
-
-    def init_recv_r_route():
-        return recv_r_route_pre.unsqueeze(0)
-
-    def init_recv_src():
-        return torch.zeros(1, N_LOCAL_EXPERTS, RECV_MAX, dtype=torch.int32)
-
     # Synthesize (int8, per-channel scale) by simulating the real MXFP4 routed-expert
     # quant grid (see gen_routed_weight). The kernel + golden both consume int8+scale.
     w1_i8, w1_s = gen_routed_weight((N_LOCAL_EXPERTS, MOE_INTER, D), ROUTED_DEQUANT_STD["w1"])
     w3_i8, w3_s = gen_routed_weight((N_LOCAL_EXPERTS, MOE_INTER, D), ROUTED_DEQUANT_STD["w3"])
     w2_i8, w2_s = gen_routed_weight((N_LOCAL_EXPERTS, D, MOE_INTER), ROUTED_DEQUANT_STD["w2"])
 
-    # Every tensor carries a leading rank dim: l3_expert_routed slices x[r] per
-    # card, the same shape contract as l3_moe (one rank here).
-    def r1(t):
-        return t.unsqueeze(0)
-
     return [
-        TensorSpec("recv_x", [1, N_LOCAL_EXPERTS, RECV_MAX, D], torch.int8,
-                   init_value=lambda: r1(init_recv_x())),
-        TensorSpec("recv_scale_dq", [1, N_LOCAL_EXPERTS, RECV_MAX], torch.float32,
-                   init_value=lambda: r1(init_recv_scale_dq())),
-        TensorSpec("recv_weights", [1, N_LOCAL_EXPERTS, RECV_MAX], torch.float32,
-                   init_value=lambda: r1(init_recv_weights())),
-        TensorSpec("recv_expert_count", [1, N_LOCAL_EXPERTS, 1], torch.int32,
-                   init_value=lambda: r1(init_recv_expert_count())),
-        TensorSpec("recv_r_route", [1, N_LOCAL_EXPERTS, RECV_MAX], torch.int32,
-                   init_value=init_recv_r_route),
-        TensorSpec("recv_src", [1, N_LOCAL_EXPERTS, RECV_MAX], torch.int32,
-                   init_value=init_recv_src),
-        TensorSpec("routed_w1", [1, N_LOCAL_EXPERTS, MOE_INTER, D], torch.int8,
-                   init_value=lambda: r1(w1_i8)),
-        TensorSpec("routed_w1_scale", [1, N_LOCAL_EXPERTS, MOE_INTER], torch.float32,
-                   init_value=lambda: r1(w1_s)),
-        TensorSpec("routed_w3", [1, N_LOCAL_EXPERTS, MOE_INTER, D], torch.int8,
-                   init_value=lambda: r1(w3_i8)),
-        TensorSpec("routed_w3_scale", [1, N_LOCAL_EXPERTS, MOE_INTER], torch.float32,
-                   init_value=lambda: r1(w3_s)),
-        TensorSpec("routed_w2", [1, N_LOCAL_EXPERTS, D, MOE_INTER], torch.int8,
-                   init_value=lambda: r1(w2_i8)),
-        TensorSpec("routed_w2_scale", [1, N_LOCAL_EXPERTS, D], torch.float32,
-                   init_value=lambda: r1(w2_s)),
-        TensorSpec("recv_y", [1, N_LOCAL_EXPERTS, RECV_MAX, D], torch.bfloat16, is_output=True),
+        TensorSpec("recv_x", [N_LOCAL_EXPERTS, RECV_MAX, D], torch.int8, init_value=init_recv_x),
+        TensorSpec("recv_scale_dq", [N_LOCAL_EXPERTS, RECV_MAX], torch.float32, init_value=init_recv_scale_dq),
+        TensorSpec("recv_weights", [N_LOCAL_EXPERTS, RECV_MAX], torch.float32, init_value=init_recv_weights),
+        TensorSpec("recv_expert_count", [N_LOCAL_EXPERTS, 1], torch.int32, init_value=init_recv_expert_count),
+        TensorSpec("routed_w1", [N_LOCAL_EXPERTS, MOE_INTER, D], torch.int8, init_value=lambda: w1_i8),
+        TensorSpec("routed_w1_scale", [N_LOCAL_EXPERTS, MOE_INTER], torch.float32, init_value=lambda: w1_s),
+        TensorSpec("routed_w3", [N_LOCAL_EXPERTS, MOE_INTER, D], torch.int8, init_value=lambda: w3_i8),
+        TensorSpec("routed_w3_scale", [N_LOCAL_EXPERTS, MOE_INTER], torch.float32, init_value=lambda: w3_s),
+        TensorSpec("routed_w2", [N_LOCAL_EXPERTS, D, MOE_INTER], torch.int8, init_value=lambda: w2_i8),
+        TensorSpec("routed_w2_scale", [N_LOCAL_EXPERTS, D], torch.float32, init_value=lambda: w2_s),
+        TensorSpec("recv_y", [N_LOCAL_EXPERTS, RECV_MAX, D], torch.bfloat16, is_output=True),
     ]
 
 
 if __name__ == "__main__":
     import argparse
     from golden import ratio_reldiff, run_jit
-    from pypto.ir.distributed_compiled_program import DistributedConfig
 
     parser = argparse.ArgumentParser()
     parser.add_argument("-p", "--platform", type=str, default="a2a3",
                         choices=["a2a3", "a2a3sim", "a5", "a5sim"])
     parser.add_argument("-d", "--device", type=int, default=0)
     parser.add_argument("--enable-l2-swimlane", type=int, nargs="?", const=1, default=0, choices=(0, 1, 2))
-    parser.add_argument("--compile-only", action="store_true", default=False)
     parser.add_argument("--dump-passes", action="store_true", default=False)
     args = parser.parse_args()
 
     result = run_jit(
-        fn=l3_expert_routed,
+        fn=expert_routed_test,
         specs=build_tensor_specs(),
-        golden_fn=golden_l3_expert_routed,
-        compile_only=args.compile_only,
-        compile_cfg=dict(
-            dump_passes=args.dump_passes,
-            distributed_config=DistributedConfig(
-                device_ids=[args.device],
-                num_sub_workers=0,
-            ),
-        ),
+        golden_fn=golden_expert_routed,
+        compile_cfg=dict(dump_passes=args.dump_passes),
         runtime_cfg=dict(
             platform=args.platform,
+            device_id=args.device,
             enable_l2_swimlane=args.enable_l2_swimlane,
         ),
         rtol=1e-3,

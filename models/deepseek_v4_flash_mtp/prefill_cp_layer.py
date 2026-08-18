@@ -27,7 +27,6 @@ config.MOE_TOKENS = config.PREFILL_TOKENS
 # Import moe first. It applies the EP override before dependent modules bake
 # config-derived MoE shapes.
 from moe import (
-    COMB_PAD,
     AUX_PAD,
     D,
     HC_DIM,
@@ -307,7 +306,7 @@ def _prefill_layer_cp_moe_tail(
     arrived: pld.DistributedTensor[[META_WINDOW_ROWS, 1], pl.INT32],
     data_arrived: pld.DistributedTensor[[META_WINDOW_ROWS, 1], pl.INT32],
     routed_y_buf: pld.DistributedTensor[[ROUTED_WINDOW_ROWS, D], pl.BF16],
-    combine_arrived: pld.DistributedTensor[[META_WINDOW_ROWS, COMB_PAD], pl.INT32],
+    combine_arrived: pld.DistributedTensor[[META_WINDOW_ROWS, 1], pl.INT32],
     # Layer stage synchronization window.
     stage_done: pld.DistributedTensor[[CP_SIZE, 1], pl.INT32],
     stage_tokens: pl.Tensor[[NUM_MOE_WAVES + 1, 1, 8], pl.FP32],
@@ -492,7 +491,7 @@ def prefill_layer_cp_swa(
     arrived: pld.DistributedTensor[[META_WINDOW_ROWS, 1], pl.INT32],
     data_arrived: pld.DistributedTensor[[META_WINDOW_ROWS, 1], pl.INT32],
     routed_y_buf: pld.DistributedTensor[[ROUTED_WINDOW_ROWS, D], pl.BF16],
-    combine_arrived: pld.DistributedTensor[[META_WINDOW_ROWS, COMB_PAD], pl.INT32],
+    combine_arrived: pld.DistributedTensor[[META_WINDOW_ROWS, 1], pl.INT32],
     # Layer stage synchronization window.
     stage_done: pld.DistributedTensor[[CP_SIZE, 1], pl.INT32],
     # Layer output.
@@ -694,7 +693,7 @@ def prefill_layer_cp_hca(
     arrived: pld.DistributedTensor[[META_WINDOW_ROWS, 1], pl.INT32],
     data_arrived: pld.DistributedTensor[[META_WINDOW_ROWS, 1], pl.INT32],
     routed_y_buf: pld.DistributedTensor[[ROUTED_WINDOW_ROWS, D], pl.BF16],
-    combine_arrived: pld.DistributedTensor[[META_WINDOW_ROWS, COMB_PAD], pl.INT32],
+    combine_arrived: pld.DistributedTensor[[META_WINDOW_ROWS, 1], pl.INT32],
     # Layer stage synchronization window.
     stage_done: pld.DistributedTensor[[CP_SIZE, 1], pl.INT32],
     # Layer output.
@@ -958,7 +957,7 @@ def prefill_layer_cp_csa(
     arrived: pld.DistributedTensor[[META_WINDOW_ROWS, 1], pl.INT32],
     data_arrived: pld.DistributedTensor[[META_WINDOW_ROWS, 1], pl.INT32],
     routed_y_buf: pld.DistributedTensor[[ROUTED_WINDOW_ROWS, D], pl.BF16],
-    combine_arrived: pld.DistributedTensor[[META_WINDOW_ROWS, COMB_PAD], pl.INT32],
+    combine_arrived: pld.DistributedTensor[[META_WINDOW_ROWS, 1], pl.INT32],
     # Layer stage synchronization window.
     stage_done: pld.DistributedTensor[[CP_SIZE, 1], pl.INT32],
     # Layer output.
@@ -1131,7 +1130,7 @@ def l3_prefill_layer_cp_swa(
     arrived_buf = pld.alloc_window_buffer([META_WINDOW_ROWS, 1], dtype=pl.INT32)
     data_arrived_buf = pld.alloc_window_buffer([META_WINDOW_ROWS, 1], dtype=pl.INT32)
     routed_y_buf_buf = pld.alloc_window_buffer([ROUTED_WINDOW_ROWS, D], dtype=pl.BF16)
-    combine_arrived_buf = pld.alloc_window_buffer([META_WINDOW_ROWS, COMB_PAD], dtype=pl.INT32)
+    combine_arrived_buf = pld.alloc_window_buffer([META_WINDOW_ROWS, 1], dtype=pl.INT32)
 
     # Domain 3: layer stage synchronization (monotonic counter, 1..5).
     stage_done_buf = pld.alloc_window_buffer([CP_SIZE, 1], dtype=pl.INT32)
@@ -1156,7 +1155,7 @@ def l3_prefill_layer_cp_swa(
         )
         routed_y_buf = pld.window(routed_y_buf_buf, [ROUTED_WINDOW_ROWS, D], dtype=pl.BF16)
         combine_arrived = pld.window(
-            combine_arrived_buf, [META_WINDOW_ROWS, COMB_PAD], dtype=pl.INT32
+            combine_arrived_buf, [META_WINDOW_ROWS, 1], dtype=pl.INT32
         )
         stage_done = pld.window(stage_done_buf, [CP_SIZE, 1], dtype=pl.INT32)
         # SWA attention weights are shared across ranks (passed directly, not
@@ -1371,7 +1370,7 @@ def l3_prefill_layer_cp_hca(
     arrived_buf = pld.alloc_window_buffer([META_WINDOW_ROWS, 1], dtype=pl.INT32)
     data_arrived_buf = pld.alloc_window_buffer([META_WINDOW_ROWS, 1], dtype=pl.INT32)
     routed_y_buf_buf = pld.alloc_window_buffer([ROUTED_WINDOW_ROWS, D], dtype=pl.BF16)
-    combine_arrived_buf = pld.alloc_window_buffer([META_WINDOW_ROWS, COMB_PAD], dtype=pl.INT32)
+    combine_arrived_buf = pld.alloc_window_buffer([META_WINDOW_ROWS, 1], dtype=pl.INT32)
 
     # Domain 4: layer stage synchronization (monotonic counter, 1..5).
     stage_done_buf = pld.alloc_window_buffer([CP_SIZE, 1], dtype=pl.INT32)
@@ -1422,7 +1421,7 @@ def l3_prefill_layer_cp_hca(
         )
         routed_y_buf = pld.window(routed_y_buf_buf, [ROUTED_WINDOW_ROWS, D], dtype=pl.BF16)
         combine_arrived = pld.window(
-            combine_arrived_buf, [META_WINDOW_ROWS, COMB_PAD], dtype=pl.INT32
+            combine_arrived_buf, [META_WINDOW_ROWS, 1], dtype=pl.INT32
         )
         stage_done = pld.window(stage_done_buf, [CP_SIZE, 1], dtype=pl.INT32)
         # HCA attention weights are shared across ranks (passed directly, not
@@ -1691,7 +1690,7 @@ def l3_prefill_layer_cp_csa(
     arrived_buf = pld.alloc_window_buffer([META_WINDOW_ROWS, 1], dtype=pl.INT32)
     data_arrived_buf = pld.alloc_window_buffer([META_WINDOW_ROWS, 1], dtype=pl.INT32)
     routed_y_buf_buf = pld.alloc_window_buffer([ROUTED_WINDOW_ROWS, D], dtype=pl.BF16)
-    combine_arrived_buf = pld.alloc_window_buffer([META_WINDOW_ROWS, COMB_PAD], dtype=pl.INT32)
+    combine_arrived_buf = pld.alloc_window_buffer([META_WINDOW_ROWS, 1], dtype=pl.INT32)
 
     # Domain 3: layer stage synchronization (monotonic counter, 1..5).
     stage_done_buf = pld.alloc_window_buffer([CP_SIZE, 1], dtype=pl.INT32)
@@ -1760,7 +1759,7 @@ def l3_prefill_layer_cp_csa(
         )
         routed_y_buf = pld.window(routed_y_buf_buf, [ROUTED_WINDOW_ROWS, D], dtype=pl.BF16)
         combine_arrived = pld.window(
-            combine_arrived_buf, [META_WINDOW_ROWS, COMB_PAD], dtype=pl.INT32
+            combine_arrived_buf, [META_WINDOW_ROWS, 1], dtype=pl.INT32
         )
         stage_done = pld.window(stage_done_buf, [CP_SIZE, 1], dtype=pl.INT32)
 

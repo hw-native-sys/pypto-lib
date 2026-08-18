@@ -129,7 +129,7 @@ def decode_fwd_mtp_l2(
     arrived: pld.DistributedTensor[[N_RANKS, 1], pl.INT32],
     data_arrived: pld.DistributedTensor[[N_RANKS, 1], pl.INT32],
     routed_y_buf: pld.DistributedTensor[[N_ROUTES, D], pl.BF16],
-    combine_arrived: pld.DistributedTensor[[N_RANKS, COMB_PAD], pl.INT32],
+    combine_arrived: pld.DistributedTensor[[N_RANKS, 1], pl.INT32],
     lm_head_hidden_window: pld.DistributedTensor[[GROUP_LOGIT_ROWS, D], pl.BF16],
     lm_head_hidden_done: pld.DistributedTensor[[LM_HEAD_TP_SIZE, 1], pl.INT32],
     lm_head_logits_window: pld.DistributedTensor[[MAX_LOGIT_ROWS, LM_HEAD_VOCAB], pl.FP32],
@@ -203,7 +203,7 @@ def decode_fwd_mtp_l2(
     mtp_arrived: pld.DistributedTensor[[N_RANKS, 1], pl.INT32],
     mtp_data_arrived: pld.DistributedTensor[[N_RANKS, 1], pl.INT32],
     mtp_routed_y_buf: pld.DistributedTensor[[N_ROUTES, D], pl.BF16],
-    mtp_combine_arrived: pld.DistributedTensor[[N_RANKS, COMB_PAD], pl.INT32],
+    mtp_combine_arrived: pld.DistributedTensor[[N_RANKS, 1], pl.INT32],
     mtp_lm_head_hidden_window: pld.DistributedTensor[[GROUP_LOGIT_ROWS, D], pl.BF16],
     mtp_lm_head_hidden_done: pld.DistributedTensor[[LM_HEAD_TP_SIZE, 1], pl.INT32],
     mtp_lm_head_logits_window: pld.DistributedTensor[[MAX_LOGIT_ROWS, LM_HEAD_VOCAB], pl.FP32],
@@ -508,7 +508,7 @@ def l3_decode_fwd_mtp(
     arrived_buf = pld.alloc_window_buffer([N_RANKS, 1], dtype=pl.INT32)
     data_arrived_buf = pld.alloc_window_buffer([N_RANKS, 1], dtype=pl.INT32)
     routed_y_buf_buf = pld.alloc_window_buffer([N_ROUTES, D], dtype=pl.BF16)
-    combine_arrived_buf = pld.alloc_window_buffer([N_RANKS, COMB_PAD], dtype=pl.INT32)
+    combine_arrived_buf = pld.alloc_window_buffer([N_RANKS, 1], dtype=pl.INT32)
     lm_head_hidden_window_buf = pld.alloc_window_buffer(GROUP_LOGIT_ROWS * D * 2)
     lm_head_logits_window_buf = pld.alloc_window_buffer(MAX_LOGIT_ROWS * LM_HEAD_VOCAB * 4)
     lm_head_hidden_done_buf = pld.alloc_window_buffer([LM_HEAD_TP_SIZE, 1], dtype=pl.INT32)
@@ -520,7 +520,7 @@ def l3_decode_fwd_mtp(
     mtp_arrived_buf = pld.alloc_window_buffer([N_RANKS, 1], dtype=pl.INT32)
     mtp_data_arrived_buf = pld.alloc_window_buffer([N_RANKS, 1], dtype=pl.INT32)
     mtp_routed_y_buf_buf = pld.alloc_window_buffer([N_ROUTES, D], dtype=pl.BF16)
-    mtp_combine_arrived_buf = pld.alloc_window_buffer([N_RANKS, COMB_PAD], dtype=pl.INT32)
+    mtp_combine_arrived_buf = pld.alloc_window_buffer([N_RANKS, 1], dtype=pl.INT32)
     mtp_lm_head_hidden_window_buf = pld.alloc_window_buffer([GROUP_LOGIT_ROWS, D], dtype=pl.BF16)
     mtp_lm_head_logits_window_buf = pld.alloc_window_buffer(MAX_LOGIT_ROWS * LM_HEAD_VOCAB * 4)
     mtp_lm_head_hidden_done_buf = pld.alloc_window_buffer([LM_HEAD_TP_SIZE, 1], dtype=pl.INT32)
@@ -533,7 +533,7 @@ def l3_decode_fwd_mtp(
         arrived: pld.DistributedTensor[[N_RANKS, 1], pl.INT32] = pld.window(arrived_buf, [N_RANKS, 1], dtype=pl.INT32)
         data_arrived: pld.DistributedTensor[[N_RANKS, 1], pl.INT32] = pld.window(data_arrived_buf, [N_RANKS, 1], dtype=pl.INT32)
         routed_y_buf: pld.DistributedTensor[[N_ROUTES, D], pl.BF16] = pld.window(routed_y_buf_buf, [N_ROUTES, D], dtype=pl.BF16)
-        combine_arrived: pld.DistributedTensor[[N_RANKS, COMB_PAD], pl.INT32] = pld.window(combine_arrived_buf, [N_RANKS, COMB_PAD], dtype=pl.INT32)
+        combine_arrived: pld.DistributedTensor[[N_RANKS, 1], pl.INT32] = pld.window(combine_arrived_buf, [N_RANKS, 1], dtype=pl.INT32)
         lm_head_hidden_window = pld.window(lm_head_hidden_window_buf, [GROUP_LOGIT_ROWS, D], dtype=pl.BF16)
         lm_head_hidden_done = pld.window(lm_head_hidden_done_buf, [LM_HEAD_TP_SIZE, 1], dtype=pl.INT32)
         lm_head_logits_window = pld.window(lm_head_logits_window_buf, [MAX_LOGIT_ROWS, LM_HEAD_VOCAB], dtype=pl.FP32)
@@ -545,7 +545,7 @@ def l3_decode_fwd_mtp(
         mtp_arrived = pld.window(mtp_arrived_buf, [N_RANKS, 1], dtype=pl.INT32)
         mtp_data_arrived = pld.window(mtp_data_arrived_buf, [N_RANKS, 1], dtype=pl.INT32)
         mtp_routed_y_buf = pld.window(mtp_routed_y_buf_buf, [N_ROUTES, D], dtype=pl.BF16)
-        mtp_combine_arrived = pld.window(mtp_combine_arrived_buf, [N_RANKS, COMB_PAD], dtype=pl.INT32)
+        mtp_combine_arrived = pld.window(mtp_combine_arrived_buf, [N_RANKS, 1], dtype=pl.INT32)
         mtp_lm_head_hidden_window = pld.window(mtp_lm_head_hidden_window_buf, [GROUP_LOGIT_ROWS, D], dtype=pl.BF16)
         mtp_lm_head_hidden_done = pld.window(mtp_lm_head_hidden_done_buf, [LM_HEAD_TP_SIZE, 1], dtype=pl.INT32)
         mtp_lm_head_logits_window = pld.window(mtp_lm_head_logits_window_buf, [MAX_LOGIT_ROWS, LM_HEAD_VOCAB], dtype=pl.FP32)
