@@ -49,7 +49,6 @@ from config import (
     CSA_STATE_BLOCK_SIZE,
     CSA_STATE_PAGES_PER_REQUEST,
     CSA_STATE_ROWS_PER_REQUEST,
-    CSA_TOPK,
     CSA_TOPK_INVALID_TASK_SLOT,
     CSA_TOPK_READY_FRONTIER_W,
     FLASH as M,
@@ -65,9 +64,7 @@ from config import (
     SWA_PERSISTENT_ROWS_PER_REQUEST,
     SWA_SOURCE_INVALID,
     SWA_SOURCE_INT32_MAX,
-    SWA_SOURCE_OVERLAY_BASE,
     SWA_WINDOW_ROWS,
-    decode_swa_overlay_source,
     encode_swa_overlay_source,
 )
 

@@ -150,7 +150,6 @@ def q_proj_rope(
     with pl.spmd(
         (Q_LORA // QR_N_TILE) * QR_OK,
         name_hint="qr_proj_matmul",
-        allow_early_resolve=True,
     ) as qr_proj_tid:
         qbg_idx = pl.tile.get_block_idx()
         q_a_col0 = (qbg_idx // QR_OK) * QR_N_TILE
