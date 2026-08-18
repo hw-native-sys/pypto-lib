@@ -70,13 +70,13 @@ from decode_sparse_attn_swa import ATTN_K_TILE, PADDED_TOPK, T_PAD, sparse_attn_
 
 # Dynamic shape variables.
 T_DYN = pl.dynamic("T_DYN")  # T = B * S
+ORI_BLOCK_NUM_DYN = pl.dynamic("ORI_BLOCK_NUM_DYN")
 
 
 # model config
 B = DECODE_BATCH // TP_SIZE
 S = DECODE_SEQ
 T = B * S
-BIAS_T_TILE = 8  # sparse_bias row block; T is a multiple of 8 by the batch contract
 EPS = M.rms_norm_eps
 D = M.hidden_size
 H = M.num_attention_heads
@@ -100,27 +100,22 @@ O_GROUP_IN = H * HEAD_DIM // O_GROUPS
 # kernel-local (SWA: ratio-0, no compressor/indexer)
 ORI_MAX_BLOCKS = KV_ORI_MAX_BLOCKS
 ORI_BLOCK_NUM = KV_ORI_BLOCK_NUM
-ORI_BLOCK_NUM_DYN = pl.dynamic("ORI_BLOCK_NUM_DYN")
 TOPK = WIN                          # SWA: sparse_attn topk = window only
 SPARSE_IDX_TOPK = M.index_topk      # sparse_attn module's IDX_TOPK (static shape contract)
 SPARSE_TOPK = WIN + SPARSE_IDX_TOPK
 SPARSE_CMP_MAX_BLOCKS = KV_CMP_MAX_BLOCKS
 
 # tiling
+BIAS_T_TILE = 8  # sparse_bias row block; T is a multiple of 8 by the batch contract
 SPARSE_ROPE_TILE = 16
 SPARSE_ROPE_INTERLEAVE_TILE = 2 * SPARSE_ROPE_TILE
 NEG_INF = -1.0e20
-
-# fixture
-TP_FIXTURE_WINDOW_BLOCKS = (WIN + BLOCK_SIZE - 1) // BLOCK_SIZE
-TP_FIXTURE_OUTPUT_SENTINEL = -7.0
 
 if T != LOCAL_T:
     raise ValueError(f"SWA token capacity {T} must equal TP-local token capacity {LOCAL_T}")
 if T_PAD != LOCAL_T_PAD:
     raise ValueError(f"SWA padded token capacity {T_PAD} must equal TP capacity {LOCAL_T_PAD}")
-if TP_FIXTURE_WINDOW_BLOCKS > ORI_BLOCK_NUM:
-    raise ValueError("SWA fixture window exceeds the original KV cache capacity")
+
 
 @pl.jit
 def decode_swa(
@@ -292,7 +287,7 @@ def decode_swa_tp1(
 
     x_normed_t = pl.create_tensor([t_dim, D], dtype=pl.BF16)
     rms_tid = rms_norm(x_mixed, attn_norm_w, x_normed_t)
-    # Defers kv_proj_matmul one hop behind rms_norm so qr_proj_matmul dispatches first.
+    # Dispatch barrier: kv_proj_matmul resolves one hop after rms_norm.
     late_dep = pl.system.task_dummy(deps=[rms_tid])
     q = pl.create_tensor([t_dim, H, HEAD_DIM], dtype=pl.BF16)
     kv = pl.create_tensor([t_dim, HEAD_DIM], dtype=pl.BF16)
@@ -394,6 +389,14 @@ def decode_swa_tp1_test(
         x_out,
     )
     return x_out
+
+
+# fixture
+TP_FIXTURE_WINDOW_BLOCKS = (WIN + BLOCK_SIZE - 1) // BLOCK_SIZE
+TP_FIXTURE_OUTPUT_SENTINEL = -7.0
+
+if TP_FIXTURE_WINDOW_BLOCKS > ORI_BLOCK_NUM:
+    raise ValueError("SWA fixture window exceeds the original KV cache capacity")
 
 
 def build_tp_tensor_specs(local_t):
@@ -565,7 +568,7 @@ def golden_decode_swa_tp1(tensors):
     tokens = tensors["x_hc"].shape[0]
     from hc_post import golden_hc_post
 
-    # ---- Block.hc_pre (model.py:691) ----
+    # Block.hc_pre
     x_mixed = torch.zeros(tokens, D, dtype=torch.bfloat16)
     post_t = torch.zeros(tokens, HC_MULT)
     comb_t = torch.zeros(tokens, HC_MULT * HC_MULT)
@@ -579,7 +582,7 @@ def golden_decode_swa_tp1(tensors):
         "comb": comb_t,
     })
 
-    # ===== Attention.forward (model.py:484-543), ratio==0 branch =====
+    # Attention.forward, ratio==0 branch
     position_ids = tensors["position_ids"].to(torch.int64)
     rd = ROPE_HEAD_DIM
 
@@ -592,7 +595,7 @@ def golden_decode_swa_tp1(tensors):
         rope_cos_T[t] = freqs_cos[pos]
         rope_sin_T[t] = freqs_sin[pos]
 
-    # q + win kv (model.py:495-504)
+    # q + win kv
     q = torch.zeros(tokens, H, HEAD_DIM, dtype=torch.bfloat16)
     kv = torch.zeros(tokens, HEAD_DIM, dtype=torch.bfloat16)
     qr = torch.zeros(tokens, Q_LORA, dtype=torch.int8)
@@ -641,7 +644,7 @@ def golden_decode_swa_tp1(tensors):
         "attn_out": attn_out,
     })
 
-    # ===== Block.hc_post (model.py:694) =====
+    # Block.hc_post
     y = torch.zeros(tokens, HC_MULT, D, dtype=torch.float32)
     golden_hc_post({
         "x": attn_out,
@@ -656,7 +659,7 @@ def golden_decode_swa_tp1(tensors):
 
 def build_tensor_specs(start_pos=None, batch=B):
     tokens = batch * S
-    import torch  # type: ignore[import]
+    import torch
     from utils import (
         block_table,
         paged_slot_mapping,
@@ -690,9 +693,7 @@ def build_tensor_specs(start_pos=None, batch=B):
 
     def init_x_hc():
         return torch.empty(tokens, HC_MULT, D).uniform_(-1, 1)
-    # Real layer-0 (SWA) hc_attn scale/base (fn synthetic at real magnitude). A synthetic
-    # scale=0.5/base=0 leaves hc_pre post~=1 + near-uniform comb, cancelling attn_out and the
-    # hc residual to near-zero in x_out where quant noise blows up the relative tail.
+    # Real layer-0 (SWA) hc_attn scale/base; fn is synthetic at the real magnitude.
     def init_hc_attn_fn():
         return torch.randn(MIX_HC, HC_DIM) * 0.039
     def init_hc_attn_scale():
@@ -809,12 +810,13 @@ if __name__ == "__main__":
     from pypto.ir.distributed_compiled_program import DistributedConfig
 
     parser = argparse.ArgumentParser()
-    parser.add_argument("-p", "--platform", type=str, default="a2a3",
-                        choices=["a2a3", "a2a3sim", "a5", "a5sim"])
-    parser.add_argument("--tp", type=int, default=TP_SIZE, choices=list(_TP_CHOICES),
-                        help="tensor-parallel world size")
-    parser.add_argument("-d", "--device", type=str, default=",".join(str(rank) for rank in range(TP_SIZE)),
-                        help=f"comma-separated device ids; need exactly {TP_SIZE}")
+    default_devices = ",".join(str(rank) for rank in range(TP_SIZE))
+    parser.add_argument("-p", "--platform", type=str, default="a2a3", choices=["a2a3", "a2a3sim", "a5", "a5sim"])
+    parser.add_argument("--tp", type=int, default=TP_SIZE, choices=list(_TP_CHOICES), help="tensor-parallel world size")
+    parser.add_argument(
+        "-d", "--device", type=str, default=default_devices,
+        help=f"comma-separated device ids; need exactly {TP_SIZE}",
+    )
     parser.add_argument("--case", choices=("all", "max", "subcapacity"), default="all")
     parser.add_argument("--compile-only", action="store_true", default=False)
     parser.add_argument("--dump-passes", action="store_true", default=False)

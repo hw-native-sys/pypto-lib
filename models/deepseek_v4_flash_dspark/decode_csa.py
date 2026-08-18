@@ -89,6 +89,11 @@ from decode_sparse_attn_csa import (
 # Dynamic shape variables.
 B_DYN = pl.dynamic("B_DYN")  # per-request axis
 T_DYN = pl.dynamic("T_DYN")  # T = B * S
+ORI_BLOCK_NUM_DYN = pl.dynamic("ORI_BLOCK_NUM_DYN")
+CMP_BLOCK_NUM_DYN = pl.dynamic("CMP_BLOCK_NUM_DYN")
+IDX_CACHE_BLOCK_NUM_DYN = pl.dynamic("IDX_CACHE_BLOCK_NUM_DYN")
+MAIN_STATE_BLOCK_NUM_DYN = pl.dynamic("CSA_STATE_BLOCK_NUM_DYN")
+INNER_STATE_BLOCK_NUM_DYN = pl.dynamic("INNER_STATE_BLOCK_NUM_DYN")
 
 # model config
 B = DECODE_BATCH // TP_SIZE
@@ -125,69 +130,24 @@ MAIN_STATE_BLOCK_SIZE = C4A_COMPRESSOR_BLOCK_SIZE
 MAIN_STATE_PHYSICAL_BLOCKS = CSA_STATE_PHYSICAL_BLOCKS
 MAIN_STATE_MAX_BLOCKS = (MAX_SEQ_LEN + MAIN_STATE_BLOCK_SIZE - 1) // MAIN_STATE_BLOCK_SIZE
 MAIN_STATE_BLOCK_NUM = MAIN_STATE_PHYSICAL_BLOCKS
-MAIN_STATE_BLOCK_NUM_DYN = pl.dynamic("CSA_STATE_BLOCK_NUM_DYN")
 INNER_OUT_DIM = COFF * IDX_HEAD_DIM
 INNER_STATE_DIM = 2 * INNER_OUT_DIM
 INNER_STATE_BLOCK_SIZE = C4A_COMPRESSOR_BLOCK_SIZE
 INNER_STATE_PHYSICAL_BLOCKS = CSA_INNER_STATE_PHYSICAL_BLOCKS
 INNER_STATE_MAX_BLOCKS = (MAX_SEQ_LEN + INNER_STATE_BLOCK_SIZE - 1) // INNER_STATE_BLOCK_SIZE
 INNER_STATE_BLOCK_NUM = INNER_STATE_PHYSICAL_BLOCKS
-INNER_STATE_BLOCK_NUM_DYN = pl.dynamic("INNER_STATE_BLOCK_NUM_DYN")
-IDX_CACHE_BLOCK_NUM_DYN = pl.dynamic("IDX_CACHE_BLOCK_NUM_DYN")
 ORI_MAX_BLOCKS = KV_ORI_MAX_BLOCKS
 ORI_BLOCK_NUM = KV_ORI_BLOCK_NUM
-ORI_BLOCK_NUM_DYN = pl.dynamic("ORI_BLOCK_NUM_DYN")
 CMP_MAX_BLOCKS = KV_CMP_MAX_BLOCKS
 CMP_BLOCK_NUM = KV_CMP_BLOCK_NUM
-CMP_BLOCK_NUM_DYN = pl.dynamic("CMP_BLOCK_NUM_DYN")
 
 # tiling
 CSA_WB_TOKEN_TILE = 8
-
-# fixture
-FIXTURE_CMP_ENTRIES = (
-    (ATTN_K_TILE - 1, BLOCK_SIZE // 4 - 1),
-    (2 * ATTN_K_TILE - 1, BLOCK_SIZE),
-    (3 * ATTN_K_TILE - 1, 2 * BLOCK_SIZE),
-    (4 * ATTN_K_TILE - 1, 4 * BLOCK_SIZE - 3),
-)
-FIXTURE_FILTERED_POSITIONS = (1, ATTN_K_TILE + 1, 2 * ATTN_K_TILE + 1, 3 * ATTN_K_TILE + 1)
-FIXTURE_CMP_SLOTS = tuple(slot for _, slot in FIXTURE_CMP_ENTRIES)
-FIXTURE_CMP_LOGICAL_BLOCKS = (max(FIXTURE_CMP_SLOTS) + 1 + BLOCK_SIZE - 1) // BLOCK_SIZE
-FIXTURE_CMP_BOUND = 4 * BLOCK_SIZE - 2
-FIXTURE_FILTERED_SLOT = FIXTURE_CMP_BOUND
-FIXTURE_POSITION_ID = COMPRESS_RATIO * FIXTURE_CMP_BOUND - 1
-FIXTURE_WINDOW_HEAD = (FIXTURE_POSITION_ID - WIN + 1) % BLOCK_SIZE
-FIXTURE_WINDOW_BLOCKS = (FIXTURE_WINDOW_HEAD + WIN + BLOCK_SIZE - 1) // BLOCK_SIZE
-FIXTURE_CMP_BLOCKS = (LOCAL_T // S) * FIXTURE_CMP_LOGICAL_BLOCKS
-FIXTURE_OUTPUT_SENTINEL = -7.0
 
 if T != LOCAL_T:
     raise ValueError(f"CSA token capacity {T} must equal TP local token capacity {LOCAL_T}")
 if T_PAD != LOCAL_T_PAD:
     raise ValueError(f"CSA token capacity {T_PAD} must equal TP local token capacity {LOCAL_T_PAD}")
-if LOCAL_T < 2 * ROPE_CS_T_TILE:
-    raise ValueError("CSA fixture token capacity must leave one RoPE row tile for subcapacity")
-if LOCAL_T % ROPE_CS_T_TILE != 0:
-    raise ValueError("CSA fixture token capacity must align to the RoPE row tile")
-if (LOCAL_T - ROPE_CS_T_TILE) % S != 0:
-    raise ValueError("CSA fixture subcapacity must preserve whole decode requests")
-if max(position for position, _ in FIXTURE_CMP_ENTRIES) >= INDEXER_SCORE_LEN:
-    raise ValueError("CSA fixture compressed positions exceed the indexer score row")
-if max(position for position, _ in FIXTURE_CMP_ENTRIES) >= 4 * ATTN_K_TILE:
-    raise ValueError("CSA fixture compressed positions exceed the four sparse tiles")
-if max(FIXTURE_FILTERED_POSITIONS) >= CMP_TOPK:
-    raise ValueError("CSA fixture filtered positions exceed the compressed top-k row")
-if FIXTURE_FILTERED_SLOT >= FIXTURE_CMP_LOGICAL_BLOCKS * BLOCK_SIZE:
-    raise ValueError("CSA filtered slot must remain inside the fixture block table")
-if FIXTURE_WINDOW_BLOCKS > ORI_BLOCK_NUM:
-    raise ValueError("CSA fixture window exceeds the original KV cache capacity")
-if FIXTURE_CMP_LOGICAL_BLOCKS > CMP_MAX_BLOCKS:
-    raise ValueError("CSA fixture compressed slots exceed the compressed block table")
-if FIXTURE_CMP_BLOCKS > CMP_BLOCK_NUM:
-    raise ValueError("CSA fixture compressed-cache pool exceeds its physical capacity")
-if O_LORA < 4 * HEADS_PER_GROUP:
-    raise ValueError("CSA fixture output projection needs four observable rows per local head")
 
 
 @pl.jit
@@ -375,12 +335,7 @@ def decode_csa_tp1(
     rope_sin_t = pl.create_tensor([t_dim, ROPE_HEAD_DIM], dtype=pl.BF16)
     step_cos = pl.create_tensor([B, HALF_ROPE], dtype=pl.FP32)
     step_sin = pl.create_tensor([B, HALF_ROPE], dtype=pl.FP32)
-    # Interleave-duplicated / sign-folded step rope rows for the indexer subsystem.
-    # The indexer's qr_rope re-ran the j>>1 dup-gather on each of its 16 spmd blocks
-    # (32 rows each) and its compressor once more; pl.gather lowers to a per-row
-    # TGATHER loop, so that was ~1056 row-gathers per layer to rebuild one small
-    # position-invariant table. Built once here instead (B rows, off the critical
-    # path -- this scope has no producer) and read as a plain load downstream.
+    # Interleave-duplicated / sign-folded step rope rows for the indexer, built once over B rows.
     step_cos_il = pl.create_tensor([B, ROPE_HEAD_DIM], dtype=pl.FP32)
     step_sin_signed = pl.create_tensor([B, ROPE_HEAD_DIM], dtype=pl.FP32)
     with pl.at(level=pl.Level.CORE_GROUP, name_hint="csa_rope_step"):
@@ -395,8 +350,10 @@ def decode_csa_tp1(
                 sin_row = pl.cast(freqs_sin[pos_b : pos_b + 1, 0 : ROPE_HEAD_DIM], target_type=pl.FP32)
                 rope_cos_t[t : t + 1, 0 : ROPE_HEAD_DIM] = pl.cast(cos_row, target_type=pl.BF16)
                 rope_sin_t[t : t + 1, 0 : ROPE_HEAD_DIM] = pl.cast(sin_row, target_type=pl.BF16)
-            step_cos[b : b + 1, 0 : HALF_ROPE] = pl.cast(freqs_cos[step_pos_b : step_pos_b + 1, 0 : HALF_ROPE], target_type=pl.FP32)
-            step_sin[b : b + 1, 0 : HALF_ROPE] = pl.cast(freqs_sin[step_pos_b : step_pos_b + 1, 0 : HALF_ROPE], target_type=pl.FP32)
+            step_cos_row = freqs_cos[step_pos_b : step_pos_b + 1, 0 : HALF_ROPE]
+            step_sin_row = freqs_sin[step_pos_b : step_pos_b + 1, 0 : HALF_ROPE]
+            step_cos[b : b + 1, 0 : HALF_ROPE] = pl.cast(step_cos_row, target_type=pl.FP32)
+            step_sin[b : b + 1, 0 : HALF_ROPE] = pl.cast(step_sin_row, target_type=pl.FP32)
 
     rope_interleave(step_cos, step_sin, step_cos_il, step_sin_signed)
 
@@ -411,16 +368,17 @@ def decode_csa_tp1(
             first_pos_b = pl.read(position_ids, [first_t])
             cmp_offset_b = COMPRESS_RATIO - (first_pos_b % COMPRESS_RATIO)
             cmp_pos_b = pl.cast(first_pos_b + cmp_offset_b - COMPRESS_RATIO, pl.INDEX)
-            cmp_cos[b : b + 1, 0 : HALF_ROPE] = pl.cast(freqs_cos[cmp_pos_b : cmp_pos_b + 1, 0 : HALF_ROPE], target_type=pl.FP32)
-            cmp_sin[b : b + 1, 0 : HALF_ROPE] = pl.cast(freqs_sin[cmp_pos_b : cmp_pos_b + 1, 0 : HALF_ROPE], target_type=pl.FP32)
+            cmp_cos_row = freqs_cos[cmp_pos_b : cmp_pos_b + 1, 0 : HALF_ROPE]
+            cmp_sin_row = freqs_sin[cmp_pos_b : cmp_pos_b + 1, 0 : HALF_ROPE]
+            cmp_cos[b : b + 1, 0 : HALF_ROPE] = pl.cast(cmp_cos_row, target_type=pl.FP32)
+            cmp_sin[b : b + 1, 0 : HALF_ROPE] = pl.cast(cmp_sin_row, target_type=pl.FP32)
 
     rope_interleave(cmp_cos, cmp_sin, cmp_cos_il, cmp_sin_signed)
 
     x_normed_t = pl.create_tensor([t_dim, D], dtype=pl.BF16)
     rms_tid = rms_norm(x_mixed, attn_norm_w, x_normed_t)
-    # rms_norm fans out to qr_proj_matmul (critical path), kv_proj_matmul, kv_score_proj
-    # and weights_proj. The latter three take this barrier instead of racing the first:
-    # the dummy resolves one hop after rms_norm, so qr_proj_matmul is dispatched first.
+    # Dispatch barrier: kv_proj_matmul, kv_score_proj and weights_proj resolve one hop
+    # after rms_norm, leaving qr_proj_matmul first.
     late_dep = pl.system.task_dummy(deps=[rms_tid])
     q = pl.create_tensor([t_dim, H, HEAD_DIM], dtype=pl.BF16)
     kv = pl.create_tensor([t_dim, HEAD_DIM], dtype=pl.BF16)
@@ -467,9 +425,8 @@ def decode_csa_tp1(
         kv_seq_lens, 0, late_dep,
     )
 
-    # sparse_attn_csa now folds the compressed-slot masking + valid-block flags in from
-    # the raw indexer topk + position, so pass those directly.
-
+    # sparse_attn_csa folds the compressed-slot masking + valid-block flags in from the
+    # raw indexer topk + position.
     position_ids_t1 = pl.reshape(position_ids, [t_dim, 1])
     attn_out = pl.create_tensor([t_dim, D], dtype=pl.BF16)
     o_packed_heads = pl.create_tensor([O_GROUPS * T_PAD, O_GROUP_IN], dtype=pl.BF16)
@@ -579,6 +536,48 @@ def decode_csa_tp1_test(
     return x_out
 
 
+# fixture
+FIXTURE_CMP_ENTRIES = (
+    (ATTN_K_TILE - 1, BLOCK_SIZE // 4 - 1),
+    (2 * ATTN_K_TILE - 1, BLOCK_SIZE),
+    (3 * ATTN_K_TILE - 1, 2 * BLOCK_SIZE),
+    (4 * ATTN_K_TILE - 1, 4 * BLOCK_SIZE - 3),
+)
+FIXTURE_FILTERED_POSITIONS = (1, ATTN_K_TILE + 1, 2 * ATTN_K_TILE + 1, 3 * ATTN_K_TILE + 1)
+FIXTURE_CMP_SLOTS = tuple(slot for _, slot in FIXTURE_CMP_ENTRIES)
+FIXTURE_CMP_LOGICAL_BLOCKS = (max(FIXTURE_CMP_SLOTS) + 1 + BLOCK_SIZE - 1) // BLOCK_SIZE
+FIXTURE_CMP_BOUND = 4 * BLOCK_SIZE - 2
+FIXTURE_FILTERED_SLOT = FIXTURE_CMP_BOUND
+FIXTURE_POSITION_ID = COMPRESS_RATIO * FIXTURE_CMP_BOUND - 1
+FIXTURE_WINDOW_HEAD = (FIXTURE_POSITION_ID - WIN + 1) % BLOCK_SIZE
+FIXTURE_WINDOW_BLOCKS = (FIXTURE_WINDOW_HEAD + WIN + BLOCK_SIZE - 1) // BLOCK_SIZE
+FIXTURE_CMP_BLOCKS = (LOCAL_T // S) * FIXTURE_CMP_LOGICAL_BLOCKS
+FIXTURE_OUTPUT_SENTINEL = -7.0
+
+if LOCAL_T < 2 * ROPE_CS_T_TILE:
+    raise ValueError("CSA fixture token capacity must leave one RoPE row tile for subcapacity")
+if LOCAL_T % ROPE_CS_T_TILE != 0:
+    raise ValueError("CSA fixture token capacity must align to the RoPE row tile")
+if (LOCAL_T - ROPE_CS_T_TILE) % S != 0:
+    raise ValueError("CSA fixture subcapacity must preserve whole decode requests")
+if max(position for position, _ in FIXTURE_CMP_ENTRIES) >= INDEXER_SCORE_LEN:
+    raise ValueError("CSA fixture compressed positions exceed the indexer score row")
+if max(position for position, _ in FIXTURE_CMP_ENTRIES) >= 4 * ATTN_K_TILE:
+    raise ValueError("CSA fixture compressed positions exceed the four sparse tiles")
+if max(FIXTURE_FILTERED_POSITIONS) >= CMP_TOPK:
+    raise ValueError("CSA fixture filtered positions exceed the compressed top-k row")
+if FIXTURE_FILTERED_SLOT >= FIXTURE_CMP_LOGICAL_BLOCKS * BLOCK_SIZE:
+    raise ValueError("CSA filtered slot must remain inside the fixture block table")
+if FIXTURE_WINDOW_BLOCKS > ORI_BLOCK_NUM:
+    raise ValueError("CSA fixture window exceeds the original KV cache capacity")
+if FIXTURE_CMP_LOGICAL_BLOCKS > CMP_MAX_BLOCKS:
+    raise ValueError("CSA fixture compressed slots exceed the compressed block table")
+if FIXTURE_CMP_BLOCKS > CMP_BLOCK_NUM:
+    raise ValueError("CSA fixture compressed-cache pool exceeds its physical capacity")
+if O_LORA < 4 * HEADS_PER_GROUP:
+    raise ValueError("CSA fixture output projection needs four observable rows per local head")
+
+
 def build_tp_tensor_specs(local_t):
     """Build deterministic tensor-parallel CSA output inputs."""
     import torch
@@ -636,21 +635,12 @@ def build_tp_tensor_specs(local_t):
                     row = cmp_slot % BLOCK_SIZE
                     cmp_kv[rank, physical_block, row, 0, :] = 0.0
                     cmp_kv[rank, physical_block, row, 0, 0] = 0.25
-                    cmp_kv[rank, physical_block, row, 0, 1] = (
-                        (rank + 1) * 0.03125
-                        + (request + 1) * 0.0078125
-                        + (entry_index + 1) * 0.001953125
-                    )
-                    cmp_kv[rank, physical_block, row, 0, NOPE_DIM] = (
-                        (rank + 1) * 0.0625
-                        + (request + 1) * 0.015625
-                        + (entry_index + 1) * 0.00390625
-                    )
-                    cmp_kv[rank, physical_block, row, 0, NOPE_DIM + 1] = (
-                        -(logical_block + 1) * 0.0625
-                        + (rank + 1) * 0.0078125
-                        + (request + 1) * 0.001953125
-                    )
+                    col1_value = (rank + 1) * 0.03125 + (request + 1) * 0.0078125 + (entry_index + 1) * 0.001953125
+                    nope_value = (rank + 1) * 0.0625 + (request + 1) * 0.015625 + (entry_index + 1) * 0.00390625
+                    block_value = -(logical_block + 1) * 0.0625 + (rank + 1) * 0.0078125 + (request + 1) * 0.001953125
+                    cmp_kv[rank, physical_block, row, 0, 1] = col1_value
+                    cmp_kv[rank, physical_block, row, 0, NOPE_DIM] = nope_value
+                    cmp_kv[rank, physical_block, row, 0, NOPE_DIM + 1] = block_value
         return cmp_kv
 
     def init_cmp_block_table():
@@ -659,9 +649,8 @@ def build_tp_tensor_specs(local_t):
             for request in range(local_batch):
                 request_block_base = request * FIXTURE_CMP_LOGICAL_BLOCKS
                 for logical_block in range(FIXTURE_CMP_LOGICAL_BLOCKS):
-                    table[rank, request, logical_block] = (
-                        request_block_base + FIXTURE_CMP_LOGICAL_BLOCKS - 1 - logical_block
-                    )
+                    physical_block = request_block_base + FIXTURE_CMP_LOGICAL_BLOCKS - 1 - logical_block
+                    table[rank, request, logical_block] = physical_block
         return table
 
     def init_idx_topk():
@@ -704,19 +693,12 @@ def build_tp_tensor_specs(local_t):
             for local_group in range(LOCAL_O_GROUPS):
                 shard_scale = (rank + 1) * (local_group + 1) * 0.125
                 for head in range(HEADS_PER_GROUP):
-                    wo_a[rank, local_group, head, head * HEAD_DIM] = shard_scale * (head + 1)
-                    wo_a[
-                        rank, local_group, HEADS_PER_GROUP + head,
-                        head * HEAD_DIM + 1,
-                    ] = shard_scale * (head + 1) * 0.75
-                    wo_a[
-                        rank, local_group, 2 * HEADS_PER_GROUP + head,
-                        head * HEAD_DIM + NOPE_DIM,
-                    ] = -shard_scale * (head + 1) * 0.5
-                    wo_a[
-                        rank, local_group, 3 * HEADS_PER_GROUP + head,
-                        head * HEAD_DIM + NOPE_DIM + 1,
-                    ] = shard_scale * (head + 1) * 0.25
+                    head_col = head * HEAD_DIM
+                    head_scale = shard_scale * (head + 1)
+                    wo_a[rank, local_group, head, head_col] = head_scale
+                    wo_a[rank, local_group, HEADS_PER_GROUP + head, head_col + 1] = head_scale * 0.75
+                    wo_a[rank, local_group, 2 * HEADS_PER_GROUP + head, head_col + NOPE_DIM] = -head_scale * 0.5
+                    wo_a[rank, local_group, 3 * HEADS_PER_GROUP + head, head_col + NOPE_DIM + 1] = head_scale * 0.25
         return wo_a
 
     def init_wo_b():
@@ -1083,9 +1065,7 @@ def build_tensor_specs(start_pos=None, batch=B):
     def init_x_hc():
         return torch.empty(tokens, HC_MULT, D).uniform_(-1, 1)
 
-    # Real layer-8 (CSA, ratio-4) hc_attn scale/base (fn synthetic at real magnitude). A
-    # synthetic scale=0.5/base=0 leaves hc_pre post~=1 + near-uniform comb, cancelling attn_out
-    # and the hc residual to near-zero in x_out where W8A8 noise blows up the relative tail.
+    # Real layer-8 (CSA, ratio-4) hc_attn scale/base; fn is synthetic at the real magnitude.
     def init_hc_attn_fn():
         return torch.randn(MIX_HC, HC_DIM) * 0.0519
 
@@ -1417,12 +1397,13 @@ if __name__ == "__main__":
     from pypto.ir.distributed_compiled_program import DistributedConfig
 
     parser = argparse.ArgumentParser()
-    parser.add_argument("-p", "--platform", type=str, default="a2a3",
-                        choices=["a2a3", "a2a3sim", "a5", "a5sim"])
-    parser.add_argument("--tp", type=int, default=TP_SIZE, choices=list(_TP_CHOICES),
-                        help="tensor-parallel world size")
-    parser.add_argument("-d", "--device", type=str, default=",".join(str(rank) for rank in range(TP_SIZE)),
-                        help=f"comma-separated device ids; need exactly {TP_SIZE}")
+    default_devices = ",".join(str(rank) for rank in range(TP_SIZE))
+    parser.add_argument("-p", "--platform", type=str, default="a2a3", choices=["a2a3", "a2a3sim", "a5", "a5sim"])
+    parser.add_argument("--tp", type=int, default=TP_SIZE, choices=list(_TP_CHOICES), help="tensor-parallel world size")
+    parser.add_argument(
+        "-d", "--device", type=str, default=default_devices,
+        help=f"comma-separated device ids; need exactly {TP_SIZE}",
+    )
     parser.add_argument("--case", choices=("all", "max", "subcapacity"), default="all")
     parser.add_argument("--compile-only", action="store_true", default=False)
     parser.add_argument("--dump-passes", action="store_true", default=False)

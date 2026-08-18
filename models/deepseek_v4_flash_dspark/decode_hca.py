@@ -84,6 +84,9 @@ from decode_sparse_attn_hca import (
 # Dynamic shape variables.
 B_DYN = pl.dynamic("B_DYN")  # per-request axis
 T_DYN = pl.dynamic("T_DYN")  # T = B * S
+ORI_BLOCK_NUM_DYN = pl.dynamic("ORI_BLOCK_NUM_DYN")
+CMP_BLOCK_NUM_DYN = pl.dynamic("CMP_BLOCK_NUM_DYN")
+COMPRESS_STATE_BLOCK_NUM_DYN = pl.dynamic("HCA_STATE_BLOCK_NUM_DYN")
 
 
 # model config
@@ -117,20 +120,16 @@ COFF = 1 + int(OVERLAP)         # always 1 for HCA
 MAIN_OUT_DIM = COFF * HEAD_DIM
 ORI_MAX_BLOCKS = KV_ORI_MAX_BLOCKS
 ORI_BLOCK_NUM = KV_ORI_BLOCK_NUM
-ORI_BLOCK_NUM_DYN = pl.dynamic("ORI_BLOCK_NUM_DYN")
 CMP_MAX_BLOCKS = KV_CMP_MAX_BLOCKS
 CMP_BLOCK_NUM = KV_CMP_BLOCK_NUM
-CMP_BLOCK_NUM_DYN = pl.dynamic("CMP_BLOCK_NUM_DYN")
 # Main compressor state pool (kv + score channels merged into one paged FP32 buffer).
 COMPRESS_STATE_BLOCK_SIZE = C128_COMPRESSOR_BLOCK_SIZE
 COMPRESS_STATE_PHYSICAL_BLOCKS = HCA_STATE_PHYSICAL_BLOCKS
 COMPRESS_STATE_MAX_BLOCKS = (MAX_SEQ_LEN + COMPRESS_STATE_BLOCK_SIZE - 1) // COMPRESS_STATE_BLOCK_SIZE
 COMPRESS_STATE_BLOCK_NUM = COMPRESS_STATE_PHYSICAL_BLOCKS
-COMPRESS_STATE_BLOCK_NUM_DYN = pl.dynamic("HCA_STATE_BLOCK_NUM_DYN")
 COMPRESS_STATE_DIM = 2 * MAIN_OUT_DIM
 COMPRESS_TOPK = MAX_SEQ_LEN // COMPRESS_RATIO   # demo 32; flash 128 (= 16384/128); max compressed positions
-# HCA has no indexer: the compressed tail is every slot the cache holds, so the
-# only bound is the cache capacity (`index_topk` belongs to the ratio-4 indexer).
+# HCA has no indexer; the compressed tail is bounded by cache capacity.
 # Longest context served = COMPRESS_TOPK * COMPRESS_RATIO = MAX_SEQ_LEN.
 HCA_TOPK_LIMIT = COMPRESS_TOPK
 
@@ -142,29 +141,10 @@ SPARSE_ROPE_INTERLEAVE_TILE = 2 * SPARSE_ROPE_TILE
 HCA_TOPK_TOKEN_TILE = 8   # tokens per cache-window topk SPMD block
 HCA_WB_TOKEN_TILE = 8  # tokens per cache-writeback SPMD block
 
-# fixture
-FIXTURE_WINDOW_BLOCKS = (WIN + BLOCK_SIZE - 1) // BLOCK_SIZE
-FIXTURE_CMP_SLOTS = (0, 31, 32, 63, 64, 95, 96, 127)
-FIXTURE_CMP_LOGICAL_BLOCKS = (max(FIXTURE_CMP_SLOTS) + 1 + BLOCK_SIZE - 1) // BLOCK_SIZE
-FIXTURE_CMP_BLOCKS_PER_RANK = CMP_BLOCK_NUM // TP_SIZE
-FIXTURE_OUTPUT_SENTINEL = -7.0
-
 if T != LOCAL_T:
     raise ValueError(f"HCA token capacity {T} must equal TP local token capacity {LOCAL_T}")
 if T_PAD != LOCAL_T_PAD:
     raise ValueError(f"HCA token capacity {T_PAD} must equal TP local token capacity {LOCAL_T_PAD}")
-if max(FIXTURE_CMP_SLOTS) >= CMP_TOPK:
-    raise ValueError("HCA fixture compressed slots exceed the configured top-k capacity")
-if FIXTURE_WINDOW_BLOCKS > ORI_BLOCK_NUM:
-    raise ValueError("HCA fixture window exceeds the original KV cache capacity")
-if FIXTURE_CMP_LOGICAL_BLOCKS > CMP_MAX_BLOCKS:
-    raise ValueError("HCA fixture compressed slots exceed the compressed block table")
-if CMP_BLOCK_NUM % TP_SIZE != 0:
-    raise ValueError("HCA fixture requires equal compressed-cache partitions across TP ranks")
-if (LOCAL_T // S) * FIXTURE_CMP_LOGICAL_BLOCKS > FIXTURE_CMP_BLOCKS_PER_RANK:
-    raise ValueError("HCA fixture compressed-cache partition is too small for the local requests")
-if O_LORA < 3 * HEADS_PER_GROUP:
-    raise ValueError("HCA fixture output projection needs three observable rows per local head")
 
 
 @pl.jit
@@ -334,10 +314,7 @@ def decode_hca_tp1(
     rope_sin_t = pl.create_tensor([t_dim, ROPE_HEAD_DIM], dtype=pl.BF16)
     cmp_cos = pl.create_tensor([B, ROPE_HEAD_DIM // 2], dtype=pl.FP32)
     cmp_sin = pl.create_tensor([B, ROPE_HEAD_DIM // 2], dtype=pl.FP32)
-    # Interleave-duplicated / sign-folded compressed-position rope rows. The ratio-128
-    # compressor's rmsnorm_rope_cache_write rebuilt this j>>1 dup-gather itself; pl.gather
-    # lowers to a per-row TGATHER loop, so it is hoisted here (once, B rows) and read as a
-    # plain load downstream.
+    # Interleave-duplicated / sign-folded compressed-position rope rows, built once over B rows.
     cmp_cos_il = pl.create_tensor([B, ROPE_HEAD_DIM], dtype=pl.FP32)
     cmp_sin_signed = pl.create_tensor([B, ROPE_HEAD_DIM], dtype=pl.FP32)
     with pl.at(level=pl.Level.CORE_GROUP, name_hint="hca_rope"):
@@ -362,7 +339,7 @@ def decode_hca_tp1(
 
     x_normed = pl.create_tensor([t_dim, D], dtype=pl.BF16)
     rms_tid = rms_norm(x_mixed, attn_norm_w, x_normed)
-    # Defers kv_proj_matmul one hop behind rms_norm so qr_proj_matmul dispatches first.
+    # Dispatch barrier: kv_proj_matmul resolves one hop after rms_norm.
     late_dep = pl.system.task_dummy(deps=[rms_tid])
     q = pl.create_tensor([t_dim, H, HEAD_DIM], dtype=pl.BF16)
     kv = pl.create_tensor([t_dim, HEAD_DIM], dtype=pl.BF16)
@@ -395,11 +372,8 @@ def decode_hca_tp1(
         late_dep,
     )
 
-    # Sparse-index build fanned out over an SPMD (8 tokens/block) instead of one
-    # serial CORE_GROUP loop. The two window-slot abs_pos branches collapse into
-    # one: column k -> ring slot k, live iff k <= abs_pos. sparse_attn pairs each
-    # K/V by its stored raw value (order-agnostic), so the full-ring rotation is
-    # dead. The compressed-slot ramp is fused into the same block.
+    # Sparse-index build over an SPMD of 8 tokens per block: window column k -> ring
+    # slot k, live iff k <= abs_pos, with the compressed-slot ramp fused into the same block.
     attn_out = pl.create_tensor([t_dim, D], dtype=pl.BF16)
     topk_all = pl.create_tensor([t_dim, HCA_CMP_TOPK], dtype=pl.INT32)
     for topk_block in pl.spmd(topk_blocks, name_hint="hca_cache_topk"):
@@ -504,6 +478,27 @@ def decode_hca_tp1_test(
     return x_out
 
 
+# fixture
+FIXTURE_WINDOW_BLOCKS = (WIN + BLOCK_SIZE - 1) // BLOCK_SIZE
+FIXTURE_CMP_SLOTS = (0, 31, 32, 63, 64, 95, 96, 127)
+FIXTURE_CMP_LOGICAL_BLOCKS = (max(FIXTURE_CMP_SLOTS) + 1 + BLOCK_SIZE - 1) // BLOCK_SIZE
+FIXTURE_CMP_BLOCKS_PER_RANK = CMP_BLOCK_NUM // TP_SIZE
+FIXTURE_OUTPUT_SENTINEL = -7.0
+
+if max(FIXTURE_CMP_SLOTS) >= CMP_TOPK:
+    raise ValueError("HCA fixture compressed slots exceed the configured top-k capacity")
+if FIXTURE_WINDOW_BLOCKS > ORI_BLOCK_NUM:
+    raise ValueError("HCA fixture window exceeds the original KV cache capacity")
+if FIXTURE_CMP_LOGICAL_BLOCKS > CMP_MAX_BLOCKS:
+    raise ValueError("HCA fixture compressed slots exceed the compressed block table")
+if CMP_BLOCK_NUM % TP_SIZE != 0:
+    raise ValueError("HCA fixture requires equal compressed-cache partitions across TP ranks")
+if (LOCAL_T // S) * FIXTURE_CMP_LOGICAL_BLOCKS > FIXTURE_CMP_BLOCKS_PER_RANK:
+    raise ValueError("HCA fixture compressed-cache partition is too small for the local requests")
+if O_LORA < 3 * HEADS_PER_GROUP:
+    raise ValueError("HCA fixture output projection needs three observable rows per local head")
+
+
 def build_tp_tensor_specs(local_t):
     """Build deterministic tensor-parallel HCA output inputs."""
     import torch
@@ -551,16 +546,10 @@ def build_tp_tensor_specs(local_t):
                     row = cmp_slot % BLOCK_SIZE
                     cmp_kv[rank, physical_block, row, 0, :] = 0.0
                     cmp_kv[rank, physical_block, row, 0, 0] = 0.25
-                    cmp_kv[rank, physical_block, row, 0, NOPE_DIM] = (
-                        (rank + 1) * 0.0625
-                        + (request + 1) * 0.015625
-                        + (slot_index + 1) * 0.00390625
-                    )
-                    cmp_kv[rank, physical_block, row, 0, NOPE_DIM + 1] = (
-                        -(logical_block + 1) * 0.0625
-                        + (rank + 1) * 0.0078125
-                        + (request + 1) * 0.001953125
-                    )
+                    nope_value = (rank + 1) * 0.0625 + (request + 1) * 0.015625 + (slot_index + 1) * 0.00390625
+                    block_value = -(logical_block + 1) * 0.0625 + (rank + 1) * 0.0078125 + (request + 1) * 0.001953125
+                    cmp_kv[rank, physical_block, row, 0, NOPE_DIM] = nope_value
+                    cmp_kv[rank, physical_block, row, 0, NOPE_DIM + 1] = block_value
         return cmp_kv
 
     def init_cmp_block_table():
@@ -570,9 +559,8 @@ def build_tp_tensor_specs(local_t):
             for request in range(local_batch):
                 request_block_base = rank_block_base + request * FIXTURE_CMP_LOGICAL_BLOCKS
                 for logical_block in range(FIXTURE_CMP_LOGICAL_BLOCKS):
-                    table[rank, request, logical_block] = (
-                        request_block_base + FIXTURE_CMP_LOGICAL_BLOCKS - 1 - logical_block
-                    )
+                    physical_block = request_block_base + FIXTURE_CMP_LOGICAL_BLOCKS - 1 - logical_block
+                    table[rank, request, logical_block] = physical_block
         return table
 
     def init_cmp_sparse_indices():
@@ -606,15 +594,11 @@ def build_tp_tensor_specs(local_t):
             for local_group in range(LOCAL_O_GROUPS):
                 shard_scale = (rank + 1) * (local_group + 1) * 0.125
                 for head in range(HEADS_PER_GROUP):
-                    wo_a[rank, local_group, head, head * HEAD_DIM] = shard_scale * (head + 1)
-                    wo_a[
-                        rank, local_group, HEADS_PER_GROUP + head,
-                        head * HEAD_DIM + NOPE_DIM,
-                    ] = shard_scale * (head + 1) * 0.75
-                    wo_a[
-                        rank, local_group, 2 * HEADS_PER_GROUP + head,
-                        head * HEAD_DIM + NOPE_DIM + 1,
-                    ] = -shard_scale * (head + 1) * 0.5
+                    head_col = head * HEAD_DIM
+                    head_scale = shard_scale * (head + 1)
+                    wo_a[rank, local_group, head, head_col] = head_scale
+                    wo_a[rank, local_group, HEADS_PER_GROUP + head, head_col + NOPE_DIM] = head_scale * 0.75
+                    wo_a[rank, local_group, 2 * HEADS_PER_GROUP + head, head_col + NOPE_DIM + 1] = -head_scale * 0.5
         return wo_a
 
     def init_wo_b():
@@ -797,7 +781,7 @@ def golden_decode_hca_tp1(tensors):
         "comb": comb_t,
     })
 
-    # ===== Attention.forward, ratio==128 branch =====
+    # Attention.forward, ratio==128 branch
     position_ids = tensors["position_ids"].to(torch.int64)
     kv_seq_lens = tensors["kv_seq_lens"].to(torch.int64)
     ratio = COMPRESS_RATIO
@@ -919,7 +903,7 @@ def golden_decode_hca_tp1(tensors):
 
 def build_tensor_specs(start_pos=None, batch=B):
     tokens = batch * S
-    import torch  # type: ignore[import]
+    import torch
     from utils import (
         block_table,
         compressed_slot_mapping,
@@ -956,9 +940,7 @@ def build_tensor_specs(start_pos=None, batch=B):
 
     def init_x_hc():
         return torch.empty(tokens, HC_MULT, D).uniform_(-1, 1)
-    # Real layer-9 (HCA, ratio-128) hc_attn scale/base (fn synthetic at real magnitude). A
-    # synthetic scale=0.5/base=0 leaves hc_pre post~=1 + near-uniform comb, cancelling attn_out
-    # and the hc residual to near-zero in x_out where W8A8 noise blows up the relative tail.
+    # Real layer-9 (HCA, ratio-128) hc_attn scale/base; fn is synthetic at the real magnitude.
     def init_hc_attn_fn():
         return torch.randn(MIX_HC, HC_DIM) * 0.0495
     def init_hc_attn_scale():
@@ -1130,12 +1112,13 @@ if __name__ == "__main__":
     from pypto.ir.distributed_compiled_program import DistributedConfig
 
     parser = argparse.ArgumentParser()
-    parser.add_argument("-p", "--platform", type=str, default="a2a3",
-                        choices=["a2a3", "a2a3sim", "a5", "a5sim"])
-    parser.add_argument("--tp", type=int, default=TP_SIZE, choices=list(_TP_CHOICES),
-                        help="tensor-parallel world size")
-    parser.add_argument("-d", "--device", type=str, default=",".join(str(rank) for rank in range(TP_SIZE)),
-                        help=f"comma-separated device ids; need exactly {TP_SIZE}")
+    default_devices = ",".join(str(rank) for rank in range(TP_SIZE))
+    parser.add_argument("-p", "--platform", type=str, default="a2a3", choices=["a2a3", "a2a3sim", "a5", "a5sim"])
+    parser.add_argument("--tp", type=int, default=TP_SIZE, choices=list(_TP_CHOICES), help="tensor-parallel world size")
+    parser.add_argument(
+        "-d", "--device", type=str, default=default_devices,
+        help=f"comma-separated device ids; need exactly {TP_SIZE}",
+    )
     parser.add_argument("--case", choices=("all", "max", "subcapacity"), default="all")
     parser.add_argument("--compile-only", action="store_true", default=False)
     parser.add_argument("--dump-passes", action="store_true", default=False)
