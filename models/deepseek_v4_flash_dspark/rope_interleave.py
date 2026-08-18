@@ -25,8 +25,8 @@ more in its compressor. This runs it once per layer over ``B_MAX`` rows instead.
 Folding the sign into sin here rather than at each consumer is exact: multiplying by
 +/-1 only flips the sign bit, so ``(x*sign)*sin`` and ``x*(sin*sign)`` are bit-identical.
 
-Phase A (Run 055) keeps the existing D-Spark ``B_DYN``/``B_MAX`` consumer ABI
-unchanged while adding a standalone active-row entry and device/golden harness.
+The active-row implementation below keeps the existing D-Spark
+``B_DYN``/``B_MAX`` consumer ABI unchanged.
 The harness covers position 0, the 128 boundary, 12K, 16K and the 1M tail
 without binding work to the maximum context capacity.
 """
@@ -82,7 +82,7 @@ def _rope_interleave_active_body(
     sin_signed: pl.Out[pl.Tensor[[ROWS_DYN, ROPE_HEAD_DIM], pl.FP32]],
     completion: pl.Array[1, pl.TASK_ID],
 ):
-    """Inline body for :func:`rope_interleave_active`.
+    """Inline active-row RoPE implementation.
 
     The active row count is a ``pl.dynamic`` axis, so it cannot be passed to
     ``pl.full`` (which needs a compile-time ``ConstInt`` shape). Following the
@@ -116,109 +116,3 @@ def _rope_interleave_active_body(
                 pl.gather(sin_half[r:r + 1, 0:HALF_ROPE], dim=-1, index=il_dup_idx), il_sign)
     completion[0] = rope_tid
     return cos_il, sin_signed
-
-
-@pl.jit
-def rope_interleave_active(
-    cos_half: pl.Tensor[[ROWS_DYN, HALF_ROPE], pl.FP32],
-    sin_half: pl.Tensor[[ROWS_DYN, HALF_ROPE], pl.FP32],
-    cos_il: pl.Out[pl.Tensor[[ROWS_DYN, ROPE_HEAD_DIM], pl.FP32]],
-    sin_signed: pl.Out[pl.Tensor[[ROWS_DYN, ROPE_HEAD_DIM], pl.FP32]],
-):
-    """Active-row counterpart of :func:`rope_interleave`.
-
-    The first dimension is the runtime active row count (number of token-local
-    RoPE rows actually consumed this step), not a fixed ``DECODE_BATCH``.
-    Used by the Phase A standalone harness to prove the work shape tracks the
-    active set, not the 1M ceiling nor a fixed B.
-
-    Thin ``@pl.jit`` compile entry that delegates to
-    :func:`_rope_interleave_active_body` (``@pl.jit.inline``), mirroring how
-    ``decode_metadata`` delegates to ``build_decode_metadata``.
-    """
-    completion = pl.array.create(1, pl.TASK_ID)
-    _rope_interleave_active_body(
-        cos_half, sin_half, cos_il, sin_signed, completion)
-    return cos_il, sin_signed
-
-
-# ---------------------------------------------------------------------------
-# Phase A standalone device/golden harness (run_055 plan §5 A5). Covers
-# position 0, 128 boundary, 12K, 16K, and the 1M tail (1M-2, 1M-1). The
-# active row count is exactly the number of positions exercised, never
-# padded to 1M nor fixed to DECODE_BATCH.
-# ---------------------------------------------------------------------------
-
-def _rope_positions_case(case: str) -> list[int]:
-    if case == "position_boundaries":
-        return [0, 127, 128, 129, 12287, 16383, 16384, M.max_position_embeddings - 2, M.max_position_embeddings - 1]
-    raise ValueError(f"unknown rope_interleave case: {case!r}")
-
-
-def _golden_rope_interleave(scratch):
-    """Reference: interleave half-width cos/sin to full width with sign fold.
-
-    Conforms to the golden-runner contract: read inputs from / write outputs
-    back into the ``scratch`` dict keyed by the TensorSpec names
-    (``cos_half``, ``sin_half`` -> ``cos_il``, ``sin_signed``).
-    """
-    import torch
-    cos_half = scratch["cos_half"].to(torch.float32)
-    sin_half = scratch["sin_half"].to(torch.float32)
-    n, half = cos_half.shape
-    full = 2 * half
-    j = torch.arange(full, dtype=torch.float32)
-    dup = (j // 2).to(torch.int64)
-    sign = torch.where(j % 2 == 0, -1.0, 1.0).to(torch.float32)
-    scratch["cos_il"] = torch.gather(cos_half, 1, dup.unsqueeze(0).expand(n, full)).contiguous()
-    scratch["sin_signed"] = (torch.gather(sin_half, 1, dup.unsqueeze(0).expand(n, full)) * sign).contiguous()
-
-
-def build_rope_interleave_specs(case: str):
-    import torch
-    from golden import TensorSpec
-    from config import FLASH as CFG
-    from utils import token_local_rope
-
-    positions = _rope_positions_case(case)
-    n = len(positions)
-    dim = CFG.qk_rope_head_dim
-    pos_t = torch.tensor(positions, dtype=torch.int32)
-    cos_full, sin_full = token_local_rope(
-        CFG, compress_ratio=0, position_ids=pos_t, rope_dim=dim,
-    )
-    half = dim // 2
-    cos_half = cos_full[:, :half].contiguous()
-    sin_half = sin_full[:, :half].contiguous()
-    specs = [
-        TensorSpec("cos_half", [n, half], torch.float32, init_value=cos_half),
-        TensorSpec("sin_half", [n, half], torch.float32, init_value=sin_half),
-        TensorSpec("cos_il", [n, dim], torch.float32, is_output=True),
-        TensorSpec("sin_signed", [n, dim], torch.float32, is_output=True),
-    ]
-    return specs
-
-
-if __name__ == "__main__":
-    import argparse
-    from golden import run_jit
-
-    parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("-p", "--platform", default="a2a3",
-                        choices=["a2a3", "a2a3sim", "a5", "a5sim"])
-    parser.add_argument("-d", "--device", type=int, default=0)
-    parser.add_argument("--compile-only", action="store_true")
-    parser.add_argument("--case", choices=["position_boundaries"], default="position_boundaries")
-    args = parser.parse_args()
-
-    result = run_jit(
-        fn=rope_interleave_active,
-        specs=build_rope_interleave_specs(args.case),
-        golden_fn=_golden_rope_interleave,
-        compile_only=args.compile_only,
-        runtime_cfg={"platform": args.platform, "device_id": args.device},
-    )
-    if not result.passed:
-        if result.error:
-            print(result.error)
-        raise SystemExit(1)

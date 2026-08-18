@@ -864,11 +864,6 @@ def build_swa_ring(
     )
 
 
-# Compatibility aliases for callers that imported the pre-block-32 helper.
-SwaOnePageRingFixture = SwaRingFixture
-build_swa_one_page_ring = build_swa_ring
-
-
 def swa_request_query_offsets(
     query_request_ids: torch.Tensor,
     *,
