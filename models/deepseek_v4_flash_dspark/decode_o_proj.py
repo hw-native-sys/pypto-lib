@@ -6,8 +6,33 @@
 # INCLUDING BUT NOT LIMITED TO NON-INFRINGEMENT, MERCHANTABILITY, OR FITNESS FOR A PARTICULAR PURPOSE.
 # See LICENSE in the root of the software repository for the full text of the License.
 # -----------------------------------------------------------------------------------------------------------
-# ci: devices=4
+# ci: devices=2  # CI: 2-card run; borrows 2 cards via task-submit --device-num
 """DeepSeek-V4 decode output projections and their TP communication."""
+
+import sys
+
+import config
+
+
+# TP-derived shapes freeze at import time, so select the TP world before the
+# config read below.
+_TP_CHOICES = (1, 2, 4)
+_TP_DEFAULT = 2
+
+
+def _parse_tp_argv():
+    for index, arg in enumerate(sys.argv):
+        if arg == "--tp" and index + 1 < len(sys.argv):
+            return int(sys.argv[index + 1])
+        if arg.startswith("--tp="):
+            return int(arg.split("=", 1)[1])
+    return _TP_DEFAULT
+
+
+TP_SIZE = _parse_tp_argv()
+if TP_SIZE not in _TP_CHOICES:
+    raise ValueError(f"--tp must be one of {_TP_CHOICES} (got {TP_SIZE})")
+config.TP = TP_SIZE
 
 import pypto.language as pl
 import pypto.language.distributed as pld
@@ -17,12 +42,8 @@ from config import (
     FLASH as M,
     INT8_AMAX_EPS,
     INT8_SCALE_MAX,
-    TP,
 )
 
-
-# parallel layout
-TP_SIZE = TP
 
 # model config
 D = M.hidden_size
@@ -734,6 +755,7 @@ if __name__ == "__main__":
 
     parser = argparse.ArgumentParser()
     parser.add_argument("-p", "--platform", type=str, default="a2a3", choices=("a2a3", "a2a3sim", "a5", "a5sim"))
+    parser.add_argument("--tp", type=int, default=TP_SIZE, choices=list(_TP_CHOICES), help="tensor-parallel world size")
     parser.add_argument("-d", "--device", type=str, default=",".join(str(i) for i in range(TP_SIZE)))
     parser.add_argument("--mode", choices=("all", "collectives", "sharded"), default="all")
     parser.add_argument(
@@ -751,6 +773,9 @@ if __name__ == "__main__":
     )
     parser.add_argument("--dump-passes", action="store_true", default=False)
     args = parser.parse_args()
+
+    if args.tp != TP_SIZE:
+        parser.error(f"--tp must remain {TP_SIZE} after import-time specialization")
 
     device_ids = [int(device) for device in args.device.split(",")]
     if args.mode in ("all", "collectives") and len(device_ids) != TP_SIZE:

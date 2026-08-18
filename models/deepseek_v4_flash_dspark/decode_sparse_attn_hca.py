@@ -25,10 +25,7 @@ from config import (
     KV_ORI_BLOCK_NUM,
     KV_CMP_MAX_BLOCKS,
     KV_ORI_MAX_BLOCKS,
-    INT8_SCALE_MAX,
-    INT8_AMAX_EPS,
 )
-from decode_o_proj import decode_o_proj_tp1
 
 
 # Dynamic shape variables.
@@ -386,10 +383,7 @@ def sparse_attn_hca_test(
     attn_sink: pl.Tensor[[H], pl.FP32],
     freqs_cos: pl.Tensor[[T_DYN, ROPE_DIM], pl.BF16],
     freqs_sin: pl.Tensor[[T_DYN, ROPE_DIM], pl.BF16],
-    wo_a: pl.Tensor[[O_GROUPS, O_LORA, O_GROUP_IN], pl.BF16],
-    wo_b: pl.Tensor[[D, O_GROUPS * O_LORA], pl.INT8],
-    wo_b_scale: pl.Tensor[[D], pl.FP32],
-    attn_out: pl.Out[pl.Tensor[[T_DYN, D], pl.BF16]],
+    o_packed_heads: pl.Out[pl.Tensor[[O_GROUPS, T_PAD, O_GROUP_IN], pl.BF16]],
 ):
     q.bind_dynamic(0, T_DYN)
     cmp_block_table.bind_dynamic(0, B_DYN)
@@ -397,25 +391,19 @@ def sparse_attn_hca_test(
     cmp_sparse_indices.bind_dynamic(0, T_DYN)
     freqs_cos.bind_dynamic(0, T_DYN)
     freqs_sin.bind_dynamic(0, T_DYN)
-    attn_out.bind_dynamic(0, T_DYN)
 
-    o_packed_heads = pl.create_tensor([O_GROUPS * T_PAD, O_GROUP_IN], dtype=pl.BF16)
-    o_packed_heads, heads_dep = sparse_attn_hca(
+    o_packed_flat = pl.reshape(o_packed_heads, [O_GROUPS * T_PAD, O_GROUP_IN])
+    o_packed_flat, _ = sparse_attn_hca(
         q, ori_kv, window_swa_indices,
         cmp_kv, cmp_block_table, cmp_sparse_indices,
         attn_sink, freqs_cos, freqs_sin,
-        o_packed_heads,
+        o_packed_flat,
     )
-    attn_out = decode_o_proj_tp1(
-        o_packed_heads,
-        wo_a, wo_b, wo_b_scale,
-        attn_out, heads_dep,
-    )
-    return attn_out
+    return o_packed_heads
 
 
 def golden_sparse_attn(tensors):
-    """Torch reference: sparse_attn decode path followed by grouped o_proj."""
+    """Torch reference for the HCA sparse-attention heads."""
     import torch
 
     q = tensors["q"].float()
@@ -429,9 +417,6 @@ def golden_sparse_attn(tensors):
     attn_sink = tensors["attn_sink"].float()
     cos = tensors["freqs_cos"].float()
     sin = tensors["freqs_sin"].float()
-    wo_a = tensors["wo_a"].float()
-    wo_b_i8 = tensors["wo_b"]
-    wo_b_scale = tensors["wo_b_scale"].float()
 
     o = torch.zeros(tokens, H, HEAD_DIM)
 
@@ -516,27 +501,10 @@ def golden_sparse_attn(tensors):
     o_rope = torch.stack([inv_even, inv_odd], dim=-1).flatten(-2)
     o = torch.cat([o[..., :NOPE_DIM], o_rope], dim=-1).to(torch.bfloat16)
 
-    seq_per_batch = tokens // batch
-    o_model = o.float().view(batch, seq_per_batch, O_GROUPS, O_GROUP_IN)
-    o_r = torch.einsum("bsgd,grd->bsgr", o_model, wo_a)
-    # PER-GROUP INT8 activation quant (one amax per O_LORA group, not per full row):
-    # this localizes the reduction so proj_a[g]->quant[g]->proj_b[g] can pipeline
-    # back-to-back. Each group's INT32 partial is dequantized by its OWN per-row
-    # activation scale before the groups are summed (the per-group scale cannot
-    # factor out of the K-sum), then the per-channel weight scale is applied.
-    o_r_g = o_r.reshape(tokens, O_GROUPS, O_LORA)
-    amax_g = o_r_g.abs().amax(dim=-1, keepdim=True).clamp_min(INT8_AMAX_EPS)   # [tokens, G, 1]
-    scale_q_g = INT8_SCALE_MAX / amax_g
-    o_r_i8_g = torch.round(o_r_g * scale_q_g).to(torch.int32).to(torch.float16).to(torch.int8)
-    scale_dq_g = 1.0 / scale_q_g                                              # [tokens, G, 1]
-    wo_b_g = wo_b_i8.reshape(D, O_GROUPS, O_LORA)
-    out = torch.zeros(tokens, D, dtype=torch.float32)
-    for g in range(O_GROUPS):
-        p_g = o_r_i8_g[:, g].to(torch.int32) @ wo_b_g[:, g].to(torch.int32).T   # [tokens, D]
-        out = out + p_g.float() * scale_dq_g[:, g]                             # per-row group scale
-    out = out * wo_b_scale.unsqueeze(0)                                        # per-channel weight scale
-
-    tensors["attn_out"][:] = out.to(torch.bfloat16)
+    # Pack as [group, T_PAD, group-input]; rows past the runtime token count are
+    # capacity padding the kernel never writes.
+    packed = tensors["o_packed_heads"]
+    packed[:, :tokens] = o.float().view(tokens, O_GROUPS, O_GROUP_IN).permute(1, 0, 2).to(torch.bfloat16)
 
 def build_tensor_specs(
     causal_regression_fixture: bool = False,
@@ -548,7 +516,7 @@ def build_tensor_specs(
     """Build deterministic demo tensors for the HCA standalone harness."""
     import torch
     from golden import TensorSpec
-    from utils import block_table, quant_w_per_channel
+    from utils import block_table
 
     tokens = batch * S
 
@@ -634,21 +602,6 @@ def build_tensor_specs(
         sin_half = torch.sin(angles)
         return torch.cat([sin_half, sin_half], dim=-1)
 
-    def init_wo_a():
-        """Initialize the grouped first-stage output-projection weights."""
-        return (torch.rand(O_GROUPS, O_LORA, O_GROUP_IN) - 0.5) / (O_GROUP_IN ** 0.5)
-
-    wo_b_bf16 = ((torch.rand(D, O_GROUPS * O_LORA) - 0.5) / ((O_GROUPS * O_LORA) ** 0.5)).to(torch.bfloat16)
-    wo_b_i8, wo_b_scale = quant_w_per_channel(wo_b_bf16)
-
-    def init_wo_b():
-        """Initialize the second-stage output-projection weights in per-channel INT8 form."""
-        return wo_b_i8
-
-    def init_wo_b_scale():
-        """Initialize the dequant scales paired with the INT8 second-stage weights."""
-        return wo_b_scale
-
     return [
         TensorSpec("q", [tokens, H, HEAD_DIM], torch.bfloat16, init_value=init_q),
         TensorSpec("ori_kv", [ORI_BLOCK_NUM, BLOCK_SIZE, 1, HEAD_DIM], torch.bfloat16, init_value=init_ori_kv),
@@ -659,10 +612,7 @@ def build_tensor_specs(
         TensorSpec("attn_sink", [H], torch.float32, init_value=init_attn_sink),
         TensorSpec("freqs_cos", [tokens, ROPE_DIM], torch.bfloat16, init_value=init_cos),
         TensorSpec("freqs_sin", [tokens, ROPE_DIM], torch.bfloat16, init_value=init_sin),
-        TensorSpec("wo_a", [O_GROUPS, O_LORA, O_GROUP_IN], torch.bfloat16, init_value=init_wo_a),
-        TensorSpec("wo_b", [D, O_GROUPS * O_LORA], torch.int8, init_value=init_wo_b),
-        TensorSpec("wo_b_scale", [D], torch.float32, init_value=init_wo_b_scale),
-        TensorSpec("attn_out", [tokens, D], torch.bfloat16, is_output=True),
+        TensorSpec("o_packed_heads", [O_GROUPS, T_PAD, O_GROUP_IN], torch.bfloat16, is_output=True),
     ]
 
 
@@ -720,7 +670,10 @@ if __name__ == "__main__":
         rtol=1e-3,
         atol=1e-3,
         compare_fn={
-            "attn_out": ratio_allclose(atol=1e-4, rtol=1.0 / 128),
+            "o_packed_heads": ratio_allclose(
+                atol=1e-4, rtol=1.0 / 128,
+                valid_rows=args.batch * S, valid_axis=1,
+            ),
         },
     )
     if not result.passed:
