@@ -107,7 +107,7 @@ assert BLOCK_SIZE % GATHER_RUN == 0, "a contiguous run must not straddle two pag
 
 
 @pl.jit.inline
-def sparse_attn_hca_heads(
+def sparse_attn_hca(
     q: pl.Tensor[[T_DYN, H, HEAD_DIM], pl.BF16],
     ori_kv: pl.Tensor[[ORI_BLOCK_NUM_DYN, BLOCK_SIZE, 1, HEAD_DIM], pl.BF16],
     window_swa_indices: pl.Tensor[[T_DYN, WIN], pl.INT32],
@@ -375,40 +375,8 @@ def sparse_attn_hca_heads(
     return o_packed_heads, merge_tid
 
 
-@pl.jit.inline
-def sparse_attn_hca(
-    q: pl.Tensor[[T_DYN, H, HEAD_DIM], pl.BF16],
-    ori_kv: pl.Tensor[[ORI_BLOCK_NUM_DYN, BLOCK_SIZE, 1, HEAD_DIM], pl.BF16],
-    window_swa_indices: pl.Tensor[[T_DYN, WIN], pl.INT32],
-    cmp_kv: pl.Tensor[[CMP_BLOCK_NUM_DYN, BLOCK_SIZE, 1, HEAD_DIM], pl.BF16],
-    cmp_block_table: pl.Tensor[[B_DYN, CMP_MAX_BLOCKS], pl.INT32],
-    cmp_sparse_indices: pl.Tensor[[T_DYN, CMP_TOPK], pl.INT32],
-    attn_sink: pl.Tensor[[H], pl.FP32],
-    freqs_cos: pl.Tensor[[T_DYN, ROPE_DIM], pl.BF16],
-    freqs_sin: pl.Tensor[[T_DYN, ROPE_DIM], pl.BF16],
-    wo_a: pl.Tensor[[O_GROUPS, O_LORA, O_GROUP_IN], pl.BF16],
-    wo_b: pl.Tensor[[D, O_GROUPS * O_LORA], pl.INT8],
-    wo_b_scale: pl.Tensor[[D], pl.FP32],
-    attn_out: pl.Tensor[[T_DYN, D], pl.BF16],
-):
-    """Compute HCA sparse attention and the grouped output projection."""
-    o_packed_heads = pl.create_tensor([O_GROUPS * T_PAD, O_GROUP_IN], dtype=pl.BF16)
-    o_packed_heads, heads_dep = sparse_attn_hca_heads(
-        q, ori_kv, window_swa_indices,
-        cmp_kv, cmp_block_table, cmp_sparse_indices,
-        attn_sink, freqs_cos, freqs_sin,
-        o_packed_heads,
-    )
-    attn_out = decode_o_proj_tp1(
-        o_packed_heads,
-        wo_a, wo_b, wo_b_scale,
-        attn_out, heads_dep,
-    )
-    return attn_out
-
-
 @pl.jit
-def sparse_attn_test(
+def sparse_attn_hca_test(
     q: pl.Tensor[[T_DYN, H, HEAD_DIM], pl.BF16],
     ori_kv: pl.Tensor[[ORI_BLOCK_NUM_DYN, BLOCK_SIZE, 1, HEAD_DIM], pl.BF16],
     window_swa_indices: pl.Tensor[[T_DYN, WIN], pl.INT32],
@@ -431,20 +399,17 @@ def sparse_attn_test(
     freqs_sin.bind_dynamic(0, T_DYN)
     attn_out.bind_dynamic(0, T_DYN)
 
-    sparse_attn_hca(
-        q,
-        ori_kv,
-        window_swa_indices,
-        cmp_kv,
-        cmp_block_table,
-        cmp_sparse_indices,
-        attn_sink,
-        freqs_cos,
-        freqs_sin,
-        wo_a,
-        wo_b,
-        wo_b_scale,
-        attn_out,
+    o_packed_heads = pl.create_tensor([O_GROUPS * T_PAD, O_GROUP_IN], dtype=pl.BF16)
+    o_packed_heads, heads_dep = sparse_attn_hca(
+        q, ori_kv, window_swa_indices,
+        cmp_kv, cmp_block_table, cmp_sparse_indices,
+        attn_sink, freqs_cos, freqs_sin,
+        o_packed_heads,
+    )
+    attn_out = decode_o_proj_tp1(
+        o_packed_heads,
+        wo_a, wo_b, wo_b_scale,
+        attn_out, heads_dep,
     )
     return attn_out
 
@@ -734,7 +699,7 @@ if __name__ == "__main__":
     print(f"compress_ratio={COMPRESS_RATIO} -> TOPK={TOPK} SPARSE_BLOCKS={SPARSE_BLOCKS} PADDED_TOPK={PADDED_TOPK}", flush=True)
 
     result = run_jit(
-        fn=sparse_attn_test,
+        fn=sparse_attn_hca_test,
         specs=build_tensor_specs(
             args.causal_regression_fixture,
             args.short_window_fixture,
