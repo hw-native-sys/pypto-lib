@@ -15,7 +15,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 import math
-from typing import Any, Callable, Sequence
+from typing import Any, Callable
 
 import torch
 
@@ -43,7 +43,6 @@ from config import (
     DECODE_START_POS,
     FLASH as M,
     HCA_COMPRESS_RATIO,
-    HCA_ROWS_PER_SHARD,
     HCA_STATE_ROWS_PER_REQUEST,
     HCA_STATE_PAGES_PER_REQUEST,
     INT8_AMAX_EPS,
@@ -52,7 +51,6 @@ from config import (
     SWA_PERSISTENT_PAGES_PER_REQUEST,
     SWA_PERSISTENT_ROWS_PER_REQUEST,
     SWA_SOURCE_INVALID,
-    SWA_WINDOW_ROWS,
 )
 
 
