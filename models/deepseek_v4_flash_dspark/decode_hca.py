@@ -41,7 +41,6 @@ import pypto.language.distributed as pld
 from config import (
     FLASH as M,
     DECODE_BATCH,
-    DECODE_LOCAL_REQUESTS,
     DECODE_SEQ,
     BLOCK_SIZE,
     C128_COMPRESSOR_BLOCK_SIZE,
@@ -82,6 +81,7 @@ from decode_sparse_attn_hca import (
     HCA_PAGES_DYN,
     HCA_REQUEST_OFFSETS_DYN,
     HCA_QUERY_OFFSETS_DYN,
+    sparse_attn_hca,
     sparse_attn_hca_heads,
 )
 
@@ -134,6 +134,11 @@ COMPRESS_STATE_BLOCK_NUM = COMPRESS_STATE_PHYSICAL_BLOCKS
 COMPRESS_STATE_DIM = 2 * MAIN_OUT_DIM
 COMPRESS_TOPK = MAX_SEQ_LEN // COMPRESS_RATIO
 CMP_TOPK = ((COMPRESS_TOPK + HCA_ROWS_PER_SHARD - 1) // HCA_ROWS_PER_SHARD) * HCA_ROWS_PER_SHARD
+# HCA has no learned indexer: its compressed tail is the complete ratio-128
+# cache capacity. Keep the baseline aliases used by the TP1 compatibility
+# path and its golden helper.
+HCA_TOPK_LIMIT = COMPRESS_TOPK
+HCA_CMP_TOPK = CMP_TOPK
 VALID_TOKEN_TILE = 8
 
 # tiling

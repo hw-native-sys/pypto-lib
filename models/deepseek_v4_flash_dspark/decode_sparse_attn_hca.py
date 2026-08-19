@@ -17,7 +17,6 @@ import pypto.language as pl
 from config import (
     BLOCK_SIZE,
     DECODE_BATCH,
-    DECODE_LOCAL_REQUESTS,
     DECODE_SEQ,
     FLASH as M,
     HCA_KV_POOL_BLOCKS,
