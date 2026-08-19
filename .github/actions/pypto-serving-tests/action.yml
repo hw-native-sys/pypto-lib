@@ -26,6 +26,14 @@ inputs:
     description: PTO2_RING_HEAP value for pypto-serving tests.
     required: false
     default: "1073741824"
+  deepseek-mtp-cases:
+    description: >-
+      Which DeepSeek MTP accuracy cases to run: "k1" runs the fused K=1 case
+      alone, "all" runs the whole accuracy file. Each on-device case starts its
+      own 8-card server, so "all" roughly doubles the device time; it also adds
+      the file's host-only unit tests, which "k1" skips.
+    required: false
+    default: "k1"
 
 runs:
   using: composite
@@ -129,7 +137,18 @@ runs:
         SERVING_WORKER_STEP_TIMEOUT: 1800
         PYPTO_LIB_CHECKOUT: ${{ inputs.pypto-lib-checkout-path }}
         PYPTO_SERVING_CHECKOUT: ${{ inputs.pypto-serving-checkout-path }}
+        MTP_CASES: ${{ inputs.deepseek-mtp-cases }}
       run: |
+        # "k1" selects the fused case by node id: one 8-card server start
+        # instead of two. A renamed case id makes pytest exit 4 (no tests ran)
+        # rather than silently widening the run.
+        test_file=tests/test_deepseek_v4_accuracy.py
+        mtp_test=test_deepseek_v4_http_completion_matches_expected_text
+        case "$MTP_CASES" in
+          k1)  pytest_target="'$test_file::$mtp_test[k1-fused]'" ;;
+          all) pytest_target="$test_file" ;;
+          *) echo "::error::unknown deepseek-mtp-cases '$MTP_CASES' (expected k1 or all)"; exit 1 ;;
+        esac
         source "$GITHUB_WORKSPACE/$PYPTO_LIB_CHECKOUT/activate.sh"
         run_cmd="source $GITHUB_WORKSPACE/$PYPTO_LIB_CHECKOUT/activate.sh"
         run_cmd="$run_cmd && cd $GITHUB_WORKSPACE/$PYPTO_SERVING_CHECKOUT"
@@ -144,7 +163,7 @@ runs:
         run_cmd="$run_cmd PTO2_STREAM_SYNC_TIMEOUT_MS=$PTO2_STREAM_SYNC_TIMEOUT_MS"
         run_cmd="$run_cmd PTO2_SCHEDULER_TIMEOUT_MS=$PTO2_SCHEDULER_TIMEOUT_MS"
         run_cmd="$run_cmd SERVING_WORKER_STEP_TIMEOUT=$SERVING_WORKER_STEP_TIMEOUT"
-        run_cmd="$run_cmd python -m pytest tests/test_deepseek_v4_accuracy.py -q -s"
+        run_cmd="$run_cmd python -m pytest $pytest_target -q -s"
         task-submit --device auto --device-num 8 --ignore-whitelist \
           --timeout 3600 --max-time 1800 \
           --run "$run_cmd"

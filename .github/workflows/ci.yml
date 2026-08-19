@@ -455,6 +455,9 @@ jobs:
           pypto-lib-checkout-path: checkout
           pypto-serving-checkout-path: serving-checkout
           model-name: deepseek-v4
+          # Only the fused K=1 case runs on device: the k3-s4-b4 case starts a
+          # second 8-card server for the same gate.
+          deepseek-mtp-cases: k1
           pto2-ring-dep-pool: "131072"
           pto2-ring-task-window: "131072"
           pto2-ring-heap: "2147483648"
