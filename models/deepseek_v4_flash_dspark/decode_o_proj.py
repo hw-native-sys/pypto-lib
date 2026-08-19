@@ -73,9 +73,10 @@ O_WINDOW_ROWS = TP_SIZE * LOCAL_T_PAD
 # local output projection tiling
 A_K_TILE = 256
 PROJ_A_MM_N_TILE = 128
-MM_T_TILE = T_PAD
 PROJ_A_ROW_TILE = 16
 B_K_TILE = 256
+# Keep the INT32 proj-b accumulator within the A2/A3 tile buffer.
+PROJ_B_MM_T_TILE = 128
 PROJ_B_MM_N_TILE = 256
 PROJ_B_ACT_N_TILE = 512
 QUANT_TOKEN_TILE = 8
@@ -115,6 +116,10 @@ if D % ACT_N_TILE != 0:
     raise ValueError(f"O-B activation tile {ACT_N_TILE} must divide hidden size {D}")
 if GROUP_T_PAD % O_B_T_TILE != 0:
     raise ValueError(f"O-B token tile {O_B_T_TILE} must divide token capacity {GROUP_T_PAD}")
+if T_PAD % PROJ_B_MM_T_TILE != 0:
+    raise ValueError(
+        f"proj_b_mm token tile {PROJ_B_MM_T_TILE} must divide token capacity {T_PAD}"
+    )
 
 
 @pl.jit.inline
@@ -196,23 +201,27 @@ def decode_o_proj_tp1(
                     o_r_i8_pad[zt : zt + QUANT_TOKEN_TILE, col_g : col_g + O_LORA] = pl.cast(
                         zero_half, target_type=pl.INT8, mode="trunc")
 
-            with pl.spmd(D // PROJ_B_D_TILE, name_hint="proj_b_mm", deps=[q_tid], allow_early_resolve=True) as pb_tid:
-                dc = pl.tile.get_block_idx()
+            proj_b_t_rows = T_PAD // PROJ_B_MM_T_TILE
+            with pl.spmd(proj_b_t_rows * (D // PROJ_B_D_TILE), name_hint="proj_b_mm", deps=[q_tid], allow_early_resolve=True) as pb_tid:
+                pb_unit = pl.tile.get_block_idx()
+                tb = pb_unit // (D // PROJ_B_D_TILE)
+                dc = pb_unit - tb * (D // PROJ_B_D_TILE)
+                t0 = tb * PROJ_B_MM_T_TILE
                 d0 = dc * PROJ_B_D_TILE
                 for nf in pl.range(PROJ_B_D_TILE // PROJ_B_MM_N_TILE):
                     n0 = d0 + nf * PROJ_B_MM_N_TILE
-                    acc_b = pl.create_tensor([MM_T_TILE, PROJ_B_MM_N_TILE], dtype=pl.INT32)
+                    acc_b = pl.create_tensor([PROJ_B_MM_T_TILE, PROJ_B_MM_N_TILE], dtype=pl.INT32)
                     for kb in pl.pipeline(0, O_LORA // B_K_TILE, stage=2):
                         k0 = col_g + kb * B_K_TILE
                         if kb == 0:
-                            b_act = o_r_i8_pad[:, col_g : col_g + B_K_TILE]
+                            b_act = o_r_i8_pad[t0 : t0 + PROJ_B_MM_T_TILE, col_g : col_g + B_K_TILE]
                             b_weight = wo_b[n0 : n0 + PROJ_B_MM_N_TILE, col_g : col_g + B_K_TILE]
                             acc_b = pl.matmul(b_act, b_weight, b_trans=True, out_dtype=pl.INT32)
                         else:
-                            b_act = o_r_i8_pad[:, k0 : k0 + B_K_TILE]
+                            b_act = o_r_i8_pad[t0 : t0 + PROJ_B_MM_T_TILE, k0 : k0 + B_K_TILE]
                             b_weight = wo_b[n0 : n0 + PROJ_B_MM_N_TILE, k0 : k0 + B_K_TILE]
                             acc_b = pl.matmul_acc(acc_b, b_act, b_weight, b_trans=True)
-                    partials[0:MM_T_TILE, g * D + n0 : g * D + n0 + PROJ_B_MM_N_TILE] = acc_b
+                    partials[t0 : t0 + PROJ_B_MM_T_TILE, g * D + n0 : g * D + n0 + PROJ_B_MM_N_TILE] = acc_b
             proj_b_tids[g] = pb_tid
 
     # proj_b_act sums the O_GROUPS INT32 partials -- each dequantized by its group's
