@@ -11,7 +11,7 @@
 
 Hidden states must already have passed the final RMSNorm.
 
-The DP world is cut into ``--dp // --tp`` groups. Every card is both an owner and
+The DP world is ``--dp`` groups of ``--tp`` TP ranks each. Every card is both an owner and
 a TP rank: it holds vocab shard ``rank % TP_SIZE`` and serves only its own group,
 so every ``peer`` is ``group_base + tp_rank``.
 
@@ -43,7 +43,7 @@ VOCAB = M.vocab_size
 
 # Parallelism. Static in the frontend, so both worlds are parsed off argv here.
 _TP_CHOICES = (2, 4, 8, 16)
-_DP_CHOICES = (2, 4, 8, 16)
+_DP_CHOICES = (1, 2, 4, 8, 16)
 _TP_DEFAULT = 2
 
 
@@ -57,10 +57,11 @@ def _parse_int_argv(name, default=None):
 
 
 TP_SIZE: int = _parse_int_argv("--tp") or _TP_DEFAULT
-# --dp only sizes the standalone l3_lm_head fixture: how many DP ranks it builds.
+# --dp sizes the standalone l3_lm_head fixture: how many DP groups it builds.
 # The kernel itself carries no DP extent, so composed callers never pass it.
-DP_SIZE: int = _parse_int_argv("--dp") or TP_SIZE
+DP_SIZE: int = _parse_int_argv("--dp") or 1
 VOCAB_PER_TP = VOCAB // TP_SIZE
+WORLD_SIZE = TP_SIZE * DP_SIZE
 
 # Rows. Decode specializations override DECODE_TOKENS before importing this
 # module; standalone and prefill callers retain the checked-in eight-row tile.
@@ -69,14 +70,34 @@ MAX_LOGIT_ROWS = DECODE_TOKENS
 TEST_TOKENS = 16  # standalone fixture: hidden rows per card, > MAX_LOGIT_ROWS
 GROUP_LOGIT_ROWS = TP_SIZE * MAX_LOGIT_ROWS
 
-# Tiling
+# Tiling. Both matmul tiles clear the 512 B contiguous-transfer floor: the
+# K-contiguous weight slice moves FUSED_K_TILE * 2 B and the FP32 logits store
+# moves FUSED_VOCAB_TILE * 4 B.
 FUSED_K_TILE = 256
-FUSED_VOCAB_TILE = 128
+FUSED_VOCAB_TILE = 256
 HIDDEN_GATHER_TILE = 512
 LOGITS_COMM_TILE = 2048
-VOCAB_TAIL = VOCAB_PER_TP % FUSED_VOCAB_TILE
+# The vocab shard rarely divides the matmul tile, so the last tile is ragged. It
+# rides the same loop as every other tile rather than getting a tail case: the
+# weight load carries a valid_shape, which is what keeps the load inside
+# lm_head_weight, and the tile count is a plain ceil. The narrow extent is then
+# dropped at the crossing and re-applied at the push -- see the two comments in
+# the fused scope. logits_shards is padded to whole tiles so the last tile's
+# full-width store stays in bounds.
+VOCAB_FULL_TILES = VOCAB_PER_TP // FUSED_VOCAB_TILE
+VOCAB_LAST_TILE = VOCAB_PER_TP % FUSED_VOCAB_TILE
+VOCAB_TILES = VOCAB_FULL_TILES + (1 if VOCAB_LAST_TILE != 0 else 0)
+SHARDS_VOCAB = VOCAB_TILES * FUSED_VOCAB_TILE
 LOGITS_COMM_TAIL = VOCAB_PER_TP % LOGITS_COMM_TILE
 FUSED_LM_HEAD_CORES = 24
+# AIV lanes per AICore. A mode=NONE split region runs its body on both, so the
+# fused kernel shards owners across them to keep every push and notify single.
+AIV_LANES = 2
+OWNER_PAIRS = TP_SIZE // AIV_LANES
+# The shard cannot be sliced, so it lands whole in a GM scratch and the per-owner
+# pushes slice that scratch instead -- a plain tensor slice, which is legal.
+SHARD_ROWS = GROUP_LOGIT_ROWS // AIV_LANES
+OWNERS_PER_LANE = TP_SIZE // AIV_LANES
 DONE_VALUE = 1
 
 # Greedy sampling uses exact 256-token chunks so the real vocabulary has no
@@ -96,6 +117,15 @@ LOGITS_COMM_BLOCKS = min(
 )
 LOGITS_TAIL_BLOCK = N_LOGITS_COMM_TILES % LOGITS_COMM_BLOCKS
 
+assert TP_SIZE % AIV_LANES == 0, "owners must divide evenly across the AIV lanes"
+# What keeps the GM staging race-free: an UP_DOWN lane writes exactly the row
+# band it later reads, and the two lanes' bands are disjoint, so no GM address is
+# touched by both lanes and the store->push RAW stays inside one lane. That holds
+# only while a lane's row half equals the rows of the owners it serves -- assert
+# it rather than rely on the coincidence.
+assert SHARD_ROWS == OWNERS_PER_LANE * MAX_LOGIT_ROWS, (
+    "each AIV lane's shard rows must be exactly the rows of the owners it pushes"
+)
 assert D % FUSED_K_TILE == 0
 assert D % HIDDEN_GATHER_TILE == 0
 assert VOCAB % TP_SIZE == 0
@@ -104,7 +134,6 @@ assert GREEDY_NUM_VOCAB_CHUNKS <= GREEDY_CHUNK_PAD
 assert GROUP_LOGIT_ROWS % 16 == 0, "matmul M extent must be a multiple of 16"
 assert TP_SIZE in _TP_CHOICES, f"--tp must be one of {_TP_CHOICES} (got {TP_SIZE})"
 assert DP_SIZE in _DP_CHOICES, f"--dp must be one of {_DP_CHOICES} (got {DP_SIZE})"
-assert DP_SIZE % TP_SIZE == 0, f"--dp must be a multiple of --tp, got dp={DP_SIZE}, tp={TP_SIZE}"
 
 
 @pl.jit.inline(auto_scope=False)
@@ -187,95 +216,125 @@ def lm_head(
         gk0 = gkb * HIDDEN_GATHER_TILE
         owner_hiddens[:, gk0 : gk0 + HIDDEN_GATHER_TILE] = hidden_window[:, gk0 : gk0 + HIDDEN_GATHER_TILE]
 
-    logits_shards = pl.create_tensor([GROUP_LOGIT_ROWS, VOCAB_PER_TP], dtype=pl.FP32)
-    # Project all group-owner rows in one matmul M tile.
-    for lm_core in pl.spmd(FUSED_LM_HEAD_CORES, name_hint="lm_head_matmul"):
-        for mm_ob in pl.range(lm_core, VOCAB_PER_TP // FUSED_VOCAB_TILE, FUSED_LM_HEAD_CORES):
+    # Mixed cube + comm kernel: the cube projects a vocab tile, pl.aiv_shard
+    # carries that accumulator across the C->V edge, and pld.tensor.remote_store
+    # pushes each owner's rows to that peer's window from the vector lane. Each
+    # tile therefore goes on the wire while the cube projects the next one,
+    # instead of the whole shard waiting for the last matmul -- that overlap is
+    # the point of fusing the projection and the push into one scope.
+    # The ragged last tile is just a padded tile in the same loop: its weight load
+    # carries valid_shape, its padded columns ride to GM as don't-care, and the
+    # push is narrowed back to the real width.
+    logits_shards = pl.create_tensor([GROUP_LOGIT_ROWS, SHARDS_VOCAB], dtype=pl.FP32)
+    with pl.spmd(
+        FUSED_LM_HEAD_CORES,
+        name_hint="lm_head_matmul_push",
+        optimizations=[pl.cross_core_slot(slot_num=2)],
+    ) as _push_tid:
+        lm_core = pl.tile.get_block_idx()
+        vocab_base = tp_rank * VOCAB_PER_TP
+        for mm_ob in pl.range(lm_core, VOCAB_TILES, FUSED_LM_HEAD_CORES):
             mm_o0 = mm_ob * FUSED_VOCAB_TILE
+            # Real width of this tile: the full tile everywhere except the ragged
+            # last one, where the weight rows run out early. The box stays static
+            # so the accumulator keeps one shape for every iteration.
+            mm_valid_n = pl.min(VOCAB_PER_TP - mm_o0, FUSED_VOCAB_TILE)
+            # M is the full group extent -- one matmul per vocab tile.
             mm_hidden0 = owner_hiddens[:, 0:FUSED_K_TILE]
-            mm_weight0 = lm_head_weight[mm_o0 : mm_o0 + FUSED_VOCAB_TILE, 0:FUSED_K_TILE]
+            mm_weight0 = pl.slice(
+                lm_head_weight,
+                [FUSED_VOCAB_TILE, FUSED_K_TILE],
+                [mm_o0, 0],
+                valid_shape=[mm_valid_n, FUSED_K_TILE],
+            )
             mm_acc = pl.matmul(mm_hidden0, mm_weight0, b_trans=True, out_dtype=pl.FP32)
             for mm_kb in pl.pipeline(1, D // FUSED_K_TILE, stage=2):
                 mm_k0 = mm_kb * FUSED_K_TILE
                 mm_hidden_tile = owner_hiddens[:, mm_k0 : mm_k0 + FUSED_K_TILE]
-                mm_weight_tile = lm_head_weight[mm_o0 : mm_o0 + FUSED_VOCAB_TILE, mm_k0 : mm_k0 + FUSED_K_TILE]
-                mm_acc = pl.matmul_acc(mm_acc, mm_hidden_tile, mm_weight_tile, b_trans=True)
-            logits_shards[:, mm_o0 : mm_o0 + FUSED_VOCAB_TILE] = mm_acc
-
-        if VOCAB_TAIL != 0:
-            if lm_core == (VOCAB_PER_TP // FUSED_VOCAB_TILE) % FUSED_LM_HEAD_CORES:
-                mm_tail_o0 = VOCAB_PER_TP // FUSED_VOCAB_TILE * FUSED_VOCAB_TILE
-                mm_hidden_t0 = owner_hiddens[:, 0:FUSED_K_TILE]
-                mm_weight_t0 = lm_head_weight[mm_tail_o0 : mm_tail_o0 + VOCAB_TAIL, 0:FUSED_K_TILE]
-                mm_acc_tail = pl.matmul(mm_hidden_t0, mm_weight_t0, b_trans=True, out_dtype=pl.FP32)
-                for mm_tail_kb in pl.pipeline(1, D // FUSED_K_TILE, stage=2):
-                    mm_tail_k0 = mm_tail_kb * FUSED_K_TILE
-                    mm_hidden_tk = owner_hiddens[:, mm_tail_k0 : mm_tail_k0 + FUSED_K_TILE]
-                    mm_weight_tk = lm_head_weight[
-                        mm_tail_o0 : mm_tail_o0 + VOCAB_TAIL, mm_tail_k0 : mm_tail_k0 + FUSED_K_TILE
-                    ]
-                    mm_acc_tail = pl.matmul_acc(mm_acc_tail, mm_hidden_tk, mm_weight_tk, b_trans=True)
-                logits_shards[:, mm_tail_o0 : mm_tail_o0 + VOCAB_TAIL] = mm_acc_tail
-
-    # Send each owner its slice of this card's vocab shard, split over vocab comm
-    # tiles: block blk pushes its tiles to every owner.
-    for blk in pl.spmd(LOGITS_COMM_BLOCKS, name_hint="lm_head_combine_push"):
-        vocab_base = tp_rank * VOCAB_PER_TP
-        for owner_tp in pl.range(TP_SIZE):
-            source_row_base = owner_tp * MAX_LOGIT_ROWS
-
-            # put, not tile.remote_store: remote_store does not drain before the
-            # notify issues (PTOAS#872), so the peer's gather reads tiles still in
-            # flight. Self-target rides the same put -- a local pl.store makes a new
-            # SSA version of logits_window that the gather cannot read across scopes
-            # without a comm ctx.
-            for ob in pl.range(blk, N_LOGITS_COMM_TILES, LOGITS_COMM_BLOCKS):
-                o0 = ob * LOGITS_COMM_TILE
-                pld.tensor.put(
-                    dst=logits_window,
-                    peer=group_base + owner_tp,
-                    src=logits_shards,
-                    dst_offsets=[0, vocab_base + o0],
-                    src_offsets=[source_row_base, o0],
-                    shape=[MAX_LOGIT_ROWS, LOGITS_COMM_TILE],
+                mm_weight_tile = pl.slice(
+                    lm_head_weight,
+                    [FUSED_VOCAB_TILE, FUSED_K_TILE],
+                    [mm_o0, mm_k0],
+                    valid_shape=[mm_valid_n, FUSED_K_TILE],
                 )
+                mm_acc = pl.matmul_acc(mm_acc, mm_hidden_tile, mm_weight_tile, b_trans=True)
 
-            if LOGITS_COMM_TAIL != 0:
-                if blk == LOGITS_TAIL_BLOCK:
-                    tail_o0 = N_LOGITS_COMM_TILES * LOGITS_COMM_TILE
-                    pld.tensor.put(
-                        dst=logits_window,
-                        peer=group_base + owner_tp,
-                        src=logits_shards,
-                        dst_offsets=[0, vocab_base + tail_o0],
-                        src_offsets=[source_row_base, tail_o0],
-                        shape=[MAX_LOGIT_ROWS, LOGITS_COMM_TAIL],
+            # Declare the columns fully valid before the C->V crossing. The
+            # boundary transports the full box and can only rebuild a narrowed
+            # column extent with the compile-time-static pto.treshape, so a
+            # runtime-valued one is rejected outright. The padded columns of the
+            # ragged tile are don't-care here: they ride to GM and the push below
+            # is what cuts them off, so they never reach a peer's window.
+            mm_acc = pl.set_validshape(mm_acc, GROUP_LOGIT_ROWS, FUSED_VOCAB_TILE)
+
+            # WORKAROUND -- revert once a subview of a pl.aiv_shard result is
+            # legal (filed against ptoas). The shard cannot be sliced, so it is
+            # stored whole to GM and the per-owner pushes read slices back out.
+            # That costs an extra GM write and an extra GM read of every tile,
+            # traffic a direct shard-to-peer push would not pay at all. It is
+            # still the cheaper option: pinning the matmul M extent to one owner
+            # per lane instead -- the only slice-free alternative -- triples cube
+            # time at tp=8 and turns the fusion into a regression there.
+            #
+            # Race-free by construction: UP_DOWN gives each lane a disjoint row
+            # band that it both writes and reads, so no GM address is touched by
+            # both lanes. The SHARD_ROWS assert above is what keeps that true.
+            for aiv_id in pl.split_aiv(AIV_LANES, mode=pl.SplitMode.UP_DOWN):
+                mm_shard = pl.aiv_shard(mm_acc)
+                lane_r0 = aiv_id * SHARD_ROWS
+                logits_shards[
+                    lane_r0 : lane_r0 + SHARD_ROWS, mm_o0 : mm_o0 + FUSED_VOCAB_TILE
+                ] = mm_shard
+                for owner_slot in pl.range(OWNERS_PER_LANE):
+                    owner_tp = aiv_id * OWNERS_PER_LANE + owner_slot
+                    src_r0 = owner_tp * MAX_LOGIT_ROWS
+                    # valid_shape rather than a narrower box: the box has to stay
+                    # static for the tile type, and a full-width push of the ragged
+                    # tile would run past this rank's slice of the shared window
+                    # into the next rank's. pl.min is inlined instead of reusing
+                    # mm_valid_n because a named cube-side scalar cannot be
+                    # materialized inside the AIV function.
+                    pld.tensor.remote_store(
+                        pl.slice(
+                            logits_shards,
+                            [MAX_LOGIT_ROWS, FUSED_VOCAB_TILE],
+                            [src_r0, mm_o0],
+                            valid_shape=[
+                                MAX_LOGIT_ROWS,
+                                pl.min(VOCAB_PER_TP - mm_o0, FUSED_VOCAB_TILE),
+                            ],
+                        ),
+                        logits_window,
+                        group_base + owner_tp,
+                        [0, vocab_base + mm_o0],
                     )
 
         # Notify folded into the push: each block signals every peer after its own
-        # stores, so a peer sees LOGITS_COMM_BLOCKS notifies per source per epoch.
-        for owner_tp in pl.range(TP_SIZE):
-            if owner_tp != tp_rank:
-                pld.system.notify(
-                    target=logits_done,
-                    peer=group_base + owner_tp,
-                    offsets=[tp_rank, 0],
-                    value=1,
-                    op=pld.NotifyOp.AtomicAdd,
-                )
+        # stores, so a peer sees FUSED_LM_HEAD_CORES notifies per source per epoch.
+        for aiv_id in pl.split_aiv(AIV_LANES, mode=pl.SplitMode.NONE):
+            for notify_pair in pl.range(OWNER_PAIRS):
+                owner_tp = notify_pair * AIV_LANES + aiv_id
+                if owner_tp != tp_rank:
+                    pld.system.notify(
+                        target=logits_done,
+                        peer=group_base + owner_tp,
+                        offsets=[tp_rank, 0],
+                        value=1,
+                        op=pld.NotifyOp.AtomicAdd,
+                    )
 
-    # Wait only (the notify rides inside the push). The logits_shards read is an
-    # anchor, not data: it deps this task on lm_head_matmul so the wait runs
-    # alongside our own push. An unanchored wait dispatches immediately and spins
-    # holding a core group.
-    with pl.at(level=pl.Level.CORE_GROUP, name_hint="lm_head_combine_wait") as _cwait_tid:
-        _shard_anchor = pl.read(logits_shards, [0, 0])
+    # Wait only (the notify rides inside the push). deps on the push scope so the
+    # wait runs alongside our own push; an unanchored wait dispatches immediately
+    # and spins holding a core group.
+    with pl.at(
+        level=pl.Level.CORE_GROUP, name_hint="lm_head_combine_wait", deps=[_push_tid]
+    ) as _cwait_tid:
         for src_tp in pl.range(TP_SIZE):
             if src_tp != tp_rank:
                 pld.system.wait(
                     signal=logits_done,
                     offsets=[src_tp, 0],
-                    expected=pl.cast(done_epoch * LOGITS_COMM_BLOCKS, pl.INT32),
+                    expected=pl.cast(done_epoch * FUSED_LM_HEAD_CORES, pl.INT32),
                     cmp=pld.WaitCmp.Ge,
                 )
 
@@ -471,13 +530,13 @@ def lm_head_with_sampling_test(
 
 @pl.jit.host
 def l3_lm_head(
-    hidden_states: pl.Tensor[[DP_SIZE, TEST_TOKENS, D], pl.BF16],
-    lm_head_weight: pl.Tensor[[DP_SIZE, VOCAB_PER_TP, D], pl.BF16],
-    logits: pl.Out[pl.Tensor[[DP_SIZE, MAX_LOGIT_ROWS, VOCAB], pl.FP32]],
+    hidden_states: pl.Tensor[[WORLD_SIZE, TEST_TOKENS, D], pl.BF16],
+    lm_head_weight: pl.Tensor[[WORLD_SIZE, VOCAB_PER_TP, D], pl.BF16],
+    logits: pl.Out[pl.Tensor[[WORLD_SIZE, MAX_LOGIT_ROWS, VOCAB], pl.FP32]],
     sampled_ids: pl.Out[
-        pl.Tensor[[DP_SIZE, MAX_LOGIT_ROWS, SAMPLED_IDS_PAD], pl.INT32]
+        pl.Tensor[[WORLD_SIZE, MAX_LOGIT_ROWS, SAMPLED_IDS_PAD], pl.INT32]
     ],
-    logit_row_indices: pl.Tensor[[DP_SIZE, MAX_LOGIT_ROWS], pl.INT32],
+    logit_row_indices: pl.Tensor[[WORLD_SIZE, MAX_LOGIT_ROWS], pl.INT32],
 ):
     # Windows are group-local: hidden_window holds one row slot per group member,
     # and every card receives only its own full-vocabulary logits.
@@ -508,7 +567,7 @@ def golden_lm_head(tensors):
     weight = tensors["lm_head_weight"].float()
     full_weight = torch.cat([weight[tp] for tp in range(TP_SIZE)], dim=0)
     full_logits = []
-    for owner_rank in range(DP_SIZE):
+    for owner_rank in range(WORLD_SIZE):
         selected = torch.zeros((MAX_LOGIT_ROWS, D), dtype=torch.float32)
         for row in range(MAX_LOGIT_ROWS):
             source_row = int(tensors["logit_row_indices"][owner_rank, row])
@@ -532,21 +591,21 @@ def build_tensor_specs(num_tokens=TEST_TOKENS):
     active = max(min(num_tokens, MAX_LOGIT_ROWS), 0)
 
     def init_hidden_states():
-        return (torch.randn(DP_SIZE, TEST_TOKENS, D) * 0.1).to(torch.bfloat16)
+        return (torch.randn(WORLD_SIZE, TEST_TOKENS, D) * 0.1).to(torch.bfloat16)
 
     def init_lm_head_weight():
         shards = (torch.randn(TP_SIZE, VOCAB_PER_TP, D) / D ** 0.5).to(torch.bfloat16)
-        return torch.stack([shards[r % TP_SIZE] for r in range(DP_SIZE)], dim=0)
+        return torch.stack([shards[r % TP_SIZE] for r in range(WORLD_SIZE)], dim=0)
 
     def init_logit_row_indices():
-        indices = torch.full((DP_SIZE, MAX_LOGIT_ROWS), -1, dtype=torch.int32)
+        indices = torch.full((WORLD_SIZE, MAX_LOGIT_ROWS), -1, dtype=torch.int32)
         indices[:, :active] = torch.arange(active, dtype=torch.int32)
         return indices
 
     return [
         TensorSpec(
             "hidden_states",
-            [DP_SIZE, TEST_TOKENS, D],
+            [WORLD_SIZE, TEST_TOKENS, D],
             torch.bfloat16,
             init_value=init_hidden_states,
         ),
@@ -555,26 +614,26 @@ def build_tensor_specs(num_tokens=TEST_TOKENS):
         # each rank-local shard on its consuming card across dispatches.
         TensorSpec(
             "lm_head_weight",
-            [DP_SIZE, VOCAB_PER_TP, D],
+            [WORLD_SIZE, VOCAB_PER_TP, D],
             torch.bfloat16,
             init_value=init_lm_head_weight,
             resident="stacked",
         ),
         TensorSpec(
             "logits",
-            [DP_SIZE, MAX_LOGIT_ROWS, VOCAB],
+            [WORLD_SIZE, MAX_LOGIT_ROWS, VOCAB],
             torch.float32,
             is_output=True,
         ),
         TensorSpec(
             "sampled_ids",
-            [DP_SIZE, MAX_LOGIT_ROWS, SAMPLED_IDS_PAD],
+            [WORLD_SIZE, MAX_LOGIT_ROWS, SAMPLED_IDS_PAD],
             torch.int32,
             is_output=True,
         ),
         TensorSpec(
             "logit_row_indices",
-            [DP_SIZE, MAX_LOGIT_ROWS],
+            [WORLD_SIZE, MAX_LOGIT_ROWS],
             torch.int32,
             init_value=init_logit_row_indices,
         ),
@@ -629,11 +688,11 @@ if __name__ == "__main__":
     parser.add_argument("--tp", type=int, default=TP_SIZE, choices=list(_TP_CHOICES),
                         help="LM-head tensor-parallel world size")
     parser.add_argument("--dp", type=int, default=DP_SIZE, choices=list(_DP_CHOICES),
-                        help="Attention-DP world size (hidden-row owners)")
+                        help="DP groups (world size = tp * dp)")
     parser.add_argument("--num-tokens", type=int, default=TEST_TOKENS,
                         help="Active hidden rows each owner projects")
-    parser.add_argument("-d", "--device", type=str, default=",".join(str(i) for i in range(DP_SIZE)),
-                        help=f"comma-separated device ids; need at least {DP_SIZE}")
+    parser.add_argument("-d", "--device", type=str, default=",".join(str(i) for i in range(WORLD_SIZE)),
+                        help=f"comma-separated device ids; need at least {WORLD_SIZE}")
     parser.add_argument("--enable-l2-swimlane", type=int, nargs="?", const=1, default=0,
                         choices=(0, 1, 2, 4))
     parser.add_argument("--compile-only", action="store_true", default=False)
@@ -642,7 +701,7 @@ if __name__ == "__main__":
     args = parser.parse_args()
 
     device_ids = [int(d) for d in args.device.split(",")]
-    required_devices = DP_SIZE
+    required_devices = WORLD_SIZE
     assert len(device_ids) >= required_devices, (
         f"need at least {required_devices} devices, got {device_ids}"
     )

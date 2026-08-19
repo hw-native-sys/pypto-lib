@@ -76,3 +76,10 @@ script's `--help` and `docs/get-started/platforms.md`.
    keep skills linked to the canonical public guide rather than copying it.
 4. **No private information** (usernames, absolute paths with usernames, etc.) in code or docs.
 5. **All code comments and documentation in English** unless the user explicitly requests otherwise.
+6. **Never silently work around a suspected compiler bug.** When the DSL looks
+   correct but the program fails to compile or produces wrong results, log it —
+   see [`.claude/rules/problem-handling.md`](rules/problem-handling.md).
+7. **Optimize wall time first, and measure it once.** Core busy time is the
+   second priority; reuse a frozen golden and a single timed process instead of
+   re-running a script for samples; strip rank start skew from distributed
+   results — see [`.claude/rules/benchmarking.md`](rules/benchmarking.md).

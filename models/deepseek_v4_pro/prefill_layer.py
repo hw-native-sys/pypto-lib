@@ -431,6 +431,66 @@ def prefill_layer_core(
             # request's physical span is rounded up to whole-T tiles, so a
             # full-T write is safe even for a partial logical tail tile.
             x_next = pl.assemble(x_next, x_next_tile, [tile_base, 0, 0])
+
+    # Retire this dispatch's MoE signal counts before the next dispatch of the
+    # same graph (benchmark rounds, serving steady state): the windows are
+    # retained across dispatches and the counters are monotonic, so without
+    # this every >=-epoch wait of round 2+ is pre-satisfied by the previous
+    # rounds' counts and the inter-rank reuse throttle goes dead.
+    #
+    # The reset is an atomic SUBTRACTION of exactly the credits this
+    # dispatch's epochs deposit — not a write of zero. A zero-write would race
+    # any credit still in flight (the final epoch's moe_consumed notifies post
+    # after the reduce with no in-dispatch reader, and may land here after a
+    # bare clear, leaking counts into the next round — the flaw in the bare
+    # clear_moe_signals pattern). AtomicAdd commutes: whether a trailing
+    # credit lands before or after the matching subtraction, every row settles
+    # at exactly zero, with at most a transient negative that the signed >=
+    # waits of the next dispatch simply outwait. No quiesce wait is needed;
+    # the anchor read only orders this task behind the final output so the
+    # subtraction cannot run ahead of this dispatch's own >=-epoch waits.
+    # Per-epoch credit slopes (see moe.py): arrived remote rows 1, data_arrived
+    # remote rows N_LOCAL, combine_arrived remote rows N_LOCAL + 1 and self
+    # row 1; the self rows of arrived / data_arrived are never written.
+    last_req = user_batch - 1
+    last_tiles = (pl.tensor.read(chunk_lens, [last_req]) + TOK_TILE - 1) // TOK_TILE
+    total_epochs = pl.cast(pl.tensor.read(chunk_tile_offsets, [last_req]), pl.INDEX) \
+        + pl.cast(last_tiles, pl.INDEX)
+    neg_epochs = pl.cast(0 - total_epochs, pl.INT32)
+    neg_data = pl.cast(0 - total_epochs * N_LOCAL, pl.INT32)
+    neg_combine = pl.cast(0 - total_epochs * (N_LOCAL + 1), pl.INT32)
+    with pl.at(level=pl.Level.CORE_GROUP, name_hint="moe_signal_retire"):
+        _x_next_anchor = pl.read(x_next, [0, 0, 0])
+        pld.system.notify(
+            target=combine_arrived,
+            peer=my_rank,
+            offsets=[my_rank, 0],
+            value=neg_epochs,
+            op=pld.NotifyOp.AtomicAdd,
+        )
+        for src in pl.range(N_RANKS):
+            if src != my_rank:
+                pld.system.notify(
+                    target=arrived,
+                    peer=my_rank,
+                    offsets=[src, 0],
+                    value=neg_epochs,
+                    op=pld.NotifyOp.AtomicAdd,
+                )
+                pld.system.notify(
+                    target=data_arrived,
+                    peer=my_rank,
+                    offsets=[src, 0],
+                    value=neg_data,
+                    op=pld.NotifyOp.AtomicAdd,
+                )
+                pld.system.notify(
+                    target=combine_arrived,
+                    peer=my_rank,
+                    offsets=[src, 0],
+                    value=neg_combine,
+                    op=pld.NotifyOp.AtomicAdd,
+                )
     return x_next
 
 

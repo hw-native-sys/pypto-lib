@@ -33,17 +33,18 @@ FUSION (unified decode + prefill): the whole op is ONE ``pl.spmd(NUM_CORES=24)``
 hard ``pl.system.syncall(core_type="mix")`` requires). The body is 3 phases separated by 2
 barriers; each barrier publishes the prior phase's cross-core HBM writes:
 
-    Phase A  cast (x BF16 -> x_fp32 FP32)  +  seed (zero mixes_raw)          AIV
-    ── syncall ──  (x_fp32 + zeroed mixes_raw visible)
-    Phase B  linear (split-K matmul -> mixes_raw, AIC)  +  rms (split-K SoS -> sq_sum_acc, AIV)
-    ── syncall ──  (sq_sum_acc + all LINEAR_OK atomic-add partials visible)
+    Phase A  linear (split-K matmul -> mixes_partials, AIC)  +  rms (split-K SoS
+             -> sq_partials, AIV)
+    ── syncall ──  (every LINEAR_OK / RMS_OK partial visible)
+    Phase B  reduce the partials in ascending K order -> mixes_raw + sq_sum_acc   AIV
+    ── syncall ──  (mixes_raw + sq_sum_acc visible)
     Phase D  per task: rsqrt(sq_sum) + scale/sigmoid GATE, then                    AIV
              comb_sinkhorn (-> comb) | mix_x (-> x_mixed) | write_post (-> post)
 
 The old Phase C (a separate rsqrt+scale+sigmoid gate pass, published by a 3rd barrier) is
 FOLDED into Phase D: since the C->D handoff was cross-core (different grid-stride striping),
 it needed a barrier -- but each D task can just recompute the ONE gate it consumes from the
-barrier-2-published mixes_raw + sq_sum_acc on its OWN core (rsqrt+sigmoid is nearly free on
+published mixes_raw + sq_sum_acc on its OWN core (rsqrt+sigmoid is nearly free on
 this latency-bound kernel). That deletes a whole hard FFTS barrier (-8% decode / -11% prefill
 on the device L2 swimlane, latency-bound so barrier removal > byte removal). comb_logits /
 post_pad_store survive only as SAME-CORE scratch (assemble then load-back, no barrier) because
@@ -115,19 +116,12 @@ LINEAR_K_CHUNK = 256  # cube K-fragment per matmul_acc (32x256x4 FP32 weight fit
 D_CHUNK = 256  # mix_x inner D-fragment (BF16 load = 1KB, 512B-aligned)
 D_SPMD = 1024  # mix_x D per spmd block: decode fans 4096 reduce over D/D_SPMD cores
 CAST_K_SPMD = 2048  # cast K per spmd block: decode fans the BF16->FP32 cast over HC_DIM/CAST_K_SPMD cores
-# Split the K=HC_DIM reduction into LINEAR_OK slices that atomic-add their FP32
-# partials, filling idle cubes at small T (decode: 1 token-tile -> LINEAR_OK
-# cube tasks) and shortening each task's matmul_acc chain. Higher OK fills more
-# decode cubes; prefill (8 token-tiles) packs OK*8 tasks into waves of ~24.
+# Split the K=HC_DIM reduction into LINEAR_OK disjoint partials.
 LINEAR_OK = 4
 LINEAR_K_PER_SPLIT = HC_DIM // LINEAR_OK
 LINEAR_CHUNKS_PER_SPLIT = LINEAR_K_PER_SPLIT // LINEAR_K_CHUNK
 
-# Split the RMS sum-of-squares K reduction over RMS_OK cores, mirroring LINEAR_OK: at decode
-# (1 token-tile) the full 16384-wide reduce is otherwise a single-lane straggler. Each
-# (token-tile, K-slice) task atomic-adds its FP32 partial sum-of-squares into sq_sum_acc
-# (zero-seeded in Phase A); Phase C reads the barrier-published total and applies rsqrt inline
-# per group (no separate inv_rms buffer / no within-phase RAW).
+# Split the RMS sum-of-squares K reduction into RMS_OK disjoint partials.
 RMS_OK = 16
 RMS_K_PER_SPLIT = HC_DIM // RMS_OK
 RMS_CHUNKS_PER_SPLIT = RMS_K_PER_SPLIT // RMS_K_CHUNK
@@ -172,6 +166,8 @@ def _hc_pre_syncall(
     # x arrives as FP32 (hc residual stream is FP32 end-to-end), so there is no x_fp32
     # staging buffer: linear / rms read x_flat directly.
     mixes_raw = pl.create_tensor([t_linear, MIX_PAD], dtype=pl.FP32)
+    linear_partial_rows = LINEAR_OK * t_linear
+    mixes_partials = pl.create_tensor([linear_partial_rows, MIX_PAD], dtype=pl.FP32)
     # post_pad_store is SAME-CORE scratch: write_post writes its token-tile's post gate then
     # reads it back on the SAME core (no barrier). It is kept (not deleted) because its
     # downstream pl.load->pl.store needs an HC_PAD-wide (32B-aligned) tile -- a narrow
@@ -185,36 +181,25 @@ def _hc_pre_syncall(
     # vs the 128-float [.,16] comb_logits round-trip this replaces).
     inv_gm = pl.create_tensor([t_linear, 1], dtype=pl.FP32)
     sq_sum_acc = pl.create_tensor([1, t_linear], dtype=pl.FP32)  # RMS split-K sum-of-squares (row layout: [1,T_TILE] tiles stay 32B-aligned)
+    sq_partials = pl.create_tensor([RMS_OK, t_linear], dtype=pl.FP32)
 
     # Per-phase grid-stride bounds (dynamic in t_dim; grid-stride round-robins any T over cores).
     tt_n = t_dim // T_TILE            # token-tiles (pre / post / comb / rsqrt / sinkhorn / write_post base)
-    cast_n = tt_n * CAST_KS           # cast fans over token-tile x K-slice
-    seed_n = t_linear // T_TILE       # seed zeros t_linear rows (includes the 8->16 pad rows)
     lin_n = (t_linear // LINEAR_T_TILE) * LINEAR_OK  # linear fans over row-block x OK K-slice
     rms_n = tt_n * RMS_OK             # rms fans over token-tile x K-slice (split-K sum-of-squares)
+    linear_reduce_n = t_linear // LINEAR_T_TILE  # linear partials reduced per row-block
+    reduce_n = linear_reduce_n + tt_n  # flattened reduce pool: linear row-blocks | rms token-tiles
     mixx_n = tt_n * MIXX_DS           # mix_x fans over token-tile x D-slice
     pool_d = 2 * tt_n + mixx_n        # phase-D flattened pool: sinkhorn(tt_n)|mix_x(mixx_n)|write_post(tt_n)
 
     with pl.spmd(NUM_CORES, name_hint="hc_pre_fused", sync_start=True, allow_early_resolve=True) as _hc_tid:  # inline form requires the TaskId capture
         core = pl.tile.get_block_idx()  # 0 .. NUM_CORES-1
 
-        # ===================== PHASE A: seed (AIV) ================================
-        # x is already FP32 (no cast); Phase A only zero-seeds mixes_raw + sq_sum_acc.
-        # Barrier 1 publishes the zeroed mixes_raw / sq_sum_acc for the Phase-B atomic-adds.
-        for aiv_id in pl.split_aiv(2, mode=pl.SplitMode.NONE):
-            lane = core * 2 + aiv_id  # 0..47
-            for tc in pl.range(lane, seed_n, NUM_CORES * 2):
-                ts0 = tc * T_TILE
-                mixes_raw = pl.assemble(mixes_raw, pl.full([T_TILE, MIX_PAD], dtype=pl.FP32, value=0.0), [ts0, 0])
-                sq_sum_acc = pl.assemble(sq_sum_acc, pl.full([1, T_TILE], dtype=pl.FP32, value=0.0), [0, ts0])
-        pl.system.syncall(core_type="mix")
-
-        # ===================== PHASE B: linear (AIC) + rms (AIV) ====================
-        # Cube split-K matmul strides over the 24 AIC; vector RMS over the 48 AIV lanes,
-        # concurrently. Barrier 2 publishes inv_rms + every LINEAR_OK atomic-add partial.
+        # Cube linear partials and vector RMS partials run concurrently.
         for task in pl.range(core, lin_n, NUM_CORES):
             t0 = (task // LINEAR_OK) * LINEAR_T_TILE
-            k_base = (task % LINEAR_OK) * LINEAR_K_PER_SPLIT
+            linear_split = task % LINEAR_OK
+            k_base = linear_split * LINEAR_K_PER_SPLIT
             t_rows = pl.min(LINEAR_T_TILE, t_dim - t0)  # last row-block spills past t_dim; valid_shape zero-fills the tail
             acc = pl.create_tensor([LINEAR_T_TILE, MIX_PAD], dtype=pl.FP32)
             for kb in pl.pipeline(0, LINEAR_CHUNKS_PER_SPLIT, stage=2):
@@ -225,23 +210,59 @@ def _hc_pre_syncall(
                     acc = pl.matmul(x_linear_chunk, w_chunk, b_trans=True, out_dtype=pl.FP32)
                 else:
                     acc = pl.matmul_acc(acc, x_linear_chunk, w_chunk, b_trans=True)
-            mixes_raw = pl.assemble(mixes_raw, acc, [t0, 0], atomic=pl.AtomicType.Add)
+            mixes_partials = pl.assemble(
+                mixes_partials,
+                acc,
+                [linear_split * t_linear + t0, 0],
+            )
         for aiv_id in pl.split_aiv(2, mode=pl.SplitMode.NONE):
             lane = core * 2 + aiv_id
             for task in pl.range(lane, rms_n, NUM_CORES * 2):
                 t0 = (task // RMS_OK) * T_TILE
-                k_base = (task % RMS_OK) * RMS_K_PER_SPLIT
+                rms_split = task % RMS_OK
+                k_base = rms_split * RMS_K_PER_SPLIT
                 sq_part = pl.full([1, T_TILE], dtype=pl.FP32, value=0.0)
                 for kb in pl.pipeline(RMS_CHUNKS_PER_SPLIT, stage=4):
                     k0 = k_base + kb * RMS_K_CHUNK
                     x_chunk = x_flat[t0:t0 + T_TILE, k0:k0 + RMS_K_CHUNK]
                     sq_part = pl.add(sq_part, pl.reshape(pl.row_sum(pl.mul(x_chunk, x_chunk)), [1, T_TILE]))
-                sq_sum_acc = pl.assemble(sq_sum_acc, sq_part, [0, t0], atomic=pl.AtomicType.Add)
+                sq_partials = pl.assemble(sq_partials, sq_part, [rms_split, t0])
+        pl.system.syncall(core_type="mix")
+
+        # Split-K partials are reduced in ascending K order.
+        for aiv_id in pl.split_aiv(2, mode=pl.SplitMode.NONE):
+            lane = core * 2 + aiv_id
+            for reduce_task in pl.range(lane, reduce_n, NUM_CORES * 2):
+                if reduce_task < linear_reduce_n:
+                    linear_t0 = reduce_task * LINEAR_T_TILE
+                    mixes_total = mixes_partials[
+                        linear_t0 : linear_t0 + LINEAR_T_TILE,
+                        0:MIX_PAD,
+                    ]
+                    for linear_split in pl.range(1, LINEAR_OK):
+                        partial_t0 = linear_split * t_linear + linear_t0
+                        mixes_total = pl.add(
+                            mixes_total,
+                            mixes_partials[
+                                partial_t0 : partial_t0 + LINEAR_T_TILE,
+                                0:MIX_PAD,
+                            ],
+                        )
+                    mixes_raw = pl.assemble(mixes_raw, mixes_total, [linear_t0, 0])
+                else:
+                    rms_t0 = (reduce_task - linear_reduce_n) * T_TILE
+                    sq_total = sq_partials[0:1, rms_t0 : rms_t0 + T_TILE]
+                    for rms_split in pl.range(1, RMS_OK):
+                        sq_total = pl.add(
+                            sq_total,
+                            sq_partials[rms_split : rms_split + 1, rms_t0 : rms_t0 + T_TILE],
+                        )
+                    sq_sum_acc = pl.assemble(sq_sum_acc, sq_total, [0, rms_t0])
         pl.system.syncall(core_type="mix")
 
         # ===================== PHASE C+D FUSED: gate + sinkhorn/mix_x/write_post (AIV) =====
         # Phase C (rsqrt + scale + sigmoid gates) is FOLDED into each Phase-D task: every
-        # task recomputes the gate it needs from the barrier-2-published mixes_raw + sq_sum_acc
+        # task recomputes the gate it needs from the published mixes_raw + sq_sum_acc
         # on its OWN core, just before using it. Recompute is nearly free here (latency-bound
         # kernel), and it deletes an entire cross-core barrier plus the pre/post/comb gate
         # round-trips -- the C->D handoff was the reason the old Barrier 3 existed. comb_logits
@@ -446,6 +467,8 @@ def _hc_pre_separate(
     # linear matmul masks them with valid_shape (zero-fill past t_dim), and rms only reads
     # the t_dim real rows.
     mixes_raw = pl.create_tensor([t_linear, MIX_PAD], dtype=pl.FP32)
+    linear_partial_rows = LINEAR_OK * t_linear
+    mixes_partials = pl.create_tensor([linear_partial_rows, MIX_PAD], dtype=pl.FP32)
 
     # rms: full-K sum-of-squares per token-tile -> inv_rms (one scope, no split-K).
     for t in pl.spmd(t_dim // T_TILE, name_hint="hc_pre_rms", allow_early_resolve=True):
@@ -458,18 +481,11 @@ def _hc_pre_separate(
         inv = pl.reshape(pl.rsqrt(pl.add(pl.mul(sq_sum, HC_DIM_INV), NORM_EPS), high_precision=True), [T_TILE, 1])
         inv_rms = pl.assemble(inv_rms, inv, [t0, 0])
 
-    # seed: zero mixes_raw for the split-K atomic-add accumulation. ONE task (single InCore
-    # region) loops the t_linear // T_TILE row-blocks internally, instead of fanning them out.
-    # On-core (not create_tensor init_value=0): AICPU init serializes on the scheduler and
-    # roughly doubles the decode orch window, whereas the on-core memset overlaps.
-    with pl.at(level=pl.Level.CORE_GROUP, name_hint="hc_pre_seed", allow_early_resolve=True):
-        for ts0 in pl.range(0, t_linear, T_TILE):
-            mixes_raw[ts0:ts0 + T_TILE, 0:MIX_PAD] = pl.full([T_TILE, MIX_PAD], dtype=pl.FP32, value=0.0)
-
-    # linear: split-K matmul; each (row-block, K-slice) atomic-adds its FP32 partial.
+    # Linear split-K partials are reduced in ascending K order.
     for task in pl.spmd((t_linear // LINEAR_T_TILE) * LINEAR_OK, name_hint="hc_pre_linear", allow_early_resolve=True):
         t0 = (task // LINEAR_OK) * LINEAR_T_TILE
-        k_base = (task % LINEAR_OK) * LINEAR_K_PER_SPLIT
+        linear_split = task % LINEAR_OK
+        k_base = linear_split * LINEAR_K_PER_SPLIT
         t_rows = pl.min(LINEAR_T_TILE, t_dim - t0)  # last row-block spills past t_dim; valid_shape zero-fills the tail
         acc = pl.create_tensor([LINEAR_T_TILE, MIX_PAD], dtype=pl.FP32)
         for kb in pl.pipeline(0, LINEAR_CHUNKS_PER_SPLIT, stage=2):
@@ -480,7 +496,22 @@ def _hc_pre_separate(
                 acc = pl.matmul(x_linear_chunk, w_chunk, b_trans=True, out_dtype=pl.FP32)
             else:
                 acc = pl.matmul_acc(acc, x_linear_chunk, w_chunk, b_trans=True)
-        mixes_raw = pl.assemble(mixes_raw, acc, [t0, 0], atomic=pl.AtomicType.Add)
+        mixes_partials = pl.assemble(mixes_partials, acc, [linear_split * t_linear + t0, 0])
+
+    for linear_block in pl.spmd(
+        t_linear // LINEAR_T_TILE,
+        name_hint="hc_pre_linear_reduce",
+        allow_early_resolve=True,
+    ):
+        linear_t0 = linear_block * LINEAR_T_TILE
+        mixes_total = mixes_partials[linear_t0 : linear_t0 + LINEAR_T_TILE, 0:MIX_PAD]
+        for linear_split in pl.range(1, LINEAR_OK):
+            partial_t0 = linear_split * t_linear + linear_t0
+            mixes_total = pl.add(
+                mixes_total,
+                mixes_partials[partial_t0 : partial_t0 + LINEAR_T_TILE, 0:MIX_PAD],
+            )
+        mixes_raw = pl.assemble(mixes_raw, mixes_total, [linear_t0, 0])
 
     # split_pre_post: inv_rms-scaled pre gate -> pre_val_store (for mix_x), post gate -> post.
     # Both compute at HC_PAD width; post narrows to HC_MULT via a valid-shape slice (an 8-wide
@@ -701,10 +732,7 @@ def _golden_a2a3_cube_linear(x_flat_2d, hc_fn):
         for group in range(group_dots.shape[-1]):
             split_mixes = (split_mixes.double() + group_dots[..., group]).float()
 
-    # Atomic completion order is not a semantic guarantee.  Canonical split
-    # order is the deterministic golden representative.  Other legal orders
-    # differ by only a few FP32 ULPs; the output tolerances cover the rare case
-    # where that difference crosses a BF16 boundary.
+    # Match the kernel's ascending split order.
     mixes = torch.zeros(t_dim, MIX_HC, dtype=torch.float32)
     for split in range(LINEAR_OK):
         mixes += split_mixes[..., split]

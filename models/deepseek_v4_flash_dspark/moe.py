@@ -200,7 +200,7 @@ def dispatch(
     # loc_e on EVERY destination rank, so the blocking cross-rank puts fan out
     # across N_LOCAL cores. One slot counter per destination rank; token-major
     # order matches the meta pass's per-(dst, loc_e) cumulative count.
-    with pl.spmd(N_LOCAL, name_hint="dispatch_push", allow_early_resolve=True):
+    with pl.spmd(N_LOCAL, name_hint="dispatch_push", allow_early_resolve=True) as _push_tid:
         loc_e = pl.tile.get_block_idx()
         active_tokens = pl.cast(num_tokens, pl.INDEX)
         if active_tokens < 0:
@@ -262,7 +262,12 @@ def dispatch(
     # with dispatch_push instead of trailing dispatch_meta's spin. Anchor it to
     # something -- an unanchored wait is dispatched immediately and spins holding a
     # core group, so pipelined layers stack up spinners.
-    with pl.at(level=pl.Level.CORE_GROUP, name_hint="dispatch_wait", allow_early_resolve=True) as _wait_tid:
+    with pl.at(
+        level=pl.Level.CORE_GROUP,
+        name_hint="dispatch_wait",
+        deps=[_push_tid],
+        allow_early_resolve=True,
+    ) as _wait_tid:
         _idx_anchor = pl.read(indices, [0, 0])
         for src in pl.range(N_RANKS):
             if src != my_rank:
@@ -282,7 +287,8 @@ def dispatch(
         N_LOCAL,
         name_hint="dispatch_gather",
         deps=[_wait_tid, _meta_tid],
-        allow_early_resolve=True,
+        # Keep the routed expert tasks off the cores until this gather retires.
+        allow_early_resolve=False,
     ) as _gather_tid:
         e = pl.tile.get_block_idx()
         e_base_row = e * RECV_MAX
@@ -300,6 +306,8 @@ def dispatch(
                 pl.write(recv_r_route_out, [e, out_col], pl.read(recv_route, [in_row, 0]))
             b = b + n
 
+    return _push_tid
+
 
 # === Combine =================================================================
 # Push recv_y rows back to their origin rank keyed by r_route, barrier, then a
@@ -316,6 +324,7 @@ def combine(
     num_tokens: pl.Scalar[pl.INT32],
     my_rank: pl.Scalar[pl.INT32],
     moe_epoch: pl.Scalar[pl.INT32],
+    dispatch_push_tid: pl.Scalar[pl.TASK_ID],
 ):
     recv_y_flat = pl.reshape(recv_y, [N_LOCAL * RECV_MAX, D])
     # One SPMD block per LOCAL EXPERT: block e pushes expert e's compact rows back to
@@ -323,9 +332,9 @@ def combine(
     # Rows are src-major, so the per-(e, src) base is a loop-carried prefix sum over
     # src inside the block (same shape as dispatch_gather). Each route maps to a
     # unique (dst, loc_e) and r_route, so the blocks' puts are write-disjoint.
-    # allow_early_resolve: shared_routed pre-stages only when every producer of its
-    # fanin is flagged, and combine_wait already is.
-    with pl.spmd(N_LOCAL, name_hint="combine", allow_early_resolve=True):
+    # Keep the scatter TaskId so the arrival handshake cannot occupy AIV cores
+    # until every routed_y_buf put from this rank has completed.
+    with pl.spmd(N_LOCAL, name_hint="combine") as _combine_tid:
         e = pl.tile.get_block_idx()
         e_base_row = e * RECV_MAX
         b = pl.cast(0, pl.INDEX)
@@ -344,11 +353,14 @@ def combine(
                 )
             b = b + n
 
-        # Payload-arrival notify folded into the scatter (mirrors dispatch_push):
-        # each block signals every peer after its own puts, so the wait below expects
-        # N_LOCAL * moe_epoch. Saves a task launch on the cross-rank critical path.
-        # The [1, D] puts above are single-shot TPUTs, which drain themselves before
-        # this notify issues.
+    # Publish only after the complete scatter grid. Keeping this cross-rank wait
+    # out of the speculative early-dispatch chain prevents it and shared_routed
+    # from reserving the AIV cores needed by the scatter itself.
+    with pl.at(
+        level=pl.Level.CORE_GROUP,
+        name_hint="combine_wait",
+        deps=[_combine_tid, dispatch_push_tid],
+    ) as _cwait_tid:
         for peer in pl.range(N_RANKS):
             if peer != my_rank:
                 pld.system.notify(
@@ -359,20 +371,12 @@ def combine(
                     op=pld.NotifyOp.AtomicAdd,
                 )
 
-    # Wait only (the notify rides inside the scatter), so it spins on the peers'
-    # counters while our own scatter runs. The recv_y_flat read is an anchor, not
-    # data: it auto-deps this task on exp_w2_act, starting the wait when the scatter
-    # starts. Anchor it to something -- a wait with no dep at all is dispatched the
-    # moment the scheduler reaches it and spins holding a core group, so pipelined
-    # layers stack up spinners that starve the scatters they wait on.
-    with pl.at(level=pl.Level.CORE_GROUP, name_hint="combine_wait", allow_early_resolve=True) as _cwait_tid:
-        _recv_y_anchor = pl.read(recv_y_flat, [0, 0])
         for src in pl.range(N_RANKS):
             if src != my_rank:
                 pld.system.wait(
                     signal=combine_arrived,
                     offsets=[src, 0],
-                    expected=pl.cast(moe_epoch * N_LOCAL, pl.INT32),
+                    expected=moe_epoch,
                     cmp=pld.WaitCmp.Ge,
                 )
 
@@ -388,7 +392,6 @@ def combine(
         T,
         name_hint="shared_routed",
         deps=[_cwait_tid],
-        allow_early_resolve=True,
     ) as _reduce_tid:
         t = pl.tile.get_block_idx()
         if t < active_tokens:
@@ -476,7 +479,7 @@ def moe(
     recv_r_route_out = pl.create_tensor([N_LOCAL, RECV_MAX], dtype=pl.INT32, manual_dep=True)
     recv_count_out = pl.create_tensor([N_LOCAL, 1], dtype=pl.INT32)
     recv_meta_local = pl.create_tensor([N_RANKS, N_LOCAL], dtype=pl.INT32, manual_dep=True)
-    dispatch(
+    dispatch_push_tid = dispatch(
         indices, x_norm_i8, x_norm_scale, weights,
         recv_x_out, recv_scale_out, recv_w_out, recv_r_route_out, recv_count_out, recv_meta_local,
         recv_meta, recv_x, recv_aux, recv_route, arrived, data_arrived,
@@ -497,7 +500,7 @@ def moe(
             recv_y, recv_r_route_out, sh,
             ffn_out, recv_meta_local,
             routed_y_buf, combine_arrived,
-            num_tokens, my_rank, moe_epoch,
+            num_tokens, my_rank, moe_epoch, dispatch_push_tid,
         )
 
         hc_post(ffn_out, x_hc, post_ffn, comb_ffn, x_next)

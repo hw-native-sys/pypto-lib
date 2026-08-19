@@ -271,8 +271,8 @@ def mtp_decode_layer(
     wkv: pl.Tensor[[D, HEAD_DIM], pl.BF16],
     gamma_cq: pl.Tensor[[Q_LORA], pl.BF16],
     gamma_ckv: pl.Tensor[[HEAD_DIM], pl.BF16],
-    freqs_cos: pl.Tensor[[MAX_SEQ_LEN, ROPE_HEAD_DIM], pl.BF16],
-    freqs_sin: pl.Tensor[[MAX_SEQ_LEN, ROPE_HEAD_DIM], pl.BF16],
+    freqs_cos: pl.Tensor[[2, MAX_SEQ_LEN, ROPE_HEAD_DIM], pl.BF16],
+    freqs_sin: pl.Tensor[[2, MAX_SEQ_LEN, ROPE_HEAD_DIM], pl.BF16],
     kv_cache: pl.InOut[pl.Tensor[[ORI_BLOCK_NUM_DYN, BLOCK_SIZE, 1, HEAD_DIM], pl.BF16]],
     ori_block_table: pl.Tensor[[B, ORI_TABLE_MAX_BLOCKS], pl.INT32],
     attn_sink: pl.Tensor[[H], pl.FP32],
@@ -324,6 +324,18 @@ def mtp_decode_layer(
     my_rank: pl.Scalar[pl.INT32],
     num_tokens: pl.Scalar[pl.INT32],
 ) -> pl.Tensor[[T, HC_MULT, D], pl.BF16]:
+    swa_cos_profile: pl.Tensor[[1, MAX_SEQ_LEN, ROPE_HEAD_DIM], pl.BF16] = pl.slice(
+        freqs_cos, [1, MAX_SEQ_LEN, ROPE_HEAD_DIM], [0, 0, 0]
+    )
+    swa_sin_profile: pl.Tensor[[1, MAX_SEQ_LEN, ROPE_HEAD_DIM], pl.BF16] = pl.slice(
+        freqs_sin, [1, MAX_SEQ_LEN, ROPE_HEAD_DIM], [0, 0, 0]
+    )
+    swa_freqs_cos: pl.Tensor[[MAX_SEQ_LEN, ROPE_HEAD_DIM], pl.BF16] = pl.reshape(
+        swa_cos_profile, [MAX_SEQ_LEN, ROPE_HEAD_DIM]
+    )
+    swa_freqs_sin: pl.Tensor[[MAX_SEQ_LEN, ROPE_HEAD_DIM], pl.BF16] = pl.reshape(
+        swa_sin_profile, [MAX_SEQ_LEN, ROPE_HEAD_DIM]
+    )
     return mtp_decode_layer_inline(
         embed_weight,
         main_pre_hc_hidden,
@@ -349,8 +361,8 @@ def mtp_decode_layer(
         wkv,
         gamma_cq,
         gamma_ckv,
-        freqs_cos,
-        freqs_sin,
+        swa_freqs_cos,
+        swa_freqs_sin,
         kv_cache,
         ori_block_table,
         attn_sink,
@@ -430,8 +442,8 @@ def l3_mtp_decode_layer(
     wkv: pl.Tensor[[N_RANKS, D, HEAD_DIM], pl.BF16],
     gamma_cq: pl.Tensor[[N_RANKS, Q_LORA], pl.BF16],
     gamma_ckv: pl.Tensor[[N_RANKS, HEAD_DIM], pl.BF16],
-    freqs_cos: pl.Tensor[[N_RANKS, MAX_SEQ_LEN, ROPE_HEAD_DIM], pl.BF16],
-    freqs_sin: pl.Tensor[[N_RANKS, MAX_SEQ_LEN, ROPE_HEAD_DIM], pl.BF16],
+    freqs_cos: pl.Tensor[[N_RANKS, 2, MAX_SEQ_LEN, ROPE_HEAD_DIM], pl.BF16],
+    freqs_sin: pl.Tensor[[N_RANKS, 2, MAX_SEQ_LEN, ROPE_HEAD_DIM], pl.BF16],
     kv_cache: pl.InOut[pl.Tensor[[N_RANKS, ORI_BLOCK_NUM_DYN, BLOCK_SIZE, 1, HEAD_DIM], pl.BF16]],
     ori_block_table: pl.Tensor[[N_RANKS, B, ORI_TABLE_MAX_BLOCKS], pl.INT32],
     attn_sink: pl.Tensor[[N_RANKS, H], pl.FP32],
@@ -693,6 +705,7 @@ def _mtp_head_specs():
 def build_tensor_specs(start_pos=DECODE_START_POS, num_tokens=T, ori_block_num=ORI_BLOCK_NUM):
     import torch
     from golden import ScalarSpec, TensorSpec
+    from utils import build_rope_tables
 
     projection_specs = _projection_specs()
     mtp_head_specs = _mtp_head_specs()
@@ -700,6 +713,34 @@ def build_tensor_specs(start_pos=DECODE_START_POS, num_tokens=T, ori_block_num=O
     swa_specs = {spec.name: spec for spec in swa_tensor_specs if isinstance(spec, TensorSpec)}
     moe_tensor_specs = build_moe_tensor_specs(layer_id=MTP_LAYER_ID, num_tokens=num_tokens)
     moe_specs = {spec.name: spec for spec in moe_tensor_specs if isinstance(spec, TensorSpec)}
+    compressed_freqs_cos, compressed_freqs_sin = build_rope_tables(M, 4, dtype=torch.bfloat16)
+
+    def init_freqs_cos():
+        return torch.stack(
+            (swa_specs["freqs_cos"].create_tensor(), compressed_freqs_cos.clone()),
+            dim=0,
+        )
+
+    def init_freqs_sin():
+        return torch.stack(
+            (swa_specs["freqs_sin"].create_tensor(), compressed_freqs_sin.clone()),
+            dim=0,
+        )
+
+    rope_specs = {
+        "freqs_cos": TensorSpec(
+            "freqs_cos",
+            [2, *swa_specs["freqs_cos"].shape],
+            swa_specs["freqs_cos"].dtype,
+            init_value=init_freqs_cos,
+        ),
+        "freqs_sin": TensorSpec(
+            "freqs_sin",
+            [2, *swa_specs["freqs_sin"].shape],
+            swa_specs["freqs_sin"].dtype,
+            init_value=init_freqs_sin,
+        ),
+    }
 
     def init_lm_head_weight():
         shards = (torch.randn(LM_HEAD_TP_SIZE, VOCAB_PER_TP, D) / D ** 0.5).to(torch.bfloat16)
@@ -779,6 +820,8 @@ def build_tensor_specs(start_pos=DECODE_START_POS, num_tokens=T, ori_block_num=O
                 torch.int32,
                 init_value=init_ori_block_table,
             ))
+        elif name in rope_specs:
+            specs.append(_ranked_spec(name, rope_specs[name], replicated=True))
         else:
             ranked_spec = _ranked_spec(
                 name, swa_specs[name],
@@ -921,8 +964,8 @@ def golden_mtp_decode_layer(tensors):
             "wkv": tensors["wkv"][rank],
             "gamma_cq": tensors["gamma_cq"][rank],
             "gamma_ckv": tensors["gamma_ckv"][rank],
-            "freqs_cos": tensors["freqs_cos"][rank],
-            "freqs_sin": tensors["freqs_sin"][rank],
+            "freqs_cos": tensors["freqs_cos"][rank, 0],
+            "freqs_sin": tensors["freqs_sin"][rank, 0],
             "kv_cache": tensors["kv_cache"][rank],
             "swa_slot_mapping": swa_slot_mapping[rank],
             "swa_indices": swa_indices[rank],

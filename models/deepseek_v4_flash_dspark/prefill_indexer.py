@@ -94,8 +94,8 @@ QH_MM_TILE = 64
 # columns; the rest stays -inf.
 SORT_LEN = 2048
 # topk_pairs (= 2*PREFILL_TOPK_CAP) must be a power of two aligned to the final mrgsort run: a
-# misaligned prefix (e.g. 2*192) faults like a narrow sort. The real score cap is 256, so two
-# merge stages are sufficient: the only finite values are sorted within the first 512-value run.
+# misaligned prefix (e.g. 2*192) faults like a narrow sort. Two merge stages order the first
+# 512-value run, which covers a 256-wide score; past that the 1024 stage below is required.
 PREFILL_TOPK_CAP = INDEXER_TOPK_CAP
 TOPK_PAIR_WIDTH = 2 * PREFILL_TOPK_CAP
 SCORE_INIT_TILE = 16                   # rows per -inf init write; keeps [tile, SORT_LEN] under the Vec limit
@@ -339,13 +339,16 @@ def prefill_indexer(
                 pos = pl.read(position_ids, [t])
                 visible_t = pl.min((pos + 1) // COMPRESS_RATIO, INDEXER_SCORE_CAP)
                 if visible_t > 0:
-                    # Sort the wide score row and gather the top-k indices. Only the first 256
-                    # values can be finite, so the 64/256 merge stages fully order the useful run.
+                    # Sort the wide score row and gather the top-k indices. The finite values
+                    # occupy the first INDEXER_SCORE_CAP columns; the merge stages must order
+                    # that whole prefix, so a cap past 256 takes the 1024 stage as well.
                     score_row = score_wide[t : t + 1, :]
                     idx_init = pl.arange(0, [1, SORT_LEN], dtype=pl.UINT32)
                     sorted_tile = pl.sort32(score_row, idx_init)
                     sorted_tile = pl.mrgsort(sorted_tile, block_len=64)
                     sorted_tile = pl.mrgsort(sorted_tile, block_len=256)
+                    if INDEXER_SCORE_CAP > 256:
+                        sorted_tile = pl.mrgsort(sorted_tile, block_len=1024)
                     topk_pairs = sorted_tile[:, 0:TOPK_PAIR_WIDTH]
                     topk_idxs_tile = pl.gather(topk_pairs, mask_pattern=pl.tile.MaskPattern.P1010, output_dtype=pl.INT32)
                     valid_topk = pl.min(PREFILL_TOPK_CAP, visible_t)

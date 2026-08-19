@@ -6,8 +6,33 @@
 # INCLUDING BUT NOT LIMITED TO NON-INFRINGEMENT, MERCHANTABILITY, OR FITNESS FOR A PARTICULAR PURPOSE.
 # See LICENSE in the root of the software repository for the full text of the License.
 # -----------------------------------------------------------------------------------------------------------
-# ci: devices=4
+# ci: devices=2  # CI: 2-card run; borrows 2 cards via task-submit --device-num
 """DeepSeek-V4 decode output projections and their TP communication."""
+
+import sys
+
+import config
+
+
+# TP-derived shapes freeze at import time, so select the TP world before the
+# config read below.
+_TP_CHOICES = (1, 2, 4)
+_TP_DEFAULT = 2
+
+
+def _parse_tp_argv():
+    for index, arg in enumerate(sys.argv):
+        if arg == "--tp" and index + 1 < len(sys.argv):
+            return int(sys.argv[index + 1])
+        if arg.startswith("--tp="):
+            return int(arg.split("=", 1)[1])
+    return _TP_DEFAULT
+
+
+TP_SIZE = _parse_tp_argv()
+if TP_SIZE not in _TP_CHOICES:
+    raise ValueError(f"--tp must be one of {_TP_CHOICES} (got {TP_SIZE})")
+config.TP = TP_SIZE
 
 import pypto.language as pl
 import pypto.language.distributed as pld
@@ -17,12 +42,8 @@ from config import (
     FLASH as M,
     INT8_AMAX_EPS,
     INT8_SCALE_MAX,
-    TP,
 )
 
-
-# parallel layout
-TP_SIZE = TP
 
 # model config
 D = M.hidden_size
@@ -292,7 +313,7 @@ def kv_token_allgather_step(
 
 
 @pl.jit.incore
-def attention_token_head_all_to_all_step(
+def o_group_a2a(
     attention_grouped: pl.Tensor[[O_GROUPS * LOCAL_T_PAD, O_GROUP_IN], pl.BF16],
     local_groups_out: pl.InOut[pl.Tensor[[ATTENTION_WINDOW_ROWS, O_GROUP_IN], pl.BF16]],
     exchange_window: pld.DistributedTensor[[ATTENTION_WINDOW_ROWS, O_GROUP_IN], pl.BF16],
@@ -328,8 +349,8 @@ def attention_token_head_all_to_all_step(
     return local_groups_out, exchange_signal
 
 
-@pl.jit.incore
-def o_projection_reduce_scatter_step(
+@pl.jit.inline
+def o_proj_reduce_scatter(
     o_partial: pl.Tensor[[GROUP_T_PAD, D], pl.FP32],
     local_out: pl.InOut[pl.Tensor[[LOCAL_T_PAD, D], pl.BF16]],
     reduce_window: pld.DistributedTensor[[O_WINDOW_ROWS, D], pl.FP32],
@@ -337,30 +358,33 @@ def o_projection_reduce_scatter_step(
     group_base: pl.Scalar[pl.INT32],
     tp_rank: pl.Scalar[pl.INT32],
     local_t: pl.Scalar[pl.INT32],
+    proj_dep: pl.Scalar[pl.TASK_ID],
 ):
     """Sum O-B rank partials and scatter valid contiguous local token rows."""
-    for owner_rank in pl.range(TP_SIZE):
-        owner_source_row = owner_rank * local_t
-        target_row = tp_rank * local_t
-        pld.tensor.put(
-            dst=reduce_window, peer=group_base + owner_rank, src=o_partial,
-            dst_offsets=[target_row, 0], src_offsets=[owner_source_row, 0], shape=[local_t, D],
-            chunk_rows=COMM_ROW_TILE, chunk_cols=D,
-        )
+    # Own core-group scope, ordered after the O-B partial through proj_dep.
+    with pl.at(level=pl.Level.CORE_GROUP, name_hint="tp_o_reduce_scatter", deps=[proj_dep]):
+        for owner_rank in pl.range(TP_SIZE):
+            owner_source_row = owner_rank * local_t
+            target_row = tp_rank * local_t
+            pld.tensor.put(
+                dst=reduce_window, peer=group_base + owner_rank, src=o_partial,
+                dst_offsets=[target_row, 0], src_offsets=[owner_source_row, 0], shape=[local_t, D],
+                chunk_rows=COMM_ROW_TILE, chunk_cols=D,
+            )
 
-    expected_one = pl.cast(1, pl.INT32)
-    reduce_signal = tp_group_barrier(reduce_signal, group_base, tp_rank, expected_one)
-    for local_row in pl.range(local_t):
-        acc = pl.load(reduce_window, [local_row, 0], [1, D])
-        for source_tp in pl.range(1, TP_SIZE):
-            source_partial_row = source_tp * local_t + local_row
-            source_partial = pl.load(reduce_window, [source_partial_row, 0], [1, D])
-            acc = pl.add(acc, source_partial)
-        reduced_bf16 = pl.cast(acc, target_type=pl.BF16, mode="rint")
-        pl.store(reduced_bf16, [local_row, 0], local_out)
-    expected_two = pl.cast(2, pl.INT32)
-    reduce_signal = tp_group_barrier(reduce_signal, group_base, tp_rank, expected_two)
-    reduce_signal = reset_tp_group_signal(reduce_signal, group_base, tp_rank)
+        expected_one = pl.cast(1, pl.INT32)
+        reduce_signal = tp_group_barrier(reduce_signal, group_base, tp_rank, expected_one)
+        for local_row in pl.range(local_t):
+            acc = pl.load(reduce_window, [local_row, 0], [1, D])
+            for source_tp in pl.range(1, TP_SIZE):
+                source_partial_row = source_tp * local_t + local_row
+                source_partial = pl.load(reduce_window, [source_partial_row, 0], [1, D])
+                acc = pl.add(acc, source_partial)
+            reduced_bf16 = pl.cast(acc, target_type=pl.BF16, mode="rint")
+            pl.store(reduced_bf16, [local_row, 0], local_out)
+        expected_two = pl.cast(2, pl.INT32)
+        reduce_signal = tp_group_barrier(reduce_signal, group_base, tp_rank, expected_two)
+        reduce_signal = reset_tp_group_signal(reduce_signal, group_base, tp_rank)
     return local_out, reduce_signal
 
 
@@ -386,11 +410,13 @@ def decode_attention_collectives_fixture(
     kv_group, kv_signal = kv_token_allgather_step(
         kv_local, kv_group, kv_window, kv_signal, group_base, tp_rank, local_t,
     )
-    attention_local_groups, attention_signal = attention_token_head_all_to_all_step(
+    attention_local_groups, attention_signal = o_group_a2a(
         attention_grouped, attention_local_groups, attention_window, attention_signal, group_base, tp_rank, local_t,
     )
-    o_local, o_signal = o_projection_reduce_scatter_step(
-        o_partial, o_local, o_window, o_signal, group_base, tp_rank, local_t,
+    # o_partial arrives as a program input, so anchor an empty dep.
+    o_partial_dep = pl.system.task_dummy(deps=[])
+    o_local, o_signal = o_proj_reduce_scatter(
+        o_partial, o_local, o_window, o_signal, group_base, tp_rank, local_t, o_partial_dep,
     )
     return kv_group, attention_local_groups, o_local, kv_signal, attention_signal, o_signal
 
@@ -509,7 +535,7 @@ def golden_decode_attention_collectives_fixture(tensors):
 
 
 @pl.jit.inline
-def decode_sharded_o_projection(
+def decode_o_proj(
     attention_local_groups: pl.Tensor[[LOCAL_O_GROUPS, GROUP_T_PAD, O_GROUP_IN], pl.BF16],
     wo_a: pl.Tensor[[LOCAL_O_GROUPS, O_LORA, O_GROUP_IN], pl.BF16],
     wo_b: pl.Tensor[[D, LOCAL_O_WIDTH], pl.INT8],
@@ -629,7 +655,7 @@ def decode_sharded_o_projection(
 
 
 @pl.jit
-def decode_sharded_o_projection_test(
+def decode_o_proj_test(
     attention_local_groups: pl.Tensor[[LOCAL_O_GROUPS, GROUP_T_PAD, O_GROUP_IN], pl.BF16],
     wo_a: pl.Tensor[[LOCAL_O_GROUPS, O_LORA, O_GROUP_IN], pl.BF16],
     wo_b: pl.Tensor[[D, LOCAL_O_WIDTH], pl.INT8],
@@ -638,7 +664,7 @@ def decode_sharded_o_projection_test(
     o_partial: pl.InOut[pl.Tensor[[GROUP_T_PAD, D], pl.FP32]],
 ):
     """Run one receive-side output projection at a runtime token count."""
-    o_partial, completion_tid = decode_sharded_o_projection(
+    o_partial, completion_tid = decode_o_proj(
         attention_local_groups, wo_a, wo_b, wo_b_scale,
         local_t, o_partial,
     )
@@ -648,7 +674,7 @@ def decode_sharded_o_projection_test(
     return o_partial
 
 
-def build_sharded_o_proj_tensor_specs(local_t):
+def build_o_proj_tensor_specs(local_t):
     """Build deterministic capacity-static inputs with a poisoned receive tail."""
     import torch
 
@@ -698,7 +724,7 @@ def build_sharded_o_proj_tensor_specs(local_t):
     ]
 
 
-def golden_decode_sharded_o_projection(tensors):
+def golden_decode_o_proj(tensors):
     """Compute the per-group A8 projection over the compact receive prefix."""
     import torch
 
@@ -729,6 +755,7 @@ if __name__ == "__main__":
 
     parser = argparse.ArgumentParser()
     parser.add_argument("-p", "--platform", type=str, default="a2a3", choices=("a2a3", "a2a3sim", "a5", "a5sim"))
+    parser.add_argument("--tp", type=int, default=TP_SIZE, choices=list(_TP_CHOICES), help="tensor-parallel world size")
     parser.add_argument("-d", "--device", type=str, default=",".join(str(i) for i in range(TP_SIZE)))
     parser.add_argument("--mode", choices=("all", "collectives", "sharded"), default="all")
     parser.add_argument(
@@ -746,6 +773,9 @@ if __name__ == "__main__":
     )
     parser.add_argument("--dump-passes", action="store_true", default=False)
     args = parser.parse_args()
+
+    if args.tp != TP_SIZE:
+        parser.error(f"--tp must remain {TP_SIZE} after import-time specialization")
 
     device_ids = [int(device) for device in args.device.split(",")]
     if args.mode in ("all", "collectives") and len(device_ids) != TP_SIZE:
@@ -799,9 +829,9 @@ if __name__ == "__main__":
                 zero_tail=True,
             )
             result = run_jit(
-                fn=decode_sharded_o_projection_test,
-                specs=build_sharded_o_proj_tensor_specs(local_t),
-                golden_fn=golden_decode_sharded_o_projection,
+                fn=decode_o_proj_test,
+                specs=build_o_proj_tensor_specs(local_t),
+                golden_fn=golden_decode_o_proj,
                 compile_only=args.compile_only,
                 compile_cfg=dict(dump_passes=args.dump_passes),
                 runtime_cfg=dict(platform=args.platform, device_id=device_ids[0]),

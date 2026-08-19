@@ -151,15 +151,25 @@ def qkv_proj_rope(
         q_rope_sin_signed[qrp_t0 : qrp_t0 + Q_ROPE_T_TILE, :] = qrp_sin_signed
         q_rope_swap_idx[qrp_t0 : qrp_t0 + Q_ROPE_T_TILE, :] = qrp_swap_idx
 
-    # Split-K qr_proj partials are reduced in ascending K order.
+    # Split-K qr_proj (M=t_dim, K=D=4096, N=Q_LORA=1024). QR_N_TILE=128 gives
+    # eight N-groups; QR_OK=2 expands them to 16 cube blocks and atomic-adds the
+    # K partials into a zero-seeded output. Auto-dep on qr_fp32 orders the seed
+    # before every atomic RMW. Seeded on-core (not create_tensor init_value=0):
+    # AICPU init serializes on the scheduler/orchestration path and roughly
+    # doubles the decode orch window, whereas the on-core memset overlaps.
     qr_fp32 = pl.create_tensor([t_matmul, Q_LORA], dtype=pl.FP32)
-    qr_partial_rows = QR_OK * t_matmul
-    qr_partials = pl.create_tensor([qr_partial_rows, Q_LORA], dtype=pl.FP32)
     qr_i8_matmul = pl.create_tensor([t_matmul, Q_LORA], dtype=pl.INT8)
+    with pl.at(level=pl.Level.CORE_GROUP, name_hint="qr_proj_seed"):
+        for tc in pl.range(t_matmul // QR_M_TILE):
+            ts0 = tc * QR_M_TILE
+            for nb in pl.range(Q_LORA // QR_N_TILE):
+                nseed0 = nb * QR_N_TILE
+                qr_fp32[ts0 : ts0 + QR_M_TILE, nseed0 : nseed0 + QR_N_TILE] = pl.full(
+                    [QR_M_TILE, QR_N_TILE], dtype=pl.FP32, value=0.0
+                )
     for qbg_idx in pl.spmd((Q_LORA // QR_N_TILE) * QR_OK, name_hint="qr_proj_matmul", allow_early_resolve=True):
         q_a_col0 = (qbg_idx // QR_OK) * QR_N_TILE
-        qr_split = qbg_idx % QR_OK
-        qr_k_base = qr_split * QR_K_SLICE
+        qr_k_base = (qbg_idx % QR_OK) * QR_K_SLICE
         for tc in pl.range(t_matmul // QR_M_TILE):
             t0 = tc * QR_M_TILE
             q_acc = pl.create_tensor([QR_M_TILE, QR_N_TILE], dtype=pl.FP32)
@@ -172,26 +182,7 @@ def qkv_proj_rope(
                     q_acc = pl.matmul(q_x_chunk_bf16, w_chunk, out_dtype=pl.FP32)
                 else:
                     q_acc = pl.matmul_acc(q_acc, q_x_chunk_bf16, w_chunk)
-            qr_partials = pl.assemble(qr_partials, q_acc, [qr_split * t_matmul + t0, q_a_col0])
-
-    for qr_reduce_idx in pl.spmd(
-        (t_matmul // QR_M_TILE) * (Q_LORA // QR_N_TILE),
-        name_hint="qr_proj_reduce",
-        allow_early_resolve=True,
-    ):
-        qr_t0 = (qr_reduce_idx // (Q_LORA // QR_N_TILE)) * QR_M_TILE
-        qr_col0 = (qr_reduce_idx % (Q_LORA // QR_N_TILE)) * QR_N_TILE
-        qr_total = qr_partials[qr_t0 : qr_t0 + QR_M_TILE, qr_col0 : qr_col0 + QR_N_TILE]
-        for qr_split in pl.range(1, QR_OK):
-            qr_partial_t0 = qr_split * t_matmul + qr_t0
-            qr_total = pl.add(
-                qr_total,
-                qr_partials[
-                    qr_partial_t0 : qr_partial_t0 + QR_M_TILE,
-                    qr_col0 : qr_col0 + QR_N_TILE,
-                ],
-            )
-        qr_fp32 = pl.assemble(qr_fp32, qr_total, [qr_t0, qr_col0])
+            qr_fp32 = pl.assemble(qr_fp32, q_acc, [t0, q_a_col0], atomic=pl.AtomicType.Add)
 
     # Two passes per block: pass 1 computes amax; pass 2 recomputes norm and quantizes.
     for tg_idx in pl.spmd(t_dim // T_TILE, name_hint="qr_rms_norm_quant", allow_early_resolve=True):
@@ -302,18 +293,25 @@ def qkv_proj_rope(
                 q_rope_bf16 = pl.cast(q_rope_rot, target_type=pl.BF16, mode="rint")
                 q_flat[tg : tg + Q_ROPE_T_TILE, h0 + NOPE_DIM : h0 + NOPE_DIM + ROPE_DIM] = q_rope_bf16
 
-    # Split-K kv_proj partials are reduced in ascending K order.
+    # Split-K kv_proj uses four 128-column N-groups and KV_OK=4, again producing
+    # 16 cube blocks. KV is off the critical path, so more K splits only add atomic
+    # contention without shortening decode.
     kv_fp32 = pl.create_tensor([t_matmul, HEAD_DIM], dtype=pl.FP32)
-    kv_partial_rows = KV_OK * t_matmul
-    kv_partials = pl.create_tensor([kv_partial_rows, HEAD_DIM], dtype=pl.FP32)
+    with pl.at(level=pl.Level.CORE_GROUP, name_hint="kv_proj_seed"):
+        for tc in pl.range(t_matmul // KV_M_TILE):
+            kts0 = tc * KV_M_TILE
+            for nb in pl.range(HEAD_DIM // KV_N_TILE):
+                kvseed0 = nb * KV_N_TILE
+                kv_fp32[kts0 : kts0 + KV_M_TILE, kvseed0 : kvseed0 + KV_N_TILE] = pl.full(
+                    [KV_M_TILE, KV_N_TILE], dtype=pl.FP32, value=0.0
+                )
     # `late_dep` is a dummy barrier hung off the rms_norm TaskId: kv_proj is off the
     # critical path, so it resolves one hop after rms_norm and lets qr_proj_matmul
     # take the cores first.
     with pl.spmd((HEAD_DIM // KV_N_TILE) * KV_OK, name_hint="kv_proj_matmul", deps=[late_dep]) as _kv_tid:
         kbg = pl.tile.get_block_idx()
         kv_col0 = (kbg // KV_OK) * KV_N_TILE
-        kv_split = kbg % KV_OK
-        kv_k_base = kv_split * KV_K_SLICE
+        kv_k_base = (kbg % KV_OK) * KV_K_SLICE
         for tc in pl.range(t_matmul // KV_M_TILE):
             t0 = tc * KV_M_TILE
             kv_acc = pl.create_tensor([KV_M_TILE, KV_N_TILE], dtype=pl.FP32)
@@ -326,26 +324,7 @@ def qkv_proj_rope(
                     kv_acc = pl.matmul(kv_x_chunk_bf16, wkv_chunk, out_dtype=pl.FP32)
                 else:
                     kv_acc = pl.matmul_acc(kv_acc, kv_x_chunk_bf16, wkv_chunk)
-            kv_partials = pl.assemble(kv_partials, kv_acc, [kv_split * t_matmul + t0, kv_col0])
-
-    for kv_reduce_idx in pl.spmd(
-        (t_matmul // KV_M_TILE) * (HEAD_DIM // KV_N_TILE),
-        name_hint="kv_proj_reduce",
-        allow_early_resolve=True,
-    ):
-        kv_t0 = (kv_reduce_idx // (HEAD_DIM // KV_N_TILE)) * KV_M_TILE
-        kv_col0 = (kv_reduce_idx % (HEAD_DIM // KV_N_TILE)) * KV_N_TILE
-        kv_total = kv_partials[kv_t0 : kv_t0 + KV_M_TILE, kv_col0 : kv_col0 + KV_N_TILE]
-        for kv_split in pl.range(1, KV_OK):
-            kv_partial_t0 = kv_split * t_matmul + kv_t0
-            kv_total = pl.add(
-                kv_total,
-                kv_partials[
-                    kv_partial_t0 : kv_partial_t0 + KV_M_TILE,
-                    kv_col0 : kv_col0 + KV_N_TILE,
-                ],
-            )
-        kv_fp32 = pl.assemble(kv_fp32, kv_total, [kv_t0, kv_col0])
+            kv_fp32 = pl.assemble(kv_fp32, kv_acc, [t0, kv_col0], atomic=pl.AtomicType.Add)
 
     # Fused KV RMSNorm + interleaved (CANN A3) RoPE. One spmd task per [KV_RMS_T_TILE, HEAD_DIM]
     # row block computes the per-row inv_rms once (pass 1) and consumes it locally for

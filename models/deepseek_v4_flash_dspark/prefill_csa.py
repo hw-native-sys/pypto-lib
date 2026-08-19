@@ -585,7 +585,9 @@ def build_tensor_specs(
             f"needs {max_visible_cmp} scored compressed positions; the indexer score "
             f"cap is {INDEXER_SCORE_CAP} and the tail past it is silently dropped"
         )
-    max_sparse_rows = WIN + max_visible_cmp
+    # The sparse rows are the window plus what the indexer actually emits, which
+    # is its top-k, not every visible compressed position.
+    max_sparse_rows = WIN + min(max_visible_cmp, IDX_TOPK)
     if max_sparse_rows > SPARSE_PREFILL_SPARSE_PAD:
         raise ValueError(
             f"needs {max_sparse_rows} sparse rows; current packed sparse CSA cap is {SPARSE_PREFILL_SPARSE_PAD}"
