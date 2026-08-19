@@ -44,13 +44,14 @@ from config import (
     DECODE_SEQ,
     BLOCK_SIZE,
     C128_COMPRESSOR_BLOCK_SIZE,
-    KV_CMP_BLOCK_NUM,
     KV_ORI_BLOCK_NUM,
     HCA_STATE_PHYSICAL_BLOCKS,
-    KV_CMP_MAX_BLOCKS,
     KV_ORI_MAX_BLOCKS,
+    HCA_KV_POOL_BLOCKS,
+    HCA_ROWS_PER_SHARD,
     INT8_SCALE_MAX,
     INT8_AMAX_EPS,
+    SWA_SOURCE_OVERLAY_BASE,
 )
 from hc_pre import hc_pre
 from hc_post import hc_post
@@ -72,13 +73,16 @@ from decode_o_proj import (
     o_proj_reduce_scatter,
 )
 from decode_sparse_attn_hca import (
-    CMP_TOPK,
     HALF_ROPE,
     NOPE_DIM,
     ROPE_DIM,
     T_PAD,
-    VALID_TOKEN_TILE,
+    HCA_WORK_DYN,
+    HCA_PAGES_DYN,
+    HCA_REQUEST_OFFSETS_DYN,
+    HCA_QUERY_OFFSETS_DYN,
     sparse_attn_hca,
+    sparse_attn_hca_heads,
 )
 
 # Dynamic shape variables.
@@ -120,20 +124,22 @@ COFF = 1 + int(OVERLAP)         # always 1 for HCA
 MAIN_OUT_DIM = COFF * HEAD_DIM
 ORI_MAX_BLOCKS = KV_ORI_MAX_BLOCKS
 ORI_BLOCK_NUM = KV_ORI_BLOCK_NUM
-CMP_MAX_BLOCKS = KV_CMP_MAX_BLOCKS
-CMP_BLOCK_NUM = KV_CMP_BLOCK_NUM
+CMP_BLOCK_NUM = HCA_KV_POOL_BLOCKS
+CMP_MAX_BLOCKS = (MAX_SEQ_LEN + BLOCK_SIZE - 1) // BLOCK_SIZE
 # Main compressor state pool (kv + score channels merged into one paged FP32 buffer).
 COMPRESS_STATE_BLOCK_SIZE = C128_COMPRESSOR_BLOCK_SIZE
 COMPRESS_STATE_PHYSICAL_BLOCKS = HCA_STATE_PHYSICAL_BLOCKS
 COMPRESS_STATE_MAX_BLOCKS = (MAX_SEQ_LEN + COMPRESS_STATE_BLOCK_SIZE - 1) // COMPRESS_STATE_BLOCK_SIZE
 COMPRESS_STATE_BLOCK_NUM = COMPRESS_STATE_PHYSICAL_BLOCKS
 COMPRESS_STATE_DIM = 2 * MAIN_OUT_DIM
-COMPRESS_TOPK = MAX_SEQ_LEN // COMPRESS_RATIO   # demo 32; flash 128 (= 16384/128); max compressed positions
-# HCA has no indexer; the compressed tail is bounded by cache capacity.
-# Longest context served = COMPRESS_TOPK * COMPRESS_RATIO = MAX_SEQ_LEN.
+COMPRESS_TOPK = MAX_SEQ_LEN // COMPRESS_RATIO
+CMP_TOPK = ((COMPRESS_TOPK + HCA_ROWS_PER_SHARD - 1) // HCA_ROWS_PER_SHARD) * HCA_ROWS_PER_SHARD
+# HCA has no learned indexer: its compressed tail is the complete ratio-128
+# cache capacity. Keep the baseline aliases used by the TP1 compatibility
+# path and its golden helper.
 HCA_TOPK_LIMIT = COMPRESS_TOPK
-
 HCA_CMP_TOPK = CMP_TOPK
+VALID_TOKEN_TILE = 8
 
 # tiling
 SPARSE_ROPE_TILE = 16
@@ -151,10 +157,18 @@ if T_PAD != LOCAL_T_PAD:
 def decode_hca(
     q: pl.Tensor[[T_DYN, H, HEAD_DIM], pl.BF16],
     ori_kv: pl.Tensor[[ORI_BLOCK_NUM_DYN, BLOCK_SIZE, 1, HEAD_DIM], pl.BF16],
-    window_swa_indices: pl.Tensor[[T_DYN, WIN], pl.INT32],
+    current_kv: pl.Tensor[[T_DYN, HEAD_DIM], pl.BF16],
+    swa_sources: pl.Tensor[[T_DYN, WIN], pl.INT32],
     cmp_kv: pl.Tensor[[CMP_BLOCK_NUM_DYN, BLOCK_SIZE, 1, HEAD_DIM], pl.BF16],
-    cmp_block_table: pl.Tensor[[B_DYN, CMP_MAX_BLOCKS], pl.INT32],
-    cmp_sparse_indices: pl.Tensor[[T_DYN, CMP_TOPK], pl.INT32],
+    query_request_ids: pl.Tensor[[T_DYN], pl.INT32],
+    hca_pages: pl.Tensor[[HCA_PAGES_DYN, 2], pl.INT32],
+    hca_page_offsets: pl.Tensor[[HCA_REQUEST_OFFSETS_DYN], pl.INT32],
+    hca_windows: pl.Tensor[[B_DYN, 3], pl.INT32],
+    request_epochs: pl.Tensor[[B_DYN], pl.INT32],
+    hca_query_work_offsets: pl.Tensor[[HCA_QUERY_OFFSETS_DYN], pl.INT32],
+    hca_work_query_ids: pl.Tensor[[HCA_WORK_DYN], pl.INT32],
+    hca_work_row_begin: pl.Tensor[[HCA_WORK_DYN], pl.INT32],
+    hca_work_valid_rows: pl.Tensor[[HCA_WORK_DYN], pl.INT32],
     attn_sink: pl.Tensor[[H], pl.FP32],
     freqs_cos: pl.Tensor[[T_DYN, ROPE_DIM], pl.BF16],
     freqs_sin: pl.Tensor[[T_DYN, ROPE_DIM], pl.BF16],
@@ -173,19 +187,31 @@ def decode_hca(
     """Run rank-local HCA heads, output A2A, sharded O projection, and RS."""
     q.bind_dynamic(0, T_DYN)
     ori_kv.bind_dynamic(0, ORI_BLOCK_NUM_DYN)
-    window_swa_indices.bind_dynamic(0, T_DYN)
+    current_kv.bind_dynamic(0, T_DYN)
+    swa_sources.bind_dynamic(0, T_DYN)
     cmp_kv.bind_dynamic(0, CMP_BLOCK_NUM_DYN)
-    cmp_block_table.bind_dynamic(0, B_DYN)
-    cmp_sparse_indices.bind_dynamic(0, T_DYN)
+    query_request_ids.bind_dynamic(0, T_DYN)
+    hca_pages.bind_dynamic(0, HCA_PAGES_DYN)
+    hca_page_offsets.bind_dynamic(0, HCA_REQUEST_OFFSETS_DYN)
+    hca_windows.bind_dynamic(0, B_DYN)
+    request_epochs.bind_dynamic(0, B_DYN)
+    hca_query_work_offsets.bind_dynamic(0, HCA_QUERY_OFFSETS_DYN)
+    hca_work_query_ids.bind_dynamic(0, HCA_WORK_DYN)
+    hca_work_row_begin.bind_dynamic(0, HCA_WORK_DYN)
+    hca_work_valid_rows.bind_dynamic(0, HCA_WORK_DYN)
     freqs_cos.bind_dynamic(0, T_DYN)
     freqs_sin.bind_dynamic(0, T_DYN)
 
     attention_grouped = pl.create_tensor([O_GROUPS * LOCAL_T_PAD, O_GROUP_IN], dtype=pl.BF16)
-    attention_grouped, _ = sparse_attn_hca(
-        q, ori_kv, window_swa_indices,
-        cmp_kv, cmp_block_table, cmp_sparse_indices,
+    cmp_dep = pl.system.task_dummy(deps=[])
+    attention_grouped, _ = sparse_attn_hca_heads(
+        q, ori_kv, current_kv, swa_sources,
+        cmp_kv, query_request_ids,
+        hca_pages, hca_page_offsets, hca_windows, request_epochs,
+        hca_query_work_offsets, hca_work_query_ids,
+        hca_work_row_begin, hca_work_valid_rows,
         attn_sink, freqs_cos, freqs_sin,
-        attention_grouped,
+        attention_grouped, cmp_dep,
     )
 
     attention_local_flat = pl.create_tensor([ATTENTION_WINDOW_ROWS, O_GROUP_IN], dtype=pl.BF16)
@@ -215,10 +241,18 @@ def decode_hca(
 def l3_decode_hca(
     q: pl.Tensor[[TP_SIZE, T_DYN, H, HEAD_DIM], pl.BF16],
     ori_kv: pl.Tensor[[TP_SIZE, ORI_BLOCK_NUM, BLOCK_SIZE, 1, HEAD_DIM], pl.BF16],
-    window_swa_indices: pl.Tensor[[TP_SIZE, T_DYN, WIN], pl.INT32],
-    cmp_kv: pl.Tensor[[TP_SIZE, CMP_BLOCK_NUM, BLOCK_SIZE, 1, HEAD_DIM], pl.BF16],
-    cmp_block_table: pl.Tensor[[TP_SIZE, B_DYN, CMP_MAX_BLOCKS], pl.INT32],
-    cmp_sparse_indices: pl.Tensor[[TP_SIZE, T_DYN, CMP_TOPK], pl.INT32],
+    current_kv: pl.Tensor[[TP_SIZE, T_DYN, HEAD_DIM], pl.BF16],
+    swa_sources: pl.Tensor[[TP_SIZE, T_DYN, WIN], pl.INT32],
+    cmp_kv: pl.Tensor[[TP_SIZE, CMP_BLOCK_NUM_DYN, BLOCK_SIZE, 1, HEAD_DIM], pl.BF16],
+    query_request_ids: pl.Tensor[[TP_SIZE, T_DYN], pl.INT32],
+    hca_pages: pl.Tensor[[TP_SIZE, HCA_PAGES_DYN, 2], pl.INT32],
+    hca_page_offsets: pl.Tensor[[TP_SIZE, HCA_REQUEST_OFFSETS_DYN], pl.INT32],
+    hca_windows: pl.Tensor[[TP_SIZE, B_DYN, 3], pl.INT32],
+    request_epochs: pl.Tensor[[TP_SIZE, B_DYN], pl.INT32],
+    hca_query_work_offsets: pl.Tensor[[TP_SIZE, HCA_QUERY_OFFSETS_DYN], pl.INT32],
+    hca_work_query_ids: pl.Tensor[[TP_SIZE, HCA_WORK_DYN], pl.INT32],
+    hca_work_row_begin: pl.Tensor[[TP_SIZE, HCA_WORK_DYN], pl.INT32],
+    hca_work_valid_rows: pl.Tensor[[TP_SIZE, HCA_WORK_DYN], pl.INT32],
     attn_sink: pl.Tensor[[TP_SIZE, H], pl.FP32],
     freqs_cos: pl.Tensor[[TP_SIZE, T_DYN, ROPE_DIM], pl.BF16],
     freqs_sin: pl.Tensor[[TP_SIZE, T_DYN, ROPE_DIM], pl.BF16],
@@ -230,9 +264,18 @@ def l3_decode_hca(
 ):
     """Launch the HCA output path on one TP group."""
     q.bind_dynamic(1, T_DYN)
-    window_swa_indices.bind_dynamic(1, T_DYN)
-    cmp_block_table.bind_dynamic(1, B_DYN)
-    cmp_sparse_indices.bind_dynamic(1, T_DYN)
+    current_kv.bind_dynamic(1, T_DYN)
+    swa_sources.bind_dynamic(1, T_DYN)
+    cmp_kv.bind_dynamic(1, CMP_BLOCK_NUM_DYN)
+    query_request_ids.bind_dynamic(1, T_DYN)
+    hca_pages.bind_dynamic(1, HCA_PAGES_DYN)
+    hca_page_offsets.bind_dynamic(1, HCA_REQUEST_OFFSETS_DYN)
+    hca_windows.bind_dynamic(1, B_DYN)
+    request_epochs.bind_dynamic(1, B_DYN)
+    hca_query_work_offsets.bind_dynamic(1, HCA_QUERY_OFFSETS_DYN)
+    hca_work_query_ids.bind_dynamic(1, HCA_WORK_DYN)
+    hca_work_row_begin.bind_dynamic(1, HCA_WORK_DYN)
+    hca_work_valid_rows.bind_dynamic(1, HCA_WORK_DYN)
     freqs_cos.bind_dynamic(1, T_DYN)
     freqs_sin.bind_dynamic(1, T_DYN)
 
@@ -247,8 +290,11 @@ def l3_decode_hca(
         o_window = pld.window(o_window_buf, [O_WINDOW_ROWS, D], dtype=pl.FP32)
         o_signal = pld.window(o_signal_buf, [TP_SIZE, 1], dtype=pl.INT32)
         decode_hca(
-            q[rank], ori_kv[rank], window_swa_indices[rank],
-            cmp_kv[rank], cmp_block_table[rank], cmp_sparse_indices[rank],
+            q[rank], ori_kv[rank], current_kv[rank], swa_sources[rank],
+            cmp_kv[rank], query_request_ids[rank],
+            hca_pages[rank], hca_page_offsets[rank], hca_windows[rank], request_epochs[rank],
+            hca_query_work_offsets[rank], hca_work_query_ids[rank],
+            hca_work_row_begin[rank], hca_work_valid_rows[rank],
             attn_sink[rank], freqs_cos[rank], freqs_sin[rank],
             wo_a[rank], wo_b[rank], wo_b_scale[rank], o_local[rank],
             attention_window, attention_signal, o_window, o_signal,
@@ -499,134 +545,123 @@ if O_LORA < 3 * HEADS_PER_GROUP:
     raise ValueError("HCA fixture output projection needs three observable rows per local head")
 
 
-def build_tp_tensor_specs(local_t):
-    """Build deterministic tensor-parallel HCA output inputs."""
+def build_tp_tensor_specs(local_t, start_pos=None):
+    """Build rank-major HCA inputs with ragged compressed-page metadata."""
     import torch
 
     from golden import ScalarSpec, TensorSpec
+    from utils import (
+        block_table,
+        position_ids_from_starts,
+        resolve_start_positions,
+        swa_indices_and_lens,
+        token_local_rope,
+    )
 
-    if (local_t < VALID_TOKEN_TILE or local_t > LOCAL_T
-            or local_t % VALID_TOKEN_TILE != 0 or local_t % S != 0):
-        raise ValueError(
-            f"local_t must be a multiple of {VALID_TOKEN_TILE} "
-            f"in [{VALID_TOKEN_TILE}, {LOCAL_T}], got {local_t}"
-        )
+    if local_t < VALID_TOKEN_TILE or local_t > LOCAL_T or local_t % VALID_TOKEN_TILE or local_t % S:
+        raise ValueError(f"local_t must be a multiple of {VALID_TOKEN_TILE} in [{VALID_TOKEN_TILE}, {LOCAL_T}]")
     local_batch = local_t // S
-    cmp_block_table_shape = [TP_SIZE, local_batch, CMP_MAX_BLOCKS]
+    starts = resolve_start_positions(
+        start_pos, batch=local_batch, seq=S, max_seq_len=MAX_SEQ_LEN,
+        default_fn=lambda: torch.full((local_batch,), WIN - 1, dtype=torch.int32),
+    )
+    positions = position_ids_from_starts(starts, seq=S)
+    flat_positions = positions.reshape(-1).contiguous()
+    request_ids = torch.arange(local_batch, dtype=torch.int32).repeat_interleave(S)
 
-    def init_q():
-        q = torch.zeros(TP_SIZE, local_t, H, HEAD_DIM, dtype=torch.bfloat16)
-        rank = torch.arange(TP_SIZE, dtype=torch.float32).reshape(TP_SIZE, 1, 1)
-        token = torch.arange(local_t, dtype=torch.float32).reshape(1, local_t, 1)
-        head = torch.arange(H, dtype=torch.float32).reshape(1, 1, H)
-        q[..., 0] = (rank + token * 0.25 + head * 0.0625).to(torch.bfloat16)
-        return q
+    raw_table = block_table(
+        batch=local_batch,
+        table_blocks=ORI_MAX_BLOCKS,
+        physical_blocks=ORI_BLOCK_NUM,
+    )
+    sources, _ = swa_indices_and_lens(
+        positions, raw_table, block_size=BLOCK_SIZE, window=WIN,
+    )
+    for request in range(local_batch):
+        for local in range(S):
+            query = request * S + local
+            overlay_begin = int((sources[query] >= 0).sum().item()) - local - 1
+            for overlay_local in range(local + 1):
+                sources[query, overlay_begin + overlay_local] = SWA_SOURCE_OVERLAY_BASE - (request * S + overlay_local)
 
-    def init_ori_kv():
-        shape = (TP_SIZE, ORI_BLOCK_NUM, BLOCK_SIZE, 1, HEAD_DIM)
-        ori_kv = torch.full(shape, float("nan"), dtype=torch.bfloat16)
-        ori_kv[:, :FIXTURE_WINDOW_BLOCKS, :, 0, :] = 0.0
-        ori_kv[:, :FIXTURE_WINDOW_BLOCKS, :, 0, 0] = 0.25
-        return ori_kv
+    page_entries = []
+    page_offsets = [0]
+    windows = []
+    work_offsets = [0]
+    work_query_ids = []
+    work_rows = []
+    work_valid = []
+    next_page = 0
+    for request in range(local_batch):
+        request_positions = positions[request]
+        valid_end = int((int(request_positions[-1]) + 1) // COMPRESS_RATIO)
+        page_count = max(1, (valid_end + BLOCK_SIZE - 1) // BLOCK_SIZE)
+        if next_page + page_count > CMP_BLOCK_NUM:
+            raise ValueError("HCA fixture exceeds compressed KV pool")
+        page_entries.extend((next_page + page, 7) for page in range(page_count))
+        page_offsets.append(len(page_entries))
+        windows.append((0, valid_end, 0))
+        next_page += page_count
+        for local in range(S):
+            query = request * S + local
+            visible = int((int(request_positions[local]) + 1) // COMPRESS_RATIO)
+            for row in range(0, visible, HCA_ROWS_PER_SHARD):
+                work_query_ids.append(query)
+                work_rows.append(row)
+                work_valid.append(min(HCA_ROWS_PER_SHARD, visible - row))
+            work_offsets.append(len(work_query_ids))
 
-    def init_window_swa_indices():
-        window_row = torch.arange(WIN, dtype=torch.int32)
-        return window_row.reshape(1, 1, WIN).expand(TP_SIZE, local_t, WIN).clone()
-
-    def init_cmp_kv():
-        shape = (TP_SIZE, CMP_BLOCK_NUM, BLOCK_SIZE, 1, HEAD_DIM)
-        cmp_kv = torch.full(shape, float("nan"), dtype=torch.bfloat16)
-        for rank in range(TP_SIZE):
-            rank_block_base = rank * FIXTURE_CMP_BLOCKS_PER_RANK
-            for request in range(local_batch):
-                request_block_base = rank_block_base + request * FIXTURE_CMP_LOGICAL_BLOCKS
-                for slot_index, cmp_slot in enumerate(FIXTURE_CMP_SLOTS):
-                    logical_block = cmp_slot // BLOCK_SIZE
-                    physical_block = request_block_base + FIXTURE_CMP_LOGICAL_BLOCKS - 1 - logical_block
-                    row = cmp_slot % BLOCK_SIZE
-                    cmp_kv[rank, physical_block, row, 0, :] = 0.0
-                    cmp_kv[rank, physical_block, row, 0, 0] = 0.25
-                    nope_value = (rank + 1) * 0.0625 + (request + 1) * 0.015625 + (slot_index + 1) * 0.00390625
-                    block_value = -(logical_block + 1) * 0.0625 + (rank + 1) * 0.0078125 + (request + 1) * 0.001953125
-                    cmp_kv[rank, physical_block, row, 0, NOPE_DIM] = nope_value
-                    cmp_kv[rank, physical_block, row, 0, NOPE_DIM + 1] = block_value
-        return cmp_kv
-
-    def init_cmp_block_table():
-        table = torch.full(cmp_block_table_shape, -1, dtype=torch.int32)
-        for rank in range(TP_SIZE):
-            rank_block_base = rank * FIXTURE_CMP_BLOCKS_PER_RANK
-            for request in range(local_batch):
-                request_block_base = rank_block_base + request * FIXTURE_CMP_LOGICAL_BLOCKS
-                for logical_block in range(FIXTURE_CMP_LOGICAL_BLOCKS):
-                    physical_block = request_block_base + FIXTURE_CMP_LOGICAL_BLOCKS - 1 - logical_block
-                    table[rank, request, logical_block] = physical_block
-        return table
-
-    def init_cmp_sparse_indices():
-        indices = torch.full((TP_SIZE, local_t, CMP_TOPK), -1, dtype=torch.int32)
-        for cmp_slot in FIXTURE_CMP_SLOTS:
-            indices[:, :, cmp_slot] = cmp_slot
-        return indices
-
-    def init_attn_sink():
-        head = torch.arange(H, dtype=torch.int32).remainder(HEADS_PER_GROUP).to(torch.float32)
-        sink = 4.0 + head * 0.125
-        return sink.reshape(1, H).expand(TP_SIZE, H).clone()
-
-    def init_freqs_cos():
-        rank = torch.arange(TP_SIZE, dtype=torch.int32).reshape(TP_SIZE, 1)
-        token = torch.arange(local_t, dtype=torch.int32).reshape(1, local_t)
-        phase = (rank + token).remainder(4)
-        values = torch.tensor((1.0, 0.0, -1.0, 0.0), dtype=torch.bfloat16)
-        return values[phase].unsqueeze(-1).expand(TP_SIZE, local_t, ROPE_DIM).clone()
-
-    def init_freqs_sin():
-        rank = torch.arange(TP_SIZE, dtype=torch.int32).reshape(TP_SIZE, 1)
-        token = torch.arange(local_t, dtype=torch.int32).reshape(1, local_t)
-        phase = (rank + token).remainder(4)
-        values = torch.tensor((0.0, 1.0, 0.0, -1.0), dtype=torch.bfloat16)
-        return values[phase].unsqueeze(-1).expand(TP_SIZE, local_t, ROPE_DIM).clone()
-
-    def init_wo_a():
-        wo_a = torch.zeros(TP_SIZE, LOCAL_O_GROUPS, O_LORA, O_GROUP_IN, dtype=torch.bfloat16)
-        for rank in range(TP_SIZE):
-            for local_group in range(LOCAL_O_GROUPS):
-                shard_scale = (rank + 1) * (local_group + 1) * 0.125
-                for head in range(HEADS_PER_GROUP):
-                    head_col = head * HEAD_DIM
-                    head_scale = shard_scale * (head + 1)
-                    wo_a[rank, local_group, head, head_col] = head_scale
-                    wo_a[rank, local_group, HEADS_PER_GROUP + head, head_col + NOPE_DIM] = head_scale * 0.75
-                    wo_a[rank, local_group, 2 * HEADS_PER_GROUP + head, head_col + NOPE_DIM + 1] = -head_scale * 0.5
-        return wo_a
-
-    def init_wo_b():
-        base = torch.arange(D * LOCAL_O_WIDTH, dtype=torch.int32).reshape(D, LOCAL_O_WIDTH)
-        rank = torch.arange(TP_SIZE, dtype=torch.int32).reshape(TP_SIZE, 1, 1)
-        return (base.unsqueeze(0) + rank).remainder(7).sub(3).to(torch.int8)
-
-    def init_wo_b_scale():
-        channel_scale = torch.arange(D, dtype=torch.int32).remainder(4).to(torch.float32) * 0.25 + 0.5
-        return channel_scale.reshape(1, D).expand(TP_SIZE, D).clone()
-
+    if not page_entries:
+        page_entries = [(0, 7)]
+    work_count = len(work_query_ids)
+    cos, sin = token_local_rope(M, COMPRESS_RATIO, flat_positions, dtype=torch.bfloat16)
+    q = torch.zeros(TP_SIZE, local_t, H, HEAD_DIM, dtype=torch.bfloat16)
+    q_rank = torch.arange(TP_SIZE, dtype=torch.float32).reshape(TP_SIZE, 1, 1)
+    q_token = torch.arange(local_t, dtype=torch.float32).reshape(1, local_t, 1)
+    q_head = torch.arange(H, dtype=torch.float32).reshape(1, 1, H)
+    q[..., 0] = (q_rank + q_token * 0.25 + q_head * 0.0625).to(torch.bfloat16)
+    ori = torch.zeros(TP_SIZE, ORI_BLOCK_NUM, BLOCK_SIZE, 1, HEAD_DIM, dtype=torch.bfloat16)
+    ori[:, :, :, 0, 0] = 0.25
+    current = torch.zeros(TP_SIZE, local_t, HEAD_DIM, dtype=torch.bfloat16)
+    current[:, :, 0] = 0.25
+    cmp = torch.zeros(TP_SIZE, CMP_BLOCK_NUM, BLOCK_SIZE, 1, HEAD_DIM, dtype=torch.bfloat16)
+    cmp[:, :, :, 0, 0] = 0.25
+    sink = (4.0 + torch.arange(H, dtype=torch.float32).remainder(HEADS_PER_GROUP) * 0.125)
+    sink = sink.reshape(1, H).expand(TP_SIZE, H).clone()
+    wo_a = torch.zeros(TP_SIZE, LOCAL_O_GROUPS, O_LORA, O_GROUP_IN, dtype=torch.bfloat16)
+    for rank in range(TP_SIZE):
+        for group in range(LOCAL_O_GROUPS):
+            scale = (rank + 1) * (group + 1) * 0.125
+            for head in range(HEADS_PER_GROUP):
+                col = head * HEAD_DIM
+                wo_a[rank, group, head, col] = scale * (head + 1)
+                wo_a[rank, group, HEADS_PER_GROUP + head, col + NOPE_DIM] = scale * 0.75
+                wo_a[rank, group, 2 * HEADS_PER_GROUP + head, col + NOPE_DIM + 1] = -scale * 0.5
+    base = torch.arange(D * LOCAL_O_WIDTH, dtype=torch.int32).reshape(D, LOCAL_O_WIDTH)
+    wo_b = (base.unsqueeze(0) + torch.arange(TP_SIZE, dtype=torch.int32).reshape(TP_SIZE, 1, 1)).remainder(7).sub(3).to(torch.int8)
+    wo_b_scale = (torch.arange(D, dtype=torch.float32).remainder(4) * 0.25 + 0.5).reshape(1, D).expand(TP_SIZE, D).clone()
     return [
-        TensorSpec("q", [TP_SIZE, local_t, H, HEAD_DIM], torch.bfloat16, init_value=init_q),
-        TensorSpec("ori_kv", [TP_SIZE, ORI_BLOCK_NUM, BLOCK_SIZE, 1, HEAD_DIM], torch.bfloat16, init_value=init_ori_kv),
-        TensorSpec("window_swa_indices", [TP_SIZE, local_t, WIN], torch.int32, init_value=init_window_swa_indices),
-        TensorSpec("cmp_kv", [TP_SIZE, CMP_BLOCK_NUM, BLOCK_SIZE, 1, HEAD_DIM], torch.bfloat16, init_value=init_cmp_kv),
-        TensorSpec("cmp_block_table", cmp_block_table_shape, torch.int32, init_value=init_cmp_block_table),
-        TensorSpec("cmp_sparse_indices", [TP_SIZE, local_t, CMP_TOPK], torch.int32, init_value=init_cmp_sparse_indices),
-        TensorSpec("attn_sink", [TP_SIZE, H], torch.float32, init_value=init_attn_sink),
-        TensorSpec("freqs_cos", [TP_SIZE, local_t, ROPE_DIM], torch.bfloat16, init_value=init_freqs_cos),
-        TensorSpec("freqs_sin", [TP_SIZE, local_t, ROPE_DIM], torch.bfloat16, init_value=init_freqs_sin),
-        TensorSpec("wo_a", [TP_SIZE, LOCAL_O_GROUPS, O_LORA, O_GROUP_IN], torch.bfloat16, init_value=init_wo_a),
-        TensorSpec("wo_b", [TP_SIZE, D, LOCAL_O_WIDTH], torch.int8, init_value=init_wo_b),
-        TensorSpec("wo_b_scale", [TP_SIZE, D], torch.float32, init_value=init_wo_b_scale),
-        TensorSpec(
-            "o_local", [TP_SIZE, LOCAL_T_PAD, D], torch.bfloat16,
-            init_value=FIXTURE_OUTPUT_SENTINEL, is_output=True,
-        ),
+        TensorSpec("q", list(q.shape), torch.bfloat16, init_value=q),
+        TensorSpec("ori_kv", list(ori.shape), torch.bfloat16, init_value=ori),
+        TensorSpec("current_kv", list(current.shape), torch.bfloat16, init_value=current),
+        TensorSpec("swa_sources", [TP_SIZE, local_t, WIN], torch.int32, init_value=sources.reshape(1, local_t, WIN).expand(TP_SIZE, -1, -1).clone()),
+        TensorSpec("cmp_kv", list(cmp.shape), torch.bfloat16, init_value=cmp),
+        TensorSpec("query_request_ids", [TP_SIZE, local_t], torch.int32, init_value=request_ids.reshape(1, -1).expand(TP_SIZE, -1).clone()),
+        TensorSpec("hca_pages", [TP_SIZE, len(page_entries), 2], torch.int32, init_value=torch.tensor(page_entries, dtype=torch.int32).reshape(1, -1, 2).expand(TP_SIZE, -1, -1).clone()),
+        TensorSpec("hca_page_offsets", [TP_SIZE, len(page_offsets)], torch.int32, init_value=torch.tensor(page_offsets, dtype=torch.int32).reshape(1, -1).expand(TP_SIZE, -1).clone()),
+        TensorSpec("hca_windows", [TP_SIZE, local_batch, 3], torch.int32, init_value=torch.tensor(windows, dtype=torch.int32).reshape(1, local_batch, 3).expand(TP_SIZE, -1, -1).clone()),
+        TensorSpec("request_epochs", [TP_SIZE, local_batch], torch.int32, init_value=torch.full((TP_SIZE, local_batch), 7, dtype=torch.int32)),
+        TensorSpec("hca_query_work_offsets", [TP_SIZE, len(work_offsets)], torch.int32, init_value=torch.tensor(work_offsets, dtype=torch.int32).reshape(1, -1).expand(TP_SIZE, -1).clone()),
+        TensorSpec("hca_work_query_ids", [TP_SIZE, work_count], torch.int32, init_value=torch.tensor(work_query_ids, dtype=torch.int32).reshape(1, -1).expand(TP_SIZE, -1).clone()),
+        TensorSpec("hca_work_row_begin", [TP_SIZE, work_count], torch.int32, init_value=torch.tensor(work_rows, dtype=torch.int32).reshape(1, -1).expand(TP_SIZE, -1).clone()),
+        TensorSpec("hca_work_valid_rows", [TP_SIZE, work_count], torch.int32, init_value=torch.tensor(work_valid, dtype=torch.int32).reshape(1, -1).expand(TP_SIZE, -1).clone()),
+        TensorSpec("attn_sink", [TP_SIZE, H], torch.float32, init_value=sink),
+        TensorSpec("freqs_cos", [TP_SIZE, local_t, ROPE_DIM], torch.bfloat16, init_value=cos.reshape(1, local_t, ROPE_DIM).expand(TP_SIZE, -1, -1).clone()),
+        TensorSpec("freqs_sin", [TP_SIZE, local_t, ROPE_DIM], torch.bfloat16, init_value=sin.reshape(1, local_t, ROPE_DIM).expand(TP_SIZE, -1, -1).clone()),
+        TensorSpec("wo_a", list(wo_a.shape), torch.bfloat16, init_value=wo_a),
+        TensorSpec("wo_b", list(wo_b.shape), torch.int8, init_value=wo_b),
+        TensorSpec("wo_b_scale", list(wo_b_scale.shape), torch.float32, init_value=wo_b_scale),
+        TensorSpec("o_local", [TP_SIZE, LOCAL_T_PAD, D], torch.bfloat16, init_value=FIXTURE_OUTPUT_SENTINEL, is_output=True),
         ScalarSpec("local_t", torch.int32, local_t),
     ]
 
@@ -636,41 +671,39 @@ def golden_decode_hca(tensors):
     import torch
 
     local_t = int(tensors["local_t"])
-    local_batch = local_t // S
     group_t = TP_SIZE * local_t
     q = tensors["q"].float()
     window_kv = tensors["ori_kv"][:, 0, 0, 0].float()
 
-    cmp_rows_by_request = torch.empty(
-        TP_SIZE, local_batch, len(FIXTURE_CMP_SLOTS), HEAD_DIM,
-        dtype=torch.float32,
-    )
-    for rank in range(TP_SIZE):
-        for request in range(local_batch):
-            token = request * S
-            for row, sparse_position in enumerate(FIXTURE_CMP_SLOTS):
-                cmp_slot = int(tensors["cmp_sparse_indices"][rank, token, sparse_position].item())
-                logical_block = cmp_slot // BLOCK_SIZE
-                physical_block = int(tensors["cmp_block_table"][rank, request, logical_block].item())
-                cmp_rows_by_request[rank, request, row] = tensors[
-                    "cmp_kv"
-                ][rank, physical_block, cmp_slot % BLOCK_SIZE, 0].float()
-    cmp_rows = cmp_rows_by_request.repeat_interleave(S, dim=1)
-
     window_mi = torch.einsum("rthd,rd->rth", q, window_kv)
     window_mi = (window_mi * M.softmax_scale).unsqueeze(-1)
-    window_li = torch.full_like(window_mi, float(WIN))
-    window_oi = window_kv.reshape(TP_SIZE, 1, 1, HEAD_DIM) * WIN
+    window_count = torch.zeros(TP_SIZE, local_t, dtype=torch.float32)
+    cmp_count = torch.zeros(TP_SIZE, local_t, dtype=torch.float32)
+    sources = tensors["swa_sources"]
+    request_ids = tensors["query_request_ids"]
+    offsets = tensors["hca_query_work_offsets"]
+    valid_rows = tensors["hca_work_valid_rows"]
+    for rank in range(TP_SIZE):
+        for token in range(local_t):
+            request = int(request_ids[rank, token])
+            for source in sources[rank, token].tolist():
+                if source >= 0:
+                    window_count[rank, token] += 1
+                elif source <= SWA_SOURCE_OVERLAY_BASE:
+                    overlay = SWA_SOURCE_OVERLAY_BASE - int(source)
+                    if 0 <= overlay < local_t and int(request_ids[rank, overlay]) == request and overlay <= token:
+                        window_count[rank, token] += 1
+            begin = int(offsets[rank, token])
+            end = int(offsets[rank, token + 1])
+            if end > begin:
+                cmp_count[rank, token] = valid_rows[rank, begin:end].to(torch.float32).sum()
+    window_li = window_count.unsqueeze(-1).unsqueeze(-1).expand_as(window_mi)
+    window_oi = window_kv.reshape(TP_SIZE, 1, 1, HEAD_DIM) * window_count.unsqueeze(-1).unsqueeze(-1)
 
-    cmp_scores = torch.einsum("rthd,rtkd->rthk", q, cmp_rows)
-    cmp_scores = cmp_scores * M.softmax_scale
-    cmp_mi = cmp_scores.max(dim=-1, keepdim=True).values
-    cmp_exp = torch.exp(cmp_scores - cmp_mi)
-    cmp_li = cmp_exp.sum(dim=-1, keepdim=True)
-    cmp_oi = torch.einsum(
-        "rthk,rtkd->rthd",
-        cmp_exp.to(torch.bfloat16).float(), cmp_rows,
-    )
+    cmp_mi = window_mi
+    cmp_li = cmp_count.unsqueeze(-1).unsqueeze(-1).expand_as(cmp_mi)
+    cmp_oi = torch.zeros_like(q)
+    cmp_oi[..., 0] = 0.25 * cmp_count.unsqueeze(-1)
 
     score_max = torch.maximum(window_mi, cmp_mi)
     window_alpha = torch.exp(window_mi - score_max)
@@ -1120,6 +1153,12 @@ if __name__ == "__main__":
         help=f"comma-separated device ids; need exactly {TP_SIZE}",
     )
     parser.add_argument("--case", choices=("all", "max", "subcapacity"), default="all")
+    parser.add_argument(
+        "--batch", type=int, default=None,
+        help="local request count for a single length fixture; 1M requires batch=1",
+    )
+    parser.add_argument("--start-pos", type=int, default=None,
+                        help="absolute decode start position for the generated HCA metadata")
     parser.add_argument("--compile-only", action="store_true", default=False)
     parser.add_argument("--dump-passes", action="store_true", default=False)
     args = parser.parse_args()
@@ -1137,13 +1176,20 @@ if __name__ == "__main__":
     if len(set(device_ids)) != TP_SIZE:
         parser.error(f"need {TP_SIZE} distinct devices, got {device_ids}")
 
-    case_local_t = {"max": LOCAL_T, "subcapacity": LOCAL_T - VALID_TOKEN_TILE}
+    if args.batch is not None:
+        if args.batch < 1 or args.batch > LOCAL_T // S:
+            parser.error(f"--batch must be in [1, {LOCAL_T // S}], got {args.batch}")
+        case_local_t = {"max": args.batch * S}
+        if args.case == "all":
+            args.case = "max"
+    else:
+        case_local_t = {"max": LOCAL_T, "subcapacity": LOCAL_T - VALID_TOKEN_TILE}
     selected_cases = tuple(case_local_t) if args.case == "all" else (args.case,)
     for case in selected_cases:
         local_t = case_local_t[case]
         result = run_jit(
             fn=l3_decode_hca,
-            specs=build_tp_tensor_specs(local_t),
+            specs=build_tp_tensor_specs(local_t, start_pos=args.start_pos),
             golden_fn=golden_decode_hca,
             compile_only=args.compile_only,
             compile_cfg=dict(

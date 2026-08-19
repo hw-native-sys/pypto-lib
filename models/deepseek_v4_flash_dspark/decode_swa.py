@@ -48,6 +48,7 @@ from config import (
     INT8_AMAX_EPS,
     KV_CMP_MAX_BLOCKS,
     KV_ORI_MAX_BLOCKS,
+    SWA_SOURCE_OVERLAY_BASE,
 )
 from hc_pre import hc_pre
 from hc_post import hc_post
@@ -121,7 +122,8 @@ if T_PAD != LOCAL_T_PAD:
 def decode_swa(
     q: pl.Tensor[[T_DYN, H, HEAD_DIM], pl.BF16],
     ori_kv: pl.Tensor[[ORI_BLOCK_NUM_DYN, BLOCK_SIZE, 1, HEAD_DIM], pl.BF16],
-    swa_indices: pl.Tensor[[T_DYN, WIN], pl.INT32],
+    current_kv: pl.Tensor[[T_DYN, HEAD_DIM], pl.BF16],
+    swa_sources: pl.Tensor[[T_DYN, WIN], pl.INT32],
     swa_lens: pl.Tensor[[T_DYN], pl.INT32],
     attn_sink: pl.Tensor[[H], pl.FP32],
     freqs_cos: pl.Tensor[[T_DYN, ROPE_HEAD_DIM], pl.BF16],
@@ -140,14 +142,15 @@ def decode_swa(
 ):
     """Run rank-local SWA heads, output A2A, sharded O projection, and RS."""
     q.bind_dynamic(0, T_DYN)
-    swa_indices.bind_dynamic(0, T_DYN)
+    current_kv.bind_dynamic(0, T_DYN)
+    swa_sources.bind_dynamic(0, T_DYN)
     swa_lens.bind_dynamic(0, T_DYN)
     freqs_cos.bind_dynamic(0, T_DYN)
     freqs_sin.bind_dynamic(0, T_DYN)
 
     t_dim = pl.tensor.dim(q, 0)
     sparse_bias = pl.create_tensor([t_dim, PADDED_TOPK], dtype=pl.FP32)
-    with pl.at(level=pl.Level.CORE_GROUP, name_hint="swa_valid_bias"):
+    with pl.at(level=pl.Level.CORE_GROUP, name_hint="swa_valid_bias") as bias_tid:
         valid_col = pl.cast(pl.arange(0, [1, ATTN_K_TILE], dtype=pl.INT32), target_type=pl.FP32)
         for bias_block in pl.range(t_dim // BIAS_T_TILE):
             token_start = bias_block * BIAS_T_TILE
@@ -164,9 +167,10 @@ def decode_swa(
 
     o_packed_heads = pl.create_tensor([O_GROUPS * T_PAD * HEADS_PER_GROUP, HEAD_DIM], dtype=pl.BF16)
     o_packed_heads, _ = sparse_attn_swa(
-        q, ori_kv, swa_indices, sparse_bias,
+        q, ori_kv, current_kv, swa_sources, sparse_bias,
         attn_sink, freqs_cos, freqs_sin,
         o_packed_heads,
+        bias_tid,
     )
 
     attention_grouped = pl.reshape(o_packed_heads, [O_GROUPS * LOCAL_T_PAD, O_GROUP_IN])
@@ -197,7 +201,8 @@ def decode_swa(
 def l3_decode_swa(
     q: pl.Tensor[[TP_SIZE, T_DYN, H, HEAD_DIM], pl.BF16],
     ori_kv: pl.Tensor[[TP_SIZE, ORI_BLOCK_NUM, BLOCK_SIZE, 1, HEAD_DIM], pl.BF16],
-    swa_indices: pl.Tensor[[TP_SIZE, T_DYN, WIN], pl.INT32],
+    current_kv: pl.Tensor[[TP_SIZE, T_DYN, HEAD_DIM], pl.BF16],
+    swa_sources: pl.Tensor[[TP_SIZE, T_DYN, WIN], pl.INT32],
     swa_lens: pl.Tensor[[TP_SIZE, T_DYN], pl.INT32],
     attn_sink: pl.Tensor[[TP_SIZE, H], pl.FP32],
     freqs_cos: pl.Tensor[[TP_SIZE, T_DYN, ROPE_HEAD_DIM], pl.BF16],
@@ -210,7 +215,8 @@ def l3_decode_swa(
 ):
     """Launch the SWA output half on one physical TP group."""
     q.bind_dynamic(1, T_DYN)
-    swa_indices.bind_dynamic(1, T_DYN)
+    current_kv.bind_dynamic(1, T_DYN)
+    swa_sources.bind_dynamic(1, T_DYN)
     swa_lens.bind_dynamic(1, T_DYN)
     freqs_cos.bind_dynamic(1, T_DYN)
     freqs_sin.bind_dynamic(1, T_DYN)
@@ -226,7 +232,7 @@ def l3_decode_swa(
         o_window = pld.window(o_window_buf, [O_WINDOW_ROWS, D], dtype=pl.FP32)
         o_signal = pld.window(o_signal_buf, [TP_SIZE, 1], dtype=pl.INT32)
         decode_swa(
-            q[rank], ori_kv[rank], swa_indices[rank], swa_lens[rank],
+            q[rank], ori_kv[rank], current_kv[rank], swa_sources[rank], swa_lens[rank],
             attn_sink[rank], freqs_cos[rank], freqs_sin[rank],
             wo_a[rank], wo_b[rank], wo_b_scale[rank], o_local[rank],
             attention_window, attention_signal, o_window, o_signal,
@@ -249,14 +255,13 @@ def decode_swa_tp1(
     wkv: pl.Tensor[[D, HEAD_DIM], pl.BF16],
     gamma_cq: pl.Tensor[[Q_LORA], pl.BF16],
     gamma_ckv: pl.Tensor[[HEAD_DIM], pl.BF16],
-    freqs_cos: pl.Tensor[[MAX_SEQ_LEN, ROPE_HEAD_DIM], pl.BF16],
-    freqs_sin: pl.Tensor[[MAX_SEQ_LEN, ROPE_HEAD_DIM], pl.BF16],
+    rope_cos: pl.Tensor[[T_DYN, ROPE_HEAD_DIM], pl.BF16],
+    rope_sin: pl.Tensor[[T_DYN, ROPE_HEAD_DIM], pl.BF16],
     # KV cache (sliding-window only: [0, WIN) ori; no cmp portion)
     kv_cache: pl.Tensor[[ORI_BLOCK_NUM_DYN, BLOCK_SIZE, 1, HEAD_DIM], pl.BF16],
-    swa_slot_mapping: pl.Tensor[[T_DYN], pl.INT64],
-    swa_indices: pl.Tensor[[T_DYN, WIN], pl.INT32],
+    swa_write_slots: pl.Tensor[[T_DYN], pl.INT64],
+    swa_sources: pl.Tensor[[T_DYN, WIN], pl.INT32],
     swa_lens: pl.Tensor[[T_DYN], pl.INT32],
-    position_ids: pl.Tensor[[T_DYN], pl.INT32],
     # sparse_attn
     attn_sink: pl.Tensor[[H], pl.FP32],
     # o_proj
@@ -266,24 +271,11 @@ def decode_swa_tp1(
     x_out: pl.Tensor[[T_DYN, HC_MULT, D], pl.FP32],
 ):
     t_dim = pl.tensor.dim(x_hc, 0)
-    b_dim = t_dim // S
     bias_blocks = t_dim // BIAS_T_TILE
     x_mixed = pl.create_tensor([t_dim, D], dtype=pl.BF16)
     post_t = pl.create_tensor([t_dim, HC_MULT], dtype=pl.FP32)
     comb_t = pl.create_tensor([t_dim, HC_MULT * HC_MULT], dtype=pl.FP32)
     hc_pre(x_hc, hc_attn_fn, hc_attn_scale, hc_attn_base, x_mixed, post_t, comb_t)
-
-    rope_cos_t = pl.create_tensor([t_dim, ROPE_HEAD_DIM], dtype=pl.BF16)
-    rope_sin_t = pl.create_tensor([t_dim, ROPE_HEAD_DIM], dtype=pl.BF16)
-    with pl.at(level=pl.Level.CORE_GROUP, name_hint="swa_rope_step"):
-        for b in pl.range(b_dim):
-            for s_idx in pl.range(S):
-                t = b * S + s_idx
-                pos_b = pl.cast(pl.read(position_ids, [t]), pl.INDEX)
-                cos_row = pl.cast(freqs_cos[pos_b : pos_b + 1, 0 : ROPE_HEAD_DIM], target_type=pl.FP32)
-                sin_row = pl.cast(freqs_sin[pos_b : pos_b + 1, 0 : ROPE_HEAD_DIM], target_type=pl.FP32)
-                rope_cos_t[t : t + 1, 0 : ROPE_HEAD_DIM] = pl.cast(cos_row, target_type=pl.BF16, mode="rint")
-                rope_sin_t[t : t + 1, 0 : ROPE_HEAD_DIM] = pl.cast(sin_row, target_type=pl.BF16, mode="rint")
 
     x_normed_t = pl.create_tensor([t_dim, D], dtype=pl.BF16)
     rms_tid = rms_norm(x_mixed, attn_norm_w, x_normed_t)
@@ -293,24 +285,16 @@ def decode_swa_tp1(
     kv = pl.create_tensor([t_dim, HEAD_DIM], dtype=pl.BF16)
     qr = pl.create_tensor([t_dim, Q_LORA], dtype=pl.INT8)
     qr_scale = pl.create_tensor([t_dim, 1], dtype=pl.FP32)
-    qkv_proj_rope(
+    qkv_done = qkv_proj_rope(
         x_normed_t, wq_a, wq_b, wq_b_scale, wkv,
-        rope_cos_t, rope_sin_t, gamma_cq, gamma_ckv,
+        rope_cos, rope_sin, gamma_cq, gamma_ckv,
         q, kv, qr, qr_scale, late_dep,
     )
 
-    # Commit current decode KV and build its additive padding mask in one task.
-    # The SWA attention kernel reads every visible row through metadata-expanded
-    # physical cache indices, so all cache writes must complete before it starts.
-    ori_block_num = pl.tensor.dim(kv_cache, 0)
-    kv_cache_flat = pl.reshape(kv_cache, [ori_block_num * BLOCK_SIZE, HEAD_DIM])
+    # Keep the pre-step cache immutable while sparse attention consumes it; the
+    # current decode rows are selected through the negative overlay sources.
     sparse_bias = pl.create_tensor([t_dim, WIN], dtype=pl.FP32)
-    with pl.at(level=pl.Level.CORE_GROUP, name_hint="swa_cache_insert_valid_bias"):
-        for write_t in pl.range(t_dim):
-            write_row_i64 = pl.read(swa_slot_mapping, [write_t])
-            if write_row_i64 >= 0:
-                write_row = pl.cast(write_row_i64, pl.INDEX)
-                kv_cache_flat[write_row : write_row + 1, 0 : HEAD_DIM] = kv[write_t : write_t + 1, 0 : HEAD_DIM]
+    with pl.at(level=pl.Level.CORE_GROUP, name_hint="swa_cache_insert_valid_bias") as bias_tid:
         v_col = pl.cast(pl.arange(0, [1, WIN], dtype=pl.INT32), target_type=pl.FP32)
         for v_blk in pl.range(bias_blocks):
             v_t0 = v_blk * BIAS_T_TILE
@@ -322,11 +306,13 @@ def decode_swa_tp1(
             )
             sparse_bias[v_t0 : v_t0 + BIAS_T_TILE, 0:WIN] = pl.mul(pl.sub(v_valid, 1.0), -NEG_INF)
     attn_out = pl.create_tensor([t_dim, D], dtype=pl.BF16)
+    sparse_ready = pl.system.task_dummy(deps=[qkv_done, bias_tid])
     o_packed_heads = pl.create_tensor([O_GROUPS * T_PAD * HEADS_PER_GROUP, HEAD_DIM], dtype=pl.BF16)
     o_packed_heads, heads_dep = sparse_attn_swa(
-        q, kv_cache, swa_indices, sparse_bias,
-        attn_sink, rope_cos_t, rope_sin_t,
+        q, kv_cache, kv, swa_sources, sparse_bias,
+        attn_sink, rope_cos, rope_sin,
         o_packed_heads,
+        sparse_ready,
     )
     o_packed = pl.reshape(o_packed_heads, [O_GROUPS * T_PAD, O_GROUP_IN])
     attn_out = decode_o_proj_tp1(
@@ -334,6 +320,23 @@ def decode_swa_tp1(
         wo_a, wo_b, wo_b_scale,
         attn_out, heads_dep,
     )
+    cache_read_done = heads_dep
+
+    ori_block_num = pl.tensor.dim(kv_cache, 0)
+    kv_cache_flat = pl.reshape(kv_cache, [ori_block_num * BLOCK_SIZE, HEAD_DIM])
+    with pl.at(
+        level=pl.Level.CORE_GROUP,
+        name_hint="swa_cache_commit",
+        deps=[cache_read_done],
+        allow_early_resolve=True,
+    ):
+        for write_t in pl.range(t_dim):
+            write_row_i64 = pl.read(swa_write_slots, [write_t])
+            if write_row_i64 >= 0:
+                write_row = pl.cast(write_row_i64, pl.INDEX)
+                kv_cache_flat[write_row : write_row + 1, 0 : HEAD_DIM] = kv[
+                    write_t : write_t + 1, 0 : HEAD_DIM
+                ]
 
     hc_post(attn_out, x_hc, post_t, comb_t, x_out)
     return x_out
@@ -354,14 +357,13 @@ def decode_swa_tp1_test(
     wkv: pl.Tensor[[D, HEAD_DIM], pl.BF16],
     gamma_cq: pl.Tensor[[Q_LORA], pl.BF16],
     gamma_ckv: pl.Tensor[[HEAD_DIM], pl.BF16],
-    freqs_cos: pl.Tensor[[MAX_SEQ_LEN, ROPE_HEAD_DIM], pl.BF16],
-    freqs_sin: pl.Tensor[[MAX_SEQ_LEN, ROPE_HEAD_DIM], pl.BF16],
+    rope_cos: pl.Tensor[[T_DYN, ROPE_HEAD_DIM], pl.BF16],
+    rope_sin: pl.Tensor[[T_DYN, ROPE_HEAD_DIM], pl.BF16],
     # KV cache (sliding-window only: [0, WIN) ori; no cmp portion)
     kv_cache: pl.InOut[pl.Tensor[[ORI_BLOCK_NUM_DYN, BLOCK_SIZE, 1, HEAD_DIM], pl.BF16]],
-    swa_slot_mapping: pl.Tensor[[T_DYN], pl.INT64],
-    swa_indices: pl.Tensor[[T_DYN, WIN], pl.INT32],
+    swa_write_slots: pl.Tensor[[T_DYN], pl.INT64],
+    swa_sources: pl.Tensor[[T_DYN, WIN], pl.INT32],
     swa_lens: pl.Tensor[[T_DYN], pl.INT32],
-    position_ids: pl.Tensor[[T_DYN], pl.INT32],
     # sparse_attn
     attn_sink: pl.Tensor[[H], pl.FP32],
     # o_proj
@@ -371,10 +373,11 @@ def decode_swa_tp1_test(
     x_out: pl.Out[pl.Tensor[[T_DYN, HC_MULT, D], pl.FP32]],
 ):
     x_hc.bind_dynamic(0, T_DYN)
-    swa_slot_mapping.bind_dynamic(0, T_DYN)
-    swa_indices.bind_dynamic(0, T_DYN)
+    rope_cos.bind_dynamic(0, T_DYN)
+    rope_sin.bind_dynamic(0, T_DYN)
+    swa_write_slots.bind_dynamic(0, T_DYN)
+    swa_sources.bind_dynamic(0, T_DYN)
     swa_lens.bind_dynamic(0, T_DYN)
-    position_ids.bind_dynamic(0, T_DYN)
     x_out.bind_dynamic(0, T_DYN)
 
     decode_swa_tp1(
@@ -382,8 +385,8 @@ def decode_swa_tp1_test(
         hc_attn_fn, hc_attn_scale, hc_attn_base,
         attn_norm_w, wq_a, wq_b, wq_b_scale, wkv,
         gamma_cq, gamma_ckv,
-        freqs_cos, freqs_sin,
-        kv_cache, swa_slot_mapping, swa_indices, swa_lens, position_ids,
+        rope_cos, rope_sin,
+        kv_cache, swa_write_slots, swa_sources, swa_lens,
         attn_sink,
         wo_a, wo_b, wo_b_scale,
         x_out,
@@ -399,11 +402,12 @@ if TP_FIXTURE_WINDOW_BLOCKS > ORI_BLOCK_NUM:
     raise ValueError("SWA fixture window exceeds the original KV cache capacity")
 
 
-def build_tp_tensor_specs(local_t):
-    """Build deterministic tensor-parallel SWA output-half inputs."""
+def build_tp_tensor_specs(local_t, start_pos=None):
+    """Build deterministic tensor-parallel SWA inputs for one context regime."""
     import torch
 
     from golden import ScalarSpec, TensorSpec
+    from utils import block_table, position_ids_from_starts, resolve_start_positions, swa_indices_and_lens
 
     if local_t < BIAS_T_TILE or local_t > LOCAL_T or local_t % BIAS_T_TILE != 0 or local_t % S != 0:
         raise ValueError(f"local_t must be a multiple of {BIAS_T_TILE} in [{BIAS_T_TILE}, {LOCAL_T}], got {local_t}")
@@ -418,17 +422,50 @@ def build_tp_tensor_specs(local_t):
 
     def init_ori_kv():
         shape = (ORI_BLOCK_NUM, BLOCK_SIZE, 1, HEAD_DIM)
-        cache = torch.full(shape, float("nan"), dtype=torch.bfloat16)
-        cache[:TP_FIXTURE_WINDOW_BLOCKS, :, 0, :] = 0.0
-        cache[:TP_FIXTURE_WINDOW_BLOCKS, :, 0, 0] = 0.25
+        cache = torch.zeros(shape, dtype=torch.bfloat16)
+        cache[:, :, 0, 0] = 0.25
         return cache.unsqueeze(0).expand(TP_SIZE, *shape).clone()
 
-    def init_swa_indices():
-        window_row = torch.arange(WIN, dtype=torch.int32)
-        return window_row.reshape(1, 1, WIN).expand(TP_SIZE, local_t, WIN).clone()
+    def init_starts():
+        return resolve_start_positions(
+            start_pos,
+            batch=local_t // S,
+            seq=S,
+            max_seq_len=MAX_SEQ_LEN,
+            default_fn=lambda: torch.full((local_t // S,), WIN - 1, dtype=torch.int32),
+        )
+
+    def init_metadata():
+        starts = init_starts()
+        positions = position_ids_from_starts(starts, seq=S)
+        table = block_table(
+            batch=local_t // S,
+            table_blocks=ORI_MAX_BLOCKS,
+            physical_blocks=ORI_BLOCK_NUM,
+        )
+        sources, lens = swa_indices_and_lens(
+            positions, table, block_size=BLOCK_SIZE, window=WIN,
+        )
+        for request in range(local_t // S):
+            for step in range(S):
+                query = request * S + step
+                begin = int(lens[query].item()) - step - 1
+                for overlay_step in range(step + 1):
+                    sources[query, begin + overlay_step] = (
+                        SWA_SOURCE_OVERLAY_BASE - (request * S + overlay_step)
+                    )
+        return sources.contiguous(), lens.contiguous()
+
+    def init_current_kv():
+        current = torch.zeros(local_t, HEAD_DIM, dtype=torch.bfloat16)
+        current[:, 0] = 0.25
+        return current.unsqueeze(0).expand(TP_SIZE, local_t, HEAD_DIM).clone()
+
+    def init_swa_sources():
+        return init_metadata()[0].reshape(1, local_t, WIN).expand(TP_SIZE, local_t, WIN).clone()
 
     def init_swa_lens():
-        return torch.full((TP_SIZE, local_t), WIN, dtype=torch.int32)
+        return init_metadata()[1].reshape(1, local_t).expand(TP_SIZE, local_t).clone()
 
     def init_attn_sink():
         head = torch.arange(H, dtype=torch.int32).remainder(HEADS_PER_GROUP).to(torch.float32)
@@ -464,7 +501,8 @@ def build_tp_tensor_specs(local_t):
     return [
         TensorSpec("q", [TP_SIZE, local_t, H, HEAD_DIM], torch.bfloat16, init_value=init_q),
         TensorSpec("ori_kv", [TP_SIZE, ORI_BLOCK_NUM, BLOCK_SIZE, 1, HEAD_DIM], torch.bfloat16, init_value=init_ori_kv),
-        TensorSpec("swa_indices", [TP_SIZE, local_t, WIN], torch.int32, init_value=init_swa_indices),
+        TensorSpec("current_kv", [TP_SIZE, local_t, HEAD_DIM], torch.bfloat16, init_value=init_current_kv),
+        TensorSpec("swa_sources", [TP_SIZE, local_t, WIN], torch.int32, init_value=init_swa_sources),
         TensorSpec("swa_lens", [TP_SIZE, local_t], torch.int32, init_value=init_swa_lens),
         TensorSpec("attn_sink", [TP_SIZE, H], torch.float32, init_value=init_attn_sink),
         TensorSpec("freqs_cos", [TP_SIZE, local_t, ROPE_HEAD_DIM], torch.bfloat16, init_value=init_freqs_cos),
@@ -487,11 +525,12 @@ def golden_decode_swa(tensors):
     local_t = tensors["q"].shape[1]
     group_t = TP_SIZE * local_t
     q0 = tensors["q"][..., 0].float()
-    kv0 = tensors["ori_kv"][:, 0, 0, 0, 0].float()
+    kv0 = tensors["current_kv"][..., 0].float()
+    valid_len = tensors["swa_lens"].to(torch.float32)
     sink = tensors["attn_sink"].float()
-    score = q0 * kv0.reshape(TP_SIZE, 1, 1) * M.softmax_scale
-    numerator = WIN * kv0.reshape(TP_SIZE, 1, 1)
-    head_value = numerator / (WIN + torch.exp(sink.reshape(TP_SIZE, 1, H) - score))
+    score = q0 * kv0.unsqueeze(-1) * M.softmax_scale
+    numerator = valid_len.reshape(TP_SIZE, local_t, 1) * kv0.unsqueeze(-1)
+    head_value = numerator / (valid_len.reshape(TP_SIZE, local_t, 1) + torch.exp(sink.reshape(TP_SIZE, 1, H) - score))
     head_value = head_value.to(torch.bfloat16)
 
     attention_grouped = torch.zeros(TP_SIZE, O_GROUPS, local_t, O_GROUP_IN, dtype=torch.bfloat16)
@@ -582,19 +621,6 @@ def golden_decode_swa_tp1(tensors):
         "comb": comb_t,
     })
 
-    # Attention.forward, ratio==0 branch
-    position_ids = tensors["position_ids"].to(torch.int64)
-    rd = ROPE_HEAD_DIM
-
-    freqs_cos = tensors["freqs_cos"]
-    freqs_sin = tensors["freqs_sin"]
-    rope_cos_T = torch.empty(tokens, rd, dtype=freqs_cos.dtype)
-    rope_sin_T = torch.empty(tokens, rd, dtype=freqs_sin.dtype)
-    for t in range(tokens):
-        pos = int(position_ids[t].item())
-        rope_cos_T[t] = freqs_cos[pos]
-        rope_sin_T[t] = freqs_sin[pos]
-
     # q + win kv
     q = torch.zeros(tokens, H, HEAD_DIM, dtype=torch.bfloat16)
     kv = torch.zeros(tokens, HEAD_DIM, dtype=torch.bfloat16)
@@ -607,8 +633,8 @@ def golden_decode_swa_tp1(tensors):
         "wq_b": tensors["wq_b"],
         "wq_b_scale": tensors["wq_b_scale"],
         "wkv": tensors["wkv"],
-        "rope_cos": rope_cos_T,
-        "rope_sin": rope_sin_T,
+        "rope_cos": tensors["rope_cos"],
+        "rope_sin": tensors["rope_sin"],
         "gamma_cq": tensors["gamma_cq"],
         "gamma_ckv": tensors["gamma_ckv"],
         "q": q,
@@ -620,29 +646,28 @@ def golden_decode_swa_tp1(tensors):
     kv_cache = tensors["kv_cache"]
     attn_out = torch.zeros(tokens, D, dtype=torch.bfloat16)
 
-    # Current decode KV is visible to SWA through the same physical cache slots
-    # that metadata points at.
-    swa_slot_mapping = tensors["swa_slot_mapping"].to(torch.int64)
-    for t in range(tokens):
-        write_row = int(swa_slot_mapping[t].item())
-        if write_row >= 0:
-            write_blk = write_row // BLOCK_SIZE
-            write_intra = write_row % BLOCK_SIZE
-            kv_cache[write_blk, write_intra, 0] = kv[t]
-
     golden_sparse_attn({
         "q": q,
         "ori_kv": kv_cache,
-        "swa_indices": tensors["swa_indices"],
+        "current_kv": kv,
+        "swa_sources": tensors["swa_sources"],
         "swa_lens": tensors["swa_lens"],
         "attn_sink": tensors["attn_sink"],
-        "freqs_cos": rope_cos_T,
-        "freqs_sin": rope_sin_T,
+        "freqs_cos": tensors["rope_cos"],
+        "freqs_sin": tensors["rope_sin"],
         "wo_a": tensors["wo_a"],
         "wo_b": tensors["wo_b"],
         "wo_b_scale": tensors["wo_b_scale"],
         "attn_out": attn_out,
     })
+
+    # The raw cache is committed only after the attention read in the device
+    # path; mirror that transaction order in the golden.
+    write_slots = tensors["swa_write_slots"].to(torch.int64)
+    for t in range(tokens):
+        write_row = int(write_slots[t].item())
+        if write_row >= 0:
+            kv_cache[write_row // BLOCK_SIZE, write_row % BLOCK_SIZE, 0] = kv[t]
 
     # Block.hc_post
     y = torch.zeros(tokens, HC_MULT, D, dtype=torch.float32)
@@ -669,9 +694,7 @@ def build_tensor_specs(start_pos=None, batch=B):
         swa_decode_start_set,
     )
     from golden import TensorSpec
-    from utils import build_rope_tables
-
-    shared_freqs_cos, shared_freqs_sin = build_rope_tables(M, 0, dtype=torch.bfloat16)
+    from utils import swa_token_local_rope
 
     def quant_w_per_output_channel(w):
         amax = w.float().abs().amax(dim=0).clamp_min(INT8_AMAX_EPS)
@@ -719,10 +742,9 @@ def build_tensor_specs(start_pos=None, batch=B):
         return torch.ones(Q_LORA)
     def init_gamma_ckv():
         return torch.ones(HEAD_DIM)
-    def init_freqs_cos():
-        return shared_freqs_cos.clone()
-    def init_freqs_sin():
-        return shared_freqs_sin.clone()
+    def init_rope_rows():
+        positions = position_ids_from_starts(init_start_pos(), seq=S).reshape(-1)
+        return swa_token_local_rope(M, positions, dtype=torch.bfloat16)
     def init_normalized_cache(shape):
         cache = torch.randn(*shape)
         denom = cache.float().pow(2).mean(dim=-1, keepdim=True).sqrt().clamp_min(EPS)
@@ -762,8 +784,17 @@ def build_tensor_specs(start_pos=None, batch=B):
             block_size=BLOCK_SIZE,
             window=WIN,
         )
-    def init_swa_indices():
-        return init_swa_metadata()[0].contiguous()
+    def init_swa_sources():
+        sources, lens = init_swa_metadata()
+        for request in range(batch):
+            for step in range(S):
+                query = request * S + step
+                begin = int(lens[query].item()) - step - 1
+                for overlay_step in range(step + 1):
+                    sources[query, begin + overlay_step] = (
+                        SWA_SOURCE_OVERLAY_BASE - (request * S + overlay_step)
+                    )
+        return sources.contiguous()
     def init_swa_lens():
         return init_swa_metadata()[1].contiguous()
     def init_wo_a():
@@ -788,13 +819,14 @@ def build_tensor_specs(start_pos=None, batch=B):
         TensorSpec("wkv", [D, HEAD_DIM], torch.bfloat16, init_value=init_wkv),
         TensorSpec("gamma_cq", [Q_LORA], torch.bfloat16, init_value=init_gamma_cq),
         TensorSpec("gamma_ckv", [HEAD_DIM], torch.bfloat16, init_value=init_gamma_ckv),
-        TensorSpec("freqs_cos", [MAX_SEQ_LEN, ROPE_HEAD_DIM], torch.bfloat16, init_value=init_freqs_cos),
-        TensorSpec("freqs_sin", [MAX_SEQ_LEN, ROPE_HEAD_DIM], torch.bfloat16, init_value=init_freqs_sin),
+        TensorSpec("rope_cos", [tokens, ROPE_HEAD_DIM], torch.bfloat16,
+                   init_value=lambda: init_rope_rows()[0]),
+        TensorSpec("rope_sin", [tokens, ROPE_HEAD_DIM], torch.bfloat16,
+                   init_value=lambda: init_rope_rows()[1]),
         TensorSpec("kv_cache", [ORI_BLOCK_NUM, BLOCK_SIZE, 1, HEAD_DIM], torch.bfloat16, init_value=init_kv_cache, is_output=True),
-        TensorSpec("swa_slot_mapping", [tokens], torch.int64, init_value=init_swa_slot_mapping),
-        TensorSpec("swa_indices", [tokens, WIN], torch.int32, init_value=init_swa_indices),
+        TensorSpec("swa_write_slots", [tokens], torch.int64, init_value=init_swa_slot_mapping),
+        TensorSpec("swa_sources", [tokens, WIN], torch.int32, init_value=init_swa_sources),
         TensorSpec("swa_lens", [tokens], torch.int32, init_value=init_swa_lens),
-        TensorSpec("position_ids", [tokens], torch.int32, init_value=init_position_ids),
         TensorSpec("attn_sink", [H], torch.float32, init_value=init_attn_sink),
         TensorSpec("wo_a", [O_GROUPS, O_LORA, O_GROUP_IN], torch.bfloat16, init_value=init_wo_a),
         TensorSpec("wo_b", [D, O_GROUPS * O_LORA], torch.int8, init_value=lambda: wo_b_i8),
@@ -818,6 +850,8 @@ if __name__ == "__main__":
         help=f"comma-separated device ids; need exactly {TP_SIZE}",
     )
     parser.add_argument("--case", choices=("all", "max", "subcapacity"), default="all")
+    parser.add_argument("--start-pos", type=int, default=None,
+                        help="absolute decode start position for the generated SWA metadata")
     parser.add_argument("--compile-only", action="store_true", default=False)
     parser.add_argument("--dump-passes", action="store_true", default=False)
     args = parser.parse_args()
@@ -841,7 +875,7 @@ if __name__ == "__main__":
         local_t = case_local_t[case]
         result = run_jit(
             fn=l3_decode_swa,
-            specs=build_tp_tensor_specs(local_t),
+            specs=build_tp_tensor_specs(local_t, start_pos=args.start_pos),
             golden_fn=golden_decode_swa,
             compile_only=args.compile_only,
             compile_cfg=dict(

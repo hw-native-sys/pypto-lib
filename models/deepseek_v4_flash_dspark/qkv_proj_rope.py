@@ -131,7 +131,7 @@ def q_proj_rope(
     q: pl.Tensor[[T_DYN, H, HEAD_DIM], pl.BF16],
     qr: pl.Tensor[[T_DYN, Q_LORA], pl.INT8],
     qr_scale: pl.Tensor[[T_DYN, 1], pl.FP32],
-):
+) -> pl.Scalar[pl.TASK_ID]:
     """Q LoRA (wq_a -> rms/quant -> wq_b) + per-head RMSNorm + interleaved RoPE."""
     t_dim = pl.tensor.dim(x, 0)
     x_view = pl.reshape(x, [t_dim, D])
@@ -147,7 +147,11 @@ def q_proj_rope(
                 qr_seed = pl.full([QR_M_TILE, QR_N_TILE], dtype=pl.FP32, value=0.0)
                 qr_fp32[ts0 : ts0 + QR_M_TILE, nseed0 : nseed0 + QR_N_TILE] = qr_seed
 
-    for qbg_idx in pl.spmd((Q_LORA // QR_N_TILE) * QR_OK, name_hint="qr_proj_matmul", allow_early_resolve=True):
+    with pl.spmd(
+        (Q_LORA // QR_N_TILE) * QR_OK,
+        name_hint="qr_proj_matmul",
+    ) as qr_proj_tid:
+        qbg_idx = pl.tile.get_block_idx()
         q_a_col0 = (qbg_idx // QR_OK) * QR_N_TILE
         qr_k_base = (qbg_idx % QR_OK) * QR_SPLIT_K_TILE
         for t0 in pl.range(0, t_matmul, QR_M_TILE):
@@ -168,7 +172,13 @@ def q_proj_rope(
     qr_i8_matmul = pl.create_tensor([t_matmul, Q_LORA], dtype=pl.INT8)
 
     # Two passes per block: pass 1 computes amax; pass 2 recomputes norm and quantizes.
-    for tg_idx in pl.spmd(t_dim // T_TILE, name_hint="qr_rms_norm_quant", allow_early_resolve=True):
+    with pl.spmd(
+        t_dim // T_TILE,
+        name_hint="qr_rms_norm_quant",
+        deps=[qr_proj_tid],
+        allow_early_resolve=True,
+    ) as qr_quant_tid:
+        tg_idx = pl.tile.get_block_idx()
         tg = tg_idx * T_TILE
         qr_sq_sum = pl.full([1, T_TILE], dtype=pl.FP32, value=0.0)
         qr_amax_g = pl.full([1, T_TILE], dtype=pl.FP32, value=0.0)
@@ -209,7 +219,12 @@ def q_proj_rope(
     # Pure-matmul qproj scope (cube, INT32 -> GM), unmixed with downstream vector work.
     q_proj_i32 = pl.create_tensor([t_matmul, H * HEAD_DIM], dtype=pl.INT32)
     # One output-column fragment per task.
-    for qproj_n_idx in pl.spmd((H * HEAD_DIM) // QPROJ_MM_N_TILE, name_hint="qproj_matmul"):
+    with pl.spmd(
+        (H * HEAD_DIM) // QPROJ_MM_N_TILE,
+        name_hint="qproj_matmul",
+        deps=[qr_quant_tid],
+    ) as qproj_tid:
+        qproj_n_idx = pl.tile.get_block_idx()
         w_col0 = qproj_n_idx * QPROJ_MM_N_TILE
         for t0 in pl.range(0, t_matmul, QPROJ_M_TILE):
             col_acc = pl.create_tensor([QPROJ_M_TILE, QPROJ_MM_N_TILE], dtype=pl.INT32)
@@ -225,7 +240,12 @@ def q_proj_rope(
     # Fused qproj dequant, per-head RMSNorm, NOPE writeback, and interleaved RoPE.
     # RoPE: out[j] = inv_rms * (x[j] * cos[j] + x[j^1] * sign[j] * sin[j]).
     q_flat = pl.reshape(q, [t_dim, H * HEAD_DIM])
-    for hg_idx in pl.spmd(H // Q_ROPE_H_TILE, name_hint="qproj_dequant_rms_nope_rope", allow_early_resolve=True):
+    with pl.spmd(
+        H // Q_ROPE_H_TILE,
+        name_hint="qproj_dequant_rms_nope_rope",
+        deps=[qproj_tid, qr_quant_tid],
+    ) as q_tid:
+        hg_idx = pl.tile.get_block_idx()
         hg = hg_idx * Q_ROPE_H_TILE
         for tg in pl.range(0, t_dim, Q_ROPE_T_TILE):
             qr_scale_dq_t = qr_scale_view[tg : tg + Q_ROPE_T_TILE, :]
@@ -264,6 +284,8 @@ def q_proj_rope(
                 q_rope_bf16 = pl.cast(q_rope_rot, target_type=pl.BF16, mode="rint")
                 q_flat[tg : tg + Q_ROPE_T_TILE, h0 + NOPE_DIM : h0 + NOPE_DIM + ROPE_DIM] = q_rope_bf16
 
+    return pl.system.task_dummy(deps=[q_tid, qr_quant_tid])
+
 
 @pl.jit.inline
 def kv_proj_rope(
@@ -275,7 +297,7 @@ def kv_proj_rope(
     rope_swap_idx: pl.Tensor[[KV_T_DYN, ROPE_DIM], pl.INT32],
     kv: pl.Tensor[[KV_T_DYN, HEAD_DIM], pl.BF16],
     late_dep: pl.Scalar[pl.TASK_ID],
-):
+) -> pl.Scalar[pl.TASK_ID]:
     """KV LoRA (wkv) + fused KV RMSNorm and interleaved RoPE."""
     t_dim = pl.tensor.dim(x, 0)
     x_view = pl.reshape(x, [t_dim, D])
@@ -291,7 +313,7 @@ def kv_proj_rope(
                 kv_fp32[kts0 : kts0 + KV_M_TILE, kvseed0 : kvseed0 + KV_N_TILE] = kv_seed
 
     # `late_dep` fences kv_proj one hop behind rms_norm so qr_proj_matmul takes the cores first.
-    with pl.spmd((HEAD_DIM // KV_N_TILE) * KV_OK, name_hint="kv_proj_matmul", deps=[late_dep]) as _kv_tid:
+    with pl.spmd((HEAD_DIM // KV_N_TILE) * KV_OK, name_hint="kv_proj_matmul", deps=[late_dep]) as kv_proj_tid:
         kbg = pl.tile.get_block_idx()
         kv_col0 = (kbg // KV_OK) * KV_N_TILE
         kv_k_base = (kbg % KV_OK) * KV_SPLIT_K_TILE
@@ -313,7 +335,12 @@ def kv_proj_rope(
     # Fused KV RMSNorm + interleaved (CANN A3) RoPE, one spmd task per
     # [KV_RMS_T_TILE, HEAD_DIM] row block. NOPE columns [0:NOPE_DIM) and rope columns
     # [NOPE_DIM:HEAD_DIM) are disjoint, so each task writes a conflict-free row block.
-    for tg_idx in pl.spmd(t_dim // KV_RMS_T_TILE, name_hint="kv_rms_norm_rope"):
+    with pl.spmd(
+        t_dim // KV_RMS_T_TILE,
+        name_hint="kv_rms_norm_rope",
+        deps=[kv_proj_tid],
+    ) as kv_tid:
+        tg_idx = pl.tile.get_block_idx()
         tg = tg_idx * KV_RMS_T_TILE
         # Pass 1: per-row sum of squares over the full HEAD_DIM -> inv_rms.
         kv_sq_sum = pl.full([1, KV_RMS_T_TILE], dtype=pl.FP32, value=0.0)
@@ -349,6 +376,8 @@ def kv_proj_rope(
         kv_rope_i16 = pl.cast(kv_rope_rot, target_type=pl.BF16, mode="rint")
         kv_view[tg : tg + KV_RMS_T_TILE, NOPE_DIM : NOPE_DIM + ROPE_DIM] = kv_rope_i16
 
+    return kv_tid
+
 
 @pl.jit.inline
 def qkv_proj_rope(
@@ -366,24 +395,24 @@ def qkv_proj_rope(
     qr: pl.Tensor[[T_DYN, Q_LORA], pl.INT8],
     qr_scale: pl.Tensor[[T_DYN, 1], pl.FP32],
     late_dep: pl.Scalar[pl.TASK_ID],
-):
+) -> pl.Scalar[pl.TASK_ID]:
     """Fused q + kv projection: both branches share one token axis and one rope table."""
     t_dim = pl.tensor.dim(x, 0)
     q_rope_cos_il = pl.create_tensor([t_dim, ROPE_DIM], dtype=pl.FP32)
     q_rope_sin_signed = pl.create_tensor([t_dim, ROPE_DIM], dtype=pl.FP32)
     q_rope_swap_idx = pl.create_tensor([t_dim, ROPE_DIM], dtype=pl.INT32)
     rope_prepare(rope_cos, rope_sin, q_rope_cos_il, q_rope_sin_signed, q_rope_swap_idx)
-    q_proj_rope(
+    q_done = q_proj_rope(
         x, wq_a, wq_b, wq_b_scale, gamma_cq,
         q_rope_cos_il, q_rope_sin_signed, q_rope_swap_idx,
         q, qr, qr_scale,
     )
-    kv_proj_rope(
+    kv_done = kv_proj_rope(
         x, wkv, gamma_ckv,
         q_rope_cos_il, q_rope_sin_signed, q_rope_swap_idx,
         kv, late_dep,
     )
-    return q
+    return pl.system.task_dummy(deps=[q_done, kv_done])
 
 
 @pl.jit

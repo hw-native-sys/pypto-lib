@@ -8,8 +8,17 @@
 # -----------------------------------------------------------------------------------------------------------
 """Device-side metadata lowering for DeepSeek-V4 decode.
 
-``utils`` holds the host-side torch counterpart used by the per-kernel test
-fixtures.
+This module carries two concerns:
+
+1. The legacy dense metadata kernel (``decode_metadata``) plus its golden
+   reference and tensor-spec fixture.  This is the baseline regression fence
+   for position-dependent slot/offset lowering.
+
+2. The Phase D packed descriptor field indices (``PHASE_D_*``).  These are
+   plain integer constants consumed by ``decode_indexer``,
+   ``decode_indexer_topk`` and ``decode_csa`` to index into the packed
+   forest descriptor tensors built on the host side.  They carry no device
+   code and no host builder; they are ABI contracts only.
 """
 
 import pypto.language as pl
@@ -18,6 +27,7 @@ from config import (
     BLOCK_SIZE,
     C4A_COMPRESSOR_BLOCK_SIZE,
     C128_COMPRESSOR_BLOCK_SIZE,
+    CSA_STATE_PAGES_PER_REQUEST,
     DECODE_BATCH,
     TP,
     DECODE_SEQ,
@@ -498,3 +508,73 @@ if __name__ == "__main__":
         if result.error:
             print(result.error)
         raise SystemExit(1)
+
+
+# ---------------------------------------------------------------------------
+# Phase D packed descriptor field indices.
+#
+# These constants are the ABI contract between the host-side forest descriptor
+# packer (in decode_indexer.py / decode_indexer_topk.py) and the device-side
+# Top-K forest kernels.  They index into the packed int32 descriptor tensors
+# that carry leaf / pair / singleton / upper-merge / root / event / state /
+# next-state ranges.  Packing keeps each descriptor below PyPTO's 32-tensor
+# callable limit while preserving exact actual row counts.
+#
+# ``CSA_STATE_PAGES_PER_REQUEST`` (from config) sets the per-request state
+# page slots packed into the state descriptor row.
+# ---------------------------------------------------------------------------
+PHASE_D_QUERY_OFFSET_LEAF = 0
+PHASE_D_QUERY_OFFSET_NODE = 1
+PHASE_D_QUERY_OFFSET_MERGE = 2
+PHASE_D_QUERY_OFFSET_PAIR_GROUP = 3
+PHASE_D_QUERY_OFFSET_FIELDS = 4
+PHASE_D_LEAF_QUERY = 0
+PHASE_D_LEAF_BEGIN = 1
+PHASE_D_LEAF_VALID = 2
+PHASE_D_LEAF_OUTPUT_SLOT = 3
+PHASE_D_LEAF_CREDIT_SLOT = 4
+PHASE_D_LEAF_FIELDS = 5
+PHASE_D_MERGE_QUERY = 0
+PHASE_D_MERGE_LEVEL = 1
+PHASE_D_MERGE_LEFT_SLOT = 2
+PHASE_D_MERGE_RIGHT_SLOT = 3
+PHASE_D_MERGE_OUTPUT_SLOT = 4
+PHASE_D_MERGE_FIELDS = 5
+PHASE_D_PAIR_LEFT_LEAF = 0
+PHASE_D_PAIR_RIGHT_LEAF = 1
+PHASE_D_PAIR_LEFT_SLOT = 2
+PHASE_D_PAIR_RIGHT_SLOT = 3
+PHASE_D_PAIR_OUTPUT_SLOT = 4
+PHASE_D_PAIR_CREDIT_SLOT = 5
+PHASE_D_PAIR_FIELDS = 6
+PHASE_D_SINGLETON_LEAF = 0
+PHASE_D_SINGLETON_SLOT = 1
+PHASE_D_SINGLETON_CREDIT_SLOT = 2
+PHASE_D_SINGLETON_FIELDS = 3
+PHASE_D_UPPER_LEFT_SLOT = 0
+PHASE_D_UPPER_RIGHT_SLOT = 1
+PHASE_D_UPPER_OUTPUT_SLOT = 2
+PHASE_D_UPPER_FIELDS = 3
+PHASE_D_ROOT_SLOT = 0
+PHASE_D_ROOT_DEPENDENCY_SLOT = 1
+PHASE_D_ROOT_FIELDS = 2
+PHASE_D_EVENT_QUERY = 0
+PHASE_D_EVENT_ROW = 1
+PHASE_D_EVENT_MAIN_SLOT = 2
+PHASE_D_EVENT_IDX_SLOT = 3
+PHASE_D_EVENT_FIELDS = 4
+PHASE_D_STATE_MAIN_SLOT = 0
+PHASE_D_STATE_INNER_SLOT = 1
+PHASE_D_STATE_SLOT_FIELDS = 2
+PHASE_D_NEXT_MAIN_BEGIN = 0
+PHASE_D_NEXT_MAIN_END = 1
+PHASE_D_NEXT_STATE_BEGIN = 2
+PHASE_D_NEXT_STATE_END = 3
+PHASE_D_NEXT_INNER_BEGIN = 4
+PHASE_D_NEXT_INNER_END = 5
+PHASE_D_NEXT_FIELDS = 6
+PHASE_D_STATE_PAGE_ID_BASE = 0
+PHASE_D_STATE_PAGE_EPOCH_BASE = PHASE_D_STATE_PAGE_ID_BASE + CSA_STATE_PAGES_PER_REQUEST
+PHASE_D_STATE_VALID_BEGIN = PHASE_D_STATE_PAGE_EPOCH_BASE + CSA_STATE_PAGES_PER_REQUEST
+PHASE_D_STATE_VALID_END = PHASE_D_STATE_VALID_BEGIN + 1
+PHASE_D_STATE_DESCRIPTOR_FIELDS = PHASE_D_STATE_VALID_END + 1
