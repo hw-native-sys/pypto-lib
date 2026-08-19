@@ -137,6 +137,8 @@ CSA_LAST_ORDER = CSA_NUM_LAYERS - 1
 
 FWD_TOKENS_DYN = pl.dynamic("PREFILL_FWD_TOKENS_DYN")
 LAST_MOE_EPOCH = 2 * HCA_NUM_LAYERS + 3
+PRE_HC_COPY_TOKEN_TILE = 4
+assert T % PRE_HC_COPY_TOKEN_TILE == 0
 
 # The LM head owns its barrier counters, so its epoch restarts at 1 rather
 # than continuing the MoE numbering.
@@ -358,6 +360,8 @@ def prefill_fwd(
     total_nt: pl.Scalar[pl.INT32] = pl.cast(0, pl.INT32)
     for owner_rank in pl.range(N_RANKS):
         total_nt = pl.max(total_nt, pl.read(num_tokens_per_owner, [owner_rank]))
+    owner_nt = pl.read(num_tokens_per_owner, [my_rank])
+    owner_tail_start = pl.max(owner_nt - T, pl.cast(0, pl.INT32))
     ori_block_num = pl.tensor.dim(kv_cache, 0) // FWD_NUM_LAYERS
     cmp_block_num = pl.tensor.dim(cmp_kv, 0) // FWD_NUM_LAYERS
     hca_state_block_num = pl.tensor.dim(hca_compress_state, 0) // HCA_NUM_LAYERS
@@ -373,6 +377,7 @@ def prefill_fwd(
     INNER_STATE_BLOCK_NUM = inner_state_block_num
     PREFILL_IDX_BLOCK_NUM = idx_block_num
     t_dim = pl.tensor.dim(x_hc, 0)
+    pre_hc_hidden_tile = pl.create_tensor([T, HC_MULT, D], dtype=pl.FP32)
     # Paged caches are slot-mapped, so tiles accumulate in place on device.
     for tile_base in pl.range(0, t_dim, T):
         with pl.scope():
@@ -768,16 +773,54 @@ def prefill_fwd(
                     routed_w2_last, routed_w2_scale_last,
                     shared_w1_last, shared_w1_scale_last, shared_w3_last, shared_w3_scale_last,
                     shared_w2_last, shared_w2_scale_last,
-                    pre_hc_hidden_out,
+                    pre_hc_hidden_tile,
                     recv_meta, recv_x, recv_aux, recv_route, arrived, data_arrived,
                     routed_y_buf, combine_arrived,
                     csa_layer_last, nt, my_rank, last_moe_epoch,
                 )
             x_head: pl.Tensor[[T, D], pl.BF16] = pl.create_tensor([T, D], dtype=pl.BF16)
             with pl.scope():
-                hc_head(pre_hc_hidden_out, hc_head_fn, hc_head_scale, hc_head_base, x_head)
+                hc_head(pre_hc_hidden_tile, hc_head_fn, hc_head_scale, hc_head_base, x_head)
                 rms_norm(x_head, final_norm_w, x_out_tile)
-    clear_moe_signals(pre_hc_hidden_out, arrived, data_arrived, combine_arrived)
+
+            # Publish each owner's final T valid pre-HC rows in chronological order.
+            tail_overlap_start = pl.max(tile_base, owner_tail_start)
+            tail_overlap_end = pl.min(tile_base + T, owner_nt)
+            tail_overlap_tokens = pl.max(
+                tail_overlap_end - tail_overlap_start,
+                pl.cast(0, pl.INT32),
+            )
+            if tail_overlap_tokens > 0:
+                tail_source_start = tail_overlap_start - tile_base
+                tail_destination_start = tail_overlap_start - owner_tail_start
+                for copy_block in pl.spmd(
+                    (T // PRE_HC_COPY_TOKEN_TILE) * HC_MULT,
+                    name_hint="prefill_pre_hc_tail_copy",
+                ):
+                    copy_token_block = copy_block // HC_MULT
+                    copy_hc_lane = copy_block % HC_MULT
+                    copy_token_start = copy_token_block * PRE_HC_COPY_TOKEN_TILE
+                    for copy_offset in pl.range(PRE_HC_COPY_TOKEN_TILE):
+                        copy_token = copy_token_start + copy_offset
+                        if copy_token < tail_overlap_tokens:
+                            source_token = tail_source_start + copy_token
+                            destination_token = tail_destination_start + copy_token
+                            pre_hc_hidden_out[
+                                destination_token : destination_token + 1,
+                                copy_hc_lane : copy_hc_lane + 1,
+                                0:D,
+                            ] = pl.slice(
+                                pre_hc_hidden_tile,
+                                [1, 1, D],
+                                [source_token, copy_hc_lane, 0],
+                            )
+
+    clear_moe_signals(
+        pre_hc_hidden_tile,
+        arrived,
+        data_arrived,
+        combine_arrived,
+    )
     return x_out
 
 
