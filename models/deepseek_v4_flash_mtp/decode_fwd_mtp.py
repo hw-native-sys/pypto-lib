@@ -20,18 +20,6 @@ from pypto.ir.distributed_compiled_program import DistributedConfig
 
 from decode_fwd import *
 from decode_fwd import build_tensor_specs as build_decode_fwd_tensor_specs
-from decode_device_state import (
-    STATE_COMMITTED_COUNT,
-    STATE_DRAFT_TOKEN,
-    STATE_GENERATION,
-    STATE_META_WIDTH,
-    STATE_TAIL_POSITION,
-    STATE_TAIL_TOKEN,
-    STATE_TOKEN_WIDTH,
-    STATE_VALID,
-    advance_decode_device_state,
-    prepare_decode_from_device_state,
-)
 from decode_mtp import (
     MOE_TOPK,
     MOE_VOCAB,
@@ -39,7 +27,273 @@ from decode_mtp import (
     build_tensor_specs as build_decode_mtp_tensor_specs,
     mtp_decode_layer_inline,
 )
-from decode_mtp_verify import verify_and_pack_mtp_tokens
+
+# decode_fwd re-exports B and T but not the per-step token count.
+from config import DECODE_SEQ as S
+
+# Persistent per-request MTP serving state.
+#
+# The scheduler batch is transient: a request may occupy a different local
+# row on every step. The tensors below form a persistent device-side pool
+# instead. Serving passes a small descriptor, (slot_id, generation), for each
+# current batch row, and the fused step then loads the previous tail/draft,
+# verifies the draft against the main-model sample, and commits the result
+# back to the same slot. For the supported S == 2 layout, flattened rows 2*r
+# and 2*r+1 belong to local batch row r.
+
+# ``state_meta`` is a persistent pool indexed by serving-assigned state slot,
+# not by the request's transient row in the current decode batch.
+# ``valid`` means that the slot contains a completely initialized payload.  In
+# the current FIFO lifecycle it changes to 1 on first assignment and is not
+# cleared on release: serving stops publishing that slot, and the generation is
+# incremented before reuse.  It is therefore an initialization guard, not the
+# scheduler's live-request/ownership bit.
+STATE_VALID = 0
+# Allocation tag (ABA guard).  Serving increments it whenever a freed slot is
+# assigned to a new request; stale prepared metadata must match neither the new
+# request's tokens nor its tail state.
+STATE_GENERATION = 1
+STATE_TAIL_POSITION = 2
+STATE_COMMITTED_COUNT = 3
+STATE_META_WIDTH = 4
+
+STATE_TAIL_TOKEN = 0
+STATE_DRAFT_TOKEN = 1
+STATE_TOKEN_WIDTH = 2
+
+assert S == 2, "persistent MTP state requires decode_seq=2"
+assert MAX_LOGIT_ROWS >= T, "verification reads one sampled row per decode token"
+
+
+@pl.jit.inline
+def prepare_decode_from_device_state(
+    state_slot_ids: pl.Tensor[[B], pl.INT32],
+    state_generations: pl.Tensor[[B], pl.INT32],
+    state_tokens: pl.Tensor[[B, STATE_TOKEN_WIDTH], pl.INT64],
+    state_meta: pl.Tensor[[B, STATE_META_WIDTH], pl.INT32],
+    input_ids: pl.Tensor[[T], pl.INT64],
+    position_ids: pl.Tensor[[T], pl.INT32],
+    kv_seq_lens: pl.Tensor[[B], pl.INT32],
+    tail_token_ids: pl.Tensor[[B], pl.INT64],
+    tail_positions: pl.Tensor[[B], pl.INT32],
+):
+    """Late-bind recurrent decode fields from stable device slots.
+
+    This runs at the beginning of the fused decode, before the main model.  For
+    each active local batch row ``r``, it validates the prepared descriptor and
+    rewrites the placeholder host inputs from the authoritative device state::
+
+        row0 = 2*r: input=tail,  position=tail_position + 1
+        row1 = 2*r+1: input=draft, position=tail_position + 2
+        kv_seq_lens[r] = tail_position + 3
+
+    Positions are zero-based.  Therefore ``tail_position + 3`` is the KV
+    length after the two rows at positions ``tail_position+1`` and
+    ``tail_position+2`` have been included.
+
+    Args:
+        state_slot_ids: ``[B]`` transient-row to persistent-slot mapping.
+            ``-1`` marks an inactive/padded row.
+        state_generations: ``[B]`` allocation generations captured by serving
+            when it prepared the batch.  This must match the slot metadata.
+        state_tokens: Persistent ``[B, 2]`` pool indexed by slot.  Column 0 is
+            the last committed tail token; column 1 is the draft to verify.
+        state_meta: Persistent ``[B, 4]`` pool indexed by slot, containing
+            ``valid``, ``generation``, ``tail_position``, and
+            ``committed_count``.
+        input_ids: In/out flattened main-decode tokens ``[T=B*S]``.  Valid
+            request rows are overwritten with ``[tail, draft]``.
+        position_ids: In/out flattened main-decode positions ``[T]``.
+        kv_seq_lens: In/out main-model KV lengths ``[B]``.
+        tail_token_ids: In/out ``[B]`` verifier scratch.  It receives the old
+            committed tail token used when the draft is rejected.
+        tail_positions: In/out ``[B]`` verifier scratch.  It receives the old
+            committed tail position used when the draft is rejected.
+
+    A row is consumed only when ``slot_id >= 0``, the slot is valid, and its
+    generation matches.  Otherwise every caller-provided padded value is left
+    untouched.  Returned tensors alias the in-place-updated arguments and make
+    the mutation/dependency explicit to PyPTO's dataflow compiler.
+    """
+    # One core owns these tightly packed scalar updates.  The metadata volume
+    # is tiny, and single ownership avoids adjacent scalar DMA write races.
+    for core in pl.spmd(1, name_hint="mtp_state_prepare"):
+        for request in pl.range(core, B):
+            slot_raw = pl.read(state_slot_ids, [request])
+            if slot_raw >= 0:
+                slot = pl.cast(slot_raw, target_type=pl.INDEX)
+                valid = pl.read(state_meta, [slot, STATE_VALID])
+                generation = pl.read(state_meta, [slot, STATE_GENERATION])
+                expected = pl.read(state_generations, [request])
+                if valid == 1 and generation == expected:
+                    row0 = request * S
+                    row1 = row0 + 1
+                    tail_token = pl.read(state_tokens, [slot, STATE_TAIL_TOKEN])
+                    draft_token = pl.read(state_tokens, [slot, STATE_DRAFT_TOKEN])
+                    tail_position = pl.read(state_meta, [slot, STATE_TAIL_POSITION])
+                    pl.write(input_ids, [row0], tail_token)
+                    pl.write(input_ids, [row1], draft_token)
+                    pl.write(
+                        position_ids,
+                        [row0],
+                        pl.cast(tail_position + 1, target_type=pl.INT32),
+                    )
+                    pl.write(
+                        position_ids,
+                        [row1],
+                        pl.cast(tail_position + 2, target_type=pl.INT32),
+                    )
+                    pl.write(
+                        kv_seq_lens,
+                        [request],
+                        pl.cast(tail_position + 3, target_type=pl.INT32),
+                    )
+                    pl.write(tail_token_ids, [request], tail_token)
+                    pl.write(tail_positions, [request], tail_position)
+    return input_ids, position_ids, kv_seq_lens, tail_token_ids, tail_positions
+
+
+@pl.jit.inline
+def advance_decode_device_state(
+    state_slot_ids: pl.Tensor[[B], pl.INT32],
+    state_generations: pl.Tensor[[B], pl.INT32],
+    state_tokens: pl.Tensor[[B, STATE_TOKEN_WIDTH], pl.INT64],
+    state_meta: pl.Tensor[[B, STATE_META_WIDTH], pl.INT32],
+    committed_input_ids: pl.Tensor[[T], pl.INT64],
+    committed_position_ids: pl.Tensor[[T], pl.INT32],
+    next_sampled_ids: pl.Tensor[[MAX_LOGIT_ROWS, SAMPLED_IDS_PAD], pl.INT32],
+    accepted_counts: pl.Tensor[[B], pl.INT32],
+):
+    """Commit verifier and draft-model outputs into their stable slots.
+
+    This runs at the end of the fused decode.  ``verify_and_pack_mtp_tokens``
+    has already normalized both acceptance outcomes into a two-row committed
+    window for request ``r``::
+
+        draft accepted (accepted=2): [main0, main1]
+        draft rejected (accepted=1): [old_tail, main0]
+
+    In both cases row ``2*r+1`` is consequently the newest committed tail.
+    This helper stores that row as the next step's tail, stores the MTP model's
+    sampled token as the next draft, advances the tail position, and increments
+    the running committed-token count by ``accepted``.
+
+    Args:
+        state_slot_ids: ``[B]`` transient-row to persistent-slot mapping used
+            for this invocation; ``-1`` means inactive.
+        state_generations: ``[B]`` expected allocation generations captured
+            with the prepared batch.
+        state_tokens: In/out persistent ``[B, 2]`` pool.  Column 0 receives
+            the newest committed tail and column 1 receives the next draft.
+        state_meta: In/out persistent ``[B, 4]`` pool.  This function updates
+            ``tail_position`` and ``committed_count`` only.
+        committed_input_ids: ``[T]`` two-row committed windows produced by
+            verification, not the original speculative main inputs.
+        committed_position_ids: ``[T]`` positions aligned with those committed
+            windows.
+        next_sampled_ids: ``[MAX_LOGIT_ROWS, SAMPLED_IDS_PAD]`` MTP LM-head
+            sampling output.  Row ``r``, column 0 is request ``r``'s next draft.
+        accepted_counts: ``[B]`` verifier result, currently 1 on rejection and
+            2 when the single draft is accepted.
+
+    The same valid-bit and generation check as the prepare side protects this
+    writeback from a stale batch after request release and slot reuse.  Returns
+    alias the two in-place-updated persistent pools.
+    """
+    # Keep the state transition single-owner for the same scalar-write reason
+    # as the prepare helper above.
+    for core in pl.spmd(1, name_hint="mtp_state_advance"):
+        for request in pl.range(core, B):
+            slot_raw = pl.read(state_slot_ids, [request])
+            if slot_raw >= 0:
+                slot = pl.cast(slot_raw, target_type=pl.INDEX)
+                valid = pl.read(state_meta, [slot, STATE_VALID])
+                generation = pl.read(state_meta, [slot, STATE_GENERATION])
+                expected = pl.read(state_generations, [request])
+                if valid == 1 and generation == expected:
+                    # Verification always packs the newest committed token and
+                    # position into the second row, regardless of acceptance.
+                    row1 = request * S + 1
+                    accepted = pl.read(accepted_counts, [request])
+                    next_draft = pl.cast(
+                        pl.read(next_sampled_ids, [request, 0]),
+                        target_type=pl.INT64,
+                    )
+                    pl.write(
+                        state_tokens,
+                        [slot, STATE_TAIL_TOKEN],
+                        pl.read(committed_input_ids, [row1]),
+                    )
+                    pl.write(state_tokens, [slot, STATE_DRAFT_TOKEN], next_draft)
+                    pl.write(
+                        state_meta,
+                        [slot, STATE_TAIL_POSITION],
+                        pl.read(committed_position_ids, [row1]),
+                    )
+                    committed = pl.read(state_meta, [slot, STATE_COMMITTED_COUNT])
+                    pl.write(
+                        state_meta,
+                        [slot, STATE_COMMITTED_COUNT],
+                        committed + accepted,
+                    )
+    return state_tokens, state_meta
+
+
+@pl.jit.inline
+def verify_and_pack_mtp_tokens(
+    main_input_ids: pl.Tensor[[T], pl.INT64],
+    main_position_ids: pl.Tensor[[T], pl.INT32],
+    main_sampled_ids: pl.Tensor[[MAX_LOGIT_ROWS, SAMPLED_IDS_PAD], pl.INT32],
+    tail_token_ids: pl.Tensor[[B], pl.INT64],
+    tail_positions: pl.Tensor[[B], pl.INT32],
+    tail_slot_ids: pl.Tensor[[B], pl.INT32],
+    mtp_input_ids: pl.Tensor[[T], pl.INT64],
+    mtp_position_ids: pl.Tensor[[T], pl.INT32],
+    accepted_counts: pl.Tensor[[B], pl.INT32],
+):
+    """Verify one draft per row and pack the two-token MTP committed window."""
+    # Keep the tightly packed scalar stores on one core. Multiple SPMD cores
+    # writing adjacent scalar addresses can race through overlapping DMA units.
+    for verify_core in pl.spmd(1, name_hint="mtp_verify_and_pack"):
+        for request in pl.range(verify_core, B):
+            row0 = request * S
+            row1 = row0 + 1
+            slot = pl.read(tail_slot_ids, [request])
+            if slot >= 0:
+                draft = pl.read(main_input_ids, [row1])
+                main0 = pl.cast(pl.read(main_sampled_ids, [row0, 0]), pl.INT64)
+                main1 = pl.cast(pl.read(main_sampled_ids, [row1, 0]), pl.INT64)
+                accepted = pl.cast(1, pl.INT32)
+                committed0 = pl.read(tail_token_ids, [request])
+                committed1 = main0
+                position0 = pl.read(tail_positions, [request])
+                position1 = pl.read(main_position_ids, [row0])
+                if draft == main0:
+                    accepted = pl.cast(2, pl.INT32)
+                    committed0 = main0
+                    committed1 = main1
+                    position0 = pl.read(main_position_ids, [row0])
+                    position1 = pl.read(main_position_ids, [row1])
+                pl.write(accepted_counts, [request], accepted)
+                pl.write(mtp_input_ids, [row0], committed0)
+                pl.write(mtp_input_ids, [row1], committed1)
+                pl.write(mtp_position_ids, [row0], position0)
+                pl.write(mtp_position_ids, [row1], position1)
+            else:
+                pl.write(accepted_counts, [request], pl.cast(1, pl.INT32))
+                pl.write(mtp_input_ids, [row0], pl.read(main_input_ids, [row0]))
+                pl.write(mtp_input_ids, [row1], pl.read(main_input_ids, [row1]))
+                pl.write(
+                    mtp_position_ids,
+                    [row0],
+                    pl.read(main_position_ids, [row0]),
+                )
+                pl.write(
+                    mtp_position_ids,
+                    [row1],
+                    pl.read(main_position_ids, [row1]),
+                )
+    return mtp_input_ids, mtp_position_ids, accepted_counts
 
 @pl.jit(auto_scope=False)
 def decode_fwd_mtp_l2(

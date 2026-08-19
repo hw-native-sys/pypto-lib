@@ -163,12 +163,14 @@ sampling is fused into the same program.
 mtp_projection   e_proj(enorm(hidden)) + h_proj(hnorm(prev_hidden))
 decode_mtp       lookup_embedding → mtp_projection → decode_swa → moe
                  → hc_head → rmsnorm → lm_head
-decode_fwd_mtp   decode_fwd → decode_mtp_verify → decode_mtp
+decode_fwd_mtp   decode_fwd → verify_and_pack_mtp_tokens → decode_mtp
 prefill_mtp      mtp_projection → prefill_swa → moe → hc_head → rmsnorm → lm_head
 ```
 
-`decode_mtp_verify` checks the draft token against the main-model sample and
-packs the committed window. `decode_prepare` lowers the packed input
+`decode_fwd_mtp` holds the persistent MTP serving state inline: it loads each
+request's previous tail/draft, checks the draft against the main-model sample,
+packs the committed window, and commits the result back to the same slot.
+`decode_prepare` lowers the packed input
 IDs and the paged-cache metadata on device; `utils` is its host-side torch
 counterpart used by the test fixtures.
 
@@ -178,7 +180,7 @@ counterpart used by the test fixtures.
 | --- | --- |
 | Full forward | [decode_fwd.py](../../models/deepseek_v4_flash_mtp/decode_fwd.py), [prefill_fwd.py](../../models/deepseek_v4_flash_mtp/prefill_fwd.py), [decode_fwd_mtp.py](../../models/deepseek_v4_flash_mtp/decode_fwd_mtp.py) |
 | Layer composition | [decode_layer.py](../../models/deepseek_v4_flash_mtp/decode_layer.py), [prefill_layer.py](../../models/deepseek_v4_flash_mtp/prefill_layer.py) |
-| MTP | [decode_mtp.py](../../models/deepseek_v4_flash_mtp/decode_mtp.py), [prefill_mtp.py](../../models/deepseek_v4_flash_mtp/prefill_mtp.py), [decode_mtp_verify.py](../../models/deepseek_v4_flash_mtp/decode_mtp_verify.py), [mtp_projection.py](../../models/deepseek_v4_flash_mtp/mtp_projection.py) |
+| MTP | [decode_mtp.py](../../models/deepseek_v4_flash_mtp/decode_mtp.py), [prefill_mtp.py](../../models/deepseek_v4_flash_mtp/prefill_mtp.py), [mtp_projection.py](../../models/deepseek_v4_flash_mtp/mtp_projection.py) |
 | Decode attention orchestration | [decode_swa.py](../../models/deepseek_v4_flash_mtp/decode_swa.py), [decode_csa.py](../../models/deepseek_v4_flash_mtp/decode_csa.py), [decode_hca.py](../../models/deepseek_v4_flash_mtp/decode_hca.py) |
 | Decode sparse attention (fused o-proj) | [decode_sparse_attn_swa.py](../../models/deepseek_v4_flash_mtp/decode_sparse_attn_swa.py), [decode_sparse_attn_csa.py](../../models/deepseek_v4_flash_mtp/decode_sparse_attn_csa.py), [decode_sparse_attn_hca.py](../../models/deepseek_v4_flash_mtp/decode_sparse_attn_hca.py) |
 | Decode compressors and indexer | [decode_compressor_ratio4.py](../../models/deepseek_v4_flash_mtp/decode_compressor_ratio4.py), [decode_compressor_ratio128.py](../../models/deepseek_v4_flash_mtp/decode_compressor_ratio128.py), [decode_indexer.py](../../models/deepseek_v4_flash_mtp/decode_indexer.py), [decode_indexer_compressor.py](../../models/deepseek_v4_flash_mtp/decode_indexer_compressor.py) |
