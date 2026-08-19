@@ -17,9 +17,12 @@ import pytest
 
 import torch
 from golden.validation import (
+    input_prefix_ratio_allclose,
     mapped_pool_ratio_allclose,
     ratio_allclose,
     ratio_reldiff,
+    sampled_ids_golden_compare,
+    stacked_mapped_pool_ratio_allclose,
     topk_pair_compare,
     validate_golden,
 )
@@ -86,6 +89,322 @@ _QKV, _ = _load_model_module(
     "_test_deepseek_v4_pro_qkv_proj_rope",
     "qkv_proj_rope.py",
 )
+
+
+class TestInputPrefixRatioAllclose:
+    """Tests for replay-time scalar-driven active-prefix validation."""
+
+    @staticmethod
+    def _call(comparator, actual, expected, num_tokens):
+        return comparator(
+            actual,
+            expected,
+            actual_outputs={"out": actual},
+            expected_outputs={"out": expected},
+            inputs={"num_tokens": torch.tensor(num_tokens, dtype=torch.int32)},
+            rtol=0.0,
+            atol=0.0,
+        )
+
+    def test_uses_runtime_scalar_for_active_prefix(self):
+        expected = torch.zeros(2, 4, 1)
+        actual = expected.clone()
+        actual[1, 1, 0] = 1.0
+        comparator = input_prefix_ratio_allclose(
+            "num_tokens",
+            valid_axis=1,
+            exact_tail=True,
+            atol=0.0,
+            rtol=0.0,
+            max_error_ratio=0.0,
+        )
+
+        ok, detail = self._call(comparator, actual, expected, num_tokens=2)
+
+        assert not ok
+        assert "ratio_allclose fail" in detail
+
+    def test_rejects_write_outside_runtime_prefix(self):
+        expected = torch.zeros(2, 4, 1)
+        actual = expected.clone()
+        actual[0, 3, 0] = 1.0
+        comparator = input_prefix_ratio_allclose(
+            "num_tokens",
+            valid_axis=1,
+            exact_tail=True,
+            atol=0.0,
+            rtol=0.0,
+            max_error_ratio=0.0,
+        )
+
+        ok, detail = self._call(comparator, actual, expected, num_tokens=2)
+
+        assert not ok
+        assert "inactive tail differs from golden" in detail
+        assert "active_rows=2" in detail
+
+    def test_accepts_matching_prefix_and_tail(self):
+        expected = torch.arange(8, dtype=torch.float32).reshape(2, 4, 1)
+        comparator = input_prefix_ratio_allclose(
+            "num_tokens",
+            valid_axis=1,
+            exact_tail=True,
+            atol=0.0,
+            rtol=0.0,
+            max_error_ratio=0.0,
+        )
+
+        ok, detail = self._call(
+            comparator,
+            expected.clone(),
+            expected,
+            num_tokens=1,
+        )
+
+        assert ok, detail
+
+
+class TestStackedMappedPoolRatioAllclose:
+    """Tests for active rows in rank- and layer-stacked pools."""
+
+    @staticmethod
+    def _mapping():
+        return torch.tensor(
+            [[0, 1, 2, 3], [0, 1, 2, 3]],
+            dtype=torch.int64,
+        )
+
+    @staticmethod
+    def _call(comparator, actual, expected, *, num_tokens=2, extra_inputs=None):
+        inputs = {
+            "num_tokens": torch.tensor(num_tokens, dtype=torch.int32),
+            "mapping": TestStackedMappedPoolRatioAllclose._mapping(),
+        }
+        if extra_inputs:
+            inputs.update(extra_inputs)
+        return comparator(
+            actual,
+            expected,
+            actual_outputs={"pool": actual},
+            expected_outputs={"pool": expected},
+            inputs=inputs,
+            rtol=0.0,
+            atol=0.0,
+        )
+
+    @staticmethod
+    def _comparator(layer_mapping_names=("mapping", "mapping")):
+        return stacked_mapped_pool_ratio_allclose(
+            layer_mapping_names,
+            mapping_shape=(2, 4),
+            block_size=2,
+            active_rows_name="num_tokens",
+            layer_labels=(10, 20),
+            pool_name="test_pool",
+            atol=0.0,
+            rtol=0.0,
+            # One bad value is only 1/16 of the whole pool, but 1/2 of this
+            # logical layer/rank's active region.  The comparator must fail
+            # the latter instead of accepting the globally diluted ratio.
+            max_error_ratio=0.2,
+        )
+
+    def test_reports_bad_mapped_values_by_layer_and_rank(self):
+        expected = torch.zeros(2, 4, 2, 1)
+        actual = expected.clone()
+        # Layer index 1 starts at block index 2; physical row 1 is intra 1.
+        actual[1, 2, 1, 0] = 1.0
+
+        ok, detail = self._call(self._comparator(), actual, expected)
+
+        assert not ok
+        assert "layer=20 rank=1" in detail
+        assert "mapping='mapping'" in detail
+        assert "mapped_rows=2" in detail
+        assert "ratio_allclose fail" in detail
+
+    def test_reports_bounded_nonfinite_logical_and_physical_coordinates(self):
+        expected = torch.zeros(2, 4, 2, 2, 3)
+        actual = expected.clone()
+        # Layer 20 starts at pool block 2. Its first two mapped rows are
+        # physical rows 0 and 1, both in that block.
+        actual[1, 2, 0, 0, 1] = float("nan")
+        actual[1, 2, 1, 0, 2] = float("inf")
+        actual[1, 2, 1, 1, 2] = float("nan")
+        comparator = stacked_mapped_pool_ratio_allclose(
+            ("mapping", "mapping"),
+            mapping_shape=(2, 4),
+            block_size=2,
+            active_rows_name="num_tokens",
+            layer_labels=(10, 20),
+            pool_name="test_pool",
+            atol=0.0,
+            rtol=0.0,
+            max_error_ratio=0.0,
+            max_show=2,
+        )
+
+        ok, detail = self._call(comparator, actual, expected)
+
+        assert not ok
+        assert "layer=20 rank=1" in detail
+        assert (
+            "illegal values in comparison: actual: NaN=2 Inf=1; expected: NaN=0 Inf=0"
+        ) in detail
+        assert "non-finite mapped coordinate(s): showing 2/3" in detail
+        assert "logical(mapped_row, feature...)=(0, 0, 1)" in detail
+        assert (
+            "physical_pool(rank, block, block_row, feature...)=(1, 2, 0, 0, 1)"
+        ) in detail
+        assert "logical(mapped_row, feature...)=(1, 0, 2)" in detail
+        assert (
+            "physical_pool(rank, block, block_row, feature...)=(1, 2, 1, 0, 2)"
+        ) in detail
+        assert "logical(mapped_row, feature...)=(1, 1, 2)" not in detail
+        assert "... and 1 more non-finite coordinate(s)" in detail
+
+    def test_reports_expected_nonfinite_coordinate(self):
+        expected = torch.zeros(2, 4, 2, 2)
+        actual = expected.clone()
+        expected[0, 0, 1, 1] = float("-inf")
+        mapping = torch.tensor(
+            [[-1, 1, 2, 3], [-1, 1, 2, 3]],
+            dtype=torch.int64,
+        )
+
+        ok, detail = self._call(
+            self._comparator(),
+            actual,
+            expected,
+            extra_inputs={"mapping": mapping},
+        )
+
+        assert not ok
+        assert (
+            "illegal values in comparison: actual: NaN=0 Inf=0; expected: NaN=0 Inf=1"
+        ) in detail
+        assert "logical(mapped_row, feature...)=(1, 1)" in detail
+        assert (
+            "physical_pool(rank, block, block_row, feature...)=(0, 0, 1, 1)"
+        ) in detail
+        assert "layer_physical_row=1 actual=0.0 expected=-inf" in detail
+
+    def test_rejects_inactive_mapped_row_write(self):
+        expected = torch.zeros(2, 4, 2, 1)
+        actual = expected.clone()
+        # Mapping row 3 exists in metadata but lies beyond num_tokens=2.
+        actual[0, 1, 1, 0] = 1.0
+
+        ok, detail = self._call(self._comparator(), actual, expected)
+
+        assert not ok
+        assert "layer=10 rank=0" in detail
+        assert "writes outside active mapped rows" in detail
+
+    def test_none_mapping_requires_exact_layer(self):
+        expected = torch.zeros(2, 4, 2, 1)
+        actual = expected.clone()
+        actual[0, 2, 0, 0] = 1.0
+
+        ok, detail = self._call(
+            self._comparator(("mapping", None)),
+            actual,
+            expected,
+        )
+
+        assert not ok
+        assert "layer=20 rank=0 mapping='None'" in detail
+        assert "writes outside active mapped rows" in detail
+
+    def test_accepts_matching_active_and_unmapped_rows(self):
+        expected = torch.arange(16, dtype=torch.float32).reshape(2, 4, 2, 1)
+
+        ok, detail = self._call(
+            self._comparator(),
+            expected.clone(),
+            expected,
+        )
+
+        assert ok, detail
+
+
+class TestSampledIdsGoldenCompare:
+    """Tests for semantic and device-logit sampler validation."""
+
+    @staticmethod
+    def _fixture():
+        expected = torch.zeros(2, 2, 4, dtype=torch.int32)
+        expected[:, 0, 0] = 1
+        logits = torch.zeros(2, 2, 3, dtype=torch.float32)
+        logits[:, 0, 1] = 2.0
+        row_indices = torch.tensor([[5, -1], [5, -1]], dtype=torch.int32)
+        return expected, logits, row_indices
+
+    @staticmethod
+    def _call(comparator, actual, expected, logits, row_indices):
+        return comparator(
+            actual,
+            expected,
+            actual_outputs={"logits": logits, "sampled_ids": actual},
+            expected_outputs={"sampled_ids": expected},
+            inputs={"logit_row_indices": row_indices},
+            rtol=0.0,
+            atol=0.0,
+        )
+
+    def test_accepts_golden_and_device_argmax_match(self):
+        expected, logits, row_indices = self._fixture()
+        comparator = sampled_ids_golden_compare()
+
+        ok, detail = self._call(
+            comparator,
+            expected.clone(),
+            expected,
+            logits,
+            row_indices,
+        )
+
+        assert ok, detail
+
+    def test_rejects_wrong_golden_even_when_device_self_consistent(self):
+        expected, logits, row_indices = self._fixture()
+        actual = expected.clone()
+        actual[:, 0, 0] = 2
+        logits[:, 0, 1] = 0.0
+        logits[:, 0, 2] = 2.0
+        comparator = sampled_ids_golden_compare()
+
+        ok, detail = self._call(
+            comparator,
+            actual,
+            expected,
+            logits,
+            row_indices,
+        )
+
+        assert not ok
+        assert "differ from golden" in detail
+        assert "disagree with argmax" not in detail
+        assert "actual=2 golden=1 device_argmax=2" in detail
+
+    def test_rejects_sampler_that_disagrees_with_device_logits(self):
+        expected, logits, row_indices = self._fixture()
+        logits[:, 0, 1] = 0.0
+        logits[:, 0, 2] = 2.0
+        comparator = sampled_ids_golden_compare()
+
+        ok, detail = self._call(
+            comparator,
+            expected.clone(),
+            expected,
+            logits,
+            row_indices,
+        )
+
+        assert not ok
+        assert "differ from golden" not in detail
+        assert "disagree with argmax" in detail
+        assert "actual=1 golden=1 device_argmax=2" in detail
 
 
 class TestMappedPoolRatioAllclose:
@@ -1202,7 +1521,90 @@ def _gate_routes():
 
 
 class TestDeepSeekV4ProGateValidation:
-    """CPU regressions for expert-routing comparator semantics."""
+    """CPU regressions for the router golden and comparator semantics."""
+
+    def test_golden_scores_keep_continuous_cube_accumulator(self, monkeypatch):
+        t = 2
+        d = 4096
+        n_experts = 8
+        row_pad = 8
+        reduce_tile = d // row_pad
+        gate_d_tile = 2048
+        monkeypatch.setattr(_GATE, "T", t)
+        monkeypatch.setattr(_GATE, "D", d)
+        monkeypatch.setattr(_GATE, "N_EXPERTS", n_experts)
+        monkeypatch.setattr(_GATE, "ROW_PAD", row_pad)
+        monkeypatch.setattr(_GATE, "FFN_REDUCE_TILE", reduce_tile)
+        monkeypatch.setattr(_GATE, "GATE_D_TILE", gate_d_tile)
+
+        generator = torch.Generator().manual_seed(0)
+        x_mixed = (
+            torch.randn(t, d, generator=generator) * 0.25
+        ).to(torch.bfloat16)
+        norm_w = (
+            torch.randn(d, generator=generator) * 0.05 + 1.0
+        ).to(torch.bfloat16)
+        gate_w = torch.randn(n_experts, d, generator=generator) / d ** 0.5
+        gate_bias = torch.randn(n_experts, generator=generator) * 0.01
+        inputs = {
+            "x_mixed": x_mixed,
+            "norm_w": norm_w,
+            "gate_w": gate_w,
+            "gate_bias": gate_bias,
+        }
+
+        xg, inv_rms, scores, biased = _GATE._golden_gate_scores(inputs)
+
+        x_f = x_mixed.float()
+        expected_xg = x_f * norm_w.float().view(1, d)
+        expected_sq_rows = (x_f * x_f).reshape(t, row_pad, reduce_tile)
+        expected_sq_sum = expected_sq_rows.sum(dim=-1).sum(
+            dim=-1,
+            keepdim=True,
+        )
+        expected_inv_rms = torch.rsqrt(
+            expected_sq_sum * (1.0 / d) + _GATE.NORM_EPS
+        )
+        expected_logits_acc = expected_xg @ gate_w.T
+        expected_logits = expected_inv_rms * expected_logits_acc
+        expected_softplus = expected_logits.clamp(min=0) + torch.log1p(
+            torch.exp(-expected_logits.abs())
+        )
+        expected_scores = expected_softplus.sqrt()
+        expected_biased = expected_scores + gate_bias.view(1, -1)
+
+        assert torch.equal(xg, expected_xg)
+        assert torch.equal(inv_rms, expected_inv_rms)
+        assert torch.equal(scores, expected_scores)
+        assert torch.equal(biased, expected_biased)
+
+        # Keep both load-bearing associations independently visible. RMS uses
+        # the two-stage vector reduction, while Cube keeps one accumulator
+        # across the source-level K tiles.
+        flat_sq_sum = (x_f * x_f).sum(dim=-1, keepdim=True)
+        flat_inv_rms = torch.rsqrt(
+            flat_sq_sum * (1.0 / d) + _GATE.NORM_EPS
+        )
+        flat_logits = flat_inv_rms * expected_logits_acc
+        flat_softplus = flat_logits.clamp(min=0) + torch.log1p(
+            torch.exp(-flat_logits.abs())
+        )
+        assert not torch.equal(scores, flat_softplus.sqrt())
+
+        # GATE_D_TILE is a source-slicing boundary, not an accumulator spill.
+        split_logits_acc = (
+            expected_xg[:, :gate_d_tile] @ gate_w[:, :gate_d_tile].T
+        )
+        for k0 in range(gate_d_tile, d, gate_d_tile):
+            k1 = k0 + gate_d_tile
+            split_logits_acc = split_logits_acc + (
+                expected_xg[:, k0:k1] @ gate_w[:, k0:k1].T
+            )
+        split_logits = expected_inv_rms * split_logits_acc
+        split_softplus = split_logits.clamp(min=0) + torch.log1p(
+            torch.exp(-split_logits.abs())
+        )
+        assert not torch.equal(scores, split_softplus.sqrt())
 
     def test_accepts_score_bounded_topk_boundary_swap(self, monkeypatch):
         scores = torch.zeros(_GATE.T, _GATE.N_EXPERTS)
@@ -1963,7 +2365,11 @@ class TestDeepSeekV4ProQkvValidation:
         ok, detail = _call_qkv_comparator(comparator, actual, expected)
 
         assert not ok
-        assert "rows>7 changed codes: 1" in detail
+        # The per-row floor is Q_LORA-derived so the assertion holds under any
+        # variant geometry the driver module was imported with (pro: rows>7,
+        # flash: rows>5); eight changed codes in one row exceed both.
+        per_row_floor = int(_QKV.Q_LORA * 0.005)
+        assert f"rows>{per_row_floor} changed codes: 1" in detail
 
     def test_quantized_qr_zero_per_row_ratio_is_strict(self):
         expected = torch.zeros(2, _QKV.Q_LORA, dtype=torch.int8)

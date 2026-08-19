@@ -767,6 +767,44 @@ class TestScalarMixedSpecs:
         assert isinstance(observed_alpha["scalar"], ctypes.c_float)
         assert observed_alpha["scalar"].value == pytest.approx(10.0)
 
+    def test_custom_comparator_receives_cached_scalar(self, mixed_specs, tmp_path):
+        """Validation exposes the replayed scalar, not the spec default."""
+        compiled_dir = tmp_path / "build"
+        compiled_dir.mkdir()
+        cache = tmp_path / "cache"
+        x = torch.tensor([1.0, 2.0, 3.0, 4.0])
+        y_golden = torch.tensor([11.0, 12.0, 13.0, 14.0])
+        _save_tensors(cache / "in", {"x": x})
+        _save_tensors(cache / "out", {"y": y_golden})
+        _save_tensors(
+            cache / "in",
+            {"alpha": torch.tensor(10.0, dtype=torch.float32)},
+        )
+        captured: dict[str, torch.Tensor] = {}
+
+        def fake_execute(_work_dir, args, **_kwargs):
+            args[2][:] = args[0] + args[1].value
+
+        def compare(actual, expected, *, inputs, **_kwargs):
+            captured["alpha"] = inputs["alpha"]
+            return torch.equal(actual, expected), ""
+
+        compile_p, exec_p = _patch_compile_and_execute(
+            compiled_dir,
+            fake_execute=fake_execute,
+        )
+        with compile_p, exec_p:
+            result = run(
+                program=object(),
+                specs=mixed_specs,
+                golden_data=str(cache),
+                compare_fn={"y": compare},
+            )
+
+        assert result.passed, f"unexpected failure: {result.error}"
+        assert captured["alpha"].ndim == 0
+        assert captured["alpha"].item() == pytest.approx(10.0)
+
     def test_missing_scalar_pt_in_cache_fails(self, mixed_specs, tmp_path):
         """golden_data with a ScalarSpec must include {name}.pt — missing it
         should produce a ``missing files`` error."""
@@ -1647,7 +1685,15 @@ class TestResidentPath:
         monkeypatch.setattr(R, "_l3_pure_out_names", lambda _c: set())
         monkeypatch.setattr(R, "_l3_run_config", lambda _cfg: "RUNCFG")
 
-        def _fake_validate(tensor_specs, tensors, golden_outputs, rtol, atol, compare_fn):
+        def _fake_validate(
+            tensor_specs,
+            tensors,
+            golden_outputs,
+            rtol,
+            atol,
+            compare_fn,
+            scalar_specs_eff=None,
+        ):
             calls["validated_value"] = tensors["kv"].clone()
 
         monkeypatch.setattr(R, "_validate", _fake_validate)
