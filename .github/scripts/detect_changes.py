@@ -75,7 +75,7 @@ def _iter_source_files():
     for root in SOURCE_ROOTS:
         for dirpath, _, files in os.walk(root):
             for name in files:
-                if name.endswith(".py") and "draft" not in name:
+                if name.endswith(".py") and not name.endswith("_draft.py"):
                     yield os.path.join(dirpath, name)
 
 
@@ -164,7 +164,7 @@ def select_runnable(changed):
         c
         for c in changed
         if c.endswith(".py")
-        and "draft" not in os.path.basename(c)
+        and not c.endswith("_draft.py")
         and c.startswith("models/")
         and not c.startswith("models/deepseek_v4_pro/")
         and os.path.isfile(c)

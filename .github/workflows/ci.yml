@@ -199,7 +199,7 @@ jobs:
           if [ "${{ github.event_name }}" = "pull_request" ]; then
             FILES="${{ needs.detect-changes.outputs.files }}"
           else
-            FILES=$(find examples -name '*.py' ! -name '*draft*' | sort)
+            FILES=$(find examples -name '*.py' ! -name '*_draft.py' | sort)
           fi
           if [ -z "$FILES" ]; then
             echo "No runnable changed files; nothing to test."
@@ -300,7 +300,7 @@ jobs:
           if [ "${{ github.event_name }}" = "pull_request" ]; then
             FILES="${{ needs.detect-changes.outputs.files }}"
           else
-            FILES=$(find examples -name '*.py' ! -name '*draft*' | sort)
+            FILES=$(find examples -name '*.py' ! -name '*_draft.py' | sort)
           fi
           if [ -z "$FILES" ]; then
             echo "No runnable changed files; nothing to test."
