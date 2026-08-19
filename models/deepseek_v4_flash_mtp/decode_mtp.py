@@ -36,7 +36,6 @@ from decode_swa import (
     build_tensor_specs as build_swa_tensor_specs,
     golden_attention_swa,
 )
-from decode_prepare import build_swa_metadata, pack_mtp_hidden
 from hc_head import golden_hc_head, hc_head
 from lm_head import (
     GROUP_LOGIT_ROWS,
@@ -49,7 +48,6 @@ from lm_head import (
     golden_lm_head,
     lm_head_with_sampling,
 )
-from lookup_embedding import VOCAB_DYN as EMBED_VOCAB_DYN, lookup_embedding
 from moe import (
     AUX_PAD,
     D,
@@ -84,12 +82,9 @@ LM_HEAD_COMM_EPOCH = 1
 
 
 @pl.jit.inline(auto_scope=False)
-def mtp_decode_layer_inline(
-    embed_weight: pl.Tensor[[EMBED_VOCAB_DYN, D], pl.BF16],
-    main_pre_hc_hidden: pl.Tensor[[T, HC_MULT, D], pl.FP32],
-    tail_pre_hc_pool: pl.InOut[pl.Tensor[[B, HC_MULT, D], pl.FP32]],
-    accepted_counts: pl.Tensor[[B], pl.INT32],
-    tail_slot_ids: pl.Tensor[[B], pl.INT32],
+def decode_mtp(
+    hidden_states: pl.Tensor[[T, D], pl.BF16],
+    prev_pre_hc_hidden: pl.Tensor[[T, HC_MULT, D], pl.FP32],
     position_ids: pl.Tensor[[T], pl.INT32],
     enorm_w: pl.Tensor[[D], pl.FP32],
     hnorm_w: pl.Tensor[[D], pl.FP32],
@@ -112,7 +107,9 @@ def mtp_decode_layer_inline(
     freqs_cos: pl.Tensor[[MAX_SEQ_LEN, ROPE_HEAD_DIM], pl.BF16],
     freqs_sin: pl.Tensor[[MAX_SEQ_LEN, ROPE_HEAD_DIM], pl.BF16],
     kv_cache: pl.InOut[pl.Tensor[[ORI_BLOCK_NUM_DYN, BLOCK_SIZE, 1, HEAD_DIM], pl.BF16]],
-    ori_block_table: pl.Tensor[[B, ORI_TABLE_MAX_BLOCKS], pl.INT32],
+    swa_slot_mapping: pl.Tensor[[T], pl.INT64],
+    swa_indices: pl.Tensor[[T, WIN], pl.INT32],
+    swa_lens: pl.Tensor[[T], pl.INT32],
     attn_sink: pl.Tensor[[H], pl.FP32],
     wo_a: pl.Tensor[[O_GROUPS, O_LORA, O_GROUP_IN], pl.BF16],
     wo_b: pl.Tensor[[D, O_GROUPS * O_LORA], pl.INT8],
@@ -164,29 +161,6 @@ def mtp_decode_layer_inline(
     my_rank: pl.Scalar[pl.INT32],
     num_tokens: pl.Scalar[pl.INT32],
 ) -> pl.Tensor[[T, HC_MULT, D], pl.BF16]:
-    hidden_states = pl.create_tensor([T, D], dtype=pl.BF16)
-    lookup_embedding(input_ids, embed_weight, hidden_states)
-    prev_pre_hc_hidden = pl.create_tensor([T, HC_MULT, D], dtype=pl.FP32)
-    fallback_hidden = main_pre_hc_hidden[0:DECODE_SEQ, 0:HC_MULT, 0:D]
-    pack_mtp_hidden(
-        main_pre_hc_hidden,
-        tail_pre_hc_pool,
-        accepted_counts,
-        tail_slot_ids,
-        fallback_hidden,
-        prev_pre_hc_hidden,
-    )
-
-    swa_slot_mapping = pl.create_tensor([T], dtype=pl.INT64)
-    swa_indices = pl.create_tensor([T, WIN], dtype=pl.INT32)
-    swa_lens = pl.create_tensor([T], dtype=pl.INT32)
-    build_swa_metadata(
-        position_ids,
-        ori_block_table,
-        swa_slot_mapping,
-        swa_indices,
-        swa_lens,
-    )
     projected_hidden = pl.create_tensor([T, HC_MULT, D], dtype=pl.FP32)
     with pl.scope():
         mtp_projection(
@@ -245,12 +219,9 @@ def mtp_decode_layer_inline(
 
 
 @pl.jit(auto_scope=False)
-def mtp_decode_layer(
-    embed_weight: pl.Tensor[[EMBED_VOCAB_DYN, D], pl.BF16],
-    main_pre_hc_hidden: pl.Tensor[[T, HC_MULT, D], pl.FP32],
-    tail_pre_hc_pool: pl.InOut[pl.Tensor[[B, HC_MULT, D], pl.FP32]],
-    accepted_counts: pl.Tensor[[B], pl.INT32],
-    tail_slot_ids: pl.Tensor[[B], pl.INT32],
+def l2_decode_mtp(
+    hidden_states: pl.Tensor[[T, D], pl.BF16],
+    prev_pre_hc_hidden: pl.Tensor[[T, HC_MULT, D], pl.FP32],
     position_ids: pl.Tensor[[T], pl.INT32],
     enorm_w: pl.Tensor[[D], pl.FP32],
     hnorm_w: pl.Tensor[[D], pl.FP32],
@@ -273,7 +244,9 @@ def mtp_decode_layer(
     freqs_cos: pl.Tensor[[2, MAX_SEQ_LEN, ROPE_HEAD_DIM], pl.BF16],
     freqs_sin: pl.Tensor[[2, MAX_SEQ_LEN, ROPE_HEAD_DIM], pl.BF16],
     kv_cache: pl.InOut[pl.Tensor[[ORI_BLOCK_NUM_DYN, BLOCK_SIZE, 1, HEAD_DIM], pl.BF16]],
-    ori_block_table: pl.Tensor[[B, ORI_TABLE_MAX_BLOCKS], pl.INT32],
+    swa_slot_mapping: pl.Tensor[[T], pl.INT64],
+    swa_indices: pl.Tensor[[T, WIN], pl.INT32],
+    swa_lens: pl.Tensor[[T], pl.INT32],
     attn_sink: pl.Tensor[[H], pl.FP32],
     wo_a: pl.Tensor[[O_GROUPS, O_LORA, O_GROUP_IN], pl.BF16],
     wo_b: pl.Tensor[[D, O_GROUPS * O_LORA], pl.INT8],
@@ -335,93 +308,35 @@ def mtp_decode_layer(
     swa_freqs_sin: pl.Tensor[[MAX_SEQ_LEN, ROPE_HEAD_DIM], pl.BF16] = pl.reshape(
         swa_sin_profile, [MAX_SEQ_LEN, ROPE_HEAD_DIM]
     )
-    return mtp_decode_layer_inline(
-        embed_weight,
-        main_pre_hc_hidden,
-        tail_pre_hc_pool,
-        accepted_counts,
-        tail_slot_ids,
-        position_ids,
-        enorm_w,
-        hnorm_w,
-        e_proj_w,
-        e_proj_w_scale,
-        e_proj_smooth,
-        h_proj_w,
-        h_proj_w_scale,
-        h_proj_smooth,
-        hc_attn_fn,
-        hc_attn_scale,
-        hc_attn_base,
-        attn_norm_w,
-        wq_a,
-        wq_b,
-        wq_b_scale,
-        wkv,
-        gamma_cq,
-        gamma_ckv,
-        swa_freqs_cos,
-        swa_freqs_sin,
-        kv_cache,
-        ori_block_table,
-        attn_sink,
-        wo_a,
-        wo_b,
-        wo_b_scale,
-        hc_ffn_fn,
-        hc_ffn_scale,
-        hc_ffn_base,
-        norm_w,
-        gate_w,
-        gate_bias,
-        tid2eid,
-        input_ids,
-        routed_w1,
-        routed_w1_scale,
-        routed_w3,
-        routed_w3_scale,
-        routed_w2,
-        routed_w2_scale,
-        shared_w1,
-        shared_w1_scale,
-        shared_w3,
-        shared_w3_scale,
-        shared_w2,
-        shared_w2_scale,
-        mtp_hc_head_fn,
-        mtp_hc_head_scale,
-        mtp_hc_head_base,
-        mtp_norm_w,
-        lm_head_weight,
-        logit_row_indices,
-        hidden_out,
-        next_pre_hc_hidden,
-        logits,
-        sampled_ids,
-        recv_meta,
-        recv_x,
-        recv_aux,
-        recv_route,
-        arrived,
-        data_arrived,
-        routed_y_buf,
-        combine_arrived,
-        lm_head_hidden_window,
-        lm_head_hidden_done,
-        lm_head_logits_window,
-        lm_head_logits_done,
-        my_rank,
-        num_tokens,
+    return decode_mtp(
+        hidden_states, prev_pre_hc_hidden, position_ids,
+        enorm_w, hnorm_w,
+        e_proj_w, e_proj_w_scale, e_proj_smooth,
+        h_proj_w, h_proj_w_scale, h_proj_smooth,
+        hc_attn_fn, hc_attn_scale, hc_attn_base,
+        attn_norm_w, wq_a, wq_b, wq_b_scale,
+        wkv, gamma_cq, gamma_ckv,
+        swa_freqs_cos, swa_freqs_sin,
+        kv_cache, swa_slot_mapping, swa_indices, swa_lens,
+        attn_sink, wo_a, wo_b, wo_b_scale,
+        hc_ffn_fn, hc_ffn_scale, hc_ffn_base,
+        norm_w, gate_w, gate_bias, tid2eid, input_ids,
+        routed_w1, routed_w1_scale, routed_w3, routed_w3_scale, routed_w2, routed_w2_scale,
+        shared_w1, shared_w1_scale, shared_w3, shared_w3_scale, shared_w2, shared_w2_scale,
+        mtp_hc_head_fn, mtp_hc_head_scale, mtp_hc_head_base, mtp_norm_w,
+        lm_head_weight, logit_row_indices,
+        hidden_out, next_pre_hc_hidden, logits, sampled_ids,
+        recv_meta, recv_x, recv_aux, recv_route,
+        arrived, data_arrived, routed_y_buf, combine_arrived,
+        lm_head_hidden_window, lm_head_hidden_done, lm_head_logits_window, lm_head_logits_done,
+        my_rank, num_tokens,
     )
 
 
 @pl.jit.host
-def l3_mtp_decode_layer(
-    embed_weight: pl.Tensor[[N_RANKS, EMBED_VOCAB_DYN, D], pl.BF16],
-    main_pre_hc_hidden: pl.Tensor[[N_RANKS, T, HC_MULT, D], pl.FP32],
-    tail_pre_hc_pool: pl.InOut[pl.Tensor[[N_RANKS, B, HC_MULT, D], pl.FP32]],
-    accepted_counts: pl.Tensor[[N_RANKS, B], pl.INT32],
-    tail_slot_ids: pl.Tensor[[N_RANKS, B], pl.INT32],
+def l3_decode_mtp(
+    hidden_states: pl.Tensor[[N_RANKS, T, D], pl.BF16],
+    prev_pre_hc_hidden: pl.Tensor[[N_RANKS, T, HC_MULT, D], pl.FP32],
     position_ids: pl.Tensor[[N_RANKS, T], pl.INT32],
     enorm_w: pl.Tensor[[N_RANKS, D], pl.FP32],
     hnorm_w: pl.Tensor[[N_RANKS, D], pl.FP32],
@@ -444,7 +359,9 @@ def l3_mtp_decode_layer(
     freqs_cos: pl.Tensor[[N_RANKS, 2, MAX_SEQ_LEN, ROPE_HEAD_DIM], pl.BF16],
     freqs_sin: pl.Tensor[[N_RANKS, 2, MAX_SEQ_LEN, ROPE_HEAD_DIM], pl.BF16],
     kv_cache: pl.InOut[pl.Tensor[[N_RANKS, ORI_BLOCK_NUM_DYN, BLOCK_SIZE, 1, HEAD_DIM], pl.BF16]],
-    ori_block_table: pl.Tensor[[N_RANKS, B, ORI_TABLE_MAX_BLOCKS], pl.INT32],
+    swa_slot_mapping: pl.Tensor[[N_RANKS, T], pl.INT64],
+    swa_indices: pl.Tensor[[N_RANKS, T, WIN], pl.INT32],
+    swa_lens: pl.Tensor[[N_RANKS, T], pl.INT32],
     attn_sink: pl.Tensor[[N_RANKS, H], pl.FP32],
     wo_a: pl.Tensor[[N_RANKS, O_GROUPS, O_LORA, O_GROUP_IN], pl.BF16],
     wo_b: pl.Tensor[[N_RANKS, D, O_GROUPS * O_LORA], pl.INT8],
@@ -509,9 +426,8 @@ def l3_mtp_decode_layer(
         lm_head_hidden_done = pld.window(lm_head_hidden_done_buf, [LM_HEAD_TP_SIZE, 1], dtype=pl.INT32)
         lm_head_logits_window = pld.window(lm_head_logits_window_buf, [MAX_LOGIT_ROWS, LM_HEAD_VOCAB], dtype=pl.FP32)
         lm_head_logits_done = pld.window(lm_head_logits_done_buf, [LM_HEAD_TP_SIZE, 1], dtype=pl.INT32)
-        mtp_decode_layer(
-            embed_weight[r], main_pre_hc_hidden[r], tail_pre_hc_pool[r],
-            accepted_counts[r], tail_slot_ids[r], position_ids[r],
+        l2_decode_mtp(
+            hidden_states[r], prev_pre_hc_hidden[r], position_ids[r],
             enorm_w[r], hnorm_w[r],
             e_proj_w[r], e_proj_w_scale[r], e_proj_smooth[r],
             h_proj_w[r], h_proj_w_scale[r], h_proj_smooth[r],
@@ -520,7 +436,7 @@ def l3_mtp_decode_layer(
             wq_a[r], wq_b[r], wq_b_scale[r],
             wkv[r], gamma_cq[r], gamma_ckv[r],
             freqs_cos[r], freqs_sin[r],
-            kv_cache[r], ori_block_table[r],
+            kv_cache[r], swa_slot_mapping[r], swa_indices[r], swa_lens[r],
             attn_sink[r], wo_a[r], wo_b[r], wo_b_scale[r],
             hc_ffn_fn[r], hc_ffn_scale[r], hc_ffn_base[r],
             norm_w[r], gate_w[r], gate_bias[r],
@@ -601,47 +517,24 @@ def _projection_specs():
             h_proj_cache = init_proj_pair()
         return h_proj_cache[1]
 
-    def init_embed_weight():
-        value = torch.randn(M.vocab_size, D).to(torch.bfloat16)
-        return value.unsqueeze(0).expand(N_RANKS, -1, -1).contiguous()
+    def init_hidden_states():
+        # Embedding rows, as pack_mtp_hidden's caller would have looked them up.
+        return torch.randn(N_RANKS, T, D).to(torch.bfloat16)
 
-    def init_main_pre_hc_hidden():
+    def init_prev_pre_hc_hidden():
         return torch.randn(N_RANKS, T, HC_MULT, D)
-
-    def init_tail_pre_hc_pool():
-        return torch.randn(N_RANKS, B, HC_MULT, D)
-
-    def init_accepted_counts():
-        counts = torch.tensor([1, 2, 1, 2], dtype=torch.int32)
-        return counts.unsqueeze(0).expand(N_RANKS, -1).contiguous()
-
-    def init_tail_slot_ids():
-        slots = torch.arange(B, dtype=torch.int32)
-        return slots.unsqueeze(0).expand(N_RANKS, -1).contiguous()
 
     def init_projection_ones():
         return torch.ones(N_RANKS, D)
 
     return {
-        "embed_weight": TensorSpec(
-            "embed_weight", [N_RANKS, M.vocab_size, D], torch.bfloat16,
-            init_value=init_embed_weight, resident="stacked",
+        "hidden_states": TensorSpec(
+            "hidden_states", [N_RANKS, T, D], torch.bfloat16,
+            init_value=init_hidden_states,
         ),
-        "main_pre_hc_hidden": TensorSpec(
-            "main_pre_hc_hidden", [N_RANKS, T, HC_MULT, D], torch.float32,
-            init_value=init_main_pre_hc_hidden,
-        ),
-        "tail_pre_hc_pool": TensorSpec(
-            "tail_pre_hc_pool", [N_RANKS, B, HC_MULT, D], torch.float32,
-            init_value=init_tail_pre_hc_pool, is_output=True, resident="stacked",
-        ),
-        "accepted_counts": TensorSpec(
-            "accepted_counts", [N_RANKS, B], torch.int32,
-            init_value=init_accepted_counts,
-        ),
-        "tail_slot_ids": TensorSpec(
-            "tail_slot_ids", [N_RANKS, B], torch.int32,
-            init_value=init_tail_slot_ids,
+        "prev_pre_hc_hidden": TensorSpec(
+            "prev_pre_hc_hidden", [N_RANKS, T, HC_MULT, D], torch.float32,
+            init_value=init_prev_pre_hc_hidden,
         ),
         "enorm_w": TensorSpec("enorm_w", [N_RANKS, D], torch.float32, init_value=init_projection_ones),
         "hnorm_w": TensorSpec("hnorm_w", [N_RANKS, D], torch.float32, init_value=init_projection_ones),
@@ -754,12 +647,55 @@ def build_tensor_specs(start_pos=DECODE_START_POS, num_tokens=T, ori_block_num=O
     def init_ori_block_table():
         from utils import block_table
 
-        table = block_table(
+        return block_table(
             batch=B,
             table_blocks=ORI_TABLE_MAX_BLOCKS,
             physical_blocks=ori_block_num,
         )
-        return table.unsqueeze(0).expand(N_RANKS, -1, -1).contiguous()
+
+    def init_swa_positions():
+        return swa_specs["position_ids"].create_tensor().reshape(B, DECODE_SEQ)
+
+    def replicated(value):
+        return value.unsqueeze(0).expand(N_RANKS, *value.shape).contiguous()
+
+    def init_swa_slot_mapping():
+        from utils import paged_slot_mapping
+
+        mapping = paged_slot_mapping(
+            init_swa_positions(),
+            init_ori_block_table(),
+            block_size=BLOCK_SIZE,
+        )
+        return replicated(mapping.reshape(-1).contiguous())
+
+    def init_swa_metadata():
+        from utils import swa_indices_and_lens
+
+        return swa_indices_and_lens(
+            init_swa_positions(),
+            init_ori_block_table(),
+            block_size=BLOCK_SIZE,
+            window=WIN,
+        )
+
+    def init_swa_indices():
+        return replicated(init_swa_metadata()[0].contiguous())
+
+    def init_swa_lens():
+        return replicated(init_swa_metadata()[1].contiguous())
+
+    swa_metadata_specs = {
+        "swa_slot_mapping": TensorSpec(
+            "swa_slot_mapping", [N_RANKS, T], torch.int64, init_value=init_swa_slot_mapping,
+        ),
+        "swa_indices": TensorSpec(
+            "swa_indices", [N_RANKS, T, WIN], torch.int32, init_value=init_swa_indices,
+        ),
+        "swa_lens": TensorSpec(
+            "swa_lens", [N_RANKS, T], torch.int32, init_value=init_swa_lens,
+        ),
+    }
 
     replicated_attention = {
         "hc_attn_fn", "hc_attn_scale", "hc_attn_base",
@@ -770,8 +706,7 @@ def build_tensor_specs(start_pos=DECODE_START_POS, num_tokens=T, ori_block_num=O
         "attn_sink", "wo_a", "wo_b", "wo_b_scale",
     }
     ordered_names = [
-        "embed_weight", "main_pre_hc_hidden", "tail_pre_hc_pool",
-        "accepted_counts", "tail_slot_ids", "position_ids",
+        "hidden_states", "prev_pre_hc_hidden", "position_ids",
         "enorm_w", "hnorm_w",
         "e_proj_w", "e_proj_w_scale", "e_proj_smooth",
         "h_proj_w", "h_proj_w_scale", "h_proj_smooth",
@@ -780,7 +715,7 @@ def build_tensor_specs(start_pos=DECODE_START_POS, num_tokens=T, ori_block_num=O
         "wq_a", "wq_b", "wq_b_scale",
         "wkv", "gamma_cq", "gamma_ckv",
         "freqs_cos", "freqs_sin",
-        "kv_cache", "ori_block_table",
+        "kv_cache", "swa_slot_mapping", "swa_indices", "swa_lens",
         "attn_sink", "wo_a", "wo_b", "wo_b_scale",
         "hc_ffn_fn", "hc_ffn_scale", "hc_ffn_base",
         "norm_w",
@@ -812,13 +747,8 @@ def build_tensor_specs(start_pos=DECODE_START_POS, num_tokens=T, ori_block_num=O
                 init_value=init_kv_cache, is_output=swa_specs[name].is_output,
             )
             specs.append(cache_spec)
-        elif name == "ori_block_table":
-            specs.append(TensorSpec(
-                name,
-                [N_RANKS, B, ORI_TABLE_MAX_BLOCKS],
-                torch.int32,
-                init_value=init_ori_block_table,
-            ))
+        elif name in swa_metadata_specs:
+            specs.append(swa_metadata_specs[name])
         elif name in rope_specs:
             specs.append(_ranked_spec(name, rope_specs[name], replicated=True))
         else:
@@ -881,42 +811,15 @@ def build_tensor_specs(start_pos=DECODE_START_POS, num_tokens=T, ori_block_num=O
     return specs
 
 
-def golden_mtp_decode_layer(tensors):
+def golden_decode_mtp(tensors):
     import torch
-    from utils import paged_slot_mapping, swa_indices_and_lens
 
     num_tokens = int(tensors["num_tokens"])
-    hidden_states = torch.empty(
-        N_RANKS, T, D, dtype=torch.bfloat16
-    )
-    prev_pre_hc_hidden = torch.empty_like(tensors["main_pre_hc_hidden"])
-    for rank in range(N_RANKS):
-        hidden_states[rank] = tensors["embed_weight"][rank].index_select(
-            0, tensors["input_ids"][rank].long()
-        )
-        fallback_hidden = tensors["main_pre_hc_hidden"][rank, :DECODE_SEQ]
-        for batch_idx in range(B):
-            row0 = batch_idx * DECODE_SEQ
-            row1 = row0 + 1
-            slot = int(tensors["tail_slot_ids"][rank, batch_idx])
-            if slot < 0:
-                prev_pre_hc_hidden[rank, row0 : row1 + 1] = fallback_hidden
-                continue
-            accepted_count = int(tensors["accepted_counts"][rank, batch_idx])
-            last_row = row0 + accepted_count - 1
-            if accepted_count == 1:
-                prev_pre_hc_hidden[rank, row0] = tensors["tail_pre_hc_pool"][rank, slot]
-            else:
-                prev_pre_hc_hidden[rank, row0] = tensors["main_pre_hc_hidden"][rank, row0]
-            last_hidden = tensors["main_pre_hc_hidden"][rank, last_row]
-            prev_pre_hc_hidden[rank, row1] = last_hidden
-            tensors["tail_pre_hc_pool"][rank, slot] = last_hidden
-
-    projected = torch.empty_like(prev_pre_hc_hidden)
+    projected = torch.empty_like(tensors["prev_pre_hc_hidden"])
     for rank in range(N_RANKS):
         projection_tensors = {
-            "hidden_states": hidden_states[rank],
-            "prev_hidden_states": prev_pre_hc_hidden[rank],
+            "hidden_states": tensors["hidden_states"][rank],
+            "prev_hidden_states": tensors["prev_pre_hc_hidden"][rank],
             "enorm_w": tensors["enorm_w"][rank],
             "hnorm_w": tensors["hnorm_w"][rank],
             "e_proj_w": tensors["e_proj_w"][rank],
@@ -928,26 +831,6 @@ def golden_mtp_decode_layer(tensors):
             "hidden_states_out": projected[rank],
         }
         golden_mtp_projection(projection_tensors)
-
-    swa_slot_mapping = torch.empty((N_RANKS, T), dtype=torch.int64)
-    swa_indices = torch.empty((N_RANKS, T, WIN), dtype=torch.int32)
-    swa_lens = torch.empty((N_RANKS, T), dtype=torch.int32)
-    for rank in range(N_RANKS):
-        positions = tensors["position_ids"][rank].reshape(B, T // B)
-        table = tensors["ori_block_table"][rank]
-        swa_slot_mapping[rank] = paged_slot_mapping(
-            positions,
-            table,
-            block_size=BLOCK_SIZE,
-        ).reshape(-1)
-        rank_indices, rank_lens = swa_indices_and_lens(
-            positions,
-            table,
-            block_size=BLOCK_SIZE,
-            window=WIN,
-        )
-        swa_indices[rank] = rank_indices
-        swa_lens[rank] = rank_lens
 
     x_attn = torch.empty_like(projected)
     for rank in range(N_RANKS):
@@ -966,9 +849,9 @@ def golden_mtp_decode_layer(tensors):
             "freqs_cos": tensors["freqs_cos"][rank, 0],
             "freqs_sin": tensors["freqs_sin"][rank, 0],
             "kv_cache": tensors["kv_cache"][rank],
-            "swa_slot_mapping": swa_slot_mapping[rank],
-            "swa_indices": swa_indices[rank],
-            "swa_lens": swa_lens[rank],
+            "swa_slot_mapping": tensors["swa_slot_mapping"][rank],
+            "swa_indices": tensors["swa_indices"][rank],
+            "swa_lens": tensors["swa_lens"][rank],
             "position_ids": tensors["position_ids"][rank],
             "attn_sink": tensors["attn_sink"][rank],
             "wo_a": tensors["wo_a"][rank],
@@ -1047,13 +930,13 @@ def main():
     assert len(device_ids) >= N_RANKS, f"need at least {N_RANKS} devices, got {device_ids}"
 
     result = run_jit(
-        fn=l3_mtp_decode_layer,
+        fn=l3_decode_mtp,
         specs=build_tensor_specs(
             start_pos=args.start_pos,
             num_tokens=args.num_tokens,
             ori_block_num=args.ori_block_num,
         ),
-        golden_fn=golden_mtp_decode_layer,
+        golden_fn=golden_decode_mtp,
         compile_only=args.compile_only,
         runtime_dir=args.runtime_dir,
         compile_cfg=dict(
