@@ -351,6 +351,7 @@ def golden_prefill_attention_hca(tensors):
     rope_sin_t = tensors["freqs_sin"].index_select(0, positions).contiguous()
     golden_qkv_proj_rope({
         "x": x_normed.view(T, D),
+        "num_tokens": num_tokens,
         "wq_a": tensors["wq_a"],
         "wq_b": tensors["wq_b"],
         "wq_b_scale": tensors["wq_b_scale"],

@@ -377,13 +377,23 @@ def _golden_gate_scores(tensors):
 
     x_f = tensors["x_mixed"].cpu().float().view(T, D)
     norm_w = tensors["norm_w"].cpu().float()
-    sq_sum = (x_f * x_f).sum(dim=-1, keepdim=True)
+    # Match ffn_norm's two row_sum stages rather than collapsing the full D
+    # reduction into one torch sum. The outer association affects the FP32
+    # router cutoff for nearly tied experts.
+    sq_rows = (x_f * x_f).reshape(T, ROW_PAD, FFN_REDUCE_TILE)
+    sq_partial = sq_rows.sum(dim=-1)
+    sq_sum = sq_partial.sum(dim=-1, keepdim=True)
     inv_rms = torch.rsqrt(sq_sum * (1.0 / D) + NORM_EPS)
     xg = x_f * norm_w.view(1, D)
 
     gate_w = tensors["gate_w"].cpu().float()
     gate_bias = tensors["gate_bias"].cpu().float()
-    logits = inv_rms * (xg @ gate_w.T)
+    # The generated A5 Cube keeps one accumulator live across every source K
+    # tile.  GATE_D_TILE controls source slicing only; it is not an FP32
+    # reduction boundary.  A full host GEMM mirrors that continuous
+    # accumulator more closely than summing independent K-tile GEMMs.
+    logits_acc = xg @ gate_w.T
+    logits = inv_rms * logits_acc
     softplus = logits.clamp(min=0) + torch.log1p(torch.exp(-logits.abs()))
     scores = softplus.sqrt()
     biased = scores + gate_bias.view(1, -1)

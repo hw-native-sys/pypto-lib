@@ -184,23 +184,14 @@ def qkv_proj_rope(
             q_rope_sin_signed[qrp_t : qrp_t + 1, :] = qrp_sin_signed
             q_rope_swap_idx[qrp_t : qrp_t + 1, :] = qrp_swap_idx
 
-    # Split-K qr_proj (M=t_dim, K=D=7168, N=Q_LORA=1536). QR_N_TILE=128 gives
-    # twelve N-groups; QR_OK=2 expands them to 24 cube blocks and atomic-adds the
-    # K partials into a zero-seeded output. Auto-dep on qr_fp32 orders the seed
-    # before every atomic RMW.
+    # Split-K qr_proj partials are reduced in ascending K order.
     qr_fp32 = pl.create_tensor([T_MAX, Q_LORA], dtype=pl.FP32)
+    qr_partials = pl.create_tensor([QR_OK * T_MAX, Q_LORA], dtype=pl.FP32)
     qr_i8_matmul = pl.create_tensor([T_MAX, Q_LORA], dtype=pl.INT8)
-    with pl.at(level=pl.Level.CORE_GROUP, name_hint="qr_proj_seed", allow_early_resolve=True):
-        for tc in pl.range(t_matmul // QR_M_TILE):
-            ts0 = tc * QR_M_TILE
-            for nb in pl.range(Q_LORA // QR_N_TILE):
-                nseed0 = nb * QR_N_TILE
-                qr_fp32[ts0 : ts0 + QR_M_TILE, nseed0 : nseed0 + QR_N_TILE] = pl.full(
-                    [QR_M_TILE, QR_N_TILE], dtype=pl.FP32, value=0.0
-                )
     for qbg_idx in pl.spmd((Q_LORA // QR_N_TILE) * QR_OK, name_hint="qr_proj_matmul", allow_early_resolve=True):
         q_a_col0 = (qbg_idx // QR_OK) * QR_N_TILE
-        qr_k_base = (qbg_idx % QR_OK) * QR_K_SLICE
+        qr_split = qbg_idx % QR_OK
+        qr_k_base = qr_split * QR_K_SLICE
         for tc in pl.range(t_matmul // QR_M_TILE):
             t0 = tc * QR_M_TILE
             q_acc = pl.create_tensor([QR_M_TILE, QR_N_TILE], dtype=pl.FP32)
@@ -213,7 +204,26 @@ def qkv_proj_rope(
                     q_acc = pl.matmul(q_x_chunk_bf16, w_chunk, out_dtype=pl.FP32)
                 else:
                     q_acc = pl.matmul_acc(q_acc, q_x_chunk_bf16, w_chunk)
-            qr_fp32 = pl.assemble(qr_fp32, q_acc, [t0, q_a_col0], atomic=pl.AtomicType.Add)
+            qr_partials = pl.assemble(qr_partials, q_acc, [qr_split * T_MAX + t0, q_a_col0])
+
+    for qr_reduce_idx in pl.spmd(
+        (t_matmul // QR_M_TILE) * (Q_LORA // QR_N_TILE),
+        name_hint="qr_proj_reduce",
+        allow_early_resolve=True,
+    ):
+        qr_t0 = (qr_reduce_idx // (Q_LORA // QR_N_TILE)) * QR_M_TILE
+        qr_col0 = (qr_reduce_idx % (Q_LORA // QR_N_TILE)) * QR_N_TILE
+        qr_total = qr_partials[qr_t0 : qr_t0 + QR_M_TILE, qr_col0 : qr_col0 + QR_N_TILE]
+        for qr_split in pl.range(1, QR_OK):
+            qr_partial_t0 = qr_split * T_MAX + qr_t0
+            qr_total = pl.add(
+                qr_total,
+                qr_partials[
+                    qr_partial_t0 : qr_partial_t0 + QR_M_TILE,
+                    qr_col0 : qr_col0 + QR_N_TILE,
+                ],
+            )
+        qr_fp32 = pl.assemble(qr_fp32, qr_total, [qr_t0, qr_col0])
 
     # Two passes per block: pass 1 computes amax; pass 2 recomputes norm and quantizes.
     for tg_idx in pl.spmd(t_dim // T_TILE, name_hint="qr_rms_norm_quant", allow_early_resolve=True):
@@ -333,25 +343,17 @@ def qkv_proj_rope(
                     q_rope_out_row = tg + q_rope_row
                     q_flat[q_rope_out_row : q_rope_out_row + 1, q_rope_col0:q_rope_col1] = q_rope_bf16
 
-    # Split-K kv_proj uses four 128-column N-groups and KV_OK=4, again producing
-    # 16 cube blocks. KV is off the critical path, so more K splits only add atomic
-    # contention without shortening decode.
+    # Split-K kv_proj partials are reduced in ascending K order.
     kv_fp32 = pl.create_tensor([T_MAX, HEAD_DIM], dtype=pl.FP32)
-    with pl.at(level=pl.Level.CORE_GROUP, name_hint="kv_proj_seed"):
-        for tc in pl.range(t_matmul // KV_M_TILE):
-            kts0 = tc * KV_M_TILE
-            for nb in pl.range(HEAD_DIM // KV_N_TILE):
-                kvseed0 = nb * KV_N_TILE
-                kv_fp32[kts0 : kts0 + KV_M_TILE, kvseed0 : kvseed0 + KV_N_TILE] = pl.full(
-                    [KV_M_TILE, KV_N_TILE], dtype=pl.FP32, value=0.0
-                )
+    kv_partials = pl.create_tensor([KV_OK * T_MAX, HEAD_DIM], dtype=pl.FP32)
     # `late_dep` is a dummy barrier hung off the rms_norm TaskId: kv_proj is off the
     # critical path, so it resolves one hop after rms_norm and lets qr_proj_matmul
     # take the cores first.
     with pl.spmd((HEAD_DIM // KV_N_TILE) * KV_OK, name_hint="kv_proj_matmul", deps=[late_dep]) as _kv_tid:
         kbg = pl.tile.get_block_idx()
         kv_col0 = (kbg // KV_OK) * KV_N_TILE
-        kv_k_base = (kbg % KV_OK) * KV_K_SLICE
+        kv_split = kbg % KV_OK
+        kv_k_base = kv_split * KV_K_SLICE
         for tc in pl.range(t_matmul // KV_M_TILE):
             t0 = tc * KV_M_TILE
             kv_acc = pl.create_tensor([KV_M_TILE, KV_N_TILE], dtype=pl.FP32)
@@ -364,7 +366,26 @@ def qkv_proj_rope(
                     kv_acc = pl.matmul(kv_x_chunk_bf16, wkv_chunk, out_dtype=pl.FP32)
                 else:
                     kv_acc = pl.matmul_acc(kv_acc, kv_x_chunk_bf16, wkv_chunk)
-            kv_fp32 = pl.assemble(kv_fp32, kv_acc, [t0, kv_col0], atomic=pl.AtomicType.Add)
+            kv_partials = pl.assemble(kv_partials, kv_acc, [kv_split * T_MAX + t0, kv_col0])
+
+    for kv_reduce_idx in pl.spmd(
+        (t_matmul // KV_M_TILE) * (HEAD_DIM // KV_N_TILE),
+        name_hint="kv_proj_reduce",
+        allow_early_resolve=True,
+    ):
+        kv_t0 = (kv_reduce_idx // (HEAD_DIM // KV_N_TILE)) * KV_M_TILE
+        kv_col0 = (kv_reduce_idx % (HEAD_DIM // KV_N_TILE)) * KV_N_TILE
+        kv_total = kv_partials[kv_t0 : kv_t0 + KV_M_TILE, kv_col0 : kv_col0 + KV_N_TILE]
+        for kv_split in pl.range(1, KV_OK):
+            kv_partial_t0 = kv_split * T_MAX + kv_t0
+            kv_total = pl.add(
+                kv_total,
+                kv_partials[
+                    kv_partial_t0 : kv_partial_t0 + KV_M_TILE,
+                    kv_col0 : kv_col0 + KV_N_TILE,
+                ],
+            )
+        kv_fp32 = pl.assemble(kv_fp32, kv_total, [kv_t0, kv_col0])
 
     # Fused KV RMSNorm + interleaved (CANN A3) RoPE. One spmd task per [KV_RMS_T_TILE, HEAD_DIM]
     # row block computes the per-row inv_rms once (pass 1) and consumes it locally for
@@ -473,38 +494,200 @@ def qkv_proj_rope_test(
     return q
 
 
+_A5_FP32_VECTOR_LANES = 64
+_A5_CUBE_ACC_K = 16
+_A5_CUBE_N_BLOCK = 128
+_A5_CUBE_K_GROUP_BLOCK = 64
+
+
+def _golden_a5_trowsum_fp32(values):
+    """Mirror A5 TROWSUM's FP32 reduction order along the last dimension."""
+    import torch
+
+    if values.dtype != torch.float32:
+        raise ValueError(f"A5 FP32 TROWSUM golden requires float32, got {values.dtype}")
+    if values.shape[-1] % _A5_FP32_VECTOR_LANES != 0:
+        raise ValueError(
+            f"A5 FP32 TROWSUM width must be divisible by {_A5_FP32_VECTOR_LANES}, "
+            f"got {values.shape[-1]}"
+        )
+
+    groups = values.reshape(*values.shape[:-1], -1, _A5_FP32_VECTOR_LANES)
+    while groups.shape[-1] > 1:
+        pairs = groups.reshape(*groups.shape[:-1], -1, 2)
+        groups = pairs[..., 0] + pairs[..., 1]
+
+    group_sums = groups[..., 0]
+    total = torch.zeros_like(group_sums[..., :1])
+    for group in range(group_sums.shape[-1]):
+        total += group_sums[..., group:group + 1]
+    return total
+
+
+def _golden_a5_high_precision_rsqrt(value):
+    """Match A5 high-precision FP32 rsqrt without host FP32 double rounding."""
+    import torch
+
+    return torch.rsqrt(value.to(torch.float64)).to(torch.float32)
+
+
+def _golden_a5_cube_bf16_matmul(lhs, rhs):
+    """Return ``lhs @ rhs`` in A5 BF16 Cube's K16 MAD accumulation order."""
+    import torch
+
+    if lhs.ndim != 2 or rhs.ndim != 2:
+        raise ValueError("A5 Cube golden requires two rank-2 matrices")
+    m_dim, k_dim = lhs.shape
+    rhs_k_dim, n_dim = rhs.shape
+    if k_dim != rhs_k_dim or k_dim % _A5_CUBE_ACC_K != 0:
+        raise ValueError(
+            f"A5 Cube golden requires equal K divisible by {_A5_CUBE_ACC_K}, "
+            f"got {k_dim} and {rhs_k_dim}"
+        )
+
+    k_groups = k_dim // _A5_CUBE_ACC_K
+    x_groups = lhs.to(torch.bfloat16).reshape(
+        m_dim, k_groups, _A5_CUBE_ACC_K
+    ).double()
+    w_groups = rhs.to(torch.bfloat16).T.contiguous().reshape(
+        n_dim, k_groups, _A5_CUBE_ACC_K
+    ).double()
+    out = torch.zeros(m_dim, n_dim, dtype=torch.float32, device=lhs.device)
+    for n0 in range(0, n_dim, _A5_CUBE_N_BLOCK):
+        n1 = min(n0 + _A5_CUBE_N_BLOCK, n_dim)
+        acc = torch.zeros(m_dim, n1 - n0, dtype=torch.float32, device=lhs.device)
+        for group0 in range(0, k_groups, _A5_CUBE_K_GROUP_BLOCK):
+            group1 = min(group0 + _A5_CUBE_K_GROUP_BLOCK, k_groups)
+            group_dots = torch.einsum(
+                "mgk,ngk->mng",
+                x_groups[:, group0:group1],
+                w_groups[n0:n1, group0:group1],
+            )
+            for group in range(group1 - group0):
+                acc = (acc.double() + group_dots[:, :, group]).float()
+        out[:, n0:n1] = acc
+    return out
+
+
+def _golden_a5_split_k_bf16_matmul(lhs, rhs, *, splits, k_per_split):
+    """Mirror per-split continuous K16 Cube MADs, then ascending split reduction."""
+    if lhs.shape[-1] != splits * k_per_split:
+        raise ValueError(
+            f"split-K golden expected K={splits * k_per_split}, got {lhs.shape[-1]}"
+        )
+    total = None
+    for split in range(splits):
+        k0 = split * k_per_split
+        partial = _golden_a5_cube_bf16_matmul(
+            lhs[:, k0:k0 + k_per_split],
+            rhs[k0:k0 + k_per_split],
+        )
+        total = partial if total is None else total + partial
+    return total
+
+
+def _golden_a5_chunked_rms_inv(values, *, chunk_size, eps):
+    """A5 FP32 RMS: TROWSUM each chunk, add chunks ascending, then HP rsqrt."""
+    import torch
+
+    if values.dtype != torch.float32:
+        raise ValueError(f"A5 RMS golden requires float32, got {values.dtype}")
+    width = values.shape[-1]
+    if width % chunk_size != 0:
+        raise ValueError(f"A5 RMS width {width} must be divisible by chunk {chunk_size}")
+    sq_sum = torch.zeros(
+        *values.shape[:-1], 1, dtype=torch.float32, device=values.device
+    )
+    for k0 in range(0, width, chunk_size):
+        chunk = values[..., k0:k0 + chunk_size]
+        sq_sum += _golden_a5_trowsum_fp32(chunk * chunk)
+    rms_arg = sq_sum * (1.0 / width) + eps
+    return _golden_a5_high_precision_rsqrt(rms_arg)
+
+
+def _golden_qr_rms_norm_quant(qr_fp32, gamma_cq):
+    """Mirror QR's A5 RMS, raw-gamma amax association, and nested scaling."""
+    import torch
+
+    gamma_fp32 = gamma_cq.to(torch.bfloat16).float()
+    qr_inv_rms = _golden_a5_chunked_rms_inv(
+        qr_fp32, chunk_size=Q_LORA_TILE, eps=EPS
+    )
+
+    qr_amax_g = torch.zeros(
+        *qr_fp32.shape[:-1], 1, dtype=torch.float32, device=qr_fp32.device
+    )
+    for k0 in range(0, qr_fp32.shape[-1], Q_LORA_TILE):
+        qr_chunk = qr_fp32[..., k0:k0 + Q_LORA_TILE]
+        gamma_chunk = gamma_fp32[k0:k0 + Q_LORA_TILE]
+        qr_amax_g = torch.maximum(
+            qr_amax_g,
+            (qr_chunk * gamma_chunk).abs().amax(dim=-1, keepdim=True),
+        )
+
+    qr_tile_amax = (qr_inv_rms * qr_amax_g).clamp_min(INT8_AMAX_EPS)
+    qr_scale_quant = torch.full_like(qr_tile_amax, INT8_SCALE_MAX) / qr_tile_amax
+    qr_scale_dequant = torch.ones_like(qr_scale_quant) / qr_scale_quant
+    qr_normed = (qr_fp32 * qr_inv_rms) * gamma_fp32
+    qr_i32 = torch.round(qr_normed * qr_scale_quant).to(torch.int32)
+    qr_i8 = qr_i32.to(torch.float16).to(torch.int8)
+    return qr_i8, qr_scale_dequant
+
+
+def _golden_a5_q_head_rms_norm(q_full):
+    """Mirror the fused Q dequant kernel's HEAD_DIM TROWSUM and HP rsqrt."""
+    q_inv_rms = _golden_a5_chunked_rms_inv(
+        q_full, chunk_size=HEAD_DIM, eps=EPS
+    )
+    return q_full * q_inv_rms
+
+
 def golden_qkv_proj_rope(tensors):
     """Torch reference: Q/KV LoRA + RoPE for an already attention-normalized input."""
     import torch
 
-    x = tensors["x"].float()
+    full_t_dim = tensors["x"].shape[0]
+    active_t_dim = full_t_dim
+    if "num_tokens" in tensors:
+        active_t_dim = max(0, min(int(tensors["num_tokens"]), full_t_dim))
+        tensors["q"].zero_()
+        tensors["kv"].zero_()
+        tensors["qr"].zero_()
+        tensors["qr_scale"].zero_()
+        if active_t_dim == 0:
+            return
+
+    x = tensors["x"][:active_t_dim].float()
     wq_a = tensors["wq_a"].float()
     wq_b = tensors["wq_b"]
     wq_b_scale = tensors["wq_b_scale"].float().view(-1)
     wkv = tensors["wkv"].float()
-    rope_cos = tensors["rope_cos"].float()
-    rope_sin = tensors["rope_sin"].float()
+    rope_cos = tensors["rope_cos"][:active_t_dim].float()
+    rope_sin = tensors["rope_sin"][:active_t_dim].float()
     gamma_cq = tensors["gamma_cq"].float()
     gamma_ckv = tensors["gamma_ckv"].float()
-
-    def int8_quant_per_row(x):
-        rows = x.reshape(-1, x.shape[-1]).float()
-        amax = rows.abs().amax(dim=-1, keepdim=True).clamp_min(INT8_AMAX_EPS)
-        scale_quant = INT8_SCALE_MAX / amax
-        scaled = rows * scale_quant
-        out_i32 = torch.round(scaled).to(torch.int32)
-        out_half = out_i32.to(torch.float16)
-        out_i8 = out_half.to(torch.int8)
-        return out_i8.reshape_as(x), (1.0 / scale_quant).reshape(*x.shape[:-1], 1)
 
     def rms_norm(x, gamma, eps=EPS):
         inv = torch.rsqrt(x.square().mean(-1, keepdim=True) + eps)
         return x * inv * gamma
 
-    def matmul_bf16_input_fp32(a, b):
+    def split_k_matmul_bf16_input_fp32(a, b, *, splits, k_per_split, k_tile):
+        """Mirror the device's per-split matmul_acc tree and ordered reduce."""
         a_fp32 = a.to(torch.bfloat16).float()
         b_fp32 = b.to(torch.bfloat16).float()
-        return torch.matmul(a_fp32, b_fp32).float()
+        total = None
+        for split in range(splits):
+            split_start = split * k_per_split
+            split_end = split_start + k_per_split
+            partial = None
+            for k0 in range(split_start, split_end, k_tile):
+                chunk = torch.matmul(
+                    a_fp32[:, k0:k0 + k_tile],
+                    b_fp32[k0:k0 + k_tile],
+                ).float()
+                partial = chunk if partial is None else partial + chunk
+            total = partial if total is None else total + partial
+        return total
 
     def apply_rope(x_rope, cos, sin):
         # x_rope: [T, ..., ROPE_DIM] with interleaved even/odd rotary pairs.
@@ -519,33 +702,46 @@ def golden_qkv_proj_rope(tensors):
         y_odd = (x_even * sin_v + x_odd * cos_v).to(torch.bfloat16)
         return torch.stack([y_even, y_odd], dim=-1).flatten(-2)
 
-    t_dim = x.shape[0]
+    t_dim = active_t_dim
     token_x = x.view(t_dim, D)
 
     # Q path
-    qr_out = rms_norm(matmul_bf16_input_fp32(token_x, wq_a), gamma_cq)   # [T, Q_LORA]
+    qr_fp32 = _golden_a5_split_k_bf16_matmul(
+        token_x,
+        wq_a,
+        splits=QR_OK,
+        k_per_split=QR_K_SLICE,
+    )   # [T, Q_LORA]
     # W8A8C16: wq_b W8 per-output-channel int8; qr_out A8 per-token int8.
     # flash: also quantizes wq_a/wkv to fp8 (default Linear dtype).
-    qr_i8, qr_scale = int8_quant_per_row(qr_out.float())
+    qr_i8, qr_scale = _golden_qr_rms_norm_quant(qr_fp32, gamma_cq)
     q_i32 = torch.matmul(qr_i8.to(torch.int32), wq_b.to(torch.int32))
     q_full = (q_i32.float() * qr_scale * wq_b_scale.view(1, -1)).view(t_dim, H, HEAD_DIM)
-    inv = torch.rsqrt(q_full.square().mean(-1, keepdim=True) + EPS)
-    q_full = q_full * inv                                            # per-head RMSNorm (no gamma)
+    q_full = _golden_a5_q_head_rms_norm(q_full)  # per-head RMSNorm (no gamma)
     q_nope = q_full[..., :NOPE_DIM]
     q_rope = apply_rope(q_full[..., NOPE_DIM:], rope_cos, rope_sin)
     q_out = torch.cat([q_nope, q_rope], dim=-1)
 
     # KV path
-    kv_full = rms_norm(matmul_bf16_input_fp32(token_x, wkv), gamma_ckv)  # [T, HEAD_DIM]
+    kv_full = rms_norm(
+        split_k_matmul_bf16_input_fp32(
+            token_x,
+            wkv,
+            splits=KV_OK,
+            k_per_split=KV_K_SLICE,
+            k_tile=KV_K_TILE,
+        ),
+        gamma_ckv,
+    )  # [T, HEAD_DIM]
     kv_nope = kv_full[..., :NOPE_DIM]
     kv_rope_in = kv_full[..., NOPE_DIM:].unsqueeze(1)               # add a pseudo head dim
     kv_rope = apply_rope(kv_rope_in, rope_cos, rope_sin).squeeze(1)
     kv_out = torch.cat([kv_nope, kv_rope], dim=-1)
 
-    tensors["q"][:]  = q_out.to(torch.bfloat16)
-    tensors["kv"][:] = kv_out.to(torch.bfloat16)
-    tensors["qr"][:] = qr_i8
-    tensors["qr_scale"][:] = qr_scale
+    tensors["q"][:active_t_dim] = q_out.to(torch.bfloat16)
+    tensors["kv"][:active_t_dim] = kv_out.to(torch.bfloat16)
+    tensors["qr"][:active_t_dim] = qr_i8
+    tensors["qr_scale"][:active_t_dim] = qr_scale
 
 
 def _reference_q_from_quantized_qr(
@@ -566,9 +762,7 @@ def _reference_q_from_quantized_qr(
         * qr_scale.float()
         * wq_b_scale.float().view(1, -1)
     ).view(t_dim, H, HEAD_DIM)
-    q_full = q_full * torch.rsqrt(
-        q_full.square().mean(dim=-1, keepdim=True) + EPS
-    )
+    q_full = _golden_a5_q_head_rms_norm(q_full)
 
     q_pair = q_full[..., NOPE_DIM:].unflatten(-1, (-1, 2))
     q_even, q_odd = q_pair[..., 0], q_pair[..., 1]

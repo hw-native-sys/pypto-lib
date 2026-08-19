@@ -7,7 +7,7 @@
 # See LICENSE in the root of the software repository for the full text of the License.
 # -----------------------------------------------------------------------------------------------------------
 # ci: no-dep-gen  # CI marker: full-occupancy pl.system.syncall -> dep_gen (DFX) trips 507018 (pypto#1931)
-"""DeepSeek-V4 hc_pre -- hyper-connection pre-mix, fused into ONE syncall-barriered task.
+"""DeepSeek-V4 hc_pre -- hyper-connection pre-mix with fused and separate-task implementations.
 
 x[T, hc, D] holds hc streams of the hidden state (x_flat = x.reshape(T, hc*D)). With the
 projection hc_fn[mix_hc, hc*D], the per-group scales hc_scale[3] and biases hc_base[mix_hc]:
@@ -21,22 +21,25 @@ projection hc_fn[mix_hc, hc*D], the per-group scales hc_scale[3] and biases hc_b
 
 TWO IMPLEMENTATIONS, selected by the ``HC_PRE_IMPL`` module flag (env ``DSV4_HC_PRE_IMPL``
 or ``--impl``); both are UNIFIED over decode + prefill and compute the identical math above:
-  * ``_hc_pre_syncall`` (default) -- the #684 fusion documented below: ONE full-occupancy
+  * ``_hc_pre_syncall`` -- the #684 fusion documented below: ONE full-occupancy
     ``pl.spmd(24)`` with 2 hard ``pl.system.syncall`` barriers, run with dep_gen OFF.
-  * ``_hc_pre_separate`` -- the pre-#684 structure: each work-type is its OWN ``pl.spmd``
-    task (cast / rms / seed / linear / split_pre_post / write_post / comb_sinkhorn / mix_x),
-    ordered by the runtime task graph (dep_gen ON), tile sizes aligned to the syncall path.
-The rest of this docstring describes the default ``_hc_pre_syncall`` fusion.
+  * ``_hc_pre_separate`` (default) -- each work-type is its OWN ``pl.spmd`` task
+    (rms / linear / deterministic linear reduce / vector pre / vector post /
+    split_pre_post / write_post / comb_sinkhorn / mix_x), ordered by the runtime
+    task graph, with tile sizes aligned to the syncall path. The standalone harness
+    enables dep-gen to capture that graph.
+The rest of this docstring describes the ``_hc_pre_syncall`` fusion.
 
 FUSION (unified decode + prefill): the whole op is ONE ``pl.spmd(NUM_CORES=24)`` launch --
 24 persistent blocks == 24 AIC + 48 AIV == every 910B core (the full-occupancy contract a
 hard ``pl.system.syncall(core_type="mix")`` requires). The body is 3 phases separated by 2
 barriers; each barrier publishes the prior phase's cross-core HBM writes:
 
-    Phase A  cast (x BF16 -> x_fp32 FP32)  +  seed (zero mixes_raw)          AIV
-    ── syncall ──  (x_fp32 + zeroed mixes_raw visible)
-    Phase B  linear (split-K matmul -> mixes_raw, AIC)  +  rms (split-K SoS -> sq_sum_acc, AIV)
-    ── syncall ──  (sq_sum_acc + all LINEAR_OK atomic-add partials visible)
+    Phase B  linear (split-K matmul -> disjoint partials, AIC) +
+             rms (split-K SoS -> disjoint partials, AIV)
+    ── syncall ──  (all split-K partials visible)
+    Phase C  reduce linear and RMS partials in ascending K-split order      AIV
+    ── syncall ──  (mixes_raw + sq_sum_acc visible)
     Phase D  per task: rsqrt(sq_sum) + scale/sigmoid GATE, then                    AIV
              comb_sinkhorn (-> comb) | mix_x (-> x_mixed) | write_post (-> post)
 
@@ -60,11 +63,11 @@ scheduling policy: Phase D runs comb_sinkhorn FIRST -- its 20-iteration serial r
 a latency floor no core count shortens, so starting it first overlaps it with the
 throughput-bound mix_x on the other lanes.
 
-Split-K linear atomic-adds LINEAR_OK FP32 partials into mixes_raw; Barrier 1's zero-seed +
-Barrier 2's publish replace the old seed->RMW WAW edge. assemble(atomic=Add) is device-only
-and the hard barrier is not modeled by the a2a3sim / a5sim simulators, so those two sim CI
-checks are skipped for hc_pre -- validate on real device. mix_hc(24) pads to a 32-wide cube
-N (MIX_PAD) and hc(4) to an 8-wide vector row (HC_PAD).
+Split-K linear and RMS tasks write disjoint FP32 partial buffers; a fixed ascending-split
+reduction makes results independent of task completion order. The hard barrier is not modeled
+by the a2a3sim / a5sim simulators, so those two sim CI checks are skipped for hc_pre -- validate
+on real device. mix_hc(24) pads to a 32-wide cube N (MIX_PAD) and hc(4) to an 8-wide vector row
+(HC_PAD).
 """
 
 
@@ -79,10 +82,10 @@ T_DYN = pl.dynamic("T_DYN")  # T = B * S
 
 # Implementation selector (both versions are UNIFIED -- one code path for decode AND
 # prefill; no separate decode/prefill dispatch):
-#   "syncall"  (default) -- the #684 fused kernel: ONE full-occupancy pl.spmd(24) with
+#   "syncall" -- the #684 fused kernel: ONE full-occupancy pl.spmd(24) with
 #               2 hard pl.system.syncall barriers; runs with dep_gen OFF (pypto#1931).
-#   "separate" -- the pre-#684 multi-scope structure: each work-type is its own pl.spmd
-#               task, ordered by the runtime task graph (dep_gen ON), applied to ALL T.
+#   "separate" (default) -- each work-type is its own pl.spmd task, ordered by the
+#               runtime task graph; dep-gen may capture those dependencies for DFX.
 # Switch via env DSV4_HC_PRE_IMPL={syncall,separate} or by reassigning this module global
 # before the kernel is traced (the __main__ below wires it to --impl).
 HC_PRE_IMPL = os.environ.get("DSV4_HC_PRE_IMPL", "separate").lower()
@@ -107,38 +110,29 @@ HC_PAD = 8  # hc (4) padded for 32B-aligned vector ops
 NUM_CORES = 24
 
 # tiling (unchanged)
-T_TILE = 8  # vector row-tile (RMS / cast / split / mix_x)
+T_TILE = 8  # vector row-tile (RMS / split / mix_x)
 LINEAR_T_TILE = 16  # cube matmul rows must be a 16-row boxed tile
 COMB_T_TILE = 8  # sinkhorn row-tile
-# cast / rms K-fragment. 256 (not 512) because PRO's HC_DIM = 4 * 7168 = 28672
+# RMS K-fragment. 256 (not 512) because PRO's HC_DIM = 4 * 7168 = 28672
 # factors as 4096 * 7: with RMS_OK = 16 the per-split K is 1792, which 512 does
 # not divide. Keeping RMS_OK at 16 preserves the decode fan-out this file is
 # tuned around, so the fragment is the knob that moves. 256 also matches
-# LINEAR_K_CHUNK / D_CHUNK, and still divides CAST_K_SPMD.
+# LINEAR_K_CHUNK / D_CHUNK.
 RMS_K_CHUNK = 256
 LINEAR_K_CHUNK = 256  # cube K-fragment per matmul_acc (32x256x4 FP32 weight fits L0B)
 D_CHUNK = 256  # mix_x inner D-fragment (BF16 load = 1KB, 512B-aligned)
 D_SPMD = 1024  # mix_x D per spmd block: decode fans 4096 reduce over D/D_SPMD cores
-CAST_K_SPMD = 2048  # cast K per spmd block: decode fans the BF16->FP32 cast over HC_DIM/CAST_K_SPMD cores
-# Split the K=HC_DIM reduction into LINEAR_OK slices that atomic-add their FP32
-# partials, filling idle cubes at small T (decode: 1 token-tile -> LINEAR_OK
-# cube tasks) and shortening each task's matmul_acc chain. Higher OK fills more
-# decode cubes; prefill (8 token-tiles) packs OK*8 tasks into waves of ~24.
+# Split the K=HC_DIM reduction into LINEAR_OK disjoint partials.
 LINEAR_OK = 4
 LINEAR_K_PER_SPLIT = HC_DIM // LINEAR_OK
 LINEAR_CHUNKS_PER_SPLIT = LINEAR_K_PER_SPLIT // LINEAR_K_CHUNK
 
-# Split the RMS sum-of-squares K reduction over RMS_OK cores, mirroring LINEAR_OK: at decode
-# (1 token-tile) the full HC_DIM-wide (28672 for PRO) reduce is otherwise a single-lane straggler. Each
-# (token-tile, K-slice) task atomic-adds its FP32 partial sum-of-squares into sq_sum_acc
-# (zero-seeded in Phase A); Phase C reads the barrier-published total and applies rsqrt inline
-# per group (no separate inv_rms buffer / no within-phase RAW).
+# Split the RMS sum-of-squares K reduction into RMS_OK disjoint partials.
 RMS_OK = 16
 RMS_K_PER_SPLIT = HC_DIM // RMS_OK
 RMS_CHUNKS_PER_SPLIT = RMS_K_PER_SPLIT // RMS_K_CHUNK
 
-# per-phase fan-out factors (compile-time constants; the token-tile factor is dynamic in T)
-CAST_KS = HC_DIM // CAST_K_SPMD  # cast tasks per token-tile (PRO: 28672/2048 = 14)
+# Per-phase fan-out factor (the token-tile factor is dynamic in T).
 MIXX_DS = D // D_SPMD  # mix_x tasks per token-tile (PRO: 7168/1024 = 7)
 
 assert HC_MULT == 4, (
@@ -149,8 +143,8 @@ assert (DECODE_BATCH * DECODE_SEQ) % T_TILE == 0
 assert (PREFILL_BATCH * PREFILL_SEQ) % T_TILE == 0
 assert (PREFILL_BATCH * PREFILL_SEQ) % LINEAR_T_TILE == 0
 assert DECODE_BATCH * DECODE_SEQ <= LINEAR_T_TILE
-assert HC_DIM % LINEAR_K_CHUNK == 0
-assert HC_DIM % CAST_K_SPMD == 0 and CAST_K_SPMD % RMS_K_CHUNK == 0
+assert HC_DIM % LINEAR_OK == 0
+assert LINEAR_K_PER_SPLIT % LINEAR_K_CHUNK == 0
 assert HC_DIM % RMS_OK == 0 and RMS_K_PER_SPLIT % RMS_K_CHUNK == 0
 assert D % D_SPMD == 0 and D_SPMD % D_CHUNK == 0
 
@@ -177,6 +171,8 @@ def _hc_pre_syncall(
     # x arrives as FP32 (hc residual stream is FP32 end-to-end), so there is no x_fp32
     # staging buffer: linear / rms read x_flat directly.
     mixes_raw = pl.create_tensor([t_linear, MIX_PAD], dtype=pl.FP32)
+    linear_partial_rows = LINEAR_OK * t_linear
+    mixes_partials = pl.create_tensor([linear_partial_rows, MIX_PAD], dtype=pl.FP32)
     # post_pad_store is SAME-CORE scratch: write_post writes its token-tile's post gate then
     # reads it back on the SAME core (no barrier). It is kept (not deleted) because its
     # downstream pl.load->pl.store needs an HC_PAD-wide (32B-aligned) tile -- a narrow
@@ -189,37 +185,26 @@ def _hc_pre_syncall(
     # is spilled to this [t_linear,1] buffer and loaded back as a [T_TILE,1] Tile (8 floats,
     # vs the 128-float [.,16] comb_logits round-trip this replaces).
     inv_gm = pl.create_tensor([t_linear, 1], dtype=pl.FP32)
-    sq_sum_acc = pl.create_tensor([1, t_linear], dtype=pl.FP32)  # RMS split-K sum-of-squares (row layout: [1,T_TILE] tiles stay 32B-aligned)
+    sq_sum_acc = pl.create_tensor([1, t_linear], dtype=pl.FP32)
+    sq_partials = pl.create_tensor([RMS_OK, t_linear], dtype=pl.FP32)
 
     # Per-phase grid-stride bounds (dynamic in t_dim; grid-stride round-robins any T over cores).
     tt_n = t_dim // T_TILE            # token-tiles (pre / post / comb / rsqrt / sinkhorn / write_post base)
-    cast_n = tt_n * CAST_KS           # cast fans over token-tile x K-slice
-    seed_n = t_linear // T_TILE       # seed zeros t_linear rows (includes the 8->16 pad rows)
     lin_n = (t_linear // LINEAR_T_TILE) * LINEAR_OK  # linear fans over row-block x OK K-slice
     rms_n = tt_n * RMS_OK             # rms fans over token-tile x K-slice (split-K sum-of-squares)
+    linear_reduce_n = t_linear // LINEAR_T_TILE
+    reduce_n = linear_reduce_n + tt_n
     mixx_n = tt_n * MIXX_DS           # mix_x fans over token-tile x D-slice
     pool_d = 2 * tt_n + mixx_n        # phase-D flattened pool: sinkhorn(tt_n)|mix_x(mixx_n)|write_post(tt_n)
 
     with pl.spmd(NUM_CORES, name_hint="hc_pre_fused", sync_start=True, allow_early_resolve=True) as _hc_tid:  # inline form requires the TaskId capture
         core = pl.tile.get_block_idx()  # 0 .. NUM_CORES-1
 
-        # ===================== PHASE A: seed (AIV) ================================
-        # x is already FP32 (no cast); Phase A only zero-seeds mixes_raw + sq_sum_acc.
-        # Barrier 1 publishes the zeroed mixes_raw / sq_sum_acc for the Phase-B atomic-adds.
-        for aiv_id in pl.split_aiv(2, mode=pl.SplitMode.NONE):
-            lane = core * 2 + aiv_id  # 0..47
-            for tc in pl.range(lane, seed_n, NUM_CORES * 2):
-                ts0 = tc * T_TILE
-                mixes_raw = pl.assemble(mixes_raw, pl.full([T_TILE, MIX_PAD], dtype=pl.FP32, value=0.0), [ts0, 0])
-                sq_sum_acc = pl.assemble(sq_sum_acc, pl.full([1, T_TILE], dtype=pl.FP32, value=0.0), [0, ts0])
-        pl.system.syncall(core_type="mix")
-
-        # ===================== PHASE B: linear (AIC) + rms (AIV) ====================
-        # Cube split-K matmul strides over the 24 AIC; vector RMS over the 48 AIV lanes,
-        # concurrently. Barrier 2 publishes inv_rms + every LINEAR_OK atomic-add partial.
+        # Cube linear partials and vector RMS partials run concurrently.
         for task in pl.range(core, lin_n, NUM_CORES):
             t0 = (task // LINEAR_OK) * LINEAR_T_TILE
-            k_base = (task % LINEAR_OK) * LINEAR_K_PER_SPLIT
+            linear_split = task % LINEAR_OK
+            k_base = linear_split * LINEAR_K_PER_SPLIT
             t_rows = pl.min(LINEAR_T_TILE, t_dim - t0)  # last row-block spills past t_dim; valid_shape zero-fills the tail
             acc = pl.create_tensor([LINEAR_T_TILE, MIX_PAD], dtype=pl.FP32)
             for kb in pl.pipeline(0, LINEAR_CHUNKS_PER_SPLIT, stage=2):
@@ -230,23 +215,59 @@ def _hc_pre_syncall(
                     acc = pl.matmul(x_linear_chunk, w_chunk, b_trans=True, out_dtype=pl.FP32)
                 else:
                     acc = pl.matmul_acc(acc, x_linear_chunk, w_chunk, b_trans=True)
-            mixes_raw = pl.assemble(mixes_raw, acc, [t0, 0], atomic=pl.AtomicType.Add)
+            mixes_partials = pl.assemble(
+                mixes_partials,
+                acc,
+                [linear_split * t_linear + t0, 0],
+            )
         for aiv_id in pl.split_aiv(2, mode=pl.SplitMode.NONE):
             lane = core * 2 + aiv_id
             for task in pl.range(lane, rms_n, NUM_CORES * 2):
                 t0 = (task // RMS_OK) * T_TILE
-                k_base = (task % RMS_OK) * RMS_K_PER_SPLIT
+                rms_split = task % RMS_OK
+                k_base = rms_split * RMS_K_PER_SPLIT
                 sq_part = pl.full([1, T_TILE], dtype=pl.FP32, value=0.0)
                 for kb in pl.pipeline(RMS_CHUNKS_PER_SPLIT, stage=4):
                     k0 = k_base + kb * RMS_K_CHUNK
                     x_chunk = x_flat[t0:t0 + T_TILE, k0:k0 + RMS_K_CHUNK]
                     sq_part = pl.add(sq_part, pl.reshape(pl.row_sum(pl.mul(x_chunk, x_chunk)), [1, T_TILE]))
-                sq_sum_acc = pl.assemble(sq_sum_acc, sq_part, [0, t0], atomic=pl.AtomicType.Add)
+                sq_partials = pl.assemble(sq_partials, sq_part, [rms_split, t0])
+        pl.system.syncall(core_type="mix")
+
+        # Split-K partials are reduced in ascending K order.
+        for aiv_id in pl.split_aiv(2, mode=pl.SplitMode.NONE):
+            lane = core * 2 + aiv_id
+            for reduce_task in pl.range(lane, reduce_n, NUM_CORES * 2):
+                if reduce_task < linear_reduce_n:
+                    linear_t0 = reduce_task * LINEAR_T_TILE
+                    mixes_total = mixes_partials[
+                        linear_t0 : linear_t0 + LINEAR_T_TILE,
+                        0:MIX_PAD,
+                    ]
+                    for linear_split in pl.range(1, LINEAR_OK):
+                        partial_t0 = linear_split * t_linear + linear_t0
+                        mixes_total = pl.add(
+                            mixes_total,
+                            mixes_partials[
+                                partial_t0 : partial_t0 + LINEAR_T_TILE,
+                                0:MIX_PAD,
+                            ],
+                        )
+                    mixes_raw = pl.assemble(mixes_raw, mixes_total, [linear_t0, 0])
+                else:
+                    rms_t0 = (reduce_task - linear_reduce_n) * T_TILE
+                    sq_total = sq_partials[0:1, rms_t0 : rms_t0 + T_TILE]
+                    for rms_split in pl.range(1, RMS_OK):
+                        sq_total = pl.add(
+                            sq_total,
+                            sq_partials[rms_split : rms_split + 1, rms_t0 : rms_t0 + T_TILE],
+                        )
+                    sq_sum_acc = pl.assemble(sq_sum_acc, sq_total, [0, rms_t0])
         pl.system.syncall(core_type="mix")
 
         # ===================== PHASE C+D FUSED: gate + sinkhorn/mix_x/write_post (AIV) =====
         # Phase C (rsqrt + scale + sigmoid gates) is FOLDED into each Phase-D task: every
-        # task recomputes the gate it needs from the barrier-2-published mixes_raw + sq_sum_acc
+        # task recomputes the gate it needs from the published mixes_raw + sq_sum_acc
         # on its OWN core, just before using it. Recompute is nearly free here (latency-bound
         # kernel), and it deletes an entire cross-core barrier plus the pre/post/comb gate
         # round-trips -- the C->D handoff was the reason the old Barrier 3 existed. comb_logits
@@ -429,9 +450,10 @@ def _hc_pre_separate(
 
     Identical math to _hc_pre_syncall, but each work-type is its OWN pl.spmd task instead
     of one full-occupancy pl.spmd + hard pl.system.syncall barriers. The runtime task
-    graph orders the scopes by their GM read/write dependencies (seed -> linear atomic-add
-    -> split_pre_post -> write_post / comb_sinkhorn / mix_x), so this path needs dep_gen ON
-    (the __main__ harness sets enable_dep_gen accordingly). Tile sizes are aligned to the
+    graph orders the scopes by their GM read/write dependencies (linear -> linear reduce ->
+    split_pre_post -> write_post / comb_sinkhorn / mix_x). The scheduler derives that ordering
+    from GM dependencies; the standalone harness enables dep-gen only to capture the graph.
+    Tile sizes are aligned to the
     tuned syncall version (D_CHUNK / D_SPMD / LINEAR_* / t_linear round-up); cross-barrier
     buffers are sized to the dynamic t_linear (the 8->16 padded row count), not a static
     T_MAX. Kept as a switchable alternative to the fused kernel (perf is not the goal here).
@@ -451,6 +473,8 @@ def _hc_pre_separate(
     # linear matmul masks them with valid_shape (zero-fill past t_dim), and rms only reads
     # the t_dim real rows.
     mixes_raw = pl.create_tensor([t_linear, MIX_PAD], dtype=pl.FP32)
+    linear_partial_rows = LINEAR_OK * t_linear
+    mixes_partials = pl.create_tensor([linear_partial_rows, MIX_PAD], dtype=pl.FP32)
 
     # rms: full-K sum-of-squares per token-tile -> inv_rms (one scope, no split-K).
     for t in pl.spmd(t_dim // T_TILE, name_hint="hc_pre_rms", allow_early_resolve=True):
@@ -463,16 +487,11 @@ def _hc_pre_separate(
         inv = pl.reshape(pl.rsqrt(pl.add(pl.mul(sq_sum, HC_DIM_INV), NORM_EPS), high_precision=True), [T_TILE, 1])
         inv_rms = pl.assemble(inv_rms, inv, [t0, 0])
 
-    # seed: zero mixes_raw for the split-K atomic-add accumulation. ONE task (single InCore
-    # region) loops the t_linear // T_TILE row-blocks internally, instead of fanning them out.
-    with pl.at(level=pl.Level.CORE_GROUP, name_hint="hc_pre_seed", allow_early_resolve=True):
-        for ts0 in pl.range(0, t_linear, T_TILE):
-            mixes_raw[ts0:ts0 + T_TILE, 0:MIX_PAD] = pl.full([T_TILE, MIX_PAD], dtype=pl.FP32, value=0.0)
-
-    # linear: split-K matmul; each (row-block, K-slice) atomic-adds its FP32 partial.
+    # Linear split-K partials are reduced in ascending K order.
     for task in pl.spmd((t_linear // LINEAR_T_TILE) * LINEAR_OK, name_hint="hc_pre_linear", allow_early_resolve=True):
         t0 = (task // LINEAR_OK) * LINEAR_T_TILE
-        k_base = (task % LINEAR_OK) * LINEAR_K_PER_SPLIT
+        linear_split = task % LINEAR_OK
+        k_base = linear_split * LINEAR_K_PER_SPLIT
         t_rows = pl.min(LINEAR_T_TILE, t_dim - t0)  # last row-block spills past t_dim; valid_shape zero-fills the tail
         acc = pl.create_tensor([LINEAR_T_TILE, MIX_PAD], dtype=pl.FP32)
         for kb in pl.pipeline(0, LINEAR_CHUNKS_PER_SPLIT, stage=2):
@@ -483,7 +502,156 @@ def _hc_pre_separate(
                 acc = pl.matmul(x_linear_chunk, w_chunk, b_trans=True, out_dtype=pl.FP32)
             else:
                 acc = pl.matmul_acc(acc, x_linear_chunk, w_chunk, b_trans=True)
-        mixes_raw = pl.assemble(mixes_raw, acc, [t0, 0], atomic=pl.AtomicType.Add)
+        mixes_partials = pl.assemble(mixes_partials, acc, [linear_split * t_linear + t0, 0])
+
+    for linear_block in pl.spmd(
+        t_linear // LINEAR_T_TILE,
+        name_hint="hc_pre_linear_reduce",
+        allow_early_resolve=True,
+    ):
+        linear_t0 = linear_block * LINEAR_T_TILE
+        mixes_total = mixes_partials[linear_t0 : linear_t0 + LINEAR_T_TILE, 0:MIX_PAD]
+        for linear_split in pl.range(1, LINEAR_OK):
+            partial_t0 = linear_split * t_linear + linear_t0
+            mixes_total = pl.add(
+                mixes_total,
+                mixes_partials[partial_t0 : partial_t0 + LINEAR_T_TILE, 0:MIX_PAD],
+            )
+        mixes_raw = pl.assemble(mixes_raw, mixes_total, [linear_t0, 0])
+
+    # The pre gate uses an explicit A5 FP32 vector reduction, one token per task.
+    # Each K256 fragment is reduced by TROWSUM and the fragment results accumulate
+    # in ascending K order. Keep this scope independent from the matching post
+    # projection: the proven schedule has one scope for rows 0..3 and one for 4..7.
+    pre_raw_store = pl.create_tensor([t_linear, HC_PAD], dtype=pl.FP32)
+    for task in pl.spmd(t_dim, name_hint="hc_pre_pre_linear_vector", allow_early_resolve=True):
+        trow = task
+        dot_out = pl.tile.full([8, 8], dtype=pl.FP32, value=0.0)
+        for kb in pl.pipeline(HC_DIM // LINEAR_K_CHUNK, stage=1):
+            k0 = kb * LINEAR_K_CHUNK
+            pre_x_chunk = pl.load(
+                x_flat,
+                [trow, k0],
+                [8, LINEAR_K_CHUNK],
+                valid_shape=[1, LINEAR_K_CHUNK],
+                target_memory=pl.MemorySpace.Vec,
+            )
+            pre_w0_chunk = pl.load(
+                hc_fn,
+                [0, k0],
+                [8, LINEAR_K_CHUNK],
+                valid_shape=[1, LINEAR_K_CHUNK],
+                target_memory=pl.MemorySpace.Vec,
+            )
+            pre_w1_chunk = pl.load(
+                hc_fn,
+                [1, k0],
+                [8, LINEAR_K_CHUNK],
+                valid_shape=[1, LINEAR_K_CHUNK],
+                target_memory=pl.MemorySpace.Vec,
+            )
+            pre_w2_chunk = pl.load(
+                hc_fn,
+                [2, k0],
+                [8, LINEAR_K_CHUNK],
+                valid_shape=[1, LINEAR_K_CHUNK],
+                target_memory=pl.MemorySpace.Vec,
+            )
+            pre_w3_chunk = pl.load(
+                hc_fn,
+                [3, k0],
+                [8, LINEAR_K_CHUNK],
+                valid_shape=[1, LINEAR_K_CHUNK],
+                target_memory=pl.MemorySpace.Vec,
+            )
+            pre_row_sum_tmp = pl.tile.create(
+                [8, LINEAR_K_CHUNK],
+                dtype=pl.FP32,
+                target_memory=pl.MemorySpace.Vec,
+            )
+            chunk0 = pl.row_sum(pl.mul(pre_x_chunk, pre_w0_chunk), pre_row_sum_tmp)
+            chunk1 = pl.row_sum(pl.mul(pre_x_chunk, pre_w1_chunk), pre_row_sum_tmp)
+            chunk2 = pl.row_sum(pl.mul(pre_x_chunk, pre_w2_chunk), pre_row_sum_tmp)
+            chunk3 = pl.row_sum(pl.mul(pre_x_chunk, pre_w3_chunk), pre_row_sum_tmp)
+            chunk0_row = pl.set_validshape(pl.reshape(chunk0, [1, 8]), 1, 1)
+            chunk1_row = pl.set_validshape(pl.reshape(chunk1, [1, 8]), 1, 1)
+            chunk2_row = pl.set_validshape(pl.reshape(chunk2, [1, 8]), 1, 1)
+            chunk3_row = pl.set_validshape(pl.reshape(chunk3, [1, 8]), 1, 1)
+            chunk_vec_init = pl.tile.full([8, 8], dtype=pl.FP32, value=0.0)
+            chunk_vec0 = pl.tile.assemble(chunk_vec_init, chunk0_row, [0, 0])
+            chunk_vec1 = pl.tile.assemble(chunk_vec0, chunk1_row, [1, 0])
+            chunk_vec2 = pl.tile.assemble(chunk_vec1, chunk2_row, [2, 0])
+            chunk_vec3 = pl.tile.assemble(chunk_vec2, chunk3_row, [3, 0])
+            dot_out = pl.add(dot_out, chunk_vec3)
+
+        pre_raw_row = pl.transpose(dot_out, axis1=0, axis2=1)
+        pre_raw_valid = pl.set_validshape(pre_raw_row, 1, HC_PAD)
+        pl.store(pre_raw_valid, [trow, 0], pre_raw_store)
+
+    post_raw_store = pl.create_tensor([t_linear, HC_PAD], dtype=pl.FP32)
+    for task in pl.spmd(t_dim, name_hint="hc_pre_post_linear_vector", allow_early_resolve=True):
+        trow = task
+        dot_out = pl.tile.full([8, 8], dtype=pl.FP32, value=0.0)
+        for kb in pl.pipeline(HC_DIM // LINEAR_K_CHUNK, stage=1):
+            k0 = kb * LINEAR_K_CHUNK
+            post_x_chunk = pl.load(
+                x_flat,
+                [trow, k0],
+                [8, LINEAR_K_CHUNK],
+                valid_shape=[1, LINEAR_K_CHUNK],
+                target_memory=pl.MemorySpace.Vec,
+            )
+            post_w0_chunk = pl.load(
+                hc_fn,
+                [HC_MULT + 0, k0],
+                [8, LINEAR_K_CHUNK],
+                valid_shape=[1, LINEAR_K_CHUNK],
+                target_memory=pl.MemorySpace.Vec,
+            )
+            post_w1_chunk = pl.load(
+                hc_fn,
+                [HC_MULT + 1, k0],
+                [8, LINEAR_K_CHUNK],
+                valid_shape=[1, LINEAR_K_CHUNK],
+                target_memory=pl.MemorySpace.Vec,
+            )
+            post_w2_chunk = pl.load(
+                hc_fn,
+                [HC_MULT + 2, k0],
+                [8, LINEAR_K_CHUNK],
+                valid_shape=[1, LINEAR_K_CHUNK],
+                target_memory=pl.MemorySpace.Vec,
+            )
+            post_w3_chunk = pl.load(
+                hc_fn,
+                [HC_MULT + 3, k0],
+                [8, LINEAR_K_CHUNK],
+                valid_shape=[1, LINEAR_K_CHUNK],
+                target_memory=pl.MemorySpace.Vec,
+            )
+            post_row_sum_tmp = pl.tile.create(
+                [8, LINEAR_K_CHUNK],
+                dtype=pl.FP32,
+                target_memory=pl.MemorySpace.Vec,
+            )
+            chunk0 = pl.row_sum(pl.mul(post_x_chunk, post_w0_chunk), post_row_sum_tmp)
+            chunk1 = pl.row_sum(pl.mul(post_x_chunk, post_w1_chunk), post_row_sum_tmp)
+            chunk2 = pl.row_sum(pl.mul(post_x_chunk, post_w2_chunk), post_row_sum_tmp)
+            chunk3 = pl.row_sum(pl.mul(post_x_chunk, post_w3_chunk), post_row_sum_tmp)
+            chunk0_row = pl.set_validshape(pl.reshape(chunk0, [1, 8]), 1, 1)
+            chunk1_row = pl.set_validshape(pl.reshape(chunk1, [1, 8]), 1, 1)
+            chunk2_row = pl.set_validshape(pl.reshape(chunk2, [1, 8]), 1, 1)
+            chunk3_row = pl.set_validshape(pl.reshape(chunk3, [1, 8]), 1, 1)
+            chunk_vec_init = pl.tile.full([8, 8], dtype=pl.FP32, value=0.0)
+            chunk_vec0 = pl.tile.assemble(chunk_vec_init, chunk0_row, [0, 0])
+            chunk_vec1 = pl.tile.assemble(chunk_vec0, chunk1_row, [1, 0])
+            chunk_vec2 = pl.tile.assemble(chunk_vec1, chunk2_row, [2, 0])
+            chunk_vec3 = pl.tile.assemble(chunk_vec2, chunk3_row, [3, 0])
+            dot_out = pl.add(dot_out, chunk_vec3)
+
+        post_raw_row = pl.transpose(dot_out, axis1=0, axis2=1)
+        post_raw_valid = pl.set_validshape(post_raw_row, 1, HC_PAD)
+        pl.store(post_raw_valid, [trow, 0], post_raw_store)
 
     # split_pre_post: inv_rms-scaled pre gate -> pre_val_store (for mix_x), post gate -> post.
     # Both compute at HC_PAD width; post narrows to HC_MULT via a valid-shape slice (an 8-wide
@@ -492,21 +660,48 @@ def _hc_pre_separate(
     pre_val_store = pl.create_tensor([t_linear, HC_PAD], dtype=pl.FP32)
     for ob in pl.spmd(t_dim // T_TILE, name_hint="split_pre_post", allow_early_resolve=True):
         t0 = ob * T_TILE
-        inv_col = inv_rms[t0:t0 + T_TILE, 0:1]
 
-        pre_base = pl.reshape(hc_base[0:HC_PAD], [1, HC_PAD])
-        pre_scaled = pl.mul(pl.row_expand_mul(mixes_raw[t0:t0 + T_TILE, 0:HC_PAD], inv_col), scale0)
+        pre_inv = pl.load(
+            inv_rms,
+            [t0, 0],
+            [T_TILE, 1],
+            target_memory=pl.MemorySpace.Vec,
+        )
+        pre_base = pl.load(
+            hc_base_2d,
+            [0, 0],
+            [1, HC_PAD],
+            target_memory=pl.MemorySpace.Vec,
+        )
+        pre_mixes = pl.load(
+            pre_raw_store,
+            [t0, 0],
+            [T_TILE, HC_PAD],
+            valid_shape=[T_TILE, HC_MULT],
+            target_memory=pl.MemorySpace.Vec,
+        )
+        pre_scaled = pl.mul(pl.row_expand_mul(pre_mixes, pre_inv), scale0)
         pre_logits = pl.add(pre_scaled, pl.col_expand(pre_scaled, pre_base))
         pre_sig = pl.recip(pl.add(pl.exp(pl.neg(pre_logits)), 1.0))
         pre_val = pl.add(pre_sig, HC_EPS)
-        pre_val_store = pl.assemble(pre_val_store, pre_val, [t0, 0])
+        pre_valid = pl.set_validshape(pre_val, T_TILE, HC_MULT)
+        pl.store(pre_valid, [t0, 0], pre_val_store)
 
-        post_base = pl.reshape(hc_base[HC_MULT:HC_MULT + HC_PAD], [1, HC_PAD])
-        post_scaled = pl.mul(pl.row_expand_mul(mixes_raw[t0:t0 + T_TILE, HC_MULT:HC_MULT + HC_PAD], inv_col), scale1)
+        post_mixes = pl.load(
+            post_raw_store,
+            [t0, 0],
+            [T_TILE, HC_PAD],
+            valid_shape=[T_TILE, HC_MULT],
+            target_memory=pl.MemorySpace.Vec,
+        )
+        post_inv = pl.load(inv_rms, [t0, 0], [T_TILE, 1], target_memory=pl.MemorySpace.Vec)
+        post_base = pl.load(hc_base_2d, [0, HC_MULT], [1, HC_PAD], target_memory=pl.MemorySpace.Vec)
+        post_scaled = pl.mul(pl.row_expand_mul(post_mixes, post_inv), scale1)
         post_logits = pl.add(post_scaled, pl.col_expand(post_scaled, post_base))
         post_sig = pl.recip(pl.add(pl.exp(pl.neg(post_logits)), 1.0))
         post_pad = pl.mul(post_sig, 2.0)
-        post[t0:t0 + T_TILE, 0:HC_MULT] = pl.slice(post_pad, [T_TILE, HC_PAD], [0, 0], valid_shape=[T_TILE, HC_MULT])
+        post_valid = pl.set_validshape(post_pad, T_TILE, HC_MULT)
+        pl.store(post_valid, [t0, 0], post)
 
     # comb_sinkhorn: comb gate (direct from mixes_raw, no comb_logits round-trip) + softmax +
     # 20-iter Sinkhorn (column-first) -> comb. inv_rms is already a [t_linear,1] column buffer,
@@ -683,6 +878,118 @@ def hc_pre_test(
     return x_mixed
 
 
+_A5_FP32_VECTOR_LANES = 64
+
+
+def _golden_a5_trowsum_fp32(values):
+    """Mirror A5 TROWSUM's FP32 reduction order along the last dimension."""
+    import torch
+
+    if values.dtype != torch.float32:
+        raise ValueError(f"A5 FP32 TROWSUM golden requires float32, got {values.dtype}")
+    if values.shape[-1] % _A5_FP32_VECTOR_LANES != 0:
+        raise ValueError(
+            f"A5 FP32 TROWSUM width must be divisible by {_A5_FP32_VECTOR_LANES}, "
+            f"got {values.shape[-1]}"
+        )
+
+    # A5 processes 64 FP32 lanes per vector repeat. vcadd recursively adds
+    # adjacent pairs inside each repeat; TRowReduce then accumulates the repeat
+    # scalars from zero in ascending address order.
+    groups = values.reshape(*values.shape[:-1], -1, _A5_FP32_VECTOR_LANES)
+    while groups.shape[-1] > 1:
+        pairs = groups.reshape(*groups.shape[:-1], -1, 2)
+        groups = pairs[..., 0] + pairs[..., 1]
+
+    group_sums = groups[..., 0]
+    total = torch.zeros_like(group_sums[..., :1])
+    for group in range(group_sums.shape[-1]):
+        total += group_sums[..., group:group + 1]
+    return total
+
+
+def _golden_a5_high_precision_rsqrt(value):
+    """Match A5 high-precision FP32 rsqrt without host FP32 double rounding."""
+    import torch
+
+    return torch.rsqrt(value.to(torch.float64)).to(torch.float32)
+
+
+def _golden_a5_rms_inv(x_flat_2d):
+    """Host mirror of hc_pre_rms: K256 chunks, A5 TROWSUM, then HP rsqrt."""
+    import torch
+
+    if x_flat_2d.dtype != torch.float32:
+        raise ValueError(f"hc_pre RMS golden requires float32, got {x_flat_2d.dtype}")
+    if x_flat_2d.shape[-1] != HC_DIM:
+        raise ValueError(f"hc_pre RMS width must be HC_DIM={HC_DIM}, got {x_flat_2d.shape[-1]}")
+
+    sq_sum = torch.zeros(
+        x_flat_2d.shape[0], 1, dtype=torch.float32, device=x_flat_2d.device
+    )
+    for k0 in range(0, HC_DIM, RMS_K_CHUNK):
+        x_chunk = x_flat_2d[:, k0:k0 + RMS_K_CHUNK]
+        sq_sum += _golden_a5_trowsum_fp32(x_chunk * x_chunk)
+
+    rms_arg = sq_sum * HC_DIM_INV + NORM_EPS
+    return _golden_a5_high_precision_rsqrt(rms_arg)
+
+
+def _golden_a5_gate_raw(x_flat_2d, hc_fn, row_start):
+    """Mirror one four-row A5 gate projection's K256 FP32 reduction order."""
+    import torch
+
+    if x_flat_2d.dtype != torch.float32 or hc_fn.dtype != torch.float32:
+        raise ValueError(
+            f"A5 gate golden requires float32 inputs, got {x_flat_2d.dtype} and {hc_fn.dtype}"
+        )
+    if x_flat_2d.shape[-1] != HC_DIM or hc_fn.shape[-1] != HC_DIM:
+        raise ValueError(
+            f"A5 gate golden widths must be HC_DIM={HC_DIM}, "
+            f"got {x_flat_2d.shape[-1]} and {hc_fn.shape[-1]}"
+        )
+    if row_start < 0 or row_start + HC_MULT > hc_fn.shape[0]:
+        raise ValueError(
+            f"A5 gate rows [{row_start}, {row_start + HC_MULT}) exceed "
+            f"hc_fn rows={hc_fn.shape[0]}"
+        )
+
+    gate_raw = torch.zeros(
+        x_flat_2d.shape[0], HC_MULT, dtype=torch.float32, device=x_flat_2d.device
+    )
+    gate_fn = hc_fn[row_start:row_start + HC_MULT]
+    for k0 in range(0, HC_DIM, LINEAR_K_CHUNK):
+        x_chunk = x_flat_2d[:, k0:k0 + LINEAR_K_CHUNK]
+        w_chunk = gate_fn[:, k0:k0 + LINEAR_K_CHUNK]
+        products = x_chunk[:, None, :] * w_chunk[None, :, :]
+        gate_raw += _golden_a5_trowsum_fp32(products)[..., 0]
+    return gate_raw
+
+
+def _golden_a5_pre_raw(x_flat_2d, hc_fn):
+    """Mirror the separate pre projection over hc_fn rows 0..3."""
+    return _golden_a5_gate_raw(x_flat_2d, hc_fn, row_start=0)
+
+
+def _golden_a5_post_raw(x_flat_2d, hc_fn):
+    """Mirror the separate post projection over hc_fn rows 4..7."""
+    return _golden_a5_gate_raw(x_flat_2d, hc_fn, row_start=HC_MULT)
+
+
+def _golden_hc_pre_pre_raw(x_flat_2d, hc_fn, cube_mixes_raw):
+    """Select the pre projection reduction used by the active implementation."""
+    if HC_PRE_IMPL == "separate":
+        return _golden_a5_pre_raw(x_flat_2d, hc_fn)
+    return cube_mixes_raw[..., :HC_MULT].clone()
+
+
+def _golden_hc_pre_post_raw(x_flat_2d, hc_fn, cube_mixes_raw):
+    """Select the post projection reduction used by the active HC-pre implementation."""
+    if HC_PRE_IMPL == "separate":
+        return _golden_a5_post_raw(x_flat_2d, hc_fn)
+    return cube_mixes_raw[..., HC_MULT:HC_MULT * 2].clone()
+
+
 def golden_hc_pre(tensors):
     """Torch reference, direct port of model.py Block.hc_pre + hc_split_sinkhorn."""
     import torch
@@ -695,11 +1002,7 @@ def golden_hc_pre(tensors):
     t_dim = x.shape[0]
     x_flat_2d = x.reshape(t_dim, HC_DIM)
 
-    sq_sum = torch.zeros(t_dim, 1, dtype=torch.float32)
-    for k0 in range(0, HC_DIM, RMS_K_CHUNK):
-        x_chunk = x_flat_2d[:, k0:k0 + RMS_K_CHUNK]
-        sq_sum += (x_chunk * x_chunk).sum(dim=1, keepdim=True)
-    rsqrt = torch.rsqrt(sq_sum * HC_DIM_INV + NORM_EPS)
+    rsqrt = _golden_a5_rms_inv(x_flat_2d)
 
     # Per-K-chunk partial dots in one reduction, then accumulated in chunk order
     # to match the cube K-fragment accumulation. Summing over n_chunk with a
@@ -711,11 +1014,14 @@ def golden_hc_pre(tensors):
     mixes = torch.zeros(t_dim, MIX_HC, dtype=torch.float32)  # [T, mix_hc]
     for c in range(n_chunk):
         mixes += per_chunk[:, :, c]
+    pre_raw = _golden_hc_pre_pre_raw(x_flat_2d, hc_fn, mixes)
+    post_raw = _golden_hc_pre_post_raw(x_flat_2d, hc_fn, mixes)
     mixes *= rsqrt
 
-    pre = torch.sigmoid(mixes[..., :HC_MULT] * hc_scale[0] + hc_base[:HC_MULT]) + HC_EPS
-    post_t = 2 * torch.sigmoid(mixes[..., HC_MULT:HC_MULT * 2] * hc_scale[1]
-                               + hc_base[HC_MULT:HC_MULT * 2])
+    pre_mixes = pre_raw * rsqrt
+    pre = torch.sigmoid(pre_mixes * hc_scale[0] + hc_base[:HC_MULT]) + HC_EPS
+    post_mixes = post_raw * rsqrt
+    post_t = 2 * torch.sigmoid(post_mixes * hc_scale[1] + hc_base[HC_MULT:HC_MULT * 2])
     comb_t = (mixes[..., HC_MULT * 2:] * hc_scale[2] + hc_base[HC_MULT * 2:]
               ).view(t_dim, HC_MULT, HC_MULT)
 
@@ -810,9 +1116,9 @@ if __name__ == "__main__":
     # AIC count and its hard full-occupancy mix-syncall hangs (AICore timeout 507018) unless
     # the launch fills every physical core; A5 (Ascend950) has a different AIC count (36), so
     # the syncall impl is rejected on A5. The "separate" impl has no such barrier -- it uses
-    # data-derived pl.spmd(work_count) + CORE_GROUP + atomic-add (the same structural pattern
-    # as hc_head/hc_post, which already pass on A5), so it is core-count-agnostic and runs on
-    # A5. Its tile sizes are 910B-tuned (perf, not correctness); a5 perf may be suboptimal
+    # data-derived pl.spmd(work_count) scopes ordered by their GM dependencies, so it is
+    # core-count-agnostic and runs on A5. Its tile sizes are 910B-tuned (perf, not correctness);
+    # a5 perf may be suboptimal
     # until re-swept, but precision is unaffected.
     if args.platform in ("a5", "a5sim") and HC_PRE_IMPL == "syncall":
         raise SystemExit(
@@ -840,8 +1146,8 @@ if __name__ == "__main__":
                 # dep_gen: the "syncall" version's full-occupancy pl.system.syncall is
                 # incompatible with dep_gen -- the DFX instrumentation perturbs core
                 # occupancy and trips AICore timeout 507018 (pypto#1931) -- so it runs with
-                # dep_gen OFF. The "separate" version has no hard syncall and RELIES on
-                # dep_gen to order its multi-scope task graph, so it runs with dep_gen ON.
+                # dep_gen OFF. The "separate" version has no hard syncall, so the harness
+                # enables dep-gen to capture its scheduler-derived dependency graph.
                 enable_dep_gen=(HC_PRE_IMPL == "separate"),
             ),
             rtol=1e-3,

@@ -43,11 +43,9 @@ D_CHUNK = 512
 #    The matmul is then a clean cube-only kernel (~86% Exec, no vector subblock)
 #    instead of a mixed cube+cast kernel.
 #  - Split-K: with one task per token-tile only T/T_TILE cube cores run (8 of
-#    ~24). LINEAR_OK splits the K reduction into OK slices that atomic-add their
-#    FP32 partials into a zero-seeded mixes_raw, filling the idle cores and
-#    shortening each core's matmul_acc chain. OK=2 is the device-sweep peak
-#    (16 tasks = one wave, minimal atomic contention); OK=4/8 spill past ~24
-#    cores into extra waves where atomic contention overtakes the shorter chain.
+#    ~24). LINEAR_OK splits the K reduction into disjoint FP32 partials, filling
+#    the idle cores and shortening each core's matmul_acc chain. A separate
+#    scope reduces those partials in ascending K order for deterministic output.
 # Tile-size tuning can't help (FP32 operands make L1/Mat the wall at K=512);
 # split-K is the lever hint_l1_tile ranked #1. Golden-validated; device best-of-5
 # median ~128-134us.
@@ -83,6 +81,7 @@ def hc_head(
     # x_fp32 staging buffer: the head-projection matmul (pure-AIC) and the inv_rms
     # reduce below read x_flat directly.
     mixes_raw = pl.create_tensor([T_MAX, HC_PAD], dtype=pl.FP32)
+    mixes_partials = pl.create_tensor([LINEAR_OK * T_MAX, HC_PAD], dtype=pl.FP32)
     pre_t = pl.create_tensor([HC_PAD, T_MAX], dtype=pl.FP32)
 
     # inv_rms scope: read the FP32 activations back and reduce sum-of-squares -> rsqrt.
@@ -100,20 +99,12 @@ def hc_head(
         inv = pl.reshape(pl.rsqrt(head_var, high_precision=True), [T_TILE, 1])
         inv_rms = pl.assemble(inv_rms, inv, [t0, 0])
 
-    # Split-K head projection: zero-seed mixes_raw, then dispatch
-    # NUM_T_TILES * LINEAR_OK tasks -- each owns one token-tile and one 1/OK
-    # K-slice, reduces it, and atomic-adds its [T_TILE, HC_PAD] FP32 partial.
-    # Token tiles touch disjoint rows, so only the LINEAR_OK tasks per row block
-    # contend; the seed write -> atomic RMW WAW dependency orders seed first.
-    for tc in pl.spmd(t_linear // T_TILE, name_hint="hc_head_seed", allow_early_resolve=True):
-        ts0 = tc * T_TILE
-        mixes_raw[ts0 : ts0 + T_TILE, 0:HC_PAD] = pl.full(
-            [T_TILE, HC_PAD], dtype=pl.FP32, value=0.0
-        )
-
+    # Split-K head projection: each task owns one token tile and one K slice,
+    # and publishes to a disjoint partial-buffer row range.
     for task in pl.spmd((t_linear // LINEAR_T_TILE) * LINEAR_OK, name_hint="hc_head_linear", allow_early_resolve=True):
         t0 = (task // LINEAR_OK) * LINEAR_T_TILE
-        k_base = (task % LINEAR_OK) * LINEAR_K_PER_SPLIT
+        linear_split = task % LINEAR_OK
+        k_base = linear_split * LINEAR_K_PER_SPLIT
         t_rows = pl.min(LINEAR_T_TILE, t_dim - t0)  # last row-block spills past t_dim; valid_shape zero-fills the tail
         acc = pl.create_tensor([LINEAR_T_TILE, HC_PAD], dtype=pl.FP32)
         for kb in pl.pipeline(0, LINEAR_CHUNKS_PER_SPLIT, stage=2):
@@ -137,7 +128,31 @@ def hc_head(
                 acc = pl.matmul(x_linear_chunk, w_chunk, b_trans=True, out_dtype=pl.FP32)
             else:
                 acc = pl.matmul_acc(acc, x_linear_chunk, w_chunk, b_trans=True)
-        mixes_raw = pl.assemble(mixes_raw, acc, [t0, 0], atomic=pl.AtomicType.Add)
+        mixes_partials = pl.assemble(
+            mixes_partials,
+            acc,
+            [linear_split * T_MAX + t0, 0],
+        )
+
+    # Preserve a fixed reduction tree: each split accumulated its K chunks in
+    # ascending order above, and this scope adds split totals from 0 to OK-1.
+    for reduce_idx in pl.spmd(
+        t_linear // LINEAR_T_TILE,
+        name_hint="hc_head_linear_reduce",
+        allow_early_resolve=True,
+    ):
+        t0 = reduce_idx * LINEAR_T_TILE
+        total = mixes_partials[t0 : t0 + LINEAR_T_TILE, 0:HC_PAD]
+        for linear_split in pl.range(1, LINEAR_OK):
+            partial_t0 = linear_split * T_MAX + t0
+            total = pl.add(
+                total,
+                mixes_partials[
+                    partial_t0 : partial_t0 + LINEAR_T_TILE,
+                    0:HC_PAD,
+                ],
+            )
+        mixes_raw = pl.assemble(mixes_raw, total, [t0, 0])
 
     # Fused scale + sigmoid + transpose -> pre_t in one scope (one dispatch).
     # Per TRANSPOSE_T_TILE block: row-scale the raw projection by inv_rms, apply
@@ -211,10 +226,15 @@ def golden_hc_head(tensors):
     mix_cols = []
     for h in range(HC_MULT):
         mix_col = torch.zeros(T, 1, dtype=torch.float32)
-        for k0 in range(0, HC_DIM, LINEAR_K_CHUNK):
-            x_chunk = x_flat_2d[:, k0:k0 + LINEAR_K_CHUNK]
-            w_chunk = hc_head_fn[h:h + 1, k0:k0 + LINEAR_K_CHUNK]
-            mix_col += (x_chunk * w_chunk).sum(dim=1, keepdim=True)
+        for linear_split in range(LINEAR_OK):
+            split_col = torch.zeros(T, 1, dtype=torch.float32)
+            split_start = linear_split * LINEAR_K_PER_SPLIT
+            split_end = split_start + LINEAR_K_PER_SPLIT
+            for k0 in range(split_start, split_end, LINEAR_K_CHUNK):
+                x_chunk = x_flat_2d[:, k0:k0 + LINEAR_K_CHUNK]
+                w_chunk = hc_head_fn[h:h + 1, k0:k0 + LINEAR_K_CHUNK]
+                split_col += (x_chunk * w_chunk).sum(dim=1, keepdim=True)
+            mix_col += split_col
         mix_cols.append(mix_col * rsqrt)
     mixes = torch.cat(mix_cols, dim=1).reshape(T, HC_MULT)
 

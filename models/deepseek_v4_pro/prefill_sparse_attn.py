@@ -76,6 +76,7 @@ ROPE_OUT_TOK_TILE = T // 2
 ROPE_TILE = 16
 ROPE_INTERLEAVE_TILE = 2 * ROPE_TILE
 A_K_TILE = 256                       # proj_a cube K-frag: K*2B = 512B = one a2a3 L2 line (128 wastes half)
+A_CUBE_ACC_K = 16                    # BF16 Cube MAD inner group before the FP32 accumulator is rounded
 A_N_TILE = 128
 A_T_TILE = 32                        # token tile for the proj_a/proj_b vec post-process
 B_K_TILE = 256
@@ -100,6 +101,7 @@ PB_ACT_NREG = D // PROJ_B_ACT_N_TILE
 PB_ACT_TBLKS = T // PROJ_B_ACT_TBLK
 assert T % QUANT_TOKEN_TILE == 0
 assert O_GROUP_IN % A_K_TILE == 0    # proj_a_mm peels 0:A_K_TILE then covers O_GROUP_IN // A_K_TILE chunks
+assert A_K_TILE % A_CUBE_ACC_K == 0
 assert O_LORA % B_K_TILE == 0        # proj_b_mm peels 0:B_K_TILE then covers O_LORA // B_K_TILE chunks
 assert D % PROJ_B_MM_N_TILE == 0 and D % PROJ_B_D_CHUNK == 0 and PROJ_B_D_CHUNK % PROJ_B_MM_N_TILE == 0
 assert T % NUM_QUANT_T_CHUNKS == 0 and QUANT_T_CHUNK % QUANT_TOKEN_TILE == 0
@@ -509,6 +511,55 @@ def _int8_quant_per_row(x):
     scale_dequant = 1.0 / scale_quant
     return out_i8.reshape_as(x), scale_dequant.reshape(*x.shape[:-1], 1)
 
+
+def _golden_a5_cube_bf16_matmul(lhs, rhs):
+    """Return ``lhs @ rhs.T`` in the A5 BF16 Cube MAD reduction order."""
+    import torch
+
+    m_dim, k_dim = lhs.shape
+    n_dim, rhs_k_dim = rhs.shape
+    assert k_dim == rhs_k_dim and k_dim % A_CUBE_ACC_K == 0
+
+    k_groups = k_dim // A_CUBE_ACC_K
+    k_group_block = 64
+    n_block = 128
+    x_groups = lhs.reshape(m_dim, k_groups, A_CUBE_ACC_K).double()
+    w_groups = rhs.reshape(n_dim, k_groups, A_CUBE_ACC_K).double()
+    out = torch.zeros(m_dim, n_dim, dtype=torch.float32)
+    for n0 in range(0, n_dim, n_block):
+        n1 = min(n0 + n_block, n_dim)
+        acc = torch.zeros(m_dim, n1 - n0, dtype=torch.float32)
+        for group0 in range(0, k_groups, k_group_block):
+            group1 = min(group0 + k_group_block, k_groups)
+            # FP64 prevents Torch from rounding or reassociating within the exact
+            # 16-product BF16 group; it does not model FP64 device arithmetic.
+            group_dots = torch.einsum(
+                "mgk,ngk->mng",
+                x_groups[:, group0:group1],
+                w_groups[n0:n1, group0:group1],
+            )
+            for group in range(group1 - group0):
+                # A5 rounds the updated accumulator once after each K16 group.
+                acc = (acc.double() + group_dots[:, :, group]).float()
+        out[:, n0:n1] = acc
+    return out
+
+
+def _golden_a5_cube_proj_a(o_model, wo_a):
+    """Apply the A5 BF16 Cube reference independently to each proj_a group."""
+    import torch
+
+    t_dim, model_groups, group_in = o_model.shape
+    weight_groups, o_lora, weight_group_in = wo_a.shape
+    assert model_groups == weight_groups and group_in == weight_group_in
+
+    out = torch.zeros(t_dim, model_groups, o_lora, dtype=torch.float32)
+    for model_group in range(model_groups):
+        out[:, model_group] = _golden_a5_cube_bf16_matmul(
+            o_model[:, model_group], wo_a[model_group]
+        )
+    return out
+
 def golden_prefill_sparse_attn(tensors):
     """Self-contained torch reference for the cache-first sparse-attn entry."""
     import torch
@@ -553,7 +604,7 @@ def golden_prefill_sparse_attn(tensors):
         oi = None
         for tile_start in range(0, kv_rows.shape[0], PREFILL_ATTN_TILE):
             kv_tile = kv_rows[tile_start : tile_start + PREFILL_ATTN_TILE]
-            scores = (q[t] @ kv_tile.T) * SOFTMAX_SCALE
+            scores = _golden_a5_cube_bf16_matmul(q[t], kv_tile) * SOFTMAX_SCALE
             cur_mi = scores.max(dim=-1, keepdim=True).values
             exp_scores = torch.exp(scores - cur_mi)
             cur_li = exp_scores.sum(dim=-1, keepdim=True)
@@ -586,7 +637,8 @@ def golden_prefill_sparse_attn(tensors):
     o = torch.cat([o[..., :NOPE_DIM], o_rope], dim=-1).to(torch.bfloat16)
 
     o_model = o.float().view(T, O_GROUPS, O_GROUP_IN)
-    o_r = torch.einsum("tgd,grd->tgr", o_model, wo_a)   # [T, G, O_LORA]
+    o_r = torch.zeros(T, O_GROUPS, O_LORA, dtype=torch.float32)
+    o_r[:num_tokens] = _golden_a5_cube_proj_a(o_model[:num_tokens], wo_a)
     # PER-GROUP INT8 activation quant (one amax per O_LORA group, not per full row) --
     # mirrors the decoupled proj_a[g]->quant[g]->proj_b[g] kernel pipeline. Each group's
     # INT32 partial is dequantized by its OWN per-row act scale (the per-group scale cannot

@@ -103,7 +103,14 @@ def golden_rms_norm(x, norm_w):
 
     x = x.float()
     norm_w = norm_w.float()
-    inv = torch.rsqrt(x.square().mean(-1, keepdim=True) + EPS)
+    # Mirror rms_norm's loop-carried FP32 reduction exactly.  A monolithic
+    # torch.mean uses a different reduction tree and can cross a BF16 rounding
+    # boundary even though both expressions are algebraically equivalent.
+    sq_sum = torch.zeros(*x.shape[:-1], 1, dtype=torch.float32)
+    for d0 in range(0, D, D_TILE):
+        x_chunk = x[..., d0:d0 + D_TILE]
+        sq_sum += (x_chunk * x_chunk).sum(dim=-1, keepdim=True)
+    inv = torch.rsqrt(sq_sum * (1.0 / D) + EPS)
     return (x * inv * norm_w).to(torch.bfloat16)
 
 
