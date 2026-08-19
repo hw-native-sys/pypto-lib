@@ -522,7 +522,37 @@ def l2_decode_fwd_mtp(
     )
     x_hc = pl.create_tensor([T, HC_MULT, D], dtype=pl.FP32)
     pack_x_hc(input_ids, embed_weight, x_hc)
-    decode_fwd(hc_attn_fn, hc_attn_scale, hc_attn_base, attn_norm_w, wq_a, wq_b, wq_b_scale, wkv, gamma_cq, gamma_ckv, kv_cache, attn_sink, wo_a, wo_b, wo_b_scale, hca_cmp_wkv, hca_cmp_wgate, hca_cmp_ape, hca_cmp_norm_w, hca_compress_state, csa_cmp_wkv, csa_cmp_wgate, csa_cmp_ape, csa_cmp_norm_w, csa_compress_state, csa_idx_wq_b, csa_idx_wq_b_scale, csa_weights_proj, csa_hadamard_idx, csa_inner_wkv, csa_inner_wgate, csa_inner_ape, csa_inner_norm_w, csa_inner_compress_state, cmp_kv, idx_kv_cache, idx_kv_scale, hc_ffn_fn, hc_ffn_scale, hc_ffn_base, norm_w, gate_w, gate_bias, tid2eid, routed_w1, routed_w1_scale, routed_w3, routed_w3_scale, routed_w2, routed_w2_scale, shared_w1, shared_w1_scale, shared_w3, shared_w3_scale, shared_w2, shared_w2_scale, freqs_cos, freqs_sin, x_hc, position_ids, kv_seq_lens, hca_compress_state_block_table, csa_compress_state_block_table, csa_inner_compress_state_block_table, cmp_block_table, idx_block_table, ori_slot_mapping, swa_slot_mapping, swa_indices, swa_lens, hca_cmp_slot_mapping, hca_state_slot_mapping, csa_cmp_slot_mapping, csa_idx_slot_mapping, csa_state_slot_mapping, csa_inner_state_slot_mapping, input_ids, hc_head_fn, hc_head_scale, hc_head_base, final_norm_w, lm_head_weight, logit_row_indices, pre_hc_hidden_out, hidden_out, logits, sampled_ids, recv_meta, recv_x, recv_aux, recv_route, arrived, data_arrived, routed_y_buf, combine_arrived, lm_head_hidden_window, lm_head_hidden_done, lm_head_logits_window, lm_head_logits_done, num_tokens_per_owner, rank)
+    decode_fwd(
+        hc_attn_fn, hc_attn_scale, hc_attn_base,
+        attn_norm_w, wq_a, wq_b, wq_b_scale,
+        wkv, gamma_cq, gamma_ckv,
+        kv_cache,
+        attn_sink, wo_a, wo_b, wo_b_scale,
+        hca_cmp_wkv, hca_cmp_wgate, hca_cmp_ape, hca_cmp_norm_w, hca_compress_state,
+        csa_cmp_wkv, csa_cmp_wgate, csa_cmp_ape, csa_cmp_norm_w, csa_compress_state,
+        csa_idx_wq_b, csa_idx_wq_b_scale, csa_weights_proj, csa_hadamard_idx,
+        csa_inner_wkv, csa_inner_wgate, csa_inner_ape, csa_inner_norm_w, csa_inner_compress_state,
+        cmp_kv, idx_kv_cache, idx_kv_scale,
+        hc_ffn_fn, hc_ffn_scale, hc_ffn_base,
+        norm_w, gate_w, gate_bias, tid2eid,
+        routed_w1, routed_w1_scale, routed_w3, routed_w3_scale, routed_w2, routed_w2_scale,
+        shared_w1, shared_w1_scale, shared_w3, shared_w3_scale, shared_w2, shared_w2_scale,
+        freqs_cos, freqs_sin,
+        x_hc, position_ids, kv_seq_lens,
+        hca_compress_state_block_table, csa_compress_state_block_table, csa_inner_compress_state_block_table,
+        cmp_block_table, idx_block_table,
+        ori_slot_mapping, swa_slot_mapping, swa_indices, swa_lens,
+        hca_cmp_slot_mapping, hca_state_slot_mapping,
+        csa_cmp_slot_mapping, csa_idx_slot_mapping, csa_state_slot_mapping, csa_inner_state_slot_mapping,
+        input_ids,
+        hc_head_fn, hc_head_scale, hc_head_base, final_norm_w,
+        lm_head_weight, logit_row_indices,
+        pre_hc_hidden_out, hidden_out, logits, sampled_ids,
+        recv_meta, recv_x, recv_aux, recv_route,
+        arrived, data_arrived, routed_y_buf, combine_arrived,
+        lm_head_hidden_window, lm_head_hidden_done, lm_head_logits_window, lm_head_logits_done,
+        num_tokens_per_owner, rank,
+    )
     verify_and_pack_mtp_tokens(
         input_ids, position_ids, sampled_ids,
         mtp_tail_token_ids, mtp_tail_positions, mtp_tail_slot_ids,

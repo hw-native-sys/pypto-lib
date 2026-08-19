@@ -20,7 +20,7 @@ import pypto.language as pl
 import pypto.language.distributed as pld
 from pypto.ir.distributed_compiled_program import DistributedConfig
 
-from config import DECODE_TOKENS, FLASH as M
+from config import DECODE_TOKENS, FLASH as M, FP32_NEG_INF
 
 
 T_DYN = pl.dynamic("LM_HEAD_T_DYN")
@@ -356,7 +356,7 @@ def greedy_sample(
     logits_grid = pl.reshape(logits, [MAX_LOGIT_ROWS * GREEDY_GRID_ROWS, GREEDY_ROW_WIDTH])
     for row in pl.spmd(MAX_LOGIT_ROWS, name_hint="lm_head_greedy_sample"):
         row_base = row * GREEDY_GRID_ROWS
-        running_max = pl.full([GREEDY_BLOCK_ROWS, GREEDY_ROW_WIDTH], dtype=pl.FP32, value=-3.402823e38)
+        running_max = pl.full([GREEDY_BLOCK_ROWS, GREEDY_ROW_WIDTH], dtype=pl.FP32, value=FP32_NEG_INF)
         running_base = pl.full([GREEDY_BLOCK_ROWS, GREEDY_ROW_WIDTH], dtype=pl.INT32, value=0)
         for block in pl.range(GREEDY_GRID_ROWS // GREEDY_BLOCK_ROWS):
             block_row = row_base + block * GREEDY_BLOCK_ROWS
