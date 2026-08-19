@@ -83,6 +83,25 @@ runs:
         echo "pypto-lib under test: $(git -C "$PYPTO_SERVING_CHECKOUT/pypto-lib" rev-parse HEAD)"
         echo "pypto-serving base:  $(git -C "$PYPTO_SERVING_CHECKOUT" rev-parse HEAD)"
 
+    - name: Verify the pinned pypto is what serving will run
+      # The serving jobs get their pypto from setup-ci-job like every other job,
+      # so they inherit PYPTO_PIN — but they are the only ones that then run
+      # someone else's test suite against it, and they are the most expensive
+      # thing to discover a wrong toolchain in (8 cards, ~30 min). Assert the
+      # build tree is still at the pin before spending that.
+      shell: bash
+      run: |
+        if [ -z "${PYPTO_PIN:-}" ] || [ -z "${PYPTO_SRC:-}" ]; then
+          echo "::error::PYPTO_PIN/PYPTO_SRC are unset — run setup-ci-job first"
+          exit 1
+        fi
+        actual=$(git -C "$PYPTO_SRC" rev-parse HEAD)
+        if [ "$actual" != "$PYPTO_PIN" ]; then
+          echo "::error::serving would run pypto $actual, not the pinned $PYPTO_PIN"
+          exit 1
+        fi
+        echo "serving runs pypto $actual (pinned)"
+
     - name: Install pypto-serving test dependencies
       shell: bash
       working-directory: ${{ inputs.pypto-lib-checkout-path }}

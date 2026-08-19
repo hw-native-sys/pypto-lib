@@ -350,6 +350,9 @@ runs:
           echo "PTOAS_ARCH=$PTOAS_ARCH"
           echo "PTOAS_SHA256=$PTOAS_SHA256"
           echo "PTO_ISA_COMMIT=$(tr -d '[:space:]' < "$PYPTO_SRC/runtime/pto_isa.pin")"
+          # Exported so later steps in the same job can assert what they build
+          # on — the pypto-serving action checks it before spending a device.
+          echo "PYPTO_PIN=$PYPTO_PIN"
         } >> "$GITHUB_ENV"
 
     - name: Check NPU
