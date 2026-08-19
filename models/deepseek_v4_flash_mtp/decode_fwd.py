@@ -89,12 +89,7 @@ from decode_csa import (
     build_tensor_specs as build_csa_tensor_specs,
 )
 from config import DECODE_START_POS, FLASH as MODEL_CONFIG
-from decode_prepare import (
-    N_CACHE_GROUPS,
-    VOCAB_DYN as EMBED_VOCAB_DYN,
-    build_decode_metadata,
-    pack_x_hc,
-)
+from decode_prepare import N_CACHE_GROUPS, VOCAB_DYN as EMBED_VOCAB_DYN, build_decode_metadata, pack_x_hc
 from moe import (
     AUX_PAD,
     IDX_PAD,
@@ -162,24 +157,15 @@ SHARED_NAMES = [
 HC_HEAD_NAMES = ["hc_head_fn", "hc_head_scale", "hc_head_base"]
 FINAL_NORM_NAMES = ["final_norm_w"]
 
-# Paged KV / compressor-state pools. These use fixed global physical capacities
-# per FWD layer (independent from B), so
-# randn-ing every layer's pool independently dominates the "generate inputs"
-# stage. Their content is smoke-only (decode_fwd has no golden_fn), so we randn a
-# single layer's pool and tile it across layers instead: each layer keeps the
-# full per-block diversity its standalone attention init produces (the indexer's
-# top-k block selection still sees varied blocks) while the randn work drops
-# ~layer_count x. Weights / gate / routing metadata are unaffected.
+# Paged KV / compressor-state pools: randn-ed for one layer and tiled across the
+# rest. Content is smoke-only -- decode_fwd has no golden_fn.
 CACHE_POOL_NAMES = frozenset({
     "kv_cache", "cmp_kv", "idx_kv_cache", "idx_kv_scale",
     "csa_compress_state", "csa_inner_compress_state", "hca_compress_state",
 })
 
-# Static weight parameters to keep device-resident, sharded per decode rank.
-# These are leading-dim-stacked ``[N_RANKS, *tail]`` tensors consumed as
-# ``weight[r]`` on ``device=r``. ``lm_head_weight`` is built separately below,
-# but follows the same layout: every DP rank carries a copy of vocab shard
-# ``r % LM_HEAD_TP_SIZE`` and its rank-local slice is kept resident.
+# Device-resident static weights, leading-dim-stacked ``[N_RANKS, *tail]`` and
+# consumed as ``weight[r]`` on ``device=r``; lm_head_weight uses the same layout.
 RESIDENT_WEIGHT_NAMES = frozenset(
     [
         n
@@ -1097,9 +1083,8 @@ def l3_decode_fwd(
         )
 
 # ---------------------------------------------------------------------------
-# Fixtures (kernel-only smoke path: no golden).  Stacked weights reuse each
-# layer's standalone attention/moe init; routing metadata, slot mappings and
-# tid2eid carry meaningful values.
+# Fixtures (kernel-only smoke path: no golden). Stacked weights reuse each
+# layer's standalone attention/moe init.
 # ---------------------------------------------------------------------------
 def _make_layer_stacked_spec(name, base_specs, layer_count=FWD_NUM_LAYERS):
     import torch
@@ -1736,22 +1721,17 @@ def build_tensor_specs(
         else:
             raise ValueError(f"unclassified decode_fwd spec: {name}")
 
-    # Shard the static weight parameters per rank and keep them device-resident
-    # (child_memory): each shard uploaded once to its card and reused across
-    # dispatches, skipping per-dispatch H2D/D2H. RESIDENT_WEIGHT_NAMES are static
-    # weights; CACHE_POOL_NAMES are the KV/state caches (the written kv_cache is
-    # also is_output=True and read back at the end via RESIDENT_CACHE_OUTPUT_NAMES).
+    # Keep per-rank shards device-resident (child_memory): uploaded once per card
+    # and reused across dispatches. RESIDENT_WEIGHT_NAMES are static weights;
+    # CACHE_POOL_NAMES are the KV/state caches.
     for spec in specs:
         if spec.name in RESIDENT_WEIGHT_NAMES or spec.name in CACHE_POOL_NAMES:
             spec.resident = "stacked"
 
     specs.append(TensorSpec("pre_hc_hidden_out", [N_RANKS, T, HC_MULT, D], torch.float32, is_output=True))
     specs.append(TensorSpec(
-        "lm_head_weight",
-        [N_RANKS, VOCAB_PER_TP, D],
-        torch.bfloat16,
-        init_value=init_lm_head_weight,
-        resident="stacked",
+        "lm_head_weight", [N_RANKS, VOCAB_PER_TP, D], torch.bfloat16,
+        init_value=init_lm_head_weight, resident="stacked",
     ))
     specs.append(TensorSpec("hidden_out", [N_RANKS, T, D], torch.bfloat16, is_output=True))
     specs.append(TensorSpec("logits", [N_RANKS, MAX_LOGIT_ROWS, LM_HEAD_VOCAB], torch.float32, is_output=True))

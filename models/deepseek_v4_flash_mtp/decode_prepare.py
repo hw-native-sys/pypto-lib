@@ -6,13 +6,7 @@
 # INCLUDING BUT NOT LIMITED TO NON-INFRINGEMENT, MERCHANTABILITY, OR FITNESS FOR A PARTICULAR PURPOSE.
 # See LICENSE in the root of the software repository for the full text of the License.
 # -----------------------------------------------------------------------------------------------------------
-"""Device-side decode preamble for DeepSeek-V4: metadata lowering and input packing.
-
-Everything decode runs before layer 0 -- paged slot mappings and visible-row
-metadata, then the embedding and MTP hidden-state packing that feed it.
-
-``utils`` holds the host-side torch counterpart of the metadata lowering.
-"""
+"""Device-side DeepSeek-V4 decode preamble: paged-cache metadata lowering and input packing."""
 
 import pypto.language as pl
 
@@ -29,10 +23,18 @@ from config import (
 )
 
 
+# Dynamic shape variables.
+VOCAB_DYN = pl.dynamic("PACK_X_HC_VOCAB_DYN")
+
+# model config
 B = DECODE_BATCH
 S = DECODE_SEQ
 T = B * S
+D = M.hidden_size
+HC_MULT = M.hc_mult
 WIN = M.sliding_window
+
+# paged block-table extents, one per cache
 ORI_TABLE_MAX_BLOCKS = KV_ORI_TABLE_MAX_BLOCKS
 CMP_MAX_BLOCKS = KV_CMP_MAX_BLOCKS
 IDX_MAX_BLOCKS = IDX_CACHE_MAX_BLOCKS
@@ -40,6 +42,7 @@ HCA_STATE_MAX_BLOCKS = 2048
 CSA_STATE_MAX_BLOCKS = 4096
 CSA_INNER_STATE_MAX_BLOCKS = 4096
 
+# block_counts columns
 GROUP_ORI = 0
 GROUP_CMP = 1
 GROUP_IDX = 2
@@ -48,17 +51,10 @@ GROUP_CSA_STATE = 4
 GROUP_CSA_INNER_STATE = 5
 N_CACHE_GROUPS = 6
 
-VOCAB_DYN = pl.dynamic("PACK_X_HC_VOCAB_DYN")
-
-D = M.hidden_size
-HC_MULT = M.hc_mult
-
+# tiling
 X_HC_HIDDEN_TILE = 512
 MTP_HIDDEN_TILE = 1024
 SPMD_BLOCKS = 48
-
-assert D % X_HC_HIDDEN_TILE == 0
-assert D % MTP_HIDDEN_TILE == 0
 
 
 @pl.jit.inline
@@ -291,28 +287,17 @@ def pack_x_hc(
 ) -> pl.Tensor[[T, HC_MULT, D], pl.FP32]:
     x_hc_flat = pl.reshape(x_hc, [T * HC_MULT, D])
     for block in pl.spmd(SPMD_BLOCKS, name_hint="pack_x_hc"):
-        for work_idx in pl.range(
-            block,
-            T * (D // X_HC_HIDDEN_TILE),
-            SPMD_BLOCKS,
-        ):
+        for work_idx in pl.range(block, T * (D // X_HC_HIDDEN_TILE), SPMD_BLOCKS):
             token_idx = work_idx // (D // X_HC_HIDDEN_TILE)
             hidden_offset = (work_idx % (D // X_HC_HIDDEN_TILE)) * X_HC_HIDDEN_TILE
             token_id = pl.tensor.read(input_ids, [token_idx])
             token_row = pl.cast(token_id, target_type=pl.INDEX)
-            hidden_chunk = pl.cast(
-                embed_weight[
-                    token_row : token_row + 1,
-                    hidden_offset : hidden_offset + X_HC_HIDDEN_TILE,
-                ],
-                target_type=pl.FP32,
-            )
+            embed_chunk = embed_weight[token_row : token_row + 1, hidden_offset : hidden_offset + X_HC_HIDDEN_TILE]
+            hidden_chunk = pl.cast(embed_chunk, target_type=pl.FP32)
+            # Every HC lane of a token starts from the same embedding row.
             for hc_idx in pl.range(HC_MULT):
                 x_hc_row = token_idx * HC_MULT + hc_idx
-                x_hc_flat[
-                    x_hc_row : x_hc_row + 1,
-                    hidden_offset : hidden_offset + X_HC_HIDDEN_TILE,
-                ] = hidden_chunk
+                x_hc_flat[x_hc_row : x_hc_row + 1, hidden_offset : hidden_offset + X_HC_HIDDEN_TILE] = hidden_chunk
     return x_hc
 
 
@@ -326,11 +311,7 @@ def pack_mtp_hidden(
     packed_hidden: pl.Tensor[[T, HC_MULT, D], pl.FP32],
 ) -> pl.Tensor[[T, HC_MULT, D], pl.FP32]:
     for block in pl.spmd(SPMD_BLOCKS, name_hint="pack_mtp_hidden"):
-        for work_idx in pl.range(
-            block,
-            B * HC_MULT * (D // MTP_HIDDEN_TILE),
-            SPMD_BLOCKS,
-        ):
+        for work_idx in pl.range(block, B * HC_MULT * (D // MTP_HIDDEN_TILE), SPMD_BLOCKS):
             batch_idx = work_idx // (HC_MULT * (D // MTP_HIDDEN_TILE))
             local_idx = work_idx % (HC_MULT * (D // MTP_HIDDEN_TILE))
             hc_idx = local_idx // (D // MTP_HIDDEN_TILE)
@@ -343,50 +324,37 @@ def pack_mtp_hidden(
                 accepted_count = pl.read(accepted_counts, [batch_idx])
                 last_row = row0 + pl.cast(accepted_count, target_type=pl.INDEX) - 1
                 last_hidden = main_pre_hc_hidden[
-                    last_row : last_row + 1,
-                    hc_idx : hc_idx + 1,
-                    hidden_offset : hidden_offset + MTP_HIDDEN_TILE,
+                    last_row : last_row + 1, hc_idx : hc_idx + 1, hidden_offset : hidden_offset + MTP_HIDDEN_TILE
                 ]
                 slot = pl.cast(slot_raw, target_type=pl.INDEX)
+                # Rejected draft replays the previous step's tail out of the pool.
                 if accepted_count == 1:
-                    packed_hidden[
-                        row0 : row0 + 1,
-                        hc_idx : hc_idx + 1,
-                        hidden_offset : hidden_offset + MTP_HIDDEN_TILE,
-                    ] = tail_pre_hc_pool[
-                        slot : slot + 1,
-                        hc_idx : hc_idx + 1,
-                        hidden_offset : hidden_offset + MTP_HIDDEN_TILE,
+                    pool_hidden = tail_pre_hc_pool[
+                        slot : slot + 1, hc_idx : hc_idx + 1, hidden_offset : hidden_offset + MTP_HIDDEN_TILE
                     ]
+                    packed_hidden[
+                        row0 : row0 + 1, hc_idx : hc_idx + 1, hidden_offset : hidden_offset + MTP_HIDDEN_TILE
+                    ] = pool_hidden
                 else:
-                    packed_hidden[
-                        row0 : row0 + 1,
-                        hc_idx : hc_idx + 1,
-                        hidden_offset : hidden_offset + MTP_HIDDEN_TILE,
-                    ] = main_pre_hc_hidden[
-                        row0 : row0 + 1,
-                        hc_idx : hc_idx + 1,
-                        hidden_offset : hidden_offset + MTP_HIDDEN_TILE,
+                    main_hidden = main_pre_hc_hidden[
+                        row0 : row0 + 1, hc_idx : hc_idx + 1, hidden_offset : hidden_offset + MTP_HIDDEN_TILE
                     ]
+                    packed_hidden[
+                        row0 : row0 + 1, hc_idx : hc_idx + 1, hidden_offset : hidden_offset + MTP_HIDDEN_TILE
+                    ] = main_hidden
                 packed_hidden[
-                    row1 : row1 + 1,
-                    hc_idx : hc_idx + 1,
-                    hidden_offset : hidden_offset + MTP_HIDDEN_TILE,
+                    row1 : row1 + 1, hc_idx : hc_idx + 1, hidden_offset : hidden_offset + MTP_HIDDEN_TILE
                 ] = last_hidden
                 tail_pre_hc_pool[
-                    slot : slot + 1,
-                    hc_idx : hc_idx + 1,
-                    hidden_offset : hidden_offset + MTP_HIDDEN_TILE,
+                    slot : slot + 1, hc_idx : hc_idx + 1, hidden_offset : hidden_offset + MTP_HIDDEN_TILE
                 ] = last_hidden
             else:
                 for seq_idx in pl.range(S):
-                    packed_hidden[
-                        row0 + seq_idx : row0 + seq_idx + 1,
-                        hc_idx : hc_idx + 1,
-                        hidden_offset : hidden_offset + MTP_HIDDEN_TILE,
-                    ] = fallback_hidden[
-                        seq_idx : seq_idx + 1,
-                        hc_idx : hc_idx + 1,
-                        hidden_offset : hidden_offset + MTP_HIDDEN_TILE,
+                    fallback_row = fallback_hidden[
+                        seq_idx : seq_idx + 1, hc_idx : hc_idx + 1, hidden_offset : hidden_offset + MTP_HIDDEN_TILE
                     ]
+                    pack_row = row0 + seq_idx
+                    packed_hidden[
+                        pack_row : pack_row + 1, hc_idx : hc_idx + 1, hidden_offset : hidden_offset + MTP_HIDDEN_TILE
+                    ] = fallback_row
     return packed_hidden

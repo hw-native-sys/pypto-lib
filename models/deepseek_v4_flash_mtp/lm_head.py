@@ -7,23 +7,11 @@
 # See LICENSE in the root of the software repository for the full text of the License.
 # -----------------------------------------------------------------------------------------------------------
 # ci: devices=2  # CI: 2-card run; borrows 2 cards via task-submit --device-num
-"""DeepSeek-V4 LM head projection with DP-owned hidden and TP vocab shards.
+"""DeepSeek-V4 LM head: dispatch hidden rows, project against a TP vocab shard, combine full-vocab logits.
 
-Hidden states must already have passed the final RMSNorm.
-
-The DP world is ``--dp`` groups of ``--tp`` TP ranks each. Every card is both an owner and
-a TP rank: it holds vocab shard ``rank % TP_SIZE`` and serves only its own group,
-so every ``peer`` is ``group_base + tp_rank``.
-
-Dispatch all-gathers the hidden rows, the matmul projects every group row against
-this card's vocab shard, and combine all-to-alls the logits so each owner ends up
-with its own rows over the full vocabulary. Both collectives are a push (peer
-``pld.tensor.put``) plus a folded notify, a wait-only scope, and a parallel
-gather; the barrier's ``expected`` therefore scales with the pushing scope's
-block count.
-
-Per-card cost tracks ``VOCAB_PER_TP``, not the DP world size: the matmul M extent
-is always ``TP_SIZE * MAX_LOGIT_ROWS``.
+Hidden states must already have passed the final RMSNorm. Every card is both an
+owner and a TP rank: it holds vocab shard ``rank % TP_SIZE`` and serves only its
+own group, so every peer is ``group_base + tp_rank``.
 """
 
 import sys
@@ -37,11 +25,11 @@ from config import DECODE_TOKENS, FLASH as M
 
 T_DYN = pl.dynamic("LM_HEAD_T_DYN")
 
-# Model
+# model config
 D = M.hidden_size
 VOCAB = M.vocab_size
 
-# Parallelism. Static in the frontend, so both worlds are parsed off argv here.
+# Parallelism, parsed off argv: the frontend needs both worlds static.
 _TP_CHOICES = (2, 4, 8, 16)
 _DP_CHOICES = (1, 2, 4, 8, 16)
 _TP_DEFAULT = 2
@@ -57,92 +45,62 @@ def _parse_int_argv(name, default=None):
 
 
 TP_SIZE: int = _parse_int_argv("--tp") or _TP_DEFAULT
-# --dp sizes the standalone l3_lm_head fixture: how many DP groups it builds.
-# The kernel itself carries no DP extent, so composed callers never pass it.
+# DP groups built by the l3_lm_head fixture; the kernel carries no DP extent.
 DP_SIZE: int = _parse_int_argv("--dp") or 1
-VOCAB_PER_TP = VOCAB // TP_SIZE
 WORLD_SIZE = TP_SIZE * DP_SIZE
+VOCAB_PER_TP = VOCAB // TP_SIZE
+# AIV lanes per AICore; owners shard across them to keep every push and notify single.
+AIV_LANES = 2
+OWNER_PAIRS = TP_SIZE // AIV_LANES
+OWNERS_PER_LANE = TP_SIZE // AIV_LANES
+FUSED_LM_HEAD_CORES = 24
+DONE_VALUE = 1
 
 # Rows. Decode specializations override DECODE_TOKENS before importing this
-# module; standalone and prefill callers retain the checked-in eight-row tile.
-# logit_row_indices picks the sources and unused rows stay zero.
+# module. logit_row_indices picks the sources; unused rows stay zero.
 MAX_LOGIT_ROWS = DECODE_TOKENS
-TEST_TOKENS = 16  # standalone fixture: hidden rows per card, > MAX_LOGIT_ROWS
 GROUP_LOGIT_ROWS = TP_SIZE * MAX_LOGIT_ROWS
+SAMPLED_IDS_PAD = 8
+TEST_TOKENS = 16  # standalone fixture: hidden rows per card, > MAX_LOGIT_ROWS
 
-# Tiling. Both matmul tiles clear the 512 B contiguous-transfer floor: the
-# K-contiguous weight slice moves FUSED_K_TILE * 2 B and the FP32 logits store
-# moves FUSED_VOCAB_TILE * 4 B.
+# tiling -- both matmul tiles clear the 512 B contiguous-transfer floor
 FUSED_K_TILE = 256
 FUSED_VOCAB_TILE = 256
 HIDDEN_GATHER_TILE = 512
 LOGITS_COMM_TILE = 2048
-# The vocab shard rarely divides the matmul tile, so the last tile is ragged. It
-# rides the same loop as every other tile rather than getting a tail case: the
-# weight load carries a valid_shape, which is what keeps the load inside
-# lm_head_weight, and the tile count is a plain ceil. The narrow extent is then
-# dropped at the crossing and re-applied at the push -- see the two comments in
-# the fused scope. logits_shards is padded to whole tiles so the last tile's
-# full-width store stays in bounds.
-VOCAB_FULL_TILES = VOCAB_PER_TP // FUSED_VOCAB_TILE
-VOCAB_LAST_TILE = VOCAB_PER_TP % FUSED_VOCAB_TILE
-VOCAB_TILES = VOCAB_FULL_TILES + (1 if VOCAB_LAST_TILE != 0 else 0)
-SHARDS_VOCAB = VOCAB_TILES * FUSED_VOCAB_TILE
-LOGITS_COMM_TAIL = VOCAB_PER_TP % LOGITS_COMM_TILE
-FUSED_LM_HEAD_CORES = 24
-# AIV lanes per AICore. A mode=NONE split region runs its body on both, so the
-# fused kernel shards owners across them to keep every push and notify single.
-AIV_LANES = 2
-OWNER_PAIRS = TP_SIZE // AIV_LANES
-# The shard cannot be sliced, so it lands whole in a GM scratch and the per-owner
-# pushes slice that scratch instead -- a plain tensor slice, which is legal.
-SHARD_ROWS = GROUP_LOGIT_ROWS // AIV_LANES
-OWNERS_PER_LANE = TP_SIZE // AIV_LANES
-DONE_VALUE = 1
-
-# Greedy sampling folds each row over a [GREEDY_BLOCK_ROWS, GREEDY_ROW_WIDTH]
-# view of it, so a reduction lands on 8 rows (32 B) rather than the 4 B
-# alloc_tile rejects, and a lane's position already encodes its column.
-# One task per row: sharding a row across more of the 48 AIV cores was measured
-# and does not pay, because the scan saturates GM bandwidth well before it runs
-# out of cores.
+# Greedy sampling scans each row as a [GREEDY_BLOCK_ROWS, GREEDY_ROW_WIDTH] grid.
+# 8 rows keeps a reduction result at 32 B; alloc_tile rejects the 4 B a [1, 1] gives.
 GREEDY_ROW_WIDTH = 808
-GREEDY_GRID_ROWS = VOCAB // GREEDY_ROW_WIDTH
 GREEDY_BLOCK_ROWS = 8
-GREEDY_NUM_BLOCKS = GREEDY_GRID_ROWS // GREEDY_BLOCK_ROWS
-GREEDY_BLOCK_SPAN = GREEDY_BLOCK_ROWS * GREEDY_ROW_WIDTH
-# 2^30: above every vocab id and clear of int32 overflow once a block base is
-# added, so a non-matching lane always loses the row_min.
-GREEDY_INDEX_SENTINEL = 1073741824
-SAMPLED_IDS_PAD = 8
 
+# Derived layout. The vocab shard rarely divides the matmul tile, so the last tile
+# is ragged: a plain ceil tile count, the weight load carries a valid_shape, and
+# logits_shards pads to whole tiles so its store stays in bounds.
+VOCAB_LAST_TILE = VOCAB_PER_TP % FUSED_VOCAB_TILE
+VOCAB_TILES = VOCAB_PER_TP // FUSED_VOCAB_TILE + (1 if VOCAB_LAST_TILE != 0 else 0)
+SHARDS_VOCAB = VOCAB_TILES * FUSED_VOCAB_TILE
+# The shard lands whole in a GM scratch; per-owner pushes slice that scratch.
+SHARD_ROWS = GROUP_LOGIT_ROWS // AIV_LANES
 # Combine blocks: one per vocab comm tile, capped at the core count; the tail tile
-# rides the block the strided loop hands it next. Raising the cap does not help --
-# the push is cross-card bandwidth bound, not core bound.
+# rides the block the strided loop hands it next.
+LOGITS_COMM_TAIL = VOCAB_PER_TP % LOGITS_COMM_TILE
 N_LOGITS_COMM_TILES = VOCAB_PER_TP // LOGITS_COMM_TILE
-LOGITS_COMM_BLOCKS = min(
-    FUSED_LM_HEAD_CORES, N_LOGITS_COMM_TILES + (1 if LOGITS_COMM_TAIL != 0 else 0)
-)
+LOGITS_COMM_BLOCKS = min(FUSED_LM_HEAD_CORES, N_LOGITS_COMM_TILES + (1 if LOGITS_COMM_TAIL != 0 else 0))
 LOGITS_TAIL_BLOCK = N_LOGITS_COMM_TILES % LOGITS_COMM_BLOCKS
+GREEDY_GRID_ROWS = VOCAB // GREEDY_ROW_WIDTH
+GREEDY_BLOCK_SPAN = GREEDY_BLOCK_ROWS * GREEDY_ROW_WIDTH
+# 2^30: above every vocab id, clear of int32 overflow once a block base is added.
+GREEDY_INDEX_SENTINEL = 1073741824
 
-assert TP_SIZE % AIV_LANES == 0, "owners must divide evenly across the AIV lanes"
-# What keeps the GM staging race-free: an UP_DOWN lane writes exactly the row
-# band it later reads, and the two lanes' bands are disjoint, so no GM address is
-# touched by both lanes and the store->push RAW stays inside one lane. That holds
-# only while a lane's row half equals the rows of the owners it serves -- assert
-# it rather than rely on the coincidence.
+# Keeps the GM staging race-free: each UP_DOWN lane writes exactly the row band it
+# later reads, and the two lanes' bands are disjoint.
 assert SHARD_ROWS == OWNERS_PER_LANE * MAX_LOGIT_ROWS, (
     "each AIV lane's shard rows must be exactly the rows of the owners it pushes"
 )
-assert D % FUSED_K_TILE == 0
-assert D % HIDDEN_GATHER_TILE == 0
-assert VOCAB % TP_SIZE == 0
-assert VOCAB % GREEDY_ROW_WIDTH == 0
-assert GREEDY_GRID_ROWS % GREEDY_BLOCK_ROWS == 0
+assert GROUP_LOGIT_ROWS % 16 == 0, "matmul M extent must be a multiple of 16"
 assert GREEDY_BLOCK_ROWS * 4 % 32 == 0, "reduction result must clear the 32 B column floor"
 assert GREEDY_ROW_WIDTH * 4 % 32 == 0, "block row must clear the 32 B row floor"
-assert VOCAB < GREEDY_INDEX_SENTINEL
-assert GROUP_LOGIT_ROWS % 16 == 0, "matmul M extent must be a multiple of 16"
+assert VOCAB < GREEDY_INDEX_SENTINEL, "sentinel must lose every row_min against a real id"
 assert TP_SIZE in _TP_CHOICES, f"--tp must be one of {_TP_CHOICES} (got {TP_SIZE})"
 assert DP_SIZE in _DP_CHOICES, f"--dp must be one of {_DP_CHOICES} (got {DP_SIZE})"
 
@@ -227,15 +185,10 @@ def lm_head(
         gk0 = gkb * HIDDEN_GATHER_TILE
         owner_hiddens[:, gk0 : gk0 + HIDDEN_GATHER_TILE] = hidden_window[:, gk0 : gk0 + HIDDEN_GATHER_TILE]
 
-    # Mixed cube + comm kernel: the cube projects a vocab tile, pl.aiv_shard
-    # carries that accumulator across the C->V edge, and pld.tensor.remote_store
-    # pushes each owner's rows to that peer's window from the vector lane. Each
-    # tile therefore goes on the wire while the cube projects the next one,
-    # instead of the whole shard waiting for the last matmul -- that overlap is
-    # the point of fusing the projection and the push into one scope.
-    # The ragged last tile is just a padded tile in the same loop: its weight load
-    # carries valid_shape, its padded columns ride to GM as don't-care, and the
-    # push is narrowed back to the real width.
+    # Mixed cube + comm kernel: the cube projects a vocab tile, pl.aiv_shard carries
+    # that accumulator across the C->V edge, and pld.tensor.remote_store pushes each
+    # owner's rows to that peer's window, so a tile goes on the wire while the cube
+    # projects the next. The ragged last tile rides the same loop as a padded tile.
     logits_shards = pl.create_tensor([GROUP_LOGIT_ROWS, SHARDS_VOCAB], dtype=pl.FP32)
     with pl.spmd(
         FUSED_LM_HEAD_CORES,
@@ -270,26 +223,16 @@ def lm_head(
                 )
                 mm_acc = pl.matmul_acc(mm_acc, mm_hidden_tile, mm_weight_tile, b_trans=True)
 
-            # Declare the columns fully valid before the C->V crossing. The
-            # boundary transports the full box and can only rebuild a narrowed
-            # column extent with the compile-time-static pto.treshape, so a
-            # runtime-valued one is rejected outright. The padded columns of the
-            # ragged tile are don't-care here: they ride to GM and the push below
-            # is what cuts them off, so they never reach a peer's window.
+            # Columns must be fully valid across the C->V crossing: the boundary
+            # transports the full box and rejects a runtime-valued column extent.
+            # The ragged tile's padding is cut off by the push below.
             mm_acc = pl.set_validshape(mm_acc, GROUP_LOGIT_ROWS, FUSED_VOCAB_TILE)
 
-            # WORKAROUND -- revert once a subview of a pl.aiv_shard result is
-            # legal (filed against ptoas). The shard cannot be sliced, so it is
-            # stored whole to GM and the per-owner pushes read slices back out.
-            # That costs an extra GM write and an extra GM read of every tile,
-            # traffic a direct shard-to-peer push would not pay at all. It is
-            # still the cheaper option: pinning the matmul M extent to one owner
-            # per lane instead -- the only slice-free alternative -- triples cube
-            # time at tp=8 and turns the fusion into a regression there.
-            #
-            # Race-free by construction: UP_DOWN gives each lane a disjoint row
-            # band that it both writes and reads, so no GM address is touched by
-            # both lanes. The SHARD_ROWS assert above is what keeps that true.
+            # WORKAROUND -- revert once a subview of a pl.aiv_shard result is legal
+            # (filed against ptoas). The shard cannot be sliced, so it is stored whole
+            # to GM and the per-owner pushes read slices back out.
+            # Race-free by construction: UP_DOWN gives each lane a disjoint row band
+            # that it both writes and reads, guarded by the SHARD_ROWS assert above.
             for aiv_id in pl.split_aiv(AIV_LANES, mode=pl.SplitMode.UP_DOWN):
                 mm_shard = pl.aiv_shard(mm_acc)
                 lane_r0 = aiv_id * SHARD_ROWS
@@ -408,73 +351,47 @@ def greedy_sample(
     sampled_ids: pl.Tensor[[MAX_LOGIT_ROWS, SAMPLED_IDS_PAD], pl.INT32],
 ):
     """Select the first maximum token id from each full-vocabulary logits row."""
-    # One streaming pass per row: fold the row into a [BLOCK_ROWS, ROW_WIDTH]
-    # accumulator that carries both the running maximum and the block that set
-    # it. A lane's column is implicit in its position, so the block index is the
-    # only positional state the pass has to keep, and the row is read from GM
-    # once instead of once per pass.
-    logits_grid = pl.reshape(
-        logits, [MAX_LOGIT_ROWS * GREEDY_GRID_ROWS, GREEDY_ROW_WIDTH]
-    )
+    # One pass per row into a [BLOCK_ROWS, ROW_WIDTH] accumulator carrying the
+    # running maximum and the block that set it; a lane's column is its position.
+    logits_grid = pl.reshape(logits, [MAX_LOGIT_ROWS * GREEDY_GRID_ROWS, GREEDY_ROW_WIDTH])
     for row in pl.spmd(MAX_LOGIT_ROWS, name_hint="lm_head_greedy_sample"):
         row_base = row * GREEDY_GRID_ROWS
-        running_max = pl.full(
-            [GREEDY_BLOCK_ROWS, GREEDY_ROW_WIDTH],
-            dtype=pl.FP32,
-            value=-3.402823e38,
-        )
-        running_base = pl.full(
-            [GREEDY_BLOCK_ROWS, GREEDY_ROW_WIDTH], dtype=pl.INT32, value=0
-        )
-        for block in pl.range(GREEDY_NUM_BLOCKS):
+        running_max = pl.full([GREEDY_BLOCK_ROWS, GREEDY_ROW_WIDTH], dtype=pl.FP32, value=-3.402823e38)
+        running_base = pl.full([GREEDY_BLOCK_ROWS, GREEDY_ROW_WIDTH], dtype=pl.INT32, value=0)
+        for block in pl.range(GREEDY_GRID_ROWS // GREEDY_BLOCK_ROWS):
             block_row = row_base + block * GREEDY_BLOCK_ROWS
-            scores = logits_grid[
-                block_row : block_row + GREEDY_BLOCK_ROWS, 0:GREEDY_ROW_WIDTH
-            ]
-            # Strict greater-than, so a lane keeps the earliest block it peaked
-            # at and the tie order stays torch.argmax's first occurrence.
-            newer = pl.cast(
-                pl.cmp(scores, running_max, cmp_type=4), target_type=pl.INT32
-            )
+            scores = logits_grid[block_row : block_row + GREEDY_BLOCK_ROWS, 0:GREEDY_ROW_WIDTH]
+            # Strict greater-than, so a lane keeps the earliest block it peaked at.
+            is_newer = pl.cmp(scores, running_max, cmp_type=4)
+            newer = pl.cast(is_newer, target_type=pl.INT32)
             running_max = pl.maximum(running_max, scores)
-            to_new = pl.neg(
-                pl.sub(running_base, pl.cast(block * GREEDY_BLOCK_SPAN, pl.INT32))
-            )
+            block_base = pl.cast(block * GREEDY_BLOCK_SPAN, pl.INT32)
+            to_new = pl.neg(pl.sub(running_base, block_base))
             running_base = pl.add(running_base, pl.mul(newer, to_new))
 
-        # Collapse the lane maxima by broadcasting them back across the block and
-        # taking a column reduction: every entry is then the row maximum, so it
-        # reads as a scalar. A scalar pl.max over the lanes is the natural
-        # spelling but miscompiles on fp32 (ptoas_bitcast).
+        # Broadcast the lane maxima back and column-reduce: every entry is then the
+        # row maximum. A scalar pl.max over the lanes miscompiles on fp32
+        # (ptoas_bitcast has no float overload).
         lane_maxima = pl.row_max(running_max)
-        lane_broadcast = pl.row_expand_add(
-            pl.full([GREEDY_BLOCK_ROWS, GREEDY_ROW_WIDTH], dtype=pl.FP32, value=0.0),
-            lane_maxima,
-        )
+        lane_zeros = pl.full([GREEDY_BLOCK_ROWS, GREEDY_ROW_WIDTH], dtype=pl.FP32, value=0.0)
+        lane_broadcast = pl.row_expand_add(lane_zeros, lane_maxima)
         best_value = pl.read(pl.col_max(lane_broadcast), [0, 0])
 
-        # Flat index of every lane still holding the row maximum, sentinel for
-        # the rest. The lane * width term is constant within a lane, so it is
-        # folded into the 8-way scalar combine instead of the ramp, which keeps
-        # the ramp a broadcast row rather than an (illegal) 2D arange.
-        column_ramp = pl.col_expand(
-            pl.full([GREEDY_BLOCK_ROWS, GREEDY_ROW_WIDTH], dtype=pl.INT32, value=0),
-            pl.arange(0, [1, GREEDY_ROW_WIDTH], dtype=pl.INT32),
-        )
+        # Flat index of every lane still at the row maximum, sentinel for the rest.
+        # The lane * width term folds into the scalar combine below, keeping the
+        # ramp a broadcast row rather than an (illegal) 2D arange.
+        ramp_zeros = pl.full([GREEDY_BLOCK_ROWS, GREEDY_ROW_WIDTH], dtype=pl.INT32, value=0)
+        column_ramp = pl.col_expand(ramp_zeros, pl.arange(0, [1, GREEDY_ROW_WIDTH], dtype=pl.INT32))
         flat_index = pl.add(running_base, column_ramp)
-        hit = pl.cast(
-            pl.cmp(running_max, best_value, cmp_type=0), target_type=pl.INT32
-        )
-        candidates = pl.add(
-            pl.mul(hit, pl.sub(flat_index, GREEDY_INDEX_SENTINEL)),
-            GREEDY_INDEX_SENTINEL,
-        )
+        is_max = pl.cmp(running_max, best_value, cmp_type=0)
+        hit = pl.cast(is_max, target_type=pl.INT32)
+        offset_index = pl.sub(flat_index, GREEDY_INDEX_SENTINEL)
+        candidates = pl.add(pl.mul(hit, offset_index), GREEDY_INDEX_SENTINEL)
         lane_indices = pl.row_min(candidates)
         best_index = pl.read(lane_indices, [0, 0])
         for lane in pl.range(1, GREEDY_BLOCK_ROWS):
-            lane_best = pl.read(lane_indices, [lane, 0]) + pl.cast(
-                lane * GREEDY_ROW_WIDTH, pl.INT32
-            )
+            lane_term = pl.cast(lane * GREEDY_ROW_WIDTH, pl.INT32)
+            lane_best = pl.read(lane_indices, [lane, 0]) + lane_term
             best_index = pl.min(best_index, lane_best)
 
         sampled_row = pl.create_tensor([1, SAMPLED_IDS_PAD], dtype=pl.INT32)
@@ -704,47 +621,6 @@ def compare_sampled_ids(actual, _expected, *, actual_outputs, **_):
     )
 
 
-@pl.jit
-def greedy_sample_test(
-    logits: pl.Tensor[[MAX_LOGIT_ROWS, VOCAB], pl.FP32],
-    sampled_ids: pl.Out[pl.Tensor[[MAX_LOGIT_ROWS, SAMPLED_IDS_PAD], pl.INT32]],
-):
-    """Standalone validation entry for greedy top-1 sampling."""
-    return greedy_sample(logits, sampled_ids)
-
-
-def build_greedy_tensor_specs():
-    import torch
-    from golden import TensorSpec
-
-    generator = torch.Generator().manual_seed(0)
-    logits = torch.randn(MAX_LOGIT_ROWS, VOCAB, generator=generator, dtype=torch.float32)
-    # Rows 0-2 pin the winner to the first, last, and an interior position.
-    logits[0, 0] = 100.0
-    logits[1, VOCAB - 1] = 100.0
-    logits[2, 65536] = 100.0
-    # Rows 3-4 duplicate the maximum; argmax must return the first occurrence.
-    logits[3, 7] = 100.0
-    logits[3, 90000] = 100.0
-    logits[4, 255] = 100.0
-    logits[4, 256] = 100.0
-    return [
-        TensorSpec("logits", [MAX_LOGIT_ROWS, VOCAB], torch.float32, init_value=logits),
-        TensorSpec(
-            "sampled_ids",
-            [MAX_LOGIT_ROWS, SAMPLED_IDS_PAD],
-            torch.int32,
-            is_output=True,
-        ),
-    ]
-
-
-def golden_greedy_sample(tensors):
-    import torch
-
-    tensors["sampled_ids"][:, 0] = torch.argmax(tensors["logits"], dim=-1).to(torch.int32)
-
-
 if __name__ == "__main__":
     import argparse
     from golden import run_jit
@@ -765,39 +641,15 @@ if __name__ == "__main__":
     parser.add_argument("--compile-only", action="store_true", default=False)
     parser.add_argument("--runtime-dir", type=str, default=None)
     parser.add_argument("--dump-passes", action="store_true", default=False)
-    parser.add_argument("--kernel", default="lm_head", choices=["lm_head", "greedy"],
-                        help="greedy runs single-card greedy_sample on its own")
     args = parser.parse_args()
 
     device_ids = [int(d) for d in args.device.split(",")]
-    required_devices = 1 if args.kernel == "greedy" else WORLD_SIZE
+    required_devices = WORLD_SIZE
     assert len(device_ids) >= required_devices, (
         f"need at least {required_devices} devices, got {device_ids}"
     )
     assert args.tp == TP_SIZE and args.dp == DP_SIZE
     assert 1 <= args.num_tokens <= TEST_TOKENS
-
-    if args.kernel == "greedy":
-        result = run_jit(
-            fn=greedy_sample_test,
-            specs=build_greedy_tensor_specs(),
-            golden_fn=golden_greedy_sample,
-            compile_only=args.compile_only,
-            runtime_dir=args.runtime_dir,
-            compile_cfg=dict(dump_passes=args.dump_passes),
-            runtime_cfg=dict(
-                platform=args.platform,
-                device_id=device_ids[0],
-                enable_l2_swimlane=args.enable_l2_swimlane,
-            ),
-            rtol=0.0,
-            atol=0.0,
-        )
-        if not result.passed:
-            if result.error:
-                print(result.error)
-            raise SystemExit(1)
-        raise SystemExit(0)
 
     fn = l3_lm_head
     specs = build_tensor_specs(args.num_tokens)

@@ -31,27 +31,12 @@ from decode_mtp import (
 # decode_fwd re-exports B and T but not the per-step token count.
 from config import DECODE_SEQ as S
 
-# Persistent per-request MTP serving state.
-#
-# The scheduler batch is transient: a request may occupy a different local
-# row on every step. The tensors below form a persistent device-side pool
-# instead. Serving passes a small descriptor, (slot_id, generation), for each
-# current batch row, and the fused step then loads the previous tail/draft,
-# verifies the draft against the main-model sample, and commits the result
-# back to the same slot. For the supported S == 2 layout, flattened rows 2*r
-# and 2*r+1 belong to local batch row r.
-
-# ``state_meta`` is a persistent pool indexed by serving-assigned state slot,
-# not by the request's transient row in the current decode batch.
-# ``valid`` means that the slot contains a completely initialized payload.  In
-# the current FIFO lifecycle it changes to 1 on first assignment and is not
-# cleared on release: serving stops publishing that slot, and the generation is
-# incremented before reuse.  It is therefore an initialization guard, not the
-# scheduler's live-request/ownership bit.
+# Persistent MTP serving state, indexed by serving-assigned slot rather than by
+# the request's transient decode-batch row. For S == 2, flattened rows 2*r and
+# 2*r+1 belong to local batch row r.
+# Initialization guard: set on first assignment, not cleared on release.
 STATE_VALID = 0
-# Allocation tag (ABA guard).  Serving increments it whenever a freed slot is
-# assigned to a new request; stale prepared metadata must match neither the new
-# request's tokens nor its tail state.
+# ABA guard: incremented when a freed slot is reassigned.
 STATE_GENERATION = 1
 STATE_TAIL_POSITION = 2
 STATE_COMMITTED_COUNT = 3
@@ -77,43 +62,16 @@ def prepare_decode_from_device_state(
     tail_token_ids: pl.Tensor[[B], pl.INT64],
     tail_positions: pl.Tensor[[B], pl.INT32],
 ):
-    """Late-bind recurrent decode fields from stable device slots.
+    """Late-bind recurrent decode fields from stable device slots::
 
-    This runs at the beginning of the fused decode, before the main model.  For
-    each active local batch row ``r``, it validates the prepared descriptor and
-    rewrites the placeholder host inputs from the authoritative device state::
-
-        row0 = 2*r: input=tail,  position=tail_position + 1
-        row1 = 2*r+1: input=draft, position=tail_position + 2
+        row0 = 2*r:   input = tail,  position = tail_position + 1
+        row1 = 2*r+1: input = draft, position = tail_position + 2
         kv_seq_lens[r] = tail_position + 3
 
-    Positions are zero-based.  Therefore ``tail_position + 3`` is the KV
-    length after the two rows at positions ``tail_position+1`` and
-    ``tail_position+2`` have been included.
-
-    Args:
-        state_slot_ids: ``[B]`` transient-row to persistent-slot mapping.
-            ``-1`` marks an inactive/padded row.
-        state_generations: ``[B]`` allocation generations captured by serving
-            when it prepared the batch.  This must match the slot metadata.
-        state_tokens: Persistent ``[B, 2]`` pool indexed by slot.  Column 0 is
-            the last committed tail token; column 1 is the draft to verify.
-        state_meta: Persistent ``[B, 4]`` pool indexed by slot, containing
-            ``valid``, ``generation``, ``tail_position``, and
-            ``committed_count``.
-        input_ids: In/out flattened main-decode tokens ``[T=B*S]``.  Valid
-            request rows are overwritten with ``[tail, draft]``.
-        position_ids: In/out flattened main-decode positions ``[T]``.
-        kv_seq_lens: In/out main-model KV lengths ``[B]``.
-        tail_token_ids: In/out ``[B]`` verifier scratch.  It receives the old
-            committed tail token used when the draft is rejected.
-        tail_positions: In/out ``[B]`` verifier scratch.  It receives the old
-            committed tail position used when the draft is rejected.
-
-    A row is consumed only when ``slot_id >= 0``, the slot is valid, and its
-    generation matches.  Otherwise every caller-provided padded value is left
-    untouched.  Returned tensors alias the in-place-updated arguments and make
-    the mutation/dependency explicit to PyPTO's dataflow compiler.
+    Positions are zero-based, so tail_position + 3 is the KV length once both
+    rows are counted. A row is consumed only when slot_id >= 0, the slot is
+    valid, and its generation matches; every other row keeps the caller's
+    padded value.
     """
     # One core owns these tightly packed scalar updates.  The metadata volume
     # is tiny, and single ownership avoids adjacent scalar DMA write races.
@@ -166,39 +124,16 @@ def advance_decode_device_state(
 ):
     """Commit verifier and draft-model outputs into their stable slots.
 
-    This runs at the end of the fused decode.  ``verify_and_pack_mtp_tokens``
-    has already normalized both acceptance outcomes into a two-row committed
-    window for request ``r``::
+    verify_and_pack_mtp_tokens has already normalized both outcomes into a
+    two-row committed window for request r::
 
         draft accepted (accepted=2): [main0, main1]
         draft rejected (accepted=1): [old_tail, main0]
 
-    In both cases row ``2*r+1`` is consequently the newest committed tail.
-    This helper stores that row as the next step's tail, stores the MTP model's
-    sampled token as the next draft, advances the tail position, and increments
-    the running committed-token count by ``accepted``.
-
-    Args:
-        state_slot_ids: ``[B]`` transient-row to persistent-slot mapping used
-            for this invocation; ``-1`` means inactive.
-        state_generations: ``[B]`` expected allocation generations captured
-            with the prepared batch.
-        state_tokens: In/out persistent ``[B, 2]`` pool.  Column 0 receives
-            the newest committed tail and column 1 receives the next draft.
-        state_meta: In/out persistent ``[B, 4]`` pool.  This function updates
-            ``tail_position`` and ``committed_count`` only.
-        committed_input_ids: ``[T]`` two-row committed windows produced by
-            verification, not the original speculative main inputs.
-        committed_position_ids: ``[T]`` positions aligned with those committed
-            windows.
-        next_sampled_ids: ``[MAX_LOGIT_ROWS, SAMPLED_IDS_PAD]`` MTP LM-head
-            sampling output.  Row ``r``, column 0 is request ``r``'s next draft.
-        accepted_counts: ``[B]`` verifier result, currently 1 on rejection and
-            2 when the single draft is accepted.
-
-    The same valid-bit and generation check as the prepare side protects this
-    writeback from a stale batch after request release and slot reuse.  Returns
-    alias the two in-place-updated persistent pools.
+    Row 2*r+1 is the newest committed tail either way. It becomes the next
+    step's tail, the MTP sample becomes the next draft, and committed_count
+    advances by accepted. Guarded by the same valid bit and generation match
+    as the prepare side.
     """
     # Keep the state transition single-owner for the same scalar-write reason
     # as the prepare helper above.
@@ -465,125 +400,51 @@ def decode_fwd_mtp_l2(
     rank: pl.Scalar[pl.INT32],
     mtp_num_tokens: pl.Scalar[pl.INT32],
 ):
-    swa_cos_profile: pl.Tensor[[1, MAX_SEQ_LEN, ROPE_HEAD_DIM], pl.BF16] = pl.slice(
-        freqs_cos, [1, MAX_SEQ_LEN, ROPE_HEAD_DIM], [0, 0, 0]
-    )
-    swa_sin_profile: pl.Tensor[[1, MAX_SEQ_LEN, ROPE_HEAD_DIM], pl.BF16] = pl.slice(
-        freqs_sin, [1, MAX_SEQ_LEN, ROPE_HEAD_DIM], [0, 0, 0]
-    )
-    swa_freqs_cos: pl.Tensor[[MAX_SEQ_LEN, ROPE_HEAD_DIM], pl.BF16] = pl.reshape(
-        swa_cos_profile, [MAX_SEQ_LEN, ROPE_HEAD_DIM]
-    )
-    swa_freqs_sin: pl.Tensor[[MAX_SEQ_LEN, ROPE_HEAD_DIM], pl.BF16] = pl.reshape(
-        swa_sin_profile, [MAX_SEQ_LEN, ROPE_HEAD_DIM]
-    )
-    # The serving-prepared tensors contain cache/batch metadata but recurrent
-    # token, position, and length fields may be placeholders.  Resolve those
-    # fields from each request's stable device slot immediately before main
-    # decode consumes them.
+    swa_cos_profile: pl.Tensor[[1, MAX_SEQ_LEN, ROPE_HEAD_DIM], pl.BF16] = pl.slice(freqs_cos, [1, MAX_SEQ_LEN, ROPE_HEAD_DIM], [0, 0, 0])
+    swa_sin_profile: pl.Tensor[[1, MAX_SEQ_LEN, ROPE_HEAD_DIM], pl.BF16] = pl.slice(freqs_sin, [1, MAX_SEQ_LEN, ROPE_HEAD_DIM], [0, 0, 0])
+    swa_freqs_cos: pl.Tensor[[MAX_SEQ_LEN, ROPE_HEAD_DIM], pl.BF16] = pl.reshape(swa_cos_profile, [MAX_SEQ_LEN, ROPE_HEAD_DIM])
+    swa_freqs_sin: pl.Tensor[[MAX_SEQ_LEN, ROPE_HEAD_DIM], pl.BF16] = pl.reshape(swa_sin_profile, [MAX_SEQ_LEN, ROPE_HEAD_DIM])
+    # Recurrent token, position, and length fields arrive as placeholders; resolve
+    # them from each request's stable device slot before main decode reads them.
     prepare_decode_from_device_state(
-        mtp_tail_slot_ids,
-        mtp_state_generations,
-        mtp_state_tokens,
-        mtp_state_meta,
-        input_ids,
-        position_ids,
-        kv_seq_lens,
-        mtp_tail_token_ids,
-        mtp_tail_positions,
+        mtp_tail_slot_ids, mtp_state_generations, mtp_state_tokens, mtp_state_meta,
+        input_ids, position_ids, kv_seq_lens,
+        mtp_tail_token_ids, mtp_tail_positions,
     )
     decode_fwd_inline(embed_weight, hc_attn_fn, hc_attn_scale, hc_attn_base, attn_norm_w, wq_a, wq_b, wq_b_scale, wkv, gamma_cq, gamma_ckv, kv_cache, attn_sink, wo_a, wo_b, wo_b_scale, hca_cmp_wkv, hca_cmp_wgate, hca_cmp_ape, hca_cmp_norm_w, hca_compress_state, csa_cmp_wkv, csa_cmp_wgate, csa_cmp_ape, csa_cmp_norm_w, csa_compress_state, csa_idx_wq_b, csa_idx_wq_b_scale, csa_weights_proj, csa_hadamard_idx, csa_inner_wkv, csa_inner_wgate, csa_inner_ape, csa_inner_norm_w, csa_inner_compress_state, cmp_kv, idx_kv_cache, idx_kv_scale, hc_ffn_fn, hc_ffn_scale, hc_ffn_base, norm_w, gate_w, gate_bias, tid2eid, routed_w1, routed_w1_scale, routed_w3, routed_w3_scale, routed_w2, routed_w2_scale, shared_w1, shared_w1_scale, shared_w3, shared_w3_scale, shared_w2, shared_w2_scale, freqs_cos, freqs_sin, block_table, position_ids, kv_seq_lens, hca_compress_state_block_table, csa_compress_state_block_table, csa_inner_compress_state_block_table, cmp_block_table, idx_block_table, block_counts, input_ids, hc_head_fn, hc_head_scale, hc_head_base, final_norm_w, lm_head_weight, logit_row_indices, pre_hc_hidden_out, hidden_out, logits, sampled_ids, recv_meta, recv_x, recv_aux, recv_route, arrived, data_arrived, routed_y_buf, combine_arrived, lm_head_hidden_window, lm_head_hidden_done, lm_head_logits_window, lm_head_logits_done, num_tokens_per_owner, rank)
-    verify_and_pack_mtp_tokens(input_ids, position_ids, sampled_ids, mtp_tail_token_ids, mtp_tail_positions, mtp_tail_slot_ids, mtp_input_ids, mtp_position_ids, mtp_accepted_counts)
-    mtp_decode_layer_inline(
-        embed_weight,
-        pre_hc_hidden_out,
-        mtp_tail_pre_hc_pool,
-        mtp_accepted_counts,
-        mtp_tail_slot_ids,
-        mtp_position_ids,
-        mtp_enorm_w,
-        mtp_hnorm_w,
-        mtp_e_proj_w,
-        mtp_e_proj_w_scale,
-        mtp_e_proj_smooth,
-        mtp_h_proj_w,
-        mtp_h_proj_w_scale,
-        mtp_h_proj_smooth,
-        mtp_hc_attn_fn,
-        mtp_hc_attn_scale,
-        mtp_hc_attn_base,
-        mtp_attn_norm_w,
-        mtp_wq_a,
-        mtp_wq_b,
-        mtp_wq_b_scale,
-        mtp_wkv,
-        mtp_gamma_cq,
-        mtp_gamma_ckv,
-        swa_freqs_cos,
-        swa_freqs_sin,
-        mtp_kv_cache,
-        block_table,
-        mtp_attn_sink,
-        mtp_wo_a,
-        mtp_wo_b,
-        mtp_wo_b_scale,
-        mtp_hc_ffn_fn,
-        mtp_hc_ffn_scale,
-        mtp_hc_ffn_base,
-        mtp_norm_w,
-        mtp_gate_w,
-        mtp_gate_bias,
-        mtp_tid2eid,
-        mtp_input_ids,
-        mtp_routed_w1,
-        mtp_routed_w1_scale,
-        mtp_routed_w3,
-        mtp_routed_w3_scale,
-        mtp_routed_w2,
-        mtp_routed_w2_scale,
-        mtp_shared_w1,
-        mtp_shared_w1_scale,
-        mtp_shared_w3,
-        mtp_shared_w3_scale,
-        mtp_shared_w2,
-        mtp_shared_w2_scale,
-        mtp_mtp_hc_head_fn,
-        mtp_mtp_hc_head_scale,
-        mtp_mtp_hc_head_base,
-        mtp_mtp_norm_w,
-        lm_head_weight,
-        mtp_logit_row_indices,
-        mtp_hidden_out,
-        mtp_next_pre_hc_hidden,
-        mtp_logits,
-        mtp_sampled_ids,
-        mtp_recv_meta,
-        mtp_recv_x,
-        mtp_recv_aux,
-        mtp_recv_route,
-        mtp_arrived,
-        mtp_data_arrived,
-        mtp_routed_y_buf,
-        mtp_combine_arrived,
-        mtp_lm_head_hidden_window,
-        mtp_lm_head_hidden_done,
-        mtp_lm_head_logits_window,
-        mtp_lm_head_logits_done,
-        rank,
-        mtp_num_tokens,
+    verify_and_pack_mtp_tokens(
+        input_ids, position_ids, sampled_ids,
+        mtp_tail_token_ids, mtp_tail_positions, mtp_tail_slot_ids,
+        mtp_input_ids, mtp_position_ids, mtp_accepted_counts,
     )
-    # Verification has packed a canonical committed window and MTP decode has
-    # sampled the next draft.  Commit both to the persistent slot so the next
-    # fused invocation no longer depends on a host state round trip.
+    mtp_decode_layer_inline(
+        embed_weight, pre_hc_hidden_out, mtp_tail_pre_hc_pool,
+        mtp_accepted_counts, mtp_tail_slot_ids, mtp_position_ids,
+        mtp_enorm_w, mtp_hnorm_w,
+        mtp_e_proj_w, mtp_e_proj_w_scale, mtp_e_proj_smooth,
+        mtp_h_proj_w, mtp_h_proj_w_scale, mtp_h_proj_smooth,
+        mtp_hc_attn_fn, mtp_hc_attn_scale, mtp_hc_attn_base,
+        mtp_attn_norm_w, mtp_wq_a, mtp_wq_b, mtp_wq_b_scale, mtp_wkv, mtp_gamma_cq, mtp_gamma_ckv,
+        swa_freqs_cos, swa_freqs_sin,
+        mtp_kv_cache, block_table,
+        mtp_attn_sink, mtp_wo_a, mtp_wo_b, mtp_wo_b_scale,
+        mtp_hc_ffn_fn, mtp_hc_ffn_scale, mtp_hc_ffn_base,
+        mtp_norm_w, mtp_gate_w, mtp_gate_bias, mtp_tid2eid, mtp_input_ids,
+        mtp_routed_w1, mtp_routed_w1_scale, mtp_routed_w3, mtp_routed_w3_scale, mtp_routed_w2, mtp_routed_w2_scale,
+        mtp_shared_w1, mtp_shared_w1_scale, mtp_shared_w3, mtp_shared_w3_scale, mtp_shared_w2, mtp_shared_w2_scale,
+        mtp_mtp_hc_head_fn, mtp_mtp_hc_head_scale, mtp_mtp_hc_head_base, mtp_mtp_norm_w,
+        lm_head_weight, mtp_logit_row_indices,
+        mtp_hidden_out, mtp_next_pre_hc_hidden, mtp_logits, mtp_sampled_ids,
+        mtp_recv_meta, mtp_recv_x, mtp_recv_aux, mtp_recv_route,
+        mtp_arrived, mtp_data_arrived, mtp_routed_y_buf, mtp_combine_arrived,
+        mtp_lm_head_hidden_window, mtp_lm_head_hidden_done, mtp_lm_head_logits_window, mtp_lm_head_logits_done,
+        rank, mtp_num_tokens,
+    )
+    # Commit the verified window and the next draft back to the persistent slot.
     advance_decode_device_state(
-        mtp_tail_slot_ids,
-        mtp_state_generations,
-        mtp_state_tokens,
-        mtp_state_meta,
-        mtp_input_ids,
-        mtp_position_ids,
-        mtp_sampled_ids,
-        mtp_accepted_counts,
+        mtp_tail_slot_ids, mtp_state_generations, mtp_state_tokens, mtp_state_meta,
+        mtp_input_ids, mtp_position_ids,
+        mtp_sampled_ids, mtp_accepted_counts,
     )
 
 
