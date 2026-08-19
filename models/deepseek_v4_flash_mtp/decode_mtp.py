@@ -36,8 +36,7 @@ from decode_swa import (
     build_tensor_specs as build_swa_tensor_specs,
     golden_attention_swa,
 )
-from decode_metadata import build_swa_metadata
-from decode_input_pack import pack_mtp_hidden
+from decode_prepare import build_swa_metadata, pack_mtp_hidden
 from hc_head import golden_hc_head, hc_head
 from lm_head import (
     GROUP_LOGIT_ROWS,

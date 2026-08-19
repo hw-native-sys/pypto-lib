@@ -168,9 +168,9 @@ prefill_mtp      mtp_projection → prefill_swa → moe → hc_head → rmsnorm 
 ```
 
 `decode_mtp_verify` checks the draft token against the main-model sample and
-packs the committed window. `decode_input_pack` and `decode_metadata` lower the
-packed input IDs and the paged-cache metadata on device; `utils` is their
-host-side torch counterpart used by the test fixtures.
+packs the committed window. `decode_prepare` lowers the packed input
+IDs and the paged-cache metadata on device; `utils` is its host-side torch
+counterpart used by the test fixtures.
 
 ## Files
 
@@ -185,9 +185,9 @@ host-side torch counterpart used by the test fixtures.
 | Prefill attention and cache | [prefill_swa.py](../../models/deepseek_v4_flash_mtp/prefill_swa.py), [prefill_csa.py](../../models/deepseek_v4_flash_mtp/prefill_csa.py), [prefill_hca.py](../../models/deepseek_v4_flash_mtp/prefill_hca.py), [prefill_sparse_attn.py](../../models/deepseek_v4_flash_mtp/prefill_sparse_attn.py), [prefill_compressor_ratio4.py](../../models/deepseek_v4_flash_mtp/prefill_compressor_ratio4.py), [prefill_compressor_ratio128.py](../../models/deepseek_v4_flash_mtp/prefill_compressor_ratio128.py), [prefill_indexer.py](../../models/deepseek_v4_flash_mtp/prefill_indexer.py), [prefill_indexer_compressor.py](../../models/deepseek_v4_flash_mtp/prefill_indexer_compressor.py) |
 | Shared transforms | [rmsnorm.py](../../models/deepseek_v4_flash_mtp/rmsnorm.py), [qkv_proj_rope.py](../../models/deepseek_v4_flash_mtp/qkv_proj_rope.py), [hc_pre.py](../../models/deepseek_v4_flash_mtp/hc_pre.py), [hc_post.py](../../models/deepseek_v4_flash_mtp/hc_post.py), [hc_head.py](../../models/deepseek_v4_flash_mtp/hc_head.py), [rope_interleave.py](../../models/deepseek_v4_flash_mtp/rope_interleave.py), [lookup_embedding.py](../../models/deepseek_v4_flash_mtp/lookup_embedding.py) |
 | MoE and output | [moe.py](../../models/deepseek_v4_flash_mtp/moe.py), [gate.py](../../models/deepseek_v4_flash_mtp/gate.py), [expert_shared.py](../../models/deepseek_v4_flash_mtp/expert_shared.py), [expert_routed.py](../../models/deepseek_v4_flash_mtp/expert_routed.py), [lm_head.py](../../models/deepseek_v4_flash_mtp/lm_head.py) |
-| Metadata and host helpers | [decode_metadata.py](../../models/deepseek_v4_flash_mtp/decode_metadata.py), [decode_input_pack.py](../../models/deepseek_v4_flash_mtp/decode_input_pack.py), [config.py](../../models/deepseek_v4_flash_mtp/config.py), [utils.py](../../models/deepseek_v4_flash_mtp/utils.py) |
+| Metadata and host helpers | [decode_prepare.py](../../models/deepseek_v4_flash_mtp/decode_prepare.py), [config.py](../../models/deepseek_v4_flash_mtp/config.py), [utils.py](../../models/deepseek_v4_flash_mtp/utils.py) |
 
-`config.py`, `utils.py`, `rope_interleave.py`, and `decode_input_pack.py` have
+`config.py`, `utils.py`, `rope_interleave.py`, and `decode_prepare.py` have
 no `__main__` block: they are imported rather than run. Executable compositions,
 including `decode_fwd_mtp.py`, are scheduled by the
 [daily model workflow](../../.github/workflows/daily_ci.yml).

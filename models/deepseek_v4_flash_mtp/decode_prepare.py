@@ -6,10 +6,12 @@
 # INCLUDING BUT NOT LIMITED TO NON-INFRINGEMENT, MERCHANTABILITY, OR FITNESS FOR A PARTICULAR PURPOSE.
 # See LICENSE in the root of the software repository for the full text of the License.
 # -----------------------------------------------------------------------------------------------------------
-"""Device-side metadata lowering for DeepSeek-V4 decode.
+"""Device-side decode preamble for DeepSeek-V4: metadata lowering and input packing.
 
-``utils`` holds the host-side torch counterpart used by the per-kernel test
-fixtures.
+Everything decode runs before layer 0 -- paged slot mappings and visible-row
+metadata, then the embedding and MTP hidden-state packing that feed it.
+
+``utils`` holds the host-side torch counterpart of the metadata lowering.
 """
 
 import pypto.language as pl
@@ -45,6 +47,18 @@ GROUP_HCA_STATE = 3
 GROUP_CSA_STATE = 4
 GROUP_CSA_INNER_STATE = 5
 N_CACHE_GROUPS = 6
+
+VOCAB_DYN = pl.dynamic("PACK_X_HC_VOCAB_DYN")
+
+D = M.hidden_size
+HC_MULT = M.hc_mult
+
+X_HC_HIDDEN_TILE = 512
+MTP_HIDDEN_TILE = 1024
+SPMD_BLOCKS = 48
+
+assert D % X_HC_HIDDEN_TILE == 0
+assert D % MTP_HIDDEN_TILE == 0
 
 
 @pl.jit.inline
@@ -269,228 +283,110 @@ def build_decode_metadata(
     )
 
 
-@pl.jit
-def decode_metadata(
-    position_ids: pl.Tensor[[T], pl.INT32],
-    ori_block_table: pl.Tensor[[B, ORI_TABLE_MAX_BLOCKS], pl.INT32],
-    cmp_block_table: pl.Tensor[[B, CMP_MAX_BLOCKS], pl.INT32],
-    idx_block_table: pl.Tensor[[B, IDX_MAX_BLOCKS], pl.INT32],
-    hca_state_block_table: pl.Tensor[[B, HCA_STATE_MAX_BLOCKS], pl.INT32],
-    csa_state_block_table: pl.Tensor[[B, CSA_STATE_MAX_BLOCKS], pl.INT32],
-    csa_inner_state_block_table: pl.Tensor[
-        [B, CSA_INNER_STATE_MAX_BLOCKS], pl.INT32
-    ],
-    block_counts: pl.Tensor[[B, N_CACHE_GROUPS], pl.INT32],
-    ori_slot_mapping: pl.Out[pl.Tensor[[T], pl.INT64]],
-    swa_slot_mapping: pl.Out[pl.Tensor[[T], pl.INT64]],
-    swa_indices: pl.Out[pl.Tensor[[T, WIN], pl.INT32]],
-    swa_lens: pl.Out[pl.Tensor[[T], pl.INT32]],
-    hca_cmp_slot_mapping: pl.Out[pl.Tensor[[T], pl.INT64]],
-    hca_state_slot_mapping: pl.Out[pl.Tensor[[T], pl.INT64]],
-    csa_cmp_slot_mapping: pl.Out[pl.Tensor[[T], pl.INT64]],
-    csa_idx_slot_mapping: pl.Out[pl.Tensor[[T], pl.INT64]],
-    csa_state_slot_mapping: pl.Out[pl.Tensor[[T], pl.INT64]],
-    csa_inner_state_slot_mapping: pl.Out[pl.Tensor[[T], pl.INT64]],
-):
-    """Standalone validation entry for device metadata lowering."""
-    return build_decode_metadata(
-        position_ids,
-        ori_block_table,
-        cmp_block_table,
-        idx_block_table,
-        hca_state_block_table,
-        csa_state_block_table,
-        csa_inner_state_block_table,
-        block_counts,
-        ori_slot_mapping,
-        swa_slot_mapping,
-        swa_indices,
-        swa_lens,
-        hca_cmp_slot_mapping,
-        hca_state_slot_mapping,
-        csa_cmp_slot_mapping,
-        csa_idx_slot_mapping,
-        csa_state_slot_mapping,
-        csa_inner_state_slot_mapping,
-    )
+@pl.jit.inline
+def pack_x_hc(
+    input_ids: pl.Tensor[[T], pl.INT64],
+    embed_weight: pl.Tensor[[VOCAB_DYN, D], pl.BF16],
+    x_hc: pl.Tensor[[T, HC_MULT, D], pl.FP32],
+) -> pl.Tensor[[T, HC_MULT, D], pl.FP32]:
+    x_hc_flat = pl.reshape(x_hc, [T * HC_MULT, D])
+    for block in pl.spmd(SPMD_BLOCKS, name_hint="pack_x_hc"):
+        for work_idx in pl.range(
+            block,
+            T * (D // X_HC_HIDDEN_TILE),
+            SPMD_BLOCKS,
+        ):
+            token_idx = work_idx // (D // X_HC_HIDDEN_TILE)
+            hidden_offset = (work_idx % (D // X_HC_HIDDEN_TILE)) * X_HC_HIDDEN_TILE
+            token_id = pl.tensor.read(input_ids, [token_idx])
+            token_row = pl.cast(token_id, target_type=pl.INDEX)
+            hidden_chunk = pl.cast(
+                embed_weight[
+                    token_row : token_row + 1,
+                    hidden_offset : hidden_offset + X_HC_HIDDEN_TILE,
+                ],
+                target_type=pl.FP32,
+            )
+            for hc_idx in pl.range(HC_MULT):
+                x_hc_row = token_idx * HC_MULT + hc_idx
+                x_hc_flat[
+                    x_hc_row : x_hc_row + 1,
+                    hidden_offset : hidden_offset + X_HC_HIDDEN_TILE,
+                ] = hidden_chunk
+    return x_hc
 
 
-def _test_inputs():
-    import torch
+@pl.jit.inline
+def pack_mtp_hidden(
+    main_pre_hc_hidden: pl.Tensor[[T, HC_MULT, D], pl.FP32],
+    tail_pre_hc_pool: pl.Tensor[[B, HC_MULT, D], pl.FP32],
+    accepted_counts: pl.Tensor[[B], pl.INT32],
+    tail_slot_ids: pl.Tensor[[B], pl.INT32],
+    fallback_hidden: pl.Tensor[[S, HC_MULT, D], pl.FP32],
+    packed_hidden: pl.Tensor[[T, HC_MULT, D], pl.FP32],
+) -> pl.Tensor[[T, HC_MULT, D], pl.FP32]:
+    for block in pl.spmd(SPMD_BLOCKS, name_hint="pack_mtp_hidden"):
+        for work_idx in pl.range(
+            block,
+            B * HC_MULT * (D // MTP_HIDDEN_TILE),
+            SPMD_BLOCKS,
+        ):
+            batch_idx = work_idx // (HC_MULT * (D // MTP_HIDDEN_TILE))
+            local_idx = work_idx % (HC_MULT * (D // MTP_HIDDEN_TILE))
+            hc_idx = local_idx // (D // MTP_HIDDEN_TILE)
+            hidden_offset = (local_idx % (D // MTP_HIDDEN_TILE)) * MTP_HIDDEN_TILE
+            row0 = batch_idx * S
+            row1 = row0 + 1
 
-    positions = torch.tensor(
-        [126, 127, 3, 4, 8191, 8192, 16382, 16383],
-        dtype=torch.int32,
-    )
-    counts = torch.tensor(
-        [
-            [2, 3, 4, 5, 6, 7],
-            [3, 4, 5, 6, 7, 8],
-            [4, 5, 6, 7, 8, 9],
-            [5, 6, 7, 8, 9, 10],
-        ],
-        dtype=torch.int32,
-    )
-
-    def table(width, group, *, repeat):
-        out = torch.zeros((B, width), dtype=torch.int32)
-        for request in range(B):
-            count = int(counts[request, group])
-            ids = torch.arange(count, dtype=torch.int32) + 1000 * (group + 1) + 100 * request
-            if repeat:
-                out[request] = ids.repeat((width + count - 1) // count)[:width]
+            slot_raw = pl.read(tail_slot_ids, [batch_idx])
+            if slot_raw >= 0:
+                accepted_count = pl.read(accepted_counts, [batch_idx])
+                last_row = row0 + pl.cast(accepted_count, target_type=pl.INDEX) - 1
+                last_hidden = main_pre_hc_hidden[
+                    last_row : last_row + 1,
+                    hc_idx : hc_idx + 1,
+                    hidden_offset : hidden_offset + MTP_HIDDEN_TILE,
+                ]
+                slot = pl.cast(slot_raw, target_type=pl.INDEX)
+                if accepted_count == 1:
+                    packed_hidden[
+                        row0 : row0 + 1,
+                        hc_idx : hc_idx + 1,
+                        hidden_offset : hidden_offset + MTP_HIDDEN_TILE,
+                    ] = tail_pre_hc_pool[
+                        slot : slot + 1,
+                        hc_idx : hc_idx + 1,
+                        hidden_offset : hidden_offset + MTP_HIDDEN_TILE,
+                    ]
+                else:
+                    packed_hidden[
+                        row0 : row0 + 1,
+                        hc_idx : hc_idx + 1,
+                        hidden_offset : hidden_offset + MTP_HIDDEN_TILE,
+                    ] = main_pre_hc_hidden[
+                        row0 : row0 + 1,
+                        hc_idx : hc_idx + 1,
+                        hidden_offset : hidden_offset + MTP_HIDDEN_TILE,
+                    ]
+                packed_hidden[
+                    row1 : row1 + 1,
+                    hc_idx : hc_idx + 1,
+                    hidden_offset : hidden_offset + MTP_HIDDEN_TILE,
+                ] = last_hidden
+                tail_pre_hc_pool[
+                    slot : slot + 1,
+                    hc_idx : hc_idx + 1,
+                    hidden_offset : hidden_offset + MTP_HIDDEN_TILE,
+                ] = last_hidden
             else:
-                out[request, :count] = ids
-        return out
-
-    return {
-        "position_ids": positions,
-        "ori_block_table": table(ORI_TABLE_MAX_BLOCKS, GROUP_ORI, repeat=True),
-        "cmp_block_table": table(CMP_MAX_BLOCKS, GROUP_CMP, repeat=False),
-        "idx_block_table": table(IDX_MAX_BLOCKS, GROUP_IDX, repeat=False),
-        "hca_state_block_table": table(
-            HCA_STATE_MAX_BLOCKS,
-            GROUP_HCA_STATE,
-            repeat=True,
-        ),
-        "csa_state_block_table": table(
-            CSA_STATE_MAX_BLOCKS,
-            GROUP_CSA_STATE,
-            repeat=True,
-        ),
-        "csa_inner_state_block_table": table(
-            CSA_INNER_STATE_MAX_BLOCKS,
-            GROUP_CSA_INNER_STATE,
-            repeat=True,
-        ),
-        "block_counts": counts,
-    }
-
-
-def golden_decode_metadata(tensors):
-    positions = tensors["position_ids"]
-    ori_table = tensors["ori_block_table"]
-    cmp_table = tensors["cmp_block_table"]
-    idx_table = tensors["idx_block_table"]
-    hca_state_table = tensors["hca_state_block_table"]
-    csa_state_table = tensors["csa_state_block_table"]
-    inner_state_table = tensors["csa_inner_state_block_table"]
-    counts = tensors["block_counts"]
-
-    tensors["swa_indices"].fill_(-1)
-    for token in range(T):
-        request = token // S
-        position = int(positions[token])
-        logical_block, block_offset = divmod(position, BLOCK_SIZE)
-        tensors["swa_slot_mapping"][token] = (
-            int(ori_table[request, logical_block]) * BLOCK_SIZE + block_offset
-        )
-        valid_len = min(position + 1, WIN)
-        start = position - valid_len + 1
-        tensors["swa_lens"][token] = valid_len
-        for offset, visible_position in enumerate(range(start, position + 1)):
-            visible_block, visible_offset = divmod(visible_position, BLOCK_SIZE)
-            tensors["swa_indices"][token, offset] = (
-                int(ori_table[request, visible_block]) * BLOCK_SIZE + visible_offset
-            )
-
-        tensors["ori_slot_mapping"][token] = (
-            int(ori_table[request, logical_block]) * BLOCK_SIZE + block_offset
-        )
-        tensors["hca_cmp_slot_mapping"][token] = -1
-        if (position + 1) % 128 == 0:
-            logical = position // 128
-            count = int(counts[request, GROUP_CMP])
-            block_index, offset = divmod(logical, BLOCK_SIZE)
-            tensors["hca_cmp_slot_mapping"][token] = (
-                int(cmp_table[request, block_index % count]) * BLOCK_SIZE + offset
-            )
-
-        tensors["csa_cmp_slot_mapping"][token] = -1
-        tensors["csa_idx_slot_mapping"][token] = -1
-        if (position + 1) % 4 == 0:
-            logical = position // 4
-            block_index, offset = divmod(logical, BLOCK_SIZE)
-            cmp_count = int(counts[request, GROUP_CMP])
-            idx_count = int(counts[request, GROUP_IDX])
-            tensors["csa_cmp_slot_mapping"][token] = (
-                int(cmp_table[request, block_index % cmp_count]) * BLOCK_SIZE + offset
-            )
-            tensors["csa_idx_slot_mapping"][token] = (
-                int(idx_table[request, block_index % idx_count]) * BLOCK_SIZE + offset
-            )
-
-        hca_block, hca_offset = divmod(position, C128_COMPRESSOR_BLOCK_SIZE)
-        hca_count = int(counts[request, GROUP_HCA_STATE])
-        tensors["hca_state_slot_mapping"][token] = (
-            int(hca_state_table[request, hca_block % hca_count])
-            * C128_COMPRESSOR_BLOCK_SIZE
-            + hca_offset
-        )
-        csa_block, csa_offset = divmod(position, C4A_COMPRESSOR_BLOCK_SIZE)
-        csa_count = int(counts[request, GROUP_CSA_STATE])
-        inner_count = int(counts[request, GROUP_CSA_INNER_STATE])
-        tensors["csa_state_slot_mapping"][token] = (
-            int(csa_state_table[request, csa_block % csa_count])
-            * C4A_COMPRESSOR_BLOCK_SIZE
-            + csa_offset
-        )
-        tensors["csa_inner_state_slot_mapping"][token] = (
-            int(inner_state_table[request, csa_block % inner_count])
-            * C4A_COMPRESSOR_BLOCK_SIZE
-            + csa_offset
-        )
-
-
-def build_tensor_specs():
-    import torch
-    from golden import TensorSpec
-
-    inputs = _test_inputs()
-    specs = [
-        TensorSpec(name, list(value.shape), value.dtype, init_value=value)
-        for name, value in inputs.items()
-    ]
-    for name, shape, dtype in (
-        ("ori_slot_mapping", [T], torch.int64),
-        ("swa_slot_mapping", [T], torch.int64),
-        ("swa_indices", [T, WIN], torch.int32),
-        ("swa_lens", [T], torch.int32),
-        ("hca_cmp_slot_mapping", [T], torch.int64),
-        ("hca_state_slot_mapping", [T], torch.int64),
-        ("csa_cmp_slot_mapping", [T], torch.int64),
-        ("csa_idx_slot_mapping", [T], torch.int64),
-        ("csa_state_slot_mapping", [T], torch.int64),
-        ("csa_inner_state_slot_mapping", [T], torch.int64),
-    ):
-        specs.append(TensorSpec(name, shape, dtype, is_output=True))
-    return specs
-
-
-if __name__ == "__main__":
-    import argparse
-
-    from golden import run_jit
-
-    parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument(
-        "-p",
-        "--platform",
-        default="a2a3",
-        choices=["a2a3", "a2a3sim", "a5", "a5sim"],
-    )
-    parser.add_argument("-d", "--device", type=int, default=0)
-    parser.add_argument("--compile-only", action="store_true")
-    args = parser.parse_args()
-
-    result = run_jit(
-        fn=decode_metadata,
-        specs=build_tensor_specs(),
-        golden_fn=golden_decode_metadata,
-        compile_only=args.compile_only,
-        runtime_cfg={"platform": args.platform, "device_id": args.device},
-    )
-    if not result.passed:
-        if result.error:
-            print(result.error)
-        raise SystemExit(1)
+                for seq_idx in pl.range(S):
+                    packed_hidden[
+                        row0 + seq_idx : row0 + seq_idx + 1,
+                        hc_idx : hc_idx + 1,
+                        hidden_offset : hidden_offset + MTP_HIDDEN_TILE,
+                    ] = fallback_hidden[
+                        seq_idx : seq_idx + 1,
+                        hc_idx : hc_idx + 1,
+                        hidden_offset : hidden_offset + MTP_HIDDEN_TILE,
+                    ]
+    return packed_hidden

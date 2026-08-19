@@ -229,7 +229,7 @@ def sparse_attn_csa(
                     # page-contiguous runs -- one multi-row gather each (row count carried
                     # by valid_shape) instead of a single-row DMA per row. Visible length
                     # and start mirror the metadata producers
-                    # (decode_metadata.build_swa_metadata / utils.swa_indices_and_lens).
+                    # (decode_prepare.build_swa_metadata / utils.swa_indices_and_lens).
                     qk_pos = pl.cast(pl.read(position_ids, [qk_t, 0]), pl.INDEX)
                     qk_win_len = pl.min(qk_pos + 1, WIN)
                     qk_win_start = qk_pos - qk_win_len + 1

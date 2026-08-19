@@ -89,8 +89,12 @@ from decode_csa import (
     build_tensor_specs as build_csa_tensor_specs,
 )
 from config import DECODE_START_POS, FLASH as MODEL_CONFIG
-from decode_input_pack import VOCAB_DYN as EMBED_VOCAB_DYN, pack_x_hc
-from decode_metadata import N_CACHE_GROUPS, build_decode_metadata
+from decode_prepare import (
+    N_CACHE_GROUPS,
+    VOCAB_DYN as EMBED_VOCAB_DYN,
+    build_decode_metadata,
+    pack_x_hc,
+)
 from moe import (
     AUX_PAD,
     IDX_PAD,
