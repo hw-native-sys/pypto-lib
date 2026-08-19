@@ -8,12 +8,25 @@
 # -----------------------------------------------------------------------------------------------------------
 # ci: devices=2
 # ci: no-sim
-"""Run an EP2 prefill-to-decode synthetic-token session on one worker.
+"""Run an EP2 prefill-to-decode token session on one worker.
 
-The session deliberately uses synthetic zero-valued model weights. It validates
+By default the session uses synthetic zero-valued model weights. It validates
 the serving control/data path rather than model numerics:
 
 ``token ids -> embedding -> full prefill -> LM head/sample -> repeated decode``.
+
+With ``--weights`` (an HF checkpoint dir or a ``weights_flash.py`` .pt cache
+matching ``--ep``/``--tp``) the resident bank is instead materialized from the
+drivers' own TensorSpecs: the 56 real-weight names come from the checkpoint via
+``weights_flash.apply_real_weights`` and the remaining architectural constants
+(RoPE tables, the indexer Hadamard) keep their fixture initializers, so the
+loop generates with real DeepSeek-V4-Flash numerics. ``--prompt``/
+``--prompt-file`` then feed a natural-language prompt through the checkpoint's
+``tokenizer.json`` (up to ``PROMPT_TOKENS`` ids; ``num_tokens`` and the logit
+row track the real prompt length), and the sampled ids are detokenized at the
+end. NOTE: only EP8 deploys the full 256-expert model; an EP2/EP4 real-weight
+run uses the first ``32*EP`` experts with reduced router tables — a smoke
+configuration whose generations do not represent true model output.
 
 Prefill and decode are compiled in separate processes because their static MoE
 token extents differ. The resulting programs are then loaded into one
@@ -180,7 +193,14 @@ def _initialize_tid2eid(tensor, *, vocab_size, topk, num_experts):
         tensor[rank].copy_(tensor[0])
 
 
-def _build_resident_hosts(prefill, prefill_compiled, decode_compiled):
+def _materialize_spec_value(spec):
+    value = spec.init_value
+    if callable(value):
+        value = value()
+    return value
+
+
+def _build_resident_hosts(prefill, prefill_compiled, decode_compiled, weight_specs=None):
     resident_names = set(prefill.RESIDENT_WEIGHT_NAMES) | set(
         prefill.RESIDENT_CACHE_NAMES
     )
@@ -210,17 +230,42 @@ def _build_resident_hosts(prefill, prefill_compiled, decode_compiled):
                 f"resident ABI mismatch for {name}: {prefill_abi} != {decode_abi}"
             )
 
+    from pypto.ir.compiled_program import _to_torch_dtype
+
     resident_hosts = {}
     total_bytes = 0
     for index, name in enumerate(sorted(resident_names), start=1):
-        tensor = _empty_host_tensor(name, prefill_infos[name], prefill.MODEL_CONFIG.vocab_size)
-        if name == "tid2eid":
-            _initialize_tid2eid(
-                tensor,
-                vocab_size=prefill.VOCAB,
-                topk=prefill.TOPK,
-                num_experts=prefill.N_EXPERTS_GLOBAL,
-            )
+        info = prefill_infos[name]
+        spec = weight_specs.get(name) if weight_specs is not None else None
+        if (
+            spec is not None
+            and spec.init_value is not None
+            and name not in prefill.RESIDENT_CACHE_NAMES
+        ):
+            # Real/fixture weight: materialize the driver's own spec init (the
+            # checkpoint value after apply_real_weights, or the architectural
+            # fixture for names like the RoPE tables and the Hadamard index).
+            tensor = _materialize_spec_value(spec)
+            expected_shape = _runtime_shape(name, info, prefill.MODEL_CONFIG.vocab_size)
+            expected_dtype = _to_torch_dtype(info.dtype)
+            if tuple(tensor.shape) != expected_shape:
+                raise ValueError(
+                    f"{name}: spec init shape {tuple(tensor.shape)} does not "
+                    f"match runtime ABI {expected_shape}"
+                )
+            if tensor.dtype != expected_dtype:
+                # Fixture inits may build in a wider dtype (e.g. fp32) than the
+                # kernel ABI declares; run_jit casts on materialization too.
+                tensor = tensor.to(expected_dtype)
+        else:
+            tensor = _empty_host_tensor(name, info, prefill.MODEL_CONFIG.vocab_size)
+            if name == "tid2eid" and weight_specs is None:
+                _initialize_tid2eid(
+                    tensor,
+                    vocab_size=prefill.VOCAB,
+                    topk=prefill.TOPK,
+                    num_experts=prefill.N_EXPERTS_GLOBAL,
+                )
         resident_hosts[name] = tensor.contiguous()
         total_bytes += tensor.numel() * tensor.element_size()
         print(
@@ -290,7 +335,7 @@ def _ranked_prefill(value, num_ranks):
     return flat.unsqueeze(0).expand(num_ranks, -1).contiguous()
 
 
-def _initialize_prefill_io(prefill, decode_metadata, io_tensors, scalars, tables):
+def _initialize_prefill_io(prefill, decode_metadata, io_tensors, scalars, tables, prompt_ids=None):
     positions = torch.arange(PROMPT_TOKENS, dtype=torch.int32).reshape(1, -1)
     table_aliases = {
         "ori_block_table": "block_table",
@@ -308,12 +353,14 @@ def _initialize_prefill_io(prefill, decode_metadata, io_tensors, scalars, tables
     io_tensors["position_ids"].copy_(
         _ranked_prefill(positions, prefill.N_RANKS)
     )
-    io_tensors["input_ids"].copy_(
-        _ranked_prefill(
-            torch.arange(PROMPT_TOKENS, dtype=torch.int64).remainder(prefill.VOCAB),
-            prefill.N_RANKS,
-        )
-    )
+    if prompt_ids is None:
+        prompt_len = PROMPT_TOKENS
+        ids_row = torch.arange(PROMPT_TOKENS, dtype=torch.int64).remainder(prefill.VOCAB)
+    else:
+        prompt_len = int(prompt_ids.numel())
+        ids_row = torch.zeros(PROMPT_TOKENS, dtype=torch.int64)
+        ids_row[:prompt_len] = prompt_ids.to(torch.int64)
+    io_tensors["input_ids"].copy_(_ranked_prefill(ids_row, prefill.N_RANKS))
 
     row = {name: table[0:1] for name, table in tables.items()}
     io_tensors["ori_slot_mapping"].copy_(
@@ -370,8 +417,8 @@ def _initialize_prefill_io(prefill, decode_metadata, io_tensors, scalars, tables
         )
 
     io_tensors["logit_row_indices"].fill_(-1)
-    io_tensors["logit_row_indices"][:, 0] = PROMPT_TOKENS - 1
-    scalars["num_tokens"] = torch.tensor(PROMPT_TOKENS, dtype=torch.int32)
+    io_tensors["logit_row_indices"][:, 0] = prompt_len - 1
+    scalars["num_tokens"] = torch.tensor(prompt_len, dtype=torch.int32)
 
 
 def _decode_base_shapes(decode):
@@ -440,8 +487,13 @@ def _refresh_decode_io(decode, io_tensors, scalars, tables, start_pos, tokens):
 def _check_sample(io_tensors, vocab_size, stage):
     logits = io_tensors["logits"][:, 0]
     sampled = io_tensors["sampled_ids"][:, 0, 0]
-    if not bool(torch.isfinite(logits).all()):
-        raise AssertionError(f"{stage}: active logits contain non-finite values")
+    finite = torch.isfinite(logits)
+    if not bool(finite.all()):
+        bad_by_rank = (~finite).sum(dim=-1).tolist()
+        raise AssertionError(
+            f"{stage}: active logits contain non-finite values by rank: "
+            f"{bad_by_rank}"
+        )
     if not bool(((sampled >= 0) & (sampled < vocab_size)).all()):
         raise AssertionError(f"{stage}: sampled token is outside the vocabulary: {sampled}")
     argmax = torch.argmax(logits, dim=-1).to(torch.int32)
@@ -451,6 +503,8 @@ def _check_sample(io_tensors, vocab_size, stage):
             f"{stage}: sampled token does not match the logits argmax: "
             f"sampled={sampled}, argmax={argmax}"
         )
+    if sampled.numel() > 1 and not bool(torch.equal(sampled, sampled[0].expand_as(sampled))):
+        raise AssertionError(f"{stage}: ranks sampled different tokens: {sampled.tolist()}")
     print(
         f"[SESSION] {stage}: sampled={sampled.tolist()} "
         f"greedy_match={greedy_match}",
@@ -502,14 +556,17 @@ def _run_session(args, prefill_dir, decode_dir, model_dir):
         distributed_config=distributed_config,
     )
 
+    prompt_ids = getattr(args, "prompt_ids", None)
+    prompt_len = int(prompt_ids.numel()) if prompt_ids is not None else PROMPT_TOKENS
+
     import_argv = [
         str(model_dir / "synthetic_token_loop.py"),
         "--variant",
         args.variant,
         "--ep",
-        "2",
+        str(args.ep),
         "--tp",
-        "2",
+        str(args.tp),
     ]
     saved_argv = sys.argv
     sys.argv = import_argv
@@ -519,9 +576,24 @@ def _run_session(args, prefill_dir, decode_dir, model_dir):
         resident_names = set(prefill.RESIDENT_WEIGHT_NAMES) | set(
             prefill.RESIDENT_CACHE_NAMES
         )
+        weight_specs = None
+        if args.weights is not None:
+            from weights_flash import apply_real_weights
+
+            specs = prefill.build_tensor_specs(start_pos=0, num_tokens=prompt_len)
+            count = apply_real_weights(
+                specs, args.weights, ep=prefill.N_RANKS, tp=prefill.LM_HEAD_TP_SIZE
+            )
+            print(f"[SESSION] real weights: {count} specs from {args.weights}", flush=True)
+            weight_specs = {
+                spec.name: spec
+                for spec in specs
+                if getattr(spec, "name", None) in prefill.RESIDENT_WEIGHT_NAMES
+            }
         resident_hosts = _build_resident_hosts(
-            prefill, prefill_compiled, decode_compiled
+            prefill, prefill_compiled, decode_compiled, weight_specs
         )
+        weight_specs = None
         prefill_io, prefill_scalars = _build_io(
             prefill_compiled, resident_names, prefill.MODEL_CONFIG.vocab_size
         )
@@ -552,6 +624,7 @@ def _run_session(args, prefill_dir, decode_dir, model_dir):
             prefill_io,
             prefill_scalars,
             tables,
+            prompt_ids,
         )
         decode_io, decode_scalars = _build_io(
             decode_compiled, resident_names, decode.MODEL_CONFIG.vocab_size
@@ -562,7 +635,7 @@ def _run_session(args, prefill_dir, decode_dir, model_dir):
             decode_io,
             decode_scalars,
             tables,
-            PROMPT_TOKENS,
+            prompt_len,
             initial_tokens,
         )
         prefill_io["logits"].fill_(float("nan"))
@@ -617,8 +690,9 @@ def _run_session(args, prefill_dir, decode_dir, model_dir):
             )
             token_history = [tokens.tolist()]
 
+            eos_id = getattr(args, "eos_id", None)
             for step in range(args.decode_steps):
-                start_pos = PROMPT_TOKENS + step
+                start_pos = prompt_len + step
                 _refresh_decode_io(
                     decode,
                     decode_io,
@@ -640,7 +714,21 @@ def _run_session(args, prefill_dir, decode_dir, model_dir):
                     f"decode[{step}]@{start_pos}",
                 )
                 token_history.append(tokens.tolist())
+                if (
+                    args.weights is not None
+                    and eos_id is not None
+                    and int(tokens[0]) == eos_id
+                ):
+                    print(f"[SESSION] eos at decode step {step}", flush=True)
+                    break
             print(f"[SESSION] token_history={token_history}", flush=True)
+            if getattr(args, "tokenizer", None):
+                from tokenizers import Tokenizer
+
+                generated = [step_tokens[0] for step_tokens in token_history]
+                text = Tokenizer.from_file(args.tokenizer).decode(generated)
+                print(f"[SESSION] generated ids: {generated}", flush=True)
+                print(f"[SESSION] generated text: {text!r}", flush=True)
         finally:
             if runtime is not None:
                 for name in reversed(uploaded):
@@ -660,24 +748,65 @@ def _run_session(args, prefill_dir, decode_dir, model_dir):
 
 def main():
     parser = argparse.ArgumentParser(
-        description="DeepSeek-V4 EP2 synthetic prefill/decode token loop."
+        description="DeepSeek-V4 prefill/decode token loop (synthetic by default; "
+        "--weights/--prompt for real-weight generation)."
     )
     parser.add_argument("--variant", choices=("pro", "flash"), default="flash")
     parser.add_argument("-p", "--platform", choices=("a5",), default="a5")
-    parser.add_argument("--ep", type=int, choices=(EP_SIZE,), default=EP_SIZE)
+    parser.add_argument("--ep", type=int, choices=(2, 4, 8), default=EP_SIZE,
+                        help="EP world size / rank count; only EP8 deploys the full 256-expert model")
     parser.add_argument("--tp", type=int, choices=(TP_SIZE,), default=TP_SIZE)
     parser.add_argument("-d", "--device", default="0,1")
     parser.add_argument("--decode-steps", type=int, default=2)
     parser.add_argument("--prefill-runtime-dir", type=Path)
     parser.add_argument("--decode-runtime-dir", type=Path)
     parser.add_argument("--compile-only", action="store_true")
+    parser.add_argument("--weights", type=str, default=None,
+                        help="HF checkpoint dir or weights_flash.py .pt cache dir "
+                             "(must match --ep/--tp); real weights for the resident bank.")
+    parser.add_argument("--prompt", type=str, default=None,
+                        help="natural-language prompt (requires --weights and a tokenizer)")
+    parser.add_argument("--prompt-file", type=str, default=None,
+                        help="read the prompt text from this file")
+    parser.add_argument("--tokenizer", type=str, default=None,
+                        help="tokenizer.json path; defaults to <--weights>/tokenizer.json if present")
+    parser.add_argument("--no-bos", action="store_true",
+                        help="do not prepend the BOS token to the prompt")
+    parser.add_argument("--eos-id", type=int, default=1,
+                        help="stop decoding when this token is sampled (real-weight runs only)")
     args = parser.parse_args()
 
     device_ids = [device for device in args.device.split(",") if device]
-    if len(device_ids) != EP_SIZE:
-        raise ValueError(f"EP2 requires exactly two devices, got {args.device!r}")
+    if len(device_ids) != args.ep:
+        raise ValueError(f"EP{args.ep} requires exactly {args.ep} devices, got {args.device!r}")
     if args.decode_steps < 1:
         raise ValueError("--decode-steps must be positive")
+
+    args.prompt_ids = None
+    if args.prompt is not None or args.prompt_file is not None:
+        if args.weights is None:
+            raise ValueError("--prompt/--prompt-file require --weights (real-weight run)")
+        if args.prompt is not None and args.prompt_file is not None:
+            raise ValueError("pass either --prompt or --prompt-file, not both")
+        text = args.prompt if args.prompt is not None else Path(args.prompt_file).read_text()
+        if args.tokenizer is None:
+            candidate = Path(args.weights) / "tokenizer.json"
+            if candidate.is_file():
+                args.tokenizer = str(candidate)
+        if args.tokenizer is None:
+            raise ValueError("--tokenizer is required (no tokenizer.json under --weights)")
+        from tokenizers import Tokenizer
+
+        tokenizer = Tokenizer.from_file(args.tokenizer)
+        ids = tokenizer.encode(text).ids
+        if not args.no_bos:
+            bos_id = tokenizer.token_to_id("<｜begin▁of▁sentence｜>")
+            if bos_id is not None:
+                ids = [bos_id] + ids
+        if not 1 <= len(ids) <= PROMPT_TOKENS:
+            raise ValueError(f"prompt is {len(ids)} tokens; must be within 1..{PROMPT_TOKENS}")
+        args.prompt_ids = torch.tensor(ids, dtype=torch.int64)
+        print(f"[SESSION] prompt: {len(ids)} tokens {ids}", flush=True)
 
     os.environ["DEEPSEEK_V4_VARIANT"] = args.variant
     model_dir = Path(__file__).resolve().parent
@@ -697,7 +826,8 @@ def main():
         return
 
     _run_session(args, prefill_dir.resolve(), decode_dir.resolve(), model_dir)
-    print("[SESSION] PASS: EP2 synthetic token loop completed", flush=True)
+    mode = "real-weight" if args.weights is not None else "synthetic"
+    print(f"[SESSION] PASS: EP{args.ep} {mode} token loop completed", flush=True)
 
 
 if __name__ == "__main__":
