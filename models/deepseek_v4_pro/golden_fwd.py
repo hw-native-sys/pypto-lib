@@ -41,14 +41,20 @@ config.MOE_TOKENS = config.PREFILL_TOKENS
 from moe import D, HC_MULT, N_RANKS, T, golden_moe
 from config import ACTIVE as MODEL_CONFIG
 from prefill_attention_swa import golden_prefill_attention_swa
-from prefill_attention_hca import golden_prefill_attention_hca
-from prefill_attention_csa import golden_prefill_attention_csa
+from prefill_attention_hca import HCA_STATE_BLOCK_SIZE, golden_prefill_attention_hca
+from prefill_attention_csa import (
+    CSA_STATE_BLOCK_SIZE,
+    INNER_STATE_BLOCK_SIZE,
+    golden_prefill_attention_csa,
+)
 from input_pack import golden_pack_x_hc
 from hc_head import (
+    LINEAR_K_PER_SPLIT as HC_HEAD_LINEAR_K_PER_SPLIT,
     LINEAR_K_CHUNK as HC_HEAD_LINEAR_K_CHUNK,
+    LINEAR_OK as HC_HEAD_LINEAR_OK,
     RMS_K_CHUNK as HC_HEAD_RMS_K_CHUNK,
 )
-from lm_head import TP_SIZE as LM_HEAD_TP_SIZE, compare_sampled_ids
+from lm_head import TP_SIZE as LM_HEAD_TP_SIZE
 from rmsnorm import golden_rms_norm
 
 # ---------------------------------------------------------------------------
@@ -57,6 +63,7 @@ from rmsnorm import golden_rms_norm
 # (ascending layer id within the kind).
 # ---------------------------------------------------------------------------
 _KIND_BY_RATIO = {0: "swa", 4: "csa", 128: "hca"}
+_ROPE_PROFILE_BY_KIND = {"swa": 0, "csa": 1, "hca": 1}
 FWD_NUM_LAYERS = MODEL_CONFIG.num_hidden_layers
 FWD_COMPRESS_RATIOS = MODEL_CONFIG.compress_ratios[:FWD_NUM_LAYERS]
 LAYER_KINDS = tuple(_KIND_BY_RATIO[ratio] for ratio in FWD_COMPRESS_RATIOS)
@@ -74,6 +81,14 @@ def _kind_orders():
 
 
 KIND_ORDER = _kind_orders()
+
+
+def _rope_profile_for_kind(stacked, kind):
+    try:
+        profile = _ROPE_PROFILE_BY_KIND[kind]
+    except KeyError as exc:
+        raise ValueError(f"unsupported DeepSeek V4 attention kind {kind!r}") from exc
+    return stacked[profile]
 
 
 def _layer_rows(stacked, count, index):
@@ -97,6 +112,7 @@ def _base_attention_views(tensors, rank, layer, x_hc, x_out, num_tokens):
     def fwd(name):
         return _layer_rows(tensors[name], FWD_NUM_LAYERS, layer)[rank]
 
+    kind = LAYER_KINDS[layer]
     return {
         "num_tokens": num_tokens,
         "x_hc": x_hc,
@@ -110,8 +126,8 @@ def _base_attention_views(tensors, rank, layer, x_hc, x_out, num_tokens):
         "wkv": fwd("wkv"),
         "gamma_cq": fwd("gamma_cq"),
         "gamma_ckv": fwd("gamma_ckv"),
-        "freqs_cos": tensors["freqs_cos"][rank],
-        "freqs_sin": tensors["freqs_sin"][rank],
+        "freqs_cos": _rope_profile_for_kind(tensors["freqs_cos"][rank], kind),
+        "freqs_sin": _rope_profile_for_kind(tensors["freqs_sin"][rank], kind),
         "position_ids": tensors["position_ids"][rank],
         "kv_cache": fwd("kv_cache"),
         "ori_slot_mapping": tensors["ori_slot_mapping"][rank],
@@ -253,10 +269,15 @@ def _golden_hc_head_rows(tensors):
     mix_cols = []
     for h in range(HC_MULT):
         mix_col = torch.zeros(rows, 1, dtype=torch.float32)
-        for k0 in range(0, hc_dim, HC_HEAD_LINEAR_K_CHUNK):
-            x_chunk = x_flat_2d[:, k0:k0 + HC_HEAD_LINEAR_K_CHUNK]
-            w_chunk = hc_head_fn[h:h + 1, k0:k0 + HC_HEAD_LINEAR_K_CHUNK]
-            mix_col += (x_chunk * w_chunk).sum(dim=1, keepdim=True)
+        for linear_split in range(HC_HEAD_LINEAR_OK):
+            split_col = torch.zeros(rows, 1, dtype=torch.float32)
+            split_start = linear_split * HC_HEAD_LINEAR_K_PER_SPLIT
+            split_end = split_start + HC_HEAD_LINEAR_K_PER_SPLIT
+            for k0 in range(split_start, split_end, HC_HEAD_LINEAR_K_CHUNK):
+                x_chunk = x_flat_2d[:, k0:k0 + HC_HEAD_LINEAR_K_CHUNK]
+                w_chunk = hc_head_fn[h:h + 1, k0:k0 + HC_HEAD_LINEAR_K_CHUNK]
+                split_col += (x_chunk * w_chunk).sum(dim=1, keepdim=True)
+            mix_col += split_col
         mix_cols.append(mix_col * rsqrt)
     mixes = torch.cat(mix_cols, dim=1).reshape(rows, HC_MULT)
 
@@ -404,32 +425,129 @@ def _logits_cosine_compare(min_cosine=0.99, max_rel_l2=0.10):
 def build_validate_compare_fn(num_tokens):
     """Per-output comparators for prefill_fwd --validate.
 
-    Hidden states use a bounded-outlier-ratio per-point comparison over the
-    active token rows; logits use cosine/relative-L2 acceptance on the sampled
-    rows; sampled_ids only require self-consistency with the device's own
-    logits (greedy argmax). Caches compare over the whole stacked pool:
-    unmapped slots stay bit-identical to the shared init on both sides, so a
-    plain ratio comparison covers mapped slots without a per-layer mapping.
+    Hidden states resolve their active prefix from the run input, so replayed
+    scalar data cannot be diluted by the spec initializer. Logits use
+    cosine/relative-L2 acceptance on the selected rows, while sampled IDs must
+    match both golden and the device-logit argmax. Layer-stacked pools compare
+    only active mapped rows, independently per layer/rank, and require every
+    other physical row to remain exactly equal to golden.
     """
-    from golden import ratio_allclose
-
-    active_rows = max(min(int(num_tokens), T), 1)
-    hidden_cmp = ratio_allclose(
-        atol=1e-2, rtol=5e-2, max_error_ratio=0.02,
-        valid_rows=active_rows, valid_axis=1,
+    from golden import (
+        input_prefix_ratio_allclose,
+        sampled_ids_golden_compare,
+        stacked_mapped_pool_ratio_allclose,
     )
-    state_cmp = ratio_allclose(atol=5e-3, rtol=2e-2, max_error_ratio=0.01)
+
+    # Keep the public builder signature used by prefill_fwd. The comparator
+    # intentionally reads the effective value from inputs["num_tokens"] at
+    # validation time because golden-data replay overrides this initializer.
+    del num_tokens
+    hidden_cmp = input_prefix_ratio_allclose(
+        "num_tokens",
+        atol=1e-2, rtol=5e-2, max_error_ratio=0.02,
+        valid_axis=1, exact_tail=True,
+    )
+    mapping_shape = (N_RANKS, T)
+    all_layer_labels = tuple(range(FWD_NUM_LAYERS))
+    csa_layer_labels = tuple(
+        layer for layer, kind in enumerate(LAYER_KINDS) if kind == "csa"
+    )
+    hca_layer_labels = tuple(
+        layer for layer, kind in enumerate(LAYER_KINDS) if kind == "hca"
+    )
+
+    def stacked_pool(
+        mapping_names,
+        *,
+        layer_labels,
+        block_size,
+        pool_name,
+        atol,
+        rtol,
+        max_error_ratio,
+    ):
+        return stacked_mapped_pool_ratio_allclose(
+            tuple(mapping_names),
+            mapping_shape=mapping_shape,
+            block_size=block_size,
+            active_rows_name="num_tokens",
+            layer_labels=tuple(layer_labels),
+            pool_name=pool_name,
+            atol=atol,
+            rtol=rtol,
+            max_error_ratio=max_error_ratio,
+        )
+
     return {
         "pre_hc_hidden_out": hidden_cmp,
         "hidden_out": hidden_cmp,
         "logits": _logits_cosine_compare(),
-        "sampled_ids": compare_sampled_ids,
-        "kv_cache": ratio_allclose(atol=1e-3, rtol=3e-2, max_error_ratio=0.01),
-        "cmp_kv": ratio_allclose(atol=1e-3, rtol=3e-2, max_error_ratio=0.01),
-        "hca_compress_state": state_cmp,
-        "csa_compress_state": state_cmp,
-        "csa_inner_compress_state": state_cmp,
+        "sampled_ids": sampled_ids_golden_compare(),
+        "kv_cache": stacked_pool(
+            ("ori_slot_mapping",) * FWD_NUM_LAYERS,
+            layer_labels=all_layer_labels,
+            block_size=config.BLOCK_SIZE,
+            pool_name="kv_cache",
+            atol=1e-3,
+            rtol=3e-2,
+            max_error_ratio=0.01,
+        ),
+        "cmp_kv": stacked_pool(
+            (
+                None if kind == "swa" else f"{kind}_cmp_slot_mapping"
+                for kind in LAYER_KINDS
+            ),
+            layer_labels=all_layer_labels,
+            block_size=config.BLOCK_SIZE,
+            pool_name="cmp_kv",
+            atol=1e-3,
+            rtol=3e-2,
+            max_error_ratio=0.01,
+        ),
+        "hca_compress_state": stacked_pool(
+            ("hca_state_slot_mapping",) * HCA_NUM_LAYERS,
+            layer_labels=hca_layer_labels,
+            block_size=HCA_STATE_BLOCK_SIZE,
+            pool_name="hca_compress_state",
+            atol=5e-3,
+            rtol=2e-2,
+            max_error_ratio=0.01,
+        ),
+        "csa_compress_state": stacked_pool(
+            ("csa_state_slot_mapping",) * CSA_NUM_LAYERS,
+            layer_labels=csa_layer_labels,
+            block_size=CSA_STATE_BLOCK_SIZE,
+            pool_name="csa_compress_state",
+            atol=5e-3,
+            rtol=2e-2,
+            max_error_ratio=0.01,
+        ),
+        "csa_inner_compress_state": stacked_pool(
+            ("csa_inner_state_slot_mapping",) * CSA_NUM_LAYERS,
+            layer_labels=csa_layer_labels,
+            block_size=INNER_STATE_BLOCK_SIZE,
+            pool_name="csa_inner_compress_state",
+            atol=5e-3,
+            rtol=2e-2,
+            max_error_ratio=0.01,
+        ),
         # INT8 index cache: allow one quantization step on a bounded fraction.
-        "idx_kv_cache": ratio_allclose(atol=1, rtol=0, max_error_ratio=0.02),
-        "idx_kv_scale": ratio_allclose(atol=1e-3, rtol=1e-2, max_error_ratio=0.01),
+        "idx_kv_cache": stacked_pool(
+            ("csa_idx_slot_mapping",) * CSA_NUM_LAYERS,
+            layer_labels=csa_layer_labels,
+            block_size=config.BLOCK_SIZE,
+            pool_name="idx_kv_cache",
+            atol=1,
+            rtol=0,
+            max_error_ratio=0.02,
+        ),
+        "idx_kv_scale": stacked_pool(
+            ("csa_idx_slot_mapping",) * CSA_NUM_LAYERS,
+            layer_labels=csa_layer_labels,
+            block_size=config.BLOCK_SIZE,
+            pool_name="idx_kv_scale",
+            atol=1e-3,
+            rtol=1e-2,
+            max_error_ratio=0.01,
+        ),
     }

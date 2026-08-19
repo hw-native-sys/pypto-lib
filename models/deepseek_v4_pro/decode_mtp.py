@@ -33,6 +33,7 @@ import pypto.language.distributed as pld
 from pypto.ir.distributed_compiled_program import DistributedConfig
 
 from config import ACTIVE as M, DECODE_START_POS
+from decode_attention_csa import COMPRESS_RATIO as CSA_COMPRESS_RATIO
 from decode_attention_swa import (
     BLOCK_SIZE,
     HEAD_DIM,
@@ -105,8 +106,8 @@ def mtp_decode_layer(
     wkv: pl.Tensor[[D, HEAD_DIM], pl.BF16],
     gamma_cq: pl.Tensor[[Q_LORA], pl.BF16],
     gamma_ckv: pl.Tensor[[HEAD_DIM], pl.BF16],
-    freqs_cos: pl.Tensor[[MAX_SEQ_LEN, ROPE_HEAD_DIM], pl.BF16],
-    freqs_sin: pl.Tensor[[MAX_SEQ_LEN, ROPE_HEAD_DIM], pl.BF16],
+    freqs_cos: pl.Tensor[[2, MAX_SEQ_LEN, ROPE_HEAD_DIM], pl.BF16],
+    freqs_sin: pl.Tensor[[2, MAX_SEQ_LEN, ROPE_HEAD_DIM], pl.BF16],
     kv_cache: pl.InOut[pl.Tensor[[ORI_BLOCK_NUM, BLOCK_SIZE, 1, HEAD_DIM], pl.BF16]],
     swa_slot_mapping: pl.Tensor[[T], pl.INT64],
     swa_indices: pl.Tensor[[T, WIN], pl.INT32],
@@ -152,6 +153,18 @@ def mtp_decode_layer(
     my_rank: pl.Scalar[pl.INT32],
     num_tokens: pl.Scalar[pl.INT32],
 ) -> pl.Tensor[[T, HC_MULT, D], pl.BF16]:
+    swa_cos_profile: pl.Tensor[[1, MAX_SEQ_LEN, ROPE_HEAD_DIM], pl.BF16] = pl.slice(
+        freqs_cos, [1, MAX_SEQ_LEN, ROPE_HEAD_DIM], [0, 0, 0]
+    )
+    swa_sin_profile: pl.Tensor[[1, MAX_SEQ_LEN, ROPE_HEAD_DIM], pl.BF16] = pl.slice(
+        freqs_sin, [1, MAX_SEQ_LEN, ROPE_HEAD_DIM], [0, 0, 0]
+    )
+    swa_freqs_cos: pl.Tensor[[MAX_SEQ_LEN, ROPE_HEAD_DIM], pl.BF16] = pl.reshape(
+        swa_cos_profile, [MAX_SEQ_LEN, ROPE_HEAD_DIM]
+    )
+    swa_freqs_sin: pl.Tensor[[MAX_SEQ_LEN, ROPE_HEAD_DIM], pl.BF16] = pl.reshape(
+        swa_sin_profile, [MAX_SEQ_LEN, ROPE_HEAD_DIM]
+    )
     projected_hidden = pl.create_tensor([T, HC_MULT, D], dtype=pl.FP32)
     mtp_projection(
         hidden_states,
@@ -179,8 +192,8 @@ def mtp_decode_layer(
         wkv,
         gamma_cq,
         gamma_ckv,
-        freqs_cos,
-        freqs_sin,
+        swa_freqs_cos,
+        swa_freqs_sin,
         kv_cache,
         swa_slot_mapping,
         swa_indices,
@@ -228,6 +241,43 @@ def mtp_decode_layer(
         my_rank,
         pl.cast(MTP_MOE_EPOCH, pl.INT32),
     )
+
+    # Retire this dispatch's persistent MoE signal credits.
+    neg_epochs = pl.cast(0 - MTP_MOE_EPOCH, pl.INT32)
+    neg_data = pl.cast(0 - MTP_MOE_EPOCH * N_LOCAL, pl.INT32)
+    neg_combine = pl.cast(0 - MTP_MOE_EPOCH * (N_LOCAL + 1), pl.INT32)
+    with pl.at(level=pl.Level.CORE_GROUP, name_hint="moe_signal_retire"):
+        _pre_hc_anchor = pl.read(next_pre_hc_hidden, [0, 0, 0])
+        pld.system.notify(
+            target=combine_arrived,
+            peer=my_rank,
+            offsets=[my_rank, 0],
+            value=neg_epochs,
+            op=pld.NotifyOp.AtomicAdd,
+        )
+        for src in pl.range(N_RANKS):
+            if src != my_rank:
+                pld.system.notify(
+                    target=arrived,
+                    peer=my_rank,
+                    offsets=[src, 0],
+                    value=neg_epochs,
+                    op=pld.NotifyOp.AtomicAdd,
+                )
+                pld.system.notify(
+                    target=data_arrived,
+                    peer=my_rank,
+                    offsets=[src, 0],
+                    value=neg_data,
+                    op=pld.NotifyOp.AtomicAdd,
+                )
+                pld.system.notify(
+                    target=combine_arrived,
+                    peer=my_rank,
+                    offsets=[src, 0],
+                    value=neg_combine,
+                    op=pld.NotifyOp.AtomicAdd,
+                )
     x_head = pl.create_tensor([T, D], dtype=pl.BF16)
     hc_head(next_pre_hc_hidden, mtp_hc_head_fn, mtp_hc_head_scale, mtp_hc_head_base, x_head)
     rms_norm(x_head, mtp_norm_w, hidden_out)
@@ -257,8 +307,8 @@ def l3_mtp_decode_layer(
     wkv: pl.Tensor[[N_RANKS, D, HEAD_DIM], pl.BF16],
     gamma_cq: pl.Tensor[[N_RANKS, Q_LORA], pl.BF16],
     gamma_ckv: pl.Tensor[[N_RANKS, HEAD_DIM], pl.BF16],
-    freqs_cos: pl.Tensor[[N_RANKS, MAX_SEQ_LEN, ROPE_HEAD_DIM], pl.BF16],
-    freqs_sin: pl.Tensor[[N_RANKS, MAX_SEQ_LEN, ROPE_HEAD_DIM], pl.BF16],
+    freqs_cos: pl.Tensor[[N_RANKS, 2, MAX_SEQ_LEN, ROPE_HEAD_DIM], pl.BF16],
+    freqs_sin: pl.Tensor[[N_RANKS, 2, MAX_SEQ_LEN, ROPE_HEAD_DIM], pl.BF16],
     kv_cache: pl.InOut[pl.Tensor[[N_RANKS, ORI_BLOCK_NUM, BLOCK_SIZE, 1, HEAD_DIM], pl.BF16]],
     swa_slot_mapping: pl.Tensor[[N_RANKS, T], pl.INT64],
     swa_indices: pl.Tensor[[N_RANKS, T, WIN], pl.INT32],
@@ -365,6 +415,32 @@ def _ranked_spec(name, spec, *, replicated=False, is_output=False):
     )
 
 
+def _make_rope_profile_spec(name, swa_spec, csa_spec):
+    import torch
+    from golden import TensorSpec
+
+    if tuple(swa_spec.shape) != tuple(csa_spec.shape):
+        raise ValueError(
+            f"{name} leaf shapes must match, got SWA {swa_spec.shape} and CSA {csa_spec.shape}"
+        )
+    if swa_spec.dtype != csa_spec.dtype:
+        raise ValueError(
+            f"{name} leaf dtypes must match, got SWA {swa_spec.dtype} and CSA {csa_spec.dtype}"
+        )
+
+    def init_value():
+        return torch.stack(
+            (swa_spec.create_tensor(), csa_spec.create_tensor()), dim=0
+        ).contiguous()
+
+    return TensorSpec(
+        name,
+        [2, *swa_spec.shape],
+        swa_spec.dtype,
+        init_value=init_value,
+    )
+
+
 def _projection_specs():
     import torch
     from golden import TensorSpec
@@ -468,6 +544,7 @@ def _mtp_head_specs():
 def build_tensor_specs(start_pos=DECODE_START_POS, num_tokens=T):
     import torch
     from golden import ScalarSpec, TensorSpec
+    from rope_tables import build_deepseek_v4_rope_tables
 
     projection_specs = _projection_specs()
     mtp_head_specs = _mtp_head_specs()
@@ -475,6 +552,27 @@ def build_tensor_specs(start_pos=DECODE_START_POS, num_tokens=T):
         spec.name: spec
         for spec in build_swa_tensor_specs(start_pos)
         if isinstance(spec, TensorSpec)
+    }
+    compressed_freqs_cos, compressed_freqs_sin = build_deepseek_v4_rope_tables(
+        M, CSA_COMPRESS_RATIO, dtype=torch.bfloat16
+    )
+    compressed_rope_specs = {
+        "freqs_cos": TensorSpec(
+            "freqs_cos",
+            list(compressed_freqs_cos.shape),
+            compressed_freqs_cos.dtype,
+            init_value=lambda: compressed_freqs_cos.clone(),
+        ),
+        "freqs_sin": TensorSpec(
+            "freqs_sin",
+            list(compressed_freqs_sin.shape),
+            compressed_freqs_sin.dtype,
+            init_value=lambda: compressed_freqs_sin.clone(),
+        ),
+    }
+    rope_specs = {
+        name: _make_rope_profile_spec(name, swa_specs[name], compressed_rope_specs[name])
+        for name in ("freqs_cos", "freqs_sin")
     }
     moe_specs = {
         spec.name: spec
@@ -526,6 +624,8 @@ def build_tensor_specs(start_pos=DECODE_START_POS, num_tokens=T):
             specs.append(mtp_head_specs[name])
         elif name in moe_specs:
             specs.append(moe_specs[name])
+        elif name in rope_specs:
+            specs.append(_ranked_spec(name, rope_specs[name], replicated=True))
         else:
             specs.append(
                 _ranked_spec(
@@ -591,8 +691,8 @@ def golden_mtp_decode_layer(tensors):
             "wkv": tensors["wkv"][rank],
             "gamma_cq": tensors["gamma_cq"][rank],
             "gamma_ckv": tensors["gamma_ckv"][rank],
-            "freqs_cos": tensors["freqs_cos"][rank],
-            "freqs_sin": tensors["freqs_sin"][rank],
+            "freqs_cos": tensors["freqs_cos"][rank, 0],
+            "freqs_sin": tensors["freqs_sin"][rank, 0],
             "kv_cache": tensors["kv_cache"][rank],
             "swa_slot_mapping": tensors["swa_slot_mapping"][rank],
             "swa_indices": tensors["swa_indices"][rank],

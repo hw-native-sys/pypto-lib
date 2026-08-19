@@ -26,6 +26,12 @@ validates every output, including the resident caches.
 """
 
 import argparse
+import os
+
+# Trace-time bisect knob for the 2026-08-19 EP8 SCHEDULER_TIMEOUT
+# investigation: "1" drops the moe_signal_retire scope from the compiled
+# program (single-dispatch outputs are unaffected by retirement).
+DSV4_DISABLE_MOE_RETIRE = os.environ.get("DSV4_DISABLE_MOE_RETIRE", "0") == "1"
 
 import pypto.language as pl
 import pypto.language.distributed as pld
@@ -144,6 +150,18 @@ MODEL_NUM_LAYERS = MODEL_CONFIG.num_hidden_layers
 FWD_COMPRESS_RATIOS = MODEL_CONFIG.compress_ratios[:MODEL_NUM_LAYERS]
 FWD_NUM_LAYERS = MODEL_NUM_LAYERS
 SWA_COMPRESS_RATIO = 0
+SWA_ROPE_PROFILE = 0
+COMPRESSED_ROPE_PROFILE = 1
+
+
+def _rope_profile_for_compress_ratio(compress_ratio):
+    if compress_ratio == SWA_COMPRESS_RATIO:
+        return SWA_ROPE_PROFILE
+    if compress_ratio in (CSA_COMPRESS_RATIO, HCA_COMPRESS_RATIO):
+        return COMPRESSED_ROPE_PROFILE
+    raise ValueError(f"unsupported DeepSeek V4 attention compress ratio {compress_ratio}")
+
+
 SWA_NUM_LAYERS = FWD_COMPRESS_RATIOS.count(SWA_COMPRESS_RATIO)
 CSA_NUM_LAYERS = FWD_COMPRESS_RATIOS.count(CSA_COMPRESS_RATIO)
 HCA_NUM_LAYERS = FWD_COMPRESS_RATIOS.count(HCA_COMPRESS_RATIO)
@@ -157,6 +175,7 @@ CSA_LAST_ORDER = CSA_NUM_LAYERS - 1
 # Flash: lead = 2 swa, 20 pairs.  Pro: lead = 2 hca, 29 pairs.
 LEAD_NUM_LAYERS = 2
 LEAD_COMPRESS_RATIO = FWD_COMPRESS_RATIOS[0]
+LEAD_ROPE_PROFILE = _rope_profile_for_compress_ratio(LEAD_COMPRESS_RATIO)
 PAIR_LOOP_COUNT = (FWD_NUM_LAYERS - LEAD_NUM_LAYERS - 1) // 2
 # hca-kind stack slot of the first *looped* hca layer: the leading layers consume
 # a slot each only when they are themselves hca (Pro: 2; Flash: 0, they were swa).
@@ -432,8 +451,8 @@ def prefill_fwd(
     hca_compress_state_block_table: pl.Tensor[[HCA_STATE_MAX_BLOCKS], pl.INT32],
     csa_compress_state_block_table: pl.Tensor[[CSA_STATE_MAX_BLOCKS], pl.INT32],
     csa_inner_compress_state_block_table: pl.Tensor[[INNER_STATE_MAX_BLOCKS], pl.INT32],
-    freqs_cos: pl.Tensor[[MAX_SEQ_LEN, ROPE_HEAD_DIM], pl.BF16],
-    freqs_sin: pl.Tensor[[MAX_SEQ_LEN, ROPE_HEAD_DIM], pl.BF16],
+    freqs_cos: pl.Tensor[[2, MAX_SEQ_LEN, ROPE_HEAD_DIM], pl.BF16],
+    freqs_sin: pl.Tensor[[2, MAX_SEQ_LEN, ROPE_HEAD_DIM], pl.BF16],
     ori_block_table: pl.Tensor[[SPARSE_ORI_MAX_BLOCKS], pl.INT32],
     cmp_block_table: pl.Tensor[[SPARSE_CMP_MAX_BLOCKS], pl.INT32],
     idx_block_table: pl.Tensor[[IDX_CACHE_MAX_BLOCKS], pl.INT32],
@@ -482,6 +501,30 @@ def prefill_fwd(
     my_rank: pl.Scalar[pl.INT32],
     num_tokens: pl.Scalar[pl.INT32],
 ) -> pl.Tensor[[T, D], pl.BF16]:
+    lead_cos_profile: pl.Tensor[[1, MAX_SEQ_LEN, ROPE_HEAD_DIM], pl.BF16] = pl.slice(
+        freqs_cos, [1, MAX_SEQ_LEN, ROPE_HEAD_DIM], [LEAD_ROPE_PROFILE, 0, 0]
+    )
+    lead_sin_profile: pl.Tensor[[1, MAX_SEQ_LEN, ROPE_HEAD_DIM], pl.BF16] = pl.slice(
+        freqs_sin, [1, MAX_SEQ_LEN, ROPE_HEAD_DIM], [LEAD_ROPE_PROFILE, 0, 0]
+    )
+    compressed_cos_profile: pl.Tensor[[1, MAX_SEQ_LEN, ROPE_HEAD_DIM], pl.BF16] = pl.slice(
+        freqs_cos, [1, MAX_SEQ_LEN, ROPE_HEAD_DIM], [COMPRESSED_ROPE_PROFILE, 0, 0]
+    )
+    compressed_sin_profile: pl.Tensor[[1, MAX_SEQ_LEN, ROPE_HEAD_DIM], pl.BF16] = pl.slice(
+        freqs_sin, [1, MAX_SEQ_LEN, ROPE_HEAD_DIM], [COMPRESSED_ROPE_PROFILE, 0, 0]
+    )
+    lead_freqs_cos: pl.Tensor[[MAX_SEQ_LEN, ROPE_HEAD_DIM], pl.BF16] = pl.reshape(
+        lead_cos_profile, [MAX_SEQ_LEN, ROPE_HEAD_DIM]
+    )
+    lead_freqs_sin: pl.Tensor[[MAX_SEQ_LEN, ROPE_HEAD_DIM], pl.BF16] = pl.reshape(
+        lead_sin_profile, [MAX_SEQ_LEN, ROPE_HEAD_DIM]
+    )
+    compressed_freqs_cos: pl.Tensor[[MAX_SEQ_LEN, ROPE_HEAD_DIM], pl.BF16] = pl.reshape(
+        compressed_cos_profile, [MAX_SEQ_LEN, ROPE_HEAD_DIM]
+    )
+    compressed_freqs_sin: pl.Tensor[[MAX_SEQ_LEN, ROPE_HEAD_DIM], pl.BF16] = pl.reshape(
+        compressed_sin_profile, [MAX_SEQ_LEN, ROPE_HEAD_DIM]
+    )
     nt: pl.Scalar[pl.INT32] = num_tokens
     x_hc = pl.create_tensor([T, HC_MULT, D], dtype=pl.FP32)
     pack_x_hc(input_ids, embed_weight, x_hc)
@@ -534,7 +577,7 @@ def prefill_fwd(
             x_hc,
             hc_attn_fn_l0, hc_attn_scale_l0, hc_attn_base_l0, attn_norm_w_l0,
             wq_a_l0, wq_b_l0, wq_b_scale_l0, wkv_l0, gamma_cq_l0, gamma_ckv_l0,
-            freqs_cos, freqs_sin,
+            lead_freqs_cos, lead_freqs_sin,
             hca_cmp_wkv_l0, hca_cmp_wgate_l0, hca_cmp_ape_l0, hca_cmp_norm_w_l0,
             hca_compress_state_l0, hca_compress_state_block_table,
             kv_cache_l0, ori_slot_mapping, ori_block_table,
@@ -605,7 +648,7 @@ def prefill_fwd(
             hidden,
             hc_attn_fn_l1, hc_attn_scale_l1, hc_attn_base_l1, attn_norm_w_l1,
             wq_a_l1, wq_b_l1, wq_b_scale_l1, wkv_l1, gamma_cq_l1, gamma_ckv_l1,
-            freqs_cos, freqs_sin,
+            lead_freqs_cos, lead_freqs_sin,
             hca_cmp_wkv_l1, hca_cmp_wgate_l1, hca_cmp_ape_l1, hca_cmp_norm_w_l1,
             hca_compress_state_l1, hca_compress_state_block_table,
             kv_cache_l1, ori_slot_mapping, ori_block_table,
@@ -698,7 +741,7 @@ def prefill_fwd(
                 hidden,
                 hc_attn_fn_csa, hc_attn_scale_csa, hc_attn_base_csa, attn_norm_w_csa,
                 wq_a_csa, wq_b_csa, wq_b_scale_csa, wkv_csa, gamma_cq_csa, gamma_ckv_csa,
-                freqs_cos, freqs_sin,
+                compressed_freqs_cos, compressed_freqs_sin,
                 csa_cmp_wkv_csa, csa_cmp_wgate_csa, csa_cmp_ape_csa, csa_cmp_norm_w_csa,
                 csa_compress_state_csa, csa_compress_state_block_table,
                 csa_hadamard_idx_csa,
@@ -774,7 +817,7 @@ def prefill_fwd(
                 hidden_mid,
                 hc_attn_fn_hca, hc_attn_scale_hca, hc_attn_base_hca, attn_norm_w_hca,
                 wq_a_hca, wq_b_hca, wq_b_scale_hca, wkv_hca, gamma_cq_hca, gamma_ckv_hca,
-                freqs_cos, freqs_sin,
+                compressed_freqs_cos, compressed_freqs_sin,
                 hca_cmp_wkv_hca, hca_cmp_wgate_hca, hca_cmp_ape_hca, hca_cmp_norm_w_hca,
                 hca_compress_state_hca, hca_compress_state_block_table,
                 kv_cache_hca, ori_slot_mapping, ori_block_table,
@@ -859,7 +902,7 @@ def prefill_fwd(
             hidden,
             hc_attn_fn_last, hc_attn_scale_last, hc_attn_base_last, attn_norm_w_last,
             wq_a_last, wq_b_last, wq_b_scale_last, wkv_last, gamma_cq_last, gamma_ckv_last,
-            freqs_cos, freqs_sin,
+            compressed_freqs_cos, compressed_freqs_sin,
             csa_cmp_wkv_last, csa_cmp_wgate_last, csa_cmp_ape_last, csa_cmp_norm_w_last,
             csa_compress_state_last, csa_compress_state_block_table,
             csa_hadamard_idx_last,
@@ -887,6 +930,56 @@ def prefill_fwd(
             routed_y_buf, combine_arrived,
             csa_layer_last, nt, my_rank, last_moe_epoch,
         )
+
+    # Persistent distributed windows survive serving or benchmark dispatches,
+    # while every invocation restarts its MoE epochs at one. Retire exactly the
+    # credits deposited by this full-model dispatch so the next dispatch cannot
+    # inherit pre-satisfied waits. Use AtomicAdd subtraction instead of a zero
+    # write: the final consumed credit may still be in flight, and addition
+    # commutes with that trailing notify.
+    #
+    # DSV4_DISABLE_MOE_RETIRE=1 (trace-time) drops the retire scope entirely —
+    # a bisect knob for the 2026-08-19 EP8 SCHEDULER_TIMEOUT investigation: the
+    # single-element anchor below orders the retire only after the task writing
+    # pre_hc_hidden_out[0,0,0], not after every wait of this dispatch, so the
+    # negative credits can land while later combine waits are still pending.
+    # Single-dispatch outputs are unaffected by retirement either way.
+    if not DSV4_DISABLE_MOE_RETIRE:
+        neg_epochs = pl.cast(0 - LAST_MOE_EPOCH, pl.INT32)
+        neg_data = pl.cast(0 - LAST_MOE_EPOCH * N_LOCAL, pl.INT32)
+        neg_combine = pl.cast(0 - LAST_MOE_EPOCH * (N_LOCAL + 1), pl.INT32)
+        with pl.at(level=pl.Level.CORE_GROUP, name_hint="moe_signal_retire"):
+            _pre_hc_anchor = pl.read(pre_hc_hidden_out, [0, 0, 0])
+            pld.system.notify(
+                target=combine_arrived,
+                peer=my_rank,
+                offsets=[my_rank, 0],
+                value=neg_epochs,
+                op=pld.NotifyOp.AtomicAdd,
+            )
+            for src in pl.range(N_RANKS):
+                if src != my_rank:
+                    pld.system.notify(
+                        target=arrived,
+                        peer=my_rank,
+                        offsets=[src, 0],
+                        value=neg_epochs,
+                        op=pld.NotifyOp.AtomicAdd,
+                    )
+                    pld.system.notify(
+                        target=data_arrived,
+                        peer=my_rank,
+                        offsets=[src, 0],
+                        value=neg_data,
+                        op=pld.NotifyOp.AtomicAdd,
+                    )
+                    pld.system.notify(
+                        target=combine_arrived,
+                        peer=my_rank,
+                        offsets=[src, 0],
+                        value=neg_combine,
+                        op=pld.NotifyOp.AtomicAdd,
+                    )
     x_head: pl.Tensor[[T, D], pl.BF16] = pl.create_tensor([T, D], dtype=pl.BF16)
     with pl.scope():
         hc_head(pre_hc_hidden_out, hc_head_fn, hc_head_scale, hc_head_base, x_head)
@@ -937,8 +1030,8 @@ def l3_prefill_fwd(
     hca_compress_state_block_table: pl.Tensor[[N_RANKS, HCA_STATE_MAX_BLOCKS], pl.INT32],
     csa_compress_state_block_table: pl.Tensor[[N_RANKS, CSA_STATE_MAX_BLOCKS], pl.INT32],
     csa_inner_compress_state_block_table: pl.Tensor[[N_RANKS, INNER_STATE_MAX_BLOCKS], pl.INT32],
-    freqs_cos: pl.Tensor[[N_RANKS, MAX_SEQ_LEN, ROPE_HEAD_DIM], pl.BF16],
-    freqs_sin: pl.Tensor[[N_RANKS, MAX_SEQ_LEN, ROPE_HEAD_DIM], pl.BF16],
+    freqs_cos: pl.Tensor[[N_RANKS, 2, MAX_SEQ_LEN, ROPE_HEAD_DIM], pl.BF16],
+    freqs_sin: pl.Tensor[[N_RANKS, 2, MAX_SEQ_LEN, ROPE_HEAD_DIM], pl.BF16],
     ori_block_table: pl.Tensor[[N_RANKS, SPARSE_ORI_MAX_BLOCKS], pl.INT32],
     cmp_block_table: pl.Tensor[[N_RANKS, SPARSE_CMP_MAX_BLOCKS], pl.INT32],
     idx_block_table: pl.Tensor[[N_RANKS, IDX_CACHE_MAX_BLOCKS], pl.INT32],
@@ -1109,6 +1202,8 @@ def _make_shared_spec(name, base_specs, start_pos):
         return single.unsqueeze(0).expand(N_RANKS, *single.shape).contiguous()
 
     def init_value():
+        if name in ("freqs_cos", "freqs_sin"):
+            return _spec_value(spec, torch).contiguous()
         if name == "position_ids":
             return ranked(pos.to(torch.int32))
         if name == "input_ids":
@@ -1268,6 +1363,32 @@ def _spec_value(spec, torch):
     return torch.zeros(spec.shape, dtype=spec.dtype)
 
 
+def _make_rope_profile_spec(name, swa_spec, csa_spec):
+    import torch
+    from golden import TensorSpec
+
+    if tuple(swa_spec.shape) != tuple(csa_spec.shape):
+        raise ValueError(
+            f"{name} leaf shapes must match, got SWA {swa_spec.shape} and CSA {csa_spec.shape}"
+        )
+    if swa_spec.dtype != csa_spec.dtype:
+        raise ValueError(
+            f"{name} leaf dtypes must match, got SWA {swa_spec.dtype} and CSA {csa_spec.dtype}"
+        )
+
+    def init_value():
+        return torch.stack(
+            (_spec_value(swa_spec, torch), _spec_value(csa_spec, torch)), dim=0
+        ).contiguous()
+
+    return TensorSpec(
+        name,
+        [2, *swa_spec.shape],
+        swa_spec.dtype,
+        init_value=init_value,
+    )
+
+
 def _ranked_init(spec, n_ranks, torch):
     def init():
         values = [_spec_value(spec, torch) for _ in range(n_ranks)]
@@ -1332,8 +1453,14 @@ def build_single_layer_tensor_specs(start_pos=START_POS, num_tokens=T, layer_id=
         ("wkv", active["wkv"]),
         ("gamma_cq", active["gamma_cq"]),
         ("gamma_ckv", active["gamma_ckv"]),
-        ("freqs_cos", active["freqs_cos"]),
-        ("freqs_sin", active["freqs_sin"]),
+        (
+            "freqs_cos",
+            _make_rope_profile_spec("freqs_cos", swa["freqs_cos"], csa["freqs_cos"]),
+        ),
+        (
+            "freqs_sin",
+            _make_rope_profile_spec("freqs_sin", swa["freqs_sin"], csa["freqs_sin"]),
+        ),
         ("hca_cmp_wkv", hca["cmp_wkv"]),
         ("hca_cmp_wgate", hca["cmp_wgate"]),
         ("hca_cmp_ape", hca["cmp_ape"]),
@@ -1560,6 +1687,14 @@ def main():
                         help=f"Active token rows for MoE routing/combine; default is T // 2={T // 2}.")
     parser.add_argument("--enable-l2-swimlane", type=int, nargs="?", const=1, default=0, choices=(0, 1, 2))
     parser.add_argument("--enable-scope-stats", action="store_true", default=False)
+    parser.add_argument(
+        "--disable-resident-caches",
+        action="store_true",
+        default=False,
+        help="bind KV/state caches as ordinary host tensors for residency A/B diagnosis",
+    )
+    parser.add_argument("--enable-dep-gen", action="store_true", default=False)
+    parser.add_argument("--dump-args", type=int, nargs="?", const=1, default=0, choices=(0, 1, 2, 3))
     parser.add_argument("--compile-only", action="store_true", default=False)
     parser.add_argument("--dump-passes", action="store_true", default=False)
     parser.add_argument("--runtime-dir", type=str, default=None)
@@ -1569,18 +1704,61 @@ def main():
     parser.add_argument("--validate", action="store_true", default=False,
                         help="Run the full-network torch golden (golden_fwd.golden_prefill_fwd) and "
                              "validate hidden states, logits, sampled ids, and the resident caches.")
+    parser.add_argument("--save-data", action="store_true", default=False,
+                        help="persist inputs and golden outputs into <work_dir>/data for replay")
+    parser.add_argument("--golden-data", type=str, default=None,
+                        help="directory containing cached in/ and out/ tensors; skips input "
+                             "generation and the golden compute (device run + validate only)")
+    parser.add_argument("--prompt-file", type=str, default=None,
+                        help="replace the synthetic input_ids with this real prompt (replicated "
+                             "across ranks); sets num_tokens to the prompt length")
+    parser.add_argument("--tokenizer", type=str, default=None,
+                        help="tokenizer.json path for --prompt-file")
     args = parser.parse_args()
+
+    prompt_ids = None
+    if args.prompt_file is not None:
+        from pathlib import Path
+
+        from tokenizers import Tokenizer
+
+        if args.tokenizer is None:
+            raise SystemExit("--prompt-file requires --tokenizer")
+        tokenizer = Tokenizer.from_file(args.tokenizer)
+        prompt_ids = tokenizer.encode(Path(args.prompt_file).read_text()).ids
+        bos_id = tokenizer.token_to_id("<｜begin▁of▁sentence｜>")
+        if bos_id is not None:
+            prompt_ids = [bos_id] + prompt_ids
+        if not 1 <= len(prompt_ids) <= T:
+            raise SystemExit(f"prompt is {len(prompt_ids)} tokens; must be within 1..{T}")
+        args.num_tokens = len(prompt_ids)
+        print(f"[RUN] prompt: {len(prompt_ids)} tokens {prompt_ids}", flush=True)
 
     device_ids = [int(d) for d in args.device.split(",")]
     assert len(device_ids) >= N_RANKS, f"need at least {N_RANKS} devices, got {device_ids}"
     assert args.tp == LM_HEAD_TP_SIZE and N_RANKS % args.tp == 0
 
     specs = build_tensor_specs(start_pos=args.start_pos, num_tokens=args.num_tokens)
+    if args.disable_resident_caches:
+        for spec in specs:
+            if getattr(spec, "name", None) in RESIDENT_CACHE_NAMES:
+                spec.resident = None
+        print("[RUN] resident caches disabled", flush=True)
     if args.weights is not None:
         from weights_flash import apply_real_weights
 
         count = apply_real_weights(specs, args.weights, ep=N_RANKS, tp=LM_HEAD_TP_SIZE)
         print(f"[RUN] real weights: {count} tensors from {args.weights}", flush=True)
+
+    if prompt_ids is not None:
+        import torch
+
+        row = torch.zeros(T, dtype=torch.int64)
+        row[: len(prompt_ids)] = torch.tensor(prompt_ids, dtype=torch.int64)
+        for spec in specs:
+            if getattr(spec, "name", None) == "input_ids":
+                spec.init_value = lambda value=row: value.unsqueeze(0).expand(N_RANKS, -1).contiguous()
+        print(f"[RUN] input_ids: real prompt replicated across {N_RANKS} ranks", flush=True)
 
     golden_fn = None
     compare_fn = None
@@ -1600,7 +1778,8 @@ def main():
         atol=1e-2,
         compile_only=args.compile_only,
         runtime_dir=args.runtime_dir,
-        save_data=False,
+        golden_data=args.golden_data,
+        save_data=args.save_data,
         compile_cfg=dict(
             dump_passes=args.dump_passes,
             distributed_config=DistributedConfig(device_ids=device_ids[:N_RANKS], num_sub_workers=0),
@@ -1609,6 +1788,8 @@ def main():
             platform=args.platform,
             enable_l2_swimlane=args.enable_l2_swimlane,
             enable_scope_stats=args.enable_scope_stats,
+            enable_dep_gen=args.enable_dep_gen,
+            enable_dump_args=args.dump_args,
             ring_heap=PREFILL_RING_HEAP,
         ),
     )

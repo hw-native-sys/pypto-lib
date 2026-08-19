@@ -12,6 +12,7 @@
 # ruff: noqa: F403,F405
 
 import argparse
+import os
 
 import pypto.language as pl
 import pypto.language.distributed as pld
@@ -28,6 +29,11 @@ from lm_head import (
     lm_head_with_sampling,
 )
 from pypto.ir.distributed_compiled_program import DistributedConfig
+
+# Trace-time bisect knob shared with prefill_fwd.py — "1" drops the
+# moe_signal_retire scope from the compiled program (2026-08-19 EP8
+# SCHEDULER_TIMEOUT investigation).
+DSV4_DISABLE_MOE_RETIRE = os.environ.get("DSV4_DISABLE_MOE_RETIRE", "0") == "1"
 from rmsnorm import rms_norm
 
 # decode_fwd is self-contained: it imports kernels, constants, and per-kind
@@ -120,6 +126,7 @@ CSA_NUM_LAYERS = FWD_COMPRESS_RATIOS.count(CSA_COMPRESS_RATIO)
 HCA_NUM_LAYERS = FWD_COMPRESS_RATIOS.count(HCA_COMPRESS_RATIO)
 # FWD index of the last layer (indexes per-FWD-layer stacked weights, not csa order).
 FWD_LAST_LAYER = FWD_NUM_LAYERS - 1
+LAST_MOE_EPOCH = FWD_NUM_LAYERS
 LM_HEAD_COMM_EPOCH = 1
 
 # Emission shape this body hand-unrolls: LEAD_NUM_LAYERS unrolled leading layers,
@@ -268,8 +275,8 @@ def decode_fwd(
     shared_w3_scale: pl.Tensor[[FWD_NUM_LAYERS * MOE_INTER], pl.FP32],
     shared_w2: pl.Tensor[[FWD_NUM_LAYERS * D, MOE_INTER], pl.INT8],
     shared_w2_scale: pl.Tensor[[FWD_NUM_LAYERS * D], pl.FP32],
-    freqs_cos: pl.Tensor[[MAX_SEQ_LEN, ROPE_HEAD_DIM], pl.BF16],
-    freqs_sin: pl.Tensor[[MAX_SEQ_LEN, ROPE_HEAD_DIM], pl.BF16],
+    freqs_cos: pl.Tensor[[2, MAX_SEQ_LEN, ROPE_HEAD_DIM], pl.BF16],
+    freqs_sin: pl.Tensor[[2, MAX_SEQ_LEN, ROPE_HEAD_DIM], pl.BF16],
     block_table: pl.Tensor[[B, ORI_TABLE_MAX_BLOCKS], pl.INT32],
     ori_slot_mapping: pl.Tensor[[T], pl.INT64],
     window_swa_indices: pl.Tensor[[T, SWA_WIN], pl.INT32],
@@ -316,6 +323,30 @@ def decode_fwd(
     my_rank: pl.Scalar[pl.INT32],
     num_tokens: pl.Scalar[pl.INT32],
 ) -> pl.Tensor[[T, D], pl.BF16]:
+    swa_cos_profile: pl.Tensor[[1, MAX_SEQ_LEN, ROPE_HEAD_DIM], pl.BF16] = pl.slice(
+        freqs_cos, [1, MAX_SEQ_LEN, ROPE_HEAD_DIM], [0, 0, 0]
+    )
+    swa_sin_profile: pl.Tensor[[1, MAX_SEQ_LEN, ROPE_HEAD_DIM], pl.BF16] = pl.slice(
+        freqs_sin, [1, MAX_SEQ_LEN, ROPE_HEAD_DIM], [0, 0, 0]
+    )
+    compressed_cos_profile: pl.Tensor[[1, MAX_SEQ_LEN, ROPE_HEAD_DIM], pl.BF16] = pl.slice(
+        freqs_cos, [1, MAX_SEQ_LEN, ROPE_HEAD_DIM], [1, 0, 0]
+    )
+    compressed_sin_profile: pl.Tensor[[1, MAX_SEQ_LEN, ROPE_HEAD_DIM], pl.BF16] = pl.slice(
+        freqs_sin, [1, MAX_SEQ_LEN, ROPE_HEAD_DIM], [1, 0, 0]
+    )
+    swa_freqs_cos: pl.Tensor[[MAX_SEQ_LEN, ROPE_HEAD_DIM], pl.BF16] = pl.reshape(
+        swa_cos_profile, [MAX_SEQ_LEN, ROPE_HEAD_DIM]
+    )
+    swa_freqs_sin: pl.Tensor[[MAX_SEQ_LEN, ROPE_HEAD_DIM], pl.BF16] = pl.reshape(
+        swa_sin_profile, [MAX_SEQ_LEN, ROPE_HEAD_DIM]
+    )
+    compressed_freqs_cos: pl.Tensor[[MAX_SEQ_LEN, ROPE_HEAD_DIM], pl.BF16] = pl.reshape(
+        compressed_cos_profile, [MAX_SEQ_LEN, ROPE_HEAD_DIM]
+    )
+    compressed_freqs_sin: pl.Tensor[[MAX_SEQ_LEN, ROPE_HEAD_DIM], pl.BF16] = pl.reshape(
+        compressed_sin_profile, [MAX_SEQ_LEN, ROPE_HEAD_DIM]
+    )
     x_hc = pl.create_tensor([T, HC_MULT, D], dtype=pl.FP32)
     pack_x_hc(input_ids, embed_weight, x_hc)
     hc_attn_fn_l0: pl.Tensor[[MIX_HC, HC_DIM], pl.FP32] = pl.slice(hc_attn_fn, [MIX_HC, HC_DIM], [0 * MIX_HC, 0])
@@ -407,7 +438,7 @@ def decode_fwd(
                 x_hc,
                 hc_attn_fn_l0, hc_attn_scale_l0, hc_attn_base_l0,
                 attn_norm_w_l0, wq_a_l0, wq_b_l0, wq_b_scale_l0,
-                wkv_l0, gamma_cq_l0, gamma_ckv_l0, freqs_cos, freqs_sin,
+                wkv_l0, gamma_cq_l0, gamma_ckv_l0, swa_freqs_cos, swa_freqs_sin,
                 kv_cache_l0,
                 swa_slot_mapping, swa_indices, swa_lens, position_ids,
                 attn_sink_l0, wo_a_l0, wo_b_l0, wo_b_scale_l0,
@@ -418,7 +449,8 @@ def decode_fwd(
                 x_hc,
                 hc_attn_fn_l0, hc_attn_scale_l0, hc_attn_base_l0,
                 attn_norm_w_l0, wq_a_l0, wq_b_l0, wq_b_scale_l0,
-                wkv_l0, gamma_cq_l0, gamma_ckv_l0, freqs_cos, freqs_sin,
+                wkv_l0, gamma_cq_l0, gamma_ckv_l0,
+                compressed_freqs_cos, compressed_freqs_sin,
                 hca_cmp_wkv_l0, hca_cmp_wgate_l0, hca_cmp_ape_l0, hca_cmp_norm_w_l0,
                 hca_compress_state_l0, hca_compress_state_block_table,
                 kv_cache_l0, cmp_kv_l0, cmp_block_table,
@@ -448,7 +480,7 @@ def decode_fwd(
                 hidden,
                 hc_attn_fn_l1, hc_attn_scale_l1, hc_attn_base_l1,
                 attn_norm_w_l1, wq_a_l1, wq_b_l1, wq_b_scale_l1,
-                wkv_l1, gamma_cq_l1, gamma_ckv_l1, freqs_cos, freqs_sin,
+                wkv_l1, gamma_cq_l1, gamma_ckv_l1, swa_freqs_cos, swa_freqs_sin,
                 kv_cache_l1,
                 swa_slot_mapping, swa_indices, swa_lens, position_ids,
                 attn_sink_l1, wo_a_l1, wo_b_l1, wo_b_scale_l1,
@@ -459,7 +491,8 @@ def decode_fwd(
                 hidden,
                 hc_attn_fn_l1, hc_attn_scale_l1, hc_attn_base_l1,
                 attn_norm_w_l1, wq_a_l1, wq_b_l1, wq_b_scale_l1,
-                wkv_l1, gamma_cq_l1, gamma_ckv_l1, freqs_cos, freqs_sin,
+                wkv_l1, gamma_cq_l1, gamma_ckv_l1,
+                compressed_freqs_cos, compressed_freqs_sin,
                 hca_cmp_wkv_l1, hca_cmp_wgate_l1, hca_cmp_ape_l1, hca_cmp_norm_w_l1,
                 hca_compress_state_l1, hca_compress_state_block_table,
                 kv_cache_l1, cmp_kv_l1, cmp_block_table,
@@ -550,7 +583,8 @@ def decode_fwd(
                 hidden,
                 hc_attn_fn_csa, hc_attn_scale_csa, hc_attn_base_csa,
                 attn_norm_w_csa, wq_a_csa, wq_b_csa, wq_b_scale_csa,
-                wkv_csa, gamma_cq_csa, gamma_ckv_csa, freqs_cos, freqs_sin,
+                wkv_csa, gamma_cq_csa, gamma_ckv_csa,
+                compressed_freqs_cos, compressed_freqs_sin,
                 csa_cmp_wkv_csa, csa_cmp_wgate_csa, csa_cmp_ape_csa, csa_cmp_norm_w_csa,
                 csa_compress_state_csa, csa_compress_state_block_table,
                 csa_idx_wq_b_csa, csa_idx_wq_b_scale_csa, csa_weights_proj_csa, csa_hadamard_idx_csa,
@@ -624,7 +658,8 @@ def decode_fwd(
                 hidden_mid,
                 hc_attn_fn_hca, hc_attn_scale_hca, hc_attn_base_hca,
                 attn_norm_w_hca, wq_a_hca, wq_b_hca, wq_b_scale_hca,
-                wkv_hca, gamma_cq_hca, gamma_ckv_hca, freqs_cos, freqs_sin,
+                wkv_hca, gamma_cq_hca, gamma_ckv_hca,
+                compressed_freqs_cos, compressed_freqs_sin,
                 hca_cmp_wkv_hca, hca_cmp_wgate_hca, hca_cmp_ape_hca, hca_cmp_norm_w_hca,
                 hca_compress_state_hca, hca_compress_state_block_table,
                 kv_cache_hca, cmp_kv_hca, cmp_block_table,
@@ -711,7 +746,8 @@ def decode_fwd(
             hidden,
             hc_attn_fn_last, hc_attn_scale_last, hc_attn_base_last,
             attn_norm_w_last, wq_a_last, wq_b_last, wq_b_scale_last,
-            wkv_last, gamma_cq_last, gamma_ckv_last, freqs_cos, freqs_sin,
+            wkv_last, gamma_cq_last, gamma_ckv_last,
+            compressed_freqs_cos, compressed_freqs_sin,
             csa_cmp_wkv_last, csa_cmp_wgate_last, csa_cmp_ape_last, csa_cmp_norm_w_last,
             csa_compress_state_last, csa_compress_state_block_table,
             csa_idx_wq_b_last, csa_idx_wq_b_scale_last, csa_weights_proj_last, csa_hadamard_idx_last,
@@ -740,6 +776,52 @@ def decode_fwd(
             routed_y_buf, combine_arrived,
             csa_layer_last, num_tokens, my_rank, last_moe_epoch,
         )
+
+    # The worker keeps distributed windows alive across autoregressive decode
+    # calls, but each call numbers its MoE epochs from one again. Retire the
+    # credits deposited by this full-model call before the next token can reuse
+    # the same windows; otherwise the next call's waits may observe stale,
+    # already-satisfied counters and consume partially published expert data.
+    # AtomicAdd subtraction is required because the last consumed notify can
+    # still be in flight and commutes with this retirement.
+    # DSV4_DISABLE_MOE_RETIRE=1 (trace-time) drops the retire scope — see the
+    # matching knob in prefill_fwd.py (2026-08-19 EP8 SCHEDULER_TIMEOUT bisect).
+    if not DSV4_DISABLE_MOE_RETIRE:
+        neg_epochs = pl.cast(0 - LAST_MOE_EPOCH, pl.INT32)
+        neg_data = pl.cast(0 - LAST_MOE_EPOCH * N_LOCAL, pl.INT32)
+        neg_combine = pl.cast(0 - LAST_MOE_EPOCH * (N_LOCAL + 1), pl.INT32)
+        with pl.at(level=pl.Level.CORE_GROUP, name_hint="moe_signal_retire"):
+            _pre_hc_anchor = pl.read(pre_hc_hidden_out, [0, 0, 0])
+            pld.system.notify(
+                target=combine_arrived,
+                peer=my_rank,
+                offsets=[my_rank, 0],
+                value=neg_epochs,
+                op=pld.NotifyOp.AtomicAdd,
+            )
+            for src in pl.range(N_RANKS):
+                if src != my_rank:
+                    pld.system.notify(
+                        target=arrived,
+                        peer=my_rank,
+                        offsets=[src, 0],
+                        value=neg_epochs,
+                        op=pld.NotifyOp.AtomicAdd,
+                    )
+                    pld.system.notify(
+                        target=data_arrived,
+                        peer=my_rank,
+                        offsets=[src, 0],
+                        value=neg_data,
+                        op=pld.NotifyOp.AtomicAdd,
+                    )
+                    pld.system.notify(
+                        target=combine_arrived,
+                        peer=my_rank,
+                        offsets=[src, 0],
+                        value=neg_combine,
+                        op=pld.NotifyOp.AtomicAdd,
+                    )
     x_head: pl.Tensor[[T, D], pl.BF16] = pl.create_tensor([T, D], dtype=pl.BF16)
     with pl.scope():
         hc_head(pre_hc_hidden_out, hc_head_fn, hc_head_scale, hc_head_base, x_head)
@@ -814,8 +896,8 @@ def l3_decode_fwd(
     shared_w3_scale: pl.Tensor[[N_RANKS, FWD_NUM_LAYERS * MOE_INTER], pl.FP32],
     shared_w2: pl.Tensor[[N_RANKS, FWD_NUM_LAYERS * D, MOE_INTER], pl.INT8],
     shared_w2_scale: pl.Tensor[[N_RANKS, FWD_NUM_LAYERS * D], pl.FP32],
-    freqs_cos: pl.Tensor[[N_RANKS, MAX_SEQ_LEN, ROPE_HEAD_DIM], pl.BF16],
-    freqs_sin: pl.Tensor[[N_RANKS, MAX_SEQ_LEN, ROPE_HEAD_DIM], pl.BF16],
+    freqs_cos: pl.Tensor[[N_RANKS, 2, MAX_SEQ_LEN, ROPE_HEAD_DIM], pl.BF16],
+    freqs_sin: pl.Tensor[[N_RANKS, 2, MAX_SEQ_LEN, ROPE_HEAD_DIM], pl.BF16],
     block_table: pl.Tensor[[N_RANKS, B, ORI_TABLE_MAX_BLOCKS], pl.INT32],
     ori_slot_mapping: pl.Tensor[[N_RANKS, T], pl.INT64],
     window_swa_indices: pl.Tensor[[N_RANKS, T, SWA_WIN], pl.INT32],
@@ -1284,6 +1366,32 @@ def _ranked_init(single_spec, *, replicated=False):
     return init
 
 
+def _make_rope_profile_spec(name, swa_spec, csa_spec):
+    import torch
+    from golden import TensorSpec
+
+    if tuple(swa_spec.shape) != tuple(csa_spec.shape):
+        raise ValueError(
+            f"{name} leaf shapes must match, got SWA {swa_spec.shape} and CSA {csa_spec.shape}"
+        )
+    if swa_spec.dtype != csa_spec.dtype:
+        raise ValueError(
+            f"{name} leaf dtypes must match, got SWA {swa_spec.dtype} and CSA {csa_spec.dtype}"
+        )
+
+    def init_value():
+        return torch.stack(
+            (swa_spec.create_tensor(), csa_spec.create_tensor()), dim=0
+        ).contiguous()
+
+    return TensorSpec(
+        name,
+        [2, *swa_spec.shape],
+        swa_spec.dtype,
+        init_value=init_value,
+    )
+
+
 def _validate_layer_id(layer_id):
     if not 0 <= layer_id < MODEL_CONFIG.num_hidden_layers:
         raise ValueError(
@@ -1386,8 +1494,18 @@ def build_single_layer_tensor_specs(start_pos=DECODE_START_POS, layer_id=10):
         ("wkv", swa_specs["wkv"]),
         ("gamma_cq", swa_specs["gamma_cq"]),
         ("gamma_ckv", swa_specs["gamma_ckv"]),
-        ("freqs_cos", swa_specs["freqs_cos"]),
-        ("freqs_sin", swa_specs["freqs_sin"]),
+        (
+            "freqs_cos",
+            _make_rope_profile_spec(
+                "freqs_cos", swa_specs["freqs_cos"], csa_specs["freqs_cos"]
+            ),
+        ),
+        (
+            "freqs_sin",
+            _make_rope_profile_spec(
+                "freqs_sin", swa_specs["freqs_sin"], csa_specs["freqs_sin"]
+            ),
+        ),
         ("kv_cache", swa_specs["kv_cache"]),
         ("block_table", TensorSpec("block_table", [B, ORI_TABLE_MAX_BLOCKS], torch.int32, init_value=init_block_table)),
         ("ori_slot_mapping", active_specs.get("ori_slot_mapping", hca_specs["ori_slot_mapping"])),

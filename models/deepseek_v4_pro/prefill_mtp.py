@@ -103,8 +103,8 @@ def mtp_prefill_fwd(
     wkv: pl.Tensor[[D, HEAD_DIM], pl.BF16],
     gamma_cq: pl.Tensor[[Q_LORA], pl.BF16],
     gamma_ckv: pl.Tensor[[HEAD_DIM], pl.BF16],
-    freqs_cos: pl.Tensor[[MAX_SEQ_LEN, ROPE_HEAD_DIM], pl.BF16],
-    freqs_sin: pl.Tensor[[MAX_SEQ_LEN, ROPE_HEAD_DIM], pl.BF16],
+    freqs_cos: pl.Tensor[[2, MAX_SEQ_LEN, ROPE_HEAD_DIM], pl.BF16],
+    freqs_sin: pl.Tensor[[2, MAX_SEQ_LEN, ROPE_HEAD_DIM], pl.BF16],
     kv_cache: pl.InOut[pl.Tensor[[BLOCK_NUM, BLOCK_SIZE, 1, HEAD_DIM], pl.BF16]],
     ori_block_table: pl.Tensor[[BLOCK_NUM], pl.INT32],
     ori_slot_mapping: pl.Tensor[[T], pl.INT64],
@@ -151,6 +151,18 @@ def mtp_prefill_fwd(
     num_tokens: pl.Scalar[pl.INT32],
 ) -> pl.Tensor[[T, D], pl.BF16]:
     nt: pl.Scalar[pl.INT32] = num_tokens
+    swa_cos_profile: pl.Tensor[[1, MAX_SEQ_LEN, ROPE_HEAD_DIM], pl.BF16] = pl.slice(
+        freqs_cos, [1, MAX_SEQ_LEN, ROPE_HEAD_DIM], [0, 0, 0]
+    )
+    swa_sin_profile: pl.Tensor[[1, MAX_SEQ_LEN, ROPE_HEAD_DIM], pl.BF16] = pl.slice(
+        freqs_sin, [1, MAX_SEQ_LEN, ROPE_HEAD_DIM], [0, 0, 0]
+    )
+    swa_freqs_cos: pl.Tensor[[MAX_SEQ_LEN, ROPE_HEAD_DIM], pl.BF16] = pl.reshape(
+        swa_cos_profile, [MAX_SEQ_LEN, ROPE_HEAD_DIM]
+    )
+    swa_freqs_sin: pl.Tensor[[MAX_SEQ_LEN, ROPE_HEAD_DIM], pl.BF16] = pl.reshape(
+        swa_sin_profile, [MAX_SEQ_LEN, ROPE_HEAD_DIM]
+    )
     projected = pl.create_tensor([T, HC_MULT, D], dtype=pl.FP32)
     x_attn = pl.create_tensor([T, HC_MULT, D], dtype=pl.FP32)
 
@@ -166,7 +178,7 @@ def mtp_prefill_fwd(
         projected,
         hc_attn_fn, hc_attn_scale, hc_attn_base, attn_norm_w,
         wq_a, wq_b, wq_b_scale, wkv, gamma_cq, gamma_ckv,
-        freqs_cos, freqs_sin,
+        swa_freqs_cos, swa_freqs_sin,
         kv_cache, ori_block_table, ori_slot_mapping,
         position_ids,
         attn_sink, wo_a, wo_b, wo_b_scale,
@@ -186,6 +198,43 @@ def mtp_prefill_fwd(
         routed_y_buf, combine_arrived,
         pl.cast(MTP_LAYER_ID, pl.INT32), nt, my_rank, pl.cast(MTP_MOE_EPOCH, pl.INT32),
     )
+
+    # Retire this dispatch's persistent MoE signal credits.
+    neg_epochs = pl.cast(0 - MTP_MOE_EPOCH, pl.INT32)
+    neg_data = pl.cast(0 - MTP_MOE_EPOCH * N_LOCAL, pl.INT32)
+    neg_combine = pl.cast(0 - MTP_MOE_EPOCH * (N_LOCAL + 1), pl.INT32)
+    with pl.at(level=pl.Level.CORE_GROUP, name_hint="moe_signal_retire"):
+        _pre_hc_anchor = pl.read(pre_hc_hidden_out, [0, 0, 0])
+        pld.system.notify(
+            target=combine_arrived,
+            peer=my_rank,
+            offsets=[my_rank, 0],
+            value=neg_epochs,
+            op=pld.NotifyOp.AtomicAdd,
+        )
+        for src in pl.range(N_RANKS):
+            if src != my_rank:
+                pld.system.notify(
+                    target=arrived,
+                    peer=my_rank,
+                    offsets=[src, 0],
+                    value=neg_epochs,
+                    op=pld.NotifyOp.AtomicAdd,
+                )
+                pld.system.notify(
+                    target=data_arrived,
+                    peer=my_rank,
+                    offsets=[src, 0],
+                    value=neg_data,
+                    op=pld.NotifyOp.AtomicAdd,
+                )
+                pld.system.notify(
+                    target=combine_arrived,
+                    peer=my_rank,
+                    offsets=[src, 0],
+                    value=neg_combine,
+                    op=pld.NotifyOp.AtomicAdd,
+                )
 
     x_head = pl.create_tensor([T, D], dtype=pl.BF16)
     hc_head(pre_hc_hidden_out, mtp_hc_head_fn, mtp_hc_head_scale, mtp_hc_head_base, x_head)
@@ -215,8 +264,8 @@ def l3_mtp_prefill_fwd(
     wkv: pl.Tensor[[N_RANKS, D, HEAD_DIM], pl.BF16],
     gamma_cq: pl.Tensor[[N_RANKS, Q_LORA], pl.BF16],
     gamma_ckv: pl.Tensor[[N_RANKS, HEAD_DIM], pl.BF16],
-    freqs_cos: pl.Tensor[[N_RANKS, MAX_SEQ_LEN, ROPE_HEAD_DIM], pl.BF16],
-    freqs_sin: pl.Tensor[[N_RANKS, MAX_SEQ_LEN, ROPE_HEAD_DIM], pl.BF16],
+    freqs_cos: pl.Tensor[[N_RANKS, 2, MAX_SEQ_LEN, ROPE_HEAD_DIM], pl.BF16],
+    freqs_sin: pl.Tensor[[N_RANKS, 2, MAX_SEQ_LEN, ROPE_HEAD_DIM], pl.BF16],
     kv_cache: pl.InOut[pl.Tensor[[N_RANKS, BLOCK_NUM, BLOCK_SIZE, 1, HEAD_DIM], pl.BF16]],
     ori_block_table: pl.Tensor[[N_RANKS, BLOCK_NUM], pl.INT32],
     ori_slot_mapping: pl.Tensor[[N_RANKS, T], pl.INT64],
@@ -507,8 +556,8 @@ def golden_mtp_prefill_fwd(tensors):
             "wkv": tensors["wkv"][rank],
             "gamma_cq": tensors["gamma_cq"][rank],
             "gamma_ckv": tensors["gamma_ckv"][rank],
-            "freqs_cos": tensors["freqs_cos"][rank],
-            "freqs_sin": tensors["freqs_sin"][rank],
+            "freqs_cos": tensors["freqs_cos"][rank, 0],
+            "freqs_sin": tensors["freqs_sin"][rank, 0],
             "kv_cache": tensors["kv_cache"][rank],
             "block_table": tensors["ori_block_table"][rank],
             "ori_slot_mapping": tensors["ori_slot_mapping"][rank],
