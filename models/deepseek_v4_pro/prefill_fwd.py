@@ -1720,7 +1720,12 @@ def main():
     if args.prompt_file is not None:
         from pathlib import Path
 
-        from tokenizers import Tokenizer
+        try:
+            from tokenizers import Tokenizer
+        except ImportError as error:
+            raise SystemExit(
+                "--prompt-file needs the `tokenizers` package (pip install tokenizers)"
+            ) from error
 
         if args.tokenizer is None:
             raise SystemExit("--prompt-file requires --tokenizer")

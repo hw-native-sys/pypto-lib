@@ -671,24 +671,6 @@ def golden_qkv_proj_rope(tensors):
         inv = torch.rsqrt(x.square().mean(-1, keepdim=True) + eps)
         return x * inv * gamma
 
-    def split_k_matmul_bf16_input_fp32(a, b, *, splits, k_per_split, k_tile):
-        """Mirror the device's per-split matmul_acc tree and ordered reduce."""
-        a_fp32 = a.to(torch.bfloat16).float()
-        b_fp32 = b.to(torch.bfloat16).float()
-        total = None
-        for split in range(splits):
-            split_start = split * k_per_split
-            split_end = split_start + k_per_split
-            partial = None
-            for k0 in range(split_start, split_end, k_tile):
-                chunk = torch.matmul(
-                    a_fp32[:, k0:k0 + k_tile],
-                    b_fp32[k0:k0 + k_tile],
-                ).float()
-                partial = chunk if partial is None else partial + chunk
-            total = partial if total is None else total + partial
-        return total
-
     def apply_rope(x_rope, cos, sin):
         # x_rope: [T, ..., ROPE_DIM] with interleaved even/odd rotary pairs.
         x_pair = x_rope.unflatten(-1, (-1, 2))
@@ -722,14 +704,15 @@ def golden_qkv_proj_rope(tensors):
     q_rope = apply_rope(q_full[..., NOPE_DIM:], rope_cos, rope_sin)
     q_out = torch.cat([q_nope, q_rope], dim=-1)
 
-    # KV path
+    # KV path: kv_proj_matmul is the same construct as qr_proj_matmul (BF16
+    # inputs, one FP32 Cube accumulator per split, ordered split reduction), so
+    # it takes the same A5 K16 reference; only the tile geometry differs.
     kv_full = rms_norm(
-        split_k_matmul_bf16_input_fp32(
+        _golden_a5_split_k_bf16_matmul(
             token_x,
             wkv,
             splits=KV_OK,
             k_per_split=KV_K_SLICE,
-            k_tile=KV_K_TILE,
         ),
         gamma_ckv,
     )  # [T, HEAD_DIM]

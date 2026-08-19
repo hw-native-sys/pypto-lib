@@ -108,7 +108,7 @@ def _ordered_args(compiled, io_tensors, resident_handles, scalars):
     return ordered
 
 
-def _compile_program(model_dir, entrypoint, args, num_tokens, start_pos):
+def _compile_program(model_dir, entrypoint, args, num_tokens, start_pos, extra_env=None):
     command = [
         sys.executable,
         str(model_dir / entrypoint),
@@ -130,6 +130,8 @@ def _compile_program(model_dir, entrypoint, args, num_tokens, start_pos):
     ]
     env = os.environ.copy()
     env["DEEPSEEK_V4_VARIANT"] = args.variant
+    if extra_env:
+        env.update(extra_env)
     repo_root = model_dir.parents[1]
     old_pythonpath = env.get("PYTHONPATH")
     env["PYTHONPATH"] = (
@@ -723,7 +725,12 @@ def _run_session(args, prefill_dir, decode_dir, model_dir):
                     break
             print(f"[SESSION] token_history={token_history}", flush=True)
             if getattr(args, "tokenizer", None):
-                from tokenizers import Tokenizer
+                try:
+                    from tokenizers import Tokenizer
+                except ImportError as error:
+                    raise SystemExit(
+                        "--tokenizer needs the `tokenizers` package (pip install tokenizers)"
+                    ) from error
 
                 generated = [step_tokens[0] for step_tokens in token_history]
                 text = Tokenizer.from_file(args.tokenizer).decode(generated)
@@ -774,6 +781,12 @@ def main():
                         help="do not prepend the BOS token to the prompt")
     parser.add_argument("--eos-id", type=int, default=1,
                         help="stop decoding when this token is sampled (real-weight runs only)")
+    parser.add_argument("--prefill-tokens", type=int, default=PROMPT_TOKENS,
+                        help="MoE token extent the prefill program is compiled with; the prompt "
+                             f"(including BOS) must fit in it (1..{PROMPT_TOKENS})")
+    parser.add_argument("--prefill-no-retire", action="store_true",
+                        help="compile the prefill program with DSV4_DISABLE_MOE_RETIRE=1; decode "
+                             "keeps its retirement (EP8 workaround, see docs/models/deepseek_v4_pro.md)")
     args = parser.parse_args()
 
     device_ids = [device for device in args.device.split(",") if device]
@@ -781,6 +794,8 @@ def main():
         raise ValueError(f"EP{args.ep} requires exactly {args.ep} devices, got {args.device!r}")
     if args.decode_steps < 1:
         raise ValueError("--decode-steps must be positive")
+    if not 1 <= args.prefill_tokens <= PROMPT_TOKENS:
+        raise ValueError(f"--prefill-tokens must be within 1..{PROMPT_TOKENS}")
 
     args.prompt_ids = None
     if args.prompt is not None or args.prompt_file is not None:
@@ -795,7 +810,12 @@ def main():
                 args.tokenizer = str(candidate)
         if args.tokenizer is None:
             raise ValueError("--tokenizer is required (no tokenizer.json under --weights)")
-        from tokenizers import Tokenizer
+        try:
+            from tokenizers import Tokenizer
+        except ImportError as error:
+            raise SystemExit(
+                "--prompt/--prompt-file need the `tokenizers` package (pip install tokenizers)"
+            ) from error
 
         tokenizer = Tokenizer.from_file(args.tokenizer)
         ids = tokenizer.encode(text).ids
@@ -803,8 +823,11 @@ def main():
             bos_id = tokenizer.token_to_id("<｜begin▁of▁sentence｜>")
             if bos_id is not None:
                 ids = [bos_id] + ids
-        if not 1 <= len(ids) <= PROMPT_TOKENS:
-            raise ValueError(f"prompt is {len(ids)} tokens; must be within 1..{PROMPT_TOKENS}")
+        if not 1 <= len(ids) <= args.prefill_tokens:
+            raise ValueError(
+                f"prompt is {len(ids)} tokens; must fit the compiled prefill extent "
+                f"1..{args.prefill_tokens} (--prefill-tokens)"
+            )
         args.prompt_ids = torch.tensor(ids, dtype=torch.int64)
         print(f"[SESSION] prompt: {len(ids)} tokens {ids}", flush=True)
 
@@ -813,8 +836,9 @@ def main():
     prefill_dir = args.prefill_runtime_dir
     decode_dir = args.decode_runtime_dir
     if prefill_dir is None:
+        prefill_env = {"DSV4_DISABLE_MOE_RETIRE": "1"} if args.prefill_no_retire else None
         prefill_dir = _compile_program(
-            model_dir, "prefill_fwd.py", args, PROMPT_TOKENS, 0
+            model_dir, "prefill_fwd.py", args, args.prefill_tokens, 0, prefill_env
         )
     if decode_dir is None:
         decode_dir = _compile_program(

@@ -53,12 +53,14 @@ def test_a5_trowsum_uses_64_lane_tree_then_ascending_group_accumulation():
 def test_a5_high_precision_rsqrt_avoids_fp32_sqrt_reciprocal_double_rounding():
     # This exact hc_pre RMS argument was observed at Flash prefill token 4.
     # The A5 high-precision path returns the correctly rounded FP32 reciprocal
-    # square root; host FP32 sqrt/reciprocal lands one ULP lower.
+    # square root: the golden computes it through float64 and rounds once, so
+    # the bit pattern is host-independent. The host FP32 `torch.rsqrt` is NOT
+    # asserted here — its rounding depends on the torch build and CPU path
+    # (this argument was observed one ULP low, 0x416997DB, on the A5 host).
     rms_arg = torch.tensor([0x3B99BBDE], dtype=torch.int32).view(torch.float32)
 
     actual = _golden_a5_high_precision_rsqrt(rms_arg)
     assert actual.view(torch.int32).item() == 0x416997DC
-    assert torch.rsqrt(rms_arg).view(torch.int32).item() == 0x416997DB
 
 
 @pytest.mark.parametrize("hc_dim", [4 * 4096, 4 * 7168])

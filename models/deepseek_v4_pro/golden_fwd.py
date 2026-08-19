@@ -406,7 +406,12 @@ def _logits_cosine_compare(min_cosine=0.99, max_rel_l2=0.10):
                 a_row = a[rank, row]
                 e_row = e[rank, row]
                 if not bool(torch.isfinite(a_row).all()):
-                    failures.append(f"    logits[{rank},{row}]: non-finite values")
+                    failures.append(f"    logits[{rank},{row}]: non-finite actual values")
+                    continue
+                if not bool(torch.isfinite(e_row).all()):
+                    # A NaN golden row would turn cosine and rel_l2 into NaN,
+                    # and every NaN comparison below reads as a pass.
+                    failures.append(f"    logits[{rank},{row}]: non-finite expected values")
                     continue
                 denom = float(a_row.norm() * e_row.norm())
                 cosine = float(a_row @ e_row) / denom if denom > 0.0 else 0.0

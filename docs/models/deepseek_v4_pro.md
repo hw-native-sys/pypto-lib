@@ -182,9 +182,13 @@ sampled ids are detokenized at the end. Decoding stops early when
 `--eos-id` (default 1) is sampled. Without `--weights` the loop keeps its
 synthetic zero-weight control-path behavior.
 
+The EP8 example carries the two workaround flags the caveats below explain
+(`--prefill-tokens 16 --prefill-no-retire`); at EP2 neither is needed:
+
 ```bash
 python models/deepseek_v4_pro/synthetic_token_loop.py --variant flash \
     --ep 8 --tp 2 -d 0,1,2,3,4,5,6,7 \
+    --prefill-tokens 16 --prefill-no-retire \
     --weights build_output/flash_weights_ep8_tp2 \
     --tokenizer /path/to/DeepSeek-V4-Flash/tokenizer.json \
     --prompt "The capital of France is" --decode-steps 32
@@ -197,15 +201,17 @@ Two EP8 caveats, pending a proper fix:
   credits only after the task writing `pre_hc_hidden_out[0, 0, 0]`, so they
   can land while later waits of the same dispatch are still pending. The
   trace-time knob `DSV4_DISABLE_MOE_RETIRE=1` compiles a forward without
-  the scope. For the token loop, compile prefill with the knob set and
-  decode without it: prefill's un-retired credits did not disturb the
-  following decode steps in testing, while multi-step decode does require
-  its own retirement (without it, decode produced non-finite logits on part
-  of the ranks by the second step).
+  the scope; the loop's `--prefill-no-retire` sets it for the prefill
+  compile only. Prefill's un-retired credits did not disturb the following
+  decode steps in testing, while multi-step decode does require its own
+  retirement (without it, decode produced non-finite logits on part of the
+  ranks by the second step) — so decode keeps the scope.
 - An EP8 prefill compiled at `--num-tokens 128` stalls on-device
   (`S1:running-stalled` on the same task id on every rank); the same source
-  at `--num-tokens 16` runs. Keep the prefill MoE extent small until the
-  stall is root-caused (EP2 at 128 and EP8 at 6/16 both run).
+  at `--num-tokens 16` runs. The loop's `--prefill-tokens 16` compiles the
+  prefill at that extent — the prompt (including BOS) must then fit in 16
+  tokens. Keep the extent small until the stall is root-caused (EP2 at 128
+  and EP8 at 6/16 both run).
 
 ## Files
 
