@@ -896,6 +896,13 @@ def build_tensor_specs(
             continue
         specs[f"mtp_{name}"] = replace(spec, name=f"mtp_{name}")
 
+    # Rank-major InOut metadata stays device-resident. A host-resident arg is keyed
+    # by buffer identity alone, so both ranks collide on one tensormap key and their
+    # dispatches serialize, deadlocking the cross-rank rendezvous. Revert once
+    # hw-native-sys/pypto#2448 makes the host key rank-aware.
+    for name in ("input_ids", "position_ids", "kv_seq_lens", "mtp_tail_token_ids", "mtp_tail_positions"):
+        specs[name] = replace(specs[name], resident="stacked")
+
     param_names = l3_decode_fwd_mtp._param_names()
     missing = set(param_names) - specs.keys()
     extra = specs.keys() - set(param_names)
