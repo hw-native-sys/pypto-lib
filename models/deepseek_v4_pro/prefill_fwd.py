@@ -1750,7 +1750,7 @@ def main():
                 spec.resident = None
         print("[RUN] resident caches disabled", flush=True)
     if args.weights is not None:
-        from weights_flash import apply_real_weights
+        from utils.weights_flash import apply_real_weights
 
         count = apply_real_weights(specs, args.weights, ep=N_RANKS, tp=LM_HEAD_TP_SIZE)
         print(f"[RUN] real weights: {count} tensors from {args.weights}", flush=True)
@@ -1769,7 +1769,7 @@ def main():
     compare_fn = None
     if args.validate:
         # Deferred import: the golden chain is only needed when validating.
-        from golden_fwd import build_validate_compare_fn, golden_prefill_fwd
+        from utils.golden_fwd import build_validate_compare_fn, golden_prefill_fwd
 
         golden_fn = golden_prefill_fwd
         compare_fn = build_validate_compare_fn(args.num_tokens)

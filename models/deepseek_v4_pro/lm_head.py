@@ -682,3 +682,31 @@ if __name__ == "__main__":
         if result.error:
             print(result.error)
         raise SystemExit(1)
+
+
+def golden_lm_head_all_ranks(tensors, *, n_ranks):
+    """LM-head replay generalized to ``n_ranks`` owners.
+
+    Mirrors ``lm_head.golden_lm_head`` but iterates the caller's EP world instead
+    of the standalone fixture's DP_SIZE (which defaults to TP_SIZE and would
+    fill only the first TP group's rows when EP > TP). Card ``r`` holds vocab
+    shard ``r % TP_SIZE``, so concatenating the first TP_SIZE shards in index
+    order reproduces the global vocabulary every owner assembles.
+    """
+    import torch
+
+    hidden = tensors["hidden_out"].float()
+    weight = tensors["lm_head_weight"].float()
+    full_weight = torch.cat([weight[tp] for tp in range(TP_SIZE)], dim=0)
+    logits = tensors["logits"]
+    max_rows = logits.shape[1]
+    for owner_rank in range(n_ranks):
+        selected = torch.zeros((max_rows, D), dtype=torch.float32)
+        for row in range(max_rows):
+            source_row = int(tensors["logit_row_indices"][owner_rank, row])
+            if source_row >= 0:
+                source_row = min(source_row, hidden.shape[1] - 1)
+                selected[row].copy_(hidden[owner_rank, source_row])
+        logits[owner_rank, :, :] = torch.matmul(selected, full_weight.t())
+    tensors["sampled_ids"].zero_()
+    tensors["sampled_ids"][:, :, 0] = torch.argmax(logits, dim=-1).to(torch.int32)

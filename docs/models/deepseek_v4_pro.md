@@ -132,7 +132,7 @@ per-layer tensors are stacked and EP/TP-sharded exactly like the fixture
 specs. Convert once offline, then point the drivers at the cache:
 
 ```bash
-python models/deepseek_v4_pro/weights_flash.py --variant flash --ep 8 --tp 2 \
+python models/deepseek_v4_pro/utils/weights_flash.py --variant flash --ep 8 --tp 2 \
     --ckpt /path/to/DeepSeek-V4-Flash --out build_output/flash_weights_ep8_tp2
 python models/deepseek_v4_pro/prefill_fwd.py --variant flash --ep 8 --tp 2 \
     -p a5 -d 0,1,2,3,4,5,6,7 --weights build_output/flash_weights_ep8_tp2
@@ -227,7 +227,7 @@ Two EP8 caveats, pending a proper fix:
 | Shared transforms | [rmsnorm.py](../../models/deepseek_v4_pro/rmsnorm.py), [qkv_proj_rope.py](../../models/deepseek_v4_pro/qkv_proj_rope.py), [hc_pre.py](../../models/deepseek_v4_pro/hc_pre.py), [hc_post.py](../../models/deepseek_v4_pro/hc_post.py), [hc_head.py](../../models/deepseek_v4_pro/hc_head.py) |
 | MoE and output | [moe.py](../../models/deepseek_v4_pro/moe.py), [gate.py](../../models/deepseek_v4_pro/gate.py), [expert_shared.py](../../models/deepseek_v4_pro/expert_shared.py), [expert_routed.py](../../models/deepseek_v4_pro/expert_routed.py), [lm_head.py](../../models/deepseek_v4_pro/lm_head.py) |
 | Metadata and host helpers | [config.py](../../models/deepseek_v4_pro/config.py), [decode_metadata.py](../../models/deepseek_v4_pro/decode_metadata.py), [rope_tables.py](../../models/deepseek_v4_pro/rope_tables.py) |
-| Real-weight loading | [weights_flash.py](../../models/deepseek_v4_pro/weights_flash.py) |
+| Real-weight loading | [weights_flash.py](../../models/deepseek_v4_pro/utils/weights_flash.py) |
 | Token loop | [synthetic_token_loop.py](../../models/deepseek_v4_pro/synthetic_token_loop.py) |
 
 `config.py`, `decode_metadata.py`, and `rope_tables.py` have no `__main__`

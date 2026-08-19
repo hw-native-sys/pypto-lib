@@ -34,7 +34,7 @@ metadata) keep their fixture initializers and are not touched here.
 Usage — one-time offline conversion (recommended; the routed experts alone
 re-quantize ~280 GB), then run the drivers against the cache::
 
-    python models/deepseek_v4_pro/weights_flash.py --variant flash --ep 8 --tp 2 \\
+    python models/deepseek_v4_pro/utils/weights_flash.py --variant flash --ep 8 --tp 2 \\
         --ckpt /path/to/DeepSeek-V4-Flash --out build_output/flash_weights_ep8_tp2
     python models/deepseek_v4_pro/prefill_fwd.py --variant flash --ep 8 --tp 2 \\
         -p a5 -d 0,1,2,3,4,5,6,7 --weights build_output/flash_weights_ep8_tp2
@@ -48,13 +48,21 @@ import argparse
 import json
 import mmap
 import struct
+import sys
 import warnings
 from pathlib import Path
 from typing import Callable
 
 import torch
 
-from config import ACTIVE as M, ACTIVE_BASE, INT8_AMAX_EPS, INT8_SCALE_MAX
+try:
+    from config import ACTIVE as M, ACTIVE_BASE, INT8_AMAX_EPS, INT8_SCALE_MAX
+except ImportError:  # executed as a script from utils/: put the model dir first
+    sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+    # A stray namespace package named `config` may have been cached by the
+    # failed import above; drop it so the retry resolves the model's module.
+    sys.modules.pop("config", None)
+    from config import ACTIVE as M, ACTIVE_BASE, INT8_AMAX_EPS, INT8_SCALE_MAX
 
 # ---------------------------------------------------------------------------
 # Model-layer geometry (mirrors prefill_fwd/decode_fwd stacking rules).

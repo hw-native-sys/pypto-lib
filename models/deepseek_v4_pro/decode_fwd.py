@@ -1721,7 +1721,7 @@ def main():
 
     specs = build_tensor_specs(start_pos=args.start_pos, num_tokens=args.num_tokens)
     if args.weights is not None:
-        from weights_flash import apply_real_weights
+        from utils.weights_flash import apply_real_weights
 
         count = apply_real_weights(specs, args.weights, ep=N_RANKS, tp=LM_HEAD_TP_SIZE)
         print(f"[RUN] real weights: {count} tensors from {args.weights}", flush=True)

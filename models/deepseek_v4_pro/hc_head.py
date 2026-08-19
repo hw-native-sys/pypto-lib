@@ -317,3 +317,61 @@ if __name__ == "__main__":
         if result.error:
             print(result.error)
         raise SystemExit(1)
+
+
+def golden_hc_head_rows(tensors):
+    """Row-count-agnostic port of ``hc_head.golden_hc_head``.
+
+    The leaf golden bakes the decode row count (``hc_head.T`` = decode tokens)
+    into its reshape, while the fwd feeds prefill ``T`` rows, so derive the row
+    count from the input instead. The K-chunked accumulation order (RMS and
+    linear mixes) and the HC_MULT==4 paired reduce are preserved bit-for-bit.
+    """
+    import torch
+
+    x = tensors["x_hc"]
+    rows = x.shape[0]
+    hc_dim = M.hc_dim
+    x_flat_2d = x.reshape(rows, hc_dim).float()
+    hc_head_fn = tensors["hc_head_fn"].float()
+
+    sq_sum = torch.zeros(rows, 1, dtype=torch.float32)
+    for k0 in range(0, hc_dim, RMS_K_CHUNK):
+        x_chunk = x_flat_2d[:, k0:k0 + RMS_K_CHUNK]
+        sq_sum += (x_chunk * x_chunk).sum(dim=1, keepdim=True)
+    rsqrt = torch.rsqrt(sq_sum * (1.0 / hc_dim) + M.rms_norm_eps)
+
+    mix_cols = []
+    for h in range(HC_MULT):
+        mix_col = torch.zeros(rows, 1, dtype=torch.float32)
+        for linear_split in range(LINEAR_OK):
+            split_col = torch.zeros(rows, 1, dtype=torch.float32)
+            split_start = linear_split * LINEAR_K_PER_SPLIT
+            split_end = split_start + LINEAR_K_PER_SPLIT
+            for k0 in range(split_start, split_end, LINEAR_K_CHUNK):
+                x_chunk = x_flat_2d[:, k0:k0 + LINEAR_K_CHUNK]
+                w_chunk = hc_head_fn[h:h + 1, k0:k0 + LINEAR_K_CHUNK]
+                split_col += (x_chunk * w_chunk).sum(dim=1, keepdim=True)
+            mix_col += split_col
+        mix_cols.append(mix_col * rsqrt)
+    mixes = torch.cat(mix_cols, dim=1).reshape(rows, HC_MULT)
+
+    pre = torch.sigmoid(
+        mixes * tensors["hc_head_scale"].float() + tensors["hc_head_base"].float()
+    ) + M.hc_eps
+    x_view = x.float()
+    if HC_MULT == 4:
+        y = (
+            x_view[:, 0, :] * pre[:, 0:1]
+            + x_view[:, 1, :] * pre[:, 1:2]
+        ) + (
+            x_view[:, 2, :] * pre[:, 2:3]
+            + x_view[:, 3, :] * pre[:, 3:4]
+        )
+    else:
+        y = torch.zeros(rows, D, dtype=torch.float32)
+        for h in range(HC_MULT):
+            y += x_view[:, h, :] * pre[:, h:h + 1]
+
+    # Match the kernel's mode="rint" cast (round to nearest, ties to even).
+    tensors["y"][:] = y.to(torch.bfloat16)
