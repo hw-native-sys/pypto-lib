@@ -6,7 +6,7 @@ AICPU side (L2 swimlane), then optimize each kernel's internal pipeline
 (L1/L0 swimlane + PMU).
 
 For the underlying levels see simpler's
-[hierarchical_level_runtime.md](https://github.com/hw-native-sys/simpler/blob/main/docs/hierarchical_level_runtime.md):
+[Hierarchical Level Runtime](https://www.pypto.ai/simpler/hierarchical-level-runtime/):
 L2 = one chip (AICPU + AIC/AIV cores), L1 = die / L2 cache, L0 = single
 compute core.
 

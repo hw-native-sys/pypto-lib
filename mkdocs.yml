@@ -96,6 +96,7 @@ nav:
       - Debugging: debug-and-tune/debugging.md
       - Precision tuning: debug-and-tune/precision-tuning.md
       - Performance tuning: debug-and-tune/performance-tuning.md
+      - Ring heap and scope stats: debug-and-tune/ring-heap-and-scope-stats.md
       - Cube tile tuning: debug-and-tune/cube-tile-tuning.md
       - In-core simulator profiling: debug-and-tune/incore-simulator-profiling.md
       - CCE in-core profiling: debug-and-tune/cce-incore-profiling.md
