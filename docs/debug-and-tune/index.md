@@ -16,6 +16,7 @@ then move from the broadest evidence to the narrowest:
 | Diagnose compile errors, runtime failures, hangs, or missing dependencies | [Debugging](debugging.md) |
 | Diagnose numerical drift and choose comparison thresholds | [Precision Tuning](precision-tuning.md) |
 | Measure end-to-end time and inspect the task schedule | [Performance Tuning](performance-tuning.md) |
+| Understand how task edges are formed and when the scheduler issues them | [Dependencies and Scheduling](dependency-and-scheduling.md) |
 | Fit intermediate tensors in the runtime's ring heaps and measure per-scope peaks | [Ring Heap and Scope Stats](ring-heap-and-scope-stats.md) |
 | Choose matmul row, N, and K tiles | [Cube Tile Tuning](cube-tile-tuning.md) |
 | Inspect one generated kernel in the operator simulator | [In-Core Simulator Profiling](incore-simulator-profiling.md) |

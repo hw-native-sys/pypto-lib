@@ -312,6 +312,9 @@ with an `rtMalloc 207001` OOM before it ever reaches the kernel.
 
 - [Debugging](debugging.md) — device logs for a hang, `runtime_dir` reuse,
   the other four DFX flags.
+- [Dependencies and scheduling](dependency-and-scheduling.md) — the task
+  graph and scheduler behind the rings: what a task is, how edges are formed,
+  and what fills a window.
 - [Performance tuning](performance-tuning.md) — L2 swimlane and PMU; scope
   placement changes the schedule too, so re-measure wall time after it.
 - [PyPTO coding style](../pypto-coding/pypto-coding-style.md) — `pl.at`
