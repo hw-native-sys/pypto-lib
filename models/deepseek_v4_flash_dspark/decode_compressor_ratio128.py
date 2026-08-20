@@ -114,7 +114,7 @@ def compressor_ratio128(
     cmp_slot_mapping: pl.Tensor[[T_DYN], pl.INT64],
     state_slot_mapping: pl.Tensor[[T_DYN], pl.INT64],
     late_dep: pl.Scalar[pl.TASK_ID],
-):
+) -> tuple[pl.Tensor, pl.Scalar[pl.TASK_ID]]:
     b_dim = pl.tensor.dim(compress_state_block_table, 0)
     bs = pl.tensor.dim(x, 0)
     s_dim = bs // b_dim
@@ -237,7 +237,7 @@ def compressor_ratio128(
     cmp_flat_rows = cmp_block_num * BLOCK_SIZE
     cmp_kv_cache_flat = pl.reshape(cmp_kv_cache, [cmp_flat_rows, HEAD_DIM])
 
-    with pl.spmd(rms_blocks, name_hint="rmsnorm_rope_cache_write", deps=[pool_tid]) as _rms_tid:
+    with pl.spmd(rms_blocks, name_hint="rmsnorm_rope_cache_write", deps=[pool_tid]) as cache_write_tid:
         # one 16-row block of B; rows rms_blk_rows..15 are pad on the tail block
         b0 = pl.tile.get_block_idx() * RMS_PAD_TILE
         rms_blk_rows = pl.min(RMS_PAD_TILE, b_dim - b0)
@@ -302,7 +302,7 @@ def compressor_ratio128(
                     kv_flat[global_c_idx * s_dim : global_c_idx * s_dim + 1, :] = kv_row
                     cmp_kv_cache_flat[cmp_row : cmp_row + 1, :] = pl.cast(kv_row, target_type=pl.BF16, mode="rint")
 
-    return kv
+    return kv, cache_write_tid
 
 
 @pl.jit
@@ -340,7 +340,7 @@ def compressor_test(
     cos_il = pl.create_tensor([B, ROPE_HEAD_DIM], dtype=pl.FP32)
     sin_signed = pl.create_tensor([B, ROPE_HEAD_DIM], dtype=pl.FP32)
     rope_interleave(cos, sin, cos_il, sin_signed)
-    compressor_ratio128(
+    kv, cache_write_tid = compressor_ratio128(
         x, kv, compress_state, compress_state_block_table, wkv, wgate, ape, norm_w,
         cos_il, sin_signed,
         cmp_kv_cache, position_ids, cmp_slot_mapping, state_slot_mapping, late_dep,

@@ -115,6 +115,7 @@ def sparse_attn_hca(
     freqs_cos: pl.Tensor[[T_DYN, ROPE_DIM], pl.BF16],
     freqs_sin: pl.Tensor[[T_DYN, ROPE_DIM], pl.BF16],
     o_packed_heads: pl.Tensor[[O_GROUPS * T_PAD, O_GROUP_IN], pl.BF16],
+    cache_ready_dep: pl.Scalar[pl.TASK_ID],
 ) -> tuple[pl.Tensor, pl.Scalar[pl.TASK_ID]]:
     """Write HCA heads as ``[group, T_PAD, O_GROUP_IN]`` slabs.
 
@@ -160,7 +161,7 @@ def sparse_attn_hca(
     # spread evenly. Invalid (-1) and padded lanes are zero-filled to match the
     # golden's zero rows; the NEG_INF bias then kills them in the softmax.
     hca_kv_flat = pl.create_tensor([t_sparse, HEAD_DIM], dtype=pl.BF16)
-    with pl.spmd(t_gather, name_hint="hca_gather_kv") as gather_tid:
+    with pl.spmd(t_gather, name_hint="hca_gather_kv", deps=[cache_ready_dep]) as gather_tid:
         g_task = pl.tile.get_block_idx()
         g_t = g_task // GATHER_SEGS
         g_seg = g_task - g_t * GATHER_SEGS
@@ -392,12 +393,13 @@ def sparse_attn_hca_test(
     freqs_cos.bind_dynamic(0, T_DYN)
     freqs_sin.bind_dynamic(0, T_DYN)
 
+    cache_ready_dep = pl.system.task_dummy(deps=[])
     o_packed_flat = pl.reshape(o_packed_heads, [O_GROUPS * T_PAD, O_GROUP_IN])
-    o_packed_flat, _ = sparse_attn_hca(
+    o_packed_flat, heads_tid = sparse_attn_hca(
         q, ori_kv, window_swa_indices,
         cmp_kv, cmp_block_table, cmp_sparse_indices,
         attn_sink, freqs_cos, freqs_sin,
-        o_packed_flat,
+        o_packed_flat, cache_ready_dep,
     )
     return o_packed_heads
 
