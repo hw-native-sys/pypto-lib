@@ -662,13 +662,28 @@ jobs:
           # the generated text (the loop prints it as a Python repr), the step
           # count actually decoded, and the first device/runtime error line if
           # the run died. Everything else stays in e2e.log (uploaded alongside).
-          python3 - "$rc" "$E2E_PROMPT" "$E2E_DECODE_STEPS" <<'EOF'
+          python3 - "$rc" "$E2E_PROMPT" "$E2E_DECODE_STEPS" "$CKPT/tokenizer.json" <<'EOF'
           import ast, json, re, sys
-          rc, prompt, steps = int(sys.argv[1]), sys.argv[2], int(sys.argv[3])
+          rc, prompt, steps, tok_path = int(sys.argv[1]), sys.argv[2], int(sys.argv[3]), sys.argv[4]
           log = open("e2e.log", errors="replace").read()
           def last(pattern):
               hits = re.findall(pattern, log, re.M)
               return hits[-1] if hits else None
+          # Every forward pass logs the token each rank sampled; rank 0's sequence
+          # is the partial continuation even when the loop dies mid-way (the
+          # typical failure is non-finite logits on one rank a few steps in), so
+          # the summary can show " Paris." and "died at decode step 1" rather
+          # than nothing. Detokenized here because only this venv has tokenizers.
+          sampled = re.findall(r"^\[SESSION\] (prefill|decode\[\d+\]@\d+): sampled=\[([^\]]*)\]", log, re.M)
+          partial_ids = [int(v.split(",")[0]) for _, v in sampled if v.strip()]
+          decode_lines = sum(1 for k, _ in sampled if k.startswith("decode"))
+          partial_text = None
+          if partial_ids:
+              try:
+                  from tokenizers import Tokenizer
+                  partial_text = Tokenizer.from_file(tok_path).decode(partial_ids, skip_special_tokens=False)
+              except Exception as exc:  # noqa: BLE001 - best effort, the ids are still reported
+                  partial_text = f"<detokenization failed: {exc}>"
           text_repr = last(r"^\[SESSION\] generated text: (.*)$")
           text = None
           if text_repr is not None:
@@ -697,10 +712,12 @@ jobs:
               "exit_code": rc,
               "prompt": prompt,
               "decode_steps_requested": steps,
-              "decode_steps_done": (int(eos) if eos else n_ids),
+              "decode_steps_done": (int(eos) if eos else (n_ids if n_ids is not None else decode_lines)),
               "eos_step": int(eos) if eos else None,
               "generated_text": text,
               "generated_ids": ids,
+              "generated_text_partial": None if text is not None else partial_text,
+              "generated_ids_partial": None if text is not None else partial_ids,
               "error": None if passed else (error or f"exit code {rc}, see e2e.log"),
           }, open("e2e.json", "w"), indent=1, ensure_ascii=False)
           print(json.dumps(json.load(open("e2e.json")), indent=1, ensure_ascii=False))
@@ -855,13 +872,18 @@ jobs:
               print("| | |")
               print("|---|---|")
               print(f"| Prompt | `{r.get('prompt', '')}` |")
-              text = r.get("generated_text")
-              if text is None:
-                  print("| Generated text | _(none — the loop did not reach detokenization)_ |")
-              else:
+              def cell(value):
                   # One table cell: keep newlines/pipes from breaking the row.
-                  cell = text.replace("|", "\\|").replace("\n", "⏎ ")
-                  print(f"| Generated text | `{cell}` |")
+                  return str(value).replace("|", "\\|").replace("\n", "⏎ ")
+              text = r.get("generated_text")
+              partial = r.get("generated_text_partial")
+              if text is not None:
+                  print(f"| Generated text | `{cell(text)}` |")
+              elif partial:
+                  n = r.get("decode_steps_done") or 0
+                  print(f"| Generated text (partial: prefill + {n} decode step(s) before the failure) | `{cell(partial)}` |")
+              else:
+                  print("| Generated text | _(none — the loop did not sample a single token)_ |")
               if r.get("error"):
                   err = str(r["error"]).replace("|", "\\|")
                   print(f"| Error | `{err}` |")
