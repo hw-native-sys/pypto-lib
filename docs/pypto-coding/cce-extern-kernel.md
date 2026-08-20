@@ -4,9 +4,10 @@ How to write a hand-written mixed (cube + vector) CCE kernel behind
 `pl.jit.extern` — and, more importantly, the non-obvious traps that make one
 compile fine but **hang on device (507018)** or silently produce wrong data.
 
-This reference was written after folding RoPE into the Qwen3-14B paged-attention
-extern (`paged_attention_rope_cce`). Every trap below cost at least one on-device
-debug cycle; they are recorded here so the next person spends minutes, not a night.
+This reference distills lessons from mixed CCE extern integrations, including a
+retired Qwen paged-attention implementation. The examples below are generic and
+the Qwen references are historical: current Qwen decode uses native PyPTO. The
+failure modes remain useful for other extern kernels.
 
 The companion references are
 [`compile-runtime-workflow.md`](../run-and-validate/compile-runtime-workflow.md)
@@ -49,52 +50,40 @@ first — several traps below follow directly from it.
 `args[]` array as **all tensors first, in signature order, then all scalars**. It
 is **not** positional to the Python signature.
 
-For the fused Qwen extern, the declaration starts with the returned attention
-buffer and ends with the scalars:
+For example, consider an extern that starts with its returned buffer and ends
+with a scalar offset:
 
 ```python
-def paged_attention_rope_cce(
-    out, query, key_cache, value_cache, block_table, workspace, metadata,
-    q_proj, k_proj, ..., seq_lens,
-    cache_row_offset: pl.Scalar[pl.INDEX],
-    batch_offset: pl.Scalar[pl.INDEX],
+def mixed_attention_extern(
+    out, state, cache, metadata, token_positions,
+    row_offset: pl.Scalar[pl.INDEX],
 ) -> ...
 ```
 
 the `args[]` indices are:
 
-| args[] | value | | args[] | value |
-| --- | --- | --- | --- | --- |
-| 0 | out          | | 9  | v_proj |
-| 1 | query        | | 10 | q_norm_w |
-| 2 | key_cache    | | 11 | k_norm_w |
-| 3 | value_cache  | | 12 | rope_cos |
-| 4 | block_table  | | 13 | rope_sin |
-| 5 | workspace    | | 14 | inv_rms_states |
-| 6 | metadata     | | 15 | slot_mapping |
-| 7 | q_proj       | | 16 | seq_lens |
-| 8 | k_proj       | | **17** | **cache_row_offset (first scalar)** |
-|   |              | | **18** | **batch_offset (second scalar — LAST)** |
+| `args[]` | Value |
+| --- | --- |
+| 0 | `out` |
+| 1 | `state` |
+| 2 | `cache` |
+| 3 | `metadata` |
+| 4 | `token_positions` |
+| **5** | **`row_offset` (the scalar, after every tensor)** |
 
-The scalar `cache_row_offset` is the eighteenth parameter and lands at
-`args[17]`, and `batch_offset` follows it at `args[18]`. Read `cache_row_offset`
-at `args[7]` and you get `q_proj`'s tensor descriptor pointer
-reinterpreted as an integer offset; read `seq_lens` at `args[17]` and you
-`reinterpret_cast<Tensor*>(scalar_value)` → for layer 0 that value is `0` → null
-deref → the next `DataCopy` from it **hangs the vector core** (surfaces as
-`507018 SCHEDULER_TIMEOUT sub_class=S1:running-stalled`).
-
-An earlier fused draft placed the scalar between `metadata` and `q_proj`; it
-still landed at `args[17]` because the ten following tensors were packed ahead
-of it. The current fused signature keeps the scalars last. The attention-only
-`paged_attention_cce` does the same, at `args[7]`. Add tensors after a scalar
-and every packed scalar index shifts even when its signature position does not.
+If the scalar is placed earlier in the Python signature, it still lands after
+all five tensors. Reading a tensor descriptor as the offset—or treating a small
+scalar such as zero as a tensor pointer—can turn the next `DataCopy` into a
+vector-core stall, commonly surfaced as
+`507018 SCHEDULER_TIMEOUT sub_class=S1:running-stalled`. Adding a tensor after a
+scalar also shifts every packed scalar index even though the scalar's signature
+position did not move.
 
 **Rules:**
 - Index tensors `0 .. (num_tensors-1)` and scalars `num_tensors ..`, in signature
   order within each group.
-- If one entry (`run_qwen_fai`) serves two ABIs, select per ABI:
-  `WithRope ? args[17] : args[7]`.
+- If one C++ entry serves multiple ABIs, calculate the tensor and scalar counts
+  for each ABI explicitly instead of sharing hard-coded indices.
 - **Verify against the generated orchestration**, never against the Python
   signature. See §7.
 
@@ -104,21 +93,21 @@ A mixed `@pl.jit.extern` group threads its first `pl.Out` or `pl.InOut`
 parameter through a single-tensor return. This makes the relative order of
 output-like parameters observable at the call site.
 
-The broken fused signature listed `query: pl.InOut` before `out: pl.Out` and
-called it as `attn_out = paged_attention_rope_cce(...)`. Generated orchestration
-therefore contained:
+For example, a broken signature can list `state: pl.InOut` before
+`out: pl.Out` and call it as `result = mixed_attention_extern(...)`. Generated
+orchestration then binds the return to the first output-like parameter:
 
 ```cpp
-const Tensor& attn_out_ssa = q_tnd;
+const Tensor& result_ssa = state;
 ```
 
-FAI still received and wrote the real output buffer, but every downstream task
-read the returned query alias. The values initially described as garbage were
-bit-exact RoPE-rotated Q.
+The extern still receives and writes the real output buffer, but downstream
+tasks read the returned state alias. This can look like numerical corruption
+even when the extern's output is correct.
 
 For a single-return extern with other mutable tensors, declare the intended
 return buffer as the first output-like parameter. After the fix, generated
-orchestration contains `attn_out_ssa = attn_out_tnd`. If multiple mutated
+orchestration binds `result_ssa = out`. If multiple mutated
 buffers must be returned as values, use an explicitly supported multi-return
 form instead of assuming the single return selects a later `Out` parameter.
 
@@ -187,12 +176,10 @@ need a **global** cube↔vector barrier, not a per-pair sync.
 - The FFTS base is set by the runtime (§1); you do not `SetSyncBaseAddr` yourself.
 - Do not mechanically surround a mixed-core barrier with `dsb(DSB_DDR)`. The
   C220 `SyncAllImpl` starts with `PipeBarrier<PIPE_ALL>`, but that implementation
-  detail is not a universal GM memory-model guarantee. The Qwen3 C220/CANN 9.0.0
-  MTE3/TSTORE-to-GM producer and MTE2 consumer path was validated without an
-  extra DDR barrier over 40 layers
-  ([pypto-lib#796](https://github.com/hw-native-sys/pypto-lib/pull/796)).
-  Re-evaluate `dcci` and `dsb` whenever the producer uses the data cache or
-  direct scalar writes.
+  detail is not a universal GM memory-model guarantee. One historical C220/CANN
+  9.0.0 MTE3/TSTORE-to-GM producer and MTE2 consumer path was validated without
+  an extra DDR barrier. Re-evaluate `dcci` and `dsb` whenever the producer uses
+  the data cache or direct scalar writes.
 
 For on-device measurement of arrival skew, collective service, and release
 skew, see
@@ -208,14 +195,13 @@ and is not the collective's intrinsic service time.
   orchestration and native kernels only; the extern's CCEC compile happens at the
   first **device** run (JIT-at-load). So a compile error in your extern surfaces
   on device, early, before execution — read the `[Incore] Compilation failed` block.
-- **Golden tolerance can hide a broken op.** A single decode layer's attention is
-  a small perturbation on the residual stream, so `--validate-fwd --fwd-layers 1`
-  can PASS at `logits 100% within 5e-2` **even with attention entirely skipped**.
-  Always validate a fused attention with the **full stack** (`--fwd-layers 40`),
-  where errors compound and the argmax actually moves.
-- Keep the original attention-only extern intact and select the fused path with a
-  template flag (`WithRope`) + a separate entry `.cpp`, so existing golden/source
-  tests are unaffected.
+- **Golden tolerance can hide a broken op.** In a residual network, one layer's
+  attention contribution can be small enough that a loose end-to-end tolerance
+  passes even when the operation is skipped. Validate the extern directly and
+  add a representative full-depth integration case where errors compound.
+- During a migration, keep reference comparisons outside the production route.
+  Once the replacement is accepted, remove the retired selector and extern
+  implementation so normal execution has one unambiguous backend.
 
 ---
 
@@ -261,8 +247,8 @@ not worth reverse-engineering; work from artifacts.
    not set for externs; per-`.o` sync globals; mode-0 count descriptors) were ruled
    out by reading these ~200 lines.
 
-6. **Confirm with a strict test.** Only a compounding, full-depth run
-   (40-layer golden) proves a fused attention correct; a single-layer pass does not
+6. **Confirm with strict tests.** Pair a direct operator oracle with a
+   representative full-depth run; a loose single-layer pass is insufficient
    (§6).
 
 7. **Wrong data (not a hang): partial-dump the op's output vs. what the consumer

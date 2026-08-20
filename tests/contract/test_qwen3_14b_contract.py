@@ -11,8 +11,10 @@ from __future__ import annotations
 
 import ast
 import inspect
-import re
-from collections import Counter
+import json
+import os
+import subprocess
+import sys
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -23,6 +25,281 @@ from contract.registry import find_contract_for_model_config, get_contract
 
 
 _REPO_ROOT = Path(__file__).resolve().parents[2]
+
+
+def test_qwen3_14b_public_abi_fingerprint_is_frozen() -> None:
+    """Backend selection is a build concern and must not change the serving ABI."""
+    contract = get_contract("qwen3", "14b")
+
+    assert contract.abi_fingerprint() == ("00fb898b160b00e9448d18c1df30e25215d5fc4f98ec2f0ed9ee6da34c59826f")
+    assert [(argument.name, argument.direction) for argument in contract.kernels["decode"].args] == [
+        ("input_rms_weight", "in"),
+        ("wq", "in"),
+        ("wk", "in"),
+        ("wv", "in"),
+        ("q_norm_weight", "in"),
+        ("k_norm_weight", "in"),
+        ("seq_lens", "in"),
+        ("block_table", "in"),
+        ("slot_mapping", "in"),
+        ("rope_cos", "in"),
+        ("rope_sin", "in"),
+        ("k_cache", "inout"),
+        ("v_cache", "inout"),
+        ("wo", "in"),
+        ("w_gate", "in"),
+        ("w_up", "in"),
+        ("w_down", "in"),
+        ("post_rms_weight", "in"),
+        ("final_norm_weight", "in"),
+        ("lm_head_weight", "in"),
+        ("out", "out"),
+        ("embed_weight", "in"),
+        ("sampled_ids_in", "in"),
+        ("sampled_ids", "out"),
+        ("next_hidden", "out"),
+    ]
+
+
+def _ast_function_source(source: str, function: ast.FunctionDef) -> str:
+    return ast.get_source_segment(source, function) or ""
+
+
+def _ast_function_signature(function: ast.FunctionDef) -> tuple[tuple[str, str | None], ...]:
+    return tuple(
+        (
+            argument.arg,
+            ast.unparse(argument.annotation) if argument.annotation is not None else None,
+        )
+        for argument in function.args.args
+    )
+
+
+def test_step9_decode_is_sole_pypto_and_preserves_task_graph() -> None:
+    """Pin the sole native implementation and the public entry signatures."""
+    path = _REPO_ROOT / "models" / "qwen3_14b" / "decode_fwd.py"
+    source = path.read_text()
+    tree = ast.parse(source)
+
+    assert "from paged_attention_pypto import" in source
+    forbidden = (
+        "PYPTO_QWEN3_PA_IMPL",
+        "expect_pa_impl",
+        "pa_backend",
+        "paged_attention_cce",
+        "legacy_cce",
+        "fa_fused",
+        "PA_METADATA_BYTES",
+        "PA_WORKSPACE_BYTES",
+        "build_paged_attention_metadata",
+    )
+    residue = [marker for marker in forbidden if marker in source]
+    assert residue == [], f"decode_fwd.py still references retired CCE markers: {residue}"
+
+    decode_layer = next(
+        node for node in tree.body if isinstance(node, ast.FunctionDef) and node.name == "_decode_layer"
+    )
+    decode_layer_source = _ast_function_source(source, decode_layer)
+    assert decode_layer_source.count("_run_paged_attention(") == 1
+    assert "rope_qkv_pypto(" not in decode_layer_source
+    assert "paged_attention_pypto_swpipe(" not in decode_layer_source
+    assert "scratch_ready[0] = attn_done_tid" in decode_layer_source
+    assert "out_proj_dummy = pl.system.task_dummy(deps=[attn_done_tid])" in decode_layer_source
+    assert 'name_hint="out_proj"' in decode_layer_source
+    assert "deps=[attn_done_tid]" in decode_layer_source
+
+    adapters = [
+        node
+        for node in tree.body
+        if isinstance(node, ast.FunctionDef) and node.name == "_run_paged_attention"
+    ]
+    assert len(adapters) == 1
+    adapter_source = _ast_function_source(source, adapters[0])
+    assert adapter_source.count("paged_attention_pypto_swpipe(") == 1
+    assert "rope_qkv_pypto" not in adapter_source
+    assert "rope_tid" not in adapter_source
+    assert "sync_start=True" not in adapter_source
+
+    for entry_name, expected_arg_count, body_name in (
+        ("decode_fwd", 25, "_decode_fwd_body"),
+        ("decode_fwd_layers", 20, "_decode_fwd_layers_body"),
+    ):
+        entries = [
+            node for node in tree.body if isinstance(node, ast.FunctionDef) and node.name == entry_name
+        ]
+        assert len(entries) == 1
+        entry = entries[0]
+        assert len(entry.args.args) == expected_arg_count
+        entry_source = _ast_function_source(source, entry)
+        assert f"{body_name}(" in entry_source
+        assert entry_source.count("pl.create_tensor(") == 4
+        assert "score_transfer" in entry_source
+        assert "probability_transfer" in entry_source
+        assert "pv_transfer" in entry_source
+        assert "ffts_workspace" in entry_source
+        assert "scratch_ready = pl.array.create(1, pl.TASK_ID)" in entry_source
+        assert "scratch_ready[0] = pl.system.task_dummy" not in entry_source
+
+
+def test_step9_decode_wrapper_materializes_public_out_tuple() -> None:
+    """Keep serving L3 return discovery intact on the sole PyPTO entry."""
+    path = _REPO_ROOT / "models" / "qwen3_14b" / "decode_fwd.py"
+    tree = ast.parse(path.read_text())
+    entries = [node for node in tree.body if isinstance(node, ast.FunctionDef) and node.name == "decode_fwd"]
+    assert len(entries) == 1
+    entry = entries[0]
+
+    expected_outputs = ("out", "sampled_ids_out", "next_hidden")
+    declared_outputs = tuple(
+        argument.arg
+        for argument in entry.args.args
+        if argument.annotation is not None and ast.unparse(argument.annotation).startswith("pl.Out[")
+    )
+    assert declared_outputs == expected_outputs
+
+    body_calls = [
+        statement
+        for statement in entry.body
+        if isinstance(statement, ast.Assign)
+        and isinstance(statement.value, ast.Call)
+        and isinstance(statement.value.func, ast.Name)
+        and statement.value.func.id == "_decode_fwd_body"
+    ]
+    assert len(body_calls) == 1
+    assignment = body_calls[0]
+    assert len(assignment.targets) == 1
+    assert isinstance(assignment.targets[0], ast.Tuple)
+    assert all(isinstance(element, ast.Name) for element in assignment.targets[0].elts)
+    assert tuple(element.id for element in assignment.targets[0].elts) == expected_outputs
+
+    assert isinstance(entry.body[-1], ast.Return)
+    assert isinstance(entry.body[-1].value, ast.Tuple)
+    assert all(isinstance(element, ast.Name) for element in entry.body[-1].value.elts)
+    assert tuple(element.id for element in entry.body[-1].value.elts) == expected_outputs
+
+    serving_entries = [
+        node for node in tree.body if isinstance(node, ast.FunctionDef) and node.name == "qwen3_decode_host"
+    ]
+    assert len(serving_entries) == 1
+    serving_entry = serving_entries[0]
+    assert any(ast.unparse(decorator) == "pl.jit.host" for decorator in serving_entry.decorator_list)
+
+    serving_call = next(
+        statement
+        for statement in serving_entry.body
+        if isinstance(statement, ast.Assign)
+        and isinstance(statement.value, ast.Call)
+        and isinstance(statement.value.func, ast.Name)
+        and statement.value.func.id == "decode_fwd"
+    )
+    assert isinstance(serving_call.targets[0], ast.Tuple)
+    assert tuple(element.id for element in serving_call.targets[0].elts) == (
+        "logits",
+        "sampled_ids",
+        "next_hidden",
+    )
+    assert isinstance(serving_entry.body[-1], ast.Return)
+    assert isinstance(serving_entry.body[-1].value, ast.Tuple)
+    assert tuple(element.id for element in serving_entry.body[-1].value.elts) == (
+        "logits",
+        "sampled_ids",
+        "next_hidden",
+    )
+
+
+_DECODE_IMPORT_PROBE_PREFIX = "__QWEN3_DECODE_IMPORT_PROBE__="
+
+
+def _run_decode_import_probe(build_dir: Path) -> subprocess.CompletedProcess[str]:
+    model_dir = _REPO_ROOT / "models" / "qwen3_14b"
+    environment = os.environ.copy()
+    environment.update(
+        {
+            "PYPTO_PROG_BUILD_DIR": str(build_dir),
+            "PYTHONDONTWRITEBYTECODE": "1",
+            "PYTHONPATH": os.pathsep.join(
+                [str(model_dir), str(_REPO_ROOT), environment.get("PYTHONPATH", "")]
+            ),
+        }
+    )
+    probe = f"""
+import inspect
+import json
+import sys
+
+import decode_fwd
+
+
+def jit_source(value):
+    return inspect.getsource(getattr(value, "_func", value))
+
+
+backend_modules = sorted(
+    {{name.rsplit(".", 1)[-1] for name in sys.modules}}
+    & {{"paged_attention_cce", "paged_attention_pypto"}}
+)
+payload = {{
+    "backend_modules": backend_modules,
+    "adapter_source": jit_source(decode_fwd._run_paged_attention),
+    "decode_source": jit_source(decode_fwd.decode_fwd),
+    "layers_source": jit_source(decode_fwd.decode_fwd_layers),
+    "decode_args": list(inspect.signature(decode_fwd.decode_fwd._func).parameters),
+    "layers_args": list(inspect.signature(decode_fwd.decode_fwd_layers._func).parameters),
+}}
+print({_DECODE_IMPORT_PROBE_PREFIX!r} + json.dumps(payload, sort_keys=True))
+"""
+    return subprocess.run(
+        [sys.executable, "-c", probe],
+        cwd=_REPO_ROOT,
+        env=environment,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+
+def test_step9_production_decode_fresh_process_is_sole_pypto(
+    tmp_path: Path,
+) -> None:
+    """A fresh process exposes only native PyPTO."""
+    completed = _run_decode_import_probe(tmp_path / "build")
+
+    assert completed.returncode == 0, completed.stderr
+    probe_lines = [
+        line for line in completed.stdout.splitlines() if line.startswith(_DECODE_IMPORT_PROBE_PREFIX)
+    ]
+    assert len(probe_lines) == 1, completed.stdout
+    payload = json.loads(probe_lines[0].removeprefix(_DECODE_IMPORT_PROBE_PREFIX))
+    assert payload["backend_modules"] == ["paged_attention_pypto"]
+    assert len(payload["decode_args"]) == 25
+    assert len(payload["layers_args"]) == 20
+
+    compile_source = "\n".join(
+        (payload["adapter_source"], payload["decode_source"], payload["layers_source"])
+    )
+    assert compile_source.count("paged_attention_pypto_swpipe(") == 1
+    assert "rope_qkv_pypto" not in compile_source
+    assert "rope_tid" not in compile_source
+    assert "score_transfer = pl.create_tensor" in compile_source
+    assert "ffts_workspace = pl.create_tensor" in compile_source
+    for forbidden in (
+        "paged_attention_rope_cce(",
+        "build_paged_attention_metadata(",
+        "PA_WORKSPACE_BYTES",
+        "legacy_cce",
+        "PYPTO_QWEN3_PA_IMPL",
+    ):
+        assert forbidden not in compile_source
+
+
+def test_qwen_pa_driver_checks_codegen_scratch_and_no_cce() -> None:
+    component = (_REPO_ROOT / "models" / "qwen3_14b" / "test_paged_attention_pypto.py").read_text()
+    assert "_resolve_pass_dump" in component
+    assert "after_ExpandMixedKernel" in component
+    assert "fused PA must allocate q_tnd plus one four-tensor scratch set" in component
+    assert "PyPTO PA artifact contains a legacy CCE marker" in component
+    assert "fused PA artifact is missing the Phase-0 GM fence + hard mixed-core barrier" in component
+    assert "375-case Cartesian product" in component
 
 
 def _tiny_model_config() -> SimpleNamespace:
@@ -120,194 +397,122 @@ def test_loaded_kernel_signatures_match_contract_arg_counts() -> None:
         assert len(kernel_params) == len(stage.args)
 
 
-def test_fused_attention_declares_real_output_first() -> None:
-    source = _REPO_ROOT / "models" / "qwen3_14b" / "paged_attention_cce.py"
-    tree = ast.parse(source.read_text())
-    func = next(
-        node
-        for node in tree.body
-        if isinstance(node, ast.FunctionDef)
-        and node.name == "paged_attention_rope_cce"
-    )
-    output_like = [
-        arg.arg
-        for arg in func.args.args
-        if isinstance(arg.annotation, ast.Subscript)
-        and isinstance(arg.annotation.value, ast.Attribute)
-        and arg.annotation.value.attr in {"Out", "InOut"}
-    ]
-
-    assert output_like[0] == "out", (
-        "single-result extern binds its return to the first Out/InOut parameter"
-    )
-
-
-def test_fused_attention_uses_standalone_rope_worker_count() -> None:
-    decode_source = _REPO_ROOT / "models" / "qwen3_14b" / "decode_fwd.py"
-    decode_tree = ast.parse(decode_source.read_text())
-    rope_cores = next(
-        node.value.value
-        for node in decode_tree.body
-        if isinstance(node, ast.Assign)
-        and any(
-            isinstance(target, ast.Name) and target.id == "ROPE_CORES"
-            for target in node.targets
-        )
-        and isinstance(node.value, ast.Constant)
-    )
-
-    kernel_dir = (
-        _REPO_ROOT
-        / "models"
-        / "qwen3_14b"
-        / "kernels"
-        / "paged_attention_cce"
-        / "kernel"
-    )
-    fai_body = (kernel_dir / "fai_body.hpp").read_text()
-    assert f"constexpr uint32_t kQwenRopeCores = {rope_cores};" in fai_body
-    # Match the lane guard and the guarded call, but NOT the call's trailing
-    # arguments: regenerating the RoPE body can change the parameter list (e.g.
-    # adding a dynamic-dim scalar), and that is a legitimate change this test
-    # should not block. The arg mapping itself is covered by the static_assert
-    # on the function-pointer type in fai_body.hpp.
-    guarded_call = re.search(
-        r"uint32_t rope_lane = block_idx \* 2 \+ sub_block_idx;\s*"
-        r"if \(rope_lane < kQwenRopeCores\) \{\s*"
-        r"qwen_rope_gen::rope_qkv\(",
-        fai_body,
-        flags=re.DOTALL,
-    )
-    assert guarded_call is not None
-
-    # Anchor on the hand-written provenance banner, not on a generated
-    # `const int64_t vNN = 32;` line -- SSA constants are renumbered by every
-    # regeneration, so pinning one makes any regen look like a real failure.
-    generated_rope = (kernel_dir / "rope_qkv_generated.hpp").read_text()
-    assert f"// ROPE_CORES: {rope_cores}" in generated_rope, (
-        "update the ROPE_CORES provenance banner in rope_qkv_generated.hpp's "
-        "hand-written preamble when regenerating the specialized RoPE body"
-    )
-
-
-def test_compile_arg_builders_follow_loaded_stage_specs() -> None:
+def test_contract_args_match_public_host_signatures() -> None:
     contract = get_contract("qwen3", "14b")
-    loaded = contract.load_kernels()
-    model_config = _tiny_model_config()
-    runtime_config = _runtime_config()
 
-    prefill_args = contract.kernels["prefill"].compile_args_builder(model_config, runtime_config)
-    decode_args = contract.kernels["decode"].compile_args_builder(model_config, runtime_config)
-    greedy_args = contract.kernels["greedy_sample"].compile_args_builder(model_config, runtime_config)
+    for stage in contract.kernels.values():
+        host_params = tuple(inspect.signature(stage.host_jit_fn._func).parameters)
+        assert tuple(arg.name for arg in stage.args) == host_params
 
-    assert len(prefill_args) == len(contract.kernels["prefill"].args)
-    assert len(prefill_args) == len(inspect.signature(loaded.functions["prefill_fwd"]._func).parameters)
-    assert prefill_args[0].shape == (32, 8)
-    assert prefill_args[-1].shape == (16, 512)
-    assert prefill_args[-1].dtype == torch.float32
-
-    assert len(decode_args) == len(contract.kernels["decode"].args)
-    assert len(decode_args) == len(inspect.signature(loaded.functions["decode_fwd"]._func).parameters)
-    assert decode_args[0].shape == (2, 8)
-    assert decode_args[-3].shape == (16, 8)
-    assert decode_args[-2].shape == (16, 8)
-    assert decode_args[-1].shape == (16, 8)
-
-    assert [tuple(arg.shape) for arg in greedy_args] == [(16, 512), (16, 8)]
-    assert len(greedy_args) == len(inspect.signature(loaded.functions["greedy_sample_fwd"]._func).parameters)
-
-
-def _rope_qkv_function_body() -> str:
-    path = (
-        _REPO_ROOT / "models" / "qwen3_14b" / "kernels" / "paged_attention_cce"
-        / "kernel" / "rope_qkv_generated.hpp"
-    )
-    src = path.read_text()
-    start = src.index("static __aicore__ void rope_qkv(")
-    depth, idx = 0, src.index("{", start)
-    while True:
-        if src[idx] == "{":
-            depth += 1
-        elif src[idx] == "}":
-            depth -= 1
-            if depth == 0:
-                return src[start:idx + 1]
-        idx += 1
-
-
-_FLAG_RE = re.compile(r"(set_flag|wait_flag)\((\w+),\s*(\w+),\s*(\w+)\)")
-
-
-def _flag_balance(text: str) -> tuple[Counter, Counter]:
-    sets: Counter = Counter()
-    waits: Counter = Counter()
-    for kind, src_pipe, dst_pipe, event in _FLAG_RE.findall(text):
-        (sets if kind == "set_flag" else waits)[(src_pipe, dst_pipe, event)] += 1
-    return sets, waits
-
-
-def test_generated_rope_every_feasible_path_is_sync_safe() -> None:
-    """Every executable path through the guarded RoPE items must not deadlock.
-
-    The generated body runs two guarded item blocks per pipeline iteration:
-    ``if (item < NUM_KV_HEADS * batch) { ... }``. At the padded batch both
-    guards are always true (max item id 127 < 128), so the skip path never runs
-    today -- but a runtime batch < BATCH_PAD makes it live, and a skipped block
-    owning a ``set_flag`` whose ``wait_flag`` still executes would hang the AIV.
-
-    Model the feasible paths rather than asserting per-block balance: the two
-    blocks handle items ``L`` and ``L + ROPE_CORES``, so the guard can only ever
-    drop the *later* one. Executing block 1 without block 0 is unreachable, and
-    a future codegen where block 0 legitimately hands a credit to block 1 must
-    not be rejected. Simulate each reachable path in source order and require
-    that no wait ever runs without an outstanding set, and that the epilogue
-    drains every credit.
-    """
-    body = _rope_qkv_function_body()
-    lines = body.split("\n")
-
-    blocks: list[tuple[int, int]] = []
-    for n, line in enumerate(lines):
-        if not re.match(r"\s*if \(v\d+ < v\d+\) \{", line):
-            continue
-        depth = 0
-        for end in range(n, len(lines)):
-            depth += lines[end].count("{") - lines[end].count("}")
-            if depth == 0 and end > n:
-                blocks.append((n, end))
-                break
-    assert len(blocks) == 2, f"expected 2 guarded item blocks, found {len(blocks)}"
-
-    def line_block(index: int) -> int | None:
-        for b, (start, end) in enumerate(blocks):
-            if start <= index <= end:
-                return b
-        return None
-
-    # Reachable prefixes only: item L+ROPE_CORES cannot pass a guard that item L
-    # failed, so {block 1 alone} is not a reachable state.
-    for taken in ((), (0,), (0, 1)):
-        credits: Counter = Counter()
-        for index, line in enumerate(lines):
-            owner = line_block(index)
-            if owner is not None and owner not in taken:
-                continue
-            for kind, src_pipe, dst_pipe, event in _FLAG_RE.findall(line):
-                key = (src_pipe, dst_pipe, event)
-                if kind == "set_flag":
-                    credits[key] += 1
-                else:
-                    assert credits[key] > 0, (
-                        f"path {taken or '(no guarded block)'}: wait_flag{key} at "
-                        f"generated line {index} has no outstanding set_flag -- "
-                        f"this path would hang the AIV at a runtime batch < BATCH_PAD"
-                    )
-                    credits[key] -= 1
-        outstanding = {k: v for k, v in credits.items() if v}
-        assert not outstanding, (
-            f"path {taken or '(no guarded block)'} leaves undrained sync credits "
-            f"{outstanding}; the epilogue must consume exactly what the prologue set"
+    for stage_name, module_name in (("prefill", "prefill_fwd.py"), ("decode", "decode_fwd.py")):
+        source = (_REPO_ROOT / "models" / "qwen3_14b" / module_name).read_text()
+        tree = ast.parse(source)
+        serving_host = next(
+            node
+            for node in tree.body
+            if isinstance(node, ast.FunctionDef) and node.name == f"qwen3_{stage_name}_host"
         )
+        assert any(ast.unparse(decorator) == "pl.jit.host" for decorator in serving_host.decorator_list)
+        assert tuple(arg.name for arg in contract.kernels[stage_name].args) == tuple(
+            argument.arg for argument in serving_host.args.args
+        )
+
+
+def test_prefill_host_maps_arguments_to_loaded_kernel_order() -> None:
+    contract_tree = ast.parse((_REPO_ROOT / "models" / "qwen3_14b" / "contract.py").read_text())
+    prefill_source = (_REPO_ROOT / "models" / "qwen3_14b" / "prefill_fwd.py").read_text()
+    prefill_tree = ast.parse(prefill_source)
+    contract_host = next(
+        node
+        for node in contract_tree.body
+        if isinstance(node, ast.FunctionDef) and node.name == "qwen3_prefill_host"
+    )
+    kernel = next(
+        node for node in prefill_tree.body if isinstance(node, ast.FunctionDef) and node.name == "prefill_fwd"
+    )
+    serving_host = next(
+        node
+        for node in prefill_tree.body
+        if isinstance(node, ast.FunctionDef) and node.name == "qwen3_prefill_host"
+    )
+
+    kernel_args = [argument.arg for argument in kernel.args.args]
+    for host in (contract_host, serving_host):
+        call = next(
+            node.value
+            for node in host.body
+            if isinstance(node, ast.Return) and isinstance(node.value, ast.Call)
+        )
+        assert [arg.id for arg in call.args if isinstance(arg, ast.Name)] == kernel_args
+
+    serving_annotations = dict(_ast_function_signature(serving_host))
+    assert serving_annotations["rope_cos"] == "pl.Tensor[[D.rope_seq, HEAD_DIM], pl.FP32]"
+    assert serving_annotations["rope_sin"] == "pl.Tensor[[D.rope_seq, HEAD_DIM], pl.FP32]"
+
+
+def test_native_paged_attention_source_has_phase0_and_fixed_mixed_groups() -> None:
+    source_path = _REPO_ROOT / "models" / "qwen3_14b" / "paged_attention_pypto.py"
+    source = source_path.read_text()
+    tree = ast.parse(source)
+
+    functions = {node.name: node for node in tree.body if isinstance(node, ast.FunctionDef)}
+    assert "paged_attention_pypto_swpipe" in functions
+    assert "rope_qkv_pypto" not in functions
+    assert "rope_tid" not in source
+    attention_function = functions["paged_attention_pypto_swpipe"]
+    attention_source = _ast_function_source(source, attention_function)
+    assert "q2d[" in attention_source
+    assert "key_cache_bsnd = pl.reshape(key_cache," in attention_source
+    assert "value_cache_bsnd = pl.reshape(value_cache," in attention_source
+    assert "key_cache_bsnd[" in attention_source
+    assert "value_cache_bsnd[" in attention_source
+    assert "with pl.spmd(" in attention_source
+    assert "ATTN_SPMD_BLOCKS" in attention_source
+    spmd_calls = [
+        node
+        for node in ast.walk(attention_function)
+        if isinstance(node, ast.Call) and ast.unparse(node.func) == "pl.spmd"
+    ]
+    assert len(spmd_calls) == 1
+    spmd_keywords = {keyword.arg: keyword.value for keyword in spmd_calls[0].keywords}
+    assert isinstance(spmd_keywords["sync_start"], ast.Constant)
+    assert spmd_keywords["sync_start"].value is True
+    assert isinstance(spmd_keywords["allow_early_resolve"], ast.Constant)
+    assert spmd_keywords["allow_early_resolve"].value is True
+    assert isinstance(spmd_keywords["deps"], (ast.List, ast.Tuple))
+    assert {ast.unparse(dependency) for dependency in spmd_keywords["deps"].elts} == {
+        "q_proj_tid",
+        "k_proj_tid",
+        "v_proj_tid",
+        "rms_tid",
+        "attn_out_seed_tid",
+        "mlp_out_seed_tid",
+        "scratch_ready_tid",
+    }
+    assert "pl.system.set_ffts(ffts_workspace)" in attention_source
+    syncall_calls = [
+        node
+        for node in ast.walk(attention_function)
+        if isinstance(node, ast.Call) and ast.unparse(node.func) == "pl.system.syncall"
+    ]
+    assert len(syncall_calls) == 1
+    syncall_keywords = {keyword.arg: keyword.value for keyword in syncall_calls[0].keywords}
+    assert isinstance(syncall_keywords["core_type"], ast.Constant)
+    assert syncall_keywords["core_type"].value == "mix"
+    fence_calls = [
+        node
+        for node in ast.walk(attention_function)
+        if isinstance(node, ast.Call) and ast.unparse(node.func) == "pl.system.fence"
+    ]
+    assert len(fence_calls) == 1
+    assert attention_source.index("pl.system.fence()") < attention_source.index(
+        'pl.system.syncall(core_type="mix")'
+    )
+    assert "pl.system.sync_set(" in attention_source
+    assert "pl.system.sync_wait(" in attention_source
+    assert "block_table_2d = pl.reshape(block_table, [active_batch, max_blocks_per_seq])" in attention_source
+    assert "pl.tensor.read(block_table_2d, [batch," in attention_source
+    assert "base = batch * max_blocks_per_seq" not in attention_source
 
 
 def test_decode_contract_uses_dynamic_batch() -> None:
@@ -397,7 +602,7 @@ def test_runtime_arg_builders_follow_host_order() -> None:
         padded_embed_weight="embed",
     )
     prefill_inputs = SimpleNamespace(
-        hidden="hidden",
+        token_ids="token_ids",
         seq_lens="seq_lens",
         chunk_lens="chunk_lens",
         chunk_offsets="chunk_offsets",
@@ -428,8 +633,33 @@ def test_runtime_arg_builders_follow_host_order() -> None:
         next_hidden_buffer="next_hidden",
     )
 
-    assert prefill_args[:6] == ("hidden", "seq_lens", "chunk_lens", "chunk_offsets", "input_rms_weight", "wq")
-    assert prefill_args[-4:] == ("post_rms_weight", "final_norm_weight", "lm_head", "logits")
+    assert prefill_args == (
+        "token_ids",
+        "seq_lens",
+        "chunk_lens",
+        "chunk_offsets",
+        "input_rms_weight",
+        "wq",
+        "wk",
+        "wv",
+        "q_norm_weight",
+        "k_norm_weight",
+        "rope_cos",
+        "rope_sin",
+        "block_table",
+        "slot_mapping",
+        "k_cache",
+        "v_cache",
+        "wo",
+        "w_gate",
+        "w_up",
+        "w_down",
+        "post_rms_weight",
+        "final_norm_weight",
+        "lm_head",
+        "embed",
+        "logits",
+    )
     assert decode_args[:4] == ("input_rms_weight", "wq", "wk", "wv")
     assert decode_args[-5:] == ("logits", "embed", "token_ids", "sampled_ids", "next_hidden")
 

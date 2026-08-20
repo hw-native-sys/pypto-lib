@@ -618,7 +618,12 @@ def _attention_phase_window_full_single_block(
                     [acc_li_row0 + 3 * Q_HEAD_BATCH_PAD, 0],
                 )
 
+        # Publish the cross-core GM accumulators before the arrival barrier,
+        # then invalidate consumer caches before the finalize phase reads them.
+        pl.system.cacheinvalid()
+        pl.system.fence()
         pl.system.syncall(core_type="mix")
+        pl.system.cacheinvalid()
 
         for final_work_id in pl.range(
             phase_core,

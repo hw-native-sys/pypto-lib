@@ -19,7 +19,9 @@ Tuning needs a number before and after. Set `PYPTO_BENCH=1` and every
 correctness dispatch — no `--benchmark` flag, no edit to the model file:
 
 ```bash
-PYPTO_BENCH=1 python models/qwen3_14b/decode_fwd.py -p a2a3 -d 0
+PYPTO_BENCH=1 \
+python models/qwen3_14b/decode_fwd.py \
+  -p a2a3 -d "$DEVICE_ID"
 ```
 
 ```
@@ -120,7 +122,8 @@ records under the build directory and, on a real-device platform, converts
 them to a merged swimlane:
 
 ```bash
-python models/qwen3_14b/decode_fwd.py -p a2a3 -d 0 --enable-l2-swimlane
+python models/qwen3_14b/decode_fwd.py \
+  -p a2a3 -d "$DEVICE_ID" --enable-l2-swimlane
 ```
 
 ```
