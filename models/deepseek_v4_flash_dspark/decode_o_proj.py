@@ -790,6 +790,7 @@ def decode_sharded_o_projection_reduce_scatter(
         O_RS_PUBLISH_WORKERS,
         name_hint="tp_o_b_dequant_publish",
         deps=[proj_b_tids[group] for group in range(LOCAL_O_GROUPS)],
+        optimizations=[pl.cross_core_slot(slot_num=2)],
     ) as publish_tid:
         worker = pl.tile.get_block_idx()
         for owner_rank in pl.range(TP_SIZE):
