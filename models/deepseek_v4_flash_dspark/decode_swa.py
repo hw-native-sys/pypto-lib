@@ -91,7 +91,8 @@ MIX_HC = M.mix_hc
 HC_DIM = M.hc_dim
 HC_SINKHORN_ITER = M.hc_sinkhorn_iters
 HC_EPS = M.hc_eps
-MAX_SEQ_LEN = M.max_position_embeddings
+# SWA-local context ceiling. The global model ceiling remains unchanged.
+max_position_embeddings_tmp = 1_048_576
 O_LORA = M.o_lora_rank
 O_GROUPS = M.o_groups
 HEADS_PER_GROUP = H // O_GROUPS
@@ -281,8 +282,8 @@ def decode_swa(
     wkv: pl.Tensor[[D, HEAD_DIM], pl.BF16],
     gamma_cq: pl.Tensor[[Q_LORA], pl.BF16],
     gamma_ckv: pl.Tensor[[HEAD_DIM], pl.BF16],
-    freqs_cos: pl.Tensor[[MAX_SEQ_LEN, ROPE_HEAD_DIM], pl.BF16],
-    freqs_sin: pl.Tensor[[MAX_SEQ_LEN, ROPE_HEAD_DIM], pl.BF16],
+    freqs_cos: pl.Tensor[[T_DYN, ROPE_HEAD_DIM], pl.BF16],
+    freqs_sin: pl.Tensor[[T_DYN, ROPE_HEAD_DIM], pl.BF16],
     # KV cache
     kv_cache: pl.Tensor[[ORI_BLOCK_NUM_DYN, BLOCK_SIZE, 1, HEAD_DIM], pl.BF16],
     swa_slot_mapping: pl.Tensor[[T_DYN], pl.INT64],
@@ -307,24 +308,11 @@ def decode_swa(
 ):
     """Run the complete SWA layer with tensor-parallel output."""
     t_dim = pl.tensor.dim(x_hc, 0)
-    b_dim = t_dim // S
     bias_blocks = t_dim // BIAS_T_TILE
     x_mixed = pl.create_tensor([t_dim, D], dtype=pl.BF16)
     post_t = pl.create_tensor([t_dim, HC_MULT], dtype=pl.FP32)
     comb_t = pl.create_tensor([t_dim, HC_MULT * HC_MULT], dtype=pl.FP32)
     hc_pre(x_hc, hc_attn_fn, hc_attn_scale, hc_attn_base, x_mixed, post_t, comb_t)
-
-    rope_cos_t = pl.create_tensor([t_dim, ROPE_HEAD_DIM], dtype=pl.BF16)
-    rope_sin_t = pl.create_tensor([t_dim, ROPE_HEAD_DIM], dtype=pl.BF16)
-    with pl.at(level=pl.Level.CORE_GROUP, name_hint="swa_rope_step"):
-        for b in pl.range(b_dim):
-            for s_idx in pl.range(S):
-                t = b * S + s_idx
-                pos_b = pl.cast(pl.read(position_ids, [t]), pl.INDEX)
-                cos_row = pl.cast(freqs_cos[pos_b : pos_b + 1, 0 : ROPE_HEAD_DIM], target_type=pl.FP32)
-                sin_row = pl.cast(freqs_sin[pos_b : pos_b + 1, 0 : ROPE_HEAD_DIM], target_type=pl.FP32)
-                rope_cos_t[t : t + 1, 0 : ROPE_HEAD_DIM] = pl.cast(cos_row, target_type=pl.BF16, mode="rint")
-                rope_sin_t[t : t + 1, 0 : ROPE_HEAD_DIM] = pl.cast(sin_row, target_type=pl.BF16, mode="rint")
 
     x_normed_t = pl.create_tensor([t_dim, D], dtype=pl.BF16)
     rms_tid = rms_norm(x_mixed, attn_norm_w, x_normed_t)
@@ -336,7 +324,7 @@ def decode_swa(
     qr_scale = pl.create_tensor([t_dim, 1], dtype=pl.FP32)
     qkv_proj_rope(
         x_normed_t, wq_a, wq_b, wq_b_scale, wkv,
-        rope_cos_t, rope_sin_t, gamma_cq, gamma_ckv,
+        freqs_cos, freqs_sin, gamma_cq, gamma_ckv,
         q, kv, qr, qr_scale, late_dep,
     )
 
@@ -367,7 +355,7 @@ def decode_swa(
     o_local = pl.create_tensor([LOCAL_T_PAD, D], dtype=pl.BF16)
     o_local, attention_signal, o_signal = decode_swa_output(
         q, kv_cache, swa_indices, sparse_bias,
-        attn_sink, rope_cos_t, rope_sin_t,
+        attn_sink, freqs_cos, freqs_sin,
         wo_a, wo_b, wo_b_scale, o_local,
         attention_window, attention_signal,
         o_window, o_signal,
@@ -396,8 +384,8 @@ def decode_swa_test(
     wkv: pl.Tensor[[D, HEAD_DIM], pl.BF16],
     gamma_cq: pl.Tensor[[Q_LORA], pl.BF16],
     gamma_ckv: pl.Tensor[[HEAD_DIM], pl.BF16],
-    freqs_cos: pl.Tensor[[MAX_SEQ_LEN, ROPE_HEAD_DIM], pl.BF16],
-    freqs_sin: pl.Tensor[[MAX_SEQ_LEN, ROPE_HEAD_DIM], pl.BF16],
+    freqs_cos: pl.Tensor[[T_DYN, ROPE_HEAD_DIM], pl.BF16],
+    freqs_sin: pl.Tensor[[T_DYN, ROPE_HEAD_DIM], pl.BF16],
     kv_cache: pl.InOut[pl.Tensor[[ORI_BLOCK_NUM_DYN, BLOCK_SIZE, 1, HEAD_DIM], pl.BF16]],
     swa_slot_mapping: pl.Tensor[[T_DYN], pl.INT64],
     swa_indices: pl.Tensor[[T_DYN, WIN], pl.INT32],
@@ -418,6 +406,8 @@ def decode_swa_test(
 ):
     """Bind dynamic inputs for the complete tensor-parallel SWA layer."""
     x_hc.bind_dynamic(0, T_DYN)
+    freqs_cos.bind_dynamic(0, T_DYN)
+    freqs_sin.bind_dynamic(0, T_DYN)
     kv_cache.bind_dynamic(0, ORI_BLOCK_NUM_DYN)
     swa_slot_mapping.bind_dynamic(0, T_DYN)
     swa_indices.bind_dynamic(0, T_DYN)
@@ -454,8 +444,8 @@ def l3_decode_swa(
     wkv: pl.Tensor[[TP_SIZE, D, HEAD_DIM], pl.BF16],
     gamma_cq: pl.Tensor[[TP_SIZE, Q_LORA], pl.BF16],
     gamma_ckv: pl.Tensor[[TP_SIZE, HEAD_DIM], pl.BF16],
-    freqs_cos: pl.Tensor[[TP_SIZE, MAX_SEQ_LEN, ROPE_HEAD_DIM], pl.BF16],
-    freqs_sin: pl.Tensor[[TP_SIZE, MAX_SEQ_LEN, ROPE_HEAD_DIM], pl.BF16],
+    freqs_cos: pl.Tensor[[TP_SIZE, T_DYN, ROPE_HEAD_DIM], pl.BF16],
+    freqs_sin: pl.Tensor[[TP_SIZE, T_DYN, ROPE_HEAD_DIM], pl.BF16],
     kv_cache: pl.InOut[pl.Tensor[[TP_SIZE, ORI_BLOCK_NUM_DYN, BLOCK_SIZE, 1, HEAD_DIM], pl.BF16]],
     swa_slot_mapping: pl.Tensor[[TP_SIZE, T_DYN], pl.INT64],
     swa_indices: pl.Tensor[[TP_SIZE, T_DYN, WIN], pl.INT32],
@@ -470,6 +460,8 @@ def l3_decode_swa(
 ):
     """Launch the complete SWA layer on one tensor-parallel group."""
     x_hc.bind_dynamic(1, T_DYN)
+    freqs_cos.bind_dynamic(1, T_DYN)
+    freqs_sin.bind_dynamic(1, T_DYN)
     kv_cache.bind_dynamic(1, ORI_BLOCK_NUM_DYN)
     swa_slot_mapping.bind_dynamic(1, T_DYN)
     swa_indices.bind_dynamic(1, T_DYN)
@@ -518,8 +510,8 @@ def decode_swa_tp1(
     wkv: pl.Tensor[[D, HEAD_DIM], pl.BF16],
     gamma_cq: pl.Tensor[[Q_LORA], pl.BF16],
     gamma_ckv: pl.Tensor[[HEAD_DIM], pl.BF16],
-    freqs_cos: pl.Tensor[[MAX_SEQ_LEN, ROPE_HEAD_DIM], pl.BF16],
-    freqs_sin: pl.Tensor[[MAX_SEQ_LEN, ROPE_HEAD_DIM], pl.BF16],
+    freqs_cos: pl.Tensor[[T_DYN, ROPE_HEAD_DIM], pl.BF16],
+    freqs_sin: pl.Tensor[[T_DYN, ROPE_HEAD_DIM], pl.BF16],
     # KV cache (sliding-window only: [0, WIN) ori; no cmp portion)
     kv_cache: pl.Tensor[[ORI_BLOCK_NUM_DYN, BLOCK_SIZE, 1, HEAD_DIM], pl.BF16],
     swa_slot_mapping: pl.Tensor[[T_DYN], pl.INT64],
@@ -534,25 +526,16 @@ def decode_swa_tp1(
     wo_b_scale: pl.Tensor[[D], pl.FP32],
     x_out: pl.Tensor[[T_DYN, HC_MULT, D], pl.FP32],
 ):
+    # Token-local RoPE: the host already materialized the active rows into
+    # freqs_cos/freqs_sin ([T_DYN, ROPE_HEAD_DIM]), so the device no longer
+    # gathers a full-context table through position_ids. position_ids stays in
+    # the ABI for host admission and golden semantics only.
     t_dim = pl.tensor.dim(x_hc, 0)
-    b_dim = t_dim // S
     bias_blocks = t_dim // BIAS_T_TILE
     x_mixed = pl.create_tensor([t_dim, D], dtype=pl.BF16)
     post_t = pl.create_tensor([t_dim, HC_MULT], dtype=pl.FP32)
     comb_t = pl.create_tensor([t_dim, HC_MULT * HC_MULT], dtype=pl.FP32)
     hc_pre(x_hc, hc_attn_fn, hc_attn_scale, hc_attn_base, x_mixed, post_t, comb_t)
-
-    rope_cos_t = pl.create_tensor([t_dim, ROPE_HEAD_DIM], dtype=pl.BF16)
-    rope_sin_t = pl.create_tensor([t_dim, ROPE_HEAD_DIM], dtype=pl.BF16)
-    with pl.at(level=pl.Level.CORE_GROUP, name_hint="swa_rope_step"):
-        for b in pl.range(b_dim):
-            for s_idx in pl.range(S):
-                t = b * S + s_idx
-                pos_b = pl.cast(pl.read(position_ids, [t]), pl.INDEX)
-                cos_row = pl.cast(freqs_cos[pos_b : pos_b + 1, 0 : ROPE_HEAD_DIM], target_type=pl.FP32)
-                sin_row = pl.cast(freqs_sin[pos_b : pos_b + 1, 0 : ROPE_HEAD_DIM], target_type=pl.FP32)
-                rope_cos_t[t : t + 1, 0 : ROPE_HEAD_DIM] = pl.cast(cos_row, target_type=pl.BF16, mode="rint")
-                rope_sin_t[t : t + 1, 0 : ROPE_HEAD_DIM] = pl.cast(sin_row, target_type=pl.BF16, mode="rint")
 
     x_normed_t = pl.create_tensor([t_dim, D], dtype=pl.BF16)
     rms_tid = rms_norm(x_mixed, attn_norm_w, x_normed_t)
@@ -564,7 +547,7 @@ def decode_swa_tp1(
     qr_scale = pl.create_tensor([t_dim, 1], dtype=pl.FP32)
     qkv_proj_rope(
         x_normed_t, wq_a, wq_b, wq_b_scale, wkv,
-        rope_cos_t, rope_sin_t, gamma_cq, gamma_ckv,
+        freqs_cos, freqs_sin, gamma_cq, gamma_ckv,
         q, kv, qr, qr_scale, late_dep,
     )
 
@@ -594,7 +577,7 @@ def decode_swa_tp1(
     o_packed_heads = pl.create_tensor([O_GROUPS * T_PAD * HEADS_PER_GROUP, HEAD_DIM], dtype=pl.BF16)
     o_packed_heads, heads_dep = sparse_attn_swa(
         q, kv_cache, swa_indices, sparse_bias,
-        attn_sink, rope_cos_t, rope_sin_t,
+        attn_sink, freqs_cos, freqs_sin,
         o_packed_heads,
     )
     o_packed = pl.reshape(o_packed_heads, [O_GROUPS * T_PAD, O_GROUP_IN])
@@ -623,8 +606,8 @@ def decode_swa_tp1_test(
     wkv: pl.Tensor[[D, HEAD_DIM], pl.BF16],
     gamma_cq: pl.Tensor[[Q_LORA], pl.BF16],
     gamma_ckv: pl.Tensor[[HEAD_DIM], pl.BF16],
-    freqs_cos: pl.Tensor[[MAX_SEQ_LEN, ROPE_HEAD_DIM], pl.BF16],
-    freqs_sin: pl.Tensor[[MAX_SEQ_LEN, ROPE_HEAD_DIM], pl.BF16],
+    freqs_cos: pl.Tensor[[T_DYN, ROPE_HEAD_DIM], pl.BF16],
+    freqs_sin: pl.Tensor[[T_DYN, ROPE_HEAD_DIM], pl.BF16],
     # KV cache (sliding-window only: [0, WIN) ori; no cmp portion)
     kv_cache: pl.InOut[pl.Tensor[[ORI_BLOCK_NUM_DYN, BLOCK_SIZE, 1, HEAD_DIM], pl.BF16]],
     swa_slot_mapping: pl.Tensor[[T_DYN], pl.INT64],
@@ -640,6 +623,8 @@ def decode_swa_tp1_test(
     x_out: pl.Out[pl.Tensor[[T_DYN, HC_MULT, D], pl.FP32]],
 ):
     x_hc.bind_dynamic(0, T_DYN)
+    freqs_cos.bind_dynamic(0, T_DYN)
+    freqs_sin.bind_dynamic(0, T_DYN)
     kv_cache.bind_dynamic(0, ORI_BLOCK_NUM_DYN)
     swa_slot_mapping.bind_dynamic(0, T_DYN)
     swa_indices.bind_dynamic(0, T_DYN)
@@ -857,18 +842,7 @@ def golden_decode_swa_tp1(tensors):
         "comb": comb_t,
     })
 
-    # Attention.forward, ratio==0 branch
-    position_ids = tensors["position_ids"].to(torch.int64)
-    rd = ROPE_HEAD_DIM
-
-    freqs_cos = tensors["freqs_cos"]
-    freqs_sin = tensors["freqs_sin"]
-    rope_cos_T = torch.empty(tokens, rd, dtype=freqs_cos.dtype)
-    rope_sin_T = torch.empty(tokens, rd, dtype=freqs_sin.dtype)
-    for t in range(tokens):
-        pos = int(position_ids[t].item())
-        rope_cos_T[t] = freqs_cos[pos]
-        rope_sin_T[t] = freqs_sin[pos]
+    # Attention.forward, ratio==0 branch. RoPE inputs are token-local.
 
     # q + win kv
     q = torch.zeros(tokens, H, HEAD_DIM, dtype=torch.bfloat16)
@@ -882,8 +856,8 @@ def golden_decode_swa_tp1(tensors):
         "wq_b": tensors["wq_b"],
         "wq_b_scale": tensors["wq_b_scale"],
         "wkv": tensors["wkv"],
-        "rope_cos": rope_cos_T,
-        "rope_sin": rope_sin_T,
+        "rope_cos": tensors["freqs_cos"],
+        "rope_sin": tensors["freqs_sin"],
         "gamma_cq": tensors["gamma_cq"],
         "gamma_ckv": tensors["gamma_ckv"],
         "q": q,
@@ -911,8 +885,8 @@ def golden_decode_swa_tp1(tensors):
         "swa_indices": tensors["swa_indices"],
         "swa_lens": tensors["swa_lens"],
         "attn_sink": tensors["attn_sink"],
-        "freqs_cos": rope_cos_T,
-        "freqs_sin": rope_sin_T,
+        "freqs_cos": tensors["freqs_cos"],
+        "freqs_sin": tensors["freqs_sin"],
         "o_packed_heads": o_packed_heads,
     })
     attn_out = golden_decode_o_proj_tp1(
@@ -934,6 +908,8 @@ def golden_decode_swa_tp1(tensors):
 
 def build_tensor_specs(start_pos=None, batch=B):
     tokens = batch * S
+    if batch <= 0 or tokens > LOCAL_T:
+        raise ValueError(f"batch must produce between {S} and {LOCAL_T} tokens, got {tokens}")
     import torch
     from utils import (
         block_table,
@@ -944,9 +920,23 @@ def build_tensor_specs(start_pos=None, batch=B):
         swa_decode_start_set,
     )
     from golden import TensorSpec
-    from utils import build_rope_tables
 
-    shared_freqs_cos, shared_freqs_sin = build_rope_tables(M, 0, dtype=torch.bfloat16)
+    # Token-local RoPE: compute only the active-position rows the device needs,
+    # never a full-context table. SWA uses the uncompressed RoPE profile.
+    _inv_freq = 1.0 / (
+        float(M.rope_theta)
+        ** (torch.arange(0, ROPE_HEAD_DIM, 2, dtype=torch.float32) / ROPE_HEAD_DIM)
+    )
+
+    def init_rope_rows():
+        positions = init_position_ids().to(torch.float32)
+        angles = torch.outer(positions, _inv_freq)
+        cos_half = torch.cos(angles)
+        sin_half = torch.sin(angles)
+        return (
+            torch.cat([cos_half, cos_half], dim=-1).to(torch.bfloat16),
+            torch.cat([sin_half, sin_half], dim=-1).to(torch.bfloat16),
+        )
 
     def quant_w_per_output_channel(w):
         amax = w.float().abs().amax(dim=0).clamp_min(INT8_AMAX_EPS)
@@ -994,10 +984,15 @@ def build_tensor_specs(start_pos=None, batch=B):
         return torch.ones(Q_LORA)
     def init_gamma_ckv():
         return torch.ones(HEAD_DIM)
+    _rope_rows_cache = {}
     def init_freqs_cos():
-        return shared_freqs_cos.clone()
+        if "cos" not in _rope_rows_cache:
+            _rope_rows_cache["cos"], _rope_rows_cache["sin"] = init_rope_rows()
+        return _rope_rows_cache["cos"]
     def init_freqs_sin():
-        return shared_freqs_sin.clone()
+        if "sin" not in _rope_rows_cache:
+            _rope_rows_cache["cos"], _rope_rows_cache["sin"] = init_rope_rows()
+        return _rope_rows_cache["sin"]
     def init_normalized_cache(shape):
         cache = torch.randn(*shape)
         denom = cache.float().pow(2).mean(dim=-1, keepdim=True).sqrt().clamp_min(EPS)
@@ -1007,7 +1002,10 @@ def build_tensor_specs(start_pos=None, batch=B):
         return init_normalized_cache((ORI_BLOCK_NUM, BLOCK_SIZE, 1, HEAD_DIM))
 
     def init_block_table():
-        return block_table(batch=batch, table_blocks=ORI_MAX_BLOCKS, physical_blocks=ORI_BLOCK_NUM)
+        # Logical block-table cols cover the full SWA ceiling so 1M positions
+        # map into the fixed physical pool (ORI_BLOCK_NUM) via % wrapping.
+        table_blocks = (max_position_embeddings_tmp + BLOCK_SIZE - 1) // BLOCK_SIZE
+        return block_table(batch=batch, table_blocks=table_blocks, physical_blocks=ORI_BLOCK_NUM)
 
     def init_attn_sink():
         return torch.zeros(H)
@@ -1015,11 +1013,28 @@ def build_tensor_specs(start_pos=None, batch=B):
         # Canonical SWA start-position set (sliding-window regimes + 8k long-context).
         return swa_decode_start_set(batch=batch, window=WIN)
     def init_start_pos():
+        # A list/tuple mixes per-request start positions within one batch
+        # (e.g. 16K + 512K). A scalar broadcasts to the whole batch; None
+        # falls back to the canonical SWA position set.
+        if isinstance(start_pos, (list, tuple)):
+            starts = torch.tensor(start_pos, dtype=torch.int32)
+            if starts.shape != (batch,):
+                raise ValueError(
+                    f"mixed start_pos needs {batch} entries, got {starts.numel()}"
+                )
+            if bool((starts < 0).any()):
+                raise ValueError("decode start positions must be non-negative")
+            if bool((starts.to(torch.int64) + S > max_position_embeddings_tmp).any()):
+                raise ValueError(
+                    "decode start positions plus seq length must fit "
+                    f"max_position_embeddings_tmp={max_position_embeddings_tmp}"
+                )
+            return starts
         return resolve_start_positions(
             start_pos,
             batch=batch,
             seq=S,
-            max_seq_len=MAX_SEQ_LEN,
+            max_seq_len=max_position_embeddings_tmp,
             default_fn=init_default_start_pos,
         )
     def init_position_ids():
@@ -1063,8 +1078,8 @@ def build_tensor_specs(start_pos=None, batch=B):
         TensorSpec("wkv", [D, HEAD_DIM], torch.bfloat16, init_value=init_wkv),
         TensorSpec("gamma_cq", [Q_LORA], torch.bfloat16, init_value=init_gamma_cq),
         TensorSpec("gamma_ckv", [HEAD_DIM], torch.bfloat16, init_value=init_gamma_ckv),
-        TensorSpec("freqs_cos", [MAX_SEQ_LEN, ROPE_HEAD_DIM], torch.bfloat16, init_value=init_freqs_cos),
-        TensorSpec("freqs_sin", [MAX_SEQ_LEN, ROPE_HEAD_DIM], torch.bfloat16, init_value=init_freqs_sin),
+        TensorSpec("freqs_cos", [tokens, ROPE_HEAD_DIM], torch.bfloat16, init_value=init_freqs_cos),
+        TensorSpec("freqs_sin", [tokens, ROPE_HEAD_DIM], torch.bfloat16, init_value=init_freqs_sin),
         TensorSpec("kv_cache", [ORI_BLOCK_NUM, BLOCK_SIZE, 1, HEAD_DIM], torch.bfloat16, init_value=init_kv_cache, is_output=True),
         TensorSpec("swa_slot_mapping", [tokens], torch.int64, init_value=init_swa_slot_mapping),
         TensorSpec("swa_indices", [tokens, WIN], torch.int32, init_value=init_swa_indices),
@@ -1078,7 +1093,7 @@ def build_tensor_specs(start_pos=None, batch=B):
     ]
 
 
-def build_distributed_tensor_specs(local_t):
+def build_distributed_tensor_specs(local_t, start_pos=None):
     """Build full-layer SWA inputs with rank-local requests and sharded O weights."""
     import torch
 
@@ -1091,7 +1106,7 @@ def build_distributed_tensor_specs(local_t):
     with torch.random.fork_rng():
         for rank in range(TP_SIZE):
             torch.manual_seed(20260819 + rank)
-            local_specs = build_tensor_specs(batch=local_t // S)
+            local_specs = build_tensor_specs(start_pos=start_pos, batch=local_t // S)
             rank_tensors.append({
                 spec.name: spec.create_tensor()
                 for spec in local_specs
@@ -1133,8 +1148,8 @@ def build_distributed_tensor_specs(local_t):
         TensorSpec("wkv", [TP_SIZE, D, HEAD_DIM], torch.bfloat16, init_value=stacked("wkv")),
         TensorSpec("gamma_cq", [TP_SIZE, Q_LORA], torch.bfloat16, init_value=stacked("gamma_cq")),
         TensorSpec("gamma_ckv", [TP_SIZE, HEAD_DIM], torch.bfloat16, init_value=stacked("gamma_ckv")),
-        TensorSpec("freqs_cos", [TP_SIZE, MAX_SEQ_LEN, ROPE_HEAD_DIM], torch.bfloat16, init_value=stacked("freqs_cos")),
-        TensorSpec("freqs_sin", [TP_SIZE, MAX_SEQ_LEN, ROPE_HEAD_DIM], torch.bfloat16, init_value=stacked("freqs_sin")),
+        TensorSpec("freqs_cos", [TP_SIZE, local_t, ROPE_HEAD_DIM], torch.bfloat16, init_value=stacked("freqs_cos")),
+        TensorSpec("freqs_sin", [TP_SIZE, local_t, ROPE_HEAD_DIM], torch.bfloat16, init_value=stacked("freqs_sin")),
         TensorSpec(
             "kv_cache", [TP_SIZE, ORI_BLOCK_NUM, BLOCK_SIZE, 1, HEAD_DIM], torch.bfloat16,
             init_value=stacked("kv_cache"), is_output=True,
@@ -1188,9 +1203,22 @@ if __name__ == "__main__":
     )
     parser.add_argument("--entry", choices=("full", "output", "tp1"), default="full")
     parser.add_argument("--case", choices=("all", "max", "subcapacity"), default="all")
+    parser.add_argument(
+        "--start-pos", type=str, default=None,
+        help="absolute decode start position for full or tp1; a scalar sets batch=1, "
+             "and a comma-separated list sets batch to its length",
+    )
+    parser.add_argument("--enable-l2-swimlane", type=int, choices=(0, 1, 2, 4), default=0)
     parser.add_argument("--compile-only", action="store_true", default=False)
     parser.add_argument("--dump-passes", action="store_true", default=False)
     args = parser.parse_args()
+
+    if args.start_pos is not None:
+        parts = [p.strip() for p in args.start_pos.split(",") if p.strip() != ""]
+        if len(parts) == 1:
+            args.start_pos = int(parts[0])
+        else:
+            args.start_pos = [int(p) for p in parts]
 
     if args.tp != TP_SIZE:
         parser.error(f"--tp must remain {TP_SIZE} after import-time specialization")
@@ -1209,23 +1237,32 @@ if __name__ == "__main__":
     if len(device_ids) != expected_devices:
         parser.error(f"{args.entry} entry needs exactly {expected_devices} device(s), got {device_ids}")
 
+    if args.entry == "output" and args.start_pos is not None:
+        parser.error("--start-pos does not apply to the output-only entry")
+
     if args.entry == "tp1":
         if args.case == "subcapacity":
             parser.error("--case subcapacity only applies to the full and output entries")
+        batch = len(args.start_pos) if isinstance(args.start_pos, list) else (1 if args.start_pos is not None else B)
+        tokens = batch * S
         result = run_jit(
             fn=decode_swa_tp1_test,
-            specs=build_tensor_specs(),
+            specs=build_tensor_specs(start_pos=args.start_pos, batch=batch),
             golden_fn=golden_decode_swa_tp1,
             compile_only=args.compile_only,
             compile_cfg=dict(dump_passes=args.dump_passes),
-            runtime_cfg=dict(platform=args.platform, device_id=device_ids[0]),
+            runtime_cfg=dict(
+                platform=args.platform,
+                device_id=device_ids[0],
+                enable_l2_swimlane=args.enable_l2_swimlane,
+            ),
             rtol=1e-2,
             atol=1e-2,
             compare_fn={
                 "x_out": ratio_reldiff(diff_thd=3e-3, pct_thd=0.008, max_diff_hd=1),
                 "kv_cache": mapped_pool_ratio_allclose(
                     "swa_slot_mapping",
-                    mapping_shape=(T,),
+                    mapping_shape=(tokens,),
                     block_size=BLOCK_SIZE,
                     pool_name="KV cache",
                     atol=1e-4,
@@ -1241,9 +1278,13 @@ if __name__ == "__main__":
         raise SystemExit(0)
 
     case_local_t = {"max": LOCAL_T, "subcapacity": LOCAL_T - BIAS_T_TILE}
-    selected_cases = tuple(case_local_t) if args.case == "all" else (args.case,)
-    for case in selected_cases:
-        local_t = case_local_t[case]
+    if args.start_pos is not None:
+        batch = len(args.start_pos) if isinstance(args.start_pos, list) else 1
+        selected_cases = (("positions", batch * S),)
+    else:
+        case_names = tuple(case_local_t) if args.case == "all" else (args.case,)
+        selected_cases = tuple((case, case_local_t[case]) for case in case_names)
+    for _case, local_t in selected_cases:
         compile_cfg = dict(
             dump_passes=args.dump_passes,
             distributed_config=DistributedConfig(device_ids=device_ids, num_sub_workers=0),
@@ -1251,11 +1292,14 @@ if __name__ == "__main__":
         if args.entry == "full":
             result = run_jit(
                 fn=l3_decode_swa,
-                specs=build_distributed_tensor_specs(local_t),
+                specs=build_distributed_tensor_specs(local_t, start_pos=args.start_pos),
                 golden_fn=golden_decode_swa,
                 compile_only=args.compile_only,
                 compile_cfg=compile_cfg,
-                runtime_cfg=dict(platform=args.platform),
+                runtime_cfg=dict(
+                    platform=args.platform,
+                    enable_l2_swimlane=args.enable_l2_swimlane,
+                ),
                 rtol=1e-2,
                 atol=1e-2,
                 compare_fn={
@@ -1279,7 +1323,10 @@ if __name__ == "__main__":
                 golden_fn=golden_decode_swa_output,
                 compile_only=args.compile_only,
                 compile_cfg=compile_cfg,
-                runtime_cfg=dict(platform=args.platform),
+                runtime_cfg=dict(
+                    platform=args.platform,
+                    enable_l2_swimlane=args.enable_l2_swimlane,
+                ),
                 compare_fn={"o_local": build_o_local_compare(local_t)},
             )
         if not result.passed:
