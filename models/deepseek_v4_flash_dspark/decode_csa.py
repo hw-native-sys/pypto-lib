@@ -70,10 +70,9 @@ from decode_o_proj import (
     LOCAL_T,
     LOCAL_T_PAD,
     O_WINDOW_ROWS,
-    decode_o_proj,
     decode_o_proj_tp1,
+    decode_sharded_o_projection_reduce_scatter,
     o_group_a2a,
-    o_proj_reduce_scatter,
 )
 from decode_sparse_attn_csa import (
     ATTN_K_TILE,
@@ -191,17 +190,12 @@ def decode_csa_output(
     )
 
     attention_local_groups = pl.reshape(attention_local_flat, [LOCAL_O_GROUPS, GROUP_T_PAD, O_GROUP_IN])
-    o_partial = pl.create_tensor([GROUP_T_PAD, D], dtype=pl.FP32)
-    o_partial, projection_tid = decode_o_proj(
+    o_local, o_signal = decode_sharded_o_projection_reduce_scatter(
         attention_local_groups,
         wo_a, wo_b, wo_b_scale,
-        local_t, o_partial,
-    )
-
-    o_local, o_signal = o_proj_reduce_scatter(
-        o_partial, o_local,
+        local_t, o_local,
         o_window, o_signal,
-        group_base, tp_rank, local_t, projection_tid,
+        group_base, tp_rank,
     )
     return o_local, attention_signal, o_signal
 
