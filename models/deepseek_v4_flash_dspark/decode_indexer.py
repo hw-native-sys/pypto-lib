@@ -279,11 +279,13 @@ def indexer(
                 weights_acc = pl.matmul_acc(weights_acc, x_tile, weights_proj_tile)
         weights_partial[kb * T_PAD + w_r0 : kb * T_PAD + w_r0 + MM_ROW_TILE, :] = weights_acc
 
-    with pl.at(level=pl.Level.CORE_GROUP, name_hint="weights_proj_reduce", allow_early_resolve=True):
-        w_sum = weights_partial[0:T_PAD, :]
+    for w_rb in pl.spmd(row_blocks, name_hint="weights_proj_reduce", allow_early_resolve=True):
+        w_r0 = w_rb * MM_ROW_TILE
+        w_sum = weights_partial[w_r0 : w_r0 + MM_ROW_TILE, :]
         for kb in pl.unroll(1, WEIGHTS_OK):
-            w_sum = pl.add(w_sum, weights_partial[kb * T_PAD : kb * T_PAD + T_PAD, :])
-        weights[0:T_PAD, :] = pl.mul(w_sum, WEIGHTS_SCALE)
+            partial_r0 = kb * T_PAD + w_r0
+            w_sum = pl.add(w_sum, weights_partial[partial_r0 : partial_r0 + MM_ROW_TILE, :])
+        weights[w_r0 : w_r0 + MM_ROW_TILE, :] = pl.mul(w_sum, WEIGHTS_SCALE)
 
     indexer_compressor(
         x, inner_kv,
