@@ -104,12 +104,17 @@ git -C "$PYPTO_ROOT/runtime" branch --show-current   # often empty (detached)
 git -C "$PTO_ISA_ROOT" rev-parse --short HEAD
 git -C "$PTO_ISA_ROOT" branch --show-current         # often empty (detached)
 
-# ptoas version
-ptoas_bin="$PTOAS_ROOT/ptoas"
-if [ ! -f "$ptoas_bin" ] || [ ! -x "$ptoas_bin" ]; then
-  ptoas_bin="$PTOAS_ROOT/bin/ptoas"
-fi
-if [ -f "$ptoas_bin" ] && [ -x "$ptoas_bin" ]; then
+# ptoas version. Probe in pypto's own order (backend/_ptoas_locate.py): the
+# three entries are not interchangeable, and from v0.55 only ptoas.sh selects
+# the CPython the release bundles — bin/ptoas dies on the caller's interpreter.
+ptoas_bin=""
+for rel in ptoas ptoas.sh bin/ptoas; do
+  if [ -f "$PTOAS_ROOT/$rel" ] && [ -x "$PTOAS_ROOT/$rel" ]; then
+    ptoas_bin="$PTOAS_ROOT/$rel"
+    break
+  fi
+done
+if [ -n "$ptoas_bin" ]; then
   "$ptoas_bin" --version
 else
   echo "not found"
