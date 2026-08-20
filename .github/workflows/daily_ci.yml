@@ -617,6 +617,19 @@ jobs:
             echo "skip=false"
           } >> "$GITHUB_OUTPUT"
 
+      - name: Install the checkpoint tokenizer
+        # synthetic_token_loop.py encodes --prompt and detokenizes the sampled
+        # ids with HuggingFace `tokenizers` (tokenizer.json from the checkpoint);
+        # it is not a pypto-lib dependency otherwise, so setup-ci-job's venv
+        # does not carry it. Without it the loop exits right after taking the
+        # eight cards ("--prompt/--prompt-file need the `tokenizers` package").
+        if: ${{ steps.weights.outputs.skip != 'true' }}
+        shell: bash
+        run: |
+          source activate.sh
+          python -c 'import tokenizers' 2>/dev/null || pip install 'tokenizers>=0.15'
+          python -c 'import tokenizers; print("tokenizers", tokenizers.__version__)'
+
       - name: Run the EP8 token loop (a5, 8 cards via task-submit)
         id: loop
         if: ${{ steps.weights.outputs.skip != 'true' }}
@@ -668,6 +681,16 @@ jobs:
           passed = bool(last(r"^\[SESSION\] PASS: EP8 .* token loop completed$")) and rc == 0
           error = last(r"^(?:RuntimeError|ValueError|TimeoutError|OSError|AssertionError)[^\n]*$") \
               or last(r"^\S*\[ERROR\][^\n]*$") or last(r"^.*(?:507\d{3}|SCHEDULER_TIMEOUT|non-finite|NaN)[^\n]*$")
+          if error is None and rc != 0:
+              # No recognisable traceback or device error: the program printed a
+              # plain one-line complaint (a missing package, a bad argument) and
+              # exited. Take the last non-boilerplate line before task-submit's
+              # own verdict so the summary shows the cause instead of "exit code 1".
+              tail = [l for l in log.splitlines()
+                      if l.strip() and not l.startswith(("[npu-lock]", "===", "[SESSION]", "提示", "任务", "等待"))
+                      and "[STRACE]" not in l and "[TIMING]" not in l]
+              if tail:
+                  error = tail[-1].strip()[:300]
           n_ids = len(ast.literal_eval(ids)) if ids else None
           json.dump({
               "status": "pass" if passed else "fail",
