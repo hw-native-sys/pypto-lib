@@ -92,7 +92,7 @@ HC_DIM = M.hc_dim
 HC_SINKHORN_ITER = M.hc_sinkhorn_iters
 HC_EPS = M.hc_eps
 # SWA-local context ceiling. The global model ceiling remains unchanged.
-max_position_embeddings_tmp = 1_048_576
+MAX_SEQ_LEN = 1_048_576
 O_LORA = M.o_lora_rank
 O_GROUPS = M.o_groups
 HEADS_PER_GROUP = H // O_GROUPS
@@ -1004,7 +1004,7 @@ def build_tensor_specs(start_pos=None, batch=B):
     def init_block_table():
         # Logical block-table cols cover the full SWA ceiling so 1M positions
         # map into the fixed physical pool (ORI_BLOCK_NUM) via % wrapping.
-        table_blocks = (max_position_embeddings_tmp + BLOCK_SIZE - 1) // BLOCK_SIZE
+        table_blocks = (MAX_SEQ_LEN + BLOCK_SIZE - 1) // BLOCK_SIZE
         return block_table(batch=batch, table_blocks=table_blocks, physical_blocks=ORI_BLOCK_NUM)
 
     def init_attn_sink():
@@ -1024,17 +1024,17 @@ def build_tensor_specs(start_pos=None, batch=B):
                 )
             if bool((starts < 0).any()):
                 raise ValueError("decode start positions must be non-negative")
-            if bool((starts.to(torch.int64) + S > max_position_embeddings_tmp).any()):
+            if bool((starts.to(torch.int64) + S > MAX_SEQ_LEN).any()):
                 raise ValueError(
                     "decode start positions plus seq length must fit "
-                    f"max_position_embeddings_tmp={max_position_embeddings_tmp}"
+                    f"MAX_SEQ_LEN={MAX_SEQ_LEN}"
                 )
             return starts
         return resolve_start_positions(
             start_pos,
             batch=batch,
             seq=S,
-            max_seq_len=max_position_embeddings_tmp,
+            max_seq_len=MAX_SEQ_LEN,
             default_fn=init_default_start_pos,
         )
     def init_position_ids():
