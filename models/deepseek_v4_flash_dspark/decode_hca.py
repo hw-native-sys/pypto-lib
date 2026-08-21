@@ -798,6 +798,8 @@ def _hca_start_positions(start_pos, *, batch):
 
     from utils import hca_decode_start_set
 
+    if batch < 1 or batch > B:
+        raise ValueError(f"HCA batch must be in [1, {B}], got {batch}")
     if start_pos is None:
         starts = hca_decode_start_set(
             batch=batch,
@@ -813,6 +815,16 @@ def _hca_start_positions(start_pos, *, batch):
     if bool((starts < 0).any()) or bool((starts.to(torch.int64) + S > MAX_SEQ_LEN).any()):
         raise ValueError(f"HCA start positions plus S={S} must fit MAX_SEQ_LEN={MAX_SEQ_LEN}")
     return starts.contiguous()
+
+
+def _validate_hca_token_count(token_count):
+    """Validate the dynamic token extent shared by TP1 and distributed HCA."""
+    if (token_count < VALID_TOKEN_TILE or token_count > LOCAL_T
+            or token_count % VALID_TOKEN_TILE != 0 or token_count % S != 0):
+        raise ValueError(
+            f"HCA token count must be a multiple of {VALID_TOKEN_TILE} and S={S} "
+            f"in [{VALID_TOKEN_TILE}, {LOCAL_T}], got {token_count}"
+        )
 
 
 def _hca_token_rope_tables(positions):
@@ -916,6 +928,7 @@ def build_tensor_specs(start_pos=None, batch=B):
     from golden import TensorSpec
 
     starts = _hca_start_positions(start_pos, batch=batch)
+    _validate_hca_token_count(tokens)
     positions = position_ids_from_starts(starts, seq=S).contiguous()
     token_freqs_cos, token_freqs_sin = _hca_token_rope_tables(positions)
     boundary_positions = starts.to(torch.int64) - starts.to(torch.int64).remainder(COMPRESS_RATIO)
@@ -1158,12 +1171,7 @@ def build_distributed_tensor_specs(local_t, start_pos=None):
 
     from golden import ScalarSpec, TensorSpec
 
-    if (local_t < VALID_TOKEN_TILE or local_t > LOCAL_T
-            or local_t % VALID_TOKEN_TILE != 0 or local_t % S != 0):
-        raise ValueError(
-            f"local_t must be a multiple of {VALID_TOKEN_TILE} "
-            f"in [{VALID_TOKEN_TILE}, {LOCAL_T}], got {local_t}"
-        )
+    _validate_hca_token_count(local_t)
 
     with torch.random.fork_rng():
         torch.manual_seed(20260819)

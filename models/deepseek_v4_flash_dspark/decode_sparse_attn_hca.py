@@ -52,7 +52,11 @@ NEG_INF = -1.0e20
 ORI_MAX_BLOCKS = KV_ORI_MAX_BLOCKS
 ORI_BLOCK_NUM = KV_ORI_BLOCK_NUM
 CMP_BLOCK_NUM = KV_CMP_BLOCK_NUM
-HCA_MAX_COMPRESSED_ROWS = CMP_BLOCK_NUM * BLOCK_SIZE
+# The logical limit is per request; the physical pool is shared by the batch.
+# Host metadata builders below admit requests only while their summed page count
+# fits HCA_COMPRESSED_POOL_ROWS.
+HCA_MAX_COMPRESSED_ROWS = 1_048_576 // COMPRESS_RATIO
+HCA_COMPRESSED_POOL_ROWS = CMP_BLOCK_NUM * BLOCK_SIZE
 
 # tiling
 VALID_TOKEN_TILE = 8
@@ -71,10 +75,12 @@ ROPE_CS_T_TILE = 8
 T_PAD = ((T + 16 - 1) // 16) * 16
 
 assert WIN == ATTN_K_TILE, "HCA raw window must form one baseline-sized attention tile"
+assert HCA_MAX_COMPRESSED_ROWS <= HCA_COMPRESSED_POOL_ROWS
 assert ATTN_K_TILE % BLOCK_SIZE == 0, "HCA work must contain complete cache pages"
 assert H % QK_M_TILE == 0 and QK_M_TILE % H_TILE == 0
 assert BLOCK_SIZE % GATHER_RUN_TILE == 0, "a contiguous gather run must stay inside one cache block"
 assert HEAD_DIM == 2 * ATTN_D_TILE, "HCA stream matmuls split the head width into exactly two bounded tiles"
+assert S % ROPE_CS_T_TILE == 0, "each request must contain complete inverse-RoPE token tiles"
 
 
 @pl.jit.inline(auto_scope=False)
@@ -146,12 +152,14 @@ def sparse_attn_hca(
                 g_sk0 = g_wk0 + g_sub * GATHER_RUN_TILE
                 g_sdst = g_row0 + g_sk0
                 g_first = pl.read(window_swa_indices, [g_t, g_sk0])
-                g_last = pl.read(
-                    window_swa_indices,
-                    [g_t, g_sk0 + GATHER_RUN_TILE - 1],
-                )
-                g_run_ok = (g_last - g_first) + pl.min(g_first, 0) * GATHER_RUN_TILE
-                if g_run_ok == GATHER_RUN_TILE - 1:
+                g_run_matches = pl.cast(g_first >= 0, pl.INT32)
+                for g_dr in pl.unroll(GATHER_RUN_TILE):
+                    g_slot_i32 = pl.read(window_swa_indices, [g_t, g_sk0 + g_dr])
+                    g_run_matches = g_run_matches * pl.cast(
+                        g_slot_i32 == g_first + g_dr,
+                        pl.INT32,
+                    )
+                if g_run_matches == 1:
                     g_run_src = pl.cast(g_first, pl.INDEX)
                     raw_kv[
                         g_sdst : g_sdst + GATHER_RUN_TILE,
@@ -464,6 +472,15 @@ def sparse_attn_hca(
             gather_dst0 = gather_item * ATTN_K_TILE
             for gather_page in pl.unroll(CMP_PAGES_PER_WORK):
                 gather_page_col = gather_first_col + gather_page
+                gather_dst = gather_dst0 + gather_page * BLOCK_SIZE
+                cmp_work_kv[
+                    gather_dst : gather_dst + BLOCK_SIZE,
+                    0:HEAD_DIM,
+                ] = pl.full(
+                    [BLOCK_SIZE, HEAD_DIM],
+                    dtype=pl.BF16,
+                    value=0.0,
+                )
                 if gather_page_col < cmp_table_blocks:
                     gather_page_i32 = pl.read(
                         cmp_block_table,
@@ -473,7 +490,6 @@ def sparse_attn_hca(
                         if gather_page_i32 < cmp_block_num:
                             gather_page_id = pl.cast(gather_page_i32, pl.INDEX)
                             gather_src = gather_page_id * BLOCK_SIZE
-                            gather_dst = gather_dst0 + gather_page * BLOCK_SIZE
                             cmp_work_kv[
                                 gather_dst : gather_dst + BLOCK_SIZE,
                                 0:HEAD_DIM,
@@ -927,6 +943,14 @@ def build_tensor_specs(
     from utils import block_table
 
     tokens = batch * S
+
+    if batch < 1 or batch > B:
+        raise ValueError(f"HCA sparse-attention batch must be in [1, {B}], got {batch}")
+    if tokens % ROPE_CS_T_TILE != 0:
+        raise ValueError(
+            f"HCA sparse-attention token count {tokens} must be divisible by "
+            f"ROPE_CS_T_TILE={ROPE_CS_T_TILE}"
+        )
 
     if mixed_topk_fixture:
         if batch != 4:
