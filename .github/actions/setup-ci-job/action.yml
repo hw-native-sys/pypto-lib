@@ -269,10 +269,6 @@ runs:
       # so the toolchain pins and the installed pypto are always the same
       # revision. pypto owns ptoas (toolchain/versions.env) and pins pto-isa via
       # its runtime submodule (runtime/pto_isa.pin); read both.
-      #
-      # The revision is PINNED (PYPTO_PIN below), not pypto's HEAD: CI must fail
-      # on pypto-lib changes only, and an upstream regression otherwise turns
-      # every open PR red at once with no way to tell the two apart.
       shell: bash
       run: |
         # $PYPTO_SRC is the per-job build tree exported by the loader step:
@@ -298,35 +294,19 @@ runs:
             sleep $((attempt * 10))
           done
         }
-        # The pypto revision CI builds against. Bump this deliberately, in its
-        # own PR, so the toolchain move is reviewable and revertable on its own.
-        #
-        # 33ff8b49 is the commit before pypto #2273 ("adapt soft SYNCALL and
-        # Simpler Buffer ABIs"), which bumps the simpler submodule 3165cc89 ->
-        # 1f27a157. From that bump on, any two-rank program whose first
-        # cross-rank step is a push/notify + spin-wait pair hangs: the waiting
-        # AIV task never completes and the peer times out on the release
-        # barrier. That is every multi-card model entry in ci.yml and
-        # daily_ci.yml, so unrelated pypto-lib PRs inherit a red CI they cannot
-        # fix. Raise the pin again once the hang is fixed upstream.
-        PYPTO_PIN=33ff8b4974b98b3a529fea3c8443292f97b8ae4d
         if [ -d "$PYPTO_SRC/.git" ]; then
-          echo "Cache hit — updating pypto to $PYPTO_PIN"
+          echo "Cache hit — updating pypto"
+          retry git -C "$PYPTO_SRC" fetch --depth=1 origin HEAD || exit 1
+          git -C "$PYPTO_SRC" reset --hard FETCH_HEAD
+          git -C "$PYPTO_SRC" clean -ffdx
+          git -C "$PYPTO_SRC" submodule foreach --recursive 'git reset --hard && git clean -ffdx' || true
         else
-          echo "Cache miss — seeding pypto repo"
+          echo "Cache miss — cloning pypto"
           mkdir -p "$(dirname "$PYPTO_SRC")"
-          rm -rf "$PYPTO_SRC"
-          git init -q "$PYPTO_SRC"
-          git -C "$PYPTO_SRC" remote add origin https://github.com/hw-native-sys/pypto.git
+          # rm before each attempt so a retried clone never hits a partial dir.
+          clone_pypto() { rm -rf "$PYPTO_SRC"; git clone --depth=1 https://github.com/hw-native-sys/pypto.git "$PYPTO_SRC"; }
+          retry clone_pypto || exit 1
         fi
-        # Fetch the pinned commit itself rather than a branch tip, so the cached
-        # tree is the same revision on a cache hit and a cache miss alike. Still
-        # --depth=1: a pin needs one commit, not the history behind it.
-        retry git -C "$PYPTO_SRC" fetch --depth=1 origin "$PYPTO_PIN" || exit 1
-        git -C "$PYPTO_SRC" reset --hard FETCH_HEAD
-        git -C "$PYPTO_SRC" clean -ffdx
-        git -C "$PYPTO_SRC" submodule foreach --recursive 'git reset --hard && git clean -ffdx' || true
-        echo "pypto at $(git -C "$PYPTO_SRC" rev-parse HEAD)"
         retry git -C "$PYPTO_SRC" submodule update --init --recursive --depth=1 || exit 1
         rm -rf "$PYPTO_SRC/build" "$PYPTO_SRC/_skbuild" "$PYPTO_SRC/runtime/build"
         # PTOAS ships one wheel per arch, with a matching PTOAS_SHA256_<ARCH> in
@@ -350,9 +330,6 @@ runs:
           echo "PTOAS_ARCH=$PTOAS_ARCH"
           echo "PTOAS_SHA256=$PTOAS_SHA256"
           echo "PTO_ISA_COMMIT=$(tr -d '[:space:]' < "$PYPTO_SRC/runtime/pto_isa.pin")"
-          # Exported so later steps in the same job can assert what they build
-          # on — the pypto-serving action checks it before spending a device.
-          echo "PYPTO_PIN=$PYPTO_PIN"
         } >> "$GITHUB_ENV"
 
     - name: Check NPU
