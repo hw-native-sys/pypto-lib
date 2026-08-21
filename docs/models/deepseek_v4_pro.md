@@ -221,10 +221,12 @@ publishes the prompt and the generated text in the run summary under
 "Daily CI Model Test Results", so a reviewer can read the continuation
 every day instead of a pass/fail tick. The runner finds the checkpoint
 through `PYPTO_DSV4_FLASH_CKPT_DIR` in its `.env` (falling back to the A5
-host's `/home/pyptouser/models/DeepSeek-V4-Flash-0731`) and reuses the
-`weights_flash.py` cache next to it (`pypto-weights-cache/flash_ep8_tp2`),
-converting the checkpoint once into its `CI_CACHE_ROOT` when no cache is
-present.
+host's `/home/pyptouser/models/DeepSeek-V4-Flash-0731`). The
+`weights_flash.py` cache (ep8/tp2) is resolved in this order:
+`PYPTO_DSV4_FLASH_WEIGHTS_DIR` from the runner's `.env` if set, else the
+shared cache next to the checkpoint (`pypto-weights-cache/flash_ep8_tp2`),
+else the runner's own `CI_CACHE_ROOT/dsv4-flash-weights/flash_ep8_tp2`,
+which the job builds from the checkpoint once (~25 min) when it is missing.
 
 ## Files
 

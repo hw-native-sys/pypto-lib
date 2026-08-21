@@ -5,6 +5,12 @@ on:
     - cron: '0 21 * * *'  # UTC 21:00 = Shanghai 05:00
   workflow_dispatch:
 
+# Every job only reads the repo (checkouts use persist-credentials: false, the
+# artifact up/download steps use the run-scoped runtime token, the summary
+# writes $GITHUB_STEP_SUMMARY), so the token needs nothing beyond contents:read.
+permissions:
+  contents: read
+
 jobs:
   model-tests-sim:
     # Simulator job: no device needed, so it runs on the CPU runner — but on the
@@ -873,8 +879,9 @@ jobs:
               print("|---|---|")
               print(f"| Prompt | `{r.get('prompt', '')}` |")
               def cell(value):
-                  # One table cell: keep newlines/pipes from breaking the row.
-                  return str(value).replace("|", "\\|").replace("\n", "⏎ ")
+                  # One table cell wrapped in a code span: a pipe or newline would
+                  # break the row and a backtick would end the span early.
+                  return str(value).replace("|", "\\|").replace("\n", "⏎ ").replace("`", "'")
               text = r.get("generated_text")
               partial = r.get("generated_text_partial")
               if text is not None:
