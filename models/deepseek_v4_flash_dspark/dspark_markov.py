@@ -208,7 +208,9 @@ def compute_base_logits(
 @pl.jit.inline
 def greedy_markov_step(
     base_logits: pl.Tensor[[DSPARK_MOE_TOKENS, VOCAB], pl.FP32],
-    anchor_token_ids: pl.Tensor[[B_DYN], pl.INT64],
+    num_sampled: pl.Tensor[[B_DYN], pl.INT32],
+    last_sampled: pl.Tensor[[B_DYN], pl.INT64],
+    next_prefill_tokens: pl.Tensor[[B_DYN], pl.INT64],
     markov_w1: pl.Tensor[[VOCAB, DSPARK_MARKOV_RANK], pl.BF16],
     markov_w2: pl.Tensor[[VOCAB, DSPARK_MARKOV_RANK], pl.BF16],
     draft_token_scratch: pl.Tensor[[MARKOV_M_TILE, MARKOV_ID_PAD], pl.INT32],
@@ -216,7 +218,7 @@ def greedy_markov_step(
     start_tid: pl.Scalar[pl.TASK_ID],
     step: pl.Scalar[pl.INT32],
 ):
-    batch = pl.tensor.dim(anchor_token_ids, 0)
+    batch = pl.tensor.dim(num_sampled, 0)
     previous_token_ids = pl.create_tensor([batch], dtype=pl.INT64)
     with pl.at(
         level=pl.Level.CORE_GROUP,
@@ -224,7 +226,11 @@ def greedy_markov_step(
         deps=[start_tid],
     ) as previous_tokens_tid:
         for request in pl.range(batch):
-            previous_token = pl.read(anchor_token_ids, [request])
+            previous_token = pl.cast(0, pl.INT64)
+            if step == 0:
+                previous_token = pl.read(next_prefill_tokens, [request])
+                if pl.read(num_sampled, [request]) > 0:
+                    previous_token = pl.read(last_sampled, [request])
             if step > 0:
                 previous_token = pl.cast(
                     pl.read(draft_token_scratch, [request, step - 1]),
@@ -327,15 +333,19 @@ def markov_sample(
     head_hidden: pl.Tensor[[B_DYN, DSPARK_QUERY_WIDTH, D], pl.BF16],
     final_norm_weight: pl.Tensor[[D], pl.BF16],
     lm_head_weight: pl.Tensor[[VOCAB, D], pl.BF16],
-    anchor_token_ids: pl.Tensor[[B_DYN], pl.INT64],
+    num_sampled: pl.Tensor[[B_DYN], pl.INT32],
+    last_sampled: pl.Tensor[[B_DYN], pl.INT64],
+    next_prefill_tokens: pl.Tensor[[B_DYN], pl.INT64],
     markov_w1: pl.Tensor[[VOCAB, DSPARK_MARKOV_RANK], pl.BF16],
     markov_w2: pl.Tensor[[VOCAB, DSPARK_MARKOV_RANK], pl.BF16],
     draft_token_ids: pl.Out[pl.Tensor[[B_DYN, DSPARK_QUERY_WIDTH], pl.INT32]],
 ):
     head_hidden.bind_dynamic(0, B_DYN)
-    anchor_token_ids.bind_dynamic(0, B_DYN)
+    num_sampled.bind_dynamic(0, B_DYN)
+    last_sampled.bind_dynamic(0, B_DYN)
+    next_prefill_tokens.bind_dynamic(0, B_DYN)
     draft_token_ids.bind_dynamic(0, B_DYN)
-    batch = pl.tensor.dim(anchor_token_ids, 0)
+    batch = pl.tensor.dim(num_sampled, 0)
     base_logits = pl.create_tensor(
         [DSPARK_MOE_TOKENS, VOCAB],
         dtype=pl.FP32,
@@ -360,37 +370,44 @@ def markov_sample(
             0:MARKOV_ID_PAD,
         ] = pl.full([1, MARKOV_ID_PAD], dtype=pl.INT32, value=0)
     step_0_tid = greedy_markov_step(
-        base_logits, anchor_token_ids, markov_w1, markov_w2,
+        base_logits, num_sampled, last_sampled, next_prefill_tokens,
+        markov_w1, markov_w2,
         draft_token_scratch,
         base_logits_tid, token_scratch_zero_tid, pl.cast(0, pl.INT32)
     )
     step_1_tid = greedy_markov_step(
-        base_logits, anchor_token_ids, markov_w1, markov_w2,
+        base_logits, num_sampled, last_sampled, next_prefill_tokens,
+        markov_w1, markov_w2,
         draft_token_scratch,
         base_logits_tid, step_0_tid, pl.cast(1, pl.INT32)
     )
     step_2_tid = greedy_markov_step(
-        base_logits, anchor_token_ids, markov_w1, markov_w2,
+        base_logits, num_sampled, last_sampled, next_prefill_tokens,
+        markov_w1, markov_w2,
         draft_token_scratch,
         base_logits_tid, step_1_tid, pl.cast(2, pl.INT32)
     )
     step_3_tid = greedy_markov_step(
-        base_logits, anchor_token_ids, markov_w1, markov_w2,
+        base_logits, num_sampled, last_sampled, next_prefill_tokens,
+        markov_w1, markov_w2,
         draft_token_scratch,
         base_logits_tid, step_2_tid, pl.cast(3, pl.INT32)
     )
     step_4_tid = greedy_markov_step(
-        base_logits, anchor_token_ids, markov_w1, markov_w2,
+        base_logits, num_sampled, last_sampled, next_prefill_tokens,
+        markov_w1, markov_w2,
         draft_token_scratch,
         base_logits_tid, step_3_tid, pl.cast(4, pl.INT32)
     )
     step_5_tid = greedy_markov_step(
-        base_logits, anchor_token_ids, markov_w1, markov_w2,
+        base_logits, num_sampled, last_sampled, next_prefill_tokens,
+        markov_w1, markov_w2,
         draft_token_scratch,
         base_logits_tid, step_4_tid, pl.cast(5, pl.INT32)
     )
     step_6_tid = greedy_markov_step(
-        base_logits, anchor_token_ids, markov_w1, markov_w2,
+        base_logits, num_sampled, last_sampled, next_prefill_tokens,
+        markov_w1, markov_w2,
         draft_token_scratch,
         base_logits_tid, step_5_tid, pl.cast(6, pl.INT32)
     )
@@ -422,8 +439,11 @@ def build_tensor_specs(batch: int):
         weight[0, :LM_K_TILE] = 1.0 / LM_K_TILE
         return weight
 
-    def init_anchor_token_ids():
+    def init_last_sampled():
         return torch.arange(batch, dtype=torch.int64) % 2 + 2
+
+    def init_next_prefill_tokens():
+        return 3 - torch.arange(batch, dtype=torch.int64) % 2
 
     def init_markov_w1():
         weight = torch.zeros(VOCAB, DSPARK_MARKOV_RANK, dtype=torch.bfloat16)
@@ -443,7 +463,19 @@ def build_tensor_specs(batch: int):
         TensorSpec("head_hidden", [batch, DSPARK_QUERY_WIDTH, D], torch.bfloat16, init_value=1),
         TensorSpec("final_norm_weight", [D], torch.bfloat16, init_value=1),
         TensorSpec("lm_head_weight", [VOCAB, D], torch.bfloat16, init_value=init_lm_head_weight),
-        TensorSpec("anchor_token_ids", [batch], torch.int64, init_value=init_anchor_token_ids),
+        TensorSpec(
+            "num_sampled",
+            [batch],
+            torch.int32,
+            init_value=lambda: torch.arange(batch, dtype=torch.int32) % 2,
+        ),
+        TensorSpec("last_sampled", [batch], torch.int64, init_value=init_last_sampled),
+        TensorSpec(
+            "next_prefill_tokens",
+            [batch],
+            torch.int64,
+            init_value=init_next_prefill_tokens,
+        ),
         TensorSpec("markov_w1", [VOCAB, DSPARK_MARKOV_RANK], torch.bfloat16, init_value=init_markov_w1),
         TensorSpec("markov_w2", [VOCAB, DSPARK_MARKOV_RANK], torch.bfloat16, init_value=init_markov_w2),
         TensorSpec(
@@ -471,7 +503,11 @@ def golden_nonzero_markov(tensors):
         tensors["lm_head_weight"][:validation_support].float().t()
     )
 
-    previous = tensors["anchor_token_ids"].long()
+    previous = torch.where(
+        tensors["num_sampled"] > 0,
+        tensors["last_sampled"],
+        tensors["next_prefill_tokens"],
+    ).long()
     for step in range(DSPARK_QUERY_WIDTH):
         embedding = tensors["markov_w1"].float().index_select(0, previous)
         markov_bias = embedding.matmul(
