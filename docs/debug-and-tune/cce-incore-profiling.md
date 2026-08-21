@@ -1,6 +1,6 @@
 # CCE In-Core Profiling
 
-Use on-device timestamps when an L2 swimlane identifies a slow fused task but
+Use on-device timestamps when a chip swimlane identifies a slow fused task but
 cannot show which phase inside the task is responsible. This technique is most
 useful for mixed AIC/AIV extern kernels, cross-core barriers, and producer to
 consumer fusion on real inputs.
@@ -12,7 +12,7 @@ kernel unless permanent telemetry is an explicit requirement.
 
 For single-core instruction and pipe analysis, use
 [In-Core Simulator Profiling](incore-simulator-profiling.md).
-For task-level scheduling, start with the L2 swimlane described in
+For task-level scheduling, start with the chip swimlane described in
 [`performance-tuning.md`](performance-tuning.md).
 
 ## Define event semantics before adding probes

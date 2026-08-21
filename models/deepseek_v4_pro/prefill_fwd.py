@@ -1685,7 +1685,7 @@ def main():
     parser.add_argument("--start-pos", type=int, default=0)
     parser.add_argument("--num-tokens", type=int, default=T // 2,
                         help=f"Active token rows for MoE routing/combine; default is T // 2={T // 2}.")
-    parser.add_argument("--enable-l2-swimlane", type=int, nargs="?", const=1, default=0, choices=(0, 1, 2))
+    parser.add_argument("--enable-chip-swimlane", type=int, nargs="?", const=1, default=0, choices=(0, 1, 2))
     parser.add_argument("--enable-scope-stats", action="store_true", default=False)
     parser.add_argument(
         "--disable-resident-caches",
@@ -1791,7 +1791,7 @@ def main():
         ),
         runtime_cfg=dict(
             platform=args.platform,
-            enable_l2_swimlane=args.enable_l2_swimlane,
+            enable_chip_swimlane=args.enable_chip_swimlane,
             enable_scope_stats=args.enable_scope_stats,
             enable_dep_gen=args.enable_dep_gen,
             enable_dump_args=args.dump_args,

@@ -1336,7 +1336,7 @@ if __name__ == "__main__":
               "program serves any batch <= host KV-cache "
               "capacity. Default: %(default)s"),
     )
-    parser.add_argument("--enable-l2-swimlane", action="store_true", default=False)
+    parser.add_argument("--enable-chip-swimlane", action="store_true", default=False)
     parser.add_argument("--max-seq", action="store_true", default=False,
                         help="set all seq_lens to MAX_SEQ")
     parser.add_argument("--num-layers", type=int, default=2)
@@ -1357,7 +1357,7 @@ if __name__ == "__main__":
         runtime_cfg=dict(
             platform=args.platform,
             device_id=args.device,
-            enable_l2_swimlane=args.enable_l2_swimlane,
+            enable_chip_swimlane=args.enable_chip_swimlane,
         ),
         rtol=5e-3,
         atol=5e-3,

@@ -3022,7 +3022,7 @@ if __name__ == "__main__":
         choices=list(FWD_LAYER_CHOICES),
         help=f"number of FWD layers (parsed at import; choices {FWD_LAYER_CHOICES}; 43 is the production schedule)",
     )
-    parser.add_argument("--enable-l2-swimlane", action="store_true", default=False)
+    parser.add_argument("--enable-chip-swimlane", action="store_true", default=False)
     parser.add_argument("--compile-only", action="store_true", default=False)
     parser.add_argument("--dump-passes", action="store_true", default=False)
     parser.add_argument(
@@ -3113,7 +3113,7 @@ if __name__ == "__main__":
         ),
         runtime_cfg=dict(
             platform=args.platform,
-            enable_l2_swimlane=args.enable_l2_swimlane,
+            enable_chip_swimlane=args.enable_chip_swimlane,
             enable_scope_stats=args.enable_scope_stats,
         ),
     )

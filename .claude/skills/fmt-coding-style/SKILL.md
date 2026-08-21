@@ -147,7 +147,7 @@ return mtp_projection(
 ```python
 # before
 parser.add_argument(
-    "--enable-l2-swimlane",
+    "--enable-chip-swimlane",
     type=int,
     nargs="?",
     const=1,
@@ -156,7 +156,7 @@ parser.add_argument(
 )
 
 # after
-parser.add_argument("--enable-l2-swimlane", type=int, nargs="?", const=1, default=0, choices=(0, 1, 2, 4))
+parser.add_argument("--enable-chip-swimlane", type=int, nargs="?", const=1, default=0, choices=(0, 1, 2, 4))
 ```
 
 Structures that stay one-item-per-line:

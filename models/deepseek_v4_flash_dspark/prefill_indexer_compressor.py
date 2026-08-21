@@ -1051,7 +1051,7 @@ if __name__ == "__main__":
         default=PREFILL_SEQ,
         help="Physical token rows, up to 8192.",
     )
-    parser.add_argument("--enable-l2-swimlane", action="store_true", default=False)
+    parser.add_argument("--enable-chip-swimlane", action="store_true", default=False)
     parser.add_argument("--dump-passes", action="store_true", default=False)
     args = parser.parse_args()
 
@@ -1061,7 +1061,7 @@ if __name__ == "__main__":
         golden_fn=golden_prefill_indexer_compressor,
         compile_cfg=dict(dump_passes=args.dump_passes),
         runtime_cfg=dict(
-            platform=args.platform, device_id=args.device, enable_l2_swimlane=args.enable_l2_swimlane
+            platform=args.platform, device_id=args.device, enable_chip_swimlane=args.enable_chip_swimlane
         ),
         compile_only=args.compile_only,
         compare_fn={

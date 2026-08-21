@@ -24,7 +24,7 @@ Where the numbers come from — see
 | Metric | Source | Quote |
 | --- | --- | --- |
 | Wall time | `PYPTO_BENCH=1` → `[RUN] effective_us (N rounds) …` | `mean=` (daily CI's per-case number is exactly this field) |
-| Core busy time | L2 swimlane per-task durations; PMU `*_busy_cycles` vs `pmu_total_cycles` | The bottleneck pipe's ratio |
+| Core busy time | chip swimlane per-task durations; PMU `*_busy_cycles` vs `pmu_total_cycles` | The bottleneck pipe's ratio |
 
 A `*sim` platform prints `effective_us unavailable: no device-domain spans`. A
 simulator run can confirm compile and correctness; it **cannot rank two
@@ -97,7 +97,7 @@ When the per-rank breakdown is not enough:
 
 - `PYPTO_BENCH_RAW=1` prints every dispatch's sample per rank in order — use it
   to spot start-up drift, a bimodal rank, or one card lagging.
-- Capture a per-rank L2 swimlane and measure from the first real compute task
+- Capture a per-rank chip swimlane and measure from the first real compute task
   instead of the window start, subtracting the leading wait explicitly.
 - `host_union_mean_us` is the opposite convention — it *includes* start skew and
   host dispatch overhead by construction. Never use it as the kernel number.

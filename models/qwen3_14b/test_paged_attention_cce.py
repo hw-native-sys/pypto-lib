@@ -126,7 +126,7 @@ def main() -> None:
     parser.add_argument("--ragged", action="store_true")
     parser.add_argument("--cache-offset-test", action="store_true")
     parser.add_argument("--compile-only", action="store_true")
-    parser.add_argument("--enable-l2-swimlane", action="store_true")
+    parser.add_argument("--enable-chip-swimlane", action="store_true")
     args = parser.parse_args()
     if not 0 < args.context_len <= args.capacity:
         raise ValueError("context length must be in (0, capacity]")
@@ -167,7 +167,7 @@ def main() -> None:
         runtime_cfg={
             "platform": args.platform,
             "device_id": args.device,
-            "enable_l2_swimlane": args.enable_l2_swimlane,
+            "enable_chip_swimlane": args.enable_chip_swimlane,
         },
         compile_only=args.compile_only or args.platform.endswith("sim"),
         rtol=5e-3,

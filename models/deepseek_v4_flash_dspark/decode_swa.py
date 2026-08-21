@@ -912,7 +912,7 @@ if __name__ == "__main__":
         help="absolute decode start position; a scalar sets batch=1, "
              "and a comma-separated list sets batch to its length",
     )
-    parser.add_argument("--enable-l2-swimlane", type=int, choices=(0, 1, 2, 4), default=0)
+    parser.add_argument("--enable-chip-swimlane", type=int, choices=(0, 1, 2, 4), default=0)
     parser.add_argument("--compile-only", action="store_true", default=False)
     parser.add_argument("--dump-passes", action="store_true", default=False)
     args = parser.parse_args()
@@ -960,7 +960,7 @@ if __name__ == "__main__":
                 runtime_cfg=dict(
                     platform=args.platform,
                     device_id=device_ids[0],
-                    enable_l2_swimlane=args.enable_l2_swimlane,
+                    enable_chip_swimlane=args.enable_chip_swimlane,
                 ),
                 rtol=1e-2,
                 atol=1e-2,
@@ -989,7 +989,7 @@ if __name__ == "__main__":
                 ),
                 runtime_cfg=dict(
                     platform=args.platform,
-                    enable_l2_swimlane=args.enable_l2_swimlane,
+                    enable_chip_swimlane=args.enable_chip_swimlane,
                 ),
                 rtol=1e-2,
                 atol=1e-2,

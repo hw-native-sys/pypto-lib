@@ -20,7 +20,7 @@ Typical usage:
     --run-env PTO2_RING_TASK_WINDOW=131072 \
     --run-env PTO2_RING_DEP_POOL=131072 \
     --run-env PTO2_RING_HEAP=536870912 \
-    -- --enable-l2-swimlane
+    -- --enable-chip-swimlane
 
 CANN, the camodel SoC, and the compile arch are auto-resolved from --target;
 override with --cann-set-env / --soc-version / --aicore-arch when needed.

@@ -1592,13 +1592,13 @@ if __name__ == "__main__":
     )
     parser.add_argument("-d", "--device", type=int, default=0)
     parser.add_argument(
-        "--enable-l2-swimlane",
+        "--enable-chip-swimlane",
         nargs="?",
         const=4,
         default=0,
         type=int,
         metavar="PERF_LEVEL",
-        help="Enable L2 swimlane perf capture at the given granularity level. Bare flag "
+        help="Enable chip swimlane perf capture at the given granularity level. Bare flag "
              "= level 4 (full). Levels: 1=AICore timing, 2=+dispatch/fanout, 3=+sched "
              "phases, 4=+orch phases; 0 (default) disables.",
     )
@@ -1684,7 +1684,7 @@ if __name__ == "__main__":
             runtime_cfg=dict(
                 platform=args.platform,
                 device_id=args.device,
-                enable_l2_swimlane=args.enable_l2_swimlane,
+                enable_chip_swimlane=args.enable_chip_swimlane,
                 enable_dep_gen=args.enable_dep_gen,
 
             ),
@@ -1720,7 +1720,7 @@ if __name__ == "__main__":
         platform=args.platform,
         device_id=args.device,
         backend_type=_backend_type(args.platform),
-        enable_l2_swimlane=args.enable_l2_swimlane,
+        enable_chip_swimlane=args.enable_chip_swimlane,
         enable_dep_gen=args.enable_dep_gen,
         dump_passes=False,
     )
@@ -1841,13 +1841,13 @@ if __name__ == "__main__":
             print(f"[stacked-fwd {N}L+LMhead] {_n_steps}-step autoregressive decode complete "
                   f"(host-ref argmax check skipped for --decode-steps > 1)")
             raise SystemExit(0)
-        # Perf-only mode: the L2 swimlane collector cannot register host buffers for a
+        # Perf-only mode: the chip swimlane collector cannot register host buffers for a
         # second on-device program in the same process (the host-ref call below would
-        # `init_l2_swimlane failed: 8`). decode_fwd already emitted the swimlane table,
+        # `init_chip_swimlane failed: 8`). decode_fwd already emitted the swimlane table,
         # so skip the reference comparison and exit cleanly.
-        if args.enable_l2_swimlane:
+        if args.enable_chip_swimlane:
             print(f"[stacked-fwd {N}L+LMhead] swimlane perf run complete "
-                  f"(host-ref argmax check skipped under --enable-l2-swimlane)")
+                  f"(host-ref argmax check skipped under --enable-chip-swimlane)")
             raise SystemExit(0)
         # host ref: run one N-layer decode_fwd_layers chunk -> final RMSNorm -> lm_head.
         # _CHUNK_NLAYERS = N keeps the inter-layer residual FP32 (chunk casts BF16 only at

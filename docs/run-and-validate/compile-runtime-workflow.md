@@ -15,7 +15,7 @@ the harness:
 ```python
 parser.add_argument("-p", "--platform", choices=["a2a3", "a2a3sim", "a5", "a5sim"])
 parser.add_argument("-d", "--device", type=int, default=0)
-parser.add_argument("--enable-l2-swimlane", action="store_true")
+parser.add_argument("--enable-chip-swimlane", action="store_true")
 args = parser.parse_args()
 
 result = run(
@@ -24,7 +24,7 @@ result = run(
     golden_fn=golden_qwen3_decode,            # PyTorch reference
     compile_cfg=dict(dump_passes=True),
     runtime_cfg=dict(platform=args.platform, device_id=args.device,
-                     enable_l2_swimlane=args.enable_l2_swimlane),
+                     enable_chip_swimlane=args.enable_chip_swimlane),
     rtol=3e-3, atol=3e-3,
 )
 ```
@@ -39,7 +39,7 @@ their `compile_cfg` fields and defaults differ; see
 |------|---------|
 | `-p` / `--platform` | Target backend. `a2a3` is Ascend 910B/C; `a5` is Ascend 950 — both run on real NPU. `a2a3sim` / `a5sim` are the matching simulators. |
 | `-d` / `--device` | Device ID for multi-card hosts. |
-| `--enable-l2-swimlane` | Forwarded to the runtime; collects per-task L2 perf records into the build_output (see [Runtime DFX flags](#runtime-dfx-flags)). |
+| `--enable-chip-swimlane` | Forwarded to the runtime; collects per-task chip swimlane records into the build_output (see [Runtime DFX flags](#runtime-dfx-flags)). |
 
 `a2a3*` maps to `BackendType.Ascend910B`; `a5*` maps to
 `BackendType.Ascend950`.
@@ -268,7 +268,7 @@ entry-specific; the table lists the common spelling when a script exposes it.
 
 | Kwarg | CLI flag | Artefact under `dfx_outputs/` |
 |-------|----------|-------------------------------|
-| `enable_l2_swimlane=True` (or a supported level) | `--enable-l2-swimlane [N]` | `l2_swimlane_records.json`; onboard runs also attempt `merged_swimlane_*.json` |
+| `enable_chip_swimlane=True` (or a supported level) | `--enable-chip-swimlane [N]` | `chip_swimlane_records.json`; onboard runs also attempt `merged_swimlane_*.json` |
 | `enable_dump_args=<N>` (int, `0`=off) | `--dump-args [N]` (bare = `1`) | `args_dump/{args_dump.json,args.bin}` |
 | `enable_pmu=<N>` (int, `0`=off) | `--enable-pmu [N]` (bare = `2`) | `pmu.csv` |
 | `enable_dep_gen=True` | `--enable-dep-gen` | `deps.json` |
@@ -279,14 +279,14 @@ Args-dump level `1` captures only arguments selected with `pl.dump_tag` or a
 values. Level `3` captures the same argument metadata without writing tensor
 payloads or `args.bin`.
 
-For an onboard L2 swimlane run, PyPTO first attempts a dependency-graph
+For an onboard chip swimlane run, PyPTO first attempts a dependency-graph
 capture and then a clean timing capture so the converter can add dependency
 arrows without perturbing the timing pass. Open the generated
 `merged_swimlane_*.json` at
 [ui.perfetto.dev](https://ui.perfetto.dev/) to visualize per-task
 execution on each AICPU / AIC / AIV lane and inspect kernel duration,
 gaps, and dependency stalls. Simulator runs retain
-`l2_swimlane_records.json` but do not generate the merged trace because the
+`chip_swimlane_records.json` but do not generate the merged trace because the
 required task metadata is unavailable.
 
 The raw dependency and scope-stat files can also be rendered offline:
@@ -305,10 +305,10 @@ end-to-end. It writes the export root below
 `build_output/<ProgramName>_<ts>/kernel_insight_all_funcs_<ts>/`.
 
 See pypto's `docs/en/dev/03-runtime-dfx.md` and the simpler reference at
-`runtime/docs/dfx/{l2-swimlane-profiling,args-dump,pmu-profiling,dep_gen,scope-stats}.md`
+`runtime/docs/dfx/{chip-swimlane-profiling,args-dump,pmu-profiling,dep_gen,scope-stats}.md`
 for full per-flag details. There is no `runtime_profiling` /
 `--runtime-profiling` compatibility alias in the current Python API; use
-`enable_l2_swimlane` or the entry's `--enable-l2-swimlane` flag.
+`enable_chip_swimlane` or the entry's `--enable-chip-swimlane` flag.
 
 ### 4b. Benchmark (opt-in, before validation)
 

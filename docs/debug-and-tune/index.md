@@ -27,7 +27,7 @@ then move from the broadest evidence to the narrowest:
 Prefer evidence that changes the program least:
 
 1. Existing compile reports and validation output.
-2. Repeated device benchmarks and L2 swimlanes.
+2. Repeated device benchmarks and chip swimlanes.
 3. PMU counters and simulator traces for one kernel.
 4. On-device instrumentation added to an extern kernel.
 

@@ -7,7 +7,7 @@
 # See LICENSE in the root of the software repository for the full text of the License.
 # -----------------------------------------------------------------------------------------------------------
 
-"""Inspect and compare actual early dispatch in level-4 L2 swimlane artifacts.
+"""Inspect and compare actual early dispatch in level-4 chip swimlane artifacts.
 
 The source-side ``allow_early_resolve`` flag belongs to a producer. A consumer
 is considered actually early-dispatched only when every direct producer is
@@ -36,7 +36,7 @@ except ImportError as exc:  # pragma: no cover - environment preflight
     ) from exc
 
 
-RECORD_NAMES = ("l2_swimlane_records.json", "l2_perf_records.json")
+RECORD_NAMES = ("chip_swimlane_records.json", "l2_swimlane_records.json", "l2_perf_records.json")
 RANK_RE = re.compile(r"rank\d+$")
 BASELINE_VERSION = 2
 
@@ -216,9 +216,9 @@ def _build_run(directory: Path) -> Run:
     if records is None:
         raise ValueError(f"{directory}: missing swimlane records")
     raw = _read_json(records)
-    level = raw.get("l2_swimlane_level") if isinstance(raw, dict) else None
+    level = raw.get("chip_swimlane_level", raw.get("l2_swimlane_level")) if isinstance(raw, dict) else None
     if level != 4:
-        raise ValueError(f"{records}: expected l2_swimlane_level=4, got {level!r}")
+        raise ValueError(f"{records}: expected chip_swimlane_level=4, got {level!r}")
     frequency = int((raw.get("metadata") or {}).get("clock_freq_hz") or 0)
     if frequency <= 0:
         raise ValueError(f"{records}: invalid clock frequency {frequency}")
@@ -1001,7 +1001,7 @@ def _render_comparison(before: dict[str, Any], after: dict[str, Any]) -> str:
 
 def parse_args(argv: list[str]) -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="Inspect actual early dispatch for a named task in level-4 L2 swimlane artifacts."
+        description="Inspect actual early dispatch for a named task in level-4 chip swimlane artifacts."
     )
     parser.add_argument("build_dir", type=Path, help="Build/run directory containing fresh dfx_outputs")
     parser.add_argument("--target", required=True, help="Exact task/operator name from name_map")

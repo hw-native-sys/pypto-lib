@@ -636,7 +636,7 @@ if __name__ == "__main__":
                         help="Active hidden rows each owner projects")
     parser.add_argument("-d", "--device", type=str, default=",".join(str(i) for i in range(WORLD_SIZE)),
                         help=f"comma-separated device ids; need at least {WORLD_SIZE}")
-    parser.add_argument("--enable-l2-swimlane", type=int, nargs="?", const=1, default=0,
+    parser.add_argument("--enable-chip-swimlane", type=int, nargs="?", const=1, default=0,
                         choices=(0, 1, 2, 4))
     parser.add_argument("--compile-only", action="store_true", default=False)
     parser.add_argument("--runtime-dir", type=str, default=None)
@@ -675,7 +675,7 @@ if __name__ == "__main__":
         ),
         runtime_cfg=dict(
             platform=args.platform,
-            enable_l2_swimlane=args.enable_l2_swimlane,
+            enable_chip_swimlane=args.enable_chip_swimlane,
         ),
         rtol=1e-3,
         atol=1e-3,

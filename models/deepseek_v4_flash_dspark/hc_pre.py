@@ -46,7 +46,7 @@ FOLDED into Phase D: since the C->D handoff was cross-core (different grid-strid
 it needed a barrier -- but each D task can just recompute the ONE gate it consumes from the
 published mixes_raw + sq_sum_acc on its OWN core (rsqrt+sigmoid is nearly free on
 this latency-bound kernel). That deletes a whole hard FFTS barrier (-8% decode / -11% prefill
-on the device L2 swimlane, latency-bound so barrier removal > byte removal). comb_logits /
+on the device chip swimlane, latency-bound so barrier removal > byte removal). comb_logits /
 post_pad_store survive only as SAME-CORE scratch (assemble then load-back, no barrier) because
 their downstream pl.load->pl.store needs an HC_PAD-wide 32B-aligned tile; the pre gate is
 consumed in tensor-world so it needs no buffer.
@@ -1006,7 +1006,7 @@ if __name__ == "__main__":
     parser.add_argument("-d", "--device", type=int, default=0)
     parser.add_argument("--mode", choices=["decode", "prefill", "all"], default="all",
                         help="Use decode or prefill batch sizes, or 'all' to test both.")
-    parser.add_argument("--enable-l2-swimlane", action="store_true", default=False)
+    parser.add_argument("--enable-chip-swimlane", action="store_true", default=False)
     parser.add_argument("--runtime-dir", type=str, default=None)
     parser.add_argument("--golden-data", type=str, default=None)
     parser.add_argument("--compile-only", action="store_true", default=False)
@@ -1057,7 +1057,7 @@ if __name__ == "__main__":
             runtime_cfg=dict(
                 platform=args.platform,
                 device_id=args.device,
-                enable_l2_swimlane=args.enable_l2_swimlane,
+                enable_chip_swimlane=args.enable_chip_swimlane,
                 # dep_gen: the "syncall" version's full-occupancy pl.system.syncall is
                 # incompatible with dep_gen -- the DFX instrumentation perturbs core
                 # occupancy and trips AICore timeout 507018 (pypto#1931) -- so it runs with

@@ -648,14 +648,14 @@ def _run_session(args, prefill_dir, decode_dir, model_dir):
             platform=args.platform,
             device_id=0,
             backend_type=BackendType.Ascend950,
-            enable_l2_swimlane=False,
+            enable_chip_swimlane=False,
             ring_heap=PREFILL_RING_HEAP,
         )
         decode_config = RunConfig(
             platform=args.platform,
             device_id=0,
             backend_type=BackendType.Ascend950,
-            enable_l2_swimlane=False,
+            enable_chip_swimlane=False,
         )
 
         inherited = _unique_storage_tensors(resident_hosts)

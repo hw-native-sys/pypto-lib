@@ -7,7 +7,7 @@
 # See LICENSE in the root of the software repository for the full text of the License.
 # -----------------------------------------------------------------------------------------------------------
 
-"""Render an operator-focused report from level-4 L2 swimlane artifacts.
+"""Render an operator-focused report from level-4 chip swimlane artifacts.
 
 The observed path itself comes from ``simpler_setup.tools.critical_path``.
 This companion adds:
@@ -41,7 +41,7 @@ except ImportError as exc:  # pragma: no cover - exercised by the environment pr
     ) from exc
 
 
-RECORD_NAMES = ("l2_swimlane_records.json", "l2_perf_records.json")
+RECORD_NAMES = ("chip_swimlane_records.json", "l2_swimlane_records.json", "l2_perf_records.json")
 RANK_RE = re.compile(r"rank\d+$")
 
 
@@ -155,9 +155,9 @@ def _build_analysis(directory: Path, root: Path, tol: int) -> RunAnalysis:
     if records is None:
         raise ValueError(f"missing swimlane records in {directory}")
     raw = _read_json(records)
-    level = raw.get("l2_swimlane_level") if isinstance(raw, dict) else None
+    level = raw.get("chip_swimlane_level", raw.get("l2_swimlane_level")) if isinstance(raw, dict) else None
     if level != 4:
-        raise ValueError(f"{records}: expected l2_swimlane_level=4, got {level!r}")
+        raise ValueError(f"{records}: expected chip_swimlane_level=4, got {level!r}")
     metadata = raw.get("metadata") or {}
     frequency = int(metadata.get("clock_freq_hz") or 0)
     if frequency <= 0:
@@ -690,7 +690,7 @@ def _render(
 
 def parse_args(argv: list[str]) -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="Render a gap/early-dispatch/blocker report from a level-4 L2 swimlane run."
+        description="Render a gap/early-dispatch/blocker report from a level-4 chip swimlane run."
     )
     parser.add_argument("build_dir", type=Path, help="Build/run directory containing dfx_outputs artifacts")
     parser.add_argument("--operator", help="Filter distributed dispatch_program.json values")

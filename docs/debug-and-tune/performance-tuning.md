@@ -2,7 +2,7 @@
 
 A practical guide for tuning pypto-lib kernels on Ascend NPU (A3 / 910C).
 The flow is two-tiered: first balance the inter-kernel schedule on the
-AICPU side (L2 swimlane), then optimize each kernel's internal pipeline
+AICPU side (chip swimlane), then optimize each kernel's internal pipeline
 (L1/L0 swimlane + PMU).
 
 For the underlying levels see simpler's
@@ -115,17 +115,17 @@ of every later run. See
 
 ### Capture
 
-Run the case with `--enable-l2-swimlane`. The runtime writes raw per-task L2
-records under the build directory and, on a real-device platform, converts
-them to a merged swimlane:
+Run the case with `--enable-chip-swimlane`. The runtime writes raw per-task
+chip swimlane records under the build directory and, on a real-device platform,
+converts them to a merged swimlane:
 
 ```bash
-python models/qwen3_14b/decode_fwd.py -p a2a3 -d 0 --enable-l2-swimlane
+python models/qwen3_14b/decode_fwd.py -p a2a3 -d 0 --enable-chip-swimlane
 ```
 
 ```
 build_output/<ProgramName>_<ts>/dfx_outputs/
-├── l2_swimlane_records.json
+├── chip_swimlane_records.json
 ├── deps.json                    # real-device graph pass
 └── merged_swimlane_<ts>.json   # real device only; open this
 ```
@@ -133,10 +133,10 @@ build_output/<ProgramName>_<ts>/dfx_outputs/
 Two viewers work:
 
 - Open `merged_swimlane_<ts>.json` in <https://ui.perfetto.dev/>.
-- Or open `l2_swimlane_records.json` directly with the
+- Or open `chip_swimlane_records.json` directly with the
   [pypto-toolkit VSCode extension](https://marketplace.visualstudio.com/items?itemName=CANN-PUB.pypto-toolkit).
 
-Simulator platforms emit `l2_swimlane_records.json` but intentionally skip
+Simulator platforms emit `chip_swimlane_records.json` but intentionally skip
 the merged conversion because their records do not yet include the task
 metadata the converter requires. Use a real-device capture when you need the
 merged Perfetto view and dependency arrows.

@@ -2,13 +2,13 @@
 
 Use the Ascend `msprof op simulator` workflow to inspect the instruction and
 pipeline behavior of one generated PTOAS kernel on a single AI Core. It
-produces cycle-level traces that can explain a low-utilization kernel after an
-L2 swimlane or PMU report has identified the task worth investigating.
+produces cycle-level traces that can explain a low-utilization kernel after a
+chip swimlane or PMU report has identified the task worth investigating.
 
 This workflow is different from:
 
 - `report/perf_hints.log`, which contains compile-time recommendations;
-- the L2 swimlane in [Performance Tuning](performance-tuning.md), which
+- the chip swimlane in [Performance Tuning](performance-tuning.md), which
   shows the multi-kernel device schedule; and
 - [CCE In-Core Profiling](cce-incore-profiling.md),
   which instruments phases of a multi-core extern kernel on real inputs.

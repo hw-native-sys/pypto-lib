@@ -1192,11 +1192,11 @@ if __name__ == "__main__":
         help="decode / prefill batch sizes, 'split' for mismatched q and kv rows, or 'all'.",
     )
     parser.add_argument(
-        "--enable-l2-swimlane",
+        "--enable-chip-swimlane",
         type=int,
         choices=[0, 1, 2, 4],
         default=0,
-        help="L2 swimlane level: 0=off, 1=per-kernel AICore timing "
+        help="chip swimlane level: 0=off, 1=per-kernel AICore timing "
         "(prints the per-function Task Statistics table), 2=+AICPU timing.",
     )
     parser.add_argument("--runtime-dir", type=str, default=None)
@@ -1236,7 +1236,7 @@ if __name__ == "__main__":
             runtime_cfg=dict(
                 platform=args.platform,
                 device_id=args.device,
-                enable_l2_swimlane=args.enable_l2_swimlane,
+                enable_chip_swimlane=args.enable_chip_swimlane,
             ),
             compile_only=args.compile_only,
         )

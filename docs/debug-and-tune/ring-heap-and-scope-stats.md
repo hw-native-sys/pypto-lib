@@ -189,7 +189,7 @@ to a **scope site**, not just a resource.
 ### Enable it
 
 `enable_scope_stats` is one of the five DFX flags the golden harness
-forwards (`enable_l2_swimlane`, `enable_dump_args`, `enable_pmu`,
+forwards (`enable_chip_swimlane`, `enable_dump_args`, `enable_pmu`,
 `enable_dep_gen`, `enable_scope_stats`). Add the flag to the entry's argparse
 and pass it through:
 
@@ -315,7 +315,7 @@ with an `rtMalloc 207001` OOM before it ever reaches the kernel.
 - [Dependencies and scheduling](dependency-and-scheduling.md) — the task
   graph and scheduler behind the rings: what a task is, how edges are formed,
   and what fills a window.
-- [Performance tuning](performance-tuning.md) — L2 swimlane and PMU; scope
+- [Performance tuning](performance-tuning.md) — chip swimlane and PMU; scope
   placement changes the schedule too, so re-measure wall time after it.
 - [PyPTO coding style](../pypto-coding/pypto-coding-style.md) — `pl.at`
   scopes (InCore), which are a different thing from the runtime scopes here.

@@ -65,7 +65,7 @@ the args-dump / dep-gen DFX flags.
 ## Performance tuning
 
 See [docs/debug-and-tune/performance-tuning.md](docs/debug-and-tune/performance-tuning.md) for the L2
-(inter-kernel) and L1/L0 (intra-kernel) tuning workflow — L2 swimlane in
+(inter-kernel) and L1/L0 (intra-kernel) tuning workflow — chip swimlane in
 Perfetto, PMU counters, and the per-kernel insight swimlane.
 
 ## Precision tuning

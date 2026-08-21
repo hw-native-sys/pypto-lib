@@ -1114,7 +1114,7 @@ if __name__ == "__main__":
                         help=f"active token count for MoE dispatch/combine (0..{T})")
     parser.add_argument("--balanced-routing", action="store_true", default=False,
                         help="use deterministic hash routes balanced evenly across all experts")
-    parser.add_argument("--enable-l2-swimlane", type=int, nargs="?", const=1, default=0, choices=range(5))
+    parser.add_argument("--enable-chip-swimlane", type=int, nargs="?", const=1, default=0, choices=range(5))
     parser.add_argument("--compile-only", action="store_true", default=False)
     parser.add_argument("--runtime-dir", type=str, default=None)
     parser.add_argument("--save-data", action="store_true", default=False)
@@ -1169,7 +1169,7 @@ if __name__ == "__main__":
         ),
         runtime_cfg=dict(
             platform=args.platform,
-            enable_l2_swimlane=args.enable_l2_swimlane,
+            enable_chip_swimlane=args.enable_chip_swimlane,
             log_level=args.log_level,
         ),
         rtol=1e-3,

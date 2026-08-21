@@ -1,12 +1,12 @@
 ---
 name: early-dispatch
-description: Enable and verify speculative early dispatch for a named small PyPTO operator by marking every direct producer with allow_early_resolve=True, using before/after level-4 L2 swimlanes to measure its start gap and prove actual scheduler staging. Use for `/early-dispatch operator-name`, reducing gaps before short operators, adding producer-side early-resolve hints, or diagnosing why an eligible task was not early-dispatched.
+description: Enable and verify speculative early dispatch for a named small PyPTO operator by marking every direct producer with allow_early_resolve=True, using before/after level-4 chip swimlanes to measure its start gap and prove actual scheduler staging. Use for `/early-dispatch operator-name`, reducing gaps before short operators, adding producer-side early-resolve hints, or diagnosing why an eligible task was not early-dispatched.
 ---
 
 # Early Dispatch
 
 Make one named small operator start sooner by opting in every direct producer,
-then prove the result with fresh before/after **L2 swimlane perf level 4**
+then prove the result with fresh before/after **chip swimlane perf level 4**
 captures.
 
 Keep these invariants:
@@ -36,10 +36,10 @@ names in the report.
    instance, not a source identifier.
 4. Inspect the executable's `argparse` definition before selecting the swimlane
    flag:
-   - For `action="store_true"`, pass bare `--enable-l2-swimlane`; runtime `True`
+   - For `action="store_true"`, pass bare `--enable-chip-swimlane`; runtime `True`
      maps to level 4.
    - For an integer/optional-value argument accepting `4`, pass
-     `--enable-l2-swimlane 4`.
+     `--enable-chip-swimlane 4`.
    - If the argument rejects level 4, stop. Do not analyze level 1/2 or silently
      change the CLI.
 
@@ -70,8 +70,8 @@ task-submit --device auto --ptoas "$SKILL_PTOAS_VERSION" \
    else echo "invalid PTOAS install: $SKILL_PTOAS_INSTALL" >&2; exit 2; fi && \
    export PATH="$PTOAS_ROOT:$PATH" && \
    python <operator.py> <normal arguments> --device "$TASK_DEVICE" \
-     --enable-l2-swimlane 4'
-find build_output -type f -name l2_swimlane_records.json -newer "$CAPTURE_MARKER" -print
+     --enable-chip-swimlane 4'
+find build_output -type f -name chip_swimlane_records.json -newer "$CAPTURE_MARKER" -print
 rm -f "$CAPTURE_MARKER"
 ```
 
@@ -101,13 +101,13 @@ value-routed graphs have identical callable identities.
 Require, for every selected rank/dispatch:
 
 ```text
-l2_swimlane_records.json
+chip_swimlane_records.json
 deps.json
 name_map*.json
 dispatch_program.json     # required when multiple programs/dispatches must be distinguished
 ```
 
-Read the raw records and require `l2_swimlane_level == 4`. Use
+Read the raw records and require `chip_swimlane_level == 4`. Use
 `swimlane_converter.read_perf_data()` for the AICore/AICPU clock join; never
 join raw cycle streams by hand. Reject a capture unless raw AICore rows, raw
 AICPU rows, and joined rows have equal counts. For every timed logical task,

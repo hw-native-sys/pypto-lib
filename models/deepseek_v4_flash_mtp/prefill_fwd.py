@@ -1632,7 +1632,7 @@ def main():
     parser.add_argument("--hca-state-block-num", type=int, default=HCA_STATE_BLOCK_NUM)
     parser.add_argument("--csa-state-block-num", type=int, default=CSA_STATE_BLOCK_NUM)
     parser.add_argument("--inner-state-block-num", type=int, default=INNER_STATE_BLOCK_NUM)
-    parser.add_argument("--enable-l2-swimlane", type=int, nargs="?", const=1, default=0, choices=(0, 1, 2))
+    parser.add_argument("--enable-chip-swimlane", type=int, nargs="?", const=1, default=0, choices=(0, 1, 2))
     parser.add_argument("--enable-scope-stats", action="store_true", default=False)
 
     parser.add_argument("--num-tiles", type=int, default=1,
@@ -1679,7 +1679,7 @@ def main():
         ),
         runtime_cfg=dict(
             platform=args.platform,
-            enable_l2_swimlane=args.enable_l2_swimlane,
+            enable_chip_swimlane=args.enable_chip_swimlane,
             enable_scope_stats=args.enable_scope_stats,
             ring_heap=PREFILL_RING_HEAP,
         ),

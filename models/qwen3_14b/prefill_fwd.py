@@ -1950,14 +1950,14 @@ if __name__ == "__main__":
                               "program serves any batch <= host KV-cache "
                               "capacity. Default: %(default)s"))
     parser.add_argument(
-        "--enable-l2-swimlane",
+        "--enable-chip-swimlane",
         nargs="?",
         const=4,
         default=0,
         type=int,
         metavar="PERF_LEVEL",
         choices=[0, 1, 2, 3, 4],
-        help="Enable L2 swimlane perf capture at the given granularity level. Bare flag "
+        help="Enable chip swimlane perf capture at the given granularity level. Bare flag "
              "= level 4 (full). Levels: 1=AICore timing, 2=+dispatch/fanout, 3=+sched "
              "phases, 4=+orch phases; 0 (default) disables.",
     )
@@ -1998,7 +1998,7 @@ if __name__ == "__main__":
         runtime_cfg=dict(
             platform=args.platform,
             device_id=args.device,
-            enable_l2_swimlane=args.enable_l2_swimlane,
+            enable_chip_swimlane=args.enable_chip_swimlane,
             enable_scope_stats=args.enable_scope_stats,
             enable_dep_gen=args.enable_dep_gen,
         ),

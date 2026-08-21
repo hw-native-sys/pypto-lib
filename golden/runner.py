@@ -116,7 +116,7 @@ def _backend_for_platform(platform: str) -> Any:
 
 
 _DFX_FLAG_KEYS = (
-    "enable_l2_swimlane",
+    "enable_chip_swimlane",
     "enable_dump_args",
     "enable_pmu",
     "enable_dep_gen",
@@ -1241,7 +1241,7 @@ def run(
             keys raise there.
         runtime_cfg: Kwargs forwarded to
             :func:`pypto.runtime.execute_compiled` (``platform``, ``device_id``,
-            ``enable_l2_swimlane``, ...). Unknown keys raise there, except
+            ``enable_chip_swimlane``, ...). Unknown keys raise there, except
             the harness-only key ``log_level``, which is consumed up-front
             to configure the PyPTO runtime logger via
             :func:`pypto.runtime.log_config.configure_log`.
@@ -1436,7 +1436,7 @@ def run_jit(
             ``RunConfig`` is built.
         runtime_cfg: Kwargs forwarded to
             :func:`pypto.runtime.execute_compiled` (``platform``, ``device_id``,
-            ``enable_l2_swimlane``, ...). Unknown keys raise there, except
+            ``enable_chip_swimlane``, ...). Unknown keys raise there, except
             the harness-only key ``log_level``, which is consumed up-front
             to configure the PyPTO runtime logger via
             :func:`pypto.runtime.log_config.configure_log`.

@@ -1,6 +1,6 @@
 ---
 name: add-dummy
-description: Protect an Observed-critical-path PyPTO operator by stopping a named early-dispatched noncritical sibling from consuming the same speculative dispatch opportunity. Add an unflagged pl.system.task_dummy(deps=[]) only to that sibling's direct deps, then use before/after level-4 L2 swimlanes to prove the protected sibling was early-dispatched and compare shared-producer-end to protected-operator-end latency. Use for `/add-dummy operator-name`, sibling early-dispatch contention, or dependency-only dummy scheduling experiments.
+description: Protect an Observed-critical-path PyPTO operator by stopping a named early-dispatched noncritical sibling from consuming the same speculative dispatch opportunity. Add an unflagged pl.system.task_dummy(deps=[]) only to that sibling's direct deps, then use before/after level-4 chip swimlanes to prove the protected sibling was early-dispatched and compare shared-producer-end to protected-operator-end latency. Use for `/add-dummy operator-name`, sibling early-dispatch contention, or dependency-only dummy scheduling experiments.
 ---
 
 # Add Dummy
@@ -41,10 +41,10 @@ SKILL_PTOAS_VERSION=${PTOAS_VERSION#v}
 
 Inspect the executable's `argparse` definition before adding the swimlane flag:
 
-- `action="store_true"`: pass bare `--enable-l2-swimlane`; runtime `True` maps
+- `action="store_true"`: pass bare `--enable-chip-swimlane`; runtime `True` maps
   to level 4.
 - An integer/optional-value argument accepting `4`: pass
-  `--enable-l2-swimlane 4`.
+  `--enable-chip-swimlane 4`.
 - If the CLI excludes level 4, stop. Do not substitute level 1 or 2.
 
 Submit the real NPU run through the device queue; do not infer device health
@@ -64,8 +64,8 @@ task-submit --device auto --ptoas "$SKILL_PTOAS_VERSION" \
    else echo "invalid PTOAS install: $SKILL_PTOAS_INSTALL" >&2; exit 2; fi && \
    export PATH="$PTOAS_ROOT:$PATH" && \
    python <operator.py> <normal arguments> --device "$TASK_DEVICE" \
-     --enable-l2-swimlane 4'
-find build_output -type f -name l2_swimlane_records.json -newer "$CAPTURE_MARKER" -print
+     --enable-chip-swimlane 4'
+find build_output -type f -name chip_swimlane_records.json -newer "$CAPTURE_MARKER" -print
 rm -f "$CAPTURE_MARKER"
 ```
 
@@ -86,13 +86,13 @@ newer than it. Current onboard PyPTO automatically performs separate graph and
 timing passes; analyze the timing pass. Require each selected dispatch to have:
 
 ```text
-l2_swimlane_records.json
+chip_swimlane_records.json
 deps.json
 name_map*.json
 dispatch_program.json       # mandatory when multiple programs/dispatches exist
 ```
 
-Require `l2_swimlane_level == 4`, a complete AICore/AICPU clock join, and the
+Require `chip_swimlane_level == 4`, a complete AICore/AICPU clock join, and the
 same value-routed task topology in the deps and timing passes. Device-resident
 control tensors are zero-filled in the graph-only child; stop if that can alter
 task routing and no equivalent capture with real control values exists.

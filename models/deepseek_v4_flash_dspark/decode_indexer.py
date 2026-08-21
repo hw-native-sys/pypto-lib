@@ -752,8 +752,8 @@ if __name__ == "__main__":
                         help=f"runtime request count; a multiple of 4 up to {B} (the compile-time "
                              "upper bound). The batch axes are pl.dynamic, so one compiled program "
                              "serves every value.")
-    parser.add_argument("--enable-l2-swimlane", type=int, default=0, choices=[0, 1, 2],
-                        help="L2 swimlane level: 0=off, 1=AICore timing, 2=+AICPU timing.")
+    parser.add_argument("--enable-chip-swimlane", type=int, default=0, choices=[0, 1, 2],
+                        help="chip swimlane level: 0=off, 1=AICore timing, 2=+AICPU timing.")
     parser.add_argument("--runtime-dir", type=str, default=None)
     parser.add_argument("--start-pos", type=int, default=None,
                         help="Uniform fixture-only start_pos override for all batches; "
@@ -807,7 +807,7 @@ if __name__ == "__main__":
         runtime_cfg=dict(
             platform=args.platform,
             device_id=args.device,
-            enable_l2_swimlane=args.enable_l2_swimlane,
+            enable_chip_swimlane=args.enable_chip_swimlane,
         ),
         rtol=1e-3,
         atol=1e-3,

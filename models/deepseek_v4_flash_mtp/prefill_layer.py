@@ -1012,7 +1012,7 @@ if __name__ == "__main__":
                         help=f"comma-separated device ids; need at least {N_RANKS}")
     parser.add_argument("--layer-id", type=int, default=2,
                         help="Layer id selects attention by MODEL_CONFIG.compress_ratios[layer_id].")
-    parser.add_argument("--enable-l2-swimlane", action="store_true", default=False)
+    parser.add_argument("--enable-chip-swimlane", action="store_true", default=False)
     parser.add_argument("--compile-only", action="store_true", default=False)
     parser.add_argument("--dump-passes", action="store_true", default=False)
     args = parser.parse_args()
@@ -1034,7 +1034,7 @@ if __name__ == "__main__":
         ),
         runtime_cfg=dict(
             platform=args.platform,
-            enable_l2_swimlane=args.enable_l2_swimlane,
+            enable_chip_swimlane=args.enable_chip_swimlane,
         ),
         rtol=1e-3,
         atol=1e-3,

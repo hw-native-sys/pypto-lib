@@ -1,18 +1,18 @@
 ---
 name: critical-path
-description: Find the execution critical path of a PyPTO operator from a level-4 L2 swimlane, report every path task and its preceding gap, mark gaps over 1 µs and tasks actually dispatched early, and identify defensible dispatch or core blockers. Use for `/critical-path operator`, operator latency investigations, multi-card fast-rank analysis, scheduler gaps, and early-dispatch verification.
+description: Find the execution critical path of a PyPTO operator from a level-4 chip swimlane, report every path task and its preceding gap, mark gaps over 1 µs and tasks actually dispatched early, and identify defensible dispatch or core blockers. Use for `/critical-path operator`, operator latency investigations, multi-card fast-rank analysis, scheduler gaps, and early-dispatch verification.
 ---
 
 # Critical Path
 
 Analyze one operator run in two stages:
 
-1. Capture a level-4 L2 swimlane and reconstruct the official Observed critical
+1. Capture a level-4 chip swimlane and reconstruct the official Observed critical
    path with `simpler_setup.tools.critical_path`.
 2. Investigate every path gap over 1 µs using task dependencies, AICPU
    dispatch/finish timestamps, and physical-core occupancy.
 
-Call this profiling tier **"L2 swimlane perf level 4"**. Do not confuse it with
+Call this profiling tier **"chip swimlane perf level 4"**. Do not confuse it with
 the runtime hierarchy's L4 worker level.
 
 ## 1. Resolve the operator and capture command
@@ -28,10 +28,10 @@ program name.
    list. A smaller or synthetic case answers a different performance question.
 4. Inspect the operator's `argparse` definition before choosing the swimlane
    flag:
-   - `action="store_true"`: pass bare `--enable-l2-swimlane`; `True` maps to
+   - `action="store_true"`: pass bare `--enable-chip-swimlane`; `True` maps to
      level 4 in the runtime binding.
    - An integer / optional-value argument accepting 4: pass
-     `--enable-l2-swimlane 4` explicitly. A bare flag often means level 1.
+     `--enable-chip-swimlane 4` explicitly. A bare flag often means level 1.
    - An argument whose choices exclude 4: stop and explain that this CLI cannot
      produce the required capture. Do not analyze level 1/2 as level 4 or
      silently edit the operator.
@@ -61,8 +61,8 @@ task-submit --device auto --ptoas "$SKILL_PTOAS_VERSION" \
    else echo "invalid PTOAS install: $SKILL_PTOAS_INSTALL" >&2; exit 2; fi && \
    export PATH="$PTOAS_ROOT:$PATH" && \
    python <operator.py> <normal operator arguments> --device "$TASK_DEVICE" \
-     --enable-l2-swimlane 4'
-find build_output -type f -name l2_swimlane_records.json -newer "$CAPTURE_MARKER" -print
+     --enable-chip-swimlane 4'
+find build_output -type f -name chip_swimlane_records.json -newer "$CAPTURE_MARKER" -print
 rm -f "$CAPTURE_MARKER"
 ```
 
@@ -92,7 +92,7 @@ join it with the timing artifacts offline.
 For every selected single-card or distributed dispatch directory, require:
 
 ```text
-l2_swimlane_records.json   # legacy l2_perf_records.json is also readable
+chip_swimlane_records.json   # legacy l2_swimlane_records.json / l2_perf_records.json also readable
 deps.json
 name_map*.json
 merged_swimlane*.json      # optional for analysis; useful in Perfetto
@@ -111,7 +111,7 @@ same `func_id`.
 Verify every records file is truly level 4:
 
 ```bash
-jq -e '.l2_swimlane_level == 4' <records>
+jq -e '.chip_swimlane_level == 4' <records>
 ```
 
 Reject the comparison if any candidate rank is missing dependencies, names, or

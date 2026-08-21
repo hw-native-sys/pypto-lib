@@ -248,7 +248,7 @@ waiting for — is settled by two artifacts and their join.
 | File | Produced by | Carries |
 |------|------------|---------|
 | `deps.json` | `--enable-dep-gen` | The task graph: tasks, `kernel_ids`, `block_num`, `early_dispatch`, annotated edges |
-| `l2_swimlane_records.json` | `--enable-l2-swimlane` | Per-task timing and scheduler/orchestrator phases; **no** edges |
+| `chip_swimlane_records.json` | `--enable-chip-swimlane` | Per-task timing and scheduler/orchestrator phases; **no** edges |
 | `name_map*.json` | Compile | Callable id → source name |
 | `dispatch_program.json` | Compile | Which program a dispatch directory belongs to |
 | `merged_swimlane*.json` | `swimlane_converter` | The two joined, for Perfetto |
@@ -268,7 +268,7 @@ timing runs of the same topology.
 | 4 | + orchestrator phase records |
 
 Anything that reasons about dispatch — gap attribution, early-dispatch proof —
-needs level 4. Note this is the L2 swimlane's *perf level*; it is unrelated to
+needs level 4. Note this is the chip swimlane's *perf level*; it is unrelated to
 the runtime hierarchy's L4 worker level.
 
 **Check the entry's `argparse` before assuming a flag shape.** Across
@@ -302,7 +302,7 @@ shared `name_hint`, so one source site may own several runtime occurrences.
 Join the streams with `swimlane_converter.read_perf_data()`; the raw file holds
 separate cycle-domain streams that must not be joined by hand. Then require:
 
-- `l2_swimlane_level == 4` in the records file;
+- `chip_swimlane_level == 4` in the records file;
 - raw AICore rows, raw AICPU rows and joined rows have **equal counts**;
 - for every timed task, `joined physical rows == deps.block_num × active kernel_ids slots`.
 
@@ -576,7 +576,7 @@ Upstream references:
 - [Managing dependencies](https://www.pypto.ai/pypto/user/performance/03-dependencies/)
   and [Runtime overhead](https://www.pypto.ai/pypto/user/performance/02-runtime-overhead/)
   — false serialization and per-task cost, upstream.
-- [L2 swimlane profiling](https://www.pypto.ai/simpler/dfx/l2-swimlane-profiling/)
+- [chip swimlane profiling](https://www.pypto.ai/simpler/dfx/chip-swimlane-profiling/)
   and [dep_gen](https://www.pypto.ai/simpler/dfx/dep-gen/) — artifact schemas.
 - [Orchestrator](https://www.pypto.ai/simpler/orchestrator/) and
   [WAR anti-dependencies](https://www.pypto.ai/simpler/war-anti-dependency/) —

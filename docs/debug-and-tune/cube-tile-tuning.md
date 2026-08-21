@@ -165,7 +165,7 @@ improve the running best beyond the noise band.
 - Use identical, seeded inputs for every candidate.
 - Revalidate numerical output for every shape; tiling must not change results.
 - Measure at least three times and compare medians, not the minimum.
-- Use the L2 swimlane and PMU data to confirm that the expected pipe changed.
+- Use the chip swimlane and PMU data to confirm that the expected pipe changed.
 - Record compile failures as evidence: a `Mat buffer usage ... exceeds` error
   identifies L1, while a UB allocation error usually belongs to the vector
   fragment.

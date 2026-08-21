@@ -53,9 +53,9 @@ Use a real A2/A3 device by selecting its device ID:
 python examples/intermediate/softmax.py -p a2a3 -d 0
 ```
 
-The single-device examples also accept `--enable-l2-swimlane` for an L2
-timeline capture. The distributed all-reduce instead takes a comma-separated
-device list and requires exactly two ranks:
+The single-device examples also accept `--enable-chip-swimlane` for a chip
+swimlane timeline capture. The distributed all-reduce instead takes a
+comma-separated device list and requires exactly two ranks:
 
 ```bash
 python examples/advanced/allreduce.py -p a2a3 -d 0,1
