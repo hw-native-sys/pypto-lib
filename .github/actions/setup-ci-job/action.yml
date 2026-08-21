@@ -4,16 +4,19 @@ description: >-
   `sim`, daily_ci.yml `model-tests-sim`) and the on-device ones (ci.yml `a2a3` /
   `serving`, daily_ci.yml `model-tests-a2a3`). All of them run directly on the
   host, as the same user, through this one action: resilient checkout into a
-  per-job dir, toolchain resolution from the cached pypto source, ptoas + pto-isa
-  install, a per-job conda venv + activate.sh, and a from-source build/install of
-  pypto + simpler. The device jobs differ only in that they additionally check the
+  per-job dir, toolchain resolution from the cached pypto source, a ptoas install,
+  a per-job conda venv + activate.sh, and a from-source build/install of
+  pypto + simpler. Simpler's own installer resolves the pinned pto-isa checkout
+  (pypto's runtime/pto_isa.pin is the single source of truth), so this action
+  never clones it. The device jobs differ only in that they additionally check the
   NPU and source CANN's set_env.sh — see the needs-device input.
 
   Unlike pypto (which builds itself), pypto-lib builds against a separate pypto
   clone kept in a per-job ci-cache/pypto-src-<build-namespace> dir (concurrent
   jobs must not share one build tree — see the build-namespace input); the
   toolchain pins (ptoas version/sha, pto-isa commit) are read from that same clone
-  so the installed pypto and the pins always match.
+  so the installed pypto and the pins always match. The pto-isa commit only
+  namespaces ccache here; it does not select a checkout.
 
   Each host describes its own layout in the runner's `.env` (the file in the
   runner application's root dir, which the runner service loads into every job it
@@ -40,7 +43,7 @@ description: >-
   into an isolated venv at PTOAS_ROOT, which keeps the PTOAS_ROOT/bin/ptoas
   layout pypto's discovery already accepts.
 
-  The calling job must define the PTOAS_ROOT, PTO_ISA_ROOT, CMAKE_* and the
+  The calling job must define the PTOAS_ROOT, CMAKE_* and the
   non-path CCACHE_* (MAXSIZE / UMASK) environment variables; they are read from
   the job environment here. PTOAS_VERSION, PTOAS_SHA256, PTO_ISA_COMMIT and
   CCACHE_NAMESPACE are resolved and exported by this action, as is every cache
@@ -268,7 +271,8 @@ runs:
       # Sync the cached pypto checkout ONCE here; the Build step below reuses it,
       # so the toolchain pins and the installed pypto are always the same
       # revision. pypto owns ptoas (toolchain/versions.env) and pins pto-isa via
-      # its runtime submodule (runtime/pto_isa.pin); read both.
+      # its runtime submodule (runtime/pto_isa.pin); read both — the pto-isa pin
+      # only keys ccache, since simpler resolves the checkout from it itself.
       shell: bash
       run: |
         # $PYPTO_SRC is the per-job build tree exported by the loader step:
@@ -384,29 +388,6 @@ runs:
     - name: Scope ccache to pto-isa version
       shell: bash
       run: echo "CCACHE_NAMESPACE=pto-isa-${PTO_ISA_COMMIT}" >> "$GITHUB_ENV"
-
-    - name: Clone pto-isa repository (pinned)
-      shell: bash
-      run: |
-        # Each composite step is a fresh shell, so re-declare the retry helper
-        # here to wrap the clone in the same transient-TLS backoff as the sync
-        # step above (a single network blip must not fail the whole job).
-        retry() {
-          local attempt=0
-          until "$@"; do
-            attempt=$((attempt + 1))
-            if [ "$attempt" -ge 4 ]; then
-              echo "'$*' failed after $attempt attempts"; return 1
-            fi
-            echo "'$*' attempt $attempt failed; retrying in $((attempt * 10))s"
-            sleep $((attempt * 10))
-          done
-        }
-        rm -rf "$PTO_ISA_ROOT"
-        retry timeout 60 git clone https://github.com/hw-native-sys/pto-isa.git "$PTO_ISA_ROOT" \
-          || { rm -rf "$PTO_ISA_ROOT"; retry timeout 300 git clone https://gitcode.com/luohuan40/pto-isa.git "$PTO_ISA_ROOT"; }
-        cd "$PTO_ISA_ROOT"
-        git checkout "$PTO_ISA_COMMIT"
 
     - name: Bootstrap conda + per-job venv + write activate.sh
       if: ${{ inputs.toolchain == 'conda' }}

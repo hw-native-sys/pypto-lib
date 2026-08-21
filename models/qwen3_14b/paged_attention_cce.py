@@ -12,6 +12,7 @@ import os
 from pathlib import Path
 
 import pypto.language as pl
+from pypto.runtime import pto_isa_include_dir
 
 
 _KERNEL_DIR = Path(__file__).parent / "kernels" / "paged_attention_cce"
@@ -52,10 +53,9 @@ _CANN_INCLUDE_DIRS = _cann_include_dirs()
 
 # The fused rope+attention extern embeds the pypto-generated rope_qkv kernel,
 # which includes <pto/pto-inst.hpp>; add the pto-isa include root for it.
-_PTO_ISA_INCLUDE = Path(os.environ.get("PTO_ISA_ROOT", "")) / "include"
-_ROPE_INCLUDE_DIRS = _CANN_INCLUDE_DIRS + (
-    (_PTO_ISA_INCLUDE,) if _PTO_ISA_INCLUDE.is_dir() else ()
-)
+# pto_isa_include_dir() resolves runtime/pto_isa.pin -- an ambient PTO_ISA_ROOT
+# is not the pin and pypto no longer reads it.
+_ROPE_INCLUDE_DIRS = _CANN_INCLUDE_DIRS + (pto_isa_include_dir(),)
 
 SUPPORTED_PLATFORMS = ("a2a3", "a2a3sim")
 # METADATA_BATCH_SLOTS is the PHYSICAL slot count of the metadata length arrays.

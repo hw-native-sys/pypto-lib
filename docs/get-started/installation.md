@@ -130,18 +130,19 @@ pinned one.
 
 ## PTO ISA
 
-Nothing to clone by hand — PyPTO and simpler each manage their own checkout at
-the commit in `$PYPTO_ROOT/runtime/pto_isa.pin`:
+Nothing to clone by hand, and nothing to point at. simpler owns the single
+managed checkout — `build/pto-isa` under the installed `simpler_setup` package
+— and `$PYPTO_ROOT/runtime/pto_isa.pin` is the only thing that selects its
+revision. PyPTO delegates to that resolver rather than keeping one of its own:
+`pypto.runtime.pto_isa_include_dir()` returns the include directory a kernel
+needs. `PTO_ISA_ROOT` is exported with the resolved path but never read back,
+so setting it cannot substitute a different tree.
 
-| Consumer | Managed checkout | Honours `PTO_ISA_ROOT` |
-|---|---|---|
-| PyPTO | `build_output/_deps/pto-isa` under the working directory | yes — set it and no clone happens |
-| simpler | `build/pto-isa` under the installed `simpler_setup` package | no — it always uses its own copy |
-
-Both clone on first use, so the first device build in a fresh environment
-pauses on a `git clone` — on a slow or blocked network that looks like a hang.
-Seeding either path with a symlink to an existing pto-isa at the pinned commit
-avoids the wait.
+The checkout is cloned on first use, so the first device build in a fresh
+environment pauses on a `git clone` — on a slow or blocked network that looks
+like a hang. Seeding that path with a symlink to an existing pto-isa at the
+pinned commit avoids the wait; a checkout that is dirty or off the pin is
+re-cloned rather than reused in place.
 
 ## Verify
 

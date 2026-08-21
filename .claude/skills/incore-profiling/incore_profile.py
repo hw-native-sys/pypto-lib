@@ -86,7 +86,16 @@ def resolve_generate_testcase(ptoas_root: Path | None) -> Path:
 
 
 def default_pto_isa_root() -> Path:
-    return repo_path(os.environ.get("PTO_ISA_ROOT", str(Path.home() / "pto-isa")))
+    """Resolve the pto-isa checkout pypto pins via ``runtime/pto_isa.pin``.
+
+    An ambient ``PTO_ISA_ROOT`` is not the pin -- pypto stopped reading it, so
+    the pin-backed resolver is the only supported source for this path.
+    """
+    # Imported here so `--help` and the pure-report paths keep working in a
+    # checkout without pypto installed.
+    from pypto.runtime import ensure_pto_isa_root
+
+    return Path(ensure_pto_isa_root())
 
 
 def discover_cann_set_env() -> Path | None:
@@ -736,7 +745,9 @@ def parse_args(argv: list[str]) -> tuple[argparse.Namespace, list[str]]:
         "when omitted, the bundled .pto-driven gen_profiling_case.py is used",
     )
     tool_group.add_argument(
-        "--pto-isa-root", default=default_pto_isa_root(), help="pto-isa root passed to CMake"
+        "--pto-isa-root",
+        default=None,
+        help="pto-isa root passed to CMake; resolved from pypto's pin when omitted",
     )
     tool_group.add_argument(
         "--soc-version",
@@ -802,7 +813,9 @@ def parse_args(argv: list[str]) -> tuple[argparse.Namespace, list[str]]:
     if case_args and case_args[0] == "--":
         case_args = case_args[1:]
     args.ptoas_root = repo_path(args.ptoas_root) if args.ptoas_root else None
-    args.pto_isa_root = repo_path(args.pto_isa_root)
+    # Left None when omitted: resolving the pin imports pypto and may clone, and
+    # `--list-funcs --build-dir` is filesystem-only. validate_toolchain() fills it in.
+    args.pto_isa_root = repo_path(args.pto_isa_root) if args.pto_isa_root else None
     args.generate_testcase = resolve_generate_testcase(args.ptoas_root)
     if args.dynamic_dim <= 0:
         parser.error("--dynamic-dim must be greater than zero")
@@ -1128,6 +1141,8 @@ def validate_toolchain(args: argparse.Namespace) -> dict[str, str]:
             raise StepError("CANN set_env.sh not found; pass --cann-set-env explicitly")
     if not args.generate_testcase.is_file():
         raise StepError(f"generate_testcase.py not found: {args.generate_testcase}")
+    if args.pto_isa_root is None:
+        args.pto_isa_root = default_pto_isa_root()
     if not args.pto_isa_root.exists():
         raise StepError(f"--pto-isa-root not found: {args.pto_isa_root}")
     env = source_env(args.cann_set_env, os.environ.copy())

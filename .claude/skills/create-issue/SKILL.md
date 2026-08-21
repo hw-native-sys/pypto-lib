@@ -59,7 +59,12 @@ jump to Step 7.
 | pypto | `hw-native-sys/pypto` | `$PYPTO_ROOT` | IR generation, lowering, codegen |
 | simpler | `hw-native-sys/simpler` | `$PYPTO_ROOT/runtime` | on-device / sim execution, task-graph build/execute (AICPU + AICore) |
 | ptoas | `hw-native-sys/PTOAS` | `$PTOAS_ROOT` (binary) / `../PTOAS` (source) | PTO bytecode assembly & optimization |
-| pto-isa | `hw-native-sys/pto-isa` | `$PTO_ISA_ROOT` | virtual tile-ISA implementations |
+| pto-isa | `hw-native-sys/pto-isa` | `$PTO_ISA_CHECKOUT` (see below) | virtual tile-ISA implementations |
+
+There is no pto-isa root to export: simpler owns that checkout and
+`runtime/pto_isa.pin` is the only thing that selects it. Resolve it once with
+`PTO_ISA_CHECKOUT="$(python -c 'from pypto.runtime import ensure_pto_isa_root; print(ensure_pto_isa_root())')"`
+before running the commands below.
 
 `simpler` is the pypto **runtime** submodule (submodule name `simpler`, path
 `$PYPTO_ROOT/runtime`). It tracks `hw-native-sys/simpler`, and it is a
@@ -100,9 +105,10 @@ git -C "$PYPTO_ROOT" branch --show-current
 git -C "$PYPTO_ROOT/runtime" rev-parse --short HEAD
 git -C "$PYPTO_ROOT/runtime" branch --show-current   # often empty (detached)
 
-# pto-isa (usually detached HEAD)
-git -C "$PTO_ISA_ROOT" rev-parse --short HEAD
-git -C "$PTO_ISA_ROOT" branch --show-current         # often empty (detached)
+# pto-isa (simpler-managed checkout; usually detached HEAD)
+PTO_ISA_CHECKOUT="$(python -c 'from pypto.runtime import ensure_pto_isa_root; print(ensure_pto_isa_root())')"
+git -C "$PTO_ISA_CHECKOUT" rev-parse --short HEAD
+git -C "$PTO_ISA_CHECKOUT" branch --show-current     # often empty (detached)
 
 # ptoas version. Probe in pypto's own order (backend/_ptoas_locate.py): the
 # three entries are not interchangeable, and from v0.55 only ptoas.sh selects
@@ -325,7 +331,7 @@ git -C "$PYPTO_ROOT/runtime" rev-parse HEAD
 
 # pto-isa: pin is a FULL 40-char hash; compare against the full actual HEAD
 tr -d '[:space:]' < "$PYPTO_ROOT/runtime/pto_isa.pin"
-git -C "$PTO_ISA_ROOT" rev-parse HEAD
+git -C "$PTO_ISA_CHECKOUT" rev-parse HEAD
 
 # ptoas: normalize both sides to a bare version, then compare
 ( . "$PYPTO_ROOT/toolchain/versions.env" && echo "${PTOAS_VERSION#v}" )

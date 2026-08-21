@@ -34,8 +34,8 @@ this skill.
    - take `PTOAS_VERSION` from that revision's `toolchain/versions.env`, never
      from a log or a previous session;
    - install PyPTO, then unpack that PTOAS release under `PTOAS_ROOT`;
-   - leave PTO ISA alone unless the user maintains their own checkout — PyPTO
-     and simpler each clone and pin one on first use.
+   - leave PTO ISA alone — simpler clones and pins the one managed checkout
+     on first use, and `PTO_ISA_ROOT` cannot redirect it.
 5. For a device environment, source the selected CANN `set_env.sh` and run
    `npu-smi info` before installing simpler. Simpler detects `ccec` and the
    cross-compiler during installation and only prebuilds the platforms whose
@@ -54,7 +54,8 @@ this skill.
      `backend/_ptoas_locate.py` does, because a v0.55+ release runs only
      through its own `ptoas.sh`;
    - the simpler submodule revision belongs to the selected PyPTO checkout;
-   - any PTO ISA checkout in use is at `runtime/pto_isa.pin`;
+   - the commit at the checkout `pypto.runtime.ensure_pto_isa_root()` returns
+     matches the full hash in `runtime/pto_isa.pin`;
    - `PTOAS_ROOT` and the repository `PYTHONPATH` are usable in the shell that
      will run the case.
 10. When the requested platform is available, run

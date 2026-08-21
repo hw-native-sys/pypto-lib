@@ -55,7 +55,7 @@ Name the owner in the entry; `unclear` is a valid answer.
 | `pypto` | `$PYPTO_ROOT` | IR generation, lowering, codegen |
 | `simpler` | `$PYPTO_ROOT/runtime` | on-device / sim execution, task-graph build & execute (AICPU + AICore) |
 | `ptoas` | `$PTOAS_ROOT` | PTO bytecode assembly & optimization |
-| `pto-isa` | `$PTO_ISA_ROOT` | virtual tile-ISA implementations |
+| `pto-isa` | simpler's managed checkout — resolve with `pypto.runtime.ensure_pto_isa_root()` | virtual tile-ISA implementations |
 
 A runtime crash / hang / AICPU error is a **simpler** issue, not a pypto one.
 
