@@ -487,7 +487,7 @@ gate = pl.system.task_dummy(deps=[tid_a, tid_b])
 
 # 2. Delay by one hop: a real producer, plus a hop, before a non-critical
 #    consumer — so it stops resolving at the same instant as the critical one.
-#    models/deepseek_v4_flash_dspark/decode_swa.py:320
+#    models/deepseek_v4_flash_dspark/decode_swa.py:171
 late_dep = pl.system.task_dummy(deps=[rms_tid])
 qkv_proj_rope(..., late_dep)
 
