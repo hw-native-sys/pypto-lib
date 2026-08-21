@@ -41,6 +41,10 @@ PREFILL_DENSE_TILE = 512
 
 # Dynamic shape variables.
 T_DYN = pl.dynamic("PREFILL_INDEXER_T_DYN")
+# Query-side token axis. Under context parallelism the cache half runs on the
+# gathered stream while the query half stays on the local slice, so the two
+# cannot share one symbol -- the same split #924 made in qkv_proj_rope.
+Q_T_DYN = pl.dynamic("PREFILL_INDEXER_Q_T_DYN")
 IDX_BLOCK_NUM_DYN = pl.dynamic("PREFILL_IDX_BLOCK_NUM_DYN")
 INNER_STATE_BLOCK_NUM_DYN = pl.dynamic("PREFILL_INNER_STATE_BLOCK_NUM_DYN")
 
@@ -594,9 +598,12 @@ def prefill_indexer(
     idx_slot_mapping: pl.Tensor[[T_DYN], pl.INT64],
     inner_state_slot_mapping: pl.Tensor[[T_DYN], pl.INT64],
 ):
-    """Canonical P4 indexer over one contiguous, position-monotonic token run."""
-    t_dim = pl.tensor.dim(x, 0)
+    """Canonical P4 indexer over one contiguous, position-monotonic token run.
 
+    A thin wrapper over the two halves below, kept so every existing caller is
+    untouched. Context parallelism calls them separately, because the cache half
+    consumes the gathered stream while the query half stays on the local slice.
+    """
     idx_kv_cache_out, idx_kv_scale_out, inner_compress_state_out = prefill_indexer_compressor(
         x,
         inner_compress_state,
@@ -615,6 +622,54 @@ def prefill_indexer(
         idx_slot_mapping,
         inner_state_slot_mapping,
     )
+
+    score, cmp_topk_indices = prefill_indexer_query(
+        x,
+        qr,
+        qr_scale,
+        wq_b,
+        wq_b_scale,
+        weights_proj,
+        cos,
+        sin,
+        hadamard,
+        idx_kv_cache,
+        idx_kv_scale,
+        idx_block_table,
+        score,
+        cmp_topk_indices,
+        position_ids,
+    )
+    return idx_kv_cache_out, idx_kv_scale_out, score, cmp_topk_indices
+
+
+@pl.jit.inline(auto_scope=False)
+def prefill_indexer_query(
+    x: pl.Tensor[[Q_T_DYN, D], pl.BF16],
+    qr: pl.Tensor[[Q_T_DYN, Q_LORA], pl.INT8],
+    qr_scale: pl.Tensor[[Q_T_DYN, 1], pl.FP32],
+    wq_b: pl.Tensor[[Q_LORA, IDX_N_HEADS * IDX_HEAD_DIM], pl.INT8],
+    wq_b_scale: pl.Tensor[[IDX_N_HEADS * IDX_HEAD_DIM], pl.FP32],
+    weights_proj: pl.Tensor[[D, IDX_N_HEADS], pl.BF16],
+    cos: pl.Tensor[[Q_T_DYN, ROPE_HEAD_DIM // 2], pl.FP32],
+    sin: pl.Tensor[[Q_T_DYN, ROPE_HEAD_DIM // 2], pl.FP32],
+    hadamard: pl.Tensor[[IDX_HEAD_DIM, IDX_HEAD_DIM], pl.BF16],
+    idx_kv_cache: pl.Tensor[[IDX_BLOCK_NUM_DYN, BLOCK_SIZE, 1, IDX_HEAD_DIM], pl.INT8],
+    idx_kv_scale: pl.Tensor[[IDX_BLOCK_NUM_DYN, BLOCK_SIZE, 1, 1], pl.FP32],
+    idx_block_table: pl.Tensor[[IDX_CACHE_MAX_BLOCKS], pl.INT32],
+    score: pl.Out[pl.Tensor[[Q_T_DYN, INDEXER_SCORE_CAP], pl.FP32]],
+    cmp_topk_indices: pl.Out[pl.Tensor[[Q_T_DYN, IDX_TOPK], pl.INT32]],
+    position_ids: pl.Tensor[[Q_T_DYN], pl.INT32],
+):
+    """Score this rank's queries against the indexer cache and select their top-k.
+
+    Query-side half of the indexer: it reads the cache but never writes it, so
+    under context parallelism it runs on the local slice while
+    `prefill_indexer_compressor` fills the same cache from the gathered stream.
+    Its token axis is a separate symbol for exactly that reason -- the two
+    halves carry different extents in one program.
+    """
+    t_dim = pl.tensor.dim(x, 0)
 
     last_pos = pl.read(position_ids, [t_dim - 1])
     max_visible = pl.cast(
@@ -673,7 +728,7 @@ def prefill_indexer(
                 max_visible,
             )
 
-    return idx_kv_cache_out, idx_kv_scale_out, score, cmp_topk_indices
+    return score, cmp_topk_indices
 
 
 @pl.jit.inline
