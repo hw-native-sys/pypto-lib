@@ -17,7 +17,7 @@ import pypto.language as pl
 import pypto.language.distributed as pld
 from pypto.ir.distributed_compiled_program import DistributedConfig
 
-from config import DECODE_TOKENS, FLASH as M
+from config import DECODE_TOKENS, FLASH as M, FP32_NEG_INF
 
 
 T_DYN = pl.dynamic("LM_HEAD_T_DYN")
@@ -62,9 +62,10 @@ HIDDEN_GATHER_ROW_TILE = min(GROUP_LOGIT_ROWS, 16)
 PUSH_ROW_TILE = 16  # rows pushed per dispatch_push block (fewer, larger ring puts)
 LOGITS_GATHER_ROW_TILE = min(MAX_LOGIT_ROWS, 8)
 LOGITS_COMM_TILE = 2048
-GREEDY_VOCAB_TILE = 256
-GREEDY_TILE_PAD = 512
-GREEDY_TOPK = 16
+# Greedy sampling scans each row as a [GREEDY_BLOCK_ROWS, GREEDY_ROW_WIDTH] grid.
+# 8 rows keeps a reduction result at 32 B; alloc_tile rejects the 4 B a [1, 1] gives.
+GREEDY_ROW_WIDTH = 808
+GREEDY_BLOCK_ROWS = 8
 SAMPLED_IDS_PAD = 8
 FUSED_LM_HEAD_CORES = 24
 # AIV lanes per AICore: the fused kernel splits each row block's accumulator
@@ -78,6 +79,10 @@ LOGITS_COMM_TAIL = VOCAB_PER_TP % LOGITS_COMM_TILE
 N_LOGITS_COMM_TILES = VOCAB_PER_TP // LOGITS_COMM_TILE
 LOGITS_COMM_BLOCKS = min(FUSED_LM_HEAD_CORES, N_LOGITS_COMM_TILES + (1 if LOGITS_COMM_TAIL != 0 else 0))
 LOGITS_TAIL_BLOCK = N_LOGITS_COMM_TILES % LOGITS_COMM_BLOCKS
+GREEDY_GRID_ROWS = VOCAB // GREEDY_ROW_WIDTH
+GREEDY_BLOCK_SPAN = GREEDY_BLOCK_ROWS * GREEDY_ROW_WIDTH
+# 2^30: above every vocab id, clear of int32 overflow once a block base is added.
+GREEDY_INDEX_SENTINEL = 1073741824
 DONE_VALUE = 1
 
 # Ring heap: the depth-1 scope holds selected_hidden and owner_hiddens plus the
@@ -87,6 +92,9 @@ os.environ.setdefault("PTO2_RING_HEAP", "1073741824")
 assert MAX_LOGIT_ROWS % MM_ROW_TILE == 0, "each row block must be one owner's rows"
 assert MAX_LOGIT_ROWS % PUSH_ROW_TILE == 0, "row block must cover whole rows"
 assert TP_SIZE % AIV_LANES == 0, "owners must divide evenly across the AIV lanes"
+assert GREEDY_BLOCK_ROWS * 4 % 32 == 0, "reduction result must clear the 32 B column floor"
+assert GREEDY_ROW_WIDTH * 4 % 32 == 0, "block row must clear the 32 B row floor"
+assert VOCAB < GREEDY_INDEX_SENTINEL, "sentinel must lose every row_min against a real id"
 
 
 @pl.jit.inline(auto_scope=False)
@@ -345,53 +353,52 @@ def greedy_sample(
     sampled_ids: pl.Tensor[[MAX_LOGIT_ROWS, SAMPLED_IDS_PAD], pl.INT32],
 ):
     """Select the first maximum token id from each full-vocabulary logits row."""
+    # One pass per row into a [BLOCK_ROWS, ROW_WIDTH] accumulator carrying the
+    # running maximum and the block that set it; a lane's column is its position.
+    logits_grid = pl.reshape(logits, [MAX_LOGIT_ROWS * GREEDY_GRID_ROWS, GREEDY_ROW_WIDTH])
     for row in pl.spmd(MAX_LOGIT_ROWS, name_hint="lm_head_greedy_sample"):
-        chunk_idx_init = pl.arange(0, [1, GREEDY_VOCAB_TILE], dtype=pl.UINT32)
-        chunk_maxima = pl.create_tensor([1, GREEDY_TILE_PAD], dtype=pl.FP32)
-        chunk_maxima[:, :] = pl.full([1, GREEDY_TILE_PAD], dtype=pl.FP32, value=-3.402823e38)
-        for chunk in pl.range(VOCAB // GREEDY_VOCAB_TILE):
-            chunk_start = chunk * GREEDY_VOCAB_TILE
-            scores = logits[row : row + 1, chunk_start : chunk_start + GREEDY_VOCAB_TILE]
-            sorted_pairs = pl.sort32(scores, chunk_idx_init)
-            sorted_pairs = pl.mrgsort(sorted_pairs, block_len=64)
-            sorted_pairs = pl.mrgsort(
-                sorted_pairs[:, 0:GREEDY_VOCAB_TILE],
-                sorted_pairs[:, GREEDY_VOCAB_TILE : 2 * GREEDY_VOCAB_TILE],
-            )
-            top_pair = sorted_pairs[:, 0 : 2 * GREEDY_TOPK]
-            top_values = pl.gather(top_pair, mask_pattern=pl.tile.MaskPattern.P0101)
-            pl.write(chunk_maxima, [0, chunk], pl.read(top_values, [0, 0]))
+        row_base = row * GREEDY_GRID_ROWS
+        running_max = pl.full([GREEDY_BLOCK_ROWS, GREEDY_ROW_WIDTH], dtype=pl.FP32, value=FP32_NEG_INF)
+        running_base = pl.full([GREEDY_BLOCK_ROWS, GREEDY_ROW_WIDTH], dtype=pl.INT32, value=0)
+        for block in pl.range(GREEDY_GRID_ROWS // GREEDY_BLOCK_ROWS):
+            block_row = row_base + block * GREEDY_BLOCK_ROWS
+            scores = logits_grid[block_row : block_row + GREEDY_BLOCK_ROWS, 0:GREEDY_ROW_WIDTH]
+            # Strict greater-than, so a lane keeps the earliest block it peaked at.
+            is_newer = pl.cmp(scores, running_max, cmp_type=4)
+            newer = pl.cast(is_newer, target_type=pl.INT32)
+            running_max = pl.maximum(running_max, scores)
+            block_base = pl.cast(block * GREEDY_BLOCK_SPAN, pl.INT32)
+            to_new = pl.neg(pl.sub(running_base, block_base))
+            running_base = pl.add(running_base, pl.mul(newer, to_new))
 
-        maxima_idx_init = pl.arange(0, [1, GREEDY_TILE_PAD], dtype=pl.UINT32)
-        sorted_maxima = pl.sort32(chunk_maxima, maxima_idx_init)
-        sorted_maxima = pl.mrgsort(sorted_maxima, block_len=64)
-        sorted_maxima = pl.mrgsort(sorted_maxima, block_len=256)
-        top_maximum_pair = sorted_maxima[:, 0 : 2 * GREEDY_TOPK]
-        top_maximum_values = pl.gather(top_maximum_pair, mask_pattern=pl.tile.MaskPattern.P0101)
-        best_value = pl.read(top_maximum_values, [0, 0])
+        # Broadcast the lane maxima back and column-reduce: every entry is then the
+        # row maximum. A scalar pl.max over the lanes miscompiles on fp32
+        # (ptoas_bitcast has no float overload).
+        lane_maxima = pl.row_max(running_max)
+        lane_zeros = pl.full([GREEDY_BLOCK_ROWS, GREEDY_ROW_WIDTH], dtype=pl.FP32, value=0.0)
+        lane_broadcast = pl.row_expand_add(lane_zeros, lane_maxima)
+        best_value = pl.read(pl.col_max(lane_broadcast), [0, 0])
 
-        # Reverse scans leave the lowest matching index selected, matching
-        # torch.argmax's first-occurrence tie behavior.
-        winning_chunk = pl.cast(0, pl.INT32)
-        for chunk in pl.range(VOCAB // GREEDY_VOCAB_TILE):
-            scan_chunk = VOCAB // GREEDY_VOCAB_TILE - 1 - chunk
-            if pl.read(chunk_maxima, [0, scan_chunk]) == best_value:
-                winning_chunk = pl.cast(scan_chunk, pl.INT32)
+        # Flat index of every lane still at the row maximum, sentinel for the rest.
+        # The lane * width term folds into the scalar combine below, keeping the
+        # ramp a broadcast row rather than an (illegal) 2D arange.
+        ramp_zeros = pl.full([GREEDY_BLOCK_ROWS, GREEDY_ROW_WIDTH], dtype=pl.INT32, value=0)
+        column_ramp = pl.col_expand(ramp_zeros, pl.arange(0, [1, GREEDY_ROW_WIDTH], dtype=pl.INT32))
+        flat_index = pl.add(running_base, column_ramp)
+        is_max = pl.cmp(running_max, best_value, cmp_type=0)
+        hit = pl.cast(is_max, target_type=pl.INT32)
+        offset_index = pl.sub(flat_index, GREEDY_INDEX_SENTINEL)
+        candidates = pl.add(pl.mul(hit, offset_index), GREEDY_INDEX_SENTINEL)
+        lane_indices = pl.row_min(candidates)
+        best_index = pl.read(lane_indices, [0, 0])
+        for lane in pl.range(1, GREEDY_BLOCK_ROWS):
+            lane_term = pl.cast(lane * GREEDY_ROW_WIDTH, pl.INT32)
+            lane_best = pl.read(lane_indices, [lane, 0]) + lane_term
+            best_index = pl.min(best_index, lane_best)
 
-        chunk_base = winning_chunk * pl.cast(GREEDY_VOCAB_TILE, pl.INT32)
-        winning_scores = pl.slice(
-            logits,
-            [1, GREEDY_VOCAB_TILE],
-            [pl.cast(row, pl.INDEX), pl.cast(chunk_base, pl.INDEX)],
-        )
-        winning_offset = pl.cast(0, pl.INT32)
-        for offset in pl.range(GREEDY_VOCAB_TILE):
-            scan_offset = GREEDY_VOCAB_TILE - 1 - offset
-            if pl.read(winning_scores, [0, scan_offset]) == best_value:
-                winning_offset = pl.cast(scan_offset, pl.INT32)
         sampled_row = pl.create_tensor([1, SAMPLED_IDS_PAD], dtype=pl.INT32)
         sampled_row[:, :] = pl.full([1, SAMPLED_IDS_PAD], dtype=pl.INT32, value=0)
-        pl.write(sampled_row, [0, 0], chunk_base + winning_offset)
+        pl.write(sampled_row, [0, 0], best_index)
         sampled_ids[row : row + 1, :] = sampled_row
 
     return sampled_ids
