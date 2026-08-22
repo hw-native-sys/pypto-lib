@@ -6,13 +6,7 @@
 # INCLUDING BUT NOT LIMITED TO NON-INFRINGEMENT, MERCHANTABILITY, OR FITNESS FOR A PARTICULAR PURPOSE.
 # See LICENSE in the root of the software repository for the full text of the License.
 # -----------------------------------------------------------------------------------------------------------
-"""DeepSeek-V4 Hyper-Connections post-mix (dynamic shape): combines a sublayer
-output with its hc-residual into the next hc-stack via post and comb weights.
-Supports both decode and prefill batch/sequence sizes via dynamic-shape tensors."""
-
-# ``hc_post`` processes a dynamic tensor whose rows are all valid (decode/MoE).
-# ``hc_post_prefill`` processes only the active prefix of a static prefill tensor
-# and deterministically zero-fills its inactive tail.
+"""DeepSeek-V4 Hyper-Connections post-mix for dynamic decode and prefill shapes."""
 
 import pypto.language as pl
 
@@ -25,11 +19,13 @@ T_DYN = pl.dynamic("T_DYN")  # T = B * S
 D = M.hidden_size
 HC_MULT = M.hc_mult
 HC_DIM = M.hc_dim
+DECODE_ROWS_MAX = DECODE_BATCH * DECODE_SEQ
 
 # tiling
 T_TILE = 4
 INACTIVE_FILL_T_TILE = 16
 INACTIVE_FILL_D_TILE = 256
+D_TILE = D // 4
 assert (DECODE_BATCH * DECODE_SEQ) % T_TILE == 0
 assert (PREFILL_BATCH * PREFILL_SEQ) % T_TILE == 0
 
@@ -46,24 +42,40 @@ def hc_post(
 
     residual_flat = pl.reshape(residual, [t_dim, HC_DIM])
     y_flat = pl.reshape(y, [t_dim, HC_DIM])
+    residual_rows = pl.reshape(residual, [t_dim * HC_MULT, D])
+    y_rows = pl.reshape(y, [t_dim * HC_MULT, D])
 
-    for block in pl.spmd((t_dim // T_TILE) * HC_MULT, name_hint="hc_post"):
-        token_block = block // HC_MULT
-        out_h = block % HC_MULT
-        t0 = token_block * T_TILE
-        for t in pl.pipeline(t0, t0 + T_TILE, stage=2):
-            post_w = pl.read(post, [t, out_h])
-            x_row = pl.cast(x[t : t + 1, 0:D], target_type=pl.FP32)
-            y_row = pl.mul(x_row, post_w)
-            for in_h in pl.pipeline(HC_MULT, stage=4):
-                comb_w = pl.read(comb, [t, in_h * HC_MULT + out_h])
-                res_d = in_h * D
-                # residual is already FP32 (hc stream is FP32 end-to-end): no cast, read straight.
-                res_row = residual_flat[t : t + 1, res_d : res_d + D]
-                weighted = pl.mul(res_row, comb_w)
-                y_row = pl.add(y_row, weighted)
-            # y is FP32 (feeds the next layer's hc_pre directly): no BF16 output cast.
-            y_flat[t : t + 1, out_h * D : out_h * D + D] = y_row
+    if t_dim <= DECODE_ROWS_MAX:
+        for t in pl.spmd(t_dim, name_hint="hc_post"):
+            h0 = t * HC_MULT
+            for d0 in pl.pipeline(0, D, D_TILE, stage=2):
+                x_chunk = pl.cast(x[t : t + 1, d0 : d0 + D_TILE], target_type=pl.FP32)
+                res_tile = residual_rows[h0 : h0 + HC_MULT, d0 : d0 + D_TILE]
+                for out_h in pl.unroll(HC_MULT):
+                    post_w_chunk = pl.read(post, [t, out_h])
+                    y_chunk = pl.mul(x_chunk, post_w_chunk)
+                    for in_h in pl.unroll(HC_MULT):
+                        comb_w = pl.read(comb, [t, in_h * HC_MULT + out_h])
+                        res_row = res_tile[in_h : in_h + 1, 0:D_TILE]
+                        res_weighted_chunk = pl.mul(res_row, comb_w)
+                        y_chunk = pl.add(y_chunk, res_weighted_chunk)
+                    y_rows[h0 + out_h : h0 + out_h + 1, d0 : d0 + D_TILE] = y_chunk
+    else:
+        for block in pl.spmd((t_dim // T_TILE) * HC_MULT, name_hint="hc_post"):
+            token_block = block // HC_MULT
+            out_h = block % HC_MULT
+            t0 = token_block * T_TILE
+            for t in pl.pipeline(t0, t0 + T_TILE, stage=2):
+                post_w = pl.read(post, [t, out_h])
+                x_row = pl.cast(x[t : t + 1, 0:D], target_type=pl.FP32)
+                y_row = pl.mul(x_row, post_w)
+                for in_h in pl.pipeline(HC_MULT, stage=4):
+                    comb_wide = pl.read(comb, [t, in_h * HC_MULT + out_h])
+                    res_d = in_h * D
+                    res_wide = residual_flat[t : t + 1, res_d : res_d + D]
+                    weighted = pl.mul(res_wide, comb_wide)
+                    y_row = pl.add(y_row, weighted)
+                y_flat[t : t + 1, out_h * D : out_h * D + D] = y_row
     return y
 
 
@@ -77,19 +89,18 @@ def hc_post_prefill(
     num_tokens: pl.Scalar[pl.INT32],
 ):
     """Compute prefill active rows and deterministically pad the static tail."""
-    t_dim = pl.tensor.dim(x, 0)
     active_tokens = pl.cast(num_tokens, pl.INDEX)
     if active_tokens < 0:
         active_tokens = pl.cast(0, pl.INDEX)
+    t_dim = pl.tensor.dim(x, 0)
     if active_tokens > t_dim:
         active_tokens = t_dim
 
     residual_flat = pl.reshape(residual, [t_dim, HC_DIM])
     y_flat = pl.reshape(y, [t_dim, HC_DIM])
-    active_tiles = (active_tokens + T_TILE - 1) // T_TILE
 
     if active_tokens > 0:
-        for block in pl.spmd(active_tiles * HC_MULT, name_hint="hc_post_prefill"):
+        for block in pl.spmd(((active_tokens + T_TILE - 1) // T_TILE) * HC_MULT, name_hint="hc_post_prefill"):
             token_block = block // HC_MULT
             out_h = block % HC_MULT
             t0 = token_block * T_TILE
@@ -102,13 +113,16 @@ def hc_post_prefill(
                         comb_w = pl.read(comb, [t, in_h * HC_MULT + out_h])
                         res_d = in_h * D
                         res_row = residual_flat[t : t + 1, res_d : res_d + D]
-                        y_row = pl.add(y_row, pl.mul(res_row, comb_w))
+                        weighted = pl.mul(res_row, comb_w)
+                        y_row = pl.add(y_row, weighted)
                     y_flat[t : t + 1, out_h * D : out_h * D + D] = y_row
 
     inactive_tokens = t_dim - active_tokens
     if inactive_tokens > 0:
-        inactive_tiles = (inactive_tokens + INACTIVE_FILL_T_TILE - 1) // INACTIVE_FILL_T_TILE
-        for fill_block in pl.spmd(inactive_tiles * HC_MULT, name_hint="hc_post_inactive_pad"):
+        for fill_block in pl.spmd(
+            ((inactive_tokens + INACTIVE_FILL_T_TILE - 1) // INACTIVE_FILL_T_TILE) * HC_MULT,
+            name_hint="hc_post_inactive_pad",
+        ):
             fill_tile = fill_block // HC_MULT
             out_h = fill_block % HC_MULT
             fill_t0 = active_tokens + fill_tile * INACTIVE_FILL_T_TILE
@@ -141,13 +155,13 @@ def hc_post_test(
 
 
 def golden_hc_post(tensors):
-    """Torch reference, direct port of model.py Block.hc_post 684-687."""
+    """Compute the Hyper-Connections post-mix reference."""
     import torch
 
-    x        = tensors["x"].float()
+    x = tensors["x"].float()
     residual = tensors["residual"].float()
-    post     = tensors["post"].float()
-    comb     = tensors["comb"].float().reshape(-1, HC_MULT, HC_MULT)  # [B, S, HC, HC]
+    post = tensors["post"].float()
+    comb = tensors["comb"].float().reshape(-1, HC_MULT, HC_MULT)
 
     T = x.shape[0]
     y_fp32 = torch.zeros(T, HC_MULT, D, dtype=torch.float32)
@@ -156,9 +170,7 @@ def golden_hc_post(tensors):
         for in_h in range(HC_MULT):
             y_row = y_row + residual[:, in_h, :] * comb[:, in_h, out_h:out_h + 1]
         y_fp32[:, out_h, :] = y_row
-    y = y_fp32  # hc residual stream is FP32 end-to-end: no BF16 rounding
-
-    tensors["y"][:] = y
+    tensors["y"][:] = y_fp32
 
 
 def golden_hc_post_prefill(tensors):
@@ -176,19 +188,23 @@ def build_tensor_specs(B, S):
 
     def init_x():
         return torch.randn(T, D) * 0.05
+
     def init_residual():
         return torch.randn(T, HC_MULT, D) * 0.05
+
     def init_post():
         return 2.0 * torch.sigmoid(torch.randn(T, HC_MULT))
+
     def init_comb():
         c = torch.rand(B, S, HC_MULT, HC_MULT) + 0.1
         return (c / c.sum(dim=-1, keepdim=True)).reshape(T, HC_MULT * HC_MULT)
+
     return [
-        TensorSpec("x",        [T, D],                    torch.bfloat16, init_value=init_x),
-        TensorSpec("residual", [T, HC_MULT, D],           torch.float32,  init_value=init_residual),
-        TensorSpec("post",     [T, HC_MULT],              torch.float32,  init_value=init_post),
-        TensorSpec("comb",     [T, HC_MULT * HC_MULT],    torch.float32,  init_value=init_comb),
-        TensorSpec("y",        [T, HC_MULT, D],           torch.float32,  is_output=True),
+        TensorSpec("x", [T, D], torch.bfloat16, init_value=init_x),
+        TensorSpec("residual", [T, HC_MULT, D], torch.float32, init_value=init_residual),
+        TensorSpec("post", [T, HC_MULT], torch.float32, init_value=init_post),
+        TensorSpec("comb", [T, HC_MULT * HC_MULT], torch.float32, init_value=init_comb),
+        TensorSpec("y", [T, HC_MULT, D], torch.float32, is_output=True),
     ]
 
 
@@ -197,16 +213,15 @@ if __name__ == "__main__":
     from golden import run_jit
 
     MODES = {
-        "decode":  (DECODE_BATCH, DECODE_SEQ),
+        "decode": (DECODE_BATCH, DECODE_SEQ),
         "prefill": (PREFILL_BATCH, PREFILL_SEQ),
     }
 
     parser = argparse.ArgumentParser()
-    parser.add_argument("-p", "--platform", type=str, default="a2a3",
-                        choices=["a2a3", "a2a3sim", "a5", "a5sim"])
+    parser.add_argument("-p", "--platform", type=str, default="a2a3", choices=["a2a3", "a2a3sim", "a5", "a5sim"])
     parser.add_argument("-d", "--device", type=int, default=0)
-    parser.add_argument("--mode", choices=["decode", "prefill", "all"], default="decode",
-                        help="Use decode or prefill batch sizes, or 'all' to test both.")
+    mode_help = "Use decode or prefill batch sizes, or 'all' to test both."
+    parser.add_argument("--mode", choices=["decode", "prefill", "all"], default="decode", help=mode_help)
     parser.add_argument("--enable-chip-swimlane", type=int, nargs="?", const=1, default=0, choices=(0, 1, 2))
     parser.add_argument("--compile-only", action="store_true", default=False)
     parser.add_argument("--dump-passes", action="store_true", default=False)

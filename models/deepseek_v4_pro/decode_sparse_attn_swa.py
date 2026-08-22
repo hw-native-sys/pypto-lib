@@ -34,121 +34,46 @@ ROPE_DIM = M.qk_rope_head_dim
 HALF_ROPE = ROPE_DIM // 2
 NOPE_DIM = M.nope_head_dim
 WIN = M.sliding_window
-MAX_SEQ_LEN = M.max_position_embeddings
 SOFTMAX_SCALE = M.softmax_scale
 O_LORA = M.o_lora_rank
 O_GROUPS = M.o_groups
 HEADS_PER_GROUP = H // O_GROUPS
 O_GROUP_IN = HEADS_PER_GROUP * HEAD_DIM
-
-# kernel-local
 ORI_MAX_BLOCKS = KV_ORI_MAX_BLOCKS
 ORI_BLOCK_NUM = DECODE_ORI_BLOCK_NUM
+TOPK = WIN
+NEG_INF = -1.0e20
 
 # tiling
-GATHER_SPLITS = 4
-GATHER_ROWS_PER_TASK = WIN // GATHER_SPLITS
-# Sub-tile probed for physical contiguity: a decode window is a run of consecutive
-# logical positions, so a sub-tile that stays inside one paged block maps to
-# consecutive cache rows and moves in ONE bulk DMA. Only a block-straddling or -1
-# sub-tile falls back to the per-row copy (~0.44us/row vs ~0.02us/row bulk).
-GATHER_RUN = 16
+GATHER_SPLIT_TILE = 4
+GATHER_ROW_TILE = WIN // GATHER_SPLIT_TILE
+GATHER_RUN_TILE = 16
 H_TILE = 16
-# qk_pv cube-batch tile (M for the QK/PV matmuls). Batching QK_M_TILE head rows
-# per matmul extracts the shared KV tile L1->L0 once per QK_M_TILE/H_TILE
-# head-tiles (2x reuse at 32) instead of per H_TILE head-tile, then slices the
-# [QK_M_TILE, ...] result back into H_TILE-row stores so the sparse_blk_* layout
-# and merge_norm stay unchanged. 32 keeps the [32,128] softmax inside the 192KB
-# Vec budget without a cross-core split. 64 is infeasible without further work
-# (its [64,128] softmax and co-resident QK+PV L0C accumulators overflow Vec/L0C).
 QK_M_TILE = 32
 ATTN_K_TILE = 128
 ROPE_TILE = 16
 ROPE_INTERLEAVE_TILE = 2 * ROPE_TILE
-# proj_a cube K-frag. 256 (not 128) keeps the B-cache-line floor: B is K-contiguous
-# under b_trans, so K*2B(bf16) = 512B == the a2a3 L2 line (K=128 was 256B, half a
-# line -> wasted MTE2 DMA). At 256 the cube's L0A/L0B operand staging hits 100%
-# (the wall); 512 would spill it for no gain (swept: K=512 net-negative).
 A_K_TILE = 256
-# proj_a is a pure-cube matmul scope (proj_a_mm) writing the fp32 GM intermediate
-# o_r (cf. expert_routed w2 decouple), consumed directly by the fused amax+quant
-# scope below; the decouple frees the cube N-frag from any vector-side UB constraint.
-PROJ_A_MM_N_TILE = 128   # cube N frag; Mat/L0C have room but L0A/L0B are the wall at
-                         # K=256, and a wider N raised cube exec without a TTT win (swept).
+PROJ_A_MM_N_TILE = 128
 MM_T_TILE = 16
 T_PAD = ((T + MM_T_TILE - 1) // MM_T_TILE) * MM_T_TILE
-B_K_TILE = 256  # proj_b_mm cube K frag; the GEMM is not the proj_b bottleneck (see below),
-                # and a device sweep found growing it (512/1024) only re-streamed more weight
-                # for no TTT gain, so it stays at the cache-line-safe 256 (256 B per INT8 row).
-# proj_b is decoupled into a pure-cube GEMM scope (proj_b_mm) and a pure-vector dequant
-# scope (proj_b_act) meeting through grouped INT32 partials in GM, so each sizes its
-# own N-fragment to its own wall (cf. the expert_routed w2 decouple). A device tile sweep
-# showed the cube is NOT the bottleneck (proj_b_mm ~32us, ~78% Exec, with L0C/L1 headroom)
-# while the vector dequant dominated: growing PROJ_B_ACT_N_TILE 128->1024 cut the per-N-block
-# vector-setup count 4x and dropped standalone TTT ~835->~730us. The vector frag goes to
-# the UB wall; the cube frag sizes to its own L0C wall (below).
-PROJ_B_MM_N_TILE = 256    # cube N frag. A later device-bias-controlled sweep (paired
-                          # within-device, post vector-retune) found 128->256 worth ~1.5-2%
-                          # (fewer matmul setups: per-D-chunk inner N-frags 8->4; proj_b_mm
-                          # exec ~33->31us). Acc = M*N*4 = 128*256*4 = 128KB rides the L0C
-                          # wall exactly (fits a2a3); Mat ~192KB has room. proj_a N stayed
-                          # 128: growing it was TTT-neutral (64->32 task drop offset by 2x
-                          # per-task cube exec). B_K_TILE stayed 256: the K=512 cache-line
-                          # fix was ambiguous (raised proj_b dispatch-prop for no clear gain).
-PROJ_B_ACT_N_TILE = 512   # vector N frag for the decoupled per-group dequant+sum (proj_b_act
-                          # now sums O_GROUPS INT32 partials, each x its group act scale, then
-                          # x the per-channel weight scale -> BF16). 512 keeps the O_GROUPS-way
-                          # accumulate inside UB and avoids the extra dispatch wave seen at 256.
-# Fused amax+quant token tile. The fused scope streams o_r twice (amax pass + quant
-# pass) per token-tile rather than holding the whole row, so UB stays small; 8 keeps
-# the [1, QUANT_TOKEN_TILE] fp32 amax tile 32-byte aligned (8*4=32B, the alloc-tile
-# row floor that a [QUANT_TOKEN_TILE, 1] column accumulator would violate). The
-# full-row hold (read o_r once) needs QUANT_TOKEN_TILE<=4 for UB but >=8 for that
-# alignment -- mutually exclusive -- so we stream; the 2nd pass mostly hits L2.
+B_K_TILE = 256
+PROJ_B_MM_N_TILE = 256
+PROJ_B_ACT_N_TILE = 512
 QUANT_TOKEN_TILE = 8
-# Per-group back-to-back o_proj (manual-scope, qwen3-style fine-grained deps):
-# proj_a[g] -> quant[g] (PER-GROUP amax, no global barrier) -> proj_b[g] pipeline.
-# Each proj_b group writes a disjoint INT32 partial; the final vector task combines
-# all group partials with their row scales, then applies the channel weight scale.
-PA_NFRAGS = O_LORA // PROJ_A_MM_N_TILE   # proj_a cube N-frags per group
-# proj_b is one task per (D-chunk, group): the D-chunk's N-frags loop INSIDE the task,
-# so the per-group split does not multiply the task count by N-frags. A 512-column
-# chunk produces 8 * (4096 / 512) = 64 balanced cube blocks.
-PROJ_B_D_CHUNK = 512
-PB_DCHUNKS = D // PROJ_B_D_CHUNK
-# proj_b_act uses one block per 512-column output region, eight blocks in total.
-PROJ_B_ACT_T_TILE = 8    # inner token tile for the proj_b_act O_GROUPS-way INT32->FP32 accumulate
-PROJ_B_ACT_TBLK = 8      # proj_b_act token block per task
-PB_ACT_NREG = D // PROJ_B_ACT_N_TILE
-PB_ACT_TBLKS = T // PROJ_B_ACT_TBLK
-NEG_INF = -1.0e20
-
-assert T % 2 == 0
-assert WIN % GATHER_SPLITS == 0
-assert GATHER_ROWS_PER_TASK % GATHER_RUN == 0, "bulk-copy runs must tile the gather task"
-assert BLOCK_SIZE % GATHER_RUN == 0, "a contiguous run must not straddle two paged blocks by construction"
-assert H % 4 == 0
-assert QK_M_TILE % H_TILE == 0
-assert H % QK_M_TILE == 0
-assert T % QUANT_TOKEN_TILE == 0
+O_GROUP_TILE = 2
+assert H % H_TILE == 0
 assert H % O_GROUPS == 0
-assert (O_GROUPS * O_LORA) % B_K_TILE == 0
-assert D % PROJ_B_MM_N_TILE == 0, "proj_b_mm cube N-loop must cover D"
-assert D % PROJ_B_D_CHUNK == 0, "proj_b D-chunk loop must cover D"
-assert PROJ_B_D_CHUNK % PROJ_B_MM_N_TILE == 0, "proj_b inner N-frag loop must cover the D-chunk"
-assert T % PROJ_B_ACT_TBLK == 0 and PROJ_B_ACT_TBLK % PROJ_B_ACT_T_TILE == 0
-assert D % PROJ_B_ACT_N_TILE == 0, "proj_b_act vector N-loop must cover D"
-assert O_LORA % B_K_TILE == 0, "proj_b group K-loop covers O_LORA in B_K_TILE iters"
-
-
-# SWA sparse-K width: sliding window only.
-TOPK = WIN
-# Decode SWA consumes metadata-expanded physical KV-cache slots. The current
-# kernel shape keeps the SWA window in one attention K tile.
+assert O_GROUPS % O_GROUP_TILE == 0
+assert H // H_TILE == O_GROUPS // O_GROUP_TILE
+assert H_TILE % HEADS_PER_GROUP == 0
+PA_NF_TILE = 2
+PROJ_B_D_TILE = 512 if M.name == "flash" else 1792
+PROJ_B_ACT_T_TILE = 8
+PROJ_B_ACT_TASK_T_TILE = 8
 SPARSE_BLOCKS = 1
 PADDED_TOPK = SPARSE_BLOCKS * ATTN_K_TILE
-assert TOPK == WIN, f"SWA decode expects TOPK ({TOPK}) == WIN ({WIN})"
-assert WIN == ATTN_K_TILE, f"SWA decode expects WIN ({WIN}) == ATTN_K_TILE ({ATTN_K_TILE})"
+assert WIN == ATTN_K_TILE
 
 
 @pl.jit.inline
@@ -166,54 +91,36 @@ def sparse_attn_swa(
     attn_out: pl.Tensor[[T, D], pl.BF16],
 ):
     """Standalone sparse attention with a BF16 projected output."""
-    partials = pl.create_tensor([T_PAD, O_GROUPS * D], dtype=pl.INT32)
-    act_scale_dq = pl.create_tensor([O_GROUPS, T], dtype=pl.FP32)
-    proj_b_tids = pl.array.create(O_GROUPS, pl.TASK_ID)
-    # SWA metadata already lowered each logical window row to a physical cache
-    # slot. Current decode tokens must be inserted into ori_kv by the caller
-    # before this function runs; there is no MTP overlay path here.
-
     swa_kv_flat = pl.create_tensor([T * WIN, HEAD_DIM], dtype=pl.BF16)
     gather_tids = pl.array.create(1, pl.TASK_ID)
-    with pl.spmd(T * GATHER_SPLITS, name_hint="swa_gather_kv") as gather_tid:
+    with pl.spmd(T * GATHER_SPLIT_TILE, name_hint="swa_gather_kv") as gather_tid:
         g_task = pl.tile.get_block_idx()
-        g_t = g_task // GATHER_SPLITS
-        g_split = g_task - g_t * GATHER_SPLITS
-        g_r0 = g_split * GATHER_ROWS_PER_TASK
+        g_t = g_task // GATHER_SPLIT_TILE
+        g_split = g_task - g_t * GATHER_SPLIT_TILE
+        g_r0 = g_split * GATHER_ROW_TILE
         g_base = g_t * WIN
-        # Probe each sub-tile's first/last slot: endpoints GATHER_RUN-1 apart mean
-        # the whole run sits in one paged block and moves as one bulk copy.
-        for g_sub in pl.range(GATHER_ROWS_PER_TASK // GATHER_RUN):
-            g_sr0 = g_r0 + g_sub * GATHER_RUN
+        for g_sub in pl.range(GATHER_ROW_TILE // GATHER_RUN_TILE):
+            g_sr0 = g_r0 + g_sub * GATHER_RUN_TILE
             g_sdst = g_base + g_sr0
             g_first = pl.read(swa_indices, [g_t, g_sr0])
-            g_last = pl.read(swa_indices, [g_t, g_sr0 + GATHER_RUN - 1])
-            # A -1 slot anywhere in the run pins g_run_ok below the match value,
-            # so an invalid or block-straddling run takes the per-row path.
-            g_run_ok = (g_last - g_first) + pl.min(g_first, 0) * GATHER_RUN
-            if g_run_ok == GATHER_RUN - 1:
+            g_last = pl.read(swa_indices, [g_t, g_sr0 + GATHER_RUN_TILE - 1])
+            g_run_ok = (g_last - g_first) + pl.min(g_first, 0) * GATHER_RUN_TILE
+            if g_run_ok == GATHER_RUN_TILE - 1:
                 g_run_src = pl.cast(g_first, pl.INDEX)
-                swa_kv_flat[g_sdst : g_sdst + GATHER_RUN, 0 : HEAD_DIM] = ori_kv_flat[
-                    g_run_src : g_run_src + GATHER_RUN, 0 : HEAD_DIM
-                ]
+                g_run_tile = ori_kv_flat[g_run_src : g_run_src + GATHER_RUN_TILE, 0 : HEAD_DIM]
+                swa_kv_flat[g_sdst : g_sdst + GATHER_RUN_TILE, 0 : HEAD_DIM] = g_run_tile
             else:
-                for g_dr in pl.range(GATHER_RUN):
+                for g_dr in pl.range(GATHER_RUN_TILE):
                     g_dst = g_sdst + g_dr
                     g_slot_i32 = pl.read(swa_indices, [g_t, g_sr0 + g_dr])
                     if g_slot_i32 >= 0:
                         g_slot = pl.cast(g_slot_i32, pl.INDEX)
                         swa_kv_flat[g_dst : g_dst + 1, 0 : HEAD_DIM] = ori_kv_flat[g_slot : g_slot + 1, 0 : HEAD_DIM]
                     else:
-                        swa_kv_flat[g_dst : g_dst + 1, 0 : HEAD_DIM] = pl.full(
-                            [1, HEAD_DIM], dtype=pl.BF16, value=0.0)
+                        swa_kv_flat[g_dst : g_dst + 1, 0 : HEAD_DIM] = pl.full([1, HEAD_DIM], dtype=pl.BF16, value=0.0)
     gather_tids[0] = gather_tid
 
-    # qk_pv writes per-tile (mi, li, oi) to GM; merge_norm reads them back. Not
-    # fused on a2a3: the PV output (Acc) -> online rescale (Vec) needs an
-    # unsupported tmov, and a [H_TILE, HEAD_DIM] carry overflows the Vec buffer.
     q_flat = pl.reshape(q, [T * H, HEAD_DIM])
-    o_packed_heads = pl.create_tensor([O_GROUPS * T * HEADS_PER_GROUP, HEAD_DIM], dtype=pl.BF16)
-    o_packed = pl.reshape(o_packed_heads, [O_GROUPS * T, O_GROUP_IN])
     sparse_blk_mi = pl.create_tensor([T * (H // H_TILE) * SPARSE_BLOCKS * H_TILE, 1], dtype=pl.FP32)
     sparse_blk_li = pl.create_tensor([T * (H // H_TILE) * SPARSE_BLOCKS * H_TILE, 1], dtype=pl.FP32)
     sparse_blk_oi = pl.create_tensor([T * (H // H_TILE) * SPARSE_BLOCKS * H_TILE, HEAD_DIM], dtype=pl.FP32)
@@ -227,8 +134,6 @@ def sparse_attn_swa(
             qk_base = qk_t * WIN + qk_s0
             qk_kv = swa_kv_flat[qk_base : qk_base + ATTN_K_TILE, 0 : HEAD_DIM]
 
-            # Keep both 32-head batches in one token task so they reuse the KV
-            # tile already resident in L1 instead of loading it once per block.
             for qk_hb in pl.pipeline(H // QK_M_TILE, stage=2):
                 qk_h0 = qk_hb * QK_M_TILE
                 qk_head_row = qk_t * H + qk_h0
@@ -237,9 +142,8 @@ def sparse_attn_swa(
                 qk_scaled = pl.mul(qk_raw, SOFTMAX_SCALE)
                 qk_scores = pl.col_expand_add(qk_scaled, qk_bias_row)
                 qk_mi = pl.row_max(qk_scores)
-                # Invalid lanes (NEG_INF bias, zero kv rows) exp to ~0; all-invalid
-                # blocks die in the merge alpha/beta -- no mask multiply needed.
-                qk_exp = pl.exp(pl.row_expand_sub(qk_scores, qk_mi))
+                qk_centered = pl.row_expand_sub(qk_scores, qk_mi)
+                qk_exp = pl.exp(qk_centered)
                 qk_li = pl.row_sum(qk_exp)
                 qk_exp_bf16 = pl.cast(qk_exp, target_type=pl.BF16, mode="rint")
                 qk_oi = pl.matmul(qk_exp_bf16, qk_kv, out_dtype=pl.FP32)
@@ -252,10 +156,6 @@ def sparse_attn_swa(
                     sparse_blk_li[qk_row : qk_row + H_TILE, 0 : 1] = qk_li[qk_r0 : qk_r0 + H_TILE, 0 : 1]
                     sparse_blk_oi[qk_row : qk_row + H_TILE, 0 : HEAD_DIM] = qk_oi[qk_r0 : qk_r0 + H_TILE, 0 : HEAD_DIM]
 
-    # Materialize the head-invariant interleaved cos and signed-sin rows once.
-    # This runs alongside qk_pv and keeps the exact indexed RoPE arithmetic used
-    # by the reference path while the group merge below changes only scheduling
-    # and store granularity.
     rope_cos_il = pl.create_tensor([T, ROPE_DIM], dtype=pl.FP32)
     rope_sin_signed = pl.create_tensor([T, ROPE_DIM], dtype=pl.FP32)
     rope_swap_idx = pl.create_tensor([H_TILE, ROPE_DIM], dtype=pl.INT32)
@@ -267,7 +167,8 @@ def sparse_attn_swa(
         swap_half = pl.mul(swap_col, 0.5)
         swap_dup_i32 = pl.cast(swap_half, target_type=pl.INT32, mode="trunc")
         swap_dup_f = pl.cast(swap_dup_i32, target_type=pl.FP32)
-        swap_lane = pl.sub(swap_col, pl.mul(swap_dup_f, 2.0))
+        swap_dup2 = pl.mul(swap_dup_f, 2.0)
+        swap_lane = pl.sub(swap_col, swap_dup2)
         swap_next = pl.add(swap_col, 1.0)
         swap_stride = pl.mul(swap_lane, 2.0)
         swap_idx_f = pl.sub(swap_next, swap_stride)
@@ -281,8 +182,10 @@ def sparse_attn_swa(
         cs_dup_i32 = pl.cast(cs_half, target_type=pl.INT32, mode="trunc")
         cs_dup_f = pl.cast(cs_dup_i32, target_type=pl.FP32)
         cs_dup_idx = pl.cast(cs_dup_f, target_type=pl.INT32)
-        cs_lane = pl.sub(cs_col, pl.mul(cs_dup_f, 2.0))
-        cs_sign_base = pl.sub(pl.mul(cs_lane, 2.0), 1.0)
+        cs_dup2 = pl.mul(cs_dup_f, 2.0)
+        cs_lane = pl.sub(cs_col, cs_dup2)
+        cs_lane2 = pl.mul(cs_lane, 2.0)
+        cs_sign_base = pl.sub(cs_lane2, 1.0)
         cs_sign = pl.neg(cs_sign_base)
         for cp in pl.range(HALF_ROPE // ROPE_TILE):
             cp_r0 = cp * ROPE_TILE
@@ -295,101 +198,93 @@ def sparse_attn_swa(
             rope_cos_il[0:T, cp_c0 : cp_c0 + ROPE_INTERLEAVE_TILE] = cs_cos_dup
             rope_sin_signed[0:T, cp_c0 : cp_c0 + ROPE_INTERLEAVE_TILE] = cs_sin_signed
 
-    # Flatten the one-block SWA merge over token/head tiles into a single
-    # 32-block grid, which fits in one AIV wave and avoids eight group-grid
-    # submissions. Each block writes two output-projection groups using the
-    # same contiguous per-group stores.
-    with pl.spmd(T * (H // H_TILE), name_hint="merge_norm", deps=[qk_tid, rope_tid],
-                 allow_early_resolve=True) as merge_tid:
-        m_idx = pl.tile.get_block_idx()
-        m_t = m_idx // (H // H_TILE)
-        m_h_idx = m_idx - m_t * (H // H_TILE)
-        m_h0 = m_h_idx * H_TILE
-        m_blk_base = m_t * H + m_h0
-        m_mi = sparse_blk_mi[m_blk_base : m_blk_base + H_TILE, 0:1]
-        m_li = sparse_blk_li[m_blk_base : m_blk_base + H_TILE, 0:1]
-        m_oi = sparse_blk_oi[m_blk_base : m_blk_base + H_TILE, 0:HEAD_DIM]
+    o_packed_heads = pl.create_tensor([O_GROUPS * T * HEADS_PER_GROUP, HEAD_DIM], dtype=pl.BF16)
+    merge_tids = pl.array.create(O_GROUPS // O_GROUP_TILE, pl.TASK_ID)
 
-        n_sink = pl.reshape(attn_sink[m_h0 : m_h0 + H_TILE], [H_TILE, 1])
-        n_sink_delta = pl.sub(n_sink, m_mi)
-        n_sink_exp = pl.exp(n_sink_delta)
-        n_denom = pl.add(m_li, n_sink_exp)
-        n_normalized = pl.row_expand_div(m_oi, n_denom)
-        n_full = n_normalized[0:H_TILE, 0:HEAD_DIM]
-        n_bf16 = pl.cast(n_full, target_type=pl.BF16, mode="rint")
+    for merge_group in pl.parallel(O_GROUPS // O_GROUP_TILE):
+        with pl.spmd(T, name_hint="merge_norm", deps=[qk_tid, rope_tid], allow_early_resolve=True) as merge_tid:
+            m_t = pl.tile.get_block_idx()
+            m_h_idx = merge_group
+            m_h0 = m_h_idx * H_TILE
+            m_blk_base = m_t * H + m_h0
+            m_mi = sparse_blk_mi[m_blk_base : m_blk_base + H_TILE, 0:1]
+            m_li = sparse_blk_li[m_blk_base : m_blk_base + H_TILE, 0:1]
+            m_oi = sparse_blk_oi[m_blk_base : m_blk_base + H_TILE, 0:HEAD_DIM]
 
-        m_rope = n_full[:, NOPE_DIM:HEAD_DIM]
-        m_swapped = pl.gather(m_rope, dim=-1, index=rope_swap_idx[:, :])
-        m_cos_il = rope_cos_il[m_t : m_t + 1, 0:ROPE_DIM]
-        m_sin_signed = rope_sin_signed[m_t : m_t + 1, 0:ROPE_DIM]
-        m_rope_cos = pl.col_expand_mul(m_rope, m_cos_il)
-        m_swap_sin = pl.col_expand_mul(m_swapped, m_sin_signed)
-        m_rot = pl.add(m_rope_cos, m_swap_sin)
-        n_rope_bf16 = pl.cast(m_rot, target_type=pl.BF16, mode="rint")
+            n_sink = pl.reshape(attn_sink[m_h0 : m_h0 + H_TILE], [H_TILE, 1])
+            n_sink_delta = pl.sub(n_sink, m_mi)
+            n_sink_exp = pl.exp(n_sink_delta)
+            n_denom = pl.add(m_li, n_sink_exp)
+            n_normalized = pl.row_expand_div(m_oi, n_denom)
+            n_full = n_normalized[0:H_TILE, 0:HEAD_DIM]
+            n_bf16 = pl.cast(n_full, target_type=pl.BF16, mode="rint")
 
-        m_g0 = m_h0 // HEADS_PER_GROUP
-        for m_sg in pl.unroll(H_TILE // HEADS_PER_GROUP):
-            m_src_h0 = m_sg * HEADS_PER_GROUP
-            n_pack_row = (m_g0 + m_sg) * T + m_t
-            n_dst_head = n_pack_row * HEADS_PER_GROUP
-            o_packed_heads[n_dst_head : n_dst_head + HEADS_PER_GROUP, 0:NOPE_DIM] = n_bf16[
-                m_src_h0 : m_src_h0 + HEADS_PER_GROUP, 0:NOPE_DIM
-            ]
-            o_packed_heads[n_dst_head : n_dst_head + HEADS_PER_GROUP, NOPE_DIM:HEAD_DIM] = n_rope_bf16[
-                m_src_h0 : m_src_h0 + HEADS_PER_GROUP, 0:ROPE_DIM
-            ]
+            m_rope = n_full[:, NOPE_DIM:HEAD_DIM]
+            m_swapped = pl.gather(m_rope, dim=-1, index=rope_swap_idx[:, :])
+            m_cos_il = rope_cos_il[m_t : m_t + 1, 0:ROPE_DIM]
+            m_sin_signed = rope_sin_signed[m_t : m_t + 1, 0:ROPE_DIM]
+            m_rope_cos = pl.col_expand_mul(m_rope, m_cos_il)
+            m_swap_sin = pl.col_expand_mul(m_swapped, m_sin_signed)
+            m_rot = pl.add(m_rope_cos, m_swap_sin)
+            n_rope_bf16 = pl.cast(m_rot, target_type=pl.BF16, mode="rint")
 
-    # ========================================================================
-    # Back-to-back grouped output projection (manual scope, PER-GROUP INT8 quant).
-    #
-    # Per-GROUP amax localizes the quant reduction to each O_LORA group (vs the
-    # per-ROW-amax form, where a full-8192-row reduction is a hard barrier between
-    # proj_a and proj_b), so the three stages PIPELINE per group with qwen3-style
-    # fine-grained deps: proj_b[*, g] waits only on quant[g], which waits only on
-    # proj_a[g, *] -- so proj_b's cube for group g runs while proj_a/quant of later
-    # groups are still in flight (a genuine proj_a<->proj_b back-to-back GEMM).
-    #
-    # manual_scope SUPPRESSES auto-dep, so every edge is explicit: proj_a[g]
-    # reads only its o_packed slab -> deps=[merge_tid]; quant[g] deps on group
-    # g's proj_a task; proj_b depends directly on quant[g] and writes a disjoint
-    # group partial. proj_b_act combines those partials with their group row scales,
-    # applies the per-channel weight scale, and is the consolidated attn_out writer.
-    # ========================================================================
+            m_g0 = m_h0 // HEADS_PER_GROUP
+            for m_sg in pl.unroll(H_TILE // HEADS_PER_GROUP):
+                m_src_h0 = m_sg * HEADS_PER_GROUP
+                n_pack_row = (m_g0 + m_sg) * T + m_t
+                n_dst_head = n_pack_row * HEADS_PER_GROUP
+                n_nope_group = n_bf16[m_src_h0 : m_src_h0 + HEADS_PER_GROUP, 0:NOPE_DIM]
+                o_packed_heads[n_dst_head : n_dst_head + HEADS_PER_GROUP, 0:NOPE_DIM] = n_nope_group
+                n_rope_group = n_rope_bf16[m_src_h0 : m_src_h0 + HEADS_PER_GROUP, 0:ROPE_DIM]
+                o_packed_heads[n_dst_head : n_dst_head + HEADS_PER_GROUP, NOPE_DIM:HEAD_DIM] = n_rope_group
+        merge_tids[merge_group] = merge_tid
+
+    o_packed = pl.reshape(o_packed_heads, [O_GROUPS * T, O_GROUP_IN])
     o_r_pad = pl.create_tensor([T_PAD, O_GROUPS * O_LORA], dtype=pl.FP32)
     o_r_i8_pad = pl.create_tensor([T_PAD, O_GROUPS * O_LORA], dtype=pl.INT8)
-    # [G, T] keeps each group's per-row scale as one contiguous row;
-    # column reads would become unsupported strided GM->VecTile loads.
-    # Per-group INT32 partials: proj_b_mm (pure cube) writes group g's contribution to
-    # output channel n at partials[:, g*D + n]; proj_b_act (pure vector) sums the
-    # O_GROUPS partials with their per-group act scales. No atomic-add -> no zero-seed.
-    # Package each group's fragments into one grid. The group TaskId is the
-    # exact dependency granularity needed by quant/proj_b, while 80 individual
-    # orchestration submissions disappear from the critical projection tail.
+    partials = pl.create_tensor([T_PAD, O_GROUPS * D], dtype=pl.INT32)
+    act_scale_dq = pl.create_tensor([O_GROUPS, T], dtype=pl.FP32)
+    proj_b_tids = pl.array.create(O_GROUPS // O_GROUP_TILE, pl.TASK_ID)
     with pl.manual_scope():
-        for g in pl.parallel(O_GROUPS):
-            row_base_o = g * T
-            out_col_g = g * O_LORA
+        for group_bundle in pl.parallel(O_GROUPS // O_GROUP_TILE):
+            with pl.spmd(
+                O_GROUP_TILE * (O_LORA // PROJ_A_MM_N_TILE // PA_NF_TILE),
+                name_hint="proj_a_mm",
+                deps=[merge_tids[group_bundle]],
+                allow_early_resolve=True,
+            ) as pa_tid:
+                pa_idx = pl.tile.get_block_idx()
+                pa_local_group = pa_idx // (O_LORA // PROJ_A_MM_N_TILE // PA_NF_TILE)
+                pa_blk = pa_idx - pa_local_group * (O_LORA // PROJ_A_MM_N_TILE // PA_NF_TILE)
+                g = group_bundle * O_GROUP_TILE + pa_local_group
+                row_base_o = g * T
+                out_col_g = g * O_LORA
+                for anf in pl.range(PA_NF_TILE):
+                    n0 = pa_blk * (PA_NF_TILE * PROJ_A_MM_N_TILE) + anf * PROJ_A_MM_N_TILE
+                    xa0_chunk = pl.slice(o_packed, [MM_T_TILE, A_K_TILE], [row_base_o, 0], valid_shape=[T, A_K_TILE])
+                    wa0_chunk = wo_a[g : g + 1, n0 : n0 + PROJ_A_MM_N_TILE, 0:A_K_TILE]
+                    acc_a = pl.matmul(xa0_chunk, wa0_chunk, b_trans=True, out_dtype=pl.FP32)
+                    for kb in pl.pipeline(1, O_GROUP_IN // A_K_TILE, stage=2):
+                        k0 = kb * A_K_TILE
+                        xa_k_chunk = pl.slice(
+                            o_packed,
+                            [MM_T_TILE, A_K_TILE],
+                            [row_base_o, k0],
+                            valid_shape=[T, A_K_TILE],
+                        )
+                        wa_k_chunk = wo_a[g : g + 1, n0 : n0 + PROJ_A_MM_N_TILE, k0 : k0 + A_K_TILE]
+                        acc_a = pl.matmul_acc(acc_a, xa_k_chunk, wa_k_chunk, b_trans=True)
+                    o_r_pad = pl.assemble(o_r_pad, acc_a, [0, out_col_g + n0])
 
-            with pl.spmd(PA_NFRAGS, name_hint="proj_a_mm", deps=[merge_tid], allow_early_resolve=True) as pa_tid:
-                nf = pl.tile.get_block_idx()
-                n0 = nf * PROJ_A_MM_N_TILE
-                xa0_chunk = pl.slice(o_packed, [MM_T_TILE, A_K_TILE], [row_base_o, 0], valid_shape=[T, A_K_TILE])
-                wa0_chunk = wo_a[g : g + 1, n0 : n0 + PROJ_A_MM_N_TILE, 0:A_K_TILE]
-                acc_a = pl.matmul(xa0_chunk, wa0_chunk, b_trans=True, out_dtype=pl.FP32)
-                for kb in pl.pipeline(1, O_GROUP_IN // A_K_TILE, stage=2):
-                    k0 = kb * A_K_TILE
-                    xa_k_chunk = pl.slice(o_packed, [MM_T_TILE, A_K_TILE], [row_base_o, k0], valid_shape=[T, A_K_TILE])
-                    wa_k_chunk = wo_a[g : g + 1, n0 : n0 + PROJ_A_MM_N_TILE, k0 : k0 + A_K_TILE]
-                    acc_a = pl.matmul_acc(acc_a, xa_k_chunk, wa_k_chunk, b_trans=True)
-                o_r_pad = pl.assemble(o_r_pad, acc_a, [0, out_col_g + n0])
-
-            col_g = g * O_LORA
-            with pl.at(
-                level=pl.Level.CORE_GROUP,
+            with pl.spmd(
+                O_GROUP_TILE,
                 name_hint="quant",
                 deps=[pa_tid],
                 allow_early_resolve=True,
             ) as q_tid:
+                q_local_group = pl.tile.get_block_idx()
+                g = group_bundle * O_GROUP_TILE + q_local_group
+                col_g = g * O_LORA
                 for qt in pl.pipeline(0, T, QUANT_TOKEN_TILE, stage=2):
                     oc_amax = o_r_pad[qt : qt + QUANT_TOKEN_TILE, col_g : col_g + O_LORA]
                     g_abs = pl.abs(oc_amax)
@@ -399,24 +294,33 @@ def sparse_attn_swa(
                     g_amax = pl.maximum(g_amax_floor, g_row_max)
                     g_scale_num = pl.full([1, QUANT_TOKEN_TILE], dtype=pl.FP32, value=INT8_SCALE_MAX)
                     g_sq_row = pl.div(g_scale_num, g_amax)
-                    g_scale_dq = pl.mul(g_amax, 1.0 / INT8_SCALE_MAX)
-                    act_scale_dq = pl.assemble(act_scale_dq, g_scale_dq, [g, qt])
+                    g_scale_dq = pl.recip(g_sq_row)
+                    act_scale_dq[g : g + 1, qt : qt + QUANT_TOKEN_TILE] = g_scale_dq
                     g_sq_col = pl.reshape(g_sq_row, [QUANT_TOKEN_TILE, 1])
                     oc_q = o_r_pad[qt : qt + QUANT_TOKEN_TILE, col_g : col_g + O_LORA]
                     oq_scaled = pl.row_expand_mul(oc_q, g_sq_col)
                     oq_i32 = pl.cast(oq_scaled, target_type=pl.INT32, mode="rint")
                     oq_half = pl.cast(oq_i32, target_type=pl.FP16, mode="round")
                     oq_i8 = pl.cast(oq_half, target_type=pl.INT8, mode="trunc")
-                    o_r_i8_pad = pl.assemble(o_r_i8_pad, oq_i8, [qt, col_g])
+                    o_r_i8_pad[qt : qt + QUANT_TOKEN_TILE, col_g : col_g + O_LORA] = oq_i8
                     if T_PAD > T:
                         zero_half = pl.full([T_PAD - T, O_LORA], dtype=pl.FP16, value=0.0)
                         zero_i8 = pl.cast(zero_half, target_type=pl.INT8, mode="trunc")
-                        o_r_i8_pad = pl.assemble(o_r_i8_pad, zero_i8, [T, col_g])
+                        o_r_i8_pad[T:T_PAD, col_g : col_g + O_LORA] = zero_i8
 
-            with pl.spmd(PB_DCHUNKS, name_hint="proj_b_mm", deps=[q_tid], allow_early_resolve=True) as pb_tid:
-                dc = pl.tile.get_block_idx()
-                d0 = dc * PROJ_B_D_CHUNK
-                for nf in pl.range(PROJ_B_D_CHUNK // PROJ_B_MM_N_TILE):
+            with pl.spmd(
+                O_GROUP_TILE * (D // PROJ_B_D_TILE),
+                name_hint="proj_b_mm",
+                deps=[q_tid],
+                allow_early_resolve=True,
+            ) as pb_tid:
+                pb_idx = pl.tile.get_block_idx()
+                pb_local_group = pb_idx // (D // PROJ_B_D_TILE)
+                dc = pb_idx - pb_local_group * (D // PROJ_B_D_TILE)
+                g = group_bundle * O_GROUP_TILE + pb_local_group
+                col_g = g * O_LORA
+                d0 = dc * PROJ_B_D_TILE
+                for nf in pl.range(PROJ_B_D_TILE // PROJ_B_MM_N_TILE):
                     n0 = d0 + nf * PROJ_B_MM_N_TILE
                     acc_b = pl.create_tensor([MM_T_TILE, PROJ_B_MM_N_TILE], dtype=pl.INT32)
                     for kb in pl.pipeline(0, O_LORA // B_K_TILE, stage=2):
@@ -429,22 +333,24 @@ def sparse_attn_swa(
                             b_act = o_r_i8_pad[:, k0 : k0 + B_K_TILE]
                             b_weight = wo_b[n0 : n0 + PROJ_B_MM_N_TILE, k0 : k0 + B_K_TILE]
                             acc_b = pl.matmul_acc(acc_b, b_act, b_weight, b_trans=True)
-                    partials = pl.assemble(partials, acc_b, [0, g * D + n0])
-            proj_b_tids[g] = pb_tid
+                    partial_n0 = g * D + n0
+                    partials[0:MM_T_TILE, partial_n0 : partial_n0 + PROJ_B_MM_N_TILE] = acc_b
+            proj_b_tids[group_bundle] = pb_tid
 
-    # Consolidate the eight grouped INT32 partials in one vector epilogue. Keep
-    # the direct per-group task dependencies so there is no synthetic join task
-    # between the output-projection cubes and dequantization.
-    with pl.spmd(PB_ACT_NREG * PB_ACT_TBLKS, name_hint="proj_b_act",
-                 deps=[proj_b_tids[i] for i in range(O_GROUPS)], allow_early_resolve=True) as _act_tid:
+    with pl.spmd(
+        (D // PROJ_B_ACT_N_TILE) * (T // PROJ_B_ACT_TASK_T_TILE),
+        name_hint="proj_b_act",
+        deps=[proj_b_tids[i] for i in range(O_GROUPS // O_GROUP_TILE)],
+        allow_early_resolve=True,
+    ) as _act_tid:
         act_idx = pl.tile.get_block_idx()
-        nreg = act_idx // PB_ACT_TBLKS
-        tblk = act_idx - nreg * PB_ACT_TBLKS
+        nreg = act_idx // (T // PROJ_B_ACT_TASK_T_TILE)
+        tblk = act_idx - nreg * (T // PROJ_B_ACT_TASK_T_TILE)
         ob_n0 = nreg * PROJ_B_ACT_N_TILE
-        t0 = tblk * PROJ_B_ACT_TBLK
+        t0 = tblk * PROJ_B_ACT_TASK_T_TILE
         wb_scale = wo_b_scale[ob_n0 : ob_n0 + PROJ_B_ACT_N_TILE]
-        wb_scale_chunk = pl.reshape(wb_scale, [1, PROJ_B_ACT_N_TILE])
-        for b_tb in pl.range(t0, t0 + PROJ_B_ACT_TBLK, PROJ_B_ACT_T_TILE):
+        wb_scale_tile = pl.reshape(wb_scale, [1, PROJ_B_ACT_N_TILE])
+        for b_tb in pl.range(t0, t0 + PROJ_B_ACT_TASK_T_TILE, PROJ_B_ACT_T_TILE):
             acc = pl.full([PROJ_B_ACT_T_TILE, PROJ_B_ACT_N_TILE], dtype=pl.FP32, value=0.0)
             for act_g in pl.pipeline(O_GROUPS, stage=2):
                 p_col0 = act_g * D + ob_n0
@@ -454,7 +360,7 @@ def sparse_attn_swa(
                 p_g_f32 = pl.cast(p_g, target_type=pl.FP32, mode="none")
                 p_g_scaled = pl.row_expand_mul(p_g_f32, g_scale)
                 acc = pl.add(acc, p_g_scaled)
-            out_t = pl.col_expand_mul(acc, wb_scale_chunk)
+            out_t = pl.col_expand_mul(acc, wb_scale_tile)
             out_bf16 = pl.cast(out_t, target_type=pl.BF16, mode="rint")
             attn_out[b_tb : b_tb + PROJ_B_ACT_T_TILE, ob_n0 : ob_n0 + PROJ_B_ACT_N_TILE] = out_bf16
     return attn_out
@@ -474,28 +380,30 @@ def sparse_attn_test(
     wo_b_scale: pl.Tensor[[D], pl.FP32],
     attn_out: pl.Out[pl.Tensor[[T, D], pl.BF16]],
 ):
-    ori_kv_flat = pl.reshape(ori_kv, [ORI_BLOCK_NUM * BLOCK_SIZE, HEAD_DIM])
     sparse_bias = pl.create_tensor([T, PADDED_TOPK], dtype=pl.FP32)
     with pl.at(level=pl.Level.CORE_GROUP, name_hint="swa_valid_bias"):
-        v_col = pl.cast(pl.arange(0, [1, ATTN_K_TILE], dtype=pl.INT32), target_type=pl.FP32)
-        v_col_m = pl.col_expand(pl.full([T, ATTN_K_TILE], dtype=pl.FP32, value=0.0), v_col)
-        v_lens = pl.cast(pl.reshape(swa_lens[0:T], [T, 1]), target_type=pl.FP32)
-        v_valid = pl.minimum(
-            pl.maximum(pl.neg(pl.row_expand_sub(v_col_m, v_lens)), 0.0),
-            1.0,
-        )
-        sparse_bias[0:T, 0:ATTN_K_TILE] = pl.mul(pl.sub(v_valid, 1.0), -NEG_INF)
+        v_col_i32 = pl.arange(0, [1, ATTN_K_TILE], dtype=pl.INT32)
+        v_col = pl.cast(v_col_i32, target_type=pl.FP32)
+        v_col_base = pl.full([T, ATTN_K_TILE], dtype=pl.FP32, value=0.0)
+        v_col_m = pl.col_expand(v_col_base, v_col)
+        v_lens_row = pl.reshape(swa_lens[0:T], [T, 1])
+        v_lens = pl.cast(v_lens_row, target_type=pl.FP32)
+        v_delta = pl.row_expand_sub(v_col_m, v_lens)
+        v_inside = pl.neg(v_delta)
+        v_floor = pl.maximum(v_inside, 0.0)
+        v_len_valid = pl.minimum(v_floor, 1.0)
+        v_idx_f = pl.cast(swa_indices[0:T, 0:ATTN_K_TILE], target_type=pl.FP32)
+        v_idx_one = pl.add(v_idx_f, 1.0)
+        v_idx_floor = pl.maximum(v_idx_one, 0.0)
+        v_idx_valid = pl.minimum(v_idx_floor, 1.0)
+        v_valid = pl.mul(v_len_valid, v_idx_valid)
+        v_mask = pl.sub(v_valid, 1.0)
+        sparse_bias[0:T, 0:ATTN_K_TILE] = pl.mul(v_mask, -NEG_INF)
+    ori_kv_flat = pl.reshape(ori_kv, [ORI_BLOCK_NUM * BLOCK_SIZE, HEAD_DIM])
     sparse_attn_swa(
-        q,
-        ori_kv_flat,
-        swa_indices,
-        sparse_bias,
-        attn_sink,
-        freqs_cos,
-        freqs_sin,
-        wo_a,
-        wo_b,
-        wo_b_scale,
+        q, ori_kv_flat, swa_indices, sparse_bias,
+        attn_sink, freqs_cos, freqs_sin,
+        wo_a, wo_b, wo_b_scale,
         attn_out,
     )
     return attn_out
@@ -543,9 +451,6 @@ def golden_sparse_attn(tensors):
 
     o = torch.zeros(T, H, HEAD_DIM)
 
-    # Per-query-token attention. swa_indices is the authoritative physical
-    # cache-row list; invalid tail columns are -1 and swa_lens gives the valid
-    # prefix length.
     for t in range(T):
         valid_len = int(swa_lens[t].item())
         valid_slots = [int(v) for v in swa_indices[t, :valid_len].tolist() if int(v) >= 0]
@@ -561,15 +466,11 @@ def golden_sparse_attn(tensors):
             start = sb * ATTN_K_TILE
             end = min(start + ATTN_K_TILE, WIN)
             slots = swa_indices[t, start:end].tolist()
-            valid_tile = torch.tensor(
-                [start + i < valid_len and int(slot) >= 0 for i, slot in enumerate(slots)],
-                dtype=torch.bool,
-            )
+            valid_entries = [start + i < valid_len and int(slot) >= 0 for i, slot in enumerate(slots)]
+            valid_tile = torch.tensor(valid_entries, dtype=torch.bool)
             if end - start < ATTN_K_TILE:
-                valid_tile = torch.cat([
-                    valid_tile,
-                    torch.zeros(ATTN_K_TILE - (end - start), dtype=torch.bool),
-                ])
+                valid_pad = torch.zeros(ATTN_K_TILE - (end - start), dtype=torch.bool)
+                valid_tile = torch.cat([valid_tile, valid_pad])
             valid_tile = valid_tile.to(device=ori_kv.device)
             kv_tile = torch.zeros(ATTN_K_TILE, HEAD_DIM, dtype=ori_kv.dtype, device=ori_kv.device)
             for r, slot in enumerate(slots):
@@ -615,11 +516,7 @@ def golden_sparse_attn(tensors):
     seq_per_batch = T // B
     o_model = o.float().view(B, seq_per_batch, O_GROUPS, O_GROUP_IN)
     o_r = torch.einsum("bsgd,grd->bsgr", o_model, wo_a)
-    # PER-GROUP INT8 activation quant (one amax per O_LORA group, not per full row):
-    # this localizes the reduction so proj_a[g]->quant[g]->proj_b[g] can pipeline
-    # back-to-back. Each group's INT32 partial is dequantized by its OWN per-row
-    # activation scale before the groups are summed (the per-group scale cannot
-    # factor out of the K-sum), then the per-channel weight scale is applied.
+    # Quantize each output-projection group independently.
     o_r_g = o_r.reshape(T, O_GROUPS, O_LORA)
     amax_g = o_r_g.abs().amax(dim=-1, keepdim=True).clamp_min(INT8_AMAX_EPS)   # [T, G, 1]
     scale_q_g = INT8_SCALE_MAX / amax_g
@@ -637,11 +534,16 @@ def golden_sparse_attn(tensors):
 def build_tensor_specs(
     causal_regression_fixture: bool = False,
     short_window_fixture: bool = False,
+    unmapped_visible_page_fixture: bool = False,
 ):
     """Build deterministic demo tensors for the merged standalone harness."""
     import torch
     from decode_metadata import block_table
     from golden import TensorSpec
+
+    fixture_count = sum((causal_regression_fixture, short_window_fixture, unmapped_visible_page_fixture))
+    if fixture_count > 1:
+        raise ValueError("regression fixtures are mutually exclusive")
 
     def init_q():
         """Initialize the query tensor used by the decode attention stage."""
@@ -663,11 +565,7 @@ def build_tensor_specs(
 
     def init_ori_block_table():
         """Build the demo block table for the sliding-window cache pages."""
-        return block_table(
-            batch=B,
-            table_blocks=ORI_MAX_BLOCKS,
-            physical_blocks=ORI_BLOCK_NUM,
-        )
+        return block_table(batch=B, table_blocks=ORI_MAX_BLOCKS, physical_blocks=ORI_BLOCK_NUM)
 
     def init_swa_lens():
         lens = torch.full((T,), WIN, dtype=torch.int32)
@@ -677,15 +575,20 @@ def build_tensor_specs(
 
     def init_swa_indices():
         """Build physical cache-row indices for the standalone SWA fixture."""
-        tbl = init_ori_block_table()
+        tbl = init_ori_block_table().clone()
+        window_start = 0
+        if unmapped_visible_page_fixture:
+            tbl[:, 0] = -1
+            window_start = BLOCK_SIZE // 2
         indices = torch.full((T, WIN), -1, dtype=torch.int32)
         lens = init_swa_lens()
         for t in range(T):
             b = t // S
             valid_len = int(lens[t].item())
             for w in range(valid_len):
-                logical_blk = w // BLOCK_SIZE
-                intra = w % BLOCK_SIZE
+                pos = window_start + w
+                logical_blk = pos // BLOCK_SIZE
+                intra = pos % BLOCK_SIZE
                 blk = int(tbl[b, logical_blk].item())
                 if blk >= 0:
                     indices[t, w] = blk * BLOCK_SIZE + intra
@@ -738,18 +641,24 @@ if __name__ == "__main__":
     from golden import ratio_allclose, run_jit
 
     parser = argparse.ArgumentParser()
-    parser.add_argument("-p", "--platform", type=str, default="a2a3",
-                        choices=["a2a3", "a2a3sim", "a5", "a5sim"])
+    parser.add_argument("-p", "--platform", type=str, default="a2a3", choices=["a2a3", "a2a3sim", "a5", "a5sim"])
     parser.add_argument("-d", "--device", type=int, default=0)
-    parser.add_argument("--causal-regression-fixture", action="store_true", default=False,
-                        help="Amplify the S=2 future-window-slot regression.")
-    parser.add_argument("--short-window-fixture", action="store_true", default=False,
-                        help="Use a short-window topk row with valid prefix + -1 padding.")
+    causal_help = "Amplify the S=2 future-window-slot regression."
+    parser.add_argument("--causal-regression-fixture", action="store_true", default=False, help=causal_help)
+    short_help = "Use a short-window topk row with valid prefix + -1 padding."
+    parser.add_argument("--short-window-fixture", action="store_true", default=False, help=short_help)
+    unmapped_help = "Use a visible window whose older cache page is unmapped."
+    parser.add_argument(
+        "--unmapped-visible-page-fixture",
+        action="store_true",
+        default=False,
+        help=unmapped_help,
+    )
     parser.add_argument("--golden-data", type=str, default=None)
     parser.add_argument("--enable-chip-swimlane", type=int, nargs="?", const=1, default=0, choices=(0, 1, 2, 4))
-    parser.add_argument("--enable-dep-gen", action="store_true", default=False,
-                        help="Capture PTO2 dependency edges (deps.json); the swimlane "
-                             "converter draws fanout/fanin arrows from the sibling file.")
+    dep_help = "Capture PTO2 dependency edges (deps.json); the swimlane "
+    dep_help += "converter draws fanout/fanin arrows from the sibling file."
+    parser.add_argument("--enable-dep-gen", action="store_true", default=False, help=dep_help)
     parser.add_argument("--enable-pmu", nargs="?", const=2, default=0, type=int, choices=[0, 1, 2, 4])
     parser.add_argument("--dump-passes", action="store_true", default=False)
     args = parser.parse_args()
@@ -761,6 +670,7 @@ if __name__ == "__main__":
         specs=build_tensor_specs(
             args.causal_regression_fixture,
             args.short_window_fixture,
+            args.unmapped_visible_page_fixture,
         ),
         golden_fn=golden_sparse_attn,
         golden_data=args.golden_data,

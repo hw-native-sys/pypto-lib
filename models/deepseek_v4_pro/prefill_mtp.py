@@ -8,15 +8,7 @@
 # -----------------------------------------------------------------------------------------------------------
 # ci: devices=2
 # ci: no-sim
-"""DeepSeek-V4 MTP packed-prefill forward.
-
-This mirrors the official MTP block:
-``e_proj(enorm(hidden_states)).unsqueeze(2) + h_proj(hnorm(prev_hidden_states))``
-followed by one SWA block, MoE, MTP ``hc_head`` and MTP RMSNorm.  The input
-``prev_hidden_states`` and ``pre_hc_hidden_out`` keep the official pre-hc layout
-``[T, HC_MULT, D]``.  ``hidden_states`` is the shared embedding/current-token
-hidden input in token-major ``[T, D]`` layout.
-"""
+"""DeepSeek-V4 packed-prefill MTP projection, SWA, MoE, HC head, and RMSNorm."""
 
 import argparse
 
@@ -34,9 +26,8 @@ from hc_head import (
     EPS as HC_HEAD_RMS_EPS,
     HC_DIM_INV as HC_HEAD_DIM_INV,
     HC_EPS as HC_HEAD_EPS,
-    LINEAR_K_CHUNK as HC_HEAD_LINEAR_K_CHUNK,
-    RMS_K_CHUNK as HC_HEAD_RMS_K_CHUNK,
     hc_head,
+    hc_head_stats_golden,
 )
 from moe import (
     AUX_PAD,
@@ -76,6 +67,7 @@ from prefill_fwd import build_single_layer_tensor_specs
 from rmsnorm import golden_rms_norm, rms_norm
 
 
+# model config
 T = PREFILL_TOKENS
 MTP_LAYER_ID = M.num_hidden_layers
 MTP_MOE_EPOCH = 1
@@ -150,22 +142,7 @@ def mtp_prefill_fwd(
     my_rank: pl.Scalar[pl.INT32],
     num_tokens: pl.Scalar[pl.INT32],
 ) -> pl.Tensor[[T, D], pl.BF16]:
-    nt: pl.Scalar[pl.INT32] = num_tokens
-    swa_cos_profile: pl.Tensor[[1, MAX_SEQ_LEN, ROPE_HEAD_DIM], pl.BF16] = pl.slice(
-        freqs_cos, [1, MAX_SEQ_LEN, ROPE_HEAD_DIM], [0, 0, 0]
-    )
-    swa_sin_profile: pl.Tensor[[1, MAX_SEQ_LEN, ROPE_HEAD_DIM], pl.BF16] = pl.slice(
-        freqs_sin, [1, MAX_SEQ_LEN, ROPE_HEAD_DIM], [0, 0, 0]
-    )
-    swa_freqs_cos: pl.Tensor[[MAX_SEQ_LEN, ROPE_HEAD_DIM], pl.BF16] = pl.reshape(
-        swa_cos_profile, [MAX_SEQ_LEN, ROPE_HEAD_DIM]
-    )
-    swa_freqs_sin: pl.Tensor[[MAX_SEQ_LEN, ROPE_HEAD_DIM], pl.BF16] = pl.reshape(
-        swa_sin_profile, [MAX_SEQ_LEN, ROPE_HEAD_DIM]
-    )
     projected = pl.create_tensor([T, HC_MULT, D], dtype=pl.FP32)
-    x_attn = pl.create_tensor([T, HC_MULT, D], dtype=pl.FP32)
-
     mtp_projection(
         hidden_states, prev_hidden_states,
         enorm_w, hnorm_w,
@@ -174,17 +151,25 @@ def mtp_prefill_fwd(
         projected,
     )
 
+    nt: pl.Scalar[pl.INT32] = num_tokens
+    cos_profile: pl.Tensor[[1, MAX_SEQ_LEN, ROPE_HEAD_DIM], pl.BF16] = freqs_cos[0:1, 0:MAX_SEQ_LEN, 0:ROPE_HEAD_DIM]
+    sin_profile: pl.Tensor[[1, MAX_SEQ_LEN, ROPE_HEAD_DIM], pl.BF16] = freqs_sin[0:1, 0:MAX_SEQ_LEN, 0:ROPE_HEAD_DIM]
+    swa_cos: pl.Tensor[[MAX_SEQ_LEN, ROPE_HEAD_DIM], pl.BF16] = pl.reshape(cos_profile, [MAX_SEQ_LEN, ROPE_HEAD_DIM])
+    swa_sin: pl.Tensor[[MAX_SEQ_LEN, ROPE_HEAD_DIM], pl.BF16] = pl.reshape(sin_profile, [MAX_SEQ_LEN, ROPE_HEAD_DIM])
+    x_attn = pl.create_tensor([T, HC_MULT, D], dtype=pl.FP32)
     prefill_attention_swa(
         projected,
         hc_attn_fn, hc_attn_scale, hc_attn_base, attn_norm_w,
         wq_a, wq_b, wq_b_scale, wkv, gamma_cq, gamma_ckv,
-        swa_freqs_cos, swa_freqs_sin,
+        swa_cos, swa_sin,
         kv_cache, ori_block_table, ori_slot_mapping,
         position_ids,
         attn_sink, wo_a, wo_b, wo_b_scale,
         x_attn, nt,
     )
 
+    mtp_layer_id = pl.cast(MTP_LAYER_ID, pl.INT32)
+    mtp_moe_epoch = pl.cast(MTP_MOE_EPOCH, pl.INT32)
     moe(
         x_attn,
         hc_ffn_fn, hc_ffn_scale, hc_ffn_base,
@@ -196,44 +181,32 @@ def mtp_prefill_fwd(
         pre_hc_hidden_out,
         recv_meta, recv_x, recv_aux, recv_route, arrived, data_arrived,
         routed_y_buf, combine_arrived,
-        pl.cast(MTP_LAYER_ID, pl.INT32), nt, my_rank, pl.cast(MTP_MOE_EPOCH, pl.INT32),
+        mtp_layer_id, nt, my_rank, mtp_moe_epoch,
     )
 
-    # Retire this dispatch's persistent MoE signal credits.
+    # Reset persistent MoE signal credits.
     neg_epochs = pl.cast(0 - MTP_MOE_EPOCH, pl.INT32)
     neg_data = pl.cast(0 - MTP_MOE_EPOCH * N_LOCAL, pl.INT32)
     neg_combine = pl.cast(0 - MTP_MOE_EPOCH * (N_LOCAL + 1), pl.INT32)
     with pl.at(level=pl.Level.CORE_GROUP, name_hint="moe_signal_retire"):
         _pre_hc_anchor = pl.read(pre_hc_hidden_out, [0, 0, 0])
         pld.system.notify(
-            target=combine_arrived,
-            peer=my_rank,
-            offsets=[my_rank, 0],
-            value=neg_epochs,
-            op=pld.NotifyOp.AtomicAdd,
+            target=combine_arrived, peer=my_rank, offsets=[my_rank, 0],
+            value=neg_epochs, op=pld.NotifyOp.AtomicAdd,
         )
         for src in pl.range(N_RANKS):
             if src != my_rank:
                 pld.system.notify(
-                    target=arrived,
-                    peer=my_rank,
-                    offsets=[src, 0],
-                    value=neg_epochs,
-                    op=pld.NotifyOp.AtomicAdd,
+                    target=arrived, peer=my_rank, offsets=[src, 0],
+                    value=neg_epochs, op=pld.NotifyOp.AtomicAdd,
                 )
                 pld.system.notify(
-                    target=data_arrived,
-                    peer=my_rank,
-                    offsets=[src, 0],
-                    value=neg_data,
-                    op=pld.NotifyOp.AtomicAdd,
+                    target=data_arrived, peer=my_rank, offsets=[src, 0],
+                    value=neg_data, op=pld.NotifyOp.AtomicAdd,
                 )
                 pld.system.notify(
-                    target=combine_arrived,
-                    peer=my_rank,
-                    offsets=[src, 0],
-                    value=neg_combine,
-                    op=pld.NotifyOp.AtomicAdd,
+                    target=combine_arrived, peer=my_rank, offsets=[src, 0],
+                    value=neg_combine, op=pld.NotifyOp.AtomicAdd,
                 )
 
     x_head = pl.create_tensor([T, D], dtype=pl.BF16)
@@ -311,7 +284,8 @@ def l3_mtp_prefill_fwd(
     routed_y_buf_buf = pld.alloc_window_buffer([N_ROUTES, D], dtype=pl.BF16)
     combine_arrived_buf = pld.alloc_window_buffer([N_RANKS, 1], dtype=pl.INT32)
 
-    for r in pl.range(pld.world_size()):
+    world_size = pld.world_size()
+    for r in pl.range(world_size):
         recv_meta: pld.DistributedTensor[[N_RANKS, N_LOCAL], pl.INT32] = pld.window(recv_meta_buf, [N_RANKS, N_LOCAL], dtype=pl.INT32)
         recv_x: pld.DistributedTensor[[N_LOCAL * RECV_MAX, D], pl.INT8] = pld.window(recv_x_buf, [N_LOCAL * RECV_MAX, D], dtype=pl.INT8)
         recv_aux: pld.DistributedTensor[[N_LOCAL * RECV_MAX, AUX_PAD], pl.FP32] = pld.window(recv_aux_buf, [N_LOCAL * RECV_MAX, AUX_PAD], dtype=pl.FP32)
@@ -350,13 +324,7 @@ def l3_mtp_prefill_fwd(
 def _ranked(spec, torch, is_output=False):
     from golden import TensorSpec
 
-    return TensorSpec(
-        spec.name,
-        list(spec.shape),
-        spec.dtype,
-        init_value=spec.init_value,
-        is_output=is_output,
-    )
+    return TensorSpec(spec.name, list(spec.shape), spec.dtype, init_value=spec.init_value, is_output=is_output)
 
 
 def _projection_specs():
@@ -374,7 +342,9 @@ def _projection_specs():
             w_i8, scale = _quantize_weight_per_out(w)
             weights.append(w_i8)
             scales.append(scale.float())
-        return torch.stack(weights, dim=0).contiguous(), torch.stack(scales, dim=0).contiguous()
+        weight_stack = torch.stack(weights, dim=0).contiguous()
+        scale_stack = torch.stack(scales, dim=0).contiguous()
+        return weight_stack, scale_stack
 
     def init_e_proj_w():
         nonlocal e_proj_cache
@@ -399,7 +369,10 @@ def _projection_specs():
         return h_proj_cache[1]
 
     return [
-        TensorSpec("hidden_states", [N_RANKS, T, D], torch.bfloat16, init_value=lambda: torch.randn(N_RANKS, T, D).to(torch.bfloat16)),
+        TensorSpec(
+            "hidden_states", [N_RANKS, T, D], torch.bfloat16,
+            init_value=lambda: torch.randn(N_RANKS, T, D).to(torch.bfloat16),
+        ),
         TensorSpec("prev_hidden_states", [N_RANKS, T, HC_MULT, D], torch.float32,
                    init_value=lambda: torch.randn(N_RANKS, T, HC_MULT, D).to(torch.bfloat16)),
         TensorSpec("enorm_w", [N_RANKS, D], torch.float32, init_value=lambda: torch.ones(N_RANKS, D)),
@@ -418,13 +391,18 @@ def _mtp_head_specs():
     from golden import TensorSpec
 
     base = [5.9166, -3.6223, -2.9324, -3.3124]
+
+    def init_mtp_hc_head_base():
+        base_tensor = torch.tensor(base, dtype=torch.float32)
+        base_row = base_tensor.view(1, HC_MULT)
+        return base_row.expand(N_RANKS, -1).contiguous()
+
     return [
         TensorSpec("mtp_hc_head_fn", [N_RANKS, HC_MULT, HC_DIM], torch.float32,
                    init_value=lambda: torch.randn(N_RANKS, HC_MULT, HC_DIM) * 0.0519),
         TensorSpec("mtp_hc_head_scale", [N_RANKS, 1], torch.float32,
                    init_value=lambda: torch.full((N_RANKS, 1), 0.076099, dtype=torch.float32)),
-        TensorSpec("mtp_hc_head_base", [N_RANKS, HC_MULT], torch.float32,
-                   init_value=lambda: torch.tensor(base, dtype=torch.float32).view(1, HC_MULT).expand(N_RANKS, -1).contiguous()),
+        TensorSpec("mtp_hc_head_base", [N_RANKS, HC_MULT], torch.float32, init_value=init_mtp_hc_head_base),
         TensorSpec("mtp_norm_w", [N_RANKS, D], torch.bfloat16,
                    init_value=lambda: (torch.randn(N_RANKS, D) * 0.1 + 1.0).to(torch.bfloat16)),
     ]
@@ -441,7 +419,8 @@ def build_tensor_specs(start_pos=0, num_tokens=T):
     }
     projection = {spec.name: spec for spec in _projection_specs()}
     mtp_head = {spec.name: spec for spec in _mtp_head_specs()}
-    moe_specs = {spec.name: spec for spec in build_moe_tensor_specs(layer_id=MTP_LAYER_ID, num_tokens=num_tokens) if isinstance(spec, TensorSpec)}
+    moe_spec_list = build_moe_tensor_specs(layer_id=MTP_LAYER_ID, num_tokens=num_tokens)
+    moe_specs = {spec.name: spec for spec in moe_spec_list if isinstance(spec, TensorSpec)}
 
     ordered_names = [
         "hidden_states", "prev_hidden_states",
@@ -486,21 +465,9 @@ def _golden_hc_head_prefill(x_hc, hc_head_fn, hc_head_scale, hc_head_base):
     x_flat_2d = x_hc.reshape(token_count, HC_DIM).float()
     hc_head_fn = hc_head_fn.float()
 
-    sq_sum = torch.zeros(token_count, 1, dtype=torch.float32)
-    for k0 in range(0, HC_DIM, HC_HEAD_RMS_K_CHUNK):
-        x_chunk = x_flat_2d[:, k0:k0 + HC_HEAD_RMS_K_CHUNK]
-        sq_sum += (x_chunk * x_chunk).sum(dim=1, keepdim=True)
+    sq_sum, mixes_raw = hc_head_stats_golden(x_flat_2d, hc_head_fn)
     rsqrt = torch.rsqrt(sq_sum * HC_HEAD_DIM_INV + HC_HEAD_RMS_EPS)
-
-    mix_cols = []
-    for h in range(HC_MULT):
-        mix_col = torch.zeros(token_count, 1, dtype=torch.float32)
-        for k0 in range(0, HC_DIM, HC_HEAD_LINEAR_K_CHUNK):
-            x_chunk = x_flat_2d[:, k0:k0 + HC_HEAD_LINEAR_K_CHUNK]
-            w_chunk = hc_head_fn[h:h + 1, k0:k0 + HC_HEAD_LINEAR_K_CHUNK]
-            mix_col += (x_chunk * w_chunk).sum(dim=1, keepdim=True)
-        mix_cols.append(mix_col * rsqrt)
-    mixes = torch.cat(mix_cols, dim=1).reshape(token_count, HC_MULT)
+    mixes = mixes_raw * rsqrt
 
     pre = torch.sigmoid(mixes * hc_head_scale.float() + hc_head_base.float()) + HC_HEAD_EPS
     x_view = x_hc.float().view(shape)
@@ -517,7 +484,6 @@ def _golden_hc_head_prefill(x_hc, hc_head_fn, hc_head_scale, hc_head_base):
         for h in range(HC_MULT):
             y += x_view[:, h, :] * pre[:, h:h + 1]
 
-    # Match the kernel's mode="rint" cast (round to nearest, ties to even).
     return y.to(torch.bfloat16)
 
 
@@ -590,10 +556,14 @@ def golden_mtp_prefill_fwd(tensors):
 def main():
     parser = argparse.ArgumentParser(description="DeepSeek-V4 MTP packed-prefill forward driver.")
     parser.add_argument("-p", "--platform", type=str, default="a2a3", choices=["a2a3", "a5"])
-    parser.add_argument("--ep", type=int, default=N_RANKS, choices=[2, 4, 8],
-                        help="EP world size / rank count (parsed at import by moe).")
-    parser.add_argument("-d", "--device", type=str, default=",".join(str(i) for i in range(N_RANKS)),
-                        help=f"comma-separated device ids; need at least {N_RANKS}")
+    parser.add_argument(
+        "--ep", type=int, default=N_RANKS, choices=[2, 4, 8],
+        help="EP world size / rank count (parsed at import by moe).",
+    )
+    parser.add_argument(
+        "-d", "--device", type=str, default=",".join(str(i) for i in range(N_RANKS)),
+        help=f"comma-separated device ids; need at least {N_RANKS}",
+    )
     parser.add_argument("--start-pos", type=int, default=0)
     parser.add_argument("--num-tokens", type=int, default=T)
     parser.add_argument("--enable-chip-swimlane", type=int, nargs="?", const=1, default=0, choices=(0, 1, 2))
@@ -604,7 +574,8 @@ def main():
     args = parser.parse_args()
 
     device_ids = [int(d) for d in args.device.split(",")]
-    assert len(device_ids) >= N_RANKS, f"need at least {N_RANKS} devices, got {device_ids}"
+    if len(device_ids) < N_RANKS:
+        raise ValueError(f"need at least {N_RANKS} devices, got {device_ids}")
 
     result = run_jit(
         fn=l3_mtp_prefill_fwd,
@@ -625,10 +596,14 @@ def main():
         rtol=1e-3,
         atol=1e-3,
         compare_fn={
-            "hidden_out": ratio_reldiff(diff_thd=0.02, pct_thd=0.05,
-                                        valid_rows=args.num_tokens, valid_axis=1),
-            "pre_hc_hidden_out": ratio_reldiff(diff_thd=0.02, pct_thd=0.05,
-                                               valid_rows=args.num_tokens, valid_axis=1),
+            "hidden_out": ratio_reldiff(
+                diff_thd=0.02, pct_thd=0.05,
+                valid_rows=args.num_tokens, valid_axis=1,
+            ),
+            "pre_hc_hidden_out": ratio_reldiff(
+                diff_thd=0.02, pct_thd=0.05,
+                valid_rows=args.num_tokens, valid_axis=1,
+            ),
         },
     )
     if not result.passed:

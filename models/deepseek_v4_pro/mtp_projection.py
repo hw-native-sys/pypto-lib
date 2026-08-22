@@ -6,15 +6,7 @@
 # INCLUDING BUT NOT LIMITED TO NON-INFRINGEMENT, MERCHANTABILITY, OR FITNESS FOR A PARTICULAR PURPOSE.
 # See LICENSE in the root of the software repository for the full text of the License.
 # -----------------------------------------------------------------------------------------------------------
-# ruff: noqa: F401,F403,F405,F821
-"""DeepSeek-V4 MTP input projection scaffold.
-
-Mirrors the MTP-only prolog in the official implementation:
-``e_proj(enorm(hidden_states)) + h_proj(hnorm(prev_hidden_states))``.
-
-``prev_hidden_states`` and ``hidden_states_out`` use token-major pre-``hc_head``
-hidden states with HC lanes: ``[T, HC_MULT, D]``.
-"""
+"""DeepSeek-V4 MTP input projection: e_proj(enorm(hidden_states)) + h_proj(hnorm(prev_hidden_states))."""
 
 import pypto.language as pl
 
@@ -28,21 +20,24 @@ from config import (
     PREFILL_SEQ,
 )
 
+# Dynamic shape variables.
+T_DYN = pl.dynamic("T_DYN")  # T = B * S
 
-T_DYN = pl.dynamic("T_DYN")
+# model config
 D = M.hidden_size
 HC_MULT = M.hc_mult
 HC_DIM = HC_MULT * D
 EPS = M.rms_norm_eps
 D_INV = 1.0 / D
 
+# tiling
 T_TILE = 8
 LINEAR_T_TILE = 16
-D_CHUNK = 128
-OUT_CHUNK = 128
-D_BLOCKS = D // D_CHUNK
-OUT_BLOCKS = D // OUT_CHUNK
-QUANT_CHUNK = 128
+LINEAR_HC_TILE = LINEAR_T_TILE * HC_MULT
+LINEAR_K_TILE = 512
+OUT_TILE = 256
+NORM_K_TILE = 1024
+QUANT_TILE = 1024
 assert (DECODE_BATCH * DECODE_SEQ) % T_TILE == 0
 assert (PREFILL_BATCH * PREFILL_SEQ) % T_TILE == 0
 
@@ -62,157 +57,138 @@ def mtp_projection(
     hidden_states_out: pl.Tensor[[T_DYN, HC_MULT, D], pl.FP32],
 ):
     t_dim = pl.tensor.dim(hidden_states, 0)
-    t_linear = ((t_dim + LINEAR_T_TILE - 1) // LINEAR_T_TILE) * LINEAR_T_TILE
     hidden_flat = pl.reshape(hidden_states, [t_dim, D])
-    prev_flat = pl.reshape(prev_hidden_states, [t_dim, HC_DIM])
-    out_flat = pl.reshape(hidden_states_out, [t_dim, HC_DIM])
-    hidden_norm = pl.create_tensor([t_linear, D], dtype=pl.FP32)
-    prev_norm = pl.create_tensor([t_linear, HC_DIM], dtype=pl.FP32)
+    t_linear = ((t_dim + LINEAR_T_TILE - 1) // LINEAR_T_TILE) * LINEAR_T_TILE
     hidden_i8 = pl.create_tensor([t_linear, D], dtype=pl.INT8)
-    prev_i8 = pl.create_tensor([t_linear, HC_DIM], dtype=pl.INT8)
-    hidden_inv_rms = pl.create_tensor([t_linear, 1], dtype=pl.FP32)
-    prev_inv_rms = pl.create_tensor([HC_MULT, t_linear], dtype=pl.FP32)
-    hidden_amax_parts = pl.create_tensor([D_BLOCKS, t_linear], dtype=pl.FP32)
-    prev_amax_parts = pl.create_tensor([HC_MULT * D_BLOCKS, t_linear], dtype=pl.FP32)
     hidden_scale_dq = pl.create_tensor([t_linear, 1], dtype=pl.FP32)
+    for hidden_block in pl.spmd(t_dim // T_TILE, name_hint="mtp_projection_hidden", allow_early_resolve=True):
+        t0 = hidden_block * T_TILE
+        hidden_sq_sum = pl.full([1, T_TILE], dtype=pl.FP32, value=0.0)
+        hidden_amax = pl.full([1, T_TILE], dtype=pl.FP32, value=INT8_AMAX_EPS)
+        for k0 in pl.pipeline(0, D, NORM_K_TILE, stage=4):
+            hidden_chunk_bf16 = hidden_flat[t0 : t0 + T_TILE, k0 : k0 + NORM_K_TILE]
+            hidden_chunk = pl.cast(hidden_chunk_bf16, target_type=pl.FP32)
+            enorm = pl.reshape(enorm_w[k0 : k0 + NORM_K_TILE], [1, NORM_K_TILE])
+            e_smooth = pl.reshape(e_proj_smooth[k0 : k0 + NORM_K_TILE], [1, NORM_K_TILE])
+            enorm_smooth = pl.mul(enorm, e_smooth)
+            hidden_xg = pl.col_expand_mul(hidden_chunk, enorm_smooth)
+            hidden_sq = pl.mul(hidden_chunk, hidden_chunk)
+            hidden_sq_row = pl.row_sum(hidden_sq)
+            hidden_sq_partial = pl.reshape(hidden_sq_row, [1, T_TILE])
+            hidden_sq_sum = pl.add(hidden_sq_sum, hidden_sq_partial)
+            hidden_abs = pl.abs(hidden_xg)
+            hidden_amax_row = pl.row_max(hidden_abs)
+            hidden_amax_col = pl.reshape(hidden_amax_row, [1, T_TILE])
+            hidden_amax = pl.maximum(hidden_amax, hidden_amax_col)
+        hidden_sq_mean = pl.mul(hidden_sq_sum, D_INV)
+        hidden_rms_arg = pl.add(hidden_sq_mean, EPS)
+        hidden_inv = pl.rsqrt(hidden_rms_arg, high_precision=True)
+        hidden_scale_max = pl.full([1, T_TILE], dtype=pl.FP32, value=INT8_SCALE_MAX)
+        hidden_quant_scale_row = pl.div(hidden_scale_max, hidden_amax)
+        hidden_sq_recip = pl.recip(hidden_quant_scale_row)
+        hidden_scale_row = pl.mul(hidden_inv, hidden_sq_recip)
+        hidden_scale_col = pl.reshape(hidden_scale_row, [T_TILE, 1])
+        hidden_scale_dq[t0 : t0 + T_TILE, 0:1] = hidden_scale_col
+        hidden_quant_scale_col = pl.reshape(hidden_quant_scale_row, [T_TILE, 1])
+        for k0 in pl.pipeline(0, D, QUANT_TILE, stage=4):
+            hidden_q_bf16 = hidden_flat[t0 : t0 + T_TILE, k0 : k0 + QUANT_TILE]
+            hidden_q_chunk = pl.cast(hidden_q_bf16, target_type=pl.FP32)
+            enorm_q = pl.reshape(enorm_w[k0 : k0 + QUANT_TILE], [1, QUANT_TILE])
+            e_smooth_q = pl.reshape(e_proj_smooth[k0 : k0 + QUANT_TILE], [1, QUANT_TILE])
+            enorm_smooth_q = pl.mul(enorm_q, e_smooth_q)
+            hidden_q_xg = pl.col_expand_mul(hidden_q_chunk, enorm_smooth_q)
+            hidden_q_scaled = pl.row_expand_mul(hidden_q_xg, hidden_quant_scale_col)
+            hidden_q_i32 = pl.cast(hidden_q_scaled, target_type=pl.INT32, mode="rint")
+            hidden_q_half = pl.cast(hidden_q_i32, target_type=pl.FP16, mode="round")
+            hidden_q_i8 = pl.cast(hidden_q_half, target_type=pl.INT8, mode="trunc")
+            hidden_i8[t0 : t0 + T_TILE, k0 : k0 + QUANT_TILE] = hidden_q_i8
+
+    prev_flat = pl.reshape(prev_hidden_states, [t_dim, HC_DIM])
+    prev_linear_rows = t_linear * HC_MULT
+    prev_i8 = pl.create_tensor([prev_linear_rows, D], dtype=pl.INT8)
     prev_scale_dq = pl.create_tensor([HC_MULT, t_linear], dtype=pl.FP32)
-    out_pad = pl.create_tensor([t_linear, HC_DIM], dtype=pl.FP32)
+    for prev_block in pl.spmd((t_dim // T_TILE) * HC_MULT, name_hint="mtp_projection_prev", allow_early_resolve=True):
+        prev_t = prev_block // HC_MULT
+        hc = prev_block - prev_t * HC_MULT
+        t0 = prev_t * T_TILE
+        prev_base = hc * D
+        prev_sq_sum = pl.full([1, T_TILE], dtype=pl.FP32, value=0.0)
+        prev_amax = pl.full([1, T_TILE], dtype=pl.FP32, value=INT8_AMAX_EPS)
+        for k0 in pl.pipeline(0, D, NORM_K_TILE, stage=4):
+            prev_chunk = prev_flat[t0 : t0 + T_TILE, prev_base + k0 : prev_base + k0 + NORM_K_TILE]
+            hnorm = pl.reshape(hnorm_w[k0 : k0 + NORM_K_TILE], [1, NORM_K_TILE])
+            h_smooth = pl.reshape(h_proj_smooth[k0 : k0 + NORM_K_TILE], [1, NORM_K_TILE])
+            hnorm_smooth = pl.mul(hnorm, h_smooth)
+            prev_xg = pl.col_expand_mul(prev_chunk, hnorm_smooth)
+            prev_sq = pl.mul(prev_chunk, prev_chunk)
+            prev_sq_row = pl.row_sum(prev_sq)
+            prev_sq_partial = pl.reshape(prev_sq_row, [1, T_TILE])
+            prev_sq_sum = pl.add(prev_sq_sum, prev_sq_partial)
+            prev_abs = pl.abs(prev_xg)
+            prev_amax_row = pl.row_max(prev_abs)
+            prev_amax_col = pl.reshape(prev_amax_row, [1, T_TILE])
+            prev_amax = pl.maximum(prev_amax, prev_amax_col)
+        prev_sq_mean = pl.mul(prev_sq_sum, D_INV)
+        prev_rms_arg = pl.add(prev_sq_mean, EPS)
+        prev_inv = pl.rsqrt(prev_rms_arg, high_precision=True)
+        prev_scale_max = pl.full([1, T_TILE], dtype=pl.FP32, value=INT8_SCALE_MAX)
+        prev_quant_scale_row = pl.div(prev_scale_max, prev_amax)
+        prev_sq_recip = pl.recip(prev_quant_scale_row)
+        prev_scale_row = pl.mul(prev_inv, prev_sq_recip)
+        prev_scale_dq[hc : hc + 1, t0 : t0 + T_TILE] = prev_scale_row
+        prev_quant_scale_col = pl.reshape(prev_quant_scale_row, [T_TILE, 1])
+        prev_q_block = t0 // LINEAR_T_TILE
+        prev_q_row0 = prev_q_block * LINEAR_HC_TILE + hc * LINEAR_T_TILE + (t0 - prev_q_block * LINEAR_T_TILE)
+        for k0 in pl.pipeline(0, D, QUANT_TILE, stage=4):
+            prev_q_chunk = prev_flat[t0 : t0 + T_TILE, prev_base + k0 : prev_base + k0 + QUANT_TILE]
+            hnorm_q = pl.reshape(hnorm_w[k0 : k0 + QUANT_TILE], [1, QUANT_TILE])
+            h_smooth_q = pl.reshape(h_proj_smooth[k0 : k0 + QUANT_TILE], [1, QUANT_TILE])
+            hnorm_smooth_q = pl.mul(hnorm_q, h_smooth_q)
+            prev_q_xg = pl.col_expand_mul(prev_q_chunk, hnorm_smooth_q)
+            prev_q_scaled = pl.row_expand_mul(prev_q_xg, prev_quant_scale_col)
+            prev_q_i32 = pl.cast(prev_q_scaled, target_type=pl.INT32, mode="rint")
+            prev_q_half = pl.cast(prev_q_i32, target_type=pl.FP16, mode="round")
+            prev_q_i8 = pl.cast(prev_q_half, target_type=pl.INT8, mode="trunc")
+            prev_i8[prev_q_row0 : prev_q_row0 + T_TILE, k0 : k0 + QUANT_TILE] = prev_q_i8
 
-    for t0 in pl.parallel(0, t_dim, T_TILE):
-        with pl.at(level=pl.Level.CORE_GROUP, name_hint="mtp_projection_rms"):
-            hidden_sq_sum = pl.full([1, T_TILE], dtype=pl.FP32, value=0.0)
-            for kb in pl.pipeline(D_BLOCKS, stage=2):
-                k0 = kb * D_CHUNK
-                hidden_chunk = pl.cast(hidden_flat[t0 : t0 + T_TILE, k0 : k0 + D_CHUNK], target_type=pl.FP32)
-                hidden_sq_sum = pl.add(
-                    hidden_sq_sum,
-                    pl.reshape(pl.row_sum(pl.mul(hidden_chunk, hidden_chunk)), [1, T_TILE]),
-                )
-            hidden_var = pl.add(pl.mul(hidden_sq_sum, D_INV), EPS)
-            hidden_inv = pl.reshape(pl.rsqrt(hidden_var, high_precision=True), [T_TILE, 1])
-            hidden_inv_rms = pl.assemble(hidden_inv_rms, hidden_inv, [t0, 0])
-            for hc in pl.range(HC_MULT):
-                prev_sq_sum = pl.full([1, T_TILE], dtype=pl.FP32, value=0.0)
-                for kb in pl.pipeline(D_BLOCKS, stage=2):
-                    k0 = kb * D_CHUNK
-                    prev_k0 = hc * D + k0
-                    prev_chunk = prev_flat[t0 : t0 + T_TILE, prev_k0 : prev_k0 + D_CHUNK]
-                    prev_sq_sum = pl.add(
-                        prev_sq_sum,
-                        pl.reshape(pl.row_sum(pl.mul(prev_chunk, prev_chunk)), [1, T_TILE]),
-                    )
-                prev_var = pl.add(pl.mul(prev_sq_sum, D_INV), EPS)
-                prev_inv = pl.reshape(pl.rsqrt(prev_var, high_precision=True), [T_TILE, 1])
-                prev_inv_rms = pl.assemble(prev_inv_rms, pl.reshape(prev_inv, [1, T_TILE]), [hc, t0])
-
-    for t0 in pl.parallel(0, t_dim, T_TILE):
-        with pl.at(level=pl.Level.CORE_GROUP, name_hint="mtp_projection_norm"):
-            hidden_inv = hidden_inv_rms[t0 : t0 + T_TILE, 0:1]
-            for kb in pl.range(D_BLOCKS):
-                k0 = kb * D_CHUNK
-                hidden_chunk = pl.cast(hidden_flat[t0 : t0 + T_TILE, k0 : k0 + D_CHUNK], target_type=pl.FP32)
-                enorm = pl.reshape(enorm_w[k0 : k0 + D_CHUNK], [1, D_CHUNK])
-                e_smooth = pl.reshape(e_proj_smooth[k0 : k0 + D_CHUNK], [1, D_CHUNK])
-                hidden_norm_tile = pl.col_expand_mul(
-                    pl.col_expand_mul(pl.row_expand_mul(hidden_chunk, hidden_inv), enorm),
-                    e_smooth,
-                )
-                hidden_norm = pl.assemble(hidden_norm, hidden_norm_tile, [t0, k0])
-                hidden_abs = pl.maximum(hidden_norm_tile, pl.neg(hidden_norm_tile))
-                hidden_amax_parts = pl.assemble(hidden_amax_parts, pl.reshape(pl.row_max(hidden_abs), [1, T_TILE]), [kb, t0])
-                hnorm = pl.reshape(hnorm_w[k0 : k0 + D_CHUNK], [1, D_CHUNK])
-                h_smooth = pl.reshape(h_proj_smooth[k0 : k0 + D_CHUNK], [1, D_CHUNK])
-                for hc in pl.range(HC_MULT):
-                    prev_k0 = hc * D + k0
-                    prev_inv = pl.reshape(prev_inv_rms[hc : hc + 1, t0 : t0 + T_TILE], [T_TILE, 1])
-                    prev_chunk = prev_flat[t0 : t0 + T_TILE, prev_k0 : prev_k0 + D_CHUNK]
-                    prev_norm_tile = pl.col_expand_mul(
-                        pl.col_expand_mul(pl.row_expand_mul(prev_chunk, prev_inv), hnorm),
-                        h_smooth,
-                    )
-                    prev_norm = pl.assemble(prev_norm, prev_norm_tile, [t0, prev_k0])
-                    prev_abs = pl.maximum(prev_norm_tile, pl.neg(prev_norm_tile))
-                    prev_amax_parts = pl.assemble(
-                        prev_amax_parts,
-                        pl.reshape(pl.row_max(prev_abs), [1, T_TILE]),
-                        [hc * D_BLOCKS + kb, t0],
-                    )
-
-    for t0 in pl.parallel(0, t_dim, T_TILE):
-        with pl.at(level=pl.Level.CORE_GROUP, name_hint="mtp_projection_quant"):
-            hidden_amax = pl.full([1, T_TILE], dtype=pl.FP32, value=INT8_AMAX_EPS)
-            for ab in pl.range(D_BLOCKS):
-                hidden_amax = pl.maximum(hidden_amax, hidden_amax_parts[ab : ab + 1, t0 : t0 + T_TILE])
-            hidden_sq_row = pl.div(pl.full([1, T_TILE], dtype=pl.FP32, value=INT8_SCALE_MAX), hidden_amax)
-            hidden_scale_dq = pl.assemble(hidden_scale_dq, pl.reshape(pl.recip(hidden_sq_row), [T_TILE, 1]), [t0, 0])
-            hidden_sq_col = pl.reshape(hidden_sq_row, [T_TILE, 1])
-            for k0 in pl.range(0, D, QUANT_CHUNK):
-                hidden_q_f32 = hidden_norm[t0 : t0 + T_TILE, k0 : k0 + QUANT_CHUNK]
-                hidden_q_i32 = pl.cast(pl.row_expand_mul(hidden_q_f32, hidden_sq_col), target_type=pl.INT32, mode="rint")
-                hidden_q_half = pl.cast(hidden_q_i32, target_type=pl.FP16, mode="round")
-                hidden_i8 = pl.assemble(hidden_i8, pl.cast(hidden_q_half, target_type=pl.INT8, mode="trunc"), [t0, k0])
-            for hc in pl.range(HC_MULT):
-                prev_amax = pl.full([1, T_TILE], dtype=pl.FP32, value=INT8_AMAX_EPS)
-                for ab in pl.range(D_BLOCKS):
-                    prev_amax = pl.maximum(prev_amax, prev_amax_parts[hc * D_BLOCKS + ab : hc * D_BLOCKS + ab + 1, t0 : t0 + T_TILE])
-                prev_sq_row = pl.div(pl.full([1, T_TILE], dtype=pl.FP32, value=INT8_SCALE_MAX), prev_amax)
-                prev_scale_dq = pl.assemble(prev_scale_dq, pl.reshape(pl.recip(prev_sq_row), [1, T_TILE]), [hc, t0])
-                prev_sq_col = pl.reshape(prev_sq_row, [T_TILE, 1])
-                for k0 in pl.range(0, D, QUANT_CHUNK):
-                    prev_k0 = hc * D + k0
-                    prev_q_f32 = prev_norm[t0 : t0 + T_TILE, prev_k0 : prev_k0 + QUANT_CHUNK]
-                    prev_q_i32 = pl.cast(pl.row_expand_mul(prev_q_f32, prev_sq_col), target_type=pl.INT32, mode="rint")
-                    prev_q_half = pl.cast(prev_q_i32, target_type=pl.FP16, mode="round")
-                    prev_i8 = pl.assemble(prev_i8, pl.cast(prev_q_half, target_type=pl.INT8, mode="trunc"), [t0, prev_k0])
-    for t0 in pl.parallel(0, t_linear, LINEAR_T_TILE):
-        for nb in pl.parallel(0, OUT_BLOCKS, 1):
-            with pl.at(level=pl.Level.CORE_GROUP, name_hint="mtp_projection_linear"):
-                n0 = nb * OUT_CHUNK
-                hidden_a0 = hidden_i8[t0 : t0 + LINEAR_T_TILE, 0:D_CHUNK]
-                e_w0 = e_proj_w[n0 : n0 + OUT_CHUNK, 0:D_CHUNK]
-                hidden_acc = pl.matmul(hidden_a0, e_w0, b_trans=True, out_dtype=pl.INT32)
-                for kb in pl.pipeline(1, D_BLOCKS, stage=2):
-                    k0 = kb * D_CHUNK
-                    hidden_a = hidden_i8[t0 : t0 + LINEAR_T_TILE, k0 : k0 + D_CHUNK]
-                    e_w = e_proj_w[n0 : n0 + OUT_CHUNK, k0 : k0 + D_CHUNK]
-                    hidden_acc = pl.matmul_acc(hidden_acc, hidden_a, e_w, b_trans=True)
-                e_scale = pl.reshape(e_proj_w_scale[n0 : n0 + OUT_CHUNK], [1, OUT_CHUNK])
-                hidden_deq = pl.col_expand_mul(
-                    pl.row_expand_mul(pl.cast(hidden_acc, target_type=pl.FP32, mode="none"), hidden_scale_dq[t0 : t0 + LINEAR_T_TILE, 0:1]),
-                    e_scale,
-                )
-                h_w0 = h_proj_w[n0 : n0 + OUT_CHUNK, 0:D_CHUNK]
-                h_scale = pl.reshape(h_proj_w_scale[n0 : n0 + OUT_CHUNK], [1, OUT_CHUNK])
-                for hc in pl.range(HC_MULT):
-                    prev_base = hc * D
-                    prev_out = prev_base + n0
-                    prev_a0 = prev_i8[t0 : t0 + LINEAR_T_TILE, prev_base : prev_base + D_CHUNK]
-                    prev_acc = pl.matmul(prev_a0, h_w0, b_trans=True, out_dtype=pl.INT32)
-                    for kb in pl.pipeline(1, D_BLOCKS, stage=2):
-                        k0 = kb * D_CHUNK
-                        prev_k0 = prev_base + k0
-                        prev_a = prev_i8[t0 : t0 + LINEAR_T_TILE, prev_k0 : prev_k0 + D_CHUNK]
-                        h_w = h_proj_w[n0 : n0 + OUT_CHUNK, k0 : k0 + D_CHUNK]
-                        prev_acc = pl.matmul_acc(prev_acc, prev_a, h_w, b_trans=True)
-                    prev_deq = pl.col_expand_mul(
-                        pl.row_expand_mul(
-                            pl.cast(prev_acc, target_type=pl.FP32, mode="none"),
-                            pl.reshape(prev_scale_dq[hc : hc + 1, t0 : t0 + LINEAR_T_TILE], [LINEAR_T_TILE, 1]),
-                        ),
-                        h_scale,
-                    )
-                    acc = pl.add(hidden_deq, prev_deq)
-                    out_pad = pl.assemble(out_pad, acc, [t0, prev_out])
-
-    with pl.at(level=pl.Level.CORE_GROUP, name_hint="mtp_projection_output"):
-        for t0 in pl.pipeline(0, t_dim, T_TILE, stage=2):
-            for hc in pl.range(HC_MULT):
-                out_base = hc * D
-                for n0 in pl.range(0, D, OUT_CHUNK):
-                    out_flat[t0 : t0 + T_TILE, out_base + n0 : out_base + n0 + OUT_CHUNK] = out_pad[
-                        t0 : t0 + T_TILE,
-                        out_base + n0 : out_base + n0 + OUT_CHUNK,
-                    ]
+    out_flat = pl.reshape(hidden_states_out, [t_dim, HC_DIM])
+    for linear_block in pl.spmd((t_linear // LINEAR_T_TILE) * (D // OUT_TILE), name_hint="mtp_projection_linear"):
+        linear_t = linear_block // (D // OUT_TILE)
+        t0 = linear_t * LINEAR_T_TILE
+        n0 = (linear_block - linear_t * (D // OUT_TILE)) * OUT_TILE
+        t_rows = pl.min(LINEAR_T_TILE, t_dim - t0)
+        hidden_a0 = hidden_i8[t0 : t0 + LINEAR_T_TILE, 0:LINEAR_K_TILE]
+        e_w0 = e_proj_w[n0 : n0 + OUT_TILE, 0:LINEAR_K_TILE]
+        hidden_acc = pl.matmul(hidden_a0, e_w0, b_trans=True, out_dtype=pl.INT32)
+        for k0 in pl.pipeline(LINEAR_K_TILE, D, LINEAR_K_TILE, stage=2):
+            hidden_a = hidden_i8[t0 : t0 + LINEAR_T_TILE, k0 : k0 + LINEAR_K_TILE]
+            e_w = e_proj_w[n0 : n0 + OUT_TILE, k0 : k0 + LINEAR_K_TILE]
+            hidden_acc = pl.matmul_acc(hidden_acc, hidden_a, e_w, b_trans=True)
+        e_scale = pl.reshape(e_proj_w_scale[n0 : n0 + OUT_TILE], [1, OUT_TILE])
+        hidden_acc_fp32 = pl.cast(hidden_acc, target_type=pl.FP32, mode="none")
+        hidden_row_deq = pl.row_expand_mul(hidden_acc_fp32, hidden_scale_dq[t0 : t0 + LINEAR_T_TILE, 0:1])
+        hidden_deq = pl.col_expand_mul(hidden_row_deq, e_scale)
+        prev_row0 = linear_t * LINEAR_HC_TILE
+        prev_a0 = prev_i8[prev_row0 : prev_row0 + LINEAR_HC_TILE, 0:LINEAR_K_TILE]
+        h_w0 = h_proj_w[n0 : n0 + OUT_TILE, 0:LINEAR_K_TILE]
+        prev_acc = pl.matmul(prev_a0, h_w0, b_trans=True, out_dtype=pl.INT32)
+        for k0 in pl.pipeline(LINEAR_K_TILE, D, LINEAR_K_TILE, stage=2):
+            prev_a = prev_i8[prev_row0 : prev_row0 + LINEAR_HC_TILE, k0 : k0 + LINEAR_K_TILE]
+            h_w = h_proj_w[n0 : n0 + OUT_TILE, k0 : k0 + LINEAR_K_TILE]
+            prev_acc = pl.matmul_acc(prev_acc, prev_a, h_w, b_trans=True)
+        prev_deq_all = pl.cast(prev_acc, target_type=pl.FP32, mode="none")
+        h_scale = pl.reshape(h_proj_w_scale[n0 : n0 + OUT_TILE], [1, OUT_TILE])
+        for hc in pl.unroll(HC_MULT):
+            hc_row0 = hc * LINEAR_T_TILE
+            prev_deq_tile = prev_deq_all[hc_row0 : hc_row0 + LINEAR_T_TILE, 0:OUT_TILE]
+            prev_scale = prev_scale_dq[hc : hc + 1, t0 : t0 + LINEAR_T_TILE]
+            prev_scale_col = pl.reshape(prev_scale, [LINEAR_T_TILE, 1])
+            prev_row_deq = pl.row_expand_mul(prev_deq_tile, prev_scale_col)
+            prev_deq = pl.col_expand_mul(prev_row_deq, h_scale)
+            acc = pl.add(hidden_deq, prev_deq)
+            prev_out = hc * D + n0
+            acc_valid = pl.set_validshape(acc, t_rows, OUT_TILE)
+            out_flat[t0 : t0 + LINEAR_T_TILE, prev_out : prev_out + OUT_TILE] = acc_valid
 
     hidden_states_out = pl.reshape(out_flat, [t_dim, HC_MULT, D])
     return hidden_states_out
@@ -236,16 +212,10 @@ def mtp_projection_test(
     prev_hidden_states.bind_dynamic(0, T_DYN)
     hidden_states_out.bind_dynamic(0, T_DYN)
     return mtp_projection(
-        hidden_states,
-        prev_hidden_states,
-        enorm_w,
-        hnorm_w,
-        e_proj_w,
-        e_proj_w_scale,
-        e_proj_smooth,
-        h_proj_w,
-        h_proj_w_scale,
-        h_proj_smooth,
+        hidden_states, prev_hidden_states,
+        enorm_w, hnorm_w,
+        e_proj_w, e_proj_w_scale, e_proj_smooth,
+        h_proj_w, h_proj_w_scale, h_proj_smooth,
         hidden_states_out,
     )
 
@@ -256,8 +226,8 @@ def _rms_norm(x, weight):
     shape = x.shape
     x_2d = x.reshape(-1, D).float()
     sq_sum = torch.zeros(x_2d.shape[0], 1, dtype=torch.float32)
-    for k0 in range(0, D, D_CHUNK):
-        x_chunk = x_2d[:, k0:k0 + D_CHUNK]
+    for k0 in range(0, D, NORM_K_TILE):
+        x_chunk = x_2d[:, k0:k0 + NORM_K_TILE]
         sq_sum += (x_chunk * x_chunk).sum(dim=1, keepdim=True)
     inv = torch.rsqrt(sq_sum * D_INV + EPS)
     return (x_2d * inv * weight.float().view(1, D)).reshape(shape)
@@ -352,8 +322,7 @@ if __name__ == "__main__":
     from golden import ratio_allclose, run_jit
 
     parser = argparse.ArgumentParser()
-    parser.add_argument("-p", "--platform", type=str, default="a2a3",
-                        choices=["a2a3", "a2a3sim", "a5", "a5sim"])
+    parser.add_argument("-p", "--platform", type=str, default="a2a3", choices=["a2a3", "a2a3sim", "a5", "a5sim"])
     parser.add_argument("-d", "--device", type=int, default=0)
     parser.add_argument("--mode", choices=["decode", "prefill", "all"], default="all")
     parser.add_argument("--seed", type=int, default=0)
@@ -381,9 +350,6 @@ if __name__ == "__main__":
             rtol=1e-3,
             atol=1e-3,
             compare_fn={
-                # Raw MTP projection adds two W8A8 terms before the next block's
-                # normalization, so near-zero cancellation leaves more relative
-                # outliers than qkv_proj_rope's post-RMSNorm q/kv outputs.
                 "hidden_states_out": ratio_allclose(atol=1e-3, rtol=1e-3, max_error_ratio=0.05),
             },
         )

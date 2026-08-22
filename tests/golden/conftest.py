@@ -70,7 +70,15 @@ def _install_pypto_stubs() -> None:
 
     for name in ("Tensor", "Scalar", "Array", "InOut", "Out"):
         setattr(language, name, _TypeSpec)
-    for name in ("BF16", "FP32", "INT8", "INT32", "INT64", "TASK_ID"):
+    for name in (
+        "BF16",
+        "FP32",
+        "INT8",
+        "INT32",
+        "INT64",
+        "TASK_ID",
+        "UINT32",
+    ):
         setattr(language, name, object())
     language.dynamic = lambda name: name
     language.jit = _identity_jit

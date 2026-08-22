@@ -6,17 +6,7 @@
 # INCLUDING BUT NOT LIMITED TO NON-INFRINGEMENT, MERCHANTABILITY, OR FITNESS FOR A PARTICULAR PURPOSE.
 # See LICENSE in the root of the software repository for the full text of the License.
 # -----------------------------------------------------------------------------------------------------------
-"""DeepSeek-V4 MoE shared expert compute (decode, EP single-card).
-
-Split out of ``expert_routed.py``: only the shared-expert FFN path lives here.
-The routed local experts are computed by ``expert_routed.py``; both kernels
-are composed inside ``moe.py``.
-
-The shared expert reuses the per-token INT8 quant already produced by
-``gate`` (``x_norm_i8`` + ``x_norm_scale``) — the same INT8 view
-that ``dispatch`` packs for the routed path. This avoids a second
-amax+rescale of the same tokens.
-"""
+"""DeepSeek-V4 MoE shared-expert FFN for decode."""
 
 
 import pypto.language as pl
@@ -33,38 +23,17 @@ SWIGLU_LIMIT = M.swiglu_limit
 # tiling
 SH_M_TILE = 16
 SH_ROW_PAD = 8
-SH_ROWS_PER_BLOCK = 2
+SH_ROW_TILE = 2
 T_PAD = ((T + SH_M_TILE - 1) // SH_M_TILE) * SH_M_TILE
-# Decode (T <= SH_M_TILE, single partial block) or prefill (T a multiple of
-# SH_M_TILE, fully valid blocks); a T that is neither would need a dynamic
-# per-block row count the static valid_shape below can't express.
-assert T <= SH_M_TILE or T % SH_M_TILE == 0, \
-    "expert_shared needs T <= SH_M_TILE (decode) or T a multiple of SH_M_TILE (prefill)"
 SH_VALID_M = T if T < SH_M_TILE else SH_M_TILE
-N_MTILES = T_PAD // SH_M_TILE
-assert SH_VALID_M % SH_ROWS_PER_BLOCK == 0
-
+assert T < SH_M_TILE or T % SH_M_TILE == 0
+assert SH_VALID_M % SH_ROW_TILE == 0
 K_TILE = 512
-INTER_K = 512
+INTER_K_TILE = 512
 MM_INTER_TILE = 256
 ACT_INTER_TILE = 1024
 D_OUT_TILE = 256
-# The quant loop requires an exact divisor of MOE_INTER. Preserve the existing
-# Flash and Pro tile choices while sharing the implementation.
 QUANT_TILE = 2048 if M.name == "flash" else 1024
-D_OUT_TILE_ACT = 512
-# Keep one w2-dequant task covering the architecture's full hidden dimension.
-W2_ACT_INNER = 8 if M.name == "flash" else 14
-
-# Every tile that is used as `<dim> // <tile>` in a loop bound must divide its dim
-# exactly, otherwise the loop silently covers only part of the tensor.
-assert MOE_INTER % QUANT_TILE == 0, "QUANT_TILE must divide MOE_INTER (silent tail truncation otherwise)"
-assert QUANT_TILE % 512 == 0, "h_tile_i8 stores must cover whole 512-byte cache lines"
-assert D % K_TILE == 0 and MOE_INTER % INTER_K == 0
-assert MOE_INTER % MM_INTER_TILE == 0 and MOE_INTER % ACT_INTER_TILE == 0
-assert D % D_OUT_TILE == 0 and D % D_OUT_TILE_ACT == 0
-assert D % (W2_ACT_INNER * D_OUT_TILE_ACT) == 0, \
-    "W2_ACT_INNER * D_OUT_TILE_ACT must divide D (otherwise the w2-dequant task count truncates)"
 
 
 @pl.jit.inline
@@ -79,20 +48,12 @@ def expert_shared(
     shared_w2_scale: pl.Tensor[[D], pl.FP32],
     sh: pl.Tensor[[T, D], pl.BF16],
 ):
-    # One M-tile of SH_M_TILE rows per iteration (decode: 1 tile, T<=16 rows valid;
-    # prefill: T_PAD/SH_M_TILE fully-valid tiles).
-    for mt in pl.parallel(N_MTILES):
+    for mt in pl.parallel(T_PAD // SH_M_TILE):
         ts0 = mt * SH_M_TILE
 
         gate_i32 = pl.create_tensor([SH_M_TILE, MOE_INTER], dtype=pl.INT32)
-        up_i32 = pl.create_tensor([SH_M_TILE, MOE_INTER], dtype=pl.INT32)
 
-        # gate (w1) cube matmul -> INT32 GM accumulator.
-        for nb_idx in pl.spmd(
-            MOE_INTER // MM_INTER_TILE,
-            name_hint="sh_gate_mm",
-            allow_early_resolve=True,
-        ):
+        for nb_idx in pl.spmd(MOE_INTER // MM_INTER_TILE, name_hint="sh_gate_mm", allow_early_resolve=True):
             n0 = nb_idx * MM_INTER_TILE
             gate_acc = pl.create_tensor([SH_M_TILE, MM_INTER_TILE], dtype=pl.INT32)
             for k0 in pl.pipeline(0, D, K_TILE, stage=2):
@@ -104,12 +65,9 @@ def expert_shared(
                     gate_acc = pl.matmul_acc(gate_acc, xs_k, sw1_k, b_trans=True)
             gate_i32[:, n0 : n0 + MM_INTER_TILE] = gate_acc
 
-        # up (w3) cube matmul -> INT32 GM accumulator.
-        for nb_idx in pl.spmd(
-            MOE_INTER // MM_INTER_TILE,
-            name_hint="sh_up_mm",
-            allow_early_resolve=True,
-        ):
+        up_i32 = pl.create_tensor([SH_M_TILE, MOE_INTER], dtype=pl.INT32)
+
+        for nb_idx in pl.spmd(MOE_INTER // MM_INTER_TILE, name_hint="sh_up_mm", allow_early_resolve=True):
             n0 = nb_idx * MM_INTER_TILE
             up_acc = pl.create_tensor([SH_M_TILE, MM_INTER_TILE], dtype=pl.INT32)
             for k0 in pl.pipeline(0, D, K_TILE, stage=2):
@@ -121,161 +79,92 @@ def expert_shared(
                     up_acc = pl.matmul_acc(up_acc, xs_k, sw3_k, b_trans=True)
             up_i32[:, n0 : n0 + MM_INTER_TILE] = up_acc
 
-        # Each AIV block owns two rows across the full intermediate axis (four
-        # blocks for the decode shape). Activation, row-amax, scale, and requant
-        # stay in one task so this stage can start alongside dispatch_push.
         h_tile_fp32 = pl.create_tensor([SH_M_TILE, MOE_INTER], dtype=pl.FP32)
-        h_tile_i8 = pl.create_tensor(
-            [SH_M_TILE, MOE_INTER], dtype=pl.INT8, init_value=0
-        )
-        h_tile_scale_dq = pl.create_tensor(
-            [SH_M_TILE, SH_ROW_PAD], dtype=pl.FP32, manual_dep=True
-        )
-        for row_block in pl.spmd(
-            SH_VALID_M // SH_ROWS_PER_BLOCK,
-            name_hint="sh_gate_up_act_q",
-            allow_early_resolve=True,
-        ):
-            row0 = row_block * SH_ROWS_PER_BLOCK
-            x_scale = pl.slice(
-                x_local_scale_dq,
-                [SH_ROW_PAD, 1],
-                [ts0 + row0, 0],
-                valid_shape=[SH_ROWS_PER_BLOCK, 1],
-            )
-            row_amax = pl.full(
-                [1, SH_ROW_PAD],
-                dtype=pl.FP32,
-                value=INT8_AMAX_EPS,
-            )
-            for part in pl.pipeline(0, MOE_INTER // ACT_INTER_TILE, stage=1):
+        h_tile_i8 = pl.create_tensor([SH_M_TILE, MOE_INTER], dtype=pl.INT8, init_value=0)
+        h_tile_scale_dq = pl.create_tensor([SH_M_TILE, SH_ROW_PAD], dtype=pl.FP32, manual_dep=True)
+        for row_block in pl.spmd(SH_VALID_M // SH_ROW_TILE, name_hint="sh_gate_up_act_q", allow_early_resolve=True):
+            row0 = row_block * SH_ROW_TILE
+            x_scale = pl.slice(x_local_scale_dq, [SH_ROW_PAD, 1], [ts0 + row0, 0], valid_shape=[SH_ROW_TILE, 1])
+            row_amax = pl.full([1, SH_ROW_PAD], dtype=pl.FP32, value=INT8_AMAX_EPS)
+            for part in pl.pipeline(0, MOE_INTER // ACT_INTER_TILE, stage=2):
                 n0 = part * ACT_INTER_TILE
                 gate_rows_i32 = pl.slice(
                     gate_i32,
                     [SH_ROW_PAD, ACT_INTER_TILE],
                     [row0, n0],
-                    valid_shape=[SH_ROWS_PER_BLOCK, ACT_INTER_TILE],
+                    valid_shape=[SH_ROW_TILE, ACT_INTER_TILE],
                 )
                 up_rows_i32 = pl.slice(
                     up_i32,
                     [SH_ROW_PAD, ACT_INTER_TILE],
                     [row0, n0],
-                    valid_shape=[SH_ROWS_PER_BLOCK, ACT_INTER_TILE],
+                    valid_shape=[SH_ROW_TILE, ACT_INTER_TILE],
                 )
-                w1_scale = pl.reshape(
-                    shared_w1_scale[n0 : n0 + ACT_INTER_TILE],
-                    [1, ACT_INTER_TILE],
-                )
-                w3_scale = pl.reshape(
-                    shared_w3_scale[n0 : n0 + ACT_INTER_TILE],
-                    [1, ACT_INTER_TILE],
-                )
-                gate_fp32 = pl.cast(
-                    gate_rows_i32, target_type=pl.FP32, mode="none"
-                )
-                up_fp32 = pl.cast(
-                    up_rows_i32, target_type=pl.FP32, mode="none"
-                )
-                gate_fp32 = pl.col_expand_mul(
-                    pl.row_expand_mul(gate_fp32, x_scale), w1_scale
-                )
-                up_fp32 = pl.col_expand_mul(
-                    pl.row_expand_mul(up_fp32, x_scale), w3_scale
-                )
+                w1_scale = pl.reshape(shared_w1_scale[n0 : n0 + ACT_INTER_TILE], [1, ACT_INTER_TILE])
+                w3_scale = pl.reshape(shared_w3_scale[n0 : n0 + ACT_INTER_TILE], [1, ACT_INTER_TILE])
+                gate_fp32 = pl.cast(gate_rows_i32, target_type=pl.FP32, mode="none")
+                up_fp32 = pl.cast(up_rows_i32, target_type=pl.FP32, mode="none")
+                gate_scaled = pl.row_expand_mul(gate_fp32, x_scale)
+                gate_fp32 = pl.col_expand_mul(gate_scaled, w1_scale)
+                up_scaled = pl.row_expand_mul(up_fp32, x_scale)
+                up_fp32 = pl.col_expand_mul(up_scaled, w3_scale)
                 if SWIGLU_LIMIT > 0.0:
                     gate_fp32 = pl.minimum(gate_fp32, SWIGLU_LIMIT)
-                    up_fp32 = pl.maximum(
-                        pl.minimum(up_fp32, SWIGLU_LIMIT), -SWIGLU_LIMIT
-                    )
-                sigmoid = pl.recip(pl.add(pl.exp(pl.neg(gate_fp32)), 1.0))
-                gated = pl.mul(pl.mul(gate_fp32, sigmoid), up_fp32)
-                chunk_amax = pl.reshape(
-                    pl.row_max(pl.abs(gated)), [1, SH_ROW_PAD]
-                )
-                row_amax = pl.maximum(row_amax, chunk_amax)
-                h_tile_fp32[
-                    row0 : row0 + SH_ROWS_PER_BLOCK,
-                    n0 : n0 + ACT_INTER_TILE,
-                ] = gated[0:SH_ROWS_PER_BLOCK, :]
+                    up_max = pl.minimum(up_fp32, SWIGLU_LIMIT)
+                    up_fp32 = pl.maximum(up_max, -SWIGLU_LIMIT)
+                gate_neg = pl.neg(gate_fp32)
+                gate_exp = pl.exp(gate_neg)
+                gate_exp_one = pl.add(gate_exp, 1.0)
+                sigmoid = pl.recip(gate_exp_one)
+                silu = pl.mul(gate_fp32, sigmoid)
+                gated = pl.mul(silu, up_fp32)
+                gated_abs = pl.abs(gated)
+                gated_amax = pl.row_max(gated_abs)
+                part_amax = pl.reshape(gated_amax, [1, SH_ROW_PAD])
+                row_amax = pl.maximum(row_amax, part_amax)
+                h_tile_fp32[row0 : row0 + SH_ROW_TILE, n0 : n0 + ACT_INTER_TILE] = gated[0:SH_ROW_TILE, :]
 
-            row_scale_q = pl.div(
-                pl.full(
-                    [1, SH_ROW_PAD],
-                    dtype=pl.FP32,
-                    value=INT8_SCALE_MAX,
-                ),
-                row_amax,
-            )
+            scale_numerator = pl.full([1, SH_ROW_PAD], dtype=pl.FP32, value=INT8_SCALE_MAX)
+            row_scale_q = pl.div(scale_numerator, row_amax)
             row_scale_q_col = pl.reshape(row_scale_q, [SH_ROW_PAD, 1])
-            row_scale_dq_col = pl.reshape(
-                pl.recip(row_scale_q), [SH_ROW_PAD, 1]
-            )
-            row_scale_dq = pl.row_expand(
-                pl.full(
-                    [SH_ROW_PAD, SH_ROW_PAD], dtype=pl.FP32, value=0.0
-                ),
-                row_scale_dq_col,
-            )
-            h_tile_scale_dq[
-                row0 : row0 + SH_ROWS_PER_BLOCK, :
-            ] = row_scale_dq[0:SH_ROWS_PER_BLOCK, :]
-            for q_idx in pl.pipeline(0, MOE_INTER // QUANT_TILE, stage=1):
+            row_scale_dq = pl.recip(row_scale_q)
+            row_scale_dq_col = pl.reshape(row_scale_dq, [SH_ROW_PAD, 1])
+            scale_base = pl.full([SH_ROW_PAD, SH_ROW_PAD], dtype=pl.FP32, value=0.0)
+            row_scale_dq_full = pl.row_expand(scale_base, row_scale_dq_col)
+            h_tile_scale_dq[row0 : row0 + SH_ROW_TILE, :] = row_scale_dq_full[0:SH_ROW_TILE, :]
+            for q_idx in pl.pipeline(0, MOE_INTER // QUANT_TILE, stage=2):
                 k0 = q_idx * QUANT_TILE
                 h_fp32 = pl.slice(
                     h_tile_fp32,
                     [SH_ROW_PAD, QUANT_TILE],
                     [row0, k0],
-                    valid_shape=[SH_ROWS_PER_BLOCK, QUANT_TILE],
+                    valid_shape=[SH_ROW_TILE, QUANT_TILE],
                 )
                 h_scaled = pl.row_expand_mul(h_fp32, row_scale_q_col)
                 h_i32 = pl.cast(h_scaled, target_type=pl.INT32, mode="rint")
                 h_fp16 = pl.cast(h_i32, target_type=pl.FP16, mode="round")
-                h_tile_i8[
-                    row0 : row0 + SH_ROWS_PER_BLOCK,
-                    k0 : k0 + QUANT_TILE,
-                ] = pl.cast(h_fp16, target_type=pl.INT8, mode="trunc")[
-                    0:SH_ROWS_PER_BLOCK, :
-                ]
+                h_i8 = pl.cast(h_fp16, target_type=pl.INT8, mode="trunc")
+                h_tile_i8[row0 : row0 + SH_ROW_TILE, k0 : k0 + QUANT_TILE] = h_i8[0:SH_ROW_TILE, :]
 
-        # w2 (down) cube matmul -> INT32 GM accumulator.
-        y_i32 = pl.create_tensor([SH_M_TILE, D], dtype=pl.INT32)
-        for db_idx in pl.spmd(
-            D // D_OUT_TILE,
-            name_hint="sh_w2_mm",
-            allow_early_resolve=True,
-        ):
+        for db_idx in pl.spmd(D // D_OUT_TILE, name_hint="sh_w2_mm", allow_early_resolve=True):
             d0 = db_idx * D_OUT_TILE
             y_acc = pl.create_tensor([SH_M_TILE, D_OUT_TILE], dtype=pl.INT32)
-            for k0 in pl.pipeline(0, MOE_INTER, INTER_K, stage=2):
-                hs_k = h_tile_i8[:, k0 : k0 + INTER_K]
-                sw2_k = shared_w2[
-                    d0 : d0 + D_OUT_TILE, k0 : k0 + INTER_K
-                ]
+            for k0 in pl.pipeline(0, MOE_INTER, INTER_K_TILE, stage=2):
+                hs_k = h_tile_i8[:, k0 : k0 + INTER_K_TILE]
+                sw2_k = shared_w2[d0 : d0 + D_OUT_TILE, k0 : k0 + INTER_K_TILE]
                 if k0 == 0:
                     y_acc = pl.matmul(hs_k, sw2_k, b_trans=True, out_dtype=pl.INT32)
                 else:
                     y_acc = pl.matmul_acc(y_acc, hs_k, sw2_k, b_trans=True)
-            y_i32[:, d0 : d0 + D_OUT_TILE] = y_acc
 
-        # Dequant w2 output (per-row h scale x per-channel w2 scale) -> BF16.
-        for db_idx in pl.spmd(D // (W2_ACT_INNER * D_OUT_TILE_ACT), name_hint="sh_w2_act"):
-            d_base = db_idx * (W2_ACT_INNER * D_OUT_TILE_ACT)
             h_scale = pl.row_max(h_tile_scale_dq[:, :])
-            for dg in pl.pipeline(W2_ACT_INNER, stage=2):
-                d0 = d_base + dg * D_OUT_TILE_ACT
-                y_2d_i32 = y_i32[:, d0 : d0 + D_OUT_TILE_ACT]
-                w2_scale_chunk = pl.reshape(shared_w2_scale[d0 : d0 + D_OUT_TILE_ACT], [1, D_OUT_TILE_ACT])
-                y_2d = pl.cast(y_2d_i32, target_type=pl.FP32, mode="none")
-                y_2d = pl.col_expand_mul(
-                    pl.row_expand_mul(y_2d, h_scale), w2_scale_chunk
-                )
-                # Write valid rows straight to the (unpadded) output, mirroring
-                # expert_routed's direct recv_y store; no sh_pad round-trip.
-                y_bf16 = pl.cast(y_2d, target_type=pl.BF16, mode="rint")
-                sh[ts0 : ts0 + SH_VALID_M, d0 : d0 + D_OUT_TILE_ACT] = y_bf16[0:SH_VALID_M, :]
+            w2_scale_tile = pl.reshape(shared_w2_scale[d0 : d0 + D_OUT_TILE], [1, D_OUT_TILE])
+            y_2d = pl.cast(y_acc, target_type=pl.FP32, mode="none")
+            y_scaled = pl.row_expand_mul(y_2d, h_scale)
+            y_2d = pl.col_expand_mul(y_scaled, w2_scale_tile)
+            y_bf16 = pl.cast(y_2d, target_type=pl.BF16, mode="rint")
+            sh[ts0 : ts0 + SH_VALID_M, d0 : d0 + D_OUT_TILE] = y_bf16[0:SH_VALID_M, :]
 
-    # The @pl.inline parser requires inline call expressions to have a return
-    # value; sh is convenient because it's already pl.Out.
     return sh
 
 
@@ -301,7 +190,7 @@ def expert_shared_test(
 
 
 def _int8_quant_per_row(x):
-    """Per-row (per-token) INT8 symmetric quant matching v3.2 scope2 Stage 2.6."""
+    """Quantize each row symmetrically to INT8."""
     import torch
     rows = x.float().reshape(-1, x.shape[-1])
     amax = rows.abs().amax(dim=-1, keepdim=True).clamp_min(INT8_AMAX_EPS)
@@ -313,30 +202,18 @@ def _int8_quant_per_row(x):
 
 
 def golden_expert_shared(tensors):
-    """Torch reference for the shared expert.
-
-    Input is the per-token INT8 quant produced by gate (shared with
-    dispatch / routed expert); we dequant inside to match the kernel's
-    dequant-then-matmul pattern."""
+    """Compute the shared-expert reference with INT32 accumulation."""
     import torch
     import torch.nn.functional as F
 
-    # Mirror the kernel's numerics exactly. Every matmul in the kernel is an
-    # exact INT8 x INT8 -> INT32 accumulate, dequantized AFTER the reduction by
-    # the per-row input scale x per-channel weight scale. Integer accumulation
-    # is exact and order-independent, so an int32 matmul here is bit-identical
-    # to the kernel's tiled int32 accumulate regardless of K-tiling. A fp32
-    # matmul of pre-dequantized operands (the previous form) instead accumulates
-    # fp32 rounding error that flips bf16 last-bit ties on the final cast; mirror
-    # the kernel's "accumulate-int32, then one fp32 dequant mul" order to match.
-    x_local_i8 = tensors["x_local_i8"]                       # [T, D] int8
-    x_local_scale_dq = tensors["x_local_scale_dq"].float()   # [T, 1]
-    w1_i8 = tensors["shared_w1"]                        # [MOE_INTER, D] int8
-    w1_scale = tensors["shared_w1_scale"].float()       # [MOE_INTER]
-    w3_i8 = tensors["shared_w3"]                        # [MOE_INTER, D] int8
-    w3_scale = tensors["shared_w3_scale"].float()       # [MOE_INTER]
-    w2_i8 = tensors["shared_w2"]                        # [D, MOE_INTER] int8
-    w2_scale = tensors["shared_w2_scale"].float()       # [D]
+    x_local_i8 = tensors["x_local_i8"]
+    x_local_scale_dq = tensors["x_local_scale_dq"].float()
+    w1_i8 = tensors["shared_w1"]
+    w1_scale = tensors["shared_w1_scale"].float()
+    w3_i8 = tensors["shared_w3"]
+    w3_scale = tensors["shared_w3_scale"].float()
+    w2_i8 = tensors["shared_w2"]
+    w2_scale = tensors["shared_w2_scale"].float()
 
     gate_int = x_local_i8.to(torch.int32) @ w1_i8.to(torch.int32).T
     sh_gate = gate_int.to(torch.float32) * x_local_scale_dq * w1_scale.unsqueeze(0)
@@ -347,7 +224,6 @@ def golden_expert_shared(tensors):
         sh_up = sh_up.clamp(-SWIGLU_LIMIT, SWIGLU_LIMIT)
     sh_h = F.silu(sh_gate) * sh_up
     sh_h_i8, sh_h_sd = _int8_quant_per_row(sh_h)
-    # W2: exact INT32 accumulate, then per-row (h) x per-channel (w2) dequant.
     sh_int = sh_h_i8.to(torch.int32) @ w2_i8.to(torch.int32).T
     sh = sh_int.to(torch.float32) * sh_h_sd * w2_scale.unsqueeze(0)
 
@@ -355,31 +231,24 @@ def golden_expert_shared(tensors):
 
 
 def gen_shared_weight(shape, dequant_std, chan_cv):
-    """Synthesize a shared-expert per-channel-symmetric INT8 weight + FP32 scale by
-    simulating the real DeepSeek-V4-Flash MXFP8 shared-expert quant grid (e4m3, 128x128-block
-    E8M0 scale), then re-quantizing per-output-channel. Unlike routed (MXFP4 -> ~37 discrete
-    levels), shared stays near-Gaussian (~200 levels). The coarse 128-block scale does NOT
-    flatten the real per-output-channel magnitude spread, so ``chan_cv`` (log-space source-gain
-    std) injects it to reproduce the real INT8 scale CV (~0.5 gate/up, ~0.35 down). Per-output-
-    channel INT8 is scale-invariant, so the grid sets the level shape and ``dequant_std`` only
-    sets the absolute scale magnitude. (routed experts use a different grid -- see
-    expert_routed.gen_routed_weight.)
-
-    ``shape`` last dim = reduction (in) dim; leading dims map to the per-output-channel
-    scale shape ([out, in] -> scale [out]).
-    """
+    """Synthesize per-channel INT8 weights and FP32 scales from an MXFP8 grid."""
     import torch
 
     FP8_MAX, TINY = 448.0, 1e-20
 
-    def sim_fp8(W, block=128):   # e4m3 + 128x128-block E8M0 (round-up) scale on (out, in)
+    def sim_fp8(W, block=128):
         out, inn = W.shape
         Wb = W.reshape(out // block, block, inn // block, block)
-        scale = torch.exp2(torch.ceil(torch.log2((Wb.abs().amax(dim=(1, 3), keepdim=True) / FP8_MAX).clamp_min(TINY))))
+        block_amax = Wb.abs().amax(dim=(1, 3), keepdim=True)
+        block_scale = (block_amax / FP8_MAX).clamp_min(TINY)
+        scale = torch.exp2(torch.ceil(torch.log2(block_scale)))
         q = (Wb / scale).to(torch.float8_e4m3fn).float() * scale
         return q.reshape(out, inn)
 
-    W = torch.randn(*shape) * torch.exp(chan_cv * torch.randn(*shape[:-1], 1))  # per-channel gain
+    weight_base = torch.randn(*shape)
+    channel_noise = torch.randn(*shape[:-1], 1)
+    channel_gain = torch.exp(chan_cv * channel_noise)
+    W = weight_base * channel_gain
     Wq = sim_fp8(W)
     amax = Wq.abs().amax(dim=-1, keepdim=True).clamp_min(INT8_AMAX_EPS)
     scale = amax / INT8_SCALE_MAX
@@ -392,14 +261,9 @@ def build_tensor_specs():
     import torch
     from golden import TensorSpec
 
-    # Pre-quantize x_local once so the i8 / scale specs see consistent values
-    # (mirrors what gate produces in the full pipeline).
     x_local_bf16 = torch.randn(T, D, dtype=torch.bfloat16)
     x_local_i8_pre, x_local_sd_pre = _int8_quant_per_row(x_local_bf16)
 
-    # Synthesize (int8, per-channel scale) by simulating the real MXFP8 shared-expert
-    # quant grid (gen_shared_weight). chan_cv reproduces the real per-output-channel scale
-    # CV (~0.5 gate/up, ~0.35 down) the coarse FP8 block scale leaves behind.
     SHARED_DEQUANT_STD = {"w1": 1.71e-2, "w2": 1.68e-2, "w3": 1.70e-2}
     sw1_i8, sw1_s = gen_shared_weight((MOE_INTER, D), SHARED_DEQUANT_STD["w1"], chan_cv=0.50)
     sw3_i8, sw3_s = gen_shared_weight((MOE_INTER, D), SHARED_DEQUANT_STD["w3"], chan_cv=0.50)
@@ -423,8 +287,7 @@ if __name__ == "__main__":
     from golden import ratio_reldiff, run_jit
 
     parser = argparse.ArgumentParser()
-    parser.add_argument("-p", "--platform", type=str, default="a2a3",
-                        choices=["a2a3", "a2a3sim", "a5", "a5sim"])
+    parser.add_argument("-p", "--platform", type=str, default="a2a3", choices=["a2a3", "a2a3sim", "a5", "a5sim"])
     parser.add_argument("-d", "--device", type=int, default=0)
     parser.add_argument("--enable-chip-swimlane", action="store_true", default=False)
     parser.add_argument("--dump-passes", action="store_true", default=False)
@@ -443,7 +306,6 @@ if __name__ == "__main__":
         rtol=1e-3,
         atol=1e-3,
         compare_fn={
-            # BF16 sh, ~1 ULP. Gen weights reproduce real(L21): 0.01% vs 0.004% of points > 1e-3.
             "sh": ratio_reldiff(diff_thd=2e-3, pct_thd=0.01),
         },
     )

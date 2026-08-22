@@ -212,9 +212,9 @@ def swa_indices_and_lens(
     Each visible absolute logical position is translated with the same paged-KV
     block table contract as vLLM:
     ``physical_slot = block_table[req, pos // block_size] * block_size + pos % block_size``.
-    Each row is ordered from the oldest visible token to the current token;
-    invalid tail columns are padded with -1 and ``lens`` records the valid
-    prefix length.
+    Each row is ordered from the oldest visible token to the current token.
+    ``lens`` records the logical visible length; an unmapped in-range page is a
+    ``-1`` hole inside that range, while columns beyond it are ``-1`` padding.
     """
     if positions.ndim != 2:
         raise ValueError("SWA indices expect positions with shape [B, S]")
