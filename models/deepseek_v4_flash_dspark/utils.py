@@ -33,19 +33,27 @@ from config import (
 
 # --- Paged-KV metadata lowering. ---
 def resolve_start_positions(
-    start_pos: int | None,
+    start_pos: int | list[int] | tuple[int, ...] | torch.Tensor | None,
     *,
     batch: int = DECODE_BATCH,
     seq: int = DECODE_SEQ,
     max_seq_len: int = M.max_position_embeddings,
     default_fn: Callable[[], torch.Tensor] | None = None,
 ) -> torch.Tensor:
-    if start_pos is not None:
+    if isinstance(start_pos, torch.Tensor):
+        starts = start_pos.to(torch.int32).reshape(-1)
+    elif isinstance(start_pos, (list, tuple)):
+        starts = torch.tensor(start_pos, dtype=torch.int32)
+    elif start_pos is not None:
         starts = torch.full((batch,), int(start_pos), dtype=torch.int32)
     elif default_fn is not None:
         starts = default_fn().to(torch.int32)
     else:
         starts = torch.zeros(batch, dtype=torch.int32)
+    if starts.shape != (batch,):
+        raise ValueError(
+            f"decode start positions need {batch} entries, got {starts.numel()}"
+        )
     _validate_starts(starts, seq=seq, max_seq_len=max_seq_len)
     return starts
 
@@ -487,6 +495,58 @@ def build_rope_tables(
         int(config.beta_slow),
         dtype=dtype,
         device=device,
+    )
+
+
+def token_local_rope(
+    config: Any,
+    compress_ratio: int,
+    position_ids: torch.Tensor,
+    *,
+    max_seq_len: int | None = None,
+    rope_dim: int | None = None,
+    dtype: torch.dtype | str = torch.bfloat16,
+    device: torch.device | str | None = None,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Compute only the RoPE rows used by the supplied absolute positions."""
+    dim = int(rope_dim if rope_dim is not None else config.qk_rope_head_dim)
+    if dim <= 0 or dim % 2 != 0:
+        raise ValueError(f"RoPE dim must be a positive even integer, got {dim}")
+    positions_i64 = position_ids.to(torch.int64).reshape(-1)
+    seq_len = int(
+        max_seq_len if max_seq_len is not None else config.max_position_embeddings
+    )
+    if bool((positions_i64 < 0).any()) or bool((positions_i64 >= seq_len).any()):
+        raise ValueError(f"RoPE positions must be in [0, {seq_len})")
+
+    out_dtype = _torch_dtype(dtype)
+    out_device = torch.device(device) if device is not None else position_ids.device
+    base, original_seq_len = rope_profile_for_compress_ratio(config, compress_ratio)
+    half_dim = dim // 2
+    inv_freq = 1.0 / (
+        float(base)
+        ** (torch.arange(0, dim, 2, dtype=torch.float32, device=out_device) / dim)
+    )
+    if original_seq_len > 0:
+        low, high = _find_correction_range(
+            int(config.beta_fast),
+            int(config.beta_slow),
+            dim,
+            float(base),
+            int(original_seq_len),
+        )
+        smooth = 1 - _linear_ramp_factor(low, high, half_dim, device=out_device)
+        inv_freq = (
+            inv_freq / float(config.rope_factor) * (1 - smooth)
+            + inv_freq * smooth
+        )
+    positions = positions_i64.to(device=out_device, dtype=torch.float32)
+    angles = torch.outer(positions, inv_freq)
+    cos_half = torch.cos(angles)
+    sin_half = torch.sin(angles)
+    return (
+        torch.cat([cos_half, cos_half], dim=-1).to(out_dtype).contiguous(),
+        torch.cat([sin_half, sin_half], dim=-1).to(out_dtype).contiguous(),
     )
 
 
