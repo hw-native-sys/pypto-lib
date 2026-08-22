@@ -21,10 +21,7 @@ from config import (
     TP,
     DECODE_SEQ,
     BLOCK_SIZE,
-    KV_CMP_BLOCK_NUM,
     KV_ORI_BLOCK_NUM,
-    KV_CMP_MAX_BLOCKS,
-    KV_ORI_MAX_BLOCKS,
 )
 
 
@@ -45,7 +42,7 @@ ROPE_DIM = M.qk_rope_head_dim
 HALF_ROPE = ROPE_DIM // 2
 NOPE_DIM = M.nope_head_dim
 WIN = M.sliding_window
-MAX_SEQ_LEN = M.max_position_embeddings
+MAX_SEQ_LEN = 1_048_576
 IDX_TOPK = M.index_topk
 CMP_TOPK = IDX_TOPK
 SOFTMAX_SCALE = M.softmax_scale
@@ -55,15 +52,13 @@ HEADS_PER_GROUP = H // O_GROUPS
 O_GROUP_IN = HEADS_PER_GROUP * HEAD_DIM
 COMPRESS_RATIO = 4
 COMPRESS_RATIO_INV = 1.0 / COMPRESS_RATIO
-INDEXER_SCORE_LEN = MAX_SEQ_LEN // 4
 CSA_CMP_GE_BIAS = 1.0  # raw + 1, folded for the ge clamp
 NEG_INF = -1.0e20
 
 # paged KV cache
-ORI_MAX_BLOCKS = KV_ORI_MAX_BLOCKS
+ORI_MAX_BLOCKS = (MAX_SEQ_LEN + BLOCK_SIZE - 1) // BLOCK_SIZE
 ORI_BLOCK_NUM = KV_ORI_BLOCK_NUM
-CMP_MAX_BLOCKS = KV_CMP_MAX_BLOCKS
-CMP_BLOCK_NUM = KV_CMP_BLOCK_NUM
+CMP_MAX_BLOCKS = (MAX_SEQ_LEN // COMPRESS_RATIO + BLOCK_SIZE - 1) // BLOCK_SIZE
 
 # tiling
 H_TILE = 16
@@ -98,7 +93,7 @@ def sparse_attn_csa(
     window_swa_indices: pl.Tensor[[T_DYN, WIN], pl.INT32],
     cmp_kv: pl.Tensor[[CMP_BLOCK_NUM_DYN, BLOCK_SIZE, 1, HEAD_DIM], pl.BF16],
     cmp_block_table: pl.Tensor[[B_DYN, CMP_MAX_BLOCKS], pl.INT32],
-    idx_topk: pl.Tensor[[T_DYN, INDEXER_SCORE_LEN], pl.INT32],
+    idx_topk: pl.Tensor[[T_DYN, IDX_TOPK], pl.INT32],
     position_ids: pl.Tensor[[T_DYN, 1], pl.INT32],
     attn_sink: pl.Tensor[[H], pl.FP32],
     freqs_cos: pl.Tensor[[T_DYN, ROPE_DIM], pl.BF16],
@@ -407,7 +402,7 @@ def sparse_attn_csa_test(
     window_swa_indices: pl.Tensor[[T_DYN, WIN], pl.INT32],
     cmp_kv: pl.Tensor[[CMP_BLOCK_NUM_DYN, BLOCK_SIZE, 1, HEAD_DIM], pl.BF16],
     cmp_block_table: pl.Tensor[[B_DYN, CMP_MAX_BLOCKS], pl.INT32],
-    idx_topk: pl.Tensor[[T_DYN, INDEXER_SCORE_LEN], pl.INT32],
+    idx_topk: pl.Tensor[[T_DYN, IDX_TOPK], pl.INT32],
     position_ids: pl.Tensor[[T_DYN, 1], pl.INT32],
     attn_sink: pl.Tensor[[H], pl.FP32],
     freqs_cos: pl.Tensor[[T_DYN, ROPE_DIM], pl.BF16],
@@ -547,19 +542,45 @@ def build_tensor_specs(
     short_window_fixture: bool = False,
     mixed_topk_fixture: bool = False,
     cache_window_replacement_fixture: bool = False,
+    start_pos=None,
     batch: int = B,
 ):
     """Build deterministic demo tensors for the CSA standalone harness."""
     import torch
     from golden import TensorSpec
-    from utils import block_table, swa_indices_and_lens
-    from utils import build_rope_tables, materialize_token_rope_tables
+    from utils import (
+        block_table,
+        csa_decode_start_set,
+        position_ids_from_starts,
+        resolve_start_positions,
+        swa_indices_and_lens,
+        token_local_rope,
+    )
 
     tokens = batch * S
-    cmp_valid = IDX_TOPK
-    shared_freqs_cos, shared_freqs_sin = build_rope_tables(M, COMPRESS_RATIO, dtype=torch.bfloat16)
-    rope_positions = torch.arange(tokens, dtype=torch.int32)
-    shared_rope_cos, shared_rope_sin = materialize_token_rope_tables(shared_freqs_cos, shared_freqs_sin, rope_positions)
+    starts = resolve_start_positions(
+        start_pos,
+        batch=batch,
+        seq=S,
+        max_seq_len=MAX_SEQ_LEN,
+        default_fn=lambda: csa_decode_start_set(
+            batch=batch,
+            seq=S,
+            compress_ratio=COMPRESS_RATIO,
+        ),
+    )
+    positions = position_ids_from_starts(starts, seq=S)
+    visible_rows = ((positions.to(torch.int64) + 1) // COMPRESS_RATIO).reshape(-1)
+    max_visible_rows = int(visible_rows.max().item())
+    active_cmp_pages = max(1, (max_visible_rows + BLOCK_SIZE - 1) // BLOCK_SIZE)
+    cmp_block_num = batch * active_cmp_pages
+    shared_rope_cos, shared_rope_sin = token_local_rope(
+        M,
+        COMPRESS_RATIO,
+        positions.reshape(-1),
+        max_seq_len=MAX_SEQ_LEN,
+        dtype=torch.bfloat16,
+    )
 
     def init_q():
         """Initialize the query tensor used by the decode attention stage."""
@@ -572,7 +593,9 @@ def build_tensor_specs(
         """Initialize the sliding-window KV cache pages."""
         kv = torch.rand(ORI_BLOCK_NUM, BLOCK_SIZE, 1, HEAD_DIM) - 0.5
         if causal_regression_fixture:
-            kv[0, WIN - 1, 0].fill_(8.0)
+            sentinel_row = int(init_window_swa_indices()[0, -1].item())
+            if sentinel_row >= 0:
+                kv.reshape(-1, 1, HEAD_DIM)[sentinel_row, 0].fill_(8.0)
         if cache_window_replacement_fixture:
             kv[0, 16, 0].fill_(0.0)
             kv[0, 16, 0, 0] = 4.0
@@ -587,7 +610,6 @@ def build_tensor_specs(
         Going through swa_indices_and_lens straddles a page boundary whenever
         init_position_ids is not page-aligned, which it is not.
         """
-        positions = init_position_ids().reshape(batch, S)
         return swa_indices_and_lens(
             positions,
             init_window_block_table(),
@@ -597,7 +619,7 @@ def build_tensor_specs(
 
     def init_cmp_kv():
         """Initialize the compressed-cache KV pages."""
-        return torch.rand(CMP_BLOCK_NUM, BLOCK_SIZE, 1, HEAD_DIM) - 0.5
+        return torch.rand(cmp_block_num, BLOCK_SIZE, 1, HEAD_DIM) - 0.5
 
     def init_attn_sink():
         """Initialize the per-head sink logits to zero."""
@@ -609,20 +631,28 @@ def build_tensor_specs(
 
     def init_cmp_block_table():
         """Build the demo block table for the compressed-cache pages."""
-        return block_table(batch=batch, table_blocks=CMP_MAX_BLOCKS, physical_blocks=CMP_BLOCK_NUM)
+        return block_table(batch=batch, table_blocks=CMP_MAX_BLOCKS, physical_blocks=cmp_block_num)
 
     def init_cmp_sparse_indices():
-        """Build the compressed sparse index list."""
+        """Build length-aware logical Top-K candidates across each visible range."""
         indices = torch.full((tokens, CMP_TOPK), -1, dtype=torch.int32)
-        indices[:, :cmp_valid] = torch.arange(cmp_valid, dtype=torch.int32).unsqueeze(0).expand(tokens, -1)
-        if short_window_fixture:
-            indices[:, :] = -1
-            indices[:, :17] = torch.arange(17, dtype=torch.int32).unsqueeze(0).expand(tokens, -1)
-        if mixed_topk_fixture:
-            indices[:, :] = -1
-            mixed_cmp_valid = min(cmp_valid, IDX_TOPK)
-            if mixed_cmp_valid:
-                indices[:, :mixed_cmp_valid] = torch.arange(mixed_cmp_valid, dtype=torch.int32).unsqueeze(0).expand(tokens, -1)
+        for token, visible in enumerate(visible_rows.tolist()):
+            valid = min(CMP_TOPK, int(visible))
+            if short_window_fixture:
+                valid = min(valid, 17)
+            if valid == 0:
+                continue
+            if valid == int(visible) or mixed_topk_fixture:
+                candidates = torch.arange(valid, dtype=torch.int64)
+            elif valid == 1:
+                candidates = torch.zeros(1, dtype=torch.int64)
+            else:
+                candidates = torch.div(
+                    torch.arange(valid, dtype=torch.int64) * (int(visible) - 1),
+                    valid - 1,
+                    rounding_mode="floor",
+                )
+            indices[token, :valid] = candidates.to(torch.int32)
         if cache_window_replacement_fixture:
             indices[:, :] = -1
         if causal_regression_fixture:
@@ -630,17 +660,11 @@ def build_tensor_specs(
         return indices
 
     def init_idx_topk():
-        """Raw indexer topk feeding sparse_attn's compressed-slot masking. Only the
-        first CMP_TOPK cols are read; identity mask here (see init_position_ids), so
-        the masked output equals this fixture pattern."""
-        topk = torch.full((tokens, INDEXER_SCORE_LEN), -1, dtype=torch.int32)
-        topk[:, :CMP_TOPK] = init_cmp_sparse_indices()
-        return topk
+        """Raw logical Top-K output produced by the standalone indexer."""
+        return init_cmp_sparse_indices()
 
     def init_position_ids():
-        """Large enough that floor((pos + 1) / COMPRESS_RATIO) >= CMP_TOPK, so the
-        per-token bound never clips the fixture slots (mask reduces to raw >= 0)."""
-        return torch.full((tokens, 1), COMPRESS_RATIO * CMP_TOPK, dtype=torch.int32)
+        return positions.reshape(tokens, 1).contiguous()
 
     def init_cos():
         """Build the split-half cosine table used by the inverse-RoPE reference."""
@@ -654,9 +678,9 @@ def build_tensor_specs(
         TensorSpec("q", [tokens, H, HEAD_DIM], torch.bfloat16, init_value=init_q),
         TensorSpec("ori_kv", [ORI_BLOCK_NUM, BLOCK_SIZE, 1, HEAD_DIM], torch.bfloat16, init_value=init_ori_kv),
         TensorSpec("window_swa_indices", [tokens, WIN], torch.int32, init_value=init_window_swa_indices),
-        TensorSpec("cmp_kv", [CMP_BLOCK_NUM, BLOCK_SIZE, 1, HEAD_DIM], torch.bfloat16, init_value=init_cmp_kv),
+        TensorSpec("cmp_kv", [cmp_block_num, BLOCK_SIZE, 1, HEAD_DIM], torch.bfloat16, init_value=init_cmp_kv),
         TensorSpec("cmp_block_table", [batch, CMP_MAX_BLOCKS], torch.int32, init_value=init_cmp_block_table),
-        TensorSpec("idx_topk", [tokens, INDEXER_SCORE_LEN], torch.int32, init_value=init_idx_topk),
+        TensorSpec("idx_topk", [tokens, IDX_TOPK], torch.int32, init_value=init_idx_topk),
         TensorSpec("position_ids", [tokens, 1], torch.int32, init_value=init_position_ids),
         TensorSpec("attn_sink", [H], torch.float32, init_value=init_attn_sink),
         TensorSpec("freqs_cos", [tokens, ROPE_DIM], torch.bfloat16, init_value=init_cos),
@@ -673,9 +697,12 @@ if __name__ == "__main__":
     parser.add_argument("-p", "--platform", type=str, default="a2a3", choices=["a2a3", "a2a3sim", "a5", "a5sim"])
     parser.add_argument("-d", "--device", type=int, default=0)
     parser.add_argument("-b", "--batch", type=int, default=B,
-                        help=f"runtime request count; a multiple of 4 up to {B} (the compile-time "
-                             "upper bound). The token axis is pl.dynamic, so one compiled program "
+                        help=f"runtime request count up to {B} (the compile-time upper bound). "
+                             "The token axis is pl.dynamic, so one compiled program "
                              "serves every value.")
+    parser.add_argument("--start-pos", type=str, default=None,
+                        help="Fixture-only start position: one value for a uniform batch or "
+                             "a comma-separated value per request.")
     parser.add_argument("--causal-regression-fixture", action="store_true", default=False,
                         help="Amplify the S=2 future-window-slot regression.")
     parser.add_argument("--short-window-fixture", action="store_true", default=False,
@@ -691,8 +718,15 @@ if __name__ == "__main__":
     parser.add_argument("--enable-pmu", nargs="?", const=2, default=0, type=int, choices=[0, 1, 2, 4])
     parser.add_argument("--dump-passes", action="store_true", default=False)
     args = parser.parse_args()
-    if args.batch < 4 or args.batch > B or args.batch % 4 != 0:
-        parser.error(f"--batch must be a multiple of 4 in [4, {B}], got {args.batch}")
+    if args.batch < 1 or args.batch > B:
+        parser.error(f"--batch must be in [1, {B}], got {args.batch}")
+    start_pos = None
+    if args.start_pos is not None:
+        try:
+            start_values = [int(value) for value in args.start_pos.split(",")]
+        except ValueError:
+            parser.error(f"--start-pos must contain integers, got {args.start_pos!r}")
+        start_pos = start_values[0] if len(start_values) == 1 else start_values
 
     print(f"compress_ratio={COMPRESS_RATIO} -> TOPK={TOPK} SPARSE_BLOCKS={SPARSE_BLOCKS} PADDED_TOPK={PADDED_TOPK}", flush=True)
 
@@ -703,6 +737,7 @@ if __name__ == "__main__":
             args.short_window_fixture,
             args.mixed_topk_fixture,
             args.cache_window_replacement_fixture,
+            start_pos=start_pos,
             batch=args.batch,
         ),
         golden_fn=golden_sparse_attn,
