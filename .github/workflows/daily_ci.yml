@@ -4,6 +4,13 @@ on:
   schedule:
     - cron: '0 21 * * *'  # UTC 21:00 = Shanghai 05:00
   workflow_dispatch:
+  push:
+    # TEMPORARY (scoped to the experiment branch, not for merge): fire the
+    # daily sweep on push to measure mainline's A5 V4-Pro state on demand.
+    # The a5 job below is byte-identical to main's — same bundle toolchain,
+    # same sweep — so a push run here reproduces exactly what the nightly
+    # does, minus the sim/a2a3 jobs (skipped on push, see their notes).
+    branches: [exp/ptoas-op-fusion-ab]
 
 # Every job only reads the repo (checkouts use persist-credentials: false, the
 # artifact up/download steps use the run-scoped runtime token, the summary
@@ -18,6 +25,10 @@ jobs:
     # user, same conda venv + activate.sh, same ci-cache). needs-device:false is
     # the only difference: no npu-smi check and no Ascend env, which the simulator
     # does not use.
+    # TEMPORARY (this branch): skip on push — this branch's push runs exist
+    # solely to collect the A5 V4-Pro sweep; the nightly already covers the
+    # sim columns, and re-running them holds the shared runners for ~an hour.
+    if: ${{ github.event_name != 'push' }}
     runs-on: [self-hosted, linux, arm64, cpu]
     timeout-minutes: 120
     strategy:
@@ -154,6 +165,8 @@ jobs:
     # or a fixed card id. Checkout / install happen under ./checkout rather
     # than at the workspace root, so the root holds only the sparsely-fetched
     # action defs and any second repo a job needs sits beside this one.
+    # TEMPORARY (this branch): skip on push — see the sim job's note.
+    if: ${{ github.event_name != 'push' }}
     runs-on: [self-hosted, linux, arm64, npu]
     # Must exceed a single task-submit's worst case (--timeout 3600 queue wait +
     # --max-time 900 run), or the job dies before task-submit's own timeout can

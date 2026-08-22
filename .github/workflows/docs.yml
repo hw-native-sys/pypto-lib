@@ -15,6 +15,10 @@ permissions:
 
 jobs:
   build:
+    # TEMPORARY (this branch): the experiment branch exists only to fire the
+    # daily A5 sweep on push; skip the docs build for its PR (deploy is
+    # already PR-excluded and needs build, so it stays skipped too).
+    if: github.head_ref != 'exp/ptoas-op-fusion-ab'
     runs-on: ubuntu-latest
     timeout-minutes: 15
     steps:
