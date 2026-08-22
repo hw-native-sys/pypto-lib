@@ -20,7 +20,7 @@ Two kinds of support are reported here:
   platform. It describes the configured test target; consult the latest
   workflow run for the result of a particular revision.
 
-All 11 tracked examples declare `a2a3`, `a2a3sim`, `a5`, and `a5sim`. The
+All 12 tracked examples declare `a2a3`, `a2a3sim`, `a5`, and `a5sim`. The
 regular CI workflow runs them on `a2a3`, `a2a3sim`, and `a5sim`. It does not
 currently run examples on an `a5` device, so an accepted `-p a5` argument is
 not the same as CI-verified A5 execution.
@@ -38,6 +38,7 @@ not the same as CI-verified A5 execution.
 | Advanced | [Multi-projection](../../examples/advanced/multi_proj.py) | Reusable inline kernels | 1 | A2/A3, A2/A3 sim, A5, A5 sim | A2/A3, A2/A3 sim, A5 sim |
 | Advanced | [Top-k](../../examples/advanced/topk.py) | Sort and merge instructions | 1 | A2/A3, A2/A3 sim, A5, A5 sim | A2/A3, A2/A3 sim, A5 sim |
 | Advanced | [All-reduce](../../examples/advanced/allreduce.py) | L3 distributed execution | 2 | A2/A3, A2/A3 sim, A5, A5 sim | A2/A3, A2/A3 sim, A5 sim |
+| Advanced | [L3 all-gather + GEMM](../../examples/advanced/l3_allgather_gemm.py) | N-rank tiled allgather + GEMM | ≥2 | A2/A3, A2/A3 sim, A5, A5 sim | A2/A3, A2/A3 sim, A5 sim |
 
 ## Running an example
 
