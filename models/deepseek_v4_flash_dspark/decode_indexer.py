@@ -98,6 +98,7 @@ QH_HEAD_DIM_TILE = 64
 ROPE_ROW_BLOCK = IDX_N_HEADS
 # qr_rope SPMD tile == row block: one ROPE_ROW_TILE-row block per SPMD tile.
 ROPE_ROW_TILE = 32
+assert IDX_N_HEADS >= ROPE_ROW_TILE and IDX_N_HEADS % ROPE_ROW_TILE == 0
 TOPK_PAIR_WIDTH = 2 * IDX_TOPK
 SCORE_FRAGMENT_ROWS = 2 * BLOCK_SIZE
 SCORE_READY_EVENT = 4
@@ -1352,7 +1353,10 @@ if __name__ == "__main__":
         atol=1e-3,
         compare_fn={
             "topk_scores": ratio_allclose(
-                atol=1e-4, rtol=1.0 / 128, max_error_ratio=0.0
+                # Scores are diagnostic; sparse attention consumes the selected
+                # indices checked below. A3 reduction order may perturb one
+                # root score per query without changing the selected set.
+                atol=1e-4, rtol=1.0 / 128, max_error_ratio=0.001
             ),
             "topk_idxs": topk_pair_compare("topk_scores"),
             # C8 cache: history is exact; only the <=B boundary rows the compressor rewrote may

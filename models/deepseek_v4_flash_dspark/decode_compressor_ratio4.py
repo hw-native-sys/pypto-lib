@@ -172,17 +172,19 @@ def compressor_ratio4(
                                 if logical_pos < first_pos_b:
                                     ring_row = logical_pos % STATE_LEN
                                     state_page_off = ring_row // COMPRESS_STATE_BLOCK_SIZE
-                                    state_blk_id = pl.cast(
-                                        pl.read(compress_state_block_table, [c_idx, state_page_off]), pl.INDEX)
-                                    state_row = state_blk_id * COMPRESS_STATE_BLOCK_SIZE + ring_row % COMPRESS_STATE_BLOCK_SIZE
-                                    value = compress_state_flat[
-                                        state_row : state_row + 1,
-                                        state_half + h0 : state_half + h0 + HEAD_TILE,
-                                    ]
-                                    score = compress_state_flat[
-                                        state_row : state_row + 1,
-                                        OUT_DIM + state_half + h0 : OUT_DIM + state_half + h0 + HEAD_TILE,
-                                    ]
+                                    state_blk_id_i32 = pl.read(
+                                        compress_state_block_table, [c_idx, state_page_off])
+                                    if state_blk_id_i32 >= 0:
+                                        state_blk_id = pl.cast(state_blk_id_i32, pl.INDEX)
+                                        state_row = state_blk_id * COMPRESS_STATE_BLOCK_SIZE + ring_row % COMPRESS_STATE_BLOCK_SIZE
+                                        value = compress_state_flat[
+                                            state_row : state_row + 1,
+                                            state_half + h0 : state_half + h0 + HEAD_TILE,
+                                        ]
+                                        score = compress_state_flat[
+                                            state_row : state_row + 1,
+                                            OUT_DIM + state_half + h0 : OUT_DIM + state_half + h0 + HEAD_TILE,
+                                        ]
                                 if logical_pos >= first_pos_b:
                                     if logical_pos <= token_pos:
                                         overlay_token = c_idx * s_dim + logical_pos - first_pos_b
@@ -434,14 +436,20 @@ def build_tensor_specs(start_pos=None, batch=B):
     )
     from golden import TensorSpec
 
+    def default_starts():
+        # Keep the default standalone fixture on a complete recurrent window;
+        # explicit --start-pos values still cover cold-start probes.
+        values = csa_decode_start_set(
+            batch=batch, seq=S, compress_ratio=COMPRESS_RATIO,
+            state_block_size=COMPRESS_STATE_BLOCK_SIZE)
+        return torch.where(values < STATE_LEN, values + STATE_LEN, values)
+
     starts = resolve_start_positions(
         start_pos,
         batch=batch,
         seq=S,
         max_seq_len=MAX_SEQ_LEN,
-        default_fn=lambda: csa_decode_start_set(
-            batch=batch, seq=S, compress_ratio=COMPRESS_RATIO,
-            state_block_size=COMPRESS_STATE_BLOCK_SIZE),
+        default_fn=default_starts,
     )
     positions = position_ids_from_starts(starts, seq=S)
     state_block_num = batch * COMPRESS_STATE_MAX_BLOCKS

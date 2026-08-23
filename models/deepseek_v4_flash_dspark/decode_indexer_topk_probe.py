@@ -341,7 +341,11 @@ def build_forest_probe_specs():
         ],
         dtype=torch.int32,
     )
-    assert candidate_counts.numel() <= PROBE_QUERY_CAP
+    if candidate_counts.numel() > PROBE_QUERY_CAP:
+        raise ValueError(
+            f"forest probe supports at most {PROBE_QUERY_CAP} queries, "
+            f"got {candidate_counts.numel()}"
+        )
     leaf_counts = (
         candidate_counts + TOPK_CANDIDATES_PER_LEAF - 1
     ) // TOPK_CANDIDATES_PER_LEAF

@@ -581,6 +581,17 @@ def build_tensor_specs(
         max_seq_len=MAX_SEQ_LEN,
         dtype=torch.bfloat16,
     )
+    shared_window_block_table = block_table(
+        batch=batch,
+        table_blocks=ORI_MAX_BLOCKS,
+        physical_blocks=ORI_BLOCK_NUM,
+    )
+    shared_swa_indices = swa_indices_and_lens(
+        positions,
+        shared_window_block_table,
+        block_size=BLOCK_SIZE,
+        window=WIN,
+    )[0].contiguous()
 
     def init_q():
         """Initialize the query tensor used by the decode attention stage."""
@@ -593,7 +604,7 @@ def build_tensor_specs(
         """Initialize the sliding-window KV cache pages."""
         kv = torch.rand(ORI_BLOCK_NUM, BLOCK_SIZE, 1, HEAD_DIM) - 0.5
         if causal_regression_fixture:
-            sentinel_row = int(init_window_swa_indices()[0, -1].item())
+            sentinel_row = int(shared_swa_indices[0, -1].item())
             if sentinel_row >= 0:
                 kv.reshape(-1, 1, HEAD_DIM)[sentinel_row, 0].fill_(8.0)
         if cache_window_replacement_fixture:
@@ -610,12 +621,7 @@ def build_tensor_specs(
         Going through swa_indices_and_lens straddles a page boundary whenever
         init_position_ids is not page-aligned, which it is not.
         """
-        return swa_indices_and_lens(
-            positions,
-            init_window_block_table(),
-            block_size=BLOCK_SIZE,
-            window=WIN,
-        )[0].contiguous()
+        return shared_swa_indices.clone()
 
     def init_cmp_kv():
         """Initialize the compressed-cache KV pages."""
@@ -627,7 +633,7 @@ def build_tensor_specs(
 
     def init_window_block_table():
         """Build the demo block table for the sliding-window cache pages."""
-        return block_table(batch=batch, table_blocks=ORI_MAX_BLOCKS, physical_blocks=ORI_BLOCK_NUM)
+        return shared_window_block_table.clone()
 
     def init_cmp_block_table():
         """Build the demo block table for the compressed-cache pages."""
@@ -723,9 +729,19 @@ if __name__ == "__main__":
     start_pos = None
     if args.start_pos is not None:
         try:
-            start_values = [int(value) for value in args.start_pos.split(",")]
+            start_values = [
+                int(value.strip())
+                for value in args.start_pos.split(",")
+                if value.strip() != ""
+            ]
         except ValueError:
             parser.error(f"--start-pos must contain integers, got {args.start_pos!r}")
+        if not start_values:
+            parser.error("--start-pos must contain at least one integer")
+        if len(start_values) not in (1, args.batch):
+            parser.error(
+                f"--start-pos needs 1 or {args.batch} values, got {len(start_values)}"
+            )
         start_pos = start_values[0] if len(start_values) == 1 else start_values
 
     print(f"compress_ratio={COMPRESS_RATIO} -> TOPK={TOPK} SPARSE_BLOCKS={SPARSE_BLOCKS} PADDED_TOPK={PADDED_TOPK}", flush=True)

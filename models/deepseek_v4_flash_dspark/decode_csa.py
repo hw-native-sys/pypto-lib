@@ -308,7 +308,7 @@ def decode_csa(
 
     position_ids_t1 = pl.reshape(position_ids, [t_dim, 1])
     attention_grouped = pl.create_tensor([O_GROUPS * LOCAL_T_PAD, O_GROUP_IN], dtype=pl.BF16)
-    attention_grouped, heads_tid = sparse_attn_csa(
+    attention_grouped, _heads_tid = sparse_attn_csa(
         q, kv_cache, window_swa_indices,
         cmp_kv, cmp_block_table, idx_topk,
         position_ids_t1, attn_sink, freqs_cos, freqs_sin,
