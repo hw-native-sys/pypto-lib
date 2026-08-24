@@ -61,8 +61,8 @@ QR_SPLIT_K_TILE = D // QR_OK  # qr_proj K per split (=2048)
 KV_M_TILE = MATMUL_T_TILE  # kv_proj token (M) tile; decode pads from 8 real rows to 16
 KV_N_TILE = 128  # kv_proj HEAD_DIM (N) per matmul
 KV_K_TILE = 256  # kv_proj D (K) reduction tile   | divides KV_SPLIT_K_TILE
-KV_OK = 4  # kv_proj split-K factor         | D//KV_OK cores share each N-group
-KV_SPLIT_K_TILE = D // KV_OK  # kv_proj K per split (=1024)
+KV_OK = 2  # kv_proj split-K factor         | D//KV_OK cores share each N-group
+KV_SPLIT_K_TILE = D // KV_OK  # kv_proj K per split (=2048)
 QPROJ_M_TILE = 64  # dense qproj token tile; fills the 128 KiB L0C accumulator
 QPROJ_TAIL_M_TILE = MATMUL_T_TILE  # partial-M path validated by decode/small physical T
 KV_RMS_T_TILE = 8  # kv rms-norm + rope fused token (T) tile
@@ -371,7 +371,7 @@ def _q_proj_rope_tile(
     # 64-row block is lowered through the established 16-row cube shape.
     for qproj_n_idx in pl.spmd(
         (H * HEAD_DIM) // QPROJ_MM_N_TILE,
-        name_hint="qproj_matmul_full",
+        name_hint="qproj_matmul",
     ):
         w_col0 = qproj_n_idx * QPROJ_MM_N_TILE
         for t0 in pl.range(0, qproj_full_rows, QPROJ_M_TILE):
@@ -388,11 +388,7 @@ def _q_proj_rope_tile(
                     col_acc = pl.matmul_acc(col_acc, qr_i8_chunk, wq_chunk)
             q_proj_i32[t0 : t0 + QPROJ_M_TILE, w_col0 : w_col0 + QPROJ_MM_N_TILE] = col_acc
 
-    for qproj_tail_n_idx in pl.spmd(
-        (H * HEAD_DIM) // QPROJ_MM_N_TILE,
-        name_hint="qproj_matmul_tail",
-    ):
-        tail_w_col0 = qproj_tail_n_idx * QPROJ_MM_N_TILE
+        tail_w_col0 = w_col0
         for tail_t0 in pl.range(qproj_full_rows, qproj_t_matmul, QPROJ_TAIL_M_TILE):
             qproj_tail_rows = pl.min(QPROJ_TAIL_M_TILE, tile_rows - tail_t0)
             tail_acc = pl.create_tensor([QPROJ_TAIL_M_TILE, QPROJ_MM_N_TILE], dtype=pl.INT32)

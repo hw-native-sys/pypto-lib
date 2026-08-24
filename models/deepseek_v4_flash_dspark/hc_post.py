@@ -48,24 +48,24 @@ def hc_post(
     y_flat = pl.reshape(y, [t_dim, HC_DIM])
 
     token_tiles = (t_dim + T_TILE - 1) // T_TILE
-    for block in pl.spmd(token_tiles * HC_MULT, name_hint="hc_post"):
-        token_block = block // HC_MULT
-        out_h = block % HC_MULT
+    for token_block in pl.spmd(token_tiles, name_hint="hc_post"):
         t0 = token_block * T_TILE
         for t in pl.pipeline(t0, t0 + T_TILE, stage=2):
             if t < t_dim:
-                post_w = pl.read(post, [t, out_h])
+                # One cast per token: all HC_MULT outputs share the x row.
                 x_row = pl.cast(x[t : t + 1, 0:D], target_type=pl.FP32)
-                y_row = pl.mul(x_row, post_w)
-                for in_h in pl.pipeline(HC_MULT, stage=4):
-                    comb_w = pl.read(comb, [t, in_h * HC_MULT + out_h])
-                    res_d = in_h * D
-                    # residual is already FP32 (hc stream is FP32 end-to-end): no cast, read straight.
-                    res_row = residual_flat[t : t + 1, res_d : res_d + D]
-                    weighted = pl.mul(res_row, comb_w)
-                    y_row = pl.add(y_row, weighted)
-                # y is FP32 (feeds the next layer's hc_pre directly): no BF16 output cast.
-                y_flat[t : t + 1, out_h * D : out_h * D + D] = y_row
+                for out_h in pl.unroll(HC_MULT):
+                    post_w = pl.read(post, [t, out_h])
+                    y_row = pl.mul(x_row, post_w)
+                    for in_h in pl.pipeline(HC_MULT, stage=4):
+                        comb_w = pl.read(comb, [t, in_h * HC_MULT + out_h])
+                        res_d = in_h * D
+                        # residual is already FP32 (hc stream is FP32 end-to-end): no cast, read straight.
+                        res_row = residual_flat[t : t + 1, res_d : res_d + D]
+                        weighted = pl.mul(res_row, comb_w)
+                        y_row = pl.add(y_row, weighted)
+                    # y is FP32 (feeds the next layer's hc_pre directly): no BF16 output cast.
+                    y_flat[t : t + 1, out_h * D : out_h * D + D] = y_row
     return y
 
 

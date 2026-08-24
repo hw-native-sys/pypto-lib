@@ -912,6 +912,8 @@ if __name__ == "__main__":
         help="absolute decode start position; a scalar sets batch=1, "
              "and a comma-separated list sets batch to its length",
     )
+    parser.add_argument("--golden-data", type=str, default=None)
+    parser.add_argument("--save-data", action="store_true", default=False)
     parser.add_argument("--enable-chip-swimlane", type=int, choices=(0, 1, 2, 4), default=0)
     parser.add_argument("--compile-only", action="store_true", default=False)
     parser.add_argument("--dump-passes", action="store_true", default=False)
@@ -955,6 +957,8 @@ if __name__ == "__main__":
                 fn=decode_swa_tp1_test,
                 specs=build_tensor_specs(start_pos=args.start_pos, batch=local_t // S),
                 golden_fn=golden_decode_swa_tp1,
+                golden_data=args.golden_data,
+                save_data=args.save_data,
                 compile_only=args.compile_only,
                 compile_cfg=dict(dump_passes=args.dump_passes),
                 runtime_cfg=dict(
@@ -982,6 +986,8 @@ if __name__ == "__main__":
                 fn=l3_decode_swa,
                 specs=build_distributed_tensor_specs(local_t, start_pos=args.start_pos),
                 golden_fn=golden_decode_swa,
+                golden_data=args.golden_data,
+                save_data=args.save_data,
                 compile_only=args.compile_only,
                 compile_cfg=dict(
                     dump_passes=args.dump_passes,

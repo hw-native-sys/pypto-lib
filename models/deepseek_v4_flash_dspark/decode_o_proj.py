@@ -73,16 +73,16 @@ O_WINDOW_ROWS = TP_SIZE * LOCAL_T_PAD
 # local output projection tiling
 A_K_TILE = 256
 PROJ_A_MM_N_TILE = 128
-PROJ_A_ROW_TILE = 16
+PROJ_A_ROW_TILE = 128  # proj_a token block; one block covers T_PAD, 8 tasks/group
 B_K_TILE = 256
 # Keep the INT32 proj-b accumulator within the A2/A3 tile buffer.
 PROJ_B_MM_T_TILE = 128
 PROJ_B_MM_N_TILE = 256
 PROJ_B_ACT_N_TILE = 512
 QUANT_TOKEN_TILE = 8
-PROJ_B_D_TILE = 512
+PROJ_B_D_TILE = 512  # proj_b_mm D chunk per task; coarser starves the 24 AIC cores
 PROJ_B_ACT_T_TILE = 8
-PROJ_B_ACT_TASK_T_TILE = 8
+PROJ_B_ACT_TASK_T_TILE = 32  # proj_b_act token block per task
 
 # TP-sharded output projection tiling
 O_A_T_TILE = 16
