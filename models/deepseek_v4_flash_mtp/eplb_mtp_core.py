@@ -127,8 +127,8 @@ def eplb_mtp_core_logits(
     wkv: pl.Tensor[[D, HEAD_DIM], pl.BF16],
     gamma_cq: pl.Tensor[[Q_LORA], pl.BF16],
     gamma_ckv: pl.Tensor[[HEAD_DIM], pl.BF16],
-    freqs_cos: pl.Tensor[[MAX_SEQ_LEN, ROPE_HEAD_DIM], pl.BF16],
-    freqs_sin: pl.Tensor[[MAX_SEQ_LEN, ROPE_HEAD_DIM], pl.BF16],
+    freqs_cos: pl.Tensor[[2, MAX_SEQ_LEN, ROPE_HEAD_DIM], pl.BF16],
+    freqs_sin: pl.Tensor[[2, MAX_SEQ_LEN, ROPE_HEAD_DIM], pl.BF16],
     kv_cache: pl.InOut[pl.Tensor[[ORI_BLOCK_NUM_DYN, BLOCK_SIZE, 1, HEAD_DIM], pl.BF16]],
     attn_sink: pl.Tensor[[H], pl.FP32],
     wo_a: pl.Tensor[[O_GROUPS, O_LORA, O_GROUP_IN], pl.BF16],
@@ -178,6 +178,21 @@ def eplb_mtp_core_logits(
     my_rank: pl.Scalar[pl.INT32],
     num_tokens: pl.Scalar[pl.INT32],
 ) -> pl.Tensor[[MAX_LOGIT_ROWS, LM_HEAD_VOCAB], pl.FP32]:
+    # Main MTP now carries SWA and compressed RoPE profiles together.  The
+    # EPLB interval still consumes the SWA profile through attention_swa's
+    # two-dimensional contract.
+    swa_cos_profile: pl.Tensor[[1, MAX_SEQ_LEN, ROPE_HEAD_DIM], pl.BF16] = pl.slice(
+        freqs_cos, [1, MAX_SEQ_LEN, ROPE_HEAD_DIM], [0, 0, 0]
+    )
+    swa_sin_profile: pl.Tensor[[1, MAX_SEQ_LEN, ROPE_HEAD_DIM], pl.BF16] = pl.slice(
+        freqs_sin, [1, MAX_SEQ_LEN, ROPE_HEAD_DIM], [0, 0, 0]
+    )
+    swa_freqs_cos: pl.Tensor[[MAX_SEQ_LEN, ROPE_HEAD_DIM], pl.BF16] = pl.reshape(
+        swa_cos_profile, [MAX_SEQ_LEN, ROPE_HEAD_DIM]
+    )
+    swa_freqs_sin: pl.Tensor[[MAX_SEQ_LEN, ROPE_HEAD_DIM], pl.BF16] = pl.reshape(
+        swa_sin_profile, [MAX_SEQ_LEN, ROPE_HEAD_DIM]
+    )
     projected_hidden = pl.create_tensor([T, HC_MULT, D], dtype=pl.FP32)
     with pl.scope():
         mtp_projection(
@@ -196,7 +211,7 @@ def eplb_mtp_core_logits(
             attn_norm_w,
             wq_a, wq_b, wq_b_scale,
             wkv, gamma_cq, gamma_ckv,
-            freqs_cos, freqs_sin,
+            swa_freqs_cos, swa_freqs_sin,
             kv_cache,
             swa_slot_mapping, swa_indices, swa_lens, position_ids,
             attn_sink, wo_a, wo_b, wo_b_scale,
@@ -277,8 +292,8 @@ def l3_eplb_mtp_core(
     wkv: pl.Tensor[[N_RANKS, D, HEAD_DIM], pl.BF16],
     gamma_cq: pl.Tensor[[N_RANKS, Q_LORA], pl.BF16],
     gamma_ckv: pl.Tensor[[N_RANKS, HEAD_DIM], pl.BF16],
-    freqs_cos: pl.Tensor[[N_RANKS, MAX_SEQ_LEN, ROPE_HEAD_DIM], pl.BF16],
-    freqs_sin: pl.Tensor[[N_RANKS, MAX_SEQ_LEN, ROPE_HEAD_DIM], pl.BF16],
+    freqs_cos: pl.Tensor[[N_RANKS, 2, MAX_SEQ_LEN, ROPE_HEAD_DIM], pl.BF16],
+    freqs_sin: pl.Tensor[[N_RANKS, 2, MAX_SEQ_LEN, ROPE_HEAD_DIM], pl.BF16],
     kv_cache: pl.InOut[pl.Tensor[[N_RANKS, ORI_BLOCK_NUM_DYN, BLOCK_SIZE, 1, HEAD_DIM], pl.BF16]],
     attn_sink: pl.Tensor[[N_RANKS, H], pl.FP32],
     wo_a: pl.Tensor[[N_RANKS, O_GROUPS, O_LORA, O_GROUP_IN], pl.BF16],
@@ -562,8 +577,8 @@ def golden_eplb_mtp_core(tensors):
             "wkv": tensors["wkv"][rank],
             "gamma_cq": tensors["gamma_cq"][rank],
             "gamma_ckv": tensors["gamma_ckv"][rank],
-            "freqs_cos": tensors["freqs_cos"][rank],
-            "freqs_sin": tensors["freqs_sin"][rank],
+            "freqs_cos": tensors["freqs_cos"][rank, 0],
+            "freqs_sin": tensors["freqs_sin"][rank, 0],
             "kv_cache": tensors["kv_cache"][rank],
             "swa_slot_mapping": tensors["swa_slot_mapping"][rank],
             "swa_indices": tensors["swa_indices"][rank],
