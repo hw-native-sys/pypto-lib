@@ -549,7 +549,15 @@ runs:
         # releases of scikit-build-core before reporting it, burying the real
         # message ("no matching distribution for packaging") under a wall of
         # version lists. pyproject already requires >=0.10.0.
-        pip install 'scikit-build-core>=0.10' nanobind cmake ninja
+        # nanobind is capped below 3.0 to match pypto's own build requirement.
+        # It has to be pinned here rather than inherited: the pypto build below
+        # passes --no-build-isolation, so the extension is compiled against this
+        # install and pypto's [build-system] requires is never consulted.
+        # nanobind 3.0 stopped binding a null holder to a parameter typed after a
+        # bound class, which is what pypto's TileView uses for `start_offset`, so
+        # `ir.TileView()` no longer matches its own all-defaulted overload and
+        # every `pl.Tile` annotation fails to parse.
+        pip install 'scikit-build-core>=0.10' 'nanobind<3' cmake ninja
         # torch BEFORE pypto is built. pypto declares torch>=2.0.0, and if it is
         # not installed yet pip resolves that from the default index, where the
         # aarch64 wheel now drags ~1.5 GB of CUDA onto an Ascend host. Under
@@ -609,7 +617,7 @@ runs:
       working-directory: ${{ inputs.checkout-path }}
       run: |
         source activate.sh
-        pip install nanobind
+        pip install 'nanobind<3'  # same cap as the build step above
         # torch is installed in the build step above, before pypto is resolved.
 
     - name: Show ccache stats (after)
