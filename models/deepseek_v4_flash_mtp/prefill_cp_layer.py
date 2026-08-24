@@ -45,7 +45,7 @@ from moe import (
     build_tensor_specs as build_moe_tensor_specs,
     clear_moe_signals,
     golden_moe,
-    moe,
+    moe_legacy,
 )
 from prefill_cp_swa import (
     CP_CHOICES,
@@ -362,7 +362,7 @@ def _prefill_layer_cp_moe_tail(
         wave_out = pl.create_tensor(
             [T, HC_MULT, D], dtype=pl.FP32, init_value=0.0
         )
-        moe(
+        moe_legacy(
             x_moe_ready, hc_ffn_fn, hc_ffn_scale, hc_ffn_base,
             norm_w, gate_w, gate_bias, tid2eid, ids,
             routed_w1, routed_w1_scale, routed_w3, routed_w3_scale,
@@ -1940,7 +1940,7 @@ def _build_moe_specs(layer_id: int):
     for spec in moe_specs:
         if not isinstance(spec, TensorSpec):
             continue  # drop ScalarSpecs (layer_id, num_tokens)
-        if spec.name in {"x_hc", "x_next", "input_ids"}:
+        if spec.name in {"x_hc", "x_next", "input_ids", "moe_token_counts"}:
             continue
         moe_keep.append(spec)
     return moe_keep

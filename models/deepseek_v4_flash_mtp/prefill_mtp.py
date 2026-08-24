@@ -46,6 +46,7 @@ from moe import (
     HC_MULT,
     IDX_PAD,
     MIX_HC,
+    MOE_STATS_NUM_LAYERS,
     MOE_INTER,
     N_EXPERTS_GLOBAL,
     N_LOCAL,
@@ -180,7 +181,9 @@ def mtp_prefill_fwd(
     data_arrived: pld.DistributedTensor[[N_RANKS, 1], pl.INT32],
     routed_y_buf: pld.DistributedTensor[[N_ROUTES, D], pl.BF16],
     combine_arrived: pld.DistributedTensor[[N_RANKS, 1], pl.INT32],
+    moe_token_counts: pl.InOut[pl.Tensor[[MOE_STATS_NUM_LAYERS, N_LOCAL], pl.INT32]],
     my_rank: pl.Scalar[pl.INT32],
+    dump_moe_stats: pl.Scalar[pl.INT32],
     num_tokens: pl.Scalar[pl.INT32],
 ) -> pl.Tensor[[T, D], pl.BF16]:
     nt: pl.Scalar[pl.INT32] = num_tokens
@@ -233,8 +236,9 @@ def mtp_prefill_fwd(
             shared_w2, shared_w2_scale,
             pre_hc_hidden_out,
             recv_meta, recv_x, recv_aux, recv_route,
-            arrived, data_arrived, routed_y_buf, combine_arrived,
-            pl.cast(MTP_LAYER_ID, pl.INT32), nt, my_rank, pl.cast(MTP_MOE_EPOCH, pl.INT32),
+            arrived, data_arrived, routed_y_buf, combine_arrived, moe_token_counts,
+            pl.cast(MTP_LAYER_ID, pl.INT32), nt, my_rank,
+            pl.cast(MTP_MOE_EPOCH, pl.INT32), dump_moe_stats,
         )
 
     clear_moe_signals(pre_hc_hidden_out, arrived, data_arrived, combine_arrived)
@@ -306,6 +310,10 @@ def l3_mtp_prefill_fwd(
     pre_hc_hidden_out: pl.Out[pl.Tensor[[N_RANKS, T, HC_MULT, D], pl.FP32]],
     logits: pl.Out[pl.Tensor[[N_RANKS, MAX_LOGIT_ROWS, LM_HEAD_VOCAB], pl.FP32]],
     logit_row_indices: pl.Tensor[[N_RANKS, MAX_LOGIT_ROWS], pl.INT32],
+    moe_token_counts: pl.InOut[
+        pl.Tensor[[N_RANKS, MOE_STATS_NUM_LAYERS, N_LOCAL], pl.INT32]
+    ],
+    dump_moe_stats: pl.Scalar[pl.INT32],
     num_tokens: pl.Scalar[pl.INT32],
 ):
     recv_meta_buf = pld.alloc_window_buffer([N_RANKS, N_LOCAL], dtype=pl.INT32)
@@ -349,8 +357,8 @@ def l3_mtp_prefill_fwd(
             mtp_hc_head_fn[r], mtp_hc_head_scale[r], mtp_hc_head_base[r], mtp_norm_w[r],
             hidden_out[r], pre_hc_hidden_out[r],
             recv_meta, recv_x, recv_aux, recv_route, arrived, data_arrived,
-            routed_y_buf, combine_arrived,
-            r, num_tokens,
+            routed_y_buf, combine_arrived, moe_token_counts[r],
+            r, dump_moe_stats, num_tokens,
             device=r,
         )
 
@@ -608,6 +616,12 @@ def build_tensor_specs(
         init_value=init_logit_row_indices,
     )
     specs.append(row_indices_spec)
+    specs.append(TensorSpec(
+        "moe_token_counts",
+        [N_RANKS, MOE_STATS_NUM_LAYERS, N_LOCAL],
+        torch.int32,
+    ))
+    specs.append(ScalarSpec("dump_moe_stats", torch.int32, 1))
     specs.append(ScalarSpec("num_tokens", torch.int32, num_tokens))
     return specs
 

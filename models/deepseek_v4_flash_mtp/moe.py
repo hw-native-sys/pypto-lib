@@ -62,6 +62,8 @@ N_RANKS = EP_WORLD_SIZE
 N_EXPERTS_GLOBAL = M.n_routed_experts
 N_LOCAL = N_EXPERTS_GLOBAL // N_RANKS
 N_ROUTES = T * TOPK
+# Hidden-layer rows plus one MTP row for physical-expert token counts.
+MOE_STATS_NUM_LAYERS = M.num_hidden_layers + 1
 
 # recv_x/recv_aux laid out [expert, source, slot], flattened to
 # [N_LOCAL * RECV_MAX, D]. Lane (e, src, slot) flat row = e * RECV_MAX +
@@ -121,10 +123,12 @@ def dispatch(
     recv_route: pld.DistributedTensor[[N_LOCAL * RECV_MAX, IDX_PAD], pl.INT32],
     arrived: pld.DistributedTensor[[N_RANKS, 1], pl.INT32],
     data_arrived: pld.DistributedTensor[[N_RANKS, 1], pl.INT32],
+    moe_token_counts: pl.InOut[pl.Tensor[[1, N_LOCAL], pl.INT32]],
     num_tokens: pl.Scalar[pl.INT32],
     my_rank: pl.Scalar[pl.INT32],
     # 1-based MoE call id; `arrived`/`data_arrived` are monotonic so waits use `>= moe_epoch`.
     moe_epoch: pl.Scalar[pl.INT32],
+    dump_moe_stats: pl.Scalar[pl.INT32],
 ):
     # Flat 2-D view kept outside the scope so it stays a tensor view, not a tile.
     recv_x_out_flat = pl.reshape(recv_x_out, [N_LOCAL * RECV_MAX, D])
@@ -194,6 +198,10 @@ def dispatch(
                 pl.write(recv_meta_local, [src, e], count)
                 acc = acc + count
             pl.write(recv_count_out, [e, 0], acc)
+            # Accumulate received token counts by physical expert.
+            if dump_moe_stats != 0:
+                previous = pl.read(moe_token_counts, [0, e])
+                pl.write(moe_token_counts, [0, e], previous + acc)
 
     # Move the bulk payload (x / aux / route) to each destination lane.
     # Split over LOCAL EXPERT INDEX (N_LOCAL blocks): block loc_e handles expert
@@ -439,12 +447,14 @@ def moe(
     data_arrived: pld.DistributedTensor[[N_RANKS, 1], pl.INT32],
     routed_y_buf: pld.DistributedTensor[[N_ROUTES, D], pl.BF16],
     combine_arrived: pld.DistributedTensor[[N_RANKS, 1], pl.INT32],
+    moe_token_counts: pl.InOut[pl.Tensor[[MOE_STATS_NUM_LAYERS, N_LOCAL], pl.INT32]],
     # scalars last: runtime TaskArgs forbids a tensor arg after a scalar arg.
     layer_id: pl.Scalar[pl.INT32],
     num_tokens: pl.Scalar[pl.INT32],
     my_rank: pl.Scalar[pl.INT32],
     # 1-based MoE call id for the shared flag windows (distinct from layer_id).
     moe_epoch: pl.Scalar[pl.INT32],
+    dump_moe_stats: pl.Scalar[pl.INT32],
 ) -> pl.Tensor[[T, HC_MULT, D], pl.FP32]:
     # Non-output intermediates allocate locally, in their producer's scope.
     x_mixed = pl.create_tensor([T, D], dtype=pl.BF16)
@@ -479,11 +489,14 @@ def moe(
     recv_r_route_out = pl.create_tensor([N_LOCAL, RECV_MAX], dtype=pl.INT32, manual_dep=True)
     recv_count_out = pl.create_tensor([N_LOCAL, 1], dtype=pl.INT32)
     recv_meta_local = pl.create_tensor([N_RANKS, N_LOCAL], dtype=pl.INT32, manual_dep=True)
+    moe_token_counts_row: pl.Tensor[[1, N_LOCAL], pl.INT32] = pl.slice(
+        moe_token_counts, [1, N_LOCAL], [layer_id, 0]
+    )
     dispatch_push_tid = dispatch(
         indices, x_norm_i8, x_norm_scale, weights,
         recv_x_out, recv_scale_out, recv_w_out, recv_r_route_out, recv_count_out, recv_meta_local,
         recv_meta, recv_x, recv_aux, recv_route, arrived, data_arrived,
-        num_tokens, my_rank, moe_epoch,
+        moe_token_counts_row, num_tokens, my_rank, moe_epoch, dump_moe_stats,
     )
 
     with pl.scope():
@@ -505,6 +518,58 @@ def moe(
 
         hc_post(ffn_out, x_hc, post_ffn, comb_ffn, x_next)
     return x_next
+
+
+@pl.jit.inline(auto_scope=False)
+def moe_legacy(
+    x_hc: pl.Tensor[[T, HC_MULT, D], pl.FP32],
+    hc_ffn_fn: pl.Tensor[[MIX_HC, HC_DIM], pl.FP32],
+    hc_ffn_scale: pl.Tensor[[3], pl.FP32],
+    hc_ffn_base: pl.Tensor[[MIX_HC], pl.FP32],
+    norm_w: pl.Tensor[[D], pl.BF16],
+    gate_w: pl.Tensor[[N_EXPERTS_GLOBAL, D], pl.FP32],
+    gate_bias: pl.Tensor[[N_EXPERTS_GLOBAL], pl.FP32],
+    tid2eid: pl.Tensor[[VOCAB, TOPK], pl.INT32],
+    input_ids: pl.Tensor[[T], pl.INT64],
+    routed_w1: pl.Tensor[[N_LOCAL, MOE_INTER, D], pl.INT8],
+    routed_w1_scale: pl.Tensor[[N_LOCAL, MOE_INTER], pl.FP32],
+    routed_w3: pl.Tensor[[N_LOCAL, MOE_INTER, D], pl.INT8],
+    routed_w3_scale: pl.Tensor[[N_LOCAL, MOE_INTER], pl.FP32],
+    routed_w2: pl.Tensor[[N_LOCAL, D, MOE_INTER], pl.INT8],
+    routed_w2_scale: pl.Tensor[[N_LOCAL, D], pl.FP32],
+    shared_w1: pl.Tensor[[MOE_INTER, D], pl.INT8],
+    shared_w1_scale: pl.Tensor[[MOE_INTER], pl.FP32],
+    shared_w3: pl.Tensor[[MOE_INTER, D], pl.INT8],
+    shared_w3_scale: pl.Tensor[[MOE_INTER], pl.FP32],
+    shared_w2: pl.Tensor[[D, MOE_INTER], pl.INT8],
+    shared_w2_scale: pl.Tensor[[D], pl.FP32],
+    x_next: pl.Out[pl.Tensor[[T, HC_MULT, D], pl.FP32]],
+    recv_meta: pld.DistributedTensor[[N_RANKS, N_LOCAL], pl.INT32],
+    recv_x: pld.DistributedTensor[[N_LOCAL * RECV_MAX, D], pl.INT8],
+    recv_aux: pld.DistributedTensor[[N_LOCAL * RECV_MAX, AUX_PAD], pl.FP32],
+    recv_route: pld.DistributedTensor[[N_LOCAL * RECV_MAX, IDX_PAD], pl.INT32],
+    arrived: pld.DistributedTensor[[N_RANKS, 1], pl.INT32],
+    data_arrived: pld.DistributedTensor[[N_RANKS, 1], pl.INT32],
+    routed_y_buf: pld.DistributedTensor[[N_ROUTES, D], pl.BF16],
+    combine_arrived: pld.DistributedTensor[[N_RANKS, 1], pl.INT32],
+    layer_id: pl.Scalar[pl.INT32],
+    num_tokens: pl.Scalar[pl.INT32],
+    my_rank: pl.Scalar[pl.INT32],
+    moe_epoch: pl.Scalar[pl.INT32],
+) -> pl.Tensor[[T, HC_MULT, D], pl.FP32]:
+    """Compatibility path for callables that do not expose the fixed stats ABI."""
+    unused_counts = pl.create_tensor([MOE_STATS_NUM_LAYERS, N_LOCAL], dtype=pl.INT32)
+    return moe(
+        x_hc, hc_ffn_fn, hc_ffn_scale, hc_ffn_base,
+        norm_w, gate_w, gate_bias, tid2eid, input_ids,
+        routed_w1, routed_w1_scale, routed_w3, routed_w3_scale,
+        routed_w2, routed_w2_scale,
+        shared_w1, shared_w1_scale, shared_w3, shared_w3_scale,
+        shared_w2, shared_w2_scale, x_next,
+        recv_meta, recv_x, recv_aux, recv_route, arrived, data_arrived,
+        routed_y_buf, combine_arrived, unused_counts,
+        layer_id, num_tokens, my_rank, moe_epoch, pl.cast(0, pl.INT32),
+    )
 
 
 @pl.jit
@@ -542,12 +607,14 @@ def moe_test(
     data_arrived: pld.DistributedTensor[[N_RANKS, 1], pl.INT32],
     routed_y_buf: pld.DistributedTensor[[N_ROUTES, D], pl.BF16],
     combine_arrived: pld.DistributedTensor[[N_RANKS, 1], pl.INT32],
+    moe_token_counts: pl.InOut[pl.Tensor[[MOE_STATS_NUM_LAYERS, N_LOCAL], pl.INT32]],
     # scalars last: runtime TaskArgs forbids a tensor arg after a scalar arg.
     layer_id: pl.Scalar[pl.INT32],
     num_tokens: pl.Scalar[pl.INT32],
     my_rank: pl.Scalar[pl.INT32],
     # 1-based MoE call id; multi-layer callers increment it per reused window.
     moe_epoch: pl.Scalar[pl.INT32],
+    dump_moe_stats: pl.Scalar[pl.INT32],
 ) -> pl.Tensor[[T, HC_MULT, D], pl.FP32]:
     moe(
         x_hc, hc_ffn_fn, hc_ffn_scale, hc_ffn_base,
@@ -558,8 +625,8 @@ def moe_test(
         shared_w2, shared_w2_scale,
         x_next,
         recv_meta, recv_x, recv_aux, recv_route, arrived, data_arrived,
-        routed_y_buf, combine_arrived,
-        layer_id, num_tokens, my_rank, moe_epoch,
+        routed_y_buf, combine_arrived, moe_token_counts,
+        layer_id, num_tokens, my_rank, moe_epoch, dump_moe_stats,
     )
     clear_moe_signals(x_next, arrived, data_arrived, combine_arrived)
     return x_next
@@ -589,8 +656,12 @@ def l3_moe(
     shared_w2: pl.Tensor[[N_RANKS, D, MOE_INTER], pl.INT8],
     shared_w2_scale: pl.Tensor[[N_RANKS, D], pl.FP32],
     x_next: pl.Out[pl.Tensor[[N_RANKS, T, HC_MULT, D], pl.FP32]],
+    moe_token_counts: pl.InOut[
+        pl.Tensor[[N_RANKS, MOE_STATS_NUM_LAYERS, N_LOCAL], pl.INT32]
+    ],
     layer_id: pl.Scalar[pl.INT32],
     num_tokens: pl.Scalar[pl.INT32],
+    dump_moe_stats: pl.Scalar[pl.INT32],
 ):
     recv_meta_buf = pld.alloc_window_buffer([N_RANKS, N_LOCAL], dtype=pl.INT32)
     recv_x_buf = pld.alloc_window_buffer([N_LOCAL * RECV_MAX, D], dtype=pl.INT8)
@@ -619,8 +690,8 @@ def l3_moe(
             shared_w2[r], shared_w2_scale[r],
             x_next[r],
             recv_meta, recv_x, recv_aux, recv_route, arrived, data_arrived,
-            routed_y_buf, combine_arrived,
-            layer_id, num_tokens, r, pl.const(1, pl.INT32),
+            routed_y_buf, combine_arrived, moe_token_counts[r],
+            layer_id, num_tokens, r, pl.const(1, pl.INT32), dump_moe_stats,
             device=r,
         )
 
@@ -947,8 +1018,14 @@ def build_tensor_specs(layer_id=0, num_tokens=T, balanced_routing=False):
         TensorSpec("shared_w2",        [N_RANKS, D, MOE_INTER],          torch.int8,    init_value=lambda: sw2_i8),
         TensorSpec("shared_w2_scale",  [N_RANKS, D],                     torch.float32, init_value=lambda: sw2_s),
         TensorSpec("x_next",           [N_RANKS, T, HC_MULT, D],      torch.float32, is_output=True),
+        TensorSpec(
+            "moe_token_counts",
+            [N_RANKS, MOE_STATS_NUM_LAYERS, N_LOCAL],
+            torch.int32,
+        ),
         ScalarSpec("layer_id",         torch.int32,                      layer_id),
         ScalarSpec("num_tokens",       torch.int32,                      num_tokens),
+        ScalarSpec("dump_moe_stats",   torch.int32,                      1),
     ]
 
     # Keep the static weight parameters device-resident (child_memory), sharded

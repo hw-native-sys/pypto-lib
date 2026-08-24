@@ -55,6 +55,7 @@ from moe import (
     HC_MULT,
     IDX_PAD,
     MIX_HC,
+    MOE_STATS_NUM_LAYERS,
     MOE_INTER,
     N_EXPERTS_GLOBAL,
     N_LOCAL,
@@ -158,7 +159,9 @@ def decode_mtp(
     lm_head_hidden_done: pld.DistributedTensor[[LM_HEAD_TP_SIZE, 1], pl.INT32],
     lm_head_logits_window: pld.DistributedTensor[[MAX_LOGIT_ROWS, LM_HEAD_VOCAB], pl.FP32],
     lm_head_logits_done: pld.DistributedTensor[[LM_HEAD_TP_SIZE, 1], pl.INT32],
+    moe_token_counts: pl.InOut[pl.Tensor[[MOE_STATS_NUM_LAYERS, N_LOCAL], pl.INT32]],
     my_rank: pl.Scalar[pl.INT32],
+    dump_moe_stats: pl.Scalar[pl.INT32],
     num_tokens: pl.Scalar[pl.INT32],
 ) -> pl.Tensor[[T, HC_MULT, D], pl.BF16]:
     projected_hidden = pl.create_tensor([T, HC_MULT, D], dtype=pl.FP32)
@@ -198,8 +201,9 @@ def decode_mtp(
             shared_w2, shared_w2_scale,
             next_pre_hc_hidden,
             recv_meta, recv_x, recv_aux, recv_route,
-            arrived, data_arrived, routed_y_buf, combine_arrived,
-            pl.cast(MTP_LAYER_ID, pl.INT32), num_tokens, my_rank, pl.cast(MTP_MOE_EPOCH, pl.INT32),
+            arrived, data_arrived, routed_y_buf, combine_arrived, moe_token_counts,
+            pl.cast(MTP_LAYER_ID, pl.INT32), num_tokens, my_rank,
+            pl.cast(MTP_MOE_EPOCH, pl.INT32), dump_moe_stats,
         )
 
     clear_moe_signals(next_pre_hc_hidden, arrived, data_arrived, combine_arrived)
@@ -293,7 +297,9 @@ def l2_decode_mtp(
     lm_head_hidden_done: pld.DistributedTensor[[LM_HEAD_TP_SIZE, 1], pl.INT32],
     lm_head_logits_window: pld.DistributedTensor[[MAX_LOGIT_ROWS, LM_HEAD_VOCAB], pl.FP32],
     lm_head_logits_done: pld.DistributedTensor[[LM_HEAD_TP_SIZE, 1], pl.INT32],
+    moe_token_counts: pl.InOut[pl.Tensor[[MOE_STATS_NUM_LAYERS, N_LOCAL], pl.INT32]],
     my_rank: pl.Scalar[pl.INT32],
+    dump_moe_stats: pl.Scalar[pl.INT32],
     num_tokens: pl.Scalar[pl.INT32],
 ) -> pl.Tensor[[T, HC_MULT, D], pl.BF16]:
     swa_cos_profile: pl.Tensor[[1, MAX_SEQ_LEN, ROPE_HEAD_DIM], pl.BF16] = pl.slice(
@@ -329,7 +335,8 @@ def l2_decode_mtp(
         recv_meta, recv_x, recv_aux, recv_route,
         arrived, data_arrived, routed_y_buf, combine_arrived,
         lm_head_hidden_window, lm_head_hidden_done, lm_head_logits_window, lm_head_logits_done,
-        my_rank, num_tokens,
+        moe_token_counts,
+        my_rank, dump_moe_stats, num_tokens,
     )
 
 
@@ -398,6 +405,10 @@ def l3_decode_mtp(
         pl.Tensor[[N_RANKS, MAX_LOGIT_ROWS, SAMPLED_IDS_PAD], pl.INT32]
     ],
     logit_row_indices: pl.Tensor[[N_RANKS, MAX_LOGIT_ROWS], pl.INT32],
+    moe_token_counts: pl.InOut[
+        pl.Tensor[[N_RANKS, MOE_STATS_NUM_LAYERS, N_LOCAL], pl.INT32]
+    ],
+    dump_moe_stats: pl.Scalar[pl.INT32],
     num_tokens: pl.Scalar[pl.INT32],
 ):
     recv_meta_buf = pld.alloc_window_buffer([N_RANKS, N_LOCAL], dtype=pl.INT32)
@@ -452,7 +463,7 @@ def l3_decode_mtp(
             arrived, data_arrived, routed_y_buf, combine_arrived,
             lm_head_hidden_window, lm_head_hidden_done,
             lm_head_logits_window, lm_head_logits_done,
-            r, num_tokens,
+            moe_token_counts[r], r, dump_moe_stats, num_tokens,
             device=r,
         )
 
@@ -807,6 +818,12 @@ def build_tensor_specs(start_pos=DECODE_START_POS, num_tokens=T, ori_block_num=O
         init_value=init_logit_row_indices,
     )
     specs.append(row_indices_spec)
+    specs.append(TensorSpec(
+        "moe_token_counts",
+        [N_RANKS, MOE_STATS_NUM_LAYERS, N_LOCAL],
+        torch.int32,
+    ))
+    specs.append(ScalarSpec("dump_moe_stats", torch.int32, 1))
     specs.append(ScalarSpec("num_tokens", torch.int32, num_tokens))
     return specs
 

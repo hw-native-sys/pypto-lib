@@ -43,7 +43,7 @@ from moe import (
     build_tensor_specs as build_moe_tensor_specs,
     clear_moe_signals,
     golden_moe,
-    moe,
+    moe_legacy,
 )
 from config import FLASH as MODEL_CONFIG, PREFILL_BATCH, PREFILL_SEQ
 from prefill_swa import (
@@ -311,7 +311,7 @@ def prefill_layer_core(
                 )
 
             x_next_tile = pl.create_tensor([TOK_TILE, HC_MULT, D], dtype=pl.FP32)
-            moe(
+            moe_legacy(
                 x_attn_tile,
                 hc_ffn_fn, hc_ffn_scale, hc_ffn_base,
                 norm_w, gate_w, gate_bias, tid2eid, input_ids_tile,
@@ -848,7 +848,7 @@ def build_tensor_specs(layer_id=2):
 
     # MoE weight tensors (per rank). tid2eid keeps its hash-table init.
     for spec in build_moe_tensor_specs(layer_id=layer_id):
-        if not isinstance(spec, TensorSpec) or spec.name in {"x_hc", "x_next", "input_ids"}:
+        if not isinstance(spec, TensorSpec) or spec.name in {"x_hc", "x_next", "input_ids", "moe_token_counts"}:
             continue
         if spec.name == "tid2eid":
             def init_tid2eid(spec=spec):

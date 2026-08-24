@@ -69,6 +69,7 @@ from decode_fwd import (
     MAX_LOGIT_ROWS,
     MAX_SEQ_LEN,
     MIX_HC,
+    MOE_STATS_NUM_LAYERS,
     MOE_INTER,
     N_CACHE_GROUPS,
     N_EXPERTS_GLOBAL,
@@ -482,7 +483,9 @@ def l2_decode_fwd_mtp(
     mtp_lm_head_hidden_done: pld.DistributedTensor[[LM_HEAD_TP_SIZE, 1], pl.INT32],
     mtp_lm_head_logits_window: pld.DistributedTensor[[MAX_LOGIT_ROWS, LM_HEAD_VOCAB], pl.FP32],
     mtp_lm_head_logits_done: pld.DistributedTensor[[LM_HEAD_TP_SIZE, 1], pl.INT32],
+    moe_token_counts: pl.InOut[pl.Tensor[[MOE_STATS_NUM_LAYERS, N_LOCAL], pl.INT32]],
     rank: pl.Scalar[pl.INT32],
+    dump_moe_stats: pl.Scalar[pl.INT32],
     mtp_num_tokens: pl.Scalar[pl.INT32],
 ):
     swa_cos_profile: pl.Tensor[[1, MAX_SEQ_LEN, ROPE_HEAD_DIM], pl.BF16] = pl.slice(freqs_cos, [1, MAX_SEQ_LEN, ROPE_HEAD_DIM], [0, 0, 0])
@@ -558,7 +561,7 @@ def l2_decode_fwd_mtp(
         recv_meta, recv_x, recv_aux, recv_route,
         arrived, data_arrived, routed_y_buf, combine_arrived,
         lm_head_hidden_window, lm_head_hidden_done, lm_head_logits_window, lm_head_logits_done,
-        num_tokens_per_owner, rank,
+        moe_token_counts, num_tokens_per_owner, rank, dump_moe_stats,
     )
     verify_and_pack_mtp_tokens(
         input_ids, position_ids, sampled_ids,
@@ -607,7 +610,7 @@ def l2_decode_fwd_mtp(
         mtp_recv_meta, mtp_recv_x, mtp_recv_aux, mtp_recv_route,
         mtp_arrived, mtp_data_arrived, mtp_routed_y_buf, mtp_combine_arrived,
         mtp_lm_head_hidden_window, mtp_lm_head_hidden_done, mtp_lm_head_logits_window, mtp_lm_head_logits_done,
-        rank, mtp_num_tokens,
+        moe_token_counts, rank, dump_moe_stats, mtp_num_tokens,
     )
     # Commit the verified window and the next draft back to the persistent slot.
     advance_decode_device_state(
@@ -718,6 +721,9 @@ def l3_decode_fwd_mtp(
     hidden_out: pl.Out[pl.Tensor[[N_RANKS, T, D], pl.BF16]],
     logits: pl.Out[pl.Tensor[[N_RANKS, MAX_LOGIT_ROWS, LM_HEAD_VOCAB], pl.FP32]],
     sampled_ids: pl.Out[pl.Tensor[[N_RANKS, MAX_LOGIT_ROWS, SAMPLED_IDS_PAD], pl.INT32]],
+    moe_token_counts: pl.InOut[
+        pl.Tensor[[N_RANKS, MOE_STATS_NUM_LAYERS, N_LOCAL], pl.INT32]
+    ],
     num_tokens_per_owner: pl.Tensor[[N_RANKS], pl.INT32],
     logit_row_indices: pl.Tensor[[N_RANKS, MAX_LOGIT_ROWS], pl.INT32],
     mtp_tail_token_ids: pl.InOut[pl.Tensor[[N_RANKS, B], pl.INT64]],
@@ -785,6 +791,7 @@ def l3_decode_fwd_mtp(
     mtp_logits: pl.Out[pl.Tensor[[N_RANKS, MAX_LOGIT_ROWS, LM_HEAD_VOCAB], pl.FP32]],
     mtp_sampled_ids: pl.Out[pl.Tensor[[N_RANKS, MAX_LOGIT_ROWS, SAMPLED_IDS_PAD], pl.INT32]],
     mtp_logit_row_indices: pl.Tensor[[N_RANKS, MAX_LOGIT_ROWS], pl.INT32],
+    dump_moe_stats: pl.Scalar[pl.INT32],
     mtp_num_tokens: pl.Scalar[pl.INT32],
 ):
     recv_meta_buf = pld.alloc_window_buffer([N_RANKS, N_LOCAL], dtype=pl.INT32)
@@ -897,7 +904,8 @@ def l3_decode_fwd_mtp(
             mtp_arrived, mtp_data_arrived, mtp_routed_y_buf, mtp_combine_arrived,
             mtp_lm_head_hidden_window, mtp_lm_head_hidden_done, mtp_lm_head_logits_window,
             mtp_lm_head_logits_done,
-            rank, mtp_num_tokens,
+            moe_token_counts[rank],
+            rank, dump_moe_stats, mtp_num_tokens,
             device=rank,
         )
 
@@ -1073,7 +1081,9 @@ def build_tensor_specs(
         "freqs_cos",
         "freqs_sin",
         "lm_head_weight",
+        "moe_token_counts",
         "num_tokens",
+        "dump_moe_stats",
     }
     # Built on device from the main step's outputs, or built explicitly below.
     custom_mtp_names = {
@@ -1205,4 +1215,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-

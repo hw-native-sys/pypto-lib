@@ -96,6 +96,7 @@ from decode_prepare import (
 from moe import (
     AUX_PAD,
     IDX_PAD,
+    MOE_STATS_NUM_LAYERS,
     MOE_INTER,
     N_EXPERTS_GLOBAL,
     N_LOCAL,
@@ -306,8 +307,10 @@ def decode_fwd(
     lm_head_hidden_done: pld.DistributedTensor[[LM_HEAD_TP_SIZE, 1], pl.INT32],
     lm_head_logits_window: pld.DistributedTensor[[MAX_LOGIT_ROWS, LM_HEAD_VOCAB], pl.FP32],
     lm_head_logits_done: pld.DistributedTensor[[LM_HEAD_TP_SIZE, 1], pl.INT32],
+    moe_token_counts: pl.InOut[pl.Tensor[[MOE_STATS_NUM_LAYERS, N_LOCAL], pl.INT32]],
     num_tokens_per_owner: pl.Tensor[[N_RANKS], pl.INT32],
     my_rank: pl.Scalar[pl.INT32],
+    dump_moe_stats: pl.Scalar[pl.INT32],
 ) -> pl.Tensor[[T, D], pl.BF16]:
     swa_cos_profile: pl.Tensor[[1, MAX_SEQ_LEN, ROPE_HEAD_DIM], pl.BF16] = pl.slice(
         freqs_cos, [1, MAX_SEQ_LEN, ROPE_HEAD_DIM], [0, 0, 0]
@@ -436,8 +439,8 @@ def decode_fwd(
             shared_w2_l0, shared_w2_scale_l0,
             hidden,
             recv_meta, recv_x, recv_aux, recv_route, arrived, data_arrived,
-            routed_y_buf, combine_arrived,
-            pl.cast(0, pl.INT32), nt, my_rank, pl.cast(1, pl.INT32),
+            routed_y_buf, combine_arrived, moe_token_counts,
+            pl.cast(0, pl.INT32), nt, my_rank, pl.cast(1, pl.INT32), dump_moe_stats,
         )
     with pl.scope():
         attention_swa(
@@ -461,8 +464,8 @@ def decode_fwd(
             shared_w2_l1, shared_w2_scale_l1,
             hidden,
             recv_meta, recv_x, recv_aux, recv_route, arrived, data_arrived,
-            routed_y_buf, combine_arrived,
-            pl.cast(1, pl.INT32), nt, my_rank, pl.cast(2, pl.INT32),
+            routed_y_buf, combine_arrived, moe_token_counts,
+            pl.cast(1, pl.INT32), nt, my_rank, pl.cast(2, pl.INT32), dump_moe_stats,
         )
     for loop_i in pl.range(HCA_NUM_LAYERS):
         csa_layer: pl.Scalar[pl.INT32] = pl.cast(loop_i * 2 + 2, pl.INT32)
@@ -555,8 +558,8 @@ def decode_fwd(
                 shared_w2_csa, shared_w2_scale_csa,
                 hidden_mid,
                 recv_meta, recv_x, recv_aux, recv_route, arrived, data_arrived,
-                routed_y_buf, combine_arrived,
-                csa_layer, nt, my_rank, csa_moe_epoch,
+                routed_y_buf, combine_arrived, moe_token_counts,
+                csa_layer, nt, my_rank, csa_moe_epoch, dump_moe_stats,
             )
         hc_attn_fn_hca: pl.Tensor[[MIX_HC, HC_DIM], pl.FP32] = pl.slice(hc_attn_fn, [MIX_HC, HC_DIM], [hca_layer * MIX_HC, 0])
         hc_attn_scale_hca: pl.Tensor[[3], pl.FP32] = pl.slice(hc_attn_scale, [3], [hca_layer * 3])
@@ -625,8 +628,8 @@ def decode_fwd(
                 shared_w2_hca, shared_w2_scale_hca,
                 hidden,
                 recv_meta, recv_x, recv_aux, recv_route, arrived, data_arrived,
-                routed_y_buf, combine_arrived,
-                hca_layer, nt, my_rank, hca_moe_epoch,
+                routed_y_buf, combine_arrived, moe_token_counts,
+                hca_layer, nt, my_rank, hca_moe_epoch, dump_moe_stats,
             )
     # FWD index (14), not CSA_LAST_LAYER (6): the *_last slices below index per-FWD-layer
     # stacked weights; csa-stacked weights use the literal (CSA_NUM_LAYERS-1).
@@ -716,8 +719,8 @@ def decode_fwd(
             shared_w2_last, shared_w2_scale_last,
             pre_hc_hidden_out,
             recv_meta, recv_x, recv_aux, recv_route, arrived, data_arrived,
-            routed_y_buf, combine_arrived,
-            csa_layer_last, nt, my_rank, last_moe_epoch,
+            routed_y_buf, combine_arrived, moe_token_counts,
+            csa_layer_last, nt, my_rank, last_moe_epoch, dump_moe_stats,
         )
     clear_moe_signals(pre_hc_hidden_out, arrived, data_arrived, combine_arrived)
     x_head: pl.Tensor[[T, D], pl.BF16] = pl.create_tensor([T, D], dtype=pl.BF16)
@@ -832,8 +835,10 @@ def l2_decode_fwd(
     lm_head_hidden_done: pld.DistributedTensor[[LM_HEAD_TP_SIZE, 1], pl.INT32],
     lm_head_logits_window: pld.DistributedTensor[[MAX_LOGIT_ROWS, LM_HEAD_VOCAB], pl.FP32],
     lm_head_logits_done: pld.DistributedTensor[[LM_HEAD_TP_SIZE, 1], pl.INT32],
+    moe_token_counts: pl.InOut[pl.Tensor[[MOE_STATS_NUM_LAYERS, N_LOCAL], pl.INT32]],
     num_tokens_per_owner: pl.Tensor[[N_RANKS], pl.INT32],
     my_rank: pl.Scalar[pl.INT32],
+    dump_moe_stats: pl.Scalar[pl.INT32],
 ) -> pl.Tensor[[T, D], pl.BF16]:
     ori_slot_mapping = pl.create_tensor([T], dtype=pl.INT64)
     swa_slot_mapping = pl.create_tensor([T], dtype=pl.INT64)
@@ -896,7 +901,8 @@ def l2_decode_fwd(
         recv_meta, recv_x, recv_aux, recv_route,
         arrived, data_arrived, routed_y_buf, combine_arrived,
         lm_head_hidden_window, lm_head_hidden_done, lm_head_logits_window, lm_head_logits_done,
-        num_tokens_per_owner, my_rank,
+        moe_token_counts,
+        num_tokens_per_owner, my_rank, dump_moe_stats,
     )
 
 
@@ -984,8 +990,12 @@ def l3_decode_fwd(
     sampled_ids: pl.Out[
         pl.Tensor[[N_RANKS, MAX_LOGIT_ROWS, SAMPLED_IDS_PAD], pl.INT32]
     ],
+    moe_token_counts: pl.InOut[
+        pl.Tensor[[N_RANKS, MOE_STATS_NUM_LAYERS, N_LOCAL], pl.INT32]
+    ],
     num_tokens_per_owner: pl.Tensor[[N_RANKS], pl.INT32],
     logit_row_indices: pl.Tensor[[N_RANKS, MAX_LOGIT_ROWS], pl.INT32],
+    dump_moe_stats: pl.Scalar[pl.INT32],
 ):
     recv_meta_buf = pld.alloc_window_buffer([N_RANKS, N_LOCAL], dtype=pl.INT32)
     # MoE and LM-head run sequentially, so they can share data storage; keep
@@ -1043,7 +1053,7 @@ def l3_decode_fwd(
             data_arrived, routed_y_buf, combine_arrived,
             lm_head_hidden_window, lm_head_hidden_done,
             lm_head_logits_window, lm_head_logits_done,
-            num_tokens_per_owner, r,
+            moe_token_counts[r], num_tokens_per_owner, r, dump_moe_stats,
             device=r,
         )
 
@@ -1718,7 +1728,7 @@ def build_tensor_specs(
     inner_state_block_num=CSA_INNER_STATE_BLOCK_NUM,
 ):
     import torch
-    from golden import TensorSpec
+    from golden import ScalarSpec, TensorSpec
 
     def init_lm_head_weight():
         shards = (torch.randn(LM_HEAD_TP_SIZE, VOCAB_PER_TP, D) / D ** 0.5).to(torch.bfloat16)
@@ -1803,6 +1813,11 @@ def build_tensor_specs(
         is_output=True,
     ))
     specs.append(TensorSpec(
+        "moe_token_counts",
+        [N_RANKS, MOE_STATS_NUM_LAYERS, N_LOCAL],
+        torch.int32,
+    ))
+    specs.append(TensorSpec(
         "num_tokens_per_owner",
         [N_RANKS],
         torch.int32,
@@ -1814,6 +1829,7 @@ def build_tensor_specs(
         torch.int32,
         init_value=init_logit_row_indices,
     ))
+    specs.append(ScalarSpec("dump_moe_stats", torch.int32, 1))
     return specs
 
 
