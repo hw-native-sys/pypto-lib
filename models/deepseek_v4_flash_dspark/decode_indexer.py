@@ -111,6 +111,8 @@ TOPK_MAX_CANDIDATES = IDX_MAX_ROWS
 TOPK_MAX_LEAVES = TOPK_MAX_CANDIDATES // TOPK_CANDIDATES_PER_LEAF
 TOPK_MAX_NODES = 2 * TOPK_MAX_LEAVES - 1
 TOPK_ARENA_ROWS = T_PAD * TOPK_MAX_NODES
+TOPK_LEAF_PARALLEL = 8
+TOPK_WORK_UNITS = T_PAD * TOPK_LEAF_PARALLEL
 TOPK_LEAF_DYN = pl.dynamic("INDEXER_TOPK_LEAF_DYN")
 assert TOPK_MAX_CANDIDATES % TOPK_CANDIDATES_PER_LEAF == 0
 assert TOPK_MAX_LEAVES == 128
@@ -221,14 +223,15 @@ def score_select_2k_top512_pairs(
     query_scales: pl.Tensor[[T_PAD * IDX_N_HEADS, 1], pl.FP32],
     query_weights: pl.Tensor[[T_PAD, IDX_N_HEADS], pl.FP32],
     score_i32_stage: pl.Tensor[
-        [T_PAD, SCORE_FRAGMENT_ROWS, IDX_N_HEADS], pl.INT32
+        [TOPK_WORK_UNITS, SCORE_FRAGMENT_ROWS, IDX_N_HEADS], pl.INT32
     ],
     score_arena: pl.Tensor[
-        [T_PAD, TOPK_CANDIDATES_PER_LEAF], pl.FP32
+        [TOPK_WORK_UNITS, TOPK_CANDIDATES_PER_LEAF], pl.FP32
     ],
     pair_arena: pl.Tensor[[TOPK_ARENA_ROWS, TOPK_PAIR_WIDTH], pl.FP32],
     query: pl.Scalar[pl.INDEX],
     batch_idx: pl.Scalar[pl.INDEX],
+    work_unit: pl.Scalar[pl.INDEX],
     logical_begin: pl.Scalar[pl.INDEX],
     valid_count: pl.Scalar[pl.INDEX],
     output_slot: pl.Scalar[pl.INDEX],
@@ -287,7 +290,7 @@ def score_select_2k_top512_pairs(
             b_trans=True,
         )
         score_i32_stage[
-            query : query + 1,
+            work_unit : work_unit + 1,
             0:BLOCK_SIZE,
             0:IDX_N_HEADS,
         ] = pl.reshape(
@@ -295,7 +298,7 @@ def score_select_2k_top512_pairs(
             [1, BLOCK_SIZE, IDX_N_HEADS],
         )
         score_i32_stage[
-            query : query + 1,
+            work_unit : work_unit + 1,
             BLOCK_SIZE:SCORE_FRAGMENT_ROWS,
             0:IDX_N_HEADS,
         ] = pl.reshape(
@@ -334,7 +337,7 @@ def score_select_2k_top512_pairs(
                         pl.slice(
                             score_i32_stage,
                             [1, SCORE_FRAGMENT_ROWS, IDX_N_HEADS],
-                            [query, 0, 0],
+                            [work_unit, 0, 0],
                         ),
                         [SCORE_FRAGMENT_ROWS, IDX_N_HEADS],
                     ),
@@ -382,7 +385,7 @@ def score_select_2k_top512_pairs(
                     pl.reshape(score1, [1, BLOCK_SIZE]),
                 )
                 score_arena[
-                    query : query + 1,
+                    work_unit : work_unit + 1,
                     fragment_begin : fragment_begin + SCORE_FRAGMENT_ROWS,
                 ] = score_row
         pl.system.sync_set(
@@ -411,7 +414,7 @@ def score_select_2k_top512_pairs(
             )
             leaf_scores_raw = pl.load(
                 score_arena,
-                [query, 0],
+                [work_unit, 0],
                 [1, TOPK_CANDIDATES_PER_LEAF],
                 valid_shape=[1, valid_count],
             )
@@ -444,7 +447,7 @@ def score_select_2k_top512_pairs(
 
 
 @pl.jit.incore
-def indexer_score_topk_forest(
+def indexer_score_topk_leaf_wave(
     idx_kv_cache: pl.Tensor[
         [IDX_CACHE_BLOCK_NUM_DYN, BLOCK_SIZE, 1, IDX_HEAD_DIM], pl.INT8
     ],
@@ -460,19 +463,19 @@ def indexer_score_topk_forest(
     position_ids: pl.Tensor[[T_DYN], pl.INT32],
     kv_seq_lens: pl.Tensor[[B_DYN], pl.INT32],
     score_arena: pl.Tensor[
-        [T_PAD, TOPK_CANDIDATES_PER_LEAF], pl.FP32
+        [TOPK_WORK_UNITS, TOPK_CANDIDATES_PER_LEAF], pl.FP32
     ],
     score_i32_stage: pl.Tensor[
-        [T_PAD, SCORE_FRAGMENT_ROWS, IDX_N_HEADS], pl.INT32
+        [TOPK_WORK_UNITS, SCORE_FRAGMENT_ROWS, IDX_N_HEADS], pl.INT32
     ],
     ffts_workspace: pl.Tensor[[FFTS_WORKSPACE_ELEMENTS], pl.INT64],
     pair_arena: pl.Tensor[[TOPK_ARENA_ROWS, TOPK_PAIR_WIDTH], pl.FP32],
-    topk_scores: pl.Tensor[[T_DYN, IDX_TOPK], pl.FP32],
-    topk_indices: pl.Tensor[[T_DYN, IDX_TOPK], pl.INT32],
 ):
-    """Score the visible leaves for one query and reduce them to Top-512."""
+    """Score one query's visible leaves across lane-private work units."""
     pl.system.set_ffts(ffts_workspace)
-    query = pl.tile.get_block_idx()
+    work_unit = pl.tile.get_block_idx()
+    query = work_unit // TOPK_LEAF_PARALLEL
+    lane = work_unit - query * TOPK_LEAF_PARALLEL
     batch_idx = query // S
     position = pl.read(position_ids, [query])
     cache_len = pl.read(kv_seq_lens, [batch_idx]) // COMPRESS_RATIO
@@ -480,32 +483,12 @@ def indexer_score_topk_forest(
         pl.min(cache_len, (position + 1) // COMPRESS_RATIO),
         TOPK_MAX_CANDIDATES,
     )
-    init_aiv = pl.tile.get_subblock_idx()
-    if init_aiv == 0:
-        if True:
-            pl.store(
-                pl.tile.full(
-                    [1, IDX_TOPK],
-                    dtype=pl.FP32,
-                    value=FP32_NEG_INF,
-                ),
-                [query, 0],
-                topk_scores,
-            )
-            pl.store(
-                pl.tile.full(
-                    [1, IDX_TOPK], dtype=pl.INT32, value=-1
-                ),
-                [query, 0],
-                topk_indices,
-            )
-
     if visible_count > 0:
         leaf_count = (
             visible_count + TOPK_CANDIDATES_PER_LEAF - 1
         ) // TOPK_CANDIDATES_PER_LEAF
         arena_base = query * TOPK_MAX_NODES
-        for leaf in pl.range(leaf_count):
+        for leaf in pl.range(lane, leaf_count, TOPK_LEAF_PARALLEL):
             logical_begin = leaf * TOPK_CANDIDATES_PER_LEAF
             valid_count = pl.min(
                 TOPK_CANDIDATES_PER_LEAF,
@@ -523,103 +506,141 @@ def indexer_score_topk_forest(
                 pair_arena,
                 query,
                 batch_idx,
+                work_unit,
                 logical_begin,
                 valid_count,
                 arena_base + leaf,
             )
 
-        forest_aiv = pl.tile.get_subblock_idx()
-        if forest_aiv == 0:
-            if True:
-                level1_count = (leaf_count + 1) // 2
-                merge_topk_level_pairs(
-                    pair_arena,
-                    arena_base,
-                    leaf_count,
-                    0,
-                    TOPK_LEVEL1_BASE,
-                )
-                level2_count = (level1_count + 1) // 2
-                merge_topk_level_pairs(
-                    pair_arena,
-                    arena_base,
-                    level1_count,
-                    TOPK_LEVEL1_BASE,
-                    TOPK_LEVEL2_BASE,
-                )
-                level3_count = (level2_count + 1) // 2
-                merge_topk_level_pairs(
-                    pair_arena,
-                    arena_base,
-                    level2_count,
-                    TOPK_LEVEL2_BASE,
-                    TOPK_LEVEL3_BASE,
-                )
-                level4_count = (level3_count + 1) // 2
-                merge_topk_level_pairs(
-                    pair_arena,
-                    arena_base,
-                    level3_count,
-                    TOPK_LEVEL3_BASE,
-                    TOPK_LEVEL4_BASE,
-                )
-                level5_count = (level4_count + 1) // 2
-                merge_topk_level_pairs(
-                    pair_arena,
-                    arena_base,
-                    level4_count,
-                    TOPK_LEVEL4_BASE,
-                    TOPK_LEVEL5_BASE,
-                )
-                level6_count = (level5_count + 1) // 2
-                merge_topk_level_pairs(
-                    pair_arena,
-                    arena_base,
-                    level5_count,
-                    TOPK_LEVEL5_BASE,
-                    TOPK_LEVEL6_BASE,
-                )
-                merge_topk_level_pairs(
-                    pair_arena,
-                    arena_base,
-                    level6_count,
-                    TOPK_LEVEL6_BASE,
-                    TOPK_ROOT_BASE,
-                )
 
-                root_slot = arena_base + TOPK_ROOT_BASE
-                root_pairs = pl.load(
-                    pair_arena,
-                    [root_slot, 0],
-                    [1, TOPK_PAIR_WIDTH],
-                )
-                pl.store(
-                    pl.tile.gather_mask(
-                        root_pairs,
-                        mask_pattern=pl.tile.MaskPattern.P0101,
-                        output_dtype=pl.FP32,
-                    ),
-                    [query, 0],
-                    topk_scores,
-                )
-                root_indices = pl.tile.gather_mask(
-                    root_pairs,
-                    mask_pattern=pl.tile.MaskPattern.P1010,
-                    output_dtype=pl.INT32,
-                )
-                output_indices = pl.tile.full(
-                    [1, IDX_TOPK], dtype=pl.INT32, value=-1
-                )
-                valid_topk = pl.min(visible_count, IDX_TOPK)
-                for lane in pl.range(valid_topk):
-                    pl.tile.write(
-                        output_indices,
-                        [0, lane],
-                        pl.tile.read(root_indices, [0, lane]),
-                    )
-                pl.store(
-                    output_indices, [query, 0], topk_indices
-                )
+@pl.jit.incore
+def indexer_score_topk_query_merge(
+    position_ids: pl.Tensor[[T_DYN], pl.INT32],
+    kv_seq_lens: pl.Tensor[[B_DYN], pl.INT32],
+    pair_arena: pl.Tensor[[TOPK_ARENA_ROWS, TOPK_PAIR_WIDTH], pl.FP32],
+    topk_scores: pl.Tensor[[T_DYN, IDX_TOPK], pl.FP32],
+    topk_indices: pl.Tensor[[T_DYN, IDX_TOPK], pl.INT32],
+):
+    """Merge each query's completed leaf rows and materialize Top-512 outputs."""
+    query = pl.tile.get_block_idx()
+    batch_idx = query // S
+    position = pl.read(position_ids, [query])
+    cache_len = pl.read(kv_seq_lens, [batch_idx]) // COMPRESS_RATIO
+    visible_count = pl.min(
+        pl.min(cache_len, (position + 1) // COMPRESS_RATIO),
+        TOPK_MAX_CANDIDATES,
+    )
+    pl.store(
+        pl.tile.full(
+            [1, IDX_TOPK],
+            dtype=pl.FP32,
+            value=FP32_NEG_INF,
+        ),
+        [query, 0],
+        topk_scores,
+    )
+    pl.store(
+        pl.tile.full(
+            [1, IDX_TOPK], dtype=pl.INT32, value=-1
+        ),
+        [query, 0],
+        topk_indices,
+    )
+
+    if visible_count > 0:
+        leaf_count = (
+            visible_count + TOPK_CANDIDATES_PER_LEAF - 1
+        ) // TOPK_CANDIDATES_PER_LEAF
+        arena_base = query * TOPK_MAX_NODES
+        level1_count = (leaf_count + 1) // 2
+        merge_topk_level_pairs(
+            pair_arena,
+            arena_base,
+            leaf_count,
+            0,
+            TOPK_LEVEL1_BASE,
+        )
+        level2_count = (level1_count + 1) // 2
+        merge_topk_level_pairs(
+            pair_arena,
+            arena_base,
+            level1_count,
+            TOPK_LEVEL1_BASE,
+            TOPK_LEVEL2_BASE,
+        )
+        level3_count = (level2_count + 1) // 2
+        merge_topk_level_pairs(
+            pair_arena,
+            arena_base,
+            level2_count,
+            TOPK_LEVEL2_BASE,
+            TOPK_LEVEL3_BASE,
+        )
+        level4_count = (level3_count + 1) // 2
+        merge_topk_level_pairs(
+            pair_arena,
+            arena_base,
+            level3_count,
+            TOPK_LEVEL3_BASE,
+            TOPK_LEVEL4_BASE,
+        )
+        level5_count = (level4_count + 1) // 2
+        merge_topk_level_pairs(
+            pair_arena,
+            arena_base,
+            level4_count,
+            TOPK_LEVEL4_BASE,
+            TOPK_LEVEL5_BASE,
+        )
+        level6_count = (level5_count + 1) // 2
+        merge_topk_level_pairs(
+            pair_arena,
+            arena_base,
+            level5_count,
+            TOPK_LEVEL5_BASE,
+            TOPK_LEVEL6_BASE,
+        )
+        merge_topk_level_pairs(
+            pair_arena,
+            arena_base,
+            level6_count,
+            TOPK_LEVEL6_BASE,
+            TOPK_ROOT_BASE,
+        )
+
+        root_slot = arena_base + TOPK_ROOT_BASE
+        root_pairs = pl.load(
+            pair_arena,
+            [root_slot, 0],
+            [1, TOPK_PAIR_WIDTH],
+        )
+        pl.store(
+            pl.tile.gather_mask(
+                root_pairs,
+                mask_pattern=pl.tile.MaskPattern.P0101,
+                output_dtype=pl.FP32,
+            ),
+            [query, 0],
+            topk_scores,
+        )
+        root_indices = pl.tile.gather_mask(
+            root_pairs,
+            mask_pattern=pl.tile.MaskPattern.P1010,
+            output_dtype=pl.INT32,
+        )
+        output_indices = pl.tile.full(
+            [1, IDX_TOPK], dtype=pl.INT32, value=-1
+        )
+        valid_topk = pl.min(visible_count, IDX_TOPK)
+        for lane in pl.range(valid_topk):
+            pl.tile.write(
+                output_indices,
+                [0, lane],
+                pl.tile.read(root_indices, [0, lane]),
+            )
+        pl.store(
+            output_indices, [query, 0], topk_indices
+        )
 
 
 @pl.jit.inline
@@ -814,10 +835,10 @@ def indexer(
     )
 
     score_arena = pl.create_tensor(
-        [T_PAD, TOPK_CANDIDATES_PER_LEAF], dtype=pl.FP32
+        [TOPK_WORK_UNITS, TOPK_CANDIDATES_PER_LEAF], dtype=pl.FP32
     )
     score_i32_stage = pl.create_tensor(
-        [T_PAD, SCORE_FRAGMENT_ROWS, IDX_N_HEADS], dtype=pl.INT32
+        [TOPK_WORK_UNITS, SCORE_FRAGMENT_ROWS, IDX_N_HEADS], dtype=pl.INT32
     )
     ffts_workspace = pl.create_tensor(
         [FFTS_WORKSPACE_ELEMENTS], dtype=pl.INT64
@@ -826,11 +847,11 @@ def indexer(
         [TOPK_ARENA_ROWS, TOPK_PAIR_WIDTH], dtype=pl.FP32
     )
     with pl.spmd(
-        bs,
-        name_hint="score_topk_forest",
+        bs * TOPK_LEAF_PARALLEL,
+        name_hint="score_topk_leaf_wave",
         deps=[qh_quant_tid, weights_tid, cache_write_tid],
-    ) as _score_tid:
-        indexer_score_topk_forest(
+    ) as leaf_tid:
+        indexer_score_topk_leaf_wave(
             idx_kv_cache,
             idx_kv_scale,
             idx_block_table,
@@ -842,6 +863,16 @@ def indexer(
             score_arena,
             score_i32_stage,
             ffts_workspace,
+            pair_arena,
+        )
+    with pl.spmd(
+        bs,
+        name_hint="score_topk_query_merge",
+        deps=[leaf_tid],
+    ) as _score_tid:
+        indexer_score_topk_query_merge(
+            position_ids,
+            kv_seq_lens,
             pair_arena,
             topk_scores,
             topk_idxs,
