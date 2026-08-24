@@ -168,38 +168,37 @@ def compressor_ratio4(
                             state_half = 0
                             if state_idx >= COMPRESS_RATIO:
                                 state_half = HEAD_DIM
-                            if logical_pos >= 0:
-                                if logical_pos < first_pos_b:
-                                    ring_row = logical_pos % STATE_LEN
-                                    state_page_off = ring_row // COMPRESS_STATE_BLOCK_SIZE
-                                    state_blk_id_i32 = pl.read(
-                                        compress_state_block_table, [c_idx, state_page_off])
-                                    if state_blk_id_i32 >= 0:
-                                        state_blk_id = pl.cast(state_blk_id_i32, pl.INDEX)
-                                        state_row = state_blk_id * COMPRESS_STATE_BLOCK_SIZE + ring_row % COMPRESS_STATE_BLOCK_SIZE
-                                        value = compress_state_flat[
-                                            state_row : state_row + 1,
-                                            state_half + h0 : state_half + h0 + HEAD_TILE,
-                                        ]
-                                        score = compress_state_flat[
-                                            state_row : state_row + 1,
-                                            OUT_DIM + state_half + h0 : OUT_DIM + state_half + h0 + HEAD_TILE,
-                                        ]
-                                if logical_pos >= first_pos_b:
-                                    if logical_pos <= token_pos:
-                                        overlay_token = c_idx * s_dim + logical_pos - first_pos_b
-                                        ape_row = pl.cast(logical_pos % COMPRESS_RATIO, target_type=pl.INDEX)
-                                        value = cmp4_kv_proj_pad[
+                            if logical_pos >= 0 and logical_pos < first_pos_b:
+                                ring_row = logical_pos % STATE_LEN
+                                state_page_off = ring_row // COMPRESS_STATE_BLOCK_SIZE
+                                state_blk_id_i32 = pl.read(
+                                    compress_state_block_table, [c_idx, state_page_off])
+                                if state_blk_id_i32 >= 0:
+                                    state_blk_id = pl.cast(state_blk_id_i32, pl.INDEX)
+                                    state_row = state_blk_id * COMPRESS_STATE_BLOCK_SIZE + ring_row % COMPRESS_STATE_BLOCK_SIZE
+                                    value = compress_state_flat[
+                                        state_row : state_row + 1,
+                                        state_half + h0 : state_half + h0 + HEAD_TILE,
+                                    ]
+                                    score = compress_state_flat[
+                                        state_row : state_row + 1,
+                                        OUT_DIM + state_half + h0 : OUT_DIM + state_half + h0 + HEAD_TILE,
+                                    ]
+                            if logical_pos >= first_pos_b:
+                                if logical_pos <= token_pos:
+                                    overlay_token = c_idx * s_dim + logical_pos - first_pos_b
+                                    ape_row = pl.cast(logical_pos % COMPRESS_RATIO, target_type=pl.INDEX)
+                                    value = cmp4_kv_proj_pad[
+                                        overlay_token : overlay_token + 1,
+                                        state_half + h0 : state_half + h0 + HEAD_TILE,
+                                    ]
+                                    score = pl.add(
+                                        cmp4_score_proj_pad[
                                             overlay_token : overlay_token + 1,
                                             state_half + h0 : state_half + h0 + HEAD_TILE,
-                                        ]
-                                        score = pl.add(
-                                            cmp4_score_proj_pad[
-                                                overlay_token : overlay_token + 1,
-                                                state_half + h0 : state_half + h0 + HEAD_TILE,
-                                            ],
-                                            ape[ape_row : ape_row + 1, state_half + h0 : state_half + h0 + HEAD_TILE],
-                                        )
+                                        ],
+                                        ape[ape_row : ape_row + 1, state_half + h0 : state_half + h0 + HEAD_TILE],
+                                    )
                             mi_next = pl.maximum(mi, score)
                             alpha = pl.exp(pl.sub(mi, mi_next))
                             beta = pl.exp(pl.sub(score, mi_next))
