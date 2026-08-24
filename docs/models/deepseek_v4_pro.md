@@ -221,8 +221,9 @@ token loop rejects artifacts that omit the runtime scalar or whose generated
 timeout or partial dispatch failure, callers must discard the worker and its
 persistent windows rather than retrying with a guessed epoch.
 
-The prefill RoPE paths use fixed even/odd lane gather and scatter operations for
-adjacent-lane permutations instead of synthesizing tile-local index tensors.
+The prefill and decode RoPE paths use fixed even/odd lane gather and scatter
+operations for adjacent-lane permutations instead of synthesizing tile-local
+index tensors.
 
 The [daily model workflow](../../.github/workflows/daily_ci.yml) runs this
 EP8 loop nightly on the A5 runner (job `e2e-flash-a5`: real

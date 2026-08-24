@@ -38,8 +38,6 @@ HEAD_DIM_INV = 1.0 / HEAD_DIM
 ROPE_HEAD_DIM = M.qk_rope_head_dim
 NOPE_HEAD_DIM = M.nope_head_dim
 MAX_SEQ_LEN = M.max_position_embeddings
-ROPE_HEAD_DIM_F = float(ROPE_HEAD_DIM)
-ROPE_HALF_F = float(ROPE_HEAD_DIM // 2)
 
 # compressor config
 COMPRESS_RATIO = 128
@@ -64,8 +62,6 @@ HEAD_TILE = 64
 MM_B_TILE = 16
 BS_PAD = ((B * S + MM_B_TILE - 1) // MM_B_TILE) * MM_B_TILE
 RMS_PAD_TILE = 16
-ROPE_FLAT_LEN = RMS_PAD_TILE * ROPE_HEAD_DIM
-ROPE_HALF_FLAT_LEN = RMS_PAD_TILE * (ROPE_HEAD_DIM // 2)
 POOL_HEAD_TILE = 128
 
 
@@ -227,45 +223,18 @@ def compressor_ratio128(
         # out[j] = n[j] * cos[j] + n[j ^ 1] * sign[j] * sin[j]
         rope_rms_scaled = pl.row_expand_mul(kv_rope_norm, inv_rms)
         rope_normed = pl.col_expand_mul(rope_rms_scaled, gamma_rope)
-        rope_ones = pl.full([RMS_PAD_TILE, ROPE_HEAD_DIM], dtype=pl.FP32, value=1.0)
-        rope_col_idx = pl.arange(0, [1, ROPE_HEAD_DIM], dtype=pl.INT32)
-        rope_col_f32 = pl.cast(rope_col_idx, target_type=pl.FP32)
-        rope_col = pl.col_expand_mul(rope_ones, rope_col_f32)
-        rope_row_idx = pl.arange(0, [1, RMS_PAD_TILE], dtype=pl.INT32)
-        rope_row_f32 = pl.cast(rope_row_idx, target_type=pl.FP32)
-        rope_row_col = pl.reshape(rope_row_f32, [RMS_PAD_TILE, 1])
-        rope_row = pl.row_expand_mul(rope_ones, rope_row_col)
-        rope_half = pl.mul(rope_col, 0.5)
-        rope_dup_i32 = pl.cast(rope_half, target_type=pl.INT32, mode="trunc")
-        rope_dup_f = pl.cast(rope_dup_i32, target_type=pl.FP32)
-        rope_dup_twice = pl.mul(rope_dup_f, 2.0)
-        rope_lane = pl.sub(rope_col, rope_dup_twice)  # j % 2
-        rope_col_next = pl.add(rope_col, 1.0)
-        rope_jx_lane = pl.mul(rope_lane, 2.0)
-        rope_jx = pl.sub(rope_col_next, rope_jx_lane)  # j ^ 1
-        rope_sign_lane = pl.mul(rope_lane, 2.0)
-        rope_sign = pl.sub(rope_sign_lane, 1.0)  # [-1, +1, ...]
-        rope_dup_row = pl.mul(rope_row, ROPE_HALF_F)
-        rope_dup_sum = pl.add(rope_dup_row, rope_dup_f)
-        rope_dup_idx = pl.cast(rope_dup_sum, target_type=pl.INT32)
-        rope_dup_flat = pl.reshape(rope_dup_idx, [1, ROPE_FLAT_LEN])
-        rope_swap_row = pl.mul(rope_row, ROPE_HEAD_DIM_F)
-        rope_swap_sum = pl.add(rope_swap_row, rope_jx)
-        rope_swap_idx = pl.cast(rope_swap_sum, target_type=pl.INT32)
-        rope_swap_flat = pl.reshape(rope_swap_idx, [1, ROPE_FLAT_LEN])
-        cos_flat = pl.reshape(cos_b, [1, ROPE_HALF_FLAT_LEN])
-        cos_gathered = pl.gather(cos_flat, dim=-1, index=rope_dup_flat)
-        cos_il = pl.reshape(cos_gathered, [RMS_PAD_TILE, ROPE_HEAD_DIM])
-        sin_flat = pl.reshape(sin_b, [1, ROPE_HALF_FLAT_LEN])
-        sin_gathered = pl.gather(sin_flat, dim=-1, index=rope_dup_flat)
-        sin_il = pl.reshape(sin_gathered, [RMS_PAD_TILE, ROPE_HEAD_DIM])
-        rope_normed_flat = pl.reshape(rope_normed, [1, ROPE_FLAT_LEN])
-        swapped_flat = pl.gather(rope_normed_flat, dim=-1, index=rope_swap_flat)
-        swapped = pl.reshape(swapped_flat, [RMS_PAD_TILE, ROPE_HEAD_DIM])
-        rope_cos = pl.mul(rope_normed, cos_il)
-        swapped_signed = pl.mul(swapped, rope_sign)
-        rope_sin = pl.mul(swapped_signed, sin_il)
-        rope_rot = pl.add(rope_cos, rope_sin)
+        rope_even = pl.gather(rope_normed, mask_pattern=pl.tile.MaskPattern.P0101)
+        rope_odd = pl.gather(rope_normed, mask_pattern=pl.tile.MaskPattern.P1010)
+        rope_even_base = pl.mul(rope_even, cos_b)
+        rope_odd_neg = pl.neg(rope_odd)
+        rope_even_delta = pl.mul(rope_odd_neg, sin_b)
+        rope_even_rot = pl.add(rope_even_base, rope_even_delta)
+        rope_odd_base = pl.mul(rope_odd, cos_b)
+        rope_odd_delta = pl.mul(rope_even, sin_b)
+        rope_odd_rot = pl.add(rope_odd_base, rope_odd_delta)
+        rope_rot = pl.full([RMS_PAD_TILE, ROPE_HEAD_DIM], dtype=pl.FP32, value=0.0)
+        rope_rot = pl.tensor.scatter(rope_even_rot, mask_pattern=pl.tile.MaskPattern.P0101, dst=rope_rot)
+        rope_rot = pl.tensor.scatter(rope_odd_rot, mask_pattern=pl.tile.MaskPattern.P1010, dst=rope_rot)
         normed_kv[0:RMS_PAD_TILE, NOPE_HEAD_DIM : HEAD_DIM] = rope_rot
 
         for write_c_idx in pl.range(b_dim):

@@ -37,10 +37,6 @@ IDX_NOPE_HEAD_DIM = M.index_nope_head_dim
 WEIGHTS_SCALE = M.index_weights_scale
 MAX_SEQ_LEN = M.max_position_embeddings
 OFFSET = M.sliding_window
-ROPE_HEAD_DIM_F = float(ROPE_HEAD_DIM)
-ROPE_HEAD_DIM_INV = 1.0 / ROPE_HEAD_DIM
-ROPE_HALF_F = float(ROPE_HEAD_DIM // 2)
-IDX_HEAD_DIM_F = float(IDX_HEAD_DIM)
 
 # indexer config
 COMPRESS_RATIO = 4
@@ -75,8 +71,6 @@ WEIGHTS_K_TILE = D // (4 if M.name == "flash" else 7)
 Q_HEAD_TILE = 32
 Q_HEAD_FLAT_LEN = Q_HEAD_TILE * IDX_HEAD_DIM
 assert IDX_N_HEADS % Q_HEAD_TILE == 0
-ROPE_IL_FLAT_LEN = B * ROPE_HEAD_DIM
-ROPE_IL_SRC_LEN = B * (ROPE_HEAD_DIM // 2)
 SCORE_LANE_TILE = 8
 TOPK_HALF_LEN = SCORE_LEN // 2
 TOPK_HALF_PAIR_OFFSET = 2 * TOPK_HALF_LEN
@@ -137,60 +131,22 @@ def indexer(
     # out[j] = x[j] * cos[j] + x[j ^ 1] * sin_signed[j]
     cos_full_t = pl.create_tensor([B, IDX_HEAD_DIM], dtype=pl.FP32)
     sin_full_t = pl.create_tensor([B, IDX_HEAD_DIM], dtype=pl.FP32)
-    q_swap_idx_t = pl.create_tensor([1, Q_HEAD_FLAT_LEN], dtype=pl.INT32)
     with pl.at(level=pl.Level.CORE_GROUP, name_hint="qr_rope_tables"):
-        il_col_idx = pl.arange(0, [1, ROPE_IL_FLAT_LEN], dtype=pl.INT32)
-        il_col = pl.cast(il_col_idx, target_type=pl.FP32)
-        il_row_scaled = pl.mul(il_col, ROPE_HEAD_DIM_INV)
-        il_row_i32 = pl.cast(il_row_scaled, target_type=pl.INT32, mode="trunc")
-        il_row = pl.cast(il_row_i32, target_type=pl.FP32)
-        il_row_base = pl.mul(il_row, ROPE_HEAD_DIM_F)
-        il_j = pl.sub(il_col, il_row_base)
-        il_half = pl.mul(il_j, 0.5)
-        il_dup_i32 = pl.cast(il_half, target_type=pl.INT32, mode="trunc")
-        il_dup_f = pl.cast(il_dup_i32, target_type=pl.FP32)
-        il_dup_twice = pl.mul(il_dup_f, 2.0)
-        il_lane = pl.sub(il_j, il_dup_twice)  # j % 2
-        il_lane_twice = pl.mul(il_lane, 2.0)
-        il_sign_row = pl.sub(il_lane_twice, 1.0)
-        il_sign = pl.reshape(il_sign_row, [B, ROPE_HEAD_DIM])
-        il_dup_row = pl.mul(il_row, ROPE_HALF_F)
-        il_dup_sum = pl.add(il_dup_row, il_dup_f)
-        il_dup_flat = pl.cast(il_dup_sum, target_type=pl.INT32)
-        cos_flat = pl.reshape(cos, [1, ROPE_IL_SRC_LEN])
-        cos_gathered = pl.gather(cos_flat, dim=-1, index=il_dup_flat)
-        cos_il = pl.reshape(cos_gathered, [B, ROPE_HEAD_DIM])
-        sin_flat = pl.reshape(sin, [1, ROPE_IL_SRC_LEN])
-        sin_gathered = pl.gather(sin_flat, dim=-1, index=il_dup_flat)
-        sin_il = pl.reshape(sin_gathered, [B, ROPE_HEAD_DIM])
-        sin_signed = pl.mul(sin_il, il_sign)
+        cos_tile = cos[0:B, 0 : ROPE_HEAD_DIM // 2]
+        sin_tile = sin[0:B, 0 : ROPE_HEAD_DIM // 2]
+        cos_il = pl.full([B, ROPE_HEAD_DIM], dtype=pl.FP32, value=0.0)
+        cos_il = pl.tensor.scatter(cos_tile, mask_pattern=pl.tile.MaskPattern.P0101, dst=cos_il)
+        cos_il = pl.tensor.scatter(cos_tile, mask_pattern=pl.tile.MaskPattern.P1010, dst=cos_il)
+        sin_neg = pl.neg(sin_tile)
+        sin_signed = pl.full([B, ROPE_HEAD_DIM], dtype=pl.FP32, value=0.0)
+        sin_signed = pl.tensor.scatter(sin_neg, mask_pattern=pl.tile.MaskPattern.P0101, dst=sin_signed)
+        sin_signed = pl.tensor.scatter(sin_tile, mask_pattern=pl.tile.MaskPattern.P1010, dst=sin_signed)
         nope_cos = pl.full([B, IDX_NOPE_HEAD_DIM], dtype=pl.FP32, value=1.0)
         cos_full = pl.concat(nope_cos, cos_il)
         cos_full_t[0:B, 0:IDX_HEAD_DIM] = cos_full
         nope_sin = pl.full([B, IDX_NOPE_HEAD_DIM], dtype=pl.FP32, value=0.0)
         sin_full = pl.concat(nope_sin, sin_signed)
         sin_full_t[0:B, 0:IDX_HEAD_DIM] = sin_full
-        sw_ones = pl.full([Q_HEAD_TILE, IDX_HEAD_DIM], dtype=pl.FP32, value=1.0)
-        sw_col_idx = pl.arange(0, [1, IDX_HEAD_DIM], dtype=pl.INT32)
-        sw_col_f32 = pl.cast(sw_col_idx, target_type=pl.FP32)
-        sw_col = pl.col_expand_mul(sw_ones, sw_col_f32)
-        sw_row_idx = pl.arange(0, [1, Q_HEAD_TILE], dtype=pl.INT32)
-        sw_row_f32 = pl.cast(sw_row_idx, target_type=pl.FP32)
-        sw_row_col = pl.reshape(sw_row_f32, [Q_HEAD_TILE, 1])
-        sw_row = pl.row_expand_mul(sw_ones, sw_row_col)
-        sw_rowbase = pl.mul(sw_row, IDX_HEAD_DIM_F)
-        sw_half = pl.mul(sw_col, 0.5)
-        sw_dup_i32 = pl.cast(sw_half, target_type=pl.INT32, mode="trunc")
-        sw_dup_f = pl.cast(sw_dup_i32, target_type=pl.FP32)
-        sw_dup_twice = pl.mul(sw_dup_f, 2.0)
-        sw_lane = pl.sub(sw_col, sw_dup_twice)  # j % 2
-        sw_col_next = pl.add(sw_col, 1.0)
-        sw_lane_twice = pl.mul(sw_lane, 2.0)
-        sw_jx = pl.sub(sw_col_next, sw_lane_twice)  # j ^ 1
-        sw_swap_sum = pl.add(sw_rowbase, sw_jx)
-        sw_swap_idx = pl.cast(sw_swap_sum, target_type=pl.INT32)
-        sw_swap_flat = pl.reshape(sw_swap_idx, [1, Q_HEAD_FLAT_LEN])
-        q_swap_idx_t[0:1, 0:Q_HEAD_FLAT_LEN] = sw_swap_flat
 
     topk_idx_init_t = pl.create_tensor([1, SCORE_LEN], dtype=pl.UINT32)
     with pl.at(level=pl.Level.CORE_GROUP, name_hint="topk_idx_table"):
@@ -211,10 +167,12 @@ def indexer(
         qr_scale_scalar = pl.read(qr_scale, [tok, 0])
         qr_dequant = pl.mul(acc_flat, qr_scale_scalar)
         qr_dq_flat = pl.mul(qr_dequant, wq_scale_flat)
-        q_swap_idx = q_swap_idx_t[0:1, 0:Q_HEAD_FLAT_LEN]
-        qr_swapped_flat = pl.gather(qr_dq_flat, dim=-1, index=q_swap_idx)
         qh_rows = pl.reshape(qr_dq_flat, [Q_HEAD_TILE, IDX_HEAD_DIM])
-        qh_swapped = pl.reshape(qr_swapped_flat, [Q_HEAD_TILE, IDX_HEAD_DIM])
+        qh_even = pl.gather(qh_rows, mask_pattern=pl.tile.MaskPattern.P0101)
+        qh_odd = pl.gather(qh_rows, mask_pattern=pl.tile.MaskPattern.P1010)
+        qh_swapped = pl.full([Q_HEAD_TILE, IDX_HEAD_DIM], dtype=pl.FP32, value=0.0)
+        qh_swapped = pl.tensor.scatter(qh_odd, mask_pattern=pl.tile.MaskPattern.P0101, dst=qh_swapped)
+        qh_swapped = pl.tensor.scatter(qh_even, mask_pattern=pl.tile.MaskPattern.P1010, dst=qh_swapped)
         cos_full_row = cos_full_t[qr_batch_idx : qr_batch_idx + 1, 0:IDX_HEAD_DIM]
         qh_cos = pl.col_expand_mul(qh_rows, cos_full_row)
         sin_full_row = sin_full_t[qr_batch_idx : qr_batch_idx + 1, 0:IDX_HEAD_DIM]

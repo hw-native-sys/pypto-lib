@@ -60,9 +60,6 @@ GATHER_RUN_TILE = 16
 H_TILE = 16
 QK_M_TILE = 32
 ATTN_K_TILE = 128
-CS_DUP_FLAT_LEN = T * ROPE_DIM
-ROPE_DIM_F = float(ROPE_DIM)
-ROPE_DIM_INV = 1.0 / ROPE_DIM
 A_K_TILE = 256
 PROJ_A_MM_N_TILE = 128
 MM_T_TILE = 16
@@ -225,35 +222,17 @@ def sparse_attn_hca(
     rope_cos_il = pl.create_tensor([T, ROPE_DIM], dtype=pl.FP32)
     rope_sin_signed = pl.create_tensor([T, ROPE_DIM], dtype=pl.FP32)
     with pl.at(level=pl.Level.CORE_GROUP, name_hint="rope_cs", allow_early_resolve=True):
-        sw_col_i_m = pl.arange(0, [1, CS_DUP_FLAT_LEN], dtype=pl.INT32)
-        sw_col_m = pl.cast(sw_col_i_m, target_type=pl.FP32)
-        sw_row_f_m = pl.mul(sw_col_m, ROPE_DIM_INV)
-        sw_row_i_m = pl.cast(sw_row_f_m, target_type=pl.INT32, mode="trunc")
-        sw_row_m = pl.cast(sw_row_i_m, target_type=pl.FP32)
-        sw_rowbase_m = pl.mul(sw_row_m, ROPE_DIM_F)
-        sw_j_m = pl.sub(sw_col_m, sw_rowbase_m)
-        sw_half_m = pl.mul(sw_j_m, 0.5)
-        sw_dup_i_m = pl.cast(sw_half_m, target_type=pl.INT32, mode="trunc")
-        sw_dup_f_m = pl.cast(sw_dup_i_m, target_type=pl.FP32)
-        sw_dup2_m = pl.mul(sw_dup_f_m, 2.0)
-        sw_lane_m = pl.sub(sw_j_m, sw_dup2_m)
-        cs_rowbase = pl.mul(sw_rowbase_m, 0.5)
-        cs_dup_f = sw_dup_f_m
-        cs_dup_idx_f = pl.add(cs_rowbase, cs_dup_f)
-        cs_dup_idx = pl.cast(cs_dup_idx_f, target_type=pl.INT32)
-        cs_lane2 = pl.mul(sw_lane_m[0:1, 0:ROPE_DIM], 2.0)
-        cs_sign_base = pl.sub(cs_lane2, 1.0)
-        cs_sign = pl.neg(cs_sign_base)
         cs_cos_f32 = pl.cast(freqs_cos[0:T, 0:HALF_ROPE], target_type=pl.FP32)
-        cs_cos = pl.reshape(cs_cos_f32, [1, T * HALF_ROPE])
         cs_sin_f32 = pl.cast(freqs_sin[0:T, 0:HALF_ROPE], target_type=pl.FP32)
-        cs_sin = pl.reshape(cs_sin_f32, [1, T * HALF_ROPE])
-        cs_cos_gather = pl.gather(cs_cos, dim=-1, index=cs_dup_idx)
-        cs_cos_il = pl.reshape(cs_cos_gather, [T, ROPE_DIM])
+        cs_cos_il = pl.full([T, ROPE_DIM], dtype=pl.FP32, value=0.0)
+        cs_cos_il = pl.tensor.scatter(cs_cos_f32, mask_pattern=pl.tile.MaskPattern.P0101, dst=cs_cos_il)
+        cs_cos_il = pl.tensor.scatter(cs_cos_f32, mask_pattern=pl.tile.MaskPattern.P1010, dst=cs_cos_il)
         rope_cos_il[0:T, 0:ROPE_DIM] = cs_cos_il
-        cs_sin_gather = pl.gather(cs_sin, dim=-1, index=cs_dup_idx)
-        cs_sin_il = pl.reshape(cs_sin_gather, [T, ROPE_DIM])
-        rope_sin_signed[0:T, 0:ROPE_DIM] = pl.col_expand_mul(cs_sin_il, cs_sign)
+        cs_sin_neg = pl.neg(cs_sin_f32)
+        cs_sin_signed = pl.full([T, ROPE_DIM], dtype=pl.FP32, value=0.0)
+        cs_sin_signed = pl.tensor.scatter(cs_sin_f32, mask_pattern=pl.tile.MaskPattern.P0101, dst=cs_sin_signed)
+        cs_sin_signed = pl.tensor.scatter(cs_sin_neg, mask_pattern=pl.tile.MaskPattern.P1010, dst=cs_sin_signed)
+        rope_sin_signed[0:T, 0:ROPE_DIM] = cs_sin_signed
 
     o_packed = pl.create_tensor([O_GROUPS * T, O_GROUP_IN], dtype=pl.BF16)
     merge_tids = pl.array.create(O_GROUPS // O_GROUP_TILE, pl.TASK_ID)
@@ -297,23 +276,14 @@ def sparse_attn_hca(
             n_full = pl.row_expand_div(m_oi, n_denom)[0 : H_TILE, 0 : HEAD_DIM]
             n_bf16 = pl.cast(n_full, target_type=pl.BF16, mode="rint")
 
-            m_col_base = pl.full([H_TILE, ROPE_DIM], dtype=pl.FP32, value=1.0)
-            m_col_i = pl.arange(0, [1, ROPE_DIM], dtype=pl.INT32)
-            m_col_f = pl.cast(m_col_i, target_type=pl.FP32)
-            m_col = pl.col_expand_mul(m_col_base, m_col_f)
-            m_half = pl.mul(m_col, 0.5)
-            m_dup_i = pl.cast(m_half, target_type=pl.INT32, mode="trunc")
-            m_dup_f = pl.cast(m_dup_i, target_type=pl.FP32)
-            m_dup2 = pl.mul(m_dup_f, 2.0)
-            m_lane = pl.sub(m_col, m_dup2)
-            m_col_next = pl.add(m_col, 1.0)
-            m_lane2 = pl.mul(m_lane, 2.0)
-            m_swap_f = pl.sub(m_col_next, m_lane2)
-            m_swap_idx = pl.cast(m_swap_f, target_type=pl.INT32)
             m_rope = n_full[0 : H_TILE, NOPE_DIM : HEAD_DIM]
             m_cos_il = rope_cos_il[m_t : m_t + 1, 0 : ROPE_DIM]
             m_sin_signed = rope_sin_signed[m_t : m_t + 1, 0 : ROPE_DIM]
-            m_swapped = pl.gather(m_rope, dim=-1, index=m_swap_idx)
+            m_even = pl.gather(m_rope, mask_pattern=pl.tile.MaskPattern.P0101)
+            m_odd = pl.gather(m_rope, mask_pattern=pl.tile.MaskPattern.P1010)
+            m_swapped = pl.full([H_TILE, ROPE_DIM], dtype=pl.FP32, value=0.0)
+            m_swapped = pl.tensor.scatter(m_odd, mask_pattern=pl.tile.MaskPattern.P0101, dst=m_swapped)
+            m_swapped = pl.tensor.scatter(m_even, mask_pattern=pl.tile.MaskPattern.P1010, dst=m_swapped)
             m_rope_cos = pl.col_expand_mul(m_rope, m_cos_il)
             m_rope_sin = pl.col_expand_mul(m_swapped, m_sin_signed)
             m_rot = pl.add(m_rope_cos, m_rope_sin)

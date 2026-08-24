@@ -30,8 +30,6 @@ Q_LORA = M.q_lora_rank
 EPS = M.rms_norm_eps
 MAX_SEQ_LEN = M.max_position_embeddings
 T_MAX = max(DECODE_BATCH * DECODE_SEQ, PREFILL_BATCH * PREFILL_SEQ)
-ROPE_DIM_F = float(ROPE_DIM)
-ROPE_DIM_INV = 1.0 / ROPE_DIM
 
 # tiling
 Q_PROJ_TILE = 128
@@ -55,7 +53,6 @@ KV_K_SPLIT_TILE = D // KV_SPLIT_TILE
 QPROJ_M_TILE = MATMUL_T_TILE
 KV_RMS_T_TILE = 8
 Q_ROPE_T_TILE = 8
-Q_ROPE_FLAT_LEN = Q_ROPE_T_TILE * ROPE_DIM
 Q_ROPE_H_TILE = 4
 
 
@@ -110,42 +107,6 @@ def qkv_proj_rope(
     late_dep: pl.Scalar[pl.TASK_ID],
 ):
     # Task resolution is ordered across the kernel.
-    q_rope_dup_flat = pl.create_tensor([1, Q_ROPE_FLAT_LEN], dtype=pl.INT32)
-    q_rope_swap_flat = pl.create_tensor([1, Q_ROPE_FLAT_LEN], dtype=pl.INT32)
-    q_rope_sign = pl.create_tensor([1, ROPE_DIM], dtype=pl.FP32)
-    with pl.at(level=pl.Level.CORE_GROUP, name_hint="q_rope_index"):
-        qri_col_i32 = pl.arange(0, [1, Q_ROPE_FLAT_LEN], dtype=pl.INT32)
-        qri_col = pl.cast(qri_col_i32, target_type=pl.FP32)
-        qri_row_scaled = pl.mul(qri_col, ROPE_DIM_INV)
-        qri_row_i32 = pl.cast(qri_row_scaled, target_type=pl.INT32, mode="trunc")
-        qri_row = pl.cast(qri_row_i32, target_type=pl.FP32)
-        qri_rowbase = pl.mul(qri_row, ROPE_DIM_F)
-        qri_j = pl.sub(qri_col, qri_rowbase)
-        qri_half = pl.mul(qri_j, 0.5)
-        qri_dup_i32 = pl.cast(qri_half, target_type=pl.INT32, mode="trunc")
-        qri_dup_f = pl.cast(qri_dup_i32, target_type=pl.FP32)
-        qri_dup_twice = pl.mul(qri_dup_f, 2.0)
-        qri_lane = pl.sub(qri_j, qri_dup_twice)
-        qri_dup_index_f = pl.add(qri_rowbase, qri_dup_f)
-        qri_dup_index = pl.cast(qri_dup_index_f, target_type=pl.INT32)
-        q_rope_dup_flat[0:1, 0:Q_ROPE_FLAT_LEN] = qri_dup_index
-        qri_j_next = pl.add(qri_j, 1.0)
-        qri_lane_twice = pl.mul(qri_lane, 2.0)
-        qri_swap = pl.sub(qri_j_next, qri_lane_twice)
-        qri_swap_index_f = pl.add(qri_rowbase, qri_swap)
-        qri_swap_index = pl.cast(qri_swap_index_f, target_type=pl.INT32)
-        q_rope_swap_flat[0:1, 0:Q_ROPE_FLAT_LEN] = qri_swap_index
-        qrs_col_i32 = pl.arange(0, [1, ROPE_DIM], dtype=pl.INT32)
-        qrs_col = pl.cast(qrs_col_i32, target_type=pl.FP32)
-        qrs_half = pl.mul(qrs_col, 0.5)
-        qrs_dup_i32 = pl.cast(qrs_half, target_type=pl.INT32, mode="trunc")
-        qrs_dup_f = pl.cast(qrs_dup_i32, target_type=pl.FP32)
-        qrs_dup_twice = pl.mul(qrs_dup_f, 2.0)
-        qrs_lane = pl.sub(qrs_col, qrs_dup_twice)
-        qrs_lane_twice = pl.mul(qrs_lane, 2.0)
-        qrs_sign = pl.sub(qrs_lane_twice, 1.0)
-        q_rope_sign[0:1, 0:ROPE_DIM] = qrs_sign
-
     t_dim = pl.tensor.dim(x, 0)
     rope_cos_view = pl.reshape(rope_cos, [t_dim, ROPE_DIM])
     rope_sin_view = pl.reshape(rope_sin, [t_dim, ROPE_DIM])
@@ -153,18 +114,16 @@ def qkv_proj_rope(
     q_rope_sin_signed = pl.create_tensor([t_dim, ROPE_DIM], dtype=pl.FP32)
     for qrp_idx in pl.spmd(t_dim // Q_ROPE_T_TILE, name_hint="q_rope_prepare"):
         qrp_t0 = qrp_idx * Q_ROPE_T_TILE
-        qrp_dup = q_rope_dup_flat[0:1, 0:Q_ROPE_FLAT_LEN]
-        qrp_sign = q_rope_sign[0:1, 0:ROPE_DIM]
-        qrp_cos = pl.cast(rope_cos_view[qrp_t0 : qrp_t0 + Q_ROPE_T_TILE, :], target_type=pl.FP32)
-        qrp_sin = pl.cast(rope_sin_view[qrp_t0 : qrp_t0 + Q_ROPE_T_TILE, :], target_type=pl.FP32)
-        qrp_cos_flat = pl.reshape(qrp_cos, [1, Q_ROPE_FLAT_LEN])
-        qrp_cos_il = pl.gather(qrp_cos_flat, dim=-1, index=qrp_dup)
-        qrp_sin_flat = pl.reshape(qrp_sin, [1, Q_ROPE_FLAT_LEN])
-        qrp_sin_il = pl.gather(qrp_sin_flat, dim=-1, index=qrp_dup)
-        qrp_cos_rows = pl.reshape(qrp_cos_il, [Q_ROPE_T_TILE, ROPE_DIM])
-        q_rope_cos_il[qrp_t0 : qrp_t0 + Q_ROPE_T_TILE, :] = qrp_cos_rows
-        qrp_sin_rows = pl.reshape(qrp_sin_il, [Q_ROPE_T_TILE, ROPE_DIM])
-        qrp_sin_signed = pl.col_expand_mul(qrp_sin_rows, qrp_sign)
+        qrp_cos = pl.cast(rope_cos_view[qrp_t0 : qrp_t0 + Q_ROPE_T_TILE, 0 : ROPE_DIM // 2], target_type=pl.FP32)
+        qrp_sin = pl.cast(rope_sin_view[qrp_t0 : qrp_t0 + Q_ROPE_T_TILE, 0 : ROPE_DIM // 2], target_type=pl.FP32)
+        qrp_cos_il = pl.full([Q_ROPE_T_TILE, ROPE_DIM], dtype=pl.FP32, value=0.0)
+        qrp_cos_il = pl.tensor.scatter(qrp_cos, mask_pattern=pl.tile.MaskPattern.P0101, dst=qrp_cos_il)
+        qrp_cos_il = pl.tensor.scatter(qrp_cos, mask_pattern=pl.tile.MaskPattern.P1010, dst=qrp_cos_il)
+        q_rope_cos_il[qrp_t0 : qrp_t0 + Q_ROPE_T_TILE, :] = qrp_cos_il
+        qrp_sin_neg = pl.neg(qrp_sin)
+        qrp_sin_signed = pl.full([Q_ROPE_T_TILE, ROPE_DIM], dtype=pl.FP32, value=0.0)
+        qrp_sin_signed = pl.tensor.scatter(qrp_sin_neg, mask_pattern=pl.tile.MaskPattern.P0101, dst=qrp_sin_signed)
+        qrp_sin_signed = pl.tensor.scatter(qrp_sin, mask_pattern=pl.tile.MaskPattern.P1010, dst=qrp_sin_signed)
         q_rope_sin_signed[qrp_t0 : qrp_t0 + Q_ROPE_T_TILE, :] = qrp_sin_signed
 
     x_view = pl.reshape(x, [t_dim, D])
@@ -272,7 +231,6 @@ def qkv_proj_rope(
             qr_scale_dq_t = qr_scale_view[tg : tg + Q_ROPE_T_TILE, :]
             q_cos_il = q_rope_cos_il[tg : tg + Q_ROPE_T_TILE, :]
             q_sin_signed = q_rope_sin_signed[tg : tg + Q_ROPE_T_TILE, :]
-            q_swap_flat = q_rope_swap_flat[0:1, 0:Q_ROPE_FLAT_LEN]
             for h_inner in pl.pipeline(Q_ROPE_H_TILE, stage=2):
                 h = hg + h_inner
                 h0 = h * HEAD_DIM
@@ -296,15 +254,20 @@ def qkv_proj_rope(
                 q_rope_chunk_raw = q_head_dq[:, NOPE_DIM:HEAD_DIM]
                 q_rope_chunk = pl.row_expand_mul(q_rope_chunk_raw, q_head_inv_rms_t)
                 q_rope_col0 = h0 + NOPE_DIM
-                q_rope_col1 = q_rope_col0 + ROPE_DIM
-                q_rope_flat = pl.reshape(q_rope_chunk, [1, Q_ROPE_FLAT_LEN])
-                q_rope_gathered = pl.gather(q_rope_flat, dim=-1, index=q_swap_flat)
-                q_rope_swapped = pl.reshape(q_rope_gathered, [Q_ROPE_T_TILE, ROPE_DIM])
+                q_rope_even = pl.gather(q_rope_chunk, mask_pattern=pl.tile.MaskPattern.P0101)
+                q_rope_odd = pl.gather(q_rope_chunk, mask_pattern=pl.tile.MaskPattern.P1010)
+                q_rope_swapped = pl.full([Q_ROPE_T_TILE, ROPE_DIM], dtype=pl.FP32, value=0.0)
+                q_rope_swapped = pl.tensor.scatter(
+                    q_rope_odd, mask_pattern=pl.tile.MaskPattern.P0101, dst=q_rope_swapped,
+                )
+                q_rope_swapped = pl.tensor.scatter(
+                    q_rope_even, mask_pattern=pl.tile.MaskPattern.P1010, dst=q_rope_swapped,
+                )
                 q_rope_base = pl.mul(q_rope_chunk, q_cos_il)
                 q_rope_delta = pl.mul(q_rope_swapped, q_sin_signed)
                 q_rope_rot = pl.add(q_rope_base, q_rope_delta)
                 q_rope_bf16 = pl.cast(q_rope_rot, target_type=pl.BF16, mode="rint")
-                q_flat[tg : tg + Q_ROPE_T_TILE, q_rope_col0:q_rope_col1] = q_rope_bf16
+                q_flat[tg : tg + Q_ROPE_T_TILE, q_rope_col0 : q_rope_col0 + ROPE_DIM] = q_rope_bf16
 
     kv_partials = pl.create_tensor([KV_SPLIT_TILE * T_MAX, HEAD_DIM], dtype=pl.FP32)
     with pl.spmd((HEAD_DIM // KV_N_TILE) * KV_SPLIT_TILE, name_hint="kv_proj_matmul", deps=[late_dep]) as _kv_tid:

@@ -34,8 +34,6 @@ HEAD_DIM_INV = 1.0 / HEAD_DIM
 ROPE_HEAD_DIM = M.qk_rope_head_dim
 NOPE_HEAD_DIM = M.index_nope_head_dim
 MAX_SEQ_LEN = M.max_position_embeddings
-ROPE_HEAD_DIM_F = float(ROPE_HEAD_DIM)
-ROPE_HALF_F = float(ROPE_HEAD_DIM // 2)
 
 # compressor config
 COMPRESS_RATIO = 4
@@ -58,8 +56,6 @@ MM_B_TILE = 16
 BS_PAD = ((B * S + MM_B_TILE - 1) // MM_B_TILE) * MM_B_TILE
 HEAD_TILE = 64
 RMS_PAD_TILE = 16
-CMP_SWAP_FLAT_LEN = RMS_PAD_TILE * ROPE_HEAD_DIM
-CMP_DUP_SRC_LEN = RMS_PAD_TILE * (ROPE_HEAD_DIM // 2)
 
 
 @pl.jit.inline
@@ -213,48 +209,20 @@ def indexer_compressor(
 
     cmp_cos_il = pl.create_tensor([RMS_PAD_TILE, ROPE_HEAD_DIM], dtype=pl.FP32)
     cmp_sin_signed = pl.create_tensor([RMS_PAD_TILE, ROPE_HEAD_DIM], dtype=pl.FP32)
-    cmp_swap_flat = pl.create_tensor([1, CMP_SWAP_FLAT_LEN], dtype=pl.INT32)
     with pl.at(level=pl.Level.CORE_GROUP, name_hint="cmp_rope_tables", allow_early_resolve=True):
         cos_b = pl.full([RMS_PAD_TILE, ROPE_HEAD_DIM // 2], dtype=pl.FP32, value=0.0)
         sin_b = pl.full([RMS_PAD_TILE, ROPE_HEAD_DIM // 2], dtype=pl.FP32, value=0.0)
         cos_b[0:B, 0 : ROPE_HEAD_DIM // 2] = cos[0:B, 0 : ROPE_HEAD_DIM // 2]
         sin_b[0:B, 0 : ROPE_HEAD_DIM // 2] = sin[0:B, 0 : ROPE_HEAD_DIM // 2]
-        t_ones = pl.full([RMS_PAD_TILE, ROPE_HEAD_DIM], dtype=pl.FP32, value=1.0)
-        t_col_idx = pl.arange(0, [1, ROPE_HEAD_DIM], dtype=pl.INT32)
-        t_col_f32 = pl.cast(t_col_idx, target_type=pl.FP32)
-        t_col = pl.col_expand_mul(t_ones, t_col_f32)
-        t_row_idx = pl.arange(0, [1, RMS_PAD_TILE], dtype=pl.INT32)
-        t_row_f32 = pl.cast(t_row_idx, target_type=pl.FP32)
-        t_row_col = pl.reshape(t_row_f32, [RMS_PAD_TILE, 1])
-        t_row = pl.row_expand_mul(t_ones, t_row_col)
-        t_half = pl.mul(t_col, 0.5)
-        t_dup_i32 = pl.cast(t_half, target_type=pl.INT32, mode="trunc")
-        t_dup_f = pl.cast(t_dup_i32, target_type=pl.FP32)
-        t_dup_twice = pl.mul(t_dup_f, 2.0)
-        t_lane = pl.sub(t_col, t_dup_twice)  # j % 2
-        t_sign_lane = pl.mul(t_lane, 2.0)
-        t_sign = pl.sub(t_sign_lane, 1.0)  # [-1, +1, ...]
-        t_col_next = pl.add(t_col, 1.0)
-        t_jx_lane = pl.mul(t_lane, 2.0)
-        t_jx = pl.sub(t_col_next, t_jx_lane)  # j ^ 1
-        t_dup_row = pl.mul(t_row, ROPE_HALF_F)
-        t_dup_sum = pl.add(t_dup_row, t_dup_f)
-        t_dup_idx = pl.cast(t_dup_sum, target_type=pl.INT32)
-        t_dup_flat = pl.reshape(t_dup_idx, [1, CMP_SWAP_FLAT_LEN])
-        cos_flat = pl.reshape(cos_b, [1, CMP_DUP_SRC_LEN])
-        cos_gathered = pl.gather(cos_flat, dim=-1, index=t_dup_flat)
-        cos_il = pl.reshape(cos_gathered, [RMS_PAD_TILE, ROPE_HEAD_DIM])
+        cos_il = pl.full([RMS_PAD_TILE, ROPE_HEAD_DIM], dtype=pl.FP32, value=0.0)
+        cos_il = pl.tensor.scatter(cos_b, mask_pattern=pl.tile.MaskPattern.P0101, dst=cos_il)
+        cos_il = pl.tensor.scatter(cos_b, mask_pattern=pl.tile.MaskPattern.P1010, dst=cos_il)
         cmp_cos_il[0:RMS_PAD_TILE, 0:ROPE_HEAD_DIM] = cos_il
-        sin_flat = pl.reshape(sin_b, [1, CMP_DUP_SRC_LEN])
-        sin_gathered = pl.gather(sin_flat, dim=-1, index=t_dup_flat)
-        sin_il = pl.reshape(sin_gathered, [RMS_PAD_TILE, ROPE_HEAD_DIM])
-        sin_signed = pl.mul(sin_il, t_sign)
+        sin_neg = pl.neg(sin_b)
+        sin_signed = pl.full([RMS_PAD_TILE, ROPE_HEAD_DIM], dtype=pl.FP32, value=0.0)
+        sin_signed = pl.tensor.scatter(sin_neg, mask_pattern=pl.tile.MaskPattern.P0101, dst=sin_signed)
+        sin_signed = pl.tensor.scatter(sin_b, mask_pattern=pl.tile.MaskPattern.P1010, dst=sin_signed)
         cmp_sin_signed[0:RMS_PAD_TILE, 0:ROPE_HEAD_DIM] = sin_signed
-        t_swap_row = pl.mul(t_row, ROPE_HEAD_DIM_F)
-        t_swap_sum = pl.add(t_swap_row, t_jx)
-        t_swap_idx = pl.cast(t_swap_sum, target_type=pl.INT32)
-        t_swap_flat = pl.reshape(t_swap_idx, [1, CMP_SWAP_FLAT_LEN])
-        cmp_swap_flat[0:1, 0:CMP_SWAP_FLAT_LEN] = t_swap_flat
 
     normed_kv = pl.create_tensor([RMS_PAD_TILE, HEAD_DIM], dtype=pl.BF16)
     norm_w_2d = pl.reshape(norm_w, [1, HEAD_DIM])
@@ -287,10 +255,11 @@ def indexer_compressor(
         # out[j] = n[j] * cos[j] + n[j ^ 1] * sign[j] * sin[j]
         rope_rms_scaled = pl.row_expand_mul(kv_rope_norm, inv_rms)
         rope_normed = pl.col_expand_mul(rope_rms_scaled, gamma_rope)
-        rope_flat = pl.reshape(rope_normed, [1, CMP_SWAP_FLAT_LEN])
-        swap_idx = cmp_swap_flat[0:1, 0:CMP_SWAP_FLAT_LEN]
-        swapped_flat = pl.gather(rope_flat, dim=-1, index=swap_idx)
-        swapped = pl.reshape(swapped_flat, [RMS_PAD_TILE, ROPE_HEAD_DIM])
+        rope_even = pl.gather(rope_normed, mask_pattern=pl.tile.MaskPattern.P0101)
+        rope_odd = pl.gather(rope_normed, mask_pattern=pl.tile.MaskPattern.P1010)
+        swapped = pl.full([RMS_PAD_TILE, ROPE_HEAD_DIM], dtype=pl.FP32, value=0.0)
+        swapped = pl.tensor.scatter(rope_odd, mask_pattern=pl.tile.MaskPattern.P0101, dst=swapped)
+        swapped = pl.tensor.scatter(rope_even, mask_pattern=pl.tile.MaskPattern.P1010, dst=swapped)
         cmp_cos = cmp_cos_il[0:RMS_PAD_TILE, 0:ROPE_HEAD_DIM]
         rope_cos = pl.mul(rope_normed, cmp_cos)
         cmp_sin = cmp_sin_signed[0:RMS_PAD_TILE, 0:ROPE_HEAD_DIM]
