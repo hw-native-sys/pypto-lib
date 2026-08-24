@@ -258,8 +258,8 @@ def _attention_phase_window(
             with pl.at(
                 level=pl.Level.CORE_GROUP,
                 name_hint="qkpv_plan",
-                deps=[rope_ready_deps[0]],
-            ) as qkpv_plan_tid:
+                allow_early_resolve=True,
+            ):
                 pl.write(qkpv_wcur, [0], pl.cast(0, pl.INT32))
                 for plan_si in pl.unroll(QKPV_PLAN_SB_BATCH):
                     plan_sb = sb_chunk + plan_si
@@ -301,7 +301,7 @@ def _attention_phase_window(
             with pl.spmd(
                 ATTN_PHASE_SPMD_BLOCKS,
                 name_hint="qk_pv_partial_plan_spmd",
-                deps=[qkpv_plan_tid, rope_ready_deps[0]],
+                deps=[rope_ready_deps[0]],
                 sync_start=True,
             ) as qkpv_tid:
                 phase_core = pl.tile.get_block_idx()
@@ -407,7 +407,6 @@ def _attention_phase_window(
             with pl.spmd(
                 FINALIZE_SPMD_BLOCKS,
                 name_hint="qk_pv_partial_merge_spmd",
-                deps=[qkpv_tid],
             ) as merge_tid:
                 merge_core = pl.tile.get_block_idx()
                 for merge_work_id in pl.range(
@@ -518,7 +517,6 @@ def _attention_phase_window(
         with pl.spmd(
             FINALIZE_SPMD_BLOCKS,
             name_hint="attention_finalize_phase_spmd",
-            deps=[rope_ready_deps[0]],
         ) as finalize_tid:
             final_core = pl.tile.get_block_idx()
             for final_work_id in pl.range(
@@ -975,13 +973,11 @@ def _out_proj_aic_phase(
     attn_tile: pl.Tensor[[TOK_TILE, HIDDEN], pl.BF16],
     wo: pl.Tensor[[LAYER_HIDDEN_ROWS_DYN, HIDDEN], pl.BF16],
     layer_hidden_base: pl.Scalar[pl.INT32],
-    rope_ready_deps: pl.Array[ROPE_READY_DEP_COUNT, pl.TASK_ID],
 ) -> pl.Tensor[[TOK_TILE, HIDDEN], pl.FP32]:
     with pl.spmd(
         OUT_PROJ_SPMD_BLOCKS,
         name_hint="out_proj_aic_spmd",
-        deps=[rope_ready_deps[0]],
-    ) as out_proj_tid:
+    ):
         out_core = pl.tile.get_block_idx()
         for ob in pl.range(out_core, Q_OUT_BLOCKS, OUT_PROJ_SPMD_BLOCKS):
             o0 = ob * Q_OUT_CHUNK
@@ -994,7 +990,6 @@ def _out_proj_aic_phase(
                 tile_w_i = pl.slice(wo, [K_CHUNK, Q_OUT_CHUNK], [layer_hidden_base + k0, o0])
                 o_acc = pl.matmul_acc(o_acc, tile_a_i, tile_w_i)
             out_proj_tile = pl.assemble(out_proj_tile, o_acc, [0, o0])
-    pl.array.update_element(rope_ready_deps, 0, out_proj_tid)
     return out_proj_tile
 
 
@@ -1024,8 +1019,8 @@ def prefill_layer(
     w_up: pl.Tensor[[LAYER_HIDDEN_ROWS_DYN, INTERMEDIATE], pl.BF16],
     w_down: pl.Tensor[[LAYER_INTER_ROWS_DYN, HIDDEN], pl.BF16],
     out: pl.Tensor[[PREFILL_TOKENS_DYN, HIDDEN], pl.BF16],
+    window_done: pl.Tensor[[BATCH_PAD, 8], pl.FP32],
     layer_idx: pl.Scalar[pl.INT32],
-    hidden_tail: pl.Array[BATCH_PAD, pl.TASK_ID],
     kv_tail: pl.Array[NUM_LAYERS * BATCH_PAD, pl.TASK_ID],
 ) -> pl.Tensor[[PREFILL_TOKENS_DYN, HIDDEN], pl.BF16]:
     hidden_states.bind_dynamic(0, PREFILL_TOKENS_DYN)
@@ -1055,8 +1050,8 @@ def prefill_layer(
     for b in pl.parallel(0, batch, 1):
         post_norm_mtile = pl.create_tensor([MLP_M_TILE, HIDDEN], dtype=pl.BF16, manual_dep=True)
         resid1_mtile = pl.create_tensor([MLP_M_TILE, HIDDEN], dtype=pl.FP32)
+        window_done_row = pl.slice(window_done, [1, 8], [b, 0])
         post_norm_tids = pl.array.create(MLP_M_TILE // TOK_TILE, pl.TASK_ID)
-        resid1_ready_tids = pl.array.create(MLP_M_TILE // TOK_TILE, pl.TASK_ID)
         original_token_base = pl.cast(pl.tensor.read(chunk_offsets, [b]), pl.INDEX) + group_p0
         token_base = pl.cast(b * MLP_M_TILE, pl.INDEX)
         seq_len_b = pl.tensor.read(seq_lens, [b])
@@ -1083,7 +1078,6 @@ def prefill_layer(
                         RMSNORM_SPMD_BLOCKS,
                         name_hint="x_gamma_spmd",
                         allow_early_resolve=True,
-                        deps=[hidden_tail[b]],
                     ) as x_gamma_tid:
                         xg_core = pl.tile.get_block_idx()
                         for work_id in pl.range(xg_core, X_GAMMA_HIDDEN_BLOCKS, RMSNORM_SPMD_BLOCKS):
@@ -1153,7 +1147,6 @@ def prefill_layer(
                         with pl.spmd(
                             Q_PROJ_SPMD_BLOCKS,
                             name_hint="q_proj_spmd",
-                            deps=[x_gamma_tid],
                         ) as q_proj_tid:
                             q_core = pl.tile.get_block_idx()
                             for ob in pl.range(q_core, Q_OUT_BLOCKS, Q_PROJ_SPMD_BLOCKS):
@@ -1171,7 +1164,6 @@ def prefill_layer(
                         with pl.spmd(
                             KV_PROJ_SPMD_BLOCKS,
                             name_hint="kv_proj_spmd",
-                            deps=[x_gamma_tid],
                         ) as kv_proj_tid:
                             kv_core = pl.tile.get_block_idx()
                             for work_id in pl.range(kv_core, KV_PROJ_WORK_ITEMS, KV_PROJ_SPMD_BLOCKS):
@@ -1308,13 +1300,11 @@ def prefill_layer(
                         attn_tile,
                         wo,
                         pl.cast(layer_hidden_base, pl.INT32),
-                        rope_ready_deps,
                     )
                     with pl.spmd(
                         OUT_RESID_SPMD_BLOCKS,
                         name_hint="out_proj_aiv_spmd",
-                        deps=[rope_ready_deps[0]],
-                    ) as out_resid_tid:
+                    ):
                         out_core = pl.tile.get_block_idx()
                         for ob in pl.range(out_core, OUT_RESID_BLOCKS, OUT_RESID_SPMD_BLOCKS):
                             o0 = ob * OUT_RESID_CHUNK
@@ -1337,7 +1327,6 @@ def prefill_layer(
                     with pl.spmd(
                         POST_RMSNORM_SPMD_BLOCKS,
                         name_hint="post_rmsnorm_spmd",
-                        deps=[out_resid_tid],
                     ) as post_norm_tid:
                         post_core = pl.tile.get_block_idx()
                         for work_id in pl.range(post_core, RMSNORM_WORK_ITEMS, POST_RMSNORM_SPMD_BLOCKS):
@@ -1382,7 +1371,6 @@ def prefill_layer(
                                         [ti0, k0],
                                     )
                     post_norm_tid_for_ready = post_norm_tid
-                    pl.array.update_element(resid1_ready_tids, p0_idx, out_resid_tid)
             post_norm_tids[p0_idx] = post_norm_tid_for_ready
 
         if tok_blocks > 0:
@@ -1398,7 +1386,6 @@ def prefill_layer(
             with pl.spmd(
                 DOWN_RESID_SPMD_BLOCKS,
                 name_hint="mlp_out_seed_spmd",
-                deps=[resid1_ready_tids],
             ) as seed_tid:
                 seed_core = pl.tile.get_block_idx()
                 for hb in pl.range(seed_core, down_n_blocks, DOWN_RESID_SPMD_BLOCKS):
@@ -1505,15 +1492,17 @@ def prefill_layer(
                 for hb in pl.range(cast_core, down_n_blocks, DOWN_RESID_SPMD_BLOCKS):
                     h0 = hb * K_CHUNK
                     acc_chunk = pl.slice(mlp_out_acc_tile, [MLP_M_TILE, K_CHUNK], [0, h0])
+                    if hb == 0:
+                        done_value = pl.slice(acc_chunk, [1, 8], [0, 0])
+                        window_done_row = pl.assemble(window_done_row, done_value, [0, 0])
                     out_bf = pl.cast(acc_chunk, target_type=pl.BF16)
                     out_valid = pl.slice(out_bf, [MLP_M_TILE, K_CHUNK], [0, 0], valid_shape=[valid_tt, K_CHUNK])
                     out = pl.assemble(out, out_valid, [m0, h0])
-            # These carry arrays live outside the dynamic layer/window loops.
-            # Keep their backing storage stable: assigning through ``arr[idx]``
+            # This carry array lives outside the dynamic layer/window loops.
+            # Keep its backing storage stable: assigning through ``arr[idx]``
             # creates an ArrayType SSA phi at the surrounding ``if`` boundary,
             # while the explicit update is emitted as the same in-place C-array
             # slot write without rebinding the array value.
-            pl.array.update_element(hidden_tail, b, cast_tid)
             pl.array.update_element(kv_tail, kv_tail_idx, cast_tid)
 
     return out
@@ -1575,7 +1564,7 @@ def prefill_fwd(
             p0 = p0_idx * MLP_M_TILE
             if batch == 1:
                 window_hidden_pair = pl.create_tensor([2 * MLP_M_TILE, HIDDEN], dtype=pl.BF16)
-                hidden_tail = pl.array.create(BATCH_PAD, pl.TASK_ID)
+                window_done = pl.create_tensor([NUM_LAYERS * BATCH_PAD, 8], dtype=pl.FP32)
                 token_base = pl.cast(pl.tensor.read(chunk_offsets, [0]), pl.INDEX)
                 chunk_len_b = pl.tensor.read(chunk_lens, [0])
                 valid_tok = pl.min(MLP_M_TILE, pl.max(chunk_len_b - p0, 0))
@@ -1583,7 +1572,7 @@ def prefill_fwd(
                 with pl.spmd(
                     TOKEN_EMBED_SPMD_BLOCKS,
                     name_hint="token_embed_single",
-                ) as embed_tid:
+                ):
                     embed_core = pl.tile.get_block_idx()
                     for work_id in pl.range(
                         embed_core,
@@ -1607,15 +1596,17 @@ def prefill_fwd(
                                 hidden_chunk,
                                 [ti, k0],
                             )
-                for hidden_tail_idx in pl.unroll(BATCH_PAD):
-                    hidden_tail[hidden_tail_idx] = embed_tid
-
                 for layer_idx in pl.range(num_layers_actual):
                     read_base = (layer_idx % 2) * MLP_M_TILE
                     write_base = ((layer_idx + 1) % 2) * MLP_M_TILE
                     with pl.scope():
                         window_hidden = pl.slice(window_hidden_pair, [MLP_M_TILE, HIDDEN], [read_base, 0])
                         window_next = pl.slice(window_hidden_pair, [MLP_M_TILE, HIDDEN], [write_base, 0])
+                        window_done_layer = pl.slice(
+                            window_done,
+                            [BATCH_PAD, 8],
+                            [layer_idx * BATCH_PAD, 0],
+                        )
                         window_next = prefill_layer(
                             window_hidden,
                             seq_lens,
@@ -1641,10 +1632,14 @@ def prefill_fwd(
                             w_up,
                             w_down,
                             window_next,
+                            window_done_layer,
                             layer_idx,
-                            hidden_tail,
                             kv_tail,
                         )
+                if num_layers_actual > 0:
+                    window_fence_idx = (num_layers_actual - 1) * BATCH_PAD
+                    window_fence = pl.tensor.read(window_done, [window_fence_idx, 0])
+                    pl.tensor.write(window_done, [window_fence_idx, 0], window_fence)
                 if chunk_len_b > 0:
                     last_group = (chunk_len_b + MLP_M_TILE - 1) // MLP_M_TILE - 1
                     if p0_idx == last_group:
@@ -1652,7 +1647,6 @@ def prefill_fwd(
                         with pl.at(
                             level=pl.Level.CORE_GROUP,
                             name_hint="save_prefill_last_token_single",
-                            deps=[hidden_tail[0]],
                         ):
                             for kb in pl.range(HIDDEN_BLOCKS):
                                 k0 = kb * K_CHUNK
@@ -1668,12 +1662,12 @@ def prefill_fwd(
                     [2 * BATCH_PAD * MLP_M_TILE, HIDDEN],
                     dtype=pl.BF16,
                 )
-                hidden_tail = pl.array.create(BATCH_PAD, pl.TASK_ID)
+                window_done = pl.create_tensor([NUM_LAYERS * BATCH_PAD, 8], dtype=pl.FP32)
 
                 with pl.spmd(
                     TOKEN_EMBED_SPMD_BLOCKS,
                     name_hint="token_embed_group",
-                ) as embed_tid:
+                ):
                     embed_core = pl.tile.get_block_idx()
                     for work_id in pl.range(
                         embed_core,
@@ -1704,9 +1698,6 @@ def prefill_fwd(
                                     hidden_chunk,
                                     [group_idx, k0],
                                 )
-                for hidden_tail_idx in pl.unroll(BATCH_PAD):
-                    hidden_tail[hidden_tail_idx] = embed_tid
-
                 group_rows = BATCH_PAD * MLP_M_TILE
                 for layer_idx in pl.range(num_layers_actual):
                     read_base = (layer_idx % 2) * group_rows
@@ -1714,6 +1705,11 @@ def prefill_fwd(
                     with pl.scope():
                         group_hidden = pl.slice(group_hidden_pair, [BATCH_PAD * MLP_M_TILE, HIDDEN], [read_base, 0])
                         group_next = pl.slice(group_hidden_pair, [BATCH_PAD * MLP_M_TILE, HIDDEN], [write_base, 0])
+                        window_done_layer = pl.slice(
+                            window_done,
+                            [BATCH_PAD, 8],
+                            [layer_idx * BATCH_PAD, 0],
+                        )
                         group_next = prefill_layer(
                             group_hidden,
                             seq_lens,
@@ -1739,10 +1735,18 @@ def prefill_fwd(
                             w_up,
                             w_down,
                             group_next,
+                            window_done_layer,
                             layer_idx,
-                            hidden_tail,
                             kv_tail,
                         )
+                if num_layers_actual > 0:
+                    window_fence_base = (num_layers_actual - 1) * BATCH_PAD
+                    for fence_b in pl.range(batch):
+                        fence_chunk_len = pl.tensor.read(chunk_lens, [fence_b])
+                        if p0 < fence_chunk_len:
+                            window_fence_idx = window_fence_base + fence_b
+                            window_fence = pl.tensor.read(window_done, [window_fence_idx, 0])
+                            pl.tensor.write(window_done, [window_fence_idx, 0], window_fence)
                 for b in pl.parallel(0, batch, 1):
                     chunk_len_b = pl.tensor.read(chunk_lens, [b])
                     if chunk_len_b > 0:
@@ -1753,7 +1757,6 @@ def prefill_fwd(
                             with pl.at(
                                 level=pl.Level.CORE_GROUP,
                                 name_hint="save_prefill_last_token_group",
-                                deps=[hidden_tail[b]],
                             ):
                                 for kb in pl.range(HIDDEN_BLOCKS):
                                     k0 = kb * K_CHUNK
