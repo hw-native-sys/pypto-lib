@@ -16,7 +16,7 @@ that every kernel imports as a bare sibling module.
 | Speculative decoding | MTP = 1 — one draft token verified against the previous one, so a decode step carries `S = 2` token rows per request |
 | Decode batch per card | 4 requests → 8 token rows per step (`DECODE_BATCH`, `DECODE_SEQ`) |
 | Decode context length | up to 16,384 positions, paged in 128-token pages (`max_position_embeddings`, `BLOCK_SIZE`) |
-| Prefill shape | one request of 128 tokens per program (`PREFILL_BATCH`, `PREFILL_SEQ`) |
+| Prefill shape | one request per rank partition, each with up to 8,192 active tokens per dispatch; the program walks the dynamic extent in 128-token tiles (`PREFILL_BATCH`, `PREFILL_SEQ`) |
 | Platform | Ascend A2/A3, single node |
 | Expert parallelism | `--ep 2/4/8`; the deployment point is EP 8, and each rank holds `256 / ep` routed experts |
 | LM-head parallelism | `--tp 2/4/8/16` vocab shards over DP row owners, `--tp <= --ep` |
