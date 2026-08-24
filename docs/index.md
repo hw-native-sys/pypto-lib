@@ -43,6 +43,8 @@ Begin with the [debugging playbook](debug-and-tune/debugging.md), then choose
 the [precision](debug-and-tune/precision-tuning.md) or
 [performance](debug-and-tune/performance-tuning.md) workflow for the problem
 at hand.
+[DeepSeek V4 decode optimization](debug-and-tune/deepseek-v4-decode-optimization.md)
+follows one model's decode path end to end and records which levers paid.
 
 ## Ecosystem
 

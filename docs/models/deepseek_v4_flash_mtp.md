@@ -178,6 +178,14 @@ torch. `decode_prepare` lowers the packed input
 IDs and the paged-cache metadata on device; `utils` is its host-side torch
 counterpart used by the test fixtures.
 
+## How it was optimized
+
+[DeepSeek V4 decode optimization](../debug-and-tune/deepseek-v4-decode-optimization.md)
+follows the tuning of this decode path in order — contracts and golden first,
+then the general tiling / parallelism / fusion levers, the attention,
+hyper-connection, MoE and router rewrites, scheduling, and finally
+serving-level residency and lowering — with the limit measured at each step.
+
 ## Files
 
 | Group | Files |
