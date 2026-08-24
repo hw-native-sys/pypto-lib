@@ -44,10 +44,34 @@ value is supplied to the runtime and its final value is validated.
 
 ### ScalarSpec
 
-`ScalarSpec(name, dtype, value)` represents a scalar kernel argument. The
-harness stores it as a zero-dimensional PyTorch tensor and converts it to the
-runtime ABI form during dispatch. The name and position must still match the
-kernel signature.
+`ScalarSpec(name, dtype, value, compile_runtime=False, benchmark_step=None)`
+represents a scalar kernel argument. The harness stores it as a
+zero-dimensional PyTorch tensor and converts it to the runtime ABI form during
+dispatch. The name and position must still match the kernel signature.
+
+`run_jit` normally specializes scalar values into the artifact. Set
+`compile_runtime=True` when dispatches must supply different values to the same
+artifact. If any scalar is marked, `run_jit` compiles from the JIT function's
+fully annotated signature, passes marked scalars as `pl.RUNTIME`, and keeps
+unmarked scalars specialized to their `value`. Every tensor parameter therefore
+needs a complete `pl.Tensor[[shape...], dtype]` annotation on this path.
+
+For an L3 benchmark that retains persistent windows, set `benchmark_step` when
+the scalar must advance with every physical dispatch. Dispatch `i`, including
+warmup launches, receives `value + i * benchmark_step`. L2 benchmarks reject
+stepped scalars because they do not provide this persistent-window contract. A
+stepped scalar compiled through `run_jit` must also use `compile_runtime=True`;
+otherwise the compiler is allowed to fold the initial value into the artifact.
+Stepped scalars cannot be combined with `runtime_cfg={"enable_l2_swimlane":
+True}`: that mode may execute multiple physical passes for one handle call while
+reusing the same argument list, so the harness rejects the combination.
+`compile_runtime` affects fresh compilation only: passing `runtime_dir` does not
+retrofit an older artifact. A `runtime_dir` invocation is therefore a
+correctness-only replay and skips `PYPTO_BENCH`, even when an L3 program can be
+reconstructed from its metadata; metadata alone cannot prove that the generated
+host orchestration forwards a scalar instead of a folded literal. Recompile
+artifacts when introducing a runtime scalar, and have long-lived callers verify
+that generated task arguments forward it.
 
 See [`golden/spec.py`](../../golden/spec.py) for the complete dtype and
 resident-tensor contract.

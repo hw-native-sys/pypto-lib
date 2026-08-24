@@ -291,23 +291,23 @@ def prefill_compressor_ratio4(
         kv_rope_norm = pooled_kv[final_base : final_base + PACKED_RMS_TILE, NOPE_HEAD_DIM : HEAD_DIM]
         gamma_rope = pl.cast(norm_w_2d[:, NOPE_HEAD_DIM : HEAD_DIM], pl.FP32)
         rope_normed = pl.col_expand_mul(pl.row_expand_mul(kv_rope_norm, inv_rms), gamma_rope)
-        # A5 gather indices stay row-sized because wider TCI tiles can overrun UB.
-        rope_ones = pl.full([1, ROPE_HEAD_DIM], dtype=pl.FP32, value=1.0)
-        rope_col = pl.col_expand_mul(rope_ones, pl.cast(pl.arange(0, [1, ROPE_HEAD_DIM], dtype=pl.INT32), target_type=pl.FP32))
-        rope_dup_f = pl.cast(pl.cast(pl.mul(rope_col, 0.5), target_type=pl.INT32, mode="trunc"), target_type=pl.FP32)
-        rope_dup_idx = pl.cast(rope_dup_f, target_type=pl.INT32)                                       # j>>1
-        rope_lane = pl.sub(rope_col, pl.mul(rope_dup_f, 2.0))                                          # j%2
-        rope_swap_idx = pl.cast(pl.sub(pl.add(rope_col, 1.0), pl.mul(rope_lane, 2.0)), target_type=pl.INT32)  # j^1
-        rope_sign = pl.sub(pl.mul(rope_lane, 2.0), 1.0)                                                # [-1,+1,...]
+        # De-interleave and re-interleave adjacent RoPE lanes.
         for rope_row in pl.range(PACKED_RMS_TILE):
-            cos_il = pl.gather(cos_b[rope_row : rope_row + 1, :], dim=-1, index=rope_dup_idx)
-            sin_il = pl.gather(sin_b[rope_row : rope_row + 1, :], dim=-1, index=rope_dup_idx)
             rope_normed_row = rope_normed[rope_row : rope_row + 1, :]
-            swapped = pl.gather(rope_normed_row, dim=-1, index=rope_swap_idx)
-            rope_base = pl.mul(rope_normed_row, cos_il)
-            rope_signed = pl.mul(swapped, rope_sign)
-            rope_delta = pl.mul(rope_signed, sin_il)
-            rope_rot = pl.add(rope_base, rope_delta)
+            rope_even = pl.gather(rope_normed_row, mask_pattern=pl.tile.MaskPattern.P0101)
+            rope_odd = pl.gather(rope_normed_row, mask_pattern=pl.tile.MaskPattern.P1010)
+            rope_cos_row = cos_b[rope_row : rope_row + 1, :]
+            rope_sin_row = sin_b[rope_row : rope_row + 1, :]
+            rope_even_base = pl.mul(rope_even, rope_cos_row)
+            rope_even_signed = pl.neg(rope_odd)
+            rope_even_delta = pl.mul(rope_even_signed, rope_sin_row)
+            rope_even_rot = pl.add(rope_even_base, rope_even_delta)
+            rope_odd_base = pl.mul(rope_odd, rope_cos_row)
+            rope_odd_delta = pl.mul(rope_even, rope_sin_row)
+            rope_odd_rot = pl.add(rope_odd_base, rope_odd_delta)
+            rope_rot_zero = pl.full([1, ROPE_HEAD_DIM], dtype=pl.FP32, value=0.0)
+            rope_rot_even = pl.tensor.scatter(rope_even_rot, mask_pattern=pl.tile.MaskPattern.P0101, dst=rope_rot_zero)
+            rope_rot = pl.tensor.scatter(rope_odd_rot, mask_pattern=pl.tile.MaskPattern.P1010, dst=rope_rot_even)
             rope_out_row = final_base + rope_row
             normed_kv[rope_out_row : rope_out_row + 1, NOPE_HEAD_DIM : HEAD_DIM] = rope_rot
 

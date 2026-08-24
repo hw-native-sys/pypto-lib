@@ -47,6 +47,7 @@ from .spec import ScalarSpec, TensorSpec
 from .validation import (
     error_distribution,
     mapped_pool_ratio_allclose,
+    mapped_pool_ratio_reldiff,
     ratio_allclose,
     ratio_reldiff,
     topk_pair_compare,
@@ -59,6 +60,7 @@ __all__ = [
     "validate_golden",
     "ratio_allclose",
     "mapped_pool_ratio_allclose",
+    "mapped_pool_ratio_reldiff",
     "ratio_reldiff",
     "error_distribution",
     "topk_pair_compare",

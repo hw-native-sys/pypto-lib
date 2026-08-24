@@ -219,21 +219,50 @@ class ScalarSpec:
             *dtype* (used directly).  After ``__post_init__`` runs, ``value``
             is **always** a 0-dim ``torch.Tensor`` carrying the dtype-precise
             representation, so cache I/O is just ``torch.save`` / ``torch.load``.
+        compile_runtime: Whether :func:`golden.run_jit` must leave this scalar
+            unspecialized in the compiled artifact.  Marked scalars are passed
+            to ``JITFunction.compile`` as ``pl.RUNTIME`` and remain real
+            runtime ABI parameters.  This flag has no effect on the direct
+            :func:`golden.run` path, whose input is already an IR program.
+        benchmark_step: Optional additive step for repeated benchmark
+            dispatches.  Dispatch ``i`` receives ``value + i * benchmark_step``
+            (including warmup dispatches); ``None`` keeps the scalar constant.
+            This is intended for persistent-window epochs and is unsupported
+            by the L2 benchmark path.
 
     Example:
         >>> ScalarSpec("alpha", torch.float32, 0.125)
         >>> ScalarSpec("seq_len", torch.int32, 4096)
+        >>> ScalarSpec(
+        ...     "epoch_base", torch.int32, 0,
+        ...     compile_runtime=True, benchmark_step=43,
+        ... )
     """
 
     name: str
     dtype: torch.dtype
     value: int | float | bool | torch.Tensor
+    compile_runtime: bool = False
+    benchmark_step: int | float | None = None
 
     def __post_init__(self) -> None:
+        if not isinstance(self.compile_runtime, bool):
+            raise ValueError(
+                f"ScalarSpec {self.name!r}: compile_runtime must be a bool, "
+                f"got {type(self.compile_runtime).__name__}"
+            )
         if self.dtype not in SUPPORTED_SCALAR_DTYPES:
             raise ValueError(
                 f"ScalarSpec {self.name!r}: unsupported dtype {self.dtype!r}; "
                 f"expected one of {list(SUPPORTED_SCALAR_DTYPES)}"
+            )
+        if self.benchmark_step is not None:
+            if self.dtype is torch.bool:
+                raise ValueError(
+                    f"ScalarSpec {self.name!r}: benchmark_step is unsupported for torch.bool"
+                )
+            _validate_primitive(
+                f"{self.name} benchmark_step", self.dtype, self.benchmark_step
             )
         if isinstance(self.value, torch.Tensor):
             if self.value.ndim != 0:
@@ -250,6 +279,34 @@ class ScalarSpec:
         _validate_primitive(self.name, self.dtype, self.value)
         # Coerce to dtype-precise 0-dim tensor so storage matches dtype.
         self.value = torch.tensor(self.value, dtype=self.dtype)
+
+    @property
+    def has_benchmark_step(self) -> bool:
+        """Whether repeated benchmark dispatches must advance this scalar."""
+        return self.benchmark_step is not None and self.benchmark_step != 0
+
+    def value_for_benchmark_dispatch(self, dispatch_index: int) -> torch.Tensor:
+        """Return the dtype-precise value for one benchmark dispatch.
+
+        Dispatch zero reuses :attr:`value`; later dispatches add
+        :attr:`benchmark_step`.  Constructing a temporary :class:`ScalarSpec`
+        keeps integer overflow and dtype validation identical to normal scalar
+        construction.
+        """
+        if isinstance(dispatch_index, bool) or not isinstance(dispatch_index, int):
+            raise ValueError(
+                f"ScalarSpec {self.name!r}: dispatch_index must be an int, "
+                f"got {type(dispatch_index).__name__}"
+            )
+        if dispatch_index < 0:
+            raise ValueError(
+                f"ScalarSpec {self.name!r}: dispatch_index must be non-negative, "
+                f"got {dispatch_index}"
+            )
+        if not self.has_benchmark_step or dispatch_index == 0:
+            return self.value
+        value = self.to_python() + dispatch_index * self.benchmark_step
+        return ScalarSpec(self.name, self.dtype, value).value
 
     def to_ctypes(self) -> ctypes._SimpleCData:
         """Encode to ``ctypes._SimpleCData`` for :func:`pypto.runtime.execute_compiled`.

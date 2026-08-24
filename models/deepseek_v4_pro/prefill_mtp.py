@@ -14,7 +14,7 @@ import argparse
 
 import pypto.language as pl
 import pypto.language.distributed as pld
-from golden import ratio_reldiff, run_jit
+from golden import mapped_pool_ratio_reldiff, ratio_reldiff, run_jit
 from pypto.ir.distributed_compiled_program import DistributedConfig
 
 import config
@@ -42,6 +42,7 @@ from moe import (
     N_RANKS,
     N_ROUTES,
     RECV_MAX,
+    SIGNAL_PAD,
     TOPK,
     VOCAB,
     build_tensor_specs as build_moe_tensor_specs,
@@ -135,10 +136,11 @@ def mtp_prefill_fwd(
     recv_x: pld.DistributedTensor[[N_LOCAL * RECV_MAX, D], pl.INT8],
     recv_aux: pld.DistributedTensor[[N_LOCAL * RECV_MAX, AUX_PAD], pl.FP32],
     recv_route: pld.DistributedTensor[[N_LOCAL * RECV_MAX, IDX_PAD], pl.INT32],
-    arrived: pld.DistributedTensor[[N_RANKS, 1], pl.INT32],
-    data_arrived: pld.DistributedTensor[[N_RANKS, 1], pl.INT32],
+    arrived: pld.DistributedTensor[[N_RANKS, SIGNAL_PAD], pl.INT32],
+    data_arrived: pld.DistributedTensor[[N_RANKS, N_LOCAL, SIGNAL_PAD], pl.INT32],
     routed_y_buf: pld.DistributedTensor[[N_ROUTES, D], pl.BF16],
-    combine_arrived: pl.InOut[pld.DistributedTensor[[N_RANKS, 1], pl.INT32]],
+    combine_arrived: pl.InOut[pld.DistributedTensor[[N_RANKS, N_LOCAL, SIGNAL_PAD], pl.INT32]],
+    consumed: pl.InOut[pld.DistributedTensor[[N_RANKS, SIGNAL_PAD], pl.INT32]],
     my_rank: pl.Scalar[pl.INT32],
     num_tokens: pl.Scalar[pl.INT32],
 ) -> pl.Tensor[[T, D], pl.BF16]:
@@ -180,33 +182,28 @@ def mtp_prefill_fwd(
         shared_w2, shared_w2_scale,
         pre_hc_hidden_out,
         recv_meta, recv_x, recv_aux, recv_route, arrived, data_arrived,
-        routed_y_buf, combine_arrived,
+        routed_y_buf, combine_arrived, consumed,
         mtp_layer_id, nt, my_rank, mtp_moe_epoch,
     )
 
-    # Reset persistent MoE signal credits.
-    neg_epochs = pl.cast(0 - MTP_MOE_EPOCH, pl.INT32)
-    neg_data = pl.cast(0 - MTP_MOE_EPOCH * N_LOCAL, pl.INT32)
-    neg_combine = pl.cast(0 - MTP_MOE_EPOCH * (N_LOCAL + 1), pl.INT32)
+    # Wait for every rank's final reduction marker before clearing this rank's
+    # inbound epoch slots. No source can still publish into these windows once
+    # every consumed slot has reached the fixed MTP epoch.
     with pl.at(level=pl.Level.CORE_GROUP, name_hint="moe_signal_retire"):
         _pre_hc_anchor = pl.read(pre_hc_hidden_out, [0, 0, 0])
-        pld.system.notify(
-            target=combine_arrived, peer=my_rank, offsets=[my_rank, 0],
-            value=neg_epochs, op=pld.NotifyOp.AtomicAdd,
-        )
         for src in pl.range(N_RANKS):
-            if src != my_rank:
+            pld.system.wait(signal=consumed, offsets=[src, 0], expected=mtp_moe_epoch, cmp=pld.WaitCmp.Ge)
+        for src in pl.range(N_RANKS):
+            pld.system.notify(target=arrived, peer=my_rank, offsets=[src, 0], value=0, op=pld.NotifyOp.Set)
+            pld.system.notify(target=consumed, peer=my_rank, offsets=[src, 0], value=0, op=pld.NotifyOp.Set)
+            for e in pl.range(N_LOCAL):
                 pld.system.notify(
-                    target=arrived, peer=my_rank, offsets=[src, 0],
-                    value=neg_epochs, op=pld.NotifyOp.AtomicAdd,
+                    target=data_arrived, peer=my_rank, offsets=[src, e, 0],
+                    value=0, op=pld.NotifyOp.Set,
                 )
                 pld.system.notify(
-                    target=data_arrived, peer=my_rank, offsets=[src, 0],
-                    value=neg_data, op=pld.NotifyOp.AtomicAdd,
-                )
-                pld.system.notify(
-                    target=combine_arrived, peer=my_rank, offsets=[src, 0],
-                    value=neg_combine, op=pld.NotifyOp.AtomicAdd,
+                    target=combine_arrived, peer=my_rank, offsets=[src, e, 0],
+                    value=0, op=pld.NotifyOp.Set,
                 )
 
     x_head = pl.create_tensor([T, D], dtype=pl.BF16)
@@ -279,10 +276,11 @@ def l3_mtp_prefill_fwd(
     recv_x_buf = pld.alloc_window_buffer([N_LOCAL * RECV_MAX, D], dtype=pl.INT8)
     recv_aux_buf = pld.alloc_window_buffer([N_LOCAL * RECV_MAX, AUX_PAD], dtype=pl.FP32)
     recv_route_buf = pld.alloc_window_buffer([N_LOCAL * RECV_MAX, IDX_PAD], dtype=pl.INT32)
-    arrived_buf = pld.alloc_window_buffer([N_RANKS, 1], dtype=pl.INT32)
-    data_arrived_buf = pld.alloc_window_buffer([N_RANKS, 1], dtype=pl.INT32)
+    arrived_buf = pld.alloc_window_buffer([N_RANKS, SIGNAL_PAD], dtype=pl.INT32)
+    data_arrived_buf = pld.alloc_window_buffer([N_RANKS, N_LOCAL, SIGNAL_PAD], dtype=pl.INT32)
     routed_y_buf_buf = pld.alloc_window_buffer([N_ROUTES, D], dtype=pl.BF16)
-    combine_arrived_buf = pld.alloc_window_buffer([N_RANKS, 1], dtype=pl.INT32)
+    combine_arrived_buf = pld.alloc_window_buffer([N_RANKS, N_LOCAL, SIGNAL_PAD], dtype=pl.INT32)
+    consumed_buf = pld.alloc_window_buffer([N_RANKS, SIGNAL_PAD], dtype=pl.INT32)
 
     world_size = pld.world_size()
     for r in pl.range(world_size):
@@ -290,10 +288,11 @@ def l3_mtp_prefill_fwd(
         recv_x: pld.DistributedTensor[[N_LOCAL * RECV_MAX, D], pl.INT8] = pld.window(recv_x_buf, [N_LOCAL * RECV_MAX, D], dtype=pl.INT8)
         recv_aux: pld.DistributedTensor[[N_LOCAL * RECV_MAX, AUX_PAD], pl.FP32] = pld.window(recv_aux_buf, [N_LOCAL * RECV_MAX, AUX_PAD], dtype=pl.FP32)
         recv_route: pld.DistributedTensor[[N_LOCAL * RECV_MAX, IDX_PAD], pl.INT32] = pld.window(recv_route_buf, [N_LOCAL * RECV_MAX, IDX_PAD], dtype=pl.INT32)
-        arrived: pld.DistributedTensor[[N_RANKS, 1], pl.INT32] = pld.window(arrived_buf, [N_RANKS, 1], dtype=pl.INT32)
-        data_arrived: pld.DistributedTensor[[N_RANKS, 1], pl.INT32] = pld.window(data_arrived_buf, [N_RANKS, 1], dtype=pl.INT32)
+        arrived = pld.window(arrived_buf, [N_RANKS, SIGNAL_PAD], dtype=pl.INT32)
+        data_arrived = pld.window(data_arrived_buf, [N_RANKS, N_LOCAL, SIGNAL_PAD], dtype=pl.INT32)
         routed_y_buf: pld.DistributedTensor[[N_ROUTES, D], pl.BF16] = pld.window(routed_y_buf_buf, [N_ROUTES, D], dtype=pl.BF16)
-        combine_arrived: pld.DistributedTensor[[N_RANKS, 1], pl.INT32] = pld.window(combine_arrived_buf, [N_RANKS, 1], dtype=pl.INT32)
+        combine_arrived = pld.window(combine_arrived_buf, [N_RANKS, N_LOCAL, SIGNAL_PAD], dtype=pl.INT32)
+        consumed = pld.window(consumed_buf, [N_RANKS, SIGNAL_PAD], dtype=pl.INT32)
         mtp_prefill_fwd(
             hidden_states[r],
             prev_hidden_states[r],
@@ -315,15 +314,17 @@ def l3_mtp_prefill_fwd(
             mtp_hc_head_fn[r], mtp_hc_head_scale[r], mtp_hc_head_base[r], mtp_norm_w[r],
             hidden_out[r], pre_hc_hidden_out[r],
             recv_meta, recv_x, recv_aux, recv_route, arrived, data_arrived,
-            routed_y_buf, combine_arrived,
+            routed_y_buf, combine_arrived, consumed,
             r, num_tokens,
             device=r,
         )
 
 
-def _ranked(spec, torch, is_output=False):
+def _ranked(spec, torch, is_output=None):
     from golden import TensorSpec
 
+    if is_output is None:
+        is_output = spec.is_output
     return TensorSpec(spec.name, list(spec.shape), spec.dtype, init_value=spec.init_value, is_output=is_output)
 
 
@@ -596,6 +597,11 @@ def main():
         rtol=1e-3,
         atol=1e-3,
         compare_fn={
+            "kv_cache": mapped_pool_ratio_reldiff(
+                "ori_slot_mapping", mapping_shape=(N_RANKS, T), block_size=BLOCK_SIZE,
+                leading_rank_axis=True, pool_name="kv_cache",
+                diff_thd=0.01, pct_thd=0.05,
+            ),
             "hidden_out": ratio_reldiff(
                 diff_thd=0.02, pct_thd=0.05,
                 valid_rows=args.num_tokens, valid_axis=1,

@@ -38,6 +38,7 @@ remain resident on device.
 from __future__ import annotations
 
 import argparse
+import ast
 import gc
 import importlib
 import os
@@ -108,7 +109,83 @@ def _ordered_args(compiled, io_tensors, resident_handles, scalars):
     return ordered
 
 
-def _compile_program(model_dir, entrypoint, args, num_tokens, start_pos, extra_env=None):
+def _require_scalar(compiled, name, program, dtype):
+    info = _info_map(compiled).get(name)
+    if info is None:
+        raise ValueError(f"{program} artifact is missing scalar {name!r}; recompile it with this source")
+    if info.shape is not None:
+        raise ValueError(f"{program} artifact parameter {name!r} is not a scalar")
+
+    from pypto.ir.compiled_program import _to_torch_dtype
+
+    artifact_dtype = _to_torch_dtype(info.dtype)
+    if artifact_dtype != dtype:
+        raise TypeError(f"{program} artifact scalar {name!r} has dtype {artifact_dtype}, expected {dtype}")
+
+
+def _is_tensor_lookup(node, artifact_name):
+    return (
+        isinstance(node, ast.Subscript)
+        and isinstance(node.value, ast.Name)
+        and node.value.id == "tensors"
+        and isinstance(node.slice, ast.Constant)
+        and node.slice.value == artifact_name
+    )
+
+
+def _host_orch_forwards_scalar(host_orch, artifact_name):
+    """Return whether ``host_orch.py`` passes one metadata scalar to TaskArgs."""
+    tree = ast.parse(host_orch.read_text(), filename=str(host_orch))
+    runtime_vars = set()
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.Assign) or not _is_tensor_lookup(node.value, artifact_name):
+            continue
+        for target in node.targets:
+            runtime_vars.update(child.id for child in ast.walk(target) if isinstance(child, ast.Name))
+
+    for node in ast.walk(tree):
+        if not (
+            isinstance(node, ast.Call)
+            and isinstance(node.func, ast.Attribute)
+            and node.func.attr == "add_scalar"
+        ):
+            continue
+        for argument in node.args:
+            if any(_is_tensor_lookup(child, artifact_name) for child in ast.walk(argument)):
+                return True
+            if any(isinstance(child, ast.Name) and child.id in runtime_vars for child in ast.walk(argument)):
+                return True
+    return False
+
+
+def _require_runtime_scalar(compiled, name, program, dtype):
+    """Validate both the scalar ABI and its generated host-side forwarding."""
+    _require_scalar(compiled, name, program, dtype)
+    artifact_name = _info_map(compiled)[name].name
+    host_orch = Path(compiled.output_dir) / "orchestration" / "host_orch.py"
+    if not host_orch.is_file():
+        raise ValueError(f"{program} artifact is missing generated host orchestration: {host_orch}")
+    try:
+        forwarded = _host_orch_forwards_scalar(host_orch, artifact_name)
+    except (OSError, SyntaxError) as error:
+        raise ValueError(f"cannot inspect {program} artifact host orchestration: {host_orch}") from error
+    if not forwarded:
+        raise ValueError(
+            f"{program} artifact scalar {name!r} is not forwarded through "
+            "TaskArgs.add_scalar; it was likely constant-specialized. Recompile "
+            "with ScalarSpec(..., compile_runtime=True) and this source"
+        )
+
+
+def _create_persistent_worker(worker_type, compiled, config, inherited):
+    return worker_type(
+        compiled, config=config,
+        persistent=True, reset_persistent_windows=False,
+        inherited_host_tensors=inherited,
+    )
+
+
+def _compile_program(model_dir, entrypoint, args, num_tokens, start_pos):
     command = [
         sys.executable,
         str(model_dir / entrypoint),
@@ -130,8 +207,6 @@ def _compile_program(model_dir, entrypoint, args, num_tokens, start_pos, extra_e
     ]
     env = os.environ.copy()
     env["DEEPSEEK_V4_VARIANT"] = args.variant
-    if extra_env:
-        env.update(extra_env)
     repo_root = model_dir.parents[1]
     old_pythonpath = env.get("PYTHONPATH")
     env["PYTHONPATH"] = (
@@ -337,7 +412,22 @@ def _ranked_prefill(value, num_ranks):
     return flat.unsqueeze(0).expand(num_ranks, -1).contiguous()
 
 
-def _initialize_prefill_io(prefill, decode_metadata, io_tensors, scalars, tables, prompt_ids=None):
+def _prefill_prompt_row(vocab, prompt_ids, synthetic_prompt_len):
+    ids_row = torch.zeros(PROMPT_TOKENS, dtype=torch.int64)
+    if prompt_ids is None:
+        prompt_len = synthetic_prompt_len
+        ids_row[:prompt_len] = torch.arange(prompt_len, dtype=torch.int64).remainder(vocab)
+    else:
+        prompt_len = int(prompt_ids.numel())
+        ids_row[:prompt_len] = prompt_ids.to(torch.int64)
+    return ids_row, prompt_len
+
+
+def _initialize_prefill_io(
+    prefill, decode_metadata,
+    io_tensors, scalars, tables,
+    prompt_ids=None, synthetic_prompt_len=PROMPT_TOKENS,
+):
     positions = torch.arange(PROMPT_TOKENS, dtype=torch.int32).reshape(1, -1)
     table_aliases = {
         "ori_block_table": "block_table",
@@ -355,13 +445,7 @@ def _initialize_prefill_io(prefill, decode_metadata, io_tensors, scalars, tables
     io_tensors["position_ids"].copy_(
         _ranked_prefill(positions, prefill.N_RANKS)
     )
-    if prompt_ids is None:
-        prompt_len = PROMPT_TOKENS
-        ids_row = torch.arange(PROMPT_TOKENS, dtype=torch.int64).remainder(prefill.VOCAB)
-    else:
-        prompt_len = int(prompt_ids.numel())
-        ids_row = torch.zeros(PROMPT_TOKENS, dtype=torch.int64)
-        ids_row[:prompt_len] = prompt_ids.to(torch.int64)
+    ids_row, prompt_len = _prefill_prompt_row(prefill.VOCAB, prompt_ids, synthetic_prompt_len)
     io_tensors["input_ids"].copy_(_ranked_prefill(ids_row, prefill.N_RANKS))
 
     row = {name: table[0:1] for name, table in tables.items()}
@@ -492,20 +576,24 @@ def _check_sample(io_tensors, vocab_size, stage):
     finite = torch.isfinite(logits)
     if not bool(finite.all()):
         bad_by_rank = (~finite).sum(dim=-1).tolist()
+        _report_sample_failure(io_tensors, stage, "non-finite logits")
         raise AssertionError(
             f"{stage}: active logits contain non-finite values by rank: "
             f"{bad_by_rank}"
         )
     if not bool(((sampled >= 0) & (sampled < vocab_size)).all()):
+        _report_sample_failure(io_tensors, stage, "sample outside vocabulary")
         raise AssertionError(f"{stage}: sampled token is outside the vocabulary: {sampled}")
     argmax = torch.argmax(logits, dim=-1).to(torch.int32)
     greedy_match = bool(torch.equal(sampled, argmax))
     if not greedy_match:
+        _report_sample_failure(io_tensors, stage, "sample and argmax differ")
         raise AssertionError(
             f"{stage}: sampled token does not match the logits argmax: "
             f"sampled={sampled}, argmax={argmax}"
         )
     if sampled.numel() > 1 and not bool(torch.equal(sampled, sampled[0].expand_as(sampled))):
+        _report_sample_failure(io_tensors, stage, "ranks sampled different tokens")
         raise AssertionError(f"{stage}: ranks sampled different tokens: {sampled.tolist()}")
     print(
         f"[SESSION] {stage}: sampled={sampled.tolist()} "
@@ -513,6 +601,60 @@ def _check_sample(io_tensors, vocab_size, stage):
         flush=True,
     )
     return sampled.to(torch.int64).clone()
+
+
+def _active_rows(io_tensors, world_size):
+    row_indices = io_tensors.get("logit_row_indices")
+    if row_indices is None:
+        return torch.zeros(world_size, dtype=torch.int64)
+    rows = row_indices[:, 0].to(torch.int64).cpu()
+    if rows.numel() != world_size:
+        return torch.zeros(world_size, dtype=torch.int64)
+    return rows
+
+
+def _selected_rank_rows(tensor, rows):
+    if tensor.ndim < 2 or tensor.shape[0] != rows.numel():
+        return tensor.reshape(tensor.shape[0], -1)
+    selected = [tensor[rank, int(rows[rank])] for rank in range(rows.numel())]
+    return torch.stack(selected).reshape(rows.numel(), -1)
+
+
+def _report_sample_failure(io_tensors, stage, reason):
+    logits = io_tensors["logits"][:, 0].float()
+    rows = _active_rows(io_tensors, logits.shape[0])
+    print(f"[FAILURE] {stage}: {reason}; active_rows={rows.tolist()}", flush=True)
+    for name in ("pre_hc_hidden_out", "hidden_out", "logits"):
+        tensor = io_tensors.get(name)
+        if tensor is None:
+            continue
+        selected = logits if name == "logits" else _selected_rank_rows(tensor, rows).float()
+        finite = torch.isfinite(selected)
+        safe = torch.where(finite, selected, torch.zeros_like(selected))
+        reference = safe[0:1]
+        stats = f"nonfinite={((~finite).sum(dim=-1)).tolist()} sum={safe.sum(dim=-1).tolist()}"
+        stats += f" sq_sum={(safe * safe).sum(dim=-1).tolist()} max_abs={safe.abs().amax(dim=-1).tolist()}"
+        stats += f" max_abs_diff_rank0={(safe - reference).abs().amax(dim=-1).tolist()}"
+        print(f"[FAILURE] {stage} {name}: {stats}", flush=True)
+    top_values, top_indices = torch.topk(logits, k=2, dim=-1)
+    print(f"[FAILURE] {stage} logits_top2: ids={top_indices.tolist()} values={top_values.tolist()}", flush=True)
+
+    dump_dir = os.environ.get("DSV4_FAIL_DUMP_DIR")
+    if not dump_dir:
+        return
+    safe_stage = re.sub(r"[^A-Za-z0-9_.-]+", "_", stage)
+    path = Path(dump_dir) / f"failure_{safe_stage}.pt"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    names = (
+        "input_ids",
+        "logit_row_indices",
+        "pre_hc_hidden_out",
+        "hidden_out",
+        "logits",
+        "sampled_ids",
+    )
+    torch.save({name: io_tensors[name].clone() for name in names if name in io_tensors}, path)
+    print(f"[FAILURE] {stage}: saved tensors to {path}", flush=True)
 
 
 def _share_io(*io_groups):
@@ -557,9 +699,15 @@ def _run_session(args, prefill_dir, decode_dir, model_dir):
         backend_type=BackendType.Ascend950,
         distributed_config=distributed_config,
     )
+    for compiled, program in (
+        (prefill_compiled, "prefill"),
+        (decode_compiled, "decode"),
+    ):
+        _require_runtime_scalar(compiled, "num_tokens", program, torch.int32)
+        _require_runtime_scalar(compiled, "moe_epoch_base", program, torch.int32)
 
     prompt_ids = getattr(args, "prompt_ids", None)
-    prompt_len = int(prompt_ids.numel()) if prompt_ids is not None else PROMPT_TOKENS
+    prompt_len = int(prompt_ids.numel()) if prompt_ids is not None else args.prefill_tokens
 
     import_argv = [
         str(model_dir / "synthetic_token_loop.py"),
@@ -621,12 +769,9 @@ def _run_session(args, prefill_dir, decode_dir, model_dir):
             )
         tables = _build_session_tables(decode)
         _initialize_prefill_io(
-            prefill_constants,
-            decode_metadata,
-            prefill_io,
-            prefill_scalars,
-            tables,
-            prompt_ids,
+            prefill_constants, decode_metadata,
+            prefill_io, prefill_scalars, tables,
+            prompt_ids, prompt_len,
         )
         decode_io, decode_scalars = _build_io(
             decode_compiled, resident_names, decode.MODEL_CONFIG.vocab_size
@@ -663,10 +808,8 @@ def _run_session(args, prefill_dir, decode_dir, model_dir):
         handles = {}
         uploaded = []
         try:
-            runtime = DistributedWorker(
-                [prefill_compiled, decode_compiled],
-                config=prefill_config,
-                inherited_host_tensors=inherited,
+            runtime = _create_persistent_worker(
+                DistributedWorker, [prefill_compiled, decode_compiled], prefill_config, inherited
             )
             for index, name in enumerate(sorted(resident_names), start=1):
                 print(
@@ -703,6 +846,7 @@ def _run_session(args, prefill_dir, decode_dir, model_dir):
                     start_pos,
                     tokens,
                 )
+                decode_scalars["moe_epoch_base"] = torch.tensor(step * decode.LAST_MOE_EPOCH, dtype=torch.int32)
                 runtime.run(
                     decode_compiled,
                     *_ordered_args(
@@ -781,12 +925,10 @@ def main():
                         help="do not prepend the BOS token to the prompt")
     parser.add_argument("--eos-id", type=int, default=1,
                         help="stop decoding when this token is sampled (real-weight runs only)")
-    parser.add_argument("--prefill-tokens", type=int, default=PROMPT_TOKENS,
-                        help="MoE token extent the prefill program is compiled with; the prompt "
-                             f"(including BOS) must fit in it (1..{PROMPT_TOKENS})")
-    parser.add_argument("--prefill-no-retire", action="store_true",
-                        help="compile the prefill program with DSV4_DISABLE_MOE_RETIRE=1; decode "
-                             "keeps its retirement (EP8 workaround, see docs/models/deepseek_v4_pro.md)")
+    parser.add_argument(
+        "--prefill-tokens", type=int, default=PROMPT_TOKENS,
+        help=f"maximum active prompt length (including BOS); the fixed prefill capacity is {PROMPT_TOKENS} tokens",
+    )
     args = parser.parse_args()
 
     device_ids = [device for device in args.device.split(",") if device]
@@ -825,7 +967,7 @@ def main():
                 ids = [bos_id] + ids
         if not 1 <= len(ids) <= args.prefill_tokens:
             raise ValueError(
-                f"prompt is {len(ids)} tokens; must fit the compiled prefill extent "
+                f"prompt is {len(ids)} tokens; must fit the configured active-token limit "
                 f"1..{args.prefill_tokens} (--prefill-tokens)"
             )
         args.prompt_ids = torch.tensor(ids, dtype=torch.int64)
@@ -836,14 +978,9 @@ def main():
     prefill_dir = args.prefill_runtime_dir
     decode_dir = args.decode_runtime_dir
     if prefill_dir is None:
-        prefill_env = {"DSV4_DISABLE_MOE_RETIRE": "1"} if args.prefill_no_retire else None
-        prefill_dir = _compile_program(
-            model_dir, "prefill_fwd.py", args, args.prefill_tokens, 0, prefill_env
-        )
+        prefill_dir = _compile_program(model_dir, "prefill_fwd.py", args, args.prefill_tokens, 0)
     if decode_dir is None:
-        decode_dir = _compile_program(
-            model_dir, "decode_fwd.py", args, 1, PROMPT_TOKENS
-        )
+        decode_dir = _compile_program(model_dir, "decode_fwd.py", args, 1, PROMPT_TOKENS)
     print(f"[SESSION] prefill_runtime_dir={prefill_dir.resolve()}", flush=True)
     print(f"[SESSION] decode_runtime_dir={decode_dir.resolve()}", flush=True)
     if args.compile_only:

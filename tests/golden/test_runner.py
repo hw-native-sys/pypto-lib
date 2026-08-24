@@ -16,23 +16,27 @@ so they run without a device.
 import ctypes
 import sys
 import types
+from contextlib import contextmanager
 from pathlib import Path
 from unittest.mock import MagicMock, patch
 
 import pytest
 import torch
-from golden import ScalarSpec, TensorSpec, run
+from golden import ScalarSpec, TensorSpec, run, run_jit
 from golden.runner import (
     RunResult,
     _backend_for_platform,
     _bench_loop_sizes,
     _format_stale_paths,
+    _l3_ordered_args,
     _maybe_reload_l3,
+    _prepare_inputs,
     _report_effective,
     _report_l3_detail,
     _report_l3_per_rank,
     _report_raw_samples,
     _resident_loop_sizes,
+    _run_benchmark,
     _run_benchmark_l3,
     _run_l3_resident,
     _save_tensors,
@@ -47,6 +51,45 @@ class _FakeCompiled:
 
     def __init__(self, output_dir: Path):
         self.output_dir = output_dir
+
+
+class _FakeParamDirection:
+    In = "In"
+    Out = "Out"
+    InOut = "InOut"
+
+
+def _l3_info(
+    name,
+    *,
+    shape=None,
+    dtype=torch.int32,
+    direction=_FakeParamDirection.In,
+):
+    return types.SimpleNamespace(
+        name=name,
+        shape=shape,
+        dtype=dtype,
+        direction=direction,
+    )
+
+
+@contextmanager
+def _l3_abi_environment():
+    """Install deterministic CPU-only metadata types for L3 ABI tests."""
+    dtype_module = types.ModuleType("pypto.ir.compiled_program")
+    dtype_module._to_torch_dtype = lambda dtype: dtype
+    with (
+        patch.object(
+            sys.modules["pypto.ir"],
+            "ParamDirection",
+            _FakeParamDirection,
+            create=True,
+        ),
+        patch.dict(sys.modules, {"pypto.ir.compiled_program": dtype_module}),
+        patch("golden.runner._is_l3", return_value=True),
+    ):
+        yield
 
 
 @pytest.fixture
@@ -463,6 +506,414 @@ class TestCompileOnly:
         # compile_only path must not persist anything under data/.
         assert not (compiled_dir / "data").exists()
 
+    def test_duplicate_specs_fail_before_compile(self):
+        specs = [
+            TensorSpec("duplicate", [1], torch.float32),
+            ScalarSpec("duplicate", torch.int32, 0),
+        ]
+        with patch("pypto.ir.compile") as compile_fn:
+            result = run(program=object(), specs=specs, compile_only=True)
+
+        assert not result.passed
+        assert "duplicate spec names" in result.error
+        compile_fn.assert_not_called()
+
+    def test_compile_only_validates_exact_l3_abi_before_success(self, tmp_path):
+        compiled_dir = tmp_path / "build"
+        compiled_dir.mkdir()
+        compiled = types.SimpleNamespace(
+            output_dir=compiled_dir,
+            _get_metadata=lambda: (
+                [_l3_info("x__ssa_v0", shape=[5], dtype=torch.float32)],
+                None,
+                None,
+            ),
+        )
+        specs = [TensorSpec("x", [4], torch.float32)]
+
+        with (
+            _l3_abi_environment(),
+            patch("pypto.ir.compile", return_value=compiled) as compile_fn,
+            patch.object(TensorSpec, "create_tensor") as create_tensor,
+            patch("pypto.runtime.execute_compiled") as execute,
+        ):
+            result = run(program=object(), specs=specs, compile_only=True)
+
+        assert not result.passed
+        assert "shape" in (result.error or "")
+        compile_fn.assert_called_once()
+        create_tensor.assert_not_called()
+        execute.assert_not_called()
+
+
+class TestRunJitCompileRuntime:
+    def test_marked_scalar_uses_signature_mode_and_runtime_marker(self, tmp_path):
+        compiled_dir = tmp_path / "build"
+        compiled_dir.mkdir()
+        compiled = _FakeCompiled(compiled_dir)
+        fn = types.SimpleNamespace(compile=MagicMock(return_value=compiled))
+        runtime_marker = object()
+
+        class FakeRunConfig:
+            def __init__(self, **kwargs):
+                self.kwargs = kwargs
+
+        specs = [
+            TensorSpec("x", [4], torch.float32),
+            ScalarSpec("num_tokens", torch.int32, 4),
+            ScalarSpec("epoch", torch.int32, 0, compile_runtime=True),
+        ]
+        with (
+            patch.object(
+                sys.modules["pypto.language"],
+                "RUNTIME",
+                runtime_marker,
+                create=True,
+            ),
+            patch.object(
+                sys.modules["pypto.runtime"],
+                "RunConfig",
+                FakeRunConfig,
+                create=True,
+            ),
+        ):
+            result = run_jit(
+                fn,
+                specs,
+                compile_cfg={"dump_passes": False},
+                runtime_cfg={"platform": "a5"},
+                compile_only=True,
+            )
+
+        assert result.passed, result.error
+        compile_call = fn.compile.call_args
+        assert compile_call.args == ()
+        assert compile_call.kwargs["epoch"] is runtime_marker
+        assert compile_call.kwargs["num_tokens"] == 4
+        assert compile_call.kwargs["config"].kwargs == {
+            "dump_passes": False,
+            "platform": "a5",
+        }
+
+    def test_stepped_scalar_requires_runtime_compilation(self):
+        fn = types.SimpleNamespace(compile=MagicMock())
+        result = run_jit(
+            fn,
+            [ScalarSpec("epoch", torch.int32, 0, benchmark_step=1)],
+            compile_only=True,
+        )
+
+        assert not result.passed
+        assert "benchmark_step requires compile_runtime=True" in result.error
+        fn.compile.assert_not_called()
+
+    def test_stepped_scalar_rejects_multi_pass_swimlane_before_compile(self):
+        fn = types.SimpleNamespace(compile=MagicMock())
+        result = run_jit(
+            fn,
+            [
+                ScalarSpec(
+                    "epoch", torch.int32, 0,
+                    compile_runtime=True, benchmark_step=1,
+                )
+            ],
+            runtime_cfg={"enable_l2_swimlane": True},
+            compile_only=True,
+        )
+
+        assert not result.passed
+        assert "benchmark_step is incompatible" in (result.error or "")
+        assert "enable_l2_swimlane=True" in (result.error or "")
+        fn.compile.assert_not_called()
+
+    def test_duplicate_specs_fail_before_compile(self):
+        fn = types.SimpleNamespace(compile=MagicMock())
+        specs = [
+            TensorSpec("duplicate", [1], torch.float32),
+            ScalarSpec("duplicate", torch.int32, 0, compile_runtime=True),
+        ]
+
+        result = run_jit(fn, specs, compile_only=True)
+
+        assert not result.passed
+        assert "duplicate spec names" in result.error
+        fn.compile.assert_not_called()
+
+    @pytest.mark.parametrize(
+        "compiled_names",
+        [
+            ["other__ssa_v0"],
+            ["epoch__ssa_v0", "extra__ssa_v0"],
+            ["epoch__ssa_v0", "epoch__ssa_v1"],
+        ],
+    )
+    def test_compile_only_validates_l3_parameter_abi(self, tmp_path, compiled_names):
+        compiled_dir = tmp_path / "build"
+        compiled_dir.mkdir()
+        compiled = types.SimpleNamespace(
+            output_dir=compiled_dir,
+            _get_metadata=lambda: (
+                [_l3_info(name) for name in compiled_names],
+                None,
+                None,
+            ),
+        )
+        fn = types.SimpleNamespace(compile=MagicMock(return_value=compiled))
+
+        with _l3_abi_environment():
+            result = run_jit(
+                fn,
+                [ScalarSpec("epoch", torch.int32, 0, compile_runtime=True)],
+                compile_only=True,
+            )
+
+        assert not result.passed
+        assert "compiled parameter ABI mismatch" in result.error or "collide" in result.error
+
+    @pytest.mark.parametrize(("artifact_shape", "passed"), [([4], True), ([5], False)])
+    def test_compile_only_validates_l2_annotation_abi(
+        self, tmp_path, artifact_shape, passed
+    ):
+        compiled_dir = tmp_path / "build"
+        compiled_dir.mkdir()
+        compiled = types.SimpleNamespace(
+            output_dir=compiled_dir,
+            _get_metadata=lambda: (
+                [
+                    _l3_info("x__ssa_v0", shape=artifact_shape, dtype=torch.float32),
+                    _l3_info("epoch__ssa_v0"),
+                ],
+                None,
+                None,
+            ),
+        )
+        fn = types.SimpleNamespace(compile=MagicMock(return_value=compiled))
+        specs = [
+            TensorSpec("x", [4], torch.float32),
+            ScalarSpec("epoch", torch.int32, 0, compile_runtime=True),
+        ]
+
+        with (
+            _l3_abi_environment(),
+            patch("golden.runner._is_l3", return_value=False),
+            patch.object(TensorSpec, "create_tensor") as create_tensor,
+            patch("pypto.runtime.execute_compiled") as execute,
+        ):
+            result = run_jit(fn, specs, compile_only=True)
+
+        assert result.passed is passed
+        if not passed:
+            assert "shape" in (result.error or "")
+        fn.compile.assert_called_once()
+        create_tensor.assert_not_called()
+        execute.assert_not_called()
+
+    def test_compile_only_rejects_l2_parameter_order_mismatch(self, tmp_path):
+        compiled_dir = tmp_path / "build"
+        compiled_dir.mkdir()
+        compiled = types.SimpleNamespace(
+            output_dir=compiled_dir,
+            _get_metadata=lambda: (
+                [
+                    _l3_info("b__ssa_v0", shape=[4], dtype=torch.float32),
+                    _l3_info("a__ssa_v0", shape=[4], dtype=torch.float32),
+                ],
+                None,
+                None,
+            ),
+        )
+        fn = types.SimpleNamespace(compile=MagicMock(return_value=compiled))
+
+        with _l3_abi_environment(), patch("golden.runner._is_l3", return_value=False):
+            result = run_jit(
+                fn,
+                [
+                    TensorSpec("a", [4], torch.float32),
+                    TensorSpec("b", [4], torch.float32),
+                ],
+                compile_only=True,
+            )
+
+        assert not result.passed
+        assert "parameter order" in (result.error or "")
+
+    @pytest.mark.parametrize(
+        ("target", "shape", "dtype", "direction", "error"),
+        [
+            ("x", [5], torch.float32, _FakeParamDirection.In, "shape"),
+            ("x", [4], torch.int32, _FakeParamDirection.In, "dtype"),
+            ("x", None, torch.float32, _FakeParamDirection.In, "expected tensor"),
+            ("x", [4], torch.float32, _FakeParamDirection.Out, "direction"),
+            ("epoch", [1], torch.int32, _FakeParamDirection.In, "expected scalar"),
+            ("epoch", None, torch.int64, _FakeParamDirection.In, "dtype"),
+            ("epoch", None, torch.int32, _FakeParamDirection.InOut, "direction"),
+        ],
+    )
+    def test_compile_only_validates_exact_l3_parameter_abi(
+        self,
+        tmp_path,
+        target,
+        shape,
+        dtype,
+        direction,
+        error,
+    ):
+        """Signature compilation must not hide a stale tensor/scalar spec."""
+        compiled_dir = tmp_path / "build"
+        compiled_dir.mkdir()
+        infos = {
+            "x": _l3_info("x__ssa_v0", shape=[4], dtype=torch.float32),
+            "epoch": _l3_info("epoch__ssa_v0"),
+        }
+        infos[target] = _l3_info(
+            f"{target}__ssa_v0",
+            shape=shape,
+            dtype=dtype,
+            direction=direction,
+        )
+        compiled = types.SimpleNamespace(
+            output_dir=compiled_dir,
+            _get_metadata=lambda: ([infos["x"], infos["epoch"]], None, None),
+        )
+        fn = types.SimpleNamespace(compile=MagicMock(return_value=compiled))
+        specs = [
+            TensorSpec("x", [4], torch.float32),
+            ScalarSpec("epoch", torch.int32, 0, compile_runtime=True),
+        ]
+
+        with (
+            _l3_abi_environment(),
+            patch.object(TensorSpec, "create_tensor") as create_tensor,
+            patch("pypto.runtime.execute_compiled") as execute,
+        ):
+            result = run_jit(fn, specs, compile_only=True)
+
+        assert not result.passed
+        assert error in (result.error or "")
+        fn.compile.assert_called_once()
+        create_tensor.assert_not_called()
+        execute.assert_not_called()
+
+    def test_compile_only_accepts_dynamic_l3_tensor_dimension(self, tmp_path):
+        compiled_dir = tmp_path / "build"
+        compiled_dir.mkdir()
+        compiled = types.SimpleNamespace(
+            output_dir=compiled_dir,
+            _get_metadata=lambda: (
+                [
+                    _l3_info("x__ssa_v0", shape=[-1], dtype=torch.float32),
+                    _l3_info(
+                        "state__ssa_v0",
+                        shape=[4],
+                        dtype=torch.float32,
+                        direction=_FakeParamDirection.InOut,
+                    ),
+                    _l3_info("epoch__ssa_v0"),
+                ],
+                None,
+                None,
+            ),
+        )
+        fn = types.SimpleNamespace(compile=MagicMock(return_value=compiled))
+
+        with _l3_abi_environment():
+            result = run_jit(
+                fn,
+                [
+                    TensorSpec("x", [4], torch.float32),
+                    TensorSpec(
+                        "state",
+                        [4],
+                        torch.float32,
+                        init_value=torch.zeros,
+                        is_output=True,
+                    ),
+                    ScalarSpec("epoch", torch.int32, 0, compile_runtime=True),
+                ],
+                compile_only=True,
+            )
+
+        assert result.passed, result.error
+
+    def test_signature_compile_uses_cached_static_scalar(self, tmp_path):
+        cache = tmp_path / "cache"
+        _save_tensors(
+            cache / "in",
+            {
+                "num_tokens": torch.tensor(9, dtype=torch.int32),
+                "epoch": torch.tensor(86, dtype=torch.int32),
+            },
+        )
+        compiled_dir = tmp_path / "build"
+        compiled_dir.mkdir()
+        fn = types.SimpleNamespace(
+            compile=MagicMock(return_value=_FakeCompiled(compiled_dir))
+        )
+        runtime_marker = object()
+        specs = [
+            ScalarSpec("num_tokens", torch.int32, 4),
+            ScalarSpec("epoch", torch.int32, 0, compile_runtime=True),
+        ]
+
+        with patch.object(
+            sys.modules["pypto.language"], "RUNTIME", runtime_marker, create=True
+        ):
+            result = run_jit(
+                fn,
+                specs,
+                golden_data=str(cache),
+                compile_only=True,
+            )
+
+        assert result.passed, result.error
+        assert fn.compile.call_args.kwargs["num_tokens"] == 9
+        assert fn.compile.call_args.kwargs["epoch"] is runtime_marker
+
+    def test_legacy_compile_uses_cached_static_scalar(self, tmp_path):
+        cache = tmp_path / "cache"
+        _save_tensors(
+            cache / "in", {"num_tokens": torch.tensor(9, dtype=torch.int32)}
+        )
+        compiled_dir = tmp_path / "build"
+        compiled_dir.mkdir()
+        fn = types.SimpleNamespace(
+            compile=MagicMock(return_value=_FakeCompiled(compiled_dir))
+        )
+
+        result = run_jit(
+            fn,
+            [ScalarSpec("num_tokens", torch.int32, 4)],
+            golden_data=str(cache),
+            compile_only=True,
+        )
+
+        assert result.passed, result.error
+        assert fn.compile.call_args.args == (9,)
+
+    @pytest.mark.parametrize(
+        "cached",
+        [
+            None,
+            torch.tensor([9], dtype=torch.int32),
+            torch.tensor(9, dtype=torch.int64),
+        ],
+    )
+    def test_bad_cached_scalar_fails_before_compile(self, tmp_path, cached):
+        cache = tmp_path / "cache"
+        if cached is not None:
+            _save_tensors(cache / "in", {"num_tokens": cached})
+        fn = types.SimpleNamespace(compile=MagicMock())
+
+        result = run_jit(
+            fn,
+            [ScalarSpec("num_tokens", torch.int32, 4)],
+            golden_data=str(cache),
+            compile_only=True,
+        )
+
+        assert not result.passed
+        fn.compile.assert_not_called()
+
 
 class TestRuntimeDir:
     """``runtime_dir`` skips compile and executes against a pre-compiled dir."""
@@ -548,6 +999,103 @@ class TestRuntimeDir:
         reload.assert_called_once()
         l3.assert_called_once()
         assert l3.call_args.args[0] is fake_l3  # the reconstructed program is dispatched
+
+    def test_runtime_dir_l3_abi_mismatch_fails_before_input_or_runtime(self, tmp_path):
+        prebuilt = tmp_path / "prebuilt"
+        prebuilt.mkdir()
+        compiled = types.SimpleNamespace(
+            output_dir=prebuilt,
+            _get_metadata=lambda: (
+                [_l3_info("x__ssa_v0", shape=[5], dtype=torch.float32)],
+                None,
+                None,
+            ),
+        )
+        specs = [TensorSpec("x", [4], torch.float32)]
+
+        with (
+            _l3_abi_environment(),
+            patch("golden.runner._maybe_reload_l3", return_value=compiled),
+            patch("pypto.ir.compile") as compile_fn,
+            patch.object(TensorSpec, "create_tensor") as create_tensor,
+            patch("golden.runner._try_l3_dispatch") as l3_dispatch,
+            patch("pypto.runtime.execute_compiled") as execute,
+        ):
+            result = run(program=object(), specs=specs, runtime_dir=str(prebuilt))
+
+        assert not result.passed
+        assert "shape" in (result.error or "")
+        compile_fn.assert_not_called()
+        create_tensor.assert_not_called()
+        l3_dispatch.assert_not_called()
+        execute.assert_not_called()
+
+    def test_run_jit_runtime_dir_l3_abi_mismatch_fails_before_input(self, tmp_path):
+        prebuilt = tmp_path / "prebuilt"
+        prebuilt.mkdir()
+        compiled = types.SimpleNamespace(
+            output_dir=prebuilt,
+            _get_metadata=lambda: (
+                [_l3_info("x__ssa_v0", shape=[4], dtype=torch.int32)],
+                None,
+                None,
+            ),
+        )
+        fn = types.SimpleNamespace(compile=MagicMock())
+
+        with (
+            _l3_abi_environment(),
+            patch("golden.runner._maybe_reload_l3", return_value=compiled),
+            patch.object(TensorSpec, "create_tensor") as create_tensor,
+            patch("golden.runner._try_l3_dispatch") as l3_dispatch,
+            patch("pypto.runtime.execute_compiled") as execute,
+        ):
+            result = run_jit(
+                fn,
+                [TensorSpec("x", [4], torch.float32)],
+                runtime_dir=str(prebuilt),
+            )
+
+        assert not result.passed
+        assert "dtype" in (result.error or "")
+        fn.compile.assert_not_called()
+        create_tensor.assert_not_called()
+        l3_dispatch.assert_not_called()
+        execute.assert_not_called()
+
+    def test_runtime_dir_l3_skips_requested_benchmark(
+        self,
+        tmp_path,
+        monkeypatch,
+        capsys,
+    ):
+        prebuilt = tmp_path / "prebuilt"
+        prebuilt.mkdir()
+        compiled = types.SimpleNamespace(
+            output_dir=prebuilt,
+            _get_metadata=lambda: (
+                [_l3_info("x__ssa_v0", shape=[1], dtype=torch.float32)],
+                None,
+                None,
+            ),
+        )
+        specs = [TensorSpec("x", [1], torch.float32)]
+        monkeypatch.setenv("PYPTO_BENCH", "1")
+
+        with (
+            _l3_abi_environment(),
+            patch("golden.runner._maybe_reload_l3", return_value=compiled),
+            patch("golden.runner._try_l3_dispatch", return_value=True),
+            patch("golden.runner._run_benchmark_l3") as benchmark,
+            patch("pypto.runtime.execute_compiled") as execute,
+        ):
+            result = run(program=object(), specs=specs, runtime_dir=str(prebuilt))
+
+        assert result.passed, result.error
+        assert result.bench is None
+        benchmark.assert_not_called()
+        execute.assert_not_called()
+        assert "benchmark skipped: runtime_dir replay is correctness-only" in capsys.readouterr().out
 
     def test_runtime_dir_missing_returns_fail(self, three_kinds_specs, tmp_path):
         missing = tmp_path / "does_not_exist"
@@ -732,6 +1280,49 @@ class TestScalarMixedSpecs:
         assert loaded.ndim == 0
         assert loaded.dtype == torch.float32
         assert loaded.item() == pytest.approx(2.5)
+
+    def test_scalar_cache_replay_preserves_benchmark_step(self, tmp_path):
+        cache = tmp_path / "cache"
+        _save_tensors(
+            cache / "in",
+            {"epoch": torch.tensor(86, dtype=torch.int32)},
+        )
+        spec = ScalarSpec(
+            "epoch",
+            torch.int32,
+            0,
+            compile_runtime=True,
+            benchmark_step=43,
+        )
+
+        _, scalar_specs_eff, _ = _prepare_inputs(
+            specs=[spec],
+            tensor_specs=[],
+            scalar_specs=[spec],
+            data_dir=cache,
+            work_dir=tmp_path / "work",
+            save_data=False,
+        )
+
+        replay = scalar_specs_eff["epoch"]
+        assert replay.value.item() == 86
+        assert replay.compile_runtime is True
+        assert replay.benchmark_step == 43
+        assert replay.value_for_benchmark_dispatch(2).item() == 172
+
+    def test_duplicate_spec_names_rejected_before_dict_conversion(self, tmp_path):
+        specs = [
+            TensorSpec("duplicate", [1], torch.float32),
+            ScalarSpec("duplicate", torch.int32, 0),
+        ]
+        with pytest.raises(ValueError, match="duplicate spec names.*duplicate"):
+            _prepare_inputs(
+                specs=specs,
+                tensor_specs=[specs[0]],
+                scalar_specs=[specs[1]],
+                data_dir=None,
+                work_dir=tmp_path,
+            )
 
     def test_scalar_pt_loaded_from_cache(self, mixed_specs, tmp_path):
         """When golden_data has {name}.pt, the cached value (not the spec
@@ -1328,6 +1919,177 @@ def test_l3_benchmark_reuses_persistent_windows_without_runtime_reset(monkeypatc
     }
 
 
+@pytest.mark.parametrize("use_jit", [False, True])
+def test_nonresident_validation_precedes_benchmark_mutation(
+    tmp_path, monkeypatch, use_jit
+):
+    """Benchmark reuse must not overwrite the dedicated correctness result."""
+    compiled = _FakeCompiled(tmp_path)
+    specs = [TensorSpec("y", [1], torch.float32, is_output=True)]
+    monkeypatch.setenv("PYPTO_BENCH", "1")
+
+    def _dispatch(_compiled, _specs, tensors, _scalars, _runtime_cfg):
+        tensors["y"].zero_()
+        return True
+
+    def _benchmark(_compiled, _specs, tensors, *_args):
+        tensors["y"].fill_(1.0)
+        return "BENCH"
+
+    with (
+        patch("golden.runner._try_l3_dispatch", side_effect=_dispatch),
+        patch("golden.runner._is_l3", return_value=True),
+        patch("golden.runner._run_benchmark_l3", side_effect=_benchmark),
+        patch("pypto.ir.compile", return_value=compiled),
+    ):
+        if use_jit:
+            fn = types.SimpleNamespace(compile=MagicMock(return_value=compiled))
+            result = run_jit(fn, specs, golden_fn=lambda values: values["y"].zero_())
+        else:
+            result = run(
+                program=object(), specs=specs,
+                golden_fn=lambda values: values["y"].zero_(),
+            )
+
+    assert result.passed, result.error
+    assert result.bench == "BENCH"
+
+
+@pytest.mark.parametrize("l3", [False, True])
+def test_benchmark_propagates_device_runtime_error(monkeypatch, l3):
+    def _benchmark(*_args, **_kwargs):
+        raise RuntimeError("DEVICE DISPATCH FAILED")
+
+    fake_runtime = types.ModuleType("pypto.runtime")
+    fake_runtime.benchmark = _benchmark
+    with patch.dict(sys.modules, {"pypto.runtime": fake_runtime}):
+        with pytest.raises(RuntimeError, match="DEVICE DISPATCH FAILED"):
+            if l3:
+                monkeypatch.setattr("golden.runner._l3_ordered_args", lambda *_a: [])
+                monkeypatch.setattr("golden.runner._l3_run_config", lambda _cfg: "RUNCFG")
+                _run_benchmark_l3(object(), [], {}, {}, {}, rounds=1, warmup=1)
+            else:
+                _run_benchmark(object(), [], {}, {}, {}, rounds=1, warmup=1)
+
+
+def test_l3_benchmark_tolerates_only_missing_strace(monkeypatch):
+    def _benchmark(*_args, **_kwargs):
+        raise RuntimeError("benchmark(): no [STRACE] markers captured")
+
+    fake_runtime = types.ModuleType("pypto.runtime")
+    fake_runtime.benchmark = _benchmark
+    monkeypatch.setattr("golden.runner._l3_ordered_args", lambda *_a: [])
+    monkeypatch.setattr("golden.runner._l3_run_config", lambda _cfg: "RUNCFG")
+    with patch.dict(sys.modules, {"pypto.runtime": fake_runtime}):
+        assert _run_benchmark_l3(object(), [], {}, {}, {}, rounds=1, warmup=1) is None
+
+
+def test_l3_benchmark_advances_stepped_scalar_per_physical_dispatch(monkeypatch):
+    """Warmup and measured launches share one monotonically stepped sequence."""
+    observed = []
+
+    def _benchmark(_compiled, args, **kwargs):
+        for _ in range(kwargs["warmup"] + kwargs["rounds"]):
+            ordered = list(args)
+            observed.append((ordered[0], ordered[1].item()))
+        return None
+
+    class _Compiled:
+        def _get_metadata(self):
+            return (
+                [
+                    types.SimpleNamespace(name="x__ssa_v0"),
+                    types.SimpleNamespace(name="epoch__ssa_v0"),
+                ],
+                None,
+                None,
+            )
+
+    fake_runtime = types.ModuleType("pypto.runtime")
+    fake_runtime.benchmark = _benchmark
+    tensors = {"x": torch.zeros(1).share_memory_()}
+    specs = [
+        TensorSpec("x", [1], torch.float32),
+        ScalarSpec("epoch", torch.int32, 0, benchmark_step=43),
+    ]
+    scalar_specs_eff = {"epoch": specs[1]}
+    monkeypatch.setattr("golden.runner._l3_run_config", lambda _cfg: "RUNCFG")
+
+    with patch.dict(sys.modules, {"pypto.runtime": fake_runtime}):
+        result = _run_benchmark_l3(
+            _Compiled(),
+            specs,
+            tensors,
+            scalar_specs_eff,
+            {"platform": "a2a3"},
+            rounds=3,
+            warmup=2,
+        )
+
+    assert result is None
+    assert [epoch for _, epoch in observed] == [0, 43, 86, 129, 172]
+    assert all(tensor is tensors["x"] for tensor, _ in observed)
+
+
+def test_l2_benchmark_rejects_stepped_scalar():
+    epoch = ScalarSpec("epoch", torch.int32, 0, benchmark_step=43)
+    with pytest.raises(ValueError, match="L2 benchmark.*benchmark_step"):
+        _run_benchmark(
+            compiled=object(),
+            specs=[epoch],
+            tensors={},
+            scalar_specs_eff={"epoch": epoch},
+            runtime_cfg={},
+            rounds=3,
+            warmup=2,
+        )
+
+
+class TestL3ParameterAbi:
+    @staticmethod
+    def _compiled(*names):
+        return types.SimpleNamespace(
+            _get_metadata=lambda: (
+                [types.SimpleNamespace(name=name) for name in names],
+                None,
+                None,
+            )
+        )
+
+    def test_extra_spec_rejected_for_stale_artifact(self):
+        compiled = self._compiled("x__ssa_v0")
+        specs = [
+            TensorSpec("x", [1], torch.float32),
+            ScalarSpec("moe_epoch_base", torch.int32, 0),
+        ]
+        with pytest.raises(ValueError, match="moe_epoch_base.*recompile"):
+            _l3_ordered_args(
+                compiled,
+                specs,
+                {"x": torch.zeros(1)},
+                {"moe_epoch_base": specs[1]},
+            )
+
+    def test_compiled_parameter_without_spec_rejected(self):
+        compiled = self._compiled("x__ssa_v0", "moe_epoch_base__ssa_v0")
+        specs = [TensorSpec("x", [1], torch.float32)]
+        with pytest.raises(ValueError, match="moe_epoch_base.*recompile"):
+            _l3_ordered_args(compiled, specs, {"x": torch.zeros(1)}, {})
+
+    def test_exact_abi_reorders_and_strips_terminal_ssa_suffix(self):
+        compiled = self._compiled("epoch__ssa_v3", "x__ssa_v0")
+        epoch = ScalarSpec("epoch", torch.int32, 7)
+        x = torch.zeros(1)
+        ordered = _l3_ordered_args(
+            compiled,
+            [TensorSpec("x", [1], torch.float32), epoch],
+            {"x": x},
+            {"epoch": epoch},
+        )
+        assert ordered[0] is epoch.value
+        assert ordered[1] is x
+
+
 class TestResidentPath:
     """resident specs route through the L3 prepare() worker."""
 
@@ -1358,7 +2120,50 @@ class TestResidentPath:
         assert r.passed, f"unexpected failure: {r.error}"
         l3res.assert_called_once()
 
-    def test_resident_benchmark_reuses_handle_and_persistent_windows(
+    def test_runtime_dir_resident_disables_embedded_benchmark(
+        self,
+        tmp_path,
+        monkeypatch,
+    ):
+        prebuilt = tmp_path / "prebuilt"
+        prebuilt.mkdir()
+        specs = self._resident_specs()
+        directions = {
+            "x": _FakeParamDirection.In,
+            "w": _FakeParamDirection.In,
+            "y": _FakeParamDirection.Out,
+        }
+        compiled = types.SimpleNamespace(
+            output_dir=prebuilt,
+            _get_metadata=lambda: (
+                [
+                    _l3_info(
+                        f"{spec.name}__ssa_v0",
+                        shape=spec.shape,
+                        dtype=spec.dtype,
+                        direction=directions[spec.name],
+                    )
+                    for spec in specs
+                ],
+                None,
+                None,
+            ),
+        )
+        monkeypatch.setenv("PYPTO_BENCH", "1")
+
+        with (
+            _l3_abi_environment(),
+            patch("golden.runner._maybe_reload_l3", return_value=compiled),
+            patch("golden.runner._run_l3_resident", return_value=None) as l3res,
+            patch("pypto.runtime.execute_compiled") as execute,
+        ):
+            result = run(program=object(), specs=specs, runtime_dir=str(prebuilt))
+
+        assert result.passed, result.error
+        assert l3res.call_args.kwargs["benchmark_enabled"] is False
+        execute.assert_not_called()
+
+    def test_resident_benchmark_reuses_handle_and_advances_stepped_scalar(
         self, monkeypatch
     ):
         """The resident L3 benchmark reuses one handle in persistent mode."""
@@ -1392,8 +2197,8 @@ class TestResidentPath:
 
             def __call__(self, *args, config=None):
                 assert config == "RUNCFG"
-                assert len(args) == 1
-                calls["events"].append(("dispatch", args[0]))
+                assert len(args) == 2
+                calls["events"].append(("dispatch", (args[0], args[1].item())))
 
         class _FakeDCP:
             def prepare(self, *args, **kwargs):
@@ -1426,7 +2231,7 @@ class TestResidentPath:
         monkeypatch.setenv("PYPTO_BENCH", "1")
         monkeypatch.setenv("PYPTO_BENCH_ROUNDS", "3")
         monkeypatch.setenv("PYPTO_BENCH_WARMUP", "2")
-        monkeypatch.setattr(R, "_l3_ordered_names", lambda _c: ["state"])
+        monkeypatch.setattr(R, "_l3_ordered_names", lambda _c: ["state", "epoch"])
         monkeypatch.setattr(R, "_l3_pure_out_names", lambda _c: set())
         monkeypatch.setattr(R, "_l3_run_config", lambda _cfg: "RUNCFG")
 
@@ -1442,7 +2247,11 @@ class TestResidentPath:
                 compiled=_FakeDCP(),
                 tensor_specs=[state_spec],
                 tensors={"state": state_init},
-                scalar_specs_eff={},
+                scalar_specs_eff={
+                    "epoch": ScalarSpec(
+                        "epoch", torch.int32, 0, benchmark_step=43
+                    )
+                },
                 runtime_cfg={"platform": "a2a3"},
                 golden_outputs=None,
                 rtol=1e-5,
@@ -1458,7 +2267,78 @@ class TestResidentPath:
         assert [kind for kind, _ in calls["events"]] == [
             "alloc", "dispatch", "dispatch", "dispatch", "dispatch", "dispatch", "free",
         ]
-        assert all(handle is state_handle for _, handle in calls["events"])
+        dispatches = [value for kind, value in calls["events"] if kind == "dispatch"]
+        assert [epoch for _, epoch in dispatches] == [0, 43, 86, 129, 172]
+        assert all(handle is state_handle for handle, _ in dispatches)
+
+    def test_resident_benchmark_propagates_later_dispatch_failure(self, monkeypatch):
+        import golden.runner as R
+
+        calls = 0
+
+        class _FakeRT:
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *_args):
+                return False
+
+            def __call__(self, *_args, **_kwargs):
+                nonlocal calls
+                calls += 1
+                if calls == 2:
+                    raise RuntimeError("persistent dispatch failed")
+
+        class _FakeDCP:
+            def prepare(self, *_args, **_kwargs):
+                return _FakeRT()
+
+        class _Capture:
+            def __init__(self, path):
+                self.path = path
+
+            def __enter__(self):
+                self.path.touch()
+
+            def __exit__(self, *_args):
+                return False
+
+        fake_dcp = types.ModuleType("pypto.ir.distributed_compiled_program")
+        fake_dcp.DistributedCompiledProgram = _FakeDCP
+        fake_bench = types.ModuleType("pypto.runtime.bench")
+        fake_bench._STRACE_LOG_LEVEL = "v9"
+        fake_bench._capture_fd_stderr = _Capture
+        fake_bench._parse_stats_from_strace = MagicMock()
+        fake_log = types.ModuleType("pypto.runtime.log_config")
+        fake_log.configure_log = lambda _level: None
+        fake_log.current_level = lambda: "v0"
+
+        monkeypatch.setenv("PYPTO_BENCH", "1")
+        monkeypatch.setenv("PYPTO_BENCH_ROUNDS", "2")
+        monkeypatch.setenv("PYPTO_BENCH_WARMUP", "1")
+        monkeypatch.setattr(R, "_l3_ordered_names", lambda _compiled: [])
+        monkeypatch.setattr(R, "_l3_pure_out_names", lambda _compiled: set())
+        monkeypatch.setattr(R, "_l3_run_config", lambda _cfg: "RUNCFG")
+
+        with (
+            patch.dict(
+                sys.modules,
+                {
+                    "pypto.ir.distributed_compiled_program": fake_dcp,
+                    "pypto.runtime.bench": fake_bench,
+                    "pypto.runtime.log_config": fake_log,
+                },
+            ),
+            pytest.raises(RuntimeError, match="persistent dispatch failed"),
+        ):
+            R._run_l3_resident(
+                compiled=_FakeDCP(), tensor_specs=[], tensors={}, scalar_specs_eff={},
+                runtime_cfg={}, golden_outputs=None, rtol=1e-5, atol=1e-5,
+                compare_fn={},
+            )
+
+        assert calls == 2
+        fake_bench._parse_stats_from_strace.assert_not_called()
 
     @staticmethod
     def _fake_dcp_module():

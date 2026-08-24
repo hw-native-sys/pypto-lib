@@ -439,29 +439,17 @@ def ratio_allclose(
     return cmp
 
 
-def mapped_pool_ratio_allclose(
+def _mapped_pool_compare(
     mapping_name: str,
     *,
     mapping_shape: tuple[int, ...],
     block_size: int,
-    leading_rank_axis: bool = False,
-    pool_name: str = "pool",
-    atol: float | None = None,
-    rtol: float | None = None,
-    max_error_ratio: float = 0.005,
+    leading_rank_axis: bool,
+    pool_name: str,
+    mapped_compare: Callable,
+    comparator_name: str,
 ) -> Callable:
-    """Compare mapped rows of a block-major pool and preserve all other rows.
-
-    ``mapping_shape`` makes the mapping contract explicit instead of relying on
-    model globals captured by a caller.  A non-ranked pool has layout
-    ``[blocks, block_size, ...]``.  With ``leading_rank_axis=True``, the layout
-    is ``[ranks, blocks, block_size, ...]`` and duplicate mappings are checked
-    independently for every rank.
-
-    Only allocator-mapped rows use the ratio-based numerical comparison and
-    floating-point finiteness checks.  Every unmapped row must remain exactly
-    equal to its golden snapshot, which detects writes outside the mapping.
-    """
+    """Apply ``mapped_compare`` to mapped rows and preserve every other row."""
     if not mapping_shape or any(dim <= 0 for dim in mapping_shape):
         raise ValueError(f"mapping_shape must contain positive dimensions, got {mapping_shape}")
     if block_size <= 0:
@@ -471,12 +459,6 @@ def mapped_pool_ratio_allclose(
             "leading_rank_axis requires mapping_shape to include a rank axis "
             f"and at least one mapped-item axis, got {mapping_shape}"
         )
-
-    mapped_compare = ratio_allclose(
-        atol=atol,
-        rtol=rtol,
-        max_error_ratio=max_error_ratio,
-    )
     integer_dtypes = (
         torch.int8,
         torch.int16,
@@ -616,12 +598,52 @@ def mapped_pool_ratio_allclose(
             return True, ""
         return False, f"    mapped rows in {pool_name} from '{mapping_name}':\n{detail}"
 
-    compare.__name__ = (
+    compare.__name__ = comparator_name
+    return compare
+
+
+def mapped_pool_ratio_allclose(
+    mapping_name: str,
+    *,
+    mapping_shape: tuple[int, ...],
+    block_size: int,
+    leading_rank_axis: bool = False,
+    pool_name: str = "pool",
+    atol: float | None = None,
+    rtol: float | None = None,
+    max_error_ratio: float = 0.005,
+) -> Callable:
+    """Compare mapped rows of a block-major pool and preserve all other rows.
+
+    ``mapping_shape`` makes the mapping contract explicit instead of relying on
+    model globals captured by a caller.  A non-ranked pool has layout
+    ``[blocks, block_size, ...]``.  With ``leading_rank_axis=True``, the layout
+    is ``[ranks, blocks, block_size, ...]`` and duplicate mappings are checked
+    independently for every rank.
+
+    Only allocator-mapped rows use the ratio-based numerical comparison and
+    floating-point finiteness checks.  Every unmapped row must remain exactly
+    equal to its golden snapshot, which detects writes outside the mapping.
+    """
+    mapped_compare = ratio_allclose(
+        atol=atol,
+        rtol=rtol,
+        max_error_ratio=max_error_ratio,
+    )
+    comparator_name = (
         f"mapped_pool_ratio_allclose(mapping={mapping_name}, shape={mapping_shape}, "
         f"block_size={block_size}, leading_rank_axis={leading_rank_axis}, "
         f"atol={atol}, rtol={rtol}, max_error_ratio={max_error_ratio})"
     )
-    return compare
+    return _mapped_pool_compare(
+        mapping_name,
+        mapping_shape=mapping_shape,
+        block_size=block_size,
+        leading_rank_axis=leading_rank_axis,
+        pool_name=pool_name,
+        mapped_compare=mapped_compare,
+        comparator_name=comparator_name,
+    )
 
 
 def ratio_reldiff(
@@ -758,6 +780,39 @@ def ratio_reldiff(
         f"valid_rows={valid_rows}, valid_axis={valid_axis}, zero_tail={zero_tail})"
     )
     return cmp
+
+
+def mapped_pool_ratio_reldiff(
+    mapping_name: str,
+    *,
+    mapping_shape: tuple[int, ...],
+    block_size: int,
+    leading_rank_axis: bool = False,
+    pool_name: str = "pool",
+    diff_thd: float = 0.01,
+    pct_thd: float = 0.05,
+    max_diff_hd: float = float("inf"),
+) -> Callable:
+    """Compare mapped pool rows with ``ratio_reldiff`` and preserve all others."""
+    mapped_compare = ratio_reldiff(
+        diff_thd=diff_thd,
+        pct_thd=pct_thd,
+        max_diff_hd=max_diff_hd,
+    )
+    comparator_name = (
+        f"mapped_pool_ratio_reldiff(mapping={mapping_name}, shape={mapping_shape}, "
+        f"block_size={block_size}, leading_rank_axis={leading_rank_axis}, "
+        f"diff_thd={diff_thd}, pct_thd={pct_thd}, max_diff_hd={max_diff_hd})"
+    )
+    return _mapped_pool_compare(
+        mapping_name,
+        mapping_shape=mapping_shape,
+        block_size=block_size,
+        leading_rank_axis=leading_rank_axis,
+        pool_name=pool_name,
+        mapped_compare=mapped_compare,
+        comparator_name=comparator_name,
+    )
 
 
 def error_distribution(

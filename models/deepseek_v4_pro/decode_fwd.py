@@ -12,7 +12,6 @@
 # ruff: noqa: F403,F405
 
 import argparse
-import os
 
 import pypto.language as pl
 import pypto.language.distributed as pld
@@ -29,11 +28,6 @@ from lm_head import (
     lm_head_with_sampling,
 )
 from pypto.ir.distributed_compiled_program import DistributedConfig
-
-# Trace-time bisect knob shared with prefill_fwd.py — "1" drops the
-# moe_signal_retire scope from the compiled program (2026-08-19 EP8
-# SCHEDULER_TIMEOUT investigation).
-DSV4_DISABLE_MOE_RETIRE = os.environ.get("DSV4_DISABLE_MOE_RETIRE", "0") == "1"
 from rmsnorm import rms_norm
 
 # decode_fwd is self-contained: it imports kernels, constants, and per-kind
@@ -105,6 +99,7 @@ from moe import (
     N_RANKS,
     N_ROUTES,
     RECV_MAX,
+    SIGNAL_PAD,
     TOPK,
     VOCAB,
     build_tensor_specs as build_moe_tensor_specs,
@@ -312,16 +307,18 @@ def decode_fwd(
     recv_x: pld.DistributedTensor[[N_LOCAL * RECV_MAX, D], pl.INT8],
     recv_aux: pld.DistributedTensor[[N_LOCAL * RECV_MAX, AUX_PAD], pl.FP32],
     recv_route: pld.DistributedTensor[[N_LOCAL * RECV_MAX, IDX_PAD], pl.INT32],
-    arrived: pld.DistributedTensor[[N_RANKS, 1], pl.INT32],
-    data_arrived: pld.DistributedTensor[[N_RANKS, 1], pl.INT32],
+    arrived: pld.DistributedTensor[[N_RANKS, SIGNAL_PAD], pl.INT32],
+    data_arrived: pld.DistributedTensor[[N_RANKS, N_LOCAL, SIGNAL_PAD], pl.INT32],
     routed_y_buf: pld.DistributedTensor[[N_ROUTES, D], pl.BF16],
-    combine_arrived: pl.InOut[pld.DistributedTensor[[N_RANKS, 1], pl.INT32]],
+    combine_arrived: pl.InOut[pld.DistributedTensor[[N_RANKS, N_LOCAL, SIGNAL_PAD], pl.INT32]],
+    consumed: pl.InOut[pld.DistributedTensor[[N_RANKS, SIGNAL_PAD], pl.INT32]],
     lm_head_hidden_window: pld.DistributedTensor[[GROUP_LOGIT_ROWS, D], pl.BF16],
     lm_head_hidden_done: pld.DistributedTensor[[LM_HEAD_TP_SIZE, 1], pl.INT32],
     lm_head_logits_window: pld.DistributedTensor[[MAX_LOGIT_ROWS, LM_HEAD_VOCAB], pl.FP32],
     lm_head_logits_done: pld.DistributedTensor[[LM_HEAD_TP_SIZE, 1], pl.INT32],
     my_rank: pl.Scalar[pl.INT32],
     num_tokens: pl.Scalar[pl.INT32],
+    moe_epoch_base: pl.Scalar[pl.INT32],
 ) -> pl.Tensor[[T, D], pl.BF16]:
     swa_cos_profile: pl.Tensor[[1, MAX_SEQ_LEN, ROPE_HEAD_DIM], pl.BF16] = pl.slice(
         freqs_cos, [1, MAX_SEQ_LEN, ROPE_HEAD_DIM], [0, 0, 0]
@@ -471,8 +468,8 @@ def decode_fwd(
             shared_w2_l0, shared_w2_scale_l0,
             hidden,
             recv_meta, recv_x, recv_aux, recv_route, arrived, data_arrived,
-            routed_y_buf, combine_arrived,
-            pl.cast(0, pl.INT32), num_tokens, my_rank, pl.cast(1, pl.INT32),
+            routed_y_buf, combine_arrived, consumed,
+            pl.cast(0, pl.INT32), num_tokens, my_rank, pl.cast(moe_epoch_base + 1, pl.INT32),
         )
     with pl.scope():
         if LEAD_COMPRESS_RATIO == SWA_COMPRESS_RATIO:
@@ -513,14 +510,14 @@ def decode_fwd(
             shared_w2_l1, shared_w2_scale_l1,
             hidden,
             recv_meta, recv_x, recv_aux, recv_route, arrived, data_arrived,
-            routed_y_buf, combine_arrived,
-            pl.cast(1, pl.INT32), num_tokens, my_rank, pl.cast(2, pl.INT32),
+            routed_y_buf, combine_arrived, consumed,
+            pl.cast(1, pl.INT32), num_tokens, my_rank, pl.cast(moe_epoch_base + 2, pl.INT32),
         )
     for loop_i in pl.range(PAIR_LOOP_COUNT):
         csa_layer: pl.Scalar[pl.INT32] = pl.cast(loop_i * 2 + 2, pl.INT32)
         hca_layer: pl.Scalar[pl.INT32] = pl.cast(loop_i * 2 + 3, pl.INT32)
-        csa_moe_epoch: pl.Scalar[pl.INT32] = pl.cast(loop_i * 2 + 3, pl.INT32)
-        hca_moe_epoch: pl.Scalar[pl.INT32] = pl.cast(loop_i * 2 + 4, pl.INT32)
+        csa_moe_epoch: pl.Scalar[pl.INT32] = pl.cast(moe_epoch_base + loop_i * 2 + 3, pl.INT32)
+        hca_moe_epoch: pl.Scalar[pl.INT32] = pl.cast(moe_epoch_base + loop_i * 2 + 4, pl.INT32)
         # csa-kind slot == loop_i; hca-kind slot is offset by the leading hca layers
         # that already own slots 0..HCA_LOOP_BASE-1.
         hca_stack_i: pl.Scalar[pl.INT32] = pl.cast(loop_i + HCA_LOOP_BASE, pl.INT32)
@@ -610,7 +607,7 @@ def decode_fwd(
                 shared_w2_csa, shared_w2_scale_csa,
                 hidden_mid,
                 recv_meta, recv_x, recv_aux, recv_route, arrived, data_arrived,
-                routed_y_buf, combine_arrived,
+                routed_y_buf, combine_arrived, consumed,
                 csa_layer, num_tokens, my_rank, csa_moe_epoch,
             )
         hc_attn_fn_hca: pl.Tensor[[MIX_HC, HC_DIM], pl.FP32] = pl.slice(hc_attn_fn, [MIX_HC, HC_DIM], [hca_layer * MIX_HC, 0])
@@ -680,15 +677,14 @@ def decode_fwd(
                 shared_w2_hca, shared_w2_scale_hca,
                 hidden,
                 recv_meta, recv_x, recv_aux, recv_route, arrived, data_arrived,
-                routed_y_buf, combine_arrived,
+                routed_y_buf, combine_arrived, consumed,
                 hca_layer, num_tokens, my_rank, hca_moe_epoch,
             )
     # FWD index, not the csa-kind index: the *_last slices below index per-FWD-layer
     # stacked weights; csa-stacked weights use (CSA_NUM_LAYERS - 1).
     csa_layer_last: pl.Scalar[pl.INT32] = pl.cast(FWD_LAST_LAYER, pl.INT32)
-    # moe_epoch is the 1-based MoE call id: layer L runs epoch L + 1, so the last
-    # layer runs epoch FWD_NUM_LAYERS.
-    last_moe_epoch: pl.Scalar[pl.INT32] = pl.cast(FWD_NUM_LAYERS, pl.INT32)
+    # Continue the persistent MoE epoch sequence for the final layer.
+    last_moe_epoch: pl.Scalar[pl.INT32] = pl.cast(moe_epoch_base + FWD_NUM_LAYERS, pl.INT32)
     x_attn_last: pl.Tensor[[T, HC_MULT, D], pl.FP32] = pl.create_tensor([T, HC_MULT, D], dtype=pl.FP32)
     hc_attn_fn_last: pl.Tensor[[MIX_HC, HC_DIM], pl.FP32] = pl.slice(hc_attn_fn, [MIX_HC, HC_DIM], [csa_layer_last * MIX_HC, 0])
     hc_attn_scale_last: pl.Tensor[[3], pl.FP32] = pl.slice(hc_attn_scale, [3], [csa_layer_last * 3])
@@ -773,55 +769,10 @@ def decode_fwd(
             shared_w2_last, shared_w2_scale_last,
             pre_hc_hidden_out,
             recv_meta, recv_x, recv_aux, recv_route, arrived, data_arrived,
-            routed_y_buf, combine_arrived,
+            routed_y_buf, combine_arrived, consumed,
             csa_layer_last, num_tokens, my_rank, last_moe_epoch,
         )
 
-    # The worker keeps distributed windows alive across autoregressive decode
-    # calls, but each call numbers its MoE epochs from one again. Retire the
-    # credits deposited by this full-model call before the next token can reuse
-    # the same windows; otherwise the next call's waits may observe stale,
-    # already-satisfied counters and consume partially published expert data.
-    # AtomicAdd subtraction is required because the last consumed notify can
-    # still be in flight and commutes with this retirement.
-    # DSV4_DISABLE_MOE_RETIRE=1 (trace-time) drops the retire scope — see the
-    # matching knob in prefill_fwd.py (2026-08-19 EP8 SCHEDULER_TIMEOUT bisect).
-    if not DSV4_DISABLE_MOE_RETIRE:
-        neg_epochs = pl.cast(0 - LAST_MOE_EPOCH, pl.INT32)
-        neg_data = pl.cast(0 - LAST_MOE_EPOCH * N_LOCAL, pl.INT32)
-        neg_combine = pl.cast(0 - LAST_MOE_EPOCH * (N_LOCAL + 1), pl.INT32)
-        with pl.at(level=pl.Level.CORE_GROUP, name_hint="moe_signal_retire"):
-            _pre_hc_anchor = pl.read(pre_hc_hidden_out, [0, 0, 0])
-            pld.system.notify(
-                target=combine_arrived,
-                peer=my_rank,
-                offsets=[my_rank, 0],
-                value=neg_epochs,
-                op=pld.NotifyOp.AtomicAdd,
-            )
-            for src in pl.range(N_RANKS):
-                if src != my_rank:
-                    pld.system.notify(
-                        target=arrived,
-                        peer=my_rank,
-                        offsets=[src, 0],
-                        value=neg_epochs,
-                        op=pld.NotifyOp.AtomicAdd,
-                    )
-                    pld.system.notify(
-                        target=data_arrived,
-                        peer=my_rank,
-                        offsets=[src, 0],
-                        value=neg_data,
-                        op=pld.NotifyOp.AtomicAdd,
-                    )
-                    pld.system.notify(
-                        target=combine_arrived,
-                        peer=my_rank,
-                        offsets=[src, 0],
-                        value=neg_combine,
-                        op=pld.NotifyOp.AtomicAdd,
-                    )
     x_head: pl.Tensor[[T, D], pl.BF16] = pl.create_tensor([T, D], dtype=pl.BF16)
     with pl.scope():
         hc_head(pre_hc_hidden_out, hc_head_fn, hc_head_scale, hc_head_base, x_head)
@@ -930,16 +881,18 @@ def l3_decode_fwd(
     logits: pl.Out[pl.Tensor[[N_RANKS, MAX_LOGIT_ROWS, LM_HEAD_VOCAB], pl.FP32]],
     sampled_ids: pl.Out[pl.Tensor[[N_RANKS, MAX_LOGIT_ROWS, SAMPLED_IDS_PAD], pl.INT32]],
     num_tokens: pl.Scalar[pl.INT32],
+    moe_epoch_base: pl.Scalar[pl.INT32],
 ):
     embed_weight.bind_dynamic(1, EMBED_VOCAB_DYN)
     recv_meta_buf = pld.alloc_window_buffer([N_RANKS, N_LOCAL], dtype=pl.INT32)
     recv_x_buf = pld.alloc_window_buffer([N_LOCAL * RECV_MAX, D], dtype=pl.INT8)
     recv_aux_buf = pld.alloc_window_buffer([N_LOCAL * RECV_MAX, AUX_PAD], dtype=pl.FP32)
     recv_route_buf = pld.alloc_window_buffer([N_LOCAL * RECV_MAX, IDX_PAD], dtype=pl.INT32)
-    arrived_buf = pld.alloc_window_buffer([N_RANKS, 1], dtype=pl.INT32)
-    data_arrived_buf = pld.alloc_window_buffer([N_RANKS, 1], dtype=pl.INT32)
+    arrived_buf = pld.alloc_window_buffer([N_RANKS, SIGNAL_PAD], dtype=pl.INT32)
+    data_arrived_buf = pld.alloc_window_buffer([N_RANKS, N_LOCAL, SIGNAL_PAD], dtype=pl.INT32)
     routed_y_buf_buf = pld.alloc_window_buffer([N_ROUTES, D], dtype=pl.BF16)
-    combine_arrived_buf = pld.alloc_window_buffer([N_RANKS, 1], dtype=pl.INT32)
+    combine_arrived_buf = pld.alloc_window_buffer([N_RANKS, N_LOCAL, SIGNAL_PAD], dtype=pl.INT32)
+    consumed_buf = pld.alloc_window_buffer([N_RANKS, SIGNAL_PAD], dtype=pl.INT32)
     lm_head_hidden_window_buf = pld.alloc_window_buffer(GROUP_LOGIT_ROWS * D * 2)
     lm_head_logits_window_buf = pld.alloc_window_buffer(MAX_LOGIT_ROWS * LM_HEAD_VOCAB * 4)
     lm_head_hidden_done_buf = pld.alloc_window_buffer([LM_HEAD_TP_SIZE, 1], dtype=pl.INT32)
@@ -950,10 +903,11 @@ def l3_decode_fwd(
         recv_x: pld.DistributedTensor[[N_LOCAL * RECV_MAX, D], pl.INT8] = pld.window(recv_x_buf, [N_LOCAL * RECV_MAX, D], dtype=pl.INT8)
         recv_aux: pld.DistributedTensor[[N_LOCAL * RECV_MAX, AUX_PAD], pl.FP32] = pld.window(recv_aux_buf, [N_LOCAL * RECV_MAX, AUX_PAD], dtype=pl.FP32)
         recv_route: pld.DistributedTensor[[N_LOCAL * RECV_MAX, IDX_PAD], pl.INT32] = pld.window(recv_route_buf, [N_LOCAL * RECV_MAX, IDX_PAD], dtype=pl.INT32)
-        arrived: pld.DistributedTensor[[N_RANKS, 1], pl.INT32] = pld.window(arrived_buf, [N_RANKS, 1], dtype=pl.INT32)
-        data_arrived: pld.DistributedTensor[[N_RANKS, 1], pl.INT32] = pld.window(data_arrived_buf, [N_RANKS, 1], dtype=pl.INT32)
+        arrived = pld.window(arrived_buf, [N_RANKS, SIGNAL_PAD], dtype=pl.INT32)
+        data_arrived = pld.window(data_arrived_buf, [N_RANKS, N_LOCAL, SIGNAL_PAD], dtype=pl.INT32)
         routed_y_buf: pld.DistributedTensor[[N_ROUTES, D], pl.BF16] = pld.window(routed_y_buf_buf, [N_ROUTES, D], dtype=pl.BF16)
-        combine_arrived: pld.DistributedTensor[[N_RANKS, 1], pl.INT32] = pld.window(combine_arrived_buf, [N_RANKS, 1], dtype=pl.INT32)
+        combine_arrived = pld.window(combine_arrived_buf, [N_RANKS, N_LOCAL, SIGNAL_PAD], dtype=pl.INT32)
+        consumed = pld.window(consumed_buf, [N_RANKS, SIGNAL_PAD], dtype=pl.INT32)
         lm_head_hidden_window = pld.window(lm_head_hidden_window_buf, [GROUP_LOGIT_ROWS, D], dtype=pl.BF16)
         lm_head_hidden_done = pld.window(lm_head_hidden_done_buf, [LM_HEAD_TP_SIZE, 1], dtype=pl.INT32)
         lm_head_logits_window = pld.window(lm_head_logits_window_buf, [MAX_LOGIT_ROWS, LM_HEAD_VOCAB], dtype=pl.FP32)
@@ -1050,10 +1004,10 @@ def l3_decode_fwd(
             logits[r],
             sampled_ids[r],
             recv_meta, recv_x, recv_aux, recv_route, arrived, data_arrived,
-            routed_y_buf, combine_arrived,
+            routed_y_buf, combine_arrived, consumed,
             lm_head_hidden_window, lm_head_hidden_done,
             lm_head_logits_window, lm_head_logits_done,
-            r, num_tokens,
+            r, num_tokens, moe_epoch_base,
             device=r,
         )
 
@@ -1681,7 +1635,8 @@ def build_tensor_specs(start_pos=DECODE_START_POS, num_tokens=T):
         torch.int32,
         is_output=True,
     ))
-    specs.append(ScalarSpec("num_tokens", torch.int32, num_tokens))
+    specs.append(ScalarSpec("num_tokens", torch.int32, num_tokens, compile_runtime=True))
+    specs.append(ScalarSpec("moe_epoch_base", torch.int32, 0, compile_runtime=True, benchmark_step=LAST_MOE_EPOCH))
     return specs
 
 

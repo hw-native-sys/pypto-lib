@@ -73,6 +73,7 @@ GATHER_TOKEN_TILE = 4
 BIAS_TOKEN_TILE = 16
 QUANT_TOKEN_TILE = 8
 ROPE_OUT_TOK_TILE = T // 2
+ROPE_CS_T_TILE = 8
 ROPE_TILE = 16
 ROPE_INTERLEAVE_TILE = 2 * ROPE_TILE
 A_K_TILE = 256                       # proj_a cube K-frag: K*2B = 512B = one a2a3 L2 line (128 wastes half)
@@ -133,33 +134,27 @@ def prefill_sparse_attn(
     attn_out: pl.Out[pl.Tensor[[T, D], pl.BF16]],
 ):
     """Gather cache-first SWA/compressed rows, then run sparse attention and o-proj."""
-    # RoPE tables, built up front. out[j] = x[j]*cos_il[j] + x[j^1]*sin_signed[j]; precompute
-    # the head-invariant cos_il / sign-folded sin once, then rotate each head's rope segment
-    # in the `rope` stage below (no rope_buf round-trip).
-    #
-    # Keep this stage isolated from the other root tasks. Concurrent dispatch of rope_cs with
-    # either merge_norm or the initial gather/bias work intermittently trips an on-device
-    # "the address for VEC to access UB is out of bounds" fault (AICore errcode 341), even
-    # though each tile is individually within the vector UB budget. Explicit dependencies on
-    # rope_cs below trade a small amount of launch overlap for deterministic execution.
+    # RoPE cosine and signed-sine tables are materialized in bounded row tiles.
     rope_cos_il = pl.create_tensor([T, ROPE_DIM], dtype=pl.FP32)
     rope_sin_signed = pl.create_tensor([T, ROPE_DIM], dtype=pl.FP32)
     with pl.spmd(ROPE_HALF // ROPE_TILE, name_hint="rope_cs") as rope_cs_tid:
         cp = pl.tile.get_block_idx()
         cp_r0 = cp * ROPE_TILE
         cp_c0 = 2 * cp_r0
-        cs_col = pl.col_expand_mul(
-            pl.full([T, ROPE_INTERLEAVE_TILE], dtype=pl.FP32, value=1.0),
-            pl.cast(pl.arange(0, [1, ROPE_INTERLEAVE_TILE], dtype=pl.INT32), target_type=pl.FP32))
-        cs_dup_f = pl.cast(pl.cast(pl.mul(cs_col, 0.5), target_type=pl.INT32, mode="trunc"), target_type=pl.FP32)
-        cs_dup_idx = pl.cast(cs_dup_f, target_type=pl.INT32)                                      # j>>1
-        cs_lane = pl.sub(cs_col, pl.mul(cs_dup_f, 2.0))                                           # j%2
-        cs_sign = pl.neg(pl.sub(pl.mul(cs_lane, 2.0), 1.0))                                       # [+1,-1,...]
-        cs_cos = pl.cast(freqs_cos[0:T, cp_r0 : cp_r0 + ROPE_TILE], target_type=pl.FP32)
-        cs_sin = pl.cast(freqs_sin[0:T, cp_r0 : cp_r0 + ROPE_TILE], target_type=pl.FP32)
-        rope_cos_il[0:T, cp_c0 : cp_c0 + ROPE_INTERLEAVE_TILE] = pl.gather(cs_cos, dim=-1, index=cs_dup_idx)
-        rope_sin_signed[0:T, cp_c0 : cp_c0 + ROPE_INTERLEAVE_TILE] = pl.mul(
-            pl.gather(cs_sin, dim=-1, index=cs_dup_idx), cs_sign)
+        for cs_t0 in pl.range(0, T, ROPE_CS_T_TILE):
+            cs_cos_bf16 = freqs_cos[cs_t0 : cs_t0 + ROPE_CS_T_TILE, cp_r0 : cp_r0 + ROPE_TILE]
+            cs_sin_bf16 = freqs_sin[cs_t0 : cs_t0 + ROPE_CS_T_TILE, cp_r0 : cp_r0 + ROPE_TILE]
+            cs_cos = pl.cast(cs_cos_bf16, target_type=pl.FP32)
+            cs_sin = pl.cast(cs_sin_bf16, target_type=pl.FP32)
+            cs_sin_neg = pl.neg(cs_sin)
+            cs_cos_dup = pl.full([ROPE_CS_T_TILE, ROPE_INTERLEAVE_TILE], dtype=pl.FP32, value=0.0)
+            cs_cos_dup = pl.tensor.scatter(cs_cos, mask_pattern=pl.tile.MaskPattern.P0101, dst=cs_cos_dup)
+            cs_cos_dup = pl.tensor.scatter(cs_cos, mask_pattern=pl.tile.MaskPattern.P1010, dst=cs_cos_dup)
+            cs_sin_signed = pl.full([ROPE_CS_T_TILE, ROPE_INTERLEAVE_TILE], dtype=pl.FP32, value=0.0)
+            cs_sin_signed = pl.tensor.scatter(cs_sin, mask_pattern=pl.tile.MaskPattern.P0101, dst=cs_sin_signed)
+            cs_sin_signed = pl.tensor.scatter(cs_sin_neg, mask_pattern=pl.tile.MaskPattern.P1010, dst=cs_sin_signed)
+            rope_cos_il[cs_t0 : cs_t0 + ROPE_CS_T_TILE, cp_c0 : cp_c0 + ROPE_INTERLEAVE_TILE] = cs_cos_dup
+            rope_sin_signed[cs_t0 : cs_t0 + ROPE_CS_T_TILE, cp_c0 : cp_c0 + ROPE_INTERLEAVE_TILE] = cs_sin_signed
 
     # Gather KV per token: each (token, block) of PREFILL_ATTN_TILE slots is staged into one
     # UB tile (scattered 1-row loads on MTE2, invalid slots stay zero) then flushed with a
@@ -171,6 +166,7 @@ def prefill_sparse_attn(
     cmp_cache_rows = cmp_block_num * BLOCK_SIZE
     cmp_kv_flat = pl.reshape(cmp_kv, [cmp_cache_rows, HEAD_DIM])
     sparse_kv = pl.create_tensor([T * PREFILL_SPARSE_PAD, HEAD_DIM], dtype=pl.BF16)
+    # Serialize sparse preparation behind the RoPE-table producer.
     with pl.spmd(
         ((T + GATHER_TOKEN_TILE - 1) // GATHER_TOKEN_TILE) * PREFILL_ATTN_BLOCKS,
         name_hint="gather_kv",
@@ -325,13 +321,6 @@ def prefill_sparse_attn(
         rp_hg = rp_idx // (T // ROPE_OUT_TOK_TILE)
         rp_tt = rp_idx - rp_hg * (T // ROPE_OUT_TOK_TILE)
         rp_t0 = rp_tt * ROPE_OUT_TOK_TILE
-        # Head-invariant swap index (j^1), built once and reused across the head group.
-        sp_col = pl.col_expand_mul(
-            pl.full([ROPE_OUT_TOK_TILE, ROPE_INTERLEAVE_TILE], dtype=pl.FP32, value=1.0),
-            pl.cast(pl.arange(0, [1, ROPE_INTERLEAVE_TILE], dtype=pl.INT32), target_type=pl.FP32))
-        sp_dup_f = pl.cast(pl.cast(pl.mul(sp_col, 0.5), target_type=pl.INT32, mode="trunc"), target_type=pl.FP32)
-        sp_lane = pl.sub(sp_col, pl.mul(sp_dup_f, 2.0))                                           # j%2
-        sp_swap_idx = pl.cast(pl.sub(pl.add(sp_col, 1.0), pl.mul(sp_lane, 2.0)), target_type=pl.INT32)  # j^1
         for rp_hl in pl.range(0, 4):
             rp_gh = rp_hg * 4 + rp_hl
             rp_g = rp_gh // HEADS_PER_GROUP
@@ -345,7 +334,11 @@ def prefill_sparse_attn(
                     [ROPE_OUT_TOK_TILE, ROPE_INTERLEAVE_TILE])
                 r_cos_il = rope_cos_il[rp_t0 : rp_t0 + ROPE_OUT_TOK_TILE, c0 : c0 + ROPE_INTERLEAVE_TILE]
                 r_sin_signed = rope_sin_signed[rp_t0 : rp_t0 + ROPE_OUT_TOK_TILE, c0 : c0 + ROPE_INTERLEAVE_TILE]
-                r_swapped = pl.gather(r_tile_fp32, dim=-1, index=sp_swap_idx)
+                r_even = pl.gather(r_tile_fp32, mask_pattern=pl.tile.MaskPattern.P0101)
+                r_odd = pl.gather(r_tile_fp32, mask_pattern=pl.tile.MaskPattern.P1010)
+                r_swap_zero = pl.full([ROPE_OUT_TOK_TILE, ROPE_INTERLEAVE_TILE], dtype=pl.FP32, value=0.0)
+                r_swapped = pl.tensor.scatter(r_odd, mask_pattern=pl.tile.MaskPattern.P0101, dst=r_swap_zero)
+                r_swapped = pl.tensor.scatter(r_even, mask_pattern=pl.tile.MaskPattern.P1010, dst=r_swapped)
                 r_rot = pl.add(pl.mul(r_tile_fp32, r_cos_il), pl.mul(r_swapped, r_sin_signed))
                 r_rot = pl.cast(r_rot, target_type=pl.BF16, mode="rint")
                 o_packed[rp_o0 : rp_o0 + ROPE_OUT_TOK_TILE, rp_col + c0 : rp_col + c0 + ROPE_INTERLEAVE_TILE] = r_rot
@@ -437,7 +430,7 @@ def prefill_sparse_attn(
     # per-channel weight scale -> BF16. Explicit deps on all proj_b_mm tasks bridge
     # manual_scope -> the return's auto-dep.
     with pl.spmd(PB_ACT_NREG * PB_ACT_TBLKS, name_hint="proj_b_act",
-                 deps=[proj_b_tids[i] for i in range(PB_DCHUNKS * O_GROUPS)]) as act_tid:
+                 deps=[proj_b_tids[i] for i in range(PB_DCHUNKS * O_GROUPS)]) as _act_tid:
         act_idx = pl.tile.get_block_idx()
         nreg = act_idx // PB_ACT_TBLKS
         tblk = act_idx - nreg * PB_ACT_TBLKS

@@ -495,8 +495,8 @@ jobs:
     # models/deepseek_v4_pro drivers with the Flash config (--variant flash),
     # EP8/TP2, one prefill plus 32 greedy decode steps, driven by
     # synthetic_token_loop.py exactly as docs/models/deepseek_v4_pro.md
-    # ("End-to-end token generation") documents, including its two EP8
-    # workaround flags (--prefill-tokens 16 --prefill-no-retire). It is the only
+    # ("End-to-end token generation") documents. The prefill has a fixed
+    # 128-row capacity while active rows follow the encoded prompt length. It is the only
     # nightly that exercises the full prompt -> tokens -> text path on real
     # weights; model-tests-a5 covers the operators one by one on synthetic data.
     runs-on: [self-hosted, linux, arm64, npu-a5]
@@ -656,7 +656,7 @@ jobs:
           task-submit --device auto --device-num 8 --ignore-whitelist --timeout 5400 --max-time 2400 \
             --run "cd $GITHUB_WORKSPACE/checkout && source activate.sh && PYTHONPATH=$GITHUB_WORKSPACE/checkout \
               python models/deepseek_v4_pro/synthetic_token_loop.py --variant flash --ep 8 --tp 2 \
-                -d \$TASK_DEVICE --prefill-tokens 16 --prefill-no-retire \
+                -d \$TASK_DEVICE \
                 --weights '$WEIGHTS' --tokenizer '$CKPT/tokenizer.json' \
                 --prompt '$E2E_PROMPT' --decode-steps $E2E_DECODE_STEPS" 2>&1 | tee e2e.log
           rc=${PIPESTATUS[0]}

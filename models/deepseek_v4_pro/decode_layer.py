@@ -89,6 +89,7 @@ from moe import (
     N_RANKS,
     N_ROUTES,
     RECV_MAX,
+    SIGNAL_PAD,
     TOPK,
     VOCAB,
     build_tensor_specs as build_moe_tensor_specs,
@@ -218,12 +219,14 @@ def decode_layer(
     recv_x: pld.DistributedTensor[[N_LOCAL * RECV_MAX, D], pl.INT8],
     recv_aux: pld.DistributedTensor[[N_LOCAL * RECV_MAX, AUX_PAD], pl.FP32],
     recv_route: pld.DistributedTensor[[N_LOCAL * RECV_MAX, IDX_PAD], pl.INT32],
-    arrived: pld.DistributedTensor[[N_RANKS, 1], pl.INT32],
-    data_arrived: pld.DistributedTensor[[N_RANKS, 1], pl.INT32],
+    arrived: pld.DistributedTensor[[N_RANKS, SIGNAL_PAD], pl.INT32],
+    data_arrived: pld.DistributedTensor[[N_RANKS, N_LOCAL, SIGNAL_PAD], pl.INT32],
     routed_y_buf: pld.DistributedTensor[[N_ROUTES, D], pl.BF16],
-    combine_arrived: pl.InOut[pld.DistributedTensor[[N_RANKS, 1], pl.INT32]],
+    combine_arrived: pl.InOut[pld.DistributedTensor[[N_RANKS, N_LOCAL, SIGNAL_PAD], pl.INT32]],
+    consumed: pl.InOut[pld.DistributedTensor[[N_RANKS, SIGNAL_PAD], pl.INT32]],
     layer_id: pl.Scalar[pl.INT32],
     my_rank: pl.Scalar[pl.INT32],
+    moe_epoch: pl.Scalar[pl.INT32],
 ) -> pl.Tensor[[T, HC_MULT, D], pl.FP32]:
     x_attn = pl.create_tensor([T, HC_MULT, D], dtype=pl.FP32)
     if layer_id < ALT_START:
@@ -299,8 +302,8 @@ def decode_layer(
         shared_w2, shared_w2_scale,
         x_next,
         recv_meta, recv_x, recv_aux, recv_route, arrived, data_arrived,
-        routed_y_buf, combine_arrived,
-        layer_id, pl.const(T, pl.INT32), my_rank, pl.const(1, pl.INT32),
+        routed_y_buf, combine_arrived, consumed,
+        layer_id, pl.const(T, pl.INT32), my_rank, moe_epoch,
     )
     return x_next
 
@@ -405,25 +408,28 @@ def l3_decode_layer(
     shared_w2_scale: pl.Tensor[[N_RANKS, D], pl.FP32],
     x_next: pl.Out[pl.Tensor[[N_RANKS, T, HC_MULT, D], pl.FP32]],
     layer_id: pl.Scalar[pl.INT32],
+    moe_epoch: pl.Scalar[pl.INT32],
 ):
     recv_meta_buf = pld.alloc_window_buffer([N_RANKS, N_LOCAL], dtype=pl.INT32)
     recv_x_buf = pld.alloc_window_buffer([N_LOCAL * RECV_MAX, D], dtype=pl.INT8)
     recv_aux_buf = pld.alloc_window_buffer([N_LOCAL * RECV_MAX, AUX_PAD], dtype=pl.FP32)
     recv_route_buf = pld.alloc_window_buffer([N_LOCAL * RECV_MAX, IDX_PAD], dtype=pl.INT32)
-    arrived_buf = pld.alloc_window_buffer([N_RANKS, 1], dtype=pl.INT32)
-    data_arrived_buf = pld.alloc_window_buffer([N_RANKS, 1], dtype=pl.INT32)
+    arrived_buf = pld.alloc_window_buffer([N_RANKS, SIGNAL_PAD], dtype=pl.INT32)
+    data_arrived_buf = pld.alloc_window_buffer([N_RANKS, N_LOCAL, SIGNAL_PAD], dtype=pl.INT32)
     routed_y_buf_buf = pld.alloc_window_buffer([N_ROUTES, D], dtype=pl.BF16)
-    combine_arrived_buf = pld.alloc_window_buffer([N_RANKS, 1], dtype=pl.INT32)
+    combine_arrived_buf = pld.alloc_window_buffer([N_RANKS, N_LOCAL, SIGNAL_PAD], dtype=pl.INT32)
+    consumed_buf = pld.alloc_window_buffer([N_RANKS, SIGNAL_PAD], dtype=pl.INT32)
 
     for r in pl.range(pld.world_size()):
         recv_meta = pld.window(recv_meta_buf, [N_RANKS, N_LOCAL], dtype=pl.INT32)
         recv_x = pld.window(recv_x_buf, [N_LOCAL * RECV_MAX, D], dtype=pl.INT8)
         recv_aux = pld.window(recv_aux_buf, [N_LOCAL * RECV_MAX, AUX_PAD], dtype=pl.FP32)
         recv_route = pld.window(recv_route_buf, [N_LOCAL * RECV_MAX, IDX_PAD], dtype=pl.INT32)
-        arrived = pld.window(arrived_buf, [N_RANKS, 1], dtype=pl.INT32)
-        data_arrived = pld.window(data_arrived_buf, [N_RANKS, 1], dtype=pl.INT32)
+        arrived = pld.window(arrived_buf, [N_RANKS, SIGNAL_PAD], dtype=pl.INT32)
+        data_arrived = pld.window(data_arrived_buf, [N_RANKS, N_LOCAL, SIGNAL_PAD], dtype=pl.INT32)
         routed_y_buf = pld.window(routed_y_buf_buf, [N_ROUTES, D], dtype=pl.BF16)
-        combine_arrived = pld.window(combine_arrived_buf, [N_RANKS, 1], dtype=pl.INT32)
+        combine_arrived = pld.window(combine_arrived_buf, [N_RANKS, N_LOCAL, SIGNAL_PAD], dtype=pl.INT32)
+        consumed = pld.window(consumed_buf, [N_RANKS, SIGNAL_PAD], dtype=pl.INT32)
         decode_layer(
             x_hc[r],
             hc_attn_fn[r], hc_attn_scale[r], hc_attn_base[r],
@@ -454,8 +460,8 @@ def l3_decode_layer(
             shared_w2[r], shared_w2_scale[r],
             x_next[r],
             recv_meta, recv_x, recv_aux, recv_route, arrived, data_arrived,
-            routed_y_buf, combine_arrived,
-            layer_id, r,
+            routed_y_buf, combine_arrived, consumed,
+            layer_id, r, moe_epoch,
             device=r,
         )
 
@@ -755,6 +761,10 @@ def build_tensor_specs(
     moe_specs = build_moe_tensor_specs(layer_id)
     moe_tensor_specs = {spec.name: spec for spec in moe_specs if isinstance(spec, TensorSpec)}
     attention_kind = _attention_kind_for_layer(layer_id)
+    mutable_cache_names = {
+        "kv_cache", "cmp_kv", "idx_kv_cache", "idx_kv_scale",
+        "csa_compress_state", "csa_inner_compress_state", "hca_compress_state",
+    }
     active_specs = {
         "swa": swa_specs,
         "hca": hca_specs,
@@ -879,14 +889,9 @@ def build_tensor_specs(
 
     specs = [
         TensorSpec(
-            name,
-            [N_RANKS, *spec.shape],
-            spec.dtype,
+            name, [N_RANKS, *spec.shape], spec.dtype,
             init_value=_ranked_init(spec, replicated=name in replicated_attention),
-            is_output=(
-                name == "kv_cache"
-                or (cache_outputs and name in active_mutable_cache_names)
-            ),
+            is_output=name in mutable_cache_names,
         )
         for name, spec in attention_specs
     ]
@@ -919,11 +924,10 @@ def build_tensor_specs(
     # exactly ``replicated_attention`` (every attention param that is not a
     # KV/state cache or per-step metadata); the MoE set adds the FFN/gate/expert
     # weights and the static tid2eid route table. The KV/state caches
-    # (RESIDENT_CACHE_NAMES) are kept resident too — the written kv_cache is also
-    # is_output=True (line above) and read back once at the end for validation;
-    # the others are read-only inputs. NOT resident: the per-step slot mappings /
-    # block tables / ids / position_ids / kv_seq_lens, the input activation
-    # (x_hc), and the output (x_next), which change per token.
+    # (RESIDENT_CACHE_NAMES) are kept resident too. Their shared entry ABI is
+    # InOut; inactive branch caches are preserved unchanged. NOT resident: the
+    # per-step slot mappings / block tables / ids / position_ids / kv_seq_lens,
+    # the input activation (x_hc), and the output (x_next), which change per token.
     RESIDENT_WEIGHT_NAMES = replicated_attention | {
         "hc_ffn_fn", "hc_ffn_scale", "hc_ffn_base", "norm_w",
         "gate_w", "gate_bias", "tid2eid",
@@ -932,10 +936,8 @@ def build_tensor_specs(
         "shared_w1", "shared_w1_scale", "shared_w3", "shared_w3_scale",
         "shared_w2", "shared_w2_scale",
     }
-    RESIDENT_CACHE_NAMES = {
-        "kv_cache", "cmp_kv", "idx_kv_cache", "idx_kv_scale",
-        "csa_compress_state", "csa_inner_compress_state", "hca_compress_state",
-    }
+    RESIDENT_CACHE_NAMES = mutable_cache_names
+    # cache_outputs selects active-cache residency, not the static InOut ABI.
     resident_cache_names = active_mutable_cache_names if cache_outputs else RESIDENT_CACHE_NAMES
     for spec in specs:
         if spec.name in RESIDENT_WEIGHT_NAMES or spec.name in resident_cache_names:
@@ -944,6 +946,7 @@ def build_tensor_specs(
     specs.extend([
         TensorSpec("x_next", [N_RANKS, T, HC_MULT, D], torch.float32, is_output=True),
         ScalarSpec("layer_id", torch.int32, layer_id),
+        ScalarSpec("moe_epoch", torch.int32, 1, compile_runtime=True, benchmark_step=1),
     ])
     return specs
 

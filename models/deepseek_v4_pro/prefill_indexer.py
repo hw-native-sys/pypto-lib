@@ -180,7 +180,7 @@ def prefill_indexer(
             qr_dequant = pl.col_expand_mul(pl.row_expand_mul(acc_fp32, scale_dq), wq_scale)
             qr_proj[r0 : r0 + QR_PROJ_ROW_TILE, o0 : o0 + Q_OUT_TILE] = qr_dequant
 
-    # === Q RoPE (A3 interleaved swap-gather), one task per token (its IDX_N_HEADS rows + cos/sin) ===
+    # Apply Q RoPE to one token per task.
     qr_proj_flat = pl.reshape(qr_proj, [T * IDX_N_HEADS, IDX_HEAD_DIM])
     qr_rope_out = pl.create_tensor([T * IDX_N_HEADS, ROPE_HEAD_DIM], dtype=pl.BF16)
     for idx in pl.spmd(T * IDX_N_HEADS // ROPE_ROW_BLOCK, name_hint="prefill_idx_qr_rope"):
@@ -188,22 +188,24 @@ def prefill_indexer(
         token_idx = idx  # ROPE_ROW_BLOCK == IDX_N_HEADS, so one task == one token
         cos_b = cos[token_idx : token_idx + 1, 0 : ROPE_HEAD_DIM // 2]
         sin_b = sin[token_idx : token_idx + 1, 0 : ROPE_HEAD_DIM // 2]
-        rope_ones = pl.full([ROPE_ROW_TILE, ROPE_HEAD_DIM], dtype=pl.FP32, value=1.0)
-        rope_col = pl.col_expand_mul(rope_ones, pl.cast(pl.arange(0, [1, ROPE_HEAD_DIM], dtype=pl.INT32), target_type=pl.FP32))
-        rope_dup_f = pl.cast(pl.cast(pl.mul(rope_col, 0.5), target_type=pl.INT32, mode="trunc"), target_type=pl.FP32)
-        rope_dup_idx = pl.cast(rope_dup_f, target_type=pl.INT32)                                       # j>>1
-        rope_lane = pl.sub(rope_col, pl.mul(rope_dup_f, 2.0))                                          # j%2
-        rope_swap_idx = pl.cast(pl.sub(pl.add(rope_col, 1.0), pl.mul(rope_lane, 2.0)), target_type=pl.INT32)  # j^1
-        rope_sign = pl.sub(pl.mul(rope_lane, 2.0), 1.0)                                                # [-1,+1,...]
         cos_b32 = pl.col_expand_mul(pl.full([ROPE_ROW_TILE, ROPE_HEAD_DIM // 2], dtype=pl.FP32, value=1.0), cos_b)
         sin_b32 = pl.col_expand_mul(pl.full([ROPE_ROW_TILE, ROPE_HEAD_DIM // 2], dtype=pl.FP32, value=1.0), sin_b)
-        cos_il = pl.gather(cos_b32, dim=-1, index=rope_dup_idx)
-        sin_il = pl.gather(sin_b32, dim=-1, index=rope_dup_idx)
+        sin_b32_neg = pl.neg(sin_b32)
+        cos_il = pl.full([ROPE_ROW_TILE, ROPE_HEAD_DIM], dtype=pl.FP32, value=0.0)
+        cos_il = pl.tensor.scatter(cos_b32, mask_pattern=pl.tile.MaskPattern.P0101, dst=cos_il)
+        cos_il = pl.tensor.scatter(cos_b32, mask_pattern=pl.tile.MaskPattern.P1010, dst=cos_il)
+        sin_signed = pl.full([ROPE_ROW_TILE, ROPE_HEAD_DIM], dtype=pl.FP32, value=0.0)
+        sin_signed = pl.tensor.scatter(sin_b32_neg, mask_pattern=pl.tile.MaskPattern.P0101, dst=sin_signed)
+        sin_signed = pl.tensor.scatter(sin_b32, mask_pattern=pl.tile.MaskPattern.P1010, dst=sin_signed)
         for ro in pl.range(0, ROPE_ROW_BLOCK, ROPE_ROW_TILE):
             r0 = o0 + ro
             qr_rope_slice = qr_proj_flat[r0 : r0 + ROPE_ROW_TILE, IDX_NOPE_HEAD_DIM : IDX_HEAD_DIM]
-            qr_swapped = pl.gather(qr_rope_slice, dim=-1, index=rope_swap_idx)
-            rope_rot = pl.add(pl.mul(qr_rope_slice, cos_il), pl.mul(pl.mul(qr_swapped, rope_sign), sin_il))
+            qr_even = pl.gather(qr_rope_slice, mask_pattern=pl.tile.MaskPattern.P0101)
+            qr_odd = pl.gather(qr_rope_slice, mask_pattern=pl.tile.MaskPattern.P1010)
+            qr_swap_zero = pl.full([ROPE_ROW_TILE, ROPE_HEAD_DIM], dtype=pl.FP32, value=0.0)
+            qr_swapped = pl.tensor.scatter(qr_odd, mask_pattern=pl.tile.MaskPattern.P0101, dst=qr_swap_zero)
+            qr_swapped = pl.tensor.scatter(qr_even, mask_pattern=pl.tile.MaskPattern.P1010, dst=qr_swapped)
+            rope_rot = pl.add(pl.mul(qr_rope_slice, cos_il), pl.mul(qr_swapped, sin_signed))
             qr_rope_out[r0 : r0 + ROPE_ROW_TILE, :] = pl.cast(rope_rot, target_type=pl.BF16, mode="rint")
 
     # === Q Hadamard rotation + per-row INT8 quant (mirrors decode_indexer qr_hadamard_quant) ===

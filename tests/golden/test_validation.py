@@ -18,6 +18,7 @@ import pytest
 import torch
 from golden.validation import (
     mapped_pool_ratio_allclose,
+    mapped_pool_ratio_reldiff,
     ratio_allclose,
     ratio_reldiff,
     topk_pair_compare,
@@ -262,6 +263,63 @@ class TestMappedPoolRatioAllclose:
         )
 
         assert ok, detail
+
+    def test_reldiff_allows_bounded_bfloat16_steps_on_mapped_rows(self):
+        expected = torch.zeros(2, 2, 4, dtype=torch.bfloat16)
+        expected[0, 0] = torch.tensor([1.0, 0.5, 0.25, 0.125])
+        actual = expected.clone()
+        actual[0, 0] = torch.tensor([1.0078125, 0.50390625, 0.251953125, 0.1259765625])
+        comparator = mapped_pool_ratio_reldiff(
+            "mapping", mapping_shape=(1,), block_size=2,
+            diff_thd=0.01, pct_thd=0.05,
+        )
+
+        ok, detail = self._call(
+            comparator,
+            actual,
+            expected,
+            torch.tensor([0], dtype=torch.int64),
+        )
+
+        assert ok, detail
+
+    def test_reldiff_rejects_excess_mapped_outliers(self):
+        expected = torch.ones(1, 1, 100, dtype=torch.float32)
+        actual = expected.clone()
+        actual[0, 0, :6] = 1.1
+        comparator = mapped_pool_ratio_reldiff(
+            "mapping", mapping_shape=(1,), block_size=1,
+            diff_thd=0.01, pct_thd=0.05,
+        )
+
+        ok, detail = self._call(
+            comparator,
+            actual,
+            expected,
+            torch.tensor([0], dtype=torch.int64),
+        )
+
+        assert not ok
+        assert "error_count=6/100" in detail
+
+    def test_reldiff_rejects_unmapped_mutation(self):
+        expected = torch.zeros(2, 2, 1, dtype=torch.float32)
+        actual = expected.clone()
+        actual[1, 1, 0] = 1.0
+        comparator = mapped_pool_ratio_reldiff(
+            "mapping", mapping_shape=(1,), block_size=2,
+            diff_thd=0.01, pct_thd=0.05,
+        )
+
+        ok, detail = self._call(
+            comparator,
+            actual,
+            expected,
+            torch.tensor([0], dtype=torch.int64),
+        )
+
+        assert not ok
+        assert "unmapped physical pool row changed" in detail
 
 
 class TestValidateGolden:

@@ -55,6 +55,7 @@ from moe import (
     N_RANKS,
     N_ROUTES,
     RECV_MAX,
+    SIGNAL_PAD,
     T,
     TOPK,
     VOCAB,
@@ -274,10 +275,11 @@ def prefill_layer_core(
     recv_x: pld.DistributedTensor[[N_LOCAL * RECV_MAX, D], pl.INT8],
     recv_aux: pld.DistributedTensor[[N_LOCAL * RECV_MAX, AUX_PAD], pl.FP32],
     recv_route: pld.DistributedTensor[[N_LOCAL * RECV_MAX, IDX_PAD], pl.INT32],
-    arrived: pld.DistributedTensor[[N_RANKS, 1], pl.INT32],
-    data_arrived: pld.DistributedTensor[[N_RANKS, 1], pl.INT32],
+    arrived: pld.DistributedTensor[[N_RANKS, SIGNAL_PAD], pl.INT32],
+    data_arrived: pld.DistributedTensor[[N_RANKS, N_LOCAL, SIGNAL_PAD], pl.INT32],
     routed_y_buf: pld.DistributedTensor[[N_ROUTES, D], pl.BF16],
-    combine_arrived: pl.InOut[pld.DistributedTensor[[N_RANKS, 1], pl.INT32]],
+    combine_arrived: pl.InOut[pld.DistributedTensor[[N_RANKS, N_LOCAL, SIGNAL_PAD], pl.INT32]],
+    consumed: pl.InOut[pld.DistributedTensor[[N_RANKS, SIGNAL_PAD], pl.INT32]],
     layer_id: pl.Scalar[pl.INT32],
     my_rank: pl.Scalar[pl.INT32],
 ) -> pl.Tensor[[PREFILL_TOKENS_DYN, HC_MULT, D], pl.FP32]:
@@ -342,9 +344,9 @@ def prefill_layer_core(
             tile_base = chunk_base + p0
             valid_tok = pl.min(TOK_TILE, chunk_len_b - p0)
             valid_n = pl.cast(valid_tok, pl.INT32)  # child num_tokens scalar (INT32)
-            # Global execution ordinal of this MoE call (1-based). The done
-            # windows are monotonic counters, so each serial MoE call needs a
-            # unique, gap-free epoch == its execution order; chunk_tile_offsets
+            # Global execution ordinal of this MoE call (1-based). The readiness
+            # windows hold monotonic epochs, so each serial MoE call needs a
+            # unique, gap-free epoch equal to its execution order; chunk_tile_offsets
             # is the exclusive prefix sum of tok_blocks over requests.
             moe_epoch = pl.cast(tile_ord_base + tile_id + 1, pl.INT32)
 
@@ -423,7 +425,7 @@ def prefill_layer_core(
                 shared_w2, shared_w2_scale,
                 x_next_tile,
                 recv_meta, recv_x, recv_aux, recv_route, arrived, data_arrived,
-                routed_y_buf, combine_arrived,
+                routed_y_buf, combine_arrived, consumed,
                 layer_id, valid_n, my_rank, moe_epoch,
             )
 
@@ -432,64 +434,30 @@ def prefill_layer_core(
             # full-T write is safe even for a partial logical tail tile.
             x_next = pl.assemble(x_next, x_next_tile, [tile_base, 0, 0])
 
-    # Retire this dispatch's MoE signal counts before the next dispatch of the
-    # same graph (benchmark rounds, serving steady state): the windows are
-    # retained across dispatches and the counters are monotonic, so without
-    # this every >=-epoch wait of round 2+ is pre-satisfied by the previous
-    # rounds' counts and the inter-rank reuse throttle goes dead.
-    #
-    # The reset is an atomic SUBTRACTION of exactly the credits this
-    # dispatch's epochs deposit — not a write of zero. A zero-write would race
-    # any credit still in flight (the final epoch's moe_consumed notifies post
-    # after the reduce with no in-dispatch reader, and may land here after a
-    # bare clear, leaking counts into the next round — the flaw in the bare
-    # clear_moe_signals pattern). AtomicAdd commutes: whether a trailing
-    # credit lands before or after the matching subtraction, every row settles
-    # at exactly zero, with at most a transient negative that the signed >=
-    # waits of the next dispatch simply outwait. No quiesce wait is needed;
-    # the anchor read only orders this task behind the final output so the
-    # subtraction cannot run ahead of this dispatch's own >=-epoch waits.
-    # Per-epoch credit slopes (see moe.py): arrived remote rows 1, data_arrived
-    # remote rows N_LOCAL, combine_arrived remote rows N_LOCAL + 1 and self
-    # row 1; the self rows of arrived / data_arrived are never written.
+    # Quiesce every rank's final reduction marker before resetting this rank's
+    # inbound epoch slots for the next persistent dispatch. Once all consumed
+    # markers are visible, no meta/payload/result publisher from this dispatch
+    # can still write these local signal windows.
     last_req = user_batch - 1
     last_tiles = (pl.tensor.read(chunk_lens, [last_req]) + TOK_TILE - 1) // TOK_TILE
     total_epochs = pl.cast(pl.tensor.read(chunk_tile_offsets, [last_req]), pl.INDEX) \
         + pl.cast(last_tiles, pl.INDEX)
-    neg_epochs = pl.cast(0 - total_epochs, pl.INT32)
-    neg_data = pl.cast(0 - total_epochs * N_LOCAL, pl.INT32)
-    neg_combine = pl.cast(0 - total_epochs * (N_LOCAL + 1), pl.INT32)
+    final_epoch = pl.cast(total_epochs, pl.INT32)
     with pl.at(level=pl.Level.CORE_GROUP, name_hint="moe_signal_retire"):
         _x_next_anchor = pl.read(x_next, [0, 0, 0])
-        pld.system.notify(
-            target=combine_arrived,
-            peer=my_rank,
-            offsets=[my_rank, 0],
-            value=neg_epochs,
-            op=pld.NotifyOp.AtomicAdd,
-        )
         for src in pl.range(N_RANKS):
-            if src != my_rank:
+            pld.system.wait(signal=consumed, offsets=[src, 0], expected=final_epoch, cmp=pld.WaitCmp.Ge)
+        for src in pl.range(N_RANKS):
+            pld.system.notify(target=arrived, peer=my_rank, offsets=[src, 0], value=0, op=pld.NotifyOp.Set)
+            pld.system.notify(target=consumed, peer=my_rank, offsets=[src, 0], value=0, op=pld.NotifyOp.Set)
+            for e in pl.range(N_LOCAL):
                 pld.system.notify(
-                    target=arrived,
-                    peer=my_rank,
-                    offsets=[src, 0],
-                    value=neg_epochs,
-                    op=pld.NotifyOp.AtomicAdd,
+                    target=data_arrived, peer=my_rank, offsets=[src, e, 0],
+                    value=0, op=pld.NotifyOp.Set,
                 )
                 pld.system.notify(
-                    target=data_arrived,
-                    peer=my_rank,
-                    offsets=[src, 0],
-                    value=neg_data,
-                    op=pld.NotifyOp.AtomicAdd,
-                )
-                pld.system.notify(
-                    target=combine_arrived,
-                    peer=my_rank,
-                    offsets=[src, 0],
-                    value=neg_combine,
-                    op=pld.NotifyOp.AtomicAdd,
+                    target=combine_arrived, peer=my_rank, offsets=[src, e, 0],
+                    value=0, op=pld.NotifyOp.Set,
                 )
     return x_next
 
@@ -588,20 +556,22 @@ def l3_prefill_layer(
     recv_x_buf = pld.alloc_window_buffer([N_LOCAL * RECV_MAX, D], dtype=pl.INT8)
     recv_aux_buf = pld.alloc_window_buffer([N_LOCAL * RECV_MAX, AUX_PAD], dtype=pl.FP32)
     recv_route_buf = pld.alloc_window_buffer([N_LOCAL * RECV_MAX, IDX_PAD], dtype=pl.INT32)
-    arrived_buf = pld.alloc_window_buffer([N_RANKS, 1], dtype=pl.INT32)
-    data_arrived_buf = pld.alloc_window_buffer([N_RANKS, 1], dtype=pl.INT32)
+    arrived_buf = pld.alloc_window_buffer([N_RANKS, SIGNAL_PAD], dtype=pl.INT32)
+    data_arrived_buf = pld.alloc_window_buffer([N_RANKS, N_LOCAL, SIGNAL_PAD], dtype=pl.INT32)
     routed_y_buf_buf = pld.alloc_window_buffer([N_ROUTES, D], dtype=pl.BF16)
-    combine_arrived_buf = pld.alloc_window_buffer([N_RANKS, 1], dtype=pl.INT32)
+    combine_arrived_buf = pld.alloc_window_buffer([N_RANKS, N_LOCAL, SIGNAL_PAD], dtype=pl.INT32)
+    consumed_buf = pld.alloc_window_buffer([N_RANKS, SIGNAL_PAD], dtype=pl.INT32)
 
     for rank in pl.range(pld.world_size()):
         recv_meta = pld.window(recv_meta_buf, [N_RANKS, N_LOCAL], dtype=pl.INT32)
         recv_x = pld.window(recv_x_buf, [N_LOCAL * RECV_MAX, D], dtype=pl.INT8)
         recv_aux = pld.window(recv_aux_buf, [N_LOCAL * RECV_MAX, AUX_PAD], dtype=pl.FP32)
         recv_route = pld.window(recv_route_buf, [N_LOCAL * RECV_MAX, IDX_PAD], dtype=pl.INT32)
-        arrived = pld.window(arrived_buf, [N_RANKS, 1], dtype=pl.INT32)
-        data_arrived = pld.window(data_arrived_buf, [N_RANKS, 1], dtype=pl.INT32)
+        arrived = pld.window(arrived_buf, [N_RANKS, SIGNAL_PAD], dtype=pl.INT32)
+        data_arrived = pld.window(data_arrived_buf, [N_RANKS, N_LOCAL, SIGNAL_PAD], dtype=pl.INT32)
         routed_y_buf = pld.window(routed_y_buf_buf, [N_ROUTES, D], dtype=pl.BF16)
-        combine_arrived = pld.window(combine_arrived_buf, [N_RANKS, 1], dtype=pl.INT32)
+        combine_arrived = pld.window(combine_arrived_buf, [N_RANKS, N_LOCAL, SIGNAL_PAD], dtype=pl.INT32)
+        consumed = pld.window(consumed_buf, [N_RANKS, SIGNAL_PAD], dtype=pl.INT32)
         prefill_layer_core(
             x_hc[rank],
             seq_lens[rank], chunk_lens[rank], chunk_offsets[rank], chunk_tile_offsets[rank],
@@ -633,7 +603,7 @@ def l3_prefill_layer(
             shared_w2[rank], shared_w2_scale[rank],
             x_next[rank],
             recv_meta, recv_x, recv_aux, recv_route, arrived, data_arrived,
-            routed_y_buf, combine_arrived,
+            routed_y_buf, combine_arrived, consumed,
             layer_id, rank,
             device=rank,
         )

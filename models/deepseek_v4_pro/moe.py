@@ -81,6 +81,7 @@ AUX_SCALE = 0
 AUX_W = 1
 IDX_PAD = 8  # INT32 route tile width; route rides a separate window from scale/w
              # (an FP32 tile can't hold it: INDEX->FP32 casts are unsupported).
+SIGNAL_PAD = 128  # 512-byte isolation stride per independently published epoch slot
 
 assert N_RANKS in _EP_CHOICES, f"--ep must be one of {_EP_CHOICES} (got {N_RANKS})"
 assert N_EXPERTS_GLOBAL == N_RANKS * N_LOCAL
@@ -88,8 +89,8 @@ assert RECV_MAX == N_RANKS * MAX_PER_SRC
 
 
 # === Dispatch ================================================================
-# Lane push, count publish, arrival wait, and cumsum gather run in one
-# pl.at(CORE_GROUP) so program order stays push -> notify -> wait -> gather.
+# Explicit task dependencies order window reuse, metadata publication, payload
+# push, per-block readiness publication, and gather.
 @pl.jit.inline
 def dispatch(
     indices: pl.Tensor[[T, TOPK], pl.INT32],
@@ -108,12 +109,14 @@ def dispatch(
     recv_x: pld.DistributedTensor[[N_LOCAL * RECV_MAX, D], pl.INT8],
     recv_aux: pld.DistributedTensor[[N_LOCAL * RECV_MAX, AUX_PAD], pl.FP32],
     recv_route: pld.DistributedTensor[[N_LOCAL * RECV_MAX, IDX_PAD], pl.INT32],
-    arrived: pld.DistributedTensor[[N_RANKS, 1], pl.INT32],
-    data_arrived: pld.DistributedTensor[[N_RANKS, 1], pl.INT32],
-    combine_arrived: pl.InOut[pld.DistributedTensor[[N_RANKS, 1], pl.INT32]],
+    arrived: pld.DistributedTensor[[N_RANKS, SIGNAL_PAD], pl.INT32],
+    data_arrived: pld.DistributedTensor[[N_RANKS, N_LOCAL, SIGNAL_PAD], pl.INT32],
+    combine_arrived: pl.InOut[pld.DistributedTensor[[N_RANKS, N_LOCAL, SIGNAL_PAD], pl.INT32]],
+    consumed: pl.InOut[pld.DistributedTensor[[N_RANKS, SIGNAL_PAD], pl.INT32]],
     num_tokens: pl.Scalar[pl.INT32],
     my_rank: pl.Scalar[pl.INT32],
-    # 1-based MoE call id; `arrived`/`data_arrived` are monotonic so waits use `>= moe_epoch`.
+    # 1-based MoE call id; reused-window epoch slots stay monotonic for the
+    # lifetime of the worker.
     moe_epoch: pl.Scalar[pl.INT32],
 ):
     # Flat 2-D view kept outside the scope so it stays a tensor view, not a tile.
@@ -121,39 +124,52 @@ def dispatch(
 
     # All dispatch and combine payload windows are reused by every MoE call.
     # Before publishing epoch E, wait until every rank has consumed epoch E-1.
-    # Remote rows in combine_arrived gain N_LOCAL scatter credits plus one
-    # consumption credit per epoch.  The self row has only the consumption
-    # credit because local scatter is ordered by the task graph rather than a
-    # notify.  Keeping this wait in its own task prevents epoch E writers from
-    # clobbering a slow rank's epoch E-1 reads.
+    # Each source owns one padded epoch slot, so this gate has no shared-word
+    # atomic fan-in and cannot confuse payload readiness with window lifetime.
     with pl.at(level=pl.Level.CORE_GROUP, name_hint="moe_reuse_wait") as _reuse_tid:
         _indices_anchor = pl.read(indices, [0, 0])
         if moe_epoch > 1:
-            pld.system.wait(
-                signal=combine_arrived,
-                offsets=[my_rank, 0],
-                expected=pl.cast(moe_epoch - 1, pl.INT32),
-                cmp=pld.WaitCmp.Ge,
-            )
-            remote_consumed = pl.cast((moe_epoch - 1) * (N_LOCAL + 1), pl.INT32)
             for src in pl.range(N_RANKS):
-                if src != my_rank:
-                    pld.system.wait(
-                        signal=combine_arrived,
-                        offsets=[src, 0],
-                        expected=remote_consumed,
-                        cmp=pld.WaitCmp.Ge,
-                    )
+                pld.system.wait(
+                    signal=consumed, offsets=[src, 0],
+                    expected=pl.cast(moe_epoch - 1, pl.INT32), cmp=pld.WaitCmp.Ge,
+                )
 
     # Meta and payload arrivals ride two independent windows (`arrived` /
-    # `data_arrived`), each single-bump with expected=moe_epoch. That lets the two
-    # phases barrier separately with no ordering between them: peers publish
-    # per-expert counts on `arrived` so recv_count_out is ready after just the meta
-    # barrier, while the bulk payload rides `data_arrived` and overlaps freely.
+    # `data_arrived`). Each producer publishes its current epoch into a unique
+    # padded slot, so metadata can gate route construction without waiting for
+    # the bulk payload barrier or contending on a shared counter.
+
+    # Stage meta and payload rows locally so their remote publications can use
+    # self-draining tensor puts before the matching notifications are issued.
+    aux_src = pl.create_tensor([N_ROUTES, AUX_PAD], dtype=pl.FP32)
+    route_src = pl.create_tensor([N_ROUTES, IDX_PAD], dtype=pl.INT32)
+
+    with pl.at(level=pl.Level.CORE_GROUP, name_hint="dispatch_stage", deps=[_reuse_tid]) as _stage_tid:
+        active_tokens = pl.cast(num_tokens, pl.INDEX)
+        if active_tokens < 0:
+            active_tokens = pl.cast(0, pl.INDEX)
+        if active_tokens > T:
+            active_tokens = pl.cast(T, pl.INDEX)
+        for t in pl.range(active_tokens):
+            for k in pl.range(TOPK):
+                r = t * TOPK + k
+                aux_tile = pl.tile.full([1, AUX_PAD], dtype=pl.FP32, value=0.0)
+                aux_scale = pl.read(x_norm_scale, [t, 0])
+                aux_weight = pl.read(weights, [t, k])
+                pl.tile.write(aux_tile, [0, AUX_SCALE], aux_scale)
+                pl.tile.write(aux_tile, [0, AUX_W], aux_weight)
+                pl.store(aux_tile, [r, 0], aux_src)
+
+                route_tile = pl.tile.full([1, IDX_PAD], dtype=pl.INT32, value=0)
+                route_index = pl.cast(r, pl.INT32)
+                pl.tile.write(route_tile, [0, 0], route_index)
+                pl.store(route_tile, [r, 0], route_src)
 
     # Phase 1: count routes, publish counts, barrier on meta only, then cumsum ->
     # recv_count_out. Earliest recv_count_out can be produced -- it needs every
     # source's counts but none of the bulk payload.
+    meta_rows = pl.create_tensor([N_RANKS, N_LOCAL], dtype=pl.INT32)
     with pl.at(
         level=pl.Level.CORE_GROUP,
         name_hint="dispatch_meta",
@@ -178,43 +194,53 @@ def dispatch(
                 loc_e = eid - dst * N_LOCAL
                 cursor[dst * N_LOCAL + loc_e] = cursor[dst * N_LOCAL + loc_e] + 1
 
-        # One meta row per dst (all N_LOCAL counts, zeros included), then bump the
-        # per-source arrival counter. AtomicAdd(1) is order-independent across the
-        # reused window, so a late notify from an earlier epoch cannot clobber it.
-        meta_tile = pl.tile.full([1, N_LOCAL], dtype=pl.INT32, value=0)
+        # One meta row per dst (all N_LOCAL counts, zeros included), followed by
+        # the unique source's epoch publication into the destination window.
         for dst in pl.range(N_RANKS):
             for e in pl.range(N_LOCAL):
-                pl.tile.write(meta_tile, [0, e], cursor[dst * N_LOCAL + e])
-            pld.tile.remote_store(meta_tile, target=recv_meta, peer=dst, offsets=[my_rank, 0])
+                pl.write(meta_rows, [dst, e], cursor[dst * N_LOCAL + e])
+        # Publish scalar GM writes before MTE2 reloads them for remote puts.
+        pl.system.cacheinvalid()
+        pl.system.fence()
+        for dst in pl.range(N_RANKS):
+            pld.tensor.put(
+                dst=recv_meta, peer=dst, src=meta_rows,
+                dst_offsets=[my_rank, 0], src_offsets=[dst, 0], shape=[1, N_LOCAL],
+            )
             if dst != my_rank:
                 pld.system.notify(
-                    target=arrived,
-                    peer=dst,
-                    offsets=[my_rank, 0],
-                    value=1,
-                    op=pld.NotifyOp.AtomicAdd,
+                    target=arrived, peer=dst, offsets=[my_rank, 0],
+                    value=moe_epoch, op=pld.NotifyOp.Set,
                 )
 
         # Wait for every source's meta flag.
         for src in pl.range(N_RANKS):
             if src != my_rank:
-                pld.system.wait(
-                    signal=arrived,
-                    offsets=[src, 0],
-                    expected=moe_epoch,
-                    cmp=pld.WaitCmp.Ge,
-                )
+                pld.system.wait(signal=arrived, offsets=[src, 0], expected=moe_epoch, cmp=pld.WaitCmp.Ge)
 
         # Cumsum recv_meta over sources -> per-expert receive count. The host reads
         # recv_count_out to size the routed-expert tile loop; producing it here lets
         # the host start submitting routed matmuls while the payload is still moving.
+        zero_count = pl.const(0, pl.INT32)
+        lane_capacity = pl.const(MAX_PER_SRC, pl.INT32)
+        recv_capacity = pl.const(RECV_MAX, pl.INT32)
         for e in pl.range(N_LOCAL):
-            acc = pl.const(0, pl.INT32)
-            for src in pl.range(N_RANKS):
-                count = pl.read(recv_meta, [src, e])
+            for src, (acc,) in pl.range(N_RANKS, init_values=(zero_count,)):
+                raw_count = pl.read(recv_meta, [src, e])
+                remaining = recv_capacity - acc
+                nonnegative = raw_count >= zero_count
+                within_lane = raw_count <= lane_capacity
+                within_total = raw_count <= remaining
+                valid_lane = nonnegative and within_lane
+                valid_count = valid_lane and within_total
+                if valid_count:
+                    count = pl.yield_(raw_count)
+                else:
+                    count = pl.yield_(zero_count)
                 pl.write(recv_meta_local, [src, e], count)
-                acc = acc + count
-            pl.write(recv_count_out, [e, 0], acc)
+                next_acc = acc + count
+                final_count = pl.yield_(next_acc)
+            pl.write(recv_count_out, [e, 0], final_count)
 
     # Phase 2: move the bulk payload (x / aux / route) to each destination lane.
     # Rides its own `data_arrived` window, so it needs no ordering against the meta
@@ -224,7 +250,7 @@ def dispatch(
     # across N_LOCAL cores. One slot counter per destination rank; token-major
     # order matches the meta pass's per-(dst, loc_e) cumulative count, so the
     # padded lane layout the gather compacts is identical to the single-block push.
-    with pl.spmd(N_LOCAL, name_hint="dispatch_push", deps=[_reuse_tid]) as _push_tid:
+    with pl.spmd(N_LOCAL, name_hint="dispatch_push", deps=[_reuse_tid, _stage_tid]) as _push_tid:
         loc_e = pl.tile.get_block_idx()
         active_tokens = pl.cast(num_tokens, pl.INDEX)
         if active_tokens < 0:
@@ -237,9 +263,6 @@ def dispatch(
             slot_ctr[d] = 0
         e_lane_base = loc_e * RECV_MAX + my_rank * MAX_PER_SRC
 
-        # Pad tiles zeroed once; used cols overwritten per push, then remote_store.
-        aux_tile = pl.tile.full([1, AUX_PAD], dtype=pl.FP32, value=0.0)
-        route_tile = pl.tile.full([1, IDX_PAD], dtype=pl.INT32, value=0)
         for t in pl.range(active_tokens):
             for k in pl.range(TOPK):
                 eid = pl.read(indices, [t, k])
@@ -250,57 +273,40 @@ def dispatch(
                     slot_ctr[dst] = slot + 1
                     # lane (loc_e, my_rank, slot) on peer=dst
                     row = e_lane_base + slot
+                    r_route = t * TOPK + k
                     pld.tensor.put(
-                        dst=recv_x,
-                        peer=dst,
-                        src=x_norm_i8,
-                        dst_offsets=[row, 0],
-                        src_offsets=[t, 0],
-                        shape=[1, D],
+                        dst=recv_x, peer=dst, src=x_norm_i8,
+                        dst_offsets=[row, 0], src_offsets=[t, 0], shape=[1, D],
                     )
-                    pl.tile.write(aux_tile, [0, AUX_SCALE], pl.read(x_norm_scale, [t, 0]))
-                    pl.tile.write(aux_tile, [0, AUX_W], pl.read(weights, [t, k]))
-                    pld.tile.remote_store(aux_tile, target=recv_aux, peer=dst, offsets=[row, 0])
-                    pl.tile.write(route_tile, [0, 0], pl.cast(t * TOPK + k, pl.INT32))
-                    pld.tile.remote_store(route_tile, target=recv_route, peer=dst, offsets=[row, 0])
+                    pld.tensor.put(
+                        dst=recv_aux, peer=dst, src=aux_src,
+                        dst_offsets=[row, 0], src_offsets=[r_route, 0], shape=[1, AUX_PAD],
+                    )
+                    pld.tensor.put(
+                        dst=recv_route, peer=dst, src=route_src,
+                        dst_offsets=[row, 0], src_offsets=[r_route, 0], shape=[1, IDX_PAD],
+                    )
 
-        # Fold the payload-arrival notify into the push. Each of the N_LOCAL push
-        # blocks signals every peer once after its own puts, so a peer accumulates
-        # N_LOCAL notifies per source per epoch (the wait below expects
-        # N_LOCAL * moe_epoch). The count reaching that threshold means all N_LOCAL
-        # blocks of the source finished their puts, so its payload has fully landed
-        # -- no separate post-push notify task and no cross-block barrier needed.
-        # recv_x rides a self-draining TPUT, while recv_aux / recv_route ride
-        # remote_store (TSTORE). InsertCommFence supplies the publishing fence
-        # before these notifies; the peer counter then gates gather until every
-        # source block has published all of its payload stores.
+        # Publish this block's epoch only after its self-draining payload puts.
+        # One cache-line-padded slot per source/block avoids shared-word and
+        # false-sharing races between the N_LOCAL producers.
         for dst in pl.range(N_RANKS):
             if dst != my_rank:
                 pld.system.notify(
-                    target=data_arrived,
-                    peer=dst,
-                    offsets=[my_rank, 0],
-                    value=1,
-                    op=pld.NotifyOp.AtomicAdd,
+                    target=data_arrived, peer=dst, offsets=[my_rank, loc_e, 0],
+                    value=moe_epoch, op=pld.NotifyOp.Set,
                 )
 
-    # Payload-arrival wait only (the notify now rides inside dispatch_push). Depend
-    # on dispatch_meta so this wait cannot be scheduled before the route-producing
-    # work for this MoE invocation. A source's counter reaching
-    # N_LOCAL * moe_epoch means all its push blocks have completed.
-    with pl.at(
-        level=pl.Level.CORE_GROUP,
-        name_hint="dispatch_wait",
-        deps=[_meta_tid],
-        allow_early_resolve=True,
-    ) as _wait_tid:
+    # Each wait block covers the matching producer slot from every remote rank.
+    # The whole-grid TaskId then gates gather without serializing 224 waits on
+    # one core or allowing a waiting first wave to starve unscheduled producers.
+    with pl.spmd(N_LOCAL, name_hint="dispatch_wait", deps=[_meta_tid, _push_tid]) as _wait_tid:
+        loc_e = pl.tile.get_block_idx()
         for src in pl.range(N_RANKS):
             if src != my_rank:
                 pld.system.wait(
-                    signal=data_arrived,
-                    offsets=[src, 0],
-                    expected=pl.cast(moe_epoch * N_LOCAL, pl.INT32),
-                    cmp=pld.WaitCmp.Ge,
+                    signal=data_arrived, offsets=[src, loc_e, 0],
+                    expected=moe_epoch, cmp=pld.WaitCmp.Ge,
                 )
 
     # Gather lanes into the compact per-expert buffers: one SPMD block per local
@@ -359,7 +365,8 @@ def combine(
     ffn_out: pl.Tensor[[T, D], pl.BF16],
     recv_meta_local: pl.Tensor[[N_RANKS, N_LOCAL], pl.INT32],
     routed_y_buf: pld.DistributedTensor[[T * TOPK, D], pl.BF16],
-    combine_arrived: pl.InOut[pld.DistributedTensor[[N_RANKS, 1], pl.INT32]],
+    combine_arrived: pl.InOut[pld.DistributedTensor[[N_RANKS, N_LOCAL, SIGNAL_PAD], pl.INT32]],
+    consumed: pl.InOut[pld.DistributedTensor[[N_RANKS, SIGNAL_PAD], pl.INT32]],
     num_tokens: pl.Scalar[pl.INT32],
     my_rank: pl.Scalar[pl.INT32],
     moe_epoch: pl.Scalar[pl.INT32],
@@ -377,42 +384,28 @@ def combine(
                 out_col = b + slot
                 r_route = pl.cast(pl.read(recv_r_route_out, [e, out_col]), pl.INDEX)
                 pld.tensor.put(
-                    dst=routed_y_buf,
-                    peer=src,
-                    src=recv_y_flat,
-                    dst_offsets=[r_route, 0],
-                    src_offsets=[e_base_row + out_col, 0],
-                    shape=[1, D],
+                    dst=routed_y_buf, peer=src, src=recv_y_flat,
+                    dst_offsets=[r_route, 0], src_offsets=[e_base_row + out_col, 0], shape=[1, D],
                 )
             b = b + n
 
-        # Each scatter block signals every peer after its own TPUTs drain, so the
-        # reused counter advances by N_LOCAL for each MoE epoch.
+        # Publish this block's epoch only after its self-draining result puts.
         for peer in pl.range(N_RANKS):
             if peer != my_rank:
                 pld.system.notify(
-                    target=combine_arrived,
-                    peer=peer,
-                    offsets=[my_rank, 0],
-                    value=1,
-                    op=pld.NotifyOp.AtomicAdd,
+                    target=combine_arrived, peer=peer, offsets=[my_rank, e, 0],
+                    value=moe_epoch, op=pld.NotifyOp.Set,
                 )
 
-    with pl.at(
-        level=pl.Level.CORE_GROUP,
-        name_hint="combine_wait",
-        deps=[_cscatter_tid],
-    ) as _cwait_tid:
+    # Match each scatter producer with an independent wait block. The full-grid
+    # dependency proves every remote result row is published before reduction.
+    with pl.spmd(N_LOCAL, name_hint="combine_wait", deps=[_cscatter_tid]) as _cwait_tid:
+        e = pl.tile.get_block_idx()
         for src in pl.range(N_RANKS):
             if src != my_rank:
                 pld.system.wait(
-                    signal=combine_arrived,
-                    offsets=[src, 0],
-                    # Each completed prior epoch contributes N_LOCAL scatter
-                    # credits plus one consumption credit.  For this epoch,
-                    # only the N_LOCAL scatter credits are required here.
-                    expected=pl.cast((moe_epoch - 1) * (N_LOCAL + 1) + N_LOCAL, pl.INT32),
-                    cmp=pld.WaitCmp.Ge,
+                    signal=combine_arrived, offsets=[src, e, 0],
+                    expected=moe_epoch, cmp=pld.WaitCmp.Ge,
                 )
 
     # ffn_out[t] = sh[t] + Sigma_k routed_y_buf[t*TOPK+k]. The wait orders
@@ -432,17 +425,14 @@ def combine(
     )
 
     # A reused routed-result window is safe to overwrite only after every
-    # reduction block has finished reading it.  The captured SPMD TaskId is a
-    # whole-grid join, unlike an element read from ffn_out.  Publish one credit
-    # per epoch to every rank; dispatch of epoch E+1 waits for this credit.
+    # reduction block has finished reading it. The captured SPMD TaskId is a
+    # whole-grid join. Publish the completed epoch into this rank's unique
+    # consumed slot on every peer; dispatch E+1 waits for all of them.
     with pl.at(level=pl.Level.CORE_GROUP, name_hint="moe_consumed", deps=[_reduce_tid]):
         for peer in pl.range(N_RANKS):
             pld.system.notify(
-                target=combine_arrived,
-                peer=peer,
-                offsets=[my_rank, 0],
-                value=1,
-                op=pld.NotifyOp.AtomicAdd,
+                target=consumed, peer=peer, offsets=[my_rank, 0],
+                value=moe_epoch, op=pld.NotifyOp.Set,
             )
 
 
@@ -477,10 +467,11 @@ def moe(
     recv_x: pld.DistributedTensor[[N_LOCAL * RECV_MAX, D], pl.INT8],
     recv_aux: pld.DistributedTensor[[N_LOCAL * RECV_MAX, AUX_PAD], pl.FP32],
     recv_route: pld.DistributedTensor[[N_LOCAL * RECV_MAX, IDX_PAD], pl.INT32],
-    arrived: pld.DistributedTensor[[N_RANKS, 1], pl.INT32],
-    data_arrived: pld.DistributedTensor[[N_RANKS, 1], pl.INT32],
+    arrived: pld.DistributedTensor[[N_RANKS, SIGNAL_PAD], pl.INT32],
+    data_arrived: pld.DistributedTensor[[N_RANKS, N_LOCAL, SIGNAL_PAD], pl.INT32],
     routed_y_buf: pld.DistributedTensor[[N_ROUTES, D], pl.BF16],
-    combine_arrived: pl.InOut[pld.DistributedTensor[[N_RANKS, 1], pl.INT32]],
+    combine_arrived: pl.InOut[pld.DistributedTensor[[N_RANKS, N_LOCAL, SIGNAL_PAD], pl.INT32]],
+    consumed: pl.InOut[pld.DistributedTensor[[N_RANKS, SIGNAL_PAD], pl.INT32]],
     # scalars last: runtime TaskArgs forbids a tensor arg after a scalar arg.
     layer_id: pl.Scalar[pl.INT32],
     num_tokens: pl.Scalar[pl.INT32],
@@ -527,7 +518,7 @@ def moe(
     dispatch(
         indices, x_norm_i8, x_norm_scale, weights,
         recv_x_out, recv_scale_out, recv_w_out, recv_r_route_out, recv_count_out, recv_meta_local,
-        recv_meta, recv_x, recv_aux, recv_route, arrived, data_arrived, combine_arrived,
+        recv_meta, recv_x, recv_aux, recv_route, arrived, data_arrived, combine_arrived, consumed,
         num_tokens, my_rank, moe_epoch,
     )
 
@@ -544,7 +535,7 @@ def moe(
         combine(
             recv_y, recv_r_route_out, sh,
             ffn_out, recv_meta_local,
-            routed_y_buf, combine_arrived,
+            routed_y_buf, combine_arrived, consumed,
             num_tokens, my_rank, moe_epoch,
         )
 
@@ -583,10 +574,11 @@ def moe_test(
     recv_x: pld.DistributedTensor[[N_LOCAL * RECV_MAX, D], pl.INT8],
     recv_aux: pld.DistributedTensor[[N_LOCAL * RECV_MAX, AUX_PAD], pl.FP32],
     recv_route: pld.DistributedTensor[[N_LOCAL * RECV_MAX, IDX_PAD], pl.INT32],
-    arrived: pld.DistributedTensor[[N_RANKS, 1], pl.INT32],
-    data_arrived: pld.DistributedTensor[[N_RANKS, 1], pl.INT32],
+    arrived: pld.DistributedTensor[[N_RANKS, SIGNAL_PAD], pl.INT32],
+    data_arrived: pld.DistributedTensor[[N_RANKS, N_LOCAL, SIGNAL_PAD], pl.INT32],
     routed_y_buf: pld.DistributedTensor[[N_ROUTES, D], pl.BF16],
-    combine_arrived: pl.InOut[pld.DistributedTensor[[N_RANKS, 1], pl.INT32]],
+    combine_arrived: pl.InOut[pld.DistributedTensor[[N_RANKS, N_LOCAL, SIGNAL_PAD], pl.INT32]],
+    consumed: pl.InOut[pld.DistributedTensor[[N_RANKS, SIGNAL_PAD], pl.INT32]],
     # scalars last: runtime TaskArgs forbids a tensor arg after a scalar arg.
     layer_id: pl.Scalar[pl.INT32],
     num_tokens: pl.Scalar[pl.INT32],
@@ -603,7 +595,7 @@ def moe_test(
         shared_w2, shared_w2_scale,
         x_next,
         recv_meta, recv_x, recv_aux, recv_route, arrived, data_arrived,
-        routed_y_buf, combine_arrived,
+        routed_y_buf, combine_arrived, consumed,
         layer_id, num_tokens, my_rank, moe_epoch,
     )
     return x_next
@@ -635,25 +627,28 @@ def l3_moe(
     x_next: pl.Out[pl.Tensor[[N_RANKS, T, HC_MULT, D], pl.FP32]],
     layer_id: pl.Scalar[pl.INT32],
     num_tokens: pl.Scalar[pl.INT32],
+    moe_epoch: pl.Scalar[pl.INT32],
 ):
     recv_meta_buf = pld.alloc_window_buffer([N_RANKS, N_LOCAL], dtype=pl.INT32)
     recv_x_buf = pld.alloc_window_buffer([N_LOCAL * RECV_MAX, D], dtype=pl.INT8)
     recv_aux_buf = pld.alloc_window_buffer([N_LOCAL * RECV_MAX, AUX_PAD], dtype=pl.FP32)
     recv_route_buf = pld.alloc_window_buffer([N_LOCAL * RECV_MAX, IDX_PAD], dtype=pl.INT32)
-    arrived_buf = pld.alloc_window_buffer([N_RANKS, 1], dtype=pl.INT32)
-    data_arrived_buf = pld.alloc_window_buffer([N_RANKS, 1], dtype=pl.INT32)
+    arrived_buf = pld.alloc_window_buffer([N_RANKS, SIGNAL_PAD], dtype=pl.INT32)
+    data_arrived_buf = pld.alloc_window_buffer([N_RANKS, N_LOCAL, SIGNAL_PAD], dtype=pl.INT32)
     routed_y_buf_buf = pld.alloc_window_buffer([N_ROUTES, D], dtype=pl.BF16)
-    combine_arrived_buf = pld.alloc_window_buffer([N_RANKS, 1], dtype=pl.INT32)
+    combine_arrived_buf = pld.alloc_window_buffer([N_RANKS, N_LOCAL, SIGNAL_PAD], dtype=pl.INT32)
+    consumed_buf = pld.alloc_window_buffer([N_RANKS, SIGNAL_PAD], dtype=pl.INT32)
 
     for r in pl.range(pld.world_size()):
         recv_meta = pld.window(recv_meta_buf, [N_RANKS, N_LOCAL], dtype=pl.INT32)
         recv_x = pld.window(recv_x_buf, [N_LOCAL * RECV_MAX, D], dtype=pl.INT8)
         recv_aux = pld.window(recv_aux_buf, [N_LOCAL * RECV_MAX, AUX_PAD], dtype=pl.FP32)
         recv_route = pld.window(recv_route_buf, [N_LOCAL * RECV_MAX, IDX_PAD], dtype=pl.INT32)
-        arrived = pld.window(arrived_buf, [N_RANKS, 1], dtype=pl.INT32)
-        data_arrived = pld.window(data_arrived_buf, [N_RANKS, 1], dtype=pl.INT32)
+        arrived = pld.window(arrived_buf, [N_RANKS, SIGNAL_PAD], dtype=pl.INT32)
+        data_arrived = pld.window(data_arrived_buf, [N_RANKS, N_LOCAL, SIGNAL_PAD], dtype=pl.INT32)
         routed_y_buf = pld.window(routed_y_buf_buf, [N_ROUTES, D], dtype=pl.BF16)
-        combine_arrived = pld.window(combine_arrived_buf, [N_RANKS, 1], dtype=pl.INT32)
+        combine_arrived = pld.window(combine_arrived_buf, [N_RANKS, N_LOCAL, SIGNAL_PAD], dtype=pl.INT32)
+        consumed = pld.window(consumed_buf, [N_RANKS, SIGNAL_PAD], dtype=pl.INT32)
         moe_test(
             x_hc[r], hc_ffn_fn[r], hc_ffn_scale[r], hc_ffn_base[r],
             norm_w[r], gate_w[r], gate_bias[r], tid2eid[r], input_ids[r],
@@ -663,8 +658,8 @@ def l3_moe(
             shared_w2[r], shared_w2_scale[r],
             x_next[r],
             recv_meta, recv_x, recv_aux, recv_route, arrived, data_arrived,
-            routed_y_buf, combine_arrived,
-            layer_id, num_tokens, r, pl.const(1, pl.INT32),
+            routed_y_buf, combine_arrived, consumed,
+            layer_id, num_tokens, r, moe_epoch,
             device=r,
         )
 
@@ -1004,6 +999,7 @@ def build_tensor_specs(layer_id=0, num_tokens=T, balanced_routing=False):
         TensorSpec("x_next",           [N_RANKS, T, HC_MULT, D],      torch.float32, is_output=True),
         ScalarSpec("layer_id",         torch.int32,                      layer_id),
         ScalarSpec("num_tokens",       torch.int32,                      num_tokens),
+        ScalarSpec("moe_epoch", torch.int32, 1, compile_runtime=True, benchmark_step=1),
     ]
 
     # Keep the static weight parameters device-resident (child_memory), sharded

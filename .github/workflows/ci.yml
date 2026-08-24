@@ -48,8 +48,8 @@ jobs:
           pip install pytest
           pip install torch --index-url https://download.pytorch.org/whl/cpu
 
-      - name: Run golden unit tests
-        run: pytest tests/golden -v
+      - name: Run golden and DeepSeek protocol unit tests
+        run: pytest tests/golden tests/contract/test_deepseek_v4_pro_moe_protocol.py -v
 
   detect-changes:
     runs-on: ubuntu-latest

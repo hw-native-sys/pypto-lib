@@ -43,6 +43,10 @@ def _install_pypto_stubs() -> None:
         Ascend910B = "Ascend910B"
         Ascend950 = "Ascend950"
 
+    class RunConfig:
+        def __init__(self, **kwargs):
+            self.kwargs = kwargs
+
     class _TypeSpec:
         @classmethod
         def __class_getitem__(cls, _item):
@@ -80,6 +84,7 @@ def _install_pypto_stubs() -> None:
         "UINT32",
     ):
         setattr(language, name, object())
+    language.RUNTIME = object()
     language.dynamic = lambda name: name
     language.jit = _identity_jit
 
@@ -88,6 +93,7 @@ def _install_pypto_stubs() -> None:
     # exploding when a test doesn't care.
     ir.compile = _unavailable
     runtime.execute_compiled = _unavailable
+    runtime.RunConfig = RunConfig
     log_config.configure_log = lambda *_a, **_k: None
     replay.invalidate_binary_cache = lambda *_a, **_k: None
     pto_rebuild.rebuild_kernel_cpp_from_pto = lambda *_a, **_k: []

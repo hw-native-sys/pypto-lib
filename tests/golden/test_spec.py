@@ -187,6 +187,45 @@ class TestScalarSpecConstruction:
         for dtype, value in sample_value.items():
             ScalarSpec("x", dtype, value)
 
+    def test_compile_runtime_is_explicit_and_defaults_off(self):
+        assert ScalarSpec("constant", torch.int32, 7).compile_runtime is False
+        assert (
+            ScalarSpec("epoch", torch.int32, 0, compile_runtime=True).compile_runtime
+            is True
+        )
+
+    @pytest.mark.parametrize("value", [1, None, "yes"])
+    def test_compile_runtime_requires_bool(self, value):
+        with pytest.raises(ValueError, match="compile_runtime must be a bool"):
+            ScalarSpec("epoch", torch.int32, 0, compile_runtime=value)
+
+    def test_benchmark_step_advances_from_initial_value(self):
+        spec = ScalarSpec("epoch", torch.int32, 2, benchmark_step=43)
+        assert spec.has_benchmark_step
+        assert spec.value_for_benchmark_dispatch(0) is spec.value
+        assert spec.value_for_benchmark_dispatch(1).item() == 45
+        assert spec.value_for_benchmark_dispatch(4).item() == 174
+
+    def test_zero_benchmark_step_is_constant(self):
+        spec = ScalarSpec("epoch", torch.int32, 7, benchmark_step=0)
+        assert not spec.has_benchmark_step
+        assert spec.value_for_benchmark_dispatch(9) is spec.value
+
+    def test_bool_benchmark_step_rejected(self):
+        with pytest.raises(ValueError, match="benchmark_step is unsupported"):
+            ScalarSpec("flag", torch.bool, False, benchmark_step=1)
+
+    @pytest.mark.parametrize("dispatch_index", [-1, True, 1.5])
+    def test_benchmark_dispatch_index_rejected(self, dispatch_index):
+        spec = ScalarSpec("epoch", torch.int32, 0, benchmark_step=43)
+        with pytest.raises(ValueError, match="dispatch_index"):
+            spec.value_for_benchmark_dispatch(dispatch_index)
+
+    def test_benchmark_step_overflow_rejected_at_dispatch(self):
+        spec = ScalarSpec("epoch", torch.int8, 120, benchmark_step=10)
+        with pytest.raises(ValueError, match="out of range"):
+            spec.value_for_benchmark_dispatch(1)
+
 
 class TestScalarSpecToCtypes:
     """ScalarSpec.to_ctypes returns a ctypes._SimpleCData instance with the

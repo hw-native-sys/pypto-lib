@@ -157,10 +157,10 @@ Numeric validation on real weights:
   plus greedy-sample agreement; per-element gates on deep hidden states and
   compressor state pools accumulate cross-layer drift and are expected to
   need looser budgets than the single-layer drivers. RoPE tables, the
-indexer Hadamard, caches, and per-step metadata keep their fixture
-initializers. The drivers stay smoke-only (`golden_fn=None`): a real-weight
-run validates that the network executes with real dynamic ranges and produces
-finite logits/sensible tokens, not a golden comparison.
+  indexer Hadamard, caches, and per-step metadata keep their fixture
+  initializers. The drivers stay smoke-only (`golden_fn=None`): a real-weight
+  run validates that the network executes with real dynamic ranges and produces
+  finite logits/sensible tokens, not a golden comparison.
 
 Golden data can be computed once and replayed: `prefill_fwd.py --validate
 --save-data` persists the generated inputs and golden outputs under
@@ -182,41 +182,52 @@ sampled ids are detokenized at the end. Decoding stops early when
 `--eos-id` (default 1) is sampled. Without `--weights` the loop keeps its
 synthetic zero-weight control-path behavior.
 
-The EP8 example carries the two workaround flags the caveats below explain
-(`--prefill-tokens 16 --prefill-no-retire`); at EP2 neither is needed:
+The EP8 example uses the fixed 128-row prefill capacity; active rows follow the
+encoded prompt length:
 
 ```bash
 python models/deepseek_v4_pro/synthetic_token_loop.py --variant flash \
     --ep 8 --tp 2 -d 0,1,2,3,4,5,6,7 \
-    --prefill-tokens 16 --prefill-no-retire \
     --weights build_output/flash_weights_ep8_tp2 \
     --tokenizer /path/to/DeepSeek-V4-Flash/tokenizer.json \
     --prompt "The capital of France is" --decode-steps 32
 ```
 
-Two EP8 caveats, pending a proper fix:
+The full prefill and decode programs carry runtime `num_tokens` and
+`moe_epoch_base` scalars in their compiled ABI. Their `ScalarSpec`s use
+`compile_runtime=True`, so `run_jit` passes `pl.RUNTIME` during
+signature-driven compilation instead of folding the initial values into
+generated task arguments. `num_tokens` follows the real prompt/decode row
+count, while callers advance the epoch scalar by
+`LAST_MOE_EPOCH` for every physical dispatch on a persistent worker.
 
-- The `moe_signal_retire` scope can deadlock an EP8 dispatch
-  (`SCHEDULER_TIMEOUT`): its single-element anchor orders the negative
-  credits only after the task writing `pre_hc_hidden_out[0, 0, 0]`, so they
-  can land while later waits of the same dispatch are still pending. The
-  trace-time knob `DSV4_DISABLE_MOE_RETIRE=1` compiles a forward without
-  the scope; the loop's `--prefill-no-retire` sets it for the prefill
-  compile only. Prefill's un-retired credits did not disturb the following
-  decode steps in testing, while multi-step decode does require its own
-  retirement (without it, decode produced non-finite logits on part of the
-  ranks by the second step) — so decode keeps the scope.
-- An EP8 prefill compiled at `--num-tokens 128` stalls on-device
-  (`S1:running-stalled` on the same task id on every rank); the same source
-  at `--num-tokens 16` runs. The loop's `--prefill-tokens 16` compiles the
-  prefill at that extent — the prompt (including BOS) must then fit in 16
-  tokens. Keep the extent small until the stall is root-caused (EP2 at 128
-  and EP8 at 6/16 both run).
+MoE payload readiness uses one cache-line-padded epoch slot per source and
+producer block. Each dispatch or combine block stores its current epoch with
+`Set` only after that block's self-draining tensor puts; a separate whole-grid
+wait observes every remote slot with `>= epoch` before gather or reduction.
+A separate per-rank `consumed` epoch is published after the complete reduction,
+and the next MoE invocation waits for every rank to consume the previous epoch
+before reusing payload windows. This avoids shared-counter atomic fan-in,
+detached notifications, and mixed readiness/lifetime credit arithmetic. The
+full forwards, standalone MoE, and decode-layer driver keep these epochs
+monotonic for the lifetime of their persistent program. The packed
+prefill-layer and fixed-epoch MTP drivers instead quiesce all final consumed
+markers and clear only their own inbound slots before a later synchronous
+dispatch.
+
+Both full programs must be recompiled when moving from an older artifact. The
+token loop rejects artifacts that omit the runtime scalar or whose generated
+`host_orch.py` does not forward it through `TaskArgs.add_scalar`. After a
+timeout or partial dispatch failure, callers must discard the worker and its
+persistent windows rather than retrying with a guessed epoch.
+
+The prefill RoPE paths use fixed even/odd lane gather and scatter operations for
+adjacent-lane permutations instead of synthesizing tile-local index tensors.
 
 The [daily model workflow](../../.github/workflows/daily_ci.yml) runs this
 EP8 loop nightly on the A5 runner (job `e2e-flash-a5`: real
-DeepSeek-V4-Flash weights, `--prefill-tokens 16 --prefill-no-retire`,
-32 greedy decode steps from the prompt "The capital of France is") and
+DeepSeek-V4-Flash weights, fixed 128-row prefill capacity with active rows set
+from the prompt, and 32 greedy decode steps from "The capital of France is") and
 publishes the prompt and the generated text in the run summary under
 "Daily CI Model Test Results", so a reviewer can read the continuation
 every day instead of a pass/fail tick. The runner finds the checkpoint
