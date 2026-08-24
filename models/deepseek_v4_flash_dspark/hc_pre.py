@@ -48,13 +48,13 @@ HC_PAD = 8  # hc (4) padded for 32B-aligned vector ops
 
 
 # tiling (unchanged)
-T_TILE = 8  # vector row-tile (RMS / cast / split / mix_x)
+T_TILE = 8  # vector row-tile (RMS / cast / split / mix_x); other values miscompare
 LINEAR_T_TILE = 16  # cube matmul rows must be a 16-row boxed tile
 COMB_T_TILE = 8  # sinkhorn row-tile
 RMS_K_CHUNK = 512  # cast / rms K-fragment
 LINEAR_K_CHUNK = 256  # cube K-fragment per matmul_acc (32x256x4 FP32 weight fits L0B)
 D_CHUNK = 256  # mix_x inner D-fragment (BF16 load = 1KB, 512B-aligned)
-D_SPMD = 1024  # mix_x D per spmd block: decode fans 4096 reduce over D/D_SPMD cores
+D_SPMD = 4096  # mix_x D per spmd block: one task per token-tile covers all of D
 CAST_K_SPMD = 2048  # cast K per spmd block: decode fans the BF16->FP32 cast over HC_DIM/CAST_K_SPMD cores
 # Split the K=HC_DIM reduction into LINEAR_OK disjoint partials.
 LINEAR_OK = 4
@@ -68,7 +68,7 @@ RMS_CHUNKS_PER_SPLIT = RMS_K_PER_SPLIT // RMS_K_CHUNK
 
 # per-phase fan-out factors (compile-time constants; the token-tile factor is dynamic in T)
 CAST_KS = HC_DIM // CAST_K_SPMD  # cast tasks per token-tile (8)
-MIXX_DS = D // D_SPMD  # mix_x tasks per token-tile (4)
+MIXX_DS = D // D_SPMD  # mix_x tasks per token-tile
 
 assert HC_MULT == 4, (
     f"hc_pre is specialized to HC_MULT == 4, got {HC_MULT}; "
