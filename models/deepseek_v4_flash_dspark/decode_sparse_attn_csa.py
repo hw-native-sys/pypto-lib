@@ -99,6 +99,7 @@ def sparse_attn_csa(
     freqs_cos: pl.Tensor[[T_DYN, ROPE_DIM], pl.BF16],
     freqs_sin: pl.Tensor[[T_DYN, ROPE_DIM], pl.BF16],
     o_packed_heads: pl.Tensor[[O_GROUPS * T_PAD, O_GROUP_IN], pl.BF16],
+    cache_ready_dep: pl.Scalar[pl.TASK_ID],
 ) -> tuple[pl.Tensor, pl.Scalar[pl.TASK_ID]]:
     """Write CSA heads as ``[group, T_PAD, O_GROUP_IN]`` slabs.
 
@@ -197,7 +198,7 @@ def sparse_attn_csa(
     sparse_blk_li = pl.create_tensor([t_blk, 1], dtype=pl.FP32)
     sparse_blk_oi = pl.create_tensor([t_blk, HEAD_DIM], dtype=pl.FP32)
 
-    with pl.spmd(NUM_QK_CORES, name_hint="qk_pv", deps=[qk_plan_tid], allow_early_resolve=True) as _qk_tid:
+    with pl.spmd(NUM_QK_CORES, name_hint="qk_pv", deps=[qk_plan_tid, cache_ready_dep], allow_early_resolve=True) as _qk_tid:
         qk_core = pl.tile.get_block_idx()
         # Items for this lane: qk_core, qk_core + NUM_QK_CORES, ...  The per-lane
         # count is derived from the lane index (no stored per-core count); a lane
@@ -417,6 +418,7 @@ def sparse_attn_csa_test(
     freqs_cos.bind_dynamic(0, T_DYN)
     freqs_sin.bind_dynamic(0, T_DYN)
 
+    cache_ready_dep = pl.system.task_dummy(deps=[])
     o_packed_flat = pl.reshape(o_packed_heads, [O_GROUPS * T_PAD, O_GROUP_IN])
     o_packed_flat, _ = sparse_attn_csa(
         q,
@@ -424,7 +426,7 @@ def sparse_attn_csa_test(
         cmp_kv, cmp_block_table, idx_topk,
         position_ids, attn_sink,
         freqs_cos, freqs_sin,
-        o_packed_flat,
+        o_packed_flat, cache_ready_dep,
     )
     return o_packed_heads
 

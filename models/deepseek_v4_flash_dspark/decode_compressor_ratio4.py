@@ -85,7 +85,7 @@ def compressor_ratio4(
     cmp_slot_mapping: pl.Tensor[[T_DYN], pl.INT64],
     state_slot_mapping: pl.Tensor[[T_DYN], pl.INT64],
     late_dep: pl.Scalar[pl.TASK_ID],
-):
+) -> tuple[pl.Tensor, pl.Scalar[pl.TASK_ID]]:
     b_dim = pl.tensor.dim(compress_state_block_table, 0)
     bs = pl.tensor.dim(x, 0)
     s_dim = bs // b_dim
@@ -224,7 +224,7 @@ def compressor_ratio4(
     norm_w_2d = pl.reshape(norm_w, [1, HEAD_DIM])
     with pl.spmd(
         rms_blocks, name_hint="rmsnorm_rope_cache_write", deps=[pool_tid]
-    ) as _rms_tid:
+    ) as cache_write_tid:
         rms_blk = pl.tile.get_block_idx()
         b0 = rms_blk * RMS_PAD_TILE
         rms_blk_rows = pl.min(RMS_PAD_TILE, bs - b0)
@@ -274,7 +274,7 @@ def compressor_ratio4(
                 cmp_kv_cache_flat[cache_row : cache_row + 1, :] = pl.cast(
                     kv_row_fp32, target_type=pl.BF16, mode="rint")
 
-    return kv
+    return kv, cache_write_tid
 
 
 @pl.jit
@@ -305,7 +305,7 @@ def compressor_test(
 
     # Standalone: no rms_norm producer, so the barrier fences nothing (ready on submit).
     late_dep = pl.system.task_dummy(deps=[])
-    compressor_ratio4(
+    kv, _cache_write_tid = compressor_ratio4(
         x,
         kv,
         compress_state,

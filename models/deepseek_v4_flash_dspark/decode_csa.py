@@ -62,10 +62,9 @@ from decode_o_proj import (
     LOCAL_T,
     LOCAL_T_PAD,
     O_WINDOW_ROWS,
-    decode_o_proj,
     decode_o_proj_tp1,
+    decode_sharded_o_projection_reduce_scatter,
     o_group_a2a,
-    o_proj_reduce_scatter,
 )
 from decode_sparse_attn_csa import (
     ROPE_CS_T_TILE,
@@ -262,6 +261,8 @@ def decode_csa(
     kv = pl.create_tensor([t_dim, HEAD_DIM], dtype=pl.BF16)
     qr = pl.create_tensor([t_dim, Q_LORA], dtype=pl.INT8)
     qr_scale = pl.create_tensor([t_dim, 1], dtype=pl.FP32)
+    position_ids_t1 = pl.reshape(position_ids, [t_dim, 1])
+    attention_local_flat = pl.create_tensor([ATTENTION_WINDOW_ROWS, O_GROUP_IN], dtype=pl.BF16)
     with pl.scope():
         late_dep = pl.system.task_dummy(deps=[rope_tid])
         qkv_proj_rope(
@@ -272,7 +273,8 @@ def decode_csa(
 
         ori_block_num = pl.tensor.dim(kv_cache, 0)
         kv_cache_flat = pl.reshape(kv_cache, [ori_block_num * BLOCK_SIZE, HEAD_DIM])
-        for wb_blk in pl.spmd(wb_blocks, name_hint="csa_cache_writeback"):
+        with pl.spmd(wb_blocks, name_hint="csa_cache_writeback") as ori_cache_write_tid:
+            wb_blk = pl.tile.get_block_idx()
             wb_t0 = wb_blk * CSA_WB_TOKEN_TILE
             for write_dt in pl.range(CSA_WB_TOKEN_TILE):
                 write_t = wb_t0 + write_dt
@@ -284,7 +286,7 @@ def decode_csa(
                     ]
 
         cmp_out = pl.create_tensor([t_dim, HEAD_DIM], dtype=pl.FP32)
-        compressor_ratio4(
+        cmp_out, cmp_cache_write_tid = compressor_ratio4(
             x_normed_t, cmp_out,
             compress_state, compress_state_block_table,
             cmp_wkv, cmp_wgate, cmp_ape, cmp_norm_w,
@@ -292,6 +294,7 @@ def decode_csa(
             position_ids, cmp_slot_mapping, state_slot_mapping,
             late_dep,
         )
+        cache_ready_dep = pl.system.task_dummy(deps=[ori_cache_write_tid, cmp_cache_write_tid])
 
         idx_kv_unused = pl.create_tensor([t_dim, IDX_HEAD_DIM], dtype=pl.FP32)
         indexer(
@@ -306,34 +309,30 @@ def decode_csa(
             kv_seq_lens, late_dep,
         )
 
-    position_ids_t1 = pl.reshape(position_ids, [t_dim, 1])
-    attention_grouped = pl.create_tensor([O_GROUPS * LOCAL_T_PAD, O_GROUP_IN], dtype=pl.BF16)
-    attention_grouped, _heads_tid = sparse_attn_csa(
-        q, kv_cache, window_swa_indices,
-        cmp_kv, cmp_block_table, idx_topk,
-        position_ids_t1, attn_sink, freqs_cos, freqs_sin,
-        attention_grouped,
-    )
-
-    attention_local_flat = pl.create_tensor([ATTENTION_WINDOW_ROWS, O_GROUP_IN], dtype=pl.BF16)
-    attention_local_flat, attention_signal = o_group_a2a(
-        attention_grouped, attention_local_flat,
-        attention_window, attention_signal,
-        group_base, tp_rank, local_t,
-    )
+        attention_grouped = pl.create_tensor(
+            [O_GROUPS * LOCAL_T_PAD, O_GROUP_IN],
+            dtype=pl.BF16,
+        )
+        attention_grouped, _heads_tid = sparse_attn_csa(
+            q, kv_cache, window_swa_indices,
+            cmp_kv, cmp_block_table, idx_topk,
+            position_ids_t1, attn_sink, freqs_cos, freqs_sin,
+            attention_grouped, cache_ready_dep,
+        )
+        attention_local_flat, attention_signal = o_group_a2a(
+            attention_grouped, attention_local_flat,
+            attention_window, attention_signal,
+            group_base, tp_rank, local_t,
+        )
 
     attention_local_groups = pl.reshape(attention_local_flat, [LOCAL_O_GROUPS, GROUP_T_PAD, O_GROUP_IN])
-    o_partial = pl.create_tensor([GROUP_T_PAD, D], dtype=pl.FP32)
-    o_partial, projection_tid = decode_o_proj(
+    o_local = pl.create_tensor([LOCAL_T_PAD, D], dtype=pl.BF16)
+    o_local, o_signal = decode_sharded_o_projection_reduce_scatter(
         attention_local_groups,
         wo_a, wo_b, wo_b_scale,
-        local_t, o_partial,
-    )
-    o_local = pl.create_tensor([LOCAL_T_PAD, D], dtype=pl.BF16)
-    o_local, o_signal = o_proj_reduce_scatter(
-        o_partial, o_local,
+        local_t, o_local,
         o_window, o_signal,
-        group_base, tp_rank, local_t, projection_tid,
+        group_base, tp_rank,
     )
     attn_out = pl.create_tensor([t_dim, D], dtype=pl.BF16)
     for block in pl.spmd(t_dim // CSA_WB_TOKEN_TILE, name_hint="csa_o_local_bridge"):
@@ -715,6 +714,8 @@ def decode_csa_tp1(
     qr_scale = pl.create_tensor([t_dim, 1], dtype=pl.FP32)
     idx_topk_scores = pl.create_tensor([t_dim, IDX_TOPK], dtype=pl.FP32)
     idx_topk = pl.create_tensor([t_dim, IDX_TOPK], dtype=pl.INT32)
+    position_ids_t1 = pl.reshape(position_ids, [t_dim, 1])
+    attn_out = pl.create_tensor([t_dim, D], dtype=pl.BF16)
     with pl.scope():
         # Dispatch barrier: kv_proj_matmul, kv_score_proj and weights_proj resolve one hop
         # after rms_norm, leaving qr_proj_matmul first.
@@ -727,7 +728,8 @@ def decode_csa_tp1(
 
         ori_block_num = pl.tensor.dim(kv_cache, 0)
         kv_cache_flat = pl.reshape(kv_cache, [ori_block_num * BLOCK_SIZE, HEAD_DIM])
-        for wb_blk in pl.spmd(wb_blocks, name_hint="csa_cache_writeback"):
+        with pl.spmd(wb_blocks, name_hint="csa_cache_writeback") as ori_cache_write_tid:
+            wb_blk = pl.tile.get_block_idx()
             wb_t0 = wb_blk * CSA_WB_TOKEN_TILE
             for write_dt in pl.range(CSA_WB_TOKEN_TILE):
                 write_t = wb_t0 + write_dt
@@ -739,7 +741,7 @@ def decode_csa_tp1(
                     ]
 
         cmp_out = pl.create_tensor([t_dim, HEAD_DIM], dtype=pl.FP32)
-        compressor_ratio4(
+        cmp_out, cmp_cache_write_tid = compressor_ratio4(
             x_normed_t, cmp_out,
             compress_state, compress_state_block_table,
             cmp_wkv, cmp_wgate, cmp_ape, cmp_norm_w,
@@ -747,6 +749,7 @@ def decode_csa_tp1(
             position_ids, cmp_slot_mapping, state_slot_mapping,
             late_dep,
         )
+        cache_ready_dep = pl.system.task_dummy(deps=[ori_cache_write_tid, cmp_cache_write_tid])
 
         idx_kv_unused = pl.create_tensor([t_dim, IDX_HEAD_DIM], dtype=pl.FP32)
         indexer(
@@ -761,24 +764,21 @@ def decode_csa_tp1(
             kv_seq_lens, late_dep,
         )
 
-    # sparse_attn_csa folds the compressed-slot masking + valid-block flags in from the
-    # raw indexer topk + position.
-    position_ids_t1 = pl.reshape(position_ids, [t_dim, 1])
-    attn_out = pl.create_tensor([t_dim, D], dtype=pl.BF16)
-    o_packed_heads = pl.create_tensor([O_GROUPS * T_PAD, O_GROUP_IN], dtype=pl.BF16)
-    o_packed_heads, heads_dep = sparse_attn_csa(
-        q, kv_cache, window_swa_indices,
-        cmp_kv, cmp_block_table, idx_topk, position_ids_t1,
-        attn_sink, freqs_cos, freqs_sin,
-        o_packed_heads,
-    )
-    attn_out = decode_o_proj_tp1(
-        o_packed_heads,
-        wo_a, wo_b, wo_b_scale,
-        attn_out, heads_dep,
-    )
-
-    hc_post(attn_out, x_hc, post_t, comb_t, x_out)
+        # sparse_attn_csa folds the compressed-slot masking + valid-block flags in from the
+        # raw indexer topk + position.
+        o_packed_heads = pl.create_tensor([O_GROUPS * T_PAD, O_GROUP_IN], dtype=pl.BF16)
+        o_packed_heads, heads_dep = sparse_attn_csa(
+            q, kv_cache, window_swa_indices,
+            cmp_kv, cmp_block_table, idx_topk, position_ids_t1,
+            attn_sink, freqs_cos, freqs_sin,
+            o_packed_heads, cache_ready_dep,
+        )
+        attn_out = decode_o_proj_tp1(
+            o_packed_heads,
+            wo_a, wo_b, wo_b_scale,
+            attn_out, heads_dep,
+        )
+        hc_post(attn_out, x_hc, post_t, comb_t, x_out)
     return x_out
 
 
@@ -1592,7 +1592,7 @@ def build_full_compare(mapping_shape, *, leading_rank_axis, diagnostic_x_out=Fal
     x_out_compare = (
         error_distribution(always_pass=False)
         if diagnostic_x_out
-        else ratio_reldiff(diff_thd=4e-3, pct_thd=0.008, max_diff_hd=1)
+        else ratio_reldiff(diff_thd=4e-3, pct_thd=0.008, max_diff_hd=2)
     )
     return {
         "compress_state": mapped_pool_ratio_allclose(

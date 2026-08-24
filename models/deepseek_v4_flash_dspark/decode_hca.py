@@ -65,10 +65,9 @@ from decode_o_proj import (
     LOCAL_T,
     LOCAL_T_PAD,
     O_WINDOW_ROWS,
-    decode_o_proj,
+    decode_sharded_o_projection_reduce_scatter,
     decode_o_proj_tp1,
     o_group_a2a,
-    o_proj_reduce_scatter,
 )
 from decode_sparse_attn_hca import (
     HCA_MAX_COMPRESSED_ROWS,
@@ -254,17 +253,13 @@ def decode_hca(
         attention_local_flat,
         [LOCAL_O_GROUPS, GROUP_T_PAD, O_GROUP_IN],
     )
-    o_partial = pl.create_tensor([GROUP_T_PAD, D], dtype=pl.FP32)
-    o_partial, projection_tid = decode_o_proj(
+    o_local = pl.create_tensor([LOCAL_T_PAD, D], dtype=pl.BF16)
+    o_local, o_signal = decode_sharded_o_projection_reduce_scatter(
         attention_local_groups,
         wo_a, wo_b, wo_b_scale,
-        local_t, o_partial,
-    )
-    o_local = pl.create_tensor([LOCAL_T_PAD, D], dtype=pl.BF16)
-    o_local, o_signal = o_proj_reduce_scatter(
-        o_partial, o_local,
+        local_t, o_local,
         o_window, o_signal,
-        group_base, tp_rank, local_t, projection_tid,
+        group_base, tp_rank,
     )
 
     attn_out = pl.create_tensor([t_dim, D], dtype=pl.BF16)
@@ -1173,16 +1168,11 @@ def build_distributed_tensor_specs(local_t, start_pos=None):
 
     _validate_hca_token_count(local_t)
 
-    with torch.random.fork_rng():
-        torch.manual_seed(20260819)
-        base_specs = build_tensor_specs(start_pos=start_pos, batch=local_t // S)
+    base_specs = build_tensor_specs(start_pos=start_pos, batch=local_t // S)
     base_by_name = {spec.name: spec for spec in base_specs}
 
     def materialize(name):
-        spec_index = next(index for index, spec in enumerate(base_specs) if spec.name == name)
-        with torch.random.fork_rng():
-            torch.manual_seed(20260819 + spec_index)
-            return base_by_name[name].create_tensor()
+        return base_by_name[name].create_tensor()
 
     def init_stacked(name):
         value = materialize(name)
