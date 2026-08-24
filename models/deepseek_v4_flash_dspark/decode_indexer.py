@@ -105,7 +105,7 @@ SCORE_READY_EVENT = 4
 SCORE_CONSUMED_EVENT = 5
 FFTS_WORKSPACE_ELEMENTS = 256
 
-# Exact Top-K geometry shared by the 1M selector and its standalone probe.
+# Exact Top-K geometry for the 1M selector.
 TOPK_CANDIDATES_PER_LEAF = 2048
 TOPK_MAX_CANDIDATES = IDX_MAX_ROWS
 TOPK_MAX_LEAVES = TOPK_MAX_CANDIDATES // TOPK_CANDIDATES_PER_LEAF
@@ -113,7 +113,6 @@ TOPK_MAX_NODES = 2 * TOPK_MAX_LEAVES - 1
 TOPK_ARENA_ROWS = T_PAD * TOPK_MAX_NODES
 TOPK_LEAF_PARALLEL = 8
 TOPK_WORK_UNITS = T_PAD * TOPK_LEAF_PARALLEL
-TOPK_LEAF_DYN = pl.dynamic("INDEXER_TOPK_LEAF_DYN")
 assert TOPK_MAX_CANDIDATES % TOPK_CANDIDATES_PER_LEAF == 0
 assert TOPK_MAX_LEAVES == 128
 assert TOPK_MAX_NODES == 255
@@ -126,37 +125,6 @@ TOPK_LEVEL5_BASE = TOPK_LEVEL4_BASE + 8
 TOPK_LEVEL6_BASE = TOPK_LEVEL5_BASE + 4
 TOPK_ROOT_BASE = TOPK_LEVEL6_BASE + 2
 assert TOPK_ROOT_BASE == TOPK_MAX_NODES - 1
-
-
-@pl.jit.inline
-def select_2k_top512_pairs(
-    scores: pl.Tensor[[TOPK_LEAF_DYN, TOPK_CANDIDATES_PER_LEAF], pl.FP32],
-    indices: pl.Tensor[[TOPK_LEAF_DYN, TOPK_CANDIDATES_PER_LEAF], pl.INT32],
-    leaf: pl.Scalar[pl.INDEX],
-):
-    """Return one pre-masked leaf's exact Top-512 score/index pairs."""
-    leaf_scores = pl.slice(
-        scores,
-        [1, TOPK_CANDIDATES_PER_LEAF],
-        [leaf, 0],
-    )
-    leaf_scores = pl.maximum(
-        leaf_scores,
-        pl.full(
-            [1, TOPK_CANDIDATES_PER_LEAF],
-            dtype=pl.FP32,
-            value=FP32_NEG_INF,
-        ),
-    )
-    leaf_indices = indices[leaf : leaf + 1, :]
-    pairs = pl.sort32(
-        leaf_scores, pl.reinterpret_view(leaf_indices, pl.UINT32)
-    )
-    pairs = pl.mrgsort(pairs, block_len=64)
-    pairs = pl.mrgsort(pairs, block_len=256)
-    pairs = pl.mrgsort(pairs, block_len=1024)
-    return pairs[:, 0:TOPK_PAIR_WIDTH]
-
 
 @pl.jit.inline
 def merge2_top512_pairs(
