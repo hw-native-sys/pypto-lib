@@ -98,6 +98,7 @@ nav:
       - Precision tuning: debug-and-tune/precision-tuning.md
       - Performance tuning: debug-and-tune/performance-tuning.md
       - DeepSeek V4 decode optimization: debug-and-tune/deepseek-v4-decode-optimization.md
+      - Qwen3-14B optimization: debug-and-tune/qwen3-14b-optimization.md
       - Dependencies and scheduling: debug-and-tune/dependency-and-scheduling.md
       - Ring heap and scope stats: debug-and-tune/ring-heap-and-scope-stats.md
       - Cube tile tuning: debug-and-tune/cube-tile-tuning.md

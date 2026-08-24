@@ -118,6 +118,14 @@ with the entry points it names — registers the prefill, decode, and
 greedy-sample stages, their compile-time argument builders, and the ABI
 constants an external runtime needs.
 
+## How it was optimized
+
+[Qwen3-14B optimization](../debug-and-tune/qwen3-14b-optimization.md) follows the
+tuning of this tree in order — the shape constraint that forbids the obvious
+attention fusion, the measurement surface and the pass-rate golden, the general
+task-count and tiling levers, the attention, sampling and KV-cache rewrites, and
+scheduling — with the limit measured at each step.
+
 ## Files
 
 | Group | Files |

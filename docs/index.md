@@ -45,6 +45,8 @@ the [precision](debug-and-tune/precision-tuning.md) or
 at hand.
 [DeepSeek V4 decode optimization](debug-and-tune/deepseek-v4-decode-optimization.md)
 follows one model's decode path end to end and records which levers paid.
+[Qwen3-14B optimization](debug-and-tune/qwen3-14b-optimization.md) records how a
+single-card dense model's kernels were tuned, in the order the work happened.
 
 ## Ecosystem
 
