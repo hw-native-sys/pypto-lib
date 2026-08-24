@@ -164,7 +164,10 @@ improve the running best beyond the noise band.
 
 - Use identical, seeded inputs for every candidate.
 - Revalidate numerical output for every shape; tiling must not change results.
-- Measure at least three times and compare medians, not the minimum.
+- Take every candidate's number from one `PYPTO_BENCH` run with the same
+  rounds / warmup, and compare the `mean=` field — repeating the whole script
+  to collect samples only re-pays for compile, input generation, and the torch
+  golden.
 - Use the chip swimlane and PMU data to confirm that the expected pipe changed.
 - Record compile failures as evidence: a `Mat buffer usage ... exceeds` error
   identifies L1, while a UB allocation error usually belongs to the vector
@@ -181,7 +184,7 @@ Before landing a tile change, confirm:
 - `Mat`, `Acc`, and `Vec` are within the exact build's constraints;
 - `Left`/`Right` percentages were not used as DSL-level targets;
 - K-contiguous transfers are not accidentally below the cache-line floor;
-- the end-to-end median improves outside normal noise;
+- the end-to-end mean wall time improves outside normal noise;
 - all numerical checks still pass; and
 - the code comment records the relevant constraint, not a transient benchmark
   story.

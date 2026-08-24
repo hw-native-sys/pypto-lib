@@ -43,7 +43,10 @@ source.
 - Save or replay one input set when comparing precision or performance.
 - Use the same platform, device topology, runtime configuration, and benchmark
   round count for every candidate.
-- Report the median of repeated measurements and retain the raw samples.
+- Collect repeats as rounds inside one process (`PYPTO_BENCH_ROUNDS`), not as
+  repeated invocations of the script, and report the `mean=` field of the
+  `[RUN] effective_us` line — the same convention as daily CI. Retain the raw
+  samples (`PYPTO_BENCH_RAW=1`).
 - Keep generated traces and build products under `build_output/`; do not commit
   them.
 - Remove diagnostic instrumentation and rerun validation before submitting a

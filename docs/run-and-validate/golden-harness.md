@@ -116,6 +116,10 @@ torch.allclose(actual, expected, rtol=rtol, atol=atol)
 Choose tolerances from the numerical contract of the kernel, not simply to
 make a failing result pass. For output types that need a different correctness
 rule, pass a comparator for that output name through `compare_fn`.
+`golden.validation` ships four ready-made gates — `topk_pair_compare`,
+`ratio_allclose`, `ratio_reldiff`, and `mapped_pool_ratio_allclose` for a
+slot-mapped paged pool — plus the `error_distribution` measurement; see
+[Compile and Runtime Workflow](compile-runtime-workflow.md#5-validate).
 
 If neither `golden_fn` nor `golden_data` is provided, the runtime can still
 execute, but validation is explicitly reported as skipped. Such a run is not

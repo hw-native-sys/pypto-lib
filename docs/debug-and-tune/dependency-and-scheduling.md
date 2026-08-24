@@ -135,10 +135,10 @@ Four opt-outs, from narrowest to widest. Each is an assertion the compiler
 
 | Construct | Scope of the claim | Used in this repo |
 |-----------|--------------------|-------------------|
-| `pl.at(..., no_dep_args=[t])` | One tensor, one task | `models/qwen3_14b/decode_layer_a8w8.py:669` |
+| `pl.at(..., no_dep_args=[t])` | One tensor, one task | the `gate_up_dual_proj` scope in `models/qwen3_14b/decode_layer_a8w8.py` |
 | `pl.no_dep(t)` at a call argument | One tensor, one task (`@pl.program` form) | — |
-| `pl.create_tensor(..., manual_dep=True)` | One tensor, its whole lifetime | `models/deepseek_v4_pro/moe.py:493` |
-| `with pl.manual_scope():` | Every task in the region | `models/qwen3_14b/decode_fwd.py:314` |
+| `pl.create_tensor(..., manual_dep=True)` | One tensor, its whole lifetime | `post_ffn` in `models/deepseek_v4_pro/moe.py` |
+| `with pl.manual_scope():` | Every task in the region | `_decode_layer` in `models/qwen3_14b/decode_fwd.py` |
 
 Prefer the narrowest one that expresses the claim. `manual_scope` says "I own
 the entire graph here" — inside it the runtime skips creator retention,
@@ -487,13 +487,14 @@ gate = pl.system.task_dummy(deps=[tid_a, tid_b])
 
 # 2. Delay by one hop: a real producer, plus a hop, before a non-critical
 #    consumer — so it stops resolving at the same instant as the critical one.
-#    models/deepseek_v4_flash_dspark/decode_swa.py:171
+#    decode_swa() in models/deepseek_v4_flash_dspark/decode_swa.py
 late_dep = pl.system.task_dummy(deps=[rms_tid])
 qkv_proj_rope(..., late_dep)
 
 # 3. Placeholder: a standalone entry has no fused-path producer to fence
 #    against, so an empty dummy satisfies the shared signature and is ready on
-#    submit.  models/deepseek_v4_flash_dspark/decode_indexer.py:428
+#    submit.  indexer_test() in
+#    models/deepseek_v4_flash_dspark/decode_indexer.py
 late_dep = pl.system.task_dummy(deps=[])
 ```
 
@@ -528,7 +529,7 @@ with non-deterministic indices — the signature of a race, not of a numerics
 bug. The live fix is a no-op self-copy that marks the parameter `inout` before
 the gather, so the writeback takes a WAW edge on it; `add_inout` is a
 param-level property, so one tile touch is enough. See the `kv_touch` scope in
-`models/deepseek_v4_pro/decode_sparse_attn.py:239` and its siblings in the
+`models/deepseek_v4_pro/decode_sparse_attn.py` and its siblings in the
 `_csa` variants.
 
 **A GM round-trip registered as `add_output`.** A GM tensor written by one task
@@ -544,8 +545,8 @@ sync timeout. Worth knowing when reading generated orchestration under
 comes from `deps=` and nothing else, for the tensor's whole lifetime. Removing
 one `deps=[tid]` to re-anchor a wait silently dropped the only edge ordering a
 cumsum before its consumer — no compile error, stale reads. The restored form
-is visible as the two-element dependency in
-`models/deepseek_v4_flash_dspark/moe.py:289`. Before cutting an explicit edge,
+is visible as the two-element dependency on the `dispatch_gather` scope of
+`models/deepseek_v4_flash_dspark/moe.py`. Before cutting an explicit edge,
 check whether any task it transitively orders reads a `manual_dep` tensor.
 
 **A conservative overlap that was not a dependency.** A `pl.range` loop whose
