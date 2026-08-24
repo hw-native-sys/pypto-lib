@@ -70,7 +70,7 @@ class Qwen3Decode:
     @pl.function(type=pl.FunctionType.Opaque)
     def qwen3_decode(self, hidden_states: pl.Tensor[..., pl.BF16], ...):
         # orchestration code (loops, tensor allocation)
-        for b0 in pl.parallel(0, batch_padded, BATCH_TILE):
+        for b0 in pl.parallel(0, BATCH, BATCH_TILE):
             with pl.at(level=pl.Level.CORE_GROUP, name_hint="rmsnorm"):
                 # InCore region — vector / cube / mte ops
                 ...
@@ -137,7 +137,7 @@ sub-kernels.
 - **`pl.split(pl.SplitMode...)`** — split the region in half so the cube and
   vector units ping-pong on the two halves (cube on one half while vec runs
   the epilogue on the other). It applies **only to a mixed cube + vector
-  region** (§6); a pure-cube or pure-vector region has nothing to ping-pong.
+  region** (§7); a pure-cube or pure-vector region has nothing to ping-pong.
   The mode picks the axis:
   - `pl.SplitMode.NONE` — the default; no split.
   - `pl.SplitMode.UP_DOWN` — split vertically (rows / height halved).
@@ -150,7 +150,7 @@ sub-kernels.
 
 ```python
 # split form on a mixed region whose FP32 epilogue would blow the UB budget
-for ob in pl.spmd(N_BLOCKS, name_hint="gate_up_silu",
+for ob in pl.spmd(INTER // INTER_TILE, name_hint="gate_up_silu",
                   optimizations=[pl.split(pl.SplitMode.UP_DOWN)]):
     ...
 ```
@@ -160,7 +160,7 @@ for ob in pl.spmd(N_BLOCKS, name_hint="gate_up_silu",
 ## 2. Vector Ops
 
 Run on the vector unit, inside an InCore region (a `pl.at` block or a
-`pl.spmd` body — see §5). Vector ops are the standard tools for the cast /
+`pl.spmd` body — see §6). Vector ops are the standard tools for the cast /
 activation / norm epilogue around a matmul, and for small standalone
 reductions.
 
@@ -313,7 +313,7 @@ gathered = pl.gather(local_scores, dim=-1, index=topk_idx_tile)   # [B, K]
 ## 3. Cube Ops
 
 Matrix multiply primitives. They run on the cube unit, inside an InCore
-region (a `pl.at` block or a `pl.spmd` body — see §5), and produce FP32
+region (a `pl.at` block or a `pl.spmd` body — see §6), and produce FP32
 results by default (`out_dtype` may override).
 
 ### `pl.matmul(lhs, rhs, *, out_dtype=None, a_trans=False, b_trans=False)`
@@ -331,13 +331,12 @@ out = pl.matmul(tile_a, tile_b, out_dtype=pl.FP32, b_trans=True)
 
 Fused multiply-accumulate: `acc += lhs @ rhs`. Use this inside a K-loop to
 keep the partial sum on chip. The first iteration uses `pl.matmul`,
-subsequent iterations use `pl.matmul_acc`. The `acc` destination is
-allocated outside `pl.at` (see §4):
+subsequent iterations use `pl.matmul_acc` — the accumulator is the value
+`pl.matmul` returned, so nothing is allocated for it:
 
 ```python
-acc = pl.create_tensor([M, N], dtype=pl.FP32)
 with pl.at(level=pl.Level.CORE_GROUP, name_hint="kproj"):
-    for kb in pl.pipeline(0, K_BLOCKS, stage=2):
+    for kb in pl.pipeline(0, K // K_STEP, stage=2):
         k0 = kb * K_STEP
         tile_a = pl.slice(a, [M, K_STEP], [m0, k0])
         tile_b = pl.slice(b, [K_STEP, N], [k0, n0])
@@ -384,11 +383,11 @@ assembly, no `create_tensor` is needed.
 
 ```python
 # Multi-stage assembly: q_proj is built by per-tile assembles
-q_proj = pl.create_tensor([batch_padded, q_hidden], dtype=pl.BF16)
-for q0 in pl.parallel(0, q_hidden, Q_OUT_STEP):
+q_proj = pl.create_tensor([BATCH, Q_HIDDEN], dtype=pl.BF16)
+for q0 in pl.parallel(0, Q_HIDDEN, Q_OUT_STEP):
     with pl.at(level=pl.Level.CORE_GROUP, name_hint="q_proj"):
         ...
-        q_proj = pl.assemble(q_proj, q_acc, [b0, q0])
+        q_proj = pl.assemble(q_proj, q_acc, [0, q0])
 ```
 
 ### `pl.slice` / `pl.assemble` — load/store at the `pl.at` boundary
@@ -430,9 +429,76 @@ flat = pl.reshape(q_chunk, [BATCH_TILE * H, D])
 
 ---
 
-## 5. Loops: `pl.range`, `pl.parallel`, `pl.pipeline`, `pl.spmd`
+## 5. Scalars: `pl.read` / `pl.write`
 
-PyPTO has four loop constructs. The choice between them is **semantic** —
+Vector and cube ops work on whole tiles. When the kernel needs **one value** —
+a routing index, a runtime row count, a slot cursor — read and write it
+directly.
+
+### `pl.read(src, offset)` / `pl.write(dst, offset, value)`
+
+`pl.read` returns a `pl.Scalar`; `pl.write` stores one. Both dispatch on the
+source kind: `src` / `dst` may be a **tensor** (GM) or a **tile** (UB), and
+`offset` is either an index list (one entry per dimension) or a single flat
+index. The explicit forms are `pl.tensor.read` / `pl.tensor.write` and
+`pl.tile.read` / `pl.tile.write`.
+
+```python
+eid = pl.read(indices, [t, k])                     # GM tensor element -> Scalar
+pl.write(recv_count_out, [e, 0], acc)              # Scalar -> GM tensor element
+pl.tile.write(meta_tile, [0, e], cursor[e])        # Scalar -> tile lane
+```
+
+A scalar read of a **tensor** is also legal in orchestration, and that is how
+a device-computed count becomes a host-side loop bound:
+
+```python
+for local_i in pl.parallel(N_LOCAL_EXPERTS):
+    n_rows = pl.read(recv_expert_count, [local_i, 0])   # a kernel wrote it
+```
+
+Cast to `pl.INDEX` before using a read value as an offset or a loop bound —
+the value comes back in its stored dtype (typically `INT32`):
+
+```python
+n = pl.cast(pl.read(recv_meta_local, [src, e]), pl.INDEX)
+for slot in pl.range(n):
+    ...
+```
+
+Keep scalar loops small. Each `pl.read` is a real memory access, so a
+per-element scalar loop over a tile-sized region is orders of magnitude
+slower than the vector op that does the same thing.
+
+### On-core scalar arrays: `pl.array`
+
+`pl.array.create(extent, dtype)` allocates a small array on the core's own
+stack — integer, BOOL, or `pl.TASK_ID` elements, and `extent` must be a
+compile-time constant. Index it with ordinary subscripts. Use it for
+bookkeeping that must not round-trip through GM: cursors, per-destination
+counters, or a list of TaskIds to fan a `deps=` in on.
+
+```python
+cursor = pl.array.create(N_RANKS * N_LOCAL, pl.INT32)
+for d in pl.range(N_RANKS):
+    for e in pl.range(N_LOCAL):
+        cursor[d * N_LOCAL + e] = 0
+...
+cursor[dst * N_LOCAL + loc_e] = cursor[dst * N_LOCAL + loc_e] + 1
+
+proj_tids = pl.array.create(O_GROUPS, pl.TASK_ID)   # orchestration: fan-in
+```
+
+Note the asymmetry with `pl.create_tensor`: an array is core-local and
+private to the block that created it, while a tensor created in orchestration
+is GM and shared. A `pl.create_tensor` **inside** a `pl.at` block yields a
+tile, not a GM tensor.
+
+---
+
+## 6. Loops: `pl.range`, `pl.unroll`, `pl.parallel`, `pl.pipeline`, `pl.spmd`
+
+PyPTO has five loop constructs. The choice between them is **semantic** —
 it tells the compiler what scheduling and codegen are valid.
 
 Each construct has a fixed placement relative to `pl.at`:
@@ -440,6 +506,7 @@ Each construct has a fixed placement relative to `pl.at`:
 | Construct | Outside `pl.at` (orchestration) | Inside `pl.at` (InCore) |
 |-----------|:-:|:-:|
 | `pl.range` | yes | yes |
+| `pl.unroll` | yes | yes |
 | `pl.parallel` | yes | no |
 | `pl.pipeline` | no | yes |
 | `pl.spmd` | yes (body is implicitly InCore) | no |
@@ -447,11 +514,12 @@ Each construct has a fixed placement relative to `pl.at`:
 `pl.parallel` distributes iterations across cores, so it must sit in
 orchestration. `pl.pipeline` software-pipelines stages within a single
 InCore region, so it must sit inside `pl.at`. `pl.range` is a plain
-sequential loop and is legal in either place. `pl.spmd` is a parallel SPMD
-loop that bundles its own InCore region — see below.
+sequential loop and is legal in either place; `pl.unroll` is the same loop
+unrolled at compile time. `pl.spmd` is a parallel SPMD loop that bundles its
+own InCore region — see below.
 
-`pl.range`, `pl.parallel`, and `pl.pipeline` share the same positional-arg
-shape, mirroring Python's `range`:
+`pl.range`, `pl.unroll`, `pl.parallel`, and `pl.pipeline` share the same
+positional-arg shape, mirroring Python's `range`:
 
 ```text
 pl.<loop>(stop)
@@ -466,8 +534,8 @@ Each argument may be either a Python `int` or a `pl.Scalar`.
 Iterations execute in strict order. Loop-carried dependencies are allowed.
 
 ```python
-for kb in pl.range(HIDDEN_BLOCKS):              # range [0, HIDDEN_BLOCKS)
-for kb in pl.range(1, hidden_blocks):           # range [1, hidden_blocks)
+for kb in pl.range(HIDDEN // K_STEP):           # range [0, HIDDEN // K_STEP)
+for kb in pl.range(1, hidden // K_STEP):        # range [1, hidden // K_STEP)
 for k0 in pl.range(0, HIDDEN, K_STEP):          # start, stop, step
 ```
 
@@ -479,6 +547,23 @@ for i, (acc,) in pl.range(N, init_values=(zero,)):
     acc = pl.add(acc, x[i])
 ```
 
+### `pl.unroll` — sequential, unrolled at compile time
+
+Same semantics as `pl.range` at run time; the parser emits `ForKind.Unroll`
+instead of `ForKind.Sequential`, so the body is replicated per iteration
+rather than looped. Use it for a short trip count whose body is small — the
+loop overhead and the per-iteration index math disappear — and keep
+`pl.range` for anything long enough that unrolling would bloat the kernel.
+
+`start`, `stop` and `step` must be compile-time constant integers, and
+`init_values=` is rejected — carry state with `pl.range` instead. The parser
+rejects both cases outright rather than failing later in the unroll pass.
+
+```python
+for kb in pl.unroll(1, K // K_STEP):          # replicated, no loop overhead
+    ...
+```
+
 ### `pl.parallel` — independent iterations
 
 Iterations are guaranteed independent — the compiler may split, reorder, or
@@ -487,7 +572,7 @@ schedule them across cores. Same arg shape and `init_values` support as
 
 ```python
 for b in pl.parallel(BATCH):                          # short form: extent only
-for b0 in pl.parallel(0, batch_padded, BATCH_TILE):   # start, stop, step
+for b0 in pl.parallel(0, BATCH, BATCH_TILE):          # start, stop, step
 ```
 
 ### `pl.pipeline` — software-pipelined sequential
@@ -500,9 +585,9 @@ ping-pong buffering; the outer trip count advances in strides of
 is not divisible by `stage`. Typical values are 2 or 4.
 
 ```python
-for kb in pl.pipeline(HIDDEN_BLOCKS, stage=2):
-for kb in pl.pipeline(2, HIDDEN_BLOCKS, stage=2):     # start at 2
-for kb in pl.pipeline(0, input_proj_k_blocks, stage=4):
+for kb in pl.pipeline(HIDDEN // K_STEP, stage=2):
+for kb in pl.pipeline(2, HIDDEN // K_STEP, stage=2):  # start at 2
+for kb in pl.pipeline(0, hidden // K_STEP, stage=4):
 ```
 
 `init_values=` is supported, with the same `(idx, (state...))` unpacking as
@@ -521,7 +606,7 @@ the iteration variable binds the per-block index (equivalent to
 `pl.tile.get_block_idx()`). No surrounding `pl.at` is needed or allowed:
 
 ```python
-for ob0 in pl.spmd(Q_SPMD_BLOCKS, name_hint="q_proj"):
+for ob0 in pl.spmd(Q_HIDDEN // (Q_OUT_STEP * 4), name_hint="q_proj"):
     # implicit InCore region — vector / cube / mte ops here
     for ob in pl.range(ob0 * 4, (ob0 + 1) * 4):
         q0 = ob * Q_OUT_STEP
@@ -545,7 +630,7 @@ Keyword args:
 
 ---
 
-## 6. Mixed Cube + Vector Within One `pl.at`
+## 7. Mixed Cube + Vector Within One `pl.at`
 
 A single `pl.at` region can contain both cube (matmul) and vector (cast,
 add, row_sum, …) ops. The compiler assigns each op to the appropriate unit
@@ -553,22 +638,19 @@ and pipelines cube/vec where possible. This is the standard pattern for a
 projection with cast/residual epilogue:
 
 ```python
-q_proj = pl.create_tensor([batch_padded, hidden], dtype=pl.BF16)
-for q0 in pl.parallel(0, hidden, Q_OUT_STEP):
-    q_acc = pl.create_tensor([BATCH_TILE, Q_OUT_STEP], dtype=pl.FP32)
+q_proj = pl.create_tensor([BATCH, Q_HIDDEN], dtype=pl.BF16)
+for q0 in pl.parallel(0, Q_HIDDEN, Q_OUT_STEP):
     with pl.at(level=pl.Level.CORE_GROUP, name_hint="q_proj"):
-        for kb in pl.pipeline(0, input_proj_k_blocks, stage=2):
-            k0 = kb * INPUT_PROJ_K_STEP
-            tile_a = pl.slice(normed_tile,
-                              [BATCH_TILE, INPUT_PROJ_K_STEP], [0, k0])  # vec source
-            tile_b = pl.slice(wq,
-                              [INPUT_PROJ_K_STEP, Q_OUT_STEP], [k0, q0])  # cube right
+        for kb in pl.pipeline(0, HIDDEN // K_STEP, stage=2):
+            k0 = kb * K_STEP
+            tile_a = pl.slice(normed, [BATCH, K_STEP], [0, k0])    # vec src
+            tile_b = pl.slice(wq, [K_STEP, Q_OUT_STEP], [k0, q0])  # cube right
             if kb == 0:
                 q_acc = pl.matmul(tile_a, tile_b)              # cube
             else:
                 q_acc = pl.matmul_acc(q_acc, tile_a, tile_b)   # cube
         q_bf16 = pl.cast(q_acc, target_type=pl.BF16)           # vector
-        q_proj = pl.assemble(q_proj, q_bf16, [b0, q0])         # mte
+        q_proj = pl.assemble(q_proj, q_bf16, [0, q0])          # mte
 ```
 
 Larger fused regions (RMSNorm + projection + residual) follow the same
@@ -577,7 +659,70 @@ shape: a `pl.pipeline` matmul reduction, then the vector epilogue, then
 
 ---
 
-## 7. Dynamic Shapes (dynamic B / S)
+## 8. Runtime Scopes: `pl.scope`
+
+A **runtime scope** (`PTO2_SCOPE`) is an orchestration-level region that
+bounds two things at once: automatic dependency tracking, and the heap ring
+that the intermediates submitted inside it are allocated from. The runtime
+wraps an implicit top-level scope around every program, so writing scopes is
+a **tuning** decision, never a correctness requirement.
+
+### Automatic placement is the default
+
+With the default `auto_scope=True` the compiler inserts an AUTO scope around
+the function body and around **each `for` / `if` body**, including inside
+every `@pl.jit.inline` callee it splices in. That is convenient and blind: a
+model nested six levels deep puts everything past depth 3 on one ring, which
+then carries the whole program.
+
+### Placing them by hand
+
+Turn the automatic ones off on the enclosing function, then write the scopes:
+
+```python
+@pl.jit(auto_scope=False)            # also @pl.jit.inline(auto_scope=False)
+def decode_fwd(...):
+    with pl.scope():                 # one attention stage
+        attention_swa(...)
+    with pl.scope():                 # one MoE stage
+        moe(...)
+```
+
+Rules:
+
+- `pl.scope()` is legal only in orchestration code, never inside `pl.at`.
+- AUTO mode — plain `pl.scope()` — requires `auto_scope=False` on the
+  enclosing function. In the default mode the compiler owns AUTO placement
+  and a hand-written AUTO scope is rejected.
+- Only `@pl.jit`, `@pl.jit.inline`, `@pl.jit.host`, and `@pl.function` take
+  `auto_scope=`; `@pl.jit.incore` / `@pl.jit.opaque` outline into their own
+  kernels and reject it.
+- Nesting deeper than three levels buys nothing — ring 3 is a clamp.
+- A scope is a scheduling boundary too: the runtime drains its bookkeeping at
+  `scope_end`, so a scope around a handful of tasks costs more than it
+  reclaims.
+
+Ring selection, sizing, and how to measure a scope's peak occupancy are in
+[Ring Heap and Scope Stats](../debug-and-tune/ring-heap-and-scope-stats.md).
+
+### `MANUAL` is a dependency choice, not a ring choice
+
+`pl.scope(mode=pl.ScopeMode.MANUAL)` — spelled `pl.manual_scope()` — turns
+**off** the runtime's automatic dependency tracking for the whole region:
+inside it every ordering edge is one you declared with `deps=`. It is legal
+in either `auto_scope` mode, and an AUTO scope may not nest inside a MANUAL
+one.
+
+Prefer the narrowest opt-out that expresses the claim —
+`pl.create_tensor(..., manual_dep=True)` for one tensor,
+`pl.at(..., no_dep_args=[t])` for one tensor in one task — and note that
+`deps=` composes with automatic tracking, so it works in an AUTO scope
+without any opt-out at all. See
+[Dependencies and Scheduling](../debug-and-tune/dependency-and-scheduling.md).
+
+---
+
+## 9. Dynamic Shapes (dynamic B / S)
 
 `@pl.jit` / `@pl.jit.inline` kernels support dynamic batch (B) and sequence
 (S) dimensions via `pl.dynamic` symbolic dims — a single kernel can serve both
@@ -646,11 +791,12 @@ def compressor_test(x: pl.Tensor[[B_DYN, S_DYN, D], pl.BF16], ...):
 
 ### Dynamic loop bounds
 
-All four loop constructs accept dynamic bounds. `pl.spmd` accepts a single
-Scalar **or a composite dynamic expression** (`b_dim * HEAD_DIM // HEAD_TILE`)
-as the block count. When an SPMD loop folds several dims into one, **place the
-dynamic dim outermost** so every `//` and `%` divides by a compile-time
-constant — otherwise the hot loop needs a runtime division:
+`pl.range`, `pl.parallel`, `pl.pipeline` and `pl.spmd` accept dynamic bounds
+(`pl.unroll` does not — it unrolls a compile-time count). `pl.spmd` accepts a
+single Scalar **or a composite dynamic expression** (`b_dim * HEAD_DIM //
+HEAD_TILE`) as the block count. When an SPMD loop folds several dims into
+one, **place the dynamic dim outermost** so every `//` and `%` divides by a
+compile-time constant — otherwise the hot loop needs a runtime division:
 
 ```python
 BLOCKS_PER_OUTER = HEAD_COUNT * (D // D_CHUNK)        # compile-time
@@ -697,7 +843,7 @@ the old mode-specific wrapper is deleted.
 
 ---
 
-## 8. Naming and comment conventions
+## 10. Naming and comment conventions
 
 ### Name tile sizes, inline block counts
 

@@ -59,6 +59,8 @@ validation, and sequential row handling within a core group.
 All-reduce is the only multi-device example. It uses distributed window
 buffers, remote tile loads, and notify/wait synchronization. The program is
 statically fixed at two ranks, and the CLI requires exactly two device IDs.
+[Distributed Programming](../pypto-coding/distributed-programming.md) is the
+reference for every construct it uses.
 
 Run it on two A2/A3 devices:
 

@@ -26,12 +26,13 @@ Files ending in `_draft.py` are works-in-progress and excluded from CI.
 - `docs/get-started/platforms.md` — simulator/device targets and CI coverage semantics
 - `docs/run-and-validate/golden-harness.md` — Golden Harness specs, execution, validation, and results
 - `docs/run-and-validate/save-and-replay.md` — frozen input/golden capture and replay
-- `docs/pypto-coding/pypto-coding-style.md` — **canonical** coding style: the two kernel forms (`@pl.jit` / `@pl.jit.inline` and `@pl.program` / `@pl.function`), `pl.at` scopes, four loop constructs (`pl.range`/`pl.parallel`/`pl.pipeline`/`pl.spmd`), vector / cube / mte ops, dynamic B/S shapes
+- `docs/pypto-coding/pypto-coding-style.md` — **canonical** coding style: the two kernel forms (`@pl.jit` / `@pl.jit.inline` and `@pl.program` / `@pl.function`), `pl.at` scopes, five loop constructs (`pl.range`/`pl.unroll`/`pl.parallel`/`pl.pipeline`/`pl.spmd`), scalar `pl.read`/`pl.write`, runtime `pl.scope`, vector / cube / mte ops, dynamic B/S shapes
 - `docs/run-and-validate/compile-runtime-workflow.md` — what `python <kernel>.py -p <platform>` does end-to-end (compile passes/codegen → input gen → golden → runtime → validate)
 - `docs/debug-and-tune/debugging.md` — debugging playbook: pypto/ptoas errors, `golden_data` replay, `runtime_dir` reuse, runtime-hang device logs, args-dump / dep-gen
 - `docs/debug-and-tune/performance-tuning.md` — L2 (inter-kernel) and L1/L0 (intra-kernel) tuning: swimlanes, PMU, buffer-occupancy / perf-hint reports
 - `docs/debug-and-tune/cce-incore-profiling.md` — on-device multi-core phase timestamps for fused CCE extern kernels: per-core capture, barrier diagnostics, and exact L2-reconciled partitions
 - `docs/debug-and-tune/precision-tuning.md` — keeping a kernel numerically faithful: `pl.cast` rounding modes vs torch, dtype alignment, fp32 intermediates / no double-cast, quant schemes, the `error_distribution` threshold sweep, and real-weight testing
+- `docs/pypto-coding/distributed-programming.md` — multi-card (L3) kernels: the `@pl.jit.host` driver, HCCL window buffers and `pld.DistributedTensor`, cross-rank `put`/`remote_store`/`remote_load`, and the notify/wait + epoch protocols
 - `docs/pypto-coding/cce-extern-kernel.md` — writing hand-written mixed (cube+vector) CCE kernels behind `pl.jit.extern`: the persistent-kernel runtime model, the tensors-first/scalars-last arg-packing trap, UB/`TPipe`, `SyncAll<false>` cross-core barriers, GM scalar coherency, and the on-device narrowing methodology
 
 ## External Dependencies

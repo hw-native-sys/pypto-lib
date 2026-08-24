@@ -47,9 +47,12 @@ flow (compile → input generation → golden → runtime → validation).
 
 Read [docs/pypto-coding/pypto-coding-style.md](docs/pypto-coding/pypto-coding-style.md) — it covers
 the two kernel forms (`@pl.jit` / `@pl.jit.inline` and `@pl.program` /
-`@pl.function`), `pl.at` scopes, the four loop constructs (`pl.range`,
-`pl.parallel`, `pl.pipeline`, `pl.spmd`), and the vector / cube / mte op
-set.
+`@pl.function`), `pl.at` scopes, the five loop constructs (`pl.range`,
+`pl.unroll`, `pl.parallel`, `pl.pipeline`, `pl.spmd`), runtime scopes
+(`pl.scope`), scalar access (`pl.read` / `pl.write`), and the vector / cube /
+mte op set. For a multi-card kernel, add
+[docs/pypto-coding/distributed-programming.md](docs/pypto-coding/distributed-programming.md)
+— window buffers, cross-rank data movement, and notify / wait.
 
 Existing kernels under `examples/intermediate/` are the best reference for
 single-stage patterns; `models/qwen3_14b/decode_fwd.py` shows a

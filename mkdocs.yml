@@ -75,6 +75,7 @@ nav:
   - PyPTO Coding:
       - Overview: pypto-coding/index.md
       - PyPTO coding style: pypto-coding/pypto-coding-style.md
+      - Distributed programming: pypto-coding/distributed-programming.md
       - CCE extern kernel: pypto-coding/cce-extern-kernel.md
   - Run and Validate:
       - Overview: run-and-validate/index.md
