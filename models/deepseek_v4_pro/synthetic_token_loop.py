@@ -41,6 +41,7 @@ import argparse
 import ast
 import gc
 import importlib
+import inspect
 import os
 from pathlib import Path
 import re
@@ -789,18 +790,29 @@ def _run_session(args, prefill_dir, decode_dir, model_dir):
         prefill_io["sampled_ids"].fill_(-1)
         _share_io(prefill_io, decode_io)
 
+        run_config_parameters = inspect.signature(RunConfig).parameters
+        if "enable_chip_swimlane" in run_config_parameters:
+            swimlane_config = {"enable_chip_swimlane": False}
+        elif "enable_l2_swimlane" in run_config_parameters:
+            swimlane_config = {"enable_l2_swimlane": False}
+        else:
+            raise TypeError(
+                "RunConfig supports neither enable_chip_swimlane nor "
+                "enable_l2_swimlane"
+            )
+
         prefill_config = RunConfig(
             platform=args.platform,
             device_id=0,
             backend_type=BackendType.Ascend950,
-            enable_chip_swimlane=False,
             ring_heap=PREFILL_RING_HEAP,
+            **swimlane_config,
         )
         decode_config = RunConfig(
             platform=args.platform,
             device_id=0,
             backend_type=BackendType.Ascend950,
-            enable_chip_swimlane=False,
+            **swimlane_config,
         )
 
         inherited = _unique_storage_tensors(resident_hosts)
