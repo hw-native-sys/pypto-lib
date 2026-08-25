@@ -181,45 +181,6 @@ assert MLP_M_TILE == TOK_TILE
 TOKEN_EMBED_HIDDEN_BLOCKS = HIDDEN // EMBED_HIDDEN_CHUNK
 
 
-@pl.jit.incore
-def _gate_up_proj_band_spmd(
-    post_norm_mtile: pl.Tensor[[MLP_M_TILE, HIDDEN], pl.BF16],
-    w_gate: pl.Tensor[[LAYER_HIDDEN_ROWS_DYN, INTERMEDIATE], pl.BF16],
-    w_up: pl.Tensor[[LAYER_HIDDEN_ROWS_DYN, INTERMEDIATE], pl.BF16],
-    gate_up_acc_b: pl.Out[pl.Tensor[[2 * MLP_M_TILE, MLP_BAND_WIDTH], pl.FP32]],
-    band_ob0: pl.Scalar[pl.INDEX],
-    band_core_rot: pl.Scalar[pl.INDEX],
-    layer_hidden_base: pl.Scalar[pl.INDEX],
-) -> pl.Tensor[[2 * MLP_M_TILE, MLP_BAND_WIDTH], pl.FP32]:
-    gu_core = (pl.tile.get_block_idx() + band_core_rot) % GATE_UP_SPMD_BLOCKS
-    for rel_ob in pl.range(gu_core, MLP_BAND_BLOCKS, GATE_UP_SPMD_BLOCKS):
-        o0 = (band_ob0 + rel_ob) * MLP_OUT_CHUNK
-        pc0 = pl.slice(post_norm_mtile, [MLP_M_TILE, K_CHUNK], [0, 0])
-        wg0 = pl.slice(w_gate, [K_CHUNK, MLP_OUT_CHUNK], [layer_hidden_base, o0])
-        gate_acc = pl.matmul(pc0, wg0, out_dtype=pl.FP32)
-        for kb in pl.pipeline(1, HIDDEN_BLOCKS, stage=2):
-            k0 = kb * K_CHUNK
-            pci = pl.slice(post_norm_mtile, [MLP_M_TILE, K_CHUNK], [0, k0])
-            wgi = pl.slice(w_gate, [K_CHUNK, MLP_OUT_CHUNK], [layer_hidden_base + k0, o0])
-            gate_acc = pl.matmul_acc(gate_acc, pci, wgi)
-        gate_up_acc_b = pl.assemble(gate_up_acc_b, gate_acc, [0, rel_ob * MLP_OUT_CHUNK])
-
-    up_core = (gu_core + UP_PROJ_CORE_SHIFT) % GATE_UP_SPMD_BLOCKS
-    for rel_ob in pl.range(up_core, MLP_BAND_BLOCKS, GATE_UP_SPMD_BLOCKS):
-        o0 = (band_ob0 + rel_ob) * MLP_OUT_CHUNK
-        pc0 = pl.slice(post_norm_mtile, [MLP_M_TILE, K_CHUNK], [0, 0])
-        wu0 = pl.slice(w_up, [K_CHUNK, MLP_OUT_CHUNK], [layer_hidden_base, o0])
-        up_acc = pl.matmul(pc0, wu0, out_dtype=pl.FP32)
-        for kb in pl.pipeline(1, HIDDEN_BLOCKS, stage=2):
-            k0 = kb * K_CHUNK
-            pci = pl.slice(post_norm_mtile, [MLP_M_TILE, K_CHUNK], [0, k0])
-            wui = pl.slice(w_up, [K_CHUNK, MLP_OUT_CHUNK], [layer_hidden_base + k0, o0])
-            up_acc = pl.matmul_acc(up_acc, pci, wui)
-        gate_up_acc_b = pl.assemble(gate_up_acc_b, up_acc, [MLP_M_TILE, rel_ob * MLP_OUT_CHUNK])
-
-    return gate_up_acc_b
-
-
 @pl.jit.inline(auto_scope=False)
 def _attention_phase_window(
     attn_tile: pl.Tensor[[TOK_TILE, HIDDEN], pl.BF16],
@@ -1406,39 +1367,53 @@ def prefill_layer(
                     mlp_silu_b = pl.create_tensor([MLP_M_TILE, MLP_BAND_WIDTH], dtype=pl.BF16)
 
                     band_core_rot = (mlp_band * MLP_BAND_CORE_ROT_STEP) % GATE_UP_SPMD_BLOCKS
-                    band_ob0_idx: pl.Scalar[pl.INDEX] = pl.cast(band_ob0, pl.INDEX)
-                    band_core_rot_idx: pl.Scalar[pl.INDEX] = pl.cast(band_core_rot, pl.INDEX)
-                    layer_hidden_base_idx: pl.Scalar[pl.INDEX] = pl.cast(layer_hidden_base, pl.INDEX)
-                    # Reference the incore helper so @pl.jit materializes it for
-                    # spmd_submit below. This constant-false branch is removed
-                    # before codegen.
-                    if False:
-                        _gate_up_acc_specialize = pl.create_tensor(
-                            [2 * MLP_M_TILE, MLP_BAND_WIDTH],
-                            dtype=pl.FP32,
-                        )
-                        _gate_up_proj_band_spmd(
-                            post_norm_mtile,
-                            w_gate,
-                            w_up,
-                            _gate_up_acc_specialize,
-                            band_ob0_idx,
-                            band_core_rot_idx,
-                            layer_hidden_base_idx,
-                        )
                     with pl.manual_scope():
-                        gate_up_acc_b, gate_up_tid = pl.spmd_submit(
-                            self._gate_up_proj_band_spmd,  # noqa: F821 - materialized as a @pl.program method by @pl.jit
-                            post_norm_mtile,
-                            w_gate,
-                            w_up,
-                            gate_up_acc_b,
-                            band_ob0_idx,
-                            band_core_rot_idx,
-                            layer_hidden_base_idx,
-                            core_num=GATE_UP_SPMD_BLOCKS,
+                        with pl.spmd(
+                            GATE_UP_SPMD_BLOCKS,
+                            name_hint="gate_up_proj_spmd",
                             deps=[post_norm_ready],
-                        )
+                        ) as gate_up_tid:
+                            gu_core = (pl.tile.get_block_idx() + band_core_rot) % GATE_UP_SPMD_BLOCKS
+                            for rel_ob in pl.range(gu_core, MLP_BAND_BLOCKS, GATE_UP_SPMD_BLOCKS):
+                                o0 = (band_ob0 + rel_ob) * MLP_OUT_CHUNK
+                                pc0 = pl.slice(post_norm_mtile, [MLP_M_TILE, K_CHUNK], [0, 0])
+                                wg0 = pl.slice(w_gate, [K_CHUNK, MLP_OUT_CHUNK], [layer_hidden_base, o0])
+                                gate_acc = pl.matmul(pc0, wg0, out_dtype=pl.FP32)
+                                for kb in pl.pipeline(1, HIDDEN_BLOCKS, stage=2):
+                                    k0 = kb * K_CHUNK
+                                    pci = pl.slice(post_norm_mtile, [MLP_M_TILE, K_CHUNK], [0, k0])
+                                    wgi = pl.slice(
+                                        w_gate,
+                                        [K_CHUNK, MLP_OUT_CHUNK],
+                                        [layer_hidden_base + k0, o0],
+                                    )
+                                    gate_acc = pl.matmul_acc(gate_acc, pci, wgi)
+                                gate_up_acc_b = pl.assemble(
+                                    gate_up_acc_b,
+                                    gate_acc,
+                                    [0, rel_ob * MLP_OUT_CHUNK],
+                                )
+
+                            up_core = (gu_core + UP_PROJ_CORE_SHIFT) % GATE_UP_SPMD_BLOCKS
+                            for rel_ob in pl.range(up_core, MLP_BAND_BLOCKS, GATE_UP_SPMD_BLOCKS):
+                                o0 = (band_ob0 + rel_ob) * MLP_OUT_CHUNK
+                                pc0 = pl.slice(post_norm_mtile, [MLP_M_TILE, K_CHUNK], [0, 0])
+                                wu0 = pl.slice(w_up, [K_CHUNK, MLP_OUT_CHUNK], [layer_hidden_base, o0])
+                                up_acc = pl.matmul(pc0, wu0, out_dtype=pl.FP32)
+                                for kb in pl.pipeline(1, HIDDEN_BLOCKS, stage=2):
+                                    k0 = kb * K_CHUNK
+                                    pci = pl.slice(post_norm_mtile, [MLP_M_TILE, K_CHUNK], [0, k0])
+                                    wui = pl.slice(
+                                        w_up,
+                                        [K_CHUNK, MLP_OUT_CHUNK],
+                                        [layer_hidden_base + k0, o0],
+                                    )
+                                    up_acc = pl.matmul_acc(up_acc, pci, wui)
+                                gate_up_acc_b = pl.assemble(
+                                    gate_up_acc_b,
+                                    up_acc,
+                                    [MLP_M_TILE, rel_ob * MLP_OUT_CHUNK],
+                                )
 
                         with pl.spmd(SILU_SPMD_BLOCKS, name_hint="silu_spmd", deps=[gate_up_tid]) as silu_tid:
                             silu_core = pl.tile.get_block_idx()
