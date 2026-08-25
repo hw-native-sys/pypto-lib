@@ -168,10 +168,18 @@ def _validate_stepped_swimlane(
 ) -> None:
     """Reject stepped scalars when one handle call launches multiple passes."""
     stepped = sorted(spec.name for spec in scalar_specs if spec.has_benchmark_step)
-    if stepped and runtime_cfg.get("enable_l2_swimlane"):
+    swimlane = next(
+        (
+            key
+            for key in ("enable_chip_swimlane", "enable_l2_swimlane")
+            if runtime_cfg.get(key)
+        ),
+        None,
+    )
+    if stepped and swimlane:
         raise ValueError(
             "ScalarSpec benchmark_step is incompatible with "
-            "runtime_cfg enable_l2_swimlane=True; one handle call may launch "
+            f"runtime_cfg {swimlane}=True; one handle call may launch "
             f"multiple physical passes with the same scalar values: {stepped}"
         )
 

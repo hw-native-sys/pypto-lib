@@ -608,23 +608,25 @@ class TestRunJitCompileRuntime:
         fn.compile.assert_not_called()
 
     def test_stepped_scalar_rejects_multi_pass_swimlane_before_compile(self):
-        fn = types.SimpleNamespace(compile=MagicMock())
-        result = run_jit(
-            fn,
-            [
-                ScalarSpec(
-                    "epoch", torch.int32, 0,
-                    compile_runtime=True, benchmark_step=1,
-                )
-            ],
-            runtime_cfg={"enable_l2_swimlane": True},
-            compile_only=True,
-        )
+        # Both the current key and its pre-rename spelling arm the guard.
+        for key in ("enable_chip_swimlane", "enable_l2_swimlane"):
+            fn = types.SimpleNamespace(compile=MagicMock())
+            result = run_jit(
+                fn,
+                [
+                    ScalarSpec(
+                        "epoch", torch.int32, 0,
+                        compile_runtime=True, benchmark_step=1,
+                    )
+                ],
+                runtime_cfg={key: True},
+                compile_only=True,
+            )
 
-        assert not result.passed
-        assert "benchmark_step is incompatible" in (result.error or "")
-        assert "enable_l2_swimlane=True" in (result.error or "")
-        fn.compile.assert_not_called()
+            assert not result.passed
+            assert "benchmark_step is incompatible" in (result.error or "")
+            assert f"{key}=True" in (result.error or "")
+            fn.compile.assert_not_called()
 
     def test_duplicate_specs_fail_before_compile(self):
         fn = types.SimpleNamespace(compile=MagicMock())

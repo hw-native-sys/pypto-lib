@@ -62,9 +62,10 @@ warmup launches, receives `value + i * benchmark_step`. L2 benchmarks reject
 stepped scalars because they do not provide this persistent-window contract. A
 stepped scalar compiled through `run_jit` must also use `compile_runtime=True`;
 otherwise the compiler is allowed to fold the initial value into the artifact.
-Stepped scalars cannot be combined with `runtime_cfg={"enable_l2_swimlane":
-True}`: that mode may execute multiple physical passes for one handle call while
-reusing the same argument list, so the harness rejects the combination.
+Stepped scalars cannot be combined with `runtime_cfg={"enable_chip_swimlane":
+True}` (nor its pre-rename spelling `enable_l2_swimlane`): that mode may
+execute multiple physical passes for one handle call while reusing the same
+argument list, so the harness rejects the combination.
 `compile_runtime` affects fresh compilation only: passing `runtime_dir` does not
 retrofit an older artifact. A `runtime_dir` invocation is therefore a
 correctness-only replay and skips `PYPTO_BENCH`, even when an L3 program can be
