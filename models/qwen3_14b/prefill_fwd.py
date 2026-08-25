@@ -632,7 +632,7 @@ def _attention_phase_window_full_single_block(
                     pl.slice(cur_li0, [Q_HEAD_BATCH_PAD, 1], [0, 0]),
                     [acc_li_row0, 0],
                 )
-        pl.system.syncall(core_type="mix")
+        pl.system.syncall(core_type=pl.KernelType.MIX)
 
         for final_work_id in pl.range(
             phase_core,

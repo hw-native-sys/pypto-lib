@@ -125,7 +125,7 @@ def _hc_pre_syncall(
                     x_sq_row = pl.reshape(x_sq_sum, [1, T_TILE])
                     sq_part = pl.add(sq_part, x_sq_row)
                 sq_partials[rms_split : rms_split + 1, t0 : t0 + T_TILE] = sq_part
-        pl.system.syncall(core_type="mix")
+        pl.system.syncall(core_type=pl.KernelType.MIX)
 
         for aiv_id in pl.split_aiv(2, mode=pl.SplitMode.NONE):
             lane = core * 2 + aiv_id
@@ -145,7 +145,7 @@ def _hc_pre_syncall(
                         sq_partial = sq_partials[rms_split : rms_split + 1, rms_t0 : rms_t0 + T_TILE]
                         sq_total = pl.add(sq_total, sq_partial)
                     sq_sum_acc[0:1, rms_t0 : rms_t0 + T_TILE] = sq_total
-        pl.system.syncall(core_type="mix")
+        pl.system.syncall(core_type=pl.KernelType.MIX)
 
         for aiv_id in pl.split_aiv(2, mode=pl.SplitMode.NONE):
             lane = core * 2 + aiv_id
