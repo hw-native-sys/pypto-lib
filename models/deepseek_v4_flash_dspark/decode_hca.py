@@ -58,19 +58,21 @@ from rmsnorm import rms_norm
 from rope_interleave import rope_interleave
 from decode_compressor_ratio128 import compressor_ratio128
 from decode_o_proj import (
+    ATTENTION_READY_ROWS,
     ATTENTION_WINDOW_ROWS,
-    GROUP_T_PAD,
     LOCAL_O_GROUPS,
     LOCAL_O_WIDTH,
     LOCAL_T,
     LOCAL_T_PAD,
+    O_A_T_TILE,
     O_WINDOW_ROWS,
-    decode_sharded_o_projection_reduce_scatter,
     decode_o_proj_tp1,
-    o_group_a2a_finish,
+    decode_streaming_o_projection_reduce_scatter,
 )
 from decode_sparse_attn_hca import (
+    HCA_A2A_READY_COUNT,
     HCA_MAX_COMPRESSED_ROWS,
+    HCA_O_A_T_TILE,
     T_PAD,
     VALID_TOKEN_TILE,
     sparse_attn_hca,
@@ -134,6 +136,8 @@ if T != LOCAL_T:
     raise ValueError(f"HCA token capacity {T} must equal TP local token capacity {LOCAL_T}")
 if T_PAD != LOCAL_T_PAD:
     raise ValueError(f"HCA token capacity {T_PAD} must equal TP local token capacity {LOCAL_T_PAD}")
+if HCA_O_A_T_TILE != O_A_T_TILE:
+    raise ValueError(f"HCA ready tile {HCA_O_A_T_TILE} must equal O-A token tile {O_A_T_TILE}")
 
 
 @pl.jit.inline(auto_scope=False)
@@ -176,6 +180,7 @@ def decode_hca(
     x_out: pl.Tensor[[T_DYN, HC_MULT, D], pl.FP32],
     attention_window: pld.DistributedTensor[[ATTENTION_WINDOW_ROWS, O_GROUP_IN], pl.BF16],
     attention_signal: pld.DistributedTensor[[TP_SIZE, 1], pl.INT32],
+    attention_ready: pld.DistributedTensor[[ATTENTION_READY_ROWS, 1], pl.INT32],
     o_window: pld.DistributedTensor[[O_WINDOW_ROWS, D], pl.FP32],
     o_signal: pld.DistributedTensor[[TP_SIZE, 1], pl.INT32],
     group_base: pl.Scalar[pl.INT32],
@@ -231,41 +236,41 @@ def decode_hca(
     )
     cache_ready_dep = pl.system.task_dummy(deps=[ori_cache_write_tid, cmp_cache_write_tid])
 
-    attention_local_flat = pl.create_tensor([ATTENTION_WINDOW_ROWS, O_GROUP_IN], dtype=pl.BF16)
     attn_out = pl.create_tensor([t_dim, D], dtype=pl.BF16)
     with pl.scope():
         attention_grouped = pl.create_tensor(
             [O_GROUPS * LOCAL_T_PAD, O_GROUP_IN],
             dtype=pl.BF16,
         )
-        attention_signal, publish_tid = sparse_attn_hca_a2a(
+        (
+            attention_signal,
+            attention_ready,
+            ready_registration_tid,
+            publish_tid,
+        ) = sparse_attn_hca_a2a(
             q, kv_cache, window_swa_indices,
             cmp_kv, cmp_block_table,
             position_ids, kv_seq_lens,
             attn_sink, freqs_cos, freqs_sin,
             attention_grouped,
-            attention_window, attention_signal,
+            attention_window, attention_signal, attention_ready,
             group_base, tp_rank, local_t,
             cache_ready_dep,
         )
-        attention_local_flat, attention_signal = o_group_a2a_finish(
-            attention_local_flat,
-            attention_window, attention_signal,
-            group_base, tp_rank, local_t,
-            publish_tid, 48,
-        )
-
-        attention_local_groups = pl.reshape(
-            attention_local_flat,
-            [LOCAL_O_GROUPS, GROUP_T_PAD, O_GROUP_IN],
-        )
         o_local = pl.create_tensor([LOCAL_T_PAD, D], dtype=pl.BF16)
-        o_local, o_signal = decode_sharded_o_projection_reduce_scatter(
-            attention_local_groups,
+        (
+            o_local,
+            attention_signal,
+            attention_ready,
+            o_signal,
+        ) = decode_streaming_o_projection_reduce_scatter(
+            attention_window, attention_signal, attention_ready,
             wo_a, wo_b, wo_b_scale,
             local_t, o_local,
             o_window, o_signal,
             group_base, tp_rank,
+            ready_registration_tid, publish_tid,
+            48, HCA_A2A_READY_COUNT,
         )
 
         for bridge_block in pl.spmd(t_dim // HCA_WB_TOKEN_TILE, name_hint="hca_output_bridge"):
@@ -320,6 +325,7 @@ def decode_hca_test(
     x_out: pl.Out[pl.Tensor[[T_DYN, HC_MULT, D], pl.FP32]],
     attention_window: pld.DistributedTensor[[ATTENTION_WINDOW_ROWS, O_GROUP_IN], pl.BF16],
     attention_signal: pld.DistributedTensor[[TP_SIZE, 1], pl.INT32],
+    attention_ready: pld.DistributedTensor[[ATTENTION_READY_ROWS, 1], pl.INT32],
     o_window: pld.DistributedTensor[[O_WINDOW_ROWS, D], pl.FP32],
     o_signal: pld.DistributedTensor[[TP_SIZE, 1], pl.INT32],
     group_base: pl.Scalar[pl.INT32],
@@ -359,7 +365,7 @@ def decode_hca_test(
         attn_sink,
         wo_a, wo_b, wo_b_scale,
         x_out,
-        attention_window, attention_signal, o_window, o_signal,
+        attention_window, attention_signal, attention_ready, o_window, o_signal,
         group_base, tp_rank, local_t,
     )
 
@@ -422,12 +428,14 @@ def l3_decode_hca(
 
     attention_window_buf = pld.alloc_window_buffer([ATTENTION_WINDOW_ROWS, O_GROUP_IN], dtype=pl.BF16)
     attention_signal_buf = pld.alloc_window_buffer([TP_SIZE, 1], dtype=pl.INT32)
+    attention_ready_buf = pld.alloc_window_buffer([ATTENTION_READY_ROWS, 1], dtype=pl.INT32)
     o_window_buf = pld.alloc_window_buffer([O_WINDOW_ROWS, D], dtype=pl.FP32)
     o_signal_buf = pld.alloc_window_buffer([TP_SIZE, 1], dtype=pl.INT32)
 
     for rank in pl.range(pld.world_size()):
         attention_window = pld.window(attention_window_buf, [ATTENTION_WINDOW_ROWS, O_GROUP_IN], dtype=pl.BF16)
         attention_signal = pld.window(attention_signal_buf, [TP_SIZE, 1], dtype=pl.INT32)
+        attention_ready = pld.window(attention_ready_buf, [ATTENTION_READY_ROWS, 1], dtype=pl.INT32)
         o_window = pld.window(o_window_buf, [O_WINDOW_ROWS, D], dtype=pl.FP32)
         o_signal = pld.window(o_signal_buf, [TP_SIZE, 1], dtype=pl.INT32)
         decode_hca_test(
@@ -446,7 +454,7 @@ def l3_decode_hca(
             attn_sink[rank],
             wo_a[rank], wo_b[rank], wo_b_scale[rank],
             x_out[rank],
-            attention_window, attention_signal, o_window, o_signal,
+            attention_window, attention_signal, attention_ready, o_window, o_signal,
             0, rank, local_t, device=rank,
         )
 

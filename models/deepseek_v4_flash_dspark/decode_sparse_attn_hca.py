@@ -70,6 +70,7 @@ ATTN_D_TILE = 256
 H_TILE = 16
 QK_M_TILE = 32
 HCA_A2A_T_TILE = 8
+HCA_O_A_T_TILE = 16
 CMP_PAGES_PER_WORK = ATTN_K_TILE // BLOCK_SIZE
 ROPE_TILE = 16
 ROPE_INTERLEAVE_TILE = 2 * ROPE_TILE
@@ -78,7 +79,9 @@ T_PAD = ((T + 16 - 1) // 16) * 16
 LOCAL_O_GROUPS = O_GROUPS // TP
 GROUP_T_PAD = TP * T_PAD
 ATTENTION_WINDOW_ROWS = LOCAL_O_GROUPS * GROUP_T_PAD
+ATTENTION_READY_ROWS = GROUP_T_PAD // HCA_O_A_T_TILE
 PACK_GROUPS = H_TILE // HEADS_PER_GROUP
+HCA_A2A_READY_COUNT = (HCA_O_A_T_TILE // HCA_A2A_T_TILE) * (LOCAL_O_GROUPS // PACK_GROUPS)
 
 if WIN != ATTN_K_TILE:
     raise ValueError("HCA raw window must form one baseline-sized attention tile")
@@ -102,6 +105,8 @@ if LOCAL_O_GROUPS % PACK_GROUPS != 0:
     raise ValueError(f"local output groups {LOCAL_O_GROUPS} must contain complete HCA pack tiles")
 if T % HCA_A2A_T_TILE != 0:
     raise ValueError(f"HCA token capacity {T} must be divisible by A2A tile {HCA_A2A_T_TILE}")
+if HCA_O_A_T_TILE % HCA_A2A_T_TILE != 0:
+    raise ValueError(f"O-A token tile {HCA_O_A_T_TILE} must contain complete HCA A2A tiles")
 
 
 @pl.jit.inline(auto_scope=False)
@@ -868,6 +873,7 @@ def sparse_attn_hca_a2a(
     attention_grouped: pl.Tensor[[O_GROUPS * T_PAD, O_GROUP_IN], pl.BF16],
     exchange_window: pld.DistributedTensor[[ATTENTION_WINDOW_ROWS, O_GROUP_IN], pl.BF16],
     exchange_signal: pld.DistributedTensor[[TP, 1], pl.INT32],
+    exchange_ready: pld.DistributedTensor[[ATTENTION_READY_ROWS, 1], pl.INT32],
     group_base: pl.Scalar[pl.INT32],
     tp_rank: pl.Scalar[pl.INT32],
     local_t: pl.Scalar[pl.INT32],
@@ -965,6 +971,15 @@ def sparse_attn_hca_a2a(
                     chunk_cols=O_GROUP_IN,
                 )
 
+            ready_row = (tp_rank * local_t + stream_t0) // HCA_O_A_T_TILE
+            pld.system.notify(
+                target=exchange_ready,
+                peer=group_base + destination_rank,
+                offsets=[ready_row, 0],
+                value=1,
+                op=pld.NotifyOp.AtomicAdd,
+            )
+
         for destination_rank in pl.range(TP):
             if destination_rank != tp_rank:
                 pld.system.notify(
@@ -975,7 +990,7 @@ def sparse_attn_hca_a2a(
                     op=pld.NotifyOp.AtomicAdd,
                 )
 
-    return exchange_signal, publish_tid
+    return exchange_signal, exchange_ready, stream_heads_tid, publish_tid
 
 
 @pl.jit
