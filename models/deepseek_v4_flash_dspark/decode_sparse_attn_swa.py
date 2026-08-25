@@ -98,7 +98,7 @@ def sparse_attn_swa(
     t_win = t_dim * WIN
     t_blk = t_dim * (H // H_TILE) * SPARSE_BLOCKS * H_TILE
     t_hblocks = t_dim * (H // H_TILE)
-    t_gather = t_dim // GATHER_T
+    t_gather = (t_dim + GATHER_T - 1) // GATHER_T
     rope_cs_blocks = t_dim // ROPE_CS_T_TILE
     ori_block_num = pl.tensor.dim(ori_kv, 0)
     ori_kv_flat = pl.reshape(ori_kv, [ori_block_num * BLOCK_SIZE, HEAD_DIM])
@@ -112,32 +112,53 @@ def sparse_attn_swa(
         g_grp = pl.tile.get_block_idx()
         for g_tok in pl.unroll(GATHER_T):
             g_t = g_grp * GATHER_T + g_tok
-            g_base = g_t * WIN
-            # Probe each sub-tile's first/last slot: endpoints GATHER_RUN-1 apart mean
-            # the whole run sits in one paged block and moves as one bulk copy.
-            for g_sub in pl.range(WIN // GATHER_RUN):
-                g_sr0 = g_sub * GATHER_RUN
-                g_sdst = g_base + g_sr0
-                g_first = pl.read(swa_indices, [g_t, g_sr0])
-                g_last = pl.read(swa_indices, [g_t, g_sr0 + GATHER_RUN - 1])
-                # A -1 slot anywhere in the run pins g_run_ok below the match value,
-                # so an invalid or block-straddling run takes the per-row path.
-                g_run_ok = (g_last - g_first) + pl.min(g_first, 0) * GATHER_RUN
-                if g_run_ok == GATHER_RUN - 1:
-                    g_run_src = pl.cast(g_first, pl.INDEX)
-                    swa_kv_flat[g_sdst : g_sdst + GATHER_RUN, 0 : HEAD_DIM] = ori_kv_flat[
-                        g_run_src : g_run_src + GATHER_RUN, 0 : HEAD_DIM
-                    ]
-                else:
-                    for g_dr in pl.range(GATHER_RUN):
-                        g_dst = g_sdst + g_dr
-                        g_slot_i32 = pl.read(swa_indices, [g_t, g_sr0 + g_dr])
-                        if g_slot_i32 >= 0:
-                            g_slot = pl.cast(g_slot_i32, pl.INDEX)
-                            swa_kv_flat[g_dst : g_dst + 1, 0 : HEAD_DIM] = ori_kv_flat[g_slot : g_slot + 1, 0 : HEAD_DIM]
-                        else:
-                            swa_kv_flat[g_dst : g_dst + 1, 0 : HEAD_DIM] = pl.full(
-                                [1, HEAD_DIM], dtype=pl.BF16, value=0.0)
+            if g_t < t_dim:
+                g_base = g_t * WIN
+                # Probe each sub-tile's first/last slot: endpoints
+                # GATHER_RUN-1 apart mean the whole run sits in one paged block
+                # and moves as one bulk copy.
+                for g_sub in pl.range(WIN // GATHER_RUN):
+                    g_sr0 = g_sub * GATHER_RUN
+                    g_sdst = g_base + g_sr0
+                    g_first = pl.read(swa_indices, [g_t, g_sr0])
+                    g_last = pl.read(
+                        swa_indices, [g_t, g_sr0 + GATHER_RUN - 1]
+                    )
+                    # A -1 slot anywhere in the run pins g_run_ok below the
+                    # match value, so an invalid or block-straddling run takes
+                    # the per-row path.
+                    g_run_ok = (
+                        (g_last - g_first)
+                        + pl.min(g_first, 0) * GATHER_RUN
+                    )
+                    if g_run_ok == GATHER_RUN - 1:
+                        g_run_src = pl.cast(g_first, pl.INDEX)
+                        swa_kv_flat[
+                            g_sdst : g_sdst + GATHER_RUN, 0 : HEAD_DIM
+                        ] = ori_kv_flat[
+                            g_run_src : g_run_src + GATHER_RUN, 0 : HEAD_DIM
+                        ]
+                    else:
+                        for g_dr in pl.range(GATHER_RUN):
+                            g_dst = g_sdst + g_dr
+                            g_slot_i32 = pl.read(
+                                swa_indices, [g_t, g_sr0 + g_dr]
+                            )
+                            if g_slot_i32 >= 0:
+                                g_slot = pl.cast(g_slot_i32, pl.INDEX)
+                                swa_kv_flat[
+                                    g_dst : g_dst + 1, 0 : HEAD_DIM
+                                ] = ori_kv_flat[
+                                    g_slot : g_slot + 1, 0 : HEAD_DIM
+                                ]
+                            else:
+                                swa_kv_flat[
+                                    g_dst : g_dst + 1, 0 : HEAD_DIM
+                                ] = pl.full(
+                                    [1, HEAD_DIM],
+                                    dtype=pl.BF16,
+                                    value=0.0,
+                                )
 
     gather_tids[0] = gather_tid
 

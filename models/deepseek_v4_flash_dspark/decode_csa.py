@@ -297,7 +297,7 @@ def decode_csa(
         cache_ready_dep = pl.system.task_dummy(deps=[ori_cache_write_tid, cmp_cache_write_tid])
 
         idx_kv_unused = pl.create_tensor([t_dim, IDX_HEAD_DIM], dtype=pl.FP32)
-        indexer(
+        idx_topk_scores, idx_topk = indexer(
             x_normed_t, qr, qr_scale, idx_wq_b, idx_wq_b_scale,
             weights_proj, idx_cos_il, idx_sin_signed, cmp_cos_il, cmp_sin_signed,
             hadamard_idx,
@@ -752,7 +752,7 @@ def decode_csa_tp1(
         cache_ready_dep = pl.system.task_dummy(deps=[ori_cache_write_tid, cmp_cache_write_tid])
 
         idx_kv_unused = pl.create_tensor([t_dim, IDX_HEAD_DIM], dtype=pl.FP32)
-        indexer(
+        idx_topk_scores, idx_topk = indexer(
             x_normed_t, qr, qr_scale, idx_wq_b, idx_wq_b_scale,
             weights_proj, idx_cos_il, idx_sin_signed, cmp_cos_il, cmp_sin_signed,
             hadamard_idx,
