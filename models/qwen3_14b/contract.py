@@ -50,7 +50,7 @@ def _arg(
 
 
 _PREFILL_ARGS = (
-    _arg("hidden_states", "bf16", ("PREFILL_TOKENS", "H")),
+    _arg("input_ids", "int32", ("PREFILL_TOKENS",)),
     _arg("seq_lens", "int32", ("BATCH",)),
     _arg("chunk_lens", "int32", ("BATCH",)),
     _arg("chunk_offsets", "int32", ("BATCH",)),
@@ -73,6 +73,7 @@ _PREFILL_ARGS = (
     _arg("post_rms_weight", "fp32", ("L", "H")),
     _arg("final_norm_weight", "fp32", (1, "H")),
     _arg("lm_head_weight", "bf16", ("VOCAB", "H")),
+    _arg("embed_weight", "bf16", ("VOCAB", "H")),
     _arg("out", "fp32", ("BATCH", "VOCAB"), "out"),
 )
 
@@ -119,7 +120,7 @@ def bind_qwen3_kernel_functions(
 
 @pl.jit.host
 def qwen3_prefill_host(
-    hidden_states: pl.Tensor,
+    input_ids: pl.Tensor,
     seq_lens: pl.Tensor,
     chunk_lens: pl.Tensor,
     chunk_offsets: pl.Tensor,
@@ -142,10 +143,11 @@ def qwen3_prefill_host(
     post_rms_weight: pl.Tensor,
     final_norm_weight: pl.Tensor,
     lm_head_weight: pl.Tensor,
+    embed_weight: pl.Tensor,
     out: pl.Out[pl.Tensor],
 ) -> pl.Tensor:
     return prefill_fwd(
-        hidden_states,
+        input_ids,
         seq_lens,
         chunk_lens,
         chunk_offsets,
@@ -168,6 +170,7 @@ def qwen3_prefill_host(
         w_down,
         final_norm_weight,
         lm_head_weight,
+        embed_weight,
         out,
     )
 
@@ -244,9 +247,11 @@ def build_prefill_compile_args(model_config: Any, runtime_config: Any) -> tuple[
 
     dims = _dims(model_config, runtime_config)
     total_tokens = dims["batch"] * dims["max_seq"]
-    cache_rows = dims["batch"] * dims["runtime_cache_blocks"] * dims["layers"] * dims["kv_heads"] * dims["page"]
+    cache_rows = (
+        dims["batch"] * dims["runtime_cache_blocks"] * dims["layers"] * dims["kv_heads"] * dims["page"]
+    )
     return (
-        torch.empty((total_tokens, dims["hidden"]), dtype=torch.bfloat16),
+        torch.empty((total_tokens,), dtype=torch.int32),
         torch.empty((dims["batch"],), dtype=torch.int32),
         torch.empty((dims["batch"],), dtype=torch.int32),
         torch.empty((dims["batch"],), dtype=torch.int32),
@@ -269,6 +274,7 @@ def build_prefill_compile_args(model_config: Any, runtime_config: Any) -> tuple[
         torch.empty((dims["layers"], dims["hidden"]), dtype=torch.float32),
         torch.empty((1, dims["hidden"]), dtype=torch.float32),
         torch.empty((dims["vocab"], dims["hidden"]), dtype=torch.bfloat16),
+        torch.empty((dims["vocab"], dims["hidden"]), dtype=torch.bfloat16),
         torch.empty((dims["batch"], dims["vocab"]), dtype=torch.float32),
     )
 
@@ -280,7 +286,9 @@ def build_decode_compile_args(model_config: Any, runtime_config: Any) -> tuple[t
     # No batch ceiling: decode_fwd runs a public batch above the padded pipeline
     # width as consecutive batch_pad-row windows.
     dims = _dims(model_config, runtime_config, batch_limit=None)
-    cache_rows = dims["layers"] * dims["batch"] * dims["runtime_cache_blocks"] * dims["kv_heads"] * dims["page"]
+    cache_rows = (
+        dims["layers"] * dims["batch"] * dims["runtime_cache_blocks"] * dims["kv_heads"] * dims["page"]
+    )
     return (
         torch.empty((dims["layers"], dims["hidden"]), dtype=torch.float32),
         torch.empty((dims["layers"] * dims["hidden"], dims["hidden"]), dtype=torch.bfloat16),
@@ -332,7 +340,7 @@ def build_prefill_runtime_args(
     """Build arguments in qwen3_prefill_host signature order."""
     weights = static.decode_weights
     return (
-        inputs.hidden,
+        inputs.token_ids,
         inputs.seq_lens,
         inputs.chunk_lens,
         inputs.chunk_offsets,
@@ -355,6 +363,7 @@ def build_prefill_runtime_args(
         weights["decode_post_rms_weight"],
         static.final_norm_weight,
         static.padded_lm_head_weight,
+        static.padded_embed_weight,
         logits,
     )
 
@@ -466,7 +475,9 @@ def validate_qwen3_kernel_modules(
     _expect(constants, "decode_num_layers", int(config.num_hidden_layers), "decode_fwd NUM_LAYERS mismatch")
     _expect(constants, "decode_vocab", padded_vocab, "decode_fwd VOCAB mismatch")
     _expect(constants, "decode_real_vocab", int(config.vocab_size), "decode_fwd REAL_VOCAB mismatch")
-    _expect(constants, "decode_sampled_ids_pad", int(contract.limits["sampled_ids_pad"]), "decode sampled width")
+    _expect(
+        constants, "decode_sampled_ids_pad", int(contract.limits["sampled_ids_pad"]), "decode sampled width"
+    )
     _expect(constants, "greedy_sample_batch_pad", kernel_batch_pad, "greedy_sample_fwd BATCH_PAD mismatch")
     _expect(constants, "greedy_sample_vocab", padded_vocab, "greedy_sample_fwd VOCAB mismatch")
 
@@ -490,7 +501,9 @@ def validate_qwen3_kernel_modules(
         )
     total_kv_pages = getattr(runtime, "total_kv_pages", None)
     if total_kv_pages is not None and int(total_kv_pages) < kernel_batch_pad:
-        raise ValueError(f"total_kv_pages must be at least kernel_batch_pad ({kernel_batch_pad}), got {total_kv_pages}")
+        raise ValueError(
+            f"total_kv_pages must be at least kernel_batch_pad ({kernel_batch_pad}), got {total_kv_pages}"
+        )
     _validate_supported_shape(config)
 
 
@@ -532,10 +545,7 @@ def get_qwen3_14b_contract() -> ModelContract:
 def matches_qwen3_14b_model_config(model_config: object) -> bool:
     """Return whether parsed model metadata matches this Qwen3-14B contract."""
     architectures_raw = getattr(model_config, "architectures", None) or ()
-    architectures = {
-        _normalize_model_config_value(str(value))
-        for value in architectures_raw
-    }
+    architectures = {_normalize_model_config_value(str(value)) for value in architectures_raw}
     architecture = getattr(model_config, "architecture", None)
     if architecture is not None:
         architectures.add(_normalize_model_config_value(str(architecture)))
@@ -580,7 +590,9 @@ def _is_other_pypto_lib_short_module(name: str) -> bool:
     return module_file.startswith(pypto_lib_models_dir) and not module_file.startswith(str(_KERNEL_DIR))
 
 
-def _dims(model_config: Any, runtime_config: Any, batch_limit: int | None = QWEN3_14B.batch_pad) -> dict[str, int]:
+def _dims(
+    model_config: Any, runtime_config: Any, batch_limit: int | None = QWEN3_14B.batch_pad
+) -> dict[str, int]:
     batch = int(runtime_config.max_batch_size)
     max_seq = int(runtime_config.max_seq_len)
     page = int(runtime_config.page_size)
@@ -592,9 +604,7 @@ def _dims(model_config: Any, runtime_config: Any, batch_limit: int | None = QWEN
     if batch < 1:
         raise ValueError(f"Qwen3-14B kernels require max_batch_size >= 1, got {batch}")
     if batch_limit is not None and batch > batch_limit:
-        raise ValueError(
-            f"Qwen3-14B kernels require 1 <= max_batch_size <= {batch_limit}, got {batch}"
-        )
+        raise ValueError(f"Qwen3-14B kernels require 1 <= max_batch_size <= {batch_limit}, got {batch}")
     if max_seq > QWEN3_14B.max_seq:
         raise ValueError(f"Qwen3-14B kernels require max_seq <= {QWEN3_14B.max_seq}, got {max_seq}")
     if page != QWEN3_14B_TILING.block_size:

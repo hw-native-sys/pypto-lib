@@ -21,17 +21,15 @@ the kernel signatures bind.
 | Context length | up to 4096 positions, paged in 128-token pages (`seq_tile`) |
 | Decode batch | the pipeline is padded to **16 rows** (`batch_pad`); any public batch ≥ 1 runs as `ceil(batch / 16)` row windows |
 | Parallelism | single card — no TP, no EP, no DP |
-| Platform | Ascend A2/A3; the BF16 decode attention is A2/A3-only because it calls a CANN operator |
+| Platform | Ascend A2/A3; the native PyPTO BF16 decode path also has A2/A3-sim compile coverage |
 | Precision, main path | BF16 weights and KV cache, FP32 inter-layer residual carry, FP32 RMSNorm weights |
 | Precision, A8W8 path | INT8 weights with per-token INT8 activations, in the `*_a8w8` entries only |
 | Serving | [contract.py](../../models/qwen3_14b/contract.py) registers the BF16 prefill and decode stages for `pypto-serving` |
 
 `batch_pad` is a throughput knob, not a capacity limit: a wider pad does more
-rows per weight read, but raising it means bumping `kMaxBatch` and the metadata
-length arrays on the CCE side, regenerating the RoPE body, and re-validating
-the M-dimension tiling. Past 16 rows correctness scales and cost does not
-amortize — windows serialize on the single paged-attention metadata/workspace
-pair and re-read the weights.
+rows per weight read, while public batches above 16 are split into row windows
+by the device-side `decode_fwd`. Each window reuses the native Page Attention
+scratch tensors through explicit task dependencies and re-reads the weights.
 
 ## Model structure, top down
 
@@ -64,24 +62,20 @@ device-side step:
 decode_fwd    _token_embed_inline (embed the previously sampled id)
               ×40  _decode_layer
                      RMSNorm → QKV projection → Q/K norm → RoPE
-                     → KV cache write
-                     → paged_attention_cce  (CANN FusedInferAttentionScore)
+                     → BSND KV cache write → native PyPTO paged attention
                      → output projection → post-attention RMSNorm
                      → SwiGLU MLP → FP32 residual
               rms_lm_head → _greedy_sample_inline → sampled_ids_out
 ```
 
-The attention stage is the one part that is not pypto-generated:
-[paged_attention_cce.py](../../models/qwen3_14b/paged_attention_cce.py) binds
-the hand-written CCE kernel under
-[kernels/paged_attention_cce/](../../models/qwen3_14b/kernels/paged_attention_cce/)
-through `pl.jit.extern`. Its public ABI matches vLLM — Q/O are active TND and
-the flat paged K/V buffers hold BSND bytes ordered `[page, token, kv_head,
-dim]`. The kernel embeds a copied pypto/ptoas codegen artifact,
-`kernel/rope_qkv_generated.hpp`, as its in-kernel phase 0;
-[rope_qkv_regen.py](../../models/qwen3_14b/rope_qkv_regen.py) is the standalone
-program that regenerates that header — it is compile-only and never reaches a
-device.
+The complete attention stage is generated from
+[paged_attention_pypto.py](../../models/qwen3_14b/paged_attention_pypto.py).
+Its Phase 0 applies Q/K norm and RoPE, then appends K/V to the paged BSND cache;
+the following mixed AIC/AIV task computes ragged GQA Page Attention. The public
+ABI remains vLLM-compatible: Q/O are active TND and the flat paged K/V buffers
+are ordered `[page, token, kv_head, dim]`. The former hand-written CCE extern,
+generated Phase-0 header, runtime tiler, and migration selector have been
+removed, so production decode has one implementation path.
 
 `decode_fwd_layers` in the same file is the same fused body over a contiguous
 layer *chunk* with no LM head, for callers that compose the stack externally.
@@ -132,13 +126,38 @@ scheduling — with the limit measured at each step.
 | --- | --- |
 | Forwards | [decode_fwd.py](../../models/qwen3_14b/decode_fwd.py), [prefill_fwd.py](../../models/qwen3_14b/prefill_fwd.py) |
 | Quantized variants | [decode_layer_a8w8.py](../../models/qwen3_14b/decode_layer_a8w8.py), [prefill_fwd_a8w8.py](../../models/qwen3_14b/prefill_fwd_a8w8.py), [turboquant_kv.py](../../models/qwen3_14b/turboquant_kv.py) |
-| CCE attention | [paged_attention_cce.py](../../models/qwen3_14b/paged_attention_cce.py), [kernels/paged_attention_cce/](../../models/qwen3_14b/kernels/paged_attention_cce/), [rope_qkv_regen.py](../../models/qwen3_14b/rope_qkv_regen.py), [test_paged_attention_cce.py](../../models/qwen3_14b/test_paged_attention_cce.py) |
+| Page Attention | [paged_attention_pypto.py](../../models/qwen3_14b/paged_attention_pypto.py), [test_paged_attention_pypto.py](../../models/qwen3_14b/test_paged_attention_pypto.py) |
 | Output and sampling | [rms_lm_head.py](../../models/qwen3_14b/rms_lm_head.py), [greedy_sample.py](../../models/qwen3_14b/greedy_sample.py), [topk_select.py](../../models/qwen3_14b/topk_select.py) |
 | Configuration and serving | [constants.py](../../models/qwen3_14b/constants.py), [config.py](../../models/qwen3_14b/config.py), [weights.py](../../models/qwen3_14b/weights.py), [contract.py](../../models/qwen3_14b/contract.py) |
 | Drafts (excluded from CI) | [decode_ssn_draft.py](../../models/qwen3_14b/decode_ssn_draft.py), [decode_tq_draft.py](../../models/qwen3_14b/decode_tq_draft.py), [prefill_tq_draft.py](../../models/qwen3_14b/prefill_tq_draft.py) |
 
 `constants.py`, `config.py`, `contract.py`, `weights.py`, `rms_lm_head.py`,
-`paged_attention_cce.py`, `turboquant_kv.py`, and `prefill_fwd_a8w8.py` have no
+`paged_attention_pypto.py`, `turboquant_kv.py`, and `prefill_fwd_a8w8.py` have no
 `__main__` block and are imported rather than run. Which entry points CI
 schedules is defined by the
 [daily model workflow](../../.github/workflows/daily_ci.yml).
+
+## Validation
+
+The Page Attention component driver provides focused deterministic Torch-oracle
+cases, focused and full pairwise matrix presets, wrapper-codegen checks, and
+optional raw benchmark recording. Performance reports are informational and
+never gate the production implementation.
+
+Run the component PR matrix and a B17 production-decode golden (one full window
+plus a one-row tail window) on an A2/A3 device with:
+
+```bash
+python models/qwen3_14b/test_paged_attention_pypto.py \
+  -p a2a3 -d "$DEVICE_ID" --matrix pr \
+  --matrix-json /tmp/qwen3-pa-matrix.json
+
+python models/qwen3_14b/decode_fwd.py \
+  -p a2a3 -d "$DEVICE_ID" --validate-fwd --fwd-layers 1 -b 17 \
+  --seq-lens 1,2,127,128,129,255,256,257,511,512,513,1023,2048,3584,4095,4096,129
+```
+
+Repository CI routes PA changes through the generic A2/A3 component smoke and
+single-layer decode golden, then runs real-weight `pypto-serving` accuracy
+coverage on A2/A3. The larger matrix commands above remain available for
+focused validation.
