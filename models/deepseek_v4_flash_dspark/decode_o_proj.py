@@ -367,6 +367,92 @@ def o_group_a2a(
     return local_groups_out, exchange_signal
 
 
+@pl.jit.inline
+def o_group_a2a_finish(
+    local_groups_out: pl.Tensor[[ATTENTION_WINDOW_ROWS, O_GROUP_IN], pl.BF16],
+    exchange_window: pld.DistributedTensor[[ATTENTION_WINDOW_ROWS, O_GROUP_IN], pl.BF16],
+    exchange_signal: pld.DistributedTensor[[TP_SIZE, 1], pl.INT32],
+    group_base: pl.Scalar[pl.INT32],
+    tp_rank: pl.Scalar[pl.INT32],
+    local_t: pl.Scalar[pl.INT32],
+    publish_dep: pl.Scalar[pl.TASK_ID],
+    publish_count: pl.Scalar[pl.INT32],
+):
+    """Finish a non-overlapping producer-fused exchange and release its window."""
+    with pl.at(
+        level=pl.Level.CORE_GROUP,
+        name_hint="o_group_a2a_wait",
+        deps=[publish_dep],
+    ) as wait_tid:
+        expected = pl.cast(publish_count, pl.INT32)
+        for source_tp in pl.range(TP_SIZE):
+            if source_tp != tp_rank:
+                pld.system.wait(
+                    signal=exchange_signal,
+                    offsets=[source_tp, 0],
+                    expected=expected,
+                    cmp=pld.WaitCmp.Ge,
+                )
+
+    group_t = TP_SIZE * local_t
+    with pl.spmd(
+        48,
+        name_hint="o_group_a2a_gather",
+        deps=[wait_tid],
+    ) as gather_tid:
+        worker = pl.tile.get_block_idx()
+        for local_group in pl.range(LOCAL_O_GROUPS):
+            group_base_row = local_group * GROUP_T_PAD
+            for group_row in pl.range(worker, group_t, 48):
+                copy_row = group_base_row + group_row
+                local_groups_out[
+                    copy_row : copy_row + 1,
+                    0:O_GROUP_IN,
+                ] = exchange_window[
+                    copy_row : copy_row + 1,
+                    0:O_GROUP_IN,
+                ]
+
+    with pl.at(
+        level=pl.Level.CORE_GROUP,
+        name_hint="o_group_a2a_complete",
+        deps=[gather_tid],
+    ):
+        completion_anchor = pl.read(local_groups_out, [0, 0])
+        for peer_tp in pl.range(TP_SIZE):
+            if peer_tp != tp_rank:
+                pld.system.notify(
+                    target=exchange_signal,
+                    peer=group_base + peer_tp,
+                    offsets=[tp_rank, 0],
+                    value=1,
+                    op=pld.NotifyOp.AtomicAdd,
+                )
+
+        completion_expected = pl.cast(publish_count + 1, pl.INT32)
+        for source_tp in pl.range(TP_SIZE):
+            if source_tp != tp_rank:
+                pld.system.wait(
+                    signal=exchange_signal,
+                    offsets=[source_tp, 0],
+                    expected=completion_expected,
+                    cmp=pld.WaitCmp.Ge,
+                )
+
+        reset_value = pl.cast(-completion_expected, pl.INT32)
+        self_rank = group_base + tp_rank
+        for source_tp in pl.range(TP_SIZE):
+            if source_tp != tp_rank:
+                pld.system.notify(
+                    target=exchange_signal,
+                    peer=self_rank,
+                    offsets=[source_tp, 0],
+                    value=reset_value,
+                    op=pld.NotifyOp.AtomicAdd,
+                )
+        pl.write(local_groups_out, [0, 0], completion_anchor)
+    return local_groups_out, exchange_signal
+
 
 @pl.jit
 def decode_attention_collectives_fixture(

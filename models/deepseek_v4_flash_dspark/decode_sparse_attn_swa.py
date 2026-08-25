@@ -14,6 +14,7 @@ variants live in sibling modules.
 
 
 import pypto.language as pl
+import pypto.language.distributed as pld
 
 from config import (
     FLASH as M,
@@ -64,6 +65,7 @@ GATHER_RUN = 16          # window sub-tile probed for physical contiguity -> one
 H_TILE = 32
 QK_M_TILE = 32           # qk_pv M rows per QK/PV matmul; upper bound on H_TILE
 ATTN_K_TILE = 128
+SWA_A2A_T_TILE = 8
 ROPE_TILE = 16
 ROPE_INTERLEAVE_TILE = 2 * ROPE_TILE
 T_PAD = ((T + 16 - 1) // 16) * 16  # T padded up to the 16-row cube M floor
@@ -72,27 +74,33 @@ BIAS_T_TILE = 8     # swa_valid_bias row block, same contract
 TOPK = WIN               # SWA sparse-K width: sliding window only
 SPARSE_BLOCKS = 1        # the SWA window fits one attention K tile
 PADDED_TOPK = SPARSE_BLOCKS * ATTN_K_TILE
+LOCAL_O_GROUPS = O_GROUPS // TP
+GROUP_T_PAD = TP * T_PAD
+ATTENTION_WINDOW_ROWS = LOCAL_O_GROUPS * GROUP_T_PAD
+PACK_GROUPS = H_TILE // HEADS_PER_GROUP
 
-assert BLOCK_SIZE % GATHER_RUN == 0, "a contiguous run must not straddle two paged blocks by construction"
-assert WIN == ATTN_K_TILE, f"SWA decode expects WIN ({WIN}) == ATTN_K_TILE ({ATTN_K_TILE})"
+if BLOCK_SIZE % GATHER_RUN != 0:
+    raise ValueError("a contiguous run must not straddle two paged blocks")
+if WIN != ATTN_K_TILE:
+    raise ValueError(f"SWA decode expects WIN ({WIN}) == ATTN_K_TILE ({ATTN_K_TILE})")
+if O_GROUPS % TP != 0:
+    raise ValueError(f"output groups {O_GROUPS} must be divisible by TP size {TP}")
+if H_TILE % HEADS_PER_GROUP != 0:
+    raise ValueError(f"SWA head tile {H_TILE} must contain complete output groups")
+if T % SWA_A2A_T_TILE != 0:
+    raise ValueError(f"SWA token capacity {T} must be divisible by A2A tile {SWA_A2A_T_TILE}")
 
 
-@pl.jit.inline
-def sparse_attn_swa(
+@pl.jit.inline(auto_scope=False)
+def _sparse_attn_swa_prepare(
     q: pl.Tensor[[T_DYN, H, HEAD_DIM], pl.BF16],
     ori_kv: pl.Tensor[[ORI_BLOCK_NUM_DYN, BLOCK_SIZE, 1, HEAD_DIM], pl.BF16],
     swa_indices: pl.Tensor[[T_DYN, WIN], pl.INT32],
     sparse_bias: pl.Tensor[[T_DYN, PADDED_TOPK], pl.FP32],
-    attn_sink: pl.Tensor[[H], pl.FP32],
     freqs_cos: pl.Tensor[[T_DYN, ROPE_DIM], pl.BF16],
     freqs_sin: pl.Tensor[[T_DYN, ROPE_DIM], pl.BF16],
-    o_packed_heads: pl.Tensor[[O_GROUPS * T_PAD * HEADS_PER_GROUP, HEAD_DIM], pl.BF16],
-) -> tuple[pl.Tensor, pl.Scalar[pl.TASK_ID]]:
-    """Write SWA heads as ``[group, T_PAD, head-in-group, dim]`` slabs.
-
-    Only the first runtime ``t_dim`` rows in each group are valid. The
-    returned task ID covers every write to the packed output tensor.
-    """
+):
+    """Prepare SWA attention partials and inverse-RoPE metadata."""
     t_dim = pl.tensor.dim(q, 0)
     t_heads = t_dim * H
     t_win = t_dim * WIN
@@ -250,11 +258,52 @@ def sparse_attn_swa(
                 rope_cos_il[cs_t0 : cs_t0 + ROPE_CS_T_TILE, cp_c0 : cp_c0 + ROPE_INTERLEAVE_TILE] = cs_cos_dup
                 rope_sin_signed[cs_t0 : cs_t0 + ROPE_CS_T_TILE, cp_c0 : cp_c0 + ROPE_INTERLEAVE_TILE] = cs_sin_signed
 
-    # Flatten the one-block SWA merge over token/head tiles into a single
-    # grid. Each block writes H_TILE // HEADS_PER_GROUP output-projection groups
-    # using the same contiguous per-group stores.
-    with pl.spmd(MERGE_TASKS, name_hint="merge_norm", deps=[qk_tid, rope_tid],
-                 allow_early_resolve=True) as merge_tid:
+    return (
+        sparse_blk_mi,
+        sparse_blk_li,
+        sparse_blk_oi,
+        rope_cos_il,
+        rope_sin_signed,
+        rope_swap_idx,
+        qk_tid,
+        rope_tid,
+    )
+
+
+@pl.jit.inline(auto_scope=False)
+def sparse_attn_swa(
+    q: pl.Tensor[[T_DYN, H, HEAD_DIM], pl.BF16],
+    ori_kv: pl.Tensor[[ORI_BLOCK_NUM_DYN, BLOCK_SIZE, 1, HEAD_DIM], pl.BF16],
+    swa_indices: pl.Tensor[[T_DYN, WIN], pl.INT32],
+    sparse_bias: pl.Tensor[[T_DYN, PADDED_TOPK], pl.FP32],
+    attn_sink: pl.Tensor[[H], pl.FP32],
+    freqs_cos: pl.Tensor[[T_DYN, ROPE_DIM], pl.BF16],
+    freqs_sin: pl.Tensor[[T_DYN, ROPE_DIM], pl.BF16],
+    o_packed_heads: pl.Tensor[[O_GROUPS * T_PAD * HEADS_PER_GROUP, HEAD_DIM], pl.BF16],
+) -> tuple[pl.Tensor, pl.Scalar[pl.TASK_ID]]:
+    """Write SWA heads as ``[group, T_PAD, head-in-group, dim]`` slabs."""
+    (
+        sparse_blk_mi,
+        sparse_blk_li,
+        sparse_blk_oi,
+        rope_cos_il,
+        rope_sin_signed,
+        rope_swap_idx,
+        qk_tid,
+        rope_tid,
+    ) = _sparse_attn_swa_prepare(
+        q, ori_kv, swa_indices, sparse_bias,
+        freqs_cos, freqs_sin,
+    )
+    t_dim = pl.tensor.dim(q, 0)
+    t_hblocks = t_dim * (H // H_TILE)
+
+    with pl.spmd(
+        MERGE_TASKS,
+        name_hint="merge_norm",
+        deps=[qk_tid, rope_tid],
+        allow_early_resolve=True,
+    ) as merge_tid:
         m_task = pl.tile.get_block_idx()
         for m_idx in pl.range(m_task, t_hblocks, MERGE_TASKS):
             m_t = m_idx // (H // H_TILE)
@@ -295,6 +344,129 @@ def sparse_attn_swa(
                 ]
 
     return o_packed_heads, merge_tid
+
+
+@pl.jit.inline(auto_scope=False)
+def sparse_attn_swa_a2a(
+    q: pl.Tensor[[T_DYN, H, HEAD_DIM], pl.BF16],
+    ori_kv: pl.Tensor[[ORI_BLOCK_NUM_DYN, BLOCK_SIZE, 1, HEAD_DIM], pl.BF16],
+    swa_indices: pl.Tensor[[T_DYN, WIN], pl.INT32],
+    sparse_bias: pl.Tensor[[T_DYN, PADDED_TOPK], pl.FP32],
+    attn_sink: pl.Tensor[[H], pl.FP32],
+    freqs_cos: pl.Tensor[[T_DYN, ROPE_DIM], pl.BF16],
+    freqs_sin: pl.Tensor[[T_DYN, ROPE_DIM], pl.BF16],
+    attention_grouped: pl.Tensor[[O_GROUPS * T_PAD, O_GROUP_IN], pl.BF16],
+    exchange_window: pld.DistributedTensor[[ATTENTION_WINDOW_ROWS, O_GROUP_IN], pl.BF16],
+    exchange_signal: pld.DistributedTensor[[TP, 1], pl.INT32],
+    group_base: pl.Scalar[pl.INT32],
+    tp_rank: pl.Scalar[pl.INT32],
+    local_t: pl.Scalar[pl.INT32],
+):
+    """Merge SWA heads and publish completed token slabs to their TP owners."""
+    (
+        sparse_blk_mi,
+        sparse_blk_li,
+        sparse_blk_oi,
+        rope_cos_il,
+        rope_sin_signed,
+        rope_swap_idx,
+        qk_tid,
+        rope_tid,
+    ) = _sparse_attn_swa_prepare(
+        q, ori_kv, swa_indices, sparse_bias,
+        freqs_cos, freqs_sin,
+    )
+    t_dim = pl.tensor.dim(q, 0)
+    pack_work_count = (t_dim // SWA_A2A_T_TILE) * (H // H_TILE)
+    o_packed_heads = pl.reshape(
+        attention_grouped,
+        [O_GROUPS * T_PAD * HEADS_PER_GROUP, HEAD_DIM],
+    )
+
+    with pl.spmd(
+        48,
+        name_hint="swa_merge_pack_publish",
+        deps=[qk_tid, rope_tid],
+    ) as publish_tid:
+        worker = pl.tile.get_block_idx()
+        for pack_work in pl.range(worker, pack_work_count, 48):
+            token_block = pack_work // (H // H_TILE)
+            head_tile = pack_work - token_block * (H // H_TILE)
+            token_start = token_block * SWA_A2A_T_TILE
+            head_start = head_tile * H_TILE
+            global_group_start = head_start // HEADS_PER_GROUP
+
+            for token_delta in pl.range(SWA_A2A_T_TILE):
+                token = token_start + token_delta
+                block_base = token * H + head_start
+                block_m = sparse_blk_mi[block_base : block_base + H_TILE, 0:1]
+                block_l = sparse_blk_li[block_base : block_base + H_TILE, 0:1]
+                block_o = sparse_blk_oi[block_base : block_base + H_TILE, 0:HEAD_DIM]
+
+                sink = pl.reshape(attn_sink[head_start : head_start + H_TILE], [H_TILE, 1])
+                sink_delta = pl.sub(sink, block_m)
+                sink_exp = pl.exp(sink_delta)
+                denom = pl.add(block_l, sink_exp)
+                normalized = pl.row_expand_div(block_o, denom)
+                full = normalized[0:H_TILE, 0:HEAD_DIM]
+                full_bf16 = pl.cast(full, target_type=pl.BF16, mode="rint")
+
+                rope = full[:, NOPE_DIM:HEAD_DIM]
+                swapped = pl.gather(rope, dim=-1, index=rope_swap_idx[:, :])
+                cos_il = rope_cos_il[token : token + 1, 0:ROPE_DIM]
+                sin_signed = rope_sin_signed[token : token + 1, 0:ROPE_DIM]
+                rope_cos = pl.col_expand_mul(rope, cos_il)
+                swap_sin = pl.col_expand_mul(swapped, sin_signed)
+                rotated = pl.add(rope_cos, swap_sin)
+                rope_bf16 = pl.cast(rotated, target_type=pl.BF16, mode="rint")
+
+                for group_slot in pl.unroll(PACK_GROUPS):
+                    source_head = group_slot * HEADS_PER_GROUP
+                    pack_row = (global_group_start + group_slot) * T_PAD + token
+                    destination_head = pack_row * HEADS_PER_GROUP
+                    o_packed_heads[
+                        destination_head : destination_head + HEADS_PER_GROUP,
+                        0:NOPE_DIM,
+                    ] = full_bf16[
+                        source_head : source_head + HEADS_PER_GROUP,
+                        0:NOPE_DIM,
+                    ]
+                    o_packed_heads[
+                        destination_head : destination_head + HEADS_PER_GROUP,
+                        NOPE_DIM:HEAD_DIM,
+                    ] = rope_bf16[
+                        source_head : source_head + HEADS_PER_GROUP,
+                        0:ROPE_DIM,
+                    ]
+
+            for group_slot in pl.unroll(PACK_GROUPS):
+                global_group = global_group_start + group_slot
+                destination_rank = global_group // LOCAL_O_GROUPS
+                local_group = global_group - destination_rank * LOCAL_O_GROUPS
+                source_row = global_group * T_PAD + token_start
+                target_row = local_group * GROUP_T_PAD + tp_rank * local_t + token_start
+                pld.tensor.put(
+                    dst=exchange_window,
+                    peer=group_base + destination_rank,
+                    src=attention_grouped,
+                    dst_offsets=[target_row, 0],
+                    src_offsets=[source_row, 0],
+                    shape=[SWA_A2A_T_TILE, O_GROUP_IN],
+                    chunk_rows=SWA_A2A_T_TILE,
+                    chunk_cols=O_GROUP_IN,
+                )
+
+        for peer_tp in pl.range(TP):
+            if peer_tp != tp_rank:
+                pld.system.notify(
+                    target=exchange_signal,
+                    peer=group_base + peer_tp,
+                    offsets=[tp_rank, 0],
+                    value=1,
+                    op=pld.NotifyOp.AtomicAdd,
+                )
+
+    return exchange_signal, publish_tid
 
 
 @pl.jit

@@ -64,12 +64,13 @@ from decode_o_proj import (
     O_WINDOW_ROWS,
     decode_o_proj_tp1,
     decode_sharded_o_projection_reduce_scatter,
-    o_group_a2a,
+    o_group_a2a_finish,
 )
 from decode_sparse_attn_csa import (
     ROPE_CS_T_TILE,
     T_PAD,
     sparse_attn_csa,
+    sparse_attn_csa_a2a,
 )
 
 # Dynamic shape variables.
@@ -263,6 +264,7 @@ def decode_csa(
     qr_scale = pl.create_tensor([t_dim, 1], dtype=pl.FP32)
     position_ids_t1 = pl.reshape(position_ids, [t_dim, 1])
     attention_local_flat = pl.create_tensor([ATTENTION_WINDOW_ROWS, O_GROUP_IN], dtype=pl.BF16)
+    attn_out = pl.create_tensor([t_dim, D], dtype=pl.BF16)
     with pl.scope():
         late_dep = pl.system.task_dummy(deps=[rope_tid])
         qkv_proj_rope(
@@ -313,34 +315,43 @@ def decode_csa(
             [O_GROUPS * LOCAL_T_PAD, O_GROUP_IN],
             dtype=pl.BF16,
         )
-        attention_grouped, _heads_tid = sparse_attn_csa(
+        attention_signal, publish_tid = sparse_attn_csa_a2a(
             q, kv_cache, window_swa_indices,
             cmp_kv, cmp_block_table, idx_topk,
             position_ids_t1, attn_sink, freqs_cos, freqs_sin,
-            attention_grouped, cache_ready_dep,
-        )
-        attention_local_flat, attention_signal = o_group_a2a(
-            attention_grouped, attention_local_flat,
+            attention_grouped,
             attention_window, attention_signal,
             group_base, tp_rank, local_t,
+            cache_ready_dep,
+        )
+        attention_local_flat, attention_signal = o_group_a2a_finish(
+            attention_local_flat,
+            attention_window, attention_signal,
+            group_base, tp_rank, local_t,
+            publish_tid, 48,
         )
 
-    attention_local_groups = pl.reshape(attention_local_flat, [LOCAL_O_GROUPS, GROUP_T_PAD, O_GROUP_IN])
-    o_local = pl.create_tensor([LOCAL_T_PAD, D], dtype=pl.BF16)
-    o_local, o_signal = decode_sharded_o_projection_reduce_scatter(
-        attention_local_groups,
-        wo_a, wo_b, wo_b_scale,
-        local_t, o_local,
-        o_window, o_signal,
-        group_base, tp_rank,
-    )
-    attn_out = pl.create_tensor([t_dim, D], dtype=pl.BF16)
-    for block in pl.spmd(t_dim // CSA_WB_TOKEN_TILE, name_hint="csa_o_local_bridge"):
-        token_start = block * CSA_WB_TOKEN_TILE
-        attn_out[token_start : token_start + CSA_WB_TOKEN_TILE, 0:D] = o_local[
-            token_start : token_start + CSA_WB_TOKEN_TILE, 0:D
-        ]
-    hc_post(attn_out, x_hc, post_t, comb_t, x_out)
+        attention_local_groups = pl.reshape(
+            attention_local_flat,
+            [LOCAL_O_GROUPS, GROUP_T_PAD, O_GROUP_IN],
+        )
+        o_local = pl.create_tensor([LOCAL_T_PAD, D], dtype=pl.BF16)
+        o_local, o_signal = decode_sharded_o_projection_reduce_scatter(
+            attention_local_groups,
+            wo_a, wo_b, wo_b_scale,
+            local_t, o_local,
+            o_window, o_signal,
+            group_base, tp_rank,
+        )
+
+        for block in pl.spmd(t_dim // CSA_WB_TOKEN_TILE, name_hint="csa_o_local_bridge"):
+            token_start = block * CSA_WB_TOKEN_TILE
+            attn_out[token_start : token_start + CSA_WB_TOKEN_TILE, 0:D] = o_local[
+                token_start : token_start + CSA_WB_TOKEN_TILE, 0:D
+            ]
+
+    with pl.scope():
+        hc_post(attn_out, x_hc, post_t, comb_t, x_out)
     return x_out
 
 
@@ -1730,6 +1741,8 @@ if __name__ == "__main__":
         help="absolute decode start position; a scalar sets batch=1, "
              "and a comma-separated list sets batch to its length",
     )
+    parser.add_argument("--golden-data", type=str, default=None)
+    parser.add_argument("--save-data", action="store_true", default=False)
     parser.add_argument("--enable-chip-swimlane", type=int, choices=(0, 1, 2, 3, 4), default=0)
     parser.add_argument("--compile-only", action="store_true", default=False)
     parser.add_argument("--dump-passes", action="store_true", default=False)
@@ -1775,6 +1788,8 @@ if __name__ == "__main__":
             fn=decode_csa_tp1_test,
             specs=build_tensor_specs(start_pos=start_pos, batch=batch),
             golden_fn=golden_decode_csa_tp1,
+            golden_data=args.golden_data,
+            save_data=args.save_data,
             compile_only=args.compile_only,
             compile_cfg=dict(dump_passes=args.dump_passes),
             runtime_cfg=dict(
@@ -1804,6 +1819,8 @@ if __name__ == "__main__":
         fn=l3_decode_csa,
         specs=build_distributed_tensor_specs(local_t, start_pos=start_pos),
         golden_fn=golden_decode_csa,
+        golden_data=args.golden_data,
+        save_data=args.save_data,
         compile_only=args.compile_only,
         compile_cfg=compile_cfg,
         runtime_cfg=dict(

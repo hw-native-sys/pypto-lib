@@ -10,6 +10,7 @@
 
 
 import pypto.language as pl
+import pypto.language.distributed as pld
 
 from config import (
     FLASH as M,
@@ -68,23 +69,43 @@ ATTN_K_TILE = 128
 ATTN_D_TILE = 256
 H_TILE = 16
 QK_M_TILE = 32
+HCA_A2A_T_TILE = 8
 CMP_PAGES_PER_WORK = ATTN_K_TILE // BLOCK_SIZE
 ROPE_TILE = 16
 ROPE_INTERLEAVE_TILE = 2 * ROPE_TILE
 ROPE_CS_T_TILE = 8
 T_PAD = ((T + 16 - 1) // 16) * 16
+LOCAL_O_GROUPS = O_GROUPS // TP
+GROUP_T_PAD = TP * T_PAD
+ATTENTION_WINDOW_ROWS = LOCAL_O_GROUPS * GROUP_T_PAD
+PACK_GROUPS = H_TILE // HEADS_PER_GROUP
 
-assert WIN == ATTN_K_TILE, "HCA raw window must form one baseline-sized attention tile"
-assert HCA_MAX_COMPRESSED_ROWS <= HCA_COMPRESSED_POOL_ROWS
-assert ATTN_K_TILE % BLOCK_SIZE == 0, "HCA work must contain complete cache pages"
-assert H % QK_M_TILE == 0 and QK_M_TILE % H_TILE == 0
-assert BLOCK_SIZE % GATHER_RUN_TILE == 0, "a contiguous gather run must stay inside one cache block"
-assert HEAD_DIM == 2 * ATTN_D_TILE, "HCA stream matmuls split the head width into exactly two bounded tiles"
-assert S % ROPE_CS_T_TILE == 0, "each request must contain complete inverse-RoPE token tiles"
+if WIN != ATTN_K_TILE:
+    raise ValueError("HCA raw window must form one baseline-sized attention tile")
+if HCA_MAX_COMPRESSED_ROWS > HCA_COMPRESSED_POOL_ROWS:
+    raise ValueError("HCA compressed rows exceed the configured pool")
+if ATTN_K_TILE % BLOCK_SIZE != 0:
+    raise ValueError("HCA work must contain complete cache pages")
+if H % QK_M_TILE != 0 or QK_M_TILE % H_TILE != 0:
+    raise ValueError("HCA head tiles must divide the attention head count")
+if BLOCK_SIZE % GATHER_RUN_TILE != 0:
+    raise ValueError("a contiguous gather run must stay inside one cache block")
+if HEAD_DIM != 2 * ATTN_D_TILE:
+    raise ValueError("HCA stream matmuls require two bounded head-width tiles")
+if S % ROPE_CS_T_TILE != 0:
+    raise ValueError("each request must contain complete inverse-RoPE token tiles")
+if O_GROUPS % TP != 0:
+    raise ValueError(f"output groups {O_GROUPS} must be divisible by TP size {TP}")
+if H_TILE % HEADS_PER_GROUP != 0:
+    raise ValueError(f"HCA head tile {H_TILE} must contain complete output groups")
+if LOCAL_O_GROUPS % PACK_GROUPS != 0:
+    raise ValueError(f"local output groups {LOCAL_O_GROUPS} must contain complete HCA pack tiles")
+if T % HCA_A2A_T_TILE != 0:
+    raise ValueError(f"HCA token capacity {T} must be divisible by A2A tile {HCA_A2A_T_TILE}")
 
 
 @pl.jit.inline(auto_scope=False)
-def sparse_attn_hca(
+def _sparse_attn_hca_stream(
     q: pl.Tensor[[T_DYN, H, HEAD_DIM], pl.BF16],
     ori_kv: pl.Tensor[[ORI_BLOCK_NUM_DYN, BLOCK_SIZE, 1, HEAD_DIM], pl.BF16],
     window_swa_indices: pl.Tensor[[T_DYN, WIN], pl.INT32],
@@ -95,10 +116,9 @@ def sparse_attn_hca(
     attn_sink: pl.Tensor[[H], pl.FP32],
     freqs_cos: pl.Tensor[[T_DYN, ROPE_DIM], pl.BF16],
     freqs_sin: pl.Tensor[[T_DYN, ROPE_DIM], pl.BF16],
-    o_packed_heads: pl.Tensor[[O_GROUPS * T_PAD, O_GROUP_IN], pl.BF16],
     cache_ready_dep: pl.Scalar[pl.TASK_ID],
-) -> tuple[pl.Tensor, pl.Scalar[pl.TASK_ID]]:
-    """Write HCA heads as grouped ``[T_PAD, O_GROUP_IN]`` slabs."""
+):
+    """Compute normalized HCA stream heads and inverse-RoPE metadata."""
     t_dim = pl.tensor.dim(q, 0)
     rope_cs_blocks = t_dim // ROPE_CS_T_TILE
     ori_block_num = pl.tensor.dim(ori_kv, 0)
@@ -744,10 +764,61 @@ def sparse_attn_hca(
         stream_output = pl.row_expand_div(stream_o, stream_denom)
         pl.store(stream_output, [stream_state_row, 0], stream_heads)
 
+    return (
+        stream_heads,
+        rope_cos_il,
+        rope_sin_signed,
+        rope_swap_idx,
+        stream_heads_tid,
+        rope_swap_tids[0],
+        rope_cs_tids[0],
+    )
+
+
+@pl.jit.inline(auto_scope=False)
+def sparse_attn_hca(
+    q: pl.Tensor[[T_DYN, H, HEAD_DIM], pl.BF16],
+    ori_kv: pl.Tensor[[ORI_BLOCK_NUM_DYN, BLOCK_SIZE, 1, HEAD_DIM], pl.BF16],
+    window_swa_indices: pl.Tensor[[T_DYN, WIN], pl.INT32],
+    cmp_kv: pl.Tensor[[CMP_BLOCK_NUM_DYN, BLOCK_SIZE, 1, HEAD_DIM], pl.BF16],
+    cmp_block_table: pl.Tensor[[B_DYN, CMP_TABLE_BLOCKS_DYN], pl.INT32],
+    position_ids: pl.Tensor[[T_DYN], pl.INT32],
+    kv_seq_lens: pl.Tensor[[B_DYN], pl.INT32],
+    attn_sink: pl.Tensor[[H], pl.FP32],
+    freqs_cos: pl.Tensor[[T_DYN, ROPE_DIM], pl.BF16],
+    freqs_sin: pl.Tensor[[T_DYN, ROPE_DIM], pl.BF16],
+    o_packed_heads: pl.Tensor[[O_GROUPS * T_PAD, O_GROUP_IN], pl.BF16],
+    cache_ready_dep: pl.Scalar[pl.TASK_ID],
+) -> tuple[pl.Tensor, pl.Scalar[pl.TASK_ID]]:
+    """Write HCA heads as grouped ``[T_PAD, O_GROUP_IN]`` slabs."""
+    (
+        stream_heads,
+        rope_cos_il,
+        rope_sin_signed,
+        rope_swap_idx,
+        stream_heads_tid,
+        rope_swap_tid,
+        rope_cs_tid,
+    ) = _sparse_attn_hca_stream(
+        q,
+        ori_kv,
+        window_swa_indices,
+        cmp_kv,
+        cmp_block_table,
+        position_ids,
+        kv_seq_lens,
+        attn_sink,
+        freqs_cos,
+        freqs_sin,
+        cache_ready_dep,
+    )
+    t_dim = pl.tensor.dim(q, 0)
+    stream_block_count = t_dim * (H // H_TILE)
+
     with pl.spmd(
         stream_block_count,
         name_hint="hca_stream_pack",
-        deps=[stream_heads_tid, rope_swap_tids[0], rope_cs_tids[0]],
+        deps=[stream_heads_tid, rope_swap_tid, rope_cs_tid],
     ) as heads_tid:
         stream_idx = pl.tile.get_block_idx()
         stream_t = stream_idx // (H // H_TILE)
@@ -780,6 +851,131 @@ def sparse_attn_hca(
             ] = n_full_bf16[n_hi : n_hi + 1, 0:HEAD_DIM]
 
     return o_packed_heads, heads_tid
+
+
+@pl.jit.inline(auto_scope=False)
+def sparse_attn_hca_a2a(
+    q: pl.Tensor[[T_DYN, H, HEAD_DIM], pl.BF16],
+    ori_kv: pl.Tensor[[ORI_BLOCK_NUM_DYN, BLOCK_SIZE, 1, HEAD_DIM], pl.BF16],
+    window_swa_indices: pl.Tensor[[T_DYN, WIN], pl.INT32],
+    cmp_kv: pl.Tensor[[CMP_BLOCK_NUM_DYN, BLOCK_SIZE, 1, HEAD_DIM], pl.BF16],
+    cmp_block_table: pl.Tensor[[B_DYN, CMP_TABLE_BLOCKS_DYN], pl.INT32],
+    position_ids: pl.Tensor[[T_DYN], pl.INT32],
+    kv_seq_lens: pl.Tensor[[B_DYN], pl.INT32],
+    attn_sink: pl.Tensor[[H], pl.FP32],
+    freqs_cos: pl.Tensor[[T_DYN, ROPE_DIM], pl.BF16],
+    freqs_sin: pl.Tensor[[T_DYN, ROPE_DIM], pl.BF16],
+    attention_grouped: pl.Tensor[[O_GROUPS * T_PAD, O_GROUP_IN], pl.BF16],
+    exchange_window: pld.DistributedTensor[[ATTENTION_WINDOW_ROWS, O_GROUP_IN], pl.BF16],
+    exchange_signal: pld.DistributedTensor[[TP, 1], pl.INT32],
+    group_base: pl.Scalar[pl.INT32],
+    tp_rank: pl.Scalar[pl.INT32],
+    local_t: pl.Scalar[pl.INT32],
+    cache_ready_dep: pl.Scalar[pl.TASK_ID],
+):
+    """Pack HCA heads and publish each completed token tile to its TP owner."""
+    (
+        stream_heads,
+        rope_cos_il,
+        rope_sin_signed,
+        rope_swap_idx,
+        stream_heads_tid,
+        rope_swap_tid,
+        rope_cs_tid,
+    ) = _sparse_attn_hca_stream(
+        q,
+        ori_kv,
+        window_swa_indices,
+        cmp_kv,
+        cmp_block_table,
+        position_ids,
+        kv_seq_lens,
+        attn_sink,
+        freqs_cos,
+        freqs_sin,
+        cache_ready_dep,
+    )
+    t_dim = pl.tensor.dim(q, 0)
+    pack_work_count = (t_dim // HCA_A2A_T_TILE) * (H // H_TILE)
+
+    with pl.spmd(
+        48,
+        name_hint="hca_stream_pack_publish",
+        deps=[stream_heads_tid, rope_swap_tid, rope_cs_tid],
+    ) as publish_tid:
+        worker = pl.tile.get_block_idx()
+        for pack_work in pl.range(worker, pack_work_count, 48):
+            token_block = pack_work // (H // H_TILE)
+            stream_h_tile = pack_work - token_block * (H // H_TILE)
+            stream_t0 = token_block * HCA_A2A_T_TILE
+            stream_h0 = stream_h_tile * H_TILE
+            global_group0 = stream_h0 // HEADS_PER_GROUP
+            destination_rank = global_group0 // LOCAL_O_GROUPS
+            local_group0 = global_group0 - destination_rank * LOCAL_O_GROUPS
+
+            for stream_dt in pl.unroll(HCA_A2A_T_TILE):
+                stream_t = stream_t0 + stream_dt
+                stream_state_row = stream_t * H + stream_h0
+                stream_output = stream_heads[
+                    stream_state_row : stream_state_row + H_TILE, 0:HEAD_DIM
+                ]
+                stream_bf16 = pl.cast(stream_output, target_type=pl.BF16, mode="rint")
+                stream_rope = stream_output[0:H_TILE, NOPE_DIM:HEAD_DIM]
+                stream_cos_il = rope_cos_il[stream_t : stream_t + 1, 0:ROPE_DIM]
+                stream_sin_signed = rope_sin_signed[stream_t : stream_t + 1, 0:ROPE_DIM]
+                stream_swap_zero = pl.full([H_TILE, ROPE_DIM], dtype=pl.INT32, value=0)
+                stream_swap_idx = pl.col_expand_add(
+                    stream_swap_zero,
+                    rope_swap_idx[0:1, 0:ROPE_DIM],
+                )
+                stream_swapped = pl.gather(stream_rope, dim=-1, index=stream_swap_idx)
+                stream_rot = pl.add(
+                    pl.col_expand_mul(stream_rope, stream_cos_il),
+                    pl.col_expand_mul(stream_swapped, stream_sin_signed),
+                )
+                n_rope_bf16 = pl.cast(stream_rot, target_type=pl.BF16, mode="rint")
+                n_full_bf16 = pl.concat(
+                    stream_bf16[0:H_TILE, 0:NOPE_DIM],
+                    n_rope_bf16,
+                )
+                for n_hi in pl.unroll(H_TILE):
+                    n_head = stream_h0 + n_hi
+                    source_row = (n_head // HEADS_PER_GROUP) * T_PAD + stream_t
+                    source_col = (n_head % HEADS_PER_GROUP) * HEAD_DIM
+                    attention_grouped[
+                        source_row : source_row + 1,
+                        source_col : source_col + HEAD_DIM,
+                    ] = n_full_bf16[n_hi : n_hi + 1, 0:HEAD_DIM]
+
+            for group_slot in pl.unroll(PACK_GROUPS):
+                source_row = (global_group0 + group_slot) * T_PAD + stream_t0
+                target_row = (
+                    (local_group0 + group_slot) * GROUP_T_PAD
+                    + tp_rank * local_t
+                    + stream_t0
+                )
+                pld.tensor.put(
+                    dst=exchange_window,
+                    peer=group_base + destination_rank,
+                    src=attention_grouped,
+                    dst_offsets=[target_row, 0],
+                    src_offsets=[source_row, 0],
+                    shape=[HCA_A2A_T_TILE, O_GROUP_IN],
+                    chunk_rows=HCA_A2A_T_TILE,
+                    chunk_cols=O_GROUP_IN,
+                )
+
+        for destination_rank in pl.range(TP):
+            if destination_rank != tp_rank:
+                pld.system.notify(
+                    target=exchange_signal,
+                    peer=group_base + destination_rank,
+                    offsets=[tp_rank, 0],
+                    value=1,
+                    op=pld.NotifyOp.AtomicAdd,
+                )
+
+    return exchange_signal, publish_tid
 
 
 @pl.jit
