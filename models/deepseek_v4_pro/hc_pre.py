@@ -52,6 +52,11 @@ HC_PAD = 8
 # Full-chip syncall requires one persistent block per Ascend 910B AIC.
 NUM_CORES = 24
 
+# The e2e nightly builds a pinned pypto whose language surface predates
+# pl.KernelType; the string spelling selects the same participant set there
+# and stays accepted on current pypto.
+SYNCALL_MIX = pl.KernelType.MIX if hasattr(pl, "KernelType") else "mix"
+
 
 @pl.jit.inline
 def _hc_pre_syncall(
@@ -125,7 +130,7 @@ def _hc_pre_syncall(
                     x_sq_row = pl.reshape(x_sq_sum, [1, T_TILE])
                     sq_part = pl.add(sq_part, x_sq_row)
                 sq_partials[rms_split : rms_split + 1, t0 : t0 + T_TILE] = sq_part
-        pl.system.syncall(core_type=pl.KernelType.MIX)
+        pl.system.syncall(core_type=SYNCALL_MIX)
 
         for aiv_id in pl.split_aiv(2, mode=pl.SplitMode.NONE):
             lane = core * 2 + aiv_id
@@ -145,7 +150,7 @@ def _hc_pre_syncall(
                         sq_partial = sq_partials[rms_split : rms_split + 1, rms_t0 : rms_t0 + T_TILE]
                         sq_total = pl.add(sq_total, sq_partial)
                     sq_sum_acc[0:1, rms_t0 : rms_t0 + T_TILE] = sq_total
-        pl.system.syncall(core_type=pl.KernelType.MIX)
+        pl.system.syncall(core_type=SYNCALL_MIX)
 
         for aiv_id in pl.split_aiv(2, mode=pl.SplitMode.NONE):
             lane = core * 2 + aiv_id
