@@ -180,11 +180,20 @@ def prefill_attention_swa(
                 valid_block_mask, mask_row, [idx_t, 0]
             )
 
-    cmp_block_table_dummy = pl.create_tensor(
-        [SPARSE_CMP_MAX_BLOCKS], dtype=pl.INT32, init_value=0
-    )
+    cmp_block_table_dummy = pl.create_tensor([SPARSE_CMP_MAX_BLOCKS], dtype=pl.INT32)
     cmp_kv_dummy = pl.create_tensor([CMP_BLOCK_NUM, BLOCK_SIZE, 1, HEAD_DIM], dtype=pl.BF16)
-    cmp_indices_dummy = pl.create_tensor([T, IDX_TOPK], dtype=pl.INT32, init_value=-1)
+    cmp_indices_dummy = pl.create_tensor([T, IDX_TOPK], dtype=pl.INT32)
+    cmp_block_table_dummy_2d = pl.reshape(
+        cmp_block_table_dummy, [1, SPARSE_CMP_MAX_BLOCKS]
+    )
+    with pl.at(level=pl.Level.CORE_GROUP, name_hint="prefill_swa_cmp_dummy_init"):
+        cmp_block_table_dummy_2d[:, :] = pl.full(
+            [1, SPARSE_CMP_MAX_BLOCKS], dtype=pl.INT32, value=0
+        )
+    for dummy_t in pl.spmd(T, name_hint="prefill_swa_cmp_indices_dummy_init"):
+        cmp_indices_dummy[dummy_t : dummy_t + 1, :] = pl.full(
+            [1, IDX_TOPK], dtype=pl.INT32, value=-1
+        )
     attn_out = pl.create_tensor([T, D], dtype=pl.BF16)
     sparse_attn(
         q, kv_cache, swa_indices,

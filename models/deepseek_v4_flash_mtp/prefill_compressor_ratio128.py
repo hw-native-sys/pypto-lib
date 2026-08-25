@@ -90,9 +90,7 @@ def prefill_compressor_ratio128(
         [state_block_num * HCA_STATE_BLOCK_SIZE, COMPRESS_STATE_DIM],
     )
     cmp_kv_flat = pl.reshape(cmp_kv, [cmp_block_num * CMP_STORAGE_BLOCK_SIZE, HEAD_DIM])
-    pooled_kv_pad = pl.create_tensor(
-        [HCA_C128_RMS_PAD_ROWS, HEAD_DIM], dtype=pl.FP32, init_value=0
-    )
+    pooled_kv_pad = pl.create_tensor([HCA_C128_RMS_PAD_ROWS, HEAD_DIM], dtype=pl.FP32)
     normed_kv_pad = pl.create_tensor([HCA_C128_RMS_PAD_ROWS, HEAD_DIM], dtype=pl.FP32)
 
     for proj_idx in pl.spmd(OUT_DIM // OUT_TILE, name_hint="prefill_hca_c128_kv_score_proj"):
@@ -195,10 +193,9 @@ def prefill_compressor_ratio128(
             pooled_chunk_t = pl.row_sum(pl.mul(pool_kv_t, score_prob))
             pooled_kv_pad[write_i : write_i + 1, h0 : h0 + HEAD_TILE] = pl.reshape(pooled_chunk_t, [1, HEAD_TILE])
         else:
-            pooled_kv_pad[write_i : write_i + 1, h0 : h0 + HEAD_TILE] = pooled_kv_pad[
-                write_i : write_i + 1,
-                h0 : h0 + HEAD_TILE,
-            ]
+            pooled_kv_pad[write_i : write_i + 1, h0 : h0 + HEAD_TILE] = pl.full(
+                [1, HEAD_TILE], dtype=pl.FP32, value=0.0
+            )
 
     norm_w_2d = pl.reshape(norm_w, [1, HEAD_DIM])
     with pl.at(level=pl.Level.CORE_GROUP, name_hint="prefill_hca_c128_rmsnorm_rope"):

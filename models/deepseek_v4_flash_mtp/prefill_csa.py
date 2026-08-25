@@ -160,7 +160,7 @@ def prefill_attention_csa(
     kv_cache: pl.InOut[pl.Tensor[[ORI_BLOCK_NUM_DYN, BLOCK_SIZE, 1, HEAD_DIM], pl.BF16]],
     ori_block_table: pl.Tensor[[SPARSE_ORI_MAX_BLOCKS], pl.INT32],
     ori_slot_mapping: pl.Tensor[[T], pl.INT64],
-    cmp_kv: pl.Out[pl.Tensor[[CMP_BLOCK_NUM_DYN, CMP_STORAGE_BLOCK_SIZE, 1, HEAD_DIM], pl.BF16]],
+    cmp_kv: pl.InOut[pl.Tensor[[CMP_BLOCK_NUM_DYN, CMP_STORAGE_BLOCK_SIZE, 1, HEAD_DIM], pl.BF16]],
     cmp_block_table: pl.Tensor[[SPARSE_CMP_MAX_BLOCKS], pl.INT32],
     idx_kv_cache: pl.Out[pl.Tensor[[IDX_BLOCK_NUM_DYN, CMP_STORAGE_BLOCK_SIZE, 1, IDX_HEAD_DIM], pl.INT8]],
     idx_kv_scale: pl.Out[pl.Tensor[[IDX_BLOCK_NUM_DYN, CMP_STORAGE_BLOCK_SIZE, 1, 1], pl.FP32]],
@@ -368,7 +368,7 @@ def prefill_attention_csa_test(
     kv_cache: pl.InOut[pl.Tensor[[ORI_BLOCK_NUM_DYN, BLOCK_SIZE, 1, HEAD_DIM], pl.BF16]],
     ori_block_table: pl.Tensor[[SPARSE_ORI_MAX_BLOCKS], pl.INT32],
     ori_slot_mapping: pl.Tensor[[T], pl.INT64],
-    cmp_kv: pl.Out[pl.Tensor[[CMP_BLOCK_NUM_DYN, CMP_STORAGE_BLOCK_SIZE, 1, HEAD_DIM], pl.BF16]],
+    cmp_kv: pl.InOut[pl.Tensor[[CMP_BLOCK_NUM_DYN, CMP_STORAGE_BLOCK_SIZE, 1, HEAD_DIM], pl.BF16]],
     cmp_block_table: pl.Tensor[[SPARSE_CMP_MAX_BLOCKS], pl.INT32],
     idx_kv_cache: pl.InOut[pl.Tensor[[IDX_BLOCK_NUM_DYN, CMP_STORAGE_BLOCK_SIZE, 1, IDX_HEAD_DIM], pl.INT8]],
     idx_kv_scale: pl.InOut[pl.Tensor[[IDX_BLOCK_NUM_DYN, CMP_STORAGE_BLOCK_SIZE, 1, 1], pl.FP32]],
@@ -911,6 +911,7 @@ def build_tensor_specs(
             [CSA_CMP_BLOCK_NUM, CMP_STORAGE_BLOCK_SIZE, 1, HEAD_DIM],
             torch.bfloat16,
             init_value=init_cmp_kv,
+            is_output=True,
         ),
         TensorSpec("cmp_block_table", [SPARSE_CMP_MAX_BLOCKS], torch.int32, init_value=init_cmp_block_table),
         TensorSpec(
@@ -918,12 +919,14 @@ def build_tensor_specs(
             [PREFILL_IDX_BLOCK_NUM, CMP_STORAGE_BLOCK_SIZE, 1, IDX_HEAD_DIM],
             torch.int8,
             init_value=init_idx_kv_cache,
+            is_output=True,
         ),
         TensorSpec(
             "idx_kv_scale",
             [PREFILL_IDX_BLOCK_NUM, CMP_STORAGE_BLOCK_SIZE, 1, 1],
             torch.float32,
             init_value=init_idx_kv_scale,
+            is_output=True,
         ),
         TensorSpec("idx_block_table", [IDX_CACHE_MAX_BLOCKS], torch.int32, init_value=init_idx_block_table),
         TensorSpec("position_ids", [T], torch.int32, init_value=init_position_ids),
@@ -998,6 +1001,7 @@ if __name__ == "__main__":
             "x_out": ratio_reldiff(diff_thd=x_out_diff_thd, pct_thd=0.005, max_diff_hd=x_out_max_diff,
                                    valid_rows=compare_tokens, zero_tail=True),
             "kv_cache": ratio_allclose(atol=1e-4, rtol=1.0 / 128),
+            "idx_kv_cache": ratio_allclose(atol=1, rtol=0.0, max_error_ratio=0.0),
         },
     )
     if not result.passed:

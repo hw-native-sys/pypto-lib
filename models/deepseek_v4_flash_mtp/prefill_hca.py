@@ -123,7 +123,7 @@ def prefill_attention_hca(
     kv_cache: pl.InOut[pl.Tensor[[ORI_BLOCK_NUM_DYN, BLOCK_SIZE, 1, HEAD_DIM], pl.BF16]],
     ori_slot_mapping: pl.Tensor[[T], pl.INT64],
     ori_block_table: pl.Tensor[[SPARSE_ORI_MAX_BLOCKS], pl.INT32],
-    cmp_kv: pl.Out[pl.Tensor[[CMP_BLOCK_NUM_DYN, CMP_STORAGE_BLOCK_SIZE, 1, HEAD_DIM], pl.BF16]],
+    cmp_kv: pl.InOut[pl.Tensor[[CMP_BLOCK_NUM_DYN, CMP_STORAGE_BLOCK_SIZE, 1, HEAD_DIM], pl.BF16]],
     cmp_block_table: pl.Tensor[[SPARSE_CMP_MAX_BLOCKS], pl.INT32],
     position_ids: pl.Tensor[[T], pl.INT32],
     cmp_slot_mapping: pl.Tensor[[T], pl.INT64],
@@ -277,7 +277,7 @@ def prefill_attention_hca_test(
     kv_cache: pl.InOut[pl.Tensor[[ORI_BLOCK_NUM_DYN, BLOCK_SIZE, 1, HEAD_DIM], pl.BF16]],
     ori_slot_mapping: pl.Tensor[[T], pl.INT64],
     ori_block_table: pl.Tensor[[SPARSE_ORI_MAX_BLOCKS], pl.INT32],
-    cmp_kv: pl.Out[pl.Tensor[[CMP_BLOCK_NUM_DYN, CMP_STORAGE_BLOCK_SIZE, 1, HEAD_DIM], pl.BF16]],
+    cmp_kv: pl.InOut[pl.Tensor[[CMP_BLOCK_NUM_DYN, CMP_STORAGE_BLOCK_SIZE, 1, HEAD_DIM], pl.BF16]],
     cmp_block_table: pl.Tensor[[SPARSE_CMP_MAX_BLOCKS], pl.INT32],
     position_ids: pl.Tensor[[T], pl.INT32],
     cmp_slot_mapping: pl.Tensor[[T], pl.INT64],
@@ -645,8 +645,8 @@ def build_tensor_specs(
         TensorSpec("cmp_wgate", [MAIN_OUT_DIM, D], torch.bfloat16, init_value=init_cmp_wgate),
         TensorSpec("cmp_ape", [COMPRESS_RATIO, MAIN_OUT_DIM], torch.float32, init_value=init_cmp_ape),
         TensorSpec("cmp_norm_w", [HEAD_DIM], torch.bfloat16, init_value=init_cmp_norm_w),
-        # Compressor caches are written in-place but not validated here (decode
-        # parity); the dedicated prefill_compressor_ratio128 test covers them.
+        # Compressor recurrent state is written in-place but not validated here
+        # (decode parity); cmp_kv is validated with the child precision contract.
         TensorSpec(
             "compress_state",
             [HCA_STATE_BLOCK_NUM, HCA_STATE_BLOCK_SIZE, MAIN_COMPRESS_STATE_DIM],
@@ -668,6 +668,7 @@ def build_tensor_specs(
             [HCA_CMP_BLOCK_NUM, CMP_STORAGE_BLOCK_SIZE, 1, HEAD_DIM],
             torch.bfloat16,
             init_value=init_cmp_kv,
+            is_output=True,
         ),
         TensorSpec("cmp_block_table", [SPARSE_CMP_MAX_BLOCKS], torch.int32, init_value=init_cmp_block_table),
         TensorSpec("position_ids", [T], torch.int32, init_value=init_position_ids),
@@ -722,6 +723,7 @@ if __name__ == "__main__":
             "x_out": ratio_reldiff(diff_thd=5e-3, pct_thd=0.005, max_diff_hd=1,
                                    valid_rows=compare_tokens, zero_tail=True),
             "kv_cache": ratio_allclose(atol=1e-4, rtol=1.0 / 128),
+            "cmp_kv": ratio_allclose(atol=1e-4, rtol=1.0 / 128, max_error_ratio=0.005),
         },
     )
     if not result.passed:
