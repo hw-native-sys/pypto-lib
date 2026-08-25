@@ -239,6 +239,12 @@ host's `/home/pyptouser/models/DeepSeek-V4-Flash-0731`). The
 shared cache next to the checkpoint (`pypto-weights-cache/flash_ep8_tp2`),
 else the runner's own `CI_CACHE_ROOT/dsv4-flash-weights/flash_ep8_tp2`,
 which the job builds from the checkpoint once (~25 min) when it is missing.
+Unlike the rest of the nightly, this job currently builds a pinned pypto
+(`pypto-ref` in the workflow, with the full story in its comment): the
+toolchain that pypto HEAD pins carries a pto-isa A5 dispatch regression
+that stalls every EP8 prefill before the first token. The pin comes off
+once the upstream fix reaches pto-isa's mirror and the simpler/pypto pins
+move past it.
 
 ## Files
 

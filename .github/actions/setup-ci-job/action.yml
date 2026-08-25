@@ -116,6 +116,15 @@ inputs:
       would otherwise thrash a single tree — pass a distinct value per job type
       (the simulator jobs pass their matrix.platform).
     required: true
+  pypto-ref:
+    description: >-
+      pypto revision to build instead of origin HEAD (a full commit sha).
+      Empty follows HEAD — the default since #1002, so upstream regressions
+      surface here instead of hiding behind a stale pin. A job passes a sha
+      only as a deliberate, commented quarantine of a broken upstream
+      toolchain, and drops it once upstream heals.
+    required: false
+    default: ''
 
 runs:
   using: composite
@@ -274,6 +283,8 @@ runs:
       # its runtime submodule (runtime/pto_isa.pin); read both — the pto-isa pin
       # only keys ccache, since simpler resolves the checkout from it itself.
       shell: bash
+      env:
+        PYPTO_REF: ${{ inputs.pypto-ref }}
       run: |
         # $PYPTO_SRC is the per-job build tree exported by the loader step:
         # ci-cache/pypto-src-<build-namespace>. These jobs run concurrently on the
@@ -299,11 +310,7 @@ runs:
           done
         }
         if [ -d "$PYPTO_SRC/.git" ]; then
-          echo "Cache hit — updating pypto"
-          retry git -C "$PYPTO_SRC" fetch --depth=1 origin HEAD || exit 1
-          git -C "$PYPTO_SRC" reset --hard FETCH_HEAD
-          git -C "$PYPTO_SRC" clean -ffdx
-          git -C "$PYPTO_SRC" submodule foreach --recursive 'git reset --hard && git clean -ffdx' || true
+          echo "Cache hit — reusing pypto checkout"
         else
           echo "Cache miss — cloning pypto"
           mkdir -p "$(dirname "$PYPTO_SRC")"
@@ -311,7 +318,16 @@ runs:
           clone_pypto() { rm -rf "$PYPTO_SRC"; git clone --depth=1 https://github.com/hw-native-sys/pypto.git "$PYPTO_SRC"; }
           retry clone_pypto || exit 1
         fi
+        # An empty pypto-ref follows origin's default branch (HEAD); a pinning
+        # job passes a full commit sha (via this step's env), fetched directly
+        # so cache hit and cache miss land on the same revision. Still
+        # --depth=1: a pin needs one commit, not the history behind it.
+        retry git -C "$PYPTO_SRC" fetch --depth=1 origin "${PYPTO_REF:-HEAD}" || exit 1
+        git -C "$PYPTO_SRC" reset --hard FETCH_HEAD
+        git -C "$PYPTO_SRC" clean -ffdx
+        git -C "$PYPTO_SRC" submodule foreach --recursive 'git reset --hard && git clean -ffdx' || true
         retry git -C "$PYPTO_SRC" submodule update --init --recursive --depth=1 || exit 1
+        echo "pypto at $(git -C "$PYPTO_SRC" rev-parse HEAD)"
         rm -rf "$PYPTO_SRC/build" "$PYPTO_SRC/_skbuild" "$PYPTO_SRC/runtime/build"
         # PTOAS ships one wheel per arch, with a matching PTOAS_SHA256_<ARCH> in
         # versions.env — so the arch is detected here rather than pinned, and only
