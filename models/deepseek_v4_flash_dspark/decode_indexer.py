@@ -105,22 +105,23 @@ TOPK_PAIR_WIDTH = 2 * IDX_TOPK
 TOPK_CANDIDATES_PER_LEAF = 2048
 TOPK_MAX_CANDIDATES = IDX_MAX_ROWS
 TOPK_MAX_LEAVES = TOPK_MAX_CANDIDATES // TOPK_CANDIDATES_PER_LEAF
-TOPK_LEAVES_PER_GROUP = 8
-TOPK_GROUPS_PER_QUERY = TOPK_MAX_LEAVES // TOPK_LEAVES_PER_GROUP
-# Each AIV reduces one group at a time. Group roots survive until the query
-# merge; the lower tree levels reuse the worker-local eight-row scratch.
-TOPK_GROUP_WORKERS = 48
-TOPK_GROUP_ROOT_ROWS = T_PAD * TOPK_GROUPS_PER_QUERY
-TOPK_GROUP_SCRATCH_ROWS = TOPK_GROUP_WORKERS * TOPK_LEAVES_PER_GROUP
-TOPK_ARENA_ROWS = TOPK_GROUP_ROOT_ROWS + TOPK_GROUP_SCRATCH_ROWS
+TOPK_MAX_NODES = 2 * TOPK_MAX_LEAVES - 1
+TOPK_ARENA_ROWS = T_PAD * TOPK_MAX_NODES
 # One persistent mixed worker per physical 910B AIC. The workers share one
 # global leaf sequence, so ragged queries cannot strand per-query lanes.
-TOPK_SCORE_WORKERS = 24
+TOPK_LEAF_WORKERS = 24
 assert TOPK_MAX_CANDIDATES % TOPK_CANDIDATES_PER_LEAF == 0
 assert TOPK_MAX_LEAVES == 128
-assert TOPK_MAX_LEAVES % TOPK_LEAVES_PER_GROUP == 0
-assert TOPK_GROUPS_PER_QUERY == 16
+assert TOPK_MAX_NODES == 255
 
+TOPK_LEVEL1_BASE = TOPK_MAX_LEAVES
+TOPK_LEVEL2_BASE = TOPK_LEVEL1_BASE + 64
+TOPK_LEVEL3_BASE = TOPK_LEVEL2_BASE + 32
+TOPK_LEVEL4_BASE = TOPK_LEVEL3_BASE + 16
+TOPK_LEVEL5_BASE = TOPK_LEVEL4_BASE + 8
+TOPK_LEVEL6_BASE = TOPK_LEVEL5_BASE + 4
+TOPK_ROOT_BASE = TOPK_LEVEL6_BASE + 2
+assert TOPK_ROOT_BASE == TOPK_MAX_NODES - 1
 
 @pl.jit.inline
 def merge2_top512_pairs(
@@ -224,16 +225,16 @@ def indexer_topk_leaf(
 
 
 @pl.jit.incore
-def indexer_topk_group_wave(
+def indexer_topk_leaf_wave(
     position_ids: pl.Tensor[[T_DYN], pl.INT32],
     kv_seq_lens: pl.Tensor[[B_DYN], pl.INT32],
     score_arena: pl.Tensor[[T_DYN, TOPK_MAX_CANDIDATES], pl.FP32],
     pair_arena: pl.Tensor[[TOPK_ARENA_ROWS, TOPK_PAIR_WIDTH], pl.FP32],
 ):
-    """Reduce globally striped eight-leaf subtrees into compact roots."""
+    """Sort a globally striped sequence of scored leaves."""
     worker = pl.tile.get_block_idx()
     query_count = pl.tensor.dim(position_ids, 0)
-    global_group_base = 0
+    global_leaf_base = 0
     for query in pl.range(query_count):
         batch_idx = query // S
         position = pl.read(position_ids, [query])
@@ -248,97 +249,26 @@ def indexer_topk_group_wave(
         leaf_count = (
             visible_count + TOPK_CANDIDATES_PER_LEAF - 1
         ) // TOPK_CANDIDATES_PER_LEAF
-        group_count = (
-            leaf_count + TOPK_LEAVES_PER_GROUP - 1
-        ) // TOPK_LEAVES_PER_GROUP
-        base_mod = global_group_base % TOPK_GROUP_WORKERS
-        first_group = (worker + base_mod) % TOPK_GROUP_WORKERS
-        for group in pl.range(
-            first_group, group_count, TOPK_GROUP_WORKERS
+        arena_base = query * TOPK_MAX_NODES
+        base_mod = global_leaf_base % TOPK_LEAF_WORKERS
+        first_leaf = (worker + base_mod) % TOPK_LEAF_WORKERS
+        for leaf in pl.range(
+            first_leaf, leaf_count, TOPK_LEAF_WORKERS
         ):
-            leaf_begin = group * TOPK_LEAVES_PER_GROUP
-            group_leaf_count = pl.min(
-                TOPK_LEAVES_PER_GROUP,
-                leaf_count - leaf_begin,
+            logical_begin = leaf * TOPK_CANDIDATES_PER_LEAF
+            valid_count = pl.min(
+                TOPK_CANDIDATES_PER_LEAF,
+                visible_count - logical_begin,
             )
-            group_root_slot = (
-                query * TOPK_GROUPS_PER_QUERY + group
+            indexer_topk_leaf(
+                score_arena,
+                pair_arena,
+                query,
+                logical_begin,
+                valid_count,
+                arena_base + leaf,
             )
-            if group_leaf_count == 1:
-                logical_begin = (
-                    leaf_begin * TOPK_CANDIDATES_PER_LEAF
-                )
-                valid_count = pl.min(
-                    TOPK_CANDIDATES_PER_LEAF,
-                    visible_count - logical_begin,
-                )
-                indexer_topk_leaf(
-                    score_arena,
-                    pair_arena,
-                    query,
-                    logical_begin,
-                    valid_count,
-                    group_root_slot,
-                )
-            else:
-                scratch_base = (
-                    TOPK_GROUP_ROOT_ROWS
-                    + worker * TOPK_LEAVES_PER_GROUP
-                )
-                for group_leaf in pl.range(group_leaf_count):
-                    leaf = leaf_begin + group_leaf
-                    logical_begin = (
-                        leaf * TOPK_CANDIDATES_PER_LEAF
-                    )
-                    valid_count = pl.min(
-                        TOPK_CANDIDATES_PER_LEAF,
-                        visible_count - logical_begin,
-                    )
-                    indexer_topk_leaf(
-                        score_arena,
-                        pair_arena,
-                        query,
-                        logical_begin,
-                        valid_count,
-                        scratch_base + group_leaf,
-                    )
-
-                level1_count = (group_leaf_count + 1) // 2
-                merge_topk_level_pairs(
-                    pair_arena,
-                    scratch_base,
-                    group_leaf_count,
-                    0,
-                    0,
-                )
-                if level1_count > 1:
-                    level2_count = (level1_count + 1) // 2
-                    merge_topk_level_pairs(
-                        pair_arena,
-                        scratch_base,
-                        level1_count,
-                        0,
-                        0,
-                    )
-                    if level2_count > 1:
-                        merge_topk_level_pairs(
-                            pair_arena,
-                            scratch_base,
-                            level2_count,
-                            0,
-                            0,
-                        )
-                group_root = pl.load(
-                    pair_arena,
-                    [scratch_base, 0],
-                    [1, TOPK_PAIR_WIDTH],
-                )
-                pl.store(
-                    group_root,
-                    [group_root_slot, 0],
-                    pair_arena,
-                )
-        global_group_base = global_group_base + group_count
+        global_leaf_base = global_leaf_base + leaf_count
 
 
 @pl.jit.incore
@@ -349,7 +279,7 @@ def indexer_topk_query_merge(
     topk_scores: pl.Tensor[[T_DYN, IDX_TOPK], pl.FP32],
     topk_indices: pl.Tensor[[T_DYN, IDX_TOPK], pl.INT32],
 ):
-    """Merge compact group roots and materialize each query's Top-512."""
+    """Merge each query's completed leaf rows and materialize Top-512 outputs."""
     query = pl.tile.get_block_idx()
     batch_idx = query // S
     position = pl.read(position_ids, [query])
@@ -379,47 +309,64 @@ def indexer_topk_query_merge(
         leaf_count = (
             visible_count + TOPK_CANDIDATES_PER_LEAF - 1
         ) // TOPK_CANDIDATES_PER_LEAF
-        group_count = (
-            leaf_count + TOPK_LEAVES_PER_GROUP - 1
-        ) // TOPK_LEAVES_PER_GROUP
-        arena_base = query * TOPK_GROUPS_PER_QUERY
-        if group_count > 1:
-            level1_count = (group_count + 1) // 2
-            merge_topk_level_pairs(
-                pair_arena,
-                arena_base,
-                group_count,
-                0,
-                0,
-            )
-            if level1_count > 1:
-                level2_count = (level1_count + 1) // 2
-                merge_topk_level_pairs(
-                    pair_arena,
-                    arena_base,
-                    level1_count,
-                    0,
-                    0,
-                )
-                if level2_count > 1:
-                    level3_count = (level2_count + 1) // 2
-                    merge_topk_level_pairs(
-                        pair_arena,
-                        arena_base,
-                        level2_count,
-                        0,
-                        0,
-                    )
-                    if level3_count > 1:
-                        merge_topk_level_pairs(
-                            pair_arena,
-                            arena_base,
-                            level3_count,
-                            0,
-                            0,
-                        )
+        arena_base = query * TOPK_MAX_NODES
+        level1_count = (leaf_count + 1) // 2
+        merge_topk_level_pairs(
+            pair_arena,
+            arena_base,
+            leaf_count,
+            0,
+            TOPK_LEVEL1_BASE,
+        )
+        level2_count = (level1_count + 1) // 2
+        merge_topk_level_pairs(
+            pair_arena,
+            arena_base,
+            level1_count,
+            TOPK_LEVEL1_BASE,
+            TOPK_LEVEL2_BASE,
+        )
+        level3_count = (level2_count + 1) // 2
+        merge_topk_level_pairs(
+            pair_arena,
+            arena_base,
+            level2_count,
+            TOPK_LEVEL2_BASE,
+            TOPK_LEVEL3_BASE,
+        )
+        level4_count = (level3_count + 1) // 2
+        merge_topk_level_pairs(
+            pair_arena,
+            arena_base,
+            level3_count,
+            TOPK_LEVEL3_BASE,
+            TOPK_LEVEL4_BASE,
+        )
+        level5_count = (level4_count + 1) // 2
+        merge_topk_level_pairs(
+            pair_arena,
+            arena_base,
+            level4_count,
+            TOPK_LEVEL4_BASE,
+            TOPK_LEVEL5_BASE,
+        )
+        level6_count = (level5_count + 1) // 2
+        merge_topk_level_pairs(
+            pair_arena,
+            arena_base,
+            level5_count,
+            TOPK_LEVEL5_BASE,
+            TOPK_LEVEL6_BASE,
+        )
+        merge_topk_level_pairs(
+            pair_arena,
+            arena_base,
+            level6_count,
+            TOPK_LEVEL6_BASE,
+            TOPK_ROOT_BASE,
+        )
 
-        root_slot = arena_base
+        root_slot = arena_base + TOPK_ROOT_BASE
         root_pairs = pl.load(
             pair_arena,
             [root_slot, 0],
@@ -507,7 +454,7 @@ def indexer_score_topk_forest(
             [bs, TOPK_MAX_CANDIDATES], dtype=pl.FP32
         )
         with pl.spmd(
-            TOPK_SCORE_WORKERS,
+            TOPK_LEAF_WORKERS,
             name_hint="indexer_score_leaf_wave",
             deps=[qh_quant_tid, weights_tid, cache_write_tid],
             optimizations=[pl.split(pl.SplitMode.NONE, slot_num=2)],
@@ -534,10 +481,10 @@ def indexer_score_topk_forest(
                 leaf_count = (
                     visible_count + TOPK_CANDIDATES_PER_LEAF - 1
                 ) // TOPK_CANDIDATES_PER_LEAF
-                base_mod = global_leaf_base % TOPK_SCORE_WORKERS
-                first_leaf = (worker + base_mod) % TOPK_SCORE_WORKERS
+                base_mod = global_leaf_base % TOPK_LEAF_WORKERS
+                first_leaf = (worker + base_mod) % TOPK_LEAF_WORKERS
                 for leaf in pl.range(
-                    first_leaf, leaf_count, TOPK_SCORE_WORKERS
+                    first_leaf, leaf_count, TOPK_LEAF_WORKERS
                 ):
                     logical_begin = leaf * TOPK_CANDIDATES_PER_LEAF
                     valid_count = pl.min(
@@ -625,11 +572,11 @@ def indexer_score_topk_forest(
                         ] = score_valid
                 global_leaf_base = global_leaf_base + leaf_count
         with pl.spmd(
-            TOPK_GROUP_WORKERS,
-            name_hint="indexer_topk_group_wave",
+            TOPK_LEAF_WORKERS,
+            name_hint="indexer_topk_leaf_wave",
             deps=[score_tid],
         ) as topk_tid:
-            indexer_topk_group_wave(
+            indexer_topk_leaf_wave(
                 position_ids,
                 kv_seq_lens,
                 score_arena,
