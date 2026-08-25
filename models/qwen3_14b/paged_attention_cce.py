@@ -21,32 +21,46 @@ _ATTENTION_ROPE_ENTRY = _KERNEL_DIR / "attention_rope" / "entry.cpp"
 _TILING_ENTRY = _KERNEL_DIR / "tiling" / "entry.cpp"
 
 
+_CANN_SUBDIRS = (
+    "include",
+    "asc/impl/adv_api",
+    "asc/impl/basic_api",
+    "asc/impl/c_api",
+    "asc/impl/basic_api/reg_compute",
+    "asc/impl/simt_api",
+    "asc/impl/utils",
+    "asc",
+    "asc/include",
+    "asc/include/adv_api",
+    "asc/include/basic_api",
+    "asc/include/aicpu_api",
+    "asc/include/c_api",
+    "asc/include/interface",
+    "asc/include/basic_api/reg_compute",
+    "asc/include/simt_api",
+    "asc/include/utils",
+    "tikcpp/tikcfw",
+    "tikcpp/tikcfw/interface",
+    "tikcpp/tikcfw/impl",
+)
+
+
 def _cann_include_dirs() -> tuple[Path, ...]:
     cann_root = Path(os.environ.get("ASCEND_HOME_PATH", "/usr/local/Ascend/latest"))
-    devkit = cann_root / "aarch64-linux"
-    candidates = (
-        devkit / "include",
-        devkit / "asc" / "impl" / "adv_api",
-        devkit / "asc" / "impl" / "basic_api",
-        devkit / "asc" / "impl" / "c_api",
-        devkit / "asc" / "impl" / "basic_api" / "reg_compute",
-        devkit / "asc" / "impl" / "simt_api",
-        devkit / "asc" / "impl" / "utils",
-        devkit / "asc",
-        devkit / "asc" / "include",
-        devkit / "asc" / "include" / "adv_api",
-        devkit / "asc" / "include" / "basic_api",
-        devkit / "asc" / "include" / "aicpu_api",
-        devkit / "asc" / "include" / "c_api",
-        devkit / "asc" / "include" / "interface",
-        devkit / "asc" / "include" / "basic_api" / "reg_compute",
-        devkit / "asc" / "include" / "simt_api",
-        devkit / "asc" / "include" / "utils",
-        devkit / "tikcpp" / "tikcfw",
-        devkit / "tikcpp" / "tikcfw" / "interface",
-        devkit / "tikcpp" / "tikcfw" / "impl",
-    )
-    return tuple(path for path in candidates if path.is_dir())
+    # CANN puts the devkit under a host-architecture directory on some installs
+    # and flat at the toolkit root on others, so probe both. Pinning one layout
+    # leaves an x86_64 host with no CANN include dir at all, and ccec then dies
+    # on a missing basic_api/kernel_basic_intf.h far inside the vendor headers.
+    devkits = (cann_root / f"{os.uname().machine}-linux", cann_root)
+    resolved = tuple(devkit / sub for devkit in devkits for sub in _CANN_SUBDIRS if (devkit / sub).is_dir())
+    if not resolved:
+        raise RuntimeError(
+            f"no CANN devkit include directories found under ASCEND_HOME_PATH={cann_root}. "
+            f"Expected asc/include or tikcpp/tikcfw below {cann_root} or below "
+            f"{cann_root / f'{os.uname().machine}-linux'}; source the CANN set_env.sh of a "
+            "toolkit that ships the AscendC devkit headers."
+        )
+    return resolved
 
 
 _CANN_INCLUDE_DIRS = _cann_include_dirs()

@@ -142,7 +142,7 @@ def decode_o_proj_tp1(
 ):
     """Project local-token, full-group attention heads into BF16 hidden rows."""
     t_dim = pl.tensor.dim(attn_out, 0)
-    act_t_blks = t_dim // PROJ_B_ACT_TASK_T_TILE
+    act_t_blks = (t_dim + PROJ_B_ACT_TASK_T_TILE - 1) // PROJ_B_ACT_TASK_T_TILE
     proj_a_rows = (t_dim + PROJ_A_ROW_TILE - 1) // PROJ_A_ROW_TILE
 
     # Back-to-back grouped output projection: proj_a[g] -> quant[g] -> proj_b[g]
@@ -245,7 +245,7 @@ def decode_o_proj_tp1(
         t0 = tblk * PROJ_B_ACT_TASK_T_TILE
         wb_scale = wo_b_scale[ob_n0 : ob_n0 + PROJ_B_ACT_N_TILE]
         wb_scale_chunk = pl.reshape(wb_scale, [1, PROJ_B_ACT_N_TILE])
-        for b_tb in pl.range(t0, t0 + PROJ_B_ACT_TASK_T_TILE, PROJ_B_ACT_T_TILE):
+        for b_tb in pl.range(t0, pl.min(t0 + PROJ_B_ACT_TASK_T_TILE, t_dim), PROJ_B_ACT_T_TILE):
             acc = pl.full([PROJ_B_ACT_T_TILE, PROJ_B_ACT_N_TILE], dtype=pl.FP32, value=0.0)
             for act_g in pl.pipeline(O_GROUPS, stage=2):
                 p_col0 = act_g * D + ob_n0

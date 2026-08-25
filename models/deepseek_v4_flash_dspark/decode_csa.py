@@ -297,7 +297,7 @@ def decode_csa(
         cache_ready_dep = pl.system.task_dummy(deps=[ori_cache_write_tid, cmp_cache_write_tid])
 
         idx_kv_unused = pl.create_tensor([t_dim, IDX_HEAD_DIM], dtype=pl.FP32)
-        indexer(
+        idx_topk_scores, idx_topk = indexer(
             x_normed_t, qr, qr_scale, idx_wq_b, idx_wq_b_scale,
             weights_proj, idx_cos_il, idx_sin_signed, cmp_cos_il, cmp_sin_signed,
             hadamard_idx,
@@ -752,7 +752,7 @@ def decode_csa_tp1(
         cache_ready_dep = pl.system.task_dummy(deps=[ori_cache_write_tid, cmp_cache_write_tid])
 
         idx_kv_unused = pl.create_tensor([t_dim, IDX_HEAD_DIM], dtype=pl.FP32)
-        indexer(
+        idx_topk_scores, idx_topk = indexer(
             x_normed_t, qr, qr_scale, idx_wq_b, idx_wq_b_scale,
             weights_proj, idx_cos_il, idx_sin_signed, cmp_cos_il, cmp_sin_signed,
             hadamard_idx,
@@ -1580,9 +1580,72 @@ def golden_decode_csa(tensors):
         golden_decode_csa_tp1(rank_tensors)
 
 
+def _csa_x_out_compare():
+    """Keep the CSA hard cap while allowing bounded near-zero sign flips."""
+    import torch
+
+    from golden import ratio_reldiff
+
+    diff_thd = 4e-3
+    pct_thd = 0.008
+    max_diff_hd = 1.0
+    near_zero_magnitude = 3e-2
+    ratio_compare = ratio_reldiff(diff_thd=diff_thd, pct_thd=pct_thd)
+
+    def compare(actual, expected, **kwargs):
+        ratio_ok, ratio_detail = ratio_compare(actual, expected, **kwargs)
+        if not ratio_ok:
+            return False, ratio_detail
+
+        actual_f = actual.cpu().to(torch.float32)
+        expected_f = expected.cpu().to(torch.float32)
+        diff_abs = (actual_f - expected_f).abs()
+        small_value_floor = (1.0 / (1 << 14)) / diff_thd
+        denom = torch.maximum(
+            torch.maximum(actual_f.abs(), expected_f.abs()),
+            torch.full_like(actual_f, small_value_floor),
+        ) + 1e-9
+        rdiff = torch.where(diff_abs < diff_thd, diff_abs, diff_abs / denom)
+        bad_mask = rdiff > diff_thd
+        sign_flip = (
+            ((actual_f > 0) & (expected_f < 0))
+            | ((actual_f < 0) & (expected_f > 0))
+        )
+        near_zero_sign_flip = (
+            sign_flip
+            & (actual_f.abs() <= near_zero_magnitude)
+            & (expected_f.abs() <= near_zero_magnitude)
+        )
+        hard_cap_mask = bad_mask & ~near_zero_sign_flip & (rdiff >= max_diff_hd)
+        if not hard_cap_mask.any().item():
+            return True, ""
+
+        flat_indices = torch.where(hard_cap_mask.flatten())[0]
+        flat_rdiff = rdiff.flatten()
+        worst_offset = torch.argmax(flat_rdiff[flat_indices])
+        flat_index = flat_indices[worst_offset]
+        flat_actual = actual_f.flatten()
+        flat_expected = expected_f.flatten()
+        flat_abs = diff_abs.flatten()
+        return False, (
+            f"    CSA x_out hard-cap fail: [{flat_index.item()}] "
+            f"actual={flat_actual[flat_index].item():.8g}, "
+            f"expected={flat_expected[flat_index].item():.8g}, "
+            f"abs_diff={flat_abs[flat_index].item():.4g}, "
+            f"rdiff={flat_rdiff[flat_index].item():.4g} "
+            f">= max_diff_hd={max_diff_hd:.4g}"
+        )
+
+    compare.__name__ = (
+        f"csa_x_out_compare(diff_thd={diff_thd}, pct_thd={pct_thd}, "
+        f"max_diff_hd={max_diff_hd}, near_zero_magnitude={near_zero_magnitude})"
+    )
+    return compare
+
+
 def build_full_compare(mapping_shape, *, leading_rank_axis, diagnostic_x_out=False):
     """Compare the six mutable pools only at allocator-mapped rows."""
-    from golden import error_distribution, mapped_pool_ratio_allclose, ratio_reldiff
+    from golden import error_distribution, mapped_pool_ratio_allclose
 
     common = {
         "mapping_shape": mapping_shape,
@@ -1592,7 +1655,7 @@ def build_full_compare(mapping_shape, *, leading_rank_axis, diagnostic_x_out=Fal
     x_out_compare = (
         error_distribution(always_pass=False)
         if diagnostic_x_out
-        else ratio_reldiff(diff_thd=4e-3, pct_thd=0.008, max_diff_hd=2)
+        else _csa_x_out_compare()
     )
     return {
         "compress_state": mapped_pool_ratio_allclose(
