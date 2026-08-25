@@ -72,6 +72,8 @@ CMP_PAGES_PER_WORK = ATTN_K_TILE // BLOCK_SIZE
 ROPE_TILE = 16
 ROPE_INTERLEAVE_TILE = 2 * ROPE_TILE
 ROPE_CS_T_TILE = 8
+# One cyclic merge worker per AIV core.
+STREAM_MERGE_TASKS = 48
 T_PAD = ((T + 16 - 1) // 16) * 16
 
 assert WIN == ATTN_K_TILE, "HCA raw window must form one baseline-sized attention tile"
@@ -667,82 +669,92 @@ def sparse_attn_hca(
         cmp_branch_tids[0] = cmp_qk_tid
 
     with pl.spmd(
-        stream_block_count,
+        STREAM_MERGE_TASKS,
         name_hint="hca_stream_merge",
         deps=[raw_branch_tids[0], cmp_branch_tids[0]],
     ) as stream_heads_tid:
-        stream_idx = pl.tile.get_block_idx()
-        stream_t = stream_idx // (H // H_TILE)
-        stream_h_tile = stream_idx - stream_t * (H // H_TILE)
-        stream_h0 = stream_h_tile * H_TILE
-        stream_state_row = stream_t * H + stream_h0
-        stream_m = pl.load(
-            stream_state_m,
-            [stream_state_row, 0],
-            [H_TILE, 1],
-            target_memory=pl.MemorySpace.Vec,
-        )
-        stream_l = pl.load(
-            stream_state_l,
-            [stream_state_row, 0],
-            [H_TILE, 1],
-            target_memory=pl.MemorySpace.Vec,
-        )
-        stream_o = pl.load(
-            stream_heads,
-            [stream_state_row, 0],
-            [H_TILE, HEAD_DIM],
-            target_memory=pl.MemorySpace.Vec,
-        )
-        stream_token_base = stream_t * (H // H_TILE) * cmp_work_count * H_TILE
-        for stream_work in pl.range(cmp_work_count):
-            stream_partial_row = (
-                stream_token_base
-                + stream_h_tile * cmp_work_count * H_TILE
-                + stream_work * H_TILE
-            )
-            stream_cmp_m_aligned = pl.load(
-                cmp_partial_m,
-                [stream_partial_row, 0],
-                [H_TILE, 8],
+        merge_task = pl.tile.get_block_idx()
+        for merge_idx in pl.range(
+            merge_task,
+            stream_block_count,
+            STREAM_MERGE_TASKS,
+        ):
+            merge_t = merge_idx // (H // H_TILE)
+            merge_h_tile = merge_idx - merge_t * (H // H_TILE)
+            merge_h0 = merge_h_tile * H_TILE
+            merge_state_row = merge_t * H + merge_h0
+            merge_m = pl.load(
+                stream_state_m,
+                [merge_state_row, 0],
+                [H_TILE, 1],
                 target_memory=pl.MemorySpace.Vec,
             )
-            stream_cmp_l_aligned = pl.load(
-                cmp_partial_l,
-                [stream_partial_row, 0],
-                [H_TILE, 8],
+            merge_l = pl.load(
+                stream_state_l,
+                [merge_state_row, 0],
+                [H_TILE, 1],
                 target_memory=pl.MemorySpace.Vec,
             )
-            stream_cmp_m = stream_cmp_m_aligned[0:H_TILE, 0:1]
-            stream_cmp_l = stream_cmp_l_aligned[0:H_TILE, 0:1]
-            stream_cmp_o = pl.load(
-                cmp_partial_o,
-                [stream_partial_row, 0],
+            merge_o = pl.load(
+                stream_heads,
+                [merge_state_row, 0],
                 [H_TILE, HEAD_DIM],
                 target_memory=pl.MemorySpace.Vec,
             )
-            stream_m_new = pl.maximum(stream_m, stream_cmp_m)
-            stream_alpha = pl.exp(pl.sub(stream_m, stream_m_new))
-            stream_beta = pl.exp(pl.sub(stream_cmp_m, stream_m_new))
-            stream_l = pl.add(
-                pl.mul(stream_alpha, stream_l),
-                pl.mul(stream_beta, stream_cmp_l),
+            merge_token_base = (
+                merge_t * (H // H_TILE) * cmp_work_count * H_TILE
             )
-            stream_o = pl.add(
-                pl.row_expand_mul(stream_o, stream_alpha),
-                pl.row_expand_mul(stream_cmp_o, stream_beta),
+            for merge_work in pl.range(cmp_work_count):
+                merge_partial_row = (
+                    merge_token_base
+                    + merge_h_tile * cmp_work_count * H_TILE
+                    + merge_work * H_TILE
+                )
+                merge_cmp_m_aligned = pl.load(
+                    cmp_partial_m,
+                    [merge_partial_row, 0],
+                    [H_TILE, 8],
+                    target_memory=pl.MemorySpace.Vec,
+                )
+                merge_cmp_l_aligned = pl.load(
+                    cmp_partial_l,
+                    [merge_partial_row, 0],
+                    [H_TILE, 8],
+                    target_memory=pl.MemorySpace.Vec,
+                )
+                merge_cmp_m = merge_cmp_m_aligned[0:H_TILE, 0:1]
+                merge_cmp_l = merge_cmp_l_aligned[0:H_TILE, 0:1]
+                merge_cmp_o = pl.load(
+                    cmp_partial_o,
+                    [merge_partial_row, 0],
+                    [H_TILE, HEAD_DIM],
+                    target_memory=pl.MemorySpace.Vec,
+                )
+                merge_m_new = pl.maximum(merge_m, merge_cmp_m)
+                merge_alpha = pl.exp(pl.sub(merge_m, merge_m_new))
+                merge_beta = pl.exp(pl.sub(merge_cmp_m, merge_m_new))
+                merge_l = pl.add(
+                    pl.mul(merge_alpha, merge_l),
+                    pl.mul(merge_beta, merge_cmp_l),
+                )
+                merge_o = pl.add(
+                    pl.row_expand_mul(merge_o, merge_alpha),
+                    pl.row_expand_mul(merge_cmp_o, merge_beta),
+                )
+                merge_m = merge_m_new
+            merge_sink = pl.load(
+                attn_sink_col,
+                [merge_h0, 0],
+                [H_TILE, 1],
+                target_memory=pl.MemorySpace.Vec,
             )
-            stream_m = stream_m_new
-        stream_sink = pl.load(
-            attn_sink_col,
-            [stream_h0, 0],
-            [H_TILE, 1],
-            target_memory=pl.MemorySpace.Vec,
-        )
-        stream_sink_tile = pl.add(pl.sub(stream_m, stream_m), stream_sink)
-        stream_denom = pl.add(stream_l, pl.exp(pl.sub(stream_sink_tile, stream_m)))
-        stream_output = pl.row_expand_div(stream_o, stream_denom)
-        pl.store(stream_output, [stream_state_row, 0], stream_heads)
+            merge_sink_tile = pl.add(pl.sub(merge_m, merge_m), merge_sink)
+            merge_denom = pl.add(
+                merge_l,
+                pl.exp(pl.sub(merge_sink_tile, merge_m)),
+            )
+            merge_output = pl.row_expand_div(merge_o, merge_denom)
+            pl.store(merge_output, [merge_state_row, 0], stream_heads)
 
     with pl.spmd(
         stream_block_count,
