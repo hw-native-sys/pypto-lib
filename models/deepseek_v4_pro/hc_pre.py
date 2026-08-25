@@ -94,7 +94,7 @@ def _hc_pre_syncall(
     sq_sum_acc = pl.create_tensor([1, t_linear], dtype=pl.FP32)
     sq_partials = pl.create_tensor([HC_DIM // RMS_K_SPLIT_TILE, t_linear], dtype=pl.FP32)
     # Capture the TaskId required by the inline spmd form.
-    with pl.spmd(NUM_CORES, name_hint="hc_pre_fused", sync_start=True, allow_early_resolve=True) as _hc_tid:
+    with pl.spmd(NUM_CORES, name_hint="hc_pre_fused", sync_start=True) as _hc_tid:
         core = pl.tile.get_block_idx()
 
         for task in pl.range(core, lin_n, NUM_CORES):
@@ -385,7 +385,7 @@ def _hc_pre_separate(
 
     x_flat = pl.reshape(x, [t_dim, HC_DIM])
     inv_rms = pl.create_tensor([t_linear, 1], dtype=pl.FP32)
-    for t in pl.spmd(t_dim // T_TILE, name_hint="hc_pre_rms", allow_early_resolve=True):
+    for t in pl.spmd(t_dim // T_TILE, name_hint="hc_pre_rms"):
         t0 = t * T_TILE
         sq_sum = pl.full([1, T_TILE], dtype=pl.FP32, value=0.0)
         for k0 in pl.pipeline(0, HC_DIM, RMS_K_TILE, stage=4):
@@ -404,7 +404,7 @@ def _hc_pre_separate(
     mixes_partials = pl.create_tensor([linear_partial_rows, MIX_PAD], dtype=pl.FP32)
     for task in pl.spmd(
         (t_linear // LINEAR_T_TILE) * (HC_DIM // LINEAR_K_SPLIT_TILE),
-        name_hint="hc_pre_linear", allow_early_resolve=True,
+        name_hint="hc_pre_linear",
     ):
         t0 = (task // (HC_DIM // LINEAR_K_SPLIT_TILE)) * LINEAR_T_TILE
         linear_split = task % (HC_DIM // LINEAR_K_SPLIT_TILE)
@@ -426,7 +426,7 @@ def _hc_pre_separate(
         mixes_partials[partial_t0 : partial_t0 + LINEAR_T_TILE, 0:MIX_PAD] = acc
 
     pre_val_store = pl.create_tensor([t_linear, HC_PAD], dtype=pl.FP32)
-    for ob in pl.spmd(t_dim // T_TILE, name_hint="split_pre_post", allow_early_resolve=True):
+    for ob in pl.spmd(t_dim // T_TILE, name_hint="split_pre_post"):
         t0 = ob * T_TILE
         inv_col = inv_rms[t0:t0 + T_TILE, 0:1]
         pre_mixes = mixes_partials[t0:t0 + T_TILE, 0:HC_PAD]
@@ -462,7 +462,7 @@ def _hc_pre_separate(
         post[t0:t0 + T_TILE, 0:HC_MULT] = pl.slice(post_pad, [T_TILE, HC_PAD], [0, 0], valid_shape=[T_TILE, HC_MULT])
 
     hc_base_2d = pl.reshape(hc_base, [1, MIX_HC])
-    for ob in pl.spmd(t_dim // COMB_T_TILE, name_hint="comb_sinkhorn", allow_early_resolve=True):
+    for ob in pl.spmd(t_dim // COMB_T_TILE, name_hint="comb_sinkhorn"):
         t0 = ob * COMB_T_TILE
         inv_col_t = pl.load(inv_rms, [t0, 0], [COMB_T_TILE, 1], target_memory=pl.MemorySpace.Vec)
         comb_off = HC_MULT * 2
@@ -618,7 +618,7 @@ def _hc_pre_separate(
         pl.store(row2_out, [t0, 2 * HC_MULT], comb)
         pl.store(row3_out, [t0, 3 * HC_MULT], comb)
 
-    for blk in pl.spmd((t_dim // T_TILE) * (D // MIX_D_TILE), name_hint="mix_x", allow_early_resolve=True):
+    for blk in pl.spmd((t_dim // T_TILE) * (D // MIX_D_TILE), name_hint="mix_x"):
         t0 = (blk // (D // MIX_D_TILE)) * T_TILE
         d_base = (blk % (D // MIX_D_TILE)) * MIX_D_TILE
         pre_tile_t = pl.transpose(pre_val_store[t0:t0 + T_TILE, 0:HC_PAD], axis1=0, axis2=1)

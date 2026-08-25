@@ -126,7 +126,7 @@ def sparse_attn(
     wo_a_2d = pl.reshape(wo_a, [O_GROUPS * O_LORA, O_GROUP_IN])
     # The unread sink materializes the shared-L2 wo_a cache-warm task.
     warm_sink = pl.create_tensor([WARM_BLOCK_TILE * MM_T_TILE, PROJ_A_MM_N_TILE], dtype=pl.FP32)
-    with pl.spmd(WARM_BLOCK_TILE, name_hint="wo_a_warm", allow_early_resolve=True):
+    with pl.spmd(WARM_BLOCK_TILE, name_hint="wo_a_warm"):
         w_blk = pl.tile.get_block_idx()
         w_r0 = w_blk * WARM_ROW_TILE
         w_a = q_flat[0:MM_T_TILE, 0:A_K_TILE]
@@ -145,7 +145,7 @@ def sparse_attn(
     qk_order = pl.create_tensor([T * SPARSE_BLOCKS], dtype=pl.INT32)
     qk_wcur = pl.create_tensor([1], dtype=pl.INT32)
 
-    with pl.at(level=pl.Level.CORE_GROUP, name_hint="csa_slots_build_valid_qk_plan", allow_early_resolve=True) as qk_plan_tid:
+    with pl.at(level=pl.Level.CORE_GROUP, name_hint="csa_slots_build_valid_qk_plan") as qk_plan_tid:
         c_raw = pl.cast(idx_topk[0:T, 0:IDX_TOPK], target_type=pl.FP32)
         c_pos = pl.cast(position_ids[0:T, 0:1], target_type=pl.FP32)
         c_pos_one = pl.add(c_pos, 1.0)
@@ -211,7 +211,7 @@ def sparse_attn(
     sparse_blk_li = pl.create_tensor([T * (H // H_TILE) * SPARSE_BLOCKS * H_TILE, 1], dtype=pl.FP32)
     sparse_blk_oi = pl.create_tensor([T * (H // H_TILE) * SPARSE_BLOCKS * H_TILE, HEAD_DIM], dtype=pl.FP32)
 
-    with pl.spmd(QK_CORE_TILE, name_hint="qk_pv", deps=[qk_plan_tid], allow_early_resolve=True) as _qk_tid:
+    with pl.spmd(QK_CORE_TILE, name_hint="qk_pv", deps=[qk_plan_tid]) as _qk_tid:
         qk_core = pl.tile.get_block_idx()
         qk_lane_iters = (T * SPARSE_BLOCKS - qk_core + QK_CORE_TILE - 1) // QK_CORE_TILE
         for qk_it in pl.range(qk_lane_iters):
@@ -286,7 +286,7 @@ def sparse_attn(
     # Inverse RoPE: out[j] = x[j] * cos[j] + x[j ^ 1] * sign[j] * sin[j].
     rope_cos_il = pl.create_tensor([T, ROPE_DIM], dtype=pl.FP32)
     rope_sin_signed = pl.create_tensor([T, ROPE_DIM], dtype=pl.FP32)
-    with pl.at(level=pl.Level.CORE_GROUP, name_hint="rope_cs", allow_early_resolve=True):
+    with pl.at(level=pl.Level.CORE_GROUP, name_hint="rope_cs"):
         cs_cos_f32 = pl.cast(freqs_cos[0:T, 0:HALF_ROPE], target_type=pl.FP32)
         cs_sin_f32 = pl.cast(freqs_sin[0:T, 0:HALF_ROPE], target_type=pl.FP32)
         cs_cos_il = pl.full([T, ROPE_DIM], dtype=pl.FP32, value=0.0)
@@ -377,7 +377,6 @@ def sparse_attn(
                 O_GROUP_TILE * (O_LORA // PROJ_A_MM_N_TILE // PA_NF_TILE),
                 name_hint="proj_a_mm",
                 deps=[merge_tids[group_bundle]],
-                allow_early_resolve=True,
             ) as pa_tid:
                 pa_idx = pl.tile.get_block_idx()
                 pa_local_group = pa_idx // (O_LORA // PROJ_A_MM_N_TILE // PA_NF_TILE)
@@ -401,7 +400,6 @@ def sparse_attn(
                 O_GROUP_TILE,
                 name_hint="quant",
                 deps=[pa_tid],
-                allow_early_resolve=True,
             ) as q_tid:
                 q_local_group = pl.tile.get_block_idx()
                 g = group_bundle * O_GROUP_TILE + q_local_group
@@ -428,7 +426,6 @@ def sparse_attn(
                 O_GROUP_TILE * (D // PROJ_B_D_TILE),
                 name_hint="proj_b_mm",
                 deps=[q_tid],
-                allow_early_resolve=True,
             ) as pb_tid:
                 pb_idx = pl.tile.get_block_idx()
                 pb_local_group = pb_idx // (D // PROJ_B_D_TILE)
@@ -457,7 +454,6 @@ def sparse_attn(
         (D // PROJ_B_ACT_N_TILE) * (T // PROJ_B_ACT_TASK_T_TILE),
         name_hint="proj_b_act",
         deps=[proj_b_tids[i] for i in range(O_GROUPS // O_GROUP_TILE)],
-        allow_early_resolve=True,
     ) as _act_tid:
         act_idx = pl.tile.get_block_idx()
         nreg = act_idx // (T // PROJ_B_ACT_TASK_T_TILE)

@@ -53,7 +53,7 @@ def expert_shared(
 
         gate_i32 = pl.create_tensor([SH_M_TILE, MOE_INTER], dtype=pl.INT32)
 
-        for nb_idx in pl.spmd(MOE_INTER // MM_INTER_TILE, name_hint="sh_gate_mm", allow_early_resolve=True):
+        for nb_idx in pl.spmd(MOE_INTER // MM_INTER_TILE, name_hint="sh_gate_mm"):
             n0 = nb_idx * MM_INTER_TILE
             gate_acc = pl.create_tensor([SH_M_TILE, MM_INTER_TILE], dtype=pl.INT32)
             for k0 in pl.pipeline(0, D, K_TILE, stage=2):
@@ -67,7 +67,7 @@ def expert_shared(
 
         up_i32 = pl.create_tensor([SH_M_TILE, MOE_INTER], dtype=pl.INT32)
 
-        for nb_idx in pl.spmd(MOE_INTER // MM_INTER_TILE, name_hint="sh_up_mm", allow_early_resolve=True):
+        for nb_idx in pl.spmd(MOE_INTER // MM_INTER_TILE, name_hint="sh_up_mm"):
             n0 = nb_idx * MM_INTER_TILE
             up_acc = pl.create_tensor([SH_M_TILE, MM_INTER_TILE], dtype=pl.INT32)
             for k0 in pl.pipeline(0, D, K_TILE, stage=2):
@@ -82,7 +82,7 @@ def expert_shared(
         h_tile_fp32 = pl.create_tensor([SH_M_TILE, MOE_INTER], dtype=pl.FP32)
         h_tile_i8 = pl.create_tensor([SH_M_TILE, MOE_INTER], dtype=pl.INT8, init_value=0)
         h_tile_scale_dq = pl.create_tensor([SH_M_TILE, SH_ROW_PAD], dtype=pl.FP32, manual_dep=True)
-        for row_block in pl.spmd(SH_VALID_M // SH_ROW_TILE, name_hint="sh_gate_up_act_q", allow_early_resolve=True):
+        for row_block in pl.spmd(SH_VALID_M // SH_ROW_TILE, name_hint="sh_gate_up_act_q"):
             row0 = row_block * SH_ROW_TILE
             x_scale = pl.slice(x_local_scale_dq, [SH_ROW_PAD, 1], [ts0 + row0, 0], valid_shape=[SH_ROW_TILE, 1])
             row_amax = pl.full([1, SH_ROW_PAD], dtype=pl.FP32, value=INT8_AMAX_EPS)
@@ -146,7 +146,7 @@ def expert_shared(
                 h_i8 = pl.cast(h_fp16, target_type=pl.INT8, mode="trunc")
                 h_tile_i8[row0 : row0 + SH_ROW_TILE, k0 : k0 + QUANT_TILE] = h_i8[0:SH_ROW_TILE, :]
 
-        for db_idx in pl.spmd(D // D_OUT_TILE, name_hint="sh_w2_mm", allow_early_resolve=True):
+        for db_idx in pl.spmd(D // D_OUT_TILE, name_hint="sh_w2_mm"):
             d0 = db_idx * D_OUT_TILE
             y_acc = pl.create_tensor([SH_M_TILE, D_OUT_TILE], dtype=pl.INT32)
             for k0 in pl.pipeline(0, MOE_INTER, INTER_K_TILE, stage=2):

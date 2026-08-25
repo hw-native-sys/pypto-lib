@@ -209,7 +209,7 @@ def indexer_compressor(
 
     cmp_cos_il = pl.create_tensor([RMS_PAD_TILE, ROPE_HEAD_DIM], dtype=pl.FP32)
     cmp_sin_signed = pl.create_tensor([RMS_PAD_TILE, ROPE_HEAD_DIM], dtype=pl.FP32)
-    with pl.at(level=pl.Level.CORE_GROUP, name_hint="cmp_rope_tables", allow_early_resolve=True):
+    with pl.at(level=pl.Level.CORE_GROUP, name_hint="cmp_rope_tables"):
         cos_b = pl.full([RMS_PAD_TILE, ROPE_HEAD_DIM // 2], dtype=pl.FP32, value=0.0)
         sin_b = pl.full([RMS_PAD_TILE, ROPE_HEAD_DIM // 2], dtype=pl.FP32, value=0.0)
         cos_b[0:B, 0 : ROPE_HEAD_DIM // 2] = cos[0:B, 0 : ROPE_HEAD_DIM // 2]

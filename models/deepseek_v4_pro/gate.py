@@ -108,7 +108,7 @@ def gate(
     xg_buf = pl.create_tensor([T_PAD, D], dtype=pl.FP32)
     inv_rms_buf = pl.create_tensor([T_PAD, 1], dtype=pl.FP32)
     xn_scale_buf = pl.create_tensor([T_PAD, 1], dtype=pl.FP32)
-    for tok in pl.spmd(active_gate_tokens, name_hint="ffn_norm", allow_early_resolve=True):
+    for tok in pl.spmd(active_gate_tokens, name_hint="ffn_norm"):
         rms_x_bf16 = pl.tile.load(x_mixed, [tok, 0], [1, D])
         rms_x = pl.cast(rms_x_bf16, pl.FP32)
         rms_w_bf16 = pl.tile.load(norm_w_2d, [0, 0], [1, D])
@@ -158,7 +158,7 @@ def gate(
         pl.tile.store(xg_sq, [tok, 0], xn_scale_buf, shapes=[1, 1])
 
     for t0 in pl.parallel(0, active_gate_tokens, T_TILE):
-        with pl.at(level=pl.Level.CORE_GROUP, name_hint="x_norm_quant", allow_early_resolve=True):
+        with pl.at(level=pl.Level.CORE_GROUP, name_hint="x_norm_quant"):
             xn_sq_col = xn_scale_buf[t0 : t0 + T_TILE, 0:1]
             for xq_b_k in pl.pipeline(0, D, QUANT_TILE, stage=2):
                 xn_q_chunk = xg_buf[t0 : t0 + T_TILE, xq_b_k : xq_b_k + QUANT_TILE]
@@ -184,7 +184,7 @@ def gate(
             biased_scores_buf[:, N_EXPERTS:SCORE_PAD] = biased_pad
 
     route_scores_buf = pl.create_tensor([T_PAD, SCORE_PAD], dtype=pl.FP32)
-    for gb_idx in pl.spmd(active_gate_tiles * (N_EXPERTS // GATE_N_TILE), name_hint="gate", allow_early_resolve=True):
+    for gb_idx in pl.spmd(active_gate_tiles * (N_EXPERTS // GATE_N_TILE), name_hint="gate"):
         tg = gb_idx // (N_EXPERTS // GATE_N_TILE)
         nb = gb_idx % (N_EXPERTS // GATE_N_TILE)
         t1 = tg * GATE_M_TILE
@@ -224,7 +224,7 @@ def gate(
 
     active_route_tiles = (active_tokens + GATE_T_TILE - 1) // GATE_T_TILE
     if layer_id < N_HASH_LAYERS:
-        for th_idx in pl.spmd(active_route_tiles, name_hint="route_hash", allow_early_resolve=True):
+        for th_idx in pl.spmd(active_route_tiles, name_hint="route_hash"):
             t1 = th_idx * GATE_T_TILE
             hs_idx_tile = pl.create_tensor([GATE_T_TILE, TOPK_PAD], dtype=pl.INT32)
             for hs_tt in pl.range(GATE_T_TILE):
@@ -256,7 +256,7 @@ def gate(
                         hs_out_weight = pl.read(hs_weights_pad, [hs_wt_tt, hs_wt_k])
                         pl.write(weights, [hs_out_t, hs_wt_k], hs_out_weight)
     else:
-        for ts_idx in pl.spmd(active_route_tiles, name_hint="route_sort", allow_early_resolve=True):
+        for ts_idx in pl.spmd(active_route_tiles, name_hint="route_sort"):
             t1 = ts_idx * GATE_T_TILE
             # ptoas pto.tmrgsort requires a single source row.
             topk_idx_tile = pl.create_tensor([GATE_T_TILE, TOPK_PAD], dtype=pl.INT32)

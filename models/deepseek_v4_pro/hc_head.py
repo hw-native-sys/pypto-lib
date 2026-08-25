@@ -56,7 +56,7 @@ def hc_head(
 
     for task in pl.spmd(
         (t_dim // T_TILE) * (HC_DIM // MIX_SPLIT_TILE),
-        name_hint="hc_head_mix", allow_early_resolve=True,
+        name_hint="hc_head_mix",
     ):
         tt = task // (HC_DIM // MIX_SPLIT_TILE)
         split = task - tt * (HC_DIM // MIX_SPLIT_TILE)
@@ -93,7 +93,7 @@ def hc_head(
         stats[stats_row : stats_row + 1, 0:STAT_COLS] = acc
 
     y_flat = pl.reshape(y, [t_dim, D])
-    for task in pl.spmd((t_dim // T_TILE) * (D // D_SPLIT_TILE), name_hint="hc_head_reduce", allow_early_resolve=True):
+    for task in pl.spmd((t_dim // T_TILE) * (D // D_SPLIT_TILE), name_hint="hc_head_reduce"):
         tt = task // (D // D_SPLIT_TILE)
         d_split = task - tt * (D // D_SPLIT_TILE)
         t0 = tt * T_TILE

@@ -174,7 +174,6 @@ def dispatch(
         level=pl.Level.CORE_GROUP,
         name_hint="dispatch_meta",
         deps=[_reuse_tid],
-        allow_early_resolve=True,
     ) as _meta_tid:
         active_tokens = pl.cast(num_tokens, pl.INDEX)
         if active_tokens < 0:

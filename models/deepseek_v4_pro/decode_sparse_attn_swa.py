@@ -125,7 +125,7 @@ def sparse_attn_swa(
     sparse_blk_li = pl.create_tensor([T * (H // H_TILE) * SPARSE_BLOCKS * H_TILE, 1], dtype=pl.FP32)
     sparse_blk_oi = pl.create_tensor([T * (H // H_TILE) * SPARSE_BLOCKS * H_TILE, HEAD_DIM], dtype=pl.FP32)
 
-    with pl.spmd(T, name_hint="qk_pv", deps=[gather_tids[0]], allow_early_resolve=True) as qk_tid:
+    with pl.spmd(T, name_hint="qk_pv", deps=[gather_tids[0]]) as qk_tid:
         qk_t = pl.tile.get_block_idx()
         qk_token_base = qk_t * (H // H_TILE) * SPARSE_BLOCKS * H_TILE
         for qk_sb in pl.unroll(SPARSE_BLOCKS):
@@ -178,7 +178,7 @@ def sparse_attn_swa(
     merge_tids = pl.array.create(O_GROUPS // O_GROUP_TILE, pl.TASK_ID)
 
     for merge_group in pl.parallel(O_GROUPS // O_GROUP_TILE):
-        with pl.spmd(T, name_hint="merge_norm", deps=[qk_tid, rope_tid], allow_early_resolve=True) as merge_tid:
+        with pl.spmd(T, name_hint="merge_norm", deps=[qk_tid, rope_tid]) as merge_tid:
             m_t = pl.tile.get_block_idx()
             m_h_idx = merge_group
             m_h0 = m_h_idx * H_TILE
@@ -231,7 +231,6 @@ def sparse_attn_swa(
                 O_GROUP_TILE * (O_LORA // PROJ_A_MM_N_TILE // PA_NF_TILE),
                 name_hint="proj_a_mm",
                 deps=[merge_tids[group_bundle]],
-                allow_early_resolve=True,
             ) as pa_tid:
                 pa_idx = pl.tile.get_block_idx()
                 pa_local_group = pa_idx // (O_LORA // PROJ_A_MM_N_TILE // PA_NF_TILE)
@@ -260,7 +259,6 @@ def sparse_attn_swa(
                 O_GROUP_TILE,
                 name_hint="quant",
                 deps=[pa_tid],
-                allow_early_resolve=True,
             ) as q_tid:
                 q_local_group = pl.tile.get_block_idx()
                 g = group_bundle * O_GROUP_TILE + q_local_group
@@ -292,7 +290,6 @@ def sparse_attn_swa(
                 O_GROUP_TILE * (D // PROJ_B_D_TILE),
                 name_hint="proj_b_mm",
                 deps=[q_tid],
-                allow_early_resolve=True,
             ) as pb_tid:
                 pb_idx = pl.tile.get_block_idx()
                 pb_local_group = pb_idx // (D // PROJ_B_D_TILE)
@@ -321,7 +318,6 @@ def sparse_attn_swa(
         (D // PROJ_B_ACT_N_TILE) * (T // PROJ_B_ACT_TASK_T_TILE),
         name_hint="proj_b_act",
         deps=[proj_b_tids[i] for i in range(O_GROUPS // O_GROUP_TILE)],
-        allow_early_resolve=True,
     ) as _act_tid:
         act_idx = pl.tile.get_block_idx()
         nreg = act_idx // (T // PROJ_B_ACT_TASK_T_TILE)

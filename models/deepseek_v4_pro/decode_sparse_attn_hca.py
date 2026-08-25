@@ -112,7 +112,7 @@ def sparse_attn_hca(
 ):
     """Run sparse decode attention, inverse RoPE, and grouped output projection."""
     sparse_bias = pl.create_tensor([T, PADDED_TOPK], dtype=pl.FP32)
-    for v_blk in pl.spmd(T // VALID_TOKEN_TILE, name_hint="build_valid", allow_early_resolve=True):
+    for v_blk in pl.spmd(T // VALID_TOKEN_TILE, name_hint="build_valid"):
         v_t0 = v_blk * VALID_TOKEN_TILE
         v_win_f = pl.cast(window_swa_indices[v_t0 : v_t0 + VALID_TOKEN_TILE, 0 : WIN], target_type=pl.FP32)
         v_idx_f = pl.cast(cmp_sparse_indices[v_t0 : v_t0 + VALID_TOKEN_TILE, 0 : CMP_TOPK], target_type=pl.FP32)
@@ -184,7 +184,7 @@ def sparse_attn_hca(
     sparse_blk_li = pl.create_tensor([T * (H // H_TILE) * SPARSE_BLOCKS * H_TILE, 1], dtype=pl.FP32)
     sparse_blk_oi = pl.create_tensor([T * (H // H_TILE) * SPARSE_BLOCKS * H_TILE, HEAD_DIM], dtype=pl.FP32)
 
-    with pl.spmd(T * SPARSE_BLOCKS, name_hint="qk_pv", deps=[gather_tid], allow_early_resolve=True) as _qk_tid:
+    with pl.spmd(T * SPARSE_BLOCKS, name_hint="qk_pv", deps=[gather_tid]) as _qk_tid:
         qk_item = pl.tile.get_block_idx()
         qk_t = qk_item // SPARSE_BLOCKS
         qk_sb = qk_item - qk_t * SPARSE_BLOCKS
@@ -221,7 +221,7 @@ def sparse_attn_hca(
     # Inverse RoPE: out[j] = x[j] * cos[j] + x[j ^ 1] * sign[j] * sin[j].
     rope_cos_il = pl.create_tensor([T, ROPE_DIM], dtype=pl.FP32)
     rope_sin_signed = pl.create_tensor([T, ROPE_DIM], dtype=pl.FP32)
-    with pl.at(level=pl.Level.CORE_GROUP, name_hint="rope_cs", allow_early_resolve=True):
+    with pl.at(level=pl.Level.CORE_GROUP, name_hint="rope_cs"):
         cs_cos_f32 = pl.cast(freqs_cos[0:T, 0:HALF_ROPE], target_type=pl.FP32)
         cs_sin_f32 = pl.cast(freqs_sin[0:T, 0:HALF_ROPE], target_type=pl.FP32)
         cs_cos_il = pl.full([T, ROPE_DIM], dtype=pl.FP32, value=0.0)
@@ -312,7 +312,6 @@ def sparse_attn_hca(
                 O_GROUP_TILE * (O_LORA // PROJ_A_MM_N_TILE // PA_NF_TILE),
                 name_hint="proj_a_mm",
                 deps=[merge_tids[group_bundle]],
-                allow_early_resolve=True,
             ) as pa_tid:
                 pa_idx = pl.tile.get_block_idx()
                 pa_local_group = pa_idx // (O_LORA // PROJ_A_MM_N_TILE // PA_NF_TILE)
@@ -341,7 +340,6 @@ def sparse_attn_hca(
                 O_GROUP_TILE,
                 name_hint="quant",
                 deps=[pa_tid],
-                allow_early_resolve=True,
             ) as q_tid:
                 q_local_group = pl.tile.get_block_idx()
                 g = group_bundle * O_GROUP_TILE + q_local_group
@@ -373,7 +371,6 @@ def sparse_attn_hca(
                 O_GROUP_TILE * (D // PROJ_B_D_TILE),
                 name_hint="proj_b_mm",
                 deps=[q_tid],
-                allow_early_resolve=True,
             ) as pb_tid:
                 pb_idx = pl.tile.get_block_idx()
                 pb_local_group = pb_idx // (D // PROJ_B_D_TILE)
@@ -399,7 +396,6 @@ def sparse_attn_hca(
         (D // PROJ_B_ACT_N_TILE) * (T // PROJ_B_ACT_TASK_T_TILE),
         name_hint="proj_b_act",
         deps=[proj_b_tids[i] for i in range(O_GROUPS // O_GROUP_TILE)],
-        allow_early_resolve=True,
     ) as _act_tid:
         act_idx = pl.tile.get_block_idx()
         nreg = act_idx // (T // PROJ_B_ACT_TASK_T_TILE)

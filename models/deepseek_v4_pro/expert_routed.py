@@ -223,7 +223,6 @@ def expert_routed(
                     with pl.spmd(
                         D // (W2_INNER * D_OUT_TILE),
                         name_hint="exp_w2_mm",
-                        allow_early_resolve=True,
                     ):
                         wb_idx = pl.tile.get_block_idx()
                         d_base = wb_idx * (W2_INNER * D_OUT_TILE)
@@ -243,7 +242,6 @@ def expert_routed(
                     with pl.spmd(
                         D // (W2_ACT_INNER * D_OUT_TILE_ACT),
                         name_hint="exp_w2_act",
-                        allow_early_resolve=True,
                     ):
                         db_idx = pl.tile.get_block_idx()
                         act_d_base = db_idx * (W2_ACT_INNER * D_OUT_TILE_ACT)

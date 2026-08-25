@@ -34,7 +34,7 @@ def rms_norm(
     x_normed: pl.Tensor[[T_DYN, D], pl.BF16],
 ):
     t_dim = pl.tensor.dim(x, 0)
-    with pl.spmd((t_dim // T_TILE) * (D // APPLY_D_TILE), name_hint="rms_norm", allow_early_resolve=True) as rms_tid:
+    with pl.spmd((t_dim // T_TILE) * (D // APPLY_D_TILE), name_hint="rms_norm") as rms_tid:
         rms_blk = pl.tile.get_block_idx()
         tg_idx = rms_blk // (D // APPLY_D_TILE)
         rms_dsplit = rms_blk - tg_idx * (D // APPLY_D_TILE)

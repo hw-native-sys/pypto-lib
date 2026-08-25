@@ -61,7 +61,7 @@ def mtp_projection(
     t_linear = ((t_dim + LINEAR_T_TILE - 1) // LINEAR_T_TILE) * LINEAR_T_TILE
     hidden_i8 = pl.create_tensor([t_linear, D], dtype=pl.INT8)
     hidden_scale_dq = pl.create_tensor([t_linear, 1], dtype=pl.FP32)
-    for hidden_block in pl.spmd(t_dim // T_TILE, name_hint="mtp_projection_hidden", allow_early_resolve=True):
+    for hidden_block in pl.spmd(t_dim // T_TILE, name_hint="mtp_projection_hidden"):
         t0 = hidden_block * T_TILE
         hidden_sq_sum = pl.full([1, T_TILE], dtype=pl.FP32, value=0.0)
         hidden_amax = pl.full([1, T_TILE], dtype=pl.FP32, value=INT8_AMAX_EPS)
@@ -107,7 +107,7 @@ def mtp_projection(
     prev_linear_rows = t_linear * HC_MULT
     prev_i8 = pl.create_tensor([prev_linear_rows, D], dtype=pl.INT8)
     prev_scale_dq = pl.create_tensor([HC_MULT, t_linear], dtype=pl.FP32)
-    for prev_block in pl.spmd((t_dim // T_TILE) * HC_MULT, name_hint="mtp_projection_prev", allow_early_resolve=True):
+    for prev_block in pl.spmd((t_dim // T_TILE) * HC_MULT, name_hint="mtp_projection_prev"):
         prev_t = prev_block // HC_MULT
         hc = prev_block - prev_t * HC_MULT
         t0 = prev_t * T_TILE
