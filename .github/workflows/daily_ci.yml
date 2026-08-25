@@ -665,25 +665,47 @@ jobs:
         run: |
           source activate.sh
           set +e
+          # A stale attempt-1 log from an earlier run on this runner would ride
+          # into the artifact even on a clean single-attempt night; drop it.
+          rm -f e2e-attempt1.log
           # Eight cards at once: the per-repo whitelist caps smaller borrows, so
           # lift it the way task-submit documents for daily CI (--ignore-whitelist;
           # the host blacklist still applies). $TASK_DEVICE is the lent set and
           # goes straight to -d; it must stay single-quoted so it expands only
           # after task-submit assigns the cards.
-          task-submit --device auto --device-num 8 --ignore-whitelist --timeout 5400 --max-time 2400 \
-            --run "cd $GITHUB_WORKSPACE/checkout && source activate.sh && PYTHONPATH=$GITHUB_WORKSPACE/checkout \
-              python models/deepseek_v4_pro/synthetic_token_loop.py --variant flash --ep 8 --tp 2 \
-                -d \$TASK_DEVICE \
-                --weights '$WEIGHTS' --tokenizer '$CKPT/tokenizer.json' \
-                --prompt '$E2E_PROMPT' --decode-steps $E2E_DECODE_STEPS" 2>&1 | tee e2e.log
-          rc=${PIPESTATUS[0]}
+          run_loop() {
+            task-submit --device auto --device-num 8 --ignore-whitelist --timeout 5400 --max-time 2400 \
+              --run "cd $GITHUB_WORKSPACE/checkout && source activate.sh && PYTHONPATH=$GITHUB_WORKSPACE/checkout \
+                python models/deepseek_v4_pro/synthetic_token_loop.py --variant flash --ep 8 --tp 2 \
+                  -d \$TASK_DEVICE \
+                  --weights '$WEIGHTS' --tokenizer '$CKPT/tokenizer.json' \
+                  --prompt '$E2E_PROMPT' --decode-steps $E2E_DECODE_STEPS" 2>&1 | tee e2e.log
+            return "${PIPESTATUS[0]}"
+          }
+          # One retry, disclosed: the pinned toolchain still carries a
+          # probabilistic cross-rank divergence (issue #1043) that kills about
+          # one run in four at a random decode step. A monitoring job that
+          # exists to publish the nightly continuation should not go dark on a
+          # known flake, and e2e.json records the attempt count and the first
+          # attempt's error so a flaky night still reads as exactly what it
+          # was. Drop the retry together with the pin once the toolchain fix
+          # lands.
+          attempts=1
+          run_loop; rc=$?
+          if [ "$rc" -ne 0 ]; then
+            cp e2e.log e2e-attempt1.log
+            echo "::warning::EP8 token loop attempt 1 failed (exit $rc) — retrying once (issue #1043)"
+            attempts=2
+            run_loop; rc=$?
+          fi
           # Distil the run into e2e.json for the summary job: status, the prompt,
           # the generated text (the loop prints it as a Python repr), the step
           # count actually decoded, and the first device/runtime error line if
           # the run died. Everything else stays in e2e.log (uploaded alongside).
-          python3 - "$rc" "$E2E_PROMPT" "$E2E_DECODE_STEPS" "$CKPT/tokenizer.json" <<'EOF'
+          python3 - "$rc" "$E2E_PROMPT" "$E2E_DECODE_STEPS" "$CKPT/tokenizer.json" "$attempts" <<'EOF'
           import ast, json, re, sys
           rc, prompt, steps, tok_path = int(sys.argv[1]), sys.argv[2], int(sys.argv[3]), sys.argv[4]
+          attempts = int(sys.argv[5])
           log = open("e2e.log", errors="replace").read()
           def last(pattern):
               hits = re.findall(pattern, log, re.M)
@@ -726,9 +748,24 @@ jobs:
               if tail:
                   error = tail[-1].strip()[:300]
           n_ids = len(ast.literal_eval(ids)) if ids else None
+          # When a first attempt failed and was retried, surface its error line
+          # next to the (final) verdict so a flaky night reads as exactly what
+          # it was; e2e-attempt1.log rides along in the artifact.
+          first_attempt_error = None
+          if attempts > 1:
+              try:
+                  log1 = open("e2e-attempt1.log", errors="replace").read()
+              except FileNotFoundError:
+                  log1 = ""
+              hits = re.findall(
+                  r"^(?:RuntimeError|ValueError|TimeoutError|OSError|AssertionError)[^\n]*$",
+                  log1, re.M)
+              first_attempt_error = hits[-1] if hits else "see e2e-attempt1.log"
           json.dump({
               "status": "pass" if passed else "fail",
               "exit_code": rc,
+              "attempts": attempts,
+              "first_attempt_error": first_attempt_error,
               "prompt": prompt,
               "decode_steps_requested": steps,
               "decode_steps_done": (int(eos) if eos else (n_ids if n_ids is not None else decode_lines)),
@@ -768,6 +805,7 @@ jobs:
           path: |
             checkout/e2e.json
             checkout/e2e.log
+            checkout/e2e-attempt1.log
           if-no-files-found: warn
 
   summary:

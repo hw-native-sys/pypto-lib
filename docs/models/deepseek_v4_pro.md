@@ -244,7 +244,11 @@ Unlike the rest of the nightly, this job currently builds a pinned pypto
 toolchain that pypto HEAD pins carries a pto-isa A5 dispatch regression
 that stalls every EP8 prefill before the first token. The pin comes off
 once the upstream fix reaches pto-isa's mirror and the simpler/pypto pins
-move past it.
+move past it. While the pinned toolchain's probabilistic cross-rank
+divergence ([#1043](https://github.com/hw-native-sys/pypto-lib/issues/1043))
+stays open, the job also retries the loop once; `e2e.json` carries the
+attempt count and the first attempt's error, so a flaky night still reads
+as exactly what it was.
 
 ## Files
 
