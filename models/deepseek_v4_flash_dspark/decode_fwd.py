@@ -6,6 +6,7 @@
 # INCLUDING BUT NOT LIMITED TO NON-INFRINGEMENT, MERCHANTABILITY, OR FITNESS FOR A PARTICULAR PURPOSE.
 # See LICENSE in the root of the software repository for the full text of the License.
 # -----------------------------------------------------------------------------------------------------------
+# ci: devices=2  # CI: EP2/TP2 full decode forward
 """DeepSeek-V4 D-Spark decode forward."""
 
 import sys
@@ -54,7 +55,6 @@ import decode_csa as csa
 import decode_hca as hca
 import decode_layer as layer
 import decode_swa as swa
-import moe as moe_module
 import pypto.language as pl
 import pypto.language.distributed as pld
 from decode_layer import decode_layer_csa, decode_layer_hca, decode_layer_swa
