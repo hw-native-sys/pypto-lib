@@ -816,9 +816,13 @@ def build_tensor_specs(cp_size: int = CP_SIZE):
     ):
         value = meta[name]
         specs.append(TensorSpec(name, list(value.shape), value.dtype, init_value=value))
-    for name in ("reverse_index", "final_win_seg_src", "final_win_row_src", "final_slot_mapping"):
-        specs.append(TensorSpec(name, list(meta[name].shape), meta[name].dtype, init_value=meta[name]))
+    # Spec order must match the kernel signature: run_jit binds its dummy compile
+    # args positionally, so owner_rank_table sits between reverse_index and the
+    # final_win_* triple exactly as prefill_cp_swa_test declares them.
+    specs.append(TensorSpec("reverse_index", list(meta["reverse_index"].shape), meta["reverse_index"].dtype, init_value=meta["reverse_index"]))
     specs.append(TensorSpec("owner_rank_table", list(owner_rank.shape), owner_rank.dtype, init_value=owner_rank))
+    for name in ("final_win_seg_src", "final_win_row_src", "final_slot_mapping"):
+        specs.append(TensorSpec(name, list(meta[name].shape), meta[name].dtype, init_value=meta[name]))
     specs.append(TensorSpec("x_out", list(x.shape), torch.float32, is_output=True))
     return specs, ctx
 

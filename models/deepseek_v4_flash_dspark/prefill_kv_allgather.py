@@ -188,7 +188,8 @@ def build_tensor_specs(local_t=FIXTURE_LOCAL_T):
 
     return [
         TensorSpec("hidden_local", [TP_SIZE, local_t, D], torch.bfloat16, init_value=init_hidden_local),
-        TensorSpec("group_out", [TP_SIZE, group_t, D], torch.bfloat16, is_output=True),
+        # init_value keeps the spec on the InOut branch the kernel declares.
+        TensorSpec("group_out", [TP_SIZE, group_t, D], torch.bfloat16, init_value=0.0, is_output=True),
     ]
 
 
