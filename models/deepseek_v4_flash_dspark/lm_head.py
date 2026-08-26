@@ -28,7 +28,7 @@ VOCAB = M.vocab_size
 MAX_LOGIT_ROWS = DECODE_TOKENS
 
 # parallelism
-_TP_CHOICES = (2, 4, 8, 16)
+_TP_CHOICES = (1, 2, 4, 8, 16)
 _DP_CHOICES = (1, 2, 4, 8, 16)
 _TP_DEFAULT = 2
 
