@@ -725,7 +725,7 @@ def decode_fwd(
         [LM_HEAD_TP_SIZE, 1], pl.INT32
     ],
     lm_head_logits_window: pld.DistributedTensor[
-        [MAX_LOGIT_ROWS, LM_HEAD_VOCAB], pl.FP32
+        [MAX_LOGIT_ROWS * LM_HEAD_VOCAB], pl.FP32
     ],
     lm_head_logits_done: pld.DistributedTensor[
         [LM_HEAD_TP_SIZE, 1], pl.INT32
@@ -1893,8 +1893,8 @@ def decode_fwd(
             hc_head_base,
             hidden_workspace,
         )
-        rms_norm(hidden_workspace, final_norm_w, x_out)
-        lm_head(
+        final_norm_tid = rms_norm(hidden_workspace, final_norm_w, x_out)
+        logits, _lm_head_done_tid = lm_head(
             x_out,
             lm_head_weight,
             logit_row_indices,
@@ -1906,6 +1906,7 @@ def decode_fwd(
             group_base,
             tp_rank,
             pl.const(LM_HEAD_COMM_EPOCH, pl.INT32),
+            final_norm_tid,
         )
         greedy_sample(logits, sampled_ids)
         mask_inactive_sample_rows(logit_row_indices, sampled_ids)
@@ -2363,7 +2364,7 @@ def l3_decode_fwd(
         [LM_HEAD_TP_SIZE, 1], dtype=pl.INT32
     )
     lm_head_logits_window_buf = pld.alloc_window_buffer(
-        [MAX_LOGIT_ROWS, LM_HEAD_VOCAB], dtype=pl.FP32
+        [MAX_LOGIT_ROWS * LM_HEAD_VOCAB], dtype=pl.FP32
     )
     lm_head_logits_done_buf = pld.alloc_window_buffer(
         [LM_HEAD_TP_SIZE, 1], dtype=pl.INT32
@@ -2424,7 +2425,7 @@ def l3_decode_fwd(
         )
         lm_head_logits_window = pld.window(
             lm_head_logits_window_buf,
-            [MAX_LOGIT_ROWS, LM_HEAD_VOCAB],
+            [MAX_LOGIT_ROWS * LM_HEAD_VOCAB],
             dtype=pl.FP32,
         )
         lm_head_logits_done = pld.window(
