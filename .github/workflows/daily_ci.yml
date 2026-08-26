@@ -502,11 +502,13 @@ jobs:
     runs-on: [self-hosted, linux, arm64, npu-a5]
     # Compile (~5 min) + resident weight upload (~8 min for 335 GB of INT8 shards)
     # + 33 forward passes fit in ~15 min once the cards are lent; the ceiling
-    # must still cover setup plus task-submit's worst case per attempt
-    # (--timeout 5400 queue wait + --max-time 2400 run = 130 min) times the two
-    # attempts the loop step may make, or the job is cancelled before
-    # task-submit can report and e2e.json / the artifact are lost.
-    timeout-minutes: 290
+    # must still cover job setup (~25 min on a cold ccache) plus task-submit's
+    # worst case per attempt (--timeout 5400 queue wait + --max-time 2400 run
+    # = 130 min) times the two attempts the loop step may make, with margin
+    # left for cleanup and the artifact upload (25 + 2 x 130 + 35 = 320) — or
+    # the job is cancelled before task-submit can report and e2e.json / the
+    # artifact are lost.
+    timeout-minutes: 320
     defaults:
       run:
         working-directory: checkout
