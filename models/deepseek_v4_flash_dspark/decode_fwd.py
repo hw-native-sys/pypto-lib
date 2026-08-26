@@ -1,0 +1,1764 @@
+# Copyright (c) PyPTO Contributors.
+# This program is free software, you can redistribute it and/or modify it under the terms and conditions of
+# CANN Open Software License Agreement Version 2.0 (the "License").
+# Please refer to the License for details. You may not use this file except in compliance with the License.
+# THIS SOFTWARE IS PROVIDED ON AN "AS IS" BASIS, WITHOUT WARRANTIES OF ANY KIND, EITHER EXPRESS OR IMPLIED,
+# INCLUDING BUT NOT LIMITED TO NON-INFRINGEMENT, MERCHANTABILITY, OR FITNESS FOR A PARTICULAR PURPOSE.
+# See LICENSE in the root of the software repository for the full text of the License.
+# -----------------------------------------------------------------------------------------------------------
+"""DeepSeek-V4 D-Spark 43-layer decode-forward integration."""
+
+import sys
+
+import config
+
+
+_TP_CHOICES = (1, 2, 4)
+_EP_CHOICES = (2, 4, 8, 16)
+_TP_DEFAULT = 2
+_EP_DEFAULT = 2
+
+
+def _parse_parallel_arg(name, default):
+    flag = f"--{name}"
+    prefix = f"{flag}="
+    for index, arg in enumerate(sys.argv):
+        if arg == flag and index + 1 < len(sys.argv):
+            return int(sys.argv[index + 1])
+        if arg.startswith(prefix):
+            return int(arg.split("=", 1)[1])
+    return default
+
+
+# TP/EP-dependent leaf shapes freeze at import time. Select both worlds before
+# importing attention, MoE, or output-projection modules.
+TP_SIZE = _parse_parallel_arg("tp", _TP_DEFAULT)
+EP_SIZE = _parse_parallel_arg("ep", _EP_DEFAULT)
+if TP_SIZE not in _TP_CHOICES:
+    raise ValueError(f"--tp must be one of {_TP_CHOICES} (got {TP_SIZE})")
+if EP_SIZE not in _EP_CHOICES:
+    raise ValueError(f"--ep must be one of {_EP_CHOICES} (got {EP_SIZE})")
+if EP_SIZE % TP_SIZE != 0:
+    raise ValueError(f"EP={EP_SIZE} must be divisible by TP={TP_SIZE}")
+
+config.TP = TP_SIZE
+config.EP = EP_SIZE
+
+import decode_csa as csa
+import decode_hca as hca
+import decode_layer as layer
+import decode_swa as swa
+import moe as moe_module
+import pypto.language as pl
+import pypto.language.distributed as pld
+from decode_layer import decode_layer_swa
+from lookup_embedding import VOCAB_DYN as EMBED_VOCAB_DYN
+from lookup_embedding import lookup_embedding
+from moe import clear_moe_signals
+
+
+MODEL_CONFIG = config.FLASH
+DECODE_TOKENS = config.DECODE_TOKENS
+
+MAIN_LAYER_COUNT = MODEL_CONFIG.num_hidden_layers
+SWA_LAYER_COUNT = 2
+CSA_LAYER_COUNT = 21
+HCA_LAYER_COUNT = 20
+LAST_MODEL_LAYER = MAIN_LAYER_COUNT - 1
+MAX_PUBLIC_TENSOR_DIMS = 5
+
+N_RANKS = layer.N_RANKS
+MOE_TOKENS = layer.MOE_TOKENS
+D = layer.D
+HC_MULT = layer.HC_MULT
+HC_DIM = layer.HC_DIM
+MAX_LOGIT_ROWS = DECODE_TOKENS
+SAMPLED_IDS_PAD = 8
+VOCAB_PER_TP = MODEL_CONFIG.vocab_size // TP_SIZE
+
+T_DYN = layer.T_DYN
+FWD_PACKED_RAW_BLOCKS_DYN = pl.dynamic("FWD_PACKED_RAW_BLOCKS_DYN")
+
+MIX_HC = layer.MIX_HC
+Q_LORA = layer.Q_LORA
+H = layer.H
+HEAD_DIM = layer.HEAD_DIM
+ROPE_HEAD_DIM = layer.ROPE_HEAD_DIM
+WIN = layer.WIN
+O_LORA = layer.O_LORA
+O_GROUP_IN = layer.O_GROUP_IN
+LOCAL_O_GROUPS = layer.LOCAL_O_GROUPS
+LOCAL_O_WIDTH = layer.LOCAL_O_WIDTH
+BLOCK_SIZE = layer.BLOCK_SIZE
+ATTENTION_WINDOW_ROWS = layer.ATTENTION_WINDOW_ROWS
+O_WINDOW_ROWS = layer.O_WINDOW_ROWS
+N_EXPERTS_GLOBAL = layer.N_EXPERTS_GLOBAL
+N_LOCAL = layer.N_LOCAL
+MOE_INTER = layer.MOE_INTER
+VOCAB = layer.VOCAB
+TOPK = layer.TOPK
+RECV_MAX = layer.RECV_MAX
+AUX_PAD = layer.AUX_PAD
+IDX_PAD = layer.IDX_PAD
+N_ROUTES = layer.N_ROUTES
+
+TWO_SWA_LAYER_COUNT = 2
+TWO_SWA_TEST_VOCAB = 256
+
+
+def _validate_import_contract():
+    if layer.TP_SIZE != TP_SIZE or layer.EP_SIZE != EP_SIZE:
+        raise ValueError(
+            "decode_layer parallel configuration diverged from decode_fwd: "
+            f"layer TP/EP={layer.TP_SIZE}/{layer.EP_SIZE}, "
+            f"forward TP/EP={TP_SIZE}/{EP_SIZE}"
+        )
+    if N_RANKS != EP_SIZE:
+        raise ValueError(f"MoE world size {N_RANKS} does not match EP={EP_SIZE}")
+    if MAIN_LAYER_COUNT != 43:
+        raise ValueError(
+            f"D-Spark decode forward expects 43 layers, got {MAIN_LAYER_COUNT}"
+        )
+    if MODEL_CONFIG.vocab_size % TP_SIZE:
+        raise ValueError(
+            f"vocab size {MODEL_CONFIG.vocab_size} must be divisible by TP={TP_SIZE}"
+        )
+    if MOE_TOKENS > MAX_LOGIT_ROWS:
+        raise ValueError(
+            f"MoE capacity {MOE_TOKENS} exceeds LM-head rows {MAX_LOGIT_ROWS}"
+        )
+
+
+_validate_import_contract()
+
+
+def build_full43_layer_plan():
+    """Return the fixed model-layer, kind-ordinal, and MoE-epoch mapping."""
+    kind_ordinals = {"swa": 0, "csa": 0, "hca": 0}
+    plan = []
+    for model_layer in range(MAIN_LAYER_COUNT):
+        kind = layer.attention_kind_for_layer(model_layer)
+        ordinal = kind_ordinals[kind]
+        kind_ordinals[kind] += 1
+        plan.append(
+            {
+                "model_layer": model_layer,
+                "kind": kind,
+                "kind_ordinal": ordinal,
+                "moe_epoch": model_layer + 1,
+            }
+        )
+
+    expected_counts = {
+        "swa": SWA_LAYER_COUNT,
+        "csa": CSA_LAYER_COUNT,
+        "hca": HCA_LAYER_COUNT,
+    }
+    if kind_ordinals != expected_counts:
+        raise ValueError(
+            f"full43 attention counts changed: {kind_ordinals} != {expected_counts}"
+        )
+    if plan[0]["kind"] != "swa" or plan[1]["kind"] != "swa":
+        raise ValueError("model layers 0 and 1 must be SWA")
+    for model_layer in range(2, MAIN_LAYER_COUNT):
+        expected_kind = "csa" if model_layer % 2 == 0 else "hca"
+        if plan[model_layer]["kind"] != expected_kind:
+            raise ValueError(
+                f"model layer {model_layer} must be {expected_kind}, "
+                f"got {plan[model_layer]['kind']}"
+            )
+    if plan[LAST_MODEL_LAYER] != {
+        "model_layer": 42,
+        "kind": "csa",
+        "kind_ordinal": 20,
+        "moe_epoch": 43,
+    }:
+        raise ValueError(f"unexpected terminal layer mapping: {plan[-1]}")
+    return tuple(plan)
+
+
+FULL43_LAYER_PLAN = build_full43_layer_plan()
+
+
+PACKED_POOL_LAYER_COUNTS = {
+    "raw_kv_pool": MAIN_LAYER_COUNT,
+    "hca_compress_state": HCA_LAYER_COUNT,
+    "hca_cmp_kv": HCA_LAYER_COUNT,
+    "csa_compress_state": CSA_LAYER_COUNT,
+    "csa_cmp_kv": CSA_LAYER_COUNT,
+    "csa_inner_compress_state": CSA_LAYER_COUNT,
+    "csa_idx_kv_cache": CSA_LAYER_COUNT,
+    "csa_idx_kv_scale": CSA_LAYER_COUNT,
+}
+
+PACKED_POOL_BLOCK_SIZES = {
+    "raw_kv_pool": swa.BLOCK_SIZE,
+    "hca_compress_state": hca.COMPRESS_STATE_BLOCK_SIZE,
+    "hca_cmp_kv": hca.BLOCK_SIZE,
+    "csa_compress_state": csa.MAIN_STATE_BLOCK_SIZE,
+    "csa_cmp_kv": csa.BLOCK_SIZE,
+    "csa_inner_compress_state": csa.INNER_STATE_BLOCK_SIZE,
+    "csa_idx_kv_cache": csa.BLOCK_SIZE,
+    "csa_idx_kv_scale": csa.BLOCK_SIZE,
+}
+
+PACKED_POOL_ELEMENT_BYTES = {
+    "raw_kv_pool": 2,
+    "hca_compress_state": 4,
+    "hca_cmp_kv": 2,
+    "csa_compress_state": 4,
+    "csa_cmp_kv": 2,
+    "csa_inner_compress_state": 4,
+    "csa_idx_kv_cache": 1,
+    "csa_idx_kv_scale": 4,
+}
+
+
+def build_packed_pool_layout(per_layer_shapes):
+    """Pack each persistent pool along its block axis without a layer axis."""
+    expected_names = set(PACKED_POOL_LAYER_COUNTS)
+    provided_names = set(per_layer_shapes)
+    missing = expected_names - provided_names
+    unknown = provided_names - expected_names
+    if missing or unknown:
+        raise ValueError(
+            f"packed pool names mismatch: missing={sorted(missing)}, "
+            f"unknown={sorted(unknown)}"
+        )
+
+    layout = {}
+    for name, layer_count in PACKED_POOL_LAYER_COUNTS.items():
+        leaf_shape = [int(dim) for dim in per_layer_shapes[name]]
+        if len(leaf_shape) not in (4, 5):
+            raise ValueError(
+                f"{name} rank-stacked leaf pool must be 4D or 5D, "
+                f"got {leaf_shape}"
+            )
+        if leaf_shape[0] != N_RANKS:
+            raise ValueError(
+                f"{name} must have leading rank extent {N_RANKS}, "
+                f"got {leaf_shape}"
+            )
+        per_layer_extent = leaf_shape[1]
+        if per_layer_extent <= 0:
+            raise ValueError(
+                f"{name} per-layer block extent must be positive, "
+                f"got {per_layer_extent}"
+            )
+        expected_block_size = PACKED_POOL_BLOCK_SIZES[name]
+        if leaf_shape[2] != expected_block_size:
+            raise ValueError(
+                f"{name} block size {leaf_shape[2]} does not match "
+                f"{expected_block_size}"
+            )
+
+        packed_shape = list(leaf_shape)
+        packed_shape[1] = layer_count * per_layer_extent
+        elements_per_rank = 1
+        for dim in packed_shape[1:]:
+            elements_per_rank *= dim
+        slices = tuple(
+            (ordinal * per_layer_extent, (ordinal + 1) * per_layer_extent)
+            for ordinal in range(layer_count)
+        )
+        layout[name] = {
+            "layer_count": layer_count,
+            "per_layer_extent": per_layer_extent,
+            "total_extent": packed_shape[1],
+            "block_size": expected_block_size,
+            "leaf_shape": leaf_shape,
+            "packed_shape": packed_shape,
+            "bytes_per_rank": (
+                elements_per_rank * PACKED_POOL_ELEMENT_BYTES[name]
+            ),
+            "slices": slices,
+        }
+    validate_packed_pool_layout(layout)
+    return layout
+
+
+def validate_packed_pool_layout(layout):
+    """Fail closed on dimension, extent, and layer-slice contract errors."""
+    if set(layout) != set(PACKED_POOL_LAYER_COUNTS):
+        raise ValueError("packed layout must describe every persistent pool")
+    for name, entry in layout.items():
+        layer_count = PACKED_POOL_LAYER_COUNTS[name]
+        total_extent = int(entry["total_extent"])
+        if total_extent % layer_count:
+            raise ValueError(
+                f"{name} packed extent {total_extent} is not divisible by "
+                f"{layer_count}"
+            )
+        if len(entry["packed_shape"]) > MAX_PUBLIC_TENSOR_DIMS:
+            raise ValueError(
+                f"{name} has {len(entry['packed_shape'])} dimensions; "
+                f"maximum is {MAX_PUBLIC_TENSOR_DIMS}"
+            )
+        if entry["packed_shape"][1] != total_extent:
+            raise ValueError(f"{name} packed shape and extent diverged")
+
+        previous_end = 0
+        for begin, end in entry["slices"]:
+            if begin != previous_end or begin >= end or end > total_extent:
+                raise ValueError(f"{name} layer slices overlap or leave a gap")
+            previous_end = end
+        if previous_end != total_extent:
+            raise ValueError(f"{name} layer slices do not cover the packed axis")
+    return layout
+
+
+def validate_local_write_slots(name, slots, per_layer_capacity, active_mask=None):
+    """Validate layer-local write slots and the inactive-row -1 contract."""
+    import torch
+
+    values = torch.as_tensor(slots)
+    capacity = int(per_layer_capacity)
+    if capacity <= 0:
+        raise ValueError(f"{name} capacity must be positive, got {capacity}")
+    if bool((values < -1).any().item()):
+        raise ValueError(f"{name} contains a write slot below -1")
+    if bool((values >= capacity).any().item()):
+        raise ValueError(
+            f"{name} contains a non-local write slot for capacity {capacity}"
+        )
+    if active_mask is not None:
+        active = torch.as_tensor(active_mask, dtype=torch.bool)
+        while active.ndim < values.ndim:
+            active = active.unsqueeze(-1)
+        if bool((values.masked_select(~active) != -1).any().item()):
+            raise ValueError(f"{name} retains a write slot for an inactive row")
+    return values
+
+
+def build_active_logit_row_indices_host(active_tokens):
+    """Build the host fixture for the terminal active-prefix row contract."""
+    import torch
+
+    active_tokens = int(active_tokens)
+    if active_tokens < 0 or active_tokens > min(MOE_TOKENS, MAX_LOGIT_ROWS):
+        raise ValueError(
+            f"active token count must be in [0, {min(MOE_TOKENS, MAX_LOGIT_ROWS)}], "
+            f"got {active_tokens}"
+        )
+    indices = torch.full((N_RANKS, MAX_LOGIT_ROWS), -1, dtype=torch.int32)
+    if active_tokens:
+        active_rows = torch.arange(active_tokens, dtype=torch.int32)
+        indices[:, :active_tokens] = active_rows
+    return indices
+
+
+@pl.jit.inline
+def decode_embedding_preamble(
+    input_ids: pl.Tensor[[T_DYN], pl.INT64],
+    embed_weight: pl.Tensor[[EMBED_VOCAB_DYN, D], pl.BF16],
+    hidden_states: pl.Tensor[[T_DYN, D], pl.BF16],
+    x_hc: pl.Tensor[[T_DYN, HC_MULT, D], pl.FP32],
+):
+    """Reuse the canonical lookup and emit the active Hyper-Connections rows."""
+    lookup_embedding(input_ids, embed_weight, hidden_states, x_hc)
+    return x_hc
+
+
+@pl.jit.inline
+def mask_inactive_sample_rows(
+    logit_row_indices: pl.Tensor[[MAX_LOGIT_ROWS], pl.INT32],
+    sampled_ids: pl.Tensor[[MAX_LOGIT_ROWS, SAMPLED_IDS_PAD], pl.INT32],
+):
+    """Make inactive terminal rows observable as -1 after greedy sampling."""
+    for row in pl.spmd(MAX_LOGIT_ROWS, name_hint="decode_fwd_sample_mask"):
+        if pl.read(logit_row_indices, [row]) < 0:
+            sampled_ids[row : row + 1, :] = pl.full(
+                [1, SAMPLED_IDS_PAD], dtype=pl.INT32, value=-1
+            )
+    return sampled_ids
+
+
+@pl.jit(auto_scope=False)
+def decode_fwd(
+    hc_attn_fn: pl.Tensor[[TWO_SWA_LAYER_COUNT * MIX_HC, HC_DIM], pl.FP32],
+    hc_attn_scale: pl.Tensor[[TWO_SWA_LAYER_COUNT * 3], pl.FP32],
+    hc_attn_base: pl.Tensor[[TWO_SWA_LAYER_COUNT * MIX_HC], pl.FP32],
+    attn_norm_w: pl.Tensor[[TWO_SWA_LAYER_COUNT * D], pl.BF16],
+    wq_a: pl.Tensor[[TWO_SWA_LAYER_COUNT * D, Q_LORA], pl.BF16],
+    wq_b: pl.Tensor[
+        [TWO_SWA_LAYER_COUNT * Q_LORA, H * HEAD_DIM], pl.INT8
+    ],
+    wq_b_scale: pl.Tensor[
+        [TWO_SWA_LAYER_COUNT * H * HEAD_DIM], pl.FP32
+    ],
+    wkv: pl.Tensor[[TWO_SWA_LAYER_COUNT * D, HEAD_DIM], pl.BF16],
+    gamma_cq: pl.Tensor[[TWO_SWA_LAYER_COUNT * Q_LORA], pl.BF16],
+    gamma_ckv: pl.Tensor[[TWO_SWA_LAYER_COUNT * HEAD_DIM], pl.BF16],
+    raw_kv_pool: pl.InOut[
+        pl.Tensor[
+            [FWD_PACKED_RAW_BLOCKS_DYN, BLOCK_SIZE, 1, HEAD_DIM],
+            pl.BF16,
+        ]
+    ],
+    freqs_cos: pl.Tensor[[T_DYN, ROPE_HEAD_DIM], pl.BF16],
+    freqs_sin: pl.Tensor[[T_DYN, ROPE_HEAD_DIM], pl.BF16],
+    swa_slot_mapping: pl.Tensor[[T_DYN], pl.INT64],
+    swa_indices: pl.Tensor[[T_DYN, WIN], pl.INT32],
+    swa_lens: pl.Tensor[[T_DYN], pl.INT32],
+    position_ids: pl.Tensor[[T_DYN], pl.INT32],
+    attn_sink: pl.Tensor[[TWO_SWA_LAYER_COUNT * H], pl.FP32],
+    wo_a: pl.Tensor[
+        [TWO_SWA_LAYER_COUNT * LOCAL_O_GROUPS, O_LORA, O_GROUP_IN],
+        pl.BF16,
+    ],
+    wo_b: pl.Tensor[
+        [TWO_SWA_LAYER_COUNT * D, LOCAL_O_WIDTH], pl.INT8
+    ],
+    wo_b_scale: pl.Tensor[[TWO_SWA_LAYER_COUNT * D], pl.FP32],
+    hc_ffn_fn: pl.Tensor[
+        [TWO_SWA_LAYER_COUNT * MIX_HC, HC_DIM], pl.FP32
+    ],
+    hc_ffn_scale: pl.Tensor[[TWO_SWA_LAYER_COUNT * 3], pl.FP32],
+    hc_ffn_base: pl.Tensor[[TWO_SWA_LAYER_COUNT * MIX_HC], pl.FP32],
+    norm_w: pl.Tensor[[TWO_SWA_LAYER_COUNT * D], pl.BF16],
+    gate_w: pl.Tensor[
+        [TWO_SWA_LAYER_COUNT * N_EXPERTS_GLOBAL, D], pl.FP32
+    ],
+    gate_bias: pl.Tensor[
+        [TWO_SWA_LAYER_COUNT * N_EXPERTS_GLOBAL], pl.FP32
+    ],
+    tid2eid: pl.Tensor[[TWO_SWA_LAYER_COUNT * VOCAB, TOPK], pl.INT32],
+    input_ids: pl.Tensor[[MOE_TOKENS], pl.INT64],
+    routed_w1: pl.Tensor[
+        [TWO_SWA_LAYER_COUNT * N_LOCAL, MOE_INTER, D], pl.INT8
+    ],
+    routed_w1_scale: pl.Tensor[
+        [TWO_SWA_LAYER_COUNT * N_LOCAL, MOE_INTER], pl.FP32
+    ],
+    routed_w3: pl.Tensor[
+        [TWO_SWA_LAYER_COUNT * N_LOCAL, MOE_INTER, D], pl.INT8
+    ],
+    routed_w3_scale: pl.Tensor[
+        [TWO_SWA_LAYER_COUNT * N_LOCAL, MOE_INTER], pl.FP32
+    ],
+    routed_w2: pl.Tensor[
+        [TWO_SWA_LAYER_COUNT * N_LOCAL, D, MOE_INTER], pl.INT8
+    ],
+    routed_w2_scale: pl.Tensor[
+        [TWO_SWA_LAYER_COUNT * N_LOCAL, D], pl.FP32
+    ],
+    shared_w1: pl.Tensor[
+        [TWO_SWA_LAYER_COUNT * MOE_INTER, D], pl.INT8
+    ],
+    shared_w1_scale: pl.Tensor[
+        [TWO_SWA_LAYER_COUNT * MOE_INTER], pl.FP32
+    ],
+    shared_w3: pl.Tensor[
+        [TWO_SWA_LAYER_COUNT * MOE_INTER, D], pl.INT8
+    ],
+    shared_w3_scale: pl.Tensor[
+        [TWO_SWA_LAYER_COUNT * MOE_INTER], pl.FP32
+    ],
+    shared_w2: pl.Tensor[
+        [TWO_SWA_LAYER_COUNT * D, MOE_INTER], pl.INT8
+    ],
+    shared_w2_scale: pl.Tensor[[TWO_SWA_LAYER_COUNT * D], pl.FP32],
+    x_ping: pl.Tensor[[T_DYN, HC_MULT, D], pl.FP32],
+    x_pong: pl.InOut[pl.Tensor[[T_DYN, HC_MULT, D], pl.FP32]],
+    x_attn_active: pl.InOut[
+        pl.Tensor[[T_DYN, HC_MULT, D], pl.FP32]
+    ],
+    x_moe_next: pl.InOut[
+        pl.Tensor[[MOE_TOKENS, HC_MULT, D], pl.FP32]
+    ],
+    x_out: pl.Out[pl.Tensor[[T_DYN, HC_MULT, D], pl.FP32]],
+    attention_window: pld.DistributedTensor[
+        [ATTENTION_WINDOW_ROWS, O_GROUP_IN], pl.BF16
+    ],
+    attention_signal: pld.DistributedTensor[[TP_SIZE, 1], pl.INT32],
+    o_window: pld.DistributedTensor[[O_WINDOW_ROWS, D], pl.FP32],
+    o_signal: pld.DistributedTensor[[TP_SIZE, 1], pl.INT32],
+    recv_meta: pld.DistributedTensor[[N_RANKS, N_LOCAL], pl.INT32],
+    recv_x: pld.DistributedTensor[[N_LOCAL * RECV_MAX, D], pl.INT8],
+    recv_aux: pld.DistributedTensor[
+        [N_LOCAL * RECV_MAX, AUX_PAD], pl.FP32
+    ],
+    recv_route: pld.DistributedTensor[
+        [N_LOCAL * RECV_MAX, IDX_PAD], pl.INT32
+    ],
+    arrived: pld.DistributedTensor[[N_RANKS, 1], pl.INT32],
+    data_arrived: pld.DistributedTensor[[N_RANKS, 1], pl.INT32],
+    routed_y_buf: pld.DistributedTensor[[N_ROUTES, D], pl.BF16],
+    combine_arrived: pld.DistributedTensor[[N_RANKS, 1], pl.INT32],
+    group_base: pl.Scalar[pl.INT32],
+    tp_rank: pl.Scalar[pl.INT32],
+    my_rank: pl.Scalar[pl.INT32],
+):
+    """Run the first two model layers with shared windows and ping-pong."""
+    x_ping.bind_dynamic(0, T_DYN)
+    raw_kv_pool.bind_dynamic(0, FWD_PACKED_RAW_BLOCKS_DYN)
+    freqs_cos.bind_dynamic(0, T_DYN)
+    freqs_sin.bind_dynamic(0, T_DYN)
+    swa_slot_mapping.bind_dynamic(0, T_DYN)
+    swa_indices.bind_dynamic(0, T_DYN)
+    swa_lens.bind_dynamic(0, T_DYN)
+    position_ids.bind_dynamic(0, T_DYN)
+    x_pong.bind_dynamic(0, T_DYN)
+    x_attn_active.bind_dynamic(0, T_DYN)
+    x_out.bind_dynamic(0, T_DYN)
+
+    local_t = pl.cast(pl.tensor.dim(x_ping, 0), pl.INT32)
+    raw_blocks_per_layer = (
+        pl.tensor.dim(raw_kv_pool, 0) // TWO_SWA_LAYER_COUNT
+    )
+    with pl.scope():
+        raw_kv_l0 = pl.slice(
+            raw_kv_pool,
+            [raw_blocks_per_layer, BLOCK_SIZE, 1, HEAD_DIM],
+            [0, 0, 0, 0],
+        )
+        hc_attn_fn_l0: pl.Tensor[[MIX_HC, HC_DIM], pl.FP32] = pl.slice(
+            hc_attn_fn, [MIX_HC, HC_DIM], [0, 0]
+        )
+        hc_attn_scale_l0: pl.Tensor[[3], pl.FP32] = pl.slice(
+            hc_attn_scale, [3], [0]
+        )
+        hc_attn_base_l0: pl.Tensor[[MIX_HC], pl.FP32] = pl.slice(
+            hc_attn_base, [MIX_HC], [0]
+        )
+        attn_norm_w_l0: pl.Tensor[[D], pl.BF16] = pl.slice(
+            attn_norm_w, [D], [0]
+        )
+        wq_a_l0: pl.Tensor[[D, Q_LORA], pl.BF16] = pl.slice(
+            wq_a, [D, Q_LORA], [0, 0]
+        )
+        wq_b_l0: pl.Tensor[[Q_LORA, H * HEAD_DIM], pl.INT8] = pl.slice(
+            wq_b, [Q_LORA, H * HEAD_DIM], [0, 0]
+        )
+        wq_b_scale_l0: pl.Tensor[[H * HEAD_DIM], pl.FP32] = pl.slice(
+            wq_b_scale, [H * HEAD_DIM], [0]
+        )
+        wkv_l0: pl.Tensor[[D, HEAD_DIM], pl.BF16] = pl.slice(
+            wkv, [D, HEAD_DIM], [0, 0]
+        )
+        gamma_cq_l0: pl.Tensor[[Q_LORA], pl.BF16] = pl.slice(
+            gamma_cq, [Q_LORA], [0]
+        )
+        gamma_ckv_l0: pl.Tensor[[HEAD_DIM], pl.BF16] = pl.slice(
+            gamma_ckv, [HEAD_DIM], [0]
+        )
+        attn_sink_l0: pl.Tensor[[H], pl.FP32] = pl.slice(
+            attn_sink, [H], [0]
+        )
+        wo_a_l0: pl.Tensor[
+            [LOCAL_O_GROUPS, O_LORA, O_GROUP_IN], pl.BF16
+        ] = pl.slice(
+            wo_a, [LOCAL_O_GROUPS, O_LORA, O_GROUP_IN], [0, 0, 0]
+        )
+        wo_b_l0: pl.Tensor[[D, LOCAL_O_WIDTH], pl.INT8] = pl.slice(
+            wo_b, [D, LOCAL_O_WIDTH], [0, 0]
+        )
+        wo_b_scale_l0: pl.Tensor[[D], pl.FP32] = pl.slice(
+            wo_b_scale, [D], [0]
+        )
+        hc_ffn_fn_l0: pl.Tensor[[MIX_HC, HC_DIM], pl.FP32] = pl.slice(
+            hc_ffn_fn, [MIX_HC, HC_DIM], [0, 0]
+        )
+        hc_ffn_scale_l0: pl.Tensor[[3], pl.FP32] = pl.slice(
+            hc_ffn_scale, [3], [0]
+        )
+        hc_ffn_base_l0: pl.Tensor[[MIX_HC], pl.FP32] = pl.slice(
+            hc_ffn_base, [MIX_HC], [0]
+        )
+        norm_w_l0: pl.Tensor[[D], pl.BF16] = pl.slice(norm_w, [D], [0])
+        gate_w_l0: pl.Tensor[[N_EXPERTS_GLOBAL, D], pl.FP32] = pl.slice(
+            gate_w, [N_EXPERTS_GLOBAL, D], [0, 0]
+        )
+        gate_bias_l0: pl.Tensor[[N_EXPERTS_GLOBAL], pl.FP32] = pl.slice(
+            gate_bias, [N_EXPERTS_GLOBAL], [0]
+        )
+        tid2eid_l0: pl.Tensor[[VOCAB, TOPK], pl.INT32] = pl.slice(
+            tid2eid, [VOCAB, TOPK], [0, 0]
+        )
+        routed_w1_l0: pl.Tensor[
+            [N_LOCAL, MOE_INTER, D], pl.INT8
+        ] = pl.slice(routed_w1, [N_LOCAL, MOE_INTER, D], [0, 0, 0])
+        routed_w1_scale_l0: pl.Tensor[
+            [N_LOCAL, MOE_INTER], pl.FP32
+        ] = pl.slice(routed_w1_scale, [N_LOCAL, MOE_INTER], [0, 0])
+        routed_w3_l0: pl.Tensor[
+            [N_LOCAL, MOE_INTER, D], pl.INT8
+        ] = pl.slice(routed_w3, [N_LOCAL, MOE_INTER, D], [0, 0, 0])
+        routed_w3_scale_l0: pl.Tensor[
+            [N_LOCAL, MOE_INTER], pl.FP32
+        ] = pl.slice(routed_w3_scale, [N_LOCAL, MOE_INTER], [0, 0])
+        routed_w2_l0: pl.Tensor[
+            [N_LOCAL, D, MOE_INTER], pl.INT8
+        ] = pl.slice(routed_w2, [N_LOCAL, D, MOE_INTER], [0, 0, 0])
+        routed_w2_scale_l0: pl.Tensor[[N_LOCAL, D], pl.FP32] = pl.slice(
+            routed_w2_scale, [N_LOCAL, D], [0, 0]
+        )
+        shared_w1_l0: pl.Tensor[[MOE_INTER, D], pl.INT8] = pl.slice(
+            shared_w1, [MOE_INTER, D], [0, 0]
+        )
+        shared_w1_scale_l0: pl.Tensor[[MOE_INTER], pl.FP32] = pl.slice(
+            shared_w1_scale, [MOE_INTER], [0]
+        )
+        shared_w3_l0: pl.Tensor[[MOE_INTER, D], pl.INT8] = pl.slice(
+            shared_w3, [MOE_INTER, D], [0, 0]
+        )
+        shared_w3_scale_l0: pl.Tensor[[MOE_INTER], pl.FP32] = pl.slice(
+            shared_w3_scale, [MOE_INTER], [0]
+        )
+        shared_w2_l0: pl.Tensor[[D, MOE_INTER], pl.INT8] = pl.slice(
+            shared_w2, [D, MOE_INTER], [0, 0]
+        )
+        shared_w2_scale_l0: pl.Tensor[[D], pl.FP32] = pl.slice(
+            shared_w2_scale, [D], [0]
+        )
+        decode_layer_swa(
+            x_ping,
+            hc_attn_fn_l0, hc_attn_scale_l0, hc_attn_base_l0,
+            attn_norm_w_l0, wq_a_l0, wq_b_l0, wq_b_scale_l0,
+            wkv_l0, gamma_cq_l0, gamma_ckv_l0,
+            freqs_cos, freqs_sin, raw_kv_l0,
+            swa_slot_mapping, swa_indices, swa_lens, position_ids,
+            attn_sink_l0, wo_a_l0, wo_b_l0, wo_b_scale_l0,
+            hc_ffn_fn_l0, hc_ffn_scale_l0, hc_ffn_base_l0,
+            norm_w_l0, gate_w_l0, gate_bias_l0, tid2eid_l0, input_ids,
+            routed_w1_l0, routed_w1_scale_l0,
+            routed_w3_l0, routed_w3_scale_l0,
+            routed_w2_l0, routed_w2_scale_l0,
+            shared_w1_l0, shared_w1_scale_l0,
+            shared_w3_l0, shared_w3_scale_l0,
+            shared_w2_l0, shared_w2_scale_l0,
+            x_attn_active, x_moe_next, x_pong,
+            attention_window, attention_signal, o_window, o_signal,
+            recv_meta, recv_x, recv_aux, recv_route,
+            arrived, data_arrived, routed_y_buf, combine_arrived,
+            pl.const(0, pl.INT32), group_base, tp_rank, local_t, my_rank,
+            pl.const(1, pl.INT32),
+        )
+
+    with pl.scope():
+        raw_kv_l1 = pl.slice(
+            raw_kv_pool,
+            [raw_blocks_per_layer, BLOCK_SIZE, 1, HEAD_DIM],
+            [raw_blocks_per_layer, 0, 0, 0],
+        )
+        hc_attn_fn_l1: pl.Tensor[[MIX_HC, HC_DIM], pl.FP32] = pl.slice(
+            hc_attn_fn, [MIX_HC, HC_DIM], [MIX_HC, 0]
+        )
+        hc_attn_scale_l1: pl.Tensor[[3], pl.FP32] = pl.slice(
+            hc_attn_scale, [3], [3]
+        )
+        hc_attn_base_l1: pl.Tensor[[MIX_HC], pl.FP32] = pl.slice(
+            hc_attn_base, [MIX_HC], [MIX_HC]
+        )
+        attn_norm_w_l1: pl.Tensor[[D], pl.BF16] = pl.slice(
+            attn_norm_w, [D], [D]
+        )
+        wq_a_l1: pl.Tensor[[D, Q_LORA], pl.BF16] = pl.slice(
+            wq_a, [D, Q_LORA], [D, 0]
+        )
+        wq_b_l1: pl.Tensor[[Q_LORA, H * HEAD_DIM], pl.INT8] = pl.slice(
+            wq_b, [Q_LORA, H * HEAD_DIM], [Q_LORA, 0]
+        )
+        wq_b_scale_l1: pl.Tensor[[H * HEAD_DIM], pl.FP32] = pl.slice(
+            wq_b_scale, [H * HEAD_DIM], [H * HEAD_DIM]
+        )
+        wkv_l1: pl.Tensor[[D, HEAD_DIM], pl.BF16] = pl.slice(
+            wkv, [D, HEAD_DIM], [D, 0]
+        )
+        gamma_cq_l1: pl.Tensor[[Q_LORA], pl.BF16] = pl.slice(
+            gamma_cq, [Q_LORA], [Q_LORA]
+        )
+        gamma_ckv_l1: pl.Tensor[[HEAD_DIM], pl.BF16] = pl.slice(
+            gamma_ckv, [HEAD_DIM], [HEAD_DIM]
+        )
+        attn_sink_l1: pl.Tensor[[H], pl.FP32] = pl.slice(
+            attn_sink, [H], [H]
+        )
+        wo_a_l1: pl.Tensor[
+            [LOCAL_O_GROUPS, O_LORA, O_GROUP_IN], pl.BF16
+        ] = pl.slice(
+            wo_a,
+            [LOCAL_O_GROUPS, O_LORA, O_GROUP_IN],
+            [LOCAL_O_GROUPS, 0, 0],
+        )
+        wo_b_l1: pl.Tensor[[D, LOCAL_O_WIDTH], pl.INT8] = pl.slice(
+            wo_b, [D, LOCAL_O_WIDTH], [D, 0]
+        )
+        wo_b_scale_l1: pl.Tensor[[D], pl.FP32] = pl.slice(
+            wo_b_scale, [D], [D]
+        )
+        hc_ffn_fn_l1: pl.Tensor[[MIX_HC, HC_DIM], pl.FP32] = pl.slice(
+            hc_ffn_fn, [MIX_HC, HC_DIM], [MIX_HC, 0]
+        )
+        hc_ffn_scale_l1: pl.Tensor[[3], pl.FP32] = pl.slice(
+            hc_ffn_scale, [3], [3]
+        )
+        hc_ffn_base_l1: pl.Tensor[[MIX_HC], pl.FP32] = pl.slice(
+            hc_ffn_base, [MIX_HC], [MIX_HC]
+        )
+        norm_w_l1: pl.Tensor[[D], pl.BF16] = pl.slice(norm_w, [D], [D])
+        gate_w_l1: pl.Tensor[[N_EXPERTS_GLOBAL, D], pl.FP32] = pl.slice(
+            gate_w, [N_EXPERTS_GLOBAL, D], [N_EXPERTS_GLOBAL, 0]
+        )
+        gate_bias_l1: pl.Tensor[[N_EXPERTS_GLOBAL], pl.FP32] = pl.slice(
+            gate_bias, [N_EXPERTS_GLOBAL], [N_EXPERTS_GLOBAL]
+        )
+        tid2eid_l1: pl.Tensor[[VOCAB, TOPK], pl.INT32] = pl.slice(
+            tid2eid, [VOCAB, TOPK], [VOCAB, 0]
+        )
+        routed_w1_l1: pl.Tensor[
+            [N_LOCAL, MOE_INTER, D], pl.INT8
+        ] = pl.slice(routed_w1, [N_LOCAL, MOE_INTER, D], [N_LOCAL, 0, 0])
+        routed_w1_scale_l1: pl.Tensor[
+            [N_LOCAL, MOE_INTER], pl.FP32
+        ] = pl.slice(routed_w1_scale, [N_LOCAL, MOE_INTER], [N_LOCAL, 0])
+        routed_w3_l1: pl.Tensor[
+            [N_LOCAL, MOE_INTER, D], pl.INT8
+        ] = pl.slice(routed_w3, [N_LOCAL, MOE_INTER, D], [N_LOCAL, 0, 0])
+        routed_w3_scale_l1: pl.Tensor[
+            [N_LOCAL, MOE_INTER], pl.FP32
+        ] = pl.slice(routed_w3_scale, [N_LOCAL, MOE_INTER], [N_LOCAL, 0])
+        routed_w2_l1: pl.Tensor[
+            [N_LOCAL, D, MOE_INTER], pl.INT8
+        ] = pl.slice(routed_w2, [N_LOCAL, D, MOE_INTER], [N_LOCAL, 0, 0])
+        routed_w2_scale_l1: pl.Tensor[[N_LOCAL, D], pl.FP32] = pl.slice(
+            routed_w2_scale, [N_LOCAL, D], [N_LOCAL, 0]
+        )
+        shared_w1_l1: pl.Tensor[[MOE_INTER, D], pl.INT8] = pl.slice(
+            shared_w1, [MOE_INTER, D], [MOE_INTER, 0]
+        )
+        shared_w1_scale_l1: pl.Tensor[[MOE_INTER], pl.FP32] = pl.slice(
+            shared_w1_scale, [MOE_INTER], [MOE_INTER]
+        )
+        shared_w3_l1: pl.Tensor[[MOE_INTER, D], pl.INT8] = pl.slice(
+            shared_w3, [MOE_INTER, D], [MOE_INTER, 0]
+        )
+        shared_w3_scale_l1: pl.Tensor[[MOE_INTER], pl.FP32] = pl.slice(
+            shared_w3_scale, [MOE_INTER], [MOE_INTER]
+        )
+        shared_w2_l1: pl.Tensor[[D, MOE_INTER], pl.INT8] = pl.slice(
+            shared_w2, [D, MOE_INTER], [D, 0]
+        )
+        shared_w2_scale_l1: pl.Tensor[[D], pl.FP32] = pl.slice(
+            shared_w2_scale, [D], [D]
+        )
+        decode_layer_swa(
+            x_pong,
+            hc_attn_fn_l1, hc_attn_scale_l1, hc_attn_base_l1,
+            attn_norm_w_l1, wq_a_l1, wq_b_l1, wq_b_scale_l1,
+            wkv_l1, gamma_cq_l1, gamma_ckv_l1,
+            freqs_cos, freqs_sin, raw_kv_l1,
+            swa_slot_mapping, swa_indices, swa_lens, position_ids,
+            attn_sink_l1, wo_a_l1, wo_b_l1, wo_b_scale_l1,
+            hc_ffn_fn_l1, hc_ffn_scale_l1, hc_ffn_base_l1,
+            norm_w_l1, gate_w_l1, gate_bias_l1, tid2eid_l1, input_ids,
+            routed_w1_l1, routed_w1_scale_l1,
+            routed_w3_l1, routed_w3_scale_l1,
+            routed_w2_l1, routed_w2_scale_l1,
+            shared_w1_l1, shared_w1_scale_l1,
+            shared_w3_l1, shared_w3_scale_l1,
+            shared_w2_l1, shared_w2_scale_l1,
+            x_attn_active, x_moe_next, x_out,
+            attention_window, attention_signal, o_window, o_signal,
+            recv_meta, recv_x, recv_aux, recv_route,
+            arrived, data_arrived, routed_y_buf, combine_arrived,
+            pl.const(1, pl.INT32), group_base, tp_rank, local_t, my_rank,
+            pl.const(2, pl.INT32),
+        )
+        clear_moe_signals(
+            x_moe_next, arrived, data_arrived, combine_arrived
+        )
+    return x_out
+
+
+@pl.jit.host
+def l3_decode_fwd(
+    hc_attn_fn: pl.Tensor[
+        [N_RANKS, TWO_SWA_LAYER_COUNT * MIX_HC, HC_DIM], pl.FP32
+    ],
+    hc_attn_scale: pl.Tensor[
+        [N_RANKS, TWO_SWA_LAYER_COUNT * 3], pl.FP32
+    ],
+    hc_attn_base: pl.Tensor[
+        [N_RANKS, TWO_SWA_LAYER_COUNT * MIX_HC], pl.FP32
+    ],
+    attn_norm_w: pl.Tensor[
+        [N_RANKS, TWO_SWA_LAYER_COUNT * D], pl.BF16
+    ],
+    wq_a: pl.Tensor[
+        [N_RANKS, TWO_SWA_LAYER_COUNT * D, Q_LORA], pl.BF16
+    ],
+    wq_b: pl.Tensor[
+        [N_RANKS, TWO_SWA_LAYER_COUNT * Q_LORA, H * HEAD_DIM], pl.INT8
+    ],
+    wq_b_scale: pl.Tensor[
+        [N_RANKS, TWO_SWA_LAYER_COUNT * H * HEAD_DIM], pl.FP32
+    ],
+    wkv: pl.Tensor[
+        [N_RANKS, TWO_SWA_LAYER_COUNT * D, HEAD_DIM], pl.BF16
+    ],
+    gamma_cq: pl.Tensor[
+        [N_RANKS, TWO_SWA_LAYER_COUNT * Q_LORA], pl.BF16
+    ],
+    gamma_ckv: pl.Tensor[
+        [N_RANKS, TWO_SWA_LAYER_COUNT * HEAD_DIM], pl.BF16
+    ],
+    raw_kv_pool: pl.InOut[
+        pl.Tensor[
+            [
+                N_RANKS,
+                FWD_PACKED_RAW_BLOCKS_DYN,
+                BLOCK_SIZE,
+                1,
+                HEAD_DIM,
+            ],
+            pl.BF16,
+        ]
+    ],
+    freqs_cos: pl.Tensor[
+        [N_RANKS, T_DYN, ROPE_HEAD_DIM], pl.BF16
+    ],
+    freqs_sin: pl.Tensor[
+        [N_RANKS, T_DYN, ROPE_HEAD_DIM], pl.BF16
+    ],
+    swa_slot_mapping: pl.Tensor[[N_RANKS, T_DYN], pl.INT64],
+    swa_indices: pl.Tensor[[N_RANKS, T_DYN, WIN], pl.INT32],
+    swa_lens: pl.Tensor[[N_RANKS, T_DYN], pl.INT32],
+    position_ids: pl.Tensor[[N_RANKS, T_DYN], pl.INT32],
+    attn_sink: pl.Tensor[
+        [N_RANKS, TWO_SWA_LAYER_COUNT * H], pl.FP32
+    ],
+    wo_a: pl.Tensor[
+        [
+            N_RANKS,
+            TWO_SWA_LAYER_COUNT * LOCAL_O_GROUPS,
+            O_LORA,
+            O_GROUP_IN,
+        ],
+        pl.BF16,
+    ],
+    wo_b: pl.Tensor[
+        [N_RANKS, TWO_SWA_LAYER_COUNT * D, LOCAL_O_WIDTH], pl.INT8
+    ],
+    wo_b_scale: pl.Tensor[
+        [N_RANKS, TWO_SWA_LAYER_COUNT * D], pl.FP32
+    ],
+    hc_ffn_fn: pl.Tensor[
+        [N_RANKS, TWO_SWA_LAYER_COUNT * MIX_HC, HC_DIM], pl.FP32
+    ],
+    hc_ffn_scale: pl.Tensor[
+        [N_RANKS, TWO_SWA_LAYER_COUNT * 3], pl.FP32
+    ],
+    hc_ffn_base: pl.Tensor[
+        [N_RANKS, TWO_SWA_LAYER_COUNT * MIX_HC], pl.FP32
+    ],
+    norm_w: pl.Tensor[
+        [N_RANKS, TWO_SWA_LAYER_COUNT * D], pl.BF16
+    ],
+    gate_w: pl.Tensor[
+        [N_RANKS, TWO_SWA_LAYER_COUNT * N_EXPERTS_GLOBAL, D], pl.FP32
+    ],
+    gate_bias: pl.Tensor[
+        [N_RANKS, TWO_SWA_LAYER_COUNT * N_EXPERTS_GLOBAL], pl.FP32
+    ],
+    tid2eid: pl.Tensor[
+        [N_RANKS, TWO_SWA_LAYER_COUNT * VOCAB, TOPK], pl.INT32
+    ],
+    input_ids: pl.Tensor[[N_RANKS, MOE_TOKENS], pl.INT64],
+    routed_w1: pl.Tensor[
+        [N_RANKS, TWO_SWA_LAYER_COUNT * N_LOCAL, MOE_INTER, D], pl.INT8
+    ],
+    routed_w1_scale: pl.Tensor[
+        [N_RANKS, TWO_SWA_LAYER_COUNT * N_LOCAL, MOE_INTER], pl.FP32
+    ],
+    routed_w3: pl.Tensor[
+        [N_RANKS, TWO_SWA_LAYER_COUNT * N_LOCAL, MOE_INTER, D], pl.INT8
+    ],
+    routed_w3_scale: pl.Tensor[
+        [N_RANKS, TWO_SWA_LAYER_COUNT * N_LOCAL, MOE_INTER], pl.FP32
+    ],
+    routed_w2: pl.Tensor[
+        [N_RANKS, TWO_SWA_LAYER_COUNT * N_LOCAL, D, MOE_INTER], pl.INT8
+    ],
+    routed_w2_scale: pl.Tensor[
+        [N_RANKS, TWO_SWA_LAYER_COUNT * N_LOCAL, D], pl.FP32
+    ],
+    shared_w1: pl.Tensor[
+        [N_RANKS, TWO_SWA_LAYER_COUNT * MOE_INTER, D], pl.INT8
+    ],
+    shared_w1_scale: pl.Tensor[
+        [N_RANKS, TWO_SWA_LAYER_COUNT * MOE_INTER], pl.FP32
+    ],
+    shared_w3: pl.Tensor[
+        [N_RANKS, TWO_SWA_LAYER_COUNT * MOE_INTER, D], pl.INT8
+    ],
+    shared_w3_scale: pl.Tensor[
+        [N_RANKS, TWO_SWA_LAYER_COUNT * MOE_INTER], pl.FP32
+    ],
+    shared_w2: pl.Tensor[
+        [N_RANKS, TWO_SWA_LAYER_COUNT * D, MOE_INTER], pl.INT8
+    ],
+    shared_w2_scale: pl.Tensor[
+        [N_RANKS, TWO_SWA_LAYER_COUNT * D], pl.FP32
+    ],
+    x_ping: pl.Tensor[[N_RANKS, T_DYN, HC_MULT, D], pl.FP32],
+    x_pong: pl.InOut[
+        pl.Tensor[[N_RANKS, T_DYN, HC_MULT, D], pl.FP32]
+    ],
+    x_attn_active: pl.InOut[
+        pl.Tensor[[N_RANKS, T_DYN, HC_MULT, D], pl.FP32]
+    ],
+    x_moe_next: pl.InOut[
+        pl.Tensor[[N_RANKS, MOE_TOKENS, HC_MULT, D], pl.FP32]
+    ],
+    x_out: pl.Out[
+        pl.Tensor[[N_RANKS, T_DYN, HC_MULT, D], pl.FP32]
+    ],
+):
+    """Allocate shared windows once and launch one two-SWA child per rank."""
+    x_ping.bind_dynamic(1, T_DYN)
+    raw_kv_pool.bind_dynamic(1, FWD_PACKED_RAW_BLOCKS_DYN)
+    freqs_cos.bind_dynamic(1, T_DYN)
+    freqs_sin.bind_dynamic(1, T_DYN)
+    swa_slot_mapping.bind_dynamic(1, T_DYN)
+    swa_indices.bind_dynamic(1, T_DYN)
+    swa_lens.bind_dynamic(1, T_DYN)
+    position_ids.bind_dynamic(1, T_DYN)
+    x_pong.bind_dynamic(1, T_DYN)
+    x_attn_active.bind_dynamic(1, T_DYN)
+    x_out.bind_dynamic(1, T_DYN)
+
+    attention_window_buf = pld.alloc_window_buffer(
+        [ATTENTION_WINDOW_ROWS, O_GROUP_IN], dtype=pl.BF16
+    )
+    attention_signal_buf = pld.alloc_window_buffer(
+        [TP_SIZE, 1], dtype=pl.INT32
+    )
+    o_window_buf = pld.alloc_window_buffer(
+        [O_WINDOW_ROWS, D], dtype=pl.FP32
+    )
+    o_signal_buf = pld.alloc_window_buffer([TP_SIZE, 1], dtype=pl.INT32)
+
+    recv_meta_buf = pld.alloc_window_buffer(
+        [N_RANKS, N_LOCAL], dtype=pl.INT32
+    )
+    recv_x_buf = pld.alloc_window_buffer(
+        [N_LOCAL * RECV_MAX, D], dtype=pl.INT8
+    )
+    recv_aux_buf = pld.alloc_window_buffer(
+        [N_LOCAL * RECV_MAX, AUX_PAD], dtype=pl.FP32
+    )
+    recv_route_buf = pld.alloc_window_buffer(
+        [N_LOCAL * RECV_MAX, IDX_PAD], dtype=pl.INT32
+    )
+    arrived_buf = pld.alloc_window_buffer([N_RANKS, 1], dtype=pl.INT32)
+    data_arrived_buf = pld.alloc_window_buffer(
+        [N_RANKS, 1], dtype=pl.INT32
+    )
+    routed_y_buf_buf = pld.alloc_window_buffer(
+        [N_ROUTES, D], dtype=pl.BF16
+    )
+    combine_arrived_buf = pld.alloc_window_buffer(
+        [N_RANKS, 1], dtype=pl.INT32
+    )
+
+    for rank in pl.range(pld.world_size()):
+        attention_window = pld.window(
+            attention_window_buf,
+            [ATTENTION_WINDOW_ROWS, O_GROUP_IN],
+            dtype=pl.BF16,
+        )
+        attention_signal = pld.window(
+            attention_signal_buf, [TP_SIZE, 1], dtype=pl.INT32
+        )
+        o_window = pld.window(
+            o_window_buf, [O_WINDOW_ROWS, D], dtype=pl.FP32
+        )
+        o_signal = pld.window(
+            o_signal_buf, [TP_SIZE, 1], dtype=pl.INT32
+        )
+        recv_meta = pld.window(
+            recv_meta_buf, [N_RANKS, N_LOCAL], dtype=pl.INT32
+        )
+        recv_x = pld.window(
+            recv_x_buf, [N_LOCAL * RECV_MAX, D], dtype=pl.INT8
+        )
+        recv_aux = pld.window(
+            recv_aux_buf,
+            [N_LOCAL * RECV_MAX, AUX_PAD],
+            dtype=pl.FP32,
+        )
+        recv_route = pld.window(
+            recv_route_buf,
+            [N_LOCAL * RECV_MAX, IDX_PAD],
+            dtype=pl.INT32,
+        )
+        arrived = pld.window(
+            arrived_buf, [N_RANKS, 1], dtype=pl.INT32
+        )
+        data_arrived = pld.window(
+            data_arrived_buf, [N_RANKS, 1], dtype=pl.INT32
+        )
+        routed_y_buf = pld.window(
+            routed_y_buf_buf, [N_ROUTES, D], dtype=pl.BF16
+        )
+        combine_arrived = pld.window(
+            combine_arrived_buf, [N_RANKS, 1], dtype=pl.INT32
+        )
+        tp_rank = rank % TP_SIZE
+        group_base = rank - tp_rank
+        decode_fwd(
+            hc_attn_fn[rank], hc_attn_scale[rank], hc_attn_base[rank],
+            attn_norm_w[rank], wq_a[rank], wq_b[rank],
+            wq_b_scale[rank], wkv[rank], gamma_cq[rank], gamma_ckv[rank],
+            raw_kv_pool[rank], freqs_cos[rank], freqs_sin[rank],
+            swa_slot_mapping[rank], swa_indices[rank], swa_lens[rank],
+            position_ids[rank], attn_sink[rank], wo_a[rank], wo_b[rank],
+            wo_b_scale[rank],
+            hc_ffn_fn[rank], hc_ffn_scale[rank], hc_ffn_base[rank],
+            norm_w[rank], gate_w[rank], gate_bias[rank], tid2eid[rank],
+            input_ids[rank],
+            routed_w1[rank], routed_w1_scale[rank],
+            routed_w3[rank], routed_w3_scale[rank],
+            routed_w2[rank], routed_w2_scale[rank],
+            shared_w1[rank], shared_w1_scale[rank],
+            shared_w3[rank], shared_w3_scale[rank],
+            shared_w2[rank], shared_w2_scale[rank],
+            x_ping[rank], x_pong[rank],
+            x_attn_active[rank], x_moe_next[rank], x_out[rank],
+            attention_window, attention_signal, o_window, o_signal,
+            recv_meta, recv_x, recv_aux, recv_route,
+            arrived, data_arrived, routed_y_buf, combine_arrived,
+            group_base, tp_rank, rank,
+            device=rank,
+        )
+    return x_out
+
+
+_COMMON_ATTN_WEIGHT_NAMES = (
+    "hc_attn_fn",
+    "hc_attn_scale",
+    "hc_attn_base",
+    "attn_norm_w",
+    "wq_a",
+    "wq_b",
+    "wq_b_scale",
+    "wkv",
+    "gamma_cq",
+    "gamma_ckv",
+    "attn_sink",
+    "wo_a",
+    "wo_b",
+    "wo_b_scale",
+)
+
+_HCA_EXTRA_WEIGHT_NAMES = (
+    "cmp_wkv",
+    "cmp_wgate",
+    "cmp_ape",
+    "cmp_norm_w",
+)
+
+_CSA_EXTRA_WEIGHT_NAMES = (
+    "cmp_wkv",
+    "cmp_wgate",
+    "cmp_ape",
+    "cmp_norm_w",
+    "idx_wq_b",
+    "idx_wq_b_scale",
+    "weights_proj",
+    "hadamard_idx",
+    "inner_wkv",
+    "inner_wgate",
+    "inner_ape",
+    "inner_norm_w",
+)
+
+_MOE_NON_WEIGHT_NAMES = {"x_attn_moe", "x_moe_next", "input_ids"}
+
+_TWO_SWA_LAYERED_WEIGHT_NAMES = (
+    *_COMMON_ATTN_WEIGHT_NAMES,
+    "hc_ffn_fn",
+    "hc_ffn_scale",
+    "hc_ffn_base",
+    "norm_w",
+    "gate_w",
+    "gate_bias",
+    "tid2eid",
+    "routed_w1",
+    "routed_w1_scale",
+    "routed_w3",
+    "routed_w3_scale",
+    "routed_w2",
+    "routed_w2_scale",
+    "shared_w1",
+    "shared_w1_scale",
+    "shared_w3",
+    "shared_w3_scale",
+    "shared_w2",
+    "shared_w2_scale",
+)
+
+_TWO_SWA_METADATA_NAMES = (
+    "freqs_cos",
+    "freqs_sin",
+    "swa_slot_mapping",
+    "swa_indices",
+    "swa_lens",
+    "position_ids",
+)
+
+_TWO_SWA_ATTN_INPUT_NAMES = (
+    "x_hc",
+    "hc_attn_fn",
+    "hc_attn_scale",
+    "hc_attn_base",
+    "attn_norm_w",
+    "wq_a",
+    "wq_b",
+    "wq_b_scale",
+    "wkv",
+    "gamma_cq",
+    "gamma_ckv",
+    "freqs_cos",
+    "freqs_sin",
+    "kv_cache",
+    "swa_slot_mapping",
+    "swa_indices",
+    "swa_lens",
+    "position_ids",
+    "attn_sink",
+    "wo_a",
+    "wo_b",
+    "wo_b_scale",
+)
+
+_METADATA_EXCLUDES = {
+    "x_hc",
+    "x_out",
+    "kv_cache",
+    "compress_state",
+    "cmp_kv",
+    "inner_compress_state",
+    "idx_kv_cache",
+    "idx_kv_scale",
+    *_COMMON_ATTN_WEIGHT_NAMES,
+    *_HCA_EXTRA_WEIGHT_NAMES,
+    *_CSA_EXTRA_WEIGHT_NAMES,
+}
+
+
+def _stack_rank_shape(shape, layer_count):
+    stacked = [int(dim) for dim in shape]
+    if len(stacked) < 2 or stacked[0] != N_RANKS:
+        raise ValueError(f"layer-stacked tensor must start with rank: {stacked}")
+    stacked[1] *= int(layer_count)
+    return stacked
+
+
+def _collect_weight_shapes(reports, common_count, hca_count, csa_count):
+    swa_shapes = reports["swa"]["distributed_shapes"]
+    hca_shapes = reports["hca"]["distributed_shapes"]
+    csa_shapes = reports["csa"]["distributed_shapes"]
+
+    common = {}
+    for name in _COMMON_ATTN_WEIGHT_NAMES:
+        reference = swa_shapes[name]
+        if hca_shapes[name] != reference or csa_shapes[name] != reference:
+            raise ValueError(f"common attention weight shape diverged for {name}")
+        common[name] = _stack_rank_shape(reference, common_count)
+
+    moe_shapes = reports["swa"]["moe_shapes"]
+    for name, shape in moe_shapes.items():
+        if name not in _MOE_NON_WEIGHT_NAMES:
+            common[name] = _stack_rank_shape(shape, common_count)
+
+    return {
+        "common": common,
+        "hca": {
+            name: _stack_rank_shape(hca_shapes[name], hca_count)
+            for name in _HCA_EXTRA_WEIGHT_NAMES
+        },
+        "csa": {
+            name: _stack_rank_shape(csa_shapes[name], csa_count)
+            for name in _CSA_EXTRA_WEIGHT_NAMES
+        },
+    }
+
+
+def _collect_metadata_shapes(reports):
+    metadata = {}
+    for kind, report in reports.items():
+        for name, shape in report["distributed_shapes"].items():
+            if name not in _METADATA_EXCLUDES:
+                metadata[f"{kind}_{name}"] = list(shape)
+    return metadata
+
+
+def _collect_per_layer_pool_shapes(reports):
+    raw_shapes = tuple(
+        reports[kind]["distributed_shapes"]["kv_cache"]
+        for kind in ("swa", "hca", "csa")
+    )
+    if raw_shapes[1:] != raw_shapes[:-1]:
+        raise ValueError(f"raw KV pool shapes diverged by attention kind: {raw_shapes}")
+
+    hca_shapes = reports["hca"]["distributed_shapes"]
+    csa_shapes = reports["csa"]["distributed_shapes"]
+    return {
+        "raw_kv_pool": list(raw_shapes[0]),
+        "hca_compress_state": list(hca_shapes["compress_state"]),
+        "hca_cmp_kv": list(hca_shapes["cmp_kv"]),
+        "csa_compress_state": list(csa_shapes["compress_state"]),
+        "csa_cmp_kv": list(csa_shapes["cmp_kv"]),
+        "csa_inner_compress_state": list(csa_shapes["inner_compress_state"]),
+        "csa_idx_kv_cache": list(csa_shapes["idx_kv_cache"]),
+        "csa_idx_kv_scale": list(csa_shapes["idx_kv_scale"]),
+    }
+
+
+def _validate_public_shapes(sections):
+    maximum_dims = 0
+    for section_name, shapes in sections.items():
+        for name, shape in shapes.items():
+            dims = len(shape)
+            maximum_dims = max(maximum_dims, dims)
+            if dims > MAX_PUBLIC_TENSOR_DIMS:
+                raise ValueError(
+                    f"{section_name} tensor {name!r} has {dims} dimensions: "
+                    f"{shape}"
+                )
+            if any(int(dim) <= 0 for dim in shape):
+                raise ValueError(
+                    f"{section_name} tensor {name!r} has an invalid shape: {shape}"
+                )
+    return maximum_dims
+
+
+def _make_two_swa_layered_spec(name, spec):
+    """Pack two copies of one rank-stacked layer weight along axis one."""
+    from golden import TensorSpec
+
+    shape = list(spec.shape)
+    shape[1] *= TWO_SWA_LAYER_COUNT
+
+    def init_value():
+        value = spec.create_tensor()
+        return value.repeat(
+            1, TWO_SWA_LAYER_COUNT, *([1] * (value.ndim - 2))
+        )
+
+    packed = TensorSpec(
+        name,
+        shape,
+        spec.dtype,
+        init_value=init_value,
+    )
+    packed.resident = "stacked"
+    return packed
+
+
+def build_two_swa_tensor_specs(start_pos=None):
+    """Build the rank-stacked two-SWA prefix fixture in L3 ABI order."""
+    import inspect
+
+    import torch
+    from golden import TensorSpec
+
+    base_specs = {
+        spec.name: spec
+        for spec in layer.build_swa_layer_specs(start_pos=start_pos, layer_id=0)
+        if isinstance(spec, TensorSpec)
+    }
+    local_t = int(base_specs["freqs_cos"].shape[1])
+
+    def init_raw_kv_pool():
+        first = base_specs["kv_cache"].create_tensor()
+        second = (first.float() + 0.125).to(torch.bfloat16)
+        return torch.cat((first, second), dim=1)
+
+    def init_input_ids():
+        value = base_specs["input_ids"].create_tensor()
+        return torch.remainder(value, TWO_SWA_TEST_VOCAB).contiguous()
+
+    specs_by_name = {
+        "raw_kv_pool": TensorSpec(
+            "raw_kv_pool",
+            [
+                N_RANKS,
+                TWO_SWA_LAYER_COUNT * base_specs["kv_cache"].shape[1],
+                BLOCK_SIZE,
+                1,
+                HEAD_DIM,
+            ],
+            torch.bfloat16,
+            init_value=init_raw_kv_pool,
+            is_output=True,
+        ),
+        "input_ids": TensorSpec(
+            "input_ids",
+            [N_RANKS, MOE_TOKENS],
+            torch.int64,
+            init_value=init_input_ids,
+        ),
+        "x_ping": TensorSpec(
+            "x_ping",
+            [N_RANKS, local_t, HC_MULT, D],
+            torch.float32,
+            init_value=base_specs["x_hc"].init_value,
+        ),
+        "x_pong": TensorSpec(
+            "x_pong",
+            [N_RANKS, local_t, HC_MULT, D],
+            torch.float32,
+            init_value=lambda: torch.zeros(
+                N_RANKS, local_t, HC_MULT, D, dtype=torch.float32
+            ),
+            is_output=True,
+        ),
+        "x_attn_active": TensorSpec(
+            "x_attn_active",
+            [N_RANKS, local_t, HC_MULT, D],
+            torch.float32,
+            init_value=lambda: torch.zeros(
+                N_RANKS, local_t, HC_MULT, D, dtype=torch.float32
+            ),
+            is_output=True,
+        ),
+        "x_moe_next": TensorSpec(
+            "x_moe_next",
+            [N_RANKS, MOE_TOKENS, HC_MULT, D],
+            torch.float32,
+            init_value=lambda: torch.zeros(
+                N_RANKS, MOE_TOKENS, HC_MULT, D, dtype=torch.float32
+            ),
+            is_output=True,
+        ),
+        "x_out": TensorSpec(
+            "x_out",
+            [N_RANKS, local_t, HC_MULT, D],
+            torch.float32,
+            is_output=True,
+        ),
+    }
+    specs_by_name["raw_kv_pool"].resident = "stacked"
+
+    for name in _TWO_SWA_LAYERED_WEIGHT_NAMES:
+        specs_by_name[name] = _make_two_swa_layered_spec(
+            name, base_specs[name]
+        )
+
+    for name in _TWO_SWA_METADATA_NAMES:
+        source = base_specs[name]
+        copied = TensorSpec(
+            name,
+            list(source.shape),
+            source.dtype,
+            init_value=source.init_value,
+        )
+        copied.resident = source.resident
+        specs_by_name[name] = copied
+
+    parameter_names = [
+        name
+        for name, parameter in inspect.signature(
+            l3_decode_fwd._func
+        ).parameters.items()
+        if parameter.default is inspect.Parameter.empty
+    ]
+    missing = [name for name in parameter_names if name not in specs_by_name]
+    extra = [name for name in specs_by_name if name not in parameter_names]
+    if missing or extra:
+        raise ValueError(
+            f"two-SWA spec/signature mismatch: missing={missing}, extra={extra}"
+        )
+    specs = [specs_by_name[name] for name in parameter_names]
+    for spec in specs:
+        if isinstance(spec, TensorSpec) and len(spec.shape) > MAX_PUBLIC_TENSOR_DIMS:
+            raise ValueError(
+                f"two-SWA tensor {spec.name!r} exceeds "
+                f"{MAX_PUBLIC_TENSOR_DIMS} dimensions: {spec.shape}"
+            )
+    return specs
+
+
+def _two_swa_layer_value(value, layer_ordinal):
+    extent = value.shape[1] // TWO_SWA_LAYER_COUNT
+    begin = layer_ordinal * extent
+    return value[:, begin : begin + extent]
+
+
+def golden_two_swa_decode_fwd(tensors):
+    """Compose two unchanged SWA+MoE goldens after the embedding preamble."""
+    import torch
+
+    local_t = int(tensors["freqs_cos"].shape[1])
+    current = tensors["x_ping"].clone()
+    raw_blocks_per_layer = (
+        tensors["raw_kv_pool"].shape[1] // TWO_SWA_LAYER_COUNT
+    )
+
+    for layer_ordinal in range(TWO_SWA_LAYER_COUNT):
+        raw_begin = layer_ordinal * raw_blocks_per_layer
+        raw_layer = tensors["raw_kv_pool"][
+            :, raw_begin : raw_begin + raw_blocks_per_layer
+        ]
+        x_attn_active = torch.zeros_like(current)
+        for group in range(layer.TP_GROUPS):
+            group_begin = group * TP_SIZE
+            group_end = group_begin + TP_SIZE
+            group_tensors = {}
+            for name in _TWO_SWA_ATTN_INPUT_NAMES:
+                if name == "x_hc":
+                    value = current
+                elif name == "kv_cache":
+                    value = raw_layer
+                elif name in _TWO_SWA_LAYERED_WEIGHT_NAMES:
+                    value = _two_swa_layer_value(
+                        tensors[name], layer_ordinal
+                    )
+                else:
+                    value = tensors[name]
+                group_tensors[name] = value[group_begin:group_end]
+            group_tensors["x_out"] = x_attn_active[group_begin:group_end]
+            group_tensors["local_t"] = local_t
+            swa.golden_decode_swa(group_tensors)
+
+        x_attn_moe = torch.zeros(
+            N_RANKS, MOE_TOKENS, HC_MULT, D, dtype=torch.float32
+        )
+        x_attn_moe[:, :local_t].copy_(x_attn_active)
+        x_moe_next = torch.zeros_like(x_attn_moe)
+        moe_tensors = dict(tensors)
+        for name in _TWO_SWA_LAYERED_WEIGHT_NAMES:
+            if name not in _COMMON_ATTN_WEIGHT_NAMES:
+                moe_tensors[name] = _two_swa_layer_value(
+                    tensors[name], layer_ordinal
+                )
+        moe_tensors.update(
+            {
+                "x_hc": x_attn_moe,
+                "x_next": x_moe_next,
+                "layer_id": layer_ordinal,
+                "num_tokens": local_t,
+            }
+        )
+        moe_module.golden_moe(moe_tensors)
+        current = x_moe_next[:, :local_t].clone()
+        tensors["x_attn_active"].copy_(x_attn_active)
+        tensors["x_moe_next"].copy_(x_moe_next)
+        if layer_ordinal == 0:
+            tensors["x_pong"].copy_(current)
+
+    tensors["x_out"].copy_(current)
+
+
+def two_swa_packed_raw_pool_compare(
+    actual, expected, **kwargs
+):
+    """Check both local layer mappings and require all other rows unchanged."""
+    from golden import mapped_pool_ratio_allclose
+
+    if actual.shape != expected.shape:
+        return False, (
+            f"    raw pool shape mismatch: actual={tuple(actual.shape)} "
+            f"expected={tuple(expected.shape)}"
+        )
+    if actual.shape[1] % TWO_SWA_LAYER_COUNT:
+        return False, "    packed raw pool is not divisible by two SWA layers"
+
+    per_layer_blocks = actual.shape[1] // TWO_SWA_LAYER_COUNT
+    mapping = kwargs.get("inputs", {}).get("swa_slot_mapping")
+    if mapping is None:
+        return False, "    compare_fn missing input 'swa_slot_mapping'"
+    compare_layer0 = mapped_pool_ratio_allclose(
+        "swa_slot_mapping",
+        mapping_shape=tuple(mapping.shape),
+        block_size=BLOCK_SIZE,
+        leading_rank_axis=True,
+        pool_name="two-SWA raw KV cache",
+        atol=1e-4,
+        rtol=1.0 / 128,
+        max_error_ratio=0.005,
+    )
+    compare_layer1 = mapped_pool_ratio_allclose(
+        "swa_slot_mapping",
+        mapping_shape=tuple(mapping.shape),
+        block_size=BLOCK_SIZE,
+        leading_rank_axis=True,
+        pool_name="two-SWA raw KV cache",
+        atol=0.01,
+        rtol=0.05,
+        max_error_ratio=0.05,
+    )
+    for layer_ordinal in range(TWO_SWA_LAYER_COUNT):
+        begin = layer_ordinal * per_layer_blocks
+        compare_layer = compare_layer0 if layer_ordinal == 0 else compare_layer1
+        ok, detail = compare_layer(
+            actual[:, begin : begin + per_layer_blocks],
+            expected[:, begin : begin + per_layer_blocks],
+            **kwargs,
+        )
+        if not ok:
+            return False, f"    layer {layer_ordinal}:\n{detail}"
+    return True, ""
+
+
+def build_two_swa_shape_report(start_pos=None):
+    """Return the concrete Phase B L3 shapes without materializing tensors."""
+    specs = build_two_swa_tensor_specs(start_pos=start_pos)
+    shapes = {
+        spec.name: list(spec.shape)
+        for spec in specs
+        if hasattr(spec, "shape")
+    }
+    return {
+        "tp": TP_SIZE,
+        "ep": EP_SIZE,
+        "active_tokens": shapes["freqs_cos"][1],
+        "raw_blocks_per_layer": (
+            shapes["raw_kv_pool"][1] // TWO_SWA_LAYER_COUNT
+        ),
+        "maximum_public_tensor_dims": max(len(shape) for shape in shapes.values()),
+        "shapes": shapes,
+    }
+
+
+def build_decode_fwd_shape_report(start_pos=None):
+    """Build production/runtime shape skeletons without building a device graph."""
+    reports = {
+        "swa": layer.build_layer_shape_report(0, start_pos=start_pos),
+        "csa": layer.build_layer_shape_report(2, start_pos=start_pos),
+        "hca": layer.build_layer_shape_report(3, start_pos=start_pos),
+    }
+    active_tokens = reports["swa"]["active_tokens"]
+    if any(report["active_tokens"] != active_tokens for report in reports.values()):
+        raise ValueError("attention kinds disagree on the active-token extent")
+
+    per_layer_pool_shapes = _collect_per_layer_pool_shapes(reports)
+    packed_layout = build_packed_pool_layout(per_layer_pool_shapes)
+    packed_pool_shapes = {
+        name: entry["packed_shape"] for name, entry in packed_layout.items()
+    }
+    metadata_shapes = _collect_metadata_shapes(reports)
+
+    preamble_shapes = {
+        "input_ids": [N_RANKS, MOE_TOKENS],
+        "embed_weight": [N_RANKS, MODEL_CONFIG.vocab_size, D],
+    }
+    workspace_shapes = {
+        "embedding_hidden": [N_RANKS, active_tokens, D],
+        "x_ping": [N_RANKS, active_tokens, HC_MULT, D],
+        "x_pong": [N_RANKS, active_tokens, HC_MULT, D],
+        "x_attn_active": [N_RANKS, active_tokens, HC_MULT, D],
+        "x_moe_next": [N_RANKS, MOE_TOKENS, HC_MULT, D],
+    }
+    terminal_shapes = {
+        "hc_head_fn": [N_RANKS, HC_MULT, HC_DIM],
+        "hc_head_scale": [N_RANKS, 1],
+        "hc_head_base": [N_RANKS, HC_MULT],
+        "final_norm_w": [N_RANKS, D],
+        "lm_head_weight": [N_RANKS, VOCAB_PER_TP, D],
+        "hidden_out": [N_RANKS, active_tokens, D],
+        "logit_row_indices": [N_RANKS, MAX_LOGIT_ROWS],
+        "logits": [N_RANKS, MAX_LOGIT_ROWS, MODEL_CONFIG.vocab_size],
+        "sampled_ids": [N_RANKS, MAX_LOGIT_ROWS, SAMPLED_IDS_PAD],
+    }
+
+    production_weights = _collect_weight_shapes(
+        reports,
+        MAIN_LAYER_COUNT,
+        HCA_LAYER_COUNT,
+        CSA_LAYER_COUNT,
+    )
+    runtime_weights = _collect_weight_shapes(reports, 1, 1, 1)
+
+    common_sections = {
+        "preamble": preamble_shapes,
+        "metadata": metadata_shapes,
+        "packed_pools": packed_pool_shapes,
+        "workspaces": workspace_shapes,
+        "terminal": terminal_shapes,
+    }
+    production_sections = {
+        **common_sections,
+        "common_weights": production_weights["common"],
+        "hca_weights": production_weights["hca"],
+        "csa_weights": production_weights["csa"],
+    }
+    runtime_sections = {
+        **common_sections,
+        "common_weights": runtime_weights["common"],
+        "hca_weights": runtime_weights["hca"],
+        "csa_weights": runtime_weights["csa"],
+    }
+    maximum_dims = max(
+        _validate_public_shapes(production_sections),
+        _validate_public_shapes(runtime_sections),
+    )
+
+    return {
+        "tp": TP_SIZE,
+        "ep": EP_SIZE,
+        "active_batch": reports["swa"]["active_batch"],
+        "active_tokens": active_tokens,
+        "layer_plan": FULL43_LAYER_PLAN,
+        "packed_layout": packed_layout,
+        "packed_pool_bytes_per_rank": sum(
+            entry["bytes_per_rank"] for entry in packed_layout.values()
+        ),
+        "weight_bank_layers": {
+            "production": {
+                "common": MAIN_LAYER_COUNT,
+                "hca": HCA_LAYER_COUNT,
+                "csa": CSA_LAYER_COUNT,
+            },
+            "runtime": {"common": 1, "hca": 1, "csa": 1},
+        },
+        "production": production_sections,
+        "runtime": runtime_sections,
+        "maximum_public_tensor_dims": maximum_dims,
+    }
+
+
+def _parse_start_pos(raw):
+    if raw is None:
+        return None
+    values = [int(part.strip()) for part in raw.split(",") if part.strip()]
+    if not values:
+        raise ValueError("--start-pos must contain at least one integer")
+    return values[0] if len(values) == 1 else values
+
+
+def main():
+    import argparse
+
+    from golden import ratio_reldiff, run_jit
+    from pypto.ir.distributed_compiled_program import DistributedConfig
+
+    parser = argparse.ArgumentParser(
+        description="DeepSeek-V4 D-Spark decode-forward integration"
+    )
+    parser.add_argument(
+        "-p", "--platform", type=str, default="a2a3",
+        choices=("a2a3", "a2a3sim", "a5", "a5sim"),
+    )
+    parser.add_argument("--tp", type=int, default=TP_SIZE, choices=_TP_CHOICES)
+    parser.add_argument("--ep", type=int, default=EP_SIZE, choices=_EP_CHOICES)
+    parser.add_argument(
+        "-d", "--device", type=str, default=None,
+        help=f"comma-separated device ids; EP={EP_SIZE} needs {EP_SIZE}",
+    )
+    parser.add_argument(
+        "--start-pos",
+        type=str,
+        default=None,
+        help="a scalar selects batch=1; a comma-separated list sets the batch",
+    )
+    parser.add_argument("--shape-only", action="store_true", default=False)
+    parser.add_argument("--compile-only", action="store_true", default=False)
+    parser.add_argument(
+        "--enable-scope-stats", action="store_true", default=False
+    )
+    parser.add_argument("--runtime-dir", type=str, default=None)
+    parser.add_argument("--golden-data", type=str, default=None)
+    parser.add_argument("--save-data", action="store_true", default=False)
+    parser.add_argument("--dump-passes", action="store_true", default=False)
+    parser.add_argument("--log-level", type=str, default=None)
+    args = parser.parse_args()
+
+    if args.tp != TP_SIZE or args.ep != EP_SIZE:
+        parser.error(
+            f"parallel sizes froze at import as TP={TP_SIZE}, EP={EP_SIZE}"
+        )
+    start_pos = _parse_start_pos(args.start_pos)
+    if args.shape_only:
+        report = build_decode_fwd_shape_report(start_pos)
+        prefix_report = build_two_swa_shape_report(start_pos)
+        packed_summary = ", ".join(
+            f"{name}={entry['total_extent']}"
+            for name, entry in report["packed_layout"].items()
+        )
+        print(
+            f"TP={report['tp']} EP={report['ep']} "
+            f"batch={report['active_batch']} active_t={report['active_tokens']} "
+            f"layers={len(report['layer_plan'])} "
+            f"max_dims={report['maximum_public_tensor_dims']}"
+        )
+        print(f"packed_blocks: {packed_summary}")
+        print(
+            "packed_pool_gib_per_rank: "
+            f"{report['packed_pool_bytes_per_rank'] / (1024 ** 3):.3f}"
+        )
+        print(
+            "two_swa: "
+            f"active_t={prefix_report['active_tokens']} "
+            f"raw_blocks_per_layer={prefix_report['raw_blocks_per_layer']} "
+            f"max_dims={prefix_report['maximum_public_tensor_dims']}"
+        )
+        return
+
+    if args.device is None:
+        args.device = ",".join(str(rank) for rank in range(EP_SIZE))
+    try:
+        device_ids = [int(device) for device in args.device.split(",")]
+    except ValueError:
+        parser.error(
+            f"--device must be a comma-separated integer list, got "
+            f"{args.device!r}"
+        )
+    if len(device_ids) != EP_SIZE:
+        parser.error(
+            f"EP={EP_SIZE} needs exactly {EP_SIZE} devices, got {device_ids}"
+        )
+    if len(set(device_ids)) != len(device_ids) or any(
+        device < 0 for device in device_ids
+    ):
+        parser.error(f"device IDs must be distinct and non-negative: {device_ids}")
+
+    specs = build_two_swa_tensor_specs(start_pos=start_pos)
+    local_t = next(spec.shape[1] for spec in specs if spec.name == "x_out")
+    result = run_jit(
+        fn=l3_decode_fwd,
+        specs=specs,
+        golden_fn=golden_two_swa_decode_fwd,
+        golden_data=args.golden_data,
+        save_data=args.save_data,
+        compile_only=args.compile_only,
+        runtime_dir=args.runtime_dir,
+        compile_cfg=dict(
+            dump_passes=args.dump_passes,
+            distributed_config=DistributedConfig(
+                device_ids=device_ids, num_sub_workers=0
+            ),
+        ),
+        runtime_cfg=dict(
+            platform=args.platform,
+            enable_scope_stats=args.enable_scope_stats,
+            log_level=args.log_level,
+        ),
+        rtol=1e-2,
+        atol=1e-2,
+        compare_fn={
+            "raw_kv_pool": two_swa_packed_raw_pool_compare,
+            "x_pong": ratio_reldiff(diff_thd=0.01, pct_thd=0.05),
+            "x_attn_active": ratio_reldiff(
+                diff_thd=0.01, pct_thd=0.05
+            ),
+            "x_moe_next": ratio_reldiff(
+                diff_thd=0.01,
+                pct_thd=0.06,
+                valid_rows=local_t,
+                valid_axis=1,
+            ),
+            "x_out": ratio_reldiff(diff_thd=0.01, pct_thd=0.06),
+        },
+    )
+    if not result.passed:
+        if result.error:
+            print(result.error)
+        raise SystemExit(1)
+
+
+if __name__ == "__main__":
+    main()
