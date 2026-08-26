@@ -502,9 +502,11 @@ jobs:
     runs-on: [self-hosted, linux, arm64, npu-a5]
     # Compile (~5 min) + resident weight upload (~8 min for 335 GB of INT8 shards)
     # + 33 forward passes fit in ~15 min once the cards are lent; the ceiling
-    # must still exceed task-submit's own worst case (--timeout 5400 queue wait +
-    # --max-time 2400 run), or the job dies before task-submit can report.
-    timeout-minutes: 150
+    # must still cover setup plus task-submit's worst case per attempt
+    # (--timeout 5400 queue wait + --max-time 2400 run = 130 min) times the two
+    # attempts the loop step may make, or the job is cancelled before
+    # task-submit can report and e2e.json / the artifact are lost.
+    timeout-minutes: 290
     defaults:
       run:
         working-directory: checkout
@@ -735,18 +737,28 @@ jobs:
           ids = last(r"^\[SESSION\] generated ids: (\[.*\])$")
           eos = last(r"^\[SESSION\] eos at decode step (\d+)$")
           passed = bool(last(r"^\[SESSION\] PASS: EP8 .* token loop completed$")) and rc == 0
-          error = last(r"^(?:RuntimeError|ValueError|TimeoutError|OSError|AssertionError)[^\n]*$") \
-              or last(r"^\S*\[ERROR\][^\n]*$") or last(r"^.*(?:507\d{3}|SCHEDULER_TIMEOUT|non-finite|NaN)[^\n]*$")
-          if error is None and rc != 0:
-              # No recognisable traceback or device error: the program printed a
-              # plain one-line complaint (a missing package, a bad argument) and
-              # exited. Take the last non-boilerplate line before task-submit's
-              # own verdict so the summary shows the cause instead of "exit code 1".
-              tail = [l for l in log.splitlines()
-                      if l.strip() and not l.startswith(("[npu-lock]", "===", "[SESSION]", "提示", "任务", "等待"))
-                      and "[STRACE]" not in l and "[TIMING]" not in l]
-              if tail:
-                  error = tail[-1].strip()[:300]
+          def extract_error(text, tail_fallback):
+              # Same ladder for both attempts: exception line, then runtime
+              # [ERROR] line, then a device error code, and finally (for a
+              # nonzero exit with none of those) the last non-boilerplate line
+              # before task-submit's own verdict — a plain one-line complaint
+              # (a missing package, a bad argument) rather than "exit code 1".
+              for pattern in (
+                  r"^(?:RuntimeError|ValueError|TimeoutError|OSError|AssertionError)[^\n]*$",
+                  r"^\S*\[ERROR\][^\n]*$",
+                  r"^.*(?:507\d{3}|SCHEDULER_TIMEOUT|non-finite|NaN)[^\n]*$",
+              ):
+                  hits = re.findall(pattern, text, re.M)
+                  if hits:
+                      return hits[-1]
+              if tail_fallback:
+                  tail = [l for l in text.splitlines()
+                          if l.strip() and not l.startswith(("[npu-lock]", "===", "[SESSION]", "提示", "任务", "等待"))
+                          and "[STRACE]" not in l and "[TIMING]" not in l]
+                  if tail:
+                      return tail[-1].strip()[:300]
+              return None
+          error = extract_error(log, rc != 0)
           n_ids = len(ast.literal_eval(ids)) if ids else None
           # When a first attempt failed and was retried, surface its error line
           # next to the (final) verdict so a flaky night reads as exactly what
@@ -757,10 +769,7 @@ jobs:
                   log1 = open("e2e-attempt1.log", errors="replace").read()
               except FileNotFoundError:
                   log1 = ""
-              hits = re.findall(
-                  r"^(?:RuntimeError|ValueError|TimeoutError|OSError|AssertionError)[^\n]*$",
-                  log1, re.M)
-              first_attempt_error = hits[-1] if hits else "see e2e-attempt1.log"
+              first_attempt_error = extract_error(log1, True) or "see e2e-attempt1.log"
           json.dump({
               "status": "pass" if passed else "fail",
               "exit_code": rc,
