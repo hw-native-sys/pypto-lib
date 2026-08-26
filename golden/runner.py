@@ -756,34 +756,6 @@ def _l3_ordered_args(
     return [arg_map[name] for name in ordered_names]
 
 
-class _SteppedBenchmarkArgs(Sequence[Any]):
-    """Lazily build one positional-argument list per physical dispatch.
-
-    ``pypto.runtime.benchmark`` expands its ``args`` sequence inside every
-    warmup and measured launch.  Advancing in :meth:`__iter__` therefore keeps
-    persistent-window epoch scalars aligned with the exact physical dispatch
-    count without changing tensor arguments or the runtime benchmark API.
-    """
-
-    def __init__(self, build_args: Callable[[int], list[Any]], size: int) -> None:
-        self._build_args = build_args
-        self._size = size
-        self._next_dispatch = 0
-
-    def __iter__(self):
-        args = self._build_args(self._next_dispatch)
-        self._next_dispatch += 1
-        return iter(args)
-
-    def __len__(self) -> int:
-        return self._size
-
-    def __getitem__(self, index):
-        # Sequence introspection must not consume a dispatch.  The runtime's
-        # physical launches use __iter__, one expansion per handle invocation.
-        return self._build_args(self._next_dispatch)[index]
-
-
 def _run_benchmark_l3(
     compiled: Any,
     specs: list[TensorSpec | ScalarSpec],
@@ -804,23 +776,25 @@ def _run_benchmark_l3(
     place and passes ``config=`` only. Returns the :class:`BenchmarkStats`, or
     ``None`` when the runtime emits no markers.
     """
+    # Every stepped driver keeps resident weights and benchmarks on the
+    # resident dispatch path, where each physical launch rebuilds its argument
+    # list; here one args list would repeat across launches and violate the
+    # epoch-stepping contract, so reject rather than support a path nothing
+    # reaches (mirrors the L2 reject above).
+    stepped = sorted(s.name for s in scalar_specs_eff.values() if s.has_benchmark_step)
+    if stepped:
+        raise ValueError(
+            "non-resident L3 benchmark does not support ScalarSpec "
+            f"benchmark_step (mark the program's weights resident); "
+            f"stepped scalars: {stepped}"
+        )
+
     from pypto.runtime import benchmark
 
     # L3 dispatch reads IO through the fork-inherited shared mapping; validation
     # (after this) then reads the device-written outputs back from these buffers.
     _share_in_place(tensors)
     ordered = _l3_ordered_args(compiled, specs, tensors, scalar_specs_eff)
-    if any(s.has_benchmark_step for s in scalar_specs_eff.values()):
-        ordered = _SteppedBenchmarkArgs(
-            lambda dispatch_index: _l3_ordered_args(
-                compiled,
-                specs,
-                tensors,
-                scalar_specs_eff,
-                benchmark_dispatch_index=dispatch_index,
-            ),
-            len(ordered),
-        )
     stats = None
     with _Stage("benchmark"):
         try:

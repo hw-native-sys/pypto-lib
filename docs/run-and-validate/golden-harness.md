@@ -58,8 +58,10 @@ needs a complete `pl.Tensor[[shape...], dtype]` annotation on this path.
 
 For an L3 benchmark that retains persistent windows, set `benchmark_step` when
 the scalar must advance with every physical dispatch. Dispatch `i`, including
-warmup launches, receives `value + i * benchmark_step`. L2 benchmarks reject
-stepped scalars because they do not provide this persistent-window contract. A
+warmup launches, receives `value + i * benchmark_step`. Stepped scalars
+require resident specs: L2 benchmarks and the non-resident L3 benchmark both
+reject them, because those paths repeat one argument list per launch instead
+of providing the persistent-window contract. A
 stepped scalar compiled through `run_jit` must also use `compile_runtime=True`;
 otherwise the compiler is allowed to fold the initial value into the artifact.
 Stepped scalars cannot be combined with `runtime_cfg={"enable_chip_swimlane":

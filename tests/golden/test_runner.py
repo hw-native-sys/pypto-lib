@@ -1986,51 +1986,21 @@ def test_l3_benchmark_tolerates_only_missing_strace(monkeypatch):
         assert _run_benchmark_l3(object(), [], {}, {}, {}, rounds=1, warmup=1) is None
 
 
-def test_l3_benchmark_advances_stepped_scalar_per_physical_dispatch(monkeypatch):
-    """Warmup and measured launches share one monotonically stepped sequence."""
-    observed = []
-
-    def _benchmark(_compiled, args, **kwargs):
-        for _ in range(kwargs["warmup"] + kwargs["rounds"]):
-            ordered = list(args)
-            observed.append((ordered[0], ordered[1].item()))
-        return None
-
-    class _Compiled:
-        def _get_metadata(self):
-            return (
-                [
-                    types.SimpleNamespace(name="x__ssa_v0"),
-                    types.SimpleNamespace(name="epoch__ssa_v0"),
-                ],
-                None,
-                None,
-            )
-
-    fake_runtime = types.ModuleType("pypto.runtime")
-    fake_runtime.benchmark = _benchmark
-    tensors = {"x": torch.zeros(1).share_memory_()}
-    specs = [
-        TensorSpec("x", [1], torch.float32),
-        ScalarSpec("epoch", torch.int32, 0, benchmark_step=43),
-    ]
-    scalar_specs_eff = {"epoch": specs[1]}
-    monkeypatch.setattr("golden.runner._l3_run_config", lambda _cfg: "RUNCFG")
-
-    with patch.dict(sys.modules, {"pypto.runtime": fake_runtime}):
-        result = _run_benchmark_l3(
-            _Compiled(),
-            specs,
-            tensors,
-            scalar_specs_eff,
-            {"platform": "a2a3"},
+def test_l3_benchmark_rejects_stepped_scalar():
+    # Stepped drivers benchmark on the resident dispatch path; the non-resident
+    # L3 benchmark expands one args list per launch and must refuse instead of
+    # silently repeating epoch values.
+    epoch = ScalarSpec("epoch", torch.int32, 0, benchmark_step=43)
+    with pytest.raises(ValueError, match="non-resident L3 benchmark.*benchmark_step"):
+        _run_benchmark_l3(
+            compiled=object(),
+            specs=[epoch],
+            tensors={},
+            scalar_specs_eff={"epoch": epoch},
+            runtime_cfg={},
             rounds=3,
             warmup=2,
         )
-
-    assert result is None
-    assert [epoch for _, epoch in observed] == [0, 43, 86, 129, 172]
-    assert all(tensor is tensors["x"] for tensor, _ in observed)
 
 
 def test_l2_benchmark_rejects_stepped_scalar():
