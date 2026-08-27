@@ -8,7 +8,8 @@
 # -----------------------------------------------------------------------------------------------------------
 # ci: devices=2
 """DeepSeek-V4 MoE single-layer (decode), FLASH preset. --ep picks the EP world
-size: 2/4/8 run N-rank distributed; each rank keeps 32 experts."""
+size: 2/4/8 run N-rank distributed; each rank keeps EXPERTS_PER_RANK experts."""
+
 
 
 # Sub-kernels freeze EP_WORLD_SIZE / n_routed_experts into their shapes at import
@@ -20,21 +21,22 @@ import config
 
 _EP_CHOICES = (2, 4, 8)
 _EP_DEFAULT = 2
+_EXPERTS_PER_RANK_DEFAULT = 32
 
 
-def _parse_ep_argv():
+def _parse_int_argv(name, default):
     for i, tok in enumerate(sys.argv):
-        if tok == "--ep" and i + 1 < len(sys.argv):
+        if tok == name and i + 1 < len(sys.argv):
             return int(sys.argv[i + 1])
-        if tok.startswith("--ep="):
+        if tok.startswith(f"{name}="):
             return int(tok.split("=", 1)[1])
-    return _EP_DEFAULT
+    return default
 
 
-EP = _parse_ep_argv()
-
+EP = _parse_int_argv("--ep", _EP_DEFAULT)
+EXPERTS_PER_RANK = _parse_int_argv("--experts-per-rank", _EXPERTS_PER_RANK_DEFAULT)
 config.EP_WORLD_SIZE = EP
-config.FLASH = dataclasses.replace(config.FLASH, n_routed_experts=config.FLASH.n_routed_experts // 8 * EP)
+config.FLASH = dataclasses.replace(config.FLASH, n_routed_experts=EXPERTS_PER_RANK * EP)
 config.RECV_MAX = EP * config.MOE_TOKENS
 
 import pypto.language as pl
@@ -1755,8 +1757,20 @@ def build_tensor_specs(layer_id=0, num_tokens=None, balanced_routing=False, *, t
     return specs
 
 
+def _seed_fixture_generators(seed):
+    import random
+
+    import numpy as np
+    import torch
+
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+
+
 if __name__ == "__main__":
     import argparse
+    import os
 
     from golden import ratio_reldiff, run
 
@@ -1764,6 +1778,8 @@ if __name__ == "__main__":
     parser.add_argument("-p", "--platform", type=str, default="a2a3", choices=["a2a3", "a2a3sim", "a5", "a5sim"])
     parser.add_argument("--ep", type=int, default=_EP_DEFAULT, choices=list(_EP_CHOICES),
                         help="EP world size / rank count")
+    parser.add_argument("--experts-per-rank", type=int, default=_EXPERTS_PER_RANK_DEFAULT,
+                        help="resident routed experts per EP rank")
     parser.add_argument("-d", "--device", type=str, default=",".join(str(i) for i in range(N_RANKS)),
                         help=f"comma-separated device ids (need {N_RANKS})")
     parser.add_argument("--layer-id", type=int, default=0)
@@ -1771,7 +1787,13 @@ if __name__ == "__main__":
                         help=f"active token count for MoE dispatch/combine (0..{T})")
     parser.add_argument("--balanced-routing", action="store_true", default=False,
                         help="use deterministic hash routes balanced evenly across all experts")
-    parser.add_argument("--enable-chip-swimlane", type=int, nargs="?", const=1, default=0, choices=range(5))
+    parser.add_argument("--seed", type=int, default=None,
+                        help="seed Python, NumPy, and Torch fixture generators")
+    parser.add_argument(
+        "--enable-chip-swimlane", "--enable-l2-swimlane",
+        dest="enable_chip_swimlane", type=int, nargs="?", const=1,
+        default=0, choices=range(5),
+    )
     parser.add_argument("--compile-only", action="store_true", default=False)
     parser.add_argument("--runtime-dir", type=str, default=None)
     parser.add_argument("--save-data", action="store_true", default=False)
@@ -1785,6 +1807,14 @@ if __name__ == "__main__":
 
     device_ids = [int(d) for d in args.device.split(",")]
     assert len(device_ids) == N_RANKS, f"need exactly {N_RANKS} devices, got {device_ids}"
+
+    if args.seed is not None:
+        _seed_fixture_generators(args.seed)
+        print(
+            f"[RUN] fixture seed={args.seed} "
+            f"python_hash_seed={os.environ.get('PYTHONHASHSEED', 'unset')}",
+            flush=True,
+        )
 
     golden_data = args.golden_data
 

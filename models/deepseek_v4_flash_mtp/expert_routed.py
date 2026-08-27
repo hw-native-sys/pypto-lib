@@ -507,39 +507,39 @@ def golden_expert_routed(tensors):
     payload; recv_y[e, cnt[e]:, :] stays at zero."""
     from utils import int8_quant_per_row
     import torch
-    import torch.nn.functional as F
-
-    def dequant_w(w_i8, w_scale):
-        return w_i8.to(torch.float32) * w_scale.unsqueeze(-1)
 
     recv_x_i8 = tensors["recv_x"]  # INT8, pre-quantized in dispatch
     recv_scale_dq = tensors["recv_scale_dq"].float()  # [E, RECV_MAX]
     recv_weights = tensors["recv_weights"].float()  # [E, RECV_MAX]
     recv_expert_count = tensors["recv_expert_count"]  # [E, 1] int32
-    w1 = dequant_w(tensors["routed_w1"], tensors["routed_w1_scale"].float())
-    w3 = dequant_w(tensors["routed_w3"], tensors["routed_w3_scale"].float())
-    w2 = dequant_w(tensors["routed_w2"], tensors["routed_w2_scale"].float())
 
     recv_y = torch.zeros_like(recv_x_i8, dtype=torch.float32)
     for e in range(N_LOCAL_EXPERTS):
         n_rows = int(recv_expert_count[e, 0].item())
         if n_rows == 0:
             continue
-        x_sub_i8 = recv_x_i8[e, :n_rows, :]
+        x_sub_i32 = recv_x_i8[e, :n_rows, :].to(torch.int32)
         x_sub_sd = recv_scale_dq[e, :n_rows].reshape(-1, 1)
-        x_sub_q = x_sub_i8.float() * x_sub_sd
         w_per_row = recv_weights[e, :n_rows].reshape(-1, 1)
 
-        gate = x_sub_q @ w1[e].T
-        up = x_sub_q @ w3[e].T
+        # Match the kernel's INT32 accumulation and post-matmul scale order.
+        # Dequantizing first changes FP32 rounding before the INT8 boundary.
+        gate_int = x_sub_i32 @ tensors["routed_w1"][e].to(torch.int32).T
+        up_int = x_sub_i32 @ tensors["routed_w3"][e].to(torch.int32).T
+        gate = gate_int.float() * x_sub_sd * tensors["routed_w1_scale"][e].float()
+        up = up_int.float() * x_sub_sd * tensors["routed_w3_scale"][e].float()
         if SWIGLU_LIMIT > 0:
             gate = gate.clamp(max=SWIGLU_LIMIT)
             up = up.clamp(-SWIGLU_LIMIT, SWIGLU_LIMIT)
-        h = F.silu(gate) * up
+        sigmoid = torch.reciprocal(torch.exp(-gate) + 1.0)
+        h = (gate * sigmoid) * up
         # A8 requant before w2 matmul.
         h_i8, h_sd = int8_quant_per_row(h)
-        h = h_i8.float() * (h_sd * w_per_row)
-        recv_y[e, :n_rows, :] = h @ w2[e].T
+        y_int = h_i8.to(torch.int32) @ tensors["routed_w2"][e].to(torch.int32).T
+        row_scale = h_sd * w_per_row
+        recv_y[e, :n_rows, :] = (
+            y_int.float() * row_scale * tensors["routed_w2_scale"][e].float()
+        )
 
     tensors["recv_y"][:] = recv_y.to(torch.bfloat16)
 
