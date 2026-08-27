@@ -577,4 +577,4 @@ kernel passes at 262144 / 4 GiB. See
   mixed CCE kernel is authored and bound behind `pl.jit.extern`
 - [CCE In-Core Profiling](cce-incore-profiling.md) — phase partitioning inside
   the external attention kernel
-- [Qwen3-14B](../models/qwen3_14b.md) — the model this page follows, top down
+- [Qwen3-14B](../models/qwen3_14b/index.md) — the model this page follows, top down

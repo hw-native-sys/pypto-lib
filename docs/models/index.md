@@ -5,7 +5,7 @@ Files ending in `_draft.py` are work in progress and excluded from CI.
 
 | Directory | What it implements | `pypto-serving` |
 | --- | --- | --- |
-| [qwen3_14b](qwen3_14b.md) | Qwen3-14B BF16 prefill and decode with the serving contract, plus A8W8 and TurboQuant variants and the sampling components | Supported — one-card A2/A3 accuracy job on relevant PRs |
+| [qwen3_14b](qwen3_14b/index.md) | Qwen3-14B BF16 prefill and decode with the serving contract, plus A8W8 and TurboQuant variants and the sampling components | Supported — one-card A2/A3 accuracy job on relevant PRs |
 | [deepseek_v4_flash_mtp](deepseek_v4_flash_mtp.md) | DeepSeek V4-Flash at MTP = 1, batch 4 per card: operators, layer and MTP compositions, prefill/decode full forwards | Supported — eight-card accuracy job on relevant PRs |
 | [deepseek_v4_pro](deepseek_v4_pro.md) | Ascend A5 DeepSeek V4-Pro with an optional Flash preset, quantized Hybrid MXFP8-MXFP4 | Not supported |
 | `deepseek_v4_flash_dspark` | The V4-Flash operators re-sized to batch 64 per card and S = 8 DSpark speculation; under development, operators only | Not supported |
