@@ -102,6 +102,7 @@ from prefill_attention_csa import (
     INNER_STATE_MAX_BLOCKS,
     MAIN_OUT_DIM as CSA_MAIN_OUT_DIM,
     MAX_SEQ_LEN,
+    PREFILL_ATTN_RING_HEAP,
     O_GROUPS,
     O_GROUP_IN,
     O_LORA,
@@ -1721,6 +1722,12 @@ if __name__ == "__main__":
         runtime_cfg=dict(
             platform=args.platform,
             enable_chip_swimlane=args.enable_chip_swimlane,
+            # This program embeds the prefill attention layer, so it inherits
+            # that layer's above-default ring requirement -- without it the run
+            # dies with `orch_error_code=2 HEAP_RING_DEADLOCK`. It used to get a
+            # ring size from the workflow's PTO2_RING_HEAP; simpler #1980
+            # retired that env var, so the requirement is declared here now.
+            ring_heap=list(PREFILL_ATTN_RING_HEAP),
         ),
         rtol=1e-3,
         atol=1e-3,

@@ -59,6 +59,7 @@ from prefill_attention_swa import (
     O_GROUP_IN,
     O_GROUPS,
     O_LORA,
+    PREFILL_ATTN_RING_HEAP,
     Q_LORA,
     ROPE_HEAD_DIM,
     golden_prefill_attention_swa,
@@ -593,6 +594,9 @@ def main():
             platform=args.platform,
             enable_chip_swimlane=args.enable_chip_swimlane,
             enable_scope_stats=args.enable_scope_stats,
+            # Same inherited prefill-attention ring requirement as
+            # prefill_layer.py -- see the note there.
+            ring_heap=list(PREFILL_ATTN_RING_HEAP),
         ),
         rtol=1e-3,
         atol=1e-3,
