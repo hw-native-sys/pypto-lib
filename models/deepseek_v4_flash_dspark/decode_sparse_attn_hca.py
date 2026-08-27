@@ -106,7 +106,7 @@ if T % ATTENTION_PUBLISH_T_TILE != 0:
 
 
 @pl.jit.inline(auto_scope=False)
-def _sparse_attn_hca_stream(
+def _compute_hca_attention_intermediates(
     q: pl.Tensor[[T_DYN, H, HEAD_DIM], pl.BF16],
     ori_kv: pl.Tensor[[ORI_BLOCK_NUM_DYN, BLOCK_SIZE, 1, HEAD_DIM], pl.BF16],
     window_swa_indices: pl.Tensor[[T_DYN, WIN], pl.INT32],
@@ -800,7 +800,7 @@ def sparse_attn_hca(
         stream_heads_tid,
         rope_swap_tid,
         rope_cs_tid,
-    ) = _sparse_attn_hca_stream(
+    ) = _compute_hca_attention_intermediates(
         q,
         ori_kv,
         window_swa_indices,
@@ -883,7 +883,7 @@ def publish_hca_o_groups(
         stream_heads_tid,
         rope_swap_tid,
         rope_cs_tid,
-    ) = _sparse_attn_hca_stream(
+    ) = _compute_hca_attention_intermediates(
         q,
         ori_kv,
         window_swa_indices,

@@ -103,7 +103,7 @@ if T % ATTENTION_PUBLISH_T_TILE != 0:
 
 
 @pl.jit.inline(auto_scope=False)
-def _sparse_attn_csa_state(
+def _compute_csa_attention_intermediates(
     q: pl.Tensor[[T_DYN, H, HEAD_DIM], pl.BF16],
     ori_kv: pl.Tensor[[ORI_BLOCK_NUM_DYN, BLOCK_SIZE, 1, HEAD_DIM], pl.BF16],
     window_swa_indices: pl.Tensor[[T_DYN, WIN], pl.INT32],
@@ -393,7 +393,7 @@ def publish_csa_o_groups(
         rope_swap_idx,
         qk_tid,
         rope_tid,
-    ) = _sparse_attn_csa_state(
+    ) = _compute_csa_attention_intermediates(
         q,
         ori_kv,
         window_swa_indices,
@@ -536,7 +536,7 @@ def sparse_attn_csa(
         rope_swap_idx,
         qk_tid,
         rope_tid,
-    ) = _sparse_attn_csa_state(
+    ) = _compute_csa_attention_intermediates(
         q,
         ori_kv,
         window_swa_indices,

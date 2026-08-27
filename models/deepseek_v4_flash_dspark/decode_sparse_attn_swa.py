@@ -93,7 +93,7 @@ if T % ATTENTION_PUBLISH_T_TILE != 0:
 
 
 @pl.jit.inline(auto_scope=False)
-def _sparse_attn_swa_prepare(
+def _compute_swa_attention_intermediates(
     q: pl.Tensor[[T_DYN, H, HEAD_DIM], pl.BF16],
     ori_kv: pl.Tensor[[ORI_BLOCK_NUM_DYN, BLOCK_SIZE, 1, HEAD_DIM], pl.BF16],
     swa_indices: pl.Tensor[[T_DYN, WIN], pl.INT32],
@@ -296,7 +296,7 @@ def publish_swa_o_groups(
         rope_swap_idx,
         qk_tid,
         rope_tid,
-    ) = _sparse_attn_swa_prepare(
+    ) = _compute_swa_attention_intermediates(
         q,
         ori_kv,
         swa_indices,
@@ -418,7 +418,7 @@ def sparse_attn_swa(
         rope_swap_idx,
         qk_tid,
         rope_tid,
-    ) = _sparse_attn_swa_prepare(
+    ) = _compute_swa_attention_intermediates(
         q, ori_kv, swa_indices, sparse_bias,
         freqs_cos, freqs_sin,
     )
