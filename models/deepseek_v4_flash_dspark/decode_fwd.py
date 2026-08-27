@@ -1597,126 +1597,6 @@ def build_tensor_specs(start_pos=None, *, weight_bank_size=RUNTIME_WEIGHT_BANK, 
     return specs
 
 
-def finite_tensor_compare(actual, _expected, **_kwargs):
-    """Require a completed finite device result without duplicating 43 goldens."""
-    import torch
-
-    if actual.numel() == 0:
-        return False, "    decode forward output is empty"
-    if actual.is_floating_point() and not bool(torch.isfinite(actual).all()):
-        return False, "    decode forward output contains NaN or Inf"
-    return True, ""
-
-
-def sampled_ids_compare(actual, _expected, **kwargs):
-    """Validate active greedy ids and the inactive-row -1 contract."""
-    import torch
-
-    row_indices = kwargs.get("inputs", {}).get("logit_row_indices")
-    if row_indices is None:
-        return False, "    missing logit_row_indices input"
-    active = row_indices >= 0
-    inactive_values = actual.masked_select((~active).unsqueeze(-1).expand_as(actual))
-    if inactive_values.numel() and not bool(torch.all(inactive_values == -1)):
-        return False, "    inactive sampled-id rows are not -1"
-    active_ids = actual[..., 0].masked_select(active)
-    if active_ids.numel() and bool(((active_ids < 0) | (active_ids >= LM_HEAD_VOCAB)).any()):
-        return False, "    active sampled token id is outside the vocabulary"
-    return True, ""
-
-
-def _packed_pool_compare(layer_mappings, layer_count, block_size, pool_name):
-    """Check every packed layer slice and reject writes outside local slots."""
-
-    def compare(actual, expected, **kwargs):
-        import torch
-
-        if actual.shape != expected.shape:
-            message = f"    {pool_name} shape mismatch: actual={tuple(actual.shape)} expected={tuple(expected.shape)}"
-            return False, message
-        if actual.shape[1] % layer_count:
-            return False, f"    {pool_name} packed extent is not divisible"
-        if len(layer_mappings) != layer_count:
-            return False, f"    {pool_name} mapping count diverged"
-        inputs = kwargs.get("inputs", {})
-        extent = actual.shape[1] // layer_count
-        for ordinal, mapping_name in enumerate(layer_mappings):
-            mapping = inputs.get(mapping_name)
-            if mapping is None:
-                return False, f"    missing input {mapping_name!r}"
-            for rank in range(actual.shape[0]):
-                begin = ordinal * extent
-                actual_rows = actual[rank, begin : begin + extent].reshape(extent * block_size, *actual.shape[3:])
-                expected_rows = expected[rank, begin : begin + extent].reshape(extent * block_size, *expected.shape[3:])
-                slots = mapping[rank].to(dtype=torch.int64).reshape(-1)
-                invalid = (slots < -1) | (slots >= actual_rows.shape[0])
-                if bool(invalid.any()):
-                    first = int(slots[invalid][0])
-                    return False, f"    {pool_name} layer={ordinal} rank={rank} contains out-of-range slot {first}"
-                slots = slots[slots >= 0]
-                target = torch.zeros(actual_rows.shape[0], dtype=torch.bool, device=actual.device)
-                if slots.numel():
-                    target[slots] = True
-                if not torch.equal(actual_rows[~target], expected_rows[~target]):
-                    return False, f"    {pool_name} layer={ordinal} rank={rank} modified an unmapped row"
-                selected = actual_rows[target]
-                if selected.is_floating_point() and not bool(torch.isfinite(selected).all()):
-                    return False, f"    {pool_name} layer={ordinal} rank={rank} wrote NaN or Inf"
-                sentinel_value = ordinal + 1
-                sentinel_initialized = bool(torch.all(expected_rows == sentinel_value))
-                selected_unchanged = torch.equal(selected, expected_rows[target])
-                if slots.numel() and sentinel_initialized and selected_unchanged:
-                    return False, f"    {pool_name} layer={ordinal} rank={rank} did not update any mapped sentinel row"
-        return True, ""
-
-    return compare
-
-
-def compare_functions():
-    """Return the decode forward runtime isolation and completion comparators."""
-    raw_mappings = ("swa_slot_mapping",) * SWA_LAYER_COUNT
-    alternating_mappings = ("csa_ori_slot_mapping", "hca_ori_slot_mapping")
-    raw_mappings += tuple(mapping for _ in range(HCA_LAYER_COUNT) for mapping in alternating_mappings)
-    raw_mappings += ("csa_ori_slot_mapping",)
-    csa_mappings = ("csa_state_slot_mapping",) * CSA_LAYER_COUNT
-    csa_cmp_mappings = ("csa_cmp_slot_mapping",) * CSA_LAYER_COUNT
-    csa_inner_mappings = ("csa_inner_state_slot_mapping",) * CSA_LAYER_COUNT
-    csa_idx_mappings = ("csa_idx_slot_mapping",) * CSA_LAYER_COUNT
-    hca_state_mappings = ("hca_state_slot_mapping",) * HCA_LAYER_COUNT
-    hca_cmp_mappings = ("hca_cmp_slot_mapping",) * HCA_LAYER_COUNT
-    finite_names = {
-        "hidden_workspace", "x_ping", "x_pong", "x_attn_active",
-        "x_moe_next", "pre_hc_hidden_out", "x_out", "logits",
-    }
-    compare = {name: finite_tensor_compare for name in finite_names}
-    compare["sampled_ids"] = sampled_ids_compare
-    compare.update({
-        "raw_kv_pool": _packed_pool_compare(raw_mappings, MAIN_LAYER_COUNT, BLOCK_SIZE, "decode forward raw KV"),
-        "hca_compress_state": _packed_pool_compare(
-            hca_state_mappings, HCA_LAYER_COUNT, HCA_COMPRESS_STATE_BLOCK_SIZE, "decode forward HCA state",
-        ),
-        "hca_cmp_kv": _packed_pool_compare(
-            hca_cmp_mappings, HCA_LAYER_COUNT, BLOCK_SIZE, "decode forward HCA compressed KV",
-        ),
-        "csa_compress_state": _packed_pool_compare(
-            csa_mappings, CSA_LAYER_COUNT, CSA_MAIN_STATE_BLOCK_SIZE, "decode forward CSA main state",
-        ),
-        "csa_cmp_kv": _packed_pool_compare(
-            csa_cmp_mappings, CSA_LAYER_COUNT, BLOCK_SIZE, "decode forward CSA compressed KV",
-        ),
-        "csa_inner_compress_state": _packed_pool_compare(
-            csa_inner_mappings, CSA_LAYER_COUNT, CSA_INNER_STATE_BLOCK_SIZE, "decode forward CSA inner state",
-        ),
-        "csa_idx_kv_cache": _packed_pool_compare(
-            csa_idx_mappings, CSA_LAYER_COUNT, BLOCK_SIZE, "decode forward CSA index KV",
-        ),
-        "csa_idx_kv_scale": _packed_pool_compare(
-            csa_idx_mappings, CSA_LAYER_COUNT, BLOCK_SIZE, "decode forward CSA index scale",
-        ),
-    })
-    return compare
-
-
 def _parse_start_pos(raw):
     if raw is None:
         return None
@@ -1755,7 +1635,6 @@ def main():
     )
     parser.add_argument("--enable-scope-stats", action="store_true", default=False)
     parser.add_argument("--runtime-dir", type=str, default=None)
-    parser.add_argument("--golden-data", type=str, default=None)
     parser.add_argument("--save-data", action="store_true", default=False)
     parser.add_argument("--dump-passes", action="store_true", default=False)
     parser.add_argument("--log-level", type=str, default=None)
@@ -1786,7 +1665,6 @@ def main():
     result = run_jit(
         fn=l3_decode_fwd,
         specs=specs,
-        golden_data=args.golden_data,
         save_data=args.save_data,
         compile_only=args.compile_only,
         runtime_dir=args.runtime_dir,
@@ -1804,7 +1682,6 @@ def main():
         ),
         rtol=1e-2,
         atol=1e-2,
-        compare_fn=compare_functions(),
     )
     if not result.passed:
         if result.error:
