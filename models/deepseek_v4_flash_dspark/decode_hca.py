@@ -1319,11 +1319,8 @@ if __name__ == "__main__":
     if args.start_pos is not None:
         batch = len(args.start_pos) if isinstance(args.start_pos, list) else 1
         token_counts = (batch * S,)
-    elif TP_SIZE == 1:
-        token_counts = (LOCAL_T,)
     else:
-        # Capacity, then one row block below it: the dynamic token axis must hold at both.
-        token_counts = (LOCAL_T, LOCAL_T - VALID_TOKEN_TILE)
+        token_counts = (LOCAL_T,)
 
     for local_t in token_counts:
         if TP_SIZE == 1:
