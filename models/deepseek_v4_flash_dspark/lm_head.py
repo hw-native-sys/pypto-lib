@@ -10,7 +10,6 @@
 # ci: no-sim    # CI marker: multi-card fixture; the fused C->V shard overflows the *sim UB limit -- device-only
 """DeepSeek-V4 Flash DSpark LM head: fused matmul+push projection with DP-owned hidden and TP vocab shards."""
 
-import os
 import sys
 
 import pypto.language as pl
@@ -83,10 +82,7 @@ GREEDY_BLOCK_SPAN = GREEDY_BLOCK_ROWS * GREEDY_ROW_WIDTH
 # 2^30: above every vocab id, clear of int32 overflow once a block base is added.
 GREEDY_INDEX_SENTINEL = 1073741824
 DONE_VALUE = 1
-
-# Ring heap: the depth-1 scope holds selected_hidden and owner_hiddens plus the
-# in-flight put payloads; 1 GiB clears the runtime default at tp=4.
-os.environ.setdefault("PTO2_RING_HEAP", "1073741824")
+LM_HEAD_RING_HEAP = 1 << 30
 
 assert MAX_LOGIT_ROWS % MM_ROW_TILE == 0, "each row block must be one owner's rows"
 assert MAX_LOGIT_ROWS % PUSH_ROW_TILE == 0, "row block must cover whole rows"
@@ -565,6 +561,7 @@ if __name__ == "__main__":
             platform=args.platform,
             enable_chip_swimlane=args.enable_chip_swimlane,
             enable_scope_stats=args.enable_scope_stats,
+            ring_heap=LM_HEAD_RING_HEAP,
         ),
         rtol=1e-3,
         atol=1e-3,

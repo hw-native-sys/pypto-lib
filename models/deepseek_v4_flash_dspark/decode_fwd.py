@@ -151,6 +151,9 @@ CSA_IDX_MAX_BLOCKS = csa.IDX_MAX_BLOCKS
 RUNTIME_TEST_VOCAB = 256
 RUNTIME_WEIGHT_BANK = 1
 HC_FN_STORAGE_ROWS = 32
+DECODE_RING_TASK_WINDOW = 16384
+DECODE_RING_HEAP = 1 << 30
+DECODE_RING_DEP_POOL = 16384
 
 
 def _validate_import_contract():
@@ -2233,6 +2236,9 @@ def main():
             platform=args.platform,
             enable_scope_stats=args.enable_scope_stats,
             log_level=args.log_level,
+            ring_task_window=DECODE_RING_TASK_WINDOW,
+            ring_heap=DECODE_RING_HEAP,
+            ring_dep_pool=DECODE_RING_DEP_POOL,
         ),
         rtol=1e-2,
         atol=1e-2,
