@@ -1597,6 +1597,10 @@ def build_tensor_specs(start_pos=None, *, weight_bank_size=RUNTIME_WEIGHT_BANK, 
     return specs
 
 
+def golden_decode_fwd(_tensors):
+    """No-op oracle: without one run_jit skips _validate, and so compare_fn."""
+
+
 def finite_tensor_compare(actual, _expected, **_kwargs):
     """Require a completed finite device result without duplicating 43 goldens."""
     import torch
@@ -1786,6 +1790,7 @@ def main():
     result = run_jit(
         fn=l3_decode_fwd,
         specs=specs,
+        golden_fn=golden_decode_fwd,
         golden_data=args.golden_data,
         save_data=args.save_data,
         compile_only=args.compile_only,
