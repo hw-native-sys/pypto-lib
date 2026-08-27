@@ -334,21 +334,22 @@ for the output format, the multi-card breakdown, and what the number means.
 `golden.validation.validate_golden` compares each device output against
 the golden using `torch.allclose(rtol, atol)` by default. Override
 per-output with the `compare_fn={"out_name": custom_callable}` argument.
-`golden.validation` ships five ready-made gates:
+`golden.validation` ships six ready-made gates:
 
 | Comparator | Use case |
 |------------|----------|
 | `topk_pair_compare(vals_name)` | Top-k index outputs whose ordering is implementation-dependent — checks the paired value tensor matches after sort, tolerating legal tie-break swaps. |
 | `ratio_allclose(atol, rtol, max_error_ratio=0.005)` | Quantized kernels where a small outlier fraction may exceed per-point `atol + rtol·|expected|`. NaN/Inf always fail. |
 | `ratio_reldiff(diff_thd, pct_thd, max_diff_hd=inf)` | cann-recipes-infer-style relative-diff check: per-point `rdiff > diff_thd` bad-point ratio capped by `pct_thd`, with optional single-point `max_diff_hd` cap. |
-| `mapped_pool_ratio_allclose(mapping_name, mapping_shape=…, block_size=…)` | A block-major paged pool (KV cache, compressor state) written through a slot mapping: allocator-mapped rows take the `ratio_allclose` check, every unmapped row must stay exactly equal to its golden snapshot, so a write outside the mapping fails. `leading_rank_axis=True` for a `[ranks, blocks, block_size, …]` pool. |
-| `mapped_pool_ratio_reldiff(mapping_name, mapping_shape=…, block_size=…)` | The same mapped-row and exact-unmapped checks using `ratio_reldiff`, for composed quantized paths. |
+| `rowwise_ratio_reldiff(output_name, row_shape=…, mapping_name=…)` | Applies `ratio_reldiff` independently to every active logical row, so one corrupt row cannot be diluted by correct rows. Without a mapping all rows are active; with a mapping, non-negative entries are active, `-1` is the only inactive sentinel, and inactive rows must remain exactly equal to Golden. Set `expected_active_rows` to freeze coverage and emit its metric; set `aggregate_pct_thd` to retain a separate tensor-wide bad-point budget. |
+| `mapped_pool_ratio_allclose(mapping_name, mapping_shape=…, block_size=…)` | A block-major paged pool (KV cache, compressor state) written through a slot mapping: allocator-mapped rows take the `ratio_allclose` check, every unmapped row must stay exactly equal to its golden snapshot, so a write outside the mapping fails. `leading_rank_axis=True` for a `[ranks, blocks, block_size, …]` pool. Set `expected_mapped_rows` when an empty or partial mapping must fail. |
+| `mapped_pool_ratio_reldiff(mapping_name, mapping_shape=…, block_size=…)` | The same mapped-row, exact-unmapped, and optional `expected_mapped_rows` checks using `ratio_reldiff`, for composed quantized paths. Set `compare_mapped_rows_individually=True` to give each mapped physical row its own bad-point budget. |
 
-A sixth helper, `error_distribution()`, is a **measurement** rather than a gate
+A separate helper, `error_distribution()`, is a **measurement** rather than a gate
 — it always passes and prints the error shape. See
 [Precision Tuning](../debug-and-tune/precision-tuning.md).
 
-Both ratio comparators also take `valid_rows` / `valid_axis` / `zero_tail`:
+The two whole-tensor ratio comparators also take `valid_rows` / `valid_axis` / `zero_tail`:
 `valid_rows=n` compares only the leading `n` entries along `valid_axis`
 (default axis 0), so a packed buffer's inactive token tail cannot dilute the
 error ratio, and `zero_tail=True` additionally fails the check when that

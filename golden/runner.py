@@ -26,6 +26,16 @@ from .spec import ScalarSpec, TensorSpec
 from .validation import validate_golden
 
 
+DeviceOutputCapture = Callable[
+    [dict[str, torch.Tensor], dict[str, torch.Tensor]],
+    None,
+]
+
+
+class _DeviceOutputCaptureError(RuntimeError):
+    """Wrap an output-capture callback failure for conversion to ``RunResult``."""
+
+
 @dataclass
 class RunResult:
     """Result of a :func:`run` invocation."""
@@ -311,6 +321,7 @@ def _prepare_inputs(
     work_dir: Path,
     save_data: bool = True,
     need_snapshot: bool = True,
+    share_readonly_golden_inputs: bool = False,
 ) -> tuple[dict[str, torch.Tensor], dict[str, ScalarSpec], dict[str, torch.Tensor]]:
     """Build inputs for the runtime stage.
 
@@ -323,6 +334,8 @@ def _prepare_inputs(
     (e.g. full-model weights) and golden replay is not needed. Set
     *need_snapshot* False as well (no ``golden_fn``) to skip the in-memory
     input clone entirely — halves peak host RAM on full-model-weight runs.
+    With *share_readonly_golden_inputs*, pure inputs are shared with a trusted
+    live Golden while initialized outputs (in/out state) remain cloned.
 
     Raises ``ValueError`` on missing files or scalar dtype mismatch.
     """
@@ -334,7 +347,11 @@ def _prepare_inputs(
         input_snapshot = {}
         if need_snapshot or save_data:
             input_snapshot = {
-                spec.name: tensors[spec.name].clone()
+                spec.name: (
+                    tensors[spec.name]
+                    if share_readonly_golden_inputs and not spec.is_output
+                    else tensors[spec.name].clone()
+                )
                 for spec in tensor_specs
                 if spec.is_input
             }
@@ -1093,6 +1110,7 @@ def _run_l3_resident(
     atol: float,
     compare_fn: dict[str, Callable],
     benchmark_enabled: bool | None = None,
+    device_output_capture: DeviceOutputCapture | None = None,
 ) -> Any:
     """Dispatch an L3 program keeping resident weights device-resident.
 
@@ -1114,8 +1132,10 @@ def _run_l3_resident(
     time), then parse the markers into a :class:`BenchmarkStats`.
 
     Validation runs on the first dispatch and propagates its ``AssertionError``;
-    a failure in the benchmark rounds that follow is logged, not raised. Returns
-    a :class:`BenchmarkStats` or ``None``.
+    a failure in the benchmark rounds that follow is logged, not raised. A
+    configured *device_output_capture* runs synchronously once, after that
+    validation and resident-output readback succeed but before any remaining
+    benchmark dispatches. Returns a :class:`BenchmarkStats` or ``None``.
     """
     try:
         from pypto.ir.distributed_compiled_program import DistributedCompiledProgram
@@ -1221,7 +1241,10 @@ def _run_l3_resident(
                     except Exception as e:  # noqa: BLE001 — best-effort cleanup
                         print(f"[RUN] warning: failed to free resident tensor {name}: {e}", flush=True)
 
+    capture_pending = device_output_capture
+
     def _validate_once(rt: Any, resident_handles: list[tuple[str, Any, bool, int]]) -> None:
+        nonlocal capture_pending
         if golden_outputs is None:
             return
         # A resident spec that is also an output is a read-write state buffer
@@ -1239,9 +1262,11 @@ def _run_l3_resident(
             atol,
             compare_fn,
             scalar_specs_eff,
+            device_output_capture=capture_pending,
         )
+        capture_pending = None
 
-    # Non-benchmark: one validation dispatch, no capture.
+    # Non-benchmark: one validation dispatch, without trace capture.
     if not bench:
         def _plain_dispatch(rt: Any, ordered_args: Callable, resident_handles: list) -> None:
             rt(*ordered_args(None), config=run_config)
@@ -1368,6 +1393,7 @@ def _compute_golden(
     data_dir: Path | None,
     golden_fn: Callable | None,
     save_data: bool = True,
+    share_readonly_golden_inputs: bool = False,
 ) -> dict[str, torch.Tensor]:
     """Produce golden output tensors for validation.
 
@@ -1375,7 +1401,8 @@ def _compute_golden(
     *golden_fn* on a scratch dict (input tensors cloned from *input_snapshot*,
     pure outputs from their own ``init_value``) and, when
     *save_data* is True, persist results into
-    ``{work_dir}/data/out/``.
+    ``{work_dir}/data/out/``. The low-memory sharing option aliases pure
+    inputs into that scratch dict and is therefore only for trusted Goldens.
     """
     with _Stage("compute golden"):
         if data_dir is not None:
@@ -1384,14 +1411,33 @@ def _compute_golden(
             return _load_tensors(data_dir, "out", output_names)
 
         scratch: dict[str, Any] = {}
+        readonly_versions: dict[str, int] = {}
         for spec in specs:
             if isinstance(spec, ScalarSpec):
                 scratch[spec.name] = scalar_specs_eff[spec.name].to_python()
-            elif spec.is_input:
-                scratch[spec.name] = input_snapshot[spec.name].clone()
-            else:
+            elif not spec.is_input:
                 scratch[spec.name] = spec.create_tensor()
+            elif share_readonly_golden_inputs and not spec.is_output:
+                scratch[spec.name] = input_snapshot[spec.name]
+                try:
+                    readonly_versions[spec.name] = input_snapshot[spec.name]._version
+                except RuntimeError as error:
+                    raise ValueError(
+                        "share_readonly_golden_inputs does not support "
+                        f"inference tensor {spec.name!r}"
+                    ) from error
+            else:
+                scratch[spec.name] = input_snapshot[spec.name].clone()
         golden_fn(scratch)
+        mutated_inputs = sorted(
+            name
+            for name, version in readonly_versions.items()
+            if input_snapshot[name]._version != version
+        )
+        if mutated_inputs:
+            raise ValueError(
+                f"golden_fn mutated shared read-only inputs: {mutated_inputs}"
+            )
         golden_outputs = {spec.name: scratch[spec.name] for spec in tensor_specs if spec.is_output}
         if save_data:
             _save_tensors(work_dir / "data" / "out", golden_outputs)
@@ -1406,21 +1452,22 @@ def _validate(
     atol: float,
     compare_fn: dict[str, Callable],
     scalar_specs_eff: dict[str, ScalarSpec] | None = None,
+    device_output_capture: DeviceOutputCapture | None = None,
 ) -> None:
-    """Compare device outputs against *golden_outputs*. Raises ``AssertionError``."""
-    with _Stage("validate"):
-        device_outputs = {spec.name: tensors[spec.name] for spec in tensor_specs if spec.is_output}
-        validation_inputs = {
-            spec.name: tensors[spec.name]
-            for spec in tensor_specs
-            if not spec.is_output
+    """Validate outputs, then synchronously pass them to an optional capture."""
+    device_outputs = {spec.name: tensors[spec.name] for spec in tensor_specs if spec.is_output}
+    validation_inputs = {
+        spec.name: tensors[spec.name]
+        for spec in tensor_specs
+        if not spec.is_output
+    }
+    validation_inputs.update(
+        {
+            name: spec.value
+            for name, spec in (scalar_specs_eff or {}).items()
         }
-        validation_inputs.update(
-            {
-                name: spec.value
-                for name, spec in (scalar_specs_eff or {}).items()
-            }
-        )
+    )
+    with _Stage("validate"):
         validate_golden(
             device_outputs, golden_outputs,
             rtol=rtol,
@@ -1428,6 +1475,15 @@ def _validate(
             compare_fn=compare_fn,
             inputs=validation_inputs,
         )
+    if device_output_capture is not None:
+        with _Stage("capture device outputs"):
+            try:
+                device_output_capture(device_outputs, validation_inputs)
+            except Exception as error:  # noqa: BLE001 - user callback boundary
+                raise _DeviceOutputCaptureError(
+                    "device_output_capture failed "
+                    f"({type(error).__name__}): {error}"
+                ) from error
 
 
 def _run_pipeline(
@@ -1445,8 +1501,10 @@ def _run_pipeline(
     compile_only: bool,
     runtime_dir: str | None,
     save_data: bool,
+    share_readonly_golden_inputs: bool,
+    device_output_capture: DeviceOutputCapture | None,
 ) -> RunResult:
-    """Shared body of :func:`run` and :func:`run`.
+    """Shared body of the two entry-point flavours.
 
     *prologue* runs entry-specific spec validation, may raise ``ValueError``,
     and returns whatever state its *compile_step* needs. *compile_step* then
@@ -1483,6 +1541,17 @@ def _run_pipeline(
             golden outputs to ``{work_dir}/data/out/`` for later replay via
             *golden_data*. Off by default; validation still runs against the
             in-memory golden.
+        share_readonly_golden_inputs: Share pure inputs between the runtime
+            tensors and the golden scratch instead of cloning them. In/out
+            tensors remain isolated. A normal tracked in-place write is
+            rejected after the Golden returns, but PyTorch's version counter
+            is not a security boundary; use this only with a trusted reference
+            whose pure inputs are read-only. Defaults to False.
+        device_output_capture: Optional ``callback(device_outputs,
+            validation_inputs)`` invoked synchronously only after Numeric Golden
+            validation succeeds. The mappings contain live tensors and are not
+            cloned; copy or persist any needed values before the callback
+            returns. Validation-skipped and compile-only runs do not invoke it.
 
     Returns:
         :class:`RunResult`.
@@ -1512,6 +1581,14 @@ def _run_pipeline(
     try:
         _validate_unique_spec_names(specs)
         _validate_stepped_swimlane(scalar_specs, runtime_cfg)
+        if not compile_only and share_readonly_golden_inputs and data_dir is not None:
+            raise ValueError(
+                "share_readonly_golden_inputs is incompatible with golden_data"
+            )
+        if not compile_only and share_readonly_golden_inputs and golden_fn is None:
+            raise ValueError(
+                "share_readonly_golden_inputs requires a live golden_fn"
+            )
         if prologue is not None:
             compile_state = prologue(scalar_specs, data_dir)
     except ValueError as e:
@@ -1550,6 +1627,7 @@ def _run_pipeline(
             tensors, scalar_specs_eff, input_snapshot = _prepare_inputs(
                 specs, tensor_specs, scalar_specs, data_dir, work_dir, save_data,
                 need_snapshot=golden_fn is not None,
+                share_readonly_golden_inputs=share_readonly_golden_inputs,
             )
     except ValueError as e:
         return _fail(str(e))
@@ -1559,7 +1637,9 @@ def _run_pipeline(
         golden_outputs = _compute_golden(
             specs, tensor_specs, scalar_specs_eff, input_snapshot,
             work_dir, data_dir, golden_fn, save_data,
+            share_readonly_golden_inputs=share_readonly_golden_inputs,
         )
+    del input_snapshot
 
     benchmark_enabled = _bench_enabled()
     if benchmark_enabled and runtime_dir is not None:
@@ -1590,8 +1670,9 @@ def _run_pipeline(
                     compiled, specs, tensors, scalar_specs_eff,
                     runtime_cfg, golden_outputs, rtol, atol, compare_fn,
                     benchmark_enabled=benchmark_enabled,
+                    device_output_capture=device_output_capture,
                 )
-            except (AssertionError, ValueError) as e:
+            except (AssertionError, ValueError, _DeviceOutputCaptureError) as e:
                 return _fail(str(e))
         return _pass(bench)
 
@@ -1611,8 +1692,9 @@ def _run_pipeline(
             _validate(
                 tensor_specs, tensors, golden_outputs,
                 rtol, atol, compare_fn, scalar_specs_eff,
+                device_output_capture=device_output_capture,
             )
-        except AssertionError as e:
+        except (AssertionError, _DeviceOutputCaptureError) as e:
             return _fail(str(e))
 
     # Benchmark (L2 via _run_benchmark, non-resident L3 via _run_benchmark_l3).
@@ -1741,6 +1823,8 @@ def run(
     compile_only: bool = False,
     runtime_dir: str | None = None,
     save_data: bool = False,
+    share_readonly_golden_inputs: bool = False,
+    device_output_capture: DeviceOutputCapture | None = None,
 ) -> RunResult:
     """Compile *fn*, run it on device, and validate against golden.
 
@@ -1785,6 +1869,17 @@ def run(
             Defaults to False, skipping the on-disk ``.pt`` snapshot;
             validation still runs against the in-memory golden. Enable it
             when you need to replay the exact inputs/outputs later.
+        share_readonly_golden_inputs: Share pure inputs between the runtime
+            tensors and the golden scratch instead of cloning them. In/out
+            tensors remain isolated. A normal tracked in-place write is
+            rejected after the Golden returns, but PyTorch's version counter
+            is not a security boundary; use this only with a trusted reference
+            whose pure inputs are read-only. Defaults to False.
+        device_output_capture: Optional ``callback(device_outputs,
+            validation_inputs)`` invoked synchronously only after Numeric Golden
+            validation succeeds. The mappings contain live tensors and are not
+            cloned; copy or persist any needed values before the callback
+            returns. Validation-skipped and compile-only runs do not invoke it.
 
     Returns:
         :class:`RunResult`.
@@ -1797,4 +1892,5 @@ def run(
         specs, compile_step, compile_label, prologue,
         golden_fn, golden_data, compile_cfg, runtime_cfg,
         rtol, atol, compare_fn, compile_only, runtime_dir, save_data,
+        share_readonly_golden_inputs, device_output_capture,
     )

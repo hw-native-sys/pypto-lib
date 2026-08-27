@@ -146,14 +146,48 @@ torch.allclose(actual, expected, rtol=rtol, atol=atol)
 Choose tolerances from the numerical contract of the kernel, not simply to
 make a failing result pass. For output types that need a different correctness
 rule, pass a comparator for that output name through `compare_fn`.
-`golden.validation` ships four ready-made gates — `topk_pair_compare`,
-`ratio_allclose`, `ratio_reldiff`, and `mapped_pool_ratio_allclose` for a
-slot-mapped paged pool — plus the `error_distribution` measurement; see
+`golden.validation` ships six ready-made gates — `topk_pair_compare`,
+`ratio_allclose`, `ratio_reldiff`, `rowwise_ratio_reldiff`,
+`mapped_pool_ratio_allclose`, and `mapped_pool_ratio_reldiff` for slot-mapped
+paged pools — plus the `error_distribution` measurement; see
 [Compile and Runtime Workflow](compile-runtime-workflow.md#5-validate).
+
+Use `rowwise_ratio_reldiff` when independent rank/token rows must each satisfy
+a numerical budget. Its optional `aggregate_pct_thd` adds a stricter
+tensor-wide budget without weakening the per-row corruption guard.
 
 If neither `golden_fn` nor `golden_data` is provided, the runtime can still
 execute, but validation is explicitly reported as skipped. Such a run is not
 a correctness check.
+
+## Low-memory live Golden
+
+Full-model fixtures can be too large to clone once for the runtime and again
+for the live Torch reference. `run` and `run_jit` provide an opt-in path for a
+trusted Golden that treats every pure input as read-only while keeping in/out
+state isolated:
+
+```python
+result = run_jit(
+    fn=kernel,
+    specs=specs,
+    golden_fn=golden_fn,
+    share_readonly_golden_inputs=True,
+)
+```
+
+Pure inputs then share storage between the runtime tensor dictionary and the
+Golden scratch dictionary. Initialized outputs, such as KV caches, still use a
+separate snapshot so Golden updates cannot alter the runtime's initial state.
+The harness checks PyTorch version counters and rejects ordinary tracked
+in-place writes, but this is a bug detector rather than a security boundary:
+`.data`, NumPy aliases, or external code can bypass that counter. Enable the
+option only for a reviewed Golden that does not mutate pure inputs.
+
+This option requires a live `golden_fn` and is incompatible with
+`golden_data`. A frozen snapshot already loads its expected outputs without
+running the live reference. Inference tensors are also unsupported because
+they do not expose the version counter used by the guard.
 
 ## Handle RunResult
 

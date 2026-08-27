@@ -20,8 +20,8 @@ T = MOE_TOKENS
 D = M.hidden_size
 NORM_EPS = M.rms_norm_eps
 # Routing space: every rank routes over the full global expert set so dispatch
-# can fan tokens across ranks. moe.py shrinks config.FLASH.n_routed_experts to
-# 32*EP before importing this module, so N_EXPERTS follows the active EP world.
+# can fan tokens across ranks. moe.py sets config.FLASH.n_routed_experts from
+# the active EP topology before importing this module.
 N_EXPERTS = M.n_routed_experts
 TOPK = M.num_experts_per_tok
 ROUTE_SCALE = M.routed_scaling_factor

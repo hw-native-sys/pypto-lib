@@ -402,6 +402,109 @@ class TestGoldenFnPath:
         # The golden_fn copy must not share storage with the device tensor.
         assert captured["x_ptr"] != device_x_ptrs["x"]
 
+    def test_golden_fn_can_share_readonly_inputs_but_not_inout_state(
+        self, three_kinds_specs, build_dir,
+    ):
+        """The opt-in low-memory path shares pure inputs and isolates in/out."""
+
+        captured = {}
+
+        def golden_fn(tensors):
+            captured["golden_x_ptr"] = tensors["x"].data_ptr()
+            captured["golden_state_ptr"] = tensors["state"].data_ptr()
+            tensors["y"][:] = tensors["x"] + 1
+            tensors["state"][:] = tensors["state"] + 100
+
+        def fake_execute(work_dir, tensors, **_kwargs):
+            captured["device_x_ptr"] = tensors[0].data_ptr()
+            captured["device_state_ptr"] = tensors[2].data_ptr()
+            tensors[1][:] = tensors[0] + 1
+            tensors[2][:] = tensors[2] + 100
+
+        fake = _FakeCompiled(build_dir)
+        with patch("pypto.ir.compile", return_value=fake), \
+             patch("pypto.runtime.execute_compiled", side_effect=fake_execute):
+            result = run(
+                fn=object(),
+                specs=three_kinds_specs,
+                golden_fn=golden_fn,
+                share_readonly_golden_inputs=True,
+            )
+
+        assert result.passed, result.error
+        assert captured["golden_x_ptr"] == captured["device_x_ptr"]
+        assert captured["golden_state_ptr"] != captured["device_state_ptr"]
+
+    def test_shared_readonly_input_mutation_is_rejected(
+        self, three_kinds_specs, build_dir,
+    ):
+        """A normal tracked in-place write is caught after Golden execution."""
+
+        def golden_fn(tensors):
+            tensors["x"].add_(1)
+            tensors["y"][:] = tensors["x"] + 1
+            tensors["state"][:] = tensors["state"] + 100
+
+        fake = _FakeCompiled(build_dir)
+        with patch("pypto.ir.compile", return_value=fake), \
+             patch("pypto.runtime.execute_compiled"):
+            with pytest.raises(
+                ValueError,
+                match="golden_fn mutated shared read-only inputs: .*x",
+            ):
+                run(
+                    fn=object(),
+                    specs=three_kinds_specs,
+                    golden_fn=golden_fn,
+                    share_readonly_golden_inputs=True,
+                )
+
+    def test_shared_inputs_reject_inference_tensors(self, build_dir):
+        """Inference tensors have no version counter for the mutation guard."""
+
+        def inference_input():
+            with torch.inference_mode():
+                return torch.ones(4)
+
+        specs = _stamped([
+            TensorSpec("x", [4], torch.float32, init_value=inference_input),
+            TensorSpec("y", [4], torch.float32),
+        ], {"x": "in", "y": "out"})
+        fake = _FakeCompiled(build_dir)
+        with patch("pypto.ir.compile", return_value=fake):
+            with pytest.raises(
+                ValueError,
+                match="does not support inference tensor 'x'",
+            ):
+                run(
+                    fn=object(),
+                    specs=specs,
+                    golden_fn=lambda tensors: tensors["y"].zero_(),
+                    share_readonly_golden_inputs=True,
+                )
+
+    def test_shared_inputs_require_a_live_golden(self, three_kinds_specs):
+        """The option cannot be combined with a skipped or replayed Golden."""
+        result = run(
+            fn=object(),
+            specs=three_kinds_specs,
+            share_readonly_golden_inputs=True,
+        )
+        assert not result.passed
+        assert result.error == "share_readonly_golden_inputs requires a live golden_fn"
+
+        result = run(
+            fn=object(),
+            specs=three_kinds_specs,
+            golden_fn=lambda _tensors: None,
+            golden_data="unused",
+            share_readonly_golden_inputs=True,
+        )
+        assert not result.passed
+        assert result.error == (
+            "share_readonly_golden_inputs is incompatible with golden_data"
+        )
+
     def test_golden_fn_mismatch_fails(self, three_kinds_specs, build_dir):
         """Device output diverges from golden_fn output → FAIL."""
 
@@ -513,6 +616,24 @@ class TestCompileOnly:
         # compile_only path must not persist anything under data/.
         assert not (build_dir / "data").exists()
 
+    @pytest.mark.parametrize("golden_data", [None, "unused"])
+    def test_compile_only_ignores_shared_input_runtime_contract(
+        self, three_kinds_specs, build_dir, golden_data,
+    ):
+        """Input sharing constraints do not apply when no tensors are created."""
+        fake = _FakeCompiled(build_dir)
+
+        with patch("pypto.ir.compile", return_value=fake):
+            result = run(
+                fn=object(),
+                specs=three_kinds_specs,
+                compile_only=True,
+                golden_data=golden_data,
+                share_readonly_golden_inputs=True,
+            )
+
+        assert result.passed, result.error
+
     def test_duplicate_specs_fail_before_compile(self):
         specs = [
             TensorSpec("duplicate", [1], torch.float32),
@@ -545,6 +666,51 @@ class TestCompileOnly:
 
 
 class TestJitCompilePath:
+    def test_shared_inputs_require_live_non_replayed_golden(self):
+        """The low-memory contract is enforced before JIT compilation."""
+        fn = types.SimpleNamespace(compile=MagicMock())
+        specs = [TensorSpec("x", [4], torch.float32)]
+
+        result = run(fn, specs, share_readonly_golden_inputs=True)
+        assert not result.passed
+        assert result.error == (
+            "share_readonly_golden_inputs requires a live golden_fn"
+        )
+
+        result = run(
+            fn,
+            specs,
+            golden_fn=lambda _tensors: None,
+            golden_data="unused",
+            share_readonly_golden_inputs=True,
+        )
+        assert not result.passed
+        assert result.error == (
+            "share_readonly_golden_inputs is incompatible with golden_data"
+        )
+        fn.compile.assert_not_called()
+
+    def test_compile_only_allows_sharing_with_cached_compile_scalar(self, tmp_path):
+        """A replayed scalar can specialize JIT while runtime sharing stays idle."""
+        cache = tmp_path / "cache"
+        _save_tensors(
+            cache / "in", {"num_tokens": torch.tensor(9, dtype=torch.int32)}
+        )
+        fn = types.SimpleNamespace(
+            compile=MagicMock(return_value=_FakeCompiled(_make_build_dir(tmp_path)))
+        )
+
+        result = run(
+            fn,
+            [ScalarSpec("num_tokens", torch.int32, 4)],
+            golden_data=str(cache),
+            compile_only=True,
+            share_readonly_golden_inputs=True,
+        )
+
+        assert result.passed, result.error
+        assert fn.compile.call_args.args == (9,)
+
     def test_marked_scalar_uses_signature_mode_and_runtime_marker(self, build_dir):
         compiled = _FakeCompiled(build_dir)
         fn = types.SimpleNamespace(compile=MagicMock(return_value=compiled))
@@ -1866,6 +2032,144 @@ def test_nonresident_validation_precedes_benchmark_mutation(
     assert result.bench == "BENCH"
 
 
+def _capture_entry(use_jit, compiled, **kwargs):
+    """Run *kwargs* through the JIT or the program entry of :func:`run`."""
+    if use_jit:
+        return run(types.SimpleNamespace(compile=MagicMock(return_value=compiled)), **kwargs)
+    return run(object(), **kwargs)
+
+
+@pytest.mark.parametrize("use_jit", [False, True])
+def test_nonresident_device_output_capture_follows_validation_and_precedes_benchmark(
+    tmp_path, monkeypatch, use_jit
+):
+    compiled = _FakeCompiled(tmp_path)
+    specs = _stamped([
+        TensorSpec("x", [1], torch.float32, init_value=torch.ones),
+        TensorSpec("y", [1], torch.float32),
+    ], {"x": "in", "y": "out"})
+    events = []
+    captured = {}
+    monkeypatch.setenv("PYPTO_BENCH", "1")
+
+    def _dispatch(_compiled, _specs, tensors, _scalars, _runtime_cfg):
+        tensors["y"].fill_(3.0)
+        return True
+
+    def _validate(actual, expected, **kwargs):
+        torch.testing.assert_close(actual["y"], expected["y"])
+        assert set(kwargs["inputs"]) == {"x"}
+        events.append("validate")
+
+    def _capture(outputs, validation_inputs):
+        events.append("capture")
+        captured["y"] = outputs["y"].clone()
+        captured["x"] = validation_inputs["x"].clone()
+
+    def _benchmark(_compiled, _specs, tensors, *_args):
+        events.append("benchmark")
+        tensors["y"].fill_(9.0)
+        return "BENCH"
+
+    with (
+        patch("golden.runner._try_l3_dispatch", side_effect=_dispatch),
+        patch("golden.runner._is_l3", return_value=True),
+        patch("golden.runner._run_benchmark_l3", side_effect=_benchmark),
+        patch("golden.runner.validate_golden", side_effect=_validate),
+        patch("pypto.ir.compile", return_value=compiled),
+    ):
+        result = _capture_entry(
+            use_jit, compiled,
+            specs=specs,
+            golden_fn=lambda values: values["y"].fill_(3.0),
+            device_output_capture=_capture,
+        )
+
+    assert result.passed, result.error
+    assert result.bench == "BENCH"
+    assert events == ["validate", "capture", "benchmark"]
+    torch.testing.assert_close(captured["y"], torch.tensor([3.0]))
+    torch.testing.assert_close(captured["x"], torch.tensor([1.0]))
+
+
+@pytest.mark.parametrize("use_jit", [False, True])
+def test_device_output_capture_is_skipped_when_numeric_validation_fails(
+    tmp_path, use_jit
+):
+    compiled = _FakeCompiled(tmp_path)
+    specs = _stamped([TensorSpec("y", [1], torch.float32)], {"y": "out"})
+    capture = MagicMock()
+
+    def _dispatch(_compiled, _specs, tensors, _scalars, _runtime_cfg):
+        tensors["y"].fill_(1.0)
+        return True
+
+    with (
+        patch("golden.runner._try_l3_dispatch", side_effect=_dispatch),
+        patch("pypto.ir.compile", return_value=compiled),
+    ):
+        result = _capture_entry(
+            use_jit, compiled,
+            specs=specs,
+            golden_fn=lambda values: values["y"].zero_(),
+            device_output_capture=capture,
+        )
+
+    assert not result.passed
+    assert "does not match golden" in (result.error or "")
+    capture.assert_not_called()
+
+
+@pytest.mark.parametrize("use_jit", [False, True])
+def test_device_output_capture_is_skipped_without_numeric_golden(tmp_path, use_jit):
+    compiled = _FakeCompiled(tmp_path)
+    specs = _stamped([TensorSpec("y", [1], torch.float32)], {"y": "out"})
+    capture = MagicMock()
+
+    with (
+        patch("golden.runner._try_l3_dispatch", return_value=True),
+        patch("pypto.ir.compile", return_value=compiled),
+    ):
+        result = _capture_entry(
+            use_jit, compiled, specs=specs, device_output_capture=capture,
+        )
+
+    assert result.passed, result.error
+    capture.assert_not_called()
+
+
+@pytest.mark.parametrize("use_jit", [False, True])
+def test_device_output_capture_failure_returns_failed_result_before_benchmark(
+    tmp_path, monkeypatch, use_jit
+):
+    compiled = _FakeCompiled(tmp_path)
+    specs = _stamped([TensorSpec("y", [1], torch.float32)], {"y": "out"})
+    benchmark = MagicMock()
+    monkeypatch.setenv("PYPTO_BENCH", "1")
+
+    def _capture(_outputs, _validation_inputs):
+        raise OSError("capture disk is full")
+
+    with (
+        patch("golden.runner._try_l3_dispatch", return_value=True),
+        patch("golden.runner._is_l3", return_value=True),
+        patch("golden.runner._run_benchmark_l3", benchmark),
+        patch("pypto.ir.compile", return_value=compiled),
+    ):
+        result = _capture_entry(
+            use_jit, compiled,
+            specs=specs,
+            golden_fn=lambda values: values["y"].zero_(),
+            device_output_capture=_capture,
+        )
+
+    assert not result.passed
+    assert result.error == (
+        "device_output_capture failed (OSError): capture disk is full"
+    )
+    benchmark.assert_not_called()
+
+
 @pytest.mark.parametrize("l3", [False, True])
 def test_benchmark_propagates_device_runtime_error(monkeypatch, l3):
     def _benchmark(*_args, **_kwargs):
@@ -2304,6 +2608,57 @@ class TestResidentPath:
 
         assert len(rt.payloads("readback")) == 1
         assert torch.equal(validated["kv"], torch.full((2, 4), 7.0))
+
+    def test_run_l3_resident_captures_after_readback_and_before_benchmark(
+        self, monkeypatch,
+    ):
+        """The capture sees the read-back device state, once, before the
+        remaining benchmark dispatches."""
+        state_handle = object()
+        state_spec = TensorSpec(
+            "state", [2, 4], torch.float32, init_value=torch.zeros,
+            resident="stacked",
+        )
+        _stamped([state_spec], {"state": "inout"})
+        epoch_spec = ScalarSpec("epoch", torch.int32, 0, benchmark_step=43)
+        readback = torch.full((2, 4), 7.0)
+        rt = _ResidentRT(stacked_handle=state_handle, readback=readback)
+        events = []
+
+        monkeypatch.setenv("PYPTO_BENCH", "1")
+        monkeypatch.setenv("PYPTO_BENCH_ROUNDS", "3")
+        monkeypatch.setenv("PYPTO_BENCH_WARMUP", "2")
+        _stub_l3_helpers(monkeypatch)
+
+        def _capture(outputs, validation_inputs):
+            assert torch.equal(outputs["state"], readback)
+            assert validation_inputs["epoch"].item() == 0
+            events.append(("capture", outputs["state"].clone()))
+
+        dcp = _resident_dcp(rt)
+        mods = _resident_modules(
+            dcp,
+            bench_capture=_NullCapture,
+            parse_stats=lambda *_a, **_k: types.SimpleNamespace(host_wall_us=[]),
+        )
+        with patch.dict(sys.modules, mods):
+            result = _run_l3_resident(
+                compiled=dcp(), specs=[state_spec, epoch_spec],
+                tensors={"state": torch.zeros(2, 4)},
+                scalar_specs_eff={"epoch": epoch_spec},
+                runtime_cfg={"platform": "a2a3"},
+                golden_outputs={"state": readback.clone()},
+                rtol=1e-5, atol=1e-5, compare_fn={},
+                device_output_capture=_capture,
+            )
+
+        assert result is None
+        # One readback and one capture, both on the validation dispatch.
+        assert rt.kinds() == [
+            "alloc_stacked", "dispatch", "readback",
+            *["dispatch"] * 4, "free_stacked",
+        ]
+        assert [kind for kind, _ in events] == ["capture"]
 
     def test_resident_on_non_l3_fails_cleanly(self, build_dir):
         """A resident spec against a non-L3 compiled program fails via RunResult."""
