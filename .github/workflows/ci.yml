@@ -191,9 +191,14 @@ jobs:
         shell: bash
         env:
           PYTHONPATH: ${{ github.workspace }}/checkout
-          PTO2_RING_DEP_POOL: 16384
-          PTO2_RING_TASK_WINDOW: 16384
-          PTO2_RING_HEAP: 1073741824
+          # NOTE: PTO2_RING_DEP_POOL / PTO2_RING_TASK_WINDOW / PTO2_RING_HEAP
+          # used to be set here. simpler #1980 retired them -- ring sizing is
+          # per task now, through RunConfig -> CallConfig.runtime_env -- so the
+          # runtime only logged "is no longer read" and every run silently fell
+          # back to the 256 MiB/ring compile default. Worse, this block shadowed
+          # the per-kernel os.environ.setdefault() that the kernels needing more
+          # relied on. A kernel that needs above-default rings now says so in
+          # its own runtime_cfg (see models/deepseek_v4_pro/prefill_attention_*).
         run: |
           source activate.sh
           set +e
@@ -288,12 +293,17 @@ jobs:
           pip-cache-name: pip-a2a3
           toolchain: bundle
 
+      # NOTE: this step used to carry an env: block setting PTO2_RING_DEP_POOL /
+      # PTO2_RING_TASK_WINDOW / PTO2_RING_HEAP. simpler #1980 retired them --
+      # ring sizing is per task now, through RunConfig -> CallConfig.runtime_env
+      # -- so the runtime only logged "is no longer read" and every run silently
+      # fell back to the 256 MiB/ring compile default. Worse, the block shadowed
+      # the per-kernel os.environ.setdefault() that the kernels needing more
+      # relied on. A kernel that needs above-default rings now says so in its own
+      # runtime_cfg (see models/deepseek_v4_pro/prefill_attention_*). They were
+      # the only entries here, so the env: key went with them.
       - name: Run a2a3 tests (via task-submit)
         shell: bash
-        env:
-          PTO2_RING_DEP_POOL: 16384
-          PTO2_RING_TASK_WINDOW: 16384
-          PTO2_RING_HEAP: 1073741824
         run: |
           source activate.sh
           set +e

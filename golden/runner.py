@@ -123,15 +123,40 @@ _DFX_FLAG_KEYS = (
     "enable_scope_stats",
 )
 
+# Per-task ring-sizing overrides. These are ``RunConfig`` fields, not
+# ``execute_compiled`` kwargs: simpler #1980 retired the process-wide
+# ``PTO2_RING_TASK_WINDOW`` / ``PTO2_RING_HEAP`` / ``PTO2_RING_DEP_POOL`` env
+# vars, so a kernel that needs more than the compile-time default (256 MiB per
+# ring) has to say so per dispatch. ``execute_compiled`` has no ring surface,
+# so their presence routes the L2 dispatch through the compiled program's own
+# call path, which builds the ``CallConfig`` from a ``RunConfig``.
+_RING_OVERRIDE_KEYS = (
+    "ring_task_window",
+    "ring_heap",
+    "ring_dep_pool",
+)
+
+
+def _ring_overrides(runtime: dict[str, Any]) -> dict[str, Any]:
+    """The ring-sizing keys present in *runtime*, unset ones omitted."""
+    return {k: runtime[k] for k in _RING_OVERRIDE_KEYS if runtime.get(k) is not None}
+
+
 
 def _execute_compiled_kwargs(runtime: dict[str, Any]) -> dict[str, Any]:
     """Translate user-facing ``runtime_cfg`` into ``execute_compiled`` kwargs.
 
-    The five DFX flags get bundled into a single ``dfx: _DfxOpts``; all other
-    keys pass through unfiltered, so ``execute_compiled`` raises ``TypeError``
-    on unknown keys rather than us silently dropping them.
+    The five DFX flags get bundled into a single ``dfx: _DfxOpts``, and the ring
+    overrides are dropped (they have no ``execute_compiled`` surface and are
+    applied by :func:`_execute_via_runner` on the ChipWorker path instead). All
+    other keys pass through unfiltered, so ``execute_compiled`` raises
+    ``TypeError`` on unknown keys rather than us silently dropping them.
     """
-    out: dict[str, Any] = {k: v for k, v in runtime.items() if k not in _DFX_FLAG_KEYS}
+    out: dict[str, Any] = {
+        k: v
+        for k, v in runtime.items()
+        if k not in _DFX_FLAG_KEYS and k not in _RING_OVERRIDE_KEYS
+    }
     dfx_flags = {k: runtime[k] for k in _DFX_FLAG_KEYS if runtime.get(k)}
     if dfx_flags:
         try:
@@ -378,14 +403,50 @@ def _execute_via_runner(
     tensors: dict[str, torch.Tensor],
     scalar_specs_eff: dict[str, ScalarSpec],
     runtime_cfg: dict[str, Any],
+    compiled: Any = None,
 ) -> None:
-    """Reorder args to orchestration param order and dispatch via ``execute_compiled``."""
+    """Reorder args to orchestration param order and dispatch the L2 program.
+
+    Normally that is ``execute_compiled``. When *runtime_cfg* carries ring
+    sizing (:data:`_RING_OVERRIDE_KEYS`) it cannot be: ``execute_compiled``
+    builds its own ``CallConfig`` and has no ring surface, so the request would
+    be silently dropped and the kernel would deadlock on the default rings.
+    Dispatch through an explicit ``ChipWorker`` instead: that is the one L2 route
+    that folds the ``RunConfig`` into the ``CallConfig`` the runtime sees
+    (``ChipWorker.run`` -> ``compiled.build_call_config`` -> ring overrides).
+    Calling ``compiled(*args, config=rc)`` does NOT work — ``_invoke_compiled``
+    forwards only platform / device_id / dfx / aicpu_thread_num to
+    ``execute_compiled`` and drops the ring fields.
+
+    ``_validate_compiled_spec_abi`` has already asserted that the L2 compiled
+    parameter order equals the spec order, so *ordered* is a valid call order
+    for both routes.
+    """
     from pypto.runtime import execute_compiled
 
     ordered: list[Any] = [
         tensors[s.name] if isinstance(s, TensorSpec) else scalar_specs_eff[s.name].to_ctypes()
         for s in specs
     ]
+    ring = _ring_overrides(runtime_cfg)
+    if ring:
+        if compiled is None:
+            raise ValueError(
+                f"runtime_cfg requests ring sizing {sorted(ring)}, which needs the "
+                "compiled program to apply; this dispatch has only a runtime dir "
+                "(runtime_only replay). Re-run without runtime_dir, or drop the "
+                "ring override."
+            )
+        from pypto.runtime import ChipWorker
+
+        rc = _pypto_run_config(runtime_cfg)
+        with ChipWorker(
+            rc,
+            runtime=compiled.runtime_name,
+            enable_sdma=bool(compiled.runtime_config.get("enable_sdma", False)),
+        ) as worker:
+            worker.run(compiled, *ordered, config=rc)
+        return
     execute_compiled(work_dir, ordered, **_execute_compiled_kwargs(runtime_cfg))
 
 
@@ -531,15 +592,27 @@ def _run_benchmark(
         tensors[s.name] if isinstance(s, TensorSpec) else scalar_specs_eff[s.name].to_ctypes()
         for s in specs
     ]
-    platform = runtime_cfg.get("platform")
-    device_id = runtime_cfg.get("device_id")
+    # `benchmark` takes platform/device_id OR a full RunConfig, never both. The
+    # plain form is enough unless this kernel needs ring sizing: the benchmark
+    # stage is a second dispatch, so leaving it on the default rings would move
+    # a HEAP_RING_DEADLOCK from the validate dispatch to this one rather than
+    # fixing it (the daily jobs run with PYPTO_BENCH=1).
+    ring = _ring_overrides(runtime_cfg)
+    bench_kwargs: dict[str, Any] = (
+        {"config": _pypto_run_config(runtime_cfg)}
+        if ring
+        else {
+            "platform": runtime_cfg.get("platform"),
+            "device_id": runtime_cfg.get("device_id"),
+        }
+    )
     stats = None
     with _Stage("benchmark"):
         try:
             stats = benchmark(
                 compiled, ordered,
                 rounds=rounds, warmup=warmup,
-                platform=platform, device_id=device_id,
+                **bench_kwargs,
             )
         except RuntimeError as e:
             if not _benchmark_unavailable(e):
@@ -801,7 +874,7 @@ def _run_benchmark_l3(
             stats = benchmark(
                 compiled, ordered,
                 rounds=rounds, warmup=warmup,
-                config=_l3_run_config(runtime_cfg),
+                config=_pypto_run_config(runtime_cfg),
                 persistent=True,
                 reset_persistent_windows=False,
             )
@@ -840,7 +913,7 @@ def _try_l3_dispatch(
         return False
 
     ordered = _l3_ordered_args(compiled, specs, tensors, scalar_specs_eff)
-    run_config = _l3_run_config(runtime_cfg)
+    run_config = _pypto_run_config(runtime_cfg)
     compiled(*ordered, config=run_config)
     return True
 
@@ -1050,12 +1123,13 @@ def _alloc_empty_stacked_tensor(rt: Any, spec: TensorSpec) -> Any:
         raise
 
 
-def _l3_run_config(runtime_cfg: dict[str, Any]) -> Any:
-    """Build the per-dispatch ``RunConfig`` for an L3 resident dispatch.
+def _pypto_run_config(runtime_cfg: dict[str, Any]) -> Any:
+    """Build the per-dispatch ``RunConfig`` for a direct ``compiled(...)`` call.
 
-    Mirrors :func:`_try_l3_dispatch`: keep only the keys that are ``RunConfig``
-    fields (DFX flags / ring sizing pass through), then pin platform / device /
-    backend.
+    Used by every dispatch that goes through the compiled program rather than
+    ``execute_compiled``: the L3 paths, and the L2 path when *runtime_cfg* asks
+    for ring sizing. Keep only the keys that are ``RunConfig`` fields (DFX flags
+    and ring sizing pass through), then pin platform / device / backend.
     """
     import dataclasses
 
@@ -1164,7 +1238,7 @@ def _run_l3_resident(
         [*tensors.keys(), *scalar_specs_eff.keys()],
     )
     pure_out_names = _l3_pure_out_names(compiled)
-    run_config = _l3_run_config(runtime_cfg)
+    run_config = _pypto_run_config(runtime_cfg)
     resident_specs = [s for s in tensor_specs if s.is_resident]
     bench = _bench_enabled() if benchmark_enabled is None else benchmark_enabled
 
@@ -1628,7 +1702,9 @@ def run(
         if compiled is None or not _try_l3_dispatch(
             compiled, specs, tensors, scalar_specs_eff, runtime_cfg,
         ):
-            _execute_via_runner(work_dir, specs, tensors, scalar_specs_eff, runtime_cfg)
+            _execute_via_runner(
+                work_dir, specs, tensors, scalar_specs_eff, runtime_cfg, compiled,
+            )
 
     # Validate the dedicated correctness dispatch before benchmark launches
     # mutate output or inout tensors in place.
@@ -1884,7 +1960,9 @@ def run_jit(
         if compiled is None or not _try_l3_dispatch(
             compiled, specs, tensors, scalar_specs_eff, runtime_cfg,
         ):
-            _execute_via_runner(work_dir, specs, tensors, scalar_specs_eff, runtime_cfg)
+            _execute_via_runner(
+                work_dir, specs, tensors, scalar_specs_eff, runtime_cfg, compiled,
+            )
 
     # Validate the dedicated correctness dispatch before benchmark launches
     # mutate output or inout tensors in place.

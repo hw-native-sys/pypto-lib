@@ -1894,7 +1894,7 @@ def test_l3_benchmark_reuses_persistent_windows_without_runtime_reset(monkeypatc
     compiled = object()
     tensors = {"x": torch.zeros(1)}
     monkeypatch.setattr("golden.runner._l3_ordered_args", lambda *_a: ["ORDERED"])
-    monkeypatch.setattr("golden.runner._l3_run_config", lambda _cfg: "RUNCFG")
+    monkeypatch.setattr("golden.runner._pypto_run_config", lambda _cfg: "RUNCFG")
 
     with patch.dict(sys.modules, {"pypto.runtime": fake_runtime}):
         result = _run_benchmark_l3(
@@ -1968,7 +1968,7 @@ def test_benchmark_propagates_device_runtime_error(monkeypatch, l3):
         with pytest.raises(RuntimeError, match="DEVICE DISPATCH FAILED"):
             if l3:
                 monkeypatch.setattr("golden.runner._l3_ordered_args", lambda *_a: [])
-                monkeypatch.setattr("golden.runner._l3_run_config", lambda _cfg: "RUNCFG")
+                monkeypatch.setattr("golden.runner._pypto_run_config", lambda _cfg: "RUNCFG")
                 _run_benchmark_l3(object(), [], {}, {}, {}, rounds=1, warmup=1)
             else:
                 _run_benchmark(object(), [], {}, {}, {}, rounds=1, warmup=1)
@@ -1981,7 +1981,7 @@ def test_l3_benchmark_tolerates_only_missing_strace(monkeypatch):
     fake_runtime = types.ModuleType("pypto.runtime")
     fake_runtime.benchmark = _benchmark
     monkeypatch.setattr("golden.runner._l3_ordered_args", lambda *_a: [])
-    monkeypatch.setattr("golden.runner._l3_run_config", lambda _cfg: "RUNCFG")
+    monkeypatch.setattr("golden.runner._pypto_run_config", lambda _cfg: "RUNCFG")
     with patch.dict(sys.modules, {"pypto.runtime": fake_runtime}):
         assert _run_benchmark_l3(object(), [], {}, {}, {}, rounds=1, warmup=1) is None
 
@@ -2205,7 +2205,7 @@ class TestResidentPath:
         monkeypatch.setenv("PYPTO_BENCH_WARMUP", "2")
         monkeypatch.setattr(R, "_l3_ordered_names", lambda _c: ["state", "epoch"])
         monkeypatch.setattr(R, "_l3_pure_out_names", lambda _c: set())
-        monkeypatch.setattr(R, "_l3_run_config", lambda _cfg: "RUNCFG")
+        monkeypatch.setattr(R, "_pypto_run_config", lambda _cfg: "RUNCFG")
 
         with patch.dict(
             sys.modules,
@@ -2290,7 +2290,7 @@ class TestResidentPath:
         monkeypatch.setenv("PYPTO_BENCH_WARMUP", "1")
         monkeypatch.setattr(R, "_l3_ordered_names", lambda _compiled: [])
         monkeypatch.setattr(R, "_l3_pure_out_names", lambda _compiled: set())
-        monkeypatch.setattr(R, "_l3_run_config", lambda _cfg: "RUNCFG")
+        monkeypatch.setattr(R, "_pypto_run_config", lambda _cfg: "RUNCFG")
 
         with (
             patch.dict(
@@ -2385,7 +2385,7 @@ class TestResidentPath:
         # Avoid real pypto.runtime / backend by stubbing the metadata + config helpers.
         monkeypatch.setattr(R, "_l3_ordered_names", lambda _c: ["w"])
         monkeypatch.setattr(R, "_l3_pure_out_names", lambda _c: set())
-        monkeypatch.setattr(R, "_l3_run_config", lambda _cfg: "RUNCFG")
+        monkeypatch.setattr(R, "_pypto_run_config", lambda _cfg: "RUNCFG")
 
         with patch.dict(sys.modules, {"pypto.ir.distributed_compiled_program": fake_mod}):
             out = R._run_l3_resident(
@@ -2460,7 +2460,7 @@ class TestResidentPath:
         tensors = {"y": torch.zeros(2, 4)}
         monkeypatch.setattr(R, "_l3_ordered_names", lambda _c: ["y"])
         monkeypatch.setattr(R, "_l3_pure_out_names", lambda _c: {"y"})
-        monkeypatch.setattr(R, "_l3_run_config", lambda _cfg: "RUNCFG")
+        monkeypatch.setattr(R, "_pypto_run_config", lambda _cfg: "RUNCFG")
 
         with patch.dict(
             sys.modules,
@@ -2535,7 +2535,7 @@ class TestResidentPath:
 
         monkeypatch.setattr(R, "_l3_ordered_names", lambda _c: ["kv"])
         monkeypatch.setattr(R, "_l3_pure_out_names", lambda _c: set())
-        monkeypatch.setattr(R, "_l3_run_config", lambda _cfg: "RUNCFG")
+        monkeypatch.setattr(R, "_pypto_run_config", lambda _cfg: "RUNCFG")
 
         def _fake_validate(
             tensor_specs,
