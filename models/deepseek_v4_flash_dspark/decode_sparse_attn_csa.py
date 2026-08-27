@@ -14,6 +14,7 @@ masking folded in. The SWA and HCA variants live in sibling modules.
 
 
 import pypto.language as pl
+import pypto.language.distributed as pld
 
 from config import (
     FLASH as M,
@@ -66,6 +67,12 @@ QK_M_TILE = 32           # qk_pv M rows per QK/PV matmul; QK_M_TILE/H_TILE-way K
 ATTN_K_TILE = 128
 NUM_QK_CORES = 24        # qk_pv dispatch lanes = a2a3 AIC count; re-sweep for other AIC counts
 T_PAD = ((T + 16 - 1) // 16) * 16  # T padded up to the 16-row cube M floor
+ATTENTION_PUBLISH_WORKERS = 48
+ATTENTION_PUBLISH_T_TILE = 8
+LOCAL_O_GROUPS = O_GROUPS // TP
+GROUP_T_PAD = TP * T_PAD
+ATTENTION_WINDOW_ROWS = LOCAL_O_GROUPS * GROUP_T_PAD
+PUBLISH_GROUPS = H_TILE // HEADS_PER_GROUP
 ROPE_CS_T_TILE = 8    # rope cos/sin row block; T is a multiple of 8 by the batch contract
 TOPK = WIN + CMP_TOPK
 # Floor to 2: a single sparse-K block miscompiles in pypto (S-stride cross-token
@@ -83,11 +90,20 @@ SWA_RUNS = (SWA_TILE_WIN_ROWS + 2 * (BLOCK_SIZE - 1)) // BLOCK_SIZE
 # Token tile for the slot / bias vector work; the whole-T form would put
 # [T, IDX_TOPK] FP32 tiles well past the Vec limit.
 BIAS_T_TILE = min(T, 8)
-assert T % BIAS_T_TILE == 0
+if T % BIAS_T_TILE != 0:
+    raise ValueError("CSA token capacity must contain complete bias tiles")
+if H_TILE % HEADS_PER_GROUP != 0:
+    raise ValueError(f"CSA head tile {H_TILE} must contain complete output groups")
+if O_GROUPS % TP != 0:
+    raise ValueError(f"output groups {O_GROUPS} must be divisible by TP size {TP}")
+if LOCAL_O_GROUPS % PUBLISH_GROUPS != 0:
+    raise ValueError("local output groups must contain complete CSA publish tiles")
+if T % ATTENTION_PUBLISH_T_TILE != 0:
+    raise ValueError("local token capacity must contain complete attention publish tiles")
 
 
-@pl.jit.inline
-def sparse_attn_csa(
+@pl.jit.inline(auto_scope=False)
+def _sparse_attn_csa_state(
     q: pl.Tensor[[T_DYN, H, HEAD_DIM], pl.BF16],
     ori_kv: pl.Tensor[[ORI_BLOCK_NUM_DYN, BLOCK_SIZE, 1, HEAD_DIM], pl.BF16],
     window_swa_indices: pl.Tensor[[T_DYN, WIN], pl.INT32],
@@ -95,23 +111,16 @@ def sparse_attn_csa(
     cmp_block_table: pl.Tensor[[B_DYN, CMP_MAX_BLOCKS], pl.INT32],
     idx_topk: pl.Tensor[[T_DYN, IDX_TOPK], pl.INT32],
     position_ids: pl.Tensor[[T_DYN, 1], pl.INT32],
-    attn_sink: pl.Tensor[[H], pl.FP32],
     freqs_cos: pl.Tensor[[T_DYN, ROPE_DIM], pl.BF16],
     freqs_sin: pl.Tensor[[T_DYN, ROPE_DIM], pl.BF16],
-    o_packed_heads: pl.Tensor[[O_GROUPS * T_PAD, O_GROUP_IN], pl.BF16],
     cache_ready_dep: pl.Scalar[pl.TASK_ID],
-) -> tuple[pl.Tensor, pl.Scalar[pl.TASK_ID]]:
-    """Write CSA heads as ``[group, T_PAD, O_GROUP_IN]`` slabs.
-
-    Only the first runtime ``t_dim`` rows in each group are valid. The
-    returned task ID covers every write to the packed output tensor.
-    """
+):
+    """Compute CSA sparse-block states and inverse-RoPE metadata."""
     # Compressed index contract: -1 invalid, [0, ...) compressed KV slots.
     ori_block_num = pl.tensor.dim(ori_kv, 0)
     t_dim = pl.tensor.dim(q, 0)
     t_heads = t_dim * H
     t_blk = t_dim * (H // H_TILE) * SPARSE_BLOCKS * H_TILE
-    t_hblocks = t_dim * (H // H_TILE)
     qk_items = t_dim * SPARSE_BLOCKS
     rope_cs_blocks = t_dim // ROPE_CS_T_TILE
     ori_kv_flat = pl.reshape(ori_kv, [ori_block_num * BLOCK_SIZE, HEAD_DIM])
@@ -198,7 +207,7 @@ def sparse_attn_csa(
     sparse_blk_li = pl.create_tensor([t_blk, 1], dtype=pl.FP32)
     sparse_blk_oi = pl.create_tensor([t_blk, HEAD_DIM], dtype=pl.FP32)
 
-    with pl.spmd(NUM_QK_CORES, name_hint="qk_pv", deps=[qk_plan_tid, cache_ready_dep], allow_early_resolve=True) as _qk_tid:
+    with pl.spmd(NUM_QK_CORES, name_hint="qk_pv", deps=[qk_plan_tid, cache_ready_dep], allow_early_resolve=True) as qk_tid:
         qk_core = pl.tile.get_block_idx()
         # Items for this lane: qk_core, qk_core + NUM_QK_CORES, ...  The per-lane
         # count is derived from the lane index (no stored per-core count); a lane
@@ -316,7 +325,7 @@ def sparse_attn_csa(
     # j^1 lane-swap index for merge_norm's rotation gather. Shaped [H_TILE, ROPE_DIM]
     # because gather's index must match its source rows.
     rope_swap_idx = pl.create_tensor([H_TILE, ROPE_DIM], dtype=pl.INT32)
-    with pl.at(level=pl.Level.CORE_GROUP, name_hint="rope_cs", allow_early_resolve=True):
+    with pl.at(level=pl.Level.CORE_GROUP, name_hint="rope_cs", allow_early_resolve=True) as rope_tid:
         sw_ones = pl.full([H_TILE, ROPE_DIM], dtype=pl.FP32, value=1.0)
         sw_idx_f = pl.cast(pl.arange(0, [1, ROPE_DIM], dtype=pl.INT32), target_type=pl.FP32)
         sw_col = pl.col_expand_mul(sw_ones, sw_idx_f)
@@ -342,10 +351,210 @@ def sparse_attn_csa(
             cs_sin_il = pl.gather(cs_sin, dim=-1, index=cs_dup_idx)
             rope_sin_signed[cs_t0 : cs_t0 + ROPE_CS_T_TILE, 0:ROPE_DIM] = pl.mul(cs_sin_il, cs_sign)
 
-    # Online-softmax merge across sparse-K tiles, sink-norm, then fused inverse RoPE,
-    # one spmd block per (token, head-tile). The rotated rope segment is packed
-    # straight into the group-major output.
-    with pl.spmd(t_hblocks, name_hint="merge_norm") as merge_tid:
+    return (
+        sparse_blk_mi,
+        sparse_blk_li,
+        sparse_blk_oi,
+        rope_cos_il,
+        rope_sin_signed,
+        rope_swap_idx,
+        qk_tid,
+        rope_tid,
+    )
+
+
+@pl.jit.inline(auto_scope=False)
+def publish_csa_o_groups(
+    q: pl.Tensor[[T_DYN, H, HEAD_DIM], pl.BF16],
+    ori_kv: pl.Tensor[[ORI_BLOCK_NUM_DYN, BLOCK_SIZE, 1, HEAD_DIM], pl.BF16],
+    window_swa_indices: pl.Tensor[[T_DYN, WIN], pl.INT32],
+    cmp_kv: pl.Tensor[[CMP_BLOCK_NUM_DYN, BLOCK_SIZE, 1, HEAD_DIM], pl.BF16],
+    cmp_block_table: pl.Tensor[[B_DYN, CMP_MAX_BLOCKS], pl.INT32],
+    idx_topk: pl.Tensor[[T_DYN, IDX_TOPK], pl.INT32],
+    position_ids: pl.Tensor[[T_DYN, 1], pl.INT32],
+    attn_sink: pl.Tensor[[H], pl.FP32],
+    freqs_cos: pl.Tensor[[T_DYN, ROPE_DIM], pl.BF16],
+    freqs_sin: pl.Tensor[[T_DYN, ROPE_DIM], pl.BF16],
+    attention_grouped: pl.Tensor[[O_GROUPS * T_PAD, O_GROUP_IN], pl.BF16],
+    exchange_window: pld.DistributedTensor[[ATTENTION_WINDOW_ROWS, O_GROUP_IN], pl.BF16],
+    exchange_signal: pld.DistributedTensor[[TP, 1], pl.INT32],
+    group_base: pl.Scalar[pl.INT32],
+    tp_rank: pl.Scalar[pl.INT32],
+    local_t: pl.Scalar[pl.INT32],
+    cache_ready_dep: pl.Scalar[pl.TASK_ID],
+):
+    """Merge CSA heads and publish completed O-group token tiles."""
+    (
+        sparse_blk_mi,
+        sparse_blk_li,
+        sparse_blk_oi,
+        rope_cos_il,
+        rope_sin_signed,
+        rope_swap_idx,
+        qk_tid,
+        rope_tid,
+    ) = _sparse_attn_csa_state(
+        q,
+        ori_kv,
+        window_swa_indices,
+        cmp_kv,
+        cmp_block_table,
+        idx_topk,
+        position_ids,
+        freqs_cos,
+        freqs_sin,
+        cache_ready_dep,
+    )
+    t_dim = pl.tensor.dim(q, 0)
+    pack_work_count = (t_dim // ATTENTION_PUBLISH_T_TILE) * (H // H_TILE)
+
+    with pl.spmd(
+        ATTENTION_PUBLISH_WORKERS,
+        name_hint="csa_merge_pack_publish",
+        deps=[qk_tid, rope_tid],
+    ) as publish_tid:
+        worker = pl.tile.get_block_idx()
+        for pack_work in pl.range(worker, pack_work_count, ATTENTION_PUBLISH_WORKERS):
+            token_block = pack_work // (H // H_TILE)
+            m_h_idx = pack_work - token_block * (H // H_TILE)
+            m_t0 = token_block * ATTENTION_PUBLISH_T_TILE
+            m_h0 = m_h_idx * H_TILE
+            global_group0 = m_h0 // HEADS_PER_GROUP
+            destination_rank = global_group0 // LOCAL_O_GROUPS
+            local_group0 = global_group0 - destination_rank * LOCAL_O_GROUPS
+
+            for m_dt in pl.range(ATTENTION_PUBLISH_T_TILE):
+                m_t = m_t0 + m_dt
+                m_idx = m_t * (H // H_TILE) + m_h_idx
+                m_blk_base = m_idx * SPARSE_BLOCKS * H_TILE
+                m_mi = sparse_blk_mi[m_blk_base : m_blk_base + H_TILE, 0:1]
+                m_li = sparse_blk_li[m_blk_base : m_blk_base + H_TILE, 0:1]
+                m_oi = sparse_blk_oi[m_blk_base : m_blk_base + H_TILE, 0:HEAD_DIM]
+
+                for m_sb in pl.pipeline(1, SPARSE_BLOCKS, stage=2):
+                    m_row = m_blk_base + m_sb * H_TILE
+                    m_cur_mi = sparse_blk_mi[m_row : m_row + H_TILE, 0:1]
+                    m_cur_li = sparse_blk_li[m_row : m_row + H_TILE, 0:1]
+                    m_cur_oi = sparse_blk_oi[m_row : m_row + H_TILE, 0:HEAD_DIM]
+                    m_mi_new = pl.maximum(m_mi, m_cur_mi)
+                    m_alpha = pl.exp(pl.sub(m_mi, m_mi_new))
+                    m_beta = pl.exp(pl.sub(m_cur_mi, m_mi_new))
+                    m_li = pl.add(pl.mul(m_alpha, m_li), pl.mul(m_beta, m_cur_li))
+                    m_oi = pl.add(
+                        pl.row_expand_mul(m_oi, m_alpha),
+                        pl.row_expand_mul(m_cur_oi, m_beta),
+                    )
+                    m_mi = m_mi_new
+
+                n_sink_bias = pl.reshape(attn_sink[m_h0 : m_h0 + H_TILE], [H_TILE, 1])
+                n_sink_tile = pl.add(pl.sub(m_mi, m_mi), n_sink_bias)
+                n_denom = pl.add(m_li, pl.exp(pl.sub(n_sink_tile, m_mi)))
+                n_full = pl.row_expand_div(m_oi, n_denom)[0:H_TILE, 0:HEAD_DIM]
+                n_bf16 = pl.cast(n_full, target_type=pl.BF16, mode="rint")
+
+                m_rope = n_full[0:H_TILE, NOPE_DIM:HEAD_DIM]
+                m_cos_il = rope_cos_il[m_t : m_t + 1, 0:ROPE_DIM]
+                m_sin_signed = rope_sin_signed[m_t : m_t + 1, 0:ROPE_DIM]
+                m_swapped = pl.gather(
+                    m_rope,
+                    dim=-1,
+                    index=rope_swap_idx[0:H_TILE, 0:ROPE_DIM],
+                )
+                m_rot = pl.add(
+                    pl.col_expand_mul(m_rope, m_cos_il),
+                    pl.col_expand_mul(m_swapped, m_sin_signed),
+                )
+                n_rope_bf16 = pl.cast(m_rot, target_type=pl.BF16, mode="rint")
+                n_full_bf16 = pl.concat(n_bf16[:, 0:NOPE_DIM], n_rope_bf16)
+
+                for n_hi in pl.unroll(H_TILE):
+                    n_head = m_h0 + n_hi
+                    source_row = (n_head // HEADS_PER_GROUP) * T_PAD + m_t
+                    source_col = (n_head % HEADS_PER_GROUP) * HEAD_DIM
+                    attention_grouped[
+                        source_row : source_row + 1,
+                        source_col : source_col + HEAD_DIM,
+                    ] = n_full_bf16[n_hi : n_hi + 1, 0:HEAD_DIM]
+
+            for group_slot in pl.unroll(PUBLISH_GROUPS):
+                source_row = (global_group0 + group_slot) * T_PAD + m_t0
+                target_row = (
+                    (local_group0 + group_slot) * GROUP_T_PAD
+                    + tp_rank * local_t
+                    + m_t0
+                )
+                pld.tensor.put(
+                    dst=exchange_window,
+                    peer=group_base + destination_rank,
+                    src=attention_grouped,
+                    dst_offsets=[target_row, 0],
+                    src_offsets=[source_row, 0],
+                    shape=[ATTENTION_PUBLISH_T_TILE, O_GROUP_IN],
+                    chunk_rows=ATTENTION_PUBLISH_T_TILE,
+                    chunk_cols=O_GROUP_IN,
+                )
+
+        for destination_rank in pl.range(TP):
+            if destination_rank != tp_rank:
+                pld.system.notify(
+                    target=exchange_signal,
+                    peer=group_base + destination_rank,
+                    offsets=[tp_rank, 0],
+                    value=1,
+                    op=pld.NotifyOp.AtomicAdd,
+                )
+
+    return exchange_signal, publish_tid
+
+
+@pl.jit.inline
+def sparse_attn_csa(
+    q: pl.Tensor[[T_DYN, H, HEAD_DIM], pl.BF16],
+    ori_kv: pl.Tensor[[ORI_BLOCK_NUM_DYN, BLOCK_SIZE, 1, HEAD_DIM], pl.BF16],
+    window_swa_indices: pl.Tensor[[T_DYN, WIN], pl.INT32],
+    cmp_kv: pl.Tensor[[CMP_BLOCK_NUM_DYN, BLOCK_SIZE, 1, HEAD_DIM], pl.BF16],
+    cmp_block_table: pl.Tensor[[B_DYN, CMP_MAX_BLOCKS], pl.INT32],
+    idx_topk: pl.Tensor[[T_DYN, IDX_TOPK], pl.INT32],
+    position_ids: pl.Tensor[[T_DYN, 1], pl.INT32],
+    attn_sink: pl.Tensor[[H], pl.FP32],
+    freqs_cos: pl.Tensor[[T_DYN, ROPE_DIM], pl.BF16],
+    freqs_sin: pl.Tensor[[T_DYN, ROPE_DIM], pl.BF16],
+    o_packed_heads: pl.Tensor[[O_GROUPS * T_PAD, O_GROUP_IN], pl.BF16],
+    cache_ready_dep: pl.Scalar[pl.TASK_ID],
+) -> tuple[pl.Tensor, pl.Scalar[pl.TASK_ID]]:
+    """Write CSA heads as ``[group, T_PAD, O_GROUP_IN]`` slabs.
+
+    Only the first runtime ``t_dim`` rows in each group are valid. The
+    returned task ID covers every write to the packed output tensor.
+    """
+    (
+        sparse_blk_mi,
+        sparse_blk_li,
+        sparse_blk_oi,
+        rope_cos_il,
+        rope_sin_signed,
+        rope_swap_idx,
+        qk_tid,
+        rope_tid,
+    ) = _sparse_attn_csa_state(
+        q,
+        ori_kv,
+        window_swa_indices,
+        cmp_kv,
+        cmp_block_table,
+        idx_topk,
+        position_ids,
+        freqs_cos,
+        freqs_sin,
+        cache_ready_dep,
+    )
+    t_dim = pl.tensor.dim(q, 0)
+
+    with pl.spmd(
+        t_dim * (H // H_TILE),
+        name_hint="merge_norm",
+        deps=[qk_tid, rope_tid],
+    ) as merge_tid:
         m_idx = pl.tile.get_block_idx()
         m_t = m_idx // (H // H_TILE)
         m_h_idx = m_idx - m_t * (H // H_TILE)

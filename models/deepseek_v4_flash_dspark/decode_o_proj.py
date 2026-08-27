@@ -64,6 +64,7 @@ T_DYN = pl.dynamic("T_DYN")
 # tiling and collective-native layouts
 TOKEN_TILE = 16
 COMM_ROW_TILE = 8
+ATTENTION_PUBLISH_WORKERS = 48
 O_RS_REDUCE_WORKERS = 8
 O_RS_PUBLISH_WORKERS = 24
 O_RS_D_TILE = 4096
@@ -330,42 +331,91 @@ def kv_token_allgather_step(
     return group_out, gather_signal
 
 
-@pl.jit.incore
+@pl.jit.inline
 def o_group_a2a(
-    attention_grouped: pl.Tensor[[O_GROUPS * LOCAL_T_PAD, O_GROUP_IN], pl.BF16],
-    local_groups_out: pl.InOut[pl.Tensor[[ATTENTION_WINDOW_ROWS, O_GROUP_IN], pl.BF16]],
+    local_groups_out: pl.Tensor[[ATTENTION_WINDOW_ROWS, O_GROUP_IN], pl.BF16],
     exchange_window: pld.DistributedTensor[[ATTENTION_WINDOW_ROWS, O_GROUP_IN], pl.BF16],
     exchange_signal: pld.DistributedTensor[[TP_SIZE, 1], pl.INT32],
     group_base: pl.Scalar[pl.INT32],
     tp_rank: pl.Scalar[pl.INT32],
     local_t: pl.Scalar[pl.INT32],
+    publish_dep: pl.Scalar[pl.TASK_ID],
+    publish_count: pl.Scalar[pl.INT32],
 ):
-    """Exchange valid output-group rows into local-group, group-token order."""
+    """Finish a non-overlapping producer-fused exchange and release its window."""
+    with pl.at(
+        level=pl.Level.CORE_GROUP,
+        name_hint="o_group_a2a_wait",
+        deps=[publish_dep],
+    ) as wait_tid:
+        expected = pl.cast(publish_count, pl.INT32)
+        for source_tp in pl.range(TP_SIZE):
+            if source_tp != tp_rank:
+                pld.system.wait(
+                    signal=exchange_signal,
+                    offsets=[source_tp, 0],
+                    expected=expected,
+                    cmp=pld.WaitCmp.Ge,
+                )
+
     group_t = TP_SIZE * local_t
-    for destination_rank in pl.range(TP_SIZE):
+    with pl.spmd(
+        ATTENTION_PUBLISH_WORKERS,
+        name_hint="o_group_a2a_gather",
+        deps=[wait_tid],
+    ) as gather_tid:
+        worker = pl.tile.get_block_idx()
         for local_group in pl.range(LOCAL_O_GROUPS):
-            global_group = destination_rank * LOCAL_O_GROUPS + local_group
-            source_row = global_group * LOCAL_T_PAD
-            target_row = local_group * GROUP_T_PAD + tp_rank * local_t
-            pld.tensor.put(
-                dst=exchange_window, peer=group_base + destination_rank, src=attention_grouped,
-                dst_offsets=[target_row, 0], src_offsets=[source_row, 0], shape=[local_t, O_GROUP_IN],
-                chunk_rows=COMM_ROW_TILE, chunk_cols=O_GROUP_IN,
-            )
+            group_base_row = local_group * GROUP_T_PAD
+            for group_row in pl.range(worker, group_t, ATTENTION_PUBLISH_WORKERS):
+                copy_row = group_base_row + group_row
+                local_groups_out[
+                    copy_row : copy_row + 1,
+                    0:O_GROUP_IN,
+                ] = exchange_window[
+                    copy_row : copy_row + 1,
+                    0:O_GROUP_IN,
+                ]
 
-    expected_one = pl.cast(1, pl.INT32)
-    exchange_signal = tp_group_barrier(exchange_signal, group_base, tp_rank, expected_one)
-    for local_group in pl.range(LOCAL_O_GROUPS):
-        group_base_row = local_group * GROUP_T_PAD
-        for group_row in pl.range(group_t):
-            copy_row = group_base_row + group_row
-            window_row = exchange_window[copy_row : copy_row + 1, 0:O_GROUP_IN]
-            local_groups_out[copy_row : copy_row + 1, 0:O_GROUP_IN] = window_row
-    expected_two = pl.cast(2, pl.INT32)
-    exchange_signal = tp_group_barrier(exchange_signal, group_base, tp_rank, expected_two)
-    exchange_signal = reset_tp_group_signal(exchange_signal, group_base, tp_rank)
+    with pl.at(
+        level=pl.Level.CORE_GROUP,
+        name_hint="o_group_a2a_complete",
+        deps=[gather_tid],
+    ):
+        completion_anchor = pl.read(local_groups_out, [0, 0])
+        for peer_tp in pl.range(TP_SIZE):
+            if peer_tp != tp_rank:
+                pld.system.notify(
+                    target=exchange_signal,
+                    peer=group_base + peer_tp,
+                    offsets=[tp_rank, 0],
+                    value=1,
+                    op=pld.NotifyOp.AtomicAdd,
+                )
+
+        completion_expected = pl.cast(publish_count + 1, pl.INT32)
+        for source_tp in pl.range(TP_SIZE):
+            if source_tp != tp_rank:
+                pld.system.wait(
+                    signal=exchange_signal,
+                    offsets=[source_tp, 0],
+                    expected=completion_expected,
+                    cmp=pld.WaitCmp.Ge,
+                )
+
+        reset_value = pl.cast(-completion_expected, pl.INT32)
+        self_rank = group_base + tp_rank
+        for source_tp in pl.range(TP_SIZE):
+            if source_tp != tp_rank:
+                pld.system.notify(
+                    target=exchange_signal,
+                    peer=self_rank,
+                    offsets=[source_tp, 0],
+                    value=reset_value,
+                    op=pld.NotifyOp.AtomicAdd,
+                )
+        pl.write(local_groups_out, [0, 0], completion_anchor)
     return local_groups_out, exchange_signal
-
 
 
 @pl.jit
@@ -386,8 +436,47 @@ def decode_attention_collectives_fixture(
     kv_group, kv_signal = kv_token_allgather_step(
         kv_local, kv_group, kv_window, kv_signal, group_base, tp_rank, local_t,
     )
+
+    with pl.spmd(
+        ATTENTION_PUBLISH_WORKERS,
+        name_hint="o_group_a2a_fixture_publish",
+    ) as publish_tid:
+        worker = pl.tile.get_block_idx()
+        for global_group in pl.range(worker, O_GROUPS, ATTENTION_PUBLISH_WORKERS):
+            destination_rank = global_group // LOCAL_O_GROUPS
+            local_group = global_group - destination_rank * LOCAL_O_GROUPS
+            source_row = global_group * LOCAL_T_PAD
+            target_row = local_group * GROUP_T_PAD + tp_rank * local_t
+            pld.tensor.put(
+                dst=attention_window,
+                peer=group_base + destination_rank,
+                src=attention_grouped,
+                dst_offsets=[target_row, 0],
+                src_offsets=[source_row, 0],
+                shape=[local_t, O_GROUP_IN],
+                chunk_rows=COMM_ROW_TILE,
+                chunk_cols=O_GROUP_IN,
+            )
+
+        for destination_rank in pl.range(TP_SIZE):
+            if destination_rank != tp_rank:
+                pld.system.notify(
+                    target=attention_signal,
+                    peer=group_base + destination_rank,
+                    offsets=[tp_rank, 0],
+                    value=1,
+                    op=pld.NotifyOp.AtomicAdd,
+                )
+
     attention_local_groups, attention_signal = o_group_a2a(
-        attention_grouped, attention_local_groups, attention_window, attention_signal, group_base, tp_rank, local_t,
+        attention_local_groups,
+        attention_window,
+        attention_signal,
+        group_base,
+        tp_rank,
+        local_t,
+        publish_tid,
+        ATTENTION_PUBLISH_WORKERS,
     )
     return kv_group, attention_local_groups, kv_signal, attention_signal
 

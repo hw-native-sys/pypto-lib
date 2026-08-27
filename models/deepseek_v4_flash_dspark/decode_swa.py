@@ -65,7 +65,14 @@ from decode_o_proj import (
     decode_o_proj_tp1,
     o_group_a2a,
 )
-from decode_sparse_attn_swa import ATTN_K_TILE, PADDED_TOPK, T_PAD, sparse_attn_swa
+from decode_sparse_attn_swa import (
+    ATTENTION_PUBLISH_WORKERS,
+    ATTN_K_TILE,
+    PADDED_TOPK,
+    T_PAD,
+    publish_swa_o_groups,
+    sparse_attn_swa,
+)
 
 # Dynamic shape variables.
 T_DYN = pl.dynamic("T_DYN")  # T = B * S
@@ -117,7 +124,7 @@ if T_PAD != LOCAL_T_PAD:
     raise ValueError(f"SWA padded token capacity {T_PAD} must equal TP capacity {LOCAL_T_PAD}")
 
 
-@pl.jit.inline
+@pl.jit.inline(auto_scope=False)
 def decode_swa(
     x_hc: pl.Tensor[[T_DYN, HC_MULT, D], pl.FP32],
     # hc_pre weights
@@ -202,37 +209,44 @@ def decode_swa(
             invalid = pl.sub(valid, 1.0)
             sparse_bias[token_start : token_start + BIAS_T_TILE, 0 : ATTN_K_TILE] = pl.mul(invalid, -NEG_INF)
 
-    o_packed_heads = pl.create_tensor([O_GROUPS * T_PAD * HEADS_PER_GROUP, HEAD_DIM], dtype=pl.BF16)
-    sparse_attn_swa(
-        q, kv_cache, swa_indices, sparse_bias,
-        attn_sink, freqs_cos, freqs_sin,
-        o_packed_heads,
-    )
-
-    attention_grouped = pl.reshape(o_packed_heads, [O_GROUPS * LOCAL_T_PAD, O_GROUP_IN])
     attention_local_flat = pl.create_tensor([ATTENTION_WINDOW_ROWS, O_GROUP_IN], dtype=pl.BF16)
-    attention_local_flat, attention_signal = o_group_a2a(
-        attention_grouped, attention_local_flat,
-        attention_window, attention_signal,
-        group_base, tp_rank, local_t,
-    )
-
-    attention_local_groups = pl.reshape(attention_local_flat, [LOCAL_O_GROUPS, GROUP_T_PAD, O_GROUP_IN])
-    o_local = pl.create_tensor([LOCAL_T_PAD, D], dtype=pl.BF16)
-    o_local, o_signal = decode_sharded_o_projection_reduce_scatter(
-        attention_local_groups,
-        wo_a, wo_b, wo_b_scale,
-        local_t, o_local,
-        o_window, o_signal,
-        group_base, tp_rank,
-    )
-
     attn_out = pl.create_tensor([t_dim, D], dtype=pl.BF16)
-    with pl.at(level=pl.Level.CORE_GROUP, name_hint="swa_o_local"):
-        for token_start in pl.range(0, t_dim, BIAS_T_TILE):
-            o_local_rows = o_local[token_start : token_start + BIAS_T_TILE, 0 : D]
-            attn_out[token_start : token_start + BIAS_T_TILE, 0 : D] = o_local_rows
-    hc_post(attn_out, x_hc, post_t, comb_t, x_out)
+    with pl.scope():
+        attention_grouped = pl.create_tensor([O_GROUPS * LOCAL_T_PAD, O_GROUP_IN], dtype=pl.BF16)
+        attention_signal, publish_tid = publish_swa_o_groups(
+            q, kv_cache, swa_indices, sparse_bias,
+            attn_sink, freqs_cos, freqs_sin,
+            attention_grouped,
+            attention_window, attention_signal,
+            group_base, tp_rank, local_t,
+        )
+        attention_local_flat, attention_signal = o_group_a2a(
+            attention_local_flat,
+            attention_window, attention_signal,
+            group_base, tp_rank, local_t,
+            publish_tid, ATTENTION_PUBLISH_WORKERS,
+        )
+
+        attention_local_groups = pl.reshape(
+            attention_local_flat,
+            [LOCAL_O_GROUPS, GROUP_T_PAD, O_GROUP_IN],
+        )
+        o_local = pl.create_tensor([LOCAL_T_PAD, D], dtype=pl.BF16)
+        o_local, o_signal = decode_sharded_o_projection_reduce_scatter(
+            attention_local_groups,
+            wo_a, wo_b, wo_b_scale,
+            local_t, o_local,
+            o_window, o_signal,
+            group_base, tp_rank,
+        )
+
+        with pl.at(level=pl.Level.CORE_GROUP, name_hint="swa_o_local"):
+            for token_start in pl.range(0, t_dim, BIAS_T_TILE):
+                o_local_rows = o_local[token_start : token_start + BIAS_T_TILE, 0 : D]
+                attn_out[token_start : token_start + BIAS_T_TILE, 0 : D] = o_local_rows
+
+    with pl.scope():
+        hc_post(attn_out, x_hc, post_t, comb_t, x_out)
     return x_out
 
 

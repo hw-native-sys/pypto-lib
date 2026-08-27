@@ -70,9 +70,11 @@ from decode_o_proj import (
     o_group_a2a,
 )
 from decode_sparse_attn_hca import (
+    ATTENTION_PUBLISH_WORKERS,
     HCA_MAX_COMPRESSED_ROWS,
     T_PAD,
     VALID_TOKEN_TILE,
+    publish_hca_o_groups,
     sparse_attn_hca,
 )
 
@@ -231,44 +233,48 @@ def decode_hca(
     cache_ready_dep = pl.system.task_dummy(deps=[ori_cache_write_tid, cmp_cache_write_tid])
 
     attention_local_flat = pl.create_tensor([ATTENTION_WINDOW_ROWS, O_GROUP_IN], dtype=pl.BF16)
+    attn_out = pl.create_tensor([t_dim, D], dtype=pl.BF16)
     with pl.scope():
         attention_grouped = pl.create_tensor(
             [O_GROUPS * LOCAL_T_PAD, O_GROUP_IN],
             dtype=pl.BF16,
         )
-        attention_grouped, _heads_tid = sparse_attn_hca(
+        attention_signal, publish_tid = publish_hca_o_groups(
             q, kv_cache, window_swa_indices,
             cmp_kv, cmp_block_table,
             position_ids, kv_seq_lens,
             attn_sink, freqs_cos, freqs_sin,
-            attention_grouped, cache_ready_dep,
-        )
-        attention_local_flat, attention_signal = o_group_a2a(
-            attention_grouped, attention_local_flat,
+            attention_grouped,
             attention_window, attention_signal,
             group_base, tp_rank, local_t,
+            cache_ready_dep,
+        )
+        attention_local_flat, attention_signal = o_group_a2a(
+            attention_local_flat,
+            attention_window, attention_signal,
+            group_base, tp_rank, local_t,
+            publish_tid, ATTENTION_PUBLISH_WORKERS,
         )
 
-    attention_local_groups = pl.reshape(
-        attention_local_flat,
-        [LOCAL_O_GROUPS, GROUP_T_PAD, O_GROUP_IN],
-    )
-    o_local = pl.create_tensor([LOCAL_T_PAD, D], dtype=pl.BF16)
-    o_local, o_signal = decode_sharded_o_projection_reduce_scatter(
-        attention_local_groups,
-        wo_a, wo_b, wo_b_scale,
-        local_t, o_local,
-        o_window, o_signal,
-        group_base, tp_rank,
-    )
+        attention_local_groups = pl.reshape(
+            attention_local_flat,
+            [LOCAL_O_GROUPS, GROUP_T_PAD, O_GROUP_IN],
+        )
+        o_local = pl.create_tensor([LOCAL_T_PAD, D], dtype=pl.BF16)
+        o_local, o_signal = decode_sharded_o_projection_reduce_scatter(
+            attention_local_groups,
+            wo_a, wo_b, wo_b_scale,
+            local_t, o_local,
+            o_window, o_signal,
+            group_base, tp_rank,
+        )
 
-    attn_out = pl.create_tensor([t_dim, D], dtype=pl.BF16)
-    for bridge_block in pl.spmd(t_dim // HCA_WB_TOKEN_TILE, name_hint="hca_output_bridge"):
-        bridge_t0 = bridge_block * HCA_WB_TOKEN_TILE
-        attn_out[bridge_t0 : bridge_t0 + HCA_WB_TOKEN_TILE, 0:D] = o_local[
-            bridge_t0 : bridge_t0 + HCA_WB_TOKEN_TILE,
-            0:D,
-        ]
+        for bridge_block in pl.spmd(t_dim // HCA_WB_TOKEN_TILE, name_hint="hca_output_bridge"):
+            bridge_t0 = bridge_block * HCA_WB_TOKEN_TILE
+            attn_out[bridge_t0 : bridge_t0 + HCA_WB_TOKEN_TILE, 0:D] = o_local[
+                bridge_t0 : bridge_t0 + HCA_WB_TOKEN_TILE,
+                0:D,
+            ]
 
     with pl.scope():
         hc_post(attn_out, x_hc, post_t, comb_t, x_out)
@@ -1256,6 +1262,8 @@ if __name__ == "__main__":
         help="absolute decode start position; a scalar sets batch=1, "
              "and a comma-separated list sets batch to its length",
     )
+    parser.add_argument("--golden-data", type=str, default=None)
+    parser.add_argument("--save-data", action="store_true", default=False)
     parser.add_argument("--enable-chip-swimlane", type=int, choices=(0, 1, 2, 4), default=0)
     parser.add_argument("--compile-only", action="store_true", default=False)
     parser.add_argument("--dump-passes", action="store_true", default=False)
@@ -1284,6 +1292,8 @@ if __name__ == "__main__":
         parser.error(f"--device IDs must be distinct, got {device_ids}")
     if len(device_ids) != TP_SIZE:
         parser.error(f"--tp {TP_SIZE} needs exactly {TP_SIZE} device(s), got {device_ids}")
+    if args.golden_data is not None and args.start_pos is None and TP_SIZE != 1:
+        parser.error("distributed --golden-data requires --start-pos to select one replay shape")
 
     if args.start_pos is not None:
         batch = len(args.start_pos) if isinstance(args.start_pos, list) else 1
@@ -1300,6 +1310,8 @@ if __name__ == "__main__":
                 fn=decode_hca_tp1_test,
                 specs=build_tensor_specs(start_pos=args.start_pos, batch=local_t // S),
                 golden_fn=golden_decode_hca_tp1,
+                golden_data=args.golden_data,
+                save_data=args.save_data,
                 compile_only=args.compile_only,
                 compile_cfg=dict(dump_passes=args.dump_passes),
                 runtime_cfg=dict(
@@ -1337,6 +1349,8 @@ if __name__ == "__main__":
                 fn=l3_decode_hca,
                 specs=build_distributed_tensor_specs(local_t, start_pos=args.start_pos),
                 golden_fn=golden_decode_hca,
+                golden_data=args.golden_data,
+                save_data=args.save_data,
                 compile_only=args.compile_only,
                 compile_cfg=dict(
                     dump_passes=args.dump_passes,
