@@ -6,6 +6,12 @@
 # INCLUDING BUT NOT LIMITED TO NON-INFRINGEMENT, MERCHANTABILITY, OR FITNESS FOR A PARTICULAR PURPOSE.
 # See LICENSE in the root of the software repository for the full text of the License.
 # -----------------------------------------------------------------------------------------------------------
+# ci: skip
+#   Not a test case: a weight-conversion CLI whose --ckpt/--out are required and
+#   which refuses any variant but flash. The model sweeps enumerate every file
+#   under models/ that has a __main__ guard, so without this marker they submit
+#   it to a card and it argparse-exits 2. It stays here because decode_fwd.py
+#   and decode_layer.py import it as a library from this exact path.
 
 """Real DeepSeek-V4-Flash checkpoint loader for the full-network drivers.
 

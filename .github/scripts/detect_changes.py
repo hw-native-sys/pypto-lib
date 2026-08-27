@@ -97,6 +97,25 @@ def _has_main(path):
         return False
 
 
+# Anchored on purpose: a prose mention of "ci: skip" inside a docstring must not
+# be able to mute a real case. Same spelling the daily sweeps grep for.
+_CI_SKIP_RE = re.compile(r"^#\s*ci:\s*skip", re.MULTILINE)
+
+
+def _ci_skipped(path):
+    """`# ci: skip` marks a runnable-looking file that is a CLI utility, not a case.
+
+    The runnable test is the substring ``__main__``, which a weight converter or
+    dump tool satisfies just as well as a kernel driver does. Those declare the
+    marker so neither PR CI nor the daily sweeps submit them as cases.
+    """
+    try:
+        with open(path, encoding="utf-8") as fh:
+            return bool(_CI_SKIP_RE.search(fh.read()))
+    except OSError:
+        return False
+
+
 def build_reverse_graph():
     """Map each source file -> set of sibling files that import it.
 
@@ -179,7 +198,11 @@ def select_runnable(changed):
             f for f in _iter_source_files() if f.startswith("examples/")
         )
 
-    return sorted(f for f in selected if os.path.isfile(f) and _has_main(f))
+    return sorted(
+        f
+        for f in selected
+        if os.path.isfile(f) and _has_main(f) and not _ci_skipped(f)
+    )
 
 
 def main():

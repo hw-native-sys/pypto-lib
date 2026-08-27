@@ -107,6 +107,17 @@ jobs:
             if ! grep -q '__main__' "$f"; then
               continue
             fi
+            # CLI utilities that happen to live under models/ and carry a
+            # __main__ guard (weight converters, dump tools) declare
+            # `# ci: skip`. Deliberately opt-OUT: an unmarked file is always
+            # run, so a new kernel case can never lose coverage by omission —
+            # the worst a missing marker can do is show up as a loud red row.
+            if grep -qE '^#\s*ci:\s*skip' "$f"; then
+              echo "::group::${f}"
+              echo "skip (ci: skip): ${f}"
+              echo "::endgroup::"
+              continue
+            fi
             if grep -qE '^#\s*ci:\s*no-sim' "$f"; then
               echo "::group::${f}"
               echo "skip (no-sim): ${f}"
@@ -260,6 +271,14 @@ jobs:
             # Skip shared modules with no __main__ guard (config.py, helper libs):
             # they are imported, not run, so they don't belong in the report.
             if ! grep -q '__main__' "$f"; then
+              continue
+            fi
+            # CLI utilities under models/ opt out with `# ci: skip` — see
+            # the sim job's note.
+            if grep -qE '^#\s*ci:\s*skip' "$f"; then
+              echo "::group::${f}"
+              echo "skip (ci: skip): ${f}"
+              echo "::endgroup::"
               continue
             fi
             run_case "$f" "$f"
@@ -447,6 +466,14 @@ jobs:
             # Skip shared modules with no __main__ guard (config.py, helper
             # libs): they are imported, not run.
             if ! grep -q '__main__' "$f"; then
+              continue
+            fi
+            # CLI utilities under models/ opt out with `# ci: skip` — see
+            # the sim job's note.
+            if grep -qE '^#\s*ci:\s*skip' "$f"; then
+              echo "::group::${f}"
+              echo "skip (ci: skip): ${f}"
+              echo "::endgroup::"
               continue
             fi
             run_case "$f" "$f"
