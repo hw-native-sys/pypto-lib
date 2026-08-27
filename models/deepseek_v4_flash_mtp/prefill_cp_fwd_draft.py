@@ -114,7 +114,7 @@ from moe import (
     clear_moe_signals,
     moe,
 )
-from prefill_cp_swa import (
+from prefill_cp_swa_draft import (
     BLOCK_ROWS,
     CP_CHOICES,
     CP_SIZE,
@@ -141,7 +141,7 @@ from prefill_cp_swa import (
 # HCA / CSA inline cores and their type-specific constants. The FWD child
 # calls the cores directly (never @pl.jit children); the constants are used
 # only for static child-side shape annotations and typed pl.slice offsets.
-from prefill_cp_hca import (
+from prefill_cp_hca_draft import (
     COMPRESS_RATIO as HCA_COMPRESS_RATIO,
     COMPRESS_STATE_DIM as HCA_COMPRESS_STATE_DIM,
     HCA_STATE_BLOCK_SIZE,
@@ -151,7 +151,7 @@ from prefill_cp_hca import (
     build_tensor_specs as build_hca_tensor_specs,
     prefill_cp_hca_core,
 )
-from prefill_cp_csa import (
+from prefill_cp_csa_draft import (
     COMPRESS_RATIO as CSA_COMPRESS_RATIO,
     IDX_HEAD_DIM,
     IDX_N_HEADS,

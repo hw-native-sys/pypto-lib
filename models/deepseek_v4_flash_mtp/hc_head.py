@@ -68,9 +68,19 @@ def hc_head(
         sq_part = pl.assemble(sq_part, sq_sum, [ok, t0])
 
     # linear: split-K head projection, fanned over (row-block x K-slice); each task
-    # atomic-adds its [LINEAR_T_TILE, HC_PAD] FP32 partial into the AICPU-zeroed mixes_raw
-    mixes_raw = pl.create_tensor([t_linear, HC_PAD], dtype=pl.FP32, init_value=0)
-    for task in pl.spmd((t_linear // LINEAR_T_TILE) * LINEAR_OK, name_hint="hc_head_linear"):
+    # atomic-adds its [LINEAR_T_TILE, HC_PAD] FP32 partial into the kernel-zeroed mixes_raw
+    mixes_raw = pl.create_tensor([t_linear, HC_PAD], dtype=pl.FP32)
+    with pl.spmd(t_linear // LINEAR_T_TILE, name_hint="hc_head_linear_seed") as linear_seed_tid:
+        seed_block = pl.tile.get_block_idx()
+        seed_t0 = seed_block * LINEAR_T_TILE
+        zeros = pl.full([LINEAR_T_TILE, HC_PAD], dtype=pl.FP32, value=0.0)
+        mixes_raw[seed_t0 : seed_t0 + LINEAR_T_TILE, 0:HC_PAD] = zeros
+    with pl.spmd(
+        (t_linear // LINEAR_T_TILE) * LINEAR_OK,
+        name_hint="hc_head_linear",
+        deps=[linear_seed_tid],
+    ) as _linear_tid:
+        task = pl.tile.get_block_idx()
         t0 = (task // LINEAR_OK) * LINEAR_T_TILE
         k_base = (task % LINEAR_OK) * (HC_DIM // LINEAR_OK)
         acc = pl.create_tensor([LINEAR_T_TILE, HC_PAD], dtype=pl.FP32)

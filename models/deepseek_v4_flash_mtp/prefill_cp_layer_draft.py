@@ -47,7 +47,7 @@ from moe import (
     golden_moe,
     moe,
 )
-from prefill_cp_swa import (
+from prefill_cp_swa_draft import (
     CP_CHOICES,
     CP_SIZE,
     CP_TAIL_WINDOW_ROWS,
@@ -71,7 +71,7 @@ from prefill_cp_swa import (
     golden_prefill_cp_swa,
     prefill_cp_swa_core,
 )
-from prefill_cp_hca import (
+from prefill_cp_hca_draft import (
     BLOCK_SIZE,
     CMP_META_DIM,
     CMP_WINDOW_ROWS,
@@ -89,7 +89,7 @@ from prefill_cp_hca import (
     golden_prefill_cp_hca,
     prefill_cp_hca_core,
 )
-from prefill_cp_csa import (
+from prefill_cp_csa_draft import (
     CSA_INNER_STATE_PHYSICAL_BLOCKS,
     CSA_STATE_PHYSICAL_BLOCKS,
     IDX_CACHE_MAX_BLOCKS,

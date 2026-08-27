@@ -80,7 +80,7 @@ def expert_shared(
             up_i32[:, n0 : n0 + MM_INTER_TILE] = up_acc
 
         h_tile_fp32 = pl.create_tensor([SH_M_TILE, MOE_INTER], dtype=pl.FP32)
-        h_tile_i8 = pl.create_tensor([SH_M_TILE, MOE_INTER], dtype=pl.INT8, init_value=0)
+        h_tile_i8 = pl.create_tensor([SH_M_TILE, MOE_INTER], dtype=pl.INT8)
         h_tile_scale_dq = pl.create_tensor([SH_M_TILE, SH_ROW_PAD], dtype=pl.FP32, manual_dep=True)
         for row_block in pl.spmd(SH_VALID_M // SH_ROW_TILE, name_hint="sh_gate_up_act_q"):
             row0 = row_block * SH_ROW_TILE
