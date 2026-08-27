@@ -123,6 +123,20 @@ jobs:
               echo "::endgroup::"
               continue
             fi
+            # `# ci: excluded` is the OTHER opt-out, and deliberately a separate
+            # word from `ci: skip`: this file IS a real case, it just cannot run
+            # inside this job's budget. Keeping the two apart is what stops a
+            # quarantine list from quietly becoming permanent — `ci: skip` is
+            # never coming back, `ci: excluded` is debt someone owes. The reason
+            # is required on the line after the marker and is echoed here, so the
+            # sweep log always states what coverage it is not providing.
+            if grep -qE '^#\s*ci:\s*excluded' "$f"; then
+              echo "::group::${f}"
+              echo "excluded (ci: excluded): ${f}"
+              sed -n 's/^#[[:space:]]*ci-reason:[[:space:]]*//p' "$f" | head -1 | sed 's/^/  reason: /'
+              echo "::endgroup::"
+              continue
+            fi
             if grep -qE '^#\s*ci:\s*no-sim' "$f"; then
               echo "::group::${f}"
               echo "skip (no-sim): ${f}"
@@ -288,6 +302,20 @@ jobs:
             if grep -qE '^#\s*ci:\s*skip' "$f"; then
               echo "::group::${f}"
               echo "skip (ci: skip): ${f}"
+              echo "::endgroup::"
+              continue
+            fi
+            # `# ci: excluded` is the OTHER opt-out, and deliberately a separate
+            # word from `ci: skip`: this file IS a real case, it just cannot run
+            # inside this job's budget. Keeping the two apart is what stops a
+            # quarantine list from quietly becoming permanent — `ci: skip` is
+            # never coming back, `ci: excluded` is debt someone owes. The reason
+            # is required on the line after the marker and is echoed here, so the
+            # sweep log always states what coverage it is not providing.
+            if grep -qE '^#\s*ci:\s*excluded' "$f"; then
+              echo "::group::${f}"
+              echo "excluded (ci: excluded): ${f}"
+              sed -n 's/^#[[:space:]]*ci-reason:[[:space:]]*//p' "$f" | head -1 | sed 's/^/  reason: /'
               echo "::endgroup::"
               continue
             fi
@@ -488,6 +516,20 @@ jobs:
             if grep -qE '^#\s*ci:\s*skip' "$f"; then
               echo "::group::${f}"
               echo "skip (ci: skip): ${f}"
+              echo "::endgroup::"
+              continue
+            fi
+            # `# ci: excluded` is the OTHER opt-out, and deliberately a separate
+            # word from `ci: skip`: this file IS a real case, it just cannot run
+            # inside this job's budget. Keeping the two apart is what stops a
+            # quarantine list from quietly becoming permanent — `ci: skip` is
+            # never coming back, `ci: excluded` is debt someone owes. The reason
+            # is required on the line after the marker and is echoed here, so the
+            # sweep log always states what coverage it is not providing.
+            if grep -qE '^#\s*ci:\s*excluded' "$f"; then
+              echo "::group::${f}"
+              echo "excluded (ci: excluded): ${f}"
+              sed -n 's/^#[[:space:]]*ci-reason:[[:space:]]*//p' "$f" | head -1 | sed 's/^/  reason: /'
               echo "::endgroup::"
               continue
             fi

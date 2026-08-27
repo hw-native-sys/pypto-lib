@@ -8,6 +8,10 @@
 # -----------------------------------------------------------------------------------------------------------
 # ci: devices=2  # CI: 2-card run; borrows 2 cards via task-submit --device-num
 # ci: no-sim    # CI marker: full multi-layer / multi-card forward — device-only, skip on *sim
+# ci: excluded  # CI marker: real case, but out of budget for the daily sweeps.
+# ci-reason: full-network forward: the fixture set does not fit this box, and the run never finishes inside --max-
+#   time 900 (generate inputs alone ~230-250s, then the runtime phase runs out the clock). Timed out in
+#   every nightly on record. Run it by hand on a machine with the headroom.
 """DeepSeek-V4 Pro/Flash decode forward experiment."""
 # ruff: noqa: F403,F405
 

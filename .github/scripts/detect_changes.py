@@ -100,20 +100,33 @@ def _has_main(path):
 # Anchored on purpose: a prose mention of "ci: skip" inside a docstring must not
 # be able to mute a real case. Same spelling the daily sweeps grep for.
 _CI_SKIP_RE = re.compile(r"^#\s*ci:\s*skip", re.MULTILINE)
+_CI_EXCLUDED_RE = re.compile(r"^#\s*ci:\s*excluded", re.MULTILINE)
 
 
 def _ci_skipped(path):
-    """`# ci: skip` marks a runnable-looking file that is a CLI utility, not a case.
+    """True if *path* opts out of being run as a case, by either marker.
 
-    The runnable test is the substring ``__main__``, which a weight converter or
-    dump tool satisfies just as well as a kernel driver does. Those declare the
-    marker so neither PR CI nor the daily sweeps submit them as cases.
+    Two markers, deliberately distinct, because they mean different things and
+    only one of them is debt:
+
+    ``# ci: skip``
+        Not a case at all — a CLI utility that happens to live under ``models/``
+        and carry a ``__main__`` guard (a weight converter, a dump tool). The
+        runnable test is the substring ``__main__``, which those satisfy just as
+        well as a kernel driver does. This never comes back.
+
+    ``# ci: excluded``
+        A real case that cannot run inside CI's budget, with a required
+        ``# ci-reason:`` line. This is a quarantine entry someone owes work on;
+        the sweeps echo the reason so the log always states what coverage is
+        missing.
     """
     try:
         with open(path, encoding="utf-8") as fh:
-            return bool(_CI_SKIP_RE.search(fh.read()))
+            text = fh.read()
     except OSError:
         return False
+    return bool(_CI_SKIP_RE.search(text) or _CI_EXCLUDED_RE.search(text))
 
 
 def build_reverse_graph():
