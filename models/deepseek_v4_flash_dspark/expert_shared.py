@@ -114,21 +114,6 @@ def expert_shared(
         # stay in one task so this stage can start alongside dispatch_push.
         h_tile_fp32 = pl.create_tensor([SH_M_TILE, MOE_INTER], dtype=pl.FP32)
         h_tile_i8 = pl.create_tensor([SH_M_TILE, MOE_INTER], dtype=pl.INT8)
-        if SH_VALID_M < SH_M_TILE:
-            with pl.spmd(
-                MOE_INTER // QUANT_TILE,
-                name_hint="sh_h_tile_i8_pad",
-            ):
-                pad_block = pl.tile.get_block_idx()
-                pad_k0 = pad_block * QUANT_TILE
-                h_tile_i8[
-                    SH_VALID_M:SH_M_TILE,
-                    pad_k0 : pad_k0 + QUANT_TILE,
-                ] = pl.full(
-                    [SH_M_TILE - SH_VALID_M, QUANT_TILE],
-                    dtype=pl.INT8,
-                    value=0,
-                )
         h_tile_scale_dq = pl.create_tensor(
             [SH_M_TILE, SH_ROW_PAD], dtype=pl.FP32, manual_dep=True
         )
