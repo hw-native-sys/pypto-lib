@@ -22,6 +22,8 @@ SAMPLED_IDS_PAD = 8
 SAMPLE_ROW_WIDTH_TILE = 256
 SAMPLE_BLOCK_ROWS_TILE = 8
 SAMPLE_CANDIDATES_TILE = 512
+GREEDY_ROW_WIDTH_TILE = 808
+GREEDY_BLOCK_ROWS_TILE = 8
 TOPK_ROW_WIDTH_TILE = 640
 TOPK_SEARCH_STEPS = 18
 
@@ -32,6 +34,7 @@ HASH_MULTIPLIER = 0x045D9F3B
 POSITION_MULTIPLIER = 65537
 UINT23_SCALE = 1.0 / 8388608.0
 FP32_POS_INF = 3.4028234663852886e38
+GREEDY_INDEX_SENTINEL = 1073741824
 
 
 @pl.jit.inline
@@ -153,6 +156,51 @@ def _sample_filtered_logits(
 
 
 @pl.jit.inline
+def _greedy_sample_logits(
+    logits_grid: pl.Tensor,
+    row: pl.Scalar[pl.INDEX],
+):
+    """Select the first maximum token id from one full-vocabulary logits row."""
+    row_base = row * (VOCAB // GREEDY_ROW_WIDTH_TILE)
+    running_max = pl.full(
+        [GREEDY_BLOCK_ROWS_TILE, GREEDY_ROW_WIDTH_TILE], dtype=pl.FP32, value=FP32_NEG_INF
+    )
+    running_base = pl.full([GREEDY_BLOCK_ROWS_TILE, GREEDY_ROW_WIDTH_TILE], dtype=pl.INT32, value=0)
+    for block in pl.range(VOCAB // GREEDY_ROW_WIDTH_TILE // GREEDY_BLOCK_ROWS_TILE):
+        block_row = row_base + block * GREEDY_BLOCK_ROWS_TILE
+        scores = logits_grid[block_row : block_row + GREEDY_BLOCK_ROWS_TILE, 0:GREEDY_ROW_WIDTH_TILE]
+        is_newer = pl.cmp(scores, running_max, cmp_type=4)
+        newer = pl.cast(is_newer, target_type=pl.INT32)
+        running_max = pl.maximum(running_max, scores)
+        block_base = pl.cast(block * GREEDY_BLOCK_ROWS_TILE * GREEDY_ROW_WIDTH_TILE, pl.INT32)
+        to_new = pl.add(pl.neg(running_base), block_base)
+        running_base = pl.add(running_base, pl.mul(newer, to_new))
+
+    lane_maxima = pl.row_max(running_max)
+    lane_zeros = pl.full([GREEDY_BLOCK_ROWS_TILE, GREEDY_ROW_WIDTH_TILE], dtype=pl.FP32, value=0.0)
+    lane_broadcast = pl.row_expand_add(lane_zeros, lane_maxima)
+    best_value = pl.read(pl.col_max(lane_broadcast), [0, 0])
+
+    ramp_zeros = pl.full([GREEDY_BLOCK_ROWS_TILE, GREEDY_ROW_WIDTH_TILE], dtype=pl.INT32, value=0)
+    column_ids = pl.arange(0, [1, GREEDY_ROW_WIDTH_TILE], dtype=pl.INT32)
+    column_ramp = pl.col_expand(ramp_zeros, column_ids)
+    flat_index = pl.add(running_base, column_ramp)
+    is_max = pl.cmp(running_max, best_value, cmp_type=0)
+    hit = pl.cast(is_max, target_type=pl.INT32)
+    index_sentinel = pl.cast(GREEDY_INDEX_SENTINEL, pl.INT32)
+    negative_index_sentinel = pl.cast(-GREEDY_INDEX_SENTINEL, pl.INT32)
+    offset_index = pl.add(flat_index, negative_index_sentinel)
+    candidates = pl.add(pl.mul(hit, offset_index), index_sentinel)
+    lane_indices = pl.row_min(candidates)
+    best_index = pl.read(lane_indices, [0, 0])
+    for lane in pl.range(1, GREEDY_BLOCK_ROWS_TILE):
+        lane_term = pl.cast(lane * GREEDY_ROW_WIDTH_TILE, pl.INT32)
+        lane_best = pl.read(lane_indices, [lane, 0]) + lane_term
+        best_index = pl.min(best_index, lane_best)
+    return best_index
+
+
+@pl.jit.inline
 def apply_temperature(
     logits: pl.Tensor,
     temperatures: pl.Tensor,
@@ -162,26 +210,27 @@ def apply_temperature(
     sample_rows = pl.tensor.dim(logits, 0)
     for row in pl.spmd(sample_rows, name_hint="sample_apply_temperature"):
         temperature = pl.read(temperatures, [row])
-        for vocab_tile in pl.range(VOCAB // SAMPLE_ROW_WIDTH_TILE):
-            vocab_start = vocab_tile * SAMPLE_ROW_WIDTH_TILE
-            scores = pl.slice(logits, [1, SAMPLE_ROW_WIDTH_TILE], [row, vocab_start])
-            scaled_scores = pl.mul(scores, 1.0)
-            if temperature >= SAMPLING_EPS:
+        if temperature >= SAMPLING_EPS:
+            for vocab_tile in pl.range(VOCAB // SAMPLE_ROW_WIDTH_TILE):
+                vocab_start = vocab_tile * SAMPLE_ROW_WIDTH_TILE
+                scores = pl.slice(logits, [1, SAMPLE_ROW_WIDTH_TILE], [row, vocab_start])
                 scaled_scores = pl.div(scores, temperature)
-            scaled_logits[row : row + 1, vocab_start : vocab_start + SAMPLE_ROW_WIDTH_TILE] = scaled_scores
+                scaled_logits[row : row + 1, vocab_start : vocab_start + SAMPLE_ROW_WIDTH_TILE] = scaled_scores
     return scaled_logits
 
 
 @pl.jit.inline
 def apply_top_k(
     scaled_logits: pl.Tensor,
+    temperatures: pl.Tensor,
     top_ks: pl.Tensor,
 ):
     """Mask logits below each row's top-k boundary in an independent stage."""
     sample_rows = pl.tensor.dim(scaled_logits, 0)
     for row in pl.spmd(sample_rows, name_hint="sample_apply_top_k"):
+        temperature = pl.read(temperatures, [row])
         top_k = pl.read(top_ks, [row])
-        if top_k > 0 and top_k < VOCAB:
+        if temperature >= SAMPLING_EPS and top_k > 0 and top_k < VOCAB:
             search_lower = pl.cast(FP32_POS_INF, pl.FP32)
             search_upper = pl.cast(FP32_NEG_INF, pl.FP32)
             for extrema_block in pl.range(VOCAB // TOPK_ROW_WIDTH_TILE // SAMPLE_BLOCK_ROWS_TILE):
@@ -421,26 +470,29 @@ def apply_top_k(
 
 @pl.jit.inline
 def gumbel_sample(
+    logits: pl.Tensor,
     filtered_logits: pl.Tensor,
     temperatures: pl.Tensor,
     seeds: pl.Tensor,
     positions: pl.Tensor,
     sampled_ids: pl.Tensor,
 ):
-    """Run greedy or Gumbel-max in an independent row-parallel stage."""
+    """Run direct-logits greedy or filtered-logits Gumbel-max sampling."""
     sample_rows = pl.tensor.dim(filtered_logits, 0)
+    logits_grid = pl.reshape(logits, [SAMPLE_ROWS * (VOCAB // GREEDY_ROW_WIDTH_TILE), GREEDY_ROW_WIDTH_TILE])
     for row in pl.spmd(sample_rows, name_hint="sample_gumbel_argmax"):
         temperature = pl.read(temperatures, [row])
-        random_flag = pl.cast(0, pl.INT32)
-        if temperature >= SAMPLING_EPS:
+        if temperature < SAMPLING_EPS:
+            best_index = _greedy_sample_logits(logits_grid, row)
+        else:
             random_flag = pl.cast(1, pl.INT32)
-        seed = pl.read(seeds, [row])
-        position = pl.read(positions, [row])
-        seed_index = pl.cast(seed, pl.INDEX)
-        position_index = pl.cast(position, pl.INDEX)
-        random_key_index = seed_index + position_index * POSITION_MULTIPLIER
-        random_key = pl.cast(random_key_index % RANDOM_KEY_MODULUS, pl.INT32)
-        best_index = _sample_filtered_logits(filtered_logits, row, random_flag, random_key)
+            seed = pl.read(seeds, [row])
+            position = pl.read(positions, [row])
+            seed_index = pl.cast(seed, pl.INDEX)
+            position_index = pl.cast(position, pl.INDEX)
+            random_key_index = seed_index + position_index * POSITION_MULTIPLIER
+            random_key = pl.cast(random_key_index % RANDOM_KEY_MODULUS, pl.INT32)
+            best_index = _sample_filtered_logits(filtered_logits, row, random_flag, random_key)
         sampled_row = pl.create_tensor([1, SAMPLED_IDS_PAD], dtype=pl.INT32)
         sampled_row[:, :] = pl.full([1, SAMPLED_IDS_PAD], dtype=pl.INT32, value=0)
         pl.write(sampled_row, [0, 0], best_index)
@@ -460,8 +512,9 @@ def sample(
     """Orchestrate independent temperature, top-k, and Gumbel stages."""
     processed_logits = pl.create_tensor([SAMPLE_ROWS, VOCAB], dtype=pl.FP32)
     apply_temperature(logits, sampling_temperatures, processed_logits)
-    apply_top_k(processed_logits, sampling_top_ks)
+    apply_top_k(processed_logits, sampling_temperatures, sampling_top_ks)
     return gumbel_sample(
+        logits,
         processed_logits,
         sampling_temperatures,
         sampling_seeds,

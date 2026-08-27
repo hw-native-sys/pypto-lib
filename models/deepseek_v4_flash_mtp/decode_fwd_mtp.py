@@ -123,7 +123,11 @@ STATE_VALID = 0
 STATE_GENERATION = 1
 STATE_TAIL_POSITION = 2
 STATE_COMMITTED_COUNT = 3
-STATE_META_WIDTH = 4
+STATE_TEMPERATURE_MICROS = 4
+STATE_TOP_K = 5
+STATE_SEED = 6
+STATE_META_WIDTH = 7
+TEMPERATURE_SCALE = 1000000.0
 
 STATE_TAIL_TOKEN = 0
 STATE_DRAFT_TOKEN = 1
@@ -144,6 +148,10 @@ def prepare_decode_from_device_state(
     kv_seq_lens: pl.Tensor[[B], pl.INT32],
     tail_token_ids: pl.Tensor[[B], pl.INT64],
     tail_positions: pl.Tensor[[B], pl.INT32],
+    sampling_temperatures: pl.Tensor[[MAX_LOGIT_ROWS], pl.FP32],
+    sampling_top_ks: pl.Tensor[[MAX_LOGIT_ROWS], pl.INT32],
+    sampling_seeds: pl.Tensor[[MAX_LOGIT_ROWS], pl.INT32],
+    sampling_positions: pl.Tensor[[MAX_LOGIT_ROWS], pl.INT32],
 ):
     """Late-bind recurrent decode fields from stable device slots::
 
@@ -159,7 +167,21 @@ def prepare_decode_from_device_state(
     # One core owns these tightly packed scalar updates.  The metadata volume
     # is tiny, and single ownership avoids adjacent scalar DMA write races.
     for core in pl.spmd(1, name_hint="mtp_state_prepare"):
+        default_temperature = pl.cast(0.0, pl.FP32)
+        default_top_k = pl.cast(VOCAB, pl.INT32)
+        default_seed = pl.cast(0, pl.INT32)
+        default_position = pl.cast(0, pl.INT32)
         for request in pl.range(core, B):
+            row0 = request * S
+            row1 = row0 + 1
+            pl.write(sampling_temperatures, [row0], default_temperature)
+            pl.write(sampling_temperatures, [row1], default_temperature)
+            pl.write(sampling_top_ks, [row0], default_top_k)
+            pl.write(sampling_top_ks, [row1], default_top_k)
+            pl.write(sampling_seeds, [row0], default_seed)
+            pl.write(sampling_seeds, [row1], default_seed)
+            pl.write(sampling_positions, [row0], default_position)
+            pl.write(sampling_positions, [row1], default_position)
             slot_raw = pl.read(state_slot_ids, [request])
             if slot_raw >= 0:
                 slot = pl.cast(slot_raw, target_type=pl.INDEX)
@@ -167,11 +189,14 @@ def prepare_decode_from_device_state(
                 generation = pl.read(state_meta, [slot, STATE_GENERATION])
                 expected = pl.read(state_generations, [request])
                 if valid == 1 and generation == expected:
-                    row0 = request * S
-                    row1 = row0 + 1
                     tail_token = pl.read(state_tokens, [slot, STATE_TAIL_TOKEN])
                     draft_token = pl.read(state_tokens, [slot, STATE_DRAFT_TOKEN])
                     tail_position = pl.read(state_meta, [slot, STATE_TAIL_POSITION])
+                    temperature_micros = pl.read(state_meta, [slot, STATE_TEMPERATURE_MICROS])
+                    temperature_fp32 = pl.cast(temperature_micros, pl.FP32)
+                    temperature = pl.div(temperature_fp32, TEMPERATURE_SCALE)
+                    top_k = pl.read(state_meta, [slot, STATE_TOP_K])
+                    seed = pl.read(state_meta, [slot, STATE_SEED])
                     pl.write(input_ids, [row0], tail_token)
                     pl.write(input_ids, [row1], draft_token)
                     pl.write(
@@ -191,7 +216,62 @@ def prepare_decode_from_device_state(
                     )
                     pl.write(tail_token_ids, [request], tail_token)
                     pl.write(tail_positions, [request], tail_position)
+                    pl.write(sampling_temperatures, [row0], temperature)
+                    pl.write(sampling_temperatures, [row1], temperature)
+                    pl.write(sampling_top_ks, [row0], top_k)
+                    pl.write(sampling_top_ks, [row1], top_k)
+                    pl.write(sampling_seeds, [row0], seed)
+                    pl.write(sampling_seeds, [row1], seed)
+                    sampling_position0 = pl.cast(tail_position + 2, target_type=pl.INT32)
+                    sampling_position1 = pl.cast(tail_position + 3, target_type=pl.INT32)
+                    pl.write(sampling_positions, [row0], sampling_position0)
+                    pl.write(sampling_positions, [row1], sampling_position1)
     return input_ids, position_ids, kv_seq_lens, tail_token_ids, tail_positions
+
+
+@pl.jit.inline
+def prepare_mtp_sampling_from_device_state(
+    state_slot_ids: pl.Tensor[[B], pl.INT32],
+    state_generations: pl.Tensor[[B], pl.INT32],
+    state_meta: pl.Tensor[[B, STATE_META_WIDTH], pl.INT32],
+    position_ids: pl.Tensor[[T], pl.INT32],
+    sampling_temperatures: pl.Tensor[[MAX_LOGIT_ROWS], pl.FP32],
+    sampling_top_ks: pl.Tensor[[MAX_LOGIT_ROWS], pl.INT32],
+    sampling_seeds: pl.Tensor[[MAX_LOGIT_ROWS], pl.INT32],
+    sampling_positions: pl.Tensor[[MAX_LOGIT_ROWS], pl.INT32],
+):
+    """Build next-draft sampling controls from persistent request state."""
+    for core in pl.spmd(1, name_hint="mtp_state_sampling"):
+        default_temperature = pl.cast(0.0, pl.FP32)
+        default_top_k = pl.cast(VOCAB, pl.INT32)
+        default_seed = pl.cast(0, pl.INT32)
+        default_position = pl.cast(0, pl.INT32)
+        for row in pl.range(core, MAX_LOGIT_ROWS):
+            pl.write(sampling_temperatures, [row], default_temperature)
+            pl.write(sampling_top_ks, [row], default_top_k)
+            pl.write(sampling_seeds, [row], default_seed)
+            pl.write(sampling_positions, [row], default_position)
+        for request in pl.range(core, B):
+            slot_raw = pl.read(state_slot_ids, [request])
+            if slot_raw >= 0:
+                slot = pl.cast(slot_raw, target_type=pl.INDEX)
+                valid = pl.read(state_meta, [slot, STATE_VALID])
+                generation = pl.read(state_meta, [slot, STATE_GENERATION])
+                expected = pl.read(state_generations, [request])
+                if valid == 1 and generation == expected:
+                    temperature_micros = pl.read(state_meta, [slot, STATE_TEMPERATURE_MICROS])
+                    temperature_fp32 = pl.cast(temperature_micros, pl.FP32)
+                    temperature = pl.div(temperature_fp32, TEMPERATURE_SCALE)
+                    top_k = pl.read(state_meta, [slot, STATE_TOP_K])
+                    seed = pl.read(state_meta, [slot, STATE_SEED])
+                    row1 = request * S + 1
+                    row1_position = pl.read(position_ids, [row1])
+                    sampling_position = pl.cast(row1_position + 1, target_type=pl.INT32)
+                    pl.write(sampling_temperatures, [request], temperature)
+                    pl.write(sampling_top_ks, [request], top_k)
+                    pl.write(sampling_seeds, [request], seed)
+                    pl.write(sampling_positions, [request], sampling_position)
+    return sampling_temperatures, sampling_top_ks, sampling_seeds, sampling_positions
 
 
 @pl.jit.inline
@@ -392,6 +472,10 @@ def l2_decode_fwd_mtp(
     final_norm_w: pl.Tensor[[D], pl.BF16],
     lm_head_weight: pl.Tensor[[VOCAB_PER_TP, D], pl.BF16],
     logit_row_indices: pl.Tensor[[MAX_LOGIT_ROWS], pl.INT32],
+    sampling_temperatures: pl.InOut[pl.Tensor[[MAX_LOGIT_ROWS], pl.FP32]],
+    sampling_top_ks: pl.InOut[pl.Tensor[[MAX_LOGIT_ROWS], pl.INT32]],
+    sampling_seeds: pl.InOut[pl.Tensor[[MAX_LOGIT_ROWS], pl.INT32]],
+    sampling_positions: pl.InOut[pl.Tensor[[MAX_LOGIT_ROWS], pl.INT32]],
     pre_hc_hidden_out: pl.Out[pl.Tensor[[T, HC_MULT, D], pl.FP32]],
     hidden_out: pl.Out[pl.Tensor[[T, D], pl.BF16]],
     logits: pl.Out[pl.Tensor[[MAX_LOGIT_ROWS, LM_HEAD_VOCAB], pl.FP32]],
@@ -466,6 +550,10 @@ def l2_decode_fwd_mtp(
     mtp_mtp_hc_head_base: pl.Tensor[[HC_MULT], pl.FP32],
     mtp_mtp_norm_w: pl.Tensor[[D], pl.BF16],
     mtp_logit_row_indices: pl.Tensor[[MAX_LOGIT_ROWS], pl.INT32],
+    mtp_sampling_temperatures: pl.InOut[pl.Tensor[[MAX_LOGIT_ROWS], pl.FP32]],
+    mtp_sampling_top_ks: pl.InOut[pl.Tensor[[MAX_LOGIT_ROWS], pl.INT32]],
+    mtp_sampling_seeds: pl.InOut[pl.Tensor[[MAX_LOGIT_ROWS], pl.INT32]],
+    mtp_sampling_positions: pl.InOut[pl.Tensor[[MAX_LOGIT_ROWS], pl.INT32]],
     mtp_hidden_out: pl.Out[pl.Tensor[[T, D], pl.BF16]],
     mtp_next_pre_hc_hidden: pl.Out[pl.Tensor[[T, HC_MULT, D], pl.FP32]],
     mtp_logits: pl.Out[pl.Tensor[[MAX_LOGIT_ROWS, LM_HEAD_VOCAB], pl.FP32]],
@@ -495,6 +583,8 @@ def l2_decode_fwd_mtp(
         mtp_tail_slot_ids, mtp_state_generations, mtp_state_tokens, mtp_state_meta,
         input_ids, position_ids, kv_seq_lens,
         mtp_tail_token_ids, mtp_tail_positions,
+        sampling_temperatures, sampling_top_ks,
+        sampling_seeds, sampling_positions,
     )
     ori_slot_mapping = pl.create_tensor([T], dtype=pl.INT64)
     swa_slot_mapping = pl.create_tensor([T], dtype=pl.INT64)
@@ -554,6 +644,7 @@ def l2_decode_fwd_mtp(
         input_ids,
         hc_head_fn, hc_head_scale, hc_head_base, final_norm_w,
         lm_head_weight, logit_row_indices,
+        sampling_temperatures, sampling_top_ks, sampling_seeds, sampling_positions,
         pre_hc_hidden_out, hidden_out, logits, sampled_ids,
         recv_meta, recv_x, recv_aux, recv_route,
         arrived, data_arrived, routed_y_buf, combine_arrived,
@@ -564,6 +655,12 @@ def l2_decode_fwd_mtp(
         input_ids, position_ids, sampled_ids,
         mtp_tail_token_ids, mtp_tail_positions, mtp_tail_slot_ids,
         mtp_input_ids, mtp_position_ids, mtp_accepted_counts,
+    )
+    prepare_mtp_sampling_from_device_state(
+        mtp_tail_slot_ids, mtp_state_generations, mtp_state_meta,
+        mtp_position_ids,
+        mtp_sampling_temperatures, mtp_sampling_top_ks,
+        mtp_sampling_seeds, mtp_sampling_positions,
     )
     mtp_hidden_states = pl.create_tensor([T, D], dtype=pl.BF16)
     lookup_embedding(mtp_input_ids, embed_weight, mtp_hidden_states)
@@ -603,6 +700,8 @@ def l2_decode_fwd_mtp(
         mtp_shared_w1, mtp_shared_w1_scale, mtp_shared_w3, mtp_shared_w3_scale, mtp_shared_w2, mtp_shared_w2_scale,
         mtp_mtp_hc_head_fn, mtp_mtp_hc_head_scale, mtp_mtp_hc_head_base, mtp_mtp_norm_w,
         lm_head_weight, mtp_logit_row_indices,
+        mtp_sampling_temperatures, mtp_sampling_top_ks,
+        mtp_sampling_seeds, mtp_sampling_positions,
         mtp_hidden_out, mtp_next_pre_hc_hidden, mtp_logits, mtp_sampled_ids,
         mtp_recv_meta, mtp_recv_x, mtp_recv_aux, mtp_recv_route,
         mtp_arrived, mtp_data_arrived, mtp_routed_y_buf, mtp_combine_arrived,
@@ -715,6 +814,10 @@ def l3_decode_fwd_mtp(
     final_norm_w: pl.Tensor[[N_RANKS, D], pl.BF16],
     pre_hc_hidden_out: pl.Out[pl.Tensor[[N_RANKS, T, HC_MULT, D], pl.FP32]],
     lm_head_weight: pl.Tensor[[N_RANKS, VOCAB_PER_TP, D], pl.BF16],
+    sampling_temperatures: pl.InOut[pl.Tensor[[N_RANKS, MAX_LOGIT_ROWS], pl.FP32]],
+    sampling_top_ks: pl.InOut[pl.Tensor[[N_RANKS, MAX_LOGIT_ROWS], pl.INT32]],
+    sampling_seeds: pl.InOut[pl.Tensor[[N_RANKS, MAX_LOGIT_ROWS], pl.INT32]],
+    sampling_positions: pl.InOut[pl.Tensor[[N_RANKS, MAX_LOGIT_ROWS], pl.INT32]],
     hidden_out: pl.Out[pl.Tensor[[N_RANKS, T, D], pl.BF16]],
     logits: pl.Out[pl.Tensor[[N_RANKS, MAX_LOGIT_ROWS, LM_HEAD_VOCAB], pl.FP32]],
     sampled_ids: pl.Out[pl.Tensor[[N_RANKS, MAX_LOGIT_ROWS, SAMPLED_IDS_PAD], pl.INT32]],
@@ -780,6 +883,10 @@ def l3_decode_fwd_mtp(
     mtp_mtp_hc_head_scale: pl.Tensor[[N_RANKS, 1], pl.FP32],
     mtp_mtp_hc_head_base: pl.Tensor[[N_RANKS, HC_MULT], pl.FP32],
     mtp_mtp_norm_w: pl.Tensor[[N_RANKS, D], pl.BF16],
+    mtp_sampling_temperatures: pl.InOut[pl.Tensor[[N_RANKS, MAX_LOGIT_ROWS], pl.FP32]],
+    mtp_sampling_top_ks: pl.InOut[pl.Tensor[[N_RANKS, MAX_LOGIT_ROWS], pl.INT32]],
+    mtp_sampling_seeds: pl.InOut[pl.Tensor[[N_RANKS, MAX_LOGIT_ROWS], pl.INT32]],
+    mtp_sampling_positions: pl.InOut[pl.Tensor[[N_RANKS, MAX_LOGIT_ROWS], pl.INT32]],
     mtp_hidden_out: pl.Out[pl.Tensor[[N_RANKS, T, D], pl.BF16]],
     mtp_next_pre_hc_hidden: pl.Out[pl.Tensor[[N_RANKS, T, HC_MULT, D], pl.FP32]],
     mtp_logits: pl.Out[pl.Tensor[[N_RANKS, MAX_LOGIT_ROWS, LM_HEAD_VOCAB], pl.FP32]],
@@ -866,6 +973,8 @@ def l3_decode_fwd_mtp(
             input_ids[rank],
             hc_head_fn[rank], hc_head_scale[rank], hc_head_base[rank], final_norm_w[rank],
             lm_head_weight[rank], logit_row_indices[rank],
+            sampling_temperatures[rank], sampling_top_ks[rank],
+            sampling_seeds[rank], sampling_positions[rank],
             pre_hc_hidden_out[rank], hidden_out[rank], logits[rank], sampled_ids[rank],
             recv_meta, recv_x, recv_aux, recv_route,
             arrived, data_arrived, routed_y_buf, combine_arrived,
@@ -892,6 +1001,8 @@ def l3_decode_fwd_mtp(
             mtp_mtp_hc_head_fn[rank], mtp_mtp_hc_head_scale[rank], mtp_mtp_hc_head_base[rank],
             mtp_mtp_norm_w[rank],
             mtp_logit_row_indices[rank],
+            mtp_sampling_temperatures[rank], mtp_sampling_top_ks[rank],
+            mtp_sampling_seeds[rank], mtp_sampling_positions[rank],
             mtp_hidden_out[rank], mtp_next_pre_hc_hidden[rank], mtp_logits[rank], mtp_sampled_ids[rank],
             mtp_recv_meta, mtp_recv_x, mtp_recv_aux, mtp_recv_route,
             mtp_arrived, mtp_data_arrived, mtp_routed_y_buf, mtp_combine_arrived,
@@ -982,6 +1093,9 @@ def build_tensor_specs(
         meta[:, :, STATE_GENERATION] = 1
         meta[:, :, STATE_TAIL_POSITION] = start_pos - 1
         meta[:, :, STATE_COMMITTED_COUNT] = 0
+        meta[:, :, STATE_TEMPERATURE_MICROS] = 0
+        meta[:, :, STATE_TOP_K] = VOCAB
+        meta[:, :, STATE_SEED] = 0
         return meta
 
     specs.update(
@@ -1095,6 +1209,17 @@ def build_tensor_specs(
             continue
         specs[f"mtp_{name}"] = replace(spec, name=f"mtp_{name}")
 
+    sampling_names = {
+        "sampling_temperatures",
+        "sampling_top_ks",
+        "sampling_seeds",
+        "sampling_positions",
+    }
+    for name in sampling_names:
+        specs[name] = replace(specs[name], is_output=True)
+        mtp_name = f"mtp_{name}"
+        specs[mtp_name] = replace(specs[mtp_name], is_output=True)
+
     param_names = l3_decode_fwd_mtp._param_names()
     missing = set(param_names) - specs.keys()
     extra = specs.keys() - set(param_names)
@@ -1205,4 +1330,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-

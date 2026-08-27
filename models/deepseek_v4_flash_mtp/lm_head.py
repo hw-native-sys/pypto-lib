@@ -20,7 +20,8 @@ import pypto.language as pl
 import pypto.language.distributed as pld
 from pypto.ir.distributed_compiled_program import DistributedConfig
 
-from config import DECODE_TOKENS, FLASH as M, FP32_NEG_INF
+from config import DECODE_TOKENS, FLASH as M
+from sample import golden_sample, sample
 
 
 T_DYN = pl.dynamic("LM_HEAD_T_DYN")
@@ -68,10 +69,6 @@ FUSED_K_TILE = 256
 FUSED_VOCAB_TILE = 256
 HIDDEN_GATHER_TILE = 512
 LOGITS_COMM_TILE = 2048
-# Greedy sampling scans each row as a [GREEDY_BLOCK_ROWS, GREEDY_ROW_WIDTH] grid.
-# 8 rows keeps a reduction result at 32 B; alloc_tile rejects the 4 B a [1, 1] gives.
-GREEDY_ROW_WIDTH = 808
-GREEDY_BLOCK_ROWS = 8
 
 # Derived layout. The vocab shard rarely divides the matmul tile, so the last tile
 # is ragged: a plain ceil tile count, the weight load carries a valid_shape, and
@@ -87,10 +84,6 @@ LOGITS_COMM_TAIL = VOCAB_PER_TP % LOGITS_COMM_TILE
 N_LOGITS_COMM_TILES = VOCAB_PER_TP // LOGITS_COMM_TILE
 LOGITS_COMM_BLOCKS = min(FUSED_LM_HEAD_CORES, N_LOGITS_COMM_TILES + (1 if LOGITS_COMM_TAIL != 0 else 0))
 LOGITS_TAIL_BLOCK = N_LOGITS_COMM_TILES % LOGITS_COMM_BLOCKS
-GREEDY_GRID_ROWS = VOCAB // GREEDY_ROW_WIDTH
-GREEDY_BLOCK_SPAN = GREEDY_BLOCK_ROWS * GREEDY_ROW_WIDTH
-# 2^30: above every vocab id, clear of int32 overflow once a block base is added.
-GREEDY_INDEX_SENTINEL = 1073741824
 
 # Keeps the GM staging race-free: each UP_DOWN lane writes exactly the row band it
 # later reads, and the two lanes' bands are disjoint.
@@ -98,9 +91,6 @@ assert SHARD_ROWS == OWNERS_PER_LANE * MAX_LOGIT_ROWS, (
     "each AIV lane's shard rows must be exactly the rows of the owners it pushes"
 )
 assert GROUP_LOGIT_ROWS % 16 == 0, "matmul M extent must be a multiple of 16"
-assert GREEDY_BLOCK_ROWS * 4 % 32 == 0, "reduction result must clear the 32 B column floor"
-assert GREEDY_ROW_WIDTH * 4 % 32 == 0, "block row must clear the 32 B row floor"
-assert VOCAB < GREEDY_INDEX_SENTINEL, "sentinel must lose every row_min against a real id"
 assert TP_SIZE in _TP_CHOICES, f"--tp must be one of {_TP_CHOICES} (got {TP_SIZE})"
 assert DP_SIZE in _DP_CHOICES, f"--dp must be one of {_DP_CHOICES} (got {DP_SIZE})"
 
@@ -336,72 +326,15 @@ def lm_head_test(
     return logits
 
 
-@pl.jit.inline
-def greedy_sample(
-    logits: pl.Tensor[[MAX_LOGIT_ROWS, VOCAB], pl.FP32],
-    sampled_ids: pl.Tensor[[MAX_LOGIT_ROWS, SAMPLED_IDS_PAD], pl.INT32],
-):
-    """Select the first maximum token id from each full-vocabulary logits row."""
-    # One pass per row into a [BLOCK_ROWS, ROW_WIDTH] accumulator carrying the
-    # running maximum and the block that set it; a lane's column is its position.
-    logits_grid = pl.reshape(logits, [MAX_LOGIT_ROWS * GREEDY_GRID_ROWS, GREEDY_ROW_WIDTH])
-    for row in pl.spmd(MAX_LOGIT_ROWS, name_hint="lm_head_greedy_sample"):
-        row_base = row * GREEDY_GRID_ROWS
-        running_max = pl.full([GREEDY_BLOCK_ROWS, GREEDY_ROW_WIDTH], dtype=pl.FP32, value=FP32_NEG_INF)
-        running_base = pl.full([GREEDY_BLOCK_ROWS, GREEDY_ROW_WIDTH], dtype=pl.INT32, value=0)
-        for block in pl.range(GREEDY_GRID_ROWS // GREEDY_BLOCK_ROWS):
-            block_row = row_base + block * GREEDY_BLOCK_ROWS
-            scores = logits_grid[block_row : block_row + GREEDY_BLOCK_ROWS, 0:GREEDY_ROW_WIDTH]
-            # Strict greater-than, so a lane keeps the earliest block it peaked at.
-            is_newer = pl.cmp(scores, running_max, cmp_type=4)
-            newer = pl.cast(is_newer, target_type=pl.INT32)
-            running_max = pl.maximum(running_max, scores)
-            block_base = pl.cast(block * GREEDY_BLOCK_SPAN, pl.INT32)
-            to_new = pl.neg(pl.sub(running_base, block_base))
-            running_base = pl.add(running_base, pl.mul(newer, to_new))
-
-        # Broadcast the lane maxima back and column-reduce: every entry is then the
-        # row maximum. A scalar pl.max over the lanes miscompiles on fp32
-        # (ptoas_bitcast has no float overload).
-        lane_maxima = pl.row_max(running_max)
-        lane_zeros = pl.full([GREEDY_BLOCK_ROWS, GREEDY_ROW_WIDTH], dtype=pl.FP32, value=0.0)
-        lane_broadcast = pl.row_expand_add(lane_zeros, lane_maxima)
-        best_value = pl.read(pl.col_max(lane_broadcast), [0, 0])
-
-        # Flat index of every lane still at the row maximum, sentinel for the rest.
-        # The lane * width term folds into the scalar combine below, keeping the
-        # ramp a broadcast row rather than an (illegal) 2D arange.
-        ramp_zeros = pl.full([GREEDY_BLOCK_ROWS, GREEDY_ROW_WIDTH], dtype=pl.INT32, value=0)
-        column_ramp = pl.col_expand(ramp_zeros, pl.arange(0, [1, GREEDY_ROW_WIDTH], dtype=pl.INT32))
-        flat_index = pl.add(running_base, column_ramp)
-        is_max = pl.cmp(running_max, best_value, cmp_type=0)
-        hit = pl.cast(is_max, target_type=pl.INT32)
-        offset_index = pl.sub(flat_index, GREEDY_INDEX_SENTINEL)
-        candidates = pl.add(pl.mul(hit, offset_index), GREEDY_INDEX_SENTINEL)
-        lane_indices = pl.row_min(candidates)
-        best_index = pl.read(lane_indices, [0, 0])
-        for lane in pl.range(1, GREEDY_BLOCK_ROWS):
-            lane_term = pl.cast(lane * GREEDY_ROW_WIDTH, pl.INT32)
-            lane_best = pl.read(lane_indices, [lane, 0]) + lane_term
-            best_index = pl.min(best_index, lane_best)
-
-        sampled_row = pl.create_tensor([1, SAMPLED_IDS_PAD], dtype=pl.INT32)
-        sampled_row[:, :] = pl.full(
-            [1, SAMPLED_IDS_PAD],
-            dtype=pl.INT32,
-            value=0,
-        )
-        pl.write(sampled_row, [0, 0], best_index)
-        sampled_ids[row : row + 1, :] = sampled_row
-
-    return sampled_ids
-
-
 @pl.jit.inline(auto_scope=False)
 def lm_head_with_sampling(
     hidden_states: pl.Tensor[[T_DYN, D], pl.BF16],
     lm_head_weight: pl.Tensor[[VOCAB_PER_TP, D], pl.BF16],
     logit_row_indices: pl.Tensor[[MAX_LOGIT_ROWS], pl.INT32],
+    sampling_temperatures: pl.Tensor[[MAX_LOGIT_ROWS], pl.FP32],
+    sampling_top_ks: pl.Tensor[[MAX_LOGIT_ROWS], pl.INT32],
+    sampling_seeds: pl.Tensor[[MAX_LOGIT_ROWS], pl.INT32],
+    sampling_positions: pl.Tensor[[MAX_LOGIT_ROWS], pl.INT32],
     logits: pl.Out[pl.Tensor[[MAX_LOGIT_ROWS, VOCAB], pl.FP32]],
     sampled_ids: pl.Out[pl.Tensor[[MAX_LOGIT_ROWS, SAMPLED_IDS_PAD], pl.INT32]],
     hidden_window: pld.DistributedTensor[[GROUP_LOGIT_ROWS, D], pl.BF16],
@@ -412,7 +345,7 @@ def lm_head_with_sampling(
     tp_rank: pl.Scalar[pl.INT32],
     done_epoch: pl.Scalar[pl.INT32],
 ):
-    """Project logits and sample top-1 tokens in one opaque L2 entry."""
+    """Project logits and sample tokens in one opaque L2 entry."""
     lm_head(
         hidden_states,
         lm_head_weight,
@@ -426,7 +359,14 @@ def lm_head_with_sampling(
         tp_rank,
         done_epoch,
     )
-    greedy_sample(logits, sampled_ids)
+    sampled_ids = sample(
+        logits,
+        sampling_temperatures,
+        sampling_top_ks,
+        sampling_seeds,
+        sampling_positions,
+        sampled_ids,
+    )
     return logits, sampled_ids
 
 
@@ -435,6 +375,10 @@ def lm_head_with_sampling_test(
     hidden_states: pl.Tensor[[T_DYN, D], pl.BF16],
     lm_head_weight: pl.Tensor[[VOCAB_PER_TP, D], pl.BF16],
     logit_row_indices: pl.Tensor[[MAX_LOGIT_ROWS], pl.INT32],
+    sampling_temperatures: pl.Tensor[[MAX_LOGIT_ROWS], pl.FP32],
+    sampling_top_ks: pl.Tensor[[MAX_LOGIT_ROWS], pl.INT32],
+    sampling_seeds: pl.Tensor[[MAX_LOGIT_ROWS], pl.INT32],
+    sampling_positions: pl.Tensor[[MAX_LOGIT_ROWS], pl.INT32],
     logits: pl.Out[pl.Tensor[[MAX_LOGIT_ROWS, VOCAB], pl.FP32]],
     sampled_ids: pl.Out[pl.Tensor[[MAX_LOGIT_ROWS, SAMPLED_IDS_PAD], pl.INT32]],
     hidden_window: pld.DistributedTensor[[GROUP_LOGIT_ROWS, D], pl.BF16],
@@ -445,11 +389,15 @@ def lm_head_with_sampling_test(
     tp_rank: pl.Scalar[pl.INT32],
     done_epoch: pl.Scalar[pl.INT32],
 ):
-    """Standalone opaque entry for projection plus greedy sampling tests."""
+    """Standalone opaque entry for projection plus sampling tests."""
     return lm_head_with_sampling(
         hidden_states,
         lm_head_weight,
         logit_row_indices,
+        sampling_temperatures,
+        sampling_top_ks,
+        sampling_seeds,
+        sampling_positions,
         logits,
         sampled_ids,
         hidden_window,
@@ -466,6 +414,10 @@ def lm_head_with_sampling_test(
 def l3_lm_head(
     hidden_states: pl.Tensor[[WORLD_SIZE, TEST_TOKENS, D], pl.BF16],
     lm_head_weight: pl.Tensor[[WORLD_SIZE, VOCAB_PER_TP, D], pl.BF16],
+    sampling_temperatures: pl.Tensor[[WORLD_SIZE, MAX_LOGIT_ROWS], pl.FP32],
+    sampling_top_ks: pl.Tensor[[WORLD_SIZE, MAX_LOGIT_ROWS], pl.INT32],
+    sampling_seeds: pl.Tensor[[WORLD_SIZE, MAX_LOGIT_ROWS], pl.INT32],
+    sampling_positions: pl.Tensor[[WORLD_SIZE, MAX_LOGIT_ROWS], pl.INT32],
     logits: pl.Out[pl.Tensor[[WORLD_SIZE, MAX_LOGIT_ROWS, VOCAB], pl.FP32]],
     sampled_ids: pl.Out[
         pl.Tensor[[WORLD_SIZE, MAX_LOGIT_ROWS, SAMPLED_IDS_PAD], pl.INT32]
@@ -485,8 +437,10 @@ def l3_lm_head(
         logits_window = pld.window(logits_window_buf, [MAX_LOGIT_ROWS, VOCAB], dtype=pl.FP32)
         logits_done = pld.window(logits_done_buf, [TP_SIZE, 1], dtype=pl.INT32)
         lm_head_with_sampling_test(
-            hidden_states[r], lm_head_weight[r], logit_row_indices[r], logits[r],
-            sampled_ids[r],
+            hidden_states[r], lm_head_weight[r], logit_row_indices[r],
+            sampling_temperatures[r], sampling_top_ks[r],
+            sampling_seeds[r], sampling_positions[r],
+            logits[r], sampled_ids[r],
             hidden_window, hidden_done, logits_window, logits_done,
             r // TP_SIZE * TP_SIZE, r % TP_SIZE, DONE_VALUE, device=r,
         )
@@ -501,7 +455,8 @@ def golden_lm_head(tensors):
     weight = tensors["lm_head_weight"].float()
     full_weight = torch.cat([weight[tp] for tp in range(TP_SIZE)], dim=0)
     full_logits = []
-    for owner_rank in range(WORLD_SIZE):
+    world_size = hidden.shape[0]
+    for owner_rank in range(world_size):
         selected = torch.zeros((MAX_LOGIT_ROWS, D), dtype=torch.float32)
         for row in range(MAX_LOGIT_ROWS):
             source_row = int(tensors["logit_row_indices"][owner_rank, row])
@@ -511,11 +466,17 @@ def golden_lm_head(tensors):
         full_logits.append(torch.matmul(selected, full_weight.t()))
     tensors["logits"][:] = torch.stack(full_logits, dim=0)
     if "sampled_ids" in tensors:
-        tensors["sampled_ids"].zero_()
-        tensors["sampled_ids"][:, :, 0] = torch.argmax(
-            tensors["logits"],
-            dim=-1,
-        ).to(torch.int32)
+        for rank in range(world_size):
+            golden_sample(
+                {
+                    "logits": tensors["logits"][rank],
+                    "temperatures": tensors["sampling_temperatures"][rank],
+                    "top_ks": tensors["sampling_top_ks"][rank],
+                    "seeds": tensors["sampling_seeds"][rank],
+                    "positions": tensors["sampling_positions"][rank],
+                    "sampled_ids": tensors["sampled_ids"][rank],
+                }
+            )
 
 
 def build_tensor_specs(num_tokens=TEST_TOKENS):
@@ -552,6 +513,32 @@ def build_tensor_specs(num_tokens=TEST_TOKENS):
             torch.bfloat16,
             init_value=init_lm_head_weight,
             resident="stacked",
+        ),
+        TensorSpec(
+            "sampling_temperatures",
+            [WORLD_SIZE, MAX_LOGIT_ROWS],
+            torch.float32,
+            init_value=lambda: torch.zeros(WORLD_SIZE, MAX_LOGIT_ROWS),
+        ),
+        TensorSpec(
+            "sampling_top_ks",
+            [WORLD_SIZE, MAX_LOGIT_ROWS],
+            torch.int32,
+            init_value=lambda: torch.full(
+                (WORLD_SIZE, MAX_LOGIT_ROWS), VOCAB, dtype=torch.int32
+            ),
+        ),
+        TensorSpec(
+            "sampling_seeds",
+            [WORLD_SIZE, MAX_LOGIT_ROWS],
+            torch.int32,
+            init_value=lambda: torch.zeros(WORLD_SIZE, MAX_LOGIT_ROWS, dtype=torch.int32),
+        ),
+        TensorSpec(
+            "sampling_positions",
+            [WORLD_SIZE, MAX_LOGIT_ROWS],
+            torch.int32,
+            init_value=lambda: torch.zeros(WORLD_SIZE, MAX_LOGIT_ROWS, dtype=torch.int32),
         ),
         TensorSpec(
             "logits",
