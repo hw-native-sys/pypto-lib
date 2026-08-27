@@ -102,13 +102,13 @@ assert IDX_N_HEADS >= ROPE_ROW_TILE and IDX_N_HEADS % ROPE_ROW_TILE == 0
 TOPK_PAIR_WIDTH = 2 * IDX_TOPK
 
 # Exact Top-K geometry for the 1M selector.
-TOPK_CANDIDATES_PER_LEAF = 2048
+TOPK_CANDIDATES_PER_LEAF = 8192
 TOPK_MAX_CANDIDATES = IDX_MAX_ROWS
 TOPK_MAX_LEAVES = TOPK_MAX_CANDIDATES // TOPK_CANDIDATES_PER_LEAF
-TOPK_LEAVES_PER_GROUP = 8
+TOPK_LEAVES_PER_GROUP = 2
 TOPK_GROUPS_PER_QUERY = TOPK_MAX_LEAVES // TOPK_LEAVES_PER_GROUP
 # Each AIV reduces one group at a time. Group roots survive until the query
-# merge; the lower tree levels reuse the worker-local eight-row scratch.
+# merge; each worker reuses a two-row scratch for its current group.
 TOPK_GROUP_WORKERS = 48
 TOPK_GROUP_ROOT_ROWS = T_PAD * TOPK_GROUPS_PER_QUERY
 TOPK_GROUP_SCRATCH_ROWS = TOPK_GROUP_WORKERS * TOPK_LEAVES_PER_GROUP
@@ -117,7 +117,7 @@ TOPK_ARENA_ROWS = TOPK_GROUP_ROOT_ROWS + TOPK_GROUP_SCRATCH_ROWS
 # global leaf sequence, so ragged queries cannot strand per-query lanes.
 TOPK_SCORE_WORKERS = 24
 assert TOPK_MAX_CANDIDATES % TOPK_CANDIDATES_PER_LEAF == 0
-assert TOPK_MAX_LEAVES == 128
+assert TOPK_MAX_LEAVES == 32
 assert TOPK_MAX_LEAVES % TOPK_LEAVES_PER_GROUP == 0
 assert TOPK_GROUPS_PER_QUERY == 16
 
@@ -181,7 +181,7 @@ def indexer_topk_leaf(
     valid_count: pl.Scalar[pl.INDEX],
     output_slot: pl.Scalar[pl.INDEX],
 ) -> None:
-    """Sort one scored 2K leaf and store its exact Top-512 pair row."""
+    """Sort one scored 8K leaf and store its exact Top-512 pair row."""
     logical_begin_i32 = pl.cast(logical_begin, pl.INT32)
     leaf_indices = pl.add(
         pl.tile.arange(
@@ -216,6 +216,7 @@ def indexer_topk_leaf(
     pairs = pl.mrgsort(pairs, block_len=64)
     pairs = pl.mrgsort(pairs, block_len=256)
     pairs = pl.mrgsort(pairs, block_len=1024)
+    pairs = pl.mrgsort(pairs, block_len=4096)
     pl.store(
         pl.tile.slice(pairs, [1, TOPK_PAIR_WIDTH], [0, 0]),
         [output_slot, 0],
@@ -230,7 +231,7 @@ def indexer_topk_group_wave(
     score_arena: pl.Tensor[[T_DYN, TOPK_MAX_CANDIDATES], pl.FP32],
     pair_arena: pl.Tensor[[TOPK_ARENA_ROWS, TOPK_PAIR_WIDTH], pl.FP32],
 ):
-    """Reduce globally striped eight-leaf subtrees into compact roots."""
+    """Reduce globally striped two-leaf subtrees into compact roots."""
     worker = pl.tile.get_block_idx()
     query_count = pl.tensor.dim(position_ids, 0)
     global_group_base = 0
@@ -285,7 +286,7 @@ def indexer_topk_group_wave(
                     TOPK_GROUP_ROOT_ROWS
                     + worker * TOPK_LEAVES_PER_GROUP
                 )
-                for group_leaf in pl.range(group_leaf_count):
+                for group_leaf in pl.unroll(TOPK_LEAVES_PER_GROUP):
                     leaf = leaf_begin + group_leaf
                     logical_begin = (
                         leaf * TOPK_CANDIDATES_PER_LEAF
@@ -302,41 +303,11 @@ def indexer_topk_group_wave(
                         valid_count,
                         scratch_base + group_leaf,
                     )
-
-                level1_count = (group_leaf_count + 1) // 2
-                merge_topk_level_pairs(
+                merge2_top512_pairs(
                     pair_arena,
                     scratch_base,
-                    group_leaf_count,
-                    0,
-                    0,
-                )
-                if level1_count > 1:
-                    level2_count = (level1_count + 1) // 2
-                    merge_topk_level_pairs(
-                        pair_arena,
-                        scratch_base,
-                        level1_count,
-                        0,
-                        0,
-                    )
-                    if level2_count > 1:
-                        merge_topk_level_pairs(
-                            pair_arena,
-                            scratch_base,
-                            level2_count,
-                            0,
-                            0,
-                        )
-                group_root = pl.load(
-                    pair_arena,
-                    [scratch_base, 0],
-                    [1, TOPK_PAIR_WIDTH],
-                )
-                pl.store(
-                    group_root,
-                    [group_root_slot, 0],
-                    pair_arena,
+                    scratch_base + 1,
+                    group_root_slot,
                 )
         global_group_base = global_group_base + group_count
 
