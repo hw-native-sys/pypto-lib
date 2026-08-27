@@ -65,17 +65,20 @@ from decode_o_proj import (
     LOCAL_T,
     LOCAL_T_PAD,
     O_WINDOW_ROWS,
-    decode_sharded_o_projection_reduce_scatter,
     decode_o_proj_tp1,
     o_group_a2a,
+    o_proj_reduce_scatter,
 )
 from decode_sparse_attn_hca import (
+    ATTENTION_PUBLISH_T_TILE,
     ATTENTION_PUBLISH_WORKERS,
+    H_TILE,
     HCA_MAX_COMPRESSED_ROWS,
+    PUBLISH_GROUPS,
     T_PAD,
     VALID_TOKEN_TILE,
-    publish_hca_o_groups,
     sparse_attn_hca,
+    sparse_attn_hca_tp1,
 )
 
 # Dynamic shape variables.
@@ -235,20 +238,85 @@ def decode_hca(
     attention_local_flat = pl.create_tensor([ATTENTION_WINDOW_ROWS, O_GROUP_IN], dtype=pl.BF16)
     attn_out = pl.create_tensor([t_dim, D], dtype=pl.BF16)
     with pl.scope():
-        attention_grouped = pl.create_tensor(
-            [O_GROUPS * LOCAL_T_PAD, O_GROUP_IN],
-            dtype=pl.BF16,
-        )
-        attention_signal, publish_tid = publish_hca_o_groups(
+        (
+            stream_heads,
+            rope_cos_il, rope_sin_signed, rope_swap_idx,
+            stream_heads_tid, rope_swap_tid, rope_cs_tid,
+        ) = sparse_attn_hca(
             q, kv_cache, window_swa_indices,
             cmp_kv, cmp_block_table,
             position_ids, kv_seq_lens,
             attn_sink, freqs_cos, freqs_sin,
-            attention_grouped,
-            attention_window, attention_signal,
-            group_base, tp_rank, local_t,
             cache_ready_dep,
         )
+
+        attention_grouped = pl.create_tensor([O_GROUPS * LOCAL_T_PAD, O_GROUP_IN], dtype=pl.BF16)
+        pack_work_count = (t_dim // ATTENTION_PUBLISH_T_TILE) * (H // H_TILE)
+        with pl.spmd(
+            ATTENTION_PUBLISH_WORKERS,
+            name_hint="hca_stream_pack_publish",
+            deps=[stream_heads_tid, rope_swap_tid, rope_cs_tid],
+        ) as publish_tid:
+            worker = pl.tile.get_block_idx()
+            for pack_work in pl.range(worker, pack_work_count, ATTENTION_PUBLISH_WORKERS):
+                token_block = pack_work // (H // H_TILE)
+                stream_h_tile = pack_work - token_block * (H // H_TILE)
+                stream_t0 = token_block * ATTENTION_PUBLISH_T_TILE
+                stream_h0 = stream_h_tile * H_TILE
+                global_group0 = stream_h0 // HEADS_PER_GROUP
+                destination_rank = global_group0 // LOCAL_O_GROUPS
+                local_group0 = global_group0 - destination_rank * LOCAL_O_GROUPS
+
+                for stream_dt in pl.unroll(ATTENTION_PUBLISH_T_TILE):
+                    stream_t = stream_t0 + stream_dt
+                    stream_state_row = stream_t * H + stream_h0
+                    stream_output = stream_heads[stream_state_row : stream_state_row + H_TILE, 0:HEAD_DIM]
+                    stream_bf16 = pl.cast(stream_output, target_type=pl.BF16, mode="rint")
+                    stream_rope = stream_output[0:H_TILE, NOPE_HEAD_DIM:HEAD_DIM]
+                    stream_cos_il = rope_cos_il[stream_t : stream_t + 1, 0:ROPE_HEAD_DIM]
+                    stream_sin_signed = rope_sin_signed[stream_t : stream_t + 1, 0:ROPE_HEAD_DIM]
+                    stream_swap_zero = pl.full([H_TILE, ROPE_HEAD_DIM], dtype=pl.INT32, value=0)
+                    stream_swap_idx = pl.col_expand_add(stream_swap_zero, rope_swap_idx[0:1, 0:ROPE_HEAD_DIM])
+                    stream_swapped = pl.gather(stream_rope, dim=-1, index=stream_swap_idx)
+                    stream_rot = pl.add(
+                        pl.col_expand_mul(stream_rope, stream_cos_il),
+                        pl.col_expand_mul(stream_swapped, stream_sin_signed),
+                    )
+                    n_rope_bf16 = pl.cast(stream_rot, target_type=pl.BF16, mode="rint")
+                    n_full_bf16 = pl.concat(stream_bf16[0:H_TILE, 0:NOPE_HEAD_DIM], n_rope_bf16)
+                    for n_hi in pl.unroll(H_TILE):
+                        n_head = stream_h0 + n_hi
+                        source_row = (n_head // HEADS_PER_GROUP) * T_PAD + stream_t
+                        source_col = (n_head % HEADS_PER_GROUP) * HEAD_DIM
+                        attention_grouped[
+                            source_row : source_row + 1,
+                            source_col : source_col + HEAD_DIM,
+                        ] = n_full_bf16[n_hi : n_hi + 1, 0:HEAD_DIM]
+
+                for group_slot in pl.unroll(PUBLISH_GROUPS):
+                    source_row = (global_group0 + group_slot) * T_PAD + stream_t0
+                    target_row = ((local_group0 + group_slot) * GROUP_T_PAD + tp_rank * local_t + stream_t0)
+                    pld.tensor.put(
+                        dst=attention_window,
+                        peer=group_base + destination_rank,
+                        src=attention_grouped,
+                        dst_offsets=[target_row, 0],
+                        src_offsets=[source_row, 0],
+                        shape=[ATTENTION_PUBLISH_T_TILE, O_GROUP_IN],
+                        chunk_rows=ATTENTION_PUBLISH_T_TILE,
+                        chunk_cols=O_GROUP_IN,
+                    )
+
+            for peer_tp in pl.range(TP_SIZE):
+                if peer_tp != tp_rank:
+                    pld.system.notify(
+                        target=attention_signal,
+                        peer=group_base + peer_tp,
+                        offsets=[tp_rank, 0],
+                        value=1,
+                        op=pld.NotifyOp.AtomicAdd,
+                    )
+
         attention_local_flat, attention_signal = o_group_a2a(
             attention_local_flat,
             attention_window, attention_signal,
@@ -256,12 +324,9 @@ def decode_hca(
             publish_tid, ATTENTION_PUBLISH_WORKERS,
         )
 
-        attention_local_groups = pl.reshape(
-            attention_local_flat,
-            [LOCAL_O_GROUPS, GROUP_T_PAD, O_GROUP_IN],
-        )
+        attention_local_groups = pl.reshape(attention_local_flat, [LOCAL_O_GROUPS, GROUP_T_PAD, O_GROUP_IN])
         o_local = pl.create_tensor([LOCAL_T_PAD, D], dtype=pl.BF16)
-        o_local, o_signal = decode_sharded_o_projection_reduce_scatter(
+        o_local, o_signal = o_proj_reduce_scatter(
             attention_local_groups,
             wo_a, wo_b, wo_b_scale,
             local_t, o_local,
@@ -550,11 +615,8 @@ def decode_hca_tp1(
 
     attn_out = pl.create_tensor([t_dim, D], dtype=pl.BF16)
     with pl.scope():
-        o_packed_heads = pl.create_tensor(
-            [O_GROUPS * T_PAD, O_GROUP_IN],
-            dtype=pl.BF16,
-        )
-        o_packed_heads, heads_dep = sparse_attn_hca(
+        o_packed_heads = pl.create_tensor([O_GROUPS * T_PAD, O_GROUP_IN], dtype=pl.BF16)
+        o_packed_heads, heads_dep = sparse_attn_hca_tp1(
             q, kv_cache, window_swa_indices,
             cmp_kv, cmp_block_table,
             position_ids, kv_seq_lens,
@@ -562,11 +624,7 @@ def decode_hca_tp1(
             o_packed_heads, cache_ready_dep,
         )
         with pl.scope():
-            decode_o_proj_tp1(
-                o_packed_heads,
-                wo_a, wo_b, wo_b_scale,
-                attn_out, heads_dep,
-            )
+            decode_o_proj_tp1(o_packed_heads, wo_a, wo_b, wo_b_scale, attn_out, heads_dep)
 
     with pl.scope():
         hc_post(attn_out, x_hc, post_t, comb_t, x_out)
@@ -758,21 +816,11 @@ def golden_decode_hca_tp1(tensors):
         "freqs_sin": rope_sin_T,
         "o_packed_heads": o_packed_heads,
     })
-    attn_out = golden_decode_o_proj_tp1(
-        o_packed_heads,
-        tensors["wo_a"], tensors["wo_b"], tensors["wo_b_scale"],
-        tokens,
-    )
+    attn_out = golden_decode_o_proj_tp1(o_packed_heads, tensors["wo_a"], tensors["wo_b"], tensors["wo_b_scale"], tokens)
 
     # ===== Block.hc_post =====
     y = torch.zeros(tokens, HC_MULT, D, dtype=torch.float32)
-    golden_hc_post({
-        "x": attn_out,
-        "residual": tensors["x_hc"],
-        "post": post_t,
-        "comb": comb_t,
-        "y": y,
-    })
+    golden_hc_post({ "x": attn_out, "residual": tensors["x_hc"], "post": post_t, "comb": comb_t, "y": y, })
 
     tensors["x_out"][:] = y
 
@@ -783,11 +831,7 @@ def golden_decode_hca(tensors):
     full_wo_b = tensors["wo_b"].permute(1, 0, 2).reshape(D, O_GROUPS * O_LORA)
 
     for rank in range(TP_SIZE):
-        rank_tensors = {
-            name: tensor[rank]
-            for name, tensor in tensors.items()
-            if name != "local_t"
-        }
+        rank_tensors = { name: tensor[rank] for name, tensor in tensors.items() if name != "local_t" }
         rank_tensors["wo_a"] = full_wo_a
         rank_tensors["wo_b"] = full_wo_b
         golden_decode_hca_tp1(rank_tensors)
@@ -824,7 +868,7 @@ def _validate_hca_token_count(token_count):
             or token_count % VALID_TOKEN_TILE != 0 or token_count % S != 0):
         raise ValueError(
             f"HCA token count must be a multiple of {VALID_TOKEN_TILE} and S={S} "
-            f"in [{VALID_TOKEN_TILE}, {LOCAL_T}], got {token_count}"
+            f"in [{VALID_TOKEN_TILE}, {LOCAL_T}], got {token_count}",
         )
 
 
@@ -836,24 +880,14 @@ def _hca_token_rope_tables(positions):
     half_dim = dim // 2
     base = float(M.compress_rope_theta)
     original_seq_len = int(M.original_max_position_embeddings)
-    inv_freq = 1.0 / (
-        base ** (torch.arange(0, dim, 2, dtype=torch.float32) / dim)
-    )
-    low = math.floor(
-        dim * math.log(original_seq_len / (int(M.beta_fast) * 2 * math.pi))
-        / (2 * math.log(base))
-    )
-    high = math.ceil(
-        dim * math.log(original_seq_len / (int(M.beta_slow) * 2 * math.pi))
-        / (2 * math.log(base))
-    )
+    inv_freq = 1.0 / (base ** (torch.arange(0, dim, 2, dtype=torch.float32) / dim))
+    low = math.floor(dim * math.log(original_seq_len / (int(M.beta_fast) * 2 * math.pi)) / (2 * math.log(base)))
+    high = math.ceil(dim * math.log(original_seq_len / (int(M.beta_slow) * 2 * math.pi)) / (2 * math.log(base)))
     low = max(low, 0)
     high = min(high, dim - 1)
     if low == high:
         high += 0.001
-    ramp = torch.clamp(
-        (torch.arange(half_dim, dtype=torch.float32) - low) / (high - low), 0, 1
-)
+    ramp = torch.clamp((torch.arange(half_dim, dtype=torch.float32) - low) / (high - low), 0, 1)
     smooth = 1 - ramp
     inv_freq = inv_freq / float(M.rope_factor) * (1 - smooth) + inv_freq * smooth
     angles = torch.outer(positions.to(torch.float32).reshape(-1), inv_freq)
@@ -882,7 +916,7 @@ def _hca_cmp_block_table(starts):
         if cursor + page_count > CMP_BLOCK_NUM:
             raise ValueError(
                 f"HCA compressed pool needs {cursor + page_count} pages for batch={batch}, "
-                f"capacity is {CMP_BLOCK_NUM}"
+                f"capacity is {CMP_BLOCK_NUM}",
             )
         if page_count:
             table[request, :page_count] = torch.arange(cursor, cursor + page_count, dtype=torch.int32)
@@ -906,11 +940,9 @@ def _hca_raw_block_table(positions):
         if cursor + page_count > ORI_BLOCK_NUM:
             raise ValueError(
                 f"HCA raw pool needs {cursor + page_count} pages for batch={batch}, "
-                f"capacity is {ORI_BLOCK_NUM}"
+                f"capacity is {ORI_BLOCK_NUM}",
             )
-        table[request, first_page:last_page + 1] = torch.arange(
-            cursor, cursor + page_count, dtype=torch.int32
-        )
+        table[request, first_page:last_page + 1] = torch.arange(cursor, cursor + page_count, dtype=torch.int32)
         cursor += page_count
     return table
 
@@ -1007,11 +1039,7 @@ def build_tensor_specs(start_pos=None, batch=B):
             physical_blocks=COMPRESS_STATE_PHYSICAL_BLOCKS,
         )
         state_positions = positions.to(torch.int64)
-        mapping = state_slot_mapping(
-            state_positions,
-            table,
-            state_block_size=COMPRESS_STATE_BLOCK_SIZE,
-        )
+        mapping = state_slot_mapping(state_positions, table, state_block_size=COMPRESS_STATE_BLOCK_SIZE)
         valid_rows = mapping[mapping >= 0]
         if torch.unique(valid_rows).numel() == valid_rows.numel():
             return table
@@ -1033,23 +1061,16 @@ def build_tensor_specs(start_pos=None, batch=B):
                     None,
                 )
                 if physical_block is None:
-                    physical_block = next(
-                        (block for block, used_mask in enumerate(occupancy) if used_mask == 0),
-                        None,
-                    )
+                    physical_block = next((block for block, used_mask in enumerate(occupancy) if used_mask == 0), None)
                 if physical_block is None:
                     raise ValueError(
                         f"HCA fixture cannot place {batch * S} active state rows "
-                        f"in {COMPRESS_STATE_BLOCK_NUM * COMPRESS_STATE_BLOCK_SIZE} physical rows"
+                        f"in {COMPRESS_STATE_BLOCK_NUM * COMPRESS_STATE_BLOCK_SIZE} physical rows",
                     )
                 table[request, logical_block] = physical_block
                 occupancy[physical_block] |= row_mask
 
-        mapping = state_slot_mapping(
-            state_positions,
-            table,
-            state_block_size=COMPRESS_STATE_BLOCK_SIZE,
-        )
+        mapping = state_slot_mapping(state_positions, table, state_block_size=COMPRESS_STATE_BLOCK_SIZE)
         valid_rows = mapping[mapping >= 0]
         if torch.unique(valid_rows).numel() != valid_rows.numel():
             raise ValueError("HCA fixture active state rows remain aliased")

@@ -10,7 +10,6 @@
 
 
 import pypto.language as pl
-import pypto.language.distributed as pld
 
 from config import (
     FLASH as M,
@@ -106,7 +105,7 @@ if T % ATTENTION_PUBLISH_T_TILE != 0:
 
 
 @pl.jit.inline(auto_scope=False)
-def _compute_hca_attention_intermediates(
+def sparse_attn_hca(
     q: pl.Tensor[[T_DYN, H, HEAD_DIM], pl.BF16],
     ori_kv: pl.Tensor[[ORI_BLOCK_NUM_DYN, BLOCK_SIZE, 1, HEAD_DIM], pl.BF16],
     window_swa_indices: pl.Tensor[[T_DYN, WIN], pl.INT32],
@@ -119,7 +118,7 @@ def _compute_hca_attention_intermediates(
     freqs_sin: pl.Tensor[[T_DYN, ROPE_DIM], pl.BF16],
     cache_ready_dep: pl.Scalar[pl.TASK_ID],
 ):
-    """Compute normalized HCA stream heads and inverse-RoPE metadata."""
+    """Run the raw and compressed branches, merge them, and build inverse-RoPE metadata."""
     t_dim = pl.tensor.dim(q, 0)
     rope_cs_blocks = t_dim // ROPE_CS_T_TILE
     ori_block_num = pl.tensor.dim(ori_kv, 0)
@@ -154,16 +153,9 @@ def _compute_hca_attention_intermediates(
 
     with pl.scope():
         raw_kv = pl.create_tensor([t_dim * WIN, HEAD_DIM], dtype=pl.BF16)
-        raw_kv_t = pl.create_tensor(
-            [raw_tile_count * HEAD_DIM, RAW_K_TILE],
-            dtype=pl.BF16,
-        )
+        raw_kv_t = pl.create_tensor([raw_tile_count * HEAD_DIM, RAW_K_TILE], dtype=pl.BF16)
         raw_valid = pl.create_tensor([t_dim, WIN], dtype=pl.FP32)
-        with pl.spmd(
-            raw_gather_count,
-            name_hint="hca_gather_kv",
-            deps=[cache_ready_dep],
-        ) as raw_gather_tid:
+        with pl.spmd(raw_gather_count, name_hint="hca_gather_kv", deps=[cache_ready_dep]) as raw_gather_tid:
             g_task = pl.tile.get_block_idx()
             g_t = g_task // GATHER_SEGMENTS
             g_seg = g_task - g_t * GATHER_SEGMENTS
@@ -176,10 +168,7 @@ def _compute_hca_attention_intermediates(
                 g_run_matches = pl.cast(g_first >= 0, pl.INT32)
                 for g_dr in pl.unroll(GATHER_RUN_TILE):
                     g_slot_i32 = pl.read(window_swa_indices, [g_t, g_sk0 + g_dr])
-                    g_run_matches = g_run_matches * pl.cast(
-                        g_slot_i32 == g_first + g_dr,
-                        pl.INT32,
-                    )
+                    g_run_matches = g_run_matches * pl.cast(g_slot_i32 == g_first + g_dr, pl.INT32)
                 if g_run_matches == 1:
                     g_run_src = pl.cast(g_first, pl.INDEX)
                     raw_kv[
@@ -198,24 +187,13 @@ def _compute_hca_attention_intermediates(
                         g_slot_i32 = pl.read(window_swa_indices, [g_t, g_lane])
                         if g_slot_i32 >= 0:
                             g_slot = pl.cast(g_slot_i32, pl.INDEX)
-                            raw_kv[g_dst : g_dst + 1, 0:HEAD_DIM] = ori_kv_flat[
-                                g_slot : g_slot + 1,
-                                0:HEAD_DIM,
-                            ]
+                            raw_kv[g_dst : g_dst + 1, 0:HEAD_DIM] = ori_kv_flat[g_slot : g_slot + 1, 0:HEAD_DIM]
                             pl.write(raw_valid, [g_t, g_lane], 1.0)
                         else:
-                            raw_kv[g_dst : g_dst + 1, 0:HEAD_DIM] = pl.full(
-                                [1, HEAD_DIM],
-                                dtype=pl.BF16,
-                                value=0.0,
-                            )
+                            raw_kv[g_dst : g_dst + 1, 0:HEAD_DIM] = pl.full([1, HEAD_DIM], dtype=pl.BF16, value=0.0)
                             pl.write(raw_valid, [g_t, g_lane], 0.0)
 
-        with pl.spmd(
-            raw_tile_count,
-            name_hint="hca_raw_transpose",
-            deps=[raw_gather_tid],
-        ) as raw_transpose_tid:
+        with pl.spmd(raw_tile_count, name_hint="hca_raw_transpose", deps=[raw_gather_tid]) as raw_transpose_tid:
             raw_tile = pl.tile.get_block_idx()
             raw_row = raw_tile * RAW_K_TILE
             raw_t_row = raw_tile * HEAD_DIM
@@ -241,28 +219,14 @@ def _compute_hca_attention_intermediates(
             sw_next = pl.add(sw_col, 1.0)
             sw_lane_offset = pl.mul(sw_lane, 2.0)
             sw_swap = pl.sub(sw_next, sw_lane_offset)
-            rope_swap_idx[
-                sw_block : sw_block + 1,
-                0:ROPE_DIM,
-            ] = pl.cast(sw_swap, target_type=pl.INT32)
+            rope_swap_idx[sw_block : sw_block + 1, 0:ROPE_DIM] = pl.cast(sw_swap, target_type=pl.INT32)
 
-        with pl.spmd(
-            HALF_ROPE // ROPE_TILE,
-            name_hint="rope_cs",
-        ) as rope_cs_tid:
+        with pl.spmd(HALF_ROPE // ROPE_TILE, name_hint="rope_cs") as rope_cs_tid:
             cp = pl.tile.get_block_idx()
             cp_r0 = cp * ROPE_TILE
             cp_c0 = 2 * cp_r0
-            cs_one = pl.full(
-                [ROPE_CS_T_TILE, ROPE_INTERLEAVE_TILE],
-                dtype=pl.FP32,
-                value=1.0,
-            )
-            cs_index_i32 = pl.arange(
-                0,
-                [1, ROPE_INTERLEAVE_TILE],
-                dtype=pl.INT32,
-            )
+            cs_one = pl.full([ROPE_CS_T_TILE, ROPE_INTERLEAVE_TILE], dtype=pl.FP32, value=1.0)
+            cs_index_i32 = pl.arange(0, [1, ROPE_INTERLEAVE_TILE], dtype=pl.INT32)
             cs_index = pl.cast(cs_index_i32, target_type=pl.FP32)
             cs_col = pl.col_expand_mul(cs_one, cs_index)
             cs_dup = pl.mul(cs_col, 0.5)
@@ -272,54 +236,25 @@ def _compute_hca_attention_intermediates(
             cs_sign = pl.neg(pl.sub(pl.mul(cs_lane, 2.0), 1.0))
             for cs_rb in pl.range(rope_cs_blocks):
                 cs_t0 = cs_rb * ROPE_CS_T_TILE
-                cs_cos_bf16 = freqs_cos[
-                    cs_t0 : cs_t0 + ROPE_CS_T_TILE,
-                    cp_r0 : cp_r0 + ROPE_TILE,
-                ]
-                cs_sin_bf16 = freqs_sin[
-                    cs_t0 : cs_t0 + ROPE_CS_T_TILE,
-                    cp_r0 : cp_r0 + ROPE_TILE,
-                ]
+                cs_cos_bf16 = freqs_cos[cs_t0 : cs_t0 + ROPE_CS_T_TILE, cp_r0 : cp_r0 + ROPE_TILE]
+                cs_sin_bf16 = freqs_sin[cs_t0 : cs_t0 + ROPE_CS_T_TILE, cp_r0 : cp_r0 + ROPE_TILE]
                 cs_cos = pl.cast(cs_cos_bf16, target_type=pl.FP32)
                 cs_sin = pl.cast(cs_sin_bf16, target_type=pl.FP32)
                 cs_cos_dup = pl.gather(cs_cos, dim=-1, index=cs_dup_idx)
                 cs_sin_dup = pl.gather(cs_sin, dim=-1, index=cs_dup_idx)
                 cs_sin_signed = pl.mul(cs_sin_dup, cs_sign)
-                rope_cos_il[
-                    cs_t0 : cs_t0 + ROPE_CS_T_TILE,
-                    cp_c0 : cp_c0 + ROPE_INTERLEAVE_TILE,
-                ] = cs_cos_dup
-                rope_sin_signed[
-                    cs_t0 : cs_t0 + ROPE_CS_T_TILE,
-                    cp_c0 : cp_c0 + ROPE_INTERLEAVE_TILE,
-                ] = cs_sin_signed
+                rope_cos_il[cs_t0 : cs_t0 + ROPE_CS_T_TILE, cp_c0 : cp_c0 + ROPE_INTERLEAVE_TILE] = cs_cos_dup
+                rope_sin_signed[cs_t0 : cs_t0 + ROPE_CS_T_TILE, cp_c0 : cp_c0 + ROPE_INTERLEAVE_TILE] = cs_sin_signed
 
-        with pl.spmd(
-            stream_block_count,
-            name_hint="hca_raw_attn",
-            deps=[raw_transpose_tid],
-        ) as raw_heads_tid:
+        with pl.spmd(stream_block_count, name_hint="hca_raw_attn", deps=[raw_transpose_tid]) as raw_heads_tid:
             stream_idx = pl.tile.get_block_idx()
             stream_t = stream_idx // (H // H_TILE)
             stream_h_tile = stream_idx - stream_t * (H // H_TILE)
             stream_h0 = stream_h_tile * H_TILE
             stream_state_row = stream_t * H + stream_h0
-            stream_q = pl.load(
-                q_flat,
-                [stream_state_row, 0],
-                [H_TILE, HEAD_DIM],
-                target_memory=pl.MemorySpace.Vec,
-            )
-            stream_row_max_tmp = pl.create_tile(
-                [H_TILE, RAW_K_TILE],
-                dtype=pl.FP32,
-                target_memory=pl.MemorySpace.Vec,
-            )
-            stream_row_sum_tmp = pl.create_tile(
-                [H_TILE, RAW_K_TILE],
-                dtype=pl.FP32,
-                target_memory=pl.MemorySpace.Vec,
-            )
+            stream_q = pl.load(q_flat, [stream_state_row, 0], [H_TILE, HEAD_DIM], target_memory=pl.MemorySpace.Vec)
+            stream_row_max_tmp = pl.create_tile([H_TILE, RAW_K_TILE], dtype=pl.FP32, target_memory=pl.MemorySpace.Vec)
+            stream_row_sum_tmp = pl.create_tile([H_TILE, RAW_K_TILE], dtype=pl.FP32, target_memory=pl.MemorySpace.Vec)
             for stream_raw_item in pl.unroll(WIN // RAW_K_TILE):
                 stream_raw_begin = stream_t * WIN + stream_raw_item * RAW_K_TILE
                 stream_valid_begin = stream_raw_item * RAW_K_TILE
@@ -329,9 +264,7 @@ def _compute_hca_attention_intermediates(
                     [RAW_K_TILE, HEAD_DIM],
                     target_memory=pl.MemorySpace.Vec,
                 )
-                stream_raw_t_begin = (
-                    stream_t * (WIN // RAW_K_TILE) + stream_raw_item
-                ) * HEAD_DIM
+                stream_raw_t_begin = (stream_t * (WIN // RAW_K_TILE) + stream_raw_item) * HEAD_DIM
                 stream_raw_kv_t_left = pl.load(
                     raw_kv_t,
                     [stream_raw_t_begin, 0],
@@ -350,80 +283,32 @@ def _compute_hca_attention_intermediates(
                     [1, RAW_K_TILE],
                     target_memory=pl.MemorySpace.Vec,
                 )
-                stream_raw_valid_zero = pl.tile.full(
-                    [H_TILE, RAW_K_TILE],
-                    dtype=pl.FP32,
-                    value=0.0,
-                )
-                stream_raw_valid = pl.col_expand_add(
-                    stream_raw_valid_zero,
-                    stream_raw_valid_row,
-                )
-                stream_raw_bias = pl.mul(
-                    pl.sub(stream_raw_valid, 1.0),
-                    -NEG_INF,
-                )
-                stream_raw_scores = pl.matmul(
-                    stream_q[:, 0:ATTN_D_TILE],
-                    stream_raw_kv_t_left,
-                    out_dtype=pl.FP32,
-                )
+                stream_raw_valid_zero = pl.tile.full([H_TILE, RAW_K_TILE], dtype=pl.FP32, value=0.0)
+                stream_raw_valid = pl.col_expand_add(stream_raw_valid_zero, stream_raw_valid_row)
+                stream_raw_bias = pl.mul(pl.sub(stream_raw_valid, 1.0), -NEG_INF)
+                stream_raw_scores = pl.matmul(stream_q[:, 0:ATTN_D_TILE], stream_raw_kv_t_left, out_dtype=pl.FP32)
                 stream_raw_scores = pl.matmul_acc(
                     stream_raw_scores,
                     stream_q[:, ATTN_D_TILE:HEAD_DIM],
                     stream_raw_kv_t_right,
                 )
-                stream_raw_scores = pl.add(
-                    pl.mul(stream_raw_scores, SOFTMAX_SCALE),
-                    stream_raw_bias,
-                )
-                stream_raw_mi_col = pl.row_max(
-                    stream_raw_scores,
-                    stream_row_max_tmp,
-                )
-                stream_raw_exp = pl.exp(
-                    pl.row_expand_sub(stream_raw_scores, stream_raw_mi_col)
-                )
+                stream_raw_scores = pl.add(pl.mul(stream_raw_scores, SOFTMAX_SCALE), stream_raw_bias)
+                stream_raw_mi_col = pl.row_max(stream_raw_scores, stream_row_max_tmp)
+                stream_raw_exp = pl.exp(pl.row_expand_sub(stream_raw_scores, stream_raw_mi_col))
                 stream_raw_exp = pl.mul(stream_raw_exp, stream_raw_valid)
-                stream_raw_li_col = pl.row_sum(
-                    stream_raw_exp,
-                    stream_row_sum_tmp,
-                )
-                stream_raw_exp_bf16 = pl.cast(
-                    stream_raw_exp,
-                    target_type=pl.BF16,
-                    mode="rint",
-                )
-                stream_raw_oi_left = pl.matmul(
-                    stream_raw_exp_bf16,
-                    stream_raw_kv[:, 0:ATTN_D_TILE],
-                    out_dtype=pl.FP32,
-                )
+                stream_raw_li_col = pl.row_sum(stream_raw_exp, stream_row_sum_tmp)
+                stream_raw_exp_bf16 = pl.cast(stream_raw_exp, target_type=pl.BF16, mode="rint")
+                stream_raw_oi_left = pl.matmul(stream_raw_exp_bf16, stream_raw_kv[:, 0:ATTN_D_TILE], out_dtype=pl.FP32)
                 stream_raw_oi_right = pl.matmul(
                     stream_raw_exp_bf16,
                     stream_raw_kv[:, ATTN_D_TILE : 2 * ATTN_D_TILE],
                     out_dtype=pl.FP32,
                 )
-                stream_raw_oi = pl.concat(
-                    stream_raw_oi_left,
-                    stream_raw_oi_right,
-                )
+                stream_raw_oi = pl.concat(stream_raw_oi_left, stream_raw_oi_right)
                 if stream_raw_item == 0:
-                    pl.store(
-                        stream_raw_mi_col,
-                        [stream_state_row, 0],
-                        stream_state_m,
-                    )
-                    pl.store(
-                        stream_raw_li_col,
-                        [stream_state_row, 0],
-                        stream_state_l,
-                    )
-                    pl.store(
-                        stream_raw_oi,
-                        [stream_state_row, 0],
-                        stream_heads,
-                    )
+                    pl.store(stream_raw_mi_col, [stream_state_row, 0], stream_state_m)
+                    pl.store(stream_raw_li_col, [stream_state_row, 0], stream_state_l)
+                    pl.store(stream_raw_oi, [stream_state_row, 0], stream_heads)
                 else:
                     stream_m = pl.load(
                         stream_state_m,
@@ -445,47 +330,23 @@ def _compute_hca_attention_intermediates(
                     )
                     stream_m_new = pl.maximum(stream_m, stream_raw_mi_col)
                     stream_alpha = pl.exp(pl.sub(stream_m, stream_m_new))
-                    stream_beta = pl.exp(
-                        pl.sub(stream_raw_mi_col, stream_m_new)
-                    )
-                    stream_l_new = pl.add(
-                        pl.mul(stream_alpha, stream_l),
-                        pl.mul(stream_beta, stream_raw_li_col),
-                    )
+                    stream_beta = pl.exp(pl.sub(stream_raw_mi_col, stream_m_new))
+                    stream_l_new = pl.add(pl.mul(stream_alpha, stream_l), pl.mul(stream_beta, stream_raw_li_col))
                     stream_o_new = pl.add(
                         pl.row_expand_mul(stream_o, stream_alpha),
                         pl.row_expand_mul(stream_raw_oi, stream_beta),
                     )
-                    pl.store(
-                        stream_m_new,
-                        [stream_state_row, 0],
-                        stream_state_m,
-                    )
-                    pl.store(
-                        stream_l_new,
-                        [stream_state_row, 0],
-                        stream_state_l,
-                    )
-                    pl.store(
-                        stream_o_new,
-                        [stream_state_row, 0],
-                        stream_heads,
-                    )
+                    pl.store(stream_m_new, [stream_state_row, 0], stream_state_m)
+                    pl.store(stream_l_new, [stream_state_row, 0], stream_state_l)
+                    pl.store(stream_o_new, [stream_state_row, 0], stream_heads)
 
         raw_branch_tids[0] = raw_heads_tid
         rope_swap_tids[0] = rope_swap_tid
         rope_cs_tids[0] = rope_cs_tid
 
     with pl.scope():
-        cmp_work_kv = pl.create_tensor(
-            [cmp_gather_count * ATTN_K_TILE, HEAD_DIM],
-            dtype=pl.BF16,
-        )
-        with pl.spmd(
-            cmp_gather_count,
-            name_hint="hca_cmp_work_gather",
-            deps=[cache_ready_dep],
-        ) as cmp_gather_tid:
+        cmp_work_kv = pl.create_tensor([cmp_gather_count * ATTN_K_TILE, HEAD_DIM], dtype=pl.BF16)
+        with pl.spmd(cmp_gather_count, name_hint="hca_cmp_work_gather", deps=[cache_ready_dep]) as cmp_gather_tid:
             gather_item = pl.tile.get_block_idx()
             gather_request = gather_item // cmp_work_count
             gather_work = gather_item - gather_request * cmp_work_count
@@ -503,10 +364,7 @@ def _compute_hca_attention_intermediates(
                     value=0.0,
                 )
                 if gather_page_col < cmp_table_blocks:
-                    gather_page_i32 = pl.read(
-                        cmp_block_table,
-                        [gather_request, gather_page_col],
-                    )
+                    gather_page_i32 = pl.read(cmp_block_table, [gather_request, gather_page_col])
                     if gather_page_i32 >= 0:
                         if gather_page_i32 < cmp_block_num:
                             gather_page_id = pl.cast(gather_page_i32, pl.INDEX)
@@ -519,38 +377,18 @@ def _compute_hca_attention_intermediates(
                                 0:HEAD_DIM,
                             ]
 
-        with pl.spmd(
-            cmp_qk_block_count,
-            name_hint="hca_cmp_qk_pv",
-            deps=[cmp_gather_tid],
-        ) as cmp_qk_tid:
+        with pl.spmd(cmp_qk_block_count, name_hint="hca_cmp_qk_pv", deps=[cmp_gather_tid]) as cmp_qk_tid:
             qk_item = pl.tile.get_block_idx()
             qk_t = qk_item // cmp_work_count
             qk_work = qk_item - qk_t * cmp_work_count
             qk_request = qk_t // S
             qk_work_row = qk_work * ATTN_K_TILE
             qk_token_base = qk_t * (H // H_TILE) * cmp_work_count * H_TILE
-            qk_neutral_m = pl.tile.full(
-                [H_TILE, 8],
-                dtype=pl.FP32,
-                value=NEG_INF,
-            )
-            qk_neutral_l = pl.tile.full(
-                [H_TILE, 8],
-                dtype=pl.FP32,
-                value=0.0,
-            )
-            qk_neutral_o = pl.tile.full(
-                [H_TILE, HEAD_DIM],
-                dtype=pl.FP32,
-                value=0.0,
-            )
+            qk_neutral_m = pl.tile.full([H_TILE, 8], dtype=pl.FP32, value=NEG_INF)
+            qk_neutral_l = pl.tile.full([H_TILE, 8], dtype=pl.FP32, value=0.0)
+            qk_neutral_o = pl.tile.full([H_TILE, HEAD_DIM], dtype=pl.FP32, value=0.0)
             for qk_h_idx in pl.unroll(H // H_TILE):
-                qk_row = (
-                    qk_token_base
-                    + qk_h_idx * cmp_work_count * H_TILE
-                    + qk_work * H_TILE
-                )
+                qk_row = (qk_token_base + qk_h_idx * cmp_work_count * H_TILE + qk_work * H_TILE)
                 pl.store(qk_neutral_m, [qk_row, 0], cmp_partial_m)
                 pl.store(qk_neutral_l, [qk_row, 0], cmp_partial_l)
                 pl.store(qk_neutral_o, [qk_row, 0], cmp_partial_o)
@@ -565,32 +403,21 @@ def _compute_hca_attention_intermediates(
                         qk_kv_len = pl.cast(qk_kv_len_i32, pl.INDEX)
                         qk_position_rows = (qk_position + 1) // COMPRESS_RATIO
                         qk_kv_rows = qk_kv_len // COMPRESS_RATIO
-                        qk_rows = pl.min(
-                            HCA_MAX_COMPRESSED_ROWS,
-                            pl.min(qk_position_rows, qk_kv_rows),
-                        )
+                        qk_rows = pl.min(HCA_MAX_COMPRESSED_ROWS, pl.min(qk_position_rows, qk_kv_rows))
 
             if qk_work_row < qk_rows:
                 qk_first_col = qk_work * CMP_PAGES_PER_WORK
-                qk_first_page_i32 = pl.read(
-                    cmp_block_table,
-                    [qk_request, qk_first_col],
-                )
+                qk_first_page_i32 = pl.read(cmp_block_table, [qk_request, qk_first_col])
                 if qk_first_page_i32 >= 0:
                     if qk_first_page_i32 < cmp_block_num:
-                        qk_work_src = (
-                            qk_request * cmp_work_count + qk_work
-                        ) * ATTN_K_TILE
+                        qk_work_src = (qk_request * cmp_work_count + qk_work) * ATTN_K_TILE
                         qk_kv = pl.load(
                             cmp_work_kv,
                             [qk_work_src, 0],
                             [ATTN_K_TILE, HEAD_DIM],
                             target_memory=pl.MemorySpace.Mat,
                         )
-                        qk_valid_rows = pl.min(
-                            ATTN_K_TILE,
-                            qk_rows - qk_work_row,
-                        )
+                        qk_valid_rows = pl.min(ATTN_K_TILE, qk_rows - qk_work_row)
                         qk_kv_t = pl.tile.transpose_view(qk_kv)
                         qk_row_max_tmp = pl.create_tile(
                             [QK_M_TILE, ATTN_K_TILE],
@@ -611,79 +438,26 @@ def _compute_hca_attention_intermediates(
                                 [QK_M_TILE, HEAD_DIM],
                                 target_memory=pl.MemorySpace.Mat,
                             )
-                            qk_scores = pl.matmul(
-                                qk_q,
-                                qk_kv_t,
-                                out_dtype=pl.FP32,
-                            )
+                            qk_scores = pl.matmul(qk_q, qk_kv_t, out_dtype=pl.FP32)
                             qk_scores = pl.mul(qk_scores, SOFTMAX_SCALE)
-                            qk_scores = pl.set_validshape(
-                                qk_scores,
-                                QK_M_TILE,
-                                qk_valid_rows,
-                            )
-                            qk_scores = pl.fillpad(
-                                qk_scores,
-                                pad_value=pl.PadValue.min,
-                            )
+                            qk_scores = pl.set_validshape(qk_scores, QK_M_TILE, qk_valid_rows)
+                            qk_scores = pl.fillpad(qk_scores, pad_value=pl.PadValue.min)
                             qk_mi = pl.row_max(qk_scores, qk_row_max_tmp)
-                            qk_exp = pl.exp(
-                                pl.row_expand_sub(qk_scores, qk_mi)
-                            )
+                            qk_exp = pl.exp(pl.row_expand_sub(qk_scores, qk_mi))
                             qk_li = pl.row_sum(qk_exp, qk_row_sum_tmp)
-                            qk_exp_bf16 = pl.cast(
-                                qk_exp,
-                                target_type=pl.BF16,
-                                mode="rint",
-                            )
-                            qk_oi_left = pl.matmul(
-                                qk_exp_bf16,
-                                qk_kv[:, 0:ATTN_D_TILE],
-                                out_dtype=pl.FP32,
-                            )
-                            qk_oi_right = pl.matmul(
-                                qk_exp_bf16,
-                                qk_kv[:, ATTN_D_TILE:HEAD_DIM],
-                                out_dtype=pl.FP32,
-                            )
+                            qk_exp_bf16 = pl.cast(qk_exp, target_type=pl.BF16, mode="rint")
+                            qk_oi_left = pl.matmul(qk_exp_bf16, qk_kv[:, 0:ATTN_D_TILE], out_dtype=pl.FP32)
+                            qk_oi_right = pl.matmul(qk_exp_bf16, qk_kv[:, ATTN_D_TILE:HEAD_DIM], out_dtype=pl.FP32)
                             qk_oi = pl.concat(qk_oi_left, qk_oi_right)
                             qk_h_idx0 = qk_hb * (QK_M_TILE // H_TILE)
-                            qk_row0 = (
-                                qk_token_base
-                                + qk_h_idx0 * cmp_work_count * H_TILE
-                                + qk_work * H_TILE
-                            )
+                            qk_row0 = (qk_token_base + qk_h_idx0 * cmp_work_count * H_TILE + qk_work * H_TILE)
                             qk_row1 = qk_row0 + cmp_work_count * H_TILE
-                            pl.store(
-                                qk_mi[0:H_TILE, 0:1],
-                                [qk_row0, 0],
-                                cmp_partial_m,
-                            )
-                            pl.store(
-                                qk_li[0:H_TILE, 0:1],
-                                [qk_row0, 0],
-                                cmp_partial_l,
-                            )
-                            pl.store(
-                                qk_oi[0:H_TILE, 0:HEAD_DIM],
-                                [qk_row0, 0],
-                                cmp_partial_o,
-                            )
-                            pl.store(
-                                qk_mi[H_TILE:QK_M_TILE, 0:1],
-                                [qk_row1, 0],
-                                cmp_partial_m,
-                            )
-                            pl.store(
-                                qk_li[H_TILE:QK_M_TILE, 0:1],
-                                [qk_row1, 0],
-                                cmp_partial_l,
-                            )
-                            pl.store(
-                                qk_oi[H_TILE:QK_M_TILE, 0:HEAD_DIM],
-                                [qk_row1, 0],
-                                cmp_partial_o,
-                            )
+                            pl.store(qk_mi[0:H_TILE, 0:1], [qk_row0, 0], cmp_partial_m)
+                            pl.store(qk_li[0:H_TILE, 0:1], [qk_row0, 0], cmp_partial_l)
+                            pl.store(qk_oi[0:H_TILE, 0:HEAD_DIM], [qk_row0, 0], cmp_partial_o)
+                            pl.store(qk_mi[H_TILE:QK_M_TILE, 0:1], [qk_row1, 0], cmp_partial_m)
+                            pl.store(qk_li[H_TILE:QK_M_TILE, 0:1], [qk_row1, 0], cmp_partial_l)
+                            pl.store(qk_oi[H_TILE:QK_M_TILE, 0:HEAD_DIM], [qk_row1, 0], cmp_partial_o)
 
         cmp_branch_tids[0] = cmp_qk_tid
 
@@ -697,31 +471,12 @@ def _compute_hca_attention_intermediates(
         stream_h_tile = stream_idx - stream_t * (H // H_TILE)
         stream_h0 = stream_h_tile * H_TILE
         stream_state_row = stream_t * H + stream_h0
-        stream_m = pl.load(
-            stream_state_m,
-            [stream_state_row, 0],
-            [H_TILE, 1],
-            target_memory=pl.MemorySpace.Vec,
-        )
-        stream_l = pl.load(
-            stream_state_l,
-            [stream_state_row, 0],
-            [H_TILE, 1],
-            target_memory=pl.MemorySpace.Vec,
-        )
-        stream_o = pl.load(
-            stream_heads,
-            [stream_state_row, 0],
-            [H_TILE, HEAD_DIM],
-            target_memory=pl.MemorySpace.Vec,
-        )
+        stream_m = pl.load(stream_state_m, [stream_state_row, 0], [H_TILE, 1], target_memory=pl.MemorySpace.Vec)
+        stream_l = pl.load(stream_state_l, [stream_state_row, 0], [H_TILE, 1], target_memory=pl.MemorySpace.Vec)
+        stream_o = pl.load(stream_heads, [stream_state_row, 0], [H_TILE, HEAD_DIM], target_memory=pl.MemorySpace.Vec)
         stream_token_base = stream_t * (H // H_TILE) * cmp_work_count * H_TILE
         for stream_work in pl.range(cmp_work_count):
-            stream_partial_row = (
-                stream_token_base
-                + stream_h_tile * cmp_work_count * H_TILE
-                + stream_work * H_TILE
-            )
+            stream_partial_row = (stream_token_base + stream_h_tile * cmp_work_count * H_TILE + stream_work * H_TILE)
             stream_cmp_m_aligned = pl.load(
                 cmp_partial_m,
                 [stream_partial_row, 0],
@@ -745,21 +500,10 @@ def _compute_hca_attention_intermediates(
             stream_m_new = pl.maximum(stream_m, stream_cmp_m)
             stream_alpha = pl.exp(pl.sub(stream_m, stream_m_new))
             stream_beta = pl.exp(pl.sub(stream_cmp_m, stream_m_new))
-            stream_l = pl.add(
-                pl.mul(stream_alpha, stream_l),
-                pl.mul(stream_beta, stream_cmp_l),
-            )
-            stream_o = pl.add(
-                pl.row_expand_mul(stream_o, stream_alpha),
-                pl.row_expand_mul(stream_cmp_o, stream_beta),
-            )
+            stream_l = pl.add(pl.mul(stream_alpha, stream_l), pl.mul(stream_beta, stream_cmp_l))
+            stream_o = pl.add(pl.row_expand_mul(stream_o, stream_alpha), pl.row_expand_mul(stream_cmp_o, stream_beta))
             stream_m = stream_m_new
-        stream_sink = pl.load(
-            attn_sink_col,
-            [stream_h0, 0],
-            [H_TILE, 1],
-            target_memory=pl.MemorySpace.Vec,
-        )
+        stream_sink = pl.load(attn_sink_col, [stream_h0, 0], [H_TILE, 1], target_memory=pl.MemorySpace.Vec)
         stream_sink_tile = pl.add(pl.sub(stream_m, stream_m), stream_sink)
         stream_denom = pl.add(stream_l, pl.exp(pl.sub(stream_sink_tile, stream_m)))
         stream_output = pl.row_expand_div(stream_o, stream_denom)
@@ -777,7 +521,7 @@ def _compute_hca_attention_intermediates(
 
 
 @pl.jit.inline(auto_scope=False)
-def sparse_attn_hca(
+def sparse_attn_hca_tp1(
     q: pl.Tensor[[T_DYN, H, HEAD_DIM], pl.BF16],
     ori_kv: pl.Tensor[[ORI_BLOCK_NUM_DYN, BLOCK_SIZE, 1, HEAD_DIM], pl.BF16],
     window_swa_indices: pl.Tensor[[T_DYN, WIN], pl.INT32],
@@ -794,13 +538,9 @@ def sparse_attn_hca(
     """Write HCA heads as grouped ``[T_PAD, O_GROUP_IN]`` slabs."""
     (
         stream_heads,
-        rope_cos_il,
-        rope_sin_signed,
-        rope_swap_idx,
-        stream_heads_tid,
-        rope_swap_tid,
-        rope_cs_tid,
-    ) = _compute_hca_attention_intermediates(
+        rope_cos_il, rope_sin_signed, rope_swap_idx,
+        stream_heads_tid, rope_swap_tid, rope_cs_tid,
+    ) = sparse_attn_hca(
         q,
         ori_kv,
         window_swa_indices,
@@ -826,9 +566,7 @@ def sparse_attn_hca(
         stream_h_tile = stream_idx - stream_t * (H // H_TILE)
         stream_h0 = stream_h_tile * H_TILE
         stream_state_row = stream_t * H + stream_h0
-        stream_output = stream_heads[
-            stream_state_row : stream_state_row + H_TILE, 0:HEAD_DIM
-        ]
+        stream_output = stream_heads[stream_state_row : stream_state_row + H_TILE, 0:HEAD_DIM]
         stream_bf16 = pl.cast(stream_output, target_type=pl.BF16, mode="rint")
         stream_rope = stream_output[0:H_TILE, NOPE_DIM:HEAD_DIM]
         stream_cos_il = rope_cos_il[stream_t : stream_t + 1, 0:ROPE_DIM]
@@ -852,131 +590,6 @@ def sparse_attn_hca(
             ] = n_full_bf16[n_hi : n_hi + 1, 0:HEAD_DIM]
 
     return o_packed_heads, heads_tid
-
-
-@pl.jit.inline(auto_scope=False)
-def publish_hca_o_groups(
-    q: pl.Tensor[[T_DYN, H, HEAD_DIM], pl.BF16],
-    ori_kv: pl.Tensor[[ORI_BLOCK_NUM_DYN, BLOCK_SIZE, 1, HEAD_DIM], pl.BF16],
-    window_swa_indices: pl.Tensor[[T_DYN, WIN], pl.INT32],
-    cmp_kv: pl.Tensor[[CMP_BLOCK_NUM_DYN, BLOCK_SIZE, 1, HEAD_DIM], pl.BF16],
-    cmp_block_table: pl.Tensor[[B_DYN, CMP_TABLE_BLOCKS_DYN], pl.INT32],
-    position_ids: pl.Tensor[[T_DYN], pl.INT32],
-    kv_seq_lens: pl.Tensor[[B_DYN], pl.INT32],
-    attn_sink: pl.Tensor[[H], pl.FP32],
-    freqs_cos: pl.Tensor[[T_DYN, ROPE_DIM], pl.BF16],
-    freqs_sin: pl.Tensor[[T_DYN, ROPE_DIM], pl.BF16],
-    attention_grouped: pl.Tensor[[O_GROUPS * T_PAD, O_GROUP_IN], pl.BF16],
-    exchange_window: pld.DistributedTensor[[ATTENTION_WINDOW_ROWS, O_GROUP_IN], pl.BF16],
-    exchange_signal: pld.DistributedTensor[[TP, 1], pl.INT32],
-    group_base: pl.Scalar[pl.INT32],
-    tp_rank: pl.Scalar[pl.INT32],
-    local_t: pl.Scalar[pl.INT32],
-    cache_ready_dep: pl.Scalar[pl.TASK_ID],
-):
-    """Pack HCA heads and publish completed O-group token tiles."""
-    (
-        stream_heads,
-        rope_cos_il,
-        rope_sin_signed,
-        rope_swap_idx,
-        stream_heads_tid,
-        rope_swap_tid,
-        rope_cs_tid,
-    ) = _compute_hca_attention_intermediates(
-        q,
-        ori_kv,
-        window_swa_indices,
-        cmp_kv,
-        cmp_block_table,
-        position_ids,
-        kv_seq_lens,
-        attn_sink,
-        freqs_cos,
-        freqs_sin,
-        cache_ready_dep,
-    )
-    t_dim = pl.tensor.dim(q, 0)
-    pack_work_count = (t_dim // ATTENTION_PUBLISH_T_TILE) * (H // H_TILE)
-
-    with pl.spmd(
-        ATTENTION_PUBLISH_WORKERS,
-        name_hint="hca_stream_pack_publish",
-        deps=[stream_heads_tid, rope_swap_tid, rope_cs_tid],
-    ) as publish_tid:
-        worker = pl.tile.get_block_idx()
-        for pack_work in pl.range(worker, pack_work_count, ATTENTION_PUBLISH_WORKERS):
-            token_block = pack_work // (H // H_TILE)
-            stream_h_tile = pack_work - token_block * (H // H_TILE)
-            stream_t0 = token_block * ATTENTION_PUBLISH_T_TILE
-            stream_h0 = stream_h_tile * H_TILE
-            global_group0 = stream_h0 // HEADS_PER_GROUP
-            destination_rank = global_group0 // LOCAL_O_GROUPS
-            local_group0 = global_group0 - destination_rank * LOCAL_O_GROUPS
-
-            for stream_dt in pl.unroll(ATTENTION_PUBLISH_T_TILE):
-                stream_t = stream_t0 + stream_dt
-                stream_state_row = stream_t * H + stream_h0
-                stream_output = stream_heads[
-                    stream_state_row : stream_state_row + H_TILE, 0:HEAD_DIM
-                ]
-                stream_bf16 = pl.cast(stream_output, target_type=pl.BF16, mode="rint")
-                stream_rope = stream_output[0:H_TILE, NOPE_DIM:HEAD_DIM]
-                stream_cos_il = rope_cos_il[stream_t : stream_t + 1, 0:ROPE_DIM]
-                stream_sin_signed = rope_sin_signed[stream_t : stream_t + 1, 0:ROPE_DIM]
-                stream_swap_zero = pl.full([H_TILE, ROPE_DIM], dtype=pl.INT32, value=0)
-                stream_swap_idx = pl.col_expand_add(
-                    stream_swap_zero,
-                    rope_swap_idx[0:1, 0:ROPE_DIM],
-                )
-                stream_swapped = pl.gather(stream_rope, dim=-1, index=stream_swap_idx)
-                stream_rot = pl.add(
-                    pl.col_expand_mul(stream_rope, stream_cos_il),
-                    pl.col_expand_mul(stream_swapped, stream_sin_signed),
-                )
-                n_rope_bf16 = pl.cast(stream_rot, target_type=pl.BF16, mode="rint")
-                n_full_bf16 = pl.concat(
-                    stream_bf16[0:H_TILE, 0:NOPE_DIM],
-                    n_rope_bf16,
-                )
-                for n_hi in pl.unroll(H_TILE):
-                    n_head = stream_h0 + n_hi
-                    source_row = (n_head // HEADS_PER_GROUP) * T_PAD + stream_t
-                    source_col = (n_head % HEADS_PER_GROUP) * HEAD_DIM
-                    attention_grouped[
-                        source_row : source_row + 1,
-                        source_col : source_col + HEAD_DIM,
-                    ] = n_full_bf16[n_hi : n_hi + 1, 0:HEAD_DIM]
-
-            for group_slot in pl.unroll(PUBLISH_GROUPS):
-                source_row = (global_group0 + group_slot) * T_PAD + stream_t0
-                target_row = (
-                    (local_group0 + group_slot) * GROUP_T_PAD
-                    + tp_rank * local_t
-                    + stream_t0
-                )
-                pld.tensor.put(
-                    dst=exchange_window,
-                    peer=group_base + destination_rank,
-                    src=attention_grouped,
-                    dst_offsets=[target_row, 0],
-                    src_offsets=[source_row, 0],
-                    shape=[ATTENTION_PUBLISH_T_TILE, O_GROUP_IN],
-                    chunk_rows=ATTENTION_PUBLISH_T_TILE,
-                    chunk_cols=O_GROUP_IN,
-                )
-
-        for destination_rank in pl.range(TP):
-            if destination_rank != tp_rank:
-                pld.system.notify(
-                    target=exchange_signal,
-                    peer=group_base + destination_rank,
-                    offsets=[tp_rank, 0],
-                    value=1,
-                    op=pld.NotifyOp.AtomicAdd,
-                )
-
-    return exchange_signal, publish_tid
 
 
 @pl.jit
@@ -1004,7 +617,7 @@ def sparse_attn_hca_test(
 
     cache_ready_dep = pl.system.task_dummy(deps=[])
     o_packed_flat = pl.reshape(o_packed_heads, [O_GROUPS * T_PAD, O_GROUP_IN])
-    o_packed_flat, _heads_tid = sparse_attn_hca(
+    o_packed_flat, _heads_tid = sparse_attn_hca_tp1(
         q, ori_kv, window_swa_indices,
         cmp_kv, cmp_block_table,
         position_ids, kv_seq_lens,
@@ -1146,36 +759,32 @@ def build_tensor_specs(
     if tokens % ROPE_CS_T_TILE != 0:
         raise ValueError(
             f"HCA sparse-attention token count {tokens} must be divisible by "
-            f"ROPE_CS_T_TILE={ROPE_CS_T_TILE}"
+            f"ROPE_CS_T_TILE={ROPE_CS_T_TILE}",
         )
 
     if mixed_topk_fixture:
         if batch != 4:
             raise ValueError("mixed HCA length fixture requires batch=4")
-        compressed_rows_by_request = torch.tensor(
-            [128, 128, 1024, 4096], dtype=torch.int32
-        )
+        compressed_rows_by_request = torch.tensor([128, 128, 1024, 4096], dtype=torch.int32)
     else:
         compressed_rows_by_request = torch.full(
-            (batch,), compressed_rows, dtype=torch.int32
+            (batch,), compressed_rows, dtype=torch.int32,
         )
 
     if bool((compressed_rows_by_request < 0).any()) or bool(
-        (compressed_rows_by_request > HCA_MAX_COMPRESSED_ROWS).any()
+        (compressed_rows_by_request > HCA_MAX_COMPRESSED_ROWS).any(),
     ):
         raise ValueError(
             f"compressed_rows must be in [0, {HCA_MAX_COMPRESSED_ROWS}], "
-            f"got {compressed_rows_by_request.tolist()}"
+            f"got {compressed_rows_by_request.tolist()}",
         )
-    pages_per_request = (
-        (compressed_rows_by_request.to(torch.int64) + BLOCK_SIZE - 1) // BLOCK_SIZE
-    )
+    pages_per_request = ((compressed_rows_by_request.to(torch.int64) + BLOCK_SIZE - 1) // BLOCK_SIZE)
     table_blocks = max(int(pages_per_request.max().item()), 1)
     required_pages = int(pages_per_request.sum().item())
     if required_pages > CMP_BLOCK_NUM:
         raise ValueError(
             f"HCA compressed pool needs {required_pages} pages, "
-            f"capacity is {CMP_BLOCK_NUM}"
+            f"capacity is {CMP_BLOCK_NUM}",
         )
 
     def init_q():

@@ -14,7 +14,6 @@ variants live in sibling modules.
 
 
 import pypto.language as pl
-import pypto.language.distributed as pld
 
 from config import (
     FLASH as M,
@@ -93,7 +92,7 @@ if T % ATTENTION_PUBLISH_T_TILE != 0:
 
 
 @pl.jit.inline(auto_scope=False)
-def _compute_swa_attention_intermediates(
+def sparse_attn_swa(
     q: pl.Tensor[[T_DYN, H, HEAD_DIM], pl.BF16],
     ori_kv: pl.Tensor[[ORI_BLOCK_NUM_DYN, BLOCK_SIZE, 1, HEAD_DIM], pl.BF16],
     swa_indices: pl.Tensor[[T_DYN, WIN], pl.INT32],
@@ -101,7 +100,7 @@ def _compute_swa_attention_intermediates(
     freqs_cos: pl.Tensor[[T_DYN, ROPE_DIM], pl.BF16],
     freqs_sin: pl.Tensor[[T_DYN, ROPE_DIM], pl.BF16],
 ):
-    """Prepare SWA attention partials and inverse-RoPE metadata."""
+    """Gather window KV, run QK/PV, and build inverse-RoPE metadata."""
     t_dim = pl.tensor.dim(q, 0)
     t_heads = t_dim * H
     t_win = t_dim * WIN
@@ -129,39 +128,32 @@ def _compute_swa_attention_intermediates(
                     g_sr0 = g_sub * GATHER_RUN
                     g_sdst = g_base + g_sr0
                     g_first = pl.read(swa_indices, [g_t, g_sr0])
-                    g_last = pl.read(
-                        swa_indices, [g_t, g_sr0 + GATHER_RUN - 1]
-                    )
+                    g_last = pl.read(swa_indices, [g_t, g_sr0 + GATHER_RUN - 1])
                     # A -1 slot anywhere in the run pins g_run_ok below the
                     # match value, so an invalid or block-straddling run takes
                     # the per-row path.
-                    g_run_ok = (
-                        (g_last - g_first)
-                        + pl.min(g_first, 0) * GATHER_RUN
-                    )
+                    g_run_ok = ((g_last - g_first) + pl.min(g_first, 0) * GATHER_RUN)
                     if g_run_ok == GATHER_RUN - 1:
                         g_run_src = pl.cast(g_first, pl.INDEX)
                         swa_kv_flat[
-                            g_sdst : g_sdst + GATHER_RUN, 0 : HEAD_DIM
+                            g_sdst : g_sdst + GATHER_RUN, 0 : HEAD_DIM,
                         ] = ori_kv_flat[
-                            g_run_src : g_run_src + GATHER_RUN, 0 : HEAD_DIM
+                            g_run_src : g_run_src + GATHER_RUN, 0 : HEAD_DIM,
                         ]
                     else:
                         for g_dr in pl.range(GATHER_RUN):
                             g_dst = g_sdst + g_dr
-                            g_slot_i32 = pl.read(
-                                swa_indices, [g_t, g_sr0 + g_dr]
-                            )
+                            g_slot_i32 = pl.read(swa_indices, [g_t, g_sr0 + g_dr])
                             if g_slot_i32 >= 0:
                                 g_slot = pl.cast(g_slot_i32, pl.INDEX)
                                 swa_kv_flat[
-                                    g_dst : g_dst + 1, 0 : HEAD_DIM
+                                    g_dst : g_dst + 1, 0 : HEAD_DIM,
                                 ] = ori_kv_flat[
-                                    g_slot : g_slot + 1, 0 : HEAD_DIM
+                                    g_slot : g_slot + 1, 0 : HEAD_DIM,
                                 ]
                             else:
                                 swa_kv_flat[
-                                    g_dst : g_dst + 1, 0 : HEAD_DIM
+                                    g_dst : g_dst + 1, 0 : HEAD_DIM,
                                 ] = pl.full(
                                     [1, HEAD_DIM],
                                     dtype=pl.BF16,
@@ -188,8 +180,7 @@ def _compute_swa_attention_intermediates(
                 qk_base = qk_t * WIN + qk_s0
                 qk_kv = swa_kv_flat[qk_base : qk_base + ATTN_K_TILE, 0 : HEAD_DIM]
 
-                # Keep both 32-head batches in one token task so they reuse the KV
-                # tile already resident in L1 instead of loading it once per block.
+                # Both head batches share one token task and one L1-resident KV tile.
                 for qk_hb in pl.pipeline(H // QK_M_TILE, stage=2):
                     qk_h0 = qk_hb * QK_M_TILE
                     qk_head_row = qk_t * H + qk_h0
@@ -213,10 +204,8 @@ def _compute_swa_attention_intermediates(
                         sparse_blk_li[qk_row : qk_row + H_TILE, 0 : 1] = qk_li[qk_r0 : qk_r0 + H_TILE, 0 : 1]
                         sparse_blk_oi[qk_row : qk_row + H_TILE, 0 : HEAD_DIM] = qk_oi[qk_r0 : qk_r0 + H_TILE, 0 : HEAD_DIM]
 
-    # Materialize the head-invariant interleaved cos and signed-sin rows once.
-    # This runs alongside qk_pv and keeps the exact indexed RoPE arithmetic used
-    # by the reference path while the group merge below changes only scheduling
-    # and store granularity.
+    # Head-invariant interleaved cos and signed-sin rows, materialized once
+    # alongside qk_pv.
     rope_cos_il = pl.create_tensor([T_PAD, ROPE_DIM], dtype=pl.FP32)
     rope_sin_signed = pl.create_tensor([T_PAD, ROPE_DIM], dtype=pl.FP32)
     rope_swap_idx = pl.create_tensor([H_TILE, ROPE_DIM], dtype=pl.INT32)
@@ -271,134 +260,7 @@ def _compute_swa_attention_intermediates(
 
 
 @pl.jit.inline(auto_scope=False)
-def publish_swa_o_groups(
-    q: pl.Tensor[[T_DYN, H, HEAD_DIM], pl.BF16],
-    ori_kv: pl.Tensor[[ORI_BLOCK_NUM_DYN, BLOCK_SIZE, 1, HEAD_DIM], pl.BF16],
-    swa_indices: pl.Tensor[[T_DYN, WIN], pl.INT32],
-    sparse_bias: pl.Tensor[[T_DYN, PADDED_TOPK], pl.FP32],
-    attn_sink: pl.Tensor[[H], pl.FP32],
-    freqs_cos: pl.Tensor[[T_DYN, ROPE_DIM], pl.BF16],
-    freqs_sin: pl.Tensor[[T_DYN, ROPE_DIM], pl.BF16],
-    attention_grouped: pl.Tensor[[O_GROUPS * T_PAD, O_GROUP_IN], pl.BF16],
-    exchange_window: pld.DistributedTensor[[ATTENTION_WINDOW_ROWS, O_GROUP_IN], pl.BF16],
-    exchange_signal: pld.DistributedTensor[[TP, 1], pl.INT32],
-    group_base: pl.Scalar[pl.INT32],
-    tp_rank: pl.Scalar[pl.INT32],
-    local_t: pl.Scalar[pl.INT32],
-):
-    """Merge SWA heads and publish completed O-group token tiles."""
-    (
-        sparse_blk_mi,
-        sparse_blk_li,
-        sparse_blk_oi,
-        rope_cos_il,
-        rope_sin_signed,
-        rope_swap_idx,
-        qk_tid,
-        rope_tid,
-    ) = _compute_swa_attention_intermediates(
-        q,
-        ori_kv,
-        swa_indices,
-        sparse_bias,
-        freqs_cos,
-        freqs_sin,
-    )
-    t_dim = pl.tensor.dim(q, 0)
-    pack_work_count = (t_dim // ATTENTION_PUBLISH_T_TILE) * (H // H_TILE)
-    o_packed_heads = pl.reshape(
-        attention_grouped,
-        [O_GROUPS * T_PAD * HEADS_PER_GROUP, HEAD_DIM],
-    )
-
-    with pl.spmd(
-        ATTENTION_PUBLISH_WORKERS,
-        name_hint="swa_merge_pack_publish",
-        deps=[qk_tid, rope_tid],
-    ) as publish_tid:
-        worker = pl.tile.get_block_idx()
-        for pack_work in pl.range(worker, pack_work_count, ATTENTION_PUBLISH_WORKERS):
-            token_block = pack_work // (H // H_TILE)
-            head_tile = pack_work - token_block * (H // H_TILE)
-            token_start = token_block * ATTENTION_PUBLISH_T_TILE
-            head_start = head_tile * H_TILE
-            global_group_start = head_start // HEADS_PER_GROUP
-
-            for token_delta in pl.range(ATTENTION_PUBLISH_T_TILE):
-                token = token_start + token_delta
-                block_base = token * H + head_start
-                block_m = sparse_blk_mi[block_base : block_base + H_TILE, 0:1]
-                block_l = sparse_blk_li[block_base : block_base + H_TILE, 0:1]
-                block_o = sparse_blk_oi[block_base : block_base + H_TILE, 0:HEAD_DIM]
-
-                sink = pl.reshape(attn_sink[head_start : head_start + H_TILE], [H_TILE, 1])
-                sink_delta = pl.sub(sink, block_m)
-                sink_exp = pl.exp(sink_delta)
-                denom = pl.add(block_l, sink_exp)
-                normalized = pl.row_expand_div(block_o, denom)
-                full = normalized[0:H_TILE, 0:HEAD_DIM]
-                full_bf16 = pl.cast(full, target_type=pl.BF16, mode="rint")
-
-                rope = full[:, NOPE_DIM:HEAD_DIM]
-                swapped = pl.gather(rope, dim=-1, index=rope_swap_idx[:, :])
-                cos_il = rope_cos_il[token : token + 1, 0:ROPE_DIM]
-                sin_signed = rope_sin_signed[token : token + 1, 0:ROPE_DIM]
-                rope_cos = pl.col_expand_mul(rope, cos_il)
-                swap_sin = pl.col_expand_mul(swapped, sin_signed)
-                rotated = pl.add(rope_cos, swap_sin)
-                rope_bf16 = pl.cast(rotated, target_type=pl.BF16, mode="rint")
-
-                for group_slot in pl.unroll(PUBLISH_GROUPS):
-                    source_head = group_slot * HEADS_PER_GROUP
-                    pack_row = (global_group_start + group_slot) * T_PAD + token
-                    destination_head = pack_row * HEADS_PER_GROUP
-                    o_packed_heads[
-                        destination_head : destination_head + HEADS_PER_GROUP,
-                        0:NOPE_DIM,
-                    ] = full_bf16[
-                        source_head : source_head + HEADS_PER_GROUP,
-                        0:NOPE_DIM,
-                    ]
-                    o_packed_heads[
-                        destination_head : destination_head + HEADS_PER_GROUP,
-                        NOPE_DIM:HEAD_DIM,
-                    ] = rope_bf16[
-                        source_head : source_head + HEADS_PER_GROUP,
-                        0:ROPE_DIM,
-                    ]
-
-            for group_slot in pl.unroll(PUBLISH_GROUPS):
-                global_group = global_group_start + group_slot
-                destination_rank = global_group // LOCAL_O_GROUPS
-                local_group = global_group - destination_rank * LOCAL_O_GROUPS
-                source_row = global_group * T_PAD + token_start
-                target_row = local_group * GROUP_T_PAD + tp_rank * local_t + token_start
-                pld.tensor.put(
-                    dst=exchange_window,
-                    peer=group_base + destination_rank,
-                    src=attention_grouped,
-                    dst_offsets=[target_row, 0],
-                    src_offsets=[source_row, 0],
-                    shape=[ATTENTION_PUBLISH_T_TILE, O_GROUP_IN],
-                    chunk_rows=ATTENTION_PUBLISH_T_TILE,
-                    chunk_cols=O_GROUP_IN,
-                )
-
-        for peer_tp in pl.range(TP):
-            if peer_tp != tp_rank:
-                pld.system.notify(
-                    target=exchange_signal,
-                    peer=group_base + peer_tp,
-                    offsets=[tp_rank, 0],
-                    value=1,
-                    op=pld.NotifyOp.AtomicAdd,
-                )
-
-    return exchange_signal, publish_tid
-
-
-@pl.jit.inline(auto_scope=False)
-def sparse_attn_swa(
+def sparse_attn_swa_tp1(
     q: pl.Tensor[[T_DYN, H, HEAD_DIM], pl.BF16],
     ori_kv: pl.Tensor[[ORI_BLOCK_NUM_DYN, BLOCK_SIZE, 1, HEAD_DIM], pl.BF16],
     swa_indices: pl.Tensor[[T_DYN, WIN], pl.INT32],
@@ -408,29 +270,19 @@ def sparse_attn_swa(
     freqs_sin: pl.Tensor[[T_DYN, ROPE_DIM], pl.BF16],
     o_packed_heads: pl.Tensor[[O_GROUPS * T_PAD * HEADS_PER_GROUP, HEAD_DIM], pl.BF16],
 ) -> tuple[pl.Tensor, pl.Scalar[pl.TASK_ID]]:
-    """Write SWA heads as ``[group, T_PAD, head-in-group, dim]`` slabs."""
+    """Merge and normalize SWA heads into ``[group, T_PAD, head-in-group, dim]`` slabs."""
     (
-        sparse_blk_mi,
-        sparse_blk_li,
-        sparse_blk_oi,
-        rope_cos_il,
-        rope_sin_signed,
-        rope_swap_idx,
-        qk_tid,
-        rope_tid,
-    ) = _compute_swa_attention_intermediates(
+        sparse_blk_mi, sparse_blk_li, sparse_blk_oi,
+        rope_cos_il, rope_sin_signed, rope_swap_idx,
+        qk_tid, rope_tid,
+    ) = sparse_attn_swa(
         q, ori_kv, swa_indices, sparse_bias,
         freqs_cos, freqs_sin,
     )
     t_dim = pl.tensor.dim(q, 0)
     t_hblocks = t_dim * (H // H_TILE)
 
-    with pl.spmd(
-        MERGE_TASKS,
-        name_hint="merge_norm",
-        deps=[qk_tid, rope_tid],
-        allow_early_resolve=True,
-    ) as merge_tid:
+    with pl.spmd(MERGE_TASKS, name_hint="merge_norm", deps=[qk_tid, rope_tid], allow_early_resolve=True) as merge_tid:
         m_task = pl.tile.get_block_idx()
         for m_idx in pl.range(m_task, t_hblocks, MERGE_TASKS):
             m_t = m_idx // (H // H_TILE)
@@ -464,10 +316,10 @@ def sparse_attn_swa(
                 n_pack_row = (m_g0 + m_sg) * T_PAD + m_t
                 n_dst_head = n_pack_row * HEADS_PER_GROUP
                 o_packed_heads[n_dst_head : n_dst_head + HEADS_PER_GROUP, 0:NOPE_DIM] = n_bf16[
-                    m_src_h0 : m_src_h0 + HEADS_PER_GROUP, 0:NOPE_DIM
+                    m_src_h0 : m_src_h0 + HEADS_PER_GROUP, 0:NOPE_DIM,
                 ]
                 o_packed_heads[n_dst_head : n_dst_head + HEADS_PER_GROUP, NOPE_DIM:HEAD_DIM] = n_rope_bf16[
-                    m_src_h0 : m_src_h0 + HEADS_PER_GROUP, 0:ROPE_DIM
+                    m_src_h0 : m_src_h0 + HEADS_PER_GROUP, 0:ROPE_DIM,
                 ]
 
     return o_packed_heads, merge_tid
@@ -498,13 +350,10 @@ def sparse_attn_swa_test(
             v_t0 = vb * BIAS_T_TILE
             v_col_m = pl.col_expand(pl.full([BIAS_T_TILE, ATTN_K_TILE], dtype=pl.FP32, value=0.0), v_col)
             v_lens = pl.cast(pl.reshape(swa_lens[v_t0 : v_t0 + BIAS_T_TILE], [BIAS_T_TILE, 1]), target_type=pl.FP32)
-            v_valid = pl.minimum(
-                pl.maximum(pl.neg(pl.row_expand_sub(v_col_m, v_lens)), 0.0),
-                1.0,
-            )
+            v_valid = pl.minimum(pl.maximum(pl.neg(pl.row_expand_sub(v_col_m, v_lens)), 0.0), 1.0)
             sparse_bias[v_t0 : v_t0 + BIAS_T_TILE, 0:ATTN_K_TILE] = pl.mul(pl.sub(v_valid, 1.0), -NEG_INF)
     o_packed_flat = pl.reshape(o_packed_heads, [O_GROUPS * T_PAD * HEADS_PER_GROUP, HEAD_DIM])
-    o_packed_flat, _ = sparse_attn_swa(
+    o_packed_flat, _ = sparse_attn_swa_tp1(
         q, ori_kv, swa_indices, sparse_bias,
         attn_sink, freqs_cos, freqs_sin,
         o_packed_flat,
@@ -551,10 +400,7 @@ def golden_sparse_attn(tensors):
                 dtype=torch.bool,
             )
             if end - start < ATTN_K_TILE:
-                valid_tile = torch.cat([
-                    valid_tile,
-                    torch.zeros(ATTN_K_TILE - (end - start), dtype=torch.bool),
-                ])
+                valid_tile = torch.cat([valid_tile, torch.zeros(ATTN_K_TILE - (end - start), dtype=torch.bool)])
             valid_tile = valid_tile.to(device=ori_kv.device)
             kv_tile = torch.zeros(ATTN_K_TILE, HEAD_DIM, dtype=ori_kv.dtype, device=ori_kv.device)
             for r, slot in enumerate(slots):

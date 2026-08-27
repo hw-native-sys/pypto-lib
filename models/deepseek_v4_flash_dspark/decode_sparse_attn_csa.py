@@ -14,7 +14,6 @@ masking folded in. The SWA and HCA variants live in sibling modules.
 
 
 import pypto.language as pl
-import pypto.language.distributed as pld
 
 from config import (
     FLASH as M,
@@ -103,7 +102,7 @@ if T % ATTENTION_PUBLISH_T_TILE != 0:
 
 
 @pl.jit.inline(auto_scope=False)
-def _compute_csa_attention_intermediates(
+def sparse_attn_csa(
     q: pl.Tensor[[T_DYN, H, HEAD_DIM], pl.BF16],
     ori_kv: pl.Tensor[[ORI_BLOCK_NUM_DYN, BLOCK_SIZE, 1, HEAD_DIM], pl.BF16],
     window_swa_indices: pl.Tensor[[T_DYN, WIN], pl.INT32],
@@ -115,7 +114,7 @@ def _compute_csa_attention_intermediates(
     freqs_sin: pl.Tensor[[T_DYN, ROPE_DIM], pl.BF16],
     cache_ready_dep: pl.Scalar[pl.TASK_ID],
 ):
-    """Compute CSA sparse-block states and inverse-RoPE metadata."""
+    """Plan and run CSA QK/PV over sparse blocks, and build inverse-RoPE metadata."""
     # Compressed index contract: -1 invalid, [0, ...) compressed KV slots.
     ori_block_num = pl.tensor.dim(ori_kv, 0)
     t_dim = pl.tensor.dim(q, 0)
@@ -170,10 +169,9 @@ def _compute_csa_attention_intermediates(
             # Additive softmax bias (0 valid / NEG_INF invalid) that qk_pv adds onto the
             # scaled scores, so invalid lanes exp to ~0 with no per-block mask multiply.
             v_win_f = pl.cast(window_swa_indices[bias_t0 : bias_t0 + BIAS_T_TILE, 0:WIN], target_type=pl.FP32)
-            # Index contract (line 138): raw == -1 invalid, raw >= 0 valid. min(idx, 0)
-            # is -1 for invalid / 0 for valid; * -NEG_INF gives NEG_INF / 0. Bit-exact,
-            # 2 vector ops instead of the add/max/min/sub clamp chain. c_out is the just-
-            # computed post-mask compressed slots (integer-valued), reused directly.
+            # Index contract: raw == -1 invalid, raw >= 0 valid. min(idx, 0) is -1 for
+            # invalid / 0 for valid; * -NEG_INF gives NEG_INF / 0. c_out is the
+            # post-mask compressed slots (integer-valued), reused directly.
             v_win_valid = pl.minimum(pl.maximum(pl.add(v_win_f, 1.0), 0.0), 1.0)
             sparse_bias[bias_t0 : bias_t0 + BIAS_T_TILE, 0:WIN] = pl.mul(pl.sub(v_win_valid, 1.0), -NEG_INF)
             sparse_bias[bias_t0 : bias_t0 + BIAS_T_TILE, WIN:TOPK] = pl.mul(pl.minimum(c_out, 0.0), -NEG_INF)
@@ -277,13 +275,9 @@ def _compute_csa_attention_intermediates(
                     else:
                         qk_kv = pl.gather_row(qk_kv, ori_kv_flat, [qk_r, 0], [0, 0], [1, HEAD_DIM])
 
-                # Cube-batch QK_M_TILE head rows per QK/PV matmul so the shared KV
-                # tile is extracted L1->L0 once per QK_M_TILE/H_TILE head-tiles
-                # (2x reuse at QK_M_TILE=32) instead of per head-tile. The
-                # [QK_M_TILE, ...] softmax result is sliced back into H_TILE-row
-                # stores at the SAME offsets as the per-head-tile path
-                # (qk_h_idx == qk_hb * (QK_M_TILE // H_TILE) + qk_sub), so the
-                # sparse_blk_* layout and merge_norm are bit-identical.
+                # Cube-batch QK_M_TILE head rows per QK/PV matmul. The [QK_M_TILE, ...]
+                # softmax result slices back into H_TILE-row stores at the same offsets
+                # as the per-head-tile path (qk_h_idx == qk_hb * (QK_M_TILE // H_TILE) + qk_sub).
                 for qk_hb in pl.pipeline(H // QK_M_TILE, stage=2):
                     qk_h0 = qk_hb * QK_M_TILE
                     qk_head_row = qk_t * H + qk_h0
@@ -363,152 +357,8 @@ def _compute_csa_attention_intermediates(
     )
 
 
-@pl.jit.inline(auto_scope=False)
-def publish_csa_o_groups(
-    q: pl.Tensor[[T_DYN, H, HEAD_DIM], pl.BF16],
-    ori_kv: pl.Tensor[[ORI_BLOCK_NUM_DYN, BLOCK_SIZE, 1, HEAD_DIM], pl.BF16],
-    window_swa_indices: pl.Tensor[[T_DYN, WIN], pl.INT32],
-    cmp_kv: pl.Tensor[[CMP_BLOCK_NUM_DYN, BLOCK_SIZE, 1, HEAD_DIM], pl.BF16],
-    cmp_block_table: pl.Tensor[[B_DYN, CMP_MAX_BLOCKS], pl.INT32],
-    idx_topk: pl.Tensor[[T_DYN, IDX_TOPK], pl.INT32],
-    position_ids: pl.Tensor[[T_DYN, 1], pl.INT32],
-    attn_sink: pl.Tensor[[H], pl.FP32],
-    freqs_cos: pl.Tensor[[T_DYN, ROPE_DIM], pl.BF16],
-    freqs_sin: pl.Tensor[[T_DYN, ROPE_DIM], pl.BF16],
-    attention_grouped: pl.Tensor[[O_GROUPS * T_PAD, O_GROUP_IN], pl.BF16],
-    exchange_window: pld.DistributedTensor[[ATTENTION_WINDOW_ROWS, O_GROUP_IN], pl.BF16],
-    exchange_signal: pld.DistributedTensor[[TP, 1], pl.INT32],
-    group_base: pl.Scalar[pl.INT32],
-    tp_rank: pl.Scalar[pl.INT32],
-    local_t: pl.Scalar[pl.INT32],
-    cache_ready_dep: pl.Scalar[pl.TASK_ID],
-):
-    """Merge CSA heads and publish completed O-group token tiles."""
-    (
-        sparse_blk_mi,
-        sparse_blk_li,
-        sparse_blk_oi,
-        rope_cos_il,
-        rope_sin_signed,
-        rope_swap_idx,
-        qk_tid,
-        rope_tid,
-    ) = _compute_csa_attention_intermediates(
-        q,
-        ori_kv,
-        window_swa_indices,
-        cmp_kv,
-        cmp_block_table,
-        idx_topk,
-        position_ids,
-        freqs_cos,
-        freqs_sin,
-        cache_ready_dep,
-    )
-    t_dim = pl.tensor.dim(q, 0)
-    pack_work_count = (t_dim // ATTENTION_PUBLISH_T_TILE) * (H // H_TILE)
-
-    with pl.spmd(
-        ATTENTION_PUBLISH_WORKERS,
-        name_hint="csa_merge_pack_publish",
-        deps=[qk_tid, rope_tid],
-    ) as publish_tid:
-        worker = pl.tile.get_block_idx()
-        for pack_work in pl.range(worker, pack_work_count, ATTENTION_PUBLISH_WORKERS):
-            token_block = pack_work // (H // H_TILE)
-            m_h_idx = pack_work - token_block * (H // H_TILE)
-            m_t0 = token_block * ATTENTION_PUBLISH_T_TILE
-            m_h0 = m_h_idx * H_TILE
-            global_group0 = m_h0 // HEADS_PER_GROUP
-            destination_rank = global_group0 // LOCAL_O_GROUPS
-            local_group0 = global_group0 - destination_rank * LOCAL_O_GROUPS
-
-            for m_dt in pl.range(ATTENTION_PUBLISH_T_TILE):
-                m_t = m_t0 + m_dt
-                m_idx = m_t * (H // H_TILE) + m_h_idx
-                m_blk_base = m_idx * SPARSE_BLOCKS * H_TILE
-                m_mi = sparse_blk_mi[m_blk_base : m_blk_base + H_TILE, 0:1]
-                m_li = sparse_blk_li[m_blk_base : m_blk_base + H_TILE, 0:1]
-                m_oi = sparse_blk_oi[m_blk_base : m_blk_base + H_TILE, 0:HEAD_DIM]
-
-                for m_sb in pl.pipeline(1, SPARSE_BLOCKS, stage=2):
-                    m_row = m_blk_base + m_sb * H_TILE
-                    m_cur_mi = sparse_blk_mi[m_row : m_row + H_TILE, 0:1]
-                    m_cur_li = sparse_blk_li[m_row : m_row + H_TILE, 0:1]
-                    m_cur_oi = sparse_blk_oi[m_row : m_row + H_TILE, 0:HEAD_DIM]
-                    m_mi_new = pl.maximum(m_mi, m_cur_mi)
-                    m_alpha = pl.exp(pl.sub(m_mi, m_mi_new))
-                    m_beta = pl.exp(pl.sub(m_cur_mi, m_mi_new))
-                    m_li = pl.add(pl.mul(m_alpha, m_li), pl.mul(m_beta, m_cur_li))
-                    m_oi = pl.add(
-                        pl.row_expand_mul(m_oi, m_alpha),
-                        pl.row_expand_mul(m_cur_oi, m_beta),
-                    )
-                    m_mi = m_mi_new
-
-                n_sink_bias = pl.reshape(attn_sink[m_h0 : m_h0 + H_TILE], [H_TILE, 1])
-                n_sink_tile = pl.add(pl.sub(m_mi, m_mi), n_sink_bias)
-                n_denom = pl.add(m_li, pl.exp(pl.sub(n_sink_tile, m_mi)))
-                n_full = pl.row_expand_div(m_oi, n_denom)[0:H_TILE, 0:HEAD_DIM]
-                n_bf16 = pl.cast(n_full, target_type=pl.BF16, mode="rint")
-
-                m_rope = n_full[0:H_TILE, NOPE_DIM:HEAD_DIM]
-                m_cos_il = rope_cos_il[m_t : m_t + 1, 0:ROPE_DIM]
-                m_sin_signed = rope_sin_signed[m_t : m_t + 1, 0:ROPE_DIM]
-                m_swapped = pl.gather(
-                    m_rope,
-                    dim=-1,
-                    index=rope_swap_idx[0:H_TILE, 0:ROPE_DIM],
-                )
-                m_rot = pl.add(
-                    pl.col_expand_mul(m_rope, m_cos_il),
-                    pl.col_expand_mul(m_swapped, m_sin_signed),
-                )
-                n_rope_bf16 = pl.cast(m_rot, target_type=pl.BF16, mode="rint")
-                n_full_bf16 = pl.concat(n_bf16[:, 0:NOPE_DIM], n_rope_bf16)
-
-                for n_hi in pl.unroll(H_TILE):
-                    n_head = m_h0 + n_hi
-                    source_row = (n_head // HEADS_PER_GROUP) * T_PAD + m_t
-                    source_col = (n_head % HEADS_PER_GROUP) * HEAD_DIM
-                    attention_grouped[
-                        source_row : source_row + 1,
-                        source_col : source_col + HEAD_DIM,
-                    ] = n_full_bf16[n_hi : n_hi + 1, 0:HEAD_DIM]
-
-            for group_slot in pl.unroll(PUBLISH_GROUPS):
-                source_row = (global_group0 + group_slot) * T_PAD + m_t0
-                target_row = (
-                    (local_group0 + group_slot) * GROUP_T_PAD
-                    + tp_rank * local_t
-                    + m_t0
-                )
-                pld.tensor.put(
-                    dst=exchange_window,
-                    peer=group_base + destination_rank,
-                    src=attention_grouped,
-                    dst_offsets=[target_row, 0],
-                    src_offsets=[source_row, 0],
-                    shape=[ATTENTION_PUBLISH_T_TILE, O_GROUP_IN],
-                    chunk_rows=ATTENTION_PUBLISH_T_TILE,
-                    chunk_cols=O_GROUP_IN,
-                )
-
-        for destination_rank in pl.range(TP):
-            if destination_rank != tp_rank:
-                pld.system.notify(
-                    target=exchange_signal,
-                    peer=group_base + destination_rank,
-                    offsets=[tp_rank, 0],
-                    value=1,
-                    op=pld.NotifyOp.AtomicAdd,
-                )
-
-    return exchange_signal, publish_tid
-
-
 @pl.jit.inline
-def sparse_attn_csa(
+def sparse_attn_csa_tp1(
     q: pl.Tensor[[T_DYN, H, HEAD_DIM], pl.BF16],
     ori_kv: pl.Tensor[[ORI_BLOCK_NUM_DYN, BLOCK_SIZE, 1, HEAD_DIM], pl.BF16],
     window_swa_indices: pl.Tensor[[T_DYN, WIN], pl.INT32],
@@ -528,15 +378,10 @@ def sparse_attn_csa(
     returned task ID covers every write to the packed output tensor.
     """
     (
-        sparse_blk_mi,
-        sparse_blk_li,
-        sparse_blk_oi,
-        rope_cos_il,
-        rope_sin_signed,
-        rope_swap_idx,
-        qk_tid,
-        rope_tid,
-    ) = _compute_csa_attention_intermediates(
+        sparse_blk_mi, sparse_blk_li, sparse_blk_oi,
+        rope_cos_il, rope_sin_signed, rope_swap_idx,
+        qk_tid, rope_tid,
+    ) = sparse_attn_csa(
         q,
         ori_kv,
         window_swa_indices,
@@ -550,11 +395,7 @@ def sparse_attn_csa(
     )
     t_dim = pl.tensor.dim(q, 0)
 
-    with pl.spmd(
-        t_dim * (H // H_TILE),
-        name_hint="merge_norm",
-        deps=[qk_tid, rope_tid],
-    ) as merge_tid:
+    with pl.spmd(t_dim * (H // H_TILE), name_hint="merge_norm", deps=[qk_tid, rope_tid]) as merge_tid:
         m_idx = pl.tile.get_block_idx()
         m_t = m_idx // (H // H_TILE)
         m_h_idx = m_idx - m_t * (H // H_TILE)
@@ -582,11 +423,8 @@ def sparse_attn_csa(
         n_full = pl.row_expand_div(m_oi, n_denom)[0 : H_TILE, 0 : HEAD_DIM]
         n_bf16 = pl.cast(n_full, target_type=pl.BF16, mode="rint")
 
-        # Inverse RoPE on this head-tile's fp32 rope segment. cos_il / sign*sin are
-        # head-invariant for token m_t, so col_expand them over the H_TILE head rows;
-        # rope_swap_idx (j^1, prebuilt above) pairs the interleaved real/imag lanes.
-        # Rounded to bf16 (golden also rounds inverse-RoPE to bf16) and packed into
-        # the group-major output.
+        # Inverse RoPE on this head-tile's fp32 rope segment: cos_il / sign*sin are
+        # head-invariant per token, rope_swap_idx (j^1) pairs the interleaved real/imag lanes.
         m_rope = n_full[0 : H_TILE, NOPE_DIM : HEAD_DIM]
         m_cos_il = rope_cos_il[m_t : m_t + 1, 0 : ROPE_DIM]
         m_sin_signed = rope_sin_signed[m_t : m_t + 1, 0 : ROPE_DIM]
@@ -598,8 +436,7 @@ def sparse_attn_csa(
         for n_hi in pl.unroll(H_TILE):
             n_pack_row = ((m_h0 + n_hi) // HEADS_PER_GROUP) * T_PAD + m_t
             n_col = ((m_h0 + n_hi) % HEADS_PER_GROUP) * HEAD_DIM
-            # one HEAD_DIM-wide store per head row instead of two: concat the nope and
-            # inverse-RoPE halves on chip so o_packed_heads takes a single contiguous write.
+            # One HEAD_DIM-wide store per head row: nope and inverse-RoPE halves concat on chip.
             o_packed_heads[n_pack_row : n_pack_row + 1, n_col : n_col + HEAD_DIM] = n_full_bf16[n_hi : n_hi + 1, :]
 
     return o_packed_heads, merge_tid
@@ -629,7 +466,7 @@ def sparse_attn_csa_test(
 
     cache_ready_dep = pl.system.task_dummy(deps=[])
     o_packed_flat = pl.reshape(o_packed_heads, [O_GROUPS * T_PAD, O_GROUP_IN])
-    o_packed_flat, _ = sparse_attn_csa(
+    o_packed_flat, _ = sparse_attn_csa_tp1(
         q,
         ori_kv, window_swa_indices,
         cmp_kv, cmp_block_table, idx_topk,
@@ -792,11 +629,7 @@ def build_tensor_specs(
         max_seq_len=MAX_SEQ_LEN,
         dtype=torch.bfloat16,
     )
-    shared_window_block_table = block_table(
-        batch=batch,
-        table_blocks=ORI_MAX_BLOCKS,
-        physical_blocks=ORI_BLOCK_NUM,
-    )
+    shared_window_block_table = block_table(batch=batch, table_blocks=ORI_MAX_BLOCKS, physical_blocks=ORI_BLOCK_NUM)
     shared_swa_indices = swa_indices_and_lens(
         positions,
         shared_window_block_table,
@@ -940,19 +773,13 @@ if __name__ == "__main__":
     start_pos = None
     if args.start_pos is not None:
         try:
-            start_values = [
-                int(value.strip())
-                for value in args.start_pos.split(",")
-                if value.strip() != ""
-            ]
+            start_values = [int(value.strip()) for value in args.start_pos.split(",") if value.strip() != ""]
         except ValueError:
             parser.error(f"--start-pos must contain integers, got {args.start_pos!r}")
         if not start_values:
             parser.error("--start-pos must contain at least one integer")
         if len(start_values) not in (1, args.batch):
-            parser.error(
-                f"--start-pos needs 1 or {args.batch} values, got {len(start_values)}"
-            )
+            parser.error(f"--start-pos needs 1 or {args.batch} values, got {len(start_values)}")
         start_pos = start_values[0] if len(start_values) == 1 else start_values
 
     print(f"compress_ratio={COMPRESS_RATIO} -> TOPK={TOPK} SPARSE_BLOCKS={SPARSE_BLOCKS} PADDED_TOPK={PADDED_TOPK}", flush=True)
