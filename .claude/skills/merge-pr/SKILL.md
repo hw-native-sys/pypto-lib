@@ -12,13 +12,12 @@ conventions **before** merging, never after.
 Input: PR number (`942`, `#942`), branch name, or no argument (current branch).
 
 Several steps below rest on the repo's current merge settings — squash-only,
-`PR_TITLE` / `PR_BODY` commit defaults, automatic head-branch deletion, and an
-unprotected `main`. Re-derive them rather than trusting this paragraph if a
-merge behaves unexpectedly:
+`PR_TITLE` / `PR_BODY` commit defaults, and an unprotected `main`. Re-derive
+them rather than trusting this paragraph if a merge behaves unexpectedly:
 
 ```bash
 gh api repos/hw-native-sys/pypto-lib \
-  -q '"squash=\(.allow_squash_merge) title=\(.squash_merge_commit_title) msg=\(.squash_merge_commit_message) delete=\(.delete_branch_on_merge)"'
+  -q '"squash=\(.allow_squash_merge) title=\(.squash_merge_commit_title) msg=\(.squash_merge_commit_message)"'
 gh api repos/hw-native-sys/pypto-lib/branches/main/protection   # 404 = unprotected
 ```
 
@@ -121,13 +120,17 @@ exempt list is not ready: report it and stop, or route to `/fix-pr`. Do not
 merge past it, and do not reach for `--admin` — an unprotected `main` means
 `--admin` is never the thing standing between you and a merge.
 
-**Exempt: the `sim` jobs — `sim (a2a3sim)` and `sim (a5sim)`.** Nobody
-maintains simulator CI at present, so a red `sim` entry carries no signal and
-its log is not worth reading. The simulator cannot execute whole classes of
-kernel — most often multi-rank comm (CP / EP / TP entries), and it also
-enforces A5 buffer limits and pto-isa CPU templates that no A2/A3 device run
-ever sees — so a device-validated kernel routinely fails there while `a2a3` and
-`serving-*` pass.
+**Exempt: the `sim` jobs — every entry named `sim` or starting with `sim (`.**
+Match the prefix, not a fixed pair of names: the matrix reports
+`sim (a2a3sim)` and `sim (a5sim)` once it runs, and collapses to a single bare
+`sim` when `detect-changes` skips it.
+
+Nobody maintains simulator CI at present, so a red `sim` entry carries no
+signal and its log is not worth reading. The simulator cannot execute whole
+classes of kernel — most often multi-rank comm (CP / EP / TP entries), and it
+also enforces A5 buffer limits and pto-isa CPU templates that no A2/A3 device
+run ever sees — so a device-validated kernel routinely fails there while `a2a3`
+and `serving-*` pass.
 
 Do **not** open a failing `sim` job, fetch its log, or diagnose the error: name
 the red `sim` entries in the report and merge. The exemption is by job name
@@ -137,29 +140,22 @@ which is easy to lose in a list that is mostly `sim` noise.
 ### Pending checks — watch, do not poll
 
 `pending` is not a failure, only an unfinished run. Block on it instead of
-re-running `gh pr checks` in a loop; each poll costs a round trip and the
-`a2a3` and `serving-*` jobs run for tens of minutes.
+re-running the listing in a loop; each poll costs a round trip and the `a2a3`
+and `serving-*` jobs run for tens of minutes.
 
 ```bash
-gh pr checks <number> -R "$REPO" --json name,bucket,link \
-  | python3 -c 'import json,sys,re; print("\n".join(sorted({m.group(1) for c in json.load(sys.stdin) if c["bucket"]=="pending" for m in [re.search(r"/runs/(\d+)", c["link"] or "")] if m})))'
+gh pr checks <number> -R "$REPO" --watch -i 30
 ```
 
-Watch every run id that prints, not just the first — the checks span several
-workflow runs, and one green run says nothing about the others.
+`--watch` blocks until every check finishes, whatever produced it. Do not
+build the wait out of `gh run watch` instead: that needs a run id scraped from
+each check's `link`, and a check from any integration other than GitHub Actions
+has no `/runs/<id>` — CodeRabbit reports an empty `link` — so the scrape
+silently drops it and the wait returns while it is still running.
 
-```bash
-gh run watch <run-id> -R "$REPO"
-```
-
-The regex only matches GitHub Actions links. A pending check from any other
-integration has no `/runs/<id>` and prints nothing, so a silent result here is
-not proof that nothing is pending — re-read the bucket listing after the
-watches return, and fall back to the check's own `link` for anything still
-`pending`.
-
-Re-read the merge state and the check list after the last watch returns; the
-tables above still decide.
+`--watch` exits non-zero when a check ends red. That is the exemption table's
+business, not a reason to stop. Re-read the merge state and the check list
+after it returns; the tables above still decide.
 
 ### Unresolved review feedback
 
@@ -268,9 +264,19 @@ HEAD_SHA=$(gh pr view <number> -R "$REPO" --json headRefOid -q .headRefOid)
 gh pr merge <number> -R "$REPO" --squash --match-head-commit "$HEAD_SHA"
 ```
 
-Never `--merge` or `--rebase`. Do not pass `--delete-branch` — the repo already
-has `delete_branch_on_merge`, so the remote branch goes on its own; the flag
-only adds deletion of the *local* branch, which is the user's to decide.
+A failed `gh pr merge` is not proof the merge did not happen — the GraphQL call
+can time out after the merge has landed. Re-read the state before retrying; a
+blind retry against an already-merged PR fails with an unrelated-looking error.
+
+```bash
+gh pr view <number> -R "$REPO" --json state,mergedAt -q '"\(.state) \(.mergedAt)"'
+```
+
+Never `--merge` or `--rebase`. **Never `--delete-branch`, and never delete the
+branch by hand afterwards — neither the remote one nor the local one.** The
+upstream repo's `delete_branch_on_merge` does not reach a fork, so a PR raised
+from `origin` keeps its head branch after the merge; that is the intended end
+state, not something to tidy up.
 
 ## 6. Verify
 
