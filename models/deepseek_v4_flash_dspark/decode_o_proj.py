@@ -64,7 +64,7 @@ T_DYN = pl.dynamic("T_DYN")
 TOKEN_TILE = 16
 COMM_ROW_TILE = 8
 ATTENTION_PUBLISH_WORKERS = 48
-O_RS_REDUCE_WORKERS = 8
+O_RS_REDUCE_WORKERS = 48   # 128 row blocks; 8 left 40 of 48 AIV idle
 O_RS_PUBLISH_WORKERS = 24    # put is fabric-bound; more workers only burn cores
 O_RS_DEQUANT_WORKERS = 12    # per owner; 4 owners -> one AIV wave
 O_RS_PUT_T_TILE = 8          # 4 owners x 16 row blocks -> 64 puts over 24 workers
@@ -607,22 +607,26 @@ def o_proj_reduce_scatter(
         name_hint="tp_o_b_publish",
     ) as publish_tid:
         pub_worker = pl.tile.get_block_idx()
-        for pub_owner in pl.range(TP_SIZE):
-            for pub_row_block in pl.range(pub_worker, put_rows, O_RS_PUBLISH_WORKERS):
-                pub_owner_row = pub_row_block * O_RS_PUT_T_TILE
-                pub_rows = pl.min(O_RS_PUT_T_TILE, local_t - pub_owner_row)
-                pub_src_row = pub_owner * LOCAL_T_PAD + pub_owner_row
-                pub_dst_row = tp_rank * LOCAL_T_PAD + pub_owner_row
-                pld.tensor.put(
-                    dst=reduce_window,
-                    peer=group_base + pub_owner,
-                    src=publish_all,
-                    dst_offsets=[pub_dst_row, 0],
-                    src_offsets=[pub_src_row, 0],
-                    shape=[pub_rows, D],
-                    chunk_rows=O_RS_PUT_T_TILE,
-                    chunk_cols=D,
-                )
+        # Flatten (owner, row block) into one work list: put_rows alone is under
+        # the worker count, so an owner-outer loop leaves a third of the workers
+        # idle while the rest each issue TP_SIZE puts.
+        for pub_blk in pl.range(pub_worker, TP_SIZE * put_rows, O_RS_PUBLISH_WORKERS):
+            pub_owner = pub_blk // put_rows
+            pub_row_block = pub_blk - pub_owner * put_rows
+            pub_owner_row = pub_row_block * O_RS_PUT_T_TILE
+            pub_rows = pl.min(O_RS_PUT_T_TILE, local_t - pub_owner_row)
+            pub_src_row = pub_owner * LOCAL_T_PAD + pub_owner_row
+            pub_dst_row = tp_rank * LOCAL_T_PAD + pub_owner_row
+            pld.tensor.put(
+                dst=reduce_window,
+                peer=group_base + pub_owner,
+                src=publish_all,
+                dst_offsets=[pub_dst_row, 0],
+                src_offsets=[pub_src_row, 0],
+                shape=[pub_rows, D],
+                chunk_rows=O_RS_PUT_T_TILE,
+                chunk_cols=D,
+            )
 
         for notify_owner in pl.range(TP_SIZE):
             if notify_owner != tp_rank:
