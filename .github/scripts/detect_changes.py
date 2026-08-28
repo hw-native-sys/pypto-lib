@@ -98,9 +98,12 @@ def _has_main(path):
 
 
 # Anchored on purpose: a prose mention of "ci: skip" inside a docstring must not
-# be able to mute a real case. Same spelling the daily sweeps grep for.
-_CI_SKIP_RE = re.compile(r"^#\s*ci:\s*skip", re.MULTILINE)
-_CI_EXCLUDED_RE = re.compile(r"^#\s*ci:\s*excluded", re.MULTILINE)
+# be able to mute a real case. Blank-only (not `\s`) on purpose too: `\s` matches
+# a newline, so `^#\s*ci:\s*skip` would accept a marker split across two lines,
+# which the sweeps' line-at-a-time grep would not -- a file could then be dropped
+# from PR discovery while the daily sweeps still ran it. Same grammar both sides.
+_CI_SKIP_RE = re.compile(r"^#[ \t]*ci:[ \t]*skip", re.MULTILINE)
+_CI_EXCLUDED_RE = re.compile(r"^#[ \t]*ci:[ \t]*excluded", re.MULTILINE)
 
 
 def _ci_skipped(path):

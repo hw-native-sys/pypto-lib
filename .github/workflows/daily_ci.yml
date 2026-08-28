@@ -117,7 +117,7 @@ jobs:
             # `# ci: skip`. Deliberately opt-OUT: an unmarked file is always
             # run, so a new kernel case can never lose coverage by omission —
             # the worst a missing marker can do is show up as a loud red row.
-            if grep -qE '^#\s*ci:\s*skip' "$f"; then
+            if grep -qE '^#[[:blank:]]*ci:[[:blank:]]*skip' "$f"; then
               echo "::group::${f}"
               echo "skip (ci: skip): ${f}"
               echo "::endgroup::"
@@ -130,14 +130,14 @@ jobs:
             # never coming back, `ci: excluded` is debt someone owes. The reason
             # is required on the line after the marker and is echoed here, so the
             # sweep log always states what coverage it is not providing.
-            if grep -qE '^#\s*ci:\s*excluded' "$f"; then
+            if grep -qE '^#[[:blank:]]*ci:[[:blank:]]*excluded' "$f"; then
               echo "::group::${f}"
               echo "excluded (ci: excluded): ${f}"
               sed -n 's/^#[[:space:]]*ci-reason:[[:space:]]*//p' "$f" | head -1 | sed 's/^/  reason: /'
               echo "::endgroup::"
               continue
             fi
-            if grep -qE '^#\s*ci:\s*no-sim' "$f"; then
+            if grep -qE '^#[[:blank:]]*ci:[[:blank:]]*no-sim' "$f"; then
               echo "::group::${f}"
               echo "skip (no-sim): ${f}"
               echo "::endgroup::"
@@ -267,8 +267,11 @@ jobs:
             # the top; borrow that many cards with `--device-num N` (defaults to
             # ep2 / 2-card runs). $TASK_DEVICE is the lent set (a single id, or
             # comma-separated for N>1) and is passed straight to -d. The child's
-            # stdout is captured (not streamed) so the perf line can be parsed;
-            # the ring env above is preserved into the child.
+            # stdout is captured (not streamed) so the perf line can be parsed.
+            # Ring sizing is NOT inherited from any env here -- simpler #1980
+            # retired the PTO2_RING_* vars; a kernel that needs above-default
+            # rings passes ring_heap in its own runtime_cfg, which reaches the
+            # runtime as RunConfig -> CallConfig.runtime_env.
             local ndev devnum_flag out rc perf
             ndev=$(grep -oP '#\s*ci:\s*devices=\K[0-9]+' "$file" | head -1)
             ndev=${ndev:-1}
@@ -299,7 +302,7 @@ jobs:
             fi
             # CLI utilities under models/ opt out with `# ci: skip` — see
             # the sim job's note.
-            if grep -qE '^#\s*ci:\s*skip' "$f"; then
+            if grep -qE '^#[[:blank:]]*ci:[[:blank:]]*skip' "$f"; then
               echo "::group::${f}"
               echo "skip (ci: skip): ${f}"
               echo "::endgroup::"
@@ -312,7 +315,7 @@ jobs:
             # never coming back, `ci: excluded` is debt someone owes. The reason
             # is required on the line after the marker and is echoed here, so the
             # sweep log always states what coverage it is not providing.
-            if grep -qE '^#\s*ci:\s*excluded' "$f"; then
+            if grep -qE '^#[[:blank:]]*ci:[[:blank:]]*excluded' "$f"; then
               echo "::group::${f}"
               echo "excluded (ci: excluded): ${f}"
               sed -n 's/^#[[:space:]]*ci-reason:[[:space:]]*//p' "$f" | head -1 | sed 's/^/  reason: /'
@@ -513,7 +516,7 @@ jobs:
             fi
             # CLI utilities under models/ opt out with `# ci: skip` — see
             # the sim job's note.
-            if grep -qE '^#\s*ci:\s*skip' "$f"; then
+            if grep -qE '^#[[:blank:]]*ci:[[:blank:]]*skip' "$f"; then
               echo "::group::${f}"
               echo "skip (ci: skip): ${f}"
               echo "::endgroup::"
@@ -526,7 +529,7 @@ jobs:
             # never coming back, `ci: excluded` is debt someone owes. The reason
             # is required on the line after the marker and is echoed here, so the
             # sweep log always states what coverage it is not providing.
-            if grep -qE '^#\s*ci:\s*excluded' "$f"; then
+            if grep -qE '^#[[:blank:]]*ci:[[:blank:]]*excluded' "$f"; then
               echo "::group::${f}"
               echo "excluded (ci: excluded): ${f}"
               sed -n 's/^#[[:space:]]*ci-reason:[[:space:]]*//p' "$f" | head -1 | sed 's/^/  reason: /'
