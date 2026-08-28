@@ -11,19 +11,23 @@ inputs:
   pypto-serving-checkout-path:
     description: Workspace-relative path where pypto-serving should be checked out.
     required: true
+  pypto-serving-ref:
+    description: pypto-serving git ref to test.
+    required: false
+    default: main
   model-name:
     description: Serving model guard to run (qwen3-14b or deepseek-v4).
     required: true
   pto2-ring-dep-pool:
-    description: PTO2_RING_DEP_POOL value for pypto-serving tests.
+    description: Scalar or four comma-separated PTO2_RING_DEP_POOL values for pypto-serving tests.
     required: false
     default: "16384"
   pto2-ring-task-window:
-    description: PTO2_RING_TASK_WINDOW value for pypto-serving tests.
+    description: Scalar or four comma-separated PTO2_RING_TASK_WINDOW values for pypto-serving tests.
     required: false
     default: "16384"
   pto2-ring-heap:
-    description: PTO2_RING_HEAP value for pypto-serving tests.
+    description: Scalar or four comma-separated PTO2_RING_HEAP values for pypto-serving tests.
     required: false
     default: "1073741824"
   deepseek-mtp-cases:
@@ -73,7 +77,7 @@ runs:
       uses: actions/checkout@v4
       with:
         repository: hw-native-sys/pypto-serving
-        ref: main
+        ref: ${{ inputs.pypto-serving-ref }}
         path: ${{ inputs.pypto-serving-checkout-path }}
         submodules: recursive
         persist-credentials: false

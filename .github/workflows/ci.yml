@@ -450,13 +450,17 @@ jobs:
         with:
           pypto-lib-checkout-path: checkout
           pypto-serving-checkout-path: serving-checkout
+          # PR #1023 and pypto-serving #187 form one cross-repository contract.
+          pypto-serving-ref: refs/pull/187/head
           model-name: deepseek-v4
           # Only the fused K=1 case runs on device: the k3-s4-b4 case starts a
           # second 8-card server for the same gate.
           deepseek-mtp-cases: k1
-          pto2-ring-dep-pool: "131072"
-          pto2-ring-task-window: "131072"
-          pto2-ring-heap: "2147483648"
+          pto2-ring-dep-pool: "16384,16384,16384,16384"
+          pto2-ring-task-window: "16384,16384,16384,16384"
+          # Keep each dispatch depth below the measured 1 GiB bound instead of
+          # broadcasting one 2 GiB scalar into all four static arenas.
+          pto2-ring-heap: "1073741824,1073741824,1073741824,1073741824"
 
       - name: Kill orphaned task-submit tasks
         if: always()
