@@ -345,7 +345,7 @@ def decode_fwd(
     sampled_ids: pl.Out[pl.Tensor[[MAX_LOGIT_ROWS, SAMPLED_IDS_PAD], pl.INT32]],
     attention_window: pld.DistributedTensor[[ATTENTION_WINDOW_ROWS, O_GROUP_IN], pl.BF16],
     attention_signal: pld.DistributedTensor[[TP_SIZE, 1], pl.INT32],
-    o_window: pld.DistributedTensor[[O_WINDOW_ROWS, D], pl.FP32],
+    o_window: pld.DistributedTensor[[O_WINDOW_ROWS, D], pl.BF16],
     o_signal: pld.DistributedTensor[[TP_SIZE, 1], pl.INT32],
     recv_meta: pld.DistributedTensor[[N_RANKS, N_LOCAL], pl.INT32],
     recv_x: pld.DistributedTensor[[N_LOCAL * RECV_MAX, D], pl.INT8],
@@ -1181,7 +1181,7 @@ def l3_decode_fwd(
 
     attention_window_buf = pld.alloc_window_buffer([ATTENTION_WINDOW_ROWS, O_GROUP_IN], dtype=pl.BF16)
     attention_signal_buf = pld.alloc_window_buffer([TP_SIZE, 1], dtype=pl.INT32)
-    o_window_buf = pld.alloc_window_buffer([O_WINDOW_ROWS, D], dtype=pl.FP32)
+    o_window_buf = pld.alloc_window_buffer([O_WINDOW_ROWS, D], dtype=pl.BF16)
     o_signal_buf = pld.alloc_window_buffer([TP_SIZE, 1], dtype=pl.INT32)
     recv_meta_buf = pld.alloc_window_buffer([N_RANKS, N_LOCAL], dtype=pl.INT32)
     recv_x_buf = pld.alloc_window_buffer([N_LOCAL * RECV_MAX, D], dtype=pl.INT8)
@@ -1199,7 +1199,7 @@ def l3_decode_fwd(
     for rank in pl.range(pld.world_size()):
         attention_window = pld.window(attention_window_buf, [ATTENTION_WINDOW_ROWS, O_GROUP_IN], dtype=pl.BF16)
         attention_signal = pld.window(attention_signal_buf, [TP_SIZE, 1], dtype=pl.INT32)
-        o_window = pld.window(o_window_buf, [O_WINDOW_ROWS, D], dtype=pl.FP32)
+        o_window = pld.window(o_window_buf, [O_WINDOW_ROWS, D], dtype=pl.BF16)
         o_signal = pld.window(o_signal_buf, [TP_SIZE, 1], dtype=pl.INT32)
         recv_meta = pld.window(recv_meta_buf, [N_RANKS, N_LOCAL], dtype=pl.INT32)
         recv_x = pld.window(recv_x_buf, [N_LOCAL * RECV_MAX, D], dtype=pl.INT8)

@@ -65,7 +65,9 @@ TOKEN_TILE = 16
 COMM_ROW_TILE = 8
 ATTENTION_PUBLISH_WORKERS = 48
 O_RS_REDUCE_WORKERS = 8
-O_RS_PUBLISH_WORKERS = 24
+O_RS_PUBLISH_WORKERS = 24    # put is fabric-bound; more workers only burn cores
+O_RS_DEQUANT_WORKERS = 48    # dequant is pure vector; take the whole AIV pool
+O_RS_PUT_T_TILE = 8          # 4 owners x 16 row blocks -> 64 puts over 24 workers
 O_RS_D_TILE = 4096
 LOCAL_T_PAD = (LOCAL_T + TOKEN_TILE - 1) // TOKEN_TILE * TOKEN_TILE
 T_PAD = LOCAL_T_PAD
@@ -88,15 +90,16 @@ PROJ_B_ACT_T_TILE = 8
 PROJ_B_ACT_TASK_T_TILE = 32  # proj_b_act token block per task
 
 # TP-sharded output projection tiling
-O_A_T_TILE = 16
+O_A_T_TILE = 128
 O_A_K_TILE = 256
 O_A_N_TILE = 128
 QUANT_T_TILE = 8
+O_A_QUANT_WORKERS = 24  # 2 groups x 24 -> one AIV wave
 O_B_T_TILE = 128
 O_B_K_TILE = 256
 O_B_N_TILE = 256
 O_B_D_TILE = 512
-ACT_T_TILE = 8
+ACT_T_TILE = 16
 ACT_N_TILE = 512
 
 # fixture
@@ -457,8 +460,8 @@ def o_proj_reduce_scatter(
     wo_b: pl.Tensor[[D, LOCAL_O_WIDTH], pl.INT8],
     wo_b_scale: pl.Tensor[[D], pl.FP32],
     local_t: pl.Scalar[pl.INT32],
-    local_out: pl.Tensor[[LOCAL_T_PAD, D], pl.BF16],
-    reduce_window: pld.DistributedTensor[[O_WINDOW_ROWS, D], pl.FP32],
+    local_out: pl.Tensor[[T_DYN, D], pl.BF16],
+    reduce_window: pld.DistributedTensor[[O_WINDOW_ROWS, D], pl.BF16],
     reduce_signal: pld.DistributedTensor[[TP_SIZE, 1], pl.INT32],
     group_base: pl.Scalar[pl.INT32],
     tp_rank: pl.Scalar[pl.INT32],
@@ -500,8 +503,12 @@ def o_proj_reduce_scatter(
             o_a_valid = pl.set_validshape(o_a_acc, a_rows, O_A_N_TILE)
             o_a_fp32[t0 : t0 + O_A_T_TILE, weight_row : weight_row + O_A_N_TILE] = o_a_valid
 
-        with pl.at(level=pl.Level.CORE_GROUP, name_hint="tp_o_a_quant", deps=[proj_a_tid]) as quant_tid:
-            for qt in pl.pipeline(0, group_t, QUANT_T_TILE, stage=2):
+        quant_blocks = (group_t + QUANT_T_TILE - 1) // QUANT_T_TILE
+        pad_blocks = (o_b_group_t + QUANT_T_TILE - 1) // QUANT_T_TILE
+        with pl.spmd(O_A_QUANT_WORKERS, name_hint="tp_o_a_quant", deps=[proj_a_tid]) as quant_tid:
+            quant_worker = pl.tile.get_block_idx()
+            for quant_block in pl.range(quant_worker, quant_blocks, O_A_QUANT_WORKERS):
+                qt = quant_block * QUANT_T_TILE
                 quant_rows = pl.min(QUANT_T_TILE, group_t - qt)
                 o_a_tile = pl.slice(o_a_fp32, [QUANT_T_TILE, O_LORA], [qt, o_a_col], valid_shape=[quant_rows, O_LORA])
                 o_a_abs = pl.abs(o_a_tile)
@@ -520,7 +527,8 @@ def o_proj_reduce_scatter(
                 o_a_quant = pl.cast(o_a_fp16, target_type=pl.INT8, mode="trunc")
                 o_a_quant_valid = pl.set_validshape(o_a_quant, quant_rows, O_LORA)
                 o_a_i8[qt : qt + QUANT_T_TILE, o_a_col : o_a_col + O_LORA] = o_a_quant_valid
-            for qt in pl.range(group_t, o_b_group_t, QUANT_T_TILE):
+            for pad_block in pl.range(quant_blocks + quant_worker, pad_blocks, O_A_QUANT_WORKERS):
+                qt = pad_block * QUANT_T_TILE
                 pad_rows = pl.min(QUANT_T_TILE, o_b_group_t - qt)
                 o_a_padding_fp16 = pl.full([QUANT_T_TILE, O_LORA], dtype=pl.FP16, value=0.0)
                 o_a_padding = pl.cast(o_a_padding_fp16, target_type=pl.INT8, mode="trunc")
@@ -546,59 +554,76 @@ def o_proj_reduce_scatter(
                 o_b_i32[t0 : t0 + O_B_T_TILE, partial_col : partial_col + O_B_N_TILE] = o_b_acc
         proj_b_tids[local_group] = proj_b_tid
 
-    publish_stage = pl.create_tensor([O_RS_PUBLISH_WORKERS * ACT_T_TILE, ACT_N_TILE], dtype=pl.FP32)
+    # Split by bottleneck: dequant is vector work and scales with cores, the put
+    # is fabric-bound and does not. Staging the whole D row first also makes each
+    # put one contiguous transfer instead of D/ACT_N_TILE strided fragments.
+    publish_all = pl.create_tensor([O_WINDOW_ROWS, D], dtype=pl.BF16)
+    put_rows = (local_t + O_RS_PUT_T_TILE - 1) // O_RS_PUT_T_TILE
     with pl.spmd(
-        O_RS_PUBLISH_WORKERS,
-        name_hint="tp_o_b_dequant_publish",
+        O_RS_DEQUANT_WORKERS,
+        name_hint="tp_o_b_dequant",
         deps=[proj_b_tids[group] for group in range(LOCAL_O_GROUPS)],
         optimizations=[pl.cross_core_slot(slot_num=2)],
-    ) as publish_tid:
-        worker = pl.tile.get_block_idx()
-        for owner_rank in pl.range(TP_SIZE):
-            owner_base = owner_rank * local_t
-            for block in pl.range(worker, owner_rows * (D // ACT_N_TILE), O_RS_PUBLISH_WORKERS):
-                row_block = block // (D // ACT_N_TILE)
-                n_block = block - row_block * (D // ACT_N_TILE)
-                owner_row = row_block * ACT_T_TILE
-                t0 = owner_base + owner_row
-                n0 = n_block * ACT_N_TILE
-                out_rows = pl.min(ACT_T_TILE, local_t - owner_row)
+    ) as dequant_tid:
+        dq_worker = pl.tile.get_block_idx()
+        for dq_owner in pl.range(TP_SIZE):
+            dq_owner_base = dq_owner * local_t
+            for dq_block in pl.range(dq_worker, owner_rows * (D // ACT_N_TILE), O_RS_DEQUANT_WORKERS):
+                dq_row_block = dq_block // (D // ACT_N_TILE)
+                dq_n_block = dq_block - dq_row_block * (D // ACT_N_TILE)
+                dq_owner_row = dq_row_block * ACT_T_TILE
+                dq_t0 = dq_owner_base + dq_owner_row
+                dq_n0 = dq_n_block * ACT_N_TILE
+                dq_rows = pl.min(ACT_T_TILE, local_t - dq_owner_row)
                 dequant_acc = pl.full([ACT_T_TILE, ACT_N_TILE], dtype=pl.FP32, value=0.0)
-                for local_group in pl.pipeline(LOCAL_O_GROUPS, stage=2):
-                    part_col = local_group * D + n0
-                    group_i32 = pl.slice(
+                for dq_group in pl.pipeline(LOCAL_O_GROUPS, stage=2):
+                    dq_part_col = dq_group * D + dq_n0
+                    dq_i32 = pl.slice(
                         o_b_i32,
                         [ACT_T_TILE, ACT_N_TILE],
-                        [t0, part_col],
-                        valid_shape=[out_rows, ACT_N_TILE],
+                        [dq_t0, dq_part_col],
+                        valid_shape=[dq_rows, ACT_N_TILE],
                     )
-                    group_partial_fp32 = pl.cast(group_i32, target_type=pl.FP32, mode="none")
-                    scale_row = pl.slice(act_scale_dq, [1, ACT_T_TILE], [local_group, t0], valid_shape=[1, out_rows])
-                    scale_col = pl.reshape(scale_row, [ACT_T_TILE, 1])
-                    group_dequant = pl.row_expand_mul(group_partial_fp32, scale_col)
-                    dequant_acc = pl.add(dequant_acc, group_dequant)
-                weight_scale = pl.reshape(wo_b_scale[n0 : n0 + ACT_N_TILE], [1, ACT_N_TILE])
-                o_b_fp32 = pl.col_expand_mul(dequant_acc, weight_scale)
-                publish_value = pl.set_validshape(o_b_fp32, out_rows, ACT_N_TILE)
-                stage_row = worker * ACT_T_TILE
-                publish_stage[stage_row : stage_row + ACT_T_TILE, 0:ACT_N_TILE] = publish_value
-                target_row = tp_rank * LOCAL_T_PAD + owner_row
+                    dq_fp32 = pl.cast(dq_i32, target_type=pl.FP32, mode="none")
+                    dq_scale_row = pl.slice(act_scale_dq, [1, ACT_T_TILE], [dq_group, dq_t0], valid_shape=[1, dq_rows])
+                    dq_scale_col = pl.reshape(dq_scale_row, [ACT_T_TILE, 1])
+                    dq_scaled = pl.row_expand_mul(dq_fp32, dq_scale_col)
+                    dequant_acc = pl.add(dequant_acc, dq_scaled)
+                dq_weight_scale = pl.reshape(wo_b_scale[dq_n0 : dq_n0 + ACT_N_TILE], [1, ACT_N_TILE])
+                dq_out_fp32 = pl.col_expand_mul(dequant_acc, dq_weight_scale)
+                dq_out_bf16 = pl.cast(dq_out_fp32, target_type=pl.BF16, mode="rint")
+                dq_value = pl.set_validshape(dq_out_bf16, dq_rows, ACT_N_TILE)
+                dq_stage_row = dq_owner * LOCAL_T_PAD + dq_owner_row
+                publish_all[dq_stage_row : dq_stage_row + ACT_T_TILE, dq_n0 : dq_n0 + ACT_N_TILE] = dq_value
+
+    with pl.spmd(
+        O_RS_PUBLISH_WORKERS,
+        name_hint="tp_o_b_publish",
+        deps=[dequant_tid],
+    ) as publish_tid:
+        pub_worker = pl.tile.get_block_idx()
+        for pub_owner in pl.range(TP_SIZE):
+            for pub_row_block in pl.range(pub_worker, put_rows, O_RS_PUBLISH_WORKERS):
+                pub_owner_row = pub_row_block * O_RS_PUT_T_TILE
+                pub_rows = pl.min(O_RS_PUT_T_TILE, local_t - pub_owner_row)
+                pub_src_row = pub_owner * LOCAL_T_PAD + pub_owner_row
+                pub_dst_row = tp_rank * LOCAL_T_PAD + pub_owner_row
                 pld.tensor.put(
                     dst=reduce_window,
-                    peer=group_base + owner_rank,
-                    src=publish_stage,
-                    dst_offsets=[target_row, n0],
-                    src_offsets=[stage_row, 0],
-                    shape=[out_rows, ACT_N_TILE],
-                    chunk_rows=ACT_T_TILE,
-                    chunk_cols=ACT_N_TILE,
+                    peer=group_base + pub_owner,
+                    src=publish_all,
+                    dst_offsets=[pub_dst_row, 0],
+                    src_offsets=[pub_src_row, 0],
+                    shape=[pub_rows, D],
+                    chunk_rows=O_RS_PUT_T_TILE,
+                    chunk_cols=D,
                 )
 
-        for owner_rank in pl.range(TP_SIZE):
-            if owner_rank != tp_rank:
+        for notify_owner in pl.range(TP_SIZE):
+            if notify_owner != tp_rank:
                 pld.system.notify(
                     target=reduce_signal,
-                    peer=group_base + owner_rank,
+                    peer=group_base + notify_owner,
                     offsets=[tp_rank, 0],
                     value=1,
                     op=pld.NotifyOp.AtomicAdd,
@@ -616,11 +641,13 @@ def o_proj_reduce_scatter(
             local_row = block // (D // O_RS_D_TILE)
             d_block = block - local_row * (D // O_RS_D_TILE)
             d0 = d_block * O_RS_D_TILE
-            reduce_acc = pl.load(reduce_window, [local_row, d0], [1, O_RS_D_TILE])
+            own_partial = pl.load(reduce_window, [local_row, d0], [1, O_RS_D_TILE])
+            reduce_acc = pl.cast(own_partial, target_type=pl.FP32, mode="none")
             for source_tp in pl.range(1, TP_SIZE):
                 source_row = source_tp * LOCAL_T_PAD + local_row
                 source_partial = pl.load(reduce_window, [source_row, d0], [1, O_RS_D_TILE])
-                reduce_acc = pl.add(reduce_acc, source_partial)
+                source_fp32 = pl.cast(source_partial, target_type=pl.FP32, mode="none")
+                reduce_acc = pl.add(reduce_acc, source_fp32)
             reduced = pl.cast(reduce_acc, target_type=pl.BF16, mode="rint")
             pl.store(reduced, [local_row, d0], local_out)
 
