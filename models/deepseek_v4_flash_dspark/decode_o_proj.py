@@ -525,7 +525,7 @@ def o_proj_reduce_scatter(
                 for qz_blk in pl.range(qz_worker, own_quant_blocks, O_A_QUANT_WORKERS):
                     qz_t = qz_blk * QUANT_T_TILE
                     qz_rows = pl.min(QUANT_T_TILE, local_t - qz_t)
-                    qz_tile = pl.slice(own_a_fp32, [QUANT_T_TILE, O_LORA], [qz_t, o_a_col], valid_shape=[qz_rows, O_LORA])
+                    qz_tile = pl.slice(own_a_fp32, [QUANT_T_TILE, O_LORA], [qz_t, o_a_col])
                     qz_amax = pl.reshape(pl.row_max(pl.abs(qz_tile)), [1, QUANT_T_TILE])
                     qz_floor = pl.full([1, QUANT_T_TILE], dtype=pl.FP32, value=INT8_AMAX_EPS)
                     qz_amax = pl.maximum(qz_floor, qz_amax)
