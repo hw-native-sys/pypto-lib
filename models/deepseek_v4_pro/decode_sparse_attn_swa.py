@@ -68,7 +68,11 @@ assert O_GROUPS % O_GROUP_TILE == 0
 assert H // H_TILE == O_GROUPS // O_GROUP_TILE
 assert H_TILE % HEADS_PER_GROUP == 0
 PA_NF_TILE = 2
-PROJ_B_D_TILE = 512 if M.name == "flash" else 1792
+# Sized so the four parallel group bundles fit the AIC grid in a single wave:
+# O_GROUP_TILE * (D // PROJ_B_D_TILE) blocks per bundle, times 4 bundles, must stay
+# under the 36 cube cores. At 512 the flash variant asked for 64 and proj_b_mm ran
+# in two waves, showing up twice on the critical path.
+PROJ_B_D_TILE = 1024 if M.name == "flash" else 1792
 PROJ_B_ACT_T_TILE = 8
 PROJ_B_ACT_TASK_T_TILE = 8
 SPARSE_BLOCKS = 1
@@ -120,12 +124,31 @@ def sparse_attn_swa(
                         swa_kv_flat[g_dst : g_dst + 1, 0 : HEAD_DIM] = pl.full([1, HEAD_DIM], dtype=pl.BF16, value=0.0)
     gather_tids[0] = gather_tid
 
+    rope_cos_il = pl.create_tensor([T, ROPE_DIM], dtype=pl.FP32)
+    rope_sin_signed = pl.create_tensor([T, ROPE_DIM], dtype=pl.FP32)
+    with pl.at(level=pl.Level.CORE_GROUP, name_hint="rope_cs") as rope_tid:
+        for cp in pl.range(HALF_ROPE // ROPE_TILE):
+            cp_r0 = cp * ROPE_TILE
+            cp_c0 = 2 * cp_r0
+            cs_cos = pl.cast(freqs_cos[0:T, cp_r0 : cp_r0 + ROPE_TILE], target_type=pl.FP32)
+            cs_sin = pl.cast(freqs_sin[0:T, cp_r0 : cp_r0 + ROPE_TILE], target_type=pl.FP32)
+            cs_cos_dup = pl.full([T, ROPE_INTERLEAVE_TILE], dtype=pl.FP32, value=0.0)
+            cs_cos_dup = pl.tensor.scatter(cs_cos, mask_pattern=pl.tile.MaskPattern.P0101, dst=cs_cos_dup)
+            cs_cos_dup = pl.tensor.scatter(cs_cos, mask_pattern=pl.tile.MaskPattern.P1010, dst=cs_cos_dup)
+            cs_sin_neg = pl.neg(cs_sin)
+            cs_sin_signed = pl.full([T, ROPE_INTERLEAVE_TILE], dtype=pl.FP32, value=0.0)
+            cs_sin_signed = pl.tensor.scatter(cs_sin, mask_pattern=pl.tile.MaskPattern.P0101, dst=cs_sin_signed)
+            cs_sin_signed = pl.tensor.scatter(cs_sin_neg, mask_pattern=pl.tile.MaskPattern.P1010, dst=cs_sin_signed)
+            rope_cos_il[0:T, cp_c0 : cp_c0 + ROPE_INTERLEAVE_TILE] = cs_cos_dup
+            rope_sin_signed[0:T, cp_c0 : cp_c0 + ROPE_INTERLEAVE_TILE] = cs_sin_signed
+
+    o_packed_heads = pl.create_tensor([O_GROUPS * T * HEADS_PER_GROUP, HEAD_DIM], dtype=pl.BF16)
     q_flat = pl.reshape(q, [T * H, HEAD_DIM])
     sparse_blk_mi = pl.create_tensor([T * (H // H_TILE) * SPARSE_BLOCKS * H_TILE, 1], dtype=pl.FP32)
     sparse_blk_li = pl.create_tensor([T * (H // H_TILE) * SPARSE_BLOCKS * H_TILE, 1], dtype=pl.FP32)
     sparse_blk_oi = pl.create_tensor([T * (H // H_TILE) * SPARSE_BLOCKS * H_TILE, HEAD_DIM], dtype=pl.FP32)
 
-    with pl.spmd(T, name_hint="qk_pv", deps=[gather_tids[0]]) as qk_tid:
+    with pl.spmd(T, name_hint="qk_pv", deps=[gather_tids[0], rope_tid]) as qk_tid:
         qk_t = pl.tile.get_block_idx()
         qk_token_base = qk_t * (H // H_TILE) * SPARSE_BLOCKS * H_TILE
         for qk_sb in pl.unroll(SPARSE_BLOCKS):
@@ -156,33 +179,12 @@ def sparse_attn_swa(
                     sparse_blk_li[qk_row : qk_row + H_TILE, 0 : 1] = qk_li[qk_r0 : qk_r0 + H_TILE, 0 : 1]
                     sparse_blk_oi[qk_row : qk_row + H_TILE, 0 : HEAD_DIM] = qk_oi[qk_r0 : qk_r0 + H_TILE, 0 : HEAD_DIM]
 
-    rope_cos_il = pl.create_tensor([T, ROPE_DIM], dtype=pl.FP32)
-    rope_sin_signed = pl.create_tensor([T, ROPE_DIM], dtype=pl.FP32)
-    with pl.at(level=pl.Level.CORE_GROUP, name_hint="rope_cs") as rope_tid:
-        for cp in pl.range(HALF_ROPE // ROPE_TILE):
-            cp_r0 = cp * ROPE_TILE
-            cp_c0 = 2 * cp_r0
-            cs_cos = pl.cast(freqs_cos[0:T, cp_r0 : cp_r0 + ROPE_TILE], target_type=pl.FP32)
-            cs_sin = pl.cast(freqs_sin[0:T, cp_r0 : cp_r0 + ROPE_TILE], target_type=pl.FP32)
-            cs_cos_dup = pl.full([T, ROPE_INTERLEAVE_TILE], dtype=pl.FP32, value=0.0)
-            cs_cos_dup = pl.tensor.scatter(cs_cos, mask_pattern=pl.tile.MaskPattern.P0101, dst=cs_cos_dup)
-            cs_cos_dup = pl.tensor.scatter(cs_cos, mask_pattern=pl.tile.MaskPattern.P1010, dst=cs_cos_dup)
-            cs_sin_neg = pl.neg(cs_sin)
-            cs_sin_signed = pl.full([T, ROPE_INTERLEAVE_TILE], dtype=pl.FP32, value=0.0)
-            cs_sin_signed = pl.tensor.scatter(cs_sin, mask_pattern=pl.tile.MaskPattern.P0101, dst=cs_sin_signed)
-            cs_sin_signed = pl.tensor.scatter(cs_sin_neg, mask_pattern=pl.tile.MaskPattern.P1010, dst=cs_sin_signed)
-            rope_cos_il[0:T, cp_c0 : cp_c0 + ROPE_INTERLEAVE_TILE] = cs_cos_dup
-            rope_sin_signed[0:T, cp_c0 : cp_c0 + ROPE_INTERLEAVE_TILE] = cs_sin_signed
-
-    o_packed_heads = pl.create_tensor([O_GROUPS * T * HEADS_PER_GROUP, HEAD_DIM], dtype=pl.BF16)
-    merge_tids = pl.array.create(O_GROUPS // O_GROUP_TILE, pl.TASK_ID)
-
-    for merge_group in pl.parallel(O_GROUPS // O_GROUP_TILE):
-        with pl.spmd(T, name_hint="merge_norm", deps=[qk_tid, rope_tid]) as merge_tid:
-            m_t = pl.tile.get_block_idx()
-            m_h_idx = merge_group
+        # Sink, normalize, inverse-RoPE and pack, for every head group of this
+        # token. SPARSE_BLOCKS is 1 here, so there is no cross-block softmax
+        # state to combine and the partials above are already final.
+        for m_h_idx in pl.range(H // H_TILE):
             m_h0 = m_h_idx * H_TILE
-            m_blk_base = m_t * H + m_h0
+            m_blk_base = qk_t * H + m_h0
             m_mi = sparse_blk_mi[m_blk_base : m_blk_base + H_TILE, 0:1]
             m_li = sparse_blk_li[m_blk_base : m_blk_base + H_TILE, 0:1]
             m_oi = sparse_blk_oi[m_blk_base : m_blk_base + H_TILE, 0:HEAD_DIM]
@@ -201,8 +203,8 @@ def sparse_attn_swa(
             m_swapped = pl.full([H_TILE, ROPE_DIM], dtype=pl.FP32, value=0.0)
             m_swapped = pl.tensor.scatter(m_odd, mask_pattern=pl.tile.MaskPattern.P0101, dst=m_swapped)
             m_swapped = pl.tensor.scatter(m_even, mask_pattern=pl.tile.MaskPattern.P1010, dst=m_swapped)
-            m_cos_il = rope_cos_il[m_t : m_t + 1, 0:ROPE_DIM]
-            m_sin_signed = rope_sin_signed[m_t : m_t + 1, 0:ROPE_DIM]
+            m_cos_il = rope_cos_il[qk_t : qk_t + 1, 0:ROPE_DIM]
+            m_sin_signed = rope_sin_signed[qk_t : qk_t + 1, 0:ROPE_DIM]
             m_rope_cos = pl.col_expand_mul(m_rope, m_cos_il)
             m_swap_sin = pl.col_expand_mul(m_swapped, m_sin_signed)
             m_rot = pl.add(m_rope_cos, m_swap_sin)
@@ -211,13 +213,13 @@ def sparse_attn_swa(
             m_g0 = m_h0 // HEADS_PER_GROUP
             for m_sg in pl.unroll(H_TILE // HEADS_PER_GROUP):
                 m_src_h0 = m_sg * HEADS_PER_GROUP
-                n_pack_row = (m_g0 + m_sg) * T + m_t
+                n_pack_row = (m_g0 + m_sg) * T + qk_t
                 n_dst_head = n_pack_row * HEADS_PER_GROUP
                 n_nope_group = n_bf16[m_src_h0 : m_src_h0 + HEADS_PER_GROUP, 0:NOPE_DIM]
                 o_packed_heads[n_dst_head : n_dst_head + HEADS_PER_GROUP, 0:NOPE_DIM] = n_nope_group
                 n_rope_group = n_rope_bf16[m_src_h0 : m_src_h0 + HEADS_PER_GROUP, 0:ROPE_DIM]
                 o_packed_heads[n_dst_head : n_dst_head + HEADS_PER_GROUP, NOPE_DIM:HEAD_DIM] = n_rope_group
-        merge_tids[merge_group] = merge_tid
+
 
     o_packed = pl.reshape(o_packed_heads, [O_GROUPS * T, O_GROUP_IN])
     o_r_pad = pl.create_tensor([T_PAD, O_GROUPS * O_LORA], dtype=pl.FP32)
@@ -230,7 +232,7 @@ def sparse_attn_swa(
             with pl.spmd(
                 O_GROUP_TILE * (O_LORA // PROJ_A_MM_N_TILE // PA_NF_TILE),
                 name_hint="proj_a_mm",
-                deps=[merge_tids[group_bundle]],
+                deps=[qk_tid],
             ) as pa_tid:
                 pa_idx = pl.tile.get_block_idx()
                 pa_local_group = pa_idx // (O_LORA // PROJ_A_MM_N_TILE // PA_NF_TILE)

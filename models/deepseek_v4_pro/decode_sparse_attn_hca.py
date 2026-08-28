@@ -74,7 +74,11 @@ assert H % O_GROUPS == 0
 assert O_GROUPS % O_GROUP_TILE == 0
 assert H // H_TILE == O_GROUPS // O_GROUP_TILE
 PA_NF_TILE = 2
-PROJ_B_D_TILE = 512 if M.name == "flash" else 1792
+# Sized so the four parallel group bundles fit the AIC grid in a single wave:
+# O_GROUP_TILE * (D // PROJ_B_D_TILE) blocks per bundle, times 4 bundles, must stay
+# under the 36 cube cores. At 512 the flash variant asked for 64 and proj_b_mm ran
+# in two waves, showing up twice on the critical path.
+PROJ_B_D_TILE = 1024 if M.name == "flash" else 1792
 PROJ_B_ACT_T_TILE = 8
 PROJ_B_ACT_TASK_T_TILE = 8
 # HCA uses at least two sparse blocks.

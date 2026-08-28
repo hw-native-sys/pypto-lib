@@ -60,7 +60,10 @@ NEG_INF = -1.0e20
 H_TILE = 16
 QK_M_TILE = 32
 ATTN_K_TILE = 128
-QK_CORE_TILE = 28
+# T * SPARSE_BLOCKS work items, so 20 lanes take exactly two each. Wider launches
+# (28) leave the two-item lanes setting the same makespan while adding blocks to
+# retire, and every extra block costs tail overhead on this mixed launch.
+QK_CORE_TILE = 20
 A_K_TILE = 256
 PROJ_A_MM_N_TILE = 128
 MM_T_TILE = 16
@@ -79,7 +82,11 @@ WARM_GROUP_TILE = min(12, O_GROUPS)
 WARM_BLOCK_TILE = 8
 WARM_ROW_TILE = (WARM_GROUP_TILE * O_LORA) // WARM_BLOCK_TILE
 assert WIN == ATTN_K_TILE
-PROJ_B_D_TILE = 512 if M.name == "flash" else 1792
+# Sized so the four parallel group bundles fit the AIC grid in a single wave:
+# O_GROUP_TILE * (D // PROJ_B_D_TILE) blocks per bundle, times 4 bundles, must stay
+# under the 36 cube cores. At 512 the flash variant asked for 64 and proj_b_mm ran
+# in two waves, showing up twice on the critical path.
+PROJ_B_D_TILE = 1024 if M.name == "flash" else 1792
 PROJ_B_ACT_T_TILE = 8
 PROJ_B_ACT_TASK_T_TILE = 8
 # CSA uses at least two sparse blocks.

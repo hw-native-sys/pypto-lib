@@ -71,7 +71,9 @@ WEIGHTS_K_TILE = D // (4 if M.name == "flash" else 7)
 Q_HEAD_TILE = 32
 Q_HEAD_FLAT_LEN = Q_HEAD_TILE * IDX_HEAD_DIM
 assert IDX_N_HEADS % Q_HEAD_TILE == 0
-SCORE_LANE_TILE = 8
+# One lane per 128-key compressed block at the 8k operating point (2048 keys),
+# instead of two blocks per lane.
+SCORE_LANE_TILE = 16
 TOPK_HALF_LEN = SCORE_LEN // 2
 TOPK_HALF_PAIR_OFFSET = 2 * TOPK_HALF_LEN
 TOPK_PAIR_WIDTH = 2 * IDX_TOPK
