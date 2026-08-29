@@ -49,8 +49,8 @@ from config import (
     KV_CMP_MAX_BLOCKS,
     KV_ORI_MAX_BLOCKS,
 )
-from hc_pre import hc_pre_decode_attention
-from hc_post import hc_post_decode_attention
+from hc_pre import hc_pre
+from hc_post import hc_post
 from qkv_proj_rope import kv_proj_rope, q_proj_rope, qkv_proj_rope, rope_prepare
 from rmsnorm import rms_norm
 from decode_cp_token_allgather import (
@@ -183,7 +183,7 @@ def decode_swa(
     x_mixed = pl.create_tensor([t_dim, D], dtype=pl.BF16)
     post_t = pl.create_tensor([t_dim, HC_MULT], dtype=pl.FP32)
     comb_t = pl.create_tensor([t_dim, HC_MULT * HC_MULT], dtype=pl.FP32)
-    hc_pre_decode_attention(x_hc, hc_attn_fn, hc_attn_scale, hc_attn_base, x_mixed, post_t, comb_t)
+    hc_pre(x_hc, hc_attn_fn, hc_attn_scale, hc_attn_base, x_mixed, post_t, comb_t)
 
     x_normed_t = pl.create_tensor([t_dim, D], dtype=pl.BF16)
     rms_tid = rms_norm(x_mixed, attn_norm_w, x_normed_t)
@@ -377,7 +377,7 @@ def decode_swa(
         )
 
     with pl.scope():
-        hc_post_decode_attention(attn_out, x_hc, post_t, comb_t, x_out)
+        hc_post(attn_out, x_hc, post_t, comb_t, x_out)
     return x_out
 
 
@@ -563,7 +563,7 @@ def decode_swa_tp1(
     x_mixed = pl.create_tensor([t_dim, D], dtype=pl.BF16)
     post_t = pl.create_tensor([t_dim, HC_MULT], dtype=pl.FP32)
     comb_t = pl.create_tensor([t_dim, HC_MULT * HC_MULT], dtype=pl.FP32)
-    hc_pre_decode_attention(x_hc, hc_attn_fn, hc_attn_scale, hc_attn_base, x_mixed, post_t, comb_t)
+    hc_pre(x_hc, hc_attn_fn, hc_attn_scale, hc_attn_base, x_mixed, post_t, comb_t)
 
     x_normed_t = pl.create_tensor([t_dim, D], dtype=pl.BF16)
     rms_tid = rms_norm(x_mixed, attn_norm_w, x_normed_t)
@@ -608,7 +608,7 @@ def decode_swa_tp1(
     o_packed = pl.reshape(o_packed_heads, [O_GROUPS * T_PAD, O_GROUP_IN])
     attn_out = decode_o_proj_tp1(o_packed, wo_a, wo_b, wo_b_scale, attn_out, heads_dep)
 
-    hc_post_decode_attention(attn_out, x_hc, post_t, comb_t, x_out)
+    hc_post(attn_out, x_hc, post_t, comb_t, x_out)
     return x_out
 
 
