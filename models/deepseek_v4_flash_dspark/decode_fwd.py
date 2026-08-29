@@ -134,6 +134,7 @@ HCA_COMPRESS_RATIO = hca.COMPRESS_RATIO
 HCA_COMPRESS_STATE_BLOCK_SIZE = hca.COMPRESS_STATE_BLOCK_SIZE
 HCA_COMPRESS_STATE_MAX_BLOCKS = hca.COMPRESS_STATE_MAX_BLOCKS
 HCA_COMPRESS_STATE_DIM = hca.COMPRESS_STATE_DIM
+HCA_ATTENTION_READY_ROWS = hca.ATTENTION_READY_ROWS
 
 CSA_B_DYN = csa.B_DYN
 CSA_MAIN_OUT_DIM = csa.MAIN_OUT_DIM
@@ -351,6 +352,7 @@ def decode_fwd(
     gather_signal: pld.DistributedTensor[[TP_SIZE, 1], pl.INT32],
     attention_window: pld.DistributedTensor[[ATTENTION_WINDOW_ROWS, O_GROUP_IN], pl.BF16],
     attention_signal: pld.DistributedTensor[[TP_SIZE, 1], pl.INT32],
+    attention_ready: pld.DistributedTensor[[HCA_ATTENTION_READY_ROWS, 1], pl.INT32],
     o_window: pld.DistributedTensor[[O_WINDOW_ROWS, D], pl.BF16],
     o_signal: pld.DistributedTensor[[TP_SIZE, 1], pl.INT32],
     recv_meta: pld.DistributedTensor[[N_RANKS, N_LOCAL], pl.INT32],
@@ -814,7 +816,7 @@ def decode_fwd(
                         position_ids, hca_kv_seq_lens,
                         attn_sink_layer_hca, wo_a_layer_hca, wo_b_layer_hca, wo_b_scale_layer_hca,
                         x_attn_active,
-                        attention_window, attention_signal, o_window, o_signal,
+                        attention_window, attention_signal, attention_ready, o_window, o_signal,
                         group_base, tp_rank, local_t,
                     )
 
@@ -1175,6 +1177,7 @@ def l3_decode_fwd(
     gather_signal_buf = pld.alloc_window_buffer([TP_SIZE, 1], dtype=pl.INT32)
     attention_window_buf = pld.alloc_window_buffer([ATTENTION_WINDOW_ROWS, O_GROUP_IN], dtype=pl.BF16)
     attention_signal_buf = pld.alloc_window_buffer([TP_SIZE, 1], dtype=pl.INT32)
+    attention_ready_buf = pld.alloc_window_buffer([HCA_ATTENTION_READY_ROWS, 1], dtype=pl.INT32)
     o_window_buf = pld.alloc_window_buffer([O_WINDOW_ROWS, D], dtype=pl.BF16)
     o_signal_buf = pld.alloc_window_buffer([TP_SIZE, 1], dtype=pl.INT32)
     recv_meta_buf = pld.alloc_window_buffer([N_RANKS, N_LOCAL], dtype=pl.INT32)
@@ -1195,6 +1198,7 @@ def l3_decode_fwd(
         gather_signal = pld.window(gather_signal_buf, [TP_SIZE, 1], dtype=pl.INT32)
         attention_window = pld.window(attention_window_buf, [ATTENTION_WINDOW_ROWS, O_GROUP_IN], dtype=pl.BF16)
         attention_signal = pld.window(attention_signal_buf, [TP_SIZE, 1], dtype=pl.INT32)
+        attention_ready = pld.window(attention_ready_buf, [HCA_ATTENTION_READY_ROWS, 1], dtype=pl.INT32)
         o_window = pld.window(o_window_buf, [O_WINDOW_ROWS, D], dtype=pl.BF16)
         o_signal = pld.window(o_signal_buf, [TP_SIZE, 1], dtype=pl.INT32)
         recv_meta = pld.window(recv_meta_buf, [N_RANKS, N_LOCAL], dtype=pl.INT32)
@@ -1265,7 +1269,7 @@ def l3_decode_fwd(
             pre_hc_hidden_out[rank], x_out[rank], logits[rank],
             sampled_ids[rank],
             gather_window, gather_signal,
-            attention_window, attention_signal, o_window, o_signal,
+            attention_window, attention_signal, attention_ready, o_window, o_signal,
             recv_meta, recv_x, recv_aux, recv_route,
             arrived, data_arrived, routed_y_buf, combine_arrived,
             lm_head_hidden_window, lm_head_hidden_done,

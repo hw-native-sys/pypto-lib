@@ -58,6 +58,8 @@ from rmsnorm import rms_norm
 from rope_interleave import rope_interleave
 from decode_compressor_ratio128 import compressor_ratio128
 from decode_o_proj import (
+    ATTENTION_READY_ROWS,
+    ATTENTION_READY_T_TILE,
     ATTENTION_WINDOW_ROWS,
     GROUP_T_PAD,
     LOCAL_O_GROUPS,
@@ -66,8 +68,7 @@ from decode_o_proj import (
     LOCAL_T_PAD,
     O_WINDOW_ROWS,
     decode_o_proj_tp1,
-    o_group_a2a,
-    o_proj_reduce_scatter,
+    decode_streaming_o_projection_reduce_scatter,
 )
 from decode_sparse_attn_hca import (
     ATTENTION_PUBLISH_T_TILE,
@@ -133,11 +134,19 @@ COMPRESS_STATE_DIM = 2 * MAIN_OUT_DIM
 SPARSE_ROPE_TILE = 16
 SPARSE_ROPE_INTERLEAVE_TILE = 2 * SPARSE_ROPE_TILE
 HCA_WB_TOKEN_TILE = 8  # tokens per cache-writeback SPMD block
+HCA_ATTENTION_READY_COUNT = (
+    (ATTENTION_READY_T_TILE // ATTENTION_PUBLISH_T_TILE)
+    * (LOCAL_O_GROUPS // PUBLISH_GROUPS)
+)
 
 if T != LOCAL_T:
     raise ValueError(f"HCA token capacity {T} must equal TP local token capacity {LOCAL_T}")
 if T_PAD != LOCAL_T_PAD:
     raise ValueError(f"HCA token capacity {T_PAD} must equal TP local token capacity {LOCAL_T_PAD}")
+if ATTENTION_READY_T_TILE % ATTENTION_PUBLISH_T_TILE != 0:
+    raise ValueError("HCA attention readiness tile must contain complete publish tiles")
+if TP_SIZE > 1 and (TP_SIZE * VALID_TOKEN_TILE) % ATTENTION_READY_T_TILE != 0:
+    raise ValueError("each valid HCA token step must form complete attention readiness rows across TP")
 
 
 @pl.jit.inline(auto_scope=False)
@@ -180,6 +189,7 @@ def decode_hca(
     x_out: pl.Tensor[[T_DYN, HC_MULT, D], pl.FP32],
     attention_window: pld.DistributedTensor[[ATTENTION_WINDOW_ROWS, O_GROUP_IN], pl.BF16],
     attention_signal: pld.DistributedTensor[[TP_SIZE, 1], pl.INT32],
+    attention_ready: pld.DistributedTensor[[ATTENTION_READY_ROWS, 1], pl.INT32],
     o_window: pld.DistributedTensor[[O_WINDOW_ROWS, D], pl.BF16],
     o_signal: pld.DistributedTensor[[TP_SIZE, 1], pl.INT32],
     group_base: pl.Scalar[pl.INT32],
@@ -235,7 +245,6 @@ def decode_hca(
     )
     cache_ready_dep = pl.system.task_dummy(deps=[ori_cache_write_tid, cmp_cache_write_tid])
 
-    attention_local_flat = pl.create_tensor([ATTENTION_WINDOW_ROWS, O_GROUP_IN], dtype=pl.BF16)
     attn_out = pl.create_tensor([t_dim, D], dtype=pl.BF16)
     with pl.scope():
         (
@@ -307,6 +316,15 @@ def decode_hca(
                         chunk_cols=O_GROUP_IN,
                     )
 
+                ready_row = (tp_rank * local_t + stream_t0) // ATTENTION_READY_T_TILE
+                pld.system.notify(
+                    target=attention_ready,
+                    peer=group_base + destination_rank,
+                    offsets=[ready_row, 0],
+                    value=1,
+                    op=pld.NotifyOp.AtomicAdd,
+                )
+
             for peer_tp in pl.range(TP_SIZE):
                 if peer_tp != tp_rank:
                     pld.system.notify(
@@ -317,22 +335,18 @@ def decode_hca(
                         op=pld.NotifyOp.AtomicAdd,
                     )
 
-        attention_local_flat, attention_signal = o_group_a2a(
-            attention_local_flat,
-            attention_window, attention_signal,
-            group_base, tp_rank, local_t,
-            publish_tid, ATTENTION_PUBLISH_WORKERS,
-        )
-
-        attention_local_groups = pl.reshape(attention_local_flat, [LOCAL_O_GROUPS, GROUP_T_PAD, O_GROUP_IN])
-        # o_proj_reduce_scatter writes attn_out in place; keep the original
-        # handle, since a returned inline handle cannot cross into hc_post.
-        _o_reduced, o_signal = o_proj_reduce_scatter(
-            attention_local_groups,
+        (
+            attention_signal,
+            attention_ready,
+            o_signal,
+        ) = decode_streaming_o_projection_reduce_scatter(
+            attention_window, attention_signal, attention_ready,
             wo_a, wo_b, wo_b_scale,
             local_t, attn_out,
             o_window, o_signal,
             group_base, tp_rank,
+            stream_heads_tid, publish_tid,
+            ATTENTION_PUBLISH_WORKERS, HCA_ATTENTION_READY_COUNT,
         )
 
     with pl.scope():
@@ -380,6 +394,7 @@ def decode_hca_test(
     x_out: pl.Out[pl.Tensor[[T_DYN, HC_MULT, D], pl.FP32]],
     attention_window: pld.DistributedTensor[[ATTENTION_WINDOW_ROWS, O_GROUP_IN], pl.BF16],
     attention_signal: pld.DistributedTensor[[TP_SIZE, 1], pl.INT32],
+    attention_ready: pld.DistributedTensor[[ATTENTION_READY_ROWS, 1], pl.INT32],
     o_window: pld.DistributedTensor[[O_WINDOW_ROWS, D], pl.BF16],
     o_signal: pld.DistributedTensor[[TP_SIZE, 1], pl.INT32],
     group_base: pl.Scalar[pl.INT32],
@@ -419,7 +434,7 @@ def decode_hca_test(
         attn_sink,
         wo_a, wo_b, wo_b_scale,
         x_out,
-        attention_window, attention_signal, o_window, o_signal,
+        attention_window, attention_signal, attention_ready, o_window, o_signal,
         group_base, tp_rank, local_t,
     )
 
@@ -482,12 +497,14 @@ def l3_decode_hca(
 
     attention_window_buf = pld.alloc_window_buffer([ATTENTION_WINDOW_ROWS, O_GROUP_IN], dtype=pl.BF16)
     attention_signal_buf = pld.alloc_window_buffer([TP_SIZE, 1], dtype=pl.INT32)
+    attention_ready_buf = pld.alloc_window_buffer([ATTENTION_READY_ROWS, 1], dtype=pl.INT32)
     o_window_buf = pld.alloc_window_buffer([O_WINDOW_ROWS, D], dtype=pl.BF16)
     o_signal_buf = pld.alloc_window_buffer([TP_SIZE, 1], dtype=pl.INT32)
 
     for rank in pl.range(pld.world_size()):
         attention_window = pld.window(attention_window_buf, [ATTENTION_WINDOW_ROWS, O_GROUP_IN], dtype=pl.BF16)
         attention_signal = pld.window(attention_signal_buf, [TP_SIZE, 1], dtype=pl.INT32)
+        attention_ready = pld.window(attention_ready_buf, [ATTENTION_READY_ROWS, 1], dtype=pl.INT32)
         o_window = pld.window(o_window_buf, [O_WINDOW_ROWS, D], dtype=pl.BF16)
         o_signal = pld.window(o_signal_buf, [TP_SIZE, 1], dtype=pl.INT32)
         decode_hca_test(
@@ -506,7 +523,7 @@ def l3_decode_hca(
             attn_sink[rank],
             wo_a[rank], wo_b[rank], wo_b_scale[rank],
             x_out[rank],
-            attention_window, attention_signal, o_window, o_signal,
+            attention_window, attention_signal, attention_ready, o_window, o_signal,
             0, rank, local_t, device=rank,
         )
 
