@@ -56,8 +56,8 @@ from hc_post import hc_post
 from qkv_proj_rope import kv_proj_rope, q_proj_rope, qkv_proj_rope, rope_prepare
 from rmsnorm import rms_norm
 from decode_cp_token_allgather import (
-    CP_KV_B_DYN,
-    CP_KV_T_DYN,
+    KV_B_DYN,
+    KV_T_DYN,
     DECODE_GROUP_CAP,
     decode_cp_token_allgather_step,
 )
@@ -159,28 +159,28 @@ def decode_hca(
     wkv: pl.Tensor[[D, HEAD_DIM], pl.BF16],
     gamma_cq: pl.Tensor[[Q_LORA], pl.BF16],
     gamma_ckv: pl.Tensor[[HEAD_DIM], pl.BF16],
-    freqs_cos: pl.Tensor[[T_DYN, ROPE_HEAD_DIM], pl.BF16],
-    freqs_sin: pl.Tensor[[T_DYN, ROPE_HEAD_DIM], pl.BF16],
-    freqs_cos_full: pl.Tensor[[CP_KV_T_DYN, ROPE_HEAD_DIM], pl.BF16],
-    freqs_sin_full: pl.Tensor[[CP_KV_T_DYN, ROPE_HEAD_DIM], pl.BF16],
-    cmp_freqs_cos_full: pl.Tensor[[CP_KV_B_DYN, ROPE_HEAD_DIM // 2], pl.FP32],
-    cmp_freqs_sin_full: pl.Tensor[[CP_KV_B_DYN, ROPE_HEAD_DIM // 2], pl.FP32],
+    freqs_cos_local: pl.Tensor[[T_DYN, ROPE_HEAD_DIM], pl.BF16],
+    freqs_sin_local: pl.Tensor[[T_DYN, ROPE_HEAD_DIM], pl.BF16],
+    freqs_cos: pl.Tensor[[KV_T_DYN, ROPE_HEAD_DIM], pl.BF16],
+    freqs_sin: pl.Tensor[[KV_T_DYN, ROPE_HEAD_DIM], pl.BF16],
+    cmp_freqs_cos: pl.Tensor[[KV_B_DYN, ROPE_HEAD_DIM // 2], pl.FP32],
+    cmp_freqs_sin: pl.Tensor[[KV_B_DYN, ROPE_HEAD_DIM // 2], pl.FP32],
     cmp_wkv: pl.Tensor[[MAIN_OUT_DIM, D], pl.BF16],
     cmp_wgate: pl.Tensor[[MAIN_OUT_DIM, D], pl.BF16],
     cmp_ape: pl.Tensor[[COMPRESS_RATIO, MAIN_OUT_DIM], pl.FP32],
     cmp_norm_w: pl.Tensor[[HEAD_DIM], pl.BF16],
     compress_state: pl.Tensor[[COMPRESS_STATE_BLOCK_NUM_DYN, COMPRESS_STATE_BLOCK_SIZE, COMPRESS_STATE_DIM], pl.FP32],
-    compress_state_block_table_full: pl.Tensor[[CP_KV_B_DYN, COMPRESS_STATE_MAX_BLOCKS], pl.INT32],
+    compress_state_block_table: pl.Tensor[[KV_B_DYN, COMPRESS_STATE_MAX_BLOCKS], pl.INT32],
     kv_cache: pl.Tensor[[ORI_BLOCK_NUM_DYN, BLOCK_SIZE, 1, HEAD_DIM], pl.BF16],
     cmp_kv: pl.Tensor[[CMP_BLOCK_NUM_DYN, BLOCK_SIZE, 1, HEAD_DIM], pl.BF16],
     cmp_block_table: pl.Tensor[[B_DYN, CMP_TABLE_BLOCKS_DYN], pl.INT32],
-    ori_slot_mapping_full: pl.Tensor[[CP_KV_T_DYN], pl.INT64],
+    ori_slot_mapping: pl.Tensor[[KV_T_DYN], pl.INT64],
     window_swa_indices: pl.Tensor[[T_DYN, WIN], pl.INT32],
     window_swa_lens: pl.Tensor[[T_DYN], pl.INT32],
-    cmp_slot_mapping_full: pl.Tensor[[CP_KV_T_DYN], pl.INT64],
-    state_slot_mapping_full: pl.Tensor[[CP_KV_T_DYN], pl.INT64],
-    position_ids: pl.Tensor[[T_DYN], pl.INT32],
-    position_ids_full: pl.Tensor[[CP_KV_T_DYN], pl.INT32],
+    cmp_slot_mapping: pl.Tensor[[KV_T_DYN], pl.INT64],
+    state_slot_mapping: pl.Tensor[[KV_T_DYN], pl.INT64],
+    position_ids_local: pl.Tensor[[T_DYN], pl.INT32],
+    position_ids: pl.Tensor[[KV_T_DYN], pl.INT32],
     kv_seq_lens: pl.Tensor[[B_DYN], pl.INT32],
     attn_sink: pl.Tensor[[H], pl.FP32],
     wo_a: pl.Tensor[[LOCAL_O_GROUPS, O_LORA, O_GROUP_IN], pl.BF16],
@@ -199,8 +199,8 @@ def decode_hca(
 ):
     """Run one rank of the context-parallel HCA layer."""
     t_dim = pl.tensor.dim(x_hc, 0)
-    kv_dim = pl.tensor.dim(ori_slot_mapping_full, 0)
-    kv_b_dim = pl.tensor.dim(compress_state_block_table_full, 0)
+    kv_dim = pl.tensor.dim(ori_slot_mapping, 0)
+    kv_b_dim = pl.tensor.dim(compress_state_block_table, 0)
     kv_wb_blocks = kv_dim // HCA_WB_TOKEN_TILE
 
     x_mixed = pl.create_tensor([t_dim, D], dtype=pl.BF16)
@@ -210,7 +210,7 @@ def decode_hca(
 
     cmp_cos_il = pl.create_tensor([kv_b_dim, ROPE_HEAD_DIM], dtype=pl.FP32)
     cmp_sin_signed = pl.create_tensor([kv_b_dim, ROPE_HEAD_DIM], dtype=pl.FP32)
-    rope_interleave(cmp_freqs_cos_full, cmp_freqs_sin_full, cmp_cos_il, cmp_sin_signed)
+    rope_interleave(cmp_freqs_cos, cmp_freqs_sin, cmp_cos_il, cmp_sin_signed)
 
     x_normed = pl.create_tensor([t_dim, D], dtype=pl.BF16)
     rms_tid = rms_norm(x_mixed, attn_norm_w, x_normed)
@@ -236,23 +236,12 @@ def decode_hca(
     kv_cos_il = pl.create_tensor([kv_dim, ROPE_HEAD_DIM], dtype=pl.FP32)
     kv_sin_signed = pl.create_tensor([kv_dim, ROPE_HEAD_DIM], dtype=pl.FP32)
     kv_swap_idx = pl.create_tensor([kv_dim, ROPE_HEAD_DIM], dtype=pl.INT32)
-    rope_prepare(freqs_cos_full, freqs_sin_full, kv_cos_il, kv_sin_signed, kv_swap_idx)
+    rope_prepare(freqs_cos, freqs_sin, kv_cos_il, kv_sin_signed, kv_swap_idx)
 
-    # The rank's query rows are its slice of the gathered stream, so the q RoPE
-    # tables are sliced out rather than prepared a second time: one rope_prepare
-    # per function keeps its token axis bound to a single row count.
     q_cos_il = pl.create_tensor([t_dim, ROPE_HEAD_DIM], dtype=pl.FP32)
     q_sin_signed = pl.create_tensor([t_dim, ROPE_HEAD_DIM], dtype=pl.FP32)
     q_swap_idx = pl.create_tensor([t_dim, ROPE_HEAD_DIM], dtype=pl.INT32)
-    q_rope_base = tp_rank * pl.cast(t_dim, pl.INT32)
-    for q_rope_row in pl.spmd(t_dim, name_hint="cp_query_rope_slice"):
-        q_rope_full = q_rope_base + q_rope_row
-        q_cos_row = pl.load(kv_cos_il, [q_rope_full, 0], [1, ROPE_HEAD_DIM], target_memory=pl.MemorySpace.Vec)
-        q_sin_row = pl.load(kv_sin_signed, [q_rope_full, 0], [1, ROPE_HEAD_DIM], target_memory=pl.MemorySpace.Vec)
-        q_swap_row = pl.load(kv_swap_idx, [q_rope_full, 0], [1, ROPE_HEAD_DIM], target_memory=pl.MemorySpace.Vec)
-        pl.store(q_cos_row, [q_rope_row, 0], q_cos_il)
-        pl.store(q_sin_row, [q_rope_row, 0], q_sin_signed)
-        pl.store(q_swap_row, [q_rope_row, 0], q_swap_idx)
+    rope_prepare(freqs_cos_local, freqs_sin_local, q_cos_il, q_sin_signed, q_swap_idx)
 
     q_proj_rope(
         x_normed, wq_a, wq_b, wq_b_scale, gamma_cq,
@@ -273,7 +262,7 @@ def decode_hca(
         wb_t0 = wb_blk * HCA_WB_TOKEN_TILE
         for write_dt in pl.range(HCA_WB_TOKEN_TILE):
             write_t = wb_t0 + write_dt
-            write_row_i64 = pl.read(ori_slot_mapping_full, [write_t])
+            write_row_i64 = pl.read(ori_slot_mapping, [write_t])
             if write_row_i64 >= 0:
                 write_row = pl.cast(write_row_i64, pl.INDEX)
                 kv_cache_flat[write_row : write_row + 1, 0 : HEAD_DIM] = (
@@ -283,11 +272,11 @@ def decode_hca(
     # Hand the compressor scalar-extent views: its token and request axes bind to
     # one row count per call, and mixing them with the gathered stream's symbols
     # leaves the two not provably equal across the call.
-    cmp_positions = pl.reshape(position_ids_full, [kv_dim])
-    cmp_slots = pl.reshape(cmp_slot_mapping_full, [kv_dim])
-    cmp_state_slots = pl.reshape(state_slot_mapping_full, [kv_dim])
+    cmp_positions = pl.reshape(position_ids, [kv_dim])
+    cmp_slots = pl.reshape(cmp_slot_mapping, [kv_dim])
+    cmp_state_slots = pl.reshape(state_slot_mapping, [kv_dim])
     cmp_state_table = pl.reshape(
-        compress_state_block_table_full, [kv_b_dim, COMPRESS_STATE_MAX_BLOCKS],
+        compress_state_block_table, [kv_b_dim, COMPRESS_STATE_MAX_BLOCKS],
     )
     cmp_kv_proj = pl.create_tensor([kv_dim, HEAD_DIM], dtype=pl.FP32)
     cmp_kv_proj, cmp_cache_write_tid = compressor_ratio128(
@@ -310,8 +299,8 @@ def decode_hca(
         ) = sparse_attn_hca(
             q, kv_cache, window_swa_indices,
             cmp_kv, cmp_block_table,
-            position_ids, kv_seq_lens,
-            attn_sink, freqs_cos, freqs_sin,
+            position_ids_local, kv_seq_lens,
+            attn_sink, freqs_cos_local, freqs_sin_local,
             cache_ready_dep,
         )
 
@@ -418,28 +407,28 @@ def decode_hca_test(
     wkv: pl.Tensor[[D, HEAD_DIM], pl.BF16],
     gamma_cq: pl.Tensor[[Q_LORA], pl.BF16],
     gamma_ckv: pl.Tensor[[HEAD_DIM], pl.BF16],
-    freqs_cos: pl.Tensor[[T_DYN, ROPE_HEAD_DIM], pl.BF16],
-    freqs_sin: pl.Tensor[[T_DYN, ROPE_HEAD_DIM], pl.BF16],
-    freqs_cos_full: pl.Tensor[[CP_KV_T_DYN, ROPE_HEAD_DIM], pl.BF16],
-    freqs_sin_full: pl.Tensor[[CP_KV_T_DYN, ROPE_HEAD_DIM], pl.BF16],
-    cmp_freqs_cos_full: pl.Tensor[[CP_KV_B_DYN, ROPE_HEAD_DIM // 2], pl.FP32],
-    cmp_freqs_sin_full: pl.Tensor[[CP_KV_B_DYN, ROPE_HEAD_DIM // 2], pl.FP32],
+    freqs_cos_local: pl.Tensor[[T_DYN, ROPE_HEAD_DIM], pl.BF16],
+    freqs_sin_local: pl.Tensor[[T_DYN, ROPE_HEAD_DIM], pl.BF16],
+    freqs_cos: pl.Tensor[[KV_T_DYN, ROPE_HEAD_DIM], pl.BF16],
+    freqs_sin: pl.Tensor[[KV_T_DYN, ROPE_HEAD_DIM], pl.BF16],
+    cmp_freqs_cos: pl.Tensor[[KV_B_DYN, ROPE_HEAD_DIM // 2], pl.FP32],
+    cmp_freqs_sin: pl.Tensor[[KV_B_DYN, ROPE_HEAD_DIM // 2], pl.FP32],
     cmp_wkv: pl.Tensor[[MAIN_OUT_DIM, D], pl.BF16],
     cmp_wgate: pl.Tensor[[MAIN_OUT_DIM, D], pl.BF16],
     cmp_ape: pl.Tensor[[COMPRESS_RATIO, MAIN_OUT_DIM], pl.FP32],
     cmp_norm_w: pl.Tensor[[HEAD_DIM], pl.BF16],
     compress_state: pl.InOut[pl.Tensor[[COMPRESS_STATE_BLOCK_NUM_DYN, COMPRESS_STATE_BLOCK_SIZE, COMPRESS_STATE_DIM], pl.FP32]],
-    compress_state_block_table_full: pl.Tensor[[CP_KV_B_DYN, COMPRESS_STATE_MAX_BLOCKS], pl.INT32],
+    compress_state_block_table: pl.Tensor[[KV_B_DYN, COMPRESS_STATE_MAX_BLOCKS], pl.INT32],
     kv_cache: pl.InOut[pl.Tensor[[ORI_BLOCK_NUM_DYN, BLOCK_SIZE, 1, HEAD_DIM], pl.BF16]],
     cmp_kv: pl.InOut[pl.Tensor[[CMP_BLOCK_NUM_DYN, BLOCK_SIZE, 1, HEAD_DIM], pl.BF16]],
     cmp_block_table: pl.Tensor[[B_DYN, CMP_TABLE_BLOCKS_DYN], pl.INT32],
-    ori_slot_mapping_full: pl.Tensor[[CP_KV_T_DYN], pl.INT64],
+    ori_slot_mapping: pl.Tensor[[KV_T_DYN], pl.INT64],
     window_swa_indices: pl.Tensor[[T_DYN, WIN], pl.INT32],
     window_swa_lens: pl.Tensor[[T_DYN], pl.INT32],
-    cmp_slot_mapping_full: pl.Tensor[[CP_KV_T_DYN], pl.INT64],
-    state_slot_mapping_full: pl.Tensor[[CP_KV_T_DYN], pl.INT64],
-    position_ids: pl.Tensor[[T_DYN], pl.INT32],
-    position_ids_full: pl.Tensor[[CP_KV_T_DYN], pl.INT32],
+    cmp_slot_mapping: pl.Tensor[[KV_T_DYN], pl.INT64],
+    state_slot_mapping: pl.Tensor[[KV_T_DYN], pl.INT64],
+    position_ids_local: pl.Tensor[[T_DYN], pl.INT32],
+    position_ids: pl.Tensor[[KV_T_DYN], pl.INT32],
     kv_seq_lens: pl.Tensor[[B_DYN], pl.INT32],
     attn_sink: pl.Tensor[[H], pl.FP32],
     wo_a: pl.Tensor[[LOCAL_O_GROUPS, O_LORA, O_GROUP_IN], pl.BF16],
@@ -458,40 +447,40 @@ def decode_hca_test(
 ):
     """Test one rank of the complete HCA tensor-parallel layer."""
     x_hc.bind_dynamic(0, T_DYN)
-    freqs_cos.bind_dynamic(0, T_DYN)
-    freqs_sin.bind_dynamic(0, T_DYN)
-    freqs_cos_full.bind_dynamic(0, CP_KV_T_DYN)
-    freqs_sin_full.bind_dynamic(0, CP_KV_T_DYN)
-    cmp_freqs_cos_full.bind_dynamic(0, CP_KV_B_DYN)
-    cmp_freqs_sin_full.bind_dynamic(0, CP_KV_B_DYN)
+    freqs_cos_local.bind_dynamic(0, T_DYN)
+    freqs_sin_local.bind_dynamic(0, T_DYN)
+    freqs_cos.bind_dynamic(0, KV_T_DYN)
+    freqs_sin.bind_dynamic(0, KV_T_DYN)
+    cmp_freqs_cos.bind_dynamic(0, KV_B_DYN)
+    cmp_freqs_sin.bind_dynamic(0, KV_B_DYN)
     compress_state.bind_dynamic(0, COMPRESS_STATE_BLOCK_NUM_DYN)
-    compress_state_block_table_full.bind_dynamic(0, CP_KV_B_DYN)
+    compress_state_block_table.bind_dynamic(0, KV_B_DYN)
     kv_cache.bind_dynamic(0, ORI_BLOCK_NUM_DYN)
     cmp_kv.bind_dynamic(0, CMP_BLOCK_NUM_DYN)
     cmp_block_table.bind_dynamic(0, B_DYN)
     cmp_block_table.bind_dynamic(1, CMP_TABLE_BLOCKS_DYN)
     kv_seq_lens.bind_dynamic(0, B_DYN)
-    ori_slot_mapping_full.bind_dynamic(0, CP_KV_T_DYN)
+    ori_slot_mapping.bind_dynamic(0, KV_T_DYN)
     window_swa_indices.bind_dynamic(0, T_DYN)
     window_swa_lens.bind_dynamic(0, T_DYN)
-    cmp_slot_mapping_full.bind_dynamic(0, CP_KV_T_DYN)
-    state_slot_mapping_full.bind_dynamic(0, CP_KV_T_DYN)
-    position_ids.bind_dynamic(0, T_DYN)
-    position_ids_full.bind_dynamic(0, CP_KV_T_DYN)
+    cmp_slot_mapping.bind_dynamic(0, KV_T_DYN)
+    state_slot_mapping.bind_dynamic(0, KV_T_DYN)
+    position_ids_local.bind_dynamic(0, T_DYN)
+    position_ids.bind_dynamic(0, KV_T_DYN)
     x_out.bind_dynamic(0, T_DYN)
 
     return decode_hca(
         x_hc,
         hc_attn_fn, hc_attn_scale, hc_attn_base,
         attn_norm_w, wq_a, wq_b, wq_b_scale, wkv, gamma_cq, gamma_ckv,
-        freqs_cos, freqs_sin, freqs_cos_full, freqs_sin_full,
-        cmp_freqs_cos_full, cmp_freqs_sin_full,
+        freqs_cos_local, freqs_sin_local, freqs_cos, freqs_sin,
+        cmp_freqs_cos, cmp_freqs_sin,
         cmp_wkv, cmp_wgate, cmp_ape, cmp_norm_w,
-        compress_state, compress_state_block_table_full,
+        compress_state, compress_state_block_table,
         kv_cache, cmp_kv, cmp_block_table,
-        ori_slot_mapping_full, window_swa_indices, window_swa_lens,
-        cmp_slot_mapping_full, state_slot_mapping_full,
-        position_ids, position_ids_full, kv_seq_lens,
+        ori_slot_mapping, window_swa_indices, window_swa_lens,
+        cmp_slot_mapping, state_slot_mapping,
+        position_ids_local, position_ids, kv_seq_lens,
         attn_sink,
         wo_a, wo_b, wo_b_scale,
         x_out,
@@ -514,28 +503,28 @@ def l3_decode_hca(
     wkv: pl.Tensor[[TP_SIZE, D, HEAD_DIM], pl.BF16],
     gamma_cq: pl.Tensor[[TP_SIZE, Q_LORA], pl.BF16],
     gamma_ckv: pl.Tensor[[TP_SIZE, HEAD_DIM], pl.BF16],
-    freqs_cos: pl.Tensor[[TP_SIZE, T_DYN, ROPE_HEAD_DIM], pl.BF16],
-    freqs_sin: pl.Tensor[[TP_SIZE, T_DYN, ROPE_HEAD_DIM], pl.BF16],
-    freqs_cos_full: pl.Tensor[[TP_SIZE, CP_KV_T_DYN, ROPE_HEAD_DIM], pl.BF16],
-    freqs_sin_full: pl.Tensor[[TP_SIZE, CP_KV_T_DYN, ROPE_HEAD_DIM], pl.BF16],
-    cmp_freqs_cos_full: pl.Tensor[[TP_SIZE, CP_KV_B_DYN, ROPE_HEAD_DIM // 2], pl.FP32],
-    cmp_freqs_sin_full: pl.Tensor[[TP_SIZE, CP_KV_B_DYN, ROPE_HEAD_DIM // 2], pl.FP32],
+    freqs_cos_local: pl.Tensor[[TP_SIZE, T_DYN, ROPE_HEAD_DIM], pl.BF16],
+    freqs_sin_local: pl.Tensor[[TP_SIZE, T_DYN, ROPE_HEAD_DIM], pl.BF16],
+    freqs_cos: pl.Tensor[[TP_SIZE, KV_T_DYN, ROPE_HEAD_DIM], pl.BF16],
+    freqs_sin: pl.Tensor[[TP_SIZE, KV_T_DYN, ROPE_HEAD_DIM], pl.BF16],
+    cmp_freqs_cos: pl.Tensor[[TP_SIZE, KV_B_DYN, ROPE_HEAD_DIM // 2], pl.FP32],
+    cmp_freqs_sin: pl.Tensor[[TP_SIZE, KV_B_DYN, ROPE_HEAD_DIM // 2], pl.FP32],
     cmp_wkv: pl.Tensor[[TP_SIZE, MAIN_OUT_DIM, D], pl.BF16],
     cmp_wgate: pl.Tensor[[TP_SIZE, MAIN_OUT_DIM, D], pl.BF16],
     cmp_ape: pl.Tensor[[TP_SIZE, COMPRESS_RATIO, MAIN_OUT_DIM], pl.FP32],
     cmp_norm_w: pl.Tensor[[TP_SIZE, HEAD_DIM], pl.BF16],
     compress_state: pl.InOut[pl.Tensor[[TP_SIZE, COMPRESS_STATE_BLOCK_NUM, COMPRESS_STATE_BLOCK_SIZE, COMPRESS_STATE_DIM], pl.FP32]],
-    compress_state_block_table_full: pl.Tensor[[TP_SIZE, CP_KV_B_DYN, COMPRESS_STATE_MAX_BLOCKS], pl.INT32],
+    compress_state_block_table: pl.Tensor[[TP_SIZE, KV_B_DYN, COMPRESS_STATE_MAX_BLOCKS], pl.INT32],
     kv_cache: pl.InOut[pl.Tensor[[TP_SIZE, ORI_BLOCK_NUM, BLOCK_SIZE, 1, HEAD_DIM], pl.BF16]],
     cmp_kv: pl.InOut[pl.Tensor[[TP_SIZE, CMP_BLOCK_NUM, BLOCK_SIZE, 1, HEAD_DIM], pl.BF16]],
     cmp_block_table: pl.Tensor[[TP_SIZE, B_DYN, CMP_TABLE_BLOCKS_DYN], pl.INT32],
-    ori_slot_mapping_full: pl.Tensor[[TP_SIZE, CP_KV_T_DYN], pl.INT64],
+    ori_slot_mapping: pl.Tensor[[TP_SIZE, KV_T_DYN], pl.INT64],
     window_swa_indices: pl.Tensor[[TP_SIZE, T_DYN, WIN], pl.INT32],
     window_swa_lens: pl.Tensor[[TP_SIZE, T_DYN], pl.INT32],
-    cmp_slot_mapping_full: pl.Tensor[[TP_SIZE, CP_KV_T_DYN], pl.INT64],
-    state_slot_mapping_full: pl.Tensor[[TP_SIZE, CP_KV_T_DYN], pl.INT64],
-    position_ids: pl.Tensor[[TP_SIZE, T_DYN], pl.INT32],
-    position_ids_full: pl.Tensor[[TP_SIZE, CP_KV_T_DYN], pl.INT32],
+    cmp_slot_mapping: pl.Tensor[[TP_SIZE, KV_T_DYN], pl.INT64],
+    state_slot_mapping: pl.Tensor[[TP_SIZE, KV_T_DYN], pl.INT64],
+    position_ids_local: pl.Tensor[[TP_SIZE, T_DYN], pl.INT32],
+    position_ids: pl.Tensor[[TP_SIZE, KV_T_DYN], pl.INT32],
     kv_seq_lens: pl.Tensor[[TP_SIZE, B_DYN], pl.INT32],
     attn_sink: pl.Tensor[[TP_SIZE, H], pl.FP32],
     wo_a: pl.Tensor[[TP_SIZE, LOCAL_O_GROUPS, O_LORA, O_GROUP_IN], pl.BF16],
@@ -546,23 +535,23 @@ def l3_decode_hca(
 ):
     """Launch the complete HCA layer on one tensor-parallel group."""
     x_hc.bind_dynamic(1, T_DYN)
-    freqs_cos.bind_dynamic(1, T_DYN)
-    freqs_sin.bind_dynamic(1, T_DYN)
-    freqs_cos_full.bind_dynamic(1, CP_KV_T_DYN)
-    freqs_sin_full.bind_dynamic(1, CP_KV_T_DYN)
-    cmp_freqs_cos_full.bind_dynamic(1, CP_KV_B_DYN)
-    cmp_freqs_sin_full.bind_dynamic(1, CP_KV_B_DYN)
-    compress_state_block_table_full.bind_dynamic(1, CP_KV_B_DYN)
+    freqs_cos_local.bind_dynamic(1, T_DYN)
+    freqs_sin_local.bind_dynamic(1, T_DYN)
+    freqs_cos.bind_dynamic(1, KV_T_DYN)
+    freqs_sin.bind_dynamic(1, KV_T_DYN)
+    cmp_freqs_cos.bind_dynamic(1, KV_B_DYN)
+    cmp_freqs_sin.bind_dynamic(1, KV_B_DYN)
+    compress_state_block_table.bind_dynamic(1, KV_B_DYN)
     cmp_block_table.bind_dynamic(1, B_DYN)
     cmp_block_table.bind_dynamic(2, CMP_TABLE_BLOCKS_DYN)
     kv_seq_lens.bind_dynamic(1, B_DYN)
-    ori_slot_mapping_full.bind_dynamic(1, CP_KV_T_DYN)
+    ori_slot_mapping.bind_dynamic(1, KV_T_DYN)
     window_swa_indices.bind_dynamic(1, T_DYN)
     window_swa_lens.bind_dynamic(1, T_DYN)
-    cmp_slot_mapping_full.bind_dynamic(1, CP_KV_T_DYN)
-    state_slot_mapping_full.bind_dynamic(1, CP_KV_T_DYN)
-    position_ids.bind_dynamic(1, T_DYN)
-    position_ids_full.bind_dynamic(1, CP_KV_T_DYN)
+    cmp_slot_mapping.bind_dynamic(1, KV_T_DYN)
+    state_slot_mapping.bind_dynamic(1, KV_T_DYN)
+    position_ids_local.bind_dynamic(1, T_DYN)
+    position_ids.bind_dynamic(1, KV_T_DYN)
     x_out.bind_dynamic(1, T_DYN)
 
     gather_window_buf = pld.alloc_window_buffer([DECODE_GROUP_CAP, D], dtype=pl.BF16)
@@ -584,15 +573,15 @@ def l3_decode_hca(
             hc_attn_fn[rank], hc_attn_scale[rank], hc_attn_base[rank],
             attn_norm_w[rank], wq_a[rank], wq_b[rank], wq_b_scale[rank],
             wkv[rank], gamma_cq[rank], gamma_ckv[rank],
+            freqs_cos_local[rank], freqs_sin_local[rank],
             freqs_cos[rank], freqs_sin[rank],
-            freqs_cos_full[rank], freqs_sin_full[rank],
-            cmp_freqs_cos_full[rank], cmp_freqs_sin_full[rank],
+            cmp_freqs_cos[rank], cmp_freqs_sin[rank],
             cmp_wkv[rank], cmp_wgate[rank], cmp_ape[rank], cmp_norm_w[rank],
-            compress_state[rank], compress_state_block_table_full[rank],
+            compress_state[rank], compress_state_block_table[rank],
             kv_cache[rank], cmp_kv[rank], cmp_block_table[rank],
-            ori_slot_mapping_full[rank], window_swa_indices[rank], window_swa_lens[rank],
-            cmp_slot_mapping_full[rank], state_slot_mapping_full[rank],
-            position_ids[rank], position_ids_full[rank], kv_seq_lens[rank],
+            ori_slot_mapping[rank], window_swa_indices[rank], window_swa_lens[rank],
+            cmp_slot_mapping[rank], state_slot_mapping[rank],
+            position_ids_local[rank], position_ids[rank], kv_seq_lens[rank],
             attn_sink[rank],
             wo_a[rank], wo_b[rank], wo_b_scale[rank],
             x_out[rank],
@@ -964,8 +953,8 @@ def golden_decode_hca(tensors):
             "wq_b": tensors["wq_b"][0],
             "wq_b_scale": tensors["wq_b_scale"][0],
             "wkv": tensors["wkv"][0],
-            "rope_cos": tensors["freqs_cos_full"][0][rows],
-            "rope_sin": tensors["freqs_sin_full"][0][rows],
+            "rope_cos": tensors["freqs_cos"][0][rows],
+            "rope_sin": tensors["freqs_sin"][0][rows],
             "gamma_cq": tensors["gamma_cq"][0],
             "gamma_ckv": tensors["gamma_ckv"][0],
             "q": torch.zeros(local_t, H, HEAD_DIM, dtype=torch.bfloat16),
@@ -978,13 +967,13 @@ def golden_decode_hca(tensors):
     cp_full = {
         "x_normed": torch.cat(normed_chunks, dim=0),
         "kv": torch.cat(kv_chunks, dim=0),
-        "ori_slot_mapping": tensors["ori_slot_mapping_full"][0].to(torch.int64),
-        "position_ids": tensors["position_ids_full"][0].to(torch.int32),
-        "cmp_slot_mapping": tensors["cmp_slot_mapping_full"][0].to(torch.int64),
-        "state_slot_mapping": tensors["state_slot_mapping_full"][0].to(torch.int64),
-        "cmp_freqs_cos": tensors["cmp_freqs_cos_full"][0],
-        "cmp_freqs_sin": tensors["cmp_freqs_sin_full"][0],
-        "compress_state_block_table": tensors["compress_state_block_table_full"][0],
+        "ori_slot_mapping": tensors["ori_slot_mapping"][0].to(torch.int64),
+        "position_ids": tensors["position_ids"][0].to(torch.int32),
+        "cmp_slot_mapping": tensors["cmp_slot_mapping"][0].to(torch.int64),
+        "state_slot_mapping": tensors["state_slot_mapping"][0].to(torch.int64),
+        "cmp_freqs_cos": tensors["cmp_freqs_cos"][0],
+        "cmp_freqs_sin": tensors["cmp_freqs_sin"][0],
+        "compress_state_block_table": tensors["compress_state_block_table"][0],
     }
 
     for rank in range(tp_size):
@@ -1394,7 +1383,7 @@ def build_distributed_tensor_specs(local_t, start_pos=None):
         value = materialize_spec(spec)
         if spec.name in full_only_names:
             full_spec = TensorSpec(
-                f"{spec.name}_full", [TP_SIZE, *spec.shape], spec.dtype,
+                spec.name, [TP_SIZE, *spec.shape], spec.dtype,
                 init_value=cp_stack(value, TP_SIZE),
             )
             if spec.name in resident_names:
@@ -1427,8 +1416,11 @@ def build_distributed_tensor_specs(local_t, start_pos=None):
             rank_value = cp_split(value, TP_SIZE)
         else:
             rank_value = cp_stack(value, TP_SIZE)
+        # A dual name carries a replicated full-stream twin, so the rank's rows
+        # take the _local suffix that names the half they are.
+        local_name = f"{spec.name}_local" if spec.name in dual_names else spec.name
         distributed_spec = TensorSpec(
-            spec.name, list(rank_value.shape), spec.dtype,
+            local_name, list(rank_value.shape), spec.dtype,
             init_value=rank_value, is_output=spec.is_output,
         )
         if spec.name in resident_names:
@@ -1437,7 +1429,7 @@ def build_distributed_tensor_specs(local_t, start_pos=None):
 
         if spec.name in dual_names:
             specs.append(TensorSpec(
-                f"{spec.name}_full", [TP_SIZE, *spec.shape], spec.dtype,
+                spec.name, [TP_SIZE, *spec.shape], spec.dtype,
                 init_value=cp_stack(value, TP_SIZE),
             ))
     specs.append(ScalarSpec("local_t", torch.int32, local_t))
@@ -1562,17 +1554,17 @@ if __name__ == "__main__":
                 atol=1e-3,
                 compare_fn={
                     "compress_state": mapped_pool_ratio_allclose(
-                        "state_slot_mapping_full", mapping_shape=full_mapping_shape,
+                        "state_slot_mapping", mapping_shape=full_mapping_shape,
                         block_size=COMPRESS_STATE_BLOCK_SIZE, leading_rank_axis=True,
                         pool_name="compressor state", atol=1e-3, rtol=1.0 / 128,
                     ),
                     "kv_cache": mapped_pool_ratio_allclose(
-                        "ori_slot_mapping_full", mapping_shape=full_mapping_shape,
+                        "ori_slot_mapping", mapping_shape=full_mapping_shape,
                         block_size=BLOCK_SIZE, leading_rank_axis=True,
                         pool_name="original KV cache", atol=1e-3, rtol=1.0 / 128,
                     ),
                     "cmp_kv": mapped_pool_ratio_allclose(
-                        "cmp_slot_mapping_full", mapping_shape=full_mapping_shape,
+                        "cmp_slot_mapping", mapping_shape=full_mapping_shape,
                         block_size=BLOCK_SIZE, leading_rank_axis=True,
                         pool_name="compressed KV cache", atol=1e-3, rtol=1.0 / 128,
                     ),

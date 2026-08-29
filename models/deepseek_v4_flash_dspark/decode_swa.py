@@ -52,7 +52,7 @@ from config import (
 from hc_pre import hc_pre
 from hc_post import hc_post
 from decode_cp_token_allgather import (
-    CP_KV_T_DYN,
+    KV_T_DYN,
     DECODE_GROUP_CAP,
     decode_cp_token_allgather_step,
 )
@@ -147,13 +147,13 @@ def decode_swa(
     wkv: pl.Tensor[[D, HEAD_DIM], pl.BF16],
     gamma_cq: pl.Tensor[[Q_LORA], pl.BF16],
     gamma_ckv: pl.Tensor[[HEAD_DIM], pl.BF16],
-    freqs_cos: pl.Tensor[[T_DYN, ROPE_HEAD_DIM], pl.BF16],
-    freqs_sin: pl.Tensor[[T_DYN, ROPE_HEAD_DIM], pl.BF16],
-    freqs_cos_full: pl.Tensor[[CP_KV_T_DYN, ROPE_HEAD_DIM], pl.BF16],
-    freqs_sin_full: pl.Tensor[[CP_KV_T_DYN, ROPE_HEAD_DIM], pl.BF16],
+    freqs_cos_local: pl.Tensor[[T_DYN, ROPE_HEAD_DIM], pl.BF16],
+    freqs_sin_local: pl.Tensor[[T_DYN, ROPE_HEAD_DIM], pl.BF16],
+    freqs_cos: pl.Tensor[[KV_T_DYN, ROPE_HEAD_DIM], pl.BF16],
+    freqs_sin: pl.Tensor[[KV_T_DYN, ROPE_HEAD_DIM], pl.BF16],
     # KV cache
     kv_cache: pl.Tensor[[ORI_BLOCK_NUM_DYN, BLOCK_SIZE, 1, HEAD_DIM], pl.BF16],
-    swa_slot_mapping_full: pl.Tensor[[CP_KV_T_DYN], pl.INT64],
+    swa_slot_mapping: pl.Tensor[[KV_T_DYN], pl.INT64],
     swa_indices: pl.Tensor[[T_DYN, WIN], pl.INT32],
     swa_lens: pl.Tensor[[T_DYN], pl.INT32],
     position_ids: pl.Tensor[[T_DYN], pl.INT32],
@@ -177,7 +177,7 @@ def decode_swa(
 ):
     """Run one rank of the context-parallel SWA layer."""
     t_dim = pl.tensor.dim(x_hc, 0)
-    kv_dim = pl.tensor.dim(swa_slot_mapping_full, 0)
+    kv_dim = pl.tensor.dim(swa_slot_mapping, 0)
     bias_blocks = t_dim // BIAS_T_TILE
     x_mixed = pl.create_tensor([t_dim, D], dtype=pl.BF16)
     post_t = pl.create_tensor([t_dim, HC_MULT], dtype=pl.FP32)
@@ -209,23 +209,12 @@ def decode_swa(
     kv_cos_il = pl.create_tensor([kv_dim, ROPE_HEAD_DIM], dtype=pl.FP32)
     kv_sin_signed = pl.create_tensor([kv_dim, ROPE_HEAD_DIM], dtype=pl.FP32)
     kv_swap_idx = pl.create_tensor([kv_dim, ROPE_HEAD_DIM], dtype=pl.INT32)
-    rope_prepare(freqs_cos_full, freqs_sin_full, kv_cos_il, kv_sin_signed, kv_swap_idx)
+    rope_prepare(freqs_cos, freqs_sin, kv_cos_il, kv_sin_signed, kv_swap_idx)
 
-    # The rank's query rows are its slice of the gathered stream, so the q RoPE
-    # tables are sliced out rather than prepared a second time: one rope_prepare
-    # per function keeps its token axis bound to a single row count.
     q_cos_il = pl.create_tensor([t_dim, ROPE_HEAD_DIM], dtype=pl.FP32)
     q_sin_signed = pl.create_tensor([t_dim, ROPE_HEAD_DIM], dtype=pl.FP32)
     q_swap_idx = pl.create_tensor([t_dim, ROPE_HEAD_DIM], dtype=pl.INT32)
-    q_rope_base = tp_rank * pl.cast(t_dim, pl.INT32)
-    for q_rope_row in pl.spmd(t_dim, name_hint="cp_query_rope_slice"):
-        q_rope_full = q_rope_base + q_rope_row
-        q_cos_row = pl.load(kv_cos_il, [q_rope_full, 0], [1, ROPE_HEAD_DIM], target_memory=pl.MemorySpace.Vec)
-        q_sin_row = pl.load(kv_sin_signed, [q_rope_full, 0], [1, ROPE_HEAD_DIM], target_memory=pl.MemorySpace.Vec)
-        q_swap_row = pl.load(kv_swap_idx, [q_rope_full, 0], [1, ROPE_HEAD_DIM], target_memory=pl.MemorySpace.Vec)
-        pl.store(q_cos_row, [q_rope_row, 0], q_cos_il)
-        pl.store(q_sin_row, [q_rope_row, 0], q_sin_signed)
-        pl.store(q_swap_row, [q_rope_row, 0], q_swap_idx)
+    rope_prepare(freqs_cos_local, freqs_sin_local, q_cos_il, q_sin_signed, q_swap_idx)
 
     q_proj_rope(
         x_normed_t, wq_a, wq_b, wq_b_scale, gamma_cq,
@@ -245,7 +234,7 @@ def decode_swa(
     sparse_bias = pl.create_tensor([t_dim, PADDED_TOPK], dtype=pl.FP32)
     with pl.at(level=pl.Level.CORE_GROUP, name_hint="swa_cache_insert_valid_bias"):
         for write_t in pl.range(kv_dim):
-            write_row_i64 = pl.read(swa_slot_mapping_full, [write_t])
+            write_row_i64 = pl.read(swa_slot_mapping, [write_t])
             if write_row_i64 >= 0:
                 write_row = pl.cast(write_row_i64, pl.INDEX)
                 kv_cache_flat[write_row : write_row + 1, 0 : HEAD_DIM] = (
@@ -274,7 +263,7 @@ def decode_swa(
             qk_tid, rope_tid,
         ) = sparse_attn_swa(
             q, kv_cache, swa_indices, sparse_bias,
-            freqs_cos, freqs_sin,
+            freqs_cos_local, freqs_sin_local,
         )
 
         attention_grouped = pl.create_tensor([O_GROUPS * LOCAL_T_PAD, O_GROUP_IN], dtype=pl.BF16)
@@ -399,12 +388,12 @@ def decode_swa_test(
     wkv: pl.Tensor[[D, HEAD_DIM], pl.BF16],
     gamma_cq: pl.Tensor[[Q_LORA], pl.BF16],
     gamma_ckv: pl.Tensor[[HEAD_DIM], pl.BF16],
-    freqs_cos: pl.Tensor[[T_DYN, ROPE_HEAD_DIM], pl.BF16],
-    freqs_sin: pl.Tensor[[T_DYN, ROPE_HEAD_DIM], pl.BF16],
-    freqs_cos_full: pl.Tensor[[CP_KV_T_DYN, ROPE_HEAD_DIM], pl.BF16],
-    freqs_sin_full: pl.Tensor[[CP_KV_T_DYN, ROPE_HEAD_DIM], pl.BF16],
+    freqs_cos_local: pl.Tensor[[T_DYN, ROPE_HEAD_DIM], pl.BF16],
+    freqs_sin_local: pl.Tensor[[T_DYN, ROPE_HEAD_DIM], pl.BF16],
+    freqs_cos: pl.Tensor[[KV_T_DYN, ROPE_HEAD_DIM], pl.BF16],
+    freqs_sin: pl.Tensor[[KV_T_DYN, ROPE_HEAD_DIM], pl.BF16],
     kv_cache: pl.InOut[pl.Tensor[[ORI_BLOCK_NUM_DYN, BLOCK_SIZE, 1, HEAD_DIM], pl.BF16]],
-    swa_slot_mapping_full: pl.Tensor[[CP_KV_T_DYN], pl.INT64],
+    swa_slot_mapping: pl.Tensor[[KV_T_DYN], pl.INT64],
     swa_indices: pl.Tensor[[T_DYN, WIN], pl.INT32],
     swa_lens: pl.Tensor[[T_DYN], pl.INT32],
     position_ids: pl.Tensor[[T_DYN], pl.INT32],
@@ -425,12 +414,12 @@ def decode_swa_test(
 ):
     """Bind dynamic inputs for the complete tensor-parallel SWA layer."""
     x_hc.bind_dynamic(0, T_DYN)
-    freqs_cos.bind_dynamic(0, T_DYN)
-    freqs_sin.bind_dynamic(0, T_DYN)
-    freqs_cos_full.bind_dynamic(0, CP_KV_T_DYN)
-    freqs_sin_full.bind_dynamic(0, CP_KV_T_DYN)
+    freqs_cos_local.bind_dynamic(0, T_DYN)
+    freqs_sin_local.bind_dynamic(0, T_DYN)
+    freqs_cos.bind_dynamic(0, KV_T_DYN)
+    freqs_sin.bind_dynamic(0, KV_T_DYN)
     kv_cache.bind_dynamic(0, ORI_BLOCK_NUM_DYN)
-    swa_slot_mapping_full.bind_dynamic(0, CP_KV_T_DYN)
+    swa_slot_mapping.bind_dynamic(0, KV_T_DYN)
     swa_indices.bind_dynamic(0, T_DYN)
     swa_lens.bind_dynamic(0, T_DYN)
     position_ids.bind_dynamic(0, T_DYN)
@@ -441,8 +430,8 @@ def decode_swa_test(
         hc_attn_fn, hc_attn_scale, hc_attn_base,
         attn_norm_w, wq_a, wq_b, wq_b_scale, wkv,
         gamma_cq, gamma_ckv,
-        freqs_cos, freqs_sin, freqs_cos_full, freqs_sin_full,
-        kv_cache, swa_slot_mapping_full, swa_indices, swa_lens, position_ids,
+        freqs_cos_local, freqs_sin_local, freqs_cos, freqs_sin,
+        kv_cache, swa_slot_mapping, swa_indices, swa_lens, position_ids,
         attn_sink,
         wo_a, wo_b, wo_b_scale,
         x_out,
@@ -466,12 +455,12 @@ def l3_decode_swa(
     wkv: pl.Tensor[[TP_SIZE, D, HEAD_DIM], pl.BF16],
     gamma_cq: pl.Tensor[[TP_SIZE, Q_LORA], pl.BF16],
     gamma_ckv: pl.Tensor[[TP_SIZE, HEAD_DIM], pl.BF16],
-    freqs_cos: pl.Tensor[[TP_SIZE, T_DYN, ROPE_HEAD_DIM], pl.BF16],
-    freqs_sin: pl.Tensor[[TP_SIZE, T_DYN, ROPE_HEAD_DIM], pl.BF16],
-    freqs_cos_full: pl.Tensor[[TP_SIZE, CP_KV_T_DYN, ROPE_HEAD_DIM], pl.BF16],
-    freqs_sin_full: pl.Tensor[[TP_SIZE, CP_KV_T_DYN, ROPE_HEAD_DIM], pl.BF16],
+    freqs_cos_local: pl.Tensor[[TP_SIZE, T_DYN, ROPE_HEAD_DIM], pl.BF16],
+    freqs_sin_local: pl.Tensor[[TP_SIZE, T_DYN, ROPE_HEAD_DIM], pl.BF16],
+    freqs_cos: pl.Tensor[[TP_SIZE, KV_T_DYN, ROPE_HEAD_DIM], pl.BF16],
+    freqs_sin: pl.Tensor[[TP_SIZE, KV_T_DYN, ROPE_HEAD_DIM], pl.BF16],
     kv_cache: pl.InOut[pl.Tensor[[TP_SIZE, ORI_BLOCK_NUM_DYN, BLOCK_SIZE, 1, HEAD_DIM], pl.BF16]],
-    swa_slot_mapping_full: pl.Tensor[[TP_SIZE, CP_KV_T_DYN], pl.INT64],
+    swa_slot_mapping: pl.Tensor[[TP_SIZE, KV_T_DYN], pl.INT64],
     swa_indices: pl.Tensor[[TP_SIZE, T_DYN, WIN], pl.INT32],
     swa_lens: pl.Tensor[[TP_SIZE, T_DYN], pl.INT32],
     position_ids: pl.Tensor[[TP_SIZE, T_DYN], pl.INT32],
@@ -484,12 +473,12 @@ def l3_decode_swa(
 ):
     """Launch the complete SWA layer on one tensor-parallel group."""
     x_hc.bind_dynamic(1, T_DYN)
-    freqs_cos.bind_dynamic(1, T_DYN)
-    freqs_sin.bind_dynamic(1, T_DYN)
-    freqs_cos_full.bind_dynamic(1, CP_KV_T_DYN)
-    freqs_sin_full.bind_dynamic(1, CP_KV_T_DYN)
+    freqs_cos_local.bind_dynamic(1, T_DYN)
+    freqs_sin_local.bind_dynamic(1, T_DYN)
+    freqs_cos.bind_dynamic(1, KV_T_DYN)
+    freqs_sin.bind_dynamic(1, KV_T_DYN)
     kv_cache.bind_dynamic(1, ORI_BLOCK_NUM_DYN)
-    swa_slot_mapping_full.bind_dynamic(1, CP_KV_T_DYN)
+    swa_slot_mapping.bind_dynamic(1, KV_T_DYN)
     swa_indices.bind_dynamic(1, T_DYN)
     swa_lens.bind_dynamic(1, T_DYN)
     position_ids.bind_dynamic(1, T_DYN)
@@ -514,9 +503,9 @@ def l3_decode_swa(
             hc_attn_fn[rank], hc_attn_scale[rank], hc_attn_base[rank],
             attn_norm_w[rank], wq_a[rank], wq_b[rank], wq_b_scale[rank], wkv[rank],
             gamma_cq[rank], gamma_ckv[rank],
+            freqs_cos_local[rank], freqs_sin_local[rank],
             freqs_cos[rank], freqs_sin[rank],
-            freqs_cos_full[rank], freqs_sin_full[rank],
-            kv_cache[rank], swa_slot_mapping_full[rank], swa_indices[rank], swa_lens[rank], position_ids[rank],
+            kv_cache[rank], swa_slot_mapping[rank], swa_indices[rank], swa_lens[rank], position_ids[rank],
             attn_sink[rank],
             wo_a[rank], wo_b[rank], wo_b_scale[rank],
             x_out[rank],
@@ -988,7 +977,7 @@ def build_distributed_tensor_specs(local_t, start_pos=None):
         value = materialize_spec(spec)
         if spec.name in full_only_names:
             specs.append(TensorSpec(
-                f"{spec.name}_full", [TP_SIZE, *spec.shape], spec.dtype,
+                spec.name, [TP_SIZE, *spec.shape], spec.dtype,
                 init_value=cp_stack(value, TP_SIZE),
             ))
             continue
@@ -1018,8 +1007,11 @@ def build_distributed_tensor_specs(local_t, start_pos=None):
             rank_value = cp_split(value, TP_SIZE)
         else:
             rank_value = cp_stack(value, TP_SIZE)
+        # A dual name carries a replicated full-stream twin, so the rank's rows
+        # take the _local suffix that names the half they are.
+        local_name = f"{spec.name}_local" if spec.name in dual_names else spec.name
         distributed_spec = TensorSpec(
-            spec.name, list(rank_value.shape), spec.dtype,
+            local_name, list(rank_value.shape), spec.dtype,
             init_value=rank_value, is_output=spec.is_output,
         )
         if spec.name in resident_names:
@@ -1028,7 +1020,7 @@ def build_distributed_tensor_specs(local_t, start_pos=None):
 
         if spec.name in dual_names:
             specs.append(TensorSpec(
-                f"{spec.name}_full", [TP_SIZE, *spec.shape], spec.dtype,
+                spec.name, [TP_SIZE, *spec.shape], spec.dtype,
                 init_value=cp_stack(value, TP_SIZE),
             ))
     specs.append(ScalarSpec("local_t", torch.int32, local_t))
@@ -1072,8 +1064,8 @@ def golden_decode_swa(tensors):
             "wq_b": tensors["wq_b"][0],
             "wq_b_scale": tensors["wq_b_scale"][0],
             "wkv": tensors["wkv"][0],
-            "rope_cos": tensors["freqs_cos_full"][0][rows],
-            "rope_sin": tensors["freqs_sin_full"][0][rows],
+            "rope_cos": tensors["freqs_cos"][0][rows],
+            "rope_sin": tensors["freqs_sin"][0][rows],
             "gamma_cq": tensors["gamma_cq"][0],
             "gamma_ckv": tensors["gamma_ckv"][0],
             "q": torch.zeros(local_t, H, HEAD_DIM, dtype=torch.bfloat16),
@@ -1085,7 +1077,7 @@ def golden_decode_swa(tensors):
 
     cp_full = {
         "kv": torch.cat(kv_chunks, dim=0),
-        "swa_slot_mapping": tensors["swa_slot_mapping_full"][0].to(torch.int64),
+        "swa_slot_mapping": tensors["swa_slot_mapping"][0].to(torch.int64),
     }
 
     for rank in range(tp_size):
@@ -1200,7 +1192,7 @@ if __name__ == "__main__":
                 compare_fn={
                     "x_out": ratio_reldiff(diff_thd=3e-3, pct_thd=0.008, max_diff_hd=1),
                     "kv_cache": mapped_pool_ratio_allclose(
-                        "swa_slot_mapping_full",
+                        "swa_slot_mapping",
                         mapping_shape=(TP_SIZE, TP_SIZE * local_t),
                         block_size=BLOCK_SIZE,
                         leading_rank_axis=True,

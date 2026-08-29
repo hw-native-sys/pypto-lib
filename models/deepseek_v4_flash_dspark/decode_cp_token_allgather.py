@@ -45,10 +45,10 @@ from config import (
 
 # Dynamic shape variables. The local query axis and the gathered KV axis carry
 # different row counts and must stay separate.
-CP_Q_T_DYN = pl.dynamic("DECODE_CP_Q_T_DYN")
-CP_KV_T_DYN = pl.dynamic("DECODE_CP_KV_T_DYN")
+Q_T_DYN = pl.dynamic("DECODE_Q_T_DYN")
+KV_T_DYN = pl.dynamic("DECODE_KV_T_DYN")
 # Request axis of the gathered stream: the whole group's requests, not the rank's.
-CP_KV_B_DYN = pl.dynamic("DECODE_CP_KV_B_DYN")
+KV_B_DYN = pl.dynamic("DECODE_KV_B_DYN")
 
 # model config
 D = M.hidden_size
@@ -71,8 +71,8 @@ if DECODE_GROUP_CAP % TP_SIZE != 0:
 
 @pl.jit.inline
 def decode_cp_token_allgather_step(
-    hidden_local: pl.Tensor[[CP_Q_T_DYN, D], pl.BF16],
-    group_out: pl.Tensor[[CP_KV_T_DYN, D], pl.BF16],
+    hidden_local: pl.Tensor[[Q_T_DYN, D], pl.BF16],
+    group_out: pl.Tensor[[KV_T_DYN, D], pl.BF16],
     gather_window: pld.DistributedTensor[[DECODE_GROUP_CAP, D], pl.BF16],
     gather_signal: pld.DistributedTensor[[TP_SIZE, 1], pl.INT32],
     group_base: pl.Scalar[pl.INT32],
@@ -161,16 +161,16 @@ def decode_cp_token_allgather_step(
 
 @pl.jit
 def decode_cp_token_allgather_fixture(
-    hidden_local: pl.Tensor[[CP_Q_T_DYN, D], pl.BF16],
-    group_out: pl.Out[pl.Tensor[[CP_KV_T_DYN, D], pl.BF16]],
+    hidden_local: pl.Tensor[[Q_T_DYN, D], pl.BF16],
+    group_out: pl.Out[pl.Tensor[[KV_T_DYN, D], pl.BF16]],
     gather_window: pl.InOut[pld.DistributedTensor[[DECODE_GROUP_CAP, D], pl.BF16]],
     gather_signal: pl.InOut[pld.DistributedTensor[[TP_SIZE, 1], pl.INT32]],
     group_base: pl.Scalar[pl.INT32],
     tp_rank: pl.Scalar[pl.INT32],
 ):
     """Run one rank of the decode token-row all-gather."""
-    hidden_local.bind_dynamic(0, CP_Q_T_DYN)
-    group_out.bind_dynamic(0, CP_KV_T_DYN)
+    hidden_local.bind_dynamic(0, Q_T_DYN)
+    group_out.bind_dynamic(0, KV_T_DYN)
     group_out, gather_signal = decode_cp_token_allgather_step(
         hidden_local, group_out,
         gather_window, gather_signal,
@@ -181,12 +181,12 @@ def decode_cp_token_allgather_fixture(
 
 @pl.jit.host
 def l3_decode_cp_token_allgather_fixture(
-    hidden_local: pl.Tensor[[FIXTURE_ROUNDS, TP_SIZE, CP_Q_T_DYN, D], pl.BF16],
-    group_out: pl.Out[pl.Tensor[[FIXTURE_ROUNDS, TP_SIZE, CP_KV_T_DYN, D], pl.BF16]],
+    hidden_local: pl.Tensor[[FIXTURE_ROUNDS, TP_SIZE, Q_T_DYN, D], pl.BF16],
+    group_out: pl.Out[pl.Tensor[[FIXTURE_ROUNDS, TP_SIZE, KV_T_DYN, D], pl.BF16]],
 ):
     """Launch two all-gather rounds on one retained TP window."""
-    hidden_local.bind_dynamic(2, CP_Q_T_DYN)
-    group_out.bind_dynamic(2, CP_KV_T_DYN)
+    hidden_local.bind_dynamic(2, Q_T_DYN)
+    group_out.bind_dynamic(2, KV_T_DYN)
     gather_window_buf = pld.alloc_window_buffer([DECODE_GROUP_CAP, D], dtype=pl.BF16)
     gather_signal_buf = pld.alloc_window_buffer([TP_SIZE, 1], dtype=pl.INT32)
 
