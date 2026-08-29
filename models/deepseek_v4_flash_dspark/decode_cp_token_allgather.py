@@ -47,6 +47,8 @@ from config import (
 # different row counts and must stay separate.
 CP_Q_T_DYN = pl.dynamic("DECODE_CP_Q_T_DYN")
 CP_KV_T_DYN = pl.dynamic("DECODE_CP_KV_T_DYN")
+# Request axis of the gathered stream: the whole group's requests, not the rank's.
+CP_KV_B_DYN = pl.dynamic("DECODE_CP_KV_B_DYN")
 
 # model config
 D = M.hidden_size

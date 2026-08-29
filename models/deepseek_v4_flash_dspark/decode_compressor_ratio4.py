@@ -27,10 +27,12 @@ from config import (
 )
 
 
-# Dynamic shape variables.
-B_DYN = pl.dynamic("B_DYN")
-S_DYN = pl.dynamic("S_DYN")
-T_DYN = pl.dynamic("T_DYN")  # T = B * S
+# Dynamic shape variables. Under CP the compressor runs over the whole TP group's
+# token stream while its caller stays on the local query rows, so its token and
+# request axes are its own symbols rather than the caller's.
+B_DYN = pl.dynamic("DECODE_CSA_C4_B_DYN")
+S_DYN = pl.dynamic("DECODE_CSA_C4_S_DYN")
+T_DYN = pl.dynamic("DECODE_CSA_C4_T_DYN")  # T = B * S
 
 # model config
 B = DECODE_BATCH // TP
@@ -61,7 +63,10 @@ CMP_BLOCK_NUM_DYN = pl.dynamic("CMP_BLOCK_NUM_DYN")
 K_TILE = 512
 OUT_TILE = 64
 MM_B_TILE = 16
-BS_PAD = ((B * S + MM_B_TILE - 1) // MM_B_TILE) * MM_B_TILE
+# Scratch spans the CP group's whole token stream, which the compressor runs
+# over, not the rank-local B * S.
+GROUP_BS = DECODE_BATCH * DECODE_SEQ
+BS_PAD = ((GROUP_BS + MM_B_TILE - 1) // MM_B_TILE) * MM_B_TILE
 HEAD_TILE = 64
 RMS_PAD_TILE = 16  # 16-row block of B (min M for FP32 vec ops)
 
