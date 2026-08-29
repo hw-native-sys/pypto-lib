@@ -26,9 +26,12 @@ from config import (
 
 
 # Dynamic shape variables.
-B_DYN = pl.dynamic("B_DYN")
-S_DYN = pl.dynamic("S_DYN")
-T_DYN = pl.dynamic("T_DYN")  # T = B * S
+# Under CP the indexer cache is built from the whole TP group's token stream while
+# the indexer's query half stays on the local rows, so this half carries its own
+# token and request axes.
+B_DYN = pl.dynamic("DECODE_IDX_C4_B_DYN")
+S_DYN = pl.dynamic("DECODE_IDX_C4_S_DYN")
+T_DYN = pl.dynamic("DECODE_IDX_C4_T_DYN")  # T = B * S
 
 # model config
 B = DECODE_BATCH // TP
@@ -60,7 +63,9 @@ OUT_TILE = 64
 PROJ_OUT_TILE = 32  # kv_score_proj N-tile
 assert PROJ_OUT_TILE % 16 == 0, "cube tile cols must be a multiple of 16"
 MM_B_TILE = 16
-BS_PAD = ((B * S + MM_B_TILE - 1) // MM_B_TILE) * MM_B_TILE
+# Scratch spans the CP group's whole token stream, not the rank-local B * S.
+GROUP_BS = DECODE_BATCH * DECODE_SEQ
+BS_PAD = ((GROUP_BS + MM_B_TILE - 1) // MM_B_TILE) * MM_B_TILE
 HEAD_TILE = 64
 RMS_PAD_TILE = 16  # 16-row block of B (hadamard matmul M multiple of 16)
 

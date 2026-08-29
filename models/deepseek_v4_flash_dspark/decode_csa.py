@@ -58,6 +58,7 @@ from decode_cp_token_allgather import (
 from hc_post import hc_post
 from hc_pre import hc_pre
 from decode_indexer import indexer
+from decode_indexer_compressor import indexer_compressor
 from qkv_proj_rope import kv_proj_rope, q_proj_rope, qkv_proj_rope, rope_prepare
 from rmsnorm import rms_norm
 from decode_o_proj import (
@@ -183,7 +184,7 @@ def decode_csa(
     inner_ape: pl.Tensor[[COMPRESS_RATIO, INNER_OUT_DIM], pl.FP32],
     inner_norm_w: pl.Tensor[[IDX_HEAD_DIM], pl.BF16],
     inner_compress_state: pl.Tensor[[INNER_STATE_BLOCK_NUM_DYN, INNER_STATE_BLOCK_SIZE, INNER_STATE_DIM], pl.FP32],
-    inner_compress_state_block_table: pl.Tensor[[B_DYN, INNER_STATE_MAX_BLOCKS], pl.INT32],
+    inner_compress_state_block_table_full: pl.Tensor[[CP_KV_B_DYN, INNER_STATE_MAX_BLOCKS], pl.INT32],
     kv_cache: pl.Tensor[[ORI_BLOCK_NUM_DYN, BLOCK_SIZE, 1, HEAD_DIM], pl.BF16],
     cmp_kv: pl.Tensor[[CMP_BLOCK_NUM_DYN, BLOCK_SIZE, 1, HEAD_DIM], pl.BF16],
     cmp_block_table: pl.Tensor[[B_DYN, CMP_MAX_BLOCKS], pl.INT32],
@@ -194,9 +195,9 @@ def decode_csa(
     window_swa_indices: pl.Tensor[[T_DYN, WIN], pl.INT32],
     window_swa_lens: pl.Tensor[[T_DYN], pl.INT32],
     cmp_slot_mapping_full: pl.Tensor[[CP_KV_T_DYN], pl.INT64],
-    idx_slot_mapping: pl.Tensor[[T_DYN], pl.INT64],
+    idx_slot_mapping_full: pl.Tensor[[CP_KV_T_DYN], pl.INT64],
     state_slot_mapping_full: pl.Tensor[[CP_KV_T_DYN], pl.INT64],
-    inner_state_slot_mapping: pl.Tensor[[T_DYN], pl.INT64],
+    inner_state_slot_mapping_full: pl.Tensor[[CP_KV_T_DYN], pl.INT64],
     position_ids: pl.Tensor[[T_DYN], pl.INT32],
     position_ids_full: pl.Tensor[[CP_KV_T_DYN], pl.INT32],
     kv_seq_lens: pl.Tensor[[B_DYN], pl.INT32],
@@ -356,17 +357,25 @@ def decode_csa(
         )
         cache_ready_dep = pl.system.task_dummy(deps=[ori_cache_write_tid, cmp_cache_write_tid])
 
-        idx_kv_unused = pl.create_tensor([t_dim, IDX_HEAD_DIM], dtype=pl.FP32)
+        # The indexer cache is per-request state, so its compressor half runs on the
+        # gathered stream while the query half stays on the rank's rows.
+        idx_kv_unused = pl.create_tensor([kv_dim, IDX_HEAD_DIM], dtype=pl.FP32)
+        idx_cache_write_tid = indexer_compressor(
+            x_normed_full, idx_kv_unused,
+            inner_compress_state, inner_compress_state_block_table_full,
+            inner_wkv, inner_wgate, inner_ape, inner_norm_w,
+            cmp_cos_il_full, cmp_sin_signed_full, hadamard_idx,
+            idx_kv_cache, idx_kv_scale,
+            position_ids_full, idx_slot_mapping_full, inner_state_slot_mapping_full,
+            late_dep,
+        )
         idx_topk_scores, idx_topk = indexer(
             x_normed_t, qr, qr_scale, idx_wq_b, idx_wq_b_scale,
-            weights_proj, idx_cos_il, idx_sin_signed, cmp_cos_il, cmp_sin_signed,
+            weights_proj, idx_cos_il, idx_sin_signed,
             hadamard_idx,
-            idx_kv_unused, inner_compress_state, inner_compress_state_block_table,
-            inner_wkv, inner_wgate, inner_ape, inner_norm_w,
             idx_kv_cache, idx_kv_scale, idx_block_table,
             idx_topk_scores, idx_topk,
-            position_ids, idx_slot_mapping, inner_state_slot_mapping,
-            kv_seq_lens, late_dep,
+            position_ids, kv_seq_lens, late_dep, idx_cache_write_tid,
         )
 
         (
@@ -523,7 +532,7 @@ def decode_csa_test(
     inner_ape: pl.Tensor[[COMPRESS_RATIO, INNER_OUT_DIM], pl.FP32],
     inner_norm_w: pl.Tensor[[IDX_HEAD_DIM], pl.BF16],
     inner_compress_state: pl.InOut[pl.Tensor[[INNER_STATE_BLOCK_NUM_DYN, INNER_STATE_BLOCK_SIZE, INNER_STATE_DIM], pl.FP32]],
-    inner_compress_state_block_table: pl.Tensor[[B_DYN, INNER_STATE_MAX_BLOCKS], pl.INT32],
+    inner_compress_state_block_table_full: pl.Tensor[[CP_KV_B_DYN, INNER_STATE_MAX_BLOCKS], pl.INT32],
     kv_cache: pl.InOut[pl.Tensor[[ORI_BLOCK_NUM_DYN, BLOCK_SIZE, 1, HEAD_DIM], pl.BF16]],
     cmp_kv: pl.InOut[pl.Tensor[[CMP_BLOCK_NUM_DYN, BLOCK_SIZE, 1, HEAD_DIM], pl.BF16]],
     cmp_block_table: pl.Tensor[[B_DYN, CMP_MAX_BLOCKS], pl.INT32],
@@ -534,9 +543,9 @@ def decode_csa_test(
     window_swa_indices: pl.Tensor[[T_DYN, WIN], pl.INT32],
     window_swa_lens: pl.Tensor[[T_DYN], pl.INT32],
     cmp_slot_mapping_full: pl.Tensor[[CP_KV_T_DYN], pl.INT64],
-    idx_slot_mapping: pl.Tensor[[T_DYN], pl.INT64],
+    idx_slot_mapping_full: pl.Tensor[[CP_KV_T_DYN], pl.INT64],
     state_slot_mapping_full: pl.Tensor[[CP_KV_T_DYN], pl.INT64],
-    inner_state_slot_mapping: pl.Tensor[[T_DYN], pl.INT64],
+    inner_state_slot_mapping_full: pl.Tensor[[CP_KV_T_DYN], pl.INT64],
     position_ids: pl.Tensor[[T_DYN], pl.INT32],
     position_ids_full: pl.Tensor[[CP_KV_T_DYN], pl.INT32],
     kv_seq_lens: pl.Tensor[[B_DYN], pl.INT32],
@@ -568,7 +577,7 @@ def decode_csa_test(
     compress_state.bind_dynamic(0, MAIN_STATE_BLOCK_NUM_DYN)
     compress_state_block_table_full.bind_dynamic(0, CP_KV_B_DYN)
     inner_compress_state.bind_dynamic(0, INNER_STATE_BLOCK_NUM_DYN)
-    inner_compress_state_block_table.bind_dynamic(0, B_DYN)
+    inner_compress_state_block_table_full.bind_dynamic(0, CP_KV_B_DYN)
     kv_cache.bind_dynamic(0, ORI_BLOCK_NUM_DYN)
     cmp_kv.bind_dynamic(0, CMP_BLOCK_NUM_DYN)
     cmp_block_table.bind_dynamic(0, B_DYN)
@@ -579,9 +588,9 @@ def decode_csa_test(
     window_swa_indices.bind_dynamic(0, T_DYN)
     window_swa_lens.bind_dynamic(0, T_DYN)
     cmp_slot_mapping_full.bind_dynamic(0, CP_KV_T_DYN)
-    idx_slot_mapping.bind_dynamic(0, T_DYN)
+    idx_slot_mapping_full.bind_dynamic(0, CP_KV_T_DYN)
     state_slot_mapping_full.bind_dynamic(0, CP_KV_T_DYN)
-    inner_state_slot_mapping.bind_dynamic(0, T_DYN)
+    inner_state_slot_mapping_full.bind_dynamic(0, CP_KV_T_DYN)
     position_ids.bind_dynamic(0, T_DYN)
     position_ids_full.bind_dynamic(0, CP_KV_T_DYN)
     kv_seq_lens.bind_dynamic(0, B_DYN)
@@ -597,12 +606,12 @@ def decode_csa_test(
         compress_state, compress_state_block_table_full,
         idx_wq_b, idx_wq_b_scale, weights_proj, hadamard_idx,
         inner_wkv, inner_wgate, inner_ape, inner_norm_w,
-        inner_compress_state, inner_compress_state_block_table,
+        inner_compress_state, inner_compress_state_block_table_full,
         kv_cache, cmp_kv, cmp_block_table,
         idx_kv_cache, idx_kv_scale, idx_block_table,
         ori_slot_mapping_full, window_swa_indices, window_swa_lens,
-        cmp_slot_mapping_full, idx_slot_mapping,
-        state_slot_mapping_full, inner_state_slot_mapping,
+        cmp_slot_mapping_full, idx_slot_mapping_full,
+        state_slot_mapping_full, inner_state_slot_mapping_full,
         position_ids, position_ids_full, kv_seq_lens,
         attn_sink, wo_a, wo_b, wo_b_scale,
         x_out,
@@ -648,7 +657,7 @@ def l3_decode_csa(
     inner_ape: pl.Tensor[[TP_SIZE, COMPRESS_RATIO, INNER_OUT_DIM], pl.FP32],
     inner_norm_w: pl.Tensor[[TP_SIZE, IDX_HEAD_DIM], pl.BF16],
     inner_compress_state: pl.InOut[pl.Tensor[[TP_SIZE, INNER_STATE_BLOCK_NUM_DYN, INNER_STATE_BLOCK_SIZE, INNER_STATE_DIM], pl.FP32]],
-    inner_compress_state_block_table: pl.Tensor[[TP_SIZE, B_DYN, INNER_STATE_MAX_BLOCKS], pl.INT32],
+    inner_compress_state_block_table_full: pl.Tensor[[TP_SIZE, CP_KV_B_DYN, INNER_STATE_MAX_BLOCKS], pl.INT32],
     kv_cache: pl.InOut[pl.Tensor[[TP_SIZE, ORI_BLOCK_NUM_DYN, BLOCK_SIZE, 1, HEAD_DIM], pl.BF16]],
     cmp_kv: pl.InOut[pl.Tensor[[TP_SIZE, CMP_BLOCK_NUM_DYN, BLOCK_SIZE, 1, HEAD_DIM], pl.BF16]],
     cmp_block_table: pl.Tensor[[TP_SIZE, B_DYN, CMP_MAX_BLOCKS], pl.INT32],
@@ -659,9 +668,9 @@ def l3_decode_csa(
     window_swa_indices: pl.Tensor[[TP_SIZE, T_DYN, WIN], pl.INT32],
     window_swa_lens: pl.Tensor[[TP_SIZE, T_DYN], pl.INT32],
     cmp_slot_mapping_full: pl.Tensor[[TP_SIZE, CP_KV_T_DYN], pl.INT64],
-    idx_slot_mapping: pl.Tensor[[TP_SIZE, T_DYN], pl.INT64],
+    idx_slot_mapping_full: pl.Tensor[[TP_SIZE, CP_KV_T_DYN], pl.INT64],
     state_slot_mapping_full: pl.Tensor[[TP_SIZE, CP_KV_T_DYN], pl.INT64],
-    inner_state_slot_mapping: pl.Tensor[[TP_SIZE, T_DYN], pl.INT64],
+    inner_state_slot_mapping_full: pl.Tensor[[TP_SIZE, CP_KV_T_DYN], pl.INT64],
     position_ids: pl.Tensor[[TP_SIZE, T_DYN], pl.INT32],
     position_ids_full: pl.Tensor[[TP_SIZE, CP_KV_T_DYN], pl.INT32],
     kv_seq_lens: pl.Tensor[[TP_SIZE, B_DYN], pl.INT32],
@@ -685,7 +694,7 @@ def l3_decode_csa(
     compress_state.bind_dynamic(1, MAIN_STATE_BLOCK_NUM_DYN)
     compress_state_block_table_full.bind_dynamic(1, CP_KV_B_DYN)
     inner_compress_state.bind_dynamic(1, INNER_STATE_BLOCK_NUM_DYN)
-    inner_compress_state_block_table.bind_dynamic(1, B_DYN)
+    inner_compress_state_block_table_full.bind_dynamic(1, CP_KV_B_DYN)
     kv_cache.bind_dynamic(1, ORI_BLOCK_NUM_DYN)
     cmp_kv.bind_dynamic(1, CMP_BLOCK_NUM_DYN)
     cmp_block_table.bind_dynamic(1, B_DYN)
@@ -696,9 +705,9 @@ def l3_decode_csa(
     window_swa_indices.bind_dynamic(1, T_DYN)
     window_swa_lens.bind_dynamic(1, T_DYN)
     cmp_slot_mapping_full.bind_dynamic(1, CP_KV_T_DYN)
-    idx_slot_mapping.bind_dynamic(1, T_DYN)
+    idx_slot_mapping_full.bind_dynamic(1, CP_KV_T_DYN)
     state_slot_mapping_full.bind_dynamic(1, CP_KV_T_DYN)
-    inner_state_slot_mapping.bind_dynamic(1, T_DYN)
+    inner_state_slot_mapping_full.bind_dynamic(1, CP_KV_T_DYN)
     position_ids.bind_dynamic(1, T_DYN)
     position_ids_full.bind_dynamic(1, CP_KV_T_DYN)
     kv_seq_lens.bind_dynamic(1, B_DYN)
@@ -731,12 +740,12 @@ def l3_decode_csa(
             compress_state[rank], compress_state_block_table_full[rank],
             idx_wq_b[rank], idx_wq_b_scale[rank], weights_proj[rank], hadamard_idx[rank],
             inner_wkv[rank], inner_wgate[rank], inner_ape[rank], inner_norm_w[rank],
-            inner_compress_state[rank], inner_compress_state_block_table[rank],
+            inner_compress_state[rank], inner_compress_state_block_table_full[rank],
             kv_cache[rank], cmp_kv[rank], cmp_block_table[rank],
             idx_kv_cache[rank], idx_kv_scale[rank], idx_block_table[rank],
             ori_slot_mapping_full[rank], window_swa_indices[rank], window_swa_lens[rank],
-            cmp_slot_mapping_full[rank], idx_slot_mapping[rank],
-            state_slot_mapping_full[rank], inner_state_slot_mapping[rank],
+            cmp_slot_mapping_full[rank], idx_slot_mapping_full[rank],
+            state_slot_mapping_full[rank], inner_state_slot_mapping_full[rank],
             position_ids[rank], position_ids_full[rank], kv_seq_lens[rank],
             attn_sink[rank], wo_a[rank], wo_b[rank], wo_b_scale[rank],
             x_out[rank],
@@ -1069,8 +1078,6 @@ def golden_decode_csa_tp1(tensors, cp_full=None):
 
     position_ids = tensors["position_ids"].to(torch.int64)
     position_ids_bsd = position_ids.reshape(batch, S).to(torch.int32).contiguous()
-    idx_slot_mapping_bsd = tensors["idx_slot_mapping"].reshape(batch, S).to(torch.int64).contiguous()
-    inner_state_slot_mapping_bsd = tensors["inner_state_slot_mapping"].reshape(batch, S).to(torch.int64).contiguous()
 
     rope_cos_t = tensors["freqs_cos"]
     rope_sin_t = tensors["freqs_sin"]
@@ -1118,6 +1125,9 @@ def golden_decode_csa_tp1(tensors, cp_full=None):
         cmp_positions = position_ids_bsd.reshape(-1)
         cmp_slots = tensors["cmp_slot_mapping"].to(torch.int64)
         cmp_state_slots = tensors["state_slot_mapping"].to(torch.int64)
+        inner_state_table = tensors["inner_compress_state_block_table"]
+        idx_slots = tensors["idx_slot_mapping"].to(torch.int64)
+        inner_state_slots = tensors["inner_state_slot_mapping"].to(torch.int64)
     else:
         cmp_x = cp_full["x_normed"]
         cmp_rope_cos, cmp_rope_sin = interleave_rope(
@@ -1127,6 +1137,9 @@ def golden_decode_csa_tp1(tensors, cp_full=None):
         cmp_positions = cp_full["position_ids"]
         cmp_slots = cp_full["cmp_slot_mapping"]
         cmp_state_slots = cp_full["state_slot_mapping"]
+        inner_state_table = cp_full["inner_compress_state_block_table"]
+        idx_slots = cp_full["idx_slot_mapping"]
+        inner_state_slots = cp_full["inner_state_slot_mapping"]
 
     cmp_out = torch.zeros(cmp_x.shape[0], HEAD_DIM, dtype=torch.float32)
     golden_compressor({
@@ -1146,7 +1159,16 @@ def golden_decode_csa_tp1(tensors, cp_full=None):
         "state_slot_mapping": cmp_state_slots,
     })
 
-    idx_kv = torch.zeros(tokens, IDX_HEAD_DIM, dtype=torch.float32)
+    inner_full = {
+        "x": cmp_x,
+        "inner_kv": torch.zeros(cmp_x.shape[0], IDX_HEAD_DIM, dtype=torch.float32),
+        "cmp_cos": cmp_rope_cos,
+        "cmp_sin": cmp_rope_sin,
+        "inner_compress_state_block_table": inner_state_table,
+        "position_ids": cmp_positions,
+        "idx_slot_mapping": idx_slots,
+        "inner_state_slot_mapping": inner_state_slots,
+    }
     idx_topk_scores = torch.full((tokens, IDX_TOPK), float("-inf"), dtype=torch.float32)
     idx_topk = torch.full((tokens, IDX_TOPK), -1, dtype=torch.int32)
     golden_indexer({
@@ -1158,12 +1180,8 @@ def golden_decode_csa_tp1(tensors, cp_full=None):
         "weights_proj": tensors["weights_proj"],
         "cos": idx_cos,
         "sin": idx_sin,
-        "cmp_cos": cmp_cos,
-        "cmp_sin": cmp_sin,
         "hadamard": tensors["hadamard_idx"],
-        "inner_kv": idx_kv,
         "inner_compress_state": tensors["inner_compress_state"],
-        "inner_compress_state_block_table": tensors["inner_compress_state_block_table"],
         "inner_wkv": tensors["inner_wkv"],
         "inner_wgate": tensors["inner_wgate"],
         "inner_ape": tensors["inner_ape"],
@@ -1174,10 +1192,8 @@ def golden_decode_csa_tp1(tensors, cp_full=None):
         "topk_scores": idx_topk_scores,
         "topk_idxs": idx_topk,
         "position_ids": position_ids_bsd.reshape(-1),
-        "idx_slot_mapping": idx_slot_mapping_bsd.reshape(-1),
-        "inner_state_slot_mapping": inner_state_slot_mapping_bsd.reshape(-1),
         "kv_seq_lens": tensors["kv_seq_lens"],
-    })
+    }, inner_full=inner_full)
 
     if cp_full is None:
         kv_rows, ori_slot_mapping = kv, tensors["ori_slot_mapping"].to(torch.int64)
@@ -1630,17 +1646,16 @@ def build_distributed_tensor_specs(local_t, start_pos=None):
     local_token_names = frozenset({
         "x_hc", "freqs_cos", "freqs_sin", "cmp_freqs_cos", "cmp_freqs_sin",
         "window_swa_indices", "window_swa_lens",
-        "idx_slot_mapping", "inner_state_slot_mapping",
         "position_ids",
     })
     local_request_names = frozenset({
-        "inner_compress_state_block_table",
         "cmp_block_table", "idx_block_table", "kv_seq_lens",
     })
     # Consumed only on the gathered stream: replicated, and renamed to say so.
     full_only_names = frozenset({
         "ori_slot_mapping", "cmp_slot_mapping", "state_slot_mapping",
-        "compress_state_block_table",
+        "idx_slot_mapping", "inner_state_slot_mapping",
+        "compress_state_block_table", "inner_compress_state_block_table",
     })
     # Consumed on both sides: the rank's rows plus a replicated full-stream twin.
     dual_names = ("freqs_cos", "freqs_sin", "cmp_freqs_cos", "cmp_freqs_sin", "position_ids")
@@ -1783,6 +1798,9 @@ def golden_decode_csa(tensors):
         "cmp_freqs_cos": tensors["cmp_freqs_cos_full"][0],
         "cmp_freqs_sin": tensors["cmp_freqs_sin_full"][0],
         "compress_state_block_table": tensors["compress_state_block_table_full"][0],
+        "idx_slot_mapping": tensors["idx_slot_mapping_full"][0].to(torch.int64),
+        "inner_state_slot_mapping": tensors["inner_state_slot_mapping_full"][0].to(torch.int64),
+        "inner_compress_state_block_table": tensors["inner_compress_state_block_table_full"][0],
     }
 
     for rank in range(tp_size):
@@ -1878,13 +1896,12 @@ def build_full_compare(mapping_shape, *, leading_rank_axis, cp_mappings=None, di
             atol=1e-3,
             rtol=1e-3,
         ),
-        "inner_compress_state": mapped_pool_ratio_allclose(
-            "inner_state_slot_mapping",
+        "inner_compress_state": mapped(
+            "inner_compress_state", "inner_state_slot_mapping",
             block_size=INNER_STATE_BLOCK_SIZE,
             pool_name="inner compressor state",
             atol=1e-3,
             rtol=1e-3,
-            **common,
         ),
         "kv_cache": mapped(
             "kv_cache", "ori_slot_mapping",
@@ -1900,23 +1917,21 @@ def build_full_compare(mapping_shape, *, leading_rank_axis, cp_mappings=None, di
             atol=1e-4,
             rtol=1.0 / 128,
         ),
-        "idx_kv_cache": mapped_pool_ratio_allclose(
-            "idx_slot_mapping",
+        "idx_kv_cache": mapped(
+            "idx_kv_cache", "idx_slot_mapping",
             block_size=BLOCK_SIZE,
             pool_name="indexer KV cache",
             atol=1,
             rtol=0,
             max_error_ratio=0.01,
-            **common,
         ),
-        "idx_kv_scale": mapped_pool_ratio_allclose(
-            "idx_slot_mapping",
+        "idx_kv_scale": mapped(
+            "idx_kv_scale", "idx_slot_mapping",
             block_size=BLOCK_SIZE,
             pool_name="indexer KV scale",
             atol=1e-4,
             rtol=1.0 / 128,
             max_error_ratio=0.01,
-            **common,
         ),
         "x_out": x_out_compare,
     }
@@ -2034,6 +2049,9 @@ if __name__ == "__main__":
                 "kv_cache": ("ori_slot_mapping_full", (TP_SIZE, TP_SIZE * local_t)),
                 "cmp_kv": ("cmp_slot_mapping_full", (TP_SIZE, TP_SIZE * local_t)),
                 "compress_state": ("state_slot_mapping_full", (TP_SIZE, TP_SIZE * local_t)),
+                "idx_kv_cache": ("idx_slot_mapping_full", (TP_SIZE, TP_SIZE * local_t)),
+                "idx_kv_scale": ("idx_slot_mapping_full", (TP_SIZE, TP_SIZE * local_t)),
+                "inner_compress_state": ("inner_state_slot_mapping_full", (TP_SIZE, TP_SIZE * local_t)),
             },
             diagnostic_x_out=args.platform.endswith("sim"),
         ),

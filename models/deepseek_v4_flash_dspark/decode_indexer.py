@@ -634,16 +634,7 @@ def indexer(
     #   cos[j] = cos_half[j>>1];  sin[j] = sin_half[j>>1] * sign[j], sign = [-1,+1,...]
     cos: pl.Tensor[[T_DYN, ROPE_HEAD_DIM], pl.FP32],
     sin: pl.Tensor[[T_DYN, ROPE_HEAD_DIM], pl.FP32],
-    cmp_cos: pl.Tensor[[T_DYN, ROPE_HEAD_DIM], pl.FP32],
-    cmp_sin: pl.Tensor[[T_DYN, ROPE_HEAD_DIM], pl.FP32],
-    hadamard: pl.Tensor[[IDX_HEAD_DIM, IDX_HEAD_DIM], pl.BF16],  # shared by q rotation and inner Compressor
-    inner_kv: pl.Tensor[[T_DYN, INNER_HEAD_DIM], pl.FP32],
-    inner_compress_state: pl.Tensor[[INNER_STATE_BLOCK_NUM_DYN, INNER_STATE_BLOCK_SIZE, INNER_STATE_DIM], pl.FP32],
-    inner_compress_state_block_table: pl.Tensor[[B_DYN, INNER_STATE_MAX_BLOCKS], pl.INT32],
-    inner_wkv: pl.Tensor[[INNER_OUT_DIM, D], pl.BF16],
-    inner_wgate: pl.Tensor[[INNER_OUT_DIM, D], pl.BF16],
-    inner_ape: pl.Tensor[[COMPRESS_RATIO, INNER_OUT_DIM], pl.FP32],
-    inner_norm_w: pl.Tensor[[INNER_HEAD_DIM], pl.BF16],
+    hadamard: pl.Tensor[[IDX_HEAD_DIM, IDX_HEAD_DIM], pl.BF16],
     # C8 indexer cache: INT8 KV (quant-on-write) + per-position FP32 dequant scale; no bf16 cache.
     idx_kv_cache: pl.InOut[pl.Tensor[[IDX_CACHE_BLOCK_NUM_DYN, BLOCK_SIZE, 1, IDX_HEAD_DIM], pl.INT8]],
     idx_kv_scale: pl.InOut[pl.Tensor[[IDX_CACHE_BLOCK_NUM_DYN, BLOCK_SIZE, 1, 1], pl.FP32]],
@@ -651,10 +642,9 @@ def indexer(
     topk_scores: pl.Out[pl.Tensor[[T_DYN, IDX_TOPK], pl.FP32]],
     topk_idxs: pl.Out[pl.Tensor[[T_DYN, IDX_TOPK], pl.INT32]],
     position_ids: pl.Tensor[[T_DYN], pl.INT32],
-    idx_slot_mapping: pl.Tensor[[T_DYN], pl.INT64],
-    inner_state_slot_mapping: pl.Tensor[[T_DYN], pl.INT64],
     kv_seq_lens: pl.Tensor[[B_DYN], pl.INT32],
     late_dep: pl.Scalar[pl.TASK_ID],
+    cache_write_dep: pl.Scalar[pl.TASK_ID],
 ):
     bs = pl.tensor.dim(x, 0)
     bs_heads = bs * IDX_N_HEADS
@@ -804,15 +794,6 @@ def indexer(
             w_sum = pl.add(w_sum, weights_partial[partial_r0 : partial_r0 + MM_ROW_TILE, :])
         weights[w_r0 : w_r0 + MM_ROW_TILE, :] = pl.mul(w_sum, WEIGHTS_SCALE)
 
-    cache_write_tid = indexer_compressor(
-        x, inner_kv,
-        inner_compress_state, inner_compress_state_block_table,
-        inner_wkv, inner_wgate, inner_ape, inner_norm_w,
-        cmp_cos, cmp_sin, hadamard, idx_kv_cache, idx_kv_scale,
-        position_ids, idx_slot_mapping, inner_state_slot_mapping,
-        late_dep,
-    )
-
     topk_scores, topk_idxs = indexer_score_topk_forest(
         qr_hadamard_i8,
         qr_hadamard_scale_dq,
@@ -826,7 +807,7 @@ def indexer(
         topk_idxs,
         qh_quant_tid,
         weights_tid,
-        cache_write_tid,
+        cache_write_dep,
     )
     return topk_scores, topk_idxs
 
@@ -880,6 +861,14 @@ def indexer_test(
 
     # Standalone: no rms_norm producer, so the barrier fences nothing (ready on submit).
     late_dep = pl.system.task_dummy(deps=[])
+    cache_write_dep = indexer_compressor(
+        x, inner_kv,
+        inner_compress_state, inner_compress_state_block_table,
+        inner_wkv, inner_wgate, inner_ape, inner_norm_w,
+        cmp_cos, cmp_sin, hadamard, idx_kv_cache, idx_kv_scale,
+        position_ids, idx_slot_mapping, inner_state_slot_mapping,
+        late_dep,
+    )
     topk_scores, topk_idxs = indexer(
         x,
         qr,
@@ -889,26 +878,16 @@ def indexer_test(
         weights_proj,
         cos,
         sin,
-        cmp_cos,
-        cmp_sin,
         hadamard,
-        inner_kv,
-        inner_compress_state,
-        inner_compress_state_block_table,
-        inner_wkv,
-        inner_wgate,
-        inner_ape,
-        inner_norm_w,
         idx_kv_cache,
         idx_kv_scale,
         idx_block_table,
         topk_scores,
         topk_idxs,
         position_ids,
-        idx_slot_mapping,
-        inner_state_slot_mapping,
         kv_seq_lens,
         late_dep,
+        cache_write_dep,
     )
     return topk_scores, idx_kv_cache, idx_kv_scale, topk_idxs
 
@@ -946,8 +925,12 @@ def gen_shared_weight(shape, dequant_std, chan_cv):
     return w_i8, scale
 
 
-def golden_indexer(tensors):
-    """Torch reference for Indexer.forward decode branch; prefill `start_pos == 0` path is omitted."""
+def golden_indexer(tensors, inner_full=None):
+    """Torch reference for Indexer.forward decode branch; prefill `start_pos == 0` path is omitted.
+
+    ``inner_full`` supplies the cache half's stream-side inputs, which under CP is
+    the whole TP group's token stream rather than the rank's rows.
+    """
     import torch
     from decode_indexer_compressor import golden_compressor
     from utils import int8_quant_per_row
@@ -983,23 +966,24 @@ def golden_indexer(tensors):
     # then dequantized with q_scale * kv_scale.
     # flash: fp4_act_quant on q (FP4 simulation).
 
+    inner_src = tensors if inner_full is None else inner_full
     inner_tensors = {
-        "x": tensors["x"],
-        "kv": tensors["inner_kv"],
+        "x": inner_src["x"],
+        "kv": inner_src["inner_kv"],
         "wkv": tensors["inner_wkv"],
         "wgate": tensors["inner_wgate"],
         "ape": tensors["inner_ape"],
         "norm_w": tensors["inner_norm_w"],
-        "cos": tensors["cmp_cos"],
-        "sin": tensors["cmp_sin"],
+        "cos": inner_src["cmp_cos"],
+        "sin": inner_src["cmp_sin"],
         "hadamard": tensors["hadamard"],
         "compress_state": tensors["inner_compress_state"],
-        "compress_state_block_table": tensors["inner_compress_state_block_table"],
+        "compress_state_block_table": inner_src["inner_compress_state_block_table"],
         "idx_kv_cache": tensors["idx_kv_cache"],
         "idx_kv_scale": tensors["idx_kv_scale"],
-        "position_ids": tensors["position_ids"],
-        "idx_slot_mapping": tensors["idx_slot_mapping"],
-        "inner_state_slot_mapping": tensors["inner_state_slot_mapping"],
+        "position_ids": inner_src["position_ids"],
+        "idx_slot_mapping": inner_src["idx_slot_mapping"],
+        "inner_state_slot_mapping": inner_src["inner_state_slot_mapping"],
     }
     golden_compressor(inner_tensors)
 
