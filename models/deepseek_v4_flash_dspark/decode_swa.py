@@ -1082,6 +1082,10 @@ def golden_decode_swa(tensors):
 
     for rank in range(tp_size):
         rank_tensors = { name: value[rank] for name, value in tensors.items() if name != "local_t" }
+        # The TP1 reference names its token-local rows without a suffix, so the
+        # _local halves replace the gathered stream that now holds the bare name.
+        rank_tensors["freqs_cos"] = tensors["freqs_cos_local"][rank]
+        rank_tensors["freqs_sin"] = tensors["freqs_sin_local"][rank]
         rank_tensors["wo_a"] = full_wo_a
         rank_tensors["wo_b"] = full_wo_b
         rank_tensors["wo_b_scale"] = tensors["wo_b_scale"][0]

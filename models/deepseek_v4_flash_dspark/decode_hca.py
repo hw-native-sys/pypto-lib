@@ -978,6 +978,11 @@ def golden_decode_hca(tensors):
 
     for rank in range(tp_size):
         rank_tensors = { name: tensor[rank] for name, tensor in tensors.items() if name != "local_t" }
+        # The TP1 reference names its token-local rows without a suffix, so the
+        # _local halves replace the gathered stream that now holds the bare name.
+        rank_tensors["freqs_cos"] = tensors["freqs_cos_local"][rank]
+        rank_tensors["freqs_sin"] = tensors["freqs_sin_local"][rank]
+        rank_tensors["position_ids"] = tensors["position_ids_local"][rank]
         rank_tensors["wo_a"] = full_wo_a
         rank_tensors["wo_b"] = full_wo_b
         golden_decode_hca_tp1(rank_tensors, cp_full=cp_full)
