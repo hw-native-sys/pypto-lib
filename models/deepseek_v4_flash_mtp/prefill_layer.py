@@ -117,6 +117,10 @@ ORI_TABLE_BLOCKS = SPARSE_ORI_MAX_BLOCKS
 CMP_TABLE_BLOCKS = SPARSE_CMP_MAX_BLOCKS
 IDX_TABLE_BLOCKS = IDX_CACHE_MAX_BLOCKS
 
+# Per-ring runtime output heap, 1 GiB on each of the 4 rings. The 256 MiB
+# compile-time default deadlocks the ring allocator on this layer.
+PREFILL_RING_HEAP = (1024 * 1024 * 1024,) * 4
+
 @pl.jit
 def prefill_layer_core(
     x_hc: pl.Tensor[[T, HC_MULT, D], pl.FP32],
@@ -1035,6 +1039,7 @@ if __name__ == "__main__":
         runtime_cfg=dict(
             platform=args.platform,
             enable_chip_swimlane=args.enable_chip_swimlane,
+            ring_heap=PREFILL_RING_HEAP,
         ),
         rtol=1e-3,
         atol=1e-3,

@@ -50,7 +50,7 @@ def _arg(
 
 
 _PREFILL_ARGS = (
-    _arg("hidden_states", "bf16", ("PREFILL_TOKENS", "H")),
+    _arg("input_ids", "int32", ("PREFILL_TOKENS",)),
     _arg("seq_lens", "int32", ("BATCH",)),
     _arg("chunk_lens", "int32", ("BATCH",)),
     _arg("chunk_offsets", "int32", ("BATCH",)),
@@ -73,6 +73,7 @@ _PREFILL_ARGS = (
     _arg("post_rms_weight", "fp32", ("L", "H")),
     _arg("final_norm_weight", "fp32", (1, "H")),
     _arg("lm_head_weight", "bf16", ("VOCAB", "H")),
+    _arg("embed_weight", "bf16", ("VOCAB", "H")),
     _arg("out", "fp32", ("BATCH", "VOCAB"), "out"),
 )
 
@@ -119,7 +120,7 @@ def bind_qwen3_kernel_functions(
 
 @pl.jit.host
 def qwen3_prefill_host(
-    hidden_states: pl.Tensor,
+    input_ids: pl.Tensor,
     seq_lens: pl.Tensor,
     chunk_lens: pl.Tensor,
     chunk_offsets: pl.Tensor,
@@ -142,10 +143,11 @@ def qwen3_prefill_host(
     post_rms_weight: pl.Tensor,
     final_norm_weight: pl.Tensor,
     lm_head_weight: pl.Tensor,
+    embed_weight: pl.Tensor,
     out: pl.Out[pl.Tensor],
 ) -> pl.Tensor:
     return prefill_fwd(
-        hidden_states,
+        input_ids,
         seq_lens,
         chunk_lens,
         chunk_offsets,
@@ -168,6 +170,7 @@ def qwen3_prefill_host(
         w_down,
         final_norm_weight,
         lm_head_weight,
+        embed_weight,
         out,
     )
 
@@ -246,7 +249,7 @@ def build_prefill_compile_args(model_config: Any, runtime_config: Any) -> tuple[
     total_tokens = dims["batch"] * dims["max_seq"]
     cache_rows = dims["batch"] * dims["runtime_cache_blocks"] * dims["layers"] * dims["kv_heads"] * dims["page"]
     return (
-        torch.empty((total_tokens, dims["hidden"]), dtype=torch.bfloat16),
+        torch.empty((total_tokens,), dtype=torch.int32),
         torch.empty((dims["batch"],), dtype=torch.int32),
         torch.empty((dims["batch"],), dtype=torch.int32),
         torch.empty((dims["batch"],), dtype=torch.int32),
@@ -268,6 +271,7 @@ def build_prefill_compile_args(model_config: Any, runtime_config: Any) -> tuple[
         torch.empty((dims["layers"] * dims["intermediate"], dims["hidden"]), dtype=torch.bfloat16),
         torch.empty((dims["layers"], dims["hidden"]), dtype=torch.float32),
         torch.empty((1, dims["hidden"]), dtype=torch.float32),
+        torch.empty((dims["vocab"], dims["hidden"]), dtype=torch.bfloat16),
         torch.empty((dims["vocab"], dims["hidden"]), dtype=torch.bfloat16),
         torch.empty((dims["batch"], dims["vocab"]), dtype=torch.float32),
     )
@@ -332,7 +336,7 @@ def build_prefill_runtime_args(
     """Build arguments in qwen3_prefill_host signature order."""
     weights = static.decode_weights
     return (
-        inputs.hidden,
+        inputs.token_ids,
         inputs.seq_lens,
         inputs.chunk_lens,
         inputs.chunk_offsets,
@@ -355,6 +359,7 @@ def build_prefill_runtime_args(
         weights["decode_post_rms_weight"],
         static.final_norm_weight,
         static.padded_lm_head_weight,
+        static.padded_embed_weight,
         logits,
     )
 

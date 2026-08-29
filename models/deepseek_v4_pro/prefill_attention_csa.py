@@ -16,7 +16,6 @@ contiguous run of <=T tokens.
 
 import functools
 
-import os
 
 import pypto.language as pl
 
@@ -129,13 +128,12 @@ assert S == WIN, "packed CSA prefill currently assumes one static window page"
 # PRO's wider hidden/HC dims make one prefill attention layer's per-task args and
 # intermediates overflow the runtime's default ring-2 output heap, which surfaces as
 # `orch_error_code=2 HEAP_RING_DEADLOCK`. prefill_fwd.py fixes the same thing with
-# run()'s `ring_heap=` argument, but the golden harness's run_jit() does not plumb
-# that kwarg through to execute_compiled(), so use the documented env-var fallback.
-# Format: per-ring bytes, ring0..ring3, `0` = leave at default.
-# All four rings, not just ring 2: raising ring 2 alone (what prefill_fwd.py needs)
-# still deadlocks here at both 2 GiB and 4 GiB -- measured on device.
+# run()'s `ring_heap=` argument, which only the L3 dispatch path honours. A
+# single-chip leaf has no way to apply it, so the size below records what the
+# kernel needs and is NOT applied -- the run takes the 256 MiB compile default.
+# All four rings, not just ring 2: raising ring 2 alone (what prefill_fwd.py
+# needs) still deadlocks here at both 2 GiB and 4 GiB, measured on device.
 PREFILL_ATTN_RING_HEAP = (4 * 1024 * 1024 * 1024,) * 4
-os.environ.setdefault("PTO2_RING_HEAP", ",".join(str(v) for v in PREFILL_ATTN_RING_HEAP))
 
 # Cache and state pools are allocator-managed global tensors.  Their physical
 # capacities are runtime values; request-local tables carry the actual block

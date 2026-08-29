@@ -14,18 +14,6 @@ inputs:
   model-name:
     description: Serving model guard to run (qwen3-14b or deepseek-v4).
     required: true
-  pto2-ring-dep-pool:
-    description: PTO2_RING_DEP_POOL value for pypto-serving tests.
-    required: false
-    default: "16384"
-  pto2-ring-task-window:
-    description: PTO2_RING_TASK_WINDOW value for pypto-serving tests.
-    required: false
-    default: "16384"
-  pto2-ring-heap:
-    description: PTO2_RING_HEAP value for pypto-serving tests.
-    required: false
-    default: "1073741824"
   deepseek-mtp-cases:
     description: >-
       Which DeepSeek MTP accuracy cases to run: "k1" runs the fused K=1 case
@@ -103,9 +91,6 @@ runs:
       shell: bash
       env:
         PYPTO_QWEN3_MODEL_DIR: ${{ steps.model.outputs.dir }}
-        PTO2_RING_DEP_POOL: ${{ inputs.pto2-ring-dep-pool }}
-        PTO2_RING_TASK_WINDOW: ${{ inputs.pto2-ring-task-window }}
-        PTO2_RING_HEAP: ${{ inputs.pto2-ring-heap }}
         PYPTO_LIB_CHECKOUT: ${{ inputs.pypto-lib-checkout-path }}
         PYPTO_SERVING_CHECKOUT: ${{ inputs.pypto-serving-checkout-path }}
       run: |
@@ -115,9 +100,6 @@ runs:
         run_cmd="$run_cmd && DEVICE_ID=\$TASK_DEVICE"
         run_cmd="$run_cmd PYTHONPATH=$GITHUB_WORKSPACE/$PYPTO_SERVING_CHECKOUT"
         run_cmd="$run_cmd PYPTO_QWEN3_MODEL_DIR=$PYPTO_QWEN3_MODEL_DIR"
-        run_cmd="$run_cmd PTO2_RING_DEP_POOL=$PTO2_RING_DEP_POOL"
-        run_cmd="$run_cmd PTO2_RING_TASK_WINDOW=$PTO2_RING_TASK_WINDOW"
-        run_cmd="$run_cmd PTO2_RING_HEAP=$PTO2_RING_HEAP"
         run_cmd="$run_cmd python -m pytest tests/test_qwen3_accuracy.py -q -s"
         task-submit --device "$DEVICE_ID" --timeout 3600 --max-time 1800 \
           --run "$run_cmd"
@@ -128,12 +110,9 @@ runs:
       env:
         PYPTO_DSV4_MODEL_DIR: ${{ steps.model.outputs.dir }}
         PYPTO_RUNTIME_LOG: error
-        PTO2_RING_DEP_POOL: ${{ inputs.pto2-ring-dep-pool }}
-        PTO2_RING_TASK_WINDOW: ${{ inputs.pto2-ring-task-window }}
-        PTO2_RING_HEAP: ${{ inputs.pto2-ring-heap }}
-        PTO2_OP_EXECUTE_TIMEOUT_US: 400000000
-        PTO2_STREAM_SYNC_TIMEOUT_MS: 440000
-        PTO2_SCHEDULER_TIMEOUT_MS: 320000
+        SIMPLER_OP_EXECUTE_TIMEOUT_US: 400000000
+        SIMPLER_STREAM_SYNC_TIMEOUT_MS: 440000
+        SIMPLER_SCHEDULER_TIMEOUT_MS: 320000
         SERVING_WORKER_STEP_TIMEOUT: 1800
         PYPTO_LIB_CHECKOUT: ${{ inputs.pypto-lib-checkout-path }}
         PYPTO_SERVING_CHECKOUT: ${{ inputs.pypto-serving-checkout-path }}
@@ -156,12 +135,9 @@ runs:
         run_cmd="$run_cmd PYTHONPATH=$GITHUB_WORKSPACE/$PYPTO_SERVING_CHECKOUT"
         run_cmd="$run_cmd PYPTO_DSV4_MODEL_DIR=$PYPTO_DSV4_MODEL_DIR"
         run_cmd="$run_cmd PYPTO_RUNTIME_LOG=$PYPTO_RUNTIME_LOG"
-        run_cmd="$run_cmd PTO2_RING_DEP_POOL=$PTO2_RING_DEP_POOL"
-        run_cmd="$run_cmd PTO2_RING_TASK_WINDOW=$PTO2_RING_TASK_WINDOW"
-        run_cmd="$run_cmd PTO2_RING_HEAP=$PTO2_RING_HEAP"
-        run_cmd="$run_cmd PTO2_OP_EXECUTE_TIMEOUT_US=$PTO2_OP_EXECUTE_TIMEOUT_US"
-        run_cmd="$run_cmd PTO2_STREAM_SYNC_TIMEOUT_MS=$PTO2_STREAM_SYNC_TIMEOUT_MS"
-        run_cmd="$run_cmd PTO2_SCHEDULER_TIMEOUT_MS=$PTO2_SCHEDULER_TIMEOUT_MS"
+        run_cmd="$run_cmd SIMPLER_OP_EXECUTE_TIMEOUT_US=$SIMPLER_OP_EXECUTE_TIMEOUT_US"
+        run_cmd="$run_cmd SIMPLER_STREAM_SYNC_TIMEOUT_MS=$SIMPLER_STREAM_SYNC_TIMEOUT_MS"
+        run_cmd="$run_cmd SIMPLER_SCHEDULER_TIMEOUT_MS=$SIMPLER_SCHEDULER_TIMEOUT_MS"
         run_cmd="$run_cmd SERVING_WORKER_STEP_TIMEOUT=$SERVING_WORKER_STEP_TIMEOUT"
         run_cmd="$run_cmd python -m pytest $pytest_target -q -s"
         task-submit --device auto --device-num 8 --ignore-whitelist \

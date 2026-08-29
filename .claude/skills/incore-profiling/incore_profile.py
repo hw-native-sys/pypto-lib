@@ -17,9 +17,8 @@ Typical usage:
   python .claude/skills/incore-profiling/incore_profile.py \
     --case models/qwen3_14b/decode_fwd.py --target a2a3 \
     --task-submit --task-device auto \
-    --run-env PTO2_RING_TASK_WINDOW=131072 \
-    --run-env PTO2_RING_DEP_POOL=131072 \
-    --run-env PTO2_RING_HEAP=536870912 \
+    --run-env PYPTO_RUNTIME_LOG=error \
+    --run-env SIMPLER_SCHEDULER_TIMEOUT_MS=320000 \
     -- --enable-chip-swimlane
 
 CANN, the camodel SoC, and the compile arch are auto-resolved from --target;

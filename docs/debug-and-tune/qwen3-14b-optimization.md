@@ -557,9 +557,9 @@ ring 1 the layer loop, ring 2 the token block, ring 3 the per-token attention â€
 dropped ring-3 task-window pressure ~38 % (#500).
 
 This is not a micro-optimization. Under auto-scope the 40-layer prefill
-**deadlocks** with a 507018 AICPU sync timeout, and the uniform
-`PTO2_RING_TASK_WINDOW` knob has no working value: 131072 deadlocks, 524288
-clears it but OOMs the static arena at 6.25 GB. With manual rings the same
+**deadlocks** with a 507018 AICPU sync timeout, and a uniform task window has
+no working value: 131072 deadlocks, 524288 clears it but OOMs the static arena
+at 6.25 GB. With manual rings the same
 kernel passes at 262144 / 4 GiB. See
 [Ring Heap and Scope Stats](ring-heap-and-scope-stats.md).
 

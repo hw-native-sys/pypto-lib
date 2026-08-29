@@ -255,7 +255,7 @@ not worth reverse-engineering; work from artifacts.
 
 5. **Read the simpler runtime, don't assume.** The execution model (§1) —
    persistent kernel, one-time `set_ffts_base_addr`, unified function-pointer
-   dispatch, `PTO2_SUBTASK_FLAG_SYNC_START` — is all in
+   dispatch, the subtask `BIT_SYNC_START` flag — is all in
    `src/{arch}/runtime/.../aicore/aicore_executor.cpp` and
    `.../platform/onboard/aicore/kernel.cpp`. Several dead-end hypotheses (FFTS base
    not set for externs; per-`.o` sync globals; mode-0 count descriptors) were ruled

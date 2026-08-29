@@ -9,7 +9,7 @@ model, how `pl.scope` shapes intermediate-tensor lifetime, and how
 
 Read it when a run dies with `HEAP_RING_DEADLOCK`, when a longer sequence
 length or a bigger EP degree stops fitting, or before changing
-`PTO2_RING_HEAP` on a kernel whose peaks nobody has measured.
+`ring_heap` on a kernel whose peaks nobody has measured.
 
 ---
 
@@ -17,7 +17,7 @@ length or a bigger EP degree stops fitting, or before changing
 
 The T&R runtime (`tensormap_and_ringbuffer`, the default for every platform
 this repo targets) does not keep one global pool. It keeps
-`PTO2_MAX_RING_DEPTH = 4` independent **ring sets**, and the scope nesting
+`CHIP_MAX_RING_DEPTH = 4` independent **ring sets**, and the scope nesting
 depth at submit time selects which one a task uses:
 
 ```text
@@ -28,25 +28,27 @@ scope depth >=3 ->  ring 3 = { ... }        # clamped: everything deeper folds i
 ```
 
 Depth 0 is the root scope the executor wraps around
-`aicpu_orchestration_entry`; the first `PTO2_SCOPE` in generated
+`aicpu_orchestration_entry`; the first runtime scope in generated
 orchestration code is depth 1. Each ring reclaims on its own watermark
 (`last_task_alive`), which is the whole point of the split: an inner
 scope's tasks can be reclaimed without waiting for the outer scope's tasks
 to finish.
 
-| Per-ring resource | Compile default (a2a3, **per ring**) | Env override |
+| Per-ring resource | Compile default (a2a3, **per ring**) | Per-task override |
 |---|---|---|
-| Task window (task slots) | 16384 | `PTO2_RING_TASK_WINDOW` |
-| Heap (bytes for task outputs / intermediates) | 256 MiB | `PTO2_RING_HEAP` |
-| Dep-list pool (fanin spill entries) | 16384 | `PTO2_RING_DEP_POOL` |
+| Task window (task slots) | 16384 | `RunConfig.ring_task_window` |
+| Heap (bytes for task outputs / intermediates) | 256 MiB | `RunConfig.ring_heap` |
+| Dep-list pool (fanin spill entries) | 16384 | `RunConfig.ring_dep_pool` |
 
 The tensormap is **not** per ring — it is one global table (65536 entries by
 default) and appears as a single row in every report.
 
-> A run rarely uses the compile defaults: CI pins its own `PTO2_RING_*`
-> values, several model entries set them at import time, and shared dev hosts
-> often export them globally. Never assume — read the effective capacities off
-> the `scope_stats` metadata line (§5).
+> Sizing is **per task**, not per process — there is no environment variable
+> for it. An L3 run takes the compile defaults unless its entry passes
+> `RunConfig` fields; a single-chip run takes the compile defaults whatever it
+> passes, because that dispatch path never applies the overrides (§4). Never
+> assume — read the effective capacities off the `scope_stats` metadata line
+> (§5).
 
 Upstream reference: simpler's
 [`MULTI_RING.md`](https://github.com/hw-native-sys/simpler/blob/main/src/a2a3/runtime/tensormap_and_ringbuffer/docs/MULTI_RING.md)
@@ -74,7 +76,7 @@ That block is released when the owning task reaches `CONSUMED`, which needs
 
 1. every consumer task has completed (fanout refcount drained), **and**
 2. the scope that submitted it has **closed** (the scope holds its own
-   reference, `PTO2_FANOUT_SCOPE_BIT`, released at scope exit).
+   reference, `FANOUT_SCOPE_BIT`, released at scope exit).
 
 Reclaim is then strictly **FIFO per ring**: `heap_tail` follows
 `last_task_alive`, so the oldest live allocation pins everything allocated
@@ -147,36 +149,45 @@ callees (`moe`, `attention_swa`) adding the deeper levels themselves.
 ## 4. Sizing the rings
 
 When the peaks are genuinely needed — a big cross-phase payload, a long
-prefill — size the rings explicitly. Both knobs take either a scalar
-(broadcast to all four rings) or four per-ring values, and `0` means "fall
-through to the next tier".
+prefill — size the rings explicitly. Each knob takes either a scalar
+(broadcast to all four rings) or four per-ring values, where `0` means "leave
+this ring at the compile default". Precedence is just two tiers now:
+`RunConfig` field > compile default.
 
-Precedence: `RunConfig` field > per-ring env > scalar env > compile default.
+**This works on the L3 (distributed) path only.** golden's `run_jit` forwards
+whatever `runtime_cfg` keys are `RunConfig` fields to the per-rank dispatch,
+which builds a `CallConfig` and transcribes the ring sizes into
+`runtime_env`:
 
 ```python
-# L3 (distributed) entries: RunConfig fields, forwarded by golden's run_jit.
+# L3 (distributed) entries — the only path where ring sizing takes effect.
 PREFILL_RING_HEAP = (0, 0, 2 * 1024 * 1024 * 1024, 0)   # ring 2 only
 runtime_cfg=dict(platform=args.platform, ring_heap=PREFILL_RING_HEAP)
 ```
 
-```python
-# L2 (single-chip) entries: execute_compiled has no ring_* kwarg, so a
-# runtime_cfg["ring_heap"] raises TypeError. Use the env fallback instead.
-os.environ.setdefault("PTO2_RING_HEAP", ",".join(str(v) for v in RING_HEAP))
-```
+Live examples: [`models/deepseek_v4_pro/prefill_fwd.py`](../../models/deepseek_v4_pro/prefill_fwd.py),
+[`models/deepseek_v4_flash_mtp/prefill_layer.py`](../../models/deepseek_v4_flash_mtp/prefill_layer.py)
+(per-ring tuple), [`models/deepseek_v4_flash_dspark/decode_layer.py`](../../models/deepseek_v4_flash_dspark/decode_layer.py)
+(scalar, broadcast to all four rings).
 
-```bash
-# Or from the command line, per ring 0..3:
-PTO2_RING_HEAP=134217728,268435456,402653184,536870912 python <kernel>.py -p a2a3 -d 0
-```
+### The single-chip path has no working knob
 
-Live examples: [`models/deepseek_v4_pro/prefill_fwd.py`](../../models/deepseek_v4_pro/prefill_fwd.py)
-(`ring_heap=` on the L3 path), [`models/deepseek_v4_pro/prefill_attention_csa.py`](../../models/deepseek_v4_pro/prefill_attention_csa.py)
-(env fallback, all four rings), [`models/deepseek_v4_flash_dspark/lm_head.py`](../../models/deepseek_v4_flash_dspark/lm_head.py)
-(scalar `setdefault`).
+An L2 (single-chip) entry cannot size its rings today, whichever way it is
+dispatched:
 
-`os.environ.setdefault` at import time is the repo idiom: it documents the
-kernel's requirement without overriding an explicit shell pin.
+- Through golden's `run_jit`, the single-chip path calls
+  `execute_compiled(work_dir, args, ...)`, which has no ring parameters — a
+  `runtime_cfg["ring_heap"]` raises `TypeError`.
+- Through `CompiledProgram.__call__(*args, config=RunConfig(ring_heap=...))`,
+  the field is accepted and validated and then **silently dropped**:
+  `_invoke_compiled` forwards only `platform`, `device_id`, `dfx` and
+  `aicpu_thread_num` to the same `execute_compiled`.
+
+Until the dispatch path forwards the fields, an L2 kernel that outgrows a ring
+has to be fixed on the kernel side: cut the peak with a `pl.scope` (§3),
+shrink the intermediates, or split the scope. A few leaves carry a
+`*_RING_HEAP` constant recording what they would need; it is documentation,
+not configuration.
 
 ---
 
@@ -217,7 +228,7 @@ It works on both the L2 and L3 paths, and it needs an actual execution —
 Line 1 is run metadata — schema `version`, `fatal`, `dropped`, and the
 **effective capacities** `task_window_max` / `heap_max` / `dep_pool_max`
 (arrays indexed by ring) and `tensormap_max`. This line is the fastest way
-to confirm a `PTO2_RING_*` pin actually took effect. Every later line is one
+to confirm a ring override actually took effect. Every later line is one
 `begin` or `end` sample carrying `site` (`<orchestration>.cpp:<line>`),
 `depth`, `ring`, and the head/tail pairs. Heap counters are monotonic
 cumulative bytes in `version` 6 (they wrapped in version 5).
@@ -296,10 +307,10 @@ at `scope_stats`:
 
 | `orch_error_code` | Name | What it means | First move |
 |---|---|---|---|
-| 1 | `SCOPE_DEADLOCK` | one scope submitted more tasks than the ring's task window; slots only free at `scope_end` | split the scope, or raise `PTO2_RING_TASK_WINDOW` |
-| 2 | `HEAP_RING_DEADLOCK` | the ring ran out of heap bytes (and slots) — no further task can be admitted | scope the intermediates, shrink them, or raise `PTO2_RING_HEAP` |
+| 1 | `SCOPE_DEADLOCK` | one scope submitted more tasks than the ring's task window; slots only free at `scope_end` | split the scope, or raise `ring_task_window` |
+| 2 | `HEAP_RING_DEADLOCK` | the ring ran out of heap bytes (and slots) — no further task can be admitted | scope the intermediates, shrink them, or raise `ring_heap` |
 | 3 | `FLOW_CONTROL_DEADLOCK` | task window blocked while heap is free — usually nesting on the *same* ring | move the nested submission to another ring |
-| 4 | `DEP_POOL_OVERFLOW` | a task's fanin edges overflowed the ring's dep pool | cut the fanin, or raise `PTO2_RING_DEP_POOL` |
+| 4 | `DEP_POOL_OVERFLOW` | a task's fanin edges overflowed the ring's dep pool | cut the fanin, or raise `ring_dep_pool` |
 | 11 | `TENSORMAP_OVERFLOW` | the global tensormap wedged | extreme scale — check the tensormap row in the report |
 
 Oversizing has its own failure: the static arena scales with every ring's

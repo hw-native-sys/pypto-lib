@@ -10,8 +10,10 @@
 from __future__ import annotations
 
 import ast
+import importlib.util
 import inspect
 import re
+import sys
 from collections import Counter
 from pathlib import Path
 from types import SimpleNamespace
@@ -22,7 +24,68 @@ import torch
 from contract.registry import find_contract_for_model_config, get_contract
 
 
+def _has_real_pypto() -> bool:
+    """True only for a real install — conftest stands in a stub when absent."""
+    module = sys.modules.get("pypto")
+    if module is not None:
+        return not getattr(module, "__pypto_stub__", False)
+    return importlib.util.find_spec("pypto") is not None
+
+
+HAS_PYPTO = _has_real_pypto()
+
 _REPO_ROOT = Path(__file__).resolve().parents[2]
+_QWEN3_DIR = _REPO_ROOT / "models" / "qwen3_14b"
+
+# Each serving stage: the module holding its kernel, and the kernel's name.
+_STAGE_KERNELS = {
+    "prefill": ("prefill_fwd", "prefill_fwd"),
+    "decode": ("decode_fwd", "decode_fwd"),
+    "greedy_sample": ("greedy_sample", "greedy_sample_fwd"),
+}
+
+# Per-stage host-parameter renames. decode_fwd distinguishes its two sampled-id
+# buffers by direction; the serving ABI calls the output half "sampled_ids".
+_HOST_TO_KERNEL_NAME = {"decode": {"sampled_ids": "sampled_ids_out"}}
+
+
+def _function_def(source_path: Path, name: str) -> ast.FunctionDef:
+    tree = ast.parse(source_path.read_text())
+    return next(
+        node
+        for node in ast.walk(tree)
+        if isinstance(node, ast.FunctionDef) and node.name == name
+    )
+
+
+def _kernel_params(stage: str) -> tuple[str, ...]:
+    """Parameter names of a stage's kernel, read from source (no pypto)."""
+    module_stem, func_name = _STAGE_KERNELS[stage]
+    func = _function_def(_QWEN3_DIR / f"{module_stem}.py", func_name)
+    return tuple(arg.arg for arg in func.args.args)
+
+
+def _host_params(contract: object, stage: str) -> tuple[str, ...]:
+    """Parameter names of a stage's ``@pl.jit.host`` serving wrapper."""
+    host_fn = contract.kernels[stage].host_jit_fn
+    return tuple(inspect.signature(getattr(host_fn, "_func", host_fn)).parameters)
+
+
+def _host_call_args(stage: str) -> tuple[str, ...]:
+    """Names the host wrapper forwards to its kernel, in call order."""
+    _module_stem, func_name = _STAGE_KERNELS[stage]
+    wrapper = _function_def(_QWEN3_DIR / "contract.py", f"qwen3_{stage}_host")
+    call = next(
+        node
+        for node in ast.walk(wrapper)
+        if isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Name)
+        and node.func.id == func_name
+    )
+    assert all(isinstance(arg, ast.Name) for arg in call.args), (
+        f"qwen3_{stage}_host must forward bare parameter names to {func_name}"
+    )
+    return tuple(arg.id for arg in call.args)
 
 
 def _tiny_model_config() -> SimpleNamespace:
@@ -99,6 +162,7 @@ def test_registry_matches_qwen3_14b_model_config_with_null_architectures() -> No
     assert contract.model.variant == "14b"
 
 
+@pytest.mark.skipif(not HAS_PYPTO, reason="load_kernels() imports the pypto kernels")
 def test_loaded_kernel_modules_match_current_qwen3_files() -> None:
     contract = get_contract("qwen3", "14b")
     loaded = contract.load_kernels()
@@ -110,14 +174,34 @@ def test_loaded_kernel_modules_match_current_qwen3_files() -> None:
     contract.validate_kernels(contract, loaded, model)
 
 
-def test_loaded_kernel_signatures_match_contract_arg_counts() -> None:
+def test_contract_host_and_kernel_signatures_agree() -> None:
+    """Pin contract args -> host wrapper -> kernel, without loading pypto.
+
+    Three edges, because each has drifted on its own: the declared args are the
+    serving ABI, the wrapper is what serving compiles, and the kernel is what
+    actually runs. The wrapper reorders between the last two — it exists partly
+    to — so that edge is pinned through the forwarding call rather than the
+    wrapper's own signature.
+    """
     contract = get_contract("qwen3", "14b")
-    loaded = contract.load_kernels()
 
     for stage_name, stage in contract.kernels.items():
-        kernel_fn = loaded.functions[f"{stage_name}_fwd"]
-        kernel_params = tuple(inspect.signature(kernel_fn._func).parameters)
-        assert len(kernel_params) == len(stage.args)
+        declared = tuple(arg.name for arg in stage.args)
+        host_params = _host_params(contract, stage_name)
+        assert declared == host_params, f"{stage_name}: declared args vs host wrapper"
+
+        forwarded = _host_call_args(stage_name)
+        assert Counter(forwarded) == Counter(host_params), (
+            f"{stage_name}: host wrapper must forward each parameter exactly once"
+        )
+
+        # Positional, so forwarded[i] binds kernel_params[i]: comparing the
+        # names as tuples catches a swapped pair, which a multiset would not.
+        renames = _HOST_TO_KERNEL_NAME.get(stage_name, {})
+        expected = tuple(renames.get(name, name) for name in forwarded)
+        assert expected == _kernel_params(stage_name), (
+            f"{stage_name}: host wrapper forwarding vs kernel signature"
+        )
 
 
 def test_fused_attention_declares_real_output_first() -> None:
@@ -192,7 +276,6 @@ def test_fused_attention_uses_standalone_rope_worker_count() -> None:
 
 def test_compile_arg_builders_follow_loaded_stage_specs() -> None:
     contract = get_contract("qwen3", "14b")
-    loaded = contract.load_kernels()
     model_config = _tiny_model_config()
     runtime_config = _runtime_config()
 
@@ -201,20 +284,20 @@ def test_compile_arg_builders_follow_loaded_stage_specs() -> None:
     greedy_args = contract.kernels["greedy_sample"].compile_args_builder(model_config, runtime_config)
 
     assert len(prefill_args) == len(contract.kernels["prefill"].args)
-    assert len(prefill_args) == len(inspect.signature(loaded.functions["prefill_fwd"]._func).parameters)
-    assert prefill_args[0].shape == (32, 8)
+    assert len(prefill_args) == len(_kernel_params("prefill"))
+    assert prefill_args[0].shape == (32,)
     assert prefill_args[-1].shape == (16, 512)
     assert prefill_args[-1].dtype == torch.float32
 
     assert len(decode_args) == len(contract.kernels["decode"].args)
-    assert len(decode_args) == len(inspect.signature(loaded.functions["decode_fwd"]._func).parameters)
+    assert len(decode_args) == len(_kernel_params("decode"))
     assert decode_args[0].shape == (2, 8)
     assert decode_args[-3].shape == (16, 8)
     assert decode_args[-2].shape == (16, 8)
     assert decode_args[-1].shape == (16, 8)
 
     assert [tuple(arg.shape) for arg in greedy_args] == [(16, 512), (16, 8)]
-    assert len(greedy_args) == len(inspect.signature(loaded.functions["greedy_sample_fwd"]._func).parameters)
+    assert len(greedy_args) == len(_kernel_params("greedy_sample"))
 
 
 def _rope_qkv_function_body() -> str:
@@ -397,7 +480,7 @@ def test_runtime_arg_builders_follow_host_order() -> None:
         padded_embed_weight="embed",
     )
     prefill_inputs = SimpleNamespace(
-        hidden="hidden",
+        token_ids="token_ids",
         seq_lens="seq_lens",
         chunk_lens="chunk_lens",
         chunk_offsets="chunk_offsets",
@@ -428,8 +511,8 @@ def test_runtime_arg_builders_follow_host_order() -> None:
         next_hidden_buffer="next_hidden",
     )
 
-    assert prefill_args[:6] == ("hidden", "seq_lens", "chunk_lens", "chunk_offsets", "input_rms_weight", "wq")
-    assert prefill_args[-4:] == ("post_rms_weight", "final_norm_weight", "lm_head", "logits")
+    assert prefill_args[:6] == ("token_ids", "seq_lens", "chunk_lens", "chunk_offsets", "input_rms_weight", "wq")
+    assert prefill_args[-5:] == ("post_rms_weight", "final_norm_weight", "lm_head", "embed", "logits")
     assert decode_args[:4] == ("input_rms_weight", "wq", "wk", "wv")
     assert decode_args[-5:] == ("logits", "embed", "token_ids", "sampled_ids", "next_hidden")
 

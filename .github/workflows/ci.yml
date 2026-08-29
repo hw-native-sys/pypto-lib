@@ -48,10 +48,8 @@ jobs:
           pip install pytest
           pip install torch --index-url https://download.pytorch.org/whl/cpu
 
-      - name: Run golden and DeepSeek contract tests
-        run: >-
-          pytest tests/golden tests/contract/test_deepseek_v4_pro_*.py
-          tests/contract/test_deepseek_v4_flash_serving_contract.py -v
+      - name: Run unit tests
+        run: pytest tests -v
 
   detect-changes:
     runs-on: ubuntu-latest
@@ -191,9 +189,6 @@ jobs:
         shell: bash
         env:
           PYTHONPATH: ${{ github.workspace }}/checkout
-          PTO2_RING_DEP_POOL: 16384
-          PTO2_RING_TASK_WINDOW: 16384
-          PTO2_RING_HEAP: 1073741824
         run: |
           source activate.sh
           set +e
@@ -290,10 +285,6 @@ jobs:
 
       - name: Run a2a3 tests (via task-submit)
         shell: bash
-        env:
-          PTO2_RING_DEP_POOL: 16384
-          PTO2_RING_TASK_WINDOW: 16384
-          PTO2_RING_HEAP: 1073741824
         run: |
           source activate.sh
           set +e
@@ -312,9 +303,9 @@ jobs:
             # Files needing multiple NPUs declare `# ci: devices=N` (N>1) near
             # the top; borrow that many cards with `--device-num N` (defaults to
             # ep2 / 2-card runs). $TASK_DEVICE is the lent set (a single id, or
-            # comma-separated for N>1) and is passed straight to -d; the ring env
-            # above is preserved into the child. Higher world sizes (ep4/ep8) are
-            # exercised as explicit --device-num 4/8 steps in daily_ci.yml.
+            # comma-separated for N>1) and is passed straight to -d. Higher
+            # world sizes (ep4/ep8) are exercised as explicit --device-num 4/8
+            # steps in daily_ci.yml.
             ndev=$(grep -oP '#\s*ci:\s*devices=\K[0-9]+' "$f" | head -1)
             ndev=${ndev:-1}
             devnum_flag=""
@@ -407,8 +398,8 @@ jobs:
   serving-deepseek:
     needs: detect-changes
     # PR-only, DeepSeek V4 — the 8-card (--device-num 8) serving run, split out
-    # of `serving` so the 8-card borrow schedules independently of the single-card
-    # qwen3 run. Same setup contract as `serving`; gated by its own model guard.
+    # of `serving-qwen` so the 8-card borrow schedules independently of the
+    # single-card run. Same setup contract; gated by its own model guard.
     if: >-
       github.event_name == 'pull_request' &&
       needs.detect-changes.outputs.run_deepseek_serving_tests == 'true'
@@ -456,9 +447,6 @@ jobs:
           # Only the fused K=1 case runs on device: the k3-s4-b4 case starts a
           # second 8-card server for the same gate.
           deepseek-mtp-cases: k1
-          pto2-ring-dep-pool: "131072"
-          pto2-ring-task-window: "131072"
-          pto2-ring-heap: "2147483648"
 
       - name: Kill orphaned task-submit tasks
         if: always()

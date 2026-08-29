@@ -661,7 +661,8 @@ shape: a `pl.pipeline` matmul reduction, then the vector epilogue, then
 
 ## 8. Runtime Scopes: `pl.scope`
 
-A **runtime scope** (`PTO2_SCOPE`) is an orchestration-level region that
+A **runtime scope** (`scope_begin` / `scope_end` in generated orchestration)
+is an orchestration-level region that
 bounds two things at once: automatic dependency tracking, and the heap ring
 that the intermediates submitted inside it are allocated from. The runtime
 wraps an implicit top-level scope around every program, so writing scopes is

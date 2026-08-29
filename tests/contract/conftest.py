@@ -13,7 +13,14 @@ The per-model contract tests import model sources (``models.*``) and the
 ``contract`` package as plain modules; ``models/`` has no ``__init__.py``, so
 a standalone ``pytest tests/contract/...`` run needs the repo root on the
 path (a combined run previously borrowed tests/golden/conftest.py's insert).
-Nothing here needs pypto.
+
+Nothing here needs a working pypto. ``models/qwen3_14b/contract.py`` is the
+only contract module that imports ``pypto.language``, and it touches one
+symbol at import time: the ``@pl.jit.host`` decorator on its three serving
+wrappers — its ``from __future__ import annotations`` keeps every
+``pl.Tensor`` / ``pl.Out[...]`` annotation an unevaluated string. When pypto
+is absent, tests/conftest.py stands in a stub carrying that decorator. Tests
+that need real kernel objects guard on ``HAS_PYPTO``.
 """
 
 import sys

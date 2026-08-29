@@ -12,7 +12,6 @@
 lowered through ``cmp_block_table``; ``-1`` is invalid in both.
 """
 
-import os
 
 import pypto.language as pl
 
@@ -38,13 +37,9 @@ MAX_SEQ_LEN = M.max_position_embeddings
 # Sparse attention's internal physical-row geometry and runtime workspace.
 PREFILL_DENSE_TILE = 512
 PREFILL_QUERY_TILE = 128
+# Records what this kernel needs, NOT what it gets: a single-chip leaf has no
+# ring knob, so the run takes the 256 MiB compile default.
 PREFILL_RING_HEAP = (1024 * 1024 * 1024,) * 4
-
-# The pinned single-chip golden runner does not yet forward ``ring_heap`` to
-# ``execute_compiled``. Use the runtime's documented environment fallback,
-# as the existing DeepSeek-V4 PRO prefill leaves do. ``setdefault`` preserves
-# an explicit deployment or test override.
-os.environ.setdefault("PTO2_RING_HEAP", ",".join(str(v) for v in PREFILL_RING_HEAP))
 
 # Dynamic shape variables.
 T_DYN = pl.dynamic("PREFILL_ATTN_T_DYN")

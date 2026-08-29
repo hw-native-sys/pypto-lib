@@ -727,3 +727,22 @@ runs:
         python -m venv "$PTOAS_ROOT" --system-site-packages
         "$PTOAS_ROOT/bin/python" -m pip install "$CACHE_WHEEL"
         "$PTOAS_ROOT/bin/ptoas" --version
+
+    - name: Report toolchain versions
+      # One grep-able block naming every component a failure has to be
+      # reproduced against. simpler has no version of its own — it is pypto's
+      # runtime/ gitlink, and reads as a detached HEAD — so resolve it here
+      # rather than leaving the log with only the pypto sha it hides behind.
+      shell: bash
+      env:
+        CHECKOUT_PATH: ${{ inputs.checkout-path }}
+      run: |
+        short() { git -C "$1" rev-parse --short HEAD 2>/dev/null || echo unknown; }
+        echo "::group::Toolchain versions"
+        echo "pypto-lib  $(short "$GITHUB_WORKSPACE/$CHECKOUT_PATH")"
+        echo "pypto      $(short "$PYPTO_SRC")"
+        echo "simpler    $(short "$PYPTO_SRC/runtime") (detached)"
+        echo "ptoas      ${PTOAS_VERSION:-unknown} ($PTOAS_ARCH)"
+        echo "pto-isa    ${PTO_ISA_COMMIT:0:8} (detached)"
+        echo "CANN       $(basename "${CANN_ROOT:-unknown}")"
+        echo "::endgroup::"

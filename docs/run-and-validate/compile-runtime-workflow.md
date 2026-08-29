@@ -69,8 +69,10 @@ Multi-card kernels use HCCL, which silent-crashes inside docker. For this
 reason the real-NPU job runs **on the host (no container)**. The shared
 `setup-ci-job` action writes an activation script that enters the Python
 environment and sources CANN's `set_env.sh`; each `task-submit` child sources
-that script. The workflow also preserves its `PTO2_RING_*` settings into the
-child. Running a multi-card kernel locally needs the same kind of real-device
+that script, so the child inherits the job's environment. Ring sizing is not
+part of it — it is per task now, see
+[Ring Heap and Scope Stats](../debug-and-tune/ring-heap-and-scope-stats.md).
+Running a multi-card kernel locally needs the same kind of real-device
 shell, e.g.
 `python models/deepseek_v4_flash_mtp/moe.py -p a2a3 --ep 2 -d 0,1`.
 
@@ -128,7 +130,7 @@ and emits files in three streams:
   pypto's IR→MLIR or from ptoas).
 - **Orchestration → C++.** `generate_orchestration` emits one
   `orchestration/<orch_name>.cpp` that drives the kernels through the
-  PTO2 runtime API (task graph build, scheduling, dependencies).
+  simpler runtime API (task graph build, scheduling, dependencies).
 - **Config → `kernel_config.py`.** Records each kernel's name, runtime
   ID, and core type (cube / vector) for the runtime to load.
 
@@ -242,7 +244,7 @@ PYPTO_GOLDEN_NUM_THREADS=8 \
 
 ### 4. Runtime (simpler)
 
-Driven by the **simpler** repo (PTO2 runtime). For a single-chip build, the
+Driven by the **simpler** repo. For a single-chip build, the
 harness orders the arguments according to `specs` and calls
 `pypto.runtime.execute_compiled`. For an L3
 `DistributedCompiledProgram`, it instead dispatches the compiled object with a

@@ -2,7 +2,7 @@ name: Daily CI
 
 on:
   schedule:
-    - cron: '0 21 * * *'  # UTC 21:00 = Shanghai 05:00
+    - cron: '51 20 * * *'  # UTC 20:51 = Shanghai 04:51
   workflow_dispatch:
 
 # Every job only reads the repo (checkouts use persist-credentials: false, the
@@ -66,9 +66,6 @@ jobs:
         shell: bash
         env:
           PYTHONPATH: ${{ github.workspace }}/checkout
-          PTO2_RING_DEP_POOL: 16384
-          PTO2_RING_TASK_WINDOW: 16384
-          PTO2_RING_HEAP: 1073741824
           PYPTO_LOG_LEVEL: error
           PYPTO_WARNING_LEVEL: none
           # Quiet simpler's runtime logger. On a SIMPLER_PROFILING build every
@@ -208,9 +205,6 @@ jobs:
           # benchmark's own fd-captured loop). benchmark() still reads timing.
           PYPTO_RUNTIME_LOG: error
           PYPTO_BENCH: '1'
-          PTO2_RING_DEP_POOL: 16384
-          PTO2_RING_TASK_WINDOW: 16384
-          PTO2_RING_HEAP: 1073741824
         run: |
           source activate.sh
           set +e
@@ -232,8 +226,7 @@ jobs:
             # the top; borrow that many cards with `--device-num N` (defaults to
             # ep2 / 2-card runs). $TASK_DEVICE is the lent set (a single id, or
             # comma-separated for N>1) and is passed straight to -d. The child's
-            # stdout is captured (not streamed) so the perf line can be parsed;
-            # the ring env above is preserved into the child.
+            # stdout is captured (not streamed) so the perf line can be parsed.
             local ndev devnum_flag out rc perf
             ndev=$(grep -oP '#\s*ci:\s*devices=\K[0-9]+' "$file" | head -1)
             ndev=${ndev:-1}
@@ -398,9 +391,6 @@ jobs:
           # Quiet simpler's runtime logger — see the sim job for the full note.
           PYPTO_RUNTIME_LOG: error
           PYPTO_BENCH: '1'
-          PTO2_RING_DEP_POOL: 16384
-          PTO2_RING_TASK_WINDOW: 16384
-          PTO2_RING_HEAP: 1073741824
         run: |
           source activate.sh
           set +e
@@ -661,9 +651,6 @@ jobs:
           PYPTO_LOG_LEVEL: error
           PYPTO_WARNING_LEVEL: none
           PYPTO_RUNTIME_LOG: error
-          PTO2_RING_DEP_POOL: 16384
-          PTO2_RING_TASK_WINDOW: 16384
-          PTO2_RING_HEAP: 1073741824
           CKPT: ${{ steps.weights.outputs.ckpt }}
           WEIGHTS: ${{ steps.weights.outputs.weights }}
         run: |
