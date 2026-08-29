@@ -69,8 +69,8 @@ def hc_post(
     return y
 
 
-# PyPTO emits one specialization per inline function identity. Decode attention
-# and fixed-capacity MoE therefore keep separate HC function identities.
+# Keep this body identical to hc_post. A wrapper would retain hc_post's PyPTO identity
+# and share one specialization between dynamic decode attention and fixed-capacity MoE.
 @pl.jit.inline
 def hc_post_decode_attention(
     x: pl.Tensor[[T_DYN, D], pl.BF16],

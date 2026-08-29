@@ -64,7 +64,8 @@ def decode_cp_token_allgather_step(
     group_base: pl.Scalar[pl.INT32],
     tp_rank: pl.Scalar[pl.INT32],
 ):
-    """Gather rank-major rows and retire the two-phase signal epoch."""
+    """Gather equal physical row extents in rank-major order and retire the signal epoch."""
+    # All TP ranks pass equal physical row extents; callers pad uneven active rows.
     local_rows = pl.tensor.dim(hidden_local, 0)
     local_t = pl.cast(local_rows, pl.INT32)
     target_row = tp_rank * local_t

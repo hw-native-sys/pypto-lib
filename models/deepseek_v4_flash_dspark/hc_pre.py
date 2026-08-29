@@ -287,8 +287,8 @@ def hc_pre(
 
 
 
-# PyPTO emits one specialization per inline function identity. Decode attention
-# and fixed-capacity MoE therefore keep separate HC function identities.
+# Keep this body identical to hc_pre. A wrapper would retain hc_pre's PyPTO identity
+# and share one specialization between dynamic decode attention and fixed-capacity MoE.
 @pl.jit.inline
 def hc_pre_decode_attention(
     x: pl.Tensor[[T_DYN, HC_MULT, D], pl.FP32],

@@ -59,7 +59,7 @@ import pypto.language as pl
 import pypto.language.distributed as pld
 from decode_csa import decode_csa, decode_csa_tp1
 from decode_hca import decode_hca, decode_hca_tp1
-from decode_swa import decode_swa, decode_swa_tp1
+from decode_swa import decode_swa_attention
 from hc_head import hc_head
 from lm_head import (
     GROUP_LOGIT_ROWS,
@@ -179,116 +179,6 @@ def _validate_import_contract():
 
 
 _validate_import_contract()
-
-
-# Import-time adapter exposes one SWA ABI to the PyPTO specializer.
-if TP_SIZE == 1:
-
-    @pl.jit.inline(auto_scope=False)
-    def _decode_swa_attention(
-        x_hc: pl.Tensor[[T_DYN, HC_MULT, D], pl.FP32],
-        hc_attn_fn: pl.Tensor[[MIX_HC, HC_DIM], pl.FP32],
-        hc_attn_scale: pl.Tensor[[3], pl.FP32],
-        hc_attn_base: pl.Tensor[[MIX_HC], pl.FP32],
-        attn_norm_w: pl.Tensor[[D], pl.BF16],
-        wq_a: pl.Tensor[[D, Q_LORA], pl.BF16],
-        wq_b: pl.Tensor[[Q_LORA, H * HEAD_DIM], pl.INT8],
-        wq_b_scale: pl.Tensor[[H * HEAD_DIM], pl.FP32],
-        wkv: pl.Tensor[[D, HEAD_DIM], pl.BF16],
-        gamma_cq: pl.Tensor[[Q_LORA], pl.BF16],
-        gamma_ckv: pl.Tensor[[HEAD_DIM], pl.BF16],
-        freqs_cos: pl.Tensor[[T_DYN, ROPE_HEAD_DIM], pl.BF16],
-        freqs_sin: pl.Tensor[[T_DYN, ROPE_HEAD_DIM], pl.BF16],
-        kv_freqs_cos: pl.Tensor[[CP_T_DYN, ROPE_HEAD_DIM], pl.BF16],
-        kv_freqs_sin: pl.Tensor[[CP_T_DYN, ROPE_HEAD_DIM], pl.BF16],
-        kv_cache: pl.Tensor[[swa.ORI_BLOCK_NUM_DYN, BLOCK_SIZE, 1, HEAD_DIM], pl.BF16],
-        swa_slot_mapping: pl.Tensor[[CP_T_DYN], pl.INT64],
-        swa_indices: pl.Tensor[[T_DYN, WIN], pl.INT32],
-        swa_lens: pl.Tensor[[T_DYN], pl.INT32],
-        position_ids: pl.Tensor[[T_DYN], pl.INT32],
-        attn_sink: pl.Tensor[[H], pl.FP32],
-        wo_a: pl.Tensor[[LOCAL_O_GROUPS, O_LORA, O_GROUP_IN], pl.BF16],
-        wo_b: pl.Tensor[[D, LOCAL_O_WIDTH], pl.INT8],
-        wo_b_scale: pl.Tensor[[D], pl.FP32],
-        x_out: pl.Tensor[[T_DYN, HC_MULT, D], pl.FP32],
-        gather_window: pld.DistributedTensor[[DECODE_GROUP_CAP, D], pl.BF16],
-        gather_signal: pld.DistributedTensor[[TP_SIZE, 1], pl.INT32],
-        attention_window: pld.DistributedTensor[[ATTENTION_WINDOW_ROWS, O_GROUP_IN], pl.BF16],
-        attention_signal: pld.DistributedTensor[[TP_SIZE, 1], pl.INT32],
-        o_window: pld.DistributedTensor[[O_WINDOW_ROWS, D], pl.BF16],
-        o_signal: pld.DistributedTensor[[TP_SIZE, 1], pl.INT32],
-        group_base: pl.Scalar[pl.INT32],
-        tp_rank: pl.Scalar[pl.INT32],
-        local_t: pl.Scalar[pl.INT32],
-    ):
-        decode_swa_tp1(
-            x_hc,
-            hc_attn_fn, hc_attn_scale, hc_attn_base,
-            attn_norm_w, wq_a, wq_b, wq_b_scale, wkv,
-            gamma_cq, gamma_ckv,
-            freqs_cos, freqs_sin,
-            kv_cache, swa_slot_mapping, swa_indices, swa_lens,
-            position_ids, attn_sink,
-            wo_a, wo_b, wo_b_scale,
-            x_out,
-        )
-        return x_out
-
-else:
-
-    @pl.jit.inline(auto_scope=False)
-    def _decode_swa_attention(
-        x_hc: pl.Tensor[[T_DYN, HC_MULT, D], pl.FP32],
-        hc_attn_fn: pl.Tensor[[MIX_HC, HC_DIM], pl.FP32],
-        hc_attn_scale: pl.Tensor[[3], pl.FP32],
-        hc_attn_base: pl.Tensor[[MIX_HC], pl.FP32],
-        attn_norm_w: pl.Tensor[[D], pl.BF16],
-        wq_a: pl.Tensor[[D, Q_LORA], pl.BF16],
-        wq_b: pl.Tensor[[Q_LORA, H * HEAD_DIM], pl.INT8],
-        wq_b_scale: pl.Tensor[[H * HEAD_DIM], pl.FP32],
-        wkv: pl.Tensor[[D, HEAD_DIM], pl.BF16],
-        gamma_cq: pl.Tensor[[Q_LORA], pl.BF16],
-        gamma_ckv: pl.Tensor[[HEAD_DIM], pl.BF16],
-        freqs_cos: pl.Tensor[[T_DYN, ROPE_HEAD_DIM], pl.BF16],
-        freqs_sin: pl.Tensor[[T_DYN, ROPE_HEAD_DIM], pl.BF16],
-        kv_freqs_cos: pl.Tensor[[CP_T_DYN, ROPE_HEAD_DIM], pl.BF16],
-        kv_freqs_sin: pl.Tensor[[CP_T_DYN, ROPE_HEAD_DIM], pl.BF16],
-        kv_cache: pl.Tensor[[swa.ORI_BLOCK_NUM_DYN, BLOCK_SIZE, 1, HEAD_DIM], pl.BF16],
-        swa_slot_mapping: pl.Tensor[[CP_T_DYN], pl.INT64],
-        swa_indices: pl.Tensor[[T_DYN, WIN], pl.INT32],
-        swa_lens: pl.Tensor[[T_DYN], pl.INT32],
-        position_ids: pl.Tensor[[T_DYN], pl.INT32],
-        attn_sink: pl.Tensor[[H], pl.FP32],
-        wo_a: pl.Tensor[[LOCAL_O_GROUPS, O_LORA, O_GROUP_IN], pl.BF16],
-        wo_b: pl.Tensor[[D, LOCAL_O_WIDTH], pl.INT8],
-        wo_b_scale: pl.Tensor[[D], pl.FP32],
-        x_out: pl.Tensor[[T_DYN, HC_MULT, D], pl.FP32],
-        gather_window: pld.DistributedTensor[[DECODE_GROUP_CAP, D], pl.BF16],
-        gather_signal: pld.DistributedTensor[[TP_SIZE, 1], pl.INT32],
-        attention_window: pld.DistributedTensor[[ATTENTION_WINDOW_ROWS, O_GROUP_IN], pl.BF16],
-        attention_signal: pld.DistributedTensor[[TP_SIZE, 1], pl.INT32],
-        o_window: pld.DistributedTensor[[O_WINDOW_ROWS, D], pl.BF16],
-        o_signal: pld.DistributedTensor[[TP_SIZE, 1], pl.INT32],
-        group_base: pl.Scalar[pl.INT32],
-        tp_rank: pl.Scalar[pl.INT32],
-        local_t: pl.Scalar[pl.INT32],
-    ):
-        decode_swa(
-            x_hc,
-            hc_attn_fn, hc_attn_scale, hc_attn_base,
-            attn_norm_w, wq_a, wq_b, wq_b_scale, wkv,
-            gamma_cq, gamma_ckv,
-            freqs_cos, freqs_sin,
-            kv_freqs_cos, kv_freqs_sin,
-            kv_cache, swa_slot_mapping, swa_indices, swa_lens,
-            position_ids, attn_sink,
-            wo_a, wo_b, wo_b_scale,
-            x_out,
-            gather_window, gather_signal,
-            attention_window, attention_signal, o_window, o_signal,
-            group_base, tp_rank, local_t,
-        )
-        return x_out
 
 
 PACKED_POOL_LAYER_COUNTS = {
@@ -578,7 +468,7 @@ def decode_fwd(
         routed_w2_layer_swa0: pl.Tensor[[N_LOCAL, D, MOE_INTER], pl.INT8] = pl.slice(routed_w2, [N_LOCAL, D, MOE_INTER], [weight_layer_swa0 * N_LOCAL, 0, 0])
         raw_kv_layer_swa0 = pl.slice(raw_kv_pool, [raw_blocks_per_layer, BLOCK_SIZE, 1, HEAD_DIM], [0, 0, 0, 0])
         with pl.scope():
-            _decode_swa_attention(
+            decode_swa_attention(
                 x_ping,
                 hc_attn_fn_layer_swa0, hc_attn_scale_layer_swa0, hc_attn_base_layer_swa0,
                 attn_norm_w_layer_swa0, wq_a_layer_swa0, wq_b_layer_swa0, wq_b_scale_layer_swa0,
@@ -660,7 +550,7 @@ def decode_fwd(
         routed_w2_layer_swa1: pl.Tensor[[N_LOCAL, D, MOE_INTER], pl.INT8] = pl.slice(routed_w2, [N_LOCAL, D, MOE_INTER], [weight_layer_swa1 * N_LOCAL, 0, 0])
         raw_kv_layer_swa1 = pl.slice(raw_kv_pool, [raw_blocks_per_layer, BLOCK_SIZE, 1, HEAD_DIM], [raw_blocks_per_layer, 0, 0, 0])
         with pl.scope():
-            _decode_swa_attention(
+            decode_swa_attention(
                 x_pong,
                 hc_attn_fn_layer_swa1, hc_attn_scale_layer_swa1, hc_attn_base_layer_swa1,
                 attn_norm_w_layer_swa1, wq_a_layer_swa1, wq_b_layer_swa1, wq_b_scale_layer_swa1,
