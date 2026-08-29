@@ -28,9 +28,12 @@ from config import (
 )
 
 # Dynamic shape variables.
-B_DYN = pl.dynamic("B_DYN")
-T_DYN = pl.dynamic("T_DYN")  # T = B * S
-S_DYN = pl.dynamic("S_DYN")
+# Under CP the compressor runs over the whole TP group's token stream while its
+# caller stays on the local query rows, so its token and request axes are its own
+# symbols rather than the caller's.
+B_DYN = pl.dynamic("DECODE_HCA_C128_B_DYN")
+T_DYN = pl.dynamic("DECODE_HCA_C128_T_DYN")  # T = B * S
+S_DYN = pl.dynamic("DECODE_HCA_C128_S_DYN")
 COMPRESS_STATE_MAX_BLOCKS_DYN = pl.dynamic("COMPRESS_STATE_MAX_BLOCKS_DYN")
 COMPRESS_STATE_BLOCK_NUM_DYN = pl.dynamic("HCA_STATE_BLOCK_NUM_DYN")
 CMP_BLOCK_NUM_DYN = pl.dynamic("CMP_BLOCK_NUM_DYN")
@@ -79,9 +82,13 @@ OUT_TILE = 64
 HEAD_TILE = 64
 B_TILE = 8
 MM_B_TILE = 16
-BS_PAD = ((B * S + MM_B_TILE - 1) // MM_B_TILE) * MM_B_TILE
+# Scratch spans the CP group's whole token stream, not the rank-local B * S.
+GROUP_BS = DECODE_BATCH * DECODE_SEQ
+BS_PAD = ((GROUP_BS + MM_B_TILE - 1) // MM_B_TILE) * MM_B_TILE
 RMS_PAD_TILE = 16  # 16-row block of B (min M for FP32 vec ops)
-RMS_PAD_BLOCKS = (B + RMS_PAD_TILE - 1) // RMS_PAD_TILE
+# Per-request scratch spans the CP group's requests, not the rank-local B.
+GROUP_B = DECODE_BATCH
+RMS_PAD_BLOCKS = (GROUP_B + RMS_PAD_TILE - 1) // RMS_PAD_TILE
 RMS_PAD_ROWS = RMS_PAD_BLOCKS * RMS_PAD_TILE
 # softmax_pool reduces over the state axis with column reductions (no transpose), so it can
 # afford a wider head tile than HEAD_TILE: each wider tile loads each state block fewer times
@@ -107,8 +114,8 @@ def compressor_ratio128(
     norm_w: pl.Tensor[[HEAD_DIM], pl.BF16],
     # Interleave-duplicated (j>>1) cos and sign-folded sin, built once by the caller:
     #   cos[j] = cos_half[j>>1];  sin[j] = sin_half[j>>1] * sign[j], sign = [-1,+1,...]
-    cos: pl.Tensor[[B, ROPE_HEAD_DIM], pl.FP32],
-    sin: pl.Tensor[[B, ROPE_HEAD_DIM], pl.FP32],
+    cos: pl.Tensor[[B_DYN, ROPE_HEAD_DIM], pl.FP32],
+    sin: pl.Tensor[[B_DYN, ROPE_HEAD_DIM], pl.FP32],
     cmp_kv_cache: pl.Tensor[[CMP_BLOCK_NUM_DYN, BLOCK_SIZE, 1, HEAD_DIM], pl.BF16],
     position_ids: pl.Tensor[[T_DYN], pl.INT32],
     cmp_slot_mapping: pl.Tensor[[T_DYN], pl.INT64],

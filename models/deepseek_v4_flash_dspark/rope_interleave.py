@@ -28,14 +28,16 @@ Folding the sign into sin here rather than at each consumer is exact: multiplyin
 
 import pypto.language as pl
 
-from config import FLASH as M, DECODE_BATCH, TP
+from config import FLASH as M, DECODE_BATCH
 
 
 # Dynamic shape variables.
 B_DYN = pl.dynamic("B_DYN")  # runtime request count
 
 # model config
-B_MAX = DECODE_BATCH // TP
+# Capacity spans the CP group's requests: the compressor consumers run over the
+# whole group's token stream, not the rank-local shard.
+B_MAX = DECODE_BATCH
 ROPE_HEAD_DIM = M.qk_rope_head_dim
 HALF_ROPE = ROPE_HEAD_DIM // 2
 
