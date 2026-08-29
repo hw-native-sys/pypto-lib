@@ -14,6 +14,7 @@ Softmax+pool over all slots. No state shift needed."""
 import pypto.language as pl
 
 from rope_interleave import rope_interleave
+from decode_cp_token_allgather import CP_GROUP_T_DYN, CP_LOCAL_T_DYN, TP_SIZE
 from config import (
     FLASH as M,
     BLOCK_SIZE,
@@ -29,7 +30,8 @@ from config import (
 
 # Dynamic shape variables.
 B_DYN = pl.dynamic("B_DYN")
-T_DYN = pl.dynamic("T_DYN")  # T = B * S
+# TP1 uses local rows; CP uses gathered group rows.
+T_DYN = CP_LOCAL_T_DYN if TP_SIZE == 1 else CP_GROUP_T_DYN
 S_DYN = pl.dynamic("S_DYN")
 COMPRESS_STATE_MAX_BLOCKS_DYN = pl.dynamic("COMPRESS_STATE_MAX_BLOCKS_DYN")
 COMPRESS_STATE_BLOCK_NUM_DYN = pl.dynamic("HCA_STATE_BLOCK_NUM_DYN")
@@ -79,10 +81,7 @@ OUT_TILE = 64
 HEAD_TILE = 64
 B_TILE = 8
 MM_B_TILE = 16
-BS_PAD = ((B * S + MM_B_TILE - 1) // MM_B_TILE) * MM_B_TILE
 RMS_PAD_TILE = 16  # 16-row block of B (min M for FP32 vec ops)
-RMS_PAD_BLOCKS = (B + RMS_PAD_TILE - 1) // RMS_PAD_TILE
-RMS_PAD_ROWS = RMS_PAD_BLOCKS * RMS_PAD_TILE
 # softmax_pool reduces over the state axis with column reductions (no transpose), so it can
 # afford a wider head tile than HEAD_TILE: each wider tile loads each state block fewer times
 # (HEAD_DIM/POOL_HEAD_TILE tiles/batch instead of HEAD_DIM/HEAD_TILE), cutting load redundancy.
@@ -107,8 +106,8 @@ def compressor_ratio128(
     norm_w: pl.Tensor[[HEAD_DIM], pl.BF16],
     # Interleave-duplicated (j>>1) cos and sign-folded sin, built once by the caller:
     #   cos[j] = cos_half[j>>1];  sin[j] = sin_half[j>>1] * sign[j], sign = [-1,+1,...]
-    cos: pl.Tensor[[B, ROPE_HEAD_DIM], pl.FP32],
-    sin: pl.Tensor[[B, ROPE_HEAD_DIM], pl.FP32],
+    cos: pl.Tensor[[B_DYN, ROPE_HEAD_DIM], pl.FP32],
+    sin: pl.Tensor[[B_DYN, ROPE_HEAD_DIM], pl.FP32],
     cmp_kv_cache: pl.Tensor[[CMP_BLOCK_NUM_DYN, BLOCK_SIZE, 1, HEAD_DIM], pl.BF16],
     position_ids: pl.Tensor[[T_DYN], pl.INT32],
     cmp_slot_mapping: pl.Tensor[[T_DYN], pl.INT64],
@@ -124,8 +123,9 @@ def compressor_ratio128(
     x_flat = x
     t_matmul = ((bs + MM_B_TILE - 1) // MM_B_TILE) * MM_B_TILE  # ceil to whole 16-row cube tiles
     rms_blocks = (b_dim + RMS_PAD_TILE - 1) // RMS_PAD_TILE
-    kv_proj_pad = pl.create_tensor([BS_PAD, OUT_DIM], dtype=pl.FP32)
-    score_proj_pad = pl.create_tensor([BS_PAD, OUT_DIM], dtype=pl.FP32)
+    rms_rows = rms_blocks * RMS_PAD_TILE
+    kv_proj_pad = pl.create_tensor([t_matmul, OUT_DIM], dtype=pl.FP32)
+    score_proj_pad = pl.create_tensor([t_matmul, OUT_DIM], dtype=pl.FP32)
 
     with pl.spmd(
         t_matmul * OUT_DIM // (MM_B_TILE * OUT_TILE), name_hint="kv_score_proj", deps=[late_dep]
@@ -157,7 +157,7 @@ def compressor_ratio128(
 
     compress_state_rows_num = compress_state_block_num * COMPRESS_STATE_BLOCK_SIZE
     compress_state_rows = pl.reshape(compress_state, [compress_state_rows_num, COMPRESS_STATE_DIM])
-    pooled_kv = pl.create_tensor([RMS_PAD_ROWS, HEAD_DIM], dtype=pl.FP32)
+    pooled_kv = pl.create_tensor([rms_rows, HEAD_DIM], dtype=pl.FP32)
     # The target decode point is start_pos=8192, where the ratio-128 boundary branch
     # is inactive. Keep scatter and all pool gates in one task to minimize dispatches.
     with pl.at(level=pl.Level.CORE_GROUP, name_hint="scatter_softmax_pool") as pool_tid:
@@ -232,7 +232,7 @@ def compressor_ratio128(
                     ] = pooled_chunk
 
     norm_w_2d = pl.reshape(norm_w, [1, HEAD_DIM])
-    normed_kv = pl.create_tensor([RMS_PAD_ROWS, HEAD_DIM], dtype=pl.FP32)
+    normed_kv = pl.create_tensor([rms_rows, HEAD_DIM], dtype=pl.FP32)
     kv_flat = kv
     cmp_flat_rows = cmp_block_num * BLOCK_SIZE
     cmp_kv_cache_flat = pl.reshape(cmp_kv_cache, [cmp_flat_rows, HEAD_DIM])
@@ -337,8 +337,9 @@ def compressor_test(
     late_dep = pl.system.task_dummy(deps=[])
     # The fused path builds these once in hca_rope; standalone does the same prep here
     # so the fixture / golden keep the half-width cos/sin ABI.
-    cos_il = pl.create_tensor([B, ROPE_HEAD_DIM], dtype=pl.FP32)
-    sin_signed = pl.create_tensor([B, ROPE_HEAD_DIM], dtype=pl.FP32)
+    b_dim = pl.tensor.dim(cos, 0)
+    cos_il = pl.create_tensor([b_dim, ROPE_HEAD_DIM], dtype=pl.FP32)
+    sin_signed = pl.create_tensor([b_dim, ROPE_HEAD_DIM], dtype=pl.FP32)
     rope_interleave(cos, sin, cos_il, sin_signed)
     kv, cache_write_tid = compressor_ratio128(
         x, kv, compress_state, compress_state_block_table, wkv, wgate, ape, norm_w,

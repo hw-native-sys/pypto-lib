@@ -20,7 +20,7 @@ Building this per consumer block means re-running the ``j >> 1`` dup-gather on e
 block. ``pl.gather`` lowers to a per-row ``TGATHER`` loop, so the cost scales with
 (blocks x rows): the indexer's ``qr_rope`` alone spent 16 blocks x 32 rows x 2 tables
 = 1024 row-gathers per layer rebuilding one small position-invariant table, plus 32
-more in its compressor. This runs it once per layer over ``B_MAX`` rows instead.
+more in its compressor. This runs it once per layer over the runtime request rows instead.
 
 Folding the sign into sin here rather than at each consumer is exact: multiplying by
 +/-1 only flips the sign bit, so ``(x*sign)*sin`` and ``x*(sin*sign)`` are bit-identical.
@@ -28,27 +28,26 @@ Folding the sign into sin here rather than at each consumer is exact: multiplyin
 
 import pypto.language as pl
 
-from config import FLASH as M, DECODE_BATCH, TP
+from config import FLASH as M
 
 
 # Dynamic shape variables.
 B_DYN = pl.dynamic("B_DYN")  # runtime request count
 
 # model config
-B_MAX = DECODE_BATCH // TP
 ROPE_HEAD_DIM = M.qk_rope_head_dim
 HALF_ROPE = ROPE_HEAD_DIM // 2
 
 # tiling
-B_TILE = 4  # rows per gather block; runtime B is a multiple of 4
+B_TILE = 4
 
 
 @pl.jit.inline
 def rope_interleave(
     cos_half: pl.Tensor[[B_DYN, HALF_ROPE], pl.FP32],
     sin_half: pl.Tensor[[B_DYN, HALF_ROPE], pl.FP32],
-    cos_il: pl.Tensor[[B_MAX, ROPE_HEAD_DIM], pl.FP32],
-    sin_signed: pl.Tensor[[B_MAX, ROPE_HEAD_DIM], pl.FP32],
+    cos_il: pl.Tensor[[B_DYN, ROPE_HEAD_DIM], pl.FP32],
+    sin_signed: pl.Tensor[[B_DYN, ROPE_HEAD_DIM], pl.FP32],
 ):
     """Expand half-width cos/sin rows to the interleaved, sign-folded rope layout."""
     b_dim = pl.tensor.dim(cos_half, 0)
@@ -60,10 +59,17 @@ def rope_interleave(
         il_dup_idx = pl.cast(il_dup_f, target_type=pl.INT32)                                    # j>>1
         il_lane = pl.sub(il_col, pl.mul(il_dup_f, 2.0))                                         # j%2
         il_sign = pl.sub(pl.mul(il_lane, 2.0), 1.0)                                             # [-1,+1,...]
-        # Rows [b_dim, B_MAX) of the scratch stay unwritten; no consumer reads them.
-        for il_blk in pl.range(b_dim // B_TILE):
-            il_b0 = il_blk * B_TILE
+        full_rows = (b_dim // B_TILE) * B_TILE
+        for il_b0 in pl.range(0, full_rows, B_TILE):
             cos_il[il_b0 : il_b0 + B_TILE, 0:ROPE_HEAD_DIM] = pl.gather(
                 cos_half[il_b0 : il_b0 + B_TILE, 0:HALF_ROPE], dim=-1, index=il_dup_idx)
             sin_signed[il_b0 : il_b0 + B_TILE, 0:ROPE_HEAD_DIM] = pl.mul(
                 pl.gather(sin_half[il_b0 : il_b0 + B_TILE, 0:HALF_ROPE], dim=-1, index=il_dup_idx), il_sign)
+        for il_b0 in pl.range(full_rows, b_dim):
+            cos_il[il_b0 : il_b0 + 1, 0:ROPE_HEAD_DIM] = pl.gather(
+                cos_half[il_b0 : il_b0 + 1, 0:HALF_ROPE], dim=-1, index=il_dup_idx[0:1, :])
+            sin_signed[il_b0 : il_b0 + 1, 0:ROPE_HEAD_DIM] = pl.mul(
+                pl.gather(
+                    sin_half[il_b0 : il_b0 + 1, 0:HALF_ROPE], dim=-1, index=il_dup_idx[0:1, :]),
+                il_sign[0:1, :],
+            )
