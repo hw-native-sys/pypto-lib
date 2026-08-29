@@ -116,7 +116,9 @@ def clear_prefill_moe_signals(
     stage_done: pld.DistributedTensor[[N_RANKS, 1], pl.INT32],
 ):
     """Clear retained prefill-MoE epochs after the final wave completes."""
-    with pl.at(level=pl.Level.CORE_GROUP, name_hint="prefill_moe_signal_clear") as clear_tid:
+    with pl.at(level=pl.Level.CORE_GROUP, name_hint="prefill_moe_signal_clear"):
+        # Read the wave-barrier epoch: orders the clear after the final wave.
+        # The always-true guard keeps the read as a dependency edge.
         completed_epoch = pl.read(stage_token, [0])
         if completed_epoch >= 0:
             zero = pl.cast(0, pl.INT32)
@@ -125,7 +127,6 @@ def clear_prefill_moe_signals(
                 pl.write(data_arrived, [src, 0], zero)
                 pl.write(combine_arrived, [src, 0], zero)
                 pl.write(stage_done, [src, 0], zero)
-    return clear_tid
 
 
 # === Dispatch ================================================================
@@ -561,40 +562,6 @@ def moe(
     return x_next
 
 
-@pl.jit.inline
-def _complete_prefill_moe_wave(
-    stage_done: pld.DistributedTensor[[N_RANKS, 1], pl.INT32],
-    stage_token: pl.Tensor[[1], pl.INT32],
-    my_rank: pl.Scalar[pl.INT32],
-    moe_epoch: pl.Scalar[pl.INT32],
-    completion_tid: pl.Scalar[pl.TASK_ID],
-) -> pl.Scalar[pl.TASK_ID]:
-    """Publish one globally complete prefill-MoE wave before window reuse."""
-    with pl.at(level=pl.Level.CORE_GROUP, name_hint="prefill_moe_wave_notify", deps=[completion_tid]) as notify_tid:
-        for peer in pl.range(N_RANKS):
-            if peer != my_rank:
-                pld.system.notify(
-                    target=stage_done, peer=peer, offsets=[my_rank, 0],
-                    value=1, op=pld.NotifyOp.AtomicAdd,
-                )
-
-    with pl.at(level=pl.Level.CORE_GROUP, name_hint="prefill_moe_wave_wait") as wait_tid:
-        for peer in pl.range(N_RANKS):
-            if peer != my_rank:
-                pld.system.defer_wait(
-                    signal=stage_done, offsets=[peer, 0],
-                    expected=moe_epoch, cmp=pld.WaitCmp.Ge,
-                )
-
-    with pl.at(
-        level=pl.Level.CORE_GROUP,
-        name_hint="prefill_moe_wave_publish",
-        deps=[completion_tid, notify_tid, wait_tid],
-    ) as barrier_tid:
-        pl.write(stage_token, [0], moe_epoch)
-    return barrier_tid
-
-
 @pl.jit.inline(auto_scope=False)
 def prefill_moe(
     attn_out: pl.Tensor[[PREFILL_GROUP_T_DYN, HC_MULT, D], pl.FP32],
@@ -708,7 +675,33 @@ def prefill_moe(
                 if token < wave_rows:
                     local_token = local_wave_base + token
                     ffn_out[local_token : local_token + 1, :] = ffn_wave[token : token + 1, :]
-            _complete_prefill_moe_wave(stage_done, stage_token, my_rank, moe_epoch, output_store_tid)
+            # Publish one globally complete wave before the windows are reused.
+            with pl.at(
+                level=pl.Level.CORE_GROUP,
+                name_hint="prefill_moe_wave_notify",
+                deps=[output_store_tid],
+            ) as notify_tid:
+                for peer in pl.range(N_RANKS):
+                    if peer != my_rank:
+                        pld.system.notify(
+                            target=stage_done, peer=peer, offsets=[my_rank, 0],
+                            value=1, op=pld.NotifyOp.AtomicAdd,
+                        )
+
+            with pl.at(level=pl.Level.CORE_GROUP, name_hint="prefill_moe_wave_wait") as wait_tid:
+                for peer in pl.range(N_RANKS):
+                    if peer != my_rank:
+                        pld.system.defer_wait(
+                            signal=stage_done, offsets=[peer, 0],
+                            expected=moe_epoch, cmp=pld.WaitCmp.Ge,
+                        )
+
+            with pl.at(
+                level=pl.Level.CORE_GROUP,
+                name_hint="prefill_moe_wave_publish",
+                deps=[output_store_tid, notify_tid, wait_tid],
+            ):
+                pl.write(stage_token, [0], moe_epoch)
 
     with pl.at(level=pl.Level.CORE_GROUP, name_hint="prefill_moe_layer_complete"):
         completed_epoch = pl.read(stage_token, [0])
@@ -787,9 +780,14 @@ def moe_test(
     return x_next
 
 
+# Rounds sharing one window allocation. >1 exercises retained-window reuse
+# across MoE epochs; the round axis is kept even at 1.
+MOE_ROUNDS = 1
+
+
 @pl.jit.host
 def l3_moe(
-    x_hc: pl.Tensor[[N_RANKS, T, HC_MULT, D], pl.FP32],
+    x_hc: pl.Tensor[[MOE_ROUNDS, N_RANKS, T, HC_MULT, D], pl.FP32],
     hc_ffn_fn: pl.Tensor[[N_RANKS, MIX_HC, HC_DIM], pl.FP32],
     hc_ffn_scale: pl.Tensor[[N_RANKS, 3], pl.FP32],
     hc_ffn_base: pl.Tensor[[N_RANKS, MIX_HC], pl.FP32],
@@ -797,7 +795,7 @@ def l3_moe(
     gate_w: pl.Tensor[[N_RANKS, N_EXPERTS_GLOBAL, D], pl.FP32],
     gate_bias: pl.Tensor[[N_RANKS, N_EXPERTS_GLOBAL], pl.FP32],
     tid2eid: pl.Tensor[[N_RANKS, VOCAB, TOPK], pl.INT32],
-    input_ids: pl.Tensor[[N_RANKS, T], pl.INT64],
+    input_ids: pl.Tensor[[MOE_ROUNDS, N_RANKS, T], pl.INT64],
     routed_w1: pl.Tensor[[N_RANKS, N_LOCAL, MOE_INTER, D], pl.INT8],
     routed_w1_scale: pl.Tensor[[N_RANKS, N_LOCAL, MOE_INTER], pl.FP32],
     routed_w3: pl.Tensor[[N_RANKS, N_LOCAL, MOE_INTER, D], pl.INT8],
@@ -810,7 +808,7 @@ def l3_moe(
     shared_w3_scale: pl.Tensor[[N_RANKS, MOE_INTER], pl.FP32],
     shared_w2: pl.Tensor[[N_RANKS, D, MOE_INTER], pl.INT8],
     shared_w2_scale: pl.Tensor[[N_RANKS, D], pl.FP32],
-    x_next: pl.Out[pl.Tensor[[N_RANKS, T, HC_MULT, D], pl.FP32]],
+    x_next: pl.Out[pl.Tensor[[MOE_ROUNDS, N_RANKS, T, HC_MULT, D], pl.FP32]],
     layer_id: pl.Scalar[pl.INT32],
     num_tokens: pl.Scalar[pl.INT32],
 ):
@@ -823,72 +821,9 @@ def l3_moe(
     routed_y_buf_buf = pld.alloc_window_buffer([N_ROUTES, D], dtype=pl.BF16)
     combine_arrived_buf = pld.alloc_window_buffer([N_RANKS, 1], dtype=pl.INT32)
 
-    for r in pl.range(pld.world_size()):
-        recv_meta = pld.window(recv_meta_buf, [N_RANKS, N_LOCAL], dtype=pl.INT32)
-        recv_x = pld.window(recv_x_buf, [N_LOCAL * RECV_MAX, D], dtype=pl.INT8)
-        recv_aux = pld.window(recv_aux_buf, [N_LOCAL * RECV_MAX, AUX_PAD], dtype=pl.FP32)
-        recv_route = pld.window(recv_route_buf, [N_LOCAL * RECV_MAX, IDX_PAD], dtype=pl.INT32)
-        arrived = pld.window(arrived_buf, [N_RANKS, 1], dtype=pl.INT32)
-        data_arrived = pld.window(data_arrived_buf, [N_RANKS, 1], dtype=pl.INT32)
-        routed_y_buf = pld.window(routed_y_buf_buf, [N_ROUTES, D], dtype=pl.BF16)
-        combine_arrived = pld.window(combine_arrived_buf, [N_RANKS, 1], dtype=pl.INT32)
-        moe_test(
-            x_hc[r], hc_ffn_fn[r], hc_ffn_scale[r], hc_ffn_base[r],
-            norm_w[r], gate_w[r], gate_bias[r], tid2eid[r], input_ids[r],
-            routed_w1[r], routed_w1_scale[r], routed_w3[r], routed_w3_scale[r],
-            routed_w2[r], routed_w2_scale[r],
-            shared_w1[r], shared_w1_scale[r], shared_w3[r], shared_w3_scale[r],
-            shared_w2[r], shared_w2_scale[r],
-            x_next[r],
-            recv_meta, recv_x, recv_aux, recv_route, arrived, data_arrived,
-            routed_y_buf, combine_arrived,
-            layer_id, num_tokens, r, pl.const(1, pl.INT32), pl.const(1, pl.INT32),
-            device=r,
-        )
-
-
-RETAINED_WINDOW_FIXTURE_ROUNDS = 2
-
-
-@pl.jit.host
-def l3_moe_retained_window_fixture(
-    x_hc: pl.Tensor[[RETAINED_WINDOW_FIXTURE_ROUNDS, N_RANKS, T, HC_MULT, D], pl.FP32],
-    hc_ffn_fn: pl.Tensor[[N_RANKS, MIX_HC, HC_DIM], pl.FP32],
-    hc_ffn_scale: pl.Tensor[[N_RANKS, 3], pl.FP32],
-    hc_ffn_base: pl.Tensor[[N_RANKS, MIX_HC], pl.FP32],
-    norm_w: pl.Tensor[[N_RANKS, D], pl.BF16],
-    gate_w: pl.Tensor[[N_RANKS, N_EXPERTS_GLOBAL, D], pl.FP32],
-    gate_bias: pl.Tensor[[N_RANKS, N_EXPERTS_GLOBAL], pl.FP32],
-    tid2eid: pl.Tensor[[N_RANKS, VOCAB, TOPK], pl.INT32],
-    input_ids: pl.Tensor[[RETAINED_WINDOW_FIXTURE_ROUNDS, N_RANKS, T], pl.INT64],
-    routed_w1: pl.Tensor[[N_RANKS, N_LOCAL, MOE_INTER, D], pl.INT8],
-    routed_w1_scale: pl.Tensor[[N_RANKS, N_LOCAL, MOE_INTER], pl.FP32],
-    routed_w3: pl.Tensor[[N_RANKS, N_LOCAL, MOE_INTER, D], pl.INT8],
-    routed_w3_scale: pl.Tensor[[N_RANKS, N_LOCAL, MOE_INTER], pl.FP32],
-    routed_w2: pl.Tensor[[N_RANKS, N_LOCAL, D, MOE_INTER], pl.INT8],
-    routed_w2_scale: pl.Tensor[[N_RANKS, N_LOCAL, D], pl.FP32],
-    shared_w1: pl.Tensor[[N_RANKS, MOE_INTER, D], pl.INT8],
-    shared_w1_scale: pl.Tensor[[N_RANKS, MOE_INTER], pl.FP32],
-    shared_w3: pl.Tensor[[N_RANKS, MOE_INTER, D], pl.INT8],
-    shared_w3_scale: pl.Tensor[[N_RANKS, MOE_INTER], pl.FP32],
-    shared_w2: pl.Tensor[[N_RANKS, D, MOE_INTER], pl.INT8],
-    shared_w2_scale: pl.Tensor[[N_RANKS, D], pl.FP32],
-    x_next: pl.Out[pl.Tensor[[RETAINED_WINDOW_FIXTURE_ROUNDS, N_RANKS, T, HC_MULT, D], pl.FP32]],
-    layer_id: pl.Scalar[pl.INT32],
-    num_tokens: pl.Scalar[pl.INT32],
-):
-    recv_meta_buf = pld.alloc_window_buffer([N_RANKS, N_LOCAL], dtype=pl.INT32)
-    recv_x_buf = pld.alloc_window_buffer([N_LOCAL * RECV_MAX, D], dtype=pl.INT8)
-    recv_aux_buf = pld.alloc_window_buffer([N_LOCAL * RECV_MAX, AUX_PAD], dtype=pl.FP32)
-    recv_route_buf = pld.alloc_window_buffer([N_LOCAL * RECV_MAX, IDX_PAD], dtype=pl.INT32)
-    arrived_buf = pld.alloc_window_buffer([N_RANKS, 1], dtype=pl.INT32)
-    data_arrived_buf = pld.alloc_window_buffer([N_RANKS, 1], dtype=pl.INT32)
-    routed_y_buf_buf = pld.alloc_window_buffer([N_ROUTES, D], dtype=pl.BF16)
-    combine_arrived_buf = pld.alloc_window_buffer([N_RANKS, 1], dtype=pl.INT32)
-
-    for round_id in pl.range(RETAINED_WINDOW_FIXTURE_ROUNDS):
+    for round_id in pl.range(MOE_ROUNDS):
         moe_epoch = round_id + 1
-        finalize_moe = pl.cast(round_id == RETAINED_WINDOW_FIXTURE_ROUNDS - 1, pl.INT32)
+        finalize_moe = pl.cast(round_id == MOE_ROUNDS - 1, pl.INT32)
         for r in pl.range(pld.world_size()):
             recv_meta = pld.window(recv_meta_buf, [N_RANKS, N_LOCAL], dtype=pl.INT32)
             recv_x = pld.window(recv_x_buf, [N_LOCAL * RECV_MAX, D], dtype=pl.INT8)
@@ -1103,8 +1038,8 @@ def golden_moe(tensors):
     _golden_moe_single(tensors)
 
 
-def golden_moe_retained_window_fixture(tensors):
-    """Evaluate every retained-window fixture round."""
+def golden_moe_rounds(tensors):
+    """Evaluate every MoE round."""
     for round_id in range(tensors["x_hc"].shape[0]):
         round_tensors = dict(tensors)
         round_tensors["x_hc"] = tensors["x_hc"][round_id]
@@ -1119,7 +1054,8 @@ def _build_tensor_specs(layer_id, num_tokens, balanced_routing, fixture_rounds):
     from expert_routed import gen_routed_weight
     from expert_shared import gen_shared_weight
 
-    retain_round_axis = fixture_rounds > 1
+    retain_round_axis = fixture_rounds is not None
+    rounds = fixture_rounds if retain_round_axis else 1
 
     # Routed = MXFP4 (gen_routed_weight), shared = MXFP8 (gen_shared_weight). This
     # is an integration test whose x_next-equivalent output is dominated by near-zero
@@ -1132,7 +1068,7 @@ def _build_tensor_specs(layer_id, num_tokens, balanced_routing, fixture_rounds):
     # Shared (replicated) weights are broadcast across ranks; the routed
     # weights are per-rank shards.
     def init_x_hc():
-        value = torch.randn(fixture_rounds, N_RANKS, T, HC_MULT, D)
+        value = torch.randn(rounds, N_RANKS, T, HC_MULT, D)
         return value if retain_round_axis else value[0]
 
     # Real layer-0 hc_ffn scale/base (fn synthetic at real magnitude). A synthetic
@@ -1184,7 +1120,7 @@ def _build_tensor_specs(layer_id, num_tokens, balanced_routing, fixture_rounds):
         if balanced_routing:
             # Active tokens across ranks consume consecutive tid2eid rows, making
             # their route ids one contiguous round-robin sequence over experts.
-            round_starts = torch.arange(fixture_rounds, dtype=torch.int64).view(fixture_rounds, 1, 1)
+            round_starts = torch.arange(rounds, dtype=torch.int64).view(rounds, 1, 1)
             rank_starts = torch.arange(N_RANKS, dtype=torch.int64).view(1, N_RANKS, 1)
             token_offsets = torch.arange(T, dtype=torch.int64).view(1, 1, T)
             round_offsets = round_starts * N_RANKS
@@ -1193,7 +1129,7 @@ def _build_tensor_specs(layer_id, num_tokens, balanced_routing, fixture_rounds):
             value = stream_starts + token_offsets
             return value if retain_round_axis else value[0]
         # Distinct per-rank token streams.
-        value = torch.randint(0, VOCAB, (fixture_rounds, N_RANKS, T), dtype=torch.int64)
+        value = torch.randint(0, VOCAB, (rounds, N_RANKS, T), dtype=torch.int64)
         return value if retain_round_axis else value[0]
 
     if balanced_routing:
@@ -1241,8 +1177,8 @@ def _build_tensor_specs(layer_id, num_tokens, balanced_routing, fixture_rounds):
     x_hc_shape = [N_RANKS, T, HC_MULT, D]
     input_ids_shape = [N_RANKS, T]
     if retain_round_axis:
-        x_hc_shape = [fixture_rounds, *x_hc_shape]
-        input_ids_shape = [fixture_rounds, *input_ids_shape]
+        x_hc_shape = [rounds, *x_hc_shape]
+        input_ids_shape = [rounds, *input_ids_shape]
 
     specs = [
         TensorSpec("x_hc", x_hc_shape, torch.float32, init_value=init_x_hc),
@@ -1295,11 +1231,12 @@ def _build_tensor_specs(layer_id, num_tokens, balanced_routing, fixture_rounds):
 
 
 def build_tensor_specs(layer_id=0, num_tokens=T, balanced_routing=False):
-    return _build_tensor_specs(layer_id, num_tokens, balanced_routing, fixture_rounds=1)
+    return _build_tensor_specs(layer_id, num_tokens, balanced_routing, fixture_rounds=None)
 
 
-def build_retained_window_fixture_tensor_specs(layer_id=0, num_tokens=T, balanced_routing=False):
-    return _build_tensor_specs(layer_id, num_tokens, balanced_routing, fixture_rounds=RETAINED_WINDOW_FIXTURE_ROUNDS,)
+def build_rounds_tensor_specs(layer_id=0, num_tokens=T, balanced_routing=False):
+    return _build_tensor_specs(layer_id, num_tokens, balanced_routing,
+                               fixture_rounds=MOE_ROUNDS)
 
 
 if __name__ == "__main__":
@@ -1337,13 +1274,13 @@ if __name__ == "__main__":
     golden_data = args.golden_data
 
     result = run_jit(
-        fn=l3_moe_retained_window_fixture,
-        specs=build_retained_window_fixture_tensor_specs(
+        fn=l3_moe,
+        specs=build_rounds_tensor_specs(
             layer_id=args.layer_id,
             num_tokens=args.num_tokens,
             balanced_routing=args.balanced_routing,
         ),
-        golden_fn=golden_moe_retained_window_fixture,
+        golden_fn=golden_moe_rounds,
         golden_data=golden_data,
         save_data=args.save_data,
         compile_only=args.compile_only,
