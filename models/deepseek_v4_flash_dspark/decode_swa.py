@@ -206,20 +206,33 @@ def decode_swa(
     kv_full = pl.create_tensor([kv_dim, HEAD_DIM], dtype=pl.BF16)
     qr = pl.create_tensor([t_dim, Q_LORA], dtype=pl.INT8)
     qr_scale = pl.create_tensor([t_dim, 1], dtype=pl.FP32)
+    kv_cos_il = pl.create_tensor([kv_dim, ROPE_HEAD_DIM], dtype=pl.FP32)
+    kv_sin_signed = pl.create_tensor([kv_dim, ROPE_HEAD_DIM], dtype=pl.FP32)
+    kv_swap_idx = pl.create_tensor([kv_dim, ROPE_HEAD_DIM], dtype=pl.INT32)
+    rope_prepare(freqs_cos_full, freqs_sin_full, kv_cos_il, kv_sin_signed, kv_swap_idx)
+
+    # The rank's query rows are its slice of the gathered stream, so the q RoPE
+    # tables are sliced out rather than prepared a second time: one rope_prepare
+    # per function keeps its token axis bound to a single row count.
     q_cos_il = pl.create_tensor([t_dim, ROPE_HEAD_DIM], dtype=pl.FP32)
     q_sin_signed = pl.create_tensor([t_dim, ROPE_HEAD_DIM], dtype=pl.FP32)
     q_swap_idx = pl.create_tensor([t_dim, ROPE_HEAD_DIM], dtype=pl.INT32)
-    rope_prepare(freqs_cos, freqs_sin, q_cos_il, q_sin_signed, q_swap_idx)
+    q_rope_base = tp_rank * pl.cast(t_dim, pl.INT32)
+    for q_rope_row in pl.spmd(t_dim, name_hint="cp_query_rope_slice"):
+        q_rope_full = q_rope_base + q_rope_row
+        q_cos_row = pl.load(kv_cos_il, [q_rope_full, 0], [1, ROPE_HEAD_DIM], target_memory=pl.MemorySpace.Vec)
+        q_sin_row = pl.load(kv_sin_signed, [q_rope_full, 0], [1, ROPE_HEAD_DIM], target_memory=pl.MemorySpace.Vec)
+        q_swap_row = pl.load(kv_swap_idx, [q_rope_full, 0], [1, ROPE_HEAD_DIM], target_memory=pl.MemorySpace.Vec)
+        pl.store(q_cos_row, [q_rope_row, 0], q_cos_il)
+        pl.store(q_sin_row, [q_rope_row, 0], q_sin_signed)
+        pl.store(q_swap_row, [q_rope_row, 0], q_swap_idx)
+
     q_proj_rope(
         x_normed_t, wq_a, wq_b, wq_b_scale, gamma_cq,
         q_cos_il, q_sin_signed, q_swap_idx,
         q, qr, qr_scale,
     )
 
-    kv_cos_il = pl.create_tensor([kv_dim, ROPE_HEAD_DIM], dtype=pl.FP32)
-    kv_sin_signed = pl.create_tensor([kv_dim, ROPE_HEAD_DIM], dtype=pl.FP32)
-    kv_swap_idx = pl.create_tensor([kv_dim, ROPE_HEAD_DIM], dtype=pl.INT32)
-    rope_prepare(freqs_cos_full, freqs_sin_full, kv_cos_il, kv_sin_signed, kv_swap_idx)
     kv_proj_rope(
         x_normed_full, wkv, gamma_ckv,
         kv_cos_il, kv_sin_signed, kv_swap_idx,

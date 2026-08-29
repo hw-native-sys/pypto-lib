@@ -233,20 +233,33 @@ def decode_hca(
     kv_full = pl.create_tensor([kv_dim, HEAD_DIM], dtype=pl.BF16)
     qr = pl.create_tensor([t_dim, Q_LORA], dtype=pl.INT8)
     qr_scale = pl.create_tensor([t_dim, 1], dtype=pl.FP32)
+    kv_cos_il = pl.create_tensor([kv_dim, ROPE_HEAD_DIM], dtype=pl.FP32)
+    kv_sin_signed = pl.create_tensor([kv_dim, ROPE_HEAD_DIM], dtype=pl.FP32)
+    kv_swap_idx = pl.create_tensor([kv_dim, ROPE_HEAD_DIM], dtype=pl.INT32)
+    rope_prepare(freqs_cos_full, freqs_sin_full, kv_cos_il, kv_sin_signed, kv_swap_idx)
+
+    # The rank's query rows are its slice of the gathered stream, so the q RoPE
+    # tables are sliced out rather than prepared a second time: one rope_prepare
+    # per function keeps its token axis bound to a single row count.
     q_cos_il = pl.create_tensor([t_dim, ROPE_HEAD_DIM], dtype=pl.FP32)
     q_sin_signed = pl.create_tensor([t_dim, ROPE_HEAD_DIM], dtype=pl.FP32)
     q_swap_idx = pl.create_tensor([t_dim, ROPE_HEAD_DIM], dtype=pl.INT32)
-    rope_prepare(freqs_cos, freqs_sin, q_cos_il, q_sin_signed, q_swap_idx)
+    q_rope_base = tp_rank * pl.cast(t_dim, pl.INT32)
+    for q_rope_row in pl.spmd(t_dim, name_hint="cp_query_rope_slice"):
+        q_rope_full = q_rope_base + q_rope_row
+        q_cos_row = pl.load(kv_cos_il, [q_rope_full, 0], [1, ROPE_HEAD_DIM], target_memory=pl.MemorySpace.Vec)
+        q_sin_row = pl.load(kv_sin_signed, [q_rope_full, 0], [1, ROPE_HEAD_DIM], target_memory=pl.MemorySpace.Vec)
+        q_swap_row = pl.load(kv_swap_idx, [q_rope_full, 0], [1, ROPE_HEAD_DIM], target_memory=pl.MemorySpace.Vec)
+        pl.store(q_cos_row, [q_rope_row, 0], q_cos_il)
+        pl.store(q_sin_row, [q_rope_row, 0], q_sin_signed)
+        pl.store(q_swap_row, [q_rope_row, 0], q_swap_idx)
+
     q_proj_rope(
         x_normed, wq_a, wq_b, wq_b_scale, gamma_cq,
         q_cos_il, q_sin_signed, q_swap_idx,
         q, qr, qr_scale,
     )
 
-    kv_cos_il = pl.create_tensor([kv_dim, ROPE_HEAD_DIM], dtype=pl.FP32)
-    kv_sin_signed = pl.create_tensor([kv_dim, ROPE_HEAD_DIM], dtype=pl.FP32)
-    kv_swap_idx = pl.create_tensor([kv_dim, ROPE_HEAD_DIM], dtype=pl.INT32)
-    rope_prepare(freqs_cos_full, freqs_sin_full, kv_cos_il, kv_sin_signed, kv_swap_idx)
     kv_proj_rope(
         x_normed_full, wkv, gamma_ckv,
         kv_cos_il, kv_sin_signed, kv_swap_idx,
@@ -267,13 +280,22 @@ def decode_hca(
                     kv_full[write_t : write_t + 1, 0 : HEAD_DIM]
                 )
 
+    # Hand the compressor scalar-extent views: its token and request axes bind to
+    # one row count per call, and mixing them with the gathered stream's symbols
+    # leaves the two not provably equal across the call.
+    cmp_positions = pl.reshape(position_ids_full, [kv_dim])
+    cmp_slots = pl.reshape(cmp_slot_mapping_full, [kv_dim])
+    cmp_state_slots = pl.reshape(state_slot_mapping_full, [kv_dim])
+    cmp_state_table = pl.reshape(
+        compress_state_block_table_full, [kv_b_dim, COMPRESS_STATE_MAX_BLOCKS],
+    )
     cmp_kv_proj = pl.create_tensor([kv_dim, HEAD_DIM], dtype=pl.FP32)
     cmp_kv_proj, cmp_cache_write_tid = compressor_ratio128(
         x_normed_full, cmp_kv_proj,
-        compress_state, compress_state_block_table_full,
+        compress_state, cmp_state_table,
         cmp_wkv, cmp_wgate, cmp_ape, cmp_norm_w,
         cmp_cos_il, cmp_sin_signed, cmp_kv,
-        position_ids_full, cmp_slot_mapping_full, state_slot_mapping_full,
+        cmp_positions, cmp_slots, cmp_state_slots,
         late_dep,
     )
     cache_ready_dep = pl.system.task_dummy(deps=[ori_cache_write_tid, cmp_cache_write_tid])

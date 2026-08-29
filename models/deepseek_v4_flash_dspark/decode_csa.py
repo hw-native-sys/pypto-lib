@@ -165,8 +165,6 @@ def decode_csa(
     freqs_sin: pl.Tensor[[T_DYN, ROPE_HEAD_DIM], pl.BF16],
     freqs_cos_full: pl.Tensor[[CP_KV_T_DYN, ROPE_HEAD_DIM], pl.BF16],
     freqs_sin_full: pl.Tensor[[CP_KV_T_DYN, ROPE_HEAD_DIM], pl.BF16],
-    cmp_freqs_cos: pl.Tensor[[T_DYN, ROPE_HEAD_DIM], pl.BF16],
-    cmp_freqs_sin: pl.Tensor[[T_DYN, ROPE_HEAD_DIM], pl.BF16],
     cmp_freqs_cos_full: pl.Tensor[[CP_KV_T_DYN, ROPE_HEAD_DIM], pl.BF16],
     cmp_freqs_sin_full: pl.Tensor[[CP_KV_T_DYN, ROPE_HEAD_DIM], pl.BF16],
     cmp_wkv: pl.Tensor[[MAIN_OUT_DIM, D], pl.BF16],
@@ -219,6 +217,7 @@ def decode_csa(
     """Run one rank of the context-parallel CSA layer."""
     t_dim = pl.tensor.dim(x_hc, 0)
     kv_dim = pl.tensor.dim(ori_slot_mapping_full, 0)
+    kv_b_dim = pl.tensor.dim(compress_state_block_table_full, 0)
     q = pl.create_tensor([t_dim, H, HEAD_DIM], dtype=pl.BF16)
     idx_topk_scores = pl.create_tensor([t_dim, IDX_TOPK], dtype=pl.FP32)
     idx_topk = pl.create_tensor([t_dim, IDX_TOPK], dtype=pl.INT32)
@@ -230,8 +229,6 @@ def decode_csa(
 
     idx_cos_il = pl.create_tensor([t_dim, ROPE_HEAD_DIM], dtype=pl.FP32)
     idx_sin_signed = pl.create_tensor([t_dim, ROPE_HEAD_DIM], dtype=pl.FP32)
-    cmp_cos_il = pl.create_tensor([t_dim, ROPE_HEAD_DIM], dtype=pl.FP32)
-    cmp_sin_signed = pl.create_tensor([t_dim, ROPE_HEAD_DIM], dtype=pl.FP32)
     cmp_cos_il_full = pl.create_tensor([kv_dim, ROPE_HEAD_DIM], dtype=pl.FP32)
     cmp_sin_signed_full = pl.create_tensor([kv_dim, ROPE_HEAD_DIM], dtype=pl.FP32)
     with pl.at(level=pl.Level.CORE_GROUP, name_hint="csa_rope_interleave") as rope_tid:
@@ -253,19 +250,6 @@ def decode_csa(
             idx_sin_signed[rope_t0 : rope_t0 + 4, :] = pl.mul(
                 pl.gather(
                     pl.cast(freqs_sin[rope_t0 : rope_t0 + 4, 0:HALF_ROPE], target_type=pl.FP32),
-                    dim=-1,
-                    index=il_dup_idx,
-                ),
-                il_sign,
-            )
-            cmp_cos_il[rope_t0 : rope_t0 + 4, :] = pl.gather(
-                pl.cast(cmp_freqs_cos[rope_t0 : rope_t0 + 4, 0:HALF_ROPE], target_type=pl.FP32),
-                dim=-1,
-                index=il_dup_idx,
-            )
-            cmp_sin_signed[rope_t0 : rope_t0 + 4, :] = pl.mul(
-                pl.gather(
-                    pl.cast(cmp_freqs_sin[rope_t0 : rope_t0 + 4, 0:HALF_ROPE], target_type=pl.FP32),
                     dim=-1,
                     index=il_dup_idx,
                 ),
@@ -312,20 +296,33 @@ def decode_csa(
     attn_out = pl.create_tensor([t_dim, D], dtype=pl.BF16)
     with pl.scope():
         late_dep = pl.system.task_dummy(deps=[rope_tid])
+        kv_cos_il = pl.create_tensor([kv_dim, ROPE_HEAD_DIM], dtype=pl.FP32)
+        kv_sin_signed = pl.create_tensor([kv_dim, ROPE_HEAD_DIM], dtype=pl.FP32)
+        kv_swap_idx = pl.create_tensor([kv_dim, ROPE_HEAD_DIM], dtype=pl.INT32)
+        rope_prepare(freqs_cos_full, freqs_sin_full, kv_cos_il, kv_sin_signed, kv_swap_idx)
+
+        # The rank's query rows are its slice of the gathered stream, so the q RoPE
+        # tables are sliced out rather than prepared a second time: one rope_prepare
+        # per function keeps its token axis bound to a single row count.
         q_cos_il = pl.create_tensor([t_dim, ROPE_HEAD_DIM], dtype=pl.FP32)
         q_sin_signed = pl.create_tensor([t_dim, ROPE_HEAD_DIM], dtype=pl.FP32)
         q_swap_idx = pl.create_tensor([t_dim, ROPE_HEAD_DIM], dtype=pl.INT32)
-        rope_prepare(freqs_cos, freqs_sin, q_cos_il, q_sin_signed, q_swap_idx)
+        q_rope_base = tp_rank * pl.cast(t_dim, pl.INT32)
+        for q_rope_row in pl.spmd(t_dim, name_hint="cp_query_rope_slice"):
+            q_rope_full = q_rope_base + q_rope_row
+            q_cos_row = pl.load(kv_cos_il, [q_rope_full, 0], [1, ROPE_HEAD_DIM], target_memory=pl.MemorySpace.Vec)
+            q_sin_row = pl.load(kv_sin_signed, [q_rope_full, 0], [1, ROPE_HEAD_DIM], target_memory=pl.MemorySpace.Vec)
+            q_swap_row = pl.load(kv_swap_idx, [q_rope_full, 0], [1, ROPE_HEAD_DIM], target_memory=pl.MemorySpace.Vec)
+            pl.store(q_cos_row, [q_rope_row, 0], q_cos_il)
+            pl.store(q_sin_row, [q_rope_row, 0], q_sin_signed)
+            pl.store(q_swap_row, [q_rope_row, 0], q_swap_idx)
+
         q_proj_rope(
             x_normed_t, wq_a, wq_b, wq_b_scale, gamma_cq,
             q_cos_il, q_sin_signed, q_swap_idx,
             q, qr, qr_scale,
         )
 
-        kv_cos_il = pl.create_tensor([kv_dim, ROPE_HEAD_DIM], dtype=pl.FP32)
-        kv_sin_signed = pl.create_tensor([kv_dim, ROPE_HEAD_DIM], dtype=pl.FP32)
-        kv_swap_idx = pl.create_tensor([kv_dim, ROPE_HEAD_DIM], dtype=pl.INT32)
-        rope_prepare(freqs_cos_full, freqs_sin_full, kv_cos_il, kv_sin_signed, kv_swap_idx)
         kv_proj_rope(
             x_normed_full, wkv, gamma_ckv,
             kv_cos_il, kv_sin_signed, kv_swap_idx,
@@ -346,13 +343,30 @@ def decode_csa(
                         kv_full[write_t : write_t + 1, 0 : HEAD_DIM]
                     )
 
+        # Hand the compressors scalar-extent views: their token and request axes
+        # bind to one row count per call, and mixing them with the gathered
+        # stream's symbols leaves the two not provably equal across the call.
+        cmp_positions = pl.reshape(position_ids_full, [kv_dim])
+        cmp_slots = pl.reshape(cmp_slot_mapping_full, [kv_dim])
+        cmp_state_slots = pl.reshape(state_slot_mapping_full, [kv_dim])
+        idx_slots = pl.reshape(idx_slot_mapping_full, [kv_dim])
+        # A distinct one-dimensional view: position_ids also feeds sparse
+        # attention as a [t_dim, 1] reshape, and the indexer needs the flat form.
+        idx_positions = pl.reshape(position_ids, [t_dim])
+        inner_state_slots = pl.reshape(inner_state_slot_mapping_full, [kv_dim])
+        cmp_state_table = pl.reshape(
+            compress_state_block_table_full, [kv_b_dim, MAIN_STATE_MAX_BLOCKS],
+        )
+        inner_state_table = pl.reshape(
+            inner_compress_state_block_table_full, [kv_b_dim, INNER_STATE_MAX_BLOCKS],
+        )
         cmp_out = pl.create_tensor([kv_dim, HEAD_DIM], dtype=pl.FP32)
         cmp_out, cmp_cache_write_tid = compressor_ratio4(
             x_normed_full, cmp_out,
-            compress_state, compress_state_block_table_full,
+            compress_state, cmp_state_table,
             cmp_wkv, cmp_wgate, cmp_ape, cmp_norm_w,
             cmp_cos_il_full, cmp_sin_signed_full, cmp_kv,
-            position_ids_full, cmp_slot_mapping_full, state_slot_mapping_full,
+            cmp_positions, cmp_slots, cmp_state_slots,
             late_dep,
         )
         cache_ready_dep = pl.system.task_dummy(deps=[ori_cache_write_tid, cmp_cache_write_tid])
@@ -362,11 +376,11 @@ def decode_csa(
         idx_kv_unused = pl.create_tensor([kv_dim, IDX_HEAD_DIM], dtype=pl.FP32)
         idx_cache_write_tid = indexer_compressor(
             x_normed_full, idx_kv_unused,
-            inner_compress_state, inner_compress_state_block_table_full,
+            inner_compress_state, inner_state_table,
             inner_wkv, inner_wgate, inner_ape, inner_norm_w,
             cmp_cos_il_full, cmp_sin_signed_full, hadamard_idx,
             idx_kv_cache, idx_kv_scale,
-            position_ids_full, idx_slot_mapping_full, inner_state_slot_mapping_full,
+            cmp_positions, idx_slots, inner_state_slots,
             late_dep,
         )
         idx_topk_scores, idx_topk = indexer(
@@ -375,7 +389,7 @@ def decode_csa(
             hadamard_idx,
             idx_kv_cache, idx_kv_scale, idx_block_table,
             idx_topk_scores, idx_topk,
-            position_ids, kv_seq_lens, late_dep, idx_cache_write_tid,
+            idx_positions, kv_seq_lens, late_dep, idx_cache_write_tid,
         )
 
         (
@@ -513,8 +527,6 @@ def decode_csa_test(
     freqs_sin: pl.Tensor[[T_DYN, ROPE_HEAD_DIM], pl.BF16],
     freqs_cos_full: pl.Tensor[[CP_KV_T_DYN, ROPE_HEAD_DIM], pl.BF16],
     freqs_sin_full: pl.Tensor[[CP_KV_T_DYN, ROPE_HEAD_DIM], pl.BF16],
-    cmp_freqs_cos: pl.Tensor[[T_DYN, ROPE_HEAD_DIM], pl.BF16],
-    cmp_freqs_sin: pl.Tensor[[T_DYN, ROPE_HEAD_DIM], pl.BF16],
     cmp_freqs_cos_full: pl.Tensor[[CP_KV_T_DYN, ROPE_HEAD_DIM], pl.BF16],
     cmp_freqs_sin_full: pl.Tensor[[CP_KV_T_DYN, ROPE_HEAD_DIM], pl.BF16],
     cmp_wkv: pl.Tensor[[MAIN_OUT_DIM, D], pl.BF16],
@@ -570,8 +582,6 @@ def decode_csa_test(
     freqs_sin.bind_dynamic(0, T_DYN)
     freqs_cos_full.bind_dynamic(0, CP_KV_T_DYN)
     freqs_sin_full.bind_dynamic(0, CP_KV_T_DYN)
-    cmp_freqs_cos.bind_dynamic(0, T_DYN)
-    cmp_freqs_sin.bind_dynamic(0, T_DYN)
     cmp_freqs_cos_full.bind_dynamic(0, CP_KV_T_DYN)
     cmp_freqs_sin_full.bind_dynamic(0, CP_KV_T_DYN)
     compress_state.bind_dynamic(0, MAIN_STATE_BLOCK_NUM_DYN)
@@ -601,7 +611,7 @@ def decode_csa_test(
         hc_attn_fn, hc_attn_scale, hc_attn_base,
         attn_norm_w, wq_a, wq_b, wq_b_scale, wkv, gamma_cq, gamma_ckv,
         freqs_cos, freqs_sin, freqs_cos_full, freqs_sin_full,
-        cmp_freqs_cos, cmp_freqs_sin, cmp_freqs_cos_full, cmp_freqs_sin_full,
+        cmp_freqs_cos_full, cmp_freqs_sin_full,
         cmp_wkv, cmp_wgate, cmp_ape, cmp_norm_w,
         compress_state, compress_state_block_table_full,
         idx_wq_b, idx_wq_b_scale, weights_proj, hadamard_idx,
@@ -638,8 +648,6 @@ def l3_decode_csa(
     freqs_sin: pl.Tensor[[TP_SIZE, T_DYN, ROPE_HEAD_DIM], pl.BF16],
     freqs_cos_full: pl.Tensor[[TP_SIZE, CP_KV_T_DYN, ROPE_HEAD_DIM], pl.BF16],
     freqs_sin_full: pl.Tensor[[TP_SIZE, CP_KV_T_DYN, ROPE_HEAD_DIM], pl.BF16],
-    cmp_freqs_cos: pl.Tensor[[TP_SIZE, T_DYN, ROPE_HEAD_DIM], pl.BF16],
-    cmp_freqs_sin: pl.Tensor[[TP_SIZE, T_DYN, ROPE_HEAD_DIM], pl.BF16],
     cmp_freqs_cos_full: pl.Tensor[[TP_SIZE, CP_KV_T_DYN, ROPE_HEAD_DIM], pl.BF16],
     cmp_freqs_sin_full: pl.Tensor[[TP_SIZE, CP_KV_T_DYN, ROPE_HEAD_DIM], pl.BF16],
     cmp_wkv: pl.Tensor[[TP_SIZE, MAIN_OUT_DIM, D], pl.BF16],
@@ -687,8 +695,6 @@ def l3_decode_csa(
     freqs_sin.bind_dynamic(1, T_DYN)
     freqs_cos_full.bind_dynamic(1, CP_KV_T_DYN)
     freqs_sin_full.bind_dynamic(1, CP_KV_T_DYN)
-    cmp_freqs_cos.bind_dynamic(1, T_DYN)
-    cmp_freqs_sin.bind_dynamic(1, T_DYN)
     cmp_freqs_cos_full.bind_dynamic(1, CP_KV_T_DYN)
     cmp_freqs_sin_full.bind_dynamic(1, CP_KV_T_DYN)
     compress_state.bind_dynamic(1, MAIN_STATE_BLOCK_NUM_DYN)
@@ -734,7 +740,6 @@ def l3_decode_csa(
             wkv[rank], gamma_cq[rank], gamma_ckv[rank],
             freqs_cos[rank], freqs_sin[rank],
             freqs_cos_full[rank], freqs_sin_full[rank],
-            cmp_freqs_cos[rank], cmp_freqs_sin[rank],
             cmp_freqs_cos_full[rank], cmp_freqs_sin_full[rank],
             cmp_wkv[rank], cmp_wgate[rank], cmp_ape[rank], cmp_norm_w[rank],
             compress_state[rank], compress_state_block_table_full[rank],
@@ -906,16 +911,22 @@ def decode_csa_tp1(
         cache_ready_dep = pl.system.task_dummy(deps=[ori_cache_write_tid, cmp_cache_write_tid])
 
         idx_kv_unused = pl.create_tensor([t_dim, IDX_HEAD_DIM], dtype=pl.FP32)
+        idx_cache_write_tid = indexer_compressor(
+            x_normed_t, idx_kv_unused,
+            inner_compress_state, inner_compress_state_block_table,
+            inner_wkv, inner_wgate, inner_ape, inner_norm_w,
+            cmp_cos_il, cmp_sin_signed, hadamard_idx,
+            idx_kv_cache, idx_kv_scale,
+            position_ids, idx_slot_mapping, inner_state_slot_mapping,
+            late_dep,
+        )
         idx_topk_scores, idx_topk = indexer(
             x_normed_t, qr, qr_scale, idx_wq_b, idx_wq_b_scale,
-            weights_proj, idx_cos_il, idx_sin_signed, cmp_cos_il, cmp_sin_signed,
+            weights_proj, idx_cos_il, idx_sin_signed,
             hadamard_idx,
-            idx_kv_unused, inner_compress_state, inner_compress_state_block_table,
-            inner_wkv, inner_wgate, inner_ape, inner_norm_w,
             idx_kv_cache, idx_kv_scale, idx_block_table,
             idx_topk_scores, idx_topk,
-            position_ids, idx_slot_mapping, inner_state_slot_mapping,
-            kv_seq_lens, late_dep,
+            position_ids, kv_seq_lens, late_dep, idx_cache_write_tid,
         )
 
         # sparse_attn_csa folds the compressed-slot masking + valid-block flags in from the
@@ -1090,7 +1101,6 @@ def golden_decode_csa_tp1(tensors, cp_full=None):
         return cos_il.contiguous(), (sin_il * sign).contiguous()
 
     idx_cos, idx_sin = interleave_rope(rope_cos_t, rope_sin_t)
-    cmp_cos, cmp_sin = interleave_rope(tensors["cmp_freqs_cos"], tensors["cmp_freqs_sin"])
 
     q = torch.zeros(tokens, H, HEAD_DIM, dtype=torch.bfloat16)
     kv = torch.zeros(tokens, HEAD_DIM, dtype=torch.bfloat16)
@@ -1120,7 +1130,9 @@ def golden_decode_csa_tp1(tensors, cp_full=None):
 
     if cp_full is None:
         cmp_x = x_normed
-        cmp_rope_cos, cmp_rope_sin = cmp_cos, cmp_sin
+        cmp_rope_cos, cmp_rope_sin = interleave_rope(
+            tensors["cmp_freqs_cos"], tensors["cmp_freqs_sin"],
+        )
         cmp_state_table = tensors["compress_state_block_table"]
         cmp_positions = position_ids_bsd.reshape(-1)
         cmp_slots = tensors["cmp_slot_mapping"].to(torch.int64)
@@ -1644,7 +1656,7 @@ def build_distributed_tensor_specs(local_t, start_pos=None):
     # Token rows and requests the rank owns. Everything else is either a
     # replicated weight or the group's full stream, which every rank holds.
     local_token_names = frozenset({
-        "x_hc", "freqs_cos", "freqs_sin", "cmp_freqs_cos", "cmp_freqs_sin",
+        "x_hc", "freqs_cos", "freqs_sin",
         "window_swa_indices", "window_swa_lens",
         "position_ids",
     })
@@ -1656,9 +1668,10 @@ def build_distributed_tensor_specs(local_t, start_pos=None):
         "ori_slot_mapping", "cmp_slot_mapping", "state_slot_mapping",
         "idx_slot_mapping", "inner_state_slot_mapping",
         "compress_state_block_table", "inner_compress_state_block_table",
+        "cmp_freqs_cos", "cmp_freqs_sin",
     })
     # Consumed on both sides: the rank's rows plus a replicated full-stream twin.
-    dual_names = ("freqs_cos", "freqs_sin", "cmp_freqs_cos", "cmp_freqs_sin", "position_ids")
+    dual_names = ("freqs_cos", "freqs_sin", "position_ids")
     resident_names = frozenset({
         "hc_attn_fn", "hc_attn_scale", "hc_attn_base",
         "attn_norm_w", "wq_a", "wq_b", "wq_b_scale", "wkv",

@@ -31,8 +31,9 @@ import pypto.language as pl
 from config import FLASH as M, DECODE_BATCH
 
 
-# Dynamic shape variables.
-B_DYN = pl.dynamic("B_DYN")  # runtime request count
+# Dynamic shape variables. Its callers run it over the CP group's request count
+# while their own request axis stays rank-local, so it carries its own symbol.
+B_DYN = pl.dynamic("ROPE_IL_B_DYN")  # runtime request count
 
 # model config
 # Capacity spans the CP group's requests: the compressor consumers run over the
