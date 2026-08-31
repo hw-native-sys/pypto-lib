@@ -56,11 +56,10 @@ ORI_BLOCK_NUM = KV_ORI_BLOCK_NUM
 # tiling
 AIC_CORES = 24
 AIV_CORES = 48
-GATHER_TASKS = 32                     # leaves 16 AIV for the concurrent qproj_dequant grid
-GATHER_T = max(1, T // GATHER_TASKS)  # tokens per gather task
 QK_TASKS = AIC_CORES                  # 1 AIC + 2 AIV records each -> 24 AIC + 48 AIV
 MERGE_TASKS = AIV_CORES               # pure AIV, one full wave
 GATHER_RUN = 16          # window sub-tile probed for physical contiguity -> one bulk DMA
+REQUEST_KV_ROWS = WIN + S - 1
 H_TILE = 32
 QK_M_TILE = 32           # qk_pv M rows per QK/PV matmul; upper bound on H_TILE
 ATTN_K_TILE = 128
@@ -96,6 +95,7 @@ def sparse_attn_swa(
     q: pl.Tensor[[T_DYN, H, HEAD_DIM], pl.BF16],
     ori_kv: pl.Tensor[[ORI_BLOCK_NUM_DYN, BLOCK_SIZE, 1, HEAD_DIM], pl.BF16],
     swa_indices: pl.Tensor[[T_DYN, WIN], pl.INT32],
+    swa_lens: pl.Tensor[[T_DYN], pl.INT32],
     sparse_bias: pl.Tensor[[T_DYN, PADDED_TOPK], pl.FP32],
     freqs_cos: pl.Tensor[[T_DYN, ROPE_DIM], pl.BF16],
     freqs_sin: pl.Tensor[[T_DYN, ROPE_DIM], pl.BF16],
@@ -103,62 +103,88 @@ def sparse_attn_swa(
     """Gather window KV, run QK/PV, and build inverse-RoPE metadata."""
     t_dim = pl.tensor.dim(q, 0)
     t_heads = t_dim * H
-    t_win = t_dim * WIN
+    request_count = t_dim // S
     t_blk = t_dim * (H // H_TILE) * SPARSE_BLOCKS * H_TILE
-    t_gather = (t_dim + GATHER_T - 1) // GATHER_T
     rope_cs_blocks = t_dim // ROPE_CS_T_TILE
     ori_block_num = pl.tensor.dim(ori_kv, 0)
     ori_kv_flat = pl.reshape(ori_kv, [ori_block_num * BLOCK_SIZE, HEAD_DIM])
-    # SWA metadata already lowered each logical window row to a physical cache
-    # slot. Current decode tokens must be inserted into ori_kv by the caller
-    # before this function runs; there is no speculative overlay path here.
-
-    swa_kv_flat = pl.create_tensor([t_win, HEAD_DIM], dtype=pl.BF16)
+    # Consecutive speculative queries share one historical prefix. The caller
+    # has already committed every current KV row to ``ori_kv``. Stage token 0's
+    # complete window once per request, append tokens 1..S-1 from the cache,
+    # and let query i read [i, i + WIN).
+    swa_kv_flat = pl.create_tensor([request_count * REQUEST_KV_ROWS, HEAD_DIM], dtype=pl.BF16)
     gather_tids = pl.array.create(1, pl.TASK_ID)
-    with pl.spmd(t_gather, name_hint="swa_gather_kv") as gather_tid:
-        g_grp = pl.tile.get_block_idx()
-        for g_tok in pl.unroll(GATHER_T):
-            g_t = g_grp * GATHER_T + g_tok
-            if g_t < t_dim:
-                g_base = g_t * WIN
-                # Probe each sub-tile's first/last slot: endpoints
-                # GATHER_RUN-1 apart mean the whole run sits in one paged block
-                # and moves as one bulk copy.
-                for g_sub in pl.range(WIN // GATHER_RUN):
-                    g_sr0 = g_sub * GATHER_RUN
-                    g_sdst = g_base + g_sr0
-                    g_first = pl.read(swa_indices, [g_t, g_sr0])
-                    g_last = pl.read(swa_indices, [g_t, g_sr0 + GATHER_RUN - 1])
-                    # A -1 slot anywhere in the run pins g_run_ok below the
-                    # match value, so an invalid or block-straddling run takes
-                    # the per-row path.
-                    g_run_ok = ((g_last - g_first) + pl.min(g_first, 0) * GATHER_RUN)
-                    if g_run_ok == GATHER_RUN - 1:
-                        g_run_src = pl.cast(g_first, pl.INDEX)
-                        swa_kv_flat[
-                            g_sdst : g_sdst + GATHER_RUN, 0 : HEAD_DIM,
-                        ] = ori_kv_flat[
-                            g_run_src : g_run_src + GATHER_RUN, 0 : HEAD_DIM,
-                        ]
-                    else:
-                        for g_dr in pl.range(GATHER_RUN):
+    with pl.spmd(request_count, name_hint="swa_gather_kv") as gather_tid:
+        g_req = pl.tile.get_block_idx()
+        g_t0 = g_req * S
+        g_base = g_req * REQUEST_KV_ROWS
+        g_first_len = pl.read(swa_lens, [g_t0])
+        g_first_pad = WIN - g_first_len
+        swa_kv_flat[
+            g_base : g_base + REQUEST_KV_ROWS, 0 : HEAD_DIM,
+        ] = pl.full([REQUEST_KV_ROWS, HEAD_DIM], dtype=pl.BF16, value=0.0)
+
+        for g_sub in pl.range((WIN - 1) // GATHER_RUN):
+            g_sr0 = g_sub * GATHER_RUN
+            g_sdst = g_base + g_first_pad + g_sr0
+            if g_sr0 + GATHER_RUN <= g_first_len:
+                g_first = pl.read(swa_indices, [g_t0, g_sr0])
+                g_last = pl.read(swa_indices, [g_t0, g_sr0 + GATHER_RUN - 1])
+                g_run_ok = ((g_last - g_first) + pl.min(g_first, 0) * GATHER_RUN)
+                if g_run_ok == GATHER_RUN - 1:
+                    g_run_src = pl.cast(g_first, pl.INDEX)
+                    swa_kv_flat[
+                        g_sdst : g_sdst + GATHER_RUN, 0 : HEAD_DIM,
+                    ] = ori_kv_flat[
+                        g_run_src : g_run_src + GATHER_RUN, 0 : HEAD_DIM,
+                    ]
+                else:
+                    for g_dr in pl.range(GATHER_RUN):
+                        g_slot_i32 = pl.read(swa_indices, [g_t0, g_sr0 + g_dr])
+                        if g_slot_i32 >= 0:
+                            g_slot = pl.cast(g_slot_i32, pl.INDEX)
                             g_dst = g_sdst + g_dr
-                            g_slot_i32 = pl.read(swa_indices, [g_t, g_sr0 + g_dr])
-                            if g_slot_i32 >= 0:
-                                g_slot = pl.cast(g_slot_i32, pl.INDEX)
-                                swa_kv_flat[
-                                    g_dst : g_dst + 1, 0 : HEAD_DIM,
-                                ] = ori_kv_flat[
-                                    g_slot : g_slot + 1, 0 : HEAD_DIM,
-                                ]
-                            else:
-                                swa_kv_flat[
-                                    g_dst : g_dst + 1, 0 : HEAD_DIM,
-                                ] = pl.full(
-                                    [1, HEAD_DIM],
-                                    dtype=pl.BF16,
-                                    value=0.0,
-                                )
+                            swa_kv_flat[
+                                g_dst : g_dst + 1, 0 : HEAD_DIM,
+                            ] = ori_kv_flat[
+                                g_slot : g_slot + 1, 0 : HEAD_DIM,
+                            ]
+            else:
+                for g_dr in pl.range(GATHER_RUN):
+                    g_row = g_sr0 + g_dr
+                    if g_row < g_first_len:
+                        g_slot_i32 = pl.read(swa_indices, [g_t0, g_row])
+                        if g_slot_i32 >= 0:
+                            g_slot = pl.cast(g_slot_i32, pl.INDEX)
+                            g_dst = g_base + g_first_pad + g_row
+                            swa_kv_flat[
+                                g_dst : g_dst + 1, 0 : HEAD_DIM,
+                            ] = ori_kv_flat[
+                                g_slot : g_slot + 1, 0 : HEAD_DIM,
+                            ]
+
+        for g_row in pl.range(((WIN - 1) // GATHER_RUN) * GATHER_RUN, WIN):
+            if g_row < g_first_len:
+                g_slot_i32 = pl.read(swa_indices, [g_t0, g_row])
+                if g_slot_i32 >= 0:
+                    g_slot = pl.cast(g_slot_i32, pl.INDEX)
+                    g_dst = g_base + g_first_pad + g_row
+                    swa_kv_flat[
+                        g_dst : g_dst + 1, 0 : HEAD_DIM,
+                    ] = ori_kv_flat[
+                        g_slot : g_slot + 1, 0 : HEAD_DIM,
+                    ]
+
+        for g_token in pl.unroll(S - 1):
+            g_t = g_t0 + g_token + 1
+            g_len = pl.read(swa_lens, [g_t])
+            g_slot_i32 = pl.read(swa_indices, [g_t, g_len - 1])
+            if g_slot_i32 >= 0:
+                g_slot = pl.cast(g_slot_i32, pl.INDEX)
+                g_dst = g_base + WIN + g_token
+                swa_kv_flat[g_dst : g_dst + 1, 0 : HEAD_DIM] = ori_kv_flat[
+                    g_slot : g_slot + 1, 0 : HEAD_DIM,
+                ]
 
     gather_tids[0] = gather_tid
 
@@ -177,7 +203,9 @@ def sparse_attn_swa(
             for qk_sb in pl.unroll(SPARSE_BLOCKS):
                 qk_s0 = qk_sb * ATTN_K_TILE
                 qk_bias_row = sparse_bias[qk_t : qk_t + 1, qk_s0 : qk_s0 + ATTN_K_TILE]
-                qk_base = qk_t * WIN + qk_s0
+                qk_request = qk_t // S
+                qk_token = qk_t - qk_request * S
+                qk_base = qk_request * REQUEST_KV_ROWS + qk_token + qk_s0
                 qk_kv = swa_kv_flat[qk_base : qk_base + ATTN_K_TILE, 0 : HEAD_DIM]
 
                 # Both head batches share one token task and one L1-resident KV tile.
@@ -264,6 +292,7 @@ def sparse_attn_swa_tp1(
     q: pl.Tensor[[T_DYN, H, HEAD_DIM], pl.BF16],
     ori_kv: pl.Tensor[[ORI_BLOCK_NUM_DYN, BLOCK_SIZE, 1, HEAD_DIM], pl.BF16],
     swa_indices: pl.Tensor[[T_DYN, WIN], pl.INT32],
+    swa_lens: pl.Tensor[[T_DYN], pl.INT32],
     sparse_bias: pl.Tensor[[T_DYN, PADDED_TOPK], pl.FP32],
     attn_sink: pl.Tensor[[H], pl.FP32],
     freqs_cos: pl.Tensor[[T_DYN, ROPE_DIM], pl.BF16],
@@ -276,7 +305,7 @@ def sparse_attn_swa_tp1(
         rope_cos_il, rope_sin_signed, rope_swap_idx,
         qk_tid, rope_tid,
     ) = sparse_attn_swa(
-        q, ori_kv, swa_indices, sparse_bias,
+        q, ori_kv, swa_indices, swa_lens, sparse_bias,
         freqs_cos, freqs_sin,
     )
     t_dim = pl.tensor.dim(q, 0)
@@ -350,11 +379,13 @@ def sparse_attn_swa_test(
             v_t0 = vb * BIAS_T_TILE
             v_col_m = pl.col_expand(pl.full([BIAS_T_TILE, ATTN_K_TILE], dtype=pl.FP32, value=0.0), v_col)
             v_lens = pl.cast(pl.reshape(swa_lens[v_t0 : v_t0 + BIAS_T_TILE], [BIAS_T_TILE, 1]), target_type=pl.FP32)
-            v_valid = pl.minimum(pl.maximum(pl.neg(pl.row_expand_sub(v_col_m, v_lens)), 0.0), 1.0)
-            sparse_bias[v_t0 : v_t0 + BIAS_T_TILE, 0:ATTN_K_TILE] = pl.mul(pl.sub(v_valid, 1.0), -NEG_INF)
+            v_invalid_front = pl.neg(pl.sub(v_lens, WIN))
+            v_before_valid = pl.neg(pl.row_expand_sub(v_col_m, v_invalid_front))
+            v_invalid = pl.minimum(pl.maximum(v_before_valid, 0.0), 1.0)
+            sparse_bias[v_t0 : v_t0 + BIAS_T_TILE, 0:ATTN_K_TILE] = pl.mul(v_invalid, NEG_INF)
     o_packed_flat = pl.reshape(o_packed_heads, [O_GROUPS * T_PAD * HEADS_PER_GROUP, HEAD_DIM])
     o_packed_flat, _ = sparse_attn_swa_tp1(
-        q, ori_kv, swa_indices, sparse_bias,
+        q, ori_kv, swa_indices, swa_lens, sparse_bias,
         attn_sink, freqs_cos, freqs_sin,
         o_packed_flat,
     )
