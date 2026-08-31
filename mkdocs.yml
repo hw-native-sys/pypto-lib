@@ -91,7 +91,7 @@ nav:
       - Overview: models/index.md
       - Qwen3-14B:
           - Model overview: models/qwen3_14b/index.md
-          - PyPTO Page Attention: models/qwen3_14b/paged_attention_pypto.html
+          - PyPTO Page Attention: models/qwen3_14b/paged_attention_pypto.md
       - DeepSeek V4-Flash (MTP): models/deepseek_v4_flash_mtp.md
       - DeepSeek V4-Pro: models/deepseek_v4_pro.md
   - Debug and Tune:

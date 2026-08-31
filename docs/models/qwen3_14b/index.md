@@ -83,7 +83,7 @@ through `pl.jit.extern`, while
 [rope_qkv_regen.py](../../../models/qwen3_14b/rope_qkv_regen.py) regenerates its
 embedded Phase-0 header. Production `decode_fwd` does not call this CCE path.
 
-The standalone [PyPTO Page Attention tutorial](paged_attention_pypto.html)
+The standalone [PyPTO Page Attention tutorial](paged_attention_pypto.md)
 walks through the native kernel in implementation order, from task/page/stack
 decomposition to the mixed AIC/AIV software pipeline.
 
