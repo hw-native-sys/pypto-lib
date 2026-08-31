@@ -371,6 +371,40 @@ def _prepare_inputs(
     return tensors, scalar_specs_eff, {}
 
 
+def _ordered_args(
+    specs: list[TensorSpec | ScalarSpec],
+    tensors: dict[str, torch.Tensor],
+    scalar_specs_eff: dict[str, ScalarSpec],
+    *,
+    ctypes_scalars: bool,
+    benchmark_dispatch_index: int | None = None,
+) -> list[Any]:
+    """Positional dispatch args in spec order.
+
+    Spec order *is* the compiled parameter order:
+    :func:`_validate_compiled_spec_abi` rejects any artifact whose parameter
+    names differ from the spec names element by element, so no name-keyed
+    reordering is needed here.
+
+    ``execute_compiled`` takes ctypes scalars; an L3 dispatch takes the 0-dim
+    value tensor. *benchmark_dispatch_index* advances a stepped scalar to its
+    value for that physical benchmark dispatch.
+    """
+    args: list[Any] = []
+    for spec in specs:
+        if isinstance(spec, TensorSpec):
+            args.append(tensors[spec.name])
+            continue
+        scalar = scalar_specs_eff[spec.name]
+        if ctypes_scalars:
+            args.append(scalar.to_ctypes())
+        elif benchmark_dispatch_index is None:
+            args.append(scalar.value)
+        else:
+            args.append(scalar.value_for_benchmark_dispatch(benchmark_dispatch_index))
+    return args
+
+
 def _execute_via_runner(
     work_dir: Path,
     specs: list[TensorSpec | ScalarSpec],
@@ -378,13 +412,10 @@ def _execute_via_runner(
     scalar_specs_eff: dict[str, ScalarSpec],
     runtime_cfg: dict[str, Any],
 ) -> None:
-    """Reorder args to orchestration param order and dispatch via ``execute_compiled``."""
+    """Dispatch via ``execute_compiled`` in orchestration param order."""
     from pypto.runtime import execute_compiled
 
-    ordered: list[Any] = [
-        tensors[s.name] if isinstance(s, TensorSpec) else scalar_specs_eff[s.name].to_ctypes()
-        for s in specs
-    ]
+    ordered = _ordered_args(specs, tensors, scalar_specs_eff, ctypes_scalars=True)
     execute_compiled(work_dir, ordered, **_execute_compiled_kwargs(runtime_cfg))
 
 
@@ -512,8 +543,8 @@ def _run_benchmark(
     L2 single-chip only: delegates to :func:`pypto.runtime.benchmark`, which
     opens one :class:`~pypto.runtime.ChipWorker`, registers *compiled* once, and
     reads each launch's on-NPU span tree from the runtime's ``[STRACE]``
-    markers (simpler PR #1177). Args are reordered to the
-    orchestration parameter order exactly as :func:`_execute_via_runner` does.
+    markers (simpler PR #1177). Args are built in spec order by
+    :func:`_ordered_args`, exactly as :func:`_execute_via_runner` does.
     Returns the :class:`~pypto.runtime.BenchmarkStats`, or ``None`` when the
     runtime emits no markers (built without ``SIMPLER_PROFILING``).
     """
@@ -526,10 +557,7 @@ def _run_benchmark(
 
     from pypto.runtime import benchmark
 
-    ordered: list[Any] = [
-        tensors[s.name] if isinstance(s, TensorSpec) else scalar_specs_eff[s.name].to_ctypes()
-        for s in specs
-    ]
+    ordered = _ordered_args(specs, tensors, scalar_specs_eff, ctypes_scalars=True)
     platform = runtime_cfg.get("platform")
     device_id = runtime_cfg.get("device_id")
     stats = None
@@ -743,37 +771,6 @@ def _report_l3_per_rank(stats: Any) -> None:
             _print_eff_summary(label, samples, indent=7)
 
 
-def _l3_ordered_args(
-    compiled: Any,
-    specs: list[TensorSpec | ScalarSpec],
-    tensors: dict[str, torch.Tensor],
-    scalar_specs_eff: dict[str, ScalarSpec],
-    *,
-    benchmark_dispatch_index: int | None = None,
-) -> list[Any]:
-    """Positional dispatch args for an L3 program, in orchestration param order.
-
-    Builds a name→value map from *specs* (tensors as host tensors, scalars as
-    their Python value) then reorders it to the compiled program's parameter
-    order, stripping SSA suffixes ``orig__ssa_vN`` -> ``orig`` (the same mapping
-    :func:`_try_l3_dispatch` uses).
-    """
-    arg_map: dict[str, Any] = {}
-    for s in specs:
-        if isinstance(s, TensorSpec):
-            arg_map[s.name] = tensors[s.name]
-        else:
-            scalar = scalar_specs_eff[s.name]
-            arg_map[s.name] = (
-                scalar.value
-                if benchmark_dispatch_index is None
-                else scalar.value_for_benchmark_dispatch(benchmark_dispatch_index)
-            )
-    ordered_names = _l3_ordered_names(compiled)
-    _validate_l3_arg_names(ordered_names, [s.name for s in specs])
-    return [arg_map[name] for name in ordered_names]
-
-
 def _run_benchmark_l3(
     compiled: Any,
     specs: list[TensorSpec | ScalarSpec],
@@ -812,7 +809,7 @@ def _run_benchmark_l3(
     # L3 dispatch reads IO through the fork-inherited shared mapping; validation
     # (after this) then reads the device-written outputs back from these buffers.
     _share_in_place(tensors)
-    ordered = _l3_ordered_args(compiled, specs, tensors, scalar_specs_eff)
+    ordered = _ordered_args(specs, tensors, scalar_specs_eff, ctypes_scalars=False)
     stats = None
     with _Stage("benchmark"):
         try:
@@ -857,7 +854,7 @@ def _try_l3_dispatch(
     if not isinstance(compiled, DistributedCompiledProgram):
         return False
 
-    ordered = _l3_ordered_args(compiled, specs, tensors, scalar_specs_eff)
+    ordered = _ordered_args(specs, tensors, scalar_specs_eff, ctypes_scalars=False)
     run_config = _l3_run_config(runtime_cfg)
     compiled(*ordered, config=run_config)
     return True
@@ -884,39 +881,6 @@ def _strip_ssa_suffix(name: str) -> str:
     """Strip only a terminal ``__ssa_vN`` suffix from a compiled parameter name."""
     base, marker, version = name.rpartition("__ssa_v")
     return base if marker and version.isdigit() else name
-
-
-def _l3_ordered_names(compiled: Any) -> list[str]:
-    """Parameter names in orchestration order (SSA suffix ``orig__ssa_vN`` -> ``orig``)."""
-    param_infos, _, _ = compiled._get_metadata()
-    names = [_strip_ssa_suffix(p.name) for p in param_infos]
-    if len(set(names)) != len(names):
-        raise ValueError("compiled L3 parameters collide after stripping SSA suffixes")
-    return names
-
-
-def _validate_l3_arg_names(compiled_names: list[str], provided_names: list[str]) -> None:
-    """Require an exact source-spec ↔ compiled-artifact parameter ABI match."""
-    duplicate_specs = sorted(
-        {name for name in provided_names if provided_names.count(name) > 1}
-    )
-    compiled_set = set(compiled_names)
-    provided_set = set(provided_names)
-    missing_specs = sorted(compiled_set - provided_set)
-    stale_specs = sorted(provided_set - compiled_set)
-    if not duplicate_specs and not missing_specs and not stale_specs:
-        return
-
-    details = []
-    if duplicate_specs:
-        details.append(f"duplicate specs={duplicate_specs}")
-    if missing_specs:
-        details.append(f"compiled parameters without specs={missing_specs}")
-    if stale_specs:
-        details.append(f"specs absent from compiled artifact={stale_specs}")
-    raise ValueError(
-        "L3 parameter ABI mismatch (" + "; ".join(details) + "); recompile the artifact"
-    )
 
 
 def _direction_names() -> dict[Any, str]:
@@ -983,7 +947,7 @@ def _validate_compiled_spec_abi(
             + "; ".join(details)
             + "); recompile the artifact"
         )
-    if not _is_l3(compiled) and compiled_names != provided_names:
+    if compiled_names != provided_names:
         raise ValueError(
             "compiled parameter ABI mismatch (parameter order "
             f"spec={provided_names} artifact={compiled_names}); recompile the artifact"
@@ -1045,10 +1009,9 @@ def _l3_pure_out_names(compiled: Any) -> set[str]:
     from pypto.ir import ParamDirection
 
     param_infos, _, _ = compiled._get_metadata()
-    normalized_names = _l3_ordered_names(compiled)
     return {
-        name
-        for name, p in zip(normalized_names, param_infos, strict=True)
+        _strip_ssa_suffix(p.name)
+        for p in param_infos
         if p.direction == ParamDirection.Out
     }
 
@@ -1134,7 +1097,7 @@ def _readback_resident_outputs(
 
 def _run_l3_resident(
     compiled: Any,
-    tensor_specs: list[TensorSpec],
+    specs: list[TensorSpec | ScalarSpec],
     tensors: dict[str, torch.Tensor],
     scalar_specs_eff: dict[str, ScalarSpec],
     runtime_cfg: dict[str, Any],
@@ -1187,14 +1150,11 @@ def _run_l3_resident(
     # Per-call IO + resident upload sources must be shared memory before prepare().
     _share_in_place(tensors)
 
-    ordered_names = _l3_ordered_names(compiled)
-    _validate_l3_arg_names(
-        ordered_names,
-        [*tensors.keys(), *scalar_specs_eff.keys()],
-    )
+    ordered_names = [spec.name for spec in specs]
     pure_out_names = _l3_pure_out_names(compiled)
     run_config = _l3_run_config(runtime_cfg)
-    resident_specs = [s for s in tensor_specs if s.is_resident]
+    tensor_specs = [spec for spec in specs if isinstance(spec, TensorSpec)]
+    resident_specs = [spec for spec in tensor_specs if spec.is_resident]
     bench = _bench_enabled() if benchmark_enabled is None else benchmark_enabled
 
     def _dispatch_resident(
@@ -1641,7 +1601,7 @@ def run(
         with _Stage("runtime"):
             try:
                 bench = _run_l3_resident(
-                    compiled, tensor_specs, tensors, scalar_specs_eff,
+                    compiled, specs, tensors, scalar_specs_eff,
                     runtime_cfg, golden_outputs, rtol, atol, compare_fn,
                     benchmark_enabled=benchmark_enabled,
                 )
@@ -1894,7 +1854,7 @@ def run_jit(
         with _Stage("runtime"):
             try:
                 bench = _run_l3_resident(
-                    compiled, tensor_specs, tensors, scalar_specs_eff,
+                    compiled, specs, tensors, scalar_specs_eff,
                     runtime_cfg, golden_outputs, rtol, atol, compare_fn,
                     benchmark_enabled=benchmark_enabled,
                 )

@@ -28,7 +28,6 @@ from golden.runner import (
     _backend_for_platform,
     _bench_loop_sizes,
     _format_stale_paths,
-    _l3_ordered_args,
     _maybe_reload_l3,
     _prepare_inputs,
     _report_effective,
@@ -43,6 +42,7 @@ from golden.runner import (
     _setup_runtime_dir,
     _share_in_place,
     _stale_cpps,
+    _validate_compiled_spec_abi,
 )
 
 
@@ -1899,7 +1899,7 @@ def test_l3_benchmark_reuses_persistent_windows_without_runtime_reset(monkeypatc
     fake_runtime.benchmark = _benchmark
     compiled = object()
     tensors = {"x": torch.zeros(1)}
-    monkeypatch.setattr("golden.runner._l3_ordered_args", lambda *_a: ["ORDERED"])
+    monkeypatch.setattr("golden.runner._ordered_args", lambda *_a, **_k: ["ORDERED"])
     monkeypatch.setattr("golden.runner._l3_run_config", lambda _cfg: "RUNCFG")
 
     with patch.dict(sys.modules, {"pypto.runtime": fake_runtime}):
@@ -1973,7 +1973,7 @@ def test_benchmark_propagates_device_runtime_error(monkeypatch, l3):
     with patch.dict(sys.modules, {"pypto.runtime": fake_runtime}):
         with pytest.raises(RuntimeError, match="DEVICE DISPATCH FAILED"):
             if l3:
-                monkeypatch.setattr("golden.runner._l3_ordered_args", lambda *_a: [])
+                monkeypatch.setattr("golden.runner._ordered_args", lambda *_a, **_k: [])
                 monkeypatch.setattr("golden.runner._l3_run_config", lambda _cfg: "RUNCFG")
                 _run_benchmark_l3(object(), [], {}, {}, {}, rounds=1, warmup=1)
             else:
@@ -1986,7 +1986,7 @@ def test_l3_benchmark_tolerates_only_missing_strace(monkeypatch):
 
     fake_runtime = types.ModuleType("pypto.runtime")
     fake_runtime.benchmark = _benchmark
-    monkeypatch.setattr("golden.runner._l3_ordered_args", lambda *_a: [])
+    monkeypatch.setattr("golden.runner._ordered_args", lambda *_a, **_k: [])
     monkeypatch.setattr("golden.runner._l3_run_config", lambda _cfg: "RUNCFG")
     with patch.dict(sys.modules, {"pypto.runtime": fake_runtime}):
         assert _run_benchmark_l3(object(), [], {}, {}, {}, rounds=1, warmup=1) is None
@@ -2024,48 +2024,60 @@ def test_l2_benchmark_rejects_stepped_scalar():
 
 
 class TestL3ParameterAbi:
+    """L3 goes through the same spec-order ABI gate as L2: nothing rebinds a
+    spec list that drifted from the kernel signature."""
+
     @staticmethod
-    def _compiled(*names):
-        return types.SimpleNamespace(
-            _get_metadata=lambda: (
-                [types.SimpleNamespace(name=name) for name in names],
-                None,
-                None,
-            )
-        )
+    def _compiled(*infos):
+        return types.SimpleNamespace(_get_metadata=lambda: (list(infos), None, None))
+
+    @staticmethod
+    def _x_info(name="x__ssa_v0"):
+        return _l3_info(name, shape=[1], dtype=torch.float32)
+
+    @staticmethod
+    def _epoch_info(name="epoch__ssa_v0"):
+        return _l3_info(name, dtype=torch.int32)
 
     def test_extra_spec_rejected_for_stale_artifact(self):
-        compiled = self._compiled("x__ssa_v0")
+        compiled = self._compiled(self._x_info())
         specs = [
             TensorSpec("x", [1], torch.float32),
             ScalarSpec("moe_epoch_base", torch.int32, 0),
         ]
-        with pytest.raises(ValueError, match="moe_epoch_base.*recompile"):
-            _l3_ordered_args(
-                compiled,
-                specs,
-                {"x": torch.zeros(1)},
-                {"moe_epoch_base": specs[1]},
-            )
+        with _l3_abi_environment():
+            with pytest.raises(ValueError, match="moe_epoch_base.*recompile"):
+                _validate_compiled_spec_abi(compiled, specs)
 
     def test_compiled_parameter_without_spec_rejected(self):
-        compiled = self._compiled("x__ssa_v0", "moe_epoch_base__ssa_v0")
-        specs = [TensorSpec("x", [1], torch.float32)]
-        with pytest.raises(ValueError, match="moe_epoch_base.*recompile"):
-            _l3_ordered_args(compiled, specs, {"x": torch.zeros(1)}, {})
-
-    def test_exact_abi_reorders_and_strips_terminal_ssa_suffix(self):
-        compiled = self._compiled("epoch__ssa_v3", "x__ssa_v0")
-        epoch = ScalarSpec("epoch", torch.int32, 7)
-        x = torch.zeros(1)
-        ordered = _l3_ordered_args(
-            compiled,
-            [TensorSpec("x", [1], torch.float32), epoch],
-            {"x": x},
-            {"epoch": epoch},
+        compiled = self._compiled(
+            self._x_info(), self._epoch_info("moe_epoch_base__ssa_v0")
         )
-        assert ordered[0] is epoch.value
-        assert ordered[1] is x
+        specs = [TensorSpec("x", [1], torch.float32)]
+        with _l3_abi_environment():
+            with pytest.raises(ValueError, match="moe_epoch_base.*recompile"):
+                _validate_compiled_spec_abi(compiled, specs)
+
+    def test_spec_order_mismatch_rejected(self):
+        """Same names, wrong order — previously rescued by the name-keyed reorder."""
+        compiled = self._compiled(self._epoch_info("epoch__ssa_v3"), self._x_info())
+        specs = [
+            TensorSpec("x", [1], torch.float32),
+            ScalarSpec("epoch", torch.int32, 7),
+        ]
+        with _l3_abi_environment():
+            with pytest.raises(ValueError, match="parameter order"):
+                _validate_compiled_spec_abi(compiled, specs)
+
+    def test_matching_order_accepted_and_terminal_ssa_suffix_stripped(self):
+        compiled = self._compiled(self._x_info(), self._epoch_info("epoch__ssa_v3"))
+        specs = [
+            TensorSpec("x", [1], torch.float32),
+            ScalarSpec("epoch", torch.int32, 7),
+        ]
+        with _l3_abi_environment():
+            _validate_compiled_spec_abi(compiled, specs)
+        assert specs[0].direction == "in"
 
 
 class TestResidentPath:
@@ -2209,7 +2221,6 @@ class TestResidentPath:
         monkeypatch.setenv("PYPTO_BENCH", "1")
         monkeypatch.setenv("PYPTO_BENCH_ROUNDS", "3")
         monkeypatch.setenv("PYPTO_BENCH_WARMUP", "2")
-        monkeypatch.setattr(R, "_l3_ordered_names", lambda _c: ["state", "epoch"])
         monkeypatch.setattr(R, "_l3_pure_out_names", lambda _c: set())
         monkeypatch.setattr(R, "_l3_run_config", lambda _cfg: "RUNCFG")
 
@@ -2221,15 +2232,12 @@ class TestResidentPath:
                 "pypto.runtime.log_config": fake_log,
             },
         ):
+            epoch_spec = ScalarSpec("epoch", torch.int32, 0, benchmark_step=43)
             result = R._run_l3_resident(
                 compiled=_FakeDCP(),
-                tensor_specs=[state_spec],
+                specs=[state_spec, epoch_spec],
                 tensors={"state": state_init},
-                scalar_specs_eff={
-                    "epoch": ScalarSpec(
-                        "epoch", torch.int32, 0, benchmark_step=43
-                    )
-                },
+                scalar_specs_eff={"epoch": epoch_spec},
                 runtime_cfg={"platform": "a2a3"},
                 golden_outputs=None,
                 rtol=1e-5,
@@ -2294,7 +2302,6 @@ class TestResidentPath:
         monkeypatch.setenv("PYPTO_BENCH", "1")
         monkeypatch.setenv("PYPTO_BENCH_ROUNDS", "2")
         monkeypatch.setenv("PYPTO_BENCH_WARMUP", "1")
-        monkeypatch.setattr(R, "_l3_ordered_names", lambda _compiled: [])
         monkeypatch.setattr(R, "_l3_pure_out_names", lambda _compiled: set())
         monkeypatch.setattr(R, "_l3_run_config", lambda _cfg: "RUNCFG")
 
@@ -2310,7 +2317,7 @@ class TestResidentPath:
             pytest.raises(RuntimeError, match="persistent dispatch failed"),
         ):
             R._run_l3_resident(
-                compiled=_FakeDCP(), tensor_specs=[], tensors={}, scalar_specs_eff={},
+                compiled=_FakeDCP(), specs=[], tensors={}, scalar_specs_eff={},
                 runtime_cfg={}, golden_outputs=None, rtol=1e-5, atol=1e-5,
                 compare_fn={},
             )
@@ -2389,14 +2396,13 @@ class TestResidentPath:
         specs = [TensorSpec("w", [2, 4], torch.float32, init_value=torch.ones, resident="stacked")]
         tensors = {"w": torch.ones(2, 4)}
         # Avoid real pypto.runtime / backend by stubbing the metadata + config helpers.
-        monkeypatch.setattr(R, "_l3_ordered_names", lambda _c: ["w"])
         monkeypatch.setattr(R, "_l3_pure_out_names", lambda _c: set())
         monkeypatch.setattr(R, "_l3_run_config", lambda _cfg: "RUNCFG")
 
         with patch.dict(sys.modules, {"pypto.ir.distributed_compiled_program": fake_mod}):
             out = R._run_l3_resident(
                 compiled=_FakeDCP(),
-                tensor_specs=specs,
+                specs=specs,
                 tensors=tensors,
                 scalar_specs_eff={},
                 runtime_cfg={"platform": "a2a3"},
@@ -2464,7 +2470,6 @@ class TestResidentPath:
 
         specs = [TensorSpec("y", [2, 4], torch.float32,  resident="stacked")]
         tensors = {"y": torch.zeros(2, 4)}
-        monkeypatch.setattr(R, "_l3_ordered_names", lambda _c: ["y"])
         monkeypatch.setattr(R, "_l3_pure_out_names", lambda _c: {"y"})
         monkeypatch.setattr(R, "_l3_run_config", lambda _cfg: "RUNCFG")
 
@@ -2477,7 +2482,7 @@ class TestResidentPath:
         ):
             R._run_l3_resident(
                 compiled=_FakeDCP(),
-                tensor_specs=specs,
+                specs=specs,
                 tensors=tensors,
                 scalar_specs_eff={},
                 runtime_cfg={"platform": "a2a3"},
@@ -2539,7 +2544,6 @@ class TestResidentPath:
         tensors = {"kv": torch.zeros(2, 4)}
         golden = {"kv": torch.full((2, 4), 7.0)}
 
-        monkeypatch.setattr(R, "_l3_ordered_names", lambda _c: ["kv"])
         monkeypatch.setattr(R, "_l3_pure_out_names", lambda _c: set())
         monkeypatch.setattr(R, "_l3_run_config", lambda _cfg: "RUNCFG")
 
@@ -2559,7 +2563,7 @@ class TestResidentPath:
         with patch.dict(sys.modules, {"pypto.ir.distributed_compiled_program": fake_mod}):
             R._run_l3_resident(
                 compiled=_FakeDCP(),
-                tensor_specs=specs,
+                specs=specs,
                 tensors=tensors,
                 scalar_specs_eff={},
                 runtime_cfg={"platform": "a2a3"},
@@ -2583,7 +2587,7 @@ class TestResidentPath:
             with pytest.raises(ValueError, match="only supported for L3"):
                 _run_l3_resident(
                     compiled=object(),
-                    tensor_specs=[TensorSpec("w", [4], torch.float32, resident=0)],
+                    specs=[TensorSpec("w", [4], torch.float32, resident=0)],
                     tensors={"w": torch.ones(4)},
                     scalar_specs_eff={},
                     runtime_cfg={"platform": "a2a3"},

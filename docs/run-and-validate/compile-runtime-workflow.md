@@ -198,7 +198,11 @@ To stop after compile without touching the device, see `compile_only` under
 Each entry of `specs` is a `TensorSpec` (named tensor, shape, dtype,
 direction) or a `ScalarSpec` (named scalar, dtype, value); see
 `golden/spec.py`. The list is ordered to match the parameter order of the
-top opaque function. For each entry, allocate a torch tensor:
+top opaque function — single-chip and distributed alike. The harness compares
+the spec names against the compiled artifact's parameters element by element
+and fails with `compiled parameter ABI mismatch (parameter order ...)` before
+allocating anything; it never rebinds a mis-ordered list by name. For each
+entry, allocate a torch tensor:
 
 - Pure inputs and inout initial values are filled via `spec.create_tensor()`
   (`init_value=None` creates zeros; random data requires an explicit factory
