@@ -619,7 +619,12 @@ jobs:
             echo "no weight cache at $weights — converting the checkpoint (one-time, ~25 min)"
             source activate.sh
             mkdir -p "$weights"
-            PYTHONPATH="$GITHUB_WORKSPACE/checkout" python models/deepseek_v4_pro/utils/weights_flash.py \
+            # utils.py has no __main__ guard (it is a helper module, not a
+            # case), so the converter runs through its main() entry point. The
+            # model dir goes on PYTHONPATH because the module resolves its
+            # siblings (config, moe, lm_head) as bare imports.
+            PYTHONPATH="$GITHUB_WORKSPACE/checkout:$GITHUB_WORKSPACE/checkout/models/deepseek_v4_pro" \
+              python -c 'import utils; utils.main()' \
               --variant flash --ep 8 --tp 2 --ckpt "$ckpt" --out "$weights"
           fi
           echo "checkpoint: $ckpt"

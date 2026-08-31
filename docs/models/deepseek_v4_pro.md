@@ -124,7 +124,7 @@ prefill_mtp     mtp_projection → prefill_attention_swa → moe → hc_head →
 
 ## Real weights (Flash)
 
-`weights_flash.py` converts the released DeepSeek-V4-Flash checkpoint (hybrid
+`utils.py` converts the released DeepSeek-V4-Flash checkpoint (hybrid
 MXFP4 routed experts + block-FP8 attention/shared-expert linears) into the
 host-tensor ABI of the two forward drivers: FP4/FP8 tensors are dequantized
 and re-quantized to the kernels' INT8 + per-output-channel FP32-scale form,
@@ -132,7 +132,8 @@ per-layer tensors are stacked and EP/TP-sharded exactly like the fixture
 specs. Convert once offline, then point the drivers at the cache:
 
 ```bash
-python models/deepseek_v4_pro/utils/weights_flash.py --variant flash --ep 8 --tp 2 \
+PYTHONPATH=.:models/deepseek_v4_pro python -c 'import utils; utils.main()' \
+    --variant flash --ep 8 --tp 2 \
     --ckpt /path/to/DeepSeek-V4-Flash --out build_output/flash_weights_ep8_tp2
 python models/deepseek_v4_pro/prefill_fwd.py --variant flash --ep 8 --tp 2 \
     -p a5 -d 0,1,2,3,4,5,6,7 --weights build_output/flash_weights_ep8_tp2
@@ -234,7 +235,7 @@ publishes the prompt and the generated text in the run summary under
 every day instead of a pass/fail tick. The runner finds the checkpoint
 through `PYPTO_DSV4_FLASH_CKPT_DIR` in its `.env` (falling back to the A5
 host's `/home/pyptouser/models/DeepSeek-V4-Flash-0731`). The
-`weights_flash.py` cache (ep8/tp2) is resolved in this order:
+`utils.py` cache (ep8/tp2) is resolved in this order:
 `PYPTO_DSV4_FLASH_WEIGHTS_DIR` from the runner's `.env` if set, else the
 shared cache next to the checkpoint (`pypto-weights-cache/flash_ep8_tp2`),
 else the runner's own `CI_CACHE_ROOT/dsv4-flash-weights/flash_ep8_tp2`,
@@ -264,7 +265,7 @@ as exactly what it was.
 | Shared transforms | [rmsnorm.py](../../models/deepseek_v4_pro/rmsnorm.py), [qkv_proj_rope.py](../../models/deepseek_v4_pro/qkv_proj_rope.py), [hc_pre.py](../../models/deepseek_v4_pro/hc_pre.py), [hc_post.py](../../models/deepseek_v4_pro/hc_post.py), [hc_head.py](../../models/deepseek_v4_pro/hc_head.py) |
 | MoE and output | [moe.py](../../models/deepseek_v4_pro/moe.py), [gate.py](../../models/deepseek_v4_pro/gate.py), [expert_shared.py](../../models/deepseek_v4_pro/expert_shared.py), [expert_routed.py](../../models/deepseek_v4_pro/expert_routed.py), [lm_head.py](../../models/deepseek_v4_pro/lm_head.py) |
 | Metadata and host helpers | [config.py](../../models/deepseek_v4_pro/config.py), [decode_metadata.py](../../models/deepseek_v4_pro/decode_metadata.py), [rope_tables.py](../../models/deepseek_v4_pro/rope_tables.py) |
-| Real-weight loading | [weights_flash.py](../../models/deepseek_v4_pro/utils/weights_flash.py) |
+| Real-weight loading | [utils.py](../../models/deepseek_v4_pro/utils.py) |
 | Token loop | [synthetic_token_loop.py](../../models/deepseek_v4_pro/synthetic_token_loop.py) |
 
 `config.py`, `decode_metadata.py`, and `rope_tables.py` have no `__main__`

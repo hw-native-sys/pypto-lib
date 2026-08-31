@@ -1090,7 +1090,7 @@ if __name__ == "__main__":
         cache_outputs=True,
     )
     if args.weights is not None:
-        from utils.weights_flash import apply_real_layer_weights
+        from utils import apply_real_layer_weights
 
         count = apply_real_layer_weights(specs, args.weights, layer_id=args.layer_id, ep=N_RANKS)
         print(f"[RUN] real weights: layer {args.layer_id}, {count} tensors from {args.weights}", flush=True)

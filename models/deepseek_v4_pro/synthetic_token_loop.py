@@ -729,7 +729,7 @@ def _run_session(args, prefill_dir, decode_dir, model_dir):
         )
         weight_specs = None
         if args.weights is not None:
-            from utils.weights_flash import apply_real_weights
+            from utils import apply_real_weights
 
             specs = prefill.build_tensor_specs(start_pos=0, num_tokens=prompt_len)
             count = apply_real_weights(
