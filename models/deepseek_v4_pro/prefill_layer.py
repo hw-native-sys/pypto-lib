@@ -1203,8 +1203,7 @@ def build_tensor_specs(layer_id=2, chunk_lens=DEFAULT_CHUNK_LENS, start_position
 
         dim0 = batch * src.shape[0]
         tensor_specs.append(TensorSpec(packed_name, [N_RANKS, dim0, *src.shape[1:]],
-                                       src.dtype, init_value=make_init(),
-                                       is_output=is_global_pool))
+                                       src.dtype, init_value=make_init()))
 
     # Batch metadata.
     tensor_specs.append(TensorSpec("seq_lens", [N_RANKS, batch], torch.int32, init_value=replicate(seq_lens_t)))
@@ -1232,7 +1231,7 @@ def build_tensor_specs(layer_id=2, chunk_lens=DEFAULT_CHUNK_LENS, start_position
     # InOut, not Out: the kernel writes only the packed chunk rows, and the host zeros
     # must reach the device so valid_ratio_reldiff can check the pad rows are untouched.
     tensor_specs.append(TensorSpec("x_next", [N_RANKS, total_tokens, HC_MULT, D], torch.float32,
-                                   init_value=torch.zeros, is_output=True))
+                                   init_value=torch.zeros))
 
     # Keep static weight parameters device-resident (child_memory), sharded per
     # rank. Dynamic cache/state/table tensors must stay as host tensors because

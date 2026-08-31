@@ -1337,7 +1337,7 @@ def _make_stacked_spec(name, base_specs, cache_block_nums=None):
         return torch.stack(layer_values, dim=1)
 
     # Mutable caches are fixture outputs.
-    return TensorSpec(name, packed_shape, spec.dtype, init_value=init_value, is_output=name in RESIDENT_CACHE_OUTPUT_NAMES)
+    return TensorSpec(name, packed_shape, spec.dtype, init_value=init_value)
 
 
 def _make_o_proj_tp_stacked_spec(name, base_specs):
@@ -1374,7 +1374,7 @@ def _make_o_proj_tp_stacked_spec(name, base_specs):
                     target.copy_(source)
         return packed
 
-    return TensorSpec(name, packed_shape, spec.dtype, init_value=init_value, is_output=False)
+    return TensorSpec(name, packed_shape, spec.dtype, init_value=init_value)
 
 
 def _make_shared_spec(name, base_specs):
@@ -1386,7 +1386,7 @@ def _make_shared_spec(name, base_specs):
     def init_value():
         return _expand_rank_axis(_spec_value(spec, torch), torch)
 
-    return TensorSpec(name, [N_RANKS, *spec.shape[1:]], spec.dtype, init_value=init_value, is_output=False)
+    return TensorSpec(name, [N_RANKS, *spec.shape[1:]], spec.dtype, init_value=init_value)
 
 
 def _align_up(value, alignment):
@@ -1536,7 +1536,7 @@ def build_single_layer_tensor_specs(
     ]
 
     tensor_specs = [
-        TensorSpec(name, list(src.shape), src.dtype, init_value=src.init_value, is_output=src.is_output)
+        TensorSpec(name, list(src.shape), src.dtype, init_value=src.init_value)
         for name, src in attention_specs
     ]
 
@@ -1572,7 +1572,7 @@ def build_single_layer_tensor_specs(
         else:
             tensor_specs.append(spec)
 
-    tensor_specs.append(TensorSpec("x_next", [N_RANKS, T, HC_MULT, D], torch.float32, is_output=True))
+    tensor_specs.append(TensorSpec("x_next", [N_RANKS, T, HC_MULT, D], torch.float32))
     tensor_by_name = {spec.name: spec for spec in tensor_specs}
     missing = [name for name in HOST_TENSOR_ORDER if name not in tensor_by_name]
     if missing:
@@ -1735,7 +1735,7 @@ def build_tensor_specs(
                 group_ids = torch.arange(N_RANKS, dtype=torch.int64) // TP_SIZE
                 return (global_x[group_ids] * 0.05).to(dtype).contiguous()
 
-            specs.append(TensorSpec(name, x_hc_shape, base.dtype, init_value=init_x_hc, is_output=True))
+            specs.append(TensorSpec(name, x_hc_shape, base.dtype, init_value=init_x_hc))
         elif name == "position_ids_local":
             if fixture_case == "ragged2":
                 specs.append(_make_shared_spec(name, base_specs))
@@ -1786,12 +1786,10 @@ def build_tensor_specs(
                 N_RANKS, O_PROJ_SCRATCH_GROUPS, O_PROJ_SCRATCH_RANK, O_PROJ_SCRATCH_INPUT,
                 dtype=torch.bfloat16,
             ),
-            is_output=False,
         ),
         TensorSpec(
             "o_proj_wo_b_full", [N_RANKS, O_PROJ_SCRATCH_D, O_PROJ_SCRATCH_COLS], torch.int8,
             init_value=lambda: torch.zeros(N_RANKS, O_PROJ_SCRATCH_D, O_PROJ_SCRATCH_COLS, dtype=torch.int8),
-            is_output=False,
         ),
     ]
     for spec in o_proj_scratch_specs:
@@ -1800,7 +1798,6 @@ def build_tensor_specs(
     attn_stage = TensorSpec(
         "attn_stage", [N_RANKS, stage_tokens, HC_MULT, D], torch.float32,
         init_value=lambda: torch.zeros(N_RANKS, stage_tokens, HC_MULT, D, dtype=torch.float32),
-        is_output=True,
     )
     attn_stage.resident = "stacked"
     specs.append(attn_stage)
@@ -1808,22 +1805,18 @@ def build_tensor_specs(
         TensorSpec(
             "x_mixed", [N_RANKS, stage_tokens, D], torch.bfloat16,
             init_value=lambda: torch.zeros(N_RANKS, stage_tokens, D, dtype=torch.bfloat16),
-            is_output=False,
         ),
         TensorSpec(
             "post_ffn", [N_RANKS, stage_tokens, HC_MULT], torch.float32,
             init_value=lambda: torch.zeros(N_RANKS, stage_tokens, HC_MULT, dtype=torch.float32),
-            is_output=False,
         ),
         TensorSpec(
             "comb_ffn", [N_RANKS, stage_tokens, HC_MULT * HC_MULT], torch.float32,
             init_value=lambda: torch.zeros(N_RANKS, stage_tokens, HC_MULT * HC_MULT, dtype=torch.float32),
-            is_output=False,
         ),
         TensorSpec(
             "ffn_out", [N_RANKS, local_tokens, D], torch.bfloat16,
             init_value=lambda: torch.zeros(N_RANKS, local_tokens, D, dtype=torch.bfloat16),
-            is_output=False,
         ),
     ]
     for spec in moe_stage_specs:
@@ -1870,9 +1863,9 @@ def build_tensor_specs(
         TensorSpec("lm_head_weight", [N_RANKS, VOCAB_PER_TP, D], torch.bfloat16, init_value=init_lm_head_weight),
         TensorSpec("logit_row_indices", [N_RANKS, MAX_LOGIT_ROWS], torch.int32, init_value=init_logit_row_indices),
         TensorSpec("hidden_workspace", [N_RANKS, stage_tokens, D], torch.bfloat16, init_value=init_hidden_workspace),
-        TensorSpec("x_out", [N_RANKS, stage_tokens, D], torch.bfloat16, is_output=True),
-        TensorSpec("logits", [N_RANKS, MAX_LOGIT_ROWS, LM_HEAD_VOCAB], torch.float32, is_output=True),
-        TensorSpec("sampled_ids", [N_RANKS, MAX_LOGIT_ROWS, SAMPLED_IDS_PAD], torch.int32, is_output=True),
+        TensorSpec("x_out", [N_RANKS, stage_tokens, D], torch.bfloat16),
+        TensorSpec("logits", [N_RANKS, MAX_LOGIT_ROWS, LM_HEAD_VOCAB], torch.float32),
+        TensorSpec("sampled_ids", [N_RANKS, MAX_LOGIT_ROWS, SAMPLED_IDS_PAD], torch.int32),
     ]
     for spec in head_specs:
         spec.resident = "stacked"

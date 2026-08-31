@@ -380,8 +380,8 @@ def build_tensor_specs():
         TensorSpec("owner_rank_table", [NUM_SEGMENTS], torch.int32, init_value=owner_rank),
         TensorSpec("final_win_seg_src", [TAIL_ROWS], torch.int32, init_value=final_segment.to(torch.int32)),
         TensorSpec("final_win_row_src", [TAIL_ROWS], torch.int32, init_value=final_row.to(torch.int32)),
-        TensorSpec("logical_tails_out", [CP_SIZE, CP_TAIL_WINDOW_ROWS, HEAD_DIM], torch.bfloat16, is_output=True),
-        TensorSpec("decode_raw_window_out", [CP_SIZE, TAIL_ROWS, HEAD_DIM], torch.bfloat16, is_output=True),
+        TensorSpec("logical_tails_out", [CP_SIZE, CP_TAIL_WINDOW_ROWS, HEAD_DIM], torch.bfloat16),
+        TensorSpec("decode_raw_window_out", [CP_SIZE, TAIL_ROWS, HEAD_DIM], torch.bfloat16),
     ]
 
 

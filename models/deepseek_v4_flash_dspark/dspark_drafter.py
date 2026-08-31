@@ -1172,8 +1172,8 @@ def build_tensor_specs(batch, *, mode="decode"):
             weight[:, layer * D + diagonal, diagonal] = 1
         return weight
 
-    def ranked(name, shape, dtype, init_value=0, *, output=False, resident=False):
-        spec = TensorSpec(name, [N_RANKS, *shape], dtype, init_value=init_value, is_output=output)
+    def ranked(name, shape, dtype, init_value=0, *, resident=False):
+        spec = TensorSpec(name, [N_RANKS, *shape], dtype, init_value=init_value)
         if resident:
             spec.resident = "stacked"
         return spec
@@ -1201,13 +1201,11 @@ def build_tensor_specs(batch, *, mode="decode"):
             "initial_hidden",
             [N_RANKS, DSPARK_MAX_BATCH * DSPARK_QUERY_PAD, HC_MULT, D],
             torch.float32,
-            is_output=True,
         ),
         TensorSpec(
             "intermediate_hidden",
             [N_RANKS, DSPARK_DRAFT_LAYERS, DSPARK_MAX_BATCH * DSPARK_QUERY_PAD, HC_MULT, D],
             torch.float32,
-            is_output=True,
         ),
         ranked("main_proj_weight", [D, MAIN_IN], torch.bfloat16, init_value=init_main_proj_weight, resident=True),
         ranked("main_norm_weight", [D], torch.bfloat16, init_value=1, resident=True),
@@ -1267,7 +1265,6 @@ def build_tensor_specs(batch, *, mode="decode"):
                 [DSPARK_DRAFT_LAYERS, ORI_BLOCK_NUM, BLOCK_SIZE, 1, HEAD_DIM],
                 torch.bfloat16,
                 init_value=init_kv_caches,
-                output=True,
             ),
             ranked("attn_sink", [DSPARK_DRAFT_LAYERS * H], torch.float32, resident=True),
             ranked("wo_a", [DSPARK_DRAFT_LAYERS * LOCAL_O_GROUPS, O_LORA, O_GROUP_IN], torch.bfloat16, resident=True),
@@ -1310,7 +1307,6 @@ def build_tensor_specs(batch, *, mode="decode"):
                 "head_hidden",
                 [N_RANKS, batch, DSPARK_QUERY_WIDTH, D],
                 torch.bfloat16,
-                is_output=True,
             ),
         ]
     )

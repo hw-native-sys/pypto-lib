@@ -1064,8 +1064,6 @@ def build_tensor_specs(
             inner_state_block_num=inner_state_block_num,
         )
     )
-    for name in ("input_ids", "position_ids", "kv_seq_lens"):
-        specs[name] = replace(specs[name], is_output=True)
 
     def init_tail_token_ids():
         tokens = torch.arange(B, dtype=torch.int64) + 10
@@ -1105,14 +1103,12 @@ def build_tensor_specs(
                 [N_RANKS, B],
                 torch.int64,
                 init_value=init_tail_token_ids,
-                is_output=True,
             ),
             "mtp_tail_positions": TensorSpec(
                 "mtp_tail_positions",
                 [N_RANKS, B],
                 torch.int32,
                 init_value=init_tail_positions,
-                is_output=True,
             ),
             "mtp_tail_slot_ids": TensorSpec(
                 "mtp_tail_slot_ids",
@@ -1131,7 +1127,6 @@ def build_tensor_specs(
                 [N_RANKS, B, STATE_TOKEN_WIDTH],
                 torch.int64,
                 init_value=init_state_tokens,
-                is_output=True,
                 resident="stacked",
             ),
             "mtp_state_meta": TensorSpec(
@@ -1139,33 +1134,28 @@ def build_tensor_specs(
                 [N_RANKS, B, STATE_META_WIDTH],
                 torch.int32,
                 init_value=init_state_meta,
-                is_output=True,
                 resident="stacked",
             ),
             "mtp_input_ids": replace(
                 mtp_specs["input_ids"],
                 name="mtp_input_ids",
                 init_value=None,
-                is_output=True,
             ),
             "mtp_position_ids": replace(
                 mtp_specs["position_ids"],
                 name="mtp_position_ids",
                 init_value=None,
-                is_output=True,
             ),
             "mtp_accepted_counts": TensorSpec(
                 "mtp_accepted_counts",
                 [N_RANKS, B],
                 torch.int32,
-                is_output=True,
             ),
             "mtp_tail_pre_hc_pool": TensorSpec(
                 "mtp_tail_pre_hc_pool",
                 [N_RANKS, B, HC_MULT, D],
                 torch.float32,
                 init_value=lambda: torch.randn(N_RANKS, B, HC_MULT, D),
-                is_output=True,
                 resident="stacked",
             ),
             "mtp_hidden_out": replace(mtp_specs["hidden_out"], name="mtp_hidden_out"),
@@ -1208,17 +1198,6 @@ def build_tensor_specs(
         if name in shared_mtp_names or name in custom_mtp_names:
             continue
         specs[f"mtp_{name}"] = replace(spec, name=f"mtp_{name}")
-
-    sampling_names = {
-        "sampling_temperatures",
-        "sampling_top_ks",
-        "sampling_seeds",
-        "sampling_positions",
-    }
-    for name in sampling_names:
-        specs[name] = replace(specs[name], is_output=True)
-        mtp_name = f"mtp_{name}"
-        specs[mtp_name] = replace(specs[mtp_name], is_output=True)
 
     param_names = l3_decode_fwd_mtp._param_names()
     missing = set(param_names) - specs.keys()

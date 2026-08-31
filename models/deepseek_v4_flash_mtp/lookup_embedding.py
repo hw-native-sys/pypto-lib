@@ -79,7 +79,7 @@ def build_tensor_specs(token_count, vocab_size):
     return [
         TensorSpec("input_ids", [token_count], torch.int64, init_value=init_input_ids),
         TensorSpec("embed_weight", [vocab_size, D], torch.bfloat16, init_value=init_embed_weight),
-        TensorSpec("hidden_states", [token_count, D], torch.bfloat16, is_output=True),
+        TensorSpec("hidden_states", [token_count, D], torch.bfloat16),
     ]
 
 

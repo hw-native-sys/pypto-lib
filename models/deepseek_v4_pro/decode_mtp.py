@@ -392,7 +392,7 @@ def _ranked_init(single_spec, *, replicated=False):
     return init
 
 
-def _ranked_spec(name, spec, *, replicated=False, is_output=False):
+def _ranked_spec(name, spec, *, replicated=False):
     from golden import TensorSpec
 
     return TensorSpec(
@@ -400,7 +400,6 @@ def _ranked_spec(name, spec, *, replicated=False, is_output=False):
         [N_RANKS, *spec.shape],
         spec.dtype,
         init_value=_ranked_init(spec, replicated=replicated),
-        is_output=is_output,
     )
 
 
@@ -621,7 +620,6 @@ def build_tensor_specs(start_pos=DECODE_START_POS, num_tokens=T):
                     name,
                     swa_specs[name],
                     replicated=name in replicated_attention,
-                    is_output=swa_specs[name].is_output,
                 )
             )
 
@@ -640,8 +638,8 @@ def build_tensor_specs(start_pos=DECODE_START_POS, num_tokens=T):
         if spec.name in resident_names:
             spec.resident = "stacked"
 
-    specs.append(TensorSpec("hidden_out", [N_RANKS, T, D], torch.bfloat16, is_output=True))
-    specs.append(TensorSpec("next_pre_hc_hidden", [N_RANKS, T, HC_MULT, D], torch.float32, is_output=True))
+    specs.append(TensorSpec("hidden_out", [N_RANKS, T, D], torch.bfloat16))
+    specs.append(TensorSpec("next_pre_hc_hidden", [N_RANKS, T, HC_MULT, D], torch.float32))
     specs.append(ScalarSpec("num_tokens", torch.int32, num_tokens))
     return specs
 

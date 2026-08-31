@@ -973,7 +973,7 @@ def build_tensor_specs(
                    init_value=init_final_norm_weight),
         TensorSpec("lm_head_weight", [vocab, hidden_size], torch.bfloat16,
                    init_value=init_lm_head_weight),
-        TensorSpec("out", [batch, vocab], torch.float32, is_output=True),
+        TensorSpec("out", [batch, vocab], torch.float32),
     ]
 
 

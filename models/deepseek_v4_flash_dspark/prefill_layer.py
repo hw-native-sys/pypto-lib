@@ -790,7 +790,7 @@ def build_tensor_specs(layer_id=0, start_pos=0, token_count=GROUP_TOKENS):
         shape[0] = N_RANKS
         specs_by_name[name] = TensorSpec(
             name, shape, source.dtype,
-            init_value=init_ranked, is_output=name in _CACHE_STATE_NAMES,
+            init_value=init_ranked, 
         )
 
     def init_attn_stage():
@@ -799,16 +799,16 @@ def build_tensor_specs(layer_id=0, start_pos=0, token_count=GROUP_TOKENS):
     stage_specs = [
         TensorSpec(
             "attn_stage", [N_RANKS, physical_tokens, HC_MULT, D], torch.float32,
-            init_value=init_attn_stage, is_output=True,
+            init_value=init_attn_stage, 
         ),
-        TensorSpec("x_mixed", [N_RANKS, physical_tokens, D], torch.bfloat16, is_output=True),
-        TensorSpec("post_ffn", [N_RANKS, physical_tokens, HC_MULT], torch.float32, is_output=True),
-        TensorSpec("comb_ffn", [N_RANKS, physical_tokens, HC_MULT * HC_MULT], torch.float32, is_output=True),
-        TensorSpec("ffn_out", [N_RANKS, local_tokens, D], torch.bfloat16, is_output=True),
+        TensorSpec("x_mixed", [N_RANKS, physical_tokens, D], torch.bfloat16),
+        TensorSpec("post_ffn", [N_RANKS, physical_tokens, HC_MULT], torch.float32),
+        TensorSpec("comb_ffn", [N_RANKS, physical_tokens, HC_MULT * HC_MULT], torch.float32),
+        TensorSpec("ffn_out", [N_RANKS, local_tokens, D], torch.bfloat16),
     ]
     specs_by_name.update({spec.name: spec for spec in stage_specs})
     specs_by_name["x_next"] = TensorSpec(
-        "x_next", [N_RANKS, physical_tokens, HC_MULT, D], torch.float32, is_output=True
+        "x_next", [N_RANKS, physical_tokens, HC_MULT, D], torch.float32
     )
 
     for name in _RESIDENT_WEIGHT_NAMES:

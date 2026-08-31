@@ -876,13 +876,11 @@ def build_tensor_specs(batch: int, *, distributed: bool = False):
             "draft_token_ids",
             with_world(batch, DSPARK_QUERY_WIDTH),
             torch.int32,
-            is_output=True,
         ),
         TensorSpec(
             "confidence_probs",
             with_world(batch, DSPARK_QUERY_WIDTH),
             torch.float32,
-            is_output=True,
         ),
     ])
     return specs

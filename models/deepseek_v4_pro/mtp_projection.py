@@ -312,7 +312,7 @@ def build_tensor_specs(batch=DECODE_BATCH, seq=DECODE_SEQ):
         TensorSpec("h_proj_w", [D, D], torch.int8, init_value=init_h_proj_w),
         TensorSpec("h_proj_w_scale", [D], torch.float32, init_value=init_h_proj_w_scale),
         TensorSpec("h_proj_smooth", [D], torch.float32, init_value=lambda: torch.ones(D)),
-        TensorSpec("hidden_states_out", [t, HC_MULT, D], torch.float32, is_output=True),
+        TensorSpec("hidden_states_out", [t, HC_MULT, D], torch.float32),
     ]
 
 

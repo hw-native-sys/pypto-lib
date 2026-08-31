@@ -91,13 +91,14 @@ Every tensor the golden test compares **must** declare an explicit direction on
 the **orchestration entry** — the `@pl.jit` entry, its `@pl.jit.host` driver, or
 the `@pl.function(type=Opaque)` / `Orchestration` method. A plain `pl.Tensor` is
 treated as `In`: the runtime skips its device→host copy-back, so the tensor
-**reads back as all-zeros on the host** and golden silently fails. The direction
-is decided by the tensor's `TensorSpec`:
+**reads back as all-zeros on the host** and golden silently fails. The
+annotation is the only place direction is declared — the harness reads it back
+off the compiled artifact, so a `TensorSpec` never restates it:
 
-| `TensorSpec` | meaning | annotation |
-|--------------|---------|------------|
-| `is_output=True`, no `init_value` | pure output (write-only) | `pl.Out[pl.Tensor[...]]` |
-| `is_output=True` **and** `init_value` | inout — read-modify-write (e.g. a paged KV cache the kernel reads history from and appends to; recurrent state) | `pl.InOut[pl.Tensor[...]]` |
+| annotation | meaning | `TensorSpec` |
+|------------|---------|--------------|
+| `pl.Out[pl.Tensor[...]]` | pure output (write-only); validated | no `init_value` needed — the host buffer is not uploaded |
+| `pl.InOut[pl.Tensor[...]]` | inout — read-modify-write (e.g. a paged KV cache the kernel reads history from and appends to; recurrent state); validated | `init_value` is the uploaded initial state |
 
 Annotate the **entry only**. `@pl.jit.inline` sub-kernels keep bare `pl.Tensor`:
 they are spliced at the call site before SSA conversion, so a parameter is

@@ -813,7 +813,6 @@ def build_tensor_specs(start_pos: int = START_POS, token_count: int = PREFILL_SE
             [CSA_STATE_BLOCK_NUM, CSA_STATE_BLOCK_SIZE, COMPRESS_STATE_DIM],
             torch.float32,
             init_value=init_compress_state,
-            is_output=True,
         ),
         TensorSpec(
             "compress_state_block_table",
@@ -832,7 +831,6 @@ def build_tensor_specs(start_pos: int = START_POS, token_count: int = PREFILL_SE
             [CMP_MAX_BLOCKS, BLOCK_SIZE, 1, HEAD_DIM],
             torch.bfloat16,
             init_value=init_cmp_kv,
-            is_output=True,
         ),
         TensorSpec("position_ids", [token_count], torch.int32, init_value=init_position_ids),
         TensorSpec("cmp_slot_mapping", [token_count], torch.int64, init_value=init_cmp_slot_mapping),

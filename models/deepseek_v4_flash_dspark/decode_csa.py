@@ -1575,7 +1575,7 @@ def build_tensor_specs(start_pos=None, batch=B):
         TensorSpec("cmp_norm_w", [HEAD_DIM], torch.bfloat16, init_value=init_cmp_norm_w),
         TensorSpec(
             "compress_state", [main_state_block_num, MAIN_STATE_BLOCK_SIZE, MAIN_STATE_DIM],
-            torch.float32, init_value=init_compress_state, is_output=True,
+            torch.float32, init_value=init_compress_state, 
         ),
         TensorSpec("compress_state_block_table", [batch, MAIN_STATE_MAX_BLOCKS], torch.int32, init_value=init_compress_state_block_table),
         TensorSpec("idx_wq_b", [Q_LORA, IDX_N_HEADS * IDX_HEAD_DIM], torch.int8, init_value=lambda: idx_wq_b_i8),
@@ -1588,22 +1588,22 @@ def build_tensor_specs(start_pos=None, batch=B):
         TensorSpec("inner_norm_w", [IDX_HEAD_DIM], torch.bfloat16, init_value=init_inner_norm_w),
         TensorSpec(
             "inner_compress_state", [inner_state_block_num, INNER_STATE_BLOCK_SIZE, INNER_STATE_DIM],
-            torch.float32, init_value=init_inner_compress_state, is_output=True,
+            torch.float32, init_value=init_inner_compress_state, 
         ),
         TensorSpec("inner_compress_state_block_table", [batch, INNER_STATE_MAX_BLOCKS], torch.int32, init_value=init_inner_compress_state_block_table),
-        TensorSpec("kv_cache", [ORI_BLOCK_NUM, BLOCK_SIZE, 1, HEAD_DIM], torch.bfloat16, init_value=init_kv_cache, is_output=True),
+        TensorSpec("kv_cache", [ORI_BLOCK_NUM, BLOCK_SIZE, 1, HEAD_DIM], torch.bfloat16, init_value=init_kv_cache),
         TensorSpec(
             "cmp_kv", [cmp_block_num, BLOCK_SIZE, 1, HEAD_DIM],
-            torch.bfloat16, init_value=init_cmp_kv, is_output=True,
+            torch.bfloat16, init_value=init_cmp_kv, 
         ),
         TensorSpec("cmp_block_table", [batch, CMP_MAX_BLOCKS], torch.int32, init_value=init_cmp_block_table),
         TensorSpec(
             "idx_kv_cache", [idx_cache_block_num, BLOCK_SIZE, 1, IDX_HEAD_DIM],
-            torch.int8, init_value=lambda: shared_idx_kv_cache_i8.clone(), is_output=True,
+            torch.int8, init_value=lambda: shared_idx_kv_cache_i8.clone(), 
         ),
         TensorSpec(
             "idx_kv_scale", [idx_cache_block_num, BLOCK_SIZE, 1, 1],
-            torch.float32, init_value=lambda: shared_idx_kv_scale.clone(), is_output=True,
+            torch.float32, init_value=lambda: shared_idx_kv_scale.clone(), 
         ),
         TensorSpec("idx_block_table", [batch, IDX_MAX_BLOCKS], torch.int32, init_value=init_idx_block_table),
         TensorSpec("ori_slot_mapping", [tokens], torch.int64, init_value=init_ori_slot_mapping),
@@ -1619,7 +1619,7 @@ def build_tensor_specs(start_pos=None, batch=B):
         TensorSpec("wo_a", [O_GROUPS, O_LORA, O_GROUP_IN], torch.bfloat16, init_value=init_wo_a),
         TensorSpec("wo_b", [D, O_GROUPS * O_LORA], torch.int8, init_value=lambda: wo_b_i8),
         TensorSpec("wo_b_scale", [D], torch.float32, init_value=lambda: wo_b_scale),
-        TensorSpec("x_out", [tokens, HC_MULT, D], torch.float32, is_output=True),
+        TensorSpec("x_out", [tokens, HC_MULT, D], torch.float32),
     ]
 
 
@@ -1687,7 +1687,7 @@ def build_distributed_tensor_specs(local_t, start_pos=None):
         if spec.name == "x_out":
             specs.append(TensorSpec(
                 "x_out", [TP_SIZE, local_t, HC_MULT, D],
-                torch.float32, is_output=True,
+                torch.float32, 
             ))
             continue
 
@@ -1734,7 +1734,7 @@ def build_distributed_tensor_specs(local_t, start_pos=None):
         local_name = f"{spec.name}_local" if spec.name in dual_names else spec.name
         distributed_spec = TensorSpec(
             local_name, list(rank_value.shape), spec.dtype,
-            init_value=rank_value, is_output=spec.is_output,
+            init_value=rank_value, 
         )
         if spec.name in resident_names:
             distributed_spec.resident = "stacked"

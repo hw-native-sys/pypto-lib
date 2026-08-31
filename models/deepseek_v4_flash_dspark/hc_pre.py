@@ -409,9 +409,9 @@ def build_tensor_specs(B, S):
         TensorSpec("hc_fn", [MIX_HC, HC_DIM], torch.float32, init_value=init_hc_fn),
         TensorSpec("hc_scale", [3], torch.float32, init_value=init_hc_scale),
         TensorSpec("hc_base", [MIX_HC], torch.float32, init_value=init_hc_base),
-        TensorSpec("x_mixed", [T, D], torch.bfloat16, is_output=True),
-        TensorSpec("post", [T, HC_MULT], torch.float32, is_output=True),
-        TensorSpec("comb", [T, HC_MULT * HC_MULT], torch.float32, is_output=True),
+        TensorSpec("x_mixed", [T, D], torch.bfloat16),
+        TensorSpec("post", [T, HC_MULT], torch.float32),
+        TensorSpec("comb", [T, HC_MULT * HC_MULT], torch.float32),
     ]
 
 

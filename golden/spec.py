@@ -45,8 +45,11 @@ class TensorSpec:
               one of the supported ``torch`` factory functions
               (``torch.randn``, ``torch.rand``, ``torch.zeros``, ``torch.ones``)
               that will be called with ``(shape, dtype=dtype)``.
-        is_output: If ``True``, the tensor is an output to be validated against the
-            golden reference.
+
+            The value is the tensor's initial host content and nothing else.
+            The runtime does not upload a pure ``Out`` parameter's host buffer
+            (see ``docs/pypto-coding/pypto-coding-style.md``), so an
+            ``init_value`` there reaches only the golden reference.
         resident: Keep this tensor device-resident (``child_memory``): the harness
             uploads inputs once and reuses them across the validation dispatch and every
             benchmark round, skipping the per-dispatch host→device upload and
@@ -74,11 +77,16 @@ class TensorSpec:
               each rank's slice must reside on the card that consumes it.
 
             ``True`` is rejected as ambiguous — pass an int worker id instead.
+        direction: ``"in"`` / ``"out"`` / ``"inout"``, stamped by the harness
+            from the compiled artifact's ``ParamDirection`` before any tensor is
+            allocated. Not an init argument: the kernel signature owns the
+            direction, and reading :attr:`is_output` / :attr:`is_input` before
+            the stamp raises.
 
     Example:
         >>> import torch
         >>> TensorSpec("query", [32, 128], torch.bfloat16, init_value=torch.randn)
-        >>> TensorSpec("out", [32, 128], torch.float32, is_output=True)
+        >>> TensorSpec("out", [32, 128], torch.float32)  # direction comes from the artifact
         >>> TensorSpec("wq_a", [2, 4096, 1536], torch.bfloat16, init_value=torch.randn, resident="stacked")
         >>> TensorSpec("bias", [128], torch.float32, init_value=torch.randn, resident=1)  # whole on card 1
     """
@@ -87,11 +95,11 @@ class TensorSpec:
     shape: list[int]
     dtype: torch.dtype
     init_value: int | float | torch.Tensor | Callable | None = field(default=None)
-    is_output: bool = False
     resident: int | str | bool | None = None
+    direction: str | None = field(default=None, init=False, repr=False, compare=False)
 
     def __post_init__(self) -> None:
-        # Validate the ``resident`` mode. ``resident`` + ``is_output`` is allowed:
+        # Validate the ``resident`` mode. A resident output is allowed:
         # a read-write resident state buffer (e.g. a KV cache) uploaded once,
         # updated in place on-device across dispatches, and read back once at the
         # end for validation.
@@ -114,6 +122,28 @@ class TensorSpec:
                 f'(whole-tensor resident on that card), or "stacked" (leading-dim sharded); '
                 f"got {r!r}."
             )
+
+    def _stamped_direction(self) -> str:
+        """The artifact-stamped direction; reading it before the stamp is a bug."""
+        if self.direction is None:
+            raise RuntimeError(
+                f"TensorSpec {self.name!r}: direction not stamped -- the compiled "
+                f"artifact's parameter metadata has not been inspected yet"
+            )
+        return self.direction
+
+    @property
+    def is_output(self) -> bool:
+        """True if the compiled parameter is written by the kernel (``Out`` / ``InOut``)."""
+        return self._stamped_direction() in ("out", "inout")
+
+    @property
+    def is_input(self) -> bool:
+        """True if the host tensor's initial content is input data (``In`` / ``InOut``).
+
+        Overlaps :attr:`is_output` on ``InOut``, mirroring ``ParamDirection``.
+        """
+        return self._stamped_direction() in ("in", "inout")
 
     @property
     def is_resident(self) -> bool:

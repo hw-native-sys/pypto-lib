@@ -317,8 +317,8 @@ def build_tensor_specs(selection_k=TOPK):
             torch.int32,
             init_value=lambda: torch.tensor([2 if selection_k == TOPK else 1, selection_k], dtype=torch.int32),
         ),
-        TensorSpec("topk_values", [BATCH_PAD, TOPK], torch.float32, is_output=True),
-        TensorSpec("topk_indices", [BATCH_PAD, TOPK], torch.int32, is_output=True),
+        TensorSpec("topk_values", [BATCH_PAD, TOPK], torch.float32),
+        TensorSpec("topk_indices", [BATCH_PAD, TOPK], torch.int32),
     ]
 
 

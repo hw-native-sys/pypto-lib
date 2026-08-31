@@ -65,12 +65,31 @@ class TestTensorSpecCreateTensor:
         with pytest.raises(TypeError, match="Unsupported init_value type"):
             spec.create_tensor()
 
-    def test_is_output_flag(self):
-        """is_output flag is stored correctly and defaults to False."""
-        spec_in = TensorSpec("a", [4], torch.float32)
-        spec_out = TensorSpec("b", [4], torch.float32, is_output=True)
-        assert spec_in.is_output is False
-        assert spec_out.is_output is True
+    def test_direction_is_not_an_init_argument(self):
+        """The kernel signature owns direction; a spec cannot declare one."""
+        with pytest.raises(TypeError):
+            TensorSpec("a", [4], torch.float32, direction="out")
+        with pytest.raises(TypeError):
+            TensorSpec("a", [4], torch.float32, is_output=True)
+
+    def test_direction_derives_is_output_and_is_input(self):
+        """Both flags read off the stamped direction, covering all three kinds."""
+        cases = {"in": (False, True), "out": (True, False), "inout": (True, True)}
+        for direction, (is_output, is_input) in cases.items():
+            spec = TensorSpec("a", [4], torch.float32)
+            spec.direction = direction
+            assert spec.is_output is is_output
+            assert spec.is_input is is_input
+
+    def test_unstamped_direction_raises(self):
+        """Reading either flag before the harness stamps the artifact's direction
+        is a harness bug, not a silent False."""
+        spec = TensorSpec("a", [4], torch.float32)
+        assert spec.direction is None
+        with pytest.raises(RuntimeError, match="direction not stamped"):
+            spec.is_output
+        with pytest.raises(RuntimeError, match="direction not stamped"):
+            spec.is_input
 
     def test_resident_defaults_off(self):
         """resident defaults to None (off) and is_resident is False."""
@@ -111,13 +130,15 @@ class TestTensorSpecCreateTensor:
             TensorSpec("w", [4], torch.float32, resident=-1)
 
     def test_resident_output_accepted(self):
-        """resident + is_output is a read-write resident state buffer (e.g. KV cache)."""
-        spec = TensorSpec("kv", [4], torch.float32, is_output=True, resident=0)
+        """A resident output is a read-write resident state buffer (e.g. KV cache)."""
+        spec = TensorSpec("kv", [4], torch.float32, resident=0)
+        spec.direction = "inout"
         assert spec.resident == 0 and spec.is_resident is True and spec.is_output is True
 
     def test_resident_stacked_output_accepted(self):
-        """resident="stacked" + is_output is a per-rank read-write state buffer."""
-        spec = TensorSpec("kv", [2, 4], torch.float32, is_output=True, resident="stacked")
+        """resident="stacked" output is a per-rank read-write state buffer."""
+        spec = TensorSpec("kv", [2, 4], torch.float32, resident="stacked")
+        spec.direction = "inout"
         assert spec.resident == "stacked" and spec.is_resident is True and spec.is_output is True
 
     def test_tensor_init_ignores_spec_shape(self):

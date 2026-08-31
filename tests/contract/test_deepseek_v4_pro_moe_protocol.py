@@ -106,7 +106,9 @@ def test_decode_layer_cache_specs_match_static_inout_abi():
 
     assert inout_names == ast.literal_eval(cache_assignment.value)
     assert out_names == {"x_next"}
-    assert "is_output=name in mutable_cache_names" in ast.unparse(build_specs)
+    # Direction is stamped from the compiled artifact, so the spec builder must
+    # not re-declare it.
+    assert "is_output" not in ast.unparse(build_specs)
 
 
 def test_prefill_mtp_ranked_specs_preserve_inout_direction():
@@ -123,7 +125,7 @@ def test_prefill_mtp_ranked_specs_preserve_inout_direction():
 
     assert inout_names == {"kv_cache"}
     assert out_names == {"hidden_out", "pre_hc_hidden_out"}
-    assert "is_output = spec.is_output" in ast.unparse(_function(tree, "_ranked"))
+    assert "is_output" not in ast.unparse(_function(tree, "_ranked"))
 
     main = _function(tree, "main")
     cache_comparators = [

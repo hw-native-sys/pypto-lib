@@ -466,7 +466,7 @@ def build_tensor_specs():
         ("csa_state_slot_mapping", [T], torch.int64),
         ("csa_inner_state_slot_mapping", [T], torch.int64),
     ):
-        specs.append(TensorSpec(name, shape, dtype, is_output=True))
+        specs.append(TensorSpec(name, shape, dtype))
     return specs
 
 

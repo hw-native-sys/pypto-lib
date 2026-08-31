@@ -430,7 +430,7 @@ def build_o_group_a2a_specs(local_t=FIXTURE_LOCAL_T):
         TensorSpec("attention_grouped", attention_grouped_shape, torch.bfloat16, init_value=init_attention_grouped),
         TensorSpec(
             "attention_local_groups", attention_local_shape, torch.bfloat16,
-            init_value=FIXTURE_OUTPUT_SENTINEL, is_output=True,
+            init_value=FIXTURE_OUTPUT_SENTINEL, 
         ),
         ScalarSpec("local_t", torch.int32, local_t),
     ]

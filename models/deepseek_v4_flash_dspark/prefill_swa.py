@@ -834,7 +834,7 @@ def build_tensor_specs(
         TensorSpec("freqs_cos", [token_count, ROPE_HEAD_DIM], torch.bfloat16, init_value=init_freqs_cos),
         TensorSpec("freqs_sin", [token_count, ROPE_HEAD_DIM], torch.bfloat16, init_value=init_freqs_sin),
         TensorSpec("kv_cache", [BLOCK_NUM, BLOCK_SIZE, 1, HEAD_DIM], torch.bfloat16,
-                   init_value=init_kv_cache, is_output=True),
+                   init_value=init_kv_cache),
         TensorSpec("block_table", [1, BLOCK_TABLE_BLOCKS], torch.int32, init_value=init_block_table),
         TensorSpec("ori_slot_mapping", [token_count], torch.int64, init_value=init_ori_slot_mapping),
         TensorSpec("position_ids", [token_count], torch.int32, init_value=init_position_ids),
@@ -843,7 +843,7 @@ def build_tensor_specs(
         TensorSpec("wo_a", [O_GROUPS, O_LORA, O_GROUP_IN], torch.bfloat16, init_value=init_wo_a),
         TensorSpec("wo_b", [D, O_GROUPS * O_LORA], torch.int8, init_value=lambda: wo_b_i8),
         TensorSpec("wo_b_scale", [D], torch.float32, init_value=lambda: wo_b_scale),
-        TensorSpec("x_out", [token_count, HC_MULT, D], torch.float32, is_output=True),
+        TensorSpec("x_out", [token_count, HC_MULT, D], torch.float32),
     ]
 
 
@@ -904,11 +904,11 @@ def build_cp_tensor_specs(
                 init_value=torch.stack(shards).contiguous(),
             ))
         elif spec.name == "x_out":
-            specs.append(TensorSpec("x_out_full", [tp_size, token_count, HC_MULT, D], spec.dtype, is_output=True))
+            specs.append(TensorSpec("x_out_full", [tp_size, token_count, HC_MULT, D], spec.dtype))
         else:
             specs.append(TensorSpec(
                 spec.name, [tp_size, *spec.shape], spec.dtype,
-                init_value=cp_stack(value, tp_size), is_output=spec.is_output,
+                init_value=cp_stack(value, tp_size), 
             ))
     return specs
 

@@ -263,7 +263,6 @@ def build_tensor_specs(batch, seq):
             [KV_ORI_BLOCK_NUM, BLOCK_SIZE, 1, HEAD_DIM],
             torch.bfloat16,
             init_value=init_kv_cache,
-            is_output=True,
         ),
     ]
 

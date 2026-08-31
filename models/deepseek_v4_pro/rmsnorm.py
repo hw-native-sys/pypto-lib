@@ -109,7 +109,7 @@ def build_tensor_specs(B, S):
     return [
         TensorSpec("x", [T, D], torch.bfloat16, init_value=init_x),
         TensorSpec("norm_w", [D], torch.bfloat16, init_value=init_norm_w),
-        TensorSpec("x_normed", [T, D], torch.bfloat16, is_output=True),
+        TensorSpec("x_normed", [T, D], torch.bfloat16),
     ]
 
 

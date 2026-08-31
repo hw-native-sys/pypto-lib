@@ -510,7 +510,7 @@ def build_tensor_specs(num_tokens=TEST_TOKENS):
             "lm_head_weight", [WORLD_SIZE, VOCAB_PER_TP, D], torch.bfloat16,
             init_value=init_lm_head_weight, resident="stacked",
         ),
-        TensorSpec("logits", [WORLD_SIZE, MAX_LOGIT_ROWS, VOCAB], torch.float32, is_output=True),
+        TensorSpec("logits", [WORLD_SIZE, MAX_LOGIT_ROWS, VOCAB], torch.float32),
         TensorSpec("logit_row_indices", [WORLD_SIZE, MAX_LOGIT_ROWS], torch.int32, init_value=init_logit_row_indices),
     ]
 

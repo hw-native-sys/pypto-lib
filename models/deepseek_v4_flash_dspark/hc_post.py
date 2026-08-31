@@ -190,7 +190,7 @@ def build_tensor_specs(B, S):
         TensorSpec("residual", [T, HC_MULT, D],           torch.float32,  init_value=init_residual),
         TensorSpec("post",     [T, HC_MULT],              torch.float32,  init_value=init_post),
         TensorSpec("comb",     [T, HC_MULT * HC_MULT],    torch.float32,  init_value=init_comb),
-        TensorSpec("y",        [T, HC_MULT, D],           torch.float32,  is_output=True),
+        TensorSpec("y",        [T, HC_MULT, D],           torch.float32),
     ]
 
 

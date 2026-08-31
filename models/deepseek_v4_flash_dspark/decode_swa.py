@@ -920,7 +920,7 @@ def build_tensor_specs(start_pos=None, batch=B):
         TensorSpec("gamma_ckv", [HEAD_DIM], torch.bfloat16, init_value=init_gamma_ckv),
         TensorSpec("freqs_cos", [tokens, ROPE_HEAD_DIM], torch.bfloat16, init_value=init_freqs_cos),
         TensorSpec("freqs_sin", [tokens, ROPE_HEAD_DIM], torch.bfloat16, init_value=init_freqs_sin),
-        TensorSpec("kv_cache", [ORI_BLOCK_NUM, BLOCK_SIZE, 1, HEAD_DIM], torch.bfloat16, init_value=init_kv_cache, is_output=True),
+        TensorSpec("kv_cache", [ORI_BLOCK_NUM, BLOCK_SIZE, 1, HEAD_DIM], torch.bfloat16, init_value=init_kv_cache),
         TensorSpec("swa_slot_mapping", [tokens], torch.int64, init_value=init_swa_slot_mapping),
         TensorSpec("swa_indices", [tokens, WIN], torch.int32, init_value=init_swa_indices),
         TensorSpec("swa_lens", [tokens], torch.int32, init_value=init_swa_lens),
@@ -929,7 +929,7 @@ def build_tensor_specs(start_pos=None, batch=B):
         TensorSpec("wo_a", [O_GROUPS, O_LORA, O_GROUP_IN], torch.bfloat16, init_value=init_wo_a),
         TensorSpec("wo_b", [D, O_GROUPS * O_LORA], torch.int8, init_value=lambda: wo_b_i8),
         TensorSpec("wo_b_scale", [D], torch.float32, init_value=lambda: wo_b_scale),
-        TensorSpec("x_out", [tokens, HC_MULT, D], torch.float32, is_output=True),
+        TensorSpec("x_out", [tokens, HC_MULT, D], torch.float32),
     ]
 
 
@@ -971,7 +971,7 @@ def build_distributed_tensor_specs(local_t, start_pos=None):
     for spec in build_tensor_specs(start_pos=start_pos, batch=group_batch):
         if spec.name == "x_out":
             specs.append(TensorSpec(
-                "x_out", [TP_SIZE, local_t, HC_MULT, D], torch.float32, is_output=True,
+                "x_out", [TP_SIZE, local_t, HC_MULT, D], torch.float32, 
             ))
             continue
 
@@ -1013,7 +1013,7 @@ def build_distributed_tensor_specs(local_t, start_pos=None):
         local_name = f"{spec.name}_local" if spec.name in dual_names else spec.name
         distributed_spec = TensorSpec(
             local_name, list(rank_value.shape), spec.dtype,
-            init_value=rank_value, is_output=spec.is_output,
+            init_value=rank_value, 
         )
         if spec.name in resident_names:
             distributed_spec.resident = "stacked"

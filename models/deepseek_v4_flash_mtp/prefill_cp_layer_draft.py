@@ -1982,7 +1982,7 @@ def _build_swa_specs(layer_id: int, cp_size: int):
     x_next_spec = TensorSpec(
         "x_next",
         [cp_size, LOCAL_PARTS, MAX_SEGMENT_TILES, T, HC_MULT, D],
-        torch.float32, is_output=True,
+        torch.float32, 
     )
     layer_id_spec = ScalarSpec("layer_id", torch.int32, layer_id)
 
@@ -2018,7 +2018,7 @@ def _build_hca_specs(layer_id: int, cp_size: int):
     x_next_spec = TensorSpec(
         "x_next",
         [cp_size, LOCAL_PARTS, MAX_SEGMENT_TILES, T, HC_MULT, D],
-        torch.float32, is_output=True,
+        torch.float32, 
     )
     layer_id_spec = ScalarSpec("layer_id", torch.int32, layer_id)
 
@@ -2080,7 +2080,7 @@ def _build_csa_specs(layer_id: int, cp_size: int):
     x_next_spec = TensorSpec(
         "x_next",
         [cp_size, LOCAL_PARTS, MAX_SEGMENT_TILES, T, HC_MULT, D],
-        torch.float32, is_output=True,
+        torch.float32, 
     )
     layer_id_spec = ScalarSpec("layer_id", torch.int32, layer_id)
 

@@ -537,10 +537,10 @@ def build_tensor_specs(B, S):
         TensorSpec("rope_sin",  [T, ROPE_DIM],          torch.bfloat16, init_value=init_sin),
         TensorSpec("gamma_cq",  [Q_LORA],               torch.bfloat16, init_value=init_gamma_cq),
         TensorSpec("gamma_ckv", [HEAD_DIM],             torch.bfloat16, init_value=init_gamma_ckv),
-        TensorSpec("q",         [T, H, HEAD_DIM],       torch.bfloat16, is_output=True),
-        TensorSpec("kv",        [T, HEAD_DIM],          torch.bfloat16, is_output=True),
-        TensorSpec("qr",        [T, Q_LORA],            torch.int8,     is_output=True),
-        TensorSpec("qr_scale",  [T, 1],                 torch.float32,  is_output=True),
+        TensorSpec("q",         [T, H, HEAD_DIM],       torch.bfloat16),
+        TensorSpec("kv",        [T, HEAD_DIM],          torch.bfloat16),
+        TensorSpec("qr",        [T, Q_LORA],            torch.int8),
+        TensorSpec("qr_scale",  [T, 1],                 torch.float32),
     ]
 
 

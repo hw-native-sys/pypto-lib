@@ -132,7 +132,7 @@ def build_tensor_specs():
 
     return [
         TensorSpec("logits", [BATCH_PAD, VOCAB], torch.float32, init_value=init_logits),
-        TensorSpec("sampled_ids", [BATCH_PAD, SAMPLED_IDS_PAD], torch.int32, is_output=True),
+        TensorSpec("sampled_ids", [BATCH_PAD, SAMPLED_IDS_PAD], torch.int32),
     ]
 
 

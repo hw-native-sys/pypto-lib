@@ -484,12 +484,12 @@ def _ranked_init(single_spec, *, replicated=False):
     return init
 
 
-def _ranked_spec(name, spec, *, replicated=False, is_output=False):
+def _ranked_spec(name, spec, *, replicated=False):
     from golden import TensorSpec
 
     return TensorSpec(
         name, [N_RANKS, *spec.shape], spec.dtype,
-        init_value=_ranked_init(spec, replicated=replicated), is_output=is_output,
+        init_value=_ranked_init(spec, replicated=replicated),
     )
 
 
@@ -760,7 +760,7 @@ def build_tensor_specs(start_pos=DECODE_START_POS, num_tokens=T, ori_block_num=O
 
             cache_spec = TensorSpec(
                 name, [N_RANKS, ori_block_num, BLOCK_SIZE, 1, HEAD_DIM], cache_dtype,
-                init_value=init_kv_cache, is_output=swa_specs[name].is_output,
+                init_value=init_kv_cache, 
             )
             specs.append(cache_spec)
         elif name in swa_metadata_specs:
@@ -770,7 +770,7 @@ def build_tensor_specs(start_pos=DECODE_START_POS, num_tokens=T, ori_block_num=O
         else:
             ranked_spec = _ranked_spec(
                 name, swa_specs[name],
-                replicated=name in replicated_attention, is_output=swa_specs[name].is_output,
+                replicated=name in replicated_attention, 
             )
             specs.append(ranked_spec)
 
@@ -832,24 +832,23 @@ def build_tensor_specs(start_pos=DECODE_START_POS, num_tokens=T, ori_block_num=O
     )
     hidden_out_spec = TensorSpec(
         "hidden_out", [N_RANKS, T, D], torch.bfloat16,
-        is_output=True, resident="stacked",
+         resident="stacked",
     )
     specs.append(hidden_out_spec)
     next_hidden_spec = TensorSpec(
         "next_pre_hc_hidden", [N_RANKS, T, HC_MULT, D], torch.float32,
-        is_output=True, resident="stacked",
+         resident="stacked",
     )
     specs.append(next_hidden_spec)
     logits_spec = TensorSpec(
         "logits", [N_RANKS, MAX_LOGIT_ROWS, LM_HEAD_VOCAB], torch.float32,
-        is_output=True, resident="stacked",
+         resident="stacked",
     )
     specs.append(logits_spec)
     sampled_ids_spec = TensorSpec(
         "sampled_ids",
         [N_RANKS, MAX_LOGIT_ROWS, SAMPLED_IDS_PAD],
         torch.int32,
-        is_output=True,
     )
     specs.append(sampled_ids_spec)
     row_indices_spec = TensorSpec(

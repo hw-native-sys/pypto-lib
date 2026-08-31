@@ -109,7 +109,7 @@ def build_tensor_specs():
 
     return [
         TensorSpec("inputs",  [N_RANKS, 1, SIZE], torch.float32, init_value=init_inputs),
-        TensorSpec("outputs", [N_RANKS, 1, SIZE], torch.float32, is_output=True),
+        TensorSpec("outputs", [N_RANKS, 1, SIZE], torch.float32),
     ]
 
 

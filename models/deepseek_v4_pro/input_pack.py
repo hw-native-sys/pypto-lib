@@ -102,7 +102,6 @@ def build_tensor_specs(token_count, vocab_size):
             "x_hc",
             [token_count, HC_MULT, D],
             torch.float32,
-            is_output=True,
         ),
     ]
 

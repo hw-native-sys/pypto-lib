@@ -1050,13 +1050,12 @@ def _make_layer_stacked_spec(name, base_specs, layer_count=FWD_NUM_LAYERS):
         init_value=init_value,
         # Caches the kernel writes in place (kv_cache) are read back for
         # validation; every other stacked tensor is a plain input.
-        is_output=name in RESIDENT_CACHE_OUTPUT_NAMES,
     )
 
 
 def _make_shared_spec(name, base_spec, out_name=None):
     from golden import TensorSpec
-    return TensorSpec(out_name or name, list(base_spec.shape), base_spec.dtype, init_value=base_spec.init_value if out_name is None else None, is_output=out_name is not None)
+    return TensorSpec(out_name or name, list(base_spec.shape), base_spec.dtype, init_value=base_spec.init_value if out_name is None else None)
 
 
 def _make_hc_head_spec(name):
@@ -1515,7 +1514,6 @@ def build_single_layer_tensor_specs(start_pos=DECODE_START_POS, layer_id=10):
             [N_RANKS, *spec.shape],
             spec.dtype,
             init_value=_ranked_init(spec, replicated=name in replicated_attention),
-            is_output=name == "kv_cache",
         )
         for name, spec in attention_specs
     ]
@@ -1543,7 +1541,7 @@ def build_single_layer_tensor_specs(start_pos=DECODE_START_POS, layer_id=10):
             specs.append(moe_tensor_specs[spec.name])
 
     specs.extend([
-        TensorSpec("x_next", [N_RANKS, T, HC_MULT, D], torch.float32, is_output=True),
+        TensorSpec("x_next", [N_RANKS, T, HC_MULT, D], torch.float32),
         ScalarSpec("layer_id", torch.int32, layer_id),
     ])
     return specs
@@ -1603,7 +1601,7 @@ def build_tensor_specs(start_pos=DECODE_START_POS, num_tokens=T):
     # (child_memory): each shard uploaded once to its card and reused across
     # dispatches, skipping per-dispatch H2D/D2H. RESIDENT_WEIGHT_NAMES are static
     # weights; CACHE_POOL_NAMES are the KV/state caches (the written kv_cache is
-    # also is_output=True and read back at the end via RESIDENT_CACHE_OUTPUT_NAMES).
+    # also an InOut, read back at the end via RESIDENT_CACHE_OUTPUT_NAMES).
     for spec in specs:
         if spec.name in RESIDENT_WEIGHT_NAMES or spec.name in CACHE_POOL_NAMES:
             spec.resident = "stacked"
@@ -1621,19 +1619,17 @@ def build_tensor_specs(start_pos=DECODE_START_POS, num_tokens=T):
         torch.int32,
         init_value=init_logit_row_indices,
     ))
-    specs.append(TensorSpec("pre_hc_hidden_out", [N_RANKS, T, HC_MULT, D], torch.float32, is_output=True))
-    specs.append(TensorSpec("hidden_out", [N_RANKS, T, D], torch.bfloat16, is_output=True))
+    specs.append(TensorSpec("pre_hc_hidden_out", [N_RANKS, T, HC_MULT, D], torch.float32))
+    specs.append(TensorSpec("hidden_out", [N_RANKS, T, D], torch.bfloat16))
     specs.append(TensorSpec(
         "logits",
         [N_RANKS, MAX_LOGIT_ROWS, LM_HEAD_VOCAB],
         torch.float32,
-        is_output=True,
     ))
     specs.append(TensorSpec(
         "sampled_ids",
         [N_RANKS, MAX_LOGIT_ROWS, SAMPLED_IDS_PAD],
         torch.int32,
-        is_output=True,
     ))
     specs.append(ScalarSpec("num_tokens", torch.int32, num_tokens, compile_runtime=True))
     specs.append(ScalarSpec("moe_epoch_base", torch.int32, 0, compile_runtime=True, benchmark_step=LAST_MOE_EPOCH))

@@ -48,7 +48,7 @@ def build_tensor_specs(
     return [
         TensorSpec("a", [m, k], torch.float32, init_value=torch.randn),
         TensorSpec("b", [k, n], torch.float32, init_value=torch.randn),
-        TensorSpec("c", [m, n], torch.float32, is_output=True),
+        TensorSpec("c", [m, n], torch.float32),
     ]
 
 

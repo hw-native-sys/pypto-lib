@@ -1845,7 +1845,6 @@ def _expand_swa_spec(spec):
         [N_RANKS, *spec.shape[1:]],
         spec.dtype,
         init_value=init_value,
-        is_output=spec.is_output,
     )
     expanded.resident = spec.resident
     return expanded
@@ -1891,19 +1890,16 @@ def build_swa_layer_specs(start_pos=None, layer_id=0):
                 "x_attn_active",
                 [N_RANKS, local_t, HC_MULT, D],
                 torch.float32,
-                is_output=True,
             ),
             TensorSpec(
                 "x_moe_next",
                 [N_RANKS, MOE_TOKENS, HC_MULT, D],
                 torch.float32,
-                is_output=True,
             ),
             TensorSpec(
                 "x_next",
                 [N_RANKS, local_t, HC_MULT, D],
                 torch.float32,
-                is_output=True,
             ),
             ScalarSpec("layer_id", torch.int32, layer_id),
             ScalarSpec("local_t", torch.int32, local_t),
@@ -1965,7 +1961,6 @@ def _expand_hca_spec(spec):
         [N_RANKS, *spec.shape[1:]],
         spec.dtype,
         init_value=init_value,
-        is_output=spec.is_output,
     )
     expanded.resident = spec.resident
     return expanded
@@ -2011,19 +2006,16 @@ def build_hca_layer_specs(start_pos=None, layer_id=3):
                 "x_attn_active",
                 [N_RANKS, local_t, HC_MULT, D],
                 torch.float32,
-                is_output=True,
             ),
             TensorSpec(
                 "x_moe_next",
                 [N_RANKS, MOE_TOKENS, HC_MULT, D],
                 torch.float32,
-                is_output=True,
             ),
             TensorSpec(
                 "x_next",
                 [N_RANKS, local_t, HC_MULT, D],
                 torch.float32,
-                is_output=True,
             ),
             ScalarSpec("layer_id", torch.int32, layer_id),
             ScalarSpec("local_t", torch.int32, local_t),
@@ -2085,7 +2077,6 @@ def _expand_csa_spec(spec):
         [N_RANKS, *spec.shape[1:]],
         spec.dtype,
         init_value=init_value,
-        is_output=spec.is_output,
     )
     expanded.resident = spec.resident
     return expanded
@@ -2131,19 +2122,16 @@ def build_csa_layer_specs(start_pos=None, layer_id=2):
                 "x_attn_active",
                 [N_RANKS, local_t, HC_MULT, D],
                 torch.float32,
-                is_output=True,
             ),
             TensorSpec(
                 "x_moe_next",
                 [N_RANKS, MOE_TOKENS, HC_MULT, D],
                 torch.float32,
-                is_output=True,
             ),
             TensorSpec(
                 "x_next",
                 [N_RANKS, local_t, HC_MULT, D],
                 torch.float32,
-                is_output=True,
             ),
             ScalarSpec("layer_id", torch.int32, layer_id),
             ScalarSpec("local_t", torch.int32, local_t),

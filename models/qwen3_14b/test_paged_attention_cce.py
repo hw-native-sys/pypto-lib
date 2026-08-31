@@ -72,7 +72,6 @@ def build_specs(
             "out",
             [batch, NUM_HEADS, HEAD_DIM],
             torch.bfloat16,
-            is_output=True,
         ),
     ]
 

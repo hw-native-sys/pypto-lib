@@ -564,13 +564,11 @@ def build_tensor_specs(num_tokens=TEST_TOKENS):
             "logits",
             [DP_SIZE, MAX_LOGIT_ROWS, VOCAB],
             torch.float32,
-            is_output=True,
         ),
         TensorSpec(
             "sampled_ids",
             [DP_SIZE, MAX_LOGIT_ROWS, SAMPLED_IDS_PAD],
             torch.int32,
-            is_output=True,
         ),
         TensorSpec(
             "logit_row_indices",

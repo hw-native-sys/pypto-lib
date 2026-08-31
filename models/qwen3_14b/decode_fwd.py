@@ -1853,7 +1853,7 @@ def _build_specs(inputs: dict) -> list:
         TensorSpec(name, list(inputs[name].shape), inputs[name].dtype, init_value=inputs[name])
         for name in INPUT_NAMES
     ]
-    specs.append(TensorSpec("out", [BATCH_PAD, HIDDEN], torch.bfloat16, is_output=True))
+    specs.append(TensorSpec("out", [BATCH_PAD, HIDDEN], torch.bfloat16))
     return specs
 
 

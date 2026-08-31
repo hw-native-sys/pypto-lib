@@ -2362,7 +2362,7 @@ def _stack_spec(spec: TensorSpec, num_layers: int) -> TensorSpec:
         shape[0] = num_layers * shape[0]
     return TensorSpec(
         spec.name, shape, spec.dtype,
-        init_value=spec.init_value, is_output=spec.is_output,
+        init_value=spec.init_value, 
         resident=spec.resident,
     )
 
@@ -2379,7 +2379,7 @@ def _make_stacked_swa_attn_spec(name: str, base_spec: TensorSpec,
     shape = [num_layers * base_spec.shape[0]] + list(base_spec.shape[1:])
     return TensorSpec(
         name, shape, base_spec.dtype, init_value=stacked,
-        is_output=base_spec.is_output, resident=base_spec.resident,
+         resident=base_spec.resident,
     )
 
 
@@ -2397,7 +2397,7 @@ def _make_stacked_moe_spec(name: str, base_spec: TensorSpec,
     )
     return TensorSpec(
         name, shape, base_spec.dtype, init_value=stacked,
-        is_output=base_spec.is_output, resident=base_spec.resident,
+         resident=base_spec.resident,
     )
 
 
@@ -2422,10 +2422,10 @@ def _build_input_ids_spec(cp_size: int, active_lengths_spec, prefix_seed: int):
 
 def _rename_spec(base_spec: TensorSpec, new_name: str) -> TensorSpec:
     """Return a copy of ``base_spec`` under a new name, preserving shape,
-    dtype, init_value, is_output, and resident."""
+    dtype, init_value, and resident."""
     return TensorSpec(
         new_name, list(base_spec.shape), base_spec.dtype,
-        init_value=base_spec.init_value, is_output=base_spec.is_output,
+        init_value=base_spec.init_value, 
         resident=base_spec.resident,
     )
 
@@ -2463,7 +2463,7 @@ def _stack_type_spec(
         )
     return TensorSpec(
         name, shape, base_spec.dtype, init_value=stacked,
-        is_output=base_spec.is_output, resident=base_spec.resident,
+         resident=base_spec.resident,
     )
 
 
@@ -2529,7 +2529,7 @@ def build_tensor_specs(cp_size: int = CP_SIZE):
     specs_by_name["kv_cache"] = TensorSpec(
         "kv_cache",
         [cp_size, FWD_NUM_LAYERS * ORI_MAX_BLOCKS, BLOCK_ROWS, 1, HEAD_DIM],
-        torch.bfloat16, init_value=cache_fwd, is_output=True,
+        torch.bfloat16, init_value=cache_fwd, 
     )
 
     # cmp_kv: compressed KV cache, FWD_NUM_LAYERS per-layer pools (every
@@ -2543,7 +2543,7 @@ def build_tensor_specs(cp_size: int = CP_SIZE):
     specs_by_name["cmp_kv"] = TensorSpec(
         "cmp_kv",
         [cp_size, FWD_NUM_LAYERS * PREFILL_CMP_BLOCK_NUM, BLOCK_SIZE, 1, HEAD_DIM],
-        torch.bfloat16, init_value=cmp_kv_fwd, is_output=True,
+        torch.bfloat16, init_value=cmp_kv_fwd, 
     )
 
     # --- HCA type-specific (layers 3 and 5) --------------------------------
@@ -2747,15 +2747,14 @@ def build_tensor_specs(cp_size: int = CP_SIZE):
     specs_by_name["pre_hc_hidden_out"] = TensorSpec(
         "pre_hc_hidden_out",
         [cp_size, LOCAL_PARTS, MAX_SEGMENT_TILES, T, HC_MULT, D],
-        torch.float32, is_output=True,
+        torch.float32, 
     )
     specs_by_name["hidden_out"] = TensorSpec(
         "hidden_out", [cp_size, LOCAL_ROWS, D], torch.bfloat16,
-        is_output=True,
     )
     specs_by_name["logits"] = TensorSpec(
         "logits", [cp_size, LM_HEAD_MAX_LOGIT_ROWS, LM_HEAD_VOCAB],
-        torch.float32, is_output=True,
+        torch.float32, 
     )
 
     # Verify the host ABI matches.
@@ -2773,7 +2772,7 @@ def build_tensor_specs(cp_size: int = CP_SIZE):
 # Harness-only Phase-3 tail sanity comparators (§8.9).
 #
 # The multi-layer FWD has no mathematical golden. Under --check-outputs the
-# harness supplies a no-op golden_fn (so every is_output spec gets a
+# harness supplies a no-op golden_fn (so every output spec gets a
 # zero-filled expected tensor) and a per-output compare_fn: persistent outputs
 # pass through _accept_output, and the three Phase-3 tail outputs
 # (pre_hc_hidden_out, hidden_out, logits) are inspected for finite + nonzero
@@ -2964,6 +2963,17 @@ def _check_logits(actual, _expected, *, inputs, **_kwargs):
     return True, "logits sanity OK"
 
 
+# Every pl.Out / pl.InOut parameter of l3_cp_prefill_fwd. Spelled out because
+# compare_fn is built before compilation, and a spec learns its direction only
+# once the harness stamps it from the compiled artifact.
+_OUTPUT_NAMES = (
+    "kv_cache", "cmp_kv", "idx_kv_cache", "idx_kv_scale",
+    "hca_compress_state", "csa_compress_state", "csa_inner_compress_state",
+    "stage_token", "completion_anchor",
+    "pre_hc_hidden_out", "hidden_out", "logits",
+)
+
+
 def _build_outputs_compare_fn(specs):
     """Build a compare_fn dict: persistent outputs pass through
     _accept_output; the three Phase-3 tail outputs use dedicated sanity
@@ -2972,7 +2982,7 @@ def _build_outputs_compare_fn(specs):
     for spec in specs:
         if not isinstance(spec, TensorSpec):
             continue
-        if not spec.is_output:
+        if spec.name not in _OUTPUT_NAMES:
             continue
         if spec.name == "pre_hc_hidden_out":
             compare_fn[spec.name] = _check_pre_hc_hidden_out
@@ -3090,7 +3100,7 @@ if __name__ == "__main__":
     specs, ctx = build_tensor_specs(cp_size=args.cp)
 
     if args.check_outputs:
-        # No-op golden fills every is_output spec with zeros; the compare_fn
+        # No-op golden fills every output spec with zeros; the compare_fn
         # ignores expected for the tail outputs and pass-throughs for the
         # persistent caches.
         golden_fn = lambda _scratch: None

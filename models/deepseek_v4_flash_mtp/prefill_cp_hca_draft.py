@@ -1668,7 +1668,6 @@ def build_tensor_specs(cp_size: int = CP_SIZE):
                 list(state.shape),
                 state.dtype,
                 init_value=state,
-                is_output=True,
             ),
             TensorSpec(
                 "compress_state_block_table",
@@ -1681,14 +1680,12 @@ def build_tensor_specs(cp_size: int = CP_SIZE):
                 list(kv_cache.shape),
                 kv_cache.dtype,
                 init_value=kv_cache,
-                is_output=True,
             ),
             TensorSpec(
                 "cmp_kv",
                 list(cmp_cache.shape),
                 cmp_cache.dtype,
                 init_value=cmp_cache,
-                is_output=True,
             ),
             TensorSpec(
                 "cmp_block_table",
@@ -1740,7 +1737,6 @@ def build_tensor_specs(cp_size: int = CP_SIZE):
             "x_out",
             list(x_hc.shape),
             torch.float32,
-            is_output=True,
         )
     )
 

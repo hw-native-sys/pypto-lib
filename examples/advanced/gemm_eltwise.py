@@ -58,7 +58,7 @@ def build_tensor_specs(
         TensorSpec("attn_out", [batch, hidden], torch.bfloat16, init_value=torch.randn),
         TensorSpec("hidden_states", [batch, hidden], torch.bfloat16, init_value=torch.randn),
         TensorSpec("wo", [hidden, hidden], torch.bfloat16, init_value=torch.randn),
-        TensorSpec("resid", [batch, hidden], torch.float32, is_output=True),
+        TensorSpec("resid", [batch, hidden], torch.float32),
     ]
 
 

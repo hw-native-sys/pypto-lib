@@ -568,14 +568,12 @@ def build_specs(
             cache_shape,
             torch.bfloat16,
             init_value=initializer("key_cache"),
-            is_output=True,
         ),
         TensorSpec(
             "value_cache",
             cache_shape,
             torch.bfloat16,
             init_value=initializer("value_cache"),
-            is_output=True,
         ),
         TensorSpec(
             "block_table",
@@ -652,7 +650,6 @@ def build_specs(
             "out",
             [case.batch, NUM_HEADS, HEAD_DIM],
             torch.bfloat16,
-            is_output=True,
         ),
     ]
 

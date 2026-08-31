@@ -205,7 +205,7 @@ def build_tensor_specs():
                    init_value=lambda: torch.tensor([0.076099])),
         TensorSpec("hc_head_base", [HC_MULT], torch.float32,
                    init_value=lambda: torch.tensor([5.9166, -3.6223, -2.9324, -3.3124])),
-        TensorSpec("y", [T, D], torch.bfloat16, is_output=True),
+        TensorSpec("y", [T, D], torch.bfloat16),
     ]
 
 

@@ -124,8 +124,8 @@ def build_tensor_specs(token_count, vocab_size):
         TensorSpec("token_ids", [token_count], torch.int64, init_value=init_token_ids),
         TensorSpec("markov_w1", [vocab_size, MARKOV_RANK], torch.bfloat16, init_value=init_markov_w1),
         TensorSpec("markov_w2", [vocab_size, MARKOV_RANK], torch.bfloat16, init_value=init_markov_w2),
-        TensorSpec("logits_bias", [token_count, vocab_size], torch.float32, is_output=True),
-        TensorSpec("markov_embed", [token_count, MARKOV_RANK], torch.bfloat16, is_output=True),
+        TensorSpec("logits_bias", [token_count, vocab_size], torch.float32),
+        TensorSpec("markov_embed", [token_count, MARKOV_RANK], torch.bfloat16),
     ]
 
 

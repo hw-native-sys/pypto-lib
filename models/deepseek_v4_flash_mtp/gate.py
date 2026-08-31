@@ -394,10 +394,10 @@ def build_tensor_specs(layer_id=0, num_tokens=T):
         ScalarSpec("num_tokens", torch.int32, num_tokens),
         TensorSpec("tid2eid", [VOCAB, TOPK], torch.int32, init_value=init_tid2eid),
         TensorSpec("input_ids", [T], torch.int64, init_value=init_input_ids),
-        TensorSpec("x_norm_i8", [T, D], torch.int8, is_output=True),
-        TensorSpec("x_norm_scale", [T, 1], torch.float32, is_output=True),
-        TensorSpec("indices", [T, TOPK], torch.int32, is_output=True),
-        TensorSpec("weights", [T, TOPK], torch.float32, is_output=True),
+        TensorSpec("x_norm_i8", [T, D], torch.int8),
+        TensorSpec("x_norm_scale", [T, 1], torch.float32),
+        TensorSpec("indices", [T, TOPK], torch.int32),
+        TensorSpec("weights", [T, TOPK], torch.float32),
     ]
 
 

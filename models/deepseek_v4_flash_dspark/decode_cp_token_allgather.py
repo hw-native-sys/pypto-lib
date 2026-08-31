@@ -247,7 +247,7 @@ def build_tensor_specs(local_t=FIXTURE_LOCAL_T):
 
     return [
         TensorSpec("hidden_local", [FIXTURE_ROUNDS, TP_SIZE, local_t, D], torch.bfloat16, init_value=init_hidden_local),
-        TensorSpec("group_out", [FIXTURE_ROUNDS, TP_SIZE, group_t, D], torch.bfloat16, is_output=True),
+        TensorSpec("group_out", [FIXTURE_ROUNDS, TP_SIZE, group_t, D], torch.bfloat16),
     ]
 
 

@@ -326,12 +326,10 @@ def l3_mtp_prefill_fwd(
         )
 
 
-def _ranked(spec, torch, is_output=None):
+def _ranked(spec, torch):
     from golden import TensorSpec
 
-    if is_output is None:
-        is_output = spec.is_output
-    return TensorSpec(spec.name, list(spec.shape), spec.dtype, init_value=spec.init_value, is_output=is_output)
+    return TensorSpec(spec.name, list(spec.shape), spec.dtype, init_value=spec.init_value)
 
 
 def _projection_specs():
@@ -458,8 +456,8 @@ def build_tensor_specs(start_pos=0, num_tokens=T):
         else:
             specs.append(_ranked(base[name], torch))
 
-    specs.append(TensorSpec("hidden_out", [N_RANKS, T, D], torch.bfloat16, is_output=True))
-    specs.append(TensorSpec("pre_hc_hidden_out", [N_RANKS, T, HC_MULT, D], torch.float32, is_output=True))
+    specs.append(TensorSpec("hidden_out", [N_RANKS, T, D], torch.bfloat16))
+    specs.append(TensorSpec("pre_hc_hidden_out", [N_RANKS, T, HC_MULT, D], torch.float32))
     specs.append(ScalarSpec("num_tokens", torch.int32, num_tokens))
     return specs
 

@@ -332,7 +332,7 @@ def build_tensor_specs(token_count: int = T):
             torch.float32,
             init_value=lambda: torch.tensor([5.9166, -3.6223, -2.9324, -3.3124]),
         ),
-        TensorSpec("y", [token_count, D], torch.bfloat16, is_output=True),
+        TensorSpec("y", [token_count, D], torch.bfloat16),
     ]
 
 

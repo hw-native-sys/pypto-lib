@@ -938,7 +938,7 @@ def build_tensor_specs(layer_id=0, num_tokens=T, balanced_routing=False):
         TensorSpec("shared_w3_scale",  [N_RANKS, MOE_INTER],             torch.float32, init_value=lambda: sw3_s),
         TensorSpec("shared_w2",        [N_RANKS, D, MOE_INTER],          torch.int8,    init_value=lambda: sw2_i8),
         TensorSpec("shared_w2_scale",  [N_RANKS, D],                     torch.float32, init_value=lambda: sw2_s),
-        TensorSpec("x_next",           [N_RANKS, T, HC_MULT, D],      torch.float32, is_output=True),
+        TensorSpec("x_next",           [N_RANKS, T, HC_MULT, D],      torch.float32),
         ScalarSpec("layer_id",         torch.int32,                      layer_id),
         ScalarSpec("num_tokens",       torch.int32,                      num_tokens),
     ]
@@ -950,7 +950,7 @@ def build_tensor_specs(layer_id=0, num_tokens=T, balanced_routing=False):
     # H2D/D2H. Covers the routed/shared expert weights and their scales, the gate,
     # the HC-FFN constants, the RMSNorm gamma, and the static tid2eid route table —
     # but NOT the per-step activation (x_hc), per-step input_ids, or the output.
-    # All resident names are inputs (is_output=False), so the flag is always valid.
+    # All resident names are pure inputs, so the flag is always valid.
     RESIDENT_WEIGHT_NAMES = frozenset([
         "hc_ffn_fn", "hc_ffn_scale", "hc_ffn_base", "norm_w",
         "gate_w", "gate_bias", "tid2eid",

@@ -64,18 +64,15 @@ def _required_files(spec: TensorSpec | ScalarSpec) -> list[tuple[str, str]]:
       :attr:`ScalarSpec.value` tensor).
     - :class:`TensorSpec` pure input: ``in/{name}.pt``.
     - :class:`TensorSpec` pure output: ``out/{name}.pt``.
-    - :class:`TensorSpec` inout (``is_output`` + ``init_value``):
-      both ``in/{name}.pt`` and ``out/{name}.pt``.
+    - :class:`TensorSpec` inout: both ``in/{name}.pt`` and ``out/{name}.pt``.
     """
     if isinstance(spec, ScalarSpec):
         return [("in", f"{spec.name}.pt")]
     files: list[tuple[str, str]] = []
-    if not spec.is_output:
+    if spec.is_input:
         files.append(("in", f"{spec.name}.pt"))
-    else:
+    if spec.is_output:
         files.append(("out", f"{spec.name}.pt"))
-        if spec.init_value is not None:
-            files.append(("in", f"{spec.name}.pt"))
     return files
 
 
@@ -340,7 +337,7 @@ def _prepare_inputs(
             input_snapshot = {
                 spec.name: tensors[spec.name].clone()
                 for spec in tensor_specs
-                if not spec.is_output or spec.init_value is not None
+                if spec.is_input
             }
         if save_data:
             in_dir = work_dir / "data" / "in"
@@ -360,11 +357,13 @@ def _prepare_inputs(
         raise ValueError(f"golden_data is missing files: {missing}")
     print(f"[RUN]   cache hit: {data_dir / 'in'}", flush=True)
 
-    # Load inputs + inout initial values from {dir}/in/; pure outputs stay zero-init.
-    input_names = [s.name for s in tensor_specs if not s.is_output or s.init_value is not None]
+    # Load inputs + inout initial values from {dir}/in/. A pure output carries
+    # no input data, so its host buffer -- the read-back destination -- stays
+    # zero-init rather than re-running the spec's init_value.
+    input_names = [s.name for s in tensor_specs if s.is_input]
     tensors = _load_tensors(data_dir, "in", input_names)
     for spec in tensor_specs:
-        if spec.is_output and spec.init_value is None:
+        if not spec.is_input:
             tensors[spec.name] = torch.zeros(spec.shape, dtype=spec.dtype)
 
     scalar_specs_eff = _effective_scalar_specs(scalar_specs, data_dir)
@@ -920,19 +919,38 @@ def _validate_l3_arg_names(compiled_names: list[str], provided_names: list[str])
     )
 
 
+def _direction_names() -> dict[Any, str]:
+    """``ParamDirection`` -> :attr:`TensorSpec.direction` string, built per call
+    so a patched ``ParamDirection`` is never shadowed by a cached map."""
+    from pypto.ir import ParamDirection
+
+    return {
+        ParamDirection.In: "in",
+        ParamDirection.Out: "out",
+        ParamDirection.InOut: "inout",
+    }
+
+
 def _validate_compiled_spec_abi(
     compiled: Any,
     specs: list[TensorSpec | ScalarSpec],
 ) -> None:
-    """Validate the complete spec ABI of any live compiled artifact.
+    """Validate the spec ABI of a live compiled artifact and stamp directions.
 
     Signature-driven JIT compilation does not consume tensor sample arguments,
     so a successful compile alone cannot prove that the caller's specs still
     match the annotated program.  Compare the normalized parameter name, kind,
-    shape, dtype, and direction before either compile-only success or replay.
-    A compiled ``-1`` dimension is dynamic and therefore accepts the matching
-    concrete spec dimension. Lightweight test doubles without metadata are
-    ignored; real L2 and L3 compiled programs both expose ``_get_metadata``.
+    shape, and dtype before either compile-only success or replay. A compiled
+    ``-1`` dimension is dynamic and therefore accepts the matching concrete spec
+    dimension.
+
+    Direction is not compared but **copied**: the kernel signature owns it, so
+    each :class:`TensorSpec` takes its :attr:`~TensorSpec.direction` from the
+    artifact here, before any tensor is allocated. Every later
+    ``spec.is_output`` / ``spec.is_input`` read resolves against it.
+
+    Lightweight test doubles without metadata are ignored; real L2 and L3
+    compiled programs both expose ``_get_metadata``.
     """
     metadata_getter = getattr(compiled, "_get_metadata", None)
     if not callable(metadata_getter):
@@ -941,9 +959,9 @@ def _validate_compiled_spec_abi(
     if not isinstance(metadata, tuple) or len(metadata) != 3:
         return
 
-    from pypto.ir import ParamDirection
     from pypto.ir.compiled_program import _to_torch_dtype
 
+    directions = _direction_names()
     param_infos, _, _ = metadata
     compiled_names = [_strip_ssa_suffix(info.name) for info in param_infos]
     if len(set(compiled_names)) != len(compiled_names):
@@ -974,9 +992,6 @@ def _validate_compiled_spec_abi(
     specs_by_name = {spec.name: spec for spec in specs}
     mismatches: list[str] = []
 
-    def _direction_name(direction: Any) -> str:
-        return getattr(direction, "name", repr(direction))
-
     for name, info in zip(compiled_names, param_infos, strict=True):
         spec = specs_by_name[name]
         artifact_shape = None if info.shape is None else tuple(info.shape)
@@ -986,19 +1001,15 @@ def _validate_compiled_spec_abi(
             artifact_dtype = None
 
         if isinstance(spec, ScalarSpec):
-            expected_direction = ParamDirection.In
             if artifact_shape is not None:
                 mismatches.append(
                     f"{name}: expected scalar, artifact is tensor shape={artifact_shape}"
                 )
+            if directions.get(info.direction) != "in":
+                mismatches.append(
+                    f"{name}: scalar direction must be In, artifact={info.direction!r}"
+                )
         else:
-            if not spec.is_output:
-                expected_direction = ParamDirection.In
-            elif spec.init_value is None:
-                expected_direction = ParamDirection.Out
-            else:
-                expected_direction = ParamDirection.InOut
-
             expected_shape = tuple(spec.shape)
             if artifact_shape is None:
                 mismatches.append(f"{name}: expected tensor shape={expected_shape}, artifact is scalar")
@@ -1016,11 +1027,10 @@ def _validate_compiled_spec_abi(
             mismatches.append(
                 f"{name}: dtype spec={spec.dtype} artifact={artifact_dtype}"
             )
-        if info.direction != expected_direction:
-            mismatches.append(
-                f"{name}: direction spec={_direction_name(expected_direction)} "
-                f"artifact={_direction_name(info.direction)}"
-            )
+        if isinstance(spec, TensorSpec):
+            spec.direction = directions.get(info.direction)
+            if spec.direction is None:
+                mismatches.append(f"{name}: unknown artifact direction {info.direction!r}")
 
     if mismatches:
         raise ValueError(
@@ -1419,8 +1429,9 @@ def _compute_golden(
     """Produce golden output tensors for validation.
 
     With *data_dir* set, load from ``{data_dir}/out/``. Otherwise call
-    *golden_fn* on a scratch dict (inputs cloned from *input_snapshot*,
-    outputs zero-init) and, when *save_data* is True, persist results into
+    *golden_fn* on a scratch dict (input tensors cloned from *input_snapshot*,
+    pure outputs from their own ``init_value``) and, when
+    *save_data* is True, persist results into
     ``{work_dir}/data/out/``.
     """
     with _Stage("compute golden"):
@@ -1433,10 +1444,10 @@ def _compute_golden(
         for spec in specs:
             if isinstance(spec, ScalarSpec):
                 scratch[spec.name] = scalar_specs_eff[spec.name].to_python()
-            elif spec.is_output and spec.init_value is None:
-                scratch[spec.name] = torch.zeros(spec.shape, dtype=spec.dtype)
-            else:
+            elif spec.is_input:
                 scratch[spec.name] = input_snapshot[spec.name].clone()
+            else:
+                scratch[spec.name] = spec.create_tensor()
         golden_fn(scratch)
         golden_outputs = {spec.name: scratch[spec.name] for spec in tensor_specs if spec.is_output}
         if save_data:

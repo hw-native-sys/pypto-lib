@@ -46,7 +46,7 @@ rank-stacked, per-FWD-layer weights and caches are packed along dim 1 by
 FWD-layer id, and the CSA/HCA-compact stacks are packed by per-kind order
 (ascending layer id of that kind). All cache slices handed to the leaf goldens
 are torch views of the stacked tensors, so their in-place slot updates land in
-the ``is_output`` cache tensors that validation reads back.
+the output cache tensors that validation reads back.
 
 Real DeepSeek-V4-Flash checkpoint loader
 ----------------------------------------
@@ -900,7 +900,7 @@ def _moe_views(tensors, layer, x_hc, x_next, num_tokens):
 
 
 def golden_prefill_fwd(tensors):
-    """Fill every ``is_output`` tensor of prefill_fwd's spec list in place."""
+    """Fill every output tensor of prefill_fwd's spec list in place."""
     import torch
 
     num_tokens = int(tensors["num_tokens"])

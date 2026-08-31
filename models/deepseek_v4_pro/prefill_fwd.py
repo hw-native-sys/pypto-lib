@@ -1138,7 +1138,6 @@ def _make_stacked_spec(name, base_specs):
     # cache).
     return TensorSpec(
         name, packed_shape, spec.dtype, init_value=init_value,
-        is_output=name in RESIDENT_CACHE_OUTPUT_NAMES,
     )
 
 
@@ -1179,7 +1178,7 @@ def _make_shared_spec(name, base_specs, start_pos):
         # Any remaining shared metadata: smoke zeros.
         return torch.zeros(list(spec.shape), dtype=spec.dtype)
 
-    return TensorSpec(name, list(spec.shape), spec.dtype, init_value=init_value, is_output=False)
+    return TensorSpec(name, list(spec.shape), spec.dtype, init_value=init_value)
 
 
 def _make_hc_head_spec(name):
@@ -1462,7 +1461,6 @@ def build_single_layer_tensor_specs(start_pos=START_POS, num_tokens=T, layer_id=
             src.dtype,
             init_value=(_ranked_x_hc_init(src, N_RANKS, active_tokens, torch) if name == "x_hc"
                         else _ranked_init(src, N_RANKS, torch)),
-            is_output=src.is_output,
         )
         for name, src in attention_specs
     ]
@@ -1495,7 +1493,7 @@ def build_single_layer_tensor_specs(start_pos=START_POS, num_tokens=T, layer_id=
         else:
             tensor_specs.append(spec)
 
-    tensor_specs.append(TensorSpec("x_next", [N_RANKS, T, HC_MULT, D], torch.float32, is_output=True))
+    tensor_specs.append(TensorSpec("x_next", [N_RANKS, T, HC_MULT, D], torch.float32))
     tensor_by_name = {spec.name: spec for spec in tensor_specs}
     missing = [name for name in HOST_TENSOR_ORDER if name not in tensor_by_name]
     if missing:
@@ -1580,13 +1578,13 @@ def build_tensor_specs(start_pos=0, num_tokens=T):
     # (child_memory): each shard uploaded once to its card and reused across
     # dispatches, skipping per-dispatch H2D/D2H. RESIDENT_WEIGHT_NAMES are static
     # weights; RESIDENT_CACHE_NAMES are the KV/state caches (the written kv_cache
-    # is also is_output=True and read back at the end via RESIDENT_CACHE_OUTPUT_NAMES).
+    # is also an InOut, read back at the end via RESIDENT_CACHE_OUTPUT_NAMES).
     for spec in specs:
         if spec.name in RESIDENT_WEIGHT_NAMES or spec.name in RESIDENT_CACHE_NAMES:
             spec.resident = "stacked"
 
-    specs.append(TensorSpec("pre_hc_hidden_out", [N_RANKS, T, HC_MULT, D], torch.float32, is_output=True))
-    specs.append(TensorSpec("hidden_out", [N_RANKS, T, D], torch.bfloat16, is_output=True))
+    specs.append(TensorSpec("pre_hc_hidden_out", [N_RANKS, T, HC_MULT, D], torch.float32))
+    specs.append(TensorSpec("hidden_out", [N_RANKS, T, D], torch.bfloat16))
     specs.append(TensorSpec(
         "lm_head_weight",
         [N_RANKS, VOCAB_PER_TP, D],
@@ -1598,13 +1596,11 @@ def build_tensor_specs(start_pos=0, num_tokens=T):
         "logits",
         [N_RANKS, MAX_LOGIT_ROWS, LM_HEAD_VOCAB],
         torch.float32,
-        is_output=True,
     ))
     specs.append(TensorSpec(
         "sampled_ids",
         [N_RANKS, MAX_LOGIT_ROWS, SAMPLED_IDS_PAD],
         torch.int32,
-        is_output=True,
     ))
     specs.append(TensorSpec(
         "logit_row_indices",

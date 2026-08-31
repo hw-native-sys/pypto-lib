@@ -68,7 +68,7 @@ def build_tensor_specs(
     return [
         TensorSpec("x", [rows, hidden], torch.float32, init_value=torch.randn),
         TensorSpec("gamma", [1, hidden], torch.float32, init_value=torch.randn),
-        TensorSpec("y", [rows, hidden], torch.float32, is_output=True),
+        TensorSpec("y", [rows, hidden], torch.float32),
     ]
 
 

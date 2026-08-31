@@ -69,7 +69,7 @@ def build_tensor_specs(
         TensorSpec("x", [total_rows, head_dim], torch.float32, init_value=torch.randn),
         TensorSpec("cos", [1, head_dim], torch.float32, init_value=torch.randn),
         TensorSpec("sin", [1, head_dim], torch.float32, init_value=torch.randn),
-        TensorSpec("y", [total_rows, head_dim], torch.float32, is_output=True),
+        TensorSpec("y", [total_rows, head_dim], torch.float32),
     ]
 
 

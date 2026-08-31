@@ -891,7 +891,6 @@ def build_tensor_specs(
         TensorSpec(
             name, [N_RANKS, *spec.shape], spec.dtype,
             init_value=_ranked_init(spec, replicated=name in replicated_attention),
-            is_output=name in mutable_cache_names,
         )
         for name, spec in attention_specs
     ]
@@ -944,7 +943,7 @@ def build_tensor_specs(
             spec.resident = "stacked"
 
     specs.extend([
-        TensorSpec("x_next", [N_RANKS, T, HC_MULT, D], torch.float32, is_output=True),
+        TensorSpec("x_next", [N_RANKS, T, HC_MULT, D], torch.float32),
         ScalarSpec("layer_id", torch.int32, layer_id),
         ScalarSpec("moe_epoch", torch.int32, 1, compile_runtime=True, benchmark_step=1),
     ])

@@ -52,8 +52,8 @@ def build_tensor_specs():
 
     return [
         TensorSpec("scores",    [ROWS, N], torch.float32, init_value=torch.randn),
-        TensorSpec("topk_vals", [ROWS, K], torch.float32, is_output=True),
-        TensorSpec("topk_idx",  [ROWS, K], torch.int32,   is_output=True),
+        TensorSpec("topk_vals", [ROWS, K], torch.float32),
+        TensorSpec("topk_idx",  [ROWS, K], torch.int32),
     ]
 
 

@@ -846,7 +846,6 @@ def build_tensor_specs(layer_id=2):
                 [N_RANKS, *src.shape],
                 src.dtype,
                 init_value=make_init(),
-                is_output=packed_name in _HISTORY_CACHE_NAMES,
             )
         )
 
@@ -866,7 +865,7 @@ def build_tensor_specs(layer_id=2):
         else:
             tensor_specs.append(spec)
 
-    tensor_specs.append(TensorSpec("x_next", [N_RANKS, total_tokens, HC_MULT, D], torch.float32, is_output=True))
+    tensor_specs.append(TensorSpec("x_next", [N_RANKS, total_tokens, HC_MULT, D], torch.float32))
 
     # Keep static weight parameters device-resident (child_memory), sharded per
     # rank. Cache/state/table tensors remain host tensors for output validation.

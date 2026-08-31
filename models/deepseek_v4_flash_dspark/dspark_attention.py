@@ -481,7 +481,6 @@ def build_tensor_specs(start_pos=None):
             [KV_ORI_BLOCK_NUM, BLOCK_SIZE, 1, HEAD_DIM],
             torch.bfloat16,
             init_value=init_kv_cache,
-            is_output=True,
         ),
         TensorSpec("slot_mapping", [T], torch.int64, init_value=init_slot_mapping),
         TensorSpec("swa_indices", [B, INDEX_WIDTH], torch.int32, init_value=init_swa_indices),
@@ -491,7 +490,6 @@ def build_tensor_specs(start_pos=None):
             "o_packed_heads",
             [O_GROUPS, LOCAL_T_PAD * HEADS_PER_GROUP, HEAD_DIM],
             torch.bfloat16,
-            is_output=True,
         ),
     ]
 

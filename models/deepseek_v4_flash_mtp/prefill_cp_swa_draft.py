@@ -805,7 +805,7 @@ def build_tensor_specs(cp_size: int = CP_SIZE):
         "freqs_cos", "freqs_sin",
     ):
         specs.append(TensorSpec(name, list(base[name].shape), base[name].dtype, init_value=base[name]))
-    specs.append(TensorSpec("kv_cache", list(cache.shape), torch.bfloat16, init_value=cache, is_output=True))
+    specs.append(TensorSpec("kv_cache", list(cache.shape), torch.bfloat16, init_value=cache))
     for name in tail_names:
         specs.append(TensorSpec(name, list(base[name].shape), base[name].dtype, init_value=base[name]))
     segment_starts = meta["segment_starts"]
@@ -823,7 +823,7 @@ def build_tensor_specs(cp_size: int = CP_SIZE):
     specs.append(TensorSpec("owner_rank_table", list(owner_rank.shape), owner_rank.dtype, init_value=owner_rank))
     for name in ("final_win_seg_src", "final_win_row_src", "final_slot_mapping"):
         specs.append(TensorSpec(name, list(meta[name].shape), meta[name].dtype, init_value=meta[name]))
-    specs.append(TensorSpec("x_out", list(x.shape), torch.float32, is_output=True))
+    specs.append(TensorSpec("x_out", list(x.shape), torch.float32))
     return specs, ctx
 
 

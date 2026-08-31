@@ -102,7 +102,7 @@ def build_tensor_specs(batch=DECODE_BATCH // TP, seq=DECODE_SEQ):
         TensorSpec("main_hidden", [t, MAIN_HIDDEN_DIM], torch.bfloat16, init_value=init_main_hidden),
         TensorSpec("main_proj_w", [D, MAIN_HIDDEN_DIM], torch.bfloat16, init_value=init_main_proj_w),
         TensorSpec("main_norm_w", [D], torch.bfloat16, init_value=lambda: torch.randn(D) * 0.1 + 1.0),
-        TensorSpec("main_x", [t, D], torch.bfloat16, is_output=True),
+        TensorSpec("main_x", [t, D], torch.bfloat16),
     ]
 
 

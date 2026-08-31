@@ -92,15 +92,23 @@ def _l3_abi_environment():
         yield
 
 
+def _stamped(specs, directions):
+    """Apply the direction stamp ``_validate_compiled_spec_abi`` normally copies
+    from the compiled artifact, for doubles that expose no parameter metadata."""
+    for spec in specs:
+        if isinstance(spec, TensorSpec):
+            spec.direction = directions[spec.name]
+    return specs
+
+
 @pytest.fixture
 def three_kinds_specs():
     """TensorSpec trio covering pure input / pure output / inout."""
-    return [
+    return _stamped([
         TensorSpec("x", [4], torch.float32, init_value=torch.randn),           # pure input
-        TensorSpec("y", [4], torch.float32, is_output=True),                   # pure output
-        TensorSpec("state", [4], torch.float32, init_value=torch.zeros,        # inout
-                   is_output=True),
-    ]
+        TensorSpec("y", [4], torch.float32),                                   # pure output
+        TensorSpec("state", [4], torch.float32, init_value=torch.zeros),       # inout
+    ], {"x": "in", "y": "out", "state": "inout"})
 
 
 @pytest.fixture
@@ -745,7 +753,6 @@ class TestRunJitCompileRuntime:
             ("x", [5], torch.float32, _FakeParamDirection.In, "shape"),
             ("x", [4], torch.int32, _FakeParamDirection.In, "dtype"),
             ("x", None, torch.float32, _FakeParamDirection.In, "expected tensor"),
-            ("x", [4], torch.float32, _FakeParamDirection.Out, "direction"),
             ("epoch", [1], torch.int32, _FakeParamDirection.In, "expected scalar"),
             ("epoch", None, torch.int64, _FakeParamDirection.In, "dtype"),
             ("epoch", None, torch.int32, _FakeParamDirection.InOut, "direction"),
@@ -828,7 +835,6 @@ class TestRunJitCompileRuntime:
                         [4],
                         torch.float32,
                         init_value=torch.zeros,
-                        is_output=True,
                     ),
                     ScalarSpec("epoch", torch.int32, 0, compile_runtime=True),
                 ],
@@ -1216,11 +1222,11 @@ class TestRunResultStr:
 @pytest.fixture
 def mixed_specs():
     """Mix of TensorSpec input + ScalarSpec + TensorSpec output."""
-    return [
+    return _stamped([
         TensorSpec("x", [4], torch.float32, init_value=torch.randn),
         ScalarSpec("alpha", torch.float32, 2.5),
-        TensorSpec("y", [4], torch.float32, is_output=True),
-    ]
+        TensorSpec("y", [4], torch.float32),
+    ], {"x": "in", "y": "out"})
 
 
 class TestScalarMixedSpecs:
@@ -1927,7 +1933,7 @@ def test_nonresident_validation_precedes_benchmark_mutation(
 ):
     """Benchmark reuse must not overwrite the dedicated correctness result."""
     compiled = _FakeCompiled(tmp_path)
-    specs = [TensorSpec("y", [1], torch.float32, is_output=True)]
+    specs = _stamped([TensorSpec("y", [1], torch.float32)], {"y": "out"})
     monkeypatch.setenv("PYPTO_BENCH", "1")
 
     def _dispatch(_compiled, _specs, tensors, _scalars, _runtime_cfg):
@@ -2070,7 +2076,7 @@ class TestResidentPath:
             TensorSpec("x", [4], torch.float32, init_value=torch.randn),     # per-call input
             TensorSpec("w", [4], torch.float32, init_value=torch.ones,       # whole-tensor resident
                        resident=0),
-            TensorSpec("y", [4], torch.float32, is_output=True),             # output
+            TensorSpec("y", [4], torch.float32),             # output
         ]
 
     def test_resident_routes_to_l3_resident_not_single_chip(self, tmp_path):
@@ -2146,7 +2152,7 @@ class TestResidentPath:
         initial_state = torch.arange(8, dtype=torch.float32).reshape(2, 4)
         state_spec = TensorSpec(
             "state", [2, 4], torch.float32, init_value=initial_state,
-            is_output=True, resident="stacked",
+             resident="stacked",
         )
         state_init = state_spec.create_tensor()
 
@@ -2456,7 +2462,7 @@ class TestResidentPath:
         fake_runtime = types.ModuleType("pypto.runtime")
         fake_runtime.StackedDeviceTensor = _FakeStackedDeviceTensor
 
-        specs = [TensorSpec("y", [2, 4], torch.float32, is_output=True, resident="stacked")]
+        specs = [TensorSpec("y", [2, 4], torch.float32,  resident="stacked")]
         tensors = {"y": torch.zeros(2, 4)}
         monkeypatch.setattr(R, "_l3_ordered_names", lambda _c: ["y"])
         monkeypatch.setattr(R, "_l3_pure_out_names", lambda _c: {"y"})
@@ -2491,7 +2497,7 @@ class TestResidentPath:
         ]
 
     def test_run_l3_resident_output_reads_back(self, monkeypatch):
-        """A resident+is_output spec (state buffer) is read back via copy_stacked_from
+        """A resident output spec (state buffer) is read back via copy_stacked_from
         before validation, so _validate sees the device's final state, not the stale host."""
         import golden.runner as R
 
@@ -2524,12 +2530,12 @@ class TestResidentPath:
         fake_mod = types.ModuleType("pypto.ir.distributed_compiled_program")
         fake_mod.DistributedCompiledProgram = _FakeDCP
 
-        specs = [
+        specs = _stamped([
             TensorSpec(
                 "kv", [2, 4], torch.float32, init_value=torch.zeros,
-                is_output=True, resident="stacked",
+                resident="stacked",
             )
-        ]
+        ], {"kv": "inout"})
         tensors = {"kv": torch.zeros(2, 4)}
         golden = {"kv": torch.full((2, 4), 7.0)}
 

@@ -21,7 +21,6 @@ TensorSpec(
     shape,
     dtype,
     init_value=None,
-    is_output=False,
 )
 ```
 
@@ -38,9 +37,13 @@ TensorSpec(
 Random input is therefore explicit: use `init_value=torch.randn` or another
 random factory. `init_value=None` does not generate random values.
 
-Set `is_output=True` for every tensor that validation must compare. An output
-with a non-`None` initializer is an input/output state tensor: its initial
-value is supplied to the runtime and its final value is validated.
+A spec does not declare a direction. The harness reads each parameter's
+`In` / `Out` / `InOut` from the compiled artifact and stamps it onto the spec
+before any tensor is allocated, so the kernel signature is the single source of
+truth: every `pl.Out` / `pl.InOut` parameter is validated, and a `pl.InOut`
+tensor's `init_value` is uploaded as its initial state. A pure `pl.Out`
+parameter's host buffer is never uploaded, so an `init_value` there reaches only
+the golden reference, not the device.
 
 ### ScalarSpec
 

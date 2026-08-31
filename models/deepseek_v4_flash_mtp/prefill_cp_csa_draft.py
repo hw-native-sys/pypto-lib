@@ -896,15 +896,6 @@ def build_tensor_specs(cp_size: int = CP_SIZE):
                 list(value.shape),
                 value.dtype,
                 init_value=value,
-                is_output=name
-                in {
-                    "compress_state",
-                    "inner_compress_state",
-                    "kv_cache",
-                    "cmp_kv",
-                    "idx_kv_cache",
-                    "idx_kv_scale",
-                },
             )
         )
     for name, value in raw.items():
@@ -1020,7 +1011,7 @@ def build_tensor_specs(cp_size: int = CP_SIZE):
         )
     specs.append(
         TensorSpec(
-            "x_out", list(x_hc.shape), torch.float32, is_output=True
+            "x_out", list(x_hc.shape), torch.float32
         )
     )
     golden_prefill_cp_csa._ctx = {

@@ -813,7 +813,6 @@ def build_tensor_specs(start_pos=DECODE_START_POS, layer_id=10):
             [N_RANKS, *spec.shape],
             spec.dtype,
             init_value=_ranked_init(spec, replicated=name in replicated_attention),
-            is_output=name == "kv_cache",
         )
         for name, spec in attention_specs
     ]
@@ -847,7 +846,7 @@ def build_tensor_specs(start_pos=DECODE_START_POS, layer_id=10):
     # KV/state cache or per-step metadata); the MoE set adds the FFN/gate/expert
     # weights and the static tid2eid route table. The KV/state caches
     # (RESIDENT_CACHE_NAMES) are kept resident too — the written kv_cache is also
-    # is_output=True (line above) and read back once at the end for validation;
+    # an InOut (line above) and read back once at the end for validation;
     # the others are read-only inputs. NOT resident: the per-step slot mappings /
     # block tables / ids / position_ids / kv_seq_lens, the input activation
     # (x_hc), and the output (x_next), which change per token.
@@ -868,7 +867,7 @@ def build_tensor_specs(start_pos=DECODE_START_POS, layer_id=10):
             spec.resident = "stacked"
 
     specs.extend([
-        TensorSpec("x_next", [N_RANKS, T, HC_MULT, D], torch.float32, is_output=True),
+        TensorSpec("x_next", [N_RANKS, T, HC_MULT, D], torch.float32),
         ScalarSpec("layer_id", torch.int32, layer_id),
     ])
     return specs

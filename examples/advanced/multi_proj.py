@@ -75,9 +75,9 @@ def build_tensor_specs():
         TensorSpec("wq",    [HIDDEN, HIDDEN], torch.bfloat16, init_value=init_w),
         TensorSpec("wk",    [HIDDEN, HIDDEN], torch.bfloat16, init_value=init_w),
         TensorSpec("wv",    [HIDDEN, HIDDEN], torch.bfloat16, init_value=init_w),
-        TensorSpec("q_out", [BATCH, HIDDEN],  torch.float32,  is_output=True),
-        TensorSpec("k_out", [BATCH, HIDDEN],  torch.float32,  is_output=True),
-        TensorSpec("v_out", [BATCH, HIDDEN],  torch.float32,  is_output=True),
+        TensorSpec("q_out", [BATCH, HIDDEN],  torch.float32),
+        TensorSpec("k_out", [BATCH, HIDDEN],  torch.float32),
+        TensorSpec("v_out", [BATCH, HIDDEN],  torch.float32),
     ]
 
 
