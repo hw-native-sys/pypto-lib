@@ -255,13 +255,10 @@ def q_proj_rope(
 ):
     """Q LoRA, RMSNorm, quantization, and RoPE over bounded dense tiles."""
     t_dim = pl.tensor.dim(x, 0)
-    x_view = pl.reshape(x, [t_dim, D])
-    qr_view = pl.reshape(qr, [t_dim, Q_LORA])
-    qr_scale_view = pl.reshape(qr_scale, [t_dim, 1])
-    q_flat = pl.reshape(q, [t_dim, H * HEAD_DIM])
     for tile_base in pl.range(0, t_dim, PREFILL_DENSE_TILE):
         tile_rows = pl.min(PREFILL_DENSE_TILE, t_dim - tile_base)
         with pl.scope():
+            x_view = pl.reshape(x, [t_dim, D])
             qr_t_matmul = ((tile_rows + QR_M_TILE - 1) // QR_M_TILE) * QR_M_TILE
             qproj_t_matmul = ((tile_rows + QPROJ_TAIL_M_TILE - 1) // QPROJ_TAIL_M_TILE) * QPROJ_TAIL_M_TILE
             qproj_full_rows = (tile_rows // QPROJ_M_TILE) * QPROJ_M_TILE
@@ -300,6 +297,8 @@ def q_proj_rope(
                             q_acc = pl.matmul_acc(q_acc, q_x_chunk_bf16, w_chunk)
                     qr_fp32 = pl.assemble(qr_fp32, q_acc, [t0, q_a_col0], atomic=pl.AtomicType.Add)
 
+            qr_view = pl.reshape(qr, [t_dim, Q_LORA])
+            qr_scale_view = pl.reshape(qr_scale, [t_dim, 1])
             qr_i8_matmul = pl.create_tensor([qproj_t_matmul, Q_LORA], dtype=pl.INT8)
             qr_scale_pad_store = pl.create_tensor([qproj_t_matmul, 1], dtype=pl.FP32)
 
@@ -416,6 +415,7 @@ def q_proj_rope(
 
             # Fused qproj dequant, per-head RMSNorm, NOPE writeback, and interleaved RoPE.
             # RoPE: out[j] = inv_rms * (x[j] * cos[j] + x[j^1] * sign[j] * sin[j]).
+            q_flat = pl.reshape(q, [t_dim, H * HEAD_DIM])
             for hg_idx in pl.spmd(
                 H // Q_ROPE_H_TILE, name_hint="qproj_dequant_rms_nope_rope", allow_early_resolve=True
             ):
@@ -563,11 +563,10 @@ def kv_proj_rope(
 ):
     """KV LoRA, RMSNorm, and RoPE over bounded dense tiles."""
     t_dim = pl.tensor.dim(x, 0)
-    x_view = pl.reshape(x, [t_dim, D])
-    kv_view = pl.reshape(kv, [t_dim, HEAD_DIM])
     for tile_base in pl.range(0, t_dim, PREFILL_DENSE_TILE):
         tile_rows = pl.min(PREFILL_DENSE_TILE, t_dim - tile_base)
         with pl.scope():
+            x_view = pl.reshape(x, [t_dim, D])
             t_matmul = ((tile_rows + MATMUL_T_TILE - 1) // MATMUL_T_TILE) * MATMUL_T_TILE
 
             # Split-K kv_proj: KV_N_TILE N-groups expanded KV_OK-fold into cube blocks that
@@ -602,6 +601,8 @@ def kv_proj_rope(
                         else:
                             kv_acc = pl.matmul_acc(kv_acc, kv_x_chunk_bf16, wkv_chunk)
                     kv_fp32 = pl.assemble(kv_fp32, kv_acc, [t0, kv_col0], atomic=pl.AtomicType.Add)
+
+            kv_view = pl.reshape(kv, [t_dim, HEAD_DIM])
 
             # Fused KV RMSNorm + interleaved (CANN A3) RoPE, one spmd task per
             # [KV_RMS_T_TILE, HEAD_DIM] row block. NOPE columns [0:NOPE_DIM) and rope columns
