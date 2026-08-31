@@ -131,7 +131,6 @@ def sparse_attn_hca(
     attn_sink_col = pl.reshape(attn_sink, [H, 1])
     request_count = pl.tensor.dim(cmp_block_table, 0)
     raw_gather_count = t_dim * GATHER_SEGMENTS
-    raw_tile_count = t_dim * (WIN // RAW_K_TILE)
     stream_block_count = t_dim * (H // H_TILE)
     cmp_gather_count = request_count * cmp_work_count
     cmp_qk_block_count = t_dim * cmp_work_count
@@ -153,7 +152,6 @@ def sparse_attn_hca(
 
     with pl.scope():
         raw_kv = pl.create_tensor([t_dim * WIN, HEAD_DIM], dtype=pl.BF16)
-        raw_kv_t = pl.create_tensor([raw_tile_count * HEAD_DIM, RAW_K_TILE], dtype=pl.BF16)
         raw_valid = pl.create_tensor([t_dim, WIN], dtype=pl.FP32)
         with pl.spmd(raw_gather_count, name_hint="hca_gather_kv", deps=[cache_ready_dep]) as raw_gather_tid:
             g_task = pl.tile.get_block_idx()
@@ -192,19 +190,6 @@ def sparse_attn_hca(
                         else:
                             raw_kv[g_dst : g_dst + 1, 0:HEAD_DIM] = pl.full([1, HEAD_DIM], dtype=pl.BF16, value=0.0)
                             pl.write(raw_valid, [g_t, g_lane], 0.0)
-
-        with pl.spmd(raw_tile_count, name_hint="hca_raw_transpose", deps=[raw_gather_tid]) as raw_transpose_tid:
-            raw_tile = pl.tile.get_block_idx()
-            raw_row = raw_tile * RAW_K_TILE
-            raw_t_row = raw_tile * HEAD_DIM
-            raw_kv_t[
-                raw_t_row : raw_t_row + HEAD_DIM,
-                0:RAW_K_TILE,
-            ] = pl.transpose(
-                raw_kv[raw_row : raw_row + RAW_K_TILE, 0:HEAD_DIM],
-                axis1=0,
-                axis2=1,
-            )
 
         with pl.spmd(1, name_hint="rope_swap") as rope_swap_tid:
             sw_block = pl.tile.get_block_idx()
@@ -246,7 +231,7 @@ def sparse_attn_hca(
                 rope_cos_il[cs_t0 : cs_t0 + ROPE_CS_T_TILE, cp_c0 : cp_c0 + ROPE_INTERLEAVE_TILE] = cs_cos_dup
                 rope_sin_signed[cs_t0 : cs_t0 + ROPE_CS_T_TILE, cp_c0 : cp_c0 + ROPE_INTERLEAVE_TILE] = cs_sin_signed
 
-        with pl.spmd(stream_block_count, name_hint="hca_raw_attn", deps=[raw_transpose_tid]) as raw_heads_tid:
+        with pl.spmd(stream_block_count, name_hint="hca_raw_attn", deps=[raw_gather_tid]) as raw_heads_tid:
             stream_idx = pl.tile.get_block_idx()
             stream_t = stream_idx // (H // H_TILE)
             stream_h_tile = stream_idx - stream_t * (H // H_TILE)
@@ -262,21 +247,11 @@ def sparse_attn_hca(
                     raw_kv,
                     [stream_raw_begin, 0],
                     [RAW_K_TILE, HEAD_DIM],
-                    target_memory=pl.MemorySpace.Vec,
+                    target_memory=pl.MemorySpace.Mat,
                 )
-                stream_raw_t_begin = (stream_t * (WIN // RAW_K_TILE) + stream_raw_item) * HEAD_DIM
-                stream_raw_kv_t_left = pl.load(
-                    raw_kv_t,
-                    [stream_raw_t_begin, 0],
-                    [ATTN_D_TILE, RAW_K_TILE],
-                    target_memory=pl.MemorySpace.Vec,
-                )
-                stream_raw_kv_t_right = pl.load(
-                    raw_kv_t,
-                    [stream_raw_t_begin + ATTN_D_TILE, 0],
-                    [ATTN_D_TILE, RAW_K_TILE],
-                    target_memory=pl.MemorySpace.Vec,
-                )
+                stream_raw_kv_t = pl.tile.transpose_view(stream_raw_kv)
+                stream_raw_kv_t_left = stream_raw_kv_t[0:ATTN_D_TILE, 0:RAW_K_TILE]
+                stream_raw_kv_t_right = stream_raw_kv_t[ATTN_D_TILE:HEAD_DIM, 0:RAW_K_TILE]
                 stream_raw_valid_row = pl.load(
                     raw_valid,
                     [stream_t, stream_valid_begin],
@@ -798,7 +773,10 @@ def build_tensor_specs(
         """Initialize the sliding-window KV cache pages."""
         kv = torch.rand(ORI_BLOCK_NUM, BLOCK_SIZE, 1, HEAD_DIM) - 0.5
         if causal_regression_fixture:
-            kv[0, WIN - 1, 0].fill_(8.0)
+            table = init_window_block_table()
+            sentinel_page = int(table[0, (WIN - 1) // BLOCK_SIZE].item())
+            sentinel_row = (WIN - 1) % BLOCK_SIZE
+            kv[sentinel_page, sentinel_row, 0].fill_(8.0)
         if cache_window_replacement_fixture:
             kv[0, 16, 0].fill_(0.0)
             kv[0, 16, 0, 0] = 4.0
