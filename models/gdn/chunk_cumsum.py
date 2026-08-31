@@ -33,7 +33,7 @@ CHUNK_GROUP = 16        # chunks sharing one tril load; T must divide CHUNK * CH
 def gdn_chunk_cumsum(
     g: pl.Tensor[[T, H], pl.FP32],
     tril: pl.Tensor[[CHUNK, CHUNK], pl.FP32],
-    g_sum: pl.Out[pl.Tensor[[T, H], pl.FP32]],
+    g_sum: pl.Out[pl.Tensor[[H, T], pl.FP32]],
 ):
     for t0 in pl.parallel(0, T, CHUNK * CHUNK_GROUP):
         with pl.at(level=pl.Level.CORE_GROUP, name_hint="chunk_cumsum"):
@@ -42,7 +42,9 @@ def gdn_chunk_cumsum(
             tl = tril[:, :]
             for c in pl.unroll(CHUNK_GROUP):
                 s0 = t0 + c * CHUNK
-                g_sum[s0 : s0 + CHUNK, :] = pl.matmul(tl, g[s0 : s0 + CHUNK, :])
+                # [H, CHUNK] = (tril @ g_chunk)^T; the cube absorbs both transposes.
+                g_sum[:, s0 : s0 + CHUNK] = pl.matmul(
+                    g[s0 : s0 + CHUNK, :], tl, a_trans=True, b_trans=True)
     return g_sum
 
 
@@ -56,7 +58,7 @@ def build_tensor_specs(t: int = T, h: int = H, chunk: int = CHUNK):
     return [
         TensorSpec("g", [t, h], torch.float32, init_value=torch.randn),
         TensorSpec("tril", [chunk, chunk], torch.float32, init_value=init_tril),
-        TensorSpec("g_sum", [t, h], torch.float32, is_output=True),
+        TensorSpec("g_sum", [h, t], torch.float32, is_output=True),
     ]
 
 
@@ -64,7 +66,7 @@ def golden_gdn_chunk_cumsum(tensors):
     g = tensors["g"]
     out = tensors["g_sum"]
     for t0 in range(0, g.shape[0], CHUNK):
-        out[t0 : t0 + CHUNK] = g[t0 : t0 + CHUNK].cumsum(dim=0)
+        out[:, t0 : t0 + CHUNK] = g[t0 : t0 + CHUNK].cumsum(dim=0).t()
 
 
 if __name__ == "__main__":
