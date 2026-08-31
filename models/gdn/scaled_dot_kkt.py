@@ -45,7 +45,15 @@ def gdn_scaled_dot_kkt(
     k_flat = pl.reshape(k, [T, H * D])
     a_flat = pl.reshape(a_out, [T, H * CHUNK])
     for t0 in pl.parallel(0, T, CHUNK):
-        with pl.at(level=pl.Level.CORE_GROUP, name_hint="scaled_dot_kkt"):
+        # An a2a3 core has two vector sub-cores, and an unsplit mixed region runs
+        # its vector work on lane 0 only (lane 1 replays with valid_shape zeroed
+        # just to keep the AIC<->AIV handshake symmetric). This stage is vector
+        # dominated -- stripping the gating chain drops it from 203.5 to 78.8 us
+        # -- so giving lane 1 the bottom half of the rows is worth 22.7%:
+        # 203.5 -> 157.3 us at T=8192. No effect on wy_fast, which is
+        # memory-bound, nor on chunk_cumsum, whose region is pure cube.
+        with pl.at(level=pl.Level.CORE_GROUP, name_hint="scaled_dot_kkt",
+                   optimizations=[pl.split(pl.SplitMode.UP_DOWN)]):
             # The mask is a constant: hold it for the whole scope rather than
             # re-reading a slice of it per head and per column block.
             msk = mask[:, :]
