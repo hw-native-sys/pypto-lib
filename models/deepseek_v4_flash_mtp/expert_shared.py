@@ -86,10 +86,7 @@ def expert_shared(
             for k0 in pl.pipeline(0, D, K_TILE, stage=2):
                 xs_k = pl.slice(x_local_i8, [SH_M_TILE, K_TILE], [ts0, k0], valid_shape=[SH_VALID_M, K_TILE])
                 sw1_k = shared_w1[n0 : n0 + MM_INTER_TILE, k0 : k0 + K_TILE]
-                if k0 == 0:
-                    gate_acc = pl.matmul(xs_k, sw1_k, b_trans=True, out_dtype=pl.INT32)
-                else:
-                    gate_acc = pl.matmul_acc(gate_acc, xs_k, sw1_k, b_trans=True)
+                gate_acc = pl.matmul_acc(gate_acc, xs_k, sw1_k, b_trans=True, init_cond=(k0 == 0))
             gate_i32[:, n0 : n0 + MM_INTER_TILE] = gate_acc
 
         # up (w3) cube matmul -> INT32 GM accumulator.
@@ -103,10 +100,7 @@ def expert_shared(
             for k0 in pl.pipeline(0, D, K_TILE, stage=2):
                 xs_k = pl.slice(x_local_i8, [SH_M_TILE, K_TILE], [ts0, k0], valid_shape=[SH_VALID_M, K_TILE])
                 sw3_k = shared_w3[n0 : n0 + MM_INTER_TILE, k0 : k0 + K_TILE]
-                if k0 == 0:
-                    up_acc = pl.matmul(xs_k, sw3_k, b_trans=True, out_dtype=pl.INT32)
-                else:
-                    up_acc = pl.matmul_acc(up_acc, xs_k, sw3_k, b_trans=True)
+                up_acc = pl.matmul_acc(up_acc, xs_k, sw3_k, b_trans=True, init_cond=(k0 == 0))
             up_i32[:, n0 : n0 + MM_INTER_TILE] = up_acc
 
         # Each AIV block owns two rows across the full intermediate axis (four
@@ -241,10 +235,7 @@ def expert_shared(
                 sw2_k = shared_w2[
                     d0 : d0 + D_OUT_TILE, k0 : k0 + INTER_K
                 ]
-                if k0 == 0:
-                    y_acc = pl.matmul(hs_k, sw2_k, b_trans=True, out_dtype=pl.INT32)
-                else:
-                    y_acc = pl.matmul_acc(y_acc, hs_k, sw2_k, b_trans=True)
+                y_acc = pl.matmul_acc(y_acc, hs_k, sw2_k, b_trans=True, init_cond=(k0 == 0))
             y_i32[:, d0 : d0 + D_OUT_TILE] = y_acc
 
         # Dequant w2 output (per-row h scale x per-channel w2 scale) -> BF16.

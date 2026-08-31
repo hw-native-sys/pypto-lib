@@ -97,10 +97,7 @@ def hc_head(
                     [0, k0],
                     valid_shape=[HC_MULT, LINEAR_K_TILE],
                 )
-                if kb == 0:
-                    acc_full = pl.matmul(x_lin_full, w_full, b_trans=True, out_dtype=pl.FP32)
-                else:
-                    acc_full = pl.matmul_acc(acc_full, x_lin_full, w_full, b_trans=True)
+                acc_full = pl.matmul_acc(acc_full, x_lin_full, w_full, b_trans=True, init_cond=(kb == 0))
             mixes_raw = pl.assemble(mixes_raw, acc_full, [t0, 0], atomic=pl.AtomicType.Add)
 
     # At most one incomplete row block exists. Keep it in a separate conditional
@@ -129,10 +126,7 @@ def hc_head(
                     [0, k0],
                     valid_shape=[HC_MULT, LINEAR_K_TILE],
                 )
-                if kb == 0:
-                    acc_tail = pl.matmul(x_lin_tail, w_tail, b_trans=True, out_dtype=pl.FP32)
-                else:
-                    acc_tail = pl.matmul_acc(acc_tail, x_lin_tail, w_tail, b_trans=True)
+                acc_tail = pl.matmul_acc(acc_tail, x_lin_tail, w_tail, b_trans=True, init_cond=(kb == 0))
             mixes_raw = pl.assemble(
                 mixes_raw,
                 acc_tail,
