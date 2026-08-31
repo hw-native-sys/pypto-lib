@@ -23,7 +23,6 @@ from config import (
     DSPARK_SPEC_TOKENS,
     FLASH as M,
     KV_ORI_BLOCK_NUM,
-    KV_ORI_MAX_BLOCKS,
     TP,
 )
 from decode_o_proj import LOCAL_T_PAD
@@ -53,6 +52,7 @@ O_GROUPS = M.o_groups
 HEADS_PER_GROUP = H // O_GROUPS
 O_GROUP_IN = HEADS_PER_GROUP * HEAD_DIM
 MAX_SEQ_LEN = M.max_position_embeddings
+ORI_MAX_BLOCKS = (MAX_SEQ_LEN + BLOCK_SIZE - 1) // BLOCK_SIZE
 SOFTMAX_SCALE = M.softmax_scale
 VISIBLE_ROWS = WIN + S                   # trailing window + whole draft block
 
@@ -390,7 +390,7 @@ def build_tensor_specs(start_pos=None):
         )
 
     def init_block_table():
-        return block_table(batch=B, table_blocks=KV_ORI_MAX_BLOCKS, physical_blocks=KV_ORI_BLOCK_NUM)
+        return block_table(batch=B, table_blocks=ORI_MAX_BLOCKS, physical_blocks=KV_ORI_BLOCK_NUM)
 
     def init_position_ids():
         return position_ids_from_starts(init_start_pos(), seq=S).reshape(-1).contiguous()

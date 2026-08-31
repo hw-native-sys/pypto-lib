@@ -16,8 +16,6 @@ from config import (
     CSA_STATE_PHYSICAL_BLOCKS,
     FLASH as M,
     FP32_NEG_INF,
-    PREFILL_CSA_CMP_MAX_BLOCKS,
-    PREFILL_MAX_CONTEXT_TOKENS,
     PREFILL_SEQ,
 )
 
@@ -38,7 +36,7 @@ HEAD_DIM = M.head_dim
 HEAD_DIM_INV = 1.0 / HEAD_DIM
 ROPE_HEAD_DIM = M.qk_rope_head_dim
 NOPE_HEAD_DIM = M.nope_head_dim
-MAX_SEQ_LEN = PREFILL_MAX_CONTEXT_TOKENS
+MAX_SEQ_LEN = M.max_position_embeddings
 START_POS = 0
 COMPRESS_RATIO = 4
 OVERLAP = COMPRESS_RATIO == 4
@@ -47,6 +45,7 @@ OUT_DIM = COFF * HEAD_DIM
 STATE_LEN = COFF * COMPRESS_RATIO
 COMPRESS_STATE_DIM = 2 * OUT_DIM
 MAX_CMP_WRITES = PREFILL_STATE_TILE // COMPRESS_RATIO
+CMP_MAX_BLOCKS = (MAX_SEQ_LEN // COMPRESS_RATIO + BLOCK_SIZE - 1) // BLOCK_SIZE
 
 # paged compressed state / KV cache
 CSA_STATE_BLOCK_SIZE = C4A_COMPRESSOR_BLOCK_SIZE
@@ -754,7 +753,7 @@ def build_tensor_specs(start_pos: int = START_POS, token_count: int = PREFILL_SE
         return 0.9569 + 0.1916 * torch.randn(HEAD_DIM)
 
     def init_cmp_kv():
-        return torch.zeros(PREFILL_CSA_CMP_MAX_BLOCKS, BLOCK_SIZE, 1, HEAD_DIM, dtype=torch.bfloat16)
+        return torch.zeros(CMP_MAX_BLOCKS, BLOCK_SIZE, 1, HEAD_DIM, dtype=torch.bfloat16)
 
     def init_position_ids():
         return torch.arange(start_pos, start_pos + token_count, dtype=torch.int32)
@@ -784,7 +783,7 @@ def build_tensor_specs(start_pos: int = START_POS, token_count: int = PREFILL_SE
             pos = start_pos + t
             if pos + 1 >= COMPRESS_RATIO and (pos + 1) % COMPRESS_RATIO == 0:
                 dst_row = (pos + 1) // COMPRESS_RATIO - 1
-                if dst_row >= PREFILL_CSA_CMP_MAX_BLOCKS * BLOCK_SIZE:
+                if dst_row >= CMP_MAX_BLOCKS * BLOCK_SIZE:
                     raise ValueError("fixture compressed slot exceeds standalone cmp_kv capacity")
                 mapping[t] = dst_row
         return mapping
@@ -818,7 +817,7 @@ def build_tensor_specs(start_pos: int = START_POS, token_count: int = PREFILL_SE
         TensorSpec("cmp_freqs_sin", [token_count, ROPE_HEAD_DIM], torch.bfloat16, init_value=init_cmp_freqs_sin),
         TensorSpec(
             "cmp_kv",
-            [PREFILL_CSA_CMP_MAX_BLOCKS, BLOCK_SIZE, 1, HEAD_DIM],
+            [CMP_MAX_BLOCKS, BLOCK_SIZE, 1, HEAD_DIM],
             torch.bfloat16,
             init_value=init_cmp_kv,
             is_output=True,

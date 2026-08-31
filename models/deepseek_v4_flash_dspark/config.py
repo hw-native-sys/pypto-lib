@@ -174,7 +174,7 @@ FLASH = DeepSeekV4Config(
     hc_mult=4,
     hc_sinkhorn_iters=20,
     hc_eps=1e-6,
-    max_position_embeddings=16384,  # 8k prompt + 512 decode steps target; official 1M;
+    max_position_embeddings=1_048_576,
     rope_theta=10000.0,
     compress_rope_theta=160000.0,
     rope_factor=16.0,
@@ -252,19 +252,11 @@ PREFILL_TOKENS = PREFILL_BATCH * PREFILL_SEQ
 BLOCK_SIZE = 32                           # paged-KV page size / weight-quant block size
 C4A_COMPRESSOR_BLOCK_SIZE = 2             # ratio-4 compressor state page size
 C128_COMPRESSOR_BLOCK_SIZE = 8            # ratio-128 compressor state page size
-KV_ORI_MAX_BLOCKS = (FLASH.max_position_embeddings + BLOCK_SIZE - 1) // BLOCK_SIZE
-KV_CMP_MAX_BLOCKS = (FLASH.max_position_embeddings // 4 + BLOCK_SIZE - 1) // BLOCK_SIZE
-IDX_CACHE_MAX_BLOCKS = 2 * KV_CMP_MAX_BLOCKS
 KV_ORI_BLOCK_NUM = 512
 KV_CMP_BLOCK_NUM = 256
 IDX_CACHE_BLOCK_NUM = 256
 
-# Prefill 1M context and paging constants
-PREFILL_MAX_CONTEXT_TOKENS = 1_048_576
-PREFILL_KV_ORI_MAX_BLOCKS = (PREFILL_MAX_CONTEXT_TOKENS + BLOCK_SIZE - 1) // BLOCK_SIZE
-PREFILL_HCA_CMP_MAX_BLOCKS = (PREFILL_MAX_CONTEXT_TOKENS // 128 + BLOCK_SIZE - 1) // BLOCK_SIZE
-PREFILL_CSA_CMP_MAX_BLOCKS = (PREFILL_MAX_CONTEXT_TOKENS // 4 + BLOCK_SIZE - 1) // BLOCK_SIZE
-PREFILL_IDX_CACHE_MAX_BLOCKS = PREFILL_CSA_CMP_MAX_BLOCKS
+# Prefill compressor state pool capacities
 HCA_STATE_PHYSICAL_BLOCKS = 256
 CSA_STATE_PHYSICAL_BLOCKS = 260
 CSA_INNER_STATE_PHYSICAL_BLOCKS = 260

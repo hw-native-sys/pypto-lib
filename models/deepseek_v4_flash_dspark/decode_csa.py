@@ -107,7 +107,7 @@ ROPE_HEAD_DIM = M.qk_rope_head_dim
 HALF_ROPE = ROPE_HEAD_DIM // 2
 Q_LORA = M.q_lora_rank
 WIN = M.sliding_window
-MAX_SEQ_LEN = 1_048_576
+MAX_SEQ_LEN = M.max_position_embeddings
 HC_MULT = M.hc_mult
 MIX_HC = M.mix_hc
 HC_DIM = M.hc_dim
@@ -1640,7 +1640,14 @@ def build_distributed_tensor_specs(local_t, start_pos=None):
     local_batch = local_t // S
     group_batch = TP_SIZE * local_batch
     if isinstance(start_pos, (list, tuple)):
-        start_pos = list(start_pos) * TP_SIZE
+        start_pos = list(start_pos)
+        if len(start_pos) == local_batch:
+            start_pos *= TP_SIZE
+        elif len(start_pos) != group_batch:
+            raise ValueError(
+                f"distributed CSA start positions need {local_batch} local or "
+                f"{group_batch} group rows, got {len(start_pos)}",
+            )
 
     # Token rows and requests the rank owns. Everything else is either a
     # replicated weight or the group's full stream, which every rank holds.

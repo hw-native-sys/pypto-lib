@@ -114,8 +114,7 @@ MIX_HC = M.mix_hc
 HC_DIM = M.hc_dim
 HC_SINKHORN_ITER = M.hc_sinkhorn_iters
 HC_EPS = M.hc_eps
-# HCA-local context ceiling. The global Flash model ceiling remains unchanged.
-MAX_SEQ_LEN = 1_048_576
+MAX_SEQ_LEN = M.max_position_embeddings
 O_LORA = M.o_lora_rank
 O_GROUPS = M.o_groups
 HEADS_PER_GROUP = H // O_GROUPS
@@ -1352,7 +1351,14 @@ def build_distributed_tensor_specs(local_t, start_pos=None):
     local_batch = local_t // S
     group_batch = TP_SIZE * local_batch
     if isinstance(start_pos, (list, tuple)):
-        start_pos = list(start_pos) * TP_SIZE
+        start_pos = list(start_pos)
+        if len(start_pos) == local_batch:
+            start_pos *= TP_SIZE
+        elif len(start_pos) != group_batch:
+            raise ValueError(
+                f"distributed HCA start positions need {local_batch} local or "
+                f"{group_batch} group rows, got {len(start_pos)}",
+            )
 
     # Token rows and requests the rank owns. Everything else is either a
     # replicated weight or the group's full stream, which every rank holds.
@@ -1371,9 +1377,8 @@ def build_distributed_tensor_specs(local_t, start_pos=None):
     resident_names = frozenset({
         "hc_attn_fn", "hc_attn_scale", "hc_attn_base",
         "attn_norm_w", "wq_a", "wq_b", "wq_b_scale", "wkv", "gamma_cq", "gamma_ckv",
-        "cmp_freqs_cos", "cmp_freqs_sin",
         "cmp_wkv", "cmp_wgate", "cmp_ape", "cmp_norm_w",
-        "compress_state", "compress_state_block_table",
+        "compress_state",
         "kv_cache", "cmp_kv", "attn_sink",
     })
 

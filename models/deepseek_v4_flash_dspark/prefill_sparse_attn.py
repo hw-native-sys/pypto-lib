@@ -19,14 +19,11 @@ from config import (
     INT8_SCALE_MAX,
     KV_ORI_BLOCK_NUM,
     PREFILL_BATCH,
-    PREFILL_CSA_CMP_MAX_BLOCKS,
-    PREFILL_HCA_CMP_MAX_BLOCKS,
-    PREFILL_MAX_CONTEXT_TOKENS,
     PREFILL_SEQ,
 )
 
 # Longest sequence the model config admits; the host-side bound on token_count.
-MAX_SEQ_LEN = PREFILL_MAX_CONTEXT_TOKENS
+MAX_SEQ_LEN = M.max_position_embeddings
 
 # Sparse attention's internal physical-row geometry and runtime workspace.
 PREFILL_DENSE_TILE = 512
@@ -66,7 +63,7 @@ HCA_COMPRESS_RATIO = 128
 # paged KV cache
 PREFILL_SPARSE_TOPK = WIN + IDX_TOPK
 ORI_BLOCK_NUM = KV_ORI_BLOCK_NUM
-CMP_MAX_BLOCKS = PREFILL_CSA_CMP_MAX_BLOCKS
+CMP_MAX_BLOCKS = (MAX_SEQ_LEN // DEFAULT_COMPRESS_RATIO + BLOCK_SIZE - 1) // BLOCK_SIZE
 CMP_BLOCK_NUM = CMP_MAX_BLOCKS
 
 # tiling
@@ -112,7 +109,8 @@ SPARSE_CMP_BIAS_COLS = max(0, SPARSE_BIAS_COLS - WIN)
 # HCA streaming tiling.
 HCA_ATTN_TILE = 128
 HCA_CMP_PAGES_PER_WORK = HCA_ATTN_TILE // BLOCK_SIZE
-HCA_CMP_WORK_COUNT = (PREFILL_HCA_CMP_MAX_BLOCKS + HCA_CMP_PAGES_PER_WORK - 1) // HCA_CMP_PAGES_PER_WORK
+HCA_CMP_MAX_BLOCKS = (MAX_SEQ_LEN // HCA_COMPRESS_RATIO + BLOCK_SIZE - 1) // BLOCK_SIZE
+HCA_CMP_WORK_COUNT = (HCA_CMP_MAX_BLOCKS + HCA_CMP_PAGES_PER_WORK - 1) // HCA_CMP_PAGES_PER_WORK
 HCA_CMP_PAD_ROWS = HCA_CMP_WORK_COUNT * HCA_ATTN_TILE
 HCA_WORK_VALID_STRIDE = 16  # one 64-byte cache line per INT32 writer
 HCA_QUERY_TILE = 8
@@ -301,7 +299,7 @@ def _hca_streaming_wave(
             qk_position_i32 = pl.read(position_ids, [qk_t])
             if qk_position_i32 >= 0:
                 qk_visible_rows = (qk_position_i32 + 1) // HCA_COMPRESS_RATIO
-                qk_cache_rows = pl.cast(PREFILL_HCA_CMP_MAX_BLOCKS * BLOCK_SIZE, pl.INDEX)
+                qk_cache_rows = pl.cast(HCA_CMP_MAX_BLOCKS * BLOCK_SIZE, pl.INDEX)
                 qk_visible_rows = pl.min(qk_visible_rows, qk_cache_rows)
                 qk_h0 = qk_hb * QK_M_TILE
                 qk_q_row = qk_t * H + qk_h0
@@ -364,7 +362,7 @@ def _hca_streaming_wave(
             merge_visible_rows = (merge_position_i32 + 1) // HCA_COMPRESS_RATIO
             if merge_visible_rows < 0:
                 merge_visible_rows = pl.cast(0, pl.INDEX)
-            merge_cache_rows = pl.cast(PREFILL_HCA_CMP_MAX_BLOCKS * BLOCK_SIZE, pl.INDEX)
+            merge_cache_rows = pl.cast(HCA_CMP_MAX_BLOCKS * BLOCK_SIZE, pl.INDEX)
             merge_visible_rows = pl.min(merge_visible_rows, merge_cache_rows)
             for merge_work in pl.range((merge_visible_rows + HCA_ATTN_TILE - 1) // HCA_ATTN_TILE):
                 merge_row = merge_partial_base + merge_work * HEAD_TILE
@@ -424,7 +422,7 @@ def _hca_streaming_attn_tile(
     ori_kv: pl.Tensor[[ORI_BLOCK_NUM_DYN, BLOCK_SIZE, 1, HEAD_DIM], pl.BF16],
     swa_indices: pl.Tensor[[T_DYN, WIN], pl.INT32],
     cmp_kv: pl.Tensor[[CMP_BLOCK_NUM_DYN, BLOCK_SIZE, 1, HEAD_DIM], pl.BF16],
-    cmp_block_table: pl.Tensor[[PREFILL_HCA_CMP_MAX_BLOCKS], pl.INT32],
+    cmp_block_table: pl.Tensor[[HCA_CMP_MAX_BLOCKS], pl.INT32],
     position_ids: pl.Tensor[[T_DYN], pl.INT32],
     attn_sink: pl.Tensor[[H], pl.FP32],
     active_rows: pl.Scalar[pl.INDEX],
@@ -1082,7 +1080,7 @@ def hca_streaming_attn_physical(
     ori_kv: pl.Tensor[[ORI_BLOCK_NUM_DYN, BLOCK_SIZE, 1, HEAD_DIM], pl.BF16],
     swa_indices: pl.Tensor[[T_DYN, WIN], pl.INT32],
     cmp_kv: pl.Tensor[[CMP_BLOCK_NUM_DYN, BLOCK_SIZE, 1, HEAD_DIM], pl.BF16],
-    cmp_block_table: pl.Tensor[[PREFILL_HCA_CMP_MAX_BLOCKS], pl.INT32],
+    cmp_block_table: pl.Tensor[[HCA_CMP_MAX_BLOCKS], pl.INT32],
     position_ids: pl.Tensor[[T_DYN], pl.INT32],
     attn_sink: pl.Tensor[[H], pl.FP32],
     freqs_cos: pl.Tensor[[T_DYN, ROPE_DIM], pl.BF16],

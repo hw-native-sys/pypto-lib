@@ -18,8 +18,6 @@ from config import (
     INT8_SCALE_MAX,
     INT8_AMAX_EPS,
     PREFILL_BATCH,
-    PREFILL_IDX_CACHE_MAX_BLOCKS,
-    PREFILL_MAX_CONTEXT_TOKENS,
     PREFILL_SEQ,
 )
 
@@ -53,7 +51,7 @@ IDX_HEAD_DIM = M.index_head_dim
 IDX_NOPE_HEAD_DIM = M.index_nope_head_dim
 Q_LORA = M.q_lora_rank
 WEIGHTS_SCALE = M.index_weights_scale
-MAX_SEQ_LEN = PREFILL_MAX_CONTEXT_TOKENS
+MAX_SEQ_LEN = M.max_position_embeddings
 WIN = M.sliding_window
 
 COMPRESS_RATIO = 4  # the indexer only runs on ratio-4 layers
@@ -72,7 +70,7 @@ INDEXER_MAX_CANDIDATES = MAX_SEQ_LEN // COMPRESS_RATIO
 TOPK_PAIR_WIDTH = 2 * IDX_TOPK
 
 # paged indexer cache
-IDX_CACHE_MAX_BLOCKS = PREFILL_IDX_CACHE_MAX_BLOCKS
+IDX_CACHE_MAX_BLOCKS = (MAX_SEQ_LEN // COMPRESS_RATIO + BLOCK_SIZE - 1) // BLOCK_SIZE
 IDX_CACHE_BLOCK_NUM = IDX_CACHE_MAX_BLOCKS
 
 # tiling

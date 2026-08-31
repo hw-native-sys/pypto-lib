@@ -280,10 +280,11 @@ def _validate_import_contract():
                 f"{module.__name__} local capacity {module.T} is smaller than "
                 f"MoE capacity {MOE_TOKENS}",
             )
-        if module.MAX_SEQ_LEN != 1_048_576:
+        if module.MAX_SEQ_LEN != MODEL_CONFIG.max_position_embeddings:
             raise ValueError(
-                f"{module.__name__} context ceiling must be 1M, got "
-                f"{module.MAX_SEQ_LEN}",
+                f"{module.__name__} context ceiling {module.MAX_SEQ_LEN} "
+                f"does not match model max_position_embeddings="
+                f"{MODEL_CONFIG.max_position_embeddings}",
             )
     if moe_module.EP != EP_SIZE or moe_module.N_RANKS != EP_SIZE:
         raise ValueError(

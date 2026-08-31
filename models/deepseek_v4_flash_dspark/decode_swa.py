@@ -46,8 +46,6 @@ from config import (
     BLOCK_SIZE,
     INT8_SCALE_MAX,
     INT8_AMAX_EPS,
-    KV_CMP_MAX_BLOCKS,
-    KV_ORI_MAX_BLOCKS,
 )
 from hc_pre import hc_pre
 from hc_post import hc_post
@@ -105,20 +103,17 @@ MIX_HC = M.mix_hc
 HC_DIM = M.hc_dim
 HC_SINKHORN_ITER = M.hc_sinkhorn_iters
 HC_EPS = M.hc_eps
-# SWA-local context ceiling. The global model ceiling remains unchanged.
-MAX_SEQ_LEN = 1_048_576
+MAX_SEQ_LEN = M.max_position_embeddings
 O_LORA = M.o_lora_rank
 O_GROUPS = M.o_groups
 HEADS_PER_GROUP = H // O_GROUPS
 O_GROUP_IN = H * HEAD_DIM // O_GROUPS
 
 # kernel-local (SWA: ratio-0, no compressor/indexer)
-ORI_MAX_BLOCKS = KV_ORI_MAX_BLOCKS
 ORI_BLOCK_NUM = KV_ORI_BLOCK_NUM
 TOPK = WIN                          # SWA: sparse_attn topk = window only
 SPARSE_IDX_TOPK = M.index_topk      # sparse_attn module's IDX_TOPK (static shape contract)
 SPARSE_TOPK = WIN + SPARSE_IDX_TOPK
-SPARSE_CMP_MAX_BLOCKS = KV_CMP_MAX_BLOCKS
 
 # tiling
 BIAS_T_TILE = 8  # sparse_bias row block; T is a multiple of 8 by the batch contract
@@ -952,7 +947,14 @@ def build_distributed_tensor_specs(local_t, start_pos=None):
     local_batch = local_t // S
     group_batch = TP_SIZE * local_batch
     if isinstance(start_pos, (list, tuple)):
-        start_pos = list(start_pos) * TP_SIZE
+        start_pos = list(start_pos)
+        if len(start_pos) == local_batch:
+            start_pos *= TP_SIZE
+        elif len(start_pos) != group_batch:
+            raise ValueError(
+                f"distributed SWA start positions need {local_batch} local or "
+                f"{group_batch} group rows, got {len(start_pos)}",
+            )
 
     # Token rows the rank owns; the KV cache write runs on the gathered stream.
     local_token_names = frozenset({

@@ -19,7 +19,6 @@ from config import (
     BLOCK_SIZE,
     KV_CMP_BLOCK_NUM,
     KV_ORI_BLOCK_NUM,
-    KV_ORI_MAX_BLOCKS,
 )
 
 
@@ -40,6 +39,7 @@ ROPE_DIM = M.qk_rope_head_dim
 HALF_ROPE = ROPE_DIM // 2
 NOPE_DIM = M.nope_head_dim
 WIN = M.sliding_window
+MAX_SEQ_LEN = M.max_position_embeddings
 SOFTMAX_SCALE = M.softmax_scale
 O_GROUPS = M.o_groups
 HEADS_PER_GROUP = H // O_GROUPS
@@ -49,13 +49,13 @@ COMPRESS_RATIO = 128
 NEG_INF = -1.0e20
 
 # paged KV cache
-ORI_MAX_BLOCKS = KV_ORI_MAX_BLOCKS
+ORI_MAX_BLOCKS = (MAX_SEQ_LEN + BLOCK_SIZE - 1) // BLOCK_SIZE
 ORI_BLOCK_NUM = KV_ORI_BLOCK_NUM
 CMP_BLOCK_NUM = KV_CMP_BLOCK_NUM
 # The logical limit is per request; the physical pool is shared by the batch.
 # Host metadata builders below admit requests only while their summed page count
 # fits HCA_COMPRESSED_POOL_ROWS.
-HCA_MAX_COMPRESSED_ROWS = 1_048_576 // COMPRESS_RATIO
+HCA_MAX_COMPRESSED_ROWS = MAX_SEQ_LEN // COMPRESS_RATIO
 HCA_COMPRESSED_POOL_ROWS = CMP_BLOCK_NUM * BLOCK_SIZE
 
 # tiling

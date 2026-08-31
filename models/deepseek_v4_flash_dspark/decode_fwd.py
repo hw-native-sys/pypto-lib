@@ -1470,8 +1470,9 @@ def build_tensor_specs(start_pos=None, *, weight_bank_size=RUNTIME_WEIGHT_BANK, 
     }:
         raise ValueError(f"unknown decode forward runtime case: {runtime_case!r}")
 
-    if runtime_case == "long_context_tail" and start_pos is None:
-        start_pos = [0, 0, 0, 1048568]
+    use_default_long_context = runtime_case == "long_context_tail" and start_pos is None
+    if use_default_long_context:
+        start_pos = [0, 0, 0, config.FLASH.max_position_embeddings - config.DECODE_SEQ]
 
     if start_pos is None:
         active_batch = MOE_TOKENS // config.DECODE_SEQ
@@ -1483,9 +1484,13 @@ def build_tensor_specs(start_pos=None, *, weight_bank_size=RUNTIME_WEIGHT_BANK, 
         raise ValueError("start_pos must be None, an int, or a non-empty list/tuple")
     local_t = active_batch * config.DECODE_SEQ
 
+    attention_start_pos = start_pos
+    if use_default_long_context and TP_SIZE > 1:
+        attention_start_pos = list(start_pos) + [0] * ((TP_SIZE - 1) * active_batch)
+
     def attention_specs(module):
         specs = {}
-        for source in module.build_distributed_tensor_specs(local_t, start_pos=start_pos):
+        for source in module.build_distributed_tensor_specs(local_t, start_pos=attention_start_pos):
             if not isinstance(source, TensorSpec):
                 continue
 

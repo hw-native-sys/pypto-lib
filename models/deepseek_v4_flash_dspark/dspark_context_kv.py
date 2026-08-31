@@ -23,7 +23,6 @@ from config import (
     DECODE_SEQ,
     FLASH as M,
     KV_ORI_BLOCK_NUM,
-    KV_ORI_MAX_BLOCKS,
     PREFILL_BATCH,
     PREFILL_SEQ,
     TP,
@@ -52,6 +51,7 @@ ROPE_HALF = ROPE_DIM // 2
 NOPE_DIM = M.nope_head_dim
 WIN = M.sliding_window
 MAX_SEQ_LEN = M.max_position_embeddings
+ORI_MAX_BLOCKS = (MAX_SEQ_LEN + BLOCK_SIZE - 1) // BLOCK_SIZE
 EPS = M.rms_norm_eps
 
 
@@ -223,7 +223,7 @@ def build_tensor_specs(batch, seq):
         return torch.zeros(batch, dtype=torch.int32)
 
     def init_block_table():
-        return block_table(batch=batch, table_blocks=KV_ORI_MAX_BLOCKS, physical_blocks=KV_ORI_BLOCK_NUM)
+        return block_table(batch=batch, table_blocks=ORI_MAX_BLOCKS, physical_blocks=KV_ORI_BLOCK_NUM)
 
     def init_position_ids():
         return position_ids_from_starts(init_start_pos(), seq=seq).reshape(-1).contiguous()

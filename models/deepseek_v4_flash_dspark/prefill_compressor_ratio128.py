@@ -15,8 +15,6 @@ from config import (
     C128_COMPRESSOR_BLOCK_SIZE,
     FLASH as M,
     HCA_STATE_PHYSICAL_BLOCKS,
-    PREFILL_HCA_CMP_MAX_BLOCKS,
-    PREFILL_MAX_CONTEXT_TOKENS,
     PREFILL_SEQ,
 )
 
@@ -39,13 +37,14 @@ HEAD_DIM_INV = 1.0 / HEAD_DIM
 ROPE_HEAD_DIM = M.qk_rope_head_dim
 ROPE_HALF = ROPE_HEAD_DIM // 2
 NOPE_HEAD_DIM = HEAD_DIM - ROPE_HEAD_DIM
-MAX_SEQ_LEN = PREFILL_MAX_CONTEXT_TOKENS
+MAX_SEQ_LEN = M.max_position_embeddings
 START_POS = 0
 COMPRESS_RATIO = 128
 OUT_DIM = HEAD_DIM
 STATE_LEN = COMPRESS_RATIO
 COMPRESS_STATE_DIM = 2 * OUT_DIM
 MAX_CMP_WRITES = PREFILL_STATE_TILE // COMPRESS_RATIO
+CMP_MAX_BLOCKS = (MAX_SEQ_LEN // COMPRESS_RATIO + BLOCK_SIZE - 1) // BLOCK_SIZE
 
 # paged compressor state
 HCA_STATE_BLOCK_SIZE = C128_COMPRESSOR_BLOCK_SIZE
@@ -528,7 +527,7 @@ def golden_prefill_compressor_ratio128(tensors):
     kv_state_flat = compress_state_flat[:, :OUT_DIM]
     score_state_flat = compress_state_flat[:, OUT_DIM:]
     state_block_table = tensors["compress_state_block_table"]
-    cmp_kv_flat = tensors["cmp_kv"].view(PREFILL_HCA_CMP_MAX_BLOCKS * BLOCK_SIZE, HEAD_DIM)
+    cmp_kv_flat = tensors["cmp_kv"].view(CMP_MAX_BLOCKS * BLOCK_SIZE, HEAD_DIM)
 
     def state_row(abs_pos):
         if abs_pos < 0 or abs_pos >= MAX_SEQ_LEN:
@@ -632,7 +631,7 @@ def build_tensor_specs(start_pos: int = START_POS, token_count: int = PREFILL_SE
         return 0.0982 + 0.0539 * torch.randn(HEAD_DIM)
 
     def init_cmp_kv():
-        return torch.zeros(PREFILL_HCA_CMP_MAX_BLOCKS, BLOCK_SIZE, 1, HEAD_DIM, dtype=torch.bfloat16)
+        return torch.zeros(CMP_MAX_BLOCKS, BLOCK_SIZE, 1, HEAD_DIM, dtype=torch.bfloat16)
 
     def init_position_ids():
         return torch.arange(start_pos, start_pos + token_count, dtype=torch.int32)
@@ -693,7 +692,7 @@ def build_tensor_specs(start_pos: int = START_POS, token_count: int = PREFILL_SE
         TensorSpec("cmp_freqs_sin", [token_count, ROPE_HEAD_DIM], torch.bfloat16, init_value=init_cmp_freqs_sin),
         TensorSpec(
             "cmp_kv",
-            [PREFILL_HCA_CMP_MAX_BLOCKS, BLOCK_SIZE, 1, HEAD_DIM],
+            [CMP_MAX_BLOCKS, BLOCK_SIZE, 1, HEAD_DIM],
             torch.bfloat16,
             init_value=init_cmp_kv,
             is_output=True,

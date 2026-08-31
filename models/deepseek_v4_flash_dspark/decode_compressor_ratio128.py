@@ -24,7 +24,6 @@ from config import (
     DECODE_SEQ,
     KV_CMP_BLOCK_NUM,
     FP32_NEG_INF,
-    KV_CMP_MAX_BLOCKS,
 )
 
 # Dynamic shape variables.
@@ -70,7 +69,7 @@ COMPRESS_STATE_PHYSICAL_BLOCKS = HCA_STATE_PHYSICAL_BLOCKS
 COMPRESS_STATE_MAX_BLOCKS = (MAX_SEQ_LEN + COMPRESS_STATE_BLOCK_SIZE - 1) // COMPRESS_STATE_BLOCK_SIZE
 COMPRESS_STATE_BLOCK_NUM = COMPRESS_STATE_PHYSICAL_BLOCKS
 COMPRESS_STATE_DIM = 2 * OUT_DIM
-CMP_MAX_BLOCKS = KV_CMP_MAX_BLOCKS
+CMP_MAX_BLOCKS = (IDX_KV_LEN + BLOCK_SIZE - 1) // BLOCK_SIZE
 CMP_BLOCK_NUM = KV_CMP_BLOCK_NUM
 if IDX_KV_LEN > CMP_MAX_BLOCKS * BLOCK_SIZE:
     raise ValueError("ratio128 compressed KV cache capacity is smaller than max compressed sequence length")
@@ -490,9 +489,7 @@ def build_tensor_specs(start_pos=None, batch=B):
         state_slot_mapping,
     )
     from golden import TensorSpec
-    from utils import build_rope_tables, materialize_half_rope_tables
-
-    shared_freqs_cos, shared_freqs_sin = build_rope_tables(M, COMPRESS_RATIO, dtype=torch.bfloat16)
+    from utils import token_local_rope
 
     def init_x():
         return torch.rand(batch * S, D)
@@ -512,10 +509,6 @@ def build_tensor_specs(start_pos=None, batch=B):
         first_pos = init_position_ids().to(torch.int64)[:, 0]
         cmp_offset = COMPRESS_RATIO - (first_pos % COMPRESS_RATIO)
         return (first_pos + cmp_offset - COMPRESS_RATIO).to(torch.int64)
-    def init_cos():
-        return materialize_half_rope_tables(shared_freqs_cos, shared_freqs_sin, init_rope_positions())[0]
-    def init_sin():
-        return materialize_half_rope_tables(shared_freqs_cos, shared_freqs_sin, init_rope_positions())[1]
     def init_cmp_kv_cache():
         return torch.zeros(CMP_BLOCK_NUM, BLOCK_SIZE, 1, HEAD_DIM)
     def init_compress_state_block_table():
@@ -546,6 +539,16 @@ def build_tensor_specs(start_pos=None, batch=B):
         )
     def init_position_ids():
         return position_ids_from_starts(init_start_pos(), seq=S)
+    token_freqs_cos, token_freqs_sin = token_local_rope(
+        M,
+        COMPRESS_RATIO,
+        init_rope_positions(),
+        dtype=torch.bfloat16,
+    )
+    def init_cos():
+        return token_freqs_cos[:, : ROPE_HEAD_DIM // 2].float().contiguous()
+    def init_sin():
+        return token_freqs_sin[:, : ROPE_HEAD_DIM // 2].float().contiguous()
     def init_state_slot_mapping():
         return state_slot_mapping(
             init_position_ids(),

@@ -18,8 +18,6 @@ from config import (
     FP32_NEG_INF,
     INT8_AMAX_EPS,
     INT8_SCALE_MAX,
-    PREFILL_IDX_CACHE_MAX_BLOCKS,
-    PREFILL_MAX_CONTEXT_TOKENS,
     PREFILL_SEQ,
 )
 
@@ -40,7 +38,7 @@ HEAD_DIM = M.index_head_dim
 HEAD_DIM_INV = 1.0 / HEAD_DIM
 ROPE_HEAD_DIM = M.qk_rope_head_dim
 NOPE_HEAD_DIM = M.index_nope_head_dim
-MAX_SEQ_LEN = PREFILL_MAX_CONTEXT_TOKENS
+MAX_SEQ_LEN = M.max_position_embeddings
 START_POS = 0
 COMPRESS_RATIO = 4
 OVERLAP = COMPRESS_RATIO == 4
@@ -49,6 +47,7 @@ OUT_DIM = COFF * HEAD_DIM
 STATE_LEN = COFF * COMPRESS_RATIO
 COMPRESS_STATE_DIM = 2 * OUT_DIM
 MAX_CMP_WRITES = PREFILL_STATE_TILE // COMPRESS_RATIO
+IDX_CACHE_MAX_BLOCKS = (MAX_SEQ_LEN // COMPRESS_RATIO + BLOCK_SIZE - 1) // BLOCK_SIZE
 
 # paged inner state / indexer KV cache
 INNER_STATE_BLOCK_SIZE = C4A_COMPRESSOR_BLOCK_SIZE
@@ -872,15 +871,15 @@ def build_tensor_specs(start_pos: int = START_POS, token_count: int = PREFILL_SE
         return (h * (HEAD_DIM**-0.5)).to(torch.bfloat16)
 
     def init_idx_kv_cache():
-        return torch.zeros(PREFILL_IDX_CACHE_MAX_BLOCKS, BLOCK_SIZE, 1, HEAD_DIM, dtype=torch.int8)
+        return torch.zeros(IDX_CACHE_MAX_BLOCKS, BLOCK_SIZE, 1, HEAD_DIM, dtype=torch.int8)
 
     def init_idx_kv_scale():
-        return torch.zeros(PREFILL_IDX_CACHE_MAX_BLOCKS, BLOCK_SIZE, 1, 1)
+        return torch.zeros(IDX_CACHE_MAX_BLOCKS, BLOCK_SIZE, 1, 1)
 
     def idx_row(cmp_slot):
         block = cmp_slot // BLOCK_SIZE
         intra = cmp_slot % BLOCK_SIZE
-        phys_block = (block * 5 + 1) % PREFILL_IDX_CACHE_MAX_BLOCKS
+        phys_block = (block * 5 + 1) % IDX_CACHE_MAX_BLOCKS
         return phys_block * BLOCK_SIZE + intra
 
     def init_position_ids():
@@ -911,7 +910,7 @@ def build_tensor_specs(start_pos: int = START_POS, token_count: int = PREFILL_SE
             pos = start_pos + t
             if (pos + 1) % COMPRESS_RATIO == 0:
                 dst_row = idx_row((pos + 1) // COMPRESS_RATIO - 1)
-                if dst_row >= PREFILL_IDX_CACHE_MAX_BLOCKS * BLOCK_SIZE:
+                if dst_row >= IDX_CACHE_MAX_BLOCKS * BLOCK_SIZE:
                     raise ValueError("fixture compressed slot exceeds standalone idx_kv_cache capacity")
                 mapping[t] = dst_row
         return mapping
@@ -946,14 +945,14 @@ def build_tensor_specs(start_pos: int = START_POS, token_count: int = PREFILL_SE
         TensorSpec("hadamard", [HEAD_DIM, HEAD_DIM], torch.bfloat16, init_value=init_hadamard),
         TensorSpec(
             "idx_kv_cache",
-            [PREFILL_IDX_CACHE_MAX_BLOCKS, BLOCK_SIZE, 1, HEAD_DIM],
+            [IDX_CACHE_MAX_BLOCKS, BLOCK_SIZE, 1, HEAD_DIM],
             torch.int8,
             init_value=init_idx_kv_cache,
             is_output=True,
         ),
         TensorSpec(
             "idx_kv_scale",
-            [PREFILL_IDX_CACHE_MAX_BLOCKS, BLOCK_SIZE, 1, 1],
+            [IDX_CACHE_MAX_BLOCKS, BLOCK_SIZE, 1, 1],
             torch.float32,
             init_value=init_idx_kv_scale,
             is_output=True,
