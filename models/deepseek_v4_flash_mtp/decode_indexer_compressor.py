@@ -357,6 +357,9 @@ def golden_compressor(tensors):
     """Torch reference for Compressor.forward (decode branch, ratio=4 overlap)."""
     import torch
 
+    # Rows this golden never writes stay NaN: ignored by the kv comparator.
+    tensors["kv"].fill_(float("nan"))
+
     x = tensors["x"].float()
     compress_state = tensors["compress_state"]
     compress_state_block_table = tensors["compress_state_block_table"]
@@ -481,7 +484,7 @@ def golden_compressor(tensors):
         cache_row = int(idx_slot_mapping[b, boundary_s].item())
         if cache_row >= 0:
             # Kernel writes committed pooled result only to kv[:, 0, :]; leave
-            # speculative-boundary rows and kv[:, 1:, :] zero-initialized.
+            # speculative-boundary rows and kv[:, 1:, :] NaN (ignored).
             tensors["kv"][b : b + 1, 0:1, :] = kv_b
             blk_id = cache_row // IDX_STORAGE_BLOCK_SIZE
             intra = cache_row % IDX_STORAGE_BLOCK_SIZE
@@ -634,7 +637,7 @@ if __name__ == "__main__":
         rtol=1e-3,
         atol=1e-3,
         compare_fn={
-            "kv":          ratio_allclose(atol=1e-4, rtol=1.0 / 128, max_error_ratio=0.0),
+            "kv":          ratio_allclose(atol=1e-4, rtol=1.0 / 128, max_error_ratio=0.0, ignore_nan=True),
             "compress_state": ratio_allclose(atol=1e-3, rtol=1e-3, max_error_ratio=0.0),
             "idx_kv_cache": ratio_allclose(atol=1, rtol=0, max_error_ratio=0.01),
             "idx_kv_scale": ratio_allclose(atol=1e-4, rtol=1.0 / 128, max_error_ratio=0.01),

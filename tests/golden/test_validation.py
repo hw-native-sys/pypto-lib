@@ -781,6 +781,99 @@ class TestRatioAllclose:
         assert ok
 
 
+class TestIgnoreNan:
+    """Tests for ratio_allclose's ignore_nan mask."""
+
+    @staticmethod
+    def _call(cmp, actual, expected, rtol=1e-5, atol=1e-5):
+        return cmp(
+            actual, expected,
+            actual_outputs={"out": actual},
+            expected_outputs={"out": expected},
+            inputs={},
+            rtol=rtol, atol=atol,
+        )
+
+    @pytest.mark.parametrize("residue", [1e9, float("nan"), float("inf")])
+    def test_nan_golden_positions_ignored(self, residue):
+        """Any actual value passes where the golden is NaN, garbage included."""
+        actual = torch.tensor([1.0, residue, 3.0])
+        expected = torch.tensor([1.0, float("nan"), 3.0])
+        cmp = ratio_allclose(atol=1e-3, rtol=1e-3, max_error_ratio=0.0,
+                             ignore_nan=True)
+        ok, detail = self._call(cmp, actual, expected)
+        assert ok, detail
+
+    def test_nan_in_actual_still_fails_inside_care_region(self):
+        """A NaN the golden does define is still a hard fail."""
+        actual = torch.tensor([float("nan"), 2.0])
+        expected = torch.tensor([1.0, float("nan")])
+        cmp = ratio_allclose(atol=1e-3, rtol=1e-3, max_error_ratio=0.0,
+                             ignore_nan=True)
+        ok, detail = self._call(cmp, actual, expected)
+        assert not ok
+        assert "illegal values in comparison" in detail
+
+    def test_mismatch_inside_care_region_still_fails(self):
+        """Masking the ignored points does not mask a real mismatch."""
+        actual = torch.tensor([1.0, 9.0, 3.0])
+        expected = torch.tensor([1.0, float("nan"), 3.5])
+        cmp = ratio_allclose(atol=1e-3, rtol=1e-3, max_error_ratio=0.0,
+                             ignore_nan=True)
+        ok, detail = self._call(cmp, actual, expected)
+        assert not ok
+        assert "error_count=1/2" in detail
+        assert "1/3 NaN golden pts ignored" in detail
+
+    def test_denominator_excludes_ignored_points(self):
+        """The error ratio is taken over the compared region, not the whole tensor."""
+        # 4 bad of 10 compared = 40% > 25%, so this must fail. Counting the 10
+        # ignored NaN points as compared would dilute it to 20% and wrongly pass.
+        actual = torch.zeros(20)
+        actual[:4] = 9.0
+        expected = torch.zeros(20)
+        expected[10:] = float("nan")
+        cmp = ratio_allclose(atol=1e-3, rtol=1e-3, max_error_ratio=0.25,
+                             ignore_nan=True)
+        ok, detail = self._call(cmp, actual, expected)
+        assert not ok
+        assert "error_count=4/10" in detail
+        assert "10/20 NaN golden pts ignored" in detail
+
+    def test_all_nan_golden_fails(self):
+        """An entirely NaN golden fails instead of passing on an empty compare."""
+        actual = torch.tensor([1.0, 2.0])
+        expected = torch.tensor([float("nan"), float("nan")])
+        cmp = ratio_allclose(atol=1e-3, rtol=1e-3, max_error_ratio=0.0,
+                             ignore_nan=True)
+        ok, detail = self._call(cmp, actual, expected)
+        assert not ok
+        assert "entirely NaN" in detail
+
+    def test_disabled_by_default(self):
+        """Without the flag a NaN golden stays a hard fail."""
+        actual = torch.tensor([1.0, 2.0])
+        expected = torch.tensor([1.0, float("nan")])
+        cmp = ratio_allclose(atol=1e-3, rtol=1e-3, max_error_ratio=0.0)
+        ok, detail = self._call(cmp, actual, expected)
+        assert not ok
+        assert "illegal values in comparison" in detail
+
+    def test_composes_with_valid_rows(self):
+        """valid_rows drops the tail first, ignore_nan masks what remains."""
+        actual = torch.tensor([[1.0, 2.0], [3.0, 4.0], [9.0, 9.0]])
+        expected = torch.tensor([[1.0, float("nan")], [3.0, 4.0], [0.0, 0.0]])
+        cmp = ratio_allclose(atol=1e-3, rtol=1e-3, max_error_ratio=0.0,
+                             valid_rows=2, ignore_nan=True)
+        ok, detail = self._call(cmp, actual, expected)
+        assert ok, detail
+
+    def test_name_reports_the_flag(self):
+        """The comparator label shows ignore_nan so PASS lines are explicit."""
+        cmp = ratio_allclose(atol=1e-3, rtol=1e-3, ignore_nan=True)
+        assert "ignore_nan=True" in cmp.__name__
+
+
 class TestRatioReldiff:
     """Tests for the ratio_reldiff comparator."""
 
@@ -949,7 +1042,7 @@ class TestValidRows:
         """The comparator label spells out every knob, defaults included."""
         assert ratio_allclose(valid_rows=5, valid_axis=1).__name__ == (
             "ratio_allclose(atol=None, rtol=None, max_error_ratio=0.005, "
-            "valid_rows=5, valid_axis=1, zero_tail=False)"
+            "valid_rows=5, valid_axis=1, zero_tail=False, ignore_nan=False)"
         )
         assert ratio_reldiff(valid_rows=5, zero_tail=True).__name__ == (
             "ratio_reldiff(diff_thd=0.01, pct_thd=0.05, max_diff_hd=inf, "

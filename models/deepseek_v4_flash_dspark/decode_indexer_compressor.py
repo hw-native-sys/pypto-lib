@@ -384,6 +384,9 @@ def golden_compressor(tensors):
     """Torch reference for Compressor.forward (decode branch, ratio=4 overlap)."""
     import torch
 
+    # Rows this golden never writes stay NaN: ignored by the kv comparator.
+    tensors["kv"].fill_(float("nan"))
+
     x = tensors["x"].float()
     compress_state = tensors["compress_state"]
     compress_state_block_table = tensors["compress_state_block_table"]
@@ -667,7 +670,7 @@ if __name__ == "__main__":
             # floor is set by that input scale, not by the cancelled output, so atol carries
             # it -- a 1e-4 floor asks small elements for a relative accuracy the bf16 inputs
             # cannot hold. rtol still bounds the large elements.
-            "kv":          ratio_allclose(atol=1e-3, rtol=1.0 / 128, max_error_ratio=0.0),
+            "kv":          ratio_allclose(atol=1e-3, rtol=1.0 / 128, max_error_ratio=0.0, ignore_nan=True),
             "compress_state": ratio_allclose(atol=1e-3, rtol=1e-3, max_error_ratio=0.0),
             "idx_kv_cache": ratio_allclose(atol=1, rtol=0, max_error_ratio=0.01),
             "idx_kv_scale": ratio_allclose(atol=1e-4, rtol=1.0 / 128, max_error_ratio=0.01),

@@ -117,6 +117,27 @@ def attention_csa_test(
     return x_out
 ```
 
+#### A `pl.Out` region the kernel does not write is undefined
+
+The runtime allocates a pure `pl.Out` buffer from the device pool: it neither
+uploads the host placeholder nor zero-fills the buffer, so **every byte the
+kernel does not write is allocator residue** — often zero on a2a3, garbage or
+`NaN` on `a2a3sim`. The host `TensorSpec` is zero-filled, so a golden that leaves
+that region at zero asserts a value the kernel never promised and passes or fails
+by platform luck.
+
+Pick one per output:
+
+| The unwritten region is | Fix |
+|---|---|
+| padding past an active token count, and the kernel already zero-fills it (`hc_post`'s `hc_post_inactive_pad`, `gate`'s inactive-token zeroing) | nothing — keep `zero_tail=True` honest |
+| a leading prefix's tail, with the boundary a fixture constant | `ratio_allclose(..., valid_rows=N, valid_axis=A)` |
+| data-dependent (slot mappings, per-request conditions) | golden fills it `float("nan")`; comparator takes `ignore_nan=True` |
+| something the test must still assert is untouched | make it `pl.InOut` with a zero `init_value`, so the host zeros reach the device |
+
+An `InOut` has no such hole: its host contents are uploaded, so an unwritten
+region reads back as whatever was sent.
+
 ### `pl.at` scopes
 
 | Parameter | Required | Purpose |

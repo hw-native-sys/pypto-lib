@@ -314,6 +314,7 @@ def ratio_allclose(
     valid_rows: int | None = None,
     valid_axis: int = 0,
     zero_tail: bool = False,
+    ignore_nan: bool = False,
 ) -> Callable:
     """Return an allclose-style comparator that tolerates a bounded outlier ratio.
 
@@ -349,6 +350,19 @@ def ratio_allclose(
         zero_tail: Additionally require the dropped tail to be all zeros. Only
             meaningful with ``valid_rows``; catches a kernel writing past the
             active token count.
+        ignore_nan: Ignore the positions where *expected* is ``NaN``, dropping
+            them from both the comparison and the error-ratio
+            denominator. A pure ``pl.Out`` parameter the kernel writes only
+            conditionally leaves the rest of the buffer undefined — the runtime
+            neither uploads the host placeholder nor zero-fills the device
+            buffer, so those bytes are allocator residue, and a zero-filled
+            golden asserts a value the kernel never promised. The golden fills
+            them with ``NaN`` to say it defines nothing there. ``NaN`` / ``Inf``
+            in *actual* still fails inside the care region, and an entirely
+            ``NaN`` golden fails rather than passing on an empty comparison.
+            Unlike ``valid_rows`` the mask is per-element, so it expresses a
+            write set that depends on runtime data (slot mappings, per-request
+            conditions) rather than a leading prefix; the two compose.
 
     Example — attention output with INT8 activation quant::
 
@@ -387,6 +401,22 @@ def ratio_allclose(
         actual_f = actual.cpu().to(torch.float32)
         expected_f = expected.cpu().to(torch.float32)
 
+        care = None
+        n_ignored = 0
+        if ignore_nan:
+            care = ~torch.isnan(expected_f)
+            n_ignored = int((~care).sum().item())
+            if not bool(care.any()):
+                return False, (
+                    f"    ignore_nan: golden is entirely NaN ({n_ignored} pts) "
+                    f"-- nothing compared"
+                )
+            # Zero both sides at the ignored points: diff 0, finite tolerance,
+            # never the reported max, and dropped from the denominator below.
+            zero = torch.zeros((), dtype=actual_f.dtype)
+            actual_f = torch.where(care, actual_f, zero)
+            expected_f = torch.where(care, expected_f, zero)
+
         nonfinite_error = _nonfinite_error(actual_f, expected_f)
         if nonfinite_error:
             return False, nonfinite_error
@@ -395,7 +425,7 @@ def ratio_allclose(
         tolerance = eff_atol + eff_rtol * expected_f.abs()
         bad_mask = diff_abs > tolerance
         error_count = int(bad_mask.sum().item())
-        numel = actual_f.numel()
+        numel = actual_f.numel() if care is None else int(care.sum().item())
         threshold = round(max_error_ratio * numel)
 
         max_diff, flat_max_pos = torch.max(diff_abs.flatten(), dim=0)
@@ -421,10 +451,16 @@ def ratio_allclose(
             )
             for i in idx
         ]
+        skipped = (
+            f"    {n_ignored}/{n_ignored + numel} NaN golden pts ignored\n"
+            if n_ignored
+            else ""
+        )
         return False, (
             f"    ratio_allclose fail: error_count={error_count}/{numel} "
             f"(ratio={error_count / numel:.4%}, allowed<={max_error_ratio:.4%}, "
             f"threshold={threshold} pts)\n"
+            f"{skipped}"
             f"    atol={eff_atol} rtol={eff_rtol}\n"
             f"    max abs diff={max_diff.item():.6g} at {max_pos} (tol={max_tol:.6g})\n"
             f"    first {n_show} mismatches:\n" + "\n".join(lines)
@@ -434,7 +470,8 @@ def ratio_allclose(
     cmp.rtol_override = rtol
     cmp.__name__ = (
         f"ratio_allclose(atol={atol}, rtol={rtol}, max_error_ratio={max_error_ratio}, "
-        f"valid_rows={valid_rows}, valid_axis={valid_axis}, zero_tail={zero_tail})"
+        f"valid_rows={valid_rows}, valid_axis={valid_axis}, zero_tail={zero_tail}, "
+        f"ignore_nan={ignore_nan})"
     )
     return cmp
 

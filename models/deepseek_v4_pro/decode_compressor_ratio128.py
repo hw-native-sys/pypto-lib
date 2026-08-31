@@ -300,6 +300,9 @@ def golden_compressor(tensors):
     """Torch reference for ratio-128 decode compression with paged caches."""
     import torch
 
+    # Rows this golden never writes stay NaN: ignored by the kv comparator.
+    tensors["kv"].fill_(float("nan"))
+
     x = tensors["x"].float()
     compress_state_block_table = tensors["compress_state_block_table"]
     position_ids = tensors["position_ids"].to(torch.int64)
@@ -528,7 +531,7 @@ if __name__ == "__main__":
         rtol=1e-3,
         atol=1e-3,
         compare_fn={
-            "kv":            ratio_allclose(atol=1e-4, rtol=1.0 / 128, max_error_ratio=0.0),
+            "kv":            ratio_allclose(atol=1e-4, rtol=1.0 / 128, max_error_ratio=0.0, ignore_nan=True),
             "compress_state": ratio_allclose(atol=1e-3, rtol=1e-3, max_error_ratio=0.0),
             "cmp_kv_cache":   ratio_allclose(atol=1e-4, rtol=1.0 / 128, max_error_ratio=0.0),
         },

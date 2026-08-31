@@ -270,7 +270,7 @@ def prefill_layer_core(
     shared_w3_scale: pl.Tensor[[MOE_INTER], pl.FP32],
     shared_w2: pl.Tensor[[D, MOE_INTER], pl.INT8],
     shared_w2_scale: pl.Tensor[[D], pl.FP32],
-    x_next: pl.Out[pl.Tensor[[PREFILL_TOKENS_DYN, HC_MULT, D], pl.FP32]],
+    x_next: pl.InOut[pl.Tensor[[PREFILL_TOKENS_DYN, HC_MULT, D], pl.FP32]],
     recv_meta: pld.DistributedTensor[[N_RANKS, N_LOCAL], pl.INT32],
     recv_x: pld.DistributedTensor[[N_LOCAL * RECV_MAX, D], pl.INT8],
     recv_aux: pld.DistributedTensor[[N_LOCAL * RECV_MAX, AUX_PAD], pl.FP32],
@@ -549,7 +549,7 @@ def l3_prefill_layer(
     shared_w3_scale: pl.Tensor[[N_RANKS, MOE_INTER], pl.FP32],
     shared_w2: pl.Tensor[[N_RANKS, D, MOE_INTER], pl.INT8],
     shared_w2_scale: pl.Tensor[[N_RANKS, D], pl.FP32],
-    x_next: pl.Out[pl.Tensor[[N_RANKS, PREFILL_TOKENS_DYN, HC_MULT, D], pl.FP32]],
+    x_next: pl.InOut[pl.Tensor[[N_RANKS, PREFILL_TOKENS_DYN, HC_MULT, D], pl.FP32]],
     layer_id: pl.Scalar[pl.INT32],
 ):
     recv_meta_buf = pld.alloc_window_buffer([N_RANKS, N_LOCAL], dtype=pl.INT32)
@@ -1224,7 +1224,10 @@ def build_tensor_specs(layer_id=2, chunk_lens=DEFAULT_CHUNK_LENS, start_position
         else:
             tensor_specs.append(spec)
 
-    tensor_specs.append(TensorSpec("x_next", [N_RANKS, total_tokens, HC_MULT, D], torch.float32, is_output=True))
+    # InOut, not Out: the kernel writes only the packed chunk rows, and the host zeros
+    # must reach the device so valid_ratio_reldiff can check the pad rows are untouched.
+    tensor_specs.append(TensorSpec("x_next", [N_RANKS, total_tokens, HC_MULT, D], torch.float32,
+                                   init_value=torch.zeros, is_output=True))
 
     # Keep static weight parameters device-resident (child_memory), sharded per
     # rank. Dynamic cache/state/table tensors must stay as host tensors because

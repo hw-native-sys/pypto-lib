@@ -351,6 +351,9 @@ def golden_compressor(tensors):
     """
     import torch
 
+    # Rows this golden never writes stay NaN: ignored by the kv comparator.
+    tensors["kv"].fill_(float("nan"))
+
     x = tensors["x"].float()
     compress_state_block_table = tensors["compress_state_block_table"]
     position_ids = tensors["position_ids"].to(torch.int64)
@@ -450,7 +453,7 @@ def golden_compressor(tensors):
         cmp_row = int(cmp_slot_mapping[b, boundary_s].item())
         if cmp_row >= 0:
             # Kernel writes committed pooled result only to kv[:, 0, :]; leave
-            # speculative-boundary rows and kv[:, 1:, :] zero-initialized.
+            # speculative-boundary rows and kv[:, 1:, :] NaN (ignored).
             tensors["kv"][b : b + 1, 0:1, :] = kv_b
             cblk = cmp_row // CMP_STORAGE_BLOCK_SIZE
             intra_offset = cmp_row % CMP_STORAGE_BLOCK_SIZE
@@ -590,7 +593,7 @@ if __name__ == "__main__":
         # Precision reference: AscendC torch.ops.custom.compressor —
         # ops-transformer/experimental/attention/compressor/tests/pytest/compressor_golden.py
         compare_fn={
-            "kv":            ratio_allclose(atol=1e-4, rtol=1.0 / 128, max_error_ratio=0.0),
+            "kv":            ratio_allclose(atol=1e-4, rtol=1.0 / 128, max_error_ratio=0.0, ignore_nan=True),
             "compress_state": ratio_allclose(atol=1e-3, rtol=1e-3, max_error_ratio=0.0),
             "cmp_kv_cache":   ratio_allclose(atol=1e-4, rtol=1.0 / 128, max_error_ratio=0.0),
         },
