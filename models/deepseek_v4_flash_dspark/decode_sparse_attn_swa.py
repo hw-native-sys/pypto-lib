@@ -110,8 +110,9 @@ def sparse_attn_swa(
     ori_kv_flat = pl.reshape(ori_kv, [ori_block_num * BLOCK_SIZE, HEAD_DIM])
     # Consecutive speculative queries share one historical prefix. The caller
     # has already committed every current KV row to ``ori_kv``. Stage token 0's
-    # complete window once per request, append tokens 1..S-1 from the cache,
-    # and let query i read [i, i + WIN).
+    # complete valid prefix once per request, then append tokens 1..S-1. Before
+    # the window fills every query starts at row 0; after it fills, query i
+    # drops only the rows that have slid out of its window.
     swa_kv_flat = pl.create_tensor([request_count * REQUEST_KV_ROWS, HEAD_DIM], dtype=pl.BF16)
     gather_tids = pl.array.create(1, pl.TASK_ID)
     with pl.spmd(request_count, name_hint="swa_gather_kv") as gather_tid:
@@ -119,14 +120,13 @@ def sparse_attn_swa(
         g_t0 = g_req * S
         g_base = g_req * REQUEST_KV_ROWS
         g_first_len = pl.read(swa_lens, [g_t0])
-        g_first_pad = WIN - g_first_len
         swa_kv_flat[
             g_base : g_base + REQUEST_KV_ROWS, 0 : HEAD_DIM,
         ] = pl.full([REQUEST_KV_ROWS, HEAD_DIM], dtype=pl.BF16, value=0.0)
 
         for g_sub in pl.range((WIN - 1) // GATHER_RUN):
             g_sr0 = g_sub * GATHER_RUN
-            g_sdst = g_base + g_first_pad + g_sr0
+            g_sdst = g_base + g_sr0
             if g_sr0 + GATHER_RUN <= g_first_len:
                 g_first = pl.read(swa_indices, [g_t0, g_sr0])
                 g_last = pl.read(swa_indices, [g_t0, g_sr0 + GATHER_RUN - 1])
@@ -156,7 +156,7 @@ def sparse_attn_swa(
                         g_slot_i32 = pl.read(swa_indices, [g_t0, g_row])
                         if g_slot_i32 >= 0:
                             g_slot = pl.cast(g_slot_i32, pl.INDEX)
-                            g_dst = g_base + g_first_pad + g_row
+                            g_dst = g_base + g_row
                             swa_kv_flat[
                                 g_dst : g_dst + 1, 0 : HEAD_DIM,
                             ] = ori_kv_flat[
@@ -168,7 +168,7 @@ def sparse_attn_swa(
                 g_slot_i32 = pl.read(swa_indices, [g_t0, g_row])
                 if g_slot_i32 >= 0:
                     g_slot = pl.cast(g_slot_i32, pl.INDEX)
-                    g_dst = g_base + g_first_pad + g_row
+                    g_dst = g_base + g_row
                     swa_kv_flat[
                         g_dst : g_dst + 1, 0 : HEAD_DIM,
                     ] = ori_kv_flat[
@@ -181,7 +181,7 @@ def sparse_attn_swa(
             g_slot_i32 = pl.read(swa_indices, [g_t, g_len - 1])
             if g_slot_i32 >= 0:
                 g_slot = pl.cast(g_slot_i32, pl.INDEX)
-                g_dst = g_base + WIN + g_token
+                g_dst = g_base + g_first_len + g_token
                 swa_kv_flat[g_dst : g_dst + 1, 0 : HEAD_DIM] = ori_kv_flat[
                     g_slot : g_slot + 1, 0 : HEAD_DIM,
                 ]
@@ -205,7 +205,10 @@ def sparse_attn_swa(
                 qk_bias_row = sparse_bias[qk_t : qk_t + 1, qk_s0 : qk_s0 + ATTN_K_TILE]
                 qk_request = qk_t // S
                 qk_token = qk_t - qk_request * S
-                qk_base = qk_request * REQUEST_KV_ROWS + qk_token + qk_s0
+                qk_first_t = qk_request * S
+                qk_first_len = pl.read(swa_lens, [qk_first_t])
+                qk_drop = pl.max(qk_first_len + qk_token - WIN, 0)
+                qk_base = qk_request * REQUEST_KV_ROWS + qk_drop + qk_s0
                 qk_kv = swa_kv_flat[qk_base : qk_base + ATTN_K_TILE, 0 : HEAD_DIM]
 
                 # Both head batches share one token task and one L1-resident KV tile.
@@ -379,10 +382,8 @@ def sparse_attn_swa_test(
             v_t0 = vb * BIAS_T_TILE
             v_col_m = pl.col_expand(pl.full([BIAS_T_TILE, ATTN_K_TILE], dtype=pl.FP32, value=0.0), v_col)
             v_lens = pl.cast(pl.reshape(swa_lens[v_t0 : v_t0 + BIAS_T_TILE], [BIAS_T_TILE, 1]), target_type=pl.FP32)
-            v_invalid_front = pl.neg(pl.sub(v_lens, WIN))
-            v_before_valid = pl.neg(pl.row_expand_sub(v_col_m, v_invalid_front))
-            v_invalid = pl.minimum(pl.maximum(v_before_valid, 0.0), 1.0)
-            sparse_bias[v_t0 : v_t0 + BIAS_T_TILE, 0:ATTN_K_TILE] = pl.mul(v_invalid, NEG_INF)
+            v_valid = pl.minimum(pl.maximum(pl.neg(pl.row_expand_sub(v_col_m, v_lens)), 0.0), 1.0)
+            sparse_bias[v_t0 : v_t0 + BIAS_T_TILE, 0:ATTN_K_TILE] = pl.mul(pl.sub(v_valid, 1.0), -NEG_INF)
     o_packed_flat = pl.reshape(o_packed_heads, [O_GROUPS * T_PAD * HEADS_PER_GROUP, HEAD_DIM])
     o_packed_flat, _ = sparse_attn_swa_tp1(
         q, ori_kv, swa_indices, swa_lens, sparse_bias,
@@ -502,7 +503,12 @@ def build_tensor_specs(
         """Initialize the sliding-window KV cache pages."""
         kv = torch.rand(ORI_BLOCK_NUM, BLOCK_SIZE, 1, HEAD_DIM) - 0.5
         if causal_regression_fixture:
-            kv[0, WIN - 1, 0].fill_(8.0)
+            # Make token 1's newly appended row dominant. Token 0 must not see
+            # it even though both queries consume slices of one request union.
+            logical_row = WIN
+            table = init_ori_block_table()
+            physical_block = int(table[0, logical_row // BLOCK_SIZE].item())
+            kv[physical_block, logical_row % BLOCK_SIZE, 0].fill_(8.0)
         return kv
 
     def init_attn_sink():
@@ -516,7 +522,8 @@ def build_tensor_specs(
     def init_swa_lens():
         lens = torch.full((tokens,), WIN, dtype=torch.int32)
         if short_window_fixture:
-            lens.fill_(17)
+            for t in range(tokens):
+                lens[t] = min(17 + t % S, WIN)
         return lens
 
     def init_swa_indices():
@@ -526,10 +533,12 @@ def build_tensor_specs(
         lens = init_swa_lens()
         for t in range(tokens):
             b = t // S
+            s = t % S
             valid_len = int(lens[t].item())
             for w in range(valid_len):
-                logical_blk = w // BLOCK_SIZE
-                intra = w % BLOCK_SIZE
+                logical_row = w if short_window_fixture else s + w
+                logical_blk = logical_row // BLOCK_SIZE
+                intra = logical_row % BLOCK_SIZE
                 blk = int(tbl[b, logical_blk].item())
                 if blk >= 0:
                     indices[t, w] = blk * BLOCK_SIZE + intra

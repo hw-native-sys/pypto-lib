@@ -248,10 +248,10 @@ def decode_swa(
             lens_slice = swa_lens[token_start : token_start + BIAS_T_TILE]
             lens_col = pl.reshape(lens_slice, [BIAS_T_TILE, 1])
             lens_fp32 = pl.cast(lens_col, target_type=pl.FP32)
-            invalid_front = pl.neg(pl.sub(lens_fp32, WIN))
-            before_valid = pl.neg(pl.row_expand_sub(valid_cols, invalid_front))
-            invalid = pl.minimum(pl.maximum(before_valid, 0.0), 1.0)
-            sparse_bias[token_start : token_start + BIAS_T_TILE, 0 : ATTN_K_TILE] = pl.mul(invalid, NEG_INF)
+            valid = pl.minimum(pl.maximum(pl.neg(pl.row_expand_sub(valid_cols, lens_fp32)), 0.0), 1.0)
+            sparse_bias[token_start : token_start + BIAS_T_TILE, 0 : ATTN_K_TILE] = pl.mul(
+                pl.sub(valid, 1.0), -NEG_INF,
+            )
 
     attention_local_flat = pl.create_tensor([ATTENTION_WINDOW_ROWS, O_GROUP_IN], dtype=pl.BF16)
     attn_out = pl.create_tensor([t_dim, D], dtype=pl.BF16)
@@ -588,10 +588,8 @@ def decode_swa_tp1(
             v_t0 = v_blk * BIAS_T_TILE
             v_col_m = pl.col_expand(pl.full([BIAS_T_TILE, WIN], dtype=pl.FP32, value=0.0), v_col)
             v_lens = pl.cast(pl.reshape(swa_lens[v_t0 : v_t0 + BIAS_T_TILE], [BIAS_T_TILE, 1]), target_type=pl.FP32)
-            v_invalid_front = pl.neg(pl.sub(v_lens, WIN))
-            v_before_valid = pl.neg(pl.row_expand_sub(v_col_m, v_invalid_front))
-            v_invalid = pl.minimum(pl.maximum(v_before_valid, 0.0), 1.0)
-            sparse_bias[v_t0 : v_t0 + BIAS_T_TILE, 0:WIN] = pl.mul(v_invalid, NEG_INF)
+            v_valid = pl.minimum(pl.maximum(pl.neg(pl.row_expand_sub(v_col_m, v_lens)), 0.0), 1.0)
+            sparse_bias[v_t0 : v_t0 + BIAS_T_TILE, 0:WIN] = pl.mul(pl.sub(v_valid, 1.0), -NEG_INF)
     attn_out = pl.create_tensor([t_dim, D], dtype=pl.BF16)
     o_packed_heads = pl.create_tensor([O_GROUPS * T_PAD * HEADS_PER_GROUP, HEAD_DIM], dtype=pl.BF16)
     o_packed_heads, heads_dep = sparse_attn_swa_tp1(
