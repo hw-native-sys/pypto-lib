@@ -1,11 +1,11 @@
 # Compile and Runtime Workflow
 
 What usually happens when you run `python <kernel>.py -p <platform>`.
-Most examples and model harnesses use `golden.run` for `@pl.program` kernels
-or `golden.run_jit` for module-level `@pl.jit` kernels. A few specialized
-smoke, artifact-regeneration, and external-runtime drivers call PyPTO's
-compile/runtime APIs directly; their `__main__` blocks are the authority for
-what a command actually validates.
+Examples and model harnesses go through `golden.run_jit`, the entry point for
+module-level `@pl.jit` kernels; `golden.run` is the same harness for
+`@pl.program` kernels. A few specialized smoke, artifact-regeneration, and
+external-runtime drivers call PyPTO's compile/runtime APIs directly; their
+`__main__` blocks are the authority for what a command actually validates.
 
 ## CLI shape
 
@@ -18,9 +18,9 @@ parser.add_argument("-d", "--device", type=int, default=0)
 parser.add_argument("--enable-chip-swimlane", action="store_true")
 args = parser.parse_args()
 
-result = run(
-    program=build_qwen3_decode_program(...),  # @pl.program class
-    specs=build_tensor_specs(...),            # ordered TensorSpec / ScalarSpec list
+result = run_jit(
+    fn=qwen3_decode,                          # module-level @pl.jit function
+    specs=build_tensor_specs(...),            # TensorSpec / ScalarSpec, in fn's param order
     golden_fn=golden_qwen3_decode,            # PyTorch reference
     compile_cfg=dict(dump_passes=True),
     runtime_cfg=dict(platform=args.platform, device_id=args.device,
@@ -29,10 +29,10 @@ result = run(
 )
 ```
 
-A kernel written as a module-level `@pl.jit` function calls **`run_jit`**
-instead, passing `fn=<jit_function>` in place of `program=`. Both entry points
-share tensor specs, golden computation, runtime dispatch, and validation, but
-their `compile_cfg` fields and defaults differ; see
+A kernel built as a `@pl.program` class calls **`run`** instead, passing
+`program=<program>` in place of `fn=`. Both entry points share tensor specs,
+golden computation, runtime dispatch, and validation, but their `compile_cfg`
+fields and defaults differ; see
 [Compile configuration](#compile-configuration).
 
 | Flag | Purpose |

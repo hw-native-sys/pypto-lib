@@ -43,18 +43,17 @@ location. Most compile failures are fixed at the cited site without any
 further tooling; read the message before reaching for the heavier
 mechanisms below.
 
-- **Compile failure** — scripts using `golden.run` call `ir.compile`
-  directly, whose default `dump_passes=True` writes per-pass IR under
-  `build_output/<...>/passes_dump/`. `golden.run_jit` constructs a
-  `RunConfig`, whose default is `dump_passes=False`; pass
-  `compile_cfg=dict(dump_passes=True)` when you need the same files. Diff the
-  last clean pass against the first failing one to see which pass rejected
-  the IR. `report/` holds scheduling diagnostics.
-- **PTOAS failure** — the error quotes the `.pto` op. With `golden.run`,
+- **Compile failure** — `golden.run_jit` constructs a `RunConfig`, whose
+  default is `dump_passes=False`; pass `compile_cfg=dict(dump_passes=True)` to
+  write per-pass IR under `build_output/<...>/passes_dump/`. `golden.run`
+  calls `ir.compile` directly, whose default `dump_passes=True` writes those
+  files already. Diff the last clean pass against the first failing one to see
+  which pass rejected the IR. `report/` holds scheduling diagnostics.
+- **PTOAS failure** — the error quotes the `.pto` op.
   `compile_cfg=dict(skip_ptoas=True)` keeps the raw `.pto` MLIR and stops
   before the C++ wrapper, isolating whether the regression is in PyPTO's
-  IR-to-MLIR path or in PTOAS. `skip_ptoas` is not a `RunConfig` field and
-  therefore is not accepted by `golden.run_jit`.
+  IR-to-MLIR path or in PTOAS. It is an `ir.compile` kwarg, not a `RunConfig`
+  field, so `golden.run` accepts it and `golden.run_jit` does not.
 - **Runtime crash** — rerun on the matching simulator (`-p a2a3sim` /
   `a5sim`); it gives more diagnostic output than the device backend and
   reproduces most lowering bugs.
