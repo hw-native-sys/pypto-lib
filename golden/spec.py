@@ -55,8 +55,8 @@ class TensorSpec:
             benchmark round, skipping the per-dispatch host→device upload and
             device→host readback. Only supported for L3 distributed programs.
             A pure ``Out`` resident is allocated uninitialized; its zero-filled
-            host placeholder is not uploaded. Combine with ``is_output=True``
-            for either a pure output or a read-write **resident state buffer**
+            host placeholder is not uploaded. Declare the parameter ``Out`` or
+            ``InOut`` for either a pure output or a read-write **resident state buffer**
             (e.g. a KV cache): an ``InOut`` state is uploaded once from
             ``init_value``, both kinds are updated on-device, and they are read
             back **once** at the end (via ``copy_stacked_from`` / ``copy_from``)

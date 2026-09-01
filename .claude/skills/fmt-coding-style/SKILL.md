@@ -60,12 +60,12 @@ the long line — when a statement cannot be split into ops (a single
 120 columns instead of trailing one keyword onto a continuation line.
 
 ```python
-# before — 96 + 15 columns split across two lines
+# before — 92 + 23 columns split across two lines
 next_hidden_spec = TensorSpec("next_pre_hc_hidden", [N_RANKS, T, HC_MULT, D], torch.float32,
-                              is_output=True)
+                              init_value=torch.zeros)
 
-# after — 112 columns, one line
-next_hidden_spec = TensorSpec("next_pre_hc_hidden", [N_RANKS, T, HC_MULT, D], torch.float32, is_output=True)
+# after — 116 columns, one line
+next_hidden_spec = TensorSpec("next_pre_hc_hidden", [N_RANKS, T, HC_MULT, D], torch.float32, init_value=torch.zeros)
 ```
 
 Past ~120, go back to Rule 1: split the op, or group the arguments as below.
