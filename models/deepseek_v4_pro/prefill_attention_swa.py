@@ -115,7 +115,7 @@ assert SPARSE_ORI_MAX_BLOCKS <= BLOCK_NUM
 # ring; measured on a5, every ring at 512 MiB is already enough for all three prefill
 # attention variants, so 1 GiB is one doubling of headroom over the measured need.
 # All four rings, not just ring 2: ring 2 alone (what prefill_fwd.py sets) does not
-# clear it. Applied through run_jit's runtime_cfg, which reaches the device only on
+# clear it. Applied through run's runtime_cfg, which reaches the device only on
 # the ChipWorker route -- see golden/runner.py::_execute_via_runner.
 PREFILL_ATTN_RING_HEAP = (1024 * 1024 * 1024,) * 4
 

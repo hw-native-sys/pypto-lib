@@ -66,7 +66,7 @@ def build_tensor_specs():
     return [
         TensorSpec("query_start_loc", list(query_start_loc.shape), torch.int32, init_value=query_start_loc),
         ScalarSpec("local_base", torch.int32, local_base),
-        TensorSpec("request_ids", list(request_ids.shape), torch.int32, is_output=True),
+        TensorSpec("request_ids", list(request_ids.shape), torch.int32),
     ]
 
 
@@ -95,7 +95,7 @@ def golden_prefill_metadata(tensors):
 if __name__ == "__main__":
     import argparse
 
-    from golden import run_jit
+    from golden import run
 
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("-p", "--platform", default="a2a3", choices=["a2a3", "a2a3sim", "a5", "a5sim"])
@@ -103,7 +103,7 @@ if __name__ == "__main__":
     parser.add_argument("--compile-only", action="store_true")
     args = parser.parse_args()
 
-    result = run_jit(
+    result = run(
         fn=prefill_metadata_test,
         specs=build_tensor_specs(),
         golden_fn=golden_prefill_metadata,

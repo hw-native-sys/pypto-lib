@@ -1990,7 +1990,7 @@ def build_ragged2_cp_tensor_specs(tp_size: int = TP_SIZE):
             continue
         replacement_spec = TensorSpec(
             spec.name, list(value.shape), spec.dtype, init_value=value,
-            is_output=spec.is_output, resident=spec.resident,
+            resident=spec.resident,
         )
         specs.append(replacement_spec)
     return specs
