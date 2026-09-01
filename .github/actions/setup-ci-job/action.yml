@@ -621,6 +621,51 @@ runs:
           done
           python3.10 -c 'import sys; assert sys.version_info[:2]==(3,10)' )
 
+    - name: Put the job venv ahead of CANN's python packages
+      # Appended to whichever bootstrap step above wrote activate.sh, so this is
+      # the last thing that file does: the venv has to win over everything the
+      # earlier lines put on PYTHONPATH.
+      #
+      # CANN's set_env.sh prepends $CANN_ROOT/python/site-packages to PYTHONPATH,
+      # and CANN >= 9.2 ships a `pypto` package there. PYTHONPATH outranks a
+      # venv's own site-packages, so on those hosts that copy shadows the pinned
+      # pypto this job just built: it tries to build its native impl online and
+      # dies on a pybind11 the venv has no reason to carry ("No module named
+      # 'pybind11'", raised from .../cann-<ver>/python/site-packages/pypto/).
+      # The revision the pin chain selects is the only pypto this repo may
+      # import, so re-assert the venv rather than installing pybind11 to make the
+      # wrong copy work.
+      #
+      # Rebuilt on every source rather than appended once: activate.sh is sourced
+      # again in each task-submit child, and set_env.sh re-prepends its own entry
+      # every time, so a "skip if already present" guard would let CANN back in
+      # front from the second source on.
+      shell: bash
+      working-directory: ${{ inputs.checkout-path }}
+      run: |
+        source activate.sh
+        # Baked in as a literal, like the roots above: resolving it needs a
+        # python run, and activate.sh is sourced on every step and every
+        # task-submit child.
+        site="$(python -c 'import sysconfig; print(sysconfig.get_paths()["purelib"])')"
+        echo "_PYPTO_SITE=$site" >> activate.sh
+        cat >> activate.sh <<'EOF'
+        _PYPTO_PP=""
+        _PYPTO_IFS="$IFS"; IFS=":"
+        for _p in ${PYTHONPATH:-}; do
+          case "$_p" in ""|"$_PYPTO_SITE") continue ;; esac
+          _PYPTO_PP="${_PYPTO_PP:+$_PYPTO_PP:}$_p"
+        done
+        IFS="$_PYPTO_IFS"
+        export PYTHONPATH="$_PYPTO_SITE${_PYPTO_PP:+:$_PYPTO_PP}"
+        EOF
+        # Prove it holds through a second source, which is what a task-submit
+        # child does and where an append-once guard would have failed.
+        ( source activate.sh
+          source activate.sh
+          python -c 'import sys, sysconfig; s = sysconfig.get_paths()["purelib"]; sys.exit(0 if sys.path[1] == s else f"::error::venv site-packages is not first on sys.path: {sys.path[1]}")'
+          echo "PYTHONPATH=$PYTHONPATH" )
+
     - name: Show cache stats (before)
       shell: bash
       run: |
@@ -1031,7 +1076,25 @@ runs:
         # a broken venv here rather than ten minutes later in the test step, and
         # it is the check that makes a cache hit safe to trust: a wheel served
         # from a slot has to import as well as one built in place.
-        python -c "import pypto, simpler; print('env OK:', pypto.__file__)"
+        #
+        # Importing is not enough: a copy outside the venv (CANN >= 9.2 ships its
+        # own pypto under $CANN_ROOT/python/site-packages) imports fine and is
+        # the wrong revision, so assert where each module came from. The
+        # PYTHONPATH guard the bootstrap installed is what keeps this true.
+        python - <<'PYCHECK'
+        import os, sys, sysconfig
+        import pypto, simpler
+        # purelib/platlib resolve from sys.prefix, so inside the venv they are
+        # the directories the install just wrote to - no VIRTUAL_ENV needed.
+        roots = {os.path.realpath(sysconfig.get_paths()[k]) for k in ("purelib", "platlib")}
+        for mod in (pypto, simpler):
+            path = os.path.realpath(mod.__file__)
+            if not any(path.startswith(root + os.sep) for root in roots):
+                sys.exit(f"::error::{mod.__name__} resolved to {path}, outside "
+                         f"this job's venv ({sorted(roots)}) - an outside copy "
+                         "is shadowing the revision the pin chain selected")
+        print("env OK:", pypto.__file__)
+        PYCHECK
 
     - name: Install runner dependencies
       shell: bash

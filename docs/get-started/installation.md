@@ -169,6 +169,7 @@ Then proceed to [Run your first kernel](first-kernel.md).
 |---|---|
 | `ModuleNotFoundError: golden` | Run from the repository root and export that root in `PYTHONPATH`. |
 | `ModuleNotFoundError: pypto` | Activate the intended environment and reinstall the selected PyPTO checkout. |
+| `RuntimeError: pybind11 pip package not found`, from a `pypto` under `$CANN_ROOT/python/site-packages` | CANN 9.2 and newer ship their own `pypto`, and `set_env.sh` puts that directory on `PYTHONPATH` ahead of your environment. Check with `python -c 'import pypto; print(pypto.__file__)'`, then put your own `site-packages` first on `PYTHONPATH` — the selected checkout is the only `pypto` this repository builds against. |
 | PTOAS cannot be found | `PTOAS_ROOT` must be exported and hold `ptoas.sh` (bundle) or `bin/ptoas` (wheel venv). |
 | The first device build stalls on a `git clone` | It is fetching pto-isa. On a blocked network, seed the checkout the error names, or symlink an existing clone. |
 | Simulator compilation cannot find `g++-15` | Install GCC 15, or provide `gcc-15` / `g++-15` wrappers for the active compiler. |
