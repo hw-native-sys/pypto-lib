@@ -80,7 +80,14 @@ script's `--help` and `docs/get-started/platforms.md`.
 6. **Never silently work around a suspected compiler bug.** When the DSL looks
    correct but the program fails to compile or produces wrong results, log it —
    see [`.claude/rules/problem-handling.md`](rules/problem-handling.md).
-7. **Optimize wall time first, and measure it once.** Core busy time is the
-   second priority; reuse a frozen golden and a single timed process instead of
-   re-running a script for samples; strip rank start skew from distributed
-   results — see [`.claude/rules/benchmarking.md`](rules/benchmarking.md).
+7. **Optimize wall time first, measure it once, and report every decided
+   attempt.** Core busy time is the second priority; reuse a frozen golden and a
+   single timed process instead of re-running a script for samples; strip rank
+   start skew from distributed results. Every finished optimization — kept or
+   reverted — reports three things: the perf gain with its conventions, why it
+   won or did not **from the trace**, and the new trace files themselves. See
+   [`.claude/rules/benchmarking.md`](rules/benchmarking.md).
+8. **Read the lessons before tuning; record one after.** Every performance
+   change opens by reading the local `OPTIMIZATION_LESSONS.md` and closes with
+   one entry per decided attempt, the reverted ones included — see
+   [`.claude/rules/optimization-lessons.md`](rules/optimization-lessons.md).

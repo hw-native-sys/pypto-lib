@@ -82,6 +82,24 @@ PYPTO_BENCH=1 PYPTO_BENCH_ROUNDS=20 python <kernel>.py -p a2a3 -d 0 --save-data
 PYPTO_BENCH=1 PYPTO_BENCH_ROUNDS=20 python <kernel>.py -p a2a3 -d 0 --golden-data build_output/<ProgramName>_<ts>/data
 ```
 
+## Parallel Sweeps — One Card per Variant
+
+A single-card entry takes a plain `-d N`, so a box with 8 NPUs can measure 8
+variants in the wall-clock time of one. Two conditions make it sound:
+
+1. **Every variant measures its own baseline on its own device**, and quotes
+   only the within-device delta. Device-to-device spread is the same order as a
+   small effect, so a cross-device comparison silently invents or erases one.
+2. **They share one frozen golden directory**, so no variant pays for input
+   generation or the torch recompute.
+
+Give each variant its own copy of the model directory — a git worktree does not
+carry an untracked one, a plain copy does. When chasing a sub-1 % effect,
+interleave baseline and variant back to back on each device so host-side
+contention from the other cards hits both sides equally.
+
+This does not apply to an L3 (`l3_*`) entry, which needs the whole card set.
+
 ## Distributed (L3) — Drop the Start Skew
 
 Ranks do not start together. A late-dispatched rank spends the head of its
@@ -116,3 +134,33 @@ Every benchmark number states: platform and device, rounds / warmup, the metric
 and its convention (headline mean vs fastest rank), the baseline it is compared
 against, and whether the golden was replayed. A number without those cannot be
 reproduced or trusted.
+
+### Every finished optimization reports three things
+
+Report as soon as an attempt is **decided** — not batched to the end of the
+session, and not only for the wins. A reverted change gets the same three parts
+as a kept one; that is what stops the next session repeating it.
+
+**1. Perf gain.** Baseline → variant with the delta, carrying every convention
+above. Give the cumulative figure too when a session has stacked several
+changes, so the running total never has to be reconstructed.
+
+**2. Why it wins — or why it does not.** Name the mechanism from the **trace**,
+not from the hypothesis that motivated the edit: which line item moved and by
+how much (`sched_overhead_analysis` phase split, per-engine starvation,
+submit / block / edge counts, per-block exec time, occupancy). Two cases deserve
+extra words rather than fewer:
+
+- The change won **for a different reason than predicted** — say so plainly. A
+  win you cannot explain will not transfer to the next shape.
+- The change **lost**, or won far less than the mechanism suggested it should.
+  State which resource you freed and why nothing was waiting on it.
+
+**3. The new trace.** Capture it and hand over the real files — merged swimlane,
+CPM traces, the `sched_overhead_analysis` dump — rather than describing them.
+Say what changed in the trace's *shape* (a phase that now overlaps, a dead band
+that closed, a lane that emptied), not only what changed in the numbers.
+
+This is the report, not the log entry. The lesson still goes to
+[`optimization-lessons.md`](optimization-lessons.md)'s file; these three parts
+are what the user reads at the moment the attempt is decided.

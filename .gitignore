@@ -67,3 +67,8 @@ KNOWN_PYPTO_ISSUES.md*
 KNOWN_PYPTO_ISSUES/
 # Retained so a developer's pre-rename local log stays ignored
 KNOWN_ISSUES.md
+OPTIMIZATION_LESSONS.md*
+OPTIMIZATION_LESSONS/
+
+# Claude Code's per-task git worktrees, linked under this checkout
+.claude/worktrees/

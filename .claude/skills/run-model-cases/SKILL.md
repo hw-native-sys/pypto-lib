@@ -104,6 +104,25 @@ schedule around it. Do not make a caller climb a ladder they did not ask for.
 Allocate devices through the site's allocator rather than by probing for an
 idle card, and pass the allocated ids.
 
+## Minimising a case — by card count, not by shape
+
+When narrowing a compute-side problem, cut the number of cards, not the shapes.
+In a tensor-parallel tree `--tp N` sets **shapes** as well as world size, and
+only the `l3_*` entries actually need N cards — a component entry with no `pld.`
+use takes a single `-d` and still accepts the deployment `--tp`. The minimal
+case for a kernel fault is therefore *one card at the deployment TP's shapes*,
+which also iterates in seconds where a multi-card layer takes minutes.
+
+Dropping to `--tp 1` instead rescales every TP-divided dimension, and that can
+delete the defect outright: a tile expression of the form `min(C, DIM // k)` can
+pin to a different block count at TP=8 than at TP=1, so the shape that creates
+the bug disappears along with the cards. Check what the flag rescales before
+treating a smaller TP as the same case, only cheaper.
+
+A multi-card entry is also unusable for ranking variants — its headline
+`effective_us` carries rank start skew, which can dominate a short kernel
+entirely. See [Benchmarking](../../rules/benchmarking.md).
+
 ## Cost discipline
 
 Forward cases allocate large fixtures and can exhaust host memory or the device

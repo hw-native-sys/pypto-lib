@@ -163,6 +163,53 @@ scheduler delay, and post-dispatch pickup, and each has a different fix. See
 formed, what the four per-task timestamps mean, and how to attribute a gap
 without guessing.
 
+### Decide the bound class before choosing a fix
+
+The symptom table narrows the candidates; it does not say whether the chip or
+the scheduler is the constraint. Run the analyzer on a level-4 capture and read
+its verdict before editing anything:
+
+```bash
+python -m simpler_setup.tools.sched_overhead_analysis \
+  --chip-swimlane-records-json <dfx_outputs>/chip_swimlane_records.json \
+  --deps-json <dfx_outputs>/deps.json
+```
+
+It prints a one-line verdict — SCHEDULER-BOUND or COMPUTE-BOUND — plus the
+AICPU phase split, and the dominant phase names the edit:
+
+| Dominant AICPU phase | The constraint | The edit |
+|---|---|---|
+| Dispatch | submit count | Group stages, `pl.spmd` (item 5) |
+| Complete | dependency-edge count | Fewer created tensors, `manual_dep`, `no_dep_args`, restated `deps=` — see [Dependencies and Scheduling](dependency-and-scheduling.md) |
+| Idle | the scheduler is no longer binding | Stop here and go back to compute (items 2–4) |
+
+Watch the trend across iterations: **rising Idle is the proof that a change
+removed the binding constraint**; Idle that stays flat means it did not. Read
+per-engine starvation before "freeing" a resource — an engine that was never
+starved gains nothing from the capacity returned to it.
+
+**The capture must be level 4.** `aicpu_tasks` is empty below it and the tool
+has nothing to report. An `--enable-chip-swimlane` declared
+`action="store_true"` yields level 1, not 4; the entry needs
+`type=int, nargs="?", const=4, choices=range(5)` before capturing.
+
+This analysis and the critical path can disagree. `critical_path` attributes a
+stall to the core being busy (`core-wait`), which reads as a resource problem
+when the AICPU is simply never dispatching; on a dispatch-heavy kernel, believe
+the phase split. Treat any single capture's "scheduler injects X %" figure as
+directional — it swings more than the effects being measured. The reproducible
+signals are the summed phase totals, the edge / task / submit counts, and the
+pop hit rate.
+
+Then state the mechanism before editing. Name (a) which task the trace says is
+the bottleneck, (b) what that task's own numbers say is limiting it — per-block
+execution time against head overhead, occupancy, or stall class — and (c) how
+the proposed change removes *that*. A sweep run without (a)–(c) can find a win
+and still leave you unable to predict the next one, or to know whether it
+transfers to another shape. When a result contradicts the stated mechanism,
+re-profile before keeping it.
+
 ### Tuning rules
 
 #### 1. Use `pl.range` vs. `pl.parallel` correctly
@@ -224,6 +271,13 @@ with pl.at(level=pl.Level.CORE_GROUP, name_hint="rmsnorm_q_proj"):
     ...   # rmsnorm, then q_proj
 ```
 
+The sharpest form of this test: **when two tasks run on the same engine and the
+only edge between them is producer → consumer, the boundary buys nothing.** They
+cannot run concurrently in any case, so it adds no parallelism while costing a
+submit, a scheduler round trip, and a barrier if either side is grouped. Read
+the engine from the `deps.json::kernel_ids` slot position (0 = AIC, 1 = AIV) and
+check the fan-out degree; same engine plus sole consumer is the signature.
+
 **c. Merge cube + vector into a mixed kernel.** When a matmul (cube) and
 its epilogue (cast / add / norm — vector) sit in separate `pl.at` regions,
 every projection generates two kernels and an AICPU hand-off between them.
@@ -238,6 +292,15 @@ with pl.at(level=pl.Level.CORE_GROUP, name_hint="q_proj"):
     q_bf16 = pl.cast(q_acc, target_type=pl.BF16)         # vector
     q_proj[b0:b0 + BATCH_TILE, q0:q0 + Q_OUT_CHUNK] = q_bf16
 ```
+
+A mixed kernel is not free. On a2a3 each AIC is paired with 2 AIV and a MIX task
+**reserves all three for its whole duration**, so a long cube phase with a short
+epilogue holds far more vector capacity than it uses. Weigh that reservation
+against the vector engine's *starvation* figure rather than its occupancy: a
+large reservation on an under-subscribed engine costs nothing, and splitting one
+back out pays only to the extent that engine was the constraint. When a split is
+worth making, group the freed vector stage rather than emitting one submit per
+item — see item 5.
 
 #### 3. Kernels too big — split and parallelize
 
@@ -348,6 +411,24 @@ others, the AICPU would otherwise track a dependency edge per block, and
 Use `pl.spmd` once the per-iteration body is self-contained and the
 AICPU lane shows a dispatch trail; keep the explicit form when you need
 to nest named sub-regions inside the chunk.
+
+On a SCHEDULER-BOUND kernel the unit of cost is the **submit** — not the task
+and not the block. Two consequences follow.
+
+**Blocks are free where submits are not.** `pl.spmd(N)` submits once whatever N
+is, so raising the block count costs no AICPU work while smoothing the wave
+across cores. Fix ragged packing by adding blocks before touching anything else.
+The floor is the cache line: blocks narrow enough to fall under it lose more in
+per-block setup than they gain in spread.
+
+**A grouped `pl.spmd` is also a barrier across its whole group.** Folding many
+per-item submits into one trades scheduler serialization for dependency
+serialization, so group the cheap stages and leave the long ones per-item.
+Grouping every stage of a region can easily be a net loss — the scheduler's
+share of the critical path collapses while critical-path *compute* rises by
+more — and the submit count has a floor below which the curve turns back up. How
+far to group depends on how sparse the work is: a grouped stage pays for the
+inactive items, an ungrouped stage skips them.
 
 ---
 

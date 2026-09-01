@@ -335,6 +335,45 @@ host and orchestrator front time and the AICPU tail. Level-4 collection has
 observer cost, so use it for causal evidence and take production numbers from
 an unprofiled benchmark; see [Performance Tuning](performance-tuning.md).
 
+#### What the two paths say together
+
+Compare the paths by **length**, not only by duration, and two bottleneck
+classes fall out that neither path names alone.
+
+**A phase serialized by issue rate, not by depth.** When a kernel family sits on
+the static path once but appears on the observed path many times, the observed
+path is hopping sideways between independent instances through same-core
+predecessors — the work is not dependency-deep, it is waiting for cores. Fuse
+those tasks rather than reordering them. The `core-wait` share corroborates it,
+since that class exists only because the tool adds same-core resource
+predecessors.
+
+**A task that is under-partitioned.** A long task with a small
+`deps.json::block_num` strands cores that everything else then waits for. Rank
+candidates by stranded core-time — `(num_cores − block_num × active kernel_ids
+slots) × duration` — and split the worst. This class is invisible to a path
+walk: such a task need not be on *either* path, because its cost is the cores it
+denies to its neighbours.
+
+**Pricing the task count itself.** `critical_path` weights each task by
+`end_tick − start_tick`, which is execution only. Recompute the same CPM with
+`receive_to_start_cycles` added to every weight, and the difference is the head
+overhead accumulated down the longest chain — a floor that exists only because
+the work is cut into that many tasks, and the most direct argument for fusing.
+It covers only the software-tunable half of launch cost; the AICPU
+dispatch→receive half needs level ≥ 2, so treat the figure as a lower bound. Do
+not add it to the tool's compute/stall tiling, since part of it hides under
+other cores' execution.
+
+Reading the records by hand invites three mistakes, which is reason enough to
+prefer the tool. `aicore_tasks` rows are `[core_id, task_token, reg_task_id,
+start_tick, end_tick, receive_to_start_cycles]`, and column 3 is a register slot
+id, not a per-core sequence number. A task **occupies**
+`[start − receive_to_start, end]` but **executes** for `end − start`, so folding
+head overhead into a CPM weight inflates the dependency floor and can make a run
+with large slack look dependency-bound. Reduce an SPMD task's blocks to a single
+weight with the per-block **max**, never the sum.
+
 ## Tuning the schedule
 
 Everything above describes the machine. This section is the method: a loop that
