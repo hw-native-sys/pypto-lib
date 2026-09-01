@@ -19,7 +19,8 @@ import pypto.language.distributed as pld
 from pypto.ir.distributed_compiled_program import DistributedConfig
 
 from config import FLASH as M, MOE_TOKENS, TP
-from expert_routed import IDX_PAD, N_SLOTS, RECV_MAX, expert_routed
+from expert_routed import IDX_PAD, N_SLOTS, RECV_MAX
+from expert_routed_persistent_balanced import expert_routed_persistent_balanced
 from expert_shared import expert_shared
 from gate import gate
 from hc_post import hc_post
@@ -72,7 +73,7 @@ def route_group(
     weights: pl.Tensor[[T, TOPK], pl.FP32],
     x_norm_i8: pl.Tensor[[T, D], pl.INT8],
     x_norm_scale: pl.Tensor[[T, 1], pl.FP32],
-    # compact per-slot outputs consumed by expert_routed / combine_local
+    # compact per-slot outputs consumed by the routed expert / combine_local
     recv_x: pl.Tensor[[N_SLOTS, RECV_MAX, D], pl.INT8],
     recv_scale: pl.Tensor[[N_SLOTS, RECV_MAX], pl.FP32],
     recv_w: pl.Tensor[[N_SLOTS, RECV_MAX], pl.FP32],
@@ -314,7 +315,7 @@ def moe(
 
     with pl.scope():
         recv_y = pl.create_tensor([N_SLOTS, RECV_MAX, D], dtype=pl.BF16)
-        expert_routed(
+        expert_routed_persistent_balanced(
             recv_x, recv_scale, recv_w, recv_count, slot_expert,
             routed_w1, routed_w1_scale, routed_w3, routed_w3_scale,
             routed_w2, routed_w2_scale,
