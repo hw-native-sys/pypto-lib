@@ -63,7 +63,7 @@ def gather_o_proj_full_weights(
     with pl.at(level=pl.Level.CORE_GROUP, name_hint="o_proj_weight_reuse_wait") as reuse_wait_tid:
         for source_tp in pl.range(TP_SIZE):
             if source_tp != tp_rank:
-                pld.system.defer_wait(
+                pld.system.wait(
                     signal=weight_consumed, offsets=[source_tp, 0],
                     expected=previous_epoch, cmp=pld.WaitCmp.Ge,
                 )
@@ -93,7 +93,7 @@ def gather_o_proj_full_weights(
     with pl.at(level=pl.Level.CORE_GROUP, name_hint="o_proj_weight_ready_wait") as ready_wait_tid:
         for source_tp in pl.range(TP_SIZE):
             if source_tp != tp_rank:
-                pld.system.defer_wait(
+                pld.system.wait(
                     signal=weight_ready, offsets=[source_tp, 0],
                     expected=weight_epoch, cmp=pld.WaitCmp.Ge,
                 )
