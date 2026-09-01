@@ -133,7 +133,7 @@ jobs:
         # actually started: it truncates results.tsv first thing, so anything
         # it uploads (even from a failed or cancelled sweep) is from this run.
         if: ${{ always() && steps.sweep.outcome != 'skipped' }}
-        uses: actions/upload-artifact@v4
+        uses: ./.github/actions/upload-results
         with:
           name: results-${{ matrix.platform }}
           # upload-artifact resolves `path` against $GITHUB_WORKSPACE and ignores
@@ -287,7 +287,7 @@ jobs:
         # for why a bare always() re-publishes a previous run's leftover
         # results.tsv when the job dies in setup.
         if: ${{ always() && steps.sweep.outcome != 'skipped' }}
-        uses: actions/upload-artifact@v4
+        uses: ./.github/actions/upload-results
         with:
           name: results-a2a3
           path: checkout/results.tsv
@@ -467,7 +467,7 @@ jobs:
         # byte-identical results-a5 leftover from the 08-05 sweep, so the
         # summary kept presenting six-day-old V4-Pro numbers as current.
         if: ${{ always() && steps.sweep.outcome != 'skipped' }}
-        uses: actions/upload-artifact@v4
+        uses: ./.github/actions/upload-results
         with:
           name: results-a5
           path: checkout/results.tsv
@@ -788,7 +788,7 @@ jobs:
         # Gated on the resolve step having run (it writes e2e.json first thing on
         # a skip), for the same leftover-table reason as the other device jobs.
         if: ${{ always() && steps.weights.outcome != 'skipped' }}
-        uses: actions/upload-artifact@v4
+        uses: ./.github/actions/upload-results
         with:
           name: results-e2e-a5
           path: |
