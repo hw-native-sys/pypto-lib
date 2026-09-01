@@ -117,6 +117,7 @@ SPARSE_TOPK = WIN + SPARSE_IDX_TOPK
 
 # tiling
 BIAS_T_TILE = 8  # sparse_bias row block; T is a multiple of 8 by the batch contract
+SWA_WB_TOKEN_TILE = 32  # tokens per cache-writeback SPMD block
 SPARSE_ROPE_TILE = 16
 SPARSE_ROPE_INTERLEAVE_TILE = 2 * SPARSE_ROPE_TILE
 NEG_INF = -1.0e20
@@ -227,26 +228,33 @@ def decode_swa(
     cache_rows = ori_block_num * BLOCK_SIZE
     kv_cache_flat = pl.reshape(kv_cache, [cache_rows, HEAD_DIM])
     sparse_bias = pl.create_tensor([t_dim, PADDED_TOPK], dtype=pl.FP32)
-    with pl.at(level=pl.Level.CORE_GROUP, name_hint="swa_cache_insert_valid_bias"):
-        for write_t in pl.range(kv_dim):
+    wb_blocks = (kv_dim + SWA_WB_TOKEN_TILE - 1) // SWA_WB_TOKEN_TILE
+    with pl.spmd(wb_blocks, name_hint="swa_cache_writeback"):
+        wb_blk = pl.tile.get_block_idx()
+        wb_t0 = wb_blk * SWA_WB_TOKEN_TILE
+        wb_rows = pl.min(SWA_WB_TOKEN_TILE, kv_dim - wb_t0)
+        for write_dt in pl.range(wb_rows):
+            write_t = wb_t0 + write_dt
             write_row_i64 = pl.read(swa_slot_mapping, [write_t])
             if write_row_i64 >= 0:
                 write_row = pl.cast(write_row_i64, pl.INDEX)
                 kv_cache_flat[write_row : write_row + 1, 0 : HEAD_DIM] = (
                     kv_full[write_t : write_t + 1, 0 : HEAD_DIM]
                 )
+
+    with pl.spmd(bias_blocks, name_hint="swa_valid_bias"):
+        bias_block = pl.tile.get_block_idx()
         valid_col = pl.cast(pl.arange(0, [1, ATTN_K_TILE], dtype=pl.INT32), target_type=pl.FP32)
-        for bias_block in pl.range(bias_blocks):
-            token_start = bias_block * BIAS_T_TILE
-            zero_rows = pl.full([BIAS_T_TILE, ATTN_K_TILE], dtype=pl.FP32, value=0.0)
-            valid_cols = pl.col_expand(zero_rows, valid_col)
-            lens_slice = swa_lens[token_start : token_start + BIAS_T_TILE]
-            lens_col = pl.reshape(lens_slice, [BIAS_T_TILE, 1])
-            lens_fp32 = pl.cast(lens_col, target_type=pl.FP32)
-            valid = pl.minimum(pl.maximum(pl.neg(pl.row_expand_sub(valid_cols, lens_fp32)), 0.0), 1.0)
-            sparse_bias[token_start : token_start + BIAS_T_TILE, 0 : ATTN_K_TILE] = pl.mul(
-                pl.sub(valid, 1.0), -NEG_INF,
-            )
+        token_start = bias_block * BIAS_T_TILE
+        zero_rows = pl.full([BIAS_T_TILE, ATTN_K_TILE], dtype=pl.FP32, value=0.0)
+        valid_cols = pl.col_expand(zero_rows, valid_col)
+        lens_slice = swa_lens[token_start : token_start + BIAS_T_TILE]
+        lens_col = pl.reshape(lens_slice, [BIAS_T_TILE, 1])
+        lens_fp32 = pl.cast(lens_col, target_type=pl.FP32)
+        valid = pl.minimum(pl.maximum(pl.neg(pl.row_expand_sub(valid_cols, lens_fp32)), 0.0), 1.0)
+        sparse_bias[token_start : token_start + BIAS_T_TILE, 0 : ATTN_K_TILE] = pl.mul(
+            pl.sub(valid, 1.0), -NEG_INF,
+        )
 
     attention_local_flat = pl.create_tensor([ATTENTION_WINDOW_ROWS, O_GROUP_IN], dtype=pl.BF16)
     attn_out = pl.create_tensor([t_dim, D], dtype=pl.BF16)

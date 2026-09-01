@@ -62,10 +62,11 @@ KV_M_TILE = MATMUL_T_TILE  # kv_proj token (M) tile; decode pads from 8 real row
 KV_N_TILE = 128  # kv_proj HEAD_DIM (N) per matmul
 KV_K_TILE = 256  # kv_proj D (K) reduction tile   | divides KV_SPLIT_K_TILE
 KV_OK = 2  # kv_proj split-K factor         | D//KV_OK cores share each N-group
+KV_OM = 4  # kv_proj split-M factor        | M-tiles fan out KV_OM-fold
 KV_SPLIT_K_TILE = D // KV_OK  # kv_proj K per split (=2048)
 QPROJ_M_TILE = 64  # dense qproj token tile; fills the 128 KiB L0C accumulator
 QPROJ_TAIL_M_TILE = MATMUL_T_TILE  # partial-M path validated by decode/small physical T
-KV_RMS_T_TILE = 8  # kv rms-norm + rope fused token (T) tile
+KV_RMS_T_TILE = 16  # kv rms-norm + rope fused token (T) tile
 Q_ROPE_T_TILE = 8
 Q_ROPE_H_TILE = 4  # heads per fused qproj dequant/rms/rope task
 assert QPROJ_MM_N_TILE * QPROJ_M_TILE * 4 <= 128 * 1024  # L0C Acc cap
@@ -579,11 +580,14 @@ def kv_proj_rope(
                         kv_fp32[kts0 : kts0 + KV_M_TILE, kvseed0 : kvseed0 + KV_N_TILE] = kv_seed
 
             # `late_dep` fences kv_proj one hop behind rms_norm so qr_proj_matmul takes the cores first.
-            with pl.spmd((HEAD_DIM // KV_N_TILE) * KV_OK, name_hint="kv_proj_matmul", deps=[late_dep]) as _kv_tid:
+            with pl.spmd(
+                (HEAD_DIM // KV_N_TILE) * KV_OK * KV_OM, name_hint="kv_proj_matmul", deps=[late_dep],
+            ) as _kv_tid:
                 kbg = pl.tile.get_block_idx()
-                kv_col0 = (kbg // KV_OK) * KV_N_TILE
-                kv_k_base = (kbg % KV_OK) * KV_SPLIT_K_TILE
-                for t0 in pl.range(0, t_matmul, KV_M_TILE):
+                kv_col0 = (kbg // (KV_OK * KV_OM)) * KV_N_TILE
+                kv_k_base = ((kbg // KV_OM) % KV_OK) * KV_SPLIT_K_TILE
+                kv_m_group = kbg % KV_OM
+                for t0 in pl.range(kv_m_group * KV_M_TILE, t_matmul, KV_OM * KV_M_TILE):
                     kv_acc = pl.create_tensor([KV_M_TILE, KV_N_TILE], dtype=pl.FP32)
                     for db in pl.pipeline(KV_SPLIT_K_TILE // KV_K_TILE, stage=2):
                         d0 = kv_k_base + db * KV_K_TILE
