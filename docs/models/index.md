@@ -9,6 +9,7 @@ Files ending in `_draft.py` are work in progress and excluded from CI.
 | [deepseek_v4_flash_mtp](deepseek_v4_flash_mtp.md) | DeepSeek V4-Flash at MTP = 1, batch 4 per card: operators, layer and MTP compositions, prefill/decode full forwards | Supported — eight-card accuracy job on relevant PRs |
 | [deepseek_v4_pro](deepseek_v4_pro.md) | Ascend A5 DeepSeek V4-Pro with an optional Flash preset, quantized Hybrid MXFP8-MXFP4 | Not supported |
 | `deepseek_v4_flash_dspark` | The V4-Flash operators re-sized to batch 64 per card and S = 8 DSpark speculation; under development, operators only | Not supported |
+| `deepseek_v4_flash_lowlat` | The V4-Flash decode path at batch 1, S = 8 DSpark speculation, world 8: replicated attention, tensor-parallel MoE, embedding and LM head; under development, decode only | Not supported |
 
 The linked directories have a page covering their deployment configuration and
 how their files compose. The rest are kernel harnesses validated against the
