@@ -432,7 +432,19 @@ jobs:
             echo "::endgroup::"
           }
           # Sweep ONLY the V4-Pro variant — its dedicated A5 daily set.
+          #
+          # decode_fwd.py and prefill_fwd.py are out: under the Pro preset they
+          # hold every one of the 61 layers' routed-expert weights resident on
+          # each rank — 48 experts x 63.0 MiB x 61 = 180.1 GiB against a 128 GiB
+          # card — and die uploading them with `rtMalloc failed: 207001`
+          # (ACL_ERROR_RT_MEMORY_ALLOCATION). The failing 60.05 GiB request is
+          # half of the layer-stacked w13 tensor, so it is the shape of the
+          # resident set, not allocator behaviour. `--ep` cannot help either:
+          # moe.py scales the global expert count with the world size, leaving
+          # 48 experts per rank at both --ep 2 and --ep 8. Re-add them once the
+          # drivers stop keeping all 61 layers resident.
           for f in $(find models/deepseek_v4_pro -name '*.py' ! -name '*_draft.py' \
+              ! -name 'decode_fwd.py' ! -name 'prefill_fwd.py' \
               ! -name 'synthetic_token_loop.py' | sort); do
             # Skip shared modules with no __main__ guard (config.py, helper
             # libs): they are imported, not run.
