@@ -2,7 +2,7 @@
 
 `models/deepseek_v4_flash_mtp/` is the reference V4-Flash tree: the operators,
 the single-layer compositions, and the prefill/decode full forwards.
-[V4-Flash DSpark](../deepseek_v4_flash_dspark.md) is the same checkpoint at a
+[V4-Flash DSpark](../deepseek_v4_flash_dspark/index.md) is the same checkpoint at a
 second deployment point — wider batch, seven draft tokens, context-parallel
 attention.
 

@@ -484,7 +484,7 @@ jobs:
     # Real-weight DeepSeek-V4-Flash token generation on 8 Ascend 950 cards: the
     # models/deepseek_v4_pro drivers with the Flash config (--variant flash),
     # EP8/TP2, one prefill plus 32 greedy decode steps, driven by
-    # synthetic_token_loop.py exactly as docs/models/deepseek_v4_pro.md
+    # synthetic_token_loop.py exactly as docs/models/deepseek_v4_pro/index.md
     # ("End-to-end token generation") documents. The prefill has a fixed
     # 128-row capacity while active rows follow the encoded prompt length. It is the only
     # nightly that exercises the full prompt -> tokens -> text path on real

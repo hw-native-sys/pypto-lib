@@ -96,8 +96,8 @@ nav:
       - DeepSeek V4-Flash (MTP):
           - Model overview: models/deepseek_v4_flash_mtp/index.md
           - Decode optimization: models/deepseek_v4_flash_mtp/decode_optimization.md
-      - DeepSeek V4-Flash (DSpark): models/deepseek_v4_flash_dspark.md
-      - DeepSeek V4-Pro: models/deepseek_v4_pro.md
+      - DeepSeek V4-Flash (DSpark): models/deepseek_v4_flash_dspark/index.md
+      - DeepSeek V4-Pro: models/deepseek_v4_pro/index.md
   - Debug and Tune:
       - Overview: debug-and-tune/index.md
       - Debugging: debug-and-tune/debugging.md
