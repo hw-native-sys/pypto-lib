@@ -72,6 +72,7 @@ ROPE_TILE = 16
 ROPE_INTERLEAVE_TILE = 2 * ROPE_TILE
 ROPE_CS_T_TILE = 8
 T_PAD = ((T + 16 - 1) // 16) * 16
+MERGE_WORKERS = 48
 ATTENTION_PUBLISH_WORKERS = 48
 ATTENTION_PUBLISH_T_TILE = 8
 LOCAL_O_GROUPS = O_GROUPS // TP
@@ -95,6 +96,8 @@ if S % ROPE_CS_T_TILE != 0:
     raise ValueError("each request must contain complete inverse-RoPE token tiles")
 if H_TILE % HEADS_PER_GROUP != 0:
     raise ValueError(f"HCA head tile {H_TILE} must contain complete output groups")
+if PUBLISH_GROUPS != 2:
+    raise ValueError("HCA merge pack expects two output groups per head tile")
 if O_GROUPS % TP != 0:
     raise ValueError(f"output groups {O_GROUPS} must be divisible by TP size {TP}")
 if LOCAL_O_GROUPS % PUBLISH_GROUPS != 0:
@@ -116,9 +119,10 @@ def sparse_attn_hca(
     attn_sink: pl.Tensor[[H], pl.FP32],
     freqs_cos: pl.Tensor[[T_DYN, ROPE_DIM], pl.BF16],
     freqs_sin: pl.Tensor[[T_DYN, ROPE_DIM], pl.BF16],
+    o_packed_heads: pl.Tensor[[O_GROUPS * T_PAD, O_GROUP_IN], pl.BF16],
     cache_ready_dep: pl.Scalar[pl.TASK_ID],
 ):
-    """Run the raw and compressed branches, merge them, and build inverse-RoPE metadata."""
+    """Merge raw and compressed attention into grouped inverse-RoPE heads."""
     t_dim = pl.tensor.dim(q, 0)
     rope_cs_blocks = t_dim // ROPE_CS_T_TILE
     ori_block_num = pl.tensor.dim(ori_kv, 0)
@@ -144,10 +148,8 @@ def sparse_attn_hca(
     cmp_partial_o = pl.create_tensor([cmp_partial_rows, HEAD_DIM], dtype=pl.FP32)
     rope_cos_il = pl.create_tensor([T_PAD, ROPE_DIM], dtype=pl.FP32)
     rope_sin_signed = pl.create_tensor([T_PAD, ROPE_DIM], dtype=pl.FP32)
-    rope_swap_idx = pl.create_tensor([1, ROPE_DIM], dtype=pl.INT32)
     raw_branch_tids = pl.array.create(1, pl.TASK_ID)
     cmp_branch_tids = pl.array.create(1, pl.TASK_ID)
-    rope_swap_tids = pl.array.create(1, pl.TASK_ID)
     rope_cs_tids = pl.array.create(1, pl.TASK_ID)
 
     with pl.scope():
@@ -252,21 +254,6 @@ def sparse_attn_hca(
                 1.0,
             )
             pl.store(valid_mask, [valid_t0, 0], raw_valid)
-
-        with pl.spmd(1, name_hint="rope_swap") as rope_swap_tid:
-            sw_block = pl.tile.get_block_idx()
-            sw_one = pl.full([1, ROPE_DIM], dtype=pl.FP32, value=1.0)
-            sw_index_i32 = pl.arange(0, [1, ROPE_DIM], dtype=pl.INT32)
-            sw_index = pl.cast(sw_index_i32, target_type=pl.FP32)
-            sw_col = pl.col_expand_mul(sw_one, sw_index)
-            sw_dup = pl.mul(sw_col, 0.5)
-            sw_dup_i32 = pl.cast(sw_dup, target_type=pl.INT32, mode="trunc")
-            sw_dup_f = pl.cast(sw_dup_i32, target_type=pl.FP32)
-            sw_lane = pl.sub(sw_col, pl.mul(sw_dup_f, 2.0))
-            sw_next = pl.add(sw_col, 1.0)
-            sw_lane_offset = pl.mul(sw_lane, 2.0)
-            sw_swap = pl.sub(sw_next, sw_lane_offset)
-            rope_swap_idx[sw_block : sw_block + 1, 0:ROPE_DIM] = pl.cast(sw_swap, target_type=pl.INT32)
 
         with pl.spmd(HALF_ROPE // ROPE_TILE, name_hint="rope_cs") as rope_cs_tid:
             cp = pl.tile.get_block_idx()
@@ -388,7 +375,6 @@ def sparse_attn_hca(
                     pl.store(stream_o_new, [stream_state_row, 0], stream_heads)
 
         raw_branch_tids[0] = raw_heads_tid
-        rope_swap_tids[0] = rope_swap_tid
         rope_cs_tids[0] = rope_cs_tid
 
     with pl.scope():
@@ -509,62 +495,110 @@ def sparse_attn_hca(
         cmp_branch_tids[0] = cmp_qk_tid
 
     with pl.spmd(
-        stream_block_count,
-        name_hint="hca_stream_merge",
-        deps=[raw_branch_tids[0], cmp_branch_tids[0]],
-    ) as stream_heads_tid:
-        stream_idx = pl.tile.get_block_idx()
-        stream_t = stream_idx // (H // H_TILE)
-        stream_h_tile = stream_idx - stream_t * (H // H_TILE)
-        stream_h0 = stream_h_tile * H_TILE
-        stream_state_row = stream_t * H + stream_h0
-        stream_m = pl.load(stream_state_m, [stream_state_row, 0], [H_TILE, 1], target_memory=pl.MemorySpace.Vec)
-        stream_l = pl.load(stream_state_l, [stream_state_row, 0], [H_TILE, 1], target_memory=pl.MemorySpace.Vec)
-        stream_o = pl.load(stream_heads, [stream_state_row, 0], [H_TILE, HEAD_DIM], target_memory=pl.MemorySpace.Vec)
-        stream_token_base = stream_t * (H // H_TILE) * cmp_work_count * H_TILE
-        for stream_work in pl.range(cmp_work_count):
-            stream_partial_row = (stream_token_base + stream_h_tile * cmp_work_count * H_TILE + stream_work * H_TILE)
-            stream_cmp_m_aligned = pl.load(
-                cmp_partial_m,
-                [stream_partial_row, 0],
-                [H_TILE, 8],
+        MERGE_WORKERS,
+        name_hint="hca_stream_merge_pack",
+        deps=[raw_branch_tids[0], cmp_branch_tids[0], rope_cs_tids[0]],
+    ) as heads_tid:
+        worker = pl.tile.get_block_idx()
+        for stream_idx in pl.range(worker, stream_block_count, MERGE_WORKERS):
+            merge_t = stream_idx // (H // H_TILE)
+            merge_h_tile = stream_idx - merge_t * (H // H_TILE)
+            merge_h0 = merge_h_tile * H_TILE
+            merge_state_row = merge_t * H + merge_h0
+            stream_m = pl.load(stream_state_m, [merge_state_row, 0], [H_TILE, 1], target_memory=pl.MemorySpace.Vec)
+            stream_l = pl.load(stream_state_l, [merge_state_row, 0], [H_TILE, 1], target_memory=pl.MemorySpace.Vec)
+            stream_o = pl.load(stream_heads, [merge_state_row, 0], [H_TILE, HEAD_DIM], target_memory=pl.MemorySpace.Vec)
+            stream_token_base = merge_t * (H // H_TILE) * cmp_work_count * H_TILE
+            for stream_work in pl.range(cmp_work_count):
+                stream_partial_row = (
+                    stream_token_base
+                    + merge_h_tile * cmp_work_count * H_TILE
+                    + stream_work * H_TILE
+                )
+                stream_cmp_m_aligned = pl.load(
+                    cmp_partial_m,
+                    [stream_partial_row, 0],
+                    [H_TILE, 8],
+                    target_memory=pl.MemorySpace.Vec,
+                )
+                stream_cmp_l_aligned = pl.load(
+                    cmp_partial_l,
+                    [stream_partial_row, 0],
+                    [H_TILE, 8],
+                    target_memory=pl.MemorySpace.Vec,
+                )
+                stream_cmp_m = stream_cmp_m_aligned[0:H_TILE, 0:1]
+                stream_cmp_l = stream_cmp_l_aligned[0:H_TILE, 0:1]
+                stream_cmp_o = pl.load(
+                    cmp_partial_o,
+                    [stream_partial_row, 0],
+                    [H_TILE, HEAD_DIM],
+                    target_memory=pl.MemorySpace.Vec,
+                )
+                stream_m_new = pl.maximum(stream_m, stream_cmp_m)
+                stream_alpha = pl.exp(pl.sub(stream_m, stream_m_new))
+                stream_beta = pl.exp(pl.sub(stream_cmp_m, stream_m_new))
+                stream_l = pl.add(
+                    pl.mul(stream_alpha, stream_l),
+                    pl.mul(stream_beta, stream_cmp_l),
+                )
+                stream_o = pl.add(
+                    pl.row_expand_mul(stream_o, stream_alpha),
+                    pl.row_expand_mul(stream_cmp_o, stream_beta),
+                )
+                stream_m = stream_m_new
+            stream_sink = pl.load(
+                attn_sink_col,
+                [merge_h0, 0],
+                [H_TILE, 1],
                 target_memory=pl.MemorySpace.Vec,
             )
-            stream_cmp_l_aligned = pl.load(
-                cmp_partial_l,
-                [stream_partial_row, 0],
-                [H_TILE, 8],
-                target_memory=pl.MemorySpace.Vec,
+            stream_sink_tile = pl.add(pl.sub(stream_m, stream_m), stream_sink)
+            stream_denom = pl.add(stream_l, pl.exp(pl.sub(stream_sink_tile, stream_m)))
+            stream_output = pl.row_expand_div(stream_o, stream_denom)
+            pl.store(stream_output, [merge_state_row, 0], stream_heads)
+            packed_stream_output = stream_heads[merge_state_row : merge_state_row + H_TILE, 0:HEAD_DIM]
+            stream_bf16 = pl.cast(packed_stream_output, target_type=pl.BF16, mode="rint")
+            stream_rope = packed_stream_output[0:H_TILE, NOPE_DIM:HEAD_DIM]
+            stream_cos_il = rope_cos_il[merge_t : merge_t + 1, 0:ROPE_DIM]
+            stream_sin_signed = rope_sin_signed[merge_t : merge_t + 1, 0:ROPE_DIM]
+            stream_swap_one = pl.full([1, ROPE_DIM], dtype=pl.FP32, value=1.0)
+            stream_swap_index = pl.cast(pl.arange(0, [1, ROPE_DIM], dtype=pl.INT32), target_type=pl.FP32)
+            stream_swap_col = pl.col_expand_mul(stream_swap_one, stream_swap_index)
+            stream_swap_dup = pl.cast(
+                pl.mul(stream_swap_col, 0.5),
+                target_type=pl.INT32,
+                mode="trunc",
             )
-            stream_cmp_m = stream_cmp_m_aligned[0:H_TILE, 0:1]
-            stream_cmp_l = stream_cmp_l_aligned[0:H_TILE, 0:1]
-            stream_cmp_o = pl.load(
-                cmp_partial_o,
-                [stream_partial_row, 0],
-                [H_TILE, HEAD_DIM],
-                target_memory=pl.MemorySpace.Vec,
+            stream_swap_dup_f = pl.cast(stream_swap_dup, target_type=pl.FP32)
+            stream_swap_lane = pl.sub(stream_swap_col, pl.mul(stream_swap_dup_f, 2.0))
+            stream_swap = pl.sub(
+                pl.add(stream_swap_col, 1.0),
+                pl.mul(stream_swap_lane, 2.0),
             )
-            stream_m_new = pl.maximum(stream_m, stream_cmp_m)
-            stream_alpha = pl.exp(pl.sub(stream_m, stream_m_new))
-            stream_beta = pl.exp(pl.sub(stream_cmp_m, stream_m_new))
-            stream_l = pl.add(pl.mul(stream_alpha, stream_l), pl.mul(stream_beta, stream_cmp_l))
-            stream_o = pl.add(pl.row_expand_mul(stream_o, stream_alpha), pl.row_expand_mul(stream_cmp_o, stream_beta))
-            stream_m = stream_m_new
-        stream_sink = pl.load(attn_sink_col, [stream_h0, 0], [H_TILE, 1], target_memory=pl.MemorySpace.Vec)
-        stream_sink_tile = pl.add(pl.sub(stream_m, stream_m), stream_sink)
-        stream_denom = pl.add(stream_l, pl.exp(pl.sub(stream_sink_tile, stream_m)))
-        stream_output = pl.row_expand_div(stream_o, stream_denom)
-        pl.store(stream_output, [stream_state_row, 0], stream_heads)
+            stream_swap_row = pl.cast(stream_swap, target_type=pl.INT32)
+            stream_swap_zero = pl.full([H_TILE, ROPE_DIM], dtype=pl.INT32, value=0)
+            stream_swap_idx = pl.col_expand_add(stream_swap_zero, stream_swap_row)
+            stream_swapped = pl.gather(stream_rope, dim=-1, index=stream_swap_idx)
+            stream_rot = pl.add(
+                pl.col_expand_mul(stream_rope, stream_cos_il),
+                pl.col_expand_mul(stream_swapped, stream_sin_signed),
+            )
+            stream_rope_bf16 = pl.cast(stream_rot, target_type=pl.BF16, mode="rint")
+            stream_full_bf16 = pl.concat(
+                stream_bf16[0:H_TILE, 0:NOPE_DIM],
+                stream_rope_bf16,
+            )
+            for stream_hi in pl.unroll(H_TILE):
+                stream_head = merge_h0 + stream_hi
+                stream_pack_row = (stream_head // HEADS_PER_GROUP) * T_PAD + merge_t
+                stream_pack_col = (stream_head % HEADS_PER_GROUP) * HEAD_DIM
+                o_packed_heads[
+                    stream_pack_row : stream_pack_row + 1,
+                    stream_pack_col : stream_pack_col + HEAD_DIM,
+                ] = stream_full_bf16[stream_hi : stream_hi + 1, 0:HEAD_DIM]
 
-    return (
-        stream_heads,
-        rope_cos_il,
-        rope_sin_signed,
-        rope_swap_idx,
-        stream_heads_tid,
-        rope_swap_tids[0],
-        rope_cs_tids[0],
-    )
+    return o_packed_heads, heads_tid
 
 
 @pl.jit.inline(auto_scope=False)
@@ -584,11 +618,7 @@ def sparse_attn_hca_tp1(
     cache_ready_dep: pl.Scalar[pl.TASK_ID],
 ) -> tuple[pl.Tensor, pl.Scalar[pl.TASK_ID]]:
     """Write HCA heads as grouped ``[T_PAD, O_GROUP_IN]`` slabs."""
-    (
-        stream_heads,
-        rope_cos_il, rope_sin_signed, rope_swap_idx,
-        stream_heads_tid, rope_swap_tid, rope_cs_tid,
-    ) = sparse_attn_hca(
+    o_packed_heads, heads_tid = sparse_attn_hca(
         q,
         ori_kv,
         window_swa_indices,
@@ -600,43 +630,9 @@ def sparse_attn_hca_tp1(
         attn_sink,
         freqs_cos,
         freqs_sin,
+        o_packed_heads,
         cache_ready_dep,
     )
-    t_dim = pl.tensor.dim(q, 0)
-    stream_block_count = t_dim * (H // H_TILE)
-
-    with pl.spmd(
-        stream_block_count,
-        name_hint="hca_stream_pack",
-        deps=[stream_heads_tid, rope_swap_tid, rope_cs_tid],
-    ) as heads_tid:
-        stream_idx = pl.tile.get_block_idx()
-        stream_t = stream_idx // (H // H_TILE)
-        stream_h_tile = stream_idx - stream_t * (H // H_TILE)
-        stream_h0 = stream_h_tile * H_TILE
-        stream_state_row = stream_t * H + stream_h0
-        stream_output = stream_heads[stream_state_row : stream_state_row + H_TILE, 0:HEAD_DIM]
-        stream_bf16 = pl.cast(stream_output, target_type=pl.BF16, mode="rint")
-        stream_rope = stream_output[0:H_TILE, NOPE_DIM:HEAD_DIM]
-        stream_cos_il = rope_cos_il[stream_t : stream_t + 1, 0:ROPE_DIM]
-        stream_sin_signed = rope_sin_signed[stream_t : stream_t + 1, 0:ROPE_DIM]
-        stream_swap_zero = pl.full([H_TILE, ROPE_DIM], dtype=pl.INT32, value=0)
-        stream_swap_idx = pl.col_expand_add(stream_swap_zero, rope_swap_idx[0:1, 0:ROPE_DIM])
-        stream_swapped = pl.gather(stream_rope, dim=-1, index=stream_swap_idx)
-        stream_rot = pl.add(
-            pl.col_expand_mul(stream_rope, stream_cos_il),
-            pl.col_expand_mul(stream_swapped, stream_sin_signed),
-        )
-        n_rope_bf16 = pl.cast(stream_rot, target_type=pl.BF16, mode="rint")
-        n_full_bf16 = pl.concat(stream_bf16[0:H_TILE, 0:NOPE_DIM], n_rope_bf16)
-        for n_hi in pl.unroll(H_TILE):
-            n_head = stream_h0 + n_hi
-            n_pack_row = (n_head // HEADS_PER_GROUP) * T_PAD + stream_t
-            n_col = (n_head % HEADS_PER_GROUP) * HEAD_DIM
-            o_packed_heads[
-                n_pack_row : n_pack_row + 1,
-                n_col : n_col + HEAD_DIM,
-            ] = n_full_bf16[n_hi : n_hi + 1, 0:HEAD_DIM]
 
     return o_packed_heads, heads_tid
 
