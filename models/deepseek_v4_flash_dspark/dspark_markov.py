@@ -957,7 +957,7 @@ def golden_distributed_markov(tensors):
 
 if __name__ == "__main__":
     import argparse
-    from golden import run_jit
+    from golden import run
 
     parser = argparse.ArgumentParser(description="Validate the DeepSeek V4 DSpark Markov sampler.")
     parser.add_argument("--batch", type=int, choices=DSPARK_SUPPORTED_BATCHES, default=4)
@@ -988,7 +988,7 @@ if __name__ == "__main__":
     else:
         runtime_cfg["device_id"] = int(args.device)
 
-    result = run_jit(
+    result = run(
         fn=fn,
         specs=build_tensor_specs(args.batch, distributed=args.distributed),
         golden_fn=golden_fn,

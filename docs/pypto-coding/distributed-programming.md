@@ -342,7 +342,7 @@ The harness compiles an L3 program when `compile_cfg` carries a
 ```python
 from pypto.ir.distributed_compiled_program import DistributedConfig
 
-result = run_jit(
+result = run(
     fn=l3_moe,                                  # the @pl.jit.host driver
     specs=build_tensor_specs(),
     golden_fn=golden_moe,

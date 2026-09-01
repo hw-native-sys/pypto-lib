@@ -108,7 +108,7 @@ def build_tensor_specs(batch=DECODE_BATCH // TP, seq=DECODE_SEQ):
 
 if __name__ == "__main__":
     import argparse
-    from golden import ratio_allclose, run_jit
+    from golden import ratio_allclose, run
 
     parser = argparse.ArgumentParser(description="DeepSeek-V4 DSpark main-hidden projection validation.")
     parser.add_argument("-p", "--platform", type=str, default="a2a3", choices=["a2a3", "a2a3sim", "a5", "a5sim"])
@@ -125,7 +125,7 @@ if __name__ == "__main__":
     for mode in (modes if args.mode == "all" else [args.mode]):
         batch, seq = modes[mode]
         print(f"--- dspark_proj_test {mode}: T={batch * seq} ---")
-        result = run_jit(
+        result = run(
             fn=dspark_proj_test,
             specs=build_tensor_specs(batch, seq),
             golden_fn=golden_dspark_proj,

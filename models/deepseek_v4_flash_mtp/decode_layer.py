@@ -875,7 +875,7 @@ def build_tensor_specs(start_pos=DECODE_START_POS, layer_id=10):
 
 if __name__ == "__main__":
     import argparse
-    from golden import ratio_allclose, ratio_reldiff, run_jit
+    from golden import ratio_allclose, ratio_reldiff, run
 
     parser = argparse.ArgumentParser()
     parser.add_argument("-p", "--platform", type=str, default="a2a3",
@@ -899,7 +899,7 @@ if __name__ == "__main__":
     host_fn = l3_decode_layer
     golden_fn = golden_decode_layer_auto
 
-    result = run_jit(
+    result = run(
         fn=host_fn,
         specs=build_tensor_specs(
             start_pos=args.start_pos,

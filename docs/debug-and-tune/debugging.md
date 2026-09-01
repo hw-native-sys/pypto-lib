@@ -7,7 +7,7 @@ does), [performance-tuning.md](performance-tuning.md) (perf), and
 [precision-tuning.md](precision-tuning.md) (numerical fidelity — cast modes,
 dtype alignment, the `error_distribution` sweep).
 
-The harness exposes most of these as both a `run` / `run_jit` kwarg and a
+The harness exposes most of these as both a `run` kwarg and a
 CLI flag; a typical model `__main__` wires them up like:
 
 ```python
@@ -18,7 +18,7 @@ parser.add_argument(
 )
 parser.add_argument("--enable-dep-gen", action="store_true")
 ...
-result = run_jit(
+result = run(
     fn=indexer_test,
     specs=build_tensor_specs(...),
     golden_fn=golden_indexer,
@@ -43,17 +43,17 @@ location. Most compile failures are fixed at the cited site without any
 further tooling; read the message before reaching for the heavier
 mechanisms below.
 
-- **Compile failure** — `golden.run_jit` constructs a `RunConfig`, whose
-  default is `dump_passes=False`; pass `compile_cfg=dict(dump_passes=True)` to
-  write per-pass IR under `build_output/<...>/passes_dump/`. `golden.run`
-  calls `ir.compile` directly, whose default `dump_passes=True` writes those
-  files already. Diff the last clean pass against the first failing one to see
-  which pass rejected the IR. `report/` holds scheduling diagnostics.
+- **Compile failure** — a `@pl.jit` kernel compiles through a `RunConfig`,
+  whose default is `dump_passes=False`; pass `compile_cfg=dict(dump_passes=True)`
+  to write per-pass IR under `build_output/<...>/passes_dump/`. A `@pl.program`
+  kernel goes through `ir.compile`, whose default `dump_passes=True` writes
+  those files already. Diff the last clean pass against the first failing one to
+  see which pass rejected the IR. `report/` holds scheduling diagnostics.
 - **PTOAS failure** — the error quotes the `.pto` op.
   `compile_cfg=dict(skip_ptoas=True)` keeps the raw `.pto` MLIR and stops
   before the C++ wrapper, isolating whether the regression is in PyPTO's
   IR-to-MLIR path or in PTOAS. It is an `ir.compile` kwarg, not a `RunConfig`
-  field, so `golden.run` accepts it and `golden.run_jit` does not.
+  field, so it works on a `@pl.program` kernel only.
 - **Runtime crash** — rerun on the matching simulator (`-p a2a3sim` /
   `a5sim`); it gives more diagnostic output than the device backend and
   reproduces most lowering bugs.
@@ -182,7 +182,7 @@ pl.dump_tag(h_tile_i8)          # capture this one tensor under partial dump
 ```
 
 ```python
-run_jit(..., runtime_cfg=dict(platform=..., enable_dump_args=1))
+run(..., runtime_cfg=dict(platform=..., enable_dump_args=1))
 ```
 
 `pl.dump_tag` works on plain function args and on internal
@@ -201,7 +201,7 @@ python -m simpler_setup.tools.dump_viewer <build_output/.../dfx_outputs/args_dum
 ```
 
 Pass the dump dir **explicitly** — with no argument the viewer looks under
-`./outputs/*/args_dump`, but `run_jit` writes to
+`./outputs/*/args_dump`, but `run` writes to
 `build_output/<...>/dfx_outputs/args_dump`.
 
 This section is the dump *mechanism*. For the end-to-end
@@ -239,7 +239,7 @@ round-trip, which drops the read-dep and lets the downstream task race).
 
 | Symptom | Tool | Kwarg / flag |
 |---------|------|--------------|
-| Compile / PTOAS error | `passes_dump/`; `skip_ptoas` for `golden.run` only | `compile_cfg=dict(dump_passes=True)`; with `run`, `compile_cfg=dict(skip_ptoas=True)` |
+| Compile / PTOAS error | `passes_dump/`; `skip_ptoas` on a `@pl.program` kernel only | `compile_cfg=dict(dump_passes=True)`; `compile_cfg=dict(skip_ptoas=True)` |
 | Need to reproduce on the same inputs | golden-data replay (§2) | `golden_data=` / `--golden-data` |
 | Iterating on generated `.cpp` / `.pto` | runtime-dir reuse (§3) | `runtime_dir=` / `--runtime-dir` |
 | Run hangs / deadlocks (§4) | device log | `runtime_cfg["log_level"]="v0"` + `ASCEND_PROCESS_LOG_PATH` |

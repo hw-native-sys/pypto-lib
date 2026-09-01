@@ -154,7 +154,7 @@ prefill — size the rings explicitly. Each knob takes either a scalar
 this ring at the compile default". Precedence is just two tiers now:
 `RunConfig` field > compile default.
 
-**This works on the L3 (distributed) path only.** golden's `run_jit` forwards
+**This works on the L3 (distributed) path only.** golden's `run` forwards
 whatever `runtime_cfg` keys are `RunConfig` fields to the per-rank dispatch,
 which builds a `CallConfig` and transcribes the ring sizes into
 `runtime_env`:
@@ -175,7 +175,7 @@ Live examples: [`models/deepseek_v4_pro/prefill_fwd.py`](../../models/deepseek_v
 An L2 (single-chip) entry cannot size its rings today, whichever way it is
 dispatched:
 
-- Through golden's `run_jit`, the single-chip path calls
+- Through golden's `run`, the single-chip path calls
   `execute_compiled(work_dir, args, ...)`, which has no ring parameters — a
   `runtime_cfg["ring_heap"]` raises `TypeError`.
 - Through `CompiledProgram.__call__(*args, config=RunConfig(ring_heap=...))`,

@@ -13,7 +13,7 @@ The file contains four parts:
 1. a module-level `@pl.jit` kernel;
 2. `TensorSpec` and `ScalarSpec` inputs for the Golden Harness;
 3. a PyTorch golden function;
-4. a CLI that calls `golden.run_jit` and exits non-zero on failure.
+4. a CLI that calls `golden.run` and exits non-zero on failure.
 
 ## Run on the A2/A3 simulator
 

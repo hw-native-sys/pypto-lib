@@ -26,7 +26,7 @@ from moe import N_RANKS
 if __name__ == "__main__":
     import argparse
 
-    from golden import run_jit
+    from golden import run
 
     parser = argparse.ArgumentParser(description="Validate DeepSeek V4 DSpark prompt prefill and drafting.")
     parser.add_argument("--batch", type=int, choices=DSPARK_SUPPORTED_BATCHES, default=4)
@@ -42,7 +42,7 @@ if __name__ == "__main__":
     assert args.tp == TP_SIZE
     assert args.ep == N_RANKS
     assert len(device_ids) >= N_RANKS
-    result = run_jit(
+    result = run(
         fn=l3_dspark_drafter,
         specs=build_tensor_specs(args.batch, mode="prefill"),
         golden_fn=golden_dspark_drafter,

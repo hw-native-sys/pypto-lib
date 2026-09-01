@@ -14,7 +14,7 @@ import argparse
 
 import pypto.language as pl
 import pypto.language.distributed as pld
-from golden import mapped_pool_ratio_reldiff, ratio_reldiff, run_jit
+from golden import mapped_pool_ratio_reldiff, ratio_reldiff, run
 from pypto.ir.distributed_compiled_program import DistributedConfig
 
 import config
@@ -582,7 +582,7 @@ def main():
     if len(device_ids) < N_RANKS:
         raise ValueError(f"need at least {N_RANKS} devices, got {device_ids}")
 
-    result = run_jit(
+    result = run(
         fn=l3_mtp_prefill_fwd,
         specs=build_tensor_specs(start_pos=args.start_pos, num_tokens=args.num_tokens),
         golden_fn=golden_mtp_prefill_fwd,

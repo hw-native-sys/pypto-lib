@@ -1095,7 +1095,7 @@ if __name__ == "__main__":
     import argparse
     import torch
 
-    from golden import run_jit
+    from golden import run
 
     parser = argparse.ArgumentParser()
     parser.add_argument("-p", "--platform", type=str, default="a2a3",
@@ -1143,7 +1143,7 @@ if __name__ == "__main__":
         ),
     }
 
-    result = run_jit(
+    result = run(
         fn=l3_moe,
         specs=build_tensor_specs(
             layer_id=args.layer_id,

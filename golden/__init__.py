@@ -42,7 +42,7 @@ def _configure_golden_threads() -> int:
 _GOLDEN_NUM_THREADS = _configure_golden_threads()
 
 
-from .runner import RunResult, run, run_jit
+from .runner import RunResult, run
 from .spec import ScalarSpec, TensorSpec
 from .validation import (
     error_distribution,
@@ -66,5 +66,4 @@ __all__ = [
     "topk_pair_compare",
     "RunResult",
     "run",
-    "run_jit",
 ]

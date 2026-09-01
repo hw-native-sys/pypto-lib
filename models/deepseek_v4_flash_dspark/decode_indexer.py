@@ -1273,7 +1273,7 @@ def build_tensor_specs(start_pos=None, batch=B):
 
 if __name__ == "__main__":
     import argparse
-    from golden import ratio_allclose, run_jit, topk_pair_compare
+    from golden import ratio_allclose, run, topk_pair_compare
 
     parser = argparse.ArgumentParser()
     parser.add_argument("-p", "--platform", type=str, default="a2a3",
@@ -1303,7 +1303,7 @@ if __name__ == "__main__":
             )
         start_pos = start_values[0] if len(start_values) == 1 else start_values
 
-    result = run_jit(
+    result = run(
         fn=indexer_test,
         specs=build_tensor_specs(start_pos, batch=args.batch),
         golden_fn=golden_indexer,

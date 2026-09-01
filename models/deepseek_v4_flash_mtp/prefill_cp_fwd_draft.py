@@ -187,7 +187,7 @@ from prefill_cp_exchange import (
     STATE_RECORDS_PER_WINDOW,
     STATE_WINDOW_ROWS,
 )
-from golden import TensorSpec, run_jit
+from golden import TensorSpec, run
 # Phase 3 final tail: HC head + final RMSNorm (inlined in the FWD child) and
 # the LM head (host-launched per rank). All are accepted leaf math; only the
 # composition is added here.
@@ -3109,7 +3109,7 @@ if __name__ == "__main__":
         golden_fn = None
         compare_fn = None
 
-    result = run_jit(
+    result = run(
         fn=l3_prefill_cp_fwd,
         specs=specs,
         golden_fn=golden_fn,

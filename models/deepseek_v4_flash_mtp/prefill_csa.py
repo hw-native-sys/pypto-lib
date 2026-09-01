@@ -953,7 +953,7 @@ def _quant_w_per_output_channel_local(w):
 
 if __name__ == "__main__":
     import argparse
-    from golden import ratio_allclose, ratio_reldiff, run_jit
+    from golden import ratio_allclose, ratio_reldiff, run
 
     parser = argparse.ArgumentParser(description="Standalone DeepSeek V4 packed prefill CSA correctness test.")
     parser.add_argument("-p", "--platform", type=str, default="a2a3", choices=["a2a3", "a2a3sim", "a5", "a5sim"])
@@ -977,7 +977,7 @@ if __name__ == "__main__":
     # elements), but keep the 0.5% fraction bar identical to full prefill.
     x_out_diff_thd, x_out_max_diff = (8e-3, 2) if args.start_pos else (5e-3, 1)
 
-    result = run_jit(
+    result = run(
         fn=prefill_attention_csa_test,
         specs=build_tensor_specs(
             args.start_pos,

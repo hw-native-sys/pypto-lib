@@ -15,7 +15,7 @@ import os
 
 import pypto.language as pl
 import pypto.language.distributed as pld
-from golden import ScalarSpec, TensorSpec, ratio_allclose, ratio_reldiff, run_jit
+from golden import ScalarSpec, TensorSpec, ratio_allclose, ratio_reldiff, run
 from pypto.ir.distributed_compiled_program import DistributedConfig
 
 from moe import (
@@ -1053,7 +1053,7 @@ def main():
     import torch
 
     torch.manual_seed(args.seed)
-    result = run_jit(
+    result = run(
         fn=l3_prefill_layer,
         specs=build_tensor_specs(args.layer_id, start_pos=args.start_pos, token_count=args.token_count),
         golden_fn=golden_prefill_layer,

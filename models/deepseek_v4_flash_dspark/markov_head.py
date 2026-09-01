@@ -131,7 +131,7 @@ def build_tensor_specs(token_count, vocab_size):
 
 if __name__ == "__main__":
     import argparse
-    from golden import ratio_allclose, run_jit
+    from golden import ratio_allclose, run
 
     TEST_VOCAB_SIZE = 4096
 
@@ -144,7 +144,7 @@ if __name__ == "__main__":
     parser.add_argument("--dump-passes", action="store_true", default=False)
     args = parser.parse_args()
 
-    result = run_jit(
+    result = run(
         fn=markov_head_test,
         specs=build_tensor_specs(args.token_count, args.vocab_size),
         golden_fn=golden_markov_head,

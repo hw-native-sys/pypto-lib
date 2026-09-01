@@ -714,7 +714,7 @@ def golden_mtp_decode_layer(tensors):
 def main():
     import torch
 
-    from golden import mapped_pool_ratio_reldiff, run_jit
+    from golden import mapped_pool_ratio_reldiff, run
 
     parser = argparse.ArgumentParser(description="DeepSeek-V4 MTP decode layer driver.")
     parser.add_argument("-p", "--platform", type=str, default="a2a3",
@@ -738,7 +738,7 @@ def main():
     device_ids = [int(d) for d in args.device.split(",")]
     assert len(device_ids) >= N_RANKS, f"need at least {N_RANKS} devices, got {device_ids}"
 
-    result = run_jit(
+    result = run(
         fn=l3_mtp_decode_layer,
         specs=build_tensor_specs(start_pos=args.start_pos, num_tokens=args.num_tokens),
         golden_fn=golden_mtp_decode_layer,

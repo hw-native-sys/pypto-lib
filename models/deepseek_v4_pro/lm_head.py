@@ -619,7 +619,7 @@ def compare_sampled_ids(actual, _expected, *, actual_outputs, **_):
 
 if __name__ == "__main__":
     import argparse
-    from golden import run_jit
+    from golden import run
 
     parser = argparse.ArgumentParser()
     parser.add_argument("-p", "--platform", type=str, default="a2a3",
@@ -655,7 +655,7 @@ if __name__ == "__main__":
         "sampled_ids": compare_sampled_ids,
     }
 
-    result = run_jit(
+    result = run(
         fn=fn,
         specs=specs,
         golden_fn=golden_fn,

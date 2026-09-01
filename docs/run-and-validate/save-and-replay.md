@@ -29,10 +29,10 @@ failure is the explicit goal.
 
 ## Harness API
 
-`run` and `run_jit` share two keyword arguments:
+`run` takes two keyword arguments for this:
 
 ```python
-result = run_jit(
+result = run(
     fn=kernel,
     specs=specs,
     golden_fn=golden_fn,
@@ -66,7 +66,7 @@ parser.add_argument(
 )
 ```
 
-Then forward `args.save_data` and `args.golden_data` to `run` or `run_jit`.
+Then forward `args.save_data` and `args.golden_data` to `run`.
 Do not assume every existing entry point already exposes both flags; check its
 `--help` and call site.
 

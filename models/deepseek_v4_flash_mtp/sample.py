@@ -643,7 +643,7 @@ def golden_sample(tensors):
 if __name__ == "__main__":
     import argparse
 
-    from golden import run_jit
+    from golden import run
 
     parser = argparse.ArgumentParser()
     parser.add_argument(
@@ -660,7 +660,7 @@ if __name__ == "__main__":
 
     if args.temperature is not None and args.temperature < 0.0:
         parser.error(f"--temperature must be non-negative, got {args.temperature}")
-    result = run_jit(
+    result = run(
         fn=sample_test,
         specs=build_tensor_specs(args.temperature, args.top_k),
         golden_fn=golden_sample,

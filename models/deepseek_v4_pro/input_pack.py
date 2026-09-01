@@ -108,7 +108,7 @@ def build_tensor_specs(token_count, vocab_size):
 
 if __name__ == "__main__":
     import argparse
-    from golden import run_jit
+    from golden import run
 
     modes = {"decode": DECODE_TOKENS, "prefill": PREFILL_TOKENS}
     test_vocab_size = 256
@@ -130,7 +130,7 @@ if __name__ == "__main__":
     for mode_name in modes_to_run:
         token_count = modes[mode_name]
         print(f"--- pack_x_hc_test {mode_name}: T={token_count} ---")
-        result = run_jit(
+        result = run(
             fn=pack_x_hc_test,
             specs=build_tensor_specs(token_count, test_vocab_size),
             golden_fn=golden_pack_x_hc,

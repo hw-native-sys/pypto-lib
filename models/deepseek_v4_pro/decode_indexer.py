@@ -1033,7 +1033,7 @@ if __name__ == "__main__":
         mapped_idx_cache_ratio_allclose,
         mapped_inner_state_ratio_allclose,
     )
-    from golden import run_jit
+    from golden import run
 
     parser = argparse.ArgumentParser()
     parser.add_argument("-p", "--platform", type=str, default="a2a3",
@@ -1048,7 +1048,7 @@ if __name__ == "__main__":
     parser.add_argument("--dump-passes", action="store_true", default=False)
     args = parser.parse_args()
 
-    result = run_jit(
+    result = run(
         fn=indexer_test,
         specs=build_tensor_specs(args.start_pos),
         golden_fn=golden_indexer,

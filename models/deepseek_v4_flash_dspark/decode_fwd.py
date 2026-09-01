@@ -1650,7 +1650,7 @@ def _parse_start_pos(raw):
 def main():
     import argparse
 
-    from golden import run_jit
+    from golden import run
     from pypto.ir.distributed_compiled_program import DistributedConfig
 
     parser = argparse.ArgumentParser(description="DeepSeek-V4 D-Spark decode-forward integration")
@@ -1703,7 +1703,7 @@ def main():
 
     runtime_case = None if weight_bank_size == MAIN_LAYER_COUNT else args.runtime_case
     specs = build_tensor_specs(start_pos=start_pos, weight_bank_size=weight_bank_size, runtime_case=runtime_case)
-    result = run_jit(
+    result = run(
         fn=l3_decode_fwd,
         specs=specs,
         save_data=args.save_data,

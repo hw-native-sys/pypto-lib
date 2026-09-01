@@ -22,7 +22,7 @@ from unittest.mock import MagicMock, patch
 
 import pytest
 import torch
-from golden import ScalarSpec, TensorSpec, run, run_jit
+from golden import ScalarSpec, TensorSpec, run
 from golden.runner import (
     RunResult,
     _backend_for_platform,
@@ -183,7 +183,7 @@ class TestGoldenDataCacheHit:
         compile_p, exec_p = _patch_compile_and_execute(compiled_dir, write_outputs)
         with compile_p, exec_p, patch.object(TensorSpec, "create_tensor", _no_create_tensor):
             r = run(
-                program=object(),
+                fn=object(),
                 specs=three_kinds_specs,
                 golden_fn=golden_fn_should_not_run,
                 golden_data=str(populated_cache),
@@ -208,7 +208,7 @@ class TestGoldenDataCacheHit:
         compile_p, exec_p = _patch_compile_and_execute(compiled_dir, write_outputs)
         with compile_p, exec_p:
             r = run(
-                program=object(),
+                fn=object(),
                 specs=three_kinds_specs,
                 golden_fn=None,
                 golden_data=str(populated_cache),
@@ -230,7 +230,7 @@ class TestGoldenDataCacheHit:
         compile_p, exec_p = _patch_compile_and_execute(compiled_dir, write_outputs)
         with compile_p, exec_p:
             r = run(
-                program=object(),
+                fn=object(),
                 specs=three_kinds_specs,
                 golden_fn=None,
                 golden_data=str(populated_cache),
@@ -261,7 +261,7 @@ class TestGoldenDataCacheHit:
         with patch("pypto.ir.compile", return_value=fake), \
              patch("pypto.runtime.execute_compiled", side_effect=capture_execute):
             r = run(
-                program=object(),
+                fn=object(),
                 specs=three_kinds_specs,
                 golden_fn=None,
                 golden_data=str(populated_cache),
@@ -284,7 +284,7 @@ class TestGoldenDataCacheMiss:
         compile_p, exec_p = _patch_compile_and_execute(compiled_dir)
         with compile_p, exec_p:
             r = run(
-                program=object(),
+                fn=object(),
                 specs=three_kinds_specs,
                 golden_fn=lambda t: None,
                 golden_data=str(empty),
@@ -308,7 +308,7 @@ class TestGoldenDataCacheMiss:
         compile_p, exec_p = _patch_compile_and_execute(compiled_dir)
         with compile_p, exec_p:
             r = run(
-                program=object(),
+                fn=object(),
                 specs=three_kinds_specs,
                 golden_fn=None,
                 golden_data=str(partial),
@@ -346,7 +346,7 @@ class TestGoldenFnPath:
         with patch("pypto.ir.compile", return_value=fake), \
              patch("pypto.runtime.execute_compiled", side_effect=fake_execute):
             r = run(
-                program=object(),
+                fn=object(),
                 specs=three_kinds_specs,
                 golden_fn=golden_fn,
                 save_data=True,
@@ -386,7 +386,7 @@ class TestGoldenFnPath:
         with patch("pypto.ir.compile", return_value=fake), \
              patch("pypto.runtime.execute_compiled", side_effect=fake_execute):
             r = run(
-                program=object(),
+                fn=object(),
                 specs=three_kinds_specs,
                 golden_fn=golden_fn,
             )
@@ -412,7 +412,7 @@ class TestGoldenFnPath:
         with patch("pypto.ir.compile", return_value=fake), \
              patch("pypto.runtime.execute_compiled", side_effect=bad_execute):
             r = run(
-                program=object(),
+                fn=object(),
                 specs=three_kinds_specs,
                 golden_fn=golden_fn,
             )
@@ -444,7 +444,7 @@ class TestSaveData:
         with patch("pypto.ir.compile", return_value=fake), \
              patch("pypto.runtime.execute_compiled", side_effect=fake_execute):
             r = run(
-                program=object(),
+                fn=object(),
                 specs=three_kinds_specs,
                 golden_fn=golden_fn,
                 save_data=False,
@@ -471,7 +471,7 @@ class TestNoValidation:
         with patch("pypto.ir.compile", return_value=fake), \
              patch("pypto.runtime.execute_compiled", side_effect=fake_execute):
             r = run(
-                program=object(),
+                fn=object(),
                 specs=three_kinds_specs,
                 golden_fn=None,
                 golden_data=None,
@@ -503,7 +503,7 @@ class TestCompileOnly:
         with patch("pypto.ir.compile", return_value=fake), \
              patch("pypto.runtime.execute_compiled", side_effect=exec_must_not_run):
             r = run(
-                program=object(),
+                fn=object(),
                 specs=three_kinds_specs,
                 compile_only=True,
                 golden_fn=golden_fn_must_not_run,
@@ -520,7 +520,7 @@ class TestCompileOnly:
             ScalarSpec("duplicate", torch.int32, 0),
         ]
         with patch("pypto.ir.compile") as compile_fn:
-            result = run(program=object(), specs=specs, compile_only=True)
+            result = run(fn=object(), specs=specs, compile_only=True)
 
         assert not result.passed
         assert "duplicate spec names" in result.error
@@ -545,7 +545,7 @@ class TestCompileOnly:
             patch.object(TensorSpec, "create_tensor") as create_tensor,
             patch("pypto.runtime.execute_compiled") as execute,
         ):
-            result = run(program=object(), specs=specs, compile_only=True)
+            result = run(fn=object(), specs=specs, compile_only=True)
 
         assert not result.passed
         assert "shape" in (result.error or "")
@@ -585,7 +585,7 @@ class TestRunJitCompileRuntime:
                 create=True,
             ),
         ):
-            result = run_jit(
+            result = run(
                 fn,
                 specs,
                 compile_cfg={"dump_passes": False},
@@ -605,7 +605,7 @@ class TestRunJitCompileRuntime:
 
     def test_stepped_scalar_requires_runtime_compilation(self):
         fn = types.SimpleNamespace(compile=MagicMock())
-        result = run_jit(
+        result = run(
             fn,
             [ScalarSpec("epoch", torch.int32, 0, benchmark_step=1)],
             compile_only=True,
@@ -619,7 +619,7 @@ class TestRunJitCompileRuntime:
         # Both the current key and its pre-rename spelling arm the guard.
         for key in ("enable_chip_swimlane", "enable_l2_swimlane"):
             fn = types.SimpleNamespace(compile=MagicMock())
-            result = run_jit(
+            result = run(
                 fn,
                 [
                     ScalarSpec(
@@ -643,7 +643,7 @@ class TestRunJitCompileRuntime:
             ScalarSpec("duplicate", torch.int32, 0, compile_runtime=True),
         ]
 
-        result = run_jit(fn, specs, compile_only=True)
+        result = run(fn, specs, compile_only=True)
 
         assert not result.passed
         assert "duplicate spec names" in result.error
@@ -671,7 +671,7 @@ class TestRunJitCompileRuntime:
         fn = types.SimpleNamespace(compile=MagicMock(return_value=compiled))
 
         with _l3_abi_environment():
-            result = run_jit(
+            result = run(
                 fn,
                 [ScalarSpec("epoch", torch.int32, 0, compile_runtime=True)],
                 compile_only=True,
@@ -709,7 +709,7 @@ class TestRunJitCompileRuntime:
             patch.object(TensorSpec, "create_tensor") as create_tensor,
             patch("pypto.runtime.execute_compiled") as execute,
         ):
-            result = run_jit(fn, specs, compile_only=True)
+            result = run(fn, specs, compile_only=True)
 
         assert result.passed is passed
         if not passed:
@@ -735,7 +735,7 @@ class TestRunJitCompileRuntime:
         fn = types.SimpleNamespace(compile=MagicMock(return_value=compiled))
 
         with _l3_abi_environment(), patch("golden.runner._is_l3", return_value=False):
-            result = run_jit(
+            result = run(
                 fn,
                 [
                     TensorSpec("a", [4], torch.float32),
@@ -795,7 +795,7 @@ class TestRunJitCompileRuntime:
             patch.object(TensorSpec, "create_tensor") as create_tensor,
             patch("pypto.runtime.execute_compiled") as execute,
         ):
-            result = run_jit(fn, specs, compile_only=True)
+            result = run(fn, specs, compile_only=True)
 
         assert not result.passed
         assert error in (result.error or "")
@@ -826,7 +826,7 @@ class TestRunJitCompileRuntime:
         fn = types.SimpleNamespace(compile=MagicMock(return_value=compiled))
 
         with _l3_abi_environment():
-            result = run_jit(
+            result = run(
                 fn,
                 [
                     TensorSpec("x", [4], torch.float32),
@@ -866,7 +866,7 @@ class TestRunJitCompileRuntime:
         with patch.object(
             sys.modules["pypto.language"], "RUNTIME", runtime_marker, create=True
         ):
-            result = run_jit(
+            result = run(
                 fn,
                 specs,
                 golden_data=str(cache),
@@ -888,7 +888,7 @@ class TestRunJitCompileRuntime:
             compile=MagicMock(return_value=_FakeCompiled(compiled_dir))
         )
 
-        result = run_jit(
+        result = run(
             fn,
             [ScalarSpec("num_tokens", torch.int32, 4)],
             golden_data=str(cache),
@@ -912,7 +912,7 @@ class TestRunJitCompileRuntime:
             _save_tensors(cache / "in", {"num_tokens": cached})
         fn = types.SimpleNamespace(compile=MagicMock())
 
-        result = run_jit(
+        result = run(
             fn,
             [ScalarSpec("num_tokens", torch.int32, 4)],
             golden_data=str(cache),
@@ -944,7 +944,7 @@ class TestRuntimeDir:
         with patch("pypto.ir.compile", side_effect=compile_must_not_run), \
              patch("pypto.runtime.execute_compiled", side_effect=fake_execute):
             r = run(
-                program=object(),
+                fn=object(),
                 specs=three_kinds_specs,
                 runtime_dir=str(prebuilt),
             )
@@ -970,7 +970,7 @@ class TestRuntimeDir:
         with patch("pypto.ir.compile", side_effect=lambda *a, **kw: pytest.fail("compile must not run")), \
              patch("pypto.runtime.execute_compiled", side_effect=fake_execute):
             r = run(
-                program=object(),
+                fn=object(),
                 specs=three_kinds_specs,
                 golden_fn=golden_fn,
                 runtime_dir=str(prebuilt),
@@ -1001,7 +1001,7 @@ class TestRuntimeDir:
             patch("golden.runner._maybe_reload_l3", return_value=fake_l3) as reload,
             patch("golden.runner._try_l3_dispatch", return_value=True) as l3,
         ):
-            r = run(program=object(), specs=three_kinds_specs, runtime_dir=str(prebuilt))
+            r = run(fn=object(), specs=three_kinds_specs, runtime_dir=str(prebuilt))
 
         assert r.passed, f"unexpected failure: {r.error}"
         reload.assert_called_once()
@@ -1029,7 +1029,7 @@ class TestRuntimeDir:
             patch("golden.runner._try_l3_dispatch") as l3_dispatch,
             patch("pypto.runtime.execute_compiled") as execute,
         ):
-            result = run(program=object(), specs=specs, runtime_dir=str(prebuilt))
+            result = run(fn=object(), specs=specs, runtime_dir=str(prebuilt))
 
         assert not result.passed
         assert "shape" in (result.error or "")
@@ -1038,7 +1038,7 @@ class TestRuntimeDir:
         l3_dispatch.assert_not_called()
         execute.assert_not_called()
 
-    def test_run_jit_runtime_dir_l3_abi_mismatch_fails_before_input(self, tmp_path):
+    def test_runtime_dir_l3_abi_mismatch_fails_before_input(self, tmp_path):
         prebuilt = tmp_path / "prebuilt"
         prebuilt.mkdir()
         compiled = types.SimpleNamespace(
@@ -1058,7 +1058,7 @@ class TestRuntimeDir:
             patch("golden.runner._try_l3_dispatch") as l3_dispatch,
             patch("pypto.runtime.execute_compiled") as execute,
         ):
-            result = run_jit(
+            result = run(
                 fn,
                 [TensorSpec("x", [4], torch.float32)],
                 runtime_dir=str(prebuilt),
@@ -1097,7 +1097,7 @@ class TestRuntimeDir:
             patch("golden.runner._run_benchmark_l3") as benchmark,
             patch("pypto.runtime.execute_compiled") as execute,
         ):
-            result = run(program=object(), specs=specs, runtime_dir=str(prebuilt))
+            result = run(fn=object(), specs=specs, runtime_dir=str(prebuilt))
 
         assert result.passed, result.error
         assert result.bench is None
@@ -1117,7 +1117,7 @@ class TestRuntimeDir:
         with patch("pypto.ir.compile", side_effect=compile_must_not_run), \
              patch("pypto.runtime.execute_compiled", side_effect=exec_must_not_run):
             r = run(
-                program=object(),
+                fn=object(),
                 specs=three_kinds_specs,
                 runtime_dir=str(missing),
             )
@@ -1140,7 +1140,7 @@ class TestRuntimeDir:
         with patch("pypto.ir.compile", side_effect=compile_must_not_run), \
              patch("pypto.runtime.execute_compiled", side_effect=exec_must_not_run):
             r = run(
-                program=object(),
+                fn=object(),
                 specs=three_kinds_specs,
                 compile_only=True,
                 runtime_dir=str(prebuilt),
@@ -1171,7 +1171,7 @@ class TestRuntimeDir:
         with patch("pypto.ir.compile", side_effect=lambda *a, **kw: pytest.fail("compile must not run")), \
              patch("pypto.runtime.execute_compiled", side_effect=fake_execute):
             r = run(
-                program=object(),
+                fn=object(),
                 specs=three_kinds_specs,
                 golden_fn=golden_fn_should_not_run,
                 golden_data=str(populated_cache),
@@ -1254,7 +1254,7 @@ class TestScalarMixedSpecs:
 
         compile_p, exec_p = _patch_compile_and_execute(compiled_dir, fake_execute=fake_execute)
         with compile_p, exec_p:
-            r = run(program=object(), specs=mixed_specs, golden_fn=golden_fn)
+            r = run(fn=object(), specs=mixed_specs, golden_fn=golden_fn)
 
         assert r.passed, f"unexpected failure: {r.error}"
         assert r.work_dir == compiled_dir
@@ -1279,7 +1279,7 @@ class TestScalarMixedSpecs:
 
         compile_p, exec_p = _patch_compile_and_execute(compiled_dir, fake_execute=fake_execute)
         with compile_p, exec_p:
-            r = run(program=object(), specs=mixed_specs, golden_fn=golden_fn, save_data=True)
+            r = run(fn=object(), specs=mixed_specs, golden_fn=golden_fn, save_data=True)
 
         assert r.passed, f"unexpected failure: {r.error}"
         scalar_path = compiled_dir / "data" / "in" / "alpha.pt"
@@ -1356,7 +1356,7 @@ class TestScalarMixedSpecs:
         compile_p, exec_p = _patch_compile_and_execute(compiled_dir, fake_execute=fake_execute)
         with compile_p, exec_p:
             r = run(
-                program=object(),
+                fn=object(),
                 specs=mixed_specs,
                 golden_data=str(cache),
             )
@@ -1394,7 +1394,7 @@ class TestScalarMixedSpecs:
         )
         with compile_p, exec_p:
             result = run(
-                program=object(),
+                fn=object(),
                 specs=mixed_specs,
                 golden_data=str(cache),
                 compare_fn={"y": compare},
@@ -1418,7 +1418,7 @@ class TestScalarMixedSpecs:
 
         compile_p, exec_p = _patch_compile_and_execute(compiled_dir)
         with compile_p, exec_p:
-            r = run(program=object(), specs=mixed_specs, golden_data=str(cache))
+            r = run(fn=object(), specs=mixed_specs, golden_data=str(cache))
 
         assert not r.passed
         assert "alpha.pt" in (r.error or "")
@@ -1437,7 +1437,7 @@ class TestScalarMixedSpecs:
 
         compile_p, exec_p = _patch_compile_and_execute(compiled_dir)
         with compile_p, exec_p:
-            r = run(program=object(), specs=mixed_specs, golden_data=str(cache))
+            r = run(fn=object(), specs=mixed_specs, golden_data=str(cache))
 
         assert not r.passed
         assert "0-dim" in (r.error or "")
@@ -1456,7 +1456,7 @@ class TestScalarMixedSpecs:
 
         compile_p, exec_p = _patch_compile_and_execute(compiled_dir)
         with compile_p, exec_p:
-            r = run(program=object(), specs=mixed_specs, golden_data=str(cache))
+            r = run(fn=object(), specs=mixed_specs, golden_data=str(cache))
 
         assert not r.passed
         assert "dtype mismatch" in (r.error or "")
@@ -1479,7 +1479,7 @@ class TestScalarMixedSpecs:
 
         compile_p, exec_p = _patch_compile_and_execute(compiled_dir, fake_execute=fake_execute)
         with compile_p, exec_p:
-            r = run(program=object(), specs=mixed_specs, golden_fn=golden_fn)
+            r = run(fn=object(), specs=mixed_specs, golden_fn=golden_fn)
 
         assert r.passed, f"unexpected failure: {r.error}"
         assert captured["alpha"] == pytest.approx(2.5)
@@ -1512,7 +1512,7 @@ class TestStageOrder:
         )
         with compile_p, exec_p:
             r = run(
-                program=object(),
+                fn=object(),
                 specs=three_kinds_specs,
                 golden_fn=golden_fn,
             )
@@ -1536,7 +1536,7 @@ class TestStageOrder:
         )
         with compile_p, exec_p, pytest.raises(RuntimeError, match="typo in golden_fn"):
             run(
-                program=object(),
+                fn=object(),
                 specs=three_kinds_specs,
                 golden_fn=bad_golden,
             )
@@ -1560,7 +1560,7 @@ class TestConfigForwarding:
         with patch("pypto.ir.compile", side_effect=fake_compile), \
              patch("pypto.runtime.execute_compiled"):
             r = run(
-                program=object(),
+                fn=object(),
                 specs=three_kinds_specs,
                 compile_cfg=dict(dump_passes=False, profiling=True),
             )
@@ -1584,7 +1584,7 @@ class TestConfigForwarding:
         compile_p, exec_p = _patch_compile_and_execute(compiled_dir, fake_execute=fake_execute)
         with compile_p, exec_p:
             r = run(
-                program=object(),
+                fn=object(),
                 specs=three_kinds_specs,
                 runtime_cfg=dict(
                     platform="a2a3sim",
@@ -1619,7 +1619,7 @@ class TestConfigForwarding:
             patch.dict(sys.modules, {"pypto.runtime.runner": runner_mod}),
         ):
             r = run(
-                program=object(),
+                fn=object(),
                 specs=three_kinds_specs,
                 runtime_cfg=dict(enable_dump_args=2),
             )
@@ -1783,7 +1783,7 @@ class TestLogLevelConsumption:
         with compile_p, exec_p, \
              patch("pypto.runtime.log_config.configure_log") as mock_cfg:
             run(
-                program=object(),
+                fn=object(),
                 specs=three_kinds_specs,
                 runtime_cfg=dict(platform="a2a3sim", device_id=0, log_level="debug"),
             )
@@ -1803,7 +1803,7 @@ class TestLogLevelConsumption:
         compile_p, exec_p = _patch_compile_and_execute(compiled_dir, fake_execute=fake_execute)
         with compile_p, exec_p, patch("pypto.runtime.log_config.configure_log"):
             run(
-                program=object(),
+                fn=object(),
                 specs=three_kinds_specs,
                 runtime_cfg=dict(platform="a2a3sim", device_id=0, log_level="debug"),
             )
@@ -1817,7 +1817,7 @@ class TestLogLevelConsumption:
         with compile_p, exec_p, \
              patch("pypto.runtime.log_config.configure_log") as mock_cfg:
             run(
-                program=object(),
+                fn=object(),
                 specs=three_kinds_specs,
                 runtime_cfg=dict(platform="a2a3sim", device_id=0),
             )
@@ -1952,10 +1952,10 @@ def test_nonresident_validation_precedes_benchmark_mutation(
     ):
         if use_jit:
             fn = types.SimpleNamespace(compile=MagicMock(return_value=compiled))
-            result = run_jit(fn, specs, golden_fn=lambda values: values["y"].zero_())
+            result = run(fn, specs, golden_fn=lambda values: values["y"].zero_())
         else:
             result = run(
-                program=object(), specs=specs,
+                fn=object(), specs=specs,
                 golden_fn=lambda values: values["y"].zero_(),
             )
 
@@ -2105,7 +2105,7 @@ class TestResidentPath:
             ),
             patch("golden.runner._run_l3_resident", return_value=None) as l3res,
         ):
-            r = run(program=object(), specs=self._resident_specs())
+            r = run(fn=object(), specs=self._resident_specs())
 
         assert r.passed, f"unexpected failure: {r.error}"
         l3res.assert_called_once()
@@ -2147,7 +2147,7 @@ class TestResidentPath:
             patch("golden.runner._run_l3_resident", return_value=None) as l3res,
             patch("pypto.runtime.execute_compiled") as execute,
         ):
-            result = run(program=object(), specs=specs, runtime_dir=str(prebuilt))
+            result = run(fn=object(), specs=specs, runtime_dir=str(prebuilt))
 
         assert result.passed, result.error
         assert l3res.call_args.kwargs["benchmark_enabled"] is False
@@ -2350,7 +2350,7 @@ class TestResidentPath:
             ),
             patch("pypto.ir.compile", return_value=fake),
         ):
-            r = run(program=object(), specs=self._resident_specs())
+            r = run(fn=object(), specs=self._resident_specs())
 
         assert not r.passed
         assert "only supported for L3" in (r.error or "")

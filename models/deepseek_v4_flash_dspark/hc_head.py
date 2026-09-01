@@ -339,7 +339,7 @@ def build_tensor_specs(token_count: int = T):
 if __name__ == "__main__":
     import argparse
     import torch
-    from golden import ratio_allclose, run_jit
+    from golden import ratio_allclose, run
 
     parser = argparse.ArgumentParser()
     parser.add_argument(
@@ -356,7 +356,7 @@ if __name__ == "__main__":
     args = parser.parse_args()
     torch.manual_seed(args.seed)
 
-    result = run_jit(
+    result = run(
         fn=hc_head_test,
         specs=build_tensor_specs(args.token_count),
         golden_fn=golden_hc_head,

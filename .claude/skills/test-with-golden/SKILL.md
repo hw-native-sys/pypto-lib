@@ -15,7 +15,7 @@ snapshot-layout, invalidation, and CLI-wiring reference.
    whose specs, inputs, golden logic, and intended numerics remain unchanged.
    Do not use it for a precision investigation that needs fixture, seed,
    dtype, rounding, quantization, or reference changes.
-2. Inspect the target's `__main__` and its `run` or `run_jit` call. Check
+2. Inspect the target's `__main__` and its `run` call. Check
    whether both `--save-data` and `--golden-data` are already exposed.
 3. If either flag is missing, add only the minimal argparse option and keyword
    forwarding shown in the canonical guide. Do not change the default run:

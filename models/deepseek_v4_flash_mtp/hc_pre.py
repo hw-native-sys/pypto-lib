@@ -387,7 +387,7 @@ def build_tensor_specs(B, S):
 
 if __name__ == "__main__":
     import argparse
-    from golden import ratio_allclose, run_jit
+    from golden import ratio_allclose, run
 
     MODES = {
         "decode":  (DECODE_BATCH, DECODE_SEQ),
@@ -410,7 +410,7 @@ if __name__ == "__main__":
     for mode_name in modes_to_run:
         B, S = MODES[mode_name]
         print(f"--- hc_pre {mode_name}: B={B}, S={S} ---")
-        result = run_jit(
+        result = run(
             fn=hc_pre_test,
             specs=build_tensor_specs(B, S),
             golden_fn=golden_hc_pre,

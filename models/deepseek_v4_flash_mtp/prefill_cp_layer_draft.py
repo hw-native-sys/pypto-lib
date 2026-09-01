@@ -114,7 +114,7 @@ from prefill_cp_csa_draft import (
     golden_prefill_cp_csa,
     prefill_cp_csa_core,
 )
-from golden import ScalarSpec, TensorSpec, ratio_allclose, ratio_reldiff, run_jit
+from golden import ScalarSpec, TensorSpec, ratio_allclose, ratio_reldiff, run
 
 # ---------------------------------------------------------------------------
 # Static CP/EP contract
@@ -2173,14 +2173,14 @@ def golden_prefill_layer_cp(tensors):
     )
 
     if layer_id == SWA_LAYER_ID:
-        # SWA golden context is installed by __main__ before run_jit.
+        # SWA golden context is installed by __main__ before run.
         swa_tensors = dict(tensors)
         swa_tensors["x_out"] = x_attn
         golden_prefill_cp_swa(swa_tensors)
         x_attn = swa_tensors["x_out"]
         # SWA golden mutates tensors["kv_cache"] in place; that stands.
     elif layer_id == HCA_LAYER_ID:
-        # HCA golden context is installed by __main__ before run_jit.
+        # HCA golden context is installed by __main__ before run.
         hca_tensors = dict(tensors)
         hca_tensors["x_out"] = x_attn
         golden_prefill_cp_hca(hca_tensors)
@@ -2292,7 +2292,7 @@ if __name__ == "__main__":
     else:
         raise RuntimeError(f"unsupported layer_id={args.layer_id}")
 
-    result = run_jit(
+    result = run(
         fn=host_fn,
         specs=specs,
         golden_fn=None if args.no_golden else golden_prefill_layer_cp,

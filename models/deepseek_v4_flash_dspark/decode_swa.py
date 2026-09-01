@@ -1096,7 +1096,7 @@ def golden_decode_swa(tensors):
 if __name__ == "__main__":
     import argparse
 
-    from golden import mapped_pool_ratio_allclose, ratio_reldiff, run_jit
+    from golden import mapped_pool_ratio_allclose, ratio_reldiff, run
     from pypto.ir.distributed_compiled_program import DistributedConfig
 
     parser = argparse.ArgumentParser()
@@ -1148,7 +1148,7 @@ if __name__ == "__main__":
 
     for local_t in token_counts:
         if TP_SIZE == 1:
-            result = run_jit(
+            result = run(
                 fn=decode_swa_tp1_test,
                 specs=build_tensor_specs(start_pos=args.start_pos, batch=local_t // S),
                 golden_fn=golden_decode_swa_tp1,
@@ -1177,7 +1177,7 @@ if __name__ == "__main__":
                 },
             )
         else:
-            result = run_jit(
+            result = run(
                 fn=l3_decode_swa,
                 specs=build_distributed_tensor_specs(local_t, start_pos=args.start_pos),
                 golden_fn=golden_decode_swa,

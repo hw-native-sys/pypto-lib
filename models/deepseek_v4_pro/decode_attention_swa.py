@@ -486,7 +486,7 @@ def build_tensor_specs(start_pos=None, unmapped_visible_page_fixture=False):
 
 if __name__ == "__main__":
     import argparse
-    from golden import ratio_reldiff, run_jit
+    from golden import ratio_reldiff, run
 
     parser = argparse.ArgumentParser()
     parser.add_argument("-p", "--platform", type=str, default="a2a3",
@@ -508,7 +508,7 @@ if __name__ == "__main__":
     parser.add_argument("--dump-passes", action="store_true", default=False)
     args = parser.parse_args()
 
-    result = run_jit(
+    result = run(
         fn=attention_swa_test,
         specs=build_tensor_specs(args.start_pos, args.unmapped_visible_page_fixture),
         golden_fn=golden_attention_swa,

@@ -729,7 +729,7 @@ def build_tensor_specs(compress_ratio: int = DEFAULT_COMPRESS_RATIO):
 
 if __name__ == "__main__":
     import argparse
-    from golden import ratio_allclose, run_jit
+    from golden import ratio_allclose, run
 
     parser = argparse.ArgumentParser()
     parser.add_argument("-p", "--platform", type=str, default="a2a3", choices=["a2a3", "a2a3sim", "a5", "a5sim"])
@@ -742,7 +742,7 @@ if __name__ == "__main__":
     parser.add_argument("--dump-passes", action="store_true", default=False)
     args = parser.parse_args()
 
-    result = run_jit(
+    result = run(
         fn=prefill_sparse_attn_test,
         specs=build_tensor_specs(args.compress_ratio),
         golden_fn=golden_prefill_sparse_attn,

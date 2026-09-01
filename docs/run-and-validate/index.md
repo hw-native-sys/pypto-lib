@@ -25,7 +25,7 @@ Use the following references:
 - [Compile and Runtime Workflow](compile-runtime-workflow.md) explains the
   generated artifacts and each stage in detail.
 - [Golden Harness](golden-harness.md) introduces `TensorSpec`, `ScalarSpec`,
-  `run`, `run_jit`, validation, and `RunResult`.
+  `run`, validation, and `RunResult`.
 - [Save and Replay Golden Data](save-and-replay.md) freezes inputs and expected
   outputs for repeated performance-oriented runs.
 

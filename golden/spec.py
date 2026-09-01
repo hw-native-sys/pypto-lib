@@ -249,7 +249,7 @@ class ScalarSpec:
             *dtype* (used directly).  After ``__post_init__`` runs, ``value``
             is **always** a 0-dim ``torch.Tensor`` carrying the dtype-precise
             representation, so cache I/O is just ``torch.save`` / ``torch.load``.
-        compile_runtime: Whether :func:`golden.run_jit` must leave this scalar
+        compile_runtime: Whether :func:`golden.run` must leave this scalar
             unspecialized in the compiled artifact.  Marked scalars are passed
             to ``JITFunction.compile`` as ``pl.RUNTIME`` and remain real
             runtime ABI parameters.  This flag has no effect on the direct

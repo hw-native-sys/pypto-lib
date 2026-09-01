@@ -15,7 +15,7 @@ import argparse
 
 import pypto.language as pl
 import pypto.language.distributed as pld
-from golden import run_jit
+from golden import run
 from hc_head import hc_head
 from input_pack import VOCAB_DYN as EMBED_VOCAB_DYN, pack_x_hc
 from lm_head import (
@@ -1677,7 +1677,7 @@ def main():
         count = apply_real_weights(specs, args.weights, ep=N_RANKS, tp=LM_HEAD_TP_SIZE)
         print(f"[RUN] real weights: {count} tensors from {args.weights}", flush=True)
 
-    result = run_jit(
+    result = run(
         fn=l3_decode_fwd,
         specs=specs,
         golden_fn=None,

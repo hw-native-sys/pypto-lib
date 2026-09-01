@@ -335,7 +335,7 @@ def build_tensor_specs(batch=DECODE_BATCH, seq=DECODE_SEQ):
 
 if __name__ == "__main__":
     import argparse
-    from golden import ratio_allclose, run_jit
+    from golden import ratio_allclose, run
 
     parser = argparse.ArgumentParser()
     parser.add_argument(
@@ -357,7 +357,7 @@ if __name__ == "__main__":
     }
     for mode in (modes if args.mode == "all" else [args.mode]):
         batch, seq = modes[mode]
-        result = run_jit(
+        result = run(
             fn=mtp_projection_test,
             specs=build_tensor_specs(batch, seq),
             golden_fn=golden_mtp_projection,

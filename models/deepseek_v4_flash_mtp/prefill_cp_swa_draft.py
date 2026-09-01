@@ -816,7 +816,7 @@ def build_tensor_specs(cp_size: int = CP_SIZE):
     ):
         value = meta[name]
         specs.append(TensorSpec(name, list(value.shape), value.dtype, init_value=value))
-    # Spec order must match the kernel signature: run_jit binds its dummy compile
+    # Spec order must match the kernel signature: run binds its dummy compile
     # args positionally, so owner_rank_table sits between reverse_index and the
     # final_win_* triple exactly as prefill_cp_swa_test declares them.
     specs.append(TensorSpec("reverse_index", list(meta["reverse_index"].shape), meta["reverse_index"].dtype, init_value=meta["reverse_index"]))
@@ -968,14 +968,14 @@ if __name__ == "__main__":
     parser.add_argument("--enable-chip-swimlane", action="store_true", default=False)
     args = parser.parse_args()
 
-    from golden import ratio_allclose, ratio_reldiff, run_jit
+    from golden import ratio_allclose, ratio_reldiff, run
 
     device_ids = [int(device) for device in args.device.split(",")]
     if len(device_ids) < args.cp:
         raise SystemExit(f"CP{args.cp} requires {args.cp} devices, got {device_ids}")
     specs, ctx = build_tensor_specs(args.cp)
     golden_prefill_cp_swa._ctx = ctx
-    result = run_jit(
+    result = run(
         fn=prefill_cp_swa_test,
         specs=specs,
         golden_fn=golden_prefill_cp_swa,

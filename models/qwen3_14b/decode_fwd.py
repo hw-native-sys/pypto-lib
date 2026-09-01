@@ -1662,7 +1662,7 @@ def _backend_type(platform: str) -> BackendType:
 # the golden with `golden_decode_layer` (a torch reference mirroring the kernel's
 # math AND its bf16 cast points), runs decode_fwd_layers with _CHUNK_NLAYERS == 1
 # (a single fused decode layer, hidden -> hidden, no LM head) on device through the
-# `golden/` harness (golden.run_jit), and validates the device output against the
+# `golden/` harness (golden.run), and validates the device output against the
 # golden — no pre-generated data files needed.
 #
 # Fixture scales are chosen so the (unnormalized) residual-stream output stays
@@ -2025,7 +2025,7 @@ if __name__ == "__main__":
     # ── Default single-layer unit test: RANDOM inputs, on-the-fly torch golden,
     # on-device run + compare, all through the golden/ harness. ──
     if not args.validate_fwd:
-        from golden import ratio_allclose, run_jit
+        from golden import ratio_allclose, run
 
         inputs = random_inputs(
             full_seq=args.max_seq,
@@ -2042,7 +2042,7 @@ if __name__ == "__main__":
         # rtol/atol=3e-3 (one bf16 ULP at value 1 is 2**-8 ≈ 0.0039 > 3e-3), so allow
         # up to 2% outliers — the codebase's ratio_allclose convention. Remaining
         # mismatches are 1-2 ULP bf16 quantization, not errors.
-        result = run_jit(
+        result = run(
             fn=decode_fwd_layers,
             specs=specs,
             golden_fn=golden_decode_layer,

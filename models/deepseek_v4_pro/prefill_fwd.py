@@ -29,7 +29,7 @@ import argparse
 
 import pypto.language as pl
 import pypto.language.distributed as pld
-from golden import run_jit
+from golden import run
 from pypto.ir.distributed_compiled_program import DistributedConfig
 from input_pack import VOCAB_DYN as EMBED_VOCAB_DYN, pack_x_hc
 
@@ -1722,7 +1722,7 @@ def main():
         golden_fn = golden_prefill_fwd
         compare_fn = build_validate_compare_fn(args.num_tokens)
 
-    result = run_jit(
+    result = run(
         fn=l3_prefill_fwd,
         specs=specs,
         golden_fn=golden_fn,

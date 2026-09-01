@@ -333,7 +333,7 @@ def _build_resident_hosts(prefill, prefill_compiled, decode_compiled, weight_spe
                 )
             if tensor.dtype != expected_dtype:
                 # Fixture inits may build in a wider dtype (e.g. fp32) than the
-                # kernel ABI declares; run_jit casts on materialization too.
+                # kernel ABI declares; run casts on materialization too.
                 tensor = tensor.to(expected_dtype)
         else:
             tensor = _empty_host_tensor(name, info, prefill.MODEL_CONFIG.vocab_size)

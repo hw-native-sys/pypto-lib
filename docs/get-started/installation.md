@@ -147,7 +147,7 @@ re-cloned rather than reused in place.
 ## Verify
 
 ```bash
-python -c "import pypto, torch; from golden import run, run_jit; print(torch.__version__)"
+python -c "import pypto, torch; from golden import run; print(torch.__version__)"
 python examples/beginner/hello_world.py -p a2a3sim
 ```
 

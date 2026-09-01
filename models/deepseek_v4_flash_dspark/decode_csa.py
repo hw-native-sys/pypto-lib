@@ -1957,7 +1957,7 @@ def build_full_compare(mapping_shape, *, leading_rank_axis, cp_mappings=None, di
 if __name__ == "__main__":
     import argparse
 
-    from golden import run_jit
+    from golden import run
     from pypto.ir.distributed_compiled_program import DistributedConfig
 
     parser = argparse.ArgumentParser()
@@ -2011,7 +2011,7 @@ if __name__ == "__main__":
     local_t = batch * S
 
     if TP_SIZE == 1:
-        result = run_jit(
+        result = run(
             fn=decode_csa_tp1_test,
             specs=build_tensor_specs(start_pos=start_pos, batch=batch),
             golden_fn=golden_decode_csa_tp1,
@@ -2042,7 +2042,7 @@ if __name__ == "__main__":
         dump_passes=args.dump_passes,
         distributed_config=DistributedConfig(device_ids=device_ids, num_sub_workers=0),
     )
-    result = run_jit(
+    result = run(
         fn=l3_decode_csa,
         specs=build_distributed_tensor_specs(local_t, start_pos=start_pos),
         golden_fn=golden_decode_csa,

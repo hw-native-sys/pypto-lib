@@ -122,7 +122,7 @@ def golden_allreduce(tensors):
 if __name__ == "__main__":
     import argparse
 
-    from golden import run_jit
+    from golden import run
     from pypto.ir.distributed_compiled_program import DistributedConfig
 
     parser = argparse.ArgumentParser()
@@ -136,7 +136,7 @@ if __name__ == "__main__":
     device_ids = [int(d) for d in args.device.split(",")]
     assert len(device_ids) == N_RANKS, f"need exactly {N_RANKS} devices, got {device_ids}"
 
-    result = run_jit(
+    result = run(
         fn=l3_allreduce,
         specs=build_tensor_specs(),
         golden_fn=golden_allreduce,

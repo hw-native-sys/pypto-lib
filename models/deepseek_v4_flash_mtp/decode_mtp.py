@@ -944,7 +944,7 @@ def golden_decode_mtp(tensors):
 
 
 def main():
-    from golden import ratio_reldiff, run_jit
+    from golden import ratio_reldiff, run
 
     parser = argparse.ArgumentParser(description="DeepSeek-V4 MTP decode layer driver.")
     parser.add_argument(
@@ -982,7 +982,7 @@ def main():
     device_ids = [int(d) for d in args.device.split(",")]
     assert len(device_ids) >= N_RANKS, f"need at least {N_RANKS} devices, got {device_ids}"
 
-    result = run_jit(
+    result = run(
         fn=l3_decode_mtp,
         specs=build_tensor_specs(
             start_pos=args.start_pos,

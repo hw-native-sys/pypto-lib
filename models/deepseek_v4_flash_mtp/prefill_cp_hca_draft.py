@@ -2125,12 +2125,12 @@ if __name__ == "__main__":
     parser.add_argument("--enable-chip-swimlane", action="store_true")
     args = parser.parse_args()
 
-    from golden import ratio_allclose, ratio_reldiff, run_jit
+    from golden import ratio_allclose, ratio_reldiff, run
 
     device_ids = [int(device) for device in args.device.split(",")]
     if len(device_ids) < args.cp:
         raise SystemExit(f"CP{args.cp} requires {args.cp} devices, got {device_ids}")
-    result = run_jit(
+    result = run(
         fn=prefill_cp_hca_test,
         specs=build_tensor_specs(args.cp),
         golden_fn=golden_prefill_cp_hca,

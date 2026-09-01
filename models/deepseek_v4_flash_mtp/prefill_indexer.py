@@ -985,7 +985,7 @@ def build_tensor_specs(start_pos: int = START_POS, num_tokens: int = T):
 if __name__ == "__main__":
     import argparse
     import torch
-    from golden import ratio_allclose, run_jit, topk_pair_compare
+    from golden import ratio_allclose, run, topk_pair_compare
 
     parser = argparse.ArgumentParser(description="Standalone token-major DeepSeek V4 prefill indexer validation.")
     parser.add_argument("-p", "--platform", type=str, default="a2a3",
@@ -1030,7 +1030,7 @@ if __name__ == "__main__":
         )
     topk_idxs_compare.__name__ = "topk_pair_compare"
 
-    result = run_jit(
+    result = run(
         fn=prefill_indexer_test,
         specs=build_tensor_specs(args.start_pos, args.num_tokens),
         golden_fn=golden_prefill_indexer,

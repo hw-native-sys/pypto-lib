@@ -947,7 +947,7 @@ def _quant_w_per_output_channel_local(w):
 
 if __name__ == "__main__":
     import argparse
-    from golden import ratio_reldiff, run_jit
+    from golden import ratio_reldiff, run
 
     parser = argparse.ArgumentParser(description="Standalone DeepSeek V4 packed prefill CSA correctness test.")
     parser.add_argument("-p", "--platform", type=str, default="a2a3", choices=["a2a3", "a2a3sim", "a5", "a5sim"])
@@ -973,7 +973,7 @@ if __name__ == "__main__":
 
     from pypto.runtime import RunConfig
 
-    result = run_jit(
+    result = run(
         fn=prefill_attention_csa_test,
         specs=build_tensor_specs(
             args.start_pos,

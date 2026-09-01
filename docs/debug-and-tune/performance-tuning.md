@@ -15,7 +15,7 @@ compute core.
 ## Measuring — the benchmark loop (`PYPTO_BENCH`)
 
 Tuning needs a number before and after. Set `PYPTO_BENCH=1` and every
-`run` / `run_jit` call in the process times the kernel on device after its
+`run` call in the process times the kernel on device after its
 correctness dispatch — no `--benchmark` flag, no edit to the model file:
 
 ```bash
@@ -366,7 +366,7 @@ python models/deepseek_v4_flash_mtp/decode_sparse_attn.py -p a2a3 -d 0 --enable-
 ```
 
 Not every kernel exposes `--enable-pmu`; a kernel that does not can still be
-captured by passing `runtime_cfg={"enable_pmu": 2}` to its `run` / `run_jit`
+captured by passing `runtime_cfg={"enable_pmu": 2}` to its `run`
 call (the harness bundles it into the runtime's DFX options).
 
 For a per-kernel intra-core swimlane, use

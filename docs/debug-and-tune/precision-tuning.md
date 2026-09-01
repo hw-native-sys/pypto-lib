@@ -173,7 +173,7 @@ comparator from the golden harness to see the precision distribution instead:
 ```python
 from golden import error_distribution
 
-run_jit(
+run(
     ...,
     compare_fn={
         "x_next": error_distribution(),    # measure, never fails

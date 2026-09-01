@@ -1261,7 +1261,7 @@ def build_tensor_specs(start_pos: int = START_POS, token_count: int = PREFILL_SE
 if __name__ == "__main__":
     import argparse
     import torch
-    from golden import ratio_allclose, run_jit
+    from golden import ratio_allclose, run
     from utils import int8_quant_per_row
 
     parser = argparse.ArgumentParser(
@@ -1399,7 +1399,7 @@ if __name__ == "__main__":
         compare.__name__ = f"mapped_active_rows({mapping_name})"
         return compare
 
-    result = run_jit(
+    result = run(
         fn=prefill_indexer_test,
         specs=build_tensor_specs(args.start_pos, args.token_count),
         golden_fn=golden_prefill_indexer,

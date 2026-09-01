@@ -36,7 +36,7 @@ from typing import Any, Sequence
 import pypto.language as pl
 import torch
 
-from golden import ScalarSpec, TensorSpec, run_jit
+from golden import ScalarSpec, TensorSpec, run
 from paged_attention_pypto import (
     BATCH,
     BLOCK_SIZE,
@@ -828,7 +828,7 @@ def _run_case(case: DynamicCase, args: argparse.Namespace) -> dict[str, object]:
     _validate_case(case)
     compile_only = args.compile_only or args.platform.endswith("sim")
     fixture = None if compile_only else make_fixture(case)
-    result = run_jit(
+    result = run(
         fn=paged_attention_pypto_dynamic,
         specs=build_specs(case, fixture),
         golden_fn=None if fixture is None else lambda values: golden_attention(values, case),

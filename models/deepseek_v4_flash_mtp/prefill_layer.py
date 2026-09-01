@@ -1003,7 +1003,7 @@ def golden_prefill_layer(tensors):
 if __name__ == "__main__":
     import argparse
 
-    from golden import ratio_allclose, ratio_reldiff, run_jit
+    from golden import ratio_allclose, ratio_reldiff, run
 
     parser = argparse.ArgumentParser()
     parser.add_argument("-p", "--platform", type=str, default="a2a3",
@@ -1023,7 +1023,7 @@ if __name__ == "__main__":
     device_ids = [int(d) for d in args.device.split(",")]
     assert len(device_ids) >= N_RANKS, f"need at least {N_RANKS} devices, got {device_ids}"
 
-    result = run_jit(
+    result = run(
         fn=l3_prefill_layer,
         specs=build_tensor_specs(layer_id=args.layer_id),
         golden_fn=golden_prefill_layer,

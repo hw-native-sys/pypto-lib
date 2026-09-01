@@ -387,7 +387,7 @@ def build_tensor_specs():
 
 if __name__ == "__main__":
     import argparse
-    from golden import run_jit
+    from golden import run
 
     parser = argparse.ArgumentParser(description="Standalone context-parallel zigzag exchange test.")
     parser.add_argument("-p", "--platform", default="a2a3", choices=["a2a3", "a2a3sim", "a5", "a5sim"])
@@ -402,7 +402,7 @@ if __name__ == "__main__":
     if len(device_ids) < args.cp:
         raise SystemExit(f"CP{args.cp} requires {args.cp} devices, got {device_ids}")
 
-    result = run_jit(
+    result = run(
         fn=prefill_cp_zigzag_kv_tail_exchange_test,
         specs=build_tensor_specs(),
         golden_fn=golden_prefill_cp_zigzag_kv_tail_exchange,

@@ -715,7 +715,7 @@ def build_tensor_specs(start_pos: int = START_POS, token_count: int = PREFILL_SE
 
 if __name__ == "__main__":
     import argparse
-    from golden import ratio_allclose, run_jit
+    from golden import ratio_allclose, run
 
     parser = argparse.ArgumentParser(
         description="Standalone token-major DeepSeek V4 prefill compressor ratio128 validation."
@@ -748,7 +748,7 @@ if __name__ == "__main__":
     parser.add_argument("--dump-passes", action="store_true", default=False)
     args = parser.parse_args()
 
-    result = run_jit(
+    result = run(
         fn=prefill_compressor_ratio128_test,
         specs=build_tensor_specs(args.start_pos, args.token_count),
         golden_fn=golden_prefill_compressor_ratio128,

@@ -1210,7 +1210,7 @@ def build_tensor_specs(
 
 
 def main():
-    from golden import run_jit
+    from golden import run
 
     parser = argparse.ArgumentParser(
         description="DeepSeek-V4 fused main-decode, verification, and MTP decode driver."
@@ -1272,7 +1272,7 @@ def main():
     device_ids = [int(device) for device in args.device.split(",")]
     assert len(device_ids) >= N_RANKS, f"need at least {N_RANKS} devices, got {device_ids}"
 
-    result = run_jit(
+    result = run(
         fn=l3_decode_fwd_mtp,
         specs=build_tensor_specs(
             start_pos=args.start_pos,

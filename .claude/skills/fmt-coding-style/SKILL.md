@@ -163,7 +163,7 @@ Structures that stay one-item-per-line:
 
 - the **kernel signature** — one annotated parameter per line, already the
   convention;
-- the **harness call**, `run_jit(...)` / `run(...)` — leave it exactly as it is.
+- the **harness call**, `run(...)` — leave it exactly as it is.
   One option per line is what makes it easy to toggle `compile_cfg` /
   `runtime_cfg` / `rtol` / `compare_fn` entries while testing;
 - list literals whose elements are themselves full-width expressions, such as

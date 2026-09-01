@@ -14,7 +14,7 @@ import argparse
 
 import pypto.language as pl
 import pypto.language.distributed as pld
-from golden import ratio_allclose, ratio_reldiff, run_jit
+from golden import ratio_allclose, ratio_reldiff, run
 from pypto.ir.distributed_compiled_program import DistributedConfig
 
 import config
@@ -758,7 +758,7 @@ def main():
     device_ids = [int(d) for d in args.device.split(",")]
     assert len(device_ids) >= N_RANKS, f"need at least {N_RANKS} devices, got {device_ids}"
 
-    result = run_jit(
+    result = run(
         fn=l3_mtp_prefill_fwd,
         specs=build_tensor_specs(
             start_pos=args.start_pos,

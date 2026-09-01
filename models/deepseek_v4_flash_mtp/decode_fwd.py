@@ -14,7 +14,7 @@ import argparse
 
 import pypto.language as pl
 import pypto.language.distributed as pld
-from golden import run_jit
+from golden import run
 from hc_head import hc_head
 from lm_head import (
     GROUP_LOGIT_ROWS,
@@ -1903,7 +1903,7 @@ def main():
         inner_state_block_num=args.inner_state_block_num,
     )
 
-    result = run_jit(
+    result = run(
         fn=l3_decode_fwd,
         specs=specs,
         golden_fn=None,

@@ -2037,7 +2037,7 @@ def golden_prefill_attention_csa_cp(tensors):
 if __name__ == "__main__":
     import argparse
 
-    from golden import ratio_allclose, ratio_reldiff, run_jit
+    from golden import ratio_allclose, ratio_reldiff, run
 
     parser = argparse.ArgumentParser(
         description="Standalone DeepSeek V4 packed prefill CSA correctness test."
@@ -2096,7 +2096,7 @@ if __name__ == "__main__":
         parser.error(f"--token-count must be a multiple of --tp={TP_SIZE}, got {args.token_count}")
 
     if TP_SIZE == 1:
-        result = run_jit(
+        result = run(
             fn=prefill_attention_csa_test,
             specs=build_tensor_specs(args.start_pos, args.token_count),
             golden_fn=golden_prefill_attention_csa,
@@ -2129,7 +2129,7 @@ if __name__ == "__main__":
             if args.case == "ragged2"
             else build_cp_tensor_specs(args.start_pos, args.token_count, TP_SIZE)
         )
-        result = run_jit(
+        result = run(
             fn=l3_prefill_attention_csa_cp,
             specs=specs,
             golden_fn=golden_prefill_attention_csa_cp,

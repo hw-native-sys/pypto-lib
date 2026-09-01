@@ -345,7 +345,7 @@ def golden_topk_select(tensors):
 if __name__ == "__main__":
     import argparse
 
-    from golden import run_jit, topk_pair_compare
+    from golden import run, topk_pair_compare
 
     parser = argparse.ArgumentParser()
     parser.add_argument(
@@ -356,7 +356,7 @@ if __name__ == "__main__":
     parser.add_argument("--enable-chip-swimlane", action="store_true", default=False)
     args = parser.parse_args()
 
-    result = run_jit(
+    result = run(
         fn=topk_select_fwd,
         specs=build_tensor_specs(args.selection_k),
         golden_fn=golden_topk_select,

@@ -765,7 +765,7 @@ def build_tensor_specs(start_pos: int = START_POS):
 
 if __name__ == "__main__":
     import argparse
-    from golden import ratio_allclose, run_jit
+    from golden import ratio_allclose, run
 
     parser = argparse.ArgumentParser(description="Standalone token-major DeepSeek V4 prefill indexer compressor validation.")
     parser.add_argument("-p", "--platform", type=str, default="a2a3",
@@ -783,7 +783,7 @@ if __name__ == "__main__":
     parser.add_argument("--dump-passes", action="store_true", default=False)
     args = parser.parse_args()
 
-    result = run_jit(
+    result = run(
         fn=prefill_indexer_compressor_test,
         specs=build_tensor_specs(args.start_pos),
         golden_fn=golden_prefill_indexer_compressor,

@@ -2195,7 +2195,7 @@ def main():
     from golden import (
         mapped_pool_ratio_allclose,
         ratio_reldiff,
-        run_jit,
+        run,
     )
     from pypto.ir.distributed_compiled_program import DistributedConfig
 
@@ -2405,7 +2405,7 @@ def main():
             "x_next": ratio_reldiff(diff_thd=0.01, pct_thd=0.05),
         }
 
-    result = run_jit(
+    result = run(
         fn=layer_fn,
         specs=specs,
         golden_fn=golden_fn,

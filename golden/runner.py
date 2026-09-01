@@ -9,7 +9,7 @@
 
 """Compile PyPTO programs, run them on device, and validate against goldens.
 
-Public entry points: :func:`run` and :func:`run_jit`.
+Public entry points: :func:`run` and :func:`run`.
 """
 
 import os
@@ -450,8 +450,8 @@ def _bench_enabled() -> bool:
     """True when ``PYPTO_BENCH`` is set truthy.
 
     Benchmarking is entirely env-driven so no model file needs a ``--benchmark``
-    flag and ``run_jit`` needs no extra parameters: daily CI's a2a3 job sets
-    ``PYPTO_BENCH=1`` and every ``run_jit`` call then times the kernel over
+    flag and ``run`` needs no extra parameters: daily CI's a2a3 job sets
+    ``PYPTO_BENCH=1`` and every ``run`` call then times the kernel over
     :func:`_bench_loop_sizes` rounds (warmup discarded).
     """
     return _env_flag("PYPTO_BENCH")
@@ -487,7 +487,7 @@ def _bench_loop_sizes() -> tuple[int, int]:
     100-round default is ~0.1 s of device time for a decode step but minutes for
     a long prefill or a multi-card L3 run, and while iterating on a kernel a
     handful of rounds is usually enough. Both are read per run (not cached), so
-    a sweep can vary them between :func:`run_jit` calls in one process.
+    a sweep can vary them between :func:`run` calls in one process.
 
     Daily CI sets neither, so its numbers stay comparable across runs. Warmup is
     allowed to be 0; rounds must be at least 1.
@@ -1446,7 +1446,7 @@ def _run_pipeline(
     runtime_dir: str | None,
     save_data: bool,
 ) -> RunResult:
-    """Shared body of :func:`run` and :func:`run_jit`.
+    """Shared body of :func:`run` and :func:`run`.
 
     *prologue* runs entry-specific spec validation, may raise ``ValueError``,
     and returns whatever state its *compile_step* needs. *compile_step* then
@@ -1629,27 +1629,11 @@ def _run_pipeline(
     return _pass(bench)
 
 
-def run(
-    program: Any,
-    specs: list[TensorSpec | ScalarSpec],
-    golden_fn: Callable | None = None,
-    golden_data: str | None = None,
-    compile_cfg: dict[str, Any] | None = None,
-    runtime_cfg: dict[str, Any] | None = None,
-    rtol: float = 1e-5,
-    atol: float = 1e-5,
-    compare_fn: dict[str, Callable] | None = None,
-    compile_only: bool = False,
-    runtime_dir: str | None = None,
-    save_data: bool = False,
-) -> RunResult:
-    """Compile *program*, run on device, and validate against golden.
-
-    The ``@pl.program`` counterpart of :func:`run_jit`: *program* is a
-    ``@pl.program`` class or an ``ir.Program``, and *compile_cfg* is forwarded
-    to :func:`pypto.ir.compile` (unknown keys raise there). Every other
-    argument behaves as documented on :func:`run_jit`.
-    """
+def _program_entry(
+    fn: Any, specs: list[TensorSpec | ScalarSpec]
+) -> tuple[Callable[[dict[str, Any], dict[str, Any], Any], Any], None, str]:
+    """``(compile_step, prologue, label)`` for a ``@pl.program`` class / ``ir.Program``."""
+    del specs  # the program path derives everything from the compiled artifact
 
     def _compile(
         compile_cfg: dict[str, Any], runtime_cfg: dict[str, Any], _state: Any
@@ -1667,69 +1651,22 @@ def run(
             # silently compiles incore kernels for a2a3sim (g++-15) instead of
             # the real device (ccec).
             compile_kwargs.setdefault("platform", platform)
-        return ir.compile(program, **compile_kwargs)
+        return ir.compile(fn, **compile_kwargs)
 
-    return _run_pipeline(
-        specs, _compile, "Program compile", None,
-        golden_fn, golden_data, compile_cfg, runtime_cfg,
-        rtol, atol, compare_fn, compile_only, runtime_dir, save_data,
-    )
+    return _compile, None, "Program compile"
 
 
-def run_jit(
-    fn: Any,
-    specs: list[TensorSpec | ScalarSpec],
-    golden_fn: Callable | None = None,
-    golden_data: str | None = None,
-    compile_cfg: dict[str, Any] | None = None,
-    runtime_cfg: dict[str, Any] | None = None,
-    rtol: float = 1e-5,
-    atol: float = 1e-5,
-    compare_fn: dict[str, Callable] | None = None,
-    compile_only: bool = False,
-    runtime_dir: str | None = None,
-    save_data: bool = False,
-) -> RunResult:
-    """Compile a ``@pl.jit`` *fn*, run it on device, and validate against golden.
+def _jit_entry(
+    fn: Any, specs: list[TensorSpec | ScalarSpec]
+) -> tuple[
+    Callable[[dict[str, Any], dict[str, Any], Any], Any],
+    Callable[[list[ScalarSpec], Path | None], Any],
+    str,
+]:
+    """``(compile_step, prologue, label)`` for a ``@pl.jit`` callable.
 
-    Args:
-        fn: ``@pl.jit`` decorated callable.
-        specs: :class:`TensorSpec` / :class:`ScalarSpec` list in *fn*'s
-            parameter order. A mismatched order is rejected, never reordered.
-        golden_fn: ``golden_fn(values)`` that fills outputs in-place; *values*
-            maps spec name to tensor clone or Python scalar. Ignored when
-            *golden_data* is set; if neither is given, validation is skipped.
-        golden_data: Directory with ``in/{name}.pt`` and ``out/{name}.pt``;
-            loads inputs and expected outputs (read-only). Takes precedence
-            over *golden_fn*.
-        compile_cfg: Compile-side ``RunConfig`` fields (``dump_passes`` /
-            ``distributed_config`` / ``compile_profiling`` / ...) carried into
-            ``JITFunction.compile``; ``platform`` is supplied separately
-            (typically via *runtime_cfg*). Unknown keys raise when the
-            ``RunConfig`` is built.
-        runtime_cfg: Kwargs forwarded to
-            :func:`pypto.runtime.execute_compiled` (``platform``, ``device_id``,
-            ``enable_chip_swimlane``, ...). Unknown keys raise there, except
-            the harness-only key ``log_level``, which is consumed up-front
-            to configure the PyPTO runtime logger via
-            :func:`pypto.runtime.log_config.configure_log`.
-        rtol, atol: Golden comparison tolerances.
-        compare_fn: Per-output-name overrides for ``torch.allclose``; see
-            :func:`golden.validation.validate_golden`.
-        compile_only: Stop after code generation; skip execute and validate.
-        runtime_dir: Pre-compiled ``build_output/`` directory to reuse. Skips
-            compile and invalidates cached ``.so``/``.bin`` so cpp edits
-            rebuild; *compile_cfg* is ignored, *compile_only* is rejected, and
-            ``PYPTO_BENCH`` is skipped because replay is correctness-only.
-        save_data: When True, persist generated inputs to
-            ``{work_dir}/data/in/`` and golden outputs to
-            ``{work_dir}/data/out/`` for later replay via *golden_data*.
-            Defaults to False, skipping the on-disk ``.pt`` snapshot;
-            validation still runs against the in-memory golden. Enable it
-            when you need to replay the exact inputs/outputs later.
-
-    Returns:
-        :class:`RunResult`.
+    The prologue resolves the scalar values the specialization key needs and
+    hands them to the compile step.
     """
 
     def _prologue(
@@ -1744,7 +1681,7 @@ def run_jit(
         )
         if stepped:
             raise ValueError(
-                "run_jit ScalarSpec benchmark_step requires compile_runtime=True; "
+                "ScalarSpec benchmark_step requires compile_runtime=True; "
                 f"stepped scalars: {stepped}"
             )
         return compile_scalars
@@ -1788,8 +1725,76 @@ def run_jit(
         ]
         return fn.compile(*dummy_args, config=RunConfig(**cfg))
 
+    return _compile, _prologue, "JIT compile"
+
+
+def run(
+    fn: Any,
+    specs: list[TensorSpec | ScalarSpec],
+    golden_fn: Callable | None = None,
+    golden_data: str | None = None,
+    compile_cfg: dict[str, Any] | None = None,
+    runtime_cfg: dict[str, Any] | None = None,
+    rtol: float = 1e-5,
+    atol: float = 1e-5,
+    compare_fn: dict[str, Callable] | None = None,
+    compile_only: bool = False,
+    runtime_dir: str | None = None,
+    save_data: bool = False,
+) -> RunResult:
+    """Compile *fn*, run it on device, and validate against golden.
+
+    Accepts either kernel form. A ``@pl.jit`` callable exposes ``compile`` and
+    is specialized through ``JITFunction.compile``; a ``@pl.program`` class or
+    an ``ir.Program`` goes straight to :func:`pypto.ir.compile`. The two differ
+    only in the compile step and in which *compile_cfg* keys they accept.
+
+    Args:
+        fn: ``@pl.jit`` callable, ``@pl.program`` class, or ``ir.Program``.
+        specs: :class:`TensorSpec` / :class:`ScalarSpec` list in *fn*'s
+            parameter order. A mismatched order is rejected, never reordered.
+        golden_fn: ``golden_fn(values)`` that fills outputs in-place; *values*
+            maps spec name to tensor clone or Python scalar. Ignored when
+            *golden_data* is set; if neither is given, validation is skipped.
+        golden_data: Directory with ``in/{name}.pt`` and ``out/{name}.pt``;
+            loads inputs and expected outputs (read-only). Takes precedence
+            over *golden_fn*.
+        compile_cfg: For a ``@pl.jit`` kernel, compile-side ``RunConfig``
+            fields (``dump_passes`` / ``distributed_config`` /
+            ``compile_profiling`` / ...) carried into ``JITFunction.compile``;
+            ``platform`` is supplied separately, typically via *runtime_cfg*.
+            For a ``@pl.program`` kernel, kwargs forwarded to
+            :func:`pypto.ir.compile`. Unknown keys raise either way.
+        runtime_cfg: Kwargs forwarded to
+            :func:`pypto.runtime.execute_compiled` (``platform``, ``device_id``,
+            ``enable_chip_swimlane``, ...). Unknown keys raise there, except
+            the harness-only key ``log_level``, which is consumed up-front
+            to configure the PyPTO runtime logger via
+            :func:`pypto.runtime.log_config.configure_log`.
+        rtol, atol: Golden comparison tolerances.
+        compare_fn: Per-output-name overrides for ``torch.allclose``; see
+            :func:`golden.validation.validate_golden`.
+        compile_only: Stop after code generation; skip execute and validate.
+        runtime_dir: Pre-compiled ``build_output/`` directory to reuse. Skips
+            compile and invalidates cached ``.so``/``.bin`` so cpp edits
+            rebuild; *compile_cfg* is ignored, *compile_only* is rejected, and
+            ``PYPTO_BENCH`` is skipped because replay is correctness-only.
+        save_data: When True, persist generated inputs to
+            ``{work_dir}/data/in/`` and golden outputs to
+            ``{work_dir}/data/out/`` for later replay via *golden_data*.
+            Defaults to False, skipping the on-disk ``.pt`` snapshot;
+            validation still runs against the in-memory golden. Enable it
+            when you need to replay the exact inputs/outputs later.
+
+    Returns:
+        :class:`RunResult`.
+    """
+    # A JITFunction exposes compile(); a @pl.program class evaluates to an
+    # ir.Program, which does not.
+    entry = _jit_entry if callable(getattr(fn, "compile", None)) else _program_entry
+    compile_step, prologue, compile_label = entry(fn, specs)
     return _run_pipeline(
-        specs, _compile, "JIT compile", _prologue,
+        specs, compile_step, compile_label, prologue,
         golden_fn, golden_data, compile_cfg, runtime_cfg,
         rtol, atol, compare_fn, compile_only, runtime_dir, save_data,
     )

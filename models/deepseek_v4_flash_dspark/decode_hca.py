@@ -1449,7 +1449,7 @@ def build_distributed_tensor_specs(local_t, start_pos=None):
 if __name__ == "__main__":
     import argparse
 
-    from golden import mapped_pool_ratio_allclose, ratio_reldiff, run_jit
+    from golden import mapped_pool_ratio_allclose, ratio_reldiff, run
     from pypto.ir.distributed_compiled_program import DistributedConfig
 
     parser = argparse.ArgumentParser()
@@ -1505,7 +1505,7 @@ if __name__ == "__main__":
 
     for local_t in token_counts:
         if TP_SIZE == 1:
-            result = run_jit(
+            result = run(
                 fn=decode_hca_tp1_test,
                 specs=build_tensor_specs(start_pos=args.start_pos, batch=local_t // S),
                 golden_fn=golden_decode_hca_tp1,
@@ -1545,7 +1545,7 @@ if __name__ == "__main__":
             full_x_out_max_diff = 2 if args.platform == "a2a3sim" else 1
             mapping_shape = (TP_SIZE, local_t)
             full_mapping_shape = (TP_SIZE, TP_SIZE * local_t)
-            result = run_jit(
+            result = run(
                 fn=l3_decode_hca,
                 specs=build_distributed_tensor_specs(local_t, start_pos=args.start_pos),
                 golden_fn=golden_decode_hca,

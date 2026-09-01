@@ -969,7 +969,7 @@ def build_tensor_specs(layer_id=0, num_tokens=T, balanced_routing=False):
 if __name__ == "__main__":
     import argparse
 
-    from golden import ratio_reldiff, run_jit
+    from golden import ratio_reldiff, run
 
     parser = argparse.ArgumentParser()
     parser.add_argument("-p", "--platform", type=str, default="a2a3",
@@ -1000,7 +1000,7 @@ if __name__ == "__main__":
 
     golden_data = args.golden_data
 
-    result = run_jit(
+    result = run(
         fn=l3_moe,
         specs=build_tensor_specs(
             layer_id=args.layer_id,

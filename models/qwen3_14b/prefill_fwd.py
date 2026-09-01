@@ -2209,7 +2209,7 @@ def golden_qwen3_14b_prefill(tensors):
 
 if __name__ == "__main__":
     import argparse
-    from golden import run_jit
+    from golden import run
 
     parser = argparse.ArgumentParser()
     parser.add_argument(
@@ -2258,7 +2258,7 @@ if __name__ == "__main__":
                         help="skip host golden computation and output validation")
     args = parser.parse_args()
 
-    result = run_jit(
+    result = run(
         fn=prefill_fwd,
         specs=build_tensor_specs(
             batch=args.batch,

@@ -196,7 +196,7 @@ python models/deepseek_v4_pro/synthetic_token_loop.py --variant flash \
 
 The full prefill and decode programs carry runtime `num_tokens` and
 `moe_epoch_base` scalars in their compiled ABI. Their `ScalarSpec`s use
-`compile_runtime=True`, so `run_jit` passes `pl.RUNTIME` during
+`compile_runtime=True`, so `run` passes `pl.RUNTIME` during
 signature-driven compilation instead of folding the initial values into
 generated task arguments. `num_tokens` follows the real prompt/decode row
 count, while callers advance the epoch scalar by

@@ -622,7 +622,7 @@ def build_tensor_specs(start_pos=None, batch=B):
 
 if __name__ == "__main__":
     import argparse
-    from golden import ratio_allclose, run_jit
+    from golden import ratio_allclose, run
 
     parser = argparse.ArgumentParser()
     parser.add_argument("-p", "--platform", type=str, default="a2a3",
@@ -650,7 +650,7 @@ if __name__ == "__main__":
             parser.error(f"--start-pos must contain integers, got {args.start_pos!r}")
         start_pos = start_values[0] if len(start_values) == 1 else start_values
 
-    result = run_jit(
+    result = run(
         fn=compressor_test,
         specs=build_tensor_specs(start_pos, batch=args.batch),
         golden_fn=golden_compressor,
