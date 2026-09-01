@@ -296,7 +296,7 @@ def decode_hca(
             rope_cos_il, rope_sin_signed, rope_swap_idx,
             stream_heads_tid, rope_swap_tid, rope_cs_tid,
         ) = sparse_attn_hca(
-            q, kv_cache, window_swa_indices,
+            q, kv_cache, window_swa_indices, window_swa_lens,
             cmp_kv, cmp_block_table,
             position_ids_local, kv_seq_lens,
             attn_sink, freqs_cos_local, freqs_sin_local,
@@ -690,7 +690,7 @@ def decode_hca_tp1(
     with pl.scope():
         o_packed_heads = pl.create_tensor([O_GROUPS * T_PAD, O_GROUP_IN], dtype=pl.BF16)
         o_packed_heads, heads_dep = sparse_attn_hca_tp1(
-            q, kv_cache, window_swa_indices,
+            q, kv_cache, window_swa_indices, window_swa_lens,
             cmp_kv, cmp_block_table,
             position_ids, kv_seq_lens,
             attn_sink, freqs_cos, freqs_sin,

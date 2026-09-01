@@ -60,9 +60,8 @@ HCA_COMPRESSED_POOL_ROWS = CMP_BLOCK_NUM * BLOCK_SIZE
 
 # tiling
 VALID_TOKEN_TILE = 8
-GATHER_SEGMENTS = 4
 GATHER_RUN_TILE = 16
-GATHER_WINDOW_TILE = WIN // GATHER_SEGMENTS
+REQUEST_KV_ROWS = WIN + S - 1
 RAW_K_TILE = BLOCK_SIZE
 ATTN_K_TILE = 128
 ATTN_D_TILE = 256
@@ -109,6 +108,7 @@ def sparse_attn_hca(
     q: pl.Tensor[[T_DYN, H, HEAD_DIM], pl.BF16],
     ori_kv: pl.Tensor[[ORI_BLOCK_NUM_DYN, BLOCK_SIZE, 1, HEAD_DIM], pl.BF16],
     window_swa_indices: pl.Tensor[[T_DYN, WIN], pl.INT32],
+    window_swa_lens: pl.Tensor[[T_DYN], pl.INT32],
     cmp_kv: pl.Tensor[[CMP_BLOCK_NUM_DYN, BLOCK_SIZE, 1, HEAD_DIM], pl.BF16],
     cmp_block_table: pl.Tensor[[B_DYN, CMP_TABLE_BLOCKS_DYN], pl.INT32],
     position_ids: pl.Tensor[[T_DYN], pl.INT32],
@@ -130,7 +130,7 @@ def sparse_attn_hca(
     q_flat = pl.reshape(q, [t_dim * H, HEAD_DIM])
     attn_sink_col = pl.reshape(attn_sink, [H, 1])
     request_count = pl.tensor.dim(cmp_block_table, 0)
-    raw_gather_count = t_dim * GATHER_SEGMENTS
+    raw_gather_count = request_count
     stream_block_count = t_dim * (H // H_TILE)
     cmp_gather_count = request_count * cmp_work_count
     cmp_qk_block_count = t_dim * cmp_work_count
@@ -151,45 +151,107 @@ def sparse_attn_hca(
     rope_cs_tids = pl.array.create(1, pl.TASK_ID)
 
     with pl.scope():
-        raw_kv = pl.create_tensor([t_dim * WIN, HEAD_DIM], dtype=pl.BF16)
+        raw_kv = pl.create_tensor([request_count * REQUEST_KV_ROWS, HEAD_DIM], dtype=pl.BF16)
         raw_valid = pl.create_tensor([t_dim, WIN], dtype=pl.FP32)
         with pl.spmd(raw_gather_count, name_hint="hca_gather_kv", deps=[cache_ready_dep]) as raw_gather_tid:
-            g_task = pl.tile.get_block_idx()
-            g_t = g_task // GATHER_SEGMENTS
-            g_seg = g_task - g_t * GATHER_SEGMENTS
-            g_wk0 = g_seg * GATHER_WINDOW_TILE
-            g_row0 = g_t * WIN
-            for g_sub in pl.range(GATHER_WINDOW_TILE // GATHER_RUN_TILE):
-                g_sk0 = g_wk0 + g_sub * GATHER_RUN_TILE
-                g_sdst = g_row0 + g_sk0
-                g_first = pl.read(window_swa_indices, [g_t, g_sk0])
-                g_run_matches = pl.cast(g_first >= 0, pl.INT32)
-                for g_dr in pl.unroll(GATHER_RUN_TILE):
-                    g_slot_i32 = pl.read(window_swa_indices, [g_t, g_sk0 + g_dr])
-                    g_run_matches = g_run_matches * pl.cast(g_slot_i32 == g_first + g_dr, pl.INT32)
-                if g_run_matches == 1:
-                    g_run_src = pl.cast(g_first, pl.INDEX)
-                    raw_kv[
-                        g_sdst : g_sdst + GATHER_RUN_TILE,
-                        0:HEAD_DIM,
-                    ] = ori_kv_flat[
-                        g_run_src : g_run_src + GATHER_RUN_TILE,
-                        0:HEAD_DIM,
-                    ]
+            g_req = pl.tile.get_block_idx()
+            g_t0 = g_req * S
+            g_base = g_req * REQUEST_KV_ROWS
+            g_first_len = pl.read(window_swa_lens, [g_t0])
+            raw_kv[
+                g_base : g_base + REQUEST_KV_ROWS,
+                0:HEAD_DIM,
+            ] = pl.full([REQUEST_KV_ROWS, HEAD_DIM], dtype=pl.BF16, value=0.0)
+
+            for g_sub in pl.range(WIN // GATHER_RUN_TILE):
+                g_sr0 = g_sub * GATHER_RUN_TILE
+                g_sdst = g_base + g_sr0
+                if g_sr0 + GATHER_RUN_TILE <= g_first_len:
+                    g_first = pl.read(window_swa_indices, [g_t0, g_sr0])
+                    g_run_matches = pl.cast(g_first >= 0, pl.INT32)
                     for g_dr in pl.unroll(GATHER_RUN_TILE):
-                        pl.write(raw_valid, [g_t, g_sk0 + g_dr], 1.0)
+                        g_slot_i32 = pl.read(window_swa_indices, [g_t0, g_sr0 + g_dr])
+                        g_run_matches = g_run_matches * pl.cast(
+                            g_slot_i32 == g_first + g_dr,
+                            pl.INT32,
+                        )
+                    if g_run_matches == 1:
+                        g_run_src = pl.cast(g_first, pl.INDEX)
+                        raw_kv[
+                            g_sdst : g_sdst + GATHER_RUN_TILE,
+                            0:HEAD_DIM,
+                        ] = ori_kv_flat[
+                            g_run_src : g_run_src + GATHER_RUN_TILE,
+                            0:HEAD_DIM,
+                        ]
+                    else:
+                        for g_dr in pl.range(GATHER_RUN_TILE):
+                            g_slot_i32 = pl.read(window_swa_indices, [g_t0, g_sr0 + g_dr])
+                            if g_slot_i32 >= 0:
+                                g_slot = pl.cast(g_slot_i32, pl.INDEX)
+                                g_dst = g_sdst + g_dr
+                                raw_kv[
+                                    g_dst : g_dst + 1,
+                                    0:HEAD_DIM,
+                                ] = ori_kv_flat[
+                                    g_slot : g_slot + 1,
+                                    0:HEAD_DIM,
+                                ]
                 else:
                     for g_dr in pl.range(GATHER_RUN_TILE):
-                        g_lane = g_sk0 + g_dr
-                        g_dst = g_row0 + g_lane
-                        g_slot_i32 = pl.read(window_swa_indices, [g_t, g_lane])
-                        if g_slot_i32 >= 0:
-                            g_slot = pl.cast(g_slot_i32, pl.INDEX)
-                            raw_kv[g_dst : g_dst + 1, 0:HEAD_DIM] = ori_kv_flat[g_slot : g_slot + 1, 0:HEAD_DIM]
-                            pl.write(raw_valid, [g_t, g_lane], 1.0)
-                        else:
-                            raw_kv[g_dst : g_dst + 1, 0:HEAD_DIM] = pl.full([1, HEAD_DIM], dtype=pl.BF16, value=0.0)
-                            pl.write(raw_valid, [g_t, g_lane], 0.0)
+                        g_row = g_sr0 + g_dr
+                        if g_row < g_first_len:
+                            g_slot_i32 = pl.read(window_swa_indices, [g_t0, g_row])
+                            if g_slot_i32 >= 0:
+                                g_slot = pl.cast(g_slot_i32, pl.INDEX)
+                                g_dst = g_base + g_row
+                                raw_kv[
+                                    g_dst : g_dst + 1,
+                                    0:HEAD_DIM,
+                                ] = ori_kv_flat[
+                                    g_slot : g_slot + 1,
+                                    0:HEAD_DIM,
+                                ]
+
+            for g_token in pl.unroll(S - 1):
+                g_t = g_t0 + g_token + 1
+                g_len = pl.read(window_swa_lens, [g_t])
+                g_slot_i32 = pl.read(window_swa_indices, [g_t, g_len - 1])
+                if g_slot_i32 >= 0:
+                    g_slot = pl.cast(g_slot_i32, pl.INDEX)
+                    g_dst = g_base + g_first_len + g_token
+                    raw_kv[
+                        g_dst : g_dst + 1,
+                        0:HEAD_DIM,
+                    ] = ori_kv_flat[
+                        g_slot : g_slot + 1,
+                        0:HEAD_DIM,
+                    ]
+
+        with pl.spmd(t_dim // VALID_TOKEN_TILE, name_hint="hca_raw_valid") as raw_valid_tid:
+            valid_block = pl.tile.get_block_idx()
+            valid_t0 = valid_block * VALID_TOKEN_TILE
+            valid_col = pl.cast(
+                pl.tile.arange(0, [1, WIN], dtype=pl.INT32),
+                target_type=pl.FP32,
+            )
+            valid_zero = pl.tile.full([VALID_TOKEN_TILE, WIN], dtype=pl.FP32, value=0.0)
+            valid_cols = pl.col_expand_add(valid_zero, valid_col)
+            valid_lens_i32 = pl.load(
+                window_swa_lens,
+                [valid_t0],
+                [VALID_TOKEN_TILE],
+                target_memory=pl.MemorySpace.Vec,
+            )
+            valid_lens = pl.cast(
+                pl.reshape(valid_lens_i32, [VALID_TOKEN_TILE, 1]),
+                target_type=pl.FP32,
+            )
+            valid_mask = pl.minimum(
+                pl.maximum(pl.neg(pl.row_expand_sub(valid_cols, valid_lens)), 0.0),
+                1.0,
+            )
+            pl.store(valid_mask, [valid_t0, 0], raw_valid)
 
         with pl.spmd(1, name_hint="rope_swap") as rope_swap_tid:
             sw_block = pl.tile.get_block_idx()
@@ -231,17 +293,27 @@ def sparse_attn_hca(
                 rope_cos_il[cs_t0 : cs_t0 + ROPE_CS_T_TILE, cp_c0 : cp_c0 + ROPE_INTERLEAVE_TILE] = cs_cos_dup
                 rope_sin_signed[cs_t0 : cs_t0 + ROPE_CS_T_TILE, cp_c0 : cp_c0 + ROPE_INTERLEAVE_TILE] = cs_sin_signed
 
-        with pl.spmd(stream_block_count, name_hint="hca_raw_attn", deps=[raw_gather_tid]) as raw_heads_tid:
+        with pl.spmd(
+            stream_block_count,
+            name_hint="hca_raw_attn",
+            deps=[raw_gather_tid, raw_valid_tid],
+        ) as raw_heads_tid:
             stream_idx = pl.tile.get_block_idx()
             stream_t = stream_idx // (H // H_TILE)
             stream_h_tile = stream_idx - stream_t * (H // H_TILE)
             stream_h0 = stream_h_tile * H_TILE
             stream_state_row = stream_t * H + stream_h0
+            stream_request = stream_t // S
+            stream_token = stream_t - stream_request * S
+            stream_first_t = stream_request * S
+            stream_first_len = pl.read(window_swa_lens, [stream_first_t])
+            stream_drop = pl.max(stream_first_len + stream_token - WIN, 0)
+            stream_raw_base = stream_request * REQUEST_KV_ROWS + stream_drop
             stream_q = pl.load(q_flat, [stream_state_row, 0], [H_TILE, HEAD_DIM], target_memory=pl.MemorySpace.Vec)
             stream_row_max_tmp = pl.create_tile([H_TILE, RAW_K_TILE], dtype=pl.FP32, target_memory=pl.MemorySpace.Vec)
             stream_row_sum_tmp = pl.create_tile([H_TILE, RAW_K_TILE], dtype=pl.FP32, target_memory=pl.MemorySpace.Vec)
             for stream_raw_item in pl.unroll(WIN // RAW_K_TILE):
-                stream_raw_begin = stream_t * WIN + stream_raw_item * RAW_K_TILE
+                stream_raw_begin = stream_raw_base + stream_raw_item * RAW_K_TILE
                 stream_valid_begin = stream_raw_item * RAW_K_TILE
                 stream_raw_kv = pl.load(
                     raw_kv,
@@ -500,6 +572,7 @@ def sparse_attn_hca_tp1(
     q: pl.Tensor[[T_DYN, H, HEAD_DIM], pl.BF16],
     ori_kv: pl.Tensor[[ORI_BLOCK_NUM_DYN, BLOCK_SIZE, 1, HEAD_DIM], pl.BF16],
     window_swa_indices: pl.Tensor[[T_DYN, WIN], pl.INT32],
+    window_swa_lens: pl.Tensor[[T_DYN], pl.INT32],
     cmp_kv: pl.Tensor[[CMP_BLOCK_NUM_DYN, BLOCK_SIZE, 1, HEAD_DIM], pl.BF16],
     cmp_block_table: pl.Tensor[[B_DYN, CMP_TABLE_BLOCKS_DYN], pl.INT32],
     position_ids: pl.Tensor[[T_DYN], pl.INT32],
@@ -519,6 +592,7 @@ def sparse_attn_hca_tp1(
         q,
         ori_kv,
         window_swa_indices,
+        window_swa_lens,
         cmp_kv,
         cmp_block_table,
         position_ids,
@@ -572,6 +646,7 @@ def sparse_attn_hca_test(
     q: pl.Tensor[[T_DYN, H, HEAD_DIM], pl.BF16],
     ori_kv: pl.Tensor[[ORI_BLOCK_NUM_DYN, BLOCK_SIZE, 1, HEAD_DIM], pl.BF16],
     window_swa_indices: pl.Tensor[[T_DYN, WIN], pl.INT32],
+    window_swa_lens: pl.Tensor[[T_DYN], pl.INT32],
     cmp_kv: pl.Tensor[[CMP_BLOCK_NUM_DYN, BLOCK_SIZE, 1, HEAD_DIM], pl.BF16],
     cmp_block_table: pl.Tensor[[B_DYN, CMP_TABLE_BLOCKS_DYN], pl.INT32],
     position_ids: pl.Tensor[[T_DYN], pl.INT32],
@@ -585,6 +660,7 @@ def sparse_attn_hca_test(
     cmp_block_table.bind_dynamic(0, B_DYN)
     cmp_block_table.bind_dynamic(1, CMP_TABLE_BLOCKS_DYN)
     window_swa_indices.bind_dynamic(0, T_DYN)
+    window_swa_lens.bind_dynamic(0, T_DYN)
     position_ids.bind_dynamic(0, T_DYN)
     kv_seq_lens.bind_dynamic(0, B_DYN)
     freqs_cos.bind_dynamic(0, T_DYN)
@@ -593,7 +669,7 @@ def sparse_attn_hca_test(
     cache_ready_dep = pl.system.task_dummy(deps=[])
     o_packed_flat = pl.reshape(o_packed_heads, [O_GROUPS * T_PAD, O_GROUP_IN])
     o_packed_flat, _heads_tid = sparse_attn_hca_tp1(
-        q, ori_kv, window_swa_indices,
+        q, ori_kv, window_swa_indices, window_swa_lens,
         cmp_kv, cmp_block_table,
         position_ids, kv_seq_lens,
         attn_sink, freqs_cos, freqs_sin,
@@ -774,8 +850,8 @@ def build_tensor_specs(
         kv = torch.rand(ORI_BLOCK_NUM, BLOCK_SIZE, 1, HEAD_DIM) - 0.5
         if causal_regression_fixture:
             table = init_window_block_table()
-            sentinel_page = int(table[0, (WIN - 1) // BLOCK_SIZE].item())
-            sentinel_row = (WIN - 1) % BLOCK_SIZE
+            sentinel_page = int(table[0, WIN // BLOCK_SIZE].item())
+            sentinel_row = WIN % BLOCK_SIZE
             kv[sentinel_page, sentinel_row, 0].fill_(8.0)
         if cache_window_replacement_fixture:
             kv[0, 16, 0].fill_(0.0)
@@ -786,13 +862,25 @@ def build_tensor_specs(
         """Build physical cache-row indices for standalone window raw slots."""
         tbl = init_window_block_table()
         indices = torch.full((tokens, WIN), -1, dtype=torch.int32)
+        lens = init_window_swa_lens()
         for t in range(tokens):
             b = t // S
-            for raw in range(WIN):
-                blk = int(tbl[b, raw // BLOCK_SIZE].item())
+            token = t % S
+            valid_len = int(lens[t].item())
+            for raw in range(valid_len):
+                logical_row = raw if short_window_fixture else token + raw
+                blk = int(tbl[b, logical_row // BLOCK_SIZE].item())
                 if blk >= 0:
-                    indices[t, raw] = blk * BLOCK_SIZE + raw % BLOCK_SIZE
+                    indices[t, raw] = blk * BLOCK_SIZE + logical_row % BLOCK_SIZE
         return indices
+
+    def init_window_swa_lens():
+        """Build the valid raw-window length for each speculative query."""
+        lens = torch.full((tokens,), WIN, dtype=torch.int32)
+        if short_window_fixture:
+            for t in range(tokens):
+                lens[t] = min(17 + t % S, WIN)
+        return lens
 
     def init_cmp_kv():
         """Initialize the compressed-cache KV pages."""
@@ -848,6 +936,7 @@ def build_tensor_specs(
         TensorSpec("q", [tokens, H, HEAD_DIM], torch.bfloat16, init_value=init_q),
         TensorSpec("ori_kv", [ORI_BLOCK_NUM, BLOCK_SIZE, 1, HEAD_DIM], torch.bfloat16, init_value=init_ori_kv),
         TensorSpec("window_swa_indices", [tokens, WIN], torch.int32, init_value=init_window_swa_indices),
+        TensorSpec("window_swa_lens", [tokens], torch.int32, init_value=init_window_swa_lens),
         TensorSpec("cmp_kv", [CMP_BLOCK_NUM, BLOCK_SIZE, 1, HEAD_DIM], torch.bfloat16, init_value=init_cmp_kv),
         TensorSpec("cmp_block_table", [batch, table_blocks], torch.int32, init_value=init_cmp_block_table),
         TensorSpec("position_ids", [tokens], torch.int32, init_value=init_position_ids),
