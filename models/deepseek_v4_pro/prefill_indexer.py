@@ -452,7 +452,7 @@ def golden_prefill_indexer_core(tensors):
     # Per-token causal mask, then top-k over the visible compressed positions.
     col = torch.arange(max_visible).unsqueeze(0)
     score = score.masked_fill(col >= visible.unsqueeze(1), FP32_NEG_INF)
-    score_full[:, :max_visible] = score
+    score_full[:num_tokens, :max_visible] = score[:num_tokens]
     for t in range(num_tokens):
         k = int(min(INDEXER_TOPK_CAP, int(visible[t].item())))
         if k > 0:
