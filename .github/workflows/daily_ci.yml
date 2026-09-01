@@ -552,23 +552,6 @@ jobs:
           build-namespace: a5-e2e
           pip-cache-name: pip-a5
           toolchain: bundle
-          # TEMPORARY toolchain quarantine — drop when the pto-isa fix lands.
-          #
-          # pypto HEAD's pin chain (runtime gitlink 93adc386 -> pto-isa
-          # cd4a3d3f) carries the pto-isa A5 regression from 92eb7f88: the
-          # legacy TPUSH/TPOP overloads read get_subblockid() on
-          # TILE_NO_SPLIT cross-core pipes, which deadlocks C2V/V2C on A5.
-          # On that toolchain every EP8 run of this job dies at the first
-          # prefill (S1:running-stalled / 507018) before sampling one token —
-          # nightlies 2026-08-21 and -24, with and without the MoE protocol
-          # fix. 7292b8da is the newest pypto whose chain (simpler 3165cc89
-          # -> pto-isa 83d01313) predates the regression; the token loop and
-          # hc_pre carry small both-ABI shims so current pypto-lib still
-          # compiles on it. The fix is upstream as GitCode CANN/pto-isa
-          # MR !1525 ("fix/a5-no-split-subblock-dispatch"); once it reaches
-          # the GitHub mirror and simpler/pypto bump their pins past it,
-          # remove this input so the job follows HEAD again.
-          pypto-ref: 7292b8daa27b396e3d34c17add080e8db3086620
 
       - name: Resolve the Flash checkpoint and its converted weight cache
         id: weights
@@ -678,14 +661,17 @@ jobs:
                   --prompt '$E2E_PROMPT' --decode-steps $E2E_DECODE_STEPS" 2>&1 | tee e2e.log
             return "${PIPESTATUS[0]}"
           }
-          # One retry, disclosed: the pinned toolchain still carries a
-          # probabilistic cross-rank divergence (issue #1043) that kills about
-          # one run in four at a random decode step. A monitoring job that
-          # exists to publish the nightly continuation should not go dark on a
-          # known flake, and e2e.json records the attempt count and the first
+          # One retry, disclosed: the toolchain carries a probabilistic
+          # cross-rank divergence (issue #1043) that kills about one run in
+          # four at a random decode step. A monitoring job that exists to
+          # publish the nightly continuation should not go dark on a known
+          # flake, and e2e.json records the attempt count and the first
           # attempt's error so a flaky night still reads as exactly what it
-          # was. Drop the retry together with the pin once the toolchain fix
-          # lands.
+          # was. This outlived the toolchain pin it was introduced beside:
+          # #1043 is still open, and whether HEAD's toolchain changes the rate
+          # is unknown until the unpinned nightlies say so. Drop the retry
+          # when #1043 closes, or when the recorded attempt counts show it is
+          # no longer earning its place.
           attempts=1
           run_loop; rc=$?
           if [ "$rc" -ne 0 ]; then
