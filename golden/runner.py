@@ -536,10 +536,29 @@ def _run_benchmark(
     stats = None
     with _Stage("benchmark"):
         try:
+            # Forward the caller's RunConfig when there is one, mirroring the
+            # L3 branch. The benchmark is a second, independent dispatch, so a
+            # program that sizes its rings for the correctness run must size
+            # them here too or it validates and then deadlocks. benchmark()
+            # takes config= or platform=/device_id=, never both, and a bare
+            # RunConfig still defaults to platform "a2a3sim" / device 0 — pin
+            # this run's real target onto a copy rather than trusting the
+            # caller to have restated it.
+            rc = runtime_cfg.get("config")
+            if rc is not None:
+                import dataclasses
+
+                bench_kwargs: dict[str, Any] = {
+                    "config": dataclasses.replace(
+                        rc, platform=platform, device_id=device_id
+                    )
+                }
+            else:
+                bench_kwargs = {"platform": platform, "device_id": device_id}
             stats = benchmark(
                 compiled, ordered,
                 rounds=rounds, warmup=warmup,
-                platform=platform, device_id=device_id,
+                **bench_kwargs,
             )
         except RuntimeError as e:
             if not _benchmark_unavailable(e):

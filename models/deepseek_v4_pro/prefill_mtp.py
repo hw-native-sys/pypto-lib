@@ -73,6 +73,12 @@ T = PREFILL_TOKENS
 MTP_LAYER_ID = M.num_hidden_layers
 MTP_MOE_EPOCH = 1
 
+# The MTP prefill layer overflows the runtime's default 256 MiB-per-ring output
+# heap and fails on device with `orch_error_code=2 HEAP_RING_DEADLOCK`. Unlike
+# prefill_fwd.py, sizing ring 2 alone does not clear it -- measured on a5, ring 2
+# at 2 GiB still deadlocks -- so size every ring.
+MTP_RING_HEAP = 1024 * 1024 * 1024
+
 
 @pl.jit
 def mtp_prefill_fwd(
@@ -593,6 +599,7 @@ def main():
             platform=args.platform,
             enable_chip_swimlane=args.enable_chip_swimlane,
             enable_scope_stats=args.enable_scope_stats,
+            ring_heap=MTP_RING_HEAP,
         ),
         rtol=1e-3,
         atol=1e-3,

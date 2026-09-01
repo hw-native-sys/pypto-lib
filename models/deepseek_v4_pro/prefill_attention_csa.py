@@ -127,13 +127,13 @@ assert S == WIN, "packed CSA prefill currently assumes one static window page"
 
 # PRO's wider hidden/HC dims make one prefill attention layer's per-task args and
 # intermediates overflow the runtime's default ring-2 output heap, which surfaces as
-# `orch_error_code=2 HEAP_RING_DEADLOCK`. prefill_fwd.py fixes the same thing with
-# run()'s `ring_heap=` argument, which only the L3 dispatch path honours. A
-# single-chip leaf has no way to apply it, so the size below records what the
-# kernel needs and is NOT applied -- the run takes the 256 MiB compile default.
-# All four rings, not just ring 2: raising ring 2 alone (what prefill_fwd.py
-# needs) still deadlocks here at both 2 GiB and 4 GiB, measured on device.
-PREFILL_ATTN_RING_HEAP = (4 * 1024 * 1024 * 1024,) * 4
+# `orch_error_code=2 HEAP_RING_DEADLOCK`. The default is CHIP_HEAP_SIZE, 256 MiB per
+# ring; measured on a5, every ring at 512 MiB is already enough for all three prefill
+# attention variants, so 1 GiB is one doubling of headroom over the measured need.
+# All four rings, not just ring 2: ring 2 alone (what prefill_fwd.py sets) does not
+# clear it. Applied through run_jit's runtime_cfg, which reaches the device only on
+# the ChipWorker route -- see golden/runner.py::_execute_via_runner.
+PREFILL_ATTN_RING_HEAP = (1024 * 1024 * 1024,) * 4
 
 # Cache and state pools are allocator-managed global tensors.  Their physical
 # capacities are runtime values; request-local tables carry the actual block
@@ -976,6 +976,8 @@ if __name__ == "__main__":
     # elements), but keep the 0.5% fraction bar identical to full prefill.
     x_out_diff_thd, x_out_max_diff = (8e-3, 2) if args.start_pos else (5e-3, 1)
 
+    from pypto.runtime import RunConfig
+
     result = run_jit(
         fn=prefill_attention_csa_test,
         specs=build_tensor_specs(
@@ -989,6 +991,9 @@ if __name__ == "__main__":
             device_id=args.device,
             enable_chip_swimlane=args.enable_chip_swimlane,
             enable_dep_gen=args.enable_dep_gen,
+            # Ring sizing lives on execute_compiled's `config`, not on its
+            # signature, so name it here rather than as a bare keyword.
+            config=RunConfig(ring_heap=PREFILL_ATTN_RING_HEAP),
         ),
         rtol=1e-2,
         atol=1e-2,

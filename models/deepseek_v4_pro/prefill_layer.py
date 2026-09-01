@@ -121,6 +121,11 @@ assert HCA_CMP_BLOCK_NUM == CSA_CMP_BLOCK_NUM
 # ``T`` is the fixed child-kernel token-tile capacity (Qwen's ``TOK_TILE``). It is
 # NOT the packed token total. The packed prefill only ever feeds the children a
 # fixed ``[T, ...]`` tile at a time.
+# One prefill layer overflows the runtime's default 256 MiB-per-ring output
+# heap and fails with `orch_error_code=2 HEAP_RING_DEADLOCK`. Size every ring:
+# ring 2 alone, which prefill_fwd.py sets, does not clear it.
+LAYER_RING_HEAP = 1024 * 1024 * 1024
+
 TOK_TILE = T
 PREFILL_CHUNK_TOKENS = T
 DEFAULT_CHUNK_LENS = (T, T + T // 2)
@@ -1724,6 +1729,7 @@ if __name__ == "__main__":
         runtime_cfg=dict(
             platform=args.platform,
             enable_chip_swimlane=args.enable_chip_swimlane,
+            ring_heap=LAYER_RING_HEAP,
         ),
         rtol=1e-3,
         atol=1e-3,
