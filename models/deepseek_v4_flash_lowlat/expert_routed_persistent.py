@@ -48,8 +48,21 @@ NUM_CORES = 24
 
 # tiling
 FUSED_N_TILE = MOE_INTER
-FUSED_K_TILE = 512
-FUSED_Y_TILE = 512
+# The whole intermediate shard is one cube N tile, which is what lets the amax
+# stay a within-row reduction -- and it is also what bounds this form by buffer
+# size. Acc holds gate_acc and up_acc double-buffered at 2 * 2 * ROW_TILE *
+# MOE_INTER * 4 B, so MOE_INTER > 512 overflows L0C no matter how K is tiled;
+# below that, K is what keeps Mat (double-buffered operands plus the 64 KiB c2v
+# ring) under its limit. TP=8 gives MOE_INTER=256 and K stays at 512.
+assert MOE_INTER <= 512, (
+    f"the fused routed expert needs MOE_INTER <= 512, got {MOE_INTER}: gate_acc and "
+    "up_acc do not fit L0C. Use expert_routed.py's four-task form at this TP degree."
+)
+# Both cube operands are bounded the same way: the gate/up weight tile is
+# MOE_INTER x FUSED_K_TILE and the down weight tile is FUSED_Y_TILE x MOE_INTER,
+# each double-buffered, and Mat has to hold them beside the 64 KiB c2v ring.
+FUSED_K_TILE = max(64, min(512, 131072 // MOE_INTER))
+FUSED_Y_TILE = max(64, min(512, 131072 // MOE_INTER))
 QUANT_TILE = MOE_INTER
 
 
