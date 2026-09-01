@@ -1,7 +1,7 @@
 # Qwen3-14B Optimization
 
 This page is a case study rather than a reference. It follows
-[`models/qwen3_14b/`](../../models/qwen3_14b/) — a 40-layer dense GQA model that
+[`models/qwen3_14b/`](../../../models/qwen3_14b/) — a 40-layer dense GQA model that
 runs prefill, decode, and sampling on a **single card** — from its first kernels
 to their current state, and records which levers moved the number, which did
 not, and what each one cost.
@@ -12,12 +12,12 @@ tiles, its task graph, and the boundary between it and the host — which is wha
 makes the order the work happened in worth recording.
 
 The mechanisms live elsewhere:
-[Performance Tuning](performance-tuning.md) for how to measure and capture,
-[Cube Tile Tuning](cube-tile-tuning.md) for choosing tiles,
-[Dependencies and Scheduling](dependency-and-scheduling.md) for the task graph
+[Performance Tuning](../../debug-and-tune/performance-tuning.md) for how to measure and capture,
+[Cube Tile Tuning](../../debug-and-tune/cube-tile-tuning.md) for choosing tiles,
+[Dependencies and Scheduling](../../debug-and-tune/dependency-and-scheduling.md) for the task graph
 and the scheduler,
-[Ring Heap and Scope Stats](ring-heap-and-scope-stats.md) for scope placement,
-and [Precision Tuning](precision-tuning.md) for thresholds and rounding. Read
+[Ring Heap and Scope Stats](../../debug-and-tune/ring-heap-and-scope-stats.md) for scope placement,
+and [Precision Tuning](../../debug-and-tune/precision-tuning.md) for thresholds and rounding. Read
 those for *how*; read this for *in what order, and what to expect*.
 
 Numbers in parentheses are pypto-lib pull requests, kept so a claim can be
@@ -42,7 +42,7 @@ move independently, and this page says which one a change moved.
 
 None of the three is what a new measurement should use. Today's number is the
 `mean=` field of `PYPTO_BENCH=1`'s `[RUN] effective_us` line, which is also what
-daily CI reports — see [Performance Tuning](performance-tuning.md). Do not
+daily CI reports — see [Performance Tuning](../../debug-and-tune/performance-tuning.md). Do not
 compare a fresh `effective_us` against a figure on this page.
 
 ## The shape of the work
@@ -91,7 +91,7 @@ The tree spent three changes finding an answer:
    `UP_DOWN`. That needed the toolchain to accept the `valid_row=0` subview the
    replay rewrites the trim into — ptoas >= 0.43 and the pto-isa
    `GetValidRow`/`GetValidCol` relaxation, both named as hard prerequisites in
-   #420. [constants.py](../../models/qwen3_14b/constants.py) still asserts the
+   #420. [constants.py](../../../models/qwen3_14b/constants.py) still asserts the
    geometry it requires: `Q_HEAD_PAD % 4 == 0` and
    `Q_HEAD_PAD // 2 >= Q_HEAD_BATCH`.
 
@@ -399,7 +399,7 @@ ties the C++ worker guard to the Python `ROPE_CORES` value.
 > boundary the in-house one could not.
 
 The methodology that made #796 possible is written up separately in
-[CCE In-Core Profiling](cce-incore-profiling.md).
+[CCE In-Core Profiling](../../debug-and-tune/cce-incore-profiling.md).
 
 ### 2.2 Sampling: host → device, then approximate → exact
 
@@ -468,7 +468,7 @@ both host goldens mirror the pack and unpack rather than reimplementing them.
 ## 3. Scheduling
 
 Once the arithmetic is mined out, dispatch shape becomes first-order. The
-mechanisms are in [Dependencies and Scheduling](dependency-and-scheduling.md);
+mechanisms are in [Dependencies and Scheduling](../../debug-and-tune/dependency-and-scheduling.md);
 what follows is what they bought here.
 
 ### 3.1 A disjoint-slice write is not a parallel write
@@ -514,7 +514,7 @@ go out as `pl.spmd` per K-split gated on the corresponding cast, and tiles
 The two ranges write disjoint columns and atomic-add over K, so the split is
 value-equivalent to the fused form — the only thing that changes is issue order.
 Both idioms are catalogued in
-[Deliberately delaying a task](dependency-and-scheduling.md#deliberately-delaying-a-task).
+[Deliberately delaying a task](../../debug-and-tune/dependency-and-scheduling.md#deliberately-delaying-a-task).
 
 ### 3.3 Early dispatch, and the one place it hangs
 
@@ -561,20 +561,20 @@ This is not a micro-optimization. Under auto-scope the 40-layer prefill
 no working value: 131072 deadlocks, 524288 clears it but OOMs the static arena
 at 6.25 GB. With manual rings the same
 kernel passes at 262144 / 4 GiB. See
-[Ring Heap and Scope Stats](ring-heap-and-scope-stats.md).
+[Ring Heap and Scope Stats](../../debug-and-tune/ring-heap-and-scope-stats.md).
 
 ## See also
 
-- [Performance Tuning](performance-tuning.md) — measurement, capture, and the
+- [Performance Tuning](../../debug-and-tune/performance-tuning.md) — measurement, capture, and the
   L2 / L1 / L0 tuning rules
-- [Cube Tile Tuning](cube-tile-tuning.md) — choosing row, N and K tiles against
+- [Cube Tile Tuning](../../debug-and-tune/cube-tile-tuning.md) — choosing row, N and K tiles against
   the compiler's memory report
-- [Dependencies and Scheduling](dependency-and-scheduling.md) — how edges form,
+- [Dependencies and Scheduling](../../debug-and-tune/dependency-and-scheduling.md) — how edges form,
   when the scheduler issues, early dispatch, and dummy-task idioms
-- [Ring Heap and Scope Stats](ring-heap-and-scope-stats.md) — manual scope
+- [Ring Heap and Scope Stats](../../debug-and-tune/ring-heap-and-scope-stats.md) — manual scope
   placement and per-ring heap and task-window pressure
-- [CCE Extern Kernel](../pypto-coding/cce-extern-kernel.md) — how a hand-written
+- [CCE Extern Kernel](../../pypto-coding/cce-extern-kernel.md) — how a hand-written
   mixed CCE kernel is authored and bound behind `pl.jit.extern`
-- [CCE In-Core Profiling](cce-incore-profiling.md) — phase partitioning inside
+- [CCE In-Core Profiling](../../debug-and-tune/cce-incore-profiling.md) — phase partitioning inside
   the external attention kernel
-- [Qwen3-14B](../models/qwen3_14b/index.md) — the model this page follows, top down
+- [Qwen3-14B](index.md) — the model this page follows, top down

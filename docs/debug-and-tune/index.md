@@ -16,8 +16,8 @@ then move from the broadest evidence to the narrowest:
 | Diagnose compile errors, runtime failures, hangs, or missing dependencies | [Debugging](debugging.md) |
 | Diagnose numerical drift and choose comparison thresholds | [Precision Tuning](precision-tuning.md) |
 | Measure end-to-end time and inspect the task schedule | [Performance Tuning](performance-tuning.md) |
-| See how a full decode path was optimized, in order, with the limit found at each step | [DeepSeek V4 Decode Optimization](deepseek-v4-decode-optimization.md) |
-| See how a single-card dense model's kernels were tuned, in the order the work happened | [Qwen3-14B Optimization](qwen3-14b-optimization.md) |
+| See how a full decode path was optimized, in order, with the limit found at each step | [DeepSeek V4 Decode Optimization](../models/deepseek_v4_flash_mtp/decode_optimization.md) |
+| See how a single-card dense model's kernels were tuned, in the order the work happened | [Qwen3-14B Optimization](../models/qwen3_14b/optimization.md) |
 | Understand how task edges are formed and when the scheduler issues them | [Dependencies and Scheduling](dependency-and-scheduling.md) |
 | Fit intermediate tensors in the runtime's ring heaps and measure per-scope peaks | [Ring Heap and Scope Stats](ring-heap-and-scope-stats.md) |
 | Choose matmul row, N, and K tiles | [Cube Tile Tuning](cube-tile-tuning.md) |

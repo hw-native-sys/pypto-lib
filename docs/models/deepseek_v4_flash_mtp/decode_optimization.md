@@ -1,17 +1,17 @@
 # DeepSeek V4 Decode Optimization
 
 This page is a case study rather than a reference. It follows
-[`models/deepseek_v4_flash_mtp/`](../../models/deepseek_v4_flash_mtp/) — a
+[`models/deepseek_v4_flash_mtp/`](../../../models/deepseek_v4_flash_mtp/) — a
 43-layer DeepSeek V4-Flash build with MTP speculative decoding, W8A8
 quantization, three attention paths, and a 256-expert MoE — from its first
 kernels to its current state, and records which levers moved the number, which
 did not, and what each one cost.
 
 The mechanisms themselves live elsewhere:
-[Performance Tuning](performance-tuning.md) for how to measure and capture,
-[Cube Tile Tuning](cube-tile-tuning.md) for choosing tiles,
-[Dependencies and Scheduling](dependency-and-scheduling.md) for the task graph
-and the scheduler, and [Precision Tuning](precision-tuning.md) for thresholds
+[Performance Tuning](../../debug-and-tune/performance-tuning.md) for how to measure and capture,
+[Cube Tile Tuning](../../debug-and-tune/cube-tile-tuning.md) for choosing tiles,
+[Dependencies and Scheduling](../../debug-and-tune/dependency-and-scheduling.md) for the task graph
+and the scheduler, and [Precision Tuning](../../debug-and-tune/precision-tuning.md) for thresholds
 and rounding. Read those for *how*; read this for *in what order, and what to
 expect*.
 
@@ -50,7 +50,7 @@ The kernel boundaries are not invented. They are read off the official
 HuggingFace **DeepSeek-V4-Flash** torch implementation — the modeling code that
 ships with the checkpoint is the specification, and each kernel entry
 corresponds to a span of it worth scheduling as one unit.
-[config.py](../../models/deepseek_v4_flash_mtp/config.py)'s `FLASH` preset
+[config.py](../../../models/deepseek_v4_flash_mtp/config.py)'s `FLASH` preset
 mirrors that checkpoint's `config.json` field for field, so a shape or
 hyper-parameter question is answered by the reference rather than guessed.
 
@@ -67,7 +67,7 @@ Three things follow from partitioning along the reference's own structure:
   from that checkpoint — see the fixture comments in the compressor, indexer and
   expert modules — so a kernel is exercised at the distribution it will actually
   see. See
-  [Precision Tuning](precision-tuning.md#8-test-with-real-weights-and-matched-data-distribution).
+  [Precision Tuning](../../debug-and-tune/precision-tuning.md#8-test-with-real-weights-and-matched-data-distribution).
 
 ### Freeze the deployment contract first
 
@@ -106,7 +106,7 @@ algebraically equivalent reorder still changes the last bits. A golden that
 follows torch's natural order while the kernel accumulates in tile order does
 not report a tolerance; it reports noise, and that noise hides the real error
 the moment one appears. The mechanics are in
-[Precision Tuning](precision-tuning.md#2-make-the-kernel-and-golden-implementations-identical).
+[Precision Tuning](../../debug-and-tune/precision-tuning.md#2-make-the-kernel-and-golden-implementations-identical).
 
 The consequence for optimization work is the rule this section exists to
 establish:
@@ -171,7 +171,7 @@ non-degenerate `stage=2` pipeline, lifting L0C occupancy from 25 % to 50 %.
 `qproj_matmul` went 56.3 µs → 36.0 µs **with no change in task count** (#718).
 
 The walls that bound this, all hit repeatedly (see
-[Cube Tile Tuning](cube-tile-tuning.md#model-the-three-practical-constraints)):
+[Cube Tile Tuning](../../debug-and-tune/cube-tile-tuning.md#model-the-three-practical-constraints)):
 
 | Wall | Value | What it forced here |
 |---|---|---|
@@ -255,7 +255,7 @@ weight L1 tile, freeing Mat for an N fragment of 256.
 - **Check PMU before pipelining.** The gate/up K loop is MTE2-bound (~80 %) and
   gains from a pipeline; the w2 K loop is scalar-bound (~97 %) and was
   deliberately left serial (#473). See
-  [Performance Tuning](performance-tuning.md#4-read-pmu-utilization).
+  [Performance Tuning](../../debug-and-tune/performance-tuning.md#4-read-pmu-utilization).
 - `pl.split(UP_DOWN)` fixes vector stragglers in mixed regions. In `proj_b` the
   INT8 GEMM finished early and the whole region's wall was set by whichever of
   the two vector lanes got the larger share of the dequant epilogue; splitting
@@ -424,7 +424,7 @@ are gone (#985).
 
 Once the arithmetic is mined out, dispatch count and graph shape become
 first-order. The mechanisms are documented in
-[Dependencies and Scheduling](dependency-and-scheduling.md); what follows is
+[Dependencies and Scheduling](../../debug-and-tune/dependency-and-scheduling.md); what follows is
 what they bought here.
 
 ### 3.1 Remove tasks and barriers
@@ -466,7 +466,7 @@ It costs a dispatch hop, and it costs a source change: the producer must switch
 to the `with pl.spmd(...) as tid` capture form, because the `for ... in`
 form yields no TaskId. Standalone entries with no producer pass an empty
 `task_dummy(deps=[])`. Both idioms are catalogued in
-[Deliberately delaying a task](dependency-and-scheduling.md#deliberately-delaying-a-task).
+[Deliberately delaying a task](../../debug-and-tune/dependency-and-scheduling.md#deliberately-delaying-a-task).
 
 ### 3.4 Delete redundant edges, and anchor waits correctly
 
@@ -496,7 +496,7 @@ per wave, so in a multi-layer forward a faster rank's next-epoch rows could
 satisfy a slower rank's current expectation. Withdrawn in full (#975, #978).
 
 Two lessons, both general: **core-time gains that do not become wall-time gains
-are not gains** (see [Performance Tuning](performance-tuning.md)), and **any
+are not gains** (see [Performance Tuning](../../debug-and-tune/performance-tuning.md)), and **any
 counter-based handshake reused across waves needs an epoch dimension.**
 
 ---
@@ -588,13 +588,13 @@ value. That is what makes it safe to tune aggressively.
 
 ## See also
 
-- [Performance Tuning](performance-tuning.md) — measurement, capture, and the
+- [Performance Tuning](../../debug-and-tune/performance-tuning.md) — measurement, capture, and the
   L2 / L1 / L0 tuning rules
-- [Cube Tile Tuning](cube-tile-tuning.md) — choosing row, N and K tiles against
+- [Cube Tile Tuning](../../debug-and-tune/cube-tile-tuning.md) — choosing row, N and K tiles against
   the compiler's memory report
-- [Dependencies and Scheduling](dependency-and-scheduling.md) — how edges form,
+- [Dependencies and Scheduling](../../debug-and-tune/dependency-and-scheduling.md) — how edges form,
   when the scheduler issues, early dispatch, and dummy-task idioms
-- [Precision Tuning](precision-tuning.md) — rounding modes, dtype alignment, and
+- [Precision Tuning](../../debug-and-tune/precision-tuning.md) — rounding modes, dtype alignment, and
   threshold selection
-- [DeepSeek V4-Flash (MTP)](../models/deepseek_v4_flash_mtp.md) — the model this
+- [DeepSeek V4-Flash (MTP)](index.md) — the model this
   page follows, top down

@@ -2,12 +2,15 @@
 
 `models/deepseek_v4_flash_mtp/` is the reference V4-Flash tree: the operators,
 the single-layer compositions, and the prefill/decode full forwards.
+[V4-Flash DSpark](../deepseek_v4_flash_dspark.md) is the same checkpoint at a
+second deployment point — wider batch, seven draft tokens, context-parallel
+attention.
 
 ## Deployment configuration
 
 The tree implements the HuggingFace **DeepSeek-V4-Flash** checkpoint — the
 `FLASH` preset in
-[config.py](../../models/deepseek_v4_flash_mtp/config.py) mirrors that model's
+[config.py](../../../models/deepseek_v4_flash_mtp/config.py) mirrors that model's
 `config.json` field for field, and `config.py` is a per-directory singleton
 that every kernel imports as a bare sibling module.
 
@@ -65,7 +68,7 @@ hyper-connection stack is 4 streams wide (`hc_mult = 4`).
 
 ### `decode_fwd`
 
-[decode_fwd.py](../../models/deepseek_v4_flash_mtp/decode_fwd.py) hand-unrolls
+[decode_fwd.py](../../../models/deepseek_v4_flash_mtp/decode_fwd.py) hand-unrolls
 the layer schedule inside one rank-generic `@pl.jit` kernel, launched once per
 EP rank from an `@pl.jit.host` driver:
 
@@ -84,7 +87,7 @@ three compressor states) are passed in flat and sliced per layer.
 
 ### `prefill_fwd`
 
-[prefill_fwd.py](../../models/deepseek_v4_flash_mtp/prefill_fwd.py) mirrors
+[prefill_fwd.py](../../../models/deepseek_v4_flash_mtp/prefill_fwd.py) mirrors
 that structure for a packed prompt: the same per-rank kernel shape, the same
 per-stage scopes, `prefill_{swa,hca,csa}` in place of the decode
 orchestrations, and the same `hc_head → rms_norm → lm_head` tail over selected
@@ -92,7 +95,7 @@ hidden rows.
 
 ### `decode_fwd_mtp`
 
-[decode_fwd_mtp.py](../../models/deepseek_v4_flash_mtp/decode_fwd_mtp.py) is
+[decode_fwd_mtp.py](../../../models/deepseek_v4_flash_mtp/decode_fwd_mtp.py) is
 the third top-level composition: it chains the main decode forward, the draft
 verification, and the MTP decode layer into one serving step. Its device-only
 CLI fixture composes the standalone forward and MTP tensor fixtures with a
@@ -142,7 +145,7 @@ decode_csa   hc_pre → rmsnorm → qkv_proj_rope
 
 ### MoE stage
 
-[moe.py](../../models/deepseek_v4_flash_mtp/moe.py) is one distributed
+[moe.py](../../../models/deepseek_v4_flash_mtp/moe.py) is one distributed
 single-layer program that `decode_fwd`, `prefill_fwd`, the layer harnesses, and
 the MTP entries all call. `gate` is RMSNorm + router + top-k + normalize and
 also produces the per-token INT8 view; `dispatch` and `combine` are the EP
@@ -180,7 +183,7 @@ counterpart used by the test fixtures.
 
 ## How it was optimized
 
-[DeepSeek V4 decode optimization](../debug-and-tune/deepseek-v4-decode-optimization.md)
+[DeepSeek V4 decode optimization](decode_optimization.md)
 follows the tuning of this decode path in order — contracts and golden first,
 then the general tiling / parallelism / fusion levers, the attention,
 hyper-connection, MoE and router rewrites, scheduling, and finally
@@ -190,18 +193,18 @@ serving-level residency and lowering — with the limit measured at each step.
 
 | Group | Files |
 | --- | --- |
-| Full forward | [decode_fwd.py](../../models/deepseek_v4_flash_mtp/decode_fwd.py), [prefill_fwd.py](../../models/deepseek_v4_flash_mtp/prefill_fwd.py), [decode_fwd_mtp.py](../../models/deepseek_v4_flash_mtp/decode_fwd_mtp.py) |
-| Layer composition | [decode_layer.py](../../models/deepseek_v4_flash_mtp/decode_layer.py), [prefill_layer.py](../../models/deepseek_v4_flash_mtp/prefill_layer.py) |
-| MTP | [decode_mtp.py](../../models/deepseek_v4_flash_mtp/decode_mtp.py), [prefill_mtp.py](../../models/deepseek_v4_flash_mtp/prefill_mtp.py), [mtp_projection.py](../../models/deepseek_v4_flash_mtp/mtp_projection.py) |
-| Decode attention orchestration | [decode_swa.py](../../models/deepseek_v4_flash_mtp/decode_swa.py), [decode_csa.py](../../models/deepseek_v4_flash_mtp/decode_csa.py), [decode_hca.py](../../models/deepseek_v4_flash_mtp/decode_hca.py) |
-| Decode sparse attention (fused o-proj) | [decode_sparse_attn_swa.py](../../models/deepseek_v4_flash_mtp/decode_sparse_attn_swa.py), [decode_sparse_attn_csa.py](../../models/deepseek_v4_flash_mtp/decode_sparse_attn_csa.py), [decode_sparse_attn_hca.py](../../models/deepseek_v4_flash_mtp/decode_sparse_attn_hca.py) |
-| Decode compressors and indexer | [decode_compressor_ratio4.py](../../models/deepseek_v4_flash_mtp/decode_compressor_ratio4.py), [decode_compressor_ratio128.py](../../models/deepseek_v4_flash_mtp/decode_compressor_ratio128.py), [decode_indexer.py](../../models/deepseek_v4_flash_mtp/decode_indexer.py), [decode_indexer_compressor.py](../../models/deepseek_v4_flash_mtp/decode_indexer_compressor.py) |
-| Prefill attention and cache | [prefill_swa.py](../../models/deepseek_v4_flash_mtp/prefill_swa.py), [prefill_csa.py](../../models/deepseek_v4_flash_mtp/prefill_csa.py), [prefill_hca.py](../../models/deepseek_v4_flash_mtp/prefill_hca.py), [prefill_sparse_attn.py](../../models/deepseek_v4_flash_mtp/prefill_sparse_attn.py), [prefill_compressor_ratio4.py](../../models/deepseek_v4_flash_mtp/prefill_compressor_ratio4.py), [prefill_compressor_ratio128.py](../../models/deepseek_v4_flash_mtp/prefill_compressor_ratio128.py), [prefill_indexer.py](../../models/deepseek_v4_flash_mtp/prefill_indexer.py), [prefill_indexer_compressor.py](../../models/deepseek_v4_flash_mtp/prefill_indexer_compressor.py) |
-| Shared transforms | [rmsnorm.py](../../models/deepseek_v4_flash_mtp/rmsnorm.py), [qkv_proj_rope.py](../../models/deepseek_v4_flash_mtp/qkv_proj_rope.py), [hc_pre.py](../../models/deepseek_v4_flash_mtp/hc_pre.py), [hc_post.py](../../models/deepseek_v4_flash_mtp/hc_post.py), [hc_head.py](../../models/deepseek_v4_flash_mtp/hc_head.py), [rope_interleave.py](../../models/deepseek_v4_flash_mtp/rope_interleave.py), [lookup_embedding.py](../../models/deepseek_v4_flash_mtp/lookup_embedding.py) |
-| MoE and output | [moe.py](../../models/deepseek_v4_flash_mtp/moe.py), [gate.py](../../models/deepseek_v4_flash_mtp/gate.py), [expert_shared.py](../../models/deepseek_v4_flash_mtp/expert_shared.py), [expert_routed.py](../../models/deepseek_v4_flash_mtp/expert_routed.py), [lm_head.py](../../models/deepseek_v4_flash_mtp/lm_head.py) |
-| Metadata and host helpers | [decode_prepare.py](../../models/deepseek_v4_flash_mtp/decode_prepare.py), [config.py](../../models/deepseek_v4_flash_mtp/config.py), [utils.py](../../models/deepseek_v4_flash_mtp/utils.py) |
+| Full forward | [decode_fwd.py](../../../models/deepseek_v4_flash_mtp/decode_fwd.py), [prefill_fwd.py](../../../models/deepseek_v4_flash_mtp/prefill_fwd.py), [decode_fwd_mtp.py](../../../models/deepseek_v4_flash_mtp/decode_fwd_mtp.py) |
+| Layer composition | [decode_layer.py](../../../models/deepseek_v4_flash_mtp/decode_layer.py), [prefill_layer.py](../../../models/deepseek_v4_flash_mtp/prefill_layer.py) |
+| MTP | [decode_mtp.py](../../../models/deepseek_v4_flash_mtp/decode_mtp.py), [prefill_mtp.py](../../../models/deepseek_v4_flash_mtp/prefill_mtp.py), [mtp_projection.py](../../../models/deepseek_v4_flash_mtp/mtp_projection.py) |
+| Decode attention orchestration | [decode_swa.py](../../../models/deepseek_v4_flash_mtp/decode_swa.py), [decode_csa.py](../../../models/deepseek_v4_flash_mtp/decode_csa.py), [decode_hca.py](../../../models/deepseek_v4_flash_mtp/decode_hca.py) |
+| Decode sparse attention (fused o-proj) | [decode_sparse_attn_swa.py](../../../models/deepseek_v4_flash_mtp/decode_sparse_attn_swa.py), [decode_sparse_attn_csa.py](../../../models/deepseek_v4_flash_mtp/decode_sparse_attn_csa.py), [decode_sparse_attn_hca.py](../../../models/deepseek_v4_flash_mtp/decode_sparse_attn_hca.py) |
+| Decode compressors and indexer | [decode_compressor_ratio4.py](../../../models/deepseek_v4_flash_mtp/decode_compressor_ratio4.py), [decode_compressor_ratio128.py](../../../models/deepseek_v4_flash_mtp/decode_compressor_ratio128.py), [decode_indexer.py](../../../models/deepseek_v4_flash_mtp/decode_indexer.py), [decode_indexer_compressor.py](../../../models/deepseek_v4_flash_mtp/decode_indexer_compressor.py) |
+| Prefill attention and cache | [prefill_swa.py](../../../models/deepseek_v4_flash_mtp/prefill_swa.py), [prefill_csa.py](../../../models/deepseek_v4_flash_mtp/prefill_csa.py), [prefill_hca.py](../../../models/deepseek_v4_flash_mtp/prefill_hca.py), [prefill_sparse_attn.py](../../../models/deepseek_v4_flash_mtp/prefill_sparse_attn.py), [prefill_compressor_ratio4.py](../../../models/deepseek_v4_flash_mtp/prefill_compressor_ratio4.py), [prefill_compressor_ratio128.py](../../../models/deepseek_v4_flash_mtp/prefill_compressor_ratio128.py), [prefill_indexer.py](../../../models/deepseek_v4_flash_mtp/prefill_indexer.py), [prefill_indexer_compressor.py](../../../models/deepseek_v4_flash_mtp/prefill_indexer_compressor.py) |
+| Shared transforms | [rmsnorm.py](../../../models/deepseek_v4_flash_mtp/rmsnorm.py), [qkv_proj_rope.py](../../../models/deepseek_v4_flash_mtp/qkv_proj_rope.py), [hc_pre.py](../../../models/deepseek_v4_flash_mtp/hc_pre.py), [hc_post.py](../../../models/deepseek_v4_flash_mtp/hc_post.py), [hc_head.py](../../../models/deepseek_v4_flash_mtp/hc_head.py), [rope_interleave.py](../../../models/deepseek_v4_flash_mtp/rope_interleave.py), [lookup_embedding.py](../../../models/deepseek_v4_flash_mtp/lookup_embedding.py) |
+| MoE and output | [moe.py](../../../models/deepseek_v4_flash_mtp/moe.py), [gate.py](../../../models/deepseek_v4_flash_mtp/gate.py), [expert_shared.py](../../../models/deepseek_v4_flash_mtp/expert_shared.py), [expert_routed.py](../../../models/deepseek_v4_flash_mtp/expert_routed.py), [lm_head.py](../../../models/deepseek_v4_flash_mtp/lm_head.py) |
+| Metadata and host helpers | [decode_prepare.py](../../../models/deepseek_v4_flash_mtp/decode_prepare.py), [config.py](../../../models/deepseek_v4_flash_mtp/config.py), [utils.py](../../../models/deepseek_v4_flash_mtp/utils.py) |
 
 `config.py`, `utils.py`, `rope_interleave.py`, and `decode_prepare.py` have
 no `__main__` block: they are imported rather than run. Executable compositions,
 including `decode_fwd_mtp.py`, are scheduled by the
-[daily model workflow](../../.github/workflows/daily_ci.yml).
+[daily model workflow](../../../.github/workflows/daily_ci.yml).

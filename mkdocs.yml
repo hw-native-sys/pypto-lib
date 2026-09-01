@@ -92,15 +92,17 @@ nav:
       - Qwen3-14B:
           - Model overview: models/qwen3_14b/index.md
           - PyPTO Page Attention: models/qwen3_14b/paged_attention_pypto.md
-      - DeepSeek V4-Flash (MTP): models/deepseek_v4_flash_mtp.md
+          - Optimization: models/qwen3_14b/optimization.md
+      - DeepSeek V4-Flash (MTP):
+          - Model overview: models/deepseek_v4_flash_mtp/index.md
+          - Decode optimization: models/deepseek_v4_flash_mtp/decode_optimization.md
+      - DeepSeek V4-Flash (DSpark): models/deepseek_v4_flash_dspark.md
       - DeepSeek V4-Pro: models/deepseek_v4_pro.md
   - Debug and Tune:
       - Overview: debug-and-tune/index.md
       - Debugging: debug-and-tune/debugging.md
       - Precision tuning: debug-and-tune/precision-tuning.md
       - Performance tuning: debug-and-tune/performance-tuning.md
-      - DeepSeek V4 decode optimization: debug-and-tune/deepseek-v4-decode-optimization.md
-      - Qwen3-14B optimization: debug-and-tune/qwen3-14b-optimization.md
       - Dependencies and scheduling: debug-and-tune/dependency-and-scheduling.md
       - Ring heap and scope stats: debug-and-tune/ring-heap-and-scope-stats.md
       - Cube tile tuning: debug-and-tune/cube-tile-tuning.md

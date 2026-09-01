@@ -12,7 +12,7 @@ model documentation, which explains what each program computes:
 
 - [Models](../../../docs/models/index.md)
 - [Qwen3-14B](../../../docs/models/qwen3_14b/index.md)
-- [DeepSeek V4-Flash](../../../docs/models/deepseek_v4_flash_mtp.md)
+- [DeepSeek V4-Flash](../../../docs/models/deepseek_v4_flash_mtp/index.md)
 - [Platforms and Devices](../../../docs/get-started/platforms.md)
 - [Compile and Runtime Workflow](../../../docs/run-and-validate/compile-runtime-workflow.md)
 

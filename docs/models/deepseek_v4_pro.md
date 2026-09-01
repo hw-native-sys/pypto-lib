@@ -32,7 +32,7 @@ constant if a case needs a longer context.
 
 Native MXFP8-MXFP4 is not implemented yet. The tracked kernels run an INT8
 stand-in with the same tensor split as
-[V4-Flash](deepseek_v4_flash_mtp.md#what-is-quantized): `gen_routed_weight` in
+[V4-Flash](deepseek_v4_flash_mtp/index.md#what-is-quantized): `gen_routed_weight` in
 [expert_routed.py](../../models/deepseek_v4_pro/expert_routed.py) re-quantizes
 off the MXFP4 grid into INT8 rather than feeding the cube MXFP4 weights.
 

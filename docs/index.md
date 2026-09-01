@@ -43,9 +43,9 @@ Begin with the [debugging playbook](debug-and-tune/debugging.md), then choose
 the [precision](debug-and-tune/precision-tuning.md) or
 [performance](debug-and-tune/performance-tuning.md) workflow for the problem
 at hand.
-[DeepSeek V4 decode optimization](debug-and-tune/deepseek-v4-decode-optimization.md)
+[DeepSeek V4 decode optimization](models/deepseek_v4_flash_mtp/decode_optimization.md)
 follows one model's decode path end to end and records which levers paid.
-[Qwen3-14B optimization](debug-and-tune/qwen3-14b-optimization.md) records how a
+[Qwen3-14B optimization](models/qwen3_14b/optimization.md) records how a
 single-card dense model's kernels were tuned, in the order the work happened.
 
 ## Ecosystem

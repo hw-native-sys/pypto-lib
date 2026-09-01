@@ -380,5 +380,5 @@ Per-rank timing, start skew, and the fastest-rank convention are in
   — the ring resources an L3 program's intermediates land in.
 - [`examples/advanced/allreduce.py`](../../examples/advanced/allreduce.py) —
   the smallest complete L3 program.
-- [DeepSeek V4-Flash MTP](../models/deepseek_v4_flash_mtp.md) — the MoE
+- [DeepSeek V4-Flash MTP](../models/deepseek_v4_flash_mtp/index.md) — the MoE
   dispatch / combine and LM-head exchanges this page is drawn from.
