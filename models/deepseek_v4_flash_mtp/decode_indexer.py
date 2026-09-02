@@ -149,10 +149,7 @@ def indexer(
                 q0 = kb * Q_TILE
                 qr_tile = pl.slice(qr, [T_PAD, Q_TILE], [0, q0], valid_shape=[T, Q_TILE])
                 wq_tile = wq_b[q0 : q0 + Q_TILE, o_base + ns : o_base + ns + MM_N_TILE]
-                if q0 == 0:
-                    qr_acc = pl.matmul(qr_tile, wq_tile, out_dtype=pl.INT32)
-                else:
-                    qr_acc = pl.matmul_acc(qr_acc, qr_tile, wq_tile)
+                qr_acc = pl.matmul_acc(qr_acc, qr_tile, wq_tile, init_cond=(q0 == 0))
             qr_acc_pad[0:T_PAD, o_base + ns : o_base + ns + MM_N_TILE] = qr_acc
     qr_proj = pl.create_tensor([T, IDX_N_HEADS * IDX_HEAD_DIM], dtype=pl.FP32)
     for ot in pl.spmd(IDX_N_HEADS * IDX_HEAD_DIM // Q_OUT_TILE, name_hint="idx_qr_proj_dequant", allow_early_resolve=True):
@@ -245,10 +242,7 @@ def indexer(
             d0 = k_base + db * D_TILE
             x_tile = pl.slice(x_flat, [MM_ROW_TILE, D_TILE], [0, d0], valid_shape=[pl.min(MM_ROW_TILE, T), D_TILE])
             weights_proj_tile = weights_proj[d0 : d0 + D_TILE, :]
-            if db == 0:
-                weights_acc = pl.matmul(x_tile, weights_proj_tile, out_dtype=pl.FP32)
-            else:
-                weights_acc = pl.matmul_acc(weights_acc, x_tile, weights_proj_tile)
+            weights_acc = pl.matmul_acc(weights_acc, x_tile, weights_proj_tile, init_cond=(db == 0))
         weights_partial[kb * MM_ROW_TILE : kb * MM_ROW_TILE + MM_ROW_TILE, :] = weights_acc
 
     with pl.at(level=pl.Level.CORE_GROUP, name_hint="weights_proj_reduce", allow_early_resolve=True):

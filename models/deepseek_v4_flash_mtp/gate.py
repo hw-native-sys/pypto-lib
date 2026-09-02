@@ -181,10 +181,7 @@ def gate(
             gd_kd = kb * GATE_D_TILE
             gd_x = xg_buf[t1 : t1 + GATE_M_TILE, gd_kd : gd_kd + GATE_D_TILE]
             gd_w = gate_w[n0 : n0 + GATE_N_TILE, gd_kd : gd_kd + GATE_D_TILE]
-            if gd_kd == 0:
-                gate_logits_tile = pl.matmul(gd_x, gd_w, out_dtype=pl.FP32, b_trans=True)
-            else:
-                gate_logits_tile = pl.matmul_acc(gate_logits_tile, gd_x, gd_w, b_trans=True)
+            gate_logits_tile = pl.matmul_acc(gate_logits_tile, gd_x, gd_w, b_trans=True, init_cond=(gd_kd == 0))
         # xg omitted inv_rms; logits = inv_rms * (xg @ gate_w.T). Per-token row-scale.
         gate_logits_tile = pl.row_expand_mul(gate_logits_tile, inv_rms_buf[t1 : t1 + GATE_M_TILE, 0:1])
         gp_relu = pl.maximum(gate_logits_tile, 0.0)

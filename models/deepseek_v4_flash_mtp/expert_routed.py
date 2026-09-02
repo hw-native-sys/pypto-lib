@@ -106,10 +106,7 @@ def expert_routed(
                                     n0 : n0 + MM_INTER_TILE,
                                     k0 : k0 + K_TILE,
                                 ]
-                                if k0 == 0:
-                                    gate_acc = pl.matmul(x_k, w1_k, b_trans=True, out_dtype=pl.INT32)
-                                else:
-                                    gate_acc = pl.matmul_acc(gate_acc, x_k, w1_k, b_trans=True)
+                                gate_acc = pl.matmul_acc(gate_acc, x_k, w1_k, b_trans=True, init_cond=(k0 == 0))
                             gate_tile_i32[:, n0 : n0 + MM_INTER_TILE] = pl.reshape(
                                 gate_acc, [RECV_TILE, MM_INTER_TILE]
                             )
@@ -127,10 +124,7 @@ def expert_routed(
                                     u0 : u0 + MM_INTER_TILE,
                                     uk0 : uk0 + K_TILE,
                                 ]
-                                if uk0 == 0:
-                                    up_acc = pl.matmul(x_u, w3_k, b_trans=True, out_dtype=pl.INT32)
-                                else:
-                                    up_acc = pl.matmul_acc(up_acc, x_u, w3_k, b_trans=True)
+                                up_acc = pl.matmul_acc(up_acc, x_u, w3_k, b_trans=True, init_cond=(uk0 == 0))
                             up_tile_i32[:, u0 : u0 + MM_INTER_TILE] = pl.reshape(
                                 up_acc, [RECV_TILE, MM_INTER_TILE]
                             )
@@ -226,10 +220,7 @@ def expert_routed(
                             for k0 in pl.pipeline(0, MOE_INTER, INTER_K, stage=2):
                                 h_k = h_tile_i8[:, k0 : k0 + INTER_K]
                                 w2_k = routed_w2[local_e : local_e + 1, d0 : d0 + D_OUT_TILE, k0 : k0 + INTER_K]
-                                if k0 == 0:
-                                    y_acc = pl.matmul(h_k, w2_k, b_trans=True, out_dtype=pl.INT32)
-                                else:
-                                    y_acc = pl.matmul_acc(y_acc, h_k, w2_k, b_trans=True)
+                                y_acc = pl.matmul_acc(y_acc, h_k, w2_k, b_trans=True, init_cond=(k0 == 0))
                             y_i32[:, d0 : d0 + D_OUT_TILE] = pl.reshape(y_acc, [RECV_TILE, D_OUT_TILE])
 
                     recv_y_tile = pl.create_tensor([RECV_TILE, D], dtype=pl.BF16)
