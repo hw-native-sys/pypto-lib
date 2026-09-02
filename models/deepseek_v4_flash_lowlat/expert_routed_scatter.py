@@ -6,68 +6,51 @@
 # INCLUDING BUT NOT LIMITED TO NON-INFRINGEMENT, MERCHANTABILITY, OR FITNESS FOR A PARTICULAR PURPOSE.
 # See LICENSE in the root of the software repository for the full text of the License.
 # -----------------------------------------------------------------------------------------------------------
-"""DeepSeek-V4 MoE routed expert as ONE persistent 24-block task. Shipped kernel.
+"""REVERTED A/B: the routed expert scattering straight onto the token rows.
 
-This is what ``moe.py`` runs. ``expert_routed.py`` keeps the geometry constants,
-the weight generator, the fixture and the golden -- imported here, so the two
-share one numerics contract -- and its four-task decomposition
-(``exp_gate_up_mm`` -> ``exp_act_h_q`` -> ``exp_w2_mm`` -> ``exp_w2_act``) stays
-as the A/B partner. ``expert_routed_persistent.py`` is a third form, three
-persistent phases, kept for the case a vector phase cannot be regioned.
+Same single persistent 24-block task as
+``expert_routed_persistent_balanced.py`` -- same hand-written ``pl.split_aiv``
+regions, same ``exp_balance_plan`` pre-task -- but the down-matmul epilogue
+scatter-accumulates each VALID row onto its destination token with
+``pl.assemble(..., atomic=pl.AtomicType.Add)`` instead of storing a per-slot
+``recv_y`` tile. That folds ``moe.combine_local`` into the expert: only valid
+rows are written (a slot holds one or two of 16 at decode) and the per-token
+TOPK sum happens in the atomic rather than in a downstream gather.
 
-The whole chain -- Up/Gate -> SwiGLU + A8 requant -> Down -> dequant -- runs in
-one ``pl.spmd(NUM_CORES)`` task that pulls expert slots from a grid-stride pool,
-with every intermediate on chip: no GM staging buffers, no per-stage task
-groups, no phase barrier. Measured against the four-task form on a2a3, 100
-rounds, golden replayed: **147.1 -> 118.8 us standalone (-19.2 %)**, and
-**758.4 -> 700.9 us on the 8-card CSA + MoE layer (-7.6 %, fastest-rank mean)**.
-The trace says why: task instances 320 -> 72, the critical path 3 hops -> 0, and
-scheduler-injected latency 66.7 -> 2.4 us, which flips the kernel from
-SCHEDULER-BOUND to COMPUTE-BOUND.
+It is SLOWER here. moe.py --tp 8, 8 cards, 20 rounds / 3 warmup, fastest-rank
+mean, interleaved against the committed form: 244.5 -> 269.0 us (+10.0 %), 3/3
+pairs. The scatter costs more inside the kernel than the gather cost outside it:
+standalone the same kernel goes 129.7 -> 136.8 us (+7.1 us), because the epilogue
+emits ROW_HALF predicated 1 x FUSED_Y_TILE atomic stores per lane per D chunk
+(2 lanes x 8 chunks x 8 rows = 128 sites per slot) where the tile form emitted 16
+coalesced stores -- and at T=8 a slot has one or two live rows, so nearly all of
+those sites are dead predicates and lane 1 is empty outright. Deleting
+combine_local gives back only its 6.2 us span and one hop, and the accumulator
+needs two new tasks (``ffn_zero``, ``sh_scatter``) on top.
 
-Why the AIV split is written by hand. The auto split emits lane 0 doing the work
-and lane 1 *replaying* the body with every tile at a static ``valid_shape=0``,
-and an INT8 cast's codegen bridges that 0 into a ``(0, 0)`` view pto-isa cannot
-compile -- so the fused form does not build at all under the auto split, for any
-cast spelling. A data-parallel ``pl.split_aiv`` region has no replay lane, so the
-requant compiles. Cube ops therefore sit outside every region, each vector phase
-is its own ``UP_DOWN`` region, and the two crossings are named: ``pl.aiv_shard``
-for cube->vector, ``pl.aic_gather`` for vector->cube. ``UP_DOWN`` is legal only
-because the per-row ``row_max`` amax stays within a lane.
+The sign flips as rows-per-slot grows: the reference this is ported from
+(deepseek_v4_flash_mtp/expert_routed_tp_persistent.py) runs 64 gathered rows over
+~32 experts, i.e. 12 rows per group, where the tile store is mostly padding and
+the gather is 8x larger. Re-measure if T or TOPK grows.
 
-The load-balancing pre-task. ``exp_balance_plan`` scans the slot table once on
-one core and writes the COMPACTED list of active slots, padded to ``N_SLOTS``
-with rows = 0 so the pool bound stays static -- a runtime bound would have to be
-``pl.read`` at orchestration level, which parks the whole task graph behind the
-pre-task. Each core then gets ceil/floor(n_active / 24) expert chains instead of
-a draw from {0, 1, 2}. No cost weighting: a chain is ~50 us regardless of how
-many of its <= 8 rows are live, because the 3 MiB of w1/w3/w2 it streams dwarfs
-the row work.
+``ffn_partial`` is an ACCUMULATOR, so its test binding is ``pl.InOut`` with a
+zero ``init_value``: a pure ``pl.Out`` buffer is allocator residue that never
+reaches the device, and the atomics would land on garbage. The harness exits 1
+with no message if you get that wrong.
 
-What the pre-task is and is not worth. It is insurance, not a speedup. Against
-the same kernel without it: +10.1 % standalone, where its serial hop is the only
-thing on the critical path (0 -> 1 hop, scheduler-injected 2.4 -> 16.9 us), but
-**+0.52 % on the 8-card layer** -- inside the run-to-run spread. The overlap is an
-inference from wall time; an L3 swimlane drops the MoE half of a layer, so no trace
-backs it. What it buys is robustness:
-``route_group`` currently packs slots densely from 0, which makes the raw
-grid-stride already balanced, so the compaction is redundant *today*. Should the
-routing ever emit a sparse slot table, the unbalanced form loses up to 26 %
-(measured at n_active 16-24 on a scattered fixture) and this one does not.
-Re-measure with ``bench_activation.py`` if ``route_group``'s packing changes.
-
-The first K step of each matmul is peeled rather than seeded from a
-``pl.create_tensor``: the accumulator has to stay a pure matmul result so it
-lives in Acc, which is the only memory the C->V boundary accepts.
+Numerics: the routed contribution stays FP32 end to end instead of rounding
+through a BF16 ``recv_y``, and the TOPK sum reassociates run to run because
+atomic-add order across cores is not fixed. Both were accepted deliberately.
 """
+
 
 
 import pypto.language as pl
 
 from config import (INT8_SCALE_MAX, INT8_AMAX_EPS)
 from expert_routed import (
-    D, IDX_PAD, MOE_INTER, N_EXPERTS, N_SLOTS, RECV_MAX, RECV_TILE, SWIGLU_LIMIT,
-    build_tensor_specs, golden_expert_routed,
+    D, IDX_PAD, MOE_INTER, N_EXPERTS, N_SLOTS, RECV_MAX, RECV_TILE, SWIGLU_LIMIT, T,
+    build_tensor_specs,
 )
 
 
@@ -99,7 +82,7 @@ FUSED_Y_TILE = max(64, min(512, 131072 // MOE_INTER))
 
 
 @pl.jit.inline(auto_scope=False)
-def expert_routed_persistent_balanced(
+def expert_routed_scatter(
     recv_x: pl.Tensor[[N_SLOTS, RECV_MAX, D], pl.INT8],
     recv_scale_dq: pl.Tensor[[N_SLOTS, RECV_MAX], pl.FP32],
     recv_weights: pl.Tensor[[N_SLOTS, RECV_MAX], pl.FP32],
@@ -111,10 +94,10 @@ def expert_routed_persistent_balanced(
     routed_w3_scale: pl.Tensor[[N_EXPERTS, MOE_INTER], pl.FP32],
     routed_w2: pl.Tensor[[N_EXPERTS, D, MOE_INTER], pl.INT8],
     routed_w2_scale: pl.Tensor[[N_EXPERTS, D], pl.FP32],
-    recv_y: pl.Tensor[[N_SLOTS, RECV_MAX, D], pl.BF16],
+    plan_row_token: pl.Tensor[[N_SLOTS, RECV_MAX], pl.INT32],
+    ffn_partial: pl.Tensor[[T, D], pl.FP32],
 ):
     recv_x_flat = pl.reshape(recv_x, [N_SLOTS * RECV_MAX, D])
-    recv_y_flat = pl.reshape(recv_y, [N_SLOTS * RECV_MAX, D])
 
     # Fold the expert axis into the row axis so every matmul operand is 2-D and
     # the accumulator comes back 2-D (no [1, RECV_TILE, TILE] reshape unwrap).
@@ -133,7 +116,7 @@ def expert_routed_persistent_balanced(
         work_slot = pl.create_tensor([N_SLOTS], dtype=pl.INT32)
         work_rows = pl.create_tensor([N_SLOTS], dtype=pl.INT32)
 
-        with pl.spmd(1, name_hint="exp_balance_plan", allow_early_resolve=True) as plan_tid:
+        with pl.spmd(1, name_hint="exp_balance_plan") as plan_tid:
             plan_core = pl.tile.get_block_idx()
             zero_i32 = pl.cast(0, pl.INT32)
             for pad in pl.range(plan_core, N_SLOTS):
@@ -148,7 +131,7 @@ def expert_routed_persistent_balanced(
                     n_live = n_live + 1
 
         with pl.spmd(
-            NUM_CORES, name_hint="exp_routed_balanced", allow_early_resolve=True,
+            NUM_CORES, name_hint="exp_routed_scatter", allow_early_resolve=True,
             deps=[plan_tid],
         ) as _routed_tid:  # inline form requires the TaskId capture
             core = pl.tile.get_block_idx()  # 0 .. NUM_CORES-1
@@ -259,18 +242,28 @@ def expert_routed_persistent_balanced(
                         # Same row split, so this lane's row_scale from phase 1 lines
                         # up with this lane's half of the accumulator.
                         for aiv_id2 in pl.split_aiv(AIV_LANES, mode=pl.SplitMode.UP_DOWN):
-                            y_off = flat_t0 + pl.cast(aiv_id2 * ROW_HALF, pl.INDEX)
+                            y_r0 = pl.cast(aiv_id2 * ROW_HALF, pl.INDEX)
+                            y_valid = pl.min(ROW_HALF, pl.max(n_rows - y_r0, 0))
                             y_sh = pl.aiv_shard(y_acc)
                             y_f = pl.cast(y_sh, target_type=pl.FP32, mode="none")
                             y_f = pl.col_expand_mul(pl.row_expand_mul(y_f, row_scale), w2_sc)
-                            recv_y_flat[y_off : y_off + ROW_HALF, d0 : d0 + FUSED_Y_TILE] = \
-                                pl.cast(y_f, target_type=pl.BF16, mode="rint")
+                            # Unrolled and predicated because the destination row
+                            # is a per-row runtime value: a dynamic row index into
+                            # an on-chip tile is not expressible, a static one is.
+                            for r in pl.unroll(ROW_HALF):
+                                if r < y_valid:
+                                    dst = pl.cast(
+                                        pl.read(plan_row_token, [s, y_r0 + r]), pl.INDEX)
+                                    ffn_partial = pl.assemble(
+                                        ffn_partial, y_f[r : r + 1, :], [dst, d0],
+                                        atomic=pl.AtomicType.Add,
+                                    )
 
-    return recv_y
+    return ffn_partial
 
 
 @pl.jit
-def expert_routed_persistent_balanced_test(
+def expert_routed_scatter_test(
     recv_x: pl.Tensor[[N_SLOTS, RECV_MAX, D], pl.INT8],
     recv_scale_dq: pl.Tensor[[N_SLOTS, RECV_MAX], pl.FP32],
     recv_weights: pl.Tensor[[N_SLOTS, RECV_MAX], pl.FP32],
@@ -282,15 +275,76 @@ def expert_routed_persistent_balanced_test(
     routed_w3_scale: pl.Tensor[[N_EXPERTS, MOE_INTER], pl.FP32],
     routed_w2: pl.Tensor[[N_EXPERTS, D, MOE_INTER], pl.INT8],
     routed_w2_scale: pl.Tensor[[N_EXPERTS, D], pl.FP32],
-    recv_y: pl.Out[pl.Tensor[[N_SLOTS, RECV_MAX, D], pl.BF16]],
+    plan_row_token: pl.Tensor[[N_SLOTS, RECV_MAX], pl.INT32],
+    # InOut, not Out: the kernel accumulates, so the host zeros must reach the
+    # device -- a pure Out buffer is allocator residue.
+    ffn_partial: pl.InOut[pl.Tensor[[T, D], pl.FP32]],
 ):
-    expert_routed_persistent_balanced(
+    expert_routed_scatter(
         recv_x, recv_scale_dq, recv_weights, recv_expert_count, slot_expert,
         routed_w1, routed_w1_scale, routed_w3, routed_w3_scale,
         routed_w2, routed_w2_scale,
-        recv_y,
+        plan_row_token, ffn_partial,
     )
-    return recv_y
+    return ffn_partial
+
+
+def build_tensor_specs_scatter():
+    """expert_routed's fixture with the recv_y output swapped for the scatter
+    plan and its zero-seeded accumulator. Row r of a slot comes from token r,
+    which is what real routing produces: an expert takes at most one row per
+    token, so a slot's rows carry distinct tokens."""
+    import torch
+    from golden import TensorSpec
+
+    specs = [s for s in build_tensor_specs() if s.name != "recv_y"]
+    row_token = torch.arange(RECV_MAX, dtype=torch.int32).repeat(N_SLOTS, 1)
+    specs.append(TensorSpec("plan_row_token", [N_SLOTS, RECV_MAX], torch.int32,
+                            init_value=lambda: row_token))
+    specs.append(TensorSpec("ffn_partial", [T, D], torch.float32, is_output=True,
+                            init_value=lambda: torch.zeros(T, D)))
+    return specs
+
+
+def golden_expert_routed_scatter(tensors):
+    """Per-route math kept in FP32 -- the kernel no longer rounds through a BF16
+    recv_y -- then the scatter the kernel folds into its store."""
+    from utils import int8_quant_per_row
+    import torch
+    import torch.nn.functional as F
+
+    def dequant_w(w_i8, w_scale):
+        return w_i8.to(torch.float32) * w_scale.unsqueeze(-1)
+
+    x_i8 = tensors["recv_x"]
+    x_sd = tensors["recv_scale_dq"].float()
+    w_rt = tensors["recv_weights"].float()
+    counts = tensors["recv_expert_count"][:, 0]
+    slot_expert = tensors["slot_expert"][:, 0]
+    rt = tensors["plan_row_token"]
+    w1 = dequant_w(tensors["routed_w1"], tensors["routed_w1_scale"].float())
+    w3 = dequant_w(tensors["routed_w3"], tensors["routed_w3_scale"].float())
+    w2 = dequant_w(tensors["routed_w2"], tensors["routed_w2_scale"].float())
+
+    out = torch.zeros(T, D, dtype=torch.float32)
+    for slot in range(N_SLOTS):
+        n = int(counts[slot].item())
+        if n == 0:
+            continue
+        e = int(slot_expert[slot].item())
+        x_q = x_i8[slot, :n, :].float() * x_sd[slot, :n].reshape(-1, 1)
+        gate = x_q @ w1[e].T
+        up = x_q @ w3[e].T
+        if SWIGLU_LIMIT > 0:
+            gate = gate.clamp(max=SWIGLU_LIMIT)
+            up = up.clamp(-SWIGLU_LIMIT, SWIGLU_LIMIT)
+        h = F.silu(gate) * up
+        h_i8, h_sd = int8_quant_per_row(h)
+        h = h_i8.float() * (h_sd * w_rt[slot, :n].reshape(-1, 1))
+        y = h @ w2[e].T
+        for r in range(n):
+            out[int(rt[slot, r].item())] += y[r]
+    tensors["ffn_partial"][:] = out
 
 
 if __name__ == "__main__":
@@ -314,9 +368,9 @@ if __name__ == "__main__":
 
     result = run_jit(
         compile_only=args.compile_only,
-        fn=expert_routed_persistent_balanced_test,
-        specs=build_tensor_specs(),
-        golden_fn=golden_expert_routed,
+        fn=expert_routed_scatter_test,
+        specs=build_tensor_specs_scatter(),
+        golden_fn=golden_expert_routed_scatter,
         golden_data=args.golden_data,
         save_data=args.save_data,
         compile_cfg=dict(dump_passes=args.dump_passes),
@@ -328,7 +382,9 @@ if __name__ == "__main__":
         rtol=1e-3,
         atol=1e-3,
         compare_fn={
-            "recv_y": ratio_reldiff(diff_thd=2e-3, pct_thd=0.01),
+            # FP32 now, and the TOPK sum reassociates across cores run to run,
+            # so this is looser than the BF16 tile form's threshold.
+            "ffn_partial": ratio_reldiff(diff_thd=2e-3, pct_thd=0.01),
         },
     )
     if not result.passed:

@@ -154,7 +154,7 @@ def gate(
     # Pre-route setup: zero the inactive-token outputs and NEG_INF the biased pad
     # columns so the sort ranks pad experts last. Route write-backs are guarded to
     # active tokens, so the inactive-zero can run here rather than post-route.
-    with pl.at(level=pl.Level.CORE_GROUP, name_hint="gate_pre_route"):
+    with pl.at(level=pl.Level.CORE_GROUP, name_hint="gate_pre_route", allow_early_resolve=True):
         for zt in pl.range(T):
             if zt >= active_tokens:
                 pl.write(x_norm_scale, [zt, 0], pl.cast(0.0, pl.FP32))
