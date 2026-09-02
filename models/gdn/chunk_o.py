@@ -36,9 +36,9 @@ CHUNK = 128             # chunk size in tokens
 NCHUNK = T // CHUNK     # state snapshots, one per chunk
 
 # Tiling
-COL_TILE = 64           # contraction block of the intra term. 32 measures 715.1 us
-                        # against 561.6 at 64 -- half as many cube<->vector round
-                        # trips per head. It only fits with a 1-slot ring (below).
+COL_TILE = 64           # contraction block of the intra term. With the row split
+                        # below: 32 measures 681.5 us against 467.0 at 64 -- half
+                        # as many cube<->vector round trips per head.
 D_TILE = D // 2         # output columns per accumulator. The tile that crosses
                         # back to the vector unit is [CHUNK, D_TILE] FP32, and
                         # the cross-core ring reserves two of them, so halving D
@@ -60,21 +60,25 @@ def gdn_chunk_o(
     v_flat = pl.reshape(v, [T, H * D])
     o_flat = pl.reshape(o_out, [T, H * D])
     for t0 in pl.parallel(0, T, CHUNK):
-        # A 2-slot ring plus this kernel's tiles needs 197120 B against a
-        # 188416 B budget; one slot fits at 164352. Giving up the double buffer
-        # costs 11% on its own (COL_TILE=32: 715.1 -> 797.2), but it buys
-        # COL_TILE=64, which is worth about 30% -- net 715.1 -> 561.6.
-        # Freeing the 8704 B needed to keep both was tried and is not reachable:
-        # the two inter tiles are the only removable 32 KB pair, and folding
-        # exp(g) into Q to delete them is refused three ways (row_expand_mul
-        # cannot write a cube-operand layout; routing via pl.mul makes a
-        # [CHUNK, D] FP16 tile the V->C pipe will not carry).
+        # An a2a3 core has two vector sub-cores, and an unsplit mixed region
+        # runs its vector work on lane 0 only. Splitting the rows across both
+        # halves every vector tile, which also frees the 8704 B that a 2-slot
+        # ring needs at COL_TILE=64 -- so the wider tile keeps its double
+        # buffer. Measured: 561.0 (1-slot, no split) -> 467.0 us, -16.8%.
+        # COL_TILE=128 still does not fit (229888 B), so the reference's
+        # whole-[C,C] layout remains out of reach.
         with pl.at(level=pl.Level.CORE_GROUP, name_hint="chunk_o",
-                   optimizations=[pl.cross_core_slot(slot_num=1)]):
+                   optimizations=[pl.split(pl.SplitMode.UP_DOWN)]):
             for h in pl.range(H):
                 qc = pl.slice(q_flat, [CHUNK, D], [t0, h * D])
                 g_col = pl.reshape(pl.slice(g_sum, [1, CHUNK], [h, t0]), [CHUNK, 1])
-                eg = pl.exp(g_col)
+                # exp on the ROW vector, reshaped after -- NOT pl.exp(g_col).
+                # Under pl.split, an elementwise op *following* a [1,C]->[C,1]
+                # reshape loses the split tracking and lane 1 reads the wrong
+                # half (max abs diff 36.86). Either ingredient alone is fine;
+                # it is the order that matters. Repro + isolation matrix:
+                # devtools/split-investigation/repro/.
+                eg = pl.reshape(pl.exp(pl.slice(g_sum, [1, CHUNK], [h, t0])), [CHUNK, 1])
 
                 # inter = exp(g_i) * (Q @ S), split over D so the tile crossing
                 # back is [CHUNK, D_TILE] rather than [CHUNK, D].
