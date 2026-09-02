@@ -522,7 +522,13 @@ def sparse_attn_csa(
     wo_b_scale: pl.Tensor[[D], pl.FP32],
     attn_out: pl.Tensor[[T, D], pl.BF16],
 ):
-    """Sparse decode attention, inverse RoPE, and the replicated grouped o_proj."""
+    """Sparse decode attention, inverse RoPE, and the replicated grouped o_proj.
+
+    The model path stops at `sparse_attn_csa_packed` and hands `o_packed` to the
+    TP-by-group projection in `o_proj_tp`; this replicated form stays as the
+    single-card unit entry below, whose subject is the attention, not the
+    projection.
+    """
     o_packed = pl.create_tensor([O_GROUPS * T, O_GROUP_IN], dtype=pl.BF16)
     merge_tid = sparse_attn_csa_packed(
         q, ori_kv, window_swa_indices, cmp_kv, cmp_block_table, idx_topk,

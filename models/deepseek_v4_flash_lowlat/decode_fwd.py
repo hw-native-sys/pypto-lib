@@ -83,8 +83,11 @@ from decode_csa import (
     MAIN_STATE_BLOCK_SIZE as CSA_MAIN_STATE_BLOCK_SIZE,
     MAIN_STATE_DIM as CSA_MAIN_STATE_DIM,
     MAIN_STATE_MAX_BLOCKS as CSA_MAIN_STATE_MAX_BLOCKS,
+    OPROJ_REDUCE_ROWS as CSA_OPROJ_REDUCE_ROWS,
+    OPROJ_SCALE_ROWS as CSA_OPROJ_SCALE_ROWS,
     attention_csa,
     build_tensor_specs as build_csa_tensor_specs,
+    clear_csa_oproj_signals,
 )
 from config import DECODE_START_POS, FLASH as MODEL_CONFIG, _parse_int_argv
 from decode_prepare import (
@@ -152,7 +155,7 @@ HCA_LAYER_STACKED_NAMES = [
     "hca_cmp_kv",
 ]
 
-LAYER_STACKED_NAMES = ['attn_norm_w', 'attn_sink', 'hca_cmp_kv', 'csa_cmp_kv', 'csa_cmp_ape', 'csa_cmp_norm_w', 'csa_cmp_wgate', 'csa_cmp_wkv', 'csa_compress_state', 'csa_hadamard_idx', 'csa_idx_wq_b', 'csa_idx_wq_b_scale', 'csa_inner_ape', 'csa_inner_compress_state', 'csa_inner_norm_w', 'csa_inner_wgate', 'csa_inner_wkv', 'csa_weights_proj', 'gamma_ckv', 'gamma_cq', 'gate_bias', 'gate_w', 'hc_attn_base', 'hc_attn_fn', 'hc_attn_scale', 'hc_ffn_base', 'hc_ffn_fn', 'hc_ffn_scale', 'hca_cmp_ape', 'hca_cmp_norm_w', 'hca_cmp_wgate', 'hca_cmp_wkv', 'hca_compress_state', 'idx_kv_cache', 'idx_kv_scale', 'kv_cache', 'norm_w', 'routed_w1', 'routed_w1_scale', 'routed_w2', 'routed_w2_scale', 'routed_w3', 'routed_w3_scale', 'shared_w1', 'shared_w1_scale', 'shared_w2', 'shared_w2_scale', 'shared_w3', 'shared_w3_scale', 'tid2eid', 'wkv', 'wo_a', 'wo_b', 'wo_b_scale', 'wq_a', 'wq_b', 'wq_b_scale']
+LAYER_STACKED_NAMES = ['attn_norm_w', 'attn_sink', 'hca_cmp_kv', 'csa_cmp_kv', 'csa_cmp_ape', 'csa_cmp_norm_w', 'csa_cmp_wgate', 'csa_cmp_wkv', 'csa_compress_state', 'csa_hadamard_idx', 'csa_idx_wq_b', 'csa_idx_wq_b_scale', 'csa_inner_ape', 'csa_inner_compress_state', 'csa_inner_norm_w', 'csa_inner_wgate', 'csa_inner_wkv', 'csa_weights_proj', 'gamma_ckv', 'gamma_cq', 'gate_bias', 'gate_w', 'hc_attn_base', 'hc_attn_fn', 'hc_attn_scale', 'hc_ffn_base', 'hc_ffn_fn', 'hc_ffn_scale', 'hca_cmp_ape', 'hca_cmp_norm_w', 'hca_cmp_wgate', 'hca_cmp_wkv', 'hca_compress_state', 'idx_kv_cache', 'idx_kv_scale', 'kv_cache', 'norm_w', 'routed_w1', 'routed_w1_scale', 'routed_w2', 'routed_w2_scale', 'routed_w3', 'routed_w3_scale', 'shared_w1', 'shared_w1_scale', 'shared_w2', 'shared_w2_scale', 'shared_w3', 'shared_w3_scale', 'tid2eid', 'wkv', 'wo_a', 'wo_a_shard', 'wo_b', 'wo_b_scale', 'wo_b_shard', 'wq_a', 'wq_b', 'wq_b_scale']
 SHARED_NAMES = [
     "hca_cmp_block_table",
     "csa_cmp_block_table",
@@ -225,6 +228,10 @@ def decode_fwd(
     wo_a: pl.Tensor[[FWD_NUM_LAYERS * O_GROUPS, O_LORA, O_GROUP_IN], pl.BF16],
     wo_b: pl.Tensor[[FWD_NUM_LAYERS * D, O_GROUPS * O_LORA], pl.INT8],
     wo_b_scale: pl.Tensor[[FWD_NUM_LAYERS * D], pl.FP32],
+    # The CSA layers shard the projection one group per card; SWA and HCA keep
+    # reading the replicated wo_a / wo_b above.
+    wo_a_shard: pl.Tensor[[FWD_NUM_LAYERS, O_LORA, O_GROUP_IN], pl.BF16],
+    wo_b_shard: pl.Tensor[[FWD_NUM_LAYERS * D, O_LORA], pl.INT8],
     hca_cmp_wkv: pl.Tensor[[HCA_NUM_LAYERS * HCA_MAIN_OUT_DIM, D], pl.BF16],
     hca_cmp_wgate: pl.Tensor[[HCA_NUM_LAYERS * HCA_MAIN_OUT_DIM, D], pl.BF16],
     hca_cmp_ape: pl.Tensor[[HCA_NUM_LAYERS * HCA_COMPRESS_RATIO, HCA_MAIN_OUT_DIM], pl.FP32],
@@ -307,6 +314,10 @@ def decode_fwd(
     ],
     reduce_window: pld.DistributedTensor[[REDUCE_WINDOW_ROWS, D], pl.FP32],
     reduce_signal: pld.DistributedTensor[[N_RANKS, 1], pl.INT32],
+    oproj_reduce_window: pld.DistributedTensor[[CSA_OPROJ_REDUCE_ROWS, D], pl.INT32],
+    oproj_scale_window: pld.DistributedTensor[[CSA_OPROJ_SCALE_ROWS, 1], pl.FP32],
+    oproj_reduce_signal: pld.DistributedTensor[[N_RANKS, 1], pl.INT32],
+    oproj_sync_signal: pld.DistributedTensor[[N_RANKS, 1], pl.INT32],
     lm_head_hidden_window: pld.DistributedTensor[[GROUP_LOGIT_ROWS, D], pl.BF16],
     lm_head_hidden_done: pld.DistributedTensor[[LM_HEAD_TP_SIZE, 1], pl.INT32],
     lm_head_logits_window: pld.DistributedTensor[[MAX_LOGIT_ROWS, LM_HEAD_VOCAB], pl.FP32],
@@ -471,6 +482,8 @@ def decode_fwd(
         csa_layer: pl.Scalar[pl.INT32] = pl.cast(loop_i * 2 + 2, pl.INT32)
         hca_layer: pl.Scalar[pl.INT32] = pl.cast(loop_i * 2 + 3, pl.INT32)
         csa_moe_epoch: pl.Scalar[pl.INT32] = pl.cast(loop_i * 2 + 3, pl.INT32)
+        # 1-based o-projection call id; the last CSA layer below takes CSA_NUM_LAYERS.
+        csa_oproj_epoch: pl.Scalar[pl.INT32] = pl.cast(loop_i + 1, pl.INT32)
         hca_moe_epoch: pl.Scalar[pl.INT32] = pl.cast(loop_i * 2 + 4, pl.INT32)
         x_attn_csa: pl.Tensor[[T, HC_MULT, D], pl.FP32] = pl.create_tensor([T, HC_MULT, D], dtype=pl.FP32)
         x_attn_hca: pl.Tensor[[T, HC_MULT, D], pl.FP32] = pl.create_tensor([T, HC_MULT, D], dtype=pl.FP32)
@@ -490,6 +503,8 @@ def decode_fwd(
         wo_a_csa: pl.Tensor[[O_GROUPS, O_LORA, O_GROUP_IN], pl.BF16] = pl.slice(wo_a, [O_GROUPS, O_LORA, O_GROUP_IN], [csa_layer * O_GROUPS, 0, 0])
         wo_b_csa: pl.Tensor[[D, O_GROUPS * O_LORA], pl.INT8] = pl.slice(wo_b, [D, O_GROUPS * O_LORA], [csa_layer * D, 0])
         wo_b_scale_csa: pl.Tensor[[D], pl.FP32] = pl.slice(wo_b_scale, [D], [csa_layer * D])
+        wo_a_shard_csa: pl.Tensor[[1, O_LORA, O_GROUP_IN], pl.BF16] = pl.slice(wo_a_shard, [1, O_LORA, O_GROUP_IN], [csa_layer, 0, 0])
+        wo_b_shard_csa: pl.Tensor[[D, O_LORA], pl.INT8] = pl.slice(wo_b_shard, [D, O_LORA], [csa_layer * D, 0])
         csa_cmp_wkv_csa: pl.Tensor[[CSA_MAIN_OUT_DIM, D], pl.BF16] = pl.slice(csa_cmp_wkv, [CSA_MAIN_OUT_DIM, D], [loop_i * CSA_MAIN_OUT_DIM, 0])
         csa_cmp_wgate_csa: pl.Tensor[[CSA_MAIN_OUT_DIM, D], pl.BF16] = pl.slice(csa_cmp_wgate, [CSA_MAIN_OUT_DIM, D], [loop_i * CSA_MAIN_OUT_DIM, 0])
         csa_cmp_ape_csa: pl.Tensor[[CSA_COMPRESS_RATIO, CSA_MAIN_OUT_DIM], pl.FP32] = pl.slice(csa_cmp_ape, [CSA_COMPRESS_RATIO, CSA_MAIN_OUT_DIM], [loop_i * CSA_COMPRESS_RATIO, 0])
@@ -544,8 +559,11 @@ def decode_fwd(
                 csa_cmp_slot_mapping, csa_idx_slot_mapping,
                 csa_state_slot_mapping, csa_inner_state_slot_mapping,
                 position_ids, kv_seq_lens,
-                attn_sink_csa, wo_a_csa, wo_b_csa, wo_b_scale_csa,
+                attn_sink_csa, wo_a_shard_csa, wo_b_shard_csa, wo_b_scale_csa,
                 x_attn_csa,
+                oproj_reduce_window, oproj_scale_window,
+                oproj_reduce_signal, oproj_sync_signal,
+                my_rank, csa_oproj_epoch,
             )
         with pl.scope():
             moe(
@@ -649,6 +667,9 @@ def decode_fwd(
     wo_a_last: pl.Tensor[[O_GROUPS, O_LORA, O_GROUP_IN], pl.BF16] = pl.slice(wo_a, [O_GROUPS, O_LORA, O_GROUP_IN], [csa_layer_last * O_GROUPS, 0, 0])
     wo_b_last: pl.Tensor[[D, O_GROUPS * O_LORA], pl.INT8] = pl.slice(wo_b, [D, O_GROUPS * O_LORA], [csa_layer_last * D, 0])
     wo_b_scale_last: pl.Tensor[[D], pl.FP32] = pl.slice(wo_b_scale, [D], [csa_layer_last * D])
+    wo_a_shard_last: pl.Tensor[[1, O_LORA, O_GROUP_IN], pl.BF16] = pl.slice(wo_a_shard, [1, O_LORA, O_GROUP_IN], [csa_layer_last, 0, 0])
+    wo_b_shard_last: pl.Tensor[[D, O_LORA], pl.INT8] = pl.slice(wo_b_shard, [D, O_LORA], [csa_layer_last * D, 0])
+    last_oproj_epoch: pl.Scalar[pl.INT32] = pl.cast(CSA_NUM_LAYERS, pl.INT32)
     csa_cmp_wkv_last: pl.Tensor[[CSA_MAIN_OUT_DIM, D], pl.BF16] = pl.slice(csa_cmp_wkv, [CSA_MAIN_OUT_DIM, D], [(CSA_NUM_LAYERS - 1) * CSA_MAIN_OUT_DIM, 0])
     csa_cmp_wgate_last: pl.Tensor[[CSA_MAIN_OUT_DIM, D], pl.BF16] = pl.slice(csa_cmp_wgate, [CSA_MAIN_OUT_DIM, D], [(CSA_NUM_LAYERS - 1) * CSA_MAIN_OUT_DIM, 0])
     csa_cmp_ape_last: pl.Tensor[[CSA_COMPRESS_RATIO, CSA_MAIN_OUT_DIM], pl.FP32] = pl.slice(csa_cmp_ape, [CSA_COMPRESS_RATIO, CSA_MAIN_OUT_DIM], [(CSA_NUM_LAYERS - 1) * CSA_COMPRESS_RATIO, 0])
@@ -703,8 +724,11 @@ def decode_fwd(
             csa_cmp_slot_mapping, csa_idx_slot_mapping,
             csa_state_slot_mapping, csa_inner_state_slot_mapping,
             position_ids, kv_seq_lens,
-            attn_sink_last, wo_a_last, wo_b_last, wo_b_scale_last,
+            attn_sink_last, wo_a_shard_last, wo_b_shard_last, wo_b_scale_last,
             x_attn_last,
+            oproj_reduce_window, oproj_scale_window,
+            oproj_reduce_signal, oproj_sync_signal,
+            my_rank, last_oproj_epoch,
         )
     with pl.scope():
         moe(
@@ -720,6 +744,7 @@ def decode_fwd(
             csa_layer_last, nt, my_rank, last_moe_epoch,
         )
     clear_moe_signals(pre_hc_hidden_out, reduce_signal)
+    clear_csa_oproj_signals(pre_hc_hidden_out, oproj_reduce_signal, oproj_sync_signal)
     x_head: pl.Tensor[[T, D], pl.BF16] = pl.create_tensor([T, D], dtype=pl.BF16)
     with pl.scope():
         hc_head(pre_hc_hidden_out, hc_head_fn, hc_head_scale, hc_head_base, x_head)
@@ -754,6 +779,10 @@ def l2_decode_fwd(
     wo_a: pl.Tensor[[FWD_NUM_LAYERS * O_GROUPS, O_LORA, O_GROUP_IN], pl.BF16],
     wo_b: pl.Tensor[[FWD_NUM_LAYERS * D, O_GROUPS * O_LORA], pl.INT8],
     wo_b_scale: pl.Tensor[[FWD_NUM_LAYERS * D], pl.FP32],
+    # The CSA layers shard the projection one group per card; SWA and HCA keep
+    # reading the replicated wo_a / wo_b above.
+    wo_a_shard: pl.Tensor[[FWD_NUM_LAYERS, O_LORA, O_GROUP_IN], pl.BF16],
+    wo_b_shard: pl.Tensor[[FWD_NUM_LAYERS * D, O_LORA], pl.INT8],
     hca_cmp_wkv: pl.Tensor[[HCA_NUM_LAYERS * HCA_MAIN_OUT_DIM, D], pl.BF16],
     hca_cmp_wgate: pl.Tensor[[HCA_NUM_LAYERS * HCA_MAIN_OUT_DIM, D], pl.BF16],
     hca_cmp_ape: pl.Tensor[[HCA_NUM_LAYERS * HCA_COMPRESS_RATIO, HCA_MAIN_OUT_DIM], pl.FP32],
@@ -827,6 +856,10 @@ def l2_decode_fwd(
     ],
     reduce_window: pld.DistributedTensor[[REDUCE_WINDOW_ROWS, D], pl.FP32],
     reduce_signal: pld.DistributedTensor[[N_RANKS, 1], pl.INT32],
+    oproj_reduce_window: pld.DistributedTensor[[CSA_OPROJ_REDUCE_ROWS, D], pl.INT32],
+    oproj_scale_window: pld.DistributedTensor[[CSA_OPROJ_SCALE_ROWS, 1], pl.FP32],
+    oproj_reduce_signal: pld.DistributedTensor[[N_RANKS, 1], pl.INT32],
+    oproj_sync_signal: pld.DistributedTensor[[N_RANKS, 1], pl.INT32],
     embed_window: pld.DistributedTensor[[T, D], pl.BF16],
     embed_signal: pld.DistributedTensor[[N_RANKS, 1], pl.INT32],
     lm_head_hidden_window: pld.DistributedTensor[[GROUP_LOGIT_ROWS, D], pl.BF16],
@@ -879,7 +912,7 @@ def l2_decode_fwd(
         hc_attn_fn, hc_attn_scale, hc_attn_base,
         attn_norm_w, wq_a, wq_b, wq_b_scale,
         wkv, gamma_cq, gamma_ckv, kv_cache,
-        attn_sink, wo_a, wo_b, wo_b_scale,
+        attn_sink, wo_a, wo_b, wo_b_scale, wo_a_shard, wo_b_shard,
         hca_cmp_wkv, hca_cmp_wgate, hca_cmp_ape, hca_cmp_norm_w, hca_compress_state,
         csa_cmp_wkv, csa_cmp_wgate, csa_cmp_ape, csa_cmp_norm_w, csa_compress_state,
         csa_idx_wq_b, csa_idx_wq_b_scale, csa_weights_proj, csa_hadamard_idx,
@@ -902,6 +935,7 @@ def l2_decode_fwd(
         sampling_temperatures, sampling_top_ks, sampling_seeds, sampling_positions,
         pre_hc_hidden_out, x_out, logits, sampled_ids,
         reduce_window, reduce_signal,
+        oproj_reduce_window, oproj_scale_window, oproj_reduce_signal, oproj_sync_signal,
         lm_head_hidden_window, lm_head_hidden_done, lm_head_logits_window, lm_head_logits_done,
         num_tokens_per_owner, my_rank,
     )
@@ -925,6 +959,8 @@ def l3_decode_fwd(
     wo_a: pl.Tensor[[N_RANKS, FWD_NUM_LAYERS * O_GROUPS, O_LORA, O_GROUP_IN], pl.BF16],
     wo_b: pl.Tensor[[N_RANKS, FWD_NUM_LAYERS * D, O_GROUPS * O_LORA], pl.INT8],
     wo_b_scale: pl.Tensor[[N_RANKS, FWD_NUM_LAYERS * D], pl.FP32],
+    wo_a_shard: pl.Tensor[[N_RANKS, FWD_NUM_LAYERS, O_LORA, O_GROUP_IN], pl.BF16],
+    wo_b_shard: pl.Tensor[[N_RANKS, FWD_NUM_LAYERS * D, O_LORA], pl.INT8],
     hca_cmp_wkv: pl.Tensor[[N_RANKS, HCA_NUM_LAYERS * HCA_MAIN_OUT_DIM, D], pl.BF16],
     hca_cmp_wgate: pl.Tensor[[N_RANKS, HCA_NUM_LAYERS * HCA_MAIN_OUT_DIM, D], pl.BF16],
     hca_cmp_ape: pl.Tensor[[N_RANKS, HCA_NUM_LAYERS * HCA_COMPRESS_RATIO, HCA_MAIN_OUT_DIM], pl.FP32],
@@ -1004,6 +1040,13 @@ def l3_decode_fwd(
     reduce_signal_buf = pld.alloc_window_buffer([N_RANKS, 1], dtype=pl.INT32)
     embed_window_buf = pld.alloc_window_buffer([T, D], dtype=pl.BF16)
     embed_signal_buf = pld.alloc_window_buffer([N_RANKS, 1], dtype=pl.INT32)
+    # The CSA o-projection reduces INT32 partials plus their per-rank activation
+    # scale, so it carries its own windows; its counters are monotonic across the
+    # forward's CSA layers and cleared once at the end, like the MoE's.
+    oproj_reduce_buf = pld.alloc_window_buffer([CSA_OPROJ_REDUCE_ROWS, D], dtype=pl.INT32)
+    oproj_scale_buf = pld.alloc_window_buffer([CSA_OPROJ_SCALE_ROWS, 1], dtype=pl.FP32)
+    oproj_reduce_signal_buf = pld.alloc_window_buffer([N_RANKS, 1], dtype=pl.INT32)
+    oproj_sync_signal_buf = pld.alloc_window_buffer([N_RANKS, 1], dtype=pl.INT32)
     # The LM head owns every window and counter it touches: a peer routes into
     # logits_window while still reading its own hidden_window.
     lm_head_hidden_window_buf = pld.alloc_window_buffer(GROUP_LOGIT_ROWS * D * 2)
@@ -1016,6 +1059,10 @@ def l3_decode_fwd(
         reduce_signal = pld.window(reduce_signal_buf, [N_RANKS, 1], dtype=pl.INT32)
         embed_window = pld.window(embed_window_buf, [T, D], dtype=pl.BF16)
         embed_signal = pld.window(embed_signal_buf, [N_RANKS, 1], dtype=pl.INT32)
+        oproj_reduce_window = pld.window(oproj_reduce_buf, [CSA_OPROJ_REDUCE_ROWS, D], dtype=pl.INT32)
+        oproj_scale_window = pld.window(oproj_scale_buf, [CSA_OPROJ_SCALE_ROWS, 1], dtype=pl.FP32)
+        oproj_reduce_signal = pld.window(oproj_reduce_signal_buf, [N_RANKS, 1], dtype=pl.INT32)
+        oproj_sync_signal = pld.window(oproj_sync_signal_buf, [N_RANKS, 1], dtype=pl.INT32)
         lm_head_hidden_window = pld.window(lm_head_hidden_window_buf, [GROUP_LOGIT_ROWS, D], dtype=pl.BF16)
         lm_head_hidden_done = pld.window(lm_head_hidden_done_buf, [LM_HEAD_TP_SIZE, 1], dtype=pl.INT32)
         lm_head_logits_window = pld.window(lm_head_logits_window_buf, [MAX_LOGIT_ROWS, LM_HEAD_VOCAB], dtype=pl.FP32)
@@ -1023,7 +1070,8 @@ def l3_decode_fwd(
         l2_decode_fwd(
             embed_weight[r], hc_attn_fn[r], hc_attn_scale[r], hc_attn_base[r], attn_norm_w[r], wq_a[r],
             wq_b[r], wq_b_scale[r], wkv[r], gamma_cq[r], gamma_ckv[r], kv_cache[r], attn_sink[r],
-            wo_a[r], wo_b[r], wo_b_scale[r], hca_cmp_wkv[r], hca_cmp_wgate[r], hca_cmp_ape[r],
+            wo_a[r], wo_b[r], wo_b_scale[r], wo_a_shard[r], wo_b_shard[r],
+            hca_cmp_wkv[r], hca_cmp_wgate[r], hca_cmp_ape[r],
             hca_cmp_norm_w[r], hca_compress_state[r], csa_cmp_wkv[r], csa_cmp_wgate[r],
             csa_cmp_ape[r], csa_cmp_norm_w[r], csa_compress_state[r], csa_idx_wq_b[r],
             csa_idx_wq_b_scale[r], csa_weights_proj[r], csa_hadamard_idx[r], csa_inner_wkv[r],
@@ -1044,7 +1092,9 @@ def l3_decode_fwd(
             sampling_temperatures[r], sampling_top_ks[r],
             sampling_seeds[r], sampling_positions[r],
             pre_hc_hidden_out[r], hidden_out[r], logits[r], sampled_ids[r],
-            reduce_window, reduce_signal, embed_window, embed_signal,
+            reduce_window, reduce_signal,
+            oproj_reduce_window, oproj_scale_window, oproj_reduce_signal, oproj_sync_signal,
+            embed_window, embed_signal,
             lm_head_hidden_window, lm_head_hidden_done,
             lm_head_logits_window, lm_head_logits_done,
             num_tokens_per_owner, r,
@@ -1430,6 +1480,7 @@ def build_single_layer_tensor_specs(
     """Per-layer single-rank tensor specs: the base shapes/dtypes/inits that
     build_tensor_specs restacks across the 43 forward layers."""
     import torch
+    from dataclasses import replace
     from utils import block_table
     from golden import ScalarSpec, TensorSpec
 
@@ -1460,6 +1511,13 @@ def build_single_layer_tensor_specs(
         for spec in build_csa_tensor_specs(start_pos)
         if isinstance(spec, TensorSpec)
     }
+    # One draw of the o-projection weights. SWA and HCA read the replicated copy,
+    # the CSA layers read the per-card shard cut from it, so both must be the same
+    # numbers -- re-calling the spec's init would redraw them.
+    wo_a_value = swa_specs["wo_a"].create_tensor()
+    wo_b_value = swa_specs["wo_b"].create_tensor()
+    swa_specs["wo_a"] = replace(swa_specs["wo_a"], init_value=wo_a_value)
+    swa_specs["wo_b"] = replace(swa_specs["wo_b"], init_value=wo_b_value)
     moe_specs = build_moe_tensor_specs(layer_id)
     moe_tensor_specs = {spec.name: spec for spec in moe_specs if isinstance(spec, TensorSpec)}
     attention_kind = _attention_kind_for_layer(layer_id)
@@ -1629,6 +1687,24 @@ def build_single_layer_tensor_specs(
         for name, spec in attention_specs
     ]
 
+    # Card r owns o-projection group r: proj_a's rows for that group and proj_b's
+    # matching O_LORA column band. Positional binding, so these sit exactly where
+    # the host entry takes them -- right after wo_b_scale.
+    oproj_shards = [
+        TensorSpec(
+            "wo_a_shard", [N_RANKS, 1, O_LORA, O_GROUP_IN], torch.bfloat16,
+            init_value=lambda: torch.stack(
+                [wo_a_value[r : r + 1] for r in range(N_RANKS)], dim=0),
+        ),
+        TensorSpec(
+            "wo_b_shard", [N_RANKS, D, O_LORA], torch.int8,
+            init_value=lambda: torch.stack(
+                [wo_b_value[:, r * O_LORA : (r + 1) * O_LORA] for r in range(N_RANKS)], dim=0),
+        ),
+    ]
+    shard_at = next(i for i, s in enumerate(specs) if s.name == "wo_b_scale") + 1
+    specs[shard_at:shard_at] = oproj_shards
+
     for spec in moe_specs:
         if not isinstance(spec, TensorSpec):
             continue
@@ -1768,7 +1844,7 @@ def build_tensor_specs(
         csa_state_block_num=csa_state_block_num,
         inner_state_block_num=inner_state_block_num,
     )
-    ordered_names = ['embed_weight', 'hc_attn_fn', 'hc_attn_scale', 'hc_attn_base', 'attn_norm_w', 'wq_a', 'wq_b', 'wq_b_scale', 'wkv', 'gamma_cq', 'gamma_ckv', 'kv_cache', 'attn_sink', 'wo_a', 'wo_b', 'wo_b_scale', 'hca_cmp_wkv', 'hca_cmp_wgate', 'hca_cmp_ape', 'hca_cmp_norm_w', 'hca_compress_state', 'csa_cmp_wkv', 'csa_cmp_wgate', 'csa_cmp_ape', 'csa_cmp_norm_w', 'csa_compress_state', 'csa_idx_wq_b', 'csa_idx_wq_b_scale', 'csa_weights_proj', 'csa_hadamard_idx', 'csa_inner_wkv', 'csa_inner_wgate', 'csa_inner_ape', 'csa_inner_norm_w', 'csa_inner_compress_state', 'hca_cmp_kv', 'csa_cmp_kv', 'idx_kv_cache', 'idx_kv_scale', 'hc_ffn_fn', 'hc_ffn_scale', 'hc_ffn_base', 'norm_w', 'gate_w', 'gate_bias', 'tid2eid', 'routed_w1', 'routed_w1_scale', 'routed_w3', 'routed_w3_scale', 'routed_w2', 'routed_w2_scale', 'shared_w1', 'shared_w1_scale', 'shared_w3', 'shared_w3_scale', 'shared_w2', 'shared_w2_scale', 'freqs_cos', 'freqs_sin', 'block_table', 'position_ids', 'kv_seq_lens', 'hca_compress_state_block_table', 'csa_compress_state_block_table', 'csa_inner_compress_state_block_table', 'hca_cmp_block_table', 'csa_cmp_block_table', 'idx_block_table', 'block_counts', 'input_ids', 'hc_head_fn', 'hc_head_scale', 'hc_head_base', 'final_norm_w']
+    ordered_names = ['embed_weight', 'hc_attn_fn', 'hc_attn_scale', 'hc_attn_base', 'attn_norm_w', 'wq_a', 'wq_b', 'wq_b_scale', 'wkv', 'gamma_cq', 'gamma_ckv', 'kv_cache', 'attn_sink', 'wo_a', 'wo_b', 'wo_b_scale', 'wo_a_shard', 'wo_b_shard', 'hca_cmp_wkv', 'hca_cmp_wgate', 'hca_cmp_ape', 'hca_cmp_norm_w', 'hca_compress_state', 'csa_cmp_wkv', 'csa_cmp_wgate', 'csa_cmp_ape', 'csa_cmp_norm_w', 'csa_compress_state', 'csa_idx_wq_b', 'csa_idx_wq_b_scale', 'csa_weights_proj', 'csa_hadamard_idx', 'csa_inner_wkv', 'csa_inner_wgate', 'csa_inner_ape', 'csa_inner_norm_w', 'csa_inner_compress_state', 'hca_cmp_kv', 'csa_cmp_kv', 'idx_kv_cache', 'idx_kv_scale', 'hc_ffn_fn', 'hc_ffn_scale', 'hc_ffn_base', 'norm_w', 'gate_w', 'gate_bias', 'tid2eid', 'routed_w1', 'routed_w1_scale', 'routed_w3', 'routed_w3_scale', 'routed_w2', 'routed_w2_scale', 'shared_w1', 'shared_w1_scale', 'shared_w3', 'shared_w3_scale', 'shared_w2', 'shared_w2_scale', 'freqs_cos', 'freqs_sin', 'block_table', 'position_ids', 'kv_seq_lens', 'hca_compress_state_block_table', 'csa_compress_state_block_table', 'csa_inner_compress_state_block_table', 'hca_cmp_block_table', 'csa_cmp_block_table', 'idx_block_table', 'block_counts', 'input_ids', 'hc_head_fn', 'hc_head_scale', 'hc_head_base', 'final_norm_w']
     specs = []
     for name in ordered_names:
         if name in preamble_specs:

@@ -7,11 +7,15 @@
 # See LICENSE in the root of the software repository for the full text of the License.
 # -----------------------------------------------------------------------------------------------------------
 # ci: devices=8  # CI: 8-card TP run; the deployment world size, borrowed via task-submit --device-num
-"""DeepSeek-V4 decode layer smoke: replicated attention followed by the TP MoE.
+"""DeepSeek-V4 decode layer smoke: attention followed by the TP MoE.
 
 Each rank owns a local decode micro-batch for the selected attention stage.
 The resulting per-rank hidden states feed the N-rank EP MoE path. The EP world
 size is chosen with --ep (2/4/8, default 2), inherited from moe; see __main__.
+
+Attention is replicated except for the CSA stage's output projection, which is
+sharded one group per card and all-reduced; SWA and HCA still run the replicated
+grouped projection.
 """
 
 import pypto.language as pl
@@ -75,7 +79,11 @@ from decode_csa import (
     MAIN_STATE_BLOCK_SIZE as CSA_MAIN_STATE_BLOCK_SIZE,
     MAIN_STATE_DIM as CSA_MAIN_STATE_DIM,
     MAIN_STATE_MAX_BLOCKS as CSA_MAIN_STATE_MAX_BLOCKS,
+    OPROJ_FIRST_EPOCH as CSA_OPROJ_FIRST_EPOCH,
+    OPROJ_REDUCE_ROWS as CSA_OPROJ_REDUCE_ROWS,
+    OPROJ_SCALE_ROWS as CSA_OPROJ_SCALE_ROWS,
     attention_csa,
+    clear_csa_oproj_signals,
     build_tensor_specs as build_csa_tensor_specs,
     golden_attention_csa,
 )
@@ -131,6 +139,8 @@ def decode_layer(
     wo_a: pl.Tensor[[O_GROUPS, O_LORA, O_GROUP_IN], pl.BF16],
     wo_b: pl.Tensor[[D, O_GROUPS * O_LORA], pl.INT8],
     wo_b_scale: pl.Tensor[[D], pl.FP32],
+    wo_a_shard: pl.Tensor[[1, O_LORA, O_GROUP_IN], pl.BF16],
+    wo_b_shard: pl.Tensor[[D, O_LORA], pl.INT8],
     hca_cmp_wkv: pl.Tensor[[HCA_MAIN_OUT_DIM, D], pl.BF16],
     hca_cmp_wgate: pl.Tensor[[HCA_MAIN_OUT_DIM, D], pl.BF16],
     hca_cmp_ape: pl.Tensor[[HCA_COMPRESS_RATIO, HCA_MAIN_OUT_DIM], pl.FP32],
@@ -198,6 +208,10 @@ def decode_layer(
     x_next: pl.Out[pl.Tensor[[T, HC_MULT, D], pl.FP32]],
     reduce_window: pld.DistributedTensor[[REDUCE_WINDOW_ROWS, D], pl.FP32],
     reduce_signal: pld.DistributedTensor[[N_RANKS, 1], pl.INT32],
+    oproj_reduce_window: pld.DistributedTensor[[CSA_OPROJ_REDUCE_ROWS, D], pl.INT32],
+    oproj_scale_window: pld.DistributedTensor[[CSA_OPROJ_SCALE_ROWS, 1], pl.FP32],
+    oproj_reduce_signal: pld.DistributedTensor[[N_RANKS, 1], pl.INT32],
+    oproj_sync_signal: pld.DistributedTensor[[N_RANKS, 1], pl.INT32],
     layer_id: pl.Scalar[pl.INT32],
     my_rank: pl.Scalar[pl.INT32],
 ) -> pl.Tensor[[T, HC_MULT, D], pl.FP32]:
@@ -245,9 +259,15 @@ def decode_layer(
             csa_cmp_slot_mapping, csa_idx_slot_mapping,
             csa_state_slot_mapping, csa_inner_state_slot_mapping,
             position_ids, kv_seq_lens,
-            attn_sink, wo_a, wo_b, wo_b_scale,
+            attn_sink, wo_a_shard, wo_b_shard, wo_b_scale,
             x_attn,
+            oproj_reduce_window, oproj_scale_window,
+            oproj_reduce_signal, oproj_sync_signal,
+            my_rank, pl.const(CSA_OPROJ_FIRST_EPOCH, pl.INT32),
         )
+        # One CSA layer per dispatch, so this is that layer: reset the counters
+        # the projection left monotonic for the next dispatch.
+        clear_csa_oproj_signals(x_attn, oproj_reduce_signal, oproj_sync_signal)
 
     moe(
         x_attn,
@@ -301,6 +321,8 @@ def l3_decode_layer(
     wo_a: pl.Tensor[[N_RANKS, O_GROUPS, O_LORA, O_GROUP_IN], pl.BF16],
     wo_b: pl.Tensor[[N_RANKS, D, O_GROUPS * O_LORA], pl.INT8],
     wo_b_scale: pl.Tensor[[N_RANKS, D], pl.FP32],
+    wo_a_shard: pl.Tensor[[N_RANKS, 1, O_LORA, O_GROUP_IN], pl.BF16],
+    wo_b_shard: pl.Tensor[[N_RANKS, D, O_LORA], pl.INT8],
     hca_cmp_wkv: pl.Tensor[[N_RANKS, HCA_MAIN_OUT_DIM, D], pl.BF16],
     hca_cmp_wgate: pl.Tensor[[N_RANKS, HCA_MAIN_OUT_DIM, D], pl.BF16],
     hca_cmp_ape: pl.Tensor[[N_RANKS, HCA_COMPRESS_RATIO, HCA_MAIN_OUT_DIM], pl.FP32],
@@ -376,10 +398,20 @@ def l3_decode_layer(
 ):
     reduce_window_buf = pld.alloc_window_buffer([REDUCE_WINDOW_ROWS, D], dtype=pl.FP32)
     reduce_signal_buf = pld.alloc_window_buffer([N_RANKS, 1], dtype=pl.INT32)
+    # The CSA o-projection reduces a different quantity -- INT32 partials plus the
+    # per-rank activation scale -- so it carries its own windows and signals.
+    oproj_reduce_buf = pld.alloc_window_buffer([CSA_OPROJ_REDUCE_ROWS, D], dtype=pl.INT32)
+    oproj_scale_buf = pld.alloc_window_buffer([CSA_OPROJ_SCALE_ROWS, 1], dtype=pl.FP32)
+    oproj_reduce_signal_buf = pld.alloc_window_buffer([N_RANKS, 1], dtype=pl.INT32)
+    oproj_sync_signal_buf = pld.alloc_window_buffer([N_RANKS, 1], dtype=pl.INT32)
 
     for r in pl.range(pld.world_size()):
         reduce_window = pld.window(reduce_window_buf, [REDUCE_WINDOW_ROWS, D], dtype=pl.FP32)
         reduce_signal = pld.window(reduce_signal_buf, [N_RANKS, 1], dtype=pl.INT32)
+        oproj_reduce_window = pld.window(oproj_reduce_buf, [CSA_OPROJ_REDUCE_ROWS, D], dtype=pl.INT32)
+        oproj_scale_window = pld.window(oproj_scale_buf, [CSA_OPROJ_SCALE_ROWS, 1], dtype=pl.FP32)
+        oproj_reduce_signal = pld.window(oproj_reduce_signal_buf, [N_RANKS, 1], dtype=pl.INT32)
+        oproj_sync_signal = pld.window(oproj_sync_signal_buf, [N_RANKS, 1], dtype=pl.INT32)
         decode_layer(
             x_hc[r],
             hc_attn_fn[r], hc_attn_scale[r], hc_attn_base[r],
@@ -395,6 +427,7 @@ def l3_decode_layer(
             csa_state_slot_mapping[r], csa_inner_state_slot_mapping[r],
             position_ids[r], kv_seq_lens[r],
             attn_sink[r], wo_a[r], wo_b[r], wo_b_scale[r],
+            wo_a_shard[r], wo_b_shard[r],
             hca_cmp_wkv[r], hca_cmp_wgate[r], hca_cmp_ape[r], hca_cmp_norm_w[r],
             hca_compress_state[r], hca_compress_state_block_table[r],
             csa_cmp_wkv[r], csa_cmp_wgate[r], csa_cmp_ape[r], csa_cmp_norm_w[r],
@@ -413,6 +446,8 @@ def l3_decode_layer(
             shared_w2[r], shared_w2_scale[r],
             x_next[r],
             reduce_window, reduce_signal,
+            oproj_reduce_window, oproj_scale_window,
+            oproj_reduce_signal, oproj_sync_signal,
             layer_id, r,
             device=r,
         )
@@ -651,6 +686,7 @@ def _attention_kind_for_layer(layer_id):
 
 def build_tensor_specs(start_pos=DECODE_START_POS, layer_id=10):
     import torch
+    from dataclasses import replace
     from utils import block_table
     from golden import ScalarSpec, TensorSpec
 
@@ -661,6 +697,14 @@ def build_tensor_specs(start_pos=DECODE_START_POS, layer_id=10):
         for spec in build_attention_tensor_specs(start_pos)
         if isinstance(spec, TensorSpec)
     }
+    # One draw of the o-projection weights. SWA and HCA read the replicated copy,
+    # the CSA layer reads the per-card shard cut from it, and the golden works off
+    # the replicated copy, so all three must be the same numbers -- re-calling the
+    # spec's init would redraw them.
+    wo_a_value = swa_specs["wo_a"].create_tensor()
+    wo_b_value = swa_specs["wo_b"].create_tensor()
+    swa_specs["wo_a"] = replace(swa_specs["wo_a"], init_value=wo_a_value)
+    swa_specs["wo_b"] = replace(swa_specs["wo_b"], init_value=wo_b_value)
     hca_specs = {
         spec.name: spec
         for spec in build_hca_tensor_specs(start_pos)
@@ -793,6 +837,24 @@ def build_tensor_specs(start_pos=DECODE_START_POS, layer_id=10):
         for name, spec in attention_specs
     ]
 
+    # Card r owns o-projection group r: proj_a's rows for that group and proj_b's
+    # matching O_LORA column band. Positional binding, so these sit exactly where
+    # l3_decode_layer takes them -- right after wo_b_scale.
+    oproj_shards = [
+        TensorSpec(
+            "wo_a_shard", [N_RANKS, 1, O_LORA, O_GROUP_IN], torch.bfloat16,
+            init_value=lambda: torch.stack(
+                [wo_a_value[r : r + 1] for r in range(N_RANKS)], dim=0),
+        ),
+        TensorSpec(
+            "wo_b_shard", [N_RANKS, D, O_LORA], torch.int8,
+            init_value=lambda: torch.stack(
+                [wo_b_value[:, r * O_LORA : (r + 1) * O_LORA] for r in range(N_RANKS)], dim=0),
+        ),
+    ]
+    shard_at = next(i for i, s in enumerate(specs) if s.name == "wo_b_scale") + 1
+    specs[shard_at:shard_at] = oproj_shards
+
     for spec in moe_specs:
         if not isinstance(spec, TensorSpec):
             continue
@@ -827,6 +889,7 @@ def build_tensor_specs(start_pos=DECODE_START_POS, layer_id=10):
     # block tables / ids / position_ids / kv_seq_lens, the input activation
     # (x_hc), and the output (x_next), which change per token.
     RESIDENT_WEIGHT_NAMES = replicated_attention | {
+        "wo_a_shard", "wo_b_shard",
         "hc_ffn_fn", "hc_ffn_scale", "hc_ffn_base", "norm_w",
         "gate_w", "gate_bias", "tid2eid",
         "routed_w1", "routed_w1_scale", "routed_w3", "routed_w3_scale",
