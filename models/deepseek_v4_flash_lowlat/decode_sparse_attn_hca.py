@@ -775,7 +775,10 @@ if __name__ == "__main__":
     parser.add_argument("--cache-window-replacement-fixture", action="store_true", default=False,
                         help="Place a sentinel row inside the cache window prefix.")
     parser.add_argument("--golden-data", type=str, default=None)
-    parser.add_argument("--enable-chip-swimlane", action="store_true", default=False)
+    parser.add_argument("--save-data", action="store_true", default=False,
+                        help="Freeze generated inputs and the torch golden for later --golden-data replay.")
+    parser.add_argument("--enable-chip-swimlane", type=int, nargs="?", const=1, default=0,
+                        choices=(0, 1, 2, 4))
     parser.add_argument("--enable-dep-gen", action="store_true", default=False,
                         help="Capture PTO2 dependency edges (deps.json); the swimlane "
                              "converter draws fanout/fanin arrows from the sibling file.")
@@ -797,6 +800,7 @@ if __name__ == "__main__":
         ),
         golden_fn=golden_sparse_attn,
         golden_data=args.golden_data,
+        save_data=args.save_data,
         compile_cfg=dict(dump_passes=args.dump_passes),
         runtime_cfg=dict(
             platform=args.platform,
