@@ -723,6 +723,7 @@ if __name__ == "__main__":
                              "instead of regenerating inputs + recomputing golden.")
     parser.add_argument("--log-level", type=str, default=None,
                         help="runtime log threshold: debug, v0..v9, info, warn, error, null")
+    parser.add_argument("--enable-pmu", nargs="?", const=2, default=0, type=int, choices=[0, 1, 2, 4])
     parser.add_argument("--dump-passes", action="store_true", default=False)
     args = parser.parse_args()
 
@@ -747,6 +748,7 @@ if __name__ == "__main__":
         runtime_cfg=dict(
             platform=args.platform,
             enable_chip_swimlane=args.enable_chip_swimlane,
+            enable_pmu=args.enable_pmu,
             log_level=args.log_level,
         ),
         rtol=1e-3,
