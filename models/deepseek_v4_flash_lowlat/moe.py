@@ -97,7 +97,6 @@ def route_group(
     """
     recv_x_flat = pl.reshape(recv_x, [N_SLOTS_B * RECV_MAX, D])
     expert_slot = pl.create_tensor([1, N_EXPERTS], dtype=pl.INT32, manual_dep=True)
-    route_token = pl.create_tensor([N_ROUTES, IDX_PAD], dtype=pl.INT32, manual_dep=True)
 
     with pl.at(level=pl.Level.CORE_GROUP, name_hint="route_table_init", allow_early_resolve=True) as init_tid:
         expert_slot[:, :] = pl.full([1, N_EXPERTS], dtype=pl.INT32, value=-1)
@@ -106,7 +105,6 @@ def route_group(
         recv_scale[:, :] = pl.full([N_SLOTS_B, RECV_MAX], dtype=pl.FP32, value=0.0)
         recv_w[:, :] = pl.full([N_SLOTS_B, RECV_MAX], dtype=pl.FP32, value=0.0)
         route_slot_row[:, :] = pl.full([N_ROUTES, IDX_PAD], dtype=pl.INT32, value=0)
-        route_token[:, :] = pl.full([N_ROUTES, IDX_PAD], dtype=pl.INT32, value=0)
         # The shared expert's slot is static: same id every step.
         slot_expert[SH_SLOT : SH_SLOT + 1, :] = pl.full(
             [1, IDX_PAD], dtype=pl.INT32, value=SHARED_EID)
@@ -141,26 +139,28 @@ def route_group(
                 pl.write(recv_w, [slot_row, count_col], pl.read(weights, [token, k]))
                 route = token * TOPK + k
                 pl.write(route_slot_row, [route, 0], pl.cast(slot * RECV_MAX + count, pl.INT32))
-                pl.write(route_token, [route, 0], pl.cast(token, pl.INT32))
             # The shared expert takes this token ungated, at the same quant scale.
             pl.write(recv_scale, [SH_SLOT, token], token_scale)
             pl.write(recv_w, [SH_SLOT, token], pl.cast(1.0, pl.FP32))
         pl.write(recv_count, [SH_SLOT, 0], pl.cast(active_tokens, pl.INT32))
 
-    active_routes = active_tokens * TOPK
-    # N_ROUTES gather blocks, then T more that stage the shared expert's rows.
-    with pl.spmd(N_ROUTES + T, name_hint="route_gather", allow_early_resolve=True, deps=[scalar_tid]) as _gather_tid:
-        route = pl.tile.get_block_idx()
-        if route < N_ROUTES:
-            if route < active_routes:
-                dst_row = pl.cast(pl.read(route_slot_row, [route, 0]), pl.INDEX)
-                src_row = pl.cast(pl.read(route_token, [route, 0]), pl.INDEX)
-                recv_x_flat[dst_row : dst_row + 1, :] = x_norm_i8[src_row : src_row + 1, :]
+    # One block per token -- it moves that token's TOPK routed rows -- plus one
+    # for the shared expert. A 4 KB row is far too little to earn a block of its
+    # own, and partitioning by token makes the source row the block index, so
+    # only the destination needs a lookup.
+    with pl.spmd(T + 1, name_hint="route_gather", allow_early_resolve=True, deps=[scalar_tid]) as _gather_tid:
+        blk = pl.tile.get_block_idx()
+        if blk < T:
+            if blk < active_tokens:
+                for k in pl.range(TOPK):
+                    dst_row = pl.cast(pl.read(route_slot_row, [blk * TOPK + k, 0]), pl.INDEX)
+                    recv_x_flat[dst_row : dst_row + 1, :] = x_norm_i8[blk : blk + 1, :]
         else:
-            sh_token = route - N_ROUTES
-            if sh_token < active_tokens:
-                sh_row = pl.cast(SH_SLOT * RECV_MAX + sh_token, pl.INDEX)
-                recv_x_flat[sh_row : sh_row + 1, :] = x_norm_i8[sh_token : sh_token + 1, :]
+            # The shared expert takes every token in order, so its rows are one
+            # static contiguous tile -- no lookup, one copy. Rows past
+            # active_tokens are never read: recv_count[SH_SLOT] bounds them.
+            sh_base = pl.cast(SH_SLOT * RECV_MAX, pl.INDEX)
+            recv_x_flat[sh_base : sh_base + T, :] = x_norm_i8[0:T, :]
 
 
 # === Combine ================================================================
