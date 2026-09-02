@@ -41,7 +41,7 @@ def hc_post(
     residual_flat = pl.reshape(residual, [t_dim, HC_DIM])
     y_flat = pl.reshape(y, [t_dim, HC_DIM])
 
-    for block in pl.spmd((t_dim // T_TILE) * HC_MULT, name_hint="hc_post"):
+    for block in pl.spmd((t_dim // T_TILE) * HC_MULT, name_hint="hc_post", allow_early_resolve=True):
         token_block = block // HC_MULT
         out_h = block % HC_MULT
         t0 = token_block * T_TILE

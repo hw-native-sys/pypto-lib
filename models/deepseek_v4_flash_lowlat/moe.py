@@ -57,7 +57,7 @@ def clear_moe_signals(
     reduce_signal: pld.DistributedTensor[[N_RANKS, 1], pl.INT32],
 ):
     """Clear this rank's all-reduce counters after its final MoE completes."""
-    with pl.at(level=pl.Level.CORE_GROUP, name_hint="moe_signal_clear"):
+    with pl.at(level=pl.Level.CORE_GROUP, name_hint="moe_signal_clear", allow_early_resolve=True):
         # The final MoE output depends on this rank observing every peer's final
         # publish notify, so no peer can issue another one in this forward.
         _completion_anchor = pl.read(completion_anchor, [0, 0, 0])
@@ -87,7 +87,7 @@ def route_group(
     expert_slot = pl.create_tensor([1, N_EXPERTS], dtype=pl.INT32, manual_dep=True)
     route_token = pl.create_tensor([N_ROUTES, IDX_PAD], dtype=pl.INT32, manual_dep=True)
 
-    with pl.at(level=pl.Level.CORE_GROUP, name_hint="route_table_init") as init_tid:
+    with pl.at(level=pl.Level.CORE_GROUP, name_hint="route_table_init", allow_early_resolve=True) as init_tid:
         expert_slot[:, :] = pl.full([1, N_EXPERTS], dtype=pl.INT32, value=-1)
         recv_count[:, :] = pl.full([N_SLOTS, IDX_PAD], dtype=pl.INT32, value=0)
         slot_expert[:, :] = pl.full([N_SLOTS, IDX_PAD], dtype=pl.INT32, value=0)
@@ -104,7 +104,7 @@ def route_group(
 
     # One core owns the slot table: adjacent scalar writes from several SPMD
     # cores can race through overlapping DMA units.
-    with pl.spmd(1, name_hint="route_group_scalar", deps=[init_tid]) as scalar_tid:
+    with pl.spmd(1, name_hint="route_group_scalar", allow_early_resolve=True, deps=[init_tid]) as scalar_tid:
         scalar_core = pl.tile.get_block_idx()
         next_slot = pl.cast(0, pl.INDEX)
         for token in pl.range(scalar_core, active_tokens):
@@ -129,7 +129,7 @@ def route_group(
                 pl.write(route_token, [route, 0], pl.cast(token, pl.INT32))
 
     active_routes = active_tokens * TOPK
-    with pl.spmd(N_ROUTES, name_hint="route_gather", deps=[scalar_tid]) as _gather_tid:
+    with pl.spmd(N_ROUTES, name_hint="route_gather", allow_early_resolve=True, deps=[scalar_tid]) as _gather_tid:
         route = pl.tile.get_block_idx()
         if route < active_routes:
             dst_row = pl.cast(pl.read(route_slot_row, [route, 0]), pl.INDEX)
@@ -155,7 +155,7 @@ def combine_local(
     if active_tokens > T:
         active_tokens = pl.cast(T, pl.INDEX)
 
-    with pl.spmd(T, name_hint="shared_routed"):
+    with pl.spmd(T, name_hint="shared_routed", allow_early_resolve=True):
         t = pl.tile.get_block_idx()
         if t < active_tokens:
             acc = pl.cast(sh[t : t + 1, :], target_type=pl.FP32)
@@ -182,7 +182,7 @@ def all_reduce_ffn(
     lane_base = pl.cast(((moe_epoch - 1) % 2) * REDUCE_LANE_ROWS, pl.INDEX)
     my_row = lane_base + pl.cast(my_rank, pl.INDEX) * T_PAD
 
-    with pl.spmd(N_RANKS, name_hint="moe_reduce_publish") as publish_tid:
+    with pl.spmd(N_RANKS, name_hint="moe_reduce_publish", allow_early_resolve=True) as publish_tid:
         peer = pl.tile.get_block_idx()
         pld.tensor.put(
             dst=reduce_window,
@@ -195,7 +195,7 @@ def all_reduce_ffn(
             chunk_cols=D,
         )
 
-    with pl.at(level=pl.Level.CORE_GROUP, name_hint="moe_reduce_barrier", deps=[publish_tid]) as barrier_tid:
+    with pl.at(level=pl.Level.CORE_GROUP, name_hint="moe_reduce_barrier", allow_early_resolve=True, deps=[publish_tid]) as barrier_tid:
         for peer in pl.range(N_RANKS):
             pld.system.notify(
                 target=reduce_signal,
@@ -212,7 +212,7 @@ def all_reduce_ffn(
                 cmp=pld.WaitCmp.Ge,
             )
 
-    with pl.spmd(T * (D // REDUCE_D_TILE), name_hint="moe_reduce", deps=[barrier_tid]) as _reduce_tid:
+    with pl.spmd(T * (D // REDUCE_D_TILE), name_hint="moe_reduce", allow_early_resolve=True, deps=[barrier_tid]) as _reduce_tid:
         block = pl.tile.get_block_idx()
         row = block // (D // REDUCE_D_TILE)
         d0 = (block % (D // REDUCE_D_TILE)) * REDUCE_D_TILE
@@ -230,7 +230,7 @@ def reduce_ffn_tp1(
     ffn_out: pl.Tensor[[T, D], pl.BF16],
 ):
     """Single-rank path: the partial is already the full sum."""
-    with pl.spmd(T * (D // REDUCE_D_TILE), name_hint="moe_reduce"):
+    with pl.spmd(T * (D // REDUCE_D_TILE), name_hint="moe_reduce", allow_early_resolve=True):
         block = pl.tile.get_block_idx()
         row = block // (D // REDUCE_D_TILE)
         d0 = (block % (D // REDUCE_D_TILE)) * REDUCE_D_TILE

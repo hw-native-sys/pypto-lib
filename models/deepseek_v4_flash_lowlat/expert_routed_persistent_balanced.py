@@ -133,7 +133,7 @@ def expert_routed_persistent_balanced(
         work_slot = pl.create_tensor([N_SLOTS], dtype=pl.INT32)
         work_rows = pl.create_tensor([N_SLOTS], dtype=pl.INT32)
 
-        with pl.spmd(1, name_hint="exp_balance_plan") as plan_tid:
+        with pl.spmd(1, name_hint="exp_balance_plan", allow_early_resolve=True) as plan_tid:
             plan_core = pl.tile.get_block_idx()
             zero_i32 = pl.cast(0, pl.INT32)
             for pad in pl.range(plan_core, N_SLOTS):

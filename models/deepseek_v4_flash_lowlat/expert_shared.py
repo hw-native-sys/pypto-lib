@@ -116,7 +116,7 @@ def expert_shared(
         h_tile_scale_dq = pl.create_tensor(
             [SH_M_TILE, SH_ROW_PAD], dtype=pl.FP32, manual_dep=True
         )
-        with pl.at(level=pl.Level.CORE_GROUP, name_hint="sh_h_tile_i8_init"):
+        with pl.at(level=pl.Level.CORE_GROUP, name_hint="sh_h_tile_i8_init", allow_early_resolve=True):
             h_tile_i8[:, :] = pl.cast(
                 pl.full([SH_M_TILE, MOE_INTER], dtype=pl.FP16, value=0.0),
                 target_type=pl.INT8,
@@ -124,7 +124,7 @@ def expert_shared(
             )
         for row_block in pl.spmd(
             SH_VALID_M // SH_ROWS_PER_BLOCK,
-            name_hint="sh_gate_up_act_q",
+            name_hint="sh_gate_up_act_q", allow_early_resolve=True,
         ):
             row0 = row_block * SH_ROWS_PER_BLOCK
             x_scale = pl.slice(
@@ -231,7 +231,7 @@ def expert_shared(
         y_i32 = pl.create_tensor([SH_M_TILE, D], dtype=pl.INT32)
         for db_idx in pl.spmd(
             D // D_OUT_TILE,
-            name_hint="sh_w2_mm",
+            name_hint="sh_w2_mm", allow_early_resolve=True,
         ):
             d0 = db_idx * D_OUT_TILE
             y_acc = pl.create_tensor([SH_M_TILE, D_OUT_TILE], dtype=pl.INT32)
