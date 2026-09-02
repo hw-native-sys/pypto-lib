@@ -377,7 +377,7 @@ def attention_csa(
     wo_b_shard: pl.Tensor[[D, O_LORA], pl.INT8],
     wo_b_scale: pl.Tensor[[D], pl.FP32],
     x_out: pl.Tensor[[T, HC_MULT, D], pl.FP32],
-    reduce_window: pld.DistributedTensor[[OPROJ_REDUCE_ROWS, D], pl.INT32],
+    reduce_window: pld.DistributedTensor[[OPROJ_REDUCE_ROWS, D], pl.FP32],
     scale_window: pld.DistributedTensor[[OPROJ_SCALE_ROWS, 1], pl.FP32],
     reduce_signal: pld.DistributedTensor[[OPROJ_N_RANKS, 1], pl.INT32],
     sync_signal: pld.DistributedTensor[[OPROJ_N_RANKS, 1], pl.INT32],
@@ -477,7 +477,7 @@ def attention_csa_test(
     wo_b_shard: pl.Tensor[[D, O_LORA], pl.INT8],
     wo_b_scale: pl.Tensor[[D], pl.FP32],
     x_out: pl.Out[pl.Tensor[[T, HC_MULT, D], pl.FP32]],
-    reduce_window: pld.DistributedTensor[[OPROJ_REDUCE_ROWS, D], pl.INT32],
+    reduce_window: pld.DistributedTensor[[OPROJ_REDUCE_ROWS, D], pl.FP32],
     scale_window: pld.DistributedTensor[[OPROJ_SCALE_ROWS, 1], pl.FP32],
     reduce_signal: pld.DistributedTensor[[OPROJ_N_RANKS, 1], pl.INT32],
     sync_signal: pld.DistributedTensor[[OPROJ_N_RANKS, 1], pl.INT32],
@@ -546,13 +546,13 @@ def l3_attention_csa(
     x_out: pl.Out[pl.Tensor[[OPROJ_N_RANKS, T, HC_MULT, D], pl.FP32]],
 ):
     """One orchestration per card, sharing the reduce and signal windows."""
-    reduce_window_buf = pld.alloc_window_buffer([OPROJ_REDUCE_ROWS, D], dtype=pl.INT32)
+    reduce_window_buf = pld.alloc_window_buffer([OPROJ_REDUCE_ROWS, D], dtype=pl.FP32)
     scale_window_buf = pld.alloc_window_buffer([OPROJ_SCALE_ROWS, 1], dtype=pl.FP32)
     reduce_signal_buf = pld.alloc_window_buffer([OPROJ_N_RANKS, 1], dtype=pl.INT32)
     sync_signal_buf = pld.alloc_window_buffer([OPROJ_N_RANKS, 1], dtype=pl.INT32)
 
     for r in pl.range(pld.world_size()):
-        reduce_window = pld.window(reduce_window_buf, [OPROJ_REDUCE_ROWS, D], dtype=pl.INT32)
+        reduce_window = pld.window(reduce_window_buf, [OPROJ_REDUCE_ROWS, D], dtype=pl.FP32)
         scale_window = pld.window(scale_window_buf, [OPROJ_SCALE_ROWS, 1], dtype=pl.FP32)
         reduce_signal = pld.window(reduce_signal_buf, [OPROJ_N_RANKS, 1], dtype=pl.INT32)
         sync_signal = pld.window(sync_signal_buf, [OPROJ_N_RANKS, 1], dtype=pl.INT32)
