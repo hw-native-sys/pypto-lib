@@ -68,6 +68,13 @@ assert O_GROUPS % O_GROUP_TILE == 0
 assert H // H_TILE == O_GROUPS // O_GROUP_TILE
 assert H_TILE % HEADS_PER_GROUP == 0
 PA_NF_TILE = 2
+
+# Streaming wo_a into shared L2 ahead of proj_a_mm. Sixteen blocks put the fetch
+# at the HBM roof rather than the per-core roof, so the whole weight arrives
+# inside the AIC-idle window that precedes the projection.
+WARM_GROUP_TILE = min(12, O_GROUPS)
+WARM_BLOCK_TILE = 16
+WARM_ROW_TILE = (WARM_GROUP_TILE * O_LORA) // WARM_BLOCK_TILE
 # Sized so the four parallel group bundles fit the AIC grid in a single wave:
 # O_GROUP_TILE * (D // PROJ_B_D_TILE) blocks per bundle, times 4 bundles, must stay
 # under the 36 cube cores. At 512 the flash variant asked for 64 and proj_b_mm ran
@@ -144,6 +151,22 @@ def sparse_attn_swa(
 
     o_packed_heads = pl.create_tensor([O_GROUPS * T * HEADS_PER_GROUP, HEAD_DIM], dtype=pl.BF16)
     q_flat = pl.reshape(q, [T * H, HEAD_DIM])
+
+    wo_a_2d = pl.reshape(wo_a, [O_GROUPS * O_LORA, O_GROUP_IN])
+    # The unread sink materializes the shared-L2 wo_a cache-warm task.
+    warm_sink = pl.create_tensor([WARM_BLOCK_TILE * MM_T_TILE, PROJ_A_MM_N_TILE], dtype=pl.FP32)
+    with pl.spmd(WARM_BLOCK_TILE, name_hint="wo_a_warm"):
+        w_blk = pl.tile.get_block_idx()
+        w_r0 = w_blk * WARM_ROW_TILE
+        w_a = q_flat[0:MM_T_TILE, 0:A_K_TILE]
+        for wn in pl.range(WARM_ROW_TILE // PROJ_A_MM_N_TILE):
+            wn0 = w_r0 + wn * PROJ_A_MM_N_TILE
+            w_acc = pl.matmul(w_a, wo_a_2d[wn0 : wn0 + PROJ_A_MM_N_TILE, 0:A_K_TILE], b_trans=True, out_dtype=pl.FP32)
+            for wk in pl.pipeline(1, O_GROUP_IN // A_K_TILE, stage=2):
+                wk0 = wk * A_K_TILE
+                w_weight = wo_a_2d[wn0 : wn0 + PROJ_A_MM_N_TILE, wk0 : wk0 + A_K_TILE]
+                w_acc = pl.matmul_acc(w_acc, w_a, w_weight, b_trans=True)
+            warm_sink[w_blk * MM_T_TILE : (w_blk + 1) * MM_T_TILE, 0:PROJ_A_MM_N_TILE] = w_acc
     sparse_blk_mi = pl.create_tensor([T * (H // H_TILE) * SPARSE_BLOCKS * H_TILE, 1], dtype=pl.FP32)
     sparse_blk_li = pl.create_tensor([T * (H // H_TILE) * SPARSE_BLOCKS * H_TILE, 1], dtype=pl.FP32)
     sparse_blk_oi = pl.create_tensor([T * (H // H_TILE) * SPARSE_BLOCKS * H_TILE, HEAD_DIM], dtype=pl.FP32)
