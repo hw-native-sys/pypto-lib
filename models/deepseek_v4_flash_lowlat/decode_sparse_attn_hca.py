@@ -313,7 +313,7 @@ def sparse_attn_hca(
     # segment is rotated in UB and packed straight into o_packed's rope columns.
     # with-form spmd so the dispatch TaskId (merge_tid) can be an explicit dep of
     # the manual-scope proj_a tasks below (which read merge_norm's o_packed cols).
-    with pl.spmd(T * (H // H_TILE), name_hint="merge_norm") as merge_tid:
+    with pl.spmd(T * (H // H_TILE), name_hint="merge_norm", allow_early_resolve=True) as merge_tid:
         m_idx = pl.tile.get_block_idx()
         m_t = m_idx // (H // H_TILE)
         m_h_idx = m_idx - m_t * (H // H_TILE)

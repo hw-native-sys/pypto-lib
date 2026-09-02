@@ -341,7 +341,7 @@ def sparse_attn_csa_packed(
     # one spmd block per (token, head-tile). The rotated rope segment is packed
     # straight into o_packed's rope columns. with-form spmd so merge_tid can be an
     # explicit dep of the manual-scope proj_a tasks below.
-    with pl.spmd(T * (H // H_TILE), name_hint="merge_norm") as merge_tid:
+    with pl.spmd(T * (H // H_TILE), name_hint="merge_norm", allow_early_resolve=True) as merge_tid:
         m_idx = pl.tile.get_block_idx()
         m_t = m_idx // (H // H_TILE)
         m_h_idx = m_idx - m_t * (H // H_TILE)

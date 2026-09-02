@@ -52,7 +52,7 @@ RMS_K_TILE = 512
 LINEAR_K_TILE = 256
 D_TILE = 256
 D_SPMD = 1024
-LINEAR_OK = 4
+LINEAR_OK = 8
 LINEAR_K_PER_SPLIT = HC_DIM // LINEAR_OK
 
 # pre0..pre3 / row0..row3 are hand-unrolled over the hc lanes.
