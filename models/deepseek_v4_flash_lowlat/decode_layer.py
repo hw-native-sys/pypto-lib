@@ -914,6 +914,10 @@ if __name__ == "__main__":
     parser.add_argument("--enable-chip-swimlane", type=int, nargs="?", const=1, default=0, choices=(0, 1, 2))
     parser.add_argument("--compile-only", action="store_true", default=False)
     parser.add_argument("--runtime-dir", type=str, default=None)
+    parser.add_argument("--golden-data", type=str, default=None,
+                        help="directory containing cached in/ and out/ tensors")
+    parser.add_argument("--save-data", action="store_true", default=False,
+                        help="persist inputs and golden outputs for replay")
     parser.add_argument("--dump-passes", action="store_true", default=False)
     args = parser.parse_args()
 
@@ -929,6 +933,8 @@ if __name__ == "__main__":
             layer_id=args.layer_id,
         ),
         golden_fn=golden_fn,
+        golden_data=args.golden_data,
+        save_data=args.save_data,
         compile_only=args.compile_only,
         runtime_dir=args.runtime_dir,
         compile_cfg=dict(
