@@ -28,7 +28,7 @@ def test_all_moe_callers_match_the_typed_window_abi():
     moe_arity = len(moe_args)
     moe_arg_names = [arg.arg for arg in moe_args]
     window_names = (
-        "recv_meta", "recv_x", "recv_aux", "recv_route",
+        "recv_meta", "recv_x", "recv_scale", "recv_aux", "recv_route",
         "arrived", "data_arrived", "routed_y_buf", "combine_arrived", "consumed",
     )
     calls = []
@@ -47,6 +47,16 @@ def test_all_moe_callers_match_the_typed_window_abi():
             assert isinstance(arg, ast.Name) and arg.id == window_name, (
                 name, line, window_name, ast.unparse(arg)
             )
+
+
+def test_mx_dispatch_uses_byte_windows_and_restores_fp8_tiles():
+    source = (MODEL_DIR / "moe.py").read_text()
+
+    assert "recv_x: pld.DistributedTensor[[N_LOCAL * RECV_MAX, D], pl.INT8]" in source
+    assert "recv_scale: pld.DistributedTensor[[N_LOCAL * RECV_MAX, K_SCALE], pl.UINT8]" in source
+    assert "raw_row_i8 = pl.reinterpret_view(raw_row, pl.INT8)" in source
+    assert "recv_x_mx = pl.reinterpret_view(recv_x_raw, pl.FP8E4M3FN)" in source
+    assert "recv_scale_mx = pl.reinterpret_view(recv_scale_raw, pl.FP8E8M0)" in source
 
 
 def test_moe_readiness_uses_unique_padded_set_epoch_slots():

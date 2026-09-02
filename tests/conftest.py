@@ -183,11 +183,14 @@ def _install_pypto_stubs() -> None:
         setattr(language, name, _TypeSpec)
     for name in (
         "BF16",
+        "FP8E4M3FN",
+        "FP8E8M0",
         "FP32",
         "INT8",
         "INT32",
         "INT64",
         "TASK_ID",
+        "UINT8",
         "UINT32",
     ):
         setattr(language, name, object())

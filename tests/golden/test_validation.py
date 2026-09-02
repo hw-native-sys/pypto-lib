@@ -1524,14 +1524,15 @@ class TestDeepSeekV4ProGateValidation:
         )
         assert not ok
 
-    def test_x_norm_scale_requires_exact_zero_inactive_tail(self):
-        active = _GATE.T - 1
-        expected = torch.ones(_GATE.T, 1)
-        expected[active:] = 0
+    def test_x_norm_scale_requires_exact_e8m0_codes(self):
+        expected = torch.full(
+            (1, _GATE.T_PAD * _GATE.MX_SCALE_GROUPS),
+            127,
+            dtype=torch.uint8,
+        ).view(torch.float8_e8m0fnu)
         actual = expected.clone()
-        comparator = _GATE.gate_x_norm_scale_compare(active)
+        comparator = _GATE.fp8_bits_equal
 
-        actual[0, 0] += 1e-3
         ok, detail = _call_gate_comparator(
             comparator,
             actual,
@@ -1542,7 +1543,7 @@ class TestDeepSeekV4ProGateValidation:
         assert ok, detail
 
         actual = expected.clone()
-        actual[active, 0] = 5e-4
+        actual.view(torch.uint8)[0, -1] = 128
         ok, _ = _call_gate_comparator(
             comparator,
             actual,
