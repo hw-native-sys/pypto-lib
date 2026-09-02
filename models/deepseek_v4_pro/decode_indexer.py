@@ -237,77 +237,98 @@ def indexer(
 
     kv_cache_i8_flat = pl.reshape(idx_kv_cache, [IDX_CACHE_BLOCK_NUM * BLOCK_SIZE, IDX_HEAD_DIM])
     idx_block_table_flat = pl.reshape(idx_block_table, [B * IDX_CACHE_MAX_BLOCKS])
-    score_acc_gm = pl.create_tensor([T * IDX_N_HEADS, SCORE_LEN], dtype=pl.INT32)
-
-    with pl.spmd(SCORE_LANE_TILE, name_hint="score_mat") as score_mat_tid:
-        mat_lane = pl.tile.get_block_idx()
-        for mat_tg in pl.unroll(T):
-            mat_b = mat_tg // S
-            mat_s = mat_tg - mat_b * S
-            mat_cache_len = pl.read(kv_seq_lens, [mat_b]) // COMPRESS_RATIO
-            mat_score_pos = pl.read(position_ids, [mat_b, mat_s])
-            mat_visible_cache = pl.min(mat_cache_len, (mat_score_pos + 1) // COMPRESS_RATIO)
-            mat_visible_len = pl.min(mat_visible_cache, SCORE_LEN)
-            mat_cache_blocks = (mat_visible_len + BLOCK_SIZE - 1) // BLOCK_SIZE
-            mat_q0 = (mat_b * S + mat_s) * IDX_N_HEADS
-            mat_lane_rot = mat_lane + (SCORE_LANE_TILE - mat_tg % SCORE_LANE_TILE) % SCORE_LANE_TILE
-            mat_first_block = mat_lane_rot - SCORE_LANE_TILE * (mat_lane_rot // SCORE_LANE_TILE)
-            mat_lane_iters = (mat_cache_blocks - mat_first_block + SCORE_LANE_TILE - 1) // SCORE_LANE_TILE
-            if mat_lane_iters > 0:
-                mat_query = qr_hadamard_i8[mat_q0 : mat_q0 + IDX_N_HEADS, 0:IDX_HEAD_DIM]
-                for mat_local_block in pl.pipeline(0, mat_lane_iters, stage=2):
-                    mat_cache_block = mat_first_block + mat_local_block * SCORE_LANE_TILE
-                    mat_c0 = mat_cache_block * BLOCK_SIZE
-                    mat_block_raw = pl.read(idx_block_table_flat, [mat_b * IDX_CACHE_MAX_BLOCKS + mat_cache_block])
-                    mat_block_id = pl.cast(mat_block_raw, pl.INDEX)
-                    mat_kv0 = mat_block_id * BLOCK_SIZE
-                    mat_kv_tile = kv_cache_i8_flat[mat_kv0 : mat_kv0 + BLOCK_SIZE, :]
-                    mat_score_acc = pl.matmul(mat_query, mat_kv_tile, out_dtype=pl.INT32, b_trans=True)
-                    score_acc_gm[mat_q0 : mat_q0 + IDX_N_HEADS, mat_c0 : mat_c0 + BLOCK_SIZE] = mat_score_acc
-
     kv_scale_rows = pl.reshape(idx_kv_scale, [IDX_CACHE_BLOCK_NUM, BLOCK_SIZE])
     score_flat = pl.reshape(score, [T, SCORE_LEN])
-    with pl.spmd(SCORE_LANE_TILE, name_hint="score_reduce", deps=[score_mat_tid]) as score_reduce_tid:
-        reduce_lane = pl.tile.get_block_idx()
-        for reduce_tg in pl.unroll(T):
-            reduce_b = reduce_tg // S
-            reduce_s = reduce_tg - reduce_b * S
-            reduce_cache_len = pl.read(kv_seq_lens, [reduce_b]) // COMPRESS_RATIO
-            reduce_score_pos = pl.read(position_ids, [reduce_b, reduce_s])
-            reduce_visible_cache = pl.min(reduce_cache_len, (reduce_score_pos + 1) // COMPRESS_RATIO)
-            reduce_visible_len = pl.min(reduce_visible_cache, SCORE_LEN)
-            reduce_cache_blocks = (reduce_visible_len + BLOCK_SIZE - 1) // BLOCK_SIZE
-            reduce_t = reduce_b * S + reduce_s
-            reduce_q0 = reduce_t * IDX_N_HEADS
-            reduce_lane_rot = reduce_lane + (SCORE_LANE_TILE - reduce_tg % SCORE_LANE_TILE) % SCORE_LANE_TILE
-            reduce_first_block = reduce_lane_rot - SCORE_LANE_TILE * (reduce_lane_rot // SCORE_LANE_TILE)
-            reduce_lane_iters = (reduce_cache_blocks - reduce_first_block + SCORE_LANE_TILE - 1) // SCORE_LANE_TILE
-            if reduce_lane_iters > 0:
-                reduce_query_scale = qr_hadamard_scale_dq[reduce_q0 : reduce_q0 + IDX_N_HEADS, :]
-                reduce_weight_row = weights[reduce_t : reduce_t + 1, 0:IDX_N_HEADS]
-                reduce_weight_col = pl.reshape(reduce_weight_row, [IDX_N_HEADS, 1])
-                reduce_head_scale = pl.mul(reduce_query_scale, reduce_weight_col)
-                for reduce_local_block in pl.pipeline(0, reduce_lane_iters, stage=2):
-                    reduce_cache_block = reduce_first_block + reduce_local_block * SCORE_LANE_TILE
-                    reduce_c0 = reduce_cache_block * BLOCK_SIZE
-                    reduce_valid_len = pl.min(BLOCK_SIZE, reduce_visible_len - reduce_c0)
-                    reduce_block_index = reduce_b * IDX_CACHE_MAX_BLOCKS + reduce_cache_block
-                    reduce_block_raw = pl.read(idx_block_table_flat, [reduce_block_index])
-                    reduce_block_id = pl.cast(reduce_block_raw, pl.INDEX)
-                    reduce_acc = score_acc_gm[reduce_q0 : reduce_q0 + IDX_N_HEADS, reduce_c0 : reduce_c0 + BLOCK_SIZE]
-                    reduce_score_fp32 = pl.cast(reduce_acc, target_type=pl.FP32, mode="none")
-                    reduce_score_relu = pl.maximum(reduce_score_fp32, 0.0)
-                    reduce_score_weighted = pl.row_expand_mul(reduce_score_relu, reduce_head_scale)
-                    reduce_score_head_sum = pl.col_sum(reduce_score_weighted)
-                    reduce_kv_scale = kv_scale_rows[reduce_block_id : reduce_block_id + 1, 0:BLOCK_SIZE]
-                    reduce_score_dequant = pl.mul(reduce_score_head_sum, reduce_kv_scale)
-                    reduce_score_shape = pl.set_validshape(reduce_score_dequant, 1, reduce_valid_len)
-                    reduce_score_padded = pl.fillpad(reduce_score_shape, pad_value=pl.PadValue.min)
-                    reduce_score_valid = pl.maximum(reduce_score_padded, FP32_NEG_INF)
-                    score_flat[reduce_t : reduce_t + 1, reduce_c0 : reduce_c0 + BLOCK_SIZE] = reduce_score_valid
+    with pl.spmd(
+        SCORE_LANE_TILE,
+        name_hint="score",
+        optimizations=[pl.split(pl.SplitMode.NONE, slot_num=2)],
+    ) as score_tid:
+        score_lane = pl.tile.get_block_idx()
+        for score_tg in pl.unroll(T):
+            score_b = score_tg // S
+            score_s = score_tg - score_b * S
+            score_cache_len = pl.read(kv_seq_lens, [score_b]) // COMPRESS_RATIO
+            score_pos = pl.read(position_ids, [score_b, score_s])
+            score_visible_cache = pl.min(
+                score_cache_len, (score_pos + 1) // COMPRESS_RATIO)
+            score_visible_len = pl.min(score_visible_cache, SCORE_LEN)
+            score_cache_blocks = (
+                score_visible_len + BLOCK_SIZE - 1) // BLOCK_SIZE
+            score_t = score_b * S + score_s
+            score_q0 = score_t * IDX_N_HEADS
+            score_lane_rot = score_lane + (
+                SCORE_LANE_TILE - score_tg % SCORE_LANE_TILE
+            ) % SCORE_LANE_TILE
+            score_first_block = score_lane_rot - SCORE_LANE_TILE * (
+                score_lane_rot // SCORE_LANE_TILE)
+            score_lane_iters = (
+                score_cache_blocks
+                - score_first_block
+                + SCORE_LANE_TILE
+                - 1
+            ) // SCORE_LANE_TILE
+            if score_lane_iters > 0:
+                score_query = qr_hadamard_i8[
+                    score_q0 : score_q0 + IDX_N_HEADS, 0:IDX_HEAD_DIM]
+                score_query_scale = qr_hadamard_scale_dq[
+                    score_q0 : score_q0 + IDX_N_HEADS, :]
+                score_weight_row = weights[
+                    score_t : score_t + 1, 0:IDX_N_HEADS]
+                score_weight_col = pl.reshape(
+                    score_weight_row, [IDX_N_HEADS, 1])
+                score_head_scale = pl.mul(
+                    score_query_scale, score_weight_col)
+                for score_local_block in pl.pipeline(
+                    0, score_lane_iters, stage=2
+                ):
+                    score_cache_block = (
+                        score_first_block
+                        + score_local_block * SCORE_LANE_TILE
+                    )
+                    score_c0 = score_cache_block * BLOCK_SIZE
+                    score_valid_len = pl.min(
+                        BLOCK_SIZE, score_visible_len - score_c0)
+                    score_block_raw = pl.read(
+                        idx_block_table_flat,
+                        [
+                            score_b * IDX_CACHE_MAX_BLOCKS
+                            + score_cache_block
+                        ],
+                    )
+                    score_block_id = pl.cast(score_block_raw, pl.INDEX)
+                    score_kv0 = score_block_id * BLOCK_SIZE
+                    score_kv_tile = kv_cache_i8_flat[
+                        score_kv0 : score_kv0 + BLOCK_SIZE, :]
+                    score_acc = pl.matmul(
+                        score_query,
+                        score_kv_tile,
+                        out_dtype=pl.INT32,
+                        b_trans=True,
+                    )
+                    score_fp32 = pl.cast(
+                        score_acc, target_type=pl.FP32, mode="none")
+                    score_relu = pl.maximum(score_fp32, 0.0)
+                    score_weighted = pl.row_expand_mul(
+                        score_relu, score_head_scale)
+                    score_head_sum = pl.col_sum(score_weighted)
+                    score_kv_scale = kv_scale_rows[
+                        score_block_id : score_block_id + 1, 0:BLOCK_SIZE]
+                    score_dequant = pl.mul(
+                        score_head_sum, score_kv_scale)
+                    score_shape = pl.set_validshape(
+                        score_dequant, 1, score_valid_len)
+                    score_padded = pl.fillpad(
+                        score_shape, pad_value=pl.PadValue.min)
+                    score_valid = pl.maximum(
+                        score_padded, FP32_NEG_INF)
+                    score_flat[
+                        score_t : score_t + 1,
+                        score_c0 : score_c0 + BLOCK_SIZE,
+                    ] = score_valid
 
     topk_idxs_flat = pl.reshape(topk_idxs, [T, SCORE_LEN])
-    with pl.spmd(T, name_hint="topk", deps=[score_reduce_tid]) as _topk_tid:
+    with pl.spmd(T, name_hint="topk", deps=[score_tid]) as _topk_tid:
         t = pl.tile.get_block_idx()
         invalid_idxs = pl.full([1, SCORE_LEN], dtype=pl.INT32, value=-1)
         topk_idxs_flat[t : t + 1, :] = invalid_idxs
@@ -1039,8 +1060,9 @@ if __name__ == "__main__":
     parser.add_argument("-p", "--platform", type=str, default="a2a3",
                         choices=["a2a3", "a2a3sim", "a5", "a5sim"])
     parser.add_argument("-d", "--device", type=int, default=0)
-    parser.add_argument("--enable-chip-swimlane", type=int, default=0, choices=[0, 1, 2],
-                        help="chip swimlane level: 0=off, 1=AICore timing, 2=+AICPU timing.")
+    parser.add_argument("--enable-chip-swimlane", type=int, default=0, choices=[0, 1, 2, 3, 4],
+                        help="chip swimlane level: 0=off, 1=AICore timing, "
+                             "2=+AICPU timing,3=+scheduler phases, 4=+orchestrator phases.")
     parser.add_argument("--runtime-dir", type=str, default=None)
     parser.add_argument("--start-pos", type=int, default=None,
                         help="Uniform fixture-only start_pos override for all batches; "

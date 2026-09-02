@@ -118,8 +118,33 @@ def indexer_compressor(
     compress_state_flat = pl.reshape(
         compress_state, [COMPRESS_STATE_BLOCK_NUM * COMPRESS_STATE_BLOCK_SIZE, COMPRESS_STATE_DIM]
     )
-    pooled_kv = pl.create_tensor([RMS_PAD_TILE, HEAD_DIM], dtype=pl.FP32)
-    with pl.at(level=pl.Level.CORE_GROUP, name_hint="scatter_softmax_pool"):
+    cmp_cos_il = pl.create_tensor([RMS_PAD_TILE, ROPE_HEAD_DIM], dtype=pl.FP32)
+    cmp_sin_signed = pl.create_tensor([RMS_PAD_TILE, ROPE_HEAD_DIM], dtype=pl.FP32)
+    with pl.at(level=pl.Level.CORE_GROUP, name_hint="cmp_rope_tables"):
+        cos_b = pl.full([RMS_PAD_TILE, ROPE_HEAD_DIM // 2], dtype=pl.FP32, value=0.0)
+        sin_b = pl.full([RMS_PAD_TILE, ROPE_HEAD_DIM // 2], dtype=pl.FP32, value=0.0)
+        cos_b[0:B, 0 : ROPE_HEAD_DIM // 2] = cos[0:B, 0 : ROPE_HEAD_DIM // 2]
+        sin_b[0:B, 0 : ROPE_HEAD_DIM // 2] = sin[0:B, 0 : ROPE_HEAD_DIM // 2]
+        cos_il = pl.full([RMS_PAD_TILE, ROPE_HEAD_DIM], dtype=pl.FP32, value=0.0)
+        cos_il = pl.tensor.scatter(cos_b, mask_pattern=pl.tile.MaskPattern.P0101, dst=cos_il)
+        cos_il = pl.tensor.scatter(cos_b, mask_pattern=pl.tile.MaskPattern.P1010, dst=cos_il)
+        cmp_cos_il[0:RMS_PAD_TILE, 0:ROPE_HEAD_DIM] = cos_il
+        sin_neg = pl.neg(sin_b)
+        sin_signed = pl.full([RMS_PAD_TILE, ROPE_HEAD_DIM], dtype=pl.FP32, value=0.0)
+        sin_signed = pl.tensor.scatter(
+            sin_neg, mask_pattern=pl.tile.MaskPattern.P0101, dst=sin_signed)
+        sin_signed = pl.tensor.scatter(
+            sin_b, mask_pattern=pl.tile.MaskPattern.P1010, dst=sin_signed)
+        cmp_sin_signed[0:RMS_PAD_TILE, 0:ROPE_HEAD_DIM] = sin_signed
+
+    norm_w_2d = pl.reshape(norm_w, [1, HEAD_DIM])
+    kv_final = pl.create_tensor([RMS_PAD_TILE, HEAD_DIM], dtype=pl.FP32)
+    with pl.at(
+        level=pl.Level.CORE_GROUP,
+        name_hint="scatter_pool_rmsnorm_rope_hadamard",
+    ):
+        pooled_kv = pl.full(
+            [RMS_PAD_TILE, HEAD_DIM], dtype=pl.FP32, value=0.0)
         for c_idx in pl.range(B):
             for s_sc in pl.pipeline(S, stage=2):
                 token_pos = pl.read(position_ids, [c_idx, s_sc])
@@ -207,26 +232,6 @@ def indexer_compressor(
                     pooled_chunk = pl.div(oi, li)
                     pooled_kv[pad_idx : pad_idx + 1, h0 : h0 + HEAD_TILE] = pooled_chunk
 
-    cmp_cos_il = pl.create_tensor([RMS_PAD_TILE, ROPE_HEAD_DIM], dtype=pl.FP32)
-    cmp_sin_signed = pl.create_tensor([RMS_PAD_TILE, ROPE_HEAD_DIM], dtype=pl.FP32)
-    with pl.at(level=pl.Level.CORE_GROUP, name_hint="cmp_rope_tables"):
-        cos_b = pl.full([RMS_PAD_TILE, ROPE_HEAD_DIM // 2], dtype=pl.FP32, value=0.0)
-        sin_b = pl.full([RMS_PAD_TILE, ROPE_HEAD_DIM // 2], dtype=pl.FP32, value=0.0)
-        cos_b[0:B, 0 : ROPE_HEAD_DIM // 2] = cos[0:B, 0 : ROPE_HEAD_DIM // 2]
-        sin_b[0:B, 0 : ROPE_HEAD_DIM // 2] = sin[0:B, 0 : ROPE_HEAD_DIM // 2]
-        cos_il = pl.full([RMS_PAD_TILE, ROPE_HEAD_DIM], dtype=pl.FP32, value=0.0)
-        cos_il = pl.tensor.scatter(cos_b, mask_pattern=pl.tile.MaskPattern.P0101, dst=cos_il)
-        cos_il = pl.tensor.scatter(cos_b, mask_pattern=pl.tile.MaskPattern.P1010, dst=cos_il)
-        cmp_cos_il[0:RMS_PAD_TILE, 0:ROPE_HEAD_DIM] = cos_il
-        sin_neg = pl.neg(sin_b)
-        sin_signed = pl.full([RMS_PAD_TILE, ROPE_HEAD_DIM], dtype=pl.FP32, value=0.0)
-        sin_signed = pl.tensor.scatter(sin_neg, mask_pattern=pl.tile.MaskPattern.P0101, dst=sin_signed)
-        sin_signed = pl.tensor.scatter(sin_b, mask_pattern=pl.tile.MaskPattern.P1010, dst=sin_signed)
-        cmp_sin_signed[0:RMS_PAD_TILE, 0:ROPE_HEAD_DIM] = sin_signed
-
-    normed_kv = pl.create_tensor([RMS_PAD_TILE, HEAD_DIM], dtype=pl.BF16)
-    norm_w_2d = pl.reshape(norm_w, [1, HEAD_DIM])
-    with pl.at(level=pl.Level.CORE_GROUP, name_hint="rmsnorm_rope"):
         partial_sq = pl.full([1, RMS_PAD_TILE], dtype=pl.FP32, value=0.0)
         for k0 in pl.range(0, HEAD_DIM, HEAD_TILE):
             kv_rms_chunk = pooled_kv[0 : RMS_PAD_TILE, k0 : k0 + HEAD_TILE]
@@ -240,14 +245,14 @@ def indexer_compressor(
         variance = pl.reshape(variance_row, [RMS_PAD_TILE, 1])
         rms = pl.sqrt(variance)
         inv_rms = pl.recip(rms)
-        for k0 in pl.range(0, NOPE_HEAD_DIM, HEAD_TILE):
-            kv_norm_chunk = pooled_kv[0 : RMS_PAD_TILE, k0 : k0 + HEAD_TILE]
-            gamma_bf16 = norm_w_2d[:, k0 : k0 + HEAD_TILE]
-            gamma = pl.cast(gamma_bf16, pl.FP32)
-            kv_rms_scaled = pl.row_expand_mul(kv_norm_chunk, inv_rms)
-            normed_chunk = pl.col_expand_mul(kv_rms_scaled, gamma)
-            normed_bf16 = pl.cast(normed_chunk, target_type=pl.BF16, mode="rint")
-            normed_kv[0 : RMS_PAD_TILE, k0 : k0 + HEAD_TILE] = normed_bf16
+        kv_norm_chunk = pooled_kv[0 : RMS_PAD_TILE, 0:NOPE_HEAD_DIM]
+        gamma_bf16 = norm_w_2d[:, 0:NOPE_HEAD_DIM]
+        gamma = pl.cast(gamma_bf16, pl.FP32)
+        kv_rms_scaled = pl.row_expand_mul(kv_norm_chunk, inv_rms)
+        normed_chunk = pl.col_expand_mul(kv_rms_scaled, gamma)
+        normed_nope_bf16 = pl.cast(
+            normed_chunk, target_type=pl.BF16, mode="rint"
+        )
 
         kv_rope_norm = pooled_kv[0 : RMS_PAD_TILE, NOPE_HEAD_DIM : HEAD_DIM]
         gamma_rope_bf16 = norm_w_2d[:, NOPE_HEAD_DIM : HEAD_DIM]
@@ -266,14 +271,11 @@ def indexer_compressor(
         rope_sin = pl.mul(swapped, cmp_sin)
         rope_rot = pl.add(rope_cos, rope_sin)
         rope_bf16 = pl.cast(rope_rot, target_type=pl.BF16, mode="rint")
-        normed_kv[0 : RMS_PAD_TILE, NOPE_HEAD_DIM : HEAD_DIM] = rope_bf16
+        normed_kv = pl.concat(normed_nope_bf16, rope_bf16)
 
-    kv_final = pl.create_tensor([RMS_PAD_TILE, HEAD_DIM], dtype=pl.FP32)
-    with pl.at(level=pl.Level.CORE_GROUP, name_hint="kv_hadamard"):
-        kv_proj_tile = normed_kv[0 : RMS_PAD_TILE, 0 : HEAD_DIM]
         for o0 in pl.range(0, HEAD_DIM, OUT_TILE):
             hadamard_tile = hadamard[0 : HEAD_DIM, o0 : o0 + OUT_TILE]
-            kv_hadamard_acc = pl.matmul(kv_proj_tile, hadamard_tile, out_dtype=pl.FP32)
+            kv_hadamard_acc = pl.matmul(normed_kv, hadamard_tile, out_dtype=pl.FP32)
             kv_final[0 : RMS_PAD_TILE, o0 : o0 + OUT_TILE] = kv_hadamard_acc
 
     kv_flat = pl.reshape(kv, [B * S, HEAD_DIM])
