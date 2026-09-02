@@ -425,28 +425,13 @@ def _hc_pre_separate(
         partial_t0 = linear_split * t_linear + t0
         mixes_partials[partial_t0 : partial_t0 + LINEAR_T_TILE, 0:MIX_PAD] = acc
 
-    pre_val_store = pl.create_tensor([t_linear, HC_PAD], dtype=pl.FP32)
-    for ob in pl.spmd(t_dim // T_TILE, name_hint="split_pre_post"):
+    for ob in pl.spmd(t_dim // T_TILE, name_hint="split_post"):
         t0 = ob * T_TILE
         inv_col = inv_rms[t0:t0 + T_TILE, 0:1]
-        pre_mixes = mixes_partials[t0:t0 + T_TILE, 0:HC_PAD]
         post_mixes = mixes_partials[t0:t0 + T_TILE, HC_MULT:HC_MULT + HC_PAD]
         for linear_split in pl.unroll(1, HC_DIM // LINEAR_K_SPLIT_TILE):
             p0 = linear_split * t_linear + t0
-            pre_mixes = pl.add(pre_mixes, mixes_partials[p0:p0 + T_TILE, 0:HC_PAD])
             post_mixes = pl.add(post_mixes, mixes_partials[p0:p0 + T_TILE, HC_MULT:HC_MULT + HC_PAD])
-
-        pre_base = pl.reshape(hc_base[0:HC_PAD], [1, HC_PAD])
-        pre_normed = pl.row_expand_mul(pre_mixes, inv_col)
-        pre_scaled = pl.mul(pre_normed, scale0)
-        pre_base_tile = pl.col_expand(pre_scaled, pre_base)
-        pre_logits = pl.add(pre_scaled, pre_base_tile)
-        pre_neg = pl.neg(pre_logits)
-        pre_exp = pl.exp(pre_neg)
-        pre_denom = pl.add(pre_exp, 1.0)
-        pre_sig = pl.recip(pre_denom)
-        pre_val = pl.add(pre_sig, HC_EPS)
-        pre_val_store[t0 : t0 + T_TILE, 0:HC_PAD] = pre_val
 
         post_base = pl.reshape(hc_base[HC_MULT:HC_MULT + HC_PAD], [1, HC_PAD])
         post_normed = pl.row_expand_mul(post_mixes, inv_col)
@@ -621,7 +606,22 @@ def _hc_pre_separate(
     for blk in pl.spmd((t_dim // T_TILE) * (D // MIX_D_TILE), name_hint="mix_x"):
         t0 = (blk // (D // MIX_D_TILE)) * T_TILE
         d_base = (blk % (D // MIX_D_TILE)) * MIX_D_TILE
-        pre_tile_t = pl.transpose(pre_val_store[t0:t0 + T_TILE, 0:HC_PAD], axis1=0, axis2=1)
+        mix_inv_col = inv_rms[t0:t0 + T_TILE, 0:1]
+        mix_pre_mixes = mixes_partials[t0:t0 + T_TILE, 0:HC_PAD]
+        for mix_split in pl.unroll(1, HC_DIM // LINEAR_K_SPLIT_TILE):
+            mix_p0 = mix_split * t_linear + t0
+            mix_pre_mixes = pl.add(mix_pre_mixes, mixes_partials[mix_p0:mix_p0 + T_TILE, 0:HC_PAD])
+        mix_pre_base = pl.reshape(hc_base[0:HC_PAD], [1, HC_PAD])
+        mix_pre_normed = pl.row_expand_mul(mix_pre_mixes, mix_inv_col)
+        mix_pre_scaled = pl.mul(mix_pre_normed, scale0)
+        mix_pre_base_tile = pl.col_expand(mix_pre_scaled, mix_pre_base)
+        mix_pre_logits = pl.add(mix_pre_scaled, mix_pre_base_tile)
+        mix_pre_neg = pl.neg(mix_pre_logits)
+        mix_pre_exp = pl.exp(mix_pre_neg)
+        mix_pre_denom = pl.add(mix_pre_exp, 1.0)
+        mix_pre_sig = pl.recip(mix_pre_denom)
+        mix_pre_val = pl.add(mix_pre_sig, HC_EPS)
+        pre_tile_t = pl.transpose(mix_pre_val, axis1=0, axis2=1)
         pre0 = pl.reshape(pre_tile_t[0:1, 0:T_TILE], [T_TILE, 1])
         pre1 = pl.reshape(pre_tile_t[1:2, 0:T_TILE], [T_TILE, 1])
         pre2 = pl.reshape(pre_tile_t[2:3, 0:T_TILE], [T_TILE, 1])
