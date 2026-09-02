@@ -36,9 +36,12 @@ CHUNK = 128             # chunk size in tokens
 NCHUNK = T // CHUNK     # state snapshots, one per chunk
 
 # Tiling
-COL_TILE = 64           # contraction block of the intra term. With the row split
-                        # below: 32 measures 681.5 us against 467.0 at 64 -- half
-                        # as many cube<->vector round trips per head.
+COL_TILE = 128          # contraction block of the intra term -- the FULL chunk,
+                        # so the intra term is one matmul per head rather than a
+                        # blocked accumulation, which is megagdn-pto's layout.
+                        # With the row split below: 32 / 64 / 128 measure
+                        # 681.5 / 464.8 / 444.5 us. Each halving of the
+                        # cube<->vector round trips is worth real time.
 D_TILE = D // 2         # output columns per accumulator. The tile that crosses
                         # back to the vector unit is [CHUNK, D_TILE] FP32, and
                         # the cross-core ring reserves two of them, so halving D
@@ -62,13 +65,14 @@ def gdn_chunk_o(
     for t0 in pl.parallel(0, T, CHUNK):
         # An a2a3 core has two vector sub-cores, and an unsplit mixed region
         # runs its vector work on lane 0 only. Splitting the rows across both
-        # halves every vector tile, which also frees the 8704 B that a 2-slot
-        # ring needs at COL_TILE=64 -- so the wider tile keeps its double
-        # buffer. Measured: 561.0 (1-slot, no split) -> 467.0 us, -16.8%.
-        # COL_TILE=128 still does not fit (229888 B), so the reference's
-        # whole-[C,C] layout remains out of reach.
+        # halves every vector tile, which is what makes COL_TILE=128 affordable:
+        # 561.0 us unsplit -> 444.5 split at the full column extent, -21%.
+        # Vec then sits at 164352 B of 188416 (87%), of which 65536 is the
+        # cross-core ring -- staging megagdn-pto pays nothing for, since it
+        # routes cube<->vector through GM and L1 instead of the vector buffer.
         with pl.at(level=pl.Level.CORE_GROUP, name_hint="chunk_o",
-                   optimizations=[pl.split(pl.SplitMode.UP_DOWN)]):
+                   optimizations=[pl.cross_core_slot(slot_num=1),
+                                  pl.split(pl.SplitMode.UP_DOWN)]):
             for h in pl.range(H):
                 qc = pl.slice(q_flat, [CHUNK, D], [t0, h * D])
                 g_col = pl.reshape(pl.slice(g_sum, [1, CHUNK], [h, t0]), [CHUNK, 1])
