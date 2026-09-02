@@ -19,6 +19,13 @@ Ascend NPUs (910B/C, 950). It also ships a golden-validation test harness
 
 Files ending in `_draft.py` are works-in-progress and excluded from CI.
 
+**Default optimization target: `models/deepseek_v4_flash_lowlat/`.** Unless a
+request names another model or directory, every performance, benchmarking, and
+tuning task in this repo — `/optimize`, `/critical-path`, `/cube-tile-tuning`,
+`/early-dispatch`, swimlane and PMU captures, and the lessons they produce —
+applies to the DeepSeek-V4-Flash low-latency variant. The other `models/`
+directories are worked on only when explicitly asked for by name.
+
 ## Key Documentation
 
 - `README.md` — project intro, quick start, dependencies
@@ -91,3 +98,7 @@ script's `--help` and `docs/get-started/platforms.md`.
    change opens by reading the local `OPTIMIZATION_LESSONS.md` and closes with
    one entry per decided attempt, the reverted ones included — see
    [`.claude/rules/optimization-lessons.md`](rules/optimization-lessons.md).
+9. **Tune `models/deepseek_v4_flash_lowlat/` by default.** It is this repo's
+   main optimization variant; treat any unqualified "the model", "the decode
+   step", or "the kernel" in a performance request as referring to it, and say
+   which variant you measured when reporting.
