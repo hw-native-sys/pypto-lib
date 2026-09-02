@@ -15,11 +15,20 @@ group g is heads [8g, 8g+8), whose `o_packed` rows every card already produced.
 
 Card r runs chain r only, then all-reduces its partial across the eight cards.
 
-There is no separate dequant pass: the per-group activation scale rides the loop
-that already has to touch every partial, which here is `oproj_reduce`, on the far
-side of the wire. So the raw INT32 partial is published, each rank's scale goes
-with it, and the reduce folds `cast * scale` in as it sums -- in rank order, so
-the sum reproduces a single card's `g` loop term for term.
+The all-reduce is the window summing itself. Each rank dequantizes its own partial
+locally -- `cast * act_scale * wo_b_scale`, both scales folded in, the per-channel
+one legally because it is shared and so distributes over the cross-rank sum -- and
+then ATOMIC-ADDs the FP32 result into one shared band that every rank targets. What
+comes back is finished, so `oproj_reduce` only narrows it to BF16 and zeroes the
+lane for its next use.
+
+Two consequences worth knowing before touching this. The band must start at zero and
+`alloc_window_buffer` does not promise that, so the first call of a dispatch zeroes
+both lanes and barriers (`oproj_band_init`); every later call is covered by the
+reduce's zero-back. And the cross-rank sum order is now whatever the atomics land
+in, so the result is no longer bit-reproducible run to run, nor term-for-term equal
+to a single card's `g` loop -- it stays well inside tolerance, but a bit-exact
+comparison against the replicated form will not hold.
 """
 
 import sys as _sys
@@ -121,7 +130,7 @@ PRE_SYNC_PEERS = N_RANKS if PRE_SYNC else 0
 # every peer published e-1, hence finished reading e-2. A layer stack calls this
 # projection once per CSA layer off one window, so the lanes are what make the
 # reuse safe.
-REDUCE_LANE_ROWS = N_RANKS * T_PAD
+REDUCE_LANE_ROWS = T_PAD  # one shared band every rank adds into, not a slot per rank
 REDUCE_WINDOW_ROWS = 2 * REDUCE_LANE_ROWS
 # One contiguous [T, 1] block per rank, so a peer reads its carrier with a
 # direct ND2ND load and no reshape.
@@ -130,7 +139,16 @@ SCALE_WINDOW_ROWS = 2 * SCALE_LANE_ROWS
 # D chunk per reduce block, i.e. D // this = 8 blocks. This grid loads all eight
 # rank slots per block, which keeps it element-bound enough that 8 blocks still pay:
 # 1024 reads 65.4 us and 2048 reads 68.7 against 64.9 here.
-REDUCE_D_TILE = 512
+# Both element-light grids below are per-block fixed-cost bound, not element bound,
+# so they want FEWER, wider blocks than a loaded grid does: measured 70.0 / 67.5 /
+# 65.3 / 64.8 / 64.7 / 65.3 us at 32 / 16 / 8 / 4 / 2 / 1 dequant blocks, and
+# 64.4 / 63.7 / 64.1 at 8 / 4 / 2 reduce blocks.
+DEQUANT_N_TILE = 1024  # D // this = 4 dequant blocks
+REDUCE_D_TILE = 1024  # D // this = 4 reduce blocks
+# The band init writes both lanes, so it moves 8x the reduce's bytes. 1024 is both
+# its optimum and its ceiling: 2048 needs a [2 * T_PAD, 2048] FP32 tile and fails
+# with `Vec buffer usage (262144 bytes) exceeds platform limit (188416 bytes)`.
+BAND_INIT_D_TILE = 1024
 FIRST_EPOCH = 1
 
 assert O_GROUPS == N_RANKS, f"TP-by-group needs one group per rank: O_GROUPS={O_GROUPS}, TP={N_RANKS}"
@@ -272,7 +290,7 @@ def o_proj_tp_core(
     wo_b_shard: pl.Tensor[[D, O_LORA], pl.INT8],
     wo_b_scale: pl.Tensor[[D], pl.FP32],
     attn_out: pl.Tensor[[T, D], pl.BF16],
-    reduce_window: pld.DistributedTensor[[REDUCE_WINDOW_ROWS, D], pl.INT32],
+    reduce_window: pld.DistributedTensor[[REDUCE_WINDOW_ROWS, D], pl.FP32],
     scale_window: pld.DistributedTensor[[SCALE_WINDOW_ROWS, 1], pl.FP32],
     reduce_signal: pld.DistributedTensor[[N_RANKS, 1], pl.INT32],
     sync_signal: pld.DistributedTensor[[N_RANKS, 1], pl.INT32],
@@ -292,14 +310,30 @@ def o_proj_tp_core(
     o_r_i8_pad = pl.create_tensor([T_PAD, O_LORA], dtype=pl.INT8)
     act_scale_col = pl.create_tensor([T, 1], dtype=pl.FP32)
     partial = pl.create_tensor([T_PAD, D], dtype=pl.INT32)
+    part_f32 = pl.create_tensor([T, D], dtype=pl.FP32)
     barrier_out = pl.array.create(1, pl.TASK_ID)
 
     lane_base = pl.cast(((oproj_epoch - 1) % 2) * REDUCE_LANE_ROWS, pl.INDEX)
     scale_lane_base = pl.cast(((oproj_epoch - 1) % 2) * SCALE_LANE_ROWS, pl.INDEX)
-    my_row = lane_base + pl.cast(my_rank, pl.INDEX) * T_PAD
+    my_row = lane_base  # every rank adds into the same band
     my_scale_row = scale_lane_base + pl.cast(my_rank, pl.INDEX) * T
     row_base_o = pl.cast(my_rank, pl.INDEX) * T
     wo_b_scale_2d = pl.reshape(wo_b_scale, [1, D])
+
+    # An accumulation band is only correct when it starts at zero, and
+    # `alloc_window_buffer` does not promise zeroed memory. `oproj_reduce` zeroes the
+    # lane it read, which covers every later call; the first call of a dispatch has no
+    # predecessor to have done that, so it zeroes both lanes here. The trip count is 1
+    # only at FIRST_EPOCH, and the task depends on nothing in the projection, so a
+    # layer stack pays it once per dispatch and the scheduler is free to overlap it
+    # with whatever ran before the projection.
+    band_init_trips = FIRST_EPOCH + 1 - oproj_epoch
+    with pl.spmd(D // BAND_INIT_D_TILE, name_hint="oproj_band_init", allow_early_resolve=True) as band_tid:
+        bi0 = pl.tile.get_block_idx() * BAND_INIT_D_TILE
+        for _ in pl.range(band_init_trips):
+            reduce_window[0:REDUCE_WINDOW_ROWS, bi0 : bi0 + BAND_INIT_D_TILE] = pl.full(
+                [REDUCE_WINDOW_ROWS, BAND_INIT_D_TILE], dtype=pl.FP32, value=0.0
+            )
 
     with pl.manual_scope():
         # Anchor the chain on a read of the local attention output, so proj_a
@@ -308,9 +342,13 @@ def o_proj_tp_core(
         # same graph shape; --pre-sync only changes the trip count from 0 to
         # N_RANKS. With it on, host dispatch skew is absorbed here and the reduce
         # barrier below measures protocol cost instead of rank start spread.
-        with pl.at(level=pl.Level.CORE_GROUP, name_hint="oproj_pre_sync") as _sync_tid:
+        with pl.at(level=pl.Level.CORE_GROUP, name_hint="oproj_pre_sync", deps=[band_tid]) as _sync_tid:
             _sync_anchor = pl.read(o_packed, [0, 0])
-            for peer in pl.range(PRE_SYNC_PEERS):
+            # The barrier is what makes the band init safe -- without it a fast peer
+            # could add its first contribution before this rank has zeroed -- so it
+            # runs whenever the init does, and --pre-sync forces it on every call.
+            sync_peers = pl.max(PRE_SYNC_PEERS, band_init_trips * N_RANKS)
+            for peer in pl.range(sync_peers):
                 pld.system.notify(
                     target=sync_signal,
                     peer=peer,
@@ -318,7 +356,7 @@ def o_proj_tp_core(
                     value=1,
                     op=pld.NotifyOp.AtomicAdd,
                 )
-            for src in pl.range(PRE_SYNC_PEERS):
+            for src in pl.range(sync_peers):
                 pld.system.wait(
                     signal=sync_signal,
                     offsets=[src, 0],
@@ -339,37 +377,33 @@ def o_proj_tp_core(
             anchor,
         )
 
-        # Dequantize by this group's per-row activation scale. The per-channel
-        # weight scale is deliberately NOT applied here -- it rides the reduce so
-        # the sum happens on the same quantity a single card's g loop sums.
-        # When the dequant rides proj_b's cube task there is no separate grid, so the
-        # publish chains straight off proj_b. An Array[TASK_ID] is the sanctioned way
-        # to carry a TaskId out of the branch that produced it.
-        # No dequant pass. The per-group scale rides the 8-way accumulate, because
-        # that loop already touches every partial; sharded, that accumulate is
-        # oproj_reduce, on the far side of the wire. So the raw INT32 partial goes
-        # out and each source's scale is folded in as the reduce sums it -- term for
-        # term a single card's g loop.
-        with pl.spmd(N_RANKS, name_hint="oproj_publish", deps=[pb_tid]) as publish_tid:
+        # Dequantize before the wire, so what crosses it is addable. `wo_b_scale` is
+        # per-channel and shared across ranks, so it distributes over the cross-rank
+        # sum and rides this pass too -- the band then holds the finished value and
+        # nothing is left to scale on the far side.
+        with pl.spmd(
+            D // DEQUANT_N_TILE, name_hint="oproj_dequant", deps=[pb_tid], allow_early_resolve=True
+        ) as dq_tid:
+            dq0 = pl.tile.get_block_idx() * DEQUANT_N_TILE
+            p_f32 = pl.cast(partial[0:T, dq0 : dq0 + DEQUANT_N_TILE], target_type=pl.FP32, mode="none")
+            p_act = pl.row_expand_mul(p_f32, act_scale_col[0:T, 0:1])
+            part_f32[0:T, dq0 : dq0 + DEQUANT_N_TILE] = pl.col_expand_mul(
+                p_act, wo_b_scale_2d[0:1, dq0 : dq0 + DEQUANT_N_TILE]
+            )
+
+        with pl.spmd(N_RANKS, name_hint="oproj_publish", deps=[dq_tid]) as publish_tid:
             peer = pl.tile.get_block_idx()
             pld.tensor.put(
                 dst=reduce_window,
                 peer=peer,
-                src=partial,
+                src=part_f32,
                 dst_offsets=[my_row, 0],
                 src_offsets=[0, 0],
                 shape=[T, D],
+                atomic=pld.AtomicType.Add,
                 chunk_rows=T,
                 chunk_cols=PUT_CHUNK_COLS,
                 pipeline=PUT_PIPELINE,
-            )
-            pld.tensor.put(
-                dst=scale_window,
-                peer=peer,
-                src=act_scale_col,
-                dst_offsets=[my_scale_row, 0],
-                src_offsets=[0, 0],
-                shape=[T, 1],
             )
             pld.system.notify(
                 target=reduce_signal,
@@ -413,27 +447,16 @@ def o_proj_tp_core(
         D // REDUCE_D_TILE, name_hint="oproj_reduce", deps=[barrier_out[0]], allow_early_resolve=True
     ) as _reduce_tid:
         d0 = pl.tile.get_block_idx() * REDUCE_D_TILE
-        # Seeded from rank 0 rather than a zero tile so the accumulator stays at
-        # tile level, and so the term order matches a single card's g loop.
-        acc = pl.row_expand_mul(
-            pl.cast(
-                pl.load(reduce_window, [lane_base, d0], [T, REDUCE_D_TILE]), target_type=pl.FP32, mode="none"
-            ),
-            pl.load(scale_window, [scale_lane_base, 0], [T, 1]),
+        # The band summed itself on the way in, so this only narrows it -- then it
+        # zeroes what it just read, which is what leaves the lane at zero for its next
+        # use. Safe two epochs out: a peer cannot publish epoch e+2 before its epoch
+        # e+1 reduce, which waits on this rank's epoch e+1 notify, which this store
+        # precedes.
+        acc = pl.load(reduce_window, [lane_base, d0], [T, REDUCE_D_TILE])
+        pl.store(pl.cast(acc, target_type=pl.BF16, mode="rint"), [0, d0], attn_out)
+        reduce_window[lane_base : lane_base + T, d0 : d0 + REDUCE_D_TILE] = pl.full(
+            [T, REDUCE_D_TILE], dtype=pl.FP32, value=0.0
         )
-        for src_rank in pl.range(1, N_RANKS):
-            p_src = pl.cast(
-                pl.load(reduce_window, [lane_base + src_rank * T_PAD, d0], [T, REDUCE_D_TILE]),
-                target_type=pl.FP32,
-                mode="none",
-            )
-            acc = pl.add(
-                acc,
-                pl.row_expand_mul(p_src, pl.load(scale_window, [scale_lane_base + src_rank * T, 0], [T, 1])),
-            )
-        wb_chunk = pl.load(wo_b_scale_2d, [0, d0], [1, REDUCE_D_TILE])
-        scaled = pl.col_expand_mul(acc, wb_chunk)
-        pl.store(pl.cast(scaled, target_type=pl.BF16, mode="rint"), [0, d0], attn_out)
 
     return attn_out
 
@@ -464,7 +487,7 @@ def o_proj_tp(
     l2_evict: pl.Tensor[[EVICT_BLOCKS, EVICT_PER_BLOCK], pl.INT8],
     l2_evict_sink: pl.Tensor[[EVICT_BLOCKS, EVICT_CHUNK], pl.INT8],
     attn_out: pl.Tensor[[T, D], pl.BF16],
-    reduce_window: pld.DistributedTensor[[REDUCE_WINDOW_ROWS, D], pl.INT32],
+    reduce_window: pld.DistributedTensor[[REDUCE_WINDOW_ROWS, D], pl.FP32],
     scale_window: pld.DistributedTensor[[SCALE_WINDOW_ROWS, 1], pl.FP32],
     reduce_signal: pld.DistributedTensor[[N_RANKS, 1], pl.INT32],
     sync_signal: pld.DistributedTensor[[N_RANKS, 1], pl.INT32],
@@ -501,7 +524,7 @@ def o_proj_tp_test(
     l2_evict: pl.Tensor[[EVICT_BLOCKS, EVICT_PER_BLOCK], pl.INT8],
     l2_evict_sink: pl.Tensor[[EVICT_BLOCKS, EVICT_CHUNK], pl.INT8],
     attn_out: pl.Out[pl.Tensor[[T, D], pl.BF16]],
-    reduce_window: pld.DistributedTensor[[REDUCE_WINDOW_ROWS, D], pl.INT32],
+    reduce_window: pld.DistributedTensor[[REDUCE_WINDOW_ROWS, D], pl.FP32],
     scale_window: pld.DistributedTensor[[SCALE_WINDOW_ROWS, 1], pl.FP32],
     reduce_signal: pld.DistributedTensor[[N_RANKS, 1], pl.INT32],
     sync_signal: pld.DistributedTensor[[N_RANKS, 1], pl.INT32],
@@ -535,13 +558,13 @@ def l3_o_proj_tp(
     l2_evict_sink: pl.Tensor[[N_RANKS, EVICT_BLOCKS, EVICT_CHUNK], pl.INT8],
     attn_out: pl.Out[pl.Tensor[[N_RANKS, T, D], pl.BF16]],
 ):
-    reduce_window_buf = pld.alloc_window_buffer([REDUCE_WINDOW_ROWS, D], dtype=pl.INT32)
+    reduce_window_buf = pld.alloc_window_buffer([REDUCE_WINDOW_ROWS, D], dtype=pl.FP32)
     scale_window_buf = pld.alloc_window_buffer([SCALE_WINDOW_ROWS, 1], dtype=pl.FP32)
     reduce_signal_buf = pld.alloc_window_buffer([N_RANKS, 1], dtype=pl.INT32)
     sync_signal_buf = pld.alloc_window_buffer([N_RANKS, 1], dtype=pl.INT32)
 
     for r in pl.range(pld.world_size()):
-        reduce_window = pld.window(reduce_window_buf, [REDUCE_WINDOW_ROWS, D], dtype=pl.INT32)
+        reduce_window = pld.window(reduce_window_buf, [REDUCE_WINDOW_ROWS, D], dtype=pl.FP32)
         scale_window = pld.window(scale_window_buf, [SCALE_WINDOW_ROWS, 1], dtype=pl.FP32)
         reduce_signal = pld.window(reduce_signal_buf, [N_RANKS, 1], dtype=pl.INT32)
         sync_signal = pld.window(sync_signal_buf, [N_RANKS, 1], dtype=pl.INT32)
