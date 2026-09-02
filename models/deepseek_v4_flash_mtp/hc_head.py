@@ -50,7 +50,10 @@ def hc_head(
     y: pl.Tensor[[T_DYN, D], pl.BF16],
 ):
     t_dim = pl.tensor.dim(x_hc, 0)
-    t_linear = pl.max(t_dim, LINEAR_T_TILE)
+    # Rounding the row count up to LINEAR_T_TILE would read whole tiles past the end
+    # of x_flat: a harmless GM overread on A2/A3, but a fatal one under CPU_SIM.
+    linear_full_rows = (t_dim // LINEAR_T_TILE) * LINEAR_T_TILE
+    t_linear = ((t_dim + LINEAR_T_TILE - 1) // LINEAR_T_TILE) * LINEAR_T_TILE
     x_flat = pl.reshape(x_hc, [t_dim, HC_DIM])
     y_flat = pl.reshape(y, [t_dim, D])
     # rms: split-K sum-of-squares, fanned over (token-tile x K-slice)
@@ -75,24 +78,67 @@ def hc_head(
         seed_t0 = seed_block * LINEAR_T_TILE
         zeros = pl.full([LINEAR_T_TILE, HC_PAD], dtype=pl.FP32, value=0.0)
         mixes_raw[seed_t0 : seed_t0 + LINEAR_T_TILE, 0:HC_PAD] = zeros
-    with pl.spmd(
-        (t_linear // LINEAR_T_TILE) * LINEAR_OK,
-        name_hint="hc_head_linear",
-        deps=[linear_seed_tid],
-    ) as _linear_tid:
-        task = pl.tile.get_block_idx()
-        t0 = (task // LINEAR_OK) * LINEAR_T_TILE
-        k_base = (task % LINEAR_OK) * (HC_DIM // LINEAR_OK)
-        acc = pl.create_tensor([LINEAR_T_TILE, HC_PAD], dtype=pl.FP32)
-        for kb in pl.pipeline(0, HC_DIM // LINEAR_OK // LINEAR_K_TILE, stage=2):
-            k0 = k_base + kb * LINEAR_K_TILE
-            x_lin = x_flat[t0 : t0 + LINEAR_T_TILE, k0 : k0 + LINEAR_K_TILE]
-            w = pl.slice(hc_head_fn, [HC_PAD, LINEAR_K_TILE], [0, k0], valid_shape=[HC_MULT, LINEAR_K_TILE])
-            if kb == 0:
-                acc = pl.matmul(x_lin, w, b_trans=True, out_dtype=pl.FP32)
-            else:
-                acc = pl.matmul_acc(acc, x_lin, w, b_trans=True)
-        mixes_raw = pl.assemble(mixes_raw, acc, [t0, 0], atomic=pl.AtomicType.Add)
+    if linear_full_rows > 0:
+        with pl.spmd(
+            (linear_full_rows // LINEAR_T_TILE) * LINEAR_OK,
+            name_hint="hc_head_linear",
+            deps=[linear_seed_tid],
+        ) as _linear_tid:
+            task = pl.tile.get_block_idx()
+            t0 = (task // LINEAR_OK) * LINEAR_T_TILE
+            k_base = (task % LINEAR_OK) * (HC_DIM // LINEAR_OK)
+            acc_full = pl.create_tensor([LINEAR_T_TILE, HC_PAD], dtype=pl.FP32)
+            for kb in pl.pipeline(0, HC_DIM // LINEAR_OK // LINEAR_K_TILE, stage=2):
+                k0 = k_base + kb * LINEAR_K_TILE
+                x_lin_full = x_flat[t0 : t0 + LINEAR_T_TILE, k0 : k0 + LINEAR_K_TILE]
+                w_full = pl.slice(
+                    hc_head_fn,
+                    [HC_PAD, LINEAR_K_TILE],
+                    [0, k0],
+                    valid_shape=[HC_MULT, LINEAR_K_TILE],
+                )
+                if kb == 0:
+                    acc_full = pl.matmul(x_lin_full, w_full, b_trans=True, out_dtype=pl.FP32)
+                else:
+                    acc_full = pl.matmul_acc(acc_full, x_lin_full, w_full, b_trans=True)
+            mixes_raw = pl.assemble(mixes_raw, acc_full, [t0, 0], atomic=pl.AtomicType.Add)
+
+    # At most one incomplete row block exists. Keep it in a separate conditional
+    # task so every aligned block above retains the original static-M Cube path.
+    if linear_full_rows < t_dim:
+        with pl.spmd(
+            LINEAR_OK,
+            name_hint="hc_head_linear_tail",
+            deps=[linear_seed_tid],
+        ) as _linear_tail_tid:
+            tail_task = pl.tile.get_block_idx()
+            k_base = tail_task * (HC_DIM // LINEAR_OK)
+            tail_rows = t_dim - linear_full_rows
+            acc_tail = pl.create_tensor([LINEAR_T_TILE, HC_PAD], dtype=pl.FP32)
+            for kb in pl.pipeline(0, HC_DIM // LINEAR_OK // LINEAR_K_TILE, stage=2):
+                k0 = k_base + kb * LINEAR_K_TILE
+                x_lin_tail = pl.slice(
+                    x_flat,
+                    [LINEAR_T_TILE, LINEAR_K_TILE],
+                    [linear_full_rows, k0],
+                    valid_shape=[tail_rows, LINEAR_K_TILE],
+                )
+                w_tail = pl.slice(
+                    hc_head_fn,
+                    [HC_PAD, LINEAR_K_TILE],
+                    [0, k0],
+                    valid_shape=[HC_MULT, LINEAR_K_TILE],
+                )
+                if kb == 0:
+                    acc_tail = pl.matmul(x_lin_tail, w_tail, b_trans=True, out_dtype=pl.FP32)
+                else:
+                    acc_tail = pl.matmul_acc(acc_tail, x_lin_tail, w_tail, b_trans=True)
+            mixes_raw = pl.assemble(
+                mixes_raw,
+                acc_tail,
+                [linear_full_rows, 0],
+                atomic=pl.AtomicType.Add,
+            )
 
     # reduce: gate + hc mix, fanned over (token-tile x D-slice). The rsqrt/sigmoid gate is
     # recomputed per task instead of being published by its own scope.
