@@ -62,9 +62,10 @@ HCA_COMPRESSED_POOL_ROWS = CMP_BLOCK_NUM * BLOCK_SIZE
 VALID_TOKEN_TILE = 8
 GATHER_RUN_TILE = 16
 REQUEST_KV_ROWS = WIN + S - 1
-RAW_K_TILE = BLOCK_SIZE
 ATTN_K_TILE = 128
+RAW_K_TILE = ATTN_K_TILE
 ATTN_D_TILE = 256
+RAW_H_TILE = 32
 H_TILE = 16
 QK_M_TILE = 32
 CMP_PAGES_PER_WORK = ATTN_K_TILE // BLOCK_SIZE
@@ -86,6 +87,8 @@ if HCA_MAX_COMPRESSED_ROWS > HCA_COMPRESSED_POOL_ROWS:
     raise ValueError("HCA compressed rows exceed the configured pool")
 if ATTN_K_TILE % BLOCK_SIZE != 0:
     raise ValueError("HCA work must contain complete cache pages")
+if H % RAW_H_TILE != 0:
+    raise ValueError("HCA raw head tiles must divide the attention head count")
 if H % QK_M_TILE != 0 or QK_M_TILE % H_TILE != 0:
     raise ValueError("HCA head tiles must divide the attention head count")
 if BLOCK_SIZE % GATHER_RUN_TILE != 0:
@@ -135,6 +138,7 @@ def sparse_attn_hca(
     attn_sink_col = pl.reshape(attn_sink, [H, 1])
     request_count = pl.tensor.dim(cmp_block_table, 0)
     raw_gather_count = request_count
+    raw_block_count = t_dim * (H // RAW_H_TILE)
     stream_block_count = t_dim * (H // H_TILE)
     cmp_gather_count = request_count * cmp_work_count
     cmp_qk_block_count = t_dim * cmp_work_count
@@ -281,14 +285,14 @@ def sparse_attn_hca(
                 rope_sin_signed[cs_t0 : cs_t0 + ROPE_CS_T_TILE, cp_c0 : cp_c0 + ROPE_INTERLEAVE_TILE] = cs_sin_signed
 
         with pl.spmd(
-            stream_block_count,
+            raw_block_count,
             name_hint="hca_raw_attn",
             deps=[raw_gather_tid, raw_valid_tid],
         ) as raw_heads_tid:
             stream_idx = pl.tile.get_block_idx()
-            stream_t = stream_idx // (H // H_TILE)
-            stream_h_tile = stream_idx - stream_t * (H // H_TILE)
-            stream_h0 = stream_h_tile * H_TILE
+            stream_t = stream_idx // (H // RAW_H_TILE)
+            stream_h_tile = stream_idx - stream_t * (H // RAW_H_TILE)
+            stream_h0 = stream_h_tile * RAW_H_TILE
             stream_state_row = stream_t * H + stream_h0
             stream_request = stream_t // S
             stream_token = stream_t - stream_request * S
@@ -296,83 +300,49 @@ def sparse_attn_hca(
             stream_first_len = pl.read(window_swa_lens, [stream_first_t])
             stream_drop = pl.max(stream_first_len + stream_token - WIN, 0)
             stream_raw_base = stream_request * REQUEST_KV_ROWS + stream_drop
-            stream_q = pl.load(q_flat, [stream_state_row, 0], [H_TILE, HEAD_DIM], target_memory=pl.MemorySpace.Vec)
-            stream_row_max_tmp = pl.create_tile([H_TILE, RAW_K_TILE], dtype=pl.FP32, target_memory=pl.MemorySpace.Vec)
-            stream_row_sum_tmp = pl.create_tile([H_TILE, RAW_K_TILE], dtype=pl.FP32, target_memory=pl.MemorySpace.Vec)
-            for stream_raw_item in pl.unroll(WIN // RAW_K_TILE):
-                stream_raw_begin = stream_raw_base + stream_raw_item * RAW_K_TILE
-                stream_valid_begin = stream_raw_item * RAW_K_TILE
-                stream_raw_kv = pl.load(
-                    raw_kv,
-                    [stream_raw_begin, 0],
-                    [RAW_K_TILE, HEAD_DIM],
-                    target_memory=pl.MemorySpace.Mat,
-                )
-                stream_raw_kv_t = pl.tile.transpose_view(stream_raw_kv)
-                stream_raw_kv_t_left = stream_raw_kv_t[0:ATTN_D_TILE, 0:RAW_K_TILE]
-                stream_raw_kv_t_right = stream_raw_kv_t[ATTN_D_TILE:HEAD_DIM, 0:RAW_K_TILE]
-                stream_raw_valid_row = pl.load(
-                    raw_valid,
-                    [stream_t, stream_valid_begin],
-                    [1, RAW_K_TILE],
-                    target_memory=pl.MemorySpace.Vec,
-                )
-                stream_raw_valid_zero = pl.tile.full([H_TILE, RAW_K_TILE], dtype=pl.FP32, value=0.0)
-                stream_raw_valid = pl.col_expand_add(stream_raw_valid_zero, stream_raw_valid_row)
-                stream_raw_bias = pl.mul(pl.sub(stream_raw_valid, 1.0), -NEG_INF)
-                stream_raw_scores = pl.matmul(stream_q[:, 0:ATTN_D_TILE], stream_raw_kv_t_left, out_dtype=pl.FP32)
-                stream_raw_scores = pl.matmul_acc(
-                    stream_raw_scores,
-                    stream_q[:, ATTN_D_TILE:HEAD_DIM],
-                    stream_raw_kv_t_right,
-                )
-                stream_raw_scores = pl.add(pl.mul(stream_raw_scores, SOFTMAX_SCALE), stream_raw_bias)
-                stream_raw_mi_col = pl.row_max(stream_raw_scores, stream_row_max_tmp)
-                stream_raw_exp = pl.exp(pl.row_expand_sub(stream_raw_scores, stream_raw_mi_col))
-                stream_raw_exp = pl.mul(stream_raw_exp, stream_raw_valid)
-                stream_raw_li_col = pl.row_sum(stream_raw_exp, stream_row_sum_tmp)
-                stream_raw_exp_bf16 = pl.cast(stream_raw_exp, target_type=pl.BF16, mode="rint")
-                stream_raw_oi_left = pl.matmul(stream_raw_exp_bf16, stream_raw_kv[:, 0:ATTN_D_TILE], out_dtype=pl.FP32)
-                stream_raw_oi_right = pl.matmul(
-                    stream_raw_exp_bf16,
-                    stream_raw_kv[:, ATTN_D_TILE : 2 * ATTN_D_TILE],
-                    out_dtype=pl.FP32,
-                )
-                stream_raw_oi = pl.concat(stream_raw_oi_left, stream_raw_oi_right)
-                if stream_raw_item == 0:
-                    pl.store(stream_raw_mi_col, [stream_state_row, 0], stream_state_m)
-                    pl.store(stream_raw_li_col, [stream_state_row, 0], stream_state_l)
-                    pl.store(stream_raw_oi, [stream_state_row, 0], stream_heads)
-                else:
-                    stream_m = pl.load(
-                        stream_state_m,
-                        [stream_state_row, 0],
-                        [H_TILE, 1],
-                        target_memory=pl.MemorySpace.Vec,
-                    )
-                    stream_l = pl.load(
-                        stream_state_l,
-                        [stream_state_row, 0],
-                        [H_TILE, 1],
-                        target_memory=pl.MemorySpace.Vec,
-                    )
-                    stream_o = pl.load(
-                        stream_heads,
-                        [stream_state_row, 0],
-                        [H_TILE, HEAD_DIM],
-                        target_memory=pl.MemorySpace.Vec,
-                    )
-                    stream_m_new = pl.maximum(stream_m, stream_raw_mi_col)
-                    stream_alpha = pl.exp(pl.sub(stream_m, stream_m_new))
-                    stream_beta = pl.exp(pl.sub(stream_raw_mi_col, stream_m_new))
-                    stream_l_new = pl.add(pl.mul(stream_alpha, stream_l), pl.mul(stream_beta, stream_raw_li_col))
-                    stream_o_new = pl.add(
-                        pl.row_expand_mul(stream_o, stream_alpha),
-                        pl.row_expand_mul(stream_raw_oi, stream_beta),
-                    )
-                    pl.store(stream_m_new, [stream_state_row, 0], stream_state_m)
-                    pl.store(stream_l_new, [stream_state_row, 0], stream_state_l)
-                    pl.store(stream_o_new, [stream_state_row, 0], stream_heads)
+            stream_q = pl.load(q_flat, [stream_state_row, 0], [RAW_H_TILE, HEAD_DIM], target_memory=pl.MemorySpace.Mat)
+            stream_row_max_tmp = pl.create_tile([RAW_H_TILE, RAW_K_TILE], dtype=pl.FP32, target_memory=pl.MemorySpace.Vec)
+            stream_row_sum_tmp = pl.create_tile([RAW_H_TILE, RAW_K_TILE], dtype=pl.FP32, target_memory=pl.MemorySpace.Vec)
+            stream_raw_kv = pl.load(
+                raw_kv,
+                [stream_raw_base, 0],
+                [RAW_K_TILE, HEAD_DIM],
+                target_memory=pl.MemorySpace.Mat,
+            )
+            stream_raw_kv_t = pl.tile.transpose_view(stream_raw_kv)
+            stream_raw_kv_t_left = stream_raw_kv_t[0:ATTN_D_TILE, 0:RAW_K_TILE]
+            stream_raw_kv_t_right = stream_raw_kv_t[ATTN_D_TILE:HEAD_DIM, 0:RAW_K_TILE]
+            stream_raw_valid_row = pl.load(
+                raw_valid,
+                [stream_t, 0],
+                [1, RAW_K_TILE],
+                target_memory=pl.MemorySpace.Vec,
+            )
+            stream_raw_valid_zero = pl.tile.full([RAW_H_TILE, RAW_K_TILE], dtype=pl.FP32, value=0.0)
+            stream_raw_valid = pl.col_expand_add(stream_raw_valid_zero, stream_raw_valid_row)
+            stream_raw_bias = pl.mul(pl.sub(stream_raw_valid, 1.0), -NEG_INF)
+            stream_raw_scores = pl.matmul(stream_q[:, 0:ATTN_D_TILE], stream_raw_kv_t_left, out_dtype=pl.FP32)
+            stream_raw_scores = pl.matmul_acc(
+                stream_raw_scores,
+                stream_q[:, ATTN_D_TILE:HEAD_DIM],
+                stream_raw_kv_t_right,
+            )
+            stream_raw_scores = pl.add(pl.mul(stream_raw_scores, SOFTMAX_SCALE), stream_raw_bias)
+            stream_raw_mi_col = pl.row_max(stream_raw_scores, stream_row_max_tmp)
+            stream_raw_exp = pl.exp(pl.row_expand_sub(stream_raw_scores, stream_raw_mi_col))
+            stream_raw_exp = pl.mul(stream_raw_exp, stream_raw_valid)
+            stream_raw_li_col = pl.row_sum(stream_raw_exp, stream_row_sum_tmp)
+            stream_raw_exp_bf16 = pl.cast(stream_raw_exp, target_type=pl.BF16, mode="rint")
+            stream_raw_oi_left = pl.matmul(stream_raw_exp_bf16, stream_raw_kv[:, 0:ATTN_D_TILE], out_dtype=pl.FP32)
+            stream_raw_oi_right = pl.matmul(
+                stream_raw_exp_bf16,
+                stream_raw_kv[:, ATTN_D_TILE : 2 * ATTN_D_TILE],
+                out_dtype=pl.FP32,
+            )
+            pl.store(stream_raw_mi_col, [stream_state_row, 0], stream_state_m)
+            pl.store(stream_raw_li_col, [stream_state_row, 0], stream_state_l)
+            pl.store(stream_raw_oi_left, [stream_state_row, 0], stream_heads)
+            pl.store(stream_raw_oi_right, [stream_state_row, ATTN_D_TILE], stream_heads)
 
         raw_branch_tids[0] = raw_heads_tid
         rope_cs_tids[0] = rope_cs_tid
