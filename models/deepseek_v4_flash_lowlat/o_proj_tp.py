@@ -54,16 +54,14 @@ N_RANKS = TP
 
 # tiling -- carried over from decode_sparse_attn_hca.py so the shard is the only
 # variable between the two entries.
-A_K_TILE = 256           # proj_a cube K frag
-PROJ_A_MM_N_TILE = 128   # proj_a cube N frag
+A_K_TILE = 256  # proj_a cube K frag
 MM_T_TILE = 16
 T_PAD = ((T + MM_T_TILE - 1) // MM_T_TILE) * MM_T_TILE
-B_K_TILE = 256           # proj_b_mm cube K frag
-PROJ_B_MM_N_TILE = 256   # proj_b_mm cube N frag; writes INT32 partials
-PROJ_B_ACT_N_TILE = 512  # dequant vector N frag
+B_K_TILE = 256  # proj_b_mm cube K frag
+
+
 # TP arm: the rank owns one group, so quant is on the serial chain instead of
-# running beside seven siblings. Split it over the O_LORA columns -- max is
-# associative, so a per-chunk row max combined across chunks is the same amax.
+# running beside seven siblings. Its O_LORA columns are the axis it fans out over.
 def _parse_int_argv(name, default):
     for i, tok in enumerate(_sys.argv):
         if tok == name and i + 1 < len(_sys.argv):
@@ -73,41 +71,31 @@ def _parse_int_argv(name, default):
     return default
 
 
-# Measured on a2a3 with the PINNED ptoas v0.57: 80.6 / 80.5 / 82.2 / 84.8 us at
-# 1 / 2 / 4 / 8 chunks, i.e. the fan-out buys nothing and costs task overhead past
-# 2. An earlier sweep on an off-pin ptoas v0.60 read 86.7 / 82.3 / 81.1 / 83.3 /
-# 93.8 and put the optimum at 4 -- that optimum was a property of 0.60's vector
-# codegen, not of the kernel. Re-sweep on any ptoas bump.
-QUANT_CHUNKS = _parse_int_argv("--quant-chunks", 2)
+# Every block recomputes the full-width amax, so a chunk buys only the quantize
+# fan-out and pays a full amax for it. Measured on a2a3 with the PINNED ptoas
+# v0.57, fastest-rank median: 69.0 / 69.3 / 69.9 us at 1 / 2 / 4 chunks -- the
+# fan-out no longer pays. The two-task form it replaced, whose chunks shared one
+# amax through GM, read 71.1 / 70.7 / 72.5 there. Re-sweep on any ptoas bump.
+QUANT_CHUNKS = _parse_int_argv("--quant-chunks", 1)
 # The publish put moves [T, D] FP32 = 128 KB. With chunk_cols == D it goes as a
 # single unbuffered chunk; a smaller chunk plus pipeline=True double-buffers the
 # VEC staging tile so one chunk is on the wire while the next loads.
 PUT_CHUNK_COLS = _parse_int_argv("--put-chunk-cols", D)
 PUT_PIPELINE = any(t == "--put-pipeline" for t in _sys.argv)
-# The TP dequant is pure vector work on 8 of the 48 AIVs. Its block count is
-# independent of the publish, which stays one bulk put per peer, so it can be
-# widened without multiplying transfers.
-DEQUANT_N_TILE = _parse_int_argv("--dequant-n-tile", 512)
-# lm_head-style overlap: fold the INT32->FP32 dequant into proj_b's cube task so
-# pl.aiv_shard carries the accumulator across the C->V edge and a tile is scaled on
-# the vector lane while the cube projects the next one.
-#
-# OFF BY DEFAULT AND DOES NOT COMPILE on the pinned ptoas v0.57:
-#   failed to legalize operation 'pto.subview'
-# on the slice of the pl.aiv_shard result -- the restriction lm_head's own
-# WORKAROUND comment describes. lm_head's way around it is to store the shard
-# whole to GM and read slices back; that is the shape this would have to take.
-# Kept as the repro. (On an off-pin v0.60 it compiled and returned wrong numbers
-# instead, via a row_expand_mul broadcast defect -- a different failure, not the
-# one that blocks it here.)
-FUSE_DEQUANT = any(t == "--fuse-dequant" for t in _sys.argv)
-AIV_LANES = 2                              # hardware-fixed lanes per AICore
-PUSH_LANE_COLS = PROJ_B_MM_N_TILE // AIV_LANES
 QUANT_COL_TILE = O_LORA // QUANT_CHUNKS
 assert O_LORA % QUANT_CHUNKS == 0, "--quant-chunks must divide O_LORA"
-PROJ_B_D_TILE = 512      # proj_b_mm D chunk per task; its N frags loop inside the task
-PROJ_B_ACT_T_TILE = 8    # dequant inner token tile
-PROJ_B_ACT_TASK_T_TILE = 8   # dequant token block per task
+# Both projections are M-starved at T=8 -- 16 rows against a 4096-deep K -- so they
+# are bound by how many cores stream weights, not by cube throughput, and the block
+# count is the lever. Measured on a2a3, fastest-rank median, at (proj_a blocks,
+# proj_b blocks): 69.4 us at (8, 8), 67.3 at (8, 16), 67.1 at (16, 8), 65.0 at
+# (16, 16), 68.2 at (32, 16). The two fan-outs are independent and additive, and
+# both turn at 24 -- the AIC count -- because a 32-block grid runs two waves.
+PROJ_A_MM_N_TILE = 64  # proj_a cube N frag; O_LORA // this = 16 blocks
+PROJ_B_D_TILE = 256  # proj_b_mm D chunk per task; D // this = 16 blocks
+# proj_b_mm cube N frag; writes INT32 partials. Equal to the D chunk, so each block
+# runs one frag: spending the width on blocks beats splitting the frag (16 blocks x
+# 2 frags of 128 reads 68.1 us).
+PROJ_B_MM_N_TILE = 256
 
 # Diagnostic: emit a leading barrier so host dispatch skew is paid BEFORE the
 # measured chain instead of inside the reduce barrier. Parsed off argv because
@@ -139,12 +127,13 @@ REDUCE_WINDOW_ROWS = 2 * REDUCE_LANE_ROWS
 # direct ND2ND load and no reshape.
 SCALE_LANE_ROWS = N_RANKS * T
 SCALE_WINDOW_ROWS = 2 * SCALE_LANE_ROWS
+# D chunk per reduce block, i.e. D // this = 8 blocks. This grid loads all eight
+# rank slots per block, which keeps it element-bound enough that 8 blocks still pay:
+# 1024 reads 65.4 us and 2048 reads 68.7 against 64.9 here.
 REDUCE_D_TILE = 512
 FIRST_EPOCH = 1
 
-assert O_GROUPS == N_RANKS, (
-    f"TP-by-group needs one group per rank: O_GROUPS={O_GROUPS}, TP={N_RANKS}"
-)
+assert O_GROUPS == N_RANKS, f"TP-by-group needs one group per rank: O_GROUPS={O_GROUPS}, TP={N_RANKS}"
 
 
 @pl.jit.inline
@@ -165,68 +154,33 @@ def _evict_l2(
 
 
 @pl.jit.inline
-def _proj_chain(
-    o_packed: pl.Tensor[[O_GROUPS * T, O_GROUP_IN], pl.BF16],
-    wo_a_g: pl.Tensor[[1, O_LORA, O_GROUP_IN], pl.BF16],
-    wo_b_g: pl.Tensor[[D, O_LORA], pl.INT8],
+def _quant(
     o_r_pad: pl.Tensor[[T_PAD, O_LORA], pl.FP32],
     o_r_i8_pad: pl.Tensor[[T_PAD, O_LORA], pl.INT8],
-    act_scale_dq: pl.Tensor[[1, T], pl.FP32],
     act_scale_col: pl.Tensor[[T, 1], pl.FP32],
-    act_scale_lane: pl.Tensor[[AIV_LANES, T], pl.FP32],
-    amax_parts: pl.Tensor[[QUANT_CHUNKS, T], pl.FP32],
-    partial: pl.Tensor[[T_PAD, D], pl.INT32],
-    part_f32: pl.Tensor[[T, D], pl.FP32],
-    row_base_o: pl.Scalar[pl.INDEX],
-    upstream: pl.Scalar[pl.TASK_ID],
+    pa_tid: pl.Scalar[pl.TASK_ID],
 ) -> pl.Scalar[pl.TASK_ID]:
-    """One group's proj_a -> quant -> proj_b chain; returns proj_b's TaskId."""
-    with pl.spmd(O_LORA // PROJ_A_MM_N_TILE, name_hint="proj_a_mm", deps=[upstream],
-                 allow_early_resolve=True) as pa_tid:
-        nf = pl.tile.get_block_idx()
-        n0 = nf * PROJ_A_MM_N_TILE
-        xa0_chunk = pl.slice(o_packed, [MM_T_TILE, A_K_TILE], [row_base_o, 0], valid_shape=[T, A_K_TILE])
-        wa0_chunk = wo_a_g[0:1, n0 : n0 + PROJ_A_MM_N_TILE, 0:A_K_TILE]
-        acc_a = pl.matmul(xa0_chunk, wa0_chunk, b_trans=True, out_dtype=pl.FP32)
-        for kb in pl.pipeline(1, O_GROUP_IN // A_K_TILE, stage=2):
-            k0 = kb * A_K_TILE
-            xa_k_chunk = pl.slice(o_packed, [MM_T_TILE, A_K_TILE], [row_base_o, k0], valid_shape=[T, A_K_TILE])
-            wa_k_chunk = wo_a_g[0:1, n0 : n0 + PROJ_A_MM_N_TILE, k0 : k0 + A_K_TILE]
-            acc_a = pl.matmul_acc(acc_a, xa_k_chunk, wa_k_chunk, b_trans=True)
-        # acc_a is 3D (wo_a_g keeps its group axis), which subscript-write cannot express.
-        o_r_pad = pl.assemble(o_r_pad, acc_a, [0, n0])
+    """Row amax over the full O_LORA width, then an INT8 quantize of one chunk.
 
-    # Pass 1: a partial row amax per column chunk, one block each.
-    with pl.spmd(QUANT_CHUNKS, name_hint="quant_amax", deps=[pa_tid],
-                 allow_early_resolve=True) as qa_tid:
-        qc = pl.tile.get_block_idx()
-        c0 = qc * QUANT_COL_TILE
-        a_abs = pl.abs(o_r_pad[0:T, c0 : c0 + QUANT_COL_TILE])
-        amax_parts[qc : qc + 1, 0:T] = pl.reshape(pl.row_max(a_abs), [1, T])
-
-    # Pass 2: every block folds the QUANT_CHUNKS partials to the same row amax --
-    # the identical value the one-task form computed -- and quantizes its own chunk.
-    with pl.spmd(QUANT_CHUNKS, name_hint="quant", deps=[qa_tid],
-                 allow_early_resolve=True) as q_tid:
+    Blocks of one spmd cannot read each other's partials, so a chunked amax would
+    need a second task to combine them. Re-reading every chunk instead keeps the
+    quantize a single task: `max` is associative, so each block lands on the same
+    amax, and the extra reads cost less than the task edge and its GM round trip.
+    """
+    with pl.spmd(QUANT_CHUNKS, name_hint="quant", deps=[pa_tid], allow_early_resolve=True) as q_tid:
         qb = pl.tile.get_block_idx()
         q0 = qb * QUANT_COL_TILE
         g_amax = pl.full([1, T], dtype=pl.FP32, value=INT8_AMAX_EPS)
         for pc in pl.unroll(QUANT_CHUNKS):
-            g_amax = pl.maximum(g_amax, amax_parts[pc : pc + 1, 0:T])
+            p0 = pc * QUANT_COL_TILE
+            p_abs = pl.abs(o_r_pad[0:T, p0 : p0 + QUANT_COL_TILE])
+            g_amax = pl.maximum(g_amax, pl.reshape(pl.row_max(p_abs), [1, T]))
         g_scale_num = pl.full([1, T], dtype=pl.FP32, value=INT8_SCALE_MAX)
         g_sq_row = pl.div(g_scale_num, g_amax)
-        # Every block folds the same partials to the same scale; one block records it.
+        # Every block folds to the same scale; one block records it.
         if qb == 0:
             sc_row = pl.recip(g_sq_row)
-            act_scale_dq[0:1, 0:T] = sc_row
             act_scale_col[0:T, 0:1] = pl.reshape(sc_row, [T, 1])
-            if FUSE_DEQUANT:
-                # One contiguous 32 B copy per AIV lane: the fused dequant's read
-                # address must reference aiv_id or LowerAutoVectorSplit rejects it
-                # as full-width, and a [1, T] FP32 row is the only carrier shape
-                # ptoas will allocate there (a [T, 1] one has 4 B rows).
-                for ln in pl.unroll(AIV_LANES):
-                    act_scale_lane[ln : ln + 1, 0:T] = sc_row
         g_sq_col = pl.reshape(g_sq_row, [T, 1])
         oc_q = o_r_pad[0:T, q0 : q0 + QUANT_COL_TILE]
         oq_scaled = pl.row_expand_mul(oc_q, g_sq_col)
@@ -234,19 +188,59 @@ def _proj_chain(
         oq_half = pl.cast(oq_i32, target_type=pl.FP16, mode="round")
         oq_i8 = pl.cast(oq_half, target_type=pl.INT8, mode="trunc")
         o_r_i8_pad[0:T, q0 : q0 + QUANT_COL_TILE] = oq_i8
+    return q_tid
+
+
+@pl.jit.inline
+def _proj_chain(
+    o_packed: pl.Tensor[[O_GROUPS * T, O_GROUP_IN], pl.BF16],
+    wo_a_g: pl.Tensor[[1, O_LORA, O_GROUP_IN], pl.BF16],
+    wo_b_g: pl.Tensor[[D, O_LORA], pl.INT8],
+    o_r_pad: pl.Tensor[[T_PAD, O_LORA], pl.FP32],
+    o_r_i8_pad: pl.Tensor[[T_PAD, O_LORA], pl.INT8],
+    act_scale_col: pl.Tensor[[T, 1], pl.FP32],
+    partial: pl.Tensor[[T_PAD, D], pl.INT32],
+    row_base_o: pl.Scalar[pl.INDEX],
+    upstream: pl.Scalar[pl.TASK_ID],
+) -> pl.Scalar[pl.TASK_ID]:
+    """One group's proj_a -> quant -> proj_b chain; returns proj_b's TaskId."""
+    with pl.spmd(
+        O_LORA // PROJ_A_MM_N_TILE, name_hint="proj_a_mm", deps=[upstream], allow_early_resolve=True
+    ) as pa_tid:
+        nf = pl.tile.get_block_idx()
+        n0 = nf * PROJ_A_MM_N_TILE
+        xa0_chunk = pl.slice(o_packed, [MM_T_TILE, A_K_TILE], [row_base_o, 0], valid_shape=[T, A_K_TILE])
+        wa0_chunk = wo_a_g[0:1, n0 : n0 + PROJ_A_MM_N_TILE, 0:A_K_TILE]
+        acc_a = pl.matmul(xa0_chunk, wa0_chunk, b_trans=True, out_dtype=pl.FP32)
+        for kb in pl.pipeline(1, O_GROUP_IN // A_K_TILE, stage=2):
+            k0 = kb * A_K_TILE
+            xa_k_chunk = pl.slice(
+                o_packed, [MM_T_TILE, A_K_TILE], [row_base_o, k0], valid_shape=[T, A_K_TILE]
+            )
+            wa_k_chunk = wo_a_g[0:1, n0 : n0 + PROJ_A_MM_N_TILE, k0 : k0 + A_K_TILE]
+            acc_a = pl.matmul_acc(acc_a, xa_k_chunk, wa_k_chunk, b_trans=True)
+        # acc_a is 3D (wo_a_g keeps its group axis), which subscript-write cannot express.
+        o_r_pad = pl.assemble(o_r_pad, acc_a, [0, n0])
+
+    q_tid = _quant(o_r_pad, o_r_i8_pad, act_scale_col, pa_tid)
 
     # The padding rows carry no data and depend on nothing, so they are zeroed
     # off the proj_a -> quant -> proj_b chain rather than inside quant, where the
     # fill is the same [T_PAD - T, O_LORA] element count as the real quantize.
-    with pl.at(level=pl.Level.CORE_GROUP, name_hint="quant_pad_zero", deps=[upstream],
-               allow_early_resolve=True) as pad_tid:
+    with pl.at(
+        level=pl.Level.CORE_GROUP, name_hint="quant_pad_zero", deps=[upstream], allow_early_resolve=True
+    ) as pad_tid:
         zero_half = pl.full([T_PAD - T, O_LORA], dtype=pl.FP16, value=0.0)
         zero_i8 = pl.cast(zero_half, target_type=pl.INT8, mode="trunc")
         o_r_i8_pad[T:T_PAD, 0:O_LORA] = zero_i8
 
-    with pl.spmd(D // PROJ_B_D_TILE, name_hint="proj_b_mm", deps=[q_tid, pad_tid],
-                 allow_early_resolve=True,
-                 optimizations=[pl.cross_core_slot(slot_num=2)]) as pb_tid:
+    with pl.spmd(
+        D // PROJ_B_D_TILE,
+        name_hint="proj_b_mm",
+        deps=[q_tid, pad_tid],
+        allow_early_resolve=True,
+        optimizations=[pl.cross_core_slot(slot_num=2)],
+    ) as pb_tid:
         dc = pl.tile.get_block_idx()
         d0 = dc * PROJ_B_D_TILE
         for nf in pl.range(PROJ_B_D_TILE // PROJ_B_MM_N_TILE):
@@ -265,31 +259,7 @@ def _proj_chain(
                     wo_b_g[n0 : n0 + PROJ_B_MM_N_TILE, k0 : k0 + B_K_TILE],
                     b_trans=True,
                 )
-            if FUSE_DEQUANT:
-                # Columns must be fully valid across the C->V crossing: LEFT_RIGHT
-                # splits the column axis and rejects a narrowed column extent.
-                acc_b = pl.set_validshape(acc_b, T_PAD, PROJ_B_MM_N_TILE)
-                for aiv_id in pl.split_aiv(AIV_LANES, mode=pl.SplitMode.NONE):
-                    # row_expand_mul with a [T, 1] carrier broadcasts wrong inside a
-                    # split_aiv + aiv_shard region -- rows 2..7 come out zero -- even
-                    # for a direct GM slice. Broadcasting along the other axis is the
-                    # documented way out: transpose to [cols, T], col_expand by the
-                    # [1, T] scale row, transpose back. A [1, T] FP32 row is 32 B, so
-                    # it is also the only shape of this carrier ptoas will allocate.
-                    # NONE keeps the crossing full-width, so the lane split is taken
-                    # explicitly out of the shard; a transpose is illegal in a
-                    # LEFT_RIGHT/UP_DOWN region because it swaps the split axis.
-                    pb_shard = pl.aiv_shard(acc_b)
-                    lane_c0 = n0 + aiv_id * PUSH_LANE_COLS
-                    lane_slice = pb_shard[0:T, aiv_id * PUSH_LANE_COLS :
-                                          aiv_id * PUSH_LANE_COLS + PUSH_LANE_COLS]
-                    p_f32 = pl.cast(lane_slice, target_type=pl.FP32, mode="none")
-                    p_t = pl.transpose(p_f32, axis1=0, axis2=1)
-                    p_t = pl.col_expand_mul(p_t, act_scale_lane[aiv_id : aiv_id + 1, 0:T])
-                    part_f32[0:T, lane_c0 : lane_c0 + PUSH_LANE_COLS] = pl.transpose(
-                        p_t, axis1=0, axis2=1)
-            else:
-                partial[0:MM_T_TILE, n0 : n0 + PROJ_B_MM_N_TILE] = acc_b
+            partial[0:MM_T_TILE, n0 : n0 + PROJ_B_MM_N_TILE] = acc_b
     return pb_tid
 
 
@@ -320,12 +290,8 @@ def o_proj_tp_core(
     """
     o_r_pad = pl.create_tensor([T_PAD, O_LORA], dtype=pl.FP32)
     o_r_i8_pad = pl.create_tensor([T_PAD, O_LORA], dtype=pl.INT8)
-    act_scale_dq = pl.create_tensor([1, T], dtype=pl.FP32)
     act_scale_col = pl.create_tensor([T, 1], dtype=pl.FP32)
-    act_scale_lane = pl.create_tensor([AIV_LANES, T], dtype=pl.FP32)
-    amax_parts = pl.create_tensor([QUANT_CHUNKS, T], dtype=pl.FP32)
     partial = pl.create_tensor([T_PAD, D], dtype=pl.INT32)
-    part_f32 = pl.create_tensor([T, D], dtype=pl.FP32)
     barrier_out = pl.array.create(1, pl.TASK_ID)
 
     lane_base = pl.cast(((oproj_epoch - 1) % 2) * REDUCE_LANE_ROWS, pl.INDEX)
@@ -362,9 +328,15 @@ def o_proj_tp_core(
         anchor = pl.system.task_dummy(deps=[_sync_tid, upstream])
 
         pb_tid = _proj_chain(
-            o_packed, wo_a_shard, wo_b_shard,
-            o_r_pad, o_r_i8_pad, act_scale_dq, act_scale_col, act_scale_lane, amax_parts, partial, part_f32,
-            row_base_o, anchor,
+            o_packed,
+            wo_a_shard,
+            wo_b_shard,
+            o_r_pad,
+            o_r_i8_pad,
+            act_scale_col,
+            partial,
+            row_base_o,
+            anchor,
         )
 
         # Dequantize by this group's per-row activation scale. The per-channel
@@ -381,27 +353,40 @@ def o_proj_tp_core(
         with pl.spmd(N_RANKS, name_hint="oproj_publish", deps=[pb_tid]) as publish_tid:
             peer = pl.tile.get_block_idx()
             pld.tensor.put(
-                dst=reduce_window, peer=peer, src=partial,
-                dst_offsets=[my_row, 0], src_offsets=[0, 0], shape=[T, D],
-                chunk_rows=T, chunk_cols=PUT_CHUNK_COLS, pipeline=PUT_PIPELINE,
+                dst=reduce_window,
+                peer=peer,
+                src=partial,
+                dst_offsets=[my_row, 0],
+                src_offsets=[0, 0],
+                shape=[T, D],
+                chunk_rows=T,
+                chunk_cols=PUT_CHUNK_COLS,
+                pipeline=PUT_PIPELINE,
             )
             pld.tensor.put(
-                dst=scale_window, peer=peer, src=act_scale_col,
-                dst_offsets=[my_scale_row, 0], src_offsets=[0, 0], shape=[T, 1],
+                dst=scale_window,
+                peer=peer,
+                src=act_scale_col,
+                dst_offsets=[my_scale_row, 0],
+                src_offsets=[0, 0],
+                shape=[T, 1],
+            )
+            pld.system.notify(
+                target=reduce_signal,
+                peer=peer,
+                offsets=[my_rank, 0],
+                value=1,
+                op=pld.NotifyOp.AtomicAdd,
             )
 
         # Split from the push so the notify rides the push scope's program order
         # and only the wait holds a core group.
-        with pl.at(level=pl.Level.CORE_GROUP, name_hint="oproj_barrier",
-                   deps=[publish_tid]) as barrier_tid:
-            for peer in pl.range(N_RANKS):
-                pld.system.notify(
-                    target=reduce_signal,
-                    peer=peer,
-                    offsets=[my_rank, 0],
-                    value=1,
-                    op=pld.NotifyOp.AtomicAdd,
-                )
+        with pl.at(
+            level=pl.Level.CORE_GROUP,
+            name_hint="oproj_barrier",
+            deps=[pb_tid],
+            allow_early_resolve=True,
+        ) as barrier_tid:
             for src in pl.range(N_RANKS):
                 pld.system.wait(
                     signal=reduce_signal,
@@ -424,21 +409,28 @@ def o_proj_tp_core(
     # Array[TASK_ID], the sanctioned way out of a scope that has closed.
     # One block per D tile carrying all T rows: [1, REDUCE_D_TILE] blocks make this
     # 64 tasks whose per-task fixed cost dominates 2 KB of loads.
-    with pl.spmd(D // REDUCE_D_TILE, name_hint="oproj_reduce",
-                 deps=[barrier_out[0]]) as _reduce_tid:
+    with pl.spmd(
+        D // REDUCE_D_TILE, name_hint="oproj_reduce", deps=[barrier_out[0]], allow_early_resolve=True
+    ) as _reduce_tid:
         d0 = pl.tile.get_block_idx() * REDUCE_D_TILE
         # Seeded from rank 0 rather than a zero tile so the accumulator stays at
         # tile level, and so the term order matches a single card's g loop.
         acc = pl.row_expand_mul(
-            pl.cast(pl.load(reduce_window, [lane_base, d0], [T, REDUCE_D_TILE]),
-                    target_type=pl.FP32, mode="none"),
-            pl.load(scale_window, [scale_lane_base, 0], [T, 1]))
+            pl.cast(
+                pl.load(reduce_window, [lane_base, d0], [T, REDUCE_D_TILE]), target_type=pl.FP32, mode="none"
+            ),
+            pl.load(scale_window, [scale_lane_base, 0], [T, 1]),
+        )
         for src_rank in pl.range(1, N_RANKS):
             p_src = pl.cast(
                 pl.load(reduce_window, [lane_base + src_rank * T_PAD, d0], [T, REDUCE_D_TILE]),
-                target_type=pl.FP32, mode="none")
-            acc = pl.add(acc, pl.row_expand_mul(
-                p_src, pl.load(scale_window, [scale_lane_base + src_rank * T, 0], [T, 1])))
+                target_type=pl.FP32,
+                mode="none",
+            )
+            acc = pl.add(
+                acc,
+                pl.row_expand_mul(p_src, pl.load(scale_window, [scale_lane_base + src_rank * T, 0], [T, 1])),
+            )
         wb_chunk = pl.load(wo_b_scale_2d, [0, d0], [1, REDUCE_D_TILE])
         scaled = pl.col_expand_mul(acc, wb_chunk)
         pl.store(pl.cast(scaled, target_type=pl.BF16, mode="rint"), [0, d0], attn_out)
@@ -482,8 +474,18 @@ def o_proj_tp(
     """Standalone entry: the L2-eviction probe, then the shared projection core."""
     evict_tid = _evict_l2(l2_evict, l2_evict_sink)
     o_proj_tp_core(
-        o_packed, evict_tid, wo_a_shard, wo_b_shard, wo_b_scale, attn_out,
-        reduce_window, scale_window, reduce_signal, sync_signal, my_rank, oproj_epoch,
+        o_packed,
+        evict_tid,
+        wo_a_shard,
+        wo_b_shard,
+        wo_b_scale,
+        attn_out,
+        reduce_window,
+        scale_window,
+        reduce_signal,
+        sync_signal,
+        my_rank,
+        oproj_epoch,
     )
     clear_oproj_signals(attn_out, reduce_signal, sync_signal)
     return attn_out
@@ -507,8 +509,19 @@ def o_proj_tp_test(
     oproj_epoch: pl.Scalar[pl.INT32],
 ):
     return o_proj_tp(
-        o_packed, wo_a_shard, wo_b_shard, wo_b_scale, l2_evict, l2_evict_sink, attn_out,
-        reduce_window, scale_window, reduce_signal, sync_signal, my_rank, oproj_epoch,
+        o_packed,
+        wo_a_shard,
+        wo_b_shard,
+        wo_b_scale,
+        l2_evict,
+        l2_evict_sink,
+        attn_out,
+        reduce_window,
+        scale_window,
+        reduce_signal,
+        sync_signal,
+        my_rank,
+        oproj_epoch,
     )
 
 
@@ -533,9 +546,20 @@ def l3_o_proj_tp(
         reduce_signal = pld.window(reduce_signal_buf, [N_RANKS, 1], dtype=pl.INT32)
         sync_signal = pld.window(sync_signal_buf, [N_RANKS, 1], dtype=pl.INT32)
         o_proj_tp_test(
-            o_packed[r], wo_a_shard[r], wo_b_shard[r], wo_b_scale[r],
-            l2_evict[r], l2_evict_sink[r], attn_out[r],
-            reduce_window, scale_window, reduce_signal, sync_signal, r, FIRST_EPOCH, device=r,
+            o_packed[r],
+            wo_a_shard[r],
+            wo_b_shard[r],
+            wo_b_scale[r],
+            l2_evict[r],
+            l2_evict_sink[r],
+            attn_out[r],
+            reduce_window,
+            scale_window,
+            reduce_signal,
+            sync_signal,
+            r,
+            FIRST_EPOCH,
+            device=r,
         )
 
 
@@ -568,7 +592,10 @@ def golden_tp(tensors):
     wo_b_full = torch.cat([tensors["wo_b_shard"][r] for r in range(N_RANKS)], dim=1)
     for r in range(tensors["o_packed"].shape[0]):
         tensors["attn_out"][r] = _golden_o_proj(
-            tensors["o_packed"][r], wo_a_full, wo_b_full, tensors["wo_b_scale"][r],
+            tensors["o_packed"][r],
+            wo_a_full,
+            wo_b_full,
+            tensors["wo_b_scale"][r],
         )
 
 
@@ -579,7 +606,7 @@ def _base_tensors():
 
     gen = torch.Generator().manual_seed(20260902)
     o_packed = (torch.randn(O_GROUPS * T, O_GROUP_IN, generator=gen) * 0.1).to(torch.bfloat16)
-    wo_a = (torch.randn(O_GROUPS, O_LORA, O_GROUP_IN, generator=gen) / O_GROUP_IN ** 0.5).to(torch.bfloat16)
+    wo_a = (torch.randn(O_GROUPS, O_LORA, O_GROUP_IN, generator=gen) / O_GROUP_IN**0.5).to(torch.bfloat16)
     wo_b = torch.randint(-127, 128, (D, O_GROUPS * O_LORA), generator=gen, dtype=torch.int32).to(torch.int8)
     wo_b_scale = (torch.rand(D, generator=gen) * 0.001 + 0.0005).to(torch.float32)
     return o_packed, wo_a, wo_b, wo_b_scale
@@ -593,29 +620,47 @@ def build_tensor_specs():
     stack = lambda x: torch.stack([x] * N_RANKS, dim=0)
 
     specs = [
-        TensorSpec("o_packed", [N_RANKS, O_GROUPS * T, O_GROUP_IN], torch.bfloat16,
-                   init_value=lambda: stack(o_packed)),
+        TensorSpec(
+            "o_packed",
+            [N_RANKS, O_GROUPS * T, O_GROUP_IN],
+            torch.bfloat16,
+            init_value=lambda: stack(o_packed),
+        ),
     ]
     specs += [
         # Card r carries group r's proj_a rows and proj_b columns only.
-        TensorSpec("wo_a_shard", [N_RANKS, 1, O_LORA, O_GROUP_IN], torch.bfloat16,
-                   init_value=lambda: torch.stack([wo_a[r : r + 1] for r in range(N_RANKS)], dim=0),
-                   resident="stacked"),
-        TensorSpec("wo_b_shard", [N_RANKS, D, O_LORA], torch.int8,
-                   init_value=lambda: torch.stack(
-                       [wo_b[:, r * O_LORA : (r + 1) * O_LORA] for r in range(N_RANKS)], dim=0),
-                   resident="stacked"),
-        TensorSpec("wo_b_scale", [N_RANKS, D], torch.float32,
-                   init_value=lambda: stack(wo_b_scale)),
+        TensorSpec(
+            "wo_a_shard",
+            [N_RANKS, 1, O_LORA, O_GROUP_IN],
+            torch.bfloat16,
+            init_value=lambda: torch.stack([wo_a[r : r + 1] for r in range(N_RANKS)], dim=0),
+            resident="stacked",
+        ),
+        TensorSpec(
+            "wo_b_shard",
+            [N_RANKS, D, O_LORA],
+            torch.int8,
+            init_value=lambda: torch.stack(
+                [wo_b[:, r * O_LORA : (r + 1) * O_LORA] for r in range(N_RANKS)], dim=0
+            ),
+            resident="stacked",
+        ),
+        TensorSpec("wo_b_scale", [N_RANKS, D], torch.float32, init_value=lambda: stack(wo_b_scale)),
         # Resident so the stream costs bandwidth, not an upload, every round.
-        TensorSpec("l2_evict", [N_RANKS, EVICT_BLOCKS, EVICT_PER_BLOCK], torch.int8,
-                   init_value=lambda: torch.ones(N_RANKS, EVICT_BLOCKS, EVICT_PER_BLOCK,
-                                                 dtype=torch.int8),
-                   resident="stacked"),
-        TensorSpec("l2_evict_sink", [N_RANKS, EVICT_BLOCKS, EVICT_CHUNK], torch.int8,
-                   init_value=lambda: torch.zeros(N_RANKS, EVICT_BLOCKS, EVICT_CHUNK,
-                                                  dtype=torch.int8),
-                   resident="stacked"),
+        TensorSpec(
+            "l2_evict",
+            [N_RANKS, EVICT_BLOCKS, EVICT_PER_BLOCK],
+            torch.int8,
+            init_value=lambda: torch.ones(N_RANKS, EVICT_BLOCKS, EVICT_PER_BLOCK, dtype=torch.int8),
+            resident="stacked",
+        ),
+        TensorSpec(
+            "l2_evict_sink",
+            [N_RANKS, EVICT_BLOCKS, EVICT_CHUNK],
+            torch.int8,
+            init_value=lambda: torch.zeros(N_RANKS, EVICT_BLOCKS, EVICT_CHUNK, dtype=torch.int8),
+            resident="stacked",
+        ),
         TensorSpec("attn_out", [N_RANKS, T, D], torch.bfloat16, is_output=True),
     ]
     return specs
@@ -627,31 +672,48 @@ if __name__ == "__main__":
     from pypto.ir.distributed_compiled_program import DistributedConfig
 
     parser = argparse.ArgumentParser()
-    parser.add_argument("-p", "--platform", type=str, default="a2a3",
-                        choices=["a2a3", "a2a3sim", "a5", "a5sim"])
-    parser.add_argument("-d", "--device", type=str,
-                        default=",".join(str(i) for i in range(N_RANKS)),
-                        help=f"comma-separated device ids; need at least {N_RANKS}")
-    parser.add_argument("--enable-chip-swimlane", type=int, nargs="?", const=1, default=0,
-                        choices=(0, 1, 2, 4))
+    parser.add_argument(
+        "-p", "--platform", type=str, default="a2a3", choices=["a2a3", "a2a3sim", "a5", "a5sim"]
+    )
+    parser.add_argument(
+        "-d",
+        "--device",
+        type=str,
+        default=",".join(str(i) for i in range(N_RANKS)),
+        help=f"comma-separated device ids; need at least {N_RANKS}",
+    )
+    parser.add_argument(
+        "--enable-chip-swimlane", type=int, nargs="?", const=1, default=0, choices=(0, 1, 2, 4)
+    )
     parser.add_argument("--enable-pmu", nargs="?", const=2, default=0, type=int, choices=[0, 1, 2, 4])
     parser.add_argument("--golden-data", type=str, default=None)
     parser.add_argument("--save-data", action="store_true", default=False)
-    parser.add_argument("--dequant-n-tile", type=int, default=DEQUANT_N_TILE,
-                        help="Column tile for the TP dequant grid; D // this = block count.")
-    parser.add_argument("--put-chunk-cols", type=int, default=PUT_CHUNK_COLS,
-                        help="Column chunk for the publish put; smaller chunks with "
-                             "--put-pipeline double-buffer the staging tile.")
+    parser.add_argument(
+        "--put-chunk-cols",
+        type=int,
+        default=PUT_CHUNK_COLS,
+        help="Column chunk for the publish put; smaller chunks with "
+        "--put-pipeline double-buffer the staging tile.",
+    )
     parser.add_argument("--put-pipeline", action="store_true", default=False)
-    parser.add_argument("--fuse-dequant", action="store_true", default=False,
-                        help="BROKEN, repro only: ride the dequant on proj_b's cube task "
-                             "via pl.aiv_shard. Returns wrong numbers -- see FUSE_DEQUANT.")
-    parser.add_argument("--quant-chunks", type=int, default=QUANT_CHUNKS,
-                        help="O_LORA column chunks the quant amax+apply fans out over.")
-    parser.add_argument("--evict-l2", action="store_true", default=False,
-                        help=f"Stream {EVICT_MB} MB before the chain so the projection reads weights cold.")
-    parser.add_argument("--pre-sync", action="store_true", default=False,
-                        help="Emit a leading barrier so dispatch skew is paid before the measured chain.")
+    parser.add_argument(
+        "--quant-chunks",
+        type=int,
+        default=QUANT_CHUNKS,
+        help="O_LORA column chunks the quantize fans out over; each recomputes the amax.",
+    )
+    parser.add_argument(
+        "--evict-l2",
+        action="store_true",
+        default=False,
+        help=f"Stream {EVICT_MB} MB before the chain so the projection reads weights cold.",
+    )
+    parser.add_argument(
+        "--pre-sync",
+        action="store_true",
+        default=False,
+        help="Emit a leading barrier so dispatch skew is paid before the measured chain.",
+    )
     parser.add_argument("--dump-passes", action="store_true", default=False)
     parser.add_argument("--compile-only", action="store_true", default=False)
     args = parser.parse_args()
