@@ -56,7 +56,7 @@ REDUCE_LANE_ROWS = N_RANKS * T_PAD
 REDUCE_WINDOW_ROWS = 2 * REDUCE_LANE_ROWS
 
 # tiling
-REDUCE_D_TILE = 512
+REDUCE_D_TILE = 512  # D // this = 8 reduce blocks, each summing [T, 512] tiles
 
 
 @pl.jit.inline
@@ -241,16 +241,17 @@ def all_reduce_ffn(
                 cmp=pld.WaitCmp.Ge,
             )
 
-    with pl.spmd(T * (D // REDUCE_D_TILE), name_hint="moe_reduce", allow_early_resolve=True, deps=[barrier_tid]) as _reduce_tid:
-        block = pl.tile.get_block_idx()
-        row = block // (D // REDUCE_D_TILE)
-        d0 = (block % (D // REDUCE_D_TILE)) * REDUCE_D_TILE
-        acc = pl.load(reduce_window, [lane_base + row, d0], [1, REDUCE_D_TILE])
+    # A rank's T rows are contiguous inside its band, so one block sums whole
+    # [T, REDUCE_D_TILE] tiles -- eight of them, one per rank -- instead of
+    # walking the band a single row at a time.
+    with pl.spmd(D // REDUCE_D_TILE, name_hint="moe_reduce", allow_early_resolve=True, deps=[barrier_tid]) as _reduce_tid:
+        d0 = pl.tile.get_block_idx() * REDUCE_D_TILE
+        acc = pl.load(reduce_window, [lane_base, d0], [T, REDUCE_D_TILE])
         for src_rank in pl.range(1, N_RANKS):
-            src_row = lane_base + src_rank * T_PAD + row
-            acc = pl.add(acc, pl.load(reduce_window, [src_row, d0], [1, REDUCE_D_TILE]))
+            src_row = lane_base + src_rank * T_PAD
+            acc = pl.add(acc, pl.load(reduce_window, [src_row, d0], [T, REDUCE_D_TILE]))
         reduced = pl.cast(acc, target_type=pl.BF16, mode="rint")
-        pl.store(reduced, [row, d0], ffn_out)
+        pl.store(reduced, [0, d0], ffn_out)
 
 
 @pl.jit.inline
@@ -259,12 +260,10 @@ def reduce_ffn_tp1(
     ffn_out: pl.Tensor[[T, D], pl.BF16],
 ):
     """Single-rank path: the partial is already the full sum."""
-    with pl.spmd(T * (D // REDUCE_D_TILE), name_hint="moe_reduce", allow_early_resolve=True):
-        block = pl.tile.get_block_idx()
-        row = block // (D // REDUCE_D_TILE)
-        d0 = (block % (D // REDUCE_D_TILE)) * REDUCE_D_TILE
-        partial = ffn_partial[row : row + 1, d0 : d0 + REDUCE_D_TILE]
-        ffn_out[row : row + 1, d0 : d0 + REDUCE_D_TILE] = pl.cast(partial, target_type=pl.BF16, mode="rint")
+    with pl.spmd(D // REDUCE_D_TILE, name_hint="moe_reduce", allow_early_resolve=True):
+        d0 = pl.tile.get_block_idx() * REDUCE_D_TILE
+        partial = ffn_partial[0:T, d0 : d0 + REDUCE_D_TILE]
+        ffn_out[0:T, d0 : d0 + REDUCE_D_TILE] = pl.cast(partial, target_type=pl.BF16, mode="rint")
 
 
 @pl.jit.inline(auto_scope=False)
