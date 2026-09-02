@@ -494,7 +494,8 @@ def o_proj_reduce_scatter(
         own_base = owner * local_t
         own_a_fp32 = pl.create_tensor([LOCAL_T_PAD, LOCAL_O_WIDTH], dtype=pl.FP32)
         own_a_i8 = pl.create_tensor([LOCAL_T_PAD, LOCAL_O_WIDTH], dtype=pl.INT8)
-        own_scale = pl.create_tensor([LOCAL_O_GROUPS, LOCAL_T_PAD], dtype=pl.FP32)
+        # The quant scale rides the own_a_i8 -> tp_o_b -> dequant chain.
+        own_scale = pl.create_tensor([LOCAL_O_GROUPS, LOCAL_T_PAD], dtype=pl.FP32, manual_dep=True)
         own_b_i32 = pl.create_tensor([LOCAL_T_PAD, LOCAL_O_GROUPS * D], dtype=pl.INT32)
 
         for local_group in pl.parallel(LOCAL_O_GROUPS):

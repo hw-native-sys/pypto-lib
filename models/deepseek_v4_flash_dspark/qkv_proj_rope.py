@@ -301,7 +301,8 @@ def q_proj_rope(
             qr_view = pl.reshape(qr, [t_dim, Q_LORA])
             qr_scale_view = pl.reshape(qr_scale, [t_dim, 1])
             qr_i8_matmul = pl.create_tensor([qproj_t_matmul, Q_LORA], dtype=pl.INT8)
-            qr_scale_pad_store = pl.create_tensor([qproj_t_matmul, 1], dtype=pl.FP32)
+            # The quant scale rides the qr_i8 -> qproj_matmul -> dequant chain.
+            qr_scale_pad_store = pl.create_tensor([qproj_t_matmul, 1], dtype=pl.FP32, manual_dep=True)
 
             # Two passes per block: pass 1 computes amax; pass 2 recomputes norm and quantizes.
             qr_token_tiles = (tile_rows + T_TILE - 1) // T_TILE

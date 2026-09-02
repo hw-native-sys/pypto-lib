@@ -176,7 +176,8 @@ def decode_swa(
     kv_dim = pl.tensor.dim(swa_slot_mapping, 0)
     bias_blocks = t_dim // BIAS_T_TILE
     x_mixed = pl.create_tensor([t_dim, D], dtype=pl.BF16)
-    post_t = pl.create_tensor([t_dim, HC_MULT], dtype=pl.FP32)
+    # split_pre_post -> hc_post is already covered by x_mixed -> attn_out.
+    post_t = pl.create_tensor([t_dim, HC_MULT], dtype=pl.FP32, manual_dep=True)
     comb_t = pl.create_tensor([t_dim, HC_MULT * HC_MULT], dtype=pl.FP32)
     hc_pre(x_hc, hc_attn_fn, hc_attn_scale, hc_attn_base, x_mixed, post_t, comb_t)
 
@@ -1122,6 +1123,7 @@ if __name__ == "__main__":
     parser.add_argument("--golden-data", type=str, default=None)
     parser.add_argument("--save-data", action="store_true", default=False)
     parser.add_argument("--enable-chip-swimlane", type=int, choices=(0, 1, 2, 4), default=0)
+    parser.add_argument("--enable-dep-gen", action="store_true", default=False)
     parser.add_argument("--compile-only", action="store_true", default=False)
     parser.add_argument("--dump-passes", action="store_true", default=False)
     args = parser.parse_args()
@@ -1168,6 +1170,7 @@ if __name__ == "__main__":
                     platform=args.platform,
                     device_id=device_ids[0],
                     enable_chip_swimlane=args.enable_chip_swimlane,
+                    enable_dep_gen=args.enable_dep_gen,
                 ),
                 rtol=1e-2,
                 atol=1e-2,
@@ -1199,6 +1202,7 @@ if __name__ == "__main__":
                 runtime_cfg=dict(
                     platform=args.platform,
                     enable_chip_swimlane=args.enable_chip_swimlane,
+                    enable_dep_gen=args.enable_dep_gen,
                 ),
                 rtol=1e-2,
                 atol=1e-2,
