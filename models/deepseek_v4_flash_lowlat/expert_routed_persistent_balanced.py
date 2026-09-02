@@ -25,18 +25,22 @@ The trace says why: task instances 320 -> 72, the critical path 3 hops -> 0, and
 scheduler-injected latency 66.7 -> 2.4 us, which flips the kernel from
 SCHEDULER-BOUND to COMPUTE-BOUND.
 
-Why the AIV split is written by hand. The auto split emits lane 0 doing the work
-and lane 1 *replaying* the body with every tile at a static ``valid_shape=0``,
-and an INT8 cast's codegen bridges that 0 into a ``(0, 0)`` view pto-isa cannot
-compile -- so the fused form does not build at all under the auto split, for any
-cast spelling. A data-parallel ``pl.split_aiv`` region has no replay lane, so the
-requant compiles. Cube ops therefore sit outside every region, each vector phase
-is its own ``UP_DOWN`` region, and the two crossings are named: ``pl.aiv_shard``
-for cube->vector, ``pl.aic_gather`` for vector->cube. ``UP_DOWN`` is legal only
-because the per-row ``row_max`` amax stays within a lane.
+Why the AIV split is written by hand. It began as a workaround: under PTOAS
+v0.60 plus pypto's level-3 explicit tcvt tmp, the auto split emitted lane 0 doing
+the work and lane 1 *replaying* the body with every tile at a static
+``valid_shape=0``, and an INT8 cast's codegen bridged that 0 into a ``(0, 0)``
+view pto-isa could not compile -- so the fused form did not build at all, for any
+cast spelling. That is no longer true: pypto reverted the level-3 TMP coupling and
+pinned PTOAS back to v0.57, and the reduced case now compiles. The hand split
+stays because it is also the faster form measured here, not because it is
+required; an auto-split A/B on the current pin has not been run. Cube ops sit
+outside every region, each vector phase is its own ``UP_DOWN`` region, and the two
+crossings are named: ``pl.aiv_shard`` for cube->vector, ``pl.aic_gather`` for
+vector->cube. ``UP_DOWN`` is legal only because the per-row ``row_max`` amax stays
+within a lane.
 
 The load-balancing pre-task. ``exp_balance_plan`` scans the slot table once on
-one core and writes the COMPACTED list of active slots, padded to ``N_SLOTS``
+one core and writes the COMPACTED list of active slots, padded to ``N_SLOTS_B``
 with rows = 0 so the pool bound stays static -- a runtime bound would have to be
 ``pl.read`` at orchestration level, which parks the whole task graph behind the
 pre-task. Each core then gets ceil/floor(n_active / 24) expert chains instead of
@@ -56,6 +60,13 @@ routing ever emit a sparse slot table, the unbalanced form loses up to 26 %
 (measured at n_active 16-24 on a scattered fixture) and this one does not.
 Re-measure with ``bench_activation.py`` if ``route_group``'s packing changes.
 
+The shared expert is not special. It runs the same INT8 SwiGLU FFN over the same
+intermediate slice, on tokens every rank already holds, and its result lands in
+the same TP partial -- so it is expert ``SHARED_EID`` of an ``N_BANK`` weight
+bank occupying slot ``SH_SLOT``, with every row at weight 1.0. That deletes
+``expert_shared``'s whole task chain and hands its ~50 us of weight streaming to
+the pool, which has slack (round 2 runs ~7 of 24 cores).
+
 The first K step of each matmul is peeled rather than seeded from a
 ``pl.create_tensor``: the accumulator has to stay a pure matmul result so it
 lives in Acc, which is the only memory the C->V boundary accepts.
@@ -66,7 +77,7 @@ import pypto.language as pl
 
 from config import (INT8_SCALE_MAX, INT8_AMAX_EPS)
 from expert_routed import (
-    D, IDX_PAD, MOE_INTER, N_EXPERTS, N_SLOTS, RECV_MAX, RECV_TILE, SWIGLU_LIMIT,
+    D, IDX_PAD, MOE_INTER, N_BANK, N_SLOTS_B, RECV_MAX, RECV_TILE, SWIGLU_LIMIT,
     build_tensor_specs, golden_expert_routed,
 )
 
@@ -100,47 +111,47 @@ FUSED_Y_TILE = max(64, min(512, 131072 // MOE_INTER))
 
 @pl.jit.inline(auto_scope=False)
 def expert_routed_persistent_balanced(
-    recv_x: pl.Tensor[[N_SLOTS, RECV_MAX, D], pl.INT8],
-    recv_scale_dq: pl.Tensor[[N_SLOTS, RECV_MAX], pl.FP32],
-    recv_weights: pl.Tensor[[N_SLOTS, RECV_MAX], pl.FP32],
-    recv_expert_count: pl.Tensor[[N_SLOTS, IDX_PAD], pl.INT32],
-    slot_expert: pl.Tensor[[N_SLOTS, IDX_PAD], pl.INT32],
-    routed_w1: pl.Tensor[[N_EXPERTS, MOE_INTER, D], pl.INT8],
-    routed_w1_scale: pl.Tensor[[N_EXPERTS, MOE_INTER], pl.FP32],
-    routed_w3: pl.Tensor[[N_EXPERTS, MOE_INTER, D], pl.INT8],
-    routed_w3_scale: pl.Tensor[[N_EXPERTS, MOE_INTER], pl.FP32],
-    routed_w2: pl.Tensor[[N_EXPERTS, D, MOE_INTER], pl.INT8],
-    routed_w2_scale: pl.Tensor[[N_EXPERTS, D], pl.FP32],
-    recv_y: pl.Tensor[[N_SLOTS, RECV_MAX, D], pl.BF16],
+    recv_x: pl.Tensor[[N_SLOTS_B, RECV_MAX, D], pl.INT8],
+    recv_scale_dq: pl.Tensor[[N_SLOTS_B, RECV_MAX], pl.FP32],
+    recv_weights: pl.Tensor[[N_SLOTS_B, RECV_MAX], pl.FP32],
+    recv_expert_count: pl.Tensor[[N_SLOTS_B, IDX_PAD], pl.INT32],
+    slot_expert: pl.Tensor[[N_SLOTS_B, IDX_PAD], pl.INT32],
+    routed_w1: pl.Tensor[[N_BANK, MOE_INTER, D], pl.INT8],
+    routed_w1_scale: pl.Tensor[[N_BANK, MOE_INTER], pl.FP32],
+    routed_w3: pl.Tensor[[N_BANK, MOE_INTER, D], pl.INT8],
+    routed_w3_scale: pl.Tensor[[N_BANK, MOE_INTER], pl.FP32],
+    routed_w2: pl.Tensor[[N_BANK, D, MOE_INTER], pl.INT8],
+    routed_w2_scale: pl.Tensor[[N_BANK, D], pl.FP32],
+    recv_y: pl.Tensor[[N_SLOTS_B, RECV_MAX, D], pl.BF16],
 ):
-    recv_x_flat = pl.reshape(recv_x, [N_SLOTS * RECV_MAX, D])
-    recv_y_flat = pl.reshape(recv_y, [N_SLOTS * RECV_MAX, D])
+    recv_x_flat = pl.reshape(recv_x, [N_SLOTS_B * RECV_MAX, D])
+    recv_y_flat = pl.reshape(recv_y, [N_SLOTS_B * RECV_MAX, D])
 
     # Fold the expert axis into the row axis so every matmul operand is 2-D and
     # the accumulator comes back 2-D (no [1, RECV_TILE, TILE] reshape unwrap).
-    w1_2d = pl.reshape(routed_w1, [N_EXPERTS * MOE_INTER, D])
-    w3_2d = pl.reshape(routed_w3, [N_EXPERTS * MOE_INTER, D])
-    w2_2d = pl.reshape(routed_w2, [N_EXPERTS * D, MOE_INTER])
+    w1_2d = pl.reshape(routed_w1, [N_BANK * MOE_INTER, D])
+    w3_2d = pl.reshape(routed_w3, [N_BANK * MOE_INTER, D])
+    w2_2d = pl.reshape(routed_w2, [N_BANK * D, MOE_INTER])
 
     with pl.scope():
         # One core owns the scan: the compaction is a serial prefix, and 48
         # scalar reads cost less than the barrier a parallel scan would need.
-        # The list is PADDED to N_SLOTS rather than bounded by a live count: a
+        # The list is PADDED to N_SLOTS_B rather than bounded by a live count: a
         # runtime pool bound would have to be pl.read at orchestration level,
         # which parks the whole task graph behind the pre-task's completion.
         # Padding entries carry rows = 0, so they land on the same zero-trip
         # skip an empty slot already takes, and the bound stays static.
-        work_slot = pl.create_tensor([N_SLOTS], dtype=pl.INT32)
-        work_rows = pl.create_tensor([N_SLOTS], dtype=pl.INT32)
+        work_slot = pl.create_tensor([N_SLOTS_B], dtype=pl.INT32)
+        work_rows = pl.create_tensor([N_SLOTS_B], dtype=pl.INT32)
 
         with pl.spmd(1, name_hint="exp_balance_plan", allow_early_resolve=True) as plan_tid:
             plan_core = pl.tile.get_block_idx()
             zero_i32 = pl.cast(0, pl.INT32)
-            for pad in pl.range(plan_core, N_SLOTS):
+            for pad in pl.range(plan_core, N_SLOTS_B):
                 pl.write(work_slot, [pad], zero_i32)
                 pl.write(work_rows, [pad], zero_i32)
             n_live = pl.cast(0, pl.INDEX)
-            for scan in pl.range(plan_core, N_SLOTS):
+            for scan in pl.range(plan_core, N_SLOTS_B):
                 scan_rows = pl.read(recv_expert_count, [scan, 0])
                 if scan_rows > 0:
                     pl.write(work_slot, [n_live], pl.cast(scan, pl.INT32))
@@ -153,7 +164,7 @@ def expert_routed_persistent_balanced(
         ) as _routed_tid:  # inline form requires the TaskId capture
             core = pl.tile.get_block_idx()  # 0 .. NUM_CORES-1
 
-            for w in pl.range(core, N_SLOTS, NUM_CORES):
+            for w in pl.range(core, N_SLOTS_B, NUM_CORES):
                 s = pl.cast(pl.read(work_slot, [w]), pl.INDEX)
                 eid = pl.cast(pl.read(slot_expert, [s, 0]), pl.INDEX)
                 n_rows = pl.read(work_rows, [w])
@@ -271,18 +282,18 @@ def expert_routed_persistent_balanced(
 
 @pl.jit
 def expert_routed_persistent_balanced_test(
-    recv_x: pl.Tensor[[N_SLOTS, RECV_MAX, D], pl.INT8],
-    recv_scale_dq: pl.Tensor[[N_SLOTS, RECV_MAX], pl.FP32],
-    recv_weights: pl.Tensor[[N_SLOTS, RECV_MAX], pl.FP32],
-    recv_expert_count: pl.Tensor[[N_SLOTS, IDX_PAD], pl.INT32],
-    slot_expert: pl.Tensor[[N_SLOTS, IDX_PAD], pl.INT32],
-    routed_w1: pl.Tensor[[N_EXPERTS, MOE_INTER, D], pl.INT8],
-    routed_w1_scale: pl.Tensor[[N_EXPERTS, MOE_INTER], pl.FP32],
-    routed_w3: pl.Tensor[[N_EXPERTS, MOE_INTER, D], pl.INT8],
-    routed_w3_scale: pl.Tensor[[N_EXPERTS, MOE_INTER], pl.FP32],
-    routed_w2: pl.Tensor[[N_EXPERTS, D, MOE_INTER], pl.INT8],
-    routed_w2_scale: pl.Tensor[[N_EXPERTS, D], pl.FP32],
-    recv_y: pl.Out[pl.Tensor[[N_SLOTS, RECV_MAX, D], pl.BF16]],
+    recv_x: pl.Tensor[[N_SLOTS_B, RECV_MAX, D], pl.INT8],
+    recv_scale_dq: pl.Tensor[[N_SLOTS_B, RECV_MAX], pl.FP32],
+    recv_weights: pl.Tensor[[N_SLOTS_B, RECV_MAX], pl.FP32],
+    recv_expert_count: pl.Tensor[[N_SLOTS_B, IDX_PAD], pl.INT32],
+    slot_expert: pl.Tensor[[N_SLOTS_B, IDX_PAD], pl.INT32],
+    routed_w1: pl.Tensor[[N_BANK, MOE_INTER, D], pl.INT8],
+    routed_w1_scale: pl.Tensor[[N_BANK, MOE_INTER], pl.FP32],
+    routed_w3: pl.Tensor[[N_BANK, MOE_INTER, D], pl.INT8],
+    routed_w3_scale: pl.Tensor[[N_BANK, MOE_INTER], pl.FP32],
+    routed_w2: pl.Tensor[[N_BANK, D, MOE_INTER], pl.INT8],
+    routed_w2_scale: pl.Tensor[[N_BANK, D], pl.FP32],
+    recv_y: pl.Out[pl.Tensor[[N_SLOTS_B, RECV_MAX, D], pl.BF16]],
 ):
     expert_routed_persistent_balanced(
         recv_x, recv_scale_dq, recv_weights, recv_expert_count, slot_expert,
@@ -315,7 +326,7 @@ if __name__ == "__main__":
     result = run_jit(
         compile_only=args.compile_only,
         fn=expert_routed_persistent_balanced_test,
-        specs=build_tensor_specs(),
+        specs=build_tensor_specs(merged=True),
         golden_fn=golden_expert_routed,
         golden_data=args.golden_data,
         save_data=args.save_data,

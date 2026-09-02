@@ -37,6 +37,21 @@ N_SLOTS = min(N_EXPERTS, T * TOPK)
 RECV_MAX = RECV_TILE
 IDX_PAD = 8  # INT32 tile width: a vector fill needs a 32-byte row
 
+# The shared expert is just another expert: every rank sees the same tokens, it
+# runs the same INT8 SwiGLU FFN over the same intermediate slice, and its output
+# is summed into the same TP partial. So it becomes expert ``SHARED_EID`` of an
+# extended weight bank, routed to one extra slot past the routing table's last
+# with every row weighted 1.0 -- and ``expert_shared.py``'s separate task chain
+# disappears. Routing can fill at most ``T * TOPK`` slots, so ``SH_SLOT`` is
+# never claimed by a routed expert.
+SHARED_EID = N_EXPERTS
+N_BANK = N_EXPERTS + 1
+SH_SLOT = N_SLOTS
+N_SLOTS_B = N_SLOTS + 1
+# The shared slot carries every active token in ONE row tile.
+assert T <= RECV_MAX, \
+    f"the shared-expert slot holds all {T} tokens in one tile of {RECV_MAX} rows"
+
 # tiling
 K_TILE = 512
 INTER_K = min(512, MOE_INTER // 2)  # >= 2 K steps: a single-trip accumulate loop breaks L0C reuse
@@ -330,16 +345,19 @@ def golden_expert_routed(tensors):
         return w_i8.to(torch.float32) * w_scale.unsqueeze(-1)
 
     recv_x_i8 = tensors["recv_x"]  # INT8, pre-quantized in dispatch
-    recv_scale_dq = tensors["recv_scale_dq"].float()  # [N_SLOTS, RECV_MAX]
-    recv_weights = tensors["recv_weights"].float()  # [N_SLOTS, RECV_MAX]
-    recv_expert_count = tensors["recv_expert_count"]  # [N_SLOTS, IDX_PAD] int32
-    slot_expert = tensors["slot_expert"]  # [N_SLOTS, IDX_PAD] int32
+    recv_scale_dq = tensors["recv_scale_dq"].float()  # [n_slots, RECV_MAX]
+    recv_weights = tensors["recv_weights"].float()  # [n_slots, RECV_MAX]
+    recv_expert_count = tensors["recv_expert_count"]  # [n_slots, IDX_PAD] int32
+    slot_expert = tensors["slot_expert"]  # [n_slots, IDX_PAD] int32
+    # Read the slot count off the fixture rather than the module constant: the
+    # merged-bank form passes N_SLOTS_B slots through this same reference.
+    n_slots = recv_expert_count.shape[0]
     w1 = dequant_w(tensors["routed_w1"], tensors["routed_w1_scale"].float())
     w3 = dequant_w(tensors["routed_w3"], tensors["routed_w3_scale"].float())
     w2 = dequant_w(tensors["routed_w2"], tensors["routed_w2_scale"].float())
 
-    recv_y = torch.zeros(N_SLOTS, RECV_MAX, D)
-    for slot in range(N_SLOTS):
+    recv_y = torch.zeros(n_slots, RECV_MAX, D)
+    for slot in range(n_slots):
         n_rows = int(recv_expert_count[slot, 0].item())
         if n_rows == 0:
             continue
@@ -415,7 +433,15 @@ def gen_routed_weight(shape, dequant_std):
     return w_i8.reshape(*shape), scale.reshape(*lead, out)
 
 
-def build_tensor_specs():
+def build_tensor_specs(merged=False):
+    """Fixture for the routed expert.
+
+    ``merged=True`` builds the shared-expert-merged form: ``N_SLOTS_B`` slots
+    whose last one carries every token at weight 1.0, and an ``N_BANK`` bank
+    whose last expert is a shared-expert weight set (a different quant grid --
+    MXFP8, not MXFP4 -- so the merge does not silently change the numerics the
+    shared path is validated against).
+    """
     from utils import int8_quant_per_row
     import torch
     from golden import TensorSpec
@@ -423,23 +449,31 @@ def build_tensor_specs():
     # Across-layer-mean dequant std (typical layer) of the real DeepSeek-V4-Flash MXFP4
     # routed experts; gen_routed_weight simulates the FP4 grid (see its docstring).
     ROUTED_DEQUANT_STD = {"w1": 2.47e-2, "w2": 2.44e-2, "w3": 2.46e-2}
+    SHARED_DEQUANT_STD = {"w1": 2.31e-2, "w2": 2.39e-2, "w3": 2.30e-2}
+
+    n_slots = N_SLOTS_B if merged else N_SLOTS
+    n_bank = N_BANK if merged else N_EXPERTS
 
     # One slot per active expert: T * TOPK routed pairs spread over N_SLOTS slots,
     # each slot holding at most T rows. Slot experts are distinct global ids.
     total = T * TOPK
     counts = torch.bincount(torch.randint(0, N_SLOTS, (total,)), minlength=N_SLOTS)
     counts = counts.clamp(max=T).to(torch.int32)
-    counts_2d = torch.zeros(N_SLOTS, IDX_PAD, dtype=torch.int32)
-    counts_2d[:, 0] = counts
     slot_expert_1d = torch.randperm(N_EXPERTS)[:N_SLOTS].to(torch.int32)
-    slot_expert_2d = torch.zeros(N_SLOTS, IDX_PAD, dtype=torch.int32)
+    if merged:
+        # The shared slot holds every token, at expert id SHARED_EID.
+        counts = torch.cat([counts, torch.tensor([T], dtype=torch.int32)])
+        slot_expert_1d = torch.cat([slot_expert_1d, torch.tensor([SHARED_EID], dtype=torch.int32)])
+    counts_2d = torch.zeros(n_slots, IDX_PAD, dtype=torch.int32)
+    counts_2d[:, 0] = counts
+    slot_expert_2d = torch.zeros(n_slots, IDX_PAD, dtype=torch.int32)
     slot_expert_2d[:, 0] = slot_expert_1d
 
     # Build a consistent INT8 recv_x + per-row dequant scale (dispatch is
     # responsible for per-token quantization). Invalid tail rows go to INT8 0
     # with scale 0 so dequant produces 0.
-    x_bf16 = torch.randn(N_SLOTS, RECV_MAX, D, dtype=torch.bfloat16)
-    valid_mask_3d = torch.arange(RECV_MAX).reshape(1, RECV_MAX, 1) < counts.reshape(N_SLOTS, 1, 1)
+    x_bf16 = torch.randn(n_slots, RECV_MAX, D, dtype=torch.bfloat16)
+    valid_mask_3d = torch.arange(RECV_MAX).reshape(1, RECV_MAX, 1) < counts.reshape(n_slots, 1, 1)
     recv_x_i8_pre, recv_scale_dq_pre = int8_quant_per_row(x_bf16)
     recv_x_i8_pre = torch.where(valid_mask_3d, recv_x_i8_pre, torch.zeros_like(recv_x_i8_pre))
     valid_mask_2d = valid_mask_3d.squeeze(-1)
@@ -463,39 +497,49 @@ def build_tensor_specs():
 
     # Per-row routing weight in [0, 1); tail rows (slot >= count) stay 0 so
     # they don't perturb the BF16 round-trip in expert_routed.
-    recv_weights_pre = torch.rand(N_SLOTS, RECV_MAX, dtype=torch.float32)
+    recv_weights_pre = torch.rand(n_slots, RECV_MAX, dtype=torch.float32)
     recv_weights_pre = torch.where(valid_mask_2d, recv_weights_pre, torch.zeros_like(recv_weights_pre))
+    if merged:
+        # The shared expert is not gated: its rows come in at weight 1.0.
+        recv_weights_pre[SH_SLOT, :] = torch.where(
+            valid_mask_2d[SH_SLOT, :], torch.ones(RECV_MAX), torch.zeros(RECV_MAX))
 
     def init_recv_weights():
         return recv_weights_pre
 
     # Only the slot experts are ever read, so synthesize N_SLOTS weight sets and
     # scatter them into the full expert bank; the rest stay zero.
-    def scatter_bank(shape_tail, dequant_std):
+    def scatter_bank(shape_tail, dequant_std, shared_dequant_std, chan_cv):
+        from expert_shared import gen_shared_weight
         w_i8, w_s = gen_routed_weight((N_SLOTS, *shape_tail), dequant_std)
-        bank_i8 = torch.zeros(N_EXPERTS, *shape_tail, dtype=torch.int8)
-        bank_s = torch.zeros(N_EXPERTS, shape_tail[0], dtype=torch.float32)
-        bank_i8[slot_expert_1d.long()] = w_i8
-        bank_s[slot_expert_1d.long()] = w_s
+        bank_i8 = torch.zeros(n_bank, *shape_tail, dtype=torch.int8)
+        bank_s = torch.zeros(n_bank, shape_tail[0], dtype=torch.float32)
+        routed_eids = slot_expert_1d[:N_SLOTS].long()
+        bank_i8[routed_eids] = w_i8
+        bank_s[routed_eids] = w_s
+        if merged:
+            sh_i8, sh_s = gen_shared_weight(shape_tail, shared_dequant_std, chan_cv=chan_cv)
+            bank_i8[SHARED_EID] = sh_i8
+            bank_s[SHARED_EID] = sh_s
         return bank_i8, bank_s
 
-    w1_i8, w1_s = scatter_bank((MOE_INTER, D), ROUTED_DEQUANT_STD["w1"])
-    w3_i8, w3_s = scatter_bank((MOE_INTER, D), ROUTED_DEQUANT_STD["w3"])
-    w2_i8, w2_s = scatter_bank((D, MOE_INTER), ROUTED_DEQUANT_STD["w2"])
+    w1_i8, w1_s = scatter_bank((MOE_INTER, D), ROUTED_DEQUANT_STD["w1"], SHARED_DEQUANT_STD["w1"], 0.50)
+    w3_i8, w3_s = scatter_bank((MOE_INTER, D), ROUTED_DEQUANT_STD["w3"], SHARED_DEQUANT_STD["w3"], 0.50)
+    w2_i8, w2_s = scatter_bank((D, MOE_INTER), ROUTED_DEQUANT_STD["w2"], SHARED_DEQUANT_STD["w2"], 0.33)
 
     return [
-        TensorSpec("recv_x", [N_SLOTS, RECV_MAX, D], torch.int8, init_value=init_recv_x),
-        TensorSpec("recv_scale_dq", [N_SLOTS, RECV_MAX], torch.float32, init_value=init_recv_scale_dq),
-        TensorSpec("recv_weights", [N_SLOTS, RECV_MAX], torch.float32, init_value=init_recv_weights),
-        TensorSpec("recv_expert_count", [N_SLOTS, IDX_PAD], torch.int32, init_value=init_recv_expert_count),
-        TensorSpec("slot_expert", [N_SLOTS, IDX_PAD], torch.int32, init_value=init_slot_expert),
-        TensorSpec("routed_w1", [N_EXPERTS, MOE_INTER, D], torch.int8, init_value=lambda: w1_i8),
-        TensorSpec("routed_w1_scale", [N_EXPERTS, MOE_INTER], torch.float32, init_value=lambda: w1_s),
-        TensorSpec("routed_w3", [N_EXPERTS, MOE_INTER, D], torch.int8, init_value=lambda: w3_i8),
-        TensorSpec("routed_w3_scale", [N_EXPERTS, MOE_INTER], torch.float32, init_value=lambda: w3_s),
-        TensorSpec("routed_w2", [N_EXPERTS, D, MOE_INTER], torch.int8, init_value=lambda: w2_i8),
-        TensorSpec("routed_w2_scale", [N_EXPERTS, D], torch.float32, init_value=lambda: w2_s),
-        TensorSpec("recv_y", [N_SLOTS, RECV_MAX, D], torch.bfloat16, is_output=True),
+        TensorSpec("recv_x", [n_slots, RECV_MAX, D], torch.int8, init_value=init_recv_x),
+        TensorSpec("recv_scale_dq", [n_slots, RECV_MAX], torch.float32, init_value=init_recv_scale_dq),
+        TensorSpec("recv_weights", [n_slots, RECV_MAX], torch.float32, init_value=init_recv_weights),
+        TensorSpec("recv_expert_count", [n_slots, IDX_PAD], torch.int32, init_value=init_recv_expert_count),
+        TensorSpec("slot_expert", [n_slots, IDX_PAD], torch.int32, init_value=init_slot_expert),
+        TensorSpec("routed_w1", [n_bank, MOE_INTER, D], torch.int8, init_value=lambda: w1_i8),
+        TensorSpec("routed_w1_scale", [n_bank, MOE_INTER], torch.float32, init_value=lambda: w1_s),
+        TensorSpec("routed_w3", [n_bank, MOE_INTER, D], torch.int8, init_value=lambda: w3_i8),
+        TensorSpec("routed_w3_scale", [n_bank, MOE_INTER], torch.float32, init_value=lambda: w3_s),
+        TensorSpec("routed_w2", [n_bank, D, MOE_INTER], torch.int8, init_value=lambda: w2_i8),
+        TensorSpec("routed_w2_scale", [n_bank, D], torch.float32, init_value=lambda: w2_s),
+        TensorSpec("recv_y", [n_slots, RECV_MAX, D], torch.bfloat16, is_output=True),
     ]
 
 

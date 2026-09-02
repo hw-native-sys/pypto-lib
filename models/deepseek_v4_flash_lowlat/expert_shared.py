@@ -8,9 +8,13 @@
 # -----------------------------------------------------------------------------------------------------------
 """DeepSeek-V4 MoE shared expert compute over a TP slice of the intermediate dim.
 
+NO LONGER ON THE MODEL PATH. ``moe.py`` now runs the shared expert as expert
+``SHARED_EID`` of the routed weight bank, in the routed expert's own persistent
+kernel -- same FFN, same intermediate slice, same TP partial, one fewer task
+chain. This file stays as the standalone reference for that FFN and as the home
+of ``gen_shared_weight`` (the MXFP8 grid the merged bank's last entry still uses).
+
 Split out of ``expert_routed.py``: only the shared-expert FFN path lives here.
-The routed experts are computed by ``expert_routed.py``; both kernels are
-composed inside ``moe.py``.
 
 The shared expert reuses the per-token INT8 quant already produced by ``gate``
 (``x_norm_i8`` + ``x_norm_scale``). ``sh`` is a partial sum over this rank's

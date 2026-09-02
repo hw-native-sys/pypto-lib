@@ -98,6 +98,7 @@ from decode_prepare import (
 from tp_embedding import VOCAB_PER_TP as EMBED_VOCAB_PER_TP, tp_lookup_embedding
 from moe import (
     MOE_INTER,
+    N_BANK,
     N_EXPERTS,
     N_RANKS,
     REDUCE_WINDOW_ROWS,
@@ -138,7 +139,11 @@ LM_HEAD_COMM_EPOCH = 1
 assert MODEL_NUM_LAYERS == 43, "DeepSeek-V4 Flash hidden layer count changed"
 
 # Routed expert weights are banked, not stacked per layer: TP puts all 256 experts
-# on every card, so one bank per layer would be MOE_BANKS times the weight volume.
+# on every card, so one bank per layer would be FWD_NUM_LAYERS / MOE_BANKS times
+# the weight volume. The shared expert now rides in that bank as expert
+# SHARED_EID, so it is banked with them -- one shared expert per bank rather than
+# per layer. decode_fwd has no golden_fn (content is smoke-only), so this only
+# changes which bytes are streamed, not what is validated.
 MOE_BANKED_NAMES = [
     "routed_w1", "routed_w1_scale", "routed_w3", "routed_w3_scale",
     "routed_w2", "routed_w2_scale",
@@ -155,7 +160,7 @@ HCA_LAYER_STACKED_NAMES = [
     "hca_cmp_kv",
 ]
 
-LAYER_STACKED_NAMES = ['attn_norm_w', 'attn_sink', 'hca_cmp_kv', 'csa_cmp_kv', 'csa_cmp_ape', 'csa_cmp_norm_w', 'csa_cmp_wgate', 'csa_cmp_wkv', 'csa_compress_state', 'csa_hadamard_idx', 'csa_idx_wq_b', 'csa_idx_wq_b_scale', 'csa_inner_ape', 'csa_inner_compress_state', 'csa_inner_norm_w', 'csa_inner_wgate', 'csa_inner_wkv', 'csa_weights_proj', 'gamma_ckv', 'gamma_cq', 'gate_bias', 'gate_w', 'hc_attn_base', 'hc_attn_fn', 'hc_attn_scale', 'hc_ffn_base', 'hc_ffn_fn', 'hc_ffn_scale', 'hca_cmp_ape', 'hca_cmp_norm_w', 'hca_cmp_wgate', 'hca_cmp_wkv', 'hca_compress_state', 'idx_kv_cache', 'idx_kv_scale', 'kv_cache', 'norm_w', 'routed_w1', 'routed_w1_scale', 'routed_w2', 'routed_w2_scale', 'routed_w3', 'routed_w3_scale', 'shared_w1', 'shared_w1_scale', 'shared_w2', 'shared_w2_scale', 'shared_w3', 'shared_w3_scale', 'tid2eid', 'wkv', 'wo_a', 'wo_a_shard', 'wo_b', 'wo_b_scale', 'wo_b_shard', 'wq_a', 'wq_b', 'wq_b_scale']
+LAYER_STACKED_NAMES = ['attn_norm_w', 'attn_sink', 'hca_cmp_kv', 'csa_cmp_kv', 'csa_cmp_ape', 'csa_cmp_norm_w', 'csa_cmp_wgate', 'csa_cmp_wkv', 'csa_compress_state', 'csa_hadamard_idx', 'csa_idx_wq_b', 'csa_idx_wq_b_scale', 'csa_inner_ape', 'csa_inner_compress_state', 'csa_inner_norm_w', 'csa_inner_wgate', 'csa_inner_wkv', 'csa_weights_proj', 'gamma_ckv', 'gamma_cq', 'gate_bias', 'gate_w', 'hc_attn_base', 'hc_attn_fn', 'hc_attn_scale', 'hc_ffn_base', 'hc_ffn_fn', 'hc_ffn_scale', 'hca_cmp_ape', 'hca_cmp_norm_w', 'hca_cmp_wgate', 'hca_cmp_wkv', 'hca_compress_state', 'idx_kv_cache', 'idx_kv_scale', 'kv_cache', 'norm_w', 'routed_w1', 'routed_w1_scale', 'routed_w2', 'routed_w2_scale', 'routed_w3', 'routed_w3_scale', 'tid2eid', 'wkv', 'wo_a', 'wo_a_shard', 'wo_b', 'wo_b_scale', 'wo_b_shard', 'wq_a', 'wq_b', 'wq_b_scale']
 SHARED_NAMES = [
     "hca_cmp_block_table",
     "csa_cmp_block_table",
@@ -262,18 +267,12 @@ def decode_fwd(
     gate_w: pl.Tensor[[FWD_NUM_LAYERS * N_EXPERTS, D], pl.FP32],
     gate_bias: pl.Tensor[[FWD_NUM_LAYERS * N_EXPERTS], pl.FP32],
     tid2eid: pl.Tensor[[FWD_NUM_LAYERS * VOCAB, TOPK], pl.INT32],
-    routed_w1: pl.Tensor[[MOE_BANKS * N_EXPERTS, MOE_INTER, D], pl.INT8],
-    routed_w1_scale: pl.Tensor[[MOE_BANKS * N_EXPERTS, MOE_INTER], pl.FP32],
-    routed_w3: pl.Tensor[[MOE_BANKS * N_EXPERTS, MOE_INTER, D], pl.INT8],
-    routed_w3_scale: pl.Tensor[[MOE_BANKS * N_EXPERTS, MOE_INTER], pl.FP32],
-    routed_w2: pl.Tensor[[MOE_BANKS * N_EXPERTS, D, MOE_INTER], pl.INT8],
-    routed_w2_scale: pl.Tensor[[MOE_BANKS * N_EXPERTS, D], pl.FP32],
-    shared_w1: pl.Tensor[[FWD_NUM_LAYERS * MOE_INTER, D], pl.INT8],
-    shared_w1_scale: pl.Tensor[[FWD_NUM_LAYERS * MOE_INTER], pl.FP32],
-    shared_w3: pl.Tensor[[FWD_NUM_LAYERS * MOE_INTER, D], pl.INT8],
-    shared_w3_scale: pl.Tensor[[FWD_NUM_LAYERS * MOE_INTER], pl.FP32],
-    shared_w2: pl.Tensor[[FWD_NUM_LAYERS * D, MOE_INTER], pl.INT8],
-    shared_w2_scale: pl.Tensor[[FWD_NUM_LAYERS * D], pl.FP32],
+    routed_w1: pl.Tensor[[MOE_BANKS * N_BANK, MOE_INTER, D], pl.INT8],
+    routed_w1_scale: pl.Tensor[[MOE_BANKS * N_BANK, MOE_INTER], pl.FP32],
+    routed_w3: pl.Tensor[[MOE_BANKS * N_BANK, MOE_INTER, D], pl.INT8],
+    routed_w3_scale: pl.Tensor[[MOE_BANKS * N_BANK, MOE_INTER], pl.FP32],
+    routed_w2: pl.Tensor[[MOE_BANKS * N_BANK, D, MOE_INTER], pl.INT8],
+    routed_w2_scale: pl.Tensor[[MOE_BANKS * N_BANK, D], pl.FP32],
     freqs_cos: pl.Tensor[[2, MAX_SEQ_LEN, ROPE_HEAD_DIM], pl.BF16],
     freqs_sin: pl.Tensor[[2, MAX_SEQ_LEN, ROPE_HEAD_DIM], pl.BF16],
     x_hc: pl.Tensor[[T, HC_MULT, D], pl.FP32],
@@ -381,18 +380,12 @@ def decode_fwd(
     gate_w_l0: pl.Tensor[[N_EXPERTS, D], pl.FP32] = pl.slice(gate_w, [N_EXPERTS, D], [0 * N_EXPERTS, 0])
     gate_bias_l0: pl.Tensor[[N_EXPERTS], pl.FP32] = pl.slice(gate_bias, [N_EXPERTS], [0 * N_EXPERTS])
     tid2eid_l0: pl.Tensor[[VOCAB, TOPK], pl.INT32] = pl.slice(tid2eid, [VOCAB, TOPK], [0 * VOCAB, 0])
-    routed_w1_l0: pl.Tensor[[N_EXPERTS, MOE_INTER, D], pl.INT8] = pl.slice(routed_w1, [N_EXPERTS, MOE_INTER, D], [(0 % MOE_BANKS) * N_EXPERTS, 0, 0])
-    routed_w1_scale_l0: pl.Tensor[[N_EXPERTS, MOE_INTER], pl.FP32] = pl.slice(routed_w1_scale, [N_EXPERTS, MOE_INTER], [(0 % MOE_BANKS) * N_EXPERTS, 0])
-    routed_w3_l0: pl.Tensor[[N_EXPERTS, MOE_INTER, D], pl.INT8] = pl.slice(routed_w3, [N_EXPERTS, MOE_INTER, D], [(0 % MOE_BANKS) * N_EXPERTS, 0, 0])
-    routed_w3_scale_l0: pl.Tensor[[N_EXPERTS, MOE_INTER], pl.FP32] = pl.slice(routed_w3_scale, [N_EXPERTS, MOE_INTER], [(0 % MOE_BANKS) * N_EXPERTS, 0])
-    routed_w2_l0: pl.Tensor[[N_EXPERTS, D, MOE_INTER], pl.INT8] = pl.slice(routed_w2, [N_EXPERTS, D, MOE_INTER], [(0 % MOE_BANKS) * N_EXPERTS, 0, 0])
-    routed_w2_scale_l0: pl.Tensor[[N_EXPERTS, D], pl.FP32] = pl.slice(routed_w2_scale, [N_EXPERTS, D], [(0 % MOE_BANKS) * N_EXPERTS, 0])
-    shared_w1_l0: pl.Tensor[[MOE_INTER, D], pl.INT8] = pl.slice(shared_w1, [MOE_INTER, D], [0 * MOE_INTER, 0])
-    shared_w1_scale_l0: pl.Tensor[[MOE_INTER], pl.FP32] = pl.slice(shared_w1_scale, [MOE_INTER], [0 * MOE_INTER])
-    shared_w3_l0: pl.Tensor[[MOE_INTER, D], pl.INT8] = pl.slice(shared_w3, [MOE_INTER, D], [0 * MOE_INTER, 0])
-    shared_w3_scale_l0: pl.Tensor[[MOE_INTER], pl.FP32] = pl.slice(shared_w3_scale, [MOE_INTER], [0 * MOE_INTER])
-    shared_w2_l0: pl.Tensor[[D, MOE_INTER], pl.INT8] = pl.slice(shared_w2, [D, MOE_INTER], [0 * D, 0])
-    shared_w2_scale_l0: pl.Tensor[[D], pl.FP32] = pl.slice(shared_w2_scale, [D], [0 * D])
+    routed_w1_l0: pl.Tensor[[N_BANK, MOE_INTER, D], pl.INT8] = pl.slice(routed_w1, [N_BANK, MOE_INTER, D], [(0 % MOE_BANKS) * N_BANK, 0, 0])
+    routed_w1_scale_l0: pl.Tensor[[N_BANK, MOE_INTER], pl.FP32] = pl.slice(routed_w1_scale, [N_BANK, MOE_INTER], [(0 % MOE_BANKS) * N_BANK, 0])
+    routed_w3_l0: pl.Tensor[[N_BANK, MOE_INTER, D], pl.INT8] = pl.slice(routed_w3, [N_BANK, MOE_INTER, D], [(0 % MOE_BANKS) * N_BANK, 0, 0])
+    routed_w3_scale_l0: pl.Tensor[[N_BANK, MOE_INTER], pl.FP32] = pl.slice(routed_w3_scale, [N_BANK, MOE_INTER], [(0 % MOE_BANKS) * N_BANK, 0])
+    routed_w2_l0: pl.Tensor[[N_BANK, D, MOE_INTER], pl.INT8] = pl.slice(routed_w2, [N_BANK, D, MOE_INTER], [(0 % MOE_BANKS) * N_BANK, 0, 0])
+    routed_w2_scale_l0: pl.Tensor[[N_BANK, D], pl.FP32] = pl.slice(routed_w2_scale, [N_BANK, D], [(0 % MOE_BANKS) * N_BANK, 0])
     hc_attn_fn_l1: pl.Tensor[[MIX_HC, HC_DIM], pl.FP32] = pl.slice(hc_attn_fn, [MIX_HC, HC_DIM], [1 * MIX_HC, 0])
     hc_attn_scale_l1: pl.Tensor[[3], pl.FP32] = pl.slice(hc_attn_scale, [3], [1 * 3])
     hc_attn_base_l1: pl.Tensor[[MIX_HC], pl.FP32] = pl.slice(hc_attn_base, [MIX_HC], [1 * MIX_HC])
@@ -415,18 +408,12 @@ def decode_fwd(
     gate_w_l1: pl.Tensor[[N_EXPERTS, D], pl.FP32] = pl.slice(gate_w, [N_EXPERTS, D], [1 * N_EXPERTS, 0])
     gate_bias_l1: pl.Tensor[[N_EXPERTS], pl.FP32] = pl.slice(gate_bias, [N_EXPERTS], [1 * N_EXPERTS])
     tid2eid_l1: pl.Tensor[[VOCAB, TOPK], pl.INT32] = pl.slice(tid2eid, [VOCAB, TOPK], [1 * VOCAB, 0])
-    routed_w1_l1: pl.Tensor[[N_EXPERTS, MOE_INTER, D], pl.INT8] = pl.slice(routed_w1, [N_EXPERTS, MOE_INTER, D], [(1 % MOE_BANKS) * N_EXPERTS, 0, 0])
-    routed_w1_scale_l1: pl.Tensor[[N_EXPERTS, MOE_INTER], pl.FP32] = pl.slice(routed_w1_scale, [N_EXPERTS, MOE_INTER], [(1 % MOE_BANKS) * N_EXPERTS, 0])
-    routed_w3_l1: pl.Tensor[[N_EXPERTS, MOE_INTER, D], pl.INT8] = pl.slice(routed_w3, [N_EXPERTS, MOE_INTER, D], [(1 % MOE_BANKS) * N_EXPERTS, 0, 0])
-    routed_w3_scale_l1: pl.Tensor[[N_EXPERTS, MOE_INTER], pl.FP32] = pl.slice(routed_w3_scale, [N_EXPERTS, MOE_INTER], [(1 % MOE_BANKS) * N_EXPERTS, 0])
-    routed_w2_l1: pl.Tensor[[N_EXPERTS, D, MOE_INTER], pl.INT8] = pl.slice(routed_w2, [N_EXPERTS, D, MOE_INTER], [(1 % MOE_BANKS) * N_EXPERTS, 0, 0])
-    routed_w2_scale_l1: pl.Tensor[[N_EXPERTS, D], pl.FP32] = pl.slice(routed_w2_scale, [N_EXPERTS, D], [(1 % MOE_BANKS) * N_EXPERTS, 0])
-    shared_w1_l1: pl.Tensor[[MOE_INTER, D], pl.INT8] = pl.slice(shared_w1, [MOE_INTER, D], [1 * MOE_INTER, 0])
-    shared_w1_scale_l1: pl.Tensor[[MOE_INTER], pl.FP32] = pl.slice(shared_w1_scale, [MOE_INTER], [1 * MOE_INTER])
-    shared_w3_l1: pl.Tensor[[MOE_INTER, D], pl.INT8] = pl.slice(shared_w3, [MOE_INTER, D], [1 * MOE_INTER, 0])
-    shared_w3_scale_l1: pl.Tensor[[MOE_INTER], pl.FP32] = pl.slice(shared_w3_scale, [MOE_INTER], [1 * MOE_INTER])
-    shared_w2_l1: pl.Tensor[[D, MOE_INTER], pl.INT8] = pl.slice(shared_w2, [D, MOE_INTER], [1 * D, 0])
-    shared_w2_scale_l1: pl.Tensor[[D], pl.FP32] = pl.slice(shared_w2_scale, [D], [1 * D])
+    routed_w1_l1: pl.Tensor[[N_BANK, MOE_INTER, D], pl.INT8] = pl.slice(routed_w1, [N_BANK, MOE_INTER, D], [(1 % MOE_BANKS) * N_BANK, 0, 0])
+    routed_w1_scale_l1: pl.Tensor[[N_BANK, MOE_INTER], pl.FP32] = pl.slice(routed_w1_scale, [N_BANK, MOE_INTER], [(1 % MOE_BANKS) * N_BANK, 0])
+    routed_w3_l1: pl.Tensor[[N_BANK, MOE_INTER, D], pl.INT8] = pl.slice(routed_w3, [N_BANK, MOE_INTER, D], [(1 % MOE_BANKS) * N_BANK, 0, 0])
+    routed_w3_scale_l1: pl.Tensor[[N_BANK, MOE_INTER], pl.FP32] = pl.slice(routed_w3_scale, [N_BANK, MOE_INTER], [(1 % MOE_BANKS) * N_BANK, 0])
+    routed_w2_l1: pl.Tensor[[N_BANK, D, MOE_INTER], pl.INT8] = pl.slice(routed_w2, [N_BANK, D, MOE_INTER], [(1 % MOE_BANKS) * N_BANK, 0, 0])
+    routed_w2_scale_l1: pl.Tensor[[N_BANK, D], pl.FP32] = pl.slice(routed_w2_scale, [N_BANK, D], [(1 % MOE_BANKS) * N_BANK, 0])
     x_attn0: pl.Tensor[[T, HC_MULT, D], pl.FP32] = pl.create_tensor([T, HC_MULT, D], dtype=pl.FP32)
     x_attn1: pl.Tensor[[T, HC_MULT, D], pl.FP32] = pl.create_tensor([T, HC_MULT, D], dtype=pl.FP32)
     hidden: pl.Tensor[[T, HC_MULT, D], pl.FP32] = pl.create_tensor([T, HC_MULT, D], dtype=pl.FP32)
@@ -448,8 +435,6 @@ def decode_fwd(
             norm_w_l0, gate_w_l0, gate_bias_l0, tid2eid_l0, input_ids,
             routed_w1_l0, routed_w1_scale_l0, routed_w3_l0, routed_w3_scale_l0,
             routed_w2_l0, routed_w2_scale_l0,
-            shared_w1_l0, shared_w1_scale_l0, shared_w3_l0, shared_w3_scale_l0,
-            shared_w2_l0, shared_w2_scale_l0,
             hidden,
             reduce_window, reduce_signal,
             pl.cast(0, pl.INT32), nt, my_rank, pl.cast(1, pl.INT32),
@@ -472,8 +457,6 @@ def decode_fwd(
             norm_w_l1, gate_w_l1, gate_bias_l1, tid2eid_l1, input_ids,
             routed_w1_l1, routed_w1_scale_l1, routed_w3_l1, routed_w3_scale_l1,
             routed_w2_l1, routed_w2_scale_l1,
-            shared_w1_l1, shared_w1_scale_l1, shared_w3_l1, shared_w3_scale_l1,
-            shared_w2_l1, shared_w2_scale_l1,
             hidden,
             reduce_window, reduce_signal,
             pl.cast(1, pl.INT32), nt, my_rank, pl.cast(2, pl.INT32),
@@ -529,18 +512,12 @@ def decode_fwd(
         gate_w_csa: pl.Tensor[[N_EXPERTS, D], pl.FP32] = pl.slice(gate_w, [N_EXPERTS, D], [csa_layer * N_EXPERTS, 0])
         gate_bias_csa: pl.Tensor[[N_EXPERTS], pl.FP32] = pl.slice(gate_bias, [N_EXPERTS], [csa_layer * N_EXPERTS])
         tid2eid_csa: pl.Tensor[[VOCAB, TOPK], pl.INT32] = pl.slice(tid2eid, [VOCAB, TOPK], [csa_layer * VOCAB, 0])
-        routed_w1_csa: pl.Tensor[[N_EXPERTS, MOE_INTER, D], pl.INT8] = pl.slice(routed_w1, [N_EXPERTS, MOE_INTER, D], [(csa_layer % MOE_BANKS) * N_EXPERTS, 0, 0])
-        routed_w1_scale_csa: pl.Tensor[[N_EXPERTS, MOE_INTER], pl.FP32] = pl.slice(routed_w1_scale, [N_EXPERTS, MOE_INTER], [(csa_layer % MOE_BANKS) * N_EXPERTS, 0])
-        routed_w3_csa: pl.Tensor[[N_EXPERTS, MOE_INTER, D], pl.INT8] = pl.slice(routed_w3, [N_EXPERTS, MOE_INTER, D], [(csa_layer % MOE_BANKS) * N_EXPERTS, 0, 0])
-        routed_w3_scale_csa: pl.Tensor[[N_EXPERTS, MOE_INTER], pl.FP32] = pl.slice(routed_w3_scale, [N_EXPERTS, MOE_INTER], [(csa_layer % MOE_BANKS) * N_EXPERTS, 0])
-        routed_w2_csa: pl.Tensor[[N_EXPERTS, D, MOE_INTER], pl.INT8] = pl.slice(routed_w2, [N_EXPERTS, D, MOE_INTER], [(csa_layer % MOE_BANKS) * N_EXPERTS, 0, 0])
-        routed_w2_scale_csa: pl.Tensor[[N_EXPERTS, D], pl.FP32] = pl.slice(routed_w2_scale, [N_EXPERTS, D], [(csa_layer % MOE_BANKS) * N_EXPERTS, 0])
-        shared_w1_csa: pl.Tensor[[MOE_INTER, D], pl.INT8] = pl.slice(shared_w1, [MOE_INTER, D], [csa_layer * MOE_INTER, 0])
-        shared_w1_scale_csa: pl.Tensor[[MOE_INTER], pl.FP32] = pl.slice(shared_w1_scale, [MOE_INTER], [csa_layer * MOE_INTER])
-        shared_w3_csa: pl.Tensor[[MOE_INTER, D], pl.INT8] = pl.slice(shared_w3, [MOE_INTER, D], [csa_layer * MOE_INTER, 0])
-        shared_w3_scale_csa: pl.Tensor[[MOE_INTER], pl.FP32] = pl.slice(shared_w3_scale, [MOE_INTER], [csa_layer * MOE_INTER])
-        shared_w2_csa: pl.Tensor[[D, MOE_INTER], pl.INT8] = pl.slice(shared_w2, [D, MOE_INTER], [csa_layer * D, 0])
-        shared_w2_scale_csa: pl.Tensor[[D], pl.FP32] = pl.slice(shared_w2_scale, [D], [csa_layer * D])
+        routed_w1_csa: pl.Tensor[[N_BANK, MOE_INTER, D], pl.INT8] = pl.slice(routed_w1, [N_BANK, MOE_INTER, D], [(csa_layer % MOE_BANKS) * N_BANK, 0, 0])
+        routed_w1_scale_csa: pl.Tensor[[N_BANK, MOE_INTER], pl.FP32] = pl.slice(routed_w1_scale, [N_BANK, MOE_INTER], [(csa_layer % MOE_BANKS) * N_BANK, 0])
+        routed_w3_csa: pl.Tensor[[N_BANK, MOE_INTER, D], pl.INT8] = pl.slice(routed_w3, [N_BANK, MOE_INTER, D], [(csa_layer % MOE_BANKS) * N_BANK, 0, 0])
+        routed_w3_scale_csa: pl.Tensor[[N_BANK, MOE_INTER], pl.FP32] = pl.slice(routed_w3_scale, [N_BANK, MOE_INTER], [(csa_layer % MOE_BANKS) * N_BANK, 0])
+        routed_w2_csa: pl.Tensor[[N_BANK, D, MOE_INTER], pl.INT8] = pl.slice(routed_w2, [N_BANK, D, MOE_INTER], [(csa_layer % MOE_BANKS) * N_BANK, 0, 0])
+        routed_w2_scale_csa: pl.Tensor[[N_BANK, D], pl.FP32] = pl.slice(routed_w2_scale, [N_BANK, D], [(csa_layer % MOE_BANKS) * N_BANK, 0])
         with pl.scope():
             attention_csa(
                 hidden,
@@ -572,8 +549,6 @@ def decode_fwd(
                 norm_w_csa, gate_w_csa, gate_bias_csa, tid2eid_csa, input_ids,
                 routed_w1_csa, routed_w1_scale_csa, routed_w3_csa, routed_w3_scale_csa,
                 routed_w2_csa, routed_w2_scale_csa,
-                shared_w1_csa, shared_w1_scale_csa, shared_w3_csa, shared_w3_scale_csa,
-                shared_w2_csa, shared_w2_scale_csa,
                 hidden_mid,
                 reduce_window, reduce_signal,
                 csa_layer, nt, my_rank, csa_moe_epoch,
@@ -606,18 +581,12 @@ def decode_fwd(
         gate_w_hca: pl.Tensor[[N_EXPERTS, D], pl.FP32] = pl.slice(gate_w, [N_EXPERTS, D], [hca_layer * N_EXPERTS, 0])
         gate_bias_hca: pl.Tensor[[N_EXPERTS], pl.FP32] = pl.slice(gate_bias, [N_EXPERTS], [hca_layer * N_EXPERTS])
         tid2eid_hca: pl.Tensor[[VOCAB, TOPK], pl.INT32] = pl.slice(tid2eid, [VOCAB, TOPK], [hca_layer * VOCAB, 0])
-        routed_w1_hca: pl.Tensor[[N_EXPERTS, MOE_INTER, D], pl.INT8] = pl.slice(routed_w1, [N_EXPERTS, MOE_INTER, D], [(hca_layer % MOE_BANKS) * N_EXPERTS, 0, 0])
-        routed_w1_scale_hca: pl.Tensor[[N_EXPERTS, MOE_INTER], pl.FP32] = pl.slice(routed_w1_scale, [N_EXPERTS, MOE_INTER], [(hca_layer % MOE_BANKS) * N_EXPERTS, 0])
-        routed_w3_hca: pl.Tensor[[N_EXPERTS, MOE_INTER, D], pl.INT8] = pl.slice(routed_w3, [N_EXPERTS, MOE_INTER, D], [(hca_layer % MOE_BANKS) * N_EXPERTS, 0, 0])
-        routed_w3_scale_hca: pl.Tensor[[N_EXPERTS, MOE_INTER], pl.FP32] = pl.slice(routed_w3_scale, [N_EXPERTS, MOE_INTER], [(hca_layer % MOE_BANKS) * N_EXPERTS, 0])
-        routed_w2_hca: pl.Tensor[[N_EXPERTS, D, MOE_INTER], pl.INT8] = pl.slice(routed_w2, [N_EXPERTS, D, MOE_INTER], [(hca_layer % MOE_BANKS) * N_EXPERTS, 0, 0])
-        routed_w2_scale_hca: pl.Tensor[[N_EXPERTS, D], pl.FP32] = pl.slice(routed_w2_scale, [N_EXPERTS, D], [(hca_layer % MOE_BANKS) * N_EXPERTS, 0])
-        shared_w1_hca: pl.Tensor[[MOE_INTER, D], pl.INT8] = pl.slice(shared_w1, [MOE_INTER, D], [hca_layer * MOE_INTER, 0])
-        shared_w1_scale_hca: pl.Tensor[[MOE_INTER], pl.FP32] = pl.slice(shared_w1_scale, [MOE_INTER], [hca_layer * MOE_INTER])
-        shared_w3_hca: pl.Tensor[[MOE_INTER, D], pl.INT8] = pl.slice(shared_w3, [MOE_INTER, D], [hca_layer * MOE_INTER, 0])
-        shared_w3_scale_hca: pl.Tensor[[MOE_INTER], pl.FP32] = pl.slice(shared_w3_scale, [MOE_INTER], [hca_layer * MOE_INTER])
-        shared_w2_hca: pl.Tensor[[D, MOE_INTER], pl.INT8] = pl.slice(shared_w2, [D, MOE_INTER], [hca_layer * D, 0])
-        shared_w2_scale_hca: pl.Tensor[[D], pl.FP32] = pl.slice(shared_w2_scale, [D], [hca_layer * D])
+        routed_w1_hca: pl.Tensor[[N_BANK, MOE_INTER, D], pl.INT8] = pl.slice(routed_w1, [N_BANK, MOE_INTER, D], [(hca_layer % MOE_BANKS) * N_BANK, 0, 0])
+        routed_w1_scale_hca: pl.Tensor[[N_BANK, MOE_INTER], pl.FP32] = pl.slice(routed_w1_scale, [N_BANK, MOE_INTER], [(hca_layer % MOE_BANKS) * N_BANK, 0])
+        routed_w3_hca: pl.Tensor[[N_BANK, MOE_INTER, D], pl.INT8] = pl.slice(routed_w3, [N_BANK, MOE_INTER, D], [(hca_layer % MOE_BANKS) * N_BANK, 0, 0])
+        routed_w3_scale_hca: pl.Tensor[[N_BANK, MOE_INTER], pl.FP32] = pl.slice(routed_w3_scale, [N_BANK, MOE_INTER], [(hca_layer % MOE_BANKS) * N_BANK, 0])
+        routed_w2_hca: pl.Tensor[[N_BANK, D, MOE_INTER], pl.INT8] = pl.slice(routed_w2, [N_BANK, D, MOE_INTER], [(hca_layer % MOE_BANKS) * N_BANK, 0, 0])
+        routed_w2_scale_hca: pl.Tensor[[N_BANK, D], pl.FP32] = pl.slice(routed_w2_scale, [N_BANK, D], [(hca_layer % MOE_BANKS) * N_BANK, 0])
         with pl.scope():
             attention_hca(
                 hidden_mid,
@@ -641,8 +610,6 @@ def decode_fwd(
                 norm_w_hca, gate_w_hca, gate_bias_hca, tid2eid_hca, input_ids,
                 routed_w1_hca, routed_w1_scale_hca, routed_w3_hca, routed_w3_scale_hca,
                 routed_w2_hca, routed_w2_scale_hca,
-                shared_w1_hca, shared_w1_scale_hca, shared_w3_hca, shared_w3_scale_hca,
-                shared_w2_hca, shared_w2_scale_hca,
                 hidden,
                 reduce_window, reduce_signal,
                 hca_layer, nt, my_rank, hca_moe_epoch,
@@ -694,18 +661,12 @@ def decode_fwd(
     gate_w_last: pl.Tensor[[N_EXPERTS, D], pl.FP32] = pl.slice(gate_w, [N_EXPERTS, D], [csa_layer_last * N_EXPERTS, 0])
     gate_bias_last: pl.Tensor[[N_EXPERTS], pl.FP32] = pl.slice(gate_bias, [N_EXPERTS], [csa_layer_last * N_EXPERTS])
     tid2eid_last: pl.Tensor[[VOCAB, TOPK], pl.INT32] = pl.slice(tid2eid, [VOCAB, TOPK], [csa_layer_last * VOCAB, 0])
-    routed_w1_last: pl.Tensor[[N_EXPERTS, MOE_INTER, D], pl.INT8] = pl.slice(routed_w1, [N_EXPERTS, MOE_INTER, D], [(csa_layer_last % MOE_BANKS) * N_EXPERTS, 0, 0])
-    routed_w1_scale_last: pl.Tensor[[N_EXPERTS, MOE_INTER], pl.FP32] = pl.slice(routed_w1_scale, [N_EXPERTS, MOE_INTER], [(csa_layer_last % MOE_BANKS) * N_EXPERTS, 0])
-    routed_w3_last: pl.Tensor[[N_EXPERTS, MOE_INTER, D], pl.INT8] = pl.slice(routed_w3, [N_EXPERTS, MOE_INTER, D], [(csa_layer_last % MOE_BANKS) * N_EXPERTS, 0, 0])
-    routed_w3_scale_last: pl.Tensor[[N_EXPERTS, MOE_INTER], pl.FP32] = pl.slice(routed_w3_scale, [N_EXPERTS, MOE_INTER], [(csa_layer_last % MOE_BANKS) * N_EXPERTS, 0])
-    routed_w2_last: pl.Tensor[[N_EXPERTS, D, MOE_INTER], pl.INT8] = pl.slice(routed_w2, [N_EXPERTS, D, MOE_INTER], [(csa_layer_last % MOE_BANKS) * N_EXPERTS, 0, 0])
-    routed_w2_scale_last: pl.Tensor[[N_EXPERTS, D], pl.FP32] = pl.slice(routed_w2_scale, [N_EXPERTS, D], [(csa_layer_last % MOE_BANKS) * N_EXPERTS, 0])
-    shared_w1_last: pl.Tensor[[MOE_INTER, D], pl.INT8] = pl.slice(shared_w1, [MOE_INTER, D], [csa_layer_last * MOE_INTER, 0])
-    shared_w1_scale_last: pl.Tensor[[MOE_INTER], pl.FP32] = pl.slice(shared_w1_scale, [MOE_INTER], [csa_layer_last * MOE_INTER])
-    shared_w3_last: pl.Tensor[[MOE_INTER, D], pl.INT8] = pl.slice(shared_w3, [MOE_INTER, D], [csa_layer_last * MOE_INTER, 0])
-    shared_w3_scale_last: pl.Tensor[[MOE_INTER], pl.FP32] = pl.slice(shared_w3_scale, [MOE_INTER], [csa_layer_last * MOE_INTER])
-    shared_w2_last: pl.Tensor[[D, MOE_INTER], pl.INT8] = pl.slice(shared_w2, [D, MOE_INTER], [csa_layer_last * D, 0])
-    shared_w2_scale_last: pl.Tensor[[D], pl.FP32] = pl.slice(shared_w2_scale, [D], [csa_layer_last * D])
+    routed_w1_last: pl.Tensor[[N_BANK, MOE_INTER, D], pl.INT8] = pl.slice(routed_w1, [N_BANK, MOE_INTER, D], [(csa_layer_last % MOE_BANKS) * N_BANK, 0, 0])
+    routed_w1_scale_last: pl.Tensor[[N_BANK, MOE_INTER], pl.FP32] = pl.slice(routed_w1_scale, [N_BANK, MOE_INTER], [(csa_layer_last % MOE_BANKS) * N_BANK, 0])
+    routed_w3_last: pl.Tensor[[N_BANK, MOE_INTER, D], pl.INT8] = pl.slice(routed_w3, [N_BANK, MOE_INTER, D], [(csa_layer_last % MOE_BANKS) * N_BANK, 0, 0])
+    routed_w3_scale_last: pl.Tensor[[N_BANK, MOE_INTER], pl.FP32] = pl.slice(routed_w3_scale, [N_BANK, MOE_INTER], [(csa_layer_last % MOE_BANKS) * N_BANK, 0])
+    routed_w2_last: pl.Tensor[[N_BANK, D, MOE_INTER], pl.INT8] = pl.slice(routed_w2, [N_BANK, D, MOE_INTER], [(csa_layer_last % MOE_BANKS) * N_BANK, 0, 0])
+    routed_w2_scale_last: pl.Tensor[[N_BANK, D], pl.FP32] = pl.slice(routed_w2_scale, [N_BANK, D], [(csa_layer_last % MOE_BANKS) * N_BANK, 0])
     with pl.scope():
         attention_csa(
             hidden,
@@ -737,8 +698,6 @@ def decode_fwd(
             norm_w_last, gate_w_last, gate_bias_last, tid2eid_last, input_ids,
             routed_w1_last, routed_w1_scale_last, routed_w3_last, routed_w3_scale_last,
             routed_w2_last, routed_w2_scale_last,
-            shared_w1_last, shared_w1_scale_last, shared_w3_last, shared_w3_scale_last,
-            shared_w2_last, shared_w2_scale_last,
             pre_hc_hidden_out,
             reduce_window, reduce_signal,
             csa_layer_last, nt, my_rank, last_moe_epoch,
@@ -813,18 +772,12 @@ def l2_decode_fwd(
     gate_w: pl.Tensor[[FWD_NUM_LAYERS * N_EXPERTS, D], pl.FP32],
     gate_bias: pl.Tensor[[FWD_NUM_LAYERS * N_EXPERTS], pl.FP32],
     tid2eid: pl.Tensor[[FWD_NUM_LAYERS * VOCAB, TOPK], pl.INT32],
-    routed_w1: pl.Tensor[[MOE_BANKS * N_EXPERTS, MOE_INTER, D], pl.INT8],
-    routed_w1_scale: pl.Tensor[[MOE_BANKS * N_EXPERTS, MOE_INTER], pl.FP32],
-    routed_w3: pl.Tensor[[MOE_BANKS * N_EXPERTS, MOE_INTER, D], pl.INT8],
-    routed_w3_scale: pl.Tensor[[MOE_BANKS * N_EXPERTS, MOE_INTER], pl.FP32],
-    routed_w2: pl.Tensor[[MOE_BANKS * N_EXPERTS, D, MOE_INTER], pl.INT8],
-    routed_w2_scale: pl.Tensor[[MOE_BANKS * N_EXPERTS, D], pl.FP32],
-    shared_w1: pl.Tensor[[FWD_NUM_LAYERS * MOE_INTER, D], pl.INT8],
-    shared_w1_scale: pl.Tensor[[FWD_NUM_LAYERS * MOE_INTER], pl.FP32],
-    shared_w3: pl.Tensor[[FWD_NUM_LAYERS * MOE_INTER, D], pl.INT8],
-    shared_w3_scale: pl.Tensor[[FWD_NUM_LAYERS * MOE_INTER], pl.FP32],
-    shared_w2: pl.Tensor[[FWD_NUM_LAYERS * D, MOE_INTER], pl.INT8],
-    shared_w2_scale: pl.Tensor[[FWD_NUM_LAYERS * D], pl.FP32],
+    routed_w1: pl.Tensor[[MOE_BANKS * N_BANK, MOE_INTER, D], pl.INT8],
+    routed_w1_scale: pl.Tensor[[MOE_BANKS * N_BANK, MOE_INTER], pl.FP32],
+    routed_w3: pl.Tensor[[MOE_BANKS * N_BANK, MOE_INTER, D], pl.INT8],
+    routed_w3_scale: pl.Tensor[[MOE_BANKS * N_BANK, MOE_INTER], pl.FP32],
+    routed_w2: pl.Tensor[[MOE_BANKS * N_BANK, D, MOE_INTER], pl.INT8],
+    routed_w2_scale: pl.Tensor[[MOE_BANKS * N_BANK, D], pl.FP32],
     freqs_cos: pl.Tensor[[2, MAX_SEQ_LEN, ROPE_HEAD_DIM], pl.BF16],
     freqs_sin: pl.Tensor[[2, MAX_SEQ_LEN, ROPE_HEAD_DIM], pl.BF16],
     block_table: pl.Tensor[[B, ORI_TABLE_MAX_BLOCKS], pl.INT32],
@@ -921,7 +874,6 @@ def l2_decode_fwd(
         hc_ffn_fn, hc_ffn_scale, hc_ffn_base,
         norm_w, gate_w, gate_bias, tid2eid,
         routed_w1, routed_w1_scale, routed_w3, routed_w3_scale, routed_w2, routed_w2_scale,
-        shared_w1, shared_w1_scale, shared_w3, shared_w3_scale, shared_w2, shared_w2_scale,
         freqs_cos, freqs_sin,
         x_hc, position_ids, kv_seq_lens,
         hca_compress_state_block_table, csa_compress_state_block_table, csa_inner_compress_state_block_table,
@@ -991,18 +943,12 @@ def l3_decode_fwd(
     gate_w: pl.Tensor[[N_RANKS, FWD_NUM_LAYERS * N_EXPERTS, D], pl.FP32],
     gate_bias: pl.Tensor[[N_RANKS, FWD_NUM_LAYERS * N_EXPERTS], pl.FP32],
     tid2eid: pl.Tensor[[N_RANKS, FWD_NUM_LAYERS * VOCAB, TOPK], pl.INT32],
-    routed_w1: pl.Tensor[[N_RANKS, MOE_BANKS * N_EXPERTS, MOE_INTER, D], pl.INT8],
-    routed_w1_scale: pl.Tensor[[N_RANKS, MOE_BANKS * N_EXPERTS, MOE_INTER], pl.FP32],
-    routed_w3: pl.Tensor[[N_RANKS, MOE_BANKS * N_EXPERTS, MOE_INTER, D], pl.INT8],
-    routed_w3_scale: pl.Tensor[[N_RANKS, MOE_BANKS * N_EXPERTS, MOE_INTER], pl.FP32],
-    routed_w2: pl.Tensor[[N_RANKS, MOE_BANKS * N_EXPERTS, D, MOE_INTER], pl.INT8],
-    routed_w2_scale: pl.Tensor[[N_RANKS, MOE_BANKS * N_EXPERTS, D], pl.FP32],
-    shared_w1: pl.Tensor[[N_RANKS, FWD_NUM_LAYERS * MOE_INTER, D], pl.INT8],
-    shared_w1_scale: pl.Tensor[[N_RANKS, FWD_NUM_LAYERS * MOE_INTER], pl.FP32],
-    shared_w3: pl.Tensor[[N_RANKS, FWD_NUM_LAYERS * MOE_INTER, D], pl.INT8],
-    shared_w3_scale: pl.Tensor[[N_RANKS, FWD_NUM_LAYERS * MOE_INTER], pl.FP32],
-    shared_w2: pl.Tensor[[N_RANKS, FWD_NUM_LAYERS * D, MOE_INTER], pl.INT8],
-    shared_w2_scale: pl.Tensor[[N_RANKS, FWD_NUM_LAYERS * D], pl.FP32],
+    routed_w1: pl.Tensor[[N_RANKS, MOE_BANKS * N_BANK, MOE_INTER, D], pl.INT8],
+    routed_w1_scale: pl.Tensor[[N_RANKS, MOE_BANKS * N_BANK, MOE_INTER], pl.FP32],
+    routed_w3: pl.Tensor[[N_RANKS, MOE_BANKS * N_BANK, MOE_INTER, D], pl.INT8],
+    routed_w3_scale: pl.Tensor[[N_RANKS, MOE_BANKS * N_BANK, MOE_INTER], pl.FP32],
+    routed_w2: pl.Tensor[[N_RANKS, MOE_BANKS * N_BANK, D, MOE_INTER], pl.INT8],
+    routed_w2_scale: pl.Tensor[[N_RANKS, MOE_BANKS * N_BANK, D], pl.FP32],
     freqs_cos: pl.Tensor[[N_RANKS, 2, MAX_SEQ_LEN, ROPE_HEAD_DIM], pl.BF16],
     freqs_sin: pl.Tensor[[N_RANKS, 2, MAX_SEQ_LEN, ROPE_HEAD_DIM], pl.BF16],
     block_table: pl.Tensor[[N_RANKS, B, ORI_TABLE_MAX_BLOCKS], pl.INT32],
@@ -1080,8 +1026,7 @@ def l3_decode_fwd(
             idx_kv_cache[r], idx_kv_scale[r],
             hc_ffn_fn[r], hc_ffn_scale[r], hc_ffn_base[r], norm_w[r], gate_w[r], gate_bias[r],
             tid2eid[r], routed_w1[r], routed_w1_scale[r], routed_w3[r], routed_w3_scale[r],
-            routed_w2[r], routed_w2_scale[r], shared_w1[r], shared_w1_scale[r], shared_w3[r],
-            shared_w3_scale[r], shared_w2[r], shared_w2_scale[r],
+            routed_w2[r], routed_w2_scale[r],
             freqs_cos[r], freqs_sin[r],
             block_table[r], position_ids[r],
             kv_seq_lens[r], hca_compress_state_block_table[r], csa_compress_state_block_table[r],
@@ -1844,7 +1789,7 @@ def build_tensor_specs(
         csa_state_block_num=csa_state_block_num,
         inner_state_block_num=inner_state_block_num,
     )
-    ordered_names = ['embed_weight', 'hc_attn_fn', 'hc_attn_scale', 'hc_attn_base', 'attn_norm_w', 'wq_a', 'wq_b', 'wq_b_scale', 'wkv', 'gamma_cq', 'gamma_ckv', 'kv_cache', 'attn_sink', 'wo_a', 'wo_b', 'wo_b_scale', 'wo_a_shard', 'wo_b_shard', 'hca_cmp_wkv', 'hca_cmp_wgate', 'hca_cmp_ape', 'hca_cmp_norm_w', 'hca_compress_state', 'csa_cmp_wkv', 'csa_cmp_wgate', 'csa_cmp_ape', 'csa_cmp_norm_w', 'csa_compress_state', 'csa_idx_wq_b', 'csa_idx_wq_b_scale', 'csa_weights_proj', 'csa_hadamard_idx', 'csa_inner_wkv', 'csa_inner_wgate', 'csa_inner_ape', 'csa_inner_norm_w', 'csa_inner_compress_state', 'hca_cmp_kv', 'csa_cmp_kv', 'idx_kv_cache', 'idx_kv_scale', 'hc_ffn_fn', 'hc_ffn_scale', 'hc_ffn_base', 'norm_w', 'gate_w', 'gate_bias', 'tid2eid', 'routed_w1', 'routed_w1_scale', 'routed_w3', 'routed_w3_scale', 'routed_w2', 'routed_w2_scale', 'shared_w1', 'shared_w1_scale', 'shared_w3', 'shared_w3_scale', 'shared_w2', 'shared_w2_scale', 'freqs_cos', 'freqs_sin', 'block_table', 'position_ids', 'kv_seq_lens', 'hca_compress_state_block_table', 'csa_compress_state_block_table', 'csa_inner_compress_state_block_table', 'hca_cmp_block_table', 'csa_cmp_block_table', 'idx_block_table', 'block_counts', 'input_ids', 'hc_head_fn', 'hc_head_scale', 'hc_head_base', 'final_norm_w']
+    ordered_names = ['embed_weight', 'hc_attn_fn', 'hc_attn_scale', 'hc_attn_base', 'attn_norm_w', 'wq_a', 'wq_b', 'wq_b_scale', 'wkv', 'gamma_cq', 'gamma_ckv', 'kv_cache', 'attn_sink', 'wo_a', 'wo_b', 'wo_b_scale', 'wo_a_shard', 'wo_b_shard', 'hca_cmp_wkv', 'hca_cmp_wgate', 'hca_cmp_ape', 'hca_cmp_norm_w', 'hca_compress_state', 'csa_cmp_wkv', 'csa_cmp_wgate', 'csa_cmp_ape', 'csa_cmp_norm_w', 'csa_compress_state', 'csa_idx_wq_b', 'csa_idx_wq_b_scale', 'csa_weights_proj', 'csa_hadamard_idx', 'csa_inner_wkv', 'csa_inner_wgate', 'csa_inner_ape', 'csa_inner_norm_w', 'csa_inner_compress_state', 'hca_cmp_kv', 'csa_cmp_kv', 'idx_kv_cache', 'idx_kv_scale', 'hc_ffn_fn', 'hc_ffn_scale', 'hc_ffn_base', 'norm_w', 'gate_w', 'gate_bias', 'tid2eid', 'routed_w1', 'routed_w1_scale', 'routed_w3', 'routed_w3_scale', 'routed_w2', 'routed_w2_scale', 'freqs_cos', 'freqs_sin', 'block_table', 'position_ids', 'kv_seq_lens', 'hca_compress_state_block_table', 'csa_compress_state_block_table', 'csa_inner_compress_state_block_table', 'hca_cmp_block_table', 'csa_cmp_block_table', 'idx_block_table', 'block_counts', 'input_ids', 'hc_head_fn', 'hc_head_scale', 'hc_head_base', 'final_norm_w']
     specs = []
     for name in ordered_names:
         if name in preamble_specs:
