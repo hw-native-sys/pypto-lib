@@ -155,7 +155,6 @@ def make_eplb_tid2eid_spec(base_spec, *, layer_count: int = 1):
         [num_ranks, layer_count * vocab, topk],
         base_spec.dtype,
         init_value=init_value,
-        is_output=base_spec.is_output,
         resident=base_spec.resident,
     )
 
@@ -180,7 +179,6 @@ def make_eplb_input_ids_spec(base_spec, *, active_tokens: int = EPLB_TOKENS):
         list(base_spec.shape),
         base_spec.dtype,
         init_value=init_value,
-        is_output=base_spec.is_output,
         resident=base_spec.resident,
     )
 

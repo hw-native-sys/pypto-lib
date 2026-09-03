@@ -626,16 +626,15 @@ def finite_tensor_compare(actual, _expected, **_context):
     return False, f"{invalid}/{actual.numel()} values are non-finite"
 
 
-def finite_output_compare_map(specs):
-    return {
-        spec.name: finite_tensor_compare
-        for spec in specs
-        if getattr(spec, "is_output", False)
-    }
+OUTPUT_NAMES = ("hidden_out", "next_pre_hc_hidden", "kv_cache", "logits")
+
+
+def finite_output_compare_map():
+    return {name: finite_tensor_compare for name in OUTPUT_NAMES}
 
 
 def main():
-    from golden import ratio_reldiff, run_jit
+    from golden import ratio_reldiff, run
 
     parser = argparse.ArgumentParser(description="DeepSeek-V4 strict EPLB MTP-core benchmark.")
     parser.add_argument("-p", "--platform", type=str, default="a2a3", choices=["a2a3", "a2a3sim", "a5", "a5sim"])
@@ -681,10 +680,10 @@ def main():
     }
     golden_fn = golden_eplb_mtp_core
     if args.finite_only:
-        compare_fn = finite_output_compare_map(specs)
+        compare_fn = finite_output_compare_map()
         golden_fn = golden_finite_smoke
 
-    result = run_jit(
+    result = run(
         fn=l3_eplb_mtp_core,
         specs=specs,
         golden_fn=golden_fn,

@@ -28,7 +28,7 @@ configure_eplb_argv()
 
 import pypto.language as pl
 import pypto.language.distributed as pld
-from golden import run_jit
+from golden import run
 from hc_head import hc_head
 from lm_head import (
     clear_lm_head_signals,
@@ -1129,14 +1129,12 @@ def _make_layer_stacked_spec(name, base_specs, layer_count=FWD_NUM_LAYERS):
         packed_shape,
         spec.dtype,
         init_value=init_value,
-        # Mark kernel-written resident caches as outputs.
-        is_output=name in RESIDENT_CACHE_OUTPUT_NAMES,
     )
 
 
 def _make_shared_spec(name, base_spec, out_name=None):
     from golden import TensorSpec
-    return TensorSpec(out_name or name, list(base_spec.shape), base_spec.dtype, init_value=base_spec.init_value if out_name is None else None, is_output=out_name is not None)
+    return TensorSpec(out_name or name, list(base_spec.shape), base_spec.dtype, init_value=base_spec.init_value if out_name is None else None)
 
 
 def _make_hc_head_spec(name):
@@ -1602,7 +1600,6 @@ def build_single_layer_tensor_specs(
                 cache_shapes[name],
                 spec.dtype,
                 init_value=lambda shape=cache_shapes[name], dtype=spec.dtype: torch.zeros(shape, dtype=dtype),
-                is_output=spec.is_output,
             )
             if name in cache_shapes else spec
         )
@@ -1615,7 +1612,6 @@ def build_single_layer_tensor_specs(
             [N_RANKS, *spec.shape],
             spec.dtype,
             init_value=_ranked_init(spec, replicated=name in replicated_attention),
-            is_output=name == "kv_cache",
         )
         for name, spec in attention_specs
     ]
@@ -1643,7 +1639,7 @@ def build_single_layer_tensor_specs(
             specs.append(moe_tensor_specs[spec.name])
 
     specs.extend([
-        TensorSpec("x_next", [N_RANKS, T, HC_MULT, D], torch.float32, is_output=True),
+        TensorSpec("x_next", [N_RANKS, T, HC_MULT, D], torch.float32),
         ScalarSpec("layer_id", torch.int32, layer_id),
     ])
     return specs
@@ -1750,7 +1746,7 @@ def build_tensor_specs(
         if spec.name in RESIDENT_WEIGHT_NAMES or spec.name in CACHE_POOL_NAMES:
             spec.resident = "stacked"
 
-    specs.append(TensorSpec("pre_hc_hidden_out", [N_RANKS, T, HC_MULT, D], torch.float32, is_output=True))
+    specs.append(TensorSpec("pre_hc_hidden_out", [N_RANKS, T, HC_MULT, D], torch.float32))
     specs.append(TensorSpec(
         "lm_head_weight",
         [N_RANKS, VOCAB_PER_TP, D],
@@ -1758,8 +1754,8 @@ def build_tensor_specs(
         init_value=init_lm_head_weight,
         resident="stacked",
     ))
-    specs.append(TensorSpec("hidden_out", [N_RANKS, T, D], torch.bfloat16, is_output=True))
-    specs.append(TensorSpec("logits", [N_RANKS, MAX_LOGIT_ROWS, LM_HEAD_VOCAB], torch.float32, is_output=True))
+    specs.append(TensorSpec("hidden_out", [N_RANKS, T, D], torch.bfloat16))
+    specs.append(TensorSpec("logits", [N_RANKS, MAX_LOGIT_ROWS, LM_HEAD_VOCAB], torch.float32))
     specs.append(TensorSpec(
         "num_tokens_per_owner",
         [N_RANKS],
@@ -1821,7 +1817,7 @@ def main():
         inner_state_block_num=args.inner_state_block_num,
     )
 
-    result = run_jit(
+    result = run(
         fn=l3_eplb_decode_logits,
         specs=specs,
         golden_fn=None,
