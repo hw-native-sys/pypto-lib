@@ -51,6 +51,9 @@ SOFTMAX_SCALE = M.softmax_scale
 O_LORA = M.o_lora_rank
 O_GROUPS = M.o_groups
 HEADS_PER_GROUP = H // O_GROUPS
+# Attention is head-sharded: card `my_rank` computes group `my_rank`'s
+# heads, which are exactly the o_packed rows its own o_proj shard reads.
+H_LOCAL = HEADS_PER_GROUP
 O_GROUP_IN = HEADS_PER_GROUP * HEAD_DIM
 
 COMPRESS_RATIO = 128
@@ -69,8 +72,12 @@ GATHER_SEGS = 4          # gather blocks per token; T*GATHER_SEGS co-resides wit
 # Each segment carries BOTH a window slice and a compressed-tail slice, whose
 # per-row costs are opposite (bulk-run window vs scattered per-row topk).
 GATHER_RUN = 16          # window sub-tile probed for physical contiguity -> one bulk DMA
-H_TILE = 16
-QK_M_TILE = 32           # qk_pv M rows per QK/PV matmul; QK_M_TILE/H_TILE-way KV L1->L0 reuse
+H_TILE = 8               # == H_LOCAL: one card's head slice is one tile
+QK_M_TILE = 8            # qk_pv real M rows == one card's heads
+# The cube addresses Acc in 16x16 fractal boxes, so an 8-head slice must
+# occupy a 16-row box with 8 valid rows -- half of every qk/pv box is
+# padding. That is the shard's tax on this kernel.
+QK_M_BOX = 16
 ATTN_K_TILE = 128
 ROPE_TILE = 16
 ROPE_INTERLEAVE_TILE = 2 * ROPE_TILE
@@ -126,6 +133,7 @@ def sparse_attn_hca_packed(
     freqs_cos: pl.Tensor[[T, ROPE_DIM], pl.BF16],
     freqs_sin: pl.Tensor[[T, ROPE_DIM], pl.BF16],
     o_packed: pl.Tensor[[O_GROUPS * T, O_GROUP_IN], pl.BF16],
+    my_rank: pl.Scalar[pl.INT32],
 ) -> pl.Scalar[pl.TASK_ID]:
     """Sparse decode attention over the compressed + window cache, and inverse RoPE, up to the packed head output.
 
@@ -221,15 +229,16 @@ def sparse_attn_hca_packed(
     # fused on a2a3: the PV output (Acc) -> online rescale (Vec) needs an
     # unsupported tmov, and a [H_TILE, HEAD_DIM] carry overflows the Vec buffer.
     q_flat = pl.reshape(q, [T * H, HEAD_DIM])
-    sparse_blk_mi = pl.create_tensor([T * (H // H_TILE) * SPARSE_BLOCKS * H_TILE, 1], dtype=pl.FP32)
-    sparse_blk_li = pl.create_tensor([T * (H // H_TILE) * SPARSE_BLOCKS * H_TILE, 1], dtype=pl.FP32)
-    sparse_blk_oi = pl.create_tensor([T * (H // H_TILE) * SPARSE_BLOCKS * H_TILE, HEAD_DIM], dtype=pl.FP32)
+    head_base = pl.cast(my_rank, pl.INDEX) * H_LOCAL
+    sparse_blk_mi = pl.create_tensor([T * QK_M_BOX * SPARSE_BLOCKS, 1], dtype=pl.FP32)
+    sparse_blk_li = pl.create_tensor([T * QK_M_BOX * SPARSE_BLOCKS, 1], dtype=pl.FP32)
+    sparse_blk_oi = pl.create_tensor([T * QK_M_BOX * SPARSE_BLOCKS, HEAD_DIM], dtype=pl.FP32)
 
     with pl.spmd(T * SPARSE_BLOCKS, name_hint="qk_pv", deps=[gather_tid], allow_early_resolve=True) as qk_tid:
         qk_item = pl.tile.get_block_idx()
         qk_t = qk_item // SPARSE_BLOCKS
         qk_sb = qk_item - qk_t * SPARSE_BLOCKS
-        qk_token_base = qk_t * (H // H_TILE) * SPARSE_BLOCKS * H_TILE
+        qk_token_base = qk_t * QK_M_BOX * SPARSE_BLOCKS
         # Sparse-block OUTER / head-tile INNER: both head-batches' QK (b_trans)
         # and PV consume the SAME pre-gathered KV tile.
         qk_s0 = qk_sb * ATTN_K_TILE
@@ -244,13 +253,15 @@ def sparse_attn_hca_packed(
         # stores at the SAME offsets as the per-head-tile path
         # (qk_h_idx == qk_hb * (QK_M_TILE // H_TILE) + qk_sub), so the
         # sparse_blk_* layout and merge_norm are bit-identical.
-        for qk_hb in pl.pipeline(H // QK_M_TILE, stage=2):
+        for qk_hb in pl.pipeline(H_LOCAL // QK_M_TILE, stage=2):
             qk_h0 = qk_hb * QK_M_TILE
-            qk_head_row = qk_t * H + qk_h0
-            qk_q_tile = q_flat[qk_head_row : qk_head_row + QK_M_TILE, 0 : HEAD_DIM]
+            qk_head_row = qk_t * H + head_base + qk_h0
+            qk_q_tile = pl.slice(
+                q_flat, [QK_M_BOX, HEAD_DIM], [qk_head_row, 0],
+                valid_shape=[QK_M_TILE, HEAD_DIM])
             qk_raw = pl.matmul(qk_q_tile, qk_kv, b_trans=True, out_dtype=pl.FP32)
             qk_scaled = pl.mul(qk_raw, SOFTMAX_SCALE)
-            qk_scores = pl.add(qk_scaled, pl.col_expand(pl.full([QK_M_TILE, ATTN_K_TILE], dtype=pl.FP32, value=0.0), qk_bias_row))
+            qk_scores = pl.add(qk_scaled, pl.col_expand(pl.full([QK_M_BOX, ATTN_K_TILE], dtype=pl.FP32, value=0.0), qk_bias_row))
             qk_mi = pl.row_max(qk_scores)
             # Invalid lanes (NEG_INF bias, zero kv rows) exp to ~0; all-invalid
             # blocks die in the merge alpha/beta -- no mask multiply needed.
@@ -258,14 +269,13 @@ def sparse_attn_hca_packed(
             qk_li = pl.row_sum(qk_exp)
             qk_exp_bf16 = pl.cast(qk_exp, target_type=pl.BF16, mode="rint")
             qk_oi = pl.matmul(qk_exp_bf16, qk_kv, out_dtype=pl.FP32)
-            for qk_sub in pl.unroll(QK_M_TILE // H_TILE):
-                qk_h_idx = qk_hb * (QK_M_TILE // H_TILE) + qk_sub
-                qk_r0 = qk_sub * H_TILE
-                qk_blk_base = qk_token_base + qk_h_idx * SPARSE_BLOCKS * H_TILE
-                qk_row = qk_blk_base + qk_sb * H_TILE
-                sparse_blk_mi[qk_row : qk_row + H_TILE, 0 : 1] = qk_mi[qk_r0 : qk_r0 + H_TILE, 0 : 1]
-                sparse_blk_li[qk_row : qk_row + H_TILE, 0 : 1] = qk_li[qk_r0 : qk_r0 + H_TILE, 0 : 1]
-                sparse_blk_oi[qk_row : qk_row + H_TILE, 0 : HEAD_DIM] = qk_oi[qk_r0 : qk_r0 + H_TILE, 0 : HEAD_DIM]
+            # One head tile per card, so the whole (valid) accumulator stores
+            # straight out -- slicing it to 8 rows would ask the cube for a
+            # partial 16x16 box, which has no address.
+            qk_row = qk_token_base + qk_sb * QK_M_BOX
+            sparse_blk_mi[qk_row : qk_row + QK_M_BOX, 0 : 1] = qk_mi
+            sparse_blk_li[qk_row : qk_row + QK_M_BOX, 0 : 1] = qk_li
+            sparse_blk_oi[qk_row : qk_row + QK_M_BOX, 0 : HEAD_DIM] = qk_oi
 
     # Precompute the head-invariant interleaved cos and sign*sin once: they depend
     # only on (token, column), not head, so building them per head would repeat the
@@ -316,12 +326,12 @@ def sparse_attn_hca_packed(
     # segment is rotated in UB and packed straight into o_packed's rope columns.
     # with-form spmd so the dispatch TaskId (merge_tid) can be an explicit dep of
     # the manual-scope proj_a tasks below (which read merge_norm's o_packed cols).
-    with pl.spmd(T * (H // H_TILE), name_hint="merge_norm", allow_early_resolve=True) as merge_tid:
+    with pl.spmd(T * (H_LOCAL // H_TILE), name_hint="merge_norm", allow_early_resolve=True) as merge_tid:
         m_idx = pl.tile.get_block_idx()
-        m_t = m_idx // (H // H_TILE)
-        m_h_idx = m_idx - m_t * (H // H_TILE)
+        m_t = m_idx // (H_LOCAL // H_TILE)
+        m_h_idx = m_idx - m_t * (H_LOCAL // H_TILE)
         m_h0 = m_h_idx * H_TILE
-        m_blk_base = m_idx * SPARSE_BLOCKS * H_TILE
+        m_blk_base = m_idx * SPARSE_BLOCKS * QK_M_BOX
         m_mi = sparse_blk_mi[m_blk_base : m_blk_base + H_TILE, 0 : 1]
         m_li = sparse_blk_li[m_blk_base : m_blk_base + H_TILE, 0 : 1]
         m_oi = sparse_blk_oi[m_blk_base : m_blk_base + H_TILE, 0 : HEAD_DIM]
@@ -330,7 +340,7 @@ def sparse_attn_hca_packed(
         # SWA-style guard needed. Software-pipelined so each iteration's
         # sparse_blk_* loads overlap the previous iteration's rescale math.
         for m_sb in pl.pipeline(1, SPARSE_BLOCKS, stage=2):
-            m_row = m_blk_base + m_sb * H_TILE
+            m_row = m_blk_base + m_sb * QK_M_BOX
             m_cur_mi = sparse_blk_mi[m_row : m_row + H_TILE, 0 : 1]
             m_cur_li = sparse_blk_li[m_row : m_row + H_TILE, 0 : 1]
             m_cur_oi = sparse_blk_oi[m_row : m_row + H_TILE, 0 : HEAD_DIM]
@@ -341,7 +351,8 @@ def sparse_attn_hca_packed(
             m_oi = pl.add(pl.row_expand_mul(m_oi, m_alpha), pl.row_expand_mul(m_cur_oi, m_beta))
             m_mi = m_mi_new
 
-        n_sink_bias = pl.reshape(attn_sink[m_h0 : m_h0 + H_TILE], [H_TILE, 1])
+        m_h_global = head_base + m_h0
+        n_sink_bias = pl.reshape(attn_sink[m_h_global : m_h_global + H_TILE], [H_TILE, 1])
         n_sink_tile = pl.add(pl.sub(m_mi, m_mi), n_sink_bias)
         n_denom = pl.add(m_li, pl.exp(pl.sub(n_sink_tile, m_mi)))
         n_full = pl.row_expand_div(m_oi, n_denom)[0 : H_TILE, 0 : HEAD_DIM]
@@ -361,7 +372,7 @@ def sparse_attn_hca_packed(
         n_full_bf16 = pl.concat(n_bf16[:, : NOPE_DIM], n_rope_bf16)
 
         for n_hi in pl.unroll(H_TILE):
-            n_pack_row = ((m_h0 + n_hi) // HEADS_PER_GROUP) * T + m_t
+            n_pack_row = pl.cast(my_rank, pl.INDEX) * T + m_t
             n_col = ((m_h0 + n_hi) % HEADS_PER_GROUP) * HEAD_DIM
             # one HEAD_DIM-wide store per head row instead of two: concat the nope and
             # inverse-RoPE halves on chip so o_packed takes a single contiguous write.
@@ -403,6 +414,7 @@ def sparse_attn_hca(
     merge_tid = sparse_attn_hca_packed(
         q, ori_kv, window_swa_indices, cmp_kv, cmp_block_table,
         cmp_sparse_indices, attn_sink, freqs_cos, freqs_sin, o_packed,
+        pl.const(0, pl.INT32),
     )
     o_proj_grouped(o_packed, merge_tid, wo_a, wo_b, wo_b_scale, attn_out)
     return attn_out

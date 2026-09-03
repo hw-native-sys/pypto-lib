@@ -48,6 +48,11 @@ SOFTMAX_SCALE = M.softmax_scale
 O_LORA = M.o_lora_rank
 O_GROUPS = M.o_groups
 HEADS_PER_GROUP = H // O_GROUPS
+# Attention is sharded on the head axis: card `my_rank` computes group
+# `my_rank`'s heads only, which are exactly the o_packed rows its own
+# o_proj shard consumes. No collective is added -- o_proj_tp already
+# all-reduces after the projection.
+H_LOCAL = HEADS_PER_GROUP
 O_GROUP_IN = HEADS_PER_GROUP * HEAD_DIM
 NEG_INF = -1.0e20
 
@@ -59,8 +64,12 @@ ORI_BLOCK_NUM = DECODE_ORI_BLOCK_NUM
 GATHER_SPLITS = 4
 GATHER_ROWS_PER_TASK = WIN // GATHER_SPLITS
 GATHER_RUN = 16          # window sub-tile probed for physical contiguity -> one bulk DMA
-H_TILE = 16
-QK_M_TILE = 32           # qk_pv M rows per QK/PV matmul; QK_M_TILE/H_TILE-way KV L1->L0 reuse
+H_TILE = 8               # == H_LOCAL: one card's head slice is one tile
+QK_M_TILE = 8            # qk_pv real M rows == one card's heads
+# The cube addresses Acc in 16x16 fractal boxes, so an 8-head slice has to
+# occupy a 16-row box with 8 valid rows. That is the shard's tax: half of
+# every qk/pv box is padding.
+QK_M_BOX = 16
 ATTN_K_TILE = 128
 ROPE_TILE = 16
 ROPE_INTERLEAVE_TILE = 2 * ROPE_TILE
@@ -96,6 +105,7 @@ def sparse_attn_swa_packed(
     freqs_cos: pl.Tensor[[T, ROPE_DIM], pl.BF16],
     freqs_sin: pl.Tensor[[T, ROPE_DIM], pl.BF16],
     o_packed: pl.Tensor[[O_GROUPS * T, O_GROUP_IN], pl.BF16],
+    my_rank: pl.Scalar[pl.INT32],
 ) -> pl.Scalar[pl.TASK_ID]:
     """Sparse decode attention over the sliding window, and inverse RoPE, up to the packed head output.
 
@@ -148,26 +158,29 @@ def sparse_attn_swa_packed(
     # fused on a2a3: the PV output (Acc) -> online rescale (Vec) needs an
     # unsupported tmov, and a [H_TILE, HEAD_DIM] carry overflows the Vec buffer.
     q_flat = pl.reshape(q, [T * H, HEAD_DIM])
+    head_base = pl.cast(my_rank, pl.INDEX) * H_LOCAL
     o_packed_heads = pl.reshape(o_packed, [O_GROUPS * T * HEADS_PER_GROUP, HEAD_DIM])
-    sparse_blk_mi = pl.create_tensor([T * (H // H_TILE) * SPARSE_BLOCKS * H_TILE, 1], dtype=pl.FP32)
-    sparse_blk_li = pl.create_tensor([T * (H // H_TILE) * SPARSE_BLOCKS * H_TILE, 1], dtype=pl.FP32)
-    sparse_blk_oi = pl.create_tensor([T * (H // H_TILE) * SPARSE_BLOCKS * H_TILE, HEAD_DIM], dtype=pl.FP32)
+    sparse_blk_mi = pl.create_tensor([T * QK_M_BOX * SPARSE_BLOCKS, 1], dtype=pl.FP32)
+    sparse_blk_li = pl.create_tensor([T * QK_M_BOX * SPARSE_BLOCKS, 1], dtype=pl.FP32)
+    sparse_blk_oi = pl.create_tensor([T * QK_M_BOX * SPARSE_BLOCKS, HEAD_DIM], dtype=pl.FP32)
 
     with pl.spmd(T, name_hint="qk_pv", deps=[gather_tids[0]], allow_early_resolve=True) as qk_tid:
         qk_t = pl.tile.get_block_idx()
-        qk_token_base = qk_t * (H // H_TILE) * SPARSE_BLOCKS * H_TILE
+        qk_token_base = qk_t * QK_M_BOX * SPARSE_BLOCKS
         for qk_sb in pl.unroll(SPARSE_BLOCKS):
             qk_s0 = qk_sb * ATTN_K_TILE
             qk_bias_row = sparse_bias[qk_t : qk_t + 1, qk_s0 : qk_s0 + ATTN_K_TILE]
             qk_base = qk_t * WIN + qk_s0
             qk_kv = swa_kv_flat[qk_base : qk_base + ATTN_K_TILE, 0 : HEAD_DIM]
 
-            # Keep both 32-head batches in one token task so they reuse the KV
-            # tile already resident in L1 instead of loading it once per block.
-            for qk_hb in pl.pipeline(H // QK_M_TILE, stage=2):
+            # One head batch per card now, so there is no second batch to reuse
+            # the resident KV tile against.
+            for qk_hb in pl.pipeline(H_LOCAL // QK_M_TILE, stage=2):
                 qk_h0 = qk_hb * QK_M_TILE
-                qk_head_row = qk_t * H + qk_h0
-                qk_q_tile = q_flat[qk_head_row : qk_head_row + QK_M_TILE, 0 : HEAD_DIM]
+                qk_head_row = qk_t * H + head_base + qk_h0
+                qk_q_tile = pl.slice(
+                    q_flat, [QK_M_BOX, HEAD_DIM], [qk_head_row, 0],
+                    valid_shape=[QK_M_TILE, HEAD_DIM])
                 qk_raw = pl.matmul(qk_q_tile, qk_kv, b_trans=True, out_dtype=pl.FP32)
                 qk_scaled = pl.mul(qk_raw, SOFTMAX_SCALE)
                 qk_scores = pl.col_expand_add(qk_scaled, qk_bias_row)
@@ -178,14 +191,13 @@ def sparse_attn_swa_packed(
                 qk_li = pl.row_sum(qk_exp)
                 qk_exp_bf16 = pl.cast(qk_exp, target_type=pl.BF16, mode="rint")
                 qk_oi = pl.matmul(qk_exp_bf16, qk_kv, out_dtype=pl.FP32)
-                for qk_sub in pl.unroll(QK_M_TILE // H_TILE):
-                    qk_h_idx = qk_hb * (QK_M_TILE // H_TILE) + qk_sub
-                    qk_r0 = qk_sub * H_TILE
-                    qk_blk_base = qk_token_base + qk_h_idx * SPARSE_BLOCKS * H_TILE
-                    qk_row = qk_blk_base + qk_sb * H_TILE
-                    sparse_blk_mi[qk_row : qk_row + H_TILE, 0 : 1] = qk_mi[qk_r0 : qk_r0 + H_TILE, 0 : 1]
-                    sparse_blk_li[qk_row : qk_row + H_TILE, 0 : 1] = qk_li[qk_r0 : qk_r0 + H_TILE, 0 : 1]
-                    sparse_blk_oi[qk_row : qk_row + H_TILE, 0 : HEAD_DIM] = qk_oi[qk_r0 : qk_r0 + H_TILE, 0 : HEAD_DIM]
+                # One head tile per card, so the whole (valid) accumulator stores
+                # straight out -- slicing it to 8 rows would ask the cube for a
+                # partial 16x16 box, which has no address.
+                qk_row = qk_token_base + qk_sb * QK_M_BOX
+                sparse_blk_mi[qk_row : qk_row + QK_M_BOX, 0 : 1] = qk_mi
+                sparse_blk_li[qk_row : qk_row + QK_M_BOX, 0 : 1] = qk_li
+                sparse_blk_oi[qk_row : qk_row + QK_M_BOX, 0 : HEAD_DIM] = qk_oi
 
     # Materialize the head-invariant interleaved cos and signed-sin rows once.
     # This runs alongside qk_pv and keeps the exact indexed RoPE arithmetic used
@@ -234,18 +246,19 @@ def sparse_attn_swa_packed(
     # 32-block grid, which fits in one AIV wave and avoids eight group-grid
     # submissions. Each block writes two output-projection groups using the
     # same contiguous per-group stores.
-    with pl.spmd(T * (H // H_TILE), name_hint="merge_norm", deps=[qk_tid, rope_tid],
+    with pl.spmd(T * (H_LOCAL // H_TILE), name_hint="merge_norm", deps=[qk_tid, rope_tid],
                  allow_early_resolve=True) as merge_tid:
         m_idx = pl.tile.get_block_idx()
-        m_t = m_idx // (H // H_TILE)
-        m_h_idx = m_idx - m_t * (H // H_TILE)
+        m_t = m_idx // (H_LOCAL // H_TILE)
+        m_h_idx = m_idx - m_t * (H_LOCAL // H_TILE)
         m_h0 = m_h_idx * H_TILE
-        m_blk_base = m_t * H + m_h0
+        m_blk_base = m_t * QK_M_BOX * SPARSE_BLOCKS + m_h0
         m_mi = sparse_blk_mi[m_blk_base : m_blk_base + H_TILE, 0:1]
         m_li = sparse_blk_li[m_blk_base : m_blk_base + H_TILE, 0:1]
         m_oi = sparse_blk_oi[m_blk_base : m_blk_base + H_TILE, 0:HEAD_DIM]
 
-        n_sink = pl.reshape(attn_sink[m_h0 : m_h0 + H_TILE], [H_TILE, 1])
+        m_h_global = head_base + m_h0
+        n_sink = pl.reshape(attn_sink[m_h_global : m_h_global + H_TILE], [H_TILE, 1])
         n_sink_delta = pl.sub(n_sink, m_mi)
         n_sink_exp = pl.exp(n_sink_delta)
         n_denom = pl.add(m_li, n_sink_exp)
@@ -262,10 +275,9 @@ def sparse_attn_swa_packed(
         m_rot = pl.add(m_rope_cos, m_swap_sin)
         n_rope_bf16 = pl.cast(m_rot, target_type=pl.BF16, mode="rint")
 
-        m_g0 = m_h0 // HEADS_PER_GROUP
         for m_sg in pl.unroll(H_TILE // HEADS_PER_GROUP):
             m_src_h0 = m_sg * HEADS_PER_GROUP
-            n_pack_row = (m_g0 + m_sg) * T + m_t
+            n_pack_row = pl.cast(my_rank, pl.INDEX) * T + m_t
             n_dst_head = n_pack_row * HEADS_PER_GROUP
             o_packed_heads[n_dst_head : n_dst_head + HEADS_PER_GROUP, 0:NOPE_DIM] = n_bf16[
                 m_src_h0 : m_src_h0 + HEADS_PER_GROUP, 0:NOPE_DIM
@@ -318,7 +330,7 @@ def sparse_attn_swa(
     o_packed = pl.create_tensor([O_GROUPS * T, O_GROUP_IN], dtype=pl.BF16)
     merge_tid = sparse_attn_swa_packed(
         q, ori_kv, swa_indices, sparse_bias, attn_sink,
-        freqs_cos, freqs_sin, o_packed,
+        freqs_cos, freqs_sin, o_packed, pl.const(0, pl.INT32),
     )
     o_proj_grouped(o_packed, merge_tid, wo_a, wo_b, wo_b_scale, attn_out)
     return attn_out

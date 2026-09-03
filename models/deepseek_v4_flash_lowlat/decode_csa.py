@@ -187,6 +187,7 @@ def attention_csa_packed(
     o_packed: pl.Tensor[[O_GROUPS * T, O_GROUP_IN], pl.BF16],
     post_t: pl.Tensor[[T, HC_MULT], pl.FP32],
     comb_t: pl.Tensor[[T, HC_MULT * HC_MULT], pl.FP32],
+    my_rank: pl.Scalar[pl.INT32],
 ) -> pl.Scalar[pl.TASK_ID]:
     x_mixed = pl.create_tensor([T, D], dtype=pl.BF16)
     hc_pre(x_hc, hc_attn_fn, hc_attn_scale, hc_attn_base, x_mixed, post_t, comb_t)
@@ -271,6 +272,7 @@ def attention_csa_packed(
         x_normed_t, wq_a, wq_b, wq_b_scale, wkv,
         rope_cos_t, rope_sin_t, gamma_cq, gamma_ckv,
         q, kv, qr, qr_scale, late_dep,
+        pl.cast(my_rank, pl.INT32) * (H // O_GROUPS),
     )
 
     ori_block_num = pl.tensor.dim(kv_cache, 0)
@@ -322,7 +324,7 @@ def attention_csa_packed(
     return sparse_attn_csa_packed(
         q, kv_cache, window_swa_indices,
         cmp_kv, cmp_block_table, idx_topk_flat, position_ids_t1,
-        attn_sink, rope_cos_t, rope_sin_t, o_packed,
+        attn_sink, rope_cos_t, rope_sin_t, o_packed, my_rank,
     )
 
 
@@ -395,7 +397,7 @@ def attention_csa(
     comb_t = pl.create_tensor([T, HC_MULT * HC_MULT], dtype=pl.FP32)
     merge_tid = attention_csa_packed(
         x_hc, hc_attn_fn, hc_attn_scale, hc_attn_base, attn_norm_w, wq_a, wq_b, wq_b_scale, wkv, gamma_cq, gamma_ckv, freqs_cos, freqs_sin, cmp_wkv, cmp_wgate, cmp_ape, cmp_norm_w, compress_state, compress_state_block_table, idx_wq_b, idx_wq_b_scale, weights_proj, hadamard_idx, inner_wkv, inner_wgate, inner_ape, inner_norm_w, inner_compress_state, inner_compress_state_block_table, kv_cache, cmp_kv, cmp_block_table, idx_kv_cache, idx_kv_scale, idx_block_table, ori_slot_mapping, window_swa_indices, window_swa_lens, cmp_slot_mapping, idx_slot_mapping, state_slot_mapping, inner_state_slot_mapping, position_ids, kv_seq_lens, attn_sink,
-        wo_a_shard, wo_b_shard, o_packed, post_t, comb_t,
+        wo_a_shard, wo_b_shard, o_packed, post_t, comb_t, my_rank,
     )
     attn_out = pl.create_tensor([T, D], dtype=pl.BF16)
     o_proj_tp_core(
