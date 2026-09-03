@@ -82,8 +82,8 @@ GROUP_T_PAD = TP * T_PAD
 ATTENTION_WINDOW_ROWS = LOCAL_O_GROUPS * GROUP_T_PAD
 PUBLISH_GROUPS = H_TILE // HEADS_PER_GROUP
 
-if WIN != ATTN_K_TILE:
-    raise ValueError("HCA raw window must form one baseline-sized attention tile")
+if WIN != RAW_K_TILE:
+    raise ValueError("HCA raw attention evaluates the window in one tile; WIN must equal RAW_K_TILE")
 if HCA_MAX_COMPRESSED_ROWS > HCA_COMPRESSED_POOL_ROWS:
     raise ValueError("HCA compressed rows exceed the configured pool")
 if ATTN_K_TILE % BLOCK_SIZE != 0:
