@@ -279,7 +279,7 @@ def attention_hca(
                         pl.write(topk_all, [topk_t, topk_ck], pl.cast(-1, pl.INT32))
 
     merge_tid = sparse_attn_hca_packed(
-        q, kv_cache, window_swa_indices,
+        q, kv_cache, window_swa_indices, window_swa_lens,
         cmp_kv, cmp_block_table, topk_all,
         attn_sink, rope_cos_t, rope_sin_t, o_packed, my_rank,
     )

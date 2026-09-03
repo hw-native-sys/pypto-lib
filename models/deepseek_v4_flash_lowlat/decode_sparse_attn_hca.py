@@ -68,9 +68,6 @@ CMP_BLOCK_NUM = DECODE_CMP_BLOCK_NUM
 
 # tiling
 VALID_TOKEN_TILE = 8
-GATHER_SEGS = 4          # gather blocks per token; T*GATHER_SEGS co-resides with qproj_dequant
-# Each segment carries BOTH a window slice and a compressed-tail slice, whose
-# per-row costs are opposite (bulk-run window vs scattered per-row topk).
 GATHER_RUN = 16          # window sub-tile probed for physical contiguity -> one bulk DMA
 H_TILE = 8               # == H_LOCAL: one card's head slice is one tile
 QK_M_TILE = 8            # qk_pv real M rows == one card's heads
@@ -108,8 +105,29 @@ TOPK = WIN + CMP_TOPK    # cache-first window slots + the ratio-128 compressed t
 # output mixup); a 2-block build with an all-invalid 2nd block is bit-exact.
 SPARSE_BLOCKS = max(2, (TOPK + ATTN_K_TILE - 1) // ATTN_K_TILE)
 PADDED_TOPK = SPARSE_BLOCKS * ATTN_K_TILE
-GATHER_WIN_ROWS = WIN // GATHER_SEGS
-GATHER_CMP_ROWS = (PADDED_TOPK - WIN) // GATHER_SEGS
+# Both halves of the sparse-K tile are shared across a request's T tokens, so
+# each is gathered once instead of T times.
+#  * window -- the T tokens sit at consecutive positions, so their windows are
+#    the same span shifted one row per token and their union is WIN + S - 1
+#    rows. Token t reads the union slice at its own offset
+#    off_t = t - (len_t - len_0), so its K tile is the same WIN rows as before.
+#  * compressed -- the ratio-128 tail has no indexer: row k is compressed slot k
+#    for every token and only the valid count differs, so the last token's row
+#    is a superset and each token's own sparse_bias masks the rest.
+UNION_ROWS = WIN + S - 1
+# WIN / GATHER_RUN blocks carry whole runs and one trailing block carries the
+# 0..S-1 rows the earlier tokens add, which keeps every full block on the bulk
+# path instead of dropping the ragged one to per-row copies.
+UNION_FULL_TASKS = WIN // GATHER_RUN
+UNION_TASKS = UNION_FULL_TASKS + 1
+# The compressed half is scattered per-row copies, so it is tiled much finer
+# than the bulk window half to even out the two block costs.
+CMP_ROWS_PER_TASK = 8
+CMP_TASKS = CMP_TOPK // CMP_ROWS_PER_TASK
+GATHER_TASKS = UNION_TASKS + CMP_TASKS
+# One contiguous buffer, window union first, so qk_pv selects its half with
+# arithmetic on the sparse-block index instead of branching between tensors.
+KV_STRIDE = UNION_ROWS + CMP_TOPK
 
 assert CMP_BLOCKS_PER_REQ <= CMP_MAX_BLOCKS, (
     f"compressed block table ({CMP_MAX_BLOCKS} blocks) must index the whole "
@@ -118,6 +136,9 @@ assert B * CMP_BLOCKS_PER_REQ <= CMP_BLOCK_NUM, (
     f"compressed KV pool ({CMP_BLOCK_NUM} blocks) must hold B={B} requests x "
     f"{CMP_BLOCKS_PER_REQ} blocks; MAX_SUPPORTED_SEQ={MAX_SUPPORTED_SEQ}")
 assert WIN == ATTN_K_TILE, f"HCA window tile requires WIN ({WIN}) == ATTN_K_TILE ({ATTN_K_TILE})"
+assert SPARSE_BLOCKS == 2, (
+    f"qk_pv picks its half of hca_kv_flat from the sparse-block index, which "
+    f"assumes one window block and one compressed block, got {SPARSE_BLOCKS}")
 assert BLOCK_SIZE % GATHER_RUN == 0, "a contiguous run must not straddle two paged blocks by construction"
 
 
@@ -126,6 +147,7 @@ def sparse_attn_hca_packed(
     q: pl.Tensor[[T, H, HEAD_DIM], pl.BF16],
     ori_kv: pl.Tensor[[ORI_BLOCK_NUM_DYN, BLOCK_SIZE, 1, HEAD_DIM], pl.BF16],
     window_swa_indices: pl.Tensor[[T, WIN], pl.INT32],
+    window_swa_lens: pl.Tensor[[T], pl.INT32],
     cmp_kv: pl.Tensor[[CMP_BLOCK_NUM_DYN, CMP_STORAGE_BLOCK_SIZE, 1, HEAD_DIM], pl.BF16],
     cmp_block_table: pl.Tensor[[B, CMP_MAX_BLOCKS], pl.INT32],
     cmp_sparse_indices: pl.Tensor[[T, CMP_TOPK], pl.INT32],
@@ -165,65 +187,95 @@ def sparse_attn_hca_packed(
             sparse_bias[v_t0 : v_t0 + VALID_TOKEN_TILE, TOPK : PADDED_TOPK] = pl.full(
                 [VALID_TOKEN_TILE, PADDED_TOPK - TOPK], dtype=pl.FP32, value=NEG_INF)
 
-    # Sparse-K gather, hoisted out of qk_pv into its own grid, writing one token's
-    # sparse-K rows into the contiguous hca_kv_flat buffer. Every block carries a
-    # GATHER_WIN_ROWS slice of the window AND a GATHER_CMP_ROWS slice of the
-    # compressed tail, so the cheap bulk runs and the costly scattered rows are
-    # spread evenly. Invalid (-1) and padded lanes are zero-filled to match the
-    # golden's zero rows; the NEG_INF bias then kills them in the softmax.
-    hca_kv_flat = pl.create_tensor([T * PADDED_TOPK, HEAD_DIM], dtype=pl.BF16)
-    with pl.spmd(T * GATHER_SEGS, name_hint="hca_gather_kv") as gather_tid:
+    # Sparse-K gather, hoisted out of qk_pv into its own grid. Both halves are
+    # gathered once per request rather than once per token: the window blocks
+    # fill the shifted union and the compressed blocks fill the tail every token
+    # shares. Invalid (-1) and padded lanes are zero-filled to match the golden's
+    # zero rows; the NEG_INF bias then kills them in the softmax.
+    hca_kv_flat = pl.create_tensor([B * KV_STRIDE, HEAD_DIM], dtype=pl.BF16)
+    with pl.spmd(B * GATHER_TASKS, name_hint="hca_gather_kv") as gather_tid:
         g_task = pl.tile.get_block_idx()
-        g_t = g_task // GATHER_SEGS
-        g_seg = g_task - g_t * GATHER_SEGS
-        g_b = g_t // S
-        g_row0 = g_t * PADDED_TOPK
-
-        # Window slice: probe each sub-tile's first/last slot. Endpoints that are
-        # GATHER_RUN-1 apart mean the whole run sits in one paged block.
-        g_wk0 = g_seg * GATHER_WIN_ROWS
-        for g_sub in pl.range(GATHER_WIN_ROWS // GATHER_RUN):
-            g_sk0 = g_wk0 + g_sub * GATHER_RUN
-            g_sdst = g_row0 + g_sk0
-            g_first = pl.read(window_swa_indices, [g_t, g_sk0])
-            g_last = pl.read(window_swa_indices, [g_t, g_sk0 + GATHER_RUN - 1])
-            # A -1 slot anywhere in the run pins g_run_ok below the match value,
-            # so an invalid or block-straddling run takes the per-row path.
-            g_run_ok = (g_last - g_first) + pl.min(g_first, 0) * GATHER_RUN
-            if g_run_ok == GATHER_RUN - 1:
-                g_run_src = pl.cast(g_first, pl.INDEX)
-                hca_kv_flat[g_sdst : g_sdst + GATHER_RUN, 0:HEAD_DIM] = ori_kv_flat[
-                    g_run_src : g_run_src + GATHER_RUN, 0:HEAD_DIM
-                ]
+        g_b = g_task // GATHER_TASKS
+        g_slot = g_task - g_b * GATHER_TASKS
+        g_t0 = g_b * S
+        g_last_t = g_t0 + S - 1
+        g_row0 = g_b * KV_STRIDE
+        if g_slot < UNION_TASKS:
+            # Union row i holds absolute position u0 + i, where u0 is the
+            # request's oldest visible position. The last token's window covers
+            # rows [g_off, g_off + WIN) and the first token's covers the rows
+            # below it, so those two index rows name every union row.
+            g_off = pl.cast(
+                (S - 1) - (pl.read(window_swa_lens, [g_last_t]) - pl.read(window_swa_lens, [g_t0])),
+                pl.INDEX)
+            g_i0 = g_slot * GATHER_RUN
+            g_sdst = g_row0 + g_i0
+            if g_slot < UNION_FULL_TASKS:
+                # Probe the run's first/last slot: endpoints GATHER_RUN-1 apart
+                # mean the whole run sits in one paged block and moves as one
+                # bulk copy. Both endpoints name consecutive absolute positions
+                # even when the run straddles g_off, so one probe still covers
+                # the two index rows.
+                g_sel_a = pl.min(pl.max(g_i0 - g_off + 1, 0), 1)
+                g_first = pl.read(window_swa_indices, [g_t0 + g_sel_a * (S - 1),
+                                                       g_i0 - g_sel_a * g_off])
+                g_ie = g_i0 + GATHER_RUN - 1
+                g_sel_b = pl.min(pl.max(g_ie - g_off + 1, 0), 1)
+                g_last = pl.read(window_swa_indices, [g_t0 + g_sel_b * (S - 1),
+                                                      g_ie - g_sel_b * g_off])
+                # A -1 slot anywhere in the run pins g_run_ok below the match
+                # value, so an invalid or block-straddling run takes the per-row
+                # path.
+                g_run_ok = (g_last - g_first) + pl.min(g_first, 0) * GATHER_RUN
+                if g_run_ok == GATHER_RUN - 1:
+                    g_run_src = pl.cast(g_first, pl.INDEX)
+                    hca_kv_flat[g_sdst : g_sdst + GATHER_RUN, 0:HEAD_DIM] = ori_kv_flat[
+                        g_run_src : g_run_src + GATHER_RUN, 0:HEAD_DIM
+                    ]
+                else:
+                    for g_dr in pl.range(GATHER_RUN):
+                        g_i = g_i0 + g_dr
+                        g_wdst = g_sdst + g_dr
+                        g_sel = pl.min(pl.max(g_i - g_off + 1, 0), 1)
+                        g_win_slot_i32 = pl.read(window_swa_indices,
+                                                 [g_t0 + g_sel * (S - 1), g_i - g_sel * g_off])
+                        if g_win_slot_i32 >= 0:
+                            g_win_slot = pl.cast(g_win_slot_i32, pl.INDEX)
+                            hca_kv_flat[g_wdst : g_wdst + 1, 0:HEAD_DIM] = ori_kv_flat[
+                                g_win_slot : g_win_slot + 1, 0:HEAD_DIM
+                            ]
+                        else:
+                            hca_kv_flat[g_wdst : g_wdst + 1, 0:HEAD_DIM] = pl.full(
+                                [1, HEAD_DIM], dtype=pl.BF16, value=0.0)
             else:
-                for g_dr in pl.range(GATHER_RUN):
-                    g_wdst = g_sdst + g_dr
-                    g_win_slot_i32 = pl.read(window_swa_indices, [g_t, g_sk0 + g_dr])
-                    if g_win_slot_i32 >= 0:
-                        g_win_slot = pl.cast(g_win_slot_i32, pl.INDEX)
-                        hca_kv_flat[g_wdst : g_wdst + 1, 0:HEAD_DIM] = ori_kv_flat[
-                            g_win_slot : g_win_slot + 1, 0:HEAD_DIM
+                # Tail: the g_off rows the earlier tokens add on top of the last
+                # token's window, so fewer than S rows and only read by the
+                # tokens whose window reaches them.
+                for g_tr in pl.range(g_off):
+                    g_tdst = g_sdst + g_tr
+                    g_tslot_i32 = pl.read(window_swa_indices, [g_last_t, WIN - g_off + g_tr])
+                    if g_tslot_i32 >= 0:
+                        g_tslot = pl.cast(g_tslot_i32, pl.INDEX)
+                        hca_kv_flat[g_tdst : g_tdst + 1, 0:HEAD_DIM] = ori_kv_flat[
+                            g_tslot : g_tslot + 1, 0:HEAD_DIM
                         ]
                     else:
-                        hca_kv_flat[g_wdst : g_wdst + 1, 0:HEAD_DIM] = pl.full(
+                        hca_kv_flat[g_tdst : g_tdst + 1, 0:HEAD_DIM] = pl.full(
                             [1, HEAD_DIM], dtype=pl.BF16, value=0.0)
-
-        # Compressed slice: topk slots are scattered, so each row is its own
-        # block-table lookup + copy.
-        g_ck0 = g_seg * GATHER_CMP_ROWS
-        g_cdst0 = g_row0 + WIN + g_ck0
-        for g_dr in pl.range(GATHER_CMP_ROWS):
-            g_dst = g_cdst0 + g_dr
-            g_cmp_k = g_ck0 + g_dr
-            if g_cmp_k < CMP_TOPK:
-                g_ridx = pl.read(cmp_sparse_indices, [g_t, g_cmp_k])
+        else:
+            # Compressed tail, gathered once from the last token's row -- the
+            # widest valid prefix. Scattered slots, so one block-table lookup and
+            # copy per row.
+            g_ck0 = (g_slot - UNION_TASKS) * CMP_ROWS_PER_TASK
+            g_cdst0 = g_row0 + UNION_ROWS + g_ck0
+            for g_dr in pl.range(CMP_ROWS_PER_TASK):
+                g_dst = g_cdst0 + g_dr
+                g_ridx = pl.read(cmp_sparse_indices, [g_last_t, g_ck0 + g_dr])
                 if g_ridx >= 0:
                     g_csrc = pl.cast(pl.read(cmp_block_table, [g_b, g_ridx]), pl.INDEX)
                     hca_kv_flat[g_dst : g_dst + 1, 0:HEAD_DIM] = cmp_kv_flat[g_csrc : g_csrc + 1, 0:HEAD_DIM]
                 else:
                     hca_kv_flat[g_dst : g_dst + 1, 0:HEAD_DIM] = pl.full([1, HEAD_DIM], dtype=pl.BF16, value=0.0)
-            else:
-                hca_kv_flat[g_dst : g_dst + 1, 0:HEAD_DIM] = pl.full([1, HEAD_DIM], dtype=pl.BF16, value=0.0)
 
     # qk_pv writes per-tile (mi, li, oi) to GM; merge_norm reads them back. Not
     # fused on a2a3: the PV output (Acc) -> online rescale (Vec) needs an
@@ -243,7 +295,15 @@ def sparse_attn_hca_packed(
         # and PV consume the SAME pre-gathered KV tile.
         qk_s0 = qk_sb * ATTN_K_TILE
         qk_bias_row = sparse_bias[qk_t : qk_t + 1, qk_s0 : qk_s0 + ATTN_K_TILE]
-        qk_base = qk_t * PADDED_TOPK + qk_s0
+        # Block 0 is this token's window slice of the union; block 1 is the
+        # compressed tail every token shares. One expression, so the two halves
+        # stay a single tensor and the cube sees the same K tile as before.
+        qk_b = qk_t // S
+        qk_t0 = qk_b * S
+        qk_off = pl.cast(
+            pl.read(window_swa_lens, [qk_t0]) - pl.read(window_swa_lens, [qk_t]),
+            pl.INDEX) + (qk_t - qk_t0)
+        qk_base = qk_b * KV_STRIDE + (1 - qk_sb) * qk_off + qk_sb * UNION_ROWS
         qk_kv = hca_kv_flat[qk_base : qk_base + ATTN_K_TILE, 0:HEAD_DIM]
 
         # Cube-batch QK_M_TILE head rows per QK/PV matmul so the shared KV
@@ -393,6 +453,7 @@ def sparse_attn_hca(
     q: pl.Tensor[[T, H, HEAD_DIM], pl.BF16],
     ori_kv: pl.Tensor[[ORI_BLOCK_NUM_DYN, BLOCK_SIZE, 1, HEAD_DIM], pl.BF16],
     window_swa_indices: pl.Tensor[[T, WIN], pl.INT32],
+    window_swa_lens: pl.Tensor[[T], pl.INT32],
     cmp_kv: pl.Tensor[[CMP_BLOCK_NUM_DYN, CMP_STORAGE_BLOCK_SIZE, 1, HEAD_DIM], pl.BF16],
     cmp_block_table: pl.Tensor[[B, CMP_MAX_BLOCKS], pl.INT32],
     cmp_sparse_indices: pl.Tensor[[T, CMP_TOPK], pl.INT32],
@@ -412,7 +473,7 @@ def sparse_attn_hca(
     """
     o_packed = pl.create_tensor([O_GROUPS * T, O_GROUP_IN], dtype=pl.BF16)
     merge_tid = sparse_attn_hca_packed(
-        q, ori_kv, window_swa_indices, cmp_kv, cmp_block_table,
+        q, ori_kv, window_swa_indices, window_swa_lens, cmp_kv, cmp_block_table,
         cmp_sparse_indices, attn_sink, freqs_cos, freqs_sin, o_packed,
         pl.const(0, pl.INT32),
     )
@@ -424,6 +485,7 @@ def sparse_attn_test(
     q: pl.Tensor[[T, H, HEAD_DIM], pl.BF16],
     ori_kv: pl.Tensor[[ORI_BLOCK_NUM_DYN, BLOCK_SIZE, 1, HEAD_DIM], pl.BF16],
     window_swa_indices: pl.Tensor[[T, WIN], pl.INT32],
+    window_swa_lens: pl.Tensor[[T], pl.INT32],
     cmp_kv: pl.Tensor[[CMP_BLOCK_NUM_DYN, CMP_STORAGE_BLOCK_SIZE, 1, HEAD_DIM], pl.BF16],
     cmp_block_table: pl.Tensor[[B, CMP_MAX_BLOCKS], pl.INT32],
     cmp_sparse_indices: pl.Tensor[[T, CMP_TOPK], pl.INT32],
@@ -439,6 +501,7 @@ def sparse_attn_test(
         q,
         ori_kv,
         window_swa_indices,
+        window_swa_lens,
         cmp_kv,
         cmp_block_table,
         cmp_sparse_indices,
@@ -604,13 +667,24 @@ def build_tensor_specs(
             kv[0, 16, 0, 0] = 4.0
         return kv
 
+    def init_window_swa_lens():
+        """Visible window length per token.
+
+        The T tokens of a decode step sit at consecutive positions, so their
+        windows grow one row per token. This fixture keeps every window
+        left-aligned at position 0 (the short-context regime), which is the
+        layout init_window_swa_indices builds below.
+        """
+        return torch.tensor([WIN - (S - 1) + (t % S) for t in range(T)], dtype=torch.int32)
+
     def init_window_swa_indices():
         """Build physical cache-row indices for standalone window raw slots."""
         tbl = init_window_block_table()
+        lens = init_window_swa_lens()
         indices = torch.full((T, WIN), -1, dtype=torch.int32)
         for t in range(T):
             b = t // S
-            for raw in range(WIN):
+            for raw in range(int(lens[t].item())):
                 blk = int(tbl[b, raw // BLOCK_SIZE].item())
                 if blk >= 0:
                     indices[t, raw] = blk * BLOCK_SIZE + raw % BLOCK_SIZE
@@ -690,6 +764,7 @@ def build_tensor_specs(
         TensorSpec("q", [T, H, HEAD_DIM], torch.bfloat16, init_value=init_q),
         TensorSpec("ori_kv", [ORI_BLOCK_NUM, BLOCK_SIZE, 1, HEAD_DIM], torch.bfloat16, init_value=init_ori_kv),
         TensorSpec("window_swa_indices", [T, WIN], torch.int32, init_value=init_window_swa_indices),
+        TensorSpec("window_swa_lens", [T], torch.int32, init_value=init_window_swa_lens),
         TensorSpec("cmp_kv", [CMP_BLOCK_NUM, CMP_STORAGE_BLOCK_SIZE, 1, HEAD_DIM], torch.bfloat16, init_value=init_cmp_kv),
         TensorSpec("cmp_block_table", [B, CMP_MAX_BLOCKS], torch.int32, init_value=init_cmp_block_table),
         TensorSpec("cmp_sparse_indices", [T, CMP_TOPK], torch.int32, init_value=init_cmp_sparse_indices),
