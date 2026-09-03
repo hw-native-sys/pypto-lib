@@ -248,7 +248,7 @@ def attention_csa_packed(
     wq_b_flat = pl.reshape(wq_b, [Q_LORA * H * HEAD_DIM])
     wo_a_flat = pl.reshape(wo_a_w, [WO_A_FLAT])
     wo_b_flat = pl.reshape(wo_b_w, [WO_B_FLAT])
-    with pl.at(level=pl.Level.CORE_GROUP, name_hint="prefetch_attn_w", deps=[rms_tid]):
+    with pl.at(level=pl.Level.CORE_GROUP, name_hint="prefetch_attn_w", allow_early_resolve=True):
         warm_ctx = pl.prefetch.make_context()
         pl.prefetch.async_prefetch(wq_a_flat, warm_ctx)
         pl.prefetch.async_prefetch(wkv_flat, warm_ctx)

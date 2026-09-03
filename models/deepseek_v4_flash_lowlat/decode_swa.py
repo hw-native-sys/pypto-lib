@@ -130,7 +130,7 @@ def attention_swa(
     wq_b_flat = pl.reshape(wq_b, [Q_LORA * H * HEAD_DIM])
     wo_a_flat = pl.reshape(wo_a, [O_GROUPS * O_LORA * O_GROUP_IN])
     wo_b_flat = pl.reshape(wo_b, [D * O_GROUPS * O_LORA])
-    with pl.at(level=pl.Level.CORE_GROUP, name_hint="prefetch_attn_w", deps=[rms_tid]):
+    with pl.at(level=pl.Level.CORE_GROUP, name_hint="prefetch_attn_w", allow_early_resolve=True):
         warm_ctx = pl.prefetch.make_context()
         pl.prefetch.async_prefetch(wq_a_flat, warm_ctx)
         pl.prefetch.async_prefetch(wkv_flat, warm_ctx)
