@@ -169,6 +169,7 @@ def attention_swa(
         x_normed_t, wq_a, wq_b, wq_b_scale, wkv,
         rope_cos_t, rope_sin_t, gamma_cq, gamma_ckv,
         q, kv, qr, qr_scale, late_dep,
+        pl.cast(my_rank, pl.INT32) * (H // O_GROUPS),
     )
 
     # Commit current decode KV and build its additive padding mask in one task.
@@ -195,7 +196,7 @@ def attention_swa(
     o_packed = pl.create_tensor([O_GROUPS * T, O_GROUP_IN], dtype=pl.BF16)
     merge_tid = sparse_attn_swa_packed(
         q, kv_cache, swa_indices, sparse_bias,
-        attn_sink, rope_cos_t, rope_sin_t, o_packed,
+        attn_sink, rope_cos_t, rope_sin_t, o_packed, my_rank,
     )
     o_proj_tp_core(
         o_packed, merge_tid, wo_a_shard, wo_b_shard, wo_b_scale, attn_out,

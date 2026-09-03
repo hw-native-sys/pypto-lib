@@ -22,6 +22,10 @@ T_DYN = pl.dynamic("T_DYN")  # T = B * S
 # model config
 D = M.hidden_size
 H = M.num_attention_heads
+# Attention is head-sharded: this card computes group `my_rank`'s heads
+# only. q / q_proj_i32 keep their full [.., H, ..] shape -- the other
+# groups' columns are simply never written, and never read.
+Q_HEADS_LOCAL = H // M.o_groups
 HEAD_DIM = M.head_dim
 ROPE_DIM = M.qk_rope_head_dim
 ROPE_HALF = ROPE_DIM // 2
@@ -46,12 +50,16 @@ MATMUL_T_TILE = 16
 QR_M_TILE = MATMUL_T_TILE  # qr_proj token (M) tile; cube rows must be a 16-row boxed tile
 QR_N_TILE = 128         # qr_proj Q_LORA (N) per matmul
 QR_K_TILE = 256         # qr_proj D (K) reduction tile    | divides QR_K_SLICE
-QR_OK = 2               # qr_proj split-K factor          | D//QR_OK cores share each N-group
+# Split-K 1, not 2: at T = 8 this GEMM is M-starved, so the second K split
+# buys no throughput and costs a cross-block partial reduction. 8 blocks.
+QR_OK = 1               # qr_proj split-K factor
 QR_K_SLICE = D // QR_OK # qr_proj K per split (=2048)     | QR_K_SLICE//QR_K_TILE inner chunks
 KV_M_TILE = MATMUL_T_TILE  # kv_proj token (M) tile; decode pads from 8 real rows to 16
 KV_N_TILE = 128         # kv_proj HEAD_DIM (N) per matmul
 KV_K_TILE = 256         # kv_proj D (K) reduction tile    | divides KV_K_SLICE
-KV_OK = 4               # kv_proj split-K factor          | D//KV_OK cores share each N-group
+# Same reasoning as QR_OK: 4 -> 2 halves the grid to 8 blocks. Widening
+# KV_N_TILE to 256 for the same count measured worse.
+KV_OK = 2               # kv_proj split-K factor
 KV_K_SLICE = D // KV_OK # kv_proj K per split (=1024)     | KV_K_SLICE//KV_K_TILE inner chunks
 QPROJ_M_TILE = MATMUL_T_TILE  # qproj token (M) tile; decode pads from 8 real rows to 16
 KV_RMS_T_TILE = 8       # kv rms-norm + rope fused token (T) tile
@@ -62,7 +70,7 @@ assert (DECODE_BATCH * DECODE_SEQ) % T_TILE == 0
 assert DECODE_BATCH * DECODE_SEQ <= MATMUL_T_TILE
 assert Q_LORA % QR_N_TILE == 0 and D % QR_OK == 0 and QR_K_SLICE % QR_K_TILE == 0
 assert HEAD_DIM % KV_N_TILE == 0 and D % KV_OK == 0 and KV_K_SLICE % KV_K_TILE == 0
-assert (H * HEAD_DIM) % QPROJ_MM_N_TILE == 0 and ((H * HEAD_DIM) // QPROJ_MM_N_TILE) % 4 == 0
+assert (Q_HEADS_LOCAL * HEAD_DIM) % QPROJ_MM_N_TILE == 0
 assert Q_LORA % Q_PROJ_TILE == 0 and QPROJ_MM_N_TILE * QPROJ_M_TILE * 4 <= 128 * 1024  # L0C Acc cap
 assert (DECODE_BATCH * DECODE_SEQ) % KV_RMS_T_TILE == 0
 assert (DECODE_BATCH * DECODE_SEQ) % Q_ROPE_T_TILE == 0
@@ -103,6 +111,7 @@ def qkv_proj_rope(
     qr: pl.Tensor[[T_DYN, Q_LORA], pl.INT8],
     qr_scale: pl.Tensor[[T_DYN, 1], pl.FP32],
     late_dep: pl.Scalar[pl.TASK_ID],
+    q_head_base: pl.Scalar[pl.INT32],
 ):
     t_dim = pl.tensor.dim(x, 0)
     x_view = pl.reshape(x, [t_dim, D])
@@ -221,8 +230,9 @@ def qkv_proj_rope(
     # instead of pinning it next to qproj and competing with the critical qr_proj AIV work.
     q_proj_i32 = pl.create_tensor([t_matmul, H * HEAD_DIM], dtype=pl.INT32)
     # One output-column fragment per task.
-    for qproj_n_idx in pl.spmd((H * HEAD_DIM) // QPROJ_MM_N_TILE, name_hint="qproj_matmul"):
-        w_col0 = qproj_n_idx * QPROJ_MM_N_TILE
+    q_col_base = pl.cast(q_head_base, pl.INDEX) * HEAD_DIM
+    for qproj_n_idx in pl.spmd((Q_HEADS_LOCAL * HEAD_DIM) // QPROJ_MM_N_TILE, name_hint="qproj_matmul"):
+        w_col0 = q_col_base + qproj_n_idx * QPROJ_MM_N_TILE
         for tc in pl.range(t_matmul // QPROJ_M_TILE):
             t0 = tc * QPROJ_M_TILE
             col_acc = pl.create_tensor([QPROJ_M_TILE, QPROJ_MM_N_TILE], dtype=pl.INT32)
@@ -241,8 +251,8 @@ def qkv_proj_rope(
     # retain it across the RMS reduction instead of rereading/recomputing NOPE.
     # RoPE: out[j] = inv_rms * (x[j] * cos[j] + x[j^1] * sign[j] * sin[j]).
     q_flat = pl.reshape(q, [t_dim, H * HEAD_DIM])
-    for hg_idx in pl.spmd(H // Q_ROPE_H_TILE, name_hint="qproj_dequant_rms_nope_rope", allow_early_resolve=True):
-        hg = hg_idx * Q_ROPE_H_TILE
+    for hg_idx in pl.spmd(Q_HEADS_LOCAL // Q_ROPE_H_TILE, name_hint="qproj_dequant_rms_nope_rope", allow_early_resolve=True):
+        hg = pl.cast(q_head_base, pl.INDEX) + hg_idx * Q_ROPE_H_TILE
         for tg_idx in pl.range(t_dim // Q_ROPE_T_TILE):
             tg = tg_idx * Q_ROPE_T_TILE
             qr_scale_dq_t = qr_scale_view[tg : tg + Q_ROPE_T_TILE, :]

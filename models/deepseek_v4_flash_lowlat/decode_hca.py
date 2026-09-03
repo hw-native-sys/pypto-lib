@@ -224,6 +224,7 @@ def attention_hca(
         x_normed, wq_a, wq_b, wq_b_scale, wkv,
         rope_cos_t, rope_sin_t, gamma_cq, gamma_ckv,
         q, kv, qr, qr_scale, late_dep,
+        pl.cast(my_rank, pl.INT32) * (H // O_GROUPS),
     )
 
     ori_block_num = pl.tensor.dim(kv_cache, 0)
@@ -280,7 +281,7 @@ def attention_hca(
     merge_tid = sparse_attn_hca_packed(
         q, kv_cache, window_swa_indices,
         cmp_kv, cmp_block_table, topk_all,
-        attn_sink, rope_cos_t, rope_sin_t, o_packed,
+        attn_sink, rope_cos_t, rope_sin_t, o_packed, my_rank,
     )
     o_proj_tp_core(
         o_packed, merge_tid, wo_a_shard, wo_b_shard, wo_b_scale, attn_out,
