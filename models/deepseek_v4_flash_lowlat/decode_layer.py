@@ -220,9 +220,15 @@ def decode_layer(
             wkv, gamma_cq, gamma_ckv, freqs_cos, freqs_sin,
             kv_cache,
             swa_slot_mapping, swa_indices, swa_lens, position_ids,
-            attn_sink, wo_a, wo_b, wo_b_scale,
+            attn_sink, wo_a_shard, wo_b_shard, wo_b_scale,
             x_attn,
+            oproj_reduce_window, oproj_scale_window,
+            oproj_reduce_signal, oproj_sync_signal,
+            my_rank, pl.const(CSA_OPROJ_FIRST_EPOCH, pl.INT32),
         )
+        # One attention layer per dispatch, so this is that layer: reset the
+        # counters the projection left monotonic for the next dispatch.
+        clear_csa_oproj_signals(x_attn, oproj_reduce_signal, oproj_sync_signal)
     elif layer_id % 2 == 1:
         attention_hca(
             x_hc,
@@ -235,9 +241,15 @@ def decode_layer(
             ori_slot_mapping, window_swa_indices, window_swa_lens,
             hca_cmp_slot_mapping, hca_state_slot_mapping,
             position_ids, kv_seq_lens,
-            attn_sink, wo_a, wo_b, wo_b_scale,
+            attn_sink, wo_a_shard, wo_b_shard, wo_b_scale,
             x_attn,
+            oproj_reduce_window, oproj_scale_window,
+            oproj_reduce_signal, oproj_sync_signal,
+            my_rank, pl.const(CSA_OPROJ_FIRST_EPOCH, pl.INT32),
         )
+        # One attention layer per dispatch, so this is that layer: reset the
+        # counters the projection left monotonic for the next dispatch.
+        clear_csa_oproj_signals(x_attn, oproj_reduce_signal, oproj_sync_signal)
     else:
         attention_csa(
             x_hc,
