@@ -313,7 +313,7 @@ def decode_fwd(
     ],
     reduce_window: pld.DistributedTensor[[REDUCE_WINDOW_ROWS, D], pl.FP32],
     reduce_signal: pld.DistributedTensor[[N_RANKS, 1], pl.INT32],
-    oproj_reduce_window: pld.DistributedTensor[[CSA_OPROJ_REDUCE_ROWS, D], pl.INT32],
+    oproj_reduce_window: pld.DistributedTensor[[CSA_OPROJ_REDUCE_ROWS, D], pl.FP32],
     oproj_scale_window: pld.DistributedTensor[[CSA_OPROJ_SCALE_ROWS, 1], pl.FP32],
     oproj_reduce_signal: pld.DistributedTensor[[N_RANKS, 1], pl.INT32],
     oproj_sync_signal: pld.DistributedTensor[[N_RANKS, 1], pl.INT32],
@@ -809,7 +809,7 @@ def l2_decode_fwd(
     ],
     reduce_window: pld.DistributedTensor[[REDUCE_WINDOW_ROWS, D], pl.FP32],
     reduce_signal: pld.DistributedTensor[[N_RANKS, 1], pl.INT32],
-    oproj_reduce_window: pld.DistributedTensor[[CSA_OPROJ_REDUCE_ROWS, D], pl.INT32],
+    oproj_reduce_window: pld.DistributedTensor[[CSA_OPROJ_REDUCE_ROWS, D], pl.FP32],
     oproj_scale_window: pld.DistributedTensor[[CSA_OPROJ_SCALE_ROWS, 1], pl.FP32],
     oproj_reduce_signal: pld.DistributedTensor[[N_RANKS, 1], pl.INT32],
     oproj_sync_signal: pld.DistributedTensor[[N_RANKS, 1], pl.INT32],
@@ -989,7 +989,7 @@ def l3_decode_fwd(
     # The CSA o-projection reduces INT32 partials plus their per-rank activation
     # scale, so it carries its own windows; its counters are monotonic across the
     # forward's CSA layers and cleared once at the end, like the MoE's.
-    oproj_reduce_buf = pld.alloc_window_buffer([CSA_OPROJ_REDUCE_ROWS, D], dtype=pl.INT32)
+    oproj_reduce_buf = pld.alloc_window_buffer([CSA_OPROJ_REDUCE_ROWS, D], dtype=pl.FP32)
     oproj_scale_buf = pld.alloc_window_buffer([CSA_OPROJ_SCALE_ROWS, 1], dtype=pl.FP32)
     oproj_reduce_signal_buf = pld.alloc_window_buffer([N_RANKS, 1], dtype=pl.INT32)
     oproj_sync_signal_buf = pld.alloc_window_buffer([N_RANKS, 1], dtype=pl.INT32)
@@ -1005,7 +1005,7 @@ def l3_decode_fwd(
         reduce_signal = pld.window(reduce_signal_buf, [N_RANKS, 1], dtype=pl.INT32)
         embed_window = pld.window(embed_window_buf, [T, D], dtype=pl.BF16)
         embed_signal = pld.window(embed_signal_buf, [N_RANKS, 1], dtype=pl.INT32)
-        oproj_reduce_window = pld.window(oproj_reduce_buf, [CSA_OPROJ_REDUCE_ROWS, D], dtype=pl.INT32)
+        oproj_reduce_window = pld.window(oproj_reduce_buf, [CSA_OPROJ_REDUCE_ROWS, D], dtype=pl.FP32)
         oproj_scale_window = pld.window(oproj_scale_buf, [CSA_OPROJ_SCALE_ROWS, 1], dtype=pl.FP32)
         oproj_reduce_signal = pld.window(oproj_reduce_signal_buf, [N_RANKS, 1], dtype=pl.INT32)
         oproj_sync_signal = pld.window(oproj_sync_signal_buf, [N_RANKS, 1], dtype=pl.INT32)
