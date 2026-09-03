@@ -76,7 +76,7 @@ ROPE_CS_T_TILE = 8
 T_PAD = ((T + 16 - 1) // 16) * 16
 MERGE_WORKERS = 48
 ATTENTION_PUBLISH_WORKERS = 48
-ATTENTION_PUBLISH_T_TILE = 8
+ATTENTION_PUBLISH_T_TILE = 4
 LOCAL_O_GROUPS = O_GROUPS // TP
 GROUP_T_PAD = TP * T_PAD
 ATTENTION_WINDOW_ROWS = LOCAL_O_GROUPS * GROUP_T_PAD
@@ -120,13 +120,11 @@ def sparse_attn_hca(
     cmp_block_table: pl.Tensor[[B_DYN, CMP_TABLE_BLOCKS_DYN], pl.INT32],
     position_ids: pl.Tensor[[T_DYN], pl.INT32],
     kv_seq_lens: pl.Tensor[[B_DYN], pl.INT32],
-    attn_sink: pl.Tensor[[H], pl.FP32],
     freqs_cos: pl.Tensor[[T_DYN, ROPE_DIM], pl.BF16],
     freqs_sin: pl.Tensor[[T_DYN, ROPE_DIM], pl.BF16],
-    o_packed_heads: pl.Tensor[[O_GROUPS * T_PAD, O_GROUP_IN], pl.BF16],
     cache_ready_dep: pl.Scalar[pl.TASK_ID],
 ):
-    """Merge raw and compressed attention into grouped inverse-RoPE heads."""
+    """Compute raw and compressed HCA states and inverse-RoPE metadata."""
     t_dim = pl.tensor.dim(q, 0)
     rope_cs_blocks = t_dim // ROPE_CS_T_TILE
     ori_block_num = pl.tensor.dim(ori_kv, 0)
@@ -136,10 +134,8 @@ def sparse_attn_hca(
     ori_kv_flat = pl.reshape(ori_kv, [ori_block_num * BLOCK_SIZE, HEAD_DIM])
     cmp_kv_flat = pl.reshape(cmp_kv, [cmp_block_num * BLOCK_SIZE, HEAD_DIM])
     q_flat = pl.reshape(q, [t_dim * H, HEAD_DIM])
-    attn_sink_col = pl.reshape(attn_sink, [H, 1])
     request_count = pl.tensor.dim(cmp_block_table, 0)
     raw_gather_count = request_count
-    stream_block_count = t_dim * (H // H_TILE)
     cmp_gather_count = request_count * cmp_work_count
     cmp_qk_block_count = t_dim * cmp_work_count
     cmp_partial_rows = t_dim * (H // H_TILE) * cmp_work_count * H_TILE
@@ -496,10 +492,73 @@ def sparse_attn_hca(
 
         cmp_branch_tids[0] = cmp_qk_tid
 
+    return (
+        stream_state_m,
+        stream_state_l,
+        stream_heads,
+        cmp_partial_m,
+        cmp_partial_l,
+        cmp_partial_o,
+        rope_cos_il,
+        rope_sin_signed,
+        raw_branch_tids[0],
+        cmp_branch_tids[0],
+        rope_cs_tids[0],
+    )
+
+
+@pl.jit.inline(auto_scope=False)
+def sparse_attn_hca_tp1(
+    q: pl.Tensor[[T_DYN, H, HEAD_DIM], pl.BF16],
+    ori_kv: pl.Tensor[[ORI_BLOCK_NUM_DYN, BLOCK_SIZE, 1, HEAD_DIM], pl.BF16],
+    window_swa_indices: pl.Tensor[[T_DYN, WIN], pl.INT32],
+    window_swa_lens: pl.Tensor[[T_DYN], pl.INT32],
+    cmp_kv: pl.Tensor[[CMP_BLOCK_NUM_DYN, BLOCK_SIZE, 1, HEAD_DIM], pl.BF16],
+    cmp_block_table: pl.Tensor[[B_DYN, CMP_TABLE_BLOCKS_DYN], pl.INT32],
+    position_ids: pl.Tensor[[T_DYN], pl.INT32],
+    kv_seq_lens: pl.Tensor[[B_DYN], pl.INT32],
+    attn_sink: pl.Tensor[[H], pl.FP32],
+    freqs_cos: pl.Tensor[[T_DYN, ROPE_DIM], pl.BF16],
+    freqs_sin: pl.Tensor[[T_DYN, ROPE_DIM], pl.BF16],
+    o_packed_heads: pl.Tensor[[O_GROUPS * T_PAD, O_GROUP_IN], pl.BF16],
+    cache_ready_dep: pl.Scalar[pl.TASK_ID],
+) -> tuple[pl.Tensor, pl.Scalar[pl.TASK_ID]]:
+    """Write HCA heads as grouped ``[T_PAD, O_GROUP_IN]`` slabs."""
+    (
+        stream_state_m,
+        stream_state_l,
+        stream_heads,
+        cmp_partial_m,
+        cmp_partial_l,
+        cmp_partial_o,
+        rope_cos_il,
+        rope_sin_signed,
+        raw_tid,
+        cmp_tid,
+        rope_tid,
+    ) = sparse_attn_hca(
+        q,
+        ori_kv,
+        window_swa_indices,
+        window_swa_lens,
+        cmp_kv,
+        cmp_block_table,
+        position_ids,
+        kv_seq_lens,
+        freqs_cos,
+        freqs_sin,
+        cache_ready_dep,
+    )
+    t_dim = pl.tensor.dim(stream_state_m, 0) // H
+    cmp_table_blocks = pl.tensor.dim(cmp_block_table, 1)
+    cmp_work_count = (cmp_table_blocks + CMP_PAGES_PER_WORK - 1) // CMP_PAGES_PER_WORK
+    stream_block_count = t_dim * (H // H_TILE)
+    attn_sink_col = pl.reshape(attn_sink, [H, 1])
+
     with pl.spmd(
         MERGE_WORKERS,
         name_hint="hca_stream_merge_pack",
-        deps=[raw_branch_tids[0], cmp_branch_tids[0], rope_cs_tids[0]],
+        deps=[raw_tid, cmp_tid, rope_tid],
     ) as heads_tid:
         worker = pl.tile.get_block_idx()
         for stream_idx in pl.range(worker, stream_block_count, MERGE_WORKERS):
@@ -599,42 +658,6 @@ def sparse_attn_hca(
                     stream_pack_row : stream_pack_row + 1,
                     stream_pack_col : stream_pack_col + HEAD_DIM,
                 ] = stream_full_bf16[stream_hi : stream_hi + 1, 0:HEAD_DIM]
-
-    return o_packed_heads, heads_tid
-
-
-@pl.jit.inline(auto_scope=False)
-def sparse_attn_hca_tp1(
-    q: pl.Tensor[[T_DYN, H, HEAD_DIM], pl.BF16],
-    ori_kv: pl.Tensor[[ORI_BLOCK_NUM_DYN, BLOCK_SIZE, 1, HEAD_DIM], pl.BF16],
-    window_swa_indices: pl.Tensor[[T_DYN, WIN], pl.INT32],
-    window_swa_lens: pl.Tensor[[T_DYN], pl.INT32],
-    cmp_kv: pl.Tensor[[CMP_BLOCK_NUM_DYN, BLOCK_SIZE, 1, HEAD_DIM], pl.BF16],
-    cmp_block_table: pl.Tensor[[B_DYN, CMP_TABLE_BLOCKS_DYN], pl.INT32],
-    position_ids: pl.Tensor[[T_DYN], pl.INT32],
-    kv_seq_lens: pl.Tensor[[B_DYN], pl.INT32],
-    attn_sink: pl.Tensor[[H], pl.FP32],
-    freqs_cos: pl.Tensor[[T_DYN, ROPE_DIM], pl.BF16],
-    freqs_sin: pl.Tensor[[T_DYN, ROPE_DIM], pl.BF16],
-    o_packed_heads: pl.Tensor[[O_GROUPS * T_PAD, O_GROUP_IN], pl.BF16],
-    cache_ready_dep: pl.Scalar[pl.TASK_ID],
-) -> tuple[pl.Tensor, pl.Scalar[pl.TASK_ID]]:
-    """Write HCA heads as grouped ``[T_PAD, O_GROUP_IN]`` slabs."""
-    o_packed_heads, heads_tid = sparse_attn_hca(
-        q,
-        ori_kv,
-        window_swa_indices,
-        window_swa_lens,
-        cmp_kv,
-        cmp_block_table,
-        position_ids,
-        kv_seq_lens,
-        attn_sink,
-        freqs_cos,
-        freqs_sin,
-        o_packed_heads,
-        cache_ready_dep,
-    )
 
     return o_packed_heads, heads_tid
 
