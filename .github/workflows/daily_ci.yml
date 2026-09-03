@@ -4,6 +4,14 @@ on:
   schedule:
     - cron: '51 20 * * *'  # UTC 20:51 = Shanghai 04:51
   workflow_dispatch:
+  push:
+    # TEMPORARY (scoped to the experiment branch, not for merge): fire this
+    # workflow on push so a candidate fix can be measured against the real A5
+    # sweep on demand instead of waiting for 21:00 UTC. The model-tests-a5 job
+    # below is byte-identical to main's, so a push run reproduces exactly what
+    # the nightly does for the V4-Pro sweep; the other jobs are skipped on push
+    # (see their notes) so the shared runners are not held for an hour.
+    branches: [exp/ptoas-op-fusion-ab]
 
 # Every job only reads the repo (checkouts use persist-credentials: false, the
 # artifact up/download steps use the run-scoped runtime token, the summary
@@ -13,6 +21,8 @@ permissions:
 
 jobs:
   model-tests-sim:
+    # TEMPORARY (this branch): skipped on push — this branch's push runs exist only to collect the A5 V4-Pro sweep.
+    if: ${{ github.event_name != 'push' }}
     # Simulator job: no device needed, so it runs on the CPU runner — but on the
     # host, through the same setup-ci-job composite as the a2a3 device job (same
     # user, same bundle venv + activate.sh, same ci-cache). needs-device:false is
@@ -141,6 +151,8 @@ jobs:
           path: checkout/results.tsv
 
   model-tests-a2a3:
+    # TEMPORARY (this branch): skipped on push — see the sim job's note.
+    if: ${{ github.event_name != 'push' }}
     # Runs directly on the host like pypto's dist-system-tests — multi-card
     # kernels use HCCL, which needs a host-only env (set_env.sh, HCCL plugin
     # paths); under docker the chip child silent-crashes in comm_init. It holds
@@ -485,6 +497,8 @@ jobs:
           path: checkout/results.tsv
 
   e2e-flash-a5:
+    # TEMPORARY (this branch): skipped on push — it shares the single npu-a5 runner with model-tests-a5 and would delay the sweep by ~30 min.
+    if: ${{ github.event_name != 'push' }}
     name: DeepSeek-V4-Flash EP8 end-to-end (a5)
     # Report-only, like model-tests-a5: the 8-card SDMA/AICPU path on the A5 host
     # has had platform-side outages (every >=2-card program dying with 507015 /
