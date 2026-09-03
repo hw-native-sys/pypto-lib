@@ -77,11 +77,14 @@ def gdn_chunk_o(
                 qc = pl.slice(q_flat, [CHUNK, D], [t0, h * D])
                 g_col = pl.reshape(pl.slice(g_sum, [1, CHUNK], [h, t0]), [CHUNK, 1])
                 # exp on the ROW vector, reshaped after -- NOT pl.exp(g_col).
-                # Under pl.split, an elementwise op *following* a [1,C]->[C,1]
-                # reshape loses the split tracking and lane 1 reads the wrong
-                # half (max abs diff 36.86). Either ingredient alone is fine;
-                # it is the order that matters. Repro + isolation matrix:
-                # devtools/split-investigation/repro/.
+                # Under pl.split, a view op reading the pass's per-lane slice
+                # used to fold onto the sliced buffer's BASE, so lane 1 applied
+                # lane 0's gate (max abs diff 36.86). FIXED upstream-side
+                # 2026-09-02 (LowerAutoVectorSplit now sinks the lane slice past
+                # the view); pl.exp(g_col) is verified correct on hardware with
+                # that fix. This spelling is KEPT so the kernel still builds
+                # against stock pypto -- same values, same generated code.
+                # Repro + isolation matrix: devtools/split-investigation/repro/.
                 eg = pl.reshape(pl.exp(pl.slice(g_sum, [1, CHUNK], [h, t0])), [CHUNK, 1])
 
                 # inter = exp(g_i) * (Q @ S), split over D so the tile crossing
