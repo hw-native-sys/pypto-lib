@@ -1042,7 +1042,9 @@ def _main() -> None:
     out = torch.empty([BATCH_PAD, HIDDEN], dtype=torch.bfloat16)
 
     if compile_only:
-        program = _decode_layer_test_entry.lower(*inputs, out)
+        program = _decode_layer_test_entry.lower(
+            *inputs, out, config=RunConfig(platform=args.platform, backend_type=backend_type)
+        )
         print(f"Lowered A8W8 decode layer with {len(program.functions)} function(s).")
         return
 
