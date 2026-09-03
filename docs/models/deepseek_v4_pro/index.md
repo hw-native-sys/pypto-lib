@@ -30,11 +30,11 @@ therefore replaces it with `KERNEL_MAX_SEQ_LEN = 16384` — an 8k prompt plus 51
 decode steps, the budget the Flash cases already exercise. Raise that one
 constant if a case needs a longer context.
 
-Native MXFP8-MXFP4 is not implemented yet. The tracked kernels run an INT8
-stand-in with the same tensor split as
-[V4-Flash](../deepseek_v4_flash_mtp/index.md#what-is-quantized): `gen_routed_weight` in
-[expert_routed.py](../../../models/deepseek_v4_pro/expert_routed.py) re-quantizes
-off the MXFP4 grid into INT8 rather than feeding the cube MXFP4 weights.
+Native MXFP8-MXFP4 MoE migration (staged):
+
+- **Expert W1/W3 (landed)**: [expert_shared.py](../../../models/deepseek_v4_pro/expert_shared.py) and [expert_routed.py](../../../models/deepseek_v4_pro/expert_routed.py) use ``pl.matmul_mx`` for the up-projection weights; W2 remains INT8.
+- **Host helpers**: [mx_utils.py](../../../models/deepseek_v4_pro/mx_utils.py) — MXFP grid simulation, E8M0 pack/unpack, FP4→FP8 LUT tables, and ``matmul_mx`` goldens.
+- **Gate / MoE dispatch (deferred)**: [gate.py](../../../models/deepseek_v4_pro/gate.py) and [moe.py](../../../models/deepseek_v4_pro/moe.py) still use the **INT8 stand-in** ABI until MX activation quant and dispatch wiring land. **Do not use ``pl.quant_mx``.**
 
 ### Model shape and layer schedule
 
