@@ -371,6 +371,8 @@ def decode_fwd(
     kv_cache_l0 = pl.slice(kv_cache, [ori_block_num, BLOCK_SIZE, 1, HEAD_DIM], [0 * ori_block_num, 0, 0, 0])
     attn_sink_l0: pl.Tensor[[H], pl.FP32] = pl.slice(attn_sink, [H], [0 * H])
     wo_a_l0: pl.Tensor[[O_GROUPS, O_LORA, O_GROUP_IN], pl.BF16] = pl.slice(wo_a, [O_GROUPS, O_LORA, O_GROUP_IN], [0 * O_GROUPS, 0, 0])
+    wo_a_shard_l0: pl.Tensor[[1, O_LORA, O_GROUP_IN], pl.BF16] = pl.slice(wo_a_shard, [1, O_LORA, O_GROUP_IN], [0, 0, 0])
+    wo_b_shard_l0: pl.Tensor[[D, O_LORA], pl.INT8] = pl.slice(wo_b_shard, [D, O_LORA], [0 * D, 0])
     wo_b_l0: pl.Tensor[[D, O_GROUPS * O_LORA], pl.INT8] = pl.slice(wo_b, [D, O_GROUPS * O_LORA], [0 * D, 0])
     wo_b_scale_l0: pl.Tensor[[D], pl.FP32] = pl.slice(wo_b_scale, [D], [0 * D])
     hc_ffn_fn_l0: pl.Tensor[[MIX_HC, HC_DIM], pl.FP32] = pl.slice(hc_ffn_fn, [MIX_HC, HC_DIM], [0 * MIX_HC, 0])
@@ -399,6 +401,8 @@ def decode_fwd(
     kv_cache_l1 = pl.slice(kv_cache, [ori_block_num, BLOCK_SIZE, 1, HEAD_DIM], [1 * ori_block_num, 0, 0, 0])
     attn_sink_l1: pl.Tensor[[H], pl.FP32] = pl.slice(attn_sink, [H], [1 * H])
     wo_a_l1: pl.Tensor[[O_GROUPS, O_LORA, O_GROUP_IN], pl.BF16] = pl.slice(wo_a, [O_GROUPS, O_LORA, O_GROUP_IN], [1 * O_GROUPS, 0, 0])
+    wo_a_shard_l1: pl.Tensor[[1, O_LORA, O_GROUP_IN], pl.BF16] = pl.slice(wo_a_shard, [1, O_LORA, O_GROUP_IN], [1, 0, 0])
+    wo_b_shard_l1: pl.Tensor[[D, O_LORA], pl.INT8] = pl.slice(wo_b_shard, [D, O_LORA], [1 * D, 0])
     wo_b_l1: pl.Tensor[[D, O_GROUPS * O_LORA], pl.INT8] = pl.slice(wo_b, [D, O_GROUPS * O_LORA], [1 * D, 0])
     wo_b_scale_l1: pl.Tensor[[D], pl.FP32] = pl.slice(wo_b_scale, [D], [1 * D])
     hc_ffn_fn_l1: pl.Tensor[[MIX_HC, HC_DIM], pl.FP32] = pl.slice(hc_ffn_fn, [MIX_HC, HC_DIM], [1 * MIX_HC, 0])
@@ -425,8 +429,11 @@ def decode_fwd(
             wkv_l0, gamma_cq_l0, gamma_ckv_l0, swa_freqs_cos, swa_freqs_sin,
             kv_cache_l0,
             swa_slot_mapping, swa_indices, swa_lens, position_ids,
-            attn_sink_l0, wo_a_l0, wo_b_l0, wo_b_scale_l0,
+            attn_sink_l0, wo_a_shard_l0, wo_b_shard_l0, wo_b_scale_l0,
             x_attn0,
+            oproj_reduce_window, oproj_scale_window,
+            oproj_reduce_signal, oproj_sync_signal,
+            my_rank, pl.cast(1, pl.INT32),
         )
     with pl.scope():
         moe(
@@ -447,8 +454,11 @@ def decode_fwd(
             wkv_l1, gamma_cq_l1, gamma_ckv_l1, swa_freqs_cos, swa_freqs_sin,
             kv_cache_l1,
             swa_slot_mapping, swa_indices, swa_lens, position_ids,
-            attn_sink_l1, wo_a_l1, wo_b_l1, wo_b_scale_l1,
+            attn_sink_l1, wo_a_shard_l1, wo_b_shard_l1, wo_b_scale_l1,
             x_attn1,
+            oproj_reduce_window, oproj_scale_window,
+            oproj_reduce_signal, oproj_sync_signal,
+            my_rank, pl.cast(2, pl.INT32),
         )
     with pl.scope():
         moe(
@@ -465,8 +475,12 @@ def decode_fwd(
         csa_layer: pl.Scalar[pl.INT32] = pl.cast(loop_i * 2 + 2, pl.INT32)
         hca_layer: pl.Scalar[pl.INT32] = pl.cast(loop_i * 2 + 3, pl.INT32)
         csa_moe_epoch: pl.Scalar[pl.INT32] = pl.cast(loop_i * 2 + 3, pl.INT32)
-        # 1-based o-projection call id; the last CSA layer below takes CSA_NUM_LAYERS.
-        csa_oproj_epoch: pl.Scalar[pl.INT32] = pl.cast(loop_i + 1, pl.INT32)
+        # 1-based o-projection call id. Every attention layer all-reduces its
+        # projection, so this counts all of them -- the two leading SWA layers
+        # take 1 and 2 and the last CSA layer below takes 2 * HCA_NUM_LAYERS + 3,
+        # the same numbering the MoE epoch beside it uses.
+        csa_oproj_epoch: pl.Scalar[pl.INT32] = pl.cast(loop_i * 2 + 3, pl.INT32)
+        hca_oproj_epoch: pl.Scalar[pl.INT32] = pl.cast(loop_i * 2 + 4, pl.INT32)
         hca_moe_epoch: pl.Scalar[pl.INT32] = pl.cast(loop_i * 2 + 4, pl.INT32)
         x_attn_csa: pl.Tensor[[T, HC_MULT, D], pl.FP32] = pl.create_tensor([T, HC_MULT, D], dtype=pl.FP32)
         x_attn_hca: pl.Tensor[[T, HC_MULT, D], pl.FP32] = pl.create_tensor([T, HC_MULT, D], dtype=pl.FP32)
@@ -566,6 +580,8 @@ def decode_fwd(
         kv_cache_hca = pl.slice(kv_cache, [ori_block_num, BLOCK_SIZE, 1, HEAD_DIM], [hca_layer * ori_block_num, 0, 0, 0])
         attn_sink_hca: pl.Tensor[[H], pl.FP32] = pl.slice(attn_sink, [H], [hca_layer * H])
         wo_a_hca: pl.Tensor[[O_GROUPS, O_LORA, O_GROUP_IN], pl.BF16] = pl.slice(wo_a, [O_GROUPS, O_LORA, O_GROUP_IN], [hca_layer * O_GROUPS, 0, 0])
+        wo_a_shard_hca: pl.Tensor[[1, O_LORA, O_GROUP_IN], pl.BF16] = pl.slice(wo_a_shard, [1, O_LORA, O_GROUP_IN], [hca_layer, 0, 0])
+        wo_b_shard_hca: pl.Tensor[[D, O_LORA], pl.INT8] = pl.slice(wo_b_shard, [D, O_LORA], [hca_layer * D, 0])
         wo_b_hca: pl.Tensor[[D, O_GROUPS * O_LORA], pl.INT8] = pl.slice(wo_b, [D, O_GROUPS * O_LORA], [hca_layer * D, 0])
         wo_b_scale_hca: pl.Tensor[[D], pl.FP32] = pl.slice(wo_b_scale, [D], [hca_layer * D])
         hca_cmp_wkv_hca: pl.Tensor[[HCA_MAIN_OUT_DIM, D], pl.BF16] = pl.slice(hca_cmp_wkv, [HCA_MAIN_OUT_DIM, D], [loop_i * HCA_MAIN_OUT_DIM, 0])
@@ -600,8 +616,11 @@ def decode_fwd(
                 ori_slot_mapping, swa_indices, swa_lens,
                 hca_cmp_slot_mapping, hca_state_slot_mapping,
                 position_ids, kv_seq_lens,
-                attn_sink_hca, wo_a_hca, wo_b_hca, wo_b_scale_hca,
+                attn_sink_hca, wo_a_shard_hca, wo_b_shard_hca, wo_b_scale_hca,
                 x_attn_hca,
+                oproj_reduce_window, oproj_scale_window,
+                oproj_reduce_signal, oproj_sync_signal,
+                my_rank, hca_oproj_epoch,
             )
         with pl.scope():
             moe(
@@ -636,7 +655,7 @@ def decode_fwd(
     wo_b_scale_last: pl.Tensor[[D], pl.FP32] = pl.slice(wo_b_scale, [D], [csa_layer_last * D])
     wo_a_shard_last: pl.Tensor[[1, O_LORA, O_GROUP_IN], pl.BF16] = pl.slice(wo_a_shard, [1, O_LORA, O_GROUP_IN], [csa_layer_last, 0, 0])
     wo_b_shard_last: pl.Tensor[[D, O_LORA], pl.INT8] = pl.slice(wo_b_shard, [D, O_LORA], [csa_layer_last * D, 0])
-    last_oproj_epoch: pl.Scalar[pl.INT32] = pl.cast(CSA_NUM_LAYERS, pl.INT32)
+    last_oproj_epoch: pl.Scalar[pl.INT32] = pl.cast(2 * HCA_NUM_LAYERS + 3, pl.INT32)
     csa_cmp_wkv_last: pl.Tensor[[CSA_MAIN_OUT_DIM, D], pl.BF16] = pl.slice(csa_cmp_wkv, [CSA_MAIN_OUT_DIM, D], [(CSA_NUM_LAYERS - 1) * CSA_MAIN_OUT_DIM, 0])
     csa_cmp_wgate_last: pl.Tensor[[CSA_MAIN_OUT_DIM, D], pl.BF16] = pl.slice(csa_cmp_wgate, [CSA_MAIN_OUT_DIM, D], [(CSA_NUM_LAYERS - 1) * CSA_MAIN_OUT_DIM, 0])
     csa_cmp_ape_last: pl.Tensor[[CSA_COMPRESS_RATIO, CSA_MAIN_OUT_DIM], pl.FP32] = pl.slice(csa_cmp_ape, [CSA_COMPRESS_RATIO, CSA_MAIN_OUT_DIM], [(CSA_NUM_LAYERS - 1) * CSA_COMPRESS_RATIO, 0])

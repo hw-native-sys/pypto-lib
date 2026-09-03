@@ -16,6 +16,10 @@ Companion files: attention_csa_draft.py (ratio=4)
 
 
 import pypto.language as pl
+import pypto.language.distributed as pld
+
+import o_proj_tp as OTP
+from o_proj_tp import o_proj_tp_core
 
 from config import (
     FLASH as M,
@@ -33,7 +37,7 @@ from hc_pre import hc_pre
 from hc_post import hc_post
 from qkv_proj_rope import qkv_proj_rope
 from rmsnorm import rms_norm
-from decode_sparse_attn_swa import sparse_attn_swa
+from decode_sparse_attn_swa import sparse_attn_swa_packed
 
 
 # model config
@@ -74,6 +78,18 @@ SPARSE_ROPE_TILE = 16
 SPARSE_ROPE_INTERLEAVE_TILE = 2 * SPARSE_ROPE_TILE
 NEG_INF = -1.0e20
 
+# This card owns group `my_rank` of the output projection, so the weights it
+# warms and multiplies are one group's slice, not the whole bank. Names mirror
+# decode_csa.py; a pl.jit tensor annotation cannot carry a dotted name, so the
+# OTP.* values are aliased here.
+WO_A_FLAT = O_LORA * O_GROUP_IN
+WO_B_FLAT = D * O_LORA
+OPROJ_N_RANKS = OTP.N_RANKS
+OPROJ_REDUCE_ROWS = OTP.REDUCE_WINDOW_ROWS
+OPROJ_SCALE_ROWS = OTP.SCALE_WINDOW_ROWS
+OPROJ_FIRST_EPOCH = OTP.FIRST_EPOCH
+
+
 @pl.jit.inline
 def attention_swa(
     x_hc: pl.Tensor[[T, HC_MULT, D], pl.FP32],
@@ -100,10 +116,16 @@ def attention_swa(
     # sparse_attn
     attn_sink: pl.Tensor[[H], pl.FP32],
     # o_proj
-    wo_a: pl.Tensor[[O_GROUPS, O_LORA, O_GROUP_IN], pl.BF16],
-    wo_b: pl.Tensor[[D, O_GROUPS * O_LORA], pl.INT8],
+    wo_a_shard: pl.Tensor[[1, O_LORA, O_GROUP_IN], pl.BF16],
+    wo_b_shard: pl.Tensor[[D, O_LORA], pl.INT8],
     wo_b_scale: pl.Tensor[[D], pl.FP32],
     x_out: pl.Tensor[[T, HC_MULT, D], pl.FP32],
+    reduce_window: pld.DistributedTensor[[OPROJ_REDUCE_ROWS, D], pl.FP32],
+    scale_window: pld.DistributedTensor[[OPROJ_SCALE_ROWS, 1], pl.FP32],
+    reduce_signal: pld.DistributedTensor[[OPROJ_N_RANKS, 1], pl.INT32],
+    sync_signal: pld.DistributedTensor[[OPROJ_N_RANKS, 1], pl.INT32],
+    my_rank: pl.Scalar[pl.INT32],
+    oproj_epoch: pl.Scalar[pl.INT32],
 ):
     x_mixed = pl.create_tensor([T, D], dtype=pl.BF16)
     post_t = pl.create_tensor([T, HC_MULT], dtype=pl.FP32)
@@ -128,8 +150,8 @@ def attention_swa(
     wq_a_flat = pl.reshape(wq_a, [D * Q_LORA])
     wkv_flat = pl.reshape(wkv, [D * HEAD_DIM])
     wq_b_flat = pl.reshape(wq_b, [Q_LORA * H * HEAD_DIM])
-    wo_a_flat = pl.reshape(wo_a, [O_GROUPS * O_LORA * O_GROUP_IN])
-    wo_b_flat = pl.reshape(wo_b, [D * O_GROUPS * O_LORA])
+    wo_a_flat = pl.reshape(wo_a_shard, [WO_A_FLAT])
+    wo_b_flat = pl.reshape(wo_b_shard, [WO_B_FLAT])
     with pl.at(level=pl.Level.CORE_GROUP, name_hint="prefetch_attn_w", allow_early_resolve=True):
         warm_ctx = pl.prefetch.make_context()
         pl.prefetch.async_prefetch(wq_a_flat, warm_ctx)
@@ -170,10 +192,14 @@ def attention_swa(
         )
         sparse_bias[0:T, 0:WIN] = pl.mul(pl.sub(v_valid, 1.0), -NEG_INF)
     attn_out = pl.create_tensor([T, D], dtype=pl.BF16)
-    sparse_attn_swa(
+    o_packed = pl.create_tensor([O_GROUPS * T, O_GROUP_IN], dtype=pl.BF16)
+    merge_tid = sparse_attn_swa_packed(
         q, kv_cache, swa_indices, sparse_bias,
-        attn_sink, rope_cos_t, rope_sin_t,
-        wo_a, wo_b, wo_b_scale, attn_out,
+        attn_sink, rope_cos_t, rope_sin_t, o_packed,
+    )
+    o_proj_tp_core(
+        o_packed, merge_tid, wo_a_shard, wo_b_shard, wo_b_scale, attn_out,
+        reduce_window, scale_window, reduce_signal, sync_signal, my_rank, oproj_epoch,
     )
 
     hc_post(attn_out, x_hc, post_t, comb_t, x_out)

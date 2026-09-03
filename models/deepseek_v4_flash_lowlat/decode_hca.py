@@ -15,6 +15,10 @@ Companion files: attention_swa.py (ratio=0)
 
 
 import pypto.language as pl
+import pypto.language.distributed as pld
+
+import o_proj_tp as OTP
+from o_proj_tp import o_proj_tp_core
 
 from config import (
     FLASH as M,
@@ -36,7 +40,7 @@ from qkv_proj_rope import qkv_proj_rope
 from rmsnorm import rms_norm
 from rope_interleave import rope_interleave
 from decode_compressor_ratio128 import compressor_ratio128
-from decode_sparse_attn_hca import sparse_attn_hca, CMP_TOPK as HCA_SPARSE_CMP_TOPK
+from decode_sparse_attn_hca import sparse_attn_hca_packed, CMP_TOPK as HCA_SPARSE_CMP_TOPK
 
 
 # model config
@@ -97,6 +101,18 @@ HCA_TOPK_TOKEN_TILE = 8   # tokens per cache-window topk SPMD block
 HCA_WB_TOKEN_TILE = 8  # tokens per cache-writeback SPMD block
 
 
+# This card owns group `my_rank` of the output projection, so the weights it
+# warms and multiplies are one group's slice, not the whole bank. Names mirror
+# decode_csa.py; a pl.jit tensor annotation cannot carry a dotted name, so the
+# OTP.* values are aliased here.
+WO_A_FLAT = O_LORA * O_GROUP_IN
+WO_B_FLAT = D * O_LORA
+OPROJ_N_RANKS = OTP.N_RANKS
+OPROJ_REDUCE_ROWS = OTP.REDUCE_WINDOW_ROWS
+OPROJ_SCALE_ROWS = OTP.SCALE_WINDOW_ROWS
+OPROJ_FIRST_EPOCH = OTP.FIRST_EPOCH
+
+
 @pl.jit.inline
 def attention_hca(
     x_hc: pl.Tensor[[T, HC_MULT, D], pl.FP32],
@@ -135,11 +151,17 @@ def attention_hca(
     kv_seq_lens: pl.Tensor[[B], pl.INT32],
     # sparse_attn
     attn_sink: pl.Tensor[[H], pl.FP32],
-    # o_proj (fused into sparse_attn)
-    wo_a: pl.Tensor[[O_GROUPS, O_LORA, O_GROUP_IN], pl.BF16],
-    wo_b: pl.Tensor[[D, O_GROUPS * O_LORA], pl.INT8],
+    # o_proj, sharded one group per card
+    wo_a_shard: pl.Tensor[[1, O_LORA, O_GROUP_IN], pl.BF16],
+    wo_b_shard: pl.Tensor[[D, O_LORA], pl.INT8],
     wo_b_scale: pl.Tensor[[D], pl.FP32],
     x_out: pl.Tensor[[T, HC_MULT, D], pl.FP32],
+    reduce_window: pld.DistributedTensor[[OPROJ_REDUCE_ROWS, D], pl.FP32],
+    scale_window: pld.DistributedTensor[[OPROJ_SCALE_ROWS, 1], pl.FP32],
+    reduce_signal: pld.DistributedTensor[[OPROJ_N_RANKS, 1], pl.INT32],
+    sync_signal: pld.DistributedTensor[[OPROJ_N_RANKS, 1], pl.INT32],
+    my_rank: pl.Scalar[pl.INT32],
+    oproj_epoch: pl.Scalar[pl.INT32],
 ):
     """HCA decode orchestration for compress_ratio=128."""
     x_mixed = pl.create_tensor([T, D], dtype=pl.BF16)
@@ -183,8 +205,8 @@ def attention_hca(
     wq_a_flat = pl.reshape(wq_a, [D * Q_LORA])
     wkv_flat = pl.reshape(wkv, [D * HEAD_DIM])
     wq_b_flat = pl.reshape(wq_b, [Q_LORA * H * HEAD_DIM])
-    wo_a_flat = pl.reshape(wo_a, [O_GROUPS * O_LORA * O_GROUP_IN])
-    wo_b_flat = pl.reshape(wo_b, [D * O_GROUPS * O_LORA])
+    wo_a_flat = pl.reshape(wo_a_shard, [WO_A_FLAT])
+    wo_b_flat = pl.reshape(wo_b_shard, [WO_B_FLAT])
     with pl.at(level=pl.Level.CORE_GROUP, name_hint="prefetch_attn_w", allow_early_resolve=True):
         warm_ctx = pl.prefetch.make_context()
         pl.prefetch.async_prefetch(wq_a_flat, warm_ctx)
@@ -235,6 +257,7 @@ def attention_hca(
     # K/V by its stored raw value (order-agnostic), so the full-ring rotation is
     # dead. The compressed-slot ramp is fused into the same block.
     attn_out = pl.create_tensor([T, D], dtype=pl.BF16)
+    o_packed = pl.create_tensor([O_GROUPS * T, O_GROUP_IN], dtype=pl.BF16)
     topk_all = pl.create_tensor([T, HCA_CMP_TOPK], dtype=pl.INT32)
     for topk_block in pl.spmd(T // HCA_TOPK_TOKEN_TILE, name_hint="hca_cache_topk"):
         topk_t0 = topk_block * HCA_TOPK_TOKEN_TILE
@@ -254,11 +277,14 @@ def attention_hca(
                     else:
                         pl.write(topk_all, [topk_t, topk_ck], pl.cast(-1, pl.INT32))
 
-    sparse_attn_hca(
+    merge_tid = sparse_attn_hca_packed(
         q, kv_cache, window_swa_indices,
         cmp_kv, cmp_block_table, topk_all,
-        attn_sink, rope_cos_t, rope_sin_t,
-        wo_a, wo_b, wo_b_scale, attn_out,
+        attn_sink, rope_cos_t, rope_sin_t, o_packed,
+    )
+    o_proj_tp_core(
+        o_packed, merge_tid, wo_a_shard, wo_b_shard, wo_b_scale, attn_out,
+        reduce_window, scale_window, reduce_signal, sync_signal, my_rank, oproj_epoch,
     )
 
     hc_post(attn_out, x_hc, post_t, comb_t, x_out)
