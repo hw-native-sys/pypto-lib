@@ -58,7 +58,7 @@ def _main_compute_sequence() -> list[str]:
     ignored_host_prep = {"build_decode_metadata", "pack_x_hc"}
     return [
         "lm_head_tail" if name == "lm_head_with_sampling" else name
-        for name in _bare_call_sequence(_MAIN_PATH, "decode_fwd_inline")
+        for name in _bare_call_sequence(_MAIN_PATH, "decode_fwd")
         if name not in ignored_host_prep
     ]
 
