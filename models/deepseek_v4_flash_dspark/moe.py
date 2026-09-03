@@ -130,7 +130,7 @@ def clear_prefill_moe_signals(
 
 
 # === Dispatch ================================================================
-# Exchange route counts, push payload lanes, defer payload waits, and compact rows by expert.
+# Exchange route counts, push payload lanes, wait for the peer payloads, and compact rows by expert.
 @pl.jit.inline
 def dispatch(
     indices: pl.Tensor[[T, TOPK], pl.INT32],
@@ -290,7 +290,7 @@ def dispatch(
     with pl.at(level=pl.Level.CORE_GROUP, name_hint="dispatch_wait") as _wait_tid:
         for src in pl.range(N_RANKS):
             if src != my_rank:
-                pld.system.defer_wait(
+                pld.system.wait(
                     signal=data_arrived,
                     offsets=[src, 0],
                     expected=pl.cast(moe_epoch * N_LOCAL, pl.INT32),
@@ -327,7 +327,7 @@ def dispatch(
 
 
 # === Combine =================================================================
-# Push rows back to their origin rank, defer peer waits, then reduce
+# Push rows back to their origin rank, wait for the peer rows, then reduce
 # ffn_out[t] = sh[t] + Sigma_k routed_y_buf[t*TOPK+k].
 @pl.jit.inline
 def combine(
@@ -381,7 +381,7 @@ def combine(
     with pl.at(level=pl.Level.CORE_GROUP, name_hint="combine_wait") as _cwait_tid:
         for src in pl.range(N_RANKS):
             if src != my_rank:
-                pld.system.defer_wait(
+                pld.system.wait(
                     signal=combine_arrived,
                     offsets=[src, 0],
                     expected=pl.cast(moe_epoch * N_LOCAL, pl.INT32),
@@ -691,7 +691,7 @@ def prefill_moe(
             with pl.at(level=pl.Level.CORE_GROUP, name_hint="prefill_moe_wave_wait") as wait_tid:
                 for peer in pl.range(N_RANKS):
                     if peer != my_rank:
-                        pld.system.defer_wait(
+                        pld.system.wait(
                             signal=stage_done, offsets=[peer, 0],
                             expected=moe_epoch, cmp=pld.WaitCmp.Ge,
                         )

@@ -391,7 +391,7 @@ def prefill_layer_moe(
     with pl.at(level=pl.Level.CORE_GROUP, name_hint="prefill_layer_moe_epoch_wait") as wait_tid:
         for src in pl.range(N_RANKS):
             if src != my_rank:
-                pld.system.defer_wait(
+                pld.system.wait(
                     signal=epoch_init_done, offsets=[src, 0],
                     expected=pl.cast(1, pl.INT32), cmp=pld.WaitCmp.Ge,
                 )
