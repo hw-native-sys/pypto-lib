@@ -223,16 +223,17 @@ def all_reduce_ffn(
             chunk_rows=T,
             chunk_cols=D,
         )
+        pld.system.notify(
+            target=reduce_signal,
+            peer=peer,
+            offsets=[my_rank, 0],
+            value=1,
+            op=pld.NotifyOp.AtomicAdd,
+        )
 
+    # Split from the push so the notify rides the push scope's program order and
+    # only the wait holds a core group.
     with pl.at(level=pl.Level.CORE_GROUP, name_hint="moe_reduce_barrier", allow_early_resolve=True, deps=[publish_tid]) as barrier_tid:
-        for peer in pl.range(N_RANKS):
-            pld.system.notify(
-                target=reduce_signal,
-                peer=peer,
-                offsets=[my_rank, 0],
-                value=1,
-                op=pld.NotifyOp.AtomicAdd,
-            )
         for src in pl.range(N_RANKS):
             pld.system.wait(
                 signal=reduce_signal,
