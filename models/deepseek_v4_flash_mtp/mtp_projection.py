@@ -156,23 +156,19 @@ def mtp_projection(
     for linear_idx in pl.spmd(linear_tasks, name_hint="mtp_linear"):
         t0 = (linear_idx // (D // LINEAR_OUT_TILE)) * LINEAR_T_TILE
         n0 = (linear_idx % (D // LINEAR_OUT_TILE)) * LINEAR_OUT_TILE
-        hidden_a0 = hidden_i8[t0 : t0 + LINEAR_T_TILE, 0:LINEAR_K_TILE]
-        e_w0 = e_proj_w[n0 : n0 + LINEAR_OUT_TILE, 0:LINEAR_K_TILE]
-        hidden_cube_acc = pl.matmul(hidden_a0, e_w0, b_trans=True, out_dtype=pl.INT32)
-        for k0 in pl.pipeline(LINEAR_K_TILE, D, LINEAR_K_TILE, stage=2):
+        hidden_cube_acc = pl.create_tensor([LINEAR_T_TILE, LINEAR_OUT_TILE], dtype=pl.INT32)
+        for k0 in pl.pipeline(0, D, LINEAR_K_TILE, stage=2):
             hidden_a = hidden_i8[t0 : t0 + LINEAR_T_TILE, k0 : k0 + LINEAR_K_TILE]
             e_w = e_proj_w[n0 : n0 + LINEAR_OUT_TILE, k0 : k0 + LINEAR_K_TILE]
-            hidden_cube_acc = pl.matmul_acc(hidden_cube_acc, hidden_a, e_w, b_trans=True)
+            hidden_cube_acc = pl.matmul_acc(hidden_cube_acc, hidden_a, e_w, b_trans=True, init_cond=(k0 == 0))
         hidden_acc_pad[t0 : t0 + LINEAR_T_TILE, n0 : n0 + LINEAR_OUT_TILE] = hidden_cube_acc
 
         prev_row0 = t0 * HC_MULT
-        h_w0 = h_proj_w[n0 : n0 + LINEAR_OUT_TILE, 0:LINEAR_K_TILE]
-        prev_a0 = prev_i8_rows[prev_row0 : prev_row0 + LINEAR_HC_TILE, 0:LINEAR_K_TILE]
-        prev_cube_acc = pl.matmul(prev_a0, h_w0, b_trans=True, out_dtype=pl.INT32)
-        for k0 in pl.pipeline(LINEAR_K_TILE, D, LINEAR_K_TILE, stage=2):
+        prev_cube_acc = pl.create_tensor([LINEAR_HC_TILE, LINEAR_OUT_TILE], dtype=pl.INT32)
+        for k0 in pl.pipeline(0, D, LINEAR_K_TILE, stage=2):
             prev_a = prev_i8_rows[prev_row0 : prev_row0 + LINEAR_HC_TILE, k0 : k0 + LINEAR_K_TILE]
             h_w = h_proj_w[n0 : n0 + LINEAR_OUT_TILE, k0 : k0 + LINEAR_K_TILE]
-            prev_cube_acc = pl.matmul_acc(prev_cube_acc, prev_a, h_w, b_trans=True)
+            prev_cube_acc = pl.matmul_acc(prev_cube_acc, prev_a, h_w, b_trans=True, init_cond=(k0 == 0))
         prev_acc_pad[prev_row0 : prev_row0 + LINEAR_HC_TILE, n0 : n0 + LINEAR_OUT_TILE] = prev_cube_acc
 
     out_flat = pl.reshape(hidden_states_out, [t_dim, HC_DIM])
