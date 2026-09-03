@@ -1509,12 +1509,51 @@ class TestConfigForwarding:
         assert captured["device_id"] == 3
         assert captured["pto_isa_commit"] == "deadbeef"
 
-    def test_dump_args_forwarded_as_dfx_option(self, three_kinds_specs, build_dir):
+    def test_dump_args_forwarded_as_dfx_option(
+        self, three_kinds_specs, build_dir, monkeypatch
+    ):
         """enable_dump_args is bundled into the execute_compiled DFX options."""
+
+        import pypto.runtime
 
         captured: dict = {}
         dfx = object()
         dfx_opts = MagicMock(return_value=dfx)
+        monkeypatch.setattr(pypto.runtime, "DfxOptions", dfx_opts, raising=False)
+
+        def fake_execute(_work_dir, _tensors, **kwargs):
+            captured.update(kwargs)
+
+        compile_p, exec_p = _patch_compile_and_execute(build_dir, fake_execute=fake_execute)
+        with compile_p, exec_p:
+            r = run(
+                fn=object(),
+                specs=three_kinds_specs,
+                runtime_cfg=dict(enable_dump_args=2),
+            )
+
+        assert r.passed, f"unexpected failure: {r.error}"
+        dfx_opts.assert_called_once_with(enable_dump_args=2)
+        assert captured["dfx"] is dfx
+        assert "enable_dump_args" not in captured
+
+    def test_dfx_option_falls_back_to_the_private_name(
+        self, three_kinds_specs, build_dir, monkeypatch
+    ):
+        """A pypto that predates the public DfxOptions still works.
+
+        Dropping the public name stands in for such a pin; the harness must then
+        reach ``pypto.runtime.runner._DfxOpts`` rather than report the runtime as
+        unable to take DFX flags. The private module is supplied through
+        ``sys.modules`` because a pypto build need not ship it at all.
+        """
+
+        import pypto.runtime
+
+        captured: dict = {}
+        dfx = object()
+        dfx_opts = MagicMock(return_value=dfx)
+        monkeypatch.delattr(pypto.runtime, "DfxOptions", raising=False)
         runner_mod = types.ModuleType("pypto.runtime.runner")
         runner_mod._DfxOpts = dfx_opts
 
@@ -1536,7 +1575,29 @@ class TestConfigForwarding:
         assert r.passed, f"unexpected failure: {r.error}"
         dfx_opts.assert_called_once_with(enable_dump_args=2)
         assert captured["dfx"] is dfx
-        assert "enable_dump_args" not in captured
+
+    def test_dfx_flags_rejected_when_the_runtime_has_neither_name(
+        self, three_kinds_specs, build_dir, monkeypatch
+    ):
+        """Neither name present is a clear error, not an AttributeError."""
+
+        import pypto.runtime
+
+        monkeypatch.delattr(pypto.runtime, "DfxOptions", raising=False)
+        runner_mod = types.ModuleType("pypto.runtime.runner")  # no _DfxOpts here
+
+        compile_p, exec_p = _patch_compile_and_execute(build_dir)
+        with (
+            compile_p,
+            exec_p,
+            patch.dict(sys.modules, {"pypto.runtime.runner": runner_mod}),
+            pytest.raises(ValueError, match="does not support execute_compiled DFX flags"),
+        ):
+            run(
+                fn=object(),
+                specs=three_kinds_specs,
+                runtime_cfg=dict(enable_dump_args=2),
+            )
 
 
 def _set_mtime(path: Path, mtime: float) -> None:

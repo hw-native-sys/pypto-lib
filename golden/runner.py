@@ -122,25 +122,40 @@ _DFX_FLAG_KEYS = (
 )
 
 
+def _dfx_options_type() -> type:
+    """Return pypto's DFX options bundle.
+
+    ``pypto.runtime.DfxOptions`` is the public name. Pins from before it was
+    exported carry the same dataclass as ``pypto.runtime.runner._DfxOpts``, and
+    both take the ``_DFX_FLAG_KEYS`` as keyword arguments, so either one serves.
+    Raises ``ImportError`` when the runtime has neither.
+    """
+    try:
+        from pypto.runtime import DfxOptions
+    except ImportError:
+        from pypto.runtime.runner import _DfxOpts as DfxOptions
+    return DfxOptions
+
+
 def _execute_compiled_kwargs(runtime: dict[str, Any]) -> dict[str, Any]:
     """Translate user-facing ``runtime_cfg`` into ``execute_compiled`` kwargs.
 
-    The five DFX flags get bundled into a single ``dfx: _DfxOpts``; all other
-    keys pass through unfiltered, so ``execute_compiled`` raises ``TypeError``
-    on unknown keys rather than us silently dropping them.
+    The five DFX flags get bundled into a single ``dfx`` option object; all
+    other keys pass through unfiltered, so ``execute_compiled`` raises
+    ``TypeError`` on unknown keys rather than us silently dropping them.
     """
     out: dict[str, Any] = {k: v for k, v in runtime.items() if k not in _DFX_FLAG_KEYS}
     dfx_flags = {k: runtime[k] for k in _DFX_FLAG_KEYS if runtime.get(k)}
     if dfx_flags:
         try:
-            from pypto.runtime.runner import _DfxOpts
+            dfx_options = _dfx_options_type()
         except ImportError as exc:
             raise ValueError(
                 "This pypto runtime does not support execute_compiled DFX flags: "
                 f"{sorted(dfx_flags)}"
             ) from exc
 
-        out["dfx"] = _DfxOpts(**dfx_flags)
+        out["dfx"] = dfx_options(**dfx_flags)
     return out
 
 
