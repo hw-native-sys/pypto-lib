@@ -143,84 +143,91 @@ def indexer_compressor(
     # have finished, so later tokens cannot overwrite rows needed by an earlier
     # boundary in the same S=8 step.
     pooled_kv = pl.create_tensor([BS_PAD, HEAD_DIM], dtype=pl.FP32)
-    with pl.at(level=pl.Level.CORE_GROUP, name_hint="scatter_softmax_pool", deps=[_kv_score_tid]) as pool_tid:
-        for c_idx in pl.range(b_dim):
-            first_pos_b = pl.read(position_ids, [c_idx * s_dim])
-            for s_idx in pl.range(s_dim):
-                token = c_idx * s_dim + s_idx
-                token_pos = pl.read(position_ids, [token])
-                pooled_kv[token : token + 1, :] = pl.full([1, HEAD_DIM], dtype=pl.FP32, value=0.0)
-                if (token_pos + 1) % COMPRESS_RATIO == 0:
-                    window_start = token_pos - STATE_LEN + 1
-                    for h0 in pl.range(0, HEAD_DIM, HEAD_TILE):
-                        last_ape_row = pl.cast(token_pos % COMPRESS_RATIO, target_type=pl.INDEX)
-                        mi = pl.add(
-                            score_proj_pad[
-                                token : token + 1,
-                                HEAD_DIM + h0 : HEAD_DIM + h0 + HEAD_TILE,
-                            ],
-                            ape[
-                                last_ape_row : last_ape_row + 1,
-                                HEAD_DIM + h0 : HEAD_DIM + h0 + HEAD_TILE,
-                            ],
-                        )
-                        li = pl.exp(pl.sub(mi, mi))
-                        oi = kv_proj_pad[
+    # One block per request: each c_idx owns its own state ring and writes only
+    # its own pooled_kv rows, so the whole nest is parallel over requests.
+    with pl.spmd(b_dim, name_hint="scatter_softmax_pool", deps=[_kv_score_tid]) as pool_tid:
+        c_idx = pl.tile.get_block_idx()
+        first_pos_b = pl.read(position_ids, [c_idx * s_dim])
+        for s_idx in pl.range(s_dim):
+            token = c_idx * s_dim + s_idx
+            token_pos = pl.read(position_ids, [token])
+            pooled_kv[token : token + 1, :] = pl.full([1, HEAD_DIM], dtype=pl.FP32, value=0.0)
+            if (token_pos + 1) % COMPRESS_RATIO == 0:
+                window_start = token_pos - STATE_LEN + 1
+                for h0 in pl.range(0, HEAD_DIM, HEAD_TILE):
+                    last_ape_row = pl.cast(token_pos % COMPRESS_RATIO, target_type=pl.INDEX)
+                    mi = pl.add(
+                        score_proj_pad[
                             token : token + 1,
                             HEAD_DIM + h0 : HEAD_DIM + h0 + HEAD_TILE,
-                        ]
-                        for state_idx in pl.range(STATE_LEN - 1):
-                            logical_pos = window_start + state_idx
-                            value = pl.full([1, HEAD_TILE], dtype=pl.FP32, value=0.0)
-                            score = pl.full([1, HEAD_TILE], dtype=pl.FP32, value=FP32_NEG_INF)
-                            state_half = 0
-                            if state_idx >= COMPRESS_RATIO:
-                                state_half = HEAD_DIM
-                            if logical_pos >= 0 and logical_pos < first_pos_b:
-                                ring_row = logical_pos % STATE_LEN
-                                state_page_off = ring_row // COMPRESS_STATE_BLOCK_SIZE
-                                state_blk_id_i32 = pl.read(
-                                    compress_state_block_table, [c_idx, state_page_off])
-                                if state_blk_id_i32 >= 0:
-                                    state_blk_id = pl.cast(state_blk_id_i32, pl.INDEX)
-                                    state_row = state_blk_id * COMPRESS_STATE_BLOCK_SIZE + ring_row % COMPRESS_STATE_BLOCK_SIZE
-                                    value = compress_state_flat[
-                                        state_row : state_row + 1,
-                                        state_half + h0 : state_half + h0 + HEAD_TILE,
-                                    ]
-                                    score = compress_state_flat[
-                                        state_row : state_row + 1,
-                                        OUT_DIM + state_half + h0 : OUT_DIM + state_half + h0 + HEAD_TILE,
-                                    ]
-                            if logical_pos >= first_pos_b:
-                                if logical_pos <= token_pos:
-                                    overlay_token = c_idx * s_dim + logical_pos - first_pos_b
-                                    ape_row = pl.cast(logical_pos % COMPRESS_RATIO, target_type=pl.INDEX)
-                                    value = kv_proj_pad[
+                        ],
+                        ape[
+                            last_ape_row : last_ape_row + 1,
+                            HEAD_DIM + h0 : HEAD_DIM + h0 + HEAD_TILE,
+                        ],
+                    )
+                    li = pl.exp(pl.sub(mi, mi))
+                    oi = kv_proj_pad[
+                        token : token + 1,
+                        HEAD_DIM + h0 : HEAD_DIM + h0 + HEAD_TILE,
+                    ]
+                    for state_idx in pl.range(STATE_LEN - 1):
+                        logical_pos = window_start + state_idx
+                        value = pl.full([1, HEAD_TILE], dtype=pl.FP32, value=0.0)
+                        score = pl.full([1, HEAD_TILE], dtype=pl.FP32, value=FP32_NEG_INF)
+                        state_half = 0
+                        if state_idx >= COMPRESS_RATIO:
+                            state_half = HEAD_DIM
+                        if logical_pos >= 0 and logical_pos < first_pos_b:
+                            ring_row = logical_pos % STATE_LEN
+                            state_page_off = ring_row // COMPRESS_STATE_BLOCK_SIZE
+                            state_blk_id_i32 = pl.read(
+                                compress_state_block_table, [c_idx, state_page_off])
+                            if state_blk_id_i32 >= 0:
+                                state_blk_id = pl.cast(state_blk_id_i32, pl.INDEX)
+                                state_row = state_blk_id * COMPRESS_STATE_BLOCK_SIZE + ring_row % COMPRESS_STATE_BLOCK_SIZE
+                                value = compress_state_flat[
+                                    state_row : state_row + 1,
+                                    state_half + h0 : state_half + h0 + HEAD_TILE,
+                                ]
+                                score = compress_state_flat[
+                                    state_row : state_row + 1,
+                                    OUT_DIM + state_half + h0 : OUT_DIM + state_half + h0 + HEAD_TILE,
+                                ]
+                        if logical_pos >= first_pos_b:
+                            if logical_pos <= token_pos:
+                                overlay_token = c_idx * s_dim + logical_pos - first_pos_b
+                                ape_row = pl.cast(logical_pos % COMPRESS_RATIO, target_type=pl.INDEX)
+                                value = kv_proj_pad[
+                                    overlay_token : overlay_token + 1,
+                                    state_half + h0 : state_half + h0 + HEAD_TILE,
+                                ]
+                                score = pl.add(
+                                    score_proj_pad[
                                         overlay_token : overlay_token + 1,
                                         state_half + h0 : state_half + h0 + HEAD_TILE,
-                                    ]
-                                    score = pl.add(
-                                        score_proj_pad[
-                                            overlay_token : overlay_token + 1,
-                                            state_half + h0 : state_half + h0 + HEAD_TILE,
-                                        ],
-                                        ape[
-                                            ape_row : ape_row + 1,
-                                            state_half + h0 : state_half + h0 + HEAD_TILE,
-                                        ],
-                                    )
-                            mi_next = pl.maximum(mi, score)
-                            alpha = pl.exp(pl.sub(mi, mi_next))
-                            beta = pl.exp(pl.sub(score, mi_next))
-                            li = pl.add(pl.mul(alpha, li), beta)
-                            oi = pl.add(pl.mul(oi, alpha), pl.mul(value, beta))
-                            mi = mi_next
-                        pooled_kv[token : token + 1, h0 : h0 + HEAD_TILE] = pl.div(oi, li)
+                                    ],
+                                    ape[
+                                        ape_row : ape_row + 1,
+                                        state_half + h0 : state_half + h0 + HEAD_TILE,
+                                    ],
+                                )
+                        mi_next = pl.maximum(mi, score)
+                        alpha = pl.exp(pl.sub(mi, mi_next))
+                        beta = pl.exp(pl.sub(score, mi_next))
+                        li = pl.add(pl.mul(alpha, li), beta)
+                        oi = pl.add(pl.mul(oi, alpha), pl.mul(value, beta))
+                        mi = mi_next
+                    pooled_kv[token : token + 1, h0 : h0 + HEAD_TILE] = pl.div(oi, li)
 
     # The recurrent state ring is a commit, not a source for the current step.
-    with pl.at(level=pl.Level.CORE_GROUP, name_hint="compress_state_commit", deps=[pool_tid]):
-        for token in pl.range(bs):
+    # One block per request, like the pool above. Each token commits to its own
+    # ring row: S <= STATE_LEN, so a request's tokens hold distinct positions mod
+    # STATE_LEN, and requests hold distinct state pages.
+    with pl.spmd(b_dim, name_hint="compress_state_commit", deps=[pool_tid]):
+        c_idx = pl.tile.get_block_idx()
+        for s_idx in pl.range(s_dim):
+            token = c_idx * s_dim + s_idx
             state_row_i64 = pl.read(inner_state_slot_mapping, [token])
             if state_row_i64 >= 0:
                 state_row = pl.cast(state_row_i64, pl.INDEX)
