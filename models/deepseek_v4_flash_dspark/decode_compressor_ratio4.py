@@ -8,7 +8,7 @@
 # -----------------------------------------------------------------------------------------------------------
 """DeepSeek-V4 KV Compressor (decode incremental, ratio=4 overlap).
 
-Uses overlapping state layout with 8 slots.
+Uses an eight-row overlapping state window in a ``STATE_LEN + S`` transaction ring.
 Front slots 0-3 at columns [0:HEAD_DIM], back slots 4-7 at columns [HEAD_DIM:OUT_DIM].
 Online-softmax pooling followed by the recurrent-state commit."""
 
@@ -22,6 +22,7 @@ from config import (
     DECODE_SEQ,
     BLOCK_SIZE,
     C4A_COMPRESSOR_BLOCK_SIZE,
+    CSA_STATE_PHYSICAL_BLOCKS,
     KV_CMP_BLOCK_NUM,
     FP32_NEG_INF,
 )
@@ -51,8 +52,13 @@ OVERLAP = COMPRESS_RATIO == 4
 COFF = 1 + int(OVERLAP)
 OUT_DIM = COFF * HEAD_DIM
 STATE_LEN = COFF * COMPRESS_RATIO
+STATE_STORAGE_LEN = STATE_LEN + S
 COMPRESS_STATE_BLOCK_SIZE = C4A_COMPRESSOR_BLOCK_SIZE
-COMPRESS_STATE_MAX_BLOCKS = (STATE_LEN + COMPRESS_STATE_BLOCK_SIZE - 1) // COMPRESS_STATE_BLOCK_SIZE
+COMPRESS_STATE_MAX_BLOCKS = (
+    STATE_STORAGE_LEN + COMPRESS_STATE_BLOCK_SIZE - 1
+) // COMPRESS_STATE_BLOCK_SIZE
+COMPRESS_STATE_BLOCK_NUM = CSA_STATE_PHYSICAL_BLOCKS
+COMPRESS_STATE_BLOCKS_PER_REQUEST = COMPRESS_STATE_BLOCK_NUM // DECODE_BATCH
 COMPRESS_STATE_BLOCK_NUM_DYN = pl.dynamic("CSA_STATE_BLOCK_NUM_DYN")
 COMPRESS_STATE_DIM = 2 * OUT_DIM
 CMP_MAX_BLOCKS = (MAX_SEQ_LEN // COMPRESS_RATIO + BLOCK_SIZE - 1) // BLOCK_SIZE
@@ -182,7 +188,7 @@ def compressor_ratio4(
                             if state_idx >= COMPRESS_RATIO:
                                 state_half = HEAD_DIM
                             if logical_pos >= 0 and logical_pos < first_pos_b:
-                                ring_row = logical_pos % STATE_LEN
+                                ring_row = logical_pos % STATE_STORAGE_LEN
                                 state_page_off = ring_row // COMPRESS_STATE_BLOCK_SIZE
                                 state_blk_id_i32 = pl.read(
                                     compress_state_block_table, [c_idx, state_page_off])
@@ -391,7 +397,7 @@ def golden_compressor(tensors):
                 value = torch.zeros(HEAD_DIM, dtype=torch.float32, device=x.device)
                 score = torch.full((HEAD_DIM,), float("-inf"), dtype=torch.float32, device=x.device)
                 if 0 <= logical_pos < first_pos:
-                    ring_row = logical_pos % STATE_LEN
+                    ring_row = logical_pos % STATE_STORAGE_LEN
                     page_off, intra = divmod(ring_row, COMPRESS_STATE_BLOCK_SIZE)
                     block = int(compress_state_block_table[b, page_off].item())
                     if block >= 0:
@@ -473,11 +479,12 @@ def build_tensor_specs(start_pos=None, batch=B):
         default_fn=default_starts,
     )
     positions = position_ids_from_starts(starts, seq=S)
-    state_block_num = batch * COMPRESS_STATE_MAX_BLOCKS
-    state_block_table = torch.arange(
-        state_block_num - 1, -1, -1, dtype=torch.int32
-    ).reshape(batch, COMPRESS_STATE_MAX_BLOCKS)
-    ring_rows = positions.to(torch.int64) % STATE_LEN
+    state_block_num = COMPRESS_STATE_BLOCK_NUM
+    logical_blocks = torch.arange(COMPRESS_STATE_MAX_BLOCKS, dtype=torch.int32)
+    ring_blocks = logical_blocks % COMPRESS_STATE_BLOCKS_PER_REQUEST
+    request_slots = torch.arange(batch, dtype=torch.int32).unsqueeze(1)
+    state_block_table = ring_blocks.unsqueeze(0) * DECODE_BATCH + request_slots
+    ring_rows = positions.to(torch.int64) % STATE_STORAGE_LEN
     state_pages = torch.gather(
         state_block_table.to(torch.int64), 1, ring_rows // COMPRESS_STATE_BLOCK_SIZE)
     state_slots = state_pages * COMPRESS_STATE_BLOCK_SIZE + ring_rows % COMPRESS_STATE_BLOCK_SIZE

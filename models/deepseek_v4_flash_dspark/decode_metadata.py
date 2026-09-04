@@ -18,6 +18,8 @@ from config import (
     BLOCK_SIZE,
     C4A_COMPRESSOR_BLOCK_SIZE,
     C128_COMPRESSOR_BLOCK_SIZE,
+    CSA_INNER_STATE_PHYSICAL_BLOCKS,
+    CSA_STATE_PHYSICAL_BLOCKS,
     DECODE_BATCH,
     TP,
     DECODE_SEQ,
@@ -37,6 +39,10 @@ IDX_MAX_BLOCKS = CMP_MAX_BLOCKS
 HCA_STATE_MAX_BLOCKS = 2048
 CSA_STATE_MAX_BLOCKS = 4096
 CSA_INNER_STATE_MAX_BLOCKS = 4096
+CSA_STATE_REQUIRED_BLOCKS = CSA_STATE_PHYSICAL_BLOCKS // DECODE_BATCH
+CSA_INNER_STATE_REQUIRED_BLOCKS = (
+    CSA_INNER_STATE_PHYSICAL_BLOCKS // DECODE_BATCH
+)
 
 GROUP_ORI = 0
 GROUP_CMP = 1
@@ -218,42 +224,61 @@ def build_decode_metadata(
 
             csa_state_logical = position // C4A_COMPRESSOR_BLOCK_SIZE
             csa_state_count = pl.read(block_counts, [request, GROUP_CSA_STATE])
-            csa_state_physical_block = pl.read(
-                csa_state_block_table,
-                [
-                    request,
-                    pl.cast(csa_state_logical % csa_state_count, pl.INDEX),
-                ],
-            )
+            csa_state_slot = pl.cast(-1, pl.INT64)
+            if position >= 0 and csa_state_count >= CSA_STATE_REQUIRED_BLOCKS:
+                csa_state_physical_block = pl.read(
+                    csa_state_block_table,
+                    [
+                        request,
+                        pl.cast(
+                            csa_state_logical % CSA_STATE_REQUIRED_BLOCKS,
+                            pl.INDEX,
+                        ),
+                    ],
+                )
+                if csa_state_physical_block >= 0:
+                    csa_state_slot = pl.cast(
+                        csa_state_physical_block * C4A_COMPRESSOR_BLOCK_SIZE
+                        + position % C4A_COMPRESSOR_BLOCK_SIZE,
+                        pl.INT64,
+                    )
             pl.write(
                 csa_state_slot_mapping,
                 [token],
-                pl.cast(
-                    csa_state_physical_block * C4A_COMPRESSOR_BLOCK_SIZE
-                    + position % C4A_COMPRESSOR_BLOCK_SIZE,
-                    pl.INT64,
-                ),
+                csa_state_slot,
             )
 
             inner_state_count = pl.read(
                 block_counts,
                 [request, GROUP_CSA_INNER_STATE],
             )
-            inner_state_physical_block = pl.read(
-                csa_inner_state_block_table,
-                [
-                    request,
-                    pl.cast(csa_state_logical % inner_state_count, pl.INDEX),
-                ],
-            )
+            inner_state_slot = pl.cast(-1, pl.INT64)
+            if (
+                position >= 0
+                and inner_state_count >= CSA_INNER_STATE_REQUIRED_BLOCKS
+            ):
+                inner_state_physical_block = pl.read(
+                    csa_inner_state_block_table,
+                    [
+                        request,
+                        pl.cast(
+                            csa_state_logical
+                            % CSA_INNER_STATE_REQUIRED_BLOCKS,
+                            pl.INDEX,
+                        ),
+                    ],
+                )
+                if inner_state_physical_block >= 0:
+                    inner_state_slot = pl.cast(
+                        inner_state_physical_block
+                        * C4A_COMPRESSOR_BLOCK_SIZE
+                        + position % C4A_COMPRESSOR_BLOCK_SIZE,
+                        pl.INT64,
+                    )
             pl.write(
                 csa_inner_state_slot_mapping,
                 [token],
-                pl.cast(
-                    inner_state_physical_block * C4A_COMPRESSOR_BLOCK_SIZE
-                    + position % C4A_COMPRESSOR_BLOCK_SIZE,
-                    pl.INT64,
-                ),
+                inner_state_slot,
             )
     return (
         ori_slot_mapping,
@@ -433,16 +458,30 @@ def golden_decode_metadata(tensors):
         csa_block, csa_offset = divmod(position, C4A_COMPRESSOR_BLOCK_SIZE)
         csa_count = int(counts[request, GROUP_CSA_STATE])
         inner_count = int(counts[request, GROUP_CSA_INNER_STATE])
-        tensors["csa_state_slot_mapping"][token] = (
-            int(csa_state_table[request, csa_block % csa_count])
-            * C4A_COMPRESSOR_BLOCK_SIZE
-            + csa_offset
-        )
-        tensors["csa_inner_state_slot_mapping"][token] = (
-            int(inner_state_table[request, csa_block % inner_count])
-            * C4A_COMPRESSOR_BLOCK_SIZE
-            + csa_offset
-        )
+        tensors["csa_state_slot_mapping"][token] = -1
+        if csa_count >= CSA_STATE_REQUIRED_BLOCKS:
+            block = int(
+                csa_state_table[
+                    request,
+                    csa_block % CSA_STATE_REQUIRED_BLOCKS,
+                ]
+            )
+            if block >= 0:
+                tensors["csa_state_slot_mapping"][token] = (
+                    block * C4A_COMPRESSOR_BLOCK_SIZE + csa_offset
+                )
+        tensors["csa_inner_state_slot_mapping"][token] = -1
+        if inner_count >= CSA_INNER_STATE_REQUIRED_BLOCKS:
+            block = int(
+                inner_state_table[
+                    request,
+                    csa_block % CSA_INNER_STATE_REQUIRED_BLOCKS,
+                ]
+            )
+            if block >= 0:
+                tensors["csa_inner_state_slot_mapping"][token] = (
+                    block * C4A_COMPRESSOR_BLOCK_SIZE + csa_offset
+                )
 
 
 def build_tensor_specs():

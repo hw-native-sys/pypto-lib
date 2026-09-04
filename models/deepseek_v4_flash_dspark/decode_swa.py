@@ -122,6 +122,25 @@ SPARSE_ROPE_TILE = 16
 SPARSE_ROPE_INTERLEAVE_TILE = 2 * SPARSE_ROPE_TILE
 NEG_INF = -1.0e20
 
+# Every SWA step eagerly publishes all S rows before any query reads the cache.
+# The per-request physical ring must therefore keep the oldest row needed by the
+# first query distinct from the last speculative write.
+SWA_TRANSACTION_ROWS = WIN + S - 1
+SWA_MIN_BLOCKS_PER_REQUEST = (SWA_TRANSACTION_ROWS + BLOCK_SIZE - 1) // BLOCK_SIZE
+
+if ORI_BLOCK_NUM % DECODE_BATCH != 0:
+    raise ValueError(
+        f"SWA cache blocks {ORI_BLOCK_NUM} must divide evenly across "
+        f"{DECODE_BATCH} requests",
+    )
+SWA_BLOCKS_PER_REQUEST = ORI_BLOCK_NUM // DECODE_BATCH
+if SWA_BLOCKS_PER_REQUEST < SWA_MIN_BLOCKS_PER_REQUEST:
+    raise ValueError(
+        f"SWA cache needs at least {SWA_MIN_BLOCKS_PER_REQUEST} blocks per request "
+        f"for a {WIN}-row window and S={S} eager writes, got "
+        f"{SWA_BLOCKS_PER_REQUEST}",
+    )
+
 if T != LOCAL_T:
     raise ValueError(f"SWA token capacity {T} must equal TP-local token capacity {LOCAL_T}")
 if T_PAD != LOCAL_T_PAD:
@@ -230,6 +249,8 @@ def decode_swa(
     kv_cache_flat = pl.reshape(kv_cache, [cache_rows, HEAD_DIM])
     sparse_bias = pl.create_tensor([t_dim, PADDED_TOPK], dtype=pl.FP32)
     wb_blocks = (kv_dim + SWA_WB_TOKEN_TILE - 1) // SWA_WB_TOKEN_TILE
+    # SWA_TRANSACTION_ROWS guarantees that later speculative writes cannot
+    # alias history still visible to an earlier query in this same step.
     with pl.spmd(wb_blocks, name_hint="swa_cache_writeback"):
         wb_blk = pl.tile.get_block_idx()
         wb_t0 = wb_blk * SWA_WB_TOKEN_TILE
@@ -581,6 +602,8 @@ def decode_swa_tp1(
     ori_block_num = pl.tensor.dim(kv_cache, 0)
     kv_cache_flat = pl.reshape(kv_cache, [ori_block_num * BLOCK_SIZE, HEAD_DIM])
     sparse_bias = pl.create_tensor([t_dim, WIN], dtype=pl.FP32)
+    # SWA_TRANSACTION_ROWS guarantees that later speculative writes cannot
+    # alias history still visible to an earlier query in this same step.
     with pl.at(level=pl.Level.CORE_GROUP, name_hint="swa_cache_insert_valid_bias"):
         for write_t in pl.range(t_dim):
             write_row_i64 = pl.read(swa_slot_mapping, [write_t])
@@ -764,7 +787,6 @@ def build_tensor_specs(start_pos=None, batch=B):
         raise ValueError(f"batch must produce between {S} and {group_cap} tokens, got {tokens}")
     import torch
     from utils import (
-        block_table,
         paged_slot_mapping,
         position_ids_from_starts,
         resolve_start_positions,
@@ -851,10 +873,13 @@ def build_tensor_specs(start_pos=None, batch=B):
         return init_normalized_cache((ORI_BLOCK_NUM, BLOCK_SIZE, 1, HEAD_DIM))
 
     def init_block_table():
-        # Logical block-table cols cover the full SWA ceiling so 1M positions
-        # map into the fixed physical pool (ORI_BLOCK_NUM) via % wrapping.
+        # Active requests retain their fixed serving request slots. The physical
+        # ring is partitioned by DECODE_BATCH, not repartitioned by active batch.
         table_blocks = (MAX_SEQ_LEN + BLOCK_SIZE - 1) // BLOCK_SIZE
-        return block_table(batch=batch, table_blocks=table_blocks, physical_blocks=ORI_BLOCK_NUM)
+        logical_blocks = torch.arange(table_blocks, dtype=torch.int32)
+        ring_blocks = logical_blocks % SWA_BLOCKS_PER_REQUEST
+        request_slots = torch.arange(batch, dtype=torch.int32).unsqueeze(1)
+        return ring_blocks.unsqueeze(0) * DECODE_BATCH + request_slots
 
     def init_attn_sink():
         return torch.zeros(H)

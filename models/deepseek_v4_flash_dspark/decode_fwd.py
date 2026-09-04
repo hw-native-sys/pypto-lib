@@ -169,6 +169,13 @@ def _validate_import_contract():
         raise ValueError(f"MoE world size {N_RANKS} does not match EP={EP_SIZE}")
     if MAIN_LAYER_COUNT != 43:
         raise ValueError(f"D-Spark decode forward expects 43 layers, got {MAIN_LAYER_COUNT}")
+    if CSA_LAYER_COUNT != HCA_LAYER_COUNT + 1:
+        raise ValueError(
+            f"alternating decode layers require one more CSA layer than HCA, got "
+            f"CSA={CSA_LAYER_COUNT}, HCA={HCA_LAYER_COUNT}",
+        )
+    if SWA_LAYER_COUNT + 2 * HCA_LAYER_COUNT + 1 != MAIN_LAYER_COUNT:
+        raise ValueError("SWA/CSA/HCA layer counts do not cover the 43-layer model")
     if MODEL_CONFIG.vocab_size % TP_SIZE:
         raise ValueError(f"vocab size {MODEL_CONFIG.vocab_size} must be divisible by TP={TP_SIZE}")
     if LM_HEAD_TP_SIZE != TP_SIZE:
@@ -1449,6 +1456,21 @@ def _make_packed_pool_spec(name, source, layer_count, *, sentinel=False):
     return spec
 
 
+def _validate_packed_pool_specs(packed_specs, layer_specs):
+    """Check the rank axis, per-layer extent and shared index-cache geometry."""
+    for name, layer_count in PACKED_POOL_LAYER_COUNTS.items():
+        layer_shape = list(layer_specs[name].shape)
+        if not 2 <= len(layer_shape) <= MAX_PUBLIC_TENSOR_DIMS or layer_shape[0] != N_RANKS:
+            raise ValueError(f"invalid rank-local pool source {name!r}: {layer_shape}")
+        if layer_shape[1] <= 0:
+            raise ValueError(f"pool {name!r} must have a positive per-layer extent")
+        expected = [N_RANKS, layer_count * layer_shape[1], *layer_shape[2:]]
+        if list(packed_specs[name].shape) != expected:
+            raise ValueError(f"packed pool {name!r} must have shape {expected}")
+    if packed_specs["csa_idx_kv_cache"].shape[:2] != packed_specs["csa_idx_kv_scale"].shape[:2]:
+        raise ValueError("CSA index cache and scale packed extents must match")
+
+
 def build_tensor_specs(start_pos=None, *, weight_bank_size=RUNTIME_WEIGHT_BANK, runtime_case="full_active"):
     """Build the production or bounded-runtime decode forward L3 fixture."""
     import inspect
@@ -1531,6 +1553,16 @@ def build_tensor_specs(start_pos=None, *, weight_bank_size=RUNTIME_WEIGHT_BANK, 
         return (torch.randn(N_RANKS, embedding_vocab, D) * 0.05).to(torch.bfloat16)
 
     sentinel = runtime_case == "packed_pool_sentinel"
+    packed_layer_specs = {
+        "raw_kv_pool": swa_specs["kv_cache"],
+        "hca_compress_state": hca_specs["compress_state"],
+        "hca_cmp_kv": hca_specs["cmp_kv"],
+        "csa_compress_state": csa_specs["compress_state"],
+        "csa_cmp_kv": csa_specs["cmp_kv"],
+        "csa_inner_compress_state": csa_specs["inner_compress_state"],
+        "csa_idx_kv_cache": csa_specs["idx_kv_cache"],
+        "csa_idx_kv_scale": csa_specs["idx_kv_scale"],
+    }
     specs_by_name = {
         "embed_weight": TensorSpec(
             "embed_weight", [N_RANKS, embedding_vocab, D], torch.bfloat16,
@@ -1592,6 +1624,8 @@ def build_tensor_specs(start_pos=None, *, weight_bank_size=RUNTIME_WEIGHT_BANK, 
             "sampled_ids", [N_RANKS, MAX_LOGIT_ROWS, SAMPLED_IDS_PAD], torch.int32, 
         ),
     }
+
+    _validate_packed_pool_specs(specs_by_name, packed_layer_specs)
 
     for name in _LAYER_WEIGHT_NAMES:
         specs_by_name[name] = _make_weight_bank_spec(name, swa_specs[name], weight_bank_size, compile_only=compile_only)

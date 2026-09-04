@@ -256,10 +256,18 @@ KV_ORI_BLOCK_NUM = 512
 KV_CMP_BLOCK_NUM = 256
 IDX_CACHE_BLOCK_NUM = 256
 
-# Prefill compressor state pool capacities
-HCA_STATE_PHYSICAL_BLOCKS = 256
-CSA_STATE_PHYSICAL_BLOCKS = 260
-CSA_INNER_STATE_PHYSICAL_BLOCKS = 260
+# Persistent compressor state pool capacities shared by prefill and decode.
+# HCA eagerly writes one full decode step before pooling a 128-row state window,
+# so each request needs 128 historical rows plus DECODE_SEQ transaction rows.
+HCA_STATE_PHYSICAL_BLOCKS = DECODE_BATCH * (
+    (128 + DECODE_SEQ + C128_COMPRESSOR_BLOCK_SIZE - 1) // C128_COMPRESSOR_BLOCK_SIZE
+)
+# Ratio-4 compressors keep an eight-row mathematical window.  Decode eagerly
+# publishes all S rows, so the persistent ring needs a disjoint S-row suffix.
+CSA_STATE_PHYSICAL_BLOCKS = DECODE_BATCH * (
+    (8 + DECODE_SEQ + C4A_COMPRESSOR_BLOCK_SIZE - 1) // C4A_COMPRESSOR_BLOCK_SIZE
+)
+CSA_INNER_STATE_PHYSICAL_BLOCKS = CSA_STATE_PHYSICAL_BLOCKS
 
 # Int8 quantization constants
 INT8_SCALE_MAX = 127.0                    # per-row INT8 quant: clamp scale so |q| <= 127

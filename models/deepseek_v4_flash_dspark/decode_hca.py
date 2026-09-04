@@ -135,6 +135,7 @@ COMPRESS_STATE_PHYSICAL_BLOCKS = HCA_STATE_PHYSICAL_BLOCKS
 COMPRESS_STATE_MAX_BLOCKS = (MAX_SEQ_LEN + COMPRESS_STATE_BLOCK_SIZE - 1) // COMPRESS_STATE_BLOCK_SIZE
 COMPRESS_STATE_BLOCK_NUM = COMPRESS_STATE_PHYSICAL_BLOCKS
 COMPRESS_STATE_DIM = 2 * MAIN_OUT_DIM
+COMPRESS_STATE_BLOCKS_PER_REQUEST = COMPRESS_STATE_PHYSICAL_BLOCKS // DECODE_BATCH
 # tiling
 SPARSE_ROPE_TILE = 16
 SPARSE_ROPE_INTERLEAVE_TILE = 2 * SPARSE_ROPE_TILE
@@ -1165,11 +1166,6 @@ def _hca_cmp_block_table(starts):
     table = torch.full((batch, table_blocks), -1, dtype=torch.int32)
     cursor = 0
     for request, page_count in enumerate(page_counts):
-        if cursor + page_count > CMP_BLOCK_NUM:
-            raise ValueError(
-                f"HCA compressed pool needs {cursor + page_count} pages for batch={batch}, "
-                f"capacity is {CMP_BLOCK_NUM}",
-            )
         if page_count:
             table[request, :page_count] = torch.arange(cursor, cursor + page_count, dtype=torch.int32)
         cursor += page_count
@@ -1203,7 +1199,6 @@ def build_tensor_specs(start_pos=None, batch=B):
     tokens = batch * S
     import torch
     from utils import (
-        block_table,
         compressed_slot_mapping,
         ori_slot_mapping,
         position_ids_from_starts,
@@ -1225,6 +1220,7 @@ def build_tensor_specs(start_pos=None, batch=B):
     cmp_freqs_sin[:batch] = boundary_sin[:, :ROPE_HEAD_DIM // 2].float()
     window_block_table = _hca_raw_block_table(positions)
     cmp_block_table = _hca_cmp_block_table(starts)
+    cmp_block_num = max(CMP_BLOCK_NUM, int(cmp_block_table.max().item()) + 1)
 
     def quant_w_per_output_channel(w):
         amax = w.float().abs().amax(dim=0).clamp_min(INT8_AMAX_EPS)
@@ -1285,49 +1281,14 @@ def build_tensor_specs(start_pos=None, batch=B):
         denom = cache.float().pow(2).mean(dim=-1, keepdim=True).sqrt().clamp_min(EPS)
         return (cache / denom).to(torch.bfloat16)
 
-    def init_injective_state_block_table():
-        table = block_table(
-            batch=batch,
-            table_blocks=COMPRESS_STATE_MAX_BLOCKS,
-            physical_blocks=COMPRESS_STATE_PHYSICAL_BLOCKS,
-        )
-        state_positions = positions.to(torch.int64)
-        mapping = state_slot_mapping(state_positions, table, state_block_size=COMPRESS_STATE_BLOCK_SIZE)
-        valid_rows = mapping[mapping >= 0]
-        if torch.unique(valid_rows).numel() == valid_rows.numel():
-            return table
-
-        occupancy = [0] * COMPRESS_STATE_PHYSICAL_BLOCKS
-        for request in range(batch):
-            logical_masks = {}
-            for position in state_positions[request].tolist():
-                logical_block = position // COMPRESS_STATE_BLOCK_SIZE
-                intra = position % COMPRESS_STATE_BLOCK_SIZE
-                logical_masks[logical_block] = logical_masks.get(logical_block, 0) | (1 << intra)
-            for logical_block, row_mask in logical_masks.items():
-                physical_block = next(
-                    (
-                        block
-                        for block, used_mask in enumerate(occupancy)
-                        if used_mask != 0 and used_mask & row_mask == 0
-                    ),
-                    None,
-                )
-                if physical_block is None:
-                    physical_block = next((block for block, used_mask in enumerate(occupancy) if used_mask == 0), None)
-                if physical_block is None:
-                    raise ValueError(
-                        f"HCA fixture cannot place {batch * S} active state rows "
-                        f"in {COMPRESS_STATE_BLOCK_NUM * COMPRESS_STATE_BLOCK_SIZE} physical rows",
-                    )
-                table[request, logical_block] = physical_block
-                occupancy[physical_block] |= row_mask
-
-        mapping = state_slot_mapping(state_positions, table, state_block_size=COMPRESS_STATE_BLOCK_SIZE)
-        valid_rows = mapping[mapping >= 0]
-        if torch.unique(valid_rows).numel() != valid_rows.numel():
-            raise ValueError("HCA fixture active state rows remain aliased")
-        return table
+    def init_state_block_table():
+        # Keep stable request slots as active batch changes. Seventeen pages per
+        # request preserve the 128-row history while all S speculative rows are
+        # eagerly published before the compressor reads a boundary window.
+        logical_blocks = torch.arange(COMPRESS_STATE_MAX_BLOCKS, dtype=torch.int32)
+        ring_blocks = logical_blocks % COMPRESS_STATE_BLOCKS_PER_REQUEST
+        request_slots = torch.arange(batch, dtype=torch.int32).unsqueeze(1)
+        return ring_blocks.unsqueeze(0) * DECODE_BATCH + request_slots
 
     # BF16 weight std and RMSNorm gamma mean/std, averaged over DeepSeek-V4-Flash-0731
     # layers 7/9 (the ratio-128 HCA main compressor).
@@ -1342,11 +1303,11 @@ def build_tensor_specs(start_pos=None, batch=B):
     def init_compress_state():
         return torch.zeros(COMPRESS_STATE_BLOCK_NUM, COMPRESS_STATE_BLOCK_SIZE, COMPRESS_STATE_DIM)
     def init_compress_state_block_table():
-        return init_injective_state_block_table()
+        return init_state_block_table()
     def init_kv_cache():
         return init_normalized_cache((ORI_BLOCK_NUM, BLOCK_SIZE, 1, HEAD_DIM))
     def init_cmp_kv():
-        return init_normalized_cache((CMP_BLOCK_NUM, BLOCK_SIZE, 1, HEAD_DIM))
+        return init_normalized_cache((cmp_block_num, BLOCK_SIZE, 1, HEAD_DIM))
 
     def init_window_block_table():
         return window_block_table.clone()
@@ -1423,7 +1384,7 @@ def build_tensor_specs(start_pos=None, batch=B):
         TensorSpec("compress_state", [COMPRESS_STATE_BLOCK_NUM, COMPRESS_STATE_BLOCK_SIZE, COMPRESS_STATE_DIM], torch.float32, init_value=init_compress_state),
         TensorSpec("compress_state_block_table", [batch, COMPRESS_STATE_MAX_BLOCKS], torch.int32, init_value=init_compress_state_block_table),
         TensorSpec("kv_cache", [ORI_BLOCK_NUM, BLOCK_SIZE, 1, HEAD_DIM], torch.bfloat16, init_value=init_kv_cache),
-        TensorSpec("cmp_kv", [CMP_BLOCK_NUM, BLOCK_SIZE, 1, HEAD_DIM], torch.bfloat16, init_value=init_cmp_kv),
+        TensorSpec("cmp_kv", [cmp_block_num, BLOCK_SIZE, 1, HEAD_DIM], torch.bfloat16, init_value=init_cmp_kv),
         TensorSpec("cmp_block_table", list(cmp_block_table.shape), torch.int32, init_value=init_cmp_block_table),
         TensorSpec("ori_slot_mapping", [tokens], torch.int64, init_value=init_ori_slot_mapping),
         TensorSpec("window_swa_indices", [tokens, WIN], torch.int32, init_value=init_window_swa_indices),
@@ -1492,8 +1453,13 @@ def build_distributed_tensor_specs(local_t, start_pos=None):
 
         value = materialize_spec(spec)
         if spec.name in full_only_names:
+            if spec.name in {"cmp_freqs_cos", "cmp_freqs_sin"}:
+                # TP1 pads these tables to its static request capacity.  The
+                # distributed kernel allocates its interleaved scratch at the
+                # active group-batch extent, so pass only the active rows.
+                value = value[:group_batch].contiguous()
             full_spec = TensorSpec(
-                spec.name, [TP_SIZE, *spec.shape], spec.dtype,
+                spec.name, [TP_SIZE, *value.shape], spec.dtype,
                 init_value=cp_stack(value, TP_SIZE),
             )
             if spec.name in resident_names:

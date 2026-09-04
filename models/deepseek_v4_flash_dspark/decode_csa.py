@@ -44,6 +44,8 @@ from config import (
     DECODE_SEQ,
     BLOCK_SIZE,
     C4A_COMPRESSOR_BLOCK_SIZE,
+    CSA_INNER_STATE_PHYSICAL_BLOCKS,
+    CSA_STATE_PHYSICAL_BLOCKS,
     KV_ORI_BLOCK_NUM,
     INT8_SCALE_MAX,
     INT8_AMAX_EPS,
@@ -127,12 +129,22 @@ MAIN_OUT_DIM = COFF * HEAD_DIM
 MAIN_STATE_DIM = 2 * MAIN_OUT_DIM
 MAIN_STATE_BLOCK_SIZE = C4A_COMPRESSOR_BLOCK_SIZE
 MAIN_STATE_LEN = COFF * COMPRESS_RATIO
-MAIN_STATE_MAX_BLOCKS = (MAIN_STATE_LEN + MAIN_STATE_BLOCK_SIZE - 1) // MAIN_STATE_BLOCK_SIZE
+MAIN_STATE_STORAGE_LEN = MAIN_STATE_LEN + S
+MAIN_STATE_MAX_BLOCKS = (
+    MAIN_STATE_STORAGE_LEN + MAIN_STATE_BLOCK_SIZE - 1
+) // MAIN_STATE_BLOCK_SIZE
+MAIN_STATE_BLOCK_NUM = CSA_STATE_PHYSICAL_BLOCKS
 INNER_OUT_DIM = COFF * IDX_HEAD_DIM
 INNER_STATE_DIM = 2 * INNER_OUT_DIM
 INNER_STATE_BLOCK_SIZE = C4A_COMPRESSOR_BLOCK_SIZE
 INNER_STATE_LEN = COFF * COMPRESS_RATIO
-INNER_STATE_MAX_BLOCKS = (INNER_STATE_LEN + INNER_STATE_BLOCK_SIZE - 1) // INNER_STATE_BLOCK_SIZE
+INNER_STATE_STORAGE_LEN = INNER_STATE_LEN + S
+INNER_STATE_MAX_BLOCKS = (
+    INNER_STATE_STORAGE_LEN + INNER_STATE_BLOCK_SIZE - 1
+) // INNER_STATE_BLOCK_SIZE
+INNER_STATE_BLOCK_NUM = CSA_INNER_STATE_PHYSICAL_BLOCKS
+MAIN_STATE_BLOCKS_PER_REQUEST = MAIN_STATE_BLOCK_NUM // DECODE_BATCH
+INNER_STATE_BLOCKS_PER_REQUEST = INNER_STATE_BLOCK_NUM // DECODE_BATCH
 ORI_MAX_BLOCKS = (MAX_SEQ_LEN + BLOCK_SIZE - 1) // BLOCK_SIZE
 ORI_BLOCK_NUM = KV_ORI_BLOCK_NUM
 CMP_MAX_ROWS = MAX_SEQ_LEN // COMPRESS_RATIO
@@ -1285,17 +1297,20 @@ def build_tensor_specs(start_pos=None, batch=B):
         dtype=torch.bfloat16,
     )
 
-    main_state_block_num = batch * MAIN_STATE_MAX_BLOCKS
-    inner_state_block_num = batch * INNER_STATE_MAX_BLOCKS
-    main_state_block_table = block_table(
-        batch=batch,
-        table_blocks=MAIN_STATE_MAX_BLOCKS,
-        physical_blocks=main_state_block_num,
+    main_state_block_num = MAIN_STATE_BLOCK_NUM
+    inner_state_block_num = INNER_STATE_BLOCK_NUM
+
+    def state_block_table(table_blocks, blocks_per_request):
+        logical_blocks = torch.arange(table_blocks, dtype=torch.int32)
+        ring_blocks = logical_blocks % blocks_per_request
+        request_slots = torch.arange(batch, dtype=torch.int32).unsqueeze(1)
+        return ring_blocks.unsqueeze(0) * DECODE_BATCH + request_slots
+
+    main_state_block_table = state_block_table(
+        MAIN_STATE_MAX_BLOCKS, MAIN_STATE_BLOCKS_PER_REQUEST,
     )
-    inner_state_block_table = block_table(
-        batch=batch,
-        table_blocks=INNER_STATE_MAX_BLOCKS,
-        physical_blocks=inner_state_block_num,
+    inner_state_block_table = state_block_table(
+        INNER_STATE_MAX_BLOCKS, INNER_STATE_BLOCKS_PER_REQUEST,
     )
 
     def ring_slots(table, state_len, state_block_size):
@@ -1303,8 +1318,12 @@ def build_tensor_specs(start_pos=None, batch=B):
         pages = torch.gather(table.to(torch.int64), 1, ring_rows // state_block_size)
         return pages * state_block_size + ring_rows % state_block_size
 
-    main_state_slots = ring_slots(main_state_block_table, MAIN_STATE_LEN, MAIN_STATE_BLOCK_SIZE)
-    inner_state_slots = ring_slots(inner_state_block_table, INNER_STATE_LEN, INNER_STATE_BLOCK_SIZE)
+    main_state_slots = ring_slots(
+        main_state_block_table, MAIN_STATE_STORAGE_LEN, MAIN_STATE_BLOCK_SIZE,
+    )
+    inner_state_slots = ring_slots(
+        inner_state_block_table, INNER_STATE_STORAGE_LEN, INNER_STATE_BLOCK_SIZE,
+    )
 
     max_visible_rows = int((kv_seq_lens.to(torch.int64) // COMPRESS_RATIO).max())
     max_active_pages = max(1, (max_visible_rows + BLOCK_SIZE - 1) // BLOCK_SIZE)

@@ -52,8 +52,9 @@ INNER_HEAD_DIM = IDX_HEAD_DIM
 INNER_OUT_DIM = INNER_COFF * INNER_HEAD_DIM
 INNER_STATE_BLOCK_SIZE = C4A_COMPRESSOR_BLOCK_SIZE
 INNER_STATE_LEN = INNER_COFF * COMPRESS_RATIO
+INNER_STATE_STORAGE_LEN = INNER_STATE_LEN + S
 INNER_STATE_MAX_BLOCKS = (
-    INNER_STATE_LEN + INNER_STATE_BLOCK_SIZE - 1
+    INNER_STATE_STORAGE_LEN + INNER_STATE_BLOCK_SIZE - 1
 ) // INNER_STATE_BLOCK_SIZE
 INNER_STATE_BLOCK_NUM_DYN = pl.dynamic("INNER_STATE_BLOCK_NUM_DYN")
 INNER_STATE_DIM = 2 * INNER_OUT_DIM
@@ -1119,7 +1120,7 @@ def build_tensor_specs(start_pos=None, batch=B):
     state_block_table = torch.arange(
         state_block_num - 1, -1, -1, dtype=torch.int32
     ).reshape(batch, INNER_STATE_MAX_BLOCKS)
-    ring_rows = positions.to(torch.int64) % INNER_STATE_LEN
+    ring_rows = positions.to(torch.int64) % INNER_STATE_STORAGE_LEN
     state_pages = torch.gather(
         state_block_table.to(torch.int64),
         1,

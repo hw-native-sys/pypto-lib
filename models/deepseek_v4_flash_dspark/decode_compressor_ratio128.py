@@ -69,6 +69,7 @@ COMPRESS_STATE_PHYSICAL_BLOCKS = HCA_STATE_PHYSICAL_BLOCKS
 COMPRESS_STATE_MAX_BLOCKS = (MAX_SEQ_LEN + COMPRESS_STATE_BLOCK_SIZE - 1) // COMPRESS_STATE_BLOCK_SIZE
 COMPRESS_STATE_BLOCK_NUM = COMPRESS_STATE_PHYSICAL_BLOCKS
 COMPRESS_STATE_DIM = 2 * OUT_DIM
+COMPRESS_STATE_BLOCKS_PER_REQUEST = COMPRESS_STATE_PHYSICAL_BLOCKS // DECODE_BATCH
 CMP_MAX_BLOCKS = (IDX_KV_LEN + BLOCK_SIZE - 1) // BLOCK_SIZE
 CMP_BLOCK_NUM = KV_CMP_BLOCK_NUM
 if IDX_KV_LEN > CMP_MAX_BLOCKS * BLOCK_SIZE:
@@ -492,12 +493,10 @@ def build_tensor_specs(start_pos=None, batch=B):
     def init_cmp_kv_cache():
         return torch.zeros(CMP_BLOCK_NUM, BLOCK_SIZE, 1, HEAD_DIM)
     def init_compress_state_block_table():
-        return block_table(
-            batch=batch,
-            table_blocks=COMPRESS_STATE_MAX_BLOCKS,
-            physical_blocks=COMPRESS_STATE_PHYSICAL_BLOCKS,
-            permuted=True,
-        )
+        logical_blocks = torch.arange(COMPRESS_STATE_MAX_BLOCKS, dtype=torch.int32)
+        ring_blocks = logical_blocks % COMPRESS_STATE_BLOCKS_PER_REQUEST
+        request_slots = torch.arange(batch, dtype=torch.int32).unsqueeze(1)
+        return ring_blocks.unsqueeze(0) * DECODE_BATCH + request_slots
     def init_cmp_block_table():
         return block_table(
             batch=batch,
