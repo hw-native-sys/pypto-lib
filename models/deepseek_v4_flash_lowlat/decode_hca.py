@@ -229,7 +229,9 @@ def attention_hca(
 
     ori_block_num = pl.tensor.dim(kv_cache, 0)
     kv_cache_flat = pl.reshape(kv_cache, [ori_block_num * BLOCK_SIZE, HEAD_DIM])
-    for wb_blk in pl.spmd(T // HCA_WB_TOKEN_TILE, name_hint="hca_cache_writeback"):
+    for wb_blk in pl.spmd(
+        T // HCA_WB_TOKEN_TILE, name_hint="hca_cache_writeback", allow_early_resolve=True
+    ):
         wb_t0 = wb_blk * HCA_WB_TOKEN_TILE
         for write_dt in pl.range(HCA_WB_TOKEN_TILE):
             write_t = wb_t0 + write_dt
@@ -260,7 +262,9 @@ def attention_hca(
     attn_out = pl.create_tensor([T, D], dtype=pl.BF16)
     o_packed = pl.create_tensor([O_GROUPS * T, O_GROUP_IN], dtype=pl.BF16)
     topk_all = pl.create_tensor([T, HCA_CMP_TOPK], dtype=pl.INT32)
-    for topk_block in pl.spmd(T // HCA_TOPK_TOKEN_TILE, name_hint="hca_cache_topk"):
+    for topk_block in pl.spmd(
+        T // HCA_TOPK_TOKEN_TILE, name_hint="hca_cache_topk", allow_early_resolve=True
+    ):
         topk_t0 = topk_block * HCA_TOPK_TOKEN_TILE
         for topk_dt in pl.range(HCA_TOPK_TOKEN_TILE):
             topk_t = topk_t0 + topk_dt
