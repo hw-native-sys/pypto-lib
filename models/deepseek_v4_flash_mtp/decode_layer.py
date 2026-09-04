@@ -16,7 +16,7 @@ size is chosen with --ep (2/4/8, default 2), inherited from moe; see __main__.
 
 import pypto.language as pl
 import pypto.language.distributed as pld
-from pypto.ir.distributed_compiled_program import DistributedConfig
+from pypto.ir import DistributedConfig
 
 from decode_swa import (
     B,

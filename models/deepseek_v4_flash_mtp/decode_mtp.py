@@ -13,7 +13,7 @@ import argparse
 
 import pypto.language as pl
 import pypto.language.distributed as pld
-from pypto.ir.distributed_compiled_program import DistributedConfig
+from pypto.ir import DistributedConfig
 
 from config import DECODE_SEQ, DECODE_START_POS, FLASH as M
 from decode_swa import (

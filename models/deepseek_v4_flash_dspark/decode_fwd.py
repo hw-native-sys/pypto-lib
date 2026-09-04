@@ -1651,7 +1651,7 @@ def main():
     import argparse
 
     from golden import run
-    from pypto.ir.distributed_compiled_program import DistributedConfig
+    from pypto.ir import DistributedConfig
 
     parser = argparse.ArgumentParser(description="DeepSeek-V4 D-Spark decode-forward integration")
     parser.add_argument("-p", "--platform", type=str, default="a2a3", choices=("a2a3", "a2a3sim", "a5", "a5sim"))

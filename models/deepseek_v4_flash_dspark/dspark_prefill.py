@@ -9,7 +9,7 @@
 # ci: devices=4
 """Validate DSpark prompt-context KV insertion followed by the seven-query drafter."""
 
-from pypto.ir.distributed_compiled_program import DistributedConfig
+from pypto.ir import DistributedConfig
 
 from dspark_drafter import (
     DSPARK_SUPPORTED_BATCHES,

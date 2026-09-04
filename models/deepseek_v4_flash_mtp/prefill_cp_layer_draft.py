@@ -17,7 +17,7 @@ remain separate so each protocol has one clear owner.
 import torch
 import pypto.language as pl
 import pypto.language.distributed as pld
-from pypto.ir.distributed_compiled_program import DistributedConfig
+from pypto.ir import DistributedConfig
 
 # The prefill path routes PREFILL_TOKENS tokens. Set MOE_TOKENS before importing
 # moe (which freezes recv shapes and derives RECV_MAX = EP * MOE_TOKENS at import).

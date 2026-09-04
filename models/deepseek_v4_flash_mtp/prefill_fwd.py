@@ -28,7 +28,7 @@ import argparse
 import pypto.language as pl
 import pypto.language.distributed as pld
 from golden import run
-from pypto.ir.distributed_compiled_program import DistributedConfig
+from pypto.ir import DistributedConfig
 
 # prefill_fwd is self-contained: it imports kernels, constants, and per-kind
 # spec builders directly from the leaf modules (no dependency on prefill_layer).
