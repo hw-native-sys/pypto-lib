@@ -273,22 +273,20 @@ def decode_csa(
             )
 
     x_normed_t = pl.create_tensor([t_dim, D], dtype=pl.BF16)
-    with pl.scope():
-        rms_norm(x_mixed, attn_norm_w, x_normed_t)
+    rms_tid = rms_norm(x_mixed, attn_norm_w, x_normed_t)
 
     # All-gather the local post-norm rows into the TP group's token stream, which
     # the KV branch and its cache write consume.
     kv_wb_blocks = kv_dim // CSA_WB_TOKEN_TILE
     x_normed_full = pl.create_tensor([kv_dim, D], dtype=pl.BF16)
-    with pl.scope():
-        # decode_cp_token_allgather_step writes x_normed_full in place; keep the
-        # original handle, since a returned inline handle cannot cross into
-        # kv_proj_rope.
-        _gathered_normed, gather_signal = decode_cp_token_allgather_step(
-            x_normed_t, x_normed_full,
-            gather_window, gather_signal,
-            group_base, tp_rank,
-        )
+    # Keep the original tensor handle because returned inline tensor versions
+    # cannot cross into kv_proj_rope; gather_done_tid carries the ordering edge.
+    _gathered_normed, gather_signal, gather_done_tid = decode_cp_token_allgather_step(
+        x_normed_t, x_normed_full,
+        gather_window, gather_signal,
+        group_base, tp_rank,
+        rms_tid,
+    )
 
     kv_full = pl.create_tensor([kv_dim, HEAD_DIM], dtype=pl.BF16)
     qr = pl.create_tensor([t_dim, Q_LORA], dtype=pl.INT8)
@@ -297,7 +295,7 @@ def decode_csa(
     attention_local_flat = pl.create_tensor([ATTENTION_WINDOW_ROWS, O_GROUP_IN], dtype=pl.BF16)
     attn_out = pl.create_tensor([t_dim, D], dtype=pl.BF16)
     with pl.scope():
-        late_dep = pl.system.task_dummy(deps=[rope_tid])
+        late_dep = pl.system.task_dummy(deps=[rope_tid, gather_done_tid])
         kv_cos_il = pl.create_tensor([kv_dim, ROPE_HEAD_DIM], dtype=pl.FP32)
         kv_sin_signed = pl.create_tensor([kv_dim, ROPE_HEAD_DIM], dtype=pl.FP32)
         kv_swap_idx = pl.create_tensor([kv_dim, ROPE_HEAD_DIM], dtype=pl.INT32)

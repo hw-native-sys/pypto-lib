@@ -83,6 +83,7 @@ def decode_cp_token_allgather_step(
     gather_signal: pld.DistributedTensor[[TP_SIZE, 1], pl.INT32],
     group_base: pl.Scalar[pl.INT32],
     tp_rank: pl.Scalar[pl.INT32],
+    input_ready_dep: pl.Scalar[pl.TASK_ID],
 ):
     """Gather rank-major rows and retire the complete two-phase signal epoch."""
     local_rows = pl.tensor.dim(hidden_local, 0)
@@ -91,7 +92,12 @@ def decode_cp_token_allgather_step(
 
     # Publish the payload and first-phase arrival from PUSH_WORKERS producers.
     full_local = (local_t // COMM_ROW_TILE) * COMM_ROW_TILE
-    with pl.spmd(PUSH_WORKERS, name_hint="cp_token_allgather_push", allow_early_resolve=True) as _push_tid:
+    with pl.spmd(
+        PUSH_WORKERS,
+        name_hint="cp_token_allgather_push",
+        deps=[input_ready_dep],
+        allow_early_resolve=True,
+    ) as _push_tid:
         worker = pl.tile.get_block_idx()
         for peer_tp in pl.range(TP_SIZE):
             for band_row in pl.range(worker * COMM_ROW_TILE, full_local, PUSH_WORKERS * COMM_ROW_TILE):
@@ -169,7 +175,7 @@ def decode_cp_token_allgather_step(
         level=pl.Level.CORE_GROUP,
         name_hint="cp_token_allgather_retire",
         deps=[_readback_tid, _readback_wait_tid],
-    ):
+    ) as retire_tid:
         completion_anchor = pl.read(group_out, [0, 0])
         reset_value = pl.cast(-READBACK_EXPECTED, pl.INT32)
         self_rank = group_base + tp_rank
@@ -181,7 +187,7 @@ def decode_cp_token_allgather_step(
                 )
         pl.write(group_out, [0, 0], completion_anchor)
 
-    return group_out, gather_signal
+    return group_out, gather_signal, retire_tid
 
 
 @pl.jit
@@ -196,10 +202,12 @@ def decode_cp_token_allgather_fixture(
     """Run one rank of the decode token-row all-gather."""
     hidden_local.bind_dynamic(0, Q_T_DYN)
     group_out.bind_dynamic(0, KV_T_DYN)
-    group_out, gather_signal = decode_cp_token_allgather_step(
+    input_ready_dep = pl.system.task_dummy(deps=[])
+    group_out, gather_signal, _gather_done_tid = decode_cp_token_allgather_step(
         hidden_local, group_out,
         gather_window, gather_signal,
         group_base, tp_rank,
+        input_ready_dep,
     )
     return group_out, gather_signal
 

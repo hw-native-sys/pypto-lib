@@ -210,24 +210,25 @@ def decode_hca(
 
     cmp_cos_il = pl.create_tensor([kv_b_dim, ROPE_HEAD_DIM], dtype=pl.FP32)
     cmp_sin_signed = pl.create_tensor([kv_b_dim, ROPE_HEAD_DIM], dtype=pl.FP32)
-    rope_interleave(cmp_freqs_cos, cmp_freqs_sin, cmp_cos_il, cmp_sin_signed)
+    cmp_rope_ready_tid = rope_interleave(
+        cmp_freqs_cos, cmp_freqs_sin, cmp_cos_il, cmp_sin_signed,
+    )
 
     x_normed = pl.create_tensor([t_dim, D], dtype=pl.BF16)
     rms_tid = rms_norm(x_mixed, attn_norm_w, x_normed)
-    late_dep = pl.system.task_dummy(deps=[rms_tid])
 
     # All-gather the local post-norm rows into the TP group's token stream, which
     # the KV branch, its cache write and the compressor consume.
     x_normed_full = pl.create_tensor([kv_dim, D], dtype=pl.BF16)
-    with pl.scope():
-        # decode_cp_token_allgather_step writes x_normed_full in place; keep the
-        # original handle, since a returned inline handle cannot cross into
-        # kv_proj_rope.
-        _gathered_normed, gather_signal = decode_cp_token_allgather_step(
-            x_normed, x_normed_full,
-            gather_window, gather_signal,
-            group_base, tp_rank,
-        )
+    # Keep the original tensor handle because returned inline tensor versions
+    # cannot cross into kv_proj_rope; gather_done_tid carries the ordering edge.
+    _gathered_normed, gather_signal, gather_done_tid = decode_cp_token_allgather_step(
+        x_normed, x_normed_full,
+        gather_window, gather_signal,
+        group_base, tp_rank,
+        rms_tid,
+    )
+    late_dep = gather_done_tid
 
     q = pl.create_tensor([t_dim, H, HEAD_DIM], dtype=pl.BF16)
     kv_full = pl.create_tensor([kv_dim, HEAD_DIM], dtype=pl.BF16)
@@ -285,7 +286,7 @@ def decode_hca(
         cmp_wkv, cmp_wgate, cmp_ape, cmp_norm_w,
         cmp_cos_il, cmp_sin_signed, cmp_kv,
         cmp_positions, cmp_slots, cmp_state_slots,
-        late_dep,
+        late_dep, cmp_rope_ready_tid,
     )
     cache_ready_dep = pl.system.task_dummy(deps=[ori_cache_write_tid, cmp_cache_write_tid])
 
@@ -747,7 +748,9 @@ def decode_hca_tp1(
     # Interleave-duplicated / sign-folded compressed-position rope rows, built once over B rows.
     cmp_cos_il = pl.create_tensor([B, ROPE_HEAD_DIM], dtype=pl.FP32)
     cmp_sin_signed = pl.create_tensor([B, ROPE_HEAD_DIM], dtype=pl.FP32)
-    rope_interleave(cmp_freqs_cos, cmp_freqs_sin, cmp_cos_il, cmp_sin_signed)
+    cmp_rope_ready_tid = rope_interleave(
+        cmp_freqs_cos, cmp_freqs_sin, cmp_cos_il, cmp_sin_signed,
+    )
 
     x_normed = pl.create_tensor([t_dim, D], dtype=pl.BF16)
     rms_tid = rms_norm(x_mixed, attn_norm_w, x_normed)
@@ -782,7 +785,7 @@ def decode_hca_tp1(
         cmp_wkv, cmp_wgate, cmp_ape, cmp_norm_w,
         cmp_cos_il, cmp_sin_signed, cmp_kv,
         position_ids, cmp_slot_mapping, state_slot_mapping,
-        late_dep,
+        late_dep, cmp_rope_ready_tid,
     )
     cache_ready_dep = pl.system.task_dummy(deps=[ori_cache_write_tid, cmp_cache_write_tid])
 

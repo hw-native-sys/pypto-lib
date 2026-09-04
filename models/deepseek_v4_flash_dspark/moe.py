@@ -230,7 +230,11 @@ def dispatch(
     # loc_e on EVERY destination rank, so the blocking cross-rank puts fan out
     # across N_LOCAL cores. One slot counter per destination rank; token-major
     # order matches the meta pass's per-(dst, loc_e) cumulative count.
-    with pl.spmd(N_LOCAL, name_hint="dispatch_push", allow_early_resolve=True):
+    with pl.spmd(
+        N_LOCAL,
+        name_hint="dispatch_push",
+        allow_early_resolve=True,
+    ) as push_tid:
         loc_e = pl.tile.get_block_idx()
         active_tokens = pl.cast(num_tokens, pl.INDEX)
         if active_tokens < 0:
@@ -287,7 +291,11 @@ def dispatch(
                     op=pld.NotifyOp.AtomicAdd,
                 )
 
-    with pl.at(level=pl.Level.CORE_GROUP, name_hint="dispatch_wait") as _wait_tid:
+    with pl.at(
+        level=pl.Level.CORE_GROUP,
+        name_hint="dispatch_wait",
+        deps=[push_tid],
+    ) as _wait_tid:
         for src in pl.range(N_RANKS):
             if src != my_rank:
                 pld.system.defer_wait(
@@ -348,7 +356,7 @@ def combine(
     # Rows are src-major, so the per-(e, src) base is a loop-carried prefix sum over
     # src inside the block (same shape as dispatch_gather). Each route maps to a
     # unique (dst, loc_e) and r_route, so the blocks' puts are write-disjoint.
-    with pl.spmd(N_LOCAL, name_hint="combine"):
+    with pl.spmd(N_LOCAL, name_hint="combine") as combine_tid:
         e = pl.tile.get_block_idx()
         e_base_row = e * RECV_MAX
         b = pl.cast(0, pl.INDEX)
@@ -378,7 +386,11 @@ def combine(
                     op=pld.NotifyOp.AtomicAdd,
                 )
 
-    with pl.at(level=pl.Level.CORE_GROUP, name_hint="combine_wait") as _cwait_tid:
+    with pl.at(
+        level=pl.Level.CORE_GROUP,
+        name_hint="combine_wait",
+        deps=[combine_tid],
+    ) as _cwait_tid:
         for src in pl.range(N_RANKS):
             if src != my_rank:
                 pld.system.defer_wait(

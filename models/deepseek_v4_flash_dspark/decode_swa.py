@@ -183,21 +183,19 @@ def decode_swa(
 
     x_normed_t = pl.create_tensor([t_dim, D], dtype=pl.BF16)
     rms_tid = rms_norm(x_mixed, attn_norm_w, x_normed_t)
-    # Dispatch barrier: kv_proj_matmul resolves one hop after rms_norm.
-    late_dep = pl.system.task_dummy(deps=[rms_tid])
 
     # All-gather the local post-norm rows into the TP group's token stream, which
     # the KV branch and its cache write consume.
     x_normed_full = pl.create_tensor([kv_dim, D], dtype=pl.BF16)
-    with pl.scope():
-        # decode_cp_token_allgather_step writes x_normed_full in place; keep the
-        # original handle, since a returned inline handle cannot cross into
-        # kv_proj_rope.
-        _gathered_normed, gather_signal = decode_cp_token_allgather_step(
-            x_normed_t, x_normed_full,
-            gather_window, gather_signal,
-            group_base, tp_rank,
-        )
+    # Keep the original tensor handle because returned inline tensor versions
+    # cannot cross into kv_proj_rope; gather_done_tid carries the ordering edge.
+    _gathered_normed, gather_signal, gather_done_tid = decode_cp_token_allgather_step(
+        x_normed_t, x_normed_full,
+        gather_window, gather_signal,
+        group_base, tp_rank,
+        rms_tid,
+    )
+    late_dep = gather_done_tid
 
     q = pl.create_tensor([t_dim, H, HEAD_DIM], dtype=pl.BF16)
     kv_full = pl.create_tensor([kv_dim, HEAD_DIM], dtype=pl.BF16)
