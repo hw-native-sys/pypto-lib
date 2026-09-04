@@ -42,10 +42,19 @@ COL_TILE = 128          # contraction block of the intra term -- the FULL chunk,
                         # With the row split below: 32 / 64 / 128 measure
                         # 681.5 / 464.8 / 444.5 us. Each halving of the
                         # cube<->vector round trips is worth real time.
-D_TILE = D // 2         # output columns per accumulator. The tile that crosses
-                        # back to the vector unit is [CHUNK, D_TILE] FP32, and
-                        # the cross-core ring reserves two of them, so halving D
-                        # halves a 128 KB reserve that alone exceeded the budget.
+D_TILE = D              # output columns per accumulator -- the FULL head dim, so
+                        # there is ONE accumulator and one [CHUNK, D] FP32 tile
+                        # crossing back, not two half-width ones.
+                        #
+                        # This was D // 2 until 2026-09-04, on the belief that a
+                        # full-width crossing "alone exceeded the budget". It does
+                        # not: 64 / 128 measure 429.9 / 315.0 us at T = 8192, a
+                        # 26.7% win. The claim was never actually tested -- the one
+                        # attempt set D_TILE = D without removing the second
+                        # accumulator, so it failed on a slice bound and the
+                        # failure was read as a budget failure. Same lever as
+                        # COL_TILE below: halve the number of cube<->vector round
+                        # trips and the time follows.
 
 
 @pl.jit
@@ -87,8 +96,7 @@ def gdn_chunk_o(
                 # Repro + isolation matrix: devtools/split-investigation/repro/.
                 eg = pl.reshape(pl.exp(pl.slice(g_sum, [1, CHUNK], [h, t0])), [CHUNK, 1])
 
-                # inter = exp(g_i) * (Q @ S), split over D so the tile crossing
-                # back is [CHUNK, D_TILE] rather than [CHUNK, D].
+                # inter = exp(g_i) * (Q @ S), full width: one accumulator.
                 # FOLDING exp(g_i) INTO Q IS NOW POSSIBLE -- 2026-09-04.
                 # It would let ONE accumulator carry both terms, removing four
                 # of this kernel's five cube->vector crossings. It used to be
@@ -107,8 +115,6 @@ def gdn_chunk_o(
                 row = (t0 // CHUNK) * (H * D) + h * D
                 inter_lo = pl.row_expand_mul(
                     pl.matmul(qc, pl.slice(state, [D, D_TILE], [row, 0])), eg)
-                inter_hi = pl.row_expand_mul(
-                    pl.matmul(qc, pl.slice(state, [D, D_TILE], [row, D_TILE])), eg)
 
                 # intra, blocked over its contraction axis: column block j of
                 # the gated scores multiplies rows j of V and accumulates in the
@@ -134,9 +140,6 @@ def gdn_chunk_o(
                 acc_lo = pl.matmul(gated,
                                    pl.slice(v_flat, [COL_TILE, D_TILE], [t0, h * D]),
                                    out_dtype=pl.FP32)
-                acc_hi = pl.matmul(gated,
-                                   pl.slice(v_flat, [COL_TILE, D_TILE], [t0, h * D + D_TILE]),
-                                   out_dtype=pl.FP32)
 
                 for jj in pl.unroll(CHUNK // COL_TILE - 1):
                     j0 = (jj + 1) * COL_TILE
@@ -152,18 +155,11 @@ def gdn_chunk_o(
                     acc_lo = pl.matmul_acc(
                         acc_lo, gated,
                         pl.slice(v_flat, [COL_TILE, D_TILE], [t0 + j0, h * D]))
-                    acc_hi = pl.matmul_acc(
-                        acc_hi, gated,
-                        pl.slice(v_flat, [COL_TILE, D_TILE], [t0 + j0, h * D + D_TILE]))
 
                 o_flat = pl.assemble(
                     o_flat,
                     pl.cast(pl.add(inter_lo, acc_lo), target_type=pl.FP16, mode="rint"),
                     [t0, h * D])
-                o_flat = pl.assemble(
-                    o_flat,
-                    pl.cast(pl.add(inter_hi, acc_hi), target_type=pl.FP16, mode="rint"),
-                    [t0, h * D + D_TILE])
     return o_out
 
 
