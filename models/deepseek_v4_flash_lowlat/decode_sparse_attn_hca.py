@@ -68,7 +68,6 @@ CMP_BLOCK_NUM = DECODE_CMP_BLOCK_NUM
 
 # tiling
 VALID_TOKEN_TILE = 8
-GATHER_RUN = 16          # window sub-tile probed for physical contiguity -> one bulk DMA
 H_TILE = 8               # == H_LOCAL: one card's head slice is one tile
 QK_M_TILE = 8            # qk_pv real M rows == one card's heads
 # The cube addresses Acc in 16x16 fractal boxes, so an 8-head slice must
@@ -114,20 +113,13 @@ PADDED_TOPK = SPARSE_BLOCKS * ATTN_K_TILE
 #  * compressed -- the ratio-128 tail has no indexer: row k is compressed slot k
 #    for every token and only the valid count differs, so the last token's row
 #    is a superset and each token's own sparse_bias masks the rest.
-UNION_ROWS = WIN + S - 1
-# WIN / GATHER_RUN blocks carry whole runs and one trailing block carries the
-# 0..S-1 rows the earlier tokens add, which keeps every full block on the bulk
-# path instead of dropping the ragged one to per-row copies.
-UNION_FULL_TASKS = WIN // GATHER_RUN
-UNION_TASKS = UNION_FULL_TASKS + 1
-# The compressed half is scattered per-row copies, so it is tiled much finer
-# than the bulk window half to even out the two block costs.
+# Only the compressed tail is staged in GM. The window half is WIN consecutive
+# positions and WIN == BLOCK_SIZE, so each token assembles it straight into L1
+# inside qk_pv from two bulk runs -- no GM round-trip and no shared union.
 CMP_ROWS_PER_TASK = 8
 CMP_TASKS = CMP_TOPK // CMP_ROWS_PER_TASK
-GATHER_TASKS = UNION_TASKS + CMP_TASKS
-# One contiguous buffer, window union first, so qk_pv selects its half with
-# arithmetic on the sparse-block index instead of branching between tensors.
-KV_STRIDE = UNION_ROWS + CMP_TOPK
+GATHER_TASKS = CMP_TASKS
+KV_STRIDE = CMP_TOPK
 
 assert CMP_BLOCKS_PER_REQ <= CMP_MAX_BLOCKS, (
     f"compressed block table ({CMP_MAX_BLOCKS} blocks) must index the whole "
@@ -139,7 +131,7 @@ assert WIN == ATTN_K_TILE, f"HCA window tile requires WIN ({WIN}) == ATTN_K_TILE
 assert SPARSE_BLOCKS == 2, (
     f"qk_pv picks its half of hca_kv_flat from the sparse-block index, which "
     f"assumes one window block and one compressed block, got {SPARSE_BLOCKS}")
-assert BLOCK_SIZE % GATHER_RUN == 0, "a contiguous run must not straddle two paged blocks by construction"
+assert WIN == BLOCK_SIZE, "a window spans at most two paged blocks only while WIN == BLOCK_SIZE"
 
 
 @pl.jit.inline
@@ -187,95 +179,32 @@ def sparse_attn_hca_packed(
             sparse_bias[v_t0 : v_t0 + VALID_TOKEN_TILE, TOPK : PADDED_TOPK] = pl.full(
                 [VALID_TOKEN_TILE, PADDED_TOPK - TOPK], dtype=pl.FP32, value=NEG_INF)
 
-    # Sparse-K gather, hoisted out of qk_pv into its own grid. Both halves are
-    # gathered once per request rather than once per token: the window blocks
-    # fill the shifted union and the compressed blocks fill the tail every token
-    # shares. Invalid (-1) and padded lanes are zero-filled to match the golden's
-    # zero rows; the NEG_INF bias then kills them in the softmax.
+    # Compressed-tail gather only. The window half is assembled per token in L1
+    # inside qk_pv (WIN consecutive positions == two bulk runs), so nothing about
+    # the window round-trips through GM any more. The compressed rows are
+    # genuinely scattered AND shared by every token, so they stay a shared task:
+    # folding them in would turn CMP_TOPK row-DMAs into T * CMP_TOPK on the AIC
+    # scalar unit that already bounds this kernel. Invalid (-1) lanes are
+    # zero-filled to match the golden's zero rows; the NEG_INF bias then kills
+    # them in the softmax.
     hca_kv_flat = pl.create_tensor([B * KV_STRIDE, HEAD_DIM], dtype=pl.BF16)
     with pl.spmd(B * GATHER_TASKS, name_hint="hca_gather_kv") as gather_tid:
         g_task = pl.tile.get_block_idx()
         g_b = g_task // GATHER_TASKS
         g_slot = g_task - g_b * GATHER_TASKS
-        g_t0 = g_b * S
-        g_last_t = g_t0 + S - 1
-        g_row0 = g_b * KV_STRIDE
-        if g_slot < UNION_TASKS:
-            # Union row i holds absolute position u0 + i, where u0 is the
-            # request's oldest visible position. The last token's window covers
-            # rows [g_off, g_off + WIN) and the first token's covers the rows
-            # below it, so those two index rows name every union row.
-            g_off = pl.cast(
-                (S - 1) - (pl.read(window_swa_lens, [g_last_t]) - pl.read(window_swa_lens, [g_t0])),
-                pl.INDEX)
-            g_i0 = g_slot * GATHER_RUN
-            g_sdst = g_row0 + g_i0
-            if g_slot < UNION_FULL_TASKS:
-                # Probe the run's first/last slot: endpoints GATHER_RUN-1 apart
-                # mean the whole run sits in one paged block and moves as one
-                # bulk copy. Both endpoints name consecutive absolute positions
-                # even when the run straddles g_off, so one probe still covers
-                # the two index rows.
-                g_sel_a = pl.min(pl.max(g_i0 - g_off + 1, 0), 1)
-                g_first = pl.read(window_swa_indices, [g_t0 + g_sel_a * (S - 1),
-                                                       g_i0 - g_sel_a * g_off])
-                g_ie = g_i0 + GATHER_RUN - 1
-                g_sel_b = pl.min(pl.max(g_ie - g_off + 1, 0), 1)
-                g_last = pl.read(window_swa_indices, [g_t0 + g_sel_b * (S - 1),
-                                                      g_ie - g_sel_b * g_off])
-                # A -1 slot anywhere in the run pins g_run_ok below the match
-                # value, so an invalid or block-straddling run takes the per-row
-                # path.
-                g_run_ok = (g_last - g_first) + pl.min(g_first, 0) * GATHER_RUN
-                if g_run_ok == GATHER_RUN - 1:
-                    g_run_src = pl.cast(g_first, pl.INDEX)
-                    hca_kv_flat[g_sdst : g_sdst + GATHER_RUN, 0:HEAD_DIM] = ori_kv_flat[
-                        g_run_src : g_run_src + GATHER_RUN, 0:HEAD_DIM
-                    ]
-                else:
-                    for g_dr in pl.range(GATHER_RUN):
-                        g_i = g_i0 + g_dr
-                        g_wdst = g_sdst + g_dr
-                        g_sel = pl.min(pl.max(g_i - g_off + 1, 0), 1)
-                        g_win_slot_i32 = pl.read(window_swa_indices,
-                                                 [g_t0 + g_sel * (S - 1), g_i - g_sel * g_off])
-                        if g_win_slot_i32 >= 0:
-                            g_win_slot = pl.cast(g_win_slot_i32, pl.INDEX)
-                            hca_kv_flat[g_wdst : g_wdst + 1, 0:HEAD_DIM] = ori_kv_flat[
-                                g_win_slot : g_win_slot + 1, 0:HEAD_DIM
-                            ]
-                        else:
-                            hca_kv_flat[g_wdst : g_wdst + 1, 0:HEAD_DIM] = pl.full(
-                                [1, HEAD_DIM], dtype=pl.BF16, value=0.0)
+        g_last_t = g_b * S + S - 1
+        # Gathered once from the last token's row -- the widest valid prefix.
+        # Scattered slots, so one block-table lookup and copy per row.
+        g_ck0 = g_slot * CMP_ROWS_PER_TASK
+        g_cdst0 = g_b * KV_STRIDE + g_ck0
+        for g_dr in pl.range(CMP_ROWS_PER_TASK):
+            g_dst = g_cdst0 + g_dr
+            g_ridx = pl.read(cmp_sparse_indices, [g_last_t, g_ck0 + g_dr])
+            if g_ridx >= 0:
+                g_csrc = pl.cast(pl.read(cmp_block_table, [g_b, g_ridx]), pl.INDEX)
+                hca_kv_flat[g_dst : g_dst + 1, 0:HEAD_DIM] = cmp_kv_flat[g_csrc : g_csrc + 1, 0:HEAD_DIM]
             else:
-                # Tail: the g_off rows the earlier tokens add on top of the last
-                # token's window, so fewer than S rows and only read by the
-                # tokens whose window reaches them.
-                for g_tr in pl.range(g_off):
-                    g_tdst = g_sdst + g_tr
-                    g_tslot_i32 = pl.read(window_swa_indices, [g_last_t, WIN - g_off + g_tr])
-                    if g_tslot_i32 >= 0:
-                        g_tslot = pl.cast(g_tslot_i32, pl.INDEX)
-                        hca_kv_flat[g_tdst : g_tdst + 1, 0:HEAD_DIM] = ori_kv_flat[
-                            g_tslot : g_tslot + 1, 0:HEAD_DIM
-                        ]
-                    else:
-                        hca_kv_flat[g_tdst : g_tdst + 1, 0:HEAD_DIM] = pl.full(
-                            [1, HEAD_DIM], dtype=pl.BF16, value=0.0)
-        else:
-            # Compressed tail, gathered once from the last token's row -- the
-            # widest valid prefix. Scattered slots, so one block-table lookup and
-            # copy per row.
-            g_ck0 = (g_slot - UNION_TASKS) * CMP_ROWS_PER_TASK
-            g_cdst0 = g_row0 + UNION_ROWS + g_ck0
-            for g_dr in pl.range(CMP_ROWS_PER_TASK):
-                g_dst = g_cdst0 + g_dr
-                g_ridx = pl.read(cmp_sparse_indices, [g_last_t, g_ck0 + g_dr])
-                if g_ridx >= 0:
-                    g_csrc = pl.cast(pl.read(cmp_block_table, [g_b, g_ridx]), pl.INDEX)
-                    hca_kv_flat[g_dst : g_dst + 1, 0:HEAD_DIM] = cmp_kv_flat[g_csrc : g_csrc + 1, 0:HEAD_DIM]
-                else:
-                    hca_kv_flat[g_dst : g_dst + 1, 0:HEAD_DIM] = pl.full([1, HEAD_DIM], dtype=pl.BF16, value=0.0)
+                hca_kv_flat[g_dst : g_dst + 1, 0:HEAD_DIM] = pl.full([1, HEAD_DIM], dtype=pl.BF16, value=0.0)
 
     # qk_pv writes per-tile (mi, li, oi) to GM; merge_norm reads them back. Not
     # fused on a2a3: the PV output (Acc) -> online rescale (Vec) needs an
@@ -295,16 +224,43 @@ def sparse_attn_hca_packed(
         # and PV consume the SAME pre-gathered KV tile.
         qk_s0 = qk_sb * ATTN_K_TILE
         qk_bias_row = sparse_bias[qk_t : qk_t + 1, qk_s0 : qk_s0 + ATTN_K_TILE]
-        # Block 0 is this token's window slice of the union; block 1 is the
-        # compressed tail every token shares. One expression, so the two halves
-        # stay a single tensor and the cube sees the same K tile as before.
+        # Block 0 is this token's own window, assembled here in L1; block 1 is
+        # the shared compressed tail, pulled from the staging buffer as one
+        # contiguous run. Both arms fill the SAME L1 tile, so the cube sees the
+        # same K tile as before.
         qk_b = qk_t // S
-        qk_t0 = qk_b * S
-        qk_off = pl.cast(
-            pl.read(window_swa_lens, [qk_t0]) - pl.read(window_swa_lens, [qk_t]),
-            pl.INDEX) + (qk_t - qk_t0)
-        qk_base = qk_b * KV_STRIDE + (1 - qk_sb) * qk_off + qk_sb * UNION_ROWS
-        qk_kv = hca_kv_flat[qk_base : qk_base + ATTN_K_TILE, 0:HEAD_DIM]
+        qk_kv = pl.create_l1([ATTN_K_TILE, HEAD_DIM], pl.BF16)
+        if qk_sb == 0:
+            # A window is WIN consecutive positions and WIN == BLOCK_SIZE, so it
+            # is the tail of block P plus the head of block P+1. Two bulk DMAs
+            # carry both runs; valid_shape expresses the runtime split without
+            # touching the tile's allocation.
+            qk_slot0 = pl.max(pl.read(window_swa_indices, [qk_t, 0]), 0)
+            qk_r = qk_slot0 % BLOCK_SIZE
+            qk_head = WIN - qk_r
+            qk_blk1 = pl.max(pl.read(window_swa_indices, [qk_t, qk_head % WIN]), 0)
+            qk_len = pl.min(pl.max(pl.read(window_swa_lens, [qk_t]), 0), WIN)
+            qk_src0 = pl.cast(qk_slot0, pl.INDEX)
+            qk_kv = pl.gather_row(qk_kv, ori_kv_flat, [0, 0], [qk_src0, 0],
+                                  [ATTN_K_TILE, HEAD_DIM], valid_shape=[qk_head, HEAD_DIM])
+            if qk_r > 0:
+                qk_src1 = pl.cast(qk_blk1, pl.INDEX)
+                qk_kv = pl.gather_row(qk_kv, ori_kv_flat, [qk_head, 0], [qk_src1, 0],
+                                      [ATTN_K_TILE, HEAD_DIM], valid_shape=[qk_r, HEAD_DIM])
+            qk_tail = WIN - qk_len
+            if qk_tail > 0:
+                # Cold start: rows past the visible prefix are allocated but not
+                # yet written. Replicate the window's oldest visible slot over
+                # them -- that row is written by definition. sparse_bias masks
+                # their scores, but a non-finite value would reach the QK matmul
+                # and propagate through row_max before it applied.
+                for qk_fill in pl.range(qk_tail):
+                    qk_kv = pl.gather_row(qk_kv, ori_kv_flat, [qk_len + qk_fill, 0],
+                                          [qk_src0, 0], [1, HEAD_DIM])
+        else:
+            qk_cmp_src = pl.cast(qk_b * KV_STRIDE, pl.INDEX)
+            qk_kv = pl.gather_row(qk_kv, hca_kv_flat, [0, 0], [qk_cmp_src, 0],
+                                  [ATTN_K_TILE, HEAD_DIM])
 
         # Cube-batch QK_M_TILE head rows per QK/PV matmul so the shared KV
         # tile is extracted L1->L0 once per QK_M_TILE/H_TILE head-tiles
