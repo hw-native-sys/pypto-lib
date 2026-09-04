@@ -89,10 +89,21 @@ def gdn_chunk_o(
 
                 # inter = exp(g_i) * (Q @ S), split over D so the tile crossing
                 # back is [CHUNK, D_TILE] rather than [CHUNK, D].
-                # (Folding exp(g_i) into Q instead would let one accumulator
-                # carry both terms -- it is exact, and FP16-safe by measurement
-                # -- but row_expand_mul cannot write a cube-operand layout:
-                # "expects dst to use row-major layout".)
+                # FOLDING exp(g_i) INTO Q IS NOW POSSIBLE -- 2026-09-04.
+                # It would let ONE accumulator carry both terms, removing four
+                # of this kernel's five cube->vector crossings. It used to be
+                # blocked because row_expand_mul could not write a cube-operand
+                # layout ("expects dst to use row-major layout"); on the current
+                # pin `row_expand_mul -> matmul` and `matmul; matmul_acc onto the
+                # same accumulator` both build (probe:
+                # devtools/../xstage/expand_to_cube.py). Numerics re-checked:
+                # exp(g) spans 8.7e-01 .. 6.8e-43 over a chunk so 108 of 128 rows
+                # flush to zero in FP16, but their true inter is ~1e-43 -- zero at
+                # any output precision -- and the folded inter differs from the
+                # current FP32 form by 2.1e-04 relative, set by FP16 rounding on
+                # the rows that survive. Same order as this pipeline's existing
+                # FP16 floor, so it needs an end-to-end measurement, not a
+                # guess. Not yet built; see GDN_ROADMAP.md.
                 row = (t0 // CHUNK) * (H * D) + h * D
                 inter_lo = pl.row_expand_mul(
                     pl.matmul(qc, pl.slice(state, [D, D_TILE], [row, 0])), eg)
