@@ -92,8 +92,11 @@ WEIGHTS_OK = 4
 WEIGHTS_K_SLICE = D // WEIGHTS_OK
 assert WEIGHTS_K_SLICE % D_TILE == 0
 QH_QUANT_TILE = 64
-# cube tile for q @ hadamard; L0C caps it at QH_MM_TILE * IDX_HEAD_DIM * 4B <= 64KiB.
+# cube tile for q @ hadamard; bs_heads // QH_MM_TILE truncates, so the tile stays
+# at the loosest divisibility the kernel already required.
 QH_MM_TILE = 64
+# qr_hadamard_matmul runs on persistent workers, each striding over the block list.
+QH_WORKERS = 24
 QH_HEAD_DIM_TILE = 64
 ROPE_ROW_BLOCK = IDX_N_HEADS
 # qr_rope SPMD tile == row block: one ROPE_ROW_TILE-row block per SPMD tile.
@@ -722,10 +725,13 @@ def indexer(
     # cube-only scope: q @ hadamard lands in GM, keeping the vector amax/quant below
     # in its own scope so the two run as separate cube and vector tasks.
     qh_acc_gm = pl.create_tensor([bs_heads, IDX_HEAD_DIM], dtype=pl.FP32)
-    for idx in pl.spmd(bs_heads // QH_MM_TILE, name_hint="qr_hadamard_matmul", allow_early_resolve=True):
-        o0 = idx * QH_MM_TILE
-        qh_acc = pl.matmul(qr_bf16[o0 : o0 + QH_MM_TILE, :], hadamard, out_dtype=pl.FP32)
-        qh_acc_gm[o0 : o0 + QH_MM_TILE, :] = qh_acc
+    for qh_worker in pl.spmd(QH_WORKERS, name_hint="qr_hadamard_matmul", allow_early_resolve=True):
+        # The hadamard matrix is the same for every block, so it is read once per worker.
+        qh_hadamard = hadamard[0:IDX_HEAD_DIM, 0:IDX_HEAD_DIM]
+        for idx in pl.range(qh_worker, bs_heads // QH_MM_TILE, QH_WORKERS):
+            o0 = idx * QH_MM_TILE
+            qh_acc = pl.matmul(qr_bf16[o0 : o0 + QH_MM_TILE, :], qh_hadamard, out_dtype=pl.FP32)
+            qh_acc_gm[o0 : o0 + QH_MM_TILE, :] = qh_acc
 
     qr_hadamard_i8 = pl.create_tensor(
         [T_PAD * IDX_N_HEADS, IDX_HEAD_DIM], dtype=pl.INT8

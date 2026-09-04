@@ -63,6 +63,8 @@ OUT_TILE = 64
 PROJ_OUT_TILE = 32  # kv_score_proj N-tile
 assert PROJ_OUT_TILE % 16 == 0, "cube tile cols must be a multiple of 16"
 MM_B_TILE = 16
+# kv_score_proj runs on persistent workers, each striding over the block list.
+KV_SCORE_WORKERS = 24
 # Scratch spans the CP group's whole token stream, not the rank-local B * S.
 GROUP_BS = DECODE_BATCH * DECODE_SEQ
 BS_PAD = ((GROUP_BS + MM_B_TILE - 1) // MM_B_TILE) * MM_B_TILE
@@ -109,34 +111,33 @@ def indexer_compressor(
 
     # Deferred behind the caller's rms_norm dummy barrier: qkv's qr_proj_matmul is the
     # critical path and must win the cores when rms_norm retires.
-    with pl.spmd(
-        t_matmul * OUT_DIM // (MM_B_TILE * PROJ_OUT_TILE), name_hint="kv_score_proj", deps=[late_dep]
-    ) as _kv_score_tid:
-        idx = pl.tile.get_block_idx()
-        global_row0 = (idx // (OUT_DIM // PROJ_OUT_TILE)) * MM_B_TILE
-        o0 = (idx % (OUT_DIM // PROJ_OUT_TILE)) * PROJ_OUT_TILE
-        kv_acc = pl.create_tensor([MM_B_TILE, PROJ_OUT_TILE], dtype=pl.FP32)
-        score_acc = pl.create_tensor([MM_B_TILE, PROJ_OUT_TILE], dtype=pl.FP32)
-        for kb in pl.pipeline(0, D // K_TILE, stage=2):
-            k0 = kb * K_TILE
-            x_rows = pl.min(MM_B_TILE, bs - global_row0)
-            x_tile = pl.slice(x_flat, [MM_B_TILE, K_TILE], [global_row0, k0], valid_shape=[x_rows, K_TILE])
-            # Weights stored transposed [OUT_DIM, D] and consumed via b_trans=True so the
-            # GM->L1 load is a DN2ZN (each [PROJ_OUT_TILE, K_TILE] row is K-contiguous = long
-            # bursts) instead of ND2NZ on [K_TILE, PROJ_OUT_TILE] (K strided = many short
-            # bursts). Mirrors the main compressor (decode_compressor_ratio4); the strided
-            # ND2NZ form here was ~2x slower on this matmul (43us -> ~20us per task).
-            wkv_tile = wkv[o0 : o0 + PROJ_OUT_TILE, k0 : k0 + K_TILE]
-            wgate_tile = wgate[o0 : o0 + PROJ_OUT_TILE, k0 : k0 + K_TILE]
-            if k0 == 0:
-                kv_acc = pl.matmul(x_tile, wkv_tile, out_dtype=pl.FP32, b_trans=True)
-                score_acc = pl.matmul(x_tile, wgate_tile, out_dtype=pl.FP32, b_trans=True)
-            else:
-                kv_acc = pl.matmul_acc(kv_acc, x_tile, wkv_tile, b_trans=True)
-                score_acc = pl.matmul_acc(score_acc, x_tile, wgate_tile, b_trans=True)
+    with pl.spmd(KV_SCORE_WORKERS, name_hint="kv_score_proj", deps=[late_dep]) as _kv_score_tid:
+        kv_worker = pl.tile.get_block_idx()
+        for idx in pl.range(kv_worker, t_matmul * OUT_DIM // (MM_B_TILE * PROJ_OUT_TILE), KV_SCORE_WORKERS):
+            global_row0 = (idx // (OUT_DIM // PROJ_OUT_TILE)) * MM_B_TILE
+            o0 = (idx % (OUT_DIM // PROJ_OUT_TILE)) * PROJ_OUT_TILE
+            kv_acc = pl.create_tensor([MM_B_TILE, PROJ_OUT_TILE], dtype=pl.FP32)
+            score_acc = pl.create_tensor([MM_B_TILE, PROJ_OUT_TILE], dtype=pl.FP32)
+            for kb in pl.pipeline(0, D // K_TILE, stage=2):
+                k0 = kb * K_TILE
+                x_rows = pl.min(MM_B_TILE, bs - global_row0)
+                x_tile = pl.slice(x_flat, [MM_B_TILE, K_TILE], [global_row0, k0], valid_shape=[x_rows, K_TILE])
+                # Weights stored transposed [OUT_DIM, D] and consumed via b_trans=True so the
+                # GM->L1 load is a DN2ZN (each [PROJ_OUT_TILE, K_TILE] row is K-contiguous = long
+                # bursts) instead of ND2NZ on [K_TILE, PROJ_OUT_TILE] (K strided = many short
+                # bursts). Mirrors the main compressor (decode_compressor_ratio4); the strided
+                # ND2NZ form here was ~2x slower on this matmul (43us -> ~20us per task).
+                wkv_tile = wkv[o0 : o0 + PROJ_OUT_TILE, k0 : k0 + K_TILE]
+                wgate_tile = wgate[o0 : o0 + PROJ_OUT_TILE, k0 : k0 + K_TILE]
+                if k0 == 0:
+                    kv_acc = pl.matmul(x_tile, wkv_tile, out_dtype=pl.FP32, b_trans=True)
+                    score_acc = pl.matmul(x_tile, wgate_tile, out_dtype=pl.FP32, b_trans=True)
+                else:
+                    kv_acc = pl.matmul_acc(kv_acc, x_tile, wkv_tile, b_trans=True)
+                    score_acc = pl.matmul_acc(score_acc, x_tile, wgate_tile, b_trans=True)
 
-        kv_proj_pad[global_row0 : global_row0 + MM_B_TILE, o0 : o0 + PROJ_OUT_TILE] = kv_acc
-        score_proj_pad[global_row0 : global_row0 + MM_B_TILE, o0 : o0 + PROJ_OUT_TILE] = score_acc
+            kv_proj_pad[global_row0 : global_row0 + MM_B_TILE, o0 : o0 + PROJ_OUT_TILE] = kv_acc
+            score_proj_pad[global_row0 : global_row0 + MM_B_TILE, o0 : o0 + PROJ_OUT_TILE] = score_acc
 
     # Pool every ratio-4 boundary against the old persistent ring plus the
     # current-step projection overlay. State is committed only after all pools
