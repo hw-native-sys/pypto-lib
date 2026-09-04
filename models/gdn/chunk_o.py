@@ -6,223 +6,96 @@
 # INCLUDING BUT NOT LIMITED TO NON-INFRINGEMENT, MERCHANTABILITY, OR FITNESS FOR A PARTICULAR PURPOSE.
 # See LICENSE in the root of the software repository for the full text of the License.
 # -----------------------------------------------------------------------------------------------------------
-"""Gated DeltaNet chunk_o -- the chunk output.
+"""Gated DeltaNet chunk_o: the chunk output,
 
-    inter = exp(g_i) * (Q @ S)                       inter-chunk, from the state
-    intra = (Q @ K^T * exp(min(g_i - g_j, 0)) * causal) @ V_new    intra-chunk
+    inter = exp(g_i) * (Q @ S)
+    intra = (Q @ K^T * exp(min(g_i - g_j, 0)) * causal) @ V_new
     O     = inter + intra
 
-Stage 7 of the GDN pipeline, and the last one to consume `g_sum`. `S` is the
-state snapshot entering the chunk and `V_new` the residual-corrected values,
-both produced by chunk_h.
-
-The causal mask here includes the diagonal (`i >= j`), unlike scaled_dot_kkt's
-strictly-lower one: a token attends to itself in the output but not in the
-key-key matrix.
-
-The intra term is blocked over its CONTRACTION axis. Column block j of the gated
-score matrix multiplies rows j of V and accumulates in the cube via matmul_acc,
-so the full [C, C] score matrix is never resident -- only one [C, COL_TILE]
-block at a time. That keeps the vector buffer inside budget at C = 128 without
-touching the arithmetic.
+S is the state snapshot entering the chunk and V_new the residual-corrected
+values, both from chunk_h. The causal mask includes the diagonal, unlike
+scaled_dot_kkt's strictly-lower one: a token attends to itself in the output but
+not in the key-key matrix.
 """
 import pypto.language as pl
 
-# Model
+# model config
 T = 8192                # tokens (single sequence, B = 1)
 H = 16                  # value heads (= key heads; no GQA in the default build)
 D = 128                 # head dimension
 CHUNK = 128             # chunk size in tokens
-NCHUNK = T // CHUNK     # state snapshots, one per chunk
-
-# Tiling
-COL_TILE = 128          # contraction block of the intra term -- the FULL chunk,
-                        # so the intra term is one matmul per head rather than a
-                        # blocked accumulation, which is megagdn-pto's layout.
-                        # With the row split below: 32 / 64 / 128 measure
-                        # 681.5 / 464.8 / 444.5 us. Each halving of the
-                        # cube<->vector round trips is worth real time.
-D_TILE = D              # output columns per accumulator -- the FULL head dim, so
-                        # there is ONE accumulator and one [CHUNK, D] FP32 tile
-                        # crossing back, not two half-width ones.
-                        #
-                        # This was D // 2 until 2026-09-04, on the belief that a
-                        # full-width crossing "alone exceeded the budget". It does
-                        # not: 64 / 128 measure 429.9 / 315.0 us at T = 8192, a
-                        # 26.7% win. The claim was never actually tested -- the one
-                        # attempt set D_TILE = D without removing the second
-                        # accumulator, so it failed on a slice bound and the
-                        # failure was read as a budget failure. Same lever as
-                        # COL_TILE below: halve the number of cube<->vector round
-                        # trips and the time follows.
 
 
-@pl.jit
-def gdn_chunk_o(
-    q: pl.Tensor[[T, H, D], pl.FP16],
-    k: pl.Tensor[[T, H, D], pl.FP16],
-    v: pl.Tensor[[T, H, D], pl.FP16],
-    state: pl.Tensor[[NCHUNK * H * D, D], pl.FP16],
-    g_sum: pl.Tensor[[H, T], pl.FP32],
-    mask: pl.Tensor[[CHUNK, CHUNK], pl.FP32],
-    o_out: pl.Out[pl.Tensor[[T, H, D], pl.FP16]],
-):
-    q_flat = pl.reshape(q, [T, H * D])
-    k_flat = pl.reshape(k, [T, H * D])
-    v_flat = pl.reshape(v, [T, H * D])
-    o_flat = pl.reshape(o_out, [T, H * D])
-    for t0 in pl.parallel(0, T, CHUNK):
-        # An a2a3 core has two vector sub-cores, and an unsplit mixed region
-        # runs its vector work on lane 0 only. Splitting the rows across both
-        # halves every vector tile, which is what makes COL_TILE=128 affordable:
-        # 561.0 us unsplit -> 444.5 split at the full column extent, -21%.
-        # Vec then sits at 164352 B of 188416 (87%), of which 65536 is the
-        # cross-core ring -- staging megagdn-pto pays nothing for, since it
-        # routes cube<->vector through GM and L1 instead of the vector buffer.
-        with pl.at(level=pl.Level.CORE_GROUP, name_hint="chunk_o",
-                   optimizations=[pl.cross_core_slot(slot_num=1),
-                                  pl.split(pl.SplitMode.UP_DOWN)]):
-            for h in pl.range(H):
-                qc = pl.slice(q_flat, [CHUNK, D], [t0, h * D])
-                g_col = pl.reshape(pl.slice(g_sum, [1, CHUNK], [h, t0]), [CHUNK, 1])
-                # exp on the ROW vector, reshaped after -- NOT pl.exp(g_col).
-                # Under pl.split, a view op reading the pass's per-lane slice
-                # used to fold onto the sliced buffer's BASE, so lane 1 applied
-                # lane 0's gate (max abs diff 36.86). FIXED upstream-side
-                # 2026-09-02 (LowerAutoVectorSplit now sinks the lane slice past
-                # the view); pl.exp(g_col) is verified correct on hardware with
-                # that fix. This spelling is KEPT so the kernel still builds
-                # against stock pypto -- same values, same generated code.
-                # Repro + isolation matrix: devtools/split-investigation/repro/.
-                eg = pl.reshape(pl.exp(pl.slice(g_sum, [1, CHUNK], [h, t0])), [CHUNK, 1])
+def build_kernel(t: int = T, h: int = H, d: int = D, chunk: int = CHUNK):
+    """The stage kernel at one shape."""
+    nchunk = t // chunk                    # state snapshots, one per chunk
 
-                # inter = exp(g_i) * (Q @ S), full width: one accumulator.
-                # FOLDING exp(g_i) INTO Q IS NOW POSSIBLE -- 2026-09-04.
-                # It would let ONE accumulator carry both terms, removing four
-                # of this kernel's five cube->vector crossings. It used to be
-                # blocked because row_expand_mul could not write a cube-operand
-                # layout ("expects dst to use row-major layout"); on the current
-                # pin `row_expand_mul -> matmul` and `matmul; matmul_acc onto the
-                # same accumulator` both build (probe:
-                # devtools/../xstage/expand_to_cube.py). Numerics re-checked:
-                # exp(g) spans 8.7e-01 .. 6.8e-43 over a chunk so 108 of 128 rows
-                # flush to zero in FP16, but their true inter is ~1e-43 -- zero at
-                # any output precision -- and the folded inter differs from the
-                # current FP32 form by 2.1e-04 relative, set by FP16 rounding on
-                # the rows that survive. Same order as this pipeline's existing
-                # FP16 floor, so it needs an end-to-end measurement, not a
-                # guess. Not yet built; see GDN_ROADMAP.md.
-                row = (t0 // CHUNK) * (H * D) + h * D
-                inter_lo = pl.row_expand_mul(
-                    pl.matmul(qc, pl.slice(state, [D, D_TILE], [row, 0])), eg)
+    @pl.jit
+    def gdn_chunk_o(
+        q: pl.Tensor[[t, h, d], pl.FP16],
+        k: pl.Tensor[[t, h, d], pl.FP16],
+        v: pl.Tensor[[t, h, d], pl.FP16],
+        state: pl.Tensor[[nchunk * h * d, d], pl.FP16],
+        g_sum: pl.Tensor[[h, t], pl.FP32],
+        mask: pl.Tensor[[chunk, chunk], pl.FP32],
+        o_out: pl.Out[pl.Tensor[[t, h, d], pl.FP16]],
+    ):
+        q_flat = pl.reshape(q, [t, h * d])
+        k_flat = pl.reshape(k, [t, h * d])
+        v_flat = pl.reshape(v, [t, h * d])
+        o_flat = pl.reshape(o_out, [t, h * d])
+        for c0 in pl.spmd(t // chunk, name_hint="chunk_o",
+                          optimizations=[pl.cross_core_slot(slot_num=1),
+                                         pl.split(pl.SplitMode.UP_DOWN)]):
+            t0 = c0 * chunk
+            for hh in pl.range(h):
+                d0 = hh * d
+                qc = q_flat[t0 : t0 + chunk, d0 : d0 + d]
+                g_row = g_sum[hh : hh + 1, t0 : t0 + chunk]
+                g_col = pl.reshape(g_row, [chunk, 1])
+                # exp on the ROW vector, reshaped after -- NOT pl.exp(g_col). Under
+                # pl.split a view op reading the per-lane slice used to fold onto the
+                # sliced buffer's base, so lane 1 applied lane 0's gate. Fixed upstream
+                # 2026-09-02; this spelling still builds against stock pypto and
+                # generates the same code.
+                eg = pl.reshape(pl.exp(g_row), [chunk, 1])
 
-                # intra, blocked over its contraction axis: column block j of
-                # the gated scores multiplies rows j of V and accumulates in the
-                # cube, so the full [C, C] score matrix is never resident.
-                #
-                # Block 0 is peeled to SEED the accumulators. The accumulator has
-                # to be a matmul result -- a tile the matrix unit owns, private to
-                # this core group. pl.create_tensor looks like the way to declare
-                # one, but it allocates a runtime TENSOR: a single buffer shared by
-                # every chunk running in parallel, which corrupts intermittently
-                # (clean at 16 concurrent chunks, ~40% wrong at 32).
-                kj = pl.slice(k_flat, [COL_TILE, D], [t0, h * D])
-                qk = pl.matmul(qc, kj, b_trans=True)
-                g_row = pl.slice(g_sum, [1, COL_TILE], [h, t0])
-                diff = pl.full([CHUNK, COL_TILE], dtype=pl.FP32, value=0.0)
+                row = c0 * (h * d) + d0
+                s_blk = state[row : row + d, 0 : d]
+                inter = pl.row_expand_mul(pl.matmul(qc, s_blk), eg)
+
+                # The accumulator has to be a matmul result -- a tile the matrix unit
+                # owns, private to this core group. pl.create_tensor allocates a runtime
+                # TENSOR instead: one buffer shared by every chunk running in parallel,
+                # which corrupts intermittently.
+                kc = k_flat[t0 : t0 + chunk, d0 : d0 + d]
+                qk = pl.matmul(qc, kc, b_trans=True)
+                diff = pl.full([chunk, chunk], dtype=pl.FP32, value=0.0)
                 diff = pl.row_expand_add(diff, g_col)
                 diff = pl.col_expand_sub(diff, g_row)
                 decay = pl.exp(pl.minimum(diff, 0.0))
-                gate = pl.mul(decay, pl.slice(mask, [CHUNK, COL_TILE], [0, 0]))
-                # A matmul's result dtype follows its CONSUMER, not its operands
-                # (see the note in the loop below).
+                gate = pl.mul(decay, mask[:, :])
+                # a matmul's result dtype follows its CONSUMER, not its operands
                 gated = pl.cast(pl.mul(qk, gate), target_type=pl.FP16, mode="rint")
-                acc_lo = pl.matmul(gated,
-                                   pl.slice(v_flat, [COL_TILE, D_TILE], [t0, h * D]),
-                                   out_dtype=pl.FP32)
+                vc = v_flat[t0 : t0 + chunk, d0 : d0 + d]
+                intra = pl.matmul(gated, vc, out_dtype=pl.FP32)
 
-                for jj in pl.unroll(CHUNK // COL_TILE - 1):
-                    j0 = (jj + 1) * COL_TILE
-                    kj = pl.slice(k_flat, [COL_TILE, D], [t0 + j0, h * D])
-                    qk = pl.matmul(qc, kj, b_trans=True)
-                    g_row = pl.slice(g_sum, [1, COL_TILE], [h, t0 + j0])
-                    diff = pl.full([CHUNK, COL_TILE], dtype=pl.FP32, value=0.0)
-                    diff = pl.row_expand_add(diff, g_col)
-                    diff = pl.col_expand_sub(diff, g_row)
-                    decay = pl.exp(pl.minimum(diff, 0.0))
-                    gate = pl.mul(decay, pl.slice(mask, [CHUNK, COL_TILE], [0, j0]))
-                    gated = pl.cast(pl.mul(qk, gate), target_type=pl.FP16, mode="rint")
-                    acc_lo = pl.matmul_acc(
-                        acc_lo, gated,
-                        pl.slice(v_flat, [COL_TILE, D_TILE], [t0 + j0, h * D]))
+                o_flat[t0 : t0 + chunk, d0 : d0 + d] = pl.cast(pl.add(inter, intra),
+                                                               target_type=pl.FP16, mode="rint")
+        return o_out
 
-                o_flat = pl.assemble(
-                    o_flat,
-                    pl.cast(pl.add(inter_lo, acc_lo), target_type=pl.FP16, mode="rint"),
-                    [t0, h * D])
-    return o_out
+    return gdn_chunk_o
 
 
-# ---------------------------------------------------------------------------
-# Test data. The state snapshots and V_new must come from the real chunk_h
-# recurrence, not from randn: a state that has decayed through NCHUNK chunks has
-# a magnitude structure that noise does not reproduce, and Q @ S in FP16 is
-# exactly where a wrong magnitude would show up. Same lesson as synthesising A
-# for wy_fast by an actual inverse rather than sampling one.
-# ---------------------------------------------------------------------------
-_CACHE = {}
-
-
-def _pipeline_inputs(t: int, h: int, d: int, chunk: int):
-    """Correlated inputs: q, k, and the chunk_h outputs (states, v_new) for them."""
-    key = (t, h, d, chunk)
-    if key in _CACHE:
-        return _CACHE[key]
-    import torch
-    import torch.nn.functional as F
-
-    torch.manual_seed(42)
-    q = F.normalize(torch.randn(t, h, d, dtype=torch.float16), dim=-1, p=2)
-    k = F.normalize(torch.randn(t, h, d, dtype=torch.float16), dim=-1, p=2)
-    w = torch.randn(t, h, d, dtype=torch.float16)
-    u = torch.randn(t, h, d, dtype=torch.float16)
-    g_in = F.logsigmoid(torch.randn(t, h, dtype=torch.float32))
-
-    g_cumsum = torch.zeros_like(g_in)
-    for t0 in range(0, t, chunk):
-        g_cumsum[t0 : t0 + chunk] = g_in[t0 : t0 + chunk].cumsum(dim=0)
-
-    # Upstream's _ref_chunk_h (test_gdn_chunk_o.py), the stage-6 recurrence.
-    nc = t // chunk
-    states = torch.zeros(nc, h, d, d, dtype=torch.float32)
-    v_new = torch.zeros(t, h, d, dtype=torch.float32)
-    kf, wf, uf = k.float(), w.float(), u.float()
-    for hh in range(h):
-        S = torch.zeros(d, d, dtype=torch.float32)
-        for ci in range(nc):
-            s0, e0 = ci * chunk, (ci + 1) * chunk
-            gc = g_cumsum[s0:e0, hh]
-            gl = gc[-1]
-            states[ci, hh] = S
-            vc = uf[s0:e0, hh, :] - wf[s0:e0, hh, :] @ S
-            v_new[s0:e0, hh, :] = vc
-            S = torch.exp(gl) * S + kf[s0:e0, hh, :].T @ (vc * torch.exp(gl - gc)[:, None])
-
-    out = dict(
-        q=q, k=k,
-        v=v_new.half(),
-        state=states.half().reshape(nc * h * d, d),
-        g_sum=g_cumsum.t().contiguous(),
-    )
-    _CACHE[key] = out
-    return out
+gdn_chunk_o = build_kernel()
 
 
 def build_tensor_specs(t: int = T, h: int = H, d: int = D, chunk: int = CHUNK):
     import torch
     from golden import TensorSpec
 
-    data = _pipeline_inputs(t, h, d, chunk)
+    from models.gdn import reference
+
     nc = t // chunk
 
     def init_mask():
@@ -231,66 +104,36 @@ def build_tensor_specs(t: int = T, h: int = H, d: int = D, chunk: int = CHUNK):
         return (rows >= cols).float()      # inclusive diagonal
 
     return [
-        TensorSpec("q", [t, h, d], torch.float16, init_value=lambda: data["q"]),
-        TensorSpec("k", [t, h, d], torch.float16, init_value=lambda: data["k"]),
-        TensorSpec("v", [t, h, d], torch.float16, init_value=lambda: data["v"]),
+        TensorSpec("q", [t, h, d], torch.float16, init_value=reference.lazy("chunk_o", "q", t, h, d, chunk)),
+        TensorSpec("k", [t, h, d], torch.float16, init_value=reference.lazy("chunk_o", "k", t, h, d, chunk)),
+        TensorSpec("v", [t, h, d], torch.float16,
+                   init_value=reference.lazy("chunk_o", "v_new16", t, h, d, chunk)),
         TensorSpec("state", [nc * h * d, d], torch.float16,
-                   init_value=lambda: data["state"]),
-        TensorSpec("g_sum", [h, t], torch.float32, init_value=lambda: data["g_sum"]),
+                   init_value=reference.lazy("chunk_o", "state", t, h, d, chunk, reference.flat_state)),
+        TensorSpec("g_sum", [h, t], torch.float32,
+                   init_value=reference.lazy("chunk_o", "g_sum", t, h, d, chunk, reference.to_hT)),
         TensorSpec("mask", [chunk, chunk], torch.float32, init_value=init_mask),
         TensorSpec("o_out", [t, h, d], torch.float16, is_output=True),
     ]
 
 
 def golden_gdn_chunk_o(tensors):
-    """Upstream's ref_chunk_o (test_gdn_chunk_o.py), in FP32."""
-    import torch
+    from models.gdn import reference
 
-    q = tensors["q"].float()
-    k = tensors["k"].float()
-    v = tensors["v"].float()
-    g = tensors["g_sum"].float()
-    state = tensors["state"].float()
-    out = tensors["o_out"]
-    t, h = q.shape[0], q.shape[1]
-    rows = torch.arange(CHUNK)[:, None]
-    cols = torch.arange(CHUNK)[None, :]
-    causal = (rows >= cols).float()
-    for ci, t0 in enumerate(range(0, t, CHUNK)):
-        for hh in range(h):
-            qc = q[t0 : t0 + CHUNK, hh, :]
-            kc = k[t0 : t0 + CHUNK, hh, :]
-            vc = v[t0 : t0 + CHUNK, hh, :]
-            gc = g[hh, t0 : t0 + CHUNK]
-            s_blk = state[(ci * h + hh) * D : (ci * h + hh) * D + D, :]
-            inter = (qc @ s_blk) * torch.exp(gc)[:, None]
-            gate = torch.exp(torch.minimum(gc[:, None] - gc[None, :],
-                                           torch.zeros(CHUNK, CHUNK)))
-            intra = ((qc @ kc.T) * gate * causal) @ vc
-            out[t0 : t0 + CHUNK, hh, :] = (inter + intra).half()
+    t, h, d = tensors["q"].shape
+    chunk = tensors["mask"].shape[0]
+    state = tensors["state"].reshape(t // chunk, h, d, d)
+    tensors["o_out"].copy_(reference.chunk_o(
+        tensors["q"], tensors["k"], tensors["v"], state, tensors["g_sum"].t(), chunk))
 
 
 def _stats_ok(actual, expected, **_kwargs):
-    """Upstream's acceptance criterion for this kernel (test_gdn_chunk_o.py)."""
-    import numpy as np
-    import torch
+    """megagdn-pto's criterion for this stage (tests/utils.py: NumericalAccuracy)."""
+    from models.gdn import reference
 
-    diff = (actual.float() - expected.float()).abs()
-    if diff.max().item() > 1.0:
-        return False, f"max abs diff {diff.max().item():.4g} exceeds hard fail 1.0"
-    if bool((diff <= 1e-5 + 1e-2 * expected.float().abs()).all()):
-        return True, ""
-    mean_abs = float(expected.float().abs().mean())
-    rmse = float(torch.sqrt((diff.flatten() ** 2).mean()))
-    if mean_abs < 1e-9:
-        return rmse < 5e-4, f"rmse={rmse:.4g}"
-    ratio = rmse / max(mean_abs, 1e-15)
-    ref = expected.float().flatten().numpy().astype(np.float64)
-    pred = actual.float().flatten().numpy().astype(np.float64)
-    ss_tot = float(np.sum((ref - ref.mean()) ** 2))
-    r2 = float("nan") if ss_tot < 1e-30 else 1.0 - float(np.sum((ref - pred) ** 2)) / ss_tot
-    ok = ratio <= 0.05 and np.isfinite(r2) and r2 >= 0.99
-    return ok, f"rmse/mean={ratio:.4g} (<=0.05), r2={r2:.6f} (>=0.99)"
+    ok, detail = reference.stats_ok(actual, expected, chunk=CHUNK)
+    print(f"[stats] {detail}", flush=True)
+    return ok, detail
 
 
 if __name__ == "__main__":

@@ -6,67 +6,77 @@
 # INCLUDING BUT NOT LIMITED TO NON-INFRINGEMENT, MERCHANTABILITY, OR FITNESS FOR A PARTICULAR PURPOSE.
 # See LICENSE in the root of the software repository for the full text of the License.
 # -----------------------------------------------------------------------------------------------------------
-"""Gated DeltaNet chunk_cumsum — chunk-local prefix sum of the gate logits.
-
-    g_sum[t, h] = sum_{i in chunk, i <= t} g[i, h]
-
-Stage 1 of the GDN pipeline. The prefix sum is what lets every later stage form
-a decay coefficient as exp(g_sum[i] - g_sum[j]).
-
-The scan is a matmul against a lower-triangular ones matrix: row t of `tril`
-selects exactly the chunk-local rows up to t. Chunks are independent, so they
-run one per core group. FP32 in and out — a 128-row accumulation in FP16 loses
-the small increments that decide exp(g_sum) downstream.
-"""
+"""Gated DeltaNet chunk_cumsum: chunk-local prefix sum of the gate logits,
+g_sum[t, h] = sum over i <= t within the chunk of g[i, h]."""
 import pypto.language as pl
 
-# Model
-T = 32768               # tokens (single sequence, B = 1)
+# model config
+T = 8192                # tokens (single sequence, B = 1)
 H = 16                  # gate heads
+D = 128                 # head dimension; unused here, drawn inputs match the pipeline
 CHUNK = 128             # chunk size in tokens
 
-# Tiling
-CHUNK_GROUP = 16        # chunks sharing one tril load; T must divide CHUNK * CHUNK_GROUP
+# tiling
+GROUP_TILE = 16         # chunks per dispatch, sharing one tril load
 
 
-@pl.jit
-def gdn_chunk_cumsum(
-    g: pl.Tensor[[T, H], pl.FP32],
-    tril: pl.Tensor[[CHUNK, CHUNK], pl.FP32],
-    g_sum: pl.Out[pl.Tensor[[H, T], pl.FP32]],
-):
-    for t0 in pl.parallel(0, T, CHUNK * CHUNK_GROUP):
-        with pl.at(level=pl.Level.CORE_GROUP, name_hint="chunk_cumsum"):
-            # tril is 64 KB against 8 KB of gate per chunk, so it is loaded once
-            # per scope and reused, not re-read per chunk.
-            tl = tril[:, :]
-            for c in pl.unroll(CHUNK_GROUP):
-                s0 = t0 + c * CHUNK
-                # [H, CHUNK] = (tril @ g_chunk)^T; the cube absorbs both transposes.
-                g_sum[:, s0 : s0 + CHUNK] = pl.matmul(
-                    g[s0 : s0 + CHUNK, :], tl, a_trans=True, b_trans=True)
-    return g_sum
+def group_tile(t: int = T, chunk: int = CHUNK, want: int = GROUP_TILE) -> int:
+    """Largest group size up to *want* that divides the chunk count evenly."""
+    group = min(want, t // chunk)
+    while (t // chunk) % group:
+        group -= 1
+    return group
 
 
-def build_tensor_specs(t: int = T, h: int = H, chunk: int = CHUNK):
+def build_kernel(t: int = T, h: int = H, d: int = D, chunk: int = CHUNK):
+    """The stage kernel at one shape; `d` is unused and accepted for a uniform signature."""
+    group = group_tile(t, chunk)
+
+    @pl.jit
+    def gdn_chunk_cumsum(
+        g: pl.Tensor[[t, h], pl.FP32],
+        tril: pl.Tensor[[chunk, chunk], pl.FP32],
+        g_sum: pl.Out[pl.Tensor[[h, t], pl.FP32]],
+    ):
+        for c0 in pl.spmd(t // (chunk * group), name_hint="chunk_cumsum"):
+            t0 = c0 * chunk * group
+            tl = tril[:, :]                        # constant, held for the whole scope
+            for c in pl.unroll(group):
+                s0 = t0 + c * chunk
+                # [H, CHUNK] = (tril @ g_chunk)^T; the cube absorbs both transposes
+                g_sum[:, s0 : s0 + chunk] = pl.matmul(g[s0 : s0 + chunk, :], tl, a_trans=True, b_trans=True)
+        return g_sum
+
+    return gdn_chunk_cumsum
+
+
+gdn_chunk_cumsum = build_kernel()
+
+
+def build_tensor_specs(t: int = T, h: int = H, d: int = D, chunk: int = CHUNK):
     import torch
     from golden import TensorSpec
+
+    from models.gdn import reference
 
     def init_tril():
         return torch.tril(torch.ones(chunk, chunk, dtype=torch.float32))
 
     return [
-        TensorSpec("g", [t, h], torch.float32, init_value=torch.randn),
+        TensorSpec("g", [t, h], torch.float32,
+                   init_value=reference.lazy("chunk_cumsum", "g", t, h, d, chunk)),
         TensorSpec("tril", [chunk, chunk], torch.float32, init_value=init_tril),
         TensorSpec("g_sum", [h, t], torch.float32, is_output=True),
     ]
 
 
 def golden_gdn_chunk_cumsum(tensors):
+    from models.gdn import reference
+
     g = tensors["g"]
     out = tensors["g_sum"]
-    for t0 in range(0, g.shape[0], CHUNK):
-        out[:, t0 : t0 + CHUNK] = g[t0 : t0 + CHUNK].cumsum(dim=0).t()
+    chunk = tensors["tril"].shape[0]
+    out.copy_(reference.to_hT(reference.cumsum(g, chunk)))
 
 
 if __name__ == "__main__":
