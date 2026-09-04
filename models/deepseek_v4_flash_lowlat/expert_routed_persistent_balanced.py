@@ -158,19 +158,18 @@ def expert_routed_persistent_balanced(
                     pl.write(work_rows, [n_live], scan_rows)
                     n_live = n_live + 1
 
-        # sync_start: the combine grid downstream is submitted while this task is
-        # still running and parks blocks on AIV lanes waiting for recv_y. Without
-        # a synchronized start this grid takes whatever lanes are free and leaves
-        # some of its own blocks queued behind those occupants -- normally a
-        # 10-20 us start spread, but occasionally a block starts only after
-        # another has already finished, which stretches the task ~113 -> ~146 us
-        # on that card, and the layer waits for it. Starting all NUM_CORES blocks
-        # together holds the spread at ~1.5 us; the grid is the whole AIC array,
-        # so refusing a partial start gives nothing away.
-        with pl.spmd(
-            NUM_CORES, name_hint="exp_routed_balanced", sync_start=True,
-            allow_early_resolve=True, deps=[plan_tid],
-        ) as _routed_tid:  # inline form requires the TaskId capture
+        # Not early-resolvable on purpose. The combine grid downstream is
+        # submitted while this task is still running and parks blocks on AIV
+        # lanes waiting for recv_y; flagging this grid lets the scheduler stage
+        # that combine ahead of time, so it takes whatever lanes are free and
+        # leaves some of this grid's own blocks queued behind those occupants --
+        # normally a 10-20 us start spread, but occasionally a block starts only
+        # after another has already finished, which stretches the task
+        # ~113 -> ~146 us on that card, and the layer waits for it. Withholding
+        # the flag keeps the combine off the lanes until this task retires.
+        # sync_start=True closes the same hole from the other side, by refusing
+        # a partial start; it is the slower of the two.
+        with pl.spmd(NUM_CORES, name_hint="exp_routed_balanced", deps=[plan_tid]):
             core = pl.tile.get_block_idx()  # 0 .. NUM_CORES-1
 
             for w in pl.range(core, N_SLOTS_B, NUM_CORES):
