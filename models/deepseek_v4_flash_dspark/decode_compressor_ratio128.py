@@ -80,7 +80,12 @@ K_TILE = 512
 OUT_TILE = 64
 HEAD_TILE = 64
 B_TILE = 8
-MM_B_TILE = 16
+# 64 rows per cube M-block, not the 16-row fractal minimum: the weight tiles are
+# reloaded once per M-block, so widening M cuts both the MTE2 weight traffic and
+# the serial block dispatches. Going 16 -> 32 raised per-block exec by only 10%
+# (10.9 -> 12.0 us) while cutting the task's core time 45% and its wall 305 -> 192
+# us, so the block was weight-load bound rather than M bound.
+MM_B_TILE = 64
 # Scratch spans the CP group's whole token stream, not the rank-local B * S.
 GROUP_BS = DECODE_BATCH * DECODE_SEQ
 BS_PAD = ((GROUP_BS + MM_B_TILE - 1) // MM_B_TILE) * MM_B_TILE

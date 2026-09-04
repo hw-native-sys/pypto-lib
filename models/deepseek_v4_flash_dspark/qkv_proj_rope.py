@@ -70,7 +70,9 @@ KV_RMS_T_TILE = 16  # kv rms-norm + rope fused token (T) tile
 Q_ROPE_T_TILE = 8
 # q_rope_prepare runs on persistent workers, capped at the tile count so the
 # short call sites do not dispatch more blocks than they have work.
-Q_ROPE_WORKERS = 48
+# 24 workers, not one per AIV lane: the task holds only ~273 core-us, so 48
+# serial block dispatches cost more than the single wave they buy.
+Q_ROPE_WORKERS = 24
 Q_ROPE_H_TILE = 4  # heads per fused qproj dequant/rms/rope task
 assert QPROJ_MM_N_TILE * QPROJ_M_TILE * 4 <= 128 * 1024  # L0C Acc cap
 assert QPROJ_M_TILE % QPROJ_TAIL_M_TILE == 0
