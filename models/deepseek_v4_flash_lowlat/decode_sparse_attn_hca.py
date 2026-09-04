@@ -113,13 +113,13 @@ PADDED_TOPK = SPARSE_BLOCKS * ATTN_K_TILE
 #  * compressed -- the ratio-128 tail has no indexer: row k is compressed slot k
 #    for every token and only the valid count differs, so the last token's row
 #    is a superset and each token's own sparse_bias masks the rest.
-# Only the compressed tail is staged in GM. The window half is WIN consecutive
-# positions and WIN == BLOCK_SIZE, so each token assembles it straight into L1
-# inside qk_pv from two bulk runs -- no GM round-trip and no shared union.
-CMP_ROWS_PER_TASK = 8
-CMP_TASKS = CMP_TOPK // CMP_ROWS_PER_TASK
-GATHER_TASKS = CMP_TASKS
-KV_STRIDE = CMP_TOPK
+# Nothing is staged in GM. Both sparse-K halves are assembled per token in L1
+# inside qk_pv: the window is WIN consecutive positions (WIN == BLOCK_SIZE, so
+# two bulk runs) and the compressed tail has no indexer, so a contiguous block
+# table makes it one more bulk run.
+# Compressed-tail probe granularity: the chunk whose endpoints are tested for
+# one bulk DMA. Must divide CMP_TOPK.
+CMP_RUN = 16
 
 assert CMP_BLOCKS_PER_REQ <= CMP_MAX_BLOCKS, (
     f"compressed block table ({CMP_MAX_BLOCKS} blocks) must index the whole "
@@ -129,9 +129,10 @@ assert B * CMP_BLOCKS_PER_REQ <= CMP_BLOCK_NUM, (
     f"{CMP_BLOCKS_PER_REQ} blocks; MAX_SUPPORTED_SEQ={MAX_SUPPORTED_SEQ}")
 assert WIN == ATTN_K_TILE, f"HCA window tile requires WIN ({WIN}) == ATTN_K_TILE ({ATTN_K_TILE})"
 assert SPARSE_BLOCKS == 2, (
-    f"qk_pv picks its half of hca_kv_flat from the sparse-block index, which "
+    f"qk_pv picks which half to assemble from the sparse-block index, which "
     f"assumes one window block and one compressed block, got {SPARSE_BLOCKS}")
 assert WIN == BLOCK_SIZE, "a window spans at most two paged blocks only while WIN == BLOCK_SIZE"
+assert CMP_TOPK % CMP_RUN == 0, "the compressed-tail probe chunk must tile CMP_TOPK"
 
 
 @pl.jit.inline
@@ -179,32 +180,10 @@ def sparse_attn_hca_packed(
             sparse_bias[v_t0 : v_t0 + VALID_TOKEN_TILE, TOPK : PADDED_TOPK] = pl.full(
                 [VALID_TOKEN_TILE, PADDED_TOPK - TOPK], dtype=pl.FP32, value=NEG_INF)
 
-    # Compressed-tail gather only. The window half is assembled per token in L1
-    # inside qk_pv (WIN consecutive positions == two bulk runs), so nothing about
-    # the window round-trips through GM any more. The compressed rows are
-    # genuinely scattered AND shared by every token, so they stay a shared task:
-    # folding them in would turn CMP_TOPK row-DMAs into T * CMP_TOPK on the AIC
-    # scalar unit that already bounds this kernel. Invalid (-1) lanes are
-    # zero-filled to match the golden's zero rows; the NEG_INF bias then kills
-    # them in the softmax.
-    hca_kv_flat = pl.create_tensor([B * KV_STRIDE, HEAD_DIM], dtype=pl.BF16)
-    with pl.spmd(B * GATHER_TASKS, name_hint="hca_gather_kv") as gather_tid:
-        g_task = pl.tile.get_block_idx()
-        g_b = g_task // GATHER_TASKS
-        g_slot = g_task - g_b * GATHER_TASKS
-        g_last_t = g_b * S + S - 1
-        # Gathered once from the last token's row -- the widest valid prefix.
-        # Scattered slots, so one block-table lookup and copy per row.
-        g_ck0 = g_slot * CMP_ROWS_PER_TASK
-        g_cdst0 = g_b * KV_STRIDE + g_ck0
-        for g_dr in pl.range(CMP_ROWS_PER_TASK):
-            g_dst = g_cdst0 + g_dr
-            g_ridx = pl.read(cmp_sparse_indices, [g_last_t, g_ck0 + g_dr])
-            if g_ridx >= 0:
-                g_csrc = pl.cast(pl.read(cmp_block_table, [g_b, g_ridx]), pl.INDEX)
-                hca_kv_flat[g_dst : g_dst + 1, 0:HEAD_DIM] = cmp_kv_flat[g_csrc : g_csrc + 1, 0:HEAD_DIM]
-            else:
-                hca_kv_flat[g_dst : g_dst + 1, 0:HEAD_DIM] = pl.full([1, HEAD_DIM], dtype=pl.BF16, value=0.0)
+    # No sparse-K gather task at all: qk_pv assembles BOTH halves in L1.
+    # The window half is WIN consecutive positions (two bulk runs) and the
+    # compressed tail has no indexer -- row k is compressed slot k -- so when
+    # the block table hands out a contiguous run it is one more bulk run.
 
     # qk_pv writes per-tile (mi, li, oi) to GM; merge_norm reads them back. Not
     # fused on a2a3: the PV output (Acc) -> online rescale (Vec) needs an
@@ -215,7 +194,7 @@ def sparse_attn_hca_packed(
     sparse_blk_li = pl.create_tensor([T * QK_M_BOX * SPARSE_BLOCKS, 1], dtype=pl.FP32)
     sparse_blk_oi = pl.create_tensor([T * QK_M_BOX * SPARSE_BLOCKS, HEAD_DIM], dtype=pl.FP32)
 
-    with pl.spmd(T * SPARSE_BLOCKS, name_hint="qk_pv", deps=[gather_tid], allow_early_resolve=True) as qk_tid:
+    with pl.spmd(T * SPARSE_BLOCKS, name_hint="qk_pv", allow_early_resolve=True) as qk_tid:
         qk_item = pl.tile.get_block_idx()
         qk_t = qk_item // SPARSE_BLOCKS
         qk_sb = qk_item - qk_t * SPARSE_BLOCKS
@@ -258,9 +237,53 @@ def sparse_attn_hca_packed(
                     qk_kv = pl.gather_row(qk_kv, ori_kv_flat, [qk_len + qk_fill, 0],
                                           [qk_src0, 0], [1, HEAD_DIM])
         else:
-            qk_cmp_src = pl.cast(qk_b * KV_STRIDE, pl.INDEX)
-            qk_kv = pl.gather_row(qk_kv, hca_kv_flat, [0, 0], [qk_cmp_src, 0],
-                                  [ATTN_K_TILE, HEAD_DIM])
+            # Gathered from the last token's row -- the widest valid prefix.
+            # The tail's valid prefix is min(HCA_TOPK_LIMIT, pos/ratio, seqlen/ratio)
+            # and is usually NARROWER than CMP_TOPK, so probing the full width only
+            # ever reads the -1 padding. Probe per CMP_RUN-row chunk instead, which
+            # keeps the bulk path reachable on the valid prefix and collapses each
+            # wholly-padded chunk to one copy as well.
+            qk_last_t = qk_b * S + S - 1
+            for qk_ck in pl.unroll(CMP_TOPK // CMP_RUN):
+                qk_c0 = qk_ck * CMP_RUN
+                qk_c_i0 = pl.read(cmp_sparse_indices, [qk_last_t, qk_c0])
+                qk_c_i1 = pl.read(cmp_sparse_indices, [qk_last_t, qk_c0 + CMP_RUN - 1])
+                # A -1 slot at the head pins the probe below the match value.
+                qk_c_ok = (qk_c_i1 - qk_c_i0) + pl.min(qk_c_i0, 0) * CMP_RUN
+                if qk_c_ok == CMP_RUN - 1:
+                    # Contiguous slot ids: bulk only if their physical rows are
+                    # contiguous too, since the block table is free to scatter.
+                    qk_c_p0 = pl.read(cmp_block_table, [qk_b, qk_c_i0])
+                    qk_c_p1 = pl.read(cmp_block_table, [qk_b, qk_c_i1])
+                    if (qk_c_p1 - qk_c_p0) == CMP_RUN - 1:
+                        qk_kv = pl.gather_row(qk_kv, cmp_kv_flat, [qk_c0, 0],
+                                              [pl.cast(qk_c_p0, pl.INDEX), 0],
+                                              [CMP_RUN, HEAD_DIM])
+                    else:
+                        for qk_cr in pl.range(CMP_RUN):
+                            qk_cs = pl.cast(
+                                pl.read(cmp_block_table, [qk_b, qk_c_i0 + qk_cr]), pl.INDEX)
+                            qk_kv = pl.gather_row(qk_kv, cmp_kv_flat, [qk_c0 + qk_cr, 0],
+                                                  [qk_cs, 0], [1, HEAD_DIM])
+                elif qk_c_i1 < 0:
+                    # Wholly padded chunk (head and tail both -1). sparse_bias
+                    # kills these lanes, but a non-finite value would still poison
+                    # row_max, so fill them from rows that are written by
+                    # construction -- one bulk copy, not CMP_RUN row copies.
+                    qk_kv = pl.gather_row(qk_kv, cmp_kv_flat, [qk_c0, 0], [0, 0],
+                                          [CMP_RUN, HEAD_DIM])
+                else:
+                    # Ragged chunk: the valid prefix ends inside it, or the slot
+                    # ids are genuinely scattered. Per row, as before.
+                    for qk_cr in pl.range(CMP_RUN):
+                        qk_cidx = pl.read(cmp_sparse_indices, [qk_last_t, qk_c0 + qk_cr])
+                        if qk_cidx >= 0:
+                            qk_cs = pl.cast(pl.read(cmp_block_table, [qk_b, qk_cidx]), pl.INDEX)
+                            qk_kv = pl.gather_row(qk_kv, cmp_kv_flat, [qk_c0 + qk_cr, 0],
+                                                  [qk_cs, 0], [1, HEAD_DIM])
+                        else:
+                            qk_kv = pl.gather_row(qk_kv, cmp_kv_flat, [qk_c0 + qk_cr, 0],
+                                                  [0, 0], [1, HEAD_DIM])
 
         # Cube-batch QK_M_TILE head rows per QK/PV matmul so the shared KV
         # tile is extracted L1->L0 once per QK_M_TILE/H_TILE head-tiles
