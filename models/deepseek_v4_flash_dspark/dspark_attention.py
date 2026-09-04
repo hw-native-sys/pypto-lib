@@ -510,8 +510,8 @@ if __name__ == "__main__":
         fn=dspark_attention_test,
         specs=build_tensor_specs(args.start_pos),
         golden_fn=golden_dspark_attention,
-        compile_cfg=dict(dump_passes=args.dump_passes),
-        runtime_cfg=dict(
+        config=dict(
+            dump_passes=args.dump_passes,
             platform=args.platform,
             device_id=args.device,
             enable_chip_swimlane=args.enable_chip_swimlane,

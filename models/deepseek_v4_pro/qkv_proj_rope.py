@@ -972,8 +972,8 @@ if __name__ == "__main__":
             },
             runtime_dir=args.runtime_dir,
             golden_data=args.golden_data,
-            compile_cfg=dict(dump_passes=args.dump_passes),
-            runtime_cfg=dict(
+            config=dict(
+                dump_passes=args.dump_passes,
                 platform=args.platform,
                 device_id=args.device,
                 enable_chip_swimlane=args.enable_chip_swimlane,

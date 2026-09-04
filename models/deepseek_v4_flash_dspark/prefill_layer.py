@@ -1060,13 +1060,13 @@ def main():
         compile_only=args.compile_only,
         runtime_dir=args.runtime_dir,
         save_data=False,
-        compile_cfg=dict(
+        config=dict(
             dump_passes=args.dump_passes,
             distributed_config=DistributedConfig(
                 device_ids=device_ids[:N_RANKS], num_sub_workers=0
             ),
+            platform=args.platform,
         ),
-        runtime_cfg=dict(platform=args.platform),
         rtol=1e-3,
         atol=1e-3,
         compare_fn=_compare_functions(args.layer_id),

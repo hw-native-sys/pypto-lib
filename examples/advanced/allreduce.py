@@ -123,7 +123,7 @@ if __name__ == "__main__":
     import argparse
 
     from golden import run
-    from pypto.ir.distributed_compiled_program import DistributedConfig
+    from pypto.ir import DistributedConfig
 
     parser = argparse.ArgumentParser()
     parser.add_argument("-p", "--platform", type=str, default="a2a3",
@@ -141,13 +141,13 @@ if __name__ == "__main__":
         specs=build_tensor_specs(),
         golden_fn=golden_allreduce,
         compile_only=args.compile_only,
-        compile_cfg=dict(
+        config=dict(
+            platform=args.platform,
             distributed_config=DistributedConfig(
                 device_ids=device_ids,
                 num_sub_workers=0,
             ),
         ),
-        runtime_cfg=dict(platform=args.platform),
         rtol=1e-5,
         atol=1e-5,
     )

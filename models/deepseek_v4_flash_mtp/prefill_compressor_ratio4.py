@@ -585,8 +585,12 @@ if __name__ == "__main__":
         fn=prefill_compressor_ratio4_test,
         specs=build_tensor_specs(args.start_pos),
         golden_fn=golden_prefill_compressor_ratio4,
-        compile_cfg=dict(dump_passes=args.dump_passes),
-        runtime_cfg=dict(platform=args.platform, device_id=args.device, enable_chip_swimlane=args.enable_chip_swimlane),
+        config=dict(
+            dump_passes=args.dump_passes,
+            platform=args.platform,
+            device_id=args.device,
+            enable_chip_swimlane=args.enable_chip_swimlane,
+        ),
         compile_only=args.compile_only,
         compare_fn={
             "compress_state": ratio_allclose(atol=1e-3, rtol=1e-3, max_error_ratio=0.0),

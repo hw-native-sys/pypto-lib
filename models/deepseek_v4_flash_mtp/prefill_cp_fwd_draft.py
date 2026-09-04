@@ -248,7 +248,7 @@ FINAL_CSA_LAYER = 2 * PAIR_COUNT + 2 if HAS_FINAL_CSA else -1
 # host graph can conditionally omit the LM-head child launch/allocation
 # (Domain 6 buffers + second rank loop) while reusing the exact 43-layer
 # rank core. --enable-scope-stats is the standard DFX flag forwarded into
-# runtime_cfg; parsed at import only to keep argparse and the host-graph
+# the run config; parsed at import only to keep argparse and the host-graph
 # guard consistent. Both default off and are no-ops for production runs.
 FWD_ONLY = _parse_static_bool("fwd-only", False)
 ENABLE_SCOPE_STATS = _parse_static_bool("enable-scope-stats", False)
@@ -3115,13 +3115,11 @@ if __name__ == "__main__":
         golden_fn=golden_fn,
         compare_fn=compare_fn,
         compile_only=args.compile_only,
-        compile_cfg=dict(
+        config=dict(
             distributed_config=DistributedConfig(
                 device_ids=device_ids[:args.cp], num_sub_workers=0
             ),
             dump_passes=args.dump_passes,
-        ),
-        runtime_cfg=dict(
             platform=args.platform,
             enable_chip_swimlane=args.enable_chip_swimlane,
             enable_scope_stats=args.enable_scope_stats,

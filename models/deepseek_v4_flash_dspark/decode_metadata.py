@@ -491,7 +491,10 @@ if __name__ == "__main__":
         specs=build_tensor_specs(),
         golden_fn=golden_decode_metadata,
         compile_only=args.compile_only,
-        runtime_cfg={"platform": args.platform, "device_id": args.device},
+        config=dict(
+            platform=args.platform,
+            device_id=args.device,
+        ),
     )
     if not result.passed:
         if result.error:

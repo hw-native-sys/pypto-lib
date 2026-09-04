@@ -341,8 +341,8 @@ if __name__ == "__main__":
             fn=mtp_projection_test,
             specs=build_tensor_specs(batch, seq),
             golden_fn=golden_mtp_projection,
-            compile_cfg=dict(dump_passes=args.dump_passes),
-            runtime_cfg=dict(
+            config=dict(
+                dump_passes=args.dump_passes,
                 platform=args.platform,
                 device_id=args.device,
                 enable_chip_swimlane=args.enable_chip_swimlane,

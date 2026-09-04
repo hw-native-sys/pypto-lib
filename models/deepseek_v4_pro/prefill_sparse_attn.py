@@ -746,8 +746,8 @@ if __name__ == "__main__":
         fn=prefill_sparse_attn_test,
         specs=build_tensor_specs(args.compress_ratio),
         golden_fn=golden_prefill_sparse_attn,
-        compile_cfg=dict(dump_passes=args.dump_passes),
-        runtime_cfg=dict(
+        config=dict(
+            dump_passes=args.dump_passes,
             platform=args.platform,
             device_id=args.device,
             enable_chip_swimlane=args.enable_chip_swimlane,

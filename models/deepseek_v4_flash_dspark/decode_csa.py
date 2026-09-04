@@ -2022,12 +2022,12 @@ if __name__ == "__main__":
             golden_data=args.golden_data,
             save_data=args.save_data,
             compile_only=args.compile_only,
-            compile_cfg=dict(dump_passes=args.dump_passes),
-            runtime_cfg=dict(
-                platform=args.platform,
-                device_id=device_ids[0],
-                enable_chip_swimlane=args.enable_chip_swimlane,
-            ),
+            config=dict(
+                            dump_passes=args.dump_passes,
+                            platform=args.platform,
+                            device_id=device_ids[0],
+                            enable_chip_swimlane=args.enable_chip_swimlane,
+                        ),
             rtol=1e-2,
             atol=1e-2,
             compare_fn=build_full_compare(
@@ -2042,10 +2042,6 @@ if __name__ == "__main__":
             raise SystemExit(1)
         raise SystemExit(0)
 
-    compile_cfg = dict(
-        dump_passes=args.dump_passes,
-        distributed_config=DistributedConfig(device_ids=device_ids, num_sub_workers=0),
-    )
     result = run(
         fn=l3_decode_csa,
         specs=build_distributed_tensor_specs(local_t, start_pos=start_pos),
@@ -2053,8 +2049,9 @@ if __name__ == "__main__":
         golden_data=args.golden_data,
         save_data=args.save_data,
         compile_only=args.compile_only,
-        compile_cfg=compile_cfg,
-        runtime_cfg=dict(
+        config=dict(
+            dump_passes=args.dump_passes,
+            distributed_config=DistributedConfig(device_ids=device_ids, num_sub_workers=0),
             platform=args.platform,
             enable_chip_swimlane=args.enable_chip_swimlane,
             ring_task_window=16_384,

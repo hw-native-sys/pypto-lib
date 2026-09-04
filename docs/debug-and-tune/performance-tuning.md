@@ -366,8 +366,8 @@ python models/deepseek_v4_flash_mtp/decode_sparse_attn.py -p a2a3 -d 0 --enable-
 ```
 
 Not every kernel exposes `--enable-pmu`; a kernel that does not can still be
-captured by passing `runtime_cfg={"enable_pmu": 2}` to its `run`
-call (the harness bundles it into the runtime's DFX options).
+captured by passing `config={"enable_pmu": 2}` to its `run` call (the
+`RunConfig` carries it to the runtime as a DFX option).
 
 For a per-kernel intra-core swimlane, use
 [In-Core Simulator Profiling](incore-simulator-profiling.md).

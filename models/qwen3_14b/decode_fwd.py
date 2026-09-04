@@ -2046,14 +2046,10 @@ if __name__ == "__main__":
             fn=decode_fwd_layers,
             specs=specs,
             golden_fn=golden_decode_layer,
-            compile_cfg=dict(
+            config=dict(
                 dump_passes=False,
                 save_kernels=args.dep_output_dir is not None,
-                save_kernels_dir=(
-                    str(args.dep_output_dir.resolve()) if args.dep_output_dir is not None else None
-                ),
-            ),
-            runtime_cfg=dict(
+                save_kernels_dir=str(args.dep_output_dir.resolve()) if args.dep_output_dir is not None else None,
                 platform=args.platform,
                 device_id=args.device,
                 enable_chip_swimlane=args.enable_chip_swimlane,

@@ -95,89 +95,50 @@ class _Stage:
         return False
 
 
-def _backend_for_platform(platform: str) -> Any:
-    """Return the :class:`pypto.backend.BackendType` for a platform string."""
-    from pypto.backend import BackendType
+def _normalize_config(config: Any | None) -> Any:
+    """Build the one ``RunConfig`` that drives both phases.
 
-    mapping = {
-        "a2a3": BackendType.Ascend910B,
-        "a2a3sim": BackendType.Ascend910B,
-        "a5": BackendType.Ascend950,
-        "a5sim": BackendType.Ascend950,
-    }
-    try:
-        return mapping[platform]
-    except KeyError:
-        raise ValueError(
-            f"Unknown runtime platform {platform!r}; expected one of {sorted(mapping)}"
-        ) from None
+    PyPTO reads the compile half off it via ``compile_kwargs()`` and the
+    dispatch half via ``run_options()`` / ``dfx_options()``, and
+    ``JITFunction.compile`` / ``CompiledProgram.__call__`` / ``benchmark`` all
+    take the aggregate — so the harness translates once, here, and every phase
+    reads the same object. There is no compile-vs-runtime split at the call
+    site because there is no split downstream.
 
-
-_DFX_FLAG_KEYS = (
-    "enable_chip_swimlane",
-    "enable_dump_args",
-    "enable_pmu",
-    "enable_dep_gen",
-    "enable_scope_stats",
-)
-
-
-def _execute_compiled_kwargs(runtime: dict[str, Any]) -> dict[str, Any]:
-    """Translate user-facing ``runtime_cfg`` into ``execute_compiled`` kwargs.
-
-    The five DFX flags get bundled into a single ``dfx: _DfxOpts``; all other
-    keys pass through unfiltered, so ``execute_compiled`` raises ``TypeError``
-    on unknown keys rather than us silently dropping them.
+    *config* is a ``dict`` of ``RunConfig`` keyword arguments, a ready
+    ``RunConfig``, or ``None``. ``log_level`` is the one key that is not a
+    ``RunConfig`` field: it sets the PyPTO runtime log threshold and is applied
+    here. Every other key goes straight to the constructor, so an unknown one
+    is ``RunConfig``'s own ``TypeError`` naming it.
     """
-    out: dict[str, Any] = {k: v for k, v in runtime.items() if k not in _DFX_FLAG_KEYS}
-    dfx_flags = {k: runtime[k] for k in _DFX_FLAG_KEYS if runtime.get(k)}
-    if dfx_flags:
-        try:
-            from pypto.runtime.runner import _DfxOpts
-        except ImportError as exc:
-            raise ValueError(
-                "This pypto runtime does not support execute_compiled DFX flags: "
-                f"{sorted(dfx_flags)}"
-            ) from exc
+    from pypto.runtime import RunConfig
 
-        out["dfx"] = _DfxOpts(**dfx_flags)
-    return out
+    if not isinstance(config, dict):
+        return config if config is not None else RunConfig()
 
-
-def _consume_runtime_harness_keys(runtime_cfg: dict[str, Any]) -> None:
-    """Pop harness-only keys from *runtime_cfg* and apply their side effects.
-
-    Recognised key (not forwarded to ``execute_compiled``):
-      - ``log_level``: PyPTO runtime log threshold, see
-        :func:`pypto.runtime.log_config.configure_log`. One of ``debug``,
-        ``v0..v9``, ``info``, ``warn``, ``error``, ``null``.
-
-    Mutates *runtime_cfg* in place by popping the recognised key.
-    """
-    level = runtime_cfg.pop("log_level", None)
-    if level is None:
-        return
-    from pypto.runtime.log_config import configure_log
-    configure_log(level)
+    fields = dict(config)
+    level = fields.pop("log_level", None)
+    if level is not None:
+        from pypto.runtime.log_config import configure_log
+        configure_log(level)
+    return RunConfig(**fields)
 
 
 def _validate_stepped_swimlane(
-    scalar_specs: Sequence[ScalarSpec], runtime_cfg: dict[str, Any]
+    scalar_specs: Sequence[ScalarSpec], cfg: Any
 ) -> None:
-    """Reject stepped scalars when one handle call launches multiple passes."""
+    """Reject stepped scalars when one handle call launches multiple passes.
+
+    An onboard swimlane capture runs the workload twice — a dep_gen pass for
+    ``deps.json``, then a clean timing pass — and a stepped scalar cannot
+    advance between two physical passes of one handle call. Both would carry
+    dispatch 0's value and the swimlane would be silently wrong.
+    """
     stepped = sorted(spec.name for spec in scalar_specs if spec.has_benchmark_step)
-    swimlane = next(
-        (
-            key
-            for key in ("enable_chip_swimlane", "enable_l2_swimlane")
-            if runtime_cfg.get(key)
-        ),
-        None,
-    )
-    if stepped and swimlane:
+    if stepped and cfg.enable_chip_swimlane:
         raise ValueError(
             "ScalarSpec benchmark_step is incompatible with "
-            f"runtime_cfg {swimlane}=True; one handle call may launch "
+            "enable_chip_swimlane; one handle call may launch "
             f"multiple physical passes with the same scalar values: {stepped}"
         )
 
@@ -385,7 +346,7 @@ def _ordered_args(
     names differ from the spec names element by element, so no name-keyed
     reordering is needed here.
 
-    ``execute_compiled`` takes ctypes scalars; an L3 dispatch takes the 0-dim
+    An L2 dispatch takes ctypes scalars; an L3 dispatch takes the 0-dim
     value tensor. *benchmark_dispatch_index* advances a stepped scalar to its
     value for that physical benchmark dispatch.
     """
@@ -404,18 +365,24 @@ def _ordered_args(
     return args
 
 
-def _execute_via_runner(
-    work_dir: Path,
+def _dispatch(
+    compiled: Any,
     specs: list[TensorSpec | ScalarSpec],
     tensors: dict[str, torch.Tensor],
     scalar_specs_eff: dict[str, ScalarSpec],
-    runtime_cfg: dict[str, Any],
+    cfg: Any,
 ) -> None:
-    """Dispatch via ``execute_compiled`` in orchestration param order."""
-    from pypto.runtime import execute_compiled
+    """Dispatch *compiled* once in orchestration param order.
 
-    ordered = _ordered_args(specs, tensors, scalar_specs_eff, ctypes_scalars=True)
-    execute_compiled(work_dir, ordered, **_execute_compiled_kwargs(runtime_cfg))
+    One call shape for both levels: ``CompiledProgram`` and
+    ``DistributedCompiledProgram`` are both callable with a ``RunConfig``. They
+    differ only in scalar marshalling — L3 reads args through the fork-inherited
+    shared mapping and takes Python scalars, L2 takes ctypes.
+    """
+    ordered = _ordered_args(
+        specs, tensors, scalar_specs_eff, ctypes_scalars=not _is_l3(compiled)
+    )
+    compiled(*ordered, config=cfg)
 
 
 def _is_l3(compiled: Any) -> bool:
@@ -530,7 +497,7 @@ def _run_benchmark(
     specs: list[TensorSpec | ScalarSpec],
     tensors: dict[str, torch.Tensor],
     scalar_specs_eff: dict[str, ScalarSpec],
-    runtime_cfg: dict[str, Any],
+    cfg: Any,
     rounds: int,
     warmup: int,
 ) -> Any:
@@ -540,7 +507,7 @@ def _run_benchmark(
     opens one :class:`~pypto.runtime.ChipWorker`, registers *compiled* once, and
     reads each launch's on-NPU span tree from the runtime's ``[STRACE]``
     markers. Args are built in spec order by :func:`_ordered_args`, exactly as
-    :func:`_execute_via_runner` does.
+    :func:`_dispatch` does.
     Returns the :class:`~pypto.runtime.BenchmarkStats`, or ``None`` when the
     runtime emits no markers (built without ``SIMPLER_PROFILING``).
     """
@@ -554,34 +521,17 @@ def _run_benchmark(
     from pypto.runtime import benchmark
 
     ordered = _ordered_args(specs, tensors, scalar_specs_eff, ctypes_scalars=True)
-    platform = runtime_cfg.get("platform")
-    device_id = runtime_cfg.get("device_id")
     stats = None
     with _Stage("benchmark"):
         try:
-            # Forward the caller's RunConfig when there is one, mirroring the
-            # L3 branch. The benchmark is a second, independent dispatch, so a
-            # program that sizes its rings for the correctness run must size
-            # them here too or it validates and then deadlocks. benchmark()
-            # takes config= or platform=/device_id=, never both, and a bare
-            # RunConfig still defaults to platform "a2a3sim" / device 0 — pin
-            # this run's real target onto a copy rather than trusting the
-            # caller to have restated it.
-            rc = runtime_cfg.get("config")
-            if rc is not None:
-                import dataclasses
-
-                bench_kwargs: dict[str, Any] = {
-                    "config": dataclasses.replace(
-                        rc, platform=platform, device_id=device_id
-                    )
-                }
-            else:
-                bench_kwargs = {"platform": platform, "device_id": device_id}
+            # The benchmark is a second, independent dispatch, so it takes the
+            # same config as the correctness run — a program that sizes its
+            # rings for one must size them for the other or it validates and
+            # then deadlocks.
             stats = benchmark(
                 compiled, ordered,
                 rounds=rounds, warmup=warmup,
-                **bench_kwargs,
+                config=cfg,
             )
         except RuntimeError as e:
             if not _benchmark_unavailable(e):
@@ -767,7 +717,7 @@ def _run_benchmark_l3(
     specs: list[TensorSpec | ScalarSpec],
     tensors: dict[str, torch.Tensor],
     scalar_specs_eff: dict[str, ScalarSpec],
-    runtime_cfg: dict[str, Any],
+    cfg: Any,
     rounds: int,
     warmup: int,
 ) -> Any:
@@ -807,7 +757,7 @@ def _run_benchmark_l3(
             stats = benchmark(
                 compiled, ordered,
                 rounds=rounds, warmup=warmup,
-                config=_l3_run_config(runtime_cfg),
+                config=cfg,
                 persistent=True,
                 reset_persistent_windows=False,
             )
@@ -823,28 +773,6 @@ def _run_benchmark_l3(
     _report_raw_samples(stats)
     _report_l3_detail(stats, compiled, resident=False)
     return stats
-
-
-def _try_l3_dispatch(
-    compiled: Any,
-    specs: list[TensorSpec | ScalarSpec],
-    tensors: dict[str, torch.Tensor],
-    scalar_specs_eff: dict[str, ScalarSpec],
-    runtime_cfg: dict[str, Any],
-) -> bool:
-    """If *compiled* is an L3 ``DistributedCompiledProgram``, dispatch it and return True.
-
-    L3 (HOST Orchestrator) programs cannot use ``execute_compiled`` (no
-    top-level ``kernel_config.py``); the compiled object is callable directly
-    with ``pypto.runtime.RunConfig``.
-    """
-    if not _is_l3(compiled):
-        return False
-
-    ordered = _ordered_args(specs, tensors, scalar_specs_eff, ctypes_scalars=False)
-    run_config = _l3_run_config(runtime_cfg)
-    compiled(*ordered, config=run_config)
-    return True
 
 
 def _share_in_place(tensors: dict[str, torch.Tensor]) -> None:
@@ -1029,26 +957,6 @@ def _alloc_empty_stacked_tensor(rt: Any, spec: TensorSpec) -> Any:
         raise
 
 
-def _l3_run_config(runtime_cfg: dict[str, Any]) -> Any:
-    """Build the per-dispatch ``RunConfig`` for an L3 resident dispatch.
-
-    Mirrors :func:`_try_l3_dispatch`: keep only the keys that are ``RunConfig``
-    fields (DFX flags / ring sizing pass through), then pin platform / device /
-    backend.
-    """
-    import dataclasses
-
-    from pypto.runtime import RunConfig as PyptoRunConfig
-
-    platform = runtime_cfg.get("platform", "a2a3")
-    allowed = {f.name for f in dataclasses.fields(PyptoRunConfig)}
-    kwargs = {k: v for k, v in runtime_cfg.items() if k in allowed}
-    kwargs.setdefault("platform", platform)
-    kwargs.setdefault("device_id", 0)
-    kwargs["backend_type"] = _backend_for_platform(platform)
-    return PyptoRunConfig(**kwargs)
-
-
 def _readback_resident_outputs(
     rt: Any,
     resident_specs: list[TensorSpec],
@@ -1087,7 +995,7 @@ def _run_l3_resident(
     specs: list[TensorSpec | ScalarSpec],
     tensors: dict[str, torch.Tensor],
     scalar_specs_eff: dict[str, ScalarSpec],
-    runtime_cfg: dict[str, Any],
+    cfg: Any,
     golden_outputs: dict[str, torch.Tensor] | None,
     rtol: float,
     atol: float,
@@ -1135,7 +1043,7 @@ def _run_l3_resident(
 
     ordered_names = [spec.name for spec in specs]
     pure_out_names = _l3_pure_out_names(compiled)
-    run_config = _l3_run_config(runtime_cfg)
+    run_config = cfg
     tensor_specs = [spec for spec in specs if isinstance(spec, TensorSpec)]
     resident_specs = [spec for spec in tensor_specs if spec.is_resident]
     bench = _bench_enabled() if benchmark_enabled is None else benchmark_enabled
@@ -1322,41 +1230,29 @@ def _run_l3_resident(
     return stats
 
 
-def _maybe_reload_l3(
-    work_dir: Path,
-    runtime_cfg: dict[str, Any],
-    compile_cfg: dict[str, Any],
-) -> Any:
-    """Reconstruct an L3 ``DistributedCompiledProgram`` from a ``runtime_dir``.
+def _reload_from_dir(work_dir: Path, cfg: Any) -> Any:
+    """Rebuild the compiled artifact from a ``runtime_dir`` without recompiling.
 
-    Returns ``None`` for a single-chip / L2 build (which keeps using
-    ``execute_compiled``). An L3 build is identified by the
-    ``distributed_meta.json`` sidecar written at compile time;
-    :meth:`DistributedCompiledProgram.from_dir` rebuilds its metadata without
-    re-running the pypto compile, so the existing :func:`_try_l3_dispatch` path
-    can dispatch it. The run's ``platform`` and ``distributed_config`` override
-    the values persisted at compile time, so ``--runtime-dir ... -p a2a3
-    -d 2,3`` replays on the requested target / devices.
+    ``from_dir`` reads the metadata sidecar each level persists at compile time
+    (``distributed_meta.json`` for L3, ``compiled_meta.json`` for L2), so the
+    replay handle is callable — and carries the param metadata
+    :func:`_validate_compiled_spec_abi` needs to stamp spec directions, which a
+    dispatch straight at the directory cannot supply.
+
+    The run's ``platform`` overrides the value persisted at compile time, so
+    ``--runtime-dir ... -p a2a3 -d 2,3`` replays on the requested target.
     """
-    if not (work_dir / "distributed_meta.json").exists():
-        return None
-    # The meta sidecar proves this is an L3 build, so a missing
-    # DistributedCompiledProgram is an unusable-pypto error, not a single-chip
-    # fallback: surface it explicitly instead of returning None and failing
-    # later in execute_compiled with a confusing single-chip error.
-    try:
-        from pypto.ir.distributed_compiled_program import DistributedCompiledProgram
-    except ImportError as e:
-        raise ImportError(
-            "L3 build detected (distributed_meta.json present), but "
-            "DistributedCompiledProgram could not be imported. Ensure your "
-            "pypto installation supports L3 distributed execution."
-        ) from e
-    return DistributedCompiledProgram.from_dir(
-        work_dir,
-        platform=runtime_cfg.get("platform"),
-        distributed_config=compile_cfg.get("distributed_config"),
-    )
+    if (work_dir / "distributed_meta.json").exists():
+        from pypto.ir import DistributedCompiledProgram
+
+        return DistributedCompiledProgram.from_dir(
+            work_dir,
+            platform=cfg.platform,
+            distributed_config=cfg.distributed_config,
+        )
+    from pypto.ir import CompiledProgram
+
+    return CompiledProgram.from_dir(work_dir, platform=cfg.platform)
 
 
 def _compute_golden(
@@ -1432,13 +1328,12 @@ def _validate(
 
 def _run_pipeline(
     specs: list[TensorSpec | ScalarSpec],
-    compile_step: Callable[[dict[str, Any], dict[str, Any], Any], Any],
+    compile_step: Callable[[Any, Any], Any],
     compile_label: str,
     prologue: Callable[[list[ScalarSpec], Path | None], Any] | None,
     golden_fn: Callable | None,
     golden_data: str | None,
-    compile_cfg: dict[str, Any] | None,
-    runtime_cfg: dict[str, Any] | None,
+    config: Any | None,
     rtol: float,
     atol: float,
     compare_fn: dict[str, Callable] | None,
@@ -1451,8 +1346,8 @@ def _run_pipeline(
     *prologue* runs entry-specific spec validation, may raise ``ValueError``,
     and returns whatever state its *compile_step* needs. *compile_step* then
     returns the ``CompiledProgram`` for a fresh compile, given the normalized
-    configs and that state. Everything around the two is identical for both
-    entry points.
+    ``RunConfig`` and that state. Everything around the two is identical for
+    both entry points.
 
     Args:
         specs: :class:`TensorSpec` / :class:`ScalarSpec` list in the compiled
@@ -1464,21 +1359,17 @@ def _run_pipeline(
         golden_data: Directory with ``in/{name}.pt`` and ``out/{name}.pt``;
             loads inputs and expected outputs (read-only). Takes precedence
             over *golden_fn*.
-        compile_cfg: Entry-specific compile kwargs; consumed by *compile_step*
-            and by the ``runtime_dir`` L3 reload.
-        runtime_cfg: Kwargs forwarded to
-            :func:`pypto.runtime.execute_compiled` (``platform``, ``device_id``,
-            ``enable_chip_swimlane``, ...). Unknown keys raise there, except
-            the harness-only key ``log_level``, consumed up-front by
-            :func:`_consume_runtime_harness_keys`.
+        config: Normalized into the one ``RunConfig`` every phase reads; see
+            :func:`_normalize_config`.
         rtol, atol: Golden comparison tolerances.
         compare_fn: Per-output-name overrides for ``torch.allclose``; see
             :func:`golden.validation.validate_golden`.
         compile_only: Stop after code generation; skip execute and validate.
         runtime_dir: Pre-compiled ``build_output/`` directory to reuse. Skips
             compile and invalidates cached ``.so``/``.bin`` so cpp edits
-            rebuild; *compile_cfg* is ignored, *compile_only* is rejected, and
-            ``PYPTO_BENCH`` is skipped because replay is correctness-only.
+            rebuild; the compile-side config is ignored, *compile_only* is
+            rejected, and ``PYPTO_BENCH`` is skipped because replay is
+            correctness-only.
         save_data: Persist generated inputs to ``{work_dir}/data/in/`` and
             golden outputs to ``{work_dir}/data/out/`` for later replay via
             *golden_data*. Off by default; validation still runs against the
@@ -1487,10 +1378,7 @@ def _run_pipeline(
     Returns:
         :class:`RunResult`.
     """
-    compile_cfg = compile_cfg or {}
-    runtime_cfg = dict(runtime_cfg or {})  # copy: we pop harness-only keys
     compare_fn = compare_fn or {}
-    _consume_runtime_harness_keys(runtime_cfg)
 
     if compile_only and runtime_dir is not None:
         return RunResult(passed=False, error="runtime_dir is incompatible with compile_only")
@@ -1510,26 +1398,27 @@ def _run_pipeline(
 
     compile_state: Any = None
     try:
+        cfg = _normalize_config(config)
         _validate_unique_spec_names(specs)
-        _validate_stepped_swimlane(scalar_specs, runtime_cfg)
+        _validate_stepped_swimlane(scalar_specs, cfg)
         if prologue is not None:
             compile_state = prologue(scalar_specs, data_dir)
     except ValueError as e:
         return _fail(str(e))
 
-    compiled: Any = None  # the CompiledProgram, when we compiled it this call
+    compiled: Any
     if runtime_dir is not None:
         try:
             work_dir = _setup_runtime_dir(runtime_dir, compile_label=compile_label)
         except ValueError as e:
             return _fail(str(e))
-        # An L3 build has no live compiled object here (compile was skipped);
-        # reconstruct it from the build dir so the L3 dispatch path below runs
-        # instead of falling through to the single-chip execute_compiled.
-        compiled = _maybe_reload_l3(work_dir, runtime_cfg, compile_cfg)
+        # Compile was skipped, so there is no live compiled object; rebuild it
+        # from the build dir. It is what stamps spec directions and what the
+        # dispatch below calls, so this is not an L3-only concern.
+        compiled = _reload_from_dir(work_dir, cfg)
     else:
         with _Stage("compile"):
-            compiled = compile_step(compile_cfg, runtime_cfg, compile_state)
+            compiled = compile_step(cfg, compile_state)
             work_dir = Path(compiled.output_dir)
 
     # Neither a signature-driven compile (which trusts annotations over tensor
@@ -1588,7 +1477,7 @@ def _run_pipeline(
             try:
                 bench = _run_l3_resident(
                     compiled, specs, tensors, scalar_specs_eff,
-                    runtime_cfg, golden_outputs, rtol, atol, compare_fn,
+                    cfg, golden_outputs, rtol, atol, compare_fn,
                     benchmark_enabled=benchmark_enabled,
                 )
             except (AssertionError, ValueError) as e:
@@ -1596,13 +1485,7 @@ def _run_pipeline(
         return _pass(bench)
 
     with _Stage("runtime"):
-        # An L3 ``DistributedCompiledProgram`` (a @pl.jit.host kernel compiled
-        # with distributed_config) dispatches per-rank via _try_l3_dispatch;
-        # everything else runs through the single-chip runner.
-        if compiled is None or not _try_l3_dispatch(
-            compiled, specs, tensors, scalar_specs_eff, runtime_cfg,
-        ):
-            _execute_via_runner(work_dir, specs, tensors, scalar_specs_eff, runtime_cfg)
+        _dispatch(compiled, specs, tensors, scalar_specs_eff, cfg)
 
     # Validate the dedicated correctness dispatch before benchmark launches
     # mutate output or inout tensors in place.
@@ -1624,34 +1507,24 @@ def _run_pipeline(
         rounds, warmup = _bench_loop_sizes()
         run_bench = _run_benchmark_l3 if _is_l3(compiled) else _run_benchmark
         bench = run_bench(
-            compiled, specs, tensors, scalar_specs_eff, runtime_cfg, rounds, warmup,
+            compiled, specs, tensors, scalar_specs_eff, cfg, rounds, warmup,
         )
     return _pass(bench)
 
 
 def _program_entry(
     fn: Any, specs: list[TensorSpec | ScalarSpec]
-) -> tuple[Callable[[dict[str, Any], dict[str, Any], Any], Any], None, str]:
+) -> tuple[Callable[[Any, Any], Any], None, str]:
     """``(compile_step, prologue, label)`` for a ``@pl.program`` class / ``ir.Program``."""
     del specs  # the program path derives everything from the compiled artifact
 
-    def _compile(
-        compile_cfg: dict[str, Any], runtime_cfg: dict[str, Any], _state: Any
-    ) -> Any:
+    def _compile(cfg: Any, _state: Any) -> Any:
         from pypto import ir
 
-        compile_kwargs = dict(compile_cfg)
-        platform = runtime_cfg.get("platform")
-        if platform is not None:
-            compile_kwargs.setdefault("backend_type", _backend_for_platform(platform))
-            # L3 distributed programs bake the platform into compiled.platform at
-            # compile time (the runtime config's platform is ignored when
-            # assembling chip callables). Without this, compiled.platform falls
-            # back to the backend's default sim platform, so a `-p a2a3` run
-            # silently compiles incore kernels for a2a3sim (g++-15) instead of
-            # the real device (ccec).
-            compile_kwargs.setdefault("platform", platform)
-        return ir.compile(fn, **compile_kwargs)
+        # compile_kwargs() carries the platform, which an L3 program bakes into
+        # compiled.platform at compile time: without it, incore kernels for a
+        # `-p a2a3` run would be built for the backend's default sim platform.
+        return ir.compile(fn, **cfg.compile_kwargs())
 
     return _compile, None, "Program compile"
 
@@ -1659,7 +1532,7 @@ def _program_entry(
 def _jit_entry(
     fn: Any, specs: list[TensorSpec | ScalarSpec]
 ) -> tuple[
-    Callable[[dict[str, Any], dict[str, Any], Any], Any],
+    Callable[[Any, Any], Any],
     Callable[[list[ScalarSpec], Path | None], Any],
     str,
 ]:
@@ -1686,17 +1559,7 @@ def _jit_entry(
             )
         return compile_scalars
 
-    def _compile(
-        compile_cfg: dict[str, Any],
-        runtime_cfg: dict[str, Any],
-        compile_scalars: dict[str, ScalarSpec],
-    ) -> Any:
-        from pypto.runtime import RunConfig
-
-        cfg = dict(compile_cfg)
-        platform = runtime_cfg.get("platform")
-        if platform is not None:
-            cfg["platform"] = platform
+    def _compile(cfg: Any, compile_scalars: dict[str, ScalarSpec]) -> Any:
         scalar_specs = [s for s in specs if isinstance(s, ScalarSpec)]
         if any(spec.compile_runtime for spec in scalar_specs):
             import pypto.language as pl
@@ -1713,7 +1576,7 @@ def _jit_entry(
                 )
                 for spec in scalar_specs
             }
-            return fn.compile(config=RunConfig(**cfg), **scalar_compile_args)
+            return fn.compile(config=cfg, **scalar_compile_args)
         # Dummy args carry shape/dtype and scalar values into the specialization
         # key; real tensors of the same shape hit the same JIT cache entry at
         # dispatch.
@@ -1723,7 +1586,7 @@ def _jit_entry(
             else torch.empty(spec.shape, dtype=spec.dtype)
             for spec in specs
         ]
-        return fn.compile(*dummy_args, config=RunConfig(**cfg))
+        return fn.compile(*dummy_args, config=cfg)
 
     return _compile, _prologue, "JIT compile"
 
@@ -1733,8 +1596,7 @@ def run(
     specs: list[TensorSpec | ScalarSpec],
     golden_fn: Callable | None = None,
     golden_data: str | None = None,
-    compile_cfg: dict[str, Any] | None = None,
-    runtime_cfg: dict[str, Any] | None = None,
+    config: Any | None = None,
     rtol: float = 1e-5,
     atol: float = 1e-5,
     compare_fn: dict[str, Callable] | None = None,
@@ -1746,8 +1608,8 @@ def run(
 
     Accepts either kernel form. A ``@pl.jit`` callable exposes ``compile`` and
     is specialized through ``JITFunction.compile``; a ``@pl.program`` class or
-    an ``ir.Program`` goes straight to :func:`pypto.ir.compile`. The two differ
-    only in the compile step and in which *compile_cfg* keys they accept.
+    an ``ir.Program`` goes straight to :func:`pypto.ir.compile`. The compile
+    step is the only difference; both read the same *config*.
 
     Args:
         fn: ``@pl.jit`` callable, ``@pl.program`` class, or ``ir.Program``.
@@ -1759,17 +1621,17 @@ def run(
         golden_data: Directory with ``in/{name}.pt`` and ``out/{name}.pt``;
             loads inputs and expected outputs (read-only). Takes precedence
             over *golden_fn*.
-        compile_cfg: For a ``@pl.jit`` kernel, compile-side ``RunConfig``
-            fields (``dump_passes`` / ``distributed_config`` /
-            ``compile_profiling`` / ...) carried into ``JITFunction.compile``;
-            ``platform`` is supplied separately, typically via *runtime_cfg*.
-            For a ``@pl.program`` kernel, kwargs forwarded to
-            :func:`pypto.ir.compile`. Unknown keys raise either way.
-        runtime_cfg: Kwargs forwarded to
-            :func:`pypto.runtime.execute_compiled` (``platform``, ``device_id``,
-            ``enable_chip_swimlane``, ...). Unknown keys raise there, except
-            the harness-only key ``log_level``, which is consumed up-front
-            to configure the PyPTO runtime logger via
+        config: Every setting for both phases, in one dict of
+            :class:`pypto.runtime.RunConfig` keyword arguments — ``platform``,
+            ``device_id``, ``enable_chip_swimlane``, ``dump_passes``,
+            ``distributed_config``, the ``ring_*`` overrides, ... A ready
+            ``RunConfig`` is accepted too. PyPTO reads the compile half off it
+            and the dispatch half off it, so nothing is restated per phase and
+            no key has to be filed under a phase by the caller. An unknown key
+            is ``RunConfig``'s own ``TypeError`` naming it. The one key that is
+            not a ``RunConfig`` field is the harness's ``log_level`` — the
+            PyPTO runtime log threshold (``debug``, ``v0``..``v9``, ``info``,
+            ``warn``, ``error``, ``null``), see
             :func:`pypto.runtime.log_config.configure_log`.
         rtol, atol: Golden comparison tolerances.
         compare_fn: Per-output-name overrides for ``torch.allclose``; see
@@ -1777,8 +1639,9 @@ def run(
         compile_only: Stop after code generation; skip execute and validate.
         runtime_dir: Pre-compiled ``build_output/`` directory to reuse. Skips
             compile and invalidates cached ``.so``/``.bin`` so cpp edits
-            rebuild; *compile_cfg* is ignored, *compile_only* is rejected, and
-            ``PYPTO_BENCH`` is skipped because replay is correctness-only.
+            rebuild; the compile-side config is ignored, *compile_only* is
+            rejected, and ``PYPTO_BENCH`` is skipped because replay is
+            correctness-only.
         save_data: When True, persist generated inputs to
             ``{work_dir}/data/in/`` and golden outputs to
             ``{work_dir}/data/out/`` for later replay via *golden_data*.
@@ -1795,6 +1658,6 @@ def run(
     compile_step, prologue, compile_label = entry(fn, specs)
     return _run_pipeline(
         specs, compile_step, compile_label, prologue,
-        golden_fn, golden_data, compile_cfg, runtime_cfg,
+        golden_fn, golden_data, config,
         rtol, atol, compare_fn, compile_only, runtime_dir, save_data,
     )

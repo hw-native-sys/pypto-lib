@@ -521,8 +521,8 @@ if __name__ == "__main__":
             args.num_tokens,
         ),
         golden_fn=golden_prefill_attention_swa,
-        compile_cfg=dict(dump_passes=args.dump_passes),
-        runtime_cfg=dict(
+        config=dict(
+            dump_passes=args.dump_passes,
             platform=args.platform,
             device_id=args.device,
             enable_chip_swimlane=args.enable_chip_swimlane,

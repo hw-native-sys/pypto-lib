@@ -154,15 +154,13 @@ prefill — size the rings explicitly. Each knob takes either a scalar
 this ring at the compile default". Precedence is just two tiers now:
 `RunConfig` field > compile default.
 
-**This works on the L3 (distributed) path only.** golden's `run` forwards
-whatever `runtime_cfg` keys are `RunConfig` fields to the per-rank dispatch,
-which builds a `CallConfig` and transcribes the ring sizes into
+golden's `run` builds one `RunConfig` from `config` and hands it to the
+dispatch, which builds a `CallConfig` and transcribes the ring sizes into
 `runtime_env`:
 
 ```python
-# L3 (distributed) entries — the only path where ring sizing takes effect.
 PREFILL_RING_HEAP = (0, 0, 2 * 1024 * 1024 * 1024, 0)   # ring 2 only
-runtime_cfg=dict(platform=args.platform, ring_heap=PREFILL_RING_HEAP)
+config=dict(platform=args.platform, ring_heap=PREFILL_RING_HEAP)
 ```
 
 Live examples: [`models/deepseek_v4_pro/prefill_fwd.py`](../../models/deepseek_v4_pro/prefill_fwd.py),
@@ -170,24 +168,24 @@ Live examples: [`models/deepseek_v4_pro/prefill_fwd.py`](../../models/deepseek_v
 (per-ring tuple), [`models/deepseek_v4_flash_dspark/decode_layer.py`](../../models/deepseek_v4_flash_dspark/decode_layer.py)
 (scalar, broadcast to all four rings).
 
-### The single-chip path has no working knob
+### The single-chip path
 
-An L2 (single-chip) entry cannot size its rings today, whichever way it is
-dispatched:
+L2 ring sizing used to be a dead knob: golden's `run` dispatched a single-chip
+program through `execute_compiled`, which has no ring parameters, and
+`CompiledProgram.__call__` forwarded only `platform`, `device_id`, `dfx` and
+`aicpu_thread_num`. A `ring_heap` was accepted, validated, and then dropped.
 
-- Through golden's `run`, the single-chip path calls
-  `execute_compiled(work_dir, args, ...)`, which has no ring parameters — a
-  `runtime_cfg["ring_heap"]` raises `TypeError`.
-- Through `CompiledProgram.__call__(*args, config=RunConfig(ring_heap=...))`,
-  the field is accepted and validated and then **silently dropped**:
-  `_invoke_compiled` forwards only `platform`, `device_id`, `dfx` and
-  `aicpu_thread_num` to the same `execute_compiled`.
+Both halves have since moved. PyPTO's `_execute_on_device` now takes the whole
+`RunConfig` and calls `_apply_ring_overrides` on the `CallConfig` it builds,
+and golden's `run` dispatches L2 through `CompiledProgram.__call__` with that
+same config — so the fields reach the runtime on both paths. **This is read
+off the plumbing, not measured**: no L2 entry in this repository sizes its
+rings yet, so if you are the first, confirm the value landed (`scope_stats`,
+§5) before trusting it.
 
-Until the dispatch path forwards the fields, an L2 kernel that outgrows a ring
-has to be fixed on the kernel side: cut the peak with a `pl.scope` (§3),
-shrink the intermediates, or split the scope. A few leaves carry a
-`*_RING_HEAP` constant recording what they would need; it is documentation,
-not configuration.
+Kernel-side remains the cheaper fix when a ring overflows: cut the peak with a
+`pl.scope` (§3), shrink the intermediates, or split the scope. A few leaves
+carry a `*_RING_HEAP` constant recording what they would need.
 
 ---
 
@@ -207,7 +205,7 @@ and pass it through:
 ```python
 parser.add_argument("--enable-scope-stats", action="store_true", default=False)
 ...
-runtime_cfg=dict(
+config=dict(
     platform=args.platform,
     device_id=args.device,
     enable_scope_stats=args.enable_scope_stats,

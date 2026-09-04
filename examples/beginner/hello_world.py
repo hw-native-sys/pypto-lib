@@ -57,6 +57,7 @@ def golden_hello_world(values):
 
 if __name__ == "__main__":
     import argparse
+
     from golden import run
 
     parser = argparse.ArgumentParser()
@@ -70,7 +71,7 @@ if __name__ == "__main__":
         fn=hello_world,
         specs=build_specs(),
         golden_fn=golden_hello_world,
-        runtime_cfg=dict(
+        config=dict(
             platform=args.platform,
             device_id=args.device,
             enable_chip_swimlane=args.enable_chip_swimlane,

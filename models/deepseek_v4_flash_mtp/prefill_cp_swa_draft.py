@@ -980,12 +980,10 @@ if __name__ == "__main__":
         specs=specs,
         golden_fn=golden_prefill_cp_swa,
         compile_only=args.compile_only,
-        compile_cfg=dict(
+        config=dict(
             distributed_config=DistributedConfig(
                 device_ids=device_ids[:args.cp], num_sub_workers=0),
             dump_passes=args.dump_passes,
-        ),
-        runtime_cfg=dict(
             platform=args.platform,
             enable_chip_swimlane=args.enable_chip_swimlane,
         ),

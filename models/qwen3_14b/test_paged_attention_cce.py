@@ -163,11 +163,11 @@ def main() -> None:
         fn=fn,
         specs=specs,
         golden_fn=golden_fn,
-        runtime_cfg={
-            "platform": args.platform,
-            "device_id": args.device,
-            "enable_chip_swimlane": args.enable_chip_swimlane,
-        },
+        config=dict(
+            platform=args.platform,
+            device_id=args.device,
+            enable_chip_swimlane=args.enable_chip_swimlane,
+        ),
         compile_only=args.compile_only or args.platform.endswith("sim"),
         rtol=5e-3,
         atol=2e-2,

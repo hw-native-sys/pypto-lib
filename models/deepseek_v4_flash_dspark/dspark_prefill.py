@@ -47,11 +47,9 @@ if __name__ == "__main__":
         specs=build_tensor_specs(args.batch, mode="prefill"),
         golden_fn=golden_dspark_drafter,
         compile_only=args.compile_only,
-        compile_cfg=dict(
+        config=dict(
             dump_passes=args.dump_passes,
             distributed_config=DistributedConfig(device_ids=device_ids[:N_RANKS], num_sub_workers=0),
-        ),
-        runtime_cfg=dict(
             platform=args.platform,
             ring_heap=_DSPARK_RING_HEAP,
         ),

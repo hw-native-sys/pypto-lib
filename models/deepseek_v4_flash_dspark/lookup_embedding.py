@@ -120,7 +120,7 @@ if __name__ == "__main__":
             fn=lookup_embedding_test,
             specs=build_tensor_specs(token_count, TEST_VOCAB_SIZE),
             golden_fn=golden_lookup_embedding_test,
-            runtime_cfg=dict(
+            config=dict(
                 platform=args.platform,
                 device_id=args.device,
             ),

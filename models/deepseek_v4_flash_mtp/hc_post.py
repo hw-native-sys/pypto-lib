@@ -221,8 +221,8 @@ if __name__ == "__main__":
             fn=hc_post_test,
             specs=build_tensor_specs(B, S),
             golden_fn=golden_hc_post,
-            compile_cfg=dict(dump_passes=args.dump_passes),
-            runtime_cfg=dict(
+            config=dict(
+                dump_passes=args.dump_passes,
                 platform=args.platform,
                 device_id=args.device,
                 enable_chip_swimlane=args.enable_chip_swimlane,

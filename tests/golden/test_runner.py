@@ -9,7 +9,7 @@
 
 """Unit tests for the ``golden_data`` cache read-back in :func:`golden.run`.
 
-These tests mock out ``pypto.ir.compile`` and ``pypto.runtime.execute_compiled``
+These tests mock out ``pypto.ir.compile`` and ``golden.runner._dispatch``
 so they run without a device.
 """
 
@@ -25,10 +25,10 @@ import torch
 from golden import ScalarSpec, TensorSpec, run
 from golden.runner import (
     RunResult,
-    _backend_for_platform,
     _bench_loop_sizes,
     _format_stale_paths,
-    _maybe_reload_l3,
+    _normalize_config,
+    _ordered_args,
     _prepare_inputs,
     _report_effective,
     _report_l3_detail,
@@ -37,6 +37,7 @@ from golden.runner import (
     _resident_loop_sizes,
     _run_benchmark,
     _run_benchmark_l3,
+    _reload_from_dir,
     _run_l3_resident,
     _save_tensors,
     _setup_runtime_dir,
@@ -99,6 +100,13 @@ def _make_build_dir(tmp_path):
     return build
 
 
+def _run_config(**kwargs):
+    """A real ``RunConfig``, for tests that drive a harness internal directly."""
+    from pypto.runtime import RunConfig
+
+    return RunConfig(**kwargs)
+
+
 def _artifact(output_dir, *infos):
     """A compiled-artifact double exposing *infos* as its parameter metadata."""
     return types.SimpleNamespace(
@@ -150,17 +158,16 @@ def _patch_compile_and_execute(
     *,
     fake_execute=None,
 ):
-    """Build context managers that stub out ``ir.compile`` and
-    ``pypto.runtime.execute_compiled``.
+    """Build context managers that stub out ``ir.compile`` and the dispatch.
 
     Args:
         compiled_dir: What `compiled.output_dir` should resolve to.
         write_outputs_positional: Optional list whose entries correspond 1:1 to
-            the tensors passed to execute_compiled (matching the order of
-            ``specs``).  Non-None entries are copied in-place into the
-            corresponding tensor, simulating a correct kernel.  Ignored when
-            ``fake_execute`` is given.
-        fake_execute: Optional fully custom ``execute_compiled`` side effect
+            the dispatched args (matching the order of ``specs``).  Non-None
+            entries are copied in-place into the corresponding tensor,
+            simulating a correct kernel.  Ignored when ``fake_execute`` is
+            given.
+        fake_execute: Optional fully custom dispatch side effect
             ``(work_dir, args, **kwargs) -> None``.  Use when a test needs to
             observe args or run logic beyond the simple per-position copy that
             ``write_outputs_positional`` supports.
@@ -177,8 +184,27 @@ def _patch_compile_and_execute(
 
     return (
         patch("pypto.ir.compile", return_value=fake),
-        patch("pypto.runtime.execute_compiled", side_effect=fake_execute),
+        patch("golden.runner._dispatch", side_effect=_as_dispatch(fake_execute)),
     )
+
+
+def _patch_reload(prebuilt: Path):
+    """Stub the runtime_dir reload with a handle pointing at *prebuilt*."""
+    return patch("golden.runner._reload_from_dir", return_value=_FakeCompiled(prebuilt))
+
+
+def _as_dispatch(fake_execute):
+    """Adapt a ``(work_dir, args, **kwargs)`` double onto ``_dispatch``'s signature.
+
+    ``_dispatch`` takes the compiled handle and the tensors by name; the doubles
+    predate it and read the args positionally, which is what ``_ordered_args``
+    builds.
+    """
+    def _dispatch(compiled, specs, tensors, scalar_specs_eff, cfg):
+        ordered = _ordered_args(specs, tensors, scalar_specs_eff, ctypes_scalars=True)
+        fake_execute(compiled.output_dir, ordered, config=cfg)
+
+    return _dispatch
 
 
 class TestGoldenDataCacheHit:
@@ -272,7 +298,7 @@ class TestGoldenDataCacheHit:
 
         fake = _FakeCompiled(build_dir)
         with patch("pypto.ir.compile", return_value=fake), \
-             patch("pypto.runtime.execute_compiled", side_effect=capture_execute):
+             patch("golden.runner._dispatch", side_effect=_as_dispatch(capture_execute)):
             r = run(
                 fn=object(),
                 specs=three_kinds_specs,
@@ -353,7 +379,7 @@ class TestGoldenFnPath:
 
         fake = _FakeCompiled(build_dir)
         with patch("pypto.ir.compile", return_value=fake), \
-             patch("pypto.runtime.execute_compiled", side_effect=fake_execute):
+             patch("golden.runner._dispatch", side_effect=_as_dispatch(fake_execute)):
             r = run(
                 fn=object(),
                 specs=three_kinds_specs,
@@ -391,7 +417,7 @@ class TestGoldenFnPath:
 
         fake = _FakeCompiled(build_dir)
         with patch("pypto.ir.compile", return_value=fake), \
-             patch("pypto.runtime.execute_compiled", side_effect=fake_execute):
+             patch("golden.runner._dispatch", side_effect=_as_dispatch(fake_execute)):
             r = run(
                 fn=object(),
                 specs=three_kinds_specs,
@@ -415,7 +441,7 @@ class TestGoldenFnPath:
 
         fake = _FakeCompiled(build_dir)
         with patch("pypto.ir.compile", return_value=fake), \
-             patch("pypto.runtime.execute_compiled", side_effect=bad_execute):
+             patch("golden.runner._dispatch", side_effect=_as_dispatch(bad_execute)):
             r = run(
                 fn=object(),
                 specs=three_kinds_specs,
@@ -445,7 +471,7 @@ class TestSaveData:
 
         fake = _FakeCompiled(build_dir)
         with patch("pypto.ir.compile", return_value=fake), \
-             patch("pypto.runtime.execute_compiled", side_effect=fake_execute):
+             patch("golden.runner._dispatch", side_effect=_as_dispatch(fake_execute)):
             r = run(
                 fn=object(),
                 specs=three_kinds_specs,
@@ -470,7 +496,7 @@ class TestNoValidation:
 
         fake = _FakeCompiled(build_dir)
         with patch("pypto.ir.compile", return_value=fake), \
-             patch("pypto.runtime.execute_compiled", side_effect=fake_execute):
+             patch("golden.runner._dispatch", side_effect=_as_dispatch(fake_execute)):
             r = run(
                 fn=object(),
                 specs=three_kinds_specs,
@@ -500,7 +526,7 @@ class TestCompileOnly:
             pytest.fail("golden_fn must not run when compile_only=True")
 
         with patch("pypto.ir.compile", return_value=fake), \
-             patch("pypto.runtime.execute_compiled", side_effect=exec_must_not_run):
+             patch("golden.runner._dispatch", side_effect=_as_dispatch(exec_must_not_run)):
             r = run(
                 fn=object(),
                 specs=three_kinds_specs,
@@ -533,7 +559,7 @@ class TestCompileOnly:
             _l3_abi_environment(),
             patch("pypto.ir.compile", return_value=compiled) as compile_fn,
             patch.object(TensorSpec, "create_tensor") as create_tensor,
-            patch("pypto.runtime.execute_compiled") as execute,
+            patch("golden.runner._dispatch") as execute,
         ):
             result = run(fn=object(), specs=specs, compile_only=True)
 
@@ -550,10 +576,6 @@ class TestJitCompilePath:
         fn = types.SimpleNamespace(compile=MagicMock(return_value=compiled))
         runtime_marker = object()
 
-        class FakeRunConfig:
-            def __init__(self, **kwargs):
-                self.kwargs = kwargs
-
         specs = [
             TensorSpec("x", [4], torch.float32),
             ScalarSpec("num_tokens", torch.int32, 4),
@@ -566,18 +588,11 @@ class TestJitCompilePath:
                 runtime_marker,
                 create=True,
             ),
-            patch.object(
-                sys.modules["pypto.runtime"],
-                "RunConfig",
-                FakeRunConfig,
-                create=True,
-            ),
         ):
             result = run(
                 fn,
                 specs,
-                compile_cfg={"dump_passes": False},
-                runtime_cfg={"platform": "a5"},
+                config={"dump_passes": False, "platform": "a5"},
                 compile_only=True,
             )
 
@@ -586,10 +601,9 @@ class TestJitCompilePath:
         assert compile_call.args == ()
         assert compile_call.kwargs["epoch"] is runtime_marker
         assert compile_call.kwargs["num_tokens"] == 4
-        assert compile_call.kwargs["config"].kwargs == {
-            "dump_passes": False,
-            "platform": "a5",
-        }
+        cfg = compile_call.kwargs["config"]
+        assert cfg.dump_passes is False
+        assert cfg.platform == "a5"
 
     def test_stepped_scalar_requires_runtime_compilation(self):
         fn = types.SimpleNamespace(compile=MagicMock())
@@ -604,25 +618,23 @@ class TestJitCompilePath:
         fn.compile.assert_not_called()
 
     def test_stepped_scalar_rejects_multi_pass_swimlane_before_compile(self):
-        # Both the current key and its pre-rename spelling arm the guard.
-        for key in ("enable_chip_swimlane", "enable_l2_swimlane"):
-            fn = types.SimpleNamespace(compile=MagicMock())
-            result = run(
-                fn,
-                [
-                    ScalarSpec(
-                        "epoch", torch.int32, 0,
-                        compile_runtime=True, benchmark_step=1,
-                    )
-                ],
-                runtime_cfg={key: True},
-                compile_only=True,
-            )
+        fn = types.SimpleNamespace(compile=MagicMock())
+        result = run(
+            fn,
+            [
+                ScalarSpec(
+                    "epoch", torch.int32, 0,
+                    compile_runtime=True, benchmark_step=1,
+                )
+            ],
+            config={"enable_chip_swimlane": True},
+            compile_only=True,
+        )
 
-            assert not result.passed
-            assert "benchmark_step is incompatible" in (result.error or "")
-            assert f"{key}=True" in (result.error or "")
-            fn.compile.assert_not_called()
+        assert not result.passed
+        assert "benchmark_step is incompatible" in (result.error or "")
+        assert "enable_chip_swimlane" in (result.error or "")
+        fn.compile.assert_not_called()
 
     def test_duplicate_specs_fail_before_compile(self):
         fn = types.SimpleNamespace(compile=MagicMock())
@@ -678,7 +690,7 @@ class TestJitCompilePath:
             _l3_abi_environment(),
             patch("golden.runner._is_l3", return_value=False),
             patch.object(TensorSpec, "create_tensor") as create_tensor,
-            patch("pypto.runtime.execute_compiled") as execute,
+            patch("golden.runner._dispatch") as execute,
         ):
             result = run(fn, specs, compile_only=True)
 
@@ -754,7 +766,7 @@ class TestJitCompilePath:
         with (
             _l3_abi_environment(),
             patch.object(TensorSpec, "create_tensor") as create_tensor,
-            patch("pypto.runtime.execute_compiled") as execute,
+            patch("golden.runner._dispatch") as execute,
         ):
             result = run(fn, specs, compile_only=True)
 
@@ -893,7 +905,8 @@ class TestRuntimeDir:
             # Leave outputs zero; no golden_fn is provided so no validation runs.
 
         with patch("pypto.ir.compile", side_effect=compile_must_not_run), \
-             patch("pypto.runtime.execute_compiled", side_effect=fake_execute):
+             _patch_reload(prebuilt), \
+             patch("golden.runner._dispatch", side_effect=_as_dispatch(fake_execute)):
             r = run(
                 fn=object(),
                 specs=three_kinds_specs,
@@ -919,7 +932,8 @@ class TestRuntimeDir:
             tensors[2][:] = tensors[2] + 100
 
         with patch("pypto.ir.compile", side_effect=lambda *a, **kw: pytest.fail("compile must not run")), \
-             patch("pypto.runtime.execute_compiled", side_effect=fake_execute):
+             _patch_reload(prebuilt), \
+             patch("golden.runner._dispatch", side_effect=_as_dispatch(fake_execute)):
             r = run(
                 fn=object(),
                 specs=three_kinds_specs,
@@ -934,10 +948,11 @@ class TestRuntimeDir:
         assert (prebuilt / "data" / "out" / "y.pt").is_file()
         assert (prebuilt / "data" / "out" / "state.pt").is_file()
 
-    def test_runtime_dir_l3_routes_to_l3_dispatch(self, three_kinds_specs, tmp_path):
-        """An L3 runtime_dir (distributed_meta.json present) is reconstructed via
-        _maybe_reload_l3 and dispatched through _try_l3_dispatch — not the
-        single-chip execute_compiled path."""
+    def test_runtime_dir_reconstructs_and_dispatches_the_handle(
+        self, three_kinds_specs, tmp_path,
+    ):
+        """A runtime_dir is reconstructed via _reload_from_dir and the resulting
+        handle -- not the directory -- is what gets dispatched."""
         prebuilt = tmp_path / "prebuilt"
         prebuilt.mkdir()
         (prebuilt / "distributed_meta.json").write_text("{}")
@@ -945,19 +960,15 @@ class TestRuntimeDir:
 
         with (
             patch("pypto.ir.compile", side_effect=lambda *a, **k: pytest.fail("compile must not run")),
-            patch(
-                "pypto.runtime.execute_compiled",
-                side_effect=lambda *a, **k: pytest.fail("execute_compiled must not run for L3"),
-            ),
-            patch("golden.runner._maybe_reload_l3", return_value=fake_l3) as reload,
-            patch("golden.runner._try_l3_dispatch", return_value=True) as l3,
+            patch("golden.runner._reload_from_dir", return_value=fake_l3) as reload,
+            patch("golden.runner._dispatch") as dispatch,
         ):
             r = run(fn=object(), specs=three_kinds_specs, runtime_dir=str(prebuilt))
 
         assert r.passed, f"unexpected failure: {r.error}"
         reload.assert_called_once()
-        l3.assert_called_once()
-        assert l3.call_args.args[0] is fake_l3  # the reconstructed program is dispatched
+        dispatch.assert_called_once()
+        assert dispatch.call_args.args[0] is fake_l3
 
     def test_runtime_dir_l3_abi_mismatch_fails_before_input_or_runtime(self, tmp_path):
         prebuilt = tmp_path / "prebuilt"
@@ -967,11 +978,10 @@ class TestRuntimeDir:
 
         with (
             _l3_abi_environment(),
-            patch("golden.runner._maybe_reload_l3", return_value=compiled),
+            patch("golden.runner._reload_from_dir", return_value=compiled),
             patch("pypto.ir.compile") as compile_fn,
             patch.object(TensorSpec, "create_tensor") as create_tensor,
-            patch("golden.runner._try_l3_dispatch") as l3_dispatch,
-            patch("pypto.runtime.execute_compiled") as execute,
+            patch("golden.runner._dispatch") as execute,
         ):
             result = run(fn=object(), specs=specs, runtime_dir=str(prebuilt))
 
@@ -979,7 +989,6 @@ class TestRuntimeDir:
         assert "shape" in (result.error or "")
         compile_fn.assert_not_called()
         create_tensor.assert_not_called()
-        l3_dispatch.assert_not_called()
         execute.assert_not_called()
 
     def test_runtime_dir_l3_abi_mismatch_fails_before_input(self, tmp_path):
@@ -990,10 +999,9 @@ class TestRuntimeDir:
 
         with (
             _l3_abi_environment(),
-            patch("golden.runner._maybe_reload_l3", return_value=compiled),
+            patch("golden.runner._reload_from_dir", return_value=compiled),
             patch.object(TensorSpec, "create_tensor") as create_tensor,
-            patch("golden.runner._try_l3_dispatch") as l3_dispatch,
-            patch("pypto.runtime.execute_compiled") as execute,
+            patch("golden.runner._dispatch") as execute,
         ):
             result = run(
                 fn,
@@ -1005,7 +1013,6 @@ class TestRuntimeDir:
         assert "dtype" in (result.error or "")
         fn.compile.assert_not_called()
         create_tensor.assert_not_called()
-        l3_dispatch.assert_not_called()
         execute.assert_not_called()
 
     def test_runtime_dir_l3_skips_requested_benchmark(
@@ -1022,17 +1029,16 @@ class TestRuntimeDir:
 
         with (
             _l3_abi_environment(),
-            patch("golden.runner._maybe_reload_l3", return_value=compiled),
-            patch("golden.runner._try_l3_dispatch", return_value=True),
+            patch("golden.runner._reload_from_dir", return_value=compiled),
             patch("golden.runner._run_benchmark_l3") as benchmark,
-            patch("pypto.runtime.execute_compiled") as execute,
+            patch("golden.runner._dispatch") as execute,
         ):
             result = run(fn=object(), specs=specs, runtime_dir=str(prebuilt))
 
         assert result.passed, result.error
         assert result.bench is None
         benchmark.assert_not_called()
-        execute.assert_not_called()
+        execute.assert_called_once()
         assert "benchmark skipped: runtime_dir replay is correctness-only" in capsys.readouterr().out
 
     def test_runtime_dir_missing_returns_fail(self, three_kinds_specs, tmp_path):
@@ -1045,7 +1051,7 @@ class TestRuntimeDir:
             pytest.fail("execute_compiled must not run when runtime_dir is missing")
 
         with patch("pypto.ir.compile", side_effect=compile_must_not_run), \
-             patch("pypto.runtime.execute_compiled", side_effect=exec_must_not_run):
+             patch("golden.runner._dispatch", side_effect=_as_dispatch(exec_must_not_run)):
             r = run(
                 fn=object(),
                 specs=three_kinds_specs,
@@ -1068,7 +1074,7 @@ class TestRuntimeDir:
             pytest.fail("execute_compiled must not run")
 
         with patch("pypto.ir.compile", side_effect=compile_must_not_run), \
-             patch("pypto.runtime.execute_compiled", side_effect=exec_must_not_run):
+             patch("golden.runner._dispatch", side_effect=_as_dispatch(exec_must_not_run)):
             r = run(
                 fn=object(),
                 specs=three_kinds_specs,
@@ -1099,7 +1105,8 @@ class TestRuntimeDir:
             pytest.fail("golden_fn must not run when golden_data is a complete cache")
 
         with patch("pypto.ir.compile", side_effect=lambda *a, **kw: pytest.fail("compile must not run")), \
-             patch("pypto.runtime.execute_compiled", side_effect=fake_execute):
+             _patch_reload(prebuilt), \
+             patch("golden.runner._dispatch", side_effect=_as_dispatch(fake_execute)):
             r = run(
                 fn=object(),
                 specs=three_kinds_specs,
@@ -1114,8 +1121,8 @@ class TestRuntimeDir:
         assert not (prebuilt / "data").exists()
 
 
-class TestBackendForPlatform:
-    """``_backend_for_platform`` maps platform strings to BackendType values."""
+class TestPlatformResolution:
+    """The normalized RunConfig owns the platform -> backend mapping."""
 
     @pytest.mark.parametrize(
         "platform, expected_name",
@@ -1127,12 +1134,13 @@ class TestBackendForPlatform:
         ],
     )
     def test_known_platforms(self, platform, expected_name):
-        backend = _backend_for_platform(platform)
-        assert backend.name == expected_name
+        cfg = _normalize_config({"platform": platform})
+        assert cfg.platform == platform
+        assert cfg.backend_type.name == expected_name
 
     def test_unknown_platform_raises_valueerror(self):
-        with pytest.raises(ValueError, match="Unknown runtime platform"):
-            _backend_for_platform("notaplatform")
+        with pytest.raises(ValueError, match="Invalid platform"):
+            _normalize_config({"platform": "notaplatform"})
 
 
 class TestRunResultStr:
@@ -1458,10 +1466,10 @@ class TestStageOrder:
 
 
 class TestConfigForwarding:
-    """compile_cfg / runtime_cfg pass-through to pypto entry points."""
+    """One ``config`` reaches both pypto phases."""
 
-    def test_compile_cfg_forwarded_to_ir_compile(self, three_kinds_specs, build_dir):
-        """Keys in compile_cfg reach ir.compile as kwargs."""
+    def test_compile_side_keys_reach_ir_compile(self, three_kinds_specs, build_dir):
+        """Compile-side keys in config reach ir.compile as kwargs."""
         fake = _FakeCompiled(build_dir)
 
         captured: dict = {}
@@ -1471,21 +1479,22 @@ class TestConfigForwarding:
             return fake
 
         with patch("pypto.ir.compile", side_effect=fake_compile), \
-             patch("pypto.runtime.execute_compiled"):
+             patch("golden.runner._dispatch"):
             r = run(
                 fn=object(),
                 specs=three_kinds_specs,
-                compile_cfg=dict(dump_passes=False, profiling=True),
+                config=dict(dump_passes=False, compile_profiling=True),
             )
 
         assert r.passed, f"unexpected failure: {r.error}"
         assert captured["dump_passes"] is False
+        # RunConfig.compile_profiling is ir.compile's `profiling`.
         assert captured["profiling"] is True
 
-    def test_runtime_cfg_forwarded_to_execute_compiled(
+    def test_dispatch_side_keys_reach_the_dispatch(
         self, three_kinds_specs, build_dir,
     ):
-        """Non-DFX keys in runtime_cfg reach execute_compiled as kwargs."""
+        """Dispatch-side keys in config reach the dispatch on the RunConfig."""
 
         captured: dict = {}
 
@@ -1497,46 +1506,45 @@ class TestConfigForwarding:
             r = run(
                 fn=object(),
                 specs=three_kinds_specs,
-                runtime_cfg=dict(
-                    platform="a2a3sim",
-                    device_id=3,
-                    pto_isa_commit="deadbeef",
-                ),
+                config=dict(platform="a2a3sim", device_id=3),
             )
 
         assert r.passed, f"unexpected failure: {r.error}"
-        assert captured["platform"] == "a2a3sim"
-        assert captured["device_id"] == 3
-        assert captured["pto_isa_commit"] == "deadbeef"
+        assert captured["config"].platform == "a2a3sim"
+        assert captured["config"].device_id == 3
 
-    def test_dump_args_forwarded_as_dfx_option(self, three_kinds_specs, build_dir):
-        """enable_dump_args is bundled into the execute_compiled DFX options."""
+    def test_unknown_key_is_rejected(self, three_kinds_specs, build_dir):
+        """A key RunConfig does not accept is its own TypeError, naming the key."""
+        compile_p, exec_p = _patch_compile_and_execute(build_dir)
+        with compile_p, exec_p, pytest.raises(TypeError, match="pto_isa_commit"):
+            run(
+                fn=object(),
+                specs=three_kinds_specs,
+                config=dict(platform="a2a3sim", pto_isa_commit="deadbeef"),
+            )
+
+    def test_dfx_flags_reach_the_dispatch_as_dfx_options(
+        self, three_kinds_specs, build_dir,
+    ):
+        """DFX flags ride the RunConfig and surface through its dfx_options()."""
 
         captured: dict = {}
-        dfx = object()
-        dfx_opts = MagicMock(return_value=dfx)
-        runner_mod = types.ModuleType("pypto.runtime.runner")
-        runner_mod._DfxOpts = dfx_opts
 
         def fake_execute(_work_dir, _tensors, **kwargs):
             captured.update(kwargs)
 
         compile_p, exec_p = _patch_compile_and_execute(build_dir, fake_execute=fake_execute)
-        with (
-            compile_p,
-            exec_p,
-            patch.dict(sys.modules, {"pypto.runtime.runner": runner_mod}),
-        ):
+        with compile_p, exec_p:
             r = run(
                 fn=object(),
                 specs=three_kinds_specs,
-                runtime_cfg=dict(enable_dump_args=2),
+                config=dict(enable_dump_args=2, enable_chip_swimlane=3),
             )
 
         assert r.passed, f"unexpected failure: {r.error}"
-        dfx_opts.assert_called_once_with(enable_dump_args=2)
-        assert captured["dfx"] is dfx
-        assert "enable_dump_args" not in captured
+        dfx = captured["config"].dfx_options()
+        assert dfx.enable_dump_args == 2
+        assert dfx.enable_chip_swimlane == 3
 
 
 def _set_mtime(path: Path, mtime: float) -> None:
@@ -1682,24 +1690,24 @@ class TestSetupRuntimeDir:
 
 
 class TestLogLevelConsumption:
-    """`runtime_cfg['log_level']` is consumed as a harness-only key."""
+    """`config['log_level']` is consumed as a harness-only key."""
 
     def test_log_level_invokes_configure_log(self, three_kinds_specs, build_dir):
-        """runtime_cfg.log_level → configure_log(level) is called."""
+        """config['log_level'] → configure_log(level) is called."""
         compile_p, exec_p = _patch_compile_and_execute(build_dir)
         with compile_p, exec_p, \
              patch("pypto.runtime.log_config.configure_log") as mock_cfg:
             run(
                 fn=object(),
                 specs=three_kinds_specs,
-                runtime_cfg=dict(platform="a2a3sim", device_id=0, log_level="debug"),
+                config=dict(platform="a2a3sim", device_id=0, log_level="debug"),
             )
         mock_cfg.assert_called_once_with("debug")
 
-    def test_log_level_not_forwarded_to_execute_compiled(
+    def test_log_level_not_forwarded_to_the_dispatch(
         self, three_kinds_specs, build_dir,
     ):
-        """log_level is popped — execute_compiled does NOT receive it."""
+        """log_level is popped — it never reaches the RunConfig."""
         captured: dict = {}
 
         def fake_execute(_w, _t, **kw):
@@ -1710,9 +1718,9 @@ class TestLogLevelConsumption:
             run(
                 fn=object(),
                 specs=three_kinds_specs,
-                runtime_cfg=dict(platform="a2a3sim", device_id=0, log_level="debug"),
+                config=dict(platform="a2a3sim", device_id=0, log_level="debug"),
             )
-        assert "log_level" not in captured
+        assert not hasattr(captured["config"], "log_level")
 
     def test_no_log_level_skips_configure_log(self, three_kinds_specs, build_dir):
         """No log_level key → configure_log not called."""
@@ -1722,56 +1730,52 @@ class TestLogLevelConsumption:
             run(
                 fn=object(),
                 specs=three_kinds_specs,
-                runtime_cfg=dict(platform="a2a3sim", device_id=0),
+                config=dict(platform="a2a3sim", device_id=0),
             )
         mock_cfg.assert_not_called()
 
 
-class TestMaybeReloadL3:
-    """`_maybe_reload_l3` reconstructs an L3 program from a runtime_dir."""
+class TestReloadFromDir:
+    """`_reload_from_dir` rebuilds the compiled handle from a runtime_dir."""
 
-    def test_returns_none_without_meta(self, tmp_path):
-        """A single-chip / L2 build (no distributed_meta.json) yields None."""
-        assert _maybe_reload_l3(tmp_path, {}, {}) is None
+    @staticmethod
+    def _fake_ir(from_dir, attr):
+        """A ``pypto.ir`` stand-in exposing *attr* with a mocked ``from_dir``.
 
-    def test_calls_from_dir_with_run_overrides(self, tmp_path):
-        """An L3 build (distributed_meta.json present) reconstructs via from_dir,
+        CI ships a lightweight pypto where ``pypto.ir`` cannot be import-patched,
+        so the in-function import resolves to this instead.
+        """
+        module = types.ModuleType("pypto.ir")
+        setattr(module, attr, type(attr, (), {"from_dir": from_dir}))
+        return module
+
+    def test_l2_build_reconstructs_single_chip_handle(self, tmp_path):
+        """No distributed_meta.json: CompiledProgram.from_dir, given the platform."""
+        sentinel = object()
+        from_dir = MagicMock(return_value=sentinel)
+        cfg = _run_config(platform="a2a3")
+        with patch.dict(
+            sys.modules, {"pypto.ir": self._fake_ir(from_dir, "CompiledProgram")}
+        ):
+            assert _reload_from_dir(tmp_path, cfg) is sentinel
+        from_dir.assert_called_once()
+        assert from_dir.call_args.kwargs["platform"] == "a2a3"
+
+    def test_l3_build_reconstructs_with_run_overrides(self, tmp_path):
+        """distributed_meta.json present: DistributedCompiledProgram.from_dir,
         threading the run's platform + distributed_config as overrides."""
         (tmp_path / "distributed_meta.json").write_text("{}")
         sentinel = object()
-        # CI ships a lightweight pypto where pypto.ir is not a package, so the
-        # real module can't be import-patched. Inject a stand-in into sys.modules
-        # so the in-function `from pypto.ir.distributed_compiled_program import
-        # ...` resolves to our fake regardless of the installed pypto.
-        fake_mod = types.ModuleType("pypto.ir.distributed_compiled_program")
         from_dir = MagicMock(return_value=sentinel)
-        fake_mod.DistributedCompiledProgram = type(
-            "DistributedCompiledProgram", (), {"from_dir": from_dir}
-        )
+        cfg = _run_config(platform="a2a3", distributed_config="DC")
         with patch.dict(
-            sys.modules, {"pypto.ir.distributed_compiled_program": fake_mod}
+            sys.modules,
+            {"pypto.ir": self._fake_ir(from_dir, "DistributedCompiledProgram")},
         ):
-            out = _maybe_reload_l3(
-                tmp_path,
-                {"platform": "a2a3"},
-                {"distributed_config": "DC"},
-            )
-        assert out is sentinel
+            assert _reload_from_dir(tmp_path, cfg) is sentinel
         from_dir.assert_called_once()
         assert from_dir.call_args.kwargs["platform"] == "a2a3"
         assert from_dir.call_args.kwargs["distributed_config"] == "DC"
-
-    def test_raises_when_l3_module_missing(self, tmp_path):
-        """An L3 build whose DistributedCompiledProgram can't be imported raises
-        a clear ImportError instead of silently returning None (which would fail
-        confusingly down the single-chip path)."""
-        (tmp_path / "distributed_meta.json").write_text("{}")
-        # sys.modules[name] = None makes `from name import ...` raise ImportError.
-        with patch.dict(
-            sys.modules, {"pypto.ir.distributed_compiled_program": None}
-        ):
-            with pytest.raises(ImportError, match="L3 build detected"):
-                _maybe_reload_l3(tmp_path, {"platform": "a2a3"}, {})
 
 
 class TestShareInPlace:
@@ -1786,6 +1790,9 @@ class TestShareInPlace:
         assert tensors["b"].is_shared() and tensors["b"].is_contiguous()
         # An already-shared+contiguous tensor is left as the same object.
         assert tensors["a"] is a
+
+
+_BENCH_L3_CFG = _run_config(platform="a2a3")
 
 
 def test_l3_benchmark_reuses_persistent_windows_without_runtime_reset(monkeypatch):
@@ -1803,7 +1810,6 @@ def test_l3_benchmark_reuses_persistent_windows_without_runtime_reset(monkeypatc
     compiled = object()
     tensors = {"x": torch.zeros(1)}
     monkeypatch.setattr("golden.runner._ordered_args", lambda *_a, **_k: ["ORDERED"])
-    monkeypatch.setattr("golden.runner._l3_run_config", lambda _cfg: "RUNCFG")
 
     with patch.dict(sys.modules, {"pypto.runtime": fake_runtime}):
         result = _run_benchmark_l3(
@@ -1811,7 +1817,7 @@ def test_l3_benchmark_reuses_persistent_windows_without_runtime_reset(monkeypatc
             [],
             tensors,
             {},
-            {"platform": "a2a3"},
+            _BENCH_L3_CFG,
             rounds=7,
             warmup=2,
         )
@@ -1823,7 +1829,7 @@ def test_l3_benchmark_reuses_persistent_windows_without_runtime_reset(monkeypatc
         "kwargs": {
             "rounds": 7,
             "warmup": 2,
-            "config": "RUNCFG",
+            "config": _BENCH_L3_CFG,
             "persistent": True,
             "reset_persistent_windows": False,
         },
@@ -1839,16 +1845,15 @@ def test_nonresident_validation_precedes_benchmark_mutation(
     specs = _stamped([TensorSpec("y", [1], torch.float32)], {"y": "out"})
     monkeypatch.setenv("PYPTO_BENCH", "1")
 
-    def _dispatch(_compiled, _specs, tensors, _scalars, _runtime_cfg):
+    def _dispatch(_compiled, _specs, tensors, _scalars, _cfg):
         tensors["y"].zero_()
-        return True
 
     def _benchmark(_compiled, _specs, tensors, *_args):
         tensors["y"].fill_(1.0)
         return "BENCH"
 
     with (
-        patch("golden.runner._try_l3_dispatch", side_effect=_dispatch),
+        patch("golden.runner._dispatch", side_effect=_dispatch),
         patch("golden.runner._is_l3", return_value=True),
         patch("golden.runner._run_benchmark_l3", side_effect=_benchmark),
         patch("pypto.ir.compile", return_value=compiled),
@@ -1873,14 +1878,14 @@ def test_benchmark_propagates_device_runtime_error(monkeypatch, l3):
 
     fake_runtime = types.ModuleType("pypto.runtime")
     fake_runtime.benchmark = _benchmark
+    cfg = _run_config()
     with patch.dict(sys.modules, {"pypto.runtime": fake_runtime}):
         with pytest.raises(RuntimeError, match="DEVICE DISPATCH FAILED"):
             if l3:
                 monkeypatch.setattr("golden.runner._ordered_args", lambda *_a, **_k: [])
-                monkeypatch.setattr("golden.runner._l3_run_config", lambda _cfg: "RUNCFG")
-                _run_benchmark_l3(object(), [], {}, {}, {}, rounds=1, warmup=1)
+                _run_benchmark_l3(object(), [], {}, {}, cfg, rounds=1, warmup=1)
             else:
-                _run_benchmark(object(), [], {}, {}, {}, rounds=1, warmup=1)
+                _run_benchmark(object(), [], {}, {}, cfg, rounds=1, warmup=1)
 
 
 def test_l3_benchmark_tolerates_only_missing_strace(monkeypatch):
@@ -1890,9 +1895,9 @@ def test_l3_benchmark_tolerates_only_missing_strace(monkeypatch):
     fake_runtime = types.ModuleType("pypto.runtime")
     fake_runtime.benchmark = _benchmark
     monkeypatch.setattr("golden.runner._ordered_args", lambda *_a, **_k: [])
-    monkeypatch.setattr("golden.runner._l3_run_config", lambda _cfg: "RUNCFG")
+    cfg = _run_config()
     with patch.dict(sys.modules, {"pypto.runtime": fake_runtime}):
-        assert _run_benchmark_l3(object(), [], {}, {}, {}, rounds=1, warmup=1) is None
+        assert _run_benchmark_l3(object(), [], {}, {}, cfg, rounds=1, warmup=1) is None
 
 
 def test_l3_benchmark_rejects_stepped_scalar():
@@ -1906,7 +1911,7 @@ def test_l3_benchmark_rejects_stepped_scalar():
             specs=[epoch],
             tensors={},
             scalar_specs_eff={"epoch": epoch},
-            runtime_cfg={},
+            cfg=_run_config(),
             rounds=3,
             warmup=2,
         )
@@ -1920,7 +1925,7 @@ def test_l2_benchmark_rejects_stepped_scalar():
             specs=[epoch],
             tensors={},
             scalar_specs_eff={"epoch": epoch},
-            runtime_cfg={},
+            cfg=_run_config(),
             rounds=3,
             warmup=2,
         )
@@ -2093,11 +2098,11 @@ def _stub_l3_helpers(monkeypatch, pure_out=frozenset()):
     import golden.runner as R
 
     monkeypatch.setattr(R, "_l3_pure_out_names", lambda _c: set(pure_out))
-    monkeypatch.setattr(R, "_l3_run_config", lambda _cfg: "RUNCFG")
 
 
+_RESIDENT_CFG = _run_config(platform="a2a3")
 _RESIDENT_KWARGS = dict(
-    runtime_cfg={"platform": "a2a3"},
+    cfg=_RESIDENT_CFG,
     golden_outputs=None,
     rtol=1e-5,
     atol=1e-5,
@@ -2122,7 +2127,7 @@ class TestResidentPath:
         with (
             patch("pypto.ir.compile", return_value=_FakeCompiled(build_dir)),
             patch(
-                "pypto.runtime.execute_compiled",
+                "golden.runner._dispatch",
                 side_effect=lambda *a, **k: pytest.fail("single-chip path must not run for resident"),
             ),
             patch("golden.runner._run_l3_resident", return_value=None) as l3res,
@@ -2148,9 +2153,9 @@ class TestResidentPath:
 
         with (
             _l3_abi_environment(),
-            patch("golden.runner._maybe_reload_l3", return_value=compiled),
+            patch("golden.runner._reload_from_dir", return_value=compiled),
             patch("golden.runner._run_l3_resident", return_value=None) as l3res,
-            patch("pypto.runtime.execute_compiled") as execute,
+            patch("golden.runner._dispatch") as execute,
         ):
             result = run(fn=object(), specs=specs, runtime_dir=str(prebuilt))
 
@@ -2190,7 +2195,9 @@ class TestResidentPath:
             )
 
         assert result is None
-        assert prepared == [(("RUNCFG",), {"persistent": True, "reset_persistent_windows": False})]
+        assert prepared == [
+            ((_RESIDENT_CFG,), {"persistent": True, "reset_persistent_windows": False})
+        ]
         assert rt.kinds() == ["alloc_stacked", *["dispatch"] * 5, "free_stacked"]
         dispatched = rt.payloads("dispatch")
         assert [args[1].item() for args, _cfg in dispatched] == [0, 43, 86, 129, 172]
@@ -2218,7 +2225,7 @@ class TestResidentPath:
         ):
             _run_l3_resident(
                 compiled=dcp(), specs=[], tensors={}, scalar_specs_eff={},
-                runtime_cfg={}, golden_outputs=None, rtol=1e-5, atol=1e-5, compare_fn={},
+                cfg=_run_config(), golden_outputs=None, rtol=1e-5, atol=1e-5, compare_fn={},
             )
 
         assert len(rt.payloads("dispatch")) == 2
@@ -2297,7 +2304,7 @@ class TestResidentPath:
             _run_l3_resident(
                 compiled=dcp(), specs=specs, tensors={"kv": torch.zeros(2, 4)},
                 scalar_specs_eff={},
-                runtime_cfg={"platform": "a2a3"},
+                cfg=_RESIDENT_CFG,
                 golden_outputs={"kv": torch.full((2, 4), 7.0)},
                 rtol=1e-5, atol=1e-5, compare_fn={},
             )

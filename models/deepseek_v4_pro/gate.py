@@ -702,8 +702,8 @@ if __name__ == "__main__":
         fn=gate_test,
         specs=build_tensor_specs(layer_id=args.layer_id, num_tokens=args.num_tokens),
         golden_fn=golden_gate_core,
-        compile_cfg=dict(dump_passes=args.dump_passes),
-        runtime_cfg=dict(
+        config=dict(
+            dump_passes=args.dump_passes,
             platform=args.platform,
             device_id=args.device,
             enable_chip_swimlane=args.enable_chip_swimlane,

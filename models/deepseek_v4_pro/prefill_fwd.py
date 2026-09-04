@@ -1733,11 +1733,9 @@ def main():
         runtime_dir=args.runtime_dir,
         golden_data=args.golden_data,
         save_data=args.save_data,
-        compile_cfg=dict(
+        config=dict(
             dump_passes=args.dump_passes,
             distributed_config=DistributedConfig(device_ids=device_ids[:N_RANKS], num_sub_workers=0),
-        ),
-        runtime_cfg=dict(
             platform=args.platform,
             enable_chip_swimlane=args.enable_chip_swimlane,
             enable_scope_stats=args.enable_scope_stats,

@@ -407,10 +407,10 @@ if __name__ == "__main__":
         specs=build_tensor_specs(),
         golden_fn=golden_prefill_cp_zigzag_kv_tail_exchange,
         compile_only=args.compile_only,
-        compile_cfg=dict(
+        config=dict(
             distributed_config=DistributedConfig(device_ids=device_ids[:args.cp], num_sub_workers=0),
+            platform=args.platform,
         ),
-        runtime_cfg=dict(platform=args.platform),
         rtol=0.0,
         atol=0.0,
     )

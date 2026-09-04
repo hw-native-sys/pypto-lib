@@ -1155,14 +1155,12 @@ if __name__ == "__main__":
         save_data=args.save_data,
         compile_only=args.compile_only,
         runtime_dir=args.runtime_dir,
-        compile_cfg=dict(
+        config=dict(
             dump_passes=args.dump_passes,
             distributed_config=DistributedConfig(
                 device_ids=device_ids,
                 num_sub_workers=0,
             ),
-        ),
-        runtime_cfg=dict(
             platform=args.platform,
             enable_chip_swimlane=args.enable_chip_swimlane,
             log_level=args.log_level,

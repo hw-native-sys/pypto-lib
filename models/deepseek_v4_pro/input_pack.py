@@ -135,7 +135,10 @@ if __name__ == "__main__":
             specs=build_tensor_specs(token_count, test_vocab_size),
             golden_fn=golden_pack_x_hc,
             compile_only=args.compile_only,
-            runtime_cfg=dict(platform=args.platform, device_id=args.device),
+            config=dict(
+                platform=args.platform,
+                device_id=args.device,
+            ),
             rtol=0.0,
             atol=0.0,
         )

@@ -667,7 +667,7 @@ if __name__ == "__main__":
         golden_data=args.golden_data,
         save_data=args.save_data,
         compile_only=args.compile_only,
-        runtime_cfg=dict(
+        config=dict(
             platform=args.platform,
             device_id=args.device,
             enable_chip_swimlane=int(args.enable_l2_swimlane),

@@ -289,8 +289,8 @@ if __name__ == "__main__":
             fn=dspark_context_kv_test,
             specs=build_tensor_specs(batch, seq),
             golden_fn=golden_dspark_context_kv,
-            compile_cfg=dict(dump_passes=args.dump_passes),
-            runtime_cfg=dict(
+            config=dict(
+                dump_passes=args.dump_passes,
                 platform=args.platform,
                 device_id=args.device,
             ),

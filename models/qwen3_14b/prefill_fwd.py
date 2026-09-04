@@ -2269,7 +2269,7 @@ if __name__ == "__main__":
             chunk_size=args.chunk_size,
         ),
         golden_fn=None if args.no_golden else golden_qwen3_14b_prefill,
-        runtime_cfg=dict(
+        config=dict(
             platform=args.platform,
             device_id=args.device,
             enable_chip_swimlane=args.enable_chip_swimlane,

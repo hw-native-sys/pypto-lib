@@ -22,17 +22,17 @@ result = run(
     fn=qwen3_decode,                          # module-level @pl.jit function
     specs=build_tensor_specs(...),            # TensorSpec / ScalarSpec, in fn's param order
     golden_fn=golden_qwen3_decode,            # PyTorch reference
-    compile_cfg=dict(dump_passes=True),
-    runtime_cfg=dict(platform=args.platform, device_id=args.device,
-                     enable_chip_swimlane=args.enable_chip_swimlane),
+    config=dict(dump_passes=True, platform=args.platform,
+                device_id=args.device,
+                enable_chip_swimlane=args.enable_chip_swimlane),
     rtol=3e-3, atol=3e-3,
 )
 ```
 
 A kernel built as a `@pl.program` class passes that program as `fn=`
 instead. Both forms share tensor specs, golden computation, runtime dispatch,
-and validation; only the compile step and the accepted `compile_cfg` fields
-differ, see [Compile configuration](#compile-configuration).
+and validation, and both read the same `config`; only the compile step
+differs, see [Compile configuration](#compile-configuration).
 
 | Flag | Purpose |
 |------|---------|
@@ -82,10 +82,11 @@ each phase, so the console log is the authoritative trace of what ran:
 
 ### 1. Compile (pypto)
 
-Driven by the **pypto** repo. For a `@pl.program` kernel, `run` calls
-`pypto.ir.compile(program, backend_type=..., **compile_cfg)` directly. For a
-`@pl.jit` kernel it builds a `pypto.runtime.RunConfig` from `compile_cfg` and
-calls `fn.compile(..., config=...)`, which specializes the JIT function before
+Driven by the **pypto** repo. `run` normalizes `config` into one
+`pypto.runtime.RunConfig`. For a `@pl.program` kernel it calls
+`pypto.ir.compile(program, **config.compile_kwargs())`, the mapping PyPTO
+itself owns. For a `@pl.jit` kernel it calls `fn.compile(..., config=...)` and
+the JIT layer applies that same mapping, specializing the function before
 entering the same IR compiler. Both paths run a **pass pipeline** followed by
 a **codegen pipeline** and normally write
 `build_output/<ProgramName>_<timestamp>/`.
@@ -156,40 +157,26 @@ build_output/<ProgramName>_<ts>/
 
 #### Compile configuration
 
-For a **`@pl.program`** kernel, `compile_cfg` is forwarded to `ir.compile`.
-Common fields are:
+`config` is one dict of `pypto.runtime.RunConfig` keyword arguments — the same
+keys for both kernel forms, because both go through `RunConfig.compile_kwargs()`.
+The compile-side ones:
 
-| `compile_cfg` field | Purpose |
+| `config` field | Compiler mapping |
 |---|---|
-| `output_dir` | Override `build_output/<name>_<timestamp>/`. |
+| `platform` | Selects the target; `ir.compile` derives `backend_type` from it. |
+| `dump_passes` | Write pass IR under `passes_dump/`. Defaults to `False`. |
 | `strategy` | Select the optimization strategy. |
-| `dump_passes` | Write pass IR under `passes_dump/`; defaults to `True` on this direct compiler path. |
-| `skip_ptoas` | Stop after `.pto` generation without producing kernel C++ wrappers. |
-| `profiling` | Write compile-stage timing reports under `report/`. |
-| `verification_level`, `diagnostic_phase`, `disabled_diagnostics` | Configure compiler verification and diagnostics. |
-| `distributed_config`, `analyze_auto_scopes_for_deps`, `memory_planner` | Configure distributed lowering, AUTO-scope dependency analysis, and memory planning. |
+| `save_kernels_dir` | Maps to `ir.compile(output_dir=...)` — override `build_output/<name>_<timestamp>/`. |
+| `compile_profiling` | Maps to `ir.compile(profiling=...)` — compile-stage timing reports under `report/`. |
+| `dump_ptoas_passes` | Dump full-module IR after every ptoas pass. |
+| `diagnostic_phase`, `disabled_diagnostics` | Configure compiler diagnostics. |
+| `distributed_config`, `analyze_auto_scopes_for_deps`, `memory_planner` | Configure distributed lowering, AUTO-scope dependency analysis, and memory planning; forwarded only when set. |
 
-The harness derives `backend_type` and `platform` from
-`runtime_cfg["platform"]` unless the direct compile configuration already
-supplies them.
+An unknown key is `RunConfig`'s own `TypeError` naming it.
 
-For a **`@pl.jit`** kernel, `compile_cfg` must instead contain fields accepted
-by `pypto.runtime.RunConfig`. The JIT layer maps its compile-side fields into
-`ir.compile`:
-
-| `compile_cfg` field | Compiler mapping |
-|---|---|
-| `dump_passes` | Same pass dumps, but the `RunConfig` default is `False`. |
-| `save_kernels_dir` | Maps to `ir.compile(output_dir=...)`. |
-| `compile_profiling` | Maps to `ir.compile(profiling=...)`. |
-| `strategy`, `diagnostic_phase`, `disabled_diagnostics` | Forwarded to the corresponding compiler fields. |
-| `distributed_config`, `analyze_auto_scopes_for_deps`, `memory_planner` | Forwarded when set. |
-
-`output_dir`, `profiling`, `skip_ptoas`, and `verification_level` are not
-`RunConfig` field names, so a `compile_cfg` written for a `@pl.program` kernel
-cannot be copied unchanged onto a `@pl.jit` one. Unknown fields raise while
-constructing `RunConfig`; unknown direct-compiler fields raise in
-`ir.compile`.
+A few `ir.compile` parameters have no `RunConfig` field — `skip_ptoas`,
+`verification_level`, `emit_source_loc` — so `config` cannot carry them. They
+are reachable by calling `ir.compile` directly on a `@pl.program` kernel.
 
 To stop after compile without touching the device, see `compile_only` under
 [Skipping phases](#skipping-phases).
@@ -249,27 +236,25 @@ PYPTO_GOLDEN_NUM_THREADS=8 \
 
 ### 4. Runtime (simpler)
 
-Driven by the **simpler** repo. For a single-chip build, the
-harness orders the arguments according to `specs` and calls
-`pypto.runtime.execute_compiled`. For an L3
-`DistributedCompiledProgram`, it instead dispatches the compiled object with a
-`pypto.runtime.RunConfig`; resident-weight L3 programs use the prepared-worker
-path. Tensors are mutated in place, so outputs land in the same Python tensors
-after dispatch.
+Driven by the **simpler** repo. The harness orders the arguments according to
+`specs` and calls the compiled object with the `RunConfig` —
+`compiled(*args, config=...)`, one call shape for a single-chip
+`CompiledProgram` and an L3 `DistributedCompiledProgram` alike; resident-weight
+L3 programs use the prepared-worker path instead. A `runtime_dir` replay
+rebuilds that same handle from the build directory's metadata sidecar via
+`from_dir`. Tensors are mutated in place, so outputs land in the same Python
+tensors after dispatch.
 
-`runtime_cfg` is therefore not forwarded verbatim in every case:
-
-- `log_level` is consumed by the harness to configure PyPTO's runtime logger;
-- the five DFX fields below are bundled into the runtime's DFX options on the
-  single-chip path;
-- remaining single-chip fields are passed to `execute_compiled`, which rejects
-  unknown names;
-- L3 dispatch retains fields supported by `RunConfig`.
+The dispatch reads the same `RunConfig` the compile did — PyPTO takes the
+platform, device, ring sizes and `aicpu_thread_num` off `run_options()` and the
+five DFX toggles off `dfx_options()`. The one key the harness intercepts is
+`log_level`, which is not a `RunConfig` field: it configures PyPTO's runtime
+logger and never reaches the config.
 
 #### Runtime DFX flags
 
 PyPTO surfaces simpler's five runtime DFX (Design For X) sub-features as
-independent toggles on `runtime_cfg`. They share the same output
+independent toggles on `config`. They share the same output
 directory and can be enabled in any combination. CLI spellings are
 entry-specific; the table lists the common spelling when a script exposes it.
 

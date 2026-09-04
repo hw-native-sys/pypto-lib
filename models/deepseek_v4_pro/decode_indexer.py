@@ -1075,8 +1075,8 @@ if __name__ == "__main__":
         specs=build_tensor_specs(args.start_pos),
         golden_fn=golden_indexer,
         runtime_dir=args.runtime_dir,
-        compile_cfg=dict(dump_passes=args.dump_passes),
-        runtime_cfg=dict(
+        config=dict(
+            dump_passes=args.dump_passes,
             platform=args.platform,
             device_id=args.device,
             enable_chip_swimlane=args.enable_chip_swimlane,

@@ -44,9 +44,109 @@ def _install_pypto_stubs() -> None:
         Ascend910B = "Ascend910B"
         Ascend950 = "Ascend950"
 
-    class RunConfig:
+    # golden's run() drives both phases off one RunConfig, so the stub has to
+    # answer the same reads the real one does: the platform axes, the compile
+    # mapping and the DFX view. A bare kwargs bag would let every one of those
+    # fail as an AttributeError instead of as a real assertion.
+    _PLATFORM_BACKEND = {
+        "a2a3": BackendType.Ascend910B,
+        "a2a3sim": BackendType.Ascend910B,
+        "a5": BackendType.Ascend950,
+        "a5sim": BackendType.Ascend950,
+    }
+
+    # Mirrors pypto.runtime.RunConfig's field list, so the stub accepts and
+    # rejects exactly the keys the real constructor does.
+    _RUN_CONFIG_FIELDS = {
+        "device_id": 0,
+        "rtol": 1e-5,
+        "atol": 1e-5,
+        "strategy": None,
+        "dump_passes": False,
+        "save_kernels": False,
+        "save_kernels_dir": None,
+        "codegen_only": False,
+        "enable_chip_swimlane": 0,
+        "enable_dump_args": 0,
+        "enable_pmu": 0,
+        "enable_dep_gen": False,
+        "enable_scope_stats": False,
+        "compile_profiling": False,
+        "diagnostic_phase": None,
+        "disabled_diagnostics": None,
+        "golden_data_dir": None,
+        "aicpu_thread_num": None,
+        "ring_task_window": None,
+        "ring_heap": None,
+        "ring_dep_pool": None,
+        "distributed_config": None,
+        "analyze_auto_scopes_for_deps": False,
+        "memory_planner": None,
+        "dump_ptoas_passes": False,
+    }
+
+    class DfxOptions:
         def __init__(self, **kwargs):
-            self.kwargs = kwargs
+            for name in (
+                "enable_chip_swimlane",
+                "enable_dump_args",
+                "enable_pmu",
+                "enable_dep_gen",
+                "enable_scope_stats",
+            ):
+                setattr(self, name, kwargs.get(name, 0))
+
+    class RunConfig:
+        def __init__(self, platform="a2a3sim", **kwargs):
+            if platform not in _PLATFORM_BACKEND:
+                raise ValueError(
+                    f"Invalid platform {platform!r}. "
+                    f"Expected one of {sorted(_PLATFORM_BACKEND)}."
+                )
+            unknown = sorted(k for k in kwargs if k not in _RUN_CONFIG_FIELDS)
+            if unknown:
+                raise TypeError(
+                    "RunConfig.__init__() got an unexpected keyword argument "
+                    f"{unknown[0]!r}"
+                )
+            self.platform = platform
+            for name, default in _RUN_CONFIG_FIELDS.items():
+                setattr(self, name, kwargs.get(name, default))
+
+        @property
+        def backend_type(self):
+            return _PLATFORM_BACKEND[self.platform]
+
+        def compile_kwargs(self):
+            """The subset of fields the real RunConfig maps onto ir.compile."""
+            kwargs = {
+                "platform": self.platform,
+                "strategy": self.strategy,
+                "dump_passes": self.dump_passes,
+                "dump_ptoas_passes": self.dump_ptoas_passes,
+                "profiling": self.compile_profiling,
+                "diagnostic_phase": self.diagnostic_phase,
+                "disabled_diagnostics": self.disabled_diagnostics,
+                "analyze_auto_scopes_for_deps": self.analyze_auto_scopes_for_deps,
+            }
+            for name, target in (
+                ("save_kernels_dir", "output_dir"),
+                ("memory_planner", "memory_planner"),
+                ("distributed_config", "distributed_config"),
+            ):
+                value = getattr(self, name)
+                if value is not None:
+                    kwargs[target] = value
+            return kwargs
+
+        def dfx_options(self):
+            return DfxOptions(
+                enable_chip_swimlane=self.enable_chip_swimlane,
+                enable_dump_args=self.enable_dump_args,
+                enable_pmu=self.enable_pmu,
+                enable_dep_gen=self.enable_dep_gen,
+                enable_scope_stats=self.enable_scope_stats,
+            )
 
     class _TypeSpec:
         @classmethod
@@ -97,6 +197,7 @@ def _install_pypto_stubs() -> None:
     ir.compile = _unavailable
     runtime.execute_compiled = _unavailable
     runtime.RunConfig = RunConfig
+    runtime.DfxOptions = DfxOptions
     log_config.configure_log = lambda *_a, **_k: None
     replay.invalidate_binary_cache = lambda *_a, **_k: None
     pto_rebuild.rebuild_kernel_cpp_from_pto = lambda *_a, **_k: []

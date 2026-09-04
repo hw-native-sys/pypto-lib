@@ -360,7 +360,7 @@ if __name__ == "__main__":
         fn=topk_select_fwd,
         specs=build_tensor_specs(args.selection_k),
         golden_fn=golden_topk_select,
-        runtime_cfg=dict(
+        config=dict(
             platform=args.platform,
             device_id=args.device,
             enable_chip_swimlane=args.enable_chip_swimlane,

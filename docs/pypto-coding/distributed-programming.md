@@ -336,7 +336,7 @@ behaviour on the target before building on it.
 
 ## 7. Running and validating
 
-The harness compiles an L3 program when `compile_cfg` carries a
+The harness compiles an L3 program when `config` carries a
 `DistributedConfig`:
 
 ```python
@@ -346,10 +346,10 @@ result = run(
     fn=l3_moe,                                  # the @pl.jit.host driver
     specs=build_tensor_specs(),
     golden_fn=golden_moe,
-    compile_cfg=dict(
+    config=dict(
+        platform=args.platform,
         distributed_config=DistributedConfig(device_ids=device_ids),
     ),
-    runtime_cfg=dict(platform=args.platform),
 )
 ```
 

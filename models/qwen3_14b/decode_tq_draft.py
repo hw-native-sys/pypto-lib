@@ -1288,7 +1288,7 @@ if __name__ == "__main__":
             num_layers=args.num_layers,
         ),
         golden_fn=golden_decode_fwd_tq,
-        runtime_cfg=dict(
+        config=dict(
             platform=args.platform,
             device_id=args.device,
             enable_chip_swimlane=args.enable_chip_swimlane,

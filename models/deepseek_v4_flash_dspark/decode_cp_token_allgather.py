@@ -317,11 +317,11 @@ if __name__ == "__main__":
         golden_fn=golden_decode_cp_token_allgather,
         compile_only=args.compile_only,
         runtime_dir=args.runtime_dir,
-        compile_cfg=dict(
+        config=dict(
             dump_passes=args.dump_passes,
             distributed_config=DistributedConfig(device_ids=device_ids, num_sub_workers=0),
+            platform=args.platform,
         ),
-        runtime_cfg=dict(platform=args.platform),
         rtol=0.0,
         atol=0.0,
     )

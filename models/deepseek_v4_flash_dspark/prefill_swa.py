@@ -1066,8 +1066,8 @@ if __name__ == "__main__":
             fn=prefill_attention_swa_test,
             specs=build_tensor_specs(args.start_pos, args.token_count),
             golden_fn=golden_prefill_attention_swa,
-            compile_cfg=dict(dump_passes=args.dump_passes),
-            runtime_cfg=dict(
+            config=dict(
+                dump_passes=args.dump_passes,
                 platform=args.platform,
                 device_id=device_ids[0],
                 enable_chip_swimlane=args.enable_chip_swimlane,
@@ -1093,11 +1093,11 @@ if __name__ == "__main__":
             fn=l3_prefill_attention_swa_cp,
             specs=specs,
             golden_fn=golden_prefill_attention_swa_cp,
-            compile_cfg=dict(
+            config=dict(
                 dump_passes=args.dump_passes,
                 distributed_config=DistributedConfig(device_ids=device_ids, num_sub_workers=0),
+                platform=args.platform,
             ),
-            runtime_cfg=dict(platform=args.platform),
             compile_only=args.compile_only,
             rtol=1e-2,
             atol=1e-2,

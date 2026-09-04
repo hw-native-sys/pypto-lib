@@ -81,7 +81,7 @@ if __name__ == "__main__":
         fn=topk,
         specs=build_tensor_specs(),
         golden_fn=golden_topk,
-        runtime_cfg=dict(
+        config=dict(
             platform=args.platform,
             device_id=args.device,
             enable_chip_swimlane=args.enable_chip_swimlane,

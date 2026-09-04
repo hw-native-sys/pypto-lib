@@ -67,8 +67,8 @@ reject them, because those paths repeat one argument list per launch instead
 of providing the persistent-window contract. A
 stepped scalar on a `@pl.jit` kernel must also use `compile_runtime=True`;
 otherwise the compiler is allowed to fold the initial value into the artifact.
-Stepped scalars cannot be combined with `runtime_cfg={"enable_chip_swimlane":
-True}` (nor its pre-rename spelling `enable_l2_swimlane`): that mode may
+Stepped scalars cannot be combined with `config={"enable_chip_swimlane":
+True}`: that mode may
 execute multiple physical passes for one handle call while reusing the same
 argument list, so the harness rejects the combination.
 `compile_runtime` affects fresh compilation only: passing `runtime_dir` does not
@@ -106,7 +106,7 @@ result = run(
     fn=hello_world,
     specs=build_specs(),
     golden_fn=golden_hello_world,
-    runtime_cfg={
+    config={
         "platform": args.platform,
         "device_id": args.device,
     },
@@ -122,7 +122,7 @@ result = run(
     fn=build_program(),
     specs=build_specs(),
     golden_fn=golden_fn,
-    runtime_cfg={
+    config={
         "platform": args.platform,
         "device_id": args.device,
     },
@@ -130,9 +130,22 @@ result = run(
 ```
 
 `run` picks the compile path from the kernel it is handed, then performs the
-same input, golden, runtime, and validation stages either way. The detailed
-sequence and configuration groups are documented in
+same input, golden, runtime, and validation stages either way.
+
+`config` is one dict of `pypto.runtime.RunConfig` keyword
+arguments and carries **both** phases: PyPTO reads the compile half off it
+(`compile_kwargs()`) and the dispatch half off it (`run_options()` /
+`dfx_options()`), so nothing is restated per phase and no key has to be filed
+under a phase by the caller. Write `platform`, `device_id`,
+`enable_chip_swimlane`, `dump_passes`, `distributed_config`, the `ring_*`
+overrides and the rest side by side. An unknown key is `RunConfig`'s own
+`TypeError` naming it; the one key that is not a `RunConfig` field is the
+harness's `log_level`. A ready `RunConfig` is accepted in place of the dict
+when a caller wants to build it once and reuse or `dataclasses.replace` it.
+
+The detailed sequence and the per-phase field tables are documented in
 [Compile and Runtime Workflow](compile-runtime-workflow.md).
+
 
 ## Validation
 

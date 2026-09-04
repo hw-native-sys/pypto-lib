@@ -115,7 +115,7 @@ assert SPARSE_ORI_MAX_BLOCKS <= BLOCK_NUM
 # ring; measured on a5, every ring at 512 MiB is already enough for all three prefill
 # attention variants, so 1 GiB is one doubling of headroom over the measured need.
 # All four rings, not just ring 2: ring 2 alone (what prefill_fwd.py sets) does not
-# clear it. Applied through run's runtime_cfg, which reaches the device only on
+# clear it. Applied through run's config, which reaches the device only on
 # the ChipWorker route -- see golden/runner.py::_execute_via_runner.
 PREFILL_ATTN_RING_HEAP = (1024 * 1024 * 1024,) * 4
 
@@ -690,7 +690,6 @@ if __name__ == "__main__":
     args = parser.parse_args()
     compare_tokens = args.num_tokens
 
-    from pypto.runtime import RunConfig
 
     result = run(
         fn=prefill_attention_swa_test,
@@ -699,15 +698,13 @@ if __name__ == "__main__":
             args.num_tokens,
         ),
         golden_fn=golden_prefill_attention_swa,
-        compile_cfg=dict(dump_passes=args.dump_passes),
-        runtime_cfg=dict(
+        config=dict(
+            dump_passes=args.dump_passes,
             platform=args.platform,
             device_id=args.device,
             enable_chip_swimlane=args.enable_chip_swimlane,
             enable_dep_gen=args.enable_dep_gen,
-            # Ring sizing lives on execute_compiled's `config`, not on its
-            # signature, so name it here rather than as a bare keyword.
-            config=RunConfig(ring_heap=PREFILL_ATTN_RING_HEAP),
+            ring_heap=PREFILL_ATTN_RING_HEAP,
         ),
         compile_only=args.compile_only,
         rtol=1e-2,

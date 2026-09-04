@@ -1403,9 +1403,11 @@ if __name__ == "__main__":
         fn=prefill_indexer_test,
         specs=build_tensor_specs(args.start_pos, args.token_count),
         golden_fn=golden_prefill_indexer,
-        compile_cfg=dict(dump_passes=args.dump_passes),
-        runtime_cfg=dict(
-            platform=args.platform, device_id=args.device, enable_chip_swimlane=args.enable_chip_swimlane
+        config=dict(
+            dump_passes=args.dump_passes,
+            platform=args.platform,
+            device_id=args.device,
+            enable_chip_swimlane=args.enable_chip_swimlane,
         ),
         rtol=1e-3,
         atol=1e-3,

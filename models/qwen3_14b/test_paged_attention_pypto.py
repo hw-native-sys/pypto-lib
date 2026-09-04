@@ -832,8 +832,11 @@ def _run_case(case: DynamicCase, args: argparse.Namespace) -> dict[str, object]:
         fn=paged_attention_pypto_dynamic,
         specs=build_specs(case, fixture),
         golden_fn=None if fixture is None else lambda values: golden_attention(values, case),
-        compile_cfg={"dump_passes": True},
-        runtime_cfg={"platform": args.platform, "device_id": args.device},
+        config=dict(
+            dump_passes=True,
+            platform=args.platform,
+            device_id=args.device,
+        ),
         compile_only=compile_only,
         rtol=5.0e-3,
         atol=2.0e-2,

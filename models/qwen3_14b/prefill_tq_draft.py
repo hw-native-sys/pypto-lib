@@ -1354,7 +1354,7 @@ if __name__ == "__main__":
             use_max_seq=args.max_seq,
         ),
         golden_fn=golden_qwen3_14b_prefill_tq,
-        runtime_cfg=dict(
+        config=dict(
             platform=args.platform,
             device_id=args.device,
             enable_chip_swimlane=args.enable_chip_swimlane,

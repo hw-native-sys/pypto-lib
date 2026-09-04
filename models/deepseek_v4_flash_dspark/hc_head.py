@@ -360,10 +360,8 @@ if __name__ == "__main__":
         fn=hc_head_test,
         specs=build_tensor_specs(args.token_count),
         golden_fn=golden_hc_head,
-        compile_cfg=dict(
+        config=dict(
             dump_passes=args.dump_passes,
-        ),
-        runtime_cfg=dict(
             platform=args.platform,
             device_id=args.device,
             enable_chip_swimlane=args.enable_chip_swimlane,

@@ -38,7 +38,7 @@ result = run(
     golden_fn=golden_fn,
     golden_data=args.golden_data,
     save_data=args.save_data,
-    runtime_cfg=runtime_cfg,
+    config=config,
 )
 ```
 

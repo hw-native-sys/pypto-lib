@@ -23,7 +23,7 @@ result = run(
     specs=build_tensor_specs(...),
     golden_fn=golden_indexer,
     runtime_dir=args.runtime_dir,                     # reuse a compile (§3)
-    runtime_cfg=dict(
+    config=dict(
         platform=args.platform, device_id=args.device,
         log_level="v5",                               # runtime log level; raise to v0 for hangs (§4)
         enable_dump_args=args.dump_args,              # argument dump (§5)
@@ -43,17 +43,18 @@ location. Most compile failures are fixed at the cited site without any
 further tooling; read the message before reaching for the heavier
 mechanisms below.
 
-- **Compile failure** — a `@pl.jit` kernel compiles through a `RunConfig`,
-  whose default is `dump_passes=False`; pass `compile_cfg=dict(dump_passes=True)`
-  to write per-pass IR under `build_output/<...>/passes_dump/`. A `@pl.program`
-  kernel goes through `ir.compile`, whose default `dump_passes=True` writes
-  those files already. Diff the last clean pass against the first failing one to
-  see which pass rejected the IR. `report/` holds scheduling diagnostics.
-- **PTOAS failure** — the error quotes the `.pto` op.
-  `compile_cfg=dict(skip_ptoas=True)` keeps the raw `.pto` MLIR and stops
-  before the C++ wrapper, isolating whether the regression is in PyPTO's
-  IR-to-MLIR path or in PTOAS. It is an `ir.compile` kwarg, not a `RunConfig`
-  field, so it works on a `@pl.program` kernel only.
+- **Compile failure** — both kernel forms compile through the harness's
+  `RunConfig`, whose default is `dump_passes=False`; pass
+  `config=dict(dump_passes=True)` to write per-pass IR under
+  `build_output/<...>/passes_dump/`. Diff the last clean pass against the first
+  failing one to see which pass rejected the IR. `report/` holds scheduling
+  diagnostics.
+- **PTOAS failure** — the error quotes the `.pto` op. `ir.compile`'s
+  `skip_ptoas=True` keeps the raw `.pto` MLIR and stops before the C++ wrapper,
+  isolating whether the regression is in PyPTO's IR-to-MLIR path or in PTOAS.
+  It is not a `RunConfig` field, so `run`'s `config` does not carry it — reach
+  it by calling `ir.compile(program, skip_ptoas=True, ...)` on a `@pl.program`
+  kernel directly.
 - **Runtime crash** — rerun on the matching simulator (`-p a2a3sim` /
   `a5sim`); it gives more diagnostic output than the device backend and
   reproduces most lowering bugs.
@@ -126,14 +127,15 @@ rather than raising a clean error, the Python side has nothing to show — the
 stall is on the device. Raise the runtime log verbosity and read the device
 log:
 
-1. Set `log_level` in `runtime_cfg`:
+1. Set `log_level` in `config`:
 
    ```python
-   runtime_cfg=dict(platform=..., device_id=..., log_level="v0")
+   config=dict(platform=..., device_id=..., log_level="v0")
    ```
 
-   `log_level` is a harness-only key — it is consumed up front
-   (`configure_log`) and not forwarded to the runtime call. Accepted values:
+   `log_level` is the one harness-only key — it is not a `RunConfig` field, so
+   it is consumed up front (`configure_log`) rather than reaching the
+   `RunConfig`. Accepted values:
    `debug`, `v0`..`v9`, `info`, `warn`, `error`, `null`. The runtime default
    is `v5` (= INFO); lower is more verbose, so `v0` (or `debug`) raises the
    detail above the default to surface the most runtime tracing.
@@ -166,7 +168,7 @@ serially before deep-diving.
 inputs/outputs and scalar inputs captured at kernel-task boundaries. Use it to
 turn a "the whole kernel is wrong" mismatch into "this one op is wrong".
 
-**Dump levels** (`runtime_cfg["enable_dump_args"]`): `0` off · `1` partial —
+**Dump levels** (`config["enable_dump_args"]`): `0` off · `1` partial —
 only tensor arguments you mark · `2` full — every task's tensor payloads and
 scalar values (heavy; can saturate the host collector / trip AICPU timeouts on
 large workloads) · `3` full metadata only — every task's tensor/scalar
@@ -182,7 +184,7 @@ pl.dump_tag(h_tile_i8)          # capture this one tensor under partial dump
 ```
 
 ```python
-run(..., runtime_cfg=dict(platform=..., enable_dump_args=1))
+run(..., config=dict(platform=..., enable_dump_args=1))
 ```
 
 `pl.dump_tag` works on plain function args and on internal
@@ -239,9 +241,9 @@ round-trip, which drops the read-dep and lets the downstream task race).
 
 | Symptom | Tool | Kwarg / flag |
 |---------|------|--------------|
-| Compile / PTOAS error | `passes_dump/`; `skip_ptoas` on a `@pl.program` kernel only | `compile_cfg=dict(dump_passes=True)`; `compile_cfg=dict(skip_ptoas=True)` |
+| Compile / PTOAS error | `passes_dump/`; `skip_ptoas` via `ir.compile` directly | `config=dict(dump_passes=True)` |
 | Need to reproduce on the same inputs | golden-data replay (§2) | `golden_data=` / `--golden-data` |
 | Iterating on generated `.cpp` / `.pto` | runtime-dir reuse (§3) | `runtime_dir=` / `--runtime-dir` |
-| Run hangs / deadlocks (§4) | device log | `runtime_cfg["log_level"]="v0"` + `ASCEND_PROCESS_LOG_PATH` |
+| Run hangs / deadlocks (§4) | device log | `config["log_level"]="v0"` + `ASCEND_PROCESS_LOG_PATH` |
 | Precision mismatch, unknown stage (§5) | args dump | `enable_dump_args=` / `--dump-args [LEVEL]` |
 | Non-deterministic / raced result (§6) | dependency graph | `enable_dep_gen=` / `--enable-dep-gen` |

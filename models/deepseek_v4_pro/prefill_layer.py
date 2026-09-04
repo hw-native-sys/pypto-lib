@@ -1718,14 +1718,12 @@ if __name__ == "__main__":
         golden_data=args.golden_data,
         save_data=args.save_data,
         compile_only=args.compile_only,
-        compile_cfg=dict(
+        config=dict(
             dump_passes=args.dump_passes,
             distributed_config=DistributedConfig(
                 device_ids=device_ids[:N_RANKS],
                 num_sub_workers=0,
             ),
-        ),
-        runtime_cfg=dict(
             platform=args.platform,
             enable_chip_swimlane=args.enable_chip_swimlane,
             ring_heap=LAYER_RING_HEAP,

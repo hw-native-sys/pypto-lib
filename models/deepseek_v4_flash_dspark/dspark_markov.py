@@ -972,8 +972,7 @@ if __name__ == "__main__":
 
     assert args.tp == TP_SIZE
     assert args.dp * args.tp == WORLD_SIZE
-    compile_cfg = dict(dump_passes=args.dump_passes)
-    runtime_cfg = dict(platform=args.platform)
+    config = dict(dump_passes=args.dump_passes, platform=args.platform)
     fn = markov_sample
     golden_fn = golden_nonzero_markov
     if args.distributed:
@@ -981,19 +980,18 @@ if __name__ == "__main__":
         assert len(device_ids) >= WORLD_SIZE
         fn = l3_distributed_markov_sample
         golden_fn = golden_distributed_markov
-        compile_cfg["distributed_config"] = DistributedConfig(
+        config["distributed_config"] = DistributedConfig(
             device_ids=device_ids[:WORLD_SIZE],
             num_sub_workers=0,
         )
     else:
-        runtime_cfg["device_id"] = int(args.device)
+        config["device_id"] = int(args.device)
 
     result = run(
         fn=fn,
         specs=build_tensor_specs(args.batch, distributed=args.distributed),
         golden_fn=golden_fn,
-        compile_cfg=compile_cfg,
-        runtime_cfg=runtime_cfg,
+        config=config,
         rtol=2e-3,
         atol=2e-3,
         compile_only=args.compile_only,
