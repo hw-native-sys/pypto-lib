@@ -97,6 +97,7 @@ from moe import (
     TOPK,
     VOCAB,
     build_tensor_specs as build_moe_tensor_specs,
+    decode_route_rows,
     clear_moe_signals,
     golden_moe,
     moe,
@@ -863,6 +864,15 @@ def build_tensor_specs(start_pos=DECODE_START_POS, layer_id=10):
                 base = torch.arange(VOCAB, dtype=torch.int32).reshape(VOCAB, 1) * TOPK
                 offs = torch.arange(TOPK, dtype=torch.int32).reshape(1, TOPK)
                 table = (base + offs) % N_EXPERTS
+                # Rows 0..T-1 are the only ones input_ids reads, and the packed
+                # arange above routes them to T * TOPK DISTINCT experts -- the
+                # maximum a step can activate. That is the single worst value for
+                # the MoE balancer, which splits (activated + 1) work items over
+                # NUM_CORES: at the maximum one core takes a third round while the
+                # rest take two. Real routing collides far below it. Redraw those
+                # rows from a fixed seed so the fixture is both reproducible and
+                # off that cliff.
+                table[:T] = decode_route_rows()
                 return table.unsqueeze(0).expand(N_RANKS, -1, -1).contiguous()
 
             specs.append(TensorSpec("tid2eid", spec.shape, spec.dtype, init_value=init_tid2eid))

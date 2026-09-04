@@ -550,6 +550,34 @@ def golden_moe(tensors):
     tensors["x_next"][:] = x_next_r.unsqueeze(0).expand(N_RANKS, -1, -1, -1)
 
 
+# Seed for the decode routing draw used by the layer / full-forward fixtures.
+# Changing it changes how many experts a step activates, and so MoE wall time --
+# read .claude/rules/benchmarking.md before touching it, and re-freeze every
+# benchmark dataset if you do.
+MOE_ROUTE_SEED = 20260904
+
+
+def decode_route_rows():
+    """The T routed rows of `tid2eid`, drawn so a step stays off the balancer cliff.
+
+    TOPK distinct experts per token, tokens drawn independently, so experts
+    collide across tokens exactly as they do in a real step. A draw that happens
+    to hit the maximum activation count (T * TOPK distinct) is rejected: the
+    balancer splits (activated + 1) work items over its core count, and the
+    maximum is the one value that costs a core an extra round.
+    """
+    import torch
+
+    gen = torch.Generator().manual_seed(MOE_ROUTE_SEED)
+    for _ in range(64):
+        rows = torch.stack(
+            [torch.randperm(N_EXPERTS, generator=gen)[:TOPK] for _ in range(T)])
+        if int(rows.unique().numel()) < T * TOPK:
+            return rows.to(torch.int32)
+    raise RuntimeError(
+        f"no routing draw below {T * TOPK} activated experts from seed {MOE_ROUTE_SEED}")
+
+
 def build_tensor_specs(layer_id=0, num_tokens=T):
     import torch
     from golden import ScalarSpec, TensorSpec
