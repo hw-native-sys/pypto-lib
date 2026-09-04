@@ -30,7 +30,7 @@ import argparse
 
 import pypto.language as pl
 import pypto.language.distributed as pld
-from pypto.ir.distributed_compiled_program import DistributedConfig
+from pypto.ir import DistributedConfig
 
 from config import ACTIVE as M, DECODE_START_POS
 from decode_attention_csa import COMPRESS_RATIO as CSA_COMPRESS_RATIO

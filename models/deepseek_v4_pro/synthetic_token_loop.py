@@ -677,7 +677,7 @@ def _unique_storage_tensors(tensors):
 
 def _run_session(args, prefill_dir, decode_dir, model_dir):
     from pypto.backend import BackendType
-    from pypto.ir.distributed_compiled_program import (
+    from pypto.ir import (
         DistributedCompiledProgram,
         DistributedConfig,
     )
@@ -804,14 +804,12 @@ def _run_session(args, prefill_dir, decode_dir, model_dir):
         prefill_config = RunConfig(
             platform=args.platform,
             device_id=0,
-            backend_type=BackendType.Ascend950,
             ring_heap=PREFILL_RING_HEAP,
             **swimlane_config,
         )
         decode_config = RunConfig(
             platform=args.platform,
             device_id=0,
-            backend_type=BackendType.Ascend950,
             **swimlane_config,
         )
 

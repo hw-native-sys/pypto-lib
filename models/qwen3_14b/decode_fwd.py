@@ -2091,7 +2091,6 @@ if __name__ == "__main__":
     run_cfg = RunConfig(
         platform=args.platform,
         device_id=args.device,
-        backend_type=_backend_type(args.platform),
         enable_chip_swimlane=args.enable_chip_swimlane,
         enable_dep_gen=args.enable_dep_gen,
         save_kernels=args.dep_output_dir is not None,

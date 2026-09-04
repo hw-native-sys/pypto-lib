@@ -25,7 +25,7 @@ from lm_head import (
     VOCAB_PER_TP,
     lm_head_with_sampling,
 )
-from pypto.ir.distributed_compiled_program import DistributedConfig
+from pypto.ir import DistributedConfig
 from rmsnorm import rms_norm
 
 # decode_fwd is self-contained: it imports kernels, constants, and per-kind

@@ -401,7 +401,7 @@ if __name__ == "__main__":
     # DEFAULT backend and collide with the set_backend_type above.
     compiled = rope_qkv_regen.compile(
         *_dummy_inputs(args.batch),
-        config=RunConfig(platform=args.platform, backend_type=_backend_type(args.platform)),
+        config=RunConfig(platform=args.platform),
     )
     post_pass = compiled.program
     print(f"Compiled program has {len(post_pass.functions)} function(s):")
