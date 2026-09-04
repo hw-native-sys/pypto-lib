@@ -260,6 +260,10 @@ def decode_fwd(
     freqs_sin_local: pl.Tensor[[T_DYN, ROPE_HEAD_DIM], pl.BF16],
     freqs_cos: pl.Tensor[[KV_T_DYN, ROPE_HEAD_DIM], pl.BF16],
     freqs_sin: pl.Tensor[[KV_T_DYN, ROPE_HEAD_DIM], pl.BF16],
+    compressed_freqs_cos_local: pl.Tensor[[T_DYN, ROPE_HEAD_DIM], pl.BF16],
+    compressed_freqs_sin_local: pl.Tensor[[T_DYN, ROPE_HEAD_DIM], pl.BF16],
+    compressed_freqs_cos: pl.Tensor[[KV_T_DYN, ROPE_HEAD_DIM], pl.BF16],
+    compressed_freqs_sin: pl.Tensor[[KV_T_DYN, ROPE_HEAD_DIM], pl.BF16],
     swa_slot_mapping: pl.Tensor[[KV_T_DYN], pl.INT64],
     swa_indices: pl.Tensor[[T_DYN, WIN], pl.INT32],
     swa_lens: pl.Tensor[[T_DYN], pl.INT32],
@@ -383,6 +387,10 @@ def decode_fwd(
     freqs_sin_local.bind_dynamic(0, T_DYN)
     freqs_cos.bind_dynamic(0, KV_T_DYN)
     freqs_sin.bind_dynamic(0, KV_T_DYN)
+    compressed_freqs_cos_local.bind_dynamic(0, T_DYN)
+    compressed_freqs_sin_local.bind_dynamic(0, T_DYN)
+    compressed_freqs_cos.bind_dynamic(0, KV_T_DYN)
+    compressed_freqs_sin.bind_dynamic(0, KV_T_DYN)
     swa_slot_mapping.bind_dynamic(0, KV_T_DYN)
     swa_indices.bind_dynamic(0, T_DYN)
     swa_lens.bind_dynamic(0, T_DYN)
@@ -689,7 +697,8 @@ def decode_fwd(
                         hc_attn_fn_layer_csa, hc_attn_scale_layer_csa, hc_attn_base_layer_csa,
                         attn_norm_w_layer_csa, wq_a_layer_csa, wq_b_layer_csa, wq_b_scale_layer_csa,
                         wkv_layer_csa, gamma_cq_layer_csa, gamma_ckv_layer_csa,
-                        freqs_cos_local, freqs_sin_local, csa_cmp_freqs_cos, csa_cmp_freqs_sin,
+                        compressed_freqs_cos_local, compressed_freqs_sin_local,
+                        csa_cmp_freqs_cos, csa_cmp_freqs_sin,
                         csa_cmp_wkv_layer_csa, csa_cmp_wgate_layer_csa,
                         csa_cmp_ape_layer_csa, csa_cmp_norm_w_layer_csa,
                         csa_state_layer_csa, csa_compress_state_block_table,
@@ -713,7 +722,9 @@ def decode_fwd(
                         hc_attn_fn_layer_csa, hc_attn_scale_layer_csa, hc_attn_base_layer_csa,
                         attn_norm_w_layer_csa, wq_a_layer_csa, wq_b_layer_csa, wq_b_scale_layer_csa,
                         wkv_layer_csa, gamma_cq_layer_csa, gamma_ckv_layer_csa,
-                        freqs_cos_local, freqs_sin_local, freqs_cos, freqs_sin, csa_cmp_freqs_cos, csa_cmp_freqs_sin,
+                        compressed_freqs_cos_local, compressed_freqs_sin_local,
+                        compressed_freqs_cos, compressed_freqs_sin,
+                        csa_cmp_freqs_cos, csa_cmp_freqs_sin,
                         csa_cmp_wkv_layer_csa, csa_cmp_wgate_layer_csa,
                         csa_cmp_ape_layer_csa, csa_cmp_norm_w_layer_csa,
                         csa_state_layer_csa, csa_compress_state_block_table,
@@ -815,7 +826,8 @@ def decode_fwd(
                         hc_attn_fn_layer_hca, hc_attn_scale_layer_hca, hc_attn_base_layer_hca,
                         attn_norm_w_layer_hca, wq_a_layer_hca, wq_b_layer_hca, wq_b_scale_layer_hca,
                         wkv_layer_hca, gamma_cq_layer_hca, gamma_ckv_layer_hca,
-                        freqs_cos_local, freqs_sin_local, hca_cmp_freqs_cos, hca_cmp_freqs_sin,
+                        compressed_freqs_cos_local, compressed_freqs_sin_local,
+                        hca_cmp_freqs_cos, hca_cmp_freqs_sin,
                         hca_cmp_wkv_layer_hca, hca_cmp_wgate_layer_hca,
                         hca_cmp_ape_layer_hca, hca_cmp_norm_w_layer_hca,
                         hca_state_layer_hca, hca_compress_state_block_table,
@@ -832,7 +844,9 @@ def decode_fwd(
                         hc_attn_fn_layer_hca, hc_attn_scale_layer_hca, hc_attn_base_layer_hca,
                         attn_norm_w_layer_hca, wq_a_layer_hca, wq_b_layer_hca, wq_b_scale_layer_hca,
                         wkv_layer_hca, gamma_cq_layer_hca, gamma_ckv_layer_hca,
-                        freqs_cos_local, freqs_sin_local, freqs_cos, freqs_sin, hca_cmp_freqs_cos, hca_cmp_freqs_sin,
+                        compressed_freqs_cos_local, compressed_freqs_sin_local,
+                        compressed_freqs_cos, compressed_freqs_sin,
+                        hca_cmp_freqs_cos, hca_cmp_freqs_sin,
                         hca_cmp_wkv_layer_hca, hca_cmp_wgate_layer_hca,
                         hca_cmp_ape_layer_hca, hca_cmp_norm_w_layer_hca,
                         hca_state_layer_hca, hca_compress_state_block_table,
@@ -942,7 +956,8 @@ def decode_fwd(
                     hc_attn_fn_layer_last, hc_attn_scale_layer_last, hc_attn_base_layer_last,
                     attn_norm_w_layer_last, wq_a_layer_last, wq_b_layer_last, wq_b_scale_layer_last,
                     wkv_layer_last, gamma_cq_layer_last, gamma_ckv_layer_last,
-                    freqs_cos_local, freqs_sin_local, csa_cmp_freqs_cos, csa_cmp_freqs_sin,
+                    compressed_freqs_cos_local, compressed_freqs_sin_local,
+                    csa_cmp_freqs_cos, csa_cmp_freqs_sin,
                     csa_cmp_wkv_layer_last, csa_cmp_wgate_layer_last,
                     csa_cmp_ape_layer_last, csa_cmp_norm_w_layer_last,
                     csa_state_layer_last, csa_compress_state_block_table,
@@ -966,7 +981,9 @@ def decode_fwd(
                     hc_attn_fn_layer_last, hc_attn_scale_layer_last, hc_attn_base_layer_last,
                     attn_norm_w_layer_last, wq_a_layer_last, wq_b_layer_last, wq_b_scale_layer_last,
                     wkv_layer_last, gamma_cq_layer_last, gamma_ckv_layer_last,
-                    freqs_cos_local, freqs_sin_local, freqs_cos, freqs_sin, csa_cmp_freqs_cos, csa_cmp_freqs_sin,
+                    compressed_freqs_cos_local, compressed_freqs_sin_local,
+                    compressed_freqs_cos, compressed_freqs_sin,
+                    csa_cmp_freqs_cos, csa_cmp_freqs_sin,
                     csa_cmp_wkv_layer_last, csa_cmp_wgate_layer_last,
                     csa_cmp_ape_layer_last, csa_cmp_norm_w_layer_last,
                     csa_state_layer_last, csa_compress_state_block_table,
@@ -1061,6 +1078,10 @@ def l3_decode_fwd(
     freqs_sin_local: pl.Tensor[[N_RANKS, T_DYN, ROPE_HEAD_DIM], pl.BF16],
     freqs_cos: pl.Tensor[[N_RANKS, KV_T_DYN, ROPE_HEAD_DIM], pl.BF16],
     freqs_sin: pl.Tensor[[N_RANKS, KV_T_DYN, ROPE_HEAD_DIM], pl.BF16],
+    compressed_freqs_cos_local: pl.Tensor[[N_RANKS, T_DYN, ROPE_HEAD_DIM], pl.BF16],
+    compressed_freqs_sin_local: pl.Tensor[[N_RANKS, T_DYN, ROPE_HEAD_DIM], pl.BF16],
+    compressed_freqs_cos: pl.Tensor[[N_RANKS, KV_T_DYN, ROPE_HEAD_DIM], pl.BF16],
+    compressed_freqs_sin: pl.Tensor[[N_RANKS, KV_T_DYN, ROPE_HEAD_DIM], pl.BF16],
     swa_slot_mapping: pl.Tensor[[N_RANKS, KV_T_DYN], pl.INT64],
     swa_indices: pl.Tensor[[N_RANKS, T_DYN, WIN], pl.INT32],
     swa_lens: pl.Tensor[[N_RANKS, T_DYN], pl.INT32],
@@ -1163,6 +1184,10 @@ def l3_decode_fwd(
     freqs_sin_local.bind_dynamic(1, T_DYN)
     freqs_cos.bind_dynamic(1, KV_T_DYN)
     freqs_sin.bind_dynamic(1, KV_T_DYN)
+    compressed_freqs_cos_local.bind_dynamic(1, T_DYN)
+    compressed_freqs_sin_local.bind_dynamic(1, T_DYN)
+    compressed_freqs_cos.bind_dynamic(1, KV_T_DYN)
+    compressed_freqs_sin.bind_dynamic(1, KV_T_DYN)
     swa_slot_mapping.bind_dynamic(1, KV_T_DYN)
     swa_indices.bind_dynamic(1, T_DYN)
     swa_lens.bind_dynamic(1, T_DYN)
@@ -1250,6 +1275,8 @@ def l3_decode_fwd(
             wq_b_scale[rank], wkv[rank], gamma_cq[rank], gamma_ckv[rank],
             raw_kv_pool[rank], freqs_cos_local[rank], freqs_sin_local[rank],
             freqs_cos[rank], freqs_sin[rank],
+            compressed_freqs_cos_local[rank], compressed_freqs_sin_local[rank],
+            compressed_freqs_cos[rank], compressed_freqs_sin[rank],
             swa_slot_mapping[rank], swa_indices[rank], swa_lens[rank],
             position_ids_local[rank], position_ids[rank],
             csa_cmp_freqs_cos[rank], csa_cmp_freqs_sin[rank],
@@ -1455,6 +1482,7 @@ def build_tensor_specs(start_pos=None, *, weight_bank_size=RUNTIME_WEIGHT_BANK, 
 
     import torch
     from golden import TensorSpec
+    from utils import swa_decode_start_set
 
     if weight_bank_size != FWD_WEIGHT_BANK_SIZE:
         raise ValueError(f"weight bank froze at module import as {FWD_WEIGHT_BANK_SIZE}, got {weight_bank_size}")
@@ -1484,6 +1512,8 @@ def build_tensor_specs(start_pos=None, *, weight_bank_size=RUNTIME_WEIGHT_BANK, 
     local_t = active_batch * config.DECODE_SEQ
 
     attention_start_pos = start_pos
+    if attention_start_pos is None:
+        attention_start_pos = swa_decode_start_set(batch=TP_SIZE * active_batch).tolist()
     if use_default_long_context and TP_SIZE > 1:
         attention_start_pos = list(start_pos) + [0] * ((TP_SIZE - 1) * active_batch)
 
@@ -1597,6 +1627,10 @@ def build_tensor_specs(start_pos=None, *, weight_bank_size=RUNTIME_WEIGHT_BANK, 
         specs_by_name[name] = _make_weight_bank_spec(name, swa_specs[name], weight_bank_size, compile_only=compile_only)
     for name in _SWA_METADATA_NAMES:
         specs_by_name[name] = _copy_spec(name, swa_specs[name])
+    # HCA and CSA share the compressed YaRN profile at ordinary token positions.
+    for name in ("freqs_cos_local", "freqs_sin_local", "freqs_cos", "freqs_sin"):
+        public_name = f"compressed_{name}"
+        specs_by_name[public_name] = _copy_spec(public_name, csa_specs[name])
     # SWA names its token-local positions bare because it has no gathered twin;
     # at this level the bare name is the group stream, so it is sourced from CSA.
     specs_by_name["position_ids_local"] = _copy_spec("position_ids_local", swa_specs["position_ids"])
