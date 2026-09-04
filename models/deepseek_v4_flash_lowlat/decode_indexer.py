@@ -80,6 +80,15 @@ assert SCORE_GROUP % SCORE_CHUNK == 0
 # the fused score scope fans the cache-page loop across REDUCE_NSPLIT extra lanes:
 # (T // SCORE_GROUP) * NSPLIT = 16 mixed blocks -> 16 AIC + 32 AIV on the 24+48 chip.
 REDUCE_NSPLIT = 16
+# === token shard ===========================================================
+# Card r scores its own token over the whole cache and takes its top-k from a
+# row it already owns, so the indexer needs no exchange and the layer stays on
+# one axis end to end. The cost is that every card still walks all SCORE_LEN
+# pages -- the page tile is shared by the token group, so it does not shard
+# with the tokens -- and the group shrinks to a single token, which narrows the
+# score matmul from SCORE_CHUNK*IDX_N_HEADS columns to IDX_N_HEADS.
+IDX_N_RANKS = 8
+assert T == IDX_N_RANKS, f"the indexer token shard needs one token per card, got T={T}"
 Q_TILE = 256
 # Q_OUT_TILE is the per-task N granularity (sets idx_qr_proj task count); MM_N_TILE
 # is the Mat-safe cube N-tile. Q_OUT_TILE fans Q_OUT_TILE // MM_N_TILE cube ops per
@@ -149,6 +158,7 @@ def indexer(
     kv_seq_lens: pl.Tensor[[B], pl.INT32],
     offset: pl.Scalar[pl.INT32],
     late_dep: pl.Scalar[pl.TASK_ID],
+    my_rank: pl.Scalar[pl.INT32],
 ):
     qr_acc_pad = pl.create_tensor([T_PAD, IDX_N_HEADS * IDX_HEAD_DIM], dtype=pl.INT32)
     for ot in pl.spmd(IDX_N_HEADS * IDX_HEAD_DIM // Q_OUT_TILE, name_hint="idx_qr_proj_matmul", allow_early_resolve=True):
@@ -290,24 +300,19 @@ def indexer(
     # on chip, so cube page i+1 pipelines against vector page i (no score_acc_gm handoff).
     # slot_num sets the cube->vector ring depth; a slot is the [REDUCE_TILE, SCORE_CHUNK*64]
     # int32 tile (8192 B * SCORE_CHUNK), so the ring must fit beside the FP32 epilogue in Vec.
-    for unit in pl.spmd(T // SCORE_GROUP * REDUCE_NSPLIT, name_hint="score", allow_early_resolve=True,
+    for split in pl.spmd(REDUCE_NSPLIT, name_hint="score", allow_early_resolve=True,
                         optimizations=[pl.split(pl.SplitMode.NONE, slot_num=SCORE_SLOT_NUM)]):
-        grp = unit // REDUCE_NSPLIT
-        split = unit - grp * REDUCE_NSPLIT
-        t0 = grp * SCORE_GROUP
+        # One token per card, so the group is this card's token and the lanes split
+        # its page range -- the same split that used to serve the whole group.
+        t0 = pl.cast(my_rank, pl.INDEX)
         b = t0 // S
         s0 = t0 - b * S
         clen_b = pl.read(kv_seq_lens, [b]) // COMPRESS_RATIO
-        # core-local: the SCORE_GROUP position_ids reads are hoisted out of the page loop.
-        visible = pl.array.create(SCORE_GROUP, pl.INT32)
-        for k in pl.unroll(SCORE_GROUP):
-            pos_k = pl.read(position_ids, [b, s0 + k])
-            visible[k] = pl.min(pl.min(clen_b, (pos_k + 1) // COMPRESS_RATIO), SCORE_LEN)
-        # visible_len is non-decreasing in s: the group's page count comes from its last token.
-        # The group max sits at the last lane: position_ids is start + arange(S)
-        # (utils.py::position_ids_from_starts) and a group never spans a batch.
-        cblk_g = (visible[SCORE_GROUP - 1] + REDUCE_TILE - 1) // REDUCE_TILE
-        lane_iters = (cblk_g - split + REDUCE_NSPLIT - 1) // REDUCE_NSPLIT
+        visible = pl.array.create(1, pl.INT32)
+        pos_k = pl.read(position_ids, [b, s0])
+        visible[0] = pl.min(pl.min(clen_b, (pos_k + 1) // COMPRESS_RATIO), SCORE_LEN)
+        cblk_g = (visible[0] + REDUCE_TILE - 1) // REDUCE_TILE
+        lane_iters = pl.max(cblk_g - split + REDUCE_NSPLIT - 1, 0) // REDUCE_NSPLIT
         for cb_local in pl.pipeline(0, lane_iters, stage=2):
             cb = split + cb_local * REDUCE_NSPLIT
             cache0 = cb * REDUCE_TILE
@@ -318,31 +323,37 @@ def indexer(
             kv0 = idx_blk_id * IDX_STORAGE_BLOCK_SIZE
             kv_i8_mat = kv_cache_i8_flat[kv0 : kv0 + REDUCE_TILE, :]
             kv_dq_red = kv_scale_flat[kv0 : kv0 + REDUCE_TILE, :]  # paged per-position dequant scale
-            for ck in pl.unroll(SCORE_GROUP // SCORE_CHUNK):
-                c0 = (t0 + ck * SCORE_CHUNK) * IDX_N_HEADS
-                qr_chunk = pl.slice(qr_hadamard_i8, [SCORE_CHUNK * IDX_N_HEADS, IDX_HEAD_DIM], [c0, 0])
-                qh_scale_c = pl.slice(qh_scale_flat, [1, SCORE_CHUNK * IDX_N_HEADS], [0, c0])
-                weights_c = pl.slice(weights_flat, [1, SCORE_CHUNK * IDX_N_HEADS], [0, c0])
+            for ck in pl.unroll(1):
+                c0 = t0 * IDX_N_HEADS
+                qr_chunk = pl.slice(qr_hadamard_i8, [IDX_N_HEADS, IDX_HEAD_DIM], [c0, 0])
+                qh_scale_c = pl.slice(qh_scale_flat, [1, IDX_N_HEADS], [0, c0])
+                weights_c = pl.slice(weights_flat, [1, IDX_N_HEADS], [0, c0])
                 score_acc_red = pl.matmul(kv_i8_mat, qr_chunk, out_dtype=pl.INT32, b_trans=True)
                 score_tile_red = pl.cast(score_acc_red, target_type=pl.FP32, mode="none")
                 score_tile_red = pl.col_expand_mul(score_tile_red, qh_scale_c)
                 relu_score_red = pl.maximum(score_tile_red, 0.0)
                 weighted_score_red = pl.col_expand_mul(relu_score_red, weights_c)
                 # per-position dequant kv_dq_red applied after the per-token head-sum
-                for k in pl.unroll(SCORE_CHUNK):
-                    kt = ck * SCORE_CHUNK + k
+                for k in pl.unroll(1):
+                    kt = 0
                     head_cols = weighted_score_red[0:REDUCE_TILE, k * IDX_N_HEADS : (k + 1) * IDX_N_HEADS]
                     weighted_score_row = pl.mul(pl.row_sum(head_cols), kv_dq_red)
                     weighted_score_s = pl.reshape(weighted_score_row, [1, REDUCE_TILE])
-                    valid_len = pl.min(REDUCE_TILE, pl.max(visible[kt] - cache0, 0))
+                    valid_len = pl.min(REDUCE_TILE, pl.max(visible[0] - cache0, 0))
                     weighted_score_valid_s = pl.fillpad(pl.set_validshape(weighted_score_s, 1, valid_len), pad_value=pl.PadValue.min)
                     weighted_score_valid_s = pl.maximum(weighted_score_valid_s, FP32_NEG_INF)
                     score_flat[t0 + kt : t0 + kt + 1, cache0 : cache0 + REDUCE_TILE] = weighted_score_valid_s
 
     topk_idxs_flat = pl.reshape(topk_idxs, [T, SCORE_LEN])
-    for t in pl.spmd(T, name_hint="topk", allow_early_resolve=True):
-        invalid_idxs = pl.full([1, SCORE_LEN], dtype=pl.INT32, value=-1)
-        topk_idxs_flat[t : t + 1, :] = invalid_idxs
+
+    # No exchange: this card scored its own token over the whole cache, so the row
+    # topk needs is already local. Every token this card does not own is marked
+    # invalid so a consumer walking all T rows sees the -1 contract.
+    with pl.at(level=pl.Level.CORE_GROUP, name_hint="topk_init", allow_early_resolve=True) as topk_init_tid:
+        topk_idxs_flat[0:T, :] = pl.full([T, SCORE_LEN], dtype=pl.INT32, value=-1)
+
+    for _tk in pl.spmd(1, name_hint="topk", allow_early_resolve=True, deps=[topk_init_tid]):
+        t = pl.cast(my_rank, pl.INDEX)
         batch_idx = t // S
         token_s = t - batch_idx * S
         cache_len_b = pl.read(kv_seq_lens, [batch_idx]) // COMPRESS_RATIO
