@@ -24,7 +24,8 @@ T_DYN = pl.dynamic("DSPARK_PROJ_T_DYN")
 
 # model config
 D = M.hidden_size
-TARGET_LAYERS = 3                        # dspark_target_layer_ids
+TARGET_LAYER_IDS = (40, 41, 42)          # dspark_target_layer_ids
+TARGET_LAYERS = len(TARGET_LAYER_IDS)
 MAIN_HIDDEN_DIM = TARGET_LAYERS * D
 
 # tiling

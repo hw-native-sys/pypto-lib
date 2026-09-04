@@ -250,7 +250,6 @@ def hc_head(
                 y_valid_tail = pl.set_validshape(y_bf16_tail, valid_rows, D_TILE)
                 y_flat[t0 : t0 + T_TILE, d0 : d0 + D_TILE] = y_valid_tail
 
-    y = pl.reshape(y_flat, [t_dim, D])
     return y
 
 

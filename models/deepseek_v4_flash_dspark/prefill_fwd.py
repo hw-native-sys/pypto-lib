@@ -18,6 +18,7 @@ import pypto.language.distributed as pld
 from golden import run
 from pypto.ir.distributed_compiled_program import DistributedConfig
 
+from dspark_proj import MAIN_HIDDEN_DIM, TARGET_LAYER_IDS
 from moe import (
     AUX_PAD,
     D,
@@ -149,6 +150,10 @@ LM_HEAD_COMM_EPOCH = 1
 
 if MODEL_NUM_LAYERS != FWD_NUM_LAYERS:
     raise ValueError("DeepSeek-V4 Flash hidden layer count changed")
+if len(TARGET_LAYER_IDS) != 3 or TARGET_LAYER_IDS != tuple(
+    range(FWD_NUM_LAYERS - len(TARGET_LAYER_IDS), FWD_NUM_LAYERS)
+):
+    raise ValueError(f"DSpark target layers must be the final three layers: {TARGET_LAYER_IDS}")
 if N_RANKS % TP_SIZE:
     raise ValueError(f"EP world size {N_RANKS} must be divisible by CP group size {TP_SIZE}")
 if LM_HEAD_TP_SIZE != TP_SIZE:
@@ -233,6 +238,18 @@ RESIDENT_CACHE_NAMES = frozenset(CACHE_NAMES)
 
 # Caches returned to the following decode invocation.
 RESIDENT_CACHE_OUTPUT_NAMES = RESIDENT_CACHE_NAMES
+
+
+@pl.jit.incore
+def _copy_target_hc_row(
+    source: pl.Tensor,
+    target: pl.Out[pl.Tensor],
+):
+    """Copy one post-layer HC row into the fused target-head input."""
+    token = pl.tile.get_block_idx()
+    row = pl.load(source, [token, 0, 0], [1, HC_MULT, D])
+    target = pl.store(row, [token, 0, 0], target)
+    return target
 
 
 @pl.jit.inline
@@ -346,7 +363,7 @@ def prefill_fwd(
     final_norm_w: pl.Tensor[[D], pl.BF16],
     lm_head_weight: pl.Tensor[[VOCAB_PER_TP, D], pl.BF16],
     logit_row_indices: pl.Tensor[[MAX_LOGIT_ROWS], pl.INT32],
-    hidden_workspace: pl.Tensor[[FWD_GROUP_TOKENS_DYN, D], pl.BF16],
+    dspark_target_hidden: pl.Out[pl.Tensor[[FWD_TOKENS_DYN, MAIN_HIDDEN_DIM], pl.BF16]],
     x_out: pl.Out[pl.Tensor[[FWD_GROUP_TOKENS_DYN, D], pl.BF16]],
     logits: pl.Out[pl.Tensor[[MAX_LOGIT_ROWS, LM_HEAD_VOCAB], pl.FP32]],
     sampled_ids: pl.Out[pl.Tensor[[MAX_LOGIT_ROWS, SAMPLED_IDS_PAD], pl.INT32]],
@@ -380,6 +397,7 @@ def prefill_fwd(
     hca_cmp_block_table.bind_dynamic(0, REQUESTS_DYN)
     csa_cmp_block_table.bind_dynamic(0, REQUESTS_DYN)
     idx_block_table.bind_dynamic(0, REQUESTS_DYN)
+    dspark_target_hidden.bind_dynamic(0, FWD_TOKENS_DYN)
     swa_freqs_cos.bind_dynamic(0, FWD_GROUP_TOKENS_DYN)
     swa_freqs_sin.bind_dynamic(0, FWD_GROUP_TOKENS_DYN)
     compressed_freqs_cos.bind_dynamic(0, FWD_GROUP_TOKENS_DYN)
@@ -583,6 +601,14 @@ def prefill_fwd(
                 group_base, tp_rank, layer_l1, my_rank,
             )
 
+    group_tokens = pl.tensor.dim(x_hc, 0)
+    local_tokens = pl.tensor.dim(input_ids, 0)
+    local_start = pl.cast(tp_rank, pl.INDEX) * pl.cast(local_tokens, pl.INDEX)
+    target_l40_start = pl.cast(group_tokens, pl.INDEX)
+    target_l41_start = target_l40_start + pl.cast(local_tokens, pl.INDEX)
+    target_head_rows = group_tokens + 2 * local_tokens
+    target_hc_stack = pl.create_tensor([target_head_rows, HC_MULT, D], dtype=pl.FP32)
+
     # Layers 2-41: CSA/HCA pairs.
     for pair_order in pl.range(HCA_NUM_LAYERS):
         attention_order = pl.cast(pair_order, pl.INT32)
@@ -736,6 +762,19 @@ def prefill_fwd(
                     gather_window, gather_signal,
                     group_base, tp_rank, csa_layer, my_rank,
                 )
+                if pair_order == HCA_NUM_LAYERS - 1:
+                    target_x_hc_l40 = pl.slice(
+                        x_hc,
+                        [local_tokens, HC_MULT, D],
+                        [local_start, 0, 0],
+                    )
+                    target_hc_l40 = pl.slice(
+                        target_hc_stack,
+                        [local_tokens, HC_MULT, D],
+                        [target_l40_start, 0, 0],
+                    )
+                    with pl.spmd(local_tokens, name_hint="prefill_fwd_capture_target_hc_l40"):
+                        target_hc_l40 = _copy_target_hc_row(target_x_hc_l40, target_hc_l40)
 
         with pl.scope():
             hca_layer = attention_order * 2 + pl.const(3, pl.INT32)
@@ -849,6 +888,19 @@ def prefill_fwd(
                     gather_window, gather_signal,
                     group_base, tp_rank, hca_layer, my_rank,
                 )
+                if pair_order == HCA_NUM_LAYERS - 1:
+                    target_x_hc_l41 = pl.slice(
+                        x_hc,
+                        [local_tokens, HC_MULT, D],
+                        [local_start, 0, 0],
+                    )
+                    target_hc_l41 = pl.slice(
+                        target_hc_stack,
+                        [local_tokens, HC_MULT, D],
+                        [target_l41_start, 0, 0],
+                    )
+                    with pl.spmd(local_tokens, name_hint="prefill_fwd_capture_target_hc_l41"):
+                        target_hc_l41 = _copy_target_hc_row(target_x_hc_l41, target_hc_l41)
 
     # Layer 42: CSA order 20.
     with pl.scope():
@@ -1010,12 +1062,37 @@ def prefill_fwd(
             group_base, tp_rank, pl.const(43, pl.INT32),
         )
 
-    # Final head over the gathered TP-group tokens: after the layer-42 token
-    # gather x_hc holds every group token on each rank, and logit_row_indices
-    # index that group token space.
+    # Project the full layer-42 group and local layer-40/41 rows in one
+    # target-head launch.
     with pl.scope():
-        hc_head(x_hc, hc_head_fn, hc_head_scale, hc_head_base, hidden_workspace)
-        final_norm_tid = rms_norm(hidden_workspace, final_norm_w, x_out)
+        target_hc_l42 = pl.slice(
+            target_hc_stack,
+            [group_tokens, HC_MULT, D],
+            [0, 0, 0],
+        )
+        with pl.spmd(group_tokens, name_hint="prefill_fwd_capture_target_hc_l42"):
+            target_hc_l42 = _copy_target_hc_row(x_hc, target_hc_l42)
+        target_hidden_stack = pl.create_tensor([target_head_rows, D], dtype=pl.BF16)
+        target_hidden_stack = hc_head(
+            target_hc_stack,
+            hc_head_fn, hc_head_scale, hc_head_base,
+            target_hidden_stack,
+        )
+        layer42_hidden = pl.slice(target_hidden_stack, [group_tokens, D], [0, 0])
+        for token in pl.spmd(local_tokens, name_hint="prefill_fwd_store_target_hidden"):
+            target_l40_row = target_l40_start + token
+            target_l41_row = target_l41_start + token
+            target_l42_row = local_start + token
+            dspark_target_hidden[token : token + 1, 0:D] = target_hidden_stack[
+                target_l40_row : target_l40_row + 1, 0:D,
+            ]
+            dspark_target_hidden[token : token + 1, D : 2 * D] = target_hidden_stack[
+                target_l41_row : target_l41_row + 1, 0:D,
+            ]
+            dspark_target_hidden[token : token + 1, 2 * D : 3 * D] = target_hidden_stack[
+                target_l42_row : target_l42_row + 1, 0:D,
+            ]
+        final_norm_tid = rms_norm(layer42_hidden, final_norm_w, x_out)
         lm_head(
             x_out, lm_head_weight, logit_row_indices, logits,
             lm_head_hidden_window, lm_head_hidden_done,
@@ -1128,7 +1205,7 @@ def l3_prefill_fwd(
     final_norm_w: pl.Tensor[[N_RANKS, D], pl.BF16],
     lm_head_weight: pl.Tensor[[N_RANKS, VOCAB_PER_TP, D], pl.BF16],
     logit_row_indices: pl.Tensor[[N_RANKS, MAX_LOGIT_ROWS], pl.INT32],
-    hidden_workspace: pl.Tensor[[N_RANKS, FWD_GROUP_TOKENS_DYN, D], pl.BF16],
+    dspark_target_hidden: pl.Out[pl.Tensor[[N_RANKS, FWD_TOKENS_DYN, MAIN_HIDDEN_DIM], pl.BF16]],
     x_out: pl.Out[pl.Tensor[[N_RANKS, FWD_GROUP_TOKENS_DYN, D], pl.BF16]],
     logits: pl.Out[pl.Tensor[[N_RANKS, MAX_LOGIT_ROWS, LM_HEAD_VOCAB], pl.FP32]],
     sampled_ids: pl.Out[pl.Tensor[[N_RANKS, MAX_LOGIT_ROWS, SAMPLED_IDS_PAD], pl.INT32]],
@@ -1154,7 +1231,7 @@ def l3_prefill_fwd(
     hca_cmp_block_table.bind_dynamic(1, REQUESTS_DYN)
     csa_cmp_block_table.bind_dynamic(1, REQUESTS_DYN)
     idx_block_table.bind_dynamic(1, REQUESTS_DYN)
-    hidden_workspace.bind_dynamic(1, FWD_GROUP_TOKENS_DYN)
+    dspark_target_hidden.bind_dynamic(1, FWD_TOKENS_DYN)
     x_out.bind_dynamic(1, FWD_GROUP_TOKENS_DYN)
     attn_stage.bind_dynamic(1, FWD_GROUP_TOKENS_DYN)
     x_mixed.bind_dynamic(1, FWD_GROUP_TOKENS_DYN)
@@ -1268,7 +1345,8 @@ def l3_prefill_fwd(
             post_ffn[r], comb_ffn[r], ffn_out[r],
             hc_head_fn[r], hc_head_scale[r], hc_head_base[r],
             final_norm_w[r], lm_head_weight[r], logit_row_indices[r],
-            hidden_workspace[r], x_out[r], logits[r], sampled_ids[r],
+            dspark_target_hidden[r],
+            x_out[r], logits[r], sampled_ids[r],
             recv_meta, recv_x, recv_aux, recv_route,
             arrived, data_arrived, routed_y_buf, combine_arrived,
             stage_done,
@@ -1280,7 +1358,7 @@ def l3_prefill_fwd(
             r,
             device=r,
         )
-    return x_out, logits, sampled_ids
+    return x_out, logits, sampled_ids, dspark_target_hidden
 
 
 # Kernel-only smoke fixtures.
@@ -1852,9 +1930,6 @@ def build_tensor_specs(
         indices[::TP_SIZE, : len(last_rows)] = torch.tensor(last_rows, dtype=torch.int32)
         return indices
 
-    def init_hidden_workspace():
-        return torch.zeros(N_RANKS, stage_tokens, D, dtype=torch.bfloat16)
-
     head_specs = [
         TensorSpec("hc_head_fn", [N_RANKS, HC_MULT, HC_DIM], torch.float32, init_value=init_hc_head_fn),
         TensorSpec("hc_head_scale", [N_RANKS, 1], torch.float32, init_value=init_hc_head_scale),
@@ -1862,7 +1937,11 @@ def build_tensor_specs(
         TensorSpec("final_norm_w", [N_RANKS, D], torch.bfloat16, init_value=init_final_norm_w),
         TensorSpec("lm_head_weight", [N_RANKS, VOCAB_PER_TP, D], torch.bfloat16, init_value=init_lm_head_weight),
         TensorSpec("logit_row_indices", [N_RANKS, MAX_LOGIT_ROWS], torch.int32, init_value=init_logit_row_indices),
-        TensorSpec("hidden_workspace", [N_RANKS, stage_tokens, D], torch.bfloat16, init_value=init_hidden_workspace),
+        TensorSpec(
+            "dspark_target_hidden",
+            [N_RANKS, local_tokens, MAIN_HIDDEN_DIM],
+            torch.bfloat16,
+        ),
         TensorSpec("x_out", [N_RANKS, stage_tokens, D], torch.bfloat16),
         TensorSpec("logits", [N_RANKS, MAX_LOGIT_ROWS, LM_HEAD_VOCAB], torch.float32),
         TensorSpec("sampled_ids", [N_RANKS, MAX_LOGIT_ROWS, SAMPLED_IDS_PAD], torch.int32),
@@ -1943,6 +2022,49 @@ def x_out_compare(actual, _expected, **kwargs):
     return True, ""
 
 
+def dspark_target_hidden_compare(actual, _expected, **kwargs):
+    """Validate all taps are written and the layer-42 local projection is exact."""
+    import torch
+    from hc_head import golden_hc_head
+
+    inputs = kwargs.get("inputs", {})
+    device_x_hc = kwargs.get("actual_outputs", {}).get("x_hc")
+    if device_x_hc is None:
+        return False, "    missing final device x_hc output"
+    slot_mapping = inputs.get("ori_slot_mapping_full")
+    if slot_mapping is None:
+        return False, "    missing Prefill slot mapping"
+    if not bool(torch.isfinite(actual).all()):
+        return False, "    DSpark target hidden contains NaN or Inf"
+
+    for rank in range(actual.shape[0]):
+        local_tokens = actual.shape[1]
+        local_start = (rank % TP_SIZE) * local_tokens
+        active_rows = slot_mapping[rank, local_start : local_start + local_tokens] >= 0
+        for slot in range(len(TARGET_LAYER_IDS) - 1):
+            part = actual[rank, :, slot * D : (slot + 1) * D]
+            if bool(active_rows.any()) and not bool(torch.count_nonzero(part[active_rows])):
+                return False, f"    rank {rank} target layer {TARGET_LAYER_IDS[slot]} was not written"
+
+        expected_l42 = torch.empty(local_tokens, D, dtype=torch.bfloat16)
+        golden_hc_head({
+            "x_hc": device_x_hc[rank, local_start : local_start + local_tokens].cpu(),
+            "hc_head_fn": inputs["hc_head_fn"][rank],
+            "hc_head_scale": inputs["hc_head_scale"][rank],
+            "hc_head_base": inputs["hc_head_base"][rank],
+            "y": expected_l42,
+        })
+        actual_l42 = actual[rank, :, 2 * D : 3 * D].float()
+        expected_l42 = expected_l42.float()
+        tolerance = 1e-4 + (1.0 / 128) * expected_l42.abs()
+        bad = (actual_l42 - expected_l42).abs() > tolerance
+        ratio = float(bad.float().mean())
+        if ratio > 0.005:
+            worst = float((actual_l42 - expected_l42).abs().max())
+            return False, f"    rank {rank} layer-42 target hidden mismatch: ratio={ratio:.2%}, max |err|={worst:.3e}"
+    return True, ""
+
+
 def logits_compare(actual, _expected, **kwargs):
     """Recompute every active logit row from the device x_out and the TP vocab shards."""
     import torch
@@ -2004,6 +2126,7 @@ def compare_functions():
         "idx_kv_cache", "idx_kv_scale",
     }
     compare = {name: finite_tensor_compare for name in finite_names}
+    compare["dspark_target_hidden"] = dspark_target_hidden_compare
     compare["x_out"] = x_out_compare
     compare["logits"] = logits_compare
     compare["sampled_ids"] = sampled_ids_compare
