@@ -95,16 +95,28 @@ def build_tensor_specs(t: int = T, h: int = H, d: int = D, chunk: int = CHUNK):
         return torch.rand(h, t, dtype=torch.float32)
 
     def init_g():
-        # g_sum as chunk_cumsum produces it: a per-chunk prefix sum of negative gates.
+        # g_sum as chunk_cumsum produces it: a per-chunk prefix sum of the
+        # log-sigmoid gates, matching upstream's own generator.
         torch.manual_seed(7)
-        g = -torch.rand(h, t, dtype=torch.float32) * 0.5
+        g = torch.nn.functional.logsigmoid(torch.randn(h, t, dtype=torch.float32))
         out = torch.zeros_like(g)
         for t0 in range(0, t, chunk):
             out[:, t0 : t0 + chunk] = g[:, t0 : t0 + chunk].cumsum(dim=1)
         return out
 
+    def init_k():
+        # L2-normalised along the head dimension, as the model produces it and as
+        # upstream's own test draws it (test_gdn_scaled_dot_kkt.py). NOT raw
+        # randn: with unnormalised k, K K^T entries scale with D and `A` reaches
+        # ~40, which makes (I + A)^-1 about 1e36 with a condition number of 1e20.
+        # The kernel is indifferent, but every consumer of `A` is not -- solve_tril
+        # chained onto that `A` inverts a matrix whose fp64 golden is already inf.
+        torch.manual_seed(11)
+        k = torch.randn(t, h, d, dtype=torch.float16)
+        return torch.nn.functional.normalize(k, dim=-1, p=2)
+
     return [
-        TensorSpec("k", [t, h, d], torch.float16, init_value=torch.randn),
+        TensorSpec("k", [t, h, d], torch.float16, init_value=init_k),
         TensorSpec("beta", [h, t], torch.float32, init_value=init_beta),
         TensorSpec("g_sum", [h, t], torch.float32, init_value=init_g),
         TensorSpec("mask", [chunk, chunk], torch.float32, init_value=init_mask),
