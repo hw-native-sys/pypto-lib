@@ -138,7 +138,9 @@ COMPRESS_STATE_DIM = 2 * MAIN_OUT_DIM
 # tiling
 SPARSE_ROPE_TILE = 16
 SPARSE_ROPE_INTERLEAVE_TILE = 2 * SPARSE_ROPE_TILE
-HCA_WB_TOKEN_TILE = 8  # tokens per cache-writeback SPMD block
+# 16 tokens per cache-writeback block: 64 blocks needed two AIV waves for the
+# same 7.9 us of work that 32 blocks fit in one, at half the dispatch cost.
+HCA_WB_TOKEN_TILE = 16
 
 if T != LOCAL_T:
     raise ValueError(f"HCA token capacity {T} must equal TP local token capacity {LOCAL_T}")
