@@ -156,9 +156,12 @@ def sparse_attn_csa(
             c_mask = pl.mul(c_ge, c_lt)
             c_out = pl.sub(pl.mul(c_mask, pl.add(c_raw, 1.0)), 1.0)
             cmp_sparse_indices[bias_t0 : bias_t0 + BIAS_T_TILE, 0:IDX_TOPK] = pl.cast(c_out, target_type=pl.INT32)
-            # Block 0 (sliding-window) is always live; blocks 1.. from the compressed mask.
+            v_win_f = pl.cast(window_swa_indices[bias_t0 : bias_t0 + BIAS_T_TILE, 0:WIN], target_type=pl.FP32)
+            v_win_valid = pl.minimum(pl.maximum(pl.add(v_win_f, 1.0), 0.0), 1.0)
+            raw_block_valid = pl.row_max(v_win_valid)
             for c_t0 in pl.range(BIAS_T_TILE):
-                pl.write(valid_block_mask, [bias_t0 + c_t0, 0], pl.cast(1, pl.INT32))
+                c_valid = pl.cast(pl.read(raw_block_valid, [c_t0, 0]), target_type=pl.INT32)
+                pl.write(valid_block_mask, [bias_t0 + c_t0, 0], c_valid)
             for c_sb in pl.range(1, SPARSE_BLOCKS):
                 c_s0 = (c_sb - 1) * ATTN_K_TILE
                 c_blk_valid = pl.row_max(c_mask[:, c_s0 : c_s0 + ATTN_K_TILE])
@@ -168,11 +171,9 @@ def sparse_attn_csa(
 
             # Additive softmax bias (0 valid / NEG_INF invalid) that qk_pv adds onto the
             # scaled scores, so invalid lanes exp to ~0 with no per-block mask multiply.
-            v_win_f = pl.cast(window_swa_indices[bias_t0 : bias_t0 + BIAS_T_TILE, 0:WIN], target_type=pl.FP32)
             # Index contract: raw == -1 invalid, raw >= 0 valid. min(idx, 0) is -1 for
             # invalid / 0 for valid; * -NEG_INF gives NEG_INF / 0. c_out is the
             # post-mask compressed slots (integer-valued), reused directly.
-            v_win_valid = pl.minimum(pl.maximum(pl.add(v_win_f, 1.0), 0.0), 1.0)
             sparse_bias[bias_t0 : bias_t0 + BIAS_T_TILE, 0:WIN] = pl.mul(pl.sub(v_win_valid, 1.0), -NEG_INF)
             sparse_bias[bias_t0 : bias_t0 + BIAS_T_TILE, WIN:TOPK] = pl.mul(pl.minimum(c_out, 0.0), -NEG_INF)
             if PADDED_TOPK > TOPK:
@@ -594,6 +595,7 @@ def build_tensor_specs(
     short_window_fixture: bool = False,
     mixed_topk_fixture: bool = False,
     cache_window_replacement_fixture: bool = False,
+    all_invalid_fixture: bool = False,
     start_pos=None,
     batch: int = B,
 ):
@@ -640,6 +642,8 @@ def build_tensor_specs(
         block_size=BLOCK_SIZE,
         window=WIN,
     )[0].contiguous()
+    if all_invalid_fixture:
+        shared_swa_indices.fill_(-1)
 
     def init_q():
         """Initialize the query tensor used by the decode attention stage."""
@@ -711,6 +715,8 @@ def build_tensor_specs(
             indices[:, :] = -1
         if causal_regression_fixture:
             indices[0, :] = -1
+        if all_invalid_fixture:
+            indices.fill_(-1)
         return indices
 
     def init_idx_topk():
@@ -765,6 +771,8 @@ if __name__ == "__main__":
                         help="Use -1-padded window slots with valid compressed raw indices.")
     parser.add_argument("--cache-window-replacement-fixture", action="store_true", default=False,
                         help="Place a sentinel row inside the cache window prefix.")
+    parser.add_argument("--all-invalid-fixture", action="store_true", default=False,
+                        help="Mask every raw and compressed row.")
     parser.add_argument("--golden-data", type=str, default=None)
     parser.add_argument("--enable-chip-swimlane", type=int, nargs="?", const=1, default=0, choices=(0, 1, 2))
     parser.add_argument("--enable-dep-gen", action="store_true", default=False,
@@ -795,6 +803,7 @@ if __name__ == "__main__":
             args.short_window_fixture,
             args.mixed_topk_fixture,
             args.cache_window_replacement_fixture,
+            args.all_invalid_fixture,
             start_pos=start_pos,
             batch=args.batch,
         ),

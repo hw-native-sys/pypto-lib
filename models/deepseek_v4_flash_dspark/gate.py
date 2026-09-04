@@ -82,6 +82,13 @@ def gate(
     if active_tokens > T:
         active_tokens = pl.cast(T, pl.INDEX)
     active_gate_tiles = (active_tokens + GATE_M_TILE - 1) // GATE_M_TILE
+    # Keep one producer tile alive for an owner with zero local tokens.  The
+    # following pre-route task overwrites the whole fixed-capacity output with
+    # zeroes, while the rank still publishes zero route counts and participates
+    # in the EP barriers.  A zero-sized producer loop leaves x_norm_i8 without a
+    # producer and can stall its fixed-shape shared-expert consumer.
+    if active_gate_tiles < 1:
+        active_gate_tiles = pl.cast(1, pl.INDEX)
     active_gate_tokens = active_gate_tiles * GATE_M_TILE
     if active_gate_tokens > T:
         active_gate_tokens = pl.cast(T, pl.INDEX)
@@ -202,6 +209,10 @@ def gate(
             biased_scores_buf[t1 : t1 + GATE_M_TILE, n0 : n0 + GATE_N_TILE] = gp_biased
 
     active_route_tiles = (active_tokens + GATE_T_TILE - 1) // GATE_T_TILE
+    # PyPTO cannot launch an SPMD task with zero blocks.  The guarded store in
+    # either routing path keeps this dummy tile from publishing any route.
+    if active_route_tiles < 1:
+        active_route_tiles = pl.cast(1, pl.INDEX)
     # Hash layers index via tid2eid[input_ids]; score layers sort+gather.
     if layer_id < N_HASH_LAYERS:
         for th_idx in pl.spmd(active_route_tiles, name_hint="route_hash", allow_early_resolve=True):
