@@ -430,6 +430,57 @@ more — and the submit count has a floor below which the curve turns back up. H
 far to group depends on how sparse the work is: a grouped stage pays for the
 inactive items, an ungrouped stage skips them.
 
+#### 6. Sharding a stage across cards — price what does not shard, and count the barriers
+
+A shard divides the arithmetic on the axis you split. It divides nothing else,
+and the two terms it leaves behind usually decide the verdict.
+
+**Whatever the group shares does not shard with it.** Before splitting an axis,
+ask what one iteration of the loop reads that the others also read; that operand
+is streamed in full on every card no matter how the axis is cut.
+
+- Head-sharding MLA attention gave `qproj_matmul` a full ~9x (core 1783.5 → 193.9
+  us) because each card then streams only its own head group's `wq_b`. The same
+  shard moved `qk_pv` only **1.4x** (AIC 495.5 → 361.8), because MQA gives it one
+  KV head shared by all 64 q heads: each card still pulls the whole
+  `[ATTN_K_TILE, HEAD_DIM]` tile per (token, sparse block). The shard removed the
+  arithmetic and left the memory traffic.
+- The indexer's `score` batches its whole token group into one cube N, so its
+  cache page walk is shared. Halving the tokens while leaving the walk identical
+  cut core only 20 %, not 50 % — it is page-walk bound, and a token shard cannot
+  reach that term.
+
+**Count the barriers the axis costs before you count the core time it saves.**
+An axis whose producer and consumer are sharded differently needs a transpose,
+and a transpose needs a barrier. Barriers do not share the rank skew between
+them: a second one placed before the ranks have reconverged charges the **full**
+remaining skew, so adding one roughly doubles the total spin.
+
+Measured on the DeepSeek-V4 CSA decode layer, a2a3 8-card TP, T = 8, summing
+every cross-rank sync point per round across all 8 ranks:
+
+| Indexer shard | `score` core | sync total per round | layer (fastest-rank median) |
+| --- | --- | --- | --- |
+| none (replicated) | 2513 us | 504.5 us | 521.3 us |
+| token axis, no exchange | 1685 us (-33 %) | 15 740 us | **511.1 us** |
+| cache axis, one exchange | 1460 us (-42 %) | 42 684 us | 516.6 us |
+
+The cache shard won every per-stage number — better core, and a `score → topk →
+plan` chain of 57.7 us against the token shard's 68.0 — and still lost the layer,
+because its exchange bought a second barrier. **At these shapes one barrier is
+worth more than 40 % of a stage's core time.**
+
+**A shard only pays if the stage gates something.** Token-sharding the same
+layer's attention cut `qk_pv` core 4.35x (11 497 → 2888 us) and its span
+116.1 → 32.3 us, for no wall-time movement at all, because `qk_pv` starts when
+the indexer's `score → topk → plan` chain releases it and not before. Read what
+gates a stage's **start** before shrinking the stage.
+
+**Corollary for measurement.** A fastest-rank number hides all of this: the
+fastest rank is the one every barrier is free on, by construction. Quote the
+sync total across all ranks beside it — see
+[Benchmarking Rules](../../.claude/rules/benchmarking.md).
+
 ---
 
 ## Part 2 — L1 / L0 tuning (intra-kernel)

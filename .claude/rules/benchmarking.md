@@ -158,6 +158,28 @@ contention from the other cards hits both sides equally.
 
 This does not apply to an L3 (`l3_*`) entry, which needs the whole card set.
 
+## Interleaving Does Not Cancel Run Order
+
+An A/B/A/B alternation is the usual defence against drift, and on an L3 decode
+entry it does not work: the arm that runs **second in a pair is slower whichever
+arm it is**, by ~6.7 us on `decode_layer.py`. A fixed alternation gives the two
+arms different position distributions, so the bias lands entirely on one of
+them and reads as a result.
+
+Two ways out, and prefer the first:
+
+- **One process, many rounds.** `PYPTO_BENCH_ROUNDS` already repeats in-process
+  and every round shares one compile, one input generation, and one golden. 300
+  rounds in one run is both a better sample and far cheaper than six 50-round
+  runs — and it has no run-order bias to cancel, because there is only one run.
+- **Balance the positions** when separate processes are unavoidable: A/B/B/A,
+  then the same set with the order reversed, so each arm occupies each slot
+  equally.
+
+Report the **median** of the fastest rank, not the mean. On an L3 layer the
+mean is set by a handful of outlier rounds — host dispatch skew lands in every
+round — and moves far more between runs than the effect being measured.
+
 ## Distributed (L3) — Drop the Start Skew
 
 Ranks do not start together. A late-dispatched rank spends the head of its

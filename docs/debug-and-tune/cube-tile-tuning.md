@@ -118,6 +118,38 @@ violating `Mat` or `Acc`.
 A tile selected with an unrealistically small fixture can look fast while
 performing poorly at production occupancy.
 
+## At decode shapes, tune the block count — it turns at the core count
+
+A decode GEMM is M-starved: a handful of token rows against a deep K. It is not
+bound by cube throughput but by **how many cores stream its weights**, which
+makes the `pl.spmd` block count the primary lever, not the fragment sizes.
+
+Measured on the DeepSeek-V4 grouped output projection, a2a3 (24 AIC), T = 8,
+fastest-rank median, at (proj_a blocks, proj_b blocks):
+
+| (a, b) | (8, 8) | (8, 16) | (16, 8) | (16, 16) | (32, 16) |
+| --- | --- | --- | --- | --- | --- |
+| us | 69.4 | 67.3 | 67.1 | **65.0** | 68.2 |
+
+The two fan-outs are independent and additive, and **both turn at 24 — the AIC
+count** — because a 32-block grid runs two waves. Sweep the block count before
+the fragments, and expect the optimum at or just below the core count.
+
+Two habits follow.
+
+**Re-tile a grid whenever you make its blocks cheaper.** The optimal block count
+is a function of per-block cost, so any change that shrinks a block moves it —
+and it moves in both directions. After a reduce's output was re-shaped from
+`T * D/512` blocks of `[1, 512]` to `D/512` blocks of `[T, 512]`, that stage went
+23.4 → 10.5 us: 64 tiny tasks whose fixed cost dwarfed 2 KB of loads. Treat a
+block-count constant as stale the moment its block's work changes.
+
+**Batching a shared operand into cube N buys fixed cost, not throughput — and it
+moves the optimum ring depth.** Widening N so several consumers share one loaded
+operand removes per-iteration setup, not FLOPs, so the win saturates; and the
+wider tile changes how many slots fit beside the epilogue, so re-sweep the
+pipeline depth in the same round rather than carrying the old value forward.
+
 ## Decouple conflicting fragments
 
 Cube and vector work can require different output fragments:
