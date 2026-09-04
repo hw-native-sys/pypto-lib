@@ -68,6 +68,9 @@ N_RANKS = EP
 N_EXPERTS_GLOBAL = M.n_routed_experts
 N_LOCAL = N_EXPERTS_GLOBAL // N_RANKS
 N_ROUTES = T * TOPK
+# Tokens per shared+routed reduce block. One token per block spends ~65% of its
+# latency on launch overhead; four fill one AIV wave at T=128.
+COMBINE_T_TILE = 4
 
 # recv_x/recv_aux laid out [expert, source, slot], flattened to
 # [N_LOCAL * RECV_MAX, D]. Lane (e, src, slot) flat row = e * RECV_MAX +
@@ -87,6 +90,7 @@ assert N_RANKS in _EP_CHOICES, f"--ep must be one of {_EP_CHOICES} (got {N_RANKS
 assert N_EXPERTS_GLOBAL == N_RANKS * N_LOCAL
 assert RECV_MAX == N_RANKS * MAX_PER_SRC
 assert RECV_MAX % FP32_PER_CACHE_LINE == 0
+assert T % COMBINE_T_TILE == 0
 
 
 @pl.jit.inline
@@ -413,19 +417,21 @@ def combine(
     if active_tokens > T:
         active_tokens = pl.cast(T, pl.INDEX)
     with pl.spmd(
-        T,
+        T // COMBINE_T_TILE,
         name_hint="shared_routed",
         deps=[_cwait_tid],
     ) as _reduce_tid:
-        t = pl.tile.get_block_idx()
-        if t < active_tokens:
-            acc = pl.cast(sh[t:t + 1, :], target_type=pl.FP32)
-            for k in pl.range(TOPK):
-                r = t * TOPK + k
-                acc = pl.add(acc, pl.cast(routed_y_buf[r:r + 1, :], target_type=pl.FP32))
-            ffn_out[t:t + 1, :] = pl.cast(acc, target_type=pl.BF16, mode="rint")
-        else:
-            ffn_out[t:t + 1, :] = sh[t:t + 1, :]
+        t_base = pl.tile.get_block_idx() * COMBINE_T_TILE
+        for dt in pl.unroll(COMBINE_T_TILE):
+            t = t_base + dt
+            if t < active_tokens:
+                acc = pl.cast(sh[t:t + 1, :], target_type=pl.FP32)
+                for k in pl.range(TOPK):
+                    r = t * TOPK + k
+                    acc = pl.add(acc, pl.cast(routed_y_buf[r:r + 1, :], target_type=pl.FP32))
+                ffn_out[t:t + 1, :] = pl.cast(acc, target_type=pl.BF16, mode="rint")
+            else:
+                ffn_out[t:t + 1, :] = sh[t:t + 1, :]
     return _reduce_tid
 
 
