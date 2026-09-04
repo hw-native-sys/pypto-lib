@@ -220,6 +220,7 @@ def _proj_chain(
     partial: pl.Tensor[[T_PAD, D], pl.INT32],
     row_base_o: pl.Scalar[pl.INDEX],
     upstream: pl.Scalar[pl.TASK_ID],
+    pad_tid: pl.Scalar[pl.TASK_ID],
 ) -> pl.Scalar[pl.TASK_ID]:
     """One group's proj_a -> quant -> proj_b chain; returns proj_b's TaskId."""
     with pl.spmd(
@@ -241,16 +242,6 @@ def _proj_chain(
         o_r_pad = pl.assemble(o_r_pad, acc_a, [0, n0])
 
     q_tid = _quant(o_r_pad, o_r_i8_pad, act_scale_col, pa_tid)
-
-    # The padding rows carry no data and depend on nothing, so they are zeroed
-    # off the proj_a -> quant -> proj_b chain rather than inside quant, where the
-    # fill is the same [T_PAD - T, O_LORA] element count as the real quantize.
-    with pl.at(
-        level=pl.Level.CORE_GROUP, name_hint="quant_pad_zero", deps=[upstream], allow_early_resolve=True
-    ) as pad_tid:
-        zero_half = pl.full([T_PAD - T, O_LORA], dtype=pl.FP16, value=0.0)
-        zero_i8 = pl.cast(zero_half, target_type=pl.INT8, mode="trunc")
-        o_r_i8_pad[T:T_PAD, 0:O_LORA] = zero_i8
 
     with pl.spmd(
         D // PROJ_B_D_TILE,
@@ -363,7 +354,16 @@ def o_proj_tp_core(
                     expected=oproj_epoch,
                     cmp=pld.WaitCmp.Ge,
                 )
-        anchor = pl.system.task_dummy(deps=[_sync_tid, upstream])
+
+        # The padding rows carry no data and depend on nothing, so they are zeroed
+        # off the proj_a -> quant -> proj_b chain rather than inside quant, where the
+        # fill is the same [T_PAD - T, O_LORA] element count as the real quantize.
+        with pl.at(
+            level=pl.Level.CORE_GROUP, name_hint="quant_pad_zero", deps=[_sync_tid], allow_early_resolve=True
+        ) as pad_tid:
+            zero_half = pl.full([T_PAD - T, O_LORA], dtype=pl.FP16, value=0.0)
+            zero_i8 = pl.cast(zero_half, target_type=pl.INT8, mode="trunc")
+            o_r_i8_pad[T:T_PAD, 0:O_LORA] = zero_i8
 
         pb_tid = _proj_chain(
             o_packed,
@@ -374,7 +374,8 @@ def o_proj_tp_core(
             act_scale_col,
             partial,
             row_base_o,
-            anchor,
+            upstream,
+            pad_tid,
         )
 
         # Dequantize before the wire, so what crosses it is addable. `wo_b_scale` is
