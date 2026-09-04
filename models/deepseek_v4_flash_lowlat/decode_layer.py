@@ -84,6 +84,8 @@ from decode_csa import (
     OPROJ_SCALE_ROWS as CSA_OPROJ_SCALE_ROWS,
     attention_csa,
     clear_csa_oproj_signals,
+    TOK_Q_ROWS,
+    TOK_O_COLS,
     build_tensor_specs as build_csa_tensor_specs,
     golden_attention_csa,
 )
@@ -209,6 +211,10 @@ def decode_layer(
     oproj_scale_window: pld.DistributedTensor[[CSA_OPROJ_SCALE_ROWS, 1], pl.FP32],
     oproj_reduce_signal: pld.DistributedTensor[[N_RANKS, 1], pl.INT32],
     oproj_sync_signal: pld.DistributedTensor[[N_RANKS, 1], pl.INT32],
+    tok_q_window: pld.DistributedTensor[[TOK_Q_ROWS, HEAD_DIM], pl.BF16],
+    tok_q_signal: pld.DistributedTensor[[N_RANKS, 1], pl.INT32],
+    tok_o_window: pld.DistributedTensor[[T, TOK_O_COLS], pl.BF16],
+    tok_o_signal: pld.DistributedTensor[[N_RANKS, 1], pl.INT32],
     layer_id: pl.Scalar[pl.INT32],
     my_rank: pl.Scalar[pl.INT32],
 ) -> pl.Tensor[[T, HC_MULT, D], pl.FP32]:
@@ -229,7 +235,9 @@ def decode_layer(
         )
         # One attention layer per dispatch, so this is that layer: reset the
         # counters the projection left monotonic for the next dispatch.
-        clear_csa_oproj_signals(x_attn, oproj_reduce_signal, oproj_sync_signal)
+        clear_csa_oproj_signals(
+            x_attn, oproj_reduce_signal, oproj_sync_signal, tok_q_signal, tok_o_signal
+        )
     elif layer_id % 2 == 1:
         attention_hca(
             x_hc,
@@ -250,7 +258,9 @@ def decode_layer(
         )
         # One attention layer per dispatch, so this is that layer: reset the
         # counters the projection left monotonic for the next dispatch.
-        clear_csa_oproj_signals(x_attn, oproj_reduce_signal, oproj_sync_signal)
+        clear_csa_oproj_signals(
+            x_attn, oproj_reduce_signal, oproj_sync_signal, tok_q_signal, tok_o_signal
+        )
     else:
         attention_csa(
             x_hc,
@@ -272,11 +282,15 @@ def decode_layer(
             x_attn,
             oproj_reduce_window, oproj_scale_window,
             oproj_reduce_signal, oproj_sync_signal,
+            tok_q_window, tok_q_signal, tok_o_window, tok_o_signal,
             my_rank, pl.const(CSA_OPROJ_FIRST_EPOCH, pl.INT32),
+            pl.const(1, pl.INT32),
         )
         # One CSA layer per dispatch, so this is that layer: reset the counters
         # the projection left monotonic for the next dispatch.
-        clear_csa_oproj_signals(x_attn, oproj_reduce_signal, oproj_sync_signal)
+        clear_csa_oproj_signals(
+            x_attn, oproj_reduce_signal, oproj_sync_signal, tok_q_signal, tok_o_signal
+        )
 
     moe(
         x_attn,
@@ -405,6 +419,11 @@ def l3_decode_layer(
     oproj_scale_buf = pld.alloc_window_buffer([CSA_OPROJ_SCALE_ROWS, 1], dtype=pl.FP32)
     oproj_reduce_signal_buf = pld.alloc_window_buffer([N_RANKS, 1], dtype=pl.INT32)
     oproj_sync_signal_buf = pld.alloc_window_buffer([N_RANKS, 1], dtype=pl.INT32)
+    # Token-shard exchange: q in on the head axis, o_packed out on the group axis.
+    tok_q_window_buf = pld.alloc_window_buffer([TOK_Q_ROWS, HEAD_DIM], dtype=pl.BF16)
+    tok_q_signal_buf = pld.alloc_window_buffer([N_RANKS, 1], dtype=pl.INT32)
+    tok_o_window_buf = pld.alloc_window_buffer([T, TOK_O_COLS], dtype=pl.BF16)
+    tok_o_signal_buf = pld.alloc_window_buffer([N_RANKS, 1], dtype=pl.INT32)
 
     for r in pl.range(pld.world_size()):
         reduce_window = pld.window(reduce_window_buf, [REDUCE_WINDOW_ROWS, D], dtype=pl.FP32)
@@ -413,6 +432,10 @@ def l3_decode_layer(
         oproj_scale_window = pld.window(oproj_scale_buf, [CSA_OPROJ_SCALE_ROWS, 1], dtype=pl.FP32)
         oproj_reduce_signal = pld.window(oproj_reduce_signal_buf, [N_RANKS, 1], dtype=pl.INT32)
         oproj_sync_signal = pld.window(oproj_sync_signal_buf, [N_RANKS, 1], dtype=pl.INT32)
+        tok_q_window = pld.window(tok_q_window_buf, [TOK_Q_ROWS, HEAD_DIM], dtype=pl.BF16)
+        tok_q_signal = pld.window(tok_q_signal_buf, [N_RANKS, 1], dtype=pl.INT32)
+        tok_o_window = pld.window(tok_o_window_buf, [T, TOK_O_COLS], dtype=pl.BF16)
+        tok_o_signal = pld.window(tok_o_signal_buf, [N_RANKS, 1], dtype=pl.INT32)
         decode_layer(
             x_hc[r],
             hc_attn_fn[r], hc_attn_scale[r], hc_attn_base[r],
@@ -447,6 +470,7 @@ def l3_decode_layer(
             reduce_window, reduce_signal,
             oproj_reduce_window, oproj_scale_window,
             oproj_reduce_signal, oproj_sync_signal,
+            tok_q_window, tok_q_signal, tok_o_window, tok_o_signal,
             layer_id, r,
             device=r,
         )

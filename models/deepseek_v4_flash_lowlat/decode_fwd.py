@@ -88,6 +88,8 @@ from decode_csa import (
     attention_csa,
     build_tensor_specs as build_csa_tensor_specs,
     clear_csa_oproj_signals,
+    TOK_Q_ROWS,
+    TOK_O_COLS,
 )
 from config import DECODE_START_POS, FLASH as MODEL_CONFIG, _parse_int_argv
 from decode_prepare import (
@@ -318,6 +320,10 @@ def decode_fwd(
     oproj_scale_window: pld.DistributedTensor[[CSA_OPROJ_SCALE_ROWS, 1], pl.FP32],
     oproj_reduce_signal: pld.DistributedTensor[[N_RANKS, 1], pl.INT32],
     oproj_sync_signal: pld.DistributedTensor[[N_RANKS, 1], pl.INT32],
+    tok_q_window: pld.DistributedTensor[[TOK_Q_ROWS, HEAD_DIM], pl.BF16],
+    tok_q_signal: pld.DistributedTensor[[N_RANKS, 1], pl.INT32],
+    tok_o_window: pld.DistributedTensor[[T, TOK_O_COLS], pl.BF16],
+    tok_o_signal: pld.DistributedTensor[[N_RANKS, 1], pl.INT32],
     lm_head_hidden_window: pld.DistributedTensor[[GROUP_LOGIT_ROWS, D], pl.BF16],
     lm_head_hidden_done: pld.DistributedTensor[[LM_HEAD_TP_SIZE, 1], pl.INT32],
     lm_head_logits_window: pld.DistributedTensor[[MAX_LOGIT_ROWS, LM_HEAD_VOCAB], pl.FP32],
@@ -481,6 +487,9 @@ def decode_fwd(
         # take 1 and 2 and the last CSA layer below takes 2 * HCA_NUM_LAYERS + 3,
         # the same numbering the MoE epoch beside it uses.
         csa_oproj_epoch: pl.Scalar[pl.INT32] = pl.cast(loop_i * 2 + 3, pl.INT32)
+        # One CSA layer per iteration, so the token-shard windows advance by one
+        # while oproj's epoch advances by two (it is shared with the HCA layer).
+        csa_tok_epoch: pl.Scalar[pl.INT32] = pl.cast(loop_i + 1, pl.INT32)
         hca_oproj_epoch: pl.Scalar[pl.INT32] = pl.cast(loop_i * 2 + 4, pl.INT32)
         hca_moe_epoch: pl.Scalar[pl.INT32] = pl.cast(loop_i * 2 + 4, pl.INT32)
         x_attn_csa: pl.Tensor[[T, HC_MULT, D], pl.FP32] = pl.create_tensor([T, HC_MULT, D], dtype=pl.FP32)
@@ -555,7 +564,8 @@ def decode_fwd(
                 x_attn_csa,
                 oproj_reduce_window, oproj_scale_window,
                 oproj_reduce_signal, oproj_sync_signal,
-                my_rank, csa_oproj_epoch,
+                tok_q_window, tok_q_signal, tok_o_window, tok_o_signal,
+                my_rank, csa_oproj_epoch, csa_tok_epoch,
             )
         with pl.scope():
             moe(
@@ -709,7 +719,8 @@ def decode_fwd(
             x_attn_last,
             oproj_reduce_window, oproj_scale_window,
             oproj_reduce_signal, oproj_sync_signal,
-            my_rank, last_oproj_epoch,
+            tok_q_window, tok_q_signal, tok_o_window, tok_o_signal,
+            my_rank, last_oproj_epoch, pl.cast(HCA_NUM_LAYERS + 1, pl.INT32),
         )
     with pl.scope():
         moe(
@@ -723,7 +734,9 @@ def decode_fwd(
             csa_layer_last, nt, my_rank, last_moe_epoch,
         )
     clear_moe_signals(pre_hc_hidden_out, reduce_signal)
-    clear_csa_oproj_signals(pre_hc_hidden_out, oproj_reduce_signal, oproj_sync_signal)
+    clear_csa_oproj_signals(
+        pre_hc_hidden_out, oproj_reduce_signal, oproj_sync_signal, tok_q_signal, tok_o_signal
+    )
     x_head: pl.Tensor[[T, D], pl.BF16] = pl.create_tensor([T, D], dtype=pl.BF16)
     with pl.scope():
         hc_head(pre_hc_hidden_out, hc_head_fn, hc_head_scale, hc_head_base, x_head)
@@ -833,6 +846,10 @@ def l2_decode_fwd(
     oproj_scale_window: pld.DistributedTensor[[CSA_OPROJ_SCALE_ROWS, 1], pl.FP32],
     oproj_reduce_signal: pld.DistributedTensor[[N_RANKS, 1], pl.INT32],
     oproj_sync_signal: pld.DistributedTensor[[N_RANKS, 1], pl.INT32],
+    tok_q_window: pld.DistributedTensor[[TOK_Q_ROWS, HEAD_DIM], pl.BF16],
+    tok_q_signal: pld.DistributedTensor[[N_RANKS, 1], pl.INT32],
+    tok_o_window: pld.DistributedTensor[[T, TOK_O_COLS], pl.BF16],
+    tok_o_signal: pld.DistributedTensor[[N_RANKS, 1], pl.INT32],
     embed_window: pld.DistributedTensor[[T, D], pl.BF16],
     embed_signal: pld.DistributedTensor[[N_RANKS, 1], pl.INT32],
     lm_head_hidden_window: pld.DistributedTensor[[GROUP_LOGIT_ROWS, D], pl.BF16],
@@ -908,6 +925,7 @@ def l2_decode_fwd(
         pre_hc_hidden_out, x_out, logits, sampled_ids,
         reduce_window, reduce_signal,
         oproj_reduce_window, oproj_scale_window, oproj_reduce_signal, oproj_sync_signal,
+        tok_q_window, tok_q_signal, tok_o_window, tok_o_signal,
         lm_head_hidden_window, lm_head_hidden_done, lm_head_logits_window, lm_head_logits_done,
         num_tokens_per_owner, my_rank,
     )
@@ -1013,6 +1031,12 @@ def l3_decode_fwd(
     oproj_scale_buf = pld.alloc_window_buffer([CSA_OPROJ_SCALE_ROWS, 1], dtype=pl.FP32)
     oproj_reduce_signal_buf = pld.alloc_window_buffer([N_RANKS, 1], dtype=pl.INT32)
     oproj_sync_signal_buf = pld.alloc_window_buffer([N_RANKS, 1], dtype=pl.INT32)
+    # The CSA attention is token-sharded, so it transposes q in on the head axis
+    # and o_packed out on the group axis; both windows are one 8 KB slice per pair.
+    tok_q_window_buf = pld.alloc_window_buffer([TOK_Q_ROWS, HEAD_DIM], dtype=pl.BF16)
+    tok_q_signal_buf = pld.alloc_window_buffer([N_RANKS, 1], dtype=pl.INT32)
+    tok_o_window_buf = pld.alloc_window_buffer([T, TOK_O_COLS], dtype=pl.BF16)
+    tok_o_signal_buf = pld.alloc_window_buffer([N_RANKS, 1], dtype=pl.INT32)
     # The LM head owns every window and counter it touches: a peer routes into
     # logits_window while still reading its own hidden_window.
     lm_head_hidden_window_buf = pld.alloc_window_buffer(GROUP_LOGIT_ROWS * D * 2)
@@ -1029,6 +1053,10 @@ def l3_decode_fwd(
         oproj_scale_window = pld.window(oproj_scale_buf, [CSA_OPROJ_SCALE_ROWS, 1], dtype=pl.FP32)
         oproj_reduce_signal = pld.window(oproj_reduce_signal_buf, [N_RANKS, 1], dtype=pl.INT32)
         oproj_sync_signal = pld.window(oproj_sync_signal_buf, [N_RANKS, 1], dtype=pl.INT32)
+        tok_q_window = pld.window(tok_q_window_buf, [TOK_Q_ROWS, HEAD_DIM], dtype=pl.BF16)
+        tok_q_signal = pld.window(tok_q_signal_buf, [N_RANKS, 1], dtype=pl.INT32)
+        tok_o_window = pld.window(tok_o_window_buf, [T, TOK_O_COLS], dtype=pl.BF16)
+        tok_o_signal = pld.window(tok_o_signal_buf, [N_RANKS, 1], dtype=pl.INT32)
         lm_head_hidden_window = pld.window(lm_head_hidden_window_buf, [GROUP_LOGIT_ROWS, D], dtype=pl.BF16)
         lm_head_hidden_done = pld.window(lm_head_hidden_done_buf, [LM_HEAD_TP_SIZE, 1], dtype=pl.INT32)
         lm_head_logits_window = pld.window(lm_head_logits_window_buf, [MAX_LOGIT_ROWS, LM_HEAD_VOCAB], dtype=pl.FP32)
@@ -1059,6 +1087,7 @@ def l3_decode_fwd(
             pre_hc_hidden_out[r], hidden_out[r], logits[r], sampled_ids[r],
             reduce_window, reduce_signal,
             oproj_reduce_window, oproj_scale_window, oproj_reduce_signal, oproj_sync_signal,
+            tok_q_window, tok_q_signal, tok_o_window, tok_o_signal,
             embed_window, embed_signal,
             lm_head_hidden_window, lm_head_hidden_done,
             lm_head_logits_window, lm_head_logits_done,

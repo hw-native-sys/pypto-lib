@@ -62,7 +62,11 @@ from decode_indexer import indexer
 from qkv_proj_rope import qkv_proj_rope
 from rmsnorm import rms_norm
 from rope_interleave import rope_interleave
-from decode_sparse_attn_csa import sparse_attn_csa_packed
+from decode_sparse_attn_csa import (
+    csa_q_all_to_all,
+    sparse_attn_csa_packed,
+)
+import decode_sparse_attn_csa as CSA
 # Imported by name, not via the module: the DSL parser needs a bare callee,
 # and an "import ... as" alias on a @pl.jit.inline callee fails specialization.
 import o_proj_tp as OTP
@@ -94,6 +98,10 @@ O_GROUP_IN = H * HEAD_DIM // O_GROUPS
 # Local names: the DSL parser does not resolve a module attribute inside a
 # tensor annotation, so OTP.* must not appear in a signature.
 OPROJ_N_RANKS = OTP.N_RANKS
+# Token-shard exchange windows: q in on the head axis, o_packed out on the
+# group axis. Both are one 8 KB slice per (src, dst) pair.
+TOK_Q_ROWS = CSA.H
+TOK_O_COLS = CSA.O_SHARD_COLS
 OPROJ_REDUCE_ROWS = OTP.REDUCE_WINDOW_ROWS
 OPROJ_SCALE_ROWS = OTP.SCALE_WINDOW_ROWS
 OPROJ_FIRST_EPOCH = OTP.FIRST_EPOCH
@@ -187,7 +195,12 @@ def attention_csa_packed(
     o_packed: pl.Tensor[[O_GROUPS * T, O_GROUP_IN], pl.BF16],
     post_t: pl.Tensor[[T, HC_MULT], pl.FP32],
     comb_t: pl.Tensor[[T, HC_MULT * HC_MULT], pl.FP32],
+    q_window: pld.DistributedTensor[[TOK_Q_ROWS, HEAD_DIM], pl.BF16],
+    q_signal: pld.DistributedTensor[[OPROJ_N_RANKS, 1], pl.INT32],
+    o_window: pld.DistributedTensor[[T, TOK_O_COLS], pl.BF16],
+    o_signal: pld.DistributedTensor[[OPROJ_N_RANKS, 1], pl.INT32],
     my_rank: pl.Scalar[pl.INT32],
+    tok_epoch: pl.Scalar[pl.INT32],
 ) -> pl.Scalar[pl.TASK_ID]:
     x_mixed = pl.create_tensor([T, D], dtype=pl.BF16)
     hc_pre(x_hc, hc_attn_fn, hc_attn_scale, hc_attn_base, x_mixed, post_t, comb_t)
@@ -275,6 +288,12 @@ def attention_csa_packed(
         pl.cast(my_rank, pl.INT32) * (H // O_GROUPS),
     )
 
+    # Transpose q onto the token shard right here. Everything between this push
+    # and qk_pv -- the KV writeback, the compressor, the whole indexer -- reads
+    # no q, so the exchange flies under work the layer was doing anyway and only
+    # its wait lands in front of the consumer.
+    q_push_tid = csa_q_all_to_all(q, q_window, q_signal, my_rank, tok_epoch)
+
     ori_block_num = pl.tensor.dim(kv_cache, 0)
     kv_cache_flat = pl.reshape(kv_cache, [ori_block_num * BLOCK_SIZE, HEAD_DIM])
     for wb_blk in pl.spmd(T // CSA_WB_TOKEN_TILE, name_hint="csa_cache_writeback"):
@@ -314,6 +333,7 @@ def attention_csa_packed(
         idx_score_unused, idx_topk_full,
         position_ids_bsd, idx_slot_mapping_bsd, inner_state_slot_mapping_bsd,
         kv_seq_lens, 0, late_dep,
+        my_rank,
     )
 
     # sparse_attn_csa now folds the compressed-slot masking + valid-block flags in from
@@ -322,9 +342,10 @@ def attention_csa_packed(
     position_ids_t1 = pl.reshape(position_ids, [T, 1])
 
     return sparse_attn_csa_packed(
-        q, kv_cache, window_swa_indices,
+        q_window, q_signal, q_push_tid, kv_cache, window_swa_indices,
         cmp_kv, cmp_block_table, idx_topk_flat, position_ids_t1,
-        attn_sink, rope_cos_t, rope_sin_t, o_packed, my_rank,
+        attn_sink, rope_cos_t, rope_sin_t, o_packed,
+        o_window, o_signal, my_rank, tok_epoch,
     )
 
 
@@ -383,10 +404,18 @@ def attention_csa(
     scale_window: pld.DistributedTensor[[OPROJ_SCALE_ROWS, 1], pl.FP32],
     reduce_signal: pld.DistributedTensor[[OPROJ_N_RANKS, 1], pl.INT32],
     sync_signal: pld.DistributedTensor[[OPROJ_N_RANKS, 1], pl.INT32],
+    q_window: pld.DistributedTensor[[TOK_Q_ROWS, HEAD_DIM], pl.BF16],
+    q_signal: pld.DistributedTensor[[OPROJ_N_RANKS, 1], pl.INT32],
+    o_window: pld.DistributedTensor[[T, TOK_O_COLS], pl.BF16],
+    o_signal: pld.DistributedTensor[[OPROJ_N_RANKS, 1], pl.INT32],
     my_rank: pl.Scalar[pl.INT32],
     oproj_epoch: pl.Scalar[pl.INT32],
+    # Counts CSA layers only. oproj's epoch is shared with the HCA layers and so
+    # advances twice per loop; these windows are notified by CSA layers alone, and
+    # a wait for an epoch nobody will reach hangs the card.
+    tok_epoch: pl.Scalar[pl.INT32],
 ):
-    """CSA layer whose output projection is sharded one group per card.
+    """CSA layer whose attention is token-sharded and projection group-sharded.
 
     Everything ahead of the projection is replicated exactly as today -- the
     shard boundary is the group axis, and group `my_rank` is heads
@@ -397,7 +426,8 @@ def attention_csa(
     comb_t = pl.create_tensor([T, HC_MULT * HC_MULT], dtype=pl.FP32)
     merge_tid = attention_csa_packed(
         x_hc, hc_attn_fn, hc_attn_scale, hc_attn_base, attn_norm_w, wq_a, wq_b, wq_b_scale, wkv, gamma_cq, gamma_ckv, freqs_cos, freqs_sin, cmp_wkv, cmp_wgate, cmp_ape, cmp_norm_w, compress_state, compress_state_block_table, idx_wq_b, idx_wq_b_scale, weights_proj, hadamard_idx, inner_wkv, inner_wgate, inner_ape, inner_norm_w, inner_compress_state, inner_compress_state_block_table, kv_cache, cmp_kv, cmp_block_table, idx_kv_cache, idx_kv_scale, idx_block_table, ori_slot_mapping, window_swa_indices, window_swa_lens, cmp_slot_mapping, idx_slot_mapping, state_slot_mapping, inner_state_slot_mapping, position_ids, kv_seq_lens, attn_sink,
-        wo_a_shard, wo_b_shard, o_packed, post_t, comb_t, my_rank,
+        wo_a_shard, wo_b_shard, o_packed, post_t, comb_t,
+        q_window, q_signal, o_window, o_signal, my_rank, tok_epoch,
     )
     attn_out = pl.create_tensor([T, D], dtype=pl.BF16)
     o_proj_tp_core(
@@ -413,6 +443,8 @@ def clear_csa_oproj_signals(
     completion_anchor: pl.Tensor[[T, HC_MULT, D], pl.FP32],
     reduce_signal: pld.DistributedTensor[[OPROJ_N_RANKS, 1], pl.INT32],
     sync_signal: pld.DistributedTensor[[OPROJ_N_RANKS, 1], pl.INT32],
+    q_signal: pld.DistributedTensor[[OPROJ_N_RANKS, 1], pl.INT32],
+    o_signal: pld.DistributedTensor[[OPROJ_N_RANKS, 1], pl.INT32],
 ):
     """Clear this rank's o-projection counters after its last CSA layer.
 
@@ -426,6 +458,8 @@ def clear_csa_oproj_signals(
         for src in pl.range(OPROJ_N_RANKS):
             pl.write(reduce_signal, [src, 0], zero)
             pl.write(sync_signal, [src, 0], zero)
+            pl.write(q_signal, [src, 0], zero)
+            pl.write(o_signal, [src, 0], zero)
 
 
 @pl.jit
@@ -483,15 +517,24 @@ def attention_csa_test(
     scale_window: pld.DistributedTensor[[OPROJ_SCALE_ROWS, 1], pl.FP32],
     reduce_signal: pld.DistributedTensor[[OPROJ_N_RANKS, 1], pl.INT32],
     sync_signal: pld.DistributedTensor[[OPROJ_N_RANKS, 1], pl.INT32],
+    q_window: pld.DistributedTensor[[TOK_Q_ROWS, HEAD_DIM], pl.BF16],
+    q_signal: pld.DistributedTensor[[OPROJ_N_RANKS, 1], pl.INT32],
+    o_window: pld.DistributedTensor[[T, TOK_O_COLS], pl.BF16],
+    o_signal: pld.DistributedTensor[[OPROJ_N_RANKS, 1], pl.INT32],
     my_rank: pl.Scalar[pl.INT32],
     oproj_epoch: pl.Scalar[pl.INT32],
+    # Counts CSA layers only. oproj's epoch is shared with the HCA layers and so
+    # advances twice per loop; these windows are notified by CSA layers alone, and
+    # a wait for an epoch nobody will reach hangs the card.
+    tok_epoch: pl.Scalar[pl.INT32],
 ):
     attention_csa(
         x_hc, hc_attn_fn, hc_attn_scale, hc_attn_base, attn_norm_w, wq_a, wq_b, wq_b_scale, wkv, gamma_cq, gamma_ckv, freqs_cos, freqs_sin, cmp_wkv, cmp_wgate, cmp_ape, cmp_norm_w, compress_state, compress_state_block_table, idx_wq_b, idx_wq_b_scale, weights_proj, hadamard_idx, inner_wkv, inner_wgate, inner_ape, inner_norm_w, inner_compress_state, inner_compress_state_block_table, kv_cache, cmp_kv, cmp_block_table, idx_kv_cache, idx_kv_scale, idx_block_table, ori_slot_mapping, window_swa_indices, window_swa_lens, cmp_slot_mapping, idx_slot_mapping, state_slot_mapping, inner_state_slot_mapping, position_ids, kv_seq_lens, attn_sink,
         wo_a_shard, wo_b_shard, wo_b_scale, x_out,
-        reduce_window, scale_window, reduce_signal, sync_signal, my_rank, oproj_epoch,
+        reduce_window, scale_window, reduce_signal, sync_signal,
+        q_window, q_signal, o_window, o_signal, my_rank, oproj_epoch, tok_epoch,
     )
-    clear_csa_oproj_signals(x_out, reduce_signal, sync_signal)
+    clear_csa_oproj_signals(x_out, reduce_signal, sync_signal, q_signal, o_signal)
     return x_out
 
 
@@ -552,16 +595,28 @@ def l3_attention_csa(
     scale_window_buf = pld.alloc_window_buffer([OPROJ_SCALE_ROWS, 1], dtype=pl.FP32)
     reduce_signal_buf = pld.alloc_window_buffer([OPROJ_N_RANKS, 1], dtype=pl.INT32)
     sync_signal_buf = pld.alloc_window_buffer([OPROJ_N_RANKS, 1], dtype=pl.INT32)
+    # Token-shard exchange: q lands head-ordered for this card's token, o_packed
+    # lands token-ordered for this card's group.
+    q_window_buf = pld.alloc_window_buffer([TOK_Q_ROWS, HEAD_DIM], dtype=pl.BF16)
+    q_signal_buf = pld.alloc_window_buffer([OPROJ_N_RANKS, 1], dtype=pl.INT32)
+    o_window_buf = pld.alloc_window_buffer([T, TOK_O_COLS], dtype=pl.BF16)
+    o_signal_buf = pld.alloc_window_buffer([OPROJ_N_RANKS, 1], dtype=pl.INT32)
 
     for r in pl.range(pld.world_size()):
         reduce_window = pld.window(reduce_window_buf, [OPROJ_REDUCE_ROWS, D], dtype=pl.FP32)
         scale_window = pld.window(scale_window_buf, [OPROJ_SCALE_ROWS, 1], dtype=pl.FP32)
         reduce_signal = pld.window(reduce_signal_buf, [OPROJ_N_RANKS, 1], dtype=pl.INT32)
         sync_signal = pld.window(sync_signal_buf, [OPROJ_N_RANKS, 1], dtype=pl.INT32)
+        q_window = pld.window(q_window_buf, [TOK_Q_ROWS, HEAD_DIM], dtype=pl.BF16)
+        q_signal = pld.window(q_signal_buf, [OPROJ_N_RANKS, 1], dtype=pl.INT32)
+        o_window = pld.window(o_window_buf, [T, TOK_O_COLS], dtype=pl.BF16)
+        o_signal = pld.window(o_signal_buf, [OPROJ_N_RANKS, 1], dtype=pl.INT32)
         attention_csa_test(
             x_hc[r], hc_attn_fn[r], hc_attn_scale[r], hc_attn_base[r], attn_norm_w[r], wq_a[r], wq_b[r], wq_b_scale[r], wkv[r], gamma_cq[r], gamma_ckv[r], freqs_cos[r], freqs_sin[r], cmp_wkv[r], cmp_wgate[r], cmp_ape[r], cmp_norm_w[r], compress_state[r], compress_state_block_table[r], idx_wq_b[r], idx_wq_b_scale[r], weights_proj[r], hadamard_idx[r], inner_wkv[r], inner_wgate[r], inner_ape[r], inner_norm_w[r], inner_compress_state[r], inner_compress_state_block_table[r], kv_cache[r], cmp_kv[r], cmp_block_table[r], idx_kv_cache[r], idx_kv_scale[r], idx_block_table[r], ori_slot_mapping[r], window_swa_indices[r], window_swa_lens[r], cmp_slot_mapping[r], idx_slot_mapping[r], state_slot_mapping[r], inner_state_slot_mapping[r], position_ids[r], kv_seq_lens[r], attn_sink[r],
             wo_a_shard[r], wo_b_shard[r], wo_b_scale[r], x_out[r],
-            reduce_window, scale_window, reduce_signal, sync_signal, r, OPROJ_FIRST_EPOCH, device=r,
+            reduce_window, scale_window, reduce_signal, sync_signal,
+            q_window, q_signal, o_window, o_signal, r, OPROJ_FIRST_EPOCH,
+            pl.const(1, pl.INT32), device=r,
         )
 
 
