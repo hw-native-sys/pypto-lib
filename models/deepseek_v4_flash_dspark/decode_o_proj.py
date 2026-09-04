@@ -277,14 +277,24 @@ def o_group_a2a(
     publish_count: pl.Scalar[pl.INT32],
 ):
     """Finish a non-overlapping producer-fused exchange and release its window."""
-    with pl.at(level=pl.Level.CORE_GROUP, name_hint="o_group_a2a_wait", deps=[publish_dep]) as wait_tid:
+    with pl.at(
+        level=pl.Level.CORE_GROUP,
+        name_hint="o_group_a2a_wait",
+        deps=[publish_dep],
+        allow_early_resolve=True,
+    ) as wait_tid:
         expected = pl.cast(publish_count, pl.INT32)
         for source_tp in pl.range(TP_SIZE):
             if source_tp != tp_rank:
                 pld.system.wait(signal=exchange_signal, offsets=[source_tp, 0], expected=expected, cmp=pld.WaitCmp.Ge)
 
     group_t = TP_SIZE * local_t
-    with pl.spmd(ATTENTION_PUBLISH_WORKERS, name_hint="o_group_a2a_gather", deps=[wait_tid]) as gather_tid:
+    with pl.spmd(
+        ATTENTION_PUBLISH_WORKERS,
+        name_hint="o_group_a2a_gather",
+        deps=[wait_tid],
+        allow_early_resolve=True,
+    ) as gather_tid:
         worker = pl.tile.get_block_idx()
         for local_group in pl.range(LOCAL_O_GROUPS):
             group_base_row = local_group * GROUP_T_PAD
@@ -298,7 +308,12 @@ def o_group_a2a(
                     0:O_GROUP_IN,
                 ]
 
-    with pl.at(level=pl.Level.CORE_GROUP, name_hint="o_group_a2a_complete", deps=[gather_tid]):
+    with pl.at(
+        level=pl.Level.CORE_GROUP,
+        name_hint="o_group_a2a_complete",
+        deps=[gather_tid],
+        allow_early_resolve=True,
+    ):
         completion_anchor = pl.read(local_groups_out, [0, 0])
         for peer_tp in pl.range(TP_SIZE):
             if peer_tp != tp_rank:
@@ -502,7 +517,11 @@ def o_proj_reduce_scatter(
             attention_row = local_group * GROUP_T_PAD + own_base
             o_a_col = local_group * O_LORA
 
-            with pl.spmd(own_a_rows * (O_LORA // O_A_N_TILE), name_hint="tp_o_a"):
+            with pl.spmd(
+                own_a_rows * (O_LORA // O_A_N_TILE),
+                name_hint="tp_o_a",
+                allow_early_resolve=True,
+            ):
                 pa_unit = pl.tile.get_block_idx()
                 pa_rb = pa_unit // (O_LORA // O_A_N_TILE)
                 pa_nb = pa_unit - pa_rb * (O_LORA // O_A_N_TILE)
@@ -521,7 +540,11 @@ def o_proj_reduce_scatter(
                 pa_valid = pl.set_validshape(pa_acc, pa_rows, O_A_N_TILE)
                 own_a_fp32[pa_t0 : pa_t0 + O_A_T_TILE, pa_wrow : pa_wrow + O_A_N_TILE] = pa_valid
 
-            with pl.spmd(O_A_QUANT_WORKERS, name_hint="tp_o_a_quant"):
+            with pl.spmd(
+                O_A_QUANT_WORKERS,
+                name_hint="tp_o_a_quant",
+                allow_early_resolve=True,
+            ):
                 qz_worker = pl.tile.get_block_idx()
                 for qz_blk in pl.range(qz_worker, own_quant_blocks, O_A_QUANT_WORKERS):
                     qz_t = qz_blk * QUANT_T_TILE
@@ -553,7 +576,11 @@ def o_proj_reduce_scatter(
                         qz_zero_i8, qz_prows, O_LORA
                     )
 
-            with pl.spmd(own_b_rows * (D // O_B_D_TILE), name_hint="tp_o_b"):
+            with pl.spmd(
+                own_b_rows * (D // O_B_D_TILE),
+                name_hint="tp_o_b",
+                allow_early_resolve=True,
+            ):
                 pb_unit = pl.tile.get_block_idx()
                 pb_tb = pb_unit // (D // O_B_D_TILE)
                 pb_db = pb_unit - pb_tb * (D // O_B_D_TILE)
@@ -574,6 +601,7 @@ def o_proj_reduce_scatter(
         with pl.spmd(
             O_RS_DEQUANT_WORKERS,
             name_hint="tp_o_b_dequant",
+            allow_early_resolve=True,
             optimizations=[pl.cross_core_slot(slot_num=2)],
         ):
             dq_worker = pl.tile.get_block_idx()
@@ -606,6 +634,7 @@ def o_proj_reduce_scatter(
     with pl.spmd(
         O_RS_PUBLISH_WORKERS,
         name_hint="tp_o_b_publish",
+        allow_early_resolve=True,
     ) as publish_tid:
         pub_worker = pl.tile.get_block_idx()
         # Flatten (owner, row block) into one work list: put_rows alone is under
@@ -639,13 +668,23 @@ def o_proj_reduce_scatter(
                     op=pld.NotifyOp.AtomicAdd,
                 )
 
-    with pl.at(level=pl.Level.CORE_GROUP, name_hint="tp_o_rs_wait", deps=[publish_tid]) as wait_tid:
+    with pl.at(
+        level=pl.Level.CORE_GROUP,
+        name_hint="tp_o_rs_wait",
+        deps=[publish_tid],
+        allow_early_resolve=True,
+    ) as wait_tid:
         expected = pl.cast(O_RS_PUBLISH_WORKERS, pl.INT32)
         for source_tp in pl.range(TP_SIZE):
             if source_tp != tp_rank:
                 pld.system.wait(signal=reduce_signal, offsets=[source_tp, 0], expected=expected, cmp=pld.WaitCmp.Ge)
 
-    with pl.spmd(O_RS_REDUCE_WORKERS, name_hint="tp_o_rs_reduce", deps=[wait_tid]) as reduce_tid:
+    with pl.spmd(
+        O_RS_REDUCE_WORKERS,
+        name_hint="tp_o_rs_reduce",
+        deps=[wait_tid],
+        allow_early_resolve=True,
+    ) as reduce_tid:
         worker = pl.tile.get_block_idx()
         for block in pl.range(worker, local_t * (D // O_RS_D_TILE), O_RS_REDUCE_WORKERS):
             local_row = block // (D // O_RS_D_TILE)
@@ -661,7 +700,12 @@ def o_proj_reduce_scatter(
             reduced = pl.cast(reduce_acc, target_type=pl.BF16, mode="rint")
             pl.store(reduced, [local_row, d0], local_out)
 
-    with pl.at(level=pl.Level.CORE_GROUP, name_hint="tp_o_rs_complete", deps=[reduce_tid]):
+    with pl.at(
+        level=pl.Level.CORE_GROUP,
+        name_hint="tp_o_rs_complete",
+        deps=[reduce_tid],
+        allow_early_resolve=True,
+    ):
         completion_anchor = pl.read(local_out, [0, 0])
         for peer_tp in pl.range(TP_SIZE):
             if peer_tp != tp_rank:
