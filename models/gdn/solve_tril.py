@@ -18,9 +18,9 @@ Straight port of `megagdn-pto/kernels/pto/tri_inverse_impl.cpp`
 
   phase 1, the "inv trick", on the FRACTAL-sized diagonal blocks only:
       N = blockdiag_F(A);  X = I - N;  Y = N @ N
-      3x:  X = X + X @ Y;  Y = Y @ Y        (Y not updated on the last pass)
-  which is the alternating Neumann sum (I-N)(I+N^2)(I+N^4)(I+N^8) -- EXACT, not
-  truncated, because N is nilpotent with N^F = 0 inside an F-block.
+      NDOUBLE x:  X = X + X @ Y;  Y = Y @ Y   (Y not updated on the last pass)
+  which is the alternating Neumann sum (I-N)(I+N^2)(I+N^4)...(I+N^(F/2)) --
+  EXACT, not truncated, because N is nilpotent with N^F = 0 inside an F-block.
 
   phase 2, the unrolled recursion, doubling the block size:
       for bs in F, 2F, 4F ... < CHUNK:
@@ -32,6 +32,44 @@ Straight port of `megagdn-pto/kernels/pto/tri_inverse_impl.cpp`
 
   (The reference calls this branch `swap_parity=true`. Its default branch is the
   upper-triangular mirror, `X = E + (I - E @ A) @ O`. `A` here is lower.)
+
+FRACTAL is a tuned knob, not a constant of the algorithm
+-------------------------------------------------------
+Phase 1 *is* the doubling algorithm; FRACTAL says how much of the matrix it
+covers. Every doubling of F removes one phase-2 level, which is 4 matmuls and one
+round of cube<->vector crossings, and adds one phase-1 step, which is 2. So
+raising F is strictly cheaper -- until FP16 runs out of precision, because a
+larger F means more of the inverse is built by chaining rounded FP16 products
+instead of by the exact block recursion.
+
+Measured on a2a3, T = 8192, against upstream's own acceptance criterion
+(`allclose(5e-5, 0.1)` AND relative Frobenius <= 1e-4) on upstream's own
+generator, which is what the criterion was calibrated on:
+
+    F    matmuls  phase-2 levels    us      frob        verdict
+    16      20          3         1049.3   7.544e-05    pass
+    32      18          2          906.4   7.500e-05    pass   <- shipped
+    64      16          1          770.3   1.128e-04    FAILS the gate
+    128     14          0          468.4   8.807e-04    FAILS the gate
+
+(megagdn-pto's own tri_inverse is 511.9 us on the same card in the same grant.)
+
+F = 32 is the largest block size that keeps the accuracy of F = 16 -- they are
+indistinguishable over 30 seeds (worst 7.706e-05 against 7.724e-05, a 1.30x gate
+margin either way). F = 64 misses by 13% and F = 128 by 9x, consistently, so
+neither is a tuning question.
+
+There is little room to find: upstream's 1e-4 gate sits at only 1.79x the FP16
+floor of this problem, so any change costing more than ~1.8x of floor error fails
+however fast it is.
+
+Worth knowing if the contract ever changes: on *real* GDN `A` from
+scaled_dot_kkt, which is far better conditioned (cond ~1.2 against ~6.9), every F
+passes with room and F = 128 is the most accurate of all at 5.6e-07. F = 128 is
+also the only F with no vector ops at all, and therefore no cube<->vector
+crossing -- which is why it drops 302 us against F = 64 for only two fewer
+matmuls, and why at 468.4 us it is *faster than the reference*. It is held back
+solely by upstream's synthetic acceptance input.
 
 Two deviations from the reference, both forced by what PyPTO can express.
 
@@ -63,8 +101,9 @@ import pypto.language as pl
 T = 8192                # tokens (single sequence, B = 1)
 H = 16                  # value heads
 CHUNK = 128             # chunk size in tokens; A is [CHUNK, CHUNK] per head
-FRACTAL = 16            # reference's FractalSize: the block the Neumann sum is exact on
-NLEVEL = 3              # phase-2 levels, log2(CHUNK / FRACTAL)
+FRACTAL = 32            # doubling block size: the block the Neumann sum is exact on
+NDOUBLE = 4             # phase-1 X updates after X = I - N, log2(FRACTAL) - 1
+NLEVEL = 2              # phase-2 levels, log2(CHUNK / FRACTAL)
 
 # Constant cube operands and the phase-2 block masks, all FP16: X is narrowed on
 # the way out of the FP32 staging buffer, before it is masked.
@@ -73,9 +112,9 @@ C_NEG_I = 1             # negative identity
 C_FRAC = 2              # 1 inside the FRACTAL-sized diagonal blocks; multiplies A, so FP16
 C_NEG_ONES = 3          # all -1: negates A on the vector unit, see below
 NCONST = 4
-M_EVEN = 0              # even bs-diagonal blocks, bs = 16, 32, 64
-M_ODD = 3               # odd  bs-diagonal blocks, bs = 16, 32, 64
-NMASK = 6
+M_EVEN = 0              # even bs-diagonal blocks, bs = 32, 64
+M_ODD = 2               # odd  bs-diagonal blocks, bs = 32, 64
+NMASK = 4
 
 
 @pl.jit
@@ -105,20 +144,24 @@ def gdn_solve_tril(
 
                 # phase 1 -- inv trick on the FRACTAL-sized diagonal blocks
                 n16 = pl.mul(a16, m_frac)
-                x_acc = pl.matmul(n16, neg_i, out_dtype=pl.FP32)
-                x_acc = pl.matmul_acc(x_acc, neg_i, neg_i)      # X = I - N
-                x16 = pl.cast(x_acc, target_type=pl.FP16, mode="rint")
+                xa = pl.matmul(n16, neg_i, out_dtype=pl.FP32)
+                xa = pl.matmul_acc(xa, neg_i, neg_i)            # X = I - N
+                x16 = pl.cast(xa, target_type=pl.FP16, mode="rint")
                 y16 = pl.cast(pl.matmul(n16, n16, out_dtype=pl.FP32),
                               target_type=pl.FP16, mode="rint")
-                for it in pl.unroll(NLEVEL - 1):
-                    xa = pl.matmul(x16, ident, out_dtype=pl.FP32)
+                for it in pl.unroll(NDOUBLE - 1):
+                    # Accumulate straight onto the FP32 X. The reference spends
+                    # a matmul per level copying X into a fresh accumulator
+                    # (`TMATMUL(c, X, I)`) because its c_l0 buffers are needed
+                    # for other things in between; ours are not, and `xa`
+                    # already holds X, so this is the same arithmetic in one
+                    # matmul instead of two. Worth 4 of 22 matmuls here.
                     xa = pl.matmul_acc(xa, x16, y16)            # X = X + X @ Y
                     x16 = pl.cast(xa, target_type=pl.FP16, mode="rint")
                     y16 = pl.cast(pl.matmul(y16, y16, out_dtype=pl.FP32),
                                   target_type=pl.FP16, mode="rint")
                 # last pass leaves Y alone -- the reference does the same, and
-                # N^16 = 0 makes the sum exact at this point anyway.
-                xa = pl.matmul(x16, ident, out_dtype=pl.FP32)
+                # N^FRACTAL = 0 makes the sum exact at this point anyway.
                 xa = pl.matmul_acc(xa, x16, y16)
                 # -A on the VECTOR unit, not as the reference's (-I) @ A matmul.
                 # A tensor slice cannot be both a vector operand and a cube
@@ -129,7 +172,7 @@ def gdn_solve_tril(
                 neg_a = pl.mul(a16, neg_ones)
                 xg = pl.cast(xa, target_type=pl.FP16, mode="rint")
 
-                # phase 2 -- unrolled recursion, bs = FRACTAL, 2F, 4F
+                # phase 2 -- unrolled recursion, bs = FRACTAL ... CHUNK/2
                 for lv in pl.unroll(NLEVEL):
                     e16 = pl.mul(xg, pl.slice(masks, [CHUNK, CHUNK],
                                               [(M_EVEN + lv) * CHUNK, 0]))
