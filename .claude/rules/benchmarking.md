@@ -82,6 +82,64 @@ PYPTO_BENCH=1 PYPTO_BENCH_ROUNDS=20 python <kernel>.py -p a2a3 -d 0 --save-data
 PYPTO_BENCH=1 PYPTO_BENCH_ROUNDS=20 python <kernel>.py -p a2a3 -d 0 --golden-data build_output/<ProgramName>_<ts>/data
 ```
 
+## The Frozen Benchmark Datasets
+
+`bench_data/layer{0,2,3}/data` holds the frozen input + golden sets the decode
+layer is benchmarked on: layer 0 = SWA, layer 2 = CSA, layer 3 = HCA. They live
+outside `build_output/` on purpose, because that directory is wiped routinely and
+regenerating a set costs a full compile plus a torch golden. `bench_data/` is
+gitignored. Reuse them:
+
+```bash
+PYPTO_BENCH=1 PYPTO_BENCH_ROUNDS=50 PYPTO_BENCH_WARMUP=5 \
+  python models/deepseek_v4_flash_lowlat/decode_layer.py -p a2a3 --tp 8 \
+  -d 0,1,2,3,4,5,6,7 --layer-id 3 --golden-data bench_data/layer3/data
+```
+
+**Never compare a number taken on one dataset against a number taken on another.**
+How many experts a step activates is a property of the dataset, and it moves MoE
+wall time by tens of microseconds.
+
+### The activated-expert count, and why it is pinned below the maximum
+
+The MoE balancer splits (activated experts + 1) work items over `NUM_CORES` = 24.
+A step can activate at most `T * TOPK` = 48, and 48 is the one value that pushes a
+core to a **third** round while every other core takes two -- a long tail worth
+~70 us of `exp_routed_balanced` span. Real routing collides well below the
+maximum: 8 tokens drawing 6 distinct experts each out of 256 lands on 44 on
+average, and hits 48 about 1.5 % of the time.
+
+Two routing paths feed it, and they are not equally exposed:
+
+| Layers | Path | Selected by | Activation count |
+| ------ | ---- | ----------- | ---------------- |
+| `layer_id < N_HASH_LAYERS` (0, 1, 2) | hash | `tid2eid[input_ids]` -- a fixture tensor | whatever the fixture makes it |
+| `layer_id >= N_HASH_LAYERS` (3+) | score | argsort of the gate scores | data-dependent, naturally ~44 |
+
+The hash path is the one a fixture can get wrong, and it was: a packed
+`tid2eid[v] = (v * TOPK + [0..5]) % N_EXPERTS` with `input_ids = arange(T)` routes
+the T tokens to 48 *distinct* experts every single run -- simultaneously the
+worst case for the balancer and a case real routing essentially never produces.
+`moe.decode_route_rows()` now redraws those rows from a fixed seed
+(`moe.MOE_ROUTE_SEED`) and rejects a draw that hits the maximum.
+
+**When you regenerate a dataset**, check the count before trusting any number
+from it:
+
+```bash
+python -c "
+import torch
+d='bench_data/layer0/data'
+t=torch.load(d+'/in/tid2eid.pt'); i=torch.load(d+'/in/input_ids.pt')
+print(int(t[0][i[0].flatten().long()].unique().numel()))"   # expect < 48
+```
+
+That check is only meaningful for a **hash** layer; on a score layer the count
+comes from the gate scores and the tensors say nothing about it. Regenerate only
+when specs, inputs, or the reference computation change -- and when you do,
+re-freeze all three together and re-state the baselines, because every previously
+recorded number was taken on the old sets.
+
 ## Parallel Sweeps — One Card per Variant
 
 A single-card entry takes a plain `-d N`, so a box with 8 NPUs can measure 8

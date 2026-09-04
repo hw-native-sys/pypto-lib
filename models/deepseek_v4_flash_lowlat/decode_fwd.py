@@ -105,6 +105,7 @@ from moe import (
     TOPK,
     VOCAB,
     build_tensor_specs as build_moe_tensor_specs,
+    decode_route_rows,
     clear_moe_signals,
     moe,
 )
@@ -1679,6 +1680,11 @@ def build_single_layer_tensor_specs(
                 base = torch.arange(VOCAB, dtype=torch.int32).reshape(VOCAB, 1) * TOPK
                 offs = torch.arange(TOPK, dtype=torch.int32).reshape(1, TOPK)
                 table = (base + offs) % N_EXPERTS
+                # Same redraw as decode_layer: the packed arange routes the T rows
+                # input_ids reads to T * TOPK distinct experts, the maximum a step
+                # can activate and the one value that costs the MoE balancer an
+                # extra round. See moe.decode_route_rows.
+                table[:T] = decode_route_rows()
                 return table.unsqueeze(0).expand(N_RANKS, -1, -1).contiguous()
 
             specs.append(TensorSpec("tid2eid", spec.shape, spec.dtype, init_value=init_tid2eid))

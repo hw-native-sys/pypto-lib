@@ -63,6 +63,9 @@ Thumbs.db
 *.log
 
 # Project-specific
+# Frozen benchmark inputs + goldens, kept out of build_output so a routine
+# build_output wipe does not destroy them. See .claude/rules/benchmarking.md.
+bench_data/
 KNOWN_PYPTO_ISSUES.md*
 KNOWN_PYPTO_ISSUES/
 # Retained so a developer's pre-rename local log stays ignored
