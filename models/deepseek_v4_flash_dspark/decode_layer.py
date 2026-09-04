@@ -68,6 +68,11 @@ DECODE_SEQ = config.DECODE_SEQ
 MOE_TOKENS = moe_module.T
 TP_GROUPS = EP_SIZE // TP_SIZE
 MAX_PUBLIC_TENSOR_DIMS = 5
+# Tokens per attention/MoE hand-off block (32 blocks at MOE_TOKENS=128). One
+# token per block leaves each block with ~2.6 us of copy against ~8.4 us of
+# launch overhead. The tile stays an unrolled run of one-token copies: a whole
+# 4-token slab would stage 256 KB through a 184 KB Vec buffer.
+MOE_PACK_T_TILE = 4
 
 # SWA and MoE use the same hidden-state layout. SWA has a dynamic active-token
 # extent, while MoE keeps its fixed per-rank capacity and consumes only the
@@ -294,6 +299,10 @@ def _validate_import_contract():
     if MOE_TOKENS % DECODE_SEQ != 0:
         raise ValueError(
             f"MoE capacity {MOE_TOKENS} must be divisible by S={DECODE_SEQ}",
+        )
+    if MOE_TOKENS % MOE_PACK_T_TILE != 0:
+        raise ValueError(
+            f"hand-off tile {MOE_PACK_T_TILE} must divide MoE capacity {MOE_TOKENS}",
         )
     for rank in range(EP_SIZE):
         tp_rank = rank % TP_SIZE
@@ -574,13 +583,18 @@ def decode_layer_swa(
 
     with pl.scope():
         x_attn_moe = pl.create_tensor([MOE_TOKENS, HC_MULT, D], dtype=pl.FP32)
-        for token in pl.spmd(MOE_TOKENS, name_hint="decode_layer_attn_pack"):
-            if token < active_t:
-                x_attn_moe[token : token + 1, 0 : HC_MULT, 0 : D] = (
-                    x_attn_active[token : token + 1, 0 : HC_MULT, 0 : D]
-                )
-            else:
-                x_attn_moe[token : token + 1, 0 : HC_MULT, 0 : D] = pl.full([1, HC_MULT, D], dtype=pl.FP32, value=0.0)
+        for block in pl.spmd(MOE_TOKENS // MOE_PACK_T_TILE, name_hint="decode_layer_attn_pack"):
+            t0 = block * MOE_PACK_T_TILE
+            for dt in pl.unroll(MOE_PACK_T_TILE):
+                token = t0 + dt
+                if token < active_t:
+                    x_attn_moe[token : token + 1, 0 : HC_MULT, 0 : D] = (
+                        x_attn_active[token : token + 1, 0 : HC_MULT, 0 : D]
+                    )
+                else:
+                    x_attn_moe[token : token + 1, 0 : HC_MULT, 0 : D] = pl.full(
+                        [1, HC_MULT, D], dtype=pl.FP32, value=0.0,
+                    )
 
         moe(
             x_attn_moe,
@@ -596,9 +610,14 @@ def decode_layer_swa(
             layer_id, local_t, my_rank, moe_epoch,
         )
 
-        for token in pl.spmd(MOE_TOKENS, name_hint="decode_layer_active_trim"):
-            if token < active_t:
-                x_next[token : token + 1, 0 : HC_MULT, 0 : D] = (x_moe_next[token : token + 1, 0 : HC_MULT, 0 : D])
+        for block in pl.spmd(MOE_TOKENS // MOE_PACK_T_TILE, name_hint="decode_layer_active_trim"):
+            t0 = block * MOE_PACK_T_TILE
+            for dt in pl.unroll(MOE_PACK_T_TILE):
+                token = t0 + dt
+                if token < active_t:
+                    x_next[token : token + 1, 0 : HC_MULT, 0 : D] = (
+                        x_moe_next[token : token + 1, 0 : HC_MULT, 0 : D]
+                    )
     return x_next
 
 
@@ -968,13 +987,18 @@ def decode_layer_hca(
 
     with pl.scope():
         x_attn_moe = pl.create_tensor([MOE_TOKENS, HC_MULT, D], dtype=pl.FP32)
-        for token in pl.spmd(MOE_TOKENS, name_hint="decode_layer_attn_pack"):
-            if token < active_t:
-                x_attn_moe[token : token + 1, 0 : HC_MULT, 0 : D] = (
-                    x_attn_active[token : token + 1, 0 : HC_MULT, 0 : D]
-                )
-            else:
-                x_attn_moe[token : token + 1, 0 : HC_MULT, 0 : D] = pl.full([1, HC_MULT, D], dtype=pl.FP32, value=0.0)
+        for block in pl.spmd(MOE_TOKENS // MOE_PACK_T_TILE, name_hint="decode_layer_attn_pack"):
+            t0 = block * MOE_PACK_T_TILE
+            for dt in pl.unroll(MOE_PACK_T_TILE):
+                token = t0 + dt
+                if token < active_t:
+                    x_attn_moe[token : token + 1, 0 : HC_MULT, 0 : D] = (
+                        x_attn_active[token : token + 1, 0 : HC_MULT, 0 : D]
+                    )
+                else:
+                    x_attn_moe[token : token + 1, 0 : HC_MULT, 0 : D] = pl.full(
+                        [1, HC_MULT, D], dtype=pl.FP32, value=0.0,
+                    )
 
         moe(
             x_attn_moe,
@@ -990,9 +1014,14 @@ def decode_layer_hca(
             layer_id, local_t, my_rank, moe_epoch,
         )
 
-        for token in pl.spmd(MOE_TOKENS, name_hint="decode_layer_active_trim"):
-            if token < active_t:
-                x_next[token : token + 1, 0 : HC_MULT, 0 : D] = (x_moe_next[token : token + 1, 0 : HC_MULT, 0 : D])
+        for block in pl.spmd(MOE_TOKENS // MOE_PACK_T_TILE, name_hint="decode_layer_active_trim"):
+            t0 = block * MOE_PACK_T_TILE
+            for dt in pl.unroll(MOE_PACK_T_TILE):
+                token = t0 + dt
+                if token < active_t:
+                    x_next[token : token + 1, 0 : HC_MULT, 0 : D] = (
+                        x_moe_next[token : token + 1, 0 : HC_MULT, 0 : D]
+                    )
     return x_next
 
 
@@ -1448,13 +1477,18 @@ def decode_layer_csa(
 
     with pl.scope():
         x_attn_moe = pl.create_tensor([MOE_TOKENS, HC_MULT, D], dtype=pl.FP32)
-        for token in pl.spmd(MOE_TOKENS, name_hint="decode_layer_attn_pack"):
-            if token < active_t:
-                x_attn_moe[token : token + 1, 0 : HC_MULT, 0 : D] = (
-                    x_attn_active[token : token + 1, 0 : HC_MULT, 0 : D]
-                )
-            else:
-                x_attn_moe[token : token + 1, 0 : HC_MULT, 0 : D] = pl.full([1, HC_MULT, D], dtype=pl.FP32, value=0.0)
+        for block in pl.spmd(MOE_TOKENS // MOE_PACK_T_TILE, name_hint="decode_layer_attn_pack"):
+            t0 = block * MOE_PACK_T_TILE
+            for dt in pl.unroll(MOE_PACK_T_TILE):
+                token = t0 + dt
+                if token < active_t:
+                    x_attn_moe[token : token + 1, 0 : HC_MULT, 0 : D] = (
+                        x_attn_active[token : token + 1, 0 : HC_MULT, 0 : D]
+                    )
+                else:
+                    x_attn_moe[token : token + 1, 0 : HC_MULT, 0 : D] = pl.full(
+                        [1, HC_MULT, D], dtype=pl.FP32, value=0.0,
+                    )
 
         moe(
             x_attn_moe,
@@ -1470,9 +1504,14 @@ def decode_layer_csa(
             layer_id, local_t, my_rank, moe_epoch,
         )
 
-        for token in pl.spmd(MOE_TOKENS, name_hint="decode_layer_active_trim"):
-            if token < active_t:
-                x_next[token : token + 1, 0 : HC_MULT, 0 : D] = (x_moe_next[token : token + 1, 0 : HC_MULT, 0 : D])
+        for block in pl.spmd(MOE_TOKENS // MOE_PACK_T_TILE, name_hint="decode_layer_active_trim"):
+            t0 = block * MOE_PACK_T_TILE
+            for dt in pl.unroll(MOE_PACK_T_TILE):
+                token = t0 + dt
+                if token < active_t:
+                    x_next[token : token + 1, 0 : HC_MULT, 0 : D] = (
+                        x_moe_next[token : token + 1, 0 : HC_MULT, 0 : D]
+                    )
     return x_next
 
 

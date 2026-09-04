@@ -39,6 +39,8 @@ D_TILE = 256
 ROW_PAD = 8
 FFN_REDUCE_TILE = D // ROW_PAD
 assert D % ROW_PAD == 0
+FFN_NORM_T_TILE = 4     # tokens per ffn_norm block; one per block is launch-bound
+assert GATE_M_TILE % FFN_NORM_T_TILE == 0
 GATE_D_TILE = 2048
 assert D % GATE_D_TILE == 0, "gate K-loop must cover D"
 QUANT_TILE = 256
@@ -86,46 +88,50 @@ def gate(
     if active_gate_tokens > T:
         active_gate_tokens = pl.cast(T, pl.INDEX)
 
-    # One token per core with two-level full-row reductions.
+    # A run of tokens per core with two-level full-row reductions. The run walks
+    # with pl.range so one token's tiles stay live at a time: the row buffers are
+    # ~110 KB against a 184 KB Vec budget, so an unrolled run would not fit.
     norm_w_2d = pl.reshape(norm_w, [1, D])
-    for tok in pl.spmd(active_gate_tokens, name_hint="ffn_norm", allow_early_resolve=True):
-        rms_x = pl.cast(pl.tile.load(x_mixed, [tok, 0], [1, D]), pl.FP32)
-        rms_w = pl.cast(pl.tile.load(norm_w_2d, [0, 0], [1, D]), pl.FP32)
-        xg = pl.mul(rms_x, rms_w)
-        pl.tile.store(xg, [tok, 0], xg_buf, shapes=[1, D])
+    for tok_block in pl.spmd(active_gate_tokens // FFN_NORM_T_TILE, name_hint="ffn_norm", allow_early_resolve=True):
+        for tok_step in pl.range(FFN_NORM_T_TILE):
+            tok = tok_block * FFN_NORM_T_TILE + tok_step
+            rms_x = pl.cast(pl.tile.load(x_mixed, [tok, 0], [1, D]), pl.FP32)
+            rms_w = pl.cast(pl.tile.load(norm_w_2d, [0, 0], [1, D]), pl.FP32)
+            xg = pl.mul(rms_x, rms_w)
+            pl.tile.store(xg, [tok, 0], xg_buf, shapes=[1, D])
 
-        sq_rows = pl.reshape(pl.mul(rms_x, rms_x), [ROW_PAD, FFN_REDUCE_TILE])
-        sq_partial_tmp = pl.create_tile([ROW_PAD, FFN_REDUCE_TILE], dtype=pl.FP32)
-        sq_partial = pl.row_sum(sq_rows, sq_partial_tmp)
-        sq_reduce = pl.create_tile([ROW_PAD, ROW_PAD], dtype=pl.FP32)
-        sq_reduce[0:1, :] = pl.reshape(sq_partial, [1, ROW_PAD])
-        sq_reduce = pl.set_validshape(sq_reduce, 1, ROW_PAD)
-        sq_sum_tmp = pl.create_tile([ROW_PAD, ROW_PAD], dtype=pl.FP32)
-        sq_sum = pl.row_sum(sq_reduce, sq_sum_tmp)
-        sq_sum = pl.set_validshape(pl.reshape(sq_sum, [1, ROW_PAD]), 1, 1)
-        inv_rms = pl.recip(pl.sqrt(pl.add(pl.mul(sq_sum, 1.0 / D), NORM_EPS)))
-        pl.tile.store(inv_rms, [tok, 0], inv_rms_buf, shapes=[1, 1])
+            sq_rows = pl.reshape(pl.mul(rms_x, rms_x), [ROW_PAD, FFN_REDUCE_TILE])
+            sq_partial_tmp = pl.create_tile([ROW_PAD, FFN_REDUCE_TILE], dtype=pl.FP32)
+            sq_partial = pl.row_sum(sq_rows, sq_partial_tmp)
+            sq_reduce = pl.create_tile([ROW_PAD, ROW_PAD], dtype=pl.FP32)
+            sq_reduce[0:1, :] = pl.reshape(sq_partial, [1, ROW_PAD])
+            sq_reduce = pl.set_validshape(sq_reduce, 1, ROW_PAD)
+            sq_sum_tmp = pl.create_tile([ROW_PAD, ROW_PAD], dtype=pl.FP32)
+            sq_sum = pl.row_sum(sq_reduce, sq_sum_tmp)
+            sq_sum = pl.set_validshape(pl.reshape(sq_sum, [1, ROW_PAD]), 1, 1)
+            inv_rms = pl.recip(pl.sqrt(pl.add(pl.mul(sq_sum, 1.0 / D), NORM_EPS)))
+            pl.tile.store(inv_rms, [tok, 0], inv_rms_buf, shapes=[1, 1])
 
-        xg_abs_rows = pl.reshape(pl.abs(xg), [ROW_PAD, FFN_REDUCE_TILE])
-        amax_partial_tmp = pl.create_tile([ROW_PAD, FFN_REDUCE_TILE], dtype=pl.FP32)
-        amax_partial = pl.row_max(xg_abs_rows, amax_partial_tmp)
-        amax_reduce = pl.create_tile([ROW_PAD, ROW_PAD], dtype=pl.FP32)
-        amax_reduce[0:1, :] = pl.reshape(amax_partial, [1, ROW_PAD])
-        amax_reduce = pl.set_validshape(amax_reduce, 1, ROW_PAD)
-        amax_tmp = pl.create_tile([ROW_PAD, ROW_PAD], dtype=pl.FP32)
-        xg_amax = pl.row_max(amax_reduce, amax_tmp)
-        xg_amax = pl.set_validshape(pl.reshape(xg_amax, [1, ROW_PAD]), 1, 1)
-        amax_eps = pl.tile.full([1, ROW_PAD], dtype=pl.FP32, value=INT8_AMAX_EPS)
-        amax_eps = pl.set_validshape(amax_eps, 1, 1)
-        xg_amax = pl.maximum(xg_amax, amax_eps)
-        # quant scale = INT8_SCALE_MAX / amax(xg); dequant scale rides inv_rms.
-        scale_max = pl.tile.full([1, ROW_PAD], dtype=pl.FP32, value=INT8_SCALE_MAX)
-        scale_max = pl.set_validshape(scale_max, 1, 1)
-        xg_sq = pl.div(scale_max, xg_amax)
-        xg_dequant_scale = pl.mul(xg_amax, 1.0 / INT8_SCALE_MAX)
-        x_norm_dequant_scale = pl.mul(xg_dequant_scale, inv_rms)
-        pl.tile.store(x_norm_dequant_scale, [tok, 0], x_norm_scale, shapes=[1, 1])
-        pl.tile.store(xg_sq, [tok, 0], xn_scale_buf, shapes=[1, 1])
+            xg_abs_rows = pl.reshape(pl.abs(xg), [ROW_PAD, FFN_REDUCE_TILE])
+            amax_partial_tmp = pl.create_tile([ROW_PAD, FFN_REDUCE_TILE], dtype=pl.FP32)
+            amax_partial = pl.row_max(xg_abs_rows, amax_partial_tmp)
+            amax_reduce = pl.create_tile([ROW_PAD, ROW_PAD], dtype=pl.FP32)
+            amax_reduce[0:1, :] = pl.reshape(amax_partial, [1, ROW_PAD])
+            amax_reduce = pl.set_validshape(amax_reduce, 1, ROW_PAD)
+            amax_tmp = pl.create_tile([ROW_PAD, ROW_PAD], dtype=pl.FP32)
+            xg_amax = pl.row_max(amax_reduce, amax_tmp)
+            xg_amax = pl.set_validshape(pl.reshape(xg_amax, [1, ROW_PAD]), 1, 1)
+            amax_eps = pl.tile.full([1, ROW_PAD], dtype=pl.FP32, value=INT8_AMAX_EPS)
+            amax_eps = pl.set_validshape(amax_eps, 1, 1)
+            xg_amax = pl.maximum(xg_amax, amax_eps)
+            # quant scale = INT8_SCALE_MAX / amax(xg); dequant scale rides inv_rms.
+            scale_max = pl.tile.full([1, ROW_PAD], dtype=pl.FP32, value=INT8_SCALE_MAX)
+            scale_max = pl.set_validshape(scale_max, 1, 1)
+            xg_sq = pl.div(scale_max, xg_amax)
+            xg_dequant_scale = pl.mul(xg_amax, 1.0 / INT8_SCALE_MAX)
+            x_norm_dequant_scale = pl.mul(xg_dequant_scale, inv_rms)
+            pl.tile.store(x_norm_dequant_scale, [tok, 0], x_norm_scale, shapes=[1, 1])
+            pl.tile.store(xg_sq, [tok, 0], xn_scale_buf, shapes=[1, 1])
 
     seed_dummy = pl.system.task_dummy(deps=[])
 
