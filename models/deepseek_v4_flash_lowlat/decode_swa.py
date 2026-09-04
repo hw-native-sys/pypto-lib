@@ -178,7 +178,7 @@ def attention_swa(
     ori_block_num = pl.tensor.dim(kv_cache, 0)
     kv_cache_flat = pl.reshape(kv_cache, [ori_block_num * BLOCK_SIZE, HEAD_DIM])
     sparse_bias = pl.create_tensor([T, WIN], dtype=pl.FP32)
-    with pl.at(level=pl.Level.CORE_GROUP, name_hint="swa_cache_insert_valid_bias"):
+    with pl.at(level=pl.Level.CORE_GROUP, name_hint="swa_cache_insert_valid_bias", allow_early_resolve=True):
         for write_t in pl.range(T):
             write_row_i64 = pl.read(swa_slot_mapping, [write_t])
             if write_row_i64 >= 0:

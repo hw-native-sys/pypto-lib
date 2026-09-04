@@ -102,9 +102,7 @@ def compressor_ratio4(
 
     # Deferred behind the caller's rms_norm dummy barrier: qkv's qr_proj_matmul is the
     # critical path and must win the cores when rms_norm retires.
-    with pl.spmd(
-        BS_PAD * OUT_DIM // (MM_B_TILE * OUT_TILE), name_hint="kv_score_proj", deps=[late_dep]
-    ) as _kv_score_tid:
+    with pl.spmd(BS_PAD * OUT_DIM // (MM_B_TILE * OUT_TILE), name_hint="kv_score_proj", allow_early_resolve=True):
         idx = pl.tile.get_block_idx()
         global_row0 = (idx // (OUT_DIM // OUT_TILE)) * MM_B_TILE
         o0 = (idx % (OUT_DIM // OUT_TILE)) * OUT_TILE
@@ -134,7 +132,7 @@ def compressor_ratio4(
     # online-softmax pool that batch's window into pooled_kv. One region -- each batch's pool
     # reads only its own just-scattered state (per-batch block table), so no cross-task barrier.
     pooled_kv = pl.create_tensor([RMS_PAD_ROWS, HEAD_DIM], dtype=pl.FP32)
-    with pl.at(level=pl.Level.CORE_GROUP, name_hint="scatter_softmax_pool"):
+    with pl.at(level=pl.Level.CORE_GROUP, name_hint="scatter_softmax_pool", allow_early_resolve=True):
         for c_idx in pl.range(B):
             for s_sc in pl.pipeline(S, stage=2):
                 token_pos = pl.read(position_ids, [c_idx, s_sc])

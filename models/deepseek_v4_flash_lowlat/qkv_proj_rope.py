@@ -163,7 +163,7 @@ def qkv_proj_rope(
     # doubles the decode orch window, whereas the on-core memset overlaps.
     qr_fp32 = pl.create_tensor([t_matmul, Q_LORA], dtype=pl.FP32)
     qr_i8_matmul = pl.create_tensor([t_matmul, Q_LORA], dtype=pl.INT8)
-    with pl.at(level=pl.Level.CORE_GROUP, name_hint="qr_proj_seed"):
+    with pl.at(level=pl.Level.CORE_GROUP, name_hint="qr_proj_seed", allow_early_resolve=True):
         for tc in pl.range(t_matmul // QR_M_TILE):
             ts0 = tc * QR_M_TILE
             for nb in pl.range(Q_LORA // QR_N_TILE):
@@ -231,7 +231,7 @@ def qkv_proj_rope(
     q_proj_i32 = pl.create_tensor([t_matmul, H * HEAD_DIM], dtype=pl.INT32)
     # One output-column fragment per task.
     q_col_base = pl.cast(q_head_base, pl.INDEX) * HEAD_DIM
-    for qproj_n_idx in pl.spmd((Q_HEADS_LOCAL * HEAD_DIM) // QPROJ_MM_N_TILE, name_hint="qproj_matmul"):
+    for qproj_n_idx in pl.spmd((Q_HEADS_LOCAL * HEAD_DIM) // QPROJ_MM_N_TILE, name_hint="qproj_matmul", allow_early_resolve=True):
         w_col0 = q_col_base + qproj_n_idx * QPROJ_MM_N_TILE
         for tc in pl.range(t_matmul // QPROJ_M_TILE):
             t0 = tc * QPROJ_M_TILE
@@ -302,7 +302,7 @@ def qkv_proj_rope(
     # 16 cube blocks. KV is off the critical path, so more K splits only add atomic
     # contention without shortening decode.
     kv_fp32 = pl.create_tensor([t_matmul, HEAD_DIM], dtype=pl.FP32)
-    with pl.at(level=pl.Level.CORE_GROUP, name_hint="kv_proj_seed"):
+    with pl.at(level=pl.Level.CORE_GROUP, name_hint="kv_proj_seed", allow_early_resolve=True):
         for tc in pl.range(t_matmul // KV_M_TILE):
             kts0 = tc * KV_M_TILE
             for nb in pl.range(HEAD_DIM // KV_N_TILE):
@@ -310,10 +310,10 @@ def qkv_proj_rope(
                 kv_fp32[kts0 : kts0 + KV_M_TILE, kvseed0 : kvseed0 + KV_N_TILE] = pl.full(
                     [KV_M_TILE, KV_N_TILE], dtype=pl.FP32, value=0.0
                 )
-    # `late_dep` is a dummy barrier hung off the rms_norm TaskId: kv_proj is off the
-    # critical path, so it resolves one hop after rms_norm and lets qr_proj_matmul
-    # take the cores first.
-    with pl.spmd((HEAD_DIM // KV_N_TILE) * KV_OK, name_hint="kv_proj_matmul", deps=[late_dep]) as _kv_tid:
+    # Early-resolved rather than held behind a dummy barrier: kv_proj is off the
+    # critical path, so it is cheaper to let the scheduler stage it speculatively
+    # than to keep it a hop behind rms_norm.
+    with pl.spmd((HEAD_DIM // KV_N_TILE) * KV_OK, name_hint="kv_proj_matmul", allow_early_resolve=True):
         kbg = pl.tile.get_block_idx()
         kv_col0 = (kbg // KV_OK) * KV_N_TILE
         kv_k_base = (kbg % KV_OK) * KV_K_SLICE

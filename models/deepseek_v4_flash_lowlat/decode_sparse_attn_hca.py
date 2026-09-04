@@ -332,7 +332,7 @@ def sparse_attn_hca_packed(
     # its own single-task scope because rope_cs below is an spmd over rope column
     # tiles -- no single block there owns a column-invariant constant.
     rope_swap_idx = pl.create_tensor([H_TILE, ROPE_DIM], dtype=pl.INT32)
-    with pl.at(level=pl.Level.CORE_GROUP, name_hint="rope_swap"):
+    with pl.at(level=pl.Level.CORE_GROUP, name_hint="rope_swap", allow_early_resolve=True):
         sw_col = pl.col_expand_mul(
             pl.full([H_TILE, ROPE_DIM], dtype=pl.FP32, value=1.0),
             pl.cast(pl.arange(0, [1, ROPE_DIM], dtype=pl.INT32), target_type=pl.FP32))
@@ -341,7 +341,7 @@ def sparse_attn_hca_packed(
         rope_swap_idx[0:H_TILE, 0:ROPE_DIM] = pl.cast(
             pl.sub(pl.add(sw_col, 1.0), pl.mul(sw_lane, 2.0)), target_type=pl.INT32)              # j^1
 
-    for cp in pl.spmd(HALF_ROPE // ROPE_TILE, name_hint="rope_cs"):
+    for cp in pl.spmd(HALF_ROPE // ROPE_TILE, name_hint="rope_cs", allow_early_resolve=True):
         cp_r0 = cp * ROPE_TILE
         cp_c0 = 2 * cp_r0
         cs_col = pl.col_expand_mul(

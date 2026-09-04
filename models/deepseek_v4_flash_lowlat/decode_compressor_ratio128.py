@@ -118,9 +118,7 @@ def compressor_ratio128(
     kv_proj_pad = pl.create_tensor([BS_PAD, OUT_DIM], dtype=pl.FP32)
     score_proj_pad = pl.create_tensor([BS_PAD, OUT_DIM], dtype=pl.FP32)
 
-    with pl.spmd(
-        t_matmul * OUT_DIM // (MM_B_TILE * OUT_TILE), name_hint="kv_score_proj", deps=[late_dep]
-    ) as _kv_score_tid:
+    with pl.spmd(t_matmul * OUT_DIM // (MM_B_TILE * OUT_TILE), name_hint="kv_score_proj", allow_early_resolve=True):
         idx = pl.tile.get_block_idx()
         global_row0 = (idx // (OUT_DIM // OUT_TILE)) * MM_B_TILE
         o0 = (idx % (OUT_DIM // OUT_TILE)) * OUT_TILE
@@ -151,7 +149,7 @@ def compressor_ratio128(
     pooled_kv = pl.create_tensor([RMS_PAD_ROWS, HEAD_DIM], dtype=pl.FP32)
     # The target decode point is start_pos=8192, where the ratio-128 boundary branch
     # is inactive. Keep scatter and all pool gates in one task to minimize dispatches.
-    with pl.at(level=pl.Level.CORE_GROUP, name_hint="scatter_softmax_pool") as pool_tid:
+    with pl.at(level=pl.Level.CORE_GROUP, name_hint="scatter_softmax_pool", allow_early_resolve=True) as pool_tid:
         for global_c_idx in pl.range(b_dim):
             for s_sc in pl.pipeline(s_dim, stage=2):
                 proj_row = global_c_idx * s_dim + s_sc
@@ -231,7 +229,10 @@ def compressor_ratio128(
     cmp_kv_cache_flat = pl.reshape(cmp_kv_cache, [cmp_flat_rows, HEAD_DIM])
 
     with pl.at(
-        level=pl.Level.CORE_GROUP, name_hint="rmsnorm_rope_cache_write", deps=[pool_tid]
+        level=pl.Level.CORE_GROUP,
+        name_hint="rmsnorm_rope_cache_write",
+        deps=[pool_tid],
+        allow_early_resolve=True,
     ):
         # cos/sin arrive interleave-duplicated and sign-folded, so these land at the full
         # ROPE_HEAD_DIM width and feed the rotation with no in-scope dup-gather.
