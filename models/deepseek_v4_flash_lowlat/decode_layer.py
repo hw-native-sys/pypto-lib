@@ -933,7 +933,8 @@ if __name__ == "__main__":
     parser.add_argument("--start-pos", type=int, default=DECODE_START_POS,
                         help="Fixture-only start_pos for all batches; default is the 8k target position.")
     parser.add_argument("--layer-id", type=int, default=10)
-    parser.add_argument("--enable-chip-swimlane", type=int, nargs="?", const=1, default=0, choices=(0, 1, 2))
+    parser.add_argument("--enable-chip-swimlane", type=int, nargs="?", const=1, default=0,
+                        choices=(0, 1, 2, 3, 4))
     parser.add_argument("--compile-only", action="store_true", default=False)
     parser.add_argument("--runtime-dir", type=str, default=None)
     parser.add_argument("--golden-data", type=str, default=None,
