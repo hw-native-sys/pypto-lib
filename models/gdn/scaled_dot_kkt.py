@@ -6,143 +6,102 @@
 # INCLUDING BUT NOT LIMITED TO NON-INFRINGEMENT, MERCHANTABILITY, OR FITNESS FOR A PARTICULAR PURPOSE.
 # See LICENSE in the root of the software repository for the full text of the License.
 # -----------------------------------------------------------------------------------------------------------
-"""Gated DeltaNet scaled_dot_kkt — the gated intra-chunk key-key matrix.
-
-    A[i, j] = (k_i . k_j) * exp(min(g_i - g_j, 0)) * beta_i    for j < i, else 0
-
-Stage 3 of the GDN pipeline, consuming g_sum from chunk_cumsum. The decay is
-formed as a difference of cumulative gates and clamped at zero, never as a
-product of exp(g_i) and exp(-g_j): the latter overflows once the cumulative gate
-grows large.
-
-Chunks are independent and run one per core group; the strict-lower mask is a
-constant, so it is loaded once per scope and reused across all heads.
-"""
+"""Gated DeltaNet scaled_dot_kkt: the gated intra-chunk key-key matrix,
+A[i, j] = (k_i . k_j) * exp(min(g_i - g_j, 0)) * beta_i for j < i, else 0."""
 import pypto.language as pl
 
-# Model
+# model config
 T = 8192                # tokens (single sequence, B = 1)
 H = 16                  # value heads
 D = 128                 # head dimension
 CHUNK = 128             # chunk size in tokens
 
-# Tiling
-COL_TILE = 64           # columns of A per matmul; sizes the cube/vector crossing tile.
-                        # 128 does not fit: with the mask resident, a [CHUNK, 128] FP32
-                        # crossing tile pushes the ring reserve past the Vec budget.
+# tiling
+COL_TILE = 128          # columns of A per matmul
+SLOT_NUM = 1            # cross-core ring depth; the default depth cannot hold a
+                        # [CHUNK, COL_TILE] FP32 crossing tile at COL_TILE = 128
 
 
-@pl.jit
-def gdn_scaled_dot_kkt(
-    k: pl.Tensor[[T, H, D], pl.FP16],
-    beta: pl.Tensor[[H, T], pl.FP32],
-    g_sum: pl.Tensor[[H, T], pl.FP32],
-    mask: pl.Tensor[[CHUNK, CHUNK], pl.FP32],
-    a_out: pl.Out[pl.Tensor[[T, H, CHUNK], pl.FP16]],
-):
-    # BSND [T, H, D] viewed as [T, H*D]: a per-head slice is then a strided 2D
-    # window (row stride H*D, D columns), which is the shape the loader collapses.
-    k_flat = pl.reshape(k, [T, H * D])
-    a_flat = pl.reshape(a_out, [T, H * CHUNK])
-    for t0 in pl.parallel(0, T, CHUNK):
-        # An a2a3 core has two vector sub-cores, and an unsplit mixed region runs
-        # its vector work on lane 0 only (lane 1 replays with valid_shape zeroed
-        # just to keep the AIC<->AIV handshake symmetric). This stage is vector
-        # dominated -- stripping the gating chain drops it from 203.5 to 78.8 us
-        # -- so giving lane 1 the bottom half of the rows is worth 22.7%:
-        # 203.5 -> 157.3 us at T=8192. No effect on wy_fast, which is
-        # memory-bound, nor on chunk_cumsum, whose region is pure cube.
-        with pl.at(level=pl.Level.CORE_GROUP, name_hint="scaled_dot_kkt",
-                   optimizations=[pl.split(pl.SplitMode.UP_DOWN)]):
-            # The mask is a constant: hold it for the whole scope rather than
-            # re-reading a slice of it per head and per column block.
-            msk = mask[:, :]
-            for h in pl.range(H):
-                kc = pl.slice(k_flat, [CHUNK, D], [t0, h * D])
-                # Head-major keeps a head's chunk contiguous, so the same window
-                # views as [1, CHUNK] for a row broadcast and [CHUNK, 1] for a
-                # column one. A strided column slice of BSND does not build on
-                # device, and an in-register transpose cannot be allocated.
-                g_col = pl.reshape(pl.slice(g_sum, [1, CHUNK], [h, t0]), [CHUNK, 1])
-                beta_col = pl.reshape(pl.slice(beta, [1, CHUNK], [h, t0]), [CHUNK, 1])
-                for j in pl.unroll(CHUNK // COL_TILE):
-                    j0 = j * COL_TILE
-                    kj = pl.slice(k_flat, [COL_TILE, D], [t0 + j0, h * D])
+def build_kernel(t: int = T, h: int = H, d: int = D, chunk: int = CHUNK,
+                 col_tile: int = COL_TILE, slot_num: int = SLOT_NUM):
+    """The stage kernel at one shape."""
+
+    @pl.jit
+    def gdn_scaled_dot_kkt(
+        k: pl.Tensor[[t, h, d], pl.FP16],
+        beta: pl.Tensor[[h, t], pl.FP32],
+        g_sum: pl.Tensor[[h, t], pl.FP32],
+        mask: pl.Tensor[[chunk, chunk], pl.FP32],
+        a_out: pl.Out[pl.Tensor[[t, h, chunk], pl.FP16]],
+    ):
+        # BSND [T, H, D] viewed as [T, H*D]: a per-head slice is a strided 2D window
+        k_flat = pl.reshape(k, [t, h * d])
+        a_flat = pl.reshape(a_out, [t, h * chunk])
+        for c0 in pl.spmd(t // chunk, name_hint="scaled_dot_kkt",
+                          optimizations=[pl.cross_core_slot(slot_num=slot_num),
+                                         pl.split(pl.SplitMode.UP_DOWN)]):
+            t0 = c0 * chunk
+            msk = mask[:, :]                       # constant, held for the whole scope
+            for hh in pl.range(h):
+                d0 = hh * d
+                kc = k_flat[t0 : t0 + chunk, d0 : d0 + d]
+                # Head-major keeps a head's chunk contiguous, so the same window views
+                # as [1, CHUNK] for a row broadcast and [CHUNK, 1] for a column one. A
+                # strided column slice of BSND does not build, and an in-register
+                # transpose cannot be allocated.
+                g_col = pl.reshape(g_sum[hh : hh + 1, t0 : t0 + chunk], [chunk, 1])
+                beta_col = pl.reshape(beta[hh : hh + 1, t0 : t0 + chunk], [chunk, 1])
+                for j0 in pl.unroll(0, chunk, col_tile):
+                    kj = k_flat[t0 + j0 : t0 + j0 + col_tile, d0 : d0 + d]
                     scores = pl.matmul(kc, kj, b_trans=True)
-                    g_row = pl.slice(g_sum, [1, COL_TILE], [h, t0 + j0])
-                    diff = pl.full([CHUNK, COL_TILE], dtype=pl.FP32, value=0.0)
+                    g_row = g_sum[hh : hh + 1, t0 + j0 : t0 + j0 + col_tile]
+                    diff = pl.full([chunk, col_tile], dtype=pl.FP32, value=0.0)
                     diff = pl.row_expand_add(diff, g_col)
                     diff = pl.col_expand_sub(diff, g_row)
                     decay = pl.exp(pl.minimum(diff, 0.0))
                     gated = pl.mul(scores, decay)
                     gated = pl.row_expand_mul(gated, beta_col)
-                    masked = pl.mul(gated, pl.slice(msk, [CHUNK, COL_TILE], [0, j0]))
-                    a_flat = pl.assemble(a_flat, pl.cast(masked, target_type=pl.FP16, mode="rint"),
-                                         [t0, h * CHUNK + j0])
-    return a_out
+                    masked = pl.mul(gated, msk[:, j0 : j0 + col_tile])
+                    masked16 = pl.cast(masked, target_type=pl.FP16, mode="rint")
+                    col = hh * chunk + j0
+                    a_flat[t0 : t0 + chunk, col : col + col_tile] = masked16
+        return a_out
+
+    return gdn_scaled_dot_kkt
+
+
+gdn_scaled_dot_kkt = build_kernel()
 
 
 def build_tensor_specs(t: int = T, h: int = H, d: int = D, chunk: int = CHUNK):
     import torch
     from golden import TensorSpec
 
+    from models.gdn import reference
+
     def init_mask():
         rows = torch.arange(chunk)[:, None]
         cols = torch.arange(chunk)[None, :]
         return (rows > cols).float()
 
-    def init_beta():
-        return torch.rand(h, t, dtype=torch.float32)
-
-    def init_g():
-        # g_sum as chunk_cumsum produces it: a per-chunk prefix sum of the
-        # log-sigmoid gates, matching upstream's own generator.
-        torch.manual_seed(7)
-        g = torch.nn.functional.logsigmoid(torch.randn(h, t, dtype=torch.float32))
-        out = torch.zeros_like(g)
-        for t0 in range(0, t, chunk):
-            out[:, t0 : t0 + chunk] = g[:, t0 : t0 + chunk].cumsum(dim=1)
-        return out
-
-    def init_k():
-        # L2-normalised along the head dimension, as the model produces it and as
-        # upstream's own test draws it (test_gdn_scaled_dot_kkt.py). NOT raw
-        # randn: with unnormalised k, K K^T entries scale with D and `A` reaches
-        # ~40, which makes (I + A)^-1 about 1e36 with a condition number of 1e20.
-        # The kernel is indifferent, but every consumer of `A` is not -- solve_tril
-        # chained onto that `A` inverts a matrix whose fp64 golden is already inf.
-        torch.manual_seed(11)
-        k = torch.randn(t, h, d, dtype=torch.float16)
-        return torch.nn.functional.normalize(k, dim=-1, p=2)
-
     return [
-        TensorSpec("k", [t, h, d], torch.float16, init_value=init_k),
-        TensorSpec("beta", [h, t], torch.float32, init_value=init_beta),
-        TensorSpec("g_sum", [h, t], torch.float32, init_value=init_g),
+        TensorSpec("k", [t, h, d], torch.float16,
+                   init_value=reference.lazy("scaled_dot_kkt", "k", t, h, d, chunk)),
+        TensorSpec("beta", [h, t], torch.float32,
+                   init_value=reference.lazy("scaled_dot_kkt", "beta", t, h, d, chunk, reference.to_hT)),
+        TensorSpec("g_sum", [h, t], torch.float32,
+                   init_value=reference.lazy("scaled_dot_kkt", "g_sum", t, h, d, chunk, reference.to_hT)),
         TensorSpec("mask", [chunk, chunk], torch.float32, init_value=init_mask),
         TensorSpec("a_out", [t, h, chunk], torch.float16, is_output=True),
     ]
 
 
 def golden_gdn_scaled_dot_kkt(tensors):
-    import torch
+    from models.gdn import reference
 
-    k = tensors["k"].float()
-    beta = tensors["beta"].float()
-    g = tensors["g_sum"].float()
-    out = tensors["a_out"]
-    out.zero_()
-    rows = torch.arange(CHUNK)[:, None]
-    cols = torch.arange(CHUNK)[None, :]
-    causal = (rows > cols).float()
-    for t0 in range(0, k.shape[0], CHUNK):
-        for h in range(k.shape[1]):
-            kc = k[t0 : t0 + CHUNK, h, :]
-            gc = g[h, t0 : t0 + CHUNK]
-            bc = beta[h, t0 : t0 + CHUNK]
-            diff = gc[:, None] - gc[None, :]
-            decay = torch.where(diff <= 0, torch.exp(diff), torch.zeros_like(diff))
-            out[t0 : t0 + CHUNK, h, :] = ((kc @ kc.T) * decay * bc[:, None] * causal).half()
+    chunk = tensors["mask"].shape[0]
+    ref = reference.kkt(tensors["k"], tensors["beta"].t(), tensors["g_sum"].t(), chunk)
+    tensors["a_out"].copy_(ref)
 
 
 if __name__ == "__main__":
