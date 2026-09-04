@@ -15,7 +15,7 @@ from dataclasses import replace
 
 import pypto.language as pl
 import pypto.language.distributed as pld
-from pypto.ir.distributed_compiled_program import DistributedConfig
+from pypto.ir import DistributedConfig
 
 from decode_fwd import (
     AUX_PAD,

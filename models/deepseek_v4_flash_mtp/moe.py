@@ -38,7 +38,7 @@ config.RECV_MAX = EP * config.MOE_TOKENS
 
 import pypto.language as pl
 import pypto.language.distributed as pld
-from pypto.ir.distributed_compiled_program import DistributedConfig
+from pypto.ir import DistributedConfig
 
 from config import FLASH as M, EP_WORLD_SIZE, MOE_TOKENS, RECV_MAX
 from hc_pre import hc_pre

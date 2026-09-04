@@ -2197,7 +2197,7 @@ def main():
         ratio_reldiff,
         run,
     )
-    from pypto.ir.distributed_compiled_program import DistributedConfig
+    from pypto.ir import DistributedConfig
 
     parser = argparse.ArgumentParser()
     parser.add_argument(

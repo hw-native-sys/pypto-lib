@@ -1082,7 +1082,7 @@ if __name__ == "__main__":
             },
         )
     else:
-        from pypto.ir.distributed_compiled_program import DistributedConfig
+        from pypto.ir import DistributedConfig
 
         specs = (
             build_ragged2_cp_tensor_specs(TP_SIZE)

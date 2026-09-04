@@ -148,6 +148,10 @@ def _install_pypto_stubs() -> None:
                 enable_scope_stats=self.enable_scope_stats,
             )
 
+    class _DistributedConfig:
+        def __init__(self, **kwargs):
+            self.kwargs = kwargs
+
     class _TypeSpec:
         @classmethod
         def __class_getitem__(cls, _item):
@@ -195,6 +199,11 @@ def _install_pypto_stubs() -> None:
     # no-ops so the runtime_dir replay path can flow through without
     # exploding when a test doesn't care.
     ir.compile = _unavailable
+    # ``models/**`` import these from ``pypto.ir``, which re-exports them from
+    # ``pypto.ir.distributed_compiled_program``. Without them the stub cannot
+    # stand in for the modules that build distributed programs.
+    ir.DistributedCompiledProgram = object
+    ir.DistributedConfig = _DistributedConfig
     runtime.execute_compiled = _unavailable
     runtime.RunConfig = RunConfig
     runtime.DfxOptions = DfxOptions

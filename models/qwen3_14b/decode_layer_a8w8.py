@@ -1043,7 +1043,7 @@ def _main() -> None:
 
     if compile_only:
         program = _decode_layer_test_entry.lower(
-            *inputs, out, config=RunConfig(platform=args.platform, backend_type=backend_type)
+            *inputs, out, config=RunConfig(platform=args.platform)
         )
         print(f"Lowered A8W8 decode layer with {len(program.functions)} function(s).")
         return
@@ -1052,7 +1052,6 @@ def _main() -> None:
     run_config = RunConfig(
         platform=args.platform,
         device_id=args.device,
-        backend_type=backend_type,
         enable_dep_gen=False,
         dump_passes=False,
     )
