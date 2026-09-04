@@ -73,6 +73,7 @@ N_ROUTES = T * TOPK
 # [N_LOCAL * RECV_MAX, D]. Lane (e, src, slot) flat row = e * RECV_MAX +
 # src * MAX_PER_SRC + slot. One source sends <= T rows to a local expert.
 MAX_PER_SRC = T
+FP32_PER_CACHE_LINE = 16
 AUX_PAD = 8  # FP32 pack tile width (32 B min tile); cols: 0=scale 1=weight
 AUX_SCALE = 0
 AUX_W = 1
@@ -85,6 +86,7 @@ PREFILL_INPUT_ID_TILE = 4
 assert N_RANKS in _EP_CHOICES, f"--ep must be one of {_EP_CHOICES} (got {N_RANKS})"
 assert N_EXPERTS_GLOBAL == N_RANKS * N_LOCAL
 assert RECV_MAX == N_RANKS * MAX_PER_SRC
+assert RECV_MAX % FP32_PER_CACHE_LINE == 0
 
 
 @pl.jit.inline
@@ -302,6 +304,8 @@ def dispatch(
     # dst == my_rank puts are already ordered by the local RAW edges on
     # recv_x / recv_aux / recv_route. deps on _meta_tid for recv_meta_local, which is
     # manual_dep and so has no auto edge from the cumsum.
+    # Each block owns one complete expert row. RECV_MAX is cache-line aligned, so
+    # the scalar metadata stores below cannot share a line across expert blocks.
     with pl.spmd(
         N_LOCAL,
         name_hint="dispatch_gather",

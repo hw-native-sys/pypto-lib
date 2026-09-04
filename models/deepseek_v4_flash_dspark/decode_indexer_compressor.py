@@ -108,6 +108,7 @@ def indexer_compressor(
     x_flat = x
     kv_proj_pad = pl.create_tensor([BS_PAD, OUT_DIM], dtype=pl.FP32)
     score_proj_pad = pl.create_tensor([BS_PAD, OUT_DIM], dtype=pl.FP32)
+    idx_kv_scale_values = pl.create_tensor([BS_PAD, 1], dtype=pl.FP32)
     compress_state_block_num = pl.tensor.dim(compress_state, 0)
     idx_block_num = pl.tensor.dim(idx_kv_cache, 0)
     compress_state_flat = pl.reshape(compress_state, [compress_state_block_num * COMPRESS_STATE_BLOCK_SIZE, COMPRESS_STATE_DIM])
@@ -330,6 +331,10 @@ def indexer_compressor(
         kv_scale_q_row = pl.div(pl.full([1, RMS_PAD_TILE], dtype=pl.FP32, value=INT8_SCALE_MAX), kv_amax)
         kv_scale_dq_col = pl.reshape(pl.recip(kv_scale_q_row), [RMS_PAD_TILE, 1])
         kv_scale_q_col = pl.reshape(kv_scale_q_row, [RMS_PAD_TILE, 1])
+        idx_kv_scale_values[
+            wr_b0 : wr_b0 + RMS_PAD_TILE,
+            0:1,
+        ] = kv_scale_dq_col
         kv_scaled = pl.row_expand_mul(kv_blk_f32, kv_scale_q_col)
         kv_i32 = pl.cast(kv_scaled, target_type=pl.INT32, mode="rint")
         kv_half = pl.cast(kv_i32, target_type=pl.FP16, mode="round")
@@ -341,10 +346,26 @@ def indexer_compressor(
                 cache_row = pl.cast(cache_row_i64, pl.INDEX)
                 kv_flat[token : token + 1, :] = kv_final[token : token + 1, 0 : HEAD_DIM]
                 idx_kv_cache_flat[cache_row : cache_row + 1, :] = kv_i8_blk[inner : inner + 1, :]
-                # scale is one value per position; a [1,1] tile store is sub-32B, so scalar-write it
-                pl.write(idx_kv_scale_flat, [cache_row, 0], pl.read(kv_scale_dq_col, [inner, 0]))
 
-    return _write_tid
+    # Adjacent logical requests may map their scalar scales into one 64-byte
+    # cache line.  Commit them from one task after the parallel cache writes so
+    # there is exactly one physical writer for every touched scale line.
+    with pl.at(
+        level=pl.Level.CORE_GROUP,
+        name_hint="idx_kv_scale_commit",
+        deps=[_write_tid],
+    ) as scale_commit_tid:
+        for token in pl.range(bs):
+            cache_row_i64 = pl.read(idx_slot_mapping, [token])
+            if cache_row_i64 >= 0:
+                cache_row = pl.cast(cache_row_i64, pl.INDEX)
+                pl.write(
+                    idx_kv_scale_flat,
+                    [cache_row, 0],
+                    pl.read(idx_kv_scale_values, [token, 0]),
+                )
+
+    return scale_commit_tid
 
 
 @pl.jit

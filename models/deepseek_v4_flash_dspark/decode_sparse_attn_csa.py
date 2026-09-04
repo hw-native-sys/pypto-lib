@@ -204,6 +204,8 @@ def sparse_attn_csa(
     sparse_blk_mi = pl.create_tensor([t_blk, 1], dtype=pl.FP32)
     sparse_blk_li = pl.create_tensor([t_blk, 1], dtype=pl.FP32)
     sparse_blk_oi = pl.create_tensor([t_blk, HEAD_DIM], dtype=pl.FP32)
+    sparse_blk_mi_lines = pl.reshape(sparse_blk_mi, [t_blk // H_TILE, H_TILE])
+    sparse_blk_li_lines = pl.reshape(sparse_blk_li, [t_blk // H_TILE, H_TILE])
 
     with pl.spmd(NUM_QK_CORES, name_hint="qk_pv", deps=[qk_plan_tid, cache_ready_dep], allow_early_resolve=True) as qk_tid:
         qk_core = pl.tile.get_block_idx()
@@ -303,13 +305,15 @@ def sparse_attn_csa(
                         sparse_blk_li[qk_row : qk_row + H_TILE, 0 : 1] = qk_li[qk_r0 : qk_r0 + H_TILE, 0 : 1]
                         sparse_blk_oi[qk_row : qk_row + H_TILE, 0 : HEAD_DIM] = qk_oi[qk_r0 : qk_r0 + H_TILE, 0 : HEAD_DIM]
             else:
+                qk_mi_empty = pl.full([1, H_TILE], dtype=pl.FP32, value=-3.0e38)
+                qk_li_empty = pl.full([1, H_TILE], dtype=pl.FP32, value=0.0)
                 qk_oi_zero = pl.full([H_TILE, HEAD_DIM], dtype=pl.FP32, value=0.0)
                 for qk_h_idx in pl.range(H // H_TILE):
                     qk_blk_base = qk_token_base + qk_h_idx * SPARSE_BLOCKS * H_TILE
                     qk_row = qk_blk_base + qk_sb * H_TILE
-                    for qk_hr in pl.range(H_TILE):
-                        pl.write(sparse_blk_mi, [qk_row + qk_hr, 0], -3.0e38)
-                        pl.write(sparse_blk_li, [qk_row + qk_hr, 0], 0.0)
+                    qk_line = qk_row // H_TILE
+                    sparse_blk_mi_lines[qk_line : qk_line + 1, 0:H_TILE] = qk_mi_empty
+                    sparse_blk_li_lines[qk_line : qk_line + 1, 0:H_TILE] = qk_li_empty
                     sparse_blk_oi[qk_row : qk_row + H_TILE, 0 : HEAD_DIM] = qk_oi_zero
 
     # Head-invariant interleaved cos and sign-folded sin, built once per token.

@@ -196,6 +196,10 @@ PACKED_POOL_LAYER_COUNTS = {
 }
 
 
+MOE_INPUT_IDS_PER_CACHE_LINE = 8  # One 64-byte cache line of INT64 values.
+assert MOE_TOKENS % MOE_INPUT_IDS_PER_CACHE_LINE == 0
+
+
 def build_active_logit_row_indices_host(active_tokens):
     """Build the host fixture for the terminal active-prefix row contract."""
     import torch
@@ -221,11 +225,17 @@ def decode_embedding_preamble(
 ):
     """Embed active rows and pad their token ids to the fixed MoE capacity."""
     active_tokens = pl.tensor.dim(input_ids, 0)
-    for token_idx in pl.spmd(MOE_TOKENS, name_hint="decode_fwd_pack_moe_input_ids"):
-        token_id = pl.cast(0, pl.INT64)
-        if token_idx < active_tokens:
-            token_id = pl.read(input_ids, [token_idx])
-        pl.write(moe_input_ids, [token_idx], token_id)
+    for token_block in pl.spmd(
+        MOE_TOKENS // MOE_INPUT_IDS_PER_CACHE_LINE,
+        name_hint="decode_fwd_pack_moe_input_ids",
+    ):
+        token_begin = token_block * MOE_INPUT_IDS_PER_CACHE_LINE
+        for token_offset in pl.range(MOE_INPUT_IDS_PER_CACHE_LINE):
+            token_idx = token_begin + token_offset
+            token_id = pl.cast(0, pl.INT64)
+            if token_idx < active_tokens:
+                token_id = pl.read(input_ids, [token_idx])
+            pl.write(moe_input_ids, [token_idx], token_id)
     lookup_embedding(input_ids, embed_weight, hidden_states, x_hc)
     return x_hc
 
