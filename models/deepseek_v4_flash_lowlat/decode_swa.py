@@ -195,7 +195,7 @@ def attention_swa(
     attn_out = pl.create_tensor([T, D], dtype=pl.BF16)
     o_packed = pl.create_tensor([O_GROUPS * T, O_GROUP_IN], dtype=pl.BF16)
     merge_tid = sparse_attn_swa_packed(
-        q, kv_cache, swa_indices, sparse_bias,
+        q, kv_cache, swa_indices, swa_lens, sparse_bias,
         attn_sink, rope_cos_t, rope_sin_t, o_packed, my_rank,
     )
     o_proj_tp_core(
