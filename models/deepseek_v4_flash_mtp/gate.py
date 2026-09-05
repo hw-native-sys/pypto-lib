@@ -162,8 +162,15 @@ def gate(
                     pl.write(indices, [zt, zk], pl.cast(0, pl.INT32))
                     pl.write(weights, [zt, zk], pl.cast(0.0, pl.FP32))
         if N_EXPERTS < SCORE_PAD:
-            biased_scores_buf[:, N_EXPERTS:SCORE_PAD] = \
-                pl.full([T_PAD, SCORE_PAD - N_EXPERTS], dtype=pl.FP32, value=FP32_NEG_INF)
+            for pad_block in pl.range(T_PAD // GATE_M_TILE):
+                pad_t0 = pad_block * GATE_M_TILE
+                biased_scores_buf[
+                    pad_t0 : pad_t0 + GATE_M_TILE, N_EXPERTS:SCORE_PAD
+                ] = pl.full(
+                    [GATE_M_TILE, SCORE_PAD - N_EXPERTS],
+                    dtype=pl.FP32,
+                    value=FP32_NEG_INF,
+                )
 
     # Gate matmul + post: x_norm @ gate_w.T → sqrt(softplus(logits)) (+bias).
     # Fan the matmul over expert columns so each block computes a [GATE_M_TILE,

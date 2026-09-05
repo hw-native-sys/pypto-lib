@@ -39,6 +39,10 @@ NOPE_HEAD_DIM = HEAD_DIM - ROPE_HEAD_DIM
 MAX_SEQ_LEN = M.max_position_embeddings
 START_POS = 0
 COMPRESS_RATIO = 128
+# The compressed block table is indexed by the same logical page as the raw KV
+# cache, so a block holds BLOCK_SIZE / COMPRESS_RATIO rows. Callers that page
+# the compressed cache differently pass an equivalent one-row-per-block view --
+# this kernel only ever addresses cmp_kv as a flat row space.
 CMP_STORAGE_BLOCK_SIZE = BLOCK_SIZE // COMPRESS_RATIO
 OUT_DIM = HEAD_DIM
 STATE_LEN = COMPRESS_RATIO
@@ -92,6 +96,43 @@ def prefill_compressor_ratio128(
     cmp_kv_flat = pl.reshape(cmp_kv, [cmp_block_num * CMP_STORAGE_BLOCK_SIZE, HEAD_DIM])
     pooled_kv_pad = pl.create_tensor([HCA_C128_RMS_PAD_ROWS, HEAD_DIM], dtype=pl.FP32)
     normed_kv_pad = pl.create_tensor([HCA_C128_RMS_PAD_ROWS, HEAD_DIM], dtype=pl.FP32)
+    rope_dup_idx_template = pl.create_tensor(
+        [HCA_C128_RMS_TILE, ROPE_HEAD_DIM], dtype=pl.INT32
+    )
+    rope_swap_idx_template = pl.create_tensor(
+        [HCA_C128_RMS_TILE, ROPE_HEAD_DIM], dtype=pl.INT32
+    )
+    rope_sign_template = pl.create_tensor(
+        [HCA_C128_RMS_TILE, ROPE_HEAD_DIM], dtype=pl.FP32
+    )
+    with pl.at(
+        level=pl.Level.CORE_GROUP,
+        name_hint="prefill_hca_c128_rope_index_prepare",
+    ):
+        # Match the PTOAS-compatible DSpark donor: keep TCI/arange out of the
+        # nested RMSNorm/RoPE task and construct its fixed gather templates
+        # explicitly in a parent task.
+        for rope_r in pl.range(HCA_C128_RMS_TILE):
+            for rope_c in pl.range(ROPE_HEAD_DIM):
+                rope_lane = rope_c % 2
+                pl.write(
+                    rope_dup_idx_template,
+                    [rope_r, rope_c],
+                    pl.cast(rope_c // 2, pl.INT32),
+                )
+                pl.write(
+                    rope_swap_idx_template,
+                    [rope_r, rope_c],
+                    pl.cast(rope_c + 1 - rope_lane * 2, pl.INT32),
+                )
+                pl.write(
+                    rope_sign_template,
+                    [rope_r, rope_c],
+                    pl.cast(
+                        pl.cast(rope_lane * 2 - 1, pl.INT32),
+                        pl.FP32,
+                    ),
+                )
 
     for proj_idx in pl.spmd(OUT_DIM // OUT_TILE, name_hint="prefill_hca_c128_kv_score_proj"):
         o0 = proj_idx * OUT_TILE
@@ -228,16 +269,12 @@ def prefill_compressor_ratio128(
         kv_rope = pooled_kv_pad[0:HCA_C128_RMS_TILE, NOPE_HEAD_DIM:HEAD_DIM]
         gamma_rope = pl.cast(norm_w_2d[:, NOPE_HEAD_DIM:HEAD_DIM], pl.FP32)
         rope_normed = pl.col_expand_mul(pl.row_expand_mul(kv_rope, inv_rms), gamma_rope)
-        # A3 interleaved swap-gather (matches decode): single data gather + sign trick instead of
-        # the P0101/P1010 de-interleave gather + rotate + re-interleave scatter.
-        # out[j] = n[j]*cos_il[j] + n[j^1]*sign[j]*sin_il[j]; idx built in-kernel from pl.arange.
-        rope_ones = pl.full([HCA_C128_RMS_TILE, ROPE_HEAD_DIM], dtype=pl.FP32, value=1.0)
-        rope_col = pl.col_expand_mul(rope_ones, pl.cast(pl.arange(0, [1, ROPE_HEAD_DIM], dtype=pl.INT32), target_type=pl.FP32))
-        rope_dup_f = pl.cast(pl.cast(pl.mul(rope_col, 0.5), target_type=pl.INT32, mode="trunc"), target_type=pl.FP32)
-        rope_dup_idx = pl.cast(rope_dup_f, target_type=pl.INT32)                                       # j>>1
-        rope_lane = pl.sub(rope_col, pl.mul(rope_dup_f, 2.0))                                          # j%2
-        rope_swap_idx = pl.cast(pl.sub(pl.add(rope_col, 1.0), pl.mul(rope_lane, 2.0)), target_type=pl.INT32)  # j^1
-        rope_sign = pl.sub(pl.mul(rope_lane, 2.0), 1.0)                                                # [-1,+1,...]
+        # A3 interleaved swap-gather: out[j] = n[j]*cos[j>>1]
+        # + n[j^1]*sign[j]*sin[j>>1].  Templates are materialized above so
+        # this Level-3 task does not request PTOAS 0.60 TCI scratch.
+        rope_dup_idx = rope_dup_idx_template[:, :]
+        rope_swap_idx = rope_swap_idx_template[:, :]
+        rope_sign = rope_sign_template[:, :]
         cos_il = pl.gather(cos_b, dim=-1, index=rope_dup_idx)
         sin_il = pl.gather(sin_b, dim=-1, index=rope_dup_idx)
         swapped = pl.gather(rope_normed, dim=-1, index=rope_swap_idx)
@@ -301,7 +338,9 @@ def golden_prefill_compressor_ratio128(tensors):
     kv_state_flat = compress_state_flat[:, :OUT_DIM]
     score_state_flat = compress_state_flat[:, OUT_DIM:]
     state_block_table = tensors["compress_state_block_table"]
-    cmp_kv_flat = tensors["cmp_kv"].view(HCA_CMP_BLOCK_NUM * CMP_STORAGE_BLOCK_SIZE, HEAD_DIM)
+    # Leaf-composed CP callers intentionally pass a single physical cache
+    # block, while the standalone entry uses the full pool.
+    cmp_kv_flat = tensors["cmp_kv"].view(-1, HEAD_DIM)
 
     def state_row(abs_pos):
         if abs_pos < 0 or abs_pos >= MAX_SEQ_LEN:

@@ -18,12 +18,19 @@ from config import (
     FLASH as M,
     FP32_NEG_INF,
     HCA_STATE_PHYSICAL_BLOCKS,
-    PREFILL_CMP_BLOCK_NUM,
     PREFILL_CMP_MAX_BLOCKS,
     PREFILL_ORI_MAX_BLOCKS,
 )
+from lm_head import (
+    GROUP_LOGIT_ROWS as LM_HEAD_GROUP_LOGIT_ROWS,
+    MAX_LOGIT_ROWS as LM_HEAD_MAX_LOGIT_ROWS,
+    TP_SIZE as LM_HEAD_TP_SIZE,
+    VOCAB as LM_HEAD_VOCAB,
+    VOCAB_PER_TP as LM_HEAD_VOCAB_PER_TP,
+    lm_head,
+)
 from prefill_compressor_ratio128 import (
-    CMP_STORAGE_BLOCK_SIZE as HCA_CMP_STORAGE_BLOCK_SIZE,
+    COMPRESS_RATIO as HCA_COMPRESS_RATIO,
     COMPRESS_STATE_DIM,
     HCA_STATE_BLOCK_SIZE,
     HCA_STATE_MAX_BLOCKS,
@@ -31,15 +38,18 @@ from prefill_compressor_ratio128 import (
 )
 from prefill_compressor_ratio4 import (
     CMP_STORAGE_BLOCK_SIZE as CSA_CMP_STORAGE_BLOCK_SIZE,
+    COMPRESS_RATIO as CSA_COMPRESS_RATIO,
     COMPRESS_STATE_DIM as MAIN_STATE_DIM,
     CSA_STATE_BLOCK_SIZE as MAIN_STATE_BLOCK_SIZE,
     HEAD_DIM as MAIN_HEAD_DIM,
 )
 from prefill_cp_zigzag import (
     CP_SIZE,
+    CP_PREFILL_CMP_BLOCK_NUM as PREFILL_CMP_BLOCK_NUM,
     CP_TAIL_WINDOW_ROWS,
     EPOCHS,
     HEAD_DIM,
+    MAX_SEGMENT_TILES,
     NUM_SEGMENTS,
     ROW_TILE,
     TAIL_ROWS,
@@ -62,6 +72,14 @@ from prefill_sparse_attn import (
 CP_CMP_BLOCK_NUM_DYN = pl.dynamic("CP_CMP_BLOCK_NUM_DYN")
 CP_CMP_STORAGE_BLOCK_SIZE_DYN = pl.dynamic("CP_CMP_STORAGE_BLOCK_SIZE_DYN")
 
+# Rows per C128 compressed cache block on the CP path. CANN Recipes and the
+# PTOAS 0.60 DSpark donor page C128 compressed rows in full cache blocks, so
+# one logical block covers BLOCK_SIZE compressed rows (BLOCK_SIZE *
+# COMPRESS_RATIO source tokens). Serving pages one row per original-KV page --
+# prefill_compressor_ratio128.CMP_STORAGE_BLOCK_SIZE -- and the shared
+# compressor reads whichever the caller's tensor carries.
+HCA_CMP_STORAGE_BLOCK_SIZE = BLOCK_SIZE
+
 
 # model config
 D = M.hidden_size
@@ -70,7 +88,6 @@ IDX_TOPK = M.index_topk
 
 # CP exchange layout
 LOCAL_PARTS = 2
-MAX_SEGMENT_TILES = 2
 NUM_LOCAL_TILES = LOCAL_PARTS * MAX_SEGMENT_TILES
 LOCAL_ROWS = NUM_LOCAL_TILES * TAIL_ROWS
 LOCAL_SPARSE_ROWS = LOCAL_ROWS * PREFILL_SPARSE_PAD
@@ -80,22 +97,220 @@ PRED_OVERLAY_ROWS = TAIL_ROWS
 OVERLAY_ROWS = 2 * TAIL_ROWS
 OVERLAY_SOURCES = 2
 
-CMP_ROWS_PER_SEGMENT = 2
+CMP_ROWS_PER_SEGMENT = (
+    MAX_SEGMENT_TILES * TAIL_ROWS // HCA_COMPRESS_RATIO
+)
 CMP_ROWS_PER_RANK = LOCAL_PARTS * CMP_ROWS_PER_SEGMENT
 CMP_META_DIM = 8
 STATE_META_DIM = 8
 CMP_WINDOW_ROWS = CP_SIZE * CMP_ROWS_PER_RANK
 STATE_WINDOW_ROWS = CP_SIZE * TAIL_ROWS
 
-ROWS_PER_RANK = 128
+ROWS_PER_RANK = (
+    LOCAL_PARTS * MAX_SEGMENT_TILES * TAIL_ROWS // CSA_COMPRESS_RATIO
+)
 STATE_ROWS_PER_RANK = 8
 META_DIM = 8
 RECORDS_PER_WINDOW = CP_SIZE * ROWS_PER_RANK
 STATE_RECORDS_PER_WINDOW = CP_SIZE * STATE_ROWS_PER_RANK
-SCALE_TILE_COLS = 8
+# FP16 scale rows must remain 32-byte aligned on PTOAS 0.60.
+SCALE_TILE_COLS = 16
 MAIN_CACHE_ROWS = PREFILL_CMP_BLOCK_NUM * CSA_CMP_STORAGE_BLOCK_SIZE
 MAIN_STATE_ROWS = CSA_STATE_PHYSICAL_BLOCKS * MAIN_STATE_BLOCK_SIZE
 INNER_STATE_ROWS = CSA_INNER_STATE_PHYSICAL_BLOCKS * INNER_STATE_BLOCK_SIZE
+CP_LAST_HIDDEN_EPOCH = 1
+
+
+@pl.jit(auto_scope=False)
+def prefill_cp_last_hidden_lm_head(
+    hidden_states: pl.Tensor[[LOCAL_ROWS, D], pl.BF16],
+    segment_active_lengths: pl.Tensor[[LOCAL_PARTS], pl.INT32],
+    final_segment_t: pl.Tensor[[1], pl.INT32],
+    owner_rank_table: pl.Tensor[[NUM_SEGMENTS], pl.INT32],
+    owner_part_table: pl.Tensor[[NUM_SEGMENTS], pl.INT32],
+    lm_head_weight: pl.Tensor[[LM_HEAD_VOCAB_PER_TP, D], pl.BF16],
+    logit_row_indices: pl.Tensor[[LM_HEAD_MAX_LOGIT_ROWS], pl.INT32],
+    logits: pl.Out[
+        pl.Tensor[[LM_HEAD_MAX_LOGIT_ROWS, LM_HEAD_VOCAB], pl.FP32]
+    ],
+    cp_hidden_window: pld.DistributedTensor[[1, D], pl.BF16],
+    cp_ready: pld.DistributedTensor[[CP_SIZE, 1], pl.INT32],
+    cp_consumed: pld.DistributedTensor[[CP_SIZE, 1], pl.INT32],
+    lm_hidden_window: pld.DistributedTensor[
+        [LM_HEAD_GROUP_LOGIT_ROWS, D], pl.BF16
+    ],
+    lm_hidden_done: pld.DistributedTensor[
+        [LM_HEAD_TP_SIZE, 1], pl.INT32
+    ],
+    lm_logits_window: pld.DistributedTensor[
+        [LM_HEAD_MAX_LOGIT_ROWS, LM_HEAD_VOCAB], pl.FP32
+    ],
+    lm_logits_done: pld.DistributedTensor[
+        [LM_HEAD_TP_SIZE, 1], pl.INT32
+    ],
+    my_rank: pl.Scalar[pl.INT32],
+    group_base: pl.Scalar[pl.INT32],
+    tp_rank: pl.Scalar[pl.INT32],
+    done_epoch: pl.Scalar[pl.INT32],
+) -> pl.Tensor[[LM_HEAD_MAX_LOGIT_ROWS, LM_HEAD_VOCAB], pl.FP32]:
+    """Feed the Recipes CP-global final hidden into the existing TP LM head.
+
+    CANN Recipes writes the global-final row on the unique owner, writes zero
+    on every other CP rank, and SUM-allreduces the resulting ``[1, D]`` row.
+    Under that one-owner invariant, the push broadcast below is numerically
+    identical.  It stays in this JIT wrapper because PTOAS 0.60 cannot map an
+    inline callee with the three distributed InOut windows plus one Out tensor
+    to an explicit return parameter.
+
+    ``cp_ready``/``cp_consumed`` form a two-phase reuse handshake: receivers
+    acknowledge only after copying their local window into ``last_hidden``,
+    and the owner waits for all acknowledgements before clearing them.
+    """
+    last_hidden = pl.create_tensor([1, D], dtype=pl.BF16)
+    final_segment = pl.read(final_segment_t, [0])
+    final_owner = pl.read(owner_rank_table, [final_segment])
+    final_part = pl.read(owner_part_table, [final_segment])
+    epoch = pl.cast(CP_LAST_HIDDEN_EPOCH, pl.INT32)
+    zero = pl.cast(0, pl.INT32)
+
+    with pl.at(
+        level=pl.Level.CORE_GROUP,
+        name_hint="prefill_cp_last_hidden_select",
+    ) as select_tid:
+        last_hidden[0:1, 0:D] = pl.full(
+            [1, D], dtype=pl.BF16, value=0.0
+        )
+        if my_rank == final_owner:
+            active = pl.read(segment_active_lengths, [final_part])
+            source_row_raw = (
+                final_part
+                * pl.cast(MAX_SEGMENT_TILES * TAIL_ROWS, pl.INT32)
+                + active
+                - pl.cast(1, pl.INT32)
+            )
+            source_row = pl.cast(source_row_raw, target_type=pl.INDEX)
+            last_hidden[0:1, 0:D] = hidden_states[
+                source_row:source_row + 1, 0:D
+            ]
+
+    # PTOAS 0.60 requires each generated orchestration scope to have at most
+    # one implicit Out/InOut result.  Keep payload, ready, consumed, and the
+    # GM readback in separate tasks, with explicit edges carrying the Recipes
+    # two-phase reuse protocol.
+    with pl.at(
+        level=pl.Level.CORE_GROUP,
+        name_hint="prefill_cp_last_hidden_put",
+        deps=[select_tid],
+    ) as put_tid:
+        if my_rank == final_owner:
+            for peer in pl.range(CP_SIZE):
+                if peer != my_rank:
+                    pld.tensor.put(
+                        dst=cp_hidden_window,
+                        peer=peer,
+                        src=last_hidden,
+                        dst_offsets=[0, 0],
+                        src_offsets=[0, 0],
+                        shape=[1, D],
+                    )
+
+    with pl.at(
+        level=pl.Level.CORE_GROUP,
+        name_hint="prefill_cp_last_hidden_ready",
+        deps=[put_tid],
+    ) as ready_tid:
+        if my_rank == final_owner:
+            for peer in pl.range(CP_SIZE):
+                if peer != my_rank:
+                    pld.system.notify(
+                        target=cp_ready,
+                        peer=peer,
+                        offsets=[my_rank, 0],
+                        value=epoch,
+                        op=pld.NotifyOp.AtomicAdd,
+                    )
+
+    with pl.at(
+        level=pl.Level.CORE_GROUP,
+        name_hint="prefill_cp_last_hidden_ready_wait",
+        deps=[select_tid],
+    ) as ready_wait_tid:
+        if my_rank != final_owner:
+            pld.system.wait(
+                signal=cp_ready,
+                offsets=[final_owner, 0],
+                expected=epoch,
+                cmp=pld.WaitCmp.Ge,
+            )
+
+    with pl.at(
+        level=pl.Level.CORE_GROUP,
+        name_hint="prefill_cp_last_hidden_readback",
+        deps=[select_tid, ready_wait_tid],
+    ) as readback_tid:
+        if my_rank != final_owner:
+            last_hidden[0:1, 0:D] = cp_hidden_window[0:1, 0:D]
+
+    with pl.at(
+        level=pl.Level.CORE_GROUP,
+        name_hint="prefill_cp_last_hidden_ready_clear",
+        deps=[readback_tid],
+    ) as ready_clear_tid:
+        if my_rank != final_owner:
+            pl.write(cp_ready, [final_owner, 0], zero)
+
+    with pl.at(
+        level=pl.Level.CORE_GROUP,
+        name_hint="prefill_cp_last_hidden_consumed",
+        deps=[ready_clear_tid],
+    ) as consumed_tid:
+        if my_rank != final_owner:
+            pld.system.notify(
+                target=cp_consumed,
+                peer=final_owner,
+                offsets=[my_rank, 0],
+                value=epoch,
+                op=pld.NotifyOp.AtomicAdd,
+            )
+
+    with pl.at(
+        level=pl.Level.CORE_GROUP,
+        name_hint="prefill_cp_last_hidden_consumed_wait",
+        deps=[ready_tid],
+    ) as consumed_wait_tid:
+        if my_rank == final_owner:
+            for peer in pl.range(CP_SIZE):
+                if peer != my_rank:
+                    pld.system.wait(
+                        signal=cp_consumed,
+                        offsets=[peer, 0],
+                        expected=epoch,
+                        cmp=pld.WaitCmp.Ge,
+                    )
+
+    with pl.at(
+        level=pl.Level.CORE_GROUP,
+        name_hint="prefill_cp_last_hidden_consumed_clear",
+        deps=[consumed_tid, consumed_wait_tid],
+    ):
+        if my_rank == final_owner:
+            for peer in pl.range(CP_SIZE):
+                if peer != my_rank:
+                    pl.write(cp_consumed, [peer, 0], zero)
+    lm_head(
+        last_hidden,
+        lm_head_weight,
+        logit_row_indices,
+        logits,
+        lm_hidden_window,
+        lm_hidden_done,
+        lm_logits_window,
+        lm_logits_done,
+        group_base,
+        tp_rank,
+        done_epoch,
+    )
+    return logits
 
 
 @pl.jit.inline
@@ -196,6 +411,99 @@ def _prefill_cp_dual_tail_exchange_wave(
 
 
 @pl.jit.inline
+def _prefill_cp_hidden_tail_exchange_wave(
+    local_hidden_tail: pl.Tensor[
+        [EPOCHS * LOCAL_PARTS * TAIL_ROWS, D], pl.BF16
+    ],
+    reverse_index: pl.Tensor[[NUM_SEGMENTS], pl.INT32],
+    owner_rank_table: pl.Tensor[[NUM_SEGMENTS], pl.INT32],
+    hidden_window: pld.DistributedTensor[
+        [CP_TAIL_WINDOW_ROWS, D], pl.BF16
+    ],
+    ready: pld.DistributedTensor[[CP_SIZE, 1], pl.INT32],
+    consumed: pld.DistributedTensor[[CP_SIZE, 1], pl.INT32],
+    logical_hidden_out: pl.Out[
+        pl.Tensor[[EPOCHS * CP_TAIL_WINDOW_ROWS, D], pl.BF16]
+    ],
+    my_rank: pl.Scalar[pl.INT32],
+    payload_epoch: pl.Scalar[pl.INT32],
+    comm_epoch: pl.Scalar[pl.INT32],
+) -> pl.Tensor[[EPOCHS * CP_TAIL_WINDOW_ROWS, D], pl.BF16]:
+    """Exchange only hidden tails, matching the Recipes CP prefill contract.
+
+    The ready/consumed protocol intentionally matches the dual-tail wave one
+    for one so callers can keep using the same monotonic cross-layer epoch.
+    Projected KV is produced locally after the hidden exchange.
+    """
+    epoch_value = pl.cast(comm_epoch + 1, pl.INT32)
+
+    for peer in pl.range(CP_SIZE):
+        if peer != my_rank:
+            pld.system.wait(
+                signal=consumed, offsets=[peer, 0],
+                expected=comm_epoch, cmp=pld.WaitCmp.Ge,
+            )
+
+    for peer in pl.range(CP_SIZE):
+        for part in pl.range(LOCAL_PARTS):
+            publish_pos = my_rank * LOCAL_PARTS + part
+            publish_dst_row = publish_pos * TAIL_ROWS
+            src_row_base = (
+                payload_epoch * LOCAL_PARTS * TAIL_ROWS
+                + part * TAIL_ROWS
+            )
+            pld.tensor.put(
+                dst=hidden_window,
+                peer=peer,
+                src=local_hidden_tail,
+                dst_offsets=[publish_dst_row, 0],
+                src_offsets=[src_row_base, 0],
+                shape=[TAIL_ROWS, D],
+                chunk_rows=ROW_TILE,
+                chunk_cols=D,
+                pipeline=True,
+            )
+
+    for peer in pl.range(CP_SIZE):
+        if peer != my_rank:
+            pld.system.notify(
+                target=ready, peer=peer, offsets=[my_rank, 0],
+                value=1, op=pld.NotifyOp.AtomicAdd,
+            )
+
+    for seg in pl.range(NUM_SEGMENTS):
+        gather_pos = reverse_index[seg]
+        owner = owner_rank_table[seg]
+        if owner != my_rank:
+            pld.system.wait(
+                signal=ready, offsets=[owner, 0],
+                expected=epoch_value, cmp=pld.WaitCmp.Ge,
+            )
+        gather_src_row = gather_pos * TAIL_ROWS
+        gather_dst_row = (
+            payload_epoch * CP_TAIL_WINDOW_ROWS + seg * TAIL_ROWS
+        )
+        for t0 in pl.range(0, TAIL_ROWS, ROW_TILE):
+            hidden_tile = hidden_window[
+                gather_src_row + t0:gather_src_row + t0 + ROW_TILE,
+                0:D,
+            ]
+            logical_hidden_out[
+                gather_dst_row + t0:gather_dst_row + t0 + ROW_TILE,
+                0:D,
+            ] = hidden_tile
+
+    for peer in pl.range(CP_SIZE):
+        if peer != my_rank:
+            pld.system.notify(
+                target=consumed, peer=peer, offsets=[my_rank, 0],
+                value=1, op=pld.NotifyOp.AtomicAdd,
+            )
+
+    return logical_hidden_out
+
+
+@pl.jit.inline
 def _prefill_cp_hca_compact_exchange_commit_wave(
     local_cmp_payload: pl.Tensor[
         [EPOCHS * CMP_ROWS_PER_RANK, HEAD_DIM], pl.BF16
@@ -244,9 +552,7 @@ def _prefill_cp_hca_compact_exchange_commit_wave(
     my_rank: pl.Scalar[pl.INT32],
     payload_epoch: pl.Scalar[pl.INT32],
     comm_epoch: pl.Scalar[pl.INT32],
-) -> pl.Tensor[
-    [PREFILL_CMP_BLOCK_NUM * HCA_CMP_STORAGE_BLOCK_SIZE, HEAD_DIM], pl.BF16
-]:
+) -> None:
     """Publish HCA compact rows and commit receiver-local cache/state.
 
     ``payload_epoch`` selects rows in the invocation-local payload tensors
@@ -320,13 +626,18 @@ def _prefill_cp_hca_compact_exchange_commit_wave(
                             physical_block = pl.read(cmp_block_table, [logical_block])
                             if physical_block >= 0:
                                 intra = pl.cast(logical_slot % HCA_CMP_STORAGE_BLOCK_SIZE, pl.INDEX)
-                                cmp_row_tile = cmp_window[cmp_source_row : cmp_source_row + 1, 0:HEAD_DIM]
+                                cmp_row_tile = cmp_window[
+                                    cmp_source_row : cmp_source_row + 1,
+                                    0:HEAD_DIM,
+                                ]
                                 cache_row = (
                                     pl.cast(physical_block, pl.INDEX)
                                     * HCA_CMP_STORAGE_BLOCK_SIZE
                                     + intra
                                 )
-                                cmp_kv[cache_row : cache_row + 1, 0:HEAD_DIM] = cmp_row_tile
+                                cmp_kv[
+                                    cache_row : cache_row + 1, 0:HEAD_DIM
+                                ] = cmp_row_tile
 
     for state_owner in pl.range(CP_SIZE):
         state_valid = pl.read(state_meta_window, [state_owner, 0])
@@ -358,7 +669,9 @@ def _prefill_cp_hca_compact_exchange_commit_wave(
                 target=consumed, peer=peer, offsets=[my_rank, 0],
                 value=1, op=pld.NotifyOp.AtomicAdd,
             )
-    return cmp_kv
+    # ``cmp_kv`` is caller-owned InOut storage.  Do not return a scoped SSA
+    # alias: PyPTO 0.60 would classify the compact task argument as Out and
+    # discard untouched cache rows instead of preserving their input values.
 
 
 @pl.jit.inline
@@ -370,7 +683,7 @@ def _prefill_cp_csa_compact_transport_wave(
         [EPOCHS * ROWS_PER_RANK, INNER_HEAD_DIM], pl.INT8
     ],
     idx_scale: pl.Tensor[
-        [EPOCHS * ROWS_PER_RANK, SCALE_TILE_COLS], pl.FP32
+        [EPOCHS * ROWS_PER_RANK, SCALE_TILE_COLS], pl.FP16
     ],
     record_meta: pl.Tensor[[EPOCHS * ROWS_PER_RANK, META_DIM], pl.INT32],
     main_state_payload: pl.Tensor[
@@ -392,7 +705,7 @@ def _prefill_cp_csa_compact_transport_wave(
         [RECORDS_PER_WINDOW, INNER_HEAD_DIM], pl.INT8
     ],
     scale_window: pld.DistributedTensor[
-        [RECORDS_PER_WINDOW, SCALE_TILE_COLS], pl.FP32
+        [RECORDS_PER_WINDOW, SCALE_TILE_COLS], pl.FP16
     ],
     record_window: pld.DistributedTensor[
         [RECORDS_PER_WINDOW, META_DIM], pl.INT32
@@ -534,7 +847,10 @@ def _prefill_cp_sparse_stage(
     cmp_cache_rows = pl.tensor.dim(cmp_kv, 0) * pl.tensor.dim(cmp_kv, 1)
     cmp_kv_flat = pl.reshape(cmp_kv, [cmp_cache_rows, HEAD_DIM])
     prefix = pl.read(segment_starts_t, [0])
-    with pl.spmd((LOCAL_ROWS // 2) * PREFILL_ATTN_BLOCKS, name_hint="prefill_cp_gather_kv"):
+    with pl.spmd(
+        (LOCAL_ROWS // 2) * PREFILL_ATTN_BLOCKS,
+        name_hint="prefill_cp_gather_kv",
+    ) as gather_tid:
         block = pl.tile.get_block_idx()
         schedule = block // PREFILL_ATTN_BLOCKS
         sparse_block = block - schedule * PREFILL_ATTN_BLOCKS
@@ -604,7 +920,9 @@ def _prefill_cp_sparse_stage(
                                 logical_block = logical_slot // cmp_storage_block_size
                                 if logical_block < PREFILL_CMP_MAX_BLOCKS:
                                     physical_block = pl.read(cmp_block_table, [logical_block])
-                                    if physical_block >= 0:
+                                    # The Recipes temporary root reserves
+                                    # physical page 0 as the sentinel.
+                                    if physical_block > 0:
                                         source_block = (
                                             pl.cast(physical_block, pl.INDEX)
                                             * cmp_storage_block_size
@@ -620,7 +938,10 @@ def _prefill_cp_sparse_stage(
                 output_row = row * PREFILL_SPARSE_PAD + key0
                 sparse_kv[output_row:output_row + PREFILL_ATTN_TILE, :] = stage
 
-    with pl.spmd(LOCAL_ROWS // BIAS_TOKEN_TILE, name_hint="prefill_cp_build_bias"):
+    with pl.spmd(
+        LOCAL_ROWS // BIAS_TOKEN_TILE,
+        name_hint="prefill_cp_build_bias",
+    ) as bias_tid:
         bias_block = pl.tile.get_block_idx()
         row0 = bias_block * BIAS_TOKEN_TILE
         raw_idx = pl.cast(swa_indices[row0:row0 + BIAS_TOKEN_TILE, 0:WIN], target_type=pl.FP32)
@@ -642,7 +963,9 @@ def _prefill_cp_sparse_stage(
                 value=FP32_NEG_INF,
             )
 
-    with pl.spmd(LOCAL_ROWS, name_hint="prefill_cp_build_valid_mask"):
+    with pl.spmd(
+        LOCAL_ROWS, name_hint="prefill_cp_build_valid_mask"
+    ) as mask_tid:
         row = pl.tile.get_block_idx()
         mask = pl.full([1, VALID_BLOCK_MASK_COLS], dtype=pl.INT32, value=0)
         for sparse_block in pl.range(PREFILL_ATTN_BLOCKS):
@@ -662,4 +985,4 @@ def _prefill_cp_sparse_stage(
             pl.write(mask, [0, sparse_block], block_valid)
         valid_block_mask[row:row + 1, 0:VALID_BLOCK_MASK_COLS] = mask
 
-    return sparse_kv
+    return pl.system.task_dummy(deps=[gather_tid, bias_tid, mask_tid])

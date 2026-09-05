@@ -21,7 +21,6 @@ from config import (
     CSA_STATE_PHYSICAL_BLOCKS,
     FLASH as M,
     IDX_CACHE_MAX_BLOCKS,
-    PREFILL_CMP_BLOCK_NUM,
     PREFILL_CMP_MAX_BLOCKS,
     PREFILL_IDX_BLOCK_NUM,
     PREFILL_IDX_MAX_BLOCKS,
@@ -40,7 +39,6 @@ from prefill_compressor_ratio4 import (
 from prefill_cp_exchange import (
     INNER_STATE_DIM,
     INNER_STATE_ROWS,
-    MAIN_CACHE_ROWS,
     MAIN_STATE_DIM,
     MAIN_STATE_ROWS,
     META_DIM,
@@ -50,16 +48,17 @@ from prefill_cp_exchange import (
     STATE_META_DIM,
     STATE_RECORDS_PER_WINDOW,
     STATE_ROWS_PER_RANK,
-    _prefill_cp_dual_tail_exchange_wave,
+    _prefill_cp_hidden_tail_exchange_wave,
     _prefill_cp_csa_compact_finish_wave,
     _prefill_cp_csa_compact_transport_wave,
-    _prefill_cp_sparse_stage,
 )
 from prefill_cp_zigzag import (
     CP_CHOICES,
+    CP_PREFILL_CMP_BLOCK_NUM as PREFILL_CMP_BLOCK_NUM,
     CP_SIZE,
     CP_TAIL_WINDOW_ROWS,
     EPOCHS,
+    MAX_SEGMENT_TILES,
     NUM_SEGMENTS,
     TAIL_ROWS,
     cp_final_window_sources,
@@ -84,16 +83,19 @@ from prefill_indexer_compressor import (
 from prefill_sparse_attn import (
     PREFILL_SPARSE_PAD,
     ROPE_DIM,
+    STAGED_SWA_ROWS,
     VALID_BLOCK_MASK_COLS,
-    sparse_attn_math,
     build_tensor_specs as build_sparse_attn_tensor_specs,
     golden_prefill_sparse_attn,
+    physical_sparse_attn_512,
 )
 from qkv_proj_rope import (
     build_tensor_specs as build_qkv_tensor_specs,
     golden_qkv_proj_rope,
+    kv_proj_rope,
     materialize_rope_rows,
     qkv_proj_rope,
+    rope_prepare,
 )
 from rmsnorm import golden_rms_norm, rms_norm
 from utils import build_rope_tables
@@ -116,22 +118,42 @@ COMPRESS_RATIO = 4
 STATE_LEN = 8
 WIN = M.sliding_window
 LOCAL_PARTS = 2
-MAX_SEGMENT_TILES = 2
+assert WIN % BLOCK_SIZE == 0
 ORI_MAX_BLOCKS = PREFILL_ORI_MAX_BLOCKS
 ORI_CACHE_ROWS = ORI_MAX_BLOCKS * BLOCK_SIZE
 OVERLAY_ROWS = 2 * TAIL_ROWS
 OVERLAY_SOURCES = 2
 MAX_SEED_ROWS = COMPRESS_RATIO + 3
 MAX_COMPRESSED_ROWS_PER_TILE = T // COMPRESS_RATIO
-MAX_COMPRESSED_ROWS_PER_SEGMENT = 2 * MAX_COMPRESSED_ROWS_PER_TILE
+MAX_COMPRESSED_ROWS_PER_SEGMENT = (
+    MAX_SEGMENT_TILES * MAX_COMPRESSED_ROWS_PER_TILE
+)
+assert ROWS_PER_RANK == LOCAL_PARTS * MAX_COMPRESSED_ROWS_PER_SEGMENT
 
 MAIN_STATE_BLOCK_SIZE = 4
 INNER_STATE_BLOCK_SIZE = 4
 MAIN_STATE_MAX_BLOCKS = (M.max_position_embeddings + MAIN_STATE_BLOCK_SIZE - 1) // MAIN_STATE_BLOCK_SIZE
 INNER_STATE_MAX_BLOCKS = (M.max_position_embeddings + INNER_STATE_BLOCK_SIZE - 1) // INNER_STATE_BLOCK_SIZE
 
-CP_CANDIDATE_CAPACITY = 1024
-SPARSE_SELECTED_WIDTH = 256
+CP_CANDIDATE_CAPACITY = CP_INDEXER_SCORE_CAP
+SPARSE_SELECTED_WIDTH = IDX_TOPK
+CSA_TOPK_SEED_ROWS = 16
+PREFILL_CP_CSA_RING_HEAP = (1024 * 1024 * 1024,) * 4
+CP_TMP_COMPRESSED_ROWS = (
+    NUM_SEGMENTS * MAX_SEGMENT_TILES * T // COMPRESS_RATIO
+)
+CP_TMP_DATA_PAGES = (
+    CP_TMP_COMPRESSED_ROWS + BLOCK_SIZE - 1
+) // BLOCK_SIZE
+CP_TMP_CACHE_PAGES = 1 + CP_TMP_DATA_PAGES
+CP_TMP_CACHE_ROWS = CP_TMP_CACHE_PAGES * BLOCK_SIZE
+CP_RAW_DATA_PAGES = NUM_SEGMENTS * MAX_SEGMENT_TILES
+CP_RAW_CACHE_PAGES = 1 + CP_RAW_DATA_PAGES
+CP_RAW_CACHE_ROWS = CP_RAW_CACHE_PAGES * BLOCK_SIZE
+CP_TMP_STATE_DATA_PAGES = 2
+CP_TMP_STATE_PAGES = 1 + CP_TMP_STATE_DATA_PAGES
+CP_TMP_STATE_ROWS = CP_TMP_STATE_PAGES * BLOCK_SIZE
+assert CP_TMP_COMPRESSED_ROWS <= CP_CANDIDATE_CAPACITY
 
 NUM_LOCAL_TILES = LOCAL_PARTS * MAX_SEGMENT_TILES
 # §8.17.8e.2 leaf-capture completion token: number of x_out tile producers
@@ -141,6 +163,9 @@ NUM_LOCAL_TILES = LOCAL_PARTS * MAX_SEGMENT_TILES
 # eliminated. Mirrors prefill_cp_fwd.py:NUM_MOE_WAVES / prefill_cp_layer.py.
 NUM_MOE_WAVES = NUM_LOCAL_TILES
 LOCAL_ROWS = NUM_LOCAL_TILES * T
+SEGMENT_ROWS = MAX_SEGMENT_TILES * T
+assert SEGMENT_ROWS == STAGED_SWA_ROWS
+assert T % CSA_TOPK_SEED_ROWS == 0
 LOCAL_SPARSE_ROWS = LOCAL_ROWS * PREFILL_SPARSE_PAD
 MAX_COMPRESS_LEAVES = 1 + MAX_SEGMENT_TILES
 MAIN_LEAF_CACHE_BLOCKS = PREFILL_CMP_BLOCK_NUM
@@ -150,6 +175,8 @@ IDX_LEAF_CACHE_ROWS = IDX_LEAF_CACHE_BLOCKS * CMP_STORAGE_BLOCK_SIZE
 LOCAL_LEAVES = LOCAL_PARTS * MAX_COMPRESS_LEAVES
 IDX_CACHE_ROWS = PREFILL_IDX_BLOCK_NUM * CMP_STORAGE_BLOCK_SIZE
 QK_ROPE_HALF = ROPE_HEAD_DIM // 2
+LOCAL_REPROJECT_ROWS = (LOCAL_PARTS + 1) * T
+FINAL_REPROJECT_ROW0 = LOCAL_PARTS * T
 
 def owner_segments(cp_size: int) -> list[list[int]]:
     """Build rank/part ownership tables."""
@@ -278,8 +305,8 @@ def _build_metadata_tensors(
         raise ValueError(f"CP size must be one of {CP_CHOICES}, got {cp_size}")
 
     prefix = 0
-    span = T
-    lengths = [T] * (2 * cp_size)
+    span = MAX_SEGMENT_TILES * T
+    lengths = [span] * (2 * cp_size)
     nseg = 2 * cp_size
     starts = _segment_starts(prefix, span, nseg)
     owners = owner_segments(cp_size)
@@ -508,8 +535,8 @@ def _build_metadata_tensors(
 def _build_raw_attention_metadata(cp_size: int) -> tuple[dict[str, torch.Tensor], dict[str, object]]:
     """Build canonical zero-history raw and overlay metadata."""
     prefix = 0
-    span = T
-    lengths = [T] * (2 * cp_size)
+    span = MAX_SEGMENT_TILES * T
+    lengths = [span] * (2 * cp_size)
     starts = _segment_starts(prefix, span, 2 * cp_size)
     owners = owner_segments(cp_size)
     query_positions = torch.zeros(
@@ -974,14 +1001,6 @@ def build_tensor_specs(cp_size: int = CP_SIZE):
         specs.append(
             TensorSpec(name, list(value.shape), value.dtype, init_value=value)
         )
-    specs.append(
-        TensorSpec(
-            "effective_x_workspace",
-            [cp_size, LOCAL_LEAVES * T, D],
-            torch.bfloat16,
-            init_value=0.0,
-        )
-    )
     for part in range(LOCAL_PARTS):
         specs.extend(
             [
@@ -1064,26 +1083,52 @@ def _cp_csa_compress_pack_part(
     main_cache = pl.create_tensor(
         [PREFILL_CMP_BLOCK_NUM, CMP_STORAGE_BLOCK_SIZE, 1, HEAD_DIM],
         dtype=pl.BF16,
-        init_value=0.0,
     )
     idx_cache = pl.create_tensor(
         [PREFILL_IDX_BLOCK_NUM, CMP_STORAGE_BLOCK_SIZE, 1, IDX_HEAD_DIM],
         dtype=pl.INT8,
-        init_value=0,
     )
     idx_scale = pl.create_tensor(
         [PREFILL_IDX_BLOCK_NUM, CMP_STORAGE_BLOCK_SIZE, 1, 1],
         dtype=pl.FP32,
-        init_value=0.0,
     )
-    main_payload = pl.create_tensor([payload_rows, HEAD_DIM], dtype=pl.BF16, init_value=0.0)
-    idx_payload = pl.create_tensor([payload_rows, IDX_HEAD_DIM], dtype=pl.INT8, init_value=0)
-    idx_scale_payload = pl.create_tensor([payload_rows, SCALE_TILE_COLS], dtype=pl.FP32, init_value=0.0)
-    record_meta = pl.create_tensor([payload_rows, META_DIM], dtype=pl.INT32, init_value=-1)
-    main_state_payload = pl.create_tensor([state_payload_rows, MAIN_STATE_DIM], dtype=pl.FP32, init_value=0.0)
-    inner_state_payload = pl.create_tensor([state_payload_rows, INNER_STATE_DIM], dtype=pl.FP32, init_value=0.0)
-    main_state_meta = pl.create_tensor([state_payload_rows, STATE_META_DIM], dtype=pl.INT32, init_value=-1)
-    inner_state_meta = pl.create_tensor([state_payload_rows, STATE_META_DIM], dtype=pl.INT32, init_value=-1)
+    main_payload = pl.create_tensor([payload_rows, HEAD_DIM], dtype=pl.BF16)
+    idx_payload = pl.create_tensor([payload_rows, IDX_HEAD_DIM], dtype=pl.INT8)
+    idx_scale_payload = pl.create_tensor(
+        [payload_rows, SCALE_TILE_COLS], dtype=pl.FP16
+    )
+    record_meta = pl.create_tensor([payload_rows, META_DIM], dtype=pl.INT32)
+    main_state_payload = pl.create_tensor(
+        [state_payload_rows, MAIN_STATE_DIM], dtype=pl.FP32
+    )
+    inner_state_payload = pl.create_tensor(
+        [state_payload_rows, INNER_STATE_DIM], dtype=pl.FP32
+    )
+    main_state_meta = pl.create_tensor(
+        [state_payload_rows, STATE_META_DIM], dtype=pl.INT32
+    )
+    inner_state_meta = pl.create_tensor(
+        [state_payload_rows, STATE_META_DIM], dtype=pl.INT32
+    )
+    with pl.at(
+        level=pl.Level.CORE_GROUP,
+        name_hint="cp_csa_seed_part_metadata",
+    ) as part_meta_seed_tid:
+        record_meta[:, :] = pl.full(
+            [EPOCHS * MAX_COMPRESSED_ROWS_PER_SEGMENT, META_DIM],
+            dtype=pl.INT32,
+            value=-1,
+        )
+        main_state_meta[:, :] = pl.full(
+            [EPOCHS * STATE_ROWS_PER_RANK, STATE_META_DIM],
+            dtype=pl.INT32,
+            value=-1,
+        )
+        inner_state_meta[:, :] = pl.full(
+            [EPOCHS * STATE_ROWS_PER_RANK, STATE_META_DIM],
+            dtype=pl.INT32,
+            value=-1,
+        )
     main_state = main_state_workspace
     inner_state = inner_state_workspace
 
@@ -1140,7 +1185,7 @@ def _cp_csa_compress_pack_part(
         with pl.at(
             level=pl.Level.CORE_GROUP,
             name_hint="cp_csa_materialize_leaf",
-            deps=[main_completion[0], inner_completion[0]],
+            deps=[part_meta_seed_tid, main_completion[0], inner_completion[0]],
         ):
             for state_row in pl.range(MAIN_STATE_ROWS):
                 main_state_next_flat[state_row : state_row + 1, :] = (
@@ -1180,8 +1225,9 @@ def _cp_csa_compress_pack_part(
                                 ] = idx_cache_flat[
                                     idx_source : idx_source + 1, :
                                 ]
-                                scale_value = pl.read(
-                                    idx_scale_flat, [idx_source, 0]
+                                scale_value = pl.cast(
+                                    pl.read(idx_scale_flat, [idx_source, 0]),
+                                    pl.FP16,
                                 )
                                 for scale_col in pl.range(SCALE_TILE_COLS):
                                     pl.write(
@@ -1228,7 +1274,11 @@ def _cp_csa_compress_pack_part(
     inner_state_flat = pl.reshape(
         inner_state, [INNER_STATE_ROWS, INNER_STATE_DIM]
     )
-    with pl.at(level=pl.Level.CORE_GROUP, name_hint="cp_csa_pack_final_state"):
+    with pl.at(
+        level=pl.Level.CORE_GROUP,
+        name_hint="cp_csa_pack_final_state",
+        deps=[part_meta_seed_tid],
+    ):
         if segment == final_segment:
             segment_end = segment_start + segment_active_length
             state_start = pl.max(segment_end - STATE_LEN, 0)
@@ -1416,7 +1466,9 @@ def prefill_cp_csa_core(
     leaf_num_tokens_input: pl.Tensor[
         [LOCAL_PARTS, MAX_COMPRESS_LEAVES], pl.INT32
     ],
-    effective_x_workspace: pl.Tensor[[LOCAL_LEAVES * T, D], pl.BF16],
+    effective_x_workspace: pl.InOut[
+        pl.Tensor[[LOCAL_LEAVES * T, D], pl.BF16]
+    ],
     hidden_tail_window: pld.DistributedTensor[
         [CP_TAIL_WINDOW_ROWS, D], pl.BF16
     ],
@@ -1432,7 +1484,7 @@ def prefill_cp_csa_core(
         [RECORDS_PER_WINDOW, IDX_HEAD_DIM], pl.INT8
     ],
     scale_window: pld.DistributedTensor[
-        [RECORDS_PER_WINDOW, SCALE_TILE_COLS], pl.FP32
+        [RECORDS_PER_WINDOW, SCALE_TILE_COLS], pl.FP16
     ],
     record_window: pld.DistributedTensor[
         [RECORDS_PER_WINDOW, META_DIM], pl.INT32
@@ -1484,13 +1536,13 @@ def prefill_cp_csa_core(
     Local payload rows stay at ``local_epoch`` (``EPOCHS == 1`` in this
     phase). Standalone/single-layer callers pass 0 for both.
     """
-    q = pl.create_tensor([LOCAL_ROWS, H, HEAD_DIM], dtype=pl.BF16, init_value=0.0)
+    q = pl.create_tensor([LOCAL_ROWS, H, HEAD_DIM], dtype=pl.BF16)
     post = pl.create_tensor([LOCAL_ROWS, HC_MULT], dtype=pl.FP32)
     comb = pl.create_tensor([LOCAL_ROWS, HC_MULT * HC_MULT], dtype=pl.FP32)
-    rope_cos_flat = pl.create_tensor([LOCAL_ROWS, ROPE_HEAD_DIM], dtype=pl.BF16, init_value=0.0)
-    rope_sin_flat = pl.create_tensor([LOCAL_ROWS, ROPE_HEAD_DIM], dtype=pl.BF16, init_value=0.0)
-    local_kv = pl.create_tensor([LOCAL_ROWS, HEAD_DIM], dtype=pl.BF16, init_value=0.0)
-    normed = pl.create_tensor([LOCAL_ROWS, D], dtype=pl.BF16, init_value=0.0)
+    rope_cos_flat = pl.create_tensor([LOCAL_ROWS, ROPE_HEAD_DIM], dtype=pl.BF16)
+    rope_sin_flat = pl.create_tensor([LOCAL_ROWS, ROPE_HEAD_DIM], dtype=pl.BF16)
+    local_kv = pl.create_tensor([LOCAL_ROWS, HEAD_DIM], dtype=pl.BF16)
+    normed = pl.create_tensor([LOCAL_ROWS, D], dtype=pl.BF16)
     mixed = pl.create_tensor([LOCAL_ROWS, D], dtype=pl.BF16)
     qr = pl.create_tensor([LOCAL_ROWS, Q_LORA], dtype=pl.INT8)
     qr_scale = pl.create_tensor([LOCAL_ROWS, 1], dtype=pl.FP32)
@@ -1536,8 +1588,9 @@ def prefill_cp_csa_core(
             q_tile, kv_tile, qr_tile, qr_scale_tile, late_dep,
         )
 
-    local_hidden_tail = pl.create_tensor([EPOCHS * LOCAL_PARTS * T, D], dtype=pl.BF16, init_value=0.0)
-    local_kv_tail = pl.create_tensor([EPOCHS * LOCAL_PARTS * T, HEAD_DIM], dtype=pl.BF16, init_value=0.0)
+    local_hidden_tail = pl.create_tensor(
+        [EPOCHS * LOCAL_PARTS * T, D], dtype=pl.BF16
+    )
     with pl.at(level=pl.Level.CORE_GROUP, name_hint="cp_csa_tail_assemble"):
         for part in pl.range(LOCAL_PARTS):
             active = pl.read(segment_active_lengths, [part])
@@ -1548,18 +1601,196 @@ def prefill_cp_csa_core(
                     source = part * MAX_SEGMENT_TILES * T + tail0 + row
                     destination = part * T + row
                     local_hidden_tail[destination : destination + 1, :] = normed[source : source + 1, :]
-                    local_kv_tail[destination : destination + 1, :] = local_kv[source : source + 1, :]
 
     logical_hidden = pl.create_tensor([EPOCHS * CP_TAIL_WINDOW_ROWS, D], dtype=pl.BF16)
-    logical_kv = pl.create_tensor([EPOCHS * CP_TAIL_WINDOW_ROWS, HEAD_DIM], dtype=pl.BF16)
-    with pl.at(level=pl.Level.CORE_GROUP, name_hint="cp_csa_tail_exchange") as tail_exchange_tid:
-        _prefill_cp_dual_tail_exchange_wave(
-            local_hidden_tail, local_kv_tail,
+    with pl.at(
+        level=pl.Level.CORE_GROUP,
+        name_hint="cp_csa_hidden_tail_exchange",
+    ) as tail_exchange_tid:
+        _prefill_cp_hidden_tail_exchange_wave(
+            local_hidden_tail,
             reverse_index, owner_rank_table,
-            hidden_tail_window, kv_tail_window, tail_ready, tail_consumed,
-            logical_hidden, logical_kv,
+            hidden_tail_window, tail_ready, tail_consumed,
+            logical_hidden,
             my_rank, pl.cast(0, pl.INT32), tail_comm_epoch,
         )
+
+    # Recipes exchanges normalized hidden tails only.  Reproject each owned
+    # segment's predecessor window locally, plus the final decode window that
+    # is committed to the persistent raw cache.  The local current-segment KV
+    # remains the one produced by qkv_proj_rope above, so this performs the
+    # same 2*128 predecessor + 128 final-row WKV work as the augmented path
+    # without duplicating the current 2*512 projection.
+    reproject_hidden = pl.create_tensor(
+        [LOCAL_REPROJECT_ROWS, D], dtype=pl.BF16
+    )
+    reproject_positions = pl.create_tensor(
+        [LOCAL_REPROJECT_ROWS], dtype=pl.INT32
+    )
+    with pl.at(
+        level=pl.Level.CORE_GROUP,
+        name_hint="cp_csa_remote_hidden_lowering",
+        deps=[tail_exchange_tid],
+    ) as remote_hidden_tid:
+        for part in pl.range(LOCAL_PARTS):
+            remote_predecessor = pl.read(
+                predecessor_segments_local, [part]
+            )
+            remote_predecessor_valid = pl.cast(0, pl.INT32)
+            remote_predecessor_position0 = pl.cast(0, pl.INT32)
+            if remote_predecessor >= 0:
+                remote_predecessor_length = pl.read(
+                    segment_lengths_t, [remote_predecessor]
+                )
+                remote_predecessor_valid = pl.cast(
+                    pl.min(remote_predecessor_length, T), pl.INT32
+                )
+                remote_predecessor_position0 = pl.cast(
+                    pl.read(segment_starts_t, [remote_predecessor])
+                    + pl.max(remote_predecessor_length - T, 0),
+                    pl.INT32,
+                )
+            for row in pl.range(T):
+                destination = part * T + row
+                reproject_hidden[destination : destination + 1, :] = pl.full(
+                    [1, D], dtype=pl.BF16, value=0.0
+                )
+                pl.write(
+                    reproject_positions,
+                    [destination],
+                    pl.cast(0, pl.INT32),
+                )
+                if (
+                    remote_predecessor >= 0
+                    and row < remote_predecessor_valid
+                ):
+                    remote_hidden_source = remote_predecessor * T + row
+                    reproject_hidden[
+                        destination : destination + 1, :
+                    ] = logical_hidden[
+                        remote_hidden_source : remote_hidden_source + 1, :
+                    ]
+                    pl.write(
+                        reproject_positions,
+                        [destination],
+                        remote_predecessor_position0
+                        + pl.cast(row, pl.INT32),
+                    )
+
+        for row in pl.range(T):
+            destination = FINAL_REPROJECT_ROW0 + row
+            reproject_hidden[destination : destination + 1, :] = pl.full(
+                [1, D], dtype=pl.BF16, value=0.0
+            )
+            pl.write(
+                reproject_positions,
+                [destination],
+                pl.cast(0, pl.INT32),
+            )
+            final_source_segment = pl.read(final_win_seg_src, [row])
+            final_tail_row = pl.read(final_win_row_src, [row])
+            if final_source_segment >= 0 and final_tail_row >= 0:
+                final_hidden_source = final_source_segment * T + final_tail_row
+                reproject_hidden[
+                    destination : destination + 1, :
+                ] = logical_hidden[
+                    final_hidden_source : final_hidden_source + 1, :
+                ]
+                final_segment_length = pl.read(
+                    segment_lengths_t, [final_source_segment]
+                )
+                final_position = pl.cast(
+                    pl.read(segment_starts_t, [final_source_segment])
+                    + pl.max(final_segment_length - T, 0)
+                    + final_tail_row,
+                    pl.INT32,
+                )
+                pl.write(
+                    reproject_positions, [destination], final_position
+                )
+
+    reproject_rope_cos = pl.create_tensor(
+        [LOCAL_REPROJECT_ROWS, ROPE_HEAD_DIM], dtype=pl.BF16
+    )
+    reproject_rope_sin = pl.create_tensor(
+        [LOCAL_REPROJECT_ROWS, ROPE_HEAD_DIM], dtype=pl.BF16
+    )
+    reproject_rope_cos_il = pl.create_tensor(
+        [LOCAL_REPROJECT_ROWS, ROPE_HEAD_DIM], dtype=pl.FP32
+    )
+    reproject_rope_sin_signed = pl.create_tensor(
+        [LOCAL_REPROJECT_ROWS, ROPE_HEAD_DIM], dtype=pl.FP32
+    )
+    reproject_rope_swap_idx = pl.create_tensor(
+        [LOCAL_REPROJECT_ROWS, ROPE_HEAD_DIM], dtype=pl.INT32
+    )
+    reproject_kv = pl.create_tensor(
+        [LOCAL_REPROJECT_ROWS, HEAD_DIM], dtype=pl.BF16
+    )
+    with pl.at(
+        level=pl.Level.CORE_GROUP,
+        name_hint="cp_csa_reproject_rope_rows",
+        deps=[remote_hidden_tid],
+    ) as reproject_rope_tid:
+        for reproject_row in pl.range(LOCAL_REPROJECT_ROWS):
+            reproject_position = pl.cast(
+                pl.read(reproject_positions, [reproject_row]), pl.INDEX
+            )
+            reproject_rope_cos[
+                reproject_row : reproject_row + 1, :
+            ] = freqs_cos[
+                reproject_position : reproject_position + 1, :
+            ]
+            reproject_rope_sin[
+                reproject_row : reproject_row + 1, :
+            ] = freqs_sin[
+                reproject_position : reproject_position + 1, :
+            ]
+    rope_prepare(
+        reproject_rope_cos,
+        reproject_rope_sin,
+        reproject_rope_cos_il,
+        reproject_rope_sin_signed,
+        reproject_rope_swap_idx,
+    )
+    kv_proj_rope(
+        reproject_hidden,
+        wkv,
+        gamma_ckv,
+        reproject_rope_cos_il,
+        reproject_rope_sin_signed,
+        reproject_rope_swap_idx,
+        reproject_kv,
+        reproject_rope_tid,
+    )
+
+    logical_kv = pl.create_tensor(
+        [EPOCHS * CP_TAIL_WINDOW_ROWS, HEAD_DIM], dtype=pl.BF16
+    )
+    with pl.at(
+        level=pl.Level.CORE_GROUP,
+        name_hint="cp_csa_remote_kv_scatter",
+    ):
+        for part in pl.range(LOCAL_PARTS):
+            scatter_predecessor = pl.read(
+                predecessor_segments_local, [part]
+            )
+            if scatter_predecessor >= 0:
+                scatter_predecessor_length = pl.read(
+                    segment_lengths_t, [scatter_predecessor]
+                )
+                scatter_predecessor_valid = pl.cast(
+                    pl.min(scatter_predecessor_length, T), pl.INT32
+                )
+                for row in pl.range(T):
+                    if row < scatter_predecessor_valid:
+                        scatter_destination = scatter_predecessor * T + row
+                        scatter_source = part * T + row
+                        logical_kv[
+                            scatter_destination : scatter_destination + 1, :
+                        ] = reproject_kv[
+                            scatter_source : scatter_source + 1, :
+                        ]
 
     effective_x = effective_x_workspace
     leaf_positions = pl.reshape(leaf_positions_input, [LOCAL_LEAVES * T])
@@ -1755,42 +1986,56 @@ def prefill_cp_csa_core(
     )
 
     packed_main_payload = pl.create_tensor(
-        [EPOCHS * ROWS_PER_RANK, HEAD_DIM], dtype=pl.BF16, init_value=0.0
+        [EPOCHS * ROWS_PER_RANK, HEAD_DIM], dtype=pl.BF16
     )
     packed_idx_payload = pl.create_tensor(
-        [EPOCHS * ROWS_PER_RANK, IDX_HEAD_DIM], dtype=pl.INT8, init_value=0
+        [EPOCHS * ROWS_PER_RANK, IDX_HEAD_DIM], dtype=pl.INT8
     )
     packed_idx_scale_payload = pl.create_tensor(
         [EPOCHS * ROWS_PER_RANK, SCALE_TILE_COLS],
-        dtype=pl.FP32,
-        init_value=0.0,
+        dtype=pl.FP16,
     )
     packed_record_meta = pl.create_tensor(
-        [EPOCHS * ROWS_PER_RANK, META_DIM], dtype=pl.INT32, init_value=-1
+        [EPOCHS * ROWS_PER_RANK, META_DIM], dtype=pl.INT32
     )
     packed_main_state_payload = pl.create_tensor(
         [EPOCHS * STATE_ROWS_PER_RANK, MAIN_STATE_DIM],
         dtype=pl.FP32,
-        init_value=0.0,
     )
     packed_inner_state_payload = pl.create_tensor(
         [EPOCHS * STATE_ROWS_PER_RANK, INNER_STATE_DIM],
         dtype=pl.FP32,
-        init_value=0.0,
     )
     packed_main_state_meta = pl.create_tensor(
         [EPOCHS * STATE_ROWS_PER_RANK, STATE_META_DIM],
         dtype=pl.INT32,
-        init_value=-1,
     )
     packed_inner_state_meta = pl.create_tensor(
         [EPOCHS * STATE_ROWS_PER_RANK, STATE_META_DIM],
         dtype=pl.INT32,
-        init_value=-1,
     )
 
+    with pl.at(
+        level=pl.Level.CORE_GROUP,
+        name_hint="cp_csa_seed_packed_state_metadata",
+    ) as packed_state_meta_seed_tid:
+        packed_main_state_meta[:, :] = pl.full(
+            [EPOCHS * STATE_ROWS_PER_RANK, STATE_META_DIM],
+            dtype=pl.INT32,
+            value=-1,
+        )
+        packed_inner_state_meta[:, :] = pl.full(
+            [EPOCHS * STATE_ROWS_PER_RANK, STATE_META_DIM],
+            dtype=pl.INT32,
+            value=-1,
+        )
+
     # Compressor-to-communication boundary.
-    with pl.at(level=pl.Level.CORE_GROUP, name_hint="cp_csa_merge_part_payloads"):
+    with pl.at(
+        level=pl.Level.CORE_GROUP,
+        name_hint="cp_csa_merge_part_payloads",
+        deps=[packed_state_meta_seed_tid],
+    ):
         for epoch in pl.range(EPOCHS):
             source_row0 = epoch * MAX_COMPRESSED_ROWS_PER_SEGMENT
             destination_epoch0 = epoch * ROWS_PER_RANK
@@ -1880,15 +2125,114 @@ def prefill_cp_csa_core(
                             pl.read(part1_inner_state_meta, [state_source, col]),
                         )
 
-    cmp_flat = pl.reshape(cmp_kv, [MAIN_CACHE_ROWS, HEAD_DIM])
-    idx_flat = pl.reshape(idx_kv_cache, [IDX_CACHE_ROWS, IDX_HEAD_DIM])
-    idx_scale_flat = pl.reshape(idx_kv_scale, [IDX_CACHE_ROWS, 1])
+    # Standalone CSA uses 32-row compressed pages, while the full forward
+    # reuses a 128-row physical pool with HCA.  Flatten the actual root rather
+    # than baking the standalone page extent into the inline core.
+    cmp_cache_rows = pl.tensor.dim(cmp_kv, 0) * pl.tensor.dim(cmp_kv, 1)
+    cmp_flat = pl.reshape(cmp_kv, [cmp_cache_rows, HEAD_DIM])
+    idx_cache_rows = (
+        pl.tensor.dim(idx_kv_cache, 0) * pl.tensor.dim(idx_kv_cache, 1)
+    )
+    idx_flat = pl.reshape(idx_kv_cache, [idx_cache_rows, IDX_HEAD_DIM])
+    idx_scale_flat = pl.reshape(idx_kv_scale, [idx_cache_rows, 1])
     main_state_flat = pl.reshape(
         compress_state, [MAIN_STATE_ROWS, MAIN_STATE_DIM]
     )
     inner_state_flat = pl.reshape(
         inner_compress_state, [INNER_STATE_ROWS, INNER_STATE_DIM]
     )
+
+    # Recipes receives the CP all-gather into page-128 temporary roots.  Page
+    # zero is the sentinel and the block table maps logical pages to 1..N.
+    # Keep the serving/decode pools above as the stable public ABI; receiver
+    # commit first lands in these roots, then copies through them to the
+    # existing pools so the temporary ABI is part of the real dataflow.
+    cp_tmp_cmp_kv = pl.create_tensor(
+        [CP_TMP_CACHE_PAGES, BLOCK_SIZE, 1, HEAD_DIM], dtype=pl.BF16
+    )
+    cp_tmp_idx_kv = pl.create_tensor(
+        [CP_TMP_CACHE_PAGES, BLOCK_SIZE, 1, IDX_HEAD_DIM], dtype=pl.INT8
+    )
+    cp_tmp_idx_scale = pl.create_tensor(
+        [CP_TMP_CACHE_PAGES, BLOCK_SIZE, 1, 1], dtype=pl.FP16
+    )
+    cp_tmp_main_state = pl.create_tensor(
+        [CP_TMP_STATE_PAGES, BLOCK_SIZE, MAIN_STATE_DIM], dtype=pl.FP32
+    )
+    cp_tmp_inner_state = pl.create_tensor(
+        [CP_TMP_STATE_PAGES, BLOCK_SIZE, INNER_STATE_DIM], dtype=pl.FP32
+    )
+    cp_tmp_block_table = pl.create_tensor(
+        [PREFILL_CMP_MAX_BLOCKS], dtype=pl.INT32
+    )
+    cp_tmp_cmp_flat = pl.reshape(
+        cp_tmp_cmp_kv, [CP_TMP_CACHE_ROWS, HEAD_DIM]
+    )
+    cp_tmp_idx_flat = pl.reshape(
+        cp_tmp_idx_kv, [CP_TMP_CACHE_ROWS, IDX_HEAD_DIM]
+    )
+    cp_tmp_idx_scale_flat = pl.reshape(
+        cp_tmp_idx_scale, [CP_TMP_CACHE_ROWS, 1]
+    )
+    cp_tmp_idx_scale_aligned = pl.reshape(
+        cp_tmp_idx_scale, [CP_TMP_CACHE_ROWS // 16, 16]
+    )
+    cp_tmp_main_state_flat = pl.reshape(
+        cp_tmp_main_state, [CP_TMP_STATE_ROWS, MAIN_STATE_DIM]
+    )
+    cp_tmp_inner_state_flat = pl.reshape(
+        cp_tmp_inner_state, [CP_TMP_STATE_ROWS, INNER_STATE_DIM]
+    )
+    with pl.at(
+        level=pl.Level.CORE_GROUP,
+        name_hint="cp_csa_tmp_root_seed",
+    ) as cp_tmp_seed_tid:
+        cp_tmp_cmp_kv[0:1, 0:BLOCK_SIZE, 0:1, 0:HEAD_DIM] = pl.full(
+            [1, BLOCK_SIZE, 1, HEAD_DIM], dtype=pl.BF16, value=0.0
+        )
+        cp_tmp_idx_kv[
+            0:1, 0:BLOCK_SIZE, 0:1, 0:IDX_HEAD_DIM
+        ] = pl.cast(
+            pl.full(
+                [1, BLOCK_SIZE, 1, IDX_HEAD_DIM],
+                dtype=pl.FP16,
+                value=0.0,
+            ),
+            target_type=pl.INT8,
+            mode="trunc",
+        )
+        # PTOAS 0.60 requires each tile row to occupy at least 32 bytes.  View
+        # the scalar FP16 scales in groups of 16 while seeding sentinel page 0.
+        cp_tmp_idx_scale_aligned[0 : BLOCK_SIZE // 16, 0:16] = pl.full(
+            [BLOCK_SIZE // 16, 16], dtype=pl.FP16, value=0.0
+        )
+        for state_seed_row in pl.range(BLOCK_SIZE):
+            cp_tmp_main_state[
+                0:1,
+                state_seed_row : state_seed_row + 1,
+                0:MAIN_STATE_DIM,
+            ] = pl.full(
+                [1, 1, MAIN_STATE_DIM], dtype=pl.FP32, value=0.0
+            )
+            cp_tmp_inner_state[
+                0:1,
+                state_seed_row : state_seed_row + 1,
+                0:INNER_STATE_DIM,
+            ] = pl.full(
+                [1, 1, INNER_STATE_DIM], dtype=pl.FP32, value=0.0
+            )
+        for table_col in pl.range(PREFILL_CMP_MAX_BLOCKS):
+            pl.write(
+                cp_tmp_block_table,
+                [table_col],
+                pl.cast(0, pl.INT32),
+            )
+        for logical_page in pl.range(CP_TMP_DATA_PAGES):
+            pl.write(
+                cp_tmp_block_table,
+                [logical_page],
+                pl.cast(logical_page + 1, pl.INT32),
+            )
     # §8.17.8e.2 leaf-capture completion token: collect the TaskId of every
     # leaf-internal commit/transport task so the terminal cp_csa_rank_complete
     # task can fan them in via pl.system.task_dummy(deps=[...]). With EPOCHS==1
@@ -1931,6 +2275,10 @@ def prefill_cp_csa_core(
         with pl.at(
             level=pl.Level.CORE_GROUP,
             name_hint="cp_csa_receiver_commit",
+            # PTOAS 0.60 does not infer a read-after-transport edge from the
+            # distributed windows.  Make receiver visibility depend on both
+            # the Recipes temporary-root seed and the completed CP exchange.
+            deps=[compact_transport_tid, cp_tmp_seed_tid],
         ) as receiver_commit_tid:
             for source_rank in pl.range(CP_SIZE):
                 source_row = source_rank * ROWS_PER_RANK
@@ -1943,7 +2291,23 @@ def prefill_cp_csa_core(
                     if record_valid > 0 and logical_segment >= 0 and boundary >= 0:
                         main_valid = pl.read(record_window, [meta_row, 4])
                         main_slot = pl.read(record_window, [meta_row, 5])
-                        if main_valid > 0 and main_slot >= 0:
+                        if (
+                            main_valid > 0
+                            and main_slot >= 0
+                            and main_slot < CP_CANDIDATE_CAPACITY
+                        ):
+                            cp_tmp_destination = BLOCK_SIZE + main_slot
+                            received_main_tile = main_window[
+                                meta_row : meta_row + 1, 0:HEAD_DIM
+                            ]
+                            cp_tmp_cmp_flat[
+                                cp_tmp_destination : cp_tmp_destination + 1,
+                                0:HEAD_DIM,
+                            ] = received_main_tile
+                            committed_main_tile = cp_tmp_cmp_flat[
+                                cp_tmp_destination : cp_tmp_destination + 1,
+                                0:HEAD_DIM,
+                            ]
                             logical_block = main_slot // CMP_STORAGE_BLOCK_SIZE
                             if logical_block < PREFILL_CMP_MAX_BLOCKS:
                                 physical_block = pl.read(
@@ -1955,11 +2319,47 @@ def prefill_cp_csa_core(
                                         * CMP_STORAGE_BLOCK_SIZE
                                         + main_slot % CMP_STORAGE_BLOCK_SIZE
                                     )
-                                    received_main_tile = main_window[meta_row : meta_row + 1, 0:HEAD_DIM]
-                                    cmp_flat[destination : destination + 1, 0:HEAD_DIM] = received_main_tile
+                                    cmp_flat[
+                                        destination : destination + 1,
+                                        0:HEAD_DIM,
+                                    ] = committed_main_tile
                         idx_valid = pl.read(record_window, [meta_row, 6])
                         idx_slot = pl.read(record_window, [meta_row, 7])
-                        if idx_valid > 0 and idx_slot >= 0:
+                        if (
+                            idx_valid > 0
+                            and idx_slot >= 0
+                            and idx_slot < CP_CANDIDATE_CAPACITY
+                        ):
+                            cp_tmp_idx_destination = BLOCK_SIZE + idx_slot
+                            received_idx_tile = idx_window[
+                                meta_row : meta_row + 1, 0:IDX_HEAD_DIM
+                            ]
+                            cp_tmp_idx_flat[
+                                cp_tmp_idx_destination :
+                                cp_tmp_idx_destination + 1,
+                                0:IDX_HEAD_DIM,
+                            ] = received_idx_tile
+                            received_idx_scale = pl.cast(
+                                pl.read(scale_window, [meta_row, 0]),
+                                pl.FP16,
+                            )
+                            pl.write(
+                                cp_tmp_idx_scale_flat,
+                                [cp_tmp_idx_destination, 0],
+                                received_idx_scale,
+                            )
+                            committed_idx_tile = cp_tmp_idx_flat[
+                                cp_tmp_idx_destination :
+                                cp_tmp_idx_destination + 1,
+                                0:IDX_HEAD_DIM,
+                            ]
+                            committed_idx_scale = pl.cast(
+                                pl.read(
+                                    cp_tmp_idx_scale_flat,
+                                    [cp_tmp_idx_destination, 0],
+                                ),
+                                pl.FP32,
+                            )
                             logical_block = idx_slot // CMP_STORAGE_BLOCK_SIZE
                             if logical_block < IDX_CACHE_MAX_BLOCKS:
                                 physical_block = pl.read(
@@ -1971,12 +2371,14 @@ def prefill_cp_csa_core(
                                         * CMP_STORAGE_BLOCK_SIZE
                                         + idx_slot % CMP_STORAGE_BLOCK_SIZE
                                     )
-                                    received_idx_tile = idx_window[meta_row : meta_row + 1, 0:IDX_HEAD_DIM]
-                                    idx_flat[destination : destination + 1, 0:IDX_HEAD_DIM] = received_idx_tile
+                                    idx_flat[
+                                        destination : destination + 1,
+                                        0:IDX_HEAD_DIM,
+                                    ] = committed_idx_tile
                                     pl.write(
                                         idx_scale_flat,
                                         [destination, 0],
-                                        pl.read(scale_window, [meta_row, 0]),
+                                        committed_idx_scale,
                                     )
 
                 for state_row in pl.range(STATE_ROWS_PER_RANK):
@@ -1988,6 +2390,28 @@ def prefill_cp_csa_core(
                         main_state_meta_window, [meta_row, 2]
                     )
                     if main_valid > 0 and main_position >= 0:
+                        cp_tmp_main_state_page = (
+                            1
+                            + (main_position // BLOCK_SIZE)
+                            % CP_TMP_STATE_DATA_PAGES
+                        )
+                        cp_tmp_main_state_destination = (
+                            cp_tmp_main_state_page * BLOCK_SIZE
+                            + main_position % BLOCK_SIZE
+                        )
+                        received_main_state = main_state_window[
+                            meta_row : meta_row + 1, 0:MAIN_STATE_DIM
+                        ]
+                        cp_tmp_main_state_flat[
+                            cp_tmp_main_state_destination :
+                            cp_tmp_main_state_destination + 1,
+                            0:MAIN_STATE_DIM,
+                        ] = received_main_state
+                        committed_main_state = cp_tmp_main_state_flat[
+                            cp_tmp_main_state_destination :
+                            cp_tmp_main_state_destination + 1,
+                            0:MAIN_STATE_DIM,
+                        ]
                         logical_block = main_position // MAIN_STATE_BLOCK_SIZE
                         if logical_block < MAIN_STATE_MAX_BLOCKS:
                             physical_block = pl.read(
@@ -1999,8 +2423,10 @@ def prefill_cp_csa_core(
                                     * MAIN_STATE_BLOCK_SIZE
                                     + main_position % MAIN_STATE_BLOCK_SIZE
                                 )
-                                received_main_state = main_state_window[meta_row : meta_row + 1, 0:MAIN_STATE_DIM]
-                                main_state_flat[destination : destination + 1, 0:MAIN_STATE_DIM] = received_main_state
+                                main_state_flat[
+                                    destination : destination + 1,
+                                    0:MAIN_STATE_DIM,
+                                ] = committed_main_state
                     inner_valid = pl.read(
                         inner_state_meta_window, [meta_row, 0]
                     )
@@ -2008,6 +2434,28 @@ def prefill_cp_csa_core(
                         inner_state_meta_window, [meta_row, 2]
                     )
                     if inner_valid > 0 and inner_position >= 0:
+                        cp_tmp_inner_state_page = (
+                            1
+                            + (inner_position // BLOCK_SIZE)
+                            % CP_TMP_STATE_DATA_PAGES
+                        )
+                        cp_tmp_inner_state_destination = (
+                            cp_tmp_inner_state_page * BLOCK_SIZE
+                            + inner_position % BLOCK_SIZE
+                        )
+                        received_inner_state = inner_state_window[
+                            meta_row : meta_row + 1, 0:INNER_STATE_DIM
+                        ]
+                        cp_tmp_inner_state_flat[
+                            cp_tmp_inner_state_destination :
+                            cp_tmp_inner_state_destination + 1,
+                            0:INNER_STATE_DIM,
+                        ] = received_inner_state
+                        committed_inner_state = cp_tmp_inner_state_flat[
+                            cp_tmp_inner_state_destination :
+                            cp_tmp_inner_state_destination + 1,
+                            0:INNER_STATE_DIM,
+                        ]
                         logical_block = inner_position // INNER_STATE_BLOCK_SIZE
                         if logical_block < INNER_STATE_MAX_BLOCKS:
                             physical_block = pl.read(
@@ -2019,16 +2467,33 @@ def prefill_cp_csa_core(
                                     * INNER_STATE_BLOCK_SIZE
                                     + inner_position % INNER_STATE_BLOCK_SIZE
                                 )
-                                received_inner_state = inner_state_window[meta_row : meta_row + 1, 0:INNER_STATE_DIM]
                                 inner_destination_end = destination + 1
-                                inner_state_flat[destination:inner_destination_end, :] = received_inner_state
+                                inner_state_flat[
+                                    destination:inner_destination_end, :
+                                ] = committed_inner_state
             _prefill_cp_csa_compact_finish_wave(compact_consumed, my_rank)
         # Store the captured receiver-commit TaskId for this epoch (idiom:
         # prefill_sparse_attn.py:300 proj_a_tids[...] = pa_tid).
         receiver_commit_tids[epoch] = receiver_commit_tid
 
-    cmp_indices = pl.create_tensor([LOCAL_ROWS, IDX_TOPK], dtype=pl.INT32, init_value=-1)
+    cmp_indices = pl.create_tensor([LOCAL_ROWS, IDX_TOPK], dtype=pl.INT32)
+    with pl.spmd(
+        LOCAL_ROWS // CSA_TOPK_SEED_ROWS,
+        name_hint="cp_csa_seed_topk_indices",
+    ) as cmp_indices_seed_tid:
+        seed_block = pl.tile.get_block_idx()
+        seed_row0 = seed_block * CSA_TOPK_SEED_ROWS
+        cmp_indices[
+            seed_row0 : seed_row0 + CSA_TOPK_SEED_ROWS, 0:IDX_TOPK
+        ] = pl.full(
+            [CSA_TOPK_SEED_ROWS, IDX_TOPK], dtype=pl.INT32, value=-1
+        )
+    indexer_input_ready_tid = pl.system.task_dummy(
+        deps=[cmp_indices_seed_tid, receiver_commit_tids[0]]
+    )
+    topk_tids = pl.array.create(NUM_LOCAL_TILES, pl.TASK_ID)
     for tile in pl.range(NUM_LOCAL_TILES):
+        topk_tids[tile] = indexer_input_ready_tid
         active = pl.read(overlay_active_flat, [tile, 1])
         if active > 0:
             row0 = tile * T
@@ -2036,7 +2501,6 @@ def prefill_cp_csa_core(
             qr_tile = pl.slice(qr, [T, Q_LORA], [row0, 0])
             qr_scale_tile = pl.slice(qr_scale, [T, 1], [row0, 0])
             pos_tile = pl.slice(query_positions_flat, [T], [row0])
-            score = pl.create_tensor([T, CP_INDEXER_SCORE_CAP], dtype=pl.FP32)
             topk_tile = pl.slice(cmp_indices, [T, IDX_TOPK], [row0, 0])
             idx_cos = pl.create_tensor([T, QK_ROPE_HALF], dtype=pl.FP32)
             idx_sin = pl.create_tensor([T, QK_ROPE_HALF], dtype=pl.FP32)
@@ -2049,30 +2513,285 @@ def prefill_cp_csa_core(
                     rope_sin_flat[row0 : row0 + T, 0:QK_ROPE_HALF],
                     target_type=pl.FP32,
                 )
-            score, topk_tile = _prefill_indexer_cp_score_topk(
+            topk_tile, topk_tid = _prefill_indexer_cp_score_topk(
                 index_x_tile, qr_tile, qr_scale_tile,
                 idx_wq_b, idx_wq_b_scale, idx_weights_proj,
                 idx_cos, idx_sin, hadamard_idx,
-                idx_kv_cache, idx_kv_scale, idx_block_table,
-                pos_tile, active, score, topk_tile,
+                cp_tmp_idx_kv, cp_tmp_idx_scale, cp_tmp_block_table,
+                pos_tile, active, indexer_input_ready_tid, topk_tile,
             )
             cmp_indices[row0 : row0 + T, 0:IDX_TOPK] = topk_tile
+            topk_tids[tile] = topk_tid
+    part0_indexer_ready_tid = pl.system.task_dummy(
+        deps=[topk_tids[i] for i in range(MAX_SEGMENT_TILES)]
+    )
+    part1_indexer_ready_tid = pl.system.task_dummy(
+        deps=[
+            topk_tids[MAX_SEGMENT_TILES + i]
+            for i in range(MAX_SEGMENT_TILES)
+        ]
+    )
+
+    # Recipes materializes one request-relative page-128 raw root.  Page 0 is
+    # the zero sentinel and logical request pages map to physical pages 1..N.
+    # Keep this rank-local temporary root internal to the CSA path: current
+    # segments and their predecessor tails are the only rows this rank's band
+    # attention can address.
+    cp_tmp_raw_kv = pl.create_tensor(
+        [CP_RAW_CACHE_PAGES, BLOCK_SIZE, 1, HEAD_DIM], dtype=pl.BF16
+    )
+    cp_tmp_raw_table = pl.create_tensor(
+        [CP_RAW_DATA_PAGES], dtype=pl.INT32
+    )
+    cp_tmp_raw_flat = pl.reshape(
+        cp_tmp_raw_kv, [CP_RAW_CACHE_ROWS, HEAD_DIM]
+    )
+    raw_physical_indices = pl.create_tensor(
+        [LOCAL_ROWS, WIN], dtype=pl.INT32
+    )
+    valid_mask = pl.create_tensor(
+        [LOCAL_ROWS, VALID_BLOCK_MASK_COLS], dtype=pl.INT32
+    )
+    request_start = pl.read(segment_starts_local, [0])
+
+    with pl.at(
+        level=pl.Level.CORE_GROUP,
+        name_hint="cp_csa_raw_root_seed",
+    ) as raw_seed_tid:
+        cp_tmp_raw_kv[
+            0:1, 0:BLOCK_SIZE, 0:1, 0:HEAD_DIM
+        ] = pl.full(
+            [1, BLOCK_SIZE, 1, HEAD_DIM],
+            dtype=pl.BF16,
+            value=0.0,
+        )
+        for logical_page in pl.range(CP_RAW_DATA_PAGES):
+            pl.write(
+                cp_tmp_raw_table,
+                [logical_page],
+                pl.cast(logical_page + 1, pl.INT32),
+            )
+
+    # First scatter both current segments.  A separate dependent predecessor
+    # pass below deliberately overwrites duplicate tail slots, matching the
+    # Recipes concat/update order on the middle zigzag ranks.
+    with pl.spmd(
+        NUM_LOCAL_TILES,
+        name_hint="cp_csa_raw_current_scatter",
+        deps=[raw_seed_tid],
+    ) as raw_current_tid:
+        scatter_tile = pl.tile.get_block_idx()
+        scatter_part = scatter_tile // MAX_SEGMENT_TILES
+        scatter_local_tile = (
+            scatter_tile - scatter_part * MAX_SEGMENT_TILES
+        )
+        scatter_segment = pl.read(owner_segments_t, [scatter_part])
+        scatter_active = pl.read(segment_active_lengths, [scatter_part])
+        scatter_tile_active = pl.min(
+            T,
+            pl.max(
+                scatter_active - scatter_local_tile * T,
+                pl.cast(0, pl.INT32),
+            ),
+        )
+        if scatter_segment >= 0 and scatter_tile_active > 0:
+            scatter_position0 = (
+                pl.read(segment_starts_local, [scatter_segment])
+                + scatter_local_tile * T
+            )
+            for scatter_row in pl.range(T):
+                if scatter_row < scatter_tile_active:
+                    scatter_relative = (
+                        scatter_position0
+                        + scatter_row
+                        - request_start
+                    )
+                    if scatter_relative >= 0:
+                        scatter_logical_page = (
+                            scatter_relative // BLOCK_SIZE
+                        )
+                        if scatter_logical_page < CP_RAW_DATA_PAGES:
+                            scatter_physical_page = pl.read(
+                                cp_tmp_raw_table,
+                                [scatter_logical_page],
+                            )
+                            if scatter_physical_page > 0:
+                                scatter_destination = (
+                                    pl.cast(
+                                        scatter_physical_page, pl.INDEX
+                                    )
+                                    * BLOCK_SIZE
+                                    + scatter_relative % BLOCK_SIZE
+                                )
+                                scatter_source = (
+                                    scatter_tile * T + scatter_row
+                                )
+                                cp_tmp_raw_flat[
+                                    scatter_destination :
+                                    scatter_destination + 1,
+                                    0:HEAD_DIM,
+                                ] = local_kv[
+                                    scatter_source : scatter_source + 1,
+                                    0:HEAD_DIM,
+                                ]
+
+    with pl.spmd(
+        LOCAL_PARTS,
+        name_hint="cp_csa_raw_predecessor_scatter",
+        deps=[raw_current_tid],
+    ) as raw_predecessor_tid:
+        scatter_part = pl.tile.get_block_idx()
+        scatter_predecessor = pl.read(
+            predecessor_segments_local, [scatter_part]
+        )
+        if scatter_predecessor >= 0:
+            scatter_valid = pl.min(
+                pl.read(segment_lengths_t, [scatter_predecessor]), T
+            )
+            for scatter_row in pl.range(T):
+                if scatter_row < scatter_valid:
+                    scatter_source = scatter_part * T + scatter_row
+                    scatter_position = pl.read(
+                        reproject_positions, [scatter_source]
+                    )
+                    scatter_relative = scatter_position - request_start
+                    if scatter_relative >= 0:
+                        scatter_logical_page = (
+                            scatter_relative // BLOCK_SIZE
+                        )
+                        if scatter_logical_page < CP_RAW_DATA_PAGES:
+                            scatter_physical_page = pl.read(
+                                cp_tmp_raw_table,
+                                [scatter_logical_page],
+                            )
+                            if scatter_physical_page > 0:
+                                scatter_destination = (
+                                    pl.cast(
+                                        scatter_physical_page, pl.INDEX
+                                    )
+                                    * BLOCK_SIZE
+                                    + scatter_relative % BLOCK_SIZE
+                                )
+                                cp_tmp_raw_flat[
+                                    scatter_destination :
+                                    scatter_destination + 1,
+                                    0:HEAD_DIM,
+                                ] = reproject_kv[
+                                    scatter_source : scatter_source + 1,
+                                    0:HEAD_DIM,
+                                ]
+
+    # Lower the legacy overlay-validity metadata into the physical-row ABI
+    # consumed by the DSpark direct-gather donor.  The shared host input keeps
+    # its old meaning for SWA/HCA; only this CSA-local tensor changes contract.
+    with pl.spmd(
+        LOCAL_ROWS,
+        name_hint="cp_csa_raw_physical_lower",
+        deps=[raw_seed_tid],
+    ) as raw_index_tid:
+        lower_row = pl.tile.get_block_idx()
+        lower_stage = pl.full(
+            [1, WIN], dtype=pl.INT32, value=-1
+        )
+        lower_query = pl.read(query_positions_flat, [lower_row])
+        lower_request = pl.read(query_requests_flat, [lower_row])
+        if lower_request >= 0:
+            for lower_col in pl.range(WIN):
+                lower_pseudo = pl.read(
+                    swa_indices_flat, [lower_row, lower_col]
+                )
+                if lower_pseudo >= 0:
+                    lower_key = lower_query - WIN + 1 + lower_col
+                    lower_relative = lower_key - request_start
+                    if lower_relative >= 0:
+                        lower_logical_page = (
+                            lower_relative // BLOCK_SIZE
+                        )
+                        if lower_logical_page < CP_RAW_DATA_PAGES:
+                            lower_physical_page = pl.read(
+                                cp_tmp_raw_table,
+                                [lower_logical_page],
+                            )
+                            if lower_physical_page > 0:
+                                lower_physical_row = (
+                                    lower_physical_page * BLOCK_SIZE
+                                    + lower_relative % BLOCK_SIZE
+                                )
+                                pl.write(
+                                    lower_stage,
+                                    [0, lower_col],
+                                    pl.cast(
+                                        lower_physical_row, pl.INT32
+                                    ),
+                                )
+        raw_physical_indices[
+            lower_row : lower_row + 1, 0:WIN
+        ] = lower_stage
+
+    with pl.spmd(
+        LOCAL_ROWS,
+        name_hint="cp_csa_physical_valid_mask",
+        deps=[raw_index_tid],
+    ) as raw_mask_tid:
+        mask_row = pl.tile.get_block_idx()
+        mask_tile = mask_row // T
+        mask_tile_row = mask_row - mask_tile * T
+        mask_active = pl.read(overlay_active_flat, [mask_tile, 1])
+        mask_visible_topk = pl.cast(0, pl.INT32)
+        if mask_tile_row < mask_active:
+            mask_position = pl.read(query_positions_flat, [mask_row])
+            mask_visible_topk = pl.cast(
+                pl.min(
+                    pl.max(
+                        (mask_position + 1) // COMPRESS_RATIO,
+                        pl.cast(0, pl.INT32),
+                    ),
+                    IDX_TOPK,
+                ),
+                pl.INT32,
+            )
+        mask_stage = pl.full(
+            [1, VALID_BLOCK_MASK_COLS], dtype=pl.INT32, value=0
+        )
+        for sparse_block in pl.range(
+            PREFILL_SPARSE_PAD // BLOCK_SIZE
+        ):
+            block_valid = pl.cast(0, pl.INT32)
+            block_col0 = sparse_block * BLOCK_SIZE
+            if block_col0 < WIN:
+                for block_col in pl.range(BLOCK_SIZE):
+                    sparse_index = pl.read(
+                        raw_physical_indices,
+                        [mask_row, block_col0 + block_col],
+                    )
+                    if sparse_index >= 0:
+                        block_valid = pl.cast(1, pl.INT32)
+            else:
+                # TopK writes a dense valid prefix followed by -1.  Recipes'
+                # block-liveness mask is therefore just a comparison against
+                # this compressed block's first column.
+                compressed_block0 = block_col0 - WIN
+                if compressed_block0 < mask_visible_topk:
+                    block_valid = pl.cast(1, pl.INT32)
+            pl.write(mask_stage, [0, sparse_block], block_valid)
+        valid_mask[
+            mask_row : mask_row + 1, 0:VALID_BLOCK_MASK_COLS
+        ] = mask_stage
+
+    raw_attention_ready_tid = pl.system.task_dummy(
+        deps=[
+            raw_predecessor_tid,
+            raw_index_tid,
+        ]
+    )
+    compressed_attention_ready_tid = pl.system.task_dummy(
+        deps=[
+            raw_mask_tid,
+            part0_indexer_ready_tid,
+        ]
+    )
 
     cache_flat = pl.reshape(kv_cache, [ORI_CACHE_ROWS, HEAD_DIM])
-    sparse_kv = pl.create_tensor([LOCAL_SPARSE_ROWS, HEAD_DIM], dtype=pl.BF16)
-    sparse_bias = pl.create_tensor([LOCAL_ROWS, PREFILL_SPARSE_PAD], dtype=pl.FP32, init_value=-3.0e38)
-    valid_mask = pl.create_tensor([LOCAL_ROWS, VALID_BLOCK_MASK_COLS], dtype=pl.INT32, init_value=0)
-    _prefill_cp_sparse_stage(
-        cache_flat, local_kv, logical_kv,
-        cmp_kv,
-        cmp_block_table,
-        pl.cast(CMP_STORAGE_BLOCK_SIZE, pl.INT32),
-        query_positions_flat, query_requests_flat,
-        overlay_positions_flat, overlay_requests_flat,
-        predecessor_segments_local, segment_starts_local,
-        swa_indices_flat, cmp_indices,
-        sparse_kv, sparse_bias, valid_mask, overlay_active_flat,
-    )
 
     with pl.at(level=pl.Level.CORE_GROUP, name_hint="cp_csa_raw_commit") as raw_commit_tid:
         for row in pl.range(T):
@@ -2080,39 +2799,115 @@ def prefill_cp_csa_core(
             raw_source_row = pl.read(final_win_row_src, [row])
             raw_destination = pl.read(final_slot_mapping, [row])
             if raw_segment >= 0 and raw_source_row >= 0 and raw_destination >= 0:
-                raw_source = raw_segment * T + raw_source_row
-                cache_flat[raw_destination : raw_destination + 1, :] = logical_kv[raw_source : raw_source + 1, :]
+                raw_source = FINAL_REPROJECT_ROW0 + row
+                cache_flat[
+                    raw_destination : raw_destination + 1, :
+                ] = reproject_kv[raw_source : raw_source + 1, :]
+
+    # Preserve the two Recipes logical segments and reuse DSpark's direct
+    # physical-root TopK512 compute.  The two calls are serialized so their
+    # wave-local gather/head/o-projection scratch does not overlap.
+    attn_out = pl.create_tensor([LOCAL_ROWS, D], dtype=pl.BF16)
+    part0_active = pl.read(segment_active_lengths, [0])
+    part1_active = pl.read(segment_active_lengths, [1])
+
+    q_part0 = pl.slice(q, [SEGMENT_ROWS, H, HEAD_DIM], [0, 0, 0])
+    raw_indices_part0 = pl.slice(
+        raw_physical_indices, [SEGMENT_ROWS, WIN], [0, 0]
+    )
+    cmp_indices_part0 = pl.slice(
+        cmp_indices, [SEGMENT_ROWS, IDX_TOPK], [0, 0]
+    )
+    mask_part0 = pl.slice(
+        valid_mask, [SEGMENT_ROWS, VALID_BLOCK_MASK_COLS], [0, 0]
+    )
+    cos_part0 = pl.slice(
+        rope_cos_flat, [SEGMENT_ROWS, ROPE_DIM], [0, 0]
+    )
+    sin_part0 = pl.slice(
+        rope_sin_flat, [SEGMENT_ROWS, ROPE_DIM], [0, 0]
+    )
+    attn_out_part0 = pl.slice(attn_out, [SEGMENT_ROWS, D], [0, 0])
+    part0_attn_tid = physical_sparse_attn_512(
+        q_part0,
+        cp_tmp_raw_kv,
+        raw_indices_part0,
+        cp_tmp_cmp_kv,
+        cp_tmp_block_table,
+        cmp_indices_part0,
+        mask_part0,
+        attn_sink,
+        cos_part0,
+        sin_part0,
+        wo_a,
+        wo_b,
+        wo_b_scale,
+        attn_out_part0,
+        part0_active,
+        raw_attention_ready_tid,
+        compressed_attention_ready_tid,
+    )
+    part1_compressed_ready_tid = pl.system.task_dummy(
+        deps=[part0_attn_tid, part1_indexer_ready_tid]
+    )
+
+    part1_row0 = SEGMENT_ROWS
+    q_part1 = pl.slice(
+        q, [SEGMENT_ROWS, H, HEAD_DIM], [part1_row0, 0, 0]
+    )
+    raw_indices_part1 = pl.slice(
+        raw_physical_indices,
+        [SEGMENT_ROWS, WIN],
+        [part1_row0, 0],
+    )
+    cmp_indices_part1 = pl.slice(
+        cmp_indices,
+        [SEGMENT_ROWS, IDX_TOPK],
+        [part1_row0, 0],
+    )
+    mask_part1 = pl.slice(
+        valid_mask,
+        [SEGMENT_ROWS, VALID_BLOCK_MASK_COLS],
+        [part1_row0, 0],
+    )
+    cos_part1 = pl.slice(
+        rope_cos_flat, [SEGMENT_ROWS, ROPE_DIM], [part1_row0, 0]
+    )
+    sin_part1 = pl.slice(
+        rope_sin_flat, [SEGMENT_ROWS, ROPE_DIM], [part1_row0, 0]
+    )
+    attn_out_part1 = pl.slice(
+        attn_out, [SEGMENT_ROWS, D], [part1_row0, 0]
+    )
+    attention_done_tid = physical_sparse_attn_512(
+        q_part1,
+        cp_tmp_raw_kv,
+        raw_indices_part1,
+        cp_tmp_cmp_kv,
+        cp_tmp_block_table,
+        cmp_indices_part1,
+        mask_part1,
+        attn_sink,
+        cos_part1,
+        sin_part1,
+        wo_a,
+        wo_b,
+        wo_b_scale,
+        attn_out_part1,
+        part1_active,
+        part0_attn_tid,
+        part1_compressed_ready_tid,
+    )
 
     x_out_flat = pl.reshape(x_out, [LOCAL_ROWS, HC_MULT, D])
     for tile in pl.range(NUM_LOCAL_TILES):
         row0 = tile * T
-        sparse_row0 = row0 * PREFILL_SPARSE_PAD
-        q_tile = pl.slice(q, [T, H, HEAD_DIM], [row0, 0, 0])
-        sparse_tile = pl.slice(
-            sparse_kv,
-            [T * PREFILL_SPARSE_PAD, HEAD_DIM],
-            [sparse_row0, 0],
-        )
-        bias_tile = pl.slice(
-            sparse_bias, [T, PREFILL_SPARSE_PAD], [row0, 0]
-        )
-        mask_tile = pl.slice(
-            valid_mask, [T, VALID_BLOCK_MASK_COLS], [row0, 0]
-        )
-        cos_tile = pl.slice(rope_cos_flat, [T, ROPE_DIM], [row0, 0])
-        sin_tile = pl.slice(rope_sin_flat, [T, ROPE_DIM], [row0, 0])
         post_tile = pl.slice(post, [T, HC_MULT], [row0, 0])
         comb_tile = pl.slice(comb, [T, HC_MULT * HC_MULT], [row0, 0])
         residual_tile = pl.slice(x_flat, [T, HC_MULT, D], [row0, 0, 0])
         active = pl.read(overlay_active_flat, [tile, 1])
-        attn_out_tile = pl.create_tensor([T, D], dtype=pl.BF16)
-        y_tile = pl.create_tensor([T, HC_MULT, D], dtype=pl.FP32, init_value=0.0)
-        sparse_attn_math(
-            q_tile, sparse_tile, bias_tile, mask_tile,
-            attn_sink, cos_tile, sin_tile,
-            wo_a, wo_b, wo_b_scale,
-            attn_out_tile, active,
-        )
+        attn_out_tile = pl.slice(attn_out, [T, D], [row0, 0])
+        y_tile = pl.create_tensor([T, HC_MULT, D], dtype=pl.FP32)
         hc_post_prefill(
             attn_out_tile, residual_tile,
             post_tile, comb_tile,
@@ -2137,6 +2932,7 @@ def prefill_cp_csa_core(
             compact_transport_tids[0],
             receiver_commit_tids[0],
             raw_commit_tid,
+            attention_done_tid,
         ]
     )
     # Terminal rank-complete task: deps=[resource_done_tid] (the four-path
@@ -2287,7 +3083,6 @@ def prefill_cp_csa_rank(
     leaf_num_tokens_input: pl.Tensor[
         [LOCAL_PARTS, MAX_COMPRESS_LEAVES], pl.INT32
     ],
-    effective_x_workspace: pl.Tensor[[LOCAL_LEAVES * T, D], pl.BF16],
     hidden_tail_window: pld.DistributedTensor[
         [CP_TAIL_WINDOW_ROWS, D], pl.BF16
     ],
@@ -2303,7 +3098,7 @@ def prefill_cp_csa_rank(
         [RECORDS_PER_WINDOW, IDX_HEAD_DIM], pl.INT8
     ],
     scale_window: pld.DistributedTensor[
-        [RECORDS_PER_WINDOW, SCALE_TILE_COLS], pl.FP32
+        [RECORDS_PER_WINDOW, SCALE_TILE_COLS], pl.FP16
     ],
     record_window: pld.DistributedTensor[
         [RECORDS_PER_WINDOW, META_DIM], pl.INT32
@@ -2334,6 +3129,11 @@ def prefill_cp_csa_rank(
     my_rank: pl.Scalar[pl.INT32],
 ):
     """Run standalone CP-CSA attention for one rank."""
+    # Compression scratch belongs to the rank-local production scope; it is
+    # not a fixture-visible input/output ABI.
+    effective_x_workspace = pl.create_tensor(
+        [LOCAL_LEAVES * T, D], dtype=pl.BF16
+    )
     # §8.17.8e.2 leaf-capture completion token: child-local, allocated here and
     # passed into prefill_cp_csa_core (which publishes it via its terminal
     # cp_csa_rank_complete task). The standalone test does not consume the
@@ -2342,7 +3142,7 @@ def prefill_cp_csa_rank(
     # Keeping it child-local avoids changing the standalone test's host
     # interface / build_tensor_specs (the token is not a host-visible output).
     completion_token = pl.create_tensor(
-        [NUM_MOE_WAVES, 1, 8], dtype=pl.FP32, init_value=0.0
+        [NUM_MOE_WAVES, 1, 8], dtype=pl.FP32
     )
     return prefill_cp_csa_core(
         x_hc, hc_attn_fn, hc_attn_scale, hc_attn_base, attn_norm_w, wq_a, wq_b, wq_b_scale,
@@ -2496,9 +3296,6 @@ def prefill_cp_csa_test(
     leaf_num_tokens_input: pl.Tensor[
         [CP_SIZE, LOCAL_PARTS, MAX_COMPRESS_LEAVES], pl.INT32
     ],
-    effective_x_workspace: pl.Tensor[
-        [CP_SIZE, LOCAL_LEAVES * T, D], pl.BF16
-    ],
     main_state_workspace0: pl.Tensor[
         [CP_SIZE, CSA_STATE_PHYSICAL_BLOCKS, MAIN_STATE_BLOCK_SIZE, MAIN_STATE_DIM],
         pl.FP32,
@@ -2536,7 +3333,7 @@ def prefill_cp_csa_test(
         [RECORDS_PER_WINDOW, IDX_HEAD_DIM], dtype=pl.INT8
     )
     scale_buf = pld.alloc_window_buffer(
-        [RECORDS_PER_WINDOW, SCALE_TILE_COLS], dtype=pl.FP32
+        [RECORDS_PER_WINDOW, SCALE_TILE_COLS], dtype=pl.FP16
     )
     record_buf = pld.alloc_window_buffer(
         [RECORDS_PER_WINDOW, META_DIM], dtype=pl.INT32
@@ -2574,7 +3371,7 @@ def prefill_cp_csa_test(
             idx_buf, [RECORDS_PER_WINDOW, IDX_HEAD_DIM], dtype=pl.INT8
         )
         scale_window = pld.window(
-            scale_buf, [RECORDS_PER_WINDOW, SCALE_TILE_COLS], dtype=pl.FP32
+            scale_buf, [RECORDS_PER_WINDOW, SCALE_TILE_COLS], dtype=pl.FP16
         )
         record_window = pld.window(
             record_buf, [RECORDS_PER_WINDOW, META_DIM], dtype=pl.INT32
@@ -2668,7 +3465,6 @@ def prefill_cp_csa_test(
             leaf_main_state_slots_input[rank],
             leaf_inner_state_slots_input[rank],
             leaf_num_tokens_input[rank],
-            effective_x_workspace[rank],
             hidden_tail_window,
             kv_tail_window,
             tail_ready,
@@ -3024,7 +3820,9 @@ def golden_prefill_cp_csa(tensors):
             )
             if row >= 0:
                 idx_flat[row] = value
-                scale_flat[row] = scale_published[logical_slot]
+                scale_flat[row] = scale_published[logical_slot].to(
+                    torch.float16
+                ).float()
 
     main_state_out = tensors["compress_state"].clone()
     inner_state_out = tensors["inner_compress_state"].clone()
@@ -3103,9 +3901,11 @@ def golden_prefill_cp_csa(tensors):
         weights = (
             norm_flat.float() @ tensors["idx_weights_proj"].float()
         ) * M.index_weights_scale
+        weights = weights.to(torch.float16).float()
         query_i8, query_scale = int8_quant_per_row(
             query.reshape(LOCAL_ROWS * IDX_N_HEADS, IDX_HEAD_DIM)
         )
+        query_scale = query_scale.to(torch.float16).float()
         max_visible = min(
             CP_CANDIDATE_CAPACITY,
             max(0, (int(positions.max()) + 1) // COMPRESS_RATIO),
@@ -3276,6 +4076,7 @@ if __name__ == "__main__":
     parser.add_argument("-d", "--device", default=",".join(str(i) for i in range(CP_SIZE)))
     parser.add_argument("--cp", type=int, default=CP_SIZE, choices=CP_CHOICES)
     parser.add_argument("--compile-only", action="store_true")
+    parser.add_argument("--no-golden", action="store_true", default=False)
     parser.add_argument("--dump-passes", action="store_true")
     parser.add_argument("--enable-chip-swimlane", action="store_true")
     args = parser.parse_args()
@@ -3289,7 +4090,7 @@ if __name__ == "__main__":
     result = run(
         fn=prefill_cp_csa_test,
         specs=build_tensor_specs(args.cp),
-        golden_fn=golden_prefill_cp_csa,
+        golden_fn=None if args.no_golden else golden_prefill_cp_csa,
         compile_only=args.compile_only,
         config=dict(
             distributed_config=DistributedConfig(
@@ -3298,6 +4099,7 @@ if __name__ == "__main__":
             dump_passes=args.dump_passes,
             platform=args.platform,
             enable_chip_swimlane=args.enable_chip_swimlane,
+            ring_heap=PREFILL_CP_CSA_RING_HEAP,
         ),
         rtol=1e-2,
         atol=1e-2,

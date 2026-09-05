@@ -24,6 +24,7 @@ HEAD_DIM = M.head_dim
 # CP layout
 CP_CHOICES = (2, 4, 8)
 CP_DEFAULT = 2
+MAX_SEGMENT_TILES = 4
 EPOCHS = 1
 
 # tiling
@@ -42,6 +43,7 @@ def _parse_static_int(name: str, default: int) -> int:
 
 CP_SIZE = _parse_static_int("cp", CP_DEFAULT)
 NUM_SEGMENTS = 2 * CP_SIZE
+CP_PREFILL_CMP_BLOCK_NUM = NUM_SEGMENTS * MAX_SEGMENT_TILES
 
 # Rank-major tail-window rows.
 CP_TAIL_WINDOW_ROWS = NUM_SEGMENTS * TAIL_ROWS

@@ -125,9 +125,17 @@ assert CP_SIZE == N_RANKS, (
 )
 assert T == 128, f"CP layer requires T == 128 (got {T})"
 assert LOCAL_PARTS == 2
-assert MAX_SEGMENT_TILES == 2
+# This single-layer entry was brought up against the 256-row segments and the
+# CP SWA contract of that time. It has not been ported to the 512-row segments
+# or to the hidden-tail exchange the SWA core now performs, and it allocates no
+# window for the latter. Run prefill_cp_fwd_draft.py instead.
+assert MAX_SEGMENT_TILES == 2, (
+    f"prefill_cp_layer_draft is not ported past 256-row segments "
+    f"(MAX_SEGMENT_TILES={MAX_SEGMENT_TILES}); use prefill_cp_fwd_draft.py"
+)
+# One MoE wave per segment tile per local part; every shape below derives from
+# this count.
 NUM_MOE_WAVES = LOCAL_PARTS * MAX_SEGMENT_TILES
-assert NUM_MOE_WAVES == 4
 assert RECV_MAX == N_RANKS * T, (
     f"CP layer requires RECV_MAX == N_RANKS * T (got {RECV_MAX} vs {N_RANKS * T})"
 )
@@ -432,6 +440,7 @@ def prefill_layer_cp_swa(
     wo_b: pl.Tensor[[D, O_GROUPS * O_LORA], pl.INT8],
     wo_b_scale: pl.Tensor[[D], pl.FP32],
     segment_starts_t: pl.Tensor[[NUM_SEGMENTS], pl.INT32],
+    segment_tail_positions: pl.Tensor[[NUM_SEGMENTS, TAIL_ROWS], pl.INT32],
     predecessor_segments: pl.Tensor[[LOCAL_PARTS], pl.INT32],
     query_position_ids: pl.Tensor[
         [LOCAL_PARTS, MAX_SEGMENT_TILES, TAIL_ROWS], pl.INT32
@@ -520,7 +529,7 @@ def prefill_layer_cp_swa(
             wq_a, wq_b, wq_b_scale, wkv, gamma_cq, gamma_ckv,
             freqs_cos, freqs_sin, kv_cache,
             attn_sink, wo_a, wo_b, wo_b_scale,
-            segment_starts_t, predecessor_segments,
+            segment_starts_t, segment_tail_positions, predecessor_segments,
             query_position_ids, query_token_to_request,
             overlay_position_ids, overlay_token_to_request,
             overlay_active_lengths, swa_indices,
@@ -1056,6 +1065,7 @@ def l3_prefill_layer_cp_swa(
     wo_b: pl.Tensor[[D, O_GROUPS * O_LORA], pl.INT8],
     wo_b_scale: pl.Tensor[[D], pl.FP32],
     segment_starts_t: pl.Tensor[[NUM_SEGMENTS], pl.INT32],
+    segment_tail_positions: pl.Tensor[[NUM_SEGMENTS, TAIL_ROWS], pl.INT32],
     predecessor_segments: pl.Tensor[[CP_SIZE, LOCAL_PARTS], pl.INT32],
     query_position_ids: pl.Tensor[
         [CP_SIZE, LOCAL_PARTS, MAX_SEGMENT_TILES, TAIL_ROWS], pl.INT32
@@ -1166,7 +1176,7 @@ def l3_prefill_layer_cp_swa(
             wq_a, wq_b, wq_b_scale, wkv, gamma_cq, gamma_ckv,
             freqs_cos, freqs_sin, kv_cache[rank],
             attn_sink, wo_a, wo_b, wo_b_scale,
-            segment_starts_t, predecessor_segments[rank],
+            segment_starts_t, segment_tail_positions, predecessor_segments[rank],
             query_position_ids[rank], query_token_to_request[rank],
             overlay_position_ids[rank], overlay_token_to_request[rank],
             overlay_active_lengths[rank], swa_indices[rank],
@@ -1877,7 +1887,7 @@ SWA_HOST_ARG_ORDER = (
     "wq_a", "wq_b", "wq_b_scale", "wkv", "gamma_cq", "gamma_ckv",
     "freqs_cos", "freqs_sin", "kv_cache",
     "attn_sink", "wo_a", "wo_b", "wo_b_scale",
-    "segment_starts_t", "predecessor_segments",
+    "segment_starts_t", "segment_tail_positions", "predecessor_segments",
     "query_position_ids", "query_token_to_request",
     "overlay_position_ids", "overlay_token_to_request",
     "overlay_active_lengths", "swa_indices", "reverse_index",

@@ -18,17 +18,13 @@ from pypto.ir.distributed_compiled_program import DistributedConfig
 from config import (
     BLOCK_SIZE,
     FLASH as M,
-    FP32_NEG_INF,
     HCA_STATE_PHYSICAL_BLOCKS,
-    PREFILL_CMP_BLOCK_NUM,
     PREFILL_CMP_MAX_BLOCKS,
     PREFILL_ORI_MAX_BLOCKS,
 )
 from prefill_compressor_ratio128 import (
-    CMP_STORAGE_BLOCK_SIZE,
     COMPRESS_RATIO,
     COMPRESS_STATE_DIM,
-    HCA_CMP_BLOCK_NUM,
     HCA_STATE_BLOCK_NUM,
     HCA_STATE_BLOCK_SIZE,
     HCA_STATE_MAX_BLOCKS,
@@ -42,18 +38,21 @@ from prefill_cp_exchange import (
     CMP_ROWS_PER_RANK,
     CMP_ROWS_PER_SEGMENT,
     CMP_WINDOW_ROWS,
+    HCA_CMP_STORAGE_BLOCK_SIZE as CMP_STORAGE_BLOCK_SIZE,
     STATE_META_DIM,
     STATE_WINDOW_ROWS,
-    _prefill_cp_dual_tail_exchange_wave,
+    _prefill_cp_hidden_tail_exchange_wave,
     _prefill_cp_hca_compact_exchange_commit_wave,
-    _prefill_cp_sparse_stage,
 )
 from prefill_cp_zigzag import (
     CP_CHOICES,
+    CP_PREFILL_CMP_BLOCK_NUM as PREFILL_CMP_BLOCK_NUM,
     CP_SIZE,
     CP_TAIL_WINDOW_ROWS,
     EPOCHS,
+    MAX_SEGMENT_TILES,
     NUM_SEGMENTS,
+    ROW_TILE,
     TAIL_ROWS,
     cp_final_window_sources,
     cp_owner_part,
@@ -67,16 +66,17 @@ from prefill_sparse_attn import (
     HEAD_DIM,
     PREFILL_SPARSE_PAD,
     ROPE_DIM,
-    VALID_BLOCK_MASK_COLS,
-    sparse_attn_math,
+    hca_streaming_attn_512,
     build_tensor_specs as build_sparse_attn_tensor_specs,
     golden_prefill_sparse_attn,
 )
 from qkv_proj_rope import (
     build_tensor_specs as build_qkv_tensor_specs,
     golden_qkv_proj_rope,
+    kv_proj_rope,
     materialize_rope_rows,
-    qkv_proj_rope,
+    q_proj_rope,
+    rope_prepare,
 )
 from rmsnorm import golden_rms_norm, rms_norm
 from utils import build_rope_tables
@@ -97,23 +97,40 @@ WIN = M.sliding_window
 
 # CP layout
 LOCAL_PARTS = 2
-MAX_SEGMENT_TILES = 2
 NUM_LOCAL_TILES = LOCAL_PARTS * MAX_SEGMENT_TILES
+SEGMENT_ROWS = MAX_SEGMENT_TILES * TAIL_ROWS
 ORI_MAX_BLOCKS = PREFILL_ORI_MAX_BLOCKS
 ORI_CACHE_ROWS = ORI_MAX_BLOCKS * BLOCK_SIZE
 OVERLAY_BASE = ORI_CACHE_ROWS
 PRED_OVERLAY_ROWS = TAIL_ROWS
 OVERLAY_ROWS = 2 * TAIL_ROWS
 OVERLAY_SOURCES = 2
-MAX_COMPRESSED_ROWS_PER_SEGMENT = MAX_SEGMENT_TILES
+MAX_COMPRESSED_ROWS_PER_SEGMENT = (
+    MAX_SEGMENT_TILES * TAIL_ROWS // COMPRESS_RATIO
+)
+assert CMP_ROWS_PER_SEGMENT == MAX_COMPRESSED_ROWS_PER_SEGMENT
 MAX_COMPRESS_LEAVES = 1 + MAX_SEGMENT_TILES
+# Concurrent scalar stores must not share a 64-byte DDR cache line.
+LEAF_NUM_TOKENS_STRIDE = 16
+ROWS_PER_AUGMENTED_PART = MAX_COMPRESS_LEAVES * TAIL_ROWS
+LOCAL_AUGMENTED_ROWS = LOCAL_PARTS * ROWS_PER_AUGMENTED_PART
 LOCAL_ROWS = NUM_LOCAL_TILES * TAIL_ROWS
 LOCAL_SPARSE_ROWS = LOCAL_ROWS * PREFILL_SPARSE_PAD
-LEAF_CMP_BLOCKS = HCA_CMP_BLOCK_NUM
+# A 128-row compressor leaf emits at most one compact row.  Keep one physical
+# 128-row cache block per leaf scratch, then compact only its first row into
+# the shared Recipes cache ABI.
+LEAF_CMP_BLOCKS = 1
+# Rows in one leaf's cache slice, i.e. the same bytes seen one row per block --
+# the view the shared ratio-128 compressor declares.
+LEAF_CMP_SLICE_ROWS = LEAF_CMP_BLOCKS * CMP_STORAGE_BLOCK_SIZE
 LEAF_CMP_ROWS = (
     LOCAL_PARTS * MAX_COMPRESS_LEAVES * LEAF_CMP_BLOCKS * CMP_STORAGE_BLOCK_SIZE
 )
 STATE_ROWS = HCA_STATE_BLOCK_NUM * HCA_STATE_BLOCK_SIZE
+
+# Canonical per-dispatch ring sizing for the standalone L3 harness.  The
+# dbdd runtime no longer reads the retired PTO2_RING_* environment variables.
+PREFILL_CP_HCA_RING_HEAP = (1024 * 1024 * 1024,) * 4
 
 def active_tile(segment_len: int, tile: int) -> int:
     return max(0, min(TAIL_ROWS, segment_len - tile * TAIL_ROWS))
@@ -173,8 +190,8 @@ def _build_raw_attention_metadata(cp_size: int):
     import torch
 
     prefix = 0
-    span = TAIL_ROWS
-    lengths = [TAIL_ROWS] * (2 * cp_size)
+    span = MAX_SEGMENT_TILES * TAIL_ROWS
+    lengths = [span] * (2 * cp_size)
     starts = segment_starts(prefix, span, 2 * cp_size)
     owners = owner_segments(cp_size)
     query_positions = torch.zeros(
@@ -330,8 +347,8 @@ def build_hca_metadata(cp_size: int = CP_SIZE):
         raise ValueError(f"cp_size must be one of {CP_CHOICES}, got {cp_size}")
 
     prefix = 0
-    span = TAIL_ROWS
-    lengths = [TAIL_ROWS] * (2 * cp_size)
+    span = MAX_SEGMENT_TILES * TAIL_ROWS
+    lengths = [span] * (2 * cp_size)
     starts = segment_starts(prefix, span, 2 * cp_size)
     owners = owner_segments(cp_size)
 
@@ -592,13 +609,20 @@ def prefill_cp_hca_core(
     domains respectively; local payload rows stay at 0 (``EPOCHS == 1``).
     Standalone/single-layer callers pass 0 for both, preserving behavior.
     """
-    q = pl.create_tensor([LOCAL_ROWS, H, HEAD_DIM], dtype=pl.BF16, init_value=0.0)
+    q = pl.create_tensor([LOCAL_ROWS, H, HEAD_DIM], dtype=pl.BF16)
     post = pl.create_tensor([LOCAL_ROWS, HC_MULT], dtype=pl.FP32)
     comb = pl.create_tensor([LOCAL_ROWS, HC_MULT * HC_MULT], dtype=pl.FP32)
-    rope_cos_flat = pl.create_tensor([LOCAL_ROWS, ROPE_HEAD_DIM], dtype=pl.BF16, init_value=0.0)
-    rope_sin_flat = pl.create_tensor([LOCAL_ROWS, ROPE_HEAD_DIM], dtype=pl.BF16, init_value=0.0)
-    local_kv = pl.create_tensor([LOCAL_ROWS, HEAD_DIM], dtype=pl.BF16, init_value=0.0)
-    normed = pl.create_tensor([LOCAL_ROWS, D], dtype=pl.BF16, init_value=0.0)
+    rope_cos_flat = pl.create_tensor([LOCAL_ROWS, ROPE_HEAD_DIM], dtype=pl.BF16)
+    rope_sin_flat = pl.create_tensor([LOCAL_ROWS, ROPE_HEAD_DIM], dtype=pl.BF16)
+    rope_cos_il = pl.create_tensor([LOCAL_ROWS, ROPE_HEAD_DIM], dtype=pl.FP32)
+    rope_sin_signed = pl.create_tensor(
+        [LOCAL_ROWS, ROPE_HEAD_DIM], dtype=pl.FP32
+    )
+    rope_swap_idx = pl.create_tensor(
+        [LOCAL_ROWS, ROPE_HEAD_DIM], dtype=pl.INT32
+    )
+    local_kv = pl.create_tensor([LOCAL_ROWS, HEAD_DIM], dtype=pl.BF16)
+    normed = pl.create_tensor([LOCAL_ROWS, D], dtype=pl.BF16)
     mixed = pl.create_tensor([LOCAL_ROWS, D], dtype=pl.BF16)
     qr = pl.create_tensor([LOCAL_ROWS, Q_LORA], dtype=pl.INT8)
     qr_scale = pl.create_tensor([LOCAL_ROWS, 1], dtype=pl.FP32)
@@ -611,173 +635,355 @@ def prefill_cp_hca_core(
     swa_indices_flat = pl.reshape(swa_indices, [LOCAL_ROWS, WIN])
     cmp_indices_flat = pl.reshape(cmp_indices, [LOCAL_ROWS, IDX_TOPK])
 
+    # Recipes treats the two owned 512-row segments as one rank-local 1024-row
+    # query projection.  KV is projected later from the augmented hidden
+    # sequence (predecessor128 + current512), after hidden-only CP exchange.
+    hc_pre(
+        x_flat,
+        hc_attn_fn,
+        hc_attn_scale,
+        hc_attn_base,
+        mixed,
+        post,
+        comb,
+    )
+    rms_norm(mixed, attn_norm_w, normed)
     for tile in pl.range(NUM_LOCAL_TILES):
         row0 = tile * TAIL_ROWS
-        x_tile = pl.slice(x_flat, [TAIL_ROWS, HC_MULT, D], [row0, 0, 0])
-        mixed_tile = pl.slice(mixed, [TAIL_ROWS, D], [row0, 0])
-        post_tile = pl.slice(post, [TAIL_ROWS, HC_MULT], [row0, 0])
-        comb_tile = pl.slice(comb, [TAIL_ROWS, HC_MULT * HC_MULT], [row0, 0])
         position_tile = pl.slice(query_positions_flat, [TAIL_ROWS], [row0])
         cos_tile = pl.slice(rope_cos_flat, [TAIL_ROWS, ROPE_HEAD_DIM], [row0, 0])
         sin_tile = pl.slice(rope_sin_flat, [TAIL_ROWS, ROPE_HEAD_DIM], [row0, 0])
-        normed_tile = pl.slice(normed, [TAIL_ROWS, D], [row0, 0])
-        q_tile = pl.slice(q, [TAIL_ROWS, H, HEAD_DIM], [row0, 0, 0])
-        kv_tile = pl.slice(local_kv, [TAIL_ROWS, HEAD_DIM], [row0, 0])
-        qr_tile = pl.slice(qr, [TAIL_ROWS, Q_LORA], [row0, 0])
-        qr_scale_tile = pl.slice(qr_scale, [TAIL_ROWS, 1], [row0, 0])
-        hc_pre(
-            x_tile,
-            hc_attn_fn,
-            hc_attn_scale,
-            hc_attn_base,
-            mixed_tile,
-            post_tile,
-            comb_tile,
-        )
-        rms_tid = rms_norm(mixed_tile, attn_norm_w, normed_tile)
-        late_dep = pl.system.task_dummy(deps=[rms_tid])
         active = pl.read(overlay_active_lengths, [tile // MAX_SEGMENT_TILES, tile % MAX_SEGMENT_TILES, 1])
         materialize_rope_rows(
             freqs_cos, freqs_sin, position_tile, active,
             cos_tile, sin_tile,
         )
-        qkv_proj_rope(
-            normed_tile,
-            wq_a, wq_b, wq_b_scale, wkv,
-            cos_tile, sin_tile,
-            gamma_cq, gamma_ckv,
-            q_tile, kv_tile, qr_tile, qr_scale_tile, late_dep,
-        )
+    rope_prepare(
+        rope_cos_flat,
+        rope_sin_flat,
+        rope_cos_il,
+        rope_sin_signed,
+        rope_swap_idx,
+    )
+    q_proj_rope(
+        normed,
+        wq_a,
+        wq_b,
+        wq_b_scale,
+        gamma_cq,
+        rope_cos_il,
+        rope_sin_signed,
+        rope_swap_idx,
+        q,
+        qr,
+        qr_scale,
+    )
 
-    local_hidden_tail = pl.create_tensor([EPOCHS * LOCAL_PARTS * TAIL_ROWS, D], dtype=pl.BF16, init_value=0.0)
-    local_kv_tail = pl.create_tensor([EPOCHS * LOCAL_PARTS * TAIL_ROWS, HEAD_DIM], dtype=pl.BF16, init_value=0.0)
+    local_hidden_tail = pl.create_tensor(
+        [EPOCHS * LOCAL_PARTS * TAIL_ROWS, D], dtype=pl.BF16
+    )
     with pl.at(level=pl.Level.CORE_GROUP, name_hint="cp_hca_tail_assemble"):
         for part in pl.range(LOCAL_PARTS):
-            first_len = pl.read(overlay_active_lengths, [part, 0, 1])
-            second_len = pl.read(overlay_active_lengths, [part, 1, 1])
-            total = first_len + second_len
+            total = pl.read(segment_active_lengths, [part])
             tail_offset0 = pl.max(total - TAIL_ROWS, 0)
             for row in pl.range(TAIL_ROWS):
                 tail_offset = tail_offset0 + row
+                destination = part * TAIL_ROWS + row
+                local_hidden_tail[
+                    destination : destination + 1, :
+                ] = pl.full([1, D], dtype=pl.BF16, value=0.0)
                 if tail_offset < total:
-                    if tail_offset < TAIL_ROWS:
-                        source = (
-                            part * MAX_SEGMENT_TILES * TAIL_ROWS
-                            + tail_offset
-                        )
-                    else:
-                        source = (
-                            part * MAX_SEGMENT_TILES * TAIL_ROWS
-                            + tail_offset
-                        )
-                    destination = part * TAIL_ROWS + row
+                    source = (
+                        part * MAX_SEGMENT_TILES * TAIL_ROWS + tail_offset
+                    )
                     local_hidden_tail[destination : destination + 1, :] = normed[source : source + 1, :]
-                    local_kv_tail[destination : destination + 1, :] = local_kv[source : source + 1, :]
 
     logical_hidden = pl.create_tensor([EPOCHS * CP_TAIL_WINDOW_ROWS, D], dtype=pl.BF16)
-    logical_kv = pl.create_tensor([EPOCHS * CP_TAIL_WINDOW_ROWS, HEAD_DIM], dtype=pl.BF16)
-    with pl.at(level=pl.Level.CORE_GROUP, name_hint="cp_hca_tail_exchange"):
-        _prefill_cp_dual_tail_exchange_wave(
-            local_hidden_tail, local_kv_tail,
+    with pl.at(
+        level=pl.Level.CORE_GROUP,
+        name_hint="cp_hca_hidden_tail_exchange",
+    ) as tail_exchange_tid:
+        _prefill_cp_hidden_tail_exchange_wave(
+            local_hidden_tail,
             reverse_index, owner_rank_table,
-            hidden_tail_window, kv_tail_window, tail_ready, tail_consumed,
-            logical_hidden, logical_kv,
+            hidden_tail_window, tail_ready, tail_consumed,
+            logical_hidden,
             my_rank, pl.cast(0, pl.INT32), tail_comm_epoch,
         )
 
-    effective_x = pl.create_tensor(
-        [LOCAL_PARTS * MAX_COMPRESS_LEAVES * TAIL_ROWS, D],
-        dtype=pl.BF16,
-        init_value=0.0,
-    )
+    effective_x = pl.create_tensor([LOCAL_AUGMENTED_ROWS, D], dtype=pl.BF16)
     leaf_positions = pl.create_tensor(
-        [LOCAL_PARTS * MAX_COMPRESS_LEAVES * TAIL_ROWS],
+        [LOCAL_AUGMENTED_ROWS],
         dtype=pl.INT32,
-        init_value=0,
     )
     leaf_num_tokens = pl.create_tensor(
-        [LOCAL_PARTS, MAX_COMPRESS_LEAVES],
+        [LOCAL_PARTS, LEAF_NUM_TOKENS_STRIDE],
         dtype=pl.INT32,
-        init_value=0,
     )
     leaf_cmp_slots = pl.create_tensor(
-        [LOCAL_PARTS * MAX_COMPRESS_LEAVES * TAIL_ROWS],
+        [LOCAL_AUGMENTED_ROWS],
         dtype=pl.INT64,
-        init_value=-1,
     )
     leaf_state_slots = pl.create_tensor(
-        [LOCAL_PARTS * MAX_COMPRESS_LEAVES * TAIL_ROWS],
+        [LOCAL_AUGMENTED_ROWS],
         dtype=pl.INT64,
-        init_value=-1,
     )
-    with pl.at(level=pl.Level.CORE_GROUP, name_hint="cp_hca_leaf_lowering"):
-        for part in pl.range(LOCAL_PARTS):
-            predecessor = pl.read(predecessor_segments, [part])
-            predecessor_valid = pl.read(
-                overlay_active_lengths, [part, 0, 0]
+    with pl.spmd(
+        LOCAL_PARTS,
+        name_hint="cp_hca_leaf_lowering",
+        deps=[tail_exchange_tid],
+    ) as leaf_lowering_tid:
+        part = pl.tile.get_block_idx()
+        predecessor = pl.read(predecessor_segments, [part])
+        predecessor_valid = pl.read(
+            overlay_active_lengths, [part, 0, 0]
+        )
+        leaf_token_row = pl.full(
+            [1, LEAF_NUM_TOKENS_STRIDE], dtype=pl.INT32, value=0
+        )
+        pl.write(leaf_token_row, [0, 0], predecessor_valid)
+        for leaf_row in pl.range(TAIL_ROWS):
+            leaf_index = part * MAX_COMPRESS_LEAVES * TAIL_ROWS + leaf_row
+            effective_x[leaf_index:leaf_index + 1, :] = pl.full(
+                [1, D], dtype=pl.BF16, value=0.0
             )
-            pl.write(leaf_num_tokens, [part, 0], predecessor_valid)
-            for leaf_row in pl.range(TAIL_ROWS):
-                leaf_index = part * MAX_COMPRESS_LEAVES * TAIL_ROWS + leaf_row
-                if predecessor >= 0 and leaf_row < predecessor_valid:
-                    source = predecessor * TAIL_ROWS + leaf_row
-                    effective_x[leaf_index:leaf_index + 1, :] = logical_hidden[source:source + 1, :]
-                    position = pl.read(
-                        segment_tail_positions, [predecessor, leaf_row]
+            pl.write(leaf_positions, [leaf_index], pl.cast(0, pl.INT32))
+            pl.write(leaf_cmp_slots, [leaf_index], pl.cast(-1, pl.INT64))
+            pl.write(leaf_state_slots, [leaf_index], pl.cast(-1, pl.INT64))
+            if predecessor >= 0 and leaf_row < predecessor_valid:
+                source = predecessor * TAIL_ROWS + leaf_row
+                effective_x[leaf_index:leaf_index + 1, :] = logical_hidden[
+                    source:source + 1, :
+                ]
+                position = pl.read(
+                    segment_tail_positions, [predecessor, leaf_row]
+                )
+                pl.write(leaf_positions, [leaf_index], position)
+                if position >= 0:
+                    logical_block = position // HCA_STATE_BLOCK_SIZE
+                    physical_block = pl.read(
+                        compress_state_block_table, [logical_block]
                     )
-                    pl.write(leaf_positions, [leaf_index], position)
-                    if position >= 0:
-                        logical_block = position // HCA_STATE_BLOCK_SIZE
-                        physical_block = pl.read(
-                            compress_state_block_table, [logical_block]
+                    if physical_block >= 0:
+                        predecessor_state_row = (
+                            pl.cast(physical_block, pl.INT64)
+                            * HCA_STATE_BLOCK_SIZE
+                            + position % HCA_STATE_BLOCK_SIZE
                         )
-                        if physical_block >= 0:
-                            predecessor_state_row = (
-                                pl.cast(physical_block, pl.INT64)
-                                * HCA_STATE_BLOCK_SIZE
-                                + position % HCA_STATE_BLOCK_SIZE
-                            )
-                            pl.write(
-                                leaf_state_slots,
-                                [leaf_index],
-                                predecessor_state_row,
-                            )
-            for tile in pl.range(MAX_SEGMENT_TILES):
-                leaf = 1 + tile
-                active = pl.read(overlay_active_lengths, [part, tile, 1])
-                pl.write(leaf_num_tokens, [part, leaf], active)
-                local_row0 = (part * MAX_SEGMENT_TILES + tile) * TAIL_ROWS
-                leaf_row0 = (
-                    part * MAX_COMPRESS_LEAVES + leaf
-                ) * TAIL_ROWS
-                for leaf_row in pl.range(TAIL_ROWS):
-                    destination = leaf_row0 + leaf_row
-                    if leaf_row < active:
-                        source = local_row0 + leaf_row
-                        effective_x[destination:destination + 1, :] = normed[source:source + 1, :]
-                        position = pl.read(query_positions_flat, [source])
-                        pl.write(leaf_positions, [destination], position)
-                        logical_block = position // HCA_STATE_BLOCK_SIZE
-                        physical_block = pl.read(
-                            compress_state_block_table, [logical_block]
+                        pl.write(
+                            leaf_state_slots,
+                            [leaf_index],
+                            predecessor_state_row,
                         )
-                        if physical_block >= 0:
-                            local_state_row = (
-                                pl.cast(physical_block, pl.INT64)
-                                * HCA_STATE_BLOCK_SIZE
-                                + position % HCA_STATE_BLOCK_SIZE
-                            )
-                            pl.write(
-                                leaf_state_slots,
-                                [destination],
-                                local_state_row,
-                            )
-                        if (position + 1) % COMPRESS_RATIO == 0:
-                            pl.write(
-                                leaf_cmp_slots,
-                                [destination],
-                                pl.cast(0, pl.INT64),
-                            )
+        for tile in pl.range(MAX_SEGMENT_TILES):
+            leaf = 1 + tile
+            active = pl.read(overlay_active_lengths, [part, tile, 1])
+            pl.write(leaf_token_row, [0, leaf], active)
+            local_row0 = (part * MAX_SEGMENT_TILES + tile) * TAIL_ROWS
+            leaf_row0 = (
+                part * MAX_COMPRESS_LEAVES + leaf
+            ) * TAIL_ROWS
+            for leaf_row in pl.range(TAIL_ROWS):
+                destination = leaf_row0 + leaf_row
+                effective_x[destination:destination + 1, :] = pl.full(
+                    [1, D], dtype=pl.BF16, value=0.0
+                )
+                pl.write(
+                    leaf_positions,
+                    [destination],
+                    pl.cast(0, pl.INT32),
+                )
+                pl.write(
+                    leaf_cmp_slots,
+                    [destination],
+                    pl.cast(-1, pl.INT64),
+                )
+                pl.write(
+                    leaf_state_slots,
+                    [destination],
+                    pl.cast(-1, pl.INT64),
+                )
+                if leaf_row < active:
+                    source = local_row0 + leaf_row
+                    effective_x[destination:destination + 1, :] = normed[
+                        source:source + 1, :
+                    ]
+                    position = pl.read(query_positions_flat, [source])
+                    pl.write(leaf_positions, [destination], position)
+                    logical_block = position // HCA_STATE_BLOCK_SIZE
+                    physical_block = pl.read(
+                        compress_state_block_table, [logical_block]
+                    )
+                    if physical_block >= 0:
+                        local_state_row = (
+                            pl.cast(physical_block, pl.INT64)
+                            * HCA_STATE_BLOCK_SIZE
+                            + position % HCA_STATE_BLOCK_SIZE
+                        )
+                        pl.write(
+                            leaf_state_slots,
+                            [destination],
+                            local_state_row,
+                        )
+                    if (position + 1) % COMPRESS_RATIO == 0:
+                        pl.write(
+                            leaf_cmp_slots,
+                            [destination],
+                            pl.cast(0, pl.INT64),
+                        )
+        leaf_num_tokens[
+            part:part + 1, 0:LEAF_NUM_TOKENS_STRIDE
+        ] = leaf_token_row
+
+    # Recipes projects KV locally from the augmented hidden sequence rather
+    # than exchanging projected KV.  `effective_x` is already laid out as
+    # [predecessor128, current512] for each owned segment and is shared with
+    # the HCA compressor, so no second hidden gather is needed.
+    augmented_rope_cos = pl.create_tensor(
+        [LOCAL_AUGMENTED_ROWS, ROPE_HEAD_DIM], dtype=pl.BF16
+    )
+    augmented_rope_sin = pl.create_tensor(
+        [LOCAL_AUGMENTED_ROWS, ROPE_HEAD_DIM], dtype=pl.BF16
+    )
+    augmented_rope_cos_il = pl.create_tensor(
+        [LOCAL_AUGMENTED_ROWS, ROPE_HEAD_DIM], dtype=pl.FP32
+    )
+    augmented_rope_sin_signed = pl.create_tensor(
+        [LOCAL_AUGMENTED_ROWS, ROPE_HEAD_DIM], dtype=pl.FP32
+    )
+    augmented_rope_swap_idx = pl.create_tensor(
+        [LOCAL_AUGMENTED_ROWS, ROPE_HEAD_DIM], dtype=pl.INT32
+    )
+    augmented_kv = pl.create_tensor(
+        [LOCAL_AUGMENTED_ROWS, HEAD_DIM], dtype=pl.BF16
+    )
+    materialize_rope_rows(
+        freqs_cos,
+        freqs_sin,
+        leaf_positions,
+        pl.const(LOCAL_AUGMENTED_ROWS, pl.INT32),
+        augmented_rope_cos,
+        augmented_rope_sin,
+    )
+    rope_prepare(
+        augmented_rope_cos,
+        augmented_rope_sin,
+        augmented_rope_cos_il,
+        augmented_rope_sin_signed,
+        augmented_rope_swap_idx,
+    )
+    kv_proj_rope(
+        effective_x,
+        wkv,
+        gamma_ckv,
+        augmented_rope_cos_il,
+        augmented_rope_sin_signed,
+        augmented_rope_swap_idx,
+        augmented_kv,
+        leaf_lowering_tid,
+    )
+
+    logical_kv = pl.create_tensor(
+        [EPOCHS * CP_TAIL_WINDOW_ROWS, HEAD_DIM], dtype=pl.BF16
+    )
+    with pl.at(level=pl.Level.CORE_GROUP, name_hint="cp_hca_augmented_kv_scatter"):
+        for part in pl.range(LOCAL_PARTS):
+            augmented_row0 = part * ROWS_PER_AUGMENTED_PART
+            local_row0 = part * MAX_SEGMENT_TILES * TAIL_ROWS
+            for row0 in pl.range(
+                0, MAX_SEGMENT_TILES * TAIL_ROWS, ROW_TILE
+            ):
+                local_kv[
+                    local_row0 + row0:local_row0 + row0 + ROW_TILE,
+                    :,
+                ] = augmented_kv[
+                    augmented_row0 + TAIL_ROWS + row0:
+                    augmented_row0 + TAIL_ROWS + row0 + ROW_TILE,
+                    :,
+                ]
+            predecessor = pl.read(predecessor_segments, [part])
+            if predecessor >= 0:
+                predecessor_row0 = predecessor * TAIL_ROWS
+                for row0 in pl.range(0, TAIL_ROWS, ROW_TILE):
+                    logical_kv[
+                        predecessor_row0 + row0:
+                        predecessor_row0 + row0 + ROW_TILE,
+                        :,
+                    ] = augmented_kv[
+                        augmented_row0 + row0:
+                        augmented_row0 + row0 + ROW_TILE,
+                        :,
+                    ]
+
+    # The decode window is also projected locally from gathered hidden tails
+    # in Recipes.  It may span the final two logical segments, so construct it
+    # row-by-row from the canonical source metadata before one 128-row KV pass.
+    final_hidden = pl.create_tensor([TAIL_ROWS, D], dtype=pl.BF16)
+    final_positions = pl.create_tensor([TAIL_ROWS], dtype=pl.INT32)
+    with pl.at(
+        level=pl.Level.CORE_GROUP,
+        name_hint="cp_hca_final_hidden_lowering",
+        deps=[tail_exchange_tid],
+    ) as final_hidden_tid:
+        for row in pl.range(TAIL_ROWS):
+            final_hidden[row:row + 1, :] = pl.full(
+                [1, D], dtype=pl.BF16, value=0.0
+            )
+            pl.write(final_positions, [row], pl.cast(0, pl.INT32))
+            segment = pl.read(final_win_seg_src, [row])
+            source_row = pl.read(final_win_row_src, [row])
+            if segment >= 0 and source_row >= 0:
+                source = segment * TAIL_ROWS + source_row
+                final_hidden[row:row + 1, :] = logical_hidden[
+                    source:source + 1, :
+                ]
+                position = pl.read(
+                    segment_tail_positions, [segment, source_row]
+                )
+                if position >= 0:
+                    pl.write(final_positions, [row], position)
+
+    final_rope_cos = pl.create_tensor(
+        [TAIL_ROWS, ROPE_HEAD_DIM], dtype=pl.BF16
+    )
+    final_rope_sin = pl.create_tensor(
+        [TAIL_ROWS, ROPE_HEAD_DIM], dtype=pl.BF16
+    )
+    final_rope_cos_il = pl.create_tensor(
+        [TAIL_ROWS, ROPE_HEAD_DIM], dtype=pl.FP32
+    )
+    final_rope_sin_signed = pl.create_tensor(
+        [TAIL_ROWS, ROPE_HEAD_DIM], dtype=pl.FP32
+    )
+    final_rope_swap_idx = pl.create_tensor(
+        [TAIL_ROWS, ROPE_HEAD_DIM], dtype=pl.INT32
+    )
+    final_kv = pl.create_tensor([TAIL_ROWS, HEAD_DIM], dtype=pl.BF16)
+    materialize_rope_rows(
+        freqs_cos,
+        freqs_sin,
+        final_positions,
+        pl.const(TAIL_ROWS, pl.INT32),
+        final_rope_cos,
+        final_rope_sin,
+    )
+    rope_prepare(
+        final_rope_cos,
+        final_rope_sin,
+        final_rope_cos_il,
+        final_rope_sin_signed,
+        final_rope_swap_idx,
+    )
+    kv_proj_rope(
+        final_hidden,
+        wkv,
+        gamma_ckv,
+        final_rope_cos_il,
+        final_rope_sin_signed,
+        final_rope_swap_idx,
+        final_kv,
+        final_hidden_tid,
+    )
 
     scratch_state = pl.create_tensor(
         [
@@ -786,16 +992,20 @@ def prefill_cp_hca_core(
             COMPRESS_STATE_DIM,
         ],
         dtype=pl.FP32,
-        init_value=0.0,
     )
     persistent_state_flat = pl.reshape(compress_state, [STATE_ROWS, COMPRESS_STATE_DIM])
     scratch_state_flat = pl.reshape(scratch_state, [LOCAL_PARTS * STATE_ROWS, COMPRESS_STATE_DIM])
     with pl.at(level=pl.Level.CORE_GROUP, name_hint="cp_hca_seed_state"):
         for part in pl.range(LOCAL_PARTS):
             segment = pl.read(owner_segments_t, [part])
-            if segment == 0:
-                for state_row in pl.range(STATE_ROWS):
-                    destination = part * STATE_ROWS + state_row
+            for state_row in pl.range(STATE_ROWS):
+                destination = part * STATE_ROWS + state_row
+                scratch_state_flat[
+                    destination : destination + 1, :
+                ] = pl.full(
+                    [1, COMPRESS_STATE_DIM], dtype=pl.FP32, value=0.0
+                )
+                if segment == 0:
                     persistent_state_row = persistent_state_flat[state_row : state_row + 1, :]
                     scratch_state_flat[destination : destination + 1, :] = persistent_state_row
 
@@ -807,7 +1017,6 @@ def prefill_cp_hca_core(
             HEAD_DIM,
         ],
         dtype=pl.BF16,
-        init_value=0.0,
     )
     for part in pl.range(LOCAL_PARTS):
         state_base = part * HCA_STATE_PHYSICAL_BLOCKS
@@ -834,24 +1043,67 @@ def prefill_cp_hca_core(
                 [cmp_block0, 0, 0, 0],
             )
             active = pl.read(leaf_num_tokens, [part, leaf])
-            cmp_leaf, state_part = prefill_compressor_ratio128(
+            # The compressor addresses cmp_kv purely as a flat row space and
+            # declares serving's one-row-per-block paging. Hand it the same
+            # bytes under that view; CP's BLOCK_SIZE-row paging only concerns
+            # the block-table consumers downstream.
+            cmp_leaf_rows = pl.reshape(
+                cmp_leaf, [LEAF_CMP_SLICE_ROWS, 1, 1, HEAD_DIM]
+            )
+            cmp_leaf_rows, state_part = prefill_compressor_ratio128(
                 x_leaf, state_part, compress_state_block_table,
                 cmp_wkv, cmp_wgate, cmp_ape, cmp_norm_w,
                 freqs_cos, freqs_sin,
-                cmp_leaf, position_leaf, active,
+                cmp_leaf_rows, position_leaf, active,
                 cmp_slots_leaf, state_slots_leaf,
+            )
+            cmp_leaf = pl.reshape(
+                cmp_leaf_rows,
+                [LEAF_CMP_BLOCKS, CMP_STORAGE_BLOCK_SIZE, 1, HEAD_DIM],
             )
             leaf_cmp = pl.assemble(leaf_cmp, cmp_leaf, [cmp_block0, 0, 0, 0])
         scratch_state = pl.assemble(scratch_state, state_part, [state_base, 0, 0])
 
-    local_cmp_payload = pl.create_tensor([EPOCHS * CMP_ROWS_PER_RANK, HEAD_DIM], dtype=pl.BF16, init_value=0.0)
-    local_cmp_meta = pl.create_tensor([EPOCHS * CMP_ROWS_PER_RANK, CMP_META_DIM], dtype=pl.INT32, init_value=-1)
-    local_state_payload = pl.create_tensor([EPOCHS * TAIL_ROWS, COMPRESS_STATE_DIM], dtype=pl.FP32, init_value=0.0)
-    local_state_meta = pl.create_tensor([EPOCHS, STATE_META_DIM], dtype=pl.INT32, init_value=-1)
+    local_cmp_payload = pl.create_tensor(
+        [EPOCHS * CMP_ROWS_PER_RANK, HEAD_DIM], dtype=pl.BF16
+    )
+    local_cmp_meta = pl.create_tensor(
+        [EPOCHS * CMP_ROWS_PER_RANK, CMP_META_DIM], dtype=pl.INT32
+    )
+    local_state_payload = pl.create_tensor(
+        [EPOCHS * TAIL_ROWS, COMPRESS_STATE_DIM], dtype=pl.FP32
+    )
+    local_state_meta = pl.create_tensor(
+        [EPOCHS, STATE_META_DIM], dtype=pl.INT32
+    )
     leaf_cmp_flat = pl.reshape(leaf_cmp, [LEAF_CMP_ROWS, HEAD_DIM])
     scratch_state_flat = pl.reshape(scratch_state, [LOCAL_PARTS * STATE_ROWS, COMPRESS_STATE_DIM])
     final_segment = pl.read(final_segment_t, [0])
-    with pl.at(level=pl.Level.CORE_GROUP, name_hint="cp_hca_pack_compact"):
+    with pl.at(
+        level=pl.Level.CORE_GROUP,
+        name_hint="cp_hca_pack_compact",
+    ) as pack_compact_tid:
+        for record in pl.range(EPOCHS * CMP_ROWS_PER_RANK):
+            local_cmp_payload[record : record + 1, :] = pl.full(
+                [1, HEAD_DIM], dtype=pl.BF16, value=0.0
+            )
+            for field in pl.range(CMP_META_DIM):
+                pl.write(
+                    local_cmp_meta,
+                    [record, field],
+                    pl.cast(-1, pl.INT32),
+                )
+        for record in pl.range(EPOCHS * TAIL_ROWS):
+            local_state_payload[record : record + 1, :] = pl.full(
+                [1, COMPRESS_STATE_DIM], dtype=pl.FP32, value=0.0
+            )
+        for record in pl.range(EPOCHS):
+            for field in pl.range(STATE_META_DIM):
+                pl.write(
+                    local_state_meta,
+                    [record, field],
+                    pl.cast(-1, pl.INT32),
+                )
         for part in pl.range(LOCAL_PARTS):
             segment = pl.read(owner_segments_t, [part])
             for tile in pl.range(MAX_SEGMENT_TILES):
@@ -873,8 +1125,8 @@ def prefill_cp_hca_core(
                                 * CMP_STORAGE_BLOCK_SIZE
                             )
                             local_cmp_payload[
-                                destination:destination + 1, :
-                            ] = leaf_cmp_flat[source:source + 1, :]
+                                destination : destination + 1, :
+                            ] = leaf_cmp_flat[source : source + 1, :]
                             pl.write(
                                 local_cmp_meta,
                                 [destination, 0],
@@ -938,8 +1190,9 @@ def prefill_cp_hca_core(
     with pl.at(
         level=pl.Level.CORE_GROUP,
         name_hint="cp_hca_compact_commit",
-    ):
-        cmp_kv_flat = _prefill_cp_hca_compact_exchange_commit_wave(
+        deps=[pack_compact_tid],
+    ) as compact_commit_tid:
+        _prefill_cp_hca_compact_exchange_commit_wave(
             local_cmp_payload,
             local_cmp_meta,
             local_state_payload,
@@ -962,62 +1215,142 @@ def prefill_cp_hca_core(
         )
 
     cache_flat = pl.reshape(kv_cache, [ORI_CACHE_ROWS, HEAD_DIM])
-    sparse_kv = pl.create_tensor([LOCAL_SPARSE_ROWS, HEAD_DIM], dtype=pl.BF16)
-    sparse_bias = pl.create_tensor([LOCAL_ROWS, PREFILL_SPARSE_PAD], dtype=pl.FP32, init_value=FP32_NEG_INF)
-    valid_mask = pl.create_tensor([LOCAL_ROWS, VALID_BLOCK_MASK_COLS], dtype=pl.INT32, init_value=0)
-    _prefill_cp_sparse_stage(
-        cache_flat, local_kv, logical_kv,
-        cmp_kv,
-        cmp_block_table,
-        pl.cast(CMP_STORAGE_BLOCK_SIZE, pl.INT32),
-        query_positions_flat, query_requests_flat,
-        overlay_positions_flat, overlay_requests_flat,
-        predecessor_segments, segment_starts_t,
-        swa_indices_flat, cmp_indices_flat,
-        sparse_kv, sparse_bias, valid_mask, overlay_active_flat,
-    )
-
-    with pl.at(level=pl.Level.CORE_GROUP, name_hint="cp_hca_raw_commit"):
+    with pl.at(
+        level=pl.Level.CORE_GROUP,
+        name_hint="cp_hca_raw_commit",
+    ) as raw_commit_tid:
         for row in pl.range(TAIL_ROWS):
             raw_segment = pl.read(final_win_seg_src, [row])
             raw_source_row = pl.read(final_win_row_src, [row])
             raw_destination = pl.read(final_slot_mapping, [row])
             if raw_segment >= 0 and raw_source_row >= 0 and raw_destination >= 0:
-                raw_source = raw_segment * TAIL_ROWS + raw_source_row
-                cache_flat[raw_destination : raw_destination + 1, :] = logical_kv[raw_source : raw_source + 1, :]
+                cache_flat[
+                    raw_destination:raw_destination + 1, :
+                ] = final_kv[row:row + 1, :]
+
+    # A TaskId-only fence is insufficient on PTOAS 0.60 if it does not carry
+    # real producer reads.  Sample Q and augmented KV while joining the compact
+    # cache commit.  Native attention lowers the Recipes physical raw-cache
+    # layout analytically, without materializing an intermediate index table.
+    native_ready_anchor = pl.create_tensor([2], dtype=pl.BF16)
+    with pl.at(
+        level=pl.Level.CORE_GROUP,
+        name_hint="cp_hca_native_cache_ready",
+        deps=[compact_commit_tid],
+    ) as native_ready_tid:
+        pl.write(native_ready_anchor, [0], pl.read(q, [0, 0, 0]))
+        pl.write(
+            native_ready_anchor,
+            [1],
+            pl.read(augmented_kv, [0, 0]),
+        )
+
+    attn_out = pl.create_tensor([LOCAL_ROWS, D], dtype=pl.BF16)
+    q_part0 = pl.slice(q, [SEGMENT_ROWS, H, HEAD_DIM], [0, 0, 0])
+    full_kv_part0_flat = pl.slice(
+        augmented_kv, [ROWS_PER_AUGMENTED_PART, HEAD_DIM], [0, 0]
+    )
+    full_kv_part0 = pl.reshape(
+        full_kv_part0_flat,
+        [MAX_COMPRESS_LEAVES, BLOCK_SIZE, 1, HEAD_DIM],
+    )
+    positions_part0 = pl.slice(
+        query_positions_flat, [SEGMENT_ROWS], [0]
+    )
+    cos_part0 = pl.slice(
+        rope_cos_flat, [SEGMENT_ROWS, ROPE_DIM], [0, 0]
+    )
+    sin_part0 = pl.slice(
+        rope_sin_flat, [SEGMENT_ROWS, ROPE_DIM], [0, 0]
+    )
+    attn_out_part0 = pl.slice(attn_out, [SEGMENT_ROWS, D], [0, 0])
+    part0_active = pl.read(segment_active_lengths, [0])
+    part0_predecessor_valid = pl.read(
+        overlay_active_lengths, [0, 0, 0]
+    )
+    if pl.read(predecessor_segments, [0]) < 0:
+        part0_predecessor_valid = pl.cast(0, pl.INT32)
+    part0_attn_tid = hca_streaming_attn_512(
+        q_part0,
+        full_kv_part0,
+        part0_predecessor_valid,
+        cmp_kv,
+        cmp_block_table,
+        positions_part0,
+        attn_sink,
+        cos_part0,
+        sin_part0,
+        wo_a,
+        wo_b,
+        wo_b_scale,
+        attn_out_part0,
+        part0_active,
+        native_ready_tid,
+        native_ready_tid,
+    )
+
+    part1_row0 = SEGMENT_ROWS
+    part1_augmented_row0 = ROWS_PER_AUGMENTED_PART
+    q_part1 = pl.slice(
+        q, [SEGMENT_ROWS, H, HEAD_DIM], [part1_row0, 0, 0]
+    )
+    full_kv_part1_flat = pl.slice(
+        augmented_kv,
+        [ROWS_PER_AUGMENTED_PART, HEAD_DIM],
+        [part1_augmented_row0, 0],
+    )
+    full_kv_part1 = pl.reshape(
+        full_kv_part1_flat,
+        [MAX_COMPRESS_LEAVES, BLOCK_SIZE, 1, HEAD_DIM],
+    )
+    positions_part1 = pl.slice(
+        query_positions_flat, [SEGMENT_ROWS], [part1_row0]
+    )
+    cos_part1 = pl.slice(
+        rope_cos_flat, [SEGMENT_ROWS, ROPE_DIM], [part1_row0, 0]
+    )
+    sin_part1 = pl.slice(
+        rope_sin_flat, [SEGMENT_ROWS, ROPE_DIM], [part1_row0, 0]
+    )
+    attn_out_part1 = pl.slice(
+        attn_out, [SEGMENT_ROWS, D], [part1_row0, 0]
+    )
+    part1_active = pl.read(segment_active_lengths, [1])
+    part1_predecessor_valid = pl.read(
+        overlay_active_lengths, [1, 0, 0]
+    )
+    if pl.read(predecessor_segments, [1]) < 0:
+        part1_predecessor_valid = pl.cast(0, pl.INT32)
+    attention_done_tid = hca_streaming_attn_512(
+        q_part1,
+        full_kv_part1,
+        part1_predecessor_valid,
+        cmp_kv,
+        cmp_block_table,
+        positions_part1,
+        attn_sink,
+        cos_part1,
+        sin_part1,
+        wo_a,
+        wo_b,
+        wo_b_scale,
+        attn_out_part1,
+        part1_active,
+        native_ready_tid,
+        native_ready_tid,
+    )
 
     x_out_flat = pl.reshape(x_out, [LOCAL_ROWS, HC_MULT, D])
     for tile in pl.range(NUM_LOCAL_TILES):
         row0 = tile * TAIL_ROWS
-        sparse_row0 = row0 * PREFILL_SPARSE_PAD
-        q_tile = pl.slice(q, [TAIL_ROWS, H, HEAD_DIM], [row0, 0, 0])
-        sparse_tile = pl.slice(
-            sparse_kv,
-            [TAIL_ROWS * PREFILL_SPARSE_PAD, HEAD_DIM],
-            [sparse_row0, 0],
-        )
-        bias_tile = pl.slice(
-            sparse_bias, [TAIL_ROWS, PREFILL_SPARSE_PAD], [row0, 0]
-        )
-        mask_tile = pl.slice(
-            valid_mask, [TAIL_ROWS, VALID_BLOCK_MASK_COLS], [row0, 0]
-        )
-        cos_tile = pl.slice(rope_cos_flat, [TAIL_ROWS, ROPE_DIM], [row0, 0])
-        sin_tile = pl.slice(rope_sin_flat, [TAIL_ROWS, ROPE_DIM], [row0, 0])
         post_tile = pl.slice(post, [TAIL_ROWS, HC_MULT], [row0, 0])
         comb_tile = pl.slice(comb, [TAIL_ROWS, HC_MULT * HC_MULT], [row0, 0])
         residual_tile = pl.slice(x_flat, [TAIL_ROWS, HC_MULT, D], [row0, 0, 0])
         active = pl.read(overlay_active_lengths, [tile // MAX_SEGMENT_TILES, tile % MAX_SEGMENT_TILES, 1])
-        attn_out_tile = pl.create_tensor([TAIL_ROWS, D], dtype=pl.BF16)
-        y_tile = pl.create_tensor(
-            [TAIL_ROWS, HC_MULT, D], dtype=pl.FP32, init_value=0.0
+        attn_out_tile = pl.slice(
+            attn_out, [TAIL_ROWS, D], [row0, 0]
         )
-        sparse_attn_math(
-            q_tile, sparse_tile, bias_tile, mask_tile,
-            attn_sink, cos_tile, sin_tile,
-            wo_a, wo_b, wo_b_scale,
-            attn_out_tile, active,
-        )
+        y_tile = pl.create_tensor([TAIL_ROWS, HC_MULT, D], dtype=pl.FP32)
         hc_post_prefill(
             attn_out_tile, residual_tile,
             post_tile, comb_tile,
@@ -1869,28 +2202,28 @@ def golden_prefill_cp_hca(tensors):
                 local_post[rank, part, tile] = post
                 local_comb[rank, part, tile] = comb
 
-            first = int(
-                tensors["overlay_active_lengths"][rank, part, 0, 1]
-            )
-            second = int(
-                tensors["overlay_active_lengths"][rank, part, 1, 1]
-            )
-            total = first + second
-            if total:
+            active_lengths = [
+                int(tensors["overlay_active_lengths"][rank, part, tile, 1])
+                for tile in range(MAX_SEGMENT_TILES)
+            ]
+            if any(active_lengths):
                 hidden_rows = torch.cat(
                     [
-                        local_norm[rank, part, 0, :first],
-                        local_norm[rank, part, 1, :second],
+                        local_norm[rank, part, tile, :active]
+                        for tile, active in enumerate(active_lengths)
+                        if active > 0
                     ],
                     dim=0,
                 )
                 kv_rows = torch.cat(
                     [
-                        local_kv[rank, part, 0, :first],
-                        local_kv[rank, part, 1, :second],
+                        local_kv[rank, part, tile, :active]
+                        for tile, active in enumerate(active_lengths)
+                        if active > 0
                     ],
                     dim=0,
                 )
+                total = sum(active_lengths)
                 valid = min(TAIL_ROWS, total)
                 logical_hidden[segment, :valid] = hidden_rows[-valid:]
                 logical_kv[segment, :valid] = kv_rows[-valid:]
@@ -2121,6 +2454,8 @@ if __name__ == "__main__":
     parser.add_argument("-d", "--device", default=",".join(str(i) for i in range(CP_SIZE)))
     parser.add_argument("--cp", type=int, default=CP_SIZE, choices=list(CP_CHOICES))
     parser.add_argument("--compile-only", action="store_true")
+    parser.add_argument("--save-data", action="store_true")
+    parser.add_argument("--golden-data", type=str, default=None)
     parser.add_argument("--dump-passes", action="store_true")
     parser.add_argument("--enable-chip-swimlane", action="store_true")
     args = parser.parse_args()
@@ -2134,6 +2469,8 @@ if __name__ == "__main__":
         fn=prefill_cp_hca_test,
         specs=build_tensor_specs(args.cp),
         golden_fn=golden_prefill_cp_hca,
+        golden_data=args.golden_data,
+        save_data=args.save_data,
         compile_only=args.compile_only,
         config=dict(
             distributed_config=DistributedConfig(
@@ -2142,6 +2479,7 @@ if __name__ == "__main__":
             dump_passes=args.dump_passes,
             platform=args.platform,
             enable_chip_swimlane=args.enable_chip_swimlane,
+            ring_heap=PREFILL_CP_HCA_RING_HEAP,
         ),
         rtol=1e-2,
         atol=1e-2,
