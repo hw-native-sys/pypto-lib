@@ -207,6 +207,26 @@ def attention_swa(
     return x_out
 
 
+@pl.jit.inline
+def clear_swa_oproj_signals(
+    completion_anchor: pl.Tensor[[T, HC_MULT, D], pl.FP32],
+    reduce_signal: pld.DistributedTensor[[OPROJ_N_RANKS, 1], pl.INT32],
+    sync_signal: pld.DistributedTensor[[OPROJ_N_RANKS, 1], pl.INT32],
+):
+    """Clear this rank's o-projection counters after its last SWA layer.
+
+    The signals are monotonic within a dispatch, so one window carries every
+    layer and the caller resets it once -- after the output that proves every
+    peer's final notify was observed.
+    """
+    with pl.at(level=pl.Level.CORE_GROUP, name_hint="oproj_signal_clear"):
+        _completion_anchor = pl.read(completion_anchor, [0, 0, 0])
+        zero = pl.cast(0, pl.INT32)
+        for src in pl.range(OPROJ_N_RANKS):
+            pl.write(reduce_signal, [src, 0], zero)
+            pl.write(sync_signal, [src, 0], zero)
+
+
 @pl.jit
 def attention_swa_test(
     x_hc: pl.Tensor[[T, HC_MULT, D], pl.FP32],
@@ -232,11 +252,17 @@ def attention_swa_test(
     position_ids: pl.Tensor[[T], pl.INT32],
     # sparse_attn
     attn_sink: pl.Tensor[[H], pl.FP32],
-    # o_proj
-    wo_a: pl.Tensor[[O_GROUPS, O_LORA, O_GROUP_IN], pl.BF16],
-    wo_b: pl.Tensor[[D, O_GROUPS * O_LORA], pl.INT8],
+    # o_proj, sharded one group per card
+    wo_a_shard: pl.Tensor[[1, O_LORA, O_GROUP_IN], pl.BF16],
+    wo_b_shard: pl.Tensor[[D, O_LORA], pl.INT8],
     wo_b_scale: pl.Tensor[[D], pl.FP32],
     x_out: pl.Out[pl.Tensor[[T, HC_MULT, D], pl.FP32]],
+    reduce_window: pld.DistributedTensor[[OPROJ_REDUCE_ROWS, D], pl.FP32],
+    scale_window: pld.DistributedTensor[[OPROJ_SCALE_ROWS, 1], pl.FP32],
+    reduce_signal: pld.DistributedTensor[[OPROJ_N_RANKS, 1], pl.INT32],
+    sync_signal: pld.DistributedTensor[[OPROJ_N_RANKS, 1], pl.INT32],
+    my_rank: pl.Scalar[pl.INT32],
+    oproj_epoch: pl.Scalar[pl.INT32],
 ):
     attention_swa(
         x_hc,
@@ -246,10 +272,62 @@ def attention_swa_test(
         freqs_cos, freqs_sin,
         kv_cache, swa_slot_mapping, swa_indices, swa_lens, position_ids,
         attn_sink,
-        wo_a, wo_b, wo_b_scale,
+        wo_a_shard, wo_b_shard, wo_b_scale,
         x_out,
+        reduce_window, scale_window, reduce_signal, sync_signal,
+        my_rank, oproj_epoch,
     )
+    clear_swa_oproj_signals(x_out, reduce_signal, sync_signal)
     return x_out
+
+
+@pl.jit.host
+def l3_attention_swa(
+    x_hc: pl.Tensor[[OPROJ_N_RANKS, T, HC_MULT, D], pl.FP32],
+    hc_attn_fn: pl.Tensor[[OPROJ_N_RANKS, MIX_HC, HC_DIM], pl.FP32],
+    hc_attn_scale: pl.Tensor[[OPROJ_N_RANKS, 3], pl.FP32],
+    hc_attn_base: pl.Tensor[[OPROJ_N_RANKS, MIX_HC], pl.FP32],
+    attn_norm_w: pl.Tensor[[OPROJ_N_RANKS, D], pl.BF16],
+    wq_a: pl.Tensor[[OPROJ_N_RANKS, D, Q_LORA], pl.BF16],
+    wq_b: pl.Tensor[[OPROJ_N_RANKS, Q_LORA, H * HEAD_DIM], pl.INT8],
+    wq_b_scale: pl.Tensor[[OPROJ_N_RANKS, H * HEAD_DIM], pl.FP32],
+    wkv: pl.Tensor[[OPROJ_N_RANKS, D, HEAD_DIM], pl.BF16],
+    gamma_cq: pl.Tensor[[OPROJ_N_RANKS, Q_LORA], pl.BF16],
+    gamma_ckv: pl.Tensor[[OPROJ_N_RANKS, HEAD_DIM], pl.BF16],
+    freqs_cos: pl.Tensor[[OPROJ_N_RANKS, MAX_SEQ_LEN, ROPE_HEAD_DIM], pl.BF16],
+    freqs_sin: pl.Tensor[[OPROJ_N_RANKS, MAX_SEQ_LEN, ROPE_HEAD_DIM], pl.BF16],
+    kv_cache: pl.InOut[pl.Tensor[[OPROJ_N_RANKS, ORI_BLOCK_NUM_DYN, BLOCK_SIZE, 1, HEAD_DIM], pl.BF16]],
+    swa_slot_mapping: pl.Tensor[[OPROJ_N_RANKS, T], pl.INT64],
+    swa_indices: pl.Tensor[[OPROJ_N_RANKS, T, WIN], pl.INT32],
+    swa_lens: pl.Tensor[[OPROJ_N_RANKS, T], pl.INT32],
+    position_ids: pl.Tensor[[OPROJ_N_RANKS, T], pl.INT32],
+    attn_sink: pl.Tensor[[OPROJ_N_RANKS, H], pl.FP32],
+    wo_a_shard: pl.Tensor[[OPROJ_N_RANKS, 1, O_LORA, O_GROUP_IN], pl.BF16],
+    wo_b_shard: pl.Tensor[[OPROJ_N_RANKS, D, O_LORA], pl.INT8],
+    wo_b_scale: pl.Tensor[[OPROJ_N_RANKS, D], pl.FP32],
+    x_out: pl.Out[pl.Tensor[[OPROJ_N_RANKS, T, HC_MULT, D], pl.FP32]],
+):
+    """One orchestration per card, sharing the reduce and signal windows."""
+    reduce_window_buf = pld.alloc_window_buffer([OPROJ_REDUCE_ROWS, D], dtype=pl.FP32)
+    scale_window_buf = pld.alloc_window_buffer([OPROJ_SCALE_ROWS, 1], dtype=pl.FP32)
+    reduce_signal_buf = pld.alloc_window_buffer([OPROJ_N_RANKS, 1], dtype=pl.INT32)
+    sync_signal_buf = pld.alloc_window_buffer([OPROJ_N_RANKS, 1], dtype=pl.INT32)
+
+    for r in pl.range(pld.world_size()):
+        reduce_window = pld.window(reduce_window_buf, [OPROJ_REDUCE_ROWS, D], dtype=pl.FP32)
+        scale_window = pld.window(scale_window_buf, [OPROJ_SCALE_ROWS, 1], dtype=pl.FP32)
+        reduce_signal = pld.window(reduce_signal_buf, [OPROJ_N_RANKS, 1], dtype=pl.INT32)
+        sync_signal = pld.window(sync_signal_buf, [OPROJ_N_RANKS, 1], dtype=pl.INT32)
+        attention_swa_test(
+            x_hc[r], hc_attn_fn[r], hc_attn_scale[r], hc_attn_base[r],
+            attn_norm_w[r], wq_a[r], wq_b[r], wq_b_scale[r], wkv[r],
+            gamma_cq[r], gamma_ckv[r], freqs_cos[r], freqs_sin[r],
+            kv_cache[r], swa_slot_mapping[r], swa_indices[r], swa_lens[r], position_ids[r],
+            attn_sink[r],
+            wo_a_shard[r], wo_b_shard[r], wo_b_scale[r], x_out[r],
+            reduce_window, scale_window, reduce_signal, sync_signal,
+            r, OPROJ_FIRST_EPOCH, device=r,
+        )
 
 
 def golden_attention_swa(tensors):
@@ -502,14 +580,79 @@ def build_tensor_specs(start_pos=None):
     ]
 
 
+def build_l3_tensor_specs(start_pos=None):
+    """The single-card SWA fixture, replicated per rank, with the o-proj weights sharded.
+
+    `run_jit` binds specs positionally, so the two shards must sit exactly where
+    `wo_a` / `wo_b` sat in the replicated list.
+    """
+    import torch
+    from golden import TensorSpec
+
+    base = build_tensor_specs(start_pos)
+    wo_a = next(s for s in base if s.name == "wo_a").init_value()
+    wo_b = next(s for s in base if s.name == "wo_b").init_value()
+
+    def ranked(spec):
+        init = spec.init_value
+        stacked = None if init is None else (lambda f=init: torch.stack([f()] * OPROJ_N_RANKS, dim=0))
+        if spec.is_output:
+            # An in-out (kv_cache) keeps its seed as well as its output role.
+            return TensorSpec(spec.name, [OPROJ_N_RANKS] + list(spec.shape), spec.dtype,
+                              init_value=stacked, is_output=True)
+        return TensorSpec(
+            spec.name, [OPROJ_N_RANKS] + list(spec.shape), spec.dtype,
+            init_value=stacked, resident=spec.resident)
+
+    out = []
+    for spec in base:
+        if spec.name == "wo_a":
+            # Card r carries group r's proj_a rows only.
+            out.append(TensorSpec(
+                "wo_a_shard", [OPROJ_N_RANKS, 1, O_LORA, O_GROUP_IN], torch.bfloat16,
+                init_value=lambda: torch.stack(
+                    [wo_a[r:r + 1] for r in range(OPROJ_N_RANKS)], dim=0),
+                resident="stacked"))
+        elif spec.name == "wo_b":
+            # ... and proj_b's matching O_LORA column band.
+            out.append(TensorSpec(
+                "wo_b_shard", [OPROJ_N_RANKS, D, O_LORA], torch.int8,
+                init_value=lambda: torch.stack(
+                    [wo_b[:, r * O_LORA:(r + 1) * O_LORA] for r in range(OPROJ_N_RANKS)], dim=0),
+                resident="stacked"))
+        else:
+            out.append(ranked(spec))
+    return out
+
+
+def golden_attention_swa_l3(tensors):
+    """Per-rank golden: rebuild the full weights from the shards, then reuse the layer's."""
+    import torch
+
+    wo_a = torch.cat([tensors["wo_a_shard"][r] for r in range(OPROJ_N_RANKS)], dim=0)
+    wo_b = torch.cat([tensors["wo_b_shard"][r] for r in range(OPROJ_N_RANKS)], dim=1)
+    for r in range(OPROJ_N_RANKS):
+        per_rank = {k: (v[r] if k not in ("wo_a_shard", "wo_b_shard") else v)
+                    for k, v in tensors.items()}
+        per_rank["wo_a"] = wo_a
+        per_rank["wo_b"] = wo_b
+        golden_attention_swa(per_rank)
+        for k, v in per_rank.items():
+            if k in tensors and k not in ("wo_a", "wo_b", "wo_a_shard", "wo_b_shard"):
+                tensors[k][r] = v
+
+
 if __name__ == "__main__":
     import argparse
     from golden import ratio_allclose, ratio_reldiff, run_jit
+    from pypto.ir.distributed_compiled_program import DistributedConfig
 
     parser = argparse.ArgumentParser()
     parser.add_argument("-p", "--platform", type=str, default="a2a3",
                         choices=["a2a3", "a2a3sim", "a5", "a5sim"])
-    parser.add_argument("-d", "--device", type=int, default=0)
+    parser.add_argument("-d", "--device", type=str,
+                        default=",".join(str(i) for i in range(OPROJ_N_RANKS)),
+                        help=f"comma-separated device ids; need at least {OPROJ_N_RANKS}")
     parser.add_argument("--start-pos", type=int, default=None,
                         help="Uniform fixture-only start_pos override for all batches; "
                              "default (unset) uses the canonical per-batch SWA set that includes the 8k point.")
@@ -520,17 +663,23 @@ if __name__ == "__main__":
     parser.add_argument("--compile-only", action="store_true", default=False)
     args = parser.parse_args()
 
+    device_ids = [int(d) for d in args.device.split(",")]
+    assert len(device_ids) >= OPROJ_N_RANKS, f"need at least {OPROJ_N_RANKS} devices, got {device_ids}"
+
     result = run_jit(
         compile_only=args.compile_only,
-        fn=attention_swa_test,
-        specs=build_tensor_specs(args.start_pos),
-        golden_fn=golden_attention_swa,
+        fn=l3_attention_swa,
+        specs=build_l3_tensor_specs(args.start_pos),
+        golden_fn=golden_attention_swa_l3,
         runtime_dir=args.runtime_dir,
         golden_data=args.golden_data,
-        compile_cfg=dict(dump_passes=args.dump_passes),
+        compile_cfg=dict(
+            dump_passes=args.dump_passes,
+            distributed_config=DistributedConfig(
+                device_ids=device_ids[:OPROJ_N_RANKS], num_sub_workers=0),
+        ),
         runtime_cfg=dict(
             platform=args.platform,
-            device_id=args.device,
             enable_chip_swimlane=args.enable_chip_swimlane,
         ),
         rtol=1e-2,

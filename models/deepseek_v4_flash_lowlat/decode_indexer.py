@@ -379,6 +379,12 @@ def indexer(
     return score, topk_idxs
 
 
+# Token this standalone entry scores. The indexer is token-sharded -- card `my_rank`
+# scores token `my_rank` only -- so a single-card run covers exactly one token, and
+# the golden below masks the rest to the untouched contract (score NEG_INF, idx -1).
+TEST_MY_RANK = 0
+
+
 @pl.jit
 def indexer_test(
     x: pl.Tensor[[B, S, D], pl.BF16],
@@ -443,6 +449,7 @@ def indexer_test(
         kv_seq_lens,
         offset,
         late_dep,
+        TEST_MY_RANK,
     )
     return score, idx_kv_cache, idx_kv_scale, topk_idxs
 
@@ -577,6 +584,15 @@ def golden_indexer(tensors):
             _, idx = score[s, :visible_len].topk(k, dim=-1)
             topk_idxs[b, s, :k] = idx.to(torch.int32)
             topk_idxs[b, s, :k] += offset
+
+    # One card scores one token: every row but TEST_MY_RANK's keeps the untouched
+    # contract -- score stays NEG_INF (which score_valid_compare then skips) and
+    # topk_idxs stays at the -1 the kernel's topk_init writes.
+    keep = torch.zeros(bsz * seqlen, dtype=torch.bool)
+    keep[TEST_MY_RANK] = True
+    keep = keep.view(bsz, seqlen, 1)
+    score_full = torch.where(keep, score_full, torch.full_like(score_full, FP32_NEG_INF))
+    topk_idxs = torch.where(keep, topk_idxs, torch.full_like(topk_idxs, -1))
 
     tensors["score"][:] = score_full
 
