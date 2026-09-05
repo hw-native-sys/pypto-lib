@@ -111,10 +111,7 @@ def hc_pre(
             k0 = k_base + kb * LINEAR_K_TILE
             x_linear_chunk = pl.slice(x_flat, [LINEAR_T_TILE, LINEAR_K_TILE], [t0, k0], valid_shape=[t_rows, LINEAR_K_TILE])
             w_chunk = pl.slice(hc_fn, [MIX_PAD, LINEAR_K_TILE], [0, k0], valid_shape=[MIX_HC, LINEAR_K_TILE])
-            if kb == 0:
-                acc = pl.matmul(x_linear_chunk, w_chunk, b_trans=True, out_dtype=pl.FP32)
-            else:
-                acc = pl.matmul_acc(acc, x_linear_chunk, w_chunk, b_trans=True)
+            acc = pl.matmul_acc(acc, x_linear_chunk, w_chunk, b_trans=True, init_cond=(kb == 0))
         partial_row0 = linear_split * t_linear + t0
         mixes_partials[partial_row0 : partial_row0 + LINEAR_T_TILE, 0:MIX_PAD] = acc
 

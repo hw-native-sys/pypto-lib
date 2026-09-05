@@ -192,15 +192,8 @@ def lm_head(
             # so the accumulator keeps one shape for every iteration.
             mm_valid_n = pl.min(VOCAB_PER_TP - mm_o0, FUSED_VOCAB_TILE)
             # M is the full group extent -- one matmul per vocab tile.
-            mm_hidden0 = owner_hiddens[:, 0:FUSED_K_TILE]
-            mm_weight0 = pl.slice(
-                lm_head_weight,
-                [FUSED_VOCAB_TILE, FUSED_K_TILE],
-                [mm_o0, 0],
-                valid_shape=[mm_valid_n, FUSED_K_TILE],
-            )
-            mm_acc = pl.matmul(mm_hidden0, mm_weight0, b_trans=True, out_dtype=pl.FP32)
-            for mm_kb in pl.pipeline(1, D // FUSED_K_TILE, stage=2):
+            mm_acc = pl.create_tensor([GROUP_LOGIT_ROWS, FUSED_VOCAB_TILE], dtype=pl.FP32)
+            for mm_kb in pl.pipeline(0, D // FUSED_K_TILE, stage=2):
                 mm_k0 = mm_kb * FUSED_K_TILE
                 mm_hidden_tile = owner_hiddens[:, mm_k0 : mm_k0 + FUSED_K_TILE]
                 mm_weight_tile = pl.slice(
@@ -209,7 +202,9 @@ def lm_head(
                     [mm_o0, mm_k0],
                     valid_shape=[mm_valid_n, FUSED_K_TILE],
                 )
-                mm_acc = pl.matmul_acc(mm_acc, mm_hidden_tile, mm_weight_tile, b_trans=True)
+                mm_acc = pl.matmul_acc(
+                    mm_acc, mm_hidden_tile, mm_weight_tile, b_trans=True, init_cond=(mm_kb == 0)
+                )
 
             # Columns must be fully valid across the C->V crossing: the boundary
             # transports the full box and rejects a runtime-valued column extent.

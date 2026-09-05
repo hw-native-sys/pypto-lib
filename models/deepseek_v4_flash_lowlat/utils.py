@@ -533,3 +533,37 @@ def quant_w_per_channel(w: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
     scaled = w.float() * scale_quant.unsqueeze(-1)
     w_i8 = torch.round(scaled).to(torch.int32).to(torch.float16).to(torch.int8)
     return w_i8, (1.0 / scale_quant).float()
+
+
+def gen_shared_weight(shape, dequant_std, chan_cv):
+    """Synthesize a shared-expert per-channel-symmetric INT8 weight + FP32 scale by
+    simulating the real DeepSeek-V4-Flash MXFP8 shared-expert quant grid (e4m3, 128x128-block
+    E8M0 scale), then re-quantizing per-output-channel. Unlike routed (MXFP4 -> ~37 discrete
+    levels), shared stays near-Gaussian (~200 levels). The coarse 128-block scale does NOT
+    flatten the real per-output-channel magnitude spread, so ``chan_cv`` (log-space source-gain
+    std) injects it to reproduce the real INT8 scale CV (~0.5 gate/up, ~0.35 down). Per-output-
+    channel INT8 is scale-invariant, so the grid sets the level shape and ``dequant_std`` only
+    sets the absolute scale magnitude. (routed experts use a different grid -- see
+    expert_routed.gen_routed_weight.)
+
+    ``shape`` last dim = reduction (in) dim; leading dims map to the per-output-channel
+    scale shape ([out, in] -> scale [out]).
+    """
+    import torch
+
+    FP8_MAX, TINY = 448.0, 1e-20
+
+    def sim_fp8(W, block=128):   # e4m3 + 128x128-block E8M0 (round-up) scale on (out, in)
+        out, inn = W.shape
+        Wb = W.reshape(out // block, block, inn // block, block)
+        scale = torch.exp2(torch.ceil(torch.log2((Wb.abs().amax(dim=(1, 3), keepdim=True) / FP8_MAX).clamp_min(TINY))))
+        q = (Wb / scale).to(torch.float8_e4m3fn).float() * scale
+        return q.reshape(out, inn)
+
+    W = torch.randn(*shape) * torch.exp(chan_cv * torch.randn(*shape[:-1], 1))  # per-channel gain
+    Wq = sim_fp8(W)
+    amax = Wq.abs().amax(dim=-1, keepdim=True).clamp_min(INT8_AMAX_EPS)
+    scale = amax / INT8_SCALE_MAX
+    w_i8 = torch.round(Wq / scale).clamp_(-INT8_SCALE_MAX, INT8_SCALE_MAX).to(torch.int8)
+    scale = (scale * (dequant_std / (w_i8.float() * scale).std())).squeeze(-1).float()
+    return w_i8, scale

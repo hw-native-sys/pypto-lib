@@ -41,7 +41,7 @@ IDX_PAD = 8  # INT32 tile width: a vector fill needs a 32-byte row
 # runs the same INT8 SwiGLU FFN over the same intermediate slice, and its output
 # is summed into the same TP partial. So it becomes expert ``SHARED_EID`` of an
 # extended weight bank, routed to one extra slot past the routing table's last
-# with every row weighted 1.0 -- and ``expert_shared.py``'s separate task chain
+# with every row weighted 1.0 -- and a separate shared-expert task chain
 # disappears. Routing can fill at most ``T * TOPK`` slots, so ``SH_SLOT`` is
 # never claimed by a routed expert.
 SHARED_EID = N_EXPERTS
@@ -389,7 +389,7 @@ def gen_routed_weight(shape, dequant_std):
     per-channel scale CV ~0.09 (the fine group scale flattens it). Per-output-channel INT8 is
     scale-invariant, so the level structure / zero spike emerge from the grid alone and
     ``dequant_std`` only sets the absolute scale magnitude. (shared experts use a different
-    grid -- see expert_shared.gen_shared_weight.)
+    grid -- see utils.gen_shared_weight.)
 
     ``shape`` last dim = reduction (in) dim; leading dims map to the per-output-channel
     scale shape ([E, out, in] -> scale [E, out]).
@@ -510,7 +510,8 @@ def build_tensor_specs(merged=False):
     # Only the slot experts are ever read, so synthesize N_SLOTS weight sets and
     # scatter them into the full expert bank; the rest stay zero.
     def scatter_bank(shape_tail, dequant_std, shared_dequant_std, chan_cv):
-        from expert_shared import gen_shared_weight
+        from utils import gen_shared_weight
+
         w_i8, w_s = gen_routed_weight((N_SLOTS, *shape_tail), dequant_std)
         bank_i8 = torch.zeros(n_bank, *shape_tail, dtype=torch.int8)
         bank_s = torch.zeros(n_bank, shape_tail[0], dtype=torch.float32)

@@ -17,8 +17,7 @@ The shared expert is not a separate stage. It runs the same INT8 SwiGLU FFN over
 the same intermediate slice, on the same tokens, into the same TP partial -- so
 ``route_group`` gives it slot ``SH_SLOT`` at weight 1.0 and the routed-expert
 kernel computes it as expert ``SHARED_EID`` of an ``N_BANK`` bank.
-``expert_shared.py`` is no longer on this path; it stays in the tree as the
-standalone reference for that FFN.
+Shared-expert fixture weights use the host utility ``utils.gen_shared_weight``.
 """
 
 import pypto.language as pl
@@ -582,7 +581,7 @@ def build_tensor_specs(layer_id=0, num_tokens=T):
     import torch
     from golden import ScalarSpec, TensorSpec
     from expert_routed import gen_routed_weight
-    from expert_shared import gen_shared_weight
+    from utils import gen_shared_weight
 
     # Routed = MXFP4 (gen_routed_weight), shared = MXFP8 (gen_shared_weight). This
     # is an integration test whose x_next-equivalent output is dominated by near-zero
