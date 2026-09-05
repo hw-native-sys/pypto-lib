@@ -375,6 +375,10 @@ def qkv_proj_rope(
     return q
 
 
+# Head group this standalone entry exercises; the layer drivers pass my_rank * Q_HEADS_LOCAL.
+TEST_Q_HEAD_BASE = 0
+
+
 @pl.jit
 def qkv_proj_rope_test(
     x: pl.Tensor[[T_DYN, D], pl.BF16],
@@ -401,6 +405,9 @@ def qkv_proj_rope_test(
 
     # Standalone: no rms_norm producer, so the barrier fences nothing (ready on submit).
     late_dep = pl.system.task_dummy(deps=[])
+    # One card's head shard. The kernel is head-sharded and writes only
+    # q[:, q_head_base : q_head_base + Q_HEADS_LOCAL]; this entry models group 0,
+    # and the golden leaves the other groups' heads at their zero init.
     qkv_proj_rope(
         x,
         wq_a,
@@ -416,6 +423,7 @@ def qkv_proj_rope_test(
         qr,
         qr_scale,
         late_dep,
+        TEST_Q_HEAD_BASE,
     )
     return q
 
@@ -480,7 +488,12 @@ def golden_qkv_proj_rope(tensors):
     kv_rope = apply_rope(kv_rope_in, rope_cos, rope_sin).squeeze(1)
     kv_out = torch.cat([kv_nope, kv_rope], dim=-1)
 
-    tensors["q"][:]  = q_out.to(torch.bfloat16)
+    # The kernel writes one head group only; the rest of q keeps its zero init.
+    q_out_sharded = torch.zeros_like(q_out)
+    h0 = TEST_Q_HEAD_BASE
+    q_out_sharded[:, h0 : h0 + Q_HEADS_LOCAL] = q_out[:, h0 : h0 + Q_HEADS_LOCAL]
+
+    tensors["q"][:]  = q_out_sharded.to(torch.bfloat16)
     tensors["kv"][:] = kv_out.to(torch.bfloat16)
     tensors["qr"][:] = qr_i8
     tensors["qr_scale"][:] = qr_scale
