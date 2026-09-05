@@ -253,16 +253,24 @@ it as `merged_swimlane_<timestamp>.json`. Three variants of the same layer are
 then three identical-looking directories, and a week later nobody can tell the
 SWA capture from the HCA one. Before handing a trace over:
 
-- **Rename the directory and the files to name the case**, keeping the
-  timestamp: `traces/hca_layer3_<timestamp>/`, with each rank's swimlane as
-  `hca_layer3_rank<N>_swimlane.json`. Nothing inside a capture references its
-  own directory name, so the rename is safe -- but a renamed directory is no
-  longer usable as `--runtime-dir`, so rename only captures kept for reading.
+- **Rename the directory to name the case**, keeping the timestamp:
+  `traces/hca_layer3_<timestamp>/`. Nothing inside a capture references its own
+  directory name, so this is safe -- but a renamed directory is no longer usable
+  as `--runtime-dir`, so rename only captures kept for reading.
+- **Never rename the files themselves -- symlink them.** The harness filenames
+  are a contract: `swimlane_converter`, `--chip-swimlane-records-json`, and the
+  VS Code swimlane viewer all open `chip_swimlane_records.json` by that exact
+  name. Leave the real files alone and add readable aliases beside them
+  (`<case>_rank<N>_swimlane.json` -> `merged_swimlane_<ts>.json`,
+  `<case>_rank<N>_chip_records.json` -> `chip_swimlane_records.json`).
+- **Keep both viewer entry points.** The merged swimlane is the Perfetto file;
+  `chip_swimlane_records.json` is what the VS Code viewer reads directly. Ship
+  the pair, not just the merged one.
 - **Symlink the fastest rank**, because that is the rank the report quotes and
   the only one whose span is mostly kernel time. Point a `fastest_rank` link at
-  its `d0/` directory and a `<case>_fastest_swimlane.json` link at its trace, so
-  the reader opens the right file without first working out which rank to trust.
-  Identify it by span (`max(ts + dur) - min(ts)` over the `X` events), not by
-  rank index.
+  its `d0/` directory, and a `<case>_fastest_swimlane.json` plus
+  `<case>_fastest_chip_records.json` at its two traces, so the reader opens the
+  right file without first working out which rank to trust. Identify it by span
+  (`max(ts + dur) - min(ts)` over the `X` events), not by rank index.
 - **Leave a `README.md` beside the set** giving the platform, the revision, the
   command that regenerates it, and the per-rank spans.
