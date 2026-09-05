@@ -244,3 +244,25 @@ that closed, a lane that emptied), not only what changed in the numbers.
 This is the report, not the log entry. The lesson still goes to
 [`optimization-lessons.md`](optimization-lessons.md)'s file; these three parts
 are what the user reads at the moment the attempt is decided.
+
+### Hand a trace over renamed, not as the harness left it
+
+The compile directory is named after the *entry point*, so every decode-layer
+capture lands as `_jit_l3_decode_layer_<timestamp>/` and every swimlane inside
+it as `merged_swimlane_<timestamp>.json`. Three variants of the same layer are
+then three identical-looking directories, and a week later nobody can tell the
+SWA capture from the HCA one. Before handing a trace over:
+
+- **Rename the directory and the files to name the case**, keeping the
+  timestamp: `traces/hca_layer3_<timestamp>/`, with each rank's swimlane as
+  `hca_layer3_rank<N>_swimlane.json`. Nothing inside a capture references its
+  own directory name, so the rename is safe -- but a renamed directory is no
+  longer usable as `--runtime-dir`, so rename only captures kept for reading.
+- **Symlink the fastest rank**, because that is the rank the report quotes and
+  the only one whose span is mostly kernel time. Point a `fastest_rank` link at
+  its `d0/` directory and a `<case>_fastest_swimlane.json` link at its trace, so
+  the reader opens the right file without first working out which rank to trust.
+  Identify it by span (`max(ts + dur) - min(ts)` over the `X` events), not by
+  rank index.
+- **Leave a `README.md` beside the set** giving the platform, the revision, the
+  command that regenerates it, and the per-rank spans.
