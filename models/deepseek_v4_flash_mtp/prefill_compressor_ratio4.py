@@ -97,12 +97,8 @@ def compressor_ratio4(
             # long bursts) instead of ND2NZ (strided short bursts). Matches ratio4/CSA/HCA layout.
             wkv_tile = wkv[o0 : o0 + OUT_TILE, k0 : k0 + K_TILE]
             wgate_tile = wgate[o0 : o0 + OUT_TILE, k0 : k0 + K_TILE]
-            if k0 == 0:
-                kv_acc = pl.matmul(x_tile, wkv_tile, out_dtype=pl.FP32, b_trans=True)
-                score_acc = pl.matmul(x_tile, wgate_tile, out_dtype=pl.FP32, b_trans=True)
-            else:
-                kv_acc = pl.matmul_acc(kv_acc, x_tile, wkv_tile, b_trans=True)
-                score_acc = pl.matmul_acc(score_acc, x_tile, wgate_tile, b_trans=True)
+            kv_acc = pl.matmul_acc(kv_acc, x_tile, wkv_tile, b_trans=True, init_cond=(k0 == 0))
+            score_acc = pl.matmul_acc(score_acc, x_tile, wgate_tile, b_trans=True, init_cond=(k0 == 0))
         cmp4_kv_proj_scratch[0:T, o0 : o0 + OUT_TILE] = kv_acc
         cmp4_score_proj_scratch[0:T, o0 : o0 + OUT_TILE] = score_acc
 

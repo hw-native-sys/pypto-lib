@@ -148,10 +148,7 @@ def prefill_indexer(
             q0 = kb * Q_TILE
             qr_tile = qr[:, q0 : q0 + Q_TILE]
             wq_tile = wq_b[q0 : q0 + Q_TILE, o0 : o0 + Q_OUT_TILE]
-            if q0 == 0:
-                qr_acc = pl.matmul(qr_tile, wq_tile, out_dtype=pl.INT32)
-            else:
-                qr_acc = pl.matmul_acc(qr_acc, qr_tile, wq_tile)
+            qr_acc = pl.matmul_acc(qr_acc, qr_tile, wq_tile, init_cond=(q0 == 0))
         wq_scale = pl.reshape(wq_b_scale[o0 : o0 + Q_OUT_TILE], [1, Q_OUT_TILE])
         for r0 in pl.range(0, T, QR_PROJ_ROW_TILE):
             acc_fp32 = pl.cast(qr_acc[r0 : r0 + QR_PROJ_ROW_TILE, :], target_type=pl.FP32, mode="none")
@@ -255,10 +252,7 @@ def prefill_indexer(
             d0 = db * D_TILE
             x_tile = x[wrow0 : wrow0 + WEIGHTS_ROW_TILE, d0 : d0 + D_TILE]
             wp_tile = weights_proj[d0 : d0 + D_TILE, :]
-            if d0 == 0:
-                weights_acc = pl.matmul(x_tile, wp_tile, out_dtype=pl.FP32)
-            else:
-                weights_acc = pl.matmul_acc(weights_acc, x_tile, wp_tile)
+            weights_acc = pl.matmul_acc(weights_acc, x_tile, wp_tile, init_cond=(d0 == 0))
         weights[wrow0 : wrow0 + WEIGHTS_ROW_TILE, :] = pl.mul(weights_acc, WEIGHTS_SCALE)
 
     # === inner compressor: build the paged compressed index KV cache ===
@@ -394,10 +388,7 @@ def _prefill_indexer_cp_score_topk(
             q0 = kb * Q_TILE
             qr_tile = qr[:, q0 : q0 + Q_TILE]
             wq_tile = wq_b[q0 : q0 + Q_TILE, o0 : o0 + Q_OUT_TILE]
-            if q0 == 0:
-                qr_acc = pl.matmul(qr_tile, wq_tile, out_dtype=pl.INT32)
-            else:
-                qr_acc = pl.matmul_acc(qr_acc, qr_tile, wq_tile)
+            qr_acc = pl.matmul_acc(qr_acc, qr_tile, wq_tile, init_cond=(q0 == 0))
         wq_scale = pl.reshape(wq_b_scale[o0 : o0 + Q_OUT_TILE], [1, Q_OUT_TILE])
         for r0 in pl.range(0, T, QR_PROJ_ROW_TILE):
             qr_acc_tile = qr_acc[r0 : r0 + QR_PROJ_ROW_TILE, :]
@@ -499,10 +490,7 @@ def _prefill_indexer_cp_score_topk(
             d0 = db * D_TILE
             x_tile = x[wrow0 : wrow0 + WEIGHTS_ROW_TILE, d0 : d0 + D_TILE]
             wp_tile = weights_proj[d0 : d0 + D_TILE, :]
-            if d0 == 0:
-                weights_acc = pl.matmul(x_tile, wp_tile, out_dtype=pl.FP32)
-            else:
-                weights_acc = pl.matmul_acc(weights_acc, x_tile, wp_tile)
+            weights_acc = pl.matmul_acc(weights_acc, x_tile, wp_tile, init_cond=(d0 == 0))
         weights[wrow0 : wrow0 + WEIGHTS_ROW_TILE, :] = pl.mul(weights_acc, WEIGHTS_SCALE)
 
     # Score paged INT8 cache rows.

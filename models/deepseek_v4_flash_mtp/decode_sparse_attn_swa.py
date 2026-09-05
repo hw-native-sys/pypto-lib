@@ -309,14 +309,12 @@ def sparse_attn_swa(
                          allow_early_resolve=True) as pa_tid:
                 nf = pl.tile.get_block_idx()
                 n0 = nf * PROJ_A_MM_N_TILE
-                xa0_chunk = pl.slice(o_packed, [MM_T_TILE, A_K_TILE], [row_base_o, 0], valid_shape=[T, A_K_TILE])
-                wa0_chunk = wo_a[g : g + 1, n0 : n0 + PROJ_A_MM_N_TILE, 0:A_K_TILE]
-                acc_a = pl.matmul(xa0_chunk, wa0_chunk, b_trans=True, out_dtype=pl.FP32)
-                for kb in pl.pipeline(1, O_GROUP_IN // A_K_TILE, stage=2):
+                acc_a = pl.create_tensor([1, MM_T_TILE, PROJ_A_MM_N_TILE], dtype=pl.FP32)
+                for kb in pl.pipeline(0, O_GROUP_IN // A_K_TILE, stage=2):
                     k0 = kb * A_K_TILE
                     xa_k_chunk = pl.slice(o_packed, [MM_T_TILE, A_K_TILE], [row_base_o, k0], valid_shape=[T, A_K_TILE])
                     wa_k_chunk = wo_a[g : g + 1, n0 : n0 + PROJ_A_MM_N_TILE, k0 : k0 + A_K_TILE]
-                    acc_a = pl.matmul_acc(acc_a, xa_k_chunk, wa_k_chunk, b_trans=True)
+                    acc_a = pl.matmul_acc(acc_a, xa_k_chunk, wa_k_chunk, b_trans=True, init_cond=(kb == 0))
                 # acc_a is 3D (wo_a keeps its group axis), which subscript-write cannot express.
                 o_r_pad = pl.assemble(o_r_pad, acc_a, [0, out_col_g + n0])
 
@@ -353,14 +351,9 @@ def sparse_attn_swa(
                     acc_b = pl.create_tensor([MM_T_TILE, PROJ_B_MM_N_TILE], dtype=pl.INT32)
                     for kb in pl.pipeline(0, O_LORA // B_K_TILE, stage=2):
                         k0 = col_g + kb * B_K_TILE
-                        if kb == 0:
-                            b_act = o_r_i8_pad[:, col_g : col_g + B_K_TILE]
-                            b_weight = wo_b[n0 : n0 + PROJ_B_MM_N_TILE, col_g : col_g + B_K_TILE]
-                            acc_b = pl.matmul(b_act, b_weight, b_trans=True, out_dtype=pl.INT32)
-                        else:
-                            b_act = o_r_i8_pad[:, k0 : k0 + B_K_TILE]
-                            b_weight = wo_b[n0 : n0 + PROJ_B_MM_N_TILE, k0 : k0 + B_K_TILE]
-                            acc_b = pl.matmul_acc(acc_b, b_act, b_weight, b_trans=True)
+                        b_act = o_r_i8_pad[:, k0 : k0 + B_K_TILE]
+                        b_weight = wo_b[n0 : n0 + PROJ_B_MM_N_TILE, k0 : k0 + B_K_TILE]
+                        acc_b = pl.matmul_acc(acc_b, b_act, b_weight, b_trans=True, init_cond=(kb == 0))
                     partials[0:MM_T_TILE, g * D + n0 : g * D + n0 + PROJ_B_MM_N_TILE] = acc_b
             proj_b_tids[g] = pb_tid
 
