@@ -88,10 +88,7 @@ def hc_head(
             k0 = k_base + kb * LINEAR_K_TILE
             x_lin = x_flat[t0 : t0 + LINEAR_T_TILE, k0 : k0 + LINEAR_K_TILE]
             w = pl.slice(hc_head_fn, [HC_PAD, LINEAR_K_TILE], [0, k0], valid_shape=[HC_MULT, LINEAR_K_TILE])
-            if kb == 0:
-                acc = pl.matmul(x_lin, w, b_trans=True, out_dtype=pl.FP32)
-            else:
-                acc = pl.matmul_acc(acc, x_lin, w, b_trans=True)
+            acc = pl.matmul_acc(acc, x_lin, w, b_trans=True, init_cond=(kb == 0))
         mixes_raw = pl.assemble(mixes_raw, acc, [t0, 0], atomic=pl.AtomicType.Add)
 
     # reduce: gate + hc mix, fanned over (token-tile x D-slice). The rsqrt/sigmoid gate is

@@ -187,27 +187,21 @@ def expert_routed_persistent_balanced(
                     flat_t0 = slot_base + t0
                     valid_rows = pl.min(RECV_TILE, n_rows - t0)
 
-                    x_k0 = pl.slice(recv_x_flat, [RECV_TILE, FUSED_K_TILE], [flat_t0, 0],
-                                    valid_shape=[valid_rows, FUSED_K_TILE])
-                    w1_k0 = w1_2d[e_w1 : e_w1 + FUSED_N_TILE, 0:FUSED_K_TILE]
-                    gate_acc = pl.matmul(x_k0, w1_k0, b_trans=True, out_dtype=pl.INT32)
-                    for kb in pl.pipeline(1, D // FUSED_K_TILE, stage=2):
+                    gate_acc = pl.create_tensor([RECV_TILE, FUSED_N_TILE], dtype=pl.INT32)
+                    for kb in pl.pipeline(0, D // FUSED_K_TILE, stage=2):
                         k0 = kb * FUSED_K_TILE
                         x_k = pl.slice(recv_x_flat, [RECV_TILE, FUSED_K_TILE], [flat_t0, k0],
                                        valid_shape=[valid_rows, FUSED_K_TILE])
                         w1_k = w1_2d[e_w1 : e_w1 + FUSED_N_TILE, k0 : k0 + FUSED_K_TILE]
-                        gate_acc = pl.matmul_acc(gate_acc, x_k, w1_k, b_trans=True)
+                        gate_acc = pl.matmul_acc(gate_acc, x_k, w1_k, b_trans=True, init_cond=(kb == 0))
 
-                    x_u0 = pl.slice(recv_x_flat, [RECV_TILE, FUSED_K_TILE], [flat_t0, 0],
-                                    valid_shape=[valid_rows, FUSED_K_TILE])
-                    w3_k0 = w3_2d[e_w1 : e_w1 + FUSED_N_TILE, 0:FUSED_K_TILE]
-                    up_acc = pl.matmul(x_u0, w3_k0, b_trans=True, out_dtype=pl.INT32)
-                    for ukb in pl.pipeline(1, D // FUSED_K_TILE, stage=2):
+                    up_acc = pl.create_tensor([RECV_TILE, FUSED_N_TILE], dtype=pl.INT32)
+                    for ukb in pl.pipeline(0, D // FUSED_K_TILE, stage=2):
                         uk0 = ukb * FUSED_K_TILE
                         x_u = pl.slice(recv_x_flat, [RECV_TILE, FUSED_K_TILE], [flat_t0, uk0],
                                        valid_shape=[valid_rows, FUSED_K_TILE])
                         w3_k = w3_2d[e_w1 : e_w1 + FUSED_N_TILE, uk0 : uk0 + FUSED_K_TILE]
-                        up_acc = pl.matmul_acc(up_acc, x_u, w3_k, b_trans=True)
+                        up_acc = pl.matmul_acc(up_acc, x_u, w3_k, b_trans=True, init_cond=(ukb == 0))
 
                     w1_sc = routed_w1_scale[eid : eid + 1, 0:FUSED_N_TILE]
                     w3_sc = routed_w3_scale[eid : eid + 1, 0:FUSED_N_TILE]
