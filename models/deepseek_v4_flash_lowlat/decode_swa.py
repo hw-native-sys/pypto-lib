@@ -46,6 +46,7 @@ S = DECODE_SEQ
 T = B * S
 EPS = M.rms_norm_eps
 D = M.hidden_size
+N_EXPERTS = M.n_routed_experts
 H = M.num_attention_heads
 HEAD_DIM = M.head_dim
 ROPE_HEAD_DIM = M.qk_rope_head_dim
@@ -93,6 +94,7 @@ OPROJ_FIRST_EPOCH = OTP.FIRST_EPOCH
 @pl.jit.inline
 def attention_swa(
     x_hc: pl.Tensor[[T, HC_MULT, D], pl.FP32],
+    gate_w: pl.Tensor[[N_EXPERTS, D], pl.FP32],
     # hc_pre weights
     hc_attn_fn: pl.Tensor[[MIX_HC, HC_DIM], pl.FP32],
     hc_attn_scale: pl.Tensor[[3], pl.FP32],
@@ -151,12 +153,15 @@ def attention_swa(
     wkv_flat = pl.reshape(wkv, [D * HEAD_DIM])
     wo_a_flat = pl.reshape(wo_a_shard, [WO_A_FLAT])
     wo_b_flat = pl.reshape(wo_b_shard, [WO_B_FLAT])
+    gate_w_flat = pl.reshape(gate_w, [N_EXPERTS * D])
     with pl.at(level=pl.Level.CORE_GROUP, name_hint="prefetch_attn_w", allow_early_resolve=True):
+        _prefetch_anchor = pl.read(x_hc, [0, 0, 0])
         warm_ctx = pl.prefetch.make_context()
         pl.prefetch.async_prefetch(wq_a_flat, warm_ctx)
         pl.prefetch.async_prefetch(wkv_flat, warm_ctx)
         pl.prefetch.async_prefetch(wo_a_flat, warm_ctx)
         pl.prefetch.async_prefetch(wo_b_flat, warm_ctx)
+        pl.prefetch.async_prefetch(gate_w_flat, warm_ctx)
     # Defers kv_proj_matmul one hop behind rms_norm so qr_proj_matmul dispatches first.
     late_dep = pl.system.task_dummy(deps=[rms_tid])
     q = pl.create_tensor([T, H, HEAD_DIM], dtype=pl.BF16)
@@ -228,6 +233,7 @@ def clear_swa_oproj_signals(
 @pl.jit
 def attention_swa_test(
     x_hc: pl.Tensor[[T, HC_MULT, D], pl.FP32],
+    gate_w: pl.Tensor[[N_EXPERTS, D], pl.FP32],
     # hc_pre weights
     hc_attn_fn: pl.Tensor[[MIX_HC, HC_DIM], pl.FP32],
     hc_attn_scale: pl.Tensor[[3], pl.FP32],
@@ -263,7 +269,7 @@ def attention_swa_test(
     oproj_epoch: pl.Scalar[pl.INT32],
 ):
     attention_swa(
-        x_hc,
+        x_hc, gate_w,
         hc_attn_fn, hc_attn_scale, hc_attn_base,
         attn_norm_w, wq_a, wq_b, wq_b_scale, wkv,
         gamma_cq, gamma_ckv,
@@ -282,6 +288,7 @@ def attention_swa_test(
 @pl.jit.host
 def l3_attention_swa(
     x_hc: pl.Tensor[[OPROJ_N_RANKS, T, HC_MULT, D], pl.FP32],
+    gate_w: pl.Tensor[[OPROJ_N_RANKS, N_EXPERTS, D], pl.FP32],
     hc_attn_fn: pl.Tensor[[OPROJ_N_RANKS, MIX_HC, HC_DIM], pl.FP32],
     hc_attn_scale: pl.Tensor[[OPROJ_N_RANKS, 3], pl.FP32],
     hc_attn_base: pl.Tensor[[OPROJ_N_RANKS, MIX_HC], pl.FP32],
@@ -317,7 +324,7 @@ def l3_attention_swa(
         reduce_signal = pld.window(reduce_signal_buf, [OPROJ_N_RANKS, 1], dtype=pl.INT32)
         sync_signal = pld.window(sync_signal_buf, [OPROJ_N_RANKS, 1], dtype=pl.INT32)
         attention_swa_test(
-            x_hc[r], hc_attn_fn[r], hc_attn_scale[r], hc_attn_base[r],
+            x_hc[r], gate_w[r], hc_attn_fn[r], hc_attn_scale[r], hc_attn_base[r],
             attn_norm_w[r], wq_a[r], wq_b[r], wq_b_scale[r], wkv[r],
             gamma_cq[r], gamma_ckv[r], freqs_cos[r], freqs_sin[r],
             kv_cache[r], swa_slot_mapping[r], swa_indices[r], swa_lens[r], position_ids[r],
@@ -552,6 +559,7 @@ def build_tensor_specs(start_pos=None):
     wo_b_i8, wo_b_scale = quant_w_per_row(wo_b_bf16)
 
     return [
+        TensorSpec("gate_w", [N_EXPERTS, D], torch.float32, init_value=lambda: torch.empty([N_EXPERTS, D], dtype=torch.float32).uniform_(-0.1, 0.1)),
         TensorSpec("x_hc", [T, HC_MULT, D], torch.float32, init_value=init_x_hc),
         TensorSpec("hc_attn_fn", [MIX_HC, HC_DIM], torch.float32, init_value=init_hc_attn_fn),
         TensorSpec("hc_attn_scale", [3], torch.float32, init_value=init_hc_attn_scale),

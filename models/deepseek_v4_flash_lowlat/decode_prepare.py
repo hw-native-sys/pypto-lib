@@ -73,7 +73,7 @@ def build_swa_metadata(
     swa_lens: pl.Out[pl.Tensor[[T], pl.INT32]],
 ):
     """Lower paged write slots and visible SWA rows for each decode token."""
-    for token in pl.spmd(T, name_hint="decode_build_swa_metadata"):
+    for token in pl.spmd(T, name_hint="decode_build_swa_metadata", allow_early_resolve=True):
         request = token // S
         position = pl.read(position_ids, [token])
         valid_len = pl.min(position + 1, WIN)
@@ -99,7 +99,7 @@ def build_swa_metadata(
                 )
         swa_indices[token : token + 1, :] = index_row
 
-    for metadata_core in pl.spmd(1, name_hint="decode_build_swa_scalar_metadata"):
+    for metadata_core in pl.spmd(1, name_hint="decode_build_swa_scalar_metadata", allow_early_resolve=True):
         for token in pl.range(metadata_core, T):
             request = token // S
             position = pl.read(position_ids, [token])
