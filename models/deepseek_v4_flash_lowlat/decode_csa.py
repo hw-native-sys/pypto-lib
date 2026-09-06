@@ -259,7 +259,6 @@ def attention_csa_packed(
     weights_proj_flat = pl.reshape(weights_proj, [D * IDX_N_HEADS])
     inner_wkv_flat = pl.reshape(inner_wkv, [INNER_OUT_DIM * D])
     inner_wgate_flat = pl.reshape(inner_wgate, [INNER_OUT_DIM * D])
-    wq_b_flat = pl.reshape(wq_b, [Q_LORA * H * HEAD_DIM])
     wo_a_flat = pl.reshape(wo_a_w, [WO_A_FLAT])
     wo_b_flat = pl.reshape(wo_b_w, [WO_B_FLAT])
     with pl.at(level=pl.Level.CORE_GROUP, name_hint="prefetch_attn_w", allow_early_resolve=True):
@@ -270,7 +269,6 @@ def attention_csa_packed(
         pl.prefetch.async_prefetch(weights_proj_flat, warm_ctx)
         pl.prefetch.async_prefetch(inner_wkv_flat, warm_ctx)
         pl.prefetch.async_prefetch(inner_wgate_flat, warm_ctx)
-        pl.prefetch.async_prefetch(wq_b_flat, warm_ctx)
         pl.prefetch.async_prefetch(wo_a_flat, warm_ctx)
         pl.prefetch.async_prefetch(wo_b_flat, warm_ctx)
     # rms_norm fans out to qr_proj_matmul (critical path), kv_proj_matmul, kv_score_proj

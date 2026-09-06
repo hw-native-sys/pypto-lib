@@ -160,6 +160,7 @@ def indexer(
     late_dep: pl.Scalar[pl.TASK_ID],
     my_rank: pl.Scalar[pl.INT32],
 ):
+    query_token = pl.cast(my_rank, pl.INDEX)
     qr_acc_pad = pl.create_tensor([T_PAD, IDX_N_HEADS * IDX_HEAD_DIM], dtype=pl.INT32)
     for ot in pl.spmd(IDX_N_HEADS * IDX_HEAD_DIM // Q_OUT_TILE, name_hint="idx_qr_proj_matmul", allow_early_resolve=True):
         o_base = ot * Q_OUT_TILE
@@ -167,34 +168,25 @@ def indexer(
             qr_acc = pl.create_tensor([MM_ROW_TILE, MM_N_TILE], dtype=pl.INT32)
             for kb in pl.pipeline(0, Q_LORA // Q_TILE, stage=2):
                 q0 = kb * Q_TILE
-                qr_tile = pl.slice(qr, [T_PAD, Q_TILE], [0, q0], valid_shape=[T, Q_TILE])
+                qr_tile = pl.slice(qr, [T_PAD, Q_TILE], [query_token, q0], valid_shape=[1, Q_TILE])
                 wq_tile = wq_b[q0 : q0 + Q_TILE, o_base + ns : o_base + ns + MM_N_TILE]
                 qr_acc = pl.matmul_acc(qr_acc, qr_tile, wq_tile, init_cond=(kb == 0))
             qr_acc_pad[0:T_PAD, o_base + ns : o_base + ns + MM_N_TILE] = qr_acc
-    qr_proj = pl.create_tensor([T, IDX_N_HEADS * IDX_HEAD_DIM], dtype=pl.FP32)
+    qr_proj = pl.create_tensor([1, IDX_N_HEADS * IDX_HEAD_DIM], dtype=pl.FP32)
     for ot in pl.spmd(IDX_N_HEADS * IDX_HEAD_DIM // Q_OUT_TILE, name_hint="idx_qr_proj_dequant", allow_early_resolve=True):
         o_base = ot * Q_OUT_TILE
         wq_scale = pl.reshape(wq_b_scale[o_base : o_base + Q_OUT_TILE], [1, Q_OUT_TILE])
-        acc_fp32 = pl.cast(qr_acc_pad[0:T, o_base : o_base + Q_OUT_TILE], target_type=pl.FP32, mode="none")
-        qr_dequant = pl.col_expand_mul(pl.row_expand_mul(acc_fp32, qr_scale[0:T, :]), wq_scale)
-        qr_proj[0:T, o_base : o_base + Q_OUT_TILE] = qr_dequant
+        acc_fp32 = pl.cast(qr_acc_pad[0:1, o_base : o_base + Q_OUT_TILE], target_type=pl.FP32, mode="none")
+        query_scale = pl.read(qr_scale, [query_token, 0])
+        qr_scaled = pl.mul(acc_fp32, query_scale)
+        qr_dequant = pl.col_expand_mul(qr_scaled, wq_scale)
+        qr_proj[0:1, o_base : o_base + Q_OUT_TILE] = qr_dequant
 
-    qr_proj_flat = pl.reshape(qr_proj, [T * IDX_N_HEADS, IDX_HEAD_DIM])
+    qr_proj_flat = pl.reshape(qr_proj, [IDX_N_HEADS, IDX_HEAD_DIM])
     # BF16 q for the Hadamard matmul: nope half rounded from the FP32 dequant, rope
     # half rotated then rounded.
-    qr_bf16 = pl.create_tensor([T * IDX_N_HEADS, IDX_HEAD_DIM], dtype=pl.BF16)
-    # spmd over ROPE_ROW_TILE-row blocks; batch_idx = block base // ROPE_ROW_BLOCK
-    # picks the per-batch cos/sin row. cos/sin arrive already interleave-duplicated and
-    # sign-folded (built once by the caller), and col_expand_mul folds the [1, ROPE_HEAD_DIM]
-    # row broadcast into the rotation multiply -- so no cos_il/sin_il tile is materialized
-    # and no per-block dup-gather runs.
-    #   out[j] = x[j]*cos_il[j] + x[j^1]*sin_il_signed[j]
-    #
-    # The j^1 lane-swap index permutes data, so no host table can hold it -- but it is
-    # block-invariant, and rebuilding it inside the spmd cost the same arange/trunc-cast/
-    # lane/arithmetic chain on all 16 blocks. Built once here instead (same form as the
-    # rope_swap scope in decode_sparse_attn_hca) and loaded per block. No pypto bitwise
-    # op is reachable at the tensor level, so the fp32 arithmetic chain is the only form.
+    qr_bf16 = pl.create_tensor([IDX_N_HEADS, IDX_HEAD_DIM], dtype=pl.BF16)
+    # Shared j^1 lane-swap indices for this token's RoPE head blocks.
     rope_swap_idx_t = pl.create_tensor([ROPE_ROW_TILE, ROPE_HEAD_DIM], dtype=pl.INT32)
     with pl.at(level=pl.Level.CORE_GROUP, name_hint="qr_rope_swap_idx", allow_early_resolve=True):
         sw_col = pl.col_expand_mul(
@@ -205,9 +197,9 @@ def indexer(
         rope_swap_idx_t[0:ROPE_ROW_TILE, 0:ROPE_HEAD_DIM] = pl.cast(
             pl.sub(pl.add(sw_col, 1.0), pl.mul(sw_lane, 2.0)), target_type=pl.INT32)                   # j^1
 
-    for idx in pl.spmd(T * IDX_N_HEADS // ROPE_ROW_TILE, name_hint="qr_rope", allow_early_resolve=True):
+    for idx in pl.spmd(IDX_N_HEADS // ROPE_ROW_TILE, name_hint="qr_rope", allow_early_resolve=True):
         o0 = idx * ROPE_ROW_TILE
-        batch_idx = o0 // ROPE_ROW_BLOCK
+        batch_idx = query_token // S
         rope_swap_idx = rope_swap_idx_t[0:ROPE_ROW_TILE, 0:ROPE_HEAD_DIM]
         cos_row = cos[batch_idx : batch_idx + 1, 0 : ROPE_HEAD_DIM]
         sin_row = sin[batch_idx : batch_idx + 1, 0 : ROPE_HEAD_DIM]
@@ -221,15 +213,15 @@ def indexer(
 
     # cube-only scope: q @ hadamard lands in GM, keeping the vector amax/quant below
     # in its own scope so the two run as separate cube and vector tasks.
-    qh_acc_gm = pl.create_tensor([T * IDX_N_HEADS, IDX_HEAD_DIM], dtype=pl.FP32)
-    for idx in pl.spmd(T * IDX_N_HEADS // QH_MM_TILE, name_hint="qr_hadamard_matmul", allow_early_resolve=True):
+    qh_acc_gm = pl.create_tensor([IDX_N_HEADS, IDX_HEAD_DIM], dtype=pl.FP32)
+    for idx in pl.spmd(IDX_N_HEADS // QH_MM_TILE, name_hint="qr_hadamard_matmul", allow_early_resolve=True):
         o0 = idx * QH_MM_TILE
         qh_acc = pl.matmul(qr_bf16[o0 : o0 + QH_MM_TILE, :], hadamard, out_dtype=pl.FP32)
         qh_acc_gm[o0 : o0 + QH_MM_TILE, :] = qh_acc
 
-    qr_hadamard_i8 = pl.create_tensor([T * IDX_N_HEADS, IDX_HEAD_DIM], dtype=pl.INT8)
-    qr_hadamard_scale_dq = pl.create_tensor([T * IDX_N_HEADS, 1], dtype=pl.FP32)
-    for idx in pl.spmd(T * IDX_N_HEADS // QH_QUANT_TILE, name_hint="qr_hadamard_quant", allow_early_resolve=True):
+    qr_hadamard_i8 = pl.create_tensor([IDX_N_HEADS, IDX_HEAD_DIM], dtype=pl.INT8)
+    qr_hadamard_scale_dq = pl.create_tensor([IDX_N_HEADS, 1], dtype=pl.FP32)
+    for idx in pl.spmd(IDX_N_HEADS // QH_QUANT_TILE, name_hint="qr_hadamard_quant", allow_early_resolve=True):
         o0 = idx * QH_QUANT_TILE
         qh_amax = pl.full([1, QH_QUANT_TILE], dtype=pl.FP32, value=INT8_AMAX_EPS)
         for h0 in pl.range(0, IDX_HEAD_DIM, QH_HEAD_DIM_TILE):
@@ -286,7 +278,7 @@ def indexer(
     idx_block_table_flat = pl.reshape(idx_block_table, [B * IDX_CACHE_MAX_BLOCKS])
     score_flat = pl.reshape(score, [T, SCORE_LEN])
     # (token, head) row views: one 512B row load per chunk instead of 64 x 4B rows.
-    qh_scale_flat = pl.reshape(qr_hadamard_scale_dq, [1, T * IDX_N_HEADS])
+    qh_scale_flat = pl.reshape(qr_hadamard_scale_dq, [1, IDX_N_HEADS])
     weights_flat = pl.reshape(weights, [1, T_PAD * IDX_N_HEADS])
 
     # No score_init: the loop writes the valid region; the tail is never read (topk re-masks).
@@ -319,8 +311,8 @@ def indexer(
             kv_dq_red = kv_scale_flat[kv0 : kv0 + REDUCE_TILE, :]  # paged per-position dequant scale
             for ck in pl.unroll(1):
                 c0 = t0 * IDX_N_HEADS
-                qr_chunk = pl.slice(qr_hadamard_i8, [IDX_N_HEADS, IDX_HEAD_DIM], [c0, 0])
-                qh_scale_c = pl.slice(qh_scale_flat, [1, IDX_N_HEADS], [0, c0])
+                qr_chunk = pl.slice(qr_hadamard_i8, [IDX_N_HEADS, IDX_HEAD_DIM], [0, 0])
+                qh_scale_c = pl.slice(qh_scale_flat, [1, IDX_N_HEADS], [0, 0])
                 weights_c = pl.slice(weights_flat, [1, IDX_N_HEADS], [0, c0])
                 score_acc_red = pl.matmul(kv_i8_mat, qr_chunk, out_dtype=pl.INT32, b_trans=True)
                 score_tile_red = pl.cast(score_acc_red, target_type=pl.FP32, mode="none")

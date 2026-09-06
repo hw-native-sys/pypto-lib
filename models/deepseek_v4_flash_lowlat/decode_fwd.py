@@ -1952,6 +1952,8 @@ def main():
     parser.add_argument("--compile-only", action="store_true", default=False)
     parser.add_argument("--dump-passes", action="store_true", default=False)
     parser.add_argument("--runtime-dir", type=str, default=None)
+    parser.add_argument("--input-data", type=str, default=None, help="directory containing a saved input snapshot")
+    parser.add_argument("--save-data", action="store_true", default=False, help="save inputs for replay")
     args = parser.parse_args()
     assert LM_HEAD_TP_SIZE == args.tp, (
         f"import-time LM_HEAD_TP_SIZE must match --tp, got {LM_HEAD_TP_SIZE} vs {args.tp}"
@@ -1972,13 +1974,35 @@ def main():
         inner_state_block_num=args.inner_state_block_num,
     )
 
+    if args.input_data is not None:
+        from dataclasses import replace
+        from functools import partial
+        from pathlib import Path
+
+        import torch
+        from golden import ScalarSpec
+
+        input_dir = Path(args.input_data) / "in"
+        replay_specs = []
+        for spec in specs:
+            input_file = input_dir / f"{spec.name}.pt"
+            if isinstance(spec, ScalarSpec):
+                cached_value = torch.load(input_file, weights_only=True, map_location="cpu")
+                spec = replace(spec, value=cached_value)
+            elif not spec.is_output or spec.init_value is not None:
+                load_input = partial(torch.load, input_file, weights_only=True, map_location="cpu")
+                spec = replace(spec, init_value=load_input)
+            replay_specs.append(spec)
+        specs = replay_specs
+        print(f"[RUN] input replay: {input_dir}", flush=True)
+
     result = run_jit(
         fn=l3_decode_fwd,
         specs=specs,
         golden_fn=None,
         compile_only=args.compile_only,
         runtime_dir=args.runtime_dir,
-        save_data=False,
+        save_data=args.save_data,
         compile_cfg=dict(
             dump_passes=args.dump_passes,
             distributed_config=DistributedConfig(device_ids=device_ids[:N_RANKS], num_sub_workers=0),
