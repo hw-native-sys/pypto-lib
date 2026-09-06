@@ -56,6 +56,9 @@ ir = types.ModuleType("pypto.ir")
 ir.__path__ = []
 compiled_program = types.ModuleType("pypto.ir.distributed_compiled_program")
 compiled_program.DistributedConfig = type("DistributedConfig", (), {})
+# main #1128 moved DistributedConfig to pypto.ir's public surface; stub both
+# homes so the double works whichever one the overlay imports from.
+ir.DistributedConfig = compiled_program.DistributedConfig
 
 pypto.language = language
 pypto.ir = ir
@@ -70,6 +73,9 @@ sys.modules["pypto.ir.distributed_compiled_program"] = compiled_program
 for module_name in ("hc_pre", "hc_post", "gate", "expert_shared", "expert_routed"):
     module = types.ModuleType(module_name)
     setattr(module, module_name, lambda *_args, **_kwargs: None)
+    # Answer any name these layers export, so a new import in moe.py (e.g.
+    # main #1121's prefill_expert_grouped) does not break the double.
+    module.__getattr__ = lambda _name: (lambda *_args, **_kwargs: None)
     sys.modules[module_name] = module
 
 import moe
