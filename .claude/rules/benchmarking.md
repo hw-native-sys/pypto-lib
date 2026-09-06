@@ -18,6 +18,14 @@ moved, and to break ties between changes that measure the same.
 
 **Never report a busy-time or utilization improvement as if it were a speedup.**
 
+For `models/deepseek_v4_flash_lowlat/`, use the
+[layer and full-forward evaluation conventions](../../docs/debug-and-tune/performance-tuning.md#low-latency-layer-and-full-forward-comparisons):
+single-dispatch level-1 layer effective times, full-forward BENCH effective
+times summarized as the lowest per-rank median, and separate level-4 captures
+for scheduling evidence. Record the rounds, warmups, fixture bank count, and
+validation limits. These are tuning conventions; retain the headline mean
+when reporting the CI metric.
+
 Where the numbers come from — see
 [`docs/debug-and-tune/performance-tuning.md`](../../docs/debug-and-tune/performance-tuning.md):
 

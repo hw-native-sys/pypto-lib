@@ -586,6 +586,84 @@ value. That is what makes it safe to tune aggressively.
 
 ---
 
+## 5. Low-latency variant evaluation
+
+The following measurements were collected on 2026-09-05/06 for
+`models/deepseek_v4_flash_lowlat/`, a2a3, TP = 8, T = 8. The pin chain was
+PyPTO `d9d3dd60`, simpler `15f5cbd9`, PTOAS 0.57, and PTO ISA `96ba706c`.
+Use the [layer/forward evaluation conventions](performance-tuning.md#low-latency-layer-and-full-forward-comparisons)
+and [input replay](../run-and-validate/save-and-replay.md#input-only-forward-replay)
+to compare candidates on fixed data.
+
+### Match preprocessing and prefetching to the consumer
+
+Full-row, per-token RMSNorm replaces two narrow-tiled passes. The CSA indexer
+prepares the query token owned by each rank, including projection, RoPE,
+Hadamard transform, and quantization; cache updates still cover the required
+tokens. Attention prefetching no longer warms the entire 32 MiB WqB matrix
+when a rank consumes only a 4 MiB shard.
+
+Together, those changes reduced the default 43-layer, one-bank forward from
+21.754 to 21.026 ms: 3.35%, using 100 measured rounds / 5 warmups and the
+fastest-rank median effective time. Layer numerical checks passed. A prefetch
+set must be evaluated against the bytes the current consumer actually reads.
+
+### Give projection and routing independent partitions
+
+The gate uses a 16-block AIC projection and an 8-block AIV stage that combines
+activation, bias, routing, and normalization. It retains two logical stages.
+The original mixed gate plus router used 49 physical core rows; the new pair
+uses 24. A 16 KiB raw-logits handoff replaces the score and biased-score
+intermediates. Each routing block owns one token, with 64-byte output rows
+that isolate its scalar writes. The standalone gate preserves packed outputs.
+
+The incremental comparisons below start from the RMSNorm/indexer/prefetch
+changes above. Each row compares the same frozen inputs and bank geometry;
+percentages from different fixtures should not be combined.
+
+| Change | Expert banks | Rounds / warmup | Forward before → after | Reduction |
+|---|---:|---:|---:|---:|
+| AIC projection; postprocessing in the existing router | 1 | 100 / 5 | 20.984 → 20.814 ms | 0.81% |
+| One token per routing block, added to that split | 1 | 100 / 5 | 20.814 → 20.581 ms | 1.12% |
+| Both gate changes | 43 | 50 / 5 | 21.227 → 20.845 ms | 1.80% |
+
+The 43-bank control copies identical weight values to separate layer bank
+addresses. It tests the address working set rather than a different
+checkpoint. These forward results are execution checks only. The final layer
+outputs passed their frozen goldens, and hash/score gate tests passed at 0, 3,
+and 8 active tokens. Positive-count guards skip zero-block SPMD submissions.
+
+| Layer | Single-dispatch effective time before → after | Reduction |
+|---|---:|---:|
+| SWA, layer 0 | 376.519 → 370.819 µs | 1.51% |
+| CSA, layer 2 | 527.359 → 518.579 µs | 1.66% |
+| HCA, layer 3 | 392.180 → 375.040 µs | 4.37% |
+
+Separate level-4 captures explain the gate change: its observed-path
+projection task fell from about 11.2 to 8.1 µs, routing from about 8.5 to 4 µs,
+and the gap before routing from 6.8 to about 2 µs. Those profiling intervals
+are distinct from the level-1 effective times above.
+
+### Require a caller-level win
+
+Additional gate and HC weight prefetches showed small, inconclusive layer
+changes. Prefetching the shared expert's 3 MiB of weights shortened an
+isolated HCA expert phase, but on top of the selected gate the 43-bank forward
+changed from 20.845 to 20.863 ms. Anchoring that prefetch to the current
+attention output gave 21.008 ms. Neither hint was retained.
+
+Cube N/K sweeps and shortening the final top-k merge did not establish an
+advantage over the selected gate. Computing only the six hash-selected scores
+per token passed correctness, but its vector dot-products and result
+collection took 28.28 µs from normalization to routing, versus 15.50 µs for
+the selected SWA gate. Reduced FLOPs or weight bytes alone did not shorten
+that path.
+
+`moe_signal_clear` remains part of the communication protocol. Repeated
+benchmarks retain communication windows with automatic resets disabled; the
+kernel clears the counters before the next invocation restarts its epochs.
+The full forward clears them once after the final MoE.
+
 ## See also
 
 - [Performance Tuning](performance-tuning.md) — measurement, capture, and the

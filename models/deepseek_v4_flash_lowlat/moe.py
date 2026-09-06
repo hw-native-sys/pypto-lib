@@ -30,7 +30,7 @@ from expert_routed import (
     IDX_PAD, N_BANK, N_SLOTS_B, RECV_MAX, SHARED_EID, SH_SLOT,
 )
 from expert_routed_persistent_balanced import expert_routed_persistent_balanced
-from gate import gate
+from gate import gate, ROUTE_ROW_PAD
 from hc_post import hc_post
 from hc_pre import hc_pre
 
@@ -77,8 +77,8 @@ def clear_moe_signals(
 # === Routing ================================================================
 @pl.jit.inline
 def route_group(
-    indices: pl.Tensor[[T, TOPK], pl.INT32],
-    weights: pl.Tensor[[T, TOPK], pl.FP32],
+    indices: pl.Tensor[[T, ROUTE_ROW_PAD], pl.INT32],
+    weights: pl.Tensor[[T, ROUTE_ROW_PAD], pl.FP32],
     x_norm_i8: pl.Tensor[[T, D], pl.INT8],
     x_norm_scale: pl.Tensor[[T, 1], pl.FP32],
     # compact per-slot outputs consumed by the routed expert / combine_local
@@ -309,8 +309,8 @@ def moe(
 
     x_norm_i8 = pl.create_tensor([T, D], dtype=pl.INT8)
     x_norm_scale = pl.create_tensor([T, 1], dtype=pl.FP32, manual_dep=True)
-    indices = pl.create_tensor([T, TOPK], dtype=pl.INT32)
-    weights = pl.create_tensor([T, TOPK], dtype=pl.FP32)
+    indices = pl.create_tensor([T, ROUTE_ROW_PAD], dtype=pl.INT32)
+    weights = pl.create_tensor([T, ROUTE_ROW_PAD], dtype=pl.FP32)
     gate(
         x_mixed, norm_w, gate_w, gate_bias,
         layer_id, num_tokens, tid2eid, input_ids,

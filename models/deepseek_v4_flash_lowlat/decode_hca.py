@@ -204,14 +204,12 @@ def attention_hca(
     # SDMA CMO L2 warm of this layer's attention weights, in deadline order.
     wq_a_flat = pl.reshape(wq_a, [D * Q_LORA])
     wkv_flat = pl.reshape(wkv, [D * HEAD_DIM])
-    wq_b_flat = pl.reshape(wq_b, [Q_LORA * H * HEAD_DIM])
     wo_a_flat = pl.reshape(wo_a_shard, [WO_A_FLAT])
     wo_b_flat = pl.reshape(wo_b_shard, [WO_B_FLAT])
     with pl.at(level=pl.Level.CORE_GROUP, name_hint="prefetch_attn_w", allow_early_resolve=True):
         warm_ctx = pl.prefetch.make_context()
         pl.prefetch.async_prefetch(wq_a_flat, warm_ctx)
         pl.prefetch.async_prefetch(wkv_flat, warm_ctx)
-        pl.prefetch.async_prefetch(wq_b_flat, warm_ctx)
         pl.prefetch.async_prefetch(wo_a_flat, warm_ctx)
         pl.prefetch.async_prefetch(wo_b_flat, warm_ctx)
     # Defers kv_proj_matmul one hop behind rms_norm so qr_proj_matmul dispatches first.

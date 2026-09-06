@@ -70,6 +70,31 @@ Then forward `args.save_data` and `args.golden_data` to `run` or `run_jit`.
 Do not assume every existing entry point already exposes both flags; check its
 `--help` and call site.
 
+## Input-only forward replay
+
+The low-latency `models/deepseek_v4_flash_lowlat/decode_fwd.py` entry has no
+golden function. Its `--save-data` flag saves inputs, and `--input-data`
+reloads those inputs without requiring expected outputs:
+
+```bash
+python models/deepseek_v4_flash_lowlat/decode_fwd.py \
+  -p a2a3 --tp 8 -d 0,1,2,3,4,5,6,7 --save-data
+
+PYPTO_BENCH=1 PYPTO_BENCH_ROUNDS=100 PYPTO_BENCH_WARMUP=5 \
+  python models/deepseek_v4_flash_lowlat/decode_fwd.py \
+    -p a2a3 --tp 8 -d 0,1,2,3,4,5,6,7 \
+    --input-data "<work_dir>/data"
+```
+
+Run these commands in the `pypto` conda environment with the pinned toolchain.
+Replay restores scalar inputs and initialized tensors, including mutable cache
+inputs. Pure outputs are allocated normally. Keep import-time shape options,
+such as `--tp` and `--moe-banks`, consistent with the saved snapshot.
+
+This provides repeatable inputs for performance comparisons; it does not add
+numerical validation to the forward. Use the layer goldens and standalone gate
+checks alongside it. See the [evaluation conventions](../debug-and-tune/performance-tuning.md#low-latency-layer-and-full-forward-comparisons).
+
 ## Capture a snapshot
 
 Run once with saving enabled:

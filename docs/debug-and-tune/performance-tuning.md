@@ -84,6 +84,45 @@ A distributed program adds a per-rank breakdown and a context line:
   segmentation was abandoned and the numbers are a pooled per-dispatch
   sample — treat them as indicative only.
 
+### Low-latency layer and full-forward comparisons
+
+Use complementary measurements for `models/deepseek_v4_flash_lowlat/`:
+
+| Purpose | Collection | Reported metric |
+|---|---|---|
+| Screen a layer change | One level-1 chip swimlane dispatch, without a benchmark loop | Select the rank with the shortest Worker View receive-to-end span; report that same rank's device `orch` / `sched` union |
+| Confirm the full-forward effect | `PYPTO_BENCH=1`, with fixed warmup and measured rounds | Compute each rank's median effective time, then report the lowest of those medians |
+| Explain the dependency and dispatch changes | A separate level-4 capture | Critical-path tasks, preceding gaps, and actual dispatch evidence |
+
+BENCH is the collection mechanism; effective time is the device metric it
+collects. The full-forward convention here is `min(rank medians)`. It excludes
+host setup and reduces the influence of rank start skew, so label it explicitly
+and keep it distinct from the headline maximum across ranks and host-inclusive
+step latency. Retain the CI headline convention above when reporting CI results.
+
+Freeze one input/golden snapshot per layer case. Freeze full-forward inputs
+separately with `decode_fwd.py --save-data`, then replay them with
+`--input-data <snapshot>/data`; see [Save and Replay](../run-and-validate/save-and-replay.md).
+Use identical rounds, warmups, shapes, pins, and devices within each comparison.
+The measured examples in the [DeepSeek case study](deepseek-v4-decode-optimization.md#5-low-latency-variant-evaluation)
+use 100 measured rounds / 5 warmups for the default forward fixture, and
+50 / 5 for a separate 43-bank fixture.
+
+A single dispatch does not guarantee cold L2. Repeated layer execution can
+reuse cached weights, and the default forward fixture reuses one MoE bank
+across layers. When testing weight traffic or prefetching, also compare with
+separate bank addresses (`--moe-banks 43` for the 43-layer fixture). Keep the
+weight values and other inputs fixed while changing the address working set,
+and compare each candidate against the baseline with the same bank count.
+Separate banks do not guarantee cold L2 between benchmark rounds either.
+
+Validate layer outputs against their goldens and exercise both gate routing
+modes, including zero and partial active-token counts. The current full
+forward has no `golden_fn`: its passing result is an execution check, not a
+numerical comparison. Do not combine timing numbers from different profiling
+levels. Reconcile physical records with dependency counts; level-4 merged
+traces also contain allocation and dummy-task display slices.
+
 ### Knobs
 
 | Env | Default | Effect |

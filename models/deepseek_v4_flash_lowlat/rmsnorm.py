@@ -23,11 +23,7 @@ D = M.hidden_size
 EPS = M.rms_norm_eps
 
 # tiling
-D_TILE = 128
-T_TILE = 8
-assert D % D_TILE == 0, "D must be divisible by D_TILE"
-assert (DECODE_BATCH * DECODE_SEQ) % T_TILE == 0
-
+REDUCE_ROW_TILE = 16
 
 @pl.jit.inline
 def rms_norm(
@@ -36,28 +32,33 @@ def rms_norm(
     x_normed: pl.Tensor[[T_DYN, D], pl.BF16],
 ):
     t_dim = pl.tensor.dim(x, 0)
-    # Capture form (not `for ... in pl.spmd`): callers need the producer TaskId to
-    # hang a `pl.system.task_dummy` barrier off it and defer non-critical consumers.
-    with pl.spmd(t_dim // T_TILE, name_hint="rms_norm", allow_early_resolve=True) as rms_tid:
-        tg_idx = pl.tile.get_block_idx()
-        tg = tg_idx * T_TILE
-        x_sq_sum = pl.full([1, T_TILE], dtype=pl.FP32, value=0.0)
-        for rms_db in pl.pipeline(D // D_TILE, stage=2):
-            rms_d0 = rms_db * D_TILE
-            rms_x_chunk = pl.cast(x[tg : tg + T_TILE, rms_d0 : rms_d0 + D_TILE], target_type=pl.FP32)
-            x_sq_sum = pl.add(x_sq_sum, pl.reshape(pl.row_sum(pl.mul(rms_x_chunk, rms_x_chunk)), [1, T_TILE]))
-        x_inv_rms = pl.rsqrt(pl.add(pl.mul(x_sq_sum, 1.0 / D), EPS), high_precision=True)
-        x_inv_rms_t = pl.reshape(x_inv_rms, [T_TILE, 1])
-        for apply_db in pl.pipeline(D // D_TILE, stage=2):
-            apply_d0 = apply_db * D_TILE
-            apply_x_chunk = pl.cast(x[tg : tg + T_TILE, apply_d0 : apply_d0 + D_TILE], target_type=pl.FP32)
-            norm_w_chunk = pl.cast(pl.reshape(norm_w[apply_d0 : apply_d0 + D_TILE], [1, D_TILE]), pl.FP32)
-            x_normed_chunk = pl.col_expand_mul(pl.row_expand_mul(apply_x_chunk, x_inv_rms_t), norm_w_chunk)
-            x_normed[tg : tg + T_TILE, apply_d0 : apply_d0 + D_TILE] = pl.cast(
-                x_normed_chunk,
-                target_type=pl.BF16,
-                mode="rint",
-            )
+    norm_w_view = pl.reshape(norm_w, [1, D])
+    with pl.spmd(t_dim, name_hint="rms_norm", allow_early_resolve=True) as rms_tid:
+        tok = pl.tile.get_block_idx()
+        x_row_bf16 = pl.tile.load(x, [tok, 0], [1, D])
+        w_row_bf16 = pl.tile.load(norm_w_view, [0, 0], [1, D])
+        x_row = pl.cast(x_row_bf16, target_type=pl.FP32)
+        w_row = pl.cast(w_row_bf16, target_type=pl.FP32)
+        x_sq = pl.mul(x_row, x_row)
+        sq_rows = pl.reshape(x_sq, [REDUCE_ROW_TILE, D // REDUCE_ROW_TILE])
+        partial_tmp = pl.create_tile([REDUCE_ROW_TILE, D // REDUCE_ROW_TILE], dtype=pl.FP32)
+        partial = pl.row_sum(sq_rows, partial_tmp)
+        reduce_tile = pl.create_tile([REDUCE_ROW_TILE, REDUCE_ROW_TILE], dtype=pl.FP32)
+        reduce_tile[0:1, :] = pl.reshape(partial, [1, REDUCE_ROW_TILE])
+        reduce_tile = pl.set_validshape(reduce_tile, 1, REDUCE_ROW_TILE)
+        sum_tmp = pl.create_tile([REDUCE_ROW_TILE, REDUCE_ROW_TILE], dtype=pl.FP32)
+        sum_tile = pl.row_sum(reduce_tile, sum_tmp)
+        sum_row = pl.reshape(sum_tile, [1, REDUCE_ROW_TILE])
+        x_sq_sum = pl.set_validshape(sum_row, 1, 1)
+        x_mean_sq = pl.mul(x_sq_sum, 1.0 / D)
+        x_mean_eps = pl.add(x_mean_sq, EPS)
+        rsqrt_tmp = pl.create_tile([1, REDUCE_ROW_TILE], dtype=pl.FP32)
+        x_inv_rms = pl.tile.rsqrt(x_mean_eps, rsqrt_tmp)
+        inv_rms_scalar = pl.tile.read(x_inv_rms, [0, 0])
+        x_scaled = pl.mul(x_row, inv_rms_scalar)
+        x_weighted = pl.mul(x_scaled, w_row)
+        normed_bf16 = pl.cast(x_weighted, target_type=pl.BF16, mode="rint")
+        pl.tile.store(normed_bf16, [tok, 0], x_normed, shapes=[1, D])
 
     return rms_tid
 
