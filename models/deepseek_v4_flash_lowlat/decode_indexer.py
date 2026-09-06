@@ -172,19 +172,6 @@ def indexer(
                 wq_tile = wq_b[q0 : q0 + Q_TILE, o_base + ns : o_base + ns + MM_N_TILE]
                 qr_acc = pl.matmul_acc(qr_acc, qr_tile, wq_tile, init_cond=(kb == 0))
             qr_acc_pad[0:T_PAD, o_base + ns : o_base + ns + MM_N_TILE] = qr_acc
-    qr_proj = pl.create_tensor([1, IDX_N_HEADS * IDX_HEAD_DIM], dtype=pl.FP32)
-    for ot in pl.spmd(IDX_N_HEADS * IDX_HEAD_DIM // Q_OUT_TILE, name_hint="idx_qr_proj_dequant", allow_early_resolve=True):
-        o_base = ot * Q_OUT_TILE
-        wq_scale = pl.reshape(wq_b_scale[o_base : o_base + Q_OUT_TILE], [1, Q_OUT_TILE])
-        acc_fp32 = pl.cast(qr_acc_pad[0:1, o_base : o_base + Q_OUT_TILE], target_type=pl.FP32, mode="none")
-        query_scale = pl.read(qr_scale, [query_token, 0])
-        qr_scaled = pl.mul(acc_fp32, query_scale)
-        qr_dequant = pl.col_expand_mul(qr_scaled, wq_scale)
-        qr_proj[0:1, o_base : o_base + Q_OUT_TILE] = qr_dequant
-
-    qr_proj_flat = pl.reshape(qr_proj, [IDX_N_HEADS, IDX_HEAD_DIM])
-    # BF16 q for the Hadamard matmul: nope half rounded from the FP32 dequant, rope
-    # half rotated then rounded.
     qr_bf16 = pl.create_tensor([IDX_N_HEADS, IDX_HEAD_DIM], dtype=pl.BF16)
     # Shared j^1 lane-swap indices for this token's RoPE head blocks.
     rope_swap_idx_t = pl.create_tensor([ROPE_ROW_TILE, ROPE_HEAD_DIM], dtype=pl.INT32)
@@ -197,19 +184,29 @@ def indexer(
         rope_swap_idx_t[0:ROPE_ROW_TILE, 0:ROPE_HEAD_DIM] = pl.cast(
             pl.sub(pl.add(sw_col, 1.0), pl.mul(sw_lane, 2.0)), target_type=pl.INT32)                   # j^1
 
-    for idx in pl.spmd(IDX_N_HEADS // ROPE_ROW_TILE, name_hint="qr_rope", allow_early_resolve=True):
-        o0 = idx * ROPE_ROW_TILE
+    for ot in pl.spmd(IDX_N_HEADS * IDX_HEAD_DIM // Q_OUT_TILE, name_hint="idx_qr_dequant_rope", allow_early_resolve=True):
+        o_base = ot * Q_OUT_TILE
+        o0 = ot * (Q_OUT_TILE // IDX_HEAD_DIM)
+        wq_scale = pl.reshape(wq_b_scale[o_base : o_base + Q_OUT_TILE], [1, Q_OUT_TILE])
+        acc_fp32 = pl.cast(qr_acc_pad[0:1, o_base : o_base + Q_OUT_TILE], target_type=pl.FP32, mode="none")
+        query_scale = pl.read(qr_scale, [query_token, 0])
+        qr_scaled = pl.mul(acc_fp32, query_scale)
+        qr_dequant = pl.col_expand_mul(qr_scaled, wq_scale)
+        qr_dequant_flat = pl.reshape(qr_dequant, [Q_OUT_TILE // IDX_HEAD_DIM, IDX_HEAD_DIM])
         batch_idx = query_token // S
-        rope_swap_idx = rope_swap_idx_t[0:ROPE_ROW_TILE, 0:ROPE_HEAD_DIM]
-        cos_row = cos[batch_idx : batch_idx + 1, 0 : ROPE_HEAD_DIM]
-        sin_row = sin[batch_idx : batch_idx + 1, 0 : ROPE_HEAD_DIM]
-        qr_nope_slice = qr_proj_flat[o0 : o0 + ROPE_ROW_TILE, 0 : IDX_NOPE_HEAD_DIM]
-        qr_rope_slice = qr_proj_flat[o0 : o0 + ROPE_ROW_TILE, IDX_NOPE_HEAD_DIM : IDX_HEAD_DIM]
+        rope_swap_idx = rope_swap_idx_t[0 : Q_OUT_TILE // IDX_HEAD_DIM, 0:ROPE_HEAD_DIM]
+        cos_row = cos[batch_idx : batch_idx + 1, 0:ROPE_HEAD_DIM]
+        sin_row = sin[batch_idx : batch_idx + 1, 0:ROPE_HEAD_DIM]
+        qr_nope_slice = qr_dequant_flat[:, 0:IDX_NOPE_HEAD_DIM]
+        qr_rope_slice = qr_dequant_flat[:, IDX_NOPE_HEAD_DIM:IDX_HEAD_DIM]
         qr_swapped = pl.gather(qr_rope_slice, dim=-1, index=rope_swap_idx)
-        rope_rot = pl.add(
-            pl.col_expand_mul(qr_rope_slice, cos_row), pl.col_expand_mul(qr_swapped, sin_row))
-        qr_vec = pl.concat(pl.cast(qr_nope_slice, target_type=pl.BF16, mode="rint"), pl.cast(rope_rot, target_type=pl.BF16, mode="rint"))
-        qr_bf16[o0 : o0 + ROPE_ROW_TILE, :] = qr_vec
+        rope_direct = pl.col_expand_mul(qr_rope_slice, cos_row)
+        rope_swapped = pl.col_expand_mul(qr_swapped, sin_row)
+        rope_rot = pl.add(rope_direct, rope_swapped)
+        qr_nope_bf16 = pl.cast(qr_nope_slice, target_type=pl.BF16, mode="rint")
+        qr_rope_bf16 = pl.cast(rope_rot, target_type=pl.BF16, mode="rint")
+        qr_vec = pl.concat(qr_nope_bf16, qr_rope_bf16)
+        qr_bf16[o0 : o0 + Q_OUT_TILE // IDX_HEAD_DIM, :] = qr_vec
 
     # cube-only scope: q @ hadamard lands in GM, keeping the vector amax/quant below
     # in its own scope so the two run as separate cube and vector tasks.

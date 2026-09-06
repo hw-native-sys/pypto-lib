@@ -29,7 +29,7 @@ from config import FLASH as M, MOE_TOKENS, TP
 from expert_routed import (
     IDX_PAD, N_BANK, N_SLOTS_B, RECV_MAX, SHARED_EID, SH_SLOT,
 )
-from expert_routed_persistent_balanced import expert_routed_persistent_balanced
+from expert_routed_persistent_balanced import WORK_SLOTS_PAD, expert_routed_persistent_planned
 from gate import gate, ROUTE_ROW_PAD
 from hc_post import hc_post
 from hc_pre import hc_pre
@@ -85,7 +85,8 @@ def route_group(
     recv_x: pl.Tensor[[N_SLOTS_B, RECV_MAX, D], pl.INT8],
     recv_scale: pl.Tensor[[N_SLOTS_B, RECV_MAX], pl.FP32],
     recv_w: pl.Tensor[[N_SLOTS_B, RECV_MAX], pl.FP32],
-    recv_count: pl.Tensor[[N_SLOTS_B, IDX_PAD], pl.INT32],
+    work_slot: pl.Tensor[[WORK_SLOTS_PAD], pl.INT32],
+    work_rows: pl.Tensor[[WORK_SLOTS_PAD], pl.INT32],
     slot_expert: pl.Tensor[[N_SLOTS_B, IDX_PAD], pl.INT32],
     route_slot_row: pl.Tensor[[N_ROUTES, IDX_PAD], pl.INT32],
     num_tokens: pl.Scalar[pl.INT32],
@@ -97,10 +98,13 @@ def route_group(
     """
     recv_x_flat = pl.reshape(recv_x, [N_SLOTS_B * RECV_MAX, D])
     expert_slot = pl.create_tensor([1, N_EXPERTS], dtype=pl.INT32, manual_dep=True)
+    work_slot_2d = pl.reshape(work_slot, [1, WORK_SLOTS_PAD])
+    work_rows_2d = pl.reshape(work_rows, [1, WORK_SLOTS_PAD])
 
     with pl.at(level=pl.Level.CORE_GROUP, name_hint="route_table_init", allow_early_resolve=True) as init_tid:
         expert_slot[:, :] = pl.full([1, N_EXPERTS], dtype=pl.INT32, value=-1)
-        recv_count[:, :] = pl.full([N_SLOTS_B, IDX_PAD], dtype=pl.INT32, value=0)
+        work_slot_2d[:, :] = pl.full([1, WORK_SLOTS_PAD], dtype=pl.INT32, value=0)
+        work_rows_2d[:, :] = pl.full([1, WORK_SLOTS_PAD], dtype=pl.INT32, value=0)
         slot_expert[:, :] = pl.full([N_SLOTS_B, IDX_PAD], dtype=pl.INT32, value=0)
         recv_scale[:, :] = pl.full([N_SLOTS_B, RECV_MAX], dtype=pl.FP32, value=0.0)
         recv_w[:, :] = pl.full([N_SLOTS_B, RECV_MAX], dtype=pl.FP32, value=0.0)
@@ -130,11 +134,12 @@ def route_group(
                     slot = pl.cast(next_slot, pl.INT32)
                     pl.write(expert_slot, [0, expert_col], slot)
                     pl.write(slot_expert, [next_slot, 0], expert_id)
+                    pl.write(work_slot, [next_slot], slot)
                     next_slot = next_slot + 1
                 slot_row = pl.cast(slot, pl.INDEX)
-                count = pl.read(recv_count, [slot_row, 0])
+                count = pl.read(work_rows, [slot_row])
                 count_col = pl.cast(count, pl.INDEX)
-                pl.write(recv_count, [slot_row, 0], pl.cast(count + 1, pl.INT32))
+                pl.write(work_rows, [slot_row], pl.cast(count + 1, pl.INT32))
                 pl.write(recv_scale, [slot_row, count_col], token_scale)
                 pl.write(recv_w, [slot_row, count_col], pl.read(weights, [token, k]))
                 route = token * TOPK + k
@@ -142,7 +147,8 @@ def route_group(
             # The shared expert takes this token ungated, at the same quant scale.
             pl.write(recv_scale, [SH_SLOT, token], token_scale)
             pl.write(recv_w, [SH_SLOT, token], pl.cast(1.0, pl.FP32))
-        pl.write(recv_count, [SH_SLOT, 0], pl.cast(active_tokens, pl.INT32))
+        pl.write(work_slot, [next_slot], pl.cast(SH_SLOT, pl.INT32))
+        pl.write(work_rows, [next_slot], pl.cast(active_tokens, pl.INT32))
 
     # One block per token -- it moves that token's TOPK routed rows -- plus one
     # for the shared expert. A 4 KB row is far too little to earn a block of its
@@ -158,7 +164,7 @@ def route_group(
         else:
             # The shared expert takes every token in order, so its rows are one
             # static contiguous tile -- no lookup, one copy. Rows past
-            # active_tokens are never read: recv_count[SH_SLOT] bounds them.
+            # active_tokens are never read by the planned expert work item.
             sh_base = pl.cast(SH_SLOT * RECV_MAX, pl.INDEX)
             recv_x_flat[sh_base : sh_base + T, :] = x_norm_i8[0:T, :]
 
@@ -320,19 +326,20 @@ def moe(
     recv_x = pl.create_tensor([N_SLOTS_B, RECV_MAX, D], dtype=pl.INT8)
     recv_scale = pl.create_tensor([N_SLOTS_B, RECV_MAX], dtype=pl.FP32)
     recv_w = pl.create_tensor([N_SLOTS_B, RECV_MAX], dtype=pl.FP32)
-    recv_count = pl.create_tensor([N_SLOTS_B, IDX_PAD], dtype=pl.INT32)
+    work_slot = pl.create_tensor([WORK_SLOTS_PAD], dtype=pl.INT32)
+    work_rows = pl.create_tensor([WORK_SLOTS_PAD], dtype=pl.INT32)
     slot_expert = pl.create_tensor([N_SLOTS_B, IDX_PAD], dtype=pl.INT32)
     route_slot_row = pl.create_tensor([N_ROUTES, IDX_PAD], dtype=pl.INT32)
     route_group(
         indices, weights, x_norm_i8, x_norm_scale,
-        recv_x, recv_scale, recv_w, recv_count, slot_expert, route_slot_row,
+        recv_x, recv_scale, recv_w, work_slot, work_rows, slot_expert, route_slot_row,
         num_tokens,
     )
 
     with pl.scope():
         recv_y = pl.create_tensor([N_SLOTS_B, RECV_MAX, D], dtype=pl.BF16)
-        expert_routed_persistent_balanced(
-            recv_x, recv_scale, recv_w, recv_count, slot_expert,
+        expert_routed_persistent_planned(
+            recv_x, recv_scale, recv_w, work_slot, work_rows, slot_expert,
             routed_w1, routed_w1_scale, routed_w3, routed_w3_scale,
             routed_w2, routed_w2_scale,
             recv_y,

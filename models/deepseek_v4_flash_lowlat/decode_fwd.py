@@ -430,7 +430,7 @@ def decode_fwd(
     hidden: pl.Tensor[[T, HC_MULT, D], pl.FP32] = pl.create_tensor([T, HC_MULT, D], dtype=pl.FP32)
     with pl.scope():
         attention_swa(
-            x_hc,
+            x_hc, gate_w_l0,
             hc_attn_fn_l0, hc_attn_scale_l0, hc_attn_base_l0,
             attn_norm_w_l0, wq_a_l0, wq_b_l0, wq_b_scale_l0,
             wkv_l0, gamma_cq_l0, gamma_ckv_l0, swa_freqs_cos, swa_freqs_sin,
@@ -455,7 +455,7 @@ def decode_fwd(
         )
     with pl.scope():
         attention_swa(
-            hidden,
+            hidden, gate_w_l1,
             hc_attn_fn_l1, hc_attn_scale_l1, hc_attn_base_l1,
             attn_norm_w_l1, wq_a_l1, wq_b_l1, wq_b_scale_l1,
             wkv_l1, gamma_cq_l1, gamma_ckv_l1, swa_freqs_cos, swa_freqs_sin,
@@ -544,7 +544,7 @@ def decode_fwd(
         routed_w2_scale_csa: pl.Tensor[[N_BANK, D], pl.FP32] = pl.slice(routed_w2_scale, [N_BANK, D], [(csa_layer % MOE_BANKS) * N_BANK, 0])
         with pl.scope():
             attention_csa(
-                hidden,
+                hidden, gate_w_csa,
                 hc_attn_fn_csa, hc_attn_scale_csa, hc_attn_base_csa,
                 attn_norm_w_csa, wq_a_csa, wq_b_csa, wq_b_scale_csa,
                 wkv_csa, gamma_cq_csa, gamma_ckv_csa,
@@ -616,7 +616,7 @@ def decode_fwd(
         routed_w2_scale_hca: pl.Tensor[[N_BANK, D], pl.FP32] = pl.slice(routed_w2_scale, [N_BANK, D], [(hca_layer % MOE_BANKS) * N_BANK, 0])
         with pl.scope():
             attention_hca(
-                hidden_mid,
+                hidden_mid, gate_w_hca,
                 hc_attn_fn_hca, hc_attn_scale_hca, hc_attn_base_hca,
                 attn_norm_w_hca, wq_a_hca, wq_b_hca, wq_b_scale_hca,
                 wkv_hca, gamma_cq_hca, gamma_ckv_hca,
@@ -699,7 +699,7 @@ def decode_fwd(
     routed_w2_scale_last: pl.Tensor[[N_BANK, D], pl.FP32] = pl.slice(routed_w2_scale, [N_BANK, D], [(csa_layer_last % MOE_BANKS) * N_BANK, 0])
     with pl.scope():
         attention_csa(
-            hidden,
+            hidden, gate_w_last,
             hc_attn_fn_last, hc_attn_scale_last, hc_attn_base_last,
             attn_norm_w_last, wq_a_last, wq_b_last, wq_b_scale_last,
             wkv_last, gamma_cq_last, gamma_ckv_last,
@@ -1947,7 +1947,7 @@ def main():
     parser.add_argument("--hca-state-block-num", type=int, default=HCA_COMPRESS_STATE_BLOCK_NUM, help="Per-layer physical HCA state cache blocks.")
     parser.add_argument("--csa-state-block-num", type=int, default=CSA_MAIN_STATE_BLOCK_NUM, help="Per-layer physical CSA state cache blocks.")
     parser.add_argument("--inner-state-block-num", type=int, default=CSA_INNER_STATE_BLOCK_NUM, help="Per-layer physical inner-state cache blocks.")
-    parser.add_argument("--enable-chip-swimlane", type=int, nargs="?", const=1, default=0, choices=(0, 1, 2))
+    parser.add_argument("--enable-chip-swimlane", type=int, nargs="?", const=1, default=0, choices=range(5))
     parser.add_argument("--enable-scope-stats", action="store_true", default=False)
     parser.add_argument("--compile-only", action="store_true", default=False)
     parser.add_argument("--dump-passes", action="store_true", default=False)

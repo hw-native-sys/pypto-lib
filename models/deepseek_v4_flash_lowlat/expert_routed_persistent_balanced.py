@@ -6,70 +6,14 @@
 # INCLUDING BUT NOT LIMITED TO NON-INFRINGEMENT, MERCHANTABILITY, OR FITNESS FOR A PARTICULAR PURPOSE.
 # See LICENSE in the root of the software repository for the full text of the License.
 # -----------------------------------------------------------------------------------------------------------
-"""DeepSeek-V4 MoE routed expert as ONE persistent 24-block task. Shipped kernel.
+"""Persistent routed and shared MoE expert execution.
 
-This is what ``moe.py`` runs. ``expert_routed.py`` keeps the geometry constants,
-the weight generator, the fixture and the golden -- imported here, so the two
-share one numerics contract -- and its four-task decomposition
-(``exp_gate_up_mm`` -> ``exp_act_h_q`` -> ``exp_w2_mm`` -> ``exp_w2_act``) stays
-as the A/B partner. ``expert_routed_persistent.py`` is a third form, three
-persistent phases, kept for the case a vector phase cannot be regioned.
-
-The whole chain -- Up/Gate -> SwiGLU + A8 requant -> Down -> dequant -- runs in
-one ``pl.spmd(NUM_CORES)`` task that pulls expert slots from a grid-stride pool,
-with every intermediate on chip: no GM staging buffers, no per-stage task
-groups, no phase barrier. Measured against the four-task form on a2a3, 100
-rounds, golden replayed: **147.1 -> 118.8 us standalone (-19.2 %)**, and
-**758.4 -> 700.9 us on the 8-card CSA + MoE layer (-7.6 %, fastest-rank mean)**.
-The trace says why: task instances 320 -> 72, the critical path 3 hops -> 0, and
-scheduler-injected latency 66.7 -> 2.4 us, which flips the kernel from
-SCHEDULER-BOUND to COMPUTE-BOUND.
-
-Why the AIV split is written by hand. It began as a workaround: under PTOAS
-v0.60 plus pypto's level-3 explicit tcvt tmp, the auto split emitted lane 0 doing
-the work and lane 1 *replaying* the body with every tile at a static
-``valid_shape=0``, and an INT8 cast's codegen bridged that 0 into a ``(0, 0)``
-view pto-isa could not compile -- so the fused form did not build at all, for any
-cast spelling. That is no longer true: pypto reverted the level-3 TMP coupling and
-pinned PTOAS back to v0.57, and the reduced case now compiles. The hand split
-stays because it is also the faster form measured here, not because it is
-required; an auto-split A/B on the current pin has not been run. Cube ops sit
-outside every region, each vector phase is its own ``UP_DOWN`` region, and the two
-crossings are named: ``pl.aiv_shard`` for cube->vector, ``pl.aic_gather`` for
-vector->cube. ``UP_DOWN`` is legal only because the per-row ``row_max`` amax stays
-within a lane.
-
-The load-balancing pre-task. ``exp_balance_plan`` scans the slot table once on
-one core and writes the COMPACTED list of active slots, padded to ``N_SLOTS_B``
-with rows = 0 so the pool bound stays static -- a runtime bound would have to be
-``pl.read`` at orchestration level, which parks the whole task graph behind the
-pre-task. Each core then gets ceil/floor(n_active / 24) expert chains instead of
-a draw from {0, 1, 2}. No cost weighting: a chain is ~50 us regardless of how
-many of its <= 8 rows are live, because the 3 MiB of w1/w3/w2 it streams dwarfs
-the row work.
-
-What the pre-task is and is not worth. It is insurance, not a speedup. Against
-the same kernel without it: +10.1 % standalone, where its serial hop is the only
-thing on the critical path (0 -> 1 hop, scheduler-injected 2.4 -> 16.9 us), but
-**+0.52 % on the 8-card layer** -- inside the run-to-run spread. The overlap is an
-inference from wall time; an L3 swimlane drops the MoE half of a layer, so no trace
-backs it. What it buys is robustness:
-``route_group`` currently packs slots densely from 0, which makes the raw
-grid-stride already balanced, so the compaction is redundant *today*. Should the
-routing ever emit a sparse slot table, the unbalanced form loses up to 26 %
-(measured at n_active 16-24 on a scattered fixture) and this one does not.
-Re-measure with ``bench_activation.py`` if ``route_group``'s packing changes.
-
-The shared expert is not special. It runs the same INT8 SwiGLU FFN over the same
-intermediate slice, on tokens every rank already holds, and its result lands in
-the same TP partial -- so it is expert ``SHARED_EID`` of an ``N_BANK`` weight
-bank occupying slot ``SH_SLOT``, with every row at weight 1.0. That deletes
-``expert_shared``'s whole task chain and hands its ~50 us of weight streaming to
-the pool, which has slack (round 2 runs ~7 of 24 cores).
-
-The first K step of each matmul is peeled rather than seeded from a
-``pl.create_tensor``: the accumulator has to stay a pure matmul result so it
-lives in Acc, which is the only memory the C->V boundary accepts.
+The planned entry consumes compact slot and row-count tables produced by route
+grouping. The balanced wrapper constructs those tables for standalone fixtures
+with arbitrary active slots. A 24-block grid processes complete expert chains,
+with gate/up matmuls, SwiGLU, activation quantization, down matmul and dequantization
+kept in one mixed task. Each cube core uses two vector lanes through UP_DOWN
+regions; intermediate activations stay on chip.
 """
 
 
@@ -85,6 +29,7 @@ from expert_routed import (
 # Persistent blocks == the a2a3 AIC count. No barrier lives in this kernel, so a
 # mismatch on another SoC is a scheduling fact, not a hang.
 NUM_CORES = 24
+WORK_SLOTS_PAD = (N_SLOTS_B + IDX_PAD - 1) // IDX_PAD * IDX_PAD
 
 # One cluster = 1 cube core + 2 buddy vector cores.
 AIV_LANES = 2
@@ -110,11 +55,12 @@ FUSED_Y_TILE = max(64, min(512, 131072 // MOE_INTER))
 
 
 @pl.jit.inline(auto_scope=False)
-def expert_routed_persistent_balanced(
+def expert_routed_persistent_planned(
     recv_x: pl.Tensor[[N_SLOTS_B, RECV_MAX, D], pl.INT8],
     recv_scale_dq: pl.Tensor[[N_SLOTS_B, RECV_MAX], pl.FP32],
     recv_weights: pl.Tensor[[N_SLOTS_B, RECV_MAX], pl.FP32],
-    recv_expert_count: pl.Tensor[[N_SLOTS_B, IDX_PAD], pl.INT32],
+    work_slot: pl.Tensor[[WORK_SLOTS_PAD], pl.INT32],
+    work_rows: pl.Tensor[[WORK_SLOTS_PAD], pl.INT32],
     slot_expert: pl.Tensor[[N_SLOTS_B, IDX_PAD], pl.INT32],
     routed_w1: pl.Tensor[[N_BANK, MOE_INTER, D], pl.INT8],
     routed_w1_scale: pl.Tensor[[N_BANK, MOE_INTER], pl.FP32],
@@ -134,30 +80,6 @@ def expert_routed_persistent_balanced(
     w2_2d = pl.reshape(routed_w2, [N_BANK * D, MOE_INTER])
 
     with pl.scope():
-        # One core owns the scan: the compaction is a serial prefix, and 48
-        # scalar reads cost less than the barrier a parallel scan would need.
-        # The list is PADDED to N_SLOTS_B rather than bounded by a live count: a
-        # runtime pool bound would have to be pl.read at orchestration level,
-        # which parks the whole task graph behind the pre-task's completion.
-        # Padding entries carry rows = 0, so they land on the same zero-trip
-        # skip an empty slot already takes, and the bound stays static.
-        work_slot = pl.create_tensor([N_SLOTS_B], dtype=pl.INT32)
-        work_rows = pl.create_tensor([N_SLOTS_B], dtype=pl.INT32)
-
-        with pl.spmd(1, name_hint="exp_balance_plan", allow_early_resolve=True) as plan_tid:
-            plan_core = pl.tile.get_block_idx()
-            zero_i32 = pl.cast(0, pl.INT32)
-            for pad in pl.range(plan_core, N_SLOTS_B):
-                pl.write(work_slot, [pad], zero_i32)
-                pl.write(work_rows, [pad], zero_i32)
-            n_live = pl.cast(0, pl.INDEX)
-            for scan in pl.range(plan_core, N_SLOTS_B):
-                scan_rows = pl.read(recv_expert_count, [scan, 0])
-                if scan_rows > 0:
-                    pl.write(work_slot, [n_live], pl.cast(scan, pl.INT32))
-                    pl.write(work_rows, [n_live], scan_rows)
-                    n_live = n_live + 1
-
         # sync_start: the combine grid downstream is submitted while this task is
         # still running and parks blocks on AIV lanes waiting for recv_y. Without
         # a synchronized start this grid takes whatever lanes are free and leaves
@@ -169,7 +91,7 @@ def expert_routed_persistent_balanced(
         # so refusing a partial start gives nothing away.
         with pl.spmd(
             NUM_CORES, name_hint="exp_routed_balanced", sync_start=True,
-            allow_early_resolve=True, deps=[plan_tid],
+            allow_early_resolve=True,
         ) as _routed_tid:  # inline form requires the TaskId capture
             core = pl.tile.get_block_idx()  # 0 .. NUM_CORES-1
 
@@ -280,6 +202,46 @@ def expert_routed_persistent_balanced(
                             recv_y_flat[y_off : y_off + ROW_HALF, d0 : d0 + FUSED_Y_TILE] = \
                                 pl.cast(y_f, target_type=pl.BF16, mode="rint")
 
+    return recv_y
+
+
+@pl.jit.inline(auto_scope=False)
+def expert_routed_persistent_balanced(
+    recv_x: pl.Tensor[[N_SLOTS_B, RECV_MAX, D], pl.INT8],
+    recv_scale_dq: pl.Tensor[[N_SLOTS_B, RECV_MAX], pl.FP32],
+    recv_weights: pl.Tensor[[N_SLOTS_B, RECV_MAX], pl.FP32],
+    recv_expert_count: pl.Tensor[[N_SLOTS_B, IDX_PAD], pl.INT32],
+    slot_expert: pl.Tensor[[N_SLOTS_B, IDX_PAD], pl.INT32],
+    routed_w1: pl.Tensor[[N_BANK, MOE_INTER, D], pl.INT8],
+    routed_w1_scale: pl.Tensor[[N_BANK, MOE_INTER], pl.FP32],
+    routed_w3: pl.Tensor[[N_BANK, MOE_INTER, D], pl.INT8],
+    routed_w3_scale: pl.Tensor[[N_BANK, MOE_INTER], pl.FP32],
+    routed_w2: pl.Tensor[[N_BANK, D, MOE_INTER], pl.INT8],
+    routed_w2_scale: pl.Tensor[[N_BANK, D], pl.FP32],
+    recv_y: pl.Tensor[[N_SLOTS_B, RECV_MAX, D], pl.BF16],
+):
+    work_slot = pl.create_tensor([WORK_SLOTS_PAD], dtype=pl.INT32)
+    work_rows = pl.create_tensor([WORK_SLOTS_PAD], dtype=pl.INT32)
+
+    with pl.spmd(1, name_hint="exp_balance_plan", allow_early_resolve=True) as plan_tid:
+        plan_core = pl.tile.get_block_idx()
+        zero_i32 = pl.cast(0, pl.INT32)
+        for pad in pl.range(plan_core, N_SLOTS_B):
+            pl.write(work_slot, [pad], zero_i32)
+            pl.write(work_rows, [pad], zero_i32)
+        n_live = pl.cast(0, pl.INDEX)
+        for scan in pl.range(plan_core, N_SLOTS_B):
+            scan_rows = pl.read(recv_expert_count, [scan, 0])
+            if scan_rows > 0:
+                pl.write(work_slot, [n_live], pl.cast(scan, pl.INT32))
+                pl.write(work_rows, [n_live], scan_rows)
+                n_live = n_live + 1
+
+    expert_routed_persistent_planned(
+        recv_x, recv_scale_dq, recv_weights, work_slot, work_rows, slot_expert,
+        routed_w1, routed_w1_scale, routed_w3, routed_w3_scale,
+        routed_w2, routed_w2_scale, recv_y,
+    )
     return recv_y
 
 

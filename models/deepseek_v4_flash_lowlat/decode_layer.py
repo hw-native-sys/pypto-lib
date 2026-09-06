@@ -221,7 +221,7 @@ def decode_layer(
     x_attn = pl.create_tensor([T, HC_MULT, D], dtype=pl.FP32)
     if layer_id < 2:
         attention_swa(
-            x_hc,
+            x_hc, gate_w,
             hc_attn_fn, hc_attn_scale, hc_attn_base,
             attn_norm_w, wq_a, wq_b, wq_b_scale,
             wkv, gamma_cq, gamma_ckv, freqs_cos, freqs_sin,
@@ -240,7 +240,7 @@ def decode_layer(
         )
     elif layer_id % 2 == 1:
         attention_hca(
-            x_hc,
+            x_hc, gate_w,
             hc_attn_fn, hc_attn_scale, hc_attn_base,
             attn_norm_w, wq_a, wq_b, wq_b_scale,
             wkv, gamma_cq, gamma_ckv, freqs_cos, freqs_sin,
@@ -263,7 +263,7 @@ def decode_layer(
         )
     else:
         attention_csa(
-            x_hc,
+            x_hc, gate_w,
             hc_attn_fn, hc_attn_scale, hc_attn_base,
             attn_norm_w, wq_a, wq_b, wq_b_scale,
             wkv, gamma_cq, gamma_ckv, freqs_cos, freqs_sin,
