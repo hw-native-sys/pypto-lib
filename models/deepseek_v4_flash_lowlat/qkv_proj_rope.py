@@ -96,38 +96,16 @@ def materialize_rope_rows(
                 rope_sin_t[rope_t : rope_t + 1, 0:ROPE_DIM] = freqs_sin[rope_pos : rope_pos + 1, 0:ROPE_DIM]
 
 @pl.jit.inline
-def qkv_proj_rope(
-    x: pl.Tensor[[T_DYN, D], pl.BF16],
-    wq_a: pl.Tensor[[D, Q_LORA], pl.BF16],
-    wq_b: pl.Tensor[[Q_LORA, H * HEAD_DIM], pl.INT8],
-    wq_b_scale: pl.Tensor[[H * HEAD_DIM], pl.FP32],
-    wkv: pl.Tensor[[D, HEAD_DIM], pl.BF16],
+def prepare_qkv_rope_metadata(
     rope_cos: pl.Tensor[[T_DYN, ROPE_DIM], pl.BF16],
     rope_sin: pl.Tensor[[T_DYN, ROPE_DIM], pl.BF16],
-    gamma_cq: pl.Tensor[[Q_LORA], pl.BF16],
-    gamma_ckv: pl.Tensor[[HEAD_DIM], pl.BF16],
-    q: pl.Tensor[[T_DYN, H, HEAD_DIM], pl.BF16],
-    kv: pl.Tensor[[T_DYN, HEAD_DIM], pl.BF16],
-    qr: pl.Tensor[[T_DYN, Q_LORA], pl.INT8],
-    qr_scale: pl.Tensor[[T_DYN, 1], pl.FP32],
-    late_dep: pl.Scalar[pl.TASK_ID],
-    q_head_base: pl.Scalar[pl.INT32],
+    q_rope_cos_il: pl.Out[pl.Tensor[[T_DYN, ROPE_DIM], pl.FP32]],
+    q_rope_sin_signed: pl.Out[pl.Tensor[[T_DYN, ROPE_DIM], pl.FP32]],
+    q_rope_swap_idx: pl.Out[pl.Tensor[[T_DYN, ROPE_DIM], pl.INT32]],
 ):
-    t_dim = pl.tensor.dim(x, 0)
-    x_view = pl.reshape(x, [t_dim, D])
+    t_dim = pl.tensor.dim(rope_cos, 0)
     rope_cos_view = pl.reshape(rope_cos, [t_dim, ROPE_DIM])
     rope_sin_view = pl.reshape(rope_sin, [t_dim, ROPE_DIM])
-    kv_view = pl.reshape(kv, [t_dim, HEAD_DIM])
-    qr_view = pl.reshape(qr, [t_dim, Q_LORA])
-    qr_scale_view = pl.reshape(qr_scale, [t_dim, 1])
-    t_matmul = pl.max(t_dim, MATMUL_T_TILE)
-
-    # RoPE indices and interleaved cos/signed-sin rows are head-invariant.
-    # Prepare them once per token tile so the 16 Q head-group tasks do not each
-    # rebuild the same arange/cast/gather chain on their critical AIV path.
-    q_rope_cos_il = pl.create_tensor([t_dim, ROPE_DIM], dtype=pl.FP32)
-    q_rope_sin_signed = pl.create_tensor([t_dim, ROPE_DIM], dtype=pl.FP32)
-    q_rope_swap_idx = pl.create_tensor([t_dim, ROPE_DIM], dtype=pl.INT32)
     for qrp_idx in pl.spmd(t_dim // Q_ROPE_T_TILE, name_hint="q_rope_prepare", allow_early_resolve=True):
         qrp_t0 = qrp_idx * Q_ROPE_T_TILE
         qrp_ones = pl.full([Q_ROPE_T_TILE, ROPE_DIM], dtype=pl.FP32, value=1.0)
@@ -154,6 +132,35 @@ def qkv_proj_rope(
         q_rope_cos_il[qrp_t0 : qrp_t0 + Q_ROPE_T_TILE, :] = qrp_cos_il
         q_rope_sin_signed[qrp_t0 : qrp_t0 + Q_ROPE_T_TILE, :] = qrp_sin_signed
         q_rope_swap_idx[qrp_t0 : qrp_t0 + Q_ROPE_T_TILE, :] = qrp_swap_idx
+
+
+@pl.jit.inline
+def qkv_proj_rope(
+    x: pl.Tensor[[T_DYN, D], pl.BF16],
+    wq_a: pl.Tensor[[D, Q_LORA], pl.BF16],
+    wq_b: pl.Tensor[[Q_LORA, H * HEAD_DIM], pl.INT8],
+    wq_b_scale: pl.Tensor[[H * HEAD_DIM], pl.FP32],
+    wkv: pl.Tensor[[D, HEAD_DIM], pl.BF16],
+    rope_cos: pl.Tensor[[T_DYN, ROPE_DIM], pl.BF16],
+    rope_sin: pl.Tensor[[T_DYN, ROPE_DIM], pl.BF16],
+    gamma_cq: pl.Tensor[[Q_LORA], pl.BF16],
+    gamma_ckv: pl.Tensor[[HEAD_DIM], pl.BF16],
+    q: pl.Tensor[[T_DYN, H, HEAD_DIM], pl.BF16],
+    kv: pl.Tensor[[T_DYN, HEAD_DIM], pl.BF16],
+    qr: pl.Tensor[[T_DYN, Q_LORA], pl.INT8],
+    qr_scale: pl.Tensor[[T_DYN, 1], pl.FP32],
+    late_dep: pl.Scalar[pl.TASK_ID],
+    q_head_base: pl.Scalar[pl.INT32],
+    q_rope_cos_il: pl.Tensor[[T_DYN, ROPE_DIM], pl.FP32],
+    q_rope_sin_signed: pl.Tensor[[T_DYN, ROPE_DIM], pl.FP32],
+    q_rope_swap_idx: pl.Tensor[[T_DYN, ROPE_DIM], pl.INT32],
+):
+    t_dim = pl.tensor.dim(x, 0)
+    x_view = pl.reshape(x, [t_dim, D])
+    kv_view = pl.reshape(kv, [t_dim, HEAD_DIM])
+    qr_view = pl.reshape(qr, [t_dim, Q_LORA])
+    qr_scale_view = pl.reshape(qr_scale, [t_dim, 1])
+    t_matmul = pl.max(t_dim, MATMUL_T_TILE)
 
     # Split-K qr_proj (M=t_dim, K=D=4096, N=Q_LORA=1024). QR_N_TILE=128 gives
     # eight N-groups; QR_OK=2 expands them to 16 cube blocks and atomic-adds the
@@ -408,6 +415,11 @@ def qkv_proj_rope_test(
     # One card's head shard. The kernel is head-sharded and writes only
     # q[:, q_head_base : q_head_base + Q_HEADS_LOCAL]; this entry models group 0,
     # and the golden leaves the other groups' heads at their zero init.
+    t_dim = pl.tensor.dim(x, 0)
+    q_rope_cos_il = pl.create_tensor([t_dim, ROPE_DIM], dtype=pl.FP32)
+    q_rope_sin_signed = pl.create_tensor([t_dim, ROPE_DIM], dtype=pl.FP32)
+    q_rope_swap_idx = pl.create_tensor([t_dim, ROPE_DIM], dtype=pl.INT32)
+    prepare_qkv_rope_metadata(rope_cos, rope_sin, q_rope_cos_il, q_rope_sin_signed, q_rope_swap_idx)
     qkv_proj_rope(
         x,
         wq_a,
@@ -423,7 +435,7 @@ def qkv_proj_rope_test(
         qr,
         qr_scale,
         late_dep,
-        TEST_Q_HEAD_BASE,
+        TEST_Q_HEAD_BASE, q_rope_cos_il, q_rope_sin_signed, q_rope_swap_idx,
     )
     return q
 

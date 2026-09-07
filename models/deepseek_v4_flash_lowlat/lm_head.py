@@ -117,7 +117,7 @@ def lm_head(
     # Publish this card's logit rows into every group member's window slot: the
     # window holds one slot per group member and each card writes only its own,
     # `tp_rank * MAX_LOGIT_ROWS`. One block per logit row, one [1, D] put per peer.
-    for row in pl.spmd(MAX_LOGIT_ROWS, name_hint="lm_head_dispatch_push"):
+    for row in pl.spmd(MAX_LOGIT_ROWS, name_hint="lm_head_dispatch_push", allow_early_resolve=True):
         hidden_rows = pl.tensor.dim(hidden_states, 0)
         source_row_raw = pl.read(logit_row_indices, [row])
         # Clamp so the load address is always inside hidden_states even if a
@@ -153,7 +153,7 @@ def lm_head(
                 )
 
     # Anchor the blocking wait to the local hidden-state producer.
-    with pl.at(level=pl.Level.CORE_GROUP, name_hint="lm_head_dispatch_wait") as _dwait_tid:
+    with pl.at(level=pl.Level.CORE_GROUP, name_hint="lm_head_dispatch_wait", allow_early_resolve=True) as _dwait_tid:
         _hidden_anchor = pl.read(hidden_states, [0, 0])
         for owner_tp in pl.range(TP_SIZE):
             if owner_tp != tp_rank:
@@ -167,7 +167,7 @@ def lm_head(
     # Window -> matmul operand: a local copy split over k-tiles. Keeps the matmul's
     # auto-dep on owner_hiddens.
     with pl.spmd(
-        D // HIDDEN_GATHER_TILE, name_hint="lm_head_dispatch_gather", deps=[_dwait_tid]
+        D // HIDDEN_GATHER_TILE, name_hint="lm_head_dispatch_gather", allow_early_resolve=True, deps=[_dwait_tid]
     ) as _dgather_tid:
         gkb = pl.tile.get_block_idx()
         gk0 = gkb * HIDDEN_GATHER_TILE
@@ -180,7 +180,7 @@ def lm_head(
     logits_shards = pl.create_tensor([GROUP_LOGIT_ROWS, SHARDS_VOCAB], dtype=pl.FP32)
     with pl.spmd(
         FUSED_LM_HEAD_CORES,
-        name_hint="lm_head_matmul_push",
+        name_hint="lm_head_matmul_push", allow_early_resolve=True,
         optimizations=[pl.cross_core_slot(slot_num=2)],
     ) as _push_tid:
         lm_core = pl.tile.get_block_idx()
@@ -262,7 +262,7 @@ def lm_head(
 
     # Keep the blocking wait behind the local logits push.
     with pl.at(
-        level=pl.Level.CORE_GROUP, name_hint="lm_head_combine_wait", deps=[_push_tid]
+        level=pl.Level.CORE_GROUP, name_hint="lm_head_combine_wait", allow_early_resolve=True, deps=[_push_tid]
     ) as _cwait_tid:
         for src_tp in pl.range(TP_SIZE):
             if src_tp != tp_rank:
@@ -276,7 +276,7 @@ def lm_head(
     # Assemble full-vocabulary logits, same vocab-tile split. deps on _cwait_tid for
     # the peers' stores; our own tiles ride the local RAW edge on logits_window.
     with pl.spmd(
-        LOGITS_COMM_BLOCKS, name_hint="lm_head_combine_gather", deps=[_cwait_tid]
+        LOGITS_COMM_BLOCKS, name_hint="lm_head_combine_gather", allow_early_resolve=True, deps=[_cwait_tid]
     ) as _gather_tid:
         gblk = pl.tile.get_block_idx()
         for src_tp in pl.range(TP_SIZE):

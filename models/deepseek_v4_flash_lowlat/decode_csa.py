@@ -36,6 +36,9 @@ older draft surface.
 """
 
 
+from qkv_proj_rope import prepare_qkv_rope_metadata
+from decode_sparse_attn_csa import prepare_csa_output_rope, H_TILE as CSA_ROPE_ROWS
+from decode_indexer import prepare_indexer_rope_indices, ROPE_ROW_TILE as IDX_ROPE_ROWS
 import pypto.language as pl
 import pypto.language.distributed as pld
 
@@ -145,6 +148,61 @@ CMP_BLOCK_NUM_DYN = pl.dynamic("CMP_BLOCK_NUM_DYN")
 CSA_WB_TOKEN_TILE = 8
 
 @pl.jit.inline
+def prepare_csa_metadata(
+    freqs_cos: pl.Tensor[[MAX_SEQ_LEN, ROPE_HEAD_DIM], pl.BF16],
+    freqs_sin: pl.Tensor[[MAX_SEQ_LEN, ROPE_HEAD_DIM], pl.BF16],
+    position_ids: pl.Tensor[[T], pl.INT32],
+    rope_cos_t: pl.Out[pl.Tensor[[T, ROPE_HEAD_DIM], pl.BF16]],
+    rope_sin_t: pl.Out[pl.Tensor[[T, ROPE_HEAD_DIM], pl.BF16]],
+    step_cos_il: pl.Out[pl.Tensor[[B, ROPE_HEAD_DIM], pl.FP32]],
+    step_sin_signed: pl.Out[pl.Tensor[[B, ROPE_HEAD_DIM], pl.FP32]],
+    cmp_cos_il: pl.Out[pl.Tensor[[B, ROPE_HEAD_DIM], pl.FP32]],
+    cmp_sin_signed: pl.Out[pl.Tensor[[B, ROPE_HEAD_DIM], pl.FP32]],
+    q_rope_cos_il: pl.Out[pl.Tensor[[T, ROPE_HEAD_DIM], pl.FP32]],
+    q_rope_sin_signed: pl.Out[pl.Tensor[[T, ROPE_HEAD_DIM], pl.FP32]],
+    q_rope_swap_idx: pl.Out[pl.Tensor[[T, ROPE_HEAD_DIM], pl.INT32]],
+    out_rope_cos_il: pl.Out[pl.Tensor[[T, ROPE_HEAD_DIM], pl.FP32]],
+    out_rope_sin_signed: pl.Out[pl.Tensor[[T, ROPE_HEAD_DIM], pl.FP32]],
+    out_rope_swap_idx: pl.Out[pl.Tensor[[CSA_ROPE_ROWS, ROPE_HEAD_DIM], pl.INT32]],
+    idx_rope_swap_idx: pl.Out[pl.Tensor[[IDX_ROPE_ROWS, ROPE_HEAD_DIM], pl.INT32]],
+):
+    step_cos = pl.create_tensor([B, HALF_ROPE], dtype=pl.FP32)
+    step_sin = pl.create_tensor([B, HALF_ROPE], dtype=pl.FP32)
+    with pl.at(level=pl.Level.CORE_GROUP, name_hint="csa_rope_step"):
+        for b in pl.range(B):
+            first_t = b * S
+            first_pos_b = pl.read(position_ids, [first_t])
+            step_pos_b = pl.cast(first_pos_b, pl.INDEX)
+            for s in pl.range(S):
+                t = b * S + s
+                pos_b = pl.cast(pl.read(position_ids, [t]), pl.INDEX)
+                cos_row = pl.cast(freqs_cos[pos_b : pos_b + 1, 0 : ROPE_HEAD_DIM], target_type=pl.FP32)
+                sin_row = pl.cast(freqs_sin[pos_b : pos_b + 1, 0 : ROPE_HEAD_DIM], target_type=pl.FP32)
+                rope_cos_t[t : t + 1, 0 : ROPE_HEAD_DIM] = pl.cast(cos_row, target_type=pl.BF16)
+                rope_sin_t[t : t + 1, 0 : ROPE_HEAD_DIM] = pl.cast(sin_row, target_type=pl.BF16)
+            step_cos[b : b + 1, 0 : HALF_ROPE] = pl.cast(freqs_cos[step_pos_b : step_pos_b + 1, 0 : HALF_ROPE], target_type=pl.FP32)
+            step_sin[b : b + 1, 0 : HALF_ROPE] = pl.cast(freqs_sin[step_pos_b : step_pos_b + 1, 0 : HALF_ROPE], target_type=pl.FP32)
+
+    rope_interleave(step_cos, step_sin, step_cos_il, step_sin_signed)
+
+    cmp_cos = pl.create_tensor([B, HALF_ROPE], dtype=pl.FP32)
+    cmp_sin = pl.create_tensor([B, HALF_ROPE], dtype=pl.FP32)
+    with pl.at(level=pl.Level.CORE_GROUP, name_hint="csa_cmp_rope"):
+        for b in pl.range(B):
+            first_t = b * S
+            first_pos_b = pl.read(position_ids, [first_t])
+            cmp_offset_b = COMPRESS_RATIO - (first_pos_b % COMPRESS_RATIO)
+            cmp_pos_b = pl.cast(first_pos_b + cmp_offset_b - COMPRESS_RATIO, pl.INDEX)
+            cmp_cos[b : b + 1, 0 : HALF_ROPE] = pl.cast(freqs_cos[cmp_pos_b : cmp_pos_b + 1, 0 : HALF_ROPE], target_type=pl.FP32)
+            cmp_sin[b : b + 1, 0 : HALF_ROPE] = pl.cast(freqs_sin[cmp_pos_b : cmp_pos_b + 1, 0 : HALF_ROPE], target_type=pl.FP32)
+
+    rope_interleave(cmp_cos, cmp_sin, cmp_cos_il, cmp_sin_signed)
+    prepare_qkv_rope_metadata(rope_cos_t, rope_sin_t, q_rope_cos_il, q_rope_sin_signed, q_rope_swap_idx)
+    prepare_csa_output_rope(rope_cos_t, rope_sin_t, out_rope_cos_il, out_rope_sin_signed, out_rope_swap_idx)
+    prepare_indexer_rope_indices(idx_rope_swap_idx)
+
+
+@pl.jit.inline
 def attention_csa_packed(
     x_hc: pl.Tensor[[T, HC_MULT, D], pl.FP32],
     gate_w: pl.Tensor[[N_EXPERTS, D], pl.FP32],
@@ -158,8 +216,12 @@ def attention_csa_packed(
     wkv: pl.Tensor[[D, HEAD_DIM], pl.BF16],
     gamma_cq: pl.Tensor[[Q_LORA], pl.BF16],
     gamma_ckv: pl.Tensor[[HEAD_DIM], pl.BF16],
-    freqs_cos: pl.Tensor[[MAX_SEQ_LEN, ROPE_HEAD_DIM], pl.BF16],
-    freqs_sin: pl.Tensor[[MAX_SEQ_LEN, ROPE_HEAD_DIM], pl.BF16],
+    rope_cos_t: pl.Tensor[[T, ROPE_HEAD_DIM], pl.BF16],
+    rope_sin_t: pl.Tensor[[T, ROPE_HEAD_DIM], pl.BF16],
+    step_cos_il: pl.Tensor[[B, ROPE_HEAD_DIM], pl.FP32],
+    step_sin_signed: pl.Tensor[[B, ROPE_HEAD_DIM], pl.FP32],
+    cmp_cos_il: pl.Tensor[[B, ROPE_HEAD_DIM], pl.FP32],
+    cmp_sin_signed: pl.Tensor[[B, ROPE_HEAD_DIM], pl.FP32],
     cmp_wkv: pl.Tensor[[MAIN_OUT_DIM, D], pl.BF16],
     cmp_wgate: pl.Tensor[[MAIN_OUT_DIM, D], pl.BF16],
     cmp_ape: pl.Tensor[[COMPRESS_RATIO, MAIN_OUT_DIM], pl.FP32],
@@ -203,54 +265,16 @@ def attention_csa_packed(
     o_signal: pld.DistributedTensor[[OPROJ_N_RANKS, 1], pl.INT32],
     my_rank: pl.Scalar[pl.INT32],
     tok_epoch: pl.Scalar[pl.INT32],
+    q_rope_cos_il: pl.Tensor[[T, ROPE_HEAD_DIM], pl.FP32],
+    q_rope_sin_signed: pl.Tensor[[T, ROPE_HEAD_DIM], pl.FP32],
+    q_rope_swap_idx: pl.Tensor[[T, ROPE_HEAD_DIM], pl.INT32],
+    out_rope_cos_il: pl.Tensor[[T, ROPE_HEAD_DIM], pl.FP32],
+    out_rope_sin_signed: pl.Tensor[[T, ROPE_HEAD_DIM], pl.FP32],
+    out_rope_swap_idx: pl.Tensor[[CSA_ROPE_ROWS, ROPE_HEAD_DIM], pl.INT32],
+    idx_rope_swap_idx: pl.Tensor[[IDX_ROPE_ROWS, ROPE_HEAD_DIM], pl.INT32],
 ) -> pl.Scalar[pl.TASK_ID]:
     x_mixed = pl.create_tensor([T, D], dtype=pl.BF16)
     hc_pre(x_hc, hc_attn_fn, hc_attn_scale, hc_attn_base, x_mixed, post_t, comb_t)
-
-    rope_cos_t = pl.create_tensor([T, ROPE_HEAD_DIM], dtype=pl.BF16)
-    rope_sin_t = pl.create_tensor([T, ROPE_HEAD_DIM], dtype=pl.BF16)
-    step_cos = pl.create_tensor([B, HALF_ROPE], dtype=pl.FP32)
-    step_sin = pl.create_tensor([B, HALF_ROPE], dtype=pl.FP32)
-    # Interleave-duplicated / sign-folded step rope rows for the indexer subsystem.
-    # The indexer's qr_rope re-ran the j>>1 dup-gather on each of its 16 spmd blocks
-    # (32 rows each) and its compressor once more; pl.gather lowers to a per-row
-    # TGATHER loop, so that was ~1056 row-gathers per layer to rebuild one small
-    # position-invariant table. Built once here instead (B rows, off the critical
-    # path -- this scope has no producer) and read as a plain load downstream.
-    step_cos_il = pl.create_tensor([B, ROPE_HEAD_DIM], dtype=pl.FP32)
-    step_sin_signed = pl.create_tensor([B, ROPE_HEAD_DIM], dtype=pl.FP32)
-    with pl.at(level=pl.Level.CORE_GROUP, name_hint="csa_rope_step"):
-        for b in pl.range(B):
-            first_t = b * S
-            first_pos_b = pl.read(position_ids, [first_t])
-            step_pos_b = pl.cast(first_pos_b, pl.INDEX)
-            for s in pl.range(S):
-                t = b * S + s
-                pos_b = pl.cast(pl.read(position_ids, [t]), pl.INDEX)
-                cos_row = pl.cast(freqs_cos[pos_b : pos_b + 1, 0 : ROPE_HEAD_DIM], target_type=pl.FP32)
-                sin_row = pl.cast(freqs_sin[pos_b : pos_b + 1, 0 : ROPE_HEAD_DIM], target_type=pl.FP32)
-                rope_cos_t[t : t + 1, 0 : ROPE_HEAD_DIM] = pl.cast(cos_row, target_type=pl.BF16)
-                rope_sin_t[t : t + 1, 0 : ROPE_HEAD_DIM] = pl.cast(sin_row, target_type=pl.BF16)
-            step_cos[b : b + 1, 0 : HALF_ROPE] = pl.cast(freqs_cos[step_pos_b : step_pos_b + 1, 0 : HALF_ROPE], target_type=pl.FP32)
-            step_sin[b : b + 1, 0 : HALF_ROPE] = pl.cast(freqs_sin[step_pos_b : step_pos_b + 1, 0 : HALF_ROPE], target_type=pl.FP32)
-
-    rope_interleave(step_cos, step_sin, step_cos_il, step_sin_signed)
-
-    cmp_cos = pl.create_tensor([B, HALF_ROPE], dtype=pl.FP32)
-    cmp_sin = pl.create_tensor([B, HALF_ROPE], dtype=pl.FP32)
-    # Same hoist as step_cos_il above, for the main compressor's rmsnorm_rope.
-    cmp_cos_il = pl.create_tensor([B, ROPE_HEAD_DIM], dtype=pl.FP32)
-    cmp_sin_signed = pl.create_tensor([B, ROPE_HEAD_DIM], dtype=pl.FP32)
-    with pl.at(level=pl.Level.CORE_GROUP, name_hint="csa_cmp_rope"):
-        for b in pl.range(B):
-            first_t = b * S
-            first_pos_b = pl.read(position_ids, [first_t])
-            cmp_offset_b = COMPRESS_RATIO - (first_pos_b % COMPRESS_RATIO)
-            cmp_pos_b = pl.cast(first_pos_b + cmp_offset_b - COMPRESS_RATIO, pl.INDEX)
-            cmp_cos[b : b + 1, 0 : HALF_ROPE] = pl.cast(freqs_cos[cmp_pos_b : cmp_pos_b + 1, 0 : HALF_ROPE], target_type=pl.FP32)
-            cmp_sin[b : b + 1, 0 : HALF_ROPE] = pl.cast(freqs_sin[cmp_pos_b : cmp_pos_b + 1, 0 : HALF_ROPE], target_type=pl.FP32)
-
-    rope_interleave(cmp_cos, cmp_sin, cmp_cos_il, cmp_sin_signed)
 
     x_normed_t = pl.create_tensor([T, D], dtype=pl.BF16)
     rms_tid = rms_norm(x_mixed, attn_norm_w, x_normed_t)
@@ -292,7 +316,7 @@ def attention_csa_packed(
         x_normed_t, wq_a, wq_b, wq_b_scale, wkv,
         rope_cos_t, rope_sin_t, gamma_cq, gamma_ckv,
         q, kv, qr, qr_scale, late_dep,
-        pl.cast(my_rank, pl.INT32) * (H // O_GROUPS),
+        pl.cast(my_rank, pl.INT32) * (H // O_GROUPS), q_rope_cos_il, q_rope_sin_signed, q_rope_swap_idx,
     )
 
     # Transpose q onto the token shard right here. Everything between this push
@@ -340,7 +364,7 @@ def attention_csa_packed(
         idx_score_unused, idx_topk_full,
         position_ids_bsd, idx_slot_mapping_bsd, inner_state_slot_mapping_bsd,
         kv_seq_lens, 0, late_dep,
-        my_rank,
+        my_rank, idx_rope_swap_idx,
     )
 
     # sparse_attn_csa now folds the compressed-slot masking + valid-block flags in from
@@ -352,7 +376,7 @@ def attention_csa_packed(
         q_window, q_signal, q_push_tid, kv_cache, window_swa_indices,
         cmp_kv, cmp_block_table, idx_topk_flat, position_ids_t1,
         attn_sink, rope_cos_t, rope_sin_t, o_packed,
-        o_window, o_signal, my_rank, tok_epoch,
+        o_window, o_signal, my_rank, tok_epoch, out_rope_cos_il, out_rope_sin_signed, out_rope_swap_idx,
     )
 
 
@@ -370,8 +394,12 @@ def attention_csa(
     wkv: pl.Tensor[[D, HEAD_DIM], pl.BF16],
     gamma_cq: pl.Tensor[[Q_LORA], pl.BF16],
     gamma_ckv: pl.Tensor[[HEAD_DIM], pl.BF16],
-    freqs_cos: pl.Tensor[[MAX_SEQ_LEN, ROPE_HEAD_DIM], pl.BF16],
-    freqs_sin: pl.Tensor[[MAX_SEQ_LEN, ROPE_HEAD_DIM], pl.BF16],
+    rope_cos_t: pl.Tensor[[T, ROPE_HEAD_DIM], pl.BF16],
+    rope_sin_t: pl.Tensor[[T, ROPE_HEAD_DIM], pl.BF16],
+    step_cos_il: pl.Tensor[[B, ROPE_HEAD_DIM], pl.FP32],
+    step_sin_signed: pl.Tensor[[B, ROPE_HEAD_DIM], pl.FP32],
+    cmp_cos_il: pl.Tensor[[B, ROPE_HEAD_DIM], pl.FP32],
+    cmp_sin_signed: pl.Tensor[[B, ROPE_HEAD_DIM], pl.FP32],
     cmp_wkv: pl.Tensor[[MAIN_OUT_DIM, D], pl.BF16],
     cmp_wgate: pl.Tensor[[MAIN_OUT_DIM, D], pl.BF16],
     cmp_ape: pl.Tensor[[COMPRESS_RATIO, MAIN_OUT_DIM], pl.FP32],
@@ -422,6 +450,13 @@ def attention_csa(
     # advances twice per loop; these windows are notified by CSA layers alone, and
     # a wait for an epoch nobody will reach hangs the card.
     tok_epoch: pl.Scalar[pl.INT32],
+    q_rope_cos_il: pl.Tensor[[T, ROPE_HEAD_DIM], pl.FP32],
+    q_rope_sin_signed: pl.Tensor[[T, ROPE_HEAD_DIM], pl.FP32],
+    q_rope_swap_idx: pl.Tensor[[T, ROPE_HEAD_DIM], pl.INT32],
+    out_rope_cos_il: pl.Tensor[[T, ROPE_HEAD_DIM], pl.FP32],
+    out_rope_sin_signed: pl.Tensor[[T, ROPE_HEAD_DIM], pl.FP32],
+    out_rope_swap_idx: pl.Tensor[[CSA_ROPE_ROWS, ROPE_HEAD_DIM], pl.INT32],
+    idx_rope_swap_idx: pl.Tensor[[IDX_ROPE_ROWS, ROPE_HEAD_DIM], pl.INT32],
 ):
     """CSA layer whose attention is token-sharded and projection group-sharded.
 
@@ -433,9 +468,9 @@ def attention_csa(
     post_t = pl.create_tensor([T, HC_MULT], dtype=pl.FP32)
     comb_t = pl.create_tensor([T, HC_MULT * HC_MULT], dtype=pl.FP32)
     merge_tid = attention_csa_packed(
-        x_hc, gate_w, hc_attn_fn, hc_attn_scale, hc_attn_base, attn_norm_w, wq_a, wq_b, wq_b_scale, wkv, gamma_cq, gamma_ckv, freqs_cos, freqs_sin, cmp_wkv, cmp_wgate, cmp_ape, cmp_norm_w, compress_state, compress_state_block_table, idx_wq_b, idx_wq_b_scale, weights_proj, hadamard_idx, inner_wkv, inner_wgate, inner_ape, inner_norm_w, inner_compress_state, inner_compress_state_block_table, kv_cache, cmp_kv, cmp_block_table, idx_kv_cache, idx_kv_scale, idx_block_table, ori_slot_mapping, window_swa_indices, window_swa_lens, cmp_slot_mapping, idx_slot_mapping, state_slot_mapping, inner_state_slot_mapping, position_ids, kv_seq_lens, attn_sink,
+        x_hc, gate_w, hc_attn_fn, hc_attn_scale, hc_attn_base, attn_norm_w, wq_a, wq_b, wq_b_scale, wkv, gamma_cq, gamma_ckv, rope_cos_t, rope_sin_t, step_cos_il, step_sin_signed, cmp_cos_il, cmp_sin_signed, cmp_wkv, cmp_wgate, cmp_ape, cmp_norm_w, compress_state, compress_state_block_table, idx_wq_b, idx_wq_b_scale, weights_proj, hadamard_idx, inner_wkv, inner_wgate, inner_ape, inner_norm_w, inner_compress_state, inner_compress_state_block_table, kv_cache, cmp_kv, cmp_block_table, idx_kv_cache, idx_kv_scale, idx_block_table, ori_slot_mapping, window_swa_indices, window_swa_lens, cmp_slot_mapping, idx_slot_mapping, state_slot_mapping, inner_state_slot_mapping, position_ids, kv_seq_lens, attn_sink,
         wo_a_shard, wo_b_shard, o_packed, post_t, comb_t,
-        q_window, q_signal, o_window, o_signal, my_rank, tok_epoch,
+        q_window, q_signal, o_window, o_signal, my_rank, tok_epoch, q_rope_cos_il, q_rope_sin_signed, q_rope_swap_idx, out_rope_cos_il, out_rope_sin_signed, out_rope_swap_idx, idx_rope_swap_idx,
     )
     attn_out = pl.create_tensor([T, D], dtype=pl.BF16)
     o_proj_tp_core(
@@ -537,11 +572,25 @@ def attention_csa_test(
     # a wait for an epoch nobody will reach hangs the card.
     tok_epoch: pl.Scalar[pl.INT32],
 ):
+    rope_cos_t = pl.create_tensor([T, ROPE_HEAD_DIM], dtype=pl.BF16)
+    rope_sin_t = pl.create_tensor([T, ROPE_HEAD_DIM], dtype=pl.BF16)
+    step_cos_il = pl.create_tensor([B, ROPE_HEAD_DIM], dtype=pl.FP32)
+    step_sin_signed = pl.create_tensor([B, ROPE_HEAD_DIM], dtype=pl.FP32)
+    cmp_cos_il = pl.create_tensor([B, ROPE_HEAD_DIM], dtype=pl.FP32)
+    cmp_sin_signed = pl.create_tensor([B, ROPE_HEAD_DIM], dtype=pl.FP32)
+    q_rope_cos_il = pl.create_tensor([T, ROPE_HEAD_DIM], dtype=pl.FP32)
+    q_rope_sin_signed = pl.create_tensor([T, ROPE_HEAD_DIM], dtype=pl.FP32)
+    q_rope_swap_idx = pl.create_tensor([T, ROPE_HEAD_DIM], dtype=pl.INT32)
+    out_rope_cos_il = pl.create_tensor([T, ROPE_HEAD_DIM], dtype=pl.FP32)
+    out_rope_sin_signed = pl.create_tensor([T, ROPE_HEAD_DIM], dtype=pl.FP32)
+    out_rope_swap_idx = pl.create_tensor([CSA_ROPE_ROWS, ROPE_HEAD_DIM], dtype=pl.INT32)
+    idx_rope_swap_idx = pl.create_tensor([IDX_ROPE_ROWS, ROPE_HEAD_DIM], dtype=pl.INT32)
+    prepare_csa_metadata(freqs_cos, freqs_sin, position_ids, rope_cos_t, rope_sin_t, step_cos_il, step_sin_signed, cmp_cos_il, cmp_sin_signed, q_rope_cos_il, q_rope_sin_signed, q_rope_swap_idx, out_rope_cos_il, out_rope_sin_signed, out_rope_swap_idx, idx_rope_swap_idx)
     attention_csa(
-        x_hc, gate_w, hc_attn_fn, hc_attn_scale, hc_attn_base, attn_norm_w, wq_a, wq_b, wq_b_scale, wkv, gamma_cq, gamma_ckv, freqs_cos, freqs_sin, cmp_wkv, cmp_wgate, cmp_ape, cmp_norm_w, compress_state, compress_state_block_table, idx_wq_b, idx_wq_b_scale, weights_proj, hadamard_idx, inner_wkv, inner_wgate, inner_ape, inner_norm_w, inner_compress_state, inner_compress_state_block_table, kv_cache, cmp_kv, cmp_block_table, idx_kv_cache, idx_kv_scale, idx_block_table, ori_slot_mapping, window_swa_indices, window_swa_lens, cmp_slot_mapping, idx_slot_mapping, state_slot_mapping, inner_state_slot_mapping, position_ids, kv_seq_lens, attn_sink,
+        x_hc, gate_w, hc_attn_fn, hc_attn_scale, hc_attn_base, attn_norm_w, wq_a, wq_b, wq_b_scale, wkv, gamma_cq, gamma_ckv, rope_cos_t, rope_sin_t, step_cos_il, step_sin_signed, cmp_cos_il, cmp_sin_signed, cmp_wkv, cmp_wgate, cmp_ape, cmp_norm_w, compress_state, compress_state_block_table, idx_wq_b, idx_wq_b_scale, weights_proj, hadamard_idx, inner_wkv, inner_wgate, inner_ape, inner_norm_w, inner_compress_state, inner_compress_state_block_table, kv_cache, cmp_kv, cmp_block_table, idx_kv_cache, idx_kv_scale, idx_block_table, ori_slot_mapping, window_swa_indices, window_swa_lens, cmp_slot_mapping, idx_slot_mapping, state_slot_mapping, inner_state_slot_mapping, position_ids, kv_seq_lens, attn_sink,
         wo_a_shard, wo_b_shard, wo_b_scale, x_out,
         reduce_window, scale_window, reduce_signal, sync_signal,
-        q_window, q_signal, o_window, o_signal, my_rank, oproj_epoch, tok_epoch,
+        q_window, q_signal, o_window, o_signal, my_rank, oproj_epoch, tok_epoch, q_rope_cos_il, q_rope_sin_signed, q_rope_swap_idx, out_rope_cos_il, out_rope_sin_signed, out_rope_swap_idx, idx_rope_swap_idx,
     )
     clear_csa_oproj_signals(x_out, reduce_signal, sync_signal, q_signal, o_signal)
     return x_out

@@ -55,7 +55,7 @@ def hc_head(
     y_flat = pl.reshape(y, [t_dim, D])
     # rms: split-K sum-of-squares, fanned over (token-tile x K-slice)
     sq_part = pl.create_tensor([RMS_OK, t_dim], dtype=pl.FP32)
-    for task in pl.spmd((t_dim // T_TILE) * RMS_OK, name_hint="hc_head_rms"):
+    for task in pl.spmd((t_dim // T_TILE) * RMS_OK, name_hint="hc_head_rms", allow_early_resolve=True):
         t0 = (task // RMS_OK) * T_TILE
         ok = task % RMS_OK
         k_base = ok * (HC_DIM // RMS_OK)
@@ -70,14 +70,14 @@ def hc_head(
     # linear: split-K head projection, fanned over (row-block x K-slice); each task
     # atomic-adds its [LINEAR_T_TILE, HC_PAD] FP32 partial into the kernel-zeroed mixes_raw
     mixes_raw = pl.create_tensor([t_linear, HC_PAD], dtype=pl.FP32)
-    with pl.spmd(t_linear // LINEAR_T_TILE, name_hint="hc_head_linear_seed") as linear_seed_tid:
+    with pl.spmd(t_linear // LINEAR_T_TILE, name_hint="hc_head_linear_seed", allow_early_resolve=True) as linear_seed_tid:
         seed_block = pl.tile.get_block_idx()
         seed_t0 = seed_block * LINEAR_T_TILE
         zeros = pl.full([LINEAR_T_TILE, HC_PAD], dtype=pl.FP32, value=0.0)
         mixes_raw[seed_t0 : seed_t0 + LINEAR_T_TILE, 0:HC_PAD] = zeros
     with pl.spmd(
         (t_linear // LINEAR_T_TILE) * LINEAR_OK,
-        name_hint="hc_head_linear",
+        name_hint="hc_head_linear", allow_early_resolve=True,
         deps=[linear_seed_tid],
     ) as _linear_tid:
         task = pl.tile.get_block_idx()
@@ -93,7 +93,7 @@ def hc_head(
 
     # reduce: gate + hc mix, fanned over (token-tile x D-slice). The rsqrt/sigmoid gate is
     # recomputed per task instead of being published by its own scope.
-    for blk in pl.spmd((t_dim // T_TILE) * (D // D_SPMD), name_hint="hc_head_reduce"):
+    for blk in pl.spmd((t_dim // T_TILE) * (D // D_SPMD), name_hint="hc_head_reduce", allow_early_resolve=True):
         t0 = (blk // (D // D_SPMD)) * T_TILE
         d_base = (blk % (D // D_SPMD)) * D_SPMD
         scale = pl.read(hc_head_scale, [0])

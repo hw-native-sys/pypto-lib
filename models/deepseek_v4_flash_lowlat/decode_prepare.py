@@ -313,7 +313,7 @@ def pack_x_hc_rows(
 ) -> pl.Tensor[[T, HC_MULT, D], pl.FP32]:
     """Fan one embedding row out over a token's HC lanes."""
     x_hc_flat = pl.reshape(x_hc, [T * HC_MULT, D])
-    for block in pl.spmd(SPMD_BLOCKS, name_hint="pack_x_hc_rows"):
+    for block in pl.spmd(SPMD_BLOCKS, name_hint="pack_x_hc_rows", allow_early_resolve=True):
         for work_idx in pl.range(block, T * (D // X_HC_HIDDEN_TILE), SPMD_BLOCKS):
             token_idx = work_idx // (D // X_HC_HIDDEN_TILE)
             hidden_offset = (work_idx % (D // X_HC_HIDDEN_TILE)) * X_HC_HIDDEN_TILE

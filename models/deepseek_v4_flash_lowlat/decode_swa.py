@@ -15,6 +15,8 @@ Companion files: attention_csa_draft.py (ratio=4)
                  attention_hca_draft.py (ratio=128)."""
 
 
+from qkv_proj_rope import prepare_qkv_rope_metadata
+from decode_sparse_attn_swa import prepare_swa_output_rope, H_TILE as SWA_ROPE_ROWS
 import pypto.language as pl
 import pypto.language.distributed as pld
 
@@ -92,6 +94,33 @@ OPROJ_FIRST_EPOCH = OTP.FIRST_EPOCH
 
 
 @pl.jit.inline
+def prepare_swa_metadata(
+    freqs_cos: pl.Tensor[[MAX_SEQ_LEN, ROPE_HEAD_DIM], pl.BF16],
+    freqs_sin: pl.Tensor[[MAX_SEQ_LEN, ROPE_HEAD_DIM], pl.BF16],
+    position_ids: pl.Tensor[[T], pl.INT32],
+    rope_cos_t: pl.Out[pl.Tensor[[T, ROPE_HEAD_DIM], pl.BF16]],
+    rope_sin_t: pl.Out[pl.Tensor[[T, ROPE_HEAD_DIM], pl.BF16]],
+    q_rope_cos_il: pl.Out[pl.Tensor[[T, ROPE_HEAD_DIM], pl.FP32]],
+    q_rope_sin_signed: pl.Out[pl.Tensor[[T, ROPE_HEAD_DIM], pl.FP32]],
+    q_rope_swap_idx: pl.Out[pl.Tensor[[T, ROPE_HEAD_DIM], pl.INT32]],
+    out_rope_cos_il: pl.Out[pl.Tensor[[T, ROPE_HEAD_DIM], pl.FP32]],
+    out_rope_sin_signed: pl.Out[pl.Tensor[[T, ROPE_HEAD_DIM], pl.FP32]],
+    out_rope_swap_idx: pl.Out[pl.Tensor[[SWA_ROPE_ROWS, ROPE_HEAD_DIM], pl.INT32]],
+):
+    with pl.at(level=pl.Level.CORE_GROUP, name_hint="swa_rope_step"):
+        for b in pl.range(B):
+            for s_idx in pl.range(S):
+                t = b * S + s_idx
+                pos_b = pl.cast(pl.read(position_ids, [t]), pl.INDEX)
+                cos_row = pl.cast(freqs_cos[pos_b : pos_b + 1, 0 : ROPE_HEAD_DIM], target_type=pl.FP32)
+                sin_row = pl.cast(freqs_sin[pos_b : pos_b + 1, 0 : ROPE_HEAD_DIM], target_type=pl.FP32)
+                rope_cos_t[t : t + 1, 0 : ROPE_HEAD_DIM] = pl.cast(cos_row, target_type=pl.BF16, mode="rint")
+                rope_sin_t[t : t + 1, 0 : ROPE_HEAD_DIM] = pl.cast(sin_row, target_type=pl.BF16, mode="rint")
+    prepare_qkv_rope_metadata(rope_cos_t, rope_sin_t, q_rope_cos_il, q_rope_sin_signed, q_rope_swap_idx)
+    prepare_swa_output_rope(rope_cos_t, rope_sin_t, out_rope_cos_il, out_rope_sin_signed, out_rope_swap_idx)
+
+
+@pl.jit.inline
 def attention_swa(
     x_hc: pl.Tensor[[T, HC_MULT, D], pl.FP32],
     gate_w: pl.Tensor[[N_EXPERTS, D], pl.FP32],
@@ -107,8 +136,8 @@ def attention_swa(
     wkv: pl.Tensor[[D, HEAD_DIM], pl.BF16],
     gamma_cq: pl.Tensor[[Q_LORA], pl.BF16],
     gamma_ckv: pl.Tensor[[HEAD_DIM], pl.BF16],
-    freqs_cos: pl.Tensor[[MAX_SEQ_LEN, ROPE_HEAD_DIM], pl.BF16],
-    freqs_sin: pl.Tensor[[MAX_SEQ_LEN, ROPE_HEAD_DIM], pl.BF16],
+    rope_cos_t: pl.Tensor[[T, ROPE_HEAD_DIM], pl.BF16],
+    rope_sin_t: pl.Tensor[[T, ROPE_HEAD_DIM], pl.BF16],
     # KV cache (sliding-window only: [0, WIN) ori; no cmp portion)
     kv_cache: pl.Tensor[[ORI_BLOCK_NUM_DYN, BLOCK_SIZE, 1, HEAD_DIM], pl.BF16],
     swa_slot_mapping: pl.Tensor[[T], pl.INT64],
@@ -128,23 +157,17 @@ def attention_swa(
     sync_signal: pld.DistributedTensor[[OPROJ_N_RANKS, 1], pl.INT32],
     my_rank: pl.Scalar[pl.INT32],
     oproj_epoch: pl.Scalar[pl.INT32],
+    q_rope_cos_il: pl.Tensor[[T, ROPE_HEAD_DIM], pl.FP32],
+    q_rope_sin_signed: pl.Tensor[[T, ROPE_HEAD_DIM], pl.FP32],
+    q_rope_swap_idx: pl.Tensor[[T, ROPE_HEAD_DIM], pl.INT32],
+    out_rope_cos_il: pl.Tensor[[T, ROPE_HEAD_DIM], pl.FP32],
+    out_rope_sin_signed: pl.Tensor[[T, ROPE_HEAD_DIM], pl.FP32],
+    out_rope_swap_idx: pl.Tensor[[SWA_ROPE_ROWS, ROPE_HEAD_DIM], pl.INT32],
 ):
     x_mixed = pl.create_tensor([T, D], dtype=pl.BF16)
     post_t = pl.create_tensor([T, HC_MULT], dtype=pl.FP32)
     comb_t = pl.create_tensor([T, HC_MULT * HC_MULT], dtype=pl.FP32)
     hc_pre(x_hc, hc_attn_fn, hc_attn_scale, hc_attn_base, x_mixed, post_t, comb_t)
-
-    rope_cos_t = pl.create_tensor([T, ROPE_HEAD_DIM], dtype=pl.BF16)
-    rope_sin_t = pl.create_tensor([T, ROPE_HEAD_DIM], dtype=pl.BF16)
-    with pl.at(level=pl.Level.CORE_GROUP, name_hint="swa_rope_step"):
-        for b in pl.range(B):
-            for s_idx in pl.range(S):
-                t = b * S + s_idx
-                pos_b = pl.cast(pl.read(position_ids, [t]), pl.INDEX)
-                cos_row = pl.cast(freqs_cos[pos_b : pos_b + 1, 0 : ROPE_HEAD_DIM], target_type=pl.FP32)
-                sin_row = pl.cast(freqs_sin[pos_b : pos_b + 1, 0 : ROPE_HEAD_DIM], target_type=pl.FP32)
-                rope_cos_t[t : t + 1, 0 : ROPE_HEAD_DIM] = pl.cast(cos_row, target_type=pl.BF16, mode="rint")
-                rope_sin_t[t : t + 1, 0 : ROPE_HEAD_DIM] = pl.cast(sin_row, target_type=pl.BF16, mode="rint")
 
     x_normed_t = pl.create_tensor([T, D], dtype=pl.BF16)
     rms_tid = rms_norm(x_mixed, attn_norm_w, x_normed_t)
@@ -172,7 +195,7 @@ def attention_swa(
         x_normed_t, wq_a, wq_b, wq_b_scale, wkv,
         rope_cos_t, rope_sin_t, gamma_cq, gamma_ckv,
         q, kv, qr, qr_scale, late_dep,
-        pl.cast(my_rank, pl.INT32) * (H // O_GROUPS),
+        pl.cast(my_rank, pl.INT32) * (H // O_GROUPS), q_rope_cos_il, q_rope_sin_signed, q_rope_swap_idx,
     )
 
     # Commit current decode KV and build its additive padding mask in one task.
@@ -199,7 +222,7 @@ def attention_swa(
     o_packed = pl.create_tensor([O_GROUPS * T, O_GROUP_IN], dtype=pl.BF16)
     merge_tid = sparse_attn_swa_packed(
         q, kv_cache, swa_indices, swa_lens, sparse_bias,
-        attn_sink, rope_cos_t, rope_sin_t, o_packed, my_rank,
+        attn_sink, rope_cos_t, rope_sin_t, o_packed, my_rank, out_rope_cos_il, out_rope_sin_signed, out_rope_swap_idx,
     )
     o_proj_tp_core(
         o_packed, merge_tid, wo_a_shard, wo_b_shard, wo_b_scale, attn_out,
@@ -268,18 +291,27 @@ def attention_swa_test(
     my_rank: pl.Scalar[pl.INT32],
     oproj_epoch: pl.Scalar[pl.INT32],
 ):
+    rope_cos_t = pl.create_tensor([T, ROPE_HEAD_DIM], dtype=pl.BF16)
+    rope_sin_t = pl.create_tensor([T, ROPE_HEAD_DIM], dtype=pl.BF16)
+    q_rope_cos_il = pl.create_tensor([T, ROPE_HEAD_DIM], dtype=pl.FP32)
+    q_rope_sin_signed = pl.create_tensor([T, ROPE_HEAD_DIM], dtype=pl.FP32)
+    q_rope_swap_idx = pl.create_tensor([T, ROPE_HEAD_DIM], dtype=pl.INT32)
+    out_rope_cos_il = pl.create_tensor([T, ROPE_HEAD_DIM], dtype=pl.FP32)
+    out_rope_sin_signed = pl.create_tensor([T, ROPE_HEAD_DIM], dtype=pl.FP32)
+    out_rope_swap_idx = pl.create_tensor([SWA_ROPE_ROWS, ROPE_HEAD_DIM], dtype=pl.INT32)
+    prepare_swa_metadata(freqs_cos, freqs_sin, position_ids, rope_cos_t, rope_sin_t, q_rope_cos_il, q_rope_sin_signed, q_rope_swap_idx, out_rope_cos_il, out_rope_sin_signed, out_rope_swap_idx)
     attention_swa(
         x_hc, gate_w,
         hc_attn_fn, hc_attn_scale, hc_attn_base,
         attn_norm_w, wq_a, wq_b, wq_b_scale, wkv,
         gamma_cq, gamma_ckv,
-        freqs_cos, freqs_sin,
+        rope_cos_t, rope_sin_t,
         kv_cache, swa_slot_mapping, swa_indices, swa_lens, position_ids,
         attn_sink,
         wo_a_shard, wo_b_shard, wo_b_scale,
         x_out,
         reduce_window, scale_window, reduce_signal, sync_signal,
-        my_rank, oproj_epoch,
+        my_rank, oproj_epoch, q_rope_cos_il, q_rope_sin_signed, q_rope_swap_idx, out_rope_cos_il, out_rope_sin_signed, out_rope_swap_idx,
     )
     clear_swa_oproj_signals(x_out, reduce_signal, sync_signal)
     return x_out

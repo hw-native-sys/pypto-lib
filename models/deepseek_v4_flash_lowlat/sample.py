@@ -208,7 +208,7 @@ def apply_temperature(
 ):
     """Apply per-row temperature in an independent vocab-tiled stage."""
     sample_rows = pl.tensor.dim(logits, 0)
-    for row in pl.spmd(sample_rows, name_hint="sample_apply_temperature"):
+    for row in pl.spmd(sample_rows, name_hint="sample_apply_temperature", allow_early_resolve=True):
         temperature = pl.read(temperatures, [row])
         if temperature >= SAMPLING_EPS:
             for vocab_tile in pl.range(VOCAB // SAMPLE_ROW_WIDTH_TILE):
@@ -227,7 +227,7 @@ def apply_top_k(
 ):
     """Mask logits below each row's top-k boundary in an independent stage."""
     sample_rows = pl.tensor.dim(scaled_logits, 0)
-    for row in pl.spmd(sample_rows, name_hint="sample_apply_top_k"):
+    for row in pl.spmd(sample_rows, name_hint="sample_apply_top_k", allow_early_resolve=True):
         temperature = pl.read(temperatures, [row])
         top_k = pl.read(top_ks, [row])
         if temperature >= SAMPLING_EPS and top_k > 0 and top_k < VOCAB:

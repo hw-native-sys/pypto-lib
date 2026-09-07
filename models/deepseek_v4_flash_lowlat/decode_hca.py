@@ -14,6 +14,8 @@ Companion files: attention_swa.py (ratio=0)
                  attention_csa_draft.py (ratio=4)."""
 
 
+from qkv_proj_rope import prepare_qkv_rope_metadata
+from decode_sparse_attn_hca import prepare_hca_output_rope, H_TILE as HCA_ROPE_ROWS
 import pypto.language as pl
 import pypto.language.distributed as pld
 
@@ -115,6 +117,69 @@ OPROJ_FIRST_EPOCH = OTP.FIRST_EPOCH
 
 
 @pl.jit.inline
+def prepare_hca_metadata(
+    freqs_cos: pl.Tensor[[MAX_SEQ_LEN, ROPE_HEAD_DIM], pl.BF16],
+    freqs_sin: pl.Tensor[[MAX_SEQ_LEN, ROPE_HEAD_DIM], pl.BF16],
+    position_ids: pl.Tensor[[T], pl.INT32],
+    kv_seq_lens: pl.Tensor[[B], pl.INT32],
+    rope_cos_t: pl.Out[pl.Tensor[[T, ROPE_HEAD_DIM], pl.BF16]],
+    rope_sin_t: pl.Out[pl.Tensor[[T, ROPE_HEAD_DIM], pl.BF16]],
+    cmp_cos_il: pl.Out[pl.Tensor[[B, ROPE_HEAD_DIM], pl.FP32]],
+    cmp_sin_signed: pl.Out[pl.Tensor[[B, ROPE_HEAD_DIM], pl.FP32]],
+    topk_all: pl.Out[pl.Tensor[[T, HCA_CMP_TOPK], pl.INT32]],
+    q_rope_cos_il: pl.Out[pl.Tensor[[T, ROPE_HEAD_DIM], pl.FP32]],
+    q_rope_sin_signed: pl.Out[pl.Tensor[[T, ROPE_HEAD_DIM], pl.FP32]],
+    q_rope_swap_idx: pl.Out[pl.Tensor[[T, ROPE_HEAD_DIM], pl.INT32]],
+    out_rope_cos_il: pl.Out[pl.Tensor[[T, ROPE_HEAD_DIM], pl.FP32]],
+    out_rope_sin_signed: pl.Out[pl.Tensor[[T, ROPE_HEAD_DIM], pl.FP32]],
+    out_rope_swap_idx: pl.Out[pl.Tensor[[HCA_ROPE_ROWS, ROPE_HEAD_DIM], pl.INT32]],
+):
+    cmp_cos = pl.create_tensor([B, ROPE_HEAD_DIM // 2], dtype=pl.FP32)
+    cmp_sin = pl.create_tensor([B, ROPE_HEAD_DIM // 2], dtype=pl.FP32)
+    with pl.at(level=pl.Level.CORE_GROUP, name_hint="hca_rope"):
+        for b in pl.range(B):
+            first_t = b * S
+            first_pos_b = pl.read(position_ids, [first_t])
+            cmp_offset_b = COMPRESS_RATIO - (first_pos_b % COMPRESS_RATIO)
+            cmp_pos_b = pl.cast(first_pos_b + cmp_offset_b - COMPRESS_RATIO, pl.INDEX)
+            cmp_cos_row = freqs_cos[cmp_pos_b : cmp_pos_b + 1, 0 : ROPE_HEAD_DIM // 2]
+            cmp_sin_row = freqs_sin[cmp_pos_b : cmp_pos_b + 1, 0 : ROPE_HEAD_DIM // 2]
+            cmp_cos[b : b + 1, 0 : ROPE_HEAD_DIM // 2] = pl.cast(cmp_cos_row, target_type=pl.FP32)
+            cmp_sin[b : b + 1, 0 : ROPE_HEAD_DIM // 2] = pl.cast(cmp_sin_row, target_type=pl.FP32)
+            for s in pl.range(S):
+                t = b * S + s
+                pos_b = pl.cast(pl.read(position_ids, [t]), pl.INDEX)
+                step_cos_row = pl.cast(freqs_cos[pos_b : pos_b + 1, 0 : ROPE_HEAD_DIM], target_type=pl.FP32)
+                step_sin_row = pl.cast(freqs_sin[pos_b : pos_b + 1, 0 : ROPE_HEAD_DIM], target_type=pl.FP32)
+                rope_cos_t[t : t + 1, 0 : ROPE_HEAD_DIM] = pl.cast(step_cos_row, target_type=pl.BF16, mode="rint")
+                rope_sin_t[t : t + 1, 0 : ROPE_HEAD_DIM] = pl.cast(step_sin_row, target_type=pl.BF16, mode="rint")
+
+    rope_interleave(cmp_cos, cmp_sin, cmp_cos_il, cmp_sin_signed)
+
+    for topk_block in pl.spmd(
+        T // HCA_TOPK_TOKEN_TILE, name_hint="hca_cache_topk", allow_early_resolve=True
+    ):
+        topk_t0 = topk_block * HCA_TOPK_TOKEN_TILE
+        for topk_dt in pl.range(HCA_TOPK_TOKEN_TILE):
+            topk_t = topk_t0 + topk_dt
+            if topk_t < T:
+                topk_b = topk_t // S
+                topk_abs_pos = pl.read(position_ids, [topk_t])
+
+                topk_cmp_valid = pl.min(
+                    HCA_TOPK_LIMIT,
+                    pl.min((topk_abs_pos + 1) // COMPRESS_RATIO, pl.read(kv_seq_lens, [topk_b]) // COMPRESS_RATIO),
+                )
+                for topk_ck in pl.range(HCA_CMP_TOPK):
+                    if topk_ck < topk_cmp_valid:
+                        pl.write(topk_all, [topk_t, topk_ck], pl.cast(topk_ck, pl.INT32))
+                    else:
+                        pl.write(topk_all, [topk_t, topk_ck], pl.cast(-1, pl.INT32))
+    prepare_qkv_rope_metadata(rope_cos_t, rope_sin_t, q_rope_cos_il, q_rope_sin_signed, q_rope_swap_idx)
+    prepare_hca_output_rope(rope_cos_t, rope_sin_t, out_rope_cos_il, out_rope_sin_signed, out_rope_swap_idx)
+
+
+@pl.jit.inline
 def attention_hca(
     x_hc: pl.Tensor[[T, HC_MULT, D], pl.FP32],
     gate_w: pl.Tensor[[N_EXPERTS, D], pl.FP32],
@@ -130,8 +195,11 @@ def attention_hca(
     wkv: pl.Tensor[[D, HEAD_DIM], pl.BF16],
     gamma_cq: pl.Tensor[[Q_LORA], pl.BF16],
     gamma_ckv: pl.Tensor[[HEAD_DIM], pl.BF16],
-    freqs_cos: pl.Tensor[[MAX_SEQ_LEN, ROPE_HEAD_DIM], pl.BF16],
-    freqs_sin: pl.Tensor[[MAX_SEQ_LEN, ROPE_HEAD_DIM], pl.BF16],
+    rope_cos_t: pl.Tensor[[T, ROPE_HEAD_DIM], pl.BF16],
+    rope_sin_t: pl.Tensor[[T, ROPE_HEAD_DIM], pl.BF16],
+    cmp_cos_il: pl.Tensor[[B, ROPE_HEAD_DIM], pl.FP32],
+    cmp_sin_signed: pl.Tensor[[B, ROPE_HEAD_DIM], pl.FP32],
+    topk_all: pl.Tensor[[T, HCA_CMP_TOPK], pl.INT32],
     # main compressor (head_dim=HEAD_DIM, ratio=128, overlap=False)
     cmp_wkv: pl.Tensor[[MAIN_OUT_DIM, D], pl.BF16],
     cmp_wgate: pl.Tensor[[MAIN_OUT_DIM, D], pl.BF16],
@@ -164,42 +232,18 @@ def attention_hca(
     sync_signal: pld.DistributedTensor[[OPROJ_N_RANKS, 1], pl.INT32],
     my_rank: pl.Scalar[pl.INT32],
     oproj_epoch: pl.Scalar[pl.INT32],
+    q_rope_cos_il: pl.Tensor[[T, ROPE_HEAD_DIM], pl.FP32],
+    q_rope_sin_signed: pl.Tensor[[T, ROPE_HEAD_DIM], pl.FP32],
+    q_rope_swap_idx: pl.Tensor[[T, ROPE_HEAD_DIM], pl.INT32],
+    out_rope_cos_il: pl.Tensor[[T, ROPE_HEAD_DIM], pl.FP32],
+    out_rope_sin_signed: pl.Tensor[[T, ROPE_HEAD_DIM], pl.FP32],
+    out_rope_swap_idx: pl.Tensor[[HCA_ROPE_ROWS, ROPE_HEAD_DIM], pl.INT32],
 ):
     """HCA decode orchestration for compress_ratio=128."""
     x_mixed = pl.create_tensor([T, D], dtype=pl.BF16)
     post_t = pl.create_tensor([T, HC_MULT], dtype=pl.FP32)
     comb_t = pl.create_tensor([T, HC_MULT * HC_MULT], dtype=pl.FP32)
     hc_pre(x_hc, hc_attn_fn, hc_attn_scale, hc_attn_base, x_mixed, post_t, comb_t)
-
-    rope_cos_t = pl.create_tensor([T, ROPE_HEAD_DIM], dtype=pl.BF16)
-    rope_sin_t = pl.create_tensor([T, ROPE_HEAD_DIM], dtype=pl.BF16)
-    cmp_cos = pl.create_tensor([B, ROPE_HEAD_DIM // 2], dtype=pl.FP32)
-    cmp_sin = pl.create_tensor([B, ROPE_HEAD_DIM // 2], dtype=pl.FP32)
-    # Interleave-duplicated / sign-folded compressed-position rope rows. The ratio-128
-    # compressor's rmsnorm_rope_cache_write rebuilt this j>>1 dup-gather itself; pl.gather
-    # lowers to a per-row TGATHER loop, so it is hoisted here (once, B rows) and read as a
-    # plain load downstream.
-    cmp_cos_il = pl.create_tensor([B, ROPE_HEAD_DIM], dtype=pl.FP32)
-    cmp_sin_signed = pl.create_tensor([B, ROPE_HEAD_DIM], dtype=pl.FP32)
-    with pl.at(level=pl.Level.CORE_GROUP, name_hint="hca_rope"):
-        for b in pl.range(B):
-            first_t = b * S
-            first_pos_b = pl.read(position_ids, [first_t])
-            cmp_offset_b = COMPRESS_RATIO - (first_pos_b % COMPRESS_RATIO)
-            cmp_pos_b = pl.cast(first_pos_b + cmp_offset_b - COMPRESS_RATIO, pl.INDEX)
-            cmp_cos_row = freqs_cos[cmp_pos_b : cmp_pos_b + 1, 0 : ROPE_HEAD_DIM // 2]
-            cmp_sin_row = freqs_sin[cmp_pos_b : cmp_pos_b + 1, 0 : ROPE_HEAD_DIM // 2]
-            cmp_cos[b : b + 1, 0 : ROPE_HEAD_DIM // 2] = pl.cast(cmp_cos_row, target_type=pl.FP32)
-            cmp_sin[b : b + 1, 0 : ROPE_HEAD_DIM // 2] = pl.cast(cmp_sin_row, target_type=pl.FP32)
-            for s in pl.range(S):
-                t = b * S + s
-                pos_b = pl.cast(pl.read(position_ids, [t]), pl.INDEX)
-                step_cos_row = pl.cast(freqs_cos[pos_b : pos_b + 1, 0 : ROPE_HEAD_DIM], target_type=pl.FP32)
-                step_sin_row = pl.cast(freqs_sin[pos_b : pos_b + 1, 0 : ROPE_HEAD_DIM], target_type=pl.FP32)
-                rope_cos_t[t : t + 1, 0 : ROPE_HEAD_DIM] = pl.cast(step_cos_row, target_type=pl.BF16, mode="rint")
-                rope_sin_t[t : t + 1, 0 : ROPE_HEAD_DIM] = pl.cast(step_sin_row, target_type=pl.BF16, mode="rint")
-
-    rope_interleave(cmp_cos, cmp_sin, cmp_cos_il, cmp_sin_signed)
 
     x_normed = pl.create_tensor([T, D], dtype=pl.BF16)
     rms_tid = rms_norm(x_mixed, attn_norm_w, x_normed)
@@ -227,7 +271,7 @@ def attention_hca(
         x_normed, wq_a, wq_b, wq_b_scale, wkv,
         rope_cos_t, rope_sin_t, gamma_cq, gamma_ckv,
         q, kv, qr, qr_scale, late_dep,
-        pl.cast(my_rank, pl.INT32) * (H // O_GROUPS),
+        pl.cast(my_rank, pl.INT32) * (H // O_GROUPS), q_rope_cos_il, q_rope_sin_signed, q_rope_swap_idx,
     )
 
     ori_block_num = pl.tensor.dim(kv_cache, 0)
@@ -257,38 +301,12 @@ def attention_hca(
         late_dep,
     )
 
-    # Sparse-index build fanned out over an SPMD (8 tokens/block) instead of one
-    # serial CORE_GROUP loop. The two window-slot abs_pos branches collapse into
-    # one: column k -> ring slot k, live iff k <= abs_pos. sparse_attn pairs each
-    # K/V by its stored raw value (order-agnostic), so the full-ring rotation is
-    # dead. The compressed-slot ramp is fused into the same block.
     attn_out = pl.create_tensor([T, D], dtype=pl.BF16)
     o_packed = pl.create_tensor([O_GROUPS * T, O_GROUP_IN], dtype=pl.BF16)
-    topk_all = pl.create_tensor([T, HCA_CMP_TOPK], dtype=pl.INT32)
-    for topk_block in pl.spmd(
-        T // HCA_TOPK_TOKEN_TILE, name_hint="hca_cache_topk", allow_early_resolve=True
-    ):
-        topk_t0 = topk_block * HCA_TOPK_TOKEN_TILE
-        for topk_dt in pl.range(HCA_TOPK_TOKEN_TILE):
-            topk_t = topk_t0 + topk_dt
-            if topk_t < T:
-                topk_b = topk_t // S
-                topk_abs_pos = pl.read(position_ids, [topk_t])
-
-                topk_cmp_valid = pl.min(
-                    HCA_TOPK_LIMIT,
-                    pl.min((topk_abs_pos + 1) // COMPRESS_RATIO, pl.read(kv_seq_lens, [topk_b]) // COMPRESS_RATIO),
-                )
-                for topk_ck in pl.range(HCA_CMP_TOPK):
-                    if topk_ck < topk_cmp_valid:
-                        pl.write(topk_all, [topk_t, topk_ck], pl.cast(topk_ck, pl.INT32))
-                    else:
-                        pl.write(topk_all, [topk_t, topk_ck], pl.cast(-1, pl.INT32))
-
     merge_tid = sparse_attn_hca_packed(
         q, kv_cache, window_swa_indices, window_swa_lens,
         cmp_kv, cmp_block_table, topk_all,
-        attn_sink, rope_cos_t, rope_sin_t, o_packed, my_rank,
+        attn_sink, rope_cos_t, rope_sin_t, o_packed, my_rank, out_rope_cos_il, out_rope_sin_signed, out_rope_swap_idx,
     )
     o_proj_tp_core(
         o_packed, merge_tid, wo_a_shard, wo_b_shard, wo_b_scale, attn_out,
@@ -363,11 +381,23 @@ def attention_hca_test(
     my_rank: pl.Scalar[pl.INT32],
     oproj_epoch: pl.Scalar[pl.INT32],
 ):
+    rope_cos_t = pl.create_tensor([T, ROPE_HEAD_DIM], dtype=pl.BF16)
+    rope_sin_t = pl.create_tensor([T, ROPE_HEAD_DIM], dtype=pl.BF16)
+    cmp_cos_il = pl.create_tensor([B, ROPE_HEAD_DIM], dtype=pl.FP32)
+    cmp_sin_signed = pl.create_tensor([B, ROPE_HEAD_DIM], dtype=pl.FP32)
+    topk_all = pl.create_tensor([T, HCA_CMP_TOPK], dtype=pl.INT32)
+    q_rope_cos_il = pl.create_tensor([T, ROPE_HEAD_DIM], dtype=pl.FP32)
+    q_rope_sin_signed = pl.create_tensor([T, ROPE_HEAD_DIM], dtype=pl.FP32)
+    q_rope_swap_idx = pl.create_tensor([T, ROPE_HEAD_DIM], dtype=pl.INT32)
+    out_rope_cos_il = pl.create_tensor([T, ROPE_HEAD_DIM], dtype=pl.FP32)
+    out_rope_sin_signed = pl.create_tensor([T, ROPE_HEAD_DIM], dtype=pl.FP32)
+    out_rope_swap_idx = pl.create_tensor([HCA_ROPE_ROWS, ROPE_HEAD_DIM], dtype=pl.INT32)
+    prepare_hca_metadata(freqs_cos, freqs_sin, position_ids, kv_seq_lens, rope_cos_t, rope_sin_t, cmp_cos_il, cmp_sin_signed, topk_all, q_rope_cos_il, q_rope_sin_signed, q_rope_swap_idx, out_rope_cos_il, out_rope_sin_signed, out_rope_swap_idx)
     attention_hca(
         x_hc, gate_w,
         hc_attn_fn, hc_attn_scale, hc_attn_base,
         attn_norm_w, wq_a, wq_b, wq_b_scale, wkv, gamma_cq, gamma_ckv,
-        freqs_cos, freqs_sin,
+        rope_cos_t, rope_sin_t, cmp_cos_il, cmp_sin_signed, topk_all,
         cmp_wkv, cmp_wgate, cmp_ape, cmp_norm_w,
         compress_state, compress_state_block_table,
         kv_cache, cmp_kv, cmp_block_table,
@@ -378,7 +408,7 @@ def attention_hca_test(
         wo_a_shard, wo_b_shard, wo_b_scale,
         x_out,
         reduce_window, scale_window, reduce_signal, sync_signal,
-        my_rank, oproj_epoch,
+        my_rank, oproj_epoch, q_rope_cos_il, q_rope_sin_signed, q_rope_swap_idx, out_rope_cos_il, out_rope_sin_signed, out_rope_swap_idx,
     )
     clear_hca_oproj_signals(x_out, reduce_signal, sync_signal)
     return x_out

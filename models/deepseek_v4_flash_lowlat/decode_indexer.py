@@ -127,6 +127,20 @@ assert IDX_TOPK <= TOPK_HALF_LEN, "per-half candidate list must cover the final 
 
 
 @pl.jit.inline
+def prepare_indexer_rope_indices(
+    rope_swap_idx_t: pl.Out[pl.Tensor[[ROPE_ROW_TILE, ROPE_HEAD_DIM], pl.INT32]],
+):
+    with pl.at(level=pl.Level.CORE_GROUP, name_hint="qr_rope_swap_idx", allow_early_resolve=True):
+        sw_col = pl.col_expand_mul(
+            pl.full([ROPE_ROW_TILE, ROPE_HEAD_DIM], dtype=pl.FP32, value=1.0),
+            pl.cast(pl.arange(0, [1, ROPE_HEAD_DIM], dtype=pl.INT32), target_type=pl.FP32))
+        sw_dup_f = pl.cast(pl.cast(pl.mul(sw_col, 0.5), target_type=pl.INT32, mode="trunc"), target_type=pl.FP32)
+        sw_lane = pl.sub(sw_col, pl.mul(sw_dup_f, 2.0))                                                # j%2
+        rope_swap_idx_t[0:ROPE_ROW_TILE, 0:ROPE_HEAD_DIM] = pl.cast(
+            pl.sub(pl.add(sw_col, 1.0), pl.mul(sw_lane, 2.0)), target_type=pl.INT32)                   # j^1
+
+
+@pl.jit.inline
 def indexer(
     x: pl.Tensor[[B, S, D], pl.BF16],
     qr: pl.Tensor[[T, Q_LORA], pl.INT8],
@@ -159,6 +173,7 @@ def indexer(
     offset: pl.Scalar[pl.INT32],
     late_dep: pl.Scalar[pl.TASK_ID],
     my_rank: pl.Scalar[pl.INT32],
+    rope_swap_idx_t: pl.Tensor[[ROPE_ROW_TILE, ROPE_HEAD_DIM], pl.INT32],
 ):
     query_token = pl.cast(my_rank, pl.INDEX)
     qr_acc_pad = pl.create_tensor([T_PAD, IDX_N_HEADS * IDX_HEAD_DIM], dtype=pl.INT32)
@@ -173,16 +188,6 @@ def indexer(
                 qr_acc = pl.matmul_acc(qr_acc, qr_tile, wq_tile, init_cond=(kb == 0))
             qr_acc_pad[0:T_PAD, o_base + ns : o_base + ns + MM_N_TILE] = qr_acc
     qr_bf16 = pl.create_tensor([IDX_N_HEADS, IDX_HEAD_DIM], dtype=pl.BF16)
-    # Shared j^1 lane-swap indices for this token's RoPE head blocks.
-    rope_swap_idx_t = pl.create_tensor([ROPE_ROW_TILE, ROPE_HEAD_DIM], dtype=pl.INT32)
-    with pl.at(level=pl.Level.CORE_GROUP, name_hint="qr_rope_swap_idx", allow_early_resolve=True):
-        sw_col = pl.col_expand_mul(
-            pl.full([ROPE_ROW_TILE, ROPE_HEAD_DIM], dtype=pl.FP32, value=1.0),
-            pl.cast(pl.arange(0, [1, ROPE_HEAD_DIM], dtype=pl.INT32), target_type=pl.FP32))
-        sw_dup_f = pl.cast(pl.cast(pl.mul(sw_col, 0.5), target_type=pl.INT32, mode="trunc"), target_type=pl.FP32)
-        sw_lane = pl.sub(sw_col, pl.mul(sw_dup_f, 2.0))                                                # j%2
-        rope_swap_idx_t[0:ROPE_ROW_TILE, 0:ROPE_HEAD_DIM] = pl.cast(
-            pl.sub(pl.add(sw_col, 1.0), pl.mul(sw_lane, 2.0)), target_type=pl.INT32)                   # j^1
 
     for ot in pl.spmd(IDX_N_HEADS * IDX_HEAD_DIM // Q_OUT_TILE, name_hint="idx_qr_dequant_rope", allow_early_resolve=True):
         o_base = ot * Q_OUT_TILE
@@ -410,6 +415,8 @@ def indexer_test(
     cos_il = pl.create_tensor([B, ROPE_HEAD_DIM], dtype=pl.FP32)
     sin_signed = pl.create_tensor([B, ROPE_HEAD_DIM], dtype=pl.FP32)
     rope_interleave(cos, sin, cos_il, sin_signed)
+    rope_swap_idx_t = pl.create_tensor([ROPE_ROW_TILE, ROPE_HEAD_DIM], dtype=pl.INT32)
+    prepare_indexer_rope_indices(rope_swap_idx_t)
     indexer(
         x,
         qr,
@@ -438,7 +445,7 @@ def indexer_test(
         kv_seq_lens,
         offset,
         late_dep,
-        TEST_MY_RANK,
+        TEST_MY_RANK, rope_swap_idx_t,
     )
     return score, idx_kv_cache, idx_kv_scale, topk_idxs
 

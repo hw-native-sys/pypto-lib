@@ -136,6 +136,39 @@ assert CMP_TOPK % CMP_RUN == 0, "the compressed-tail probe chunk must tile CMP_T
 
 
 @pl.jit.inline
+def prepare_hca_output_rope(
+    freqs_cos: pl.Tensor[[T, ROPE_DIM], pl.BF16],
+    freqs_sin: pl.Tensor[[T, ROPE_DIM], pl.BF16],
+    rope_cos_il: pl.Out[pl.Tensor[[T, ROPE_DIM], pl.FP32]],
+    rope_sin_signed: pl.Out[pl.Tensor[[T, ROPE_DIM], pl.FP32]],
+    rope_swap_idx: pl.Out[pl.Tensor[[H_TILE, ROPE_DIM], pl.INT32]],
+):
+    with pl.at(level=pl.Level.CORE_GROUP, name_hint="rope_swap", allow_early_resolve=True):
+        sw_col = pl.col_expand_mul(
+            pl.full([H_TILE, ROPE_DIM], dtype=pl.FP32, value=1.0),
+            pl.cast(pl.arange(0, [1, ROPE_DIM], dtype=pl.INT32), target_type=pl.FP32))
+        sw_dup_f = pl.cast(pl.cast(pl.mul(sw_col, 0.5), target_type=pl.INT32, mode="trunc"), target_type=pl.FP32)
+        sw_lane = pl.sub(sw_col, pl.mul(sw_dup_f, 2.0))                                           # j%2
+        rope_swap_idx[0:H_TILE, 0:ROPE_DIM] = pl.cast(
+            pl.sub(pl.add(sw_col, 1.0), pl.mul(sw_lane, 2.0)), target_type=pl.INT32)              # j^1
+    for cp in pl.spmd(HALF_ROPE // ROPE_TILE, name_hint="rope_cs", allow_early_resolve=True):
+        cp_r0 = cp * ROPE_TILE
+        cp_c0 = 2 * cp_r0
+        cs_col = pl.col_expand_mul(
+            pl.full([T, ROPE_INTERLEAVE_TILE], dtype=pl.FP32, value=1.0),
+            pl.cast(pl.arange(0, [1, ROPE_INTERLEAVE_TILE], dtype=pl.INT32), target_type=pl.FP32))
+        cs_dup_f = pl.cast(pl.cast(pl.mul(cs_col, 0.5), target_type=pl.INT32, mode="trunc"), target_type=pl.FP32)
+        cs_dup_idx = pl.cast(cs_dup_f, target_type=pl.INT32)                                      # j>>1
+        cs_lane = pl.sub(cs_col, pl.mul(cs_dup_f, 2.0))                                           # j%2
+        cs_sign = pl.neg(pl.sub(pl.mul(cs_lane, 2.0), 1.0))                                       # [+1,-1,...] (conjugate)
+        cs_cos = pl.cast(freqs_cos[0:T, cp_r0 : cp_r0 + ROPE_TILE], target_type=pl.FP32)
+        cs_sin = pl.cast(freqs_sin[0:T, cp_r0 : cp_r0 + ROPE_TILE], target_type=pl.FP32)
+        rope_cos_il[0:T, cp_c0 : cp_c0 + ROPE_INTERLEAVE_TILE] = pl.gather(cs_cos, dim=-1, index=cs_dup_idx)
+        rope_sin_signed[0:T, cp_c0 : cp_c0 + ROPE_INTERLEAVE_TILE] = pl.mul(
+            pl.gather(cs_sin, dim=-1, index=cs_dup_idx), cs_sign)
+
+
+@pl.jit.inline
 def sparse_attn_hca_packed(
     q: pl.Tensor[[T, H, HEAD_DIM], pl.BF16],
     ori_kv: pl.Tensor[[ORI_BLOCK_NUM_DYN, BLOCK_SIZE, 1, HEAD_DIM], pl.BF16],
@@ -149,6 +182,9 @@ def sparse_attn_hca_packed(
     freqs_sin: pl.Tensor[[T, ROPE_DIM], pl.BF16],
     o_packed: pl.Tensor[[O_GROUPS * T, O_GROUP_IN], pl.BF16],
     my_rank: pl.Scalar[pl.INT32],
+    rope_cos_il: pl.Tensor[[T, ROPE_DIM], pl.FP32],
+    rope_sin_signed: pl.Tensor[[T, ROPE_DIM], pl.FP32],
+    rope_swap_idx: pl.Tensor[[H_TILE, ROPE_DIM], pl.INT32],
 ) -> pl.Scalar[pl.TASK_ID]:
     """Sparse decode attention over the compressed + window cache, and inverse RoPE, up to the packed head output.
 
@@ -316,47 +352,6 @@ def sparse_attn_hca_packed(
             sparse_blk_li[qk_row : qk_row + QK_M_BOX, 0 : 1] = qk_li
             sparse_blk_oi[qk_row : qk_row + QK_M_BOX, 0 : HEAD_DIM] = qk_oi
 
-    # Precompute the head-invariant interleaved cos and sign*sin once: they depend
-    # only on (token, column), not head, so building them per head would repeat the
-    # same dup-gather H times on the bottleneck Vec engine. sign is folded into sin
-    # (multiply by +/-1). The conjugate (inverse) rotation is:
-    #   out[j] = x[j]*cos_il[j] + x[j^1]*sign[j]*sin_il[j]
-    # Hoisted ABOVE merge_norm (which now fuses the rotation): independent of qk_pv,
-    # so it overlaps it and is off merge_norm's critical path.
-    rope_cos_il = pl.create_tensor([T, ROPE_DIM], dtype=pl.FP32)
-    rope_sin_signed = pl.create_tensor([T, ROPE_DIM], dtype=pl.FP32)
-    # The j^1 lane-swap index for merge_norm's rotation gather is a pure constant
-    # (no token/head dependence), so it is built once here instead of rebuilding
-    # the same arange/cast chain on each of the T*(H//H_TILE) merge blocks. Shaped
-    # [H_TILE, ROPE_DIM] because gather's index must match its source rows. It gets
-    # its own single-task scope because rope_cs below is an spmd over rope column
-    # tiles -- no single block there owns a column-invariant constant.
-    rope_swap_idx = pl.create_tensor([H_TILE, ROPE_DIM], dtype=pl.INT32)
-    with pl.at(level=pl.Level.CORE_GROUP, name_hint="rope_swap", allow_early_resolve=True):
-        sw_col = pl.col_expand_mul(
-            pl.full([H_TILE, ROPE_DIM], dtype=pl.FP32, value=1.0),
-            pl.cast(pl.arange(0, [1, ROPE_DIM], dtype=pl.INT32), target_type=pl.FP32))
-        sw_dup_f = pl.cast(pl.cast(pl.mul(sw_col, 0.5), target_type=pl.INT32, mode="trunc"), target_type=pl.FP32)
-        sw_lane = pl.sub(sw_col, pl.mul(sw_dup_f, 2.0))                                           # j%2
-        rope_swap_idx[0:H_TILE, 0:ROPE_DIM] = pl.cast(
-            pl.sub(pl.add(sw_col, 1.0), pl.mul(sw_lane, 2.0)), target_type=pl.INT32)              # j^1
-
-    for cp in pl.spmd(HALF_ROPE // ROPE_TILE, name_hint="rope_cs", allow_early_resolve=True):
-        cp_r0 = cp * ROPE_TILE
-        cp_c0 = 2 * cp_r0
-        cs_col = pl.col_expand_mul(
-            pl.full([T, ROPE_INTERLEAVE_TILE], dtype=pl.FP32, value=1.0),
-            pl.cast(pl.arange(0, [1, ROPE_INTERLEAVE_TILE], dtype=pl.INT32), target_type=pl.FP32))
-        cs_dup_f = pl.cast(pl.cast(pl.mul(cs_col, 0.5), target_type=pl.INT32, mode="trunc"), target_type=pl.FP32)
-        cs_dup_idx = pl.cast(cs_dup_f, target_type=pl.INT32)                                      # j>>1
-        cs_lane = pl.sub(cs_col, pl.mul(cs_dup_f, 2.0))                                           # j%2
-        cs_sign = pl.neg(pl.sub(pl.mul(cs_lane, 2.0), 1.0))                                       # [+1,-1,...] (conjugate)
-        cs_cos = pl.cast(freqs_cos[0:T, cp_r0 : cp_r0 + ROPE_TILE], target_type=pl.FP32)
-        cs_sin = pl.cast(freqs_sin[0:T, cp_r0 : cp_r0 + ROPE_TILE], target_type=pl.FP32)
-        rope_cos_il[0:T, cp_c0 : cp_c0 + ROPE_INTERLEAVE_TILE] = pl.gather(cs_cos, dim=-1, index=cs_dup_idx)
-        rope_sin_signed[0:T, cp_c0 : cp_c0 + ROPE_INTERLEAVE_TILE] = pl.mul(
-            pl.gather(cs_sin, dim=-1, index=cs_dup_idx), cs_sign)
-
     # Online-softmax merge across sparse-K tiles, sink-norm, then fused inverse RoPE.
     # One spmd block per (token, head-tile) -- T*(H//H_TILE) blocks -- so the merge
     # fans out over that many AIVs instead of T blocks each running a serial head-tile
@@ -451,10 +446,14 @@ def sparse_attn_hca(
     entry below, whose subject is the attention, not the projection.
     """
     o_packed = pl.create_tensor([O_GROUPS * T, O_GROUP_IN], dtype=pl.BF16)
+    rope_cos_il = pl.create_tensor([T, ROPE_DIM], dtype=pl.FP32)
+    rope_sin_signed = pl.create_tensor([T, ROPE_DIM], dtype=pl.FP32)
+    rope_swap_idx = pl.create_tensor([H_TILE, ROPE_DIM], dtype=pl.INT32)
+    prepare_hca_output_rope(freqs_cos, freqs_sin, rope_cos_il, rope_sin_signed, rope_swap_idx)
     merge_tid = sparse_attn_hca_packed(
         q, ori_kv, window_swa_indices, window_swa_lens, cmp_kv, cmp_block_table,
         cmp_sparse_indices, attn_sink, freqs_cos, freqs_sin, o_packed,
-        pl.const(0, pl.INT32),
+        pl.const(0, pl.INT32), rope_cos_il, rope_sin_signed, rope_swap_idx,
     )
     o_proj_grouped(o_packed, merge_tid, wo_a, wo_b, wo_b_scale, attn_out)
     return attn_out
