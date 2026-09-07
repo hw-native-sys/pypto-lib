@@ -40,7 +40,7 @@ def embed_shard_gather(
     vocab_base: pl.Scalar[pl.INT32],
 ):
     """Copy the rows this rank owns; rows it does not own are left untouched."""
-    for block in pl.spmd(T * (D // HIDDEN_TILE), name_hint="embed_shard_gather"):
+    for block in pl.spmd(T * (D // HIDDEN_TILE), name_hint="embed_shard_gather", allow_early_resolve=True):
         token = block // (D // HIDDEN_TILE)
         hidden_offset = (block % (D // HIDDEN_TILE)) * HIDDEN_TILE
         token_id = pl.cast(pl.tensor.read(input_ids, [token]), pl.INT32)
@@ -65,7 +65,7 @@ def all_gather_embedding(
     gather_epoch: pl.Scalar[pl.INT32],
 ):
     """Publish each owned row to every peer, barrier, then read the assembled window."""
-    with pl.spmd(T, name_hint="embed_publish") as publish_tid:
+    with pl.spmd(T, name_hint="embed_publish", allow_early_resolve=True) as publish_tid:
         token = pl.tile.get_block_idx()
         token_id = pl.cast(pl.tensor.read(input_ids, [token]), pl.INT32)
         local_id = token_id - vocab_base
@@ -81,7 +81,7 @@ def all_gather_embedding(
                         shape=[1, D],
                     )
 
-    with pl.at(level=pl.Level.CORE_GROUP, name_hint="embed_barrier", deps=[publish_tid]) as barrier_tid:
+    with pl.at(level=pl.Level.CORE_GROUP, name_hint="embed_barrier", allow_early_resolve=True, deps=[publish_tid]) as barrier_tid:
         for peer in pl.range(N_RANKS):
             pld.system.notify(
                 target=gather_signal,
@@ -98,7 +98,7 @@ def all_gather_embedding(
                 cmp=pld.WaitCmp.Ge,
             )
 
-    with pl.spmd(T * (D // HIDDEN_TILE), name_hint="embed_readback", deps=[barrier_tid]) as _readback_tid:
+    with pl.spmd(T * (D // HIDDEN_TILE), name_hint="embed_readback", allow_early_resolve=True, deps=[barrier_tid]) as _readback_tid:
         block = pl.tile.get_block_idx()
         token = block // (D // HIDDEN_TILE)
         hidden_offset = (block % (D // HIDDEN_TILE)) * HIDDEN_TILE

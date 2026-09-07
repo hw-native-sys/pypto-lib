@@ -43,6 +43,8 @@ from decode_swa import (
     T,
     WIN as SWA_WIN,
     attention_swa,
+    prepare_swa_metadata,
+    SWA_ROPE_ROWS,
     build_tensor_specs as build_attention_tensor_specs,
     golden_attention_swa,
 )
@@ -57,6 +59,9 @@ from decode_hca import (
     COMPRESS_STATE_MAX_BLOCKS as HCA_COMPRESS_STATE_MAX_BLOCKS,
     MAIN_OUT_DIM as HCA_MAIN_OUT_DIM,
     attention_hca,
+    prepare_hca_metadata,
+    HCA_ROPE_ROWS,
+    HCA_CMP_TOPK,
     build_tensor_specs as build_hca_tensor_specs,
     golden_attention_hca,
 )
@@ -83,6 +88,9 @@ from decode_csa import (
     OPROJ_REDUCE_ROWS as CSA_OPROJ_REDUCE_ROWS,
     OPROJ_SCALE_ROWS as CSA_OPROJ_SCALE_ROWS,
     attention_csa,
+    prepare_csa_metadata,
+    CSA_ROPE_ROWS,
+    IDX_ROPE_ROWS,
     clear_csa_oproj_signals,
     TOK_Q_ROWS,
     TOK_O_COLS,
@@ -220,18 +228,27 @@ def decode_layer(
 ) -> pl.Tensor[[T, HC_MULT, D], pl.FP32]:
     x_attn = pl.create_tensor([T, HC_MULT, D], dtype=pl.FP32)
     if layer_id < 2:
+        rope_cos_t = pl.create_tensor([T, ROPE_HEAD_DIM], dtype=pl.BF16)
+        rope_sin_t = pl.create_tensor([T, ROPE_HEAD_DIM], dtype=pl.BF16)
+        q_rope_cos_il = pl.create_tensor([T, ROPE_HEAD_DIM], dtype=pl.FP32)
+        q_rope_sin_signed = pl.create_tensor([T, ROPE_HEAD_DIM], dtype=pl.FP32)
+        q_rope_swap_idx = pl.create_tensor([T, ROPE_HEAD_DIM], dtype=pl.INT32)
+        out_rope_cos_il = pl.create_tensor([T, ROPE_HEAD_DIM], dtype=pl.FP32)
+        out_rope_sin_signed = pl.create_tensor([T, ROPE_HEAD_DIM], dtype=pl.FP32)
+        out_rope_swap_idx = pl.create_tensor([SWA_ROPE_ROWS, ROPE_HEAD_DIM], dtype=pl.INT32)
+        prepare_swa_metadata(freqs_cos, freqs_sin, position_ids, rope_cos_t, rope_sin_t, q_rope_cos_il, q_rope_sin_signed, q_rope_swap_idx, out_rope_cos_il, out_rope_sin_signed, out_rope_swap_idx)
         attention_swa(
             x_hc, gate_w,
             hc_attn_fn, hc_attn_scale, hc_attn_base,
             attn_norm_w, wq_a, wq_b, wq_b_scale,
-            wkv, gamma_cq, gamma_ckv, freqs_cos, freqs_sin,
+            wkv, gamma_cq, gamma_ckv, rope_cos_t, rope_sin_t,
             kv_cache,
             swa_slot_mapping, swa_indices, swa_lens, position_ids,
             attn_sink, wo_a_shard, wo_b_shard, wo_b_scale,
             x_attn,
             oproj_reduce_window, oproj_scale_window,
             oproj_reduce_signal, oproj_sync_signal,
-            my_rank, pl.const(CSA_OPROJ_FIRST_EPOCH, pl.INT32),
+            my_rank, pl.const(CSA_OPROJ_FIRST_EPOCH, pl.INT32), q_rope_cos_il, q_rope_sin_signed, q_rope_swap_idx, out_rope_cos_il, out_rope_sin_signed, out_rope_swap_idx,
         )
         # One attention layer per dispatch, so this is that layer: reset the
         # counters the projection left monotonic for the next dispatch.
@@ -239,11 +256,23 @@ def decode_layer(
             x_attn, oproj_reduce_signal, oproj_sync_signal, tok_q_signal, tok_o_signal
         )
     elif layer_id % 2 == 1:
+        rope_cos_t = pl.create_tensor([T, ROPE_HEAD_DIM], dtype=pl.BF16)
+        rope_sin_t = pl.create_tensor([T, ROPE_HEAD_DIM], dtype=pl.BF16)
+        cmp_cos_il = pl.create_tensor([B, ROPE_HEAD_DIM], dtype=pl.FP32)
+        cmp_sin_signed = pl.create_tensor([B, ROPE_HEAD_DIM], dtype=pl.FP32)
+        topk_all = pl.create_tensor([T, HCA_CMP_TOPK], dtype=pl.INT32)
+        q_rope_cos_il = pl.create_tensor([T, ROPE_HEAD_DIM], dtype=pl.FP32)
+        q_rope_sin_signed = pl.create_tensor([T, ROPE_HEAD_DIM], dtype=pl.FP32)
+        q_rope_swap_idx = pl.create_tensor([T, ROPE_HEAD_DIM], dtype=pl.INT32)
+        out_rope_cos_il = pl.create_tensor([T, ROPE_HEAD_DIM], dtype=pl.FP32)
+        out_rope_sin_signed = pl.create_tensor([T, ROPE_HEAD_DIM], dtype=pl.FP32)
+        out_rope_swap_idx = pl.create_tensor([HCA_ROPE_ROWS, ROPE_HEAD_DIM], dtype=pl.INT32)
+        prepare_hca_metadata(freqs_cos, freqs_sin, position_ids, kv_seq_lens, rope_cos_t, rope_sin_t, cmp_cos_il, cmp_sin_signed, topk_all, q_rope_cos_il, q_rope_sin_signed, q_rope_swap_idx, out_rope_cos_il, out_rope_sin_signed, out_rope_swap_idx)
         attention_hca(
             x_hc, gate_w,
             hc_attn_fn, hc_attn_scale, hc_attn_base,
             attn_norm_w, wq_a, wq_b, wq_b_scale,
-            wkv, gamma_cq, gamma_ckv, freqs_cos, freqs_sin,
+            wkv, gamma_cq, gamma_ckv, rope_cos_t, rope_sin_t, cmp_cos_il, cmp_sin_signed, topk_all,
             hca_cmp_wkv, hca_cmp_wgate, hca_cmp_ape, hca_cmp_norm_w,
             hca_compress_state, hca_compress_state_block_table,
             kv_cache, hca_cmp_kv, hca_cmp_block_table,
@@ -254,7 +283,7 @@ def decode_layer(
             x_attn,
             oproj_reduce_window, oproj_scale_window,
             oproj_reduce_signal, oproj_sync_signal,
-            my_rank, pl.const(CSA_OPROJ_FIRST_EPOCH, pl.INT32),
+            my_rank, pl.const(CSA_OPROJ_FIRST_EPOCH, pl.INT32), q_rope_cos_il, q_rope_sin_signed, q_rope_swap_idx, out_rope_cos_il, out_rope_sin_signed, out_rope_swap_idx,
         )
         # One attention layer per dispatch, so this is that layer: reset the
         # counters the projection left monotonic for the next dispatch.
@@ -262,11 +291,25 @@ def decode_layer(
             x_attn, oproj_reduce_signal, oproj_sync_signal, tok_q_signal, tok_o_signal
         )
     else:
+        rope_cos_t = pl.create_tensor([T, ROPE_HEAD_DIM], dtype=pl.BF16)
+        rope_sin_t = pl.create_tensor([T, ROPE_HEAD_DIM], dtype=pl.BF16)
+        step_cos_il = pl.create_tensor([B, ROPE_HEAD_DIM], dtype=pl.FP32)
+        step_sin_signed = pl.create_tensor([B, ROPE_HEAD_DIM], dtype=pl.FP32)
+        cmp_cos_il = pl.create_tensor([B, ROPE_HEAD_DIM], dtype=pl.FP32)
+        cmp_sin_signed = pl.create_tensor([B, ROPE_HEAD_DIM], dtype=pl.FP32)
+        q_rope_cos_il = pl.create_tensor([T, ROPE_HEAD_DIM], dtype=pl.FP32)
+        q_rope_sin_signed = pl.create_tensor([T, ROPE_HEAD_DIM], dtype=pl.FP32)
+        q_rope_swap_idx = pl.create_tensor([T, ROPE_HEAD_DIM], dtype=pl.INT32)
+        out_rope_cos_il = pl.create_tensor([T, ROPE_HEAD_DIM], dtype=pl.FP32)
+        out_rope_sin_signed = pl.create_tensor([T, ROPE_HEAD_DIM], dtype=pl.FP32)
+        out_rope_swap_idx = pl.create_tensor([CSA_ROPE_ROWS, ROPE_HEAD_DIM], dtype=pl.INT32)
+        idx_rope_swap_idx = pl.create_tensor([IDX_ROPE_ROWS, ROPE_HEAD_DIM], dtype=pl.INT32)
+        prepare_csa_metadata(freqs_cos, freqs_sin, position_ids, rope_cos_t, rope_sin_t, step_cos_il, step_sin_signed, cmp_cos_il, cmp_sin_signed, q_rope_cos_il, q_rope_sin_signed, q_rope_swap_idx, out_rope_cos_il, out_rope_sin_signed, out_rope_swap_idx, idx_rope_swap_idx)
         attention_csa(
             x_hc, gate_w,
             hc_attn_fn, hc_attn_scale, hc_attn_base,
             attn_norm_w, wq_a, wq_b, wq_b_scale,
-            wkv, gamma_cq, gamma_ckv, freqs_cos, freqs_sin,
+            wkv, gamma_cq, gamma_ckv, rope_cos_t, rope_sin_t, step_cos_il, step_sin_signed, cmp_cos_il, cmp_sin_signed,
             csa_cmp_wkv, csa_cmp_wgate, csa_cmp_ape, csa_cmp_norm_w,
             csa_compress_state, csa_compress_state_block_table,
             csa_idx_wq_b, csa_idx_wq_b_scale, csa_weights_proj, csa_hadamard_idx,
@@ -284,7 +327,7 @@ def decode_layer(
             oproj_reduce_signal, oproj_sync_signal,
             tok_q_window, tok_q_signal, tok_o_window, tok_o_signal,
             my_rank, pl.const(CSA_OPROJ_FIRST_EPOCH, pl.INT32),
-            pl.const(1, pl.INT32),
+            pl.const(1, pl.INT32), q_rope_cos_il, q_rope_sin_signed, q_rope_swap_idx, out_rope_cos_il, out_rope_sin_signed, out_rope_swap_idx, idx_rope_swap_idx,
         )
         # One CSA layer per dispatch, so this is that layer: reset the counters
         # the projection left monotonic for the next dispatch.

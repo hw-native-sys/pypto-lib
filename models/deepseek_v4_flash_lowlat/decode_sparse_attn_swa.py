@@ -93,6 +93,51 @@ assert WIN == ATTN_K_TILE, f"SWA decode expects WIN ({WIN}) == ATTN_K_TILE ({ATT
 
 
 @pl.jit.inline
+def prepare_swa_output_rope(
+    freqs_cos: pl.Tensor[[T, ROPE_DIM], pl.BF16],
+    freqs_sin: pl.Tensor[[T, ROPE_DIM], pl.BF16],
+    rope_cos_il: pl.Out[pl.Tensor[[T, ROPE_DIM], pl.FP32]],
+    rope_sin_signed: pl.Out[pl.Tensor[[T, ROPE_DIM], pl.FP32]],
+    rope_swap_idx: pl.Out[pl.Tensor[[H_TILE, ROPE_DIM], pl.INT32]],
+):
+    with pl.at(level=pl.Level.CORE_GROUP, name_hint="rope_cs", allow_early_resolve=True) as rope_tid:
+        swap_ones = pl.full([H_TILE, ROPE_DIM], dtype=pl.FP32, value=1.0)
+        swap_range_i32 = pl.arange(0, [1, ROPE_DIM], dtype=pl.INT32)
+        swap_range = pl.cast(swap_range_i32, target_type=pl.FP32)
+        swap_col = pl.col_expand_mul(swap_ones, swap_range)
+        swap_half = pl.mul(swap_col, 0.5)
+        swap_dup_i32 = pl.cast(swap_half, target_type=pl.INT32, mode="trunc")
+        swap_dup_f = pl.cast(swap_dup_i32, target_type=pl.FP32)
+        swap_lane = pl.sub(swap_col, pl.mul(swap_dup_f, 2.0))
+        swap_next = pl.add(swap_col, 1.0)
+        swap_stride = pl.mul(swap_lane, 2.0)
+        swap_idx_f = pl.sub(swap_next, swap_stride)
+        rope_swap_idx[:, :] = pl.cast(swap_idx_f, target_type=pl.INT32)
+
+        cs_ones = pl.full([T, ROPE_INTERLEAVE_TILE], dtype=pl.FP32, value=1.0)
+        cs_range_i32 = pl.arange(0, [1, ROPE_INTERLEAVE_TILE], dtype=pl.INT32)
+        cs_range = pl.cast(cs_range_i32, target_type=pl.FP32)
+        cs_col = pl.col_expand_mul(cs_ones, cs_range)
+        cs_half = pl.mul(cs_col, 0.5)
+        cs_dup_i32 = pl.cast(cs_half, target_type=pl.INT32, mode="trunc")
+        cs_dup_f = pl.cast(cs_dup_i32, target_type=pl.FP32)
+        cs_dup_idx = pl.cast(cs_dup_f, target_type=pl.INT32)
+        cs_lane = pl.sub(cs_col, pl.mul(cs_dup_f, 2.0))
+        cs_sign_base = pl.sub(pl.mul(cs_lane, 2.0), 1.0)
+        cs_sign = pl.neg(cs_sign_base)
+        for cp in pl.range(HALF_ROPE // ROPE_TILE):
+            cp_r0 = cp * ROPE_TILE
+            cp_c0 = 2 * cp_r0
+            cs_cos = pl.cast(freqs_cos[0:T, cp_r0 : cp_r0 + ROPE_TILE], target_type=pl.FP32)
+            cs_sin = pl.cast(freqs_sin[0:T, cp_r0 : cp_r0 + ROPE_TILE], target_type=pl.FP32)
+            cs_cos_dup = pl.gather(cs_cos, dim=-1, index=cs_dup_idx)
+            cs_sin_dup = pl.gather(cs_sin, dim=-1, index=cs_dup_idx)
+            cs_sin_signed = pl.mul(cs_sin_dup, cs_sign)
+            rope_cos_il[0:T, cp_c0 : cp_c0 + ROPE_INTERLEAVE_TILE] = cs_cos_dup
+            rope_sin_signed[0:T, cp_c0 : cp_c0 + ROPE_INTERLEAVE_TILE] = cs_sin_signed
+
+
+@pl.jit.inline
 def sparse_attn_swa_packed(
     q: pl.Tensor[[T, H, HEAD_DIM], pl.BF16],
     ori_kv: pl.Tensor[[ORI_BLOCK_NUM_DYN, BLOCK_SIZE, 1, HEAD_DIM], pl.BF16],
@@ -104,6 +149,9 @@ def sparse_attn_swa_packed(
     freqs_sin: pl.Tensor[[T, ROPE_DIM], pl.BF16],
     o_packed: pl.Tensor[[O_GROUPS * T, O_GROUP_IN], pl.BF16],
     my_rank: pl.Scalar[pl.INT32],
+    rope_cos_il: pl.Tensor[[T, ROPE_DIM], pl.FP32],
+    rope_sin_signed: pl.Tensor[[T, ROPE_DIM], pl.FP32],
+    rope_swap_idx: pl.Tensor[[H_TILE, ROPE_DIM], pl.INT32],
 ) -> pl.Scalar[pl.TASK_ID]:
     """Sparse decode attention over the sliding window, and inverse RoPE, up to the packed head output.
 
@@ -189,54 +237,11 @@ def sparse_attn_swa_packed(
                 sparse_blk_li[qk_row : qk_row + QK_M_BOX, 0 : 1] = qk_li
                 sparse_blk_oi[qk_row : qk_row + QK_M_BOX, 0 : HEAD_DIM] = qk_oi
 
-    # Materialize the head-invariant interleaved cos and signed-sin rows once.
-    # This runs alongside qk_pv and keeps the exact indexed RoPE arithmetic used
-    # by the reference path while the group merge below changes only scheduling
-    # and store granularity.
-    rope_cos_il = pl.create_tensor([T, ROPE_DIM], dtype=pl.FP32)
-    rope_sin_signed = pl.create_tensor([T, ROPE_DIM], dtype=pl.FP32)
-    rope_swap_idx = pl.create_tensor([H_TILE, ROPE_DIM], dtype=pl.INT32)
-    with pl.at(level=pl.Level.CORE_GROUP, name_hint="rope_cs", allow_early_resolve=True) as rope_tid:
-        swap_ones = pl.full([H_TILE, ROPE_DIM], dtype=pl.FP32, value=1.0)
-        swap_range_i32 = pl.arange(0, [1, ROPE_DIM], dtype=pl.INT32)
-        swap_range = pl.cast(swap_range_i32, target_type=pl.FP32)
-        swap_col = pl.col_expand_mul(swap_ones, swap_range)
-        swap_half = pl.mul(swap_col, 0.5)
-        swap_dup_i32 = pl.cast(swap_half, target_type=pl.INT32, mode="trunc")
-        swap_dup_f = pl.cast(swap_dup_i32, target_type=pl.FP32)
-        swap_lane = pl.sub(swap_col, pl.mul(swap_dup_f, 2.0))
-        swap_next = pl.add(swap_col, 1.0)
-        swap_stride = pl.mul(swap_lane, 2.0)
-        swap_idx_f = pl.sub(swap_next, swap_stride)
-        rope_swap_idx[:, :] = pl.cast(swap_idx_f, target_type=pl.INT32)
-
-        cs_ones = pl.full([T, ROPE_INTERLEAVE_TILE], dtype=pl.FP32, value=1.0)
-        cs_range_i32 = pl.arange(0, [1, ROPE_INTERLEAVE_TILE], dtype=pl.INT32)
-        cs_range = pl.cast(cs_range_i32, target_type=pl.FP32)
-        cs_col = pl.col_expand_mul(cs_ones, cs_range)
-        cs_half = pl.mul(cs_col, 0.5)
-        cs_dup_i32 = pl.cast(cs_half, target_type=pl.INT32, mode="trunc")
-        cs_dup_f = pl.cast(cs_dup_i32, target_type=pl.FP32)
-        cs_dup_idx = pl.cast(cs_dup_f, target_type=pl.INT32)
-        cs_lane = pl.sub(cs_col, pl.mul(cs_dup_f, 2.0))
-        cs_sign_base = pl.sub(pl.mul(cs_lane, 2.0), 1.0)
-        cs_sign = pl.neg(cs_sign_base)
-        for cp in pl.range(HALF_ROPE // ROPE_TILE):
-            cp_r0 = cp * ROPE_TILE
-            cp_c0 = 2 * cp_r0
-            cs_cos = pl.cast(freqs_cos[0:T, cp_r0 : cp_r0 + ROPE_TILE], target_type=pl.FP32)
-            cs_sin = pl.cast(freqs_sin[0:T, cp_r0 : cp_r0 + ROPE_TILE], target_type=pl.FP32)
-            cs_cos_dup = pl.gather(cs_cos, dim=-1, index=cs_dup_idx)
-            cs_sin_dup = pl.gather(cs_sin, dim=-1, index=cs_dup_idx)
-            cs_sin_signed = pl.mul(cs_sin_dup, cs_sign)
-            rope_cos_il[0:T, cp_c0 : cp_c0 + ROPE_INTERLEAVE_TILE] = cs_cos_dup
-            rope_sin_signed[0:T, cp_c0 : cp_c0 + ROPE_INTERLEAVE_TILE] = cs_sin_signed
-
     # Flatten the one-block SWA merge over token/head tiles into a single
     # 32-block grid, which fits in one AIV wave and avoids eight group-grid
     # submissions. Each block writes two output-projection groups using the
     # same contiguous per-group stores.
-    with pl.spmd(T * (H_LOCAL // H_TILE), name_hint="merge_norm", deps=[qk_tid, rope_tid],
+    with pl.spmd(T * (H_LOCAL // H_TILE), name_hint="merge_norm", deps=[qk_tid],
                  allow_early_resolve=True) as merge_tid:
         m_idx = pl.tile.get_block_idx()
         m_t = m_idx // (H_LOCAL // H_TILE)
@@ -319,9 +324,13 @@ def sparse_attn_swa(
     entry below, whose subject is the attention, not the projection.
     """
     o_packed = pl.create_tensor([O_GROUPS * T, O_GROUP_IN], dtype=pl.BF16)
+    rope_cos_il = pl.create_tensor([T, ROPE_DIM], dtype=pl.FP32)
+    rope_sin_signed = pl.create_tensor([T, ROPE_DIM], dtype=pl.FP32)
+    rope_swap_idx = pl.create_tensor([H_TILE, ROPE_DIM], dtype=pl.INT32)
+    prepare_swa_output_rope(freqs_cos, freqs_sin, rope_cos_il, rope_sin_signed, rope_swap_idx)
     merge_tid = sparse_attn_swa_packed(
         q, ori_kv, swa_indices, swa_lens, sparse_bias, attn_sink,
-        freqs_cos, freqs_sin, o_packed, pl.const(0, pl.INT32),
+        freqs_cos, freqs_sin, o_packed, pl.const(0, pl.INT32), rope_cos_il, rope_sin_signed, rope_swap_idx,
     )
     o_proj_grouped(o_packed, merge_tid, wo_a, wo_b, wo_b_scale, attn_out)
     return attn_out

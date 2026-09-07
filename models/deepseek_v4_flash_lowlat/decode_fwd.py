@@ -52,6 +52,8 @@ from decode_swa import (
     T,
     WIN as SWA_WIN,
     attention_swa,
+    prepare_swa_metadata,
+    SWA_ROPE_ROWS,
     build_tensor_specs as build_attention_tensor_specs,
 )
 from decode_hca import (
@@ -63,6 +65,9 @@ from decode_hca import (
     COMPRESS_STATE_MAX_BLOCKS as HCA_COMPRESS_STATE_MAX_BLOCKS,
     MAIN_OUT_DIM as HCA_MAIN_OUT_DIM,
     attention_hca,
+    prepare_hca_metadata,
+    HCA_ROPE_ROWS,
+    HCA_CMP_TOPK,
     build_tensor_specs as build_hca_tensor_specs,
 )
 from decode_csa import (
@@ -86,6 +91,9 @@ from decode_csa import (
     OPROJ_REDUCE_ROWS as CSA_OPROJ_REDUCE_ROWS,
     OPROJ_SCALE_ROWS as CSA_OPROJ_SCALE_ROWS,
     attention_csa,
+    prepare_csa_metadata,
+    CSA_ROPE_ROWS,
+    IDX_ROPE_ROWS,
     build_tensor_specs as build_csa_tensor_specs,
     clear_csa_oproj_signals,
     TOK_Q_ROWS,
@@ -355,6 +363,41 @@ def decode_fwd(
     compressed_freqs_sin: pl.Tensor[[MAX_SEQ_LEN, ROPE_HEAD_DIM], pl.BF16] = pl.reshape(
         compressed_sin_profile, [MAX_SEQ_LEN, ROPE_HEAD_DIM]
     )
+    fwd_swa_rope_cos_t = pl.create_tensor([T, ROPE_HEAD_DIM], dtype=pl.BF16)
+    fwd_swa_rope_sin_t = pl.create_tensor([T, ROPE_HEAD_DIM], dtype=pl.BF16)
+    fwd_swa_q_rope_cos_il = pl.create_tensor([T, ROPE_HEAD_DIM], dtype=pl.FP32)
+    fwd_swa_q_rope_sin_signed = pl.create_tensor([T, ROPE_HEAD_DIM], dtype=pl.FP32)
+    fwd_swa_q_rope_swap_idx = pl.create_tensor([T, ROPE_HEAD_DIM], dtype=pl.INT32)
+    fwd_swa_out_rope_cos_il = pl.create_tensor([T, ROPE_HEAD_DIM], dtype=pl.FP32)
+    fwd_swa_out_rope_sin_signed = pl.create_tensor([T, ROPE_HEAD_DIM], dtype=pl.FP32)
+    fwd_swa_out_rope_swap_idx = pl.create_tensor([SWA_ROPE_ROWS, ROPE_HEAD_DIM], dtype=pl.INT32)
+    prepare_swa_metadata(swa_freqs_cos, swa_freqs_sin, position_ids, fwd_swa_rope_cos_t, fwd_swa_rope_sin_t, fwd_swa_q_rope_cos_il, fwd_swa_q_rope_sin_signed, fwd_swa_q_rope_swap_idx, fwd_swa_out_rope_cos_il, fwd_swa_out_rope_sin_signed, fwd_swa_out_rope_swap_idx)
+    fwd_csa_rope_cos_t = pl.create_tensor([T, ROPE_HEAD_DIM], dtype=pl.BF16)
+    fwd_csa_rope_sin_t = pl.create_tensor([T, ROPE_HEAD_DIM], dtype=pl.BF16)
+    fwd_csa_step_cos_il = pl.create_tensor([B, ROPE_HEAD_DIM], dtype=pl.FP32)
+    fwd_csa_step_sin_signed = pl.create_tensor([B, ROPE_HEAD_DIM], dtype=pl.FP32)
+    fwd_csa_cmp_cos_il = pl.create_tensor([B, ROPE_HEAD_DIM], dtype=pl.FP32)
+    fwd_csa_cmp_sin_signed = pl.create_tensor([B, ROPE_HEAD_DIM], dtype=pl.FP32)
+    fwd_csa_q_rope_cos_il = pl.create_tensor([T, ROPE_HEAD_DIM], dtype=pl.FP32)
+    fwd_csa_q_rope_sin_signed = pl.create_tensor([T, ROPE_HEAD_DIM], dtype=pl.FP32)
+    fwd_csa_q_rope_swap_idx = pl.create_tensor([T, ROPE_HEAD_DIM], dtype=pl.INT32)
+    fwd_csa_out_rope_cos_il = pl.create_tensor([T, ROPE_HEAD_DIM], dtype=pl.FP32)
+    fwd_csa_out_rope_sin_signed = pl.create_tensor([T, ROPE_HEAD_DIM], dtype=pl.FP32)
+    fwd_csa_out_rope_swap_idx = pl.create_tensor([CSA_ROPE_ROWS, ROPE_HEAD_DIM], dtype=pl.INT32)
+    fwd_csa_idx_rope_swap_idx = pl.create_tensor([IDX_ROPE_ROWS, ROPE_HEAD_DIM], dtype=pl.INT32)
+    prepare_csa_metadata(compressed_freqs_cos, compressed_freqs_sin, position_ids, fwd_csa_rope_cos_t, fwd_csa_rope_sin_t, fwd_csa_step_cos_il, fwd_csa_step_sin_signed, fwd_csa_cmp_cos_il, fwd_csa_cmp_sin_signed, fwd_csa_q_rope_cos_il, fwd_csa_q_rope_sin_signed, fwd_csa_q_rope_swap_idx, fwd_csa_out_rope_cos_il, fwd_csa_out_rope_sin_signed, fwd_csa_out_rope_swap_idx, fwd_csa_idx_rope_swap_idx)
+    fwd_hca_rope_cos_t = pl.create_tensor([T, ROPE_HEAD_DIM], dtype=pl.BF16)
+    fwd_hca_rope_sin_t = pl.create_tensor([T, ROPE_HEAD_DIM], dtype=pl.BF16)
+    fwd_hca_cmp_cos_il = pl.create_tensor([B, ROPE_HEAD_DIM], dtype=pl.FP32)
+    fwd_hca_cmp_sin_signed = pl.create_tensor([B, ROPE_HEAD_DIM], dtype=pl.FP32)
+    fwd_hca_topk_all = pl.create_tensor([T, HCA_CMP_TOPK], dtype=pl.INT32)
+    fwd_hca_q_rope_cos_il = pl.create_tensor([T, ROPE_HEAD_DIM], dtype=pl.FP32)
+    fwd_hca_q_rope_sin_signed = pl.create_tensor([T, ROPE_HEAD_DIM], dtype=pl.FP32)
+    fwd_hca_q_rope_swap_idx = pl.create_tensor([T, ROPE_HEAD_DIM], dtype=pl.INT32)
+    fwd_hca_out_rope_cos_il = pl.create_tensor([T, ROPE_HEAD_DIM], dtype=pl.FP32)
+    fwd_hca_out_rope_sin_signed = pl.create_tensor([T, ROPE_HEAD_DIM], dtype=pl.FP32)
+    fwd_hca_out_rope_swap_idx = pl.create_tensor([HCA_ROPE_ROWS, ROPE_HEAD_DIM], dtype=pl.INT32)
+    prepare_hca_metadata(compressed_freqs_cos, compressed_freqs_sin, position_ids, kv_seq_lens, fwd_hca_rope_cos_t, fwd_hca_rope_sin_t, fwd_hca_cmp_cos_il, fwd_hca_cmp_sin_signed, fwd_hca_topk_all, fwd_hca_q_rope_cos_il, fwd_hca_q_rope_sin_signed, fwd_hca_q_rope_swap_idx, fwd_hca_out_rope_cos_il, fwd_hca_out_rope_sin_signed, fwd_hca_out_rope_swap_idx)
     nt = pl.cast(0, pl.INT32)
     for owner_rank in pl.range(N_RANKS):
         nt = pl.max(nt, pl.read(num_tokens_per_owner, [owner_rank]))
@@ -433,14 +476,14 @@ def decode_fwd(
             x_hc, gate_w_l0,
             hc_attn_fn_l0, hc_attn_scale_l0, hc_attn_base_l0,
             attn_norm_w_l0, wq_a_l0, wq_b_l0, wq_b_scale_l0,
-            wkv_l0, gamma_cq_l0, gamma_ckv_l0, swa_freqs_cos, swa_freqs_sin,
+            wkv_l0, gamma_cq_l0, gamma_ckv_l0, fwd_swa_rope_cos_t, fwd_swa_rope_sin_t,
             kv_cache_l0,
             swa_slot_mapping, swa_indices, swa_lens, position_ids,
             attn_sink_l0, wo_a_shard_l0, wo_b_shard_l0, wo_b_scale_l0,
             x_attn0,
             oproj_reduce_window, oproj_scale_window,
             oproj_reduce_signal, oproj_sync_signal,
-            my_rank, pl.cast(1, pl.INT32),
+            my_rank, pl.cast(1, pl.INT32), fwd_swa_q_rope_cos_il, fwd_swa_q_rope_sin_signed, fwd_swa_q_rope_swap_idx, fwd_swa_out_rope_cos_il, fwd_swa_out_rope_sin_signed, fwd_swa_out_rope_swap_idx,
         )
     with pl.scope():
         moe(
@@ -458,14 +501,14 @@ def decode_fwd(
             hidden, gate_w_l1,
             hc_attn_fn_l1, hc_attn_scale_l1, hc_attn_base_l1,
             attn_norm_w_l1, wq_a_l1, wq_b_l1, wq_b_scale_l1,
-            wkv_l1, gamma_cq_l1, gamma_ckv_l1, swa_freqs_cos, swa_freqs_sin,
+            wkv_l1, gamma_cq_l1, gamma_ckv_l1, fwd_swa_rope_cos_t, fwd_swa_rope_sin_t,
             kv_cache_l1,
             swa_slot_mapping, swa_indices, swa_lens, position_ids,
             attn_sink_l1, wo_a_shard_l1, wo_b_shard_l1, wo_b_scale_l1,
             x_attn1,
             oproj_reduce_window, oproj_scale_window,
             oproj_reduce_signal, oproj_sync_signal,
-            my_rank, pl.cast(2, pl.INT32),
+            my_rank, pl.cast(2, pl.INT32), fwd_swa_q_rope_cos_il, fwd_swa_q_rope_sin_signed, fwd_swa_q_rope_swap_idx, fwd_swa_out_rope_cos_il, fwd_swa_out_rope_sin_signed, fwd_swa_out_rope_swap_idx,
         )
     with pl.scope():
         moe(
@@ -548,7 +591,7 @@ def decode_fwd(
                 hc_attn_fn_csa, hc_attn_scale_csa, hc_attn_base_csa,
                 attn_norm_w_csa, wq_a_csa, wq_b_csa, wq_b_scale_csa,
                 wkv_csa, gamma_cq_csa, gamma_ckv_csa,
-                compressed_freqs_cos, compressed_freqs_sin,
+                fwd_csa_rope_cos_t, fwd_csa_rope_sin_t, fwd_csa_step_cos_il, fwd_csa_step_sin_signed, fwd_csa_cmp_cos_il, fwd_csa_cmp_sin_signed,
                 csa_cmp_wkv_csa, csa_cmp_wgate_csa, csa_cmp_ape_csa, csa_cmp_norm_w_csa,
                 csa_compress_state_csa, csa_compress_state_block_table,
                 csa_idx_wq_b_csa, csa_idx_wq_b_scale_csa, csa_weights_proj_csa, csa_hadamard_idx_csa,
@@ -565,7 +608,7 @@ def decode_fwd(
                 oproj_reduce_window, oproj_scale_window,
                 oproj_reduce_signal, oproj_sync_signal,
                 tok_q_window, tok_q_signal, tok_o_window, tok_o_signal,
-                my_rank, csa_oproj_epoch, csa_tok_epoch,
+                my_rank, csa_oproj_epoch, csa_tok_epoch, fwd_csa_q_rope_cos_il, fwd_csa_q_rope_sin_signed, fwd_csa_q_rope_swap_idx, fwd_csa_out_rope_cos_il, fwd_csa_out_rope_sin_signed, fwd_csa_out_rope_swap_idx, fwd_csa_idx_rope_swap_idx,
             )
         with pl.scope():
             moe(
@@ -620,7 +663,7 @@ def decode_fwd(
                 hc_attn_fn_hca, hc_attn_scale_hca, hc_attn_base_hca,
                 attn_norm_w_hca, wq_a_hca, wq_b_hca, wq_b_scale_hca,
                 wkv_hca, gamma_cq_hca, gamma_ckv_hca,
-                compressed_freqs_cos, compressed_freqs_sin,
+                fwd_hca_rope_cos_t, fwd_hca_rope_sin_t, fwd_hca_cmp_cos_il, fwd_hca_cmp_sin_signed, fwd_hca_topk_all,
                 hca_cmp_wkv_hca, hca_cmp_wgate_hca, hca_cmp_ape_hca, hca_cmp_norm_w_hca,
                 hca_compress_state_hca, hca_compress_state_block_table,
                 kv_cache_hca, cmp_kv_hca, hca_cmp_block_table,
@@ -631,7 +674,7 @@ def decode_fwd(
                 x_attn_hca,
                 oproj_reduce_window, oproj_scale_window,
                 oproj_reduce_signal, oproj_sync_signal,
-                my_rank, hca_oproj_epoch,
+                my_rank, hca_oproj_epoch, fwd_hca_q_rope_cos_il, fwd_hca_q_rope_sin_signed, fwd_hca_q_rope_swap_idx, fwd_hca_out_rope_cos_il, fwd_hca_out_rope_sin_signed, fwd_hca_out_rope_swap_idx,
             )
         with pl.scope():
             moe(
@@ -703,7 +746,7 @@ def decode_fwd(
             hc_attn_fn_last, hc_attn_scale_last, hc_attn_base_last,
             attn_norm_w_last, wq_a_last, wq_b_last, wq_b_scale_last,
             wkv_last, gamma_cq_last, gamma_ckv_last,
-            compressed_freqs_cos, compressed_freqs_sin,
+            fwd_csa_rope_cos_t, fwd_csa_rope_sin_t, fwd_csa_step_cos_il, fwd_csa_step_sin_signed, fwd_csa_cmp_cos_il, fwd_csa_cmp_sin_signed,
             csa_cmp_wkv_last, csa_cmp_wgate_last, csa_cmp_ape_last, csa_cmp_norm_w_last,
             csa_compress_state_last, csa_compress_state_block_table,
             csa_idx_wq_b_last, csa_idx_wq_b_scale_last, csa_weights_proj_last, csa_hadamard_idx_last,
@@ -720,7 +763,7 @@ def decode_fwd(
             oproj_reduce_window, oproj_scale_window,
             oproj_reduce_signal, oproj_sync_signal,
             tok_q_window, tok_q_signal, tok_o_window, tok_o_signal,
-            my_rank, last_oproj_epoch, pl.cast(HCA_NUM_LAYERS + 1, pl.INT32),
+            my_rank, last_oproj_epoch, pl.cast(HCA_NUM_LAYERS + 1, pl.INT32), fwd_csa_q_rope_cos_il, fwd_csa_q_rope_sin_signed, fwd_csa_q_rope_swap_idx, fwd_csa_out_rope_cos_il, fwd_csa_out_rope_sin_signed, fwd_csa_out_rope_swap_idx, fwd_csa_idx_rope_swap_idx,
         )
     with pl.scope():
         moe(

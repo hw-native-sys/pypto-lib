@@ -159,6 +159,39 @@ def csa_q_all_to_all(
 
 
 @pl.jit.inline
+def prepare_csa_output_rope(
+    freqs_cos: pl.Tensor[[T, ROPE_DIM], pl.BF16],
+    freqs_sin: pl.Tensor[[T, ROPE_DIM], pl.BF16],
+    rope_cos_il: pl.Out[pl.Tensor[[T, ROPE_DIM], pl.FP32]],
+    rope_sin_signed: pl.Out[pl.Tensor[[T, ROPE_DIM], pl.FP32]],
+    rope_swap_idx: pl.Out[pl.Tensor[[H_TILE, ROPE_DIM], pl.INT32]],
+):
+    with pl.at(level=pl.Level.CORE_GROUP, name_hint="rope_cs", allow_early_resolve=True):
+        sw_ones = pl.full([H_TILE, ROPE_DIM], dtype=pl.FP32, value=1.0)
+        sw_idx_f = pl.cast(pl.arange(0, [1, ROPE_DIM], dtype=pl.INT32), target_type=pl.FP32)
+        sw_col = pl.col_expand_mul(sw_ones, sw_idx_f)
+        sw_dup_i32 = pl.cast(pl.mul(sw_col, 0.5), target_type=pl.INT32, mode="trunc")
+        sw_dup_f = pl.cast(sw_dup_i32, target_type=pl.FP32)
+        sw_lane = pl.sub(sw_col, pl.mul(sw_dup_f, 2.0))                                           # j%2
+        sw_swap_f = pl.sub(pl.add(sw_col, 1.0), pl.mul(sw_lane, 2.0))                             # j^1
+        rope_swap_idx[0:H_TILE, 0:ROPE_DIM] = pl.cast(sw_swap_f, target_type=pl.INT32)
+
+        cs_ones = pl.full([T, ROPE_DIM], dtype=pl.FP32, value=1.0)
+        cs_idx_f = pl.cast(pl.arange(0, [1, ROPE_DIM], dtype=pl.INT32), target_type=pl.FP32)
+        cs_col = pl.col_expand_mul(cs_ones, cs_idx_f)
+        cs_dup_i32 = pl.cast(pl.mul(cs_col, 0.5), target_type=pl.INT32, mode="trunc")
+        cs_dup_f = pl.cast(cs_dup_i32, target_type=pl.FP32)
+        cs_dup_idx = pl.cast(cs_dup_f, target_type=pl.INT32)                                      # j>>1
+        cs_lane = pl.sub(cs_col, pl.mul(cs_dup_f, 2.0))                                           # j%2
+        cs_sign = pl.neg(pl.sub(pl.mul(cs_lane, 2.0), 1.0))                                       # [+1,-1,...] (conjugate)
+        cs_cos = pl.cast(freqs_cos[0:T, 0:HALF_ROPE], target_type=pl.FP32)
+        cs_sin = pl.cast(freqs_sin[0:T, 0:HALF_ROPE], target_type=pl.FP32)
+        rope_cos_il[0:T, 0:ROPE_DIM] = pl.gather(cs_cos, dim=-1, index=cs_dup_idx)
+        cs_sin_il = pl.gather(cs_sin, dim=-1, index=cs_dup_idx)
+        rope_sin_signed[0:T, 0:ROPE_DIM] = pl.mul(cs_sin_il, cs_sign)
+
+
+@pl.jit.inline
 def sparse_attn_csa_packed(
     q_window: pld.DistributedTensor[[H, HEAD_DIM], pl.BF16],
     q_signal: pld.DistributedTensor[[N_RANKS, 1], pl.INT32],
@@ -177,6 +210,9 @@ def sparse_attn_csa_packed(
     o_signal: pld.DistributedTensor[[N_RANKS, 1], pl.INT32],
     my_rank: pl.Scalar[pl.INT32],
     tok_epoch: pl.Scalar[pl.INT32],
+    rope_cos_il: pl.Tensor[[T, ROPE_DIM], pl.FP32],
+    rope_sin_signed: pl.Tensor[[T, ROPE_DIM], pl.FP32],
+    rope_swap_idx: pl.Tensor[[H_TILE, ROPE_DIM], pl.INT32],
 ) -> pl.Scalar[pl.TASK_ID]:
     """Token-sharded sparse decode attention, up to the packed head output.
 
@@ -373,37 +409,6 @@ def sparse_attn_csa_packed(
                         pl.write(sparse_blk_mi, [qk_hrow + qk_hr, 0], -3.0e38)
                         pl.write(sparse_blk_li, [qk_hrow + qk_hr, 0], 0.0)
                     sparse_blk_oi[qk_hrow : qk_hrow + QK_M_TILE, 0 : HEAD_DIM] = qk_oi_zero
-
-    # Head-invariant interleaved cos and sign-folded sin for this card's token.
-    # The conjugate (inverse) rotation is out[j] = x[j]*cos_il[j] + x[j^1]*sign[j]*sin_il[j].
-    rope_cos_il = pl.create_tensor([T, ROPE_DIM], dtype=pl.FP32)
-    rope_sin_signed = pl.create_tensor([T, ROPE_DIM], dtype=pl.FP32)
-    # j^1 lane-swap index for merge_norm's rotation gather. Shaped [H_TILE, ROPE_DIM]
-    # because gather's index must match its source rows.
-    rope_swap_idx = pl.create_tensor([H_TILE, ROPE_DIM], dtype=pl.INT32)
-    with pl.at(level=pl.Level.CORE_GROUP, name_hint="rope_cs", allow_early_resolve=True):
-        sw_ones = pl.full([H_TILE, ROPE_DIM], dtype=pl.FP32, value=1.0)
-        sw_idx_f = pl.cast(pl.arange(0, [1, ROPE_DIM], dtype=pl.INT32), target_type=pl.FP32)
-        sw_col = pl.col_expand_mul(sw_ones, sw_idx_f)
-        sw_dup_i32 = pl.cast(pl.mul(sw_col, 0.5), target_type=pl.INT32, mode="trunc")
-        sw_dup_f = pl.cast(sw_dup_i32, target_type=pl.FP32)
-        sw_lane = pl.sub(sw_col, pl.mul(sw_dup_f, 2.0))                                           # j%2
-        sw_swap_f = pl.sub(pl.add(sw_col, 1.0), pl.mul(sw_lane, 2.0))                             # j^1
-        rope_swap_idx[0:H_TILE, 0:ROPE_DIM] = pl.cast(sw_swap_f, target_type=pl.INT32)
-
-        cs_ones = pl.full([T, ROPE_DIM], dtype=pl.FP32, value=1.0)
-        cs_idx_f = pl.cast(pl.arange(0, [1, ROPE_DIM], dtype=pl.INT32), target_type=pl.FP32)
-        cs_col = pl.col_expand_mul(cs_ones, cs_idx_f)
-        cs_dup_i32 = pl.cast(pl.mul(cs_col, 0.5), target_type=pl.INT32, mode="trunc")
-        cs_dup_f = pl.cast(cs_dup_i32, target_type=pl.FP32)
-        cs_dup_idx = pl.cast(cs_dup_f, target_type=pl.INT32)                                      # j>>1
-        cs_lane = pl.sub(cs_col, pl.mul(cs_dup_f, 2.0))                                           # j%2
-        cs_sign = pl.neg(pl.sub(pl.mul(cs_lane, 2.0), 1.0))                                       # [+1,-1,...] (conjugate)
-        cs_cos = pl.cast(freqs_cos[0:T, 0:HALF_ROPE], target_type=pl.FP32)
-        cs_sin = pl.cast(freqs_sin[0:T, 0:HALF_ROPE], target_type=pl.FP32)
-        rope_cos_il[0:T, 0:ROPE_DIM] = pl.gather(cs_cos, dim=-1, index=cs_dup_idx)
-        cs_sin_il = pl.gather(cs_sin, dim=-1, index=cs_dup_idx)
-        rope_sin_signed[0:T, 0:ROPE_DIM] = pl.mul(cs_sin_il, cs_sign)
 
     # Online-softmax merge across this token's sparse-K tiles, sink-norm, then fused
     # inverse RoPE, one spmd block per head tile. A block covers exactly one output
