@@ -210,14 +210,17 @@ jobs:
           set +e
           : > results.tsv
           failed=()
-          # Perf number per case is the `effective_us (...) mean=` benchmark line:
-          # the multi-round mean of the Effective window. L2 is each round's window;
-          # L3 (multi-card) is the per-round max across ranks (slowest rank bounds
-          # the round), or the pooled per-dispatch mean when per-round segmentation
-          # falls back to flattened. A case becomes `-` only when no timing line was
-          # emitted (e.g. the run failed or the runtime lacks SIMPLER_PROFILING).
+          # Perf number per case is the `effective_us (N rounds) min=... mean=...`
+          # headline: the multi-round mean of the Effective window. The pattern
+          # matches that headline's full shape rather than `effective_us .*mean=`,
+          # so a breakdown line can never be picked up instead. L2 is each round's
+          # window; L3 (multi-card) is the per-round max across ranks (slowest rank
+          # bounds the round), or the pooled per-dispatch mean when per-round
+          # segmentation falls back to flattened. A case becomes `-` only when no
+          # timing line was emitted (e.g. the run failed or the runtime lacks
+          # SIMPLER_PROFILING).
           extract_perf() {
-            grep -oP 'effective_us .*mean=\K[0-9.]+' | tail -1
+            grep -oP 'effective_us \(\d+ rounds\) min=[0-9.]+ median=[0-9.]+ mean=\K[0-9.]+' | tail -1
           }
           run_case() {
             local file="$1" label="$2"; shift 2
@@ -396,13 +399,13 @@ jobs:
           set +e
           : > results.tsv
           failed=()
-          # Perf number per case is the `effective_us (...) mean=` benchmark line
-          # (same rule as the a2a3 job): the multi-round mean of the Effective
-          # window. L2 is each round's window; L3 (multi-card) is the per-round
-          # max across ranks, or the pooled per-dispatch mean when per-round
-          # segmentation falls back to flattened.
+          # Perf number per case is the `effective_us (N rounds) ... mean=`
+          # headline (same rule and pattern as the a2a3 job): the multi-round mean
+          # of the Effective window. L2 is each round's window; L3 (multi-card) is
+          # the per-round max across ranks, or the pooled per-dispatch mean when
+          # per-round segmentation falls back to flattened.
           extract_perf() {
-            grep -oP 'effective_us .*mean=\K[0-9.]+' | tail -1
+            grep -oP 'effective_us \(\d+ rounds\) min=[0-9.]+ median=[0-9.]+ mean=\K[0-9.]+' | tail -1
           }
           run_case() {
             local file="$1" label="$2"; shift 2

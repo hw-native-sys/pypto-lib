@@ -30,8 +30,7 @@ from golden.runner import (
     _normalize_config,
     _ordered_args,
     _prepare_inputs,
-    _report_effective,
-    _report_l3_detail,
+    _report_bench,
     _report_l3_per_rank,
     _report_raw_samples,
     _resident_loop_sizes,
@@ -1237,7 +1236,7 @@ class TestScalarMixedSpecs:
             benchmark_step=43,
         )
 
-        _, scalar_specs_eff, _ = _prepare_inputs(
+        _, scalar_specs_eff = _prepare_inputs(
             specs=[spec],
             tensor_specs=[],
             scalar_specs=[spec],
@@ -1444,6 +1443,40 @@ class TestStageOrder:
 
         assert r.passed, f"unexpected failure: {r.error}"
         assert order == ["golden", "runtime"]
+
+    def test_golden_fn_cannot_corrupt_the_dispatch_buffers(
+        self, three_kinds_specs, build_dir,
+    ):
+        """golden_fn writes its scratch in place; the device still gets the
+        generated inputs.
+
+        _compute_golden reads straight off the dispatch buffers and clones what
+        it hands golden_fn — that clone is the only thing between the two. If
+        the golden ever stopped running before the dispatch, or stopped
+        cloning, the device would launch on trampled inputs.
+        """
+        seen: dict = {}
+
+        def golden_fn(values):
+            values["x"].fill_(-999.0)      # trample the pure input
+            values["state"].fill_(-999.0)  # and the inout's initial state
+            values["y"].zero_()
+
+        def fake_execute(_work_dir, tensors, **_kwargs):
+            seen["x"] = tensors[0].clone()
+            seen["state"] = tensors[2].clone()
+            tensors[1].zero_()          # y matches the golden
+            tensors[2].fill_(-999.0)    # state matches the golden
+
+        compile_p, exec_p = _patch_compile_and_execute(
+            build_dir, fake_execute=fake_execute,
+        )
+        with compile_p, exec_p:
+            r = run(fn=object(), specs=three_kinds_specs, golden_fn=golden_fn)
+
+        assert r.passed, f"unexpected failure: {r.error}"
+        assert not (seen["x"] == -999.0).any(), "golden_fn leaked into the input"
+        torch.testing.assert_close(seen["state"], torch.zeros(4))
 
     def test_golden_fn_error_short_circuits_runtime(self, three_kinds_specs, build_dir):
         """A typo / shape bug in golden_fn surfaces before execute_compiled runs."""
@@ -1693,16 +1726,47 @@ class TestLogLevelConsumption:
     """`config['log_level']` is consumed as a harness-only key."""
 
     def test_log_level_invokes_configure_log(self, three_kinds_specs, build_dir):
-        """config['log_level'] → configure_log(level) is called."""
+        """config['log_level'] → configure_log(level), then a restore on the way out."""
         compile_p, exec_p = _patch_compile_and_execute(build_dir)
         with compile_p, exec_p, \
-             patch("pypto.runtime.log_config.configure_log") as mock_cfg:
+             patch("pypto.runtime.log_config.configure_log") as mock_cfg, \
+             patch("pypto.runtime.log_config.current_level", return_value=30):
             run(
                 fn=object(),
                 specs=three_kinds_specs,
                 config=dict(platform="a2a3sim", device_id=0, log_level="debug"),
             )
-        mock_cfg.assert_called_once_with("debug")
+        assert [c.args for c in mock_cfg.call_args_list] == [("debug",), (30,)]
+
+    def test_log_level_does_not_leak_into_the_next_run(
+        self, three_kinds_specs, build_dir,
+    ):
+        """configure_log is process-global, so a sweep sharing one process must
+        not inherit the previous run's level. The restore happens even when the
+        run fails, so a bad variant cannot poison the rest of the sweep."""
+        compile_p, exec_p = _patch_compile_and_execute(build_dir)
+        with compile_p, exec_p, \
+             patch("pypto.runtime.log_config.configure_log") as mock_cfg, \
+             patch("pypto.runtime.log_config.current_level", return_value=30):
+            # Variant 1 raises the level and fails validation.
+            noisy = run(
+                fn=object(),
+                specs=three_kinds_specs,
+                config=dict(platform="a2a3sim", device_id=0, log_level="debug"),
+                golden_fn=lambda values: values["y"].fill_(7.0),
+            )
+            noisy_calls = [c.args for c in mock_cfg.call_args_list]
+            # Variant 2 sets no level of its own.
+            mock_cfg.reset_mock()
+            run(
+                fn=object(),
+                specs=three_kinds_specs,
+                config=dict(platform="a2a3sim", device_id=0),
+            )
+            quiet_calls = [c.args for c in mock_cfg.call_args_list]
+        assert not noisy.passed  # the failure is what makes the restore load-bearing
+        assert noisy_calls == [("debug",), (30,)]  # raised, then put back
+        assert quiet_calls == []  # so variant 2 inherits nothing
 
     def test_log_level_not_forwarded_to_the_dispatch(
         self, three_kinds_specs, build_dir,
@@ -2093,6 +2157,22 @@ class _NullCapture:
         return False
 
 
+class _LoudCapture:
+    """``_capture_fd_stderr`` stand-in that leaves a recognizable log behind."""
+
+    BLOB = "STRACE-NOISE-" + "x" * 64
+
+    def __init__(self, path):
+        self.path = path
+
+    def __enter__(self):
+        self.path.write_text(self.BLOB)
+        return None
+
+    def __exit__(self, *_a):
+        return False
+
+
 def _stub_l3_helpers(monkeypatch, pure_out=frozenset()):
     """Bypass the real metadata / RunConfig helpers around `_run_l3_resident`."""
     import golden.runner as R
@@ -2230,6 +2310,56 @@ class TestResidentPath:
 
         assert len(rt.payloads("dispatch")) == 2
         parse_stats.assert_not_called()
+
+    def _bench_resident(self, monkeypatch, *, validate_error, golden_outputs):
+        """Run one resident benchmark whose first dispatch fails, and return stderr."""
+        monkeypatch.setenv("PYPTO_BENCH", "1")
+        monkeypatch.setenv("PYPTO_BENCH_ROUNDS", "2")
+        monkeypatch.setenv("PYPTO_BENCH_WARMUP", "1")
+        _stub_l3_helpers(monkeypatch)
+        monkeypatch.setattr(
+            "golden.runner._validate", MagicMock(side_effect=validate_error)
+        )
+        dcp = _resident_dcp(_ResidentRT())
+        mods = _resident_modules(
+            dcp, bench_capture=_LoudCapture, parse_stats=MagicMock()
+        )
+        with (
+            patch.dict(sys.modules, mods),
+            pytest.raises(type(validate_error)),
+        ):
+            _run_l3_resident(
+                compiled=dcp(), specs=[], tensors={}, scalar_specs_eff={},
+                cfg=_RESIDENT_CFG, golden_outputs=golden_outputs,
+                rtol=1e-5, atol=1e-5, compare_fn={},
+            )
+
+    def test_resident_validation_failure_suppresses_strace_echo(
+        self, monkeypatch, capsys,
+    ):
+        """A golden mismatch keeps its own message instead of the v9 capture.
+
+        The capture around the resident benchmark runs at [STRACE] level, so
+        echoing it would put tens of MB between the reader and the failing
+        tensor line.
+        """
+        self._bench_resident(
+            monkeypatch,
+            validate_error=AssertionError("'y' FAIL shape=(4,)"),
+            golden_outputs={"y": torch.zeros(4)},
+        )
+        err = capsys.readouterr().err
+        assert _LoudCapture.BLOB not in err
+        assert "capture suppressed" in err
+
+    def test_resident_dispatch_failure_still_echoes_strace(self, monkeypatch, capsys):
+        """A runtime failure is the case the echo exists for — it must survive."""
+        self._bench_resident(
+            monkeypatch,
+            validate_error=RuntimeError("device dispatch failed"),
+            golden_outputs={"y": torch.zeros(4)},
+        )
+        assert _LoudCapture.BLOB in capsys.readouterr().err
 
     def test_run_l3_resident_stacked_uses_alloc_stacked(self, monkeypatch):
         """A resident="stacked" spec uploads and frees as a stack, never per tensor."""
@@ -2475,9 +2605,12 @@ class TestBenchReports:
         assert "slot" not in out
 
     def test_report_lines_stay_ci_safe(self, monkeypatch, capsys):
-        """Daily CI greps ``effective_us .*mean=`` and takes the last match, so
-        exactly one line may match it; device_wall is no longer reported at all.
-        See .github/workflows/daily_ci.yml.
+        """Daily CI's pattern selects the headline and only the headline.
+
+        The pattern is .github/workflows/daily_ci.yml's ``extract_perf``: it
+        matches the headline's full ``(N rounds) min=... median=... mean=``
+        shape, so a breakdown line cannot be picked up even if it spelled the
+        metric the same way. device_wall is no longer reported at all.
         """
         import re
 
@@ -2485,12 +2618,17 @@ class TestBenchReports:
         # The multi-dispatch fake exercises every reporter, including the nested
         # per-dispatch slot lines, against the single-match contract.
         stats = _FakeMultiDispatchStats()
-        _report_effective(stats)
-        _report_l3_per_rank(stats)
-        _report_raw_samples(stats)
-        _report_l3_detail(stats, _FakeCompiled(Path("/x/moe_ep2_20260722_101010")), resident=True)
+        _report_bench(
+            stats,
+            _FakeCompiled(Path("/x/moe_ep2_20260722_101010")),
+            l3=True,
+            resident=True,
+        )
         out = capsys.readouterr().out
-        assert re.findall(r"effective_us .*mean=([0-9.]+)", out) == ["99.7"]  # mean of [99.0, 100.4]
+        ci_pattern = r"effective_us \(\d+ rounds\) min=[0-9.]+ median=[0-9.]+ mean=([0-9.]+)"
+        assert re.findall(ci_pattern, out) == ["99.7"]  # mean of [99.0, 100.4]
+        # Even with every breakdown line respelled, the pattern still picks one.
+        assert re.findall(ci_pattern, out.replace("eff_us", "effective_us")) == ["99.7"]
         assert "device_wall" not in out
         assert "rank 10: eff_us min=50.0 median=50.5 mean=50.5 max=51.0" in out
         assert "slot 1 (decode_orch): eff_us" in out
