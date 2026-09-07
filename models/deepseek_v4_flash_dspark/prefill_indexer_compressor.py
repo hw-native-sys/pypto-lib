@@ -53,9 +53,6 @@ IDX_CACHE_MAX_BLOCKS = (MAX_SEQ_LEN // COMPRESS_RATIO + BLOCK_SIZE - 1) // BLOCK
 INNER_STATE_BLOCK_SIZE = C4A_COMPRESSOR_BLOCK_SIZE
 INNER_STATE_MAX_BLOCKS = (MAX_SEQ_LEN + INNER_STATE_BLOCK_SIZE - 1) // INNER_STATE_BLOCK_SIZE
 INNER_STATE_BLOCK_NUM = CSA_INNER_STATE_PHYSICAL_BLOCKS
-INNER_STATE_ROWS_PER_REQUEST = (
-    CSA_INNER_STATE_BLOCKS_PER_REQUEST * INNER_STATE_BLOCK_SIZE
-)
 
 # tiling
 K_TILE = 512  # projection D (K) reduction tile
@@ -71,7 +68,6 @@ PACKED_RMS_TILE = 16
 assert PREFILL_STATE_TILE % PROJ_ROW_TILE == 0
 assert PREFILL_STATE_TILE % COMPRESS_RATIO == 0
 assert MAX_CMP_WRITES % PACKED_RMS_TILE == 0
-assert INNER_STATE_ROWS_PER_REQUEST >= STATE_LEN
 
 
 @pl.jit.inline(auto_scope=False)
@@ -247,10 +243,7 @@ def _prefill_indexer_compressor_tile(
         write_dst_map[0:1, 0:MAX_CMP_WRITES] = write_dst_tile
         write_src_map[0:1, 0:MAX_CMP_WRITES] = write_src_tile
 
-    with pl.spmd(
-        MAX_CMP_WRITES * (HEAD_DIM // HEAD_D_TILE),
-        name_hint="prefill_idx_c4_softmax_pool",
-    ) as pool_tid:
+    with pl.spmd(MAX_CMP_WRITES * (HEAD_DIM // HEAD_D_TILE), name_hint="prefill_idx_c4_softmax_pool") as pool_tid:
         pool_idx = pl.tile.get_block_idx()
         state_order_anchor = pl.read(state_order_fence, [0])
         write_i = pool_idx // (HEAD_DIM // HEAD_D_TILE)
@@ -319,9 +312,7 @@ def _prefill_indexer_compressor_tile(
                         OUT_DIM + HEAD_DIM + h0 : OUT_DIM + HEAD_DIM + h0 + HEAD_D_TILE,
                     ]
 
-            # Consume current-tile state directly from projection scratch.
-            # Persistent state remains unchanged until all outputs in this
-            # tile have finished reading the preceding history.
+            # Current-tile state overlay from projection scratch.
             for pool_local in pl.range(tile_rows):
                 pool_global = tile_base + pool_local
                 pool_pos = pl.read(position_ids, [pool_global])
@@ -412,26 +403,17 @@ def _prefill_indexer_compressor_tile(
 
     publish_rows = pl.min(tile_rows, STATE_LEN)
     publish_base = tile_rows - publish_rows
-    with pl.spmd(
-        STATE_LEN,
-        name_hint="prefill_idx_c4_state_tail_publish",
-        deps=[pool_tid],
-    ) as state_publish_tid:
+    with pl.spmd(STATE_LEN, name_hint="prefill_idx_c4_state_tail_publish", deps=[pool_tid]) as state_publish_tid:
         publish_i = pl.tile.get_block_idx()
         if publish_i < publish_rows:
             publish_local = publish_base + publish_i
             publish_global = tile_base + publish_local
-            publish_row_raw = pl.read(
-                inner_state_slot_mapping,
-                [publish_global],
-            )
+            publish_row_raw = pl.read(inner_state_slot_mapping, [publish_global])
             if publish_row_raw >= 0:
                 publish_row = pl.cast(publish_row_raw, pl.INDEX)
                 publish_pos = pl.read(position_ids, [publish_global])
-                publish_ape_slot = pl.cast(
-                    publish_pos % COMPRESS_RATIO,
-                    pl.INDEX,
-                )
+                publish_ape_offset = publish_pos % COMPRESS_RATIO
+                publish_ape_slot = pl.cast(publish_ape_offset, pl.INDEX)
                 for publish_ob in pl.range(OUT_DIM // OUT_TILE):
                     publish_o0 = publish_ob * OUT_TILE
                     compress_state_flat[
@@ -441,10 +423,7 @@ def _prefill_indexer_compressor_tile(
                         publish_local : publish_local + 1,
                         publish_o0 : publish_o0 + OUT_TILE,
                     ]
-                    compress_state_flat[
-                        publish_row : publish_row + 1,
-                        OUT_DIM + publish_o0 : OUT_DIM + publish_o0 + OUT_TILE,
-                    ] = pl.add(
+                    publish_score = pl.add(
                         score_proj_scratch[
                             publish_local : publish_local + 1,
                             publish_o0 : publish_o0 + OUT_TILE,
@@ -454,6 +433,10 @@ def _prefill_indexer_compressor_tile(
                             publish_o0 : publish_o0 + OUT_TILE,
                         ],
                     )
+                    compress_state_flat[
+                        publish_row : publish_row + 1,
+                        OUT_DIM + publish_o0 : OUT_DIM + publish_o0 + OUT_TILE,
+                    ] = publish_score
 
     norm_w_2d = pl.reshape(norm_w, [1, HEAD_DIM])
     for final_block in pl.spmd(MAX_CMP_WRITES // PACKED_RMS_TILE, name_hint="prefill_idx_c4_rmsnorm_rope"):
@@ -563,11 +546,7 @@ def _prefill_indexer_compressor_tile(
                 pl.write(idx_kv_scale_flat, [dst_row, 0], scale_value)
 
     # Cache/scale publication fence.
-    with pl.at(
-        level=pl.Level.CORE_GROUP,
-        name_hint="prefill_idx_c4_state_order_commit",
-        deps=[state_publish_tid],
-    ):
+    with pl.at(level=pl.Level.CORE_GROUP, name_hint="prefill_idx_c4_state_order_commit", deps=[state_publish_tid]):
         pool_sample = pl.read(pooled_kv, [0, 0])
         fence_value = pl.cast(pool_sample == pool_sample, pl.INT32)
         for commit_i in pl.range(MAX_CMP_WRITES):
@@ -866,9 +845,7 @@ def golden_prefill_indexer_compressor(tensors):
                 continue
             pos = int(position_ids[token_id].item())
             kv_state_flat[dst_row] = kv_proj[token_id]
-            score_state_flat[dst_row] = (
-                score_proj[token_id] + ape[pos % COMPRESS_RATIO]
-            )
+            score_state_flat[dst_row] = score_proj[token_id] + ape[pos % COMPRESS_RATIO]
     tensors["idx_kv_cache"][:] = idx_kv_cache
     tensors["idx_kv_scale"][:] = idx_kv_scale
 
@@ -887,7 +864,9 @@ def build_tensor_specs(start_pos: int = START_POS, token_count: int = PREFILL_SE
 
     def init_inner_compress_state_block_table():
         logical_blocks = torch.arange(INNER_STATE_MAX_BLOCKS, dtype=torch.int64)
-        return ((logical_blocks * 17 + 3) % CSA_INNER_STATE_BLOCKS_PER_REQUEST).to(torch.int32).unsqueeze(0)
+        physical_blocks = (logical_blocks * 17 + 3) % CSA_INNER_STATE_BLOCKS_PER_REQUEST
+        physical_blocks = physical_blocks.to(torch.int32)
+        return physical_blocks.unsqueeze(0)
 
     def state_row(abs_pos):
         if abs_pos < 0 or abs_pos >= MAX_SEQ_LEN:

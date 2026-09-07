@@ -53,7 +53,6 @@ CMP_MAX_BLOCKS = (MAX_SEQ_LEN // COMPRESS_RATIO + BLOCK_SIZE - 1) // BLOCK_SIZE
 CSA_STATE_BLOCK_SIZE = C4A_COMPRESSOR_BLOCK_SIZE
 CSA_STATE_MAX_BLOCKS = (MAX_SEQ_LEN + CSA_STATE_BLOCK_SIZE - 1) // CSA_STATE_BLOCK_SIZE
 CSA_STATE_BLOCK_NUM = CSA_STATE_PHYSICAL_BLOCKS
-CSA_STATE_ROWS_PER_REQUEST = CSA_STATE_BLOCKS_PER_REQUEST * CSA_STATE_BLOCK_SIZE
 
 # tiling
 K_TILE = 512  # projection D (K) reduction tile
@@ -69,7 +68,6 @@ PACKED_RMS_TILE = 16
 assert PREFILL_STATE_TILE % PROJ_ROW_TILE == 0
 assert PREFILL_STATE_TILE % COMPRESS_RATIO == 0
 assert MAX_CMP_WRITES % PACKED_RMS_TILE == 0
-assert CSA_STATE_ROWS_PER_REQUEST >= STATE_LEN
 
 
 @pl.jit.inline(auto_scope=False)
@@ -302,26 +300,22 @@ def _prefill_compressor_ratio4_tile(
                         OUT_DIM + HEAD_DIM : COMPRESS_STATE_DIM,
                     ]
 
-            # Current-tile state is consumed directly from projection scratch.
-            # Persistent state remains untouched until every compressed output
-            # in this tile has finished reading the preceding history.
+            # Current-tile state overlay from projection scratch.
             for pool_local in pl.range(tile_rows):
                 pool_global = tile_base + pool_local
                 pool_state_row_raw = pl.read(state_slot_mapping, [pool_global])
                 pool_pos = pl.read(position_ids, [pool_global])
                 if pool_state_row_raw >= 0:
                     if pool_pos <= write_pos and pool_pos >= prev_start:
-                        pool_ape_slot = pl.cast(pool_pos % COMPRESS_RATIO, pl.INDEX)
+                        pool_ape_offset = pool_pos % COMPRESS_RATIO
+                        pool_ape_slot = pl.cast(pool_ape_offset, pl.INDEX)
                         if pool_pos < cur_start:
                             pool_slot = pl.cast(pool_pos - prev_start, pl.INDEX)
                             pool_kv_tile[pool_slot : pool_slot + 1, 0:HEAD_D_TILE] = kv_proj_scratch[
                                 pool_local : pool_local + 1,
                                 0:HEAD_DIM,
                             ]
-                            pool_score_tile[
-                                pool_slot : pool_slot + 1,
-                                0:HEAD_D_TILE,
-                            ] = pl.add(
+                            pool_prev_score = pl.add(
                                 score_proj_scratch[
                                     pool_local : pool_local + 1,
                                     0:HEAD_DIM,
@@ -331,16 +325,14 @@ def _prefill_compressor_ratio4_tile(
                                     0:HEAD_DIM,
                                 ],
                             )
+                            pool_score_tile[pool_slot : pool_slot + 1, 0:HEAD_D_TILE] = pool_prev_score
                         else:
                             pool_slot = pl.cast(COMPRESS_RATIO + pool_pos - cur_start, pl.INDEX)
                             pool_kv_tile[pool_slot : pool_slot + 1, 0:HEAD_D_TILE] = kv_proj_scratch[
                                 pool_local : pool_local + 1,
                                 HEAD_DIM:OUT_DIM,
                             ]
-                            pool_score_tile[
-                                pool_slot : pool_slot + 1,
-                                0:HEAD_D_TILE,
-                            ] = pl.add(
+                            pool_current_score = pl.add(
                                 score_proj_scratch[
                                     pool_local : pool_local + 1,
                                     HEAD_DIM:OUT_DIM,
@@ -350,6 +342,7 @@ def _prefill_compressor_ratio4_tile(
                                     HEAD_DIM:OUT_DIM,
                                 ],
                             )
+                            pool_score_tile[pool_slot : pool_slot + 1, 0:HEAD_D_TILE] = pool_current_score
 
             init_slot = STATE_LEN - 1
             mi_buf = pl.create_tensor([1, HEAD_D_TILE], dtype=pl.FP32)
@@ -387,16 +380,10 @@ def _prefill_compressor_ratio4_tile(
             pooled_zero = pl.full([1, HEAD_DIM], dtype=pl.FP32, value=0.0)
             pooled_kv[write_i : write_i + 1, 0:HEAD_DIM] = pooled_zero
 
-    # Only the state tail is persistent. Publishing it after pooling preserves
-    # the old history while this tile is active and leaves exactly the rows
-    # needed by the next tile or the first decode step.
+    # Persistent recurrent-state tail.
     publish_rows = pl.min(tile_rows, STATE_LEN)
     publish_base = tile_rows - publish_rows
-    with pl.spmd(
-        STATE_LEN,
-        name_hint="prefill_c4_state_tail_publish",
-        deps=[pool_tid],
-    ) as state_publish_tid:
+    with pl.spmd(STATE_LEN, name_hint="prefill_c4_state_tail_publish", deps=[pool_tid]) as state_publish_tid:
         publish_i = pl.tile.get_block_idx()
         if publish_i < publish_rows:
             publish_local = publish_base + publish_i
@@ -405,7 +392,8 @@ def _prefill_compressor_ratio4_tile(
             if publish_row_raw >= 0:
                 publish_row = pl.cast(publish_row_raw, pl.INDEX)
                 publish_pos = pl.read(position_ids, [publish_global])
-                publish_ape_slot = pl.cast(publish_pos % COMPRESS_RATIO, pl.INDEX)
+                publish_ape_offset = publish_pos % COMPRESS_RATIO
+                publish_ape_slot = pl.cast(publish_ape_offset, pl.INDEX)
                 for publish_ob in pl.range(OUT_DIM // OUT_TILE):
                     publish_o0 = publish_ob * OUT_TILE
                     compress_state_flat[
@@ -415,10 +403,7 @@ def _prefill_compressor_ratio4_tile(
                         publish_local : publish_local + 1,
                         publish_o0 : publish_o0 + OUT_TILE,
                     ]
-                    compress_state_flat[
-                        publish_row : publish_row + 1,
-                        OUT_DIM + publish_o0 : OUT_DIM + publish_o0 + OUT_TILE,
-                    ] = pl.add(
+                    publish_score = pl.add(
                         score_proj_scratch[
                             publish_local : publish_local + 1,
                             publish_o0 : publish_o0 + OUT_TILE,
@@ -428,13 +413,14 @@ def _prefill_compressor_ratio4_tile(
                             publish_o0 : publish_o0 + OUT_TILE,
                         ],
                     )
+                    compress_state_flat[
+                        publish_row : publish_row + 1,
+                        OUT_DIM + publish_o0 : OUT_DIM + publish_o0 + OUT_TILE,
+                    ] = publish_score
 
-    with pl.at(
-        level=pl.Level.CORE_GROUP,
-        name_hint="prefill_c4_state_order_commit",
-        deps=[state_publish_tid],
-    ):
-        pl.write(state_order_fence, [0], pl.cast(1, pl.INT32))
+    with pl.at(level=pl.Level.CORE_GROUP, name_hint="prefill_c4_state_order_commit", deps=[state_publish_tid]):
+        state_order_value = pl.cast(1, pl.INT32)
+        pl.write(state_order_fence, [0], state_order_value)
 
     norm_w_2d = pl.reshape(norm_w, [1, HEAD_DIM])
     normed_kv = pl.create_tensor([MAX_CMP_WRITES, HEAD_DIM], dtype=pl.FP32)
@@ -807,7 +793,9 @@ def build_tensor_specs(start_pos: int = START_POS, token_count: int = PREFILL_SE
 
     def init_compress_state_block_table():
         logical_blocks = torch.arange(CSA_STATE_MAX_BLOCKS, dtype=torch.int64)
-        return ((logical_blocks * 17 + 3) % CSA_STATE_BLOCKS_PER_REQUEST).to(torch.int32).unsqueeze(0)
+        physical_blocks = (logical_blocks * 17 + 3) % CSA_STATE_BLOCKS_PER_REQUEST
+        physical_blocks = physical_blocks.to(torch.int32)
+        return physical_blocks.unsqueeze(0)
 
     def state_row(abs_pos):
         if abs_pos < 0 or abs_pos >= MAX_SEQ_LEN:

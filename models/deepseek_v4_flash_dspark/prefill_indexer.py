@@ -1041,7 +1041,9 @@ def build_tensor_specs(start_pos: int = START_POS, token_count: int = PREFILL_SE
 
     def init_inner_compress_state_block_table():
         blocks = torch.arange(INNER_STATE_MAX_BLOCKS, dtype=torch.int64)
-        return ((blocks * 17 + 3) % CSA_INNER_STATE_BLOCKS_PER_REQUEST).to(torch.int32).unsqueeze(0)
+        physical_blocks = (blocks * 17 + 3) % CSA_INNER_STATE_BLOCKS_PER_REQUEST
+        physical_blocks = physical_blocks.to(torch.int32)
+        return physical_blocks.unsqueeze(0)
 
     def state_row(abs_pos):
         if abs_pos < 0 or abs_pos >= MAX_SEQ_LEN:
