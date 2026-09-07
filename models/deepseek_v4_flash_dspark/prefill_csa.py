@@ -16,8 +16,8 @@ import pypto.language as pl
 from config import (
     FLASH as M,
     BLOCK_SIZE,
-    CSA_INNER_STATE_PHYSICAL_BLOCKS,
-    CSA_STATE_PHYSICAL_BLOCKS,
+    CSA_INNER_STATE_BLOCKS_PER_REQUEST,
+    CSA_STATE_BLOCKS_PER_REQUEST,
     INT8_AMAX_EPS,
     INT8_SCALE_MAX,
     KV_ORI_BLOCK_NUM,
@@ -887,7 +887,10 @@ def build_tensor_specs(
             * 0.1916
         )
 
-    state_table = _state_block_table(CSA_STATE_MAX_BLOCKS, CSA_STATE_PHYSICAL_BLOCKS)
+    state_table = _state_block_table(
+        CSA_STATE_MAX_BLOCKS,
+        CSA_STATE_BLOCKS_PER_REQUEST,
+    )
 
     def init_compress_state_block_table():
         return state_table.clone().unsqueeze(0)
@@ -930,7 +933,7 @@ def build_tensor_specs(
 
     inner_state_table = _state_block_table(
         INNER_STATE_MAX_BLOCKS,
-        CSA_INNER_STATE_PHYSICAL_BLOCKS,
+        CSA_INNER_STATE_BLOCKS_PER_REQUEST,
     )
 
     def init_inner_compress_state_block_table():
@@ -1875,13 +1878,26 @@ def build_ragged2_cp_tensor_specs(tp_size: int = TP_SIZE):
     ori_block_table = make_block_table(batch=2, table_blocks=SPARSE_ORI_MAX_BLOCKS, physical_blocks=CSA_ORI_BLOCK_NUM)
     cmp_block_table = make_block_table(batch=2, table_blocks=SPARSE_CMP_MAX_BLOCKS, physical_blocks=CSA_CMP_BLOCK_NUM)
     idx_block_table = make_block_table(batch=2, table_blocks=IDX_CACHE_MAX_BLOCKS, physical_blocks=IDX_CACHE_BLOCK_NUM)
-    compress_state_block_table = make_block_table(
-        batch=2, table_blocks=CSA_STATE_MAX_BLOCKS,
-        physical_blocks=CSA_STATE_BLOCK_NUM,
+    request_slots = torch.arange(2, dtype=torch.int32).unsqueeze(1)
+    state_request_stride = CSA_STATE_BLOCK_NUM // CSA_STATE_BLOCKS_PER_REQUEST
+    state_ring_blocks = _state_block_table(
+        CSA_STATE_MAX_BLOCKS,
+        CSA_STATE_BLOCKS_PER_REQUEST,
     )
-    inner_compress_state_block_table = make_block_table(
-        batch=2, table_blocks=INNER_STATE_MAX_BLOCKS,
-        physical_blocks=INNER_STATE_BLOCK_NUM,
+    compress_state_block_table = (
+        state_ring_blocks.unsqueeze(0) * state_request_stride + request_slots
+    )
+    inner_state_request_stride = (
+        INNER_STATE_BLOCK_NUM // CSA_INNER_STATE_BLOCKS_PER_REQUEST
+    )
+    inner_state_ring_blocks = _state_block_table(
+        INNER_STATE_MAX_BLOCKS,
+        CSA_INNER_STATE_BLOCKS_PER_REQUEST,
+    )
+    inner_compress_state_block_table = (
+        inner_state_ring_blocks.unsqueeze(0)
+        * inner_state_request_stride
+        + request_slots
     )
 
     ori_mappings = []

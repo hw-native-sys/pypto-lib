@@ -13,7 +13,7 @@ import pypto.language as pl
 from config import (
     FLASH as M,
     BLOCK_SIZE,
-    CSA_INNER_STATE_PHYSICAL_BLOCKS,
+    CSA_INNER_STATE_BLOCKS_PER_REQUEST,
     FP32_NEG_INF,
     INT8_SCALE_MAX,
     INT8_AMAX_EPS,
@@ -1041,14 +1041,14 @@ def build_tensor_specs(start_pos: int = START_POS, token_count: int = PREFILL_SE
 
     def init_inner_compress_state_block_table():
         blocks = torch.arange(INNER_STATE_MAX_BLOCKS, dtype=torch.int64)
-        return ((blocks * 17 + 3) % CSA_INNER_STATE_PHYSICAL_BLOCKS).to(torch.int32).unsqueeze(0)
+        return ((blocks * 17 + 3) % CSA_INNER_STATE_BLOCKS_PER_REQUEST).to(torch.int32).unsqueeze(0)
 
     def state_row(abs_pos):
         if abs_pos < 0 or abs_pos >= MAX_SEQ_LEN:
             return -1
         block = abs_pos // INNER_STATE_BLOCK_SIZE
         intra = abs_pos % INNER_STATE_BLOCK_SIZE
-        physical_block = (block * 17 + 3) % CSA_INNER_STATE_PHYSICAL_BLOCKS
+        physical_block = (block * 17 + 3) % CSA_INNER_STATE_BLOCKS_PER_REQUEST
         return physical_block * INNER_STATE_BLOCK_SIZE + intra
 
     def init_x():

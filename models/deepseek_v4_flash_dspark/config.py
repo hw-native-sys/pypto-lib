@@ -262,12 +262,21 @@ IDX_CACHE_BLOCK_NUM = 256
 HCA_STATE_PHYSICAL_BLOCKS = DECODE_BATCH * (
     (128 + DECODE_SEQ + C128_COMPRESSOR_BLOCK_SIZE - 1) // C128_COMPRESSOR_BLOCK_SIZE
 )
-# Ratio-4 compressors keep an eight-row mathematical window.  Decode eagerly
-# publishes all S rows, so the persistent ring needs a disjoint S-row suffix.
-CSA_STATE_PHYSICAL_BLOCKS = DECODE_BATCH * (
+# Ratio-4 compressors keep an eight-row mathematical window. Decode eagerly
+# publishes all S rows, so each request needs a disjoint S-row suffix.
+# This is the request-local capacity, measured in compressor-state blocks.
+CSA_STATE_BLOCKS_PER_REQUEST = (
     (8 + DECODE_SEQ + C4A_COMPRESSOR_BLOCK_SIZE - 1) // C4A_COMPRESSOR_BLOCK_SIZE
 )
-CSA_INNER_STATE_PHYSICAL_BLOCKS = CSA_STATE_PHYSICAL_BLOCKS
+# This is the total physical pool capacity for one layer across all configured
+# request slots; it is not the capacity available to one request.
+CSA_STATE_PHYSICAL_BLOCKS = DECODE_BATCH * CSA_STATE_BLOCKS_PER_REQUEST
+# The inner/indexer compressor uses the same request-local ring geometry, but
+# owns a separate physical pool from the main CSA compressor.
+CSA_INNER_STATE_BLOCKS_PER_REQUEST = CSA_STATE_BLOCKS_PER_REQUEST
+CSA_INNER_STATE_PHYSICAL_BLOCKS = (
+    DECODE_BATCH * CSA_INNER_STATE_BLOCKS_PER_REQUEST
+)
 
 # Int8 quantization constants
 INT8_SCALE_MAX = 127.0                    # per-row INT8 quant: clamp scale so |q| <= 127
