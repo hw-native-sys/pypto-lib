@@ -36,6 +36,7 @@ from prefill_metadata import QUERY_START_LOC_DYN, REQUESTS_DYN
 from qkv_proj_rope import golden_qkv_proj_rope, qkv_proj_rope
 from rmsnorm import golden_rms_norm, rms_norm
 from prefill_sparse_attn import (
+    PREFILL_RING_HEAP,
     golden_prefill_sparse_attn,
     hca_streaming_attn_physical,
 )
@@ -1680,6 +1681,7 @@ if __name__ == "__main__":
                 dump_passes=args.dump_passes,
                 distributed_config=DistributedConfig(device_ids=device_ids, num_sub_workers=0),
                 platform=args.platform,
+                ring_heap=PREFILL_RING_HEAP,
             ),
             compile_only=args.compile_only,
             rtol=1e-2,
