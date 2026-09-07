@@ -143,5 +143,6 @@ scheduling — with the limit measured at each step.
 | Drafts (work in progress) | [decode_ssn_draft.py](../../../models/qwen3_14b/decode_ssn_draft.py), [decode_tq_draft.py](../../../models/qwen3_14b/decode_tq_draft.py), [prefill_tq_draft.py](../../../models/qwen3_14b/prefill_tq_draft.py) |
 
 `constants.py`, `config.py`, `contract.py`, `weights.py`, `rms_lm_head.py`,
-`paged_attention_cce.py`, `paged_attention_pypto.py`, `turboquant_kv.py`, and
-`prefill_fwd_a8w8.py` have no `__main__` block and are imported rather than run.
+`paged_attention_cce.py`, `paged_attention_pypto.py`, `turboquant_kv.py`,
+`decode_layer_a8w8.py`, and `prefill_fwd_a8w8.py` do not define standalone
+entry points and are not run directly.
