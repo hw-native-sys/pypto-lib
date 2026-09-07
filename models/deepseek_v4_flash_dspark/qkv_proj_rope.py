@@ -65,7 +65,12 @@ KV_OK = 2  # kv_proj split-K factor         | D//KV_OK cores share each N-group
 KV_OM = 4  # kv_proj split-M factor        | M-tiles fan out KV_OM-fold
 KV_SPLIT_K_TILE = D // KV_OK  # kv_proj K per split (=2048)
 QPROJ_M_TILE = 64  # dense qproj token tile; fills the 128 KiB L0C accumulator
+# qproj_matmul runs on persistent workers, one per physical AIC.
+QPROJ_WORKERS = 24
 QPROJ_TAIL_M_TILE = MATMUL_T_TILE  # partial-M path validated by decode/small physical T
+# Staging rows for the qr -> qproj handoff: a dense tile is capped at
+# PREFILL_DENSE_TILE rows, so this bounds qproj_t_matmul for every caller.
+QPROJ_T_PAD = ((PREFILL_DENSE_TILE + QPROJ_TAIL_M_TILE - 1) // QPROJ_TAIL_M_TILE) * QPROJ_TAIL_M_TILE
 KV_RMS_T_TILE = 16  # kv rms-norm + rope fused token (T) tile
 Q_ROPE_T_TILE = 8
 # q_rope_prepare runs on persistent workers, capped at the tile count so the
@@ -248,21 +253,24 @@ def rope_prepare(
                 )
 
 
+
 @pl.jit.inline(auto_scope=False)
-def q_proj_rope(
+def q_proj_qr(
     x: pl.Tensor[[T_DYN, D], pl.BF16],
     wq_a: pl.Tensor[[D, Q_LORA], pl.BF16],
-    wq_b: pl.Tensor[[Q_LORA, H * HEAD_DIM], pl.INT8],
-    wq_b_scale: pl.Tensor[[H * HEAD_DIM], pl.FP32],
     gamma_cq: pl.Tensor[[Q_LORA], pl.BF16],
-    rope_cos_il: pl.Tensor[[T_DYN, ROPE_DIM], pl.FP32],
-    rope_sin_signed: pl.Tensor[[T_DYN, ROPE_DIM], pl.FP32],
-    rope_swap_idx: pl.Tensor[[T_DYN, ROPE_DIM], pl.INT32],
-    q: pl.Tensor[[T_DYN, H, HEAD_DIM], pl.BF16],
     qr: pl.Tensor[[T_DYN, Q_LORA], pl.INT8],
     qr_scale: pl.Tensor[[T_DYN, 1], pl.FP32],
+    qr_i8_matmul: pl.Out[pl.Tensor[[QPROJ_T_PAD, Q_LORA], pl.INT8]],
+    qr_scale_pad_store: pl.Out[pl.Tensor[[QPROJ_T_PAD, 1], pl.FP32]],
 ):
-    """Q LoRA, RMSNorm, quantization, and RoPE over bounded dense tiles."""
+    """Q LoRA, RMSNorm and quantization -- the half the indexer query chain needs.
+
+    The two staging tensors are held by the caller so the qproj half can be issued
+    separately; they are rewritten per dense tile, so a caller that runs more than one
+    tile iteration must let the qproj half finish before the next one starts. Every
+    current caller has t_dim <= PREFILL_DENSE_TILE, i.e. a single iteration.
+    """
     t_dim = pl.tensor.dim(x, 0)
     for tile_base in pl.range(0, t_dim, PREFILL_DENSE_TILE):
         tile_rows = pl.min(PREFILL_DENSE_TILE, t_dim - tile_base)
@@ -270,7 +278,6 @@ def q_proj_rope(
             x_view = pl.reshape(x, [t_dim, D])
             qr_t_matmul = ((tile_rows + QR_M_TILE - 1) // QR_M_TILE) * QR_M_TILE
             qproj_t_matmul = ((tile_rows + QPROJ_TAIL_M_TILE - 1) // QPROJ_TAIL_M_TILE) * QPROJ_TAIL_M_TILE
-            qproj_full_rows = (tile_rows // QPROJ_M_TILE) * QPROJ_M_TILE
 
             # Split-K qr_proj (M=t_dim, K=D=4096, N=Q_LORA=1024): QR_N_TILE N-groups expanded
             # QR_OK-fold into cube blocks that atomic-add their K partials into a zero-seeded
@@ -308,9 +315,6 @@ def q_proj_rope(
 
             qr_view = pl.reshape(qr, [t_dim, Q_LORA])
             qr_scale_view = pl.reshape(qr_scale, [t_dim, 1])
-            qr_i8_matmul = pl.create_tensor([qproj_t_matmul, Q_LORA], dtype=pl.INT8)
-            # The quant scale rides the qr_i8 -> qproj_matmul -> dequant chain.
-            qr_scale_pad_store = pl.create_tensor([qproj_t_matmul, 1], dtype=pl.FP32, manual_dep=True)
 
             # Two passes per block: pass 1 computes amax; pass 2 recomputes norm and quantizes.
             qr_token_tiles = (tile_rows + T_TILE - 1) // T_TILE
@@ -375,59 +379,91 @@ def q_proj_rope(
                         )
                         pl.store(qr_q_tail, [out_tg, qa], qr_view)
 
+
+@pl.jit.inline(auto_scope=False)
+def q_proj_q(
+    x: pl.Tensor[[T_DYN, D], pl.BF16],
+    wq_b: pl.Tensor[[Q_LORA, H * HEAD_DIM], pl.INT8],
+    wq_b_scale: pl.Tensor[[H * HEAD_DIM], pl.FP32],
+    rope_cos_il: pl.Tensor[[T_DYN, ROPE_DIM], pl.FP32],
+    rope_sin_signed: pl.Tensor[[T_DYN, ROPE_DIM], pl.FP32],
+    rope_swap_idx: pl.Tensor[[T_DYN, ROPE_DIM], pl.INT32],
+    q: pl.Tensor[[T_DYN, H, HEAD_DIM], pl.BF16],
+    qr_i8_matmul: pl.Tensor[[QPROJ_T_PAD, Q_LORA], pl.INT8],
+    qr_scale_pad_store: pl.Tensor[[QPROJ_T_PAD, 1], pl.FP32],
+    qproj_dep: pl.Scalar[pl.TASK_ID],
+):
+    """Q projection and its dequant + RMSNorm + RoPE, off the indexer critical path."""
+    t_dim = pl.tensor.dim(x, 0)
+    for tile_base in pl.range(0, t_dim, PREFILL_DENSE_TILE):
+        tile_rows = pl.min(PREFILL_DENSE_TILE, t_dim - tile_base)
+        with pl.scope():
+            qproj_t_matmul = ((tile_rows + QPROJ_TAIL_M_TILE - 1) // QPROJ_TAIL_M_TILE) * QPROJ_TAIL_M_TILE
+            qproj_full_rows = (tile_rows // QPROJ_M_TILE) * QPROJ_M_TILE
             # Pure-matmul qproj scope (cube, INT32 -> GM), unmixed with downstream vector work.
             q_proj_i32 = pl.create_tensor([qproj_t_matmul, H * HEAD_DIM], dtype=pl.INT32)
             # Full 64-row cube tiles use the dense path.  The A2/A3 partial-M path is
             # not numerically reliable at this tile size, so the final incomplete
             # 64-row block is lowered through the established 16-row cube shape.
-            for qproj_n_idx in pl.spmd(
-                (H * HEAD_DIM) // QPROJ_MM_N_TILE,
-                name_hint="qproj_matmul",
+            # Fenced behind the caller's dep for the same reason as the dequant below:
+            # 64 cube blocks landing on top of the indexer's own qr projection push it
+            # back, and q is not read until attention.
+            # Persistent workers: 64 one-shot cube blocks fragment into a dozen small
+            # waves on 24 AICs and pay the wq_b L1 load once per wave. QPROJ_WORKERS
+            # workers stride the same column list, so each core loads once and runs through.
+            for qproj_worker in pl.spmd(
+                QPROJ_WORKERS, name_hint="qproj_matmul", deps=[qproj_dep],
             ):
-                w_col0 = qproj_n_idx * QPROJ_MM_N_TILE
-                for t0 in pl.range(0, qproj_full_rows, QPROJ_M_TILE):
-                    col_acc = pl.create_tensor([QPROJ_M_TILE, QPROJ_MM_N_TILE], dtype=pl.INT32)
-                    for qr_proj_col0 in pl.pipeline(0, Q_LORA, Q_PROJ_TILE, stage=2):
-                        qr_i8_chunk = qr_i8_matmul[
-                            t0 : t0 + QPROJ_M_TILE,
-                            qr_proj_col0 : qr_proj_col0 + Q_PROJ_TILE,
-                        ]
-                        wq_chunk = wq_b[qr_proj_col0 : qr_proj_col0 + Q_PROJ_TILE, w_col0 : w_col0 + QPROJ_MM_N_TILE]
-                        if qr_proj_col0 == 0:
-                            col_acc = pl.matmul(qr_i8_chunk, wq_chunk, out_dtype=pl.INT32)
-                        else:
-                            col_acc = pl.matmul_acc(col_acc, qr_i8_chunk, wq_chunk)
-                    q_proj_i32[t0 : t0 + QPROJ_M_TILE, w_col0 : w_col0 + QPROJ_MM_N_TILE] = col_acc
+                for qproj_n_idx in pl.range(
+                    qproj_worker, (H * HEAD_DIM) // QPROJ_MM_N_TILE, QPROJ_WORKERS,
+                ):
+                    w_col0 = qproj_n_idx * QPROJ_MM_N_TILE
+                    for t0 in pl.range(0, qproj_full_rows, QPROJ_M_TILE):
+                        col_acc = pl.create_tensor([QPROJ_M_TILE, QPROJ_MM_N_TILE], dtype=pl.INT32)
+                        for qr_proj_col0 in pl.pipeline(0, Q_LORA, Q_PROJ_TILE, stage=2):
+                            qr_i8_chunk = qr_i8_matmul[
+                                t0 : t0 + QPROJ_M_TILE,
+                                qr_proj_col0 : qr_proj_col0 + Q_PROJ_TILE,
+                            ]
+                            wq_chunk = wq_b[qr_proj_col0 : qr_proj_col0 + Q_PROJ_TILE, w_col0 : w_col0 + QPROJ_MM_N_TILE]
+                            if qr_proj_col0 == 0:
+                                col_acc = pl.matmul(qr_i8_chunk, wq_chunk, out_dtype=pl.INT32)
+                            else:
+                                col_acc = pl.matmul_acc(col_acc, qr_i8_chunk, wq_chunk)
+                        q_proj_i32[t0 : t0 + QPROJ_M_TILE, w_col0 : w_col0 + QPROJ_MM_N_TILE] = col_acc
 
-                tail_w_col0 = w_col0
-                for tail_t0 in pl.range(qproj_full_rows, qproj_t_matmul, QPROJ_TAIL_M_TILE):
-                    qproj_tail_rows = pl.min(QPROJ_TAIL_M_TILE, tile_rows - tail_t0)
-                    tail_acc = pl.create_tensor([QPROJ_TAIL_M_TILE, QPROJ_MM_N_TILE], dtype=pl.INT32)
-                    for tail_qr_col0 in pl.pipeline(0, Q_LORA, Q_PROJ_TILE, stage=2):
-                        qr_i8_tail = pl.slice(
-                            qr_i8_matmul,
-                            [QPROJ_TAIL_M_TILE, Q_PROJ_TILE],
-                            [tail_t0, tail_qr_col0],
-                            valid_shape=[qproj_tail_rows, Q_PROJ_TILE],
-                        )
-                        wq_tail = wq_b[
-                            tail_qr_col0 : tail_qr_col0 + Q_PROJ_TILE,
+                    tail_w_col0 = w_col0
+                    for tail_t0 in pl.range(qproj_full_rows, qproj_t_matmul, QPROJ_TAIL_M_TILE):
+                        qproj_tail_rows = pl.min(QPROJ_TAIL_M_TILE, tile_rows - tail_t0)
+                        tail_acc = pl.create_tensor([QPROJ_TAIL_M_TILE, QPROJ_MM_N_TILE], dtype=pl.INT32)
+                        for tail_qr_col0 in pl.pipeline(0, Q_LORA, Q_PROJ_TILE, stage=2):
+                            qr_i8_tail = pl.slice(
+                                qr_i8_matmul,
+                                [QPROJ_TAIL_M_TILE, Q_PROJ_TILE],
+                                [tail_t0, tail_qr_col0],
+                                valid_shape=[qproj_tail_rows, Q_PROJ_TILE],
+                            )
+                            wq_tail = wq_b[
+                                tail_qr_col0 : tail_qr_col0 + Q_PROJ_TILE,
+                                tail_w_col0 : tail_w_col0 + QPROJ_MM_N_TILE,
+                            ]
+                            if tail_qr_col0 == 0:
+                                tail_acc = pl.matmul(qr_i8_tail, wq_tail, out_dtype=pl.INT32)
+                            else:
+                                tail_acc = pl.matmul_acc(tail_acc, qr_i8_tail, wq_tail)
+                        q_proj_i32[
+                            tail_t0 : tail_t0 + QPROJ_TAIL_M_TILE,
                             tail_w_col0 : tail_w_col0 + QPROJ_MM_N_TILE,
-                        ]
-                        if tail_qr_col0 == 0:
-                            tail_acc = pl.matmul(qr_i8_tail, wq_tail, out_dtype=pl.INT32)
-                        else:
-                            tail_acc = pl.matmul_acc(tail_acc, qr_i8_tail, wq_tail)
-                    q_proj_i32[
-                        tail_t0 : tail_t0 + QPROJ_TAIL_M_TILE,
-                        tail_w_col0 : tail_w_col0 + QPROJ_MM_N_TILE,
-                    ] = tail_acc
+                        ] = tail_acc
 
-            # Fused qproj dequant, per-head RMSNorm, NOPE writeback, and interleaved RoPE.
-            # RoPE: out[j] = inv_rms * (x[j] * cos[j] + x[j^1] * sign[j] * sin[j]).
+                # Fused qproj dequant, per-head RMSNorm, NOPE writeback, and interleaved RoPE.
+                # RoPE: out[j] = inv_rms * (x[j] * cos[j] + x[j^1] * sign[j] * sin[j]).
             q_flat = pl.reshape(q, [t_dim, H * HEAD_DIM])
+            # No fence needed: it reads q_proj_i32, so it already trails qproj_matmul,
+            # which sits at the tail of the caller's cube chain.
             for hg_idx in pl.spmd(
-                H // Q_ROPE_H_TILE, name_hint="qproj_dequant_rms_nope_rope", allow_early_resolve=True
+                H // Q_ROPE_H_TILE, name_hint="qproj_dequant_rms_nope_rope",
+                allow_early_resolve=True,
             ):
                 hg = hg_idx * Q_ROPE_H_TILE
                 for tg in pl.range(0, tile_rows, Q_ROPE_T_TILE):
@@ -558,6 +594,34 @@ def q_proj_rope(
                             q_rope_bf16_tail = pl.cast(q_rope_rot_tail, target_type=pl.BF16, mode="rint")
                             q_rope_valid = pl.set_validshape(q_rope_bf16_tail, valid_tail_rows, ROPE_DIM)
                             pl.store(q_rope_valid, [out_tg, h0_tail + NOPE_DIM], q_flat)
+
+
+@pl.jit.inline(auto_scope=False)
+def q_proj_rope(
+    x: pl.Tensor[[T_DYN, D], pl.BF16],
+    wq_a: pl.Tensor[[D, Q_LORA], pl.BF16],
+    wq_b: pl.Tensor[[Q_LORA, H * HEAD_DIM], pl.INT8],
+    wq_b_scale: pl.Tensor[[H * HEAD_DIM], pl.FP32],
+    gamma_cq: pl.Tensor[[Q_LORA], pl.BF16],
+    rope_cos_il: pl.Tensor[[T_DYN, ROPE_DIM], pl.FP32],
+    rope_sin_signed: pl.Tensor[[T_DYN, ROPE_DIM], pl.FP32],
+    rope_swap_idx: pl.Tensor[[T_DYN, ROPE_DIM], pl.INT32],
+    q: pl.Tensor[[T_DYN, H, HEAD_DIM], pl.BF16],
+    qr: pl.Tensor[[T_DYN, Q_LORA], pl.INT8],
+    qr_scale: pl.Tensor[[T_DYN, 1], pl.FP32],
+):
+    """Q LoRA, RMSNorm, quantization, and RoPE over bounded dense tiles."""
+    qr_i8_matmul = pl.create_tensor([QPROJ_T_PAD, Q_LORA], dtype=pl.INT8)
+    # The quant scale rides the qr_i8 -> qproj_matmul -> dequant chain.
+    qr_scale_pad_store = pl.create_tensor([QPROJ_T_PAD, 1], dtype=pl.FP32, manual_dep=True)
+    q_proj_qr(x, wq_a, gamma_cq, qr, qr_scale, qr_i8_matmul, qr_scale_pad_store)
+    q_seq_dep = pl.system.task_dummy(deps=[])
+    q_proj_q(
+        x, wq_b, wq_b_scale, rope_cos_il, rope_sin_signed, rope_swap_idx, q,
+        qr_i8_matmul, qr_scale_pad_store, q_seq_dep,
+    )
+
+
 
 
 @pl.jit.inline(auto_scope=False)

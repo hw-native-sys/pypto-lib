@@ -50,7 +50,12 @@ from config import (
     INT8_SCALE_MAX,
     INT8_AMAX_EPS,
 )
-from decode_compressor_ratio4 import compressor_ratio4
+from decode_compressor_ratio4 import (
+    BS_PAD as CMP_BS_PAD,
+    compressor_ratio4,
+    compressor_ratio4_cache_write,
+    compressor_ratio4_pool,
+)
 from decode_cp_token_allgather import (
     KV_B_DYN,
     KV_T_DYN,
@@ -59,9 +64,27 @@ from decode_cp_token_allgather import (
 )
 from hc_post import hc_post
 from hc_pre import hc_pre
-from decode_indexer import indexer
-from decode_indexer_compressor import indexer_compressor
-from qkv_proj_rope import kv_proj_rope, q_proj_rope, qkv_proj_rope, rope_prepare
+from decode_indexer import (
+    T_PAD as IDX_T_PAD,
+    indexer,
+    indexer_qr_hadamard_mm,
+    indexer_qr_rope,
+    indexer_weights_score,
+)
+from decode_indexer_compressor import (
+    BS_PAD as IDX_CMP_BS_PAD,
+    indexer_compressor,
+    indexer_compressor_pool,
+    indexer_compressor_write,
+)
+from qkv_proj_rope import (
+    QPROJ_T_PAD,
+    kv_proj_rope,
+    q_proj_q,
+    q_proj_qr,
+    qkv_proj_rope,
+    rope_prepare,
+)
 from rmsnorm import rms_norm
 from decode_o_proj import (
     ATTENTION_WINDOW_ROWS,
@@ -307,7 +330,9 @@ def decode_csa(
     attention_local_flat = pl.create_tensor([ATTENTION_WINDOW_ROWS, O_GROUP_IN], dtype=pl.BF16)
     attn_out = pl.create_tensor([t_dim, D], dtype=pl.BF16)
     with pl.scope():
-        late_dep = pl.system.task_dummy(deps=[rope_tid, gather_done_tid])
+        # The chain head reads the gathered stream, so it carries the allgather
+        # ordering edge for everything downstream of it.
+        gather_dep = pl.system.task_dummy(deps=[rope_tid, gather_done_tid])
         kv_cos_il = pl.create_tensor([kv_dim, ROPE_HEAD_DIM], dtype=pl.FP32)
         kv_sin_signed = pl.create_tensor([kv_dim, ROPE_HEAD_DIM], dtype=pl.FP32)
         kv_swap_idx = pl.create_tensor([kv_dim, ROPE_HEAD_DIM], dtype=pl.INT32)
@@ -318,32 +343,32 @@ def decode_csa(
         q_swap_idx = pl.create_tensor([t_dim, ROPE_HEAD_DIM], dtype=pl.INT32)
         rope_prepare(freqs_cos_local, freqs_sin_local, q_cos_il, q_sin_signed, q_swap_idx)
 
-        q_proj_rope(
-            x_normed_t, wq_a, wq_b, wq_b_scale, gamma_cq,
-            q_cos_il, q_sin_signed, q_swap_idx,
-            q, qr, qr_scale,
+        qr_i8_matmul = pl.create_tensor([QPROJ_T_PAD, Q_LORA], dtype=pl.INT8)
+        qr_scale_pad = pl.create_tensor([QPROJ_T_PAD, 1], dtype=pl.FP32, manual_dep=True)
+        q_proj_qr(
+            x_normed_t, wq_a, gamma_cq, qr, qr_scale,
+            qr_i8_matmul, qr_scale_pad,
         )
 
-        kv_proj_rope(
-            x_normed_full, wkv, gamma_ckv,
-            kv_cos_il, kv_sin_signed, kv_swap_idx,
-            kv_full, late_dep,
+        # The five cube launches are chained head to tail so each one gets the whole
+        # cube array instead of splitting it:
+        #   idx_qr_proj_matmul -> kv_score_proj_0 -> kv_score_proj
+        #     -> qr_hadamard_matmul -> qproj_matmul
+        # Every one of them is a 24- or 64-block launch, so two overlapping ones each
+        # come up short and stretch; serialised, each runs at its occupancy floor.
+        qr_bf16 = pl.create_tensor(
+            [IDX_T_PAD * IDX_N_HEADS, IDX_HEAD_DIM], dtype=pl.BF16
         )
-
-        ori_block_num = pl.tensor.dim(kv_cache, 0)
-        kv_cache_flat = pl.reshape(kv_cache, [ori_block_num * BLOCK_SIZE, HEAD_DIM])
-        with pl.spmd(CSA_WB_WORKERS, name_hint="csa_cache_writeback") as ori_cache_write_tid:
-            wb_worker = pl.tile.get_block_idx()
-            for wb_blk in pl.range(wb_worker, kv_wb_blocks, CSA_WB_WORKERS):
-                wb_t0 = wb_blk * CSA_WB_TOKEN_TILE
-                for write_dt in pl.range(CSA_WB_TOKEN_TILE):
-                    write_t = wb_t0 + write_dt
-                    write_row_i64 = pl.read(ori_slot_mapping, [write_t])
-                    if write_row_i64 >= 0:
-                        write_row = pl.cast(write_row_i64, pl.INDEX)
-                        kv_cache_flat[write_row : write_row + 1, 0 : HEAD_DIM] = (
-                            kv_full[write_t : write_t + 1, 0 : HEAD_DIM]
-                        )
+        qr_hadamard_i8 = pl.create_tensor(
+            [IDX_T_PAD * IDX_N_HEADS, IDX_HEAD_DIM], dtype=pl.INT8
+        )
+        qr_hadamard_scale_dq = pl.create_tensor(
+            [IDX_T_PAD * IDX_N_HEADS, 1], dtype=pl.FP32
+        )
+        idx_qr_mm_tid = indexer_qr_rope(
+            x_normed_t, qr, qr_scale, idx_wq_b, idx_wq_b_scale,
+            idx_cos_il, idx_sin_signed, qr_bf16,
+        )
 
         # Hand the compressors scalar-extent views: their token and request axes
         # bind to one row count per call, and mixing them with the gathered
@@ -363,36 +388,88 @@ def decode_csa(
             inner_compress_state_block_table, [kv_b_dim, INNER_STATE_MAX_BLOCKS],
         )
         cmp_out = pl.create_tensor([kv_dim, HEAD_DIM], dtype=pl.FP32)
-        cmp_out, cmp_cache_write_tid = compressor_ratio4(
-            x_normed_full, cmp_out,
-            compress_state, cmp_state_table,
-            cmp_wkv, cmp_wgate, cmp_ape, cmp_norm_w,
-            cmp_cos_il_full, cmp_sin_signed_full, cmp_kv,
-            cmp_positions, cmp_slots, cmp_state_slots,
-            late_dep,
-        )
-        cache_ready_dep = pl.system.task_dummy(deps=[ori_cache_write_tid, cmp_cache_write_tid])
-
-        # The indexer cache is per-request state, so its compressor half runs on the
-        # gathered stream while the query half stays on the rank's rows.
-        idx_kv_unused = pl.create_tensor([kv_dim, IDX_HEAD_DIM], dtype=pl.FP32)
-        idx_cache_write_tid = indexer_compressor(
-            x_normed_full, idx_kv_unused,
+        cmp_pooled_kv = pl.create_tensor([CMP_BS_PAD, HEAD_DIM], dtype=pl.FP32)
+        cmp_kv_proj_pad = pl.create_tensor([CMP_BS_PAD, MAIN_OUT_DIM], dtype=pl.FP32)
+        cmp_score_proj_pad = pl.create_tensor([CMP_BS_PAD, MAIN_OUT_DIM], dtype=pl.FP32)
+        idx_normed_kv = pl.create_tensor([IDX_CMP_BS_PAD, IDX_HEAD_DIM], dtype=pl.BF16)
+        idx_kv_score_tid, idx_rms_tid = indexer_compressor_pool(
+            x_normed_full,
             inner_compress_state, inner_state_table,
             inner_wkv, inner_wgate, inner_ape, inner_norm_w,
-            cmp_cos_il_full, cmp_sin_signed_full, hadamard_idx,
-            idx_kv_cache, idx_kv_scale,
-            cmp_positions, idx_slots, inner_state_slots,
-            late_dep,
+            cmp_cos_il_full, cmp_sin_signed_full,
+            cmp_positions, inner_state_slots, idx_normed_kv,
+            gather_dep, idx_qr_mm_tid,
         )
-        idx_topk_scores, idx_topk = indexer(
-            x_normed_t, qr, qr_scale, idx_wq_b, idx_wq_b_scale,
-            weights_proj, idx_cos_il, idx_sin_signed,
-            hadamard_idx,
+        cmp_pool_tid, cmp_kv_score_tid = compressor_ratio4_pool(
+            x_normed_full,
+            compress_state, cmp_state_table,
+            cmp_wkv, cmp_wgate, cmp_ape,
+            cmp_positions, cmp_pooled_kv, cmp_kv_proj_pad, cmp_score_proj_pad,
+            idx_kv_score_tid,
+        )
+        qh_mm_tid, qh_quant_tid = indexer_qr_hadamard_mm(
+            x_normed_t, qr_bf16, hadamard_idx,
+            qr_hadamard_i8, qr_hadamard_scale_dq, cmp_kv_score_tid,
+        )
+
+        # kv_hadamard is another 24-block launch, so it takes its own slot in the
+        # chain: 15 us ahead of qproj_matmul rather than beside it, where it costs
+        # qproj_matmul a core and a whole extra worker pass.
+        idx_kv_unused = pl.create_tensor([kv_dim, IDX_HEAD_DIM], dtype=pl.FP32)
+        idx_hadamard_tid, idx_cache_write_tid = indexer_compressor_write(
+            x_normed_full, idx_kv_unused, idx_normed_kv, hadamard_idx,
+            idx_kv_cache, idx_kv_scale, idx_slots,
+            idx_rms_tid, qh_mm_tid,
+        )
+        # q is not read until attention, so its cube and vector halves take the tail
+        # of the chain.
+        q_proj_q(
+            x_normed_t, wq_b, wq_b_scale,
+            q_cos_il, q_sin_signed, q_swap_idx, q,
+            qr_i8_matmul, qr_scale_pad, idx_hadamard_tid,
+        )
+        idx_topk_scores, idx_topk, leaf_tid = indexer_weights_score(
+            x_normed_t, weights_proj, qr_hadamard_i8, qr_hadamard_scale_dq,
             idx_kv_cache, idx_kv_scale, idx_block_table,
             idx_topk_scores, idx_topk,
-            idx_positions, kv_seq_lens, late_dep, idx_cache_write_tid,
+            idx_positions, kv_seq_lens,
+            idx_cache_write_tid, cmp_kv_score_tid, qh_quant_tid,
         )
+
+        # indexer_score_leaf_wave is a 24-block MIX launch that needs all 24 clusters:
+        # a single small task squatting on one cluster's AIV costs it a whole extra
+        # wave. Everything that would otherwise run inside its window is fenced behind
+        # it -- the ratio4 cache write, the KV branch, and the original-KV writeback.
+        # They only have to beat qk_pv, which waits on the top-k merge anyway.
+        cmp_cache_write_tid = compressor_ratio4_cache_write(
+            x_normed_full, cmp_out, cmp_pooled_kv, cmp_norm_w,
+            cmp_cos_il_full, cmp_sin_signed_full, cmp_kv, cmp_slots,
+            compress_state, cmp_state_table, cmp_ape,
+            cmp_kv_proj_pad, cmp_score_proj_pad, cmp_positions, cmp_state_slots,
+            cmp_pool_tid, leaf_tid,
+        )
+        kv_proj_rope(
+            x_normed_full, wkv, gamma_ckv,
+            kv_cos_il, kv_sin_signed, kv_swap_idx,
+            kv_full, leaf_tid,
+        )
+
+        ori_block_num = pl.tensor.dim(kv_cache, 0)
+        kv_cache_flat = pl.reshape(kv_cache, [ori_block_num * BLOCK_SIZE, HEAD_DIM])
+        with pl.spmd(CSA_WB_WORKERS, name_hint="csa_cache_writeback") as ori_cache_write_tid:
+            wb_worker = pl.tile.get_block_idx()
+            for wb_blk in pl.range(wb_worker, kv_wb_blocks, CSA_WB_WORKERS):
+                wb_t0 = wb_blk * CSA_WB_TOKEN_TILE
+                for write_dt in pl.range(CSA_WB_TOKEN_TILE):
+                    write_t = wb_t0 + write_dt
+                    write_row_i64 = pl.read(ori_slot_mapping, [write_t])
+                    if write_row_i64 >= 0:
+                        write_row = pl.cast(write_row_i64, pl.INDEX)
+                        kv_cache_flat[write_row : write_row + 1, 0 : HEAD_DIM] = (
+                            kv_full[write_t : write_t + 1, 0 : HEAD_DIM]
+                        )
+
+        cache_ready_dep = pl.system.task_dummy(deps=[ori_cache_write_tid, cmp_cache_write_tid])
 
         (
             sparse_blk_mi, sparse_blk_li, sparse_blk_oi,
@@ -903,7 +980,7 @@ def decode_csa_tp1(
                         kv_cache_flat[write_row : write_row + 1, 0 : HEAD_DIM] = kv[write_t : write_t + 1, 0 : HEAD_DIM]
 
         cmp_out = pl.create_tensor([t_dim, HEAD_DIM], dtype=pl.FP32)
-        cmp_out, cmp_cache_write_tid = compressor_ratio4(
+        cmp_out, cmp_cache_write_tid, cmp_kv_score_tid = compressor_ratio4(
             x_normed_t, cmp_out,
             compress_state, compress_state_block_table,
             cmp_wkv, cmp_wgate, cmp_ape, cmp_norm_w,
@@ -921,7 +998,7 @@ def decode_csa_tp1(
             cmp_cos_il, cmp_sin_signed, hadamard_idx,
             idx_kv_cache, idx_kv_scale,
             position_ids, idx_slot_mapping, inner_state_slot_mapping,
-            late_dep,
+            late_dep, cmp_kv_score_tid,
         )
         idx_topk_scores, idx_topk = indexer(
             x_normed_t, qr, qr_scale, idx_wq_b, idx_wq_b_scale,

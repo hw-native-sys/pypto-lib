@@ -101,6 +101,8 @@ QR_PROJ_WORKERS = 24
 QH_MM_TILE = 64
 # qr_hadamard_matmul runs on persistent workers, each striding over the block list.
 QH_WORKERS = 24
+# weights_proj runs on persistent workers, one per physical AIC.
+WEIGHTS_WORKERS = 24
 QH_HEAD_DIM_TILE = 64
 ROPE_ROW_BLOCK = IDX_N_HEADS
 # qr_rope runs on persistent workers, each striding over ROPE_ROW_TILE-row blocks.
@@ -481,128 +483,132 @@ def indexer_score_topk_forest(
     pair_arena = pl.create_tensor(
         [TOPK_ARENA_ROWS, TOPK_PAIR_WIDTH], dtype=pl.FP32
     )
-    with pl.scope():
-        score_arena = pl.create_tensor(
-            [bs, TOPK_MAX_CANDIDATES], dtype=pl.FP32
-        )
-        with pl.spmd(
-            TOPK_SCORE_WORKERS,
-            name_hint="indexer_score_leaf_wave",
-            deps=[qh_quant_tid, weights_tid, cache_write_tid],
-            optimizations=[pl.split(pl.SplitMode.NONE, slot_num=2)],
-        ) as score_tid:
-            worker = pl.tile.get_block_idx()
-            query_count = pl.tensor.dim(position_ids, 0)
-            global_leaf_base = 0
-            for query in pl.range(query_count):
-                batch_idx = query // S
-                position = pl.read(position_ids, [query])
-                cache_len = (
-                    pl.read(kv_seq_lens, [batch_idx]) // COMPRESS_RATIO
-                )
-                visible_count = pl.max(
+    # leaf_wave sits outside the arena scope so its TaskId survives the scope
+    # close: callers fence their own tasks behind it (a squatter on one of the
+    # 24 clusters costs this launch a whole extra wave).
+    score_arena = pl.create_tensor(
+        [bs, TOPK_MAX_CANDIDATES], dtype=pl.FP32
+    )
+    with pl.spmd(
+        TOPK_SCORE_WORKERS,
+        name_hint="indexer_score_leaf_wave",
+        deps=[qh_quant_tid, weights_tid, cache_write_tid],
+        optimizations=[pl.split(pl.SplitMode.NONE, slot_num=2)],
+    ) as score_tid:
+        worker = pl.tile.get_block_idx()
+        query_count = pl.tensor.dim(position_ids, 0)
+        global_leaf_base = 0
+        for query in pl.range(query_count):
+            batch_idx = query // S
+            position = pl.read(position_ids, [query])
+            cache_len = (
+                pl.read(kv_seq_lens, [batch_idx]) // COMPRESS_RATIO
+            )
+            visible_count = pl.max(
+                pl.min(
                     pl.min(
-                        pl.min(
-                            cache_len,
-                            (position + 1) // COMPRESS_RATIO,
-                        ),
-                        TOPK_MAX_CANDIDATES,
+                        cache_len,
+                        (position + 1) // COMPRESS_RATIO,
                     ),
-                    0,
+                    TOPK_MAX_CANDIDATES,
+                ),
+                0,
+            )
+            leaf_count = (
+                visible_count + TOPK_CANDIDATES_PER_LEAF - 1
+            ) // TOPK_CANDIDATES_PER_LEAF
+            base_mod = global_leaf_base % TOPK_SCORE_WORKERS
+            first_leaf = (worker + base_mod) % TOPK_SCORE_WORKERS
+            for leaf in pl.range(
+                first_leaf, leaf_count, TOPK_SCORE_WORKERS
+            ):
+                logical_begin = leaf * TOPK_CANDIDATES_PER_LEAF
+                valid_count = pl.min(
+                    TOPK_CANDIDATES_PER_LEAF,
+                    visible_count - logical_begin,
                 )
-                leaf_count = (
-                    visible_count + TOPK_CANDIDATES_PER_LEAF - 1
-                ) // TOPK_CANDIDATES_PER_LEAF
-                base_mod = global_leaf_base % TOPK_SCORE_WORKERS
-                first_leaf = (worker + base_mod) % TOPK_SCORE_WORKERS
-                for leaf in pl.range(
-                    first_leaf, leaf_count, TOPK_SCORE_WORKERS
-                ):
-                    logical_begin = leaf * TOPK_CANDIDATES_PER_LEAF
-                    valid_count = pl.min(
-                        TOPK_CANDIDATES_PER_LEAF,
-                        visible_count - logical_begin,
-                    )
-                    query_head_begin = query * IDX_N_HEADS
-                    query_vector = qr_hadamard_i8[
+                query_head_begin = query * IDX_N_HEADS
+                query_vector = qr_hadamard_i8[
+                    query_head_begin : query_head_begin + IDX_N_HEADS,
+                    0:IDX_HEAD_DIM,
+                ]
+                query_scale = pl.reshape(
+                    qr_hadamard_scale_dq[
                         query_head_begin : query_head_begin + IDX_N_HEADS,
+                        0:1,
+                    ],
+                    [1, IDX_N_HEADS],
+                )
+                query_weight = weights[
+                    query : query + 1,
+                    0:IDX_N_HEADS,
+                ]
+                page_count = (
+                    valid_count + BLOCK_SIZE - 1
+                ) // BLOCK_SIZE
+                for page in pl.pipeline(0, page_count, stage=2):
+                    page_begin = page * BLOCK_SIZE
+                    logical_row = logical_begin + page_begin
+                    logical_page = logical_row // BLOCK_SIZE
+                    physical_block = pl.cast(
+                        pl.read(
+                            idx_block_table_flat,
+                            [
+                                batch_idx * IDX_MAX_BLOCKS
+                                + logical_page
+                            ],
+                        ),
+                        pl.INDEX,
+                    )
+                    physical_row = physical_block * BLOCK_SIZE
+                    kv_i8 = kv_cache_i8_flat[
+                        physical_row : physical_row + BLOCK_SIZE,
                         0:IDX_HEAD_DIM,
                     ]
-                    query_scale = pl.reshape(
-                        qr_hadamard_scale_dq[
-                            query_head_begin : query_head_begin + IDX_N_HEADS,
-                            0:1,
-                        ],
-                        [1, IDX_N_HEADS],
+                    score_i32 = pl.matmul(
+                        kv_i8,
+                        query_vector,
+                        out_dtype=pl.INT32,
+                        b_trans=True,
                     )
-                    query_weight = weights[
-                        query : query + 1,
-                        0:IDX_N_HEADS,
+                    score_fp32 = pl.cast(
+                        score_i32,
+                        target_type=pl.FP32,
+                        mode="none",
+                    )
+                    score_fp32 = pl.col_expand_mul(
+                        score_fp32,
+                        query_scale,
+                    )
+                    score_fp32 = pl.maximum(score_fp32, 0.0)
+                    score_fp32 = pl.col_expand_mul(
+                        score_fp32,
+                        query_weight,
+                    )
+                    kv_scale = kv_scale_flat[
+                        physical_row : physical_row + BLOCK_SIZE,
+                        0:1,
                     ]
-                    page_count = (
-                        valid_count + BLOCK_SIZE - 1
-                    ) // BLOCK_SIZE
-                    for page in pl.pipeline(0, page_count, stage=2):
-                        page_begin = page * BLOCK_SIZE
-                        logical_row = logical_begin + page_begin
-                        logical_page = logical_row // BLOCK_SIZE
-                        physical_block = pl.cast(
-                            pl.read(
-                                idx_block_table_flat,
-                                [
-                                    batch_idx * IDX_MAX_BLOCKS
-                                    + logical_page
-                                ],
-                            ),
-                            pl.INDEX,
-                        )
-                        physical_row = physical_block * BLOCK_SIZE
-                        kv_i8 = kv_cache_i8_flat[
-                            physical_row : physical_row + BLOCK_SIZE,
-                            0:IDX_HEAD_DIM,
-                        ]
-                        score_i32 = pl.matmul(
-                            kv_i8,
-                            query_vector,
-                            out_dtype=pl.INT32,
-                            b_trans=True,
-                        )
-                        score_fp32 = pl.cast(
-                            score_i32,
-                            target_type=pl.FP32,
-                            mode="none",
-                        )
-                        score_fp32 = pl.col_expand_mul(
-                            score_fp32,
-                            query_scale,
-                        )
-                        score_fp32 = pl.maximum(score_fp32, 0.0)
-                        score_fp32 = pl.col_expand_mul(
-                            score_fp32,
-                            query_weight,
-                        )
-                        kv_scale = kv_scale_flat[
-                            physical_row : physical_row + BLOCK_SIZE,
-                            0:1,
-                        ]
-                        score = pl.mul(
-                            pl.row_sum(score_fp32),
-                            kv_scale,
-                        )
-                        score_row = pl.reshape(score, [1, BLOCK_SIZE])
-                        valid_rows = pl.min(
-                            BLOCK_SIZE,
-                            valid_count - page_begin,
-                        )
-                        score_valid = pl.fillpad(
-                            pl.set_validshape(score_row, 1, valid_rows),
-                            pad_value=pl.PadValue.min,
-                        )
-                        score_arena[
-                            query : query + 1,
-                            logical_row : logical_row + BLOCK_SIZE,
-                        ] = score_valid
-                global_leaf_base = global_leaf_base + leaf_count
+                    score = pl.mul(
+                        pl.row_sum(score_fp32),
+                        kv_scale,
+                    )
+                    score_row = pl.reshape(score, [1, BLOCK_SIZE])
+                    valid_rows = pl.min(
+                        BLOCK_SIZE,
+                        valid_count - page_begin,
+                    )
+                    score_valid = pl.fillpad(
+                        pl.set_validshape(score_row, 1, valid_rows),
+                        pad_value=pl.PadValue.min,
+                    )
+                    score_arena[
+                        query : query + 1,
+                        logical_row : logical_row + BLOCK_SIZE,
+                    ] = score_valid
+            global_leaf_base = global_leaf_base + leaf_count
+
+    with pl.scope():
         with pl.spmd(
             TOPK_GROUP_WORKERS,
             name_hint="indexer_topk_group_wave",
@@ -627,38 +633,32 @@ def indexer_score_topk_forest(
                 topk_idxs,
             )
 
-    return topk_scores, topk_idxs
+    return topk_scores, topk_idxs, score_tid
 
 
-@pl.jit.inline
-def indexer(
+
+@pl.jit.inline(auto_scope=False)
+def indexer_qr_rope(
     x: pl.Tensor[[T_DYN, D], pl.BF16],
     qr: pl.Tensor[[T_DYN, Q_LORA], pl.INT8],
     qr_scale: pl.Tensor[[T_DYN, 1], pl.FP32],
     wq_b: pl.Tensor[[Q_LORA, IDX_N_HEADS * IDX_HEAD_DIM], pl.INT8],
     wq_b_scale: pl.Tensor[[IDX_N_HEADS * IDX_HEAD_DIM], pl.FP32],
-    weights_proj: pl.Tensor[[D, IDX_N_HEADS], pl.BF16],
-    # Interleave-duplicated (j>>1) cos and sign-folded sin, built once by the caller:
-    #   cos[j] = cos_half[j>>1];  sin[j] = sin_half[j>>1] * sign[j], sign = [-1,+1,...]
+    # Interleave-duplicated (j>>1) cos and sign-folded sin, built once by the caller.
     cos: pl.Tensor[[T_DYN, ROPE_HEAD_DIM], pl.FP32],
     sin: pl.Tensor[[T_DYN, ROPE_HEAD_DIM], pl.FP32],
-    hadamard: pl.Tensor[[IDX_HEAD_DIM, IDX_HEAD_DIM], pl.BF16],
-    # C8 indexer cache: INT8 KV (quant-on-write) + per-position FP32 dequant scale; no bf16 cache.
-    idx_kv_cache: pl.InOut[pl.Tensor[[IDX_CACHE_BLOCK_NUM_DYN, BLOCK_SIZE, 1, IDX_HEAD_DIM], pl.INT8]],
-    idx_kv_scale: pl.InOut[pl.Tensor[[IDX_CACHE_BLOCK_NUM_DYN, BLOCK_SIZE, 1, 1], pl.FP32]],
-    idx_block_table: pl.Tensor[[B_DYN, IDX_MAX_BLOCKS], pl.INT32],
-    topk_scores: pl.Out[pl.Tensor[[T_DYN, IDX_TOPK], pl.FP32]],
-    topk_idxs: pl.Out[pl.Tensor[[T_DYN, IDX_TOPK], pl.INT32]],
-    position_ids: pl.Tensor[[T_DYN], pl.INT32],
-    kv_seq_lens: pl.Tensor[[B_DYN], pl.INT32],
-    late_dep: pl.Scalar[pl.TASK_ID],
-    cache_write_dep: pl.Scalar[pl.TASK_ID],
+    qr_bf16: pl.Out[pl.Tensor[[T_PAD * IDX_N_HEADS, IDX_HEAD_DIM], pl.BF16]],
 ):
+    """Indexer query projection, dequant and RoPE -- everything before the hadamard."""
+
     bs = pl.tensor.dim(x, 0)
     bs_heads = bs * IDX_N_HEADS
     row_blocks = (bs + MM_ROW_TILE - 1) // MM_ROW_TILE
     qr_acc_pad = pl.create_tensor([T_PAD, IDX_N_HEADS * IDX_HEAD_DIM], dtype=pl.INT32)
-    for qr_proj_worker in pl.spmd(QR_PROJ_WORKERS, name_hint="idx_qr_proj_matmul", allow_early_resolve=True):
+    with pl.spmd(
+        QR_PROJ_WORKERS, name_hint="idx_qr_proj_matmul", allow_early_resolve=True,
+    ) as idx_qr_mm_tid:
+        qr_proj_worker = pl.tile.get_block_idx()
         for qr_unit in pl.range(qr_proj_worker, QR_OT_COUNT * row_blocks, QR_PROJ_WORKERS):
             qr_rb = qr_unit // QR_OT_COUNT  # row block outermost
             ot = qr_unit - qr_rb * QR_OT_COUNT
@@ -691,7 +691,6 @@ def indexer(
     qr_proj_flat = pl.reshape(qr_proj, [bs_heads, IDX_HEAD_DIM])
     # BF16 q for the Hadamard matmul: nope half rounded from the FP32 dequant, rope
     # half rotated then rounded.
-    qr_bf16 = pl.create_tensor([bs_heads, IDX_HEAD_DIM], dtype=pl.BF16)
     # spmd over ROPE_ROW_TILE-row blocks; token_idx = block base // ROPE_ROW_BLOCK
     # picks the token-local cos/sin row. cos/sin arrive already interleave-duplicated and
     # sign-folded (built once by the caller), and col_expand_mul folds the [1, ROPE_HEAD_DIM]
@@ -730,10 +729,31 @@ def indexer(
             qr_vec = pl.concat(pl.cast(qr_nope_slice, target_type=pl.BF16, mode="rint"), pl.cast(rope_rot, target_type=pl.BF16, mode="rint"))
             qr_bf16[o0 : o0 + ROPE_ROW_TILE, :] = qr_vec
 
+
+    return idx_qr_mm_tid
+
+
+@pl.jit.inline(auto_scope=False)
+def indexer_qr_hadamard_mm(
+    x: pl.Tensor[[T_DYN, D], pl.BF16],
+    qr_bf16: pl.Tensor[[T_PAD * IDX_N_HEADS, IDX_HEAD_DIM], pl.BF16],
+    hadamard: pl.Tensor[[IDX_HEAD_DIM, IDX_HEAD_DIM], pl.BF16],
+    qr_hadamard_i8: pl.Out[pl.Tensor[[T_PAD * IDX_N_HEADS, IDX_HEAD_DIM], pl.INT8]],
+    qr_hadamard_scale_dq: pl.Out[pl.Tensor[[T_PAD * IDX_N_HEADS, 1], pl.FP32]],
+    qh_mm_dep: pl.Scalar[pl.TASK_ID],
+):
+    """q @ hadamard and its INT8 quant, fenced behind the caller's cube ordering."""
+    bs = pl.tensor.dim(x, 0)
+    bs_heads = bs * IDX_N_HEADS
+
     # cube-only scope: q @ hadamard lands in GM, keeping the vector amax/quant below
     # in its own scope so the two run as separate cube and vector tasks.
     qh_acc_gm = pl.create_tensor([bs_heads, IDX_HEAD_DIM], dtype=pl.FP32)
-    for qh_worker in pl.spmd(QH_WORKERS, name_hint="qr_hadamard_matmul", allow_early_resolve=True):
+    with pl.spmd(
+        QH_WORKERS, name_hint="qr_hadamard_matmul", deps=[qh_mm_dep],
+        allow_early_resolve=True,
+    ) as qh_mm_tid:
+        qh_worker = pl.tile.get_block_idx()
         # The hadamard matrix is the same for every block, so it is read once per worker.
         qh_hadamard = hadamard[0:IDX_HEAD_DIM, 0:IDX_HEAD_DIM]
         for idx in pl.range(qh_worker, bs_heads // QH_MM_TILE, QH_WORKERS):
@@ -741,12 +761,6 @@ def indexer(
             qh_acc = pl.matmul(qr_bf16[o0 : o0 + QH_MM_TILE, :], qh_hadamard, out_dtype=pl.FP32)
             qh_acc_gm[o0 : o0 + QH_MM_TILE, :] = qh_acc
 
-    qr_hadamard_i8 = pl.create_tensor(
-        [T_PAD * IDX_N_HEADS, IDX_HEAD_DIM], dtype=pl.INT8
-    )
-    qr_hadamard_scale_dq = pl.create_tensor(
-        [T_PAD * IDX_N_HEADS, 1], dtype=pl.FP32
-    )
     with pl.spmd(
         QH_QUANT_WORKERS,
         name_hint="qr_hadamard_quant",
@@ -773,28 +787,82 @@ def indexer(
                 qh_i8 = pl.cast(qh_q_half, target_type=pl.INT8, mode="trunc")
                 qr_hadamard_i8[o0 : o0 + QH_QUANT_TILE, h1 : h1 + QH_HEAD_DIM_TILE] = qh_i8
 
+
+    return qh_mm_tid, qh_quant_tid
+
+
+@pl.jit.inline(auto_scope=False)
+def indexer_qr_hadamard(
+    x: pl.Tensor[[T_DYN, D], pl.BF16],
+    qr: pl.Tensor[[T_DYN, Q_LORA], pl.INT8],
+    qr_scale: pl.Tensor[[T_DYN, 1], pl.FP32],
+    wq_b: pl.Tensor[[Q_LORA, IDX_N_HEADS * IDX_HEAD_DIM], pl.INT8],
+    wq_b_scale: pl.Tensor[[IDX_N_HEADS * IDX_HEAD_DIM], pl.FP32],
+    cos: pl.Tensor[[T_DYN, ROPE_HEAD_DIM], pl.FP32],
+    sin: pl.Tensor[[T_DYN, ROPE_HEAD_DIM], pl.FP32],
+    hadamard: pl.Tensor[[IDX_HEAD_DIM, IDX_HEAD_DIM], pl.BF16],
+    qr_hadamard_i8: pl.Out[pl.Tensor[[T_PAD * IDX_N_HEADS, IDX_HEAD_DIM], pl.INT8]],
+    qr_hadamard_scale_dq: pl.Out[pl.Tensor[[T_PAD * IDX_N_HEADS, 1], pl.FP32]],
+):
+    """Query half of the indexer: qr projection, rope, hadamard, and INT8 quant."""
+    qr_bf16 = pl.create_tensor([T_PAD * IDX_N_HEADS, IDX_HEAD_DIM], dtype=pl.BF16)
+    idx_qr_mm_tid = indexer_qr_rope(
+        x, qr, qr_scale, wq_b, wq_b_scale, cos, sin, qr_bf16,
+    )
+    qh_seq_dep = pl.system.task_dummy(deps=[])
+    qh_mm_tid, qh_quant_tid = indexer_qr_hadamard_mm(
+        x, qr_bf16, hadamard, qr_hadamard_i8, qr_hadamard_scale_dq, qh_seq_dep,
+    )
+    return qh_mm_tid, qh_quant_tid, idx_qr_mm_tid
+
+
+
+@pl.jit.inline(auto_scope=False)
+def indexer_weights_score(
+    x: pl.Tensor[[T_DYN, D], pl.BF16],
+    weights_proj: pl.Tensor[[D, IDX_N_HEADS], pl.BF16],
+    qr_hadamard_i8: pl.Tensor[[T_PAD * IDX_N_HEADS, IDX_HEAD_DIM], pl.INT8],
+    qr_hadamard_scale_dq: pl.Tensor[[T_PAD * IDX_N_HEADS, 1], pl.FP32],
+    idx_kv_cache: pl.InOut[pl.Tensor[[IDX_CACHE_BLOCK_NUM_DYN, BLOCK_SIZE, 1, IDX_HEAD_DIM], pl.INT8]],
+    idx_kv_scale: pl.InOut[pl.Tensor[[IDX_CACHE_BLOCK_NUM_DYN, BLOCK_SIZE, 1, 1], pl.FP32]],
+    idx_block_table: pl.Tensor[[B_DYN, IDX_MAX_BLOCKS], pl.INT32],
+    topk_scores: pl.Out[pl.Tensor[[T_DYN, IDX_TOPK], pl.FP32]],
+    topk_idxs: pl.Out[pl.Tensor[[T_DYN, IDX_TOPK], pl.INT32]],
+    position_ids: pl.Tensor[[T_DYN], pl.INT32],
+    kv_seq_lens: pl.Tensor[[B_DYN], pl.INT32],
+    cache_write_dep: pl.Scalar[pl.TASK_ID],
+    weights_gate_dep: pl.Scalar[pl.TASK_ID],
+    qh_quant_tid: pl.Scalar[pl.TASK_ID],
+):
+    """Weights projection and the score/top-k forest over an already-quantized query."""
+    bs = pl.tensor.dim(x, 0)
+    row_blocks = (bs + MM_ROW_TILE - 1) // MM_ROW_TILE
+
     x_flat = x
     weights = pl.create_tensor([T_PAD, IDX_N_HEADS], dtype=pl.FP32)
     weights_partial = pl.create_tensor([WEIGHTS_OK * T_PAD, IDX_N_HEADS], dtype=pl.FP32)
-    # Deferred behind the caller's rms_norm dummy barrier: qkv's qr_proj_matmul is the
-    # critical path and must win the cores when rms_norm retires.
-    with pl.spmd(WEIGHTS_OK * row_blocks, name_hint="weights_proj", deps=[late_dep]) as _weights_tid:
-        w_unit = pl.tile.get_block_idx()
-        w_rb = w_unit // WEIGHTS_OK  # row block outermost
-        kb = w_unit - w_rb * WEIGHTS_OK
-        w_r0 = w_rb * MM_ROW_TILE
-        w_rows = pl.min(MM_ROW_TILE, bs - w_r0)
-        k_base = kb * WEIGHTS_K_SLICE
-        weights_acc = pl.create_tensor([MM_ROW_TILE, IDX_N_HEADS], dtype=pl.FP32)
-        for db in pl.range(WEIGHTS_K_SLICE // D_TILE):
-            d0 = k_base + db * D_TILE
-            x_tile = pl.slice(x_flat, [MM_ROW_TILE, D_TILE], [w_r0, d0], valid_shape=[w_rows, D_TILE])
-            weights_proj_tile = weights_proj[d0 : d0 + D_TILE, :]
-            if db == 0:
-                weights_acc = pl.matmul(x_tile, weights_proj_tile, out_dtype=pl.FP32)
-            else:
-                weights_acc = pl.matmul_acc(weights_acc, x_tile, weights_proj_tile)
-        weights_partial[kb * T_PAD + w_r0 : kb * T_PAD + w_r0 + MM_ROW_TILE, :] = weights_acc
+    # Off the critical path, so it is fenced behind the caller's dep; persistent
+    # workers keep the launch at one block per AIC.
+    with pl.spmd(
+        WEIGHTS_WORKERS, name_hint="weights_proj", deps=[weights_gate_dep],
+    ) as _weights_tid:
+        w_worker = pl.tile.get_block_idx()
+        for w_unit in pl.range(w_worker, WEIGHTS_OK * row_blocks, WEIGHTS_WORKERS):
+            w_rb = w_unit // WEIGHTS_OK  # row block outermost
+            kb = w_unit - w_rb * WEIGHTS_OK
+            w_r0 = w_rb * MM_ROW_TILE
+            w_rows = pl.min(MM_ROW_TILE, bs - w_r0)
+            k_base = kb * WEIGHTS_K_SLICE
+            weights_acc = pl.create_tensor([MM_ROW_TILE, IDX_N_HEADS], dtype=pl.FP32)
+            for db in pl.range(WEIGHTS_K_SLICE // D_TILE):
+                d0 = k_base + db * D_TILE
+                x_tile = pl.slice(x_flat, [MM_ROW_TILE, D_TILE], [w_r0, d0], valid_shape=[w_rows, D_TILE])
+                weights_proj_tile = weights_proj[d0 : d0 + D_TILE, :]
+                if db == 0:
+                    weights_acc = pl.matmul(x_tile, weights_proj_tile, out_dtype=pl.FP32)
+                else:
+                    weights_acc = pl.matmul_acc(weights_acc, x_tile, weights_proj_tile)
+            weights_partial[kb * T_PAD + w_r0 : kb * T_PAD + w_r0 + MM_ROW_TILE, :] = weights_acc
 
     with pl.spmd(
         row_blocks,
@@ -809,7 +877,7 @@ def indexer(
             w_sum = pl.add(w_sum, weights_partial[partial_r0 : partial_r0 + MM_ROW_TILE, :])
         weights[w_r0 : w_r0 + MM_ROW_TILE, :] = pl.mul(w_sum, WEIGHTS_SCALE)
 
-    topk_scores, topk_idxs = indexer_score_topk_forest(
+    topk_scores, topk_idxs, leaf_tid = indexer_score_topk_forest(
         qr_hadamard_i8,
         qr_hadamard_scale_dq,
         weights,
@@ -823,6 +891,49 @@ def indexer(
         qh_quant_tid,
         weights_tid,
         cache_write_dep,
+    )
+    return topk_scores, topk_idxs, leaf_tid
+
+
+@pl.jit.inline
+def indexer(
+    x: pl.Tensor[[T_DYN, D], pl.BF16],
+    qr: pl.Tensor[[T_DYN, Q_LORA], pl.INT8],
+    qr_scale: pl.Tensor[[T_DYN, 1], pl.FP32],
+    wq_b: pl.Tensor[[Q_LORA, IDX_N_HEADS * IDX_HEAD_DIM], pl.INT8],
+    wq_b_scale: pl.Tensor[[IDX_N_HEADS * IDX_HEAD_DIM], pl.FP32],
+    weights_proj: pl.Tensor[[D, IDX_N_HEADS], pl.BF16],
+    # Interleave-duplicated (j>>1) cos and sign-folded sin, built once by the caller:
+    #   cos[j] = cos_half[j>>1];  sin[j] = sin_half[j>>1] * sign[j], sign = [-1,+1,...]
+    cos: pl.Tensor[[T_DYN, ROPE_HEAD_DIM], pl.FP32],
+    sin: pl.Tensor[[T_DYN, ROPE_HEAD_DIM], pl.FP32],
+    hadamard: pl.Tensor[[IDX_HEAD_DIM, IDX_HEAD_DIM], pl.BF16],
+    # C8 indexer cache: INT8 KV (quant-on-write) + per-position FP32 dequant scale; no bf16 cache.
+    idx_kv_cache: pl.InOut[pl.Tensor[[IDX_CACHE_BLOCK_NUM_DYN, BLOCK_SIZE, 1, IDX_HEAD_DIM], pl.INT8]],
+    idx_kv_scale: pl.InOut[pl.Tensor[[IDX_CACHE_BLOCK_NUM_DYN, BLOCK_SIZE, 1, 1], pl.FP32]],
+    idx_block_table: pl.Tensor[[B_DYN, IDX_MAX_BLOCKS], pl.INT32],
+    topk_scores: pl.Out[pl.Tensor[[T_DYN, IDX_TOPK], pl.FP32]],
+    topk_idxs: pl.Out[pl.Tensor[[T_DYN, IDX_TOPK], pl.INT32]],
+    position_ids: pl.Tensor[[T_DYN], pl.INT32],
+    kv_seq_lens: pl.Tensor[[B_DYN], pl.INT32],
+    late_dep: pl.Scalar[pl.TASK_ID],
+    cache_write_dep: pl.Scalar[pl.TASK_ID],
+):
+    qr_hadamard_i8 = pl.create_tensor(
+        [T_PAD * IDX_N_HEADS, IDX_HEAD_DIM], dtype=pl.INT8
+    )
+    qr_hadamard_scale_dq = pl.create_tensor(
+        [T_PAD * IDX_N_HEADS, 1], dtype=pl.FP32
+    )
+    qh_mm_tid, qh_quant_tid, _idx_qr_mm_tid = indexer_qr_hadamard(
+        x, qr, qr_scale, wq_b, wq_b_scale, cos, sin, hadamard,
+        qr_hadamard_i8, qr_hadamard_scale_dq,
+    )
+    topk_scores, topk_idxs, _leaf_tid = indexer_weights_score(
+        x, weights_proj, qr_hadamard_i8, qr_hadamard_scale_dq,
+        idx_kv_cache, idx_kv_scale, idx_block_table,
+        topk_scores, topk_idxs, position_ids, kv_seq_lens,
+        cache_write_dep, qh_mm_tid, qh_quant_tid,
     )
     return topk_scores, topk_idxs
 
@@ -882,7 +993,7 @@ def indexer_test(
         inner_wkv, inner_wgate, inner_ape, inner_norm_w,
         cmp_cos, cmp_sin, hadamard, idx_kv_cache, idx_kv_scale,
         position_ids, idx_slot_mapping, inner_state_slot_mapping,
-        late_dep,
+        late_dep, late_dep,
     )
     topk_scores, topk_idxs = indexer(
         x,
