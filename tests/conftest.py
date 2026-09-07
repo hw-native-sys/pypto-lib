@@ -14,7 +14,7 @@ real pypto is not importable, so the unit tests can run in a CPU-only CI job
 without building the compiler. The stubs expose the attributes the tests patch,
 the side-effect helpers ``golden/runner.py`` calls on the runtime_dir replay
 path (``invalidate_binary_cache``, ``rebuild_kernel_cpp_from_pto``,
-``configure_log``), and the ``@pl.jit.host`` decorator
+``configure_log`` / ``current_level``), and the ``@pl.jit.host`` decorator
 ``models/qwen3_14b/contract.py`` applies to its serving wrappers. If real pypto
 is installed it is used as-is.
 
@@ -207,7 +207,10 @@ def _install_pypto_stubs() -> None:
     runtime.execute_compiled = _unavailable
     runtime.RunConfig = RunConfig
     runtime.DfxOptions = DfxOptions
+    # golden's run() reads the level before overriding it so it can put the
+    # process-global threshold back afterwards; the stub answers both halves.
     log_config.configure_log = lambda *_a, **_k: None
+    log_config.current_level = lambda: 30  # logging.WARNING
     replay.invalidate_binary_cache = lambda *_a, **_k: None
     pto_rebuild.rebuild_kernel_cpp_from_pto = lambda *_a, **_k: []
     backend.BackendType = BackendType
