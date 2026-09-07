@@ -23,10 +23,9 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        # a2a3sim only. a5sim carries examples, and this workflow sweeps models
-        # exclusively — A5 model coverage is the model-tests-a5 device job. The
-        # matrix stays so a second simulator can be added back in one line.
-        platform: [a2a3sim]
+        # Route the model families to their matching simulator: a2a3sim sweeps
+        # every non-Pro model, while a5sim sweeps only the A5-targeted Pro tree.
+        platform: [a2a3sim, a5sim]
     defaults:
       run:
         working-directory: checkout
@@ -71,6 +70,9 @@ jobs:
           PYTHONPATH: ${{ github.workspace }}/checkout
           PYPTO_LOG_LEVEL: error
           PYPTO_WARNING_LEVEL: none
+          # Keep the Pro simulator leg pinned to the Pro preset even if the
+          # runner environment selects the optional Flash preset.
+          DEEPSEEK_V4_VARIANT: ${{ matrix.platform == 'a5sim' && 'pro' || '' }}
           # Quiet simpler's runtime logger. On a SIMPLER_PROFILING build every
           # simpler_run emits its [STRACE] timing tree at the INFO_V9 tier, and
           # simpler's logger defaults to INFO — so without this the console floods
@@ -98,8 +100,14 @@ jobs:
           # Run every model file once with no extra args. Files marked
           # `# ci: no-sim` (full multi-layer / multi-card forwards) are
           # device-only and would just argparse-reject *sim, so skip them here.
-          for f in $(find models -name '*.py' ! -name '*_draft.py' \
-              ! -path 'models/deepseek_v4_pro/*' | sort); do
+          for f in $(find models -name '*.py' ! -name '*_draft.py' | sort); do
+            # Pro targets Ascend 950: exercise it only on a5sim. Conversely,
+            # keep every non-Pro model on the existing a2a3sim leg.
+            if [ "${{ matrix.platform }}" = "a5sim" ]; then
+              [[ "$f" == models/deepseek_v4_pro/* ]] || continue
+            elif [[ "$f" == models/deepseek_v4_pro/* ]]; then
+              continue
+            fi
             # Shared modules (config.py, helper libs) have no __main__ guard —
             # they are imported by kernels, not run. Running them import-exits 0
             # and shows a misleading pass, so drop them from the report entirely
@@ -311,9 +319,9 @@ jobs:
     # Real Ascend 950 (A5) device job — the dedicated daily coverage of the
     # DeepSeek V4-Pro variant (the Pro preset in models/deepseek_v4_pro/). Mirrors
     # model-tests-a2a3 but runs -p a5 on the npu-a5 self-hosted runner and
-    # sweeps ONLY Pro: Pro is excluded from the a2a3/a2a3sim sweeps above
-    # (it is the A5-targeted variant, so running it on 910B would be
-    # duplicate cost against the wrong backend). It goes through
+    # sweeps ONLY Pro: Pro is covered by a5sim above but remains excluded from
+    # the a2a3/a2a3sim sweeps (it is the A5-targeted variant, so running it on
+    # 910B would be duplicate cost against the wrong backend). It goes through
     # the same setup-ci-job as the other device jobs (needs-device:true);
     # the A5 host's own runner .env supplies its CANN_ROOT / cache roots, so
     # no A5-specific path is named here. NOTE: until the npu-a5 runner is
@@ -835,10 +843,9 @@ jobs:
           python3 - <<'EOF' >> "$GITHUB_STEP_SUMMARY"
           import pathlib
 
-          # Two tables, not one matrix: model-tests-a5 sweeps only
-          # models/deepseek_v4_pro and the other jobs exclude it, so the case
-          # sets are disjoint. A single table makes every row half filler —
-          # 35 Pro rows blank under a2a3/sim, 48 others blank under a5.
+          # Keep the non-Pro A2/A3 cases separate from the Pro A5 cases. The A5
+          # device sweep has one extra device-only case, labelled explicitly in
+          # the A5Sim column when both artifacts are present.
           ICON = {"pass": ":white_check_mark:", "fail": ":x:", "missing": ":heavy_minus_sign:"}
           ROOT = pathlib.Path("results")
 
@@ -865,8 +872,9 @@ jobs:
                   "fails cases still uploads its table."
               )
 
-          def table(title, platforms, timed):
+          def table(title, platforms, timed, expected_absences=None):
               """`timed` is the platform whose effective_us column is shown."""
+              expected_absences = expected_absences or {}
               data = {p: load(p) for p in platforms}
               present = [p for p in platforms if data[p][0] is not None]
               missing = [p for p in platforms if data[p][0] is None]
@@ -887,7 +895,11 @@ jobs:
               for case in sorted({c for p in present for c in data[p][0]}):
                   row = [f"`{case}`"]
                   for p in platforms:
-                      row.append(ICON.get((data[p][0] or {}).get(case, "missing"), "?"))
+                      status = (data[p][0] or {}).get(case, "missing")
+                      if status == "missing" and data[p][0] is not None:
+                          row.append(expected_absences.get((case, p), ICON["missing"]))
+                      else:
+                          row.append(ICON.get(status, "?"))
                       if p == timed:
                           row.append(perf.get(case, "-"))
                   print("| " + " | ".join(row) + " |")
@@ -959,6 +971,11 @@ jobs:
           print("## Daily CI Model Test Results")
           print()
           table("a2a3 and a2a3sim", ["a2a3", "a2a3sim"], "a2a3")
-          table("a5 (DeepSeek V4-Pro)", ["a5"], "a5")
+          table(
+              "a5 and a5sim (DeepSeek V4-Pro)",
+              ["a5", "a5sim"],
+              "a5",
+              {("models/deepseek_v4_pro/prefill_mtp.py", "a5sim"): "only a5"},
+          )
           e2e("a5 DeepSeek-V4-Flash EP8 end-to-end token generation (real weights)", "e2e-a5")
           EOF
