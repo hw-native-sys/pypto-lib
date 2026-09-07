@@ -46,7 +46,7 @@ EPS = M.rms_norm_eps
 MAX_SEQ_LEN = M.max_position_embeddings
 
 # tiling
-Q_PROJ_TILE = 128  # qproj K-tile (Q_LORA reduction)
+Q_PROJ_TILE = 256  # qproj K-tile (Q_LORA reduction)
 QPROJ_MM_N_TILE = 512  # qproj output-column tile
 Q_LORA_TILE = 256  # qr rms-norm / quant N granularity
 KV_TILE = 64  # kv rms-norm / rope / NOPE N granularity
@@ -54,15 +54,17 @@ QUANT_TILE = 256
 T_TILE = 8
 MATMUL_T_TILE = 16
 QR_M_TILE = MATMUL_T_TILE  # qr_proj token (M) tile; cube rows must be a 16-row boxed tile
+QR_DENSE_M_TILE = 64
 QR_N_TILE = 128  # qr_proj Q_LORA (N) per matmul
 QR_K_TILE = 256  # qr_proj D (K) reduction tile   | divides QR_SPLIT_K_TILE
 QR_OK = 2  # qr_proj split-K factor         | D//QR_OK cores share each N-group
 QR_SPLIT_K_TILE = D // QR_OK  # qr_proj K per split (=2048)
 KV_M_TILE = MATMUL_T_TILE  # kv_proj token (M) tile; decode pads from 8 real rows to 16
+KV_DENSE_M_TILE = 64
 KV_N_TILE = 128  # kv_proj HEAD_DIM (N) per matmul
 KV_K_TILE = 256  # kv_proj D (K) reduction tile   | divides KV_SPLIT_K_TILE
 KV_OK = 2  # kv_proj split-K factor         | D//KV_OK cores share each N-group
-KV_OM = 4  # kv_proj split-M factor        | M-tiles fan out KV_OM-fold
+KV_OM = 4  # maximum kv_proj split-M factor
 KV_SPLIT_K_TILE = D // KV_OK  # kv_proj K per split (=2048)
 QPROJ_M_TILE = 64  # dense qproj token tile; fills the 128 KiB L0C accumulator
 # qproj_matmul runs on persistent workers, one per physical AIC.
@@ -77,6 +79,7 @@ Q_ROPE_T_TILE = 8
 # short call sites do not dispatch more blocks than they have work.
 Q_ROPE_WORKERS = 48
 Q_ROPE_H_TILE = 4  # heads per fused qproj dequant/rms/rope task
+Q_DEQUANT_WORKERS = 32
 assert QPROJ_MM_N_TILE * QPROJ_M_TILE * 4 <= 128 * 1024  # L0C Acc cap
 assert QPROJ_M_TILE % QPROJ_TAIL_M_TILE == 0
 
@@ -277,6 +280,7 @@ def q_proj_qr(
         with pl.scope():
             x_view = pl.reshape(x, [t_dim, D])
             qr_t_matmul = ((tile_rows + QR_M_TILE - 1) // QR_M_TILE) * QR_M_TILE
+            qr_full_rows = (tile_rows // QR_DENSE_M_TILE) * QR_DENSE_M_TILE
             qproj_t_matmul = ((tile_rows + QPROJ_TAIL_M_TILE - 1) // QPROJ_TAIL_M_TILE) * QPROJ_TAIL_M_TILE
 
             # Split-K qr_proj (M=t_dim, K=D=4096, N=Q_LORA=1024): QR_N_TILE N-groups expanded
@@ -294,7 +298,18 @@ def q_proj_qr(
             ):
                 q_a_col0 = (qbg_idx // QR_OK) * QR_N_TILE
                 qr_k_base = (qbg_idx % QR_OK) * QR_SPLIT_K_TILE
-                for t0 in pl.range(0, qr_t_matmul, QR_M_TILE):
+                for dense_t0 in pl.range(0, qr_full_rows, QR_DENSE_M_TILE):
+                    dense_x0 = tile_base + dense_t0
+                    dense_first_x = x_view[dense_x0 : dense_x0 + QR_DENSE_M_TILE, qr_k_base : qr_k_base + QR_K_TILE]
+                    dense_first_w = wq_a[qr_k_base : qr_k_base + QR_K_TILE, q_a_col0 : q_a_col0 + QR_N_TILE]
+                    dense_acc = pl.matmul(dense_first_x, dense_first_w, out_dtype=pl.FP32)
+                    for dense_k in pl.pipeline(1, QR_SPLIT_K_TILE // QR_K_TILE, stage=2):
+                        dense_d0 = qr_k_base + dense_k * QR_K_TILE
+                        dense_x = x_view[dense_x0 : dense_x0 + QR_DENSE_M_TILE, dense_d0 : dense_d0 + QR_K_TILE]
+                        dense_w = wq_a[dense_d0 : dense_d0 + QR_K_TILE, q_a_col0 : q_a_col0 + QR_N_TILE]
+                        dense_acc = pl.matmul_acc(dense_acc, dense_x, dense_w)
+                    qr_fp32 = pl.assemble(qr_fp32, dense_acc, [dense_t0, q_a_col0], atomic=pl.AtomicType.Add)
+                for t0 in pl.range(qr_full_rows, qr_t_matmul, QR_M_TILE):
                     q_acc = pl.create_tensor([QR_M_TILE, QR_N_TILE], dtype=pl.FP32)
                     for db in pl.pipeline(QR_SPLIT_K_TILE // QR_K_TILE, stage=2):
                         qr_d0 = qr_k_base + db * QR_K_TILE
@@ -461,12 +476,15 @@ def q_proj_q(
             q_flat = pl.reshape(q, [t_dim, H * HEAD_DIM])
             # No fence needed: it reads q_proj_i32, so it already trails qproj_matmul,
             # which sits at the tail of the caller's cube chain.
-            for hg_idx in pl.spmd(
-                H // Q_ROPE_H_TILE, name_hint="qproj_dequant_rms_nope_rope",
+            for dq_worker in pl.spmd(
+                Q_DEQUANT_WORKERS, name_hint="qproj_dequant_rms_nope_rope",
                 allow_early_resolve=True,
             ):
-                hg = hg_idx * Q_ROPE_H_TILE
-                for tg in pl.range(0, tile_rows, Q_ROPE_T_TILE):
+                for dq_work in pl.range(
+                    dq_worker, ((tile_rows + Q_ROPE_T_TILE - 1) // Q_ROPE_T_TILE) * (H // Q_ROPE_H_TILE), Q_DEQUANT_WORKERS,
+                ):
+                    hg = (dq_work % (H // Q_ROPE_H_TILE)) * Q_ROPE_H_TILE
+                    tg = (dq_work // (H // Q_ROPE_H_TILE)) * Q_ROPE_T_TILE
                     out_tg = tile_base + tg
                     if tg + Q_ROPE_T_TILE <= tile_rows:
                         qr_scale_dq_t = qr_scale_pad_store[tg : tg + Q_ROPE_T_TILE, :]
@@ -642,6 +660,8 @@ def kv_proj_rope(
         with pl.scope():
             x_view = pl.reshape(x, [t_dim, D])
             t_matmul = ((tile_rows + MATMUL_T_TILE - 1) // MATMUL_T_TILE) * MATMUL_T_TILE
+            kv_full_rows = (tile_rows // KV_DENSE_M_TILE) * KV_DENSE_M_TILE
+            kv_m_groups = pl.min(KV_OM, pl.max(1, tile_rows // (2 * KV_DENSE_M_TILE)))
 
             # Split-K kv_proj: KV_N_TILE N-groups expanded KV_OK-fold into cube blocks that
             # atomic-add their K partials into a zero-seeded output.
@@ -652,15 +672,26 @@ def kv_proj_rope(
                         kv_seed = pl.full([KV_M_TILE, KV_N_TILE], dtype=pl.FP32, value=0.0)
                         kv_fp32[kts0 : kts0 + KV_M_TILE, kvseed0 : kvseed0 + KV_N_TILE] = kv_seed
 
-            # `late_dep` fences kv_proj one hop behind rms_norm so qr_proj_matmul takes the cores first.
+            # KV projection consumes the caller's readiness dependency.
             with pl.spmd(
-                (HEAD_DIM // KV_N_TILE) * KV_OK * KV_OM, name_hint="kv_proj_matmul", deps=[late_dep],
+                (HEAD_DIM // KV_N_TILE) * KV_OK * kv_m_groups, name_hint="kv_proj_matmul", deps=[late_dep],
             ) as _kv_tid:
                 kbg = pl.tile.get_block_idx()
-                kv_col0 = (kbg // (KV_OK * KV_OM)) * KV_N_TILE
-                kv_k_base = ((kbg // KV_OM) % KV_OK) * KV_SPLIT_K_TILE
-                kv_m_group = kbg % KV_OM
-                for t0 in pl.range(kv_m_group * KV_M_TILE, t_matmul, KV_OM * KV_M_TILE):
+                kv_col0 = (kbg // (KV_OK * kv_m_groups)) * KV_N_TILE
+                kv_k_base = ((kbg // kv_m_groups) % KV_OK) * KV_SPLIT_K_TILE
+                kv_m_group = kbg % kv_m_groups
+                for dense_t0 in pl.range(kv_m_group * KV_DENSE_M_TILE, kv_full_rows, kv_m_groups * KV_DENSE_M_TILE):
+                    dense_x0 = tile_base + dense_t0
+                    dense_first_x = x_view[dense_x0 : dense_x0 + KV_DENSE_M_TILE, kv_k_base : kv_k_base + KV_K_TILE]
+                    dense_first_w = wkv[kv_k_base : kv_k_base + KV_K_TILE, kv_col0 : kv_col0 + KV_N_TILE]
+                    dense_acc = pl.matmul(dense_first_x, dense_first_w, out_dtype=pl.FP32)
+                    for dense_k in pl.pipeline(1, KV_SPLIT_K_TILE // KV_K_TILE, stage=2):
+                        dense_d0 = kv_k_base + dense_k * KV_K_TILE
+                        dense_x = x_view[dense_x0 : dense_x0 + KV_DENSE_M_TILE, dense_d0 : dense_d0 + KV_K_TILE]
+                        dense_w = wkv[dense_d0 : dense_d0 + KV_K_TILE, kv_col0 : kv_col0 + KV_N_TILE]
+                        dense_acc = pl.matmul_acc(dense_acc, dense_x, dense_w)
+                    kv_fp32 = pl.assemble(kv_fp32, dense_acc, [dense_t0, kv_col0], atomic=pl.AtomicType.Add)
+                for t0 in pl.range(kv_full_rows + kv_m_group * KV_M_TILE, t_matmul, kv_m_groups * KV_M_TILE):
                     kv_acc = pl.create_tensor([KV_M_TILE, KV_N_TILE], dtype=pl.FP32)
                     for db in pl.pipeline(KV_SPLIT_K_TILE // KV_K_TILE, stage=2):
                         d0 = kv_k_base + db * KV_K_TILE

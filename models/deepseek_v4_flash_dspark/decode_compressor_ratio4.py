@@ -74,34 +74,21 @@ RMS_PAD_TILE = 16  # 16-row block of B (min M for FP32 vec ops)
 
 
 @pl.jit.inline(auto_scope=False)
-def compressor_ratio4_pool(
+def compressor_ratio4_project(
     x: pl.Tensor[[T_DYN, D], pl.BF16],
-    compress_state: pl.Tensor[[COMPRESS_STATE_BLOCK_NUM_DYN, COMPRESS_STATE_BLOCK_SIZE, COMPRESS_STATE_DIM], pl.FP32],
-    compress_state_block_table: pl.Tensor[[B_DYN, COMPRESS_STATE_MAX_BLOCKS], pl.INT32],
     wkv: pl.Tensor[[OUT_DIM, D], pl.BF16],
     wgate: pl.Tensor[[OUT_DIM, D], pl.BF16],
-    ape: pl.Tensor[[COMPRESS_RATIO, OUT_DIM], pl.FP32],
-    position_ids: pl.Tensor[[T_DYN], pl.INT32],
-    pooled_kv: pl.Out[pl.Tensor[[BS_PAD, HEAD_DIM], pl.FP32]],
-    kv_proj_pad: pl.Out[pl.Tensor[[BS_PAD, OUT_DIM], pl.FP32]],
-    score_proj_pad: pl.Out[pl.Tensor[[BS_PAD, OUT_DIM], pl.FP32]],
+    kv_proj_pad: pl.Tensor[[BS_PAD, OUT_DIM], pl.FP32],
+    score_proj_pad: pl.Tensor[[BS_PAD, OUT_DIM], pl.FP32],
     late_dep: pl.Scalar[pl.TASK_ID],
 ):
-    """Projection and pooling -- everything up to the pooled KV rows.
-
-    Split out of compressor_ratio4 so a caller can defer the state commit and the
-    cache write behind a task that must not share cores with them.
-    """
-    b_dim = pl.tensor.dim(compress_state_block_table, 0)
+    """Project token-local compressor values and scores in FP32."""
     bs = pl.tensor.dim(x, 0)
-    s_dim = bs // b_dim
-    t_matmul = ((bs + MM_B_TILE - 1) // MM_B_TILE) * MM_B_TILE  # ceil to whole 16-row cube tiles
+    t_matmul = ((bs + MM_B_TILE - 1) // MM_B_TILE) * MM_B_TILE
     x_flat = x
+
     cmp4_kv_proj_pad = kv_proj_pad
     cmp4_score_proj_pad = score_proj_pad
-    compress_state_block_num = pl.tensor.dim(compress_state, 0)
-    compress_state_rows = compress_state_block_num * COMPRESS_STATE_BLOCK_SIZE
-    compress_state_flat = pl.reshape(compress_state, [compress_state_rows, COMPRESS_STATE_DIM])
 
     # Caller-ordered KV and score projections.
     with pl.spmd(
@@ -130,7 +117,32 @@ def compressor_ratio4_pool(
             cmp4_kv_proj_pad[global_row0 : global_row0 + MM_B_TILE, o0 : o0 + OUT_TILE] = kv_acc
             cmp4_score_proj_pad[global_row0 : global_row0 + MM_B_TILE, o0 : o0 + OUT_TILE] = score_acc
 
-    # Ratio-4 state-ring pooling.
+    return _kv_score_tid
+
+
+@pl.jit.inline(auto_scope=False)
+def compressor_ratio4_pool_projected(
+    compress_state: pl.Tensor[[COMPRESS_STATE_BLOCK_NUM_DYN, COMPRESS_STATE_BLOCK_SIZE, COMPRESS_STATE_DIM], pl.FP32],
+    compress_state_block_table: pl.Tensor[[B_DYN, COMPRESS_STATE_MAX_BLOCKS], pl.INT32],
+    ape: pl.Tensor[[COMPRESS_RATIO, OUT_DIM], pl.FP32],
+    position_ids: pl.Tensor[[T_DYN], pl.INT32],
+    pooled_kv: pl.Out[pl.Tensor[[BS_PAD, HEAD_DIM], pl.FP32]],
+    kv_proj_pad: pl.Out[pl.Tensor[[BS_PAD, OUT_DIM], pl.FP32]],
+    score_proj_pad: pl.Out[pl.Tensor[[BS_PAD, OUT_DIM], pl.FP32]],
+    late_dep: pl.Scalar[pl.TASK_ID],
+):
+    """Pool full-stream projected values and scores against the state ring."""
+    b_dim = pl.tensor.dim(compress_state_block_table, 0)
+    bs = pl.tensor.dim(position_ids, 0)
+    s_dim = bs // b_dim
+    cmp4_kv_proj_pad = kv_proj_pad
+    cmp4_score_proj_pad = score_proj_pad
+    compress_state_block_num = pl.tensor.dim(compress_state, 0)
+    compress_state_rows = compress_state_block_num * COMPRESS_STATE_BLOCK_SIZE
+    compress_state_flat = pl.reshape(compress_state, [compress_state_rows, COMPRESS_STATE_DIM])
+
+    _kv_score_tid = late_dep
+
     with pl.spmd(POOL_WORKERS, name_hint="scatter_softmax_pool", deps=[_kv_score_tid]) as pool_tid:
         pool_worker = pl.tile.get_block_idx()
         for c_idx in pl.range(pool_worker, b_dim, POOL_WORKERS):
@@ -209,8 +221,32 @@ def compressor_ratio4_pool(
 
 
 @pl.jit.inline(auto_scope=False)
-def compressor_ratio4_cache_write(
+def compressor_ratio4_pool(
     x: pl.Tensor[[T_DYN, D], pl.BF16],
+    compress_state: pl.Tensor[[COMPRESS_STATE_BLOCK_NUM_DYN, COMPRESS_STATE_BLOCK_SIZE, COMPRESS_STATE_DIM], pl.FP32],
+    compress_state_block_table: pl.Tensor[[B_DYN, COMPRESS_STATE_MAX_BLOCKS], pl.INT32],
+    wkv: pl.Tensor[[OUT_DIM, D], pl.BF16],
+    wgate: pl.Tensor[[OUT_DIM, D], pl.BF16],
+    ape: pl.Tensor[[COMPRESS_RATIO, OUT_DIM], pl.FP32],
+    position_ids: pl.Tensor[[T_DYN], pl.INT32],
+    pooled_kv: pl.Out[pl.Tensor[[BS_PAD, HEAD_DIM], pl.FP32]],
+    kv_proj_pad: pl.Out[pl.Tensor[[BS_PAD, OUT_DIM], pl.FP32]],
+    score_proj_pad: pl.Out[pl.Tensor[[BS_PAD, OUT_DIM], pl.FP32]],
+    late_dep: pl.Scalar[pl.TASK_ID],
+):
+    """Project, then pool and commit the token stream."""
+    projection_tid = compressor_ratio4_project(
+        x, wkv, wgate, kv_proj_pad, score_proj_pad, late_dep,
+    )
+    pool_tid, projection_ready_tid = compressor_ratio4_pool_projected(
+        compress_state, compress_state_block_table, ape, position_ids,
+        pooled_kv, kv_proj_pad, score_proj_pad, projection_tid,
+    )
+    return pool_tid, projection_ready_tid
+
+
+@pl.jit.inline(auto_scope=False)
+def compressor_ratio4_cache_write(
     kv: pl.Tensor[[T_DYN, HEAD_DIM], pl.FP32],
     pooled_kv: pl.Tensor[[BS_PAD, HEAD_DIM], pl.FP32],
     norm_w: pl.Tensor[[HEAD_DIM], pl.BF16],
@@ -230,7 +266,7 @@ def compressor_ratio4_cache_write(
 ):
     """State commit, RMSNorm + RoPE over the pooled rows, and the compressed KV cache write."""
     b_dim = pl.tensor.dim(compress_state_block_table, 0)
-    bs = pl.tensor.dim(x, 0)
+    bs = pl.tensor.dim(position_ids, 0)
     s_dim = bs // b_dim
     rms_blocks = (bs + RMS_PAD_TILE - 1) // RMS_PAD_TILE
     cmp_block_num = pl.tensor.dim(cmp_kv_cache, 0)
@@ -340,7 +376,7 @@ def compressor_ratio4(
         late_dep,
     )
     cache_write_tid = compressor_ratio4_cache_write(
-        x, kv, pooled_kv, norm_w, cos, sin, cmp_kv_cache, cmp_slot_mapping,
+        kv, pooled_kv, norm_w, cos, sin, cmp_kv_cache, cmp_slot_mapping,
         compress_state, compress_state_block_table, ape,
         kv_proj_pad, score_proj_pad, position_ids, state_slot_mapping,
         pool_tid, pool_tid,

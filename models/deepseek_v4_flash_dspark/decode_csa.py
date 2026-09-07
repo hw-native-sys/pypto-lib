@@ -53,13 +53,15 @@ from decode_compressor_ratio4 import (
     BS_PAD as CMP_BS_PAD,
     compressor_ratio4,
     compressor_ratio4_cache_write,
-    compressor_ratio4_pool,
+    compressor_ratio4_project,
+    compressor_ratio4_pool_projected,
 )
-from decode_cp_token_allgather import (
+from decode_cp_allgather import (
+    decode_cp_csa_aux_allgather_step,
     KV_B_DYN,
     KV_T_DYN,
     DECODE_GROUP_CAP,
-    decode_cp_token_allgather_step,
+    decode_cp_projection_allgather_step,
 )
 from hc_post import hc_post
 from hc_pre import hc_pre
@@ -73,7 +75,8 @@ from decode_indexer import (
 from decode_indexer_compressor import (
     BS_PAD as IDX_CMP_BS_PAD,
     indexer_compressor,
-    indexer_compressor_pool,
+    indexer_compressor_project,
+    indexer_compressor_pool_projected,
     indexer_compressor_write,
 )
 from qkv_proj_rope import (
@@ -309,16 +312,7 @@ def decode_csa(
     x_normed_t = pl.create_tensor([t_dim, D], dtype=pl.BF16)
     rms_tid = rms_norm(x_mixed, attn_norm_w, x_normed_t)
 
-    # TP gathered post-norm token stream.
     kv_wb_blocks = kv_dim // CSA_WB_TOKEN_TILE
-    x_normed_full = pl.create_tensor([kv_dim, D], dtype=pl.BF16)
-    # Gathered token-stream handle.
-    _gathered_normed, gather_signal, gather_done_tid = decode_cp_token_allgather_step(
-        x_normed_t, x_normed_full,
-        gather_window, gather_signal,
-        group_base, tp_rank,
-        rms_tid,
-    )
 
     kv_full = pl.create_tensor([kv_dim, HEAD_DIM], dtype=pl.BF16)
     qr = pl.create_tensor([t_dim, Q_LORA], dtype=pl.INT8)
@@ -328,11 +322,7 @@ def decode_csa(
     attn_out = pl.create_tensor([t_dim, D], dtype=pl.BF16)
     with pl.scope():
         # Gathered-stream projection chain.
-        gather_dep = pl.system.task_dummy(deps=[rope_tid, gather_done_tid])
-        kv_cos_il = pl.create_tensor([kv_dim, ROPE_HEAD_DIM], dtype=pl.FP32)
-        kv_sin_signed = pl.create_tensor([kv_dim, ROPE_HEAD_DIM], dtype=pl.FP32)
-        kv_swap_idx = pl.create_tensor([kv_dim, ROPE_HEAD_DIM], dtype=pl.INT32)
-        rope_prepare(freqs_cos, freqs_sin, kv_cos_il, kv_sin_signed, kv_swap_idx)
+        projection_dep = pl.system.task_dummy(deps=[rope_tid, rms_tid])
 
         q_cos_il = pl.create_tensor([t_dim, ROPE_HEAD_DIM], dtype=pl.FP32)
         q_sin_signed = pl.create_tensor([t_dim, ROPE_HEAD_DIM], dtype=pl.FP32)
@@ -380,30 +370,92 @@ def decode_csa(
         cmp_kv_proj_pad = pl.create_tensor([CMP_BS_PAD, MAIN_OUT_DIM], dtype=pl.FP32)
         cmp_score_proj_pad = pl.create_tensor([CMP_BS_PAD, MAIN_OUT_DIM], dtype=pl.FP32)
         idx_normed_kv = pl.create_tensor([IDX_CMP_BS_PAD, IDX_HEAD_DIM], dtype=pl.BF16)
-        idx_kv_score_tid, idx_rms_tid = indexer_compressor_pool(
-            x_normed_full,
+        cmp_values_local = pl.create_tensor([CMP_BS_PAD, MAIN_OUT_DIM], dtype=pl.FP32)
+        cmp_scores_local = pl.create_tensor([CMP_BS_PAD, MAIN_OUT_DIM], dtype=pl.FP32)
+        idx_values_local = pl.create_tensor([IDX_CMP_BS_PAD, 2 * IDX_HEAD_DIM], dtype=pl.FP32)
+        idx_scores_local = pl.create_tensor([IDX_CMP_BS_PAD, 2 * IDX_HEAD_DIM], dtype=pl.FP32)
+        idx_projection_tid = indexer_compressor_project(
+            x_normed_t, inner_wkv, inner_wgate, idx_values_local, idx_scores_local,
+            projection_dep, idx_qr_mm_tid,
+        )
+        cmp_projection_tid = compressor_ratio4_project(
+            x_normed_t, cmp_wkv, cmp_wgate, cmp_values_local, cmp_scores_local,
+            idx_projection_tid,
+        )
+        kv_local = pl.create_tensor([t_dim, HEAD_DIM], dtype=pl.BF16)
+        kv_proj_rope(
+            x_normed_t, wkv, gamma_ckv,
+            q_cos_il, q_sin_signed, q_swap_idx,
+            kv_local, rms_tid,
+        )
+        main_projection_local = pl.create_tensor([t_dim, D], dtype=pl.BF16)
+        aux_projection_local = pl.create_tensor([t_dim, 1536], dtype=pl.BF16)
+        with pl.spmd(16, name_hint="csa_main_projection_pack", deps=[cmp_projection_tid]) as main_pack_tid:
+            pack_worker = pl.tile.get_block_idx()
+            for pack_row in pl.range(pack_worker * 8, t_dim, 16 * 8):
+                cmp_value_bits = pl.reinterpret_view(cmp_values_local[pack_row : pack_row + 8, :], pl.BF16)
+                cmp_score_bits = pl.reinterpret_view(cmp_scores_local[pack_row : pack_row + 8, :], pl.BF16)
+                main_projection_local[pack_row : pack_row + 8, 0:2048] = cmp_value_bits
+                main_projection_local[pack_row : pack_row + 8, 2048:4096] = cmp_score_bits
+        with pl.spmd(16, name_hint="csa_aux_projection_pack", deps=[idx_projection_tid]) as aux_pack_tid:
+            pack_worker = pl.tile.get_block_idx()
+            for pack_row in pl.range(pack_worker * 8, t_dim, 16 * 8):
+                idx_value_bits = pl.reinterpret_view(idx_values_local[pack_row : pack_row + 8, :], pl.BF16)
+                idx_score_bits = pl.reinterpret_view(idx_scores_local[pack_row : pack_row + 8, :], pl.BF16)
+                aux_projection_local[pack_row : pack_row + 8, 0:512] = idx_value_bits
+                aux_projection_local[pack_row : pack_row + 8, 512:1024] = idx_score_bits
+                aux_projection_local[pack_row : pack_row + 8, 1024:1536] = kv_local[pack_row : pack_row + 8, :]
+        aux_projection_full = pl.create_tensor([kv_dim, 1536], dtype=pl.BF16)
+        _aux_full, gather_signal, aux_gather_tid = decode_cp_csa_aux_allgather_step(
+            aux_projection_local, aux_projection_full, gather_window, gather_signal,
+            group_base, tp_rank, aux_pack_tid,
+        )
+        main_projection_full = pl.create_tensor([kv_dim, D], dtype=pl.BF16)
+        main_gather_dep = pl.system.task_dummy(deps=[aux_gather_tid, main_pack_tid])
+        _main_full, gather_signal, main_gather_tid = decode_cp_projection_allgather_step(
+            main_projection_local, main_projection_full, gather_window, gather_signal,
+            group_base, tp_rank, main_gather_dep,
+        )
+        idx_values_full = pl.create_tensor([IDX_CMP_BS_PAD, 2 * IDX_HEAD_DIM], dtype=pl.FP32)
+        idx_scores_full = pl.create_tensor([IDX_CMP_BS_PAD, 2 * IDX_HEAD_DIM], dtype=pl.FP32)
+        with pl.spmd(16, name_hint="csa_aux_projection_unpack", deps=[aux_gather_tid]) as kv_gather_done_tid:
+            unpack_worker = pl.tile.get_block_idx()
+            for unpack_row in pl.range(unpack_worker * 8, kv_dim, 16 * 8):
+                idx_value_fp32 = pl.reinterpret_view(aux_projection_full[unpack_row : unpack_row + 8, 0:512], pl.FP32)
+                idx_score_fp32 = pl.reinterpret_view(aux_projection_full[unpack_row : unpack_row + 8, 512:1024], pl.FP32)
+                idx_values_full[unpack_row : unpack_row + 8, :] = idx_value_fp32
+                idx_scores_full[unpack_row : unpack_row + 8, :] = idx_score_fp32
+                kv_full[unpack_row : unpack_row + 8, :] = aux_projection_full[unpack_row : unpack_row + 8, 1024:1536]
+        with pl.spmd(16, name_hint="csa_main_projection_unpack", deps=[main_gather_tid]) as main_unpack_tid:
+            unpack_worker = pl.tile.get_block_idx()
+            for unpack_row in pl.range(unpack_worker * 8, kv_dim, 16 * 8):
+                cmp_value_fp32 = pl.reinterpret_view(main_projection_full[unpack_row : unpack_row + 8, 0:2048], pl.FP32)
+                cmp_score_fp32 = pl.reinterpret_view(main_projection_full[unpack_row : unpack_row + 8, 2048:4096], pl.FP32)
+                cmp_kv_proj_pad[unpack_row : unpack_row + 8, :] = cmp_value_fp32
+                cmp_score_proj_pad[unpack_row : unpack_row + 8, :] = cmp_score_fp32
+        idx_kv_score_tid, idx_rms_tid = indexer_compressor_pool_projected(
+            idx_values_full, idx_scores_full,
             inner_compress_state, inner_state_table,
-            inner_wkv, inner_wgate, inner_ape, inner_norm_w,
+            inner_ape, inner_norm_w,
             cmp_cos_il_full, cmp_sin_signed_full,
             cmp_positions, inner_state_slots, idx_normed_kv,
-            gather_dep, idx_qr_mm_tid,
+            kv_gather_done_tid, idx_qr_mm_tid,
         )
-        cmp_pool_tid, cmp_kv_score_tid = compressor_ratio4_pool(
-            x_normed_full,
+        cmp_pool_tid, cmp_kv_score_tid = compressor_ratio4_pool_projected(
             compress_state, cmp_state_table,
-            cmp_wkv, cmp_wgate, cmp_ape,
+            cmp_ape,
             cmp_positions, cmp_pooled_kv, cmp_kv_proj_pad, cmp_score_proj_pad,
-            idx_kv_score_tid,
+            main_unpack_tid,
         )
         qh_mm_tid, qh_quant_tid = indexer_qr_hadamard_mm(
             x_normed_t, qr_bf16, hadamard_idx,
-            qr_hadamard_i8, qr_hadamard_scale_dq, cmp_kv_score_tid,
+            qr_hadamard_i8, qr_hadamard_scale_dq, cmp_projection_tid,
         )
 
         # Indexer KV cache projection.
         idx_kv_unused = pl.create_tensor([kv_dim, IDX_HEAD_DIM], dtype=pl.FP32)
         idx_hadamard_tid, idx_cache_write_tid = indexer_compressor_write(
-            x_normed_full, idx_kv_unused, idx_normed_kv, hadamard_idx,
+            idx_kv_unused, idx_normed_kv, hadamard_idx,
             idx_kv_cache, idx_kv_scale, idx_slots, cmp_positions,
             idx_rms_tid, qh_mm_tid,
         )
@@ -418,26 +470,20 @@ def decode_csa(
             idx_kv_cache, idx_kv_scale, idx_block_table,
             idx_topk_scores, idx_topk,
             idx_positions, kv_seq_lens,
-            idx_cache_write_tid, cmp_kv_score_tid, qh_quant_tid,
+            idx_cache_write_tid, cmp_projection_tid, qh_quant_tid,
         )
 
         # Indexer score and Top-K selection.
         compressor_ratio4_cache_write(
-            x_normed_full, cmp_out, cmp_pooled_kv, cmp_norm_w,
+            cmp_out, cmp_pooled_kv, cmp_norm_w,
             cmp_cos_il_full, cmp_sin_signed_full, cmp_kv, cmp_slots,
             compress_state, cmp_state_table, cmp_ape,
             cmp_kv_proj_pad, cmp_score_proj_pad, cmp_positions, cmp_state_slots,
             cmp_pool_tid, leaf_tid,
         )
-        kv_proj_rope(
-            x_normed_full, wkv, gamma_ckv,
-            kv_cos_il, kv_sin_signed, kv_swap_idx,
-            kv_full, leaf_tid,
-        )
-
         ori_block_num = pl.tensor.dim(kv_cache, 0)
         kv_cache_flat = pl.reshape(kv_cache, [ori_block_num * BLOCK_SIZE, HEAD_DIM])
-        with pl.spmd(CSA_WB_WORKERS, name_hint="csa_cache_writeback"):
+        with pl.spmd(CSA_WB_WORKERS, name_hint="csa_cache_writeback", deps=[kv_gather_done_tid]):
             wb_worker = pl.tile.get_block_idx()
             for wb_blk in pl.range(wb_worker, kv_wb_blocks, CSA_WB_WORKERS):
                 wb_t0 = wb_blk * CSA_WB_TOKEN_TILE
@@ -1696,7 +1742,7 @@ def build_distributed_tensor_specs(local_t, start_pos=None):
     import torch
 
     from golden import ScalarSpec, TensorSpec
-    from decode_cp_token_allgather import cp_split, cp_stack, materialize_spec
+    from decode_cp_allgather import cp_split, cp_stack, materialize_spec
 
     if (local_t < ROPE_CS_T_TILE or local_t > LOCAL_T
             or local_t % ROPE_CS_T_TILE != 0 or local_t % S != 0):

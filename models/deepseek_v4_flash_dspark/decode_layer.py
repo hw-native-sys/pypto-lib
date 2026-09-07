@@ -52,7 +52,7 @@ import decode_swa as swa
 import moe as moe_module
 import pypto.language as pl
 import pypto.language.distributed as pld
-from decode_cp_token_allgather import (
+from decode_cp_allgather import (
     KV_B_DYN,
     KV_T_DYN,
     DECODE_GROUP_CAP,

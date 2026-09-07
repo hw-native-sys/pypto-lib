@@ -108,38 +108,19 @@ POOL_PAGE_STEPS = COMPRESS_STATE_BLOCK_SIZE // POOL_STATE_TILE
 POOL_STATE_STEPS = STATE_LEN // POOL_STATE_TILE
 
 
-@pl.jit.inline
-def compressor_ratio128(
+@pl.jit.inline(auto_scope=False)
+def compressor_ratio128_project(
     x: pl.Tensor[[T_DYN, D], pl.BF16],
-    kv: pl.Tensor[[T_DYN, HEAD_DIM], pl.FP32],
-    compress_state: pl.Tensor[[COMPRESS_STATE_BLOCK_NUM_DYN, COMPRESS_STATE_BLOCK_SIZE, COMPRESS_STATE_DIM], pl.FP32],
-    compress_state_block_table: pl.Tensor[[B_DYN, COMPRESS_STATE_MAX_BLOCKS_DYN], pl.INT32],
     wkv: pl.Tensor[[OUT_DIM, D], pl.BF16],
     wgate: pl.Tensor[[OUT_DIM, D], pl.BF16],
-    ape: pl.Tensor[[COMPRESS_RATIO, OUT_DIM], pl.FP32],
-    norm_w: pl.Tensor[[HEAD_DIM], pl.BF16],
-    # Interleave-duplicated (j>>1) cos and sign-folded sin, built once by the caller:
-    #   cos[j] = cos_half[j>>1];  sin[j] = sin_half[j>>1] * sign[j], sign = [-1,+1,...]
-    cos: pl.Tensor[[B_DYN, ROPE_HEAD_DIM], pl.FP32],
-    sin: pl.Tensor[[B_DYN, ROPE_HEAD_DIM], pl.FP32],
-    cmp_kv_cache: pl.Tensor[[CMP_BLOCK_NUM_DYN, BLOCK_SIZE, 1, HEAD_DIM], pl.BF16],
-    position_ids: pl.Tensor[[T_DYN], pl.INT32],
-    cmp_slot_mapping: pl.Tensor[[T_DYN], pl.INT64],
-    state_slot_mapping: pl.Tensor[[T_DYN], pl.INT64],
+    kv_proj_pad: pl.Tensor[[BS_PAD, OUT_DIM], pl.FP32],
+    score_proj_pad: pl.Tensor[[BS_PAD, OUT_DIM], pl.FP32],
     late_dep: pl.Scalar[pl.TASK_ID],
-    rope_ready_dep: pl.Scalar[pl.TASK_ID],
-) -> tuple[pl.Tensor, pl.Scalar[pl.TASK_ID]]:
-    b_dim = pl.tensor.dim(compress_state_block_table, 0)
+):
+    """Project token-local compressor values and scores in FP32."""
     bs = pl.tensor.dim(x, 0)
-    s_dim = bs // b_dim
-    compress_state_block_num = pl.tensor.dim(compress_state, 0)
-    cmp_block_num = pl.tensor.dim(cmp_kv_cache, 0)
-
+    t_matmul = ((bs + MM_B_TILE - 1) // MM_B_TILE) * MM_B_TILE
     x_flat = x
-    t_matmul = ((bs + MM_B_TILE - 1) // MM_B_TILE) * MM_B_TILE  # ceil to whole 16-row cube tiles
-    rms_blocks = (b_dim + RMS_PAD_TILE - 1) // RMS_PAD_TILE
-    kv_proj_pad = pl.create_tensor([BS_PAD, OUT_DIM], dtype=pl.FP32)
-    score_proj_pad = pl.create_tensor([BS_PAD, OUT_DIM], dtype=pl.FP32)
 
     group_rows = MM_B_TILE * KV_SCORE_T_GROUP
     t_groups = (t_matmul + group_rows - 1) // group_rows
@@ -174,10 +155,42 @@ def compressor_ratio128(
                 kv_proj_pad[global_row0 : global_row0 + MM_B_TILE, o0 : o0 + OUT_TILE] = kv_acc
                 score_proj_pad[global_row0 : global_row0 + MM_B_TILE, o0 : o0 + OUT_TILE] = score_acc
 
+    return _kv_score_tid
+
+
+@pl.jit.inline
+def compressor_ratio128_projected(
+    kv_proj_pad: pl.Tensor[[BS_PAD, OUT_DIM], pl.FP32],
+    score_proj_pad: pl.Tensor[[BS_PAD, OUT_DIM], pl.FP32],
+    kv: pl.Tensor[[T_DYN, HEAD_DIM], pl.FP32],
+    compress_state: pl.Tensor[[COMPRESS_STATE_BLOCK_NUM_DYN, COMPRESS_STATE_BLOCK_SIZE, COMPRESS_STATE_DIM], pl.FP32],
+    compress_state_block_table: pl.Tensor[[B_DYN, COMPRESS_STATE_MAX_BLOCKS_DYN], pl.INT32],
+    ape: pl.Tensor[[COMPRESS_RATIO, OUT_DIM], pl.FP32],
+    norm_w: pl.Tensor[[HEAD_DIM], pl.BF16],
+    # Interleave-duplicated (j>>1) cos and sign-folded sin, built once by the caller:
+    #   cos[j] = cos_half[j>>1];  sin[j] = sin_half[j>>1] * sign[j], sign = [-1,+1,...]
+    cos: pl.Tensor[[B_DYN, ROPE_HEAD_DIM], pl.FP32],
+    sin: pl.Tensor[[B_DYN, ROPE_HEAD_DIM], pl.FP32],
+    cmp_kv_cache: pl.Tensor[[CMP_BLOCK_NUM_DYN, BLOCK_SIZE, 1, HEAD_DIM], pl.BF16],
+    position_ids: pl.Tensor[[T_DYN], pl.INT32],
+    cmp_slot_mapping: pl.Tensor[[T_DYN], pl.INT64],
+    state_slot_mapping: pl.Tensor[[T_DYN], pl.INT64],
+    late_dep: pl.Scalar[pl.TASK_ID],
+    rope_ready_dep: pl.Scalar[pl.TASK_ID],
+) -> tuple[pl.Tensor, pl.Scalar[pl.TASK_ID]]:
+    """Pool projected HCA rows, commit state, and update compressed KV."""
+    b_dim = pl.tensor.dim(compress_state_block_table, 0)
+    bs = pl.tensor.dim(position_ids, 0)
+    s_dim = bs // b_dim
+    compress_state_block_num = pl.tensor.dim(compress_state, 0)
+    cmp_block_num = pl.tensor.dim(cmp_kv_cache, 0)
+
+    rms_blocks = (b_dim + RMS_PAD_TILE - 1) // RMS_PAD_TILE
+
     compress_state_rows_num = compress_state_block_num * COMPRESS_STATE_BLOCK_SIZE
     compress_state_rows = pl.reshape(compress_state, [compress_state_rows_num, COMPRESS_STATE_DIM])
     pooled_kv = pl.create_tensor([RMS_PAD_ROWS, HEAD_DIM], dtype=pl.FP32)
-    with pl.spmd(b_dim, name_hint="scatter_softmax_pool") as pool_tid:
+    with pl.spmd(b_dim, name_hint="scatter_softmax_pool", deps=[late_dep]) as pool_tid:
         request_idx = pl.tile.get_block_idx()
         for s_sc in pl.pipeline(s_dim, stage=2):
             proj_row = request_idx * s_dim + s_sc
@@ -305,6 +318,42 @@ def compressor_ratio128(
                     kv_flat[global_c_idx * s_dim : global_c_idx * s_dim + 1, :] = kv_row
                     cmp_kv_cache_flat[cmp_row : cmp_row + 1, :] = pl.cast(kv_row, target_type=pl.BF16, mode="rint")
 
+    return kv, cache_write_tid
+
+
+@pl.jit.inline
+def compressor_ratio128(
+    x: pl.Tensor[[T_DYN, D], pl.BF16],
+    kv: pl.Tensor[[T_DYN, HEAD_DIM], pl.FP32],
+    compress_state: pl.Tensor[[COMPRESS_STATE_BLOCK_NUM_DYN, COMPRESS_STATE_BLOCK_SIZE, COMPRESS_STATE_DIM], pl.FP32],
+    compress_state_block_table: pl.Tensor[[B_DYN, COMPRESS_STATE_MAX_BLOCKS_DYN], pl.INT32],
+    wkv: pl.Tensor[[OUT_DIM, D], pl.BF16],
+    wgate: pl.Tensor[[OUT_DIM, D], pl.BF16],
+    ape: pl.Tensor[[COMPRESS_RATIO, OUT_DIM], pl.FP32],
+    norm_w: pl.Tensor[[HEAD_DIM], pl.BF16],
+    # Interleave-duplicated (j>>1) cos and sign-folded sin, built once by the caller:
+    #   cos[j] = cos_half[j>>1];  sin[j] = sin_half[j>>1] * sign[j], sign = [-1,+1,...]
+    cos: pl.Tensor[[B_DYN, ROPE_HEAD_DIM], pl.FP32],
+    sin: pl.Tensor[[B_DYN, ROPE_HEAD_DIM], pl.FP32],
+    cmp_kv_cache: pl.Tensor[[CMP_BLOCK_NUM_DYN, BLOCK_SIZE, 1, HEAD_DIM], pl.BF16],
+    position_ids: pl.Tensor[[T_DYN], pl.INT32],
+    cmp_slot_mapping: pl.Tensor[[T_DYN], pl.INT64],
+    state_slot_mapping: pl.Tensor[[T_DYN], pl.INT64],
+    late_dep: pl.Scalar[pl.TASK_ID],
+    rope_ready_dep: pl.Scalar[pl.TASK_ID],
+) -> tuple[pl.Tensor, pl.Scalar[pl.TASK_ID]]:
+    """Project, then pool and commit the token stream."""
+    kv_proj_pad = pl.create_tensor([BS_PAD, OUT_DIM], dtype=pl.FP32)
+    score_proj_pad = pl.create_tensor([BS_PAD, OUT_DIM], dtype=pl.FP32)
+    projection_tid = compressor_ratio128_project(
+        x, wkv, wgate, kv_proj_pad, score_proj_pad, late_dep,
+    )
+    kv, cache_write_tid = compressor_ratio128_projected(
+        kv_proj_pad, score_proj_pad, kv, compress_state,
+        compress_state_block_table, ape, norm_w, cos,
+        sin, cmp_kv_cache, position_ids, cmp_slot_mapping,
+        state_slot_mapping, projection_tid, rope_ready_dep,
+    )
     return kv, cache_write_tid
 
 

@@ -55,14 +55,17 @@ from hc_pre import hc_pre
 from hc_post import hc_post
 from qkv_proj_rope import kv_proj_rope, q_proj_rope, qkv_proj_rope, rope_prepare
 from rmsnorm import rms_norm
-from decode_cp_token_allgather import (
+from decode_cp_allgather import (
+    decode_cp_hca_projection_allgather_step,
     KV_B_DYN,
     KV_T_DYN,
     DECODE_GROUP_CAP,
-    decode_cp_token_allgather_step,
 )
 from rope_interleave import rope_interleave
-from decode_compressor_ratio128 import compressor_ratio128
+from decode_compressor_ratio128 import (
+    compressor_ratio128, compressor_ratio128_project, compressor_ratio128_projected,
+    BS_PAD as CMP_PROJ_PAD,
+)
 from decode_o_proj import (
     ATTENTION_WINDOW_ROWS,
     GROUP_T_PAD,
@@ -218,27 +221,10 @@ def decode_hca(
     x_normed = pl.create_tensor([t_dim, D], dtype=pl.BF16)
     rms_tid = rms_norm(x_mixed, attn_norm_w, x_normed)
 
-    # All-gather the local post-norm rows into the TP group's token stream, which
-    # the KV branch, its cache write and the compressor consume.
-    x_normed_full = pl.create_tensor([kv_dim, D], dtype=pl.BF16)
-    # Keep the original tensor handle because returned inline tensor versions
-    # cannot cross into kv_proj_rope; gather_done_tid carries the ordering edge.
-    _gathered_normed, gather_signal, gather_done_tid = decode_cp_token_allgather_step(
-        x_normed, x_normed_full,
-        gather_window, gather_signal,
-        group_base, tp_rank,
-        rms_tid,
-    )
-    late_dep = gather_done_tid
-
     q = pl.create_tensor([t_dim, H, HEAD_DIM], dtype=pl.BF16)
     kv_full = pl.create_tensor([kv_dim, HEAD_DIM], dtype=pl.BF16)
     qr = pl.create_tensor([t_dim, Q_LORA], dtype=pl.INT8)
     qr_scale = pl.create_tensor([t_dim, 1], dtype=pl.FP32)
-    kv_cos_il = pl.create_tensor([kv_dim, ROPE_HEAD_DIM], dtype=pl.FP32)
-    kv_sin_signed = pl.create_tensor([kv_dim, ROPE_HEAD_DIM], dtype=pl.FP32)
-    kv_swap_idx = pl.create_tensor([kv_dim, ROPE_HEAD_DIM], dtype=pl.INT32)
-    rope_prepare(freqs_cos, freqs_sin, kv_cos_il, kv_sin_signed, kv_swap_idx)
 
     q_cos_il = pl.create_tensor([t_dim, ROPE_HEAD_DIM], dtype=pl.FP32)
     q_sin_signed = pl.create_tensor([t_dim, ROPE_HEAD_DIM], dtype=pl.FP32)
@@ -251,15 +237,45 @@ def decode_hca(
         q, qr, qr_scale,
     )
 
+    kv_local = pl.create_tensor([t_dim, HEAD_DIM], dtype=pl.BF16)
     kv_proj_rope(
-        x_normed_full, wkv, gamma_ckv,
-        kv_cos_il, kv_sin_signed, kv_swap_idx,
-        kv_full, late_dep,
+        x_normed, wkv, gamma_ckv,
+        q_cos_il, q_sin_signed, q_swap_idx,
+        kv_local, rms_tid,
     )
+    cmp_values_local = pl.create_tensor([CMP_PROJ_PAD, HEAD_DIM], dtype=pl.FP32)
+    cmp_scores_local = pl.create_tensor([CMP_PROJ_PAD, HEAD_DIM], dtype=pl.FP32)
+    cmp_projection_tid = compressor_ratio128_project(
+        x_normed, cmp_wkv, cmp_wgate, cmp_values_local, cmp_scores_local, rms_tid,
+    )
+    projection_local = pl.create_tensor([t_dim, 2560], dtype=pl.BF16)
+    with pl.spmd(16, name_hint="hca_projection_pack", deps=[cmp_projection_tid]) as projection_pack_tid:
+        pack_worker = pl.tile.get_block_idx()
+        for pack_row in pl.range(pack_worker, t_dim, 16):
+            value_bits = pl.reinterpret_view(cmp_values_local[pack_row : pack_row + 1, :], pl.BF16)
+            score_bits = pl.reinterpret_view(cmp_scores_local[pack_row : pack_row + 1, :], pl.BF16)
+            projection_local[pack_row : pack_row + 1, 0:1024] = value_bits
+            projection_local[pack_row : pack_row + 1, 1024:2048] = score_bits
+            projection_local[pack_row : pack_row + 1, 2048:2560] = kv_local[pack_row : pack_row + 1, :]
+    projection_full = pl.create_tensor([kv_dim, 2560], dtype=pl.BF16)
+    _projection_full, gather_signal, gather_done_tid = decode_cp_hca_projection_allgather_step(
+        projection_local, projection_full, gather_window, gather_signal,
+        group_base, tp_rank, projection_pack_tid,
+    )
+    cmp_values_full = pl.create_tensor([CMP_PROJ_PAD, HEAD_DIM], dtype=pl.FP32)
+    cmp_scores_full = pl.create_tensor([CMP_PROJ_PAD, HEAD_DIM], dtype=pl.FP32)
+    with pl.spmd(16, name_hint="hca_projection_unpack", deps=[gather_done_tid]) as kv_gather_done_tid:
+        unpack_worker = pl.tile.get_block_idx()
+        for unpack_row in pl.range(unpack_worker, kv_dim, 16):
+            value_fp32 = pl.reinterpret_view(projection_full[unpack_row : unpack_row + 1, 0:1024], pl.FP32)
+            score_fp32 = pl.reinterpret_view(projection_full[unpack_row : unpack_row + 1, 1024:2048], pl.FP32)
+            cmp_values_full[unpack_row : unpack_row + 1, :] = value_fp32
+            cmp_scores_full[unpack_row : unpack_row + 1, :] = score_fp32
+            kv_full[unpack_row : unpack_row + 1, :] = projection_full[unpack_row : unpack_row + 1, 2048:2560]
 
     ori_block_num = pl.tensor.dim(kv_cache, 0)
     kv_cache_flat = pl.reshape(kv_cache, [ori_block_num * BLOCK_SIZE, HEAD_DIM])
-    with pl.spmd(kv_wb_blocks, name_hint="hca_cache_writeback") as ori_cache_write_tid:
+    with pl.spmd(kv_wb_blocks, name_hint="hca_cache_writeback", deps=[kv_gather_done_tid]) as ori_cache_write_tid:
         wb_blk = pl.tile.get_block_idx()
         wb_t0 = wb_blk * HCA_WB_TOKEN_TILE
         for write_dt in pl.range(HCA_WB_TOKEN_TILE):
@@ -281,13 +297,13 @@ def decode_hca(
         compress_state_block_table, [kv_b_dim, COMPRESS_STATE_MAX_BLOCKS],
     )
     cmp_kv_proj = pl.create_tensor([kv_dim, HEAD_DIM], dtype=pl.FP32)
-    cmp_kv_proj, cmp_cache_write_tid = compressor_ratio128(
-        x_normed_full, cmp_kv_proj,
+    cmp_kv_proj, cmp_cache_write_tid = compressor_ratio128_projected(
+        cmp_values_full, cmp_scores_full, cmp_kv_proj,
         compress_state, cmp_state_table,
-        cmp_wkv, cmp_wgate, cmp_ape, cmp_norm_w,
+        cmp_ape, cmp_norm_w,
         cmp_cos_il, cmp_sin_signed, cmp_kv,
         cmp_positions, cmp_slots, cmp_state_slots,
-        late_dep, cmp_rope_ready_tid,
+        kv_gather_done_tid, cmp_rope_ready_tid,
     )
     cache_ready_dep = pl.system.task_dummy(deps=[ori_cache_write_tid, cmp_cache_write_tid])
 
@@ -1409,7 +1425,7 @@ def build_distributed_tensor_specs(local_t, start_pos=None):
     import torch
 
     from golden import ScalarSpec, TensorSpec
-    from decode_cp_token_allgather import cp_split, cp_stack, materialize_spec
+    from decode_cp_allgather import cp_split, cp_stack, materialize_spec
 
     _validate_hca_token_count(local_t)
     local_batch = local_t // S

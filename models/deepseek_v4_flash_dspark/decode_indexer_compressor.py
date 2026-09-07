@@ -77,34 +77,19 @@ RMS_PAD_TILE = 16  # 16-row block of B (hadamard matmul M multiple of 16)
 
 
 @pl.jit.inline(auto_scope=False)
-def indexer_compressor_pool(
+def indexer_compressor_project(
     x: pl.Tensor[[T_DYN, D], pl.BF16],
-    compress_state: pl.Tensor[[COMPRESS_STATE_BLOCK_NUM_DYN, COMPRESS_STATE_BLOCK_SIZE, COMPRESS_STATE_DIM], pl.FP32],
-    compress_state_block_table: pl.Tensor[[B_DYN, COMPRESS_STATE_MAX_BLOCKS], pl.INT32],
     wkv: pl.Tensor[[OUT_DIM, D], pl.BF16],
     wgate: pl.Tensor[[OUT_DIM, D], pl.BF16],
-    ape: pl.Tensor[[COMPRESS_RATIO, OUT_DIM], pl.FP32],
-    norm_w: pl.Tensor[[HEAD_DIM], pl.BF16],
-    cos: pl.Tensor[[T_DYN, ROPE_HEAD_DIM], pl.FP32],
-    sin: pl.Tensor[[T_DYN, ROPE_HEAD_DIM], pl.FP32],
-    position_ids: pl.Tensor[[T_DYN], pl.INT32],
-    inner_state_slot_mapping: pl.Tensor[[T_DYN], pl.INT64],
-    normed_kv: pl.Out[pl.Tensor[[BS_PAD, HEAD_DIM], pl.BF16]],
+    kv_proj_pad: pl.Tensor[[BS_PAD, OUT_DIM], pl.FP32],
+    score_proj_pad: pl.Tensor[[BS_PAD, OUT_DIM], pl.FP32],
     late_dep: pl.Scalar[pl.TASK_ID],
     chain_dep: pl.Scalar[pl.TASK_ID],
 ):
-    """Projection, pooling, state commit and RMSNorm+RoPE -- up to the normed KV rows."""
-    b_dim = pl.tensor.dim(compress_state_block_table, 0)
+    """Project token-local compressor values and scores in FP32."""
     bs = pl.tensor.dim(x, 0)
-    s_dim = bs // b_dim
-    t_matmul = ((bs + MM_B_TILE - 1) // MM_B_TILE) * MM_B_TILE  # ceil to whole 16-row cube tiles
-    rms_blocks = (bs + RMS_PAD_TILE - 1) // RMS_PAD_TILE
+    t_matmul = ((bs + MM_B_TILE - 1) // MM_B_TILE) * MM_B_TILE
     x_flat = x
-    kv_proj_pad = pl.create_tensor([BS_PAD, OUT_DIM], dtype=pl.FP32)
-    score_proj_pad = pl.create_tensor([BS_PAD, OUT_DIM], dtype=pl.FP32)
-    compress_state_block_num = pl.tensor.dim(compress_state, 0)
-    compress_state_rows = compress_state_block_num * COMPRESS_STATE_BLOCK_SIZE
-    compress_state_flat = pl.reshape(compress_state, [compress_state_rows, COMPRESS_STATE_DIM])
 
     # Caller-ordered KV and score projections.
     with pl.spmd(
@@ -132,6 +117,36 @@ def indexer_compressor_pool(
 
             kv_proj_pad[global_row0 : global_row0 + MM_B_TILE, o0 : o0 + PROJ_OUT_TILE] = kv_acc
             score_proj_pad[global_row0 : global_row0 + MM_B_TILE, o0 : o0 + PROJ_OUT_TILE] = score_acc
+
+    return _kv_score_tid
+
+
+@pl.jit.inline(auto_scope=False)
+def indexer_compressor_pool_projected(
+    kv_proj_pad: pl.Tensor[[BS_PAD, OUT_DIM], pl.FP32],
+    score_proj_pad: pl.Tensor[[BS_PAD, OUT_DIM], pl.FP32],
+    compress_state: pl.Tensor[[COMPRESS_STATE_BLOCK_NUM_DYN, COMPRESS_STATE_BLOCK_SIZE, COMPRESS_STATE_DIM], pl.FP32],
+    compress_state_block_table: pl.Tensor[[B_DYN, COMPRESS_STATE_MAX_BLOCKS], pl.INT32],
+    ape: pl.Tensor[[COMPRESS_RATIO, OUT_DIM], pl.FP32],
+    norm_w: pl.Tensor[[HEAD_DIM], pl.BF16],
+    cos: pl.Tensor[[T_DYN, ROPE_HEAD_DIM], pl.FP32],
+    sin: pl.Tensor[[T_DYN, ROPE_HEAD_DIM], pl.FP32],
+    position_ids: pl.Tensor[[T_DYN], pl.INT32],
+    inner_state_slot_mapping: pl.Tensor[[T_DYN], pl.INT64],
+    normed_kv: pl.Out[pl.Tensor[[BS_PAD, HEAD_DIM], pl.BF16]],
+    late_dep: pl.Scalar[pl.TASK_ID],
+    chain_dep: pl.Scalar[pl.TASK_ID],
+):
+    """Pool projected rows, commit state, and normalize boundary KV rows."""
+    b_dim = pl.tensor.dim(compress_state_block_table, 0)
+    bs = pl.tensor.dim(position_ids, 0)
+    s_dim = bs // b_dim
+    rms_blocks = (bs + RMS_PAD_TILE - 1) // RMS_PAD_TILE
+    compress_state_block_num = pl.tensor.dim(compress_state, 0)
+    compress_state_rows = compress_state_block_num * COMPRESS_STATE_BLOCK_SIZE
+    compress_state_flat = pl.reshape(compress_state, [compress_state_rows, COMPRESS_STATE_DIM])
+
+    _kv_score_tid = late_dep
 
     # Ratio-4 state-ring pooling.
     pooled_kv = pl.create_tensor([BS_PAD, HEAD_DIM], dtype=pl.FP32)
@@ -278,8 +293,39 @@ def indexer_compressor_pool(
 
 
 @pl.jit.inline(auto_scope=False)
-def indexer_compressor_write(
+def indexer_compressor_pool(
     x: pl.Tensor[[T_DYN, D], pl.BF16],
+    compress_state: pl.Tensor[[COMPRESS_STATE_BLOCK_NUM_DYN, COMPRESS_STATE_BLOCK_SIZE, COMPRESS_STATE_DIM], pl.FP32],
+    compress_state_block_table: pl.Tensor[[B_DYN, COMPRESS_STATE_MAX_BLOCKS], pl.INT32],
+    wkv: pl.Tensor[[OUT_DIM, D], pl.BF16],
+    wgate: pl.Tensor[[OUT_DIM, D], pl.BF16],
+    ape: pl.Tensor[[COMPRESS_RATIO, OUT_DIM], pl.FP32],
+    norm_w: pl.Tensor[[HEAD_DIM], pl.BF16],
+    cos: pl.Tensor[[T_DYN, ROPE_HEAD_DIM], pl.FP32],
+    sin: pl.Tensor[[T_DYN, ROPE_HEAD_DIM], pl.FP32],
+    position_ids: pl.Tensor[[T_DYN], pl.INT32],
+    inner_state_slot_mapping: pl.Tensor[[T_DYN], pl.INT64],
+    normed_kv: pl.Out[pl.Tensor[[BS_PAD, HEAD_DIM], pl.BF16]],
+    late_dep: pl.Scalar[pl.TASK_ID],
+    chain_dep: pl.Scalar[pl.TASK_ID],
+):
+    """Project, then pool and commit the token stream."""
+    kv_proj_pad = pl.create_tensor([BS_PAD, OUT_DIM], dtype=pl.FP32)
+    score_proj_pad = pl.create_tensor([BS_PAD, OUT_DIM], dtype=pl.FP32)
+    projection_tid = indexer_compressor_project(
+        x, wkv, wgate, kv_proj_pad, score_proj_pad, late_dep, chain_dep,
+    )
+    projection_ready_tid, rms_tid = indexer_compressor_pool_projected(
+        kv_proj_pad, score_proj_pad, compress_state, compress_state_block_table,
+        ape, norm_w, cos, sin,
+        position_ids, inner_state_slot_mapping, normed_kv, projection_tid,
+        chain_dep,
+    )
+    return projection_ready_tid, rms_tid
+
+
+@pl.jit.inline(auto_scope=False)
+def indexer_compressor_write(
     kv: pl.Tensor[[T_DYN, HEAD_DIM], pl.FP32],
     normed_kv: pl.Tensor[[BS_PAD, HEAD_DIM], pl.BF16],
     hadamard: pl.Tensor[[HEAD_DIM, HEAD_DIM], pl.BF16],
@@ -291,7 +337,7 @@ def indexer_compressor_write(
     hadamard_dep: pl.Scalar[pl.TASK_ID],
 ):
     """Rotate compact boundary rows and write their quantized indexer KV cache."""
-    bs = pl.tensor.dim(x, 0)
+    bs = pl.tensor.dim(position_ids, 0)
     compact_rows = bs // COMPRESS_RATIO
     rms_blocks = (compact_rows + RMS_PAD_TILE - 1) // RMS_PAD_TILE
     kv_flat = kv
@@ -398,7 +444,7 @@ def indexer_compressor(
         cos, sin, position_ids, inner_state_slot_mapping, normed_kv, late_dep, late_dep,
     )
     _hadamard_tid, write_tid = indexer_compressor_write(
-        x, kv, normed_kv, hadamard, idx_kv_cache, idx_kv_scale, idx_slot_mapping, position_ids,
+        kv, normed_kv, hadamard, idx_kv_cache, idx_kv_scale, idx_slot_mapping, position_ids,
         rms_tid, hadamard_dep,
     )
     return write_tid

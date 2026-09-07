@@ -49,10 +49,10 @@ from config import (
 )
 from hc_pre import hc_pre
 from hc_post import hc_post
-from decode_cp_token_allgather import (
+from decode_cp_allgather import (
     KV_T_DYN,
     DECODE_GROUP_CAP,
-    decode_cp_token_allgather_step,
+    decode_cp_kv_allgather_step,
 )
 from qkv_proj_rope import kv_proj_rope, q_proj_rope, qkv_proj_rope, rope_prepare
 from rmsnorm import rms_norm
@@ -203,28 +203,9 @@ def decode_swa(
     x_normed_t = pl.create_tensor([t_dim, D], dtype=pl.BF16)
     rms_tid = rms_norm(x_mixed, attn_norm_w, x_normed_t)
 
-    # All-gather the local post-norm rows into the TP group's token stream, which
-    # the KV branch and its cache write consume.
-    x_normed_full = pl.create_tensor([kv_dim, D], dtype=pl.BF16)
-    # Keep the original tensor handle because returned inline tensor versions
-    # cannot cross into kv_proj_rope; gather_done_tid carries the ordering edge.
-    _gathered_normed, gather_signal, gather_done_tid = decode_cp_token_allgather_step(
-        x_normed_t, x_normed_full,
-        gather_window, gather_signal,
-        group_base, tp_rank,
-        rms_tid,
-    )
-    late_dep = gather_done_tid
-
     q = pl.create_tensor([t_dim, H, HEAD_DIM], dtype=pl.BF16)
-    kv_full = pl.create_tensor([kv_dim, HEAD_DIM], dtype=pl.BF16)
     qr = pl.create_tensor([t_dim, Q_LORA], dtype=pl.INT8)
     qr_scale = pl.create_tensor([t_dim, 1], dtype=pl.FP32)
-    kv_cos_il = pl.create_tensor([kv_dim, ROPE_HEAD_DIM], dtype=pl.FP32)
-    kv_sin_signed = pl.create_tensor([kv_dim, ROPE_HEAD_DIM], dtype=pl.FP32)
-    kv_swap_idx = pl.create_tensor([kv_dim, ROPE_HEAD_DIM], dtype=pl.INT32)
-    rope_prepare(freqs_cos, freqs_sin, kv_cos_il, kv_sin_signed, kv_swap_idx)
-
     q_cos_il = pl.create_tensor([t_dim, ROPE_HEAD_DIM], dtype=pl.FP32)
     q_sin_signed = pl.create_tensor([t_dim, ROPE_HEAD_DIM], dtype=pl.FP32)
     q_swap_idx = pl.create_tensor([t_dim, ROPE_HEAD_DIM], dtype=pl.INT32)
@@ -236,10 +217,16 @@ def decode_swa(
         q, qr, qr_scale,
     )
 
+    kv_local = pl.create_tensor([t_dim, HEAD_DIM], dtype=pl.BF16)
     kv_proj_rope(
-        x_normed_full, wkv, gamma_ckv,
-        kv_cos_il, kv_sin_signed, kv_swap_idx,
-        kv_full, late_dep,
+        x_normed_t, wkv, gamma_ckv,
+        q_cos_il, q_sin_signed, q_swap_idx,
+        kv_local, rms_tid,
+    )
+
+    kv_full = pl.create_tensor([kv_dim, HEAD_DIM], dtype=pl.BF16)
+    _gathered_kv, gather_signal, gather_done_tid = decode_cp_kv_allgather_step(
+        kv_local, kv_full, gather_window, gather_signal, group_base, tp_rank, rms_tid,
     )
 
     ori_block_num = pl.tensor.dim(kv_cache, 0)
@@ -249,7 +236,7 @@ def decode_swa(
     wb_blocks = (kv_dim + SWA_WB_TOKEN_TILE - 1) // SWA_WB_TOKEN_TILE
     # SWA_TRANSACTION_ROWS guarantees that later speculative writes cannot
     # alias history still visible to an earlier query in this same step.
-    with pl.spmd(wb_blocks, name_hint="swa_cache_writeback"):
+    with pl.spmd(wb_blocks, name_hint="swa_cache_writeback", deps=[gather_done_tid]):
         wb_blk = pl.tile.get_block_idx()
         wb_t0 = wb_blk * SWA_WB_TOKEN_TILE
         wb_rows = pl.min(SWA_WB_TOKEN_TILE, kv_dim - wb_t0)
@@ -315,7 +302,8 @@ def decode_swa(
                     sink_delta = pl.sub(sink, block_m)
                     sink_exp = pl.exp(sink_delta)
                     denom = pl.add(block_l, sink_exp)
-                    normalized = pl.row_expand_div(block_o, denom)
+                    inv_denom = pl.recip(denom)
+                    normalized = pl.row_expand_mul(block_o, inv_denom)
                     full = normalized[0:H_TILE, 0:HEAD_DIM]
                     full_bf16 = pl.cast(full, target_type=pl.BF16, mode="rint")
 
@@ -970,7 +958,7 @@ def build_distributed_tensor_specs(local_t, start_pos=None):
     import torch
 
     from golden import ScalarSpec, TensorSpec
-    from decode_cp_token_allgather import cp_split, cp_stack, materialize_spec
+    from decode_cp_allgather import cp_split, cp_stack, materialize_spec
 
     if local_t < BIAS_T_TILE or local_t > LOCAL_T or local_t % BIAS_T_TILE != 0 or local_t % S != 0:
         raise ValueError(f"local_t must be a multiple of {BIAS_T_TILE} in [{BIAS_T_TILE}, {LOCAL_T}], got {local_t}")
@@ -1072,7 +1060,7 @@ def golden_decode_swa(tensors):
     full_wo_a = tensors["wo_a"].reshape(O_GROUPS, O_LORA, O_GROUP_IN)
     full_wo_b = tensors["wo_b"].permute(1, 0, 2).reshape(D, O_GROUPS * O_LORA)
 
-    # Post-norm rows the all-gather publishes, rank-major.
+    # Project rank-local rows with replicated KV weights before all-gather.
     kv_chunks = []
     for rank in range(tp_size):
         x_mixed = torch.zeros(local_t, D, dtype=torch.bfloat16)

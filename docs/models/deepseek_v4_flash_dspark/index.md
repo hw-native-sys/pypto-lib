@@ -96,11 +96,27 @@ decode_csa   … → decode_compressor_ratio4 (main, inner)
                  → decode_sparse_attn_csa                             → …
 ```
 
-- [decode_cp_token_allgather.py](../../../models/deepseek_v4_flash_dspark/decode_cp_token_allgather.py)
-  gathers the CP group's token rows into rank-major order on **every** rank.
+- [decode_cp_allgather.py](../../../models/deepseek_v4_flash_dspark/decode_cp_allgather.py)
+  gathers projected payloads into rank-major order on **every** rank.
   Each rank then writes the group's whole KV stream into its own replicated
   cache, so a compressor or indexer sees the full context while its queries stay
   on their token owner.
+- SWA projects and normalizes KV on the token owner, then uses
+  `decode_cp_kv_allgather_step` from the same module
+  to gather the 512-wide KV rows. KV projection and normalization weights are
+  replicated across the CP group. The shared 4096-column window remains
+  compatible with the full forward entry; SWA transfers only its KV columns.
+- HCA and CSA project compressor/indexer values and scores on the token owner
+  as well. FP32 projections are transported through lossless BF16 bit views,
+  without numeric conversion; normalized hidden rows are never gathered.
+  HCA uses one 2560-column payload containing compressor values, scores and KV.
+  CSA gathers its 1536-column indexer/KV payload first, then its 4096-column
+  main-compressor payload after the first epoch retires. Their pooling and
+  replicated cache/state updates still consume the full projected stream.
+  The standalone transport fixture selects layouts with
+  `--payload-kind {kv,hca,csa-main,csa-aux}`; `--raw-bits` checks opaque 16-bit
+  payloads bit-for-bit, including BF16 NaN patterns, across two retained-window
+  epochs. Use `--local-t 17` to exercise partial row bands.
 - [decode_o_proj.py](../../../models/deepseek_v4_flash_dspark/decode_o_proj.py)
   owns the grouped output projection and its TP communication: each rank
   dequantizes and projects its own `o_groups` shard, then publishes the result
@@ -189,7 +205,7 @@ with is rejected rather than silently ignored.
 | Decode sparse attention | [decode_sparse_attn_swa.py](../../../models/deepseek_v4_flash_dspark/decode_sparse_attn_swa.py), [decode_sparse_attn_csa.py](../../../models/deepseek_v4_flash_dspark/decode_sparse_attn_csa.py), [decode_sparse_attn_hca.py](../../../models/deepseek_v4_flash_dspark/decode_sparse_attn_hca.py) |
 | Decode compressors and indexer | [decode_compressor_ratio4.py](../../../models/deepseek_v4_flash_dspark/decode_compressor_ratio4.py), [decode_compressor_ratio128.py](../../../models/deepseek_v4_flash_dspark/decode_compressor_ratio128.py), [decode_indexer.py](../../../models/deepseek_v4_flash_dspark/decode_indexer.py), [decode_indexer_compressor.py](../../../models/deepseek_v4_flash_dspark/decode_indexer_compressor.py) |
 | Prefill attention and cache | [prefill_swa.py](../../../models/deepseek_v4_flash_dspark/prefill_swa.py), [prefill_csa.py](../../../models/deepseek_v4_flash_dspark/prefill_csa.py), [prefill_hca.py](../../../models/deepseek_v4_flash_dspark/prefill_hca.py), [prefill_sparse_attn.py](../../../models/deepseek_v4_flash_dspark/prefill_sparse_attn.py), [prefill_compressor_ratio4.py](../../../models/deepseek_v4_flash_dspark/prefill_compressor_ratio4.py), [prefill_compressor_ratio128.py](../../../models/deepseek_v4_flash_dspark/prefill_compressor_ratio128.py), [prefill_indexer.py](../../../models/deepseek_v4_flash_dspark/prefill_indexer.py), [prefill_indexer_compressor.py](../../../models/deepseek_v4_flash_dspark/prefill_indexer_compressor.py) |
-| Output projection and CP transport | [decode_o_proj.py](../../../models/deepseek_v4_flash_dspark/decode_o_proj.py), [prefill_o_proj.py](../../../models/deepseek_v4_flash_dspark/prefill_o_proj.py), [decode_cp_token_allgather.py](../../../models/deepseek_v4_flash_dspark/decode_cp_token_allgather.py), [prefill_cp_token_allgather.py](../../../models/deepseek_v4_flash_dspark/prefill_cp_token_allgather.py) |
+| Output projection and CP transport | [decode_o_proj.py](../../../models/deepseek_v4_flash_dspark/decode_o_proj.py), [prefill_o_proj.py](../../../models/deepseek_v4_flash_dspark/prefill_o_proj.py), [decode_cp_allgather.py](../../../models/deepseek_v4_flash_dspark/decode_cp_allgather.py), [prefill_cp_token_allgather.py](../../../models/deepseek_v4_flash_dspark/prefill_cp_token_allgather.py) |
 | Shared transforms | [rmsnorm.py](../../../models/deepseek_v4_flash_dspark/rmsnorm.py), [qkv_proj_rope.py](../../../models/deepseek_v4_flash_dspark/qkv_proj_rope.py), [hc_pre.py](../../../models/deepseek_v4_flash_dspark/hc_pre.py), [hc_post.py](../../../models/deepseek_v4_flash_dspark/hc_post.py), [hc_head.py](../../../models/deepseek_v4_flash_dspark/hc_head.py), [rope_interleave.py](../../../models/deepseek_v4_flash_dspark/rope_interleave.py), [lookup_embedding.py](../../../models/deepseek_v4_flash_dspark/lookup_embedding.py) |
 | MoE and output | [moe.py](../../../models/deepseek_v4_flash_dspark/moe.py), [gate.py](../../../models/deepseek_v4_flash_dspark/gate.py), [expert_shared.py](../../../models/deepseek_v4_flash_dspark/expert_shared.py), [expert_routed.py](../../../models/deepseek_v4_flash_dspark/expert_routed.py), [lm_head.py](../../../models/deepseek_v4_flash_dspark/lm_head.py) |
 | Metadata and host helpers | [decode_metadata.py](../../../models/deepseek_v4_flash_dspark/decode_metadata.py), [prefill_metadata.py](../../../models/deepseek_v4_flash_dspark/prefill_metadata.py), [config.py](../../../models/deepseek_v4_flash_dspark/config.py), [utils.py](../../../models/deepseek_v4_flash_dspark/utils.py) |
