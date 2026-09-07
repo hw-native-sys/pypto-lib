@@ -15,8 +15,7 @@ import sys
 import config
 
 
-# Sub-kernels freeze TP-derived shapes at import time, so select the standalone
-# program's TP world before importing them below.
+# TP specialization before sub-kernel imports.
 _TP_CHOICES = (1, 2, 4)
 _TP_DEFAULT = 2
 
@@ -144,7 +143,7 @@ O_GROUPS = M.o_groups
 HEADS_PER_GROUP = H // O_GROUPS
 O_GROUP_IN = H * HEAD_DIM // O_GROUPS
 
-# kernel-local
+# kernel constants
 COMPRESS_RATIO = 4
 OVERLAP = COMPRESS_RATIO == 4
 COFF = 1 + int(OVERLAP)
@@ -176,8 +175,7 @@ IDX_MAX_BLOCKS = CMP_MAX_BLOCKS
 
 # tiling
 CSA_WB_TOKEN_TILE = 8
-# csa_cache_writeback runs on persistent workers, each striding over token tiles.
-CSA_WB_WORKERS = 48
+CSA_WB_WORKERS = 48  # CSA cache-write workers
 
 if T != LOCAL_T:
     raise ValueError(f"CSA token capacity {T} must equal TP local token capacity {LOCAL_T}")
@@ -268,7 +266,8 @@ def decode_csa(
     idx_sin_signed = pl.create_tensor([t_dim, ROPE_HEAD_DIM], dtype=pl.FP32)
     cmp_cos_il_full = pl.create_tensor([kv_dim, ROPE_HEAD_DIM], dtype=pl.FP32)
     cmp_sin_signed_full = pl.create_tensor([kv_dim, ROPE_HEAD_DIM], dtype=pl.FP32)
-    with pl.at(level=pl.Level.CORE_GROUP, name_hint="csa_rope_interleave") as rope_tid:
+    with pl.spmd(48, name_hint="csa_rope_interleave") as rope_tid:
+        rope_worker = pl.tile.get_block_idx()
         il_ones = pl.full([4, ROPE_HEAD_DIM], dtype=pl.FP32, value=1.0)
         il_col = pl.col_expand_mul(
             il_ones,
@@ -278,7 +277,7 @@ def decode_csa(
         il_dup_idx = pl.cast(il_dup_f, target_type=pl.INT32)
         il_lane = pl.sub(il_col, pl.mul(il_dup_f, 2.0))
         il_sign = pl.sub(pl.mul(il_lane, 2.0), 1.0)
-        for rope_t0 in pl.range(0, t_dim, 4):
+        for rope_t0 in pl.range(rope_worker * 4, t_dim, 48 * 4):
             idx_cos_il[rope_t0 : rope_t0 + 4, :] = pl.gather(
                 pl.cast(freqs_cos_local[rope_t0 : rope_t0 + 4, 0:HALF_ROPE], target_type=pl.FP32),
                 dim=-1,
@@ -292,7 +291,7 @@ def decode_csa(
                 ),
                 il_sign,
             )
-        for cmp_t0 in pl.range(0, kv_dim, 4):
+        for cmp_t0 in pl.range(rope_worker * 4, kv_dim, 48 * 4):
             cmp_cos_il_full[cmp_t0 : cmp_t0 + 4, :] = pl.gather(
                 pl.cast(cmp_freqs_cos[cmp_t0 : cmp_t0 + 4, 0:HALF_ROPE], target_type=pl.FP32),
                 dim=-1,
@@ -310,12 +309,10 @@ def decode_csa(
     x_normed_t = pl.create_tensor([t_dim, D], dtype=pl.BF16)
     rms_tid = rms_norm(x_mixed, attn_norm_w, x_normed_t)
 
-    # All-gather the local post-norm rows into the TP group's token stream, which
-    # the KV branch and its cache write consume.
+    # TP gathered post-norm token stream.
     kv_wb_blocks = kv_dim // CSA_WB_TOKEN_TILE
     x_normed_full = pl.create_tensor([kv_dim, D], dtype=pl.BF16)
-    # Keep the original tensor handle because returned inline tensor versions
-    # cannot cross into kv_proj_rope; gather_done_tid carries the ordering edge.
+    # Gathered token-stream handle.
     _gathered_normed, gather_signal, gather_done_tid = decode_cp_token_allgather_step(
         x_normed_t, x_normed_full,
         gather_window, gather_signal,
@@ -330,8 +327,7 @@ def decode_csa(
     attention_local_flat = pl.create_tensor([ATTENTION_WINDOW_ROWS, O_GROUP_IN], dtype=pl.BF16)
     attn_out = pl.create_tensor([t_dim, D], dtype=pl.BF16)
     with pl.scope():
-        # The chain head reads the gathered stream, so it carries the allgather
-        # ordering edge for everything downstream of it.
+        # Gathered-stream projection chain.
         gather_dep = pl.system.task_dummy(deps=[rope_tid, gather_done_tid])
         kv_cos_il = pl.create_tensor([kv_dim, ROPE_HEAD_DIM], dtype=pl.FP32)
         kv_sin_signed = pl.create_tensor([kv_dim, ROPE_HEAD_DIM], dtype=pl.FP32)
@@ -350,12 +346,7 @@ def decode_csa(
             qr_i8_matmul, qr_scale_pad,
         )
 
-        # The five cube launches are chained head to tail so each one gets the whole
-        # cube array instead of splitting it:
-        #   idx_qr_proj_matmul -> kv_score_proj_0 -> kv_score_proj
-        #     -> qr_hadamard_matmul -> qproj_matmul
-        # Every one of them is a 24- or 64-block launch, so two overlapping ones each
-        # come up short and stretch; serialised, each runs at its occupancy floor.
+        # Cube projection chain.
         qr_bf16 = pl.create_tensor(
             [IDX_T_PAD * IDX_N_HEADS, IDX_HEAD_DIM], dtype=pl.BF16
         )
@@ -370,15 +361,12 @@ def decode_csa(
             idx_cos_il, idx_sin_signed, qr_bf16,
         )
 
-        # Hand the compressors scalar-extent views: their token and request axes
-        # bind to one row count per call, and mixing them with the gathered
-        # stream's symbols leaves the two not provably equal across the call.
+        # Compressor token and request views.
         cmp_positions = pl.reshape(position_ids, [kv_dim])
         cmp_slots = pl.reshape(cmp_slot_mapping, [kv_dim])
         cmp_state_slots = pl.reshape(state_slot_mapping, [kv_dim])
         idx_slots = pl.reshape(idx_slot_mapping, [kv_dim])
-        # A distinct one-dimensional view: position_ids_local also feeds sparse
-        # attention as a [t_dim, 1] reshape, and the indexer needs the flat form.
+        # Flat local position IDs.
         idx_positions = pl.reshape(position_ids_local, [t_dim])
         inner_state_slots = pl.reshape(inner_state_slot_mapping, [kv_dim])
         cmp_state_table = pl.reshape(
@@ -412,17 +400,14 @@ def decode_csa(
             qr_hadamard_i8, qr_hadamard_scale_dq, cmp_kv_score_tid,
         )
 
-        # kv_hadamard is another 24-block launch, so it takes its own slot in the
-        # chain: 15 us ahead of qproj_matmul rather than beside it, where it costs
-        # qproj_matmul a core and a whole extra worker pass.
+        # Indexer KV cache projection.
         idx_kv_unused = pl.create_tensor([kv_dim, IDX_HEAD_DIM], dtype=pl.FP32)
         idx_hadamard_tid, idx_cache_write_tid = indexer_compressor_write(
             x_normed_full, idx_kv_unused, idx_normed_kv, hadamard_idx,
-            idx_kv_cache, idx_kv_scale, idx_slots,
+            idx_kv_cache, idx_kv_scale, idx_slots, cmp_positions,
             idx_rms_tid, qh_mm_tid,
         )
-        # q is not read until attention, so its cube and vector halves take the tail
-        # of the chain.
+        # Query projection.
         q_proj_q(
             x_normed_t, wq_b, wq_b_scale,
             q_cos_il, q_sin_signed, q_swap_idx, q,
@@ -436,12 +421,8 @@ def decode_csa(
             idx_cache_write_tid, cmp_kv_score_tid, qh_quant_tid,
         )
 
-        # indexer_score_leaf_wave is a 24-block MIX launch that needs all 24 clusters:
-        # a single small task squatting on one cluster's AIV costs it a whole extra
-        # wave. Everything that would otherwise run inside its window is fenced behind
-        # it -- the ratio4 cache write, the KV branch, and the original-KV writeback.
-        # They only have to beat qk_pv, which waits on the top-k merge anyway.
-        cmp_cache_write_tid = compressor_ratio4_cache_write(
+        # Indexer score and Top-K selection.
+        compressor_ratio4_cache_write(
             x_normed_full, cmp_out, cmp_pooled_kv, cmp_norm_w,
             cmp_cos_il_full, cmp_sin_signed_full, cmp_kv, cmp_slots,
             compress_state, cmp_state_table, cmp_ape,
@@ -456,7 +437,7 @@ def decode_csa(
 
         ori_block_num = pl.tensor.dim(kv_cache, 0)
         kv_cache_flat = pl.reshape(kv_cache, [ori_block_num * BLOCK_SIZE, HEAD_DIM])
-        with pl.spmd(CSA_WB_WORKERS, name_hint="csa_cache_writeback") as ori_cache_write_tid:
+        with pl.spmd(CSA_WB_WORKERS, name_hint="csa_cache_writeback"):
             wb_worker = pl.tile.get_block_idx()
             for wb_blk in pl.range(wb_worker, kv_wb_blocks, CSA_WB_WORKERS):
                 wb_t0 = wb_blk * CSA_WB_TOKEN_TILE
@@ -469,8 +450,6 @@ def decode_csa(
                             kv_full[write_t : write_t + 1, 0 : HEAD_DIM]
                         )
 
-        cache_ready_dep = pl.system.task_dummy(deps=[ori_cache_write_tid, cmp_cache_write_tid])
-
         (
             sparse_blk_mi, sparse_blk_li, sparse_blk_oi,
             rope_cos_il, rope_sin_signed, rope_swap_idx,
@@ -479,7 +458,6 @@ def decode_csa(
             q, kv_cache, window_swa_indices,
             cmp_kv, cmp_block_table, idx_topk,
             position_ids_t1, freqs_cos_local, freqs_sin_local,
-            cache_ready_dep,
         )
 
         attention_grouped = pl.create_tensor([O_GROUPS * LOCAL_T_PAD, O_GROUP_IN], dtype=pl.BF16)
@@ -533,14 +511,13 @@ def decode_csa(
                     n_rope_bf16 = pl.cast(m_rot, target_type=pl.BF16, mode="rint")
                     n_full_bf16 = pl.concat(n_bf16[:, 0:NOPE_DIM], n_rope_bf16)
 
-                    for n_hi in pl.unroll(H_TILE):
-                        n_head = m_h0 + n_hi
-                        source_row = (n_head // HEADS_PER_GROUP) * T_PAD + m_t
-                        source_col = (n_head % HEADS_PER_GROUP) * HEAD_DIM
+                    n_group_bf16 = pl.reshape(n_full_bf16, [PUBLISH_GROUPS, O_GROUP_IN])
+                    for n_group in pl.unroll(PUBLISH_GROUPS):
+                        source_row = (global_group0 + n_group) * T_PAD + m_t
                         attention_grouped[
                             source_row : source_row + 1,
-                            source_col : source_col + HEAD_DIM,
-                        ] = n_full_bf16[n_hi : n_hi + 1, 0:HEAD_DIM]
+                            0:O_GROUP_IN,
+                        ] = n_group_bf16[n_group : n_group + 1, :]
 
                 for group_slot in pl.unroll(PUBLISH_GROUPS):
                     source_row = (global_group0 + group_slot) * T_PAD + m_t0
@@ -574,8 +551,7 @@ def decode_csa(
         )
 
         attention_local_groups = pl.reshape(attention_local_flat, [LOCAL_O_GROUPS, GROUP_T_PAD, O_GROUP_IN])
-        # o_proj_reduce_scatter writes attn_out in place; keep the original
-        # handle, since a returned inline handle cannot cross into hc_post.
+        # Attention output handle.
         _o_reduced, o_signal = o_proj_reduce_scatter(
             attention_local_groups,
             wo_a, wo_b, wo_b_scale,
@@ -957,8 +933,7 @@ def decode_csa_tp1(
     position_ids_t1 = pl.reshape(position_ids, [t_dim, 1])
     attn_out = pl.create_tensor([t_dim, D], dtype=pl.BF16)
     with pl.scope():
-        # Dispatch barrier: kv_proj_matmul, kv_score_proj and weights_proj resolve one hop
-        # after rms_norm, leaving qr_proj_matmul first.
+        # Projection-chain dependency marker.
         late_dep = pl.system.task_dummy(deps=[rope_tid])
         qkv_proj_rope(
             x_normed_t, wq_a, wq_b, wq_b_scale, wkv,
@@ -968,7 +943,7 @@ def decode_csa_tp1(
 
         ori_block_num = pl.tensor.dim(kv_cache, 0)
         kv_cache_flat = pl.reshape(kv_cache, [ori_block_num * BLOCK_SIZE, HEAD_DIM])
-        with pl.spmd(CSA_WB_WORKERS, name_hint="csa_cache_writeback") as ori_cache_write_tid:
+        with pl.spmd(CSA_WB_WORKERS, name_hint="csa_cache_writeback"):
             wb_worker = pl.tile.get_block_idx()
             for wb_blk in pl.range(wb_worker, wb_blocks, CSA_WB_WORKERS):
                 wb_t0 = wb_blk * CSA_WB_TOKEN_TILE
@@ -988,8 +963,6 @@ def decode_csa_tp1(
             position_ids, cmp_slot_mapping, state_slot_mapping,
             late_dep,
         )
-        cache_ready_dep = pl.system.task_dummy(deps=[ori_cache_write_tid, cmp_cache_write_tid])
-
         idx_kv_unused = pl.create_tensor([t_dim, IDX_HEAD_DIM], dtype=pl.FP32)
         idx_cache_write_tid = indexer_compressor(
             x_normed_t, idx_kv_unused,
@@ -1016,7 +989,7 @@ def decode_csa_tp1(
             q, kv_cache, window_swa_indices,
             cmp_kv, cmp_block_table, idx_topk, position_ids_t1,
             attn_sink, freqs_cos, freqs_sin,
-            o_packed_heads, cache_ready_dep,
+            o_packed_heads,
         )
         attn_out = decode_o_proj_tp1(o_packed_heads, wo_a, wo_b, wo_b_scale, attn_out, heads_dep)
         hc_post(attn_out, x_hc, post_t, comb_t, x_out)
@@ -1625,10 +1598,7 @@ def build_tensor_specs(start_pos=None, batch=B):
         "post": shared_post,
         "comb": shared_comb,
     })
-    # idx_wq_b is the only quantized indexer weight: simulate the real MXFP8 (e4m3 +
-    # 128x128-block E8M0) grid like the shared experts (199 levels, scaleCV ~0.61, ~1.1% zero
-    # spike) instead of a benign randn INT8. gen_shared_weight reduces over the last (in) dim
-    # and yields scale per output channel, so build [out, in] then transpose to [Q_LORA, out].
+    # Quantized indexer query projection weights.
     from decode_indexer import gen_shared_weight
     idx_wq_b_i8_T, idx_wq_b_scale = gen_shared_weight(
         (IDX_N_HEADS * IDX_HEAD_DIM, Q_LORA), dequant_std=0.108, chan_cv=0.56)
@@ -1827,8 +1797,7 @@ def build_distributed_tensor_specs(local_t, start_pos=None):
             rank_value = cp_split(value, TP_SIZE)
         else:
             rank_value = cp_stack(value, TP_SIZE)
-        # A dual name carries a replicated full-stream twin, so the rank's rows
-        # take the _local suffix that names the half they are.
+        # Rank-local token stream names.
         local_name = f"{spec.name}_local" if spec.name in dual_names else spec.name
         distributed_spec = TensorSpec(
             local_name, list(rank_value.shape), spec.dtype,
@@ -1915,8 +1884,7 @@ def golden_decode_csa(tensors):
 
     for rank in range(tp_size):
         rank_tensors = { name: value[rank] for name, value in tensors.items() if name != "local_t" }
-        # The TP1 reference names its token-local rows without a suffix, so the
-        # _local halves replace the gathered stream that now holds the bare name.
+        # TP1 token-local tensor names.
         rank_tensors["freqs_cos"] = tensors["freqs_cos_local"][rank]
         rank_tensors["freqs_sin"] = tensors["freqs_sin_local"][rank]
         rank_tensors["position_ids"] = tensors["position_ids_local"][rank]
@@ -1989,8 +1957,6 @@ def _csa_x_out_compare():
 def build_full_compare(mapping_shape, *, leading_rank_axis, cp_mappings=None, diagnostic_x_out=False):
     """Compare the six mutable pools only at allocator-mapped rows."""
     from golden import error_distribution, mapped_pool_ratio_allclose
-
-    common = { "mapping_shape": mapping_shape, "leading_rank_axis": leading_rank_axis, }
 
     def pool_mapping(pool, local_mapping):
         name, shape = (cp_mappings or {}).get(pool, (local_mapping, mapping_shape))
