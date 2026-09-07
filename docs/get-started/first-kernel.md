@@ -37,9 +37,9 @@ The harness reports these stages:
 [RUN] PASS (...)
 ```
 
-The simulator path does not require CANN or an NPU in this repository's CI.
-It still requires the PyPTO, simpler, PTOAS, PTO ISA, and compiler setup
-described on the installation page.
+The simulator path requires neither CANN nor an NPU. It still requires the
+PyPTO, simpler, PTOAS, PTO ISA, and compiler setup described on the
+installation page.
 
 ## Run on an A2/A3 device
 

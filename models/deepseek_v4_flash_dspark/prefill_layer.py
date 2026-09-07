@@ -6,8 +6,8 @@
 # INCLUDING BUT NOT LIMITED TO NON-INFRINGEMENT, MERCHANTABILITY, OR FITNESS FOR A PARTICULAR PURPOSE.
 # See LICENSE in the root of the software repository for the full text of the License.
 # -----------------------------------------------------------------------------------------------------------
-# ci: devices=2  # CI: EP2/TP2 representative single-layer golden
-# ci: no-sim    # CI marker: distributed communication oracle requires real devices
+# ci: devices=2
+# ci: no-sim
 """DeepSeek-V4 Flash DSpark DSA-CP single-layer numerical oracle."""
 
 import argparse

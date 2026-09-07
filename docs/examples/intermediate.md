@@ -4,8 +4,7 @@ The intermediate examples add reduction loops, normalization, and
 transformer-oriented elementwise operations. Each script is a runnable
 single-device Golden Harness case.
 
-All five scripts declare `a2a3`, `a2a3sim`, `a5`, and `a5sim`. Repository CI
-exercises `a2a3`, `a2a3sim`, and `a5sim`.
+All five scripts declare `a2a3`, `a2a3sim`, `a5`, and `a5sim`.
 
 ## GEMM
 

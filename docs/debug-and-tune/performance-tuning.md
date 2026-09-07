@@ -28,10 +28,8 @@ PYPTO_BENCH=1 python models/qwen3_14b/decode_fwd.py -p a2a3 -d 0
 
 **Effective** is the framework's post-graph-build execution window on
 device (`orch` ∪ `sched` — the old device-log "Total"), recovered from the
-runtime's `[STRACE]` markers. Quote `mean=`: daily CI's per-case perf number
-is exactly this field of exactly this line
-([daily_ci.yml](../../.github/workflows/daily_ci.yml)), so a local mean is
-directly comparable to the dashboard.
+runtime's `[STRACE]` markers. Quote `mean=` — this field of this line is the
+per-case number, so two runs are comparable only when both quote it.
 
 Requirements: a real device — a `*sim` platform prints
 `effective_us unavailable: no device-domain spans` — and a runtime built
@@ -94,9 +92,9 @@ A distributed program adds a per-rank breakdown and a context line:
 | `PYPTO_BENCH_RAW` | off | Prints every measured dispatch's Effective sample, one line per rank, in dispatch order. Use it when a summary looks suspicious — start-up drift, a bimodal rank, one card lagging. |
 
 A malformed or out-of-range value warns and falls back to the default
-rather than failing the run. Daily CI sets none of the three, so its numbers
-always come from the 100 / 5 baseline; if you change the loop sizes locally,
-compare only against other runs with the same sizes.
+rather than failing the run. The 100 / 5 default is the baseline every
+reported number should come from; if you change the loop sizes, compare only
+against other runs with the same sizes.
 
 ```bash
 # Quick iteration on a long prefill, with the raw per-dispatch samples.

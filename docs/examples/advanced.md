@@ -4,9 +4,7 @@ These examples focus on fusion, reusable inline functions, specialized tile
 instructions, and distributed L3 execution. The first three are single-device
 cases. All-reduce requires two ranks.
 
-All four scripts declare `a2a3`, `a2a3sim`, `a5`, and `a5sim`. Repository CI
-exercises `a2a3`, `a2a3sim`, and `a5sim`; A5 device execution is not currently
-covered by CI.
+All four scripts declare `a2a3`, `a2a3sim`, `a5`, and `a5sim`.
 
 ## GEMM plus elementwise
 
@@ -74,6 +72,5 @@ To check compilation without executing the distributed program:
 python examples/advanced/allreduce.py -p a2a3 --compile-only -d 0,1
 ```
 
-The `# ci: devices=2` marker is executable test metadata: the A2/A3 CI job
-borrows two cards for this case. It does not imply that larger world sizes are
-supported.
+Two ranks is the world size this case is written for; it does not imply that
+larger world sizes are supported.

@@ -23,7 +23,10 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        platform: [a2a3sim, a5sim]
+        # a2a3sim only. a5sim carries examples, and this workflow sweeps models
+        # exclusively — A5 model coverage is the model-tests-a5 device job. The
+        # matrix stays so a second simulator can be added back in one line.
+        platform: [a2a3sim]
     defaults:
       run:
         working-directory: checkout
@@ -308,9 +311,9 @@ jobs:
     # Real Ascend 950 (A5) device job — the dedicated daily coverage of the
     # DeepSeek V4-Pro variant (the Pro preset in models/deepseek_v4_pro/). Mirrors
     # model-tests-a2a3 but runs -p a5 on the npu-a5 self-hosted runner and
-    # sweeps ONLY Pro: Pro is excluded from the a2a3/a2a3sim/a5sim
-    # sweeps above (it is the A5-targeted variant, so running it on 910B
-    # would be duplicate cost against the wrong backend). It goes through
+    # sweeps ONLY Pro: Pro is excluded from the a2a3/a2a3sim sweeps above
+    # (it is the A5-targeted variant, so running it on 910B would be
+    # duplicate cost against the wrong backend). It goes through
     # the same setup-ci-job as the other device jobs (needs-device:true);
     # the A5 host's own runner .env supplies its CANN_ROOT / cache roots, so
     # no A5-specific path is named here. NOTE: until the npu-a5 runner is
@@ -833,8 +836,8 @@ jobs:
           import pathlib
 
           # Two tables, not one matrix: model-tests-a5 sweeps only
-          # models/deepseek_v4_pro sweep and the other three jobs exclude it, so the
-          # case sets are disjoint. A single table makes every row half filler —
+          # models/deepseek_v4_pro and the other jobs exclude it, so the case
+          # sets are disjoint. A single table makes every row half filler —
           # 35 Pro rows blank under a2a3/sim, 48 others blank under a5.
           ICON = {"pass": ":white_check_mark:", "fail": ":x:", "missing": ":heavy_minus_sign:"}
           ROOT = pathlib.Path("results")
@@ -955,7 +958,7 @@ jobs:
 
           print("## Daily CI Model Test Results")
           print()
-          table("a2a3 and simulators", ["a2a3", "a2a3sim", "a5sim"], "a2a3")
+          table("a2a3 and a2a3sim", ["a2a3", "a2a3sim"], "a2a3")
           table("a5 (DeepSeek V4-Pro)", ["a5"], "a5")
           e2e("a5 DeepSeek-V4-Flash EP8 end-to-end token generation (real weights)", "e2e-a5")
           EOF

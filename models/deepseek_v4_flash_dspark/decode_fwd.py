@@ -6,8 +6,8 @@
 # INCLUDING BUT NOT LIMITED TO NON-INFRINGEMENT, MERCHANTABILITY, OR FITNESS FOR A PARTICULAR PURPOSE.
 # See LICENSE in the root of the software repository for the full text of the License.
 # -----------------------------------------------------------------------------------------------------------
-# ci: devices=2  # CI: EP2/TP2 full decode forward
-# ci: no-sim    # CI marker: full multi-layer / multi-card forward — device-only, skip on *sim
+# ci: devices=2
+# ci: no-sim
 """DeepSeek-V4 D-Spark decode forward."""
 
 import sys

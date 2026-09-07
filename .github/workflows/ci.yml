@@ -197,6 +197,11 @@ jobs:
           else
             FILES=$(find examples -name '*.py' ! -name '*_draft.py' | sort)
           fi
+          # a5sim carries examples only. Models are validated on a2a3 and
+          # a2a3sim; A5 model coverage is the daily model-tests-a5 device sweep.
+          if [ "${{ matrix.platform }}" = "a5sim" ]; then
+            FILES=$(printf '%s\n' $FILES | grep '^examples/' || true)
+          fi
           if [ -z "$FILES" ]; then
             echo "No runnable changed files; nothing to test."
             exit 0

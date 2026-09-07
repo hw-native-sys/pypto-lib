@@ -14,7 +14,7 @@ every one of them:
 | PTO ISA | cloned automatically on first use | PyPTO's `runtime/pto_isa.pin` |
 
 Install what the selected PyPTO revision points at. Do not copy a PTOAS version
-or a PTO ISA commit from an old CI log or hard-code one in a setup script.
+or a PTO ISA commit from an old log or hard-code one in a setup script.
 
 ## Prerequisites
 

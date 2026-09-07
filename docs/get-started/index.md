@@ -32,4 +32,4 @@ its saved-data replay workflow.
   source code.
 
 Files ending in `_draft.py` are works in progress and are excluded from the
-normal runnable set in CI.
+normal runnable set.

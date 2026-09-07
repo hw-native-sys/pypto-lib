@@ -226,30 +226,11 @@ The prefill and decode RoPE paths use fixed even/odd lane gather and scatter
 operations for adjacent-lane permutations instead of synthesizing tile-local
 index tensors.
 
-The [daily model workflow](../../../.github/workflows/daily_ci.yml) runs this
-EP8 loop nightly on the A5 runner (job `e2e-flash-a5`: real
-DeepSeek-V4-Flash weights, fixed 128-row prefill capacity with active rows set
-from the prompt, and 32 greedy decode steps from "The capital of France is") and
-publishes the prompt and the generated text in the run summary under
-"Daily CI Model Test Results", so a reviewer can read the continuation
-every day instead of a pass/fail tick. The runner finds the checkpoint
-through `PYPTO_DSV4_FLASH_CKPT_DIR` in its `.env` (falling back to the A5
-host's `/home/pyptouser/models/DeepSeek-V4-Flash-0731`). The
-`utils.py` cache (ep8/tp2) is resolved in this order:
-`PYPTO_DSV4_FLASH_WEIGHTS_DIR` from the runner's `.env` if set, else the
-shared cache next to the checkpoint (`pypto-weights-cache/flash_ep8_tp2`),
-else the runner's own `CI_CACHE_ROOT/dsv4-flash-weights/flash_ep8_tp2`,
-which the job builds from the checkpoint once (~25 min) when it is missing.
-Unlike the rest of the nightly, this job currently builds a pinned pypto
-(`pypto-ref` in the workflow, with the full story in its comment): the
-toolchain that pypto HEAD pins carries a pto-isa A5 dispatch regression
-that stalls every EP8 prefill before the first token. The pin comes off
-once the upstream fix reaches pto-isa's mirror and the simpler/pypto pins
-move past it. While the pinned toolchain's probabilistic cross-rank
-divergence ([#1043](https://github.com/hw-native-sys/pypto-lib/issues/1043))
-stays open, the job also retries the loop once; `e2e.json` carries the
-attempt count and the first attempt's error, so a flaky night still reads
-as exactly what it was.
+The EP8 loop needs a toolchain without the pto-isa A5 dispatch regression that
+stalls every EP8 prefill before the first token, and a probabilistic
+cross-rank divergence
+([#1043](https://github.com/hw-native-sys/pypto-lib/issues/1043)) is still
+open, so a run can diverge between ranks without the kernels having changed.
 
 ## Files
 
@@ -269,5 +250,4 @@ as exactly what it was.
 | Token loop | [synthetic_token_loop.py](../../../models/deepseek_v4_pro/synthetic_token_loop.py) |
 
 `config.py`, `decode_metadata.py`, and `rope_tables.py` have no `__main__`
-block and are imported rather than run. Which entry points CI schedules is
-defined by the [daily model workflow](../../../.github/workflows/daily_ci.yml).
+block and are imported rather than run.

@@ -355,8 +355,8 @@ result = run(
 
 - **CLI**: distributed entries take `-d 0,1,...` (a comma-separated list),
   not a single integer, and usually an `--ep` / `--tp` degree.
-- **CI**: declare the card count with a `# ci: devices=N` marker near the top
-  of the file; the real-NPU job borrows that many cards. See
+- **Devices**: the entry needs as many free cards as its world size, and they
+  must all be on the same host. See
   [Platforms and Devices](../get-started/platforms.md).
 - **Specs**: every tensor keeps its leading rank axis, so a `TensorSpec` is
   `[N_RANKS, ...]`. `resident="stacked"` uploads shard `i` to card `i` once

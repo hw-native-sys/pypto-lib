@@ -8,8 +8,7 @@ The beginner examples introduce the common shape of a PyPTO-Lib executable:
 4. describe inputs and outputs with Golden Harness specs;
 5. compare the device or simulator result with a Torch reference.
 
-Both examples accept `-p {a2a3,a2a3sim,a5,a5sim}`. Repository CI exercises
-`a2a3`, `a2a3sim`, and `a5sim`.
+Both examples accept `-p {a2a3,a2a3sim,a5,a5sim}`.
 
 ## Hello World
 

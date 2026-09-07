@@ -6,7 +6,7 @@
 # INCLUDING BUT NOT LIMITED TO NON-INFRINGEMENT, MERCHANTABILITY, OR FITNESS FOR A PARTICULAR PURPOSE.
 # See LICENSE in the root of the software repository for the full text of the License.
 # -----------------------------------------------------------------------------------------------------------
-# ci: no-sim    # CI marker: full multi-layer forward — device-only, skip on *sim
+# ci: no-sim
 """Qwen3-14B full-layer prefill forward.
 
 Each transformer layer runs the same fused prefill body: input RMSNorm,

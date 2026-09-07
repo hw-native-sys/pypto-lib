@@ -41,8 +41,8 @@ product get faster"; a device span answers "did the kernel get faster". They
 move independently, and this page says which one a change moved.
 
 None of the three is what a new measurement should use. Today's number is the
-`mean=` field of `PYPTO_BENCH=1`'s `[RUN] effective_us` line, which is also what
-daily CI reports — see [Performance Tuning](../../debug-and-tune/performance-tuning.md). Do not
+`mean=` field of `PYPTO_BENCH=1`'s `[RUN] effective_us` line — see
+[Performance Tuning](../../debug-and-tune/performance-tuning.md). Do not
 compare a fresh `effective_us` against a figure on this page.
 
 ## The shape of the work
@@ -154,7 +154,7 @@ Smooth geometric growth, no systematic bias, cosine > 0.999. The answer was a
 passes when at least a threshold fraction of elements satisfy the run-level
 `atol`/`rtol` (#241). A real systematic bug still fails fast — most elements
 skew the same direction and the rate collapses — while the ULP long tail is
-absorbed. CI then runs it as a three-tier sweep so sensitivity stays uniform
+absorbed. It is then run as a three-tier sweep so sensitivity stays uniform
 with depth (#247):
 
 | layers | threshold | measured | role |
@@ -164,8 +164,8 @@ with depth (#247):
 | 40 | 0.98 | 0.989795 | full-depth regression |
 
 **A loosened tolerance is a debt with a due date.** #349 raised `atol`/`rtol`
-from `3e-3` to `1.5e-2` to get CI green around a pypto cross-lane GM race, with
-the upstream issue named at the call site. #366 restored `3e-3` and deleted the
+from `3e-3` to `1.5e-2` to get the case passing around a pypto cross-lane GM
+race, with the upstream issue named at the call site. #366 restored `3e-3` and deleted the
 comment the same week the upstream fix landed. Every temporary tolerance in this
 tree carries the issue number that will retire it.
 

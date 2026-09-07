@@ -99,8 +99,8 @@ hidden rows.
 the third top-level composition: it chains the main decode forward, the draft
 verification, and the MTP decode layer into one serving step. Its device-only
 CLI fixture composes the standalone forward and MTP tensor fixtures with a
-persistent recurrent-state pool. Daily CI runs the default EP2/TP2 fixture on
-two devices; component-level golden checks remain with the standalone paths.
+persistent recurrent-state pool. The default fixture is EP2/TP2 on two
+devices; component-level golden checks remain with the standalone paths.
 
 ### One layer
 
@@ -205,6 +205,5 @@ serving-level residency and lowering — with the limit measured at each step.
 | Metadata and host helpers | [decode_prepare.py](../../../models/deepseek_v4_flash_mtp/decode_prepare.py), [config.py](../../../models/deepseek_v4_flash_mtp/config.py), [utils.py](../../../models/deepseek_v4_flash_mtp/utils.py) |
 
 `config.py`, `utils.py`, `rope_interleave.py`, and `decode_prepare.py` have
-no `__main__` block: they are imported rather than run. Executable compositions,
-including `decode_fwd_mtp.py`, are scheduled by the
-[daily model workflow](../../../.github/workflows/daily_ci.yml).
+no `__main__` block: they are imported rather than run. Every other file,
+including `decode_fwd_mtp.py`, is an executable composition.

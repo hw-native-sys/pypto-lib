@@ -43,37 +43,19 @@ differs, see [Compile configuration](#compile-configuration).
 `a2a3*` maps to `BackendType.Ascend910B`; `a5*` maps to
 `BackendType.Ascend950`.
 
-### Multi-card kernels in CI
+### Multi-card kernels
 
-Most kernels take a single `-d <id>`. A kernel that needs several NPUs
-(e.g. an EP/TP program parsing `-d` as a comma-separated list) declares its
-card count with a marker comment near the top of the file:
+Most kernels take a single `-d <id>`. A kernel that needs several NPUs is an
+EP/TP program that parses `-d` as a comma-separated device list, and it runs
+at its **default** world size unless an explicit `--ep` / `--tp` argument
+says otherwise — commonly EP2 for the distributed DeepSeek entries.
 
-```python
-# ci: devices=2
-```
-
-The real-NPU CI job greps for `# ci: devices=N`; when `N > 1` it borrows
-that many cards from the host device queue with
-`task-submit --device "$DEVICE_ID" --device-num N`. `$DEVICE_ID` is `auto`
-(borrow any free cards) or a fixed id set by the CI backend, and the lent
-set comes back as `$TASK_DEVICE`, passed straight to `-d`. Files without the
-marker default to one card. Runs use each program's **default** world size,
-commonly EP2 for distributed DeepSeek entries. The current workflow contains
-only a commented EP4 command example; it does not provide active EP4 or EP8
-per-file coverage. See the `a2a3` job in
-[.github/workflows/ci.yml](../../.github/workflows/ci.yml).
-
-Multi-card kernels use HCCL, which silent-crashes inside docker. For this
-reason the real-NPU job runs **on the host (no container)**. The shared
-`setup-ci-job` action writes an activation script that enters the Python
-environment and sources CANN's `set_env.sh`; each `task-submit` child sources
-that script, so the child inherits the job's environment. Ring sizing is not
-part of it — it is per task now, see
+Multi-card kernels use HCCL, which silent-crashes inside docker: run them on
+the host, in a shell that has entered the Python environment and sourced
+CANN's `set_env.sh`, e.g.
+`python models/deepseek_v4_flash_mtp/moe.py -p a2a3 --ep 2 -d 0,1`. Ring
+sizing is not part of that environment — it is per task now, see
 [Ring Heap and Scope Stats](../debug-and-tune/ring-heap-and-scope-stats.md).
-Running a multi-card kernel locally needs the same kind of real-device
-shell, e.g.
-`python models/deepseek_v4_flash_mtp/moe.py -p a2a3 --ep 2 -d 0,1`.
 
 ## Phases inside the Golden Harness
 
@@ -352,7 +334,7 @@ false; an uncaught compile/runtime exception is already a nonzero failure.
 
 | Knob | Effect |
 |------|--------|
-| `compile_only=True` | Stops after the compile phase. Useful in CI smoke tests that just check the program lowers cleanly. |
+| `compile_only=True` | Stops after the compile phase. Useful for a smoke test that just checks the program lowers cleanly. |
 | `runtime_dir="<path>"` | Skips compile and reuses an existing `build_output/<...>` directory. Useful when iterating on `golden_fn` or validation logic without recompiling. |
 | `golden_data="<path>"` | Loads inputs from `<path>/in/` and goldens from `<path>/out/` instead of generating them. `golden_data` overrides `golden_fn`. Useful for deterministic regressions: a previous run leaves these files in its `data/` dir, so passing that dir reproduces the exact failing inputs. |
 | `save_data=True` (default `False`) | Writes the `data/in/` + `data/out/` snapshot so the exact inputs/goldens can be replayed later via `golden_data`. Off by default: runs skip the snapshot and validate against the in-memory golden only. Opt in when you need replay; full-model kernels like `models/qwen3_14b/{prefill_fwd,decode_fwd}.py` expose it as `--save-data`. |

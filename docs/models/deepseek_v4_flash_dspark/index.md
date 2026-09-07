@@ -162,10 +162,10 @@ step yet.
 ## Status
 
 Under development, and not wired into `pypto-serving`. Every executable file
-carries its own Golden Harness fixture and CI markers, and the daily model
-workflow sweeps the directory like any other model tree; the
+carries its own Golden Harness fixture; the
 `decode_fwd` / `prefill_fwd` / `decode_layer` / `prefill_layer` compositions and
-the distributed communication oracles are device-only (`ci: no-sim`).
+the distributed communication oracles are device-only and do not run on a
+simulator.
 
 ```bash
 python models/deepseek_v4_flash_dspark/decode_layer.py -p a2a3 --tp 2 --ep 2 -d 0,1

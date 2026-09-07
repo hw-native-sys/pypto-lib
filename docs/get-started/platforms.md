@@ -30,9 +30,6 @@ PYTHONPATH="$PWD" \
   python examples/beginner/hello_world.py -p a2a3 -d 0
 ```
 
-The current CI makes the same distinction: simulator jobs do not source CANN,
-while real-device jobs source CANN and verify the NPU before execution.
-
 ## Inspect each entry point
 
 The beginner examples accept:
@@ -44,29 +41,22 @@ The beginner examples accept:
 
 Do not generalize that device shape to every model. A distributed program can
 require a comma-separated device set and an explicit world-size argument.
-Some large programs are marked `# ci: no-sim`, or take a compile-only path on
-a simulator.
+Some large programs are device-only, or take a compile-only path on a
+simulator.
 
 Always inspect the selected file:
 
 ```bash
 PYTHONPATH="$PWD" python path/to/kernel.py --help
-rg -n '^#\s*ci:' path/to/kernel.py
 ```
 
-## What CI coverage means
+## Declared is not validated
 
-For selected runnable changes, pull-request CI exercises:
-
-- `a2a3sim` and `a5sim` in the simulator matrix, unless the file opts out;
-- `a2a3` on a real NPU, including declared multi-card allocations.
-
-Additional scheduled jobs are configured for broader model and A5-device
-cases. A CLI choice means an entry point accepts the target; it does not by
-itself prove that every path in that program is validated on the target.
-Consult the [Examples](../examples/index.md) page for the stated coverage of a
-particular example, and the [Models](../models/index.md) pages for what each
-model tree implements.
+A CLI choice means an entry point accepts the target; it does not by itself
+prove that every path in that program is validated on the target. Consult the
+[Examples](../examples/index.md) page for the stated platforms of a particular
+example, and the [Models](../models/index.md) pages for what each model tree
+implements.
 
 ## Shared device hosts
 
@@ -81,5 +71,5 @@ source "$CANN_ROOT/set_env.sh"
 npu-smi info
 ```
 
-The repository CI uses `task-submit` to allocate devices, but that service is
-infrastructure-specific and is not required by PyPTO-Lib itself.
+Any site-level allocator is infrastructure-specific and is not required by
+PyPTO-Lib itself.

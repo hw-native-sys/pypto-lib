@@ -6,8 +6,8 @@
 # INCLUDING BUT NOT LIMITED TO NON-INFRINGEMENT, MERCHANTABILITY, OR FITNESS FOR A PARTICULAR PURPOSE.
 # See LICENSE in the root of the software repository for the full text of the License.
 # -----------------------------------------------------------------------------------------------------------
-# ci: devices=2  # CI: 2-card run; borrows 2 cards via task-submit --device-num
-# ci: no-sim    # CI marker: full multi-layer / multi-card forward — device-only, skip on *sim
+# ci: devices=2
+# ci: no-sim
 """DeepSeek-V4 Flash decode forward experiment with looped CSA/HCA layers inside a pl.jit function."""
 
 import argparse

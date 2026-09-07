@@ -6,7 +6,7 @@
 # INCLUDING BUT NOT LIMITED TO NON-INFRINGEMENT, MERCHANTABILITY, OR FITNESS FOR A PARTICULAR PURPOSE.
 # See LICENSE in the root of the software repository for the full text of the License.
 # -----------------------------------------------------------------------------------------------------------
-# ci: no-sim    # Runtime simulation is disabled; a2a3sim compile-only smoke is supported.
+# ci: no-sim
 """Qwen3-14B decode with FP32 inter-layer carry and native PyPTO paged attention.
 
 The projection, output projection, MLP, and dependency topology follow the main

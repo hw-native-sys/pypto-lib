@@ -103,8 +103,8 @@ decode_ssn_draft    serial 4D-blocked single-layer decode
 
 [turboquant_kv.py](../../../models/qwen3_14b/turboquant_kv.py) holds the Lloyd-Max
 codebook computation, the prefill KV quantization, and the QJL K-residual
-quantization. The three `*_draft.py` files are work in progress and excluded
-from CI.
+quantization. The three `*_draft.py` files are work in progress and are not
+part of the tracked runnable set.
 
 ### Sampling and output
 
@@ -140,10 +140,8 @@ scheduling — with the limit measured at each step.
 | Retained CCE attention | [paged_attention_cce.py](../../../models/qwen3_14b/paged_attention_cce.py), [kernels/paged_attention_cce/](../../../models/qwen3_14b/kernels/paged_attention_cce/), [rope_qkv_regen.py](../../../models/qwen3_14b/rope_qkv_regen.py), [test_paged_attention_cce.py](../../../models/qwen3_14b/test_paged_attention_cce.py) |
 | Output and sampling | [rms_lm_head.py](../../../models/qwen3_14b/rms_lm_head.py), [greedy_sample.py](../../../models/qwen3_14b/greedy_sample.py), [topk_select.py](../../../models/qwen3_14b/topk_select.py) |
 | Configuration and serving | [constants.py](../../../models/qwen3_14b/constants.py), [config.py](../../../models/qwen3_14b/config.py), [weights.py](../../../models/qwen3_14b/weights.py), [contract.py](../../../models/qwen3_14b/contract.py) |
-| Drafts (excluded from CI) | [decode_ssn_draft.py](../../../models/qwen3_14b/decode_ssn_draft.py), [decode_tq_draft.py](../../../models/qwen3_14b/decode_tq_draft.py), [prefill_tq_draft.py](../../../models/qwen3_14b/prefill_tq_draft.py) |
+| Drafts (work in progress) | [decode_ssn_draft.py](../../../models/qwen3_14b/decode_ssn_draft.py), [decode_tq_draft.py](../../../models/qwen3_14b/decode_tq_draft.py), [prefill_tq_draft.py](../../../models/qwen3_14b/prefill_tq_draft.py) |
 
 `constants.py`, `config.py`, `contract.py`, `weights.py`, `rms_lm_head.py`,
 `paged_attention_cce.py`, `paged_attention_pypto.py`, `turboquant_kv.py`, and
 `prefill_fwd_a8w8.py` have no `__main__` block and are imported rather than run.
-Which entry points CI schedules is defined by the
-[daily model workflow](../../../.github/workflows/daily_ci.yml).
