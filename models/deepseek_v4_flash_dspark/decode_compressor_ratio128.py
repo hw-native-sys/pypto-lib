@@ -82,6 +82,12 @@ OUT_TILE = 64
 HEAD_TILE = 64
 B_TILE = 8
 MM_B_TILE = 16
+# Token tiles handled sequentially inside one kv_score_proj block. The grid is
+# (token group, output tile); every token tile in a group shares the same o0, so
+# the [OUT_TILE, K_TILE] weight tiles are fetched once per group instead of once
+# per token tile. Coarsening the grid only -- the [MM_B_TILE, OUT_TILE]
+# accumulator shape is unchanged, so the cube tile stays row-compact.
+KV_SCORE_T_GROUP = 2
 # Scratch spans the CP group's whole token stream, not the rank-local B * S.
 GROUP_BS = DECODE_BATCH * DECODE_SEQ
 BS_PAD = ((GROUP_BS + MM_B_TILE - 1) // MM_B_TILE) * MM_B_TILE
@@ -135,33 +141,38 @@ def compressor_ratio128(
     kv_proj_pad = pl.create_tensor([BS_PAD, OUT_DIM], dtype=pl.FP32)
     score_proj_pad = pl.create_tensor([BS_PAD, OUT_DIM], dtype=pl.FP32)
 
+    group_rows = MM_B_TILE * KV_SCORE_T_GROUP
+    t_groups = (t_matmul + group_rows - 1) // group_rows
     with pl.spmd(
-        t_matmul * OUT_DIM // (MM_B_TILE * OUT_TILE), name_hint="kv_score_proj", deps=[late_dep]
+        t_groups * (OUT_DIM // OUT_TILE), name_hint="kv_score_proj", deps=[late_dep]
     ) as _kv_score_tid:
         idx = pl.tile.get_block_idx()
-        global_row0 = (idx // (OUT_DIM // OUT_TILE)) * MM_B_TILE
+        group_row0 = (idx // (OUT_DIM // OUT_TILE)) * group_rows
         o0 = (idx % (OUT_DIM // OUT_TILE)) * OUT_TILE
-        kv_acc = pl.create_tensor([MM_B_TILE, OUT_TILE], dtype=pl.FP32)
-        score_acc = pl.create_tensor([MM_B_TILE, OUT_TILE], dtype=pl.FP32)
-        for kb in pl.pipeline(0, D // K_TILE, stage=2):
-            k0 = kb * K_TILE
-            x_rows = pl.min(MM_B_TILE, bs - global_row0)
-            x_tile = pl.slice(x_flat, [MM_B_TILE, K_TILE], [global_row0, k0], valid_shape=[x_rows, K_TILE])
-            # Weights stored transposed [OUT_DIM, D] and consumed via b_trans=True so the
-            # GM->L1 load is a DN2ZN (each [OUT_TILE, K_TILE] row is K-contiguous = long
-            # bursts) instead of ND2NZ on [K_TILE, OUT_TILE] (K strided = many short
-            # bursts). Cuts the transaction-bound MTE2 cost. Matches ratio4/CSA layout.
-            wkv_tile = wkv[o0 : o0 + OUT_TILE, k0 : k0 + K_TILE]
-            wgate_tile = wgate[o0 : o0 + OUT_TILE, k0 : k0 + K_TILE]
-            if k0 == 0:
-                kv_acc = pl.matmul(x_tile, wkv_tile, out_dtype=pl.FP32, b_trans=True)
-                score_acc = pl.matmul(x_tile, wgate_tile, out_dtype=pl.FP32, b_trans=True)
-            else:
-                kv_acc = pl.matmul_acc(kv_acc, x_tile, wkv_tile, b_trans=True)
-                score_acc = pl.matmul_acc(score_acc, x_tile, wgate_tile, b_trans=True)
+        for tt in pl.range(KV_SCORE_T_GROUP):
+            global_row0 = group_row0 + tt * MM_B_TILE
+            if global_row0 < t_matmul:
+                kv_acc = pl.create_tensor([MM_B_TILE, OUT_TILE], dtype=pl.FP32)
+                score_acc = pl.create_tensor([MM_B_TILE, OUT_TILE], dtype=pl.FP32)
+                for kb in pl.pipeline(0, D // K_TILE, stage=2):
+                    k0 = kb * K_TILE
+                    x_rows = pl.min(MM_B_TILE, bs - global_row0)
+                    x_tile = pl.slice(x_flat, [MM_B_TILE, K_TILE], [global_row0, k0], valid_shape=[x_rows, K_TILE])
+                    # Weights stored transposed [OUT_DIM, D] and consumed via b_trans=True so the
+                    # GM->L1 load is a DN2ZN (each [OUT_TILE, K_TILE] row is K-contiguous = long
+                    # bursts) instead of ND2NZ on [K_TILE, OUT_TILE] (K strided = many short
+                    # bursts). Cuts the transaction-bound MTE2 cost. Matches ratio4/CSA layout.
+                    wkv_tile = wkv[o0 : o0 + OUT_TILE, k0 : k0 + K_TILE]
+                    wgate_tile = wgate[o0 : o0 + OUT_TILE, k0 : k0 + K_TILE]
+                    if k0 == 0:
+                        kv_acc = pl.matmul(x_tile, wkv_tile, out_dtype=pl.FP32, b_trans=True)
+                        score_acc = pl.matmul(x_tile, wgate_tile, out_dtype=pl.FP32, b_trans=True)
+                    else:
+                        kv_acc = pl.matmul_acc(kv_acc, x_tile, wkv_tile, b_trans=True)
+                        score_acc = pl.matmul_acc(score_acc, x_tile, wgate_tile, b_trans=True)
 
-        kv_proj_pad[global_row0 : global_row0 + MM_B_TILE, o0 : o0 + OUT_TILE] = kv_acc
-        score_proj_pad[global_row0 : global_row0 + MM_B_TILE, o0 : o0 + OUT_TILE] = score_acc
+                kv_proj_pad[global_row0 : global_row0 + MM_B_TILE, o0 : o0 + OUT_TILE] = kv_acc
+                score_proj_pad[global_row0 : global_row0 + MM_B_TILE, o0 : o0 + OUT_TILE] = score_acc
 
     compress_state_rows_num = compress_state_block_num * COMPRESS_STATE_BLOCK_SIZE
     compress_state_rows = pl.reshape(compress_state, [compress_state_rows_num, COMPRESS_STATE_DIM])
