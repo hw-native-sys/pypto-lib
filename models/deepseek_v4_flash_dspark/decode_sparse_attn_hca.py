@@ -125,7 +125,8 @@ def sparse_attn_hca(
     kv_seq_lens: pl.Tensor[[B_DYN], pl.INT32],
     freqs_cos: pl.Tensor[[T_DYN, ROPE_DIM], pl.BF16],
     freqs_sin: pl.Tensor[[T_DYN, ROPE_DIM], pl.BF16],
-    cache_ready_dep: pl.Scalar[pl.TASK_ID],
+    ori_cache_ready_dep: pl.Scalar[pl.TASK_ID],
+    cmp_cache_ready_dep: pl.Scalar[pl.TASK_ID],
 ):
     """Compute raw and compressed HCA states and inverse-RoPE metadata."""
     t_dim = pl.tensor.dim(q, 0)
@@ -158,7 +159,7 @@ def sparse_attn_hca(
     with pl.scope():
         raw_kv = pl.create_tensor([request_count * REQUEST_KV_ROWS, HEAD_DIM], dtype=pl.BF16)
         raw_valid = pl.create_tensor([t_dim, WIN], dtype=pl.FP32)
-        with pl.spmd(raw_gather_count, name_hint="hca_gather_kv", deps=[cache_ready_dep]) as raw_gather_tid:
+        with pl.spmd(raw_gather_count, name_hint="hca_gather_kv", deps=[ori_cache_ready_dep]) as raw_gather_tid:
             g_req = pl.tile.get_block_idx()
             g_t0 = g_req * S
             g_base = g_req * REQUEST_KV_ROWS
@@ -380,7 +381,7 @@ def sparse_attn_hca(
 
     with pl.scope():
         cmp_work_kv = pl.create_tensor([cmp_gather_count * ATTN_K_TILE, HEAD_DIM], dtype=pl.BF16)
-        with pl.spmd(cmp_gather_count, name_hint="hca_cmp_work_gather", deps=[cache_ready_dep]) as cmp_gather_tid:
+        with pl.spmd(cmp_gather_count, name_hint="hca_cmp_work_gather", deps=[cmp_cache_ready_dep]) as cmp_gather_tid:
             gather_item = pl.tile.get_block_idx()
             gather_request = gather_item // cmp_work_count
             gather_work = gather_item - gather_request * cmp_work_count
@@ -563,6 +564,7 @@ def sparse_attn_hca_tp1(
         kv_seq_lens,
         freqs_cos,
         freqs_sin,
+        cache_ready_dep,
         cache_ready_dep,
     )
     t_dim = pl.tensor.dim(stream_state_m, 0) // H

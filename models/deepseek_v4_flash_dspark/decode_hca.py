@@ -206,7 +206,7 @@ def decode_hca(
     kv_b_dim = pl.tensor.dim(compress_state_block_table, 0)
     kv_wb_blocks = kv_dim // HCA_WB_TOKEN_TILE
 
-    post_t = pl.create_tensor([t_dim, HC_MULT], dtype=pl.FP32)
+    post_t = pl.create_tensor([t_dim, HC_MULT], dtype=pl.FP32, manual_dep=True)
     comb_t = pl.create_tensor([t_dim, HC_MULT * HC_MULT], dtype=pl.FP32)
     x_normed = pl.create_tensor([t_dim, D], dtype=pl.BF16)
     rms_tid = hc_pre_norm(
@@ -256,7 +256,7 @@ def decode_hca(
             projection_local[pack_row : pack_row + 1, 0:1024] = value_bits
             projection_local[pack_row : pack_row + 1, 1024:2048] = score_bits
             projection_local[pack_row : pack_row + 1, 2048:2560] = kv_local[pack_row : pack_row + 1, :]
-    projection_full = pl.create_tensor([kv_dim, 2560], dtype=pl.BF16)
+    projection_full = pl.create_tensor([kv_dim, 2560], dtype=pl.BF16, manual_dep=True)
     _projection_full, gather_signal, gather_done_tid = decode_cp_hca_projection_allgather_step(
         projection_local, projection_full, gather_window, gather_signal,
         group_base, tp_rank, projection_pack_tid,
@@ -314,8 +314,6 @@ def decode_hca(
         cmp_positions, cmp_slots, cmp_state_slots,
         kv_gather_done_tid, cmp_rope_ready_tid,
     )
-    cache_ready_dep = pl.system.task_dummy(deps=[ori_cache_write_tid, cmp_cache_write_tid])
-
     attention_local_flat = pl.create_tensor([ATTENTION_WINDOW_ROWS, O_GROUP_IN], dtype=pl.BF16)
     attn_out = pl.create_tensor([t_dim, D], dtype=pl.BF16)
     with pl.scope():
@@ -336,7 +334,7 @@ def decode_hca(
             cmp_kv, cmp_block_table,
             position_ids_local, kv_seq_lens,
             freqs_cos_local, freqs_sin_local,
-            cache_ready_dep,
+            ori_cache_write_tid, cmp_cache_write_tid,
         )
 
         attention_grouped = pl.create_tensor([O_GROUPS * LOCAL_T_PAD, O_GROUP_IN], dtype=pl.BF16)

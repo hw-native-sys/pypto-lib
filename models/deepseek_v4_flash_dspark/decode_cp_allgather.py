@@ -192,6 +192,33 @@ def decode_cp_projection_allgather_step(
 
 
 
+@pl.jit.incore
+def cp_hca_projection_allgather_readback(
+    group_out: pl.Out[pl.Tensor[[KV_T_DYN, 2560], pl.BF16]],
+    gather_window: pld.DistributedTensor[[DECODE_GROUP_CAP, D], pl.BF16],
+    gather_signal: pld.DistributedTensor[[TP_SIZE, 1], pl.INT32],
+    group_base: pl.Scalar[pl.INT32],
+    tp_rank: pl.Scalar[pl.INT32],
+    group_rows: pl.Scalar[pl.INDEX],
+    full_rows: pl.Scalar[pl.INDEX],
+):
+    """Copy HCA projection rows and publish readback completion."""
+    worker = pl.tile.get_block_idx()
+    for tile_row in pl.range(worker * READBACK_ROW_TILE, full_rows, READBACK_WORKERS * READBACK_ROW_TILE):
+        window_tile = gather_window[tile_row : tile_row + READBACK_ROW_TILE, 0:2560]
+        group_out[tile_row : tile_row + READBACK_ROW_TILE, 0:2560] = window_tile
+    for tail_row in pl.range(full_rows + worker, group_rows, READBACK_WORKERS):
+        window_row = gather_window[tail_row : tail_row + 1, 0:2560]
+        group_out[tail_row : tail_row + 1, 0:2560] = window_row
+    for peer_tp in pl.range(TP_SIZE):
+        if peer_tp != tp_rank:
+            pld.system.notify(
+                target=gather_signal, peer=group_base + peer_tp,
+                offsets=[tp_rank, 0], value=1, op=pld.NotifyOp.AtomicAdd,
+            )
+    return group_out
+
+
 @pl.jit.inline
 def decode_cp_hca_projection_allgather_step(
     payload_local: pl.Tensor[[Q_T_DYN, 2560], pl.BF16],
@@ -256,29 +283,24 @@ def decode_cp_hca_projection_allgather_step(
     # Copy peer payloads and publish local readback completion.
     group_rows = TP_SIZE * local_rows
     full_rows = (group_rows // READBACK_ROW_TILE) * READBACK_ROW_TILE
-    with pl.spmd(
-        READBACK_WORKERS,
-        name_hint="cp_hca_projection_allgather_readback",
-        deps=[_push_tid, _payload_wait_tid],
-    ) as _readback_tid:
-        worker = pl.tile.get_block_idx()
-        for tile_row in pl.range(worker * READBACK_ROW_TILE, full_rows, READBACK_WORKERS * READBACK_ROW_TILE):
-            window_tile = gather_window[tile_row : tile_row + READBACK_ROW_TILE, 0:2560]
-            group_out[tile_row : tile_row + READBACK_ROW_TILE, 0:2560] = window_tile
-        for tail_row in pl.range(full_rows + worker, group_rows, READBACK_WORKERS):
-            window_row = gather_window[tail_row : tail_row + 1, 0:2560]
-            group_out[tail_row : tail_row + 1, 0:2560] = window_row
-        for peer_tp in pl.range(TP_SIZE):
-            if peer_tp != tp_rank:
-                pld.system.notify(
-                    target=gather_signal, peer=group_base + peer_tp,
-                    offsets=[tp_rank, 0], value=1, op=pld.NotifyOp.AtomicAdd,
-                )
+    # Specialize the explicit SPMD callee on a scratch output.
+    if False:
+        readback_specialize = pl.create_tensor([group_rows, 2560], dtype=pl.BF16)
+        cp_hca_projection_allgather_readback(
+            readback_specialize, gather_window, gather_signal, group_base, tp_rank, group_rows, full_rows,
+        )
+    group_out, _readback_tid = pl.spmd_submit(
+        self.cp_hca_projection_allgather_readback,  # noqa: F821 - materialized by @pl.jit
+        group_out, pl.no_dep(gather_window), pl.no_dep(gather_signal),
+        group_base, tp_rank, group_rows, full_rows,
+        core_num=READBACK_WORKERS, deps=[_payload_wait_tid],
+    )
 
     with pl.at(
         level=pl.Level.CORE_GROUP,
         name_hint="cp_hca_projection_allgather_readback_wait",
         deps=[_readback_tid],
+        no_dep_args=[gather_signal],
     ) as _readback_wait_tid:
         for source_tp in pl.range(TP_SIZE):
             if source_tp != tp_rank:
@@ -291,7 +313,8 @@ def decode_cp_hca_projection_allgather_step(
     with pl.at(
         level=pl.Level.CORE_GROUP,
         name_hint="cp_hca_projection_allgather_retire",
-        deps=[_readback_tid, _readback_wait_tid],
+        deps=[_readback_wait_tid],
+        no_dep_args=[gather_signal],
     ) as retire_tid:
         completion_anchor = pl.read(group_out, [0, 0])
         reset_value = pl.cast(-READBACK_EXPECTED, pl.INT32)
