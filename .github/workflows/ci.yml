@@ -302,9 +302,22 @@ jobs:
             echo "No runnable changed files; nothing to test."
             exit 0
           fi
-          failed=()
+          # Cards this step may hold at once, summed over every in-flight
+          # task-submit task. Submissions no longer block on each other: the
+          # queue schedules them onto whatever cards are free, so the step
+          # costs about the slowest entry rather than the sum of all of them.
+          # No second layer of throttling here on purpose: task-submit owns the
+          # scheduling, holds the per-card locks and queues whatever exceeds the
+          # free cards, so a local budget could only make worse decisions with
+          # less information -- it cannot see the sim jobs, the daily model runs
+          # or the other repos sharing this host's queue.
+          # Parallelism materialises only when the runner sets DEVICE_ID=auto;
+          # a backend that pins a fixed card id serialises these on that card's
+          # lock, which is slower but still correct.
+          log_dir="$RUNNER_TEMP/a2a3-logs"
+          rm -rf "$log_dir"
+          mkdir -p "$log_dir"
           for f in $FILES; do
-            echo "::group::$f"
             # Files needing multiple NPUs declare `# ci: devices=N` (N>1) near
             # the top; borrow that many cards with `--device-num N` (defaults to
             # ep2 / 2-card runs). $TASK_DEVICE is the lent set (a single id, or
@@ -315,13 +328,34 @@ jobs:
             ndev=${ndev:-1}
             devnum_flag=""
             [ "$ndev" -gt 1 ] && devnum_flag="--device-num $ndev"
-            task-submit --device "$DEVICE_ID" $devnum_flag --timeout 3600 --max-time 600 \
-              --run "cd $GITHUB_WORKSPACE/checkout && source activate.sh && PYTHONPATH=$GITHUB_WORKSPACE/checkout python $f -p a2a3 -d \$TASK_DEVICE"
-            if [ $? -ne 0 ]; then
+            slug=${f//\//_}
+            # Each task captures its own log. Concurrent children share this
+            # step's stdout, and interleaved lines would shred the ::group::
+            # blocks -- so nothing is printed until every task has finished and
+            # the logs are replayed below in $FILES order.
+            (
+              task-submit --device "$DEVICE_ID" $devnum_flag --timeout 3600 --max-time 600 \
+                --run "cd $GITHUB_WORKSPACE/checkout && source activate.sh && PYTHONPATH=$GITHUB_WORKSPACE/checkout python $f -p a2a3 -d \$TASK_DEVICE" \
+                > "$log_dir/$slug.log" 2>&1
+              echo $? > "$log_dir/$slug.rc"
+            ) &
+            echo "[submit] $f (cards=$ndev)"
+          done
+          wait
+          failed=()
+          for f in $FILES; do
+            slug=${f//\//_}
+            echo "::group::$f"
+            cat "$log_dir/$slug.log" 2>/dev/null
+            echo "::endgroup::"
+            # A missing .rc means the subshell died before it could record one
+            # (runner OOM, cancellation). Count that as a failure: defaulting to
+            # 0 would report a task that never ran as green.
+            rc=$(cat "$log_dir/$slug.rc" 2>/dev/null || echo 1)
+            if [ "$rc" -ne 0 ]; then
               failed+=("$f")
               echo "::error file=${f}::FAIL"
             fi
-            echo "::endgroup::"
           done
           if [ ${#failed[@]} -ne 0 ]; then
             printf 'FAILED: %s\n' "${failed[@]}"
