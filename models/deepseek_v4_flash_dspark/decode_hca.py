@@ -337,7 +337,6 @@ def decode_hca(
             ori_cache_write_tid, cmp_cache_write_tid,
         )
 
-        attention_grouped = pl.create_tensor([O_GROUPS * LOCAL_T_PAD, O_GROUP_IN], dtype=pl.BF16)
         attn_sink_col = pl.reshape(attn_sink, [H, 1])
         cmp_table_blocks = pl.tensor.dim(cmp_block_table, 1)
         cmp_work_count = (cmp_table_blocks + CMP_PAGES_PER_WORK - 1) // CMP_PAGES_PER_WORK
@@ -390,6 +389,8 @@ def decode_hca(
                 token_block = pack_work // (H // H_TILE)
                 stream_t0 = token_block * ATTENTION_PUBLISH_T_TILE
 
+                publish_first = pl.create_tile([ATTENTION_PUBLISH_T_TILE, O_GROUP_IN], dtype=pl.BF16)
+                publish_second = pl.create_tile([ATTENTION_PUBLISH_T_TILE, O_GROUP_IN], dtype=pl.BF16)
                 for stream_dt in pl.range(ATTENTION_PUBLISH_T_TILE):
                     merge_t = stream_t0 + stream_dt
                     merge_state_row = merge_t * H + stream_h0
@@ -468,24 +469,19 @@ def decode_hca(
                         stream_rope_bf16,
                     )
                     stream_groups = pl.reshape(stream_full_bf16, [PUBLISH_GROUPS, O_GROUP_IN])
-                    for stream_group in pl.unroll(PUBLISH_GROUPS):
-                        stream_pack_row = (global_group0 + stream_group) * T_PAD + merge_t
-                        stream_group_values = pl.slice(stream_groups, [1, O_GROUP_IN], [stream_group, 0])
-                        pl.store(stream_group_values, [stream_pack_row, 0], attention_grouped)
+                    publish_first_row = stream_groups[0:1, 0:O_GROUP_IN]
+                    publish_second_row = stream_groups[1:2, 0:O_GROUP_IN]
+                    publish_first = pl.tile.assemble(publish_first, publish_first_row, [stream_dt, 0])
+                    publish_second = pl.tile.assemble(publish_second, publish_second_row, [stream_dt, 0])
 
-                for group_slot in pl.unroll(PUBLISH_GROUPS):
-                    source_row = (global_group0 + group_slot) * T_PAD + stream_t0
-                    target_row = ((local_group0 + group_slot) * GROUP_T_PAD + tp_rank * local_t + stream_t0)
-                    pld.tensor.put(
-                        dst=attention_window,
-                        peer=group_base + destination_rank,
-                        src=attention_grouped,
-                        dst_offsets=[target_row, 0],
-                        src_offsets=[source_row, 0],
-                        shape=[ATTENTION_PUBLISH_T_TILE, O_GROUP_IN],
-                        chunk_rows=ATTENTION_PUBLISH_T_TILE,
-                        chunk_cols=O_GROUP_IN,
-                    )
+                publish_first_offset = local_group0 * GROUP_T_PAD + tp_rank * local_t + stream_t0
+                publish_second_offset = (local_group0 + 1) * GROUP_T_PAD + tp_rank * local_t + stream_t0
+                pld.tile.remote_store(
+                    publish_first, attention_window, group_base + destination_rank, [publish_first_offset, 0],
+                )
+                pld.tile.remote_store(
+                    publish_second, attention_window, group_base + destination_rank, [publish_second_offset, 0],
+                )
 
             for peer_tp in pl.range(TP_SIZE):
                 if peer_tp != tp_rank:
