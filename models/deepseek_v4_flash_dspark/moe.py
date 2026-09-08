@@ -185,9 +185,11 @@ def dispatch(
         for d in pl.range(N_RANKS):
             for e in pl.range(N_LOCAL):
                 cursor[d * N_LOCAL + e] = 0
+        # Route ids ride one UB tile; a per-element pl.read is a GM access.
+        indices_tile = pl.tile.load(indices, [0, 0], [T, IDX_PAD], valid_shape=[T, TOPK])
         for t in pl.range(active_tokens):
             for k in pl.range(TOPK):
-                eid = pl.read(indices, [t, k])
+                eid = pl.tile.read(indices_tile, [t, k])
                 dst = eid // N_LOCAL
                 loc_e = eid - dst * N_LOCAL
                 cursor[dst * N_LOCAL + loc_e] = cursor[dst * N_LOCAL + loc_e] + 1
@@ -247,39 +249,43 @@ def dispatch(
         if active_tokens > T:
             active_tokens = pl.cast(T, pl.INDEX)
 
-        slot_ctr = pl.array.create(N_RANKS, pl.INT32)
-        for d in pl.range(N_RANKS):
-            slot_ctr[d] = 0
         e_lane_base = loc_e * RECV_MAX + my_rank * MAX_PER_SRC
 
-        # Pad tiles zeroed once; used cols overwritten per push, then remote_store.
-        aux_tile = pl.tile.full([1, AUX_PAD], dtype=pl.FP32, value=0.0)
-        route_tile = pl.tile.full([1, IDX_PAD], dtype=pl.INT32, value=0)
         indices_tile = pl.tile.load(indices, [0, 0], [T, IDX_PAD], valid_shape=[T, TOPK])
         weights_tile = pl.tile.load(weights, [0, 0], [T, AUX_PAD], valid_shape=[T, TOPK])
-        for t in pl.range(active_tokens):
-            for k in pl.range(TOPK):
-                eid = pl.tile.read(indices_tile, [t, k])
-                dst = eid // N_LOCAL
-                le = eid - dst * N_LOCAL
-                if le == loc_e:
-                    slot = slot_ctr[dst]
-                    slot_ctr[dst] = slot + 1
-                    # lane (loc_e, my_rank, slot) on peer=dst
-                    row = e_lane_base + slot
-                    pld.tensor.put(
-                        dst=recv_x,
-                        peer=dst,
-                        src=x_norm_i8,
-                        dst_offsets=[row, 0],
-                        src_offsets=[t, 0],
-                        shape=[1, D],
-                    )
-                    pl.tile.write(aux_tile, [0, AUX_SCALE], pl.read(x_norm_scale, [t, 0]))
-                    pl.tile.write(aux_tile, [0, AUX_W], pl.tile.read(weights_tile, [t, k]))
-                    pld.tile.remote_store(aux_tile, target=recv_aux, peer=dst, offsets=[row, 0])
-                    pl.tile.write(route_tile, [0, 0], pl.cast(t * TOPK + k, pl.INT32))
-                    pld.tile.remote_store(route_tile, target=recv_route, peer=dst, offsets=[row, 0])
+        # dst-major: this block's rows to one dst fill the contiguous lane
+        # (loc_e, my_rank, 0..n), so aux / route ship as one remote_store per dst
+        # instead of a 32 B store per row. The lane tile always stores MAX_PER_SRC
+        # rows; slots >= n are never read back. The route scan repeats per dst.
+        for dst in pl.range(N_RANKS):
+            aux_lane = pl.tile.full([MAX_PER_SRC, AUX_PAD], dtype=pl.FP32, value=0.0)
+            route_lane = pl.tile.full([MAX_PER_SRC, IDX_PAD], dtype=pl.INT32, value=0)
+            slot_ctr = pl.array.create(1, pl.INT32)
+            slot_ctr[0] = 0
+            for t in pl.range(active_tokens):
+                for k in pl.range(TOPK):
+                    eid = pl.tile.read(indices_tile, [t, k])
+                    d = eid // N_LOCAL
+                    le = eid - d * N_LOCAL
+                    if le == loc_e:
+                        if d == dst:
+                            slot = slot_ctr[0]
+                            slot_ctr[0] = slot + 1
+                            # lane (loc_e, my_rank, slot) on peer=dst
+                            row = e_lane_base + slot
+                            pld.tensor.put(
+                                dst=recv_x,
+                                peer=dst,
+                                src=x_norm_i8,
+                                dst_offsets=[row, 0],
+                                src_offsets=[t, 0],
+                                shape=[1, D],
+                            )
+                            pl.tile.write(aux_lane, [slot, AUX_SCALE], pl.read(x_norm_scale, [t, 0]))
+                            pl.tile.write(aux_lane, [slot, AUX_W], pl.tile.read(weights_tile, [t, k]))
+                            pl.tile.write(route_lane, [slot, 0], pl.cast(t * TOPK + k, pl.INT32))
+            pld.tile.remote_store(aux_lane, target=recv_aux, peer=dst, offsets=[e_lane_base, 0])
+            pld.tile.remote_store(route_lane, target=recv_route, peer=dst, offsets=[e_lane_base, 0])
 
         # Payload-arrival notify folded into the push: each block signals every peer
         # after its own puts, so a peer sees N_LOCAL notifies per source per epoch
@@ -368,12 +374,14 @@ def combine(
     with pl.spmd(N_LOCAL, name_hint="combine") as combine_tid:
         e = pl.tile.get_block_idx()
         e_base_row = e * RECV_MAX
+        # This expert's whole route row rides one UB tile.
+        route_row = pl.tile.load(recv_r_route_out, [e, 0], [1, RECV_MAX])
         b = pl.cast(0, pl.INDEX)
         for src in pl.range(N_RANKS):
             n = pl.cast(pl.read(recv_meta_local, [src, e]), pl.INDEX)
             for slot in pl.range(n):
                 out_col = b + slot
-                r_route = pl.cast(pl.read(recv_r_route_out, [e, out_col]), pl.INDEX)
+                r_route = pl.cast(pl.tile.read(route_row, [0, out_col]), pl.INDEX)
                 pld.tensor.put(
                     dst=routed_y_buf,
                     peer=src,
