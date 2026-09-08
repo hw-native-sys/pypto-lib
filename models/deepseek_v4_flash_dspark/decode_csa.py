@@ -64,7 +64,7 @@ from decode_cp_allgather import (
     decode_cp_projection_allgather_step,
 )
 from hc_post import hc_post
-from hc_pre import hc_pre
+from hc_pre import hc_pre_norm
 from decode_indexer import (
     T_PAD as IDX_T_PAD,
     indexer,
@@ -87,7 +87,6 @@ from qkv_proj_rope import (
     qkv_proj_rope,
     rope_prepare,
 )
-from rmsnorm import rms_norm
 from decode_o_proj import (
     ATTENTION_WINDOW_ROWS,
     GROUP_T_PAD,
@@ -261,9 +260,11 @@ def decode_csa(
     idx_topk = pl.create_tensor([t_dim, IDX_TOPK], dtype=pl.INT32)
     post_t = pl.create_tensor([t_dim, HC_MULT], dtype=pl.FP32)
     comb_t = pl.create_tensor([t_dim, HC_MULT * HC_MULT], dtype=pl.FP32)
-    x_mixed = pl.create_tensor([t_dim, D], dtype=pl.BF16)
-    with pl.scope():
-        hc_pre(x_hc, hc_attn_fn, hc_attn_scale, hc_attn_base, x_mixed, post_t, comb_t)
+    x_normed_t = pl.create_tensor([t_dim, D], dtype=pl.BF16)
+    rms_tid = hc_pre_norm(
+        x_hc, hc_attn_fn, hc_attn_scale, hc_attn_base, attn_norm_w,
+        post_t, comb_t, x_normed_t,
+    )
 
     idx_cos_il = pl.create_tensor([t_dim, ROPE_HEAD_DIM], dtype=pl.FP32)
     idx_sin_signed = pl.create_tensor([t_dim, ROPE_HEAD_DIM], dtype=pl.FP32)
@@ -308,9 +309,6 @@ def decode_csa(
                 ),
                 il_sign,
             )
-
-    x_normed_t = pl.create_tensor([t_dim, D], dtype=pl.BF16)
-    rms_tid = rms_norm(x_mixed, attn_norm_w, x_normed_t)
 
     kv_wb_blocks = kv_dim // CSA_WB_TOKEN_TILE
 
@@ -919,11 +917,14 @@ def decode_csa_tp1(
 ):
     t_dim = pl.tensor.dim(x_hc, 0)
     wb_blocks = t_dim // CSA_WB_TOKEN_TILE
-    x_mixed = pl.create_tensor([t_dim, D], dtype=pl.BF16)
     post_t = pl.create_tensor([t_dim, HC_MULT], dtype=pl.FP32)
     comb_t = pl.create_tensor([t_dim, HC_MULT * HC_MULT], dtype=pl.FP32)
+    x_normed_t = pl.create_tensor([t_dim, D], dtype=pl.BF16)
     with pl.scope():
-        hc_pre(x_hc, hc_attn_fn, hc_attn_scale, hc_attn_base, x_mixed, post_t, comb_t)
+        hc_pre_norm(
+            x_hc, hc_attn_fn, hc_attn_scale, hc_attn_base, attn_norm_w,
+            post_t, comb_t, x_normed_t,
+        )
 
     idx_cos_il = pl.create_tensor([t_dim, ROPE_HEAD_DIM], dtype=pl.FP32)
     idx_sin_signed = pl.create_tensor([t_dim, ROPE_HEAD_DIM], dtype=pl.FP32)
@@ -967,9 +968,6 @@ def decode_csa_tp1(
                 il_sign,
             )
 
-    x_normed_t = pl.create_tensor([t_dim, D], dtype=pl.BF16)
-    with pl.scope():
-        rms_norm(x_mixed, attn_norm_w, x_normed_t)
     q = pl.create_tensor([t_dim, H, HEAD_DIM], dtype=pl.BF16)
     kv = pl.create_tensor([t_dim, HEAD_DIM], dtype=pl.BF16)
     qr = pl.create_tensor([t_dim, Q_LORA], dtype=pl.INT8)

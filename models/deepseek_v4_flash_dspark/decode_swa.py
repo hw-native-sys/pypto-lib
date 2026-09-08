@@ -47,7 +47,7 @@ from config import (
     INT8_SCALE_MAX,
     INT8_AMAX_EPS,
 )
-from hc_pre import hc_pre
+from hc_pre import hc_pre_norm
 from hc_post import hc_post
 from decode_cp_allgather import (
     KV_T_DYN,
@@ -55,7 +55,6 @@ from decode_cp_allgather import (
     decode_cp_kv_allgather_step,
 )
 from qkv_proj_rope import kv_proj_rope, q_proj_rope, qkv_proj_rope, rope_prepare
-from rmsnorm import rms_norm
 from decode_o_proj import (
     ATTENTION_WINDOW_ROWS,
     GROUP_T_PAD,
@@ -194,14 +193,14 @@ def decode_swa(
     t_dim = pl.tensor.dim(x_hc, 0)
     kv_dim = pl.tensor.dim(swa_slot_mapping, 0)
     bias_blocks = t_dim // BIAS_T_TILE
-    x_mixed = pl.create_tensor([t_dim, D], dtype=pl.BF16)
-    # split_pre_post -> hc_post is already covered by x_mixed -> attn_out.
+    # split_pre_post -> hc_post is covered by x_normed_t -> attn_out.
     post_t = pl.create_tensor([t_dim, HC_MULT], dtype=pl.FP32, manual_dep=True)
     comb_t = pl.create_tensor([t_dim, HC_MULT * HC_MULT], dtype=pl.FP32)
-    hc_pre(x_hc, hc_attn_fn, hc_attn_scale, hc_attn_base, x_mixed, post_t, comb_t)
-
     x_normed_t = pl.create_tensor([t_dim, D], dtype=pl.BF16)
-    rms_tid = rms_norm(x_mixed, attn_norm_w, x_normed_t)
+    rms_tid = hc_pre_norm(
+        x_hc, hc_attn_fn, hc_attn_scale, hc_attn_base, attn_norm_w,
+        post_t, comb_t, x_normed_t,
+    )
 
     q = pl.create_tensor([t_dim, H, HEAD_DIM], dtype=pl.BF16)
     qr = pl.create_tensor([t_dim, Q_LORA], dtype=pl.INT8)
@@ -563,13 +562,13 @@ def decode_swa_tp1(
     # the ABI for host admission and golden semantics only.
     t_dim = pl.tensor.dim(x_hc, 0)
     bias_blocks = t_dim // BIAS_T_TILE
-    x_mixed = pl.create_tensor([t_dim, D], dtype=pl.BF16)
     post_t = pl.create_tensor([t_dim, HC_MULT], dtype=pl.FP32)
     comb_t = pl.create_tensor([t_dim, HC_MULT * HC_MULT], dtype=pl.FP32)
-    hc_pre(x_hc, hc_attn_fn, hc_attn_scale, hc_attn_base, x_mixed, post_t, comb_t)
-
     x_normed_t = pl.create_tensor([t_dim, D], dtype=pl.BF16)
-    rms_tid = rms_norm(x_mixed, attn_norm_w, x_normed_t)
+    rms_tid = hc_pre_norm(
+        x_hc, hc_attn_fn, hc_attn_scale, hc_attn_base, attn_norm_w,
+        post_t, comb_t, x_normed_t,
+    )
     # Dispatch barrier: kv_proj_matmul resolves one hop after rms_norm.
     late_dep = pl.system.task_dummy(deps=[rms_tid])
     q = pl.create_tensor([t_dim, H, HEAD_DIM], dtype=pl.BF16)

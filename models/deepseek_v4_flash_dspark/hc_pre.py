@@ -12,6 +12,7 @@
 import pypto.language as pl
 
 from config import FLASH as M, DECODE_BATCH, DECODE_SEQ, TP, PREFILL_BATCH, PREFILL_SEQ
+from rmsnorm import rms_norm_apply, rms_norm_inverse
 
 
 # Dynamic shape variables.
@@ -45,20 +46,16 @@ assert HC_MULT == 4, f"hc_pre is specialized to HC_MULT == 4, got {HC_MULT}"
 
 
 @pl.jit.inline
-def hc_pre(
+def hc_pre_gates(
     x: pl.Tensor[[T_DYN, HC_MULT, D], pl.FP32],
     hc_fn: pl.Tensor[[MIX_HC, HC_DIM], pl.FP32],
     hc_scale: pl.Tensor[[3], pl.FP32],
     hc_base: pl.Tensor[[MIX_HC], pl.FP32],
-    x_mixed: pl.Tensor[[T_DYN, D], pl.BF16],
+    pre_val_store: pl.Tensor[[T_DYN, HC_PAD], pl.FP32],
     post: pl.Tensor[[T_DYN, HC_MULT], pl.FP32],
     comb: pl.Tensor[[T_DYN, HC_MULT * HC_MULT], pl.FP32],
 ):
-    """One pl.spmd task per work-type, ordered by their GM read/write dependencies.
-
-    rms -> linear -> linear_reduce -> split_pre_post / comb_sinkhorn / mix_x. Cross-scope
-    buffers are sized to t_linear, the token count padded up to whole 16-row cube tiles.
-    """
+    """Compute pre/post gates and Sinkhorn combinations with padded linear intermediates."""
     t_dim = pl.tensor.dim(x, 0)
     token_tiles = (t_dim + T_TILE - 1) // T_TILE
     t_linear = ((t_dim + LINEAR_T_TILE - 1) // LINEAR_T_TILE) * LINEAR_T_TILE  # pad t_dim up to whole 16-row cube tiles
@@ -126,7 +123,6 @@ def hc_pre(
     # Both compute at HC_PAD width; post narrows to HC_MULT via a valid-shape slice (an 8-wide
     # 32B tile, 4 cols valid -- a bare 4-wide slice allocs a 16B tile ptoas rejects). comb gate
     # lives in comb_sinkhorn.
-    pre_val_store = pl.create_tensor([t_linear, HC_PAD], dtype=pl.FP32)
     # Only the final partial token tile uses these fixed-size staging buffers.
     post_tail_store = pl.create_tensor([T_TILE, HC_PAD], dtype=pl.FP32)
     for ob in pl.spmd(token_tiles, name_hint="split_pre_post", allow_early_resolve=True):
@@ -253,6 +249,27 @@ def hc_pre(
             pl.store(row2_tail, [t0, 2 * HC_MULT], comb)
             pl.store(row3_tail, [t0, 3 * HC_MULT], comb)
 
+    return pre_val_store
+
+
+@pl.jit.inline
+def hc_pre(
+    x: pl.Tensor[[T_DYN, HC_MULT, D], pl.FP32],
+    hc_fn: pl.Tensor[[MIX_HC, HC_DIM], pl.FP32],
+    hc_scale: pl.Tensor[[3], pl.FP32],
+    hc_base: pl.Tensor[[MIX_HC], pl.FP32],
+    x_mixed: pl.Tensor[[T_DYN, D], pl.BF16],
+    post: pl.Tensor[[T_DYN, HC_MULT], pl.FP32],
+    comb: pl.Tensor[[T_DYN, HC_MULT * HC_MULT], pl.FP32],
+):
+    """Compute HC gates and BF16 pre-mixed activations."""
+    t_dim = pl.tensor.dim(x, 0)
+    token_tiles = (t_dim + T_TILE - 1) // T_TILE
+    t_linear = ((t_dim + LINEAR_T_TILE - 1) // LINEAR_T_TILE) * LINEAR_T_TILE
+    pre_val_store = pl.create_tensor([t_linear, HC_PAD], dtype=pl.FP32)
+    hc_pre_gates(x, hc_fn, hc_scale, hc_base, pre_val_store, post, comb)
+    x_flat = pl.reshape(x, [t_dim, HC_DIM])
+
     # mix_x: x_mixed = sum_h pre[:,h]*x[:,h,:], fanned over D/D_SPMD blocks per token tile.
     x_mixed_tail_store = pl.create_tensor([T_TILE, D], dtype=pl.BF16)
     for blk in pl.spmd(token_tiles * (D // D_SPMD), name_hint="mix_x", allow_early_resolve=True):
@@ -285,6 +302,70 @@ def hc_pre(
     return x_mixed
 
 
+
+
+@pl.jit.inline
+def hc_pre_norm(
+    x: pl.Tensor[[T_DYN, HC_MULT, D], pl.FP32],
+    hc_fn: pl.Tensor[[MIX_HC, HC_DIM], pl.FP32],
+    hc_scale: pl.Tensor[[3], pl.FP32],
+    hc_base: pl.Tensor[[MIX_HC], pl.FP32],
+    norm_w: pl.Tensor[[D], pl.BF16],
+    post: pl.Tensor[[T_DYN, HC_MULT], pl.FP32],
+    comb: pl.Tensor[[T_DYN, HC_MULT * HC_MULT], pl.FP32],
+    x_normed: pl.Tensor[[T_DYN, D], pl.BF16],
+):
+    """Normalize pre-mixed activations for complete eight-token decode tiles."""
+    t_dim = pl.tensor.dim(x, 0)
+    t_linear = ((t_dim + LINEAR_T_TILE - 1) // LINEAR_T_TILE) * LINEAR_T_TILE
+    pre_val_store = pl.create_tensor([t_linear, HC_PAD], dtype=pl.FP32)
+    hc_pre_gates(x, hc_fn, hc_scale, hc_base, pre_val_store, post, comb)
+    x_flat = pl.reshape(x, [t_dim, HC_DIM])
+    x_mixed = pl.create_tensor([t_dim, D], dtype=pl.BF16)
+
+    # The RMS statistic includes the intermediate BF16 rounding.
+    with pl.spmd(t_dim // T_TILE, name_hint="mix_x_rms_norm", allow_early_resolve=True) as mixed_tid:
+        t0 = pl.tile.get_block_idx() * T_TILE
+        pre_tile = pre_val_store[t0:t0 + T_TILE, 0:HC_PAD]
+        pre_tile_t = pl.transpose(pre_tile, axis1=0, axis2=1)
+        pre0 = pl.reshape(pre_tile_t[0:1, 0:T_TILE], [T_TILE, 1])
+        pre1 = pl.reshape(pre_tile_t[1:2, 0:T_TILE], [T_TILE, 1])
+        pre2 = pl.reshape(pre_tile_t[2:3, 0:T_TILE], [T_TILE, 1])
+        pre3 = pl.reshape(pre_tile_t[3:4, 0:T_TILE], [T_TILE, 1])
+        sq_sum = pl.full([1, T_TILE], dtype=pl.FP32, value=0.0)
+        for mix_db in pl.pipeline(D // D_TILE, stage=2):
+            d0 = mix_db * D_TILE
+            x0 = x_flat[t0:t0 + T_TILE, d0:d0 + D_TILE]
+            x1 = x_flat[t0:t0 + T_TILE, D + d0:D + d0 + D_TILE]
+            x2 = x_flat[t0:t0 + T_TILE, 2 * D + d0:2 * D + d0 + D_TILE]
+            x3 = x_flat[t0:t0 + T_TILE, 3 * D + d0:3 * D + d0 + D_TILE]
+            y0 = pl.row_expand_mul(x0, pre0)
+            y1 = pl.row_expand_mul(x1, pre1)
+            y2 = pl.row_expand_mul(x2, pre2)
+            y3 = pl.row_expand_mul(x3, pre3)
+            y01 = pl.add(y0, y1)
+            y23 = pl.add(y2, y3)
+            y = pl.add(y01, y23)
+            y_bf16 = pl.cast(y, pl.BF16, mode="rint")
+            x_mixed[t0:t0 + T_TILE, d0:d0 + D_TILE] = y_bf16
+            y_rounded = pl.cast(y_bf16, pl.FP32)
+            y_sq = pl.mul(y_rounded, y_rounded)
+            y_sq_sum = pl.row_sum(y_sq)
+            y_sq_row = pl.reshape(y_sq_sum, [1, T_TILE])
+            sq_sum = pl.add(sq_sum, y_sq_row)
+        norm_sq_sum = pl.create_tensor([1, T_TILE], dtype=pl.FP32)
+        norm_sq_sum[:, :] = sq_sum
+        y_inv = pl.create_tensor([1, T_TILE], dtype=pl.FP32)
+        inverse_result = rms_norm_inverse(norm_sq_sum)
+        y_inv[:, :] = inverse_result
+        for norm_db in pl.pipeline(D // D_TILE, stage=2):
+            d0 = norm_db * D_TILE
+            mixed_input = x_mixed[t0:t0 + T_TILE, d0:d0 + D_TILE]
+            norm_w_input = norm_w[d0:d0 + D_TILE]
+            norm_w_row = pl.reshape(norm_w_input, [1, D_TILE])
+            normed_bf16 = rms_norm_apply(mixed_input, norm_w_row, y_inv)
+            x_normed[t0:t0 + T_TILE, d0:d0 + D_TILE] = normed_bf16
+    return mixed_tid
 
 
 @pl.jit
@@ -420,14 +501,16 @@ if __name__ == "__main__":
     from golden import ratio_allclose, run
 
     MODES = {
-        "decode":  (DECODE_BATCH // TP, DECODE_SEQ),
-        "prefill": (PREFILL_BATCH, PREFILL_SEQ),
+        "decode":     (DECODE_BATCH // TP, DECODE_SEQ),
+        "decode_dp":  (DECODE_BATCH, DECODE_SEQ),
+        "prefill":    (PREFILL_BATCH, PREFILL_SEQ),
     }
+    ALL_MODES = ["decode", "prefill"]
 
     parser = argparse.ArgumentParser()
     parser.add_argument("-p", "--platform", type=str, default="a2a3", choices=["a2a3", "a2a3sim", "a5", "a5sim"])
     parser.add_argument("-d", "--device", type=int, default=0)
-    parser.add_argument("--mode", choices=["decode", "prefill", "all"], default="all", help="decode / prefill batch sizes, or both.")
+    parser.add_argument("--mode", choices=["decode", "decode_dp", "prefill", "all"], default="all", help="decode (per-TP-rank batch) / decode_dp (whole DP-rank batch) / prefill batch sizes, or decode+prefill.")
     parser.add_argument("--enable-chip-swimlane", action="store_true", default=False)
     parser.add_argument("--runtime-dir", type=str, default=None)
     parser.add_argument("--golden-data", type=str, default=None)
@@ -435,7 +518,7 @@ if __name__ == "__main__":
     parser.add_argument("--dump-passes", action="store_true", default=False)
     args = parser.parse_args()
 
-    modes_to_run = list(MODES.keys()) if args.mode == "all" else [args.mode]
+    modes_to_run = ALL_MODES if args.mode == "all" else [args.mode]
 
     for mode_name in modes_to_run:
         B, S = MODES[mode_name]

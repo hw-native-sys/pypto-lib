@@ -51,10 +51,9 @@ from config import (
     INT8_SCALE_MAX,
     INT8_AMAX_EPS,
 )
-from hc_pre import hc_pre
+from hc_pre import hc_pre_norm
 from hc_post import hc_post
 from qkv_proj_rope import kv_proj_rope, q_proj_rope, qkv_proj_rope, rope_prepare
-from rmsnorm import rms_norm
 from decode_cp_allgather import (
     decode_cp_hca_projection_allgather_step,
     KV_B_DYN,
@@ -207,19 +206,19 @@ def decode_hca(
     kv_b_dim = pl.tensor.dim(compress_state_block_table, 0)
     kv_wb_blocks = kv_dim // HCA_WB_TOKEN_TILE
 
-    x_mixed = pl.create_tensor([t_dim, D], dtype=pl.BF16)
     post_t = pl.create_tensor([t_dim, HC_MULT], dtype=pl.FP32)
     comb_t = pl.create_tensor([t_dim, HC_MULT * HC_MULT], dtype=pl.FP32)
-    hc_pre(x_hc, hc_attn_fn, hc_attn_scale, hc_attn_base, x_mixed, post_t, comb_t)
+    x_normed = pl.create_tensor([t_dim, D], dtype=pl.BF16)
+    rms_tid = hc_pre_norm(
+        x_hc, hc_attn_fn, hc_attn_scale, hc_attn_base, attn_norm_w,
+        post_t, comb_t, x_normed,
+    )
 
     cmp_cos_il = pl.create_tensor([kv_b_dim, ROPE_HEAD_DIM], dtype=pl.FP32)
     cmp_sin_signed = pl.create_tensor([kv_b_dim, ROPE_HEAD_DIM], dtype=pl.FP32)
     cmp_rope_ready_tid = rope_interleave(
         cmp_freqs_cos, cmp_freqs_sin, cmp_cos_il, cmp_sin_signed,
     )
-
-    x_normed = pl.create_tensor([t_dim, D], dtype=pl.BF16)
-    rms_tid = rms_norm(x_mixed, attn_norm_w, x_normed)
 
     q = pl.create_tensor([t_dim, H, HEAD_DIM], dtype=pl.BF16)
     kv_full = pl.create_tensor([kv_dim, HEAD_DIM], dtype=pl.BF16)
@@ -757,10 +756,13 @@ def decode_hca_tp1(
     """HCA decode orchestration for compress_ratio=128."""
     t_dim = pl.tensor.dim(x_hc, 0)
     wb_blocks = t_dim // HCA_WB_TOKEN_TILE
-    x_mixed = pl.create_tensor([t_dim, D], dtype=pl.BF16)
     post_t = pl.create_tensor([t_dim, HC_MULT], dtype=pl.FP32)
     comb_t = pl.create_tensor([t_dim, HC_MULT * HC_MULT], dtype=pl.FP32)
-    hc_pre(x_hc, hc_attn_fn, hc_attn_scale, hc_attn_base, x_mixed, post_t, comb_t)
+    x_normed = pl.create_tensor([t_dim, D], dtype=pl.BF16)
+    rms_tid = hc_pre_norm(
+        x_hc, hc_attn_fn, hc_attn_scale, hc_attn_base, attn_norm_w,
+        post_t, comb_t, x_normed,
+    )
 
     # Interleave-duplicated / sign-folded compressed-position rope rows, built once over B rows.
     cmp_cos_il = pl.create_tensor([B, ROPE_HEAD_DIM], dtype=pl.FP32)
@@ -769,8 +771,6 @@ def decode_hca_tp1(
         cmp_freqs_cos, cmp_freqs_sin, cmp_cos_il, cmp_sin_signed,
     )
 
-    x_normed = pl.create_tensor([t_dim, D], dtype=pl.BF16)
-    rms_tid = rms_norm(x_mixed, attn_norm_w, x_normed)
     # Dispatch barrier: kv_proj_matmul resolves one hop after rms_norm.
     late_dep = pl.system.task_dummy(deps=[rms_tid])
     q = pl.create_tensor([t_dim, H, HEAD_DIM], dtype=pl.BF16)
