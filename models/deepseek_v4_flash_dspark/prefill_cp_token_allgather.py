@@ -87,11 +87,11 @@ def prefill_cp_token_allgather_step(
                     offsets=[tp_rank, 0], value=1, op=pld.NotifyOp.AtomicAdd,
                 )
 
-    # Register the peer payload conditions as deferred completion.
+    # Wait for every peer payload arrival.
     with pl.at(level=pl.Level.CORE_GROUP, name_hint="prefill_cp_token_allgather_payload_wait") as _payload_wait_tid:
         for source_tp in pl.range(TP_SIZE):
             if source_tp != tp_rank:
-                pld.system.defer_wait(
+                pld.system.wait(
                     signal=gather_signal, offsets=[source_tp, 0],
                     expected=pl.cast(1, pl.INT32), cmp=pld.WaitCmp.Ge,
                 )
@@ -120,7 +120,7 @@ def prefill_cp_token_allgather_step(
     with pl.at(level=pl.Level.CORE_GROUP, name_hint="prefill_cp_token_allgather_readback_wait") as _readback_wait_tid:
         for source_tp in pl.range(TP_SIZE):
             if source_tp != tp_rank:
-                pld.system.defer_wait(
+                pld.system.wait(
                     signal=gather_signal, offsets=[source_tp, 0],
                     expected=pl.cast(2, pl.INT32), cmp=pld.WaitCmp.Ge,
                 )
