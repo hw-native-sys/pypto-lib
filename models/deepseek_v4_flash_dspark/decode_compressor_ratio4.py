@@ -143,7 +143,12 @@ def compressor_ratio4_pool_projected(
 
     _kv_score_tid = late_dep
 
-    with pl.spmd(POOL_WORKERS, name_hint="scatter_softmax_pool", deps=[_kv_score_tid]) as pool_tid:
+    with pl.spmd(
+        POOL_WORKERS,
+        name_hint="scatter_softmax_pool",
+        deps=[_kv_score_tid],
+        allow_early_resolve=True,
+    ) as pool_tid:
         pool_worker = pl.tile.get_block_idx()
         for c_idx in pl.range(pool_worker, b_dim, POOL_WORKERS):
             first_pos_b = pl.read(position_ids, [c_idx * s_dim])

@@ -92,6 +92,7 @@ TOPK_MAX_LEAVES = TOPK_MAX_CANDIDATES // TOPK_CANDIDATES_PER_LEAF
 TOPK_LEAVES_PER_GROUP = 2
 TOPK_GROUPS_PER_QUERY = TOPK_MAX_LEAVES // TOPK_LEAVES_PER_GROUP
 TOPK_GROUP_WORKERS = 48  # Top-K group-reduction workers
+TOPK_QUERY_WORKERS = 48  # Top-K query-merge workers
 TOPK_GROUP_ROOT_ROWS = T_PAD * TOPK_GROUPS_PER_QUERY
 TOPK_GROUP_SCRATCH_ROWS = TOPK_GROUP_WORKERS * TOPK_LEAVES_PER_GROUP
 TOPK_ARENA_ROWS = TOPK_GROUP_ROOT_ROWS + TOPK_GROUP_SCRATCH_ROWS
@@ -365,16 +366,16 @@ def indexer_topk_group_wave(
         global_group_base = global_group_base + group_count
 
 
-@pl.jit.incore
-def indexer_topk_query_merge(
+@pl.jit.inline
+def indexer_topk_query_merge_one(
+    query: pl.Scalar[pl.INDEX],
     position_ids: pl.Tensor[[T_DYN], pl.INT32],
     kv_seq_lens: pl.Tensor[[B_DYN], pl.INT32],
     pair_arena: pl.Tensor[[TOPK_ARENA_ROWS, TOPK_PAIR_WIDTH], pl.FP32],
     topk_scores: pl.Tensor[[T_DYN, IDX_TOPK], pl.FP32],
     topk_indices: pl.Tensor[[T_DYN, IDX_TOPK], pl.INT32],
 ):
-    """Merge compact group roots and materialize each query's Top-512."""
-    query = pl.tile.get_block_idx()
+    """Merge compact group roots and materialize one query's Top-512."""
     batch_idx = query // S
     position = pl.read(position_ids, [query])
     cache_len = pl.read(kv_seq_lens, [batch_idx]) // COMPRESS_RATIO
@@ -411,6 +412,28 @@ def indexer_topk_query_merge(
     else:
         pl.store(pl.tile.full([1, IDX_TOPK], dtype=pl.FP32, value=FP32_NEG_INF), [query, 0], topk_scores)
         pl.store(pl.tile.full([1, IDX_TOPK], dtype=pl.INT32, value=-1), [query, 0], topk_indices)
+
+
+@pl.jit.incore
+def indexer_topk_query_merge(
+    position_ids: pl.Tensor[[T_DYN], pl.INT32],
+    kv_seq_lens: pl.Tensor[[B_DYN], pl.INT32],
+    pair_arena: pl.Tensor[[TOPK_ARENA_ROWS, TOPK_PAIR_WIDTH], pl.FP32],
+    topk_scores: pl.Tensor[[T_DYN, IDX_TOPK], pl.FP32],
+    topk_indices: pl.Tensor[[T_DYN, IDX_TOPK], pl.INT32],
+):
+    """Merge query roots on one persistent worker per physical AIV."""
+    worker = pl.tile.get_block_idx()
+    query_count = pl.tensor.dim(position_ids, 0)
+    for query in pl.range(worker, query_count, TOPK_QUERY_WORKERS):
+        indexer_topk_query_merge_one(
+            query,
+            position_ids,
+            kv_seq_lens,
+            pair_arena,
+            topk_scores,
+            topk_indices,
+        )
 
 
 @pl.jit.inline(auto_scope=False)
@@ -455,6 +478,7 @@ def indexer_score_topk_forest(
         TOPK_SCORE_WORKERS,
         name_hint="indexer_score_leaf_wave",
         deps=[qh_quant_tid, weights_tid, cache_write_tid],
+        allow_early_resolve=True,
         optimizations=[pl.split(pl.SplitMode.NONE, slot_num=2)],
     ) as score_tid:
         worker = pl.tile.get_block_idx()
@@ -529,7 +553,11 @@ def indexer_score_topk_forest(
         else:
             with pl.spmd(TOPK_GROUP_WORKERS, name_hint="indexer_topk_group_wave", deps=[score_tid]) as topk_tid:
                 indexer_topk_group_wave(position_ids, kv_seq_lens, score_arena, pair_arena)
-            with pl.spmd(bs, name_hint="indexer_topk_query_merge", deps=[topk_tid]) as _score_tid:
+            with pl.spmd(
+                TOPK_QUERY_WORKERS,
+                name_hint="indexer_topk_query_merge",
+                deps=[topk_tid],
+            ) as _merge_tid:
                 indexer_topk_query_merge(position_ids, kv_seq_lens, pair_arena, topk_scores, topk_idxs)
 
     return topk_scores, topk_idxs, score_tid

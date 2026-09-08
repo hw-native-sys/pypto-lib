@@ -80,9 +80,11 @@ from decode_indexer_compressor import (
     indexer_compressor_write,
 )
 from qkv_proj_rope import (
+    QPROJ_TAIL_M_TILE,
     QPROJ_T_PAD,
     kv_proj_rope,
-    q_proj_q,
+    q_proj_q_dequant,
+    q_proj_q_matmul,
     q_proj_qr,
     qkv_proj_rope,
     rope_prepare,
@@ -270,7 +272,11 @@ def decode_csa(
     idx_sin_signed = pl.create_tensor([t_dim, ROPE_HEAD_DIM], dtype=pl.FP32)
     cmp_cos_il_full = pl.create_tensor([kv_dim, ROPE_HEAD_DIM], dtype=pl.FP32)
     cmp_sin_signed_full = pl.create_tensor([kv_dim, ROPE_HEAD_DIM], dtype=pl.FP32)
-    with pl.spmd(48, name_hint="csa_rope_interleave") as rope_tid:
+    with pl.spmd(
+        48,
+        name_hint="csa_rope_interleave",
+        allow_early_resolve=True,
+    ) as rope_tid:
         rope_worker = pl.tile.get_block_idx()
         il_ones = pl.full([4, ROPE_HEAD_DIM], dtype=pl.FP32, value=1.0)
         il_col = pl.col_expand_mul(
@@ -328,7 +334,7 @@ def decode_csa(
         rope_prepare(freqs_cos_local, freqs_sin_local, q_cos_il, q_sin_signed, q_swap_idx)
 
         qr_i8_matmul = pl.create_tensor([QPROJ_T_PAD, Q_LORA], dtype=pl.INT8)
-        qr_scale_pad = pl.create_tensor([QPROJ_T_PAD, 1], dtype=pl.FP32, manual_dep=True)
+        qr_scale_pad = pl.create_tensor([QPROJ_T_PAD, 1], dtype=pl.FP32)
         q_proj_qr(
             x_normed_t, wq_a, gamma_cq, qr, qr_scale,
             qr_i8_matmul, qr_scale_pad,
@@ -376,9 +382,14 @@ def decode_csa(
             x_normed_t, inner_wkv, inner_wgate, idx_values_local, idx_scores_local,
             projection_dep, idx_qr_mm_tid,
         )
+        qproj_t_matmul = ((t_dim + QPROJ_TAIL_M_TILE - 1) // QPROJ_TAIL_M_TILE) * QPROJ_TAIL_M_TILE
+        q_proj_i32 = pl.create_tensor([qproj_t_matmul, H * HEAD_DIM], dtype=pl.INT32)
+        q_proj_i32, qproj_tid = q_proj_q_matmul(
+            wq_b, qr_i8_matmul, q_proj_i32, t_dim, idx_projection_tid,
+        )
         cmp_projection_tid = compressor_ratio4_project(
             x_normed_t, cmp_wkv, cmp_wgate, cmp_values_local, cmp_scores_local,
-            idx_projection_tid,
+            qproj_tid,
         )
         kv_local = pl.create_tensor([t_dim, HEAD_DIM], dtype=pl.BF16)
         kv_proj_rope(
@@ -457,19 +468,20 @@ def decode_csa(
             idx_kv_cache, idx_kv_scale, idx_slots, cmp_positions,
             idx_rms_tid, qh_mm_tid,
         )
-        # Query projection.
-        q_proj_q(
-            x_normed_t, wq_b, wq_b_scale,
+        q_proj_q_dequant(
+            wq_b_scale,
             q_cos_il, q_sin_signed, q_swap_idx, q,
-            qr_i8_matmul, qr_scale_pad, idx_hadamard_tid,
+            qr_scale_pad, q_proj_i32, 0, t_dim,
         )
         idx_topk_scores, idx_topk, leaf_tid = indexer_weights_score(
             x_normed_t, weights_proj, qr_hadamard_i8, qr_hadamard_scale_dq,
             idx_kv_cache, idx_kv_scale, idx_block_table,
             idx_topk_scores, idx_topk,
             idx_positions, kv_seq_lens,
-            idx_cache_write_tid, cmp_projection_tid, qh_quant_tid,
+            idx_cache_write_tid, idx_hadamard_tid, qh_quant_tid,
         )
+        # Fence non-Top-K successors behind the completed leaf wave.
+        post_leaf_fence_tid = pl.system.task_dummy(deps=[leaf_tid])
 
         # Indexer score and Top-K selection.
         compressor_ratio4_cache_write(
@@ -477,7 +489,7 @@ def decode_csa(
             cmp_cos_il_full, cmp_sin_signed_full, cmp_kv, cmp_slots,
             compress_state, cmp_state_table, cmp_ape,
             cmp_kv_proj_pad, cmp_score_proj_pad, cmp_positions, cmp_state_slots,
-            cmp_pool_tid, leaf_tid,
+            cmp_pool_tid, post_leaf_fence_tid,
         )
         ori_block_num = pl.tensor.dim(kv_cache, 0)
         kv_cache_flat = pl.reshape(kv_cache, [ori_block_num * BLOCK_SIZE, HEAD_DIM])
