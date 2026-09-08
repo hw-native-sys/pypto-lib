@@ -141,126 +141,45 @@ _ATTENTION_MODULES = { "swa": swa, "hca": hca, "csa": csa, }
 
 _SWA_INPUT_NAMES = (
     "x_hc",
-    "hc_attn_fn",
-    "hc_attn_scale",
-    "hc_attn_base",
-    "attn_norm_w",
-    "wq_a",
-    "wq_b",
-    "wq_b_scale",
-    "wkv",
-    "gamma_cq",
-    "gamma_ckv",
-    "freqs_cos_local",
-    "freqs_sin_local",
-    "freqs_cos",
-    "freqs_sin",
-    "kv_cache",
-    "swa_slot_mapping",
-    "swa_indices",
-    "swa_lens",
-    "position_ids",
-    "attn_sink",
-    "wo_a",
-    "wo_b",
-    "wo_b_scale",
+    "hc_attn_fn", "hc_attn_scale", "hc_attn_base",
+    "attn_norm_w", "wq_a", "wq_b", "wq_b_scale", "wkv", "gamma_cq", "gamma_ckv",
+    "freqs_cos", "freqs_sin",
+    "kv_cache", "swa_slot_mapping", "swa_indices", "swa_lens",
+    "position_ids", "attn_sink",
+    "wo_a", "wo_b", "wo_b_scale",
 )
 
 _HCA_INPUT_NAMES = (
     "x_hc",
-    "hc_attn_fn",
-    "hc_attn_scale",
-    "hc_attn_base",
-    "attn_norm_w",
-    "wq_a",
-    "wq_b",
-    "wq_b_scale",
-    "wkv",
-    "gamma_cq",
-    "gamma_ckv",
-    "freqs_cos_local",
-    "freqs_sin_local",
-    "freqs_cos",
-    "freqs_sin",
-    "cmp_freqs_cos",
-    "cmp_freqs_sin",
-    "cmp_wkv",
-    "cmp_wgate",
-    "cmp_ape",
-    "cmp_norm_w",
-    "compress_state",
-    "compress_state_block_table",
-    "kv_cache",
-    "cmp_kv",
-    "cmp_block_table",
-    "ori_slot_mapping",
-    "window_swa_indices",
-    "window_swa_lens",
-    "cmp_slot_mapping",
-    "state_slot_mapping",
-    "position_ids_local",
-    "position_ids",
-    "kv_seq_lens",
-    "attn_sink",
-    "wo_a",
-    "wo_b",
-    "wo_b_scale",
+    "hc_attn_fn", "hc_attn_scale", "hc_attn_base",
+    "attn_norm_w", "wq_a", "wq_b", "wq_b_scale", "wkv", "gamma_cq", "gamma_ckv",
+    "freqs_cos", "freqs_sin", "cmp_freqs_cos", "cmp_freqs_sin",
+    "cmp_wkv", "cmp_wgate", "cmp_ape", "cmp_norm_w",
+    "compress_state", "compress_state_block_table",
+    "kv_cache", "cmp_kv", "cmp_block_table",
+    "ori_slot_mapping", "window_swa_indices", "window_swa_lens",
+    "cmp_slot_mapping", "state_slot_mapping",
+    "position_ids_local", "position_ids", "kv_seq_lens",
+    "attn_sink", "wo_a", "wo_b", "wo_b_scale",
 )
 
 _CSA_INPUT_NAMES = (
     "x_hc",
-    "hc_attn_fn",
-    "hc_attn_scale",
-    "hc_attn_base",
-    "attn_norm_w",
-    "wq_a",
-    "wq_b",
-    "wq_b_scale",
-    "wkv",
-    "gamma_cq",
-    "gamma_ckv",
-    "freqs_cos_local",
-    "freqs_sin_local",
-    "freqs_cos",
-    "freqs_sin",
-    "cmp_freqs_cos",
-    "cmp_freqs_sin",
-    "cmp_wkv",
-    "cmp_wgate",
-    "cmp_ape",
-    "cmp_norm_w",
-    "compress_state",
-    "compress_state_block_table",
-    "idx_wq_b",
-    "idx_wq_b_scale",
-    "weights_proj",
-    "hadamard_idx",
-    "inner_wkv",
-    "inner_wgate",
-    "inner_ape",
-    "inner_norm_w",
-    "inner_compress_state",
-    "inner_compress_state_block_table",
-    "kv_cache",
-    "cmp_kv",
-    "cmp_block_table",
-    "idx_kv_cache",
-    "idx_kv_scale",
-    "idx_block_table",
-    "ori_slot_mapping",
-    "window_swa_indices",
-    "window_swa_lens",
-    "cmp_slot_mapping",
-    "idx_slot_mapping",
-    "state_slot_mapping",
-    "inner_state_slot_mapping",
-    "position_ids_local",
-    "position_ids",
-    "kv_seq_lens",
-    "attn_sink",
-    "wo_a",
-    "wo_b",
-    "wo_b_scale",
+    "hc_attn_fn", "hc_attn_scale", "hc_attn_base",
+    "attn_norm_w", "wq_a", "wq_b", "wq_b_scale", "wkv", "gamma_cq", "gamma_ckv",
+    "freqs_cos", "freqs_sin", "cmp_freqs_cos", "cmp_freqs_sin",
+    "cmp_wkv", "cmp_wgate", "cmp_ape", "cmp_norm_w",
+    "compress_state", "compress_state_block_table",
+    "idx_wq_b", "idx_wq_b_scale", "weights_proj", "hadamard_idx",
+    "inner_wkv", "inner_wgate", "inner_ape", "inner_norm_w",
+    "inner_compress_state", "inner_compress_state_block_table",
+    "kv_cache", "cmp_kv", "cmp_block_table",
+    "idx_kv_cache", "idx_kv_scale", "idx_block_table",
+    "ori_slot_mapping", "window_swa_indices", "window_swa_lens",
+    "cmp_slot_mapping", "idx_slot_mapping",
+    "state_slot_mapping", "inner_state_slot_mapping",
+    "position_ids_local", "position_ids", "kv_seq_lens",
+    "attn_sink", "wo_a", "wo_b", "wo_b_scale",
 )
 
 
@@ -358,12 +277,7 @@ def _validate_active_tokens(active_tokens):
 
 def _distributed_shape(module, name, shape):
     if name == "wo_a":
-        return [
-            EP_SIZE,
-            module.LOCAL_O_GROUPS,
-            module.O_LORA,
-            module.O_GROUP_IN,
-        ]
+        return [EP_SIZE, module.LOCAL_O_GROUPS, module.O_LORA, module.O_GROUP_IN]
     if name == "wo_b":
         return [EP_SIZE, module.D, module.LOCAL_O_WIDTH]
     return [EP_SIZE, *shape]
@@ -484,10 +398,8 @@ def decode_layer_swa(
     wkv: pl.Tensor[[D, HEAD_DIM], pl.BF16],
     gamma_cq: pl.Tensor[[Q_LORA], pl.BF16],
     gamma_ckv: pl.Tensor[[HEAD_DIM], pl.BF16],
-    freqs_cos_local: pl.Tensor[[T_DYN, ROPE_HEAD_DIM], pl.BF16],
-    freqs_sin_local: pl.Tensor[[T_DYN, ROPE_HEAD_DIM], pl.BF16],
-    freqs_cos: pl.Tensor[[KV_T_DYN, ROPE_HEAD_DIM], pl.BF16],
-    freqs_sin: pl.Tensor[[KV_T_DYN, ROPE_HEAD_DIM], pl.BF16],
+    freqs_cos: pl.Tensor[[T_DYN, ROPE_HEAD_DIM], pl.BF16],
+    freqs_sin: pl.Tensor[[T_DYN, ROPE_HEAD_DIM], pl.BF16],
     kv_cache: pl.InOut[pl.Tensor[[ORI_BLOCK_NUM_DYN, BLOCK_SIZE, 1, HEAD_DIM], pl.BF16]],
     swa_slot_mapping: pl.Tensor[[KV_T_DYN], pl.INT64],
     swa_indices: pl.Tensor[[T_DYN, WIN], pl.INT32],
@@ -550,7 +462,7 @@ def decode_layer_swa(
                 hc_attn_fn, hc_attn_scale, hc_attn_base,
                 attn_norm_w, wq_a, wq_b, wq_b_scale, wkv,
                 gamma_cq, gamma_ckv,
-                freqs_cos_local, freqs_sin_local,
+                freqs_cos, freqs_sin,
                 kv_cache, swa_slot_mapping, swa_indices, swa_lens,
                 position_ids, attn_sink,
                 wo_a, wo_b, wo_b_scale,
@@ -562,7 +474,7 @@ def decode_layer_swa(
                 hc_attn_fn, hc_attn_scale, hc_attn_base,
                 attn_norm_w, wq_a, wq_b, wq_b_scale, wkv,
                 gamma_cq, gamma_ckv,
-                freqs_cos_local, freqs_sin_local, freqs_cos, freqs_sin,
+                freqs_cos, freqs_sin,
                 kv_cache, swa_slot_mapping, swa_indices, swa_lens,
                 position_ids, attn_sink,
                 wo_a, wo_b, wo_b_scale,
@@ -615,10 +527,8 @@ def decode_layer_swa_test(
     wkv: pl.Tensor[[D, HEAD_DIM], pl.BF16],
     gamma_cq: pl.Tensor[[Q_LORA], pl.BF16],
     gamma_ckv: pl.Tensor[[HEAD_DIM], pl.BF16],
-    freqs_cos_local: pl.Tensor[[T_DYN, ROPE_HEAD_DIM], pl.BF16],
-    freqs_sin_local: pl.Tensor[[T_DYN, ROPE_HEAD_DIM], pl.BF16],
-    freqs_cos: pl.Tensor[[KV_T_DYN, ROPE_HEAD_DIM], pl.BF16],
-    freqs_sin: pl.Tensor[[KV_T_DYN, ROPE_HEAD_DIM], pl.BF16],
+    freqs_cos: pl.Tensor[[T_DYN, ROPE_HEAD_DIM], pl.BF16],
+    freqs_sin: pl.Tensor[[T_DYN, ROPE_HEAD_DIM], pl.BF16],
     kv_cache: pl.InOut[pl.Tensor[[ORI_BLOCK_NUM_DYN, BLOCK_SIZE, 1, HEAD_DIM], pl.BF16]],
     swa_slot_mapping: pl.Tensor[[KV_T_DYN], pl.INT64],
     swa_indices: pl.Tensor[[T_DYN, WIN], pl.INT32],
@@ -674,10 +584,8 @@ def decode_layer_swa_test(
 ):
     """Standalone child: run one layer and clear its fresh MoE signals."""
     x_hc.bind_dynamic(0, T_DYN)
-    freqs_cos_local.bind_dynamic(0, T_DYN)
-    freqs_cos.bind_dynamic(0, KV_T_DYN)
-    freqs_sin.bind_dynamic(0, KV_T_DYN)
-    freqs_sin_local.bind_dynamic(0, T_DYN)
+    freqs_cos.bind_dynamic(0, T_DYN)
+    freqs_sin.bind_dynamic(0, T_DYN)
     kv_cache.bind_dynamic(0, ORI_BLOCK_NUM_DYN)
     swa_slot_mapping.bind_dynamic(0, KV_T_DYN)
     swa_indices.bind_dynamic(0, T_DYN)
@@ -691,7 +599,7 @@ def decode_layer_swa_test(
         hc_attn_fn, hc_attn_scale, hc_attn_base,
         attn_norm_w, wq_a, wq_b, wq_b_scale, wkv,
         gamma_cq, gamma_ckv,
-        freqs_cos_local, freqs_sin_local, freqs_cos, freqs_sin,
+        freqs_cos, freqs_sin,
         kv_cache, swa_slot_mapping, swa_indices, swa_lens, position_ids,
         attn_sink,
         wo_a, wo_b, wo_b_scale,
@@ -725,10 +633,8 @@ def l3_decode_layer_swa(
     wkv: pl.Tensor[[N_RANKS, D, HEAD_DIM], pl.BF16],
     gamma_cq: pl.Tensor[[N_RANKS, Q_LORA], pl.BF16],
     gamma_ckv: pl.Tensor[[N_RANKS, HEAD_DIM], pl.BF16],
-    freqs_cos_local: pl.Tensor[[N_RANKS, T_DYN, ROPE_HEAD_DIM], pl.BF16],
-    freqs_sin_local: pl.Tensor[[N_RANKS, T_DYN, ROPE_HEAD_DIM], pl.BF16],
-    freqs_cos: pl.Tensor[[N_RANKS, KV_T_DYN, ROPE_HEAD_DIM], pl.BF16],
-    freqs_sin: pl.Tensor[[N_RANKS, KV_T_DYN, ROPE_HEAD_DIM], pl.BF16],
+    freqs_cos: pl.Tensor[[N_RANKS, T_DYN, ROPE_HEAD_DIM], pl.BF16],
+    freqs_sin: pl.Tensor[[N_RANKS, T_DYN, ROPE_HEAD_DIM], pl.BF16],
     kv_cache: pl.InOut[pl.Tensor[[N_RANKS, ORI_BLOCK_NUM_DYN, BLOCK_SIZE, 1, HEAD_DIM], pl.BF16]],
     swa_slot_mapping: pl.Tensor[[N_RANKS, KV_T_DYN], pl.INT64],
     swa_indices: pl.Tensor[[N_RANKS, T_DYN, WIN], pl.INT32],
@@ -766,10 +672,8 @@ def l3_decode_layer_swa(
 ):
     """Launch one standalone SWA+MoE layer child on every EP rank."""
     x_hc.bind_dynamic(1, T_DYN)
-    freqs_cos_local.bind_dynamic(1, T_DYN)
-    freqs_cos.bind_dynamic(1, KV_T_DYN)
-    freqs_sin.bind_dynamic(1, KV_T_DYN)
-    freqs_sin_local.bind_dynamic(1, T_DYN)
+    freqs_cos.bind_dynamic(1, T_DYN)
+    freqs_sin.bind_dynamic(1, T_DYN)
     kv_cache.bind_dynamic(1, ORI_BLOCK_NUM_DYN)
     swa_slot_mapping.bind_dynamic(1, KV_T_DYN)
     swa_indices.bind_dynamic(1, T_DYN)
@@ -816,7 +720,6 @@ def l3_decode_layer_swa(
             hc_attn_fn[rank], hc_attn_scale[rank], hc_attn_base[rank],
             attn_norm_w[rank], wq_a[rank], wq_b[rank],
             wq_b_scale[rank], wkv[rank], gamma_cq[rank], gamma_ckv[rank],
-            freqs_cos_local[rank], freqs_sin_local[rank],
             freqs_cos[rank], freqs_sin[rank],
             kv_cache[rank], swa_slot_mapping[rank], swa_indices[rank],
             swa_lens[rank], position_ids[rank], attn_sink[rank],
@@ -855,10 +758,8 @@ def decode_layer_hca(
     wkv: pl.Tensor[[D, HEAD_DIM], pl.BF16],
     gamma_cq: pl.Tensor[[Q_LORA], pl.BF16],
     gamma_ckv: pl.Tensor[[HEAD_DIM], pl.BF16],
-    freqs_cos_local: pl.Tensor[[T_DYN, ROPE_HEAD_DIM], pl.BF16],
-    freqs_sin_local: pl.Tensor[[T_DYN, ROPE_HEAD_DIM], pl.BF16],
-    freqs_cos: pl.Tensor[[KV_T_DYN, ROPE_HEAD_DIM], pl.BF16],
-    freqs_sin: pl.Tensor[[KV_T_DYN, ROPE_HEAD_DIM], pl.BF16],
+    freqs_cos: pl.Tensor[[T_DYN, ROPE_HEAD_DIM], pl.BF16],
+    freqs_sin: pl.Tensor[[T_DYN, ROPE_HEAD_DIM], pl.BF16],
     cmp_freqs_cos: pl.Tensor[[KV_B_DYN, ROPE_HEAD_DIM // 2], pl.FP32],
     cmp_freqs_sin: pl.Tensor[[KV_B_DYN, ROPE_HEAD_DIM // 2], pl.FP32],
     cmp_wkv: pl.Tensor[[HCA_MAIN_OUT_DIM, D], pl.BF16],
@@ -935,7 +836,7 @@ def decode_layer_hca(
                 hc_attn_fn, hc_attn_scale, hc_attn_base,
                 attn_norm_w, wq_a, wq_b, wq_b_scale, wkv,
                 gamma_cq, gamma_ckv,
-                freqs_cos_local, freqs_sin_local, cmp_freqs_cos, cmp_freqs_sin,
+                freqs_cos, freqs_sin, cmp_freqs_cos, cmp_freqs_sin,
                 cmp_wkv, cmp_wgate, cmp_ape, cmp_norm_w,
                 compress_state, compress_state_block_table,
                 kv_cache, cmp_kv, cmp_block_table,
@@ -951,7 +852,7 @@ def decode_layer_hca(
                 hc_attn_fn, hc_attn_scale, hc_attn_base,
                 attn_norm_w, wq_a, wq_b, wq_b_scale, wkv,
                 gamma_cq, gamma_ckv,
-                freqs_cos_local, freqs_sin_local, freqs_cos, freqs_sin,
+                freqs_cos, freqs_sin,
                 cmp_freqs_cos, cmp_freqs_sin,
                 cmp_wkv, cmp_wgate, cmp_ape, cmp_norm_w,
                 compress_state, compress_state_block_table,
@@ -1009,10 +910,8 @@ def decode_layer_hca_test(
     wkv: pl.Tensor[[D, HEAD_DIM], pl.BF16],
     gamma_cq: pl.Tensor[[Q_LORA], pl.BF16],
     gamma_ckv: pl.Tensor[[HEAD_DIM], pl.BF16],
-    freqs_cos_local: pl.Tensor[[T_DYN, ROPE_HEAD_DIM], pl.BF16],
-    freqs_sin_local: pl.Tensor[[T_DYN, ROPE_HEAD_DIM], pl.BF16],
-    freqs_cos: pl.Tensor[[KV_T_DYN, ROPE_HEAD_DIM], pl.BF16],
-    freqs_sin: pl.Tensor[[KV_T_DYN, ROPE_HEAD_DIM], pl.BF16],
+    freqs_cos: pl.Tensor[[T_DYN, ROPE_HEAD_DIM], pl.BF16],
+    freqs_sin: pl.Tensor[[T_DYN, ROPE_HEAD_DIM], pl.BF16],
     cmp_freqs_cos: pl.Tensor[[KV_B_DYN, ROPE_HEAD_DIM // 2], pl.FP32],
     cmp_freqs_sin: pl.Tensor[[KV_B_DYN, ROPE_HEAD_DIM // 2], pl.FP32],
     cmp_wkv: pl.Tensor[[HCA_MAIN_OUT_DIM, D], pl.BF16],
@@ -1082,12 +981,10 @@ def decode_layer_hca_test(
 ):
     """Standalone child: run one HCA layer and clear its fresh MoE signals."""
     x_hc.bind_dynamic(0, T_DYN)
-    freqs_cos_local.bind_dynamic(0, T_DYN)
-    freqs_cos.bind_dynamic(0, KV_T_DYN)
-    freqs_sin.bind_dynamic(0, KV_T_DYN)
+    freqs_cos.bind_dynamic(0, T_DYN)
     cmp_freqs_cos.bind_dynamic(0, KV_B_DYN)
     cmp_freqs_sin.bind_dynamic(0, KV_B_DYN)
-    freqs_sin_local.bind_dynamic(0, T_DYN)
+    freqs_sin.bind_dynamic(0, T_DYN)
     compress_state.bind_dynamic(0, HCA_COMPRESS_STATE_BLOCK_NUM_DYN)
     compress_state_block_table.bind_dynamic(0, KV_B_DYN)
     kv_cache.bind_dynamic(0, ORI_BLOCK_NUM_DYN)
@@ -1110,7 +1007,7 @@ def decode_layer_hca_test(
         hc_attn_fn, hc_attn_scale, hc_attn_base,
         attn_norm_w, wq_a, wq_b, wq_b_scale, wkv,
         gamma_cq, gamma_ckv,
-        freqs_cos_local, freqs_sin_local, freqs_cos, freqs_sin,
+        freqs_cos, freqs_sin,
         cmp_freqs_cos, cmp_freqs_sin,
         cmp_wkv, cmp_wgate, cmp_ape, cmp_norm_w,
         compress_state, compress_state_block_table,
@@ -1149,10 +1046,8 @@ def l3_decode_layer_hca(
     wkv: pl.Tensor[[N_RANKS, D, HEAD_DIM], pl.BF16],
     gamma_cq: pl.Tensor[[N_RANKS, Q_LORA], pl.BF16],
     gamma_ckv: pl.Tensor[[N_RANKS, HEAD_DIM], pl.BF16],
-    freqs_cos_local: pl.Tensor[[N_RANKS, T_DYN, ROPE_HEAD_DIM], pl.BF16],
-    freqs_sin_local: pl.Tensor[[N_RANKS, T_DYN, ROPE_HEAD_DIM], pl.BF16],
-    freqs_cos: pl.Tensor[[N_RANKS, KV_T_DYN, ROPE_HEAD_DIM], pl.BF16],
-    freqs_sin: pl.Tensor[[N_RANKS, KV_T_DYN, ROPE_HEAD_DIM], pl.BF16],
+    freqs_cos: pl.Tensor[[N_RANKS, T_DYN, ROPE_HEAD_DIM], pl.BF16],
+    freqs_sin: pl.Tensor[[N_RANKS, T_DYN, ROPE_HEAD_DIM], pl.BF16],
     cmp_freqs_cos: pl.Tensor[[N_RANKS, KV_B_DYN, ROPE_HEAD_DIM // 2], pl.FP32],
     cmp_freqs_sin: pl.Tensor[[N_RANKS, KV_B_DYN, ROPE_HEAD_DIM // 2], pl.FP32],
     cmp_wkv: pl.Tensor[[N_RANKS, HCA_MAIN_OUT_DIM, D], pl.BF16],
@@ -1204,12 +1099,10 @@ def l3_decode_layer_hca(
 ):
     """Launch one standalone HCA+MoE layer child on every EP rank."""
     x_hc.bind_dynamic(1, T_DYN)
-    freqs_cos_local.bind_dynamic(1, T_DYN)
-    freqs_cos.bind_dynamic(1, KV_T_DYN)
-    freqs_sin.bind_dynamic(1, KV_T_DYN)
+    freqs_cos.bind_dynamic(1, T_DYN)
     cmp_freqs_cos.bind_dynamic(1, KV_B_DYN)
     cmp_freqs_sin.bind_dynamic(1, KV_B_DYN)
-    freqs_sin_local.bind_dynamic(1, T_DYN)
+    freqs_sin.bind_dynamic(1, T_DYN)
     compress_state.bind_dynamic(1, HCA_COMPRESS_STATE_BLOCK_NUM_DYN)
     compress_state_block_table.bind_dynamic(1, KV_B_DYN)
     kv_cache.bind_dynamic(1, ORI_BLOCK_NUM_DYN)
@@ -1265,7 +1158,6 @@ def l3_decode_layer_hca(
             hc_attn_fn[rank], hc_attn_scale[rank], hc_attn_base[rank],
             attn_norm_w[rank], wq_a[rank], wq_b[rank],
             wq_b_scale[rank], wkv[rank], gamma_cq[rank], gamma_ckv[rank],
-            freqs_cos_local[rank], freqs_sin_local[rank],
             freqs_cos[rank], freqs_sin[rank],
             cmp_freqs_cos[rank], cmp_freqs_sin[rank],
             cmp_wkv[rank], cmp_wgate[rank], cmp_ape[rank], cmp_norm_w[rank],
@@ -1310,10 +1202,8 @@ def decode_layer_csa(
     wkv: pl.Tensor[[D, HEAD_DIM], pl.BF16],
     gamma_cq: pl.Tensor[[Q_LORA], pl.BF16],
     gamma_ckv: pl.Tensor[[HEAD_DIM], pl.BF16],
-    freqs_cos_local: pl.Tensor[[T_DYN, ROPE_HEAD_DIM], pl.BF16],
-    freqs_sin_local: pl.Tensor[[T_DYN, ROPE_HEAD_DIM], pl.BF16],
-    freqs_cos: pl.Tensor[[KV_T_DYN, ROPE_HEAD_DIM], pl.BF16],
-    freqs_sin: pl.Tensor[[KV_T_DYN, ROPE_HEAD_DIM], pl.BF16],
+    freqs_cos: pl.Tensor[[T_DYN, ROPE_HEAD_DIM], pl.BF16],
+    freqs_sin: pl.Tensor[[T_DYN, ROPE_HEAD_DIM], pl.BF16],
     cmp_freqs_cos: pl.Tensor[[KV_T_DYN, ROPE_HEAD_DIM], pl.BF16],
     cmp_freqs_sin: pl.Tensor[[KV_T_DYN, ROPE_HEAD_DIM], pl.BF16],
     cmp_wkv: pl.Tensor[[CSA_MAIN_OUT_DIM, D], pl.BF16],
@@ -1405,7 +1295,7 @@ def decode_layer_csa(
                 hc_attn_fn, hc_attn_scale, hc_attn_base,
                 attn_norm_w, wq_a, wq_b, wq_b_scale, wkv,
                 gamma_cq, gamma_ckv,
-                freqs_cos_local, freqs_sin_local, cmp_freqs_cos, cmp_freqs_sin,
+                freqs_cos, freqs_sin, cmp_freqs_cos, cmp_freqs_sin,
                 cmp_wkv, cmp_wgate, cmp_ape, cmp_norm_w,
                 compress_state, compress_state_block_table,
                 idx_wq_b, idx_wq_b_scale, weights_proj, hadamard_idx,
@@ -1426,7 +1316,7 @@ def decode_layer_csa(
                 hc_attn_fn, hc_attn_scale, hc_attn_base,
                 attn_norm_w, wq_a, wq_b, wq_b_scale, wkv,
                 gamma_cq, gamma_ckv,
-                freqs_cos_local, freqs_sin_local, freqs_cos, freqs_sin,
+                freqs_cos, freqs_sin,
                 cmp_freqs_cos, cmp_freqs_sin,
                 cmp_wkv, cmp_wgate, cmp_ape, cmp_norm_w,
                 compress_state, compress_state_block_table,
@@ -1489,10 +1379,8 @@ def decode_layer_csa_test(
     wkv: pl.Tensor[[D, HEAD_DIM], pl.BF16],
     gamma_cq: pl.Tensor[[Q_LORA], pl.BF16],
     gamma_ckv: pl.Tensor[[HEAD_DIM], pl.BF16],
-    freqs_cos_local: pl.Tensor[[T_DYN, ROPE_HEAD_DIM], pl.BF16],
-    freqs_sin_local: pl.Tensor[[T_DYN, ROPE_HEAD_DIM], pl.BF16],
-    freqs_cos: pl.Tensor[[KV_T_DYN, ROPE_HEAD_DIM], pl.BF16],
-    freqs_sin: pl.Tensor[[KV_T_DYN, ROPE_HEAD_DIM], pl.BF16],
+    freqs_cos: pl.Tensor[[T_DYN, ROPE_HEAD_DIM], pl.BF16],
+    freqs_sin: pl.Tensor[[T_DYN, ROPE_HEAD_DIM], pl.BF16],
     cmp_freqs_cos: pl.Tensor[[KV_T_DYN, ROPE_HEAD_DIM], pl.BF16],
     cmp_freqs_sin: pl.Tensor[[KV_T_DYN, ROPE_HEAD_DIM], pl.BF16],
     cmp_wkv: pl.Tensor[[CSA_MAIN_OUT_DIM, D], pl.BF16],
@@ -1577,12 +1465,10 @@ def decode_layer_csa_test(
 ):
     """Run one standalone CSA+MoE layer and clear its MoE signals."""
     x_hc.bind_dynamic(0, T_DYN)
-    freqs_cos_local.bind_dynamic(0, T_DYN)
-    freqs_cos.bind_dynamic(0, KV_T_DYN)
-    freqs_sin.bind_dynamic(0, KV_T_DYN)
+    freqs_cos.bind_dynamic(0, T_DYN)
     cmp_freqs_cos.bind_dynamic(0, KV_T_DYN)
     cmp_freqs_sin.bind_dynamic(0, KV_T_DYN)
-    freqs_sin_local.bind_dynamic(0, T_DYN)
+    freqs_sin.bind_dynamic(0, T_DYN)
     compress_state.bind_dynamic(0, CSA_MAIN_STATE_BLOCK_NUM_DYN)
     compress_state_block_table.bind_dynamic(0, KV_B_DYN)
     inner_compress_state.bind_dynamic(0, CSA_INNER_STATE_BLOCK_NUM_DYN)
@@ -1611,7 +1497,7 @@ def decode_layer_csa_test(
         hc_attn_fn, hc_attn_scale, hc_attn_base,
         attn_norm_w, wq_a, wq_b, wq_b_scale, wkv,
         gamma_cq, gamma_ckv,
-        freqs_cos_local, freqs_sin_local, freqs_cos, freqs_sin,
+        freqs_cos, freqs_sin,
         cmp_freqs_cos, cmp_freqs_sin,
         cmp_wkv, cmp_wgate, cmp_ape, cmp_norm_w,
         compress_state, compress_state_block_table,
@@ -1655,10 +1541,8 @@ def l3_decode_layer_csa(
     wkv: pl.Tensor[[N_RANKS, D, HEAD_DIM], pl.BF16],
     gamma_cq: pl.Tensor[[N_RANKS, Q_LORA], pl.BF16],
     gamma_ckv: pl.Tensor[[N_RANKS, HEAD_DIM], pl.BF16],
-    freqs_cos_local: pl.Tensor[[N_RANKS, T_DYN, ROPE_HEAD_DIM], pl.BF16],
-    freqs_sin_local: pl.Tensor[[N_RANKS, T_DYN, ROPE_HEAD_DIM], pl.BF16],
-    freqs_cos: pl.Tensor[[N_RANKS, KV_T_DYN, ROPE_HEAD_DIM], pl.BF16],
-    freqs_sin: pl.Tensor[[N_RANKS, KV_T_DYN, ROPE_HEAD_DIM], pl.BF16],
+    freqs_cos: pl.Tensor[[N_RANKS, T_DYN, ROPE_HEAD_DIM], pl.BF16],
+    freqs_sin: pl.Tensor[[N_RANKS, T_DYN, ROPE_HEAD_DIM], pl.BF16],
     cmp_freqs_cos: pl.Tensor[[N_RANKS, KV_T_DYN, ROPE_HEAD_DIM], pl.BF16],
     cmp_freqs_sin: pl.Tensor[[N_RANKS, KV_T_DYN, ROPE_HEAD_DIM], pl.BF16],
     cmp_wkv: pl.Tensor[[N_RANKS, CSA_MAIN_OUT_DIM, D], pl.BF16],
@@ -1725,10 +1609,8 @@ def l3_decode_layer_csa(
 ):
     """Launch one complete CSA+MoE child per EP-world rank."""
     x_hc.bind_dynamic(1, T_DYN)
-    freqs_cos_local.bind_dynamic(1, T_DYN)
-    freqs_cos.bind_dynamic(1, KV_T_DYN)
-    freqs_sin.bind_dynamic(1, KV_T_DYN)
-    freqs_sin_local.bind_dynamic(1, T_DYN)
+    freqs_cos.bind_dynamic(1, T_DYN)
+    freqs_sin.bind_dynamic(1, T_DYN)
     cmp_freqs_cos.bind_dynamic(1, KV_T_DYN)
     cmp_freqs_sin.bind_dynamic(1, KV_T_DYN)
     compress_state.bind_dynamic(1, CSA_MAIN_STATE_BLOCK_NUM_DYN)
@@ -1791,7 +1673,6 @@ def l3_decode_layer_csa(
             hc_attn_fn[rank], hc_attn_scale[rank], hc_attn_base[rank],
             attn_norm_w[rank], wq_a[rank], wq_b[rank],
             wq_b_scale[rank], wkv[rank], gamma_cq[rank], gamma_ckv[rank],
-            freqs_cos_local[rank], freqs_sin_local[rank],
             freqs_cos[rank], freqs_sin[rank],
             cmp_freqs_cos[rank], cmp_freqs_sin[rank],
             cmp_wkv[rank], cmp_wgate[rank], cmp_ape[rank], cmp_norm_w[rank],
@@ -2212,9 +2093,7 @@ def main():
     )
     parser.add_argument("--layer-id", type=int, default=0)
     parser.add_argument(
-        "--start-pos",
-        type=str,
-        default=None,
+        "--start-pos", type=str, default=None,
         help="a scalar selects batch=1; a comma-separated list sets batch to its length",
     )
     parser.add_argument(

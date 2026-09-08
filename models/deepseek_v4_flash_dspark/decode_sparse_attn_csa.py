@@ -149,8 +149,8 @@ def sparse_attn_csa(
             sparse_bias[bias_t0 : bias_t0 + BIAS_T_TILE, 0:WIN] = pl.mul(pl.sub(v_win_valid, 1.0), -NEG_INF)
             sparse_bias[bias_t0 : bias_t0 + BIAS_T_TILE, WIN:TOPK] = pl.mul(pl.minimum(c_out, 0.0), -NEG_INF)
             if PADDED_TOPK > TOPK:
-                sparse_bias[bias_t0 : bias_t0 + BIAS_T_TILE, TOPK:PADDED_TOPK] = pl.full(
-                    [BIAS_T_TILE, PADDED_TOPK - TOPK], dtype=pl.FP32, value=NEG_INF)
+                bias_pad = pl.full([BIAS_T_TILE, PADDED_TOPK - TOPK], dtype=pl.FP32, value=NEG_INF)
+                sparse_bias[bias_t0 : bias_t0 + BIAS_T_TILE, TOPK:PADDED_TOPK] = bias_pad
 
     # QK/PV scratch tensors.
     cmp_block_num = pl.tensor.dim(cmp_kv, 0)
@@ -290,14 +290,9 @@ def sparse_attn_csa(
             rope_sin_signed[cs_t0 : cs_t0 + ROPE_CS_T_TILE, 0:ROPE_DIM] = pl.mul(cs_sin_il, cs_sign)
 
     return (
-        sparse_blk_mi,
-        sparse_blk_li,
-        sparse_blk_oi,
-        rope_cos_il,
-        rope_sin_signed,
-        rope_swap_idx,
-        qk_tid,
-        rope_tid,
+        sparse_blk_mi, sparse_blk_li, sparse_blk_oi,
+        rope_cos_il, rope_sin_signed, rope_swap_idx,
+        qk_tid, rope_tid,
     )
 
 
@@ -400,11 +395,9 @@ def sparse_attn_csa_test(
 
     o_packed_flat = pl.reshape(o_packed_heads, [O_GROUPS * T_PAD, O_GROUP_IN])
     o_packed_flat, _ = sparse_attn_csa_tp1(
-        q,
-        ori_kv, window_swa_indices,
+        q, ori_kv, window_swa_indices,
         cmp_kv, cmp_block_table, idx_topk,
-        position_ids, attn_sink,
-        freqs_cos, freqs_sin,
+        position_ids, attn_sink, freqs_cos, freqs_sin,
         o_packed_flat,
     )
     return o_packed_heads
@@ -537,16 +530,11 @@ def build_tensor_specs(
     )
 
     tokens = batch * S
+    def default_starts():
+        return csa_decode_start_set(batch=batch, seq=S, compress_ratio=COMPRESS_RATIO)
+
     starts = resolve_start_positions(
-        start_pos,
-        batch=batch,
-        seq=S,
-        max_seq_len=MAX_SEQ_LEN,
-        default_fn=lambda: csa_decode_start_set(
-            batch=batch,
-            seq=S,
-            compress_ratio=COMPRESS_RATIO,
-        ),
+        start_pos, batch=batch, seq=S, max_seq_len=MAX_SEQ_LEN, default_fn=default_starts,
     )
     positions = position_ids_from_starts(starts, seq=S)
     visible_rows = ((positions.to(torch.int64) + 1) // COMPRESS_RATIO).reshape(-1)
@@ -554,19 +542,12 @@ def build_tensor_specs(
     active_cmp_pages = max(1, (max_visible_rows + BLOCK_SIZE - 1) // BLOCK_SIZE)
     cmp_block_num = batch * active_cmp_pages
     shared_rope_cos, shared_rope_sin = token_local_rope(
-        M,
-        COMPRESS_RATIO,
-        positions.reshape(-1),
-        max_seq_len=MAX_SEQ_LEN,
-        dtype=torch.bfloat16,
+        M, COMPRESS_RATIO, positions.reshape(-1),
+        max_seq_len=MAX_SEQ_LEN, dtype=torch.bfloat16,
     )
     shared_window_block_table = block_table(batch=batch, table_blocks=ORI_MAX_BLOCKS, physical_blocks=ORI_BLOCK_NUM)
-    shared_swa_indices = swa_indices_and_lens(
-        positions,
-        shared_window_block_table,
-        block_size=BLOCK_SIZE,
-        window=WIN,
-    )[0].contiguous()
+    shared_swa_metadata = swa_indices_and_lens(positions, shared_window_block_table, block_size=BLOCK_SIZE, window=WIN)
+    shared_swa_indices = shared_swa_metadata[0].contiguous()
     if all_invalid_fixture:
         shared_swa_indices.fill_(-1)
 
@@ -630,11 +611,8 @@ def build_tensor_specs(
             elif valid == 1:
                 candidates = torch.zeros(1, dtype=torch.int64)
             else:
-                candidates = torch.div(
-                    torch.arange(valid, dtype=torch.int64) * (int(visible) - 1),
-                    valid - 1,
-                    rounding_mode="floor",
-                )
+                spread = torch.arange(valid, dtype=torch.int64) * (int(visible) - 1)
+                candidates = torch.div(spread, valid - 1, rounding_mode="floor")
             indices[token, :valid] = candidates.to(torch.int32)
         if cache_window_replacement_fixture:
             indices[:, :] = -1
@@ -681,27 +659,42 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("-p", "--platform", type=str, default="a2a3", choices=["a2a3", "a2a3sim", "a5", "a5sim"])
     parser.add_argument("-d", "--device", type=int, default=0)
-    parser.add_argument("-b", "--batch", type=int, default=B,
-                        help=f"runtime request count up to {B} (the compile-time upper bound). "
-                             "The token axis is pl.dynamic, so one compiled program "
-                             "serves every value.")
-    parser.add_argument("--start-pos", type=str, default=None,
-                        help="Fixture-only start position: one value for a uniform batch or "
-                             "a comma-separated value per request.")
-    parser.add_argument("--causal-regression-fixture", action="store_true", default=False,
-                        help="Amplify the S=2 future-window-slot regression.")
-    parser.add_argument("--short-window-fixture", action="store_true", default=False,
-                        help="Use a short-window topk row with valid prefix + -1 padding.")
-    parser.add_argument("--mixed-topk-fixture", action="store_true", default=False,
-                        help="Use -1-padded window slots with valid compressed raw indices.")
-    parser.add_argument("--cache-window-replacement-fixture", action="store_true", default=False,
-                        help="Place a sentinel row inside the cache window prefix.")
-    parser.add_argument("--all-invalid-fixture", action="store_true", default=False,
-                        help="Mask every raw and compressed row.")
+    parser.add_argument(
+        "-b", "--batch", type=int, default=B,
+        help=f"runtime request count up to {B} (the compile-time upper bound). The token axis "
+             "is pl.dynamic, so one compiled program serves every value.",
+    )
+    parser.add_argument(
+        "--start-pos", type=str, default=None,
+        help="Fixture-only start position: one value for a uniform batch or "
+             "a comma-separated value per request.",
+    )
+    parser.add_argument(
+        "--causal-regression-fixture", action="store_true", default=False,
+        help="Amplify the S=2 future-window-slot regression.",
+    )
+    parser.add_argument(
+        "--short-window-fixture", action="store_true", default=False,
+        help="Use a short-window topk row with valid prefix + -1 padding.",
+    )
+    parser.add_argument(
+        "--mixed-topk-fixture", action="store_true", default=False,
+        help="Use -1-padded window slots with valid compressed raw indices.",
+    )
+    parser.add_argument(
+        "--cache-window-replacement-fixture", action="store_true", default=False,
+        help="Place a sentinel row inside the cache window prefix.",
+    )
+    parser.add_argument(
+        "--all-invalid-fixture", action="store_true", default=False,
+        help="Mask every raw and compressed row.",
+    )
     parser.add_argument("--golden-data", type=str, default=None)
     parser.add_argument("--enable-chip-swimlane", type=int, nargs="?", const=1, default=0, choices=(0, 1, 2))
-    parser.add_argument("--enable-dep-gen", action="store_true", default=False,
-                        help="Capture PTO2 dependency edges (deps.json) for the swimlane converter.")
+    parser.add_argument(
+        "--enable-dep-gen", action="store_true", default=False,
+        help="Capture PTO2 dependency edges (deps.json) for the swimlane converter.",
+    )
     parser.add_argument("--enable-pmu", nargs="?", const=2, default=0, type=int, choices=[0, 1, 2, 4])
     parser.add_argument("--dump-passes", action="store_true", default=False)
     args = parser.parse_args()
@@ -724,13 +717,9 @@ if __name__ == "__main__":
     result = run(
         fn=sparse_attn_csa_test,
         specs=build_tensor_specs(
-            args.causal_regression_fixture,
-            args.short_window_fixture,
-            args.mixed_topk_fixture,
-            args.cache_window_replacement_fixture,
-            args.all_invalid_fixture,
-            start_pos=start_pos,
-            batch=args.batch,
+            args.causal_regression_fixture, args.short_window_fixture, args.mixed_topk_fixture,
+            args.cache_window_replacement_fixture, args.all_invalid_fixture,
+            start_pos=start_pos, batch=args.batch,
         ),
         golden_fn=golden_sparse_attn,
         golden_data=args.golden_data,

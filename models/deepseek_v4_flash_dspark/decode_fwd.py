@@ -273,10 +273,7 @@ def decode_embedding_preamble(
     owner_tokens: pl.Scalar[pl.INT32],
 ):
     """Prepare one owner's fixed-capacity embedding and MoE token-id buffers."""
-    for token_block in pl.spmd(
-        MOE_TOKENS // MOE_INPUT_IDS_PER_CACHE_LINE,
-        name_hint="decode_fwd_pack_moe_input_ids",
-    ):
+    for token_block in pl.spmd(MOE_TOKENS // MOE_INPUT_IDS_PER_CACHE_LINE, name_hint="decode_fwd_pack_moe_input_ids"):
         token_begin = token_block * MOE_INPUT_IDS_PER_CACHE_LINE
         for token_offset in pl.range(MOE_INPUT_IDS_PER_CACHE_LINE):
             token_idx = token_begin + token_offset
@@ -288,9 +285,8 @@ def decode_embedding_preamble(
     physical_tokens = pl.tensor.dim(input_ids, 0)
     for token in pl.spmd(MOE_TOKENS, name_hint="decode_fwd_embedding_active_mask"):
         if token < physical_tokens and token >= owner_tokens:
-            x_hc[token : token + 1, 0 : HC_MULT, 0 : D] = pl.full(
-                [1, HC_MULT, D], dtype=pl.FP32, value=0.0,
-            )
+            zero_hc_row = pl.full([1, HC_MULT, D], dtype=pl.FP32, value=0.0)
+            x_hc[token : token + 1, 0 : HC_MULT, 0 : D] = zero_hc_row
     return x_hc
 
 
@@ -320,14 +316,10 @@ def decode_fwd(
     gamma_cq: pl.Tensor[[FWD_WEIGHT_BANK_SIZE * Q_LORA], pl.BF16],
     gamma_ckv: pl.Tensor[[FWD_WEIGHT_BANK_SIZE * HEAD_DIM], pl.BF16],
     raw_kv_pool: pl.InOut[pl.Tensor[[FWD_PACKED_RAW_BLOCKS_DYN, BLOCK_SIZE, 1, HEAD_DIM], pl.BF16]],
-    freqs_cos_local: pl.Tensor[[T_DYN, ROPE_HEAD_DIM], pl.BF16],
-    freqs_sin_local: pl.Tensor[[T_DYN, ROPE_HEAD_DIM], pl.BF16],
-    freqs_cos: pl.Tensor[[KV_T_DYN, ROPE_HEAD_DIM], pl.BF16],
-    freqs_sin: pl.Tensor[[KV_T_DYN, ROPE_HEAD_DIM], pl.BF16],
-    compressed_freqs_cos_local: pl.Tensor[[T_DYN, ROPE_HEAD_DIM], pl.BF16],
-    compressed_freqs_sin_local: pl.Tensor[[T_DYN, ROPE_HEAD_DIM], pl.BF16],
-    compressed_freqs_cos: pl.Tensor[[KV_T_DYN, ROPE_HEAD_DIM], pl.BF16],
-    compressed_freqs_sin: pl.Tensor[[KV_T_DYN, ROPE_HEAD_DIM], pl.BF16],
+    freqs_cos: pl.Tensor[[T_DYN, ROPE_HEAD_DIM], pl.BF16],
+    freqs_sin: pl.Tensor[[T_DYN, ROPE_HEAD_DIM], pl.BF16],
+    compressed_freqs_cos: pl.Tensor[[T_DYN, ROPE_HEAD_DIM], pl.BF16],
+    compressed_freqs_sin: pl.Tensor[[T_DYN, ROPE_HEAD_DIM], pl.BF16],
     swa_slot_mapping: pl.Tensor[[KV_T_DYN], pl.INT64],
     swa_indices: pl.Tensor[[T_DYN, WIN], pl.INT32],
     swa_lens: pl.Tensor[[T_DYN], pl.INT32],
@@ -450,14 +442,10 @@ def decode_fwd(
     dspark_target_hidden.bind_dynamic(0, T_DYN)
     x_ping.bind_dynamic(0, T_DYN)
     raw_kv_pool.bind_dynamic(0, FWD_PACKED_RAW_BLOCKS_DYN)
-    freqs_cos_local.bind_dynamic(0, T_DYN)
-    freqs_sin_local.bind_dynamic(0, T_DYN)
-    freqs_cos.bind_dynamic(0, KV_T_DYN)
-    freqs_sin.bind_dynamic(0, KV_T_DYN)
-    compressed_freqs_cos_local.bind_dynamic(0, T_DYN)
-    compressed_freqs_sin_local.bind_dynamic(0, T_DYN)
-    compressed_freqs_cos.bind_dynamic(0, KV_T_DYN)
-    compressed_freqs_sin.bind_dynamic(0, KV_T_DYN)
+    freqs_cos.bind_dynamic(0, T_DYN)
+    freqs_sin.bind_dynamic(0, T_DYN)
+    compressed_freqs_cos.bind_dynamic(0, T_DYN)
+    compressed_freqs_sin.bind_dynamic(0, T_DYN)
     swa_slot_mapping.bind_dynamic(0, KV_T_DYN)
     swa_indices.bind_dynamic(0, T_DYN)
     swa_lens.bind_dynamic(0, T_DYN)
@@ -569,7 +557,7 @@ def decode_fwd(
                         hc_attn_fn_layer_swa0, hc_attn_scale_layer_swa0, hc_attn_base_layer_swa0,
                         attn_norm_w_layer_swa0, wq_a_layer_swa0, wq_b_layer_swa0, wq_b_scale_layer_swa0,
                         wkv_layer_swa0, gamma_cq_layer_swa0, gamma_ckv_layer_swa0,
-                        freqs_cos_local, freqs_sin_local,
+                        freqs_cos, freqs_sin,
                         raw_kv_layer_swa0, swa_slot_mapping, swa_indices, swa_lens, position_ids_local,
                         attn_sink_layer_swa0, wo_a_layer_swa0, wo_b_layer_swa0, wo_b_scale_layer_swa0,
                         x_attn_active,
@@ -583,7 +571,7 @@ def decode_fwd(
                         hc_attn_fn_layer_swa0, hc_attn_scale_layer_swa0, hc_attn_base_layer_swa0,
                         attn_norm_w_layer_swa0, wq_a_layer_swa0, wq_b_layer_swa0, wq_b_scale_layer_swa0,
                         wkv_layer_swa0, gamma_cq_layer_swa0, gamma_ckv_layer_swa0,
-                        freqs_cos_local, freqs_sin_local, freqs_cos, freqs_sin,
+                        freqs_cos, freqs_sin,
                         raw_kv_layer_swa0, swa_slot_mapping, swa_indices, swa_lens, position_ids_local,
                         attn_sink_layer_swa0, wo_a_layer_swa0, wo_b_layer_swa0, wo_b_scale_layer_swa0,
                         x_attn_active,
@@ -597,9 +585,8 @@ def decode_fwd(
             x_attn_moe_swa0 = pl.create_tensor([MOE_TOKENS, HC_MULT, D], dtype=pl.FP32)
             for token in pl.spmd(MOE_TOKENS, name_hint="decode_fwd_swa0_attn_pack"):
                 if token < owner_tokens:
-                    x_attn_moe_swa0[token : token + 1, 0 : HC_MULT, 0 : D] = x_attn_active[
-                        token : token + 1, 0 : HC_MULT, 0 : D,
-                    ]
+                    attn_row_swa0 = x_attn_active[token : token + 1, 0 : HC_MULT, 0 : D]
+                    x_attn_moe_swa0[token : token + 1, 0 : HC_MULT, 0 : D] = attn_row_swa0
                 else:
                     zero_moe_row_swa0 = pl.full([1, HC_MULT, D], dtype=pl.FP32, value=0.0)
                     x_attn_moe_swa0[token : token + 1, 0 : HC_MULT, 0 : D] = zero_moe_row_swa0
@@ -622,13 +609,11 @@ def decode_fwd(
             for token in pl.spmd(MOE_TOKENS, name_hint="decode_fwd_swa0_active_trim"):
                 if token < local_t:
                     if token < owner_tokens:
-                        x_pong[token : token + 1, 0 : HC_MULT, 0 : D] = x_moe_next[
-                            token : token + 1, 0 : HC_MULT, 0 : D,
-                        ]
+                        next_row_swa0 = x_moe_next[token : token + 1, 0 : HC_MULT, 0 : D]
+                        x_pong[token : token + 1, 0 : HC_MULT, 0 : D] = next_row_swa0
                     else:
-                        x_pong[token : token + 1, 0 : HC_MULT, 0 : D] = pl.full(
-                            [1, HC_MULT, D], dtype=pl.FP32, value=0.0,
-                        )
+                        zero_next_row_swa0 = pl.full([1, HC_MULT, D], dtype=pl.FP32, value=0.0)
+                        x_pong[token : token + 1, 0 : HC_MULT, 0 : D] = zero_next_row_swa0
 
     with pl.scope():
         weight_layer_swa1 = pl.const(1, pl.INT32) % FWD_WEIGHT_BANK_SIZE
@@ -674,7 +659,7 @@ def decode_fwd(
                         hc_attn_fn_layer_swa1, hc_attn_scale_layer_swa1, hc_attn_base_layer_swa1,
                         attn_norm_w_layer_swa1, wq_a_layer_swa1, wq_b_layer_swa1, wq_b_scale_layer_swa1,
                         wkv_layer_swa1, gamma_cq_layer_swa1, gamma_ckv_layer_swa1,
-                        freqs_cos_local, freqs_sin_local,
+                        freqs_cos, freqs_sin,
                         raw_kv_layer_swa1, swa_slot_mapping, swa_indices, swa_lens, position_ids_local,
                         attn_sink_layer_swa1, wo_a_layer_swa1, wo_b_layer_swa1, wo_b_scale_layer_swa1,
                         x_attn_active,
@@ -688,7 +673,7 @@ def decode_fwd(
                         hc_attn_fn_layer_swa1, hc_attn_scale_layer_swa1, hc_attn_base_layer_swa1,
                         attn_norm_w_layer_swa1, wq_a_layer_swa1, wq_b_layer_swa1, wq_b_scale_layer_swa1,
                         wkv_layer_swa1, gamma_cq_layer_swa1, gamma_ckv_layer_swa1,
-                        freqs_cos_local, freqs_sin_local, freqs_cos, freqs_sin,
+                        freqs_cos, freqs_sin,
                         raw_kv_layer_swa1, swa_slot_mapping, swa_indices, swa_lens, position_ids_local,
                         attn_sink_layer_swa1, wo_a_layer_swa1, wo_b_layer_swa1, wo_b_scale_layer_swa1,
                         x_attn_active,
@@ -702,9 +687,8 @@ def decode_fwd(
             x_attn_moe_swa1 = pl.create_tensor([MOE_TOKENS, HC_MULT, D], dtype=pl.FP32)
             for token in pl.spmd(MOE_TOKENS, name_hint="decode_fwd_swa1_attn_pack"):
                 if token < owner_tokens:
-                    x_attn_moe_swa1[token : token + 1, 0 : HC_MULT, 0 : D] = x_attn_active[
-                        token : token + 1, 0 : HC_MULT, 0 : D,
-                    ]
+                    attn_row_swa1 = x_attn_active[token : token + 1, 0 : HC_MULT, 0 : D]
+                    x_attn_moe_swa1[token : token + 1, 0 : HC_MULT, 0 : D] = attn_row_swa1
                 else:
                     zero_moe_row_swa1 = pl.full([1, HC_MULT, D], dtype=pl.FP32, value=0.0)
                     x_attn_moe_swa1[token : token + 1, 0 : HC_MULT, 0 : D] = zero_moe_row_swa1
@@ -727,13 +711,11 @@ def decode_fwd(
             for token in pl.spmd(MOE_TOKENS, name_hint="decode_fwd_swa1_active_trim"):
                 if token < local_t:
                     if token < owner_tokens:
-                        x_ping[token : token + 1, 0 : HC_MULT, 0 : D] = x_moe_next[
-                            token : token + 1, 0 : HC_MULT, 0 : D,
-                        ]
+                        next_row_swa1 = x_moe_next[token : token + 1, 0 : HC_MULT, 0 : D]
+                        x_ping[token : token + 1, 0 : HC_MULT, 0 : D] = next_row_swa1
                     else:
-                        x_ping[token : token + 1, 0 : HC_MULT, 0 : D] = pl.full(
-                            [1, HC_MULT, D], dtype=pl.FP32, value=0.0,
-                        )
+                        zero_next_row_swa1 = pl.full([1, HC_MULT, D], dtype=pl.FP32, value=0.0)
+                        x_ping[token : token + 1, 0 : HC_MULT, 0 : D] = zero_next_row_swa1
 
     for ordinal in pl.range(HCA_LAYER_COUNT):
         csa_model_layer = pl.cast(ordinal * 2 + 2, pl.INT32)
@@ -803,7 +785,7 @@ def decode_fwd(
                             hc_attn_fn_layer_csa, hc_attn_scale_layer_csa, hc_attn_base_layer_csa,
                             attn_norm_w_layer_csa, wq_a_layer_csa, wq_b_layer_csa, wq_b_scale_layer_csa,
                             wkv_layer_csa, gamma_cq_layer_csa, gamma_ckv_layer_csa,
-                            compressed_freqs_cos_local, compressed_freqs_sin_local,
+                            compressed_freqs_cos, compressed_freqs_sin,
                             csa_cmp_freqs_cos, csa_cmp_freqs_sin,
                             csa_cmp_wkv_layer_csa, csa_cmp_wgate_layer_csa,
                             csa_cmp_ape_layer_csa, csa_cmp_norm_w_layer_csa,
@@ -831,7 +813,6 @@ def decode_fwd(
                             hc_attn_fn_layer_csa, hc_attn_scale_layer_csa, hc_attn_base_layer_csa,
                             attn_norm_w_layer_csa, wq_a_layer_csa, wq_b_layer_csa, wq_b_scale_layer_csa,
                             wkv_layer_csa, gamma_cq_layer_csa, gamma_ckv_layer_csa,
-                            compressed_freqs_cos_local, compressed_freqs_sin_local,
                             compressed_freqs_cos, compressed_freqs_sin,
                             csa_cmp_freqs_cos, csa_cmp_freqs_sin,
                             csa_cmp_wkv_layer_csa, csa_cmp_wgate_layer_csa,
@@ -860,9 +841,8 @@ def decode_fwd(
                 x_attn_moe_csa = pl.create_tensor([MOE_TOKENS, HC_MULT, D], dtype=pl.FP32)
                 for token in pl.spmd(MOE_TOKENS, name_hint="decode_fwd_csa_attn_pack"):
                     if token < owner_tokens:
-                        x_attn_moe_csa[token : token + 1, 0 : HC_MULT, 0 : D] = x_attn_active[
-                            token : token + 1, 0 : HC_MULT, 0 : D,
-                        ]
+                        attn_row_csa = x_attn_active[token : token + 1, 0 : HC_MULT, 0 : D]
+                        x_attn_moe_csa[token : token + 1, 0 : HC_MULT, 0 : D] = attn_row_csa
                     else:
                         zero_moe_row_csa = pl.full([1, HC_MULT, D], dtype=pl.FP32, value=0.0)
                         x_attn_moe_csa[token : token + 1, 0 : HC_MULT, 0 : D] = zero_moe_row_csa
@@ -885,13 +865,11 @@ def decode_fwd(
                 for token in pl.spmd(MOE_TOKENS, name_hint="decode_fwd_csa_active_trim"):
                     if token < local_t:
                         if token < owner_tokens:
-                            x_pong[token : token + 1, 0 : HC_MULT, 0 : D] = x_moe_next[
-                                token : token + 1, 0 : HC_MULT, 0 : D,
-                            ]
+                            next_row_csa = x_moe_next[token : token + 1, 0 : HC_MULT, 0 : D]
+                            x_pong[token : token + 1, 0 : HC_MULT, 0 : D] = next_row_csa
                         else:
-                            x_pong[token : token + 1, 0 : HC_MULT, 0 : D] = pl.full(
-                                [1, HC_MULT, D], dtype=pl.FP32, value=0.0,
-                            )
+                            zero_next_row_csa = pl.full([1, HC_MULT, D], dtype=pl.FP32, value=0.0)
+                            x_pong[token : token + 1, 0 : HC_MULT, 0 : D] = zero_next_row_csa
 
         with pl.scope():
             hc_attn_fn_layer_hca = pl.slice(hc_attn_fn, [MIX_HC, HC_DIM], [hca_weight_layer * HC_FN_STORAGE_ROWS, 0])
@@ -942,7 +920,7 @@ def decode_fwd(
                             hc_attn_fn_layer_hca, hc_attn_scale_layer_hca, hc_attn_base_layer_hca,
                             attn_norm_w_layer_hca, wq_a_layer_hca, wq_b_layer_hca, wq_b_scale_layer_hca,
                             wkv_layer_hca, gamma_cq_layer_hca, gamma_ckv_layer_hca,
-                            compressed_freqs_cos_local, compressed_freqs_sin_local,
+                            compressed_freqs_cos, compressed_freqs_sin,
                             hca_cmp_freqs_cos, hca_cmp_freqs_sin,
                             hca_cmp_wkv_layer_hca, hca_cmp_wgate_layer_hca,
                             hca_cmp_ape_layer_hca, hca_cmp_norm_w_layer_hca,
@@ -963,7 +941,6 @@ def decode_fwd(
                             hc_attn_fn_layer_hca, hc_attn_scale_layer_hca, hc_attn_base_layer_hca,
                             attn_norm_w_layer_hca, wq_a_layer_hca, wq_b_layer_hca, wq_b_scale_layer_hca,
                             wkv_layer_hca, gamma_cq_layer_hca, gamma_ckv_layer_hca,
-                            compressed_freqs_cos_local, compressed_freqs_sin_local,
                             compressed_freqs_cos, compressed_freqs_sin,
                             hca_cmp_freqs_cos, hca_cmp_freqs_sin,
                             hca_cmp_wkv_layer_hca, hca_cmp_wgate_layer_hca,
@@ -985,9 +962,8 @@ def decode_fwd(
                 x_attn_moe_hca = pl.create_tensor([MOE_TOKENS, HC_MULT, D], dtype=pl.FP32)
                 for token in pl.spmd(MOE_TOKENS, name_hint="decode_fwd_hca_attn_pack"):
                     if token < owner_tokens:
-                        x_attn_moe_hca[token : token + 1, 0 : HC_MULT, 0 : D] = x_attn_active[
-                            token : token + 1, 0 : HC_MULT, 0 : D,
-                        ]
+                        attn_row_hca = x_attn_active[token : token + 1, 0 : HC_MULT, 0 : D]
+                        x_attn_moe_hca[token : token + 1, 0 : HC_MULT, 0 : D] = attn_row_hca
                     else:
                         zero_moe_row_hca = pl.full([1, HC_MULT, D], dtype=pl.FP32, value=0.0)
                         x_attn_moe_hca[token : token + 1, 0 : HC_MULT, 0 : D] = zero_moe_row_hca
@@ -1010,13 +986,11 @@ def decode_fwd(
                 for token in pl.spmd(MOE_TOKENS, name_hint="decode_fwd_hca_active_trim"):
                     if token < local_t:
                         if token < owner_tokens:
-                            x_ping[token : token + 1, 0 : HC_MULT, 0 : D] = x_moe_next[
-                                token : token + 1, 0 : HC_MULT, 0 : D,
-                            ]
+                            next_row_hca = x_moe_next[token : token + 1, 0 : HC_MULT, 0 : D]
+                            x_ping[token : token + 1, 0 : HC_MULT, 0 : D] = next_row_hca
                         else:
-                            x_ping[token : token + 1, 0 : HC_MULT, 0 : D] = pl.full(
-                                [1, HC_MULT, D], dtype=pl.FP32, value=0.0,
-                            )
+                            zero_next_row_hca = pl.full([1, HC_MULT, D], dtype=pl.FP32, value=0.0)
+                            x_ping[token : token + 1, 0 : HC_MULT, 0 : D] = zero_next_row_hca
 
     with pl.scope():
         csa_ordinal_last = pl.const(20, pl.INT32)
@@ -1082,7 +1056,7 @@ def decode_fwd(
                         hc_attn_fn_layer_last, hc_attn_scale_layer_last, hc_attn_base_layer_last,
                         attn_norm_w_layer_last, wq_a_layer_last, wq_b_layer_last, wq_b_scale_layer_last,
                         wkv_layer_last, gamma_cq_layer_last, gamma_ckv_layer_last,
-                        compressed_freqs_cos_local, compressed_freqs_sin_local,
+                        compressed_freqs_cos, compressed_freqs_sin,
                         csa_cmp_freqs_cos, csa_cmp_freqs_sin,
                         csa_cmp_wkv_layer_last, csa_cmp_wgate_layer_last,
                         csa_cmp_ape_layer_last, csa_cmp_norm_w_layer_last,
@@ -1110,7 +1084,6 @@ def decode_fwd(
                         hc_attn_fn_layer_last, hc_attn_scale_layer_last, hc_attn_base_layer_last,
                         attn_norm_w_layer_last, wq_a_layer_last, wq_b_layer_last, wq_b_scale_layer_last,
                         wkv_layer_last, gamma_cq_layer_last, gamma_ckv_layer_last,
-                        compressed_freqs_cos_local, compressed_freqs_sin_local,
                         compressed_freqs_cos, compressed_freqs_sin,
                         csa_cmp_freqs_cos, csa_cmp_freqs_sin,
                         csa_cmp_wkv_layer_last, csa_cmp_wgate_layer_last,
@@ -1139,9 +1112,8 @@ def decode_fwd(
             x_attn_moe_last = pl.create_tensor([MOE_TOKENS, HC_MULT, D], dtype=pl.FP32)
             for token in pl.spmd(MOE_TOKENS, name_hint="decode_fwd_last_attn_pack"):
                 if token < owner_tokens:
-                    x_attn_moe_last[token : token + 1, 0 : HC_MULT, 0 : D] = x_attn_active[
-                        token : token + 1, 0 : HC_MULT, 0 : D,
-                    ]
+                    attn_row_last = x_attn_active[token : token + 1, 0 : HC_MULT, 0 : D]
+                    x_attn_moe_last[token : token + 1, 0 : HC_MULT, 0 : D] = attn_row_last
                 else:
                     zero_moe_row_last = pl.full([1, HC_MULT, D], dtype=pl.FP32, value=0.0)
                     x_attn_moe_last[token : token + 1, 0 : HC_MULT, 0 : D] = zero_moe_row_last
@@ -1164,13 +1136,11 @@ def decode_fwd(
             for token in pl.spmd(MOE_TOKENS, name_hint="decode_fwd_last_active_trim"):
                 if token < local_t:
                     if token < owner_tokens:
-                        pre_hc_hidden_out[token : token + 1, 0 : HC_MULT, 0 : D] = x_moe_next[
-                            token : token + 1, 0 : HC_MULT, 0 : D,
-                        ]
+                        next_row_last = x_moe_next[token : token + 1, 0 : HC_MULT, 0 : D]
+                        pre_hc_hidden_out[token : token + 1, 0 : HC_MULT, 0 : D] = next_row_last
                     else:
-                        pre_hc_hidden_out[token : token + 1, 0 : HC_MULT, 0 : D] = pl.full(
-                            [1, HC_MULT, D], dtype=pl.FP32, value=0.0,
-                        )
+                        zero_next_row_last = pl.full([1, HC_MULT, D], dtype=pl.FP32, value=0.0)
+                        pre_hc_hidden_out[token : token + 1, 0 : HC_MULT, 0 : D] = zero_next_row_last
     clear_moe_signals(x_moe_next, arrived, data_arrived, combine_arrived)
 
     with pl.scope():
@@ -1179,15 +1149,12 @@ def decode_fwd(
             for token in pl.spmd(MOE_TOKENS, name_hint="decode_fwd_pack_target_hc"):
                 if token < local_t:
                     target_row = token * 3
-                    target_hc_stack[target_row : target_row + 1, 0 : HC_MULT, 0 : D] = x_pong[
-                        token : token + 1, 0 : HC_MULT, 0 : D,
-                    ]
-                    target_hc_stack[target_row + 1 : target_row + 2, 0 : HC_MULT, 0 : D] = x_ping[
-                        token : token + 1, 0 : HC_MULT, 0 : D,
-                    ]
-                    target_hc_stack[target_row + 2 : target_row + 3, 0 : HC_MULT, 0 : D] = pre_hc_hidden_out[
-                        token : token + 1, 0 : HC_MULT, 0 : D,
-                    ]
+                    pong_row = x_pong[token : token + 1, 0 : HC_MULT, 0 : D]
+                    target_hc_stack[target_row : target_row + 1, 0 : HC_MULT, 0 : D] = pong_row
+                    ping_row = x_ping[token : token + 1, 0 : HC_MULT, 0 : D]
+                    target_hc_stack[target_row + 1 : target_row + 2, 0 : HC_MULT, 0 : D] = ping_row
+                    hidden_out_row = pre_hc_hidden_out[token : token + 1, 0 : HC_MULT, 0 : D]
+                    target_hc_stack[target_row + 2 : target_row + 3, 0 : HC_MULT, 0 : D] = hidden_out_row
             target_rows = local_t * 3
             target_hc_active = pl.slice(target_hc_stack, [target_rows, HC_MULT, D], [0, 0, 0])
             target_hidden_stack = pl.create_tensor([MOE_TOKENS * 3, D], dtype=pl.BF16)
@@ -1228,16 +1195,13 @@ def decode_fwd(
             for row in pl.spmd(MAX_LOGIT_ROWS, name_hint="decode_fwd_inactive_sample_rows"):
                 for col in pl.range(LM_HEAD_VOCAB // LOGITS_ZERO_TILE):
                     col_begin = col * LOGITS_ZERO_TILE
-                    logits[row : row + 1, col_begin : col_begin + LOGITS_ZERO_TILE] = pl.full(
-                        [1, LOGITS_ZERO_TILE], dtype=pl.FP32, value=0.0,
-                    )
+                    zero_logits_tile = pl.full([1, LOGITS_ZERO_TILE], dtype=pl.FP32, value=0.0)
+                    logits[row : row + 1, col_begin : col_begin + LOGITS_ZERO_TILE] = zero_logits_tile
                 if LM_HEAD_VOCAB % LOGITS_ZERO_TILE != 0:
-                    logits[row : row + 1, LM_HEAD_VOCAB // LOGITS_ZERO_TILE * LOGITS_ZERO_TILE :] = pl.full(
-                        [1, LM_HEAD_VOCAB % LOGITS_ZERO_TILE], dtype=pl.FP32, value=0.0,
-                    )
-                sampled_ids[row : row + 1, :] = pl.full(
-                    [1, SAMPLED_IDS_PAD], dtype=pl.INT32, value=-1,
-                )
+                    zero_logits_tail = pl.full([1, LM_HEAD_VOCAB % LOGITS_ZERO_TILE], dtype=pl.FP32, value=0.0)
+                    logits[row : row + 1, LM_HEAD_VOCAB // LOGITS_ZERO_TILE * LOGITS_ZERO_TILE :] = zero_logits_tail
+                unset_ids_row = pl.full([1, SAMPLED_IDS_PAD], dtype=pl.INT32, value=-1)
+                sampled_ids[row : row + 1, :] = unset_ids_row
     return x_out
 
 
@@ -1255,14 +1219,10 @@ def l3_decode_fwd(
     gamma_cq: pl.Tensor[[N_RANKS, FWD_WEIGHT_BANK_SIZE * Q_LORA], pl.BF16],
     gamma_ckv: pl.Tensor[[N_RANKS, FWD_WEIGHT_BANK_SIZE * HEAD_DIM], pl.BF16],
     raw_kv_pool: pl.InOut[pl.Tensor[[N_RANKS, FWD_PACKED_RAW_BLOCKS_DYN, BLOCK_SIZE, 1, HEAD_DIM], pl.BF16]],
-    freqs_cos_local: pl.Tensor[[N_RANKS, T_DYN, ROPE_HEAD_DIM], pl.BF16],
-    freqs_sin_local: pl.Tensor[[N_RANKS, T_DYN, ROPE_HEAD_DIM], pl.BF16],
-    freqs_cos: pl.Tensor[[N_RANKS, KV_T_DYN, ROPE_HEAD_DIM], pl.BF16],
-    freqs_sin: pl.Tensor[[N_RANKS, KV_T_DYN, ROPE_HEAD_DIM], pl.BF16],
-    compressed_freqs_cos_local: pl.Tensor[[N_RANKS, T_DYN, ROPE_HEAD_DIM], pl.BF16],
-    compressed_freqs_sin_local: pl.Tensor[[N_RANKS, T_DYN, ROPE_HEAD_DIM], pl.BF16],
-    compressed_freqs_cos: pl.Tensor[[N_RANKS, KV_T_DYN, ROPE_HEAD_DIM], pl.BF16],
-    compressed_freqs_sin: pl.Tensor[[N_RANKS, KV_T_DYN, ROPE_HEAD_DIM], pl.BF16],
+    freqs_cos: pl.Tensor[[N_RANKS, T_DYN, ROPE_HEAD_DIM], pl.BF16],
+    freqs_sin: pl.Tensor[[N_RANKS, T_DYN, ROPE_HEAD_DIM], pl.BF16],
+    compressed_freqs_cos: pl.Tensor[[N_RANKS, T_DYN, ROPE_HEAD_DIM], pl.BF16],
+    compressed_freqs_sin: pl.Tensor[[N_RANKS, T_DYN, ROPE_HEAD_DIM], pl.BF16],
     swa_slot_mapping: pl.Tensor[[N_RANKS, KV_T_DYN], pl.INT64],
     swa_indices: pl.Tensor[[N_RANKS, T_DYN, WIN], pl.INT32],
     swa_lens: pl.Tensor[[N_RANKS, T_DYN], pl.INT32],
@@ -1364,14 +1324,10 @@ def l3_decode_fwd(
     dspark_target_hidden.bind_dynamic(1, T_DYN)
     x_ping.bind_dynamic(1, T_DYN)
     raw_kv_pool.bind_dynamic(1, FWD_PACKED_RAW_BLOCKS_DYN)
-    freqs_cos_local.bind_dynamic(1, T_DYN)
-    freqs_sin_local.bind_dynamic(1, T_DYN)
-    freqs_cos.bind_dynamic(1, KV_T_DYN)
-    freqs_sin.bind_dynamic(1, KV_T_DYN)
-    compressed_freqs_cos_local.bind_dynamic(1, T_DYN)
-    compressed_freqs_sin_local.bind_dynamic(1, T_DYN)
-    compressed_freqs_cos.bind_dynamic(1, KV_T_DYN)
-    compressed_freqs_sin.bind_dynamic(1, KV_T_DYN)
+    freqs_cos.bind_dynamic(1, T_DYN)
+    freqs_sin.bind_dynamic(1, T_DYN)
+    compressed_freqs_cos.bind_dynamic(1, T_DYN)
+    compressed_freqs_sin.bind_dynamic(1, T_DYN)
     swa_slot_mapping.bind_dynamic(1, KV_T_DYN)
     swa_indices.bind_dynamic(1, T_DYN)
     swa_lens.bind_dynamic(1, T_DYN)
@@ -1457,9 +1413,7 @@ def l3_decode_fwd(
             hc_attn_fn[rank], hc_attn_scale[rank], hc_attn_base[rank],
             attn_norm_w[rank], wq_a[rank], wq_b[rank],
             wq_b_scale[rank], wkv[rank], gamma_cq[rank], gamma_ckv[rank],
-            raw_kv_pool[rank], freqs_cos_local[rank], freqs_sin_local[rank],
-            freqs_cos[rank], freqs_sin[rank],
-            compressed_freqs_cos_local[rank], compressed_freqs_sin_local[rank],
+            raw_kv_pool[rank], freqs_cos[rank], freqs_sin[rank],
             compressed_freqs_cos[rank], compressed_freqs_sin[rank],
             swa_slot_mapping[rank], swa_indices[rank], swa_lens[rank],
             position_ids_local[rank], position_ids[rank],
@@ -1543,7 +1497,7 @@ _LAYER_WEIGHT_NAMES = (
 )
 
 _SWA_METADATA_NAMES = (
-    "freqs_cos_local", "freqs_sin_local", "freqs_cos", "freqs_sin",
+    "freqs_cos", "freqs_sin",
     "swa_slot_mapping", "swa_indices", "swa_lens",
 )
 
@@ -1695,12 +1649,7 @@ def build_tensor_specs(
     compile_only = runtime_case is None
     if not compile_only and weight_bank_size != RUNTIME_WEIGHT_BANK:
         raise ValueError("decode forward runtime witnesses use one reusable weight bank")
-    if runtime_case not in {
-        None,
-        "full_active",
-        "packed_pool_sentinel",
-        "long_context_tail",
-    }:
+    if runtime_case not in {None, "full_active", "packed_pool_sentinel", "long_context_tail"}:
         raise ValueError(f"unknown decode forward runtime case: {runtime_case!r}")
 
     use_default_long_context = runtime_case == "long_context_tail" and start_pos is None
@@ -1750,9 +1699,9 @@ def build_tensor_specs(
         if isinstance(spec, TensorSpec) and spec.name not in {"x_hc", "x_next"}:
             swa_specs.setdefault(spec.name, spec)
 
-    if int(csa_specs["freqs_cos_local"].shape[1]) != local_t:
+    if int(csa_specs["freqs_cos"].shape[1]) != local_t:
         raise ValueError("CSA and SWA decode forward fixtures disagree on active rows")
-    if int(hca_specs["freqs_cos_local"].shape[1]) != local_t:
+    if int(hca_specs["freqs_cos"].shape[1]) != local_t:
         raise ValueError("HCA and SWA decode forward fixtures disagree on active rows")
 
     def zero_active():
@@ -1854,7 +1803,7 @@ def build_tensor_specs(
     for name in _SWA_METADATA_NAMES:
         specs_by_name[name] = _copy_spec(name, swa_specs[name])
     # HCA and CSA share the compressed YaRN profile at ordinary token positions.
-    for name in ("freqs_cos_local", "freqs_sin_local", "freqs_cos", "freqs_sin"):
+    for name in ("freqs_cos", "freqs_sin"):
         public_name = f"compressed_{name}"
         specs_by_name[public_name] = _copy_spec(public_name, csa_specs[name])
     # SWA names its token-local positions bare because it has no gathered twin;
@@ -2003,11 +1952,7 @@ def dspark_target_hidden_compare(actual, _expected, **kwargs):
 
     inputs = kwargs.get("inputs", {})
     outputs = kwargs.get("actual_outputs", {})
-    sources = (
-        outputs.get("x_pong"),
-        outputs.get("x_ping"),
-        outputs.get("pre_hc_hidden_out"),
-    )
+    sources = (outputs.get("x_pong"), outputs.get("x_ping"), outputs.get("pre_hc_hidden_out"))
     if any(source is None for source in sources):
         return False, "    missing layer-40/41/42 HC source output"
     owner_counts = inputs.get("num_tokens_per_owner")
@@ -2049,22 +1994,10 @@ def compare_functions():
     """Validate every output for completion and the DSpark tap mathematically."""
     finite_names = {
         "raw_kv_pool",
-        "csa_compress_state",
-        "csa_inner_compress_state",
-        "csa_cmp_kv",
-        "csa_idx_kv_cache",
-        "csa_idx_kv_scale",
-        "hca_compress_state",
-        "hca_cmp_kv",
-        "hidden_workspace",
-        "x_ping",
-        "x_pong",
-        "x_attn_active",
-        "x_moe_next",
-        "pre_hc_hidden_out",
-        "x_out",
-        "logits",
-        "sampled_ids",
+        "csa_compress_state", "csa_inner_compress_state", "csa_cmp_kv", "csa_idx_kv_cache", "csa_idx_kv_scale",
+        "hca_compress_state", "hca_cmp_kv",
+        "hidden_workspace", "x_ping", "x_pong", "x_attn_active", "x_moe_next",
+        "pre_hc_hidden_out", "x_out", "logits", "sampled_ids",
     }
     compare = {name: finite_tensor_compare for name in finite_names}
     compare["dspark_target_hidden"] = dspark_target_hidden_compare
@@ -2132,10 +2065,8 @@ def main():
 
     runtime_case = None if weight_bank_size == MAIN_LAYER_COUNT else args.runtime_case
     specs = build_tensor_specs(
-        start_pos=start_pos,
-        num_tokens_per_owner=num_tokens_per_owner,
-        weight_bank_size=weight_bank_size,
-        runtime_case=runtime_case,
+        start_pos=start_pos, num_tokens_per_owner=num_tokens_per_owner,
+        weight_bank_size=weight_bank_size, runtime_case=runtime_case,
     )
     result = run(
         fn=l3_decode_fwd,

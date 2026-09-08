@@ -40,11 +40,7 @@ def test_decode_fwd_routes_rope_by_attention_family():
                     (ast.unparse(arg) for arg in call.args),
                 ))
                 for suffix in ("cos", "sin"):
-                    assert arguments[f"freqs_{suffix}"] == (
-                        f"{prefix}freqs_{suffix}_local" if tp1 else f"{prefix}freqs_{suffix}"
-                    )
-                    if not tp1:
-                        assert arguments[f"freqs_{suffix}_local"] == f"{prefix}freqs_{suffix}_local"
+                    assert arguments[f"freqs_{suffix}"] == f"{prefix}freqs_{suffix}"
                     if family != "swa":
                         assert arguments[f"cmp_freqs_{suffix}"] == f"{family}_cmp_freqs_{suffix}"
 
@@ -52,19 +48,21 @@ def test_decode_fwd_routes_rope_by_attention_family():
 def test_decode_fwd_binds_and_forwards_both_rope_profiles():
     functions = _functions("decode_fwd")
     rope_names = [
-        f"{prefix}freqs_{suffix}{local}"
+        f"{prefix}freqs_{suffix}"
         for prefix in ("", "compressed_")
         for suffix in ("cos", "sin")
-        for local in ("", "_local")
     ]
     for function_name, axis in (("decode_fwd", 0), ("l3_decode_fwd", 1)):
         function = functions[function_name]
         parameters = {arg.arg: ast.unparse(arg.annotation) for arg in function.args.args}
         body = ast.unparse(function)
+        # Each profile keeps only the rank's own token rows; the gathered
+        # KV_T_DYN twin it used to pair with is gone. position_ids still
+        # carries both halves, so this guard is scoped to the rope tables.
+        assert not [name for name in parameters if "freqs" in name and name.endswith("_local")]
         for name in rope_names:
-            dim = "T_DYN" if name.endswith("_local") else "KV_T_DYN"
-            assert dim in parameters[name]
-            assert f"{name}.bind_dynamic({axis}, {dim})" in body
+            assert "KV_T_DYN" not in parameters[name]
+            assert f"{name}.bind_dynamic({axis}, T_DYN)" in body
     child_call = next(
         node for node in ast.walk(functions["l3_decode_fwd"])
         if isinstance(node, ast.Call) and isinstance(node.func, ast.Name)
@@ -96,7 +94,7 @@ def test_decode_fwd_fixture_uses_shared_positions_and_separate_profiles():
     )
     assert "start_pos=attention_start_pos" in ast.unparse(attention_specs)
 
-    rope_names = ("freqs_cos_local", "freqs_sin_local", "freqs_cos", "freqs_sin")
+    rope_names = ("freqs_cos", "freqs_sin")
     namespace = {
         "_SWA_METADATA_NAMES": rope_names,
         "swa_specs": {name: f"swa:{name}" for name in rope_names},

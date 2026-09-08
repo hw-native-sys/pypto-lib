@@ -8,8 +8,7 @@
 # -----------------------------------------------------------------------------------------------------------
 """DeepSeek-V4 SWA sparse attention with grouped output projection (decode).
 
-Sliding window only -- no compressed cache and no indexer. The CSA and HCA
-variants live in sibling modules.
+Sliding window only: no compressed cache and no indexer.
 """
 
 
@@ -119,9 +118,8 @@ def sparse_attn_swa(
         g_t0 = g_req * S
         g_base = g_req * REQUEST_KV_ROWS
         g_first_len = pl.read(swa_lens, [g_t0])
-        swa_kv_flat[
-            g_base : g_base + REQUEST_KV_ROWS, 0 : HEAD_DIM,
-        ] = pl.full([REQUEST_KV_ROWS, HEAD_DIM], dtype=pl.BF16, value=0.0)
+        g_zero_rows = pl.full([REQUEST_KV_ROWS, HEAD_DIM], dtype=pl.BF16, value=0.0)
+        swa_kv_flat[g_base : g_base + REQUEST_KV_ROWS, 0 : HEAD_DIM] = g_zero_rows
 
         for g_sub in pl.range((WIN - 1) // GATHER_RUN):
             g_sr0 = g_sub * GATHER_RUN
@@ -132,22 +130,15 @@ def sparse_attn_swa(
                 g_run_ok = ((g_last - g_first) + pl.min(g_first, 0) * GATHER_RUN)
                 if g_run_ok == GATHER_RUN - 1:
                     g_run_src = pl.cast(g_first, pl.INDEX)
-                    swa_kv_flat[
-                        g_sdst : g_sdst + GATHER_RUN, 0 : HEAD_DIM,
-                    ] = ori_kv_flat[
-                        g_run_src : g_run_src + GATHER_RUN, 0 : HEAD_DIM,
-                    ]
+                    g_run_rows = ori_kv_flat[g_run_src : g_run_src + GATHER_RUN, 0 : HEAD_DIM]
+                    swa_kv_flat[g_sdst : g_sdst + GATHER_RUN, 0 : HEAD_DIM] = g_run_rows
                 else:
                     for g_dr in pl.range(GATHER_RUN):
                         g_slot_i32 = pl.read(swa_indices, [g_t0, g_sr0 + g_dr])
                         if g_slot_i32 >= 0:
                             g_slot = pl.cast(g_slot_i32, pl.INDEX)
                             g_dst = g_sdst + g_dr
-                            swa_kv_flat[
-                                g_dst : g_dst + 1, 0 : HEAD_DIM,
-                            ] = ori_kv_flat[
-                                g_slot : g_slot + 1, 0 : HEAD_DIM,
-                            ]
+                            swa_kv_flat[g_dst : g_dst + 1, 0 : HEAD_DIM] = ori_kv_flat[g_slot : g_slot + 1, 0 : HEAD_DIM]
             else:
                 for g_dr in pl.range(GATHER_RUN):
                     g_row = g_sr0 + g_dr
@@ -156,11 +147,7 @@ def sparse_attn_swa(
                         if g_slot_i32 >= 0:
                             g_slot = pl.cast(g_slot_i32, pl.INDEX)
                             g_dst = g_base + g_row
-                            swa_kv_flat[
-                                g_dst : g_dst + 1, 0 : HEAD_DIM,
-                            ] = ori_kv_flat[
-                                g_slot : g_slot + 1, 0 : HEAD_DIM,
-                            ]
+                            swa_kv_flat[g_dst : g_dst + 1, 0 : HEAD_DIM] = ori_kv_flat[g_slot : g_slot + 1, 0 : HEAD_DIM]
 
         for g_row in pl.range(((WIN - 1) // GATHER_RUN) * GATHER_RUN, WIN):
             if g_row < g_first_len:
@@ -168,11 +155,7 @@ def sparse_attn_swa(
                 if g_slot_i32 >= 0:
                     g_slot = pl.cast(g_slot_i32, pl.INDEX)
                     g_dst = g_base + g_row
-                    swa_kv_flat[
-                        g_dst : g_dst + 1, 0 : HEAD_DIM,
-                    ] = ori_kv_flat[
-                        g_slot : g_slot + 1, 0 : HEAD_DIM,
-                    ]
+                    swa_kv_flat[g_dst : g_dst + 1, 0 : HEAD_DIM] = ori_kv_flat[g_slot : g_slot + 1, 0 : HEAD_DIM]
 
         for g_token in pl.unroll(S - 1):
             g_t = g_t0 + g_token + 1
@@ -181,9 +164,7 @@ def sparse_attn_swa(
             if g_slot_i32 >= 0:
                 g_slot = pl.cast(g_slot_i32, pl.INDEX)
                 g_dst = g_base + g_first_len + g_token
-                swa_kv_flat[g_dst : g_dst + 1, 0 : HEAD_DIM] = ori_kv_flat[
-                    g_slot : g_slot + 1, 0 : HEAD_DIM,
-                ]
+                swa_kv_flat[g_dst : g_dst + 1, 0 : HEAD_DIM] = ori_kv_flat[g_slot : g_slot + 1, 0 : HEAD_DIM]
 
     gather_tids[0] = gather_tid
 
@@ -278,14 +259,9 @@ def sparse_attn_swa(
                 rope_sin_signed[cs_t0 : cs_t0 + ROPE_CS_T_TILE, cp_c0 : cp_c0 + ROPE_INTERLEAVE_TILE] = cs_sin_signed
 
     return (
-        sparse_blk_mi,
-        sparse_blk_li,
-        sparse_blk_oi,
-        rope_cos_il,
-        rope_sin_signed,
-        rope_swap_idx,
-        qk_tid,
-        rope_tid,
+        sparse_blk_mi, sparse_blk_li, sparse_blk_oi,
+        rope_cos_il, rope_sin_signed, rope_swap_idx,
+        qk_tid, rope_tid,
     )
 
 
@@ -346,12 +322,10 @@ def sparse_attn_swa_tp1(
                 m_src_h0 = m_sg * HEADS_PER_GROUP
                 n_pack_row = (m_g0 + m_sg) * T_PAD + m_t
                 n_dst_head = n_pack_row * HEADS_PER_GROUP
-                o_packed_heads[n_dst_head : n_dst_head + HEADS_PER_GROUP, 0:NOPE_DIM] = n_bf16[
-                    m_src_h0 : m_src_h0 + HEADS_PER_GROUP, 0:NOPE_DIM,
-                ]
-                o_packed_heads[n_dst_head : n_dst_head + HEADS_PER_GROUP, NOPE_DIM:HEAD_DIM] = n_rope_bf16[
-                    m_src_h0 : m_src_h0 + HEADS_PER_GROUP, 0:ROPE_DIM,
-                ]
+                n_nope_tile = n_bf16[m_src_h0 : m_src_h0 + HEADS_PER_GROUP, 0:NOPE_DIM]
+                o_packed_heads[n_dst_head : n_dst_head + HEADS_PER_GROUP, 0:NOPE_DIM] = n_nope_tile
+                n_rope_tile = n_rope_bf16[m_src_h0 : m_src_h0 + HEADS_PER_GROUP, 0:ROPE_DIM]
+                o_packed_heads[n_dst_head : n_dst_head + HEADS_PER_GROUP, NOPE_DIM:HEAD_DIM] = n_rope_tile
 
     return o_packed_heads, merge_tid
 
@@ -426,10 +400,8 @@ def golden_sparse_attn(tensors):
             start = sb * ATTN_K_TILE
             end = min(start + ATTN_K_TILE, WIN)
             slots = swa_indices[t, start:end].tolist()
-            valid_tile = torch.tensor(
-                [start + i < valid_len and int(slot) >= 0 for i, slot in enumerate(slots)],
-                dtype=torch.bool,
-            )
+            valid_rows = [start + i < valid_len and int(slot) >= 0 for i, slot in enumerate(slots)]
+            valid_tile = torch.tensor(valid_rows, dtype=torch.bool)
             if end - start < ATTN_K_TILE:
                 valid_tile = torch.cat([valid_tile, torch.zeros(ATTN_K_TILE - (end - start), dtype=torch.bool)])
             valid_tile = valid_tile.to(device=ori_kv.device)
@@ -574,19 +546,26 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("-p", "--platform", type=str, default="a2a3", choices=["a2a3", "a2a3sim", "a5", "a5sim"])
     parser.add_argument("-d", "--device", type=int, default=0)
-    parser.add_argument("-b", "--batch", type=int, default=B,
-                        help=f"runtime request count; a multiple of 4 up to {B} (the compile-time "
-                             "upper bound). The token axis is pl.dynamic, so one compiled program "
-                             "serves every value.")
-    parser.add_argument("--causal-regression-fixture", action="store_true", default=False,
-                        help="Amplify the S=2 future-window-slot regression.")
-    parser.add_argument("--short-window-fixture", action="store_true", default=False,
-                        help="Use a short-window topk row with valid prefix + -1 padding.")
+    parser.add_argument(
+        "-b", "--batch", type=int, default=B,
+        help=f"runtime request count; a multiple of 4 up to {B} (the compile-time upper bound). "
+             "The token axis is pl.dynamic, so one compiled program serves every value.",
+    )
+    parser.add_argument(
+        "--causal-regression-fixture", action="store_true", default=False,
+        help="Amplify the S=2 future-window-slot regression.",
+    )
+    parser.add_argument(
+        "--short-window-fixture", action="store_true", default=False,
+        help="Use a short-window topk row with valid prefix + -1 padding.",
+    )
     parser.add_argument("--golden-data", type=str, default=None)
     parser.add_argument("--enable-chip-swimlane", type=int, nargs="?", const=1, default=0, choices=(0, 1, 2, 4))
-    parser.add_argument("--enable-dep-gen", action="store_true", default=False,
-                        help="Capture PTO2 dependency edges (deps.json); the swimlane "
-                             "converter draws fanout/fanin arrows from the sibling file.")
+    parser.add_argument(
+        "--enable-dep-gen", action="store_true", default=False,
+        help="Capture PTO2 dependency edges (deps.json); the swimlane converter draws "
+             "fanout/fanin arrows from the sibling file.",
+    )
     parser.add_argument("--enable-pmu", nargs="?", const=2, default=0, type=int, choices=[0, 1, 2, 4])
     parser.add_argument("--dump-passes", action="store_true", default=False)
     args = parser.parse_args()
@@ -597,11 +576,7 @@ if __name__ == "__main__":
 
     result = run(
         fn=sparse_attn_swa_test,
-        specs=build_tensor_specs(
-            args.causal_regression_fixture,
-            args.short_window_fixture,
-            batch=args.batch,
-        ),
+        specs=build_tensor_specs(args.causal_regression_fixture, args.short_window_fixture, batch=args.batch),
         golden_fn=golden_sparse_attn,
         golden_data=args.golden_data,
         config=dict(

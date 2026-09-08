@@ -162,10 +162,8 @@ def decode_hca(
     wkv: pl.Tensor[[D, HEAD_DIM], pl.BF16],
     gamma_cq: pl.Tensor[[Q_LORA], pl.BF16],
     gamma_ckv: pl.Tensor[[HEAD_DIM], pl.BF16],
-    freqs_cos_local: pl.Tensor[[T_DYN, ROPE_HEAD_DIM], pl.BF16],
-    freqs_sin_local: pl.Tensor[[T_DYN, ROPE_HEAD_DIM], pl.BF16],
-    freqs_cos: pl.Tensor[[KV_T_DYN, ROPE_HEAD_DIM], pl.BF16],
-    freqs_sin: pl.Tensor[[KV_T_DYN, ROPE_HEAD_DIM], pl.BF16],
+    freqs_cos: pl.Tensor[[T_DYN, ROPE_HEAD_DIM], pl.BF16],
+    freqs_sin: pl.Tensor[[T_DYN, ROPE_HEAD_DIM], pl.BF16],
     cmp_freqs_cos: pl.Tensor[[KV_B_DYN, ROPE_HEAD_DIM // 2], pl.FP32],
     cmp_freqs_sin: pl.Tensor[[KV_B_DYN, ROPE_HEAD_DIM // 2], pl.FP32],
     cmp_wkv: pl.Tensor[[MAIN_OUT_DIM, D], pl.BF16],
@@ -228,7 +226,7 @@ def decode_hca(
     q_cos_il = pl.create_tensor([t_dim, ROPE_HEAD_DIM], dtype=pl.FP32)
     q_sin_signed = pl.create_tensor([t_dim, ROPE_HEAD_DIM], dtype=pl.FP32)
     q_swap_idx = pl.create_tensor([t_dim, ROPE_HEAD_DIM], dtype=pl.INT32)
-    rope_prepare(freqs_cos_local, freqs_sin_local, q_cos_il, q_sin_signed, q_swap_idx)
+    rope_prepare(freqs_cos, freqs_sin, q_cos_il, q_sin_signed, q_swap_idx)
 
     q_proj_rope(
         x_normed, wq_a, wq_b, wq_b_scale, gamma_cq,
@@ -302,9 +300,7 @@ def decode_hca(
     cmp_positions = pl.reshape(position_ids, [kv_dim])
     cmp_slots = pl.reshape(cmp_slot_mapping, [kv_dim])
     cmp_state_slots = pl.reshape(state_slot_mapping, [kv_dim])
-    cmp_state_table = pl.reshape(
-        compress_state_block_table, [kv_b_dim, COMPRESS_STATE_MAX_BLOCKS],
-    )
+    cmp_state_table = pl.reshape(compress_state_block_table, [kv_b_dim, COMPRESS_STATE_MAX_BLOCKS])
     cmp_kv_proj = pl.create_tensor([kv_dim, HEAD_DIM], dtype=pl.FP32)
     cmp_kv_proj, cmp_cache_write_tid = compressor_ratio128_projected(
         cmp_values_full, cmp_scores_full, cmp_kv_proj,
@@ -318,22 +314,15 @@ def decode_hca(
     attn_out = pl.create_tensor([t_dim, D], dtype=pl.BF16)
     with pl.scope():
         (
-            stream_state_m,
-            stream_state_l,
-            stream_heads,
-            cmp_partial_m,
-            cmp_partial_l,
-            cmp_partial_o,
-            rope_cos_il,
-            rope_sin_signed,
-            raw_tid,
-            cmp_tid,
-            rope_tid,
+            stream_state_m, stream_state_l, stream_heads,
+            cmp_partial_m, cmp_partial_l, cmp_partial_o,
+            rope_cos_il, rope_sin_signed,
+            raw_tid, cmp_tid, rope_tid,
         ) = sparse_attn_hca(
             q, kv_cache, window_swa_indices, window_swa_lens,
             cmp_kv, cmp_block_table,
             position_ids_local, kv_seq_lens,
-            freqs_cos_local, freqs_sin_local,
+            freqs_cos, freqs_sin,
             ori_cache_write_tid, cmp_cache_write_tid,
         )
 
@@ -342,39 +331,26 @@ def decode_hca(
         cmp_work_count = (cmp_table_blocks + CMP_PAGES_PER_WORK - 1) // CMP_PAGES_PER_WORK
         pack_work_count = (t_dim // ATTENTION_PUBLISH_T_TILE) * (H // H_TILE)
         with pl.spmd(
-            ATTENTION_PUBLISH_WORKERS,
-            name_hint="hca_stream_merge_pack_publish",
-            deps=[raw_tid, cmp_tid, rope_tid],
+            ATTENTION_PUBLISH_WORKERS, name_hint="hca_stream_merge_pack_publish", deps=[raw_tid, cmp_tid, rope_tid],
         ) as publish_tid:
             worker = pl.tile.get_block_idx()
             stream_h_tile = worker - (worker // (H // H_TILE)) * (H // H_TILE)
             stream_h0 = stream_h_tile * H_TILE
             global_group0 = stream_h0 // HEADS_PER_GROUP
-            destination_rank = global_group0 // LOCAL_O_GROUPS
-            local_group0 = global_group0 - destination_rank * LOCAL_O_GROUPS
-            stream_sink = pl.load(
-                attn_sink_col,
-                [stream_h0, 0],
-                [H_TILE, 1],
-                target_memory=pl.MemorySpace.Vec,
-            )
+            dst_rank = global_group0 // LOCAL_O_GROUPS
+            local_group0 = global_group0 - dst_rank * LOCAL_O_GROUPS
+            stream_sink = pl.load(attn_sink_col, [stream_h0, 0], [H_TILE, 1], target_memory=pl.MemorySpace.Vec)
             stream_swap_one = pl.tile.full([1, ROPE_HEAD_DIM], dtype=pl.FP32, value=1.0)
-            stream_swap_index = pl.cast(
-                pl.tile.arange(0, [1, ROPE_HEAD_DIM], dtype=pl.INT32),
-                target_type=pl.FP32,
-            )
+            stream_swap_lane_ids = pl.tile.arange(0, [1, ROPE_HEAD_DIM], dtype=pl.INT32)
+            stream_swap_index = pl.cast(stream_swap_lane_ids, target_type=pl.FP32)
             stream_swap_col = pl.col_expand_mul(stream_swap_one, stream_swap_index)
-            stream_swap_dup = pl.cast(
-                pl.mul(stream_swap_col, 0.5),
-                target_type=pl.INT32,
-                mode="trunc",
-            )
+            stream_swap_half = pl.mul(stream_swap_col, 0.5)
+            stream_swap_dup = pl.cast(stream_swap_half, target_type=pl.INT32, mode="trunc")
             stream_swap_dup_f = pl.cast(stream_swap_dup, target_type=pl.FP32)
             stream_swap_lane = pl.sub(stream_swap_col, pl.mul(stream_swap_dup_f, 2.0))
-            stream_swap = pl.sub(
-                pl.add(stream_swap_col, 1.0),
-                pl.mul(stream_swap_lane, 2.0),
-            )
+            stream_swap_next = pl.add(stream_swap_col, 1.0)
+            stream_swap_back = pl.mul(stream_swap_lane, 2.0)
+            stream_swap = pl.sub(stream_swap_next, stream_swap_back)
             stream_swap_zero = pl.tile.full([H_TILE, ROPE_HEAD_DIM], dtype=pl.FP32, value=0.0)
             stream_swap_source = pl.add(stream_swap, NOPE_DIM)
             stream_swap_grid = pl.col_expand_add(stream_swap_zero, stream_swap_source)
@@ -394,62 +370,33 @@ def decode_hca(
                 for stream_dt in pl.range(ATTENTION_PUBLISH_T_TILE):
                     merge_t = stream_t0 + stream_dt
                     merge_state_row = merge_t * H + stream_h0
-                    stream_m = pl.load(
-                        stream_state_m,
-                        [merge_state_row, 0],
-                        [H_TILE, 1],
-                        target_memory=pl.MemorySpace.Vec,
-                    )
-                    stream_l = pl.load(
-                        stream_state_l,
-                        [merge_state_row, 0],
-                        [H_TILE, 1],
-                        target_memory=pl.MemorySpace.Vec,
-                    )
-                    stream_o = pl.load(
-                        stream_heads,
-                        [merge_state_row, 0],
-                        [H_TILE, HEAD_DIM],
-                        target_memory=pl.MemorySpace.Vec,
-                    )
+                    stream_m = pl.load(stream_state_m, [merge_state_row, 0], [H_TILE, 1], target_memory=pl.MemorySpace.Vec)
+                    stream_l = pl.load(stream_state_l, [merge_state_row, 0], [H_TILE, 1], target_memory=pl.MemorySpace.Vec)
+                    stream_o = pl.load(stream_heads, [merge_state_row, 0], [H_TILE, HEAD_DIM], target_memory=pl.MemorySpace.Vec)
                     stream_token_base = merge_t * (H // H_TILE) * cmp_work_count * H_TILE
                     for stream_work in pl.range(cmp_work_count):
-                        stream_partial_row = (
-                            stream_token_base
-                            + stream_h_tile * cmp_work_count * H_TILE
-                            + stream_work * H_TILE
-                        )
+                        stream_tile_base = stream_h_tile * cmp_work_count * H_TILE
+                        stream_partial_row = stream_token_base + stream_tile_base + stream_work * H_TILE
                         stream_cmp_m_aligned = pl.load(
-                            cmp_partial_m,
-                            [stream_partial_row, 0],
-                            [H_TILE, 8],
-                            target_memory=pl.MemorySpace.Vec,
+                            cmp_partial_m, [stream_partial_row, 0], [H_TILE, 8], target_memory=pl.MemorySpace.Vec,
                         )
                         stream_cmp_l_aligned = pl.load(
-                            cmp_partial_l,
-                            [stream_partial_row, 0],
-                            [H_TILE, 8],
-                            target_memory=pl.MemorySpace.Vec,
+                            cmp_partial_l, [stream_partial_row, 0], [H_TILE, 8], target_memory=pl.MemorySpace.Vec,
                         )
                         stream_cmp_m = stream_cmp_m_aligned[0:H_TILE, 0:1]
                         stream_cmp_l = stream_cmp_l_aligned[0:H_TILE, 0:1]
                         stream_cmp_o = pl.load(
-                            cmp_partial_o,
-                            [stream_partial_row, 0],
-                            [H_TILE, HEAD_DIM],
-                            target_memory=pl.MemorySpace.Vec,
+                            cmp_partial_o, [stream_partial_row, 0], [H_TILE, HEAD_DIM], target_memory=pl.MemorySpace.Vec,
                         )
                         stream_m_new = pl.maximum(stream_m, stream_cmp_m)
                         stream_alpha = pl.exp(pl.sub(stream_m, stream_m_new))
                         stream_beta = pl.exp(pl.sub(stream_cmp_m, stream_m_new))
-                        stream_l = pl.add(
-                            pl.mul(stream_alpha, stream_l),
-                            pl.mul(stream_beta, stream_cmp_l),
-                        )
-                        stream_o = pl.add(
-                            pl.row_expand_mul(stream_o, stream_alpha),
-                            pl.row_expand_mul(stream_cmp_o, stream_beta),
-                        )
+                        stream_l_scaled = pl.mul(stream_alpha, stream_l)
+                        stream_cmp_l_scaled = pl.mul(stream_beta, stream_cmp_l)
+                        stream_l = pl.add(stream_l_scaled, stream_cmp_l_scaled)
+                        stream_o_scaled = pl.row_expand_mul(stream_o, stream_alpha)
+                        stream_cmp_o_scaled = pl.row_expand_mul(stream_cmp_o, stream_beta)
+                        stream_o = pl.add(stream_o_scaled, stream_cmp_o_scaled)
                         stream_m = stream_m_new
                     stream_sink_tile = pl.add(pl.sub(stream_m, stream_m), stream_sink)
                     stream_denom = pl.add(stream_l, pl.exp(pl.sub(stream_sink_tile, stream_m)))
@@ -459,15 +406,12 @@ def decode_hca(
                     stream_cos_il = pl.load(rope_cos_il, [merge_t, 0], [1, ROPE_HEAD_DIM])
                     stream_sin_signed = pl.load(rope_sin_signed, [merge_t, 0], [1, ROPE_HEAD_DIM])
                     stream_swapped = pl.tile.gather(stream_output, stream_swap_idx, stream_gather_tmp)
-                    stream_rot = pl.add(
-                        pl.col_expand_mul(stream_rope, stream_cos_il),
-                        pl.col_expand_mul(stream_swapped, stream_sin_signed),
-                    )
+                    stream_rope_cos = pl.col_expand_mul(stream_rope, stream_cos_il)
+                    stream_swap_sin = pl.col_expand_mul(stream_swapped, stream_sin_signed)
+                    stream_rot = pl.add(stream_rope_cos, stream_swap_sin)
                     stream_rope_bf16 = pl.cast(stream_rot, target_type=pl.BF16, mode="rint")
-                    stream_full_bf16 = pl.concat(
-                        stream_bf16[0:H_TILE, 0:NOPE_DIM],
-                        stream_rope_bf16,
-                    )
+                    stream_nope_bf16 = stream_bf16[0:H_TILE, 0:NOPE_DIM]
+                    stream_full_bf16 = pl.concat(stream_nope_bf16, stream_rope_bf16)
                     stream_groups = pl.reshape(stream_full_bf16, [PUBLISH_GROUPS, O_GROUP_IN])
                     publish_first_row = stream_groups[0:1, 0:O_GROUP_IN]
                     publish_second_row = stream_groups[1:2, 0:O_GROUP_IN]
@@ -477,20 +421,17 @@ def decode_hca(
                 publish_first_offset = local_group0 * GROUP_T_PAD + tp_rank * local_t + stream_t0
                 publish_second_offset = (local_group0 + 1) * GROUP_T_PAD + tp_rank * local_t + stream_t0
                 pld.tile.remote_store(
-                    publish_first, attention_window, group_base + destination_rank, [publish_first_offset, 0],
+                    publish_first, attention_window, group_base + dst_rank, [publish_first_offset, 0],
                 )
                 pld.tile.remote_store(
-                    publish_second, attention_window, group_base + destination_rank, [publish_second_offset, 0],
+                    publish_second, attention_window, group_base + dst_rank, [publish_second_offset, 0],
                 )
 
             for peer_tp in pl.range(TP_SIZE):
                 if peer_tp != tp_rank:
                     pld.system.notify(
-                        target=attention_signal,
-                        peer=group_base + peer_tp,
-                        offsets=[tp_rank, 0],
-                        value=1,
-                        op=pld.NotifyOp.AtomicAdd,
+                        target=attention_signal, peer=group_base + peer_tp,
+                        offsets=[tp_rank, 0], value=1, op=pld.NotifyOp.AtomicAdd,
                     )
 
         attention_local_flat, attention_signal = o_group_a2a(
@@ -529,10 +470,8 @@ def decode_hca_test(
     wkv: pl.Tensor[[D, HEAD_DIM], pl.BF16],
     gamma_cq: pl.Tensor[[Q_LORA], pl.BF16],
     gamma_ckv: pl.Tensor[[HEAD_DIM], pl.BF16],
-    freqs_cos_local: pl.Tensor[[T_DYN, ROPE_HEAD_DIM], pl.BF16],
-    freqs_sin_local: pl.Tensor[[T_DYN, ROPE_HEAD_DIM], pl.BF16],
-    freqs_cos: pl.Tensor[[KV_T_DYN, ROPE_HEAD_DIM], pl.BF16],
-    freqs_sin: pl.Tensor[[KV_T_DYN, ROPE_HEAD_DIM], pl.BF16],
+    freqs_cos: pl.Tensor[[T_DYN, ROPE_HEAD_DIM], pl.BF16],
+    freqs_sin: pl.Tensor[[T_DYN, ROPE_HEAD_DIM], pl.BF16],
     cmp_freqs_cos: pl.Tensor[[KV_B_DYN, ROPE_HEAD_DIM // 2], pl.FP32],
     cmp_freqs_sin: pl.Tensor[[KV_B_DYN, ROPE_HEAD_DIM // 2], pl.FP32],
     cmp_wkv: pl.Tensor[[MAIN_OUT_DIM, D], pl.BF16],
@@ -569,10 +508,8 @@ def decode_hca_test(
 ):
     """Test one rank of the complete HCA tensor-parallel layer."""
     x_hc.bind_dynamic(0, T_DYN)
-    freqs_cos_local.bind_dynamic(0, T_DYN)
-    freqs_sin_local.bind_dynamic(0, T_DYN)
-    freqs_cos.bind_dynamic(0, KV_T_DYN)
-    freqs_sin.bind_dynamic(0, KV_T_DYN)
+    freqs_cos.bind_dynamic(0, T_DYN)
+    freqs_sin.bind_dynamic(0, T_DYN)
     cmp_freqs_cos.bind_dynamic(0, KV_B_DYN)
     cmp_freqs_sin.bind_dynamic(0, KV_B_DYN)
     compress_state.bind_dynamic(0, COMPRESS_STATE_BLOCK_NUM_DYN)
@@ -595,7 +532,7 @@ def decode_hca_test(
         x_hc,
         hc_attn_fn, hc_attn_scale, hc_attn_base,
         attn_norm_w, wq_a, wq_b, wq_b_scale, wkv, gamma_cq, gamma_ckv,
-        freqs_cos_local, freqs_sin_local, freqs_cos, freqs_sin,
+        freqs_cos, freqs_sin,
         cmp_freqs_cos, cmp_freqs_sin,
         cmp_wkv, cmp_wgate, cmp_ape, cmp_norm_w,
         compress_state, compress_state_block_table,
@@ -625,10 +562,8 @@ def l3_decode_hca(
     wkv: pl.Tensor[[TP_SIZE, D, HEAD_DIM], pl.BF16],
     gamma_cq: pl.Tensor[[TP_SIZE, Q_LORA], pl.BF16],
     gamma_ckv: pl.Tensor[[TP_SIZE, HEAD_DIM], pl.BF16],
-    freqs_cos_local: pl.Tensor[[TP_SIZE, T_DYN, ROPE_HEAD_DIM], pl.BF16],
-    freqs_cos: pl.Tensor[[TP_SIZE, KV_T_DYN, ROPE_HEAD_DIM], pl.BF16],
-    freqs_sin_local: pl.Tensor[[TP_SIZE, T_DYN, ROPE_HEAD_DIM], pl.BF16],
-    freqs_sin: pl.Tensor[[TP_SIZE, KV_T_DYN, ROPE_HEAD_DIM], pl.BF16],
+    freqs_cos: pl.Tensor[[TP_SIZE, T_DYN, ROPE_HEAD_DIM], pl.BF16],
+    freqs_sin: pl.Tensor[[TP_SIZE, T_DYN, ROPE_HEAD_DIM], pl.BF16],
     cmp_freqs_cos: pl.Tensor[[TP_SIZE, KV_B_DYN, ROPE_HEAD_DIM // 2], pl.FP32],
     cmp_freqs_sin: pl.Tensor[[TP_SIZE, KV_B_DYN, ROPE_HEAD_DIM // 2], pl.FP32],
     cmp_wkv: pl.Tensor[[TP_SIZE, MAIN_OUT_DIM, D], pl.BF16],
@@ -657,10 +592,8 @@ def l3_decode_hca(
 ):
     """Launch the complete HCA layer on one tensor-parallel group."""
     x_hc.bind_dynamic(1, T_DYN)
-    freqs_cos_local.bind_dynamic(1, T_DYN)
-    freqs_sin_local.bind_dynamic(1, T_DYN)
-    freqs_cos.bind_dynamic(1, KV_T_DYN)
-    freqs_sin.bind_dynamic(1, KV_T_DYN)
+    freqs_cos.bind_dynamic(1, T_DYN)
+    freqs_sin.bind_dynamic(1, T_DYN)
     cmp_freqs_cos.bind_dynamic(1, KV_B_DYN)
     cmp_freqs_sin.bind_dynamic(1, KV_B_DYN)
     compress_state_block_table.bind_dynamic(1, KV_B_DYN)
@@ -695,7 +628,6 @@ def l3_decode_hca(
             hc_attn_fn[rank], hc_attn_scale[rank], hc_attn_base[rank],
             attn_norm_w[rank], wq_a[rank], wq_b[rank], wq_b_scale[rank],
             wkv[rank], gamma_cq[rank], gamma_ckv[rank],
-            freqs_cos_local[rank], freqs_sin_local[rank],
             freqs_cos[rank], freqs_sin[rank],
             cmp_freqs_cos[rank], cmp_freqs_sin[rank],
             cmp_wkv[rank], cmp_wgate[rank], cmp_ape[rank], cmp_norm_w[rank],
@@ -906,9 +838,7 @@ def decode_hca_tp1_test(
 
 
 def golden_decode_hca_tp1(tensors, cp_full=None):
-    """End-to-end orchestration for the ratio=128 (HCA) layers.
-    Mirrors Block.hc_pre + Attention.forward (decode branch, ratio==128 path: main compressor only,
-    no indexer) + Block.hc_post."""
+    """End-to-end orchestration for the ratio=128 (HCA) layers."""
     import torch
 
     from hc_pre import golden_hc_pre
@@ -1070,7 +1000,6 @@ def golden_decode_hca(tensors):
         x_normed = golden_rms_norm(x_mixed, tensors["attn_norm_w"][rank])
         normed_chunks.append(x_normed)
 
-        rows = slice(rank * local_t, (rank + 1) * local_t)
         kv_chunk = torch.zeros(local_t, HEAD_DIM, dtype=torch.bfloat16)
         golden_qkv_proj_rope({
             "x": x_normed,
@@ -1078,8 +1007,8 @@ def golden_decode_hca(tensors):
             "wq_b": tensors["wq_b"][0],
             "wq_b_scale": tensors["wq_b_scale"][0],
             "wkv": tensors["wkv"][0],
-            "rope_cos": tensors["freqs_cos"][0][rows],
-            "rope_sin": tensors["freqs_sin"][0][rows],
+            "rope_cos": tensors["freqs_cos"][rank],
+            "rope_sin": tensors["freqs_sin"][rank],
             "gamma_cq": tensors["gamma_cq"][0],
             "gamma_ckv": tensors["gamma_ckv"][0],
             "q": torch.zeros(local_t, H, HEAD_DIM, dtype=torch.bfloat16),
@@ -1104,9 +1033,7 @@ def golden_decode_hca(tensors):
     for rank in range(tp_size):
         rank_tensors = { name: tensor[rank] for name, tensor in tensors.items() if name != "local_t" }
         # The TP1 reference names its token-local rows without a suffix, so the
-        # _local halves replace the gathered stream that now holds the bare name.
-        rank_tensors["freqs_cos"] = tensors["freqs_cos_local"][rank]
-        rank_tensors["freqs_sin"] = tensors["freqs_sin_local"][rank]
+        # _local half replaces the gathered stream that now holds the bare name.
         rank_tensors["position_ids"] = tensors["position_ids_local"][rank]
         rank_tensors["wo_a"] = full_wo_a
         rank_tensors["wo_b"] = full_wo_b
@@ -1459,7 +1386,7 @@ def build_distributed_tensor_specs(local_t, start_pos=None):
         "compress_state_block_table", "cmp_freqs_cos", "cmp_freqs_sin",
     })
     # Consumed on both sides: the rank's rows plus a replicated full-stream twin.
-    dual_names = ("freqs_cos", "freqs_sin", "position_ids")
+    dual_names = ("position_ids",)
     resident_names = frozenset({
         "hc_attn_fn", "hc_attn_scale", "hc_attn_base",
         "attn_norm_w", "wq_a", "wq_b", "wq_b_scale", "wkv", "gamma_cq", "gamma_ckv",

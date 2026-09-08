@@ -164,10 +164,8 @@ def sparse_attn_hca(
             g_t0 = g_req * S
             g_base = g_req * REQUEST_KV_ROWS
             g_first_len = pl.read(window_swa_lens, [g_t0])
-            raw_kv[
-                g_base : g_base + REQUEST_KV_ROWS,
-                0:HEAD_DIM,
-            ] = pl.full([REQUEST_KV_ROWS, HEAD_DIM], dtype=pl.BF16, value=0.0)
+            g_zero_rows = pl.full([REQUEST_KV_ROWS, HEAD_DIM], dtype=pl.BF16, value=0.0)
+            raw_kv[g_base : g_base + REQUEST_KV_ROWS, 0:HEAD_DIM] = g_zero_rows
 
             g_bulk_matches = pl.cast(g_first_len == WIN, pl.INT32)
             g_bulk_first = pl.read(window_swa_indices, [g_t0, 0])
@@ -188,9 +186,8 @@ def sparse_attn_hca(
                     g_bulk_matches = g_bulk_matches * pl.cast(g_len == WIN, pl.INT32)
             if g_bulk_matches == 1:
                 g_bulk_src = pl.cast(g_bulk_first, pl.INDEX)
-                raw_kv[g_base : g_base + REQUEST_KV_ROWS, 0:HEAD_DIM] = ori_kv_flat[
-                    g_bulk_src : g_bulk_src + REQUEST_KV_ROWS, 0:HEAD_DIM,
-                ]
+                g_bulk_rows = ori_kv_flat[g_bulk_src : g_bulk_src + REQUEST_KV_ROWS, 0:HEAD_DIM]
+                raw_kv[g_base : g_base + REQUEST_KV_ROWS, 0:HEAD_DIM] = g_bulk_rows
             else:
                 for g_sub in pl.range(WIN // GATHER_RUN_TILE):
                     g_sr0 = g_sub * GATHER_RUN_TILE
@@ -200,32 +197,19 @@ def sparse_attn_hca(
                         g_run_matches = pl.cast(g_first >= 0, pl.INT32)
                         for g_dr in pl.unroll(GATHER_RUN_TILE):
                             g_slot_i32 = pl.read(window_swa_indices, [g_t0, g_sr0 + g_dr])
-                            g_run_matches = g_run_matches * pl.cast(
-                                g_slot_i32 == g_first + g_dr,
-                                pl.INT32,
-                            )
+                            g_run_matches = g_run_matches * pl.cast(g_slot_i32 == g_first + g_dr, pl.INT32)
                         if g_run_matches == 1:
                             g_run_src = pl.cast(g_first, pl.INDEX)
-                            raw_kv[
-                                g_sdst : g_sdst + GATHER_RUN_TILE,
-                                0:HEAD_DIM,
-                            ] = ori_kv_flat[
-                                g_run_src : g_run_src + GATHER_RUN_TILE,
-                                0:HEAD_DIM,
-                            ]
+                            g_run_rows = ori_kv_flat[g_run_src : g_run_src + GATHER_RUN_TILE, 0:HEAD_DIM]
+                            raw_kv[g_sdst : g_sdst + GATHER_RUN_TILE, 0:HEAD_DIM] = g_run_rows
                         else:
                             for g_dr in pl.range(GATHER_RUN_TILE):
                                 g_slot_i32 = pl.read(window_swa_indices, [g_t0, g_sr0 + g_dr])
                                 if g_slot_i32 >= 0:
                                     g_slot = pl.cast(g_slot_i32, pl.INDEX)
                                     g_dst = g_sdst + g_dr
-                                    raw_kv[
-                                        g_dst : g_dst + 1,
-                                        0:HEAD_DIM,
-                                    ] = ori_kv_flat[
-                                        g_slot : g_slot + 1,
-                                        0:HEAD_DIM,
-                                    ]
+                                    g_slot_row = ori_kv_flat[g_slot : g_slot + 1, 0:HEAD_DIM]
+                                    raw_kv[g_dst : g_dst + 1, 0:HEAD_DIM] = g_slot_row
                     else:
                         for g_dr in pl.range(GATHER_RUN_TILE):
                             g_row = g_sr0 + g_dr
@@ -234,13 +218,8 @@ def sparse_attn_hca(
                                 if g_slot_i32 >= 0:
                                     g_slot = pl.cast(g_slot_i32, pl.INDEX)
                                     g_dst = g_base + g_row
-                                    raw_kv[
-                                        g_dst : g_dst + 1,
-                                        0:HEAD_DIM,
-                                    ] = ori_kv_flat[
-                                        g_slot : g_slot + 1,
-                                        0:HEAD_DIM,
-                                    ]
+                                    g_slot_row = ori_kv_flat[g_slot : g_slot + 1, 0:HEAD_DIM]
+                                    raw_kv[g_dst : g_dst + 1, 0:HEAD_DIM] = g_slot_row
 
                 for g_token in pl.unroll(S - 1):
                     g_t = g_t0 + g_token + 1
@@ -249,37 +228,18 @@ def sparse_attn_hca(
                     if g_slot_i32 >= 0:
                         g_slot = pl.cast(g_slot_i32, pl.INDEX)
                         g_dst = g_base + g_first_len + g_token
-                        raw_kv[
-                            g_dst : g_dst + 1,
-                            0:HEAD_DIM,
-                        ] = ori_kv_flat[
-                            g_slot : g_slot + 1,
-                            0:HEAD_DIM,
-                        ]
+                        g_slot_row = ori_kv_flat[g_slot : g_slot + 1, 0:HEAD_DIM]
+                        raw_kv[g_dst : g_dst + 1, 0:HEAD_DIM] = g_slot_row
 
         with pl.spmd(t_dim // VALID_TOKEN_TILE, name_hint="hca_raw_valid") as raw_valid_tid:
             valid_block = pl.tile.get_block_idx()
             valid_t0 = valid_block * VALID_TOKEN_TILE
-            valid_col = pl.cast(
-                pl.tile.arange(0, [1, WIN], dtype=pl.INT32),
-                target_type=pl.FP32,
-            )
+            valid_col = pl.cast(pl.tile.arange(0, [1, WIN], dtype=pl.INT32), target_type=pl.FP32)
             valid_zero = pl.tile.full([VALID_TOKEN_TILE, WIN], dtype=pl.FP32, value=0.0)
             valid_cols = pl.col_expand_add(valid_zero, valid_col)
-            valid_lens_i32 = pl.load(
-                window_swa_lens,
-                [valid_t0],
-                [VALID_TOKEN_TILE],
-                target_memory=pl.MemorySpace.Vec,
-            )
-            valid_lens = pl.cast(
-                pl.reshape(valid_lens_i32, [VALID_TOKEN_TILE, 1]),
-                target_type=pl.FP32,
-            )
-            valid_mask = pl.minimum(
-                pl.maximum(pl.neg(pl.row_expand_sub(valid_cols, valid_lens)), 0.0),
-                1.0,
-            )
+            valid_lens_i32 = pl.load(window_swa_lens, [valid_t0], [VALID_TOKEN_TILE], target_memory=pl.MemorySpace.Vec)
+            valid_lens = pl.cast(pl.reshape(valid_lens_i32, [VALID_TOKEN_TILE, 1]), target_type=pl.FP32)
+            valid_mask = pl.minimum(pl.maximum(pl.neg(pl.row_expand_sub(valid_cols, valid_lens)), 0.0), 1.0)
             pl.store(valid_mask, [valid_t0, 0], raw_valid)
 
         with pl.spmd(HALF_ROPE // ROPE_TILE, name_hint="rope_cs") as rope_cs_tid:
@@ -308,9 +268,7 @@ def sparse_attn_hca(
                 rope_sin_signed[cs_t0 : cs_t0 + ROPE_CS_T_TILE, cp_c0 : cp_c0 + ROPE_INTERLEAVE_TILE] = cs_sin_signed
 
         with pl.spmd(
-            RAW_WORKERS,
-            name_hint="hca_raw_attn",
-            deps=[raw_gather_tid, raw_valid_tid],
+            RAW_WORKERS, name_hint="hca_raw_attn", deps=[raw_gather_tid, raw_valid_tid],
         ) as raw_heads_tid:
             stream_worker = pl.tile.get_block_idx()
             for stream_t in pl.range(stream_worker, t_dim, RAW_WORKERS):
@@ -321,78 +279,44 @@ def sparse_attn_hca(
                 stream_drop = pl.max(stream_first_len + stream_token - WIN, 0)
                 stream_raw_base = stream_request * REQUEST_KV_ROWS + stream_drop
                 stream_raw_kv = pl.load(
-                    raw_kv,
-                    [stream_raw_base, 0],
-                    [RAW_K_TILE, HEAD_DIM],
-                    target_memory=pl.MemorySpace.Mat,
+                    raw_kv, [stream_raw_base, 0], [RAW_K_TILE, HEAD_DIM], target_memory=pl.MemorySpace.Mat,
                 )
                 stream_raw_kv_t = pl.tile.transpose_view(stream_raw_kv)
                 stream_raw_kv_t_left = stream_raw_kv_t[0:ATTN_D_TILE, 0:RAW_K_TILE]
                 stream_raw_kv_t_right = stream_raw_kv_t[ATTN_D_TILE:HEAD_DIM, 0:RAW_K_TILE]
                 stream_raw_valid_row = pl.load(
-                    raw_valid,
-                    [stream_t, 0],
-                    [1, RAW_K_TILE],
-                    target_memory=pl.MemorySpace.Vec,
+                    raw_valid, [stream_t, 0], [1, RAW_K_TILE], target_memory=pl.MemorySpace.Vec,
                 )
-                stream_raw_valid_zero = pl.tile.full(
-                    [RAW_H_TILE, RAW_K_TILE],
-                    dtype=pl.FP32,
-                    value=0.0,
-                )
+                stream_raw_valid_zero = pl.tile.full([RAW_H_TILE, RAW_K_TILE], dtype=pl.FP32, value=0.0)
                 stream_raw_valid = pl.col_expand_add(stream_raw_valid_zero, stream_raw_valid_row)
                 stream_raw_bias = pl.mul(pl.sub(stream_raw_valid, 1.0), -NEG_INF)
                 stream_row_max_tmp = pl.create_tile(
-                    [RAW_H_TILE, RAW_K_TILE],
-                    dtype=pl.FP32,
-                    target_memory=pl.MemorySpace.Vec,
+                    [RAW_H_TILE, RAW_K_TILE], dtype=pl.FP32, target_memory=pl.MemorySpace.Vec,
                 )
                 stream_row_sum_tmp = pl.create_tile(
-                    [RAW_H_TILE, RAW_K_TILE],
-                    dtype=pl.FP32,
-                    target_memory=pl.MemorySpace.Vec,
+                    [RAW_H_TILE, RAW_K_TILE], dtype=pl.FP32, target_memory=pl.MemorySpace.Vec,
                 )
                 for stream_h_tile in pl.range(H // RAW_H_TILE):
                     stream_h0 = stream_h_tile * RAW_H_TILE
                     stream_state_row = stream_t * H + stream_h0
                     stream_q = pl.load(
-                        q_flat,
-                        [stream_state_row, 0],
-                        [RAW_H_TILE, HEAD_DIM],
-                        target_memory=pl.MemorySpace.Mat,
+                        q_flat, [stream_state_row, 0], [RAW_H_TILE, HEAD_DIM], target_memory=pl.MemorySpace.Mat,
                     )
-                    stream_raw_scores = pl.matmul(
-                        stream_q[:, 0:ATTN_D_TILE],
-                        stream_raw_kv_t_left,
-                        out_dtype=pl.FP32,
-                    )
+                    stream_raw_scores = pl.matmul(stream_q[:, 0:ATTN_D_TILE], stream_raw_kv_t_left, out_dtype=pl.FP32)
                     stream_raw_scores = pl.matmul_acc(
-                        stream_raw_scores,
-                        stream_q[:, ATTN_D_TILE:HEAD_DIM],
-                        stream_raw_kv_t_right,
+                        stream_raw_scores, stream_q[:, ATTN_D_TILE:HEAD_DIM], stream_raw_kv_t_right,
                     )
-                    stream_raw_scores = pl.add(
-                        pl.mul(stream_raw_scores, SOFTMAX_SCALE),
-                        stream_raw_bias,
-                    )
+                    stream_raw_scores = pl.add(pl.mul(stream_raw_scores, SOFTMAX_SCALE), stream_raw_bias)
                     stream_raw_mi_col = pl.row_max(stream_raw_scores, stream_row_max_tmp)
                     stream_raw_exp = pl.exp(pl.row_expand_sub(stream_raw_scores, stream_raw_mi_col))
                     stream_raw_exp = pl.mul(stream_raw_exp, stream_raw_valid)
                     stream_raw_li_col = pl.row_sum(stream_raw_exp, stream_row_sum_tmp)
-                    stream_raw_exp_bf16 = pl.cast(
-                        stream_raw_exp,
-                        target_type=pl.BF16,
-                        mode="rint",
-                    )
+                    stream_raw_exp_bf16 = pl.cast(stream_raw_exp, target_type=pl.BF16, mode="rint")
                     stream_raw_oi_left = pl.matmul(
-                        stream_raw_exp_bf16,
-                        stream_raw_kv[:, 0:ATTN_D_TILE],
-                        out_dtype=pl.FP32,
+                        stream_raw_exp_bf16, stream_raw_kv[:, 0:ATTN_D_TILE], out_dtype=pl.FP32,
                     )
                     stream_raw_oi_right = pl.matmul(
-                        stream_raw_exp_bf16,
-                        stream_raw_kv[:, ATTN_D_TILE : 2 * ATTN_D_TILE],
-                        out_dtype=pl.FP32,
+                        stream_raw_exp_bf16, stream_raw_kv[:, ATTN_D_TILE : 2 * ATTN_D_TILE], out_dtype=pl.FP32,
                     )
                     pl.store(stream_raw_mi_col, [stream_state_row, 0], stream_state_m)
                     pl.store(stream_raw_li_col, [stream_state_row, 0], stream_state_l)
@@ -413,27 +337,16 @@ def sparse_attn_hca(
             for gather_page in pl.unroll(CMP_PAGES_PER_WORK):
                 gather_page_col = gather_first_col + gather_page
                 gather_dst = gather_dst0 + gather_page * BLOCK_SIZE
-                cmp_work_kv[
-                    gather_dst : gather_dst + BLOCK_SIZE,
-                    0:HEAD_DIM,
-                ] = pl.full(
-                    [BLOCK_SIZE, HEAD_DIM],
-                    dtype=pl.BF16,
-                    value=0.0,
-                )
+                gather_zero_rows = pl.full([BLOCK_SIZE, HEAD_DIM], dtype=pl.BF16, value=0.0)
+                cmp_work_kv[gather_dst : gather_dst + BLOCK_SIZE, 0:HEAD_DIM] = gather_zero_rows
                 if gather_page_col < cmp_table_blocks:
                     gather_page_i32 = pl.read(cmp_block_table, [gather_request, gather_page_col])
                     if gather_page_i32 >= 0:
                         if gather_page_i32 < cmp_block_num:
                             gather_page_id = pl.cast(gather_page_i32, pl.INDEX)
                             gather_src = gather_page_id * BLOCK_SIZE
-                            cmp_work_kv[
-                                gather_dst : gather_dst + BLOCK_SIZE,
-                                0:HEAD_DIM,
-                            ] = cmp_kv_flat[
-                                gather_src : gather_src + BLOCK_SIZE,
-                                0:HEAD_DIM,
-                            ]
+                            gather_page_rows = cmp_kv_flat[gather_src : gather_src + BLOCK_SIZE, 0:HEAD_DIM]
+                            cmp_work_kv[gather_dst : gather_dst + BLOCK_SIZE, 0:HEAD_DIM] = gather_page_rows
 
         with pl.spmd(cmp_qk_block_count, name_hint="hca_cmp_qk_pv", deps=[cmp_gather_tid]) as cmp_qk_tid:
             qk_item = pl.tile.get_block_idx()
@@ -460,21 +373,14 @@ def sparse_attn_hca(
                 if qk_first_page_i32 < cmp_block_num:
                     qk_work_src = (qk_request * cmp_work_count + qk_work) * ATTN_K_TILE
                     qk_kv = pl.load(
-                        cmp_work_kv,
-                        [qk_work_src, 0],
-                        [ATTN_K_TILE, HEAD_DIM],
-                        target_memory=pl.MemorySpace.Mat,
+                        cmp_work_kv, [qk_work_src, 0], [ATTN_K_TILE, HEAD_DIM], target_memory=pl.MemorySpace.Mat,
                     )
                     qk_kv_t = pl.tile.transpose_view(qk_kv)
                     qk_row_max_tmp = pl.create_tile(
-                        [QK_M_TILE, ATTN_K_TILE],
-                        dtype=pl.FP32,
-                        target_memory=pl.MemorySpace.Vec,
+                        [QK_M_TILE, ATTN_K_TILE], dtype=pl.FP32, target_memory=pl.MemorySpace.Vec,
                     )
                     qk_row_sum_tmp = pl.create_tile(
-                        [QK_M_TILE, ATTN_K_TILE],
-                        dtype=pl.FP32,
-                        target_memory=pl.MemorySpace.Vec,
+                        [QK_M_TILE, ATTN_K_TILE], dtype=pl.FP32, target_memory=pl.MemorySpace.Vec,
                     )
                     for qk_dt in pl.range(CMP_T_TILE):
                         qk_t = qk_t0 + qk_dt
@@ -488,10 +394,7 @@ def sparse_attn_hca(
                                     qk_kv_len = pl.cast(qk_kv_len_i32, pl.INDEX)
                                     qk_position_rows = (qk_position + 1) // COMPRESS_RATIO
                                     qk_kv_rows = qk_kv_len // COMPRESS_RATIO
-                                    qk_rows = pl.min(
-                                        HCA_MAX_COMPRESSED_ROWS,
-                                        pl.min(qk_position_rows, qk_kv_rows),
-                                    )
+                                    qk_rows = pl.min(HCA_MAX_COMPRESSED_ROWS, pl.min(qk_position_rows, qk_kv_rows))
 
                         if qk_work_row < qk_rows:
                             qk_token_base = qk_t * (H // H_TILE) * cmp_work_count * H_TILE
@@ -500,10 +403,7 @@ def sparse_attn_hca(
                                 qk_h0 = qk_hb * QK_M_TILE
                                 qk_head_row = qk_t * H + qk_h0
                                 qk_q = pl.load(
-                                    q_flat,
-                                    [qk_head_row, 0],
-                                    [QK_M_TILE, HEAD_DIM],
-                                    target_memory=pl.MemorySpace.Mat,
+                                    q_flat, [qk_head_row, 0], [QK_M_TILE, HEAD_DIM], target_memory=pl.MemorySpace.Mat,
                                 )
                                 qk_scores = pl.matmul(qk_q, qk_kv_t, out_dtype=pl.FP32)
                                 qk_scores = pl.mul(qk_scores, SOFTMAX_SCALE)
@@ -517,11 +417,8 @@ def sparse_attn_hca(
                                 qk_oi_right = pl.matmul(qk_exp_bf16, qk_kv[:, ATTN_D_TILE:HEAD_DIM], out_dtype=pl.FP32)
                                 qk_oi = pl.concat(qk_oi_left, qk_oi_right)
                                 qk_h_idx0 = qk_hb * (QK_M_TILE // H_TILE)
-                                qk_row0 = (
-                                    qk_token_base
-                                    + qk_h_idx0 * cmp_work_count * H_TILE
-                                    + qk_work * H_TILE
-                                )
+                                qk_tile_base = qk_h_idx0 * cmp_work_count * H_TILE
+                                qk_row0 = qk_token_base + qk_tile_base + qk_work * H_TILE
                                 qk_row1 = qk_row0 + cmp_work_count * H_TILE
                                 pl.store(qk_mi[0:H_TILE, 0:1], [qk_row0, 0], cmp_partial_m)
                                 pl.store(qk_li[0:H_TILE, 0:1], [qk_row0, 0], cmp_partial_l)
@@ -533,17 +430,10 @@ def sparse_attn_hca(
         cmp_branch_tids[0] = cmp_qk_tid
 
     return (
-        stream_state_m,
-        stream_state_l,
-        stream_heads,
-        cmp_partial_m,
-        cmp_partial_l,
-        cmp_partial_o,
-        rope_cos_il,
-        rope_sin_signed,
-        raw_branch_tids[0],
-        cmp_branch_tids[0],
-        rope_cs_tids[0],
+        stream_state_m, stream_state_l, stream_heads,
+        cmp_partial_m, cmp_partial_l, cmp_partial_o,
+        rope_cos_il, rope_sin_signed,
+        raw_branch_tids[0], cmp_branch_tids[0], rope_cs_tids[0],
     )
 
 
@@ -565,30 +455,13 @@ def sparse_attn_hca_tp1(
 ) -> tuple[pl.Tensor, pl.Scalar[pl.TASK_ID]]:
     """Write HCA heads as grouped ``[T_PAD, O_GROUP_IN]`` slabs."""
     (
-        stream_state_m,
-        stream_state_l,
-        stream_heads,
-        cmp_partial_m,
-        cmp_partial_l,
-        cmp_partial_o,
-        rope_cos_il,
-        rope_sin_signed,
-        raw_tid,
-        cmp_tid,
-        rope_tid,
+        stream_state_m, stream_state_l, stream_heads,
+        cmp_partial_m, cmp_partial_l, cmp_partial_o,
+        rope_cos_il, rope_sin_signed,
+        raw_tid, cmp_tid, rope_tid,
     ) = sparse_attn_hca(
-        q,
-        ori_kv,
-        window_swa_indices,
-        window_swa_lens,
-        cmp_kv,
-        cmp_block_table,
-        position_ids,
-        kv_seq_lens,
-        freqs_cos,
-        freqs_sin,
-        cache_ready_dep,
-        cache_ready_dep,
+        q, ori_kv, window_swa_indices, window_swa_lens, cmp_kv, cmp_block_table, position_ids, kv_seq_lens, freqs_cos,
+        freqs_sin, cache_ready_dep, cache_ready_dep,
     )
     t_dim = pl.tensor.dim(stream_state_m, 0) // H
     cmp_table_blocks = pl.tensor.dim(cmp_block_table, 1)
@@ -597,9 +470,7 @@ def sparse_attn_hca_tp1(
     attn_sink_col = pl.reshape(attn_sink, [H, 1])
 
     with pl.spmd(
-        MERGE_WORKERS,
-        name_hint="hca_stream_merge_pack",
-        deps=[raw_tid, cmp_tid, rope_tid],
+        MERGE_WORKERS, name_hint="hca_stream_merge_pack", deps=[raw_tid, cmp_tid, rope_tid],
     ) as heads_tid:
         worker = pl.tile.get_block_idx()
         for stream_idx in pl.range(worker, stream_block_count, MERGE_WORKERS):
@@ -612,49 +483,28 @@ def sparse_attn_hca_tp1(
             stream_o = pl.load(stream_heads, [merge_state_row, 0], [H_TILE, HEAD_DIM], target_memory=pl.MemorySpace.Vec)
             stream_token_base = merge_t * (H // H_TILE) * cmp_work_count * H_TILE
             for stream_work in pl.range(cmp_work_count):
-                stream_partial_row = (
-                    stream_token_base
-                    + merge_h_tile * cmp_work_count * H_TILE
-                    + stream_work * H_TILE
-                )
+                stream_tile_base = merge_h_tile * cmp_work_count * H_TILE
+                stream_partial_row = stream_token_base + stream_tile_base + stream_work * H_TILE
                 stream_cmp_m_aligned = pl.load(
-                    cmp_partial_m,
-                    [stream_partial_row, 0],
-                    [H_TILE, 8],
-                    target_memory=pl.MemorySpace.Vec,
+                    cmp_partial_m, [stream_partial_row, 0], [H_TILE, 8], target_memory=pl.MemorySpace.Vec,
                 )
                 stream_cmp_l_aligned = pl.load(
-                    cmp_partial_l,
-                    [stream_partial_row, 0],
-                    [H_TILE, 8],
-                    target_memory=pl.MemorySpace.Vec,
+                    cmp_partial_l, [stream_partial_row, 0], [H_TILE, 8], target_memory=pl.MemorySpace.Vec,
                 )
                 stream_cmp_m = stream_cmp_m_aligned[0:H_TILE, 0:1]
                 stream_cmp_l = stream_cmp_l_aligned[0:H_TILE, 0:1]
                 stream_cmp_o = pl.load(
-                    cmp_partial_o,
-                    [stream_partial_row, 0],
-                    [H_TILE, HEAD_DIM],
-                    target_memory=pl.MemorySpace.Vec,
+                    cmp_partial_o, [stream_partial_row, 0], [H_TILE, HEAD_DIM], target_memory=pl.MemorySpace.Vec,
                 )
                 stream_m_new = pl.maximum(stream_m, stream_cmp_m)
                 stream_alpha = pl.exp(pl.sub(stream_m, stream_m_new))
                 stream_beta = pl.exp(pl.sub(stream_cmp_m, stream_m_new))
-                stream_l = pl.add(
-                    pl.mul(stream_alpha, stream_l),
-                    pl.mul(stream_beta, stream_cmp_l),
-                )
-                stream_o = pl.add(
-                    pl.row_expand_mul(stream_o, stream_alpha),
-                    pl.row_expand_mul(stream_cmp_o, stream_beta),
-                )
+                stream_l = pl.add(pl.mul(stream_alpha, stream_l), pl.mul(stream_beta, stream_cmp_l))
+                stream_o_scaled = pl.row_expand_mul(stream_o, stream_alpha)
+                stream_cmp_o_scaled = pl.row_expand_mul(stream_cmp_o, stream_beta)
+                stream_o = pl.add(stream_o_scaled, stream_cmp_o_scaled)
                 stream_m = stream_m_new
-            stream_sink = pl.load(
-                attn_sink_col,
-                [merge_h0, 0],
-                [H_TILE, 1],
-                target_memory=pl.MemorySpace.Vec,
-            )
+            stream_sink = pl.load(attn_sink_col, [merge_h0, 0], [H_TILE, 1], target_memory=pl.MemorySpace.Vec)
             stream_sink_tile = pl.add(pl.sub(stream_m, stream_m), stream_sink)
             stream_denom = pl.add(stream_l, pl.exp(pl.sub(stream_sink_tile, stream_m)))
             stream_output = pl.row_expand_div(stream_o, stream_denom)
@@ -667,38 +517,27 @@ def sparse_attn_hca_tp1(
             stream_swap_one = pl.full([1, ROPE_DIM], dtype=pl.FP32, value=1.0)
             stream_swap_index = pl.cast(pl.arange(0, [1, ROPE_DIM], dtype=pl.INT32), target_type=pl.FP32)
             stream_swap_col = pl.col_expand_mul(stream_swap_one, stream_swap_index)
-            stream_swap_dup = pl.cast(
-                pl.mul(stream_swap_col, 0.5),
-                target_type=pl.INT32,
-                mode="trunc",
-            )
+            stream_swap_dup = pl.cast(pl.mul(stream_swap_col, 0.5), target_type=pl.INT32, mode="trunc")
             stream_swap_dup_f = pl.cast(stream_swap_dup, target_type=pl.FP32)
             stream_swap_lane = pl.sub(stream_swap_col, pl.mul(stream_swap_dup_f, 2.0))
-            stream_swap = pl.sub(
-                pl.add(stream_swap_col, 1.0),
-                pl.mul(stream_swap_lane, 2.0),
-            )
+            stream_swap = pl.sub(pl.add(stream_swap_col, 1.0), pl.mul(stream_swap_lane, 2.0))
             stream_swap_row = pl.cast(stream_swap, target_type=pl.INT32)
             stream_swap_zero = pl.full([H_TILE, ROPE_DIM], dtype=pl.INT32, value=0)
             stream_swap_idx = pl.col_expand_add(stream_swap_zero, stream_swap_row)
             stream_swapped = pl.gather(stream_rope, dim=-1, index=stream_swap_idx)
-            stream_rot = pl.add(
-                pl.col_expand_mul(stream_rope, stream_cos_il),
-                pl.col_expand_mul(stream_swapped, stream_sin_signed),
-            )
+            stream_rope_cos = pl.col_expand_mul(stream_rope, stream_cos_il)
+            stream_swap_sin = pl.col_expand_mul(stream_swapped, stream_sin_signed)
+            stream_rot = pl.add(stream_rope_cos, stream_swap_sin)
             stream_rope_bf16 = pl.cast(stream_rot, target_type=pl.BF16, mode="rint")
-            stream_full_bf16 = pl.concat(
-                stream_bf16[0:H_TILE, 0:NOPE_DIM],
-                stream_rope_bf16,
-            )
+            stream_full_bf16 = pl.concat(stream_bf16[0:H_TILE, 0:NOPE_DIM], stream_rope_bf16)
             for stream_hi in pl.unroll(H_TILE):
                 stream_head = merge_h0 + stream_hi
                 stream_pack_row = (stream_head // HEADS_PER_GROUP) * T_PAD + merge_t
                 stream_pack_col = (stream_head % HEADS_PER_GROUP) * HEAD_DIM
+                stream_head_row = stream_full_bf16[stream_hi : stream_hi + 1, 0:HEAD_DIM]
                 o_packed_heads[
-                    stream_pack_row : stream_pack_row + 1,
-                    stream_pack_col : stream_pack_col + HEAD_DIM,
-                ] = stream_full_bf16[stream_hi : stream_hi + 1, 0:HEAD_DIM]
+                    stream_pack_row : stream_pack_row + 1, stream_pack_col : stream_pack_col + HEAD_DIM,
+                ] = stream_head_row
 
     return o_packed_heads, heads_tid
 
@@ -731,11 +570,8 @@ def sparse_attn_hca_test(
     cache_ready_dep = pl.system.task_dummy(deps=[])
     o_packed_flat = pl.reshape(o_packed_heads, [O_GROUPS * T_PAD, O_GROUP_IN])
     o_packed_flat, _heads_tid = sparse_attn_hca_tp1(
-        q, ori_kv, window_swa_indices, window_swa_lens,
-        cmp_kv, cmp_block_table,
-        position_ids, kv_seq_lens,
-        attn_sink, freqs_cos, freqs_sin,
-        o_packed_flat, cache_ready_dep,
+        q, ori_kv, window_swa_indices, window_swa_lens, cmp_kv, cmp_block_table, position_ids, kv_seq_lens,
+        attn_sink, freqs_cos, freqs_sin, o_packed_flat, cache_ready_dep,
     )
     return o_packed_heads
 
@@ -782,11 +618,9 @@ def golden_sparse_attn(tensors):
             item_rows.append(raw_rows[row_begin : row_begin + ATTN_K_TILE])
             item_valid.append(raw_valid[row_begin : row_begin + ATTN_K_TILE])
 
-        compressed_rows = min(
-            (int(position_ids[t].item()) + 1) // COMPRESS_RATIO,
-            int(kv_seq_lens[b].item()) // COMPRESS_RATIO,
-            HCA_MAX_COMPRESSED_ROWS,
-        )
+        position_rows = (int(position_ids[t].item()) + 1) // COMPRESS_RATIO
+        cache_rows = int(kv_seq_lens[b].item()) // COMPRESS_RATIO
+        compressed_rows = min(position_rows, cache_rows, HCA_MAX_COMPRESSED_ROWS)
         for row_begin in range(0, max(compressed_rows, 0), ATTN_K_TILE):
             valid_rows = min(ATTN_K_TILE, compressed_rows - row_begin)
             rows = []
@@ -880,13 +714,11 @@ def build_tensor_specs(
             raise ValueError("mixed HCA length fixture requires batch=4")
         compressed_rows_by_request = torch.tensor([128, 128, 1024, 4096], dtype=torch.int32)
     else:
-        compressed_rows_by_request = torch.full(
-            (batch,), compressed_rows, dtype=torch.int32,
-        )
+        compressed_rows_by_request = torch.full((batch,), compressed_rows, dtype=torch.int32)
 
-    if bool((compressed_rows_by_request < 0).any()) or bool(
-        (compressed_rows_by_request > HCA_MAX_COMPRESSED_ROWS).any(),
-    ):
+    rows_below = bool((compressed_rows_by_request < 0).any())
+    rows_above = bool((compressed_rows_by_request > HCA_MAX_COMPRESSED_ROWS).any())
+    if rows_below or rows_above:
         raise ValueError(
             f"compressed_rows must be in [0, {HCA_MAX_COMPRESSED_ROWS}], "
             f"got {compressed_rows_by_request.tolist()}",
@@ -1017,25 +849,38 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("-p", "--platform", type=str, default="a2a3", choices=["a2a3", "a2a3sim", "a5", "a5sim"])
     parser.add_argument("-d", "--device", type=int, default=0)
-    parser.add_argument("-b", "--batch", type=int, default=B,
-                        help=f"runtime request count in [1, {B}] (the compile-time "
-                             "upper bound). The token axis is pl.dynamic, so one compiled program "
-                             "serves every value.")
-    parser.add_argument("--compressed-rows", type=int, default=128,
-                        help="visible ratio-128 rows per query; use 8192 for the 1M ceiling")
-    parser.add_argument("--causal-regression-fixture", action="store_true", default=False,
-                        help="Amplify the S=2 future-window-slot regression.")
-    parser.add_argument("--short-window-fixture", action="store_true", default=False,
-                        help="Use a short-window topk row with valid prefix + -1 padding.")
-    parser.add_argument("--mixed-topk-fixture", action="store_true", default=False,
-                        help="Use B=4 compressed histories for 16K, 16K, 128K, and 512K.")
-    parser.add_argument("--cache-window-replacement-fixture", action="store_true", default=False,
-                        help="Place a sentinel row inside the cache window prefix.")
+    parser.add_argument(
+        "-b", "--batch", type=int, default=B,
+        help=f"runtime request count in [1, {B}] (the compile-time upper bound). The token axis "
+             "is pl.dynamic, so one compiled program serves every value.",
+    )
+    parser.add_argument(
+        "--compressed-rows", type=int, default=128,
+        help="visible ratio-128 rows per query; use 8192 for the 1M ceiling",
+    )
+    parser.add_argument(
+        "--causal-regression-fixture", action="store_true", default=False,
+        help="Amplify the S=2 future-window-slot regression.",
+    )
+    parser.add_argument(
+        "--short-window-fixture", action="store_true", default=False,
+        help="Use a short-window topk row with valid prefix + -1 padding.",
+    )
+    parser.add_argument(
+        "--mixed-topk-fixture", action="store_true", default=False,
+        help="Use B=4 compressed histories for 16K, 16K, 128K, and 512K.",
+    )
+    parser.add_argument(
+        "--cache-window-replacement-fixture", action="store_true", default=False,
+        help="Place a sentinel row inside the cache window prefix.",
+    )
     parser.add_argument("--golden-data", type=str, default=None)
     parser.add_argument("--enable-chip-swimlane", action="store_true", default=False)
-    parser.add_argument("--enable-dep-gen", action="store_true", default=False,
-                        help="Capture PTO2 dependency edges (deps.json); the swimlane "
-                             "converter draws fanout/fanin arrows from the sibling file.")
+    parser.add_argument(
+        "--enable-dep-gen", action="store_true", default=False,
+        help="Capture PTO2 dependency edges (deps.json); the swimlane converter draws "
+             "fanout/fanin arrows from the sibling file.",
+    )
     parser.add_argument("--enable-pmu", nargs="?", const=2, default=0, type=int, choices=[0, 1, 2, 4])
     parser.add_argument("--dump-passes", action="store_true", default=False)
     args = parser.parse_args()
@@ -1045,39 +890,27 @@ if __name__ == "__main__":
     if args.mixed_topk_fixture:
         workload = "compressed_rows/request=[128,128,1024,4096]"
     else:
-        workload = (
-            f"compressed_rows={args.compressed_rows} "
-            f"work/query={(args.compressed_rows + ATTN_K_TILE - 1) // ATTN_K_TILE}"
-        )
+        work_per_query = (args.compressed_rows + ATTN_K_TILE - 1) // ATTN_K_TILE
+        workload = f"compressed_rows={args.compressed_rows} work/query={work_per_query}"
     print(f"compress_ratio={COMPRESS_RATIO} {workload}", flush=True)
 
     result = run(
         fn=sparse_attn_hca_test,
         specs=build_tensor_specs(
-            args.causal_regression_fixture,
-            args.short_window_fixture,
-            args.mixed_topk_fixture,
-            args.cache_window_replacement_fixture,
-            batch=args.batch,
-            compressed_rows=args.compressed_rows,
+            args.causal_regression_fixture, args.short_window_fixture, args.mixed_topk_fixture,
+            args.cache_window_replacement_fixture, batch=args.batch, compressed_rows=args.compressed_rows,
         ),
         golden_fn=golden_sparse_attn,
         golden_data=args.golden_data,
         config=dict(
-            dump_passes=args.dump_passes,
-            platform=args.platform,
-            device_id=args.device,
-            enable_chip_swimlane=args.enable_chip_swimlane,
-            enable_dep_gen=args.enable_dep_gen,
+            dump_passes=args.dump_passes, platform=args.platform, device_id=args.device,
+            enable_chip_swimlane=args.enable_chip_swimlane, enable_dep_gen=args.enable_dep_gen,
             enable_pmu=args.enable_pmu,
         ),
         rtol=1e-3,
         atol=1e-3,
         compare_fn={
-            "o_packed_heads": ratio_allclose(
-                atol=1e-4, rtol=1.0 / 128,
-                valid_rows=args.batch * S, valid_axis=1,
-            ),
+            "o_packed_heads": ratio_allclose(atol=1e-4, rtol=1.0 / 128, valid_rows=args.batch * S, valid_axis=1),
         },
     )
     if not result.passed:
