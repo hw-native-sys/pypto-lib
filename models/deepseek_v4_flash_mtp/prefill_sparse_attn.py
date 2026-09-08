@@ -336,7 +336,7 @@ def sparse_attn_math(
     proj_b_tids = pl.array.create(PB_DSLABS * O_GROUPS, pl.TASK_ID)
 
     with pl.manual_scope():
-        # proj_a[g, nf]: BF16 grouped GEMM -> o_r[:, group g], peel-first-iter form.
+        # proj_a[g, nf]: BF16 grouped GEMM -> o_r[:, group g], init_cond K loop.
         for g in pl.parallel(O_GROUPS):
             row_base_o = g * T
             out_col_g = g * O_LORA
@@ -382,8 +382,8 @@ def sparse_attn_math(
                 quant_tids[g * QUANT_CHUNKS + tc] = q_tid
 
         # proj_b_mm[dc, g]: INT8 GEMM of group g's contribution to a PROJ_B_D_TILE-wide slab
-        # of D, written as INT32 partials[:, g*D+n]. Peel-first matmul: matmul_acc from a zero
-        # carry trips TLOAD DN->NZ (pypto#1540).
+        # of D, written as INT32 partials[:, g*D+n]. init_cond overwrites the accumulator on
+        # the first K step; accumulating from a zero carry trips TLOAD DN->NZ (pypto#1540).
         for dc in pl.parallel(PB_DSLABS):
             d0 = dc * PROJ_B_D_TILE
             for g in pl.range(O_GROUPS):

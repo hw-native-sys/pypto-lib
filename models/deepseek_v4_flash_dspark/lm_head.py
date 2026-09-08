@@ -207,14 +207,12 @@ def lm_head(
             mm_o0 = mm_ob * FUSED_VOCAB_TILE
             for mm_rb in pl.range(GROUP_LOGIT_ROWS // MM_ROW_TILE):
                 mm_r0 = mm_rb * MM_ROW_TILE
-                mm_hidden0 = owner_hiddens[mm_r0 : mm_r0 + MM_ROW_TILE, 0:FUSED_K_TILE]
-                mm_weight0 = lm_head_weight[mm_o0 : mm_o0 + FUSED_VOCAB_TILE, 0:FUSED_K_TILE]
-                mm_acc = pl.matmul(mm_hidden0, mm_weight0, b_trans=True, out_dtype=pl.FP32)
-                for mm_kb in pl.pipeline(1, D // FUSED_K_TILE, stage=2):
+                mm_acc = pl.create_tensor([MM_ROW_TILE, FUSED_VOCAB_TILE], dtype=pl.FP32)
+                for mm_kb in pl.pipeline(0, D // FUSED_K_TILE, stage=2):
                     mm_k0 = mm_kb * FUSED_K_TILE
                     mm_hidden_tile = owner_hiddens[mm_r0 : mm_r0 + MM_ROW_TILE, mm_k0 : mm_k0 + FUSED_K_TILE]
                     mm_weight_tile = lm_head_weight[mm_o0 : mm_o0 + FUSED_VOCAB_TILE, mm_k0 : mm_k0 + FUSED_K_TILE]
-                    mm_acc = pl.matmul_acc(mm_acc, mm_hidden_tile, mm_weight_tile, b_trans=True)
+                    mm_acc = pl.matmul_acc(mm_acc, mm_hidden_tile, mm_weight_tile, b_trans=True, init_cond=(mm_kb == 0))
                 logits_shards[
                     mm_r0 : mm_r0 + MM_ROW_TILE,
                     mm_o0 : mm_o0 + FUSED_VOCAB_TILE,
@@ -225,10 +223,8 @@ def lm_head(
                 mm_tail_o0 = VOCAB_FULL_TILES * FUSED_VOCAB_TILE
                 for tail_rb in pl.range(GROUP_LOGIT_ROWS // MM_ROW_TILE):
                     tail_r0 = tail_rb * MM_ROW_TILE
-                    tail_hidden0 = owner_hiddens[tail_r0 : tail_r0 + MM_ROW_TILE, 0:FUSED_K_TILE]
-                    tail_weight0 = lm_head_weight[mm_tail_o0 : mm_tail_o0 + VOCAB_TAIL, 0:FUSED_K_TILE]
-                    tail_acc = pl.matmul(tail_hidden0, tail_weight0, b_trans=True, out_dtype=pl.FP32)
-                    for tail_kb in pl.pipeline(1, D // FUSED_K_TILE, stage=2):
+                    tail_acc = pl.create_tensor([MM_ROW_TILE, VOCAB_TAIL], dtype=pl.FP32)
+                    for tail_kb in pl.pipeline(0, D // FUSED_K_TILE, stage=2):
                         tail_k0 = tail_kb * FUSED_K_TILE
                         tail_hidden_tile = owner_hiddens[
                             tail_r0 : tail_r0 + MM_ROW_TILE, tail_k0 : tail_k0 + FUSED_K_TILE
@@ -237,7 +233,7 @@ def lm_head(
                             mm_tail_o0 : mm_tail_o0 + VOCAB_TAIL,
                             tail_k0 : tail_k0 + FUSED_K_TILE,
                         ]
-                        tail_acc = pl.matmul_acc(tail_acc, tail_hidden_tile, tail_weight_tile, b_trans=True)
+                        tail_acc = pl.matmul_acc(tail_acc, tail_hidden_tile, tail_weight_tile, b_trans=True, init_cond=(tail_kb == 0))
                     logits_shards[
                         tail_r0 : tail_r0 + MM_ROW_TILE,
                         mm_tail_o0 : mm_tail_o0 + VOCAB_TAIL,

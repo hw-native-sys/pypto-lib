@@ -33,10 +33,7 @@ def proj(
                 k0 = kb * K_TILE
                 tile_x = x[:, k0 : k0 + K_TILE]
                 tile_w = w[k0 : k0 + K_TILE, n0 : n0 + N_TILE]
-                if kb == 0:
-                    acc = pl.matmul(tile_x, tile_w, out_dtype=pl.FP32)
-                else:
-                    acc = pl.matmul_acc(acc, tile_x, tile_w)
+                acc = pl.matmul_acc(acc, tile_x, tile_w, init_cond=(kb == 0))
             y[:, n0 : n0 + N_TILE] = acc
     return y
 

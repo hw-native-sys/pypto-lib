@@ -951,7 +951,7 @@ def _sparse_attn_o_proj(
     proj_b_rows = o_compute_rows // PROJ_B_ROW_TILE
 
     with pl.manual_scope():
-        # proj_a[g, nf]: BF16 grouped GEMM -> o_r[:, group g], peel-first-iter form.
+        # proj_a[g, nf]: BF16 grouped GEMM -> o_r[:, group g], init_cond K loop.
         # Row-blocked over PROJ_A_ROW_TILE with a padded load, so the T_PAD-strided
         # o_packed slab never feeds uninitialized rows into the matmul.
         for g in pl.parallel(O_GROUPS):
@@ -963,20 +963,15 @@ def _sparse_attn_o_proj(
                     pa_rb = pl.tile.get_block_idx()
                     pa_r0 = pa_rb * PROJ_A_ROW_TILE
                     pa_src0 = row_base_o + pa_r0
-                    xa0_chunk = o_packed[
-                        pa_src0 : pa_src0 + PROJ_A_ROW_TILE,
-                        0:A_K_TILE,
-                    ]
-                    wa0_chunk = wo_a[g : g + 1, n0 : n0 + PROJ_A_MM_N_TILE, 0:A_K_TILE]
-                    acc_a = pl.matmul(xa0_chunk, wa0_chunk, b_trans=True, out_dtype=pl.FP32)
-                    for kb in pl.pipeline(1, O_GROUP_IN // A_K_TILE, stage=2):
+                    acc_a = pl.create_tensor([1, PROJ_A_ROW_TILE, PROJ_A_MM_N_TILE], dtype=pl.FP32)
+                    for kb in pl.pipeline(0, O_GROUP_IN // A_K_TILE, stage=2):
                         k0 = kb * A_K_TILE
                         xa_k_chunk = o_packed[
                             pa_src0 : pa_src0 + PROJ_A_ROW_TILE,
                             k0 : k0 + A_K_TILE,
                         ]
                         wa_k_chunk = wo_a[g : g + 1, n0 : n0 + PROJ_A_MM_N_TILE, k0 : k0 + A_K_TILE]
-                        acc_a = pl.matmul_acc(acc_a, xa_k_chunk, wa_k_chunk, b_trans=True)
+                        acc_a = pl.matmul_acc(acc_a, xa_k_chunk, wa_k_chunk, b_trans=True, init_cond=(kb == 0))
                     # acc_a is 3D (wo_a keeps its group axis), which subscript-write cannot express.
                     o_r = pl.assemble(o_r, acc_a, [pa_r0, out_col_g + n0])
                 proj_a_tids[g * PA_NFRAGS + nf] = pa_tid
@@ -1019,8 +1014,8 @@ def _sparse_attn_o_proj(
             quant_tids[g] = q_tid
 
         # proj_b_mm[dc, g]: INT8 GEMM of group g's contribution to a PROJ_B_D_TILE-wide slab
-        # of D, written as INT32 partials[:, g*D+n]. Peel the first matmul: matmul_acc from a
-        # zero carry trips TLOAD DN->NZ (pypto#1540).
+        # of D, written as INT32 partials[:, g*D+n]. init_cond overwrites the accumulator on
+        # the first K step; accumulating from a zero carry trips TLOAD DN->NZ (pypto#1540).
         for dc in pl.parallel(PB_DSLABS):
             d0 = dc * PROJ_B_D_TILE
             for g in pl.range(O_GROUPS):
@@ -1030,20 +1025,15 @@ def _sparse_attn_o_proj(
                         n0 = d0 + nf * PROJ_B_MM_N_TILE
                         for pb_rb in pl.range(proj_b_rows):
                             pb_r0 = pb_rb * PROJ_B_ROW_TILE
-                            b_act0 = o_r_i8[
-                                pb_r0 : pb_r0 + PROJ_B_ROW_TILE,
-                                col_g : col_g + B_K_TILE,
-                            ]
-                            b_weight0 = wo_b[n0 : n0 + PROJ_B_MM_N_TILE, col_g : col_g + B_K_TILE]
-                            acc_b = pl.matmul(b_act0, b_weight0, b_trans=True, out_dtype=pl.INT32)
-                            for kb in pl.pipeline(1, O_LORA // B_K_TILE, stage=2):
+                            acc_b = pl.create_tensor([PROJ_B_ROW_TILE, PROJ_B_MM_N_TILE], dtype=pl.INT32)
+                            for kb in pl.pipeline(0, O_LORA // B_K_TILE, stage=2):
                                 k0 = col_g + kb * B_K_TILE
                                 b_act = o_r_i8[
                                     pb_r0 : pb_r0 + PROJ_B_ROW_TILE,
                                     k0 : k0 + B_K_TILE,
                                 ]
                                 b_weight = wo_b[n0 : n0 + PROJ_B_MM_N_TILE, k0 : k0 + B_K_TILE]
-                                acc_b = pl.matmul_acc(acc_b, b_act, b_weight, b_trans=True)
+                                acc_b = pl.matmul_acc(acc_b, b_act, b_weight, b_trans=True, init_cond=(kb == 0))
                             partials[
                                 pb_r0 : pb_r0 + PROJ_B_ROW_TILE, g * D + n0 : g * D + n0 + PROJ_B_MM_N_TILE
                             ] = acc_b

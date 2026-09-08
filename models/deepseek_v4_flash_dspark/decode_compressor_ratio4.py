@@ -107,6 +107,11 @@ def compressor_ratio4_project(
                 # Transposed [OUT_DIM, D] projection weights.
                 wkv_tile = wkv[o0 : o0 + OUT_TILE, k0 : k0 + K_TILE]
                 wgate_tile = wgate[o0 : o0 + OUT_TILE, k0 : k0 + K_TILE]
+                # This peel is NOT foldable into init_cond: x_tile narrows to a
+                # runtime row count and MM_B_TILE spans four 16-row fractals, so
+                # mad writes at pitch ceil(validRow/16)*16 while a create_tensor
+                # accumulator is read back at 64. Only pl.matmul stamps the
+                # accumulator compact, so dropping it fails AccCompactValid.
                 if k0 == 0:
                     kv_acc = pl.matmul(x_tile, wkv_tile, out_dtype=pl.FP32, b_trans=True)
                     score_acc = pl.matmul(x_tile, wgate_tile, out_dtype=pl.FP32, b_trans=True)

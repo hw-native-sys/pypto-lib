@@ -36,10 +36,7 @@ def gemm_eltwise(
                 k0 = kb * K_TILE
                 tile_a = attn_out[:, k0 : k0 + K_TILE]
                 tile_w = wo[k0 : k0 + K_TILE, n0 : n0 + N_TILE]
-                if kb == 0:
-                    acc = pl.matmul(tile_a, tile_w, out_dtype=pl.FP32)
-                else:
-                    acc = pl.matmul_acc(acc, tile_a, tile_w)
+                acc = pl.matmul_acc(acc, tile_a, tile_w, init_cond=(kb == 0))
 
             # fuse the residual add while the matmul output is still on chip
             hidden_tile = pl.cast(hidden_states[:, n0 : n0 + N_TILE], target_type=pl.FP32)

@@ -138,12 +138,8 @@ def _prefill_indexer_compressor_tile(
                     # Weights are [OUT_DIM, D] and use the K-contiguous DN2ZN path.
                     wkv_tile = wkv[o0 : o0 + OUT_TILE, k0 : k0 + K_TILE]
                     wgate_tile = wgate[o0 : o0 + OUT_TILE, k0 : k0 + K_TILE]
-                    if k0 == 0:
-                        kv_acc = pl.matmul(x_tile, wkv_tile, out_dtype=pl.FP32, b_trans=True)
-                        score_acc = pl.matmul(x_tile, wgate_tile, out_dtype=pl.FP32, b_trans=True)
-                    else:
-                        kv_acc = pl.matmul_acc(kv_acc, x_tile, wkv_tile, b_trans=True)
-                        score_acc = pl.matmul_acc(score_acc, x_tile, wgate_tile, b_trans=True)
+                    kv_acc = pl.matmul_acc(kv_acc, x_tile, wkv_tile, b_trans=True, init_cond=(k0 == 0))
+                    score_acc = pl.matmul_acc(score_acc, x_tile, wgate_tile, b_trans=True, init_cond=(k0 == 0))
                 kv_proj_scratch[
                     local_t0 : local_t0 + PROJ_ROW_TILE,
                     o0 : o0 + OUT_TILE,
@@ -184,32 +180,8 @@ def _prefill_indexer_compressor_tile(
                         tail_o0 : tail_o0 + OUT_TILE,
                         tail_k0 : tail_k0 + K_TILE,
                     ]
-                    if tail_k0 == 0:
-                        kv_tail_acc = pl.matmul(
-                            x_tail,
-                            wkv_tail,
-                            out_dtype=pl.FP32,
-                            b_trans=True,
-                        )
-                        score_tail_acc = pl.matmul(
-                            x_tail,
-                            wgate_tail,
-                            out_dtype=pl.FP32,
-                            b_trans=True,
-                        )
-                    else:
-                        kv_tail_acc = pl.matmul_acc(
-                            kv_tail_acc,
-                            x_tail,
-                            wkv_tail,
-                            b_trans=True,
-                        )
-                        score_tail_acc = pl.matmul_acc(
-                            score_tail_acc,
-                            x_tail,
-                            wgate_tail,
-                            b_trans=True,
-                        )
+                    kv_tail_acc = pl.matmul_acc(kv_tail_acc, x_tail, wkv_tail, b_trans=True, init_cond=(tail_k0 == 0))
+                    score_tail_acc = pl.matmul_acc(score_tail_acc, x_tail, wgate_tail, b_trans=True, init_cond=(tail_k0 == 0))
                 kv_proj_scratch[
                     tail_t0 : tail_t0 + PROJ_TAIL_ROW_TILE,
                     tail_o0 : tail_o0 + OUT_TILE,

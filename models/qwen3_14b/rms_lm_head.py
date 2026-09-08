@@ -113,14 +113,11 @@ def rms_lm_head(
                 # via set_validshape and store straight to `out` (no GM scratch + separate
                 # vector store). The valid-row trim bounds the write into the
                 # dynamic-shaped `out` [BATCH_DYN, VOCAB].
-                lm_hidden_chunk = pl.slice(final_normed, [BATCH_TILE, LM_HEAD_K_CHUNK], [b0, 0])
-                lm_weight_chunk = pl.slice(lm_head_weight, [VOCAB_CHUNK, LM_HEAD_K_CHUNK], [lm_o0, 0])
-                lm_acc = pl.matmul(lm_hidden_chunk, lm_weight_chunk, out_dtype=pl.FP32, b_trans=True)
+                lm_acc = pl.create_tensor([BATCH_TILE, VOCAB_CHUNK], dtype=pl.FP32)
                 # Pipeline the K-accumulation (stage=2) so the next K-tile load overlaps
                 # the current matmul_acc — same idiom as q_proj / out_proj / gate_proj.
-                # The leading matmul (kb=0) stays peeled: it initializes the L0C
-                # accumulator, so it can't sit inside the pipelined accumulate loop.
-                for kb in pl.pipeline(1, HIDDEN // LM_HEAD_K_CHUNK, stage=2):
+                # init_cond initializes the L0C accumulator on kb == 0.
+                for kb in pl.pipeline(0, HIDDEN // LM_HEAD_K_CHUNK, stage=2):
                     lm_k0 = kb * LM_HEAD_K_CHUNK
                     lm_hidden_chunk = pl.slice(final_normed, [BATCH_TILE, LM_HEAD_K_CHUNK], [b0, lm_k0])
                     lm_weight_chunk = pl.slice(
@@ -128,7 +125,7 @@ def rms_lm_head(
                         [VOCAB_CHUNK, LM_HEAD_K_CHUNK],
                         [lm_o0, lm_k0],
                     )
-                    lm_acc = pl.matmul_acc(lm_acc, lm_hidden_chunk, lm_weight_chunk, b_trans=True)
+                    lm_acc = pl.matmul_acc(lm_acc, lm_hidden_chunk, lm_weight_chunk, b_trans=True, init_cond=(kb == 0))
                 lm_acc_trimmed = pl.tensor.set_validshape(lm_acc, lm_valid_rows, VOCAB_CHUNK)
                 out = pl.assemble(out, lm_acc_trimmed, [b0, lm_o0])
 
@@ -191,10 +188,8 @@ def rms_lm_head_fp32(
             lm_valid_rows = pl.min(BATCH_TILE, valid_rows - b0)
             for ob in pl.range(lm_core, VOCAB // VOCAB_CHUNK, LM_HEAD_CORES):
                 lm_o0 = ob * VOCAB_CHUNK
-                lm_hidden_chunk = pl.slice(final_normed, [BATCH_TILE, LM_HEAD_K_CHUNK], [b0, 0])
-                lm_weight_chunk = pl.slice(lm_head_weight, [VOCAB_CHUNK, LM_HEAD_K_CHUNK], [lm_o0, 0])
-                lm_acc = pl.matmul(lm_hidden_chunk, lm_weight_chunk, out_dtype=pl.FP32, b_trans=True)
-                for kb in pl.pipeline(1, HIDDEN // LM_HEAD_K_CHUNK, stage=2):
+                lm_acc = pl.create_tensor([BATCH_TILE, VOCAB_CHUNK], dtype=pl.FP32)
+                for kb in pl.pipeline(0, HIDDEN // LM_HEAD_K_CHUNK, stage=2):
                     lm_k0 = kb * LM_HEAD_K_CHUNK
                     lm_hidden_chunk = pl.slice(final_normed, [BATCH_TILE, LM_HEAD_K_CHUNK], [b0, lm_k0])
                     lm_weight_chunk = pl.slice(
@@ -202,7 +197,7 @@ def rms_lm_head_fp32(
                         [VOCAB_CHUNK, LM_HEAD_K_CHUNK],
                         [lm_o0, lm_k0],
                     )
-                    lm_acc = pl.matmul_acc(lm_acc, lm_hidden_chunk, lm_weight_chunk, b_trans=True)
+                    lm_acc = pl.matmul_acc(lm_acc, lm_hidden_chunk, lm_weight_chunk, b_trans=True, init_cond=(kb == 0))
                 lm_acc_trimmed = pl.set_validshape(lm_acc, lm_valid_rows, VOCAB_CHUNK)
                 out = pl.assemble(out, lm_acc_trimmed, [row_offset + b0, lm_o0])
 
@@ -323,10 +318,8 @@ def rms_lm_head_single_chunk(
         lm_o0 = 0
         lm_acc_gm = pl.create_tensor([BATCH_TILE, VOCAB_CHUNK], dtype=pl.FP32)
         with pl.at(level=pl.Level.CORE_GROUP, name_hint="lm_head"):
-            lm_hidden_chunk = pl.slice(final_normed, [BATCH_TILE, LM_HEAD_K_CHUNK], [b0, 0])
-            lm_weight_chunk = pl.slice(lm_head_weight, [VOCAB_CHUNK, LM_HEAD_K_CHUNK], [lm_o0, 0])
-            lm_acc = pl.matmul(lm_hidden_chunk, lm_weight_chunk, out_dtype=pl.FP32, b_trans=True)
-            for kb in pl.range(1, HIDDEN // LM_HEAD_K_CHUNK):
+            lm_acc = pl.create_tensor([BATCH_TILE, VOCAB_CHUNK], dtype=pl.FP32)
+            for kb in pl.range(0, HIDDEN // LM_HEAD_K_CHUNK):
                 lm_k0 = kb * LM_HEAD_K_CHUNK
                 lm_hidden_chunk = pl.slice(final_normed, [BATCH_TILE, LM_HEAD_K_CHUNK], [b0, lm_k0])
                 lm_weight_chunk = pl.slice(
@@ -334,7 +327,7 @@ def rms_lm_head_single_chunk(
                     [VOCAB_CHUNK, LM_HEAD_K_CHUNK],
                     [lm_o0, lm_k0],
                 )
-                lm_acc = pl.matmul_acc(lm_acc, lm_hidden_chunk, lm_weight_chunk, b_trans=True)
+                lm_acc = pl.matmul_acc(lm_acc, lm_hidden_chunk, lm_weight_chunk, b_trans=True, init_cond=(kb == 0))
             lm_acc_gm = pl.assemble(lm_acc_gm, lm_acc, [0, 0])
 
         with pl.at(level=pl.Level.CORE_GROUP, name_hint="lm_head_store"):

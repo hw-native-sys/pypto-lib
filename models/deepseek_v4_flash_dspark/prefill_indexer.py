@@ -398,10 +398,7 @@ def _prefill_indexer_dense_tile(
                         q0 : q0 + Q_TILE,
                     ]
                     wq_tile = wq_b[q0 : q0 + Q_TILE, o0 : o0 + Q_OUT_TILE]
-                    if q0 == 0:
-                        qr_acc = pl.matmul(qr_tile, wq_tile, out_dtype=pl.INT32)
-                    else:
-                        qr_acc = pl.matmul_acc(qr_acc, qr_tile, wq_tile)
+                    qr_acc = pl.matmul_acc(qr_acc, qr_tile, wq_tile, init_cond=(q0 == 0))
                 wq_scale = pl.reshape(wq_b_scale[o0 : o0 + Q_OUT_TILE], [1, Q_OUT_TILE])
                 for rl in pl.range(0, QR_PROJ_MM_ROW_TILE, QR_PROJ_ROW_TILE):
                     acc_fp32 = pl.cast(
@@ -448,10 +445,7 @@ def _prefill_indexer_dense_tile(
                         tail_q0 : tail_q0 + Q_TILE,
                         tail_o0 : tail_o0 + Q_OUT_TILE,
                     ]
-                    if tail_q0 == 0:
-                        qr_tail_acc = pl.matmul(qr_tail, wq_tail, out_dtype=pl.INT32)
-                    else:
-                        qr_tail_acc = pl.matmul_acc(qr_tail_acc, qr_tail, wq_tail)
+                    qr_tail_acc = pl.matmul_acc(qr_tail_acc, qr_tail, wq_tail, init_cond=(tail_q0 == 0))
                 tail_acc_fp32 = pl.cast(qr_tail_acc, target_type=pl.FP32, mode="none")
                 tail_scale = pl.slice(
                     qr_scale_view,
@@ -573,10 +567,7 @@ def _prefill_indexer_dense_tile(
                     d0 : d0 + D_TILE,
                 ]
                 wp_tile = weights_proj[d0 : d0 + D_TILE, :]
-                if d0 == 0:
-                    weights_acc = pl.matmul(x_tile, wp_tile, out_dtype=pl.FP32)
-                else:
-                    weights_acc = pl.matmul_acc(weights_acc, x_tile, wp_tile)
+                weights_acc = pl.matmul_acc(weights_acc, x_tile, wp_tile, init_cond=(d0 == 0))
             weights[weights_t0 : weights_t0 + WEIGHTS_ROW_TILE, :] = pl.mul(
                 weights_acc,
                 WEIGHTS_SCALE,
@@ -607,10 +598,7 @@ def _prefill_indexer_dense_tile(
                         valid_shape=[weights_tail_valid, D_TILE],
                     )
                     wp_tail = weights_proj[tail_d0 : tail_d0 + D_TILE, :]
-                    if tail_d0 == 0:
-                        weights_tail_acc = pl.matmul(x_tail, wp_tail, out_dtype=pl.FP32)
-                    else:
-                        weights_tail_acc = pl.matmul_acc(weights_tail_acc, x_tail, wp_tail)
+                    weights_tail_acc = pl.matmul_acc(weights_tail_acc, x_tail, wp_tail, init_cond=(tail_d0 == 0))
                 weights[
                     weights_tail_t0 : weights_tail_t0 + WEIGHTS_TAIL_ROW_TILE,
                     :,

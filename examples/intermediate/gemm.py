@@ -37,10 +37,7 @@ def gemm(
                     k0 = kb * K_TILE
                     tile_a = a[mb : mb + M_TILE, k0 : k0 + K_TILE]
                     tile_b = b[k0 : k0 + K_TILE, nb : nb + N_TILE]
-                    if kb == 0:
-                        acc = pl.matmul(tile_a, tile_b)
-                    else:
-                        acc = pl.matmul_acc(acc, tile_a, tile_b)
+                    acc = pl.matmul_acc(acc, tile_a, tile_b, init_cond=(kb == 0))
                 c[mb : mb + M_TILE, nb : nb + N_TILE] = acc
     return c
 

@@ -942,14 +942,12 @@ def _out_proj_aic_phase(
         out_core = pl.tile.get_block_idx()
         for ob in pl.range(out_core, Q_OUT_BLOCKS, OUT_PROJ_SPMD_BLOCKS):
             o0 = ob * Q_OUT_CHUNK
-            tile_a = pl.slice(attn_tile, [TOK_TILE, K_CHUNK], [0, 0])
-            tile_w = pl.slice(wo, [K_CHUNK, Q_OUT_CHUNK], [layer_hidden_base, o0])
-            o_acc = pl.matmul(tile_a, tile_w, out_dtype=pl.FP32)
-            for kb in pl.pipeline(1, HIDDEN_BLOCKS, stage=2):
+            o_acc = pl.create_tensor([TOK_TILE, Q_OUT_CHUNK], dtype=pl.FP32)
+            for kb in pl.pipeline(0, HIDDEN_BLOCKS, stage=2):
                 k0 = kb * K_CHUNK
                 tile_a_i = pl.slice(attn_tile, [TOK_TILE, K_CHUNK], [0, k0])
                 tile_w_i = pl.slice(wo, [K_CHUNK, Q_OUT_CHUNK], [layer_hidden_base + k0, o0])
-                o_acc = pl.matmul_acc(o_acc, tile_a_i, tile_w_i)
+                o_acc = pl.matmul_acc(o_acc, tile_a_i, tile_w_i, init_cond=(kb == 0))
             out_proj_tile = pl.assemble(out_proj_tile, o_acc, [0, o0])
     return out_proj_tile
 
@@ -1112,14 +1110,12 @@ def prefill_layer(
                             q_core = pl.tile.get_block_idx()
                             for ob in pl.range(q_core, Q_OUT_BLOCKS, Q_PROJ_SPMD_BLOCKS):
                                 q0 = ob * Q_OUT_CHUNK
-                                tile_a = pl.slice(x_gamma_tile, [TOK_TILE, K_CHUNK], [0, 0])
-                                tile_w = pl.slice(wq, [K_CHUNK, Q_OUT_CHUNK], [layer_hidden_base, q0])
-                                q_acc = pl.matmul(tile_a, tile_w, out_dtype=pl.FP32)
-                                for kb in pl.pipeline(1, HIDDEN_BLOCKS, stage=2):
+                                q_acc = pl.create_tensor([TOK_TILE, Q_OUT_CHUNK], dtype=pl.FP32)
+                                for kb in pl.pipeline(0, HIDDEN_BLOCKS, stage=2):
                                     k0 = kb * K_CHUNK
                                     tile_a_i = pl.slice(x_gamma_tile, [TOK_TILE, K_CHUNK], [0, k0])
                                     tile_w_i = pl.slice(wq, [K_CHUNK, Q_OUT_CHUNK], [layer_hidden_base + k0, q0])
-                                    q_acc = pl.matmul_acc(q_acc, tile_a_i, tile_w_i)
+                                    q_acc = pl.matmul_acc(q_acc, tile_a_i, tile_w_i, init_cond=(kb == 0))
                                 q_proj_tile = pl.assemble(q_proj_tile, q_acc, [0, q0])
 
                         with pl.spmd(
@@ -1130,26 +1126,22 @@ def prefill_layer(
                             for work_id in pl.range(kv_core, KV_PROJ_WORK_ITEMS, KV_PROJ_SPMD_BLOCKS):
                                 if work_id < KV_OUT_BLOCKS:
                                     kv0 = work_id * KV_OUT_CHUNK
-                                    tile_a = pl.slice(x_gamma_tile, [TOK_TILE, K_CHUNK], [0, 0])
-                                    tile_wk = pl.slice(wk, [K_CHUNK, KV_OUT_CHUNK], [layer_hidden_base, kv0])
-                                    k_acc = pl.matmul(tile_a, tile_wk, out_dtype=pl.FP32)
-                                    for kb in pl.pipeline(1, HIDDEN_BLOCKS, stage=2):
+                                    k_acc = pl.create_tensor([TOK_TILE, KV_OUT_CHUNK], dtype=pl.FP32)
+                                    for kb in pl.pipeline(0, HIDDEN_BLOCKS, stage=2):
                                         k0 = kb * K_CHUNK
                                         tile_a_i = pl.slice(x_gamma_tile, [TOK_TILE, K_CHUNK], [0, k0])
                                         tile_wk_i = pl.slice(wk, [K_CHUNK, KV_OUT_CHUNK], [layer_hidden_base + k0, kv0])
-                                        k_acc = pl.matmul_acc(k_acc, tile_a_i, tile_wk_i)
+                                        k_acc = pl.matmul_acc(k_acc, tile_a_i, tile_wk_i, init_cond=(kb == 0))
                                     k_proj_tile = pl.assemble(k_proj_tile, k_acc, [0, kv0])
                                 else:
                                     kv_work = work_id - KV_OUT_BLOCKS
                                     kv0 = kv_work * KV_OUT_CHUNK
-                                    tile_a = pl.slice(x_gamma_tile, [TOK_TILE, K_CHUNK], [0, 0])
-                                    tile_wv = pl.slice(wv, [K_CHUNK, KV_OUT_CHUNK], [layer_hidden_base, kv0])
-                                    v_acc = pl.matmul(tile_a, tile_wv, out_dtype=pl.FP32)
-                                    for kb in pl.pipeline(1, HIDDEN_BLOCKS, stage=2):
+                                    v_acc = pl.create_tensor([TOK_TILE, KV_OUT_CHUNK], dtype=pl.FP32)
+                                    for kb in pl.pipeline(0, HIDDEN_BLOCKS, stage=2):
                                         k0 = kb * K_CHUNK
                                         tile_a_i = pl.slice(x_gamma_tile, [TOK_TILE, K_CHUNK], [0, k0])
                                         tile_wv_i = pl.slice(wv, [K_CHUNK, KV_OUT_CHUNK], [layer_hidden_base + k0, kv0])
-                                        v_acc = pl.matmul_acc(v_acc, tile_a_i, tile_wv_i)
+                                        v_acc = pl.matmul_acc(v_acc, tile_a_i, tile_wv_i, init_cond=(kb == 0))
                                     v_proj_tile = pl.assemble(v_proj_tile, v_acc, [0, kv0])
                         fused_qkpv_deps[0] = rms_recip_tid
                         fused_qkpv_deps[1] = q_proj_tid
@@ -1376,10 +1368,8 @@ def prefill_layer(
                             gu_core = (pl.tile.get_block_idx() + band_core_rot) % GATE_UP_SPMD_BLOCKS
                             for rel_ob in pl.range(gu_core, MLP_BAND_BLOCKS, GATE_UP_SPMD_BLOCKS):
                                 o0 = (band_ob0 + rel_ob) * MLP_OUT_CHUNK
-                                pc0 = pl.slice(post_norm_mtile, [MLP_M_TILE, K_CHUNK], [0, 0])
-                                wg0 = pl.slice(w_gate, [K_CHUNK, MLP_OUT_CHUNK], [layer_hidden_base, o0])
-                                gate_acc = pl.matmul(pc0, wg0, out_dtype=pl.FP32)
-                                for kb in pl.pipeline(1, HIDDEN_BLOCKS, stage=2):
+                                gate_acc = pl.create_tensor([MLP_M_TILE, MLP_OUT_CHUNK], dtype=pl.FP32)
+                                for kb in pl.pipeline(0, HIDDEN_BLOCKS, stage=2):
                                     k0 = kb * K_CHUNK
                                     pci = pl.slice(post_norm_mtile, [MLP_M_TILE, K_CHUNK], [0, k0])
                                     wgi = pl.slice(
@@ -1387,7 +1377,7 @@ def prefill_layer(
                                         [K_CHUNK, MLP_OUT_CHUNK],
                                         [layer_hidden_base + k0, o0],
                                     )
-                                    gate_acc = pl.matmul_acc(gate_acc, pci, wgi)
+                                    gate_acc = pl.matmul_acc(gate_acc, pci, wgi, init_cond=(kb == 0))
                                 gate_up_acc_b = pl.assemble(
                                     gate_up_acc_b,
                                     gate_acc,
@@ -1397,10 +1387,8 @@ def prefill_layer(
                             up_core = (gu_core + UP_PROJ_CORE_SHIFT) % GATE_UP_SPMD_BLOCKS
                             for rel_ob in pl.range(up_core, MLP_BAND_BLOCKS, GATE_UP_SPMD_BLOCKS):
                                 o0 = (band_ob0 + rel_ob) * MLP_OUT_CHUNK
-                                pc0 = pl.slice(post_norm_mtile, [MLP_M_TILE, K_CHUNK], [0, 0])
-                                wu0 = pl.slice(w_up, [K_CHUNK, MLP_OUT_CHUNK], [layer_hidden_base, o0])
-                                up_acc = pl.matmul(pc0, wu0, out_dtype=pl.FP32)
-                                for kb in pl.pipeline(1, HIDDEN_BLOCKS, stage=2):
+                                up_acc = pl.create_tensor([MLP_M_TILE, MLP_OUT_CHUNK], dtype=pl.FP32)
+                                for kb in pl.pipeline(0, HIDDEN_BLOCKS, stage=2):
                                     k0 = kb * K_CHUNK
                                     pci = pl.slice(post_norm_mtile, [MLP_M_TILE, K_CHUNK], [0, k0])
                                     wui = pl.slice(
@@ -1408,7 +1396,7 @@ def prefill_layer(
                                         [K_CHUNK, MLP_OUT_CHUNK],
                                         [layer_hidden_base + k0, o0],
                                     )
-                                    up_acc = pl.matmul_acc(up_acc, pci, wui)
+                                    up_acc = pl.matmul_acc(up_acc, pci, wui, init_cond=(kb == 0))
                                 gate_up_acc_b = pl.assemble(
                                     gate_up_acc_b,
                                     up_acc,
@@ -1437,10 +1425,8 @@ def prefill_layer(
                             down_core = pl.tile.get_block_idx()
                             for hb in pl.range(down_core, down_n_blocks, DOWN_PROJ_SPMD_BLOCKS):
                                 h0 = hb * K_CHUNK
-                                ms0 = pl.slice(mlp_silu_b, [MLP_M_TILE, MLP_OUT_CHUNK], [0, 0])
-                                wd0 = pl.slice(w_down, [MLP_OUT_CHUNK, K_CHUNK], [layer_inter_base + band_inter0, h0])
-                                down_acc = pl.matmul(ms0, wd0, out_dtype=pl.FP32)
-                                for cb in pl.pipeline(1, band_k_chunks, stage=2):
+                                down_acc = pl.create_tensor([MLP_M_TILE, K_CHUNK], dtype=pl.FP32)
+                                for cb in pl.pipeline(0, band_k_chunks, stage=2):
                                     c0 = cb * MLP_OUT_CHUNK
                                     msi = pl.slice(mlp_silu_b, [MLP_M_TILE, MLP_OUT_CHUNK], [0, c0])
                                     wdi = pl.slice(
@@ -1448,7 +1434,7 @@ def prefill_layer(
                                         [MLP_OUT_CHUNK, K_CHUNK],
                                         [layer_inter_base + band_inter0 + c0, h0],
                                     )
-                                    down_acc = pl.matmul_acc(down_acc, msi, wdi)
+                                    down_acc = pl.matmul_acc(down_acc, msi, wdi, init_cond=(cb == 0))
                                 mlp_out_acc_tile = pl.assemble(
                                     mlp_out_acc_tile,
                                     down_acc,

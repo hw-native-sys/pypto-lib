@@ -187,14 +187,12 @@ def prefill_layer(
                     with pl.at(level=pl.Level.CORE_GROUP, name_hint="q_proj_matmul"):
                         for ob in pl.range(ob_chunk, ob_chunk + 4):
                             q0 = ob * Q_OUT_CHUNK
-                            q_tile_a0 = pl.slice(normed_i8, [TOK_TILE, K_CHUNK], [0, 0])
-                            q_tile_w0 = pl.slice(wq, [K_CHUNK, Q_OUT_CHUNK], [layer_hidden_base, q0])
-                            q_acc = pl.matmul(q_tile_a0, q_tile_w0, out_dtype=pl.INT32)
-                            for kb in pl.range(1, HIDDEN_BLOCKS):
+                            q_acc = pl.create_tensor([TOK_TILE, Q_OUT_CHUNK], dtype=pl.INT32)
+                            for kb in pl.range(0, HIDDEN_BLOCKS):
                                 q_k0 = kb * K_CHUNK
                                 q_tile_a_i = pl.slice(normed_i8, [TOK_TILE, K_CHUNK], [0, q_k0])
                                 q_tile_w_i = pl.slice(wq, [K_CHUNK, Q_OUT_CHUNK], [layer_hidden_base + q_k0, q0])
-                                q_acc = pl.matmul_acc(q_acc, q_tile_a_i, q_tile_w_i)
+                                q_acc = pl.matmul_acc(q_acc, q_tile_a_i, q_tile_w_i, init_cond=(kb == 0))
                             q_proj_i32 = pl.assemble(q_proj_i32, q_acc, [0, q0])
                     with pl.at(level=pl.Level.CORE_GROUP, name_hint="q_proj_dequant"):
                         for ob in pl.range(ob_chunk, ob_chunk + 4):
@@ -224,24 +222,20 @@ def prefill_layer(
                         for ob in pl.range(ob_chunk, ob_chunk + 4):
                             kv0 = ob * KV_OUT_CHUNK
 
-                            k_proj_tile_a0 = pl.slice(normed_i8, [TOK_TILE, K_CHUNK], [0, 0])
-                            k_proj_tile_w0 = pl.slice(wk, [K_CHUNK, KV_OUT_CHUNK], [layer_hidden_base, kv0])
-                            k_acc = pl.matmul(k_proj_tile_a0, k_proj_tile_w0, out_dtype=pl.INT32)
-                            for kb in pl.range(1, HIDDEN_BLOCKS):
+                            k_acc = pl.create_tensor([TOK_TILE, KV_OUT_CHUNK], dtype=pl.INT32)
+                            for kb in pl.range(0, HIDDEN_BLOCKS):
                                 k_proj_k0 = kb * K_CHUNK
                                 k_proj_tile_a_i = pl.slice(normed_i8, [TOK_TILE, K_CHUNK], [0, k_proj_k0])
                                 k_proj_tile_w_i = pl.slice(wk, [K_CHUNK, KV_OUT_CHUNK], [layer_hidden_base + k_proj_k0, kv0])
-                                k_acc = pl.matmul_acc(k_acc, k_proj_tile_a_i, k_proj_tile_w_i)
+                                k_acc = pl.matmul_acc(k_acc, k_proj_tile_a_i, k_proj_tile_w_i, init_cond=(kb == 0))
                             k_proj_i32 = pl.assemble(k_proj_i32, k_acc, [0, kv0])
 
-                            v_proj_tile_a0 = pl.slice(normed_i8, [TOK_TILE, K_CHUNK], [0, 0])
-                            v_proj_tile_w0 = pl.slice(wv, [K_CHUNK, KV_OUT_CHUNK], [layer_hidden_base, kv0])
-                            v_acc = pl.matmul(v_proj_tile_a0, v_proj_tile_w0, out_dtype=pl.INT32)
-                            for kb in pl.range(1, HIDDEN_BLOCKS):
+                            v_acc = pl.create_tensor([TOK_TILE, KV_OUT_CHUNK], dtype=pl.INT32)
+                            for kb in pl.range(0, HIDDEN_BLOCKS):
                                 v_proj_k0 = kb * K_CHUNK
                                 v_proj_tile_a_i = pl.slice(normed_i8, [TOK_TILE, K_CHUNK], [0, v_proj_k0])
                                 v_proj_tile_w_i = pl.slice(wv, [K_CHUNK, KV_OUT_CHUNK], [layer_hidden_base + v_proj_k0, kv0])
-                                v_acc = pl.matmul_acc(v_acc, v_proj_tile_a_i, v_proj_tile_w_i)
+                                v_acc = pl.matmul_acc(v_acc, v_proj_tile_a_i, v_proj_tile_w_i, init_cond=(kb == 0))
                             v_proj_i32 = pl.assemble(v_proj_i32, v_acc, [0, kv0])
 
                     with pl.at(level=pl.Level.CORE_GROUP, name_hint="kv_proj_dequant"):

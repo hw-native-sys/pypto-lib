@@ -372,13 +372,29 @@ GEMMs included — a rank-3 weight slice that keeps its group axis takes
 `init_cond` the same way:
 
 ```python
-acc = pl.create_tensor([1, M, N], dtype=pl.INT32)
-for kb in pl.pipeline(0, K // K_STEP, stage=2):
-    k0 = kb * K_STEP
-    tile_a = pl.slice(a, [M, K_STEP], [m0, k0])
-    tile_b = w[g : g + 1, n0 : n0 + N, k0 : k0 + K_STEP]
-    acc = pl.matmul_acc(acc, tile_a, tile_b, b_trans=True, init_cond=(kb == 0))
+with pl.spmd(O_GROUPS, name_hint="proj_a_mm"):   # a pl.spmd body is InCore too (§6)
+    acc = pl.create_tensor([1, M, N], dtype=pl.INT32)
+    for kb in pl.pipeline(0, K // K_STEP, stage=2):
+        k0 = kb * K_STEP
+        tile_a = pl.slice(a, [M, K_STEP], [m0, k0])
+        tile_b = w[g : g + 1, n0 : n0 + N, k0 : k0 + K_STEP]
+        acc = pl.matmul_acc(acc, tile_a, tile_b, b_trans=True, init_cond=(kb == 0))
 ```
+
+One case still needs the peel: when the left operand narrows to a **runtime**
+row count *and* the accumulator is taller than one 16-row fractal. `mad` then
+writes the product at pitch `ceil(validRow / 16) * 16`, while a
+`create_tensor` accumulator is read back at its physical row count — only
+`pl.matmul` stamps the accumulator compact, so `init_cond` alone fails
+verification with:
+
+```text
+error: 'tile.matmul_acc' accumulates pl.min(x_rows, 64) valid rows into an
+accumulator that is not compact — AccCompactValid
+```
+
+A `valid_shape` whose extent is a compile-time constant, or an accumulator of
+at most 16 rows, is unaffected: the pitch is the same either way.
 
 ### `pl.matmul_bias(lhs, rhs, bias)`
 
@@ -409,19 +425,21 @@ on where each `pl.slice` / `pl.assemble` sits relative to `pl.at`.
 
 ### `pl.create_tensor(shape, dtype=...)` — where it goes decides what it is
 
-Placement is not a style choice: a `create_tensor` **outside** `pl.at`
-allocates a GM tensor, one **inside** yields a tile (§5).
+Placement is not a style choice: a `create_tensor` in **orchestration** —
+outside every InCore region — allocates a GM tensor, while one **inside** a
+region yields a tile (§5). The region is what matters, not the keyword: a
+`pl.at` block and a `pl.spmd` body are both InCore, and a `pl.spmd` body
+cannot be wrapped in a `pl.at` (§6).
 
-Put it outside when several `pl.at` regions cooperate to fill one
-intermediate tensor — allocated once in orchestration, then each region
-writes its piece via `assemble`. If the result of a single `pl.at` flows
-straight to its caller without further assembly, no `create_tensor` is
-needed at all.
+Put it in orchestration when several regions cooperate to fill one
+intermediate tensor — allocated once, then each region writes its piece via
+`assemble`. When a single region's result flows straight to its caller
+without further assembly, that GM tensor is not needed at all.
 
-Put it inside for a region-local accumulator — the tile an `init_cond`
-K-loop carries (§3). That one **must** be allocated in the region; hoisting
-it to orchestration makes it a GM tensor and ptoas rejects the accumulator
-load:
+Put it inside a region for a region-local accumulator — the tile an
+`init_cond` K-loop carries (§3). That one **must** be allocated in the
+region; hoisting it to orchestration makes it a GM tensor and ptoas rejects
+the accumulator load:
 
 ```text
 error: 'pto.tload' op expects A2/A3 tload dst to use loc=vec or loc=mat

@@ -195,24 +195,22 @@ def prefill_layer_tq(
                         normed_tile, pl.cast(normed, target_type=pl.BF16), [0, k0],
                     )
 
-            # Stage 1.2: Q projection (matmul + matmul_acc, FP32 output).
+            # Stage 1.2: Q projection (matmul_acc over K, FP32 output).
             q_proj_tile = pl.create_tensor([TOK_TILE, HIDDEN], dtype=pl.FP32)
             for ob_chunk in pl.parallel(0, Q_OUT_BLOCKS, 4):
                 with pl.at(level=pl.Level.CORE_GROUP, name_hint="q_proj"):
                     for ob in pl.range(ob_chunk, ob_chunk + 4):
                         q0 = ob * Q_OUT_CHUNK
-                        tile_a = pl.slice(normed_tile, [TOK_TILE, K_CHUNK], [0, 0])
-                        tile_w = pl.slice(wq, [K_CHUNK, Q_OUT_CHUNK], [layer_hidden_base, q0])
-                        q_acc = pl.matmul(tile_a, tile_w, out_dtype=pl.FP32)
-                        for kb in pl.range(1, HIDDEN_BLOCKS):
+                        q_acc = pl.create_tensor([TOK_TILE, Q_OUT_CHUNK], dtype=pl.FP32)
+                        for kb in pl.range(0, HIDDEN_BLOCKS):
                             k0 = kb * K_CHUNK
                             tile_a_i = pl.slice(normed_tile, [TOK_TILE, K_CHUNK], [0, k0])
                             tile_w_i = pl.slice(wq, [K_CHUNK, Q_OUT_CHUNK],
                                                 [layer_hidden_base + k0, q0])
-                            q_acc = pl.matmul_acc(q_acc, tile_a_i, tile_w_i)
+                            q_acc = pl.matmul_acc(q_acc, tile_a_i, tile_w_i, init_cond=(kb == 0))
                         q_proj_tile = pl.assemble(q_proj_tile, q_acc, [0, q0])
 
-            # Stage 1.3: K/V projection (matmul + matmul_acc in single incore).
+            # Stage 1.3: K/V projection (matmul_acc over K in single incore).
             k_proj_tile = pl.create_tensor([TOK_TILE, KV_HIDDEN], dtype=pl.FP32)
             v_proj_tile = pl.create_tensor([TOK_TILE, KV_HIDDEN], dtype=pl.FP32)
             for ob_chunk in pl.parallel(0, KV_OUT_BLOCKS, 4):
@@ -220,28 +218,22 @@ def prefill_layer_tq(
                     for ob in pl.range(ob_chunk, ob_chunk + 4):
                         kv0 = ob * KV_OUT_CHUNK
 
-                        tile_a = pl.slice(normed_tile, [TOK_TILE, K_CHUNK], [0, 0])
-                        tile_wk = pl.slice(wk, [K_CHUNK, KV_OUT_CHUNK],
-                                           [layer_hidden_base, kv0])
-                        k_acc = pl.matmul(tile_a, tile_wk, out_dtype=pl.FP32)
-                        for kb in pl.range(1, HIDDEN_BLOCKS):
+                        k_acc = pl.create_tensor([TOK_TILE, KV_OUT_CHUNK], dtype=pl.FP32)
+                        for kb in pl.range(0, HIDDEN_BLOCKS):
                             k0 = kb * K_CHUNK
                             tile_a_i = pl.slice(normed_tile, [TOK_TILE, K_CHUNK], [0, k0])
                             tile_wk_i = pl.slice(wk, [K_CHUNK, KV_OUT_CHUNK],
                                                  [layer_hidden_base + k0, kv0])
-                            k_acc = pl.matmul_acc(k_acc, tile_a_i, tile_wk_i)
+                            k_acc = pl.matmul_acc(k_acc, tile_a_i, tile_wk_i, init_cond=(kb == 0))
                         k_proj_tile = pl.assemble(k_proj_tile, k_acc, [0, kv0])
 
-                        tile_a = pl.slice(normed_tile, [TOK_TILE, K_CHUNK], [0, 0])
-                        tile_wv = pl.slice(wv, [K_CHUNK, KV_OUT_CHUNK],
-                                           [layer_hidden_base, kv0])
-                        v_acc = pl.matmul(tile_a, tile_wv, out_dtype=pl.FP32)
-                        for kb in pl.range(1, HIDDEN_BLOCKS):
+                        v_acc = pl.create_tensor([TOK_TILE, KV_OUT_CHUNK], dtype=pl.FP32)
+                        for kb in pl.range(0, HIDDEN_BLOCKS):
                             k0 = kb * K_CHUNK
                             tile_a_i = pl.slice(normed_tile, [TOK_TILE, K_CHUNK], [0, k0])
                             tile_wv_i = pl.slice(wv, [K_CHUNK, KV_OUT_CHUNK],
                                                  [layer_hidden_base + k0, kv0])
-                            v_acc = pl.matmul_acc(v_acc, tile_a_i, tile_wv_i)
+                            v_acc = pl.matmul_acc(v_acc, tile_a_i, tile_wv_i, init_cond=(kb == 0))
                         v_proj_tile = pl.assemble(v_proj_tile, v_acc, [0, kv0])
 
             # Stage 1.4: Q/K per-head RMSNorm (FP32 in-place on proj tiles).
@@ -539,17 +531,14 @@ def prefill_layer_tq(
             for ob in pl.range(Q_OUT_BLOCKS):
                 o0 = ob * Q_OUT_CHUNK
                 with pl.at(level=pl.Level.CORE_GROUP, name_hint="out_proj"):
-                    tile_a = pl.slice(attn_tile, [TOK_TILE, K_CHUNK], [0, 0])
-                    tile_w = pl.slice(wo, [K_CHUNK, Q_OUT_CHUNK],
-                                      [layer_hidden_base, o0])
-                    o_acc = pl.matmul(tile_a, tile_w, out_dtype=pl.FP32)
-                    for kb in pl.range(1, HIDDEN_BLOCKS):
+                    o_acc = pl.create_tensor([TOK_TILE, Q_OUT_CHUNK], dtype=pl.FP32)
+                    for kb in pl.range(0, HIDDEN_BLOCKS):
                         k0 = kb * K_CHUNK
                         tile_a_i = pl.slice(attn_tile, [TOK_TILE, K_CHUNK],
                                             [0, k0])
                         tile_w_i = pl.slice(wo, [K_CHUNK, Q_OUT_CHUNK],
                                             [layer_hidden_base + k0, o0])
-                        o_acc = pl.matmul_acc(o_acc, tile_a_i, tile_w_i)
+                        o_acc = pl.matmul_acc(o_acc, tile_a_i, tile_w_i, init_cond=(kb == 0))
                     resid1_tile = pl.assemble(resid1_tile, o_acc, [0, o0])
 
                 with pl.at(level=pl.Level.CORE_GROUP, name_hint="out_proj_residual"):
@@ -601,30 +590,24 @@ def prefill_layer_tq(
                 o0 = ob * MLP_OUT_CHUNK
 
                 with pl.at(level=pl.Level.CORE_GROUP, name_hint="gate_proj"):
-                    pc0 = pl.slice(post_norm_tile, [TOK_TILE, K_CHUNK], [0, 0])
-                    wg0 = pl.slice(w_gate, [K_CHUNK, MLP_OUT_CHUNK],
-                                   [layer_hidden_base, o0])
-                    gate_acc = pl.matmul(pc0, wg0, out_dtype=pl.FP32)
-                    for kb in pl.range(1, HIDDEN_BLOCKS):
+                    gate_acc = pl.create_tensor([TOK_TILE, MLP_OUT_CHUNK], dtype=pl.FP32)
+                    for kb in pl.range(0, HIDDEN_BLOCKS):
                         k0 = kb * K_CHUNK
                         pci = pl.slice(post_norm_tile, [TOK_TILE, K_CHUNK],
                                        [0, k0])
                         wgi = pl.slice(w_gate, [K_CHUNK, MLP_OUT_CHUNK],
                                        [layer_hidden_base + k0, o0])
-                        gate_acc = pl.matmul_acc(gate_acc, pci, wgi)
+                        gate_acc = pl.matmul_acc(gate_acc, pci, wgi, init_cond=(kb == 0))
 
                 with pl.at(level=pl.Level.CORE_GROUP, name_hint="up_proj"):
-                    pc0 = pl.slice(post_norm_tile, [TOK_TILE, K_CHUNK], [0, 0])
-                    wu0 = pl.slice(w_up, [K_CHUNK, MLP_OUT_CHUNK],
-                                   [layer_hidden_base, o0])
-                    up_acc = pl.matmul(pc0, wu0, out_dtype=pl.FP32)
-                    for kb in pl.range(1, HIDDEN_BLOCKS):
+                    up_acc = pl.create_tensor([TOK_TILE, MLP_OUT_CHUNK], dtype=pl.FP32)
+                    for kb in pl.range(0, HIDDEN_BLOCKS):
                         k0 = kb * K_CHUNK
                         pci = pl.slice(post_norm_tile, [TOK_TILE, K_CHUNK],
                                        [0, k0])
                         wui = pl.slice(w_up, [K_CHUNK, MLP_OUT_CHUNK],
                                        [layer_hidden_base + k0, o0])
-                        up_acc = pl.matmul_acc(up_acc, pci, wui)
+                        up_acc = pl.matmul_acc(up_acc, pci, wui, init_cond=(kb == 0))
 
                 with pl.at(level=pl.Level.CORE_GROUP, name_hint="silu"):
                     sigmoid = pl.recip(pl.add(pl.exp(pl.neg(gate_acc)), 1.0))
@@ -638,15 +621,8 @@ def prefill_layer_tq(
             for dob in pl.range(HIDDEN_BLOCKS):
                 d0 = dob * K_CHUNK
                 with pl.at(level=pl.Level.CORE_GROUP, name_hint="down_proj"):
-                    mlp_chunk_0 = pl.slice(mlp_silu_tile, [TOK_TILE, MLP_OUT_CHUNK],
-                                           [0, 0])
-                    w_down_chunk_0 = pl.slice(
-                        w_down, [MLP_OUT_CHUNK, K_CHUNK],
-                        [layer_inter_base, d0],
-                    )
-                    down_acc = pl.matmul(mlp_chunk_0, w_down_chunk_0,
-                                         out_dtype=pl.FP32)
-                    for ob in pl.range(1, MLP_OUT_BLOCKS):
+                    down_acc = pl.create_tensor([TOK_TILE, K_CHUNK], dtype=pl.FP32)
+                    for ob in pl.range(0, MLP_OUT_BLOCKS):
                         o0 = ob * MLP_OUT_CHUNK
                         mlp_chunk_i = pl.slice(
                             mlp_silu_tile, [TOK_TILE, MLP_OUT_CHUNK], [0, o0],
@@ -655,8 +631,7 @@ def prefill_layer_tq(
                             w_down, [MLP_OUT_CHUNK, K_CHUNK],
                             [layer_inter_base + o0, d0],
                         )
-                        down_acc = pl.matmul_acc(down_acc, mlp_chunk_i,
-                                                 w_down_chunk_i)
+                        down_acc = pl.matmul_acc(down_acc, mlp_chunk_i, w_down_chunk_i, init_cond=(ob == 0))
 
                 with pl.at(level=pl.Level.CORE_GROUP,
                            name_hint="down_proj_residual"):

@@ -596,10 +596,7 @@ def indexer_qr_rope(
                     q0 = kb * Q_TILE
                     qr_tile = pl.slice(qr, [MM_ROW_TILE, Q_TILE], [qr_r0, q0], valid_shape=[qr_rows, Q_TILE])
                     wq_tile = wq_b[q0 : q0 + Q_TILE, o_base + ns : o_base + ns + MM_N_TILE]
-                    if q0 == 0:
-                        qr_acc = pl.matmul(qr_tile, wq_tile, out_dtype=pl.INT32)
-                    else:
-                        qr_acc = pl.matmul_acc(qr_acc, qr_tile, wq_tile)
+                    qr_acc = pl.matmul_acc(qr_acc, qr_tile, wq_tile, init_cond=(q0 == 0))
                 qr_acc_pad[qr_r0 : qr_r0 + MM_ROW_TILE, o_base + ns : o_base + ns + MM_N_TILE] = qr_acc
     qr_proj = pl.create_tensor([bs, IDX_N_HEADS * IDX_HEAD_DIM], dtype=pl.FP32)
     for ot in pl.spmd(IDX_N_HEADS * IDX_HEAD_DIM // Q_OUT_TILE, name_hint="idx_qr_proj_dequant", allow_early_resolve=True):
@@ -774,10 +771,7 @@ def indexer_weights_score(
                 d0 = k_base + db * D_TILE
                 x_tile = pl.slice(x_flat, [MM_ROW_TILE, D_TILE], [w_r0, d0], valid_shape=[w_rows, D_TILE])
                 weights_proj_tile = weights_proj[d0 : d0 + D_TILE, :]
-                if db == 0:
-                    weights_acc = pl.matmul(x_tile, weights_proj_tile, out_dtype=pl.FP32)
-                else:
-                    weights_acc = pl.matmul_acc(weights_acc, x_tile, weights_proj_tile)
+                weights_acc = pl.matmul_acc(weights_acc, x_tile, weights_proj_tile, init_cond=(db == 0))
             weights_partial[kb * T_PAD + w_r0 : kb * T_PAD + w_r0 + MM_ROW_TILE, :] = weights_acc
 
     with pl.spmd(

@@ -203,17 +203,14 @@ def _decode_layer(  # noqa: PLR0913 — model signature is intrinsic
         q_on = q_grid // N_SUB
         n_sub = q_grid - q_on * N_SUB
         q_n0 = q_on * QKV_N_TILE + n_sub * TN
-        q_acc = pl.matmul(
-            pl.tensor.set_validshape(normed_i8[:, 0:TK], ACTIVE_BATCH, TK),
-            wq[layer_hidden_base + 0 : layer_hidden_base + TK, q_n0 : q_n0 + TN],
-            out_dtype=pl.INT32,
-        )
-        for kc in pl.range(1, QKV_K_CHUNKS - 1):
+        q_acc = pl.create_tensor([BATCH_PAD, TN], dtype=pl.INT32)
+        for kc in pl.range(0, QKV_K_CHUNKS - 1):
             q_kk = kc * TK
             q_acc = pl.matmul_acc(
                 q_acc,
                 pl.tensor.set_validshape(normed_i8[:, q_kk : q_kk + TK], ACTIVE_BATCH, TK),
                 wq[layer_hidden_base + q_kk : layer_hidden_base + q_kk + TK, q_n0 : q_n0 + TN],
+                init_cond=(kc == 0),
             )
         q_w_scale = pl.reshape(pl.slice(wq_scale, [1, TN], [layer_idx, q_n0]), [1, TN])
         q_last_kk = (QKV_K_CHUNKS - 1) * TK
@@ -231,17 +228,14 @@ def _decode_layer(  # noqa: PLR0913 — model signature is intrinsic
         k_on = k_grid // N_SUB
         n_sub = k_grid - k_on * N_SUB
         k_n0 = k_on * QKV_N_TILE + n_sub * TN
-        k_acc = pl.matmul(
-            pl.tensor.set_validshape(normed_i8[:, 0:TK], ACTIVE_BATCH, TK),
-            wk[layer_hidden_base + 0 : layer_hidden_base + TK, k_n0 : k_n0 + TN],
-            out_dtype=pl.INT32,
-        )
-        for kc in pl.range(1, QKV_K_CHUNKS - 1):
+        k_acc = pl.create_tensor([BATCH_PAD, TN], dtype=pl.INT32)
+        for kc in pl.range(0, QKV_K_CHUNKS - 1):
             k_kk = kc * TK
             k_acc = pl.matmul_acc(
                 k_acc,
                 pl.tensor.set_validshape(normed_i8[:, k_kk : k_kk + TK], ACTIVE_BATCH, TK),
                 wk[layer_hidden_base + k_kk : layer_hidden_base + k_kk + TK, k_n0 : k_n0 + TN],
+                init_cond=(kc == 0),
             )
         k_w_scale = pl.reshape(pl.slice(wk_scale, [1, TN], [layer_idx, k_n0]), [1, TN])
         k_last_kk = (QKV_K_CHUNKS - 1) * TK
@@ -262,17 +256,14 @@ def _decode_layer(  # noqa: PLR0913 — model signature is intrinsic
         v_on = v_grid // N_SUB
         n_sub = v_grid - v_on * N_SUB
         v_n0 = v_on * QKV_N_TILE + n_sub * TN
-        v_acc = pl.matmul(
-            pl.tensor.set_validshape(normed_i8[:, 0:TK], ACTIVE_BATCH, TK),
-            wv[layer_hidden_base + 0 : layer_hidden_base + TK, v_n0 : v_n0 + TN],
-            out_dtype=pl.INT32,
-        )
-        for kc in pl.range(1, QKV_K_CHUNKS - 1):
+        v_acc = pl.create_tensor([BATCH_PAD, TN], dtype=pl.INT32)
+        for kc in pl.range(0, QKV_K_CHUNKS - 1):
             v_kk = kc * TK
             v_acc = pl.matmul_acc(
                 v_acc,
                 pl.tensor.set_validshape(normed_i8[:, v_kk : v_kk + TK], ACTIVE_BATCH, TK),
                 wv[layer_hidden_base + v_kk : layer_hidden_base + v_kk + TK, v_n0 : v_n0 + TN],
+                init_cond=(kc == 0),
             )
         v_w_scale = pl.reshape(pl.slice(wv_scale, [1, TN], [layer_idx, v_n0]), [1, TN])
         v_last_kk = (QKV_K_CHUNKS - 1) * TK
@@ -565,12 +556,8 @@ def _decode_layer(  # noqa: PLR0913 — model signature is intrinsic
         out_c_acc = pl.full([BATCH_PAD, OUT_TN], dtype=pl.INT32, value=0)
         for k_split_out in pl.range(K_SPLITS_OUT):
             k_op = k_split_out * OUT_TK
-            out_acc_k = pl.matmul(
-                pl.tensor.set_validshape(attn_out_i8[:, k_op : k_op + OUT_INNER_TK], ACTIVE_BATCH, OUT_INNER_TK),
-                wo[layer_hidden_base + k_op : layer_hidden_base + OUT_INNER_TK + k_op, n_op : n_op + OUT_TN],
-                out_dtype=pl.INT32,
-            )
-            for out_lk in pl.range(1, OUT_N_SUB_K):
+            out_acc_k = pl.create_tensor([BATCH_PAD, OUT_TN], dtype=pl.INT32)
+            for out_lk in pl.range(0, OUT_N_SUB_K):
                 out_ks_off = out_lk * OUT_INNER_TK
                 out_a_k = pl.tensor.set_validshape(
                     attn_out_i8[:, k_op + out_ks_off : k_op + out_ks_off + OUT_INNER_TK],
@@ -586,7 +573,7 @@ def _decode_layer(  # noqa: PLR0913 — model signature is intrinsic
                     + OUT_INNER_TK,
                     n_op : n_op + OUT_TN,
                 ]
-                out_acc_k = pl.matmul_acc(out_acc_k, out_a_k, out_w_k)
+                out_acc_k = pl.matmul_acc(out_acc_k, out_a_k, out_w_k, init_cond=(out_lk == 0))
             out_c_acc = pl.add(out_c_acc, out_acc_k)
         w_scale_col = pl.reshape(pl.slice(wo_scale, [1, OUT_TN], [layer_idx, n_op]), [1, OUT_TN])
         out_fp32 = pl.mul(pl.col_expand_mul(pl.cast(out_c_acc, target_type=pl.FP32), w_scale_col), attn_out_scales)

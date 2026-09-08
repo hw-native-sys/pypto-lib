@@ -189,10 +189,7 @@ def decode_layer_tq(
                     q_k0 = kb * SCOPE1_K_CHUNK
                     q_tile_a = pl.slice(normed_tile, [BATCH_TILE, SCOPE1_K_CHUNK], [0, q_k0])
                     q_tile_b = pl.slice(wq, [SCOPE1_K_CHUNK, Q_OUT_CHUNK], [layer_hidden_base + q_k0, q0])
-                    if q_k0 == 0:
-                        q_acc = pl.matmul(q_tile_a, q_tile_b, out_dtype=pl.FP32)
-                    else:
-                        q_acc = pl.matmul_acc(q_acc, q_tile_a, q_tile_b)
+                    q_acc = pl.matmul_acc(q_acc, q_tile_a, q_tile_b, init_cond=(q_k0 == 0))
                 q_proj = pl.assemble(q_proj, q_acc, [b0, q0])
 
         # K/V projection.
@@ -203,10 +200,7 @@ def decode_layer_tq(
                     k_k0 = kb * SCOPE1_K_CHUNK
                     k_tile_a = pl.slice(normed_tile, [BATCH_TILE, SCOPE1_K_CHUNK], [0, k_k0])
                     k_tile_b = pl.slice(wk, [SCOPE1_K_CHUNK, KV_OUT_CHUNK], [layer_hidden_base + k_k0, kv0])
-                    if k_k0 == 0:
-                        k_acc = pl.matmul(k_tile_a, k_tile_b, out_dtype=pl.FP32)
-                    else:
-                        k_acc = pl.matmul_acc(k_acc, k_tile_a, k_tile_b)
+                    k_acc = pl.matmul_acc(k_acc, k_tile_a, k_tile_b, init_cond=(k_k0 == 0))
                 k_proj = pl.assemble(k_proj, k_acc, [b0, kv0])
 
             with pl.at(level=pl.Level.CORE_GROUP, name_hint="v_proj"):
@@ -215,10 +209,7 @@ def decode_layer_tq(
                     v_k0 = kb * SCOPE1_K_CHUNK
                     v_tile_a = pl.slice(normed_tile, [BATCH_TILE, SCOPE1_K_CHUNK], [0, v_k0])
                     v_tile_b = pl.slice(wv, [SCOPE1_K_CHUNK, KV_OUT_CHUNK], [layer_hidden_base + v_k0, kv0])
-                    if v_k0 == 0:
-                        v_acc = pl.matmul(v_tile_a, v_tile_b, out_dtype=pl.FP32)
-                    else:
-                        v_acc = pl.matmul_acc(v_acc, v_tile_a, v_tile_b)
+                    v_acc = pl.matmul_acc(v_acc, v_tile_a, v_tile_b, init_cond=(v_k0 == 0))
                 v_proj = pl.assemble(v_proj, v_acc, [b0, kv0])
 
     # Q/K per-head norm (grouped by KV head).
@@ -498,14 +489,12 @@ def decode_layer_tq(
         for ob in pl.spmd(Q_OUT_BLOCKS, name_hint="out_proj",
                           optimizations=[pl.split(pl.SplitMode.UP_DOWN)]):
             o0 = ob * Q_OUT_CHUNK
-            a_chunk_0 = pl.slice(attn_out, [BATCH_TILE, K_CHUNK], [b0, 0])
-            w_chunk_0 = pl.slice(wo, [K_CHUNK, Q_OUT_CHUNK], [layer_hidden_base, o0])
-            o_acc = pl.matmul(a_chunk_0, w_chunk_0, out_dtype=pl.FP32)
-            for kb in pl.range(1, HIDDEN_BLOCKS):
+            o_acc = pl.create_tensor([BATCH_TILE, Q_OUT_CHUNK], dtype=pl.FP32)
+            for kb in pl.range(0, HIDDEN_BLOCKS):
                 k0 = kb * K_CHUNK
                 a_chunk = pl.slice(attn_out, [BATCH_TILE, K_CHUNK], [b0, k0])
                 w_chunk = pl.slice(wo, [K_CHUNK, Q_OUT_CHUNK], [layer_hidden_base + k0, o0])
-                o_acc = pl.matmul_acc(o_acc, a_chunk, w_chunk)
+                o_acc = pl.matmul_acc(o_acc, a_chunk, w_chunk, init_cond=(kb == 0))
             resid = pl.cast(pl.slice(current_hidden, [BATCH_TILE, Q_OUT_CHUNK], [b0, o0]), target_type=pl.FP32)
             resid1_tile = pl.assemble(resid1_tile, pl.add(o_acc, resid), [0, o0])
 
@@ -532,18 +521,15 @@ def decode_layer_tq(
         for ob in pl.spmd(MLP_OUT_BLOCKS, name_hint="gate_up_silu",
                           optimizations=[pl.split(pl.SplitMode.UP_DOWN)]):
             mlp_o0 = ob * 256  # MLP_OUT_CHUNK = 256
-            post_chunk_0 = pl.slice(post_norm_tile, [BATCH_TILE, K_CHUNK], [0, 0])
-            wg_0 = pl.slice(w_gate, [K_CHUNK, 256], [layer_hidden_base, mlp_o0])
-            wu_0 = pl.slice(w_up, [K_CHUNK, 256], [layer_hidden_base, mlp_o0])
-            gate_acc = pl.matmul(post_chunk_0, wg_0, out_dtype=pl.FP32)
-            up_acc = pl.matmul(post_chunk_0, wu_0, out_dtype=pl.FP32)
-            for kb in pl.range(1, HIDDEN_BLOCKS):
+            gate_acc = pl.create_tensor([BATCH_TILE, 256], dtype=pl.FP32)
+            up_acc = pl.create_tensor([BATCH_TILE, 256], dtype=pl.FP32)
+            for kb in pl.range(0, HIDDEN_BLOCKS):
                 k0 = kb * K_CHUNK
                 post_chunk = pl.slice(post_norm_tile, [BATCH_TILE, K_CHUNK], [0, k0])
                 wg = pl.slice(w_gate, [K_CHUNK, 256], [layer_hidden_base + k0, mlp_o0])
                 wu = pl.slice(w_up, [K_CHUNK, 256], [layer_hidden_base + k0, mlp_o0])
-                gate_acc = pl.matmul_acc(gate_acc, post_chunk, wg)
-                up_acc = pl.matmul_acc(up_acc, post_chunk, wu)
+                gate_acc = pl.matmul_acc(gate_acc, post_chunk, wg, init_cond=(kb == 0))
+                up_acc = pl.matmul_acc(up_acc, post_chunk, wu, init_cond=(kb == 0))
             sigmoid = pl.recip(pl.add(pl.exp(pl.neg(gate_acc)), 1.0))
             mlp_chunk = pl.mul(pl.mul(gate_acc, sigmoid), up_acc)
             mlp_tile = pl.assemble(mlp_tile, pl.cast(mlp_chunk, target_type=pl.BF16), [0, mlp_o0])
@@ -552,14 +538,12 @@ def decode_layer_tq(
         for dob in pl.spmd(HIDDEN_BLOCKS, name_hint="down_proj",
                           optimizations=[pl.split(pl.SplitMode.UP_DOWN)]):
             d0 = dob * K_CHUNK
-            mlp_chunk_0 = pl.slice(mlp_tile, [BATCH_TILE, 256], [0, 0])
-            w_down_chunk_0 = pl.slice(w_down, [256, K_CHUNK], [layer_inter_base, d0])
-            down_acc = pl.matmul(mlp_chunk_0, w_down_chunk_0, out_dtype=pl.FP32)
-            for ob in pl.range(1, MLP_OUT_BLOCKS):
+            down_acc = pl.create_tensor([BATCH_TILE, K_CHUNK], dtype=pl.FP32)
+            for ob in pl.range(0, MLP_OUT_BLOCKS):
                 down_o0 = ob * 256
                 down_mlp = pl.slice(mlp_tile, [BATCH_TILE, 256], [0, down_o0])
                 w_down_chunk = pl.slice(w_down, [256, K_CHUNK], [layer_inter_base + down_o0, d0])
-                down_acc = pl.matmul_acc(down_acc, down_mlp, w_down_chunk)
+                down_acc = pl.matmul_acc(down_acc, down_mlp, w_down_chunk, init_cond=(ob == 0))
             resid_chunk_fp32 = pl.slice(resid1_tile, [BATCH_TILE, K_CHUNK], [0, d0])
             out_chunk = pl.add(down_acc, resid_chunk_fp32)
             next_hidden = pl.assemble(next_hidden, pl.cast(out_chunk, target_type=pl.BF16), [b0, d0])

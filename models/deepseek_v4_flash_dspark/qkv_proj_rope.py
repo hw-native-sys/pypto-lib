@@ -301,14 +301,12 @@ def q_proj_qr(
                 qr_k_base = (qbg_idx % QR_OK) * QR_SPLIT_K_TILE
                 for dense_t0 in pl.range(0, qr_full_rows, QR_DENSE_M_TILE):
                     dense_x0 = tile_base + dense_t0
-                    dense_first_x = x_view[dense_x0 : dense_x0 + QR_DENSE_M_TILE, qr_k_base : qr_k_base + QR_K_TILE]
-                    dense_first_w = wq_a[qr_k_base : qr_k_base + QR_K_TILE, q_a_col0 : q_a_col0 + QR_N_TILE]
-                    dense_acc = pl.matmul(dense_first_x, dense_first_w, out_dtype=pl.FP32)
-                    for dense_k in pl.pipeline(1, QR_SPLIT_K_TILE // QR_K_TILE, stage=2):
+                    dense_acc = pl.create_tensor([QR_DENSE_M_TILE, QR_N_TILE], dtype=pl.FP32)
+                    for dense_k in pl.pipeline(0, QR_SPLIT_K_TILE // QR_K_TILE, stage=2):
                         dense_d0 = qr_k_base + dense_k * QR_K_TILE
                         dense_x = x_view[dense_x0 : dense_x0 + QR_DENSE_M_TILE, dense_d0 : dense_d0 + QR_K_TILE]
                         dense_w = wq_a[dense_d0 : dense_d0 + QR_K_TILE, q_a_col0 : q_a_col0 + QR_N_TILE]
-                        dense_acc = pl.matmul_acc(dense_acc, dense_x, dense_w)
+                        dense_acc = pl.matmul_acc(dense_acc, dense_x, dense_w, init_cond=(dense_k == 0))
                     qr_fp32 = pl.assemble(qr_fp32, dense_acc, [dense_t0, q_a_col0], atomic=pl.AtomicType.Add)
                 for t0 in pl.range(qr_full_rows, qr_t_matmul, QR_M_TILE):
                     q_acc = pl.create_tensor([QR_M_TILE, QR_N_TILE], dtype=pl.FP32)
@@ -323,10 +321,7 @@ def q_proj_qr(
                             valid_shape=[qr_rows, QR_K_TILE],
                         )
                         w_chunk = wq_a[qr_d0 : qr_d0 + QR_K_TILE, q_a_col0 : q_a_col0 + QR_N_TILE]
-                        if db == 0:
-                            q_acc = pl.matmul(q_x_chunk_bf16, w_chunk, out_dtype=pl.FP32)
-                        else:
-                            q_acc = pl.matmul_acc(q_acc, q_x_chunk_bf16, w_chunk)
+                        q_acc = pl.matmul_acc(q_acc, q_x_chunk_bf16, w_chunk, init_cond=(db == 0))
                     qr_fp32 = pl.assemble(qr_fp32, q_acc, [t0, q_a_col0], atomic=pl.AtomicType.Add)
 
             qr_view = pl.reshape(qr, [t_dim, Q_LORA])
@@ -423,10 +418,7 @@ def q_proj_q_matmul(
                         qr_proj_col0 : qr_proj_col0 + Q_PROJ_TILE,
                     ]
                     wq_chunk = wq_b[qr_proj_col0 : qr_proj_col0 + Q_PROJ_TILE, w_col0 : w_col0 + QPROJ_MM_N_TILE]
-                    if qr_proj_col0 == 0:
-                        col_acc = pl.matmul(qr_i8_chunk, wq_chunk, out_dtype=pl.INT32)
-                    else:
-                        col_acc = pl.matmul_acc(col_acc, qr_i8_chunk, wq_chunk)
+                    col_acc = pl.matmul_acc(col_acc, qr_i8_chunk, wq_chunk, init_cond=(qr_proj_col0 == 0))
                 q_proj_i32[t0 : t0 + QPROJ_M_TILE, w_col0 : w_col0 + QPROJ_MM_N_TILE] = col_acc
 
             tail_w_col0 = w_col0
@@ -444,10 +436,7 @@ def q_proj_q_matmul(
                         tail_qr_col0 : tail_qr_col0 + Q_PROJ_TILE,
                         tail_w_col0 : tail_w_col0 + QPROJ_MM_N_TILE,
                     ]
-                    if tail_qr_col0 == 0:
-                        tail_acc = pl.matmul(qr_i8_tail, wq_tail, out_dtype=pl.INT32)
-                    else:
-                        tail_acc = pl.matmul_acc(tail_acc, qr_i8_tail, wq_tail)
+                    tail_acc = pl.matmul_acc(tail_acc, qr_i8_tail, wq_tail, init_cond=(tail_qr_col0 == 0))
                 q_proj_i32[
                     tail_t0 : tail_t0 + QPROJ_TAIL_M_TILE,
                     tail_w_col0 : tail_w_col0 + QPROJ_MM_N_TILE,
@@ -707,14 +696,12 @@ def kv_proj_rope(
                 kv_m_group = kbg % kv_m_groups
                 for dense_t0 in pl.range(kv_m_group * KV_DENSE_M_TILE, kv_full_rows, kv_m_groups * KV_DENSE_M_TILE):
                     dense_x0 = tile_base + dense_t0
-                    dense_first_x = x_view[dense_x0 : dense_x0 + KV_DENSE_M_TILE, kv_k_base : kv_k_base + KV_K_TILE]
-                    dense_first_w = wkv[kv_k_base : kv_k_base + KV_K_TILE, kv_col0 : kv_col0 + KV_N_TILE]
-                    dense_acc = pl.matmul(dense_first_x, dense_first_w, out_dtype=pl.FP32)
-                    for dense_k in pl.pipeline(1, KV_SPLIT_K_TILE // KV_K_TILE, stage=2):
+                    dense_acc = pl.create_tensor([KV_DENSE_M_TILE, KV_N_TILE], dtype=pl.FP32)
+                    for dense_k in pl.pipeline(0, KV_SPLIT_K_TILE // KV_K_TILE, stage=2):
                         dense_d0 = kv_k_base + dense_k * KV_K_TILE
                         dense_x = x_view[dense_x0 : dense_x0 + KV_DENSE_M_TILE, dense_d0 : dense_d0 + KV_K_TILE]
                         dense_w = wkv[dense_d0 : dense_d0 + KV_K_TILE, kv_col0 : kv_col0 + KV_N_TILE]
-                        dense_acc = pl.matmul_acc(dense_acc, dense_x, dense_w)
+                        dense_acc = pl.matmul_acc(dense_acc, dense_x, dense_w, init_cond=(dense_k == 0))
                     kv_fp32 = pl.assemble(kv_fp32, dense_acc, [dense_t0, kv_col0], atomic=pl.AtomicType.Add)
                 for t0 in pl.range(kv_full_rows + kv_m_group * KV_M_TILE, t_matmul, kv_m_groups * KV_M_TILE):
                     kv_acc = pl.create_tensor([KV_M_TILE, KV_N_TILE], dtype=pl.FP32)
@@ -729,10 +716,7 @@ def kv_proj_rope(
                             valid_shape=[kv_rows, KV_K_TILE],
                         )
                         wkv_chunk = wkv[d0 : d0 + KV_K_TILE, kv_col0 : kv_col0 + KV_N_TILE]
-                        if db == 0:
-                            kv_acc = pl.matmul(kv_x_chunk_bf16, wkv_chunk, out_dtype=pl.FP32)
-                        else:
-                            kv_acc = pl.matmul_acc(kv_acc, kv_x_chunk_bf16, wkv_chunk)
+                        kv_acc = pl.matmul_acc(kv_acc, kv_x_chunk_bf16, wkv_chunk, init_cond=(db == 0))
                     kv_fp32 = pl.assemble(kv_fp32, kv_acc, [t0, kv_col0], atomic=pl.AtomicType.Add)
 
             kv_view = pl.reshape(kv, [t_dim, HEAD_DIM])
