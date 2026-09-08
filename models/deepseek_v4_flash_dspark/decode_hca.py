@@ -455,14 +455,13 @@ def decode_hca(
                         stream_bf16[0:H_TILE, 0:NOPE_DIM],
                         stream_rope_bf16,
                     )
-                    for stream_hi in pl.unroll(H_TILE):
-                        stream_head = stream_h0 + stream_hi
-                        stream_pack_row = (stream_head // HEADS_PER_GROUP) * T_PAD + merge_t
-                        stream_pack_col = (stream_head % HEADS_PER_GROUP) * HEAD_DIM
+                    stream_groups = pl.reshape(stream_full_bf16, [PUBLISH_GROUPS, O_GROUP_IN])
+                    for stream_group in pl.unroll(PUBLISH_GROUPS):
+                        stream_pack_row = (global_group0 + stream_group) * T_PAD + merge_t
                         attention_grouped[
                             stream_pack_row : stream_pack_row + 1,
-                            stream_pack_col : stream_pack_col + HEAD_DIM,
-                        ] = stream_full_bf16[stream_hi : stream_hi + 1, 0:HEAD_DIM]
+                            0:O_GROUP_IN,
+                        ] = stream_groups[stream_group : stream_group + 1, 0:O_GROUP_IN]
 
                 for group_slot in pl.unroll(PUBLISH_GROUPS):
                     source_row = (global_group0 + group_slot) * T_PAD + stream_t0
