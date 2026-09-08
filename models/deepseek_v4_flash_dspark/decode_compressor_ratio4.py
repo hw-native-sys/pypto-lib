@@ -150,8 +150,9 @@ def compressor_ratio4_pool_projected(
             for s_idx in pl.range(s_dim):
                 token = c_idx * s_dim + s_idx
                 token_pos = pl.read(position_ids, [token])
-                pooled_kv[token : token + 1, :] = pl.full([1, HEAD_DIM], dtype=pl.FP32, value=0.0)
                 if (token_pos + 1) % COMPRESS_RATIO == 0:
+                    # S=8 has one boundary in each four-token group.
+                    compact_token = token // COMPRESS_RATIO
                     window_start = token_pos - STATE_LEN + 1
                     for h0 in pl.range(0, HEAD_DIM, POOL_HEAD_TILE):
                         last_ape_row = pl.cast(token_pos % COMPRESS_RATIO, target_type=pl.INDEX)
@@ -215,7 +216,7 @@ def compressor_ratio4_pool_projected(
                             li = pl.add(pl.mul(alpha, li), beta)
                             oi = pl.add(pl.mul(oi, alpha), pl.mul(value, beta))
                             mi = mi_next
-                        pooled_kv[token : token + 1, h0 : h0 + POOL_HEAD_TILE] = pl.div(oi, li)
+                        pooled_kv[compact_token : compact_token + 1, h0 : h0 + POOL_HEAD_TILE] = pl.div(oi, li)
 
     return pool_tid, _kv_score_tid
 
@@ -268,7 +269,8 @@ def compressor_ratio4_cache_write(
     b_dim = pl.tensor.dim(compress_state_block_table, 0)
     bs = pl.tensor.dim(position_ids, 0)
     s_dim = bs // b_dim
-    rms_blocks = (bs + RMS_PAD_TILE - 1) // RMS_PAD_TILE
+    compact_rows = bs // COMPRESS_RATIO
+    rms_blocks = (compact_rows + RMS_PAD_TILE - 1) // RMS_PAD_TILE
     cmp_block_num = pl.tensor.dim(cmp_kv_cache, 0)
     kv_flat = kv
     cmp_kv_cache_flat = pl.reshape(cmp_kv_cache, [cmp_block_num * BLOCK_SIZE, HEAD_DIM])
@@ -303,9 +305,17 @@ def compressor_ratio4_cache_write(
     ) as cache_write_tid:
         rms_blk = pl.tile.get_block_idx()
         b0 = rms_blk * RMS_PAD_TILE
-        rms_blk_rows = pl.min(RMS_PAD_TILE, bs - b0)
-        cos_b = pl.slice(cos, [RMS_PAD_TILE, ROPE_HEAD_DIM], [b0, 0], valid_shape=[rms_blk_rows, ROPE_HEAD_DIM])
-        sin_b = pl.slice(sin, [RMS_PAD_TILE, ROPE_HEAD_DIM], [b0, 0], valid_shape=[rms_blk_rows, ROPE_HEAD_DIM])
+        rms_blk_rows = pl.min(RMS_PAD_TILE, compact_rows - b0)
+        # Only boundary rows need normalization and token-local RoPE.
+        cos_b = pl.full([RMS_PAD_TILE, ROPE_HEAD_DIM], dtype=pl.FP32, value=0.0)
+        sin_b = pl.full([RMS_PAD_TILE, ROPE_HEAD_DIM], dtype=pl.FP32, value=0.0)
+        for inner in pl.range(rms_blk_rows):
+            compact_token = b0 + inner
+            request = (compact_token * COMPRESS_RATIO) // s_dim
+            first_pos = pl.read(position_ids, [request * s_dim])
+            token = compact_token * COMPRESS_RATIO + COMPRESS_RATIO - 1 - first_pos % COMPRESS_RATIO
+            cos_b = pl.gather_row(cos_b, cos, [inner, 0], [token, 0], [1, ROPE_HEAD_DIM])
+            sin_b = pl.gather_row(sin_b, sin, [inner, 0], [token, 0], [1, ROPE_HEAD_DIM])
         partial_sq = pl.full([1, RMS_PAD_TILE], dtype=pl.FP32, value=0.0)
         for k0 in pl.range(0, HEAD_DIM, HEAD_TILE):
             kv_rms_chunk = pooled_kv[b0 : b0 + RMS_PAD_TILE, k0 : k0 + HEAD_TILE]
@@ -337,11 +347,14 @@ def compressor_ratio4_cache_write(
         normed_kv[b0 : b0 + RMS_PAD_TILE, NOPE_HEAD_DIM : HEAD_DIM] = rope_rot
 
         for inner in pl.range(rms_blk_rows):
-            token = b0 + inner
+            compact_token = b0 + inner
+            request = (compact_token * COMPRESS_RATIO) // s_dim
+            first_pos = pl.read(position_ids, [request * s_dim])
+            token = compact_token * COMPRESS_RATIO + COMPRESS_RATIO - 1 - first_pos % COMPRESS_RATIO
             cache_row_i64 = pl.read(cmp_slot_mapping, [token])
             if cache_row_i64 >= 0:
                 cache_row = pl.cast(cache_row_i64, pl.INDEX)
-                kv_row_fp32 = normed_kv[token : token + 1, 0 : HEAD_DIM]
+                kv_row_fp32 = normed_kv[compact_token : compact_token + 1, 0 : HEAD_DIM]
                 kv_flat[token : token + 1, :] = kv_row_fp32
                 cmp_kv_cache_flat[cache_row : cache_row + 1, :] = pl.cast(
                     kv_row_fp32, target_type=pl.BF16, mode="rint")

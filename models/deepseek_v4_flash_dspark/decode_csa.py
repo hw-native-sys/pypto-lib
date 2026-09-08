@@ -542,10 +542,9 @@ def decode_csa(
                         m_mi = m_mi_new
 
                     n_sink_bias = pl.reshape(attn_sink[m_h0 : m_h0 + H_TILE], [H_TILE, 1])
-                    n_sink_tile = pl.add(pl.sub(m_mi, m_mi), n_sink_bias)
-                    n_denom = pl.add(m_li, pl.exp(pl.sub(n_sink_tile, m_mi)))
+                    n_denom = pl.add(m_li, pl.exp(pl.sub(n_sink_bias, m_mi)))
                     n_full = pl.row_expand_div(m_oi, n_denom)[0:H_TILE, 0:HEAD_DIM]
-                    n_bf16 = pl.cast(n_full, target_type=pl.BF16, mode="rint")
+                    n_nope_bf16 = pl.cast(n_full[:, 0:NOPE_DIM], target_type=pl.BF16, mode="rint")
 
                     m_rope = n_full[0:H_TILE, NOPE_DIM:HEAD_DIM]
                     m_cos_il = rope_cos_il[m_t : m_t + 1, 0:ROPE_HEAD_DIM]
@@ -553,7 +552,7 @@ def decode_csa(
                     m_swapped = pl.gather(m_rope, dim=-1, index=rope_swap_idx[0:H_TILE, 0:ROPE_HEAD_DIM])
                     m_rot = pl.add(pl.col_expand_mul(m_rope, m_cos_il), pl.col_expand_mul(m_swapped, m_sin_signed))
                     n_rope_bf16 = pl.cast(m_rot, target_type=pl.BF16, mode="rint")
-                    n_full_bf16 = pl.concat(n_bf16[:, 0:NOPE_DIM], n_rope_bf16)
+                    n_full_bf16 = pl.concat(n_nope_bf16, n_rope_bf16)
 
                     n_group_bf16 = pl.reshape(n_full_bf16, [PUBLISH_GROUPS, O_GROUP_IN])
                     for n_group in pl.unroll(PUBLISH_GROUPS):

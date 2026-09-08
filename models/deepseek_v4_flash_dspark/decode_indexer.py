@@ -321,14 +321,11 @@ def indexer_topk_group_wave(
     kv_seq_lens: pl.Tensor[[B_DYN], pl.INT32],
     score_arena: pl.Tensor[[T_DYN, TOPK_MAX_CANDIDATES], pl.FP32],
     pair_arena: pl.Tensor[[TOPK_ARENA_ROWS, TOPK_PAIR_WIDTH], pl.FP32],
+    max_cache_len: pl.Scalar[pl.INDEX],
 ):
     """Reduce globally striped two-leaf subtrees into compact roots."""
     worker = pl.tile.get_block_idx()
     query_count = pl.tensor.dim(position_ids, 0)
-    max_cache_len = 0
-    for batch in pl.range(query_count // S):
-        batch_cache_len = pl.read(kv_seq_lens, [batch]) // COMPRESS_RATIO
-        max_cache_len = pl.max(max_cache_len, batch_cache_len)
     single_group = pl.cast(max_cache_len <= TOPK_CANDIDATES_PER_LEAF * TOPK_LEAVES_PER_GROUP, pl.INDEX)
     query_begin = worker * single_group
     query_step = 1 + single_group * (TOPK_GROUP_WORKERS - 1)
@@ -451,6 +448,11 @@ def indexer_score_topk_forest(
     score_arena = pl.create_tensor(
         [bs, TOPK_MAX_CANDIDATES], dtype=pl.FP32
     )
+    max_topk_cache_len = 0
+    for topk_batch in pl.range(b_dim):
+        topk_cache_len = pl.read(kv_seq_lens, [topk_batch]) // COMPRESS_RATIO
+        max_topk_cache_len = pl.max(max_topk_cache_len, topk_cache_len)
+
     with pl.spmd(
         TOPK_SCORE_WORKERS,
         name_hint="indexer_score_leaf_wave",
@@ -459,11 +461,7 @@ def indexer_score_topk_forest(
     ) as score_tid:
         worker = pl.tile.get_block_idx()
         query_count = pl.tensor.dim(position_ids, 0)
-        max_cache_len = 0
-        for batch in pl.range(query_count // S):
-            batch_cache_len = pl.read(kv_seq_lens, [batch]) // COMPRESS_RATIO
-            max_cache_len = pl.max(max_cache_len, batch_cache_len)
-        single_leaf = pl.cast(max_cache_len <= TOPK_CANDIDATES_PER_LEAF, pl.INDEX)
+        single_leaf = pl.cast(max_topk_cache_len <= TOPK_CANDIDATES_PER_LEAF, pl.INDEX)
         query_begin = worker * single_leaf
         query_step = 1 + single_leaf * (TOPK_SCORE_WORKERS - 1)
         global_leaf_base = 0
@@ -514,10 +512,6 @@ def indexer_score_topk_forest(
                     score_arena[query : query + 1, logical_row : logical_row + SCORE_TILE] = score_valid
             global_leaf_base = global_leaf_base + leaf_count
 
-    max_topk_cache_len = 0
-    for topk_batch in pl.range(b_dim):
-        topk_cache_len = pl.read(kv_seq_lens, [topk_batch]) // COMPRESS_RATIO
-        max_topk_cache_len = pl.max(max_topk_cache_len, topk_cache_len)
     with pl.scope():
         if max_topk_cache_len <= TOPK_CANDIDATES_PER_LEAF * TOPK_LEAVES_PER_GROUP:
             with pl.spmd(TOPK_GROUP_WORKERS, name_hint="indexer_topk_single_group_publish", deps=[score_tid]):
@@ -528,7 +522,9 @@ def indexer_score_topk_forest(
                 )
         else:
             with pl.spmd(TOPK_GROUP_WORKERS, name_hint="indexer_topk_group_wave", deps=[score_tid]) as topk_tid:
-                indexer_topk_group_wave(position_ids, kv_seq_lens, score_arena, pair_arena)
+                indexer_topk_group_wave(
+                    position_ids, kv_seq_lens, score_arena, pair_arena, max_topk_cache_len,
+                )
             with pl.spmd(bs, name_hint="indexer_topk_query_merge", deps=[topk_tid]) as _score_tid:
                 indexer_topk_query_merge(position_ids, kv_seq_lens, pair_arena, topk_scores, topk_idxs)
 

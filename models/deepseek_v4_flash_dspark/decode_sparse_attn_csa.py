@@ -127,10 +127,11 @@ def sparse_attn_csa(
             c_pos_q = pl.cast(c_pos_i32, target_type=pl.FP32)
             # Per-token compressed-slot bound.
             c_upper_b = pl.row_expand_mul(pl.full([BIAS_T_TILE, IDX_TOPK], dtype=pl.FP32, value=1.0), c_pos_q)
-            c_ge = pl.minimum(pl.maximum(pl.add(c_raw, CSA_CMP_GE_BIAS), 0.0), 1.0)
+            c_shifted = pl.add(c_raw, CSA_CMP_GE_BIAS)
+            c_ge = pl.minimum(pl.maximum(c_shifted, 0.0), 1.0)
             c_lt = pl.minimum(pl.maximum(pl.sub(c_upper_b, c_raw), 0.0), 1.0)
             c_mask = pl.mul(c_ge, c_lt)
-            c_out = pl.sub(pl.mul(c_mask, pl.add(c_raw, 1.0)), 1.0)
+            c_out = pl.sub(pl.mul(c_mask, c_shifted), 1.0)
             cmp_sparse_indices[bias_t0 : bias_t0 + BIAS_T_TILE, 0:IDX_TOPK] = pl.cast(c_out, target_type=pl.INT32)
             v_win_f = pl.cast(window_swa_indices[bias_t0 : bias_t0 + BIAS_T_TILE, 0:WIN], target_type=pl.FP32)
             v_win_valid = pl.minimum(pl.maximum(pl.add(v_win_f, 1.0), 0.0), 1.0)
@@ -354,10 +355,9 @@ def sparse_attn_csa_tp1(
             m_mi = m_mi_new
 
         n_sink_bias = pl.reshape(attn_sink[m_h0 : m_h0 + H_TILE], [H_TILE, 1])
-        n_sink_tile = pl.add(pl.sub(m_mi, m_mi), n_sink_bias)
-        n_denom = pl.add(m_li, pl.exp(pl.sub(n_sink_tile, m_mi)))
+        n_denom = pl.add(m_li, pl.exp(pl.sub(n_sink_bias, m_mi)))
         n_full = pl.row_expand_div(m_oi, n_denom)[0 : H_TILE, 0 : HEAD_DIM]
-        n_bf16 = pl.cast(n_full, target_type=pl.BF16, mode="rint")
+        n_nope_bf16 = pl.cast(n_full[:, :NOPE_DIM], target_type=pl.BF16, mode="rint")
 
         # Inverse-RoPE head tile.
         m_rope = n_full[0 : H_TILE, NOPE_DIM : HEAD_DIM]
@@ -366,7 +366,7 @@ def sparse_attn_csa_tp1(
         m_swapped = pl.gather(m_rope, dim=-1, index=rope_swap_idx[0:H_TILE, 0:ROPE_DIM])
         m_rot = pl.add(pl.col_expand_mul(m_rope, m_cos_il), pl.col_expand_mul(m_swapped, m_sin_signed))
         n_rope_bf16 = pl.cast(m_rot, target_type=pl.BF16, mode="rint")
-        n_full_bf16 = pl.concat(n_bf16[:, : NOPE_DIM], n_rope_bf16)
+        n_full_bf16 = pl.concat(n_nope_bf16, n_rope_bf16)
 
         n_group_bf16 = pl.reshape(n_full_bf16, [PUBLISH_GROUPS, O_GROUP_IN])
         for n_group in pl.unroll(PUBLISH_GROUPS):

@@ -141,7 +141,8 @@ def indexer_compressor_pool_projected(
     b_dim = pl.tensor.dim(compress_state_block_table, 0)
     bs = pl.tensor.dim(position_ids, 0)
     s_dim = bs // b_dim
-    rms_blocks = (bs + RMS_PAD_TILE - 1) // RMS_PAD_TILE
+    compact_rows = bs // COMPRESS_RATIO
+    rms_blocks = (compact_rows + RMS_PAD_TILE - 1) // RMS_PAD_TILE
     compress_state_block_num = pl.tensor.dim(compress_state, 0)
     compress_state_rows = compress_state_block_num * COMPRESS_STATE_BLOCK_SIZE
     compress_state_flat = pl.reshape(compress_state, [compress_state_rows, COMPRESS_STATE_DIM])
@@ -157,8 +158,9 @@ def indexer_compressor_pool_projected(
             for s_idx in pl.range(s_dim):
                 token = c_idx * s_dim + s_idx
                 token_pos = pl.read(position_ids, [token])
-                pooled_kv[token : token + 1, :] = pl.full([1, HEAD_DIM], dtype=pl.FP32, value=0.0)
                 if (token_pos + 1) % COMPRESS_RATIO == 0:
+                    # S=8 has one boundary in each four-token group.
+                    compact_token = token // COMPRESS_RATIO
                     window_start = token_pos - STATE_LEN + 1
                     for h0 in pl.range(0, HEAD_DIM, HEAD_TILE):
                         last_ape_row = pl.cast(token_pos % COMPRESS_RATIO, target_type=pl.INDEX)
@@ -225,7 +227,7 @@ def indexer_compressor_pool_projected(
                             li = pl.add(pl.mul(alpha, li), beta)
                             oi = pl.add(pl.mul(oi, alpha), pl.mul(value, beta))
                             mi = mi_next
-                        pooled_kv[token : token + 1, h0 : h0 + HEAD_TILE] = pl.div(oi, li)
+                        pooled_kv[compact_token : compact_token + 1, h0 : h0 + HEAD_TILE] = pl.div(oi, li)
 
     # Recurrent state-ring commit.
     with pl.spmd(COMMIT_WORKERS, name_hint="compress_state_commit", deps=[pool_tid]):
@@ -248,11 +250,18 @@ def indexer_compressor_pool_projected(
     norm_w_2d = pl.reshape(norm_w, [1, HEAD_DIM])
     with pl.spmd(rms_blocks, name_hint="rmsnorm_rope", deps=[pool_tid]) as rms_tid:
         rms_blk = pl.tile.get_block_idx()
-        # Padded token block and interleaved inverse-RoPE rows.
+        # Compact boundary rows and their interleaved inverse-RoPE rows.
         b0 = rms_blk * RMS_PAD_TILE
-        rms_blk_rows = pl.min(RMS_PAD_TILE, bs - b0)
-        cos_b = pl.slice(cos, [RMS_PAD_TILE, ROPE_HEAD_DIM], [b0, 0], valid_shape=[rms_blk_rows, ROPE_HEAD_DIM])
-        sin_b = pl.slice(sin, [RMS_PAD_TILE, ROPE_HEAD_DIM], [b0, 0], valid_shape=[rms_blk_rows, ROPE_HEAD_DIM])
+        rms_blk_rows = pl.min(RMS_PAD_TILE, compact_rows - b0)
+        cos_b = pl.create_tensor([RMS_PAD_TILE, ROPE_HEAD_DIM], dtype=pl.FP32)
+        sin_b = pl.create_tensor([RMS_PAD_TILE, ROPE_HEAD_DIM], dtype=pl.FP32)
+        for inner in pl.range(rms_blk_rows):
+            compact_token = b0 + inner
+            request = compact_token // (S // COMPRESS_RATIO)
+            first_pos = pl.read(position_ids, [request * S])
+            token = compact_token * COMPRESS_RATIO + COMPRESS_RATIO - 1 - first_pos % COMPRESS_RATIO
+            cos_b = pl.gather_row(cos_b, cos, [inner, 0], [token, 0], [1, ROPE_HEAD_DIM])
+            sin_b = pl.gather_row(sin_b, sin, [inner, 0], [token, 0], [1, ROPE_HEAD_DIM])
         partial_sq = pl.full([1, RMS_PAD_TILE], dtype=pl.FP32, value=0.0)
         for k0 in pl.pipeline(0, HEAD_DIM, HEAD_TILE, stage=2):
             kv_rms_chunk = pooled_kv[b0 : b0 + RMS_PAD_TILE, k0 : k0 + HEAD_TILE]
@@ -282,12 +291,9 @@ def indexer_compressor_pool_projected(
         rope_rot = pl.add(pl.mul(rope_normed, cos_b), pl.mul(swapped, sin_b))
         normed_rope = pl.cast(rope_rot, target_type=pl.BF16, mode="rint")
         for inner in pl.range(rms_blk_rows):
-            token = b0 + inner
-            token_pos = pl.read(position_ids, [token])
-            if (token_pos + 1) % COMPRESS_RATIO == 0:
-                compact_token = token // COMPRESS_RATIO
-                normed_kv[compact_token : compact_token + 1, 0:NOPE_HEAD_DIM] = normed_nope[inner : inner + 1, :]
-                normed_kv[compact_token : compact_token + 1, NOPE_HEAD_DIM:HEAD_DIM] = normed_rope[inner : inner + 1, :]
+            compact_token = b0 + inner
+            normed_kv[compact_token : compact_token + 1, 0:NOPE_HEAD_DIM] = normed_nope[inner : inner + 1, :]
+            normed_kv[compact_token : compact_token + 1, NOPE_HEAD_DIM:HEAD_DIM] = normed_rope[inner : inner + 1, :]
 
     return _kv_score_tid, rms_tid
 
