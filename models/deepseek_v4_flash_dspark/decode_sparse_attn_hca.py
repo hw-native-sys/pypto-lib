@@ -169,70 +169,93 @@ def sparse_attn_hca(
                 0:HEAD_DIM,
             ] = pl.full([REQUEST_KV_ROWS, HEAD_DIM], dtype=pl.BF16, value=0.0)
 
-            for g_sub in pl.range(WIN // GATHER_RUN_TILE):
-                g_sr0 = g_sub * GATHER_RUN_TILE
-                g_sdst = g_base + g_sr0
-                if g_sr0 + GATHER_RUN_TILE <= g_first_len:
-                    g_first = pl.read(window_swa_indices, [g_t0, g_sr0])
-                    g_run_matches = pl.cast(g_first >= 0, pl.INT32)
+            g_bulk_matches = pl.cast(g_first_len == WIN, pl.INT32)
+            g_bulk_first = pl.read(window_swa_indices, [g_t0, 0])
+            g_bulk_matches = g_bulk_matches * pl.cast(g_bulk_first >= 0, pl.INT32)
+            if g_first_len == WIN:
+                for g_sub in pl.range(WIN // GATHER_RUN_TILE):
                     for g_dr in pl.unroll(GATHER_RUN_TILE):
-                        g_slot_i32 = pl.read(window_swa_indices, [g_t0, g_sr0 + g_dr])
-                        g_run_matches = g_run_matches * pl.cast(
-                            g_slot_i32 == g_first + g_dr,
-                            pl.INT32,
-                        )
-                    if g_run_matches == 1:
-                        g_run_src = pl.cast(g_first, pl.INDEX)
-                        raw_kv[
-                            g_sdst : g_sdst + GATHER_RUN_TILE,
-                            0:HEAD_DIM,
-                        ] = ori_kv_flat[
-                            g_run_src : g_run_src + GATHER_RUN_TILE,
-                            0:HEAD_DIM,
-                        ]
+                        g_row = g_sub * GATHER_RUN_TILE + g_dr
+                        g_slot_i32 = pl.read(window_swa_indices, [g_t0, g_row])
+                        g_matches = pl.cast(g_slot_i32 == g_bulk_first + g_row, pl.INT32)
+                        g_bulk_matches = g_bulk_matches * g_matches
+                for g_token in pl.unroll(S - 1):
+                    g_t = g_t0 + g_token + 1
+                    g_len = pl.read(window_swa_lens, [g_t])
+                    g_slot_i32 = pl.read(window_swa_indices, [g_t, g_len - 1])
+                    g_matches = pl.cast(g_slot_i32 == g_bulk_first + WIN + g_token, pl.INT32)
+                    g_bulk_matches = g_bulk_matches * g_matches
+                    g_bulk_matches = g_bulk_matches * pl.cast(g_len == WIN, pl.INT32)
+            if g_bulk_matches == 1:
+                g_bulk_src = pl.cast(g_bulk_first, pl.INDEX)
+                raw_kv[g_base : g_base + REQUEST_KV_ROWS, 0:HEAD_DIM] = ori_kv_flat[
+                    g_bulk_src : g_bulk_src + REQUEST_KV_ROWS, 0:HEAD_DIM,
+                ]
+            else:
+                for g_sub in pl.range(WIN // GATHER_RUN_TILE):
+                    g_sr0 = g_sub * GATHER_RUN_TILE
+                    g_sdst = g_base + g_sr0
+                    if g_sr0 + GATHER_RUN_TILE <= g_first_len:
+                        g_first = pl.read(window_swa_indices, [g_t0, g_sr0])
+                        g_run_matches = pl.cast(g_first >= 0, pl.INT32)
+                        for g_dr in pl.unroll(GATHER_RUN_TILE):
+                            g_slot_i32 = pl.read(window_swa_indices, [g_t0, g_sr0 + g_dr])
+                            g_run_matches = g_run_matches * pl.cast(
+                                g_slot_i32 == g_first + g_dr,
+                                pl.INT32,
+                            )
+                        if g_run_matches == 1:
+                            g_run_src = pl.cast(g_first, pl.INDEX)
+                            raw_kv[
+                                g_sdst : g_sdst + GATHER_RUN_TILE,
+                                0:HEAD_DIM,
+                            ] = ori_kv_flat[
+                                g_run_src : g_run_src + GATHER_RUN_TILE,
+                                0:HEAD_DIM,
+                            ]
+                        else:
+                            for g_dr in pl.range(GATHER_RUN_TILE):
+                                g_slot_i32 = pl.read(window_swa_indices, [g_t0, g_sr0 + g_dr])
+                                if g_slot_i32 >= 0:
+                                    g_slot = pl.cast(g_slot_i32, pl.INDEX)
+                                    g_dst = g_sdst + g_dr
+                                    raw_kv[
+                                        g_dst : g_dst + 1,
+                                        0:HEAD_DIM,
+                                    ] = ori_kv_flat[
+                                        g_slot : g_slot + 1,
+                                        0:HEAD_DIM,
+                                    ]
                     else:
                         for g_dr in pl.range(GATHER_RUN_TILE):
-                            g_slot_i32 = pl.read(window_swa_indices, [g_t0, g_sr0 + g_dr])
-                            if g_slot_i32 >= 0:
-                                g_slot = pl.cast(g_slot_i32, pl.INDEX)
-                                g_dst = g_sdst + g_dr
-                                raw_kv[
-                                    g_dst : g_dst + 1,
-                                    0:HEAD_DIM,
-                                ] = ori_kv_flat[
-                                    g_slot : g_slot + 1,
-                                    0:HEAD_DIM,
-                                ]
-                else:
-                    for g_dr in pl.range(GATHER_RUN_TILE):
-                        g_row = g_sr0 + g_dr
-                        if g_row < g_first_len:
-                            g_slot_i32 = pl.read(window_swa_indices, [g_t0, g_row])
-                            if g_slot_i32 >= 0:
-                                g_slot = pl.cast(g_slot_i32, pl.INDEX)
-                                g_dst = g_base + g_row
-                                raw_kv[
-                                    g_dst : g_dst + 1,
-                                    0:HEAD_DIM,
-                                ] = ori_kv_flat[
-                                    g_slot : g_slot + 1,
-                                    0:HEAD_DIM,
-                                ]
+                            g_row = g_sr0 + g_dr
+                            if g_row < g_first_len:
+                                g_slot_i32 = pl.read(window_swa_indices, [g_t0, g_row])
+                                if g_slot_i32 >= 0:
+                                    g_slot = pl.cast(g_slot_i32, pl.INDEX)
+                                    g_dst = g_base + g_row
+                                    raw_kv[
+                                        g_dst : g_dst + 1,
+                                        0:HEAD_DIM,
+                                    ] = ori_kv_flat[
+                                        g_slot : g_slot + 1,
+                                        0:HEAD_DIM,
+                                    ]
 
-            for g_token in pl.unroll(S - 1):
-                g_t = g_t0 + g_token + 1
-                g_len = pl.read(window_swa_lens, [g_t])
-                g_slot_i32 = pl.read(window_swa_indices, [g_t, g_len - 1])
-                if g_slot_i32 >= 0:
-                    g_slot = pl.cast(g_slot_i32, pl.INDEX)
-                    g_dst = g_base + g_first_len + g_token
-                    raw_kv[
-                        g_dst : g_dst + 1,
-                        0:HEAD_DIM,
-                    ] = ori_kv_flat[
-                        g_slot : g_slot + 1,
-                        0:HEAD_DIM,
-                    ]
+                for g_token in pl.unroll(S - 1):
+                    g_t = g_t0 + g_token + 1
+                    g_len = pl.read(window_swa_lens, [g_t])
+                    g_slot_i32 = pl.read(window_swa_indices, [g_t, g_len - 1])
+                    if g_slot_i32 >= 0:
+                        g_slot = pl.cast(g_slot_i32, pl.INDEX)
+                        g_dst = g_base + g_first_len + g_token
+                        raw_kv[
+                            g_dst : g_dst + 1,
+                            0:HEAD_DIM,
+                        ] = ori_kv_flat[
+                            g_slot : g_slot + 1,
+                            0:HEAD_DIM,
+                        ]
 
         with pl.spmd(t_dim // VALID_TOKEN_TILE, name_hint="hca_raw_valid") as raw_valid_tid:
             valid_block = pl.tile.get_block_idx()
