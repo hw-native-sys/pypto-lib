@@ -328,7 +328,7 @@ jobs:
     # registered this job stays queued; the summary job does not depend on
     # it, so the existing daily report keeps producing and the A5 table
     # fills in once it runs.
-    runs-on: [self-hosted, linux, arm64, npu-a5]
+    runs-on: [self-hosted, linux, npu-a5]
     # Pro is roughly half the a2a3 sweep (no qwen3 / v3_2 / Flash), so
     # 120 min is generous; keep parity with the other device job's ceiling.
     timeout-minutes: 120
@@ -515,7 +515,7 @@ jobs:
     # 128-row capacity while active rows follow the encoded prompt length. It is the only
     # nightly that exercises the full prompt -> tokens -> text path on real
     # weights; model-tests-a5 covers the operators one by one on synthetic data.
-    runs-on: [self-hosted, linux, arm64, npu-a5]
+    runs-on: [self-hosted, linux, npu-a5]
     # Compile (~5 min) + resident weight upload (~8 min for 335 GB of INT8 shards)
     # + 33 forward passes fit in ~15 min once the cards are lent; the ceiling
     # must still cover job setup (~25 min on a cold ccache) plus task-submit's
