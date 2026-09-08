@@ -31,9 +31,9 @@ MOE_INTER = M.moe_intermediate_size
 SWIGLU_LIMIT = M.swiglu_limit
 
 # tiling
-SH_M_TILE = 16
+SH_M_TILE = 64
 SH_ROW_PAD = 8
-SH_ROWS_PER_BLOCK = 2
+SH_ROWS_PER_BLOCK = 8
 T_PAD = ((T + SH_M_TILE - 1) // SH_M_TILE) * SH_M_TILE
 # Decode (T <= SH_M_TILE, single partial block) or prefill (T a multiple of
 # SH_M_TILE, fully valid blocks); a T that is neither would need a dynamic
@@ -44,14 +44,16 @@ SH_VALID_M = T if T < SH_M_TILE else SH_M_TILE
 N_MTILES = T_PAD // SH_M_TILE
 assert SH_VALID_M % SH_ROWS_PER_BLOCK == 0
 
-K_TILE = 512
+K_TILE = 1024
 INTER_K = 512
-MM_INTER_TILE = 256
+MM_INTER_TILE = 128
+SH_MM_BLOCKS = 6
 ACT_INTER_TILE = 1024
 D_OUT_TILE = 256
+W2_INNER = 2
 # h_tile_i8 stores use a whole number of a2a3 512-byte L2 cache lines.
 QUANT_TILE = 2048
-D_OUT_TILE_ACT = 512
+D_OUT_TILE_ACT = 128
 W2_ACT_INNER = 8
 
 
@@ -67,8 +69,7 @@ def expert_shared(
     shared_w2_scale: pl.Tensor[[D], pl.FP32],
     sh: pl.Tensor[[T, D], pl.BF16],
 ):
-    # One M-tile of SH_M_TILE rows per iteration (decode: 1 tile, T<=16 rows valid;
-    # prefill: T_PAD/SH_M_TILE fully-valid tiles).
+    # One M-tile of SH_M_TILE rows per iteration.
     for mt in pl.parallel(N_MTILES):
         ts0 = mt * SH_M_TILE
 
@@ -77,49 +78,51 @@ def expert_shared(
 
         # gate (w1) cube matmul -> INT32 GM accumulator.
         for nb_idx in pl.spmd(
-            MOE_INTER // MM_INTER_TILE,
+            SH_MM_BLOCKS,
             name_hint="sh_gate_mm",
             allow_early_resolve=True,
         ):
-            n0 = nb_idx * MM_INTER_TILE
-            gate_acc = pl.create_tensor([SH_M_TILE, MM_INTER_TILE], dtype=pl.INT32)
-            for k0 in pl.pipeline(0, D, K_TILE, stage=2):
-                xs_k = pl.slice(x_local_i8, [SH_M_TILE, K_TILE], [ts0, k0], valid_shape=[SH_VALID_M, K_TILE])
-                sw1_k = shared_w1[n0 : n0 + MM_INTER_TILE, k0 : k0 + K_TILE]
-                if k0 == 0:
-                    gate_acc = pl.matmul(xs_k, sw1_k, b_trans=True, out_dtype=pl.INT32)
-                else:
-                    gate_acc = pl.matmul_acc(gate_acc, xs_k, sw1_k, b_trans=True)
-            gate_i32[:, n0 : n0 + MM_INTER_TILE] = gate_acc
+            for ng in pl.range(nb_idx, MOE_INTER // MM_INTER_TILE, SH_MM_BLOCKS):
+                n0 = ng * MM_INTER_TILE
+                gate_acc = pl.create_tensor([SH_M_TILE, MM_INTER_TILE], dtype=pl.INT32)
+                for k0 in pl.pipeline(0, D, K_TILE, stage=2):
+                    xs_k = pl.slice(x_local_i8, [SH_M_TILE, K_TILE], [ts0, k0], valid_shape=[SH_VALID_M, K_TILE])
+                    sw1_k = shared_w1[n0 : n0 + MM_INTER_TILE, k0 : k0 + K_TILE]
+                    if k0 == 0:
+                        gate_acc = pl.matmul(xs_k, sw1_k, b_trans=True, out_dtype=pl.INT32)
+                    else:
+                        gate_acc = pl.matmul_acc(gate_acc, xs_k, sw1_k, b_trans=True)
+                gate_i32[:, n0 : n0 + MM_INTER_TILE] = gate_acc
 
         # up (w3) cube matmul -> INT32 GM accumulator.
         for nb_idx in pl.spmd(
-            MOE_INTER // MM_INTER_TILE,
+            SH_MM_BLOCKS,
             name_hint="sh_up_mm",
             allow_early_resolve=True,
         ):
-            n0 = nb_idx * MM_INTER_TILE
-            up_acc = pl.create_tensor([SH_M_TILE, MM_INTER_TILE], dtype=pl.INT32)
-            for k0 in pl.pipeline(0, D, K_TILE, stage=2):
-                xs_k = pl.slice(x_local_i8, [SH_M_TILE, K_TILE], [ts0, k0], valid_shape=[SH_VALID_M, K_TILE])
-                sw3_k = shared_w3[n0 : n0 + MM_INTER_TILE, k0 : k0 + K_TILE]
-                if k0 == 0:
-                    up_acc = pl.matmul(xs_k, sw3_k, b_trans=True, out_dtype=pl.INT32)
-                else:
-                    up_acc = pl.matmul_acc(up_acc, xs_k, sw3_k, b_trans=True)
-            up_i32[:, n0 : n0 + MM_INTER_TILE] = up_acc
+            for ng in pl.range(nb_idx, MOE_INTER // MM_INTER_TILE, SH_MM_BLOCKS):
+                n0 = ng * MM_INTER_TILE
+                up_acc = pl.create_tensor([SH_M_TILE, MM_INTER_TILE], dtype=pl.INT32)
+                for k0 in pl.pipeline(0, D, K_TILE, stage=2):
+                    xs_k = pl.slice(x_local_i8, [SH_M_TILE, K_TILE], [ts0, k0], valid_shape=[SH_VALID_M, K_TILE])
+                    sw3_k = shared_w3[n0 : n0 + MM_INTER_TILE, k0 : k0 + K_TILE]
+                    if k0 == 0:
+                        up_acc = pl.matmul(xs_k, sw3_k, b_trans=True, out_dtype=pl.INT32)
+                    else:
+                        up_acc = pl.matmul_acc(up_acc, xs_k, sw3_k, b_trans=True)
+                up_i32[:, n0 : n0 + MM_INTER_TILE] = up_acc
 
-        # Each AIV block owns two rows across the full intermediate axis (four
-        # blocks for the decode shape). Activation, row-amax, scale, and requant
-        # stay in one task so this stage can start alongside dispatch_push.
+        # Each AIV block owns SH_ROWS_PER_BLOCK rows across the intermediate axis.
+        # Activation, row-amax, scale, and requant share one task.
         h_tile_fp32 = pl.create_tensor([SH_M_TILE, MOE_INTER], dtype=pl.FP32)
         h_tile_i8 = pl.create_tensor([SH_M_TILE, MOE_INTER], dtype=pl.INT8)
         h_tile_scale_dq = pl.create_tensor(
             [SH_M_TILE, SH_ROW_PAD], dtype=pl.FP32, manual_dep=True
         )
-        with pl.at(level=pl.Level.CORE_GROUP, name_hint="sh_h_tile_i8_init"):
-            h_tile_i8[:, :] = pl.cast(
-                pl.full([SH_M_TILE, MOE_INTER], dtype=pl.FP16, value=0.0),
+        for init_block in pl.spmd(SH_M_TILE // 16, name_hint="sh_h_tile_i8_init"):
+            init_row = init_block * 16
+            h_tile_i8[init_row : init_row + 16, :] = pl.cast(
+                pl.full([16, MOE_INTER], dtype=pl.FP16, value=0.0),
                 target_type=pl.INT8,
                 mode="trunc",
             )
@@ -231,22 +234,23 @@ def expert_shared(
         # w2 (down) cube matmul -> INT32 GM accumulator.
         y_i32 = pl.create_tensor([SH_M_TILE, D], dtype=pl.INT32)
         for db_idx in pl.spmd(
-            D // D_OUT_TILE,
+            D // (W2_INNER * D_OUT_TILE),
             name_hint="sh_w2_mm",
         ):
-            d0 = db_idx * D_OUT_TILE
-            y_acc = pl.create_tensor([SH_M_TILE, D_OUT_TILE], dtype=pl.INT32)
-            for k0 in pl.pipeline(0, MOE_INTER, INTER_K, stage=2):
-                hs_k = h_tile_i8[:, k0 : k0 + INTER_K]
-                sw2_k = shared_w2[
-                    d0 : d0 + D_OUT_TILE, k0 : k0 + INTER_K
-                ]
-                if k0 == 0:
-                    y_acc = pl.matmul(hs_k, sw2_k, b_trans=True, out_dtype=pl.INT32)
-                else:
-                    y_acc = pl.matmul_acc(y_acc, hs_k, sw2_k, b_trans=True)
-            y_i32[:, d0 : d0 + D_OUT_TILE] = y_acc
-
+            d_base = db_idx * (W2_INNER * D_OUT_TILE)
+            for dg in pl.range(W2_INNER):
+                d0 = d_base + dg * D_OUT_TILE
+                y_acc = pl.create_tensor([SH_M_TILE, D_OUT_TILE], dtype=pl.INT32)
+                for k0 in pl.pipeline(0, MOE_INTER, INTER_K, stage=2):
+                    hs_k = h_tile_i8[:, k0 : k0 + INTER_K]
+                    sw2_k = shared_w2[
+                        d0 : d0 + D_OUT_TILE, k0 : k0 + INTER_K
+                    ]
+                    if k0 == 0:
+                        y_acc = pl.matmul(hs_k, sw2_k, b_trans=True, out_dtype=pl.INT32)
+                    else:
+                        y_acc = pl.matmul_acc(y_acc, hs_k, sw2_k, b_trans=True)
+                y_i32[:, d0 : d0 + D_OUT_TILE] = y_acc
         # Dequant w2 output (per-row h scale x per-channel w2 scale) -> BF16.
         for db_idx in pl.spmd(
             D // (W2_ACT_INNER * D_OUT_TILE_ACT),
@@ -402,12 +406,16 @@ if __name__ == "__main__":
     parser.add_argument("-d", "--device", type=int, default=0)
     parser.add_argument("--enable-chip-swimlane", action="store_true", default=False)
     parser.add_argument("--dump-passes", action="store_true", default=False)
+    parser.add_argument("--save-data", action="store_true", default=False)
+    parser.add_argument("--golden-data", type=str, default=None)
     args = parser.parse_args()
 
     result = run(
         fn=expert_shared_test,
         specs=build_tensor_specs(),
         golden_fn=golden_expert_shared,
+        save_data=args.save_data,
+        golden_data=args.golden_data,
         config=dict(
             dump_passes=args.dump_passes,
             platform=args.platform,

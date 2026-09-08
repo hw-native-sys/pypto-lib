@@ -31,19 +31,19 @@ SWIGLU_LIMIT = M.swiglu_limit
 N_LOCAL_EXPERTS = M.n_routed_experts // EP
 
 # tiling
-RECV_TILE = 16
+RECV_TILE = 64
 K_TILE = 512
 INTER_K = 512
 MM_INTER_TILE = 256
 MM_GATE_INNER = 4
-ACT_INTER_TILE = 128
+ACT_INTER_TILE = 64
 ACT_GATE_INNER = 4
 D_OUT_TILE = 256
-# h_tile_i8 store innermost = QUANT_TILE bytes (int8); 512 hits the a2a3 L2 cache
-# line (perf_hint PH001 flagged the prior 256B store as sub-line).
 QUANT_TILE = 512
-D_OUT_TILE_ACT = 512
-W2_INNER = 4
+QUANT_ROW_TILE = 16
+QUANT_SCALE_PAD = 8
+D_OUT_TILE_ACT = 256
+W2_INNER = 1
 W2_ACT_INNER = 8
 TILES_PER_EXPERT = RECV_MAX // RECV_TILE
 
@@ -73,7 +73,7 @@ def expert_routed(
         # per-row dequant scale occupy about 64 MiB instead.
         h_i8 = pl.create_tensor([N_LOCAL_EXPERTS * RECV_MAX, MOE_INTER], dtype=pl.INT8)
         h_scale_dq = pl.create_tensor(
-            [N_LOCAL_EXPERTS * RECV_MAX, 1], dtype=pl.FP32, manual_dep=True
+            [N_LOCAL_EXPERTS * RECV_MAX, QUANT_SCALE_PAD], dtype=pl.FP32, manual_dep=True
         )
 
         # Produce one gate/up row tile at a time, immediately activate and quantize
@@ -177,25 +177,29 @@ def expert_routed(
 
                     h_tile_i8 = h_i8[flat_t0 : flat_t0 + RECV_TILE]
                     h_tile_scale_dq = h_scale_dq[flat_t0 : flat_t0 + RECV_TILE]
-                    with pl.at(level=pl.Level.CORE_GROUP, name_hint="exp_h_q"):
-                        eh_amax = pl.full([1, RECV_TILE], dtype=pl.FP32, value=INT8_AMAX_EPS)
+                    for q_block in pl.spmd(RECV_TILE // QUANT_ROW_TILE, name_hint="exp_h_q"):
+                        q_row = q_block * QUANT_ROW_TILE
+                        eh_amax = pl.full([1, QUANT_ROW_TILE], dtype=pl.FP32, value=INT8_AMAX_EPS)
                         for k0 in pl.pipeline(0, MOE_INTER, QUANT_TILE, stage=2):
-                            eh_a_f32 = h_tile_fp32[:, k0 : k0 + QUANT_TILE]
+                            eh_a_f32 = h_tile_fp32[q_row : q_row + QUANT_ROW_TILE, k0 : k0 + QUANT_TILE]
                             eh_a_abs = pl.maximum(eh_a_f32, pl.neg(eh_a_f32))
-                            eh_a_max = pl.reshape(pl.row_max(eh_a_abs), [1, RECV_TILE])
+                            eh_a_max = pl.reshape(pl.row_max(eh_a_abs), [1, QUANT_ROW_TILE])
                             eh_amax = pl.maximum(eh_amax, eh_a_max)
                         eh_sq_row = pl.div(
-                            pl.full([1, RECV_TILE], dtype=pl.FP32, value=INT8_SCALE_MAX),
+                            pl.full([1, QUANT_ROW_TILE], dtype=pl.FP32, value=INT8_SCALE_MAX),
                             eh_amax,
                         )
-                        h_tile_scale_dq[:, :] = pl.reshape(pl.recip(eh_sq_row), [RECV_TILE, 1])
-                        eh_sq_col = pl.reshape(eh_sq_row, [RECV_TILE, 1])
+                        eh_sd_col = pl.reshape(pl.recip(eh_sq_row), [QUANT_ROW_TILE, 1])
+                        eh_sd_zeros = pl.full([QUANT_ROW_TILE, QUANT_SCALE_PAD], dtype=pl.FP32, value=0.0)
+                        eh_sd_pad = pl.row_expand(eh_sd_zeros, eh_sd_col)
+                        h_tile_scale_dq[q_row : q_row + QUANT_ROW_TILE, :] = eh_sd_pad
+                        eh_sq_col = pl.reshape(eh_sq_row, [QUANT_ROW_TILE, 1])
                         for k1 in pl.pipeline(0, MOE_INTER, QUANT_TILE, stage=2):
-                            eh_q_f32 = h_tile_fp32[:, k1 : k1 + QUANT_TILE]
+                            eh_q_f32 = h_tile_fp32[q_row : q_row + QUANT_ROW_TILE, k1 : k1 + QUANT_TILE]
                             eh_q_scaled = pl.row_expand_mul(eh_q_f32, eh_sq_col)
                             eh_q_i32 = pl.cast(eh_q_scaled, target_type=pl.INT32, mode="rint")
                             eh_q_half = pl.cast(eh_q_i32, target_type=pl.FP16, mode="round")
-                            h_tile_i8[:, k1 : k1 + QUANT_TILE] = pl.cast(
+                            h_tile_i8[q_row : q_row + QUANT_ROW_TILE, k1 : k1 + QUANT_TILE] = pl.cast(
                                 eh_q_half, target_type=pl.INT8, mode="trunc"
                             )
 
@@ -244,7 +248,8 @@ def expert_routed(
                             recv_weights[local_e : local_e + 1, tt0 : tt0 + RECV_TILE],
                             [RECV_TILE, 1],
                         )
-                        row_scale_blk = pl.mul(h_tile_scale_dq, w_col_blk)
+                        h_row_scale = pl.row_max(h_tile_scale_dq)
+                        row_scale_blk = pl.mul(h_row_scale, w_col_blk)
                         for dg in pl.pipeline(W2_ACT_INNER, stage=2):
                             act_d0 = act_d_base + dg * D_OUT_TILE_ACT
                             y_2d_i32 = y_i32[:, act_d0 : act_d0 + D_OUT_TILE_ACT]

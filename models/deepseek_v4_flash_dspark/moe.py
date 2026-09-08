@@ -83,6 +83,7 @@ IDX_PAD = 8  # INT32 route tile width; route rides a separate window from scale/
 
 # tiling
 PREFILL_INPUT_ID_TILE = 4
+COMBINE_TOKEN_TILE = 4
 
 assert N_RANKS in _EP_CHOICES, f"--ep must be one of {_EP_CHOICES} (got {N_RANKS})"
 assert N_EXPERTS_GLOBAL == N_RANKS * N_LOCAL
@@ -254,9 +255,11 @@ def dispatch(
         # Pad tiles zeroed once; used cols overwritten per push, then remote_store.
         aux_tile = pl.tile.full([1, AUX_PAD], dtype=pl.FP32, value=0.0)
         route_tile = pl.tile.full([1, IDX_PAD], dtype=pl.INT32, value=0)
+        indices_tile = pl.tile.load(indices, [0, 0], [T, IDX_PAD], valid_shape=[T, TOPK])
+        weights_tile = pl.tile.load(weights, [0, 0], [T, AUX_PAD], valid_shape=[T, TOPK])
         for t in pl.range(active_tokens):
             for k in pl.range(TOPK):
-                eid = pl.read(indices, [t, k])
+                eid = pl.tile.read(indices_tile, [t, k])
                 dst = eid // N_LOCAL
                 le = eid - dst * N_LOCAL
                 if le == loc_e:
@@ -273,7 +276,7 @@ def dispatch(
                         shape=[1, D],
                     )
                     pl.tile.write(aux_tile, [0, AUX_SCALE], pl.read(x_norm_scale, [t, 0]))
-                    pl.tile.write(aux_tile, [0, AUX_W], pl.read(weights, [t, k]))
+                    pl.tile.write(aux_tile, [0, AUX_W], pl.tile.read(weights_tile, [t, k]))
                     pld.tile.remote_store(aux_tile, target=recv_aux, peer=dst, offsets=[row, 0])
                     pl.tile.write(route_tile, [0, 0], pl.cast(t * TOPK + k, pl.INT32))
                     pld.tile.remote_store(route_tile, target=recv_route, peer=dst, offsets=[row, 0])
@@ -414,20 +417,17 @@ def combine(
         active_tokens = pl.cast(0, pl.INDEX)
     if active_tokens > T:
         active_tokens = pl.cast(T, pl.INDEX)
-    with pl.spmd(
-        T,
-        name_hint="shared_routed",
-        deps=[_cwait_tid],
-    ) as _reduce_tid:
-        t = pl.tile.get_block_idx()
-        if t < active_tokens:
-            acc = pl.cast(sh[t:t + 1, :], target_type=pl.FP32)
-            for k in pl.range(TOPK):
-                r = t * TOPK + k
-                acc = pl.add(acc, pl.cast(routed_y_buf[r:r + 1, :], target_type=pl.FP32))
-            ffn_out[t:t + 1, :] = pl.cast(acc, target_type=pl.BF16, mode="rint")
-        else:
-            ffn_out[t:t + 1, :] = sh[t:t + 1, :]
+    with pl.spmd(T // COMBINE_TOKEN_TILE, name_hint="shared_routed", deps=[_cwait_tid]) as _reduce_tid:
+        t0 = pl.tile.get_block_idx() * COMBINE_TOKEN_TILE
+        for t in pl.range(t0, t0 + COMBINE_TOKEN_TILE):
+            if t < active_tokens:
+                acc = pl.cast(sh[t:t + 1, :], target_type=pl.FP32)
+                for k in pl.range(TOPK):
+                    r = t * TOPK + k
+                    acc = pl.add(acc, pl.cast(routed_y_buf[r:r + 1, :], target_type=pl.FP32))
+                ffn_out[t:t + 1, :] = pl.cast(acc, target_type=pl.BF16, mode="rint")
+            else:
+                ffn_out[t:t + 1, :] = sh[t:t + 1, :]
     return _reduce_tid
 
 
