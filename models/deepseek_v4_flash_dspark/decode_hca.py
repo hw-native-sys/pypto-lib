@@ -278,14 +278,24 @@ def decode_hca(
     with pl.spmd(kv_wb_blocks, name_hint="hca_cache_writeback", deps=[kv_gather_done_tid]) as ori_cache_write_tid:
         wb_blk = pl.tile.get_block_idx()
         wb_t0 = wb_blk * HCA_WB_TOKEN_TILE
-        for write_dt in pl.range(HCA_WB_TOKEN_TILE):
-            write_t = wb_t0 + write_dt
-            write_row_i64 = pl.read(ori_slot_mapping, [write_t])
-            if write_row_i64 >= 0:
-                write_row = pl.cast(write_row_i64, pl.INDEX)
-                kv_cache_flat[write_row : write_row + 1, 0 : HEAD_DIM] = (
-                    kv_full[write_t : write_t + 1, 0 : HEAD_DIM]
-                )
+        wb_first_i64 = pl.read(ori_slot_mapping, [wb_t0])
+        wb_contiguous = pl.cast(wb_first_i64 >= 0, pl.INT32)
+        for wb_dt in pl.unroll(1, HCA_WB_TOKEN_TILE):
+            wb_slot_i64 = pl.read(ori_slot_mapping, [wb_t0 + wb_dt])
+            wb_slot_matches = pl.cast(wb_slot_i64 == wb_first_i64 + wb_dt, pl.INT32)
+            wb_contiguous = wb_contiguous * wb_slot_matches
+        if wb_contiguous != 0:
+            wb_first = pl.cast(wb_first_i64, pl.INDEX)
+            wb_values = kv_full[wb_t0 : wb_t0 + HCA_WB_TOKEN_TILE, 0 : HEAD_DIM]
+            kv_cache_flat[wb_first : wb_first + HCA_WB_TOKEN_TILE, 0 : HEAD_DIM] = wb_values
+        else:
+            for write_dt in pl.range(HCA_WB_TOKEN_TILE):
+                write_t = wb_t0 + write_dt
+                write_row_i64 = pl.read(ori_slot_mapping, [write_t])
+                if write_row_i64 >= 0:
+                    write_row = pl.cast(write_row_i64, pl.INDEX)
+                    write_values = kv_full[write_t : write_t + 1, 0 : HEAD_DIM]
+                    kv_cache_flat[write_row : write_row + 1, 0 : HEAD_DIM] = write_values
 
     # Hand the compressor scalar-extent views: its token and request axes bind to
     # one row count per call, and mixing them with the gathered stream's symbols
