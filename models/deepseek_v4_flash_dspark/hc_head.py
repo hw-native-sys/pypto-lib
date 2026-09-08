@@ -41,14 +41,24 @@ HC_DIM_INV = 1.0 / HC_DIM
 # tiling
 HC_PAD = 16
 HC_VPAD = 8
-T_TILE = 8
+T_TILE = 16
 LINEAR_T_TILE = 16
-RMS_K_TILE = 512
+RMS_T_TILE = 64
+RMS_K_TILE = 256
 LINEAR_K_TILE = 256
-D_TILE = 512
-D_SPMD = 512
-LINEAR_OK = 16
-RMS_OK = 16
+D_TILE = 256
+# The vector array is 48 cores wide. RMS_T_TILE and D_SPMD are sized so the rms
+# and reduce fan-outs land at 48 tasks for a decode-forward tail (3 target layers
+# x MOE_TOKENS rows) instead of queueing four waves of short ones.
+D_SPMD = 2048
+# The same tail hands the cube one row block per 16 rows, which already fills the
+# cube array: splitting K again only adds tasks and atomic traffic. RMS_OK stops
+# at 8 because a narrower sq_part column falls under the 32 B reduction floor.
+LINEAR_OK = 1
+RMS_OK = 8
+# Rows every stage pads its row count to, so the taller rms tile still lands
+# inside the shared sq_part / mixes_raw slabs.
+ROW_ALIGN = max(T_TILE, LINEAR_T_TILE, RMS_T_TILE)
 
 
 @pl.jit.inline
@@ -61,33 +71,36 @@ def hc_head(
 ):
     t_dim = pl.tensor.dim(x_hc, 0)
     token_tiles = (t_dim + T_TILE - 1) // T_TILE
+    rms_tiles = (t_dim + RMS_T_TILE - 1) // RMS_T_TILE
     linear_full_rows = (t_dim // LINEAR_T_TILE) * LINEAR_T_TILE
-    t_linear = ((t_dim + LINEAR_T_TILE - 1) // LINEAR_T_TILE) * LINEAR_T_TILE
+    t_linear = ((t_dim + ROW_ALIGN - 1) // ROW_ALIGN) * ROW_ALIGN
     x_flat = pl.reshape(x_hc, [t_dim, HC_DIM])
     y_flat = pl.reshape(y, [t_dim, D])
-    # rms: split-K sum-of-squares, fanned over (token-tile x K-slice)
+    # rms: split-K sum-of-squares, fanned over (rms-tile x K-slice). RMS_T_TILE is
+    # taller than the gate's T_TILE so the fan-out stays inside the vector array
+    # instead of queueing several waves of short tasks.
     sq_part = pl.create_tensor([RMS_OK, t_linear], dtype=pl.FP32)
-    for task in pl.spmd(token_tiles * RMS_OK, name_hint="hc_head_rms"):
-        t0 = (task // RMS_OK) * T_TILE
+    for task in pl.spmd(rms_tiles * RMS_OK, name_hint="hc_head_rms"):
+        t0 = (task // RMS_OK) * RMS_T_TILE
         ok = task % RMS_OK
         k_base = ok * (HC_DIM // RMS_OK)
-        valid_rows = pl.min(T_TILE, t_dim - t0)
-        sq_sum = pl.full([1, T_TILE], dtype=pl.FP32, value=0.0)
+        valid_rows = pl.min(RMS_T_TILE, t_dim - t0)
+        sq_sum = pl.full([1, RMS_T_TILE], dtype=pl.FP32, value=0.0)
         for kb in pl.pipeline(HC_DIM // RMS_OK // RMS_K_TILE, stage=4):
             k0 = k_base + kb * RMS_K_TILE
-            if valid_rows == T_TILE:
-                x_rms_full = x_flat[t0 : t0 + T_TILE, k0 : k0 + RMS_K_TILE]
+            if valid_rows == RMS_T_TILE:
+                x_rms_full = x_flat[t0 : t0 + RMS_T_TILE, k0 : k0 + RMS_K_TILE]
                 sq_col_full = pl.row_sum(pl.mul(x_rms_full, x_rms_full))
-                sq_sum = pl.add(sq_sum, pl.reshape(sq_col_full, [1, T_TILE]))
+                sq_sum = pl.add(sq_sum, pl.reshape(sq_col_full, [1, RMS_T_TILE]))
             else:
                 x_rms_tail = pl.slice(
                     x_flat,
-                    [T_TILE, RMS_K_TILE],
+                    [RMS_T_TILE, RMS_K_TILE],
                     [t0, k0],
                     valid_shape=[valid_rows, RMS_K_TILE],
                 )
                 sq_col_tail = pl.row_sum(pl.mul(x_rms_tail, x_rms_tail))
-                sq_sum = pl.add(sq_sum, pl.reshape(sq_col_tail, [1, T_TILE]))
+                sq_sum = pl.add(sq_sum, pl.reshape(sq_col_tail, [1, RMS_T_TILE]))
         sq_part = pl.assemble(sq_part, sq_sum, [ok, t0])
 
     # linear: split-K head projection, fanned over (row-block x K-slice); each task

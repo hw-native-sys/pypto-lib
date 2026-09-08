@@ -586,7 +586,7 @@ def l2_distributed_markov_sample(
     confidence_probs: pl.Out[pl.Tensor[[B_DYN, DSPARK_QUERY_WIDTH], pl.FP32]],
     hidden_window: pld.DistributedTensor[[GROUP_LOGIT_ROWS, D], pl.BF16],
     hidden_done: pld.DistributedTensor[[TP_SIZE, 1], pl.INT32],
-    logits_window: pld.DistributedTensor[[MAX_LOGIT_ROWS * VOCAB], pl.FP32],
+    logits_window: pld.DistributedTensor[[MAX_LOGIT_ROWS, VOCAB], pl.FP32],
     logits_done: pld.DistributedTensor[[TP_SIZE, 1], pl.INT32],
     group_base: pl.Scalar[pl.INT32],
     tp_rank: pl.Scalar[pl.INT32],
@@ -673,7 +673,7 @@ def l3_distributed_markov_sample(
         )
         logits_window = pld.window(
             logits_window_buf,
-            [MAX_LOGIT_ROWS * VOCAB],
+            [MAX_LOGIT_ROWS, VOCAB],
             dtype=pl.FP32,
         )
         hidden_done = pld.window(hidden_done_buf, [TP_SIZE, 1], dtype=pl.INT32)

@@ -95,7 +95,6 @@ FWD_CSA_IDX_BLOCKS_DYN = pl.dynamic("FWD_CSA_IDX_BLOCKS_DYN")
 
 # model config
 MODEL_CONFIG = config.FLASH
-DECODE_TOKENS = config.DECODE_TOKENS
 MAIN_LAYER_COUNT = MODEL_CONFIG.num_hidden_layers
 SWA_LAYER_COUNT = 2
 CSA_LAYER_COUNT = 21
@@ -188,10 +187,8 @@ def _validate_import_contract():
         raise ValueError(f"LM-head TP={LM_HEAD_TP_SIZE} does not match forward TP={TP_SIZE}")
     if LM_HEAD_VOCAB != MODEL_CONFIG.vocab_size:
         raise ValueError(f"LM-head vocab={LM_HEAD_VOCAB} does not match model vocab={MODEL_CONFIG.vocab_size}")
-    if MAX_LOGIT_ROWS != DECODE_TOKENS:
-        raise ValueError(f"LM-head rows={MAX_LOGIT_ROWS} do not match decode capacity={DECODE_TOKENS}")
-    if MOE_TOKENS > MAX_LOGIT_ROWS:
-        raise ValueError(f"MoE capacity {MOE_TOKENS} exceeds LM-head rows {MAX_LOGIT_ROWS}")
+    if MAX_LOGIT_ROWS != MOE_TOKENS:
+        raise ValueError(f"LM-head rows={MAX_LOGIT_ROWS} do not match owner capacity={MOE_TOKENS}")
 
 
 _validate_import_contract()
@@ -288,18 +285,6 @@ def decode_embedding_preamble(
             zero_hc_row = pl.full([1, HC_MULT, D], dtype=pl.FP32, value=0.0)
             x_hc[token : token + 1, 0 : HC_MULT, 0 : D] = zero_hc_row
     return x_hc
-
-
-@pl.jit.inline
-def mask_inactive_sample_rows(
-    logit_row_indices: pl.Tensor[[MAX_LOGIT_ROWS], pl.INT32],
-    sampled_ids: pl.Tensor[[MAX_LOGIT_ROWS, SAMPLED_IDS_PAD], pl.INT32],
-):
-    """Make inactive terminal rows observable as -1 after greedy sampling."""
-    for row in pl.spmd(MAX_LOGIT_ROWS, name_hint="decode_fwd_sample_mask"):
-        if pl.read(logit_row_indices, [row]) < 0:
-            sampled_ids[row:row + 1, :] = pl.full([1, SAMPLED_IDS_PAD], dtype=pl.INT32, value=-1)
-    return sampled_ids
 
 
 @pl.jit(auto_scope=False)
@@ -429,7 +414,7 @@ def decode_fwd(
     combine_arrived: pld.DistributedTensor[[N_RANKS, 1], pl.INT32],
     lm_head_hidden_window: pld.DistributedTensor[[GROUP_LOGIT_ROWS, D], pl.BF16],
     lm_head_hidden_done: pld.DistributedTensor[[LM_HEAD_TP_SIZE, 1], pl.INT32],
-    lm_head_logits_window: pld.DistributedTensor[[MAX_LOGIT_ROWS * LM_HEAD_VOCAB], pl.FP32],
+    lm_head_logits_window: pld.DistributedTensor[[MAX_LOGIT_ROWS, LM_HEAD_VOCAB], pl.FP32],
     lm_head_logits_done: pld.DistributedTensor[[LM_HEAD_TP_SIZE, 1], pl.INT32],
     group_base: pl.Scalar[pl.INT32],
     tp_rank: pl.Scalar[pl.INT32],
@@ -1189,8 +1174,7 @@ def decode_fwd(
                 pl.const(LM_HEAD_COMM_EPOCH, pl.INT32),
                 final_norm_tid,
             )
-            greedy_sample(logits, sampled_ids)
-            mask_inactive_sample_rows(logit_row_indices, sampled_ids)
+            greedy_sample(logits, logit_row_indices, sampled_ids)
         else:
             for row in pl.spmd(MAX_LOGIT_ROWS, name_hint="decode_fwd_inactive_sample_rows"):
                 for col in pl.range(LM_HEAD_VOCAB // LOGITS_ZERO_TILE):
@@ -1384,7 +1368,7 @@ def l3_decode_fwd(
     combine_arrived_buf = pld.alloc_window_buffer([N_RANKS, 1], dtype=pl.INT32)
     lm_head_hidden_window_buf = pld.alloc_window_buffer([GROUP_LOGIT_ROWS, D], dtype=pl.BF16)
     lm_head_hidden_done_buf = pld.alloc_window_buffer([LM_HEAD_TP_SIZE, 1], dtype=pl.INT32)
-    lm_head_logits_window_buf = pld.alloc_window_buffer([MAX_LOGIT_ROWS * LM_HEAD_VOCAB], dtype=pl.FP32)
+    lm_head_logits_window_buf = pld.alloc_window_buffer([MAX_LOGIT_ROWS, LM_HEAD_VOCAB], dtype=pl.FP32)
     lm_head_logits_done_buf = pld.alloc_window_buffer([LM_HEAD_TP_SIZE, 1], dtype=pl.INT32)
 
     for rank in pl.range(pld.world_size()):
@@ -1404,7 +1388,7 @@ def l3_decode_fwd(
         combine_arrived = pld.window(combine_arrived_buf, [N_RANKS, 1], dtype=pl.INT32)
         lm_head_hidden_window = pld.window(lm_head_hidden_window_buf, [GROUP_LOGIT_ROWS, D], dtype=pl.BF16)
         lm_head_hidden_done = pld.window(lm_head_hidden_done_buf, [LM_HEAD_TP_SIZE, 1], dtype=pl.INT32)
-        lm_head_logits_window = pld.window(lm_head_logits_window_buf, [MAX_LOGIT_ROWS * LM_HEAD_VOCAB], dtype=pl.FP32)
+        lm_head_logits_window = pld.window(lm_head_logits_window_buf, [MAX_LOGIT_ROWS, LM_HEAD_VOCAB], dtype=pl.FP32)
         lm_head_logits_done = pld.window(lm_head_logits_done_buf, [LM_HEAD_TP_SIZE, 1], dtype=pl.INT32)
         tp_rank = rank % TP_SIZE
         group_base = rank - tp_rank
@@ -2036,6 +2020,7 @@ def main():
         choices=("full_active", "packed_pool_sentinel", "long_context_tail"),
     )
     parser.add_argument("--enable-scope-stats", action="store_true", default=False)
+    parser.add_argument("--enable-chip-swimlane", type=int, default=0, choices=range(5))
     parser.add_argument("--runtime-dir", type=str, default=None)
     parser.add_argument("--save-data", action="store_true", default=False)
     parser.add_argument("--dump-passes", action="store_true", default=False)
@@ -2082,6 +2067,7 @@ def main():
             ),
             platform=args.platform,
             enable_scope_stats=args.enable_scope_stats,
+            enable_chip_swimlane=args.enable_chip_swimlane,
             log_level=args.log_level,
             ring_heap=DECODE_RING_HEAP,
         ),
