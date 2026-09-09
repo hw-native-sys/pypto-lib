@@ -80,7 +80,6 @@ from decode_o_proj import (
 from decode_sparse_attn_hca import (
     ATTENTION_PUBLISH_T_TILE,
     ATTENTION_PUBLISH_WORKERS,
-    CMP_PAGES_PER_WORK,
     H_TILE,
     HCA_MAX_COMPRESSED_ROWS,
     NOPE_DIM,
@@ -322,13 +321,11 @@ def decode_hca(
             q, kv_cache, window_swa_indices, window_swa_lens,
             cmp_kv, cmp_block_table,
             position_ids_local, kv_seq_lens,
-            freqs_cos, freqs_sin,
+            attn_sink, freqs_cos, freqs_sin,
             ori_cache_write_tid, cmp_cache_write_tid,
         )
 
         attn_sink_col = pl.reshape(attn_sink, [H, 1])
-        cmp_table_blocks = pl.tensor.dim(cmp_block_table, 1)
-        cmp_work_count = (cmp_table_blocks + CMP_PAGES_PER_WORK - 1) // CMP_PAGES_PER_WORK
         pack_work_count = (t_dim // ATTENTION_PUBLISH_T_TILE) * (H // H_TILE)
         with pl.spmd(
             ATTENTION_PUBLISH_WORKERS, name_hint="hca_stream_merge_pack_publish", deps=[raw_tid, cmp_tid, rope_tid],
@@ -373,31 +370,22 @@ def decode_hca(
                     stream_m = pl.load(stream_state_m, [merge_state_row, 0], [H_TILE, 1], target_memory=pl.MemorySpace.Vec)
                     stream_l = pl.load(stream_state_l, [merge_state_row, 0], [H_TILE, 1], target_memory=pl.MemorySpace.Vec)
                     stream_o = pl.load(stream_heads, [merge_state_row, 0], [H_TILE, HEAD_DIM], target_memory=pl.MemorySpace.Vec)
-                    stream_token_base = merge_t * (H // H_TILE) * cmp_work_count * H_TILE
-                    for stream_work in pl.range(cmp_work_count):
-                        stream_tile_base = stream_h_tile * cmp_work_count * H_TILE
-                        stream_partial_row = stream_token_base + stream_tile_base + stream_work * H_TILE
-                        stream_cmp_m_aligned = pl.load(
-                            cmp_partial_m, [stream_partial_row, 0], [H_TILE, 8], target_memory=pl.MemorySpace.Vec,
-                        )
-                        stream_cmp_l_aligned = pl.load(
-                            cmp_partial_l, [stream_partial_row, 0], [H_TILE, 8], target_memory=pl.MemorySpace.Vec,
-                        )
-                        stream_cmp_m = stream_cmp_m_aligned[0:H_TILE, 0:1]
-                        stream_cmp_l = stream_cmp_l_aligned[0:H_TILE, 0:1]
-                        stream_cmp_o = pl.load(
-                            cmp_partial_o, [stream_partial_row, 0], [H_TILE, HEAD_DIM], target_memory=pl.MemorySpace.Vec,
-                        )
-                        stream_m_new = pl.maximum(stream_m, stream_cmp_m)
-                        stream_alpha = pl.exp(pl.sub(stream_m, stream_m_new))
-                        stream_beta = pl.exp(pl.sub(stream_cmp_m, stream_m_new))
-                        stream_l_scaled = pl.mul(stream_alpha, stream_l)
-                        stream_cmp_l_scaled = pl.mul(stream_beta, stream_cmp_l)
-                        stream_l = pl.add(stream_l_scaled, stream_cmp_l_scaled)
-                        stream_o_scaled = pl.row_expand_mul(stream_o, stream_alpha)
-                        stream_cmp_o_scaled = pl.row_expand_mul(stream_cmp_o, stream_beta)
-                        stream_o = pl.add(stream_o_scaled, stream_cmp_o_scaled)
-                        stream_m = stream_m_new
+                    # Compressed QK/PV publishes one online-softmax state per query.
+                    stream_cmp_m = pl.load(cmp_partial_m, [merge_state_row, 0], [H_TILE, 1], target_memory=pl.MemorySpace.Vec)
+                    stream_cmp_l = pl.load(cmp_partial_l, [merge_state_row, 0], [H_TILE, 1], target_memory=pl.MemorySpace.Vec)
+                    stream_cmp_o = pl.load(
+                        cmp_partial_o, [merge_state_row, 0], [H_TILE, HEAD_DIM], target_memory=pl.MemorySpace.Vec,
+                    )
+                    stream_m_new = pl.maximum(stream_m, stream_cmp_m)
+                    stream_alpha = pl.exp(pl.sub(stream_m, stream_m_new))
+                    stream_beta = pl.exp(pl.sub(stream_cmp_m, stream_m_new))
+                    stream_l_scaled = pl.mul(stream_alpha, stream_l)
+                    stream_cmp_l_scaled = pl.mul(stream_beta, stream_cmp_l)
+                    stream_l = pl.add(stream_l_scaled, stream_cmp_l_scaled)
+                    stream_o_scaled = pl.row_expand_mul(stream_o, stream_alpha)
+                    stream_cmp_o_scaled = pl.row_expand_mul(stream_cmp_o, stream_beta)
+                    stream_o = pl.add(stream_o_scaled, stream_cmp_o_scaled)
+                    stream_m = stream_m_new
                     stream_sink_tile = pl.add(pl.sub(stream_m, stream_m), stream_sink)
                     stream_denom = pl.add(stream_l, pl.exp(pl.sub(stream_sink_tile, stream_m)))
                     stream_output = pl.row_expand_div(stream_o, stream_denom)
