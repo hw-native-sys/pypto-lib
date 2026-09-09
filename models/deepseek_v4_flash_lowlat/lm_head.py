@@ -21,7 +21,7 @@ import pypto.language.distributed as pld
 from pypto.ir.distributed_compiled_program import DistributedConfig
 
 from config import DECODE_TOKENS, FLASH as M, TP as CONFIG_TP
-from sample import golden_sample, sample
+from sample import SAMPLING_EPS, golden_sample, sample_from_greedy_partials
 
 
 T_DYN = pl.dynamic("LM_HEAD_T_DYN")
@@ -96,7 +96,7 @@ assert DP_SIZE in _DP_CHOICES, f"--dp must be one of {_DP_CHOICES} (got {DP_SIZE
 
 
 @pl.jit.inline(auto_scope=False)
-def lm_head(
+def _lm_head_with_greedy_partials(
     hidden_states: pl.Tensor,
     lm_head_weight: pl.Tensor[[VOCAB_PER_TP, D], pl.BF16],
     logit_row_indices: pl.Tensor[[MAX_LOGIT_ROWS], pl.INT32],
@@ -108,6 +108,8 @@ def lm_head(
     group_base: pl.Scalar[pl.INT32],
     tp_rank: pl.Scalar[pl.INT32],
     done_epoch: pl.Scalar[pl.INT32],
+    greedy_scores: pl.Tensor[[LOGITS_COMM_BLOCKS * MAX_LOGIT_ROWS, SAMPLED_IDS_PAD], pl.FP32],
+    greedy_indices: pl.Tensor[[LOGITS_COMM_BLOCKS * MAX_LOGIT_ROWS, SAMPLED_IDS_PAD], pl.INT32],
 ) -> pl.Tensor[[MAX_LOGIT_ROWS, VOCAB], pl.FP32]:
     # Scratch is allocated just outside the scope that first writes it: a
     # create_tensor inside a pl.at yields a tile, not a GM tensor view.
@@ -279,18 +281,48 @@ def lm_head(
         LOGITS_COMM_BLOCKS, name_hint="lm_head_combine_gather", allow_early_resolve=True, deps=[_cwait_tid]
     ) as _gather_tid:
         gblk = pl.tile.get_block_idx()
+        running_scores = pl.tile.full([MAX_LOGIT_ROWS, SAMPLED_IDS_PAD], dtype=pl.FP32, value=-3.4028234663852886e38)
+        running_indices = pl.tile.full([MAX_LOGIT_ROWS, SAMPLED_IDS_PAD], dtype=pl.INT32, value=1073741824)
         for src_tp in pl.range(TP_SIZE):
             src_vocab_base = src_tp * VOCAB_PER_TP
             for ob in pl.range(gblk, N_LOGITS_COMM_TILES, LOGITS_COMM_BLOCKS):
                 o0 = ob * LOGITS_COMM_TILE
                 lo = src_vocab_base + o0
-                logits[:, lo : lo + LOGITS_COMM_TILE] = logits_window[:, lo : lo + LOGITS_COMM_TILE]
+                scores = pl.load(logits_window, [0, lo], [MAX_LOGIT_ROWS, LOGITS_COMM_TILE])
+                pl.store(scores, [0, lo], logits)
+                reduce_tmp = pl.create_tile([MAX_LOGIT_ROWS, LOGITS_COMM_TILE], dtype=pl.FP32, target_memory=pl.MemorySpace.Vec)
+                tile_maxima = pl.row_max(scores, reduce_tmp)
+                tile_indices = pl.row_argmax(scores, reduce_tmp)
+                score_zeros = pl.tile.full([MAX_LOGIT_ROWS, SAMPLED_IDS_PAD], dtype=pl.FP32, value=0.0)
+                index_zeros = pl.tile.full([MAX_LOGIT_ROWS, SAMPLED_IDS_PAD], dtype=pl.INT32, value=0)
+                candidate_scores = pl.row_expand_add(score_zeros, tile_maxima)
+                candidate_indices = pl.add(pl.row_expand_add(index_zeros, tile_indices), pl.cast(lo, pl.INT32))
+                newer = pl.cmp(candidate_scores, running_scores, cmp_type=4)
+                select_tmp = pl.create_tile([MAX_LOGIT_ROWS, SAMPLED_IDS_PAD], dtype=pl.INT32, target_memory=pl.MemorySpace.Vec)
+                running_indices = pl.sel(newer, candidate_indices, running_indices, select_tmp)
+                running_scores = pl.maximum(running_scores, candidate_scores)
 
             if LOGITS_COMM_TAIL != 0:
                 if gblk == LOGITS_TAIL_BLOCK:
                     tail_o0 = N_LOGITS_COMM_TILES * LOGITS_COMM_TILE
                     tl = src_vocab_base + tail_o0
-                    logits[:, tl : tl + LOGITS_COMM_TAIL] = logits_window[:, tl : tl + LOGITS_COMM_TAIL]
+                    tail_scores = pl.load(logits_window, [0, tl], [MAX_LOGIT_ROWS, LOGITS_COMM_TAIL])
+                    pl.store(tail_scores, [0, tl], logits)
+                    tail_reduce_tmp = pl.create_tile([MAX_LOGIT_ROWS, LOGITS_COMM_TAIL], dtype=pl.FP32, target_memory=pl.MemorySpace.Vec)
+                    tail_tile_maxima = pl.row_max(tail_scores, tail_reduce_tmp)
+                    tail_tile_indices = pl.row_argmax(tail_scores, tail_reduce_tmp)
+                    tail_score_zeros = pl.tile.full([MAX_LOGIT_ROWS, SAMPLED_IDS_PAD], dtype=pl.FP32, value=0.0)
+                    tail_index_zeros = pl.tile.full([MAX_LOGIT_ROWS, SAMPLED_IDS_PAD], dtype=pl.INT32, value=0)
+                    tail_candidate_scores = pl.row_expand_add(tail_score_zeros, tail_tile_maxima)
+                    tail_candidate_indices = pl.add(pl.row_expand_add(tail_index_zeros, tail_tile_indices), pl.cast(tl, pl.INT32))
+                    tail_newer = pl.cmp(tail_candidate_scores, running_scores, cmp_type=4)
+                    tail_select_tmp = pl.create_tile([MAX_LOGIT_ROWS, SAMPLED_IDS_PAD], dtype=pl.INT32, target_memory=pl.MemorySpace.Vec)
+                    running_indices = pl.sel(tail_newer, tail_candidate_indices, running_indices, tail_select_tmp)
+                    running_scores = pl.maximum(running_scores, tail_candidate_scores)
+
+        partial_row = gblk * MAX_LOGIT_ROWS
+        pl.store(running_scores, [partial_row, 0], greedy_scores)
+        pl.store(running_indices, [partial_row, 0], greedy_indices)
 
     # Every local wait has observed all current-round peer notifies before the
     # logits gather can complete. Clear only this rank's counters so a retained
@@ -301,6 +333,33 @@ def lm_head(
         for src_tp in pl.range(TP_SIZE):
             pl.write(hidden_done, [src_tp, 0], zero)
             pl.write(logits_done, [src_tp, 0], zero)
+    return logits
+
+
+
+@pl.jit.inline(auto_scope=False)
+def lm_head(
+    hidden_states: pl.Tensor,
+    lm_head_weight: pl.Tensor[[VOCAB_PER_TP, D], pl.BF16],
+    logit_row_indices: pl.Tensor[[MAX_LOGIT_ROWS], pl.INT32],
+    logits: pl.Tensor[[MAX_LOGIT_ROWS, VOCAB], pl.FP32],
+    hidden_window: pld.DistributedTensor[[GROUP_LOGIT_ROWS, D], pl.BF16],
+    hidden_done: pld.DistributedTensor[[TP_SIZE, 1], pl.INT32],
+    logits_window: pld.DistributedTensor[[MAX_LOGIT_ROWS, VOCAB], pl.FP32],
+    logits_done: pld.DistributedTensor[[TP_SIZE, 1], pl.INT32],
+    group_base: pl.Scalar[pl.INT32],
+    tp_rank: pl.Scalar[pl.INT32],
+    done_epoch: pl.Scalar[pl.INT32],
+) -> pl.Tensor[[MAX_LOGIT_ROWS, VOCAB], pl.FP32]:
+    # Scratch is allocated just outside the scope that first writes it: a
+    # create_tensor inside a pl.at yields a tile, not a GM tensor view.
+    greedy_scores = pl.create_tensor([LOGITS_COMM_BLOCKS * MAX_LOGIT_ROWS, SAMPLED_IDS_PAD], dtype=pl.FP32)
+    greedy_indices = pl.create_tensor([LOGITS_COMM_BLOCKS * MAX_LOGIT_ROWS, SAMPLED_IDS_PAD], dtype=pl.INT32)
+    _lm_head_with_greedy_partials(
+        hidden_states, lm_head_weight, logit_row_indices, logits,
+        hidden_window, hidden_done, logits_window, logits_done,
+        group_base, tp_rank, done_epoch, greedy_scores, greedy_indices,
+    )
     return logits
 
 
@@ -346,7 +405,9 @@ def lm_head_with_sampling(
     done_epoch: pl.Scalar[pl.INT32],
 ):
     """Project logits and sample tokens in one opaque L2 entry."""
-    lm_head(
+    greedy_scores = pl.create_tensor([LOGITS_COMM_BLOCKS * MAX_LOGIT_ROWS, SAMPLED_IDS_PAD], dtype=pl.FP32)
+    greedy_indices = pl.create_tensor([LOGITS_COMM_BLOCKS * MAX_LOGIT_ROWS, SAMPLED_IDS_PAD], dtype=pl.INT32)
+    _lm_head_with_greedy_partials(
         hidden_states,
         lm_head_weight,
         logit_row_indices,
@@ -358,14 +419,16 @@ def lm_head_with_sampling(
         group_base,
         tp_rank,
         done_epoch,
+        greedy_scores, greedy_indices,
     )
-    sampled_ids = sample(
+    sampled_ids = sample_from_greedy_partials(
         logits,
         sampling_temperatures,
         sampling_top_ks,
         sampling_seeds,
         sampling_positions,
         sampled_ids,
+        greedy_scores, greedy_indices,
     )
     return logits, sampled_ids
 
@@ -582,14 +645,22 @@ def compare_logits(actual, expected, **_):
     return False, "\n".join(lines)
 
 
-def compare_sampled_ids(actual, _expected, *, actual_outputs, **_):
+def compare_sampled_ids(actual, _expected, *, actual_outputs, inputs=None, **_):
     import torch
 
     expected = torch.zeros_like(actual)
-    expected[:, :, 0] = torch.argmax(
-        actual_outputs["logits"].cpu(),
-        dim=-1,
-    ).to(torch.int32)
+    if inputs is None or bool(torch.all(inputs["sampling_temperatures"] < SAMPLING_EPS)):
+        expected[:, :, 0] = torch.argmax(actual_outputs["logits"].cpu(), dim=-1).to(torch.int32)
+    else:
+        for rank in range(actual.shape[0]):
+            golden_sample({
+                "logits": actual_outputs["logits"][rank].cpu(),
+                "temperatures": inputs["sampling_temperatures"][rank],
+                "top_ks": inputs["sampling_top_ks"][rank],
+                "seeds": inputs["sampling_seeds"][rank],
+                "positions": inputs["sampling_positions"][rank],
+                "sampled_ids": expected[rank],
+            })
     if torch.equal(actual, expected):
         return True, ""
     mismatch = actual != expected
@@ -619,6 +690,8 @@ if __name__ == "__main__":
     parser.add_argument("--compile-only", action="store_true", default=False)
     parser.add_argument("--runtime-dir", type=str, default=None)
     parser.add_argument("--dump-passes", action="store_true", default=False)
+    parser.add_argument("--save-data", action="store_true", default=False)
+    parser.add_argument("--golden-data", type=str, default=None)
     args = parser.parse_args()
 
     device_ids = [int(d) for d in args.device.split(",")]
@@ -642,6 +715,8 @@ if __name__ == "__main__":
         specs=specs,
         golden_fn=golden_fn,
         compare_fn=compare_fn,
+        save_data=args.save_data,
+        golden_data=args.golden_data,
         compile_only=args.compile_only,
         runtime_dir=args.runtime_dir,
         compile_cfg=dict(

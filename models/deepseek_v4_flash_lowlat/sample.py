@@ -201,6 +201,21 @@ def _greedy_sample_logits(
 
 
 @pl.jit.inline
+def _apply_temperature_row(
+    logits: pl.Tensor, temperatures: pl.Tensor, scaled_logits: pl.Tensor,
+    row: pl.Scalar[pl.INDEX],
+):
+    temperature = pl.read(temperatures, [row])
+    if temperature >= SAMPLING_EPS:
+        for vocab_tile in pl.range(VOCAB // SAMPLE_ROW_WIDTH_TILE):
+            vocab_start = vocab_tile * SAMPLE_ROW_WIDTH_TILE
+            scores = pl.slice(logits, [1, SAMPLE_ROW_WIDTH_TILE], [row, vocab_start])
+            scaled_scores = pl.div(scores, temperature)
+            scaled_logits[row : row + 1, vocab_start : vocab_start + SAMPLE_ROW_WIDTH_TILE] = scaled_scores
+    return scaled_logits
+
+
+@pl.jit.inline
 def apply_temperature(
     logits: pl.Tensor,
     temperatures: pl.Tensor,
@@ -209,13 +224,262 @@ def apply_temperature(
     """Apply per-row temperature in an independent vocab-tiled stage."""
     sample_rows = pl.tensor.dim(logits, 0)
     for row in pl.spmd(sample_rows, name_hint="sample_apply_temperature", allow_early_resolve=True):
-        temperature = pl.read(temperatures, [row])
-        if temperature >= SAMPLING_EPS:
-            for vocab_tile in pl.range(VOCAB // SAMPLE_ROW_WIDTH_TILE):
-                vocab_start = vocab_tile * SAMPLE_ROW_WIDTH_TILE
-                scores = pl.slice(logits, [1, SAMPLE_ROW_WIDTH_TILE], [row, vocab_start])
-                scaled_scores = pl.div(scores, temperature)
-                scaled_logits[row : row + 1, vocab_start : vocab_start + SAMPLE_ROW_WIDTH_TILE] = scaled_scores
+        _apply_temperature_row(logits, temperatures, scaled_logits, row)
+    return scaled_logits
+
+
+@pl.jit.inline
+def _apply_top_k_row(
+    scaled_logits: pl.Tensor, temperatures: pl.Tensor, top_ks: pl.Tensor,
+    row: pl.Scalar[pl.INDEX],
+):
+    temperature = pl.read(temperatures, [row])
+    top_k = pl.read(top_ks, [row])
+    if temperature >= SAMPLING_EPS and top_k > 0 and top_k < VOCAB:
+        search_lower = pl.cast(FP32_POS_INF, pl.FP32)
+        search_upper = pl.cast(FP32_NEG_INF, pl.FP32)
+        for extrema_block in pl.range(VOCAB // TOPK_ROW_WIDTH_TILE // SAMPLE_BLOCK_ROWS_TILE):
+            extrema_start = extrema_block * SAMPLE_BLOCK_ROWS_TILE * TOPK_ROW_WIDTH_TILE
+            extrema_flat = pl.slice(
+                scaled_logits,
+                [1, SAMPLE_BLOCK_ROWS_TILE * TOPK_ROW_WIDTH_TILE],
+                [row, extrema_start],
+            )
+            extrema_scores = pl.reshape(extrema_flat, [SAMPLE_BLOCK_ROWS_TILE, TOPK_ROW_WIDTH_TILE])
+            block_minima = pl.row_min(extrema_scores)
+            block_maxima = pl.row_max(extrema_scores)
+            for extrema_lane in pl.range(SAMPLE_BLOCK_ROWS_TILE):
+                lane_minimum = pl.read(block_minima, [extrema_lane, 0])
+                lane_maximum = pl.read(block_maxima, [extrema_lane, 0])
+                if lane_minimum < search_lower:
+                    search_lower = lane_minimum
+                if lane_maximum > search_upper:
+                    search_upper = lane_maximum
+
+        tail_start = (
+            VOCAB
+            // TOPK_ROW_WIDTH_TILE
+            // SAMPLE_BLOCK_ROWS_TILE
+            * SAMPLE_BLOCK_ROWS_TILE
+            * TOPK_ROW_WIDTH_TILE
+        )
+        tail_flat = pl.slice(
+            scaled_logits,
+            [1, VOCAB // TOPK_ROW_WIDTH_TILE % SAMPLE_BLOCK_ROWS_TILE * TOPK_ROW_WIDTH_TILE],
+            [row, tail_start],
+        )
+        tail_scores = pl.reshape(
+            tail_flat,
+            [VOCAB // TOPK_ROW_WIDTH_TILE % SAMPLE_BLOCK_ROWS_TILE, TOPK_ROW_WIDTH_TILE],
+        )
+        tail_min_scores = pl.full(
+            [SAMPLE_BLOCK_ROWS_TILE, TOPK_ROW_WIDTH_TILE],
+            dtype=pl.FP32,
+            value=FP32_POS_INF,
+        )
+        tail_min_scores[0 : VOCAB // TOPK_ROW_WIDTH_TILE % SAMPLE_BLOCK_ROWS_TILE, :] = tail_scores
+        tail_max_scores = pl.full(
+            [SAMPLE_BLOCK_ROWS_TILE, TOPK_ROW_WIDTH_TILE],
+            dtype=pl.FP32,
+            value=FP32_NEG_INF,
+        )
+        tail_max_scores[0 : VOCAB // TOPK_ROW_WIDTH_TILE % SAMPLE_BLOCK_ROWS_TILE, :] = tail_scores
+        tail_minima = pl.row_min(tail_min_scores)
+        tail_maxima = pl.row_max(tail_max_scores)
+        for tail_lane in pl.range(VOCAB // TOPK_ROW_WIDTH_TILE % SAMPLE_BLOCK_ROWS_TILE):
+            tail_minimum = pl.read(tail_minima, [tail_lane, 0])
+            tail_maximum = pl.read(tail_maxima, [tail_lane, 0])
+            if tail_minimum < search_lower:
+                search_lower = tail_minimum
+            if tail_maximum > search_upper:
+                search_upper = tail_maximum
+
+        for search_step in pl.range(TOPK_SEARCH_STEPS):
+            lower_tile = pl.full(
+                [SAMPLE_BLOCK_ROWS_TILE, SAMPLE_BLOCK_ROWS_TILE],
+                dtype=pl.FP32,
+                value=0.0,
+            )
+            upper_tile = pl.full(
+                [SAMPLE_BLOCK_ROWS_TILE, SAMPLE_BLOCK_ROWS_TILE],
+                dtype=pl.FP32,
+                value=0.0,
+            )
+            pl.write(lower_tile, [0, 0], search_lower)
+            pl.write(upper_tile, [0, 0], search_upper)
+            search_range_tile = pl.sub(upper_tile, lower_tile)
+            lower_pivot_tile = pl.add(lower_tile, pl.mul(search_range_tile, 1.0 / 3.0))
+            upper_pivot_tile = pl.add(lower_tile, pl.mul(search_range_tile, 2.0 / 3.0))
+            lower_pivot = pl.read(lower_pivot_tile, [0, 0])
+            upper_pivot = pl.read(upper_pivot_tile, [0, 0])
+            lower_count = pl.cast(0, pl.INT32)
+            upper_count = pl.cast(0, pl.INT32)
+            for count_block in pl.range(VOCAB // TOPK_ROW_WIDTH_TILE // SAMPLE_BLOCK_ROWS_TILE):
+                count_start = count_block * SAMPLE_BLOCK_ROWS_TILE * TOPK_ROW_WIDTH_TILE
+                count_flat = pl.slice(
+                    scaled_logits,
+                    [1, SAMPLE_BLOCK_ROWS_TILE * TOPK_ROW_WIDTH_TILE],
+                    [row, count_start],
+                )
+                count_scores = pl.reshape(count_flat, [SAMPLE_BLOCK_ROWS_TILE, TOPK_ROW_WIDTH_TILE])
+                lower_mask = pl.cmp(count_scores, lower_pivot, cmp_type=4)
+                upper_mask = pl.cmp(count_scores, upper_pivot, cmp_type=4)
+                lower_rows = pl.row_sum(lower_mask)
+                upper_rows = pl.row_sum(upper_mask)
+                for count_lane in pl.range(SAMPLE_BLOCK_ROWS_TILE):
+                    lower_lane_fp32 = pl.read(lower_rows, [count_lane, 0])
+                    upper_lane_fp32 = pl.read(upper_rows, [count_lane, 0])
+                    lower_count = lower_count + pl.cast(lower_lane_fp32, pl.INT32)
+                    upper_count = upper_count + pl.cast(upper_lane_fp32, pl.INT32)
+
+            tail_lower_mask = pl.cmp(tail_max_scores, lower_pivot, cmp_type=4)
+            tail_upper_mask = pl.cmp(tail_max_scores, upper_pivot, cmp_type=4)
+            tail_lower_rows = pl.row_sum(tail_lower_mask)
+            tail_upper_rows = pl.row_sum(tail_upper_mask)
+            for count_tail_lane in pl.range(VOCAB // TOPK_ROW_WIDTH_TILE % SAMPLE_BLOCK_ROWS_TILE):
+                lower_tail_fp32 = pl.read(tail_lower_rows, [count_tail_lane, 0])
+                upper_tail_fp32 = pl.read(tail_upper_rows, [count_tail_lane, 0])
+                lower_count = lower_count + pl.cast(lower_tail_fp32, pl.INT32)
+                upper_count = upper_count + pl.cast(upper_tail_fp32, pl.INT32)
+
+            if upper_count >= top_k:
+                search_lower = upper_pivot
+            elif lower_count >= top_k:
+                search_lower = lower_pivot
+                search_upper = upper_pivot
+            else:
+                search_upper = lower_pivot
+
+        boundary = pl.cast(FP32_POS_INF, pl.FP32)
+        lower_reject_count = pl.cast(0, pl.INT32)
+        for boundary_block in pl.range(VOCAB // TOPK_ROW_WIDTH_TILE // SAMPLE_BLOCK_ROWS_TILE):
+            boundary_start = boundary_block * SAMPLE_BLOCK_ROWS_TILE * TOPK_ROW_WIDTH_TILE
+            boundary_flat = pl.slice(
+                scaled_logits,
+                [1, SAMPLE_BLOCK_ROWS_TILE * TOPK_ROW_WIDTH_TILE],
+                [row, boundary_start],
+            )
+            boundary_scores = pl.reshape(
+                boundary_flat,
+                [SAMPLE_BLOCK_ROWS_TILE, TOPK_ROW_WIDTH_TILE],
+            )
+            reject_boundary = pl.cmp(boundary_scores, search_lower, cmp_type=3)
+            lower_reject_rows = pl.row_sum(reject_boundary)
+            rejected_offset = pl.mul(reject_boundary, FP32_POS_INF)
+            boundary_candidates = pl.add(boundary_scores, rejected_offset)
+            boundary_minima = pl.row_min(boundary_candidates)
+            for boundary_lane in pl.range(SAMPLE_BLOCK_ROWS_TILE):
+                lane_boundary = pl.read(boundary_minima, [boundary_lane, 0])
+                lower_rejected = pl.read(lower_reject_rows, [boundary_lane, 0])
+                lower_reject_count = lower_reject_count + pl.cast(lower_rejected, pl.INT32)
+                if lane_boundary < boundary:
+                    boundary = lane_boundary
+
+        boundary_tail_scores = pl.full(
+            [SAMPLE_BLOCK_ROWS_TILE, TOPK_ROW_WIDTH_TILE],
+            dtype=pl.FP32,
+            value=FP32_POS_INF,
+        )
+        boundary_tail_scores[0 : VOCAB // TOPK_ROW_WIDTH_TILE % SAMPLE_BLOCK_ROWS_TILE, :] = tail_scores
+        reject_tail_boundary = pl.cmp(boundary_tail_scores, search_lower, cmp_type=3)
+        lower_reject_tail_rows = pl.row_sum(reject_tail_boundary)
+        rejected_tail_offset = pl.mul(reject_tail_boundary, FP32_POS_INF)
+        tail_boundary_candidates = pl.add(boundary_tail_scores, rejected_tail_offset)
+        tail_boundary_minima = pl.row_min(tail_boundary_candidates)
+        for boundary_tail_lane in pl.range(VOCAB // TOPK_ROW_WIDTH_TILE % SAMPLE_BLOCK_ROWS_TILE):
+            tail_boundary = pl.read(tail_boundary_minima, [boundary_tail_lane, 0])
+            lower_tail_rejected = pl.read(lower_reject_tail_rows, [boundary_tail_lane, 0])
+            lower_reject_count = lower_reject_count + pl.cast(lower_tail_rejected, pl.INT32)
+            if tail_boundary < boundary:
+                boundary = tail_boundary
+
+        if VOCAB - lower_reject_count < top_k:
+            boundary = search_lower
+
+        greater_boundary_count = pl.cast(0, pl.INT32)
+        for greater_block in pl.range(VOCAB // TOPK_ROW_WIDTH_TILE // SAMPLE_BLOCK_ROWS_TILE):
+            greater_start = greater_block * SAMPLE_BLOCK_ROWS_TILE * TOPK_ROW_WIDTH_TILE
+            greater_flat = pl.slice(
+                scaled_logits,
+                [1, SAMPLE_BLOCK_ROWS_TILE * TOPK_ROW_WIDTH_TILE],
+                [row, greater_start],
+            )
+            greater_scores = pl.reshape(
+                greater_flat,
+                [SAMPLE_BLOCK_ROWS_TILE, TOPK_ROW_WIDTH_TILE],
+            )
+            greater_boundary_mask = pl.cmp(greater_scores, boundary, cmp_type=4)
+            greater_boundary_rows = pl.row_sum(greater_boundary_mask)
+            for greater_lane in pl.range(SAMPLE_BLOCK_ROWS_TILE):
+                greater_lane_fp32 = pl.read(greater_boundary_rows, [greater_lane, 0])
+                greater_lane_count = pl.cast(greater_lane_fp32, pl.INT32)
+                greater_boundary_count = greater_boundary_count + greater_lane_count
+
+        greater_tail_scores_pad = pl.full(
+            [SAMPLE_BLOCK_ROWS_TILE, TOPK_ROW_WIDTH_TILE],
+            dtype=pl.FP32,
+            value=FP32_NEG_INF,
+        )
+        greater_tail_scores_pad[0 : VOCAB // TOPK_ROW_WIDTH_TILE % SAMPLE_BLOCK_ROWS_TILE, :] = (
+            tail_scores
+        )
+        greater_tail_mask = pl.cmp(greater_tail_scores_pad, boundary, cmp_type=4)
+        greater_tail_rows = pl.row_sum(greater_tail_mask)
+        for greater_tail_lane in pl.range(VOCAB // TOPK_ROW_WIDTH_TILE % SAMPLE_BLOCK_ROWS_TILE):
+            greater_tail_fp32 = pl.read(greater_tail_rows, [greater_tail_lane, 0])
+            greater_tail_count = pl.cast(greater_tail_fp32, pl.INT32)
+            greater_boundary_count = greater_boundary_count + greater_tail_count
+
+        boundary_keep_count = top_k - greater_boundary_count
+        boundary_kept = pl.cast(0, pl.INT32)
+        for mask_tile in pl.range(VOCAB // SAMPLE_ROW_WIDTH_TILE):
+            mask_start = mask_tile * SAMPLE_ROW_WIDTH_TILE
+            mask_scores_flat = pl.slice(scaled_logits, [1, SAMPLE_ROW_WIDTH_TILE], [row, mask_start])
+            mask_scores = pl.reshape(mask_scores_flat, [SAMPLE_BLOCK_ROWS_TILE, 32])
+            boundary_mask = pl.cmp(mask_scores, boundary, cmp_type=0)
+            boundary_rows = pl.row_sum(boundary_mask)
+            tile_boundary_count = pl.cast(0, pl.INT32)
+            for boundary_lane in pl.range(SAMPLE_BLOCK_ROWS_TILE):
+                lane_count_fp32 = pl.read(boundary_rows, [boundary_lane, 0])
+                tile_boundary_count = tile_boundary_count + pl.cast(lane_count_fp32, pl.INT32)
+
+            if boundary_kept + tile_boundary_count <= boundary_keep_count:
+                keep_mask = pl.cmp(mask_scores, boundary, cmp_type=5)
+                reject_mask = pl.cmp(mask_scores, boundary, cmp_type=2)
+                kept_scores = pl.mul(mask_scores, keep_mask)
+                rejected_scores = pl.mul(reject_mask, FP32_NEG_INF)
+                filtered_scores = pl.add(kept_scores, rejected_scores)
+                filtered_flat = pl.reshape(filtered_scores, [1, SAMPLE_ROW_WIDTH_TILE])
+                scaled_logits[row : row + 1, mask_start : mask_start + SAMPLE_ROW_WIDTH_TILE] = (
+                    filtered_flat
+                )
+                boundary_kept = boundary_kept + tile_boundary_count
+            elif boundary_kept >= boundary_keep_count:
+                keep_mask = pl.cmp(mask_scores, boundary, cmp_type=4)
+                reject_mask = pl.cmp(mask_scores, boundary, cmp_type=3)
+                kept_scores = pl.mul(mask_scores, keep_mask)
+                rejected_scores = pl.mul(reject_mask, FP32_NEG_INF)
+                filtered_scores = pl.add(kept_scores, rejected_scores)
+                filtered_flat = pl.reshape(filtered_scores, [1, SAMPLE_ROW_WIDTH_TILE])
+                scaled_logits[row : row + 1, mask_start : mask_start + SAMPLE_ROW_WIDTH_TILE] = (
+                    filtered_flat
+                )
+            else:
+                for mask_lane in pl.range(SAMPLE_ROW_WIDTH_TILE):
+                    mask_row = mask_lane // 32
+                    mask_column = mask_lane % 32
+                    token_score = pl.read(mask_scores, [mask_row, mask_column])
+                    if token_score < boundary:
+                        pl.write(mask_scores, [mask_row, mask_column], FP32_NEG_INF)
+                    elif token_score == boundary:
+                        if boundary_kept < boundary_keep_count:
+                            boundary_kept = boundary_kept + pl.cast(1, pl.INT32)
+                        else:
+                            pl.write(mask_scores, [mask_row, mask_column], FP32_NEG_INF)
+                filtered_flat = pl.reshape(mask_scores, [1, SAMPLE_ROW_WIDTH_TILE])
+                scaled_logits[row : row + 1, mask_start : mask_start + SAMPLE_ROW_WIDTH_TILE] = (
+                    filtered_flat
+                )
     return scaled_logits
 
 
@@ -228,243 +492,7 @@ def apply_top_k(
     """Mask logits below each row's top-k boundary in an independent stage."""
     sample_rows = pl.tensor.dim(scaled_logits, 0)
     for row in pl.spmd(sample_rows, name_hint="sample_apply_top_k", allow_early_resolve=True):
-        temperature = pl.read(temperatures, [row])
-        top_k = pl.read(top_ks, [row])
-        if temperature >= SAMPLING_EPS and top_k > 0 and top_k < VOCAB:
-            search_lower = pl.cast(FP32_POS_INF, pl.FP32)
-            search_upper = pl.cast(FP32_NEG_INF, pl.FP32)
-            for extrema_block in pl.range(VOCAB // TOPK_ROW_WIDTH_TILE // SAMPLE_BLOCK_ROWS_TILE):
-                extrema_start = extrema_block * SAMPLE_BLOCK_ROWS_TILE * TOPK_ROW_WIDTH_TILE
-                extrema_flat = pl.slice(
-                    scaled_logits,
-                    [1, SAMPLE_BLOCK_ROWS_TILE * TOPK_ROW_WIDTH_TILE],
-                    [row, extrema_start],
-                )
-                extrema_scores = pl.reshape(extrema_flat, [SAMPLE_BLOCK_ROWS_TILE, TOPK_ROW_WIDTH_TILE])
-                block_minima = pl.row_min(extrema_scores)
-                block_maxima = pl.row_max(extrema_scores)
-                for extrema_lane in pl.range(SAMPLE_BLOCK_ROWS_TILE):
-                    lane_minimum = pl.read(block_minima, [extrema_lane, 0])
-                    lane_maximum = pl.read(block_maxima, [extrema_lane, 0])
-                    if lane_minimum < search_lower:
-                        search_lower = lane_minimum
-                    if lane_maximum > search_upper:
-                        search_upper = lane_maximum
-
-            tail_start = (
-                VOCAB
-                // TOPK_ROW_WIDTH_TILE
-                // SAMPLE_BLOCK_ROWS_TILE
-                * SAMPLE_BLOCK_ROWS_TILE
-                * TOPK_ROW_WIDTH_TILE
-            )
-            tail_flat = pl.slice(
-                scaled_logits,
-                [1, VOCAB // TOPK_ROW_WIDTH_TILE % SAMPLE_BLOCK_ROWS_TILE * TOPK_ROW_WIDTH_TILE],
-                [row, tail_start],
-            )
-            tail_scores = pl.reshape(
-                tail_flat,
-                [VOCAB // TOPK_ROW_WIDTH_TILE % SAMPLE_BLOCK_ROWS_TILE, TOPK_ROW_WIDTH_TILE],
-            )
-            tail_min_scores = pl.full(
-                [SAMPLE_BLOCK_ROWS_TILE, TOPK_ROW_WIDTH_TILE],
-                dtype=pl.FP32,
-                value=FP32_POS_INF,
-            )
-            tail_min_scores[0 : VOCAB // TOPK_ROW_WIDTH_TILE % SAMPLE_BLOCK_ROWS_TILE, :] = tail_scores
-            tail_max_scores = pl.full(
-                [SAMPLE_BLOCK_ROWS_TILE, TOPK_ROW_WIDTH_TILE],
-                dtype=pl.FP32,
-                value=FP32_NEG_INF,
-            )
-            tail_max_scores[0 : VOCAB // TOPK_ROW_WIDTH_TILE % SAMPLE_BLOCK_ROWS_TILE, :] = tail_scores
-            tail_minima = pl.row_min(tail_min_scores)
-            tail_maxima = pl.row_max(tail_max_scores)
-            for tail_lane in pl.range(VOCAB // TOPK_ROW_WIDTH_TILE % SAMPLE_BLOCK_ROWS_TILE):
-                tail_minimum = pl.read(tail_minima, [tail_lane, 0])
-                tail_maximum = pl.read(tail_maxima, [tail_lane, 0])
-                if tail_minimum < search_lower:
-                    search_lower = tail_minimum
-                if tail_maximum > search_upper:
-                    search_upper = tail_maximum
-
-            for search_step in pl.range(TOPK_SEARCH_STEPS):
-                lower_tile = pl.full(
-                    [SAMPLE_BLOCK_ROWS_TILE, SAMPLE_BLOCK_ROWS_TILE],
-                    dtype=pl.FP32,
-                    value=0.0,
-                )
-                upper_tile = pl.full(
-                    [SAMPLE_BLOCK_ROWS_TILE, SAMPLE_BLOCK_ROWS_TILE],
-                    dtype=pl.FP32,
-                    value=0.0,
-                )
-                pl.write(lower_tile, [0, 0], search_lower)
-                pl.write(upper_tile, [0, 0], search_upper)
-                search_range_tile = pl.sub(upper_tile, lower_tile)
-                lower_pivot_tile = pl.add(lower_tile, pl.mul(search_range_tile, 1.0 / 3.0))
-                upper_pivot_tile = pl.add(lower_tile, pl.mul(search_range_tile, 2.0 / 3.0))
-                lower_pivot = pl.read(lower_pivot_tile, [0, 0])
-                upper_pivot = pl.read(upper_pivot_tile, [0, 0])
-                lower_count = pl.cast(0, pl.INT32)
-                upper_count = pl.cast(0, pl.INT32)
-                for count_block in pl.range(VOCAB // TOPK_ROW_WIDTH_TILE // SAMPLE_BLOCK_ROWS_TILE):
-                    count_start = count_block * SAMPLE_BLOCK_ROWS_TILE * TOPK_ROW_WIDTH_TILE
-                    count_flat = pl.slice(
-                        scaled_logits,
-                        [1, SAMPLE_BLOCK_ROWS_TILE * TOPK_ROW_WIDTH_TILE],
-                        [row, count_start],
-                    )
-                    count_scores = pl.reshape(count_flat, [SAMPLE_BLOCK_ROWS_TILE, TOPK_ROW_WIDTH_TILE])
-                    lower_mask = pl.cmp(count_scores, lower_pivot, cmp_type=4)
-                    upper_mask = pl.cmp(count_scores, upper_pivot, cmp_type=4)
-                    lower_rows = pl.row_sum(lower_mask)
-                    upper_rows = pl.row_sum(upper_mask)
-                    for count_lane in pl.range(SAMPLE_BLOCK_ROWS_TILE):
-                        lower_lane_fp32 = pl.read(lower_rows, [count_lane, 0])
-                        upper_lane_fp32 = pl.read(upper_rows, [count_lane, 0])
-                        lower_count = lower_count + pl.cast(lower_lane_fp32, pl.INT32)
-                        upper_count = upper_count + pl.cast(upper_lane_fp32, pl.INT32)
-
-                tail_lower_mask = pl.cmp(tail_max_scores, lower_pivot, cmp_type=4)
-                tail_upper_mask = pl.cmp(tail_max_scores, upper_pivot, cmp_type=4)
-                tail_lower_rows = pl.row_sum(tail_lower_mask)
-                tail_upper_rows = pl.row_sum(tail_upper_mask)
-                for count_tail_lane in pl.range(VOCAB // TOPK_ROW_WIDTH_TILE % SAMPLE_BLOCK_ROWS_TILE):
-                    lower_tail_fp32 = pl.read(tail_lower_rows, [count_tail_lane, 0])
-                    upper_tail_fp32 = pl.read(tail_upper_rows, [count_tail_lane, 0])
-                    lower_count = lower_count + pl.cast(lower_tail_fp32, pl.INT32)
-                    upper_count = upper_count + pl.cast(upper_tail_fp32, pl.INT32)
-
-                if upper_count >= top_k:
-                    search_lower = upper_pivot
-                elif lower_count >= top_k:
-                    search_lower = lower_pivot
-                    search_upper = upper_pivot
-                else:
-                    search_upper = lower_pivot
-
-            boundary = pl.cast(FP32_POS_INF, pl.FP32)
-            for boundary_block in pl.range(VOCAB // TOPK_ROW_WIDTH_TILE // SAMPLE_BLOCK_ROWS_TILE):
-                boundary_start = boundary_block * SAMPLE_BLOCK_ROWS_TILE * TOPK_ROW_WIDTH_TILE
-                boundary_flat = pl.slice(
-                    scaled_logits,
-                    [1, SAMPLE_BLOCK_ROWS_TILE * TOPK_ROW_WIDTH_TILE],
-                    [row, boundary_start],
-                )
-                boundary_scores = pl.reshape(
-                    boundary_flat,
-                    [SAMPLE_BLOCK_ROWS_TILE, TOPK_ROW_WIDTH_TILE],
-                )
-                reject_boundary = pl.cmp(boundary_scores, search_lower, cmp_type=3)
-                rejected_offset = pl.mul(reject_boundary, FP32_POS_INF)
-                boundary_candidates = pl.add(boundary_scores, rejected_offset)
-                boundary_minima = pl.row_min(boundary_candidates)
-                for boundary_lane in pl.range(SAMPLE_BLOCK_ROWS_TILE):
-                    lane_boundary = pl.read(boundary_minima, [boundary_lane, 0])
-                    if lane_boundary < boundary:
-                        boundary = lane_boundary
-
-            boundary_tail_scores = pl.full(
-                [SAMPLE_BLOCK_ROWS_TILE, TOPK_ROW_WIDTH_TILE],
-                dtype=pl.FP32,
-                value=FP32_POS_INF,
-            )
-            boundary_tail_scores[0 : VOCAB // TOPK_ROW_WIDTH_TILE % SAMPLE_BLOCK_ROWS_TILE, :] = tail_scores
-            reject_tail_boundary = pl.cmp(boundary_tail_scores, search_lower, cmp_type=3)
-            rejected_tail_offset = pl.mul(reject_tail_boundary, FP32_POS_INF)
-            tail_boundary_candidates = pl.add(boundary_tail_scores, rejected_tail_offset)
-            tail_boundary_minima = pl.row_min(tail_boundary_candidates)
-            for boundary_tail_lane in pl.range(VOCAB // TOPK_ROW_WIDTH_TILE % SAMPLE_BLOCK_ROWS_TILE):
-                tail_boundary = pl.read(tail_boundary_minima, [boundary_tail_lane, 0])
-                if tail_boundary < boundary:
-                    boundary = tail_boundary
-
-            greater_boundary_count = pl.cast(0, pl.INT32)
-            for greater_block in pl.range(VOCAB // TOPK_ROW_WIDTH_TILE // SAMPLE_BLOCK_ROWS_TILE):
-                greater_start = greater_block * SAMPLE_BLOCK_ROWS_TILE * TOPK_ROW_WIDTH_TILE
-                greater_flat = pl.slice(
-                    scaled_logits,
-                    [1, SAMPLE_BLOCK_ROWS_TILE * TOPK_ROW_WIDTH_TILE],
-                    [row, greater_start],
-                )
-                greater_scores = pl.reshape(
-                    greater_flat,
-                    [SAMPLE_BLOCK_ROWS_TILE, TOPK_ROW_WIDTH_TILE],
-                )
-                greater_boundary_mask = pl.cmp(greater_scores, boundary, cmp_type=4)
-                greater_boundary_rows = pl.row_sum(greater_boundary_mask)
-                for greater_lane in pl.range(SAMPLE_BLOCK_ROWS_TILE):
-                    greater_lane_fp32 = pl.read(greater_boundary_rows, [greater_lane, 0])
-                    greater_lane_count = pl.cast(greater_lane_fp32, pl.INT32)
-                    greater_boundary_count = greater_boundary_count + greater_lane_count
-
-            greater_tail_scores_pad = pl.full(
-                [SAMPLE_BLOCK_ROWS_TILE, TOPK_ROW_WIDTH_TILE],
-                dtype=pl.FP32,
-                value=FP32_NEG_INF,
-            )
-            greater_tail_scores_pad[0 : VOCAB // TOPK_ROW_WIDTH_TILE % SAMPLE_BLOCK_ROWS_TILE, :] = (
-                tail_scores
-            )
-            greater_tail_mask = pl.cmp(greater_tail_scores_pad, boundary, cmp_type=4)
-            greater_tail_rows = pl.row_sum(greater_tail_mask)
-            for greater_tail_lane in pl.range(VOCAB // TOPK_ROW_WIDTH_TILE % SAMPLE_BLOCK_ROWS_TILE):
-                greater_tail_fp32 = pl.read(greater_tail_rows, [greater_tail_lane, 0])
-                greater_tail_count = pl.cast(greater_tail_fp32, pl.INT32)
-                greater_boundary_count = greater_boundary_count + greater_tail_count
-
-            boundary_keep_count = top_k - greater_boundary_count
-            boundary_kept = pl.cast(0, pl.INT32)
-            for mask_tile in pl.range(VOCAB // SAMPLE_ROW_WIDTH_TILE):
-                mask_start = mask_tile * SAMPLE_ROW_WIDTH_TILE
-                mask_scores_flat = pl.slice(scaled_logits, [1, SAMPLE_ROW_WIDTH_TILE], [row, mask_start])
-                mask_scores = pl.reshape(mask_scores_flat, [SAMPLE_BLOCK_ROWS_TILE, 32])
-                boundary_mask = pl.cmp(mask_scores, boundary, cmp_type=0)
-                boundary_rows = pl.row_sum(boundary_mask)
-                tile_boundary_count = pl.cast(0, pl.INT32)
-                for boundary_lane in pl.range(SAMPLE_BLOCK_ROWS_TILE):
-                    lane_count_fp32 = pl.read(boundary_rows, [boundary_lane, 0])
-                    tile_boundary_count = tile_boundary_count + pl.cast(lane_count_fp32, pl.INT32)
-
-                if boundary_kept + tile_boundary_count <= boundary_keep_count:
-                    keep_mask = pl.cmp(mask_scores, boundary, cmp_type=5)
-                    reject_mask = pl.cmp(mask_scores, boundary, cmp_type=2)
-                    kept_scores = pl.mul(mask_scores, keep_mask)
-                    rejected_scores = pl.mul(reject_mask, FP32_NEG_INF)
-                    filtered_scores = pl.add(kept_scores, rejected_scores)
-                    filtered_flat = pl.reshape(filtered_scores, [1, SAMPLE_ROW_WIDTH_TILE])
-                    scaled_logits[row : row + 1, mask_start : mask_start + SAMPLE_ROW_WIDTH_TILE] = (
-                        filtered_flat
-                    )
-                    boundary_kept = boundary_kept + tile_boundary_count
-                elif boundary_kept >= boundary_keep_count:
-                    keep_mask = pl.cmp(mask_scores, boundary, cmp_type=4)
-                    reject_mask = pl.cmp(mask_scores, boundary, cmp_type=3)
-                    kept_scores = pl.mul(mask_scores, keep_mask)
-                    rejected_scores = pl.mul(reject_mask, FP32_NEG_INF)
-                    filtered_scores = pl.add(kept_scores, rejected_scores)
-                    filtered_flat = pl.reshape(filtered_scores, [1, SAMPLE_ROW_WIDTH_TILE])
-                    scaled_logits[row : row + 1, mask_start : mask_start + SAMPLE_ROW_WIDTH_TILE] = (
-                        filtered_flat
-                    )
-                else:
-                    for mask_lane in pl.range(SAMPLE_ROW_WIDTH_TILE):
-                        mask_row = mask_lane // 32
-                        mask_column = mask_lane % 32
-                        token_score = pl.read(mask_scores, [mask_row, mask_column])
-                        if token_score < boundary:
-                            pl.write(mask_scores, [mask_row, mask_column], FP32_NEG_INF)
-                        elif token_score == boundary:
-                            if boundary_kept < boundary_keep_count:
-                                boundary_kept = boundary_kept + pl.cast(1, pl.INT32)
-                            else:
-                                pl.write(mask_scores, [mask_row, mask_column], FP32_NEG_INF)
-                    filtered_flat = pl.reshape(mask_scores, [1, SAMPLE_ROW_WIDTH_TILE])
-                    scaled_logits[row : row + 1, mask_start : mask_start + SAMPLE_ROW_WIDTH_TILE] = (
-                        filtered_flat
-                    )
+        _apply_top_k_row(scaled_logits, temperatures, top_ks, row)
     return scaled_logits
 
 
@@ -501,6 +529,53 @@ def gumbel_sample(
 
 
 @pl.jit.inline
+def sample_from_greedy_partials(
+    logits: pl.Tensor,
+    sampling_temperatures: pl.Tensor,
+    sampling_top_ks: pl.Tensor,
+    sampling_seeds: pl.Tensor,
+    sampling_positions: pl.Tensor,
+    sampled_ids: pl.Tensor,
+    greedy_scores: pl.Tensor,
+    greedy_indices: pl.Tensor,
+):
+    """Sample each row with its temperature and top-k work in the same task."""
+    processed_logits = pl.create_tensor([SAMPLE_ROWS, VOCAB], dtype=pl.FP32)
+    greedy_parts = pl.tensor.dim(greedy_scores, 0) // SAMPLE_ROWS
+    for row in pl.spmd(SAMPLE_ROWS, name_hint="sample_draw"):
+        temperature = pl.read(sampling_temperatures, [row])
+        if temperature < SAMPLING_EPS:
+            best_score = pl.cast(FP32_NEG_INF, pl.FP32)
+            best_index = pl.cast(GREEDY_INDEX_SENTINEL, pl.INT32)
+            for part in pl.range(greedy_parts):
+                part_row = part * SAMPLE_ROWS + row
+                part_score = pl.read(greedy_scores, [part_row, 0])
+                part_index = pl.read(greedy_indices, [part_row, 0])
+                if part_score > best_score:
+                    best_score = part_score
+                    best_index = part_index
+                elif part_score == best_score:
+                    best_index = pl.min(best_index, part_index)
+        else:
+            _apply_temperature_row(logits, sampling_temperatures, processed_logits, row)
+            _apply_top_k_row(processed_logits, sampling_temperatures, sampling_top_ks, row)
+            random_flag = pl.cast(1, pl.INT32)
+            seed = pl.read(sampling_seeds, [row])
+            position = pl.read(sampling_positions, [row])
+            seed_index = pl.cast(seed, pl.INDEX)
+            position_index = pl.cast(position, pl.INDEX)
+            random_key_index = seed_index + position_index * POSITION_MULTIPLIER
+            random_key = pl.cast(random_key_index % RANDOM_KEY_MODULUS, pl.INT32)
+            best_index = _sample_filtered_logits(processed_logits, row, random_flag, random_key)
+        sampled_row = pl.create_tensor([1, SAMPLED_IDS_PAD], dtype=pl.INT32)
+        sampled_row[:, :] = pl.full([1, SAMPLED_IDS_PAD], dtype=pl.INT32, value=0)
+        pl.write(sampled_row, [0, 0], best_index)
+        sampled_ids[row : row + 1, :] = sampled_row
+    return sampled_ids
+
+
+
+@pl.jit.inline
 def sample(
     logits: pl.Tensor,
     sampling_temperatures: pl.Tensor,
@@ -509,18 +584,29 @@ def sample(
     sampling_positions: pl.Tensor,
     sampled_ids: pl.Tensor,
 ):
-    """Orchestrate independent temperature, top-k, and Gumbel stages."""
+    """Sample each row with its temperature and top-k work in the same task."""
     processed_logits = pl.create_tensor([SAMPLE_ROWS, VOCAB], dtype=pl.FP32)
-    apply_temperature(logits, sampling_temperatures, processed_logits)
-    apply_top_k(processed_logits, sampling_temperatures, sampling_top_ks)
-    return gumbel_sample(
-        logits,
-        processed_logits,
-        sampling_temperatures,
-        sampling_seeds,
-        sampling_positions,
-        sampled_ids,
-    )
+    logits_grid = pl.reshape(logits, [SAMPLE_ROWS * (VOCAB // GREEDY_ROW_WIDTH_TILE), GREEDY_ROW_WIDTH_TILE])
+    for row in pl.spmd(SAMPLE_ROWS, name_hint="sample_draw"):
+        temperature = pl.read(sampling_temperatures, [row])
+        if temperature < SAMPLING_EPS:
+            best_index = _greedy_sample_logits(logits_grid, row)
+        else:
+            _apply_temperature_row(logits, sampling_temperatures, processed_logits, row)
+            _apply_top_k_row(processed_logits, sampling_temperatures, sampling_top_ks, row)
+            random_flag = pl.cast(1, pl.INT32)
+            seed = pl.read(sampling_seeds, [row])
+            position = pl.read(sampling_positions, [row])
+            seed_index = pl.cast(seed, pl.INDEX)
+            position_index = pl.cast(position, pl.INDEX)
+            random_key_index = seed_index + position_index * POSITION_MULTIPLIER
+            random_key = pl.cast(random_key_index % RANDOM_KEY_MODULUS, pl.INT32)
+            best_index = _sample_filtered_logits(processed_logits, row, random_flag, random_key)
+        sampled_row = pl.create_tensor([1, SAMPLED_IDS_PAD], dtype=pl.INT32)
+        sampled_row[:, :] = pl.full([1, SAMPLED_IDS_PAD], dtype=pl.INT32, value=0)
+        pl.write(sampled_row, [0, 0], best_index)
+        sampled_ids[row : row + 1, :] = sampled_row
+    return sampled_ids
 
 
 @pl.jit
@@ -563,6 +649,11 @@ def build_tensor_specs(temperature=None, top_k=None):
         generator = torch.Generator().manual_seed(20260821)
         logits = torch.randn(SAMPLE_ROWS, VOCAB, generator=generator, dtype=torch.float32)
         logits[0, 7] = 20.0
+        if SAMPLE_ROWS > 2:
+            logits[2].zero_()
+        if SAMPLE_ROWS > 3:
+            logits[3].fill_(-1.0)
+            logits[3, [17, 60000, VOCAB - 1]] = 1.0
         if SAMPLE_ROWS > 4:
             logits[4, 42] = 20.0
         if SAMPLE_ROWS > 5:

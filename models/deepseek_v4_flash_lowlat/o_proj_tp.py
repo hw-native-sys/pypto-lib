@@ -204,7 +204,7 @@ def _quant(
         oq_scaled = pl.row_expand_mul(oc_q, g_sq_col)
         oq_i32 = pl.cast(oq_scaled, target_type=pl.INT32, mode="rint")
         oq_half = pl.cast(oq_i32, target_type=pl.FP16, mode="round")
-        oq_i8 = pl.cast(oq_half, target_type=pl.INT8, mode="trunc")
+        oq_i8 = pl.cast(oq_half, target_type=pl.INT8, mode="trunc", saturation_mode="on")
         o_r_i8_pad[0:T, q0 : q0 + QUANT_COL_TILE] = oq_i8
     return q_tid
 
@@ -356,7 +356,7 @@ def o_proj_tp_core(
             level=pl.Level.CORE_GROUP, name_hint="quant_pad_zero", deps=[_sync_tid], allow_early_resolve=True
         ) as pad_tid:
             zero_half = pl.full([T_PAD - T, O_LORA], dtype=pl.FP16, value=0.0)
-            zero_i8 = pl.cast(zero_half, target_type=pl.INT8, mode="trunc")
+            zero_i8 = pl.cast(zero_half, target_type=pl.INT8, mode="trunc", saturation_mode="on")
             o_r_i8_pad[T:T_PAD, 0:O_LORA] = zero_i8
 
         pb_tid = _proj_chain(

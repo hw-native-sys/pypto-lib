@@ -150,7 +150,7 @@ def gate(
                 xn_q_i32 = pl.cast(xn_q_scaled, pl.INT32, mode="rint")
                 xn_q_half = pl.cast(xn_q_i32, pl.FP16, mode="round")
                 x_norm_i8[t0 : t0 + T_TILE, xq_b_k : xq_b_k + QUANT_TILE] = \
-                    pl.cast(xn_q_half, pl.INT8, mode="trunc")
+                    pl.cast(xn_q_half, pl.INT8, mode="trunc", saturation_mode="on")
 
     # Zero inactive-token routing outputs.
     with pl.at(level=pl.Level.CORE_GROUP, name_hint="gate_pre_route", allow_early_resolve=True):
