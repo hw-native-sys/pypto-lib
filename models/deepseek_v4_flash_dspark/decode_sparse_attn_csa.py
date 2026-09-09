@@ -66,6 +66,7 @@ QK_PROB_READY_EVENT = 2
 QK_PV_READY_EVENT = 3
 ATTN_K_TILE = 128
 NUM_QK_CORES = 24  # qk_pv dispatch lanes
+CSA_PLAN_WORKERS = 16  # csa_slots_build_valid_qk_plan token-tile lanes
 T_PAD = ((T + 16 - 1) // 16) * 16  # Cube M floor
 ATTENTION_PUBLISH_WORKERS = 48
 ATTENTION_PUBLISH_T_TILE = 4
@@ -76,6 +77,13 @@ PUBLISH_GROUPS = H_TILE // HEADS_PER_GROUP
 ROPE_CS_T_TILE = 8
 TOPK = WIN + CMP_TOPK
 SPARSE_BLOCKS = max(2, (TOPK + ATTN_K_TILE - 1) // ATTN_K_TILE)  # Sparse-K block floor
+# One whole 64-byte DDR line per token row of valid_block_mask: the plan lanes
+# write it with scalar pl.write, and a scalar write lands a full line, so two
+# lanes sharing a line would silently drop each other's stores.
+MASK_LINE_ELEMS = 64 // 4
+VALID_BLOCK_MASK_COLS = (
+    (SPARSE_BLOCKS + MASK_LINE_ELEMS - 1) // MASK_LINE_ELEMS
+) * MASK_LINE_ELEMS
 PADDED_TOPK = SPARSE_BLOCKS * ATTN_K_TILE
 SWA_TILE_WIN_ROWS = min(ATTN_K_TILE, WIN)
 SWA_RUNS = (SWA_TILE_WIN_ROWS + 2 * (BLOCK_SIZE - 1)) // BLOCK_SIZE  # Sliding-window page runs
@@ -120,10 +128,14 @@ def sparse_attn_csa(
     # Sparse slot indices, additive softmax bias, and per-block validity.
     sparse_bias = pl.create_tensor([t_dim, PADDED_TOPK], dtype=pl.FP32)
     cmp_sparse_indices = pl.create_tensor([t_dim, CMP_TOPK], dtype=pl.INT32)
-    valid_block_mask = pl.create_tensor([t_dim, SPARSE_BLOCKS], dtype=pl.INT32)
-    with pl.at(level=pl.Level.CORE_GROUP, name_hint="csa_slots_build_valid_qk_plan") as qk_plan_tid:
+    valid_block_mask = pl.create_tensor([t_dim, VALID_BLOCK_MASK_COLS], dtype=pl.INT32)
+    # Every token tile is independent: it reads its own idx_topk / position_ids /
+    # window_swa_indices rows and writes its own cmp_sparse_indices, valid_block_mask
+    # and sparse_bias rows, so the tiles spread over lanes instead of one core.
+    with pl.spmd(CSA_PLAN_WORKERS, name_hint="csa_slots_build_valid_qk_plan") as qk_plan_tid:
+        plan_worker = pl.tile.get_block_idx()
         # Valid compressed slots.
-        for bias_t0 in pl.range(0, t_dim, BIAS_T_TILE):
+        for bias_t0 in pl.range(plan_worker * BIAS_T_TILE, t_dim, CSA_PLAN_WORKERS * BIAS_T_TILE):
             c_raw = pl.cast(idx_topk[bias_t0 : bias_t0 + BIAS_T_TILE, 0:IDX_TOPK], target_type=pl.FP32)
             c_pos = pl.cast(position_ids[bias_t0 : bias_t0 + BIAS_T_TILE, 0:1], target_type=pl.FP32)
             c_pos_scaled = pl.mul(pl.add(c_pos, 1.0), COMPRESS_RATIO_INV)
@@ -138,6 +150,11 @@ def sparse_attn_csa(
             cmp_sparse_indices[bias_t0 : bias_t0 + BIAS_T_TILE, 0:IDX_TOPK] = pl.cast(c_out, target_type=pl.INT32)
             v_win_f = pl.cast(window_swa_indices[bias_t0 : bias_t0 + BIAS_T_TILE, 0:WIN], target_type=pl.FP32)
             v_win_valid = pl.minimum(pl.maximum(pl.add(v_win_f, 1.0), 0.0), 1.0)
+            # Scalar writes, but VALID_BLOCK_MASK_COLS gives every token row its own
+            # whole 64-byte line, and a lane owns BIAS_T_TILE entire rows, so no two
+            # lanes can land in the same line. The compiler still reports
+            # ScalarWriteLineShared because the row index is computed at runtime and
+            # it cannot prove that; the golden replay is what checks it.
             raw_block_valid = pl.row_max(v_win_valid)
             for c_t0 in pl.range(BIAS_T_TILE):
                 c_valid = pl.cast(pl.read(raw_block_valid, [c_t0, 0]), target_type=pl.INT32)
