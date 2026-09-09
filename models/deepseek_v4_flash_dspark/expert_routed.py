@@ -329,9 +329,20 @@ def expert_routed(
     recv_y: pl.Tensor[[N_LOCAL_EXPERTS, RECV_MAX, D], pl.BF16],
 ):
     recv_y_flat = pl.reshape(recv_y, [N_LOCAL_EXPERTS * RECV_MAX, D])
-    inputs_ready = pl.system.task_dummy(deps=[])
+    d_tiles = D // D_OUT_TILE_ACT
+    with pl.spmd(
+        N_LOCAL_EXPERTS * TILES_PER_EXPERT * d_tiles,
+        name_hint="expert_recv_y_zero",
+    ) as inputs_ready:
+        block = pl.tile.get_block_idx()
+        zero_row = (block // d_tiles) * RECV_TILE
+        zero_col = (block % d_tiles) * D_OUT_TILE_ACT
+        recv_y_flat[
+            zero_row : zero_row + RECV_TILE,
+            zero_col : zero_col + D_OUT_TILE_ACT,
+        ] = pl.full([RECV_TILE, D_OUT_TILE_ACT], dtype=pl.BF16, value=0.0)
     for local_e in pl.parallel(N_LOCAL_EXPERTS):
-        n_rows = pl.read(recv_expert_count, [local_e, 0])
+        n_rows = pl.cast(pl.read(recv_expert_count, [local_e, 0]), pl.INDEX)
         n_tiles = (n_rows + RECV_TILE - 1) // RECV_TILE
         for tile in pl.parallel(n_tiles):
             tile_row = tile * RECV_TILE
