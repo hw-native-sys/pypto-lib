@@ -442,6 +442,7 @@ def _moe_tile(
     data_arrived: pld.DistributedTensor[[N_RANKS, 1], pl.INT32],
     routed_y_buf: pld.DistributedTensor[[N_ROUTES, D], pl.BF16],
     combine_arrived: pld.DistributedTensor[[N_RANKS, 1], pl.INT32],
+    task_handles: pl.Array[1, pl.TASK_ID],
     layer_id: pl.Scalar[pl.INT32],
     num_tokens: pl.Scalar[pl.INT32],
     my_rank: pl.Scalar[pl.INT32],
@@ -478,6 +479,8 @@ def _moe_tile(
         recv_meta, recv_x, recv_aux, recv_route, arrived, data_arrived,
         num_tokens, my_rank, moe_epoch,
     )
+
+    task_handles[0] = dispatch_done
 
     expert_completion_tids = pl.array.create(N_LOCAL, pl.TASK_ID)
     for local_e in pl.parallel(N_LOCAL):
@@ -553,6 +556,74 @@ def _moe_tile(
 
 
 @pl.jit.inline(auto_scope=False)
+def moe_with_task_handles(
+    # model inputs
+    x_hc: pl.Tensor[[T, HC_MULT, D], pl.FP32],
+    hc_ffn_fn: pl.Tensor[[MIX_HC, HC_DIM], pl.FP32],
+    hc_ffn_scale: pl.Tensor[[3], pl.FP32],
+    hc_ffn_base: pl.Tensor[[MIX_HC], pl.FP32],
+    norm_w: pl.Tensor[[D], pl.BF16],
+    gate_w: pl.Tensor[[N_EXPERTS_GLOBAL, D], pl.FP32],
+    gate_bias: pl.Tensor[[N_EXPERTS_GLOBAL], pl.FP32],
+    tid2eid: pl.Tensor[[VOCAB, TOPK], pl.INT32],
+    input_ids: pl.Tensor[[T], pl.INT64],
+    routed_w1: pl.Tensor[[N_LOCAL, MOE_INTER, D], pl.INT8],
+    routed_w1_scale: pl.Tensor[[N_LOCAL, MOE_INTER], pl.FP32],
+    routed_w3: pl.Tensor[[N_LOCAL, MOE_INTER, D], pl.INT8],
+    routed_w3_scale: pl.Tensor[[N_LOCAL, MOE_INTER], pl.FP32],
+    routed_w2: pl.Tensor[[N_LOCAL, D, MOE_INTER], pl.INT8],
+    routed_w2_scale: pl.Tensor[[N_LOCAL, D], pl.FP32],
+    shared_w1: pl.Tensor[[MOE_INTER, D], pl.INT8],
+    shared_w1_scale: pl.Tensor[[MOE_INTER], pl.FP32],
+    shared_w3: pl.Tensor[[MOE_INTER, D], pl.INT8],
+    shared_w3_scale: pl.Tensor[[MOE_INTER], pl.FP32],
+    shared_w2: pl.Tensor[[D, MOE_INTER], pl.INT8],
+    shared_w2_scale: pl.Tensor[[D], pl.FP32],
+    # final output
+    x_next: pl.Tensor[[T, HC_MULT, D], pl.FP32],
+    # windows
+    recv_meta: pld.DistributedTensor[[N_RANKS, N_LOCAL], pl.INT32],
+    recv_x: pld.DistributedTensor[[N_LOCAL * RECV_MAX, D], pl.INT8],
+    recv_aux: pld.DistributedTensor[[N_LOCAL * RECV_MAX, AUX_PAD], pl.FP32],
+    recv_route: pld.DistributedTensor[[N_LOCAL * RECV_MAX, IDX_PAD], pl.INT32],
+    arrived: pld.DistributedTensor[[N_RANKS, 1], pl.INT32],
+    data_arrived: pld.DistributedTensor[[N_RANKS, 1], pl.INT32],
+    routed_y_buf: pld.DistributedTensor[[N_ROUTES, D], pl.BF16],
+    combine_arrived: pld.DistributedTensor[[N_RANKS, 1], pl.INT32],
+    task_handles: pl.Array[1, pl.TASK_ID],
+    # scalars last: runtime TaskArgs forbids a tensor arg after a scalar arg.
+    layer_id: pl.Scalar[pl.INT32],
+    num_tokens: pl.Scalar[pl.INT32],
+    my_rank: pl.Scalar[pl.INT32],
+    # 1-based MoE call id for the shared flag windows (distinct from layer_id).
+    moe_epoch: pl.Scalar[pl.INT32],
+) -> pl.Tensor[[T, HC_MULT, D], pl.FP32]:
+    """Run MoE and export its dispatch-gather task ID."""
+    # Non-output intermediates allocate locally, in their producer's scope.
+    x_mixed = pl.create_tensor([T, D], dtype=pl.BF16)
+    post_ffn = pl.create_tensor([T, HC_MULT], dtype=pl.FP32, manual_dep=True)
+    comb_ffn = pl.create_tensor([T, HC_MULT * HC_MULT], dtype=pl.FP32)
+    hc_pre(x_hc, hc_ffn_fn, hc_ffn_scale, hc_ffn_base, x_mixed, post_ffn, comb_ffn)
+
+    ffn_out = pl.create_tensor([T, D], dtype=pl.BF16)
+    with pl.scope():
+        _moe_tile(
+            x_mixed,
+            norm_w, gate_w, gate_bias, tid2eid, input_ids,
+            routed_w1, routed_w1_scale, routed_w3, routed_w3_scale,
+            routed_w2, routed_w2_scale,
+            shared_w1, shared_w1_scale, shared_w3, shared_w3_scale,
+            shared_w2, shared_w2_scale,
+            ffn_out,
+            recv_meta, recv_x, recv_aux, recv_route,
+            arrived, data_arrived, routed_y_buf, combine_arrived,
+            task_handles, layer_id, num_tokens, my_rank, moe_epoch,
+        )
+        hc_post(ffn_out, x_hc, post_ffn, comb_ffn, x_next)
+    return x_next
+
+
+@pl.jit.inline(auto_scope=False)
 def moe(
     # model inputs
     x_hc: pl.Tensor[[T, HC_MULT, D], pl.FP32],
@@ -594,27 +665,21 @@ def moe(
     # 1-based MoE call id for the shared flag windows (distinct from layer_id).
     moe_epoch: pl.Scalar[pl.INT32],
 ) -> pl.Tensor[[T, HC_MULT, D], pl.FP32]:
-    # Non-output intermediates allocate locally, in their producer's scope.
-    x_mixed = pl.create_tensor([T, D], dtype=pl.BF16)
-    post_ffn = pl.create_tensor([T, HC_MULT], dtype=pl.FP32, manual_dep=True)
-    comb_ffn = pl.create_tensor([T, HC_MULT * HC_MULT], dtype=pl.FP32)
-    hc_pre(x_hc, hc_ffn_fn, hc_ffn_scale, hc_ffn_base, x_mixed, post_ffn, comb_ffn)
-
-    ffn_out = pl.create_tensor([T, D], dtype=pl.BF16)
-    with pl.scope():
-        _moe_tile(
-            x_mixed,
-            norm_w, gate_w, gate_bias, tid2eid, input_ids,
-            routed_w1, routed_w1_scale, routed_w3, routed_w3_scale,
-            routed_w2, routed_w2_scale,
-            shared_w1, shared_w1_scale, shared_w3, shared_w3_scale,
-            shared_w2, shared_w2_scale,
-            ffn_out,
-            recv_meta, recv_x, recv_aux, recv_route,
-            arrived, data_arrived, routed_y_buf, combine_arrived,
-            layer_id, num_tokens, my_rank, moe_epoch,
-        )
-        hc_post(ffn_out, x_hc, post_ffn, comb_ffn, x_next)
+    """Run one MoE layer with private scheduling task handles."""
+    task_handles = pl.array.create(1, pl.TASK_ID)
+    moe_with_task_handles(
+        x_hc,
+        hc_ffn_fn, hc_ffn_scale, hc_ffn_base,
+        norm_w, gate_w, gate_bias, tid2eid, input_ids,
+        routed_w1, routed_w1_scale, routed_w3, routed_w3_scale,
+        routed_w2, routed_w2_scale,
+        shared_w1, shared_w1_scale, shared_w3, shared_w3_scale,
+        shared_w2, shared_w2_scale,
+        x_next,
+        recv_meta, recv_x, recv_aux, recv_route,
+        arrived, data_arrived, routed_y_buf, combine_arrived,
+        task_handles, layer_id, num_tokens, my_rank, moe_epoch,
+    )
     return x_next
 
 
@@ -726,6 +791,7 @@ def prefill_moe(
             input_ids_wave = pl.reshape(input_ids_wave_rows, [T])
 
             ffn_wave = pl.create_tensor([T, D], dtype=pl.BF16)
+            task_handles = pl.array.create(1, pl.TASK_ID)
             completion_tid = _moe_tile(
                 x_mixed_wave,
                 norm_w, gate_w, gate_bias, tid2eid, input_ids_wave,
@@ -736,7 +802,7 @@ def prefill_moe(
                 ffn_wave,
                 recv_meta, recv_x, recv_aux, recv_route,
                 arrived, data_arrived, routed_y_buf, combine_arrived,
-                layer_id, wave_rows_i32, my_rank, moe_epoch,
+                task_handles, layer_id, wave_rows_i32, my_rank, moe_epoch,
             )
             with pl.spmd(T, name_hint="prefill_moe_output_store", deps=[completion_tid]) as output_store_tid:
                 token = pl.tile.get_block_idx()

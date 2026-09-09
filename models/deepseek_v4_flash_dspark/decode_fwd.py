@@ -79,7 +79,7 @@ from lm_head import (
 )
 from lookup_embedding import VOCAB_DYN as EMBED_VOCAB_DYN
 from lookup_embedding import lookup_embedding
-from moe import clear_moe_signals, moe
+from moe import clear_moe_signals, moe, moe_with_task_handles
 from rmsnorm import rms_norm
 
 
@@ -285,6 +285,64 @@ def decode_embedding_preamble(
             zero_hc_row = pl.full([1, HC_MULT, D], dtype=pl.FP32, value=0.0)
             x_hc[token : token + 1, 0 : HC_MULT, 0 : D] = zero_hc_row
     return x_hc
+
+
+@pl.jit.inline(auto_scope=False)
+def prefetch_next_csa_weights(
+    wq_a: pl.Tensor[[FWD_WEIGHT_BANK_SIZE * D, Q_LORA], pl.BF16],
+    wkv: pl.Tensor[[FWD_WEIGHT_BANK_SIZE * D, HEAD_DIM], pl.BF16],
+    csa_idx_wq_b: pl.Tensor[[FWD_CSA_WEIGHT_BANK_SIZE * Q_LORA, CSA_IDX_N_HEADS * CSA_IDX_HEAD_DIM], pl.INT8],
+    csa_inner_wkv: pl.Tensor[[FWD_CSA_WEIGHT_BANK_SIZE * CSA_INNER_OUT_DIM, D], pl.BF16],
+    csa_inner_wgate: pl.Tensor[[FWD_CSA_WEIGHT_BANK_SIZE * CSA_INNER_OUT_DIM, D], pl.BF16],
+    wq_b: pl.Tensor[[FWD_WEIGHT_BANK_SIZE * Q_LORA, H * HEAD_DIM], pl.INT8],
+    csa_cmp_wkv: pl.Tensor[[FWD_CSA_WEIGHT_BANK_SIZE * CSA_MAIN_OUT_DIM, D], pl.BF16],
+    csa_cmp_wgate: pl.Tensor[[FWD_CSA_WEIGHT_BANK_SIZE * CSA_MAIN_OUT_DIM, D], pl.BF16],
+    csa_weights_proj: pl.Tensor[[FWD_CSA_WEIGHT_BANK_SIZE * D, CSA_IDX_N_HEADS], pl.BF16],
+    wo_a: pl.Tensor[[FWD_WEIGHT_BANK_SIZE * LOCAL_O_GROUPS, O_LORA, O_GROUP_IN], pl.BF16],
+    wo_b: pl.Tensor[[FWD_WEIGHT_BANK_SIZE * D, LOCAL_O_WIDTH], pl.INT8],
+    model_layer: pl.Scalar[pl.INT32],
+    csa_ordinal: pl.Scalar[pl.INT32],
+    anchor_tid: pl.Scalar[pl.TASK_ID],
+):
+    """Prefetch eleven weight slices for the next CSA layer."""
+    weight_layer = model_layer % FWD_WEIGHT_BANK_SIZE
+    extra_layer = csa_ordinal % FWD_CSA_WEIGHT_BANK_SIZE
+    wq_a_layer = pl.slice(wq_a, [D, Q_LORA], [weight_layer * D, 0])
+    wq_a_flat = pl.reshape(wq_a_layer, [D * Q_LORA])
+    wkv_layer = pl.slice(wkv, [D, HEAD_DIM], [weight_layer * D, 0])
+    wkv_flat = pl.reshape(wkv_layer, [D * HEAD_DIM])
+    csa_idx_wq_b_layer = pl.slice(csa_idx_wq_b, [Q_LORA, CSA_IDX_N_HEADS * CSA_IDX_HEAD_DIM], [extra_layer * Q_LORA, 0])
+    csa_idx_wq_b_flat = pl.reshape(csa_idx_wq_b_layer, [Q_LORA * CSA_IDX_N_HEADS * CSA_IDX_HEAD_DIM])
+    csa_inner_wkv_layer = pl.slice(csa_inner_wkv, [CSA_INNER_OUT_DIM, D], [extra_layer * CSA_INNER_OUT_DIM, 0])
+    csa_inner_wkv_flat = pl.reshape(csa_inner_wkv_layer, [CSA_INNER_OUT_DIM * D])
+    csa_inner_wgate_layer = pl.slice(csa_inner_wgate, [CSA_INNER_OUT_DIM, D], [extra_layer * CSA_INNER_OUT_DIM, 0])
+    csa_inner_wgate_flat = pl.reshape(csa_inner_wgate_layer, [CSA_INNER_OUT_DIM * D])
+    wq_b_layer = pl.slice(wq_b, [Q_LORA, H * HEAD_DIM], [weight_layer * Q_LORA, 0])
+    wq_b_flat = pl.reshape(wq_b_layer, [Q_LORA * H * HEAD_DIM])
+    csa_cmp_wkv_layer = pl.slice(csa_cmp_wkv, [CSA_MAIN_OUT_DIM, D], [extra_layer * CSA_MAIN_OUT_DIM, 0])
+    csa_cmp_wkv_flat = pl.reshape(csa_cmp_wkv_layer, [CSA_MAIN_OUT_DIM * D])
+    csa_cmp_wgate_layer = pl.slice(csa_cmp_wgate, [CSA_MAIN_OUT_DIM, D], [extra_layer * CSA_MAIN_OUT_DIM, 0])
+    csa_cmp_wgate_flat = pl.reshape(csa_cmp_wgate_layer, [CSA_MAIN_OUT_DIM * D])
+    csa_weights_proj_layer = pl.slice(csa_weights_proj, [D, CSA_IDX_N_HEADS], [extra_layer * D, 0])
+    csa_weights_proj_flat = pl.reshape(csa_weights_proj_layer, [D * CSA_IDX_N_HEADS])
+    wo_a_layer = pl.slice(wo_a, [LOCAL_O_GROUPS, O_LORA, O_GROUP_IN], [weight_layer * LOCAL_O_GROUPS, 0, 0])
+    wo_a_flat = pl.reshape(wo_a_layer, [LOCAL_O_GROUPS * O_LORA * O_GROUP_IN])
+    wo_b_layer = pl.slice(wo_b, [D, LOCAL_O_WIDTH], [weight_layer * D, 0])
+    wo_b_flat = pl.reshape(wo_b_layer, [D * LOCAL_O_WIDTH])
+    with pl.at(level=pl.Level.CORE_GROUP, name_hint="prefetch_next_csa_w", deps=[anchor_tid]) as prefetch_tid:
+        warm_ctx = pl.prefetch.make_context()
+        pl.prefetch.async_prefetch(wq_a_flat, warm_ctx)
+        pl.prefetch.async_prefetch(wkv_flat, warm_ctx)
+        pl.prefetch.async_prefetch(csa_idx_wq_b_flat, warm_ctx)
+        pl.prefetch.async_prefetch(csa_inner_wkv_flat, warm_ctx)
+        pl.prefetch.async_prefetch(csa_inner_wgate_flat, warm_ctx)
+        pl.prefetch.async_prefetch(wq_b_flat, warm_ctx)
+        pl.prefetch.async_prefetch(csa_cmp_wkv_flat, warm_ctx)
+        pl.prefetch.async_prefetch(csa_cmp_wgate_flat, warm_ctx)
+        pl.prefetch.async_prefetch(csa_weights_proj_flat, warm_ctx)
+        pl.prefetch.async_prefetch(wo_a_flat, warm_ctx)
+        pl.prefetch.async_prefetch(wo_b_flat, warm_ctx)
+    return prefetch_tid
 
 
 @pl.jit(auto_scope=False)
@@ -677,7 +735,8 @@ def decode_fwd(
                 else:
                     zero_moe_row_swa1 = pl.full([1, HC_MULT, D], dtype=pl.FP32, value=0.0)
                     x_attn_moe_swa1[token : token + 1, 0 : HC_MULT, 0 : D] = zero_moe_row_swa1
-            moe(
+            next_moe_tids_swa1 = pl.array.create(1, pl.TASK_ID)
+            moe_with_task_handles(
                 x_attn_moe_swa1,
                 hc_ffn_fn_layer_swa1, hc_ffn_scale_layer_swa1, hc_ffn_base_layer_swa1,
                 norm_w_layer_swa1, gate_w_layer_swa1, gate_bias_layer_swa1, tid2eid_layer_swa1,
@@ -691,8 +750,19 @@ def decode_fwd(
                 x_moe_next,
                 recv_meta, recv_x, recv_aux, recv_route, arrived, data_arrived,
                 routed_y_buf, combine_arrived,
+                next_moe_tids_swa1,
                 pl.const(1, pl.INT32), owner_tokens, my_rank, pl.const(2, pl.INT32),
             )
+            if TP_SIZE > 1:
+                if group_tokens > 0:
+                    next_prefetch_anchor_swa1 = next_moe_tids_swa1[0]
+                    prefetch_next_csa_weights(
+                        wq_a, wkv, csa_idx_wq_b,
+                        csa_inner_wkv, csa_inner_wgate, wq_b,
+                        csa_cmp_wkv, csa_cmp_wgate, csa_weights_proj,
+                        wo_a, wo_b,
+                        pl.const(2, pl.INT32), pl.const(0, pl.INT32), next_prefetch_anchor_swa1,
+                    )
             for token in pl.spmd(MOE_TOKENS, name_hint="decode_fwd_swa1_active_trim"):
                 if token < local_t:
                     if token < owner_tokens:
@@ -952,7 +1022,8 @@ def decode_fwd(
                     else:
                         zero_moe_row_hca = pl.full([1, HC_MULT, D], dtype=pl.FP32, value=0.0)
                         x_attn_moe_hca[token : token + 1, 0 : HC_MULT, 0 : D] = zero_moe_row_hca
-                moe(
+                next_moe_tids_hca = pl.array.create(1, pl.TASK_ID)
+                moe_with_task_handles(
                     x_attn_moe_hca,
                     hc_ffn_fn_layer_hca, hc_ffn_scale_layer_hca, hc_ffn_base_layer_hca,
                     norm_w_layer_hca, gate_w_layer_hca, gate_bias_layer_hca, tid2eid_layer_hca,
@@ -966,8 +1037,19 @@ def decode_fwd(
                     x_moe_next,
                     recv_meta, recv_x, recv_aux, recv_route, arrived, data_arrived,
                     routed_y_buf, combine_arrived,
+                    next_moe_tids_hca,
                     hca_model_layer, owner_tokens, my_rank, hca_model_layer + 1,
                 )
+                if TP_SIZE > 1:
+                    if group_tokens > 0:
+                        next_prefetch_anchor_hca = next_moe_tids_hca[0]
+                        prefetch_next_csa_weights(
+                            wq_a, wkv, csa_idx_wq_b,
+                            csa_inner_wkv, csa_inner_wgate, wq_b,
+                            csa_cmp_wkv, csa_cmp_wgate, csa_weights_proj,
+                            wo_a, wo_b,
+                            hca_model_layer + 1, pl.cast(ordinal + 1, pl.INT32), next_prefetch_anchor_hca,
+                        )
                 for token in pl.spmd(MOE_TOKENS, name_hint="decode_fwd_hca_active_trim"):
                     if token < local_t:
                         if token < owner_tokens:
@@ -2023,6 +2105,7 @@ def main():
     parser.add_argument("--enable-chip-swimlane", type=int, nargs="?", const=1, default=0, choices=range(5))
     parser.add_argument("--runtime-dir", type=str, default=None)
     parser.add_argument("--save-data", action="store_true", default=False)
+    parser.add_argument("--golden-data", type=str, default=None)
     parser.add_argument("--dump-passes", action="store_true", default=False)
     parser.add_argument("--log-level", type=str, default=None)
     args = parser.parse_args()
@@ -2058,6 +2141,7 @@ def main():
         specs=specs,
         golden_fn=golden_decode_fwd,
         save_data=args.save_data,
+        golden_data=args.golden_data,
         compile_only=args.compile_only,
         runtime_dir=args.runtime_dir,
         config=dict(
