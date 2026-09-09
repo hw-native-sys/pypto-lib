@@ -240,7 +240,7 @@ def indexer(
             qh_q_scaled = pl.row_expand_mul(qh_q_f32, qh_scale_quant)
             qh_q_i32 = pl.cast(qh_q_scaled, target_type=pl.INT32, mode="rint")
             qh_q_half = pl.cast(qh_q_i32, target_type=pl.FP16, mode="round")
-            qh_i8 = pl.cast(qh_q_half, target_type=pl.INT8, mode="trunc")
+            qh_i8 = pl.cast(qh_q_half, target_type=pl.INT8, mode="trunc", saturation_mode="on")
             qr_hadamard_i8[o0 : o0 + QH_QUANT_TILE, h1 : h1 + QH_HEAD_DIM_TILE] = qh_i8
 
     x_flat = pl.reshape(x, [T, D])

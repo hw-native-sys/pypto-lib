@@ -225,7 +225,7 @@ def qkv_proj_rope(
             qr_q_scaled = pl.row_expand_mul(qr_q_normed, qr_scale_quant_t)
             qr_q_i32 = pl.cast(qr_q_scaled, target_type=pl.INT32, mode="rint")
             qr_q_half = pl.cast(qr_q_i32, target_type=pl.FP16, mode="round")
-            qr_q_i8 = pl.cast(qr_q_half, target_type=pl.INT8, mode="trunc")
+            qr_q_i8 = pl.cast(qr_q_half, target_type=pl.INT8, mode="trunc", saturation_mode="on")
             qr_view[tg : tg + T_TILE, qa : qa + QUANT_TILE] = qr_q_i8
             qr_i8_matmul[tg : tg + T_TILE, qa : qa + QUANT_TILE] = qr_q_i8
 
