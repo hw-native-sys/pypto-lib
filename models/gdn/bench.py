@@ -69,7 +69,7 @@ def _random_specs(specs):
 def bench_stage(stage: str, t: int, h: int, platform: str, device: int,
                 rounds: int, warmup: int, data: str) -> dict:
     """One compile and one timed loop. Returns the record for this (stage, shape)."""
-    from golden import run_jit
+    from golden import run
 
     mod = importlib.import_module(f"models.gdn.{stage}")
     fn = mod.build_kernel(t=t, h=h, d=D, chunk=CHUNK)
@@ -78,11 +78,11 @@ def bench_stage(stage: str, t: int, h: int, platform: str, device: int,
         specs = _random_specs(specs)
 
     started = time.time()
-    result = run_jit(
+    result = run(
         fn=fn,
         specs=specs,
         golden_fn=None,                       # timing only; correctness is test_gdn_stages
-        runtime_cfg=dict(platform=platform, device_id=device),
+        config=dict(platform=platform, device_id=device),
     )
     rec = dict(stage=stage, t=t, h=h, d=D, chunk=CHUNK, rounds=rounds,
                warmup=warmup, data=data, ok=bool(result.passed),

@@ -92,7 +92,7 @@ def build_tensor_specs(t: int = T, h: int = H, d: int = D, chunk: int = CHUNK):
         TensorSpec("g_sum", [h, t], torch.float32,
                    init_value=reference.lazy("scaled_dot_kkt", "g_sum", t, h, d, chunk, reference.to_hT)),
         TensorSpec("mask", [chunk, chunk], torch.float32, init_value=init_mask),
-        TensorSpec("a_out", [t, h, chunk], torch.float16, is_output=True),
+        TensorSpec("a_out", [t, h, chunk], torch.float16),
     ]
 
 
@@ -106,7 +106,7 @@ def golden_gdn_scaled_dot_kkt(tensors):
 
 if __name__ == "__main__":
     import argparse
-    from golden import run_jit
+    from golden import run
 
     parser = argparse.ArgumentParser()
     parser.add_argument("-p", "--platform", type=str, default="a2a3",
@@ -117,14 +117,14 @@ if __name__ == "__main__":
     parser.add_argument("--runtime-dir", type=str, default=None)
     args = parser.parse_args()
 
-    result = run_jit(
+    result = run(
         fn=gdn_scaled_dot_kkt,
         specs=build_tensor_specs(),
         golden_fn=golden_gdn_scaled_dot_kkt,
         golden_data=args.golden_data,
         runtime_dir=args.runtime_dir,
         save_data=args.save_data,
-        runtime_cfg=dict(
+        config=dict(
             platform=args.platform,
             device_id=args.device,
         ),
