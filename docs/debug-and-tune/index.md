@@ -21,6 +21,7 @@ then move from the broadest evidence to the narrowest:
 | Understand how task edges are formed and when the scheduler issues them | [Dependencies and Scheduling](dependency-and-scheduling.md) |
 | Fit intermediate tensors in the runtime's ring heaps and measure per-scope peaks | [Ring Heap and Scope Stats](ring-heap-and-scope-stats.md) |
 | Choose matmul row, N, and K tiles | [Cube Tile Tuning](cube-tile-tuning.md) |
+| Warm L2 for a weight set the next stage evicts | [L2 Prefetch](l2-prefetch.md) |
 | Inspect one generated kernel in the operator simulator | [In-Core Simulator Profiling](incore-simulator-profiling.md) |
 | Partition phases inside a multi-core CCE extern kernel on real hardware | [CCE In-Core Profiling](cce-incore-profiling.md) |
 

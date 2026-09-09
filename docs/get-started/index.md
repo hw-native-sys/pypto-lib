@@ -1,21 +1,18 @@
 # Get Started
 
-PyPTO-Lib contains executable kernels and model implementations built with
-[PyPTO](https://www.pypto.ai/pypto/). It also contains the Golden Harness used
-to compile those programs, execute them with
-[simpler](https://www.pypto.ai/simpler/), and compare their outputs with
-PyTorch references.
+PyPTO-Lib holds runnable [PyPTO](https://www.pypto.ai/pypto/) kernels and
+end-to-end LLM models, plus the Golden Harness that compiles them, executes
+them with [simpler](https://www.pypto.ai/simpler/), and compares their outputs
+with PyTorch references.
 
 Follow these pages in order:
 
 1. [Install the development environment](installation.md). PyPTO owns the
    compatible runtime, PTOAS, and PTO ISA revisions, so begin with a selected
    PyPTO checkout.
-2. [Run the first kernel](first-kernel.md) on a simulator or an available NPU.
-3. [Choose a platform and device](platforms.md) for later examples and model
-   kernels.
-4. Read the
-   [kernel coding style](../pypto-coding/pypto-coding-style.md) before
+2. [Run the first kernel](first-kernel.md) on a simulator or an available NPU,
+   and pick the platform for later examples and model kernels.
+3. Read the [PyPTO Coding](../pypto-coding/index.md) chapter before
    modifying a kernel.
 
 After the first successful run, continue with

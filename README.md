@@ -1,7 +1,6 @@
 # PyPTO-Lib
 
-Tensor-level kernels and model implementations built on the **pypto**
-programming framework, targeting Ascend NPUs (910B/C, 950).
+**PyPTO** kernels and end-to-end LLM models for Ascend NPUs.
 
 **Documentation:** [www.pypto.ai/pypto-lib](https://www.pypto.ai/pypto-lib/)
 
@@ -39,19 +38,18 @@ python models/qwen3_14b/decode_fwd.py -p a2a3 -d 0   # real NPU, device 0
 The learning examples accept `-p {a2a3,a2a3sim,a5,a5sim}` and exit non-zero
 on validation mismatch. Model and distributed entry points have
 script-specific platform and device arguments; inspect `--help` and the
-[platform guide](docs/get-started/platforms.md). See the
+[platform table](docs/get-started/first-kernel.md#platforms-and-devices). See the
 [compile and runtime workflow](docs/run-and-validate/compile-runtime-workflow.md) for the full
 flow (compile → input generation → golden → runtime → validation).
 
 ## Writing a kernel
 
-Read [docs/pypto-coding/pypto-coding-style.md](docs/pypto-coding/pypto-coding-style.md) — it covers
-the two kernel forms (`@pl.jit` / `@pl.jit.inline` and `@pl.program` /
-`@pl.function`), `pl.at` scopes, the five loop constructs (`pl.range`,
-`pl.unroll`, `pl.parallel`, `pl.pipeline`, `pl.spmd`), runtime scopes
-(`pl.scope`), scalar access (`pl.read` / `pl.write`), and the vector / cube /
-mte op set. For a multi-card kernel, add
-[docs/pypto-coding/distributed-programming.md](docs/pypto-coding/distributed-programming.md)
+Read [docs/pypto-coding/](docs/pypto-coding/index.md) — the coding style split
+across kernel structure (the two authoring forms, `pl.at` regions, dynamic
+shapes), operations (vector / cube / mte / scalar), the five loop constructs
+(`pl.range`, `pl.unroll`, `pl.parallel`, `pl.pipeline`, `pl.spmd`), mixed
+cube + vector regions, and naming. For a multi-card kernel, add
+[docs/pypto-coding/l3-programming.md](docs/pypto-coding/l3-programming.md)
 — window buffers, cross-rank data movement, and notify / wait.
 
 Existing kernels under `examples/intermediate/` are the best reference for

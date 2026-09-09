@@ -52,12 +52,32 @@ PYTHONPATH="$PWD" \
   python examples/beginner/hello_world.py -p a2a3 -d 0
 ```
 
-`-d 0` selects device 0. Do not assume that device is available on a shared
-host; use the allocation mechanism provided by that host.
+`-d 0` selects device 0. Do not assume it is free on a shared host — use that
+host's allocator rather than probing for an idle card and racing another user.
 
-See [Platforms and Devices](platforms.md) before changing `-p`, and check the
-target script's `--help` because distributed and model entry points may use a
-different device argument shape.
+## Platforms and devices
+
+`-p` selects both the PyPTO backend and the simpler runtime target:
+
+| CLI value | PyPTO backend | Execution target | Device argument |
+|---|---|---|---|
+| `a2a3sim` | `Ascend910B` | A2/A3 simulator | none |
+| `a2a3` | `Ascend910B` | Ascend 910B/C NPU | usually one integer ID |
+| `a5sim` | `Ascend950` | A5 simulator | none |
+| `a5` | `Ascend950` | Ascend 950 NPU | usually one integer ID |
+
+The mapping is enforced by
+[`golden.runner._backend_for_platform`](../../golden/runner.py) — an unknown
+platform fails instead of silently choosing a default. The host's own CPU
+architecture (`uname -m`) only picks the PTOAS release asset at install time; it
+does not decide whether a run uses a simulator or a real NPU.
+
+Two caveats hold everywhere beyond the beginner examples. **Declared is not
+validated**: a CLI choice means the script accepts that target, not that every
+path in it was verified there. And **the device argument is per-script** — a
+distributed entry takes a comma-separated set plus a world-size argument, and
+some large programs are device-only, or take a compile-only path on a simulator.
+Read the target's `--help` first.
 
 ## Read the kernel
 
@@ -76,8 +96,9 @@ for r in pl.parallel(0, ROWS, ROW_TILE):
 - `pl.at` defines an InCore region.
 - The slice load, `pl.add`, and slice store operate on one tile.
 
-Read the [kernel coding style](../pypto-coding/pypto-coding-style.md) before
-editing this or another kernel.
+Read [L2 Programming](../pypto-coding/l2-programming.md) and
+[Operations](../pypto-coding/operations.md) before editing this or another
+kernel.
 
 ## Understand the validation
 

@@ -8,7 +8,6 @@ description: Set up the pypto-lib development environment, including pypto, ptoa
 Read the canonical public setup guides before changing the environment:
 
 - [Installation and Environment](../../../docs/get-started/installation.md)
-- [Platforms and Devices](../../../docs/get-started/platforms.md)
 
 Use `.github/actions/setup-ci-job/action.yml` as the executable reference for a
 CI-equivalent build. Do not duplicate its current versions or host paths in

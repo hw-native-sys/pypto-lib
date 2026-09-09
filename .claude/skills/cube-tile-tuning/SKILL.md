@@ -48,7 +48,7 @@ allocation or the currently bound pipe. The budget script is an estimate.
 1. **Resolve the target.**
    - Read the requested kernel, its golden function, and its existing tile
      constants.
-   - Follow `docs/pypto-coding/pypto-coding-style.md` for any kernel edit.
+   - Follow `docs/pypto-coding/` for any kernel edit.
    - Identify all matmuls in the affected scope and give distinct tasks
      distinct knobs before sweeping.
 

@@ -149,6 +149,92 @@ merged Perfetto view and dependency arrows.
 The trace shows one lane per AICPU / AIC / AIV with task name, duration
 and dependency edges — gaps and stalls are visible directly.
 
+### Timing one stage of a full network — task-timing slots
+
+A swimlane answers "where did every task go". A narrower question comes up
+constantly on a full network: **what does this one stage cost inside the whole
+program?** simpler answers that with *selective task-timing slots* — 16 fixed
+slots into which the Scheduler folds a tagged task's AICPU dispatch→finish
+window, at the same boundaries the swimlane's `finish_time` uses.
+
+| | Task-timing slot | Chip swimlane |
+|---|---|---|
+| Covers | up to 16 tagged tasks | every task |
+| Switch | tagging in the generated orchestration `.cpp` — no env var, no compile gate, works in `SIMPLER_DFX=0` builds | `--enable-chip-swimlane` |
+| Cost on untagged tasks | one cache-hot sentinel compare | per-task records and collector threads |
+| Output | `[STRACE]` spans named `chip.run.runner_run.device_wall.task_slot_<N>` (`clk=dev`, `ts` / `dur` in ns) | merged Perfetto JSON |
+
+Reach for a slot when a whole-network swimlane is too large to read or perturbs
+the schedule being measured, and you already know which stage you care about.
+Reach for the swimlane when the question is *why* that stage is slow.
+
+They are also how a change the benchmark loop distorts gets attributed. An L2
+warm is the standard example: `PYPTO_BENCH` replays the same weights every round,
+so its L2 is already warm and the end-to-end delta is both flattered and diluted
+— see [L2 Prefetch](l2-prefetch.md#the-benchmark-loop-flatters-a-warm).
+
+**PyPTO exposes no DSL surface for the tag**, so the workflow patches the
+generated orchestration C++ and replays it — the same
+[`runtime_dir` loop](debugging.md#3-reuse-a-compile-with-runtime_dir-edit-cpp-pto-and-retest)
+used for any generated-code edit:
+
+1. Compile once (`--compile-only`, or reuse an existing build directory).
+2. Open the orchestration source — `<work_dir>/orchestration/<prog>.cpp` for an
+   L2 program, `<work_dir>/next_levels/<prog>/orchestration/<prog>.cpp` for an
+   L3 one. Every submit block carries a comment naming its scope and kernel,
+   which is how a stage is located:
+
+   ```cpp
+   // Spmd w1_mm_spmd: w1_mm
+   CoreTaskArgs params_t0;
+   params_t0.add_input(ext_recv_x);
+   params_t0.add_output(ext_gate_i32);
+   params_t0.set_task_timing_slot(0);        // <- the tag
+   params_t0.launch_spec.set_block_num(8);
+   rt_submit_aic_task(0, params_t0);
+   ```
+
+3. **Tag one iteration, not all.** A `pl.range` layer loop becomes a real C++
+   `for` whose induction variable keeps the DSL's own name, so an unguarded tag
+   merges all 20 layers into one useless window. Guard it:
+
+   ```cpp
+   if (ordinal == 10) params_t0.set_task_timing_slot(0);
+   ```
+
+4. Replay the patched build. Editing the `.cpp` is the only signal the harness
+   needs — do not delete the sibling `.o` / `.so`:
+
+   ```bash
+   python models/deepseek_v4_flash_mtp/decode_fwd.py -p a2a3 -d 0 \
+       --runtime-dir build_output/<ProgramName>_<ts>
+   ```
+
+5. Read the spans out of the runtime log. They are emitted at the `timing`
+   level, which is the default; pass `PYPTO_RUNTIME_LOG=timing` if the entry
+   raised the threshold, then grep for `task_slot_`.
+
+#### Reading the numbers
+
+- **Each slot reduces to `min(dispatch)` / `max(finish)`.** Reusing one slot
+  across several tasks yields a single merged window from the earliest tagged
+  dispatch to the latest tagged finish — which is exactly how a multi-kernel
+  *stage* is measured. Distinct slots keep each task's own window, so tooling
+  can recover `finish(B) − dispatch(A)`. A MIX task's AIC/AIV0/AIV1 subtasks and
+  an SPMD task's blocks all fold into the one tagged slot.
+- **Read finish-to-finish, not span length.** `dispatch` is the *speculative*
+  publication, so under `allow_early_resolve` the windows overlap heavily and a
+  slot's own `dur` is not that stage's cost. Take
+  `(slot_{k+1}.ts + slot_{k+1}.dur) − (slot_k.ts + slot_k.dur)`, which means
+  tagging the preceding stage too — otherwise the first stage has no anchor.
+- **Slots reset every run**, and a `--runtime-dir` replay is correctness-only, so
+  one replay yields one sample per slot. Repeat it for a distribution, against a
+  frozen golden ([Save and Replay](../run-and-validate/save-and-replay.md)) so a
+  repeat costs only the dispatch.
+- **The patch lives in `build_output/` only.** Recompiling regenerates the
+  orchestration `.cpp` and silently drops every tag — which is also how the
+  instrumentation is removed.
+
 ### What to look for
 
 Look for these shapes on the swimlane that indicate a problem:
@@ -159,7 +245,8 @@ Look for these shapes on the swimlane that indicate a problem:
 | Long tail on a single AIC/AIV | One kernel is too big and serializes | Split it (item 3) |
 | Cube / vector unit utilization low even though kernel is busy | Tile size under-fills the user-visible on-chip buffers | Re-tile against `Mat` / `Acc` for cube or `Vec` for vector work (item 4) |
 | Cube lane busy while vector lane idle (or vice versa) | Vec/cube epilogue is split into separate kernels | Merge into a mixed kernel (item 2c) |
-| Sequential AICPU dispatch trail per region | Region issues one kernel per iteration | Use `pl.spmd` to dispatch a block fan-out once (item 5) |
+| A stage re-reads the same weights every layer, MTE2-bound, with a large unrelated stage in between | The weights are evicted from L2 before the next use | Warm them with `pl.prefetch` (item 5) |
+| Sequential AICPU dispatch trail per region | Region issues one kernel per iteration | Use `pl.spmd` to dispatch a block fan-out once (item 6) |
 
 A gap on this trace is not automatically a scheduling problem: the interval
 before a task splits into producer-FIN detection, ready-but-undispatched
@@ -330,7 +417,15 @@ tile's MTE2 overlaps the current tile's compute (see Part 2 item 2).
 For the complete M/N/K constraint model and empirical sweep method, see
 [Cube Tile Tuning](cube-tile-tuning.md).
 
-#### 5. `pl.spmd` for parallel sub-kernel dispatch
+#### 5. Warm L2 for a weight set the next stage evicts
+
+When a stage re-reads a fixed weight set every layer and something between two
+layers evicts it, an SDMA cache warm (`pl.prefetch`) can hide the reload behind
+compute that is already running. It writes no tensor, so it is free to try and
+free to delete — but a partial or oversized warm costs more than it saves. See
+[L2 Prefetch](l2-prefetch.md).
+
+#### 6. `pl.spmd` for parallel sub-kernel dispatch
 
 `pl.spmd(N)` dispatches `N` blocks of an InCore body in parallel from
 **one** AICPU schedule entry, instead of N successive `pl.parallel +

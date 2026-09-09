@@ -48,7 +48,7 @@ class TensorSpec:
 
             The value is the tensor's initial host content and nothing else.
             The runtime does not upload a pure ``Out`` parameter's host buffer
-            (see ``docs/pypto-coding/pypto-coding-style.md``), so an
+            (see ``docs/pypto-coding/l2-programming.md``), so an
             ``init_value`` there reaches only the golden reference.
         resident: Keep this tensor device-resident (``child_memory``): the harness
             uploads inputs once and reuses them across the validation dispatch and every

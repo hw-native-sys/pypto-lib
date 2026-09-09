@@ -566,9 +566,10 @@ Every decode attention layer streams its whole weight set from HBM once per
 forward, and in a full forward that traffic is always **cold**: the MoE between
 two layers pushes 427.8 MB through L2, so nothing an attention layer read
 survives to the next one. One SDMA CMO warm per layer now covers every weight
-that layer reads, in consumer-deadline order, **anchored at layer entry** where
-the cores are still busy with the previous stage so the warm overlaps them —
-anchoring it later measured worse.
+that layer reads, in consumer-deadline order, **anchored on the layer's
+`rms_norm`** — early enough to land before the projections need the weights, and
+late enough that the cores are busy with work the warm can overlap. Both the
+layer's first task and every later anchor measured worse.
 
 **Fast rank p50 40132.0 → 39287.9 µs (−2.10 %)**, with each attention block
 returning to its standalone speed and MoE unaffected, as expected (#963).
@@ -582,7 +583,9 @@ Three hard constraints, each established by its own negative result:
 | **The warm set must fit L2.** | 157.9 MB and 146.9 MB sets fit inside 192 MiB and win; a 268.4 MB set (1.33× L2) evicts itself and costs 3 %. |
 
 The warm is a cache hint with no destination — deleting the scope changes no
-value. That is what makes it safe to tune aggressively.
+value. That is what makes it safe to tune aggressively. The general form of this
+change — when a warm pays off, the API, and how to measure one — is
+[L2 Prefetch](../../debug-and-tune/l2-prefetch.md).
 
 ---
 
@@ -592,6 +595,8 @@ value. That is what makes it safe to tune aggressively.
   L2 / L1 / L0 tuning rules
 - [Cube Tile Tuning](../../debug-and-tune/cube-tile-tuning.md) — choosing row, N and K tiles against
   the compiler's memory report
+- [L2 Prefetch](../../debug-and-tune/l2-prefetch.md) — the SDMA cache warm used in
+  §4.5, generalized: candidate selection, sizing, anchoring, and measurement
 - [Dependencies and Scheduling](../../debug-and-tune/dependency-and-scheduling.md) — how edges form,
   when the scheduler issues, early dispatch, and dummy-task idioms
 - [Precision Tuning](../../debug-and-tune/precision-tuning.md) — rounding modes, dtype alignment, and

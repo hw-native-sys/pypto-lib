@@ -567,8 +567,9 @@ can exceed the serialization it removed — measure both ends.
 - [Ring Heap and Scope Stats](ring-heap-and-scope-stats.md) — the ring model
   behind the back-pressure above, and how to size it.
 - [Debugging](debugging.md) — device logs for a hang, and 507xxx triage.
-- [PyPTO coding style](../pypto-coding/pypto-coding-style.md) — the kernel forms
-  and loop constructs these tasks are written with.
+- [L2 Programming](../pypto-coding/l2-programming.md) and
+  [Loops](../pypto-coding/loops.md) — the kernel forms and loop constructs
+  these tasks are written with.
 
 Upstream references:
 

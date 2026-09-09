@@ -1,8 +1,8 @@
 # PyPTO-Lib
 
-PyPTO-Lib is a collection of tensor-level kernels, model implementations, and
-validation workflows built with [PyPTO](https://www.pypto.ai/pypto/) for
-Ascend NPUs.
+PyPTO-Lib holds [PyPTO](https://www.pypto.ai/pypto/) kernels and end-to-end LLM
+models for Ascend NPUs, with the harness that compiles, runs, and validates
+them.
 
 Use this documentation to move from a first simulator run to validated model
 kernels and systematic precision or performance tuning.

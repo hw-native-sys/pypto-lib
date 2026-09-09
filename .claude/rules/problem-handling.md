@@ -33,7 +33,7 @@ stop and ask.
 
 That is the whole point of this file. Concretely, log when:
 
-- A construct sanctioned by `docs/pypto-coding/pypto-coding-style.md` fails to
+- A construct sanctioned by `docs/pypto-coding/` fails to
   compile (pypto traceback, IR validation error, codegen / g++ error, ptoas
   "failed to legalize", …).
 - The kernel compiles and runs but the golden comparison FAILs, and the model
@@ -64,7 +64,7 @@ A runtime crash / hang / AICPU error is a **simpler** issue, not a pypto one.
 Three gates. Pass all three, then log — otherwise you are recording your own
 mistake as a compiler bug.
 
-1. **Style gate** — re-read `docs/pypto-coding/pypto-coding-style.md` for the
+1. **Style gate** — re-read the `docs/pypto-coding/` page covering the
    construct in question. If the guide does not sanction what you wrote, fix the
    kernel.
 2. **Pin gate** — a mismatched pypto / simpler / ptoas / pto-isa combination

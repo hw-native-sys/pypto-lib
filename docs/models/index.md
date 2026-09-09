@@ -19,7 +19,7 @@ history of their tuned path —
 which record which levers moved the number and what each one cost.
 
 Entry points take script-specific platform and device arguments; inspect
-`--help`, the [platform guide](../get-started/platforms.md), and the
+`--help`, the [platform table](../get-started/first-kernel.md#platforms-and-devices), and the
 [Golden Harness guide](../run-and-validate/golden-harness.md).
 
 ```bash

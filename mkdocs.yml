@@ -1,5 +1,5 @@
 site_name: PyPTO-Lib
-site_description: Kernels, model implementations, and validation workflows built with PyPTO
+site_description: PyPTO kernels and end-to-end LLM models for Ascend NPUs
 site_url: https://hw-native-sys.github.io/pypto-lib/
 repo_url: https://github.com/hw-native-sys/pypto-lib
 repo_name: hw-native-sys/pypto-lib
@@ -71,22 +71,21 @@ nav:
       - Overview: get-started/index.md
       - Installation and environment: get-started/installation.md
       - Run your first kernel: get-started/first-kernel.md
-      - Platforms and devices: get-started/platforms.md
   - PyPTO Coding:
       - Overview: pypto-coding/index.md
-      - PyPTO coding style: pypto-coding/pypto-coding-style.md
-      - Distributed programming: pypto-coding/distributed-programming.md
+      - L2 programming: pypto-coding/l2-programming.md
+      - Operations: pypto-coding/operations.md
+      - Loops: pypto-coding/loops.md
+      - L3 programming: pypto-coding/l3-programming.md
+      - Golden and run: pypto-coding/golden-and-run.md
+      - Naming and comments: pypto-coding/naming-and-comments.md
       - CCE extern kernel: pypto-coding/cce-extern-kernel.md
   - Run and Validate:
       - Overview: run-and-validate/index.md
       - Compile and runtime workflow: run-and-validate/compile-runtime-workflow.md
       - Golden Harness: run-and-validate/golden-harness.md
       - Save and replay golden data: run-and-validate/save-and-replay.md
-  - Examples:
-      - Overview: examples/index.md
-      - Beginner: examples/beginner.md
-      - Intermediate: examples/intermediate.md
-      - Advanced and distributed: examples/advanced.md
+  - Examples: examples/index.md
   - Models:
       - Overview: models/index.md
       - Qwen3-14B:
@@ -106,5 +105,6 @@ nav:
       - Dependencies and scheduling: debug-and-tune/dependency-and-scheduling.md
       - Ring heap and scope stats: debug-and-tune/ring-heap-and-scope-stats.md
       - Cube tile tuning: debug-and-tune/cube-tile-tuning.md
+      - L2 prefetch: debug-and-tune/l2-prefetch.md
       - In-core simulator profiling: debug-and-tune/incore-simulator-profiling.md
       - CCE in-core profiling: debug-and-tune/cce-incore-profiling.md

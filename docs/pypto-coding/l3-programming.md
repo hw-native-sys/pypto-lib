@@ -1,4 +1,4 @@
-# Distributed Programming
+# L3 Programming
 
 How a multi-card (L3) program is written in PyPTO-Lib: the host driver that
 launches one orchestration per rank, the HCCL **window buffers** those ranks
@@ -13,13 +13,13 @@ import pypto.language.distributed as pld
 `pld` is the only accepted alias for the distributed namespace, exactly as
 `pl` is for the core one.
 
-Read [PyPTO Coding Style](pypto-coding-style.md) first — everything there
-about kernel forms, `pl.at` scopes, and loops applies unchanged inside a rank.
+Read [L2 Programming](l2-programming.md), [Operations](operations.md) and
+[Loops](loops.md) first — everything there applies unchanged inside a rank.
 This page only adds what crosses the card boundary.
 
 ---
 
-## 1. The shape of an L3 program
+## The shape of an L3 program
 
 Three layers, and each `@pl.jit.*` kind has exactly one job:
 
@@ -60,7 +60,7 @@ A runnable version of exactly this is
 
 ---
 
-## 2. Window buffers and `DistributedTensor`
+## Window buffers and `DistributedTensor`
 
 A **window buffer** is a slot of HCCL symmetric memory: one
 `alloc_window_buffer` call reserves the *same* region on *every* rank. That
@@ -125,7 +125,7 @@ another rank, and a lane overrun silently corrupts a neighbour's rows.
 
 ---
 
-## 3. Moving data
+## Moving data
 
 Five ops, split by *who holds the data* and *which direction it goes*:
 
@@ -172,7 +172,7 @@ pld.tensor.put(
 
 ---
 
-## 4. Synchronization
+## Synchronization
 
 Data movement carries **no ordering of its own**. Every cross-rank
 dependency is a signal window plus a notify / wait pair.
@@ -271,7 +271,7 @@ live in a dependent task.
 
 ---
 
-## 5. Scheduling rules
+## Scheduling rules
 
 Comm is ordinary task-graph work, and the rules in
 [Dependencies and Scheduling](../debug-and-tune/dependency-and-scheduling.md)
@@ -320,7 +320,7 @@ program-order guarantee only.
 
 ---
 
-## 6. Collectives
+## Collectives
 
 `pld.tensor` also exposes `allgather`, `all_to_all`, `all_to_all_v`,
 `allreduce`, `reduce_scatter`, `broadcast`, and `barrier`, each taking a
@@ -334,7 +334,7 @@ behaviour on the target before building on it.
 
 ---
 
-## 7. Running and validating
+## Running and validating
 
 The harness compiles an L3 program when `config` carries a
 `DistributedConfig`:
@@ -356,8 +356,8 @@ result = run(
 - **CLI**: distributed entries take `-d 0,1,...` (a comma-separated list),
   not a single integer, and usually an `--ep` / `--tp` degree.
 - **Devices**: the entry needs as many free cards as its world size, and they
-  must all be on the same host. See
-  [Platforms and Devices](../get-started/platforms.md).
+  must all be on the same host — on a shared machine take them from the host's
+  allocator rather than probing for idle cards.
 - **Specs**: every tensor keeps its leading rank axis, so a `TensorSpec` is
   `[N_RANKS, ...]`. `resident="stacked"` uploads shard `i` to card `i` once
   instead of per dispatch — see [`golden/spec.py`](../../golden/spec.py).
@@ -373,7 +373,7 @@ Per-rank timing, start skew, and the fastest-rank convention are in
 
 ## See also
 
-- [PyPTO Coding Style](pypto-coding-style.md) — kernel forms, scopes, loops.
+- [PyPTO Coding](index.md) — kernel forms, ops, and loops, inside one rank.
 - [Dependencies and Scheduling](../debug-and-tune/dependency-and-scheduling.md)
   — task edges, early dispatch, and why an unanchored wait costs a core.
 - [Ring Heap and Scope Stats](../debug-and-tune/ring-heap-and-scope-stats.md)

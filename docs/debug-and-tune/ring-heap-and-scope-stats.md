@@ -130,6 +130,9 @@ Rules and gotchas:
 - Keep loop-carried values (`hidden_states = layer(...)`, output params) out
   of the inner scope's ownership — they must outlive it, and a value still
   read after its scope closed keeps its block live anyway.
+- Only `@pl.jit`, `@pl.jit.inline`, `@pl.jit.host` and `@pl.function` take
+  `auto_scope=`; `@pl.jit.incore` / `@pl.jit.opaque` outline into their own
+  kernels and reject it.
 - Nesting past depth 3 buys nothing: ring 3 is a clamp, so a 5-deep chain
   just concentrates pressure there.
 - A scope is also a scheduling boundary — the runtime drains scope
@@ -326,8 +329,8 @@ with an `rtMalloc 207001` OOM before it ever reaches the kernel.
   and what fills a window.
 - [Performance tuning](performance-tuning.md) — chip swimlane and PMU; scope
   placement changes the schedule too, so re-measure wall time after it.
-- [PyPTO coding style](../pypto-coding/pypto-coding-style.md) — `pl.at`
-  scopes (InCore), which are a different thing from the runtime scopes here.
+- [L2 Programming](../pypto-coding/l2-programming.md) — `pl.at` scopes
+  (InCore), which are a different thing from the runtime scopes here.
 - simpler's [Scope stats](https://www.pypto.ai/simpler/dfx/scope-stats/)
   — the collector's own reference: report layout, JSONL schema history, and
   the AICPU / host internals.
