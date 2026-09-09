@@ -108,7 +108,6 @@ from decode_sparse_attn_csa import (
     NOPE_DIM,
     PUBLISH_GROUPS,
     ROPE_CS_T_TILE,
-    SPARSE_BLOCKS,
     T_PAD,
     sparse_attn_csa,
     sparse_attn_csa_tp1,
@@ -470,13 +469,13 @@ def decode_csa(
                         kv_cache_flat[write_row : write_row + 1, 0 : HEAD_DIM] = kv_row
 
         (
-            sparse_blk_mi, sparse_blk_li, sparse_blk_oi,
+            attn_mi, attn_li, attn_oi,
             rope_cos_il, rope_sin_signed, rope_swap_idx,
             qk_tid, attn_rope_tid,
         ) = sparse_attn_csa(
             q, kv_cache, window_swa_indices,
             cmp_kv, cmp_block_table, idx_topk,
-            position_ids_t1, freqs_cos, freqs_sin,
+            position_ids_t1, attn_sink, freqs_cos, freqs_sin,
         )
 
         attention_grouped = pl.create_tensor([O_GROUPS * LOCAL_T_PAD, O_GROUP_IN], dtype=pl.BF16)
@@ -495,22 +494,10 @@ def decode_csa(
                 for m_dt in pl.range(ATTENTION_PUBLISH_T_TILE):
                     m_t = m_t0 + m_dt
                     m_idx = m_t * (H // H_TILE) + m_h_idx
-                    m_blk_base = m_idx * SPARSE_BLOCKS * H_TILE
-                    m_mi = sparse_blk_mi[m_blk_base : m_blk_base + H_TILE, 0:1]
-                    m_li = sparse_blk_li[m_blk_base : m_blk_base + H_TILE, 0:1]
-                    m_oi = sparse_blk_oi[m_blk_base : m_blk_base + H_TILE, 0:HEAD_DIM]
-
-                    for m_sb in pl.pipeline(1, SPARSE_BLOCKS, stage=2):
-                        m_row = m_blk_base + m_sb * H_TILE
-                        m_cur_mi = sparse_blk_mi[m_row : m_row + H_TILE, 0:1]
-                        m_cur_li = sparse_blk_li[m_row : m_row + H_TILE, 0:1]
-                        m_cur_oi = sparse_blk_oi[m_row : m_row + H_TILE, 0:HEAD_DIM]
-                        m_mi_new = pl.maximum(m_mi, m_cur_mi)
-                        m_alpha = pl.exp(pl.sub(m_mi, m_mi_new))
-                        m_beta = pl.exp(pl.sub(m_cur_mi, m_mi_new))
-                        m_li = pl.add(pl.mul(m_alpha, m_li), pl.mul(m_beta, m_cur_li))
-                        m_oi = pl.add(pl.row_expand_mul(m_oi, m_alpha), pl.row_expand_mul(m_cur_oi, m_beta))
-                        m_mi = m_mi_new
+                    m_row = m_idx * H_TILE
+                    m_mi = attn_mi[m_row : m_row + H_TILE, 0:1]
+                    m_li = attn_li[m_row : m_row + H_TILE, 0:1]
+                    m_oi = attn_oi[m_row : m_row + H_TILE, 0:HEAD_DIM]
 
                     n_sink_bias = pl.reshape(attn_sink[m_h0 : m_h0 + H_TILE], [H_TILE, 1])
                     n_sink_tile = pl.add(pl.sub(m_mi, m_mi), n_sink_bias)
