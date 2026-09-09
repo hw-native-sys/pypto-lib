@@ -81,7 +81,7 @@ def build_tensor_specs(t: int = T, h: int = H, d: int = D, chunk: int = CHUNK):
                    init_value=reference.lazy("solve_tril", "a16", t, h, d, chunk)),
         TensorSpec("neg_eye", [chunk, chunk], torch.float16,
                    init_value=lambda: -torch.eye(chunk, dtype=torch.float16)),
-        TensorSpec("t_out", [t, h, chunk], torch.float32, is_output=True),
+        TensorSpec("t_out", [t, h, chunk], torch.float32),
     ]
 
 
@@ -110,7 +110,7 @@ def _tri_inv_ok(actual, expected, **_kwargs):
 
 if __name__ == "__main__":
     import argparse
-    from golden import run_jit
+    from golden import run
 
     parser = argparse.ArgumentParser()
     parser.add_argument("-p", "--platform", type=str, default="a2a3",
@@ -121,14 +121,14 @@ if __name__ == "__main__":
     parser.add_argument("--runtime-dir", type=str, default=None)
     args = parser.parse_args()
 
-    result = run_jit(
+    result = run(
         fn=gdn_solve_tril,
         specs=build_tensor_specs(),
         golden_fn=golden_gdn_solve_tril,
         golden_data=args.golden_data,
         runtime_dir=args.runtime_dir,
         save_data=args.save_data,
-        runtime_cfg=dict(platform=args.platform, device_id=args.device),
+        config=dict(platform=args.platform, device_id=args.device),
         rtol=1e-2,
         atol=1e-5,
         compare_fn={"t_out": _tri_inv_ok},
