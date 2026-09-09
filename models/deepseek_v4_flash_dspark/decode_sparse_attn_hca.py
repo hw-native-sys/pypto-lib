@@ -164,8 +164,6 @@ def sparse_attn_hca(
             g_t0 = g_req * S
             g_base = g_req * REQUEST_KV_ROWS
             g_first_len = pl.read(window_swa_lens, [g_t0])
-            g_zero_rows = pl.full([REQUEST_KV_ROWS, HEAD_DIM], dtype=pl.BF16, value=0.0)
-            raw_kv[g_base : g_base + REQUEST_KV_ROWS, 0:HEAD_DIM] = g_zero_rows
 
             g_bulk_matches = pl.cast(g_first_len == WIN, pl.INT32)
             g_bulk_first = pl.read(window_swa_indices, [g_t0, 0])
@@ -189,6 +187,8 @@ def sparse_attn_hca(
                 g_bulk_rows = ori_kv_flat[g_bulk_src : g_bulk_src + REQUEST_KV_ROWS, 0:HEAD_DIM]
                 raw_kv[g_base : g_base + REQUEST_KV_ROWS, 0:HEAD_DIM] = g_bulk_rows
             else:
+                g_zero_rows = pl.full([REQUEST_KV_ROWS, HEAD_DIM], dtype=pl.BF16, value=0.0)
+                raw_kv[g_base : g_base + REQUEST_KV_ROWS, 0:HEAD_DIM] = g_zero_rows
                 for g_sub in pl.range(WIN // GATHER_RUN_TILE):
                     g_sr0 = g_sub * GATHER_RUN_TILE
                     g_sdst = g_base + g_sr0
