@@ -24,7 +24,10 @@ NUM_VOCAB_CHUNKS = VOCAB // VOCAB_CHUNK
 REAL_NUM_FULL_VOCAB_CHUNKS = REAL_VOCAB // VOCAB_CHUNK
 REAL_VOCAB_TAIL = REAL_VOCAB % VOCAB_CHUNK
 REAL_NUM_VOCAB_CHUNKS = REAL_NUM_FULL_VOCAB_CHUNKS + (1 if REAL_VOCAB_TAIL != 0 else 0)
-TOPK = 32
+TOPK = M.topk_select_k
+SAMPLING_CONTROL_FIELDS = M.sampling_control_fields
+SAMPLING_CONTROL_ACTIVE_BATCH = 0
+SAMPLING_CONTROL_SELECTION_K = 1
 TOPK_GROUP_WIDTH = 2048
 TOPK_NUM_FULL_GROUPS = REAL_VOCAB // TOPK_GROUP_WIDTH
 TOPK_GROUP_TAIL = REAL_VOCAB % TOPK_GROUP_WIDTH
@@ -43,6 +46,7 @@ assert TOPK_GROUP_WIDTH % VOCAB_CHUNK == 0
 assert TOPK_GROUP_TAIL == REAL_VOCAB_TAIL
 assert TOPK_NUM_GROUPS * TOPK <= TOPK_CANDIDATE_PAD
 assert NUM_VOCAB_CHUNKS <= GREEDY_CHUNK_PAD
+assert SAMPLING_CONTROL_FIELDS == 2
 
 
 @pl.jit.inline
@@ -68,14 +72,14 @@ def _topk_group_pairs(
 @pl.jit
 def topk_select_fwd(
     logits: pl.Tensor[[BATCH_PAD, VOCAB], pl.FP32],
-    sampling_control: pl.Tensor[[2], pl.INT32],
+    sampling_control: pl.Tensor[[SAMPLING_CONTROL_FIELDS], pl.INT32],
     topk_values: pl.Out[pl.Tensor[[BATCH_PAD, TOPK], pl.FP32]],
     topk_indices: pl.Out[pl.Tensor[[BATCH_PAD, TOPK], pl.INT32]],
 ):
     """Return greedy top-1 or the largest TOPK real-vocab candidates per row."""
     for b in pl.parallel(BATCH_PAD):
-        if b < pl.read(sampling_control, [0]):
-            if pl.read(sampling_control, [1]) == 1:
+        if b < pl.read(sampling_control, [SAMPLING_CONTROL_ACTIVE_BATCH]):
+            if pl.read(sampling_control, [SAMPLING_CONTROL_SELECTION_K]) == 1:
                 with pl.at(level=pl.Level.CORE_GROUP, name_hint="greedy_select"):
                     idx_init = pl.arange(0, [1, VOCAB_CHUNK], dtype=pl.UINT32)
                     chunk_vals = pl.create_tensor([1, GREEDY_CHUNK_PAD], dtype=pl.FP32)
@@ -272,7 +276,7 @@ def topk_select_fwd(
 @pl.jit.host
 def qwen3_topk_select_host(
     logits: pl.Tensor[[BATCH_PAD, VOCAB], pl.FP32],
-    sampling_control: pl.Tensor[[2], pl.INT32],
+    sampling_control: pl.Tensor[[SAMPLING_CONTROL_FIELDS], pl.INT32],
     topk_values: pl.Out[pl.Tensor[[BATCH_PAD, TOPK], pl.FP32]],
     topk_indices: pl.Out[pl.Tensor[[BATCH_PAD, TOPK], pl.INT32]],
 ) -> tuple[pl.Tensor, pl.Tensor]:
@@ -313,9 +317,9 @@ def build_tensor_specs(selection_k=TOPK):
         TensorSpec("logits", [BATCH_PAD, VOCAB], torch.float32, init_value=init_logits),
         TensorSpec(
             "sampling_control",
-            [2],
+            [SAMPLING_CONTROL_FIELDS],
             torch.int32,
-            init_value=lambda: torch.tensor([2 if selection_k == TOPK else 1, selection_k], dtype=torch.int32),
+            init_value=lambda: _sampling_control_fixture(selection_k),
         ),
         TensorSpec("topk_values", [BATCH_PAD, TOPK], torch.float32),
         TensorSpec("topk_indices", [BATCH_PAD, TOPK], torch.int32),
@@ -325,8 +329,8 @@ def build_tensor_specs(selection_k=TOPK):
 def golden_topk_select(tensors):
     import torch
 
-    active_batch = int(tensors["sampling_control"][0].item())
-    selection_k = int(tensors["sampling_control"][1].item())
+    active_batch = int(tensors["sampling_control"][SAMPLING_CONTROL_ACTIVE_BATCH].item())
+    selection_k = int(tensors["sampling_control"][SAMPLING_CONTROL_SELECTION_K].item())
     tensors["topk_values"][:] = FP32_NEG_INF
     tensors["topk_indices"][:] = 0
     logits = tensors["logits"][:active_batch, :REAL_VOCAB].float()
@@ -340,6 +344,15 @@ def golden_topk_select(tensors):
     vals, idx = torch.topk(logits, TOPK, dim=-1, largest=True, sorted=True)
     tensors["topk_values"][:active_batch] = vals
     tensors["topk_indices"][:active_batch] = idx.to(torch.int32)
+
+
+def _sampling_control_fixture(selection_k):
+    import torch
+
+    control = torch.zeros((SAMPLING_CONTROL_FIELDS,), dtype=torch.int32)
+    control[SAMPLING_CONTROL_ACTIVE_BATCH] = 2 if selection_k == TOPK else 1
+    control[SAMPLING_CONTROL_SELECTION_K] = selection_k
+    return control
 
 
 if __name__ == "__main__":

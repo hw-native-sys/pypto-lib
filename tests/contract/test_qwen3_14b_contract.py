@@ -42,6 +42,7 @@ _STAGE_KERNELS = {
     "prefill": ("prefill_fwd", "prefill_fwd"),
     "decode": ("decode_fwd", "decode_fwd"),
     "greedy_sample": ("greedy_sample", "greedy_sample_fwd"),
+    "topk_select": ("topk_select", "topk_select_fwd"),
 }
 
 # Per-stage host-parameter renames. decode_fwd distinguishes its two sampled-id
@@ -115,8 +116,15 @@ def test_registry_resolves_explicit_qwen3_14b_contract() -> None:
 
     assert contract.model.family == "qwen3"
     assert contract.model.variant == "14b"
-    assert sorted(contract.kernels) == ["decode", "greedy_sample", "prefill"]
-    assert contract.execution == {"prefill": ("prefill",), "decode": ("decode",)}
+    assert sorted(contract.kernels) == ["decode", "greedy_sample", "prefill", "topk_select"]
+    assert contract.execution == {
+        "prefill": ("prefill",),
+        "decode": ("decode",),
+        "topk_select": ("topk_select",),
+    }
+    assert "device_topk_sampling" in contract.capabilities
+    assert contract.limits["topk"] == 32
+    assert contract.limits["sampling_control_fields"] == 2
     assert contract.abi_fingerprint()
 
 
@@ -168,8 +176,13 @@ def test_loaded_kernel_modules_match_current_qwen3_files() -> None:
     loaded = contract.load_kernels()
     model = _qwen3_14b_model()
 
-    assert sorted(loaded.functions) == ["decode_fwd", "greedy_sample_fwd", "prefill_fwd"]
-    assert sorted(contract.kernels) == ["decode", "greedy_sample", "prefill"]
+    assert sorted(loaded.functions) == [
+        "decode_fwd",
+        "greedy_sample_fwd",
+        "prefill_fwd",
+        "topk_select_fwd",
+    ]
+    assert sorted(contract.kernels) == ["decode", "greedy_sample", "prefill", "topk_select"]
     assert set(contract.kernels) <= {name.removesuffix("_fwd") for name in loaded.functions}
     contract.validate_kernels(contract, loaded, model)
 
@@ -282,6 +295,7 @@ def test_compile_arg_builders_follow_loaded_stage_specs() -> None:
     prefill_args = contract.kernels["prefill"].compile_args_builder(model_config, runtime_config)
     decode_args = contract.kernels["decode"].compile_args_builder(model_config, runtime_config)
     greedy_args = contract.kernels["greedy_sample"].compile_args_builder(model_config, runtime_config)
+    topk_args = contract.kernels["topk_select"].compile_args_builder(model_config, runtime_config)
 
     assert len(prefill_args) == len(contract.kernels["prefill"].args)
     assert len(prefill_args) == len(_kernel_params("prefill"))
@@ -298,6 +312,26 @@ def test_compile_arg_builders_follow_loaded_stage_specs() -> None:
 
     assert [tuple(arg.shape) for arg in greedy_args] == [(16, 512), (16, 8)]
     assert len(greedy_args) == len(_kernel_params("greedy_sample"))
+
+    topk_spec = contract.kernels["topk_select"]
+    assert [
+        (arg.name, arg.dtype, arg.shape, arg.direction)
+        for arg in topk_spec.args
+    ] == [
+        ("logits", "fp32", ("BATCH", "VOCAB"), "in"),
+        ("sampling_control", "int32", ("SAMPLING_CONTROL_FIELDS",), "in"),
+        ("topk_values", "fp32", ("BATCH", "TOPK"), "out"),
+        ("topk_indices", "int32", ("BATCH", "TOPK"), "out"),
+    ]
+    assert len(topk_args) == len(topk_spec.args)
+    assert len(topk_args) == len(_kernel_params("topk_select"))
+    assert [tuple(arg.shape) for arg in topk_args] == [
+        (16, 512),
+        (2,),
+        (16, 32),
+        (16, 32),
+    ]
+    assert [arg.dtype for arg in topk_args] == [torch.float32, torch.int32, torch.float32, torch.int32]
 
 
 def _rope_qkv_function_body() -> str:
@@ -447,12 +481,12 @@ def test_decode_contract_rejects_empty_batch(batch: int) -> None:
 
 
 @pytest.mark.parametrize("batch", [17, 32])
-def test_prefill_and_greedy_sample_stay_capped_at_pad(batch: int) -> None:
-    """Only decode chunks. The other two stages still bound the batch by the pad."""
+def test_fixed_batch_stages_stay_capped_at_pad(batch: int) -> None:
+    """Only decode chunks. Fixed-batch stages still bound the batch by the pad."""
     runtime = _runtime_config()
     runtime.max_batch_size = batch
     contract = get_contract("qwen3", "14b")
-    for stage in ("prefill", "greedy_sample"):
+    for stage in ("prefill", "greedy_sample", "topk_select"):
         with pytest.raises(ValueError, match="max_batch_size"):
             contract.kernels[stage].compile_args_builder(_tiny_model_config(), runtime)
 
@@ -494,6 +528,7 @@ def test_runtime_arg_builders_follow_host_order() -> None:
         logits="logits",
         token_ids="token_ids",
     )
+    topk_inputs = SimpleNamespace(logits="logits", sampling_control="sampling_control")
 
     prefill_args = contract.kernels["prefill"].runtime_args_builder(
         prefill_inputs,
@@ -510,11 +545,18 @@ def test_runtime_arg_builders_follow_host_order() -> None:
         sampled_ids_buffer="sampled_ids",
         next_hidden_buffer="next_hidden",
     )
+    topk_args = contract.kernels["topk_select"].runtime_args_builder(
+        topk_inputs,
+        static,
+        topk_values_buffer="topk_values",
+        topk_indices_buffer="topk_indices",
+    )
 
     assert prefill_args[:6] == ("token_ids", "seq_lens", "chunk_lens", "chunk_offsets", "input_rms_weight", "wq")
     assert prefill_args[-5:] == ("post_rms_weight", "final_norm_weight", "lm_head", "embed", "logits")
     assert decode_args[:4] == ("input_rms_weight", "wq", "wk", "wv")
     assert decode_args[-5:] == ("logits", "embed", "token_ids", "sampled_ids", "next_hidden")
+    assert topk_args == ("logits", "sampling_control", "topk_values", "topk_indices")
 
 
 def test_prepare_weights_rejects_oversized_lm_head_vocab() -> None:
