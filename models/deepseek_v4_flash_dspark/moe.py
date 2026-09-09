@@ -508,6 +508,9 @@ def _moe_tile(
                 level=pl.Level.CORE_GROUP,
                 name_hint="expert_tile_scatter",
                 deps=[tile_ready],
+                # Route rows are unique within an epoch, and the completion
+                # fan-in below already orders combine after every scatter.
+                no_dep_args=[routed_y_buf],
             ) as scatter_tid:
                 tile_end = tile_row + valid_rows
                 source_begin = pl.cast(0, pl.INDEX)

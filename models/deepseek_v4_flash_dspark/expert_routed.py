@@ -279,7 +279,7 @@ def expert_routed_tile(
     with pl.spmd(
         D // (W2_ACT_INNER * D_OUT_TILE_ACT),
         name_hint="exp_w2_act",
-        deps=[w2_tid, quant_tids[0]],
+        deps=[w2_tid],
         allow_early_resolve=True,
     ) as w2_act_tid:
         block = pl.tile.get_block_idx()
