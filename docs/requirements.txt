@@ -1,5 +1,8 @@
 # Documentation-only dependencies. Building the site must not install PyPTO,
 # CANN, or this repository's runtime dependencies.
-mkdocs==1.6.1
-mkdocs-material==9.7.7
+# The shared theme supplies the tested MkDocs/Material versions.
+-c ../.site-theme/docs-theme/constraints.txt
+
+mkdocs>=1.6
+mkdocs-material>=9.5
 PyYAML>=6,<7

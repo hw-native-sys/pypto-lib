@@ -22,6 +22,7 @@ develop-eggs/
 build_output/
 pa_build/
 site/
+.site-theme/
 
 # Virtual environments
 .env/

@@ -1,6 +1,8 @@
-site_name: PyPTO-Lib
+INHERIT: .site-theme/docs-theme/base.yml
+
+site_name: PyPTO Lib
 site_description: PyPTO kernels and end-to-end LLM models for Ascend NPUs
-site_url: https://hw-native-sys.github.io/pypto-lib/
+site_url: https://www.pypto.ai/pypto-lib/
 repo_url: https://github.com/hw-native-sys/pypto-lib
 repo_name: hw-native-sys/pypto-lib
 edit_uri: edit/main/docs/
@@ -11,30 +13,27 @@ site_dir: site
 exclude_docs: |
   _hooks/
   requirements.txt
+  theme-revision.txt
 
 theme:
-  name: material
+  custom_dir: .site-theme/docs-theme/overrides
   language: en
+  # Keep instant navigation alongside the shared layout features.
   features:
     - navigation.instant
+    - navigation.tabs
     - navigation.sections
     - navigation.indexes
     - navigation.top
+    - navigation.footer
     - content.action.edit
     - content.code.copy
     - search.highlight
     - search.suggest
-  palette:
-    - media: "(prefers-color-scheme: light)"
-      scheme: default
-      toggle:
-        icon: material/weather-night
-        name: Switch to dark mode
-    - media: "(prefers-color-scheme: dark)"
-      scheme: slate
-      toggle:
-        icon: material/weather-sunny
-        name: Switch to light mode
+    - toc.follow
+
+extra:
+  pypto_project: pypto-lib
 
 validation:
   nav:
