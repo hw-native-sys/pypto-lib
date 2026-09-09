@@ -39,6 +39,19 @@ D = 128
 CHUNK = 128
 
 
+# What each stage writes. The harness stamps TensorSpec.direction from the
+# compiled kernel's pl.Out parameters, so it is only readable after the run;
+# the comparators have to be built before it.
+OUTPUTS = {
+    "chunk_cumsum": ("g_sum",),
+    "scaled_dot_kkt": ("a_out",),
+    "solve_tril": ("t_out",),
+    "wy_fast": ("w_out", "u_out"),
+    "chunk_h": ("state", "v_new"),
+    "chunk_o": ("o_out",),
+}
+
+
 # Which of a stage's inputs the preceding kernels produce, for --chain:
 #   spec name -> (producing stage, its output name)
 CHAINED = {
@@ -53,7 +66,7 @@ CHAINED = {
 }
 
 
-def _comparators(specs, captured=None) -> dict:
+def _comparators(stage: str, captured=None) -> dict:
     """megagdn's criterion on every output, optionally capturing the device result."""
     from models.gdn import reference
 
@@ -67,8 +80,7 @@ def _comparators(specs, captured=None) -> dict:
             return ok, detail
         return compare
 
-    return {spec.name: make(spec.name) for spec in specs
-            if getattr(spec, "is_output", False)}
+    return {name: make(name) for name in OUTPUTS[stage]}
 
 
 def _chain_specs(stage: str, specs: list, produced: dict) -> list:
@@ -89,7 +101,7 @@ def _chain_specs(stage: str, specs: list, produced: dict) -> list:
 def check_stage(stage: str, t: int, h: int, platform: str, device: int,
                 produced: dict | None = None) -> tuple[bool, str]:
     """Compile, run and validate one stage. Returns (passed, detail)."""
-    from golden import run_jit
+    from golden import run
 
     mod = importlib.import_module(f"models.gdn.{stage}")
     fn = mod.build_kernel(t=t, h=h, d=D, chunk=CHUNK)
@@ -97,14 +109,14 @@ def check_stage(stage: str, t: int, h: int, platform: str, device: int,
     if produced is not None:
         specs = _chain_specs(stage, specs, produced)
 
-    result = run_jit(
+    result = run(
         fn=fn,
         specs=specs,
         golden_fn=getattr(mod, f"golden_gdn_{stage}"),
-        runtime_cfg=dict(platform=platform, device_id=device),
+        config=dict(platform=platform, device_id=device),
         rtol=1e-2,
         atol=1e-5,
-        compare_fn=_comparators(specs, produced),
+        compare_fn=_comparators(stage, produced),
     )
     return bool(result.passed), (result.error or "").strip()
 
