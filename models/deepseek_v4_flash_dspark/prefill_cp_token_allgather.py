@@ -32,6 +32,10 @@ if TP_SIZE not in _TP_CHOICES:
 import pypto.language as pl
 import pypto.language.distributed as pld
 
+from _collective_helpers import (
+    make_clear_peer_credits,
+    make_wait_for_peer_credits_deferred,
+)
 from config import FLASH as M
 
 
@@ -53,6 +57,9 @@ READBACK_ROW_TILE = 16
 # fixture
 FIXTURE_ROUNDS = 2
 FIXTURE_LOCAL_T = min(257, PREFILL_LOCAL_CAP)
+
+wait_for_peer_credits_deferred = make_wait_for_peer_credits_deferred(TP_SIZE)
+clear_peer_credits = make_clear_peer_credits(TP_SIZE)
 
 
 @pl.jit.inline
@@ -88,13 +95,12 @@ def prefill_cp_token_allgather_step(
                 )
 
     # Register the peer payload conditions as deferred completion.
+    # Intentional: prefill uses defer_wait (decode CP allgather uses blocking) —
+    # see _collective_helpers; do not silently unify.
     with pl.at(level=pl.Level.CORE_GROUP, name_hint="prefill_cp_token_allgather_payload_wait") as _payload_wait_tid:
-        for source_tp in pl.range(TP_SIZE):
-            if source_tp != tp_rank:
-                pld.system.defer_wait(
-                    signal=gather_signal, offsets=[source_tp, 0],
-                    expected=pl.cast(1, pl.INT32), cmp=pld.WaitCmp.Ge,
-                )
+        gather_signal = wait_for_peer_credits_deferred(
+            gather_signal, tp_rank, pl.cast(1, pl.INT32),
+        )
 
     # Copy peer payloads and publish local readback completion.
     group_rows = TP_SIZE * local_rows
@@ -118,12 +124,9 @@ def prefill_cp_token_allgather_step(
                 )
 
     with pl.at(level=pl.Level.CORE_GROUP, name_hint="prefill_cp_token_allgather_readback_wait") as _readback_wait_tid:
-        for source_tp in pl.range(TP_SIZE):
-            if source_tp != tp_rank:
-                pld.system.defer_wait(
-                    signal=gather_signal, offsets=[source_tp, 0],
-                    expected=pl.cast(2, pl.INT32), cmp=pld.WaitCmp.Ge,
-                )
+        gather_signal = wait_for_peer_credits_deferred(
+            gather_signal, tp_rank, pl.cast(2, pl.INT32),
+        )
 
     # Retire peer credits and anchor output consumption to signal retirement.
     with pl.at(
@@ -132,14 +135,12 @@ def prefill_cp_token_allgather_step(
         deps=[_readback_tid, _readback_wait_tid],
     ):
         completion_anchor = pl.read(group_out, [0, 0])
-        reset_value = pl.cast(-2, pl.INT32)
-        self_rank = group_base + tp_rank
-        for source_tp in pl.range(TP_SIZE):
-            if source_tp != tp_rank:
-                pld.system.notify(
-                    target=gather_signal, peer=self_rank,
-                    offsets=[source_tp, 0], value=reset_value, op=pld.NotifyOp.AtomicAdd,
-                )
+        gather_signal = clear_peer_credits(
+            gather_signal,
+            tp_rank,
+            group_base + tp_rank,
+            pl.cast(-2, pl.INT32),
+        )
         pl.write(group_out, [0, 0], completion_anchor)
 
     return group_out, gather_signal
