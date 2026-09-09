@@ -1247,7 +1247,7 @@ if __name__ == "__main__":
     parser.add_argument("--max-seq", type=int, default=128)
     parser.add_argument("--num-layers", type=int, default=NUM_LAYERS)
     parser.add_argument("--compile-only", action="store_true", default=False)
-    parser.add_argument("--enable-chip-swimlane", action="store_true", default=False)
+    parser.add_argument("--enable-chip-swimlane", type=int, nargs="?", const=1, default=0, choices=range(5))
     parser.add_argument("--pass-rate", type=float, default=0.98,
                         help="Fraction of `out` elements that must satisfy atol/rtol. "
                              "Default 0.98 tolerates the BF16 ULP long-tail.")

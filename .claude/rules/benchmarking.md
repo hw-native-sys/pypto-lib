@@ -23,7 +23,7 @@ Where the numbers come from — see
 
 | Metric | Source | Quote |
 | --- | --- | --- |
-| Wall time | `PYPTO_BENCH=1` → `[RUN] effective_us (N rounds) …` | `mean=` (daily CI's per-case number is exactly this field) |
+| Wall time | `PYPTO_BENCH=1` → `[RUN] effective_us (N rounds) …` | `median=`; quote `mean=` too when comparing against daily CI, whose per-case number is that field |
 | Core busy time | chip swimlane per-task durations; PMU `*_busy_cycles` vs `pmu_total_cycles` | The bottleneck pipe's ratio |
 
 A `*sim` platform prints `effective_us unavailable: no device-domain spans`. A
@@ -88,10 +88,12 @@ Ranks do not start together. A late-dispatched rank spends the head of its
 window waiting; that wait is not kernel time, it varies round to round, and it
 lands inside the measured window.
 
-**Report the fastest rank, not the headline.** The `effective_us` headline is
-the per-round **max across ranks** (the round ends when the slowest card
-finishes), so it carries the full start skew. For tuning comparisons, quote the
-lowest per-rank mean from the `[RUN] rank N: eff_us … mean=` breakdown.
+**Report the fastest rank's median, not the headline.** The `effective_us`
+headline is the per-round **max across ranks** (the round ends when the slowest
+card finishes), so it carries the full start skew. For tuning comparisons, quote
+the lowest per-rank **median** from the `[RUN] rank N: eff_us … median=`
+breakdown — the median over a mean, because a single stalled round moves the
+mean and not the median.
 
 When the per-rank breakdown is not enough:
 
@@ -113,6 +115,6 @@ Keep it honest:
 ## Reporting a Result
 
 Every benchmark number states: platform and device, rounds / warmup, the metric
-and its convention (headline mean vs fastest rank), the baseline it is compared
-against, and whether the golden was replayed. A number without those cannot be
-reproduced or trusted.
+and its convention (headline mean vs fastest rank's median), the baseline it is
+compared against, and whether the golden was replayed. A number without those
+cannot be reproduced or trusted.

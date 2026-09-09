@@ -792,9 +792,9 @@ def _run_session(args, prefill_dir, decode_dir, model_dir):
 
         run_config_parameters = inspect.signature(RunConfig).parameters
         if "enable_chip_swimlane" in run_config_parameters:
-            swimlane_config = {"enable_chip_swimlane": False}
+            swimlane_config = {"enable_chip_swimlane": 0}
         elif "enable_l2_swimlane" in run_config_parameters:
-            swimlane_config = {"enable_l2_swimlane": False}
+            swimlane_config = {"enable_l2_swimlane": 0}
         else:
             raise TypeError(
                 "RunConfig supports neither enable_chip_swimlane nor "

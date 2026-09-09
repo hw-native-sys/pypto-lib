@@ -963,7 +963,7 @@ if __name__ == "__main__":
                         help="context_len (multiple of S=WIN); fixture-only, lowered into token metadata.")
     parser.add_argument("--num-tokens", type=int, default=T,
                         help="Active token count (q_len), capped by T; passed to the kernel as num_tokens.")
-    parser.add_argument("--enable-chip-swimlane", action="store_true", default=False)
+    parser.add_argument("--enable-chip-swimlane", type=int, nargs="?", const=1, default=0, choices=range(5))
     parser.add_argument("--enable-dep-gen", action="store_true", default=False)
     parser.add_argument("--dump-passes", action="store_true", default=False)
     args = parser.parse_args()

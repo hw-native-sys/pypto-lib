@@ -2297,7 +2297,7 @@ if __name__ == "__main__":
     parser.add_argument("--save-data", action="store_true")
     parser.add_argument("--golden-data", type=str, default=None)
     parser.add_argument("--dump-passes", action="store_true")
-    parser.add_argument("--enable-chip-swimlane", action="store_true")
+    parser.add_argument("--enable-chip-swimlane", type=int, nargs="?", const=1, default=0, choices=range(5))
     args = parser.parse_args()
 
     from golden import ratio_allclose, ratio_reldiff, run

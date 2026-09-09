@@ -1311,7 +1311,7 @@ if __name__ == "__main__":
               "program serves any batch <= host KV-cache "
               "capacity. Default: %(default)s"),
     )
-    parser.add_argument("--enable-chip-swimlane", action="store_true", default=False)
+    parser.add_argument("--enable-chip-swimlane", type=int, nargs="?", const=1, default=0, choices=range(5))
     parser.add_argument("--max-seq", action="store_true", default=False,
                         help="set all seq_lens to MAX_SEQ")
     parser.add_argument("--num-layers", type=int, default=2)

@@ -1282,8 +1282,7 @@ if __name__ == "__main__":
                         help=f"runtime request count up to {B} (the compile-time upper bound). "
                              "The batch axes are pl.dynamic, so one compiled program "
                              "serves every value.")
-    parser.add_argument("--enable-chip-swimlane", type=int, default=0, choices=[0, 1, 2],
-                        help="chip swimlane level: 0=off, 1=AICore timing, 2=+AICPU timing.")
+    parser.add_argument("--enable-chip-swimlane", type=int, nargs="?", const=1, default=0, choices=range(5))
     parser.add_argument("--runtime-dir", type=str, default=None)
     parser.add_argument("--start-pos", type=str, default=None,
                         help="Fixture-only start position: one value for a uniform batch or "

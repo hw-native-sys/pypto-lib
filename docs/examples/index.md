@@ -46,8 +46,9 @@ python examples/intermediate/softmax.py -p a2a3 -d 0
 ```
 
 The single-device examples also accept `--enable-chip-swimlane` for a chip
-swimlane timeline capture. The distributed all-reduce instead takes a
-comma-separated device list and requires exactly two ranks:
+swimlane timeline capture; it takes a level `0`-`4`, and a bare flag means
+level 1. The distributed all-reduce instead takes a comma-separated device list
+and requires exactly two ranks:
 
 ```bash
 python examples/advanced/allreduce.py -p a2a3 -d 0,1

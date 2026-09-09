@@ -626,7 +626,7 @@ class TestJitCompilePath:
                     compile_runtime=True, benchmark_step=1,
                 )
             ],
-            config={"enable_chip_swimlane": True},
+            config={"enable_chip_swimlane": 1},
             compile_only=True,
         )
 

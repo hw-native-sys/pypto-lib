@@ -34,14 +34,13 @@ names in the report.
    predecessor sets, list the candidates and require the intended task ID or
    source occurrence before editing. A runtime task ID is an execution
    instance, not a source identifier.
-4. Inspect the executable's `argparse` definition before selecting the swimlane
-   flag:
-   - For `action="store_true"`, pass bare `--enable-chip-swimlane`; runtime `True`
-     maps to level 4.
-   - For an integer/optional-value argument accepting `4`, pass
-     `--enable-chip-swimlane 4`.
-   - If the argument rejects level 4, stop. Do not analyze level 1/2 or silently
-     change the CLI.
+4. Pass the swimlane level explicitly: `--enable-chip-swimlane 4`. Every entry
+   in this repository declares the flag the same way and accepts levels 0-4, so
+   no per-entry inspection is needed. A bare flag means level 1, which cannot
+   answer a dispatch question. If an entry still rejects `4`, its declaration
+   predates the repo-wide form — normalize it to
+   `type=int, nargs="?", const=1, default=0, choices=range(5)` rather than
+   analyzing a level 1/2 capture as level 4.
 
 Activate the worktree environment:
 

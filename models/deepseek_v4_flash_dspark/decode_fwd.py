@@ -2020,7 +2020,7 @@ def main():
         choices=("full_active", "packed_pool_sentinel", "long_context_tail"),
     )
     parser.add_argument("--enable-scope-stats", action="store_true", default=False)
-    parser.add_argument("--enable-chip-swimlane", type=int, default=0, choices=range(5))
+    parser.add_argument("--enable-chip-swimlane", type=int, nargs="?", const=1, default=0, choices=range(5))
     parser.add_argument("--runtime-dir", type=str, default=None)
     parser.add_argument("--save-data", action="store_true", default=False)
     parser.add_argument("--dump-passes", action="store_true", default=False)

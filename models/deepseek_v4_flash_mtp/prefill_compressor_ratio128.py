@@ -465,7 +465,7 @@ if __name__ == "__main__":
             "slot mapping; it is not a JIT kernel parameter."
         ),
     )
-    parser.add_argument("--enable-chip-swimlane", action="store_true", default=False)
+    parser.add_argument("--enable-chip-swimlane", type=int, nargs="?", const=1, default=0, choices=range(5))
     parser.add_argument("--dump-passes", action="store_true", default=False)
     args = parser.parse_args()
 

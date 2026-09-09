@@ -560,7 +560,7 @@ if __name__ == "__main__":
         help="Use a short-window topk row with valid prefix + -1 padding.",
     )
     parser.add_argument("--golden-data", type=str, default=None)
-    parser.add_argument("--enable-chip-swimlane", type=int, nargs="?", const=1, default=0, choices=(0, 1, 2, 4))
+    parser.add_argument("--enable-chip-swimlane", type=int, nargs="?", const=1, default=0, choices=range(5))
     parser.add_argument(
         "--enable-dep-gen", action="store_true", default=False,
         help="Capture PTO2 dependency edges (deps.json); the swimlane converter draws "

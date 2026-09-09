@@ -39,13 +39,13 @@ source "$PYPTO_ROOT/toolchain/versions.env"
 SKILL_PTOAS_VERSION=${PTOAS_VERSION#v}
 ```
 
-Inspect the executable's `argparse` definition before adding the swimlane flag:
-
-- `action="store_true"`: pass bare `--enable-chip-swimlane`; runtime `True` maps
-  to level 4.
-- An integer/optional-value argument accepting `4`: pass
-  `--enable-chip-swimlane 4`.
-- If the CLI excludes level 4, stop. Do not substitute level 1 or 2.
+Pass the swimlane level explicitly: `--enable-chip-swimlane 4`. Every entry in
+this repository declares the flag the same way and accepts levels 0-4, so no
+per-entry inspection is needed. A bare flag means level 1, which cannot answer a
+dispatch question. If an entry still rejects `4`, its declaration predates the
+repo-wide form — normalize it to
+`type=int, nargs="?", const=1, default=0, choices=range(5)` rather than
+substituting level 1 or 2.
 
 Submit the real NPU run through the device queue; do not infer device health
 from an unassigned shell:

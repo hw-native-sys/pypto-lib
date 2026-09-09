@@ -2245,7 +2245,7 @@ def main():
     parser.add_argument("--hca-state-block-num", type=int, default=HCA_STATE_BLOCK_NUM)
     parser.add_argument("--csa-state-block-num", type=int, default=CSA_STATE_BLOCK_NUM)
     parser.add_argument("--inner-state-block-num", type=int, default=INNER_STATE_BLOCK_NUM)
-    parser.add_argument("--enable-chip-swimlane", type=int, nargs="?", const=1, default=0, choices=(0, 1, 2))
+    parser.add_argument("--enable-chip-swimlane", type=int, nargs="?", const=1, default=0, choices=range(5))
     parser.add_argument("--enable-scope-stats", action="store_true", default=False)
 
     parser.add_argument("--seed", type=int, default=20260824, help="Torch seed for reproducible runner inputs and weights.")

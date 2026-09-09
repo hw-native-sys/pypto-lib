@@ -271,13 +271,17 @@ Anything that reasons about dispatch — gap attribution, early-dispatch proof �
 needs level 4. Note this is the chip swimlane's *perf level*; it is unrelated to
 the runtime hierarchy's L4 worker level.
 
-**Check the entry's `argparse` before assuming a flag shape.** Across
-`models/` and `examples/` the flag is declared six different ways in 128
-places: 68 use `action="store_true"` (a bare flag means level 4), 28 use
-`nargs="?", const=1, choices=(0, 1, 2)` (a bare flag means level **1**, and
-level 4 is rejected outright), 17 allow 4 explicitly, 5 make a bare flag mean
-4, and 7 require an explicit value. There is no safe default form; read the
-target's `--help`.
+Every entry across `models/` and `examples/` declares the flag the same way:
+
+```python
+parser.add_argument("--enable-chip-swimlane", type=int, nargs="?", const=1, default=0, choices=range(5))
+```
+
+So a bare `--enable-chip-swimlane` means level **1** everywhere, every level
+through `4` is accepted everywhere, and level 4 is always requested explicitly
+as `--enable-chip-swimlane 4`. Declare it this way in a new entry too — a
+`store_true` flag cannot express a level, and its `True` silently binds to the
+most expensive capture.
 
 ### Identity chain
 

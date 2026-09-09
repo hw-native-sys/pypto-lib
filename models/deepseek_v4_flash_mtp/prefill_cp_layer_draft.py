@@ -2241,7 +2241,7 @@ if __name__ == "__main__":
         "--layer-id", type=int, default=SWA_LAYER_ID,
         help="layer 0 = SWA, layer 2 = CSA, layer 3 = HCA",
     )
-    parser.add_argument("--enable-chip-swimlane", action="store_true", default=False)
+    parser.add_argument("--enable-chip-swimlane", type=int, nargs="?", const=1, default=0, choices=range(5))
     parser.add_argument("--enable-dep-gen", action="store_true", default=False)
     parser.add_argument("--no-golden", action="store_true", default=False)
     parser.add_argument("--compile-only", action="store_true", default=False)

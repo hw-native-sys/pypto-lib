@@ -125,7 +125,7 @@ def main() -> None:
     parser.add_argument("--ragged", action="store_true")
     parser.add_argument("--cache-offset-test", action="store_true")
     parser.add_argument("--compile-only", action="store_true")
-    parser.add_argument("--enable-chip-swimlane", action="store_true")
+    parser.add_argument("--enable-chip-swimlane", type=int, nargs="?", const=1, default=0, choices=range(5))
     args = parser.parse_args()
     if not 0 < args.context_len <= args.capacity:
         raise ValueError("context length must be in (0, capacity]")

@@ -26,15 +26,13 @@ program name.
    remains.
 3. Reuse the operator's normal platform, shapes, weights, and multi-card device
    list. A smaller or synthetic case answers a different performance question.
-4. Inspect the operator's `argparse` definition before choosing the swimlane
-   flag:
-   - `action="store_true"`: pass bare `--enable-chip-swimlane`; `True` maps to
-     level 4 in the runtime binding.
-   - An integer / optional-value argument accepting 4: pass
-     `--enable-chip-swimlane 4` explicitly. A bare flag often means level 1.
-   - An argument whose choices exclude 4: stop and explain that this CLI cannot
-     produce the required capture. Do not analyze level 1/2 as level 4 or
-     silently edit the operator.
+4. Pass the swimlane level explicitly: `--enable-chip-swimlane 4`. Every entry
+   in this repository declares the flag the same way and accepts levels 0-4, so
+   no per-entry inspection is needed. A bare flag means level 1, which cannot
+   answer a dispatch question. If an entry still rejects `4`, its declaration
+   predates the repo-wide form — normalize it to
+   `type=int, nargs="?", const=1, default=0, choices=range(5)` rather than
+   analyzing a level 1/2 capture as level 4.
 
 Activate the worktree environment before running:
 

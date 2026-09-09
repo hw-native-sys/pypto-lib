@@ -1625,7 +1625,7 @@ if __name__ == "__main__":
                         help="Comma-separated per-request logical chunk lengths.")
     parser.add_argument("--start-positions", type=str, default=None,
                         help="Comma-separated per-request prior context lengths; defaults to all zeros.")
-    parser.add_argument("--enable-chip-swimlane", action="store_true", default=False)
+    parser.add_argument("--enable-chip-swimlane", type=int, nargs="?", const=1, default=0, choices=range(5))
     parser.add_argument("--compile-only", action="store_true", default=False)
     parser.add_argument("--save-data", action="store_true", default=False,
                         help="persist inputs and golden outputs for replay")

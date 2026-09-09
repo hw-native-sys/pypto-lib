@@ -1227,9 +1227,9 @@ def _run_session(args, runtime_dirs, model_dir: Path) -> None:
 
     run_config_parameters = inspect.signature(RunConfig).parameters
     if "enable_chip_swimlane" in run_config_parameters:
-        swimlane = {"enable_chip_swimlane": False}
+        swimlane = {"enable_chip_swimlane": 0}
     elif "enable_l2_swimlane" in run_config_parameters:
-        swimlane = {"enable_l2_swimlane": False}
+        swimlane = {"enable_l2_swimlane": 0}
     else:
         raise TypeError("RunConfig exposes no supported swimlane switch")
 

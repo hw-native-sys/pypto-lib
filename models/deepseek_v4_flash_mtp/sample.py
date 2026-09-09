@@ -651,7 +651,7 @@ if __name__ == "__main__":
     )
     parser.add_argument("-d", "--device", type=int, default=0)
     parser.add_argument("--compile-only", action="store_true", default=False)
-    parser.add_argument("--enable-l2-swimlane", action="store_true", default=False)
+    parser.add_argument("--enable-chip-swimlane", type=int, nargs="?", const=1, default=0, choices=range(5))
     parser.add_argument("--temperature", type=float, default=None)
     parser.add_argument("--top-k", type=int, default=None)
     parser.add_argument("--save-data", action="store_true", default=False)
@@ -670,7 +670,7 @@ if __name__ == "__main__":
         config=dict(
             platform=args.platform,
             device_id=args.device,
-            enable_chip_swimlane=int(args.enable_l2_swimlane),
+            enable_chip_swimlane=args.enable_chip_swimlane,
         ),
         rtol=0,
         atol=0,

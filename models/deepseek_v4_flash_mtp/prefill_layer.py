@@ -1015,7 +1015,7 @@ if __name__ == "__main__":
                         help=f"comma-separated device ids; need at least {N_RANKS}")
     parser.add_argument("--layer-id", type=int, default=2,
                         help="Layer id selects attention by MODEL_CONFIG.compress_ratios[layer_id].")
-    parser.add_argument("--enable-chip-swimlane", action="store_true", default=False)
+    parser.add_argument("--enable-chip-swimlane", type=int, nargs="?", const=1, default=0, choices=range(5))
     parser.add_argument("--compile-only", action="store_true", default=False)
     parser.add_argument("--dump-passes", action="store_true", default=False)
     args = parser.parse_args()

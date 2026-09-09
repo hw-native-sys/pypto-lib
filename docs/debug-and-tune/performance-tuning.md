@@ -128,6 +128,13 @@ build_output/<ProgramName>_<ts>/dfx_outputs/
 └── merged_swimlane_<ts>.json   # real device only; open this
 ```
 
+The flag takes a capture **level**, and a bare flag means level 1 — per-task
+AICore timing, which is what reading the L2 schedule needs. Raise it only when
+the question requires it; each level records more and perturbs the timing it
+measures. Gap attribution and early-dispatch proofs need
+`--enable-chip-swimlane 4` — see
+[Capture levels](dependency-and-scheduling.md#capture-levels).
+
 Two viewers work:
 
 - Open `merged_swimlane_<ts>.json` in <https://ui.perfetto.dev/>.

@@ -152,11 +152,11 @@ parser.add_argument(
     nargs="?",
     const=1,
     default=0,
-    choices=(0, 1, 2, 4),
+    choices=range(5),
 )
 
 # after
-parser.add_argument("--enable-chip-swimlane", type=int, nargs="?", const=1, default=0, choices=(0, 1, 2, 4))
+parser.add_argument("--enable-chip-swimlane", type=int, nargs="?", const=1, default=0, choices=range(5))
 ```
 
 Structures that stay one-item-per-line:
