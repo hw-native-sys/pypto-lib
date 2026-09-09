@@ -47,13 +47,21 @@ SEQ_LENS = (4096, 8192, 16384)
 HEADS = (16,)
 
 
-def _random_specs(specs):
-    """Same shapes and dtypes, values drawn at random instead of from the chain."""
+def _random_specs(stage, specs):
+    """Same shapes and dtypes, values drawn at random instead of from the chain.
+
+    Outputs are left alone. TensorSpec.direction is stamped from the compiled
+    kernel, so it cannot be read before the run; the names come from the stage
+    test's map instead.
+    """
     import torch
 
+    from models.gdn.test_gdn_stages import OUTPUTS
+
+    leave_alone = set(OUTPUTS[stage]) | {"mask", "tril", "neg_eye"}
     out = []
     for spec in specs:
-        if getattr(spec, "is_output", False) or spec.name in ("mask", "tril", "neg_eye"):
+        if spec.name in leave_alone:
             out.append(spec)
             continue
         dtype = spec.dtype
@@ -75,7 +83,7 @@ def bench_stage(stage: str, t: int, h: int, platform: str, device: int,
     fn = mod.build_kernel(t=t, h=h, d=D, chunk=CHUNK)
     specs = mod.build_tensor_specs(t=t, h=h, d=D, chunk=CHUNK)
     if data == "random":
-        specs = _random_specs(specs)
+        specs = _random_specs(stage, specs)
 
     started = time.time()
     result = run(
