@@ -117,8 +117,8 @@ def build_tensor_specs(t: int = T, h: int = H, d: int = D, chunk: int = CHUNK):
                    init_value=reference.lazy("chunk_h", "u16", t, h, d, chunk)),
         TensorSpec("g_sum", [h, t], torch.float32,
                    init_value=reference.lazy("chunk_h", "g_sum", t, h, d, chunk, reference.to_hT)),
-        TensorSpec("state", [nc * h * d, d], torch.float16, is_output=True),
-        TensorSpec("v_new", [t, h, d], torch.float16, is_output=True),
+        TensorSpec("state", [nc * h * d, d], torch.float16),
+        TensorSpec("v_new", [t, h, d], torch.float16),
     ]
 
 
@@ -144,7 +144,7 @@ def _stats_ok(actual, expected, **_kwargs):
 
 if __name__ == "__main__":
     import argparse
-    from golden import run_jit
+    from golden import run
 
     parser = argparse.ArgumentParser()
     parser.add_argument("-p", "--platform", type=str, default="a2a3",
@@ -155,14 +155,14 @@ if __name__ == "__main__":
     parser.add_argument("--runtime-dir", type=str, default=None)
     args = parser.parse_args()
 
-    result = run_jit(
+    result = run(
         fn=gdn_chunk_h,
         specs=build_tensor_specs(),
         golden_fn=golden_gdn_chunk_h,
         golden_data=args.golden_data,
         runtime_dir=args.runtime_dir,
         save_data=args.save_data,
-        runtime_cfg=dict(platform=args.platform, device_id=args.device),
+        config=dict(platform=args.platform, device_id=args.device),
         rtol=1e-2,
         atol=1e-5,
         compare_fn={"state": _stats_ok, "v_new": _stats_ok},

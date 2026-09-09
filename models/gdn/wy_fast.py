@@ -84,8 +84,8 @@ def build_tensor_specs(t: int = T, h: int = H, d: int = D, chunk: int = CHUNK):
                    init_value=reference.lazy("wy_fast", "beta", t, h, d, chunk, reference.to_hT)),
         TensorSpec("g_sum", [h, t], torch.float32,
                    init_value=reference.lazy("wy_fast", "g_sum", t, h, d, chunk, reference.to_hT)),
-        TensorSpec("w_out", [t, h, d], torch.float16, is_output=True),
-        TensorSpec("u_out", [t, h, d], torch.float16, is_output=True),
+        TensorSpec("w_out", [t, h, d], torch.float16),
+        TensorSpec("u_out", [t, h, d], torch.float16),
     ]
 
 
@@ -110,7 +110,7 @@ def _stats_ok(actual, expected, **_kwargs):
 
 if __name__ == "__main__":
     import argparse
-    from golden import run_jit
+    from golden import run
 
     parser = argparse.ArgumentParser()
     parser.add_argument("-p", "--platform", type=str, default="a2a3",
@@ -121,14 +121,14 @@ if __name__ == "__main__":
     parser.add_argument("--runtime-dir", type=str, default=None)
     args = parser.parse_args()
 
-    result = run_jit(
+    result = run(
         fn=gdn_wy_fast,
         specs=build_tensor_specs(),
         golden_fn=golden_gdn_wy_fast,
         golden_data=args.golden_data,
         runtime_dir=args.runtime_dir,
         save_data=args.save_data,
-        runtime_cfg=dict(
+        config=dict(
             platform=args.platform,
             device_id=args.device,
         ),
