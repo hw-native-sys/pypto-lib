@@ -343,7 +343,7 @@ def golden_gate_core(tensors):
 
     xg, inv_rms, scores, biased = _golden_gate_scores(tensors)
 
-    from mx_utils import host_mxfp8_activation
+    from utils import host_mxfp8_activation
 
     x_norm = xg * inv_rms
     x_norm[num_tokens:] = 0

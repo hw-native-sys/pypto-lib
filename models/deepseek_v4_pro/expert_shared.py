@@ -350,7 +350,7 @@ def golden_expert_shared(tensors):
     import torch
     import torch.nn.functional as F
 
-    from mx_utils import decode_e8m0_codes, host_quant_mxfp8, matmul_mx_golden
+    from utils import decode_e8m0_codes, host_quant_mxfp8, matmul_mx_golden
 
     x_fp8 = tensors["x_local"][:T]
     x_scale = decode_e8m0_codes(
@@ -378,7 +378,7 @@ def golden_expert_shared(tensors):
 def build_tensor_specs():
     import torch
     from golden import TensorSpec
-    from mx_utils import gen_mxfp8_weight_kn_device, host_mxfp8_activation
+    from utils import gen_mxfp8_weight_kn_device, host_mxfp8_activation
 
     x_local_bf16 = torch.randn(T_PAD, D, dtype=torch.bfloat16)
     if T < T_PAD:

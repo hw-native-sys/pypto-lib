@@ -281,7 +281,7 @@ def golden_expert_routed(tensors):
     import torch
     import torch.nn.functional as F
 
-    from mx_utils import decode_e8m0_codes, host_quant_mxfp8, matmul_mx_golden
+    from utils import decode_e8m0_codes, host_quant_mxfp8, matmul_mx_golden
 
     recv_x = tensors["recv_x"]
     recv_mx_scale = decode_e8m0_codes(
@@ -330,7 +330,7 @@ def golden_expert_routed(tensors):
 def gen_routed_mx_weights(n_experts, dequant_std, seed_base=0):
     """Expand synthetic MXFP4 W1/W3/W2 through the checkpoint conversion path."""
     import torch
-    from mx_utils import gen_mxfp4_weight_kn_device, pack_b_scale, unpack_b_scale
+    from utils import gen_mxfp4_weight_kn_device, pack_b_scale, unpack_b_scale
 
     w1_list, w1s_list, w3_list, w3s_list, w2_list, w2s_list = [], [], [], [], [], []
     for e in range(n_experts):
@@ -363,7 +363,7 @@ def gen_routed_mx_weights(n_experts, dequant_std, seed_base=0):
 def build_tensor_specs():
     import torch
     from golden import TensorSpec
-    from mx_utils import host_quant_mxfp8, pack_a_scale
+    from utils import host_quant_mxfp8, pack_a_scale
 
     # Across-layer-mean dequant std (typical layer) of the real routed experts.
     ROUTED_DEQUANT_STD = {"w1": 2.47e-2, "w2": 2.44e-2, "w3": 2.46e-2}

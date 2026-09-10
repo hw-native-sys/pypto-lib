@@ -33,7 +33,7 @@ constant if a case needs a longer context.
 The MoE path follows the DeepSeek-V4-Pro AscendC quantization boundary:
 
 - Routed W1/W3/W2 checkpoint tensors stay MXFP4 on disk. The host bridge in
-  [mx_utils.py](../../../models/deepseek_v4_pro/mx_utils.py) expands each E2M1
+  [utils.py](../../../models/deepseek_v4_pro/utils.py) expands each E2M1
   nibble exactly to its FP8E4M3 value, preserves the original per-32 E8M0
   scale, and packs it as ``MX_B_NN`` before Cube multiplication.
 - Shared W1/W3/W2 use native MXFP8 data and per-32 E8M0 scales.
@@ -262,8 +262,8 @@ open, so a run can diverge between ranks without the kernels having changed.
 | Prefill attention and cache | [prefill_attention_swa.py](../../../models/deepseek_v4_pro/prefill_attention_swa.py), [prefill_attention_csa.py](../../../models/deepseek_v4_pro/prefill_attention_csa.py), [prefill_attention_hca.py](../../../models/deepseek_v4_pro/prefill_attention_hca.py), [prefill_sparse_attn.py](../../../models/deepseek_v4_pro/prefill_sparse_attn.py), [prefill_compressor_ratio4.py](../../../models/deepseek_v4_pro/prefill_compressor_ratio4.py), [prefill_compressor_ratio128.py](../../../models/deepseek_v4_pro/prefill_compressor_ratio128.py), [prefill_indexer.py](../../../models/deepseek_v4_pro/prefill_indexer.py), [prefill_indexer_compressor.py](../../../models/deepseek_v4_pro/prefill_indexer_compressor.py) |
 | Shared transforms | [rmsnorm.py](../../../models/deepseek_v4_pro/rmsnorm.py), [qkv_proj_rope.py](../../../models/deepseek_v4_pro/qkv_proj_rope.py), [hc_pre.py](../../../models/deepseek_v4_pro/hc_pre.py), [hc_post.py](../../../models/deepseek_v4_pro/hc_post.py), [hc_head.py](../../../models/deepseek_v4_pro/hc_head.py) |
 | MoE and output | [moe.py](../../../models/deepseek_v4_pro/moe.py), [gate.py](../../../models/deepseek_v4_pro/gate.py), [expert_shared.py](../../../models/deepseek_v4_pro/expert_shared.py), [expert_routed.py](../../../models/deepseek_v4_pro/expert_routed.py), [lm_head.py](../../../models/deepseek_v4_pro/lm_head.py) |
-| Metadata and host helpers | [config.py](../../../models/deepseek_v4_pro/config.py), [decode_metadata.py](../../../models/deepseek_v4_pro/decode_metadata.py), [rope_tables.py](../../../models/deepseek_v4_pro/rope_tables.py) |
-| Real-weight loading | [utils.py](../../../models/deepseek_v4_pro/utils.py) |
+| Metadata and host helpers | [config.py](../../../models/deepseek_v4_pro/config.py), [decode_metadata.py](../../../models/deepseek_v4_pro/decode_metadata.py), [rope_tables.py](../../../models/deepseek_v4_pro/rope_tables.py), [utils.py](../../../models/deepseek_v4_pro/utils.py) |
+| Real-weight loading and MX conversion | [utils.py](../../../models/deepseek_v4_pro/utils.py) |
 | Token loop | [synthetic_token_loop.py](../../../models/deepseek_v4_pro/synthetic_token_loop.py) |
 
 `config.py`, `decode_metadata.py`, and `rope_tables.py` have no `__main__`

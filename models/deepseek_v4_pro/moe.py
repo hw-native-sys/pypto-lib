@@ -760,7 +760,7 @@ def golden_moe(tensors):
     from gate import golden_gate_core
     from expert_shared import golden_expert_shared
     from expert_routed import golden_expert_routed
-    from mx_utils import pack_a_scale, unpack_a_scale
+    from utils import pack_a_scale, unpack_a_scale
 
     x_next_out = torch.zeros(N_RANKS, T, HC_MULT, D, dtype=torch.float32)
     num_tokens = max(0, min(T, int(tensors.get("num_tokens", T))))
@@ -936,7 +936,7 @@ def build_tensor_specs(layer_id=0, num_tokens=T, balanced_routing=False):
     import torch
     from golden import ScalarSpec, TensorSpec
     from expert_routed import gen_routed_mx_weights
-    from mx_utils import gen_mxfp8_weight_kn_device
+    from utils import gen_mxfp8_weight_kn_device
 
     # Routed = MXFP4 value grid, shared = MXFP8. This
     # is an integration test whose x_next-equivalent output is dominated by near-zero
