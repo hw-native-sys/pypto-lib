@@ -33,15 +33,22 @@ CHUNK = GDN_TILING.chunk                    # chunk size in tokens, our tiling c
 T = 8192                # tokens (single sequence, B = 1)
 
 
-def build_kernel(t: int = T, h: int = H, d: int = D, chunk: int = CHUNK):
-    """The stage kernel at one shape; `d` is unused and accepted for a uniform signature."""
+def build_kernel(t: int = T, h: int = H, d: int = D, chunk: int = CHUNK,
+                 inline: bool = False, out_dtype=None):
+    """The stage kernel at one shape; `d` is unused and accepted for a uniform signature.
+
+    `out_dtype` is FP32 standalone, which is what the stage test scores. wy_fast
+    reads A_inv as FP16, so `gdn_layer` asks for FP16 here and the narrowing rides
+    on the last matmul instead of costing a second pass over [T, H, C].
+    """
+    out_dtype = pl.FP32 if out_dtype is None else out_dtype
     ndouble = chunk.bit_length() - 2       # X updates after X = I - A, log2(CHUNK) - 1
 
-    @pl.jit
+    @(pl.jit.inline if inline else pl.jit)
     def gdn_solve_tril(
         a_in: pl.Tensor[[t, h, chunk], pl.FP16],
         neg_eye: pl.Tensor[[chunk, chunk], pl.FP16],
-        t_out: pl.Out[pl.Tensor[[t, h, chunk], pl.FP32]],
+        t_out: pl.Out[pl.Tensor[[t, h, chunk], out_dtype]],
     ):
         a_flat = pl.reshape(a_in, [t, h * chunk])
         t_flat = pl.reshape(t_out, [t, h * chunk])
@@ -66,6 +73,9 @@ def build_kernel(t: int = T, h: int = H, d: int = D, chunk: int = CHUNK):
                     y32 = pl.matmul(y16, y16, out_dtype=pl.FP32)
                     y16 = pl.cast(y32, target_type=pl.FP16, mode="rint")
                 xn = pl.matmul_acc(xa, x16, y16)                # last factor; Y is dead
+                # No cast: the store carries the dtype, so an FP16 t_out narrows the
+                # FP32 accumulator on the way out. A build-time `if` cannot help here --
+                # pypto traces both sides of a Python branch inside a kernel body.
                 t_flat[t0 : t0 + chunk, col : col + chunk] = xn
         return t_out
 
@@ -76,7 +86,7 @@ gdn_solve_tril = build_kernel()
 
 
 def build_tensor_specs(t: int = T, h: int = H, d: int = D, chunk: int = CHUNK,
-                       hg: int = HG):
+                       hg: int = HG, out_dtype=None):
     # hg only picks which reference chain to draw from; this stage reads no q or k.
     import torch
     from golden import TensorSpec
@@ -88,7 +98,8 @@ def build_tensor_specs(t: int = T, h: int = H, d: int = D, chunk: int = CHUNK,
                    init_value=reference.lazy("solve_tril", "a16", t, h, d, chunk, hg=hg)),
         TensorSpec("neg_eye", [chunk, chunk], torch.float16,
                    init_value=lambda: -torch.eye(chunk, dtype=torch.float16)),
-        TensorSpec("t_out", [t, h, chunk], torch.float32),
+        TensorSpec("t_out", [t, h, chunk],
+                   torch.float32 if out_dtype is None else out_dtype),
     ]
 
 
