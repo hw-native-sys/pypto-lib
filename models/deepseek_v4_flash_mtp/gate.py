@@ -151,12 +151,19 @@ def gate(
                 x_norm_i8[t0 : t0 + T_TILE, xq_b_k : xq_b_k + QUANT_TILE] = \
                     pl.cast(xn_q_half, pl.INT8, mode="trunc")
 
-    # Pre-route setup: zero the inactive-token outputs and NEG_INF the biased pad
-    # columns so the sort ranks pad experts last. Route write-backs are guarded to
-    # active tokens, so the inactive-zero can run here rather than post-route.
+    # Pre-route setup: zero the inactive-token inputs/outputs and NEG_INF the
+    # biased pad columns so the sort ranks pad experts last. Shared experts read
+    # the complete physical slab, so inactive quantized rows must be initialized.
     with pl.at(level=pl.Level.CORE_GROUP, name_hint="gate_pre_route"):
         for zt in pl.range(T):
             if zt >= active_tokens:
+                inactive_x_norm_f16 = pl.full([1, D], dtype=pl.FP16, value=0.0)
+                inactive_x_norm_i8 = pl.cast(
+                    inactive_x_norm_f16,
+                    target_type=pl.INT8,
+                    mode="trunc",
+                )
+                x_norm_i8[zt : zt + 1, :] = inactive_x_norm_i8
                 pl.write(x_norm_scale, [zt, 0], pl.cast(0.0, pl.FP32))
                 for zk in pl.range(TOPK):
                     pl.write(indices, [zt, zk], pl.cast(0, pl.INT32))
@@ -219,9 +226,18 @@ def gate(
             # Tail [TOPK, TOPK_PAD) zeroed so fillpad drops it from the sum.
             hs_idx_tile = pl.create_tensor([GATE_T_TILE, TOPK_PAD], dtype=pl.INT32)
             for hs_tt in pl.range(GATE_T_TILE):
-                hs_token = pl.cast(pl.read(input_ids, [t1 + hs_tt]), pl.INDEX)
-                for hs_k in pl.range(TOPK):
-                    pl.write(hs_idx_tile, [hs_tt, hs_k], pl.read(tid2eid, [hs_token, hs_k]))
+                hs_row = t1 + hs_tt
+                if hs_row < active_tokens:
+                    hs_token = pl.cast(pl.read(input_ids, [hs_row]), pl.INDEX)
+                    for hs_k in pl.range(TOPK):
+                        pl.write(
+                            hs_idx_tile,
+                            [hs_tt, hs_k],
+                            pl.read(tid2eid, [hs_token, hs_k]),
+                        )
+                else:
+                    for hs_k in pl.range(TOPK):
+                        pl.write(hs_idx_tile, [hs_tt, hs_k], pl.cast(0, pl.INT32))
                 for hs_pad_k in pl.range(TOPK, TOPK_PAD):
                     pl.write(hs_idx_tile, [hs_tt, hs_pad_k], pl.cast(0, pl.INT32))
             # Batched score gather (replaces per-eid scalar reads); set_validshape +
@@ -357,7 +373,8 @@ def golden_gate_core(tensors):
     if layer_id < N_HASH_LAYERS:
         tid2eid = tensors["tid2eid"]
         input_ids = tensors["input_ids"]
-        indices = tid2eid[input_ids.flatten().long()]
+        indices = torch.zeros((T, TOPK), dtype=tid2eid.dtype, device=tid2eid.device)
+        indices[:num_tokens] = tid2eid[input_ids.flatten()[:num_tokens].long()]
     else:
         indices = torch.argsort(-biased, dim=-1, stable=True)[..., :TOPK]
 
@@ -366,6 +383,7 @@ def golden_gate_core(tensors):
     denom = topk_vals.sum(dim=-1, keepdim=True)
     weights = (topk_vals / denom) * ROUTE_SCALE
     if num_tokens < T:
+        x_norm_i8[num_tokens:] = 0
         x_norm_scale[num_tokens:] = 0
         indices[num_tokens:] = 0
         weights[num_tokens:] = 0

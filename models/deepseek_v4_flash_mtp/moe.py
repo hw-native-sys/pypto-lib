@@ -43,7 +43,7 @@ from pypto.ir import DistributedConfig
 
 from config import FLASH as M, EP_WORLD_SIZE, MOE_TOKENS, RECV_MAX
 from hc_pre import hc_pre
-from hc_post import hc_post
+from hc_post import hc_post, hc_post_prefill
 from gate import gate
 from expert_shared import expert_shared
 from expert_routed import expert_routed, prefill_expert_grouped
@@ -929,8 +929,10 @@ def prefill_moe(
     gate_bias: pl.Tensor[[N_EXPERTS_GLOBAL], pl.FP32],
     tid2eid: pl.Tensor[[VOCAB, TOPK], pl.INT32],
     input_ids: pl.Tensor[[T], pl.INT64],
-    routed_w13: pl.Tensor[[N_LOCAL, 2 * MOE_INTER, D], pl.INT8],
-    routed_w13_scale: pl.Tensor[[N_LOCAL, 2 * MOE_INTER], pl.FP32],
+    routed_w1: pl.Tensor[[N_LOCAL, MOE_INTER, D], pl.INT8],
+    routed_w1_scale: pl.Tensor[[N_LOCAL, MOE_INTER], pl.FP32],
+    routed_w3: pl.Tensor[[N_LOCAL, MOE_INTER, D], pl.INT8],
+    routed_w3_scale: pl.Tensor[[N_LOCAL, MOE_INTER], pl.FP32],
     routed_w2: pl.Tensor[[N_LOCAL, D, MOE_INTER], pl.INT8],
     routed_w2_scale: pl.Tensor[[N_LOCAL, D], pl.FP32],
     shared_w1: pl.Tensor[[MOE_INTER, D], pl.INT8],
@@ -976,8 +978,10 @@ def prefill_moe(
     The strict CP8/EP8 production caller configures ``config.MOE_TOKENS`` to
     its 1024 local rows before importing this module. EP2/EP4 and T=128 remain
     valid compile/correctness gates because all capacities are shape-derived.
-    The production contract routes the complete physical slab, so callers pass
-    ``num_tokens == T``; an inactive physical tail is not initialized here.
+    Callers provide a complete initialized physical slab and an active-prefix
+    length satisfying ``1 <= num_tokens <= T``. HC pre-mix still reads every
+    physical ``x_hc`` row; only the active prefix is routed, and the inactive
+    ``x_next`` tail is deterministically zero-filled.
 
     This path implements count-driven A2Av transport, 16-row-aligned grouped
     routed experts and source-side BF16 top-k weighting. It deliberately still
@@ -1081,8 +1085,10 @@ def prefill_moe(
         grouped_x,
         grouped_scale,
         expert_counts,
-        routed_w13,
-        routed_w13_scale,
+        routed_w1,
+        routed_w1_scale,
+        routed_w3,
+        routed_w3_scale,
         routed_w2,
         routed_w2_scale,
         grouped_y,
@@ -1108,7 +1114,7 @@ def prefill_moe(
         moe_epoch,
     )
 
-    hc_post(ffn_out, x_hc, post_ffn, comb_ffn, x_next)
+    hc_post_prefill(ffn_out, x_hc, post_ffn, comb_ffn, x_next, num_tokens)
     with pl.at(
         level=pl.Level.CORE_GROUP,
         name_hint="prefill_moe_grouped_complete",

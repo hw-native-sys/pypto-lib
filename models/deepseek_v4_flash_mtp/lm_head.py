@@ -96,47 +96,41 @@ assert DP_SIZE in _DP_CHOICES, f"--dp must be one of {_DP_CHOICES} (got {DP_SIZE
 
 
 @pl.jit.inline(auto_scope=False)
-def lm_head(
-    hidden_states: pl.Tensor,
+def lm_head_selected_with_window_offsets(
+    selected_hidden: pl.Tensor[[MAX_LOGIT_ROWS, D], pl.BF16],
     lm_head_weight: pl.Tensor[[VOCAB_PER_TP, D], pl.BF16],
-    logit_row_indices: pl.Tensor[[MAX_LOGIT_ROWS], pl.INT32],
     logits: pl.Tensor[[MAX_LOGIT_ROWS, VOCAB], pl.FP32],
-    hidden_window: pld.DistributedTensor[[GROUP_LOGIT_ROWS, D], pl.BF16],
-    hidden_done: pld.DistributedTensor[[TP_SIZE, 1], pl.INT32],
-    logits_window: pld.DistributedTensor[[MAX_LOGIT_ROWS, VOCAB], pl.FP32],
-    logits_done: pld.DistributedTensor[[TP_SIZE, 1], pl.INT32],
+    hidden_window: pld.DistributedTensor,
+    hidden_done: pld.DistributedTensor,
+    logits_window: pld.DistributedTensor,
+    logits_done: pld.DistributedTensor,
     group_base: pl.Scalar[pl.INT32],
     tp_rank: pl.Scalar[pl.INT32],
     done_epoch: pl.Scalar[pl.INT32],
+    hidden_window_row_base: pl.Scalar[pl.INT32],
+    logits_window_row_base: pl.Scalar[pl.INT32],
+    signal_row_base: pl.Scalar[pl.INT32],
 ) -> pl.Tensor[[MAX_LOGIT_ROWS, VOCAB], pl.FP32]:
-    # Scratch is allocated just outside the scope that first writes it: a
-    # create_tensor inside a pl.at yields a tile, not a GM tensor view.
-    selected_hidden = pl.create_tensor([MAX_LOGIT_ROWS, D], dtype=pl.BF16)
-    owner_hiddens = pl.create_tensor([GROUP_LOGIT_ROWS, D], dtype=pl.BF16)
+    """Project preselected rows through one caller-owned window segment.
 
+    The signal segment starts at the previous epoch's credits and is cleared
+    after the result is gathered. Fresh request segments therefore use epoch 1.
+    """
     # Publish this card's logit rows into every group member's window slot: the
-    # window holds one slot per group member and each card writes only its own,
-    # `tp_rank * MAX_LOGIT_ROWS`. One block per logit row, one [1, D] put per peer.
-    for row in pl.spmd(MAX_LOGIT_ROWS, name_hint="lm_head_dispatch_push"):
-        hidden_rows = pl.tensor.dim(hidden_states, 0)
-        source_row_raw = pl.read(logit_row_indices, [row])
-        # Clamp so the load address is always inside hidden_states even if a
-        # caller hands over a stale index; the -1 guard below decides whether
-        # the row is actually used.
-        safe_raw = pl.max(pl.min(source_row_raw, hidden_rows - 1), 0)
-        # Full-width [1, D] tile: the block owns the whole row.
-        selected_hidden[row : row + 1, :] = pl.full([1, D], dtype=pl.BF16, value=0.0)
-        if source_row_raw >= 0:
-            source_row = pl.cast(safe_raw, target_type=pl.INDEX)
-            selected_hidden[row : row + 1, :] = hidden_states[source_row : source_row + 1, :]
-
+    # request segment holds one slot per group member and each card writes only
+    # its own, `tp_rank * MAX_LOGIT_ROWS`. One block per row, one put per peer.
+    with pl.spmd(MAX_LOGIT_ROWS, name_hint="lm_head_dispatch_push") as _dispatch_push_tid:
+        row = pl.tile.get_block_idx()
         # Self-target rides the same put; put drains before the notify issues.
         for peer_tp in pl.range(TP_SIZE):
             pld.tensor.put(
                 dst=hidden_window,
                 peer=group_base + peer_tp,
                 src=selected_hidden,
-                dst_offsets=[tp_rank * MAX_LOGIT_ROWS + row, 0],
+                dst_offsets=[
+                    hidden_window_row_base + tp_rank * MAX_LOGIT_ROWS + row,
+                    0,
+                ],
                 src_offsets=[row, 0],
                 shape=[1, D],
             )
@@ -147,31 +141,46 @@ def lm_head(
                 pld.system.notify(
                     target=hidden_done,
                     peer=group_base + peer_tp,
-                    offsets=[tp_rank, 0],
+                    offsets=[signal_row_base + tp_rank, 0],
                     value=1,
                     op=pld.NotifyOp.AtomicAdd,
                 )
 
-    # Anchor the blocking wait to the local hidden-state producer.
-    with pl.at(level=pl.Level.CORE_GROUP, name_hint="lm_head_dispatch_wait") as _dwait_tid:
-        _hidden_anchor = pl.read(hidden_states, [0, 0])
+    # Submit the blocking wait only after this rank has published its rows.
+    with pl.at(
+        level=pl.Level.CORE_GROUP,
+        name_hint="lm_head_dispatch_wait",
+        deps=[_dispatch_push_tid],
+        allow_early_resolve=False,
+    ) as _dwait_tid:
+        _hidden_anchor = pl.read(
+            hidden_window,
+            [hidden_window_row_base + tp_rank * MAX_LOGIT_ROWS, 0],
+        )
         for owner_tp in pl.range(TP_SIZE):
             if owner_tp != tp_rank:
                 pld.system.wait(
                     signal=hidden_done,
-                    offsets=[owner_tp, 0],
+                    offsets=[signal_row_base + owner_tp, 0],
                     expected=pl.cast(done_epoch * MAX_LOGIT_ROWS, pl.INT32),
                     cmp=pld.WaitCmp.Ge,
                 )
 
-    # Window -> matmul operand: a local copy split over k-tiles. Keeps the matmul's
-    # auto-dep on owner_hiddens.
+    # Window -> matmul operand: a local copy split over k-tiles.
+    owner_hiddens = pl.create_tensor([GROUP_LOGIT_ROWS, D], dtype=pl.BF16)
     with pl.spmd(
-        D // HIDDEN_GATHER_TILE, name_hint="lm_head_dispatch_gather", deps=[_dwait_tid]
+        D // HIDDEN_GATHER_TILE,
+        name_hint="lm_head_dispatch_gather",
+        deps=[_dwait_tid, _dispatch_push_tid],
     ) as _dgather_tid:
         gkb = pl.tile.get_block_idx()
         gk0 = gkb * HIDDEN_GATHER_TILE
-        owner_hiddens[:, gk0 : gk0 + HIDDEN_GATHER_TILE] = hidden_window[:, gk0 : gk0 + HIDDEN_GATHER_TILE]
+        gathered_hidden = pl.load(
+            hidden_window,
+            [hidden_window_row_base, gk0],
+            [GROUP_LOGIT_ROWS, HIDDEN_GATHER_TILE],
+        )
+        pl.store(gathered_hidden, [0, gk0], owner_hiddens)
 
     # Mixed cube + comm kernel: the cube projects a vocab tile, pl.aiv_shard carries
     # that accumulator across the C->V edge, and pld.tensor.remote_store pushes each
@@ -243,7 +252,7 @@ def lm_head(
                         ),
                         logits_window,
                         group_base + owner_tp,
-                        [0, vocab_base + mm_o0],
+                        [logits_window_row_base, vocab_base + mm_o0],
                     )
 
         # Notify folded into the push: each block signals every peer after its own
@@ -255,20 +264,27 @@ def lm_head(
                     pld.system.notify(
                         target=logits_done,
                         peer=group_base + owner_tp,
-                        offsets=[tp_rank, 0],
+                        offsets=[signal_row_base + tp_rank, 0],
                         value=1,
                         op=pld.NotifyOp.AtomicAdd,
                     )
 
     # Keep the blocking wait behind the local logits push.
     with pl.at(
-        level=pl.Level.CORE_GROUP, name_hint="lm_head_combine_wait", deps=[_push_tid]
+        level=pl.Level.CORE_GROUP,
+        name_hint="lm_head_combine_wait",
+        deps=[_push_tid],
+        allow_early_resolve=False,
     ) as _cwait_tid:
+        _logits_anchor = pl.read(
+            logits_window,
+            [logits_window_row_base, tp_rank * VOCAB_PER_TP],
+        )
         for src_tp in pl.range(TP_SIZE):
             if src_tp != tp_rank:
                 pld.system.wait(
                     signal=logits_done,
-                    offsets=[src_tp, 0],
+                    offsets=[signal_row_base + src_tp, 0],
                     expected=pl.cast(done_epoch * FUSED_LM_HEAD_CORES, pl.INT32),
                     cmp=pld.WaitCmp.Ge,
                 )
@@ -284,24 +300,74 @@ def lm_head(
             for ob in pl.range(gblk, N_LOGITS_COMM_TILES, LOGITS_COMM_BLOCKS):
                 o0 = ob * LOGITS_COMM_TILE
                 lo = src_vocab_base + o0
-                logits[:, lo : lo + LOGITS_COMM_TILE] = logits_window[:, lo : lo + LOGITS_COMM_TILE]
+                gathered_logits = pl.load(
+                    logits_window,
+                    [logits_window_row_base, lo],
+                    [MAX_LOGIT_ROWS, LOGITS_COMM_TILE],
+                )
+                pl.store(gathered_logits, [0, lo], logits)
 
             if LOGITS_COMM_TAIL != 0:
                 if gblk == LOGITS_TAIL_BLOCK:
                     tail_o0 = N_LOGITS_COMM_TILES * LOGITS_COMM_TILE
                     tl = src_vocab_base + tail_o0
-                    logits[:, tl : tl + LOGITS_COMM_TAIL] = logits_window[:, tl : tl + LOGITS_COMM_TAIL]
+                    gathered_tail = pl.load(
+                        logits_window,
+                        [logits_window_row_base, tl],
+                        [MAX_LOGIT_ROWS, LOGITS_COMM_TAIL],
+                    )
+                    pl.store(gathered_tail, [0, tl], logits)
 
     # Every local wait has observed all current-round peer notifies before the
     # logits gather can complete. Clear only this rank's counters so a retained
     # CommDomain can safely reuse the fixed done_epoch on the next forward.
-    with pl.at(level=pl.Level.CORE_GROUP, name_hint="lm_head_signal_clear"):
-        _completion_anchor = pl.read(logits, [0, 0])
+    with pl.at(
+        level=pl.Level.CORE_GROUP,
+        name_hint="lm_head_signal_clear",
+        deps=[_gather_tid],
+    ):
         zero = pl.cast(0, pl.INT32)
         for src_tp in pl.range(TP_SIZE):
-            pl.write(hidden_done, [src_tp, 0], zero)
-            pl.write(logits_done, [src_tp, 0], zero)
+            pl.write(hidden_done, [signal_row_base + src_tp, 0], zero)
+            pl.write(logits_done, [signal_row_base + src_tp, 0], zero)
     return logits
+
+
+@pl.jit.inline(auto_scope=False)
+def lm_head(
+    hidden_states: pl.Tensor,
+    lm_head_weight: pl.Tensor[[VOCAB_PER_TP, D], pl.BF16],
+    logit_row_indices: pl.Tensor[[MAX_LOGIT_ROWS], pl.INT32],
+    logits: pl.Tensor[[MAX_LOGIT_ROWS, VOCAB], pl.FP32],
+    hidden_window: pld.DistributedTensor[[GROUP_LOGIT_ROWS, D], pl.BF16],
+    hidden_done: pld.DistributedTensor[[TP_SIZE, 1], pl.INT32],
+    logits_window: pld.DistributedTensor[[MAX_LOGIT_ROWS, VOCAB], pl.FP32],
+    logits_done: pld.DistributedTensor[[TP_SIZE, 1], pl.INT32],
+    group_base: pl.Scalar[pl.INT32],
+    tp_rank: pl.Scalar[pl.INT32],
+    done_epoch: pl.Scalar[pl.INT32],
+) -> pl.Tensor[[MAX_LOGIT_ROWS, VOCAB], pl.FP32]:
+    # Scratch remains in orchestration; allocating it inside the selection
+    # region would yield a tile instead of a GM tensor view.
+    selected_hidden = pl.create_tensor([MAX_LOGIT_ROWS, D], dtype=pl.BF16)
+    for row in pl.spmd(MAX_LOGIT_ROWS, name_hint="lm_head_select_rows"):
+        hidden_rows = pl.tensor.dim(hidden_states, 0)
+        source_row_raw = pl.read(logit_row_indices, [row])
+        # Clamp so the load address is always inside hidden_states even if a
+        # caller hands over a stale index; the -1 guard below decides whether
+        # the row is actually used.
+        safe_raw = pl.max(pl.min(source_row_raw, hidden_rows - 1), 0)
+        selected_hidden[row : row + 1, :] = pl.full([1, D], dtype=pl.BF16, value=0.0)
+        if source_row_raw >= 0:
+            source_row = pl.cast(safe_raw, target_type=pl.INDEX)
+            selected_hidden[row : row + 1, :] = hidden_states[source_row : source_row + 1, :]
+
+    return lm_head_selected_with_window_offsets(
+        selected_hidden, lm_head_weight, logits,
+        hidden_window, hidden_done, logits_window, logits_done,
+        group_base, tp_rank, done_epoch,
+        pl.cast(0, pl.INT32), pl.cast(0, pl.INT32), pl.cast(0, pl.INT32),
+    )
 
 
 @pl.jit
@@ -318,7 +384,7 @@ def lm_head_test(
     tp_rank: pl.Scalar[pl.INT32],
     done_epoch: pl.Scalar[pl.INT32],
 ) -> pl.Tensor[[MAX_LOGIT_ROWS, VOCAB], pl.FP32]:
-    lm_head(
+    logits = lm_head(
         hidden_states, lm_head_weight, logit_row_indices, logits,
         hidden_window, hidden_done, logits_window, logits_done,
         group_base, tp_rank, done_epoch,
@@ -346,7 +412,7 @@ def lm_head_with_sampling(
     done_epoch: pl.Scalar[pl.INT32],
 ):
     """Project logits and sample tokens in one opaque L2 entry."""
-    lm_head(
+    logits = lm_head(
         hidden_states,
         lm_head_weight,
         logit_row_indices,

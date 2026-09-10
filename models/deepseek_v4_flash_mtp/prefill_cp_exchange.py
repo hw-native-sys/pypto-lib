@@ -266,7 +266,7 @@ def prefill_cp_last_hidden_lm_head(
             for peer in pl.range(CP_SIZE):
                 if peer != my_rank:
                     pl.write(cp_consumed, [peer, 0], zero)
-    lm_head(
+    logits = lm_head(
         last_hidden,
         lm_head_weight,
         logit_row_indices,
