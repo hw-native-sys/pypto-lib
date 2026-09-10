@@ -25,12 +25,19 @@ D = 128                 # head dimension
 CHUNK = 128             # chunk size in tokens
 
 
-def build_kernel(t: int = T, h: int = H, d: int = D, chunk: int = CHUNK):
-    """The stage kernel at one shape."""
+def build_kernel(t: int = T, h: int = H, d: int = D, chunk: int = CHUNK,
+                 hg: int | None = None):
+    """The stage kernel at one shape.
+
+    `hg` is the number of QK heads, `h` the number of value heads; they differ
+    under GQA. Defaults to `h`, which makes the head mapping an identity.
+    """
+    hg = h if hg is None else hg
+    grp = h // hg
 
     @pl.jit
     def gdn_wy_fast(
-        k: pl.Tensor[[t, h, d], pl.FP16],
+        k: pl.Tensor[[t, hg, d], pl.FP16],
         v: pl.Tensor[[t, h, d], pl.FP16],
         a_in: pl.Tensor[[t, h, chunk], pl.FP16],
         beta: pl.Tensor[[h, t], pl.FP32],
@@ -38,7 +45,7 @@ def build_kernel(t: int = T, h: int = H, d: int = D, chunk: int = CHUNK):
         w_out: pl.Out[pl.Tensor[[t, h, d], pl.FP16]],
         u_out: pl.Out[pl.Tensor[[t, h, d], pl.FP16]],
     ):
-        k_flat = pl.reshape(k, [t, h * d])
+        k_flat = pl.reshape(k, [t, hg * d])
         v_flat = pl.reshape(v, [t, h * d])
         a_flat = pl.reshape(a_in, [t, h * chunk])
         w_flat = pl.reshape(w_out, [t, h * d])
@@ -56,8 +63,10 @@ def build_kernel(t: int = T, h: int = H, d: int = D, chunk: int = CHUNK):
                 a2 = pl.col_expand_mul(a_chunk, beta16)
                 a1 = pl.col_expand_mul(a_chunk, gate16)
                 d0 = hh * d
+                # GQA: W reads key head hh // grp, U reads value head hh.
+                dg0 = (hh // grp) * d
                 v_blk = v_flat[t0 : t0 + chunk, d0 : d0 + d]
-                k_blk = k_flat[t0 : t0 + chunk, d0 : d0 + d]
+                k_blk = k_flat[t0 : t0 + chunk, dg0 : dg0 + d]
                 # FP16 operands promote to an FP16 result, accumulated FP32 in the cube
                 u_flat[t0 : t0 + chunk, d0 : d0 + d] = pl.matmul(a2, v_blk)
                 w_flat[t0 : t0 + chunk, d0 : d0 + d] = pl.matmul(a1, k_blk)
@@ -69,21 +78,25 @@ def build_kernel(t: int = T, h: int = H, d: int = D, chunk: int = CHUNK):
 gdn_wy_fast = build_kernel()
 
 
-def build_tensor_specs(t: int = T, h: int = H, d: int = D, chunk: int = CHUNK):
+def build_tensor_specs(t: int = T, h: int = H, d: int = D, chunk: int = CHUNK,
+                       hg: int | None = None):
     import torch
     from golden import TensorSpec
 
     from models.gdn import reference
 
+    hg = h if hg is None else hg
+
     return [
-        TensorSpec("k", [t, h, d], torch.float16, init_value=reference.lazy("wy_fast", "k", t, h, d, chunk)),
-        TensorSpec("v", [t, h, d], torch.float16, init_value=reference.lazy("wy_fast", "v", t, h, d, chunk)),
+        TensorSpec("k", [t, hg, d], torch.float16,
+                   init_value=reference.lazy("wy_fast", "k", t, h, d, chunk, hg=hg)),
+        TensorSpec("v", [t, h, d], torch.float16, init_value=reference.lazy("wy_fast", "v", t, h, d, chunk, hg=hg)),
         TensorSpec("a_in", [t, h, chunk], torch.float16,
-                   init_value=reference.lazy("wy_fast", "a_inv16", t, h, d, chunk)),
+                   init_value=reference.lazy("wy_fast", "a_inv16", t, h, d, chunk, hg=hg)),
         TensorSpec("beta", [h, t], torch.float32,
-                   init_value=reference.lazy("wy_fast", "beta", t, h, d, chunk, reference.to_hT)),
+                   init_value=reference.lazy("wy_fast", "beta", t, h, d, chunk, reference.to_hT, hg=hg)),
         TensorSpec("g_sum", [h, t], torch.float32,
-                   init_value=reference.lazy("wy_fast", "g_sum", t, h, d, chunk, reference.to_hT)),
+                   init_value=reference.lazy("wy_fast", "g_sum", t, h, d, chunk, reference.to_hT, hg=hg)),
         TensorSpec("w_out", [t, h, d], torch.float16),
         TensorSpec("u_out", [t, h, d], torch.float16),
     ]

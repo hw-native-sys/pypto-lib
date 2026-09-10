@@ -26,22 +26,29 @@ D = 128                 # head dimension
 CHUNK = 128             # chunk size in tokens
 
 
-def build_kernel(t: int = T, h: int = H, d: int = D, chunk: int = CHUNK):
-    """The stage kernel at one shape."""
+def build_kernel(t: int = T, h: int = H, d: int = D, chunk: int = CHUNK,
+                 hg: int | None = None):
+    """The stage kernel at one shape.
+
+    `hg` is the number of QK heads, `h` the number of value heads; they differ
+    under GQA. Defaults to `h`, which makes the head mapping an identity.
+    """
     nchunk = t // chunk                    # state snapshots, one per chunk
+    hg = h if hg is None else hg
+    grp = h // hg
 
     @pl.jit
     def gdn_chunk_o(
-        q: pl.Tensor[[t, h, d], pl.FP16],
-        k: pl.Tensor[[t, h, d], pl.FP16],
+        q: pl.Tensor[[t, hg, d], pl.FP16],
+        k: pl.Tensor[[t, hg, d], pl.FP16],
         v: pl.Tensor[[t, h, d], pl.FP16],
         state: pl.Tensor[[nchunk * h * d, d], pl.FP16],
         g_sum: pl.Tensor[[h, t], pl.FP32],
         mask: pl.Tensor[[chunk, chunk], pl.FP32],
         o_out: pl.Out[pl.Tensor[[t, h, d], pl.FP16]],
     ):
-        q_flat = pl.reshape(q, [t, h * d])
-        k_flat = pl.reshape(k, [t, h * d])
+        q_flat = pl.reshape(q, [t, hg * d])
+        k_flat = pl.reshape(k, [t, hg * d])
         v_flat = pl.reshape(v, [t, h * d])
         o_flat = pl.reshape(o_out, [t, h * d])
         for c0 in pl.spmd(t // chunk, name_hint="chunk_o",
@@ -50,7 +57,10 @@ def build_kernel(t: int = T, h: int = H, d: int = D, chunk: int = CHUNK):
             t0 = c0 * chunk
             for hh in pl.range(h):
                 d0 = hh * d
-                qc = q_flat[t0 : t0 + chunk, d0 : d0 + d]
+                # GQA: Q and K come from key head hh // grp; V, O and the state
+                # snapshot are per value head.
+                dg0 = (hh // grp) * d
+                qc = q_flat[t0 : t0 + chunk, dg0 : dg0 + d]
                 g_row = g_sum[hh : hh + 1, t0 : t0 + chunk]
                 g_col = pl.reshape(g_row, [chunk, 1])
                 # exp on the ROW vector, reshaped after -- NOT pl.exp(g_col). Under
@@ -68,7 +78,7 @@ def build_kernel(t: int = T, h: int = H, d: int = D, chunk: int = CHUNK):
                 # owns, private to this core group. pl.create_tensor allocates a runtime
                 # TENSOR instead: one buffer shared by every chunk running in parallel,
                 # which corrupts intermittently.
-                kc = k_flat[t0 : t0 + chunk, d0 : d0 + d]
+                kc = k_flat[t0 : t0 + chunk, dg0 : dg0 + d]
                 qk = pl.matmul(qc, kc, b_trans=True)
                 diff = pl.full([chunk, chunk], dtype=pl.FP32, value=0.0)
                 diff = pl.row_expand_add(diff, g_col)
@@ -90,13 +100,15 @@ def build_kernel(t: int = T, h: int = H, d: int = D, chunk: int = CHUNK):
 gdn_chunk_o = build_kernel()
 
 
-def build_tensor_specs(t: int = T, h: int = H, d: int = D, chunk: int = CHUNK):
+def build_tensor_specs(t: int = T, h: int = H, d: int = D, chunk: int = CHUNK,
+                       hg: int | None = None):
     import torch
     from golden import TensorSpec
 
     from models.gdn import reference
 
     nc = t // chunk
+    hg = h if hg is None else hg
 
     def init_mask():
         rows = torch.arange(chunk)[:, None]
@@ -104,14 +116,16 @@ def build_tensor_specs(t: int = T, h: int = H, d: int = D, chunk: int = CHUNK):
         return (rows >= cols).float()      # inclusive diagonal
 
     return [
-        TensorSpec("q", [t, h, d], torch.float16, init_value=reference.lazy("chunk_o", "q", t, h, d, chunk)),
-        TensorSpec("k", [t, h, d], torch.float16, init_value=reference.lazy("chunk_o", "k", t, h, d, chunk)),
+        TensorSpec("q", [t, hg, d], torch.float16,
+                   init_value=reference.lazy("chunk_o", "q", t, h, d, chunk, hg=hg)),
+        TensorSpec("k", [t, hg, d], torch.float16,
+                   init_value=reference.lazy("chunk_o", "k", t, h, d, chunk, hg=hg)),
         TensorSpec("v", [t, h, d], torch.float16,
-                   init_value=reference.lazy("chunk_o", "v_new16", t, h, d, chunk)),
+                   init_value=reference.lazy("chunk_o", "v_new16", t, h, d, chunk, hg=hg)),
         TensorSpec("state", [nc * h * d, d], torch.float16,
-                   init_value=reference.lazy("chunk_o", "state", t, h, d, chunk, reference.flat_state)),
+                   init_value=reference.lazy("chunk_o", "state", t, h, d, chunk, reference.flat_state, hg=hg)),
         TensorSpec("g_sum", [h, t], torch.float32,
-                   init_value=reference.lazy("chunk_o", "g_sum", t, h, d, chunk, reference.to_hT)),
+                   init_value=reference.lazy("chunk_o", "g_sum", t, h, d, chunk, reference.to_hT, hg=hg)),
         TensorSpec("mask", [chunk, chunk], torch.float32, init_value=init_mask),
         TensorSpec("o_out", [t, h, d], torch.float16),
     ]
@@ -120,7 +134,8 @@ def build_tensor_specs(t: int = T, h: int = H, d: int = D, chunk: int = CHUNK):
 def golden_gdn_chunk_o(tensors):
     from models.gdn import reference
 
-    t, h, d = tensors["q"].shape
+    t, _, d = tensors["q"].shape          # q and k have Hg heads under GQA
+    h = tensors["v"].shape[1]             # V, O and the state are per value head
     chunk = tensors["mask"].shape[0]
     state = tensors["state"].reshape(t // chunk, h, d, d)
     tensors["o_out"].copy_(reference.chunk_o(
