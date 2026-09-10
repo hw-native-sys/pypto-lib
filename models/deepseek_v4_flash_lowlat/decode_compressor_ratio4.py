@@ -100,9 +100,12 @@ def compressor_ratio4(
     kv_flat = pl.reshape(kv, [B * S, HEAD_DIM])
     cmp_kv_cache_flat = pl.reshape(cmp_kv_cache, [cmp_block_num * CMP_STORAGE_BLOCK_SIZE, HEAD_DIM])
 
-    # Deferred behind the caller's rms_norm dummy barrier: qkv's qr_proj_matmul is the
-    # critical path and must win the cores when rms_norm retires.
-    with pl.spmd(BS_PAD * OUT_DIM // (MM_B_TILE * OUT_TILE), name_hint="kv_score_proj", allow_early_resolve=True):
+    with pl.spmd(
+        BS_PAD * OUT_DIM // (MM_B_TILE * OUT_TILE),
+        name_hint="kv_score_proj",
+        allow_early_resolve=True,
+        deps=[late_dep],
+    ) as _kv_score_proj_tid:
         idx = pl.tile.get_block_idx()
         global_row0 = (idx // (OUT_DIM // OUT_TILE)) * MM_B_TILE
         o0 = (idx % (OUT_DIM // OUT_TILE)) * OUT_TILE

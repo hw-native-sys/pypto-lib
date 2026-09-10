@@ -261,7 +261,6 @@ def attention_hca(
         pl.prefetch.async_prefetch(wo_a_flat, warm_ctx)
         pl.prefetch.async_prefetch(wo_b_flat, warm_ctx)
         pl.prefetch.async_prefetch(gate_w_flat, warm_ctx)
-    # Defers kv_proj_matmul one hop behind rms_norm so qr_proj_matmul dispatches first.
     late_dep = pl.system.task_dummy(deps=[rms_tid])
     q = pl.create_tensor([T, H, HEAD_DIM], dtype=pl.BF16)
     kv = pl.create_tensor([T, HEAD_DIM], dtype=pl.BF16)
@@ -270,7 +269,7 @@ def attention_hca(
     qkv_proj_rope(
         x_normed, wq_a, wq_b, wq_b_scale, wkv,
         rope_cos_t, rope_sin_t, gamma_cq, gamma_ckv,
-        q, kv, qr, qr_scale, late_dep,
+        q, kv, qr, qr_scale, rms_tid,
         pl.cast(my_rank, pl.INT32) * (H // O_GROUPS), q_rope_cos_il, q_rope_sin_signed, q_rope_swap_idx,
     )
 
