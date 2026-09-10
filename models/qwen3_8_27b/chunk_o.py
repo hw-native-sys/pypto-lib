@@ -32,16 +32,17 @@ T = 8192                # tokens (single sequence, B = 1)
 
 
 def build_kernel(t: int = T, h: int = H, d: int = D, chunk: int = CHUNK,
-                 hg: int = HG):
+                 hg: int = HG, inline: bool = False):
     """The stage kernel at one shape.
 
     `hg` is the number of QK heads, `h` the number of value heads; they differ
-    under GQA. Defaults to `h`, which makes the head mapping an identity.
+    under GQA. Pass `hg=h` for an ungrouped shape. `inline` makes the kernel a
+    callee for `gdn_layer` rather than a program of its own.
     """
     nchunk = t // chunk                    # state snapshots, one per chunk
     grp = h // hg
 
-    @pl.jit
+    @(pl.jit.inline if inline else pl.jit)
     def gdn_chunk_o(
         q: pl.Tensor[[t, hg, d], pl.FP16],
         k: pl.Tensor[[t, hg, d], pl.FP16],
