@@ -19,22 +19,26 @@ not in the key-key matrix.
 """
 import pypto.language as pl
 
-# model config
+from models.qwen3_8_27b.config import GDN_TILING, QWEN3_8_27B
+
+# model shape
+H = QWEN3_8_27B.linear_num_value_heads      # value heads
+HG = QWEN3_8_27B.linear_num_key_heads       # QK heads; H // HG value heads share one
+D = QWEN3_8_27B.linear_value_head_dim       # head dimension
+CHUNK = GDN_TILING.chunk                    # chunk size in tokens, our tiling choice
+
+# case shape
 T = 8192                # tokens (single sequence, B = 1)
-H = 16                  # value heads (= key heads; no GQA in the default build)
-D = 128                 # head dimension
-CHUNK = 128             # chunk size in tokens
 
 
 def build_kernel(t: int = T, h: int = H, d: int = D, chunk: int = CHUNK,
-                 hg: int | None = None):
+                 hg: int = HG):
     """The stage kernel at one shape.
 
     `hg` is the number of QK heads, `h` the number of value heads; they differ
     under GQA. Defaults to `h`, which makes the head mapping an identity.
     """
     nchunk = t // chunk                    # state snapshots, one per chunk
-    hg = h if hg is None else hg
     grp = h // hg
 
     @pl.jit
@@ -101,14 +105,13 @@ gdn_chunk_o = build_kernel()
 
 
 def build_tensor_specs(t: int = T, h: int = H, d: int = D, chunk: int = CHUNK,
-                       hg: int | None = None):
+                       hg: int = HG):
     import torch
     from golden import TensorSpec
 
-    from models.gdn import reference
+    from models.qwen3_8_27b import reference
 
     nc = t // chunk
-    hg = h if hg is None else hg
 
     def init_mask():
         rows = torch.arange(chunk)[:, None]
@@ -132,7 +135,7 @@ def build_tensor_specs(t: int = T, h: int = H, d: int = D, chunk: int = CHUNK,
 
 
 def golden_gdn_chunk_o(tensors):
-    from models.gdn import reference
+    from models.qwen3_8_27b import reference
 
     t, _, d = tensors["q"].shape          # q and k have Hg heads under GQA
     h = tensors["v"].shape[1]             # V, O and the state are per value head
@@ -144,7 +147,7 @@ def golden_gdn_chunk_o(tensors):
 
 def _stats_ok(actual, expected, **_kwargs):
     """megagdn-pto's criterion for this stage (tests/utils.py: NumericalAccuracy)."""
-    from models.gdn import reference
+    from models.qwen3_8_27b import reference
 
     ok, detail = reference.stats_ok(actual, expected, chunk=CHUNK)
     print(f"[stats] {detail}", flush=True)

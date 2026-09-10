@@ -10,11 +10,16 @@
 g_sum[t, h] = sum over i <= t within the chunk of g[i, h]."""
 import pypto.language as pl
 
-# model config
+from models.qwen3_8_27b.config import GDN_TILING, QWEN3_8_27B
+
+# model shape
+H = QWEN3_8_27B.linear_num_value_heads      # gate heads
+HG = QWEN3_8_27B.linear_num_key_heads       # QK heads; H // HG value heads share one
+D = QWEN3_8_27B.linear_value_head_dim       # head dimension; unused here, drawn inputs match the pipeline
+CHUNK = GDN_TILING.chunk                    # chunk size in tokens, our tiling choice
+
+# case shape
 T = 8192                # tokens (single sequence, B = 1)
-H = 16                  # gate heads
-D = 128                 # head dimension; unused here, drawn inputs match the pipeline
-CHUNK = 128             # chunk size in tokens
 
 # tiling
 GROUP_TILE = 16         # chunks per dispatch, sharing one tril load
@@ -54,14 +59,12 @@ gdn_chunk_cumsum = build_kernel()
 
 
 def build_tensor_specs(t: int = T, h: int = H, d: int = D, chunk: int = CHUNK,
-                       hg: int | None = None):
+                       hg: int = HG):
+    # hg only picks which reference chain to draw from; this stage reads no q or k.
     import torch
     from golden import TensorSpec
 
-    from models.gdn import reference
-
-    # hg picks the reference chain to draw from; this stage reads no q or k.
-    hg = h if hg is None else hg
+    from models.qwen3_8_27b import reference
 
     def init_tril():
         return torch.tril(torch.ones(chunk, chunk, dtype=torch.float32))
@@ -75,7 +78,7 @@ def build_tensor_specs(t: int = T, h: int = H, d: int = D, chunk: int = CHUNK,
 
 
 def golden_gdn_chunk_cumsum(tensors):
-    from models.gdn import reference
+    from models.qwen3_8_27b import reference
 
     g = tensors["g"]
     out = tensors["g_sum"]
