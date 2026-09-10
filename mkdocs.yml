@@ -98,6 +98,7 @@ nav:
       - DeepSeek V4-Pro: models/deepseek_v4_pro/index.md
       - DeepSeek V4.1-Flash: models/deepseek_v4_1_flash/index.md
       - GLM-5.3-Flash: models/glm5_3_flash/index.md
+      - Qwen3.8-27B (GDN): models/qwen3_8_27b/index.md
   - Debug and Tune:
       - Overview: debug-and-tune/index.md
       - Debugging: debug-and-tune/debugging.md
