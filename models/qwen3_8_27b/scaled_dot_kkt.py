@@ -28,15 +28,17 @@ SLOT_NUM = 1            # cross-core ring depth; the default depth cannot hold a
 
 
 def build_kernel(t: int = T, h: int = H, d: int = D, chunk: int = CHUNK, hg: int = HG,
-                 col_tile: int = COL_TILE, slot_num: int = SLOT_NUM):
+                 col_tile: int = COL_TILE, slot_num: int = SLOT_NUM,
+                 inline: bool = False):
     """The stage kernel at one shape.
 
     `hg` is the number of QK heads, `h` the number of value heads; they differ
-    under GQA. Defaults to `h`, which makes the head mapping an identity.
+    under GQA. Pass `hg=h` for an ungrouped shape. `inline` makes the kernel a
+    callee for `gdn_layer` rather than a program of its own.
     """
     grp = h // hg
 
-    @pl.jit
+    @(pl.jit.inline if inline else pl.jit)
     def gdn_scaled_dot_kkt(
         k: pl.Tensor[[t, hg, d], pl.FP16],
         beta: pl.Tensor[[h, t], pl.FP32],
