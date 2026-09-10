@@ -74,14 +74,17 @@ def _random_specs(stage, specs):
     return out
 
 
-def bench_stage(stage: str, t: int, h: int, platform: str, device: int,
+def bench_stage(stage: str, t: int, h: int, hg: int, platform: str, device: int,
                 rounds: int, warmup: int, data: str) -> dict:
     """One compile and one timed loop. Returns the record for this (stage, shape)."""
     from golden import run
 
+    from models.gdn.test_gdn_stages import GQA_STAGES
+
     mod = importlib.import_module(f"models.gdn.{stage}")
-    fn = mod.build_kernel(t=t, h=h, d=D, chunk=CHUNK)
-    specs = mod.build_tensor_specs(t=t, h=h, d=D, chunk=CHUNK)
+    kernel_kw = dict(hg=hg) if stage in GQA_STAGES else {}
+    fn = mod.build_kernel(t=t, h=h, d=D, chunk=CHUNK, **kernel_kw)
+    specs = mod.build_tensor_specs(t=t, h=h, d=D, chunk=CHUNK, hg=hg)
     if data == "random":
         specs = _random_specs(stage, specs)
 
@@ -92,7 +95,7 @@ def bench_stage(stage: str, t: int, h: int, platform: str, device: int,
         golden_fn=None,                       # timing only; correctness is test_gdn_stages
         config=dict(platform=platform, device_id=device),
     )
-    rec = dict(stage=stage, t=t, h=h, d=D, chunk=CHUNK, rounds=rounds,
+    rec = dict(stage=stage, t=t, h=h, hg=hg, d=D, chunk=CHUNK, rounds=rounds,
                warmup=warmup, data=data, ok=bool(result.passed),
                compile_and_run_s=round(time.time() - started, 2))
     samples = []
@@ -118,7 +121,10 @@ def main() -> int:
                         help="comma-separated single-sequence token counts")
     parser.add_argument("--heads", type=str,
                         default=",".join(str(x) for x in HEADS),
-                        help="comma-separated head counts (H = Hg; no GQA yet)")
+                        help="comma-separated value-head counts H")
+    parser.add_argument("--qk-heads", type=int, default=None,
+                        help="QK heads Hg (default: equal to H, i.e. no GQA). "
+                             "Qwen3.8-27B is H=48, Hg=16")
     parser.add_argument("--stages", type=str, default=",".join(STAGES))
     parser.add_argument("--rounds", type=int, default=50)
     parser.add_argument("--warmup", type=int, default=5)
@@ -134,15 +140,19 @@ def main() -> int:
     seq_lens = [int(x) for x in args.seq_len.split(",") if x]
     heads = [int(x) for x in args.heads.split(",") if x]
     stages = [s for s in args.stages.split(",") if s]
+    for h in heads:
+        if args.qk_heads is not None and h % args.qk_heads:
+            parser.error(f"H={h} must be divisible by Hg={args.qk_heads}")
 
     records = []
     for t in seq_lens:
         for h in heads:
+            hg = h if args.qk_heads is None else args.qk_heads
             for stage in stages:
-                rec = bench_stage(stage, t, h, args.platform, args.device,
+                rec = bench_stage(stage, t, h, hg, args.platform, args.device,
                                   args.rounds, args.warmup, args.data)
                 records.append(rec)
-                print(f"[bench] {stage:<16} T={t:<7} H={h:<3} "
+                print(f"[bench] {stage:<16} T={t:<7} H={h:<3} Hg={hg:<3} "
                       f"mean={rec.get('mean_us', float('nan'))} us "
                       f"(median={rec.get('median_us')}, min={rec.get('min_us')}, "
                       f"max={rec.get('max_us')})", flush=True)
