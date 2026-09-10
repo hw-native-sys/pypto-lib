@@ -100,6 +100,7 @@ RMS_PAD_ROWS = RMS_PAD_BLOCKS * RMS_PAD_TILE
 # afford a wider head tile than HEAD_TILE: each wider tile loads each state block fewer times
 # (HEAD_DIM/POOL_HEAD_TILE tiles/batch instead of HEAD_DIM/HEAD_TILE), cutting load redundancy.
 POOL_HEAD_TILE = 128
+POOL_REQUEST_TILE = 2
 # Gather rows per softmax_pool iteration. Held independent of the state page size: the
 # two [STATE_LEN, POOL_HEAD_TILE] FP32 pools already take 128 KB of the 184 KB Vec space,
 # leaving room for one double-buffered [POOL_STATE_TILE, POOL_HEAD_TILE] pair.
@@ -186,58 +187,62 @@ def compressor_ratio128_projected(
     compress_state_rows_num = compress_state_block_num * COMPRESS_STATE_BLOCK_SIZE
     compress_state_rows = pl.reshape(compress_state, [compress_state_rows_num, COMPRESS_STATE_DIM])
     pooled_kv = pl.create_tensor([RMS_PAD_ROWS, HEAD_DIM], dtype=pl.FP32)
-    with pl.spmd(b_dim, name_hint="scatter_softmax_pool", deps=[late_dep]) as pool_tid:
-        request_idx = pl.tile.get_block_idx()
-        for s_sc in pl.pipeline(s_dim, stage=2):
-            proj_row = request_idx * s_dim + s_sc
-            token_pos = pl.read(position_ids, [request_idx * s_dim + s_sc])
-            token_ape_row = pl.cast(token_pos % COMPRESS_RATIO, target_type=pl.INDEX)
-            state_row_i64 = pl.read(state_slot_mapping, [request_idx * s_dim + s_sc])
-            if state_row_i64 >= 0:
-                state_row = pl.cast(state_row_i64, target_type=pl.INDEX)
-                kv_row = kv_proj_pad[proj_row : proj_row + 1, 0 : OUT_DIM]
-                score_row = score_proj_pad[proj_row : proj_row + 1, 0 : OUT_DIM]
-                ape_row = ape[token_ape_row : token_ape_row + 1, 0 : OUT_DIM]
-                compress_state_rows[state_row : state_row + 1, 0 : OUT_DIM] = kv_row
-                state_score = pl.add(score_row, ape_row)
-                compress_state_rows[state_row : state_row + 1, OUT_DIM : COMPRESS_STATE_DIM] = state_score
+    with pl.spmd(
+        (b_dim + POOL_REQUEST_TILE - 1) // POOL_REQUEST_TILE,
+        name_hint="scatter_softmax_pool", deps=[late_dep],
+    ) as pool_tid:
+        request_start = pl.tile.get_block_idx() * POOL_REQUEST_TILE
+        for request_idx in pl.range(request_start, pl.min(request_start + POOL_REQUEST_TILE, b_dim)):
+            for s_sc in pl.pipeline(s_dim, stage=2):
+                proj_row = request_idx * s_dim + s_sc
+                token_pos = pl.read(position_ids, [request_idx * s_dim + s_sc])
+                token_ape_row = pl.cast(token_pos % COMPRESS_RATIO, target_type=pl.INDEX)
+                state_row_i64 = pl.read(state_slot_mapping, [request_idx * s_dim + s_sc])
+                if state_row_i64 >= 0:
+                    state_row = pl.cast(state_row_i64, target_type=pl.INDEX)
+                    kv_row = kv_proj_pad[proj_row : proj_row + 1, 0 : OUT_DIM]
+                    score_row = score_proj_pad[proj_row : proj_row + 1, 0 : OUT_DIM]
+                    ape_row = ape[token_ape_row : token_ape_row + 1, 0 : OUT_DIM]
+                    compress_state_rows[state_row : state_row + 1, 0 : OUT_DIM] = kv_row
+                    state_score = pl.add(score_row, ape_row)
+                    compress_state_rows[state_row : state_row + 1, OUT_DIM : COMPRESS_STATE_DIM] = state_score
 
-        first_pos_gate = pl.read(position_ids, [request_idx * s_dim])
-        pos_gate = first_pos_gate % COMPRESS_RATIO
-        if pos_gate + s_dim >= COMPRESS_RATIO:
-            compress_pos = first_pos_gate + (COMPRESS_RATIO - 1 - pos_gate)
-            state_pos0 = compress_pos - (COMPRESS_RATIO - 1)
-            base_logical_blk = state_pos0 // COMPRESS_STATE_BLOCK_SIZE
-            for h0 in pl.range(0, HEAD_DIM, POOL_HEAD_TILE):
-                softmax_score_state = pl.create_tensor([STATE_LEN, POOL_HEAD_TILE], dtype=pl.FP32)
-                softmax_kv_state = pl.create_tensor([STATE_LEN, POOL_HEAD_TILE], dtype=pl.FP32)
-                for gather_i in pl.pipeline(POOL_STATE_STEPS, stage=2):
-                    blk_i = gather_i // POOL_PAGE_STEPS
-                    intra0 = (gather_i % POOL_PAGE_STEPS) * POOL_STATE_TILE
-                    s0 = gather_i * POOL_STATE_TILE
-                    slot_score = pl.full([POOL_STATE_TILE, POOL_HEAD_TILE], dtype=pl.FP32, value=FP32_NEG_INF)
-                    slot_kv = pl.full([POOL_STATE_TILE, POOL_HEAD_TILE], dtype=pl.FP32, value=0.0)
-                    state_blk_raw = pl.read(compress_state_block_table, [request_idx, base_logical_blk + blk_i])
-                    if state_blk_raw >= 0:
-                        state_blk_id = pl.cast(state_blk_raw, target_type=pl.INDEX)
-                        row0 = state_blk_id * COMPRESS_STATE_BLOCK_SIZE + intra0
-                        slot_score = compress_state_rows[
-                            row0 : row0 + POOL_STATE_TILE,
-                            OUT_DIM + h0 : OUT_DIM + h0 + POOL_HEAD_TILE,
-                        ]
-                        slot_kv = compress_state_rows[
-                            row0 : row0 + POOL_STATE_TILE,
-                            h0 : h0 + POOL_HEAD_TILE,
-                        ]
-                    softmax_score_state[s0 : s0 + POOL_STATE_TILE, :] = slot_score
-                    softmax_kv_state[s0 : s0 + POOL_STATE_TILE, :] = slot_kv
+            first_pos_gate = pl.read(position_ids, [request_idx * s_dim])
+            pos_gate = first_pos_gate % COMPRESS_RATIO
+            if pos_gate + s_dim >= COMPRESS_RATIO:
+                compress_pos = first_pos_gate + (COMPRESS_RATIO - 1 - pos_gate)
+                state_pos0 = compress_pos - (COMPRESS_RATIO - 1)
+                base_logical_blk = state_pos0 // COMPRESS_STATE_BLOCK_SIZE
+                for h0 in pl.range(0, HEAD_DIM, POOL_HEAD_TILE):
+                    softmax_score_state = pl.create_tensor([STATE_LEN, POOL_HEAD_TILE], dtype=pl.FP32)
+                    softmax_kv_state = pl.create_tensor([STATE_LEN, POOL_HEAD_TILE], dtype=pl.FP32)
+                    for gather_i in pl.pipeline(POOL_STATE_STEPS, stage=2):
+                        blk_i = gather_i // POOL_PAGE_STEPS
+                        intra0 = (gather_i % POOL_PAGE_STEPS) * POOL_STATE_TILE
+                        s0 = gather_i * POOL_STATE_TILE
+                        slot_score = pl.full([POOL_STATE_TILE, POOL_HEAD_TILE], dtype=pl.FP32, value=FP32_NEG_INF)
+                        slot_kv = pl.full([POOL_STATE_TILE, POOL_HEAD_TILE], dtype=pl.FP32, value=0.0)
+                        state_blk_raw = pl.read(compress_state_block_table, [request_idx, base_logical_blk + blk_i])
+                        if state_blk_raw >= 0:
+                            state_blk_id = pl.cast(state_blk_raw, target_type=pl.INDEX)
+                            row0 = state_blk_id * COMPRESS_STATE_BLOCK_SIZE + intra0
+                            slot_score = compress_state_rows[
+                                row0 : row0 + POOL_STATE_TILE,
+                                OUT_DIM + h0 : OUT_DIM + h0 + POOL_HEAD_TILE,
+                            ]
+                            slot_kv = compress_state_rows[
+                                row0 : row0 + POOL_STATE_TILE,
+                                h0 : h0 + POOL_HEAD_TILE,
+                            ]
+                        softmax_score_state[s0 : s0 + POOL_STATE_TILE, :] = slot_score
+                        softmax_kv_state[s0 : s0 + POOL_STATE_TILE, :] = slot_kv
 
-                score_max = pl.col_max(softmax_score_state)
-                score_exp = pl.col_expand_expdif(softmax_score_state, score_max)
-                score_sum = pl.col_sum(score_exp)
-                score_prob = pl.col_expand_mul(score_exp, pl.recip(score_sum))
-                pooled_chunk = pl.col_sum(pl.mul(softmax_kv_state, score_prob))
-                pooled_kv[request_idx : request_idx + 1, h0 : h0 + POOL_HEAD_TILE] = pooled_chunk
+                    score_max = pl.col_max(softmax_score_state)
+                    score_exp = pl.col_expand_expdif(softmax_score_state, score_max)
+                    score_sum = pl.col_sum(score_exp)
+                    score_prob = pl.col_expand_mul(score_exp, pl.recip(score_sum))
+                    pooled_chunk = pl.col_sum(pl.mul(softmax_kv_state, score_prob))
+                    pooled_kv[request_idx : request_idx + 1, h0 : h0 + POOL_HEAD_TILE] = pooled_chunk
 
     norm_w_2d = pl.reshape(norm_w, [1, HEAD_DIM])
     normed_kv = pl.create_tensor([RMS_PAD_ROWS, HEAD_DIM], dtype=pl.FP32)
