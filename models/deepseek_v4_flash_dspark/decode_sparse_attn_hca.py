@@ -63,6 +63,7 @@ VALID_TOKEN_TILE = 8
 GATHER_RUN_TILE = 16
 REQUEST_KV_ROWS = WIN + S - 1
 ATTN_K_TILE = 128
+CMP_ATTN_K_TILE = 32
 RAW_K_TILE = ATTN_K_TILE
 RAW_WORKERS = 20
 H_TILE = 16
@@ -72,7 +73,7 @@ QK_TRANSFER_SLOTS = QK_PRE_LAUNCH + 1
 QK_SCORE_READY_EVENT = 0
 QK_PROB_READY_EVENT = 1
 QK_PV_READY_EVENT = 2
-CMP_PAGES_PER_WORK = ATTN_K_TILE // BLOCK_SIZE
+CMP_PAGES_PER_WORK = CMP_ATTN_K_TILE // BLOCK_SIZE
 ROPE_TILE = 16
 ROPE_INTERLEAVE_TILE = 2 * ROPE_TILE
 ROPE_CS_T_TILE = 8
@@ -329,13 +330,13 @@ def sparse_attn_hca(
         rope_cs_tids[0] = rope_cs_tid
 
     with pl.scope():
-        cmp_work_kv = pl.create_tensor([cmp_gather_count * ATTN_K_TILE, HEAD_DIM], dtype=pl.BF16)
+        cmp_work_kv = pl.create_tensor([cmp_gather_count * CMP_ATTN_K_TILE, HEAD_DIM], dtype=pl.BF16)
         with pl.spmd(cmp_gather_count, name_hint="hca_cmp_work_gather", deps=[cmp_cache_ready_dep]) as cmp_gather_tid:
             gather_item = pl.tile.get_block_idx()
             gather_request = gather_item // cmp_work_count
             gather_work = gather_item - gather_request * cmp_work_count
             gather_first_col = gather_work * CMP_PAGES_PER_WORK
-            gather_dst0 = gather_item * ATTN_K_TILE
+            gather_dst0 = gather_item * CMP_ATTN_K_TILE
             for gather_page in pl.unroll(CMP_PAGES_PER_WORK):
                 gather_page_col = gather_first_col + gather_page
                 gather_dst = gather_dst0 + gather_page * BLOCK_SIZE
@@ -355,8 +356,8 @@ def sparse_attn_hca(
         attn_sink_col = pl.reshape(attn_sink, [H, 1])
         transfer_slots = NUM_QK_CORES * QK_TRANSFER_SLOTS
         transfer_heads = transfer_slots * H
-        score_transfer = pl.create_tensor([transfer_heads, ATTN_K_TILE], dtype=pl.FP32)
-        probability_transfer = pl.create_tensor([transfer_heads, ATTN_K_TILE], dtype=pl.BF16)
+        score_transfer = pl.create_tensor([transfer_heads, CMP_ATTN_K_TILE], dtype=pl.FP32)
+        probability_transfer = pl.create_tensor([transfer_heads, CMP_ATTN_K_TILE], dtype=pl.BF16)
         pv_transfer = pl.create_tensor([transfer_heads, HEAD_DIM], dtype=pl.FP32)
         mi_transfer = pl.create_tensor([transfer_heads, 1], dtype=pl.FP32)
         li_transfer = pl.create_tensor([transfer_heads, 1], dtype=pl.FP32)
@@ -369,7 +370,7 @@ def sparse_attn_hca(
                 qk_position = pl.max(pl.read(position_ids, [qk_t]), -1)
                 qk_kv_len = pl.max(pl.read(kv_seq_lens, [qk_request]), 0)
                 qk_rows = pl.min(HCA_MAX_COMPRESSED_ROWS, pl.min((qk_position + 1) // COMPRESS_RATIO, qk_kv_len // COMPRESS_RATIO))
-                qk_blocks = pl.min(cmp_work_count, (qk_rows + ATTN_K_TILE - 1) // ATTN_K_TILE)
+                qk_blocks = pl.min(cmp_work_count, (qk_rows + CMP_ATTN_K_TILE - 1) // CMP_ATTN_K_TILE)
                 qk_q = pl.load(
                     q_flat, [qk_t * H, 0], [H, HEAD_DIM], target_memory=pl.MemorySpace.Mat,
                 )
@@ -379,10 +380,10 @@ def sparse_attn_hca(
                         qk_first_page = pl.read(cmp_block_table, [qk_request, qk_sb * CMP_PAGES_PER_WORK])
                         if pl.min(qk_first_page + 1, cmp_block_num - qk_first_page) > 0:
                             qk_slot = qk_core * QK_TRANSFER_SLOTS + qk_sb % QK_TRANSFER_SLOTS
-                            qk_kv_row = (qk_request * cmp_work_count + qk_sb) * ATTN_K_TILE
+                            qk_kv_row = (qk_request * cmp_work_count + qk_sb) * CMP_ATTN_K_TILE
                             qk_transfer_row = qk_slot * H
                             qk_kv = pl.load(
-                                cmp_work_kv, [qk_kv_row, 0], [ATTN_K_TILE, HEAD_DIM],
+                                cmp_work_kv, [qk_kv_row, 0], [CMP_ATTN_K_TILE, HEAD_DIM],
                                 target_memory=pl.MemorySpace.Mat,
                             )
                             qk_scores = pl.matmul(qk_q, pl.tile.transpose_view(qk_kv), out_dtype=pl.FP32)
@@ -396,15 +397,15 @@ def sparse_attn_hca(
                         pv_first_page = pl.read(cmp_block_table, [qk_request, pv_sb * CMP_PAGES_PER_WORK])
                         if pl.min(pv_first_page + 1, cmp_block_num - pv_first_page) > 0:
                             pv_slot = qk_core * QK_TRANSFER_SLOTS + pv_sb % QK_TRANSFER_SLOTS
-                            pv_kv_row = (qk_request * cmp_work_count + pv_sb) * ATTN_K_TILE
+                            pv_kv_row = (qk_request * cmp_work_count + pv_sb) * CMP_ATTN_K_TILE
                             pv_transfer_row = pv_slot * H
                             pl.system.sync_wait(QK_PROB_READY_EVENT, pipe=pl.PipeType.MTE2, core_type=pl.KernelType.AIC)
                             pv_probability = pl.load(
-                                probability_transfer, [pv_transfer_row, 0], [H, ATTN_K_TILE],
+                                probability_transfer, [pv_transfer_row, 0], [H, CMP_ATTN_K_TILE],
                                 target_memory=pl.MemorySpace.Mat,
                             )
                             pv_kv = pl.load(
-                                cmp_work_kv, [pv_kv_row, 0], [ATTN_K_TILE, HEAD_DIM],
+                                cmp_work_kv, [pv_kv_row, 0], [CMP_ATTN_K_TILE, HEAD_DIM],
                                 target_memory=pl.MemorySpace.Mat,
                             )
                             pv_output = pl.matmul(pv_probability, pv_kv, out_dtype=pl.FP32)
@@ -417,7 +418,7 @@ def sparse_attn_hca(
                 for qk_aiv in pl.split_aiv(2, mode=pl.SplitMode.NONE):
                     pl.system.set_ffts(ffts_workspace)
                     qk_lane_head = qk_aiv * (H // 2)
-                    qk_reduce_tmp = pl.create_tile([H // 2, ATTN_K_TILE], dtype=pl.FP32, target_memory=pl.MemorySpace.Vec)
+                    qk_reduce_tmp = pl.create_tile([H // 2, CMP_ATTN_K_TILE], dtype=pl.FP32, target_memory=pl.MemorySpace.Vec)
                     running_m = pl.load(attn_sink_col, [qk_lane_head, 0], [H // 2, 1], target_memory=pl.MemorySpace.Vec)
                     running_l = pl.tile.muls(running_m, 0.0)
                     running_left = pl.tile.full([H // 2, HEAD_DIM // 2], dtype=pl.FP32, value=0.0)
@@ -434,11 +435,11 @@ def sparse_attn_hca(
                                 qk_transfer_row = qk_slot * H
                                 pl.system.sync_wait(QK_SCORE_READY_EVENT, pipe=pl.PipeType.MTE2, core_type=pl.KernelType.AIV)
                                 qk_scores_half = pl.load(
-                                    score_transfer, [qk_transfer_row + qk_lane_head, 0], [H // 2, ATTN_K_TILE],
+                                    score_transfer, [qk_transfer_row + qk_lane_head, 0], [H // 2, CMP_ATTN_K_TILE],
                                     target_memory=pl.MemorySpace.Vec,
                                 )
                                 qk_scaled = pl.mul(qk_scores_half, SOFTMAX_SCALE)
-                                qk_valid_rows = pl.min(ATTN_K_TILE, qk_rows - qk_sb * ATTN_K_TILE)
+                                qk_valid_rows = pl.min(CMP_ATTN_K_TILE, qk_rows - qk_sb * CMP_ATTN_K_TILE)
                                 qk_valid_scores = pl.set_validshape(qk_scaled, H // 2, qk_valid_rows)
                                 qk_masked = pl.fillpad(qk_valid_scores, pad_value=pl.PadValue.min)
                                 qk_mi = pl.row_max(qk_masked, qk_reduce_tmp)
@@ -941,7 +942,7 @@ if __name__ == "__main__":
     if args.mixed_topk_fixture:
         workload = "compressed_rows/request=[128,128,1024,4096]"
     else:
-        work_per_query = (args.compressed_rows + ATTN_K_TILE - 1) // ATTN_K_TILE
+        work_per_query = (args.compressed_rows + CMP_ATTN_K_TILE - 1) // CMP_ATTN_K_TILE
         workload = f"compressed_rows={args.compressed_rows} work/query={work_per_query}"
     print(f"compress_ratio={COMPRESS_RATIO} {workload}", flush=True)
 
