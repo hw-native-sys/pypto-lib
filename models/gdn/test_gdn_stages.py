@@ -38,6 +38,10 @@ STAGES = ("chunk_cumsum", "scaled_dot_kkt", "solve_tril", "wy_fast",
 D = 128
 CHUNK = 128
 
+# Stages that read q or k, and so need to know how many QK heads there are.
+# chunk_cumsum and solve_tril are per value head and read neither.
+GQA_STAGES = ("scaled_dot_kkt", "wy_fast", "chunk_h", "chunk_o")
+
 
 # What each stage writes. The harness stamps TensorSpec.direction from the
 # compiled kernel's pl.Out parameters, so it is only readable after the run;
@@ -98,14 +102,15 @@ def _chain_specs(stage: str, specs: list, produced: dict) -> list:
     return out
 
 
-def check_stage(stage: str, t: int, h: int, platform: str, device: int,
+def check_stage(stage: str, t: int, h: int, hg: int, platform: str, device: int,
                 produced: dict | None = None) -> tuple[bool, str]:
     """Compile, run and validate one stage. Returns (passed, detail)."""
     from golden import run
 
     mod = importlib.import_module(f"models.gdn.{stage}")
-    fn = mod.build_kernel(t=t, h=h, d=D, chunk=CHUNK)
-    specs = mod.build_tensor_specs(t=t, h=h, d=D, chunk=CHUNK)
+    kernel_kw = dict(hg=hg) if stage in GQA_STAGES else {}
+    fn = mod.build_kernel(t=t, h=h, d=D, chunk=CHUNK, **kernel_kw)
+    specs = mod.build_tensor_specs(t=t, h=h, d=D, chunk=CHUNK, hg=hg)
     if produced is not None:
         specs = _chain_specs(stage, specs, produced)
 
@@ -127,7 +132,11 @@ def main() -> int:
                         choices=["a2a3", "a2a3sim", "a5", "a5sim"])
     parser.add_argument("-d", "--device", type=int, default=0)
     parser.add_argument("--seq-len", type=int, default=8192)
-    parser.add_argument("--heads", type=int, default=16)
+    parser.add_argument("--heads", type=int, default=16,
+                        help="value heads H")
+    parser.add_argument("--qk-heads", type=int, default=None,
+                        help="QK heads Hg (default: equal to H, i.e. no GQA). "
+                             "Qwen3.8-27B is H=48, Hg=16")
     parser.add_argument("--stages", type=str, default=",".join(STAGES))
     parser.add_argument("--save-output", type=str, default=None,
                         help="write the final chunk_o result and the inputs that "
@@ -140,18 +149,21 @@ def main() -> int:
                              "it actually received")
     args = parser.parse_args()
 
+    hg = args.heads if args.qk_heads is None else args.qk_heads
+    if args.heads % hg:
+        parser.error(f"H={args.heads} must be divisible by Hg={hg}")
     stages = [s for s in args.stages.split(",") if s]
     produced: dict | None = {} if (args.chain or args.save_output) else None
     results = []
     for stage in stages:
         print(f"\n=================== {stage} ===================", flush=True)
         started = time.time()
-        ok, detail = check_stage(stage, args.seq_len, args.heads,
+        ok, detail = check_stage(stage, args.seq_len, args.heads, hg,
                                  args.platform, args.device, produced)
         results.append((stage, ok, detail, time.time() - started))
 
     print("\n=================== summary ===================")
-    print(f"T={args.seq_len} H={args.heads} D={D} chunk={CHUNK} "
+    print(f"T={args.seq_len} H={args.heads} Hg={hg} D={D} chunk={CHUNK} "
           f"platform={args.platform} inputs="
           f"{'previous kernel output' if args.chain else 'reference chain'}")
     for stage, ok, detail, secs in results:
@@ -162,7 +174,7 @@ def main() -> int:
 
         from models.gdn import reference
 
-        x = reference.make_inputs(args.seq_len, args.heads, D)
+        x = reference.make_inputs(args.seq_len, args.heads, D, hg)
         torch.save(dict(q=x["q"], k=x["k"], v=x["v"], g_in=x["g"],
                         beta=reference.to_hT(x["beta"]), o_dev=produced["o_out"]),
                    args.save_output)

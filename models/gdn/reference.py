@@ -33,8 +33,14 @@ REF_DTYPE = torch.float64
 # ---------------------------------------------------------------------------
 
 
-def make_inputs(t: int, h: int, d: int, seed: int = 42) -> dict[str, torch.Tensor]:
+def make_inputs(t: int, h: int, d: int, hg: int | None = None,
+                seed: int = 42) -> dict[str, torch.Tensor]:
     """The model's own input distribution, in the model's dtypes.
+
+    `hg` is the number of QK heads; `h` the number of value heads. They differ
+    under GQA (Qwen3.8-27B is 48 against 16), and each value head reads key head
+    `h // (H // Hg)` -- the model's own implementation reaches the same place by
+    `repeat_interleave`, megagdn's reference by that index. Defaults to `h`.
 
     Same draw as the reference harness (`megagdn-pto/tests/utils.py:
     generate_random_inputs`): q and k L2-normalised along the head dimension, v
@@ -44,13 +50,15 @@ def make_inputs(t: int, h: int, d: int, seed: int = 42) -> dict[str, torch.Tenso
     Each tensor draws from its own generator, so changing one shape does not
     reshuffle the others -- `g` at a given (t, h) is the same whatever D is.
     """
+    hg = h if hg is None else hg
+
     def gen(offset):
         return torch.Generator().manual_seed(seed + offset)
 
     return dict(
-        q=F.normalize(torch.randn(t, h, d, dtype=torch.float16, generator=gen(1)),
+        q=F.normalize(torch.randn(t, hg, d, dtype=torch.float16, generator=gen(1)),
                       dim=-1, p=2),
-        k=F.normalize(torch.randn(t, h, d, dtype=torch.float16, generator=gen(2)),
+        k=F.normalize(torch.randn(t, hg, d, dtype=torch.float16, generator=gen(2)),
                       dim=-1, p=2),
         v=torch.randn(t, h, d, dtype=torch.float16, generator=gen(3)),
         beta=torch.rand(t, h, dtype=torch.float16, generator=gen(4)),
@@ -91,7 +99,9 @@ def kkt(k: torch.Tensor, beta: torch.Tensor, g_sum: torch.Tensor,
     `exp(min(g_i - g_j, 0))`: on the strict lower triangle the two agree, and the
     masked-out entries are discarded either way.
     """
-    t, h, _ = k.shape
+    t, hg, _ = k.shape
+    h = beta.shape[1]
+    grp = h // hg
     kf, bf, gf = k.to(REF_DTYPE), beta.to(REF_DTYPE), g_sum.to(REF_DTYPE)
     out = torch.zeros(t, h, chunk, dtype=REF_DTYPE)
     rows = torch.arange(chunk)[:, None]
@@ -99,7 +109,7 @@ def kkt(k: torch.Tensor, beta: torch.Tensor, g_sum: torch.Tensor,
     strict_lower = (rows > cols).to(REF_DTYPE)
     for t0 in range(0, t, chunk):
         for hh in range(h):
-            kc = kf[t0 : t0 + chunk, hh, :]
+            kc = kf[t0 : t0 + chunk, hh // grp, :]
             gc = gf[t0 : t0 + chunk, hh]
             diff = gc[:, None] - gc[None, :]
             decay = torch.where(diff <= 0, torch.exp(diff), torch.zeros_like(diff))
@@ -125,7 +135,9 @@ def wy_fast(k: torch.Tensor, v: torch.Tensor, beta: torch.Tensor,
             a_inv: torch.Tensor, g_sum: torch.Tensor,
             chunk: int) -> tuple[torch.Tensor, torch.Tensor]:
     """S5: the WY representation. -> (W, U), both [T, H, D]."""
-    t, h, d = k.shape
+    t, hg, d = k.shape
+    h = v.shape[1]
+    grp = h // hg
     kf, vf, bf, af, gf = (x.to(REF_DTYPE) for x in (k, v, beta, a_inv, g_sum))
     w = torch.zeros(t, h, d, dtype=REF_DTYPE)
     u = torch.zeros(t, h, d, dtype=REF_DTYPE)
@@ -136,7 +148,7 @@ def wy_fast(k: torch.Tensor, v: torch.Tensor, beta: torch.Tensor,
             gc = gf[t0 : t0 + chunk, hh, None]
             u[t0 : t0 + chunk, hh, :] = ab @ (vf[t0 : t0 + chunk, hh, :] * bc)
             w[t0 : t0 + chunk, hh, :] = ab @ (
-                kf[t0 : t0 + chunk, hh, :] * bc * torch.exp(gc))
+                kf[t0 : t0 + chunk, hh // grp, :] * bc * torch.exp(gc))
     return w, u
 
 
@@ -148,7 +160,9 @@ def chunk_h(k: torch.Tensor, w: torch.Tensor, u: torch.Tensor, g_sum: torch.Tens
     residual-corrected values V_new, [T, H, D]; and the state LEAVING the last
     chunk, [H, D, D], which is what an inference cache carries forward.
     """
-    t, h, d = k.shape
+    t, hg, d = k.shape
+    h = w.shape[1]
+    grp = h // hg
     nc = t // chunk
     kf, wf, uf, gf = (x.to(REF_DTYPE) for x in (k, w, u, g_sum))
     state = torch.zeros(nc, h, d, d, dtype=REF_DTYPE)
@@ -163,7 +177,8 @@ def chunk_h(k: torch.Tensor, w: torch.Tensor, u: torch.Tensor, g_sum: torch.Tens
             state[ci, hh] = s
             vc = uf[t0 : t0 + chunk, hh, :] - wf[t0 : t0 + chunk, hh, :] @ s
             v_new[t0 : t0 + chunk, hh, :] = vc
-            kv = kf[t0 : t0 + chunk, hh, :].T @ (vc * torch.exp(g_last - gc)[:, None])
+            kv = (kf[t0 : t0 + chunk, hh // grp, :].T
+                  @ (vc * torch.exp(g_last - gc)[:, None]))
             s = torch.exp(g_last) * s + kv
         final_state[hh] = s
     return state, v_new, final_state
@@ -175,7 +190,9 @@ def chunk_o(q: torch.Tensor, k: torch.Tensor, v_new: torch.Tensor,
 
     The causal mask includes the diagonal here, unlike :func:`kkt`'s.
     """
-    t, h, d = q.shape
+    t, hg, d = q.shape
+    h = v_new.shape[1]
+    grp = h // hg
     qf, kf, vf, sf, gf = (x.to(REF_DTYPE) for x in (q, k, v_new, state, g_sum))
     out = torch.zeros(t, h, d, dtype=REF_DTYPE)
     rows = torch.arange(chunk)[:, None]
@@ -185,8 +202,8 @@ def chunk_o(q: torch.Tensor, k: torch.Tensor, v_new: torch.Tensor,
     for ci in range(t // chunk):
         t0 = ci * chunk
         for hh in range(h):
-            qc = qf[t0 : t0 + chunk, hh, :]
-            kc = kf[t0 : t0 + chunk, hh, :]
+            qc = qf[t0 : t0 + chunk, hh // grp, :]
+            kc = kf[t0 : t0 + chunk, hh // grp, :]
             gc = gf[t0 : t0 + chunk, hh]
             inter = (qc @ sf[ci, hh]) * torch.exp(gc)[:, None]
             gate = torch.exp(torch.minimum(gc[:, None] - gc[None, :], zero))
@@ -203,7 +220,7 @@ _CACHE: dict[tuple, dict] = {}
 
 
 def compute(upto: str, t: int, h: int, d: int, chunk: int,
-            seed: int = 42) -> dict[str, torch.Tensor]:
+            hg: int | None = None, seed: int = 42) -> dict[str, torch.Tensor]:
     """Reference inputs plus every stage output through *upto*, cached and extended.
 
     Values crossing a stage boundary are narrowed to the dtype the kernels
@@ -214,11 +231,12 @@ def compute(upto: str, t: int, h: int, d: int, chunk: int,
     *upto* is a stage name or ``"inputs"``. Calling it twice on the same shape
     only computes the stages that are missing.
     """
+    hg = h if hg is None else hg
     want = 0 if upto == "inputs" else STAGES.index(upto) + 1
-    key = (t, h, d, chunk, seed)
+    key = (t, h, d, chunk, hg, seed)
     st = _CACHE.get(key)
     if st is None:
-        st = _CACHE[key] = dict(make_inputs(t, h, d, seed), _done=0)
+        st = _CACHE[key] = dict(make_inputs(t, h, d, hg, seed), _done=0)
     while st["_done"] < want:
         stage = STAGES[st["_done"]]
         if stage == "chunk_cumsum":
@@ -247,14 +265,14 @@ def compute(upto: str, t: int, h: int, d: int, chunk: int,
 
 
 def stage_inputs(stage: str, t: int, h: int, d: int, chunk: int,
-                 seed: int = 42) -> dict[str, torch.Tensor]:
+                 hg: int | None = None, seed: int = 42) -> dict[str, torch.Tensor]:
     """Everything *stage* consumes: the reference chain up to its predecessor."""
     i = STAGES.index(stage)
-    return compute("inputs" if i == 0 else STAGES[i - 1], t, h, d, chunk, seed)
+    return compute("inputs" if i == 0 else STAGES[i - 1], t, h, d, chunk, hg, seed)
 
 
 def lazy(stage: str, key: str, t: int, h: int, d: int, chunk: int,
-         transform=None, seed: int = 42):
+         transform=None, hg: int | None = None, seed: int = 42):
     """A no-argument callable returning one reference tensor, computed on first use.
 
     `TensorSpec(init_value=...)` takes a callable, and deferring the chain this
@@ -262,7 +280,7 @@ def lazy(stage: str, key: str, t: int, h: int, d: int, chunk: int,
     their shapes and dtypes, and never pays for the host reference.
     """
     def load():
-        value = stage_inputs(stage, t, h, d, chunk, seed)[key]
+        value = stage_inputs(stage, t, h, d, chunk, hg, seed)[key]
         return transform(value) if transform is not None else value
 
     return load
