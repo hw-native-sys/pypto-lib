@@ -320,7 +320,7 @@ def decode_csa(
         # When every cache fits Top-K, attention consumes the complete visible set.
         # Keep compressor/cache updates, but omit query scoring and sorting in CSA.
         max_indexer_cache_len = IDX_TOPK + 1
-        if TP_SIZE == 4:
+        if TP_SIZE > 1:
             local_b_dim = pl.tensor.dim(kv_seq_lens, 0)
             max_indexer_cache_len = 0
             for short_batch in pl.range(local_b_dim):
@@ -328,7 +328,7 @@ def decode_csa(
                 max_indexer_cache_len = pl.max(max_indexer_cache_len, short_cache_len)
         # Task-ID array slots retain dependencies across conditional scopes.
         indexer_phase_deps = pl.array.create(4, pl.TASK_ID)
-        if TP_SIZE == 4 and max_indexer_cache_len <= IDX_TOPK:
+        if TP_SIZE > 1 and max_indexer_cache_len <= IDX_TOPK:
             indexer_phase_deps[0] = projection_dep
         else:
             scored_idx_qr_mm_tid = indexer_qr_rope(
@@ -396,7 +396,7 @@ def decode_csa(
         idx_values_full = pl.create_tensor([IDX_CMP_BS_PAD, 2 * IDX_HEAD_DIM], dtype=pl.FP32)
         idx_scores_full = pl.create_tensor([IDX_CMP_BS_PAD, 2 * IDX_HEAD_DIM], dtype=pl.FP32)
         gather_completion = pl.array.create(2, pl.TASK_ID)
-        if TP_SIZE == 4:
+        if TP_SIZE > 1:
             gather_signal, aux_typed_ready_tid = decode_cp_csa_aux_typed_allgather_step(
                 aux_projection_local, idx_values_full, idx_scores_full, kv_full,
                 gather_window, gather_signal, group_base, tp_rank, aux_pack_tid,
@@ -455,7 +455,7 @@ def decode_csa(
             cmp_positions, cmp_pooled_kv, cmp_kv_proj_pad, cmp_score_proj_pad,
             main_unpack_tid,
         )
-        if TP_SIZE == 4 and max_indexer_cache_len <= IDX_TOPK:
+        if TP_SIZE > 1 and max_indexer_cache_len <= IDX_TOPK:
             indexer_phase_deps[1] = cmp_projection_tid
             indexer_phase_deps[2] = cmp_projection_tid
         else:
@@ -480,7 +480,7 @@ def decode_csa(
             q_cos_il, q_sin_signed, q_swap_idx, q,
             qr_scale_pad, q_proj_i32, 0, t_dim,
         )
-        if TP_SIZE == 4 and max_indexer_cache_len <= IDX_TOPK:
+        if TP_SIZE > 1 and max_indexer_cache_len <= IDX_TOPK:
             # One worker owns each whole index row, including its -1 padding.
             with pl.spmd(
                 16, name_hint="csa_indexer_all_visible", deps=[idx_cache_write_tid],
