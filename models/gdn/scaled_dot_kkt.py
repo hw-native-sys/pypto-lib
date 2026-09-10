@@ -22,20 +22,26 @@ SLOT_NUM = 1            # cross-core ring depth; the default depth cannot hold a
                         # [CHUNK, COL_TILE] FP32 crossing tile at COL_TILE = 128
 
 
-def build_kernel(t: int = T, h: int = H, d: int = D, chunk: int = CHUNK,
+def build_kernel(t: int = T, h: int = H, d: int = D, chunk: int = CHUNK, hg: int | None = None,
                  col_tile: int = COL_TILE, slot_num: int = SLOT_NUM):
-    """The stage kernel at one shape."""
+    """The stage kernel at one shape.
+
+    `hg` is the number of QK heads, `h` the number of value heads; they differ
+    under GQA. Defaults to `h`, which makes the head mapping an identity.
+    """
+    hg = h if hg is None else hg
+    grp = h // hg
 
     @pl.jit
     def gdn_scaled_dot_kkt(
-        k: pl.Tensor[[t, h, d], pl.FP16],
+        k: pl.Tensor[[t, hg, d], pl.FP16],
         beta: pl.Tensor[[h, t], pl.FP32],
         g_sum: pl.Tensor[[h, t], pl.FP32],
         mask: pl.Tensor[[chunk, chunk], pl.FP32],
         a_out: pl.Out[pl.Tensor[[t, h, chunk], pl.FP16]],
     ):
-        # BSND [T, H, D] viewed as [T, H*D]: a per-head slice is a strided 2D window
-        k_flat = pl.reshape(k, [t, h * d])
+        # BSND [T, Hg, D] viewed as [T, Hg*D]: a per-head slice is a strided 2D window
+        k_flat = pl.reshape(k, [t, hg * d])
         a_flat = pl.reshape(a_out, [t, h * chunk])
         for c0 in pl.spmd(t // chunk, name_hint="scaled_dot_kkt",
                           optimizations=[pl.cross_core_slot(slot_num=slot_num),
@@ -43,7 +49,9 @@ def build_kernel(t: int = T, h: int = H, d: int = D, chunk: int = CHUNK,
             t0 = c0 * chunk
             msk = mask[:, :]                       # constant, held for the whole scope
             for hh in pl.range(h):
-                d0 = hh * d
+                # GQA: value head hh reads key head hh // grp, the same mapping the
+                # model reaches by repeat_interleave. grp == 1 leaves this an identity.
+                d0 = (hh // grp) * d
                 kc = k_flat[t0 : t0 + chunk, d0 : d0 + d]
                 # Head-major keeps a head's chunk contiguous, so the same window views
                 # as [1, CHUNK] for a row broadcast and [CHUNK, 1] for a column one. A
@@ -73,11 +81,14 @@ def build_kernel(t: int = T, h: int = H, d: int = D, chunk: int = CHUNK,
 gdn_scaled_dot_kkt = build_kernel()
 
 
-def build_tensor_specs(t: int = T, h: int = H, d: int = D, chunk: int = CHUNK):
+def build_tensor_specs(t: int = T, h: int = H, d: int = D, chunk: int = CHUNK,
+                       hg: int | None = None):
     import torch
     from golden import TensorSpec
 
     from models.gdn import reference
+
+    hg = h if hg is None else hg
 
     def init_mask():
         rows = torch.arange(chunk)[:, None]
@@ -85,12 +96,12 @@ def build_tensor_specs(t: int = T, h: int = H, d: int = D, chunk: int = CHUNK):
         return (rows > cols).float()
 
     return [
-        TensorSpec("k", [t, h, d], torch.float16,
-                   init_value=reference.lazy("scaled_dot_kkt", "k", t, h, d, chunk)),
+        TensorSpec("k", [t, hg, d], torch.float16,
+                   init_value=reference.lazy("scaled_dot_kkt", "k", t, h, d, chunk, hg=hg)),
         TensorSpec("beta", [h, t], torch.float32,
-                   init_value=reference.lazy("scaled_dot_kkt", "beta", t, h, d, chunk, reference.to_hT)),
+                   init_value=reference.lazy("scaled_dot_kkt", "beta", t, h, d, chunk, reference.to_hT, hg=hg)),
         TensorSpec("g_sum", [h, t], torch.float32,
-                   init_value=reference.lazy("scaled_dot_kkt", "g_sum", t, h, d, chunk, reference.to_hT)),
+                   init_value=reference.lazy("scaled_dot_kkt", "g_sum", t, h, d, chunk, reference.to_hT, hg=hg)),
         TensorSpec("mask", [chunk, chunk], torch.float32, init_value=init_mask),
         TensorSpec("a_out", [t, h, chunk], torch.float16),
     ]

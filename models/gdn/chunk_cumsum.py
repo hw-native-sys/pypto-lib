@@ -53,18 +53,22 @@ def build_kernel(t: int = T, h: int = H, d: int = D, chunk: int = CHUNK):
 gdn_chunk_cumsum = build_kernel()
 
 
-def build_tensor_specs(t: int = T, h: int = H, d: int = D, chunk: int = CHUNK):
+def build_tensor_specs(t: int = T, h: int = H, d: int = D, chunk: int = CHUNK,
+                       hg: int | None = None):
     import torch
     from golden import TensorSpec
 
     from models.gdn import reference
+
+    # hg picks the reference chain to draw from; this stage reads no q or k.
+    hg = h if hg is None else hg
 
     def init_tril():
         return torch.tril(torch.ones(chunk, chunk, dtype=torch.float32))
 
     return [
         TensorSpec("g", [t, h], torch.float32,
-                   init_value=reference.lazy("chunk_cumsum", "g", t, h, d, chunk)),
+                   init_value=reference.lazy("chunk_cumsum", "g", t, h, d, chunk, hg=hg)),
         TensorSpec("tril", [chunk, chunk], torch.float32, init_value=init_tril),
         TensorSpec("g_sum", [h, t], torch.float32),
     ]
