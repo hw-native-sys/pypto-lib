@@ -311,10 +311,12 @@ def qkv_proj_rope(
                 kv_fp32[kts0 : kts0 + KV_M_TILE, kvseed0 : kvseed0 + KV_N_TILE] = pl.full(
                     [KV_M_TILE, KV_N_TILE], dtype=pl.FP32, value=0.0
                 )
-    # Early-resolved rather than held behind a dummy barrier: kv_proj is off the
-    # critical path, so it is cheaper to let the scheduler stage it speculatively
-    # than to keep it a hop behind rms_norm.
-    with pl.spmd((HEAD_DIM // KV_N_TILE) * KV_OK, name_hint="kv_proj_matmul", allow_early_resolve=True):
+    with pl.spmd(
+        (HEAD_DIM // KV_N_TILE) * KV_OK,
+        name_hint="kv_proj_matmul",
+        allow_early_resolve=True,
+        deps=[late_dep],
+    ) as _kv_proj_tid:
         kbg = pl.tile.get_block_idx()
         kv_col0 = (kbg // KV_OK) * KV_N_TILE
         kv_k_base = (kbg % KV_OK) * KV_K_SLICE

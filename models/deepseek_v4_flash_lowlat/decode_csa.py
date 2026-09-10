@@ -304,10 +304,8 @@ def attention_csa_packed(
         pl.prefetch.async_prefetch(wo_a_flat, warm_ctx)
         pl.prefetch.async_prefetch(wo_b_flat, warm_ctx)
         pl.prefetch.async_prefetch(gate_w_flat, warm_ctx)
-    # rms_norm fans out to qr_proj_matmul (critical path), kv_proj_matmul, kv_score_proj
-    # and weights_proj. The latter three take this barrier instead of racing the first:
-    # the dummy resolves one hop after rms_norm, so qr_proj_matmul is dispatched first.
     late_dep = pl.system.task_dummy(deps=[rms_tid])
+    kv_dep = pl.system.task_dummy(deps=[])
     q = pl.create_tensor([T, H, HEAD_DIM], dtype=pl.BF16)
     kv = pl.create_tensor([T, HEAD_DIM], dtype=pl.BF16)
     qr = pl.create_tensor([T, Q_LORA], dtype=pl.INT8)
@@ -315,7 +313,7 @@ def attention_csa_packed(
     qkv_proj_rope(
         x_normed_t, wq_a, wq_b, wq_b_scale, wkv,
         rope_cos_t, rope_sin_t, gamma_cq, gamma_ckv,
-        q, kv, qr, qr_scale, late_dep,
+        q, kv, qr, qr_scale, kv_dep,
         pl.cast(my_rank, pl.INT32) * (H // O_GROUPS), q_rope_cos_il, q_rope_sin_signed, q_rope_swap_idx,
     )
 
@@ -349,7 +347,7 @@ def attention_csa_packed(
         cmp_wkv, cmp_wgate, cmp_ape, cmp_norm_w,
         cmp_cos_il, cmp_sin_signed, cmp_kv,
         position_ids_bsd, cmp_slot_mapping_bsd, state_slot_mapping_bsd,
-        late_dep,
+        kv_dep,
     )
 
     idx_kv_unused = pl.create_tensor([B, S, IDX_HEAD_DIM], dtype=pl.FP32)
