@@ -140,18 +140,20 @@ def wy_fast(k: torch.Tensor, v: torch.Tensor, beta: torch.Tensor,
     return w, u
 
 
-def chunk_h(k: torch.Tensor, w: torch.Tensor, u: torch.Tensor,
-            g_sum: torch.Tensor, chunk: int) -> tuple[torch.Tensor, torch.Tensor]:
+def chunk_h(k: torch.Tensor, w: torch.Tensor, u: torch.Tensor, g_sum: torch.Tensor,
+            chunk: int) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """S6: the inter-chunk state recurrence.
 
-    Returns the state snapshot ENTERING each chunk, [NCHUNK, H, D, D], and the
-    residual-corrected values V_new, [T, H, D].
+    Returns the state snapshot ENTERING each chunk, [NCHUNK, H, D, D]; the
+    residual-corrected values V_new, [T, H, D]; and the state LEAVING the last
+    chunk, [H, D, D], which is what an inference cache carries forward.
     """
     t, h, d = k.shape
     nc = t // chunk
     kf, wf, uf, gf = (x.to(REF_DTYPE) for x in (k, w, u, g_sum))
     state = torch.zeros(nc, h, d, d, dtype=REF_DTYPE)
     v_new = torch.zeros(t, h, d, dtype=REF_DTYPE)
+    final_state = torch.zeros(h, d, d, dtype=REF_DTYPE)
     for hh in range(h):
         s = torch.zeros(d, d, dtype=REF_DTYPE)
         for ci in range(nc):
@@ -163,7 +165,8 @@ def chunk_h(k: torch.Tensor, w: torch.Tensor, u: torch.Tensor,
             v_new[t0 : t0 + chunk, hh, :] = vc
             kv = kf[t0 : t0 + chunk, hh, :].T @ (vc * torch.exp(g_last - gc)[:, None])
             s = torch.exp(g_last) * s + kv
-    return state, v_new
+        final_state[hh] = s
+    return state, v_new, final_state
 
 
 def chunk_o(q: torch.Tensor, k: torch.Tensor, v_new: torch.Tensor,
@@ -232,8 +235,8 @@ def compute(upto: str, t: int, h: int, d: int, chunk: int,
             st["w16"] = st["w"].to(torch.float16)
             st["u16"] = st["u"].to(torch.float16)
         elif stage == "chunk_h":
-            st["state"], st["v_new"] = chunk_h(st["k"], st["w16"], st["u16"],
-                                               st["g_sum"], chunk)
+            st["state"], st["v_new"], st["final_state"] = chunk_h(
+                st["k"], st["w16"], st["u16"], st["g_sum"], chunk)
             st["state16"] = st["state"].to(torch.float16)
             st["v_new16"] = st["v_new"].to(torch.float16)
         elif stage == "chunk_o":

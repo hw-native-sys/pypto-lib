@@ -127,8 +127,8 @@ def golden_gdn_chunk_h(tensors):
 
     t, h, d = tensors["k"].shape
     chunk = t // (tensors["state"].shape[0] // (h * d))
-    state, v_new = reference.chunk_h(tensors["k"], tensors["w"], tensors["u"],
-                                     tensors["g_sum"].t(), chunk)
+    state, v_new, _ = reference.chunk_h(tensors["k"], tensors["w"], tensors["u"],
+                                        tensors["g_sum"].t(), chunk)
     tensors["state"].copy_(reference.flat_state(state))
     tensors["v_new"].copy_(v_new)
 
