@@ -88,6 +88,7 @@ H_TILE = 8               # merge_norm head tile
 # One token per card gives the cube a full 64-row M, so every qk/pv box is
 # 16 valid rows instead of the 8-in-16 the head shard was forced into.
 QK_M_TILE = 16
+QK_AIV_TILE = QK_M_TILE // 2
 QK_M_BOX = 16
 QK_HEAD_TILES = H // QK_M_TILE
 # K tile. The head shard ran 128 with T * 5 = 40 work items; one token leaves 5,
@@ -233,58 +234,54 @@ def sparse_attn_csa_packed(
         ori_kv_flat[0:T, 0:HEAD_DIM] = ori_kv_flat[0:T, 0:HEAD_DIM]
 
     # This card plans only its own token, so qk_order holds SPARSE_BLOCKS items.
-    sparse_bias = pl.create_tensor([T, PADDED_TOPK], dtype=pl.FP32)
-    cmp_sparse_indices = pl.create_tensor([T, CMP_TOPK], dtype=pl.INT32)
-    valid_block_mask = pl.create_tensor([T, SPARSE_BLOCKS], dtype=pl.INT32)
+    sparse_bias = pl.create_tensor([1, PADDED_TOPK], dtype=pl.FP32)
+    cmp_sparse_indices = pl.create_tensor([1, CMP_TOPK], dtype=pl.INT32)
+    valid_block_mask = pl.create_tensor([1, SPARSE_BLOCKS], dtype=pl.INT32)
     qk_order = pl.create_tensor([QK_ITEMS], dtype=pl.INT32)
     qk_wcur = pl.create_tensor([1], dtype=pl.INT32)
     with pl.at(level=pl.Level.CORE_GROUP, name_hint="csa_slots_build_valid_qk_plan", allow_early_resolve=True) as qk_plan_tid:
-        # Compressed slots [0, IDX_TOPK): vectorized masked copy over all T rows, keeping
+        # Compressed slots [0, IDX_TOPK): masked copy for the owning token, keeping
         # raw iff 0 <= raw < floor((pos + 1) / COMPRESS_RATIO), as out = mask*(raw + 1) - 1.
-        c_raw = pl.cast(idx_topk[0:T, 0:IDX_TOPK], target_type=pl.FP32)
-        c_pos = pl.cast(position_ids[0:T, 0:1], target_type=pl.FP32)
-        c_pos_scaled = pl.mul(pl.add(c_pos, 1.0), COMPRESS_RATIO_INV)
-        c_pos_i32 = pl.cast(c_pos_scaled, target_type=pl.INT32, mode="trunc")
+        c_raw = pl.cast(idx_topk[my_t : my_t + 1, 0:IDX_TOPK], target_type=pl.FP32)
+        c_pos = pl.read(position_ids, [my_t, 0])
+        c_pos_i32 = pl.cast((c_pos + 1) // COMPRESS_RATIO, target_type=pl.INT32)
         c_pos_q = pl.cast(c_pos_i32, target_type=pl.FP32)
-        # Broadcast the per-token bound over IDX_TOPK cols.
-        c_upper_b = pl.row_expand_mul(pl.full([T, IDX_TOPK], dtype=pl.FP32, value=1.0), c_pos_q)
+        c_upper_b = pl.mul(pl.full([1, IDX_TOPK], dtype=pl.FP32, value=1.0), c_pos_q)
         c_ge = pl.minimum(pl.maximum(pl.add(c_raw, CSA_CMP_GE_BIAS), 0.0), 1.0)
         c_lt = pl.minimum(pl.maximum(pl.sub(c_upper_b, c_raw), 0.0), 1.0)
         c_mask = pl.mul(c_ge, c_lt)
         c_out = pl.sub(pl.mul(c_mask, pl.add(c_raw, 1.0)), 1.0)
-        cmp_sparse_indices[0:T, 0:IDX_TOPK] = pl.cast(c_out, target_type=pl.INT32)
+        cmp_sparse_indices[0:1, 0:IDX_TOPK] = pl.cast(c_out, target_type=pl.INT32)
         # Window blocks are always live; compressed blocks from the mask.
-        for c_t0 in pl.range(T):
-            for c_wb in pl.range(WIN_BLOCKS):
-                pl.write(valid_block_mask, [c_t0, c_wb], pl.cast(1, pl.INT32))
+        for c_wb in pl.range(WIN_BLOCKS):
+            pl.write(valid_block_mask, [0, c_wb], pl.cast(1, pl.INT32))
+        c_blocks = pl.reshape(c_mask, [CMP_TOPK // ATTN_K_TILE, ATTN_K_TILE])
+        c_blocks_valid = pl.row_max(c_blocks)
         for c_sb in pl.range(WIN_BLOCKS, SPARSE_BLOCKS):
-            c_s0 = (c_sb - WIN_BLOCKS) * ATTN_K_TILE
-            c_blk_valid = pl.row_max(c_mask[:, c_s0 : c_s0 + ATTN_K_TILE])
-            for c_dt in pl.range(T):
-                c_valid = pl.cast(pl.read(c_blk_valid, [c_dt, 0]), target_type=pl.INT32)
-                pl.write(valid_block_mask, [c_dt, c_sb], c_valid)
+            c_valid = pl.cast(pl.read(c_blocks_valid, [c_sb - WIN_BLOCKS, 0]), target_type=pl.INT32)
+            pl.write(valid_block_mask, [0, c_sb], c_valid)
 
         # Additive softmax bias (0 valid / NEG_INF invalid) that qk_pv adds onto the
         # scaled scores, so invalid lanes exp to ~0 with no per-block mask multiply.
-        v_win_f = pl.cast(window_swa_indices[0:T, 0:WIN], target_type=pl.FP32)
+        v_win_f = pl.cast(window_swa_indices[my_t : my_t + 1, 0:WIN], target_type=pl.FP32)
         # Index contract: raw == -1 invalid, raw >= 0 valid. min(idx, 0) is -1 for
         # invalid / 0 for valid; * -NEG_INF gives NEG_INF / 0.
         v_win_valid = pl.minimum(pl.maximum(pl.add(v_win_f, 1.0), 0.0), 1.0)
-        sparse_bias[0:T, 0:WIN] = pl.mul(pl.sub(v_win_valid, 1.0), -NEG_INF)
-        sparse_bias[0:T, WIN:TOPK] = pl.mul(pl.minimum(c_out, 0.0), -NEG_INF)
+        sparse_bias[0:1, 0:WIN] = pl.mul(pl.sub(v_win_valid, 1.0), -NEG_INF)
+        sparse_bias[0:1, WIN:TOPK] = pl.mul(pl.minimum(c_out, 0.0), -NEG_INF)
         if PADDED_TOPK > TOPK:
-            sparse_bias[0:T, TOPK:PADDED_TOPK] = pl.full([T, PADDED_TOPK - TOPK], dtype=pl.FP32, value=NEG_INF)
+            sparse_bias[0:1, TOPK:PADDED_TOPK] = pl.full([1, PADDED_TOPK - TOPK], dtype=pl.FP32, value=NEG_INF)
 
         pl.write(qk_wcur, [0], pl.cast(0, pl.INT32))
         # Pass 1: this card's non-empty tiles to the front of qk_order.
         for plan_sb in pl.range(SPARSE_BLOCKS):
-            if pl.read(valid_block_mask, [my_t, plan_sb]) > 0:
+            if pl.read(valid_block_mask, [0, plan_sb]) > 0:
                 plan_w = pl.read(qk_wcur, [0])
                 pl.write(qk_order, [plan_w], pl.cast(plan_sb, pl.INT32))
                 pl.write(qk_wcur, [0], pl.cast(plan_w + 1, pl.INT32))
         # Pass 2: empty tiles appended to the tail.
         for plan_sb in pl.range(SPARSE_BLOCKS):
-            if pl.read(valid_block_mask, [my_t, plan_sb]) <= 0:
+            if pl.read(valid_block_mask, [0, plan_sb]) <= 0:
                 plan_w = pl.read(qk_wcur, [0])
                 pl.write(qk_order, [plan_w], pl.cast(plan_sb, pl.INT32))
                 pl.write(qk_wcur, [0], pl.cast(plan_w + 1, pl.INT32))
@@ -325,8 +322,9 @@ def sparse_attn_csa_packed(
             qk_sb = pl.cast(pl.read(qk_order, [qk_flat]), pl.INDEX)
             qk_b = my_t // S
             qk_s0 = qk_sb * ATTN_K_TILE
-            qk_bias_row = sparse_bias[my_t : my_t + 1, qk_s0 : qk_s0 + ATTN_K_TILE]
-            qk_block_valid = pl.read(valid_block_mask, [my_t, qk_sb])
+            for _ in pl.split_aiv(2, mode=pl.SplitMode.NONE):
+                qk_bias_row = sparse_bias[0:1, qk_s0 : qk_s0 + ATTN_K_TILE]
+            qk_block_valid = pl.read(valid_block_mask, [0, qk_sb])
             qk_row = qk_sb * H
             if qk_block_valid > 0:
                 qk_kv = pl.create_l1([ATTN_K_TILE, HEAD_DIM], pl.BF16)
@@ -363,7 +361,7 @@ def sparse_attn_csa_packed(
                 for qk_r in pl.range(qk_win_rows, ATTN_K_TILE):
                     qk_cmp_k = qk_s0 + qk_r - WIN
                     if qk_cmp_k < CMP_TOPK:
-                        qk_ridx = pl.read(cmp_sparse_indices, [my_t, qk_cmp_k])
+                        qk_ridx = pl.read(cmp_sparse_indices, [0, qk_cmp_k])
                         if qk_ridx >= 0:
                             qk_slot = qk_ridx
                             qk_cblk = pl.cast(
@@ -387,28 +385,32 @@ def sparse_attn_csa_packed(
                     qk_h0 = qk_hb * QK_M_TILE
                     qk_q_tile = q_tok[qk_h0 : qk_h0 + QK_M_TILE, 0:HEAD_DIM]
                     qk_raw = pl.matmul(qk_q_tile, qk_kv, b_trans=True, out_dtype=pl.FP32)
-                    qk_scaled = pl.mul(qk_raw, SOFTMAX_SCALE)
-                    # Per-block bias broadcast-added in one op.
-                    qk_scores = pl.col_expand_add(qk_scaled, qk_bias_row)
-                    qk_mi = pl.row_max(qk_scores)
-                    # Invalid lanes (NEG_INF bias) exp to ~0; all-invalid blocks die in
-                    # the merge alpha/beta, so no mask multiply is needed.
-                    qk_exp = pl.exp(pl.row_expand_sub(qk_scores, qk_mi))
-                    qk_li = pl.row_sum(qk_exp)
-                    qk_exp_bf16 = pl.cast(qk_exp, target_type=pl.BF16, mode="rint")
-                    qk_oi = pl.matmul(qk_exp_bf16, qk_kv, out_dtype=pl.FP32)
+                    for qk_aiv in pl.split_aiv(2, mode=pl.SplitMode.UP_DOWN):
+                        qk_shard = pl.aiv_shard(qk_raw)
+                        qk_scaled = pl.mul(qk_shard, SOFTMAX_SCALE)
+                        qk_scores = pl.col_expand_add(qk_scaled, qk_bias_row)
+                        qk_mi = pl.row_max(qk_scores)
+                        qk_shifted = pl.row_expand_sub(qk_scores, qk_mi)
+                        qk_exp = pl.exp(qk_shifted)
+                        qk_li = pl.row_sum(qk_exp)
+                        qk_exp_bf16 = pl.cast(qk_exp, target_type=pl.BF16, mode="rint")
+                        qk_exp_full = pl.aic_gather(qk_exp_bf16)
+                        qk_vrow = qk_row + qk_h0 + pl.cast(qk_aiv * QK_AIV_TILE, pl.INDEX)
+                        sparse_blk_mi[qk_vrow : qk_vrow + QK_AIV_TILE, 0:1] = qk_mi
+                        sparse_blk_li[qk_vrow : qk_vrow + QK_AIV_TILE, 0:1] = qk_li
+                    qk_oi = pl.matmul(qk_exp_full, qk_kv, out_dtype=pl.FP32)
                     qk_hrow = qk_row + qk_h0
-                    sparse_blk_mi[qk_hrow : qk_hrow + QK_M_TILE, 0 : 1] = qk_mi
-                    sparse_blk_li[qk_hrow : qk_hrow + QK_M_TILE, 0 : 1] = qk_li
                     sparse_blk_oi[qk_hrow : qk_hrow + QK_M_TILE, 0 : HEAD_DIM] = qk_oi
             else:
-                qk_oi_zero = pl.full([QK_M_TILE, HEAD_DIM], dtype=pl.FP32, value=0.0)
-                for qk_hb in pl.range(QK_HEAD_TILES):
-                    qk_hrow = qk_row + qk_hb * QK_M_TILE
-                    for qk_hr in pl.range(QK_M_TILE):
-                        pl.write(sparse_blk_mi, [qk_hrow + qk_hr, 0], -3.0e38)
-                        pl.write(sparse_blk_li, [qk_hrow + qk_hr, 0], 0.0)
-                    sparse_blk_oi[qk_hrow : qk_hrow + QK_M_TILE, 0 : HEAD_DIM] = qk_oi_zero
+                for qk_zero_aiv in pl.split_aiv(2, mode=pl.SplitMode.NONE):
+                    if qk_zero_aiv == 0:
+                        qk_oi_zero = pl.full([QK_M_TILE, HEAD_DIM], dtype=pl.FP32, value=0.0)
+                        for qk_hb in pl.range(QK_HEAD_TILES):
+                            qk_hrow = qk_row + qk_hb * QK_M_TILE
+                            for qk_hr in pl.range(QK_M_TILE):
+                                pl.write(sparse_blk_mi, [qk_hrow + qk_hr, 0], -3.0e38)
+                                pl.write(sparse_blk_li, [qk_hrow + qk_hr, 0], 0.0)
+                            sparse_blk_oi[qk_hrow : qk_hrow + QK_M_TILE, 0 : HEAD_DIM] = qk_oi_zero
 
     # Online-softmax merge across this token's sparse-K tiles, sink-norm, then fused
     # inverse RoPE, one spmd block per head tile. A block covers exactly one output

@@ -106,7 +106,7 @@ def indexer_compressor(
     # critical path and must win the cores when rms_norm retires.
     with pl.spmd(
         BS_PAD * OUT_DIM // (MM_B_TILE * PROJ_OUT_TILE), name_hint="kv_score_proj", deps=[late_dep]
-    ) as _kv_score_tid:
+    ):
         idx = pl.tile.get_block_idx()
         global_row0 = (idx // (OUT_DIM // PROJ_OUT_TILE)) * MM_B_TILE
         o0 = (idx % (OUT_DIM // PROJ_OUT_TILE)) * PROJ_OUT_TILE
@@ -279,7 +279,7 @@ def indexer_compressor(
             target_type=pl.FP32)
         # amax = max(|x|); abs-based (max(row_max, -row_min) is wrong on signed KV)
         kv_amax = pl.reshape(pl.row_max(pl.abs(kv_blk_f32)), [1, RMS_PAD_TILE])
-        kv_amax = pl.maximum(kv_amax, pl.full([1, RMS_PAD_TILE], dtype=pl.FP32, value=INT8_AMAX_EPS))
+        kv_amax = pl.maximum(kv_amax, INT8_AMAX_EPS)
         kv_scale_q_row = pl.div(pl.full([1, RMS_PAD_TILE], dtype=pl.FP32, value=INT8_SCALE_MAX), kv_amax)
         kv_scale_dq_col = pl.reshape(pl.recip(kv_scale_q_row), [RMS_PAD_TILE, 1])
         kv_scale_q_col = pl.reshape(kv_scale_q_row, [RMS_PAD_TILE, 1])

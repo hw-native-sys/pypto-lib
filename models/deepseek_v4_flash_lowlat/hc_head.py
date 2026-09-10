@@ -70,16 +70,19 @@ def hc_head(
     # linear: split-K head projection, fanned over (row-block x K-slice); each task
     # atomic-adds its [LINEAR_T_TILE, HC_PAD] FP32 partial into the kernel-zeroed mixes_raw
     mixes_raw = pl.create_tensor([t_linear, HC_PAD], dtype=pl.FP32)
-    with pl.spmd(t_linear // LINEAR_T_TILE, name_hint="hc_head_linear_seed", allow_early_resolve=True) as linear_seed_tid:
+    with pl.spmd(
+        t_linear // LINEAR_T_TILE, name_hint="hc_head_linear_seed", allow_early_resolve=True
+    ) as linear_seed_tid:
         seed_block = pl.tile.get_block_idx()
         seed_t0 = seed_block * LINEAR_T_TILE
         zeros = pl.full([LINEAR_T_TILE, HC_PAD], dtype=pl.FP32, value=0.0)
         mixes_raw[seed_t0 : seed_t0 + LINEAR_T_TILE, 0:HC_PAD] = zeros
     with pl.spmd(
         (t_linear // LINEAR_T_TILE) * LINEAR_OK,
-        name_hint="hc_head_linear", allow_early_resolve=True,
+        name_hint="hc_head_linear",
+        allow_early_resolve=True,
         deps=[linear_seed_tid],
-    ) as _linear_tid:
+    ):
         task = pl.tile.get_block_idx()
         t0 = (task // LINEAR_OK) * LINEAR_T_TILE
         k_base = (task % LINEAR_OK) * (HC_DIM // LINEAR_OK)
@@ -93,7 +96,9 @@ def hc_head(
 
     # reduce: gate + hc mix, fanned over (token-tile x D-slice). The rsqrt/sigmoid gate is
     # recomputed per task instead of being published by its own scope.
-    for blk in pl.spmd((t_dim // T_TILE) * (D // D_SPMD), name_hint="hc_head_reduce", allow_early_resolve=True):
+    for blk in pl.spmd(
+        (t_dim // T_TILE) * (D // D_SPMD), name_hint="hc_head_reduce", allow_early_resolve=True
+    ):
         t0 = (blk // (D // D_SPMD)) * T_TILE
         d_base = (blk % (D // D_SPMD)) * D_SPMD
         scale = pl.read(hc_head_scale, [0])
@@ -152,7 +157,7 @@ def golden_hc_head(tensors):
 
     sq_sum = torch.zeros(T, 1, dtype=torch.float32)
     for k0 in range(0, HC_DIM, RMS_K_TILE):
-        x_chunk = x_flat_2d[:, k0:k0 + RMS_K_TILE]
+        x_chunk = x_flat_2d[:, k0 : k0 + RMS_K_TILE]
         sq_sum += (x_chunk * x_chunk).sum(dim=1, keepdim=True)
     rsqrt = torch.rsqrt(sq_sum * HC_DIM_INV + EPS)
 
@@ -160,8 +165,8 @@ def golden_hc_head(tensors):
     for h in range(HC_MULT):
         mix_col = torch.zeros(T, 1, dtype=torch.float32)
         for k0 in range(0, HC_DIM, LINEAR_K_TILE):
-            x_chunk = x_flat_2d[:, k0:k0 + LINEAR_K_TILE]
-            w_chunk = hc_head_fn[h:h + 1, k0:k0 + LINEAR_K_TILE]
+            x_chunk = x_flat_2d[:, k0 : k0 + LINEAR_K_TILE]
+            w_chunk = hc_head_fn[h : h + 1, k0 : k0 + LINEAR_K_TILE]
             mix_col += (x_chunk * w_chunk).sum(dim=1, keepdim=True)
         mix_cols.append(mix_col * rsqrt)
     mixes = torch.cat(mix_cols, dim=1).reshape(T, HC_MULT)
@@ -169,17 +174,13 @@ def golden_hc_head(tensors):
     pre = torch.sigmoid(mixes * tensors["hc_head_scale"].float() + tensors["hc_head_base"].float()) + HC_EPS
     x_view = x.float().view(shape)
     if HC_MULT == 4:
-        y = (
-            x_view[:, 0, :] * pre[:, 0:1]
-            + x_view[:, 1, :] * pre[:, 1:2]
-        ) + (
-            x_view[:, 2, :] * pre[:, 2:3]
-            + x_view[:, 3, :] * pre[:, 3:4]
+        y = (x_view[:, 0, :] * pre[:, 0:1] + x_view[:, 1, :] * pre[:, 1:2]) + (
+            x_view[:, 2, :] * pre[:, 2:3] + x_view[:, 3, :] * pre[:, 3:4]
         )
     else:
         y = torch.zeros(T, D, dtype=torch.float32)
         for h in range(HC_MULT):
-            y += x_view[:, h, :] * pre[:, h:h + 1]
+            y += x_view[:, h, :] * pre[:, h : h + 1]
 
     # Match the kernel's mode="rint" cast (round to nearest, ties to even).
     tensors["y"][:] = y.to(torch.bfloat16)
@@ -198,10 +199,13 @@ def build_tensor_specs():
     return [
         TensorSpec("x_hc", [T, HC_MULT, D], torch.float32, init_value=init_x_hc),
         TensorSpec("hc_head_fn", [HC_MULT, HC_DIM], torch.float32, init_value=init_hc_head_fn),
-        TensorSpec("hc_head_scale", [1], torch.float32,
-                   init_value=lambda: torch.tensor([0.076099])),
-        TensorSpec("hc_head_base", [HC_MULT], torch.float32,
-                   init_value=lambda: torch.tensor([5.9166, -3.6223, -2.9324, -3.3124])),
+        TensorSpec("hc_head_scale", [1], torch.float32, init_value=lambda: torch.tensor([0.076099])),
+        TensorSpec(
+            "hc_head_base",
+            [HC_MULT],
+            torch.float32,
+            init_value=lambda: torch.tensor([5.9166, -3.6223, -2.9324, -3.3124]),
+        ),
         TensorSpec("y", [T, D], torch.bfloat16, is_output=True),
     ]
 
@@ -212,8 +216,9 @@ if __name__ == "__main__":
     from golden import ratio_allclose, run_jit
 
     parser = argparse.ArgumentParser()
-    parser.add_argument("-p", "--platform", type=str, default="a2a3",
-                        choices=["a2a3", "a2a3sim", "a5", "a5sim"])
+    parser.add_argument(
+        "-p", "--platform", type=str, default="a2a3", choices=["a2a3", "a2a3sim", "a5", "a5sim"]
+    )
     parser.add_argument("-d", "--device", type=int, default=0)
     parser.add_argument("--seed", type=int, default=0)
     # Int mode (0=off; 1=timing only, most accurate; 2=timing + dep graph, two runs).

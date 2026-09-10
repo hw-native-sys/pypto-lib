@@ -20,7 +20,7 @@ from expert_routed import (D, IDX_PAD, MOE_INTER, N_BANK, N_EXPERTS, N_SLOTS,
                            golden_expert_routed, gen_routed_weight)
 
 p = argparse.ArgumentParser()
-p.add_argument("--variant", required=True)
+p.add_argument("--variant", required=True, choices=["expert_routed", "expert_routed_persistent_balanced"])
 p.add_argument("--n-active", type=int, required=True)
 p.add_argument("-d", "--device", type=int, default=0)
 p.add_argument("--dense", action="store_true", help="active slots are 0..n-1, as moe.route_group emits them")
