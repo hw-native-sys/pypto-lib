@@ -377,6 +377,7 @@ def decode_hca(
                         cmp_partial_o, [merge_state_row, 0], [H_TILE, HEAD_DIM], target_memory=pl.MemorySpace.Vec,
                     )
                     stream_m_new = pl.maximum(stream_m, stream_cmp_m)
+                    stream_m_new = pl.maximum(stream_m_new, stream_sink)
                     stream_alpha = pl.exp(pl.sub(stream_m, stream_m_new))
                     stream_beta = pl.exp(pl.sub(stream_cmp_m, stream_m_new))
                     stream_l_scaled = pl.mul(stream_alpha, stream_l)
