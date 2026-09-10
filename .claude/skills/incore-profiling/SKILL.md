@@ -86,6 +86,13 @@ python .claude/skills/incore-profiling/incore_profile.py \
 Use `--task-submit` only when the user requested or authorized the repository's
 internal task queue workflow.
 
+For CANN 9, use the generated per-case runtime alias and a compatible complete
+profiler package; see the guide's
+[runtime isolation and timeout rules](../../../docs/debug-and-tune/incore-simulator-profiling.md#cann-9-simulator-runtime-isolation).
+The alias is scoped to simulator subprocesses and must not be used for device
+runs. The workflow's `--msprof-timeout` is in seconds, rounded up to minutes for
+the underlying profiler.
+
 The bundled generator allocates runtime-shaped tensor dimensions using
 `--dynamic-dim` (default `256`). Generated `main.cpp` rejects a direct dynamic
 scalar that exceeds this allocation bound. Set `--dynamic-dim` to at least the

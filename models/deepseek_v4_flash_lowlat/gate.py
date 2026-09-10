@@ -25,14 +25,13 @@ NORM_EPS = M.rms_norm_eps
 N_EXPERTS = M.n_routed_experts
 TOPK = M.num_experts_per_tok
 ROUTE_SCALE = M.routed_scaling_factor
-TOPK_FLOAT = float(TOPK)
 VOCAB = M.vocab_size
 N_HASH_LAYERS = M.num_hash_layers
 
 # tiling
 T_TILE = 8
 GATE_T_TILE = 1         # one token per routing block
-ROUTE_ROW_PAD = 16     # 64-byte rows for scalar routing writes
+ROUTE_ROW_PAD = 16     # 64-byte routing row stride
 GATE_M_TILE = 16        # cube M-tile: matmul rows must be a multiple of 16 (fractal)
 GATE_N_TILE = 16        # expert columns per gate spmd block
 assert N_EXPERTS % GATE_N_TILE == 0
@@ -64,6 +63,7 @@ def gate(
     indices: pl.Tensor[[T, ROUTE_ROW_PAD], pl.INT32],
     weights: pl.Tensor[[T, ROUTE_ROW_PAD], pl.FP32],
 ):
+    # Routing outputs and x_norm_scale are valid only for active tokens.
     # Deferred RMSNorm (qwen3-style): store xg = x*gamma (NOT *inv_rms), because
     # the per-token positive scalar inv_rms factors out of everything downstream:
     #   - gate logits: inv_rms * (xg @ gate_w.T)  -> applied as a [16,1] row-scale
@@ -116,9 +116,7 @@ def gate(
             amax_tmp = pl.create_tile([ROW_PAD, ROW_PAD], dtype=pl.FP32)
             xg_amax = pl.row_max(amax_reduce, amax_tmp)
             xg_amax = pl.set_validshape(pl.reshape(xg_amax, [1, ROW_PAD]), 1, 1)
-            amax_eps = pl.tile.full([1, ROW_PAD], dtype=pl.FP32, value=INT8_AMAX_EPS)
-            amax_eps = pl.set_validshape(amax_eps, 1, 1)
-            xg_amax = pl.maximum(xg_amax, amax_eps)
+            xg_amax = pl.maximum(xg_amax, INT8_AMAX_EPS)
             # quant scale = INT8_SCALE_MAX / amax(xg); dequant scale rides inv_rms.
             scale_max = pl.tile.full([1, ROW_PAD], dtype=pl.FP32, value=INT8_SCALE_MAX)
             scale_max = pl.set_validshape(scale_max, 1, 1)
@@ -152,14 +150,6 @@ def gate(
                 x_norm_i8[t0 : t0 + T_TILE, xq_b_k : xq_b_k + QUANT_TILE] = \
                     pl.cast(xn_q_half, pl.INT8, mode="trunc", saturation_mode="on")
 
-    # Zero inactive-token routing outputs.
-    with pl.at(level=pl.Level.CORE_GROUP, name_hint="gate_pre_route", allow_early_resolve=True):
-        for zt in pl.range(T):
-            if zt >= active_tokens:
-                pl.write(x_norm_scale, [zt, 0], pl.cast(0.0, pl.FP32))
-                for zk in pl.range(TOPK):
-                    pl.write(indices, [zt, zk], pl.cast(0, pl.INT32))
-                    pl.write(weights, [zt, zk], pl.cast(0.0, pl.FP32))
     gate_logits_buf = pl.create_tensor([T_PAD, SCORE_PAD], dtype=pl.FP32)
     GATE_N_BLOCKS = N_EXPERTS // GATE_N_TILE
     if active_gate_tiles > 0:
@@ -186,43 +176,25 @@ def gate(
                 route_inv_rms = pl.read(inv_rms_buf, [t1, 0])
                 route_logits = pl.mul(route_logits, route_inv_rms)
                 gp_relu = pl.maximum(route_logits, 0.0)
-                gp_abs = pl.maximum(route_logits, pl.neg(route_logits))
+                gp_abs = pl.abs(route_logits)
                 gp_softplus_log = pl.add(gp_relu, pl.log(pl.add(pl.exp(pl.neg(gp_abs)), 1.0)))
                 gp_neg_floor_mask = pl.minimum(pl.maximum(pl.sub(pl.neg(route_logits), 10.0), 0.0), 1.0)
                 gp_neg_floor = pl.mul(gp_neg_floor_mask, pl.exp(pl.minimum(route_logits, 0.0)))
                 gp_softplus = pl.maximum(gp_softplus_log, gp_neg_floor)
                 gp_score = pl.sqrt(gp_softplus)
-                # eids from tid2eid[input_ids]: scalar lookup (dynamic row index) into a
-                # Tensor. tid2eid row load hits the 32B tile floor (TOPK*4=24B), so the
-                # index build stays scalar; the score fetch is a batched gather below.
-                # Zero indices in the padded selection lanes.
-                hs_idx_tile = pl.create_tensor([GATE_T_TILE, TOPK_PAD], dtype=pl.INT32)
-                for hs_tt in pl.range(GATE_T_TILE):
-                    hs_token = pl.cast(pl.read(input_ids, [t1 + hs_tt]), pl.INDEX)
-                    for hs_k in pl.range(TOPK):
-                        pl.write(hs_idx_tile, [hs_tt, hs_k], pl.read(tid2eid, [hs_token, hs_k]))
-                    for hs_pad_k in pl.range(TOPK, TOPK_PAD):
-                        pl.write(hs_idx_tile, [hs_tt, hs_pad_k], pl.cast(0, pl.INT32))
-                # Gather selected scores and mask padded lanes before normalization.
-                local_scores = pl.create_tensor([GATE_T_TILE, SCORE_PAD], dtype=pl.FP32)
-                local_scores[:, :] = pl.full([GATE_T_TILE, SCORE_PAD], dtype=pl.FP32, value=0.0)
-                local_scores[:, 0:N_EXPERTS] = gp_score
-                gather_all = pl.gather(local_scores, dim=-1, index=hs_idx_tile)
-                hs_values = pl.create_tensor([GATE_T_TILE, TOPK_PAD], dtype=pl.FP32)
-                hs_values[:, :] = gather_all[:, :]
-                hs_ids = pl.create_tensor([GATE_T_TILE, TOPK_PAD], dtype=pl.INT32)
-                hs_ids[:, :] = hs_idx_tile[:, :]
-                hs_lanes = pl.cast(pl.arange(0, [GATE_T_TILE, TOPK_PAD], dtype=pl.INT32), pl.FP32)
-                hs_limit = pl.full([GATE_T_TILE, TOPK_PAD], dtype=pl.FP32, value=TOPK_FLOAT)
-                hs_mask = pl.minimum(pl.maximum(pl.sub(hs_limit, hs_lanes), 0.0), 1.0)
+                # Load the selected expert row into an aligned UB tile.
+                hs_token = pl.cast(pl.read(input_ids, [t1]), pl.INDEX)
+                hs_idx_tile = pl.slice(tid2eid, [GATE_T_TILE, TOPK_PAD], [hs_token, 0], valid_shape=[GATE_T_TILE, TOPK])
+                # Normalize only the selected scores.
+                gather_all = pl.gather(gp_score, dim=-1, index=hs_idx_tile)
                 hs_reduce = pl.create_tensor([ROW_PAD, TOPK_PAD], dtype=pl.FP32)
-                hs_reduce[:, :] = pl.full([ROW_PAD, TOPK_PAD], dtype=pl.FP32, value=1.0)
-                hs_reduce[0:1, :] = pl.mul(hs_values, hs_mask)
+                hs_reduce[0:GATE_T_TILE, :] = gather_all
+                hs_reduce = pl.set_validshape(hs_reduce, GATE_T_TILE, TOPK)
                 hs_denom = pl.row_sum(hs_reduce)
                 hs_weight_mat = pl.mul(pl.row_expand_div(hs_reduce, hs_denom), ROUTE_SCALE)
-                for hs_k in pl.range(TOPK):
-                    pl.write(indices, [t1, hs_k], pl.read(hs_ids, [0, hs_k]))
-                    pl.write(weights, [t1, hs_k], pl.read(hs_weight_mat, [0, hs_k]))
+                hs_indices_valid = pl.set_validshape(hs_idx_tile, GATE_T_TILE, TOPK)
+                indices = pl.assemble(indices, hs_indices_valid, [t1, 0])
+                weights = pl.assemble(weights, hs_weight_mat, [t1, 0])
         else:
             for ts_idx in pl.spmd(active_route_tiles, name_hint="route_sort", allow_early_resolve=True):
                 t1 = ts_idx * GATE_T_TILE
@@ -230,17 +202,16 @@ def gate(
                 route_inv_rms = pl.read(inv_rms_buf, [t1, 0])
                 route_logits = pl.mul(route_logits, route_inv_rms)
                 gp_relu = pl.maximum(route_logits, 0.0)
-                gp_abs = pl.maximum(route_logits, pl.neg(route_logits))
+                gp_abs = pl.abs(route_logits)
                 gp_softplus_log = pl.add(gp_relu, pl.log(pl.add(pl.exp(pl.neg(gp_abs)), 1.0)))
                 gp_neg_floor_mask = pl.minimum(pl.maximum(pl.sub(pl.neg(route_logits), 10.0), 0.0), 1.0)
                 gp_neg_floor = pl.mul(gp_neg_floor_mask, pl.exp(pl.minimum(route_logits, 0.0)))
                 gp_softplus = pl.maximum(gp_softplus_log, gp_neg_floor)
                 gp_score = pl.sqrt(gp_softplus)
                 gp_bias_row = pl.reshape(gate_bias, [1, N_EXPERTS])
-                gp_bias = pl.col_expand_mul(pl.full([GATE_T_TILE, N_EXPERTS], dtype=pl.FP32, value=1.0), gp_bias_row)
                 gp_biased = pl.create_tensor([GATE_T_TILE, SCORE_PAD], dtype=pl.FP32)
                 gp_biased[:, :] = pl.full([GATE_T_TILE, SCORE_PAD], dtype=pl.FP32, value=FP32_NEG_INF)
-                gp_biased[:, 0:N_EXPERTS] = pl.add(gp_score, gp_bias)
+                gp_biased[:, 0:N_EXPERTS] = pl.add(gp_score, gp_bias_row)
                 # topk_idx_tile stays Tensor (created here, not a pl.full Tile) so
                 # the batched pl.gather below accepts it — Tile-against-Tensor src
                 # is rejected.
@@ -257,30 +228,17 @@ def gate(
                     sr_pairs = sr_sorted[:, 0:SORT_PAD]
                     sr_i = pl.gather(sr_pairs, mask_pattern=pl.tile.MaskPattern.P1010, output_dtype=pl.INT32)
                     topk_idx_tile[sr_tt : sr_tt + 1, :] = sr_i
-                # Gather selected scores and mask padded lanes before normalization.
-                local_scores = pl.create_tensor([GATE_T_TILE, SCORE_PAD], dtype=pl.FP32)
-                local_scores[:, :] = pl.full([GATE_T_TILE, SCORE_PAD], dtype=pl.FP32, value=0.0)
-                local_scores[:, 0:N_EXPERTS] = gp_score
-                gather_all = pl.gather(local_scores, dim=-1, index=topk_idx_tile)
-                nm_values = pl.create_tensor([GATE_T_TILE, TOPK_PAD], dtype=pl.FP32)
-                nm_values[:, :] = gather_all[:, :]
-                nm_ids = pl.create_tensor([GATE_T_TILE, TOPK_PAD], dtype=pl.INT32)
-                nm_ids[:, :] = topk_idx_tile[:, :]
-                nm_lanes = pl.cast(pl.arange(0, [GATE_T_TILE, TOPK_PAD], dtype=pl.INT32), pl.FP32)
-                nm_limit = pl.full([GATE_T_TILE, TOPK_PAD], dtype=pl.FP32, value=TOPK_FLOAT)
-                nm_mask = pl.minimum(pl.maximum(pl.sub(nm_limit, nm_lanes), 0.0), 1.0)
+                # Normalize only the selected scores.
+                gather_all = pl.gather(gp_score, dim=-1, index=topk_idx_tile)
                 nm_reduce = pl.create_tensor([ROW_PAD, TOPK_PAD], dtype=pl.FP32)
-                nm_reduce[:, :] = pl.full([ROW_PAD, TOPK_PAD], dtype=pl.FP32, value=1.0)
-                nm_reduce[0:1, :] = pl.mul(nm_values, nm_mask)
+                nm_reduce[0:GATE_T_TILE, :] = gather_all
+                nm_reduce = pl.set_validshape(nm_reduce, GATE_T_TILE, TOPK)
                 nm_denom = pl.row_sum(nm_reduce)
                 nm_weight_mat = pl.mul(pl.row_expand_div(nm_reduce, nm_denom), ROUTE_SCALE)
-                for nm_k in pl.range(TOPK):
-                    pl.write(indices, [t1, nm_k], pl.read(nm_ids, [0, nm_k]))
-                    pl.write(weights, [t1, nm_k], pl.read(nm_weight_mat, [0, nm_k]))
+                nm_indices_valid = pl.set_validshape(topk_idx_tile, GATE_T_TILE, TOPK)
+                indices = pl.assemble(indices, nm_indices_valid, [t1, 0])
+                weights = pl.assemble(weights, nm_weight_mat, [t1, 0])
 
-    # The @pl.inline parser requires inline call expressions to have a return
-    # value. weights is convenient because it's already pl.Out and reads as
-    # the same SSA name on the caller side.
     return weights
 
 
@@ -308,11 +266,13 @@ def gate_test(
         tid2eid, input_ids,
         x_norm_i8, x_norm_scale, indices_pad, weights_pad,
     )
+    active_tokens = pl.min(pl.max(pl.cast(num_tokens, pl.INDEX), 0), T)
     with pl.at(level=pl.Level.CORE_GROUP, name_hint="route_pack"):
-        for pack_t in pl.range(T):
-            for pack_k in pl.range(TOPK):
-                pl.write(indices, [pack_t, pack_k], pl.read(indices_pad, [pack_t, pack_k]))
-                pl.write(weights, [pack_t, pack_k], pl.read(weights_pad, [pack_t, pack_k]))
+        if active_tokens > 0:
+            packed_indices = pl.tile.load(indices_pad, [0, 0], [T, TOPK_PAD], valid_shape=[active_tokens, TOPK])
+            packed_weights = pl.tile.load(weights_pad, [0, 0], [T, TOPK_PAD], valid_shape=[active_tokens, TOPK])
+            pl.tile.store(packed_indices, [0, 0], indices, shapes=[active_tokens, TOPK])
+            pl.tile.store(packed_weights, [0, 0], weights, shapes=[active_tokens, TOPK])
     return x_norm_i8, x_norm_scale, indices, weights
 
 
@@ -420,9 +380,31 @@ def gate_active_rows(num_tokens):
     return min(T, ((active_count + GATE_M_TILE - 1) // GATE_M_TILE) * GATE_M_TILE)
 
 
+def gate_compare_fn(num_tokens):
+    """Compare routing outputs over active rows and quant over computed rows."""
+    from golden import ratio_allclose, topk_pair_compare
+
+    active_tokens = max(0, min(T, int(num_tokens)))
+    compare_indices = topk_pair_compare("weights")
+
+    def compare_active_indices(actual, expected, **kwargs):
+        actual_outputs = dict(kwargs["actual_outputs"])
+        actual_outputs["weights"] = actual_outputs["weights"][:active_tokens]
+        kwargs["actual_outputs"] = actual_outputs
+        return compare_indices(actual[:active_tokens], expected[:active_tokens], **kwargs)
+
+    return {
+        "x_norm_i8": ratio_allclose(atol=1, rtol=0, max_error_ratio=0.001,
+                                     valid_rows=gate_active_rows(num_tokens)),
+        "x_norm_scale": ratio_allclose(max_error_ratio=0, valid_rows=active_tokens),
+        "indices": compare_active_indices,
+        "weights": ratio_allclose(max_error_ratio=0, valid_rows=active_tokens),
+    }
+
+
 if __name__ == "__main__":
     import argparse
-    from golden import ratio_allclose, run_jit, topk_pair_compare
+    from golden import run_jit
 
     parser = argparse.ArgumentParser()
     parser.add_argument("-p", "--platform", type=str, default="a2a3",
@@ -448,11 +430,7 @@ if __name__ == "__main__":
         ),
         rtol=1e-3,
         atol=1e-3,
-        compare_fn={
-            "x_norm_i8": ratio_allclose(atol=1, rtol=0, max_error_ratio=0.001,
-                                        valid_rows=gate_active_rows(args.num_tokens)),
-            "indices": topk_pair_compare("weights"),
-        },
+        compare_fn=gate_compare_fn(args.num_tokens),
     )
     if not result.passed:
         if result.error:

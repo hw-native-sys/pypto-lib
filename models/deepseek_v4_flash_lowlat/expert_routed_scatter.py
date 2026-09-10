@@ -43,13 +43,19 @@ through a BF16 ``recv_y``, and the TOPK sum reassociates run to run because
 atomic-add order across cores is not fixed. Both were accepted deliberately.
 """
 
-
-
 import pypto.language as pl
 
-from config import (INT8_SCALE_MAX, INT8_AMAX_EPS)
+from config import INT8_SCALE_MAX, INT8_AMAX_EPS
 from expert_routed import (
-    D, IDX_PAD, MOE_INTER, N_EXPERTS, N_SLOTS, RECV_MAX, RECV_TILE, SWIGLU_LIMIT, T,
+    D,
+    IDX_PAD,
+    MOE_INTER,
+    N_EXPERTS,
+    N_SLOTS,
+    RECV_MAX,
+    RECV_TILE,
+    SWIGLU_LIMIT,
+    T,
     build_tensor_specs,
 )
 
@@ -131,9 +137,11 @@ def expert_routed_scatter(
                     n_live = n_live + 1
 
         with pl.spmd(
-            NUM_CORES, name_hint="exp_routed_scatter", allow_early_resolve=True,
+            NUM_CORES,
+            name_hint="exp_routed_scatter",
+            allow_early_resolve=True,
             deps=[plan_tid],
-        ) as _routed_tid:  # inline form requires the TaskId capture
+        ):
             core = pl.tile.get_block_idx()  # 0 .. NUM_CORES-1
 
             for w in pl.range(core, N_SLOTS, NUM_CORES):
@@ -150,25 +158,41 @@ def expert_routed_scatter(
                     flat_t0 = slot_base + t0
                     valid_rows = pl.min(RECV_TILE, n_rows - t0)
 
-                    x_k0 = pl.slice(recv_x_flat, [RECV_TILE, FUSED_K_TILE], [flat_t0, 0],
-                                    valid_shape=[valid_rows, FUSED_K_TILE])
+                    x_k0 = pl.slice(
+                        recv_x_flat,
+                        [RECV_TILE, FUSED_K_TILE],
+                        [flat_t0, 0],
+                        valid_shape=[valid_rows, FUSED_K_TILE],
+                    )
                     w1_k0 = w1_2d[e_w1 : e_w1 + FUSED_N_TILE, 0:FUSED_K_TILE]
                     gate_acc = pl.matmul(x_k0, w1_k0, b_trans=True, out_dtype=pl.INT32)
                     for kb in pl.pipeline(1, D // FUSED_K_TILE, stage=2):
                         k0 = kb * FUSED_K_TILE
-                        x_k = pl.slice(recv_x_flat, [RECV_TILE, FUSED_K_TILE], [flat_t0, k0],
-                                       valid_shape=[valid_rows, FUSED_K_TILE])
+                        x_k = pl.slice(
+                            recv_x_flat,
+                            [RECV_TILE, FUSED_K_TILE],
+                            [flat_t0, k0],
+                            valid_shape=[valid_rows, FUSED_K_TILE],
+                        )
                         w1_k = w1_2d[e_w1 : e_w1 + FUSED_N_TILE, k0 : k0 + FUSED_K_TILE]
                         gate_acc = pl.matmul_acc(gate_acc, x_k, w1_k, b_trans=True)
 
-                    x_u0 = pl.slice(recv_x_flat, [RECV_TILE, FUSED_K_TILE], [flat_t0, 0],
-                                    valid_shape=[valid_rows, FUSED_K_TILE])
+                    x_u0 = pl.slice(
+                        recv_x_flat,
+                        [RECV_TILE, FUSED_K_TILE],
+                        [flat_t0, 0],
+                        valid_shape=[valid_rows, FUSED_K_TILE],
+                    )
                     w3_k0 = w3_2d[e_w1 : e_w1 + FUSED_N_TILE, 0:FUSED_K_TILE]
                     up_acc = pl.matmul(x_u0, w3_k0, b_trans=True, out_dtype=pl.INT32)
                     for ukb in pl.pipeline(1, D // FUSED_K_TILE, stage=2):
                         uk0 = ukb * FUSED_K_TILE
-                        x_u = pl.slice(recv_x_flat, [RECV_TILE, FUSED_K_TILE], [flat_t0, uk0],
-                                       valid_shape=[valid_rows, FUSED_K_TILE])
+                        x_u = pl.slice(
+                            recv_x_flat,
+                            [RECV_TILE, FUSED_K_TILE],
+                            [flat_t0, uk0],
+                            valid_shape=[valid_rows, FUSED_K_TILE],
+                        )
                         w3_k = w3_2d[e_w1 : e_w1 + FUSED_N_TILE, uk0 : uk0 + FUSED_K_TILE]
                         up_acc = pl.matmul_acc(up_acc, x_u, w3_k, b_trans=True)
 
@@ -189,8 +213,8 @@ def expert_routed_scatter(
                         gate_sh = pl.aiv_shard(gate_acc)
                         up_sh = pl.aiv_shard(up_acc)
                         x_sc = pl.reshape(
-                            recv_scale_dq[s : s + 1, lane_r0 : lane_r0 + ROW_HALF],
-                            [ROW_HALF, 1])
+                            recv_scale_dq[s : s + 1, lane_r0 : lane_r0 + ROW_HALF], [ROW_HALF, 1]
+                        )
                         gate_f = pl.cast(gate_sh, target_type=pl.FP32, mode="none")
                         up_f = pl.cast(up_sh, target_type=pl.FP32, mode="none")
                         gate_f = pl.col_expand_mul(pl.row_expand_mul(gate_f, x_sc), w1_sc)
@@ -213,9 +237,7 @@ def expert_routed_scatter(
                             pl.full([1, ROW_HALF], dtype=pl.FP32, value=INT8_AMAX_EPS),
                             pl.reshape(pl.row_max(h_abs), [1, ROW_HALF]),
                         )
-                        sq_row = pl.div(
-                            pl.full([1, ROW_HALF], dtype=pl.FP32, value=INT8_SCALE_MAX), h_amax
-                        )
+                        sq_row = pl.div(pl.full([1, ROW_HALF], dtype=pl.FP32, value=INT8_SCALE_MAX), h_amax)
                         h_scale_dq = pl.reshape(pl.recip(sq_row), [ROW_HALF, 1])
                         sq_col = pl.reshape(sq_row, [ROW_HALF, 1])
                         q_scaled = pl.row_expand_mul(h_f32, sq_col)
@@ -224,8 +246,8 @@ def expert_routed_scatter(
                         h_i8 = pl.cast(q_f16, target_type=pl.INT8, mode="trunc")
 
                         w_col = pl.reshape(
-                            recv_weights[s : s + 1, lane_r0 : lane_r0 + ROW_HALF],
-                            [ROW_HALF, 1])
+                            recv_weights[s : s + 1, lane_r0 : lane_r0 + ROW_HALF], [ROW_HALF, 1]
+                        )
                         row_scale = pl.mul(h_scale_dq, w_col)
 
                         # V->C: the two lanes' row bands are stitched back into one
@@ -252,10 +274,11 @@ def expert_routed_scatter(
                             # an on-chip tile is not expressible, a static one is.
                             for r in pl.unroll(ROW_HALF):
                                 if r < y_valid:
-                                    dst = pl.cast(
-                                        pl.read(plan_row_token, [s, y_r0 + r]), pl.INDEX)
+                                    dst = pl.cast(pl.read(plan_row_token, [s, y_r0 + r]), pl.INDEX)
                                     ffn_partial = pl.assemble(
-                                        ffn_partial, y_f[r : r + 1, :], [dst, d0],
+                                        ffn_partial,
+                                        y_f[r : r + 1, :],
+                                        [dst, d0],
                                         atomic=pl.AtomicType.Add,
                                     )
 
@@ -281,10 +304,19 @@ def expert_routed_scatter_test(
     ffn_partial: pl.InOut[pl.Tensor[[T, D], pl.FP32]],
 ):
     expert_routed_scatter(
-        recv_x, recv_scale_dq, recv_weights, recv_expert_count, slot_expert,
-        routed_w1, routed_w1_scale, routed_w3, routed_w3_scale,
-        routed_w2, routed_w2_scale,
-        plan_row_token, ffn_partial,
+        recv_x,
+        recv_scale_dq,
+        recv_weights,
+        recv_expert_count,
+        slot_expert,
+        routed_w1,
+        routed_w1_scale,
+        routed_w3,
+        routed_w3_scale,
+        routed_w2,
+        routed_w2_scale,
+        plan_row_token,
+        ffn_partial,
     )
     return ffn_partial
 
@@ -299,10 +331,10 @@ def build_tensor_specs_scatter():
 
     specs = [s for s in build_tensor_specs() if s.name != "recv_y"]
     row_token = torch.arange(RECV_MAX, dtype=torch.int32).repeat(N_SLOTS, 1)
-    specs.append(TensorSpec("plan_row_token", [N_SLOTS, RECV_MAX], torch.int32,
-                            init_value=lambda: row_token))
-    specs.append(TensorSpec("ffn_partial", [T, D], torch.float32, is_output=True,
-                            init_value=lambda: torch.zeros(T, D)))
+    specs.append(TensorSpec("plan_row_token", [N_SLOTS, RECV_MAX], torch.int32, init_value=lambda: row_token))
+    specs.append(
+        TensorSpec("ffn_partial", [T, D], torch.float32, is_output=True, init_value=lambda: torch.zeros(T, D))
+    )
     return specs
 
 
@@ -353,15 +385,26 @@ if __name__ == "__main__":
     from golden import ratio_reldiff, run_jit
 
     parser = argparse.ArgumentParser()
-    parser.add_argument("-p", "--platform", type=str, default="a2a3",
-                        choices=["a2a3", "a2a3sim", "a5", "a5sim"])
+    parser.add_argument(
+        "-p", "--platform", type=str, default="a2a3", choices=["a2a3", "a2a3sim", "a5", "a5sim"]
+    )
     parser.add_argument("-d", "--device", type=int, default=0)
-    parser.add_argument("--tp", type=int, default=TP, choices=[1, 2, 4, 8], help="tensor-parallel degree; config freezes it at import")
+    parser.add_argument(
+        "--tp",
+        type=int,
+        default=TP,
+        choices=[1, 2, 4, 8],
+        help="tensor-parallel degree; config freezes it at import",
+    )
     parser.add_argument("--compile-only", action="store_true", default=False)
     parser.add_argument("--save-data", action="store_true", default=False)
-    parser.add_argument("--golden-data", type=str, default=None,
-                        help="dir with cached in/{name}.pt + out/{name}.pt; reuses them "
-                             "instead of regenerating inputs + recomputing golden.")
+    parser.add_argument(
+        "--golden-data",
+        type=str,
+        default=None,
+        help="dir with cached in/{name}.pt + out/{name}.pt; reuses them "
+        "instead of regenerating inputs + recomputing golden.",
+    )
     parser.add_argument("--enable-chip-swimlane", type=int, nargs="?", const=4, default=0, choices=range(5))
     parser.add_argument("--dump-passes", action="store_true", default=False)
     args = parser.parse_args()

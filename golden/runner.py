@@ -127,7 +127,7 @@ _DFX_FLAG_KEYS = (
 def _execute_compiled_kwargs(runtime: dict[str, Any]) -> dict[str, Any]:
     """Translate user-facing ``runtime_cfg`` into ``execute_compiled`` kwargs.
 
-    The five DFX flags get bundled into a single ``dfx: _DfxOpts``; all other
+    The five DFX flags get bundled into a single ``dfx: DfxOptions``; all other
     keys pass through unfiltered, so ``execute_compiled`` raises ``TypeError``
     on unknown keys rather than us silently dropping them.
     """
@@ -135,14 +135,14 @@ def _execute_compiled_kwargs(runtime: dict[str, Any]) -> dict[str, Any]:
     dfx_flags = {k: runtime[k] for k in _DFX_FLAG_KEYS if runtime.get(k)}
     if dfx_flags:
         try:
-            from pypto.runtime.runner import _DfxOpts
+            from pypto.runtime.runner import DfxOptions
         except ImportError as exc:
             raise ValueError(
                 "This pypto runtime does not support execute_compiled DFX flags: "
                 f"{sorted(dfx_flags)}"
             ) from exc
 
-        out["dfx"] = _DfxOpts(**dfx_flags)
+        out["dfx"] = DfxOptions(**dfx_flags)
     return out
 
 

@@ -225,16 +225,6 @@ typedef struct { unsigned char v; } float4_e2m1x2_t;
 #include <pto/pto-inst.hpp>
 #include <pto/common/constants.hpp>
 
-#if !defined(__CCE_AICORE__) && !defined(TMRGSORT_HPP)
-namespace pto {
-struct MrgSortExecutedNumList {
-    uint16_t mrgSortList0;
-    uint16_t mrgSortList1;
-    uint16_t mrgSortList2;
-    uint16_t mrgSortList3;
-};
-} // namespace pto
-#endif
 #ifndef __CPU_SIM
 #include "acl/acl.h"
 #endif

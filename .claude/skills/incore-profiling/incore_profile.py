@@ -33,6 +33,7 @@ import datetime as _dt
 import os
 import re
 import shutil
+import signal
 import subprocess
 import sys
 import tempfile
@@ -182,15 +183,18 @@ def source_env(set_env: str | Path | None, base_env: dict[str, str]) -> dict[str
     set_env_path = repo_path(set_env)
     if not set_env_path.is_file():
         raise StepError(f"CANN set_env.sh not found: {set_env_path}")
-    cmd = f"source {sh_quote(str(set_env_path))} >/dev/null && env -0"
     cp = subprocess.run(
-        ["bash", "-lc", cmd],
+        [
+            "bash", "--noprofile", "--norc", "-c",
+            'source "$1" >/dev/null && env -0', "bash", str(set_env_path),
+        ],
+        env=base_env,
         capture_output=True,
         check=False,
     )
     if cp.returncode != 0:
         raise StepError(cp.stderr.decode("utf-8", errors="replace"))
-    env = base_env.copy()
+    env: dict[str, str] = {}
     for item in cp.stdout.split(b"\0"):
         if not item or b"=" not in item:
             continue
@@ -213,17 +217,34 @@ def run_cmd(
     check: bool = True,
 ) -> subprocess.CompletedProcess[str]:
     text = "$ " + " ".join(sh_quote(c) if " " in c else c for c in cmd) + "\n"
-    cp = subprocess.run(
+    proc = subprocess.Popen(
         cmd,
         cwd=str(cwd) if cwd else None,
         env=env,
         text=True,
         stdout=subprocess.PIPE,
         stderr=subprocess.STDOUT,
-        timeout=timeout,
-        check=False,
+        start_new_session=True,
     )
-    text += cp.stdout
+    timed_out = False
+    try:
+        stdout, _ = proc.communicate(timeout=timeout)
+    except subprocess.TimeoutExpired:
+        timed_out = True
+        # msprof launches a worker and an application. Killing only the launcher
+        # leaves the simulator running and can keep its output pipe open.
+        try:
+            os.killpg(proc.pid, signal.SIGKILL)
+        except ProcessLookupError:
+            pass
+        stdout, _ = proc.communicate()
+    # A launcher may already have exited zero while a child holds stdout open.
+    # An expired deadline is still a failure in that case.
+    returncode = -signal.SIGKILL if timed_out else proc.returncode
+    cp = subprocess.CompletedProcess(cmd, returncode, stdout)
+    text += stdout
+    if timed_out:
+        text += f"\n[timeout after {timeout} seconds; process group terminated]\n"
     text += f"\n[exit {cp.returncode}]\n"
     if log_path:
         private_dir(log_path.parent)
@@ -358,6 +379,64 @@ def make_ld_library_path(build_dir: Path, env: dict[str, str], soc_version: str)
     if old:
         parts.append(old)
     return ":".join(parts)
+
+
+def make_simulator_env(build_dir: Path, env: dict[str, str], soc_version: str) -> dict[str, str]:
+    """Resolve transitive runtime dependencies to this simulator's camodel.
+
+    CANN 9's libascend_dump depends on libruntime.so and registers a callback
+    from its constructor. Loading both the device runtime and runtime_camodel
+    can interpose that callback before the camodel's globals are initialized.
+    A local alias makes the loader initialize the same runtime dependency first.
+    It affects only the simulator subprocess, never the installed toolkit.
+    """
+    ascend_home = Path(env.get("ASCEND_HOME_PATH", ""))
+    candidates = [
+        ascend_home / triplet / "simulator" / soc_version / "lib" / "libruntime_camodel.so"
+        for triplet in detect_host_triplets(ascend_home)
+    ]
+    candidates += [
+        ascend_home / prefix / soc_version / "lib" / "libruntime_camodel.so"
+        for prefix in ("simulator", "tools/simulator")
+    ]
+    camodel = next((p.resolve() for p in candidates if p.is_file()), None)
+    if camodel is None:
+        raise StepError(f"no libruntime_camodel.so found for {soc_version} under {ascend_home}")
+    alias_dir = build_dir / "camodel_runtime"
+    private_dir(alias_dir)
+    alias = alias_dir / "libruntime.so"
+    if alias.is_symlink():
+        if alias.resolve() != camodel:
+            raise StepError(f"simulator runtime alias points at another toolkit: {alias}")
+    elif alias.exists():
+        raise StepError(f"refusing to replace existing simulator runtime file: {alias}")
+    else:
+        alias.symlink_to(camodel)
+    sim_env = env.copy()
+    sim_env["LD_LIBRARY_PATH"] = str(alias_dir) + ":" + make_ld_library_path(
+        build_dir, env, soc_version
+    )
+    return sim_env
+
+
+def simulator_timeout_minutes(seconds: int) -> int:
+    """msprof accepts whole minutes; the public wrapper accepts seconds."""
+    return (seconds + 59) // 60
+
+
+def profiler_failed(output: str) -> bool:
+    """The launcher can print success and return zero after a child failure."""
+    child_statuses = re.findall(r"Child process exited with status\s+(-?\d+)", output)
+    if any(int(status) != 0 for status in child_statuses):
+        return True
+    return any(marker in output for marker in (
+        "The timeout has reached",
+        "The process is manually stopped",
+        "Instr info list is empty",
+        "std::bad_alloc",
+        "Running task failed",
+        "May cause generating performance files to fail",
+    ))
 
 
 def resolve_symbol(kernel_lib: Path, preferred_names: list[str]) -> tuple[str, str]:
@@ -604,8 +683,9 @@ def export_one(
         log(f"[{index:02d}/{total:02d}] golden {func}")
         run_golden(case_dir, env, logs_dir / "golden.log", args.step_timeout)
 
-        sim_env = env.copy()
-        sim_env["LD_LIBRARY_PATH"] = make_ld_library_path(build_dir, sim_env, args.soc_version)
+        sim_env = make_simulator_env(build_dir, env, args.soc_version)
+        timeout_minutes = simulator_timeout_minutes(args.msprof_timeout)
+        collection_timeout = timeout_minutes * 60 + 120
 
         log(f"[{index:02d}/{total:02d}] collect {func}")
         collect_cmd = [
@@ -616,7 +696,7 @@ def export_one(
             f"--kernel-name={symbol}",
             f"--launch-count={args.launch_count}",
             f"--soc-version={args.soc_version}",
-            f"--timeout={args.msprof_timeout}",
+            f"--timeout={timeout_minutes}",
             f"--output={collect_dir / 'out'}",
         ]
         cp = run_cmd(
@@ -624,10 +704,10 @@ def export_one(
             cwd=case_dir,
             env=sim_env,
             log_path=collect_dir / "collect.log",
-            timeout=args.msprof_timeout + 120,
+            timeout=collection_timeout,
             check=False,
         )
-        if cp.returncode != 0 or SUCCESS_TEXT not in cp.stdout:
+        if cp.returncode != 0 or SUCCESS_TEXT not in cp.stdout or profiler_failed(cp.stdout):
             tail = cp.stdout[-800:].replace("\n", " ")
             return finish("collect_failed", f"rc={cp.returncode}; tail={tail}")
 
@@ -664,12 +744,15 @@ def export_one(
             cwd=case_dir,
             env=sim_env,
             log_path=export_dir / "export.log",
-            timeout=args.msprof_timeout + 120,
+            timeout=collection_timeout,
             check=False,
         )
         artifacts = collect_artifacts(export_dir)
         result.update(artifacts)
-        if cp2.returncode == 0 and artifacts["trace_json"] and artifacts["visualize_data_bin"]:
+        if (
+            cp2.returncode == 0 and not profiler_failed(cp2.stdout)
+            and artifacts["trace_json"] and artifacts["visualize_data_bin"]
+        ):
             warn = detect_degenerate_trace(export_dir)
             log(
                 f"[{index:02d}/{total:02d}] {'WARN' if warn else 'OK'} {func}: "
@@ -794,7 +877,8 @@ def parse_args(argv: list[str]) -> tuple[argparse.Namespace, list[str]]:
     prof_group = parser.add_argument_group("profiling")
     prof_group.add_argument("--launch-count", type=int, default=1, help="msprof --launch-count")
     prof_group.add_argument(
-        "--msprof-timeout", type=int, default=180, help="msprof simulator timeout seconds"
+        "--msprof-timeout", type=int, default=180,
+        help="simulator budget in seconds, rounded up to whole minutes; export gets 120 extra seconds"
     )
     prof_group.add_argument(
         "--step-timeout", type=int, default=300, help="timeout for testcase generation/cmake/golden"
@@ -818,6 +902,8 @@ def parse_args(argv: list[str]) -> tuple[argparse.Namespace, list[str]]:
     args.generate_testcase = resolve_generate_testcase(args.ptoas_root)
     if args.dynamic_dim <= 0:
         parser.error("--dynamic-dim must be greater than zero")
+    if not 1 <= args.msprof_timeout <= 2880 * 60:
+        parser.error("--msprof-timeout must be between 1 and 172800 seconds")
     return args, case_args
 
 

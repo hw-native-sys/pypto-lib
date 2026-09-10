@@ -1592,8 +1592,13 @@ class TestConfigForwarding:
         assert captured["device_id"] == 3
         assert captured["pto_isa_commit"] == "deadbeef"
 
-    def test_dump_args_forwarded_as_dfx_option(self, three_kinds_specs, tmp_path):
-        """enable_dump_args is bundled into the execute_compiled DFX options."""
+    @pytest.mark.parametrize("dfx_flags", [
+        {"enable_dump_args": 2},
+        {"enable_chip_swimlane": 4},
+        {"enable_chip_swimlane": 4, "enable_pmu": 2},
+    ])
+    def test_runtime_flags_forwarded_as_public_dfx_options(self, three_kinds_specs, tmp_path, dfx_flags):
+        """DFX levels survive translation through the public runtime options."""
         compiled_dir = tmp_path / "build"
         compiled_dir.mkdir()
 
@@ -1601,7 +1606,7 @@ class TestConfigForwarding:
         dfx = object()
         dfx_opts = MagicMock(return_value=dfx)
         runner_mod = types.ModuleType("pypto.runtime.runner")
-        runner_mod._DfxOpts = dfx_opts
+        runner_mod.DfxOptions = dfx_opts
 
         def fake_execute(_work_dir, _tensors, **kwargs):
             captured.update(kwargs)
@@ -1615,13 +1620,13 @@ class TestConfigForwarding:
             r = run(
                 program=object(),
                 specs=three_kinds_specs,
-                runtime_cfg=dict(enable_dump_args=2),
+                runtime_cfg=dfx_flags,
             )
 
         assert r.passed, f"unexpected failure: {r.error}"
-        dfx_opts.assert_called_once_with(enable_dump_args=2)
+        dfx_opts.assert_called_once_with(**dfx_flags)
         assert captured["dfx"] is dfx
-        assert "enable_dump_args" not in captured
+        assert not captured.keys() & dfx_flags.keys()
 
 
 def _set_mtime(path: Path, mtime: float) -> None:

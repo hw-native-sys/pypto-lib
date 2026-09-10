@@ -191,7 +191,7 @@ def expert_routed_persistent(
 
         with pl.spmd(
             NUM_CORES, name_hint="exp_p3_down_act", allow_early_resolve=True, deps=[p2_tid]
-        ) as _p3_tid:
+        ):
             d_core = pl.tile.get_block_idx()
 
             for ds in pl.range(d_core, N_SLOTS, NUM_CORES):

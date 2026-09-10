@@ -14,10 +14,9 @@ arrive already grouped: slot ``i`` holds the rows routed to expert
 ``slot_expert[i]``, and inactive slots carry a zero count.
 """
 
-
 import pypto.language as pl
 
-from config import (FLASH as M, DECODE_BATCH, DECODE_SEQ, TP, INT8_SCALE_MAX, INT8_AMAX_EPS)
+from config import FLASH as M, DECODE_BATCH, DECODE_SEQ, TP, INT8_SCALE_MAX, INT8_AMAX_EPS
 
 
 # model config
@@ -49,8 +48,7 @@ N_BANK = N_EXPERTS + 1
 SH_SLOT = N_SLOTS
 N_SLOTS_B = N_SLOTS + 1
 # The shared slot carries every active token in ONE row tile.
-assert T <= RECV_MAX, \
-    f"the shared-expert slot holds all {T} tokens in one tile of {RECV_MAX} rows"
+assert T <= RECV_MAX, f"the shared-expert slot holds all {T} tokens in one tile of {RECV_MAX} rows"
 
 # tiling
 K_TILE = 512
@@ -101,9 +99,7 @@ def expert_routed(
         # The full INT32 gate/up tensors would occupy 512 MiB at EP8; h_i8 and its
         # per-row dequant scale occupy about 64 MiB instead.
         h_i8 = pl.create_tensor([N_SLOTS * RECV_MAX, MOE_INTER], dtype=pl.INT8)
-        h_scale_dq = pl.create_tensor(
-            [N_SLOTS * RECV_MAX, 1], dtype=pl.FP32, manual_dep=True
-        )
+        h_scale_dq = pl.create_tensor([N_SLOTS * RECV_MAX, 1], dtype=pl.FP32, manual_dep=True)
         # Slot-major so a grouped quantize block can address its own rows.
         # manual_dep: the pool's only real edge is gate_up -> h_q, restated below
         # per slot group, so the scheduler skips creator retention and the
@@ -111,15 +107,9 @@ def expert_routed(
         # Split variant: the cube task writes INT32 gate/up here so it stays
         # AIC-only instead of reserving its two paired AIV cores for the whole
         # matmul. 1.5 MiB at the decode shape; scales with N_SLOTS*RECV_MAX.
-        gate_i32 = pl.create_tensor(
-            [N_SLOTS * RECV_MAX, MOE_INTER], dtype=pl.INT32, manual_dep=True
-        )
-        up_i32 = pl.create_tensor(
-            [N_SLOTS * RECV_MAX, MOE_INTER], dtype=pl.INT32, manual_dep=True
-        )
-        h_fp32 = pl.create_tensor(
-            [N_SLOTS * RECV_MAX, MOE_INTER], dtype=pl.FP32, manual_dep=True
-        )
+        gate_i32 = pl.create_tensor([N_SLOTS * RECV_MAX, MOE_INTER], dtype=pl.INT32, manual_dep=True)
+        up_i32 = pl.create_tensor([N_SLOTS * RECV_MAX, MOE_INTER], dtype=pl.INT32, manual_dep=True)
+        h_fp32 = pl.create_tensor([N_SLOTS * RECV_MAX, MOE_INTER], dtype=pl.FP32, manual_dep=True)
         gate_up_tids = pl.array.create(N_SLOTS, pl.TASK_ID)
 
         for local_i in pl.parallel(N_SLOTS):
@@ -137,9 +127,7 @@ def expert_routed(
                 # Cube only: gate and up share the x tile and the K loop, so one
                 # spmd covers both. The SwiGLU epilogue is a separate AIV task, so
                 # this one never reserves the paired vector cores.
-                with pl.spmd(
-                    MOE_INTER // MM_INTER_TILE, name_hint="exp_gate_up_mm"
-                ) as gate_up_tid:
+                with pl.spmd(MOE_INTER // MM_INTER_TILE, name_hint="exp_gate_up_mm") as gate_up_tid:
                     nb_idx = pl.tile.get_block_idx()
                     n0 = nb_idx * MM_INTER_TILE
 
@@ -169,10 +157,12 @@ def expert_routed(
                         else:
                             up_acc = pl.matmul_acc(up_acc, x_u, w3_k, b_trans=True)
 
-                    gate_i32[flat_t0 : flat_t0 + RECV_TILE, n0 : n0 + MM_INTER_TILE] = \
-                        pl.reshape(gate_acc, [RECV_TILE, MM_INTER_TILE])
-                    up_i32[flat_t0 : flat_t0 + RECV_TILE, n0 : n0 + MM_INTER_TILE] = \
-                        pl.reshape(up_acc, [RECV_TILE, MM_INTER_TILE])
+                    gate_i32[flat_t0 : flat_t0 + RECV_TILE, n0 : n0 + MM_INTER_TILE] = pl.reshape(
+                        gate_acc, [RECV_TILE, MM_INTER_TILE]
+                    )
+                    up_i32[flat_t0 : flat_t0 + RECV_TILE, n0 : n0 + MM_INTER_TILE] = pl.reshape(
+                        up_acc, [RECV_TILE, MM_INTER_TILE]
+                    )
                 gate_up_tids[local_i] = gate_up_tid
 
         # AIV -> AIV with no other consumer: the SwiGLU epilogue and the
@@ -183,7 +173,7 @@ def expert_routed(
                 SLOT_GROUP,
                 name_hint="exp_act_h_q",
                 deps=[gate_up_tids[ga * SLOT_GROUP + s_] for s_ in range(SLOT_GROUP)],
-            ) as _act_h_q_tid:
+            ):
                 a_sub = pl.tile.get_block_idx()
                 a_slot = ga * SLOT_GROUP + a_sub
                 flat_a0 = a_slot * RECV_MAX
@@ -191,9 +181,7 @@ def expert_routed(
                 a_rows = pl.read(recv_expert_count, [a_slot, 0])
                 for _a in pl.range((a_rows + RECV_TILE - 1) // RECV_TILE):
                     a_valid = pl.min(RECV_TILE, a_rows)
-                    a_scale = pl.reshape(
-                        recv_scale_dq[a_slot : a_slot + 1, 0:RECV_TILE], [RECV_TILE, 1]
-                    )
+                    a_scale = pl.reshape(recv_scale_dq[a_slot : a_slot + 1, 0:RECV_TILE], [RECV_TILE, 1])
                     eh_amax = pl.full([1, RECV_TILE], dtype=pl.FP32, value=INT8_AMAX_EPS)
                     for ag in pl.pipeline(MOE_INTER // ACT_INTER_TILE, stage=2):
                         a0 = ag * ACT_INTER_TILE
@@ -217,15 +205,15 @@ def expert_routed(
                             eh_amax,
                             pl.reshape(pl.row_max(pl.maximum(gd_pad, pl.neg(gd_pad))), [1, RECV_TILE]),
                         )
-                    eh_sq_row = pl.div(
-                        pl.full([1, RECV_TILE], dtype=pl.FP32, value=INT8_SCALE_MAX), eh_amax
-                    )
+                    eh_sq_row = pl.div(pl.full([1, RECV_TILE], dtype=pl.FP32, value=INT8_SCALE_MAX), eh_amax)
                     h_scale_dq[flat_a0 : flat_a0 + RECV_TILE, 0:1] = pl.reshape(
                         pl.recip(eh_sq_row), [RECV_TILE, 1]
                     )
                     eh_sq_col = pl.reshape(eh_sq_row, [RECV_TILE, 1])
                     for k1 in pl.pipeline(0, MOE_INTER, QUANT_TILE, stage=2):
-                        eh_q_scaled = pl.row_expand_mul(h_fp32[flat_a0 : flat_a0 + RECV_TILE, k1 : k1 + QUANT_TILE], eh_sq_col)
+                        eh_q_scaled = pl.row_expand_mul(
+                            h_fp32[flat_a0 : flat_a0 + RECV_TILE, k1 : k1 + QUANT_TILE], eh_sq_col
+                        )
                         eh_q_i32 = pl.cast(eh_q_scaled, target_type=pl.INT32, mode="rint")
                         eh_q_half = pl.cast(eh_q_i32, target_type=pl.FP16, mode="round")
                         h_i8[flat_a0 : flat_a0 + RECV_TILE, k1 : k1 + QUANT_TILE] = pl.cast(
@@ -233,9 +221,7 @@ def expert_routed(
                         )
 
         with pl.scope():
-            y_i32 = pl.create_tensor(
-                [N_SLOTS * RECV_MAX, D], dtype=pl.INT32, manual_dep=True
-            )
+            y_i32 = pl.create_tensor([N_SLOTS * RECV_MAX, D], dtype=pl.INT32, manual_dep=True)
             w2_mm_tids = pl.array.create(N_SLOTS, pl.TASK_ID)
 
             for local_e in pl.parallel(N_SLOTS):
@@ -263,7 +249,9 @@ def expert_routed(
                             y_acc = pl.create_tensor([1, RECV_TILE, D_OUT_TILE], dtype=pl.INT32)
                             for k0 in pl.pipeline(0, MOE_INTER, INTER_K, stage=2):
                                 h_k = h_tile_i8[:, k0 : k0 + INTER_K]
-                                w2_k = routed_w2[expert_e : expert_e + 1, d0 : d0 + D_OUT_TILE, k0 : k0 + INTER_K]
+                                w2_k = routed_w2[
+                                    expert_e : expert_e + 1, d0 : d0 + D_OUT_TILE, k0 : k0 + INTER_K
+                                ]
                                 if k0 == 0:
                                     y_acc = pl.matmul(h_k, w2_k, b_trans=True, out_dtype=pl.INT32)
                                 else:
@@ -278,7 +266,7 @@ def expert_routed(
                     name_hint="exp_w2_act",
                     allow_early_resolve=True,
                     deps=[w2_mm_tids[ga * SLOT_GROUP + s] for s in range(SLOT_GROUP)],
-                ) as _w2_act_tid:
+                ):
                     act_blk = pl.tile.get_block_idx()
                     act_sub = act_blk // (D // (W2_ACT_INNER * D_OUT_TILE_ACT))
                     db_idx = act_blk % (D // (W2_ACT_INNER * D_OUT_TILE_ACT))
@@ -289,21 +277,23 @@ def expert_routed(
                         expert_a = pl.cast(pl.read(slot_expert, [act_slot, 0]), pl.INDEX)
                         act_d_base = db_idx * (W2_ACT_INNER * D_OUT_TILE_ACT)
                         w_col_blk = pl.reshape(
-                            recv_weights[act_slot : act_slot + 1, 0 : RECV_TILE],
+                            recv_weights[act_slot : act_slot + 1, 0:RECV_TILE],
                             [RECV_TILE, 1],
                         )
-                        row_scale_blk = pl.mul(
-                            h_scale_dq[flat_at0 : flat_at0 + RECV_TILE, 0:1], w_col_blk
-                        )
+                        row_scale_blk = pl.mul(h_scale_dq[flat_at0 : flat_at0 + RECV_TILE, 0:1], w_col_blk)
                         for dg in pl.pipeline(W2_ACT_INNER, stage=2):
                             act_d0 = act_d_base + dg * D_OUT_TILE_ACT
-                            y_2d_i32 = y_i32[flat_at0 : flat_at0 + RECV_TILE, act_d0 : act_d0 + D_OUT_TILE_ACT]
-                            w2_scale_chunk = routed_w2_scale[expert_a : expert_a + 1, act_d0 : act_d0 + D_OUT_TILE_ACT]
+                            y_2d_i32 = y_i32[
+                                flat_at0 : flat_at0 + RECV_TILE, act_d0 : act_d0 + D_OUT_TILE_ACT
+                            ]
+                            w2_scale_chunk = routed_w2_scale[
+                                expert_a : expert_a + 1, act_d0 : act_d0 + D_OUT_TILE_ACT
+                            ]
                             y_2d = pl.cast(y_2d_i32, target_type=pl.FP32, mode="none")
                             y_2d = pl.col_expand_mul(pl.row_expand_mul(y_2d, row_scale_blk), w2_scale_chunk)
-                            recv_y_flat[
-                                flat_at0 : flat_at0 + RECV_TILE, act_d0 : act_d0 + D_OUT_TILE_ACT
-                            ] = pl.cast(y_2d, target_type=pl.BF16, mode="rint")
+                            recv_y_flat[flat_at0 : flat_at0 + RECV_TILE, act_d0 : act_d0 + D_OUT_TILE_ACT] = (
+                                pl.cast(y_2d, target_type=pl.BF16, mode="rint")
+                            )
 
     return recv_y
 
@@ -324,9 +314,17 @@ def expert_routed_test(
     recv_y: pl.Out[pl.Tensor[[N_SLOTS, RECV_MAX, D], pl.BF16]],
 ):
     expert_routed(
-        recv_x, recv_scale_dq, recv_weights, recv_expert_count, slot_expert,
-        routed_w1, routed_w1_scale, routed_w3, routed_w3_scale,
-        routed_w2, routed_w2_scale,
+        recv_x,
+        recv_scale_dq,
+        recv_weights,
+        recv_expert_count,
+        slot_expert,
+        routed_w1,
+        routed_w1_scale,
+        routed_w3,
+        routed_w3_scale,
+        routed_w2,
+        routed_w2_scale,
         recv_y,
     )
     return recv_y
@@ -400,7 +398,7 @@ def gen_routed_weight(shape, dequant_std):
     FP4_MID = torch.tensor([0.25, 0.75, 1.25, 1.75, 2.5, 3.5, 5.0])  # nearest-grid bounds
     FP4_MAX, TINY = 6.0, 1e-20
     GROUP = 32
-    CHUNK_ELEMS = 1 << 25    # elements per pass; unchunked this walks GiB-sized temporaries
+    CHUNK_ELEMS = 1 << 25  # elements per pass; unchunked this walks GiB-sized temporaries
 
     *lead, out, inn = shape
     n_lead = 1
@@ -416,17 +414,20 @@ def gen_routed_weight(shape, dequant_std):
     # (out, in) row, so the chunk boundary cannot change a result.
     step = max(1, CHUNK_ELEMS // (out * inn))
     for i0 in range(0, n_lead, step):
-        w = W[i0:i0 + step]
+        w = W[i0 : i0 + step]
         wg = w.reshape(-1, out, inn // GROUP, GROUP)
         absw = wg.abs()
-        grp_scale = torch.exp2(torch.ceil(torch.log2((absw.amax(-1, keepdim=True) / FP4_MAX).clamp_min(TINY))))
+        grp_scale = torch.exp2(
+            torch.ceil(torch.log2((absw.amax(-1, keepdim=True) / FP4_MAX).clamp_min(TINY)))
+        )
         idx = torch.bucketize(absw.div_(grp_scale), FP4_MID).clamp_max_(7)
         wq = (torch.sign(wg) * FP4_MAG[idx]).mul_(grp_scale).reshape(w.shape)
         amax = wq.abs().amax(dim=-1, keepdim=True).clamp_min(INT8_AMAX_EPS)
         chan_scale = amax / INT8_SCALE_MAX
-        w_i8[i0:i0 + step] = torch.round(wq.div_(chan_scale)).clamp_(
-            -INT8_SCALE_MAX, INT8_SCALE_MAX).to(torch.int8)
-        scale[i0:i0 + step] = chan_scale
+        w_i8[i0 : i0 + step] = (
+            torch.round(wq.div_(chan_scale)).clamp_(-INT8_SCALE_MAX, INT8_SCALE_MAX).to(torch.int8)
+        )
+        scale[i0 : i0 + step] = chan_scale
     del W
 
     scale = (scale * (dequant_std / (w_i8.float() * scale).std())).squeeze(-1).float()
@@ -502,7 +503,8 @@ def build_tensor_specs(merged=False):
     if merged:
         # The shared expert is not gated: its rows come in at weight 1.0.
         recv_weights_pre[SH_SLOT, :] = torch.where(
-            valid_mask_2d[SH_SLOT, :], torch.ones(RECV_MAX), torch.zeros(RECV_MAX))
+            valid_mask_2d[SH_SLOT, :], torch.ones(RECV_MAX), torch.zeros(RECV_MAX)
+        )
 
     def init_recv_weights():
         return recv_weights_pre
@@ -511,6 +513,7 @@ def build_tensor_specs(merged=False):
     # scatter them into the full expert bank; the rest stay zero.
     def scatter_bank(shape_tail, dequant_std, shared_dequant_std, chan_cv):
         from expert_shared import gen_shared_weight
+
         w_i8, w_s = gen_routed_weight((N_SLOTS, *shape_tail), dequant_std)
         bank_i8 = torch.zeros(n_bank, *shape_tail, dtype=torch.int8)
         bank_s = torch.zeros(n_bank, shape_tail[0], dtype=torch.float32)
@@ -548,15 +551,26 @@ if __name__ == "__main__":
     from golden import ratio_reldiff, run_jit
 
     parser = argparse.ArgumentParser()
-    parser.add_argument("-p", "--platform", type=str, default="a2a3",
-                        choices=["a2a3", "a2a3sim", "a5", "a5sim"])
+    parser.add_argument(
+        "-p", "--platform", type=str, default="a2a3", choices=["a2a3", "a2a3sim", "a5", "a5sim"]
+    )
     parser.add_argument("-d", "--device", type=int, default=0)
-    parser.add_argument("--tp", type=int, default=TP, choices=[1, 2, 4, 8], help="tensor-parallel degree; config freezes it at import")
+    parser.add_argument(
+        "--tp",
+        type=int,
+        default=TP,
+        choices=[1, 2, 4, 8],
+        help="tensor-parallel degree; config freezes it at import",
+    )
     parser.add_argument("--compile-only", action="store_true", default=False)
     parser.add_argument("--save-data", action="store_true", default=False)
-    parser.add_argument("--golden-data", type=str, default=None,
-                        help="dir with cached in/{name}.pt + out/{name}.pt; reuses them "
-                             "instead of regenerating inputs + recomputing golden.")
+    parser.add_argument(
+        "--golden-data",
+        type=str,
+        default=None,
+        help="dir with cached in/{name}.pt + out/{name}.pt; reuses them "
+        "instead of regenerating inputs + recomputing golden.",
+    )
     parser.add_argument("--enable-chip-swimlane", type=int, nargs="?", const=4, default=0, choices=range(5))
     parser.add_argument("--dump-passes", action="store_true", default=False)
     args = parser.parse_args()

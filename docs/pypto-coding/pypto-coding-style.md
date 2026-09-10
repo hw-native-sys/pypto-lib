@@ -130,8 +130,8 @@ Pick one per output:
 
 | The unwritten region is | Fix |
 |---|---|
-| padding past an active token count, and the kernel already zero-fills it (`hc_post`'s `hc_post_inactive_pad`, `gate`'s inactive-token zeroing) | nothing — keep `zero_tail=True` honest |
-| a leading prefix's tail, with the boundary a fixture constant | `ratio_allclose(..., valid_rows=N, valid_axis=A)` |
+| padding past an active token count, and the kernel already zero-fills it (`hc_post`'s `hc_post_inactive_pad`) | nothing — keep `zero_tail=True` honest |
+| a leading prefix's tail, with the boundary a fixture constant (`gate`'s routing outputs and scales) | `ratio_allclose(..., valid_rows=N, valid_axis=A)` |
 | data-dependent (slot mappings, per-request conditions) | golden fills it `float("nan")`; comparator takes `ignore_nan=True` |
 | something the test must still assert is untouched | make it `pl.InOut` with a zero `init_value`, so the host zeros reach the device |
 

@@ -94,7 +94,7 @@ def expert_routed_persistent_manual(
 
     with pl.spmd(
         NUM_CORES, name_hint="exp_routed_manual", allow_early_resolve=True
-    ) as _routed_tid:  # inline form requires the TaskId capture
+    ):
         core = pl.tile.get_block_idx()  # 0 .. NUM_CORES-1
 
         for s in pl.range(core, N_SLOTS, NUM_CORES):

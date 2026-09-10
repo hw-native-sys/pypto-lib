@@ -46,6 +46,43 @@ versions. Prefer installing the complete matching CANN package; any temporary
 copy into an existing toolkit requires the toolkit owner's approval and must
 include the worker's companion injection library.
 
+### CANN 9 simulator runtime isolation
+
+Use a profiler package that explicitly supports the selected CANN release.
+Copying an 8.5 worker into a 9.0 toolkit is not sufficient: the application can
+finish its simulated kernels while collection hangs until timeout and exports
+empty instruction data. A verified MindStudio Ops Profiler 26.1.0 package works
+with CANN 9.0.0 on Ascend910B1; install the complete profiler package, including
+its injection library and plugins. The compiler, runtime and camodel remain
+those of the selected CANN installation.
+
+The profiling workflow also creates
+`builds/<function>/camodel_runtime/libruntime.so`, a local alias to that
+installation's `libruntime_camodel.so`, and prepends it to the simulator
+subprocess's library path. This prevents transitive dependencies from loading
+the device runtime alongside the simulator runtime. In CANN 9, a constructor
+in `libascend_dump.so` registers a runtime callback; loading both runtimes can
+call the camodel before its globals are initialized and crash in
+`RegAtraceInfoInit`, before the application launches its kernel.
+
+This alias belongs to the generated case. Do not replace `libruntime.so` inside
+CANN's `lib64`, or export the simulator alias into a shell used for device
+runs. For a manual recollection, apply the same library path only to that
+simulator command.
+
+### Timeouts and collection status
+
+`msprof op simulator --timeout` accepts whole **minutes**. The repository
+workflow's `--msprof-timeout` accepts seconds and rounds up to whole minutes
+before invoking it; the default 180 seconds becomes `--timeout=3`. Parsing gets
+an additional 120 seconds. If that outer limit expires, the workflow terminates
+the subprocess group and preserves its output log.
+
+A zero launcher exit code and an "All task success" banner do not establish a
+complete capture. A child crash, forced timeout, or empty-instruction error
+makes the collection fail even when those success signals are present. Partial
+artifacts are retained for diagnosis.
+
 ## Select the scope before collecting
 
 Use an existing build whenever possible. It preserves the exact generated
@@ -187,6 +224,8 @@ simulator trace.
 | `cannot find -lruntime_camodel` | Selected SoC has no camodel library | Choose an installed SoC variant that matches the device |
 | Missing `msopprof` worker | Incomplete toolkit package | Install the matching operator-development tools; do not silently mutate a shared toolkit |
 | Injection library cannot be preloaded, followed by `aclInit` failure | Worker and companion library are incomplete or mismatched | Install both from the same CANN package |
+| CANN 9 crashes in `RegAtraceInfoInit` during startup | Device and camodel runtime libraries loaded together | Use the generated per-case simulator runtime alias |
+| Kernels finish but profiling times out with empty instructions | Profiler worker/injection package may not support the selected camodel | Verify profiler provenance and use a complete compatible package |
 | Sibling `.pto` not found | Incomplete build source pair | Select a PTOAS directory containing both `.cpp` and `.pto` |
 | Export reports no dump file | CANN version emitted traces during collection | Inspect the collection output before treating export as failed |
 | Near-empty trace | Synthetic control inputs or scalar defaults | Wire a representative standalone workload and recollect |
