@@ -10,11 +10,16 @@
 A[i, j] = (k_i . k_j) * exp(min(g_i - g_j, 0)) * beta_i for j < i, else 0."""
 import pypto.language as pl
 
-# model config
+from models.qwen3_8_27b.config import GDN_TILING, QWEN3_8_27B
+
+# model shape
+H = QWEN3_8_27B.linear_num_value_heads      # value heads
+HG = QWEN3_8_27B.linear_num_key_heads       # QK heads; H // HG value heads share one
+D = QWEN3_8_27B.linear_value_head_dim       # head dimension
+CHUNK = GDN_TILING.chunk                    # chunk size in tokens, our tiling choice
+
+# case shape
 T = 8192                # tokens (single sequence, B = 1)
-H = 16                  # value heads
-D = 128                 # head dimension
-CHUNK = 128             # chunk size in tokens
 
 # tiling
 COL_TILE = 128          # columns of A per matmul
@@ -22,14 +27,13 @@ SLOT_NUM = 1            # cross-core ring depth; the default depth cannot hold a
                         # [CHUNK, COL_TILE] FP32 crossing tile at COL_TILE = 128
 
 
-def build_kernel(t: int = T, h: int = H, d: int = D, chunk: int = CHUNK, hg: int | None = None,
+def build_kernel(t: int = T, h: int = H, d: int = D, chunk: int = CHUNK, hg: int = HG,
                  col_tile: int = COL_TILE, slot_num: int = SLOT_NUM):
     """The stage kernel at one shape.
 
     `hg` is the number of QK heads, `h` the number of value heads; they differ
     under GQA. Defaults to `h`, which makes the head mapping an identity.
     """
-    hg = h if hg is None else hg
     grp = h // hg
 
     @pl.jit
@@ -82,13 +86,12 @@ gdn_scaled_dot_kkt = build_kernel()
 
 
 def build_tensor_specs(t: int = T, h: int = H, d: int = D, chunk: int = CHUNK,
-                       hg: int | None = None):
+                       hg: int = HG):
     import torch
     from golden import TensorSpec
 
-    from models.gdn import reference
+    from models.qwen3_8_27b import reference
 
-    hg = h if hg is None else hg
 
     def init_mask():
         rows = torch.arange(chunk)[:, None]
@@ -108,7 +111,7 @@ def build_tensor_specs(t: int = T, h: int = H, d: int = D, chunk: int = CHUNK,
 
 
 def golden_gdn_scaled_dot_kkt(tensors):
-    from models.gdn import reference
+    from models.qwen3_8_27b import reference
 
     chunk = tensors["mask"].shape[0]
     ref = reference.kkt(tensors["k"], tensors["beta"].t(), tensors["g_sum"].t(), chunk)

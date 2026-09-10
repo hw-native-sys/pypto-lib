@@ -26,8 +26,8 @@ no denormal path, so values do not move the time. Pass `--data reference` to
 time the pipeline's own data instead; that builds a float64 reference chain on
 the host and is only affordable at small T.
 
-    python models/gdn/bench.py -p a2a3 -d 0
-    python models/gdn/bench.py -p a2a3 -d 0 --seq-len 4096,8192 --json out.json
+    python models/qwen3_8_27b/bench.py -p a2a3 -d 0
+    python models/qwen3_8_27b/bench.py -p a2a3 -d 0 --seq-len 4096,8192 --json out.json
 """
 import argparse
 import dataclasses
@@ -40,11 +40,13 @@ import time
 STAGES = ("chunk_cumsum", "scaled_dot_kkt", "solve_tril", "wy_fast",
           "chunk_h", "chunk_o")
 
-# The reference benchmark's fixed dimensions and its --l-seg list.
-D = 128
-CHUNK = 128
-SEQ_LENS = (4096, 8192, 16384)
-HEADS = (16,)
+from models.qwen3_8_27b.config import GDN_TILING, QWEN3_8_27B
+
+D = QWEN3_8_27B.linear_value_head_dim
+CHUNK = GDN_TILING.chunk
+HEADS = (QWEN3_8_27B.linear_num_value_heads,)
+QK_HEADS = QWEN3_8_27B.linear_num_key_heads
+SEQ_LENS = (4096, 8192, 16384)      # the reference benchmark's --l-seg list
 
 
 def _random_specs(stage, specs):
@@ -56,7 +58,7 @@ def _random_specs(stage, specs):
     """
     import torch
 
-    from models.gdn.test_gdn_stages import OUTPUTS
+    from models.qwen3_8_27b.test_gdn_stages import OUTPUTS
 
     leave_alone = set(OUTPUTS[stage]) | {"mask", "tril", "neg_eye"}
     out = []
@@ -79,9 +81,9 @@ def bench_stage(stage: str, t: int, h: int, hg: int, platform: str, device: int,
     """One compile and one timed loop. Returns the record for this (stage, shape)."""
     from golden import run
 
-    from models.gdn.test_gdn_stages import GQA_STAGES
+    from models.qwen3_8_27b.test_gdn_stages import GQA_STAGES
 
-    mod = importlib.import_module(f"models.gdn.{stage}")
+    mod = importlib.import_module(f"models.qwen3_8_27b.{stage}")
     kernel_kw = dict(hg=hg) if stage in GQA_STAGES else {}
     fn = mod.build_kernel(t=t, h=h, d=D, chunk=CHUNK, **kernel_kw)
     specs = mod.build_tensor_specs(t=t, h=h, d=D, chunk=CHUNK, hg=hg)
@@ -122,9 +124,9 @@ def main() -> int:
     parser.add_argument("--heads", type=str,
                         default=",".join(str(x) for x in HEADS),
                         help="comma-separated value-head counts H")
-    parser.add_argument("--qk-heads", type=int, default=None,
-                        help="QK heads Hg (default: equal to H, i.e. no GQA). "
-                             "Qwen3.8-27B is H=48, Hg=16")
+    parser.add_argument("--qk-heads", type=int, default=QK_HEADS,
+                        help="QK heads Hg; pass the same value as --heads for no "
+                             "grouping")
     parser.add_argument("--stages", type=str, default=",".join(STAGES))
     parser.add_argument("--rounds", type=int, default=50)
     parser.add_argument("--warmup", type=int, default=5)
@@ -141,13 +143,13 @@ def main() -> int:
     heads = [int(x) for x in args.heads.split(",") if x]
     stages = [s for s in args.stages.split(",") if s]
     for h in heads:
-        if args.qk_heads is not None and h % args.qk_heads:
+        if h % args.qk_heads:
             parser.error(f"H={h} must be divisible by Hg={args.qk_heads}")
 
     records = []
     for t in seq_lens:
         for h in heads:
-            hg = h if args.qk_heads is None else args.qk_heads
+            hg = args.qk_heads
             for stage in stages:
                 rec = bench_stage(stage, t, h, hg, args.platform, args.device,
                                   args.rounds, args.warmup, args.data)

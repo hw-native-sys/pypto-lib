@@ -21,11 +21,16 @@ FP32 tile across the cube/vector boundary.
 """
 import pypto.language as pl
 
-# model config
+from models.qwen3_8_27b.config import GDN_TILING, QWEN3_8_27B
+
+# model shape
+H = QWEN3_8_27B.linear_num_value_heads      # value heads
+HG = QWEN3_8_27B.linear_num_key_heads       # QK heads; H // HG value heads share one
+D = QWEN3_8_27B.linear_value_head_dim       # head dimension; unused here, drawn inputs match the pipeline
+CHUNK = GDN_TILING.chunk                    # chunk size in tokens, our tiling choice
+
+# case shape
 T = 8192                # tokens (single sequence, B = 1)
-H = 16                  # value heads
-CHUNK = 128             # chunk size in tokens; A is [CHUNK, CHUNK] per head
-D = 128                 # head dimension; unused here, drawn inputs match the pipeline
 
 
 def build_kernel(t: int = T, h: int = H, d: int = D, chunk: int = CHUNK):
@@ -71,14 +76,12 @@ gdn_solve_tril = build_kernel()
 
 
 def build_tensor_specs(t: int = T, h: int = H, d: int = D, chunk: int = CHUNK,
-                       hg: int | None = None):
+                       hg: int = HG):
+    # hg only picks which reference chain to draw from; this stage reads no q or k.
     import torch
     from golden import TensorSpec
 
-    from models.gdn import reference
-
-    # hg picks the reference chain to draw from; this stage reads no q or k.
-    hg = h if hg is None else hg
+    from models.qwen3_8_27b import reference
 
     return [
         TensorSpec("a_in", [t, h, chunk], torch.float16,
@@ -90,7 +93,7 @@ def build_tensor_specs(t: int = T, h: int = H, d: int = D, chunk: int = CHUNK,
 
 
 def golden_gdn_solve_tril(tensors):
-    from models.gdn import reference
+    from models.qwen3_8_27b import reference
 
     chunk = tensors["a_in"].shape[-1]
     tensors["t_out"].copy_(reference.solve_tril(tensors["a_in"], chunk))
@@ -103,7 +106,7 @@ def _tri_inv_ok(actual, expected, **_kwargs):
     reported because the pipeline narrows this stage's FP32 output to FP16 before
     wy_fast, so it says how much of any budget that later step spends on its own.
     """
-    from models.gdn import reference
+    from models.qwen3_8_27b import reference
 
     exp = expected.double()
     _, floor_detail = reference.stats_ok(exp.half(), exp)
