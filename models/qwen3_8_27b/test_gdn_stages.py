@@ -20,10 +20,10 @@ stage on the previous KERNEL's output, which is what the deployed pipeline does;
 a stage's score there is still against a reference recomputed from the inputs it
 actually received, so the two modes differ in the input, not in the yardstick.
 
-    python models/gdn/test_gdn_stages.py -p a2a3 -d 0
-    python models/gdn/test_gdn_stages.py -p a2a3 -d 0 --chain
-    python models/gdn/test_gdn_stages.py -p a2a3sim --seq-len 1024
-    python models/gdn/test_gdn_stages.py -p a2a3 -d 0 --stages solve_tril,chunk_o
+    python models/qwen3_8_27b/test_gdn_stages.py -p a2a3 -d 0
+    python models/qwen3_8_27b/test_gdn_stages.py -p a2a3 -d 0 --chain
+    python models/qwen3_8_27b/test_gdn_stages.py -p a2a3sim --seq-len 1024
+    python models/qwen3_8_27b/test_gdn_stages.py -p a2a3 -d 0 --stages solve_tril,chunk_o
 
 This is a device entry point, not a pytest case: it needs an NPU and a compile,
 so it carries no `test_` functions and CI's `pytest tests/...` never collects it.
@@ -35,8 +35,10 @@ import time
 STAGES = ("chunk_cumsum", "scaled_dot_kkt", "solve_tril", "wy_fast",
           "chunk_h", "chunk_o")
 
-D = 128
-CHUNK = 128
+from models.qwen3_8_27b.config import GDN_TILING, QWEN3_8_27B
+
+D = QWEN3_8_27B.linear_value_head_dim
+CHUNK = GDN_TILING.chunk
 
 # Stages that read q or k, and so need to know how many QK heads there are.
 # chunk_cumsum and solve_tril are per value head and read neither.
@@ -72,7 +74,7 @@ CHAINED = {
 
 def _comparators(stage: str, captured=None) -> dict:
     """megagdn's criterion on every output, optionally capturing the device result."""
-    from models.gdn import reference
+    from models.qwen3_8_27b import reference
 
     def make(name):
         def compare(actual, expected, actual_outputs=None, **_kw):
@@ -107,7 +109,7 @@ def check_stage(stage: str, t: int, h: int, hg: int, platform: str, device: int,
     """Compile, run and validate one stage. Returns (passed, detail)."""
     from golden import run
 
-    mod = importlib.import_module(f"models.gdn.{stage}")
+    mod = importlib.import_module(f"models.qwen3_8_27b.{stage}")
     kernel_kw = dict(hg=hg) if stage in GQA_STAGES else {}
     fn = mod.build_kernel(t=t, h=h, d=D, chunk=CHUNK, **kernel_kw)
     specs = mod.build_tensor_specs(t=t, h=h, d=D, chunk=CHUNK, hg=hg)
@@ -132,11 +134,13 @@ def main() -> int:
                         choices=["a2a3", "a2a3sim", "a5", "a5sim"])
     parser.add_argument("-d", "--device", type=int, default=0)
     parser.add_argument("--seq-len", type=int, default=8192)
-    parser.add_argument("--heads", type=int, default=16,
+    parser.add_argument("--heads", type=int,
+                        default=QWEN3_8_27B.linear_num_value_heads,
                         help="value heads H")
-    parser.add_argument("--qk-heads", type=int, default=None,
-                        help="QK heads Hg (default: equal to H, i.e. no GQA). "
-                             "Qwen3.8-27B is H=48, Hg=16")
+    parser.add_argument("--qk-heads", type=int,
+                        default=QWEN3_8_27B.linear_num_key_heads,
+                        help="QK heads Hg; pass the same value as --heads for no "
+                             "grouping")
     parser.add_argument("--stages", type=str, default=",".join(STAGES))
     parser.add_argument("--save-output", type=str, default=None,
                         help="write the final chunk_o result and the inputs that "
@@ -149,7 +153,7 @@ def main() -> int:
                              "it actually received")
     args = parser.parse_args()
 
-    hg = args.heads if args.qk_heads is None else args.qk_heads
+    hg = args.qk_heads
     if args.heads % hg:
         parser.error(f"H={args.heads} must be divisible by Hg={hg}")
     stages = [s for s in args.stages.split(",") if s]
@@ -172,7 +176,7 @@ def main() -> int:
     if args.save_output and produced is not None and "o_out" in produced:
         import torch
 
-        from models.gdn import reference
+        from models.qwen3_8_27b import reference
 
         x = reference.make_inputs(args.seq_len, args.heads, D, hg)
         torch.save(dict(q=x["q"], k=x["k"], v=x["v"], g_in=x["g"],
