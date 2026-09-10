@@ -70,15 +70,19 @@ def build_kernel(t: int = T, h: int = H, d: int = D, chunk: int = CHUNK):
 gdn_solve_tril = build_kernel()
 
 
-def build_tensor_specs(t: int = T, h: int = H, d: int = D, chunk: int = CHUNK):
+def build_tensor_specs(t: int = T, h: int = H, d: int = D, chunk: int = CHUNK,
+                       hg: int | None = None):
     import torch
     from golden import TensorSpec
 
     from models.gdn import reference
 
+    # hg picks the reference chain to draw from; this stage reads no q or k.
+    hg = h if hg is None else hg
+
     return [
         TensorSpec("a_in", [t, h, chunk], torch.float16,
-                   init_value=reference.lazy("solve_tril", "a16", t, h, d, chunk)),
+                   init_value=reference.lazy("solve_tril", "a16", t, h, d, chunk, hg=hg)),
         TensorSpec("neg_eye", [chunk, chunk], torch.float16,
                    init_value=lambda: -torch.eye(chunk, dtype=torch.float16)),
         TensorSpec("t_out", [t, h, chunk], torch.float32),

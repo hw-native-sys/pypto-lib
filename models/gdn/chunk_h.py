@@ -31,20 +31,27 @@ D = 128                 # head dimension
 CHUNK = 128             # chunk size in tokens
 
 
-def build_kernel(t: int = T, h: int = H, d: int = D, chunk: int = CHUNK):
-    """The stage kernel at one shape."""
+def build_kernel(t: int = T, h: int = H, d: int = D, chunk: int = CHUNK,
+                 hg: int | None = None):
+    """The stage kernel at one shape.
+
+    `hg` is the number of QK heads, `h` the number of value heads; they differ
+    under GQA. Defaults to `h`, which makes the head mapping an identity.
+    """
     nchunk = t // chunk                    # sequential steps per head
+    hg = h if hg is None else hg
+    grp = h // hg
 
     @pl.jit
     def gdn_chunk_h(
-        k: pl.Tensor[[t, h, d], pl.FP16],
+        k: pl.Tensor[[t, hg, d], pl.FP16],
         w: pl.Tensor[[t, h, d], pl.FP16],
         u: pl.Tensor[[t, h, d], pl.FP16],
         g_sum: pl.Tensor[[h, t], pl.FP32],
         state: pl.Out[pl.Tensor[[nchunk * h * d, d], pl.FP16]],
         v_new: pl.Out[pl.Tensor[[t, h, d], pl.FP16]],
     ):
-        k_flat = pl.reshape(k, [t, h * d])
+        k_flat = pl.reshape(k, [t, hg * d])
         w_flat = pl.reshape(w, [t, h * d])
         u_flat = pl.reshape(u, [t, h * d])
         v_flat = pl.reshape(v_new, [t, h * d])
@@ -58,6 +65,9 @@ def build_kernel(t: int = T, h: int = H, d: int = D, chunk: int = CHUNK):
                 t0 = c * chunk
                 row = (c * h + hh) * d
                 d0 = hh * d
+                # GQA: K comes from key head hh // grp; W, U and the state are per
+                # value head.
+                dg0 = (hh // grp) * d
 
                 s16 = pl.cast(s_cur, target_type=pl.FP16, mode="rint")
                 st_next = pl.assemble(st, s16, [row, 0])        # state ENTERING this chunk
@@ -83,7 +93,7 @@ def build_kernel(t: int = T, h: int = H, d: int = D, chunk: int = CHUNK):
                 # on K: K^T (V c) == (K c)^T V, and under pl.split a matmul whose
                 # TRANSPOSED operand was produced on the vector unit cannot be lowered
                 # (ptoas: "'pto.tmov' op expects a supported tmov address-space pair").
-                kc = k_flat[t0 : t0 + chunk, d0 : d0 + d]
+                kc = k_flat[t0 : t0 + chunk, dg0 : dg0 + d]
                 vs = pl.row_expand_mul(vc, coeff)
                 vs16 = pl.cast(vs, target_type=pl.FP16, mode="rint")
                 kv = pl.matmul(kc, vs16, a_trans=True, out_dtype=pl.FP32)
@@ -101,22 +111,25 @@ def build_kernel(t: int = T, h: int = H, d: int = D, chunk: int = CHUNK):
 gdn_chunk_h = build_kernel()
 
 
-def build_tensor_specs(t: int = T, h: int = H, d: int = D, chunk: int = CHUNK):
+def build_tensor_specs(t: int = T, h: int = H, d: int = D, chunk: int = CHUNK,
+                       hg: int | None = None):
     import torch
     from golden import TensorSpec
 
     from models.gdn import reference
 
     nc = t // chunk
+    hg = h if hg is None else hg
 
     return [
-        TensorSpec("k", [t, h, d], torch.float16, init_value=reference.lazy("chunk_h", "k", t, h, d, chunk)),
+        TensorSpec("k", [t, hg, d], torch.float16,
+                   init_value=reference.lazy("chunk_h", "k", t, h, d, chunk, hg=hg)),
         TensorSpec("w", [t, h, d], torch.float16,
-                   init_value=reference.lazy("chunk_h", "w16", t, h, d, chunk)),
+                   init_value=reference.lazy("chunk_h", "w16", t, h, d, chunk, hg=hg)),
         TensorSpec("u", [t, h, d], torch.float16,
-                   init_value=reference.lazy("chunk_h", "u16", t, h, d, chunk)),
+                   init_value=reference.lazy("chunk_h", "u16", t, h, d, chunk, hg=hg)),
         TensorSpec("g_sum", [h, t], torch.float32,
-                   init_value=reference.lazy("chunk_h", "g_sum", t, h, d, chunk, reference.to_hT)),
+                   init_value=reference.lazy("chunk_h", "g_sum", t, h, d, chunk, reference.to_hT, hg=hg)),
         TensorSpec("state", [nc * h * d, d], torch.float16),
         TensorSpec("v_new", [t, h, d], torch.float16),
     ]
@@ -125,7 +138,8 @@ def build_tensor_specs(t: int = T, h: int = H, d: int = D, chunk: int = CHUNK):
 def golden_gdn_chunk_h(tensors):
     from models.gdn import reference
 
-    t, h, d = tensors["k"].shape
+    t, _, d = tensors["k"].shape          # k has Hg heads under GQA
+    h = tensors["w"].shape[1]             # W, U and the state are per value head
     chunk = t // (tensors["state"].shape[0] // (h * d))
     state, v_new, _ = reference.chunk_h(tensors["k"], tensors["w"], tensors["u"],
                                         tensors["g_sum"].t(), chunk)
