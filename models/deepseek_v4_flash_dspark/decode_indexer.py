@@ -573,7 +573,7 @@ def indexer_qr_rope(
     cos: pl.Tensor[[T_DYN, ROPE_HEAD_DIM], pl.FP32],
     sin: pl.Tensor[[T_DYN, ROPE_HEAD_DIM], pl.FP32],
     qr_bf16: pl.Out[pl.Tensor[[T_PAD * IDX_N_HEADS, IDX_HEAD_DIM], pl.BF16]],
-):
+) -> pl.Scalar[pl.TASK_ID]:
     """Indexer query projection, dequant and RoPE -- everything before the hadamard."""
 
     bs = pl.tensor.dim(x, 0)
@@ -653,7 +653,7 @@ def indexer_qr_hadamard_mm(
     qr_hadamard_i8: pl.Out[pl.Tensor[[T_PAD * IDX_N_HEADS, IDX_HEAD_DIM], pl.INT8]],
     qr_hadamard_scale_dq: pl.Out[pl.Tensor[[T_PAD * IDX_N_HEADS, 1], pl.FP32]],
     qh_mm_dep: pl.Scalar[pl.TASK_ID],
-):
+) -> tuple[pl.Scalar[pl.TASK_ID], pl.Scalar[pl.TASK_ID]]:
     """q @ hadamard and its INT8 quant, fenced behind the caller's cube ordering."""
     bs = pl.tensor.dim(x, 0)
     bs_heads = bs * IDX_N_HEADS
@@ -747,7 +747,7 @@ def indexer_weights_score(
     cache_write_dep: pl.Scalar[pl.TASK_ID],
     weights_gate_dep: pl.Scalar[pl.TASK_ID],
     qh_quant_tid: pl.Scalar[pl.TASK_ID],
-):
+) -> tuple[pl.Tensor[[T_DYN, IDX_TOPK], pl.FP32], pl.Tensor[[T_DYN, IDX_TOPK], pl.INT32], pl.Scalar[pl.TASK_ID]]:
     """Weights projection and the score/top-k forest over an already-quantized query."""
     bs = pl.tensor.dim(x, 0)
     row_blocks = (bs + MM_ROW_TILE - 1) // MM_ROW_TILE
