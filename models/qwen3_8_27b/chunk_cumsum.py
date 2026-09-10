@@ -33,11 +33,12 @@ def group_tile(t: int = T, chunk: int = CHUNK, want: int = GROUP_TILE) -> int:
     return group
 
 
-def build_kernel(t: int = T, h: int = H, d: int = D, chunk: int = CHUNK):
+def build_kernel(t: int = T, h: int = H, d: int = D, chunk: int = CHUNK,
+                 inline: bool = False):
     """The stage kernel at one shape; `d` is unused and accepted for a uniform signature."""
     group = group_tile(t, chunk)
 
-    @pl.jit
+    @(pl.jit.inline if inline else pl.jit)
     def gdn_chunk_cumsum(
         g: pl.Tensor[[t, h], pl.FP32],
         tril: pl.Tensor[[chunk, chunk], pl.FP32],
