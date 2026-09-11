@@ -190,8 +190,12 @@ def format_table(records: list[dict]) -> str:
     total = []
     for t, h in shapes:
         vals = [by[(s, t, h)].get("mean_us") for s in stages if (s, t, h) in by]
+        # A stage with no timing leaves the total unknown; one that legitimately
+        # measured 0.0 does not. `all(vals)` cannot tell those apart, and `all([])`
+        # is True, which would print a total of 0 for a shape that has no records.
+        complete = bool(vals) and all(v is not None for v in vals)
         width = len(f" T={t} H={h} ")
-        total.append(f"{round(sum(v for v in vals if v), 1) if all(vals) else '-':>{width}}|")
+        total.append(f"{round(sum(vals), 1) if complete else '-':>{width}}|")
     lines.append(f"| {'TOTAL':<16} |" + "".join(total))
     return "\n".join(lines)
 

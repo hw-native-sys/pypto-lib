@@ -19,6 +19,9 @@ output is deliberate: it isolates the stage. `--chain` runs the other way, each
 stage on the previous KERNEL's output, which is what the deployed pipeline does;
 a stage's score there is still against a reference recomputed from the inputs it
 actually received, so the two modes differ in the input, not in the yardstick.
+`--save-output` implies `--chain`, because the pair it writes -- the original
+inputs and the final output -- is only an end-to-end result if the kernels
+produced it end to end.
 
     python models/qwen3_8_27b/test_gdn_stages.py -p a2a3 -d 0
     python models/qwen3_8_27b/test_gdn_stages.py -p a2a3 -d 0 --chain
@@ -105,15 +108,21 @@ def _chain_specs(stage: str, specs: list, produced: dict) -> list:
 
 
 def check_stage(stage: str, t: int, h: int, hg: int, platform: str, device: int,
-                produced: dict | None = None) -> tuple[bool, str]:
-    """Compile, run and validate one stage. Returns (passed, detail)."""
+                produced: dict | None = None,
+                chain: bool = False) -> tuple[bool, str]:
+    """Compile, run and validate one stage. Returns (passed, detail).
+
+    `produced` captures each stage's device outputs; `chain` is what decides
+    whether they are also fed forward. --save-output needs the capture without
+    the substitution, so the two cannot be the same switch.
+    """
     from golden import run
 
     mod = importlib.import_module(f"models.qwen3_8_27b.{stage}")
     kernel_kw = dict(hg=hg) if stage in GQA_STAGES else {}
     fn = mod.build_kernel(t=t, h=h, d=D, chunk=CHUNK, **kernel_kw)
     specs = mod.build_tensor_specs(t=t, h=h, d=D, chunk=CHUNK, hg=hg)
-    if produced is not None:
+    if chain and produced is not None:
         specs = _chain_specs(stage, specs, produced)
 
     result = run(
@@ -145,7 +154,9 @@ def main() -> int:
     parser.add_argument("--save-output", type=str, default=None,
                         help="write the final chunk_o result and the inputs that "
                              "produced it here (torch .pt), for an end-to-end score "
-                             "against an external reference")
+                             "against an external reference. IMPLIES --chain: the "
+                             "saved pair is only end to end if the kernels produced "
+                             "it end to end")
     parser.add_argument("--chain", action="store_true",
                         help="feed each stage the previous KERNEL's device output "
                              "instead of the reference chain; each stage is still "
@@ -157,19 +168,24 @@ def main() -> int:
     if args.heads % hg:
         parser.error(f"H={args.heads} must be divisible by Hg={hg}")
     stages = [s for s in args.stages.split(",") if s]
-    produced: dict | None = {} if (args.chain or args.save_output) else None
+    # --save-output saves the ORIGINAL inputs beside the final output, so that pair
+    # is only meaningful if every stage ran on the previous kernel's result. It
+    # therefore implies --chain rather than quietly enabling it.
+    chain = args.chain or bool(args.save_output)
+    produced: dict | None = {} if chain else None
     results = []
     for stage in stages:
         print(f"\n=================== {stage} ===================", flush=True)
         started = time.time()
         ok, detail = check_stage(stage, args.seq_len, args.heads, hg,
-                                 args.platform, args.device, produced)
+                                 args.platform, args.device, produced,
+                                 chain=chain)
         results.append((stage, ok, detail, time.time() - started))
 
     print("\n=================== summary ===================")
     print(f"T={args.seq_len} H={args.heads} Hg={hg} D={D} chunk={CHUNK} "
           f"platform={args.platform} inputs="
-          f"{'previous kernel output' if args.chain else 'reference chain'}")
+          f"{'previous kernel output' if chain else 'reference chain'}")
     for stage, ok, detail, secs in results:
         print(f"  {'PASS' if ok else 'FAIL'}  {stage:<16} ({secs:5.1f}s)"
               + (f"  {detail}" if not ok else ""))
