@@ -57,13 +57,11 @@ from decode_compressor_ratio4 import (
     compressor_ratio4_pool_projected,
 )
 from decode_cp_allgather import (
-    decode_cp_csa_aux_allgather_step,
     decode_cp_csa_main_typed_allgather_step,
     decode_cp_csa_aux_typed_allgather_step,
     KV_B_DYN,
     KV_T_DYN,
     DECODE_GROUP_CAP,
-    decode_cp_projection_allgather_step,
 )
 from hc_post import hc_post
 from hc_pre import hc_pre_norm
@@ -319,16 +317,14 @@ def decode_csa(
         qr_hadamard_scale_dq = pl.create_tensor([IDX_T_PAD * IDX_N_HEADS, 1], dtype=pl.FP32)
         # When every cache fits Top-K, attention consumes the complete visible set.
         # Keep compressor/cache updates, but omit query scoring and sorting in CSA.
-        max_indexer_cache_len = IDX_TOPK + 1
-        if TP_SIZE > 1:
-            local_b_dim = pl.tensor.dim(kv_seq_lens, 0)
-            max_indexer_cache_len = 0
-            for short_batch in pl.range(local_b_dim):
-                short_cache_len = pl.read(kv_seq_lens, [short_batch]) // COMPRESS_RATIO
-                max_indexer_cache_len = pl.max(max_indexer_cache_len, short_cache_len)
+        local_b_dim = pl.tensor.dim(kv_seq_lens, 0)
+        max_indexer_cache_len = 0
+        for short_batch in pl.range(local_b_dim):
+            short_cache_len = pl.read(kv_seq_lens, [short_batch]) // COMPRESS_RATIO
+            max_indexer_cache_len = pl.max(max_indexer_cache_len, short_cache_len)
         # Task-ID array slots retain dependencies across conditional scopes.
         indexer_phase_deps = pl.array.create(4, pl.TASK_ID)
-        if TP_SIZE > 1 and max_indexer_cache_len <= IDX_TOPK:
+        if max_indexer_cache_len <= IDX_TOPK:
             indexer_phase_deps[0] = projection_dep
         else:
             scored_idx_qr_mm_tid = indexer_qr_rope(
@@ -395,52 +391,15 @@ def decode_csa(
                 aux_projection_local[pack_row : pack_row + 8, 1024:1536] = kv_local[pack_row : pack_row + 8, :]
         idx_values_full = pl.create_tensor([IDX_CMP_BS_PAD, 2 * IDX_HEAD_DIM], dtype=pl.FP32)
         idx_scores_full = pl.create_tensor([IDX_CMP_BS_PAD, 2 * IDX_HEAD_DIM], dtype=pl.FP32)
-        gather_completion = pl.array.create(2, pl.TASK_ID)
-        if TP_SIZE > 1:
-            gather_signal, aux_typed_ready_tid = decode_cp_csa_aux_typed_allgather_step(
-                aux_projection_local, idx_values_full, idx_scores_full, kv_full,
-                gather_window, gather_signal, group_base, tp_rank, aux_pack_tid,
-            )
-            main_gather_dep = pl.system.task_dummy(deps=[aux_typed_ready_tid, main_pack_tid])
-            gather_signal, main_typed_ready_tid = decode_cp_csa_main_typed_allgather_step(
-                main_projection_local, cmp_kv_proj_pad, cmp_score_proj_pad,
-                gather_window, gather_signal, group_base, tp_rank, main_gather_dep,
-            )
-            gather_completion[0] = aux_typed_ready_tid
-            gather_completion[1] = main_typed_ready_tid
-        else:
-            aux_projection_full = pl.create_tensor([kv_dim, 1536], dtype=pl.BF16)
-            _aux_full, gather_signal, aux_gather_tid = decode_cp_csa_aux_allgather_step(
-                aux_projection_local, aux_projection_full, gather_window, gather_signal,
-                group_base, tp_rank, aux_pack_tid,
-            )
-            main_projection_full = pl.create_tensor([kv_dim, D], dtype=pl.BF16)
-            main_gather_dep = pl.system.task_dummy(deps=[aux_gather_tid, main_pack_tid])
-            _main_full, gather_signal, main_gather_tid = decode_cp_projection_allgather_step(
-                main_projection_local, main_projection_full, gather_window, gather_signal,
-                group_base, tp_rank, main_gather_dep,
-            )
-            with pl.spmd(16, name_hint="csa_aux_projection_unpack", deps=[aux_gather_tid]) as aux_unpack_ready_tid:
-                unpack_worker = pl.tile.get_block_idx()
-                for unpack_row in pl.range(unpack_worker * 8, kv_dim, 16 * 8):
-                    idx_value_fp32 = pl.reinterpret_view(aux_projection_full[unpack_row : unpack_row + 8, 0:512], pl.FP32)
-                    idx_score_raw = aux_projection_full[unpack_row : unpack_row + 8, 512:1024]
-                    idx_score_fp32 = pl.reinterpret_view(idx_score_raw, pl.FP32)
-                    idx_values_full[unpack_row : unpack_row + 8, :] = idx_value_fp32
-                    idx_scores_full[unpack_row : unpack_row + 8, :] = idx_score_fp32
-                    kv_full[unpack_row : unpack_row + 8, :] = aux_projection_full[unpack_row : unpack_row + 8, 1024:1536]
-            with pl.spmd(16, name_hint="csa_main_projection_unpack", deps=[main_gather_tid]) as main_unpack_ready_tid:
-                unpack_worker = pl.tile.get_block_idx()
-                for unpack_row in pl.range(unpack_worker * 8, kv_dim, 16 * 8):
-                    cmp_value_fp32 = pl.reinterpret_view(main_projection_full[unpack_row : unpack_row + 8, 0:2048], pl.FP32)
-                    cmp_score_raw = main_projection_full[unpack_row : unpack_row + 8, 2048:4096]
-                    cmp_score_fp32 = pl.reinterpret_view(cmp_score_raw, pl.FP32)
-                    cmp_kv_proj_pad[unpack_row : unpack_row + 8, :] = cmp_value_fp32
-                    cmp_score_proj_pad[unpack_row : unpack_row + 8, :] = cmp_score_fp32
-            gather_completion[0] = aux_unpack_ready_tid
-            gather_completion[1] = main_unpack_ready_tid
-        kv_gather_done_tid = gather_completion[0]
-        main_unpack_tid = gather_completion[1]
+        gather_signal, kv_gather_done_tid = decode_cp_csa_aux_typed_allgather_step(
+            aux_projection_local, idx_values_full, idx_scores_full, kv_full,
+            gather_window, gather_signal, group_base, tp_rank, aux_pack_tid,
+        )
+        main_gather_dep = pl.system.task_dummy(deps=[kv_gather_done_tid, main_pack_tid])
+        gather_signal, main_typed_ready_tid = decode_cp_csa_main_typed_allgather_step(
+            main_projection_local, cmp_kv_proj_pad, cmp_score_proj_pad,
+            gather_window, gather_signal, group_base, tp_rank, main_gather_dep,
+        )
         idx_kv_score_tid, idx_rms_tid = indexer_compressor_pool_projected(
             idx_values_full, idx_scores_full,
             inner_compress_state, inner_state_table,
@@ -453,9 +412,9 @@ def decode_csa(
             compress_state, cmp_state_table,
             cmp_ape,
             cmp_positions, cmp_pooled_kv, cmp_kv_proj_pad, cmp_score_proj_pad,
-            main_unpack_tid,
+            main_typed_ready_tid,
         )
-        if TP_SIZE > 1 and max_indexer_cache_len <= IDX_TOPK:
+        if max_indexer_cache_len <= IDX_TOPK:
             indexer_phase_deps[1] = cmp_projection_tid
             indexer_phase_deps[2] = cmp_projection_tid
         else:
@@ -480,7 +439,7 @@ def decode_csa(
             q_cos_il, q_sin_signed, q_swap_idx, q,
             qr_scale_pad, q_proj_i32, 0, t_dim,
         )
-        if TP_SIZE > 1 and max_indexer_cache_len <= IDX_TOPK:
+        if max_indexer_cache_len <= IDX_TOPK:
             # One worker owns each whole index row, including its -1 padding.
             with pl.spmd(
                 16, name_hint="csa_indexer_all_visible", deps=[idx_cache_write_tid],
