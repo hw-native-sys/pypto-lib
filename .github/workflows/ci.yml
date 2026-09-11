@@ -58,6 +58,7 @@ jobs:
       files: ${{ steps.check.outputs.files }}
       run_qwen_serving_tests: ${{ steps.check.outputs.run_qwen_serving_tests }}
       run_deepseek_serving_tests: ${{ steps.check.outputs.run_deepseek_serving_tests }}
+      run_dspark_serving_tests: ${{ steps.check.outputs.run_dspark_serving_tests }}
     steps:
       - uses: actions/checkout@v4
         with:
@@ -72,6 +73,7 @@ jobs:
 
           echo "run_qwen_serving_tests=false" >> "$GITHUB_OUTPUT"
           echo "run_deepseek_serving_tests=false" >> "$GITHUB_OUTPUT"
+          echo "run_dspark_serving_tests=false" >> "$GITHUB_OUTPUT"
 
           if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
             echo "has_changes=true" >> "$GITHUB_OUTPUT"
@@ -131,6 +133,10 @@ jobs:
           if [ "${{ github.event_name }}" = "pull_request" ] &&
              printf '%s\n' "$CHANGED_FILES" | grep -qE '^models/deepseek_v4_flash_mtp/'; then
             echo "run_deepseek_serving_tests=true" >> "$GITHUB_OUTPUT"
+          fi
+          if [ "${{ github.event_name }}" = "pull_request" ] &&
+             printf '%s\n' "$CHANGED_FILES" | grep -qE '^models/deepseek_v4_flash_dspark/'; then
+            echo "run_dspark_serving_tests=true" >> "$GITHUB_OUTPUT"
           fi
           echo "Selected files: $FILES"
 
@@ -447,6 +453,62 @@ jobs:
           # Only the fused K=1 case runs on device: the k3-s4-b4 case starts a
           # second 8-card server for the same gate.
           deepseek-mtp-cases: k1
+
+      - name: Kill orphaned task-submit tasks
+        if: always()
+        uses: ./.github/actions/kill-orphaned-tasks
+        with:
+          checkout-path: checkout
+
+      - name: Clean up build artifacts
+        if: always()
+        run: rm -rf serving-checkout/build_output
+
+  serving-dspark:
+    needs: detect-changes
+    # PR-only, DSpark target generation on TP4/DP4/EP16.
+    if: >-
+      github.event_name == 'pull_request' &&
+      needs.detect-changes.outputs.run_dspark_serving_tests == 'true'
+    runs-on: [self-hosted, linux, arm64, npu]
+    # One task-submit worst case: --timeout 4800 queue + --max-time 7200 run,
+    # plus setup/build headroom.
+    timeout-minutes: 240
+    env:
+      PTOAS_ROOT: ${{ github.workspace }}/checkout/ptoas-bin
+      CMAKE_BUILD_PARALLEL_LEVEL: 16
+      CMAKE_C_COMPILER_LAUNCHER: ccache
+      CMAKE_CXX_COMPILER_LAUNCHER: ccache
+      CCACHE_MAXSIZE: 30G
+      CCACHE_UMASK: '000'
+
+    steps:
+      - name: Fetch composite action definitions
+        uses: actions/checkout@v4
+        with:
+          sparse-checkout: .github/actions
+          clean: false
+          persist-credentials: false
+
+      - name: Setup CI job
+        uses: ./.github/actions/setup-ci-job
+        with:
+          checkout-path: checkout
+          needs-device: 'true'
+          build-namespace: serving-dspark
+          toolchain: bundle
+          install-torch-npu: 'true'
+          ccache-name: ccache-serving
+          pip-cache-name: pip-serving-dspark
+          # Match the PyPTO stack validated by the dependent pypto-serving#223.
+          pypto-ref: 747e1e4ba99f13dea1a609d893ac7512e85a5897
+
+      - name: Run pypto-serving DeepSeek V4 DSpark tests
+        uses: ./.github/actions/pypto-serving-tests
+        with:
+          pypto-lib-checkout-path: checkout
+          pypto-serving-checkout-path: serving-checkout
+          model-name: deepseek-v4-dspark
 
       - name: Kill orphaned task-submit tasks
         if: always()

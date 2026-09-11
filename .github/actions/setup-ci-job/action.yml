@@ -29,6 +29,7 @@ description: >-
     CANN_ROOT              CANN toolkit — device runners only (needs-device)
     PYPTO_QWEN3_MODEL_DIR  model weights — only the serving job reads these
     PYPTO_DSV4_MODEL_DIR
+    PYPTO_DSV4_DSPARK_MODEL_DIR
 
   The bundle (toolchain: bundle) deliberately has no entry here: its location is
   not a free choice, so there is nothing for a host to declare. The prefix
@@ -110,7 +111,7 @@ inputs:
       the ccache and the uv every bundle job builds and installs with.
 
       The default was 'conda' while the fleet was migrated a label at a time.
-      That is finished — every caller in this repo (sim, a2a3, both serving jobs,
+      That is finished — every caller in this repo (sim, a2a3, the serving jobs,
       and the a5 daily sweep) passes 'bundle' explicitly — so the default
       follows, and a job added without this input lands on the path CI actually
       exercises rather than on one with no coverage that additionally demands
@@ -215,6 +216,7 @@ runs:
           echo "  CI_CACHE_ROOT=/path/to/ci-cache"
           echo "  PYPTO_QWEN3_MODEL_DIR=/path/to/Qwen3-14B"
           echo "  PYPTO_DSV4_MODEL_DIR=/path/to/dsv4-flash-w8a8"
+          echo "  PYPTO_DSV4_DSPARK_MODEL_DIR=/path/to/dsv4-flash-dspark-w8a8"
           echo "  CANN_ROOT=/usr/local/Ascend/cann-9.0.0"
           echo "(CANN_ROOT is only needed on device runners; CI_CACHE_ROOT is"
           echo " created if absent. The service reads .env at startup — restart"

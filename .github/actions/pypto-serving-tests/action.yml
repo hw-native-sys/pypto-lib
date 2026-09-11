@@ -12,7 +12,7 @@ inputs:
     description: Workspace-relative path where pypto-serving should be checked out.
     required: true
   model-name:
-    description: Serving model guard to run (qwen3-14b or deepseek-v4).
+    description: Serving model guard to run (qwen3-14b, deepseek-v4, or deepseek-v4-dspark).
     required: true
   deepseek-mtp-cases:
     description: >-
@@ -41,6 +41,10 @@ runs:
         case "$MODEL_NAME" in
           qwen3-14b)   key=PYPTO_QWEN3_MODEL_DIR; value="${PYPTO_QWEN3_MODEL_DIR:-}" ;;
           deepseek-v4) key=PYPTO_DSV4_MODEL_DIR;  value="${PYPTO_DSV4_MODEL_DIR:-}" ;;
+          deepseek-v4-dspark)
+            key=PYPTO_DSV4_DSPARK_MODEL_DIR
+            value="${PYPTO_DSV4_DSPARK_MODEL_DIR:-}"
+            ;;
           *) echo "::error::unknown model-name '$MODEL_NAME'"; exit 1 ;;
         esac
         if [ -z "$value" ]; then
@@ -149,4 +153,28 @@ runs:
         run_cmd="$run_cmd python -m pytest $pytest_target -q -s"
         task-submit --device auto --device-num 8 --ignore-whitelist \
           --timeout 3600 --max-time 1800 \
+          --run "$run_cmd"
+
+    - name: Run pypto-serving DeepSeek V4 DSpark accuracy test
+      if: ${{ inputs.model-name == 'deepseek-v4-dspark' }}
+      shell: bash
+      env:
+        PYPTO_DSV4_DSPARK_MODEL_DIR: ${{ steps.model.outputs.dir }}
+        PYPTO_RUNTIME_LOG: error
+        PYPTO_LIB_CHECKOUT: ${{ inputs.pypto-lib-checkout-path }}
+        PYPTO_SERVING_CHECKOUT: ${{ inputs.pypto-serving-checkout-path }}
+      run: |
+        # Palace 64/128: TP4/DP4/EP16, device greedy sampling, no speculation.
+        # The guard prints the completion for review and checks the HTTP
+        # response contract and token accounting.
+        source "$GITHUB_WORKSPACE/$PYPTO_LIB_CHECKOUT/activate.sh"
+        run_cmd="source $GITHUB_WORKSPACE/$PYPTO_LIB_CHECKOUT/activate.sh"
+        run_cmd="$run_cmd && cd $GITHUB_WORKSPACE/$PYPTO_SERVING_CHECKOUT"
+        run_cmd="$run_cmd && TASK_DEVICE=\$TASK_DEVICE"
+        run_cmd="$run_cmd PYTHONPATH=$GITHUB_WORKSPACE/$PYPTO_SERVING_CHECKOUT"
+        run_cmd="$run_cmd PYPTO_DSV4_DSPARK_MODEL_DIR=$PYPTO_DSV4_DSPARK_MODEL_DIR"
+        run_cmd="$run_cmd PYPTO_RUNTIME_LOG=$PYPTO_RUNTIME_LOG"
+        run_cmd="$run_cmd python -m pytest tests/test_deepseek_dspark_accuracy.py -q -s"
+        task-submit --device auto --device-num 16 --ignore-whitelist \
+          --timeout 4800 --max-time 7200 \
           --run "$run_cmd"
