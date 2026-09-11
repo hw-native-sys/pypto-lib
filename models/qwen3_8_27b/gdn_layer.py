@@ -56,6 +56,11 @@ T = 8192                # tokens (single sequence, B = 1)
 LAYER_RING_HEAP = 1024 * 1024 * 1024
 
 
+def run_config(platform: str = "a2a3", device: int = 0) -> dict:
+    """The config `golden.run` needs for this layer. The ring heap is not optional."""
+    return dict(platform=platform, device_id=device, ring_heap=LAYER_RING_HEAP)
+
+
 def build_kernel(t: int = T, h: int = H, d: int = D, chunk: int = CHUNK,
                  hg: int = HG):
     """The layer at one shape, composing the six operators as inlined callees."""
@@ -192,8 +197,7 @@ if __name__ == "__main__":
         golden_data=args.golden_data,
         runtime_dir=args.runtime_dir,
         save_data=args.save_data,
-        config=dict(platform=args.platform, device_id=args.device,
-                    ring_heap=LAYER_RING_HEAP),
+        config=run_config(args.platform, args.device),
         rtol=1e-2, atol=1e-5,
         compare_fn={"o_out": _stats_ok},
     )

@@ -8,7 +8,7 @@
 # -----------------------------------------------------------------------------------------------------------
 """Float64 CPU reference for the Gated DeltaNet forward pass.
 
-One function per pipeline stage, plus :func:`pipeline` which chains all six and
+One function per pipeline stage, plus :func:`compute` which chains all six and
 returns every intermediate. Each stage kernel validates against the matching
 function here, and every stage's test input is the reference output of the stage
 before it -- so no stage is ever fed data the pipeline could not produce.
@@ -17,8 +17,12 @@ The stage signatures follow the model's natural layout ([T, H, D] values,
 [T, H] per-token scalars, [NCHUNK, H, D, D] states). The kernels take some of
 those transposed or flattened; :func:`to_hT` and :func:`flat_state` convert.
 
-Single sequence (B = 1), no GQA. Packed variable-length batches and separate
-key-head counts are pipeline features the kernels do not implement yet.
+Grouped-query attention is implemented: `hg` QK heads against `h` value heads,
+value head `i` reading key head `i // (h // hg)`. `hg` defaults to `h`, which
+makes the mapping an identity.
+
+Single sequence (B = 1). Packed variable-length batches are a pipeline feature
+the kernels do not implement yet.
 """
 from __future__ import annotations
 

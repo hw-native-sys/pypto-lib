@@ -42,6 +42,11 @@ def build_kernel(t: int = T, h: int = H, d: int = D, chunk: int = CHUNK,
     on the last matmul instead of costing a second pass over [T, H, C].
     """
     out_dtype = pl.FP32 if out_dtype is None else out_dtype
+    # A is nilpotent at A^chunk, and the doubling reaches A^(2^ndouble). Off a power
+    # of two the product stops short and the kernel returns a truncated inverse with
+    # no other symptom, so refuse the shape instead.
+    if chunk & (chunk - 1):
+        raise ValueError(f"chunk must be a power of two, got {chunk}")
     ndouble = chunk.bit_length() - 2       # X updates after X = I - A, log2(CHUNK) - 1
 
     @(pl.jit.inline if inline else pl.jit)
