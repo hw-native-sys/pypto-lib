@@ -10,7 +10,7 @@
 g_sum[t, h] = sum over i <= t within the chunk of g[i, h]."""
 import pypto.language as pl
 
-from models.qwen3_8_27b.config import GDN_TILING, QWEN3_8_27B
+from config import GDN_TILING, QWEN3_8_27B
 
 # model shape
 H = QWEN3_8_27B.linear_num_value_heads      # gate heads
@@ -65,7 +65,7 @@ def build_tensor_specs(t: int = T, h: int = H, d: int = D, chunk: int = CHUNK,
     import torch
     from golden import TensorSpec
 
-    from models.qwen3_8_27b import reference
+    import reference
 
     def init_tril():
         return torch.tril(torch.ones(chunk, chunk, dtype=torch.float32))
@@ -79,7 +79,7 @@ def build_tensor_specs(t: int = T, h: int = H, d: int = D, chunk: int = CHUNK,
 
 
 def golden_gdn_chunk_cumsum(tensors):
-    from models.qwen3_8_27b import reference
+    import reference
 
     g = tensors["g"]
     out = tensors["g_sum"]
