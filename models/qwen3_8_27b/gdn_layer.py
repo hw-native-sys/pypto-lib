@@ -30,15 +30,13 @@ for the host to narrow, which is what its consumer reads anyway.
 """
 import pypto.language as pl
 
-from models.qwen3_8_27b import (
-    chunk_cumsum,
-    chunk_h,
-    chunk_o,
-    scaled_dot_kkt,
-    solve_tril,
-    wy_fast,
-)
-from models.qwen3_8_27b.config import GDN_TILING, QWEN3_8_27B
+import chunk_cumsum
+import chunk_h
+import chunk_o
+import scaled_dot_kkt
+import solve_tril
+import wy_fast
+from config import GDN_TILING, QWEN3_8_27B
 
 # model shape
 H = QWEN3_8_27B.linear_num_value_heads      # value heads
@@ -120,7 +118,7 @@ def build_tensor_specs(t: int = T, h: int = H, d: int = D, chunk: int = CHUNK,
     import torch
     from golden import TensorSpec
 
-    from models.qwen3_8_27b import reference
+    import reference
 
     def init_tril():
         return torch.tril(torch.ones(chunk, chunk, dtype=torch.float32))
@@ -151,7 +149,7 @@ def build_tensor_specs(t: int = T, h: int = H, d: int = D, chunk: int = CHUNK,
 
 def golden_gdn_layer(tensors):
     """The whole chain in float64, scored end to end rather than stage by stage."""
-    from models.qwen3_8_27b import reference
+    import reference
 
     t, h, d = tensors["v"].shape
     chunk = tensors["tril"].shape[0]
@@ -161,7 +159,7 @@ def golden_gdn_layer(tensors):
 
 def _stats_ok(actual, expected, **_kwargs):
     """megagdn-pto's criterion (tests/utils.py: NumericalAccuracy)."""
-    from models.qwen3_8_27b import reference
+    import reference
 
     ok, detail = reference.stats_ok(actual, expected, chunk=CHUNK)
     print(f"[stats] {detail}", flush=True)

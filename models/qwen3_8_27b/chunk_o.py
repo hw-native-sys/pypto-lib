@@ -19,7 +19,7 @@ not in the key-key matrix.
 """
 import pypto.language as pl
 
-from models.qwen3_8_27b.config import GDN_TILING, QWEN3_8_27B
+from config import GDN_TILING, QWEN3_8_27B
 
 # model shape
 H = QWEN3_8_27B.linear_num_value_heads      # value heads
@@ -110,7 +110,7 @@ def build_tensor_specs(t: int = T, h: int = H, d: int = D, chunk: int = CHUNK,
     import torch
     from golden import TensorSpec
 
-    from models.qwen3_8_27b import reference
+    import reference
 
     nc = t // chunk
 
@@ -136,7 +136,7 @@ def build_tensor_specs(t: int = T, h: int = H, d: int = D, chunk: int = CHUNK,
 
 
 def golden_gdn_chunk_o(tensors):
-    from models.qwen3_8_27b import reference
+    import reference
 
     t, _, d = tensors["q"].shape          # q and k have Hg heads under GQA
     h = tensors["v"].shape[1]             # V, O and the state are per value head
@@ -148,7 +148,7 @@ def golden_gdn_chunk_o(tensors):
 
 def _stats_ok(actual, expected, **_kwargs):
     """megagdn-pto's criterion for this stage (tests/utils.py: NumericalAccuracy)."""
-    from models.qwen3_8_27b import reference
+    import reference
 
     ok, detail = reference.stats_ok(actual, expected, chunk=CHUNK)
     print(f"[stats] {detail}", flush=True)
