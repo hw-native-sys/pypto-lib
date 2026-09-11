@@ -76,122 +76,6 @@ if DECODE_GROUP_CAP % TP_SIZE != 0:
     raise ValueError(f"decode tokens {DECODE_GROUP_CAP} must be divisible by TP size {TP_SIZE}")
 
 
-@pl.jit.inline
-def decode_cp_projection_allgather_step(
-    payload_local: pl.Tensor[[Q_T_DYN, D], pl.BF16],
-    group_out: pl.Tensor[[KV_T_DYN, D], pl.BF16],
-    gather_window: pld.DistributedTensor[[DECODE_GROUP_CAP, D], pl.BF16],
-    gather_signal: pld.DistributedTensor[[TP_SIZE, 1], pl.INT32],
-    group_base: pl.Scalar[pl.INT32],
-    tp_rank: pl.Scalar[pl.INT32],
-    input_ready_dep: pl.Scalar[pl.TASK_ID],
-):
-    """Gather rank-major rows and retire the complete two-phase signal epoch."""
-    local_rows = pl.tensor.dim(payload_local, 0)
-    local_t = pl.cast(local_rows, pl.INT32)
-    target_row = tp_rank * local_t
-
-    # Publish the payload and first-phase arrival from PUSH_WORKERS producers.
-    full_local = (local_t // COMM_ROW_TILE) * COMM_ROW_TILE
-    with pl.spmd(
-        PUSH_WORKERS,
-        name_hint="cp_projection_allgather_push",
-        deps=[input_ready_dep],
-        allow_early_resolve=True,
-    ) as _push_tid:
-        worker = pl.tile.get_block_idx()
-        for peer_tp in pl.range(TP_SIZE):
-            for band_row in pl.range(worker * COMM_ROW_TILE, full_local, PUSH_WORKERS * COMM_ROW_TILE):
-                pld.tensor.put(
-                    dst=gather_window, peer=group_base + peer_tp,
-                    src=payload_local,
-                    dst_offsets=[target_row + band_row, 0], src_offsets=[band_row, 0],
-                    shape=[COMM_ROW_TILE, D],
-                    chunk_rows=COMM_ROW_TILE, chunk_cols=D,
-                )
-            for tail_row in pl.range(full_local + worker, local_t, PUSH_WORKERS):
-                pld.tensor.put(
-                    dst=gather_window, peer=group_base + peer_tp,
-                    src=payload_local,
-                    dst_offsets=[target_row + tail_row, 0], src_offsets=[tail_row, 0],
-                    shape=[1, D],
-                    chunk_rows=1, chunk_cols=D,
-                )
-        for peer_tp in pl.range(TP_SIZE):
-            if peer_tp != tp_rank:
-                pld.system.notify(
-                    target=gather_signal, peer=group_base + peer_tp,
-                    offsets=[tp_rank, 0], value=1, op=pld.NotifyOp.AtomicAdd,
-                )
-
-    # Block on the peer payload arrivals, after the local push has been issued.
-    with pl.at(
-        level=pl.Level.CORE_GROUP,
-        name_hint="cp_projection_allgather_payload_wait",
-        deps=[_push_tid],
-    ) as _payload_wait_tid:
-        for source_tp in pl.range(TP_SIZE):
-            if source_tp != tp_rank:
-                pld.system.wait(
-                    signal=gather_signal, offsets=[source_tp, 0],
-                    expected=pl.cast(PAYLOAD_EXPECTED, pl.INT32), cmp=pld.WaitCmp.Ge,
-                )
-
-    # Copy peer payloads and publish local readback completion.
-    group_rows = TP_SIZE * local_rows
-    full_rows = (group_rows // READBACK_ROW_TILE) * READBACK_ROW_TILE
-    with pl.spmd(
-        READBACK_WORKERS,
-        name_hint="cp_projection_allgather_readback",
-        deps=[_push_tid, _payload_wait_tid],
-    ) as _readback_tid:
-        worker = pl.tile.get_block_idx()
-        for tile_row in pl.range(worker * READBACK_ROW_TILE, full_rows, READBACK_WORKERS * READBACK_ROW_TILE):
-            window_tile = gather_window[tile_row : tile_row + READBACK_ROW_TILE, 0:D]
-            group_out[tile_row : tile_row + READBACK_ROW_TILE, 0:D] = window_tile
-        for tail_row in pl.range(full_rows + worker, group_rows, READBACK_WORKERS):
-            window_row = gather_window[tail_row : tail_row + 1, 0:D]
-            group_out[tail_row : tail_row + 1, 0:D] = window_row
-        for peer_tp in pl.range(TP_SIZE):
-            if peer_tp != tp_rank:
-                pld.system.notify(
-                    target=gather_signal, peer=group_base + peer_tp,
-                    offsets=[tp_rank, 0], value=1, op=pld.NotifyOp.AtomicAdd,
-                )
-
-    with pl.at(
-        level=pl.Level.CORE_GROUP,
-        name_hint="cp_projection_allgather_readback_wait",
-        deps=[_readback_tid],
-    ) as _readback_wait_tid:
-        for source_tp in pl.range(TP_SIZE):
-            if source_tp != tp_rank:
-                pld.system.wait(
-                    signal=gather_signal, offsets=[source_tp, 0],
-                    expected=pl.cast(READBACK_EXPECTED, pl.INT32), cmp=pld.WaitCmp.Ge,
-                )
-
-    # Retire peer credits and anchor output consumption to signal retirement.
-    with pl.at(
-        level=pl.Level.CORE_GROUP,
-        name_hint="cp_projection_allgather_retire",
-        deps=[_readback_tid, _readback_wait_tid],
-    ) as retire_tid:
-        completion_anchor = pl.read(group_out, [0, 0])
-        reset_value = pl.cast(-READBACK_EXPECTED, pl.INT32)
-        self_rank = group_base + tp_rank
-        for source_tp in pl.range(TP_SIZE):
-            if source_tp != tp_rank:
-                pld.system.notify(
-                    target=gather_signal, peer=self_rank,
-                    offsets=[source_tp, 0], value=reset_value, op=pld.NotifyOp.AtomicAdd,
-                )
-        pl.write(group_out, [0, 0], completion_anchor)
-
-    return group_out, gather_signal, retire_tid
-
-
-
 @pl.jit.incore
 def cp_hca_projection_allgather_readback(
     group_out: pl.Out[pl.Tensor[[KV_T_DYN, 2560], pl.BF16]],
@@ -329,121 +213,6 @@ def decode_cp_hca_projection_allgather_step(
 
     return group_out, gather_signal, retire_tid
 
-
-
-@pl.jit.inline
-def decode_cp_csa_aux_allgather_step(
-    payload_local: pl.Tensor[[Q_T_DYN, 1536], pl.BF16],
-    group_out: pl.Tensor[[KV_T_DYN, 1536], pl.BF16],
-    gather_window: pld.DistributedTensor[[DECODE_GROUP_CAP, D], pl.BF16],
-    gather_signal: pld.DistributedTensor[[TP_SIZE, 1], pl.INT32],
-    group_base: pl.Scalar[pl.INT32],
-    tp_rank: pl.Scalar[pl.INT32],
-    input_ready_dep: pl.Scalar[pl.TASK_ID],
-):
-    """Gather rank-major rows and retire the complete two-phase signal epoch."""
-    local_rows = pl.tensor.dim(payload_local, 0)
-    local_t = pl.cast(local_rows, pl.INT32)
-    target_row = tp_rank * local_t
-
-    # Publish the payload and first-phase arrival from 8 producers.
-    full_local = (local_t // COMM_ROW_TILE) * COMM_ROW_TILE
-    with pl.spmd(
-        8,
-        name_hint="cp_csa_aux_allgather_push",
-        deps=[input_ready_dep],
-        allow_early_resolve=True,
-    ) as _push_tid:
-        worker = pl.tile.get_block_idx()
-        for peer_tp in pl.range(TP_SIZE):
-            for band_row in pl.range(worker * COMM_ROW_TILE, full_local, 8 * COMM_ROW_TILE):
-                pld.tensor.put(
-                    dst=gather_window, peer=group_base + peer_tp,
-                    src=payload_local,
-                    dst_offsets=[target_row + band_row, 0], src_offsets=[band_row, 0],
-                    shape=[COMM_ROW_TILE, 1536],
-                    chunk_rows=COMM_ROW_TILE, chunk_cols=1536,
-                )
-            for tail_row in pl.range(full_local + worker, local_t, 8):
-                pld.tensor.put(
-                    dst=gather_window, peer=group_base + peer_tp,
-                    src=payload_local,
-                    dst_offsets=[target_row + tail_row, 0], src_offsets=[tail_row, 0],
-                    shape=[1, 1536],
-                    chunk_rows=1, chunk_cols=1536,
-                )
-        for peer_tp in pl.range(TP_SIZE):
-            if peer_tp != tp_rank:
-                pld.system.notify(
-                    target=gather_signal, peer=group_base + peer_tp,
-                    offsets=[tp_rank, 0], value=1, op=pld.NotifyOp.AtomicAdd,
-                )
-
-    # Block on the peer payload arrivals, after the local push has been issued.
-    with pl.at(
-        level=pl.Level.CORE_GROUP,
-        name_hint="cp_csa_aux_allgather_payload_wait",
-        deps=[_push_tid],
-    ) as _payload_wait_tid:
-        for source_tp in pl.range(TP_SIZE):
-            if source_tp != tp_rank:
-                pld.system.wait(
-                    signal=gather_signal, offsets=[source_tp, 0],
-                    expected=pl.cast(8, pl.INT32), cmp=pld.WaitCmp.Ge,
-                )
-
-    # Copy peer payloads and publish local readback completion.
-    group_rows = TP_SIZE * local_rows
-    full_rows = (group_rows // READBACK_ROW_TILE) * READBACK_ROW_TILE
-    with pl.spmd(
-        8,
-        name_hint="cp_csa_aux_allgather_readback",
-        deps=[_push_tid, _payload_wait_tid],
-    ) as _readback_tid:
-        worker = pl.tile.get_block_idx()
-        for tile_row in pl.range(worker * READBACK_ROW_TILE, full_rows, 8 * READBACK_ROW_TILE):
-            window_tile = gather_window[tile_row : tile_row + READBACK_ROW_TILE, 0:1536]
-            group_out[tile_row : tile_row + READBACK_ROW_TILE, 0:1536] = window_tile
-        for tail_row in pl.range(full_rows + worker, group_rows, 8):
-            window_row = gather_window[tail_row : tail_row + 1, 0:1536]
-            group_out[tail_row : tail_row + 1, 0:1536] = window_row
-        for peer_tp in pl.range(TP_SIZE):
-            if peer_tp != tp_rank:
-                pld.system.notify(
-                    target=gather_signal, peer=group_base + peer_tp,
-                    offsets=[tp_rank, 0], value=1, op=pld.NotifyOp.AtomicAdd,
-                )
-
-    with pl.at(
-        level=pl.Level.CORE_GROUP,
-        name_hint="cp_csa_aux_allgather_readback_wait",
-        deps=[_readback_tid],
-    ) as _readback_wait_tid:
-        for source_tp in pl.range(TP_SIZE):
-            if source_tp != tp_rank:
-                pld.system.wait(
-                    signal=gather_signal, offsets=[source_tp, 0],
-                    expected=pl.cast(16, pl.INT32), cmp=pld.WaitCmp.Ge,
-                )
-
-    # Retire peer credits and anchor output consumption to signal retirement.
-    with pl.at(
-        level=pl.Level.CORE_GROUP,
-        name_hint="cp_csa_aux_allgather_retire",
-        deps=[_readback_tid, _readback_wait_tid],
-    ) as retire_tid:
-        completion_anchor = pl.read(group_out, [0, 0])
-        reset_value = pl.cast(-16, pl.INT32)
-        self_rank = group_base + tp_rank
-        for source_tp in pl.range(TP_SIZE):
-            if source_tp != tp_rank:
-                pld.system.notify(
-                    target=gather_signal, peer=self_rank,
-                    offsets=[source_tp, 0], value=reset_value, op=pld.NotifyOp.AtomicAdd,
-                )
-        pl.write(group_out, [0, 0], completion_anchor)
-
-    return group_out, gather_signal, retire_tid
 
 
 @pl.jit.inline
@@ -793,11 +562,65 @@ def decode_cp_kv_allgather_step(
 
 
 
+@pl.jit.inline
+def csa_main_allgather_fixture_step(
+    payload_local: pl.Tensor[[Q_T_DYN, D], pl.BF16],
+    group_out: pl.Tensor[[KV_T_DYN, D], pl.BF16],
+    gather_window: pld.DistributedTensor[[DECODE_GROUP_CAP, D], pl.BF16],
+    gather_signal: pld.DistributedTensor[[TP_SIZE, 1], pl.INT32],
+    group_base: pl.Scalar[pl.INT32],
+    tp_rank: pl.Scalar[pl.INT32],
+    input_ready_dep: pl.Scalar[pl.TASK_ID],
+):
+    """Exercise typed main outputs and repack their bits for the transport oracle."""
+    values = pl.create_tensor([DECODE_GROUP_CAP, 1024], dtype=pl.FP32)
+    scores = pl.create_tensor([DECODE_GROUP_CAP, 1024], dtype=pl.FP32)
+    gather_signal, gather_done_tid = decode_cp_csa_main_typed_allgather_step(
+        payload_local, values, scores, gather_window, gather_signal,
+        group_base, tp_rank, input_ready_dep,
+    )
+    group_rows = pl.tensor.dim(group_out, 0)
+    with pl.spmd(READBACK_WORKERS, name_hint="csa_main_fixture_repack", deps=[gather_done_tid]) as repack_tid:
+        worker = pl.tile.get_block_idx()
+        for row in pl.range(worker, group_rows, READBACK_WORKERS):
+            group_out[row : row + 1, 0:2048] = pl.reinterpret_view(values[row : row + 1, :], pl.BF16)
+            group_out[row : row + 1, 2048:4096] = pl.reinterpret_view(scores[row : row + 1, :], pl.BF16)
+    return group_out, gather_signal, repack_tid
+
+
+@pl.jit.inline
+def csa_aux_allgather_fixture_step(
+    payload_local: pl.Tensor[[Q_T_DYN, 1536], pl.BF16],
+    group_out: pl.Tensor[[KV_T_DYN, 1536], pl.BF16],
+    gather_window: pld.DistributedTensor[[DECODE_GROUP_CAP, D], pl.BF16],
+    gather_signal: pld.DistributedTensor[[TP_SIZE, 1], pl.INT32],
+    group_base: pl.Scalar[pl.INT32],
+    tp_rank: pl.Scalar[pl.INT32],
+    input_ready_dep: pl.Scalar[pl.TASK_ID],
+):
+    """Exercise typed aux outputs and repack their bits for the transport oracle."""
+    group_rows = pl.tensor.dim(group_out, 0)
+    values = pl.create_tensor([DECODE_GROUP_CAP, 256], dtype=pl.FP32)
+    scores = pl.create_tensor([DECODE_GROUP_CAP, 256], dtype=pl.FP32)
+    kv = pl.create_tensor([group_rows, HEAD_DIM], dtype=pl.BF16)
+    gather_signal, gather_done_tid = decode_cp_csa_aux_typed_allgather_step(
+        payload_local, values, scores, kv, gather_window, gather_signal,
+        group_base, tp_rank, input_ready_dep,
+    )
+    with pl.spmd(READBACK_WORKERS, name_hint="csa_aux_fixture_repack", deps=[gather_done_tid]) as repack_tid:
+        worker = pl.tile.get_block_idx()
+        for row in pl.range(worker, group_rows, READBACK_WORKERS):
+            group_out[row : row + 1, 0:512] = pl.reinterpret_view(values[row : row + 1, :], pl.BF16)
+            group_out[row : row + 1, 512:1024] = pl.reinterpret_view(scores[row : row + 1, :], pl.BF16)
+            group_out[row : row + 1, 1024:1536] = kv[row : row + 1, :]
+    return group_out, gather_signal, repack_tid
+
+
 _PAYLOAD_FIXTURES = {
     "kv": (HEAD_DIM, decode_cp_kv_allgather_step),
     "hca": (2560, decode_cp_hca_projection_allgather_step),
-    "csa-main": (D, decode_cp_projection_allgather_step),
-    "csa-aux": (1536, decode_cp_csa_aux_allgather_step),
+    "csa-main": (D, csa_main_allgather_fixture_step),
+    "csa-aux": (1536, csa_aux_allgather_fixture_step),
 }
 
 
