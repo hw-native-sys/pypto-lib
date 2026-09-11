@@ -245,7 +245,9 @@ def decode_hca(
         x_normed, cmp_wkv, cmp_wgate, cmp_values_local, cmp_scores_local, rms_tid,
     )
     projection_local = pl.create_tensor([t_dim, 2560], dtype=pl.BF16)
-    with pl.spmd(16, name_hint="hca_projection_pack", deps=[cmp_projection_tid]) as projection_pack_tid:
+    with pl.spmd(
+        16, name_hint="hca_projection_pack", deps=[cmp_projection_tid], allow_early_resolve=True,
+    ) as projection_pack_tid:
         pack_worker = pl.tile.get_block_idx()
         for pack_row in pl.range(pack_worker, t_dim, 16):
             value_bits = pl.reinterpret_view(cmp_values_local[pack_row : pack_row + 1, :], pl.BF16)
