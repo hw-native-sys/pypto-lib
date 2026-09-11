@@ -38,7 +38,7 @@ import time
 STAGES = ("chunk_cumsum", "scaled_dot_kkt", "solve_tril", "wy_fast",
           "chunk_h", "chunk_o")
 
-from models.qwen3_8_27b.config import GDN_TILING, QWEN3_8_27B
+from config import GDN_TILING, QWEN3_8_27B
 
 D = QWEN3_8_27B.linear_value_head_dim
 CHUNK = GDN_TILING.chunk
@@ -77,7 +77,7 @@ CHAINED = {
 
 def _comparators(stage: str, captured=None) -> dict:
     """megagdn's criterion on every output, optionally capturing the device result."""
-    from models.qwen3_8_27b import reference
+    import reference
 
     def make(name):
         def compare(actual, expected, actual_outputs=None, **_kw):
@@ -118,7 +118,7 @@ def check_stage(stage: str, t: int, h: int, hg: int, platform: str, device: int,
     """
     from golden import run
 
-    mod = importlib.import_module(f"models.qwen3_8_27b.{stage}")
+    mod = importlib.import_module(stage)
     kernel_kw = dict(hg=hg) if stage in GQA_STAGES else {}
     fn = mod.build_kernel(t=t, h=h, d=D, chunk=CHUNK, **kernel_kw)
     specs = mod.build_tensor_specs(t=t, h=h, d=D, chunk=CHUNK, hg=hg)
@@ -192,7 +192,7 @@ def main() -> int:
     if args.save_output and produced is not None and "o_out" in produced:
         import torch
 
-        from models.qwen3_8_27b import reference
+        import reference
 
         x = reference.make_inputs(args.seq_len, args.heads, D, hg)
         torch.save(dict(q=x["q"], k=x["k"], v=x["v"], g_in=x["g"],
