@@ -120,7 +120,7 @@ runs:
       shell: bash
       env:
         PYPTO_DSV4_MODEL_DIR: ${{ steps.model.outputs.dir }}
-        PYPTO_RUNTIME_LOG: error
+        PYPTO_RUNTIME_LOG: info
         SIMPLER_OP_EXECUTE_TIMEOUT_US: 400000000
         SIMPLER_STREAM_SYNC_TIMEOUT_MS: 440000
         SIMPLER_SCHEDULER_TIMEOUT_MS: 320000
@@ -140,8 +140,14 @@ runs:
           *) echo "::error::unknown deepseek-mtp-cases '$MTP_CASES' (expected k1 or all)"; exit 1 ;;
         esac
         source "$GITHUB_WORKSPACE/$PYPTO_LIB_CHECKOUT/activate.sh"
+        # Keep the complete server log and device startup evidence: pytest's
+        # failure output includes only the last 50 KB of the server log.
+        log_dir="$GITHUB_WORKSPACE/$PYPTO_SERVING_CHECKOUT/build_output/ci_serving_logs"
+        mkdir -p "$log_dir/device"
         run_cmd="source $GITHUB_WORKSPACE/$PYPTO_LIB_CHECKOUT/activate.sh"
         run_cmd="$run_cmd && cd $GITHUB_WORKSPACE/$PYPTO_SERVING_CHECKOUT"
+        # Take this diagnostic after task-submit has acquired the device locks.
+        run_cmd="$run_cmd && (npu-smi info > $log_dir/npu-before.log 2>&1 || true)"
         run_cmd="$run_cmd && TASK_DEVICE=\$TASK_DEVICE"
         run_cmd="$run_cmd PYTHONPATH=$GITHUB_WORKSPACE/$PYPTO_SERVING_CHECKOUT"
         run_cmd="$run_cmd PYPTO_DSV4_MODEL_DIR=$PYPTO_DSV4_MODEL_DIR"
@@ -150,9 +156,10 @@ runs:
         run_cmd="$run_cmd SIMPLER_STREAM_SYNC_TIMEOUT_MS=$SIMPLER_STREAM_SYNC_TIMEOUT_MS"
         run_cmd="$run_cmd SIMPLER_SCHEDULER_TIMEOUT_MS=$SIMPLER_SCHEDULER_TIMEOUT_MS"
         run_cmd="$run_cmd SERVING_WORKER_STEP_TIMEOUT=$SERVING_WORKER_STEP_TIMEOUT"
-        run_cmd="$run_cmd python -m pytest $pytest_target -q -s"
+        run_cmd="$run_cmd python -m pytest $pytest_target -q -s --basetemp $log_dir/pytest"
         task-submit --device auto --device-num 8 --ignore-whitelist \
           --timeout 3600 --max-time 1800 \
+          --env ASCEND_PROCESS_LOG_PATH="$log_dir/device" \
           --run "$run_cmd"
 
     - name: Run pypto-serving DeepSeek V4 DSpark accuracy test

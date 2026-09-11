@@ -79,6 +79,12 @@ CMP_BLOCK_NUM = PREFILL_CMP_BLOCK_NUM
 # tiling
 HEAD_TILE = 16               # storage / merge head-tile
 QK_M_TILE = 32               # head rows cube-batched per QK/PV matmul
+QK_TASKS = min(24, T)
+QK_PRE_LAUNCH = 2
+QK_TRANSFER_SLOTS = QK_PRE_LAUNCH + 1
+QK_SCORE_READY_EVENT = 0
+QK_PROB_READY_EVENT = 1
+QK_PV_READY_EVENT = 2
 GATHER_TOKEN_TILE = 2
 BIAS_TOKEN_TILE = 16
 QUANT_TOKEN_TILE = 8
@@ -106,7 +112,7 @@ SPARSE_CMP_BIAS_COLS = max(0, SPARSE_BIAS_COLS - WIN)
 # Shared attention derives query extents from tensors. The query tile only
 # bounds reusable scratch in the paged sparse gather path.
 STAGED_SWA_QUERY_TILE = 128
-STAGED_SWA_QUERY_STATS_ROWS = (STAGED_SWA_QUERY_TILE * (H // HEAD_TILE) * PREFILL_ATTN_BLOCKS * HEAD_TILE)
+STAGED_SWA_QUERY_STATS_ROWS = STAGED_SWA_QUERY_TILE * H
 STAGED_SWA_ROPE_CS_T_TILE = 8
 STAGED_SWA_PROJ_A_ROW_TILE = 256
 STAGED_SWA_PROJ_B_ROW_TILE = 128
@@ -209,7 +215,8 @@ def _staged_sparse_wave(
     query_base: pl.Scalar[pl.INDEX],
 ) -> pl.Scalar[pl.TASK_ID]:
     """Run a QK/PV/merge wave bounded by caller-owned statistics scratch."""
-    wave_rows = pl.tensor.dim(sparse_blk_mi, 0) // (H * PREFILL_ATTN_BLOCKS)
+    wave_rows = pl.tensor.dim(sparse_blk_mi, 0) // H
+    wave_end = pl.min(active_rows, query_base + wave_rows)
     token_rows = pl.tensor.dim(q, 0)
     packed_rows = pl.tensor.dim(o_packed_heads, 0) // H
     query_head_rows = token_rows * H
@@ -218,72 +225,149 @@ def _staged_sparse_wave(
     attn_sink_col = pl.reshape(attn_sink, [H, 1])
     o_packed = pl.reshape(o_packed_heads, [output_group_rows, O_GROUP_IN])
 
-    # Statistics use wave-local row indices, so all waves reuse one scratch.
-    with pl.spmd(wave_rows, name_hint="staged_swa_qk_pv", deps=[source_ready_tid]) as qk_tid:
-        qk_local_t = pl.tile.get_block_idx()
-        qk_t = query_base + qk_local_t
-        if qk_t < active_rows:
-            qk_kv_base = qk_t * PREFILL_SPARSE_PAD
-            qk_token_base = (qk_local_t * (H // HEAD_TILE) * PREFILL_ATTN_BLOCKS * HEAD_TILE)
-            for qk_sb in pl.range(PREFILL_ATTN_BLOCKS):
-                qk_s0 = qk_kv_base + qk_sb * PREFILL_ATTN_TILE
-                qk_b0 = qk_sb * PREFILL_ATTN_TILE
-                qk_bias_row = sparse_bias[qk_t : qk_t + 1, qk_b0 : qk_b0 + PREFILL_ATTN_TILE]
-                qk_block_valid = pl.read(valid_block_mask, [qk_t, qk_sb])
-                if qk_sb == 0:
-                    qk_block_valid = pl.cast(1, pl.INT32)
-                if qk_block_valid > 0:
-                    qk_kv_k = sparse_kv[qk_s0 : qk_s0 + PREFILL_ATTN_TILE, :]
-                    qk_kv_v = sparse_kv[qk_s0 : qk_s0 + PREFILL_ATTN_TILE, :]
-                    for qk_hb in pl.pipeline(H // QK_M_TILE, stage=2):
-                        qk_head_row = qk_t * H + qk_hb * QK_M_TILE
-                        qk_q_tile = q_flat[qk_head_row : qk_head_row + QK_M_TILE, :]
-                        qk_raw = pl.matmul(qk_q_tile, qk_kv_k, b_trans=True, out_dtype=pl.FP32)
-                        qk_scaled = pl.mul(qk_raw, SOFTMAX_SCALE)
-                        qk_scores = pl.col_expand_add(qk_scaled, qk_bias_row)
-                        qk_mi = pl.row_max(qk_scores)
-                        qk_exp = pl.exp(pl.row_expand_sub(qk_scores, qk_mi))
-                        qk_li = pl.row_sum(qk_exp)
-                        qk_exp_bf16 = pl.cast(qk_exp, target_type=pl.BF16, mode="rint")
-                        qk_oi = pl.matmul(qk_exp_bf16, qk_kv_v, out_dtype=pl.FP32)
-                        for qk_sub in pl.unroll(QK_M_TILE // HEAD_TILE):
-                            qk_h_idx = (qk_hb * (QK_M_TILE // HEAD_TILE) + qk_sub)
-                            qk_r0 = qk_sub * HEAD_TILE
-                            qk_blk_base = (qk_token_base + qk_h_idx * PREFILL_ATTN_BLOCKS * HEAD_TILE)
-                            qk_row = qk_blk_base + qk_sb * HEAD_TILE
-                            sparse_blk_mi[qk_row : qk_row + HEAD_TILE, :] = qk_mi[qk_r0 : qk_r0 + HEAD_TILE, :]
-                            sparse_blk_li[qk_row : qk_row + HEAD_TILE, :] = qk_li[qk_r0 : qk_r0 + HEAD_TILE, :]
-                            sparse_blk_oi[qk_row : qk_row + HEAD_TILE, :] = qk_oi[qk_r0 : qk_r0 + HEAD_TILE, :]
+    # Pipeline K blocks and keep the online-softmax state local to each query.
+    transfer_slots = QK_TASKS * QK_TRANSFER_SLOTS
+    transfer_heads = transfer_slots * H
+    score_transfer = pl.create_tensor([transfer_heads, PREFILL_ATTN_TILE], dtype=pl.FP32)
+    probability_transfer = pl.create_tensor([transfer_heads, PREFILL_ATTN_TILE], dtype=pl.BF16)
+    pv_transfer = pl.create_tensor([transfer_heads, HEAD_DIM], dtype=pl.FP32)
+    mi_transfer = pl.create_tensor([transfer_heads, 1], dtype=pl.FP32)
+    li_transfer = pl.create_tensor([transfer_heads, 1], dtype=pl.FP32)
+    ffts_workspace = pl.create_tensor([256], dtype=pl.INT64)
+    with pl.spmd(QK_TASKS, name_hint="staged_swa_qk_pv", deps=[source_ready_tid], allow_early_resolve=True) as qk_tid:
+        qk_core = pl.tile.get_block_idx()
+        pl.system.set_ffts(ffts_workspace)
+        for qk_t in pl.range(query_base + qk_core, wave_end, QK_TASKS):
+            qk_q = pl.load(
+                q_flat, [qk_t * H, 0], [H, HEAD_DIM], target_memory=pl.MemorySpace.Mat,
+            )
+            for qk_tick in pl.range(PREFILL_ATTN_BLOCKS + QK_PRE_LAUNCH):
+                if qk_tick < PREFILL_ATTN_BLOCKS:
+                    qk_sb = qk_tick
+                    if pl.read(valid_block_mask, [qk_t, qk_sb]) > 0:
+                        qk_slot = qk_core * QK_TRANSFER_SLOTS + qk_sb % QK_TRANSFER_SLOTS
+                        qk_kv_row = qk_t * PREFILL_SPARSE_PAD + qk_sb * PREFILL_ATTN_TILE
+                        qk_transfer_row = qk_slot * H
+                        qk_kv = pl.load(
+                            sparse_kv, [qk_kv_row, 0], [PREFILL_ATTN_TILE, HEAD_DIM],
+                            target_memory=pl.MemorySpace.Mat,
+                        )
+                        qk_scores = pl.matmul(qk_q, pl.tile.transpose_view(qk_kv), out_dtype=pl.FP32)
+                        pl.store(qk_scores, [qk_transfer_row, 0], score_transfer)
+                        pl.system.sync_set(
+                            QK_SCORE_READY_EVENT, pipe=pl.PipeType.FIX,
+                            ffts_mode=2, core_type=pl.KernelType.AIC,
+                        )
+                if qk_tick >= QK_PRE_LAUNCH:
+                    pv_sb = qk_tick - QK_PRE_LAUNCH
+                    if pl.read(valid_block_mask, [qk_t, pv_sb]) > 0:
+                        pv_slot = qk_core * QK_TRANSFER_SLOTS + pv_sb % QK_TRANSFER_SLOTS
+                        pv_kv_row = qk_t * PREFILL_SPARSE_PAD + pv_sb * PREFILL_ATTN_TILE
+                        pv_transfer_row = pv_slot * H
+                        pl.system.sync_wait(QK_PROB_READY_EVENT, pipe=pl.PipeType.MTE2, core_type=pl.KernelType.AIC)
+                        pv_probability = pl.load(
+                            probability_transfer, [pv_transfer_row, 0], [H, PREFILL_ATTN_TILE],
+                            target_memory=pl.MemorySpace.Mat,
+                        )
+                        pv_kv = pl.load(
+                            sparse_kv, [pv_kv_row, 0], [PREFILL_ATTN_TILE, HEAD_DIM],
+                            target_memory=pl.MemorySpace.Mat,
+                        )
+                        pv_output = pl.matmul(pv_probability, pv_kv, out_dtype=pl.FP32)
+                        pl.store(pv_output, [pv_transfer_row, 0], pv_transfer)
+                        pl.system.sync_set(
+                            QK_PV_READY_EVENT, pipe=pl.PipeType.FIX,
+                            ffts_mode=2, core_type=pl.KernelType.AIC,
+                        )
+
+            for qk_aiv in pl.split_aiv(2, mode=pl.SplitMode.NONE):
+                pl.system.set_ffts(ffts_workspace)
+                qk_lane_head = qk_aiv * (H // 2)
+                qk_reduce_tmp = pl.create_tile([H // 2, PREFILL_ATTN_TILE], dtype=pl.FP32, target_memory=pl.MemorySpace.Vec)
+                running_m = pl.load(attn_sink_col, [qk_lane_head, 0], [H // 2, 1], target_memory=pl.MemorySpace.Vec)
+                running_l = pl.tile.muls(running_m, 0.0)
+                running_left = pl.tile.full([H // 2, HEAD_DIM // 2], dtype=pl.FP32, value=0.0)
+                running_right = pl.tile.full([H // 2, HEAD_DIM // 2], dtype=pl.FP32, value=0.0)
+                for qk_tick, (m_iter, l_iter, left_iter, right_iter) in pl.range(
+                    PREFILL_ATTN_BLOCKS + QK_PRE_LAUNCH,
+                    init_values=(running_m, running_l, running_left, running_right),
+                ):
+                    if qk_tick < PREFILL_ATTN_BLOCKS:
+                        qk_sb = qk_tick
+                        if pl.read(valid_block_mask, [qk_t, qk_sb]) > 0:
+                            qk_slot = qk_core * QK_TRANSFER_SLOTS + qk_sb % QK_TRANSFER_SLOTS
+                            qk_transfer_row = qk_slot * H
+                            qk_s0 = qk_sb * PREFILL_ATTN_TILE
+                            pl.system.sync_wait(QK_SCORE_READY_EVENT, pipe=pl.PipeType.MTE2, core_type=pl.KernelType.AIV)
+                            qk_scores_half = pl.load(
+                                score_transfer, [qk_transfer_row + qk_lane_head, 0], [H // 2, PREFILL_ATTN_TILE],
+                                target_memory=pl.MemorySpace.Vec,
+                            )
+                            qk_bias = pl.load(
+                                sparse_bias, [qk_t, qk_s0], [1, PREFILL_ATTN_TILE], target_memory=pl.MemorySpace.Vec,
+                            )
+                            qk_scaled = pl.mul(qk_scores_half, SOFTMAX_SCALE)
+                            qk_masked = pl.col_expand_add(qk_scaled, qk_bias)
+                            qk_mi = pl.row_max(qk_masked, qk_reduce_tmp)
+                            qk_exp = pl.exp(pl.row_expand_sub(qk_masked, qk_mi))
+                            qk_li = pl.row_sum(qk_exp, qk_reduce_tmp)
+                            qk_probability = pl.cast(qk_exp, target_type=pl.BF16, mode="rint")
+                            pl.store(qk_probability, [qk_transfer_row + qk_lane_head, 0], probability_transfer)
+                            pl.store(qk_mi, [qk_transfer_row + qk_lane_head, 0], mi_transfer)
+                            pl.store(qk_li, [qk_transfer_row + qk_lane_head, 0], li_transfer)
+                            pl.system.sync_set(
+                                QK_PROB_READY_EVENT, pipe=pl.PipeType.MTE3,
+                                ffts_mode=2, core_type=pl.KernelType.AIV,
+                            )
+                    if qk_tick >= QK_PRE_LAUNCH:
+                        pv_sb = qk_tick - QK_PRE_LAUNCH
+                        if pl.read(valid_block_mask, [qk_t, pv_sb]) > 0:
+                            pv_slot = qk_core * QK_TRANSFER_SLOTS + pv_sb % QK_TRANSFER_SLOTS
+                            pv_transfer_row = pv_slot * H
+                            pl.system.sync_wait(QK_PV_READY_EVENT, pipe=pl.PipeType.MTE2, core_type=pl.KernelType.AIV)
+                            pv_m = pl.load(mi_transfer, [pv_transfer_row + qk_lane_head, 0], [H // 2, 1], target_memory=pl.MemorySpace.Vec)
+                            pv_l = pl.load(li_transfer, [pv_transfer_row + qk_lane_head, 0], [H // 2, 1], target_memory=pl.MemorySpace.Vec)
+                            next_m = pl.maximum(m_iter, pv_m)
+                            alpha = pl.exp(pl.sub(m_iter, next_m))
+                            beta = pl.exp(pl.sub(pv_m, next_m))
+                            next_l = pl.add(pl.mul(alpha, l_iter), pl.mul(beta, pv_l))
+                            pv_left = pl.load(
+                                pv_transfer, [pv_transfer_row + qk_lane_head, 0], [H // 2, HEAD_DIM // 2],
+                                target_memory=pl.MemorySpace.Vec,
+                            )
+                            next_left = pl.add(pl.row_expand_mul(left_iter, alpha), pl.row_expand_mul(pv_left, beta))
+                            pv_right = pl.load(
+                                pv_transfer, [pv_transfer_row + qk_lane_head, HEAD_DIM // 2], [H // 2, HEAD_DIM // 2],
+                                target_memory=pl.MemorySpace.Vec,
+                            )
+                            next_right = pl.add(pl.row_expand_mul(right_iter, alpha), pl.row_expand_mul(pv_right, beta))
+                            m_valid, l_valid, left_valid, right_valid = pl.yield_(next_m, next_l, next_left, next_right)
+                        else:
+                            m_valid, l_valid, left_valid, right_valid = pl.yield_(m_iter, l_iter, left_iter, right_iter)
+                        m_after, l_after, left_after, right_after = pl.yield_(m_valid, l_valid, left_valid, right_valid)
+                    else:
+                        m_after, l_after, left_after, right_after = pl.yield_(m_iter, l_iter, left_iter, right_iter)
+                    running_m, running_l, running_left, running_right = pl.yield_(m_after, l_after, left_after, right_after)
+                qk_output_row = (qk_t - query_base) * H + qk_lane_head
+                pl.store(running_m, [qk_output_row, 0], sparse_blk_mi)
+                pl.store(running_l, [qk_output_row, 0], sparse_blk_li)
+                pl.store(running_left, [qk_output_row, 0], sparse_blk_oi)
+                pl.store(running_right, [qk_output_row, HEAD_DIM // 2], sparse_blk_oi)
 
     with pl.spmd(wave_rows, name_hint="staged_swa_merge_rope_pack", deps=[qk_tid, merge_ready_tid]) as merge_tid:
         m_local_t = pl.tile.get_block_idx()
         m_t = query_base + m_local_t
         if m_t < active_rows:
-            m_token_base = (m_local_t * (H // HEAD_TILE) * PREFILL_ATTN_BLOCKS * HEAD_TILE)
-            m_mask_row = valid_block_mask[m_t : m_t + 1, :]
+            m_token_base = m_local_t * H
             m_swap_idx = rope_swap_idx[:, :]
             m_cos_il = rope_cos_il[m_t : m_t + 1, :]
             m_sin_signed = rope_sin_signed[m_t : m_t + 1, :]
             for m_h_idx in pl.range(H // HEAD_TILE):
                 m_h0 = m_h_idx * HEAD_TILE
-                m_blk_base = (m_token_base + m_h_idx * PREFILL_ATTN_BLOCKS * HEAD_TILE)
+                m_blk_base = m_token_base + m_h_idx * HEAD_TILE
                 m_mi = sparse_blk_mi[m_blk_base : m_blk_base + HEAD_TILE, :]
                 m_li = sparse_blk_li[m_blk_base : m_blk_base + HEAD_TILE, :]
                 m_oi = sparse_blk_oi[m_blk_base : m_blk_base + HEAD_TILE, :]
-                for m_sb in pl.unroll(1, PREFILL_ATTN_BLOCKS):
-                    m_block_valid = pl.read(m_mask_row, [0, m_sb])
-                    if m_block_valid > 0:
-                        m_row = m_blk_base + m_sb * HEAD_TILE
-                        cur_mi = sparse_blk_mi[m_row : m_row + HEAD_TILE, :]
-                        cur_li = sparse_blk_li[m_row : m_row + HEAD_TILE, :]
-                        cur_oi = sparse_blk_oi[m_row : m_row + HEAD_TILE, :]
-                        mi_new = pl.maximum(m_mi, cur_mi)
-                        alpha = pl.exp(pl.sub(m_mi, mi_new))
-                        beta = pl.exp(pl.sub(cur_mi, mi_new))
-                        m_li = pl.add(pl.mul(alpha, m_li), pl.mul(beta, cur_li))
-                        m_oi = pl.add(pl.row_expand_mul(m_oi, alpha), pl.row_expand_mul(cur_oi, beta))
-                        m_mi = mi_new
-
                 sink_bias = attn_sink_col[m_h0 : m_h0 + HEAD_TILE, :]
                 sink_tile = pl.add(pl.sub(m_mi, m_mi), sink_bias)
                 denom = pl.add(m_li, pl.exp(pl.sub(sink_tile, m_mi)))
@@ -550,7 +634,7 @@ def _physical_sparse_heads(
     """Run a segment-sized physical-gather wave with split source dependencies."""
     token_rows = pl.tensor.dim(q, 0)
     source_rows = token_rows * PREFILL_SPARSE_PAD
-    stats_rows = token_rows * H * PREFILL_ATTN_BLOCKS
+    stats_rows = token_rows * H
     rope_rows = ((token_rows + STAGED_SWA_ROPE_CS_T_TILE - 1) // STAGED_SWA_ROPE_CS_T_TILE) * STAGED_SWA_ROPE_CS_T_TILE
     completion = pl.array.create(1, pl.TASK_ID)
     completion[0] = packed_init_tid
@@ -1675,6 +1759,8 @@ if __name__ == "__main__":
     parser.add_argument("--cmp-block-num", type=int, default=CMP_BLOCK_NUM)
     parser.add_argument("--enable-chip-swimlane", type=int, nargs="?", const=1, default=0, choices=range(5))
     parser.add_argument("--enable-pmu", nargs="?", const=2, default=0, type=int, choices=[0, 1, 2, 4])
+    parser.add_argument("--save-data", action="store_true", help="Save inputs and golden outputs for replay.")
+    parser.add_argument("--golden-data", type=str, default=None)
     parser.add_argument("--dump-passes", action="store_true", default=False)
     args = parser.parse_args()
 
@@ -1682,6 +1768,8 @@ if __name__ == "__main__":
         fn=prefill_sparse_attn_test,
         specs=build_tensor_specs(args.compress_ratio, args.num_tokens, args.ori_block_num, args.cmp_block_num),
         golden_fn=golden_prefill_sparse_attn,
+        save_data=args.save_data,
+        golden_data=args.golden_data,
         config=dict(
             dump_passes=args.dump_passes,
             platform=args.platform,
