@@ -6,12 +6,16 @@
 # INCLUDING BUT NOT LIMITED TO NON-INFRINGEMENT, MERCHANTABILITY, OR FITNESS FOR A PARTICULAR PURPOSE.
 # See LICENSE in the root of the software repository for the full text of the License.
 # -----------------------------------------------------------------------------------------------------------
-"""Float64 CPU reference for the Gated DeltaNet forward pass.
+"""Float64 CPU reference for the Gated DeltaNet block.
 
-One function per pipeline stage, plus :func:`compute` which chains all six and
-returns every intermediate. Each stage kernel validates against the matching
-function here, and every stage's test input is the reference output of the stage
-before it -- so no stage is ever fed data the pipeline could not produce.
+Two layers. The delta rule: one function per pipeline stage, plus :func:`compute`
+which chains all six and returns every intermediate. Each stage kernel validates
+against the matching function here, and every stage's test input is the
+reference output of the stage before it -- so no stage is ever fed data the
+pipeline could not produce. Around it the block: the projections, the short
+convolution, the qk-norm and gate, the gated RMSNorm and `out_proj`, chained by
+:func:`block` from hidden states to hidden states. That chain is checked against
+the model's own `Qwen3_5GatedDeltaNet` by `test_block_reference.py`.
 
 The stage signatures follow the model's natural layout ([T, H, D] values,
 [T, H] per-token scalars, [NCHUNK, H, D, D] states). The kernels take some of
@@ -28,6 +32,8 @@ from __future__ import annotations
 
 import torch
 import torch.nn.functional as F
+
+from config import Qwen38Config
 
 REF_DTYPE = torch.float64
 
@@ -223,6 +229,44 @@ STAGES = ("chunk_cumsum", "scaled_dot_kkt", "solve_tril", "wy_fast",
 _CACHE: dict[tuple, dict] = {}
 
 
+def _run_stage(st: dict, stage: str, chunk: int, narrow: bool) -> None:
+    """Advance the chain in *st* by one stage.
+
+    With *narrow*, values crossing a stage boundary are also kept narrowed to the
+    dtype the kernels exchange -- FP16 for A, A_inv, W, U, V_new and the state
+    snapshots, under the key with a `16` suffix -- and that copy is what the next
+    stage reads, so a stage's reference input is bit-identical to what the
+    preceding kernel would have handed it. Without it every stage reads float64.
+    """
+    def put(key, value):
+        st[key] = value
+        if narrow:
+            st[key + "16"] = value.to(torch.float16)
+
+    def src(key):
+        return st[key + "16"] if narrow else st[key]
+
+    if stage == "chunk_cumsum":
+        st["g_sum"] = cumsum(st["g"], chunk)
+    elif stage == "scaled_dot_kkt":
+        put("a", kkt(st["k"], st["beta"], st["g_sum"], chunk))
+    elif stage == "solve_tril":
+        put("a_inv", solve_tril(src("a"), chunk))
+    elif stage == "wy_fast":
+        w, u = wy_fast(st["k"], st["v"], st["beta"], src("a_inv"), st["g_sum"], chunk)
+        put("w", w)
+        put("u", u)
+    elif stage == "chunk_h":
+        state, v_new, final_state = chunk_h(st["k"], src("w"), src("u"),
+                                            st["g_sum"], chunk)
+        put("state", state)
+        put("v_new", v_new)
+        st["final_state"] = final_state
+    elif stage == "chunk_o":
+        st["o"] = chunk_o(st["q"], st["k"], src("v_new"), src("state"),
+                          st["g_sum"], chunk)
+
+
 def compute(upto: str, t: int, h: int, d: int, chunk: int,
             hg: int | None = None, seed: int = 42) -> dict[str, torch.Tensor]:
     """Reference inputs plus every stage output through *upto*, cached and extended.
@@ -242,29 +286,22 @@ def compute(upto: str, t: int, h: int, d: int, chunk: int,
     if st is None:
         st = _CACHE[key] = dict(make_inputs(t, h, d, hg, seed), _done=0)
     while st["_done"] < want:
-        stage = STAGES[st["_done"]]
-        if stage == "chunk_cumsum":
-            st["g_sum"] = cumsum(st["g"], chunk)
-        elif stage == "scaled_dot_kkt":
-            st["a"] = kkt(st["k"], st["beta"], st["g_sum"], chunk)
-            st["a16"] = st["a"].to(torch.float16)
-        elif stage == "solve_tril":
-            st["a_inv"] = solve_tril(st["a16"], chunk)
-            st["a_inv16"] = st["a_inv"].to(torch.float16)
-        elif stage == "wy_fast":
-            st["w"], st["u"] = wy_fast(st["k"], st["v"], st["beta"],
-                                       st["a_inv16"], st["g_sum"], chunk)
-            st["w16"] = st["w"].to(torch.float16)
-            st["u16"] = st["u"].to(torch.float16)
-        elif stage == "chunk_h":
-            st["state"], st["v_new"], st["final_state"] = chunk_h(
-                st["k"], st["w16"], st["u16"], st["g_sum"], chunk)
-            st["state16"] = st["state"].to(torch.float16)
-            st["v_new16"] = st["v_new"].to(torch.float16)
-        elif stage == "chunk_o":
-            st["o"] = chunk_o(st["q"], st["k"], st["v_new16"], st["state16"],
-                              st["g_sum"], chunk)
+        _run_stage(st, STAGES[st["_done"]], chunk, narrow=True)
         st["_done"] += 1
+    return st
+
+
+def delta_rule(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor,
+               beta: torch.Tensor, g: torch.Tensor, chunk: int,
+               narrow: bool = False) -> dict[str, torch.Tensor]:
+    """All six stages on the given inputs; every intermediate, `o` the output.
+
+    The block's core. Float64 throughout unless *narrow*, which narrows the
+    stage boundaries exactly as :func:`compute` does.
+    """
+    st = dict(q=q, k=k, v=v, beta=beta, g=g)
+    for stage in STAGES:
+        _run_stage(st, stage, chunk, narrow)
     return st
 
 
@@ -288,6 +325,171 @@ def lazy(stage: str, key: str, t: int, h: int, d: int, chunk: int,
         return transform(value) if transform is not None else value
 
     return load
+
+
+# ---------------------------------------------------------------------------
+# The block around the delta rule
+# ---------------------------------------------------------------------------
+#
+# `Qwen3_5GatedDeltaNet.forward` (transformers 5.17.0, `models/qwen3_5/
+# modeling_qwen3_5.py`), read line by line, for one sequence of T tokens:
+#
+#   qkv     = x @ Wqkv^T                          in_proj_qkv, hidden -> 2*Hg*D + H*D
+#   z       = x @ Wz^T                            in_proj_z,   hidden -> H*D
+#   a, b    = x @ Wa^T, x @ Wb^T                  in_proj_a/b, hidden -> H each
+#   qkv     = silu(causal_conv(qkv))              depthwise, K taps, no bias
+#   q, k, v = split(qkv)                          [T, Hg, D], [T, Hg, D], [T, H, D]
+#   q       = l2norm(q) * D^-0.5;  k = l2norm(k)  eps = 1e-6, inside the sqrt
+#   beta    = sigmoid(b)
+#   g       = -exp(A_log) * softplus(a + dt_bias)
+#   o       = delta_rule(q, k, v, beta, g)        the six stages above
+#   y       = o * rsqrt(mean(o^2) + eps) * w_norm * silu(z)     per head row
+#   out     = y @ Wout^T                          out_proj, H*D -> hidden
+#
+# Weights carry the checkpoint's names under `linear_attn.`, so one dict serves
+# this chain and the module's `load_state_dict` alike. `nn.Linear` stores
+# `[out, in]`; `conv1d.weight` is `[C, 1, K]`.
+
+WEIGHT_NAMES = ("in_proj_qkv.weight", "in_proj_z.weight", "in_proj_a.weight",
+                "in_proj_b.weight", "conv1d.weight", "A_log", "dt_bias",
+                "norm.weight", "out_proj.weight")
+
+# The model's dtype: what the checkpoint stores and what its activations carry.
+MODEL_DTYPE = torch.bfloat16
+
+QK_NORM_EPS = 1e-6
+
+
+def make_block_inputs(t: int, cfg: Qwen38Config, seed: int = 42) -> torch.Tensor:
+    """Hidden states entering the block, `[T, hidden]`, unit normal in bf16.
+
+    What the layer's input RMSNorm hands over is unit-scale per channel, and this
+    is the stand-in for it; nothing here depends on a real prompt.
+    """
+    gen = torch.Generator().manual_seed(seed)
+    return torch.randn(t, cfg.hidden_size, generator=gen).to(MODEL_DTYPE)
+
+
+def make_block_weights(cfg: Qwen38Config, seed: int = 42) -> dict[str, torch.Tensor]:
+    """Random weights from the module's own init, in the checkpoint's bf16.
+
+    `nn.Linear` and `nn.Conv1d` default to kaiming-uniform, which for their
+    default gain is `U(-1/sqrt(fan_in), 1/sqrt(fan_in))`; the conv's fan-in is its
+    K taps. `A_log = log(U(0.01, 16))`, `dt_bias = 1` and `norm.weight = 1` are
+    `Qwen3_5GatedDeltaNet.__init__` verbatim. Fine for the fast loop; the decay
+    range a trained layer reaches is what the real weights are for.
+
+    Each tensor draws from its own generator, as :func:`make_inputs` does.
+    """
+    h, hg, d = (cfg.linear_num_value_heads, cfg.linear_num_key_heads,
+                cfg.linear_value_head_dim)
+    hidden, k = cfg.hidden_size, cfg.linear_conv_kernel_dim
+
+    def uniform(offset, *shape, bound):
+        gen = torch.Generator().manual_seed(seed + offset)
+        return ((torch.rand(*shape, generator=gen) * 2 - 1) * bound).to(MODEL_DTYPE)
+
+    lin = hidden ** -0.5
+    a_gen = torch.Generator().manual_seed(seed + 6)
+    return {
+        "in_proj_qkv.weight": uniform(1, cfg.qkv_width, hidden, bound=lin),
+        "in_proj_z.weight": uniform(2, h * d, hidden, bound=lin),
+        "in_proj_a.weight": uniform(3, h, hidden, bound=lin),
+        "in_proj_b.weight": uniform(4, h, hidden, bound=lin),
+        "conv1d.weight": uniform(5, cfg.qkv_width, 1, k, bound=k ** -0.5),
+        "A_log": torch.log(0.01 + (16 - 0.01) * torch.rand(h, generator=a_gen)).to(MODEL_DTYPE),
+        "dt_bias": torch.ones(h, dtype=MODEL_DTYPE),
+        "norm.weight": torch.ones(d, dtype=MODEL_DTYPE),
+        "out_proj.weight": uniform(7, hidden, h * d, bound=(h * d) ** -0.5),
+    }
+
+
+def linear(x: torch.Tensor, weight: torch.Tensor) -> torch.Tensor:
+    """`nn.Linear` without bias: `x @ W^T`, W stored `[out, in]`."""
+    return x.to(REF_DTYPE) @ weight.to(REF_DTYPE).t()
+
+
+def short_conv(x: torch.Tensor, weight: torch.Tensor) -> torch.Tensor:
+    """Depthwise causal convolution over the token axis, then silu. [T, C] -> [T, C].
+
+    `out[t, c] = sum_j w[c, j] * x[t - (K - 1) + j, c]`, taps before the start of
+    the sequence reading zero -- `nn.Conv1d(padding=K-1, groups=C, bias=False)`
+    kept to its first T outputs. So tap `K-1` reads the token itself and tap `0`
+    the token `K-1` back: the filter is written newest-last.
+    """
+    t, c = x.shape
+    k = weight.shape[-1]
+    xf = x.to(REF_DTYPE)
+    wf = weight.reshape(c, k).to(REF_DTYPE)
+    padded = torch.cat([torch.zeros(k - 1, c, dtype=REF_DTYPE), xf])
+    out = torch.zeros(t, c, dtype=REF_DTYPE)
+    for j in range(k):
+        out += padded[j : j + t] * wf[:, j]
+    return F.silu(out)
+
+
+def l2norm(x: torch.Tensor, eps: float = QK_NORM_EPS) -> torch.Tensor:
+    """`x * rsqrt(sum(x^2) + eps)` over the last dim: the eps sits inside the sqrt."""
+    xf = x.to(REF_DTYPE)
+    return xf * torch.rsqrt((xf * xf).sum(dim=-1, keepdim=True) + eps)
+
+
+def qk_norm_gate(q: torch.Tensor, k: torch.Tensor, a: torch.Tensor, b: torch.Tensor,
+                 a_log: torch.Tensor, dt_bias: torch.Tensor
+                 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    """What the delta rule reads: q and k L2-normalised, q scaled by D^-0.5, beta, g.
+
+    `beta = sigmoid(b)`; `g = -exp(A_log) * softplus(a + dt_bias)`, so g <= 0 and
+    the state only ever decays. Both are per value head, `[T, H]`.
+    """
+    d = q.shape[-1]
+    q_out = l2norm(q) * d ** -0.5
+    k_out = l2norm(k)
+    beta = torch.sigmoid(b.to(REF_DTYPE))
+    g = -torch.exp(a_log.to(REF_DTYPE)) * F.softplus(a.to(REF_DTYPE) + dt_bias.to(REF_DTYPE))
+    return q_out, k_out, beta, g
+
+
+def gated_rmsnorm(o: torch.Tensor, z: torch.Tensor, weight: torch.Tensor,
+                  eps: float) -> torch.Tensor:
+    """RMSNorm over the head dim, times the weight, times `silu(z)`. [T, H, D] -> same.
+
+    The gate multiplies after the norm (`Qwen3_5RMSNormGated`: "norm before
+    gate"), so z does not enter the variance.
+    """
+    of = o.to(REF_DTYPE)
+    var = (of * of).mean(dim=-1, keepdim=True)
+    return of * torch.rsqrt(var + eps) * weight.to(REF_DTYPE) * F.silu(z.to(REF_DTYPE))
+
+
+def block(x: torch.Tensor, w: dict[str, torch.Tensor], cfg: Qwen38Config,
+          chunk: int) -> dict[str, torch.Tensor]:
+    """The whole block in float64, hidden states `[T, hidden]` to `out` of the same shape.
+
+    Returns every intermediate: the projections `qkv`, `z`, `a_proj`, `b_proj`
+    (`a` is the delta rule's key-key matrix, as everywhere else here); the conv
+    output `qkv_conv`; the delta rule's inputs `q`, `k`, `v`, `beta`, `g` and
+    its output `o` (plus everything :func:`delta_rule` keeps); the normed `y`;
+    and `out`. Nothing is narrowed anywhere.
+    """
+    h, hg, d = (cfg.linear_num_value_heads, cfg.linear_num_key_heads,
+                cfg.linear_value_head_dim)
+    t = x.shape[0]
+    key_width = hg * d
+
+    st = {}
+    st["qkv"] = linear(x, w["in_proj_qkv.weight"])
+    st["z"] = linear(x, w["in_proj_z.weight"]).reshape(t, h, d)
+    st["a_proj"] = linear(x, w["in_proj_a.weight"])
+    st["b_proj"] = linear(x, w["in_proj_b.weight"])
+    st["qkv_conv"] = short_conv(st["qkv"], w["conv1d.weight"])
+    q, k, v = torch.split(st["qkv_conv"], [key_width, key_width, h * d], dim=-1)
+    q, k, beta, g = qk_norm_gate(q.reshape(t, hg, d), k.reshape(t, hg, d),
+                                 st["a_proj"], st["b_proj"], w["A_log"], w["dt_bias"])
+    st.update(delta_rule(q, k, v.reshape(t, h, d), beta, g, chunk))
+    st["y"] = gated_rmsnorm(st["o"], st["z"], w["norm.weight"], cfg.rms_norm_eps)
+    st["out"] = linear(st["y"].reshape(t, h * d), w["out_proj.weight"])
+    return st
 
 
 # ---------------------------------------------------------------------------

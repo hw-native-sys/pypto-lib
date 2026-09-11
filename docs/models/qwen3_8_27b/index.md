@@ -68,7 +68,30 @@ rest of the block and are not built yet.
 ## Validating and benchmarking
 
 [reference.py](../../../models/qwen3_8_27b/reference.py) is a float64 torch chain
-of all six stages. [test_gdn_stages.py](../../../models/qwen3_8_27b/test_gdn_stages.py)
+of all six stages, and around them of the whole block: the four projections, the
+depthwise convolution, the qk-norm and gate, the gated RMSNorm and `out_proj`,
+read line by line from `Qwen3_5GatedDeltaNet` in `transformers`. That block
+chain is what the operators still to be built will be scored against, so it is
+itself checked against the model's own module:
+[test_block_reference.py](../../../models/qwen3_8_27b/test_block_reference.py)
+runs `Qwen3_5GatedDeltaNet` on the same hidden states and weights and compares
+the two at every projection, after the delta rule, after the norm and at the
+output. With the module in float64 the projections agree exactly and everything
+after the gate to about 3e-7 -- the module computes its gate, delta rule and norm
+statistics in fp32 by its own code, which is the floor. In the model's own bf16
+the block output sits 3e-3 to 7e-3 from the float64 chain, which is the
+yardstick for what a device-side block can be held to.
+
+Two weight sets serve that check and every later one: random weights drawn the
+way the module's own `__init__` draws them, and one real layer.
+[weights.py](../../../models/qwen3_8_27b/weights.py) fetches a layer's nine
+`linear_attn` tensors from the published checkpoint with a single 221 MiB range
+request -- they are contiguous in their shard -- so no checkpoint download is
+needed. A trained layer's `A_log` and `dt_bias` reach a decay range the random
+init does not, and that is the range where a wrong scale, a wrong eps or a
+saturating gate would show.
+
+[test_gdn_stages.py](../../../models/qwen3_8_27b/test_gdn_stages.py)
 feeds each operator the reference outputs of the ones before it and scores it on
 relative Frobenius norm; `--chain` instead feeds each operator the previous
 *kernel's* device output, which is what the deployed pipeline does.
@@ -84,5 +107,15 @@ python models/qwen3_8_27b/bench.py -p a2a3 -d 0 --seq-len 8192
 Both take `--heads` and `--qk-heads`, defaulting to the model's 48 and 16. Pass
 the same value to both for an ungrouped shape.
 
-These are device entry points, not pytest cases: they need an NPU and a compile,
-so they carry no `test_` functions and CI never collects them.
+The block reference check needs no NPU, only `transformers` (5.17.0):
+
+```bash
+python models/qwen3_8_27b/weights.py --layer 0
+python models/qwen3_8_27b/test_block_reference.py
+python models/qwen3_8_27b/test_block_reference.py --weights build_output/qwen3_8_27b/linear_attn_layer0.pt
+python models/qwen3_8_27b/test_block_reference.py --module-dtype float64,bfloat16 --seq-len 1024
+```
+
+These are entry points, not pytest cases: the device ones need an NPU and a
+compile, the block check a `transformers` install and a weight download, so they
+carry no `test_` functions and CI never collects them.
