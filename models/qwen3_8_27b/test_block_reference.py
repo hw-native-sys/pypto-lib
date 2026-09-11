@@ -35,6 +35,16 @@ the model is served; that number is reported, not gated -- it measures the
 model's own rounding against the float64 truth, and it is the yardstick for what
 the kernels' block-level gate can be.
 
+`--quant` adds the second reference: the block with the W8A8 arithmetic the
+projection kernels will implement (`config.GDN_QUANT`; int8 per-channel weights,
+per-token int8 hidden states and normed output). It prints what each part of
+the scheme costs against the float64 truth -- weights alone, each activation
+alone, the whole scheme, and the whole scheme with `in_proj_a/b` in int8 too,
+which is the number the decision to keep those bf16 rests on -- and, when a
+bf16 module run is requested, against the model as served. Nothing to gate:
+the numbers are the finding, and the kernels of Q4b-e are gated against this
+chain rather than the truth because of them.
+
 Host only: no NPU, no compile. Needs `transformers` (pinned at 5.17.0 in the
 environment; the `qwen3_5` modeling code it carries is byte-identical to `main`
 as of 2026-09-11) and runs the module's pure-torch path -- with `fla` or
@@ -50,9 +60,20 @@ import torch
 
 import reference
 import weights as weights_mod
-from config import GDN_TILING, QWEN3_8_27B
+from config import GDN_QUANT, GDN_TILING, QWEN3_8_27B
 
 CHUNK = GDN_TILING.chunk
+
+# The W8A8 ablation: what is int8 in each variant. `weights` names the weight
+# set to quantise, or None for bf16.
+QUANT_VARIANTS = (
+    ("int8 weights only, activations exact", GDN_QUANT.weights, False, False),
+    ("per-token int8 x only, weights exact", None, True, False),
+    ("per-token int8 y only, weights exact", None, False, True),
+    ("W8A8 -- the scheme", GDN_QUANT.weights, True, True),
+    ("W8A8 with in_proj_a/b int8 too",
+     GDN_QUANT.weights + ("in_proj_a.weight", "in_proj_b.weight"), True, True),
+)
 
 # torch's CPU depthwise conv opens a parallel region per channel group, and the
 # reference's per-(chunk, head) loops one per small matmul; on a 192-core host
@@ -132,8 +153,32 @@ def compare(ours: torch.Tensor, theirs: torch.Tensor) -> tuple[float, float]:
     return frob, float((a - b).abs().max())
 
 
+def quant_table(t: int, x: torch.Tensor, w: dict[str, torch.Tensor],
+                truth: dict[str, torch.Tensor], bf16_out: torch.Tensor | None) -> None:
+    """Every variant of the W8A8 scheme against the truth (and the bf16 model, if run)."""
+    print(f"\n[quant] W8A8 chain, T={t}: relative Frobenius against the float64 truth"
+          + ("; last column against the bf16 module" if bf16_out is not None else ""))
+    head = f"  {'variant':<42} {'o (delta rule)':>15} {'out':>10}"
+    print(head + (f" {'out vs bf16':>12}" if bf16_out is not None else ""))
+    for name, names, quant_x, quant_y in QUANT_VARIANTS:
+        started = time.time()
+        wq = reference.quantize_weights(w, names) if names else w
+        st = reference.block(x, wq, QWEN3_8_27B, CHUNK, quant_x=quant_x, quant_y=quant_y)
+        row = f"  {name:<42} {compare(st['o'], truth['o'])[0]:>15.3e} {compare(st['out'], truth['out'])[0]:>10.3e}"
+        if bf16_out is not None:
+            row += f" {compare(st['out'], bf16_out)[0]:>12.3e}"
+        print(row + f"   ({time.time() - started:.0f}s)")
+    y = truth["y"].reshape(t, -1)
+    by_channel = y.abs().amax(dim=0)
+    by_token = y.abs().amax(dim=1)
+    print(f"  y before out_proj: rms {float(y.pow(2).mean().sqrt()):.3g}; amax per channel "
+          f"median {float(by_channel.median()):.3g}, max {float(by_channel.max()):.3g}; "
+          f"amax per token median {float(by_token.median()):.3g} -- the per-token step is "
+          f"amax/{GDN_QUANT.scale_max:g}")
+
+
 def check(t: int, w: dict[str, torch.Tensor], dtypes: list[torch.dtype],
-          seed: int, tol: float) -> bool:
+          seed: int, tol: float, quant: bool = False) -> bool:
     for name in ("fla", "causal_conv1d", "kernels"):
         if importlib.util.find_spec(name) is not None:
             print(f"[warn] `{name}` is installed: the module may not run its "
@@ -148,9 +193,12 @@ def check(t: int, w: dict[str, torch.Tensor], dtypes: list[torch.dtype],
           f"|out| max {float(ours['out'].abs().max()):.3g}")
 
     passed = True
+    bf16_out = None
     for dtype in dtypes:
         started = time.time()
         theirs = module_forward(x, w, dtype)
+        if dtype == torch.bfloat16:
+            bf16_out = theirs["out"]
         gated = dtype != torch.bfloat16
         print(f"\n[module] {str(dtype).removeprefix('torch.')}: "
               f"{time.time() - started:.1f}s"
@@ -165,6 +213,8 @@ def check(t: int, w: dict[str, torch.Tensor], dtypes: list[torch.dtype],
                 passed &= ok
                 verdict = "  ok" if ok else "  FAIL"
             print(f"  {key:<6} {op:<12} {frob:>10.3e} {max_diff:>12.3e}{verdict}")
+    if quant:
+        quant_table(t, x, w, ours, bf16_out)
     return passed
 
 
@@ -181,6 +231,9 @@ def main() -> int:
                              "and float32 are gated, bfloat16 is reported (and slow "
                              "on a CPU without bf16 GEMM kernels: ~12 min at T = 8192)")
     parser.add_argument("--tol", type=float, default=TOL)
+    parser.add_argument("--quant", action="store_true",
+                        help="also run the W8A8 chain in its variants and report each "
+                             "against the truth (and the bf16 module, if requested)")
     args = parser.parse_args()
 
     torch.set_num_threads(min(torch.get_num_threads(), MAX_THREADS))
@@ -196,7 +249,7 @@ def main() -> int:
         print(f"[weights] random, the module's own init, seed {args.seed}")
     dtypes = [getattr(torch, name.strip()) for name in args.module_dtype.split(",")]
 
-    passed = check(args.seq_len, w, dtypes, args.seed, args.tol)
+    passed = check(args.seq_len, w, dtypes, args.seed, args.tol, quant=args.quant)
     print(f"\n{'PASS' if passed else 'FAIL'}: T={args.seq_len} "
           f"H={QWEN3_8_27B.linear_num_value_heads} Hg={QWEN3_8_27B.linear_num_key_heads} "
           f"D={QWEN3_8_27B.linear_value_head_dim} chunk={CHUNK}")

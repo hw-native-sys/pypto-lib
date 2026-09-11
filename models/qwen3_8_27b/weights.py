@@ -16,12 +16,18 @@ gives every tensor's dtype, shape and byte span.
 
     python models/qwen3_8_27b/weights.py                 # layer 0
     python models/qwen3_8_27b/weights.py --layer 2 --out my_layer2.pt
+    python models/qwen3_8_27b/weights.py --quantize      # layer 0's W8A8 form
 
 The file is a `torch.save` dict keyed by the tensor names under `linear_attn.`
 -- `in_proj_qkv.weight`, `A_log`, ... -- in the checkpoint's bf16, which is what
 `reference.block` and the module's `load_state_dict` both take. Default path:
 `build_output/qwen3_8_27b/linear_attn_layer<N>.pt`, next to the compile output
-and gitignored with it.
+and gitignored with it. `--quantize` writes the int8 form beside it
+(`..._int8.pt`): the projections the kernels run as W8A8 replaced by int8 plus a
+per-output-channel `weight_scale`, everything else as it was (see
+`reference.quantize_weights`; the scheme is `config.GDN_QUANT`). The
+checkpoint ships no int8, so this is the quantisation the kernels are scored
+against until a converted checkpoint supplies its own scales.
 
 Random weights (`reference.make_block_weights`) do not reach the decay range a
 trained layer does, so this is the weight set that exercises `exp(g)` where the
@@ -47,9 +53,10 @@ PREFIX = "model.language_model.layers.{layer}.linear_attn."
 _DTYPES = {"BF16": torch.bfloat16, "F16": torch.float16, "F32": torch.float32}
 
 
-def default_path(layer: int) -> Path:
+def default_path(layer: int, quantized: bool = False) -> Path:
     root = Path(__file__).resolve().parents[2]
-    return root / "build_output" / "qwen3_8_27b" / f"linear_attn_layer{layer}.pt"
+    suffix = "_int8" if quantized else ""
+    return root / "build_output" / "qwen3_8_27b" / f"linear_attn_layer{layer}{suffix}.pt"
 
 
 def _get(url: str, byte_range: tuple[int, int] | None = None) -> bytes:
@@ -106,14 +113,28 @@ def main() -> int:
     parser.add_argument("--out", type=str, default=None,
                         help="where to write the .pt (default build_output/qwen3_8_27b/)")
     parser.add_argument("--revision", type=str, default=REVISION)
+    parser.add_argument("--quantize", action="store_true",
+                        help="write the layer's W8A8 form instead, from the bf16 file "
+                             "(fetched first if it is missing)")
     args = parser.parse_args()
 
-    out = Path(args.out) if args.out else default_path(args.layer)
-    weights = fetch_layer(args.layer, revision=args.revision)
+    if args.quantize:
+        import reference
+
+        source = default_path(args.layer)
+        if not source.is_file():
+            weights = fetch_layer(args.layer, revision=args.revision)
+            source.parent.mkdir(parents=True, exist_ok=True)
+            torch.save(weights, source)
+        weights = reference.quantize_weights(load_layer(source))
+        out = Path(args.out) if args.out else default_path(args.layer, quantized=True)
+    else:
+        weights = fetch_layer(args.layer, revision=args.revision)
+        out = Path(args.out) if args.out else default_path(args.layer)
     out.parent.mkdir(parents=True, exist_ok=True)
     torch.save(weights, out)
     for name, w in weights.items():
-        print(f"  {name:<20} {str(tuple(w.shape)):<16} {w.dtype}")
+        print(f"  {name:<24} {str(tuple(w.shape)):<16} {w.dtype}")
     print(f"[weights] saved to {out}")
     return 0
 

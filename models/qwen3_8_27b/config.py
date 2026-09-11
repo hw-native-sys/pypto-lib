@@ -81,6 +81,26 @@ class GdnTiling:
     chunk: int
 
 
+@dataclass(frozen=True)
+class GdnQuant:
+    """The W8A8 scheme the projections use. Our choice, not from the model config.
+
+    Symmetric int8 both sides: weights with one scale per output channel,
+    activations with one scale per token, both `amax / scale_max` with `amax`
+    clamped at `amax_eps`. The chain `models/qwen3_14b` and `models/deepseek_v4_pro`
+    use, so a W8A8 checkpoint made for those kernels loads here unchanged.
+    """
+
+    scale_max: float
+    amax_eps: float
+    # Which projections are int8. `in_proj_a` and `in_proj_b` stay bf16: at 0.5 MB
+    # and 0.1% of the FLOPs there is nothing to gain, and int8 there was measured
+    # to change the block output by 3e-5 -- so bf16 is the simpler path at no
+    # cost, not an accuracy choice (`test_block_reference.py --quant`). The
+    # conv's 80 KB of taps likewise.
+    weights: tuple[str, ...]
+
+
 QWEN3_8_27B = Qwen38Config(
     name="Qwen3.8-27B",
     hidden_size=5120,
@@ -99,3 +119,9 @@ QWEN3_8_27B = Qwen38Config(
 )
 
 GDN_TILING = GdnTiling(chunk=128)
+
+GDN_QUANT = GdnQuant(
+    scale_max=127.0,
+    amax_eps=1e-4,
+    weights=("in_proj_qkv.weight", "in_proj_z.weight", "out_proj.weight"),
+)

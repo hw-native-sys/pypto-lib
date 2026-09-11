@@ -17,6 +17,13 @@ convolution, the qk-norm and gate, the gated RMSNorm and `out_proj`, chained by
 :func:`block` from hidden states to hidden states. That chain is checked against
 the model's own `Qwen3_5GatedDeltaNet` by `test_block_reference.py`.
 
+:func:`block` is two references in one. On bf16 weights with no activation
+quantisation it is the float64 truth: how far a result is from the model. On
+int8 weights (:func:`quantize_weights`) with `quant_x` / `quant_y` it is the
+W8A8 chain the projection kernels implement, with their exact quantisation
+arithmetic -- the correctness gate for those kernels, since quantisation alone
+puts the block ~3e-2 from the truth, ten times the model's own bf16 rounding.
+
 The stage signatures follow the model's natural layout ([T, H, D] values,
 [T, H] per-token scalars, [NCHUNK, H, D, D] states). The kernels take some of
 those transposed or flattened; :func:`to_hT` and :func:`flat_state` convert.
@@ -33,7 +40,7 @@ from __future__ import annotations
 import torch
 import torch.nn.functional as F
 
-from config import Qwen38Config
+from config import GDN_QUANT, Qwen38Config
 
 REF_DTYPE = torch.float64
 
@@ -404,6 +411,51 @@ def make_block_weights(cfg: Qwen38Config, seed: int = 42) -> dict[str, torch.Ten
     }
 
 
+def quantize_rows(x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+    """Symmetric int8 with one fp32 scale per row, in the kernels' arithmetic.
+
+    Per output channel of an `[out, in]` weight, per token of a `[T, C]`
+    activation -- the same chain either way: in fp32, `amax` over the row clamped
+    at `amax_eps`, the row times `scale_max / amax`, round to nearest even, clamp
+    to +-scale_max, int8; the dequant scale is `amax / scale_max`. Mirrors
+    `quant_int8_per_out_channel` (deepseek_v4_pro) and the `*_act_quant` regions
+    of `qwen3_14b/prefill_fwd_a8w8.py`, multiply by the reciprocal included.
+    """
+    xf = x.to(torch.float32)
+    amax = xf.abs().amax(dim=-1).clamp_min(GDN_QUANT.amax_eps)
+    q = torch.round(xf * (GDN_QUANT.scale_max / amax)[:, None])
+    q = q.clamp(-GDN_QUANT.scale_max, GDN_QUANT.scale_max).to(torch.int8)
+    return q, amax / GDN_QUANT.scale_max
+
+
+def dequantize(q: torch.Tensor, scale: torch.Tensor) -> torch.Tensor:
+    """int8 rows times their fp32 scale, in float64: exact, the integers being small."""
+    return q.to(REF_DTYPE) * scale.to(REF_DTYPE)[:, None]
+
+
+def quantize_weights(w: dict[str, torch.Tensor],
+                     names: tuple[str, ...] = GDN_QUANT.weights) -> dict[str, torch.Tensor]:
+    """The int8 form of a weight set: *names* replaced by int8, `<module>.weight_scale` added.
+
+    Everything else passes through. The scale's name follows the W8A8 checkpoint
+    convention (`weight_scale` beside `weight`), so a converted checkpoint's
+    tensors take the same keys.
+    """
+    out = dict(w)
+    for name in names:
+        assert name.endswith(".weight"), name
+        out[name], out[name[: -len("weight")] + "weight_scale"] = quantize_rows(w[name])
+    return out
+
+
+def weight(w: dict[str, torch.Tensor], module: str) -> torch.Tensor:
+    """A projection's `[out, in]` weight in float64; int8 ones dequantised by their scale."""
+    value = w[module + ".weight"]
+    if value.dtype == torch.int8:
+        return dequantize(value, w[module + ".weight_scale"])
+    return value.to(REF_DTYPE)
+
+
 def linear(x: torch.Tensor, weight: torch.Tensor) -> torch.Tensor:
     """`nn.Linear` without bias: `x @ W^T`, W stored `[out, in]`."""
     return x.to(REF_DTYPE) @ weight.to(REF_DTYPE).t()
@@ -463,7 +515,8 @@ def gated_rmsnorm(o: torch.Tensor, z: torch.Tensor, weight: torch.Tensor,
 
 
 def block(x: torch.Tensor, w: dict[str, torch.Tensor], cfg: Qwen38Config,
-          chunk: int) -> dict[str, torch.Tensor]:
+          chunk: int, quant_x: bool = False, quant_y: bool = False
+          ) -> dict[str, torch.Tensor]:
     """The whole block in float64, hidden states `[T, hidden]` to `out` of the same shape.
 
     Returns every intermediate: the projections `qkv`, `z`, `a_proj`, `b_proj`
@@ -471,6 +524,16 @@ def block(x: torch.Tensor, w: dict[str, torch.Tensor], cfg: Qwen38Config,
     output `qkv_conv`; the delta rule's inputs `q`, `k`, `v`, `beta`, `g` and
     its output `o` (plus everything :func:`delta_rule` keeps); the normed `y`;
     and `out`. Nothing is narrowed anywhere.
+
+    What you pass is what you get. bf16 weights compute the truth; int8 ones
+    (:func:`quantize_weights`) are used at their dequantised values. *quant_x*
+    quantises the hidden states per token before every projection reads them,
+    *quant_y* the normed output per token before `out_proj` -- the two
+    activation quantisations a W8A8 block performs, at the places the kernels
+    do them. The int8 tensors and fp32 scales come back as `x_q`, `x_scale`,
+    `y_q`, `y_scale`, so a kernel can be checked at the quantised hand-off too.
+    `y` is quantised from its fp32 rounding, as the norm kernel that produces
+    it will hold it.
     """
     h, hg, d = (cfg.linear_num_value_heads, cfg.linear_num_key_heads,
                 cfg.linear_value_head_dim)
@@ -478,17 +541,25 @@ def block(x: torch.Tensor, w: dict[str, torch.Tensor], cfg: Qwen38Config,
     key_width = hg * d
 
     st = {}
-    st["qkv"] = linear(x, w["in_proj_qkv.weight"])
-    st["z"] = linear(x, w["in_proj_z.weight"]).reshape(t, h, d)
-    st["a_proj"] = linear(x, w["in_proj_a.weight"])
-    st["b_proj"] = linear(x, w["in_proj_b.weight"])
+    xf = x
+    if quant_x:
+        st["x_q"], st["x_scale"] = quantize_rows(x)
+        xf = dequantize(st["x_q"], st["x_scale"])
+    st["qkv"] = linear(xf, weight(w, "in_proj_qkv"))
+    st["z"] = linear(xf, weight(w, "in_proj_z")).reshape(t, h, d)
+    st["a_proj"] = linear(xf, weight(w, "in_proj_a"))
+    st["b_proj"] = linear(xf, weight(w, "in_proj_b"))
     st["qkv_conv"] = short_conv(st["qkv"], w["conv1d.weight"])
     q, k, v = torch.split(st["qkv_conv"], [key_width, key_width, h * d], dim=-1)
     q, k, beta, g = qk_norm_gate(q.reshape(t, hg, d), k.reshape(t, hg, d),
                                  st["a_proj"], st["b_proj"], w["A_log"], w["dt_bias"])
     st.update(delta_rule(q, k, v.reshape(t, h, d), beta, g, chunk))
     st["y"] = gated_rmsnorm(st["o"], st["z"], w["norm.weight"], cfg.rms_norm_eps)
-    st["out"] = linear(st["y"].reshape(t, h * d), w["out_proj.weight"])
+    y = st["y"].reshape(t, h * d)
+    if quant_y:
+        st["y_q"], st["y_scale"] = quantize_rows(y)
+        y = dequantize(st["y_q"], st["y_scale"])
+    st["out"] = linear(y, weight(w, "out_proj"))
     return st
 
 

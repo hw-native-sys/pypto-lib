@@ -24,7 +24,7 @@ against it without a translation table.
 | Short convolution | depthwise, kernel 4, over all 10240 q/k/v channels |
 | Chunk length | 128 — our tiling choice, not a model constant |
 | Platform | Ascend A2/A3 (`-p a2a3`); A5 through the daily job |
-| Quantization | none — this layer has no weights; it consumes activations |
+| Quantization | the delta rule has none (no weights); the projections around it, not built yet, are planned as W8A8 — int8 weights per output channel, int8 activations per token — and the reference already carries that arithmetic |
 
 Grouped-query attention is the shape that matters here: value head `h` reads key
 head `h // 3`. q and k carry 16 heads; v, beta, the gate, the state and the
@@ -82,6 +82,19 @@ statistics in fp32 by its own code, which is the floor. In the model's own bf16
 the block output sits 3e-3 to 7e-3 from the float64 chain, which is the
 yardstick for what a device-side block can be held to.
 
+The reference is two references in one. On bf16 weights it is the float64
+truth above. On int8 weights (`reference.quantize_weights`, the same
+per-output-channel chain `models/qwen3_14b` and `models/deepseek_v4_pro` use)
+with per-token quantisation of the hidden states and of the normed output, it
+is the W8A8 chain the projection kernels will implement, with their exact
+arithmetic. `test_block_reference.py --quant` reports what each part of that
+scheme costs against the truth: on the real layer at T = 8192 the whole scheme
+sits 3.0e-2 away, of which int8 weights alone are 1.1e-2, the per-token hidden
+states 1.3e-2 and the per-token normed output 2.4e-2 — ten times the model's own
+bf16 rounding. That is why the projection kernels are gated against this chain
+and only reported against the truth: quantisation is the whole gap by
+construction, and a kernel gate has to sit below it.
+
 Two weight sets serve that check and every later one: random weights drawn the
 way the module's own `__init__` draws them, and one real layer.
 [weights.py](../../../models/qwen3_8_27b/weights.py) fetches a layer's nine
@@ -111,8 +124,10 @@ The block reference check needs no NPU, only `transformers` (5.17.0):
 
 ```bash
 python models/qwen3_8_27b/weights.py --layer 0
+python models/qwen3_8_27b/weights.py --quantize
 python models/qwen3_8_27b/test_block_reference.py
 python models/qwen3_8_27b/test_block_reference.py --weights build_output/qwen3_8_27b/linear_attn_layer0.pt
+python models/qwen3_8_27b/test_block_reference.py --weights build_output/qwen3_8_27b/linear_attn_layer0.pt --quant
 python models/qwen3_8_27b/test_block_reference.py --module-dtype float64,bfloat16 --seq-len 1024
 ```
 
