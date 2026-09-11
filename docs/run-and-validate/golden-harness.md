@@ -72,10 +72,11 @@ True}`: that mode may
 execute multiple physical passes for one handle call while reusing the same
 argument list, so the harness rejects the combination.
 `compile_runtime` affects fresh compilation only: passing `runtime_dir` does not
-retrofit an older artifact. A `runtime_dir` invocation is therefore a
-correctness-only replay and skips `PYPTO_BENCH`, even when an L3 program can be
-reconstructed from its metadata; metadata alone cannot prove that the generated
-host orchestration forwards a scalar instead of a folded literal. Recompile
+retrofit an older artifact. A `runtime_dir` replay benchmarks under
+`PYPTO_BENCH` like a fresh compile, for L2 and L3 alike, except when a spec
+carries a stepped scalar: metadata alone cannot prove that the generated host
+orchestration forwards that scalar instead of a folded literal, so the harness
+skips the benchmark with a `[RUN] benchmark skipped` note naming it. Recompile
 artifacts when introducing a runtime scalar, and have long-lived callers verify
 that generated task arguments forward it.
 

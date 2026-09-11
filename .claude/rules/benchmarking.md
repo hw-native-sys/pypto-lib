@@ -44,17 +44,15 @@ none of which is the thing being measured. Do not pay for them twice.
    torch recompute drop out. Regenerate only when specs, inputs, or the
    reference computation change. See the `test-with-golden` skill and
    [`docs/run-and-validate/save-and-replay.md`](../../docs/run-and-validate/save-and-replay.md).
-3. **Reuse the compiled work dir for untimed iterations** —
-   `--runtime-dir <build_output/…>` skips the pypto compile while validation
-   logic, `golden_fn`, or the generated `.cpp` / `.pto` change. Reuse it only
-   while the kernel source stays compatible with that build: the directory
-   carries the program it was compiled from, so a DSL, spec, or shape change
-   makes it stale and requires a fresh compile.
-   **A `runtime_dir` replay cannot be benchmarked**: there is no live
-   `CompiledProgram`, so the harness prints
-   `[RUN] benchmark skipped: no live CompiledProgram (runtime_dir replay)` even
-   with `PYPTO_BENCH=1`. A timed run compiles — budget for it rather than trying
-   to extract a number from a replay.
+3. **Reuse the compiled work dir** — `--runtime-dir <build_output/…>` skips
+   the pypto compile while validation logic, `golden_fn`, or the generated
+   `.cpp` / `.pto` change. Reuse it only while the kernel source stays
+   compatible with that build: the directory carries the program it was
+   compiled from, so a DSL, spec, or shape change makes it stale and requires
+   a fresh compile. A replay benchmarks under `PYPTO_BENCH=1` (L2 and L3), which
+   is how a patched `.cpp` — e.g. task-timing slot tags — gets timed. The one
+   exception is a spec with a stepped scalar (`ScalarSpec(benchmark_step=…)`):
+   the harness skips the benchmark and says so, and that entry needs a compile.
 4. **Batch a sweep into one process.** When comparing K tile sizes or constants,
    prefer a single process that runs all K variants over K invocations. When
    separate processes are unavoidable, they must still share one frozen golden

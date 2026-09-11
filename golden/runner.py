@@ -632,8 +632,66 @@ def _report_bench(stats: Any, compiled: Any, *, l3: bool, resident: bool) -> Non
     if l3:
         _report_l3_per_rank(stats)
     _report_raw_samples(stats)
+    _report_task_slots(stats)
     if l3:
         _report_l3_detail(stats, compiled, resident=resident)
+
+
+_TASK_SLOT_RE = re.compile(r"\.task_slot_(\d+)$")
+
+
+def _report_task_slots(stats: Any) -> None:
+    """Print per-rank task-timing slot windows captured during the benchmark.
+
+    No-op unless the orchestration tags tasks with ``set_task_timing_slot``.
+    Per slot: ``fin_us`` is the slot's finish (``ts + dur``) from the run's
+    device-clock origin, ``dur_us`` its own dispatch-to-finish window, and
+    ``dfin_us`` the per-round finish minus the previous tagged slot's finish.
+    Repeated spans of one slot in a dispatch merge into one
+    ``min(ts)``..``max(ts + dur)`` window, and ``dfin_us`` pairs only the
+    dispatches that carry both slots. Each is the median over measured
+    dispatches; ``PYPTO_BENCH_RAW`` adds the per-dispatch ``fin_us`` lists.
+    """
+    by_pid: dict[int, dict[int, dict[int, tuple[float, float]]]] = {}
+    for iv in sorted(stats.invocations or [], key=lambda i: (i.pid, i.inv)):
+        windows: dict[int, tuple[float, float]] = {}
+        for span in iv.spans:
+            m = _TASK_SLOT_RE.search(span.name)
+            if m and span.is_device:
+                slot = int(m.group(1))
+                start, fin = span.ts, span.ts + span.dur
+                if slot in windows:
+                    start = min(start, windows[slot][0])
+                    fin = max(fin, windows[slot][1])
+                windows[slot] = (start, fin)
+        for slot, (start, fin) in windows.items():
+            rank = by_pid.setdefault(iv.pid, {})
+            rank.setdefault(slot, {})[iv.inv] = (fin / 1000.0, (fin - start) / 1000.0)
+    if not by_pid:
+        return
+    print(f"[RUN]   task slots: ranks={len(by_pid)}", flush=True)
+    for pid in sorted(by_pid):
+        slots = by_pid[pid]
+        prev = None
+        for slot in sorted(slots):
+            fins = [fin for fin, _ in slots[slot].values()]
+            durs = [dur for _, dur in slots[slot].values()]
+            line = (
+                f"[RUN]     rank {pid} task_slot {slot}: n={len(fins)} "
+                f"fin_us={statistics.median(fins):.1f} dur_us={statistics.median(durs):.1f}"
+            )
+            if prev is not None:
+                deltas = [
+                    fin - slots[prev][inv][0]
+                    for inv, (fin, _) in slots[slot].items()
+                    if inv in slots[prev]
+                ]
+                if deltas:
+                    line += f" dfin_us={statistics.median(deltas):.1f}"
+            print(line, flush=True)
+            if _bench_raw_enabled():
+                print(f"[RUN]       raw fin_us={[round(f, 1) for f in fins]}", flush=True)
+            prev = slot
 
 
 def _eff_summary(samples: Any) -> tuple[int, str] | None:
@@ -1492,9 +1550,11 @@ def _run_pipeline(
         )
 
     benchmark_enabled = _bench_enabled()
-    if benchmark_enabled and runtime_dir is not None:
+    stepped = sorted(n for n, s in scalar_specs_eff.items() if s.has_benchmark_step)
+    if benchmark_enabled and runtime_dir is not None and stepped:
         print(
-            "[RUN]   benchmark skipped: runtime_dir replay is correctness-only",
+            "[RUN]   benchmark skipped: runtime_dir replay cannot prove stepped "
+            f"scalar(s) {stepped} reach the kernel; recompile to benchmark",
             flush=True,
         )
         benchmark_enabled = False
@@ -1540,9 +1600,9 @@ def _run_pipeline(
             return _fail(str(e))
 
     # Benchmark (L2 via _run_benchmark, non-resident L3 via _run_benchmark_l3).
-    # Runs only after the correctness dispatch has been validated. A runtime-dir
-    # replay is correctness-only even when an L3 object was reconstructed from
-    # metadata. Entirely env-gated via PYPTO_BENCH=1 (daily CI).
+    # Runs only after the correctness dispatch has been validated, for a fresh
+    # compile and a runtime-dir replay alike. Entirely env-gated via
+    # PYPTO_BENCH=1 (daily CI).
     bench = None
     if benchmark_enabled:
         rounds, warmup = _bench_loop_sizes()
@@ -1677,9 +1737,8 @@ def run(
         compile_only: Stop after code generation; skip execute and validate.
         runtime_dir: Pre-compiled ``build_output/`` directory to reuse. Skips
             compile and invalidates cached ``.so``/``.bin`` so cpp edits
-            rebuild; the compile-side config is ignored, *compile_only* is
-            rejected, and ``PYPTO_BENCH`` is skipped because replay is
-            correctness-only.
+            rebuild; the compile-side config is ignored and *compile_only* is
+            rejected. ``PYPTO_BENCH`` benchmarks the replayed build.
         save_data: When True, persist generated inputs to
             ``{work_dir}/data/in/`` and golden outputs to
             ``{work_dir}/data/out/`` for later replay via *golden_data*.

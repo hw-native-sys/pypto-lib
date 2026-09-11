@@ -33,9 +33,9 @@ per-case number, so two runs are comparable only when both quote it.
 
 Requirements: a real device — a `*sim` platform prints
 `effective_us unavailable: no device-domain spans` — and a runtime built
-with `SIMPLER_PROFILING`. A `runtime_dir=` replay has no live
-`CompiledProgram` and skips benchmarking with a `[RUN] benchmark skipped`
-note.
+with `SIMPLER_PROFILING`. A `runtime_dir=` replay benchmarks the replayed
+build, so a hand-edited `.cpp` can be timed without recompiling; only a spec
+with a stepped scalar skips it, with a `[RUN] benchmark skipped` note.
 
 ### Multi-card (L3) output
 
@@ -206,13 +206,15 @@ used for any generated-code edit:
    needs — do not delete the sibling `.o` / `.so`:
 
    ```bash
-   python models/deepseek_v4_flash_mtp/decode_fwd.py -p a2a3 -d 0 \
+   PYPTO_BENCH=1 python models/deepseek_v4_flash_mtp/decode_fwd.py -p a2a3 -d 0,1 --ep 2 \
        --runtime-dir build_output/<ProgramName>_<ts>
    ```
 
-5. Read the spans out of the runtime log. They are emitted at the `timing`
-   level, which is the default; pass `PYPTO_RUNTIME_LOG=timing` if the entry
-   raised the threshold, then grep for `task_slot_`.
+5. Read the `[RUN] task slots` block the benchmark prints (below). Without
+   `PYPTO_BENCH` the one correctness dispatch prints its spans to the runtime
+   log instead, at the default `timing` level — pass `PYPTO_RUNTIME_LOG=timing`
+   if the entry raised the threshold, then grep for `task_slot_`. The benchmark
+   captures stderr itself, so under `PYPTO_BENCH` those log lines never appear.
 
 #### Reading the numbers
 
@@ -227,10 +229,20 @@ used for any generated-code edit:
   slot's own `dur` is not that stage's cost. Take
   `(slot_{k+1}.ts + slot_{k+1}.dur) − (slot_k.ts + slot_k.dur)`, which means
   tagging the preceding stage too — otherwise the first stage has no anchor.
-- **Slots reset every run**, and a `--runtime-dir` replay is correctness-only, so
-  one replay yields one sample per slot. Repeat it for a distribution, against a
-  frozen golden ([Save and Replay](../run-and-validate/save-and-replay.md)) so a
-  repeat costs only the dispatch.
+- **Slots reset every run.** A plain replay therefore yields one sample per
+  slot. Add `PYPTO_BENCH=1` to the replay for a distribution: every measured
+  round reports its slots, and the harness prints one line per rank and slot —
+
+  ```text
+  [RUN]   task slots: ranks=2
+  [RUN]     rank 1872915 task_slot 4: n=100 fin_us=2177.4 dur_us=8.6 dfin_us=713.9
+  [RUN]     rank 1872915 task_slot 5: n=100 fin_us=2599.3 dur_us=7.9 dfin_us=428.1
+  ```
+
+  `fin_us` is the slot's finish from the run's device-clock origin, `dur_us`
+  its own window, and `dfin_us` the per-round finish minus the previous slot's
+  finish — the finish-to-finish stage cost when slots are numbered in stage
+  order. All three are medians; `PYPTO_BENCH_RAW=1` adds each round's `fin_us`.
 - **The patch lives in `build_output/` only.** Recompiling regenerates the
   orchestration `.cpp` and silently drops every tag — which is also how the
   instrumentation is removed.
