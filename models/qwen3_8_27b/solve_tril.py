@@ -21,7 +21,7 @@ FP32 tile across the cube/vector boundary.
 """
 import pypto.language as pl
 
-from models.qwen3_8_27b.config import GDN_TILING, QWEN3_8_27B
+from config import GDN_TILING, QWEN3_8_27B
 
 # model shape
 H = QWEN3_8_27B.linear_num_value_heads      # value heads
@@ -96,7 +96,7 @@ def build_tensor_specs(t: int = T, h: int = H, d: int = D, chunk: int = CHUNK,
     import torch
     from golden import TensorSpec
 
-    from models.qwen3_8_27b import reference
+    import reference
 
     return [
         TensorSpec("a_in", [t, h, chunk], torch.float16,
@@ -109,7 +109,7 @@ def build_tensor_specs(t: int = T, h: int = H, d: int = D, chunk: int = CHUNK,
 
 
 def golden_gdn_solve_tril(tensors):
-    from models.qwen3_8_27b import reference
+    import reference
 
     chunk = tensors["a_in"].shape[-1]
     tensors["t_out"].copy_(reference.solve_tril(tensors["a_in"], chunk))
@@ -122,7 +122,7 @@ def _tri_inv_ok(actual, expected, **_kwargs):
     reported because the pipeline narrows this stage's FP32 output to FP16 before
     wy_fast, so it says how much of any budget that later step spends on its own.
     """
-    from models.qwen3_8_27b import reference
+    import reference
 
     exp = expected.double()
     _, floor_detail = reference.stats_ok(exp.half(), exp)

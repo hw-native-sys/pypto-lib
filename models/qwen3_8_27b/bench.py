@@ -6,6 +6,7 @@
 # INCLUDING BUT NOT LIMITED TO NON-INFRINGEMENT, MERCHANTABILITY, OR FITNESS FOR A PARTICULAR PURPOSE.
 # See LICENSE in the root of the software repository for the full text of the License.
 # -----------------------------------------------------------------------------------------------------------
+# ci: no-sim
 """Latency benchmark for the six GDN stages.
 
 Times each stage on device over a sweep of sequence lengths and head counts, in
@@ -27,7 +28,11 @@ time the pipeline's own data instead; that builds a float64 reference chain on
 the host and is only affordable at small T.
 
     python models/qwen3_8_27b/bench.py -p a2a3 -d 0
-    python models/qwen3_8_27b/bench.py -p a2a3 -d 0 --seq-len 4096,8192 --json out.json
+    python models/qwen3_8_27b/bench.py -p a2a3 -d 0 --seq-len 4096,8192,16384
+
+There are no numbers to collect on a simulator -- the effective window comes
+from a span tree the simulators do not build -- so this file is marked
+`ci: no-sim` and CI runs it on device only.
 """
 import argparse
 import dataclasses
@@ -40,13 +45,15 @@ import time
 STAGES = ("chunk_cumsum", "scaled_dot_kkt", "solve_tril", "wy_fast",
           "chunk_h", "chunk_o")
 
-from models.qwen3_8_27b.config import GDN_TILING, QWEN3_8_27B
+from config import GDN_TILING, QWEN3_8_27B
 
 D = QWEN3_8_27B.linear_value_head_dim
 CHUNK = GDN_TILING.chunk
 HEADS = (QWEN3_8_27B.linear_num_value_heads,)
 QK_HEADS = QWEN3_8_27B.linear_num_key_heads
-SEQ_LENS = (4096, 8192, 16384)      # the reference benchmark's --l-seg list
+# One shape by default so a bare run stays a few minutes; the reference
+# benchmark's own --l-seg list is 4096, 8192, 16384 and --seq-len takes it.
+SEQ_LENS = (8192,)
 
 
 def _random_specs(stage, specs):
@@ -58,7 +65,7 @@ def _random_specs(stage, specs):
     """
     import torch
 
-    from models.qwen3_8_27b.test_gdn_stages import OUTPUTS
+    from test_gdn_stages import OUTPUTS
 
     leave_alone = set(OUTPUTS[stage]) | {"mask", "tril", "neg_eye"}
     out = []
@@ -81,9 +88,9 @@ def bench_stage(stage: str, t: int, h: int, hg: int, platform: str, device: int,
     """One compile and one timed loop. Returns the record for this (stage, shape)."""
     from golden import run
 
-    from models.qwen3_8_27b.test_gdn_stages import GQA_STAGES
+    from test_gdn_stages import GQA_STAGES
 
-    mod = importlib.import_module(f"models.qwen3_8_27b.{stage}")
+    mod = importlib.import_module(stage)
     kernel_kw = dict(hg=hg) if stage in GQA_STAGES else {}
     fn = mod.build_kernel(t=t, h=h, d=D, chunk=CHUNK, **kernel_kw)
     specs = mod.build_tensor_specs(t=t, h=h, d=D, chunk=CHUNK, hg=hg)
