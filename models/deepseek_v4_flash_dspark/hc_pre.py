@@ -32,7 +32,7 @@ NORM_EPS = M.rms_norm_eps
 MIX_PAD = 32  # mix_hc (24) padded to a 32-wide cube N / vector row
 HC_PAD = 8  # hc (4) padded for 32B-aligned vector ops
 T_TILE = 8  # other values miscompare
-LINEAR_T_TILE = 16  # cube matmul rows must be a 16-row boxed tile
+LINEAR_T_TILE = 32  # two 16-row cube fractals per split-K task
 COMB_T_TILE = 8
 RMS_K_TILE = 512
 LINEAR_K_TILE = 256
@@ -58,7 +58,7 @@ def hc_pre_gates(
     """Compute pre/post gates and Sinkhorn combinations with padded linear intermediates."""
     t_dim = pl.tensor.dim(x, 0)
     token_tiles = (t_dim + T_TILE - 1) // T_TILE
-    t_linear = ((t_dim + LINEAR_T_TILE - 1) // LINEAR_T_TILE) * LINEAR_T_TILE  # pad t_dim up to whole 16-row cube tiles
+    t_linear = ((t_dim + LINEAR_T_TILE - 1) // LINEAR_T_TILE) * LINEAR_T_TILE
     x_flat = pl.reshape(x, [t_dim, HC_DIM])
     scale0 = pl.read(hc_scale, [0])
     scale1 = pl.read(hc_scale, [1])
@@ -101,21 +101,17 @@ def hc_pre_gates(
             k0 = k_base + kb * LINEAR_K_TILE
             x_linear_chunk = pl.slice(x_flat, [LINEAR_T_TILE, LINEAR_K_TILE], [t0, k0], valid_shape=[t_rows, LINEAR_K_TILE])
             w_chunk = pl.slice(hc_fn, [MIX_PAD, LINEAR_K_TILE], [0, k0], valid_shape=[MIX_HC, LINEAR_K_TILE])
-            acc = pl.matmul_acc(acc, x_linear_chunk, w_chunk, b_trans=True, init_cond=(kb == 0))
+            # The first matmul stamps the compact accumulator layout for a tail
+            # spanning fewer rows than the physical two-fractal tile.
+            if kb == 0:
+                acc = pl.matmul(x_linear_chunk, w_chunk, b_trans=True)
+            else:
+                acc = pl.matmul_acc(acc, x_linear_chunk, w_chunk, b_trans=True)
         partial_row0 = linear_split * t_linear + t0
         mixes_partials[partial_row0 : partial_row0 + LINEAR_T_TILE, 0:MIX_PAD] = acc
 
-    # Partials are reduced in ascending K order.
-    mixes_raw = pl.create_tensor([t_linear, MIX_PAD], dtype=pl.FP32)
-    for linear_block in pl.spmd(t_linear // LINEAR_T_TILE, name_hint="hc_pre_linear_reduce", allow_early_resolve=True):
-        linear_t0 = linear_block * LINEAR_T_TILE
-        mixes_total = mixes_partials[linear_t0 : linear_t0 + LINEAR_T_TILE, 0:MIX_PAD]
-        for linear_split in pl.range(1, LINEAR_OK):
-            partial_t0 = linear_split * t_linear + linear_t0
-            partial_tile = mixes_partials[partial_t0 : partial_t0 + LINEAR_T_TILE, 0:MIX_PAD]
-            mixes_total = pl.add(mixes_total, partial_tile)
-        mixes_raw[linear_t0 : linear_t0 + LINEAR_T_TILE, 0:MIX_PAD] = mixes_total
-
+    # Each consumer reduces its partials in ascending K order, avoiding a separate
+    # reduction task and the mixes_raw GM round trip.
     # split_pre_post: inv_rms-scaled pre gate -> pre_val_store (for mix_x), post gate -> post.
     # Both compute at HC_PAD width; post narrows to HC_MULT via a valid-shape slice (an 8-wide
     # 32B tile, 4 cols valid -- a bare 4-wide slice allocs a 16B tile ptoas rejects). comb gate
@@ -125,17 +121,23 @@ def hc_pre_gates(
     for ob in pl.spmd(token_tiles, name_hint="split_pre_post", allow_early_resolve=True):
         t0 = ob * T_TILE
         valid_rows = pl.min(T_TILE, t_dim - t0)
+        pre_mixes = mixes_partials[t0:t0 + T_TILE, 0:HC_PAD]
+        post_mixes = mixes_partials[t0:t0 + T_TILE, HC_MULT:HC_MULT + HC_PAD]
+        for linear_split in pl.range(1, LINEAR_OK):
+            partial_t0 = linear_split * t_linear + t0
+            pre_mixes = pl.add(pre_mixes, mixes_partials[partial_t0:partial_t0 + T_TILE, 0:HC_PAD])
+            post_mixes = pl.add(post_mixes, mixes_partials[partial_t0:partial_t0 + T_TILE, HC_MULT:HC_MULT + HC_PAD])
         inv_col = inv_rms[t0:t0 + T_TILE, 0:1]
 
         pre_base = pl.reshape(hc_base[0:HC_PAD], [1, HC_PAD])
-        pre_scaled = pl.mul(pl.row_expand_mul(mixes_raw[t0:t0 + T_TILE, 0:HC_PAD], inv_col), scale0)
+        pre_scaled = pl.mul(pl.row_expand_mul(pre_mixes, inv_col), scale0)
         pre_logits = pl.add(pre_scaled, pl.col_expand(pre_scaled, pre_base))
         pre_sig = pl.recip(pl.add(pl.exp(pl.neg(pre_logits)), 1.0))
         pre_val = pl.add(pre_sig, HC_EPS)
         pre_val_store[t0:t0 + T_TILE, 0:HC_PAD] = pre_val
 
         post_base = pl.reshape(hc_base[HC_MULT:HC_MULT + HC_PAD], [1, HC_PAD])
-        post_scaled = pl.mul(pl.row_expand_mul(mixes_raw[t0:t0 + T_TILE, HC_MULT:HC_MULT + HC_PAD], inv_col), scale1)
+        post_scaled = pl.mul(pl.row_expand_mul(post_mixes, inv_col), scale1)
         post_logits = pl.add(post_scaled, pl.col_expand(post_scaled, post_base))
         post_sig = pl.recip(pl.add(pl.exp(pl.neg(post_logits)), 1.0))
         post_pad = pl.mul(post_sig, 2.0)
@@ -146,18 +148,33 @@ def hc_pre_gates(
             post_tile = pl.load(post_tail_store, [0, 0], [T_TILE, HC_PAD], valid_shape=[valid_rows, HC_MULT], target_memory=pl.MemorySpace.Vec)
             pl.store(post_tile, [t0, 0], post)
 
-    # comb_sinkhorn: comb gate from mixes_raw cols 8/12/16/20, softmax, then a
+    # comb_sinkhorn: reduce comb partials at cols 8/12/16/20, softmax, then a
     # column-first 20-iteration Sinkhorn -> comb.
     comb_tail_store = pl.create_tensor([COMB_T_TILE, HC_PAD * HC_MULT], dtype=pl.FP32)
-    for ob in pl.spmd(token_tiles, name_hint="comb_sinkhorn", allow_early_resolve=True):
+    # Keep this non-critical consumer out of speculative dispatch.
+    seed_dummy = pl.system.task_dummy(deps=[])
+    with pl.spmd(
+        token_tiles, name_hint="comb_sinkhorn", deps=[seed_dummy], allow_early_resolve=True
+    ) as comb_tid:
+        ob = pl.tile.get_block_idx()
         t0 = ob * COMB_T_TILE
         valid_rows = pl.min(COMB_T_TILE, t_dim - t0)
         inv_col_t = pl.load(inv_rms, [t0, 0], [COMB_T_TILE, 1], valid_shape=[valid_rows, 1], target_memory=pl.MemorySpace.Vec)
         comb_off = HC_MULT * 2
-        mix_g0 = pl.load(mixes_raw, [t0, comb_off + 0 * HC_MULT], [COMB_T_TILE, HC_PAD], valid_shape=[valid_rows, HC_MULT], target_memory=pl.MemorySpace.Vec)
-        mix_g1 = pl.load(mixes_raw, [t0, comb_off + 1 * HC_MULT], [COMB_T_TILE, HC_PAD], valid_shape=[valid_rows, HC_MULT], target_memory=pl.MemorySpace.Vec)
-        mix_g2 = pl.load(mixes_raw, [t0, comb_off + 2 * HC_MULT], [COMB_T_TILE, HC_PAD], valid_shape=[valid_rows, HC_MULT], target_memory=pl.MemorySpace.Vec)
-        mix_g3 = pl.load(mixes_raw, [t0, comb_off + 3 * HC_MULT], [COMB_T_TILE, HC_PAD], valid_shape=[valid_rows, HC_MULT], target_memory=pl.MemorySpace.Vec)
+        mix_g0 = pl.load(mixes_partials, [t0, comb_off + 0 * HC_MULT], [COMB_T_TILE, HC_PAD], valid_shape=[valid_rows, HC_MULT], target_memory=pl.MemorySpace.Vec)
+        mix_g1 = pl.load(mixes_partials, [t0, comb_off + 1 * HC_MULT], [COMB_T_TILE, HC_PAD], valid_shape=[valid_rows, HC_MULT], target_memory=pl.MemorySpace.Vec)
+        mix_g2 = pl.load(mixes_partials, [t0, comb_off + 2 * HC_MULT], [COMB_T_TILE, HC_PAD], valid_shape=[valid_rows, HC_MULT], target_memory=pl.MemorySpace.Vec)
+        mix_g3 = pl.load(mixes_partials, [t0, comb_off + 3 * HC_MULT], [COMB_T_TILE, HC_PAD], valid_shape=[valid_rows, HC_MULT], target_memory=pl.MemorySpace.Vec)
+        for linear_split in pl.range(1, LINEAR_OK):
+            partial_t0 = linear_split * t_linear + t0
+            partial_g0 = pl.load(mixes_partials, [partial_t0, comb_off + 0 * HC_MULT], [COMB_T_TILE, HC_PAD], valid_shape=[valid_rows, HC_MULT], target_memory=pl.MemorySpace.Vec)
+            mix_g0 = pl.add(mix_g0, partial_g0)
+            partial_g1 = pl.load(mixes_partials, [partial_t0, comb_off + 1 * HC_MULT], [COMB_T_TILE, HC_PAD], valid_shape=[valid_rows, HC_MULT], target_memory=pl.MemorySpace.Vec)
+            mix_g1 = pl.add(mix_g1, partial_g1)
+            partial_g2 = pl.load(mixes_partials, [partial_t0, comb_off + 2 * HC_MULT], [COMB_T_TILE, HC_PAD], valid_shape=[valid_rows, HC_MULT], target_memory=pl.MemorySpace.Vec)
+            mix_g2 = pl.add(mix_g2, partial_g2)
+            partial_g3 = pl.load(mixes_partials, [partial_t0, comb_off + 3 * HC_MULT], [COMB_T_TILE, HC_PAD], valid_shape=[valid_rows, HC_MULT], target_memory=pl.MemorySpace.Vec)
+            mix_g3 = pl.add(mix_g3, partial_g3)
         cb0 = pl.load(hc_base_2d, [0, comb_off + 0 * HC_MULT], [1, HC_PAD], valid_shape=[1, HC_MULT], target_memory=pl.MemorySpace.Vec)
         cb1 = pl.load(hc_base_2d, [0, comb_off + 1 * HC_MULT], [1, HC_PAD], valid_shape=[1, HC_MULT], target_memory=pl.MemorySpace.Vec)
         cb2 = pl.load(hc_base_2d, [0, comb_off + 2 * HC_MULT], [1, HC_PAD], valid_shape=[1, HC_MULT], target_memory=pl.MemorySpace.Vec)

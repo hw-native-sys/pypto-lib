@@ -94,7 +94,7 @@ O_A_T_TILE = 128
 O_A_K_TILE = 256
 O_A_N_TILE = 128
 QUANT_T_TILE = 8
-O_A_QUANT_WORKERS = 6   # per owner-group; 4 x 2 x 6 -> one AIV wave
+O_A_QUANT_WORKERS = 16  # one worker per 8-row block at local_t=128
 O_B_T_TILE = 128
 O_B_K_TILE = 256
 O_B_N_TILE = 256
@@ -280,8 +280,8 @@ def o_group_a2a_gather(
     return local_groups_out
 
 
-@pl.jit.inline
-def o_group_a2a(
+@pl.jit.inline(auto_scope=False)
+def o_group_a2a_with_completion(
     local_groups_out: pl.Tensor[[ATTENTION_WINDOW_ROWS, O_GROUP_IN], pl.BF16],
     exchange_window: pld.DistributedTensor[[ATTENTION_WINDOW_ROWS, O_GROUP_IN], pl.BF16],
     exchange_signal: pld.DistributedTensor[[TP_SIZE, 1], pl.INT32],
@@ -290,7 +290,7 @@ def o_group_a2a(
     local_t: pl.Scalar[pl.INT32],
     publish_dep: pl.Scalar[pl.TASK_ID],
     publish_count: pl.Scalar[pl.INT32],
-):
+) -> tuple[pl.Tensor, pld.DistributedTensor, pl.Scalar[pl.TASK_ID]]:
     """Finish a non-overlapping producer-fused exchange and release its window."""
     with pl.at(level=pl.Level.CORE_GROUP, name_hint="o_group_a2a_wait", deps=[publish_dep]) as wait_tid:
         expected = pl.cast(publish_count, pl.INT32)
@@ -309,7 +309,7 @@ def o_group_a2a(
         core_num=ATTENTION_PUBLISH_WORKERS, deps=[wait_tid],
     )
 
-    with pl.at(level=pl.Level.CORE_GROUP, name_hint="o_group_a2a_complete", deps=[gather_tid], no_dep_args=[exchange_signal]):
+    with pl.at(level=pl.Level.CORE_GROUP, name_hint="o_group_a2a_complete", deps=[gather_tid], no_dep_args=[exchange_signal]) as completion_tid:
         completion_anchor = pl.read(local_groups_out, [0, 0])
         for peer_tp in pl.range(TP_SIZE):
             if peer_tp != tp_rank:
@@ -343,6 +343,25 @@ def o_group_a2a(
                     op=pld.NotifyOp.AtomicAdd,
                 )
         pl.write(local_groups_out, [0, 0], completion_anchor)
+    return local_groups_out, exchange_signal, completion_tid
+
+
+@pl.jit.inline
+def o_group_a2a(
+    local_groups_out: pl.Tensor[[ATTENTION_WINDOW_ROWS, O_GROUP_IN], pl.BF16],
+    exchange_window: pld.DistributedTensor[[ATTENTION_WINDOW_ROWS, O_GROUP_IN], pl.BF16],
+    exchange_signal: pld.DistributedTensor[[TP_SIZE, 1], pl.INT32],
+    group_base: pl.Scalar[pl.INT32],
+    tp_rank: pl.Scalar[pl.INT32],
+    local_t: pl.Scalar[pl.INT32],
+    publish_dep: pl.Scalar[pl.TASK_ID],
+    publish_count: pl.Scalar[pl.INT32],
+):
+    """Finish the attention exchange while preserving the two-result API."""
+    local_groups_out, exchange_signal, _completion_tid = o_group_a2a_with_completion(
+        local_groups_out, exchange_window, exchange_signal,
+        group_base, tp_rank, local_t, publish_dep, publish_count,
+    )
     return local_groups_out, exchange_signal
 
 
@@ -635,7 +654,7 @@ def o_proj_reduce_scatter(
 
     with pl.spmd(
         O_RS_PUBLISH_WORKERS,
-        name_hint="tp_o_b_publish",
+        name_hint="tp_o_b_publish", allow_early_resolve=True,
     ) as publish_tid:
         pub_worker = pl.tile.get_block_idx()
         # Flatten (owner, row block) into one work list: put_rows alone is under
@@ -669,7 +688,7 @@ def o_proj_reduce_scatter(
                     op=pld.NotifyOp.AtomicAdd,
                 )
 
-    with pl.at(level=pl.Level.CORE_GROUP, name_hint="tp_o_rs_wait", deps=[publish_tid]) as wait_tid:
+    with pl.at(level=pl.Level.CORE_GROUP, name_hint="tp_o_rs_wait", deps=[publish_tid], allow_early_resolve=True) as wait_tid:
         expected = pl.cast(O_RS_PUBLISH_WORKERS, pl.INT32)
         for source_tp in pl.range(TP_SIZE):
             if source_tp != tp_rank:
@@ -683,10 +702,10 @@ def o_proj_reduce_scatter(
     local_out, reduce_tid = pl.spmd_submit(
         self.tp_o_rs_reduce,  # noqa: F821 - materialized by @pl.jit
         local_out, pl.no_dep(reduce_window), local_t,
-        core_num=O_RS_REDUCE_WORKERS, deps=[wait_tid],
+        core_num=O_RS_REDUCE_WORKERS, deps=[wait_tid], allow_early_resolve=True,
     )
 
-    with pl.at(level=pl.Level.CORE_GROUP, name_hint="tp_o_rs_complete", deps=[reduce_tid], no_dep_args=[reduce_signal]):
+    with pl.at(level=pl.Level.CORE_GROUP, name_hint="tp_o_rs_complete", deps=[reduce_tid], no_dep_args=[reduce_signal], allow_early_resolve=True):
         completion_anchor = pl.read(local_out, [0, 0])
         for peer_tp in pl.range(TP_SIZE):
             if peer_tp != tp_rank:

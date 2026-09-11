@@ -256,14 +256,7 @@ def compressor_ratio4_pool(
 
 
 @pl.jit.inline(auto_scope=False)
-def compressor_ratio4_cache_write(
-    kv: pl.Tensor[[T_DYN, HEAD_DIM], pl.FP32],
-    pooled_kv: pl.Tensor[[BS_PAD, HEAD_DIM], pl.FP32],
-    norm_w: pl.Tensor[[HEAD_DIM], pl.BF16],
-    cos: pl.Tensor[[T_DYN, ROPE_HEAD_DIM], pl.FP32],
-    sin: pl.Tensor[[T_DYN, ROPE_HEAD_DIM], pl.FP32],
-    cmp_kv_cache: pl.Tensor[[CMP_BLOCK_NUM_DYN, BLOCK_SIZE, 1, HEAD_DIM], pl.BF16],
-    cmp_slot_mapping: pl.Tensor[[T_DYN], pl.INT64],
+def compressor_ratio4_state_commit(
     compress_state: pl.Tensor[[COMPRESS_STATE_BLOCK_NUM_DYN, COMPRESS_STATE_BLOCK_SIZE, COMPRESS_STATE_DIM], pl.FP32],
     compress_state_block_table: pl.Tensor[[B_DYN, COMPRESS_STATE_MAX_BLOCKS], pl.INT32],
     ape: pl.Tensor[[COMPRESS_RATIO, OUT_DIM], pl.FP32],
@@ -274,14 +267,10 @@ def compressor_ratio4_cache_write(
     pool_tid: pl.Scalar[pl.TASK_ID],
     late_write_dep: pl.Scalar[pl.TASK_ID],
 ):
-    """State commit, RMSNorm + RoPE over the pooled rows, and the compressed KV cache write."""
+    """Commit recurrent state after pooling and the caller's scheduling dependency."""
     b_dim = pl.tensor.dim(compress_state_block_table, 0)
     bs = pl.tensor.dim(position_ids, 0)
     s_dim = bs // b_dim
-    rms_blocks = (bs + RMS_PAD_TILE - 1) // RMS_PAD_TILE
-    cmp_block_num = pl.tensor.dim(cmp_kv_cache, 0)
-    kv_flat = kv
-    cmp_kv_cache_flat = pl.reshape(cmp_kv_cache, [cmp_block_num * BLOCK_SIZE, HEAD_DIM])
     compress_state_block_num = pl.tensor.dim(compress_state, 0)
     compress_state_rows = compress_state_block_num * COMPRESS_STATE_BLOCK_SIZE
     compress_state_flat = pl.reshape(compress_state, [compress_state_rows, COMPRESS_STATE_DIM])
@@ -305,6 +294,25 @@ def compressor_ratio4_cache_write(
                         cmp4_score_proj_pad[token : token + 1, 0 : OUT_DIM], ape[ape_row : ape_row + 1, 0 : OUT_DIM])
 
 
+@pl.jit.inline(auto_scope=False)
+def compressor_ratio4_cache_write_only(
+    kv: pl.Tensor[[T_DYN, HEAD_DIM], pl.FP32],
+    pooled_kv: pl.Tensor[[BS_PAD, HEAD_DIM], pl.FP32],
+    norm_w: pl.Tensor[[HEAD_DIM], pl.BF16],
+    cos: pl.Tensor[[T_DYN, ROPE_HEAD_DIM], pl.FP32],
+    sin: pl.Tensor[[T_DYN, ROPE_HEAD_DIM], pl.FP32],
+    cmp_kv_cache: pl.Tensor[[CMP_BLOCK_NUM_DYN, BLOCK_SIZE, 1, HEAD_DIM], pl.BF16],
+    cmp_slot_mapping: pl.Tensor[[T_DYN], pl.INT64],
+    position_ids: pl.Tensor[[T_DYN], pl.INT32],
+    pool_tid: pl.Scalar[pl.TASK_ID],
+    late_write_dep: pl.Scalar[pl.TASK_ID],
+):
+    """Normalize pooled rows, apply RoPE, and write the compressed KV cache."""
+    bs = pl.tensor.dim(position_ids, 0)
+    rms_blocks = (bs + RMS_PAD_TILE - 1) // RMS_PAD_TILE
+    cmp_block_num = pl.tensor.dim(cmp_kv_cache, 0)
+    kv_flat = kv
+    cmp_kv_cache_flat = pl.reshape(cmp_kv_cache, [cmp_block_num * BLOCK_SIZE, HEAD_DIM])
 
     normed_kv = pl.create_tensor([BS_PAD, HEAD_DIM], dtype=pl.FP32)
     norm_w_2d = pl.reshape(norm_w, [1, HEAD_DIM])
@@ -356,6 +364,38 @@ def compressor_ratio4_cache_write(
                 cmp_kv_cache_flat[cache_row : cache_row + 1, :] = pl.cast(
                     kv_row_fp32, target_type=pl.BF16, mode="rint")
 
+    return cache_write_tid
+
+
+@pl.jit.inline(auto_scope=False)
+def compressor_ratio4_cache_write(
+    kv: pl.Tensor[[T_DYN, HEAD_DIM], pl.FP32],
+    pooled_kv: pl.Tensor[[BS_PAD, HEAD_DIM], pl.FP32],
+    norm_w: pl.Tensor[[HEAD_DIM], pl.BF16],
+    cos: pl.Tensor[[T_DYN, ROPE_HEAD_DIM], pl.FP32],
+    sin: pl.Tensor[[T_DYN, ROPE_HEAD_DIM], pl.FP32],
+    cmp_kv_cache: pl.Tensor[[CMP_BLOCK_NUM_DYN, BLOCK_SIZE, 1, HEAD_DIM], pl.BF16],
+    cmp_slot_mapping: pl.Tensor[[T_DYN], pl.INT64],
+    compress_state: pl.Tensor[[COMPRESS_STATE_BLOCK_NUM_DYN, COMPRESS_STATE_BLOCK_SIZE, COMPRESS_STATE_DIM], pl.FP32],
+    compress_state_block_table: pl.Tensor[[B_DYN, COMPRESS_STATE_MAX_BLOCKS], pl.INT32],
+    ape: pl.Tensor[[COMPRESS_RATIO, OUT_DIM], pl.FP32],
+    kv_proj_pad: pl.Tensor[[BS_PAD, OUT_DIM], pl.FP32],
+    score_proj_pad: pl.Tensor[[BS_PAD, OUT_DIM], pl.FP32],
+    position_ids: pl.Tensor[[T_DYN], pl.INT32],
+    state_slot_mapping: pl.Tensor[[T_DYN], pl.INT64],
+    pool_tid: pl.Scalar[pl.TASK_ID],
+    late_write_dep: pl.Scalar[pl.TASK_ID],
+):
+    """Commit recurrent state and write the compressed KV cache."""
+    compressor_ratio4_state_commit(
+        compress_state, compress_state_block_table, ape,
+        kv_proj_pad, score_proj_pad, position_ids, state_slot_mapping,
+        pool_tid, late_write_dep,
+    )
+    cache_write_tid = compressor_ratio4_cache_write_only(
+        kv, pooled_kv, norm_w, cos, sin, cmp_kv_cache, cmp_slot_mapping,
+        position_ids, pool_tid, late_write_dep,
+    )
     return cache_write_tid
 
 

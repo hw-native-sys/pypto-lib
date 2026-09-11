@@ -52,7 +52,8 @@ from config import (
 from decode_compressor_ratio4 import (
     BS_PAD as CMP_BS_PAD,
     compressor_ratio4,
-    compressor_ratio4_cache_write,
+    compressor_ratio4_cache_write_only,
+    compressor_ratio4_state_commit,
     compressor_ratio4_project,
     compressor_ratio4_pool_projected,
 )
@@ -92,7 +93,7 @@ from qkv_proj_rope import (
     q_proj_q_matmul,
     q_proj_qr,
     qkv_proj_rope,
-    rope_prepare,
+    rope_prepare_after,
 )
 from decode_o_proj import (
     ATTENTION_WINDOW_ROWS,
@@ -103,7 +104,7 @@ from decode_o_proj import (
     LOCAL_T_PAD,
     O_WINDOW_ROWS,
     decode_o_proj_tp1,
-    o_group_a2a,
+    o_group_a2a_with_completion,
     o_proj_reduce_scatter,
 )
 from decode_sparse_attn_csa import (
@@ -317,7 +318,8 @@ def decode_csa(
         q_cos_il = pl.create_tensor([t_dim, ROPE_HEAD_DIM], dtype=pl.FP32)
         q_sin_signed = pl.create_tensor([t_dim, ROPE_HEAD_DIM], dtype=pl.FP32)
         q_swap_idx = pl.create_tensor([t_dim, ROPE_HEAD_DIM], dtype=pl.INT32)
-        rope_prepare(freqs_cos, freqs_sin, q_cos_il, q_sin_signed, q_swap_idx)
+        # Defer non-critical RoPE preparation until mixed activations are normalized.
+        rope_prepare_after(freqs_cos, freqs_sin, q_cos_il, q_sin_signed, q_swap_idx, rms_tid)
 
         qr_i8_matmul = pl.create_tensor([QPROJ_T_PAD, Q_LORA], dtype=pl.INT8)
         qr_scale_pad = pl.create_tensor([QPROJ_T_PAD, 1], dtype=pl.FP32)
@@ -491,12 +493,10 @@ def decode_csa(
         post_leaf_fence_tid = pl.system.task_dummy(deps=[leaf_tid])
 
         # Indexer score and Top-K selection.
-        compressor_ratio4_cache_write(
+        compressor_ratio4_cache_write_only(
             cmp_out, cmp_pooled_kv, cmp_norm_w,
             cmp_cos_il_full, cmp_sin_signed_full, cmp_kv, cmp_slots,
-            compress_state, cmp_state_table, cmp_ape,
-            cmp_kv_proj_pad, cmp_score_proj_pad, cmp_positions, cmp_state_slots,
-            cmp_pool_tid, post_leaf_fence_tid,
+            cmp_positions, cmp_pool_tid, post_leaf_fence_tid,
         )
         ori_block_num = pl.tensor.dim(kv_cache, 0)
         kv_cache_flat = pl.reshape(kv_cache, [ori_block_num * BLOCK_SIZE, HEAD_DIM])
@@ -579,11 +579,18 @@ def decode_csa(
                         offsets=[tp_rank, 0], value=1, op=pld.NotifyOp.AtomicAdd,
                     )
 
-        attention_local_flat, attention_signal = o_group_a2a(
+        attention_local_flat, attention_signal, o_a2a_complete_tid = o_group_a2a_with_completion(
             attention_local_flat,
             attention_window, attention_signal,
             group_base, tp_rank, local_t,
             publish_tid, ATTENTION_PUBLISH_WORKERS,
+        )
+
+        # Keep recurrent state writes out of the attention exchange's task window.
+        compressor_ratio4_state_commit(
+            compress_state, cmp_state_table, cmp_ape,
+            cmp_kv_proj_pad, cmp_score_proj_pad, cmp_positions, cmp_state_slots,
+            cmp_pool_tid, o_a2a_complete_tid,
         )
 
         attention_local_groups = pl.reshape(attention_local_flat, [LOCAL_O_GROUPS, GROUP_T_PAD, O_GROUP_IN])

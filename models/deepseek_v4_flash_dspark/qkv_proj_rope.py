@@ -128,13 +128,29 @@ def materialize_rope_rows(
                 rope_sin_t[rope_t : rope_t + 1, 0:ROPE_DIM] = freqs_sin[rope_pos : rope_pos + 1, 0:ROPE_DIM]
 
 
-@pl.jit.inline
+@pl.jit.inline(auto_scope=False)
 def rope_prepare(
     rope_cos: pl.Tensor[[ROPE_T_DYN, ROPE_DIM], pl.BF16],
     rope_sin: pl.Tensor[[ROPE_T_DYN, ROPE_DIM], pl.BF16],
     rope_cos_il: pl.Tensor[[ROPE_T_DYN, ROPE_DIM], pl.FP32],
     rope_sin_signed: pl.Tensor[[ROPE_T_DYN, ROPE_DIM], pl.FP32],
     rope_swap_idx: pl.Tensor[[ROPE_T_DYN, ROPE_DIM], pl.INT32],
+):
+    """Prepare RoPE rows without an additional scheduling dependency."""
+    prepare_dep = pl.system.task_invalid()
+    rope_prepare_after(
+        rope_cos, rope_sin, rope_cos_il, rope_sin_signed, rope_swap_idx, prepare_dep,
+    )
+
+
+@pl.jit.inline
+def rope_prepare_after(
+    rope_cos: pl.Tensor[[ROPE_T_DYN, ROPE_DIM], pl.BF16],
+    rope_sin: pl.Tensor[[ROPE_T_DYN, ROPE_DIM], pl.BF16],
+    rope_cos_il: pl.Tensor[[ROPE_T_DYN, ROPE_DIM], pl.FP32],
+    rope_sin_signed: pl.Tensor[[ROPE_T_DYN, ROPE_DIM], pl.FP32],
+    rope_swap_idx: pl.Tensor[[ROPE_T_DYN, ROPE_DIM], pl.INT32],
+    prepare_dep: pl.Scalar[pl.TASK_ID],
 ):
     """Build the head-invariant interleaved cos / sign-folded sin / swap-index rope rows."""
     t_dim = pl.tensor.dim(rope_cos, 0)
@@ -149,9 +165,11 @@ def rope_prepare(
     rope_swap_idx_view = pl.reshape(rope_swap_idx, [t_dim, ROPE_DIM])
 
     token_tiles = (t_dim + Q_ROPE_T_TILE - 1) // Q_ROPE_T_TILE
-    for qrp_worker in pl.spmd(
-        pl.min(Q_ROPE_WORKERS, token_tiles), name_hint="q_rope_prepare", allow_early_resolve=True
-    ):
+    with pl.spmd(
+        pl.min(Q_ROPE_WORKERS, token_tiles), name_hint="q_rope_prepare",
+        deps=[prepare_dep], allow_early_resolve=True,
+    ) as prepare_tid:
+        qrp_worker = pl.tile.get_block_idx()
         # The interleave lane, swap index and sign fold only depend on the column
         # index, so they are built once per worker instead of once per tile.
         qrp_ones = pl.full([Q_ROPE_T_TILE, ROPE_DIM], dtype=pl.FP32, value=1.0)
