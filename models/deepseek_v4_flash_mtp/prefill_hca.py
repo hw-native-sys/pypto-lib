@@ -40,6 +40,7 @@ from prefill_cp_exchange import (
     STATE_META_DIM,
     STATE_WINDOW_ROWS,
     _prefill_cp_hidden_tail_exchange_wave,
+    _prefill_cp_hca_history_exchange,
     _prefill_cp_hca_compact_exchange_commit_wave,
 )
 from prefill_cp_zigzag import (
@@ -207,13 +208,12 @@ def _lower_raw_key(
     return -1
 
 
-def _build_raw_attention_metadata(cp_size: int, *, num_tokens: int | None = None):
+def _build_raw_attention_metadata(cp_size: int, *, num_tokens: int | None = None, prefix: int = 0):
     import torch
 
-    prefix = 0
     if num_tokens is None:
         num_tokens = 2 * cp_size * MAX_SEGMENT_TILES * TAIL_ROWS
-    span, starts, lengths = cp_segment_layout(num_tokens, cp_size)
+    span, starts, lengths = cp_segment_layout(num_tokens, cp_size, prefix=prefix)
     owners = owner_segments(cp_size)
     query_positions = torch.zeros(cp_size, LOCAL_PARTS, MAX_SEGMENT_TILES, TAIL_ROWS, dtype=torch.int32)
     query_requests = torch.full_like(query_positions, -1)
@@ -221,6 +221,9 @@ def _build_raw_attention_metadata(cp_size: int, *, num_tokens: int | None = None
     overlay_requests = torch.full_like(overlay_positions, -1)
     overlay_lengths = torch.zeros(cp_size, LOCAL_PARTS, MAX_SEGMENT_TILES, OVERLAY_SOURCES, dtype=torch.int32)
     swa_indices = torch.full((cp_size, LOCAL_PARTS, MAX_SEGMENT_TILES, TAIL_ROWS, WIN), -1, dtype=torch.int32)
+    history_slot_mapping = torch.full((cp_size, LOCAL_PARTS, TAIL_ROWS), -1, dtype=torch.int32)
+    history_positions = torch.full((cp_size, LOCAL_PARTS, TAIL_ROWS), -1, dtype=torch.int32)
+    history_cmp_rows = torch.full((cp_size, 1), 0, dtype=torch.int32)
     segment_active = torch.zeros(cp_size, LOCAL_PARTS, dtype=torch.int32)
     predecessors = torch.full_like(segment_active, -1)
     for rank in range(cp_size):
@@ -268,6 +271,24 @@ def _build_raw_attention_metadata(cp_size: int, *, num_tokens: int | None = None
                             swa_indices[
                                 rank, part, tile, query_row, sparse_col
                             ] = _lower_raw_key(key_abs, segment, tile, starts, lengths, prefix)
+            # A chunk's first segment has no in-chunk predecessor; its window
+            # reaches into the previous chunk, which lives in the paged cache.
+            if prefix and segment == 0:
+                valid = min(TAIL_ROWS, prefix)
+                for row in range(valid):
+                    history_slot_mapping[rank, part, TAIL_ROWS - valid + row] = _ring_phys_row(
+                        prefix - valid + row
+                    )
+                overlay_lengths[rank, part, 0, 0] = valid
+                history_positions[rank, part, TAIL_ROWS - valid:TAIL_ROWS] = torch.arange(
+                    prefix - valid, prefix, dtype=torch.int32
+                )
+                history_cmp_rows[rank, 0] = min(prefix // COMPRESS_RATIO, HCA_MAX_COMPRESSED_ROWS)
+    # Request history is addressed by the cache owner, independently of which
+    # rank computes segment0. Part0 carries the request-level source window.
+    history_slot_mapping[:, 0] = history_slot_mapping[0, 0].clone()
+    history_positions[:, 0] = history_positions[0, 0].clone()
+    history_cmp_rows.fill_(min(prefix // COMPRESS_RATIO, HCA_MAX_COMPRESSED_ROWS))
     final_seg_src, final_row_src = cp_final_window_sources(lengths)
     final_slot_mapping = torch.tensor(
         [
@@ -286,6 +307,9 @@ def _build_raw_attention_metadata(cp_size: int, *, num_tokens: int | None = None
         "overlay_token_to_request": overlay_requests,
         "overlay_active_lengths": overlay_lengths,
         "swa_indices": swa_indices,
+        "history_slot_mapping": history_slot_mapping,
+        "history_positions": history_positions,
+        "history_cmp_rows": history_cmp_rows,
         "reverse_index": cp_reverse_index(cp_size).to(torch.int32),
         "final_win_seg_src": final_seg_src.to(torch.int32),
         "final_win_row_src": final_row_src.to(torch.int32),
@@ -320,17 +344,16 @@ def _state_block_tables(cp_size: int):
     return tables
 
 
-def build_hca_metadata(cp_size: int = CP_SIZE, *, num_tokens: int | None = None):
-    """Build canonical zero-history CP-HCA metadata."""
+def build_hca_metadata(cp_size: int = CP_SIZE, *, num_tokens: int | None = None, prefix: int = 0):
+    """Build CP-HCA metadata for the current chunk and its prefix."""
     import torch
 
     if cp_size not in CP_CHOICES:
         raise ValueError(f"cp_size must be one of {CP_CHOICES}, got {cp_size}")
 
-    prefix = 0
     if num_tokens is None:
         num_tokens = 2 * cp_size * MAX_SEGMENT_TILES * TAIL_ROWS
-    span, starts, lengths = cp_segment_layout(num_tokens, cp_size)
+    span, starts, lengths = cp_segment_layout(num_tokens, cp_size, prefix=prefix)
     owners = owner_segments(cp_size)
 
     query_positions = torch.full((cp_size, LOCAL_PARTS, MAX_SEGMENT_TILES, TAIL_ROWS), -1, dtype=torch.int32)
@@ -448,6 +471,9 @@ def prefill_attention_hca(
     segment_active_lengths: pl.Tensor[[LOCAL_PARTS], pl.INT32],
     owner_segments_t: pl.Tensor[[LOCAL_PARTS], pl.INT32],
     predecessor_segments: pl.Tensor[[LOCAL_PARTS], pl.INT32],
+    history_slot_mapping: pl.Tensor[[LOCAL_PARTS, TAIL_ROWS], pl.INT32],
+    history_positions: pl.Tensor[[LOCAL_PARTS, TAIL_ROWS], pl.INT32],
+    history_cmp_rows: pl.Tensor[[1], pl.INT32],
     query_positions: pl.Tensor[[LOCAL_PARTS, MAX_SEGMENT_TILES, TAIL_ROWS], pl.INT32],
     overlay_active_lengths: pl.Tensor[[LOCAL_PARTS, MAX_SEGMENT_TILES, OVERLAY_SOURCES], pl.INT32],
     segment_tail_positions: pl.Tensor[[NUM_SEGMENTS, TAIL_ROWS], pl.INT32],
@@ -505,6 +531,37 @@ def prefill_attention_hca(
     x_flat = pl.reshape(x_hc, [LOCAL_ROWS, HC_MULT, D])
     query_positions_flat = pl.reshape(query_positions, [LOCAL_ROWS])
 
+    attn_cmp_flat = pl.create_tensor([HCA_MAX_COMPRESSED_ROWS, HEAD_DIM], dtype=pl.BF16)
+    attn_cmp_table = pl.create_tensor([PREFILL_CMP_MAX_BLOCKS], dtype=pl.INT32)
+    history_raw = pl.create_tensor([TAIL_ROWS, HEAD_DIM], dtype=pl.BF16)
+    history_state = pl.create_tensor([TAIL_ROWS, COMPRESS_STATE_DIM], dtype=pl.FP32)
+    with pl.at(level=pl.Level.CORE_GROUP, name_hint="cp_hca_attn_cache_init"):
+        attn_cmp_flat[:, :] = pl.full([HCA_MAX_COMPRESSED_ROWS, HEAD_DIM], dtype=pl.BF16, value=0.0)
+        for history_row0 in pl.range(0, TAIL_ROWS, ROW_TILE):
+            history_raw[history_row0:history_row0 + ROW_TILE, :] = pl.full([ROW_TILE, HEAD_DIM], dtype=pl.BF16, value=0.0)
+            history_state[history_row0:history_row0 + ROW_TILE, :] = pl.full([ROW_TILE, COMPRESS_STATE_DIM], dtype=pl.FP32, value=0.0)
+        for logical in pl.range(PREFILL_CMP_MAX_BLOCKS):
+            pl.write(attn_cmp_table, [logical], pl.cast(logical, pl.INT32))
+    attn_cmp_kv = pl.reshape(attn_cmp_flat, [HCA_MAX_COMPRESSED_ROWS, 1, 1, HEAD_DIM])
+    cmp_cache_rows = pl.tensor.dim(cmp_kv, 0)
+    cmp_kv_flat = pl.reshape(cmp_kv, [cmp_cache_rows, HEAD_DIM])
+    history_rows = pl.tensor.dim(kv_cache, 0) * BLOCK_SIZE
+    history_phases = pl.cast(0, pl.INT32)
+    if pl.read(segment_starts_t, [0]) > 0:
+        history_phases = pl.cast(
+            1 + (pl.read(history_cmp_rows, [0]) + CMP_WINDOW_ROWS - 1) // CMP_WINDOW_ROWS,
+            pl.INT32,
+        )
+        _history_done = _prefill_cp_hca_history_exchange(
+            kv_cache, cmp_kv, compress_state, history_slot_mapping,
+            cmp_block_table, compress_state_block_table,
+            cmp_window, state_window, compact_ready, compact_consumed,
+            history_raw, history_state, attn_cmp_flat,
+            pl.read(segment_starts_t, [0]), pl.read(history_cmp_rows, [0]), cache_owner_rank, my_rank,
+            pl.cast(compact_comm_epoch_base * (history_phases + 1), pl.INT32),
+        )
+    compact_epoch = pl.cast(compact_comm_epoch_base * (history_phases + 1) + history_phases, pl.INT32)
+
     # Recipes treats the two owned 512-row segments as one rank-local 1024-row
     # query projection.  KV is projected later from the augmented hidden
     # sequence (predecessor128 + current512), after hidden-only CP exchange.
@@ -553,14 +610,31 @@ def prefill_attention_hca(
         part = pl.tile.get_block_idx()
         predecessor = pl.read(predecessor_segments, [part])
         predecessor_valid = pl.read(overlay_active_lengths, [part, 0, 0])
+        if predecessor < 0:
+            predecessor_valid = pl.cast(0, pl.INT32)
+            if pl.read(history_slot_mapping, [part, TAIL_ROWS - 1]) >= 0:
+                predecessor_valid = pl.cast(pl.min(TAIL_ROWS, pl.max(0, pl.read(segment_starts_t, [0]))), pl.INT32)
+        # The predecessor leaf feeds two consumers with different needs. Attention
+        # counts every visible key, including a continued chunk's history window.
+        # The compressor consumes hidden states, and a history window has none --
+        # its rows are already compressed in the persistent cache -- so it must
+        # see zero tokens there or it would compress 128 zero rows.
+        compressor_tokens = predecessor_valid
+        if predecessor < 0:
+            compressor_tokens = pl.cast(0, pl.INT32)
         leaf_token_row = pl.full([1, LEAF_NUM_TOKENS_STRIDE], dtype=pl.INT32, value=0)
-        pl.write(leaf_token_row, [0, 0], predecessor_valid)
+        pl.write(leaf_token_row, [0, 0], compressor_tokens)
         for leaf_row in pl.range(TAIL_ROWS):
             leaf_index = part * MAX_COMPRESS_LEAVES * TAIL_ROWS + leaf_row
             effective_x[leaf_index:leaf_index + 1, :] = pl.full([1, D], dtype=pl.BF16, value=0.0)
             pl.write(leaf_positions, [leaf_index], pl.cast(0, pl.INT32))
             pl.write(leaf_cmp_slots, [leaf_index], pl.cast(-1, pl.INT64))
             pl.write(leaf_state_slots, [leaf_index], pl.cast(-1, pl.INT64))
+            if predecessor < 0 and leaf_row < predecessor_valid:
+                # History rows carry real absolute positions; leaving them at 0
+                # would put them outside every query's sliding window.
+                history_row = TAIL_ROWS - predecessor_valid + leaf_row
+                pl.write(leaf_positions, [leaf_index], pl.read(history_positions, [part, history_row]))
             if predecessor >= 0 and leaf_row < predecessor_valid:
                 source = predecessor * TAIL_ROWS + leaf_row
                 effective_x[leaf_index:leaf_index + 1, :] = logical_hidden[source:source + 1, :]
@@ -641,8 +715,30 @@ def prefill_attention_hca(
         leaf_lowering_tid,
     )
 
+    # A continued chunk's first segment has no in-chunk predecessor: its window
+    # reaches into the previous chunk, whose KV is already projected and RoPEd in
+    # the paged cache. Overwrite the predecessor leaf with those rows instead of
+    # re-projecting hidden states we no longer hold.
     logical_kv = pl.create_tensor([EPOCHS * CP_TAIL_WINDOW_ROWS, HEAD_DIM], dtype=pl.BF16)
     with pl.at(level=pl.Level.CORE_GROUP, name_hint="cp_hca_augmented_kv_scatter"):
+        # Done here rather than in its own scope: this one already reads
+        # augmented_kv, so it is ordered after kv_proj_rope's write. A separate
+        # scope carries no producer read and the projection overwrites it.
+        for part in pl.range(LOCAL_PARTS):
+            augmented_row0 = part * ROWS_PER_AUGMENTED_PART
+            history_valid = pl.min(TAIL_ROWS, pl.max(0, pl.read(segment_starts_t, [0])))
+            for row in pl.range(TAIL_ROWS):
+                slot = pl.cast(-1, pl.INT32)
+                # Metadata right-aligns the pre-chunk window; the raw attention
+                # gather addresses valid predecessor rows from the leaf's start.
+                if row < history_valid and pl.read(predecessor_segments, [part]) < 0:
+                    history_row = TAIL_ROWS - history_valid + row
+                    slot = pl.read(history_slot_mapping, [part, history_row])
+                if slot >= 0 and slot < history_rows:
+                    source = TAIL_ROWS - history_valid + row
+                    augmented_kv[augmented_row0 + row:augmented_row0 + row + 1, :] = history_raw[
+                        source:source + 1, :
+                    ]
         for part in pl.range(LOCAL_PARTS):
             augmented_row0 = part * ROWS_PER_AUGMENTED_PART
             local_row0 = part * MAX_SEGMENT_TILES * TAIL_ROWS
@@ -713,7 +809,6 @@ def prefill_attention_hca(
         ],
         dtype=pl.FP32,
     )
-    persistent_state_flat = pl.reshape(compress_state, [state_rows, COMPRESS_STATE_DIM])
     scratch_state_flat = pl.reshape(scratch_state, [LOCAL_PARTS * state_rows, COMPRESS_STATE_DIM])
     with pl.at(level=pl.Level.CORE_GROUP, name_hint="cp_hca_seed_state"):
         for part in pl.range(LOCAL_PARTS):
@@ -723,9 +818,15 @@ def prefill_attention_hca(
                 scratch_state_flat[
                     destination : destination + 1, :
                 ] = pl.full([1, COMPRESS_STATE_DIM], dtype=pl.FP32, value=0.0)
-                if segment == 0 and pl.read(segment_starts_t, [0]) > 0:
-                    persistent_state_row = persistent_state_flat[state_row : state_row + 1, :]
-                    scratch_state_flat[destination : destination + 1, :] = persistent_state_row
+            if segment == 0 and pl.read(segment_starts_t, [0]) > 0:
+                for row in pl.range(TAIL_ROWS):
+                    seed_position = pl.read(segment_starts_t, [0]) - TAIL_ROWS + row
+                    if seed_position >= 0:
+                        seed_page = pl.read(compress_state_block_table, [seed_position // HCA_STATE_BLOCK_SIZE])
+                        seed_row = seed_page * HCA_STATE_BLOCK_SIZE + seed_position % HCA_STATE_BLOCK_SIZE
+                        if seed_page >= 0 and seed_row < state_rows:
+                            seed_destination = part * state_rows + seed_row
+                            scratch_state_flat[seed_destination:seed_destination + 1, :] = history_state[row:row + 1, :]
 
     leaf_cmp = pl.create_tensor(
         [
@@ -832,15 +933,6 @@ def prefill_attention_hca(
                             )
                             local_state_payload[row:row + 1, :] = scratch_state_flat[source:source + 1, :]
 
-    attn_cmp_flat = pl.create_tensor([HCA_MAX_COMPRESSED_ROWS, HEAD_DIM], dtype=pl.BF16)
-    attn_cmp_table = pl.create_tensor([PREFILL_CMP_MAX_BLOCKS], dtype=pl.INT32)
-    with pl.at(level=pl.Level.CORE_GROUP, name_hint="cp_hca_attn_cache_init"):
-        attn_cmp_flat[:, :] = pl.full([HCA_MAX_COMPRESSED_ROWS, HEAD_DIM], dtype=pl.BF16, value=0.0)
-        for logical in pl.range(PREFILL_CMP_MAX_BLOCKS):
-            pl.write(attn_cmp_table, [logical], pl.cast(logical, pl.INT32))
-    attn_cmp_kv = pl.reshape(attn_cmp_flat, [HCA_MAX_COMPRESSED_ROWS, 1, 1, HEAD_DIM])
-    cmp_cache_rows = pl.tensor.dim(cmp_kv, 0)
-    cmp_kv_flat = pl.reshape(cmp_kv, [cmp_cache_rows, HEAD_DIM])
     compact_commit_tid = _prefill_cp_hca_compact_exchange_commit_wave(
         local_cmp_payload,
         local_cmp_meta,
@@ -861,7 +953,7 @@ def prefill_attention_hca(
         attn_cmp_flat, cache_owner_rank,
         my_rank,
         pl.cast(0, pl.INT32),
-        compact_comm_epoch_base,
+        compact_epoch,
         pack_compact_tid,
     )
 
@@ -900,6 +992,8 @@ def prefill_attention_hca(
     part0_predecessor_valid = pl.read(overlay_active_lengths, [0, 0, 0])
     if pl.read(predecessor_segments, [0]) < 0:
         part0_predecessor_valid = pl.cast(0, pl.INT32)
+        if pl.read(history_slot_mapping, [0, TAIL_ROWS - 1]) >= 0:
+            part0_predecessor_valid = pl.cast(pl.min(TAIL_ROWS, pl.max(0, pl.read(segment_starts_t, [0]))), pl.INT32)
     part0_attn_tid = hca_attn(
         q_part0,
         full_kv_part0,
@@ -928,6 +1022,8 @@ def prefill_attention_hca(
     part1_predecessor_valid = pl.read(overlay_active_lengths, [1, 0, 0])
     if pl.read(predecessor_segments, [1]) < 0:
         part1_predecessor_valid = pl.cast(0, pl.INT32)
+        if pl.read(history_slot_mapping, [1, TAIL_ROWS - 1]) >= 0:
+            part1_predecessor_valid = pl.cast(pl.min(TAIL_ROWS, pl.max(0, pl.read(segment_starts_t, [0]))), pl.INT32)
     attention_done_tid = hca_attn(
         q_part1,
         full_kv_part1,
@@ -968,7 +1064,7 @@ def prefill_attention_hca(
             completion_token[tile : tile + 1, 0:1, 0:8] = pl.slice(x_out_flat, [1, 1, 8], [tile * TAIL_ROWS, 0, 0])
     _completed = pl.read(completion_token, [0, 0, 0])
 
-    return pl.reshape(x_out_flat, [LOCAL_PARTS, MAX_SEGMENT_TILES, TAIL_ROWS, HC_MULT, D])
+    return x_out
 
 
 @pl.jit
@@ -999,6 +1095,9 @@ def prefill_cp_hca_rank(
     segment_active_lengths: pl.Tensor[[LOCAL_PARTS], pl.INT32],
     owner_segments_t: pl.Tensor[[LOCAL_PARTS], pl.INT32],
     predecessor_segments: pl.Tensor[[LOCAL_PARTS], pl.INT32],
+    history_slot_mapping: pl.Tensor[[LOCAL_PARTS, TAIL_ROWS], pl.INT32],
+    history_positions: pl.Tensor[[LOCAL_PARTS, TAIL_ROWS], pl.INT32],
+    history_cmp_rows: pl.Tensor[[1], pl.INT32],
     query_positions: pl.Tensor[[LOCAL_PARTS, MAX_SEGMENT_TILES, TAIL_ROWS], pl.INT32],
     overlay_active_lengths: pl.Tensor[[LOCAL_PARTS, MAX_SEGMENT_TILES, OVERLAY_SOURCES], pl.INT32],
     segment_tail_positions: pl.Tensor[[NUM_SEGMENTS, TAIL_ROWS], pl.INT32],
@@ -1039,7 +1138,7 @@ def prefill_cp_hca_rank(
         compress_state, compress_state_block_table,
         kv_cache, cmp_kv, cmp_block_table,
         segment_starts_t, segment_active_lengths,
-        owner_segments_t, predecessor_segments,
+        owner_segments_t, predecessor_segments, history_slot_mapping, history_positions, history_cmp_rows,
         query_positions,
         overlay_active_lengths,
         segment_tail_positions,
@@ -1091,6 +1190,9 @@ def prefill_cp_hca_test(
     overlay_requests: pl.Tensor[[CP_SIZE, LOCAL_PARTS, MAX_SEGMENT_TILES, OVERLAY_ROWS], pl.INT32],
     overlay_active_lengths: pl.Tensor[[CP_SIZE, LOCAL_PARTS, MAX_SEGMENT_TILES, OVERLAY_SOURCES], pl.INT32],
     swa_indices: pl.Tensor[[CP_SIZE, LOCAL_PARTS, MAX_SEGMENT_TILES, TAIL_ROWS, WIN], pl.INT32],
+    history_slot_mapping: pl.Tensor[[CP_SIZE, LOCAL_PARTS, TAIL_ROWS], pl.INT32],
+    history_positions: pl.Tensor[[CP_SIZE, LOCAL_PARTS, TAIL_ROWS], pl.INT32],
+    history_cmp_rows: pl.Tensor[[CP_SIZE, 1], pl.INT32],
     cmp_indices: pl.Tensor[[CP_SIZE, LOCAL_PARTS, MAX_SEGMENT_TILES, TAIL_ROWS, IDX_TOPK], pl.INT32],
     segment_tail_positions: pl.Tensor[[NUM_SEGMENTS, TAIL_ROWS], pl.INT32],
     snapshot_positions: pl.Tensor[[CP_SIZE, LOCAL_PARTS, TAIL_ROWS], pl.INT32],
@@ -1145,6 +1247,9 @@ def prefill_cp_hca_test(
             segment_starts_t, segment_active_lengths[rank],
             owner_segments_t[rank],
             predecessor_segments[rank],
+            history_slot_mapping[rank],
+            history_positions[rank],
+            history_cmp_rows[rank],
             query_positions[rank],
             overlay_active_lengths[rank],
 
@@ -1194,15 +1299,15 @@ def _cmp_physical_row(table, logical_slot: int) -> int:
     return (physical_block * CMP_STORAGE_BLOCK_SIZE + logical_slot % CMP_STORAGE_BLOCK_SIZE)
 
 
-def build_cp_tensor_specs(cp_size: int = CP_SIZE, *, num_tokens: int | None = None):
+def build_cp_tensor_specs(cp_size: int = CP_SIZE, *, num_tokens: int | None = None, prefix: int = 0):
     """Build the canonical CP-HCA fixture."""
     import torch
     from golden import TensorSpec
 
     if cp_size != CP_SIZE:
         raise ValueError(f"runtime cp_size={cp_size} does not match static CP_SIZE={CP_SIZE}")
-    metadata = build_hca_metadata(cp_size, num_tokens=num_tokens)
-    raw_metadata = _build_raw_attention_metadata(cp_size, num_tokens=num_tokens)
+    metadata = build_hca_metadata(cp_size, num_tokens=num_tokens, prefix=prefix)
+    raw_metadata = _build_raw_attention_metadata(cp_size, num_tokens=num_tokens, prefix=prefix)
     qkv_specs = {spec.name: spec for spec in build_qkv_tensor_specs(1, TAIL_ROWS)}
     sparse_specs = { spec.name: spec for spec in build_sparse_attn_tensor_specs(COMPRESS_RATIO, TAIL_ROWS) }
     compressor_specs = { spec.name: spec for spec in build_compressor_tensor_specs(0) }
@@ -1230,6 +1335,14 @@ def build_cp_tensor_specs(cp_size: int = CP_SIZE, *, num_tokens: int | None = No
                 if active:
                     x_hc[rank, part, tile, :active].uniform_(-1.0, 1.0)
     kv_cache = torch.zeros(cp_size, ORI_MAX_BLOCKS, BLOCK_SIZE, 1, HEAD_DIM, dtype=torch.bfloat16)
+    # Raw window an earlier chunk would have committed. Without it the history
+    # rows read an incidental zero and a wrong row cannot be told from a right one.
+    if prefix:
+        raw_rows = kv_cache.reshape(cp_size, -1, HEAD_DIM)
+        raw_history = torch.empty(TAIL_ROWS, HEAD_DIM, dtype=torch.float32).uniform_(-1.0, 1.0)
+        for offset, position in enumerate(range(max(0, prefix - TAIL_ROWS), prefix)):
+            raw_rows[:, _ring_phys_row(position)] = raw_history[offset].to(torch.bfloat16)
+        kv_cache = raw_rows.reshape(kv_cache.shape)
 
     common_names = (
         "hc_attn_fn",
@@ -1327,6 +1440,9 @@ def build_cp_tensor_specs(cp_size: int = CP_SIZE, *, num_tokens: int | None = No
         "overlay_requests": raw_metadata["overlay_token_to_request"],
         "overlay_active_lengths": raw_metadata["overlay_active_lengths"],
         "swa_indices": raw_metadata["swa_indices"],
+        "history_slot_mapping": raw_metadata["history_slot_mapping"],
+        "history_positions": raw_metadata["history_positions"],
+        "history_cmp_rows": raw_metadata["history_cmp_rows"],
         "cmp_indices": metadata["cmp_indices"],
         "segment_tail_positions": metadata["segment_tail_positions"],
         "snapshot_positions": metadata["snapshot_positions"],
@@ -1368,6 +1484,7 @@ def golden_prefill_cp_hca(tensors):
     if ctx is None:
         raise RuntimeError("CP-HCA golden context was not installed")
     cp_size = ctx["cp_size"]
+    cache_owner = int(tensors["cache_owner_rank_t"][0, 0])
     lengths = ctx["lengths"]
     owners = ctx["owners"]
 
@@ -1462,7 +1579,7 @@ def golden_prefill_cp_hca(tensors):
         state_table = tensors["compress_state_block_table"][owner]
         scratch = torch.zeros_like(initial_state[owner])
         if segment == 0 and int(tensors["segment_starts_t"][0]) > 0:
-            scratch.copy_(initial_state[owner])
+            scratch.copy_(initial_state[cache_owner])
 
         leaves = []
         predecessor = segment - 1
@@ -1529,7 +1646,7 @@ def golden_prefill_cp_hca(tensors):
                 snapshot[row] = scratch_flat[source]
         segment_snapshots[segment] = snapshot
 
-    cmp_result = tensors["cmp_kv"].clone()
+    cmp_result = tensors["cmp_kv"][cache_owner:cache_owner + 1].expand_as(tensors["cmp_kv"]).clone()
     for logical_slot, value in compressed_rows:
         for receiver in range(cp_size):
             destination = _cmp_physical_row(tensors["cmp_block_table"][receiver], logical_slot)
@@ -1554,7 +1671,7 @@ def golden_prefill_cp_hca(tensors):
     raw_initial = tensors["kv_cache"].clone()
     output = torch.zeros_like(tensors["x_out"])
     for rank in range(cp_size):
-        persistent = raw_initial[rank].view(-1, HEAD_DIM)
+        persistent = raw_initial[cache_owner].view(-1, HEAD_DIM)
         for part in range(LOCAL_PARTS):
             segment = owners[rank][part]
             for tile in range(MAX_SEGMENT_TILES):
@@ -1630,6 +1747,8 @@ if __name__ == "__main__":
     parser.add_argument("-d", "--device", default=",".join(str(i) for i in range(CP_SIZE)))
     parser.add_argument("--cp", type=int, default=CP_SIZE, choices=list(CP_CHOICES))
     parser.add_argument("--num-tokens", type=int, default=None, help="actual request length; defaults to full capacity")
+    parser.add_argument("--prefix", type=int, default=0,
+                        help="tokens already resident in this request's caches from earlier chunks")
     parser.add_argument("--compile-only", action="store_true")
     parser.add_argument("--save-data", action="store_true")
     parser.add_argument("--golden-data", type=str, default=None)
@@ -1644,7 +1763,7 @@ if __name__ == "__main__":
         raise SystemExit(f"CP{args.cp} requires {args.cp} devices, got {device_ids}")
     result = run(
         fn=prefill_cp_hca_test,
-        specs=build_cp_tensor_specs(args.cp, num_tokens=args.num_tokens),
+        specs=build_cp_tensor_specs(args.cp, num_tokens=args.num_tokens, prefix=args.prefix),
         golden_fn=golden_prefill_cp_hca,
         golden_data=args.golden_data,
         save_data=args.save_data,

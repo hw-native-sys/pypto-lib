@@ -49,25 +49,33 @@ CP_PREFILL_CMP_BLOCK_NUM = NUM_SEGMENTS * MAX_SEGMENT_TILES
 CP_TAIL_WINDOW_ROWS = NUM_SEGMENTS * TAIL_ROWS
 
 
-def cp_segment_layout(num_tokens: int, cp_size: int = CP_SIZE):
-    """Return padded segment span, logical starts and real lengths for one request.
+def cp_segment_layout(num_tokens: int, cp_size: int = CP_SIZE, *, prefix: int = 0):
+    """Return padded segment span, logical starts and real lengths for one chunk.
 
     Distributed Recipes ownership uses 2*CP equal segments of at least one
     SWA window each. CP=1 keeps the same local storage layout without peers.
     The returned lengths exclude padding; starts use the padded segment span,
     independently of the kernel's fixed backing capacity.
+
+    ``prefix`` is the number of tokens already resident in this request's caches
+    from earlier chunks. Starts are absolute positions, so ``starts[0] == prefix``
+    and the attention leaves read anything below it out of the paged caches.
+    ``num_tokens`` remains this chunk's length and is bounded by the per-chunk
+    capacity, which ``prefix`` does not change.
     """
-    if type(num_tokens) is not int or type(cp_size) is not int:
-        raise TypeError("num_tokens and cp_size must be an int")
+    if type(num_tokens) is not int or type(cp_size) is not int or type(prefix) is not int:
+        raise TypeError("num_tokens, cp_size and prefix must be an int")
     if cp_size not in CP_CHOICES:
         raise ValueError(f"cp_size must be one of {CP_CHOICES}, got {cp_size}")
+    if prefix < 0:
+        raise ValueError(f"prefix must be non-negative, got {prefix}")
     nseg = 2 * cp_size
     capacity = nseg * MAX_SEGMENT_TILES * TAIL_ROWS
     if not 1 <= num_tokens <= capacity:
         raise ValueError(f"num_tokens must be in [1, {capacity}], got {num_tokens}")
     span = max(TAIL_ROWS, (num_tokens + nseg - 1) // nseg)
-    starts = [segment * span for segment in range(nseg)]
-    lengths = [max(0, min(span, num_tokens - start)) for start in starts]
+    starts = [prefix + segment * span for segment in range(nseg)]
+    lengths = [max(0, min(span, prefix + num_tokens - start)) for start in starts]
     return span, starts, lengths
 
 

@@ -59,6 +59,7 @@ HCA_STATE_BLOCKS_DYN = pl.dynamic("CP_HCA_STATE_BLOCKS_DYN")
 CP_CMP_BLOCK_NUM_DYN = pl.dynamic("CP_CMP_BLOCK_NUM_DYN")
 CP_CMP_ROWS_DYN = pl.dynamic("CP_CMP_ROWS_DYN")
 CP_CMP_STORAGE_BLOCK_SIZE_DYN = pl.dynamic("CP_CMP_STORAGE_BLOCK_SIZE_DYN")
+HCA_RAW_BLOCKS_DYN = pl.dynamic("CP_HCA_HISTORY_RAW_BLOCKS_DYN")
 
 # model config
 D = M.hidden_size
@@ -127,9 +128,13 @@ def _prefill_cp_request_header(
         if owners != 1:
             owner = pl.cast(-1, pl.INDEX)
             length = pl.cast(0, pl.INDEX)
+        # A continued chunk arrives with an absolute base; the caches it reads
+        # were written by the earlier chunks of the same request.
+        base = pl.cast(0, pl.INDEX)
         mode = pl.cast(0, pl.INDEX)
         if owner == my_rank:
-            if pl.read(position_ids, [0]) == 0:
+            base = pl.cast(pl.read(position_ids, [0]), pl.INDEX)
+            if base >= 0:
                 if length <= CP_REQUEST_CAPACITY:
                     mode = pl.cast(1, pl.INDEX)
         span = pl.max(TAIL_ROWS, (length + NUM_SEGMENTS - 1) // NUM_SEGMENTS)
@@ -143,6 +148,8 @@ def _prefill_cp_request_header(
                 value = pl.cast(length, pl.INT32)
             elif col == 3:
                 value = pl.cast(span, pl.INT32)
+            elif col == 4:
+                value = pl.cast(base, pl.INT32)
             pl.write(header, [0, col], value)
     return header
 
@@ -398,6 +405,122 @@ def _prefill_cp_hidden_tail_exchange_wave(
             )
 
     return logical_hidden_out
+
+
+@pl.jit.inline
+def _prefill_cp_hca_history_exchange(
+    raw_cache: pl.Tensor[[HCA_RAW_BLOCKS_DYN, BLOCK_SIZE, 1, HEAD_DIM], pl.BF16],
+    cmp_cache: pl.Tensor[[CP_CMP_BLOCK_NUM_DYN, HCA_CMP_STORAGE_BLOCK_SIZE, 1, HEAD_DIM], pl.BF16],
+    state: pl.Tensor[[HCA_STATE_BLOCKS_DYN, HCA_STATE_BLOCK_SIZE, COMPRESS_STATE_DIM], pl.FP32],
+    raw_slots: pl.Tensor[[LOCAL_PARTS, TAIL_ROWS], pl.INT32],
+    cmp_table: pl.Tensor[[PREFILL_CMP_MAX_BLOCKS], pl.INT32],
+    state_table: pl.Tensor[[HCA_STATE_MAX_BLOCKS], pl.INT32],
+    cmp_window: pld.DistributedTensor[[CMP_WINDOW_ROWS, HEAD_DIM], pl.BF16],
+    state_window: pld.DistributedTensor[[STATE_WINDOW_ROWS, COMPRESS_STATE_DIM], pl.FP32],
+    ready: pld.DistributedTensor[[CP_SIZE, 1], pl.INT32],
+    consumed: pld.DistributedTensor[[CP_SIZE, 1], pl.INT32],
+    history_raw: pl.Out[pl.Tensor[[TAIL_ROWS, HEAD_DIM], pl.BF16]],
+    history_state: pl.Out[pl.Tensor[[TAIL_ROWS, COMPRESS_STATE_DIM], pl.FP32]],
+    history_cmp: pl.InOut[pl.Tensor[[HCA_MAX_COMPRESSED_ROWS, HEAD_DIM], pl.BF16]],
+    base: pl.Scalar[pl.INT32],
+    history_count: pl.Scalar[pl.INT32],
+    cache_owner_rank: pl.Scalar[pl.INT32],
+    my_rank: pl.Scalar[pl.INT32],
+    epoch_base: pl.Scalar[pl.INT32],
+) -> pl.Scalar[pl.TASK_ID]:
+    """Stage owner history without writing other requests' persistent pools.
+
+    One phase transfers the raw/state tail; subsequent phases stream compressed
+    rows through the existing compact window. Every phase is consumed before
+    the next overwrite, including the later current-chunk compact publication.
+    State-window lanes0/1 hold FP32 state/raw respectively (CP is at least2);
+    conversion of BF16 raw KV to FP32 and back is exact.
+    """
+    state_rows = pl.tensor.dim(state, 0) * HCA_STATE_BLOCK_SIZE
+    state_flat = pl.reshape(state, [state_rows, COMPRESS_STATE_DIM])
+    raw_rows = pl.tensor.dim(raw_cache, 0) * BLOCK_SIZE
+    raw_flat = pl.reshape(raw_cache, [raw_rows, HEAD_DIM])
+    cmp_rows = pl.tensor.dim(cmp_cache, 0) * HCA_CMP_STORAGE_BLOCK_SIZE
+    cmp_flat = pl.reshape(cmp_cache, [cmp_rows, HEAD_DIM])
+    state_payload = pl.create_tensor([TAIL_ROWS, COMPRESS_STATE_DIM], dtype=pl.FP32)
+    raw_payload = pl.create_tensor([TAIL_ROWS, HEAD_DIM], dtype=pl.FP32)
+    cmp_payload = pl.create_tensor([CMP_WINDOW_ROWS, HEAD_DIM], dtype=pl.BF16)
+    with pl.at(level=pl.Level.CORE_GROUP, name_hint="cp_hca_owner_history") as history_tid:
+        cp_rank = my_rank % CP_SIZE
+        group_base = my_rank - cp_rank
+        compressed = history_count
+        waves = (compressed + CMP_WINDOW_ROWS - 1) // CMP_WINDOW_ROWS
+        for phase in pl.range(waves + 1):
+            epoch = epoch_base + phase
+            for peer in pl.range(CP_SIZE):
+                if peer != cp_rank:
+                    pld.system.wait(signal=consumed, offsets=[peer, 0], expected=epoch, cmp=pld.WaitCmp.Ge)
+            if my_rank == cache_owner_rank:
+                if phase == 0:
+                    for row in pl.range(TAIL_ROWS):
+                        state_payload[row:row + 1, :] = pl.full([1, COMPRESS_STATE_DIM], dtype=pl.FP32, value=0.0)
+                        raw_payload[row:row + 1, :] = pl.full([1, HEAD_DIM], dtype=pl.FP32, value=0.0)
+                        position = base - TAIL_ROWS + row
+                        if position >= 0:
+                            page = pl.read(state_table, [position // HCA_STATE_BLOCK_SIZE])
+                            source = page * HCA_STATE_BLOCK_SIZE + position % HCA_STATE_BLOCK_SIZE
+                            if page >= 0 and source < state_rows:
+                                state_payload[row:row + 1, :] = state_flat[source:source + 1, :]
+                        raw_source = pl.read(raw_slots, [0, row])
+                        if raw_source >= 0 and raw_source < raw_rows:
+                            raw_payload[row:row + 1, :] = pl.cast(raw_flat[raw_source:raw_source + 1, :], pl.FP32)
+                    for peer in pl.range(CP_SIZE):
+                        pld.tensor.put(
+                            dst=state_window, peer=group_base + peer, src=state_payload,
+                            dst_offsets=[0, 0], src_offsets=[0, 0], shape=[TAIL_ROWS, COMPRESS_STATE_DIM],
+                            chunk_rows=ROW_TILE, chunk_cols=COMPRESS_STATE_DIM, pipeline=True,
+                        )
+                        pld.tensor.put(
+                            dst=state_window, peer=group_base + peer, src=raw_payload,
+                            dst_offsets=[TAIL_ROWS, 0], src_offsets=[0, 0], shape=[TAIL_ROWS, HEAD_DIM],
+                            chunk_rows=ROW_TILE, chunk_cols=HEAD_DIM, pipeline=True,
+                        )
+                else:
+                    for row in pl.range(CMP_WINDOW_ROWS):
+                        logical = (phase - 1) * CMP_WINDOW_ROWS + row
+                        cmp_payload[row:row + 1, :] = pl.full([1, HEAD_DIM], dtype=pl.BF16, value=0.0)
+                        if logical < compressed:
+                            page = pl.read(cmp_table, [logical // HCA_CMP_STORAGE_BLOCK_SIZE])
+                            source = page * HCA_CMP_STORAGE_BLOCK_SIZE + logical % HCA_CMP_STORAGE_BLOCK_SIZE
+                            if page >= 0 and source < cmp_rows:
+                                cmp_payload[row:row + 1, :] = cmp_flat[source:source + 1, :]
+                    for peer in pl.range(CP_SIZE):
+                        pld.tensor.put(
+                            dst=cmp_window, peer=group_base + peer, src=cmp_payload,
+                            dst_offsets=[0, 0], src_offsets=[0, 0], shape=[CMP_WINDOW_ROWS, HEAD_DIM],
+                            chunk_rows=CMP_ROWS_PER_RANK, chunk_cols=HEAD_DIM, pipeline=True,
+                        )
+            for peer in pl.range(CP_SIZE):
+                if peer != cp_rank:
+                    pld.system.notify(
+                        target=ready, peer=group_base + peer, offsets=[cp_rank, 0],
+                        value=1, op=pld.NotifyOp.AtomicAdd,
+                    )
+            for peer in pl.range(CP_SIZE):
+                if peer != cp_rank:
+                    pld.system.wait(signal=ready, offsets=[peer, 0], expected=epoch + 1, cmp=pld.WaitCmp.Ge)
+            if phase == 0:
+                for row0 in pl.range(0, TAIL_ROWS, ROW_TILE):
+                    history_state[row0:row0 + ROW_TILE, :] = state_window[row0:row0 + ROW_TILE, :]
+                    history_raw[row0:row0 + ROW_TILE, :] = pl.cast(
+                        state_window[TAIL_ROWS + row0:TAIL_ROWS + row0 + ROW_TILE, 0:HEAD_DIM], pl.BF16)
+            else:
+                for row in pl.range(CMP_WINDOW_ROWS):
+                    logical = (phase - 1) * CMP_WINDOW_ROWS + row
+                    if logical < compressed:
+                        history_cmp[logical:logical + 1, :] = cmp_window[row:row + 1, :]
+            for peer in pl.range(CP_SIZE):
+                if peer != cp_rank:
+                    pld.system.notify(
+                        target=consumed, peer=group_base + peer, offsets=[cp_rank, 0],
+                        value=1, op=pld.NotifyOp.AtomicAdd,
+                    )
+    return history_tid
 
 
 @pl.jit.inline

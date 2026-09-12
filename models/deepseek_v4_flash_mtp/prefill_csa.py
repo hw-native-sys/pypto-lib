@@ -190,7 +190,8 @@ CP_TMP_DATA_PAGES = (CP_TMP_COMPRESSED_ROWS + BLOCK_SIZE - 1) // BLOCK_SIZE
 CP_TMP_CACHE_PAGES = 1 + CP_TMP_DATA_PAGES
 CP_TMP_CACHE_ROWS = CP_TMP_CACHE_PAGES * BLOCK_SIZE
 CP_RAW_DATA_PAGES = NUM_SEGMENTS * MAX_SEGMENT_TILES
-CP_RAW_CACHE_PAGES = 1 + CP_RAW_DATA_PAGES
+CP_RAW_CACHE_PAGES = 1 + CP_RAW_DATA_PAGES + 1
+CP_HISTORY_ROW0 = (1 + CP_RAW_DATA_PAGES) * BLOCK_SIZE
 CP_RAW_CACHE_ROWS = CP_RAW_CACHE_PAGES * BLOCK_SIZE
 CP_TMP_STATE_DATA_PAGES = 2
 CP_TMP_STATE_PAGES = 1 + CP_TMP_STATE_DATA_PAGES
@@ -323,15 +324,14 @@ def _build_block_tables(cp_size: int) -> dict[str, torch.Tensor]:
 
 def _build_metadata_tensors(
     cp_size: int,
-    *, num_tokens: int | None = None,
+    *, num_tokens: int | None = None, prefix: int = 0,
 ) -> tuple[dict[str, torch.Tensor], dict[str, object]]:
     if cp_size not in CP_CHOICES:
         raise ValueError(f"CP size must be one of {CP_CHOICES}, got {cp_size}")
 
-    prefix = 0
     if num_tokens is None:
         num_tokens = 2 * cp_size * MAX_SEGMENT_TILES * T
-    span, starts, lengths = cp_segment_layout(num_tokens, cp_size)
+    span, starts, lengths = cp_segment_layout(num_tokens, cp_size, prefix=prefix)
     nseg = 2 * cp_size
     owners = owner_segments(cp_size)
     request_end = max(
@@ -516,12 +516,11 @@ def _build_metadata_tensors(
     return tensors, ctx
 
 
-def _build_raw_attention_metadata(cp_size: int, *, num_tokens: int | None = None) -> tuple[dict[str, torch.Tensor], dict[str, object]]:
-    """Build canonical zero-history raw and overlay metadata."""
-    prefix = 0
+def _build_raw_attention_metadata(cp_size: int, *, num_tokens: int | None = None, prefix: int = 0) -> tuple[dict[str, torch.Tensor], dict[str, object]]:
+    """Build raw and overlay metadata; keys below ``prefix`` address the paged cache."""
     if num_tokens is None:
         num_tokens = 2 * cp_size * MAX_SEGMENT_TILES * T
-    span, starts, lengths = cp_segment_layout(num_tokens, cp_size)
+    span, starts, lengths = cp_segment_layout(num_tokens, cp_size, prefix=prefix)
     owners = owner_segments(cp_size)
     query_positions = torch.zeros(cp_size, LOCAL_PARTS, MAX_SEGMENT_TILES, T, dtype=torch.int32)
     query_requests = torch.full_like(query_positions, -1)
@@ -529,6 +528,11 @@ def _build_raw_attention_metadata(cp_size: int, *, num_tokens: int | None = None
     overlay_requests = torch.full_like(overlay_positions, -1)
     overlay_lengths = torch.zeros(cp_size, LOCAL_PARTS, MAX_SEGMENT_TILES, OVERLAY_SOURCES, dtype=torch.int32)
     swa_indices = torch.full((cp_size, LOCAL_PARTS, MAX_SEGMENT_TILES, T, WIN), -1, dtype=torch.int32)
+    history_slot_mapping = torch.full((cp_size, T), -1, dtype=torch.int32)
+    if prefix:
+        for rank in range(cp_size):
+            for offset, position in enumerate(range(max(0, prefix - T), prefix)):
+                history_slot_mapping[rank, T - min(T, prefix) + offset] = ring_phys_row(position)
     segment_active = torch.zeros(cp_size, LOCAL_PARTS, dtype=torch.int32)
     predecessors = torch.full_like(segment_active, -1)
 
@@ -600,6 +604,7 @@ def _build_raw_attention_metadata(cp_size: int, *, num_tokens: int | None = None
         "overlay_requests": overlay_requests,
         "overlay_active_lengths": overlay_lengths,
         "swa_indices": swa_indices,
+        "history_slot_mapping": history_slot_mapping,
         "final_segment_t": torch.tensor([final_segment], dtype=torch.int32),
         "reverse_index": cp_reverse_index(cp_size).to(torch.int32),
         "owner_rank_table": owner_rank_table.to(torch.int32),
@@ -687,14 +692,14 @@ def build_csa_leaf_metadata(cp_size, metadata, raw, raw_ctx):
     }
 
 
-def build_cp_tensor_specs(cp_size: int = CP_SIZE, *, num_tokens: int | None = None):
+def build_cp_tensor_specs(cp_size: int = CP_SIZE, *, num_tokens: int | None = None, prefix: int = 0):
     """Build the canonical CP-CSA fixture."""
     from golden import TensorSpec
 
     if cp_size != CP_SIZE:
         raise ValueError(f"runtime cp_size={cp_size} does not match static CP_SIZE={CP_SIZE}")
-    metadata, ctx = _build_metadata_tensors(cp_size, num_tokens=num_tokens)
-    raw, raw_ctx = _build_raw_attention_metadata(cp_size, num_tokens=num_tokens)
+    metadata, ctx = _build_metadata_tensors(cp_size, num_tokens=num_tokens, prefix=prefix)
+    raw, raw_ctx = _build_raw_attention_metadata(cp_size, num_tokens=num_tokens, prefix=prefix)
     qkv_specs = {spec.name: spec for spec in build_qkv_tensor_specs(1, T)}
     sparse_specs = { spec.name: spec for spec in build_sparse_attn_tensor_specs(COMPRESS_RATIO, T) }
     compressor_specs = { spec.name: spec for spec in build_compressor_tensor_specs(0) }
@@ -735,6 +740,14 @@ def build_cp_tensor_specs(cp_size: int = CP_SIZE, *, num_tokens: int | None = No
                 if tile_active:
                     x_hc[rank, part, tile, :tile_active].uniform_(-1.0, 1.0)
     kv_cache = torch.zeros(cp_size, ORI_MAX_BLOCKS, BLOCK_SIZE, 1, HEAD_DIM, dtype=torch.bfloat16)
+    # Raw window an earlier chunk would have committed, so history rows carry
+    # data a wrong row cannot accidentally match.
+    if prefix:
+        raw_rows = kv_cache.reshape(cp_size, -1, HEAD_DIM)
+        raw_history = torch.empty(T, HEAD_DIM, dtype=torch.float32).uniform_(-1.0, 1.0)
+        for offset, position in enumerate(range(max(0, prefix - T), prefix)):
+            raw_rows[:, ring_phys_row(position)] = raw_history[offset].to(torch.bfloat16)
+        kv_cache = raw_rows.reshape(kv_cache.shape)
 
     shared_names = (
         "hc_attn_fn",
@@ -1101,6 +1114,163 @@ def _cp_csa_compress_pack_part(
 
 
 @pl.jit.inline
+def _prefill_cp_csa_history_exchange(
+    kv_cache: pl.Tensor[[RAW_BLOCKS_DYN, BLOCK_SIZE, 1, HEAD_DIM], pl.BF16],
+    cmp_kv: pl.Tensor[[CP_CMP_BLOCK_NUM_DYN, CMP_STORAGE_BLOCK_SIZE, 1, HEAD_DIM], pl.BF16],
+    idx_kv_cache: pl.Tensor[[IDX_BLOCKS_DYN, CMP_STORAGE_BLOCK_SIZE, 1, IDX_HEAD_DIM], pl.INT8],
+    idx_kv_scale: pl.Tensor[[IDX_BLOCKS_DYN, CMP_STORAGE_BLOCK_SIZE, 1, 1], pl.FP32],
+    compress_state: pl.Tensor[[MAIN_STATE_BLOCKS_DYN, MAIN_STATE_BLOCK_SIZE, MAIN_STATE_DIM], pl.FP32],
+    inner_compress_state: pl.Tensor[[INNER_STATE_BLOCKS_DYN, INNER_STATE_BLOCK_SIZE, INNER_STATE_DIM], pl.FP32],
+    history_slots: pl.Tensor[[T], pl.INT32],
+    cmp_table: pl.Tensor[[PREFILL_CMP_MAX_BLOCKS], pl.INT32],
+    idx_table: pl.Tensor[[IDX_CACHE_MAX_BLOCKS], pl.INT32],
+    main_table: pl.Tensor[[MAIN_STATE_MAX_BLOCKS], pl.INT32],
+    inner_table: pl.Tensor[[INNER_STATE_MAX_BLOCKS], pl.INT32],
+    main_window: pld.DistributedTensor[[RECORDS_PER_WINDOW, HEAD_DIM], pl.BF16],
+    idx_window: pld.DistributedTensor[[RECORDS_PER_WINDOW, IDX_HEAD_DIM], pl.INT8],
+    scale_window: pld.DistributedTensor[[RECORDS_PER_WINDOW, SCALE_TILE_COLS], pl.FP16],
+    main_state_window: pld.DistributedTensor[[STATE_RECORDS_PER_WINDOW, MAIN_STATE_DIM], pl.FP32],
+    inner_state_window: pld.DistributedTensor[[STATE_RECORDS_PER_WINDOW, INNER_STATE_DIM], pl.FP32],
+    ready: pld.DistributedTensor[[CP_SIZE, 1], pl.INT32],
+    consumed: pld.DistributedTensor[[CP_SIZE, 1], pl.INT32],
+    history_raw: pl.Out[pl.Tensor[[T, HEAD_DIM], pl.BF16]],
+    history_main: pl.Out[pl.Tensor[[STATE_LEN, MAIN_STATE_DIM], pl.FP32]],
+    history_inner: pl.Out[pl.Tensor[[STATE_LEN, INNER_STATE_DIM], pl.FP32]],
+    cmp_root: pl.InOut[pl.Tensor[[CP_TMP_CACHE_PAGES, BLOCK_SIZE, 1, HEAD_DIM], pl.BF16]],
+    idx_root: pl.InOut[pl.Tensor[[CP_TMP_CACHE_PAGES, BLOCK_SIZE, 1, IDX_HEAD_DIM], pl.INT8]],
+    scale_root: pl.InOut[pl.Tensor[[CP_TMP_CACHE_PAGES, BLOCK_SIZE, 1, 1], pl.FP16]],
+    base: pl.Scalar[pl.INT32],
+    cache_owner_rank: pl.Scalar[pl.INT32],
+    my_rank: pl.Scalar[pl.INT32],
+    epoch_base: pl.Scalar[pl.INT32],
+) -> pl.Scalar[pl.TASK_ID]:
+    """Publish owner history into local attention roots and compressor seeds.
+
+    Reuse the compact windows in consumed phases: raw/paired-state tails first,
+    then compressed KV and indexer records. Peer persistent pools are untouched.
+    """
+    raw_rows = pl.tensor.dim(kv_cache, 0) * BLOCK_SIZE
+    cmp_rows = pl.tensor.dim(cmp_kv, 0) * CMP_STORAGE_BLOCK_SIZE
+    idx_rows = pl.tensor.dim(idx_kv_cache, 0) * CMP_STORAGE_BLOCK_SIZE
+    main_rows = pl.tensor.dim(compress_state, 0) * MAIN_STATE_BLOCK_SIZE
+    inner_rows = pl.tensor.dim(inner_compress_state, 0) * INNER_STATE_BLOCK_SIZE
+    raw_flat = pl.reshape(kv_cache, [raw_rows, HEAD_DIM])
+    cmp_flat = pl.reshape(cmp_kv, [cmp_rows, HEAD_DIM])
+    idx_flat = pl.reshape(idx_kv_cache, [idx_rows, IDX_HEAD_DIM])
+    scale_flat = pl.reshape(idx_kv_scale, [idx_rows, 1])
+    main_flat = pl.reshape(compress_state, [main_rows, MAIN_STATE_DIM])
+    inner_flat = pl.reshape(inner_compress_state, [inner_rows, INNER_STATE_DIM])
+    cmp_dst = pl.reshape(cmp_root, [CP_TMP_CACHE_ROWS, HEAD_DIM])
+    idx_dst = pl.reshape(idx_root, [CP_TMP_CACHE_ROWS, IDX_HEAD_DIM])
+    scale_dst = pl.reshape(scale_root, [CP_TMP_CACHE_ROWS, 1])
+    raw_payload = pl.create_tensor([T, HEAD_DIM], dtype=pl.BF16)
+    main_payload = pl.create_tensor([STATE_LEN, MAIN_STATE_DIM], dtype=pl.FP32)
+    inner_payload = pl.create_tensor([STATE_LEN, INNER_STATE_DIM], dtype=pl.FP32)
+    cmp_payload = pl.create_tensor([RECORDS_PER_WINDOW, HEAD_DIM], dtype=pl.BF16)
+    idx_payload = pl.create_tensor([RECORDS_PER_WINDOW, IDX_HEAD_DIM], dtype=pl.INT8)
+    scale_payload = pl.create_tensor([RECORDS_PER_WINDOW, SCALE_TILE_COLS], dtype=pl.FP16)
+    with pl.at(level=pl.Level.CORE_GROUP, name_hint="cp_csa_owner_history") as history_tid:
+        compressed = base // COMPRESS_RATIO
+        waves = (compressed + RECORDS_PER_WINDOW - 1) // RECORDS_PER_WINDOW
+        for phase in pl.range(waves + 1):
+            epoch = epoch_base + phase
+            for peer in pl.range(CP_SIZE):
+                if peer != my_rank:
+                    pld.system.wait(signal=consumed, offsets=[peer, 0], expected=epoch, cmp=pld.WaitCmp.Ge)
+            if my_rank == cache_owner_rank:
+                if phase == 0:
+                    for row in pl.range(T):
+                        raw_payload[row:row + 1, :] = pl.full([1, HEAD_DIM], dtype=pl.BF16, value=0.0)
+                        source = pl.cast(pl.read(history_slots, [row]), pl.INDEX)
+                        if source >= 0 and source < raw_rows:
+                            raw_payload[row:row + 1, :] = raw_flat[source:source + 1, :]
+                    for row in pl.range(STATE_LEN):
+                        main_payload[row:row + 1, :] = pl.full([1, MAIN_STATE_DIM], dtype=pl.FP32, value=0.0)
+                        inner_payload[row:row + 1, :] = pl.full([1, INNER_STATE_DIM], dtype=pl.FP32, value=0.0)
+                        position = base - STATE_LEN + row
+                        if position >= 0:
+                            page = pl.read(main_table, [position // MAIN_STATE_BLOCK_SIZE])
+                            source = page * MAIN_STATE_BLOCK_SIZE + position % MAIN_STATE_BLOCK_SIZE
+                            if page >= 0 and source < main_rows:
+                                main_payload[row:row + 1, :] = main_flat[source:source + 1, :]
+                            inner_page = pl.read(inner_table, [position // INNER_STATE_BLOCK_SIZE])
+                            inner_source = inner_page * INNER_STATE_BLOCK_SIZE + position % INNER_STATE_BLOCK_SIZE
+                            if inner_page >= 0 and inner_source < inner_rows:
+                                inner_payload[row:row + 1, :] = inner_flat[inner_source:inner_source + 1, :]
+                    for peer in pl.range(CP_SIZE):
+                        pld.tensor.put(
+                            dst=main_window, peer=peer, src=raw_payload,
+                            dst_offsets=[0, 0], src_offsets=[0, 0], shape=[T, HEAD_DIM],
+                            chunk_rows=8, chunk_cols=HEAD_DIM, pipeline=True,
+                        )
+                        pld.tensor.put(
+                            dst=main_state_window, peer=peer, src=main_payload,
+                            dst_offsets=[0, 0], src_offsets=[0, 0], shape=[STATE_LEN, MAIN_STATE_DIM],
+                            chunk_rows=1, chunk_cols=MAIN_STATE_DIM, pipeline=True,
+                        )
+                        pld.tensor.put(
+                            dst=inner_state_window, peer=peer, src=inner_payload,
+                            dst_offsets=[0, 0], src_offsets=[0, 0], shape=[STATE_LEN, INNER_STATE_DIM],
+                            chunk_rows=1, chunk_cols=INNER_STATE_DIM, pipeline=True,
+                        )
+                else:
+                    for row in pl.range(RECORDS_PER_WINDOW):
+                        logical = (phase - 1) * RECORDS_PER_WINDOW + row
+                        cmp_payload[row:row + 1, :] = pl.full([1, HEAD_DIM], dtype=pl.BF16, value=0.0)
+                        idx_payload[row:row + 1, :] = pl.cast(pl.full([1, IDX_HEAD_DIM], dtype=pl.FP16, value=0.0), target_type=pl.INT8, mode="trunc")
+                        for col in pl.range(SCALE_TILE_COLS):
+                            pl.write(scale_payload, [row, col], pl.cast(0.0, pl.FP16))
+                        if logical < compressed:
+                            page = pl.read(cmp_table, [logical // CMP_STORAGE_BLOCK_SIZE])
+                            source = page * CMP_STORAGE_BLOCK_SIZE + logical % CMP_STORAGE_BLOCK_SIZE
+                            if page >= 0 and source < cmp_rows:
+                                cmp_payload[row:row + 1, :] = cmp_flat[source:source + 1, :]
+                            idx_page = pl.read(idx_table, [logical // CMP_STORAGE_BLOCK_SIZE])
+                            idx_source = idx_page * CMP_STORAGE_BLOCK_SIZE + logical % CMP_STORAGE_BLOCK_SIZE
+                            if idx_page >= 0 and idx_source < idx_rows:
+                                idx_payload[row:row + 1, :] = idx_flat[idx_source:idx_source + 1, :]
+                                pl.write(scale_payload, [row, 0], pl.cast(pl.read(scale_flat, [idx_source, 0]), pl.FP16))
+                    for peer in pl.range(CP_SIZE):
+                        pld.tensor.put(
+                            dst=main_window, peer=peer, src=cmp_payload,
+                            dst_offsets=[0, 0], src_offsets=[0, 0], shape=[RECORDS_PER_WINDOW, HEAD_DIM],
+                            chunk_rows=8, chunk_cols=HEAD_DIM, pipeline=True,
+                        )
+                        pld.tensor.put(
+                            dst=idx_window, peer=peer, src=idx_payload,
+                            dst_offsets=[0, 0], src_offsets=[0, 0], shape=[RECORDS_PER_WINDOW, IDX_HEAD_DIM],
+                            chunk_rows=8, chunk_cols=IDX_HEAD_DIM, pipeline=True,
+                        )
+                        pld.tensor.put(
+                            dst=scale_window, peer=peer, src=scale_payload,
+                            dst_offsets=[0, 0], src_offsets=[0, 0], shape=[RECORDS_PER_WINDOW, SCALE_TILE_COLS],
+                            chunk_rows=8, chunk_cols=SCALE_TILE_COLS, pipeline=True,
+                        )
+            for peer in pl.range(CP_SIZE):
+                if peer != my_rank:
+                    pld.system.notify(target=ready, peer=peer, offsets=[my_rank, 0], value=1, op=pld.NotifyOp.AtomicAdd)
+            for peer in pl.range(CP_SIZE):
+                if peer != my_rank:
+                    pld.system.wait(signal=ready, offsets=[peer, 0], expected=epoch + 1, cmp=pld.WaitCmp.Ge)
+            if phase == 0:
+                for row in pl.range(0, T, 8):
+                    history_raw[row:row + 8, :] = main_window[row:row + 8, 0:HEAD_DIM]
+                for row in pl.range(STATE_LEN):
+                    history_main[row:row + 1, :] = main_state_window[row:row + 1, 0:MAIN_STATE_DIM]
+                    history_inner[row:row + 1, :] = inner_state_window[row:row + 1, 0:INNER_STATE_DIM]
+            else:
+                for row in pl.range(RECORDS_PER_WINDOW):
+                    logical = (phase - 1) * RECORDS_PER_WINDOW + row
+                    if logical < compressed:
+                        destination = BLOCK_SIZE + logical
+                        cmp_dst[destination:destination + 1, :] = main_window[row:row + 1, 0:HEAD_DIM]
+                        idx_dst[destination:destination + 1, :] = idx_window[row:row + 1, 0:IDX_HEAD_DIM]
+                        pl.write(scale_dst, [destination, 0], pl.read(scale_window, [row, 0]))
+            _prefill_cp_csa_compact_finish_wave(consumed, my_rank)
+    return history_tid
+
+
+@pl.jit.inline
 def prefill_attention_csa(
     x_hc: pl.Tensor[[LOCAL_PARTS, MAX_SEGMENT_TILES, T, HC_MULT, D], pl.FP32],
     hc_attn_fn: pl.Tensor[[MIX_HC, HC_DIM], pl.FP32],
@@ -1150,6 +1320,7 @@ def prefill_attention_csa(
     query_requests: pl.Tensor[[LOCAL_PARTS, MAX_SEGMENT_TILES, T], pl.INT32],
     overlay_active_lengths: pl.Tensor[[LOCAL_PARTS, MAX_SEGMENT_TILES, OVERLAY_SOURCES], pl.INT32],
     swa_indices: pl.Tensor[[LOCAL_PARTS, MAX_SEGMENT_TILES, T, WIN], pl.INT32],
+    history_slot_mapping: pl.Tensor[[T], pl.INT32],
     final_segment_t: pl.Tensor[[1], pl.INT32],
     reverse_index: pl.Tensor[[NUM_SEGMENTS], pl.INT32],
     owner_rank_table: pl.Tensor[[NUM_SEGMENTS], pl.INT32],
@@ -1209,6 +1380,74 @@ def prefill_attention_csa(
     inner_state_blocks = pl.tensor.dim(inner_compress_state, 0)
     main_state_rows = main_state_blocks * MAIN_STATE_BLOCK_SIZE
     inner_state_rows = inner_state_blocks * INNER_STATE_BLOCK_SIZE
+    # Recipes receives the CP all-gather into page-128 temporary roots.  Page
+    # zero is the sentinel and the block table maps logical pages to 1..N.
+    # Keep the serving/decode pools above as the stable public ABI; receiver
+    # commit first lands in these roots, then copies through them to the
+    # existing pools so the temporary ABI is part of the real dataflow.
+    cp_tmp_cmp_kv = pl.create_tensor([CP_TMP_CACHE_PAGES, BLOCK_SIZE, 1, HEAD_DIM], dtype=pl.BF16)
+    cp_tmp_idx_kv = pl.create_tensor([CP_TMP_CACHE_PAGES, BLOCK_SIZE, 1, IDX_HEAD_DIM], dtype=pl.INT8)
+    cp_tmp_idx_scale = pl.create_tensor([CP_TMP_CACHE_PAGES, BLOCK_SIZE, 1, 1], dtype=pl.FP16)
+    cp_tmp_main_state = pl.create_tensor([CP_TMP_STATE_PAGES, BLOCK_SIZE, MAIN_STATE_DIM], dtype=pl.FP32)
+    cp_tmp_inner_state = pl.create_tensor([CP_TMP_STATE_PAGES, BLOCK_SIZE, INNER_STATE_DIM], dtype=pl.FP32)
+    cp_tmp_block_table = pl.create_tensor([PREFILL_CMP_MAX_BLOCKS], dtype=pl.INT32)
+    cp_tmp_cmp_flat = pl.reshape(cp_tmp_cmp_kv, [CP_TMP_CACHE_ROWS, HEAD_DIM])
+    cp_tmp_idx_flat = pl.reshape(cp_tmp_idx_kv, [CP_TMP_CACHE_ROWS, IDX_HEAD_DIM])
+    cp_tmp_idx_scale_flat = pl.reshape(cp_tmp_idx_scale, [CP_TMP_CACHE_ROWS, 1])
+    cp_tmp_idx_scale_aligned = pl.reshape(cp_tmp_idx_scale, [CP_TMP_CACHE_ROWS // 16, 16])
+    cp_tmp_main_state_flat = pl.reshape(cp_tmp_main_state, [CP_TMP_STATE_ROWS, MAIN_STATE_DIM])
+    cp_tmp_inner_state_flat = pl.reshape(cp_tmp_inner_state, [CP_TMP_STATE_ROWS, INNER_STATE_DIM])
+    with pl.at(level=pl.Level.CORE_GROUP, name_hint="cp_csa_tmp_root_seed") as cp_tmp_seed_tid:
+        cp_tmp_cmp_kv[0:1, 0:BLOCK_SIZE, 0:1, 0:HEAD_DIM] = pl.full(
+            [1, BLOCK_SIZE, 1, HEAD_DIM], dtype=pl.BF16, value=0.0
+        )
+        cp_tmp_idx_kv[0:1, 0:BLOCK_SIZE, 0:1, 0:IDX_HEAD_DIM] = pl.cast(
+            pl.full([1, BLOCK_SIZE, 1, IDX_HEAD_DIM], dtype=pl.FP16, value=0.0),
+            target_type=pl.INT8,
+            mode="trunc",
+        )
+        # PTOAS 0.60 requires each tile row to occupy at least 32 bytes.  View
+        # the scalar FP16 scales in groups of 16 while seeding sentinel page 0.
+        cp_tmp_idx_scale_aligned[0 : BLOCK_SIZE // 16, 0:16] = pl.full([BLOCK_SIZE // 16, 16], dtype=pl.FP16, value=0.0)
+        for state_seed_row in pl.range(BLOCK_SIZE):
+            cp_tmp_main_state[
+                0:1,
+                state_seed_row : state_seed_row + 1,
+                0:MAIN_STATE_DIM,
+            ] = pl.full([1, 1, MAIN_STATE_DIM], dtype=pl.FP32, value=0.0)
+            cp_tmp_inner_state[
+                0:1,
+                state_seed_row : state_seed_row + 1,
+                0:INNER_STATE_DIM,
+            ] = pl.full([1, 1, INNER_STATE_DIM], dtype=pl.FP32, value=0.0)
+        for table_col in pl.range(PREFILL_CMP_MAX_BLOCKS):
+            pl.write(cp_tmp_block_table, [table_col], pl.cast(0, pl.INT32))
+        for logical_page in pl.range(CP_TMP_DATA_PAGES):
+            pl.write(cp_tmp_block_table, [logical_page], pl.cast(logical_page + 1, pl.INT32))
+    history_raw = pl.create_tensor([T, HEAD_DIM], dtype=pl.BF16)
+    history_main = pl.create_tensor([STATE_LEN, MAIN_STATE_DIM], dtype=pl.FP32)
+    history_inner = pl.create_tensor([STATE_LEN, INNER_STATE_DIM], dtype=pl.FP32)
+    with pl.at(level=pl.Level.CORE_GROUP, name_hint="cp_csa_history_seed"):
+        for row in pl.range(0, T, 8):
+            history_raw[row:row + 8, :] = pl.full([8, HEAD_DIM], dtype=pl.BF16, value=0.0)
+        for row in pl.range(STATE_LEN):
+            history_main[row:row + 1, :] = pl.full([1, MAIN_STATE_DIM], dtype=pl.FP32, value=0.0)
+            history_inner[row:row + 1, :] = pl.full([1, INNER_STATE_DIM], dtype=pl.FP32, value=0.0)
+    history_base = pl.read(segment_starts_t, [0])
+    history_phases = pl.cast(0, pl.INT32)
+    history_ready_tid = cp_tmp_seed_tid
+    if history_base > 0:
+        history_phases = pl.cast(1 + (history_base // COMPRESS_RATIO + RECORDS_PER_WINDOW - 1) // RECORDS_PER_WINDOW, pl.INT32)
+        history_ready_tid = _prefill_cp_csa_history_exchange(
+            kv_cache, cmp_kv, idx_kv_cache, idx_kv_scale, compress_state, inner_compress_state,
+            history_slot_mapping, cmp_block_table, idx_block_table,
+            compress_state_block_table, inner_compress_state_block_table,
+            main_window, idx_window, scale_window, main_state_window, inner_state_window,
+            compact_ready, compact_consumed, history_raw, history_main, history_inner,
+            cp_tmp_cmp_kv, cp_tmp_idx_kv, cp_tmp_idx_scale, history_base,
+            cache_owner_rank, my_rank, pl.cast(compact_comm_epoch_base * (history_phases + EPOCHS), pl.INT32),
+        )
+    compact_epoch_base = pl.cast(compact_comm_epoch_base * (history_phases + EPOCHS) + history_phases, pl.INT32)
     q = pl.create_tensor([LOCAL_ROWS, H, HEAD_DIM], dtype=pl.BF16)
     post = pl.create_tensor([LOCAL_ROWS, HC_MULT], dtype=pl.FP32)
     comb = pl.create_tensor([LOCAL_ROWS, HC_MULT * HC_MULT], dtype=pl.FP32)
@@ -1403,8 +1642,6 @@ def prefill_attention_csa(
                     if row < active:
                         effective_x[leaf_row : leaf_row + 1, :] = normed[source : source + 1, :]
 
-    persistent_main_flat = pl.reshape(compress_state, [main_state_rows, MAIN_STATE_DIM])
-    persistent_inner_flat = pl.reshape(inner_compress_state, [inner_state_rows, INNER_STATE_DIM])
     scratch_main0_flat = pl.reshape(main_state_workspace0, [main_state_rows, MAIN_STATE_DIM])
     scratch_main1_flat = pl.reshape(main_state_workspace1, [main_state_rows, MAIN_STATE_DIM])
     scratch_inner0_flat = pl.reshape(inner_state_workspace0, [inner_state_rows, INNER_STATE_DIM])
@@ -1412,26 +1649,42 @@ def prefill_attention_csa(
     with pl.at(level=pl.Level.CORE_GROUP, name_hint="cp_csa_seed_persistent_state"):
         if pl.read(owner_segments_t, [0]) == 0:
             for row in pl.range(main_state_rows):
-                if pl.read(segment_starts_t, [0]) > 0:
-                    scratch_main0_flat[row : row + 1, :] = persistent_main_flat[row : row + 1, :]
-                else:
-                    scratch_main0_flat[row : row + 1, :] = pl.full([1, MAIN_STATE_DIM], dtype=pl.FP32, value=0.0)
+                scratch_main0_flat[row:row + 1, :] = pl.full([1, MAIN_STATE_DIM], dtype=pl.FP32, value=0.0)
+            for row in pl.range(STATE_LEN):
+                position = history_base - STATE_LEN + row
+                if position >= 0:
+                    page = pl.read(compress_state_block_table, [position // MAIN_STATE_BLOCK_SIZE])
+                    destination = page * MAIN_STATE_BLOCK_SIZE + position % MAIN_STATE_BLOCK_SIZE
+                    if page >= 0 and destination < main_state_rows:
+                        scratch_main0_flat[destination:destination + 1, :] = history_main[row:row + 1, :]
             for row in pl.range(inner_state_rows):
-                if pl.read(segment_starts_t, [0]) > 0:
-                    scratch_inner0_flat[row : row + 1, :] = persistent_inner_flat[row : row + 1, :]
-                else:
-                    scratch_inner0_flat[row : row + 1, :] = pl.full([1, INNER_STATE_DIM], dtype=pl.FP32, value=0.0)
+                scratch_inner0_flat[row:row + 1, :] = pl.full([1, INNER_STATE_DIM], dtype=pl.FP32, value=0.0)
+            for row in pl.range(STATE_LEN):
+                position = history_base - STATE_LEN + row
+                if position >= 0:
+                    page = pl.read(inner_compress_state_block_table, [position // INNER_STATE_BLOCK_SIZE])
+                    destination = page * INNER_STATE_BLOCK_SIZE + position % INNER_STATE_BLOCK_SIZE
+                    if page >= 0 and destination < inner_state_rows:
+                        scratch_inner0_flat[destination:destination + 1, :] = history_inner[row:row + 1, :]
         if pl.read(owner_segments_t, [1]) == 0:
             for row in pl.range(main_state_rows):
-                if pl.read(segment_starts_t, [0]) > 0:
-                    scratch_main1_flat[row : row + 1, :] = persistent_main_flat[row : row + 1, :]
-                else:
-                    scratch_main1_flat[row : row + 1, :] = pl.full([1, MAIN_STATE_DIM], dtype=pl.FP32, value=0.0)
+                scratch_main1_flat[row:row + 1, :] = pl.full([1, MAIN_STATE_DIM], dtype=pl.FP32, value=0.0)
+            for row in pl.range(STATE_LEN):
+                position = history_base - STATE_LEN + row
+                if position >= 0:
+                    page = pl.read(compress_state_block_table, [position // MAIN_STATE_BLOCK_SIZE])
+                    destination = page * MAIN_STATE_BLOCK_SIZE + position % MAIN_STATE_BLOCK_SIZE
+                    if page >= 0 and destination < main_state_rows:
+                        scratch_main1_flat[destination:destination + 1, :] = history_main[row:row + 1, :]
             for row in pl.range(inner_state_rows):
-                if pl.read(segment_starts_t, [0]) > 0:
-                    scratch_inner1_flat[row : row + 1, :] = persistent_inner_flat[row : row + 1, :]
-                else:
-                    scratch_inner1_flat[row : row + 1, :] = pl.full([1, INNER_STATE_DIM], dtype=pl.FP32, value=0.0)
+                scratch_inner1_flat[row:row + 1, :] = pl.full([1, INNER_STATE_DIM], dtype=pl.FP32, value=0.0)
+            for row in pl.range(STATE_LEN):
+                position = history_base - STATE_LEN + row
+                if position >= 0:
+                    page = pl.read(inner_compress_state_block_table, [position // INNER_STATE_BLOCK_SIZE])
+                    destination = page * INNER_STATE_BLOCK_SIZE + position % INNER_STATE_BLOCK_SIZE
+                    if page >= 0 and destination < inner_state_rows:
+                        scratch_inner1_flat[destination:destination + 1, :] = history_inner[row:row + 1, :]
 
     part_leaf_rows = MAX_COMPRESS_LEAVES * T
     leaf_num_tokens_flat = pl.reshape(leaf_num_tokens, [LOCAL_LEAVES])
@@ -1611,50 +1864,6 @@ def prefill_attention_csa(
     main_state_flat = pl.reshape(compress_state, [main_state_rows, MAIN_STATE_DIM])
     inner_state_flat = pl.reshape(inner_compress_state, [inner_state_rows, INNER_STATE_DIM])
 
-    # Recipes receives the CP all-gather into page-128 temporary roots.  Page
-    # zero is the sentinel and the block table maps logical pages to 1..N.
-    # Keep the serving/decode pools above as the stable public ABI; receiver
-    # commit first lands in these roots, then copies through them to the
-    # existing pools so the temporary ABI is part of the real dataflow.
-    cp_tmp_cmp_kv = pl.create_tensor([CP_TMP_CACHE_PAGES, BLOCK_SIZE, 1, HEAD_DIM], dtype=pl.BF16)
-    cp_tmp_idx_kv = pl.create_tensor([CP_TMP_CACHE_PAGES, BLOCK_SIZE, 1, IDX_HEAD_DIM], dtype=pl.INT8)
-    cp_tmp_idx_scale = pl.create_tensor([CP_TMP_CACHE_PAGES, BLOCK_SIZE, 1, 1], dtype=pl.FP16)
-    cp_tmp_main_state = pl.create_tensor([CP_TMP_STATE_PAGES, BLOCK_SIZE, MAIN_STATE_DIM], dtype=pl.FP32)
-    cp_tmp_inner_state = pl.create_tensor([CP_TMP_STATE_PAGES, BLOCK_SIZE, INNER_STATE_DIM], dtype=pl.FP32)
-    cp_tmp_block_table = pl.create_tensor([PREFILL_CMP_MAX_BLOCKS], dtype=pl.INT32)
-    cp_tmp_cmp_flat = pl.reshape(cp_tmp_cmp_kv, [CP_TMP_CACHE_ROWS, HEAD_DIM])
-    cp_tmp_idx_flat = pl.reshape(cp_tmp_idx_kv, [CP_TMP_CACHE_ROWS, IDX_HEAD_DIM])
-    cp_tmp_idx_scale_flat = pl.reshape(cp_tmp_idx_scale, [CP_TMP_CACHE_ROWS, 1])
-    cp_tmp_idx_scale_aligned = pl.reshape(cp_tmp_idx_scale, [CP_TMP_CACHE_ROWS // 16, 16])
-    cp_tmp_main_state_flat = pl.reshape(cp_tmp_main_state, [CP_TMP_STATE_ROWS, MAIN_STATE_DIM])
-    cp_tmp_inner_state_flat = pl.reshape(cp_tmp_inner_state, [CP_TMP_STATE_ROWS, INNER_STATE_DIM])
-    with pl.at(level=pl.Level.CORE_GROUP, name_hint="cp_csa_tmp_root_seed") as cp_tmp_seed_tid:
-        cp_tmp_cmp_kv[0:1, 0:BLOCK_SIZE, 0:1, 0:HEAD_DIM] = pl.full(
-            [1, BLOCK_SIZE, 1, HEAD_DIM], dtype=pl.BF16, value=0.0
-        )
-        cp_tmp_idx_kv[0:1, 0:BLOCK_SIZE, 0:1, 0:IDX_HEAD_DIM] = pl.cast(
-            pl.full([1, BLOCK_SIZE, 1, IDX_HEAD_DIM], dtype=pl.FP16, value=0.0),
-            target_type=pl.INT8,
-            mode="trunc",
-        )
-        # PTOAS 0.60 requires each tile row to occupy at least 32 bytes.  View
-        # the scalar FP16 scales in groups of 16 while seeding sentinel page 0.
-        cp_tmp_idx_scale_aligned[0 : BLOCK_SIZE // 16, 0:16] = pl.full([BLOCK_SIZE // 16, 16], dtype=pl.FP16, value=0.0)
-        for state_seed_row in pl.range(BLOCK_SIZE):
-            cp_tmp_main_state[
-                0:1,
-                state_seed_row : state_seed_row + 1,
-                0:MAIN_STATE_DIM,
-            ] = pl.full([1, 1, MAIN_STATE_DIM], dtype=pl.FP32, value=0.0)
-            cp_tmp_inner_state[
-                0:1,
-                state_seed_row : state_seed_row + 1,
-                0:INNER_STATE_DIM,
-            ] = pl.full([1, 1, INNER_STATE_DIM], dtype=pl.FP32, value=0.0)
-        for table_col in pl.range(PREFILL_CMP_MAX_BLOCKS):
-            pl.write(cp_tmp_block_table, [table_col], pl.cast(0, pl.INT32))
-        for logical_page in pl.range(CP_TMP_DATA_PAGES):
-            pl.write(cp_tmp_block_table, [logical_page], pl.cast(logical_page + 1, pl.INT32))
     # §8.17.8e.2 leaf-capture completion token: collect the TaskId of every
     # leaf-internal commit/transport task so the terminal cp_csa_rank_complete
     # task can fan them in via pl.system.task_dummy(deps=[...]). With EPOCHS==1
@@ -1664,7 +1873,7 @@ def prefill_attention_csa(
     compact_transport_tids = pl.array.create(EPOCHS, pl.TASK_ID)
     receiver_commit_tids = pl.array.create(EPOCHS, pl.TASK_ID)
     for epoch in pl.range(EPOCHS):
-        with pl.at(level=pl.Level.CORE_GROUP, name_hint="cp_csa_compact_transport") as compact_transport_tid:
+        with pl.at(level=pl.Level.CORE_GROUP, name_hint="cp_csa_compact_transport", deps=[history_ready_tid]) as compact_transport_tid:
             _prefill_cp_csa_compact_transport_wave(
                 packed_main_payload,
                 packed_idx_payload,
@@ -1683,7 +1892,7 @@ def prefill_attention_csa(
                 compact_ready, compact_consumed,
                 my_rank,
                 pl.cast(epoch, pl.INT32),
-                pl.cast(compact_comm_epoch_base + epoch, pl.INT32),
+                pl.cast(compact_epoch_base + epoch, pl.INT32),
             )
         # Store the captured TaskId for this epoch (idiom:
         # prefill_sparse_attn.py:300 proj_a_tids[...] = pa_tid).
@@ -1875,6 +2084,7 @@ def prefill_attention_csa(
     cp_tmp_raw_flat = pl.reshape(cp_tmp_raw_kv, [CP_RAW_CACHE_ROWS, HEAD_DIM])
     raw_physical_indices = pl.create_tensor([LOCAL_ROWS, WIN], dtype=pl.INT32)
     valid_mask = pl.create_tensor([LOCAL_ROWS, VALID_BLOCK_MASK_COLS], dtype=pl.INT32)
+    history_cache_rows = pl.tensor.dim(kv_cache, 0) * BLOCK_SIZE
     request_start = pl.read(segment_starts_local, [0])
 
     with pl.at(level=pl.Level.CORE_GROUP, name_hint="cp_csa_raw_root_seed") as raw_seed_tid:
@@ -1883,6 +2093,18 @@ def prefill_attention_csa(
         ] = pl.full([1, BLOCK_SIZE, 1, HEAD_DIM], dtype=pl.BF16, value=0.0)
         for logical_page in pl.range(CP_RAW_DATA_PAGES):
             pl.write(cp_tmp_raw_table, [logical_page], pl.cast(logical_page + 1, pl.INT32))
+        # A continued chunk's window reaches below its base; those rows were
+        # committed to the paged cache by an earlier chunk. Stage them into this
+        # rank-local root so band attention can address them like any other key.
+        # Done inside this scope, not a new one: a separate scope carries no
+        # producer read and its write is overwritten by the current scatter.
+        for history_row in pl.range(T):
+            history_slot = pl.read(history_slot_mapping, [history_row])
+            if history_slot >= 0:
+                if history_slot < history_cache_rows:
+                    cp_tmp_raw_flat[
+                        CP_HISTORY_ROW0 + history_row : CP_HISTORY_ROW0 + history_row + 1, :
+                    ] = history_raw[history_row : history_row + 1, :]
 
     # First scatter both current segments.  A separate dependent predecessor
     # pass below deliberately overwrites duplicate tail slots, matching the
@@ -1955,6 +2177,13 @@ def prefill_attention_csa(
                 if lower_pseudo >= 0:
                     lower_key = lower_query - WIN + 1 + lower_col
                     lower_relative = lower_key - request_start
+                    if lower_relative < 0:
+                        lower_history = T + lower_relative
+                        if lower_history >= 0:
+                            pl.write(
+                                lower_stage, [0, lower_col],
+                                pl.cast(CP_HISTORY_ROW0 + lower_history, pl.INT32),
+                            )
                     if lower_relative >= 0:
                         lower_logical_page = (lower_relative // BLOCK_SIZE)
                         if lower_logical_page < CP_RAW_DATA_PAGES:
@@ -2083,7 +2312,7 @@ def prefill_attention_csa(
         for tile in pl.range(NUM_MOE_WAVES):
             completion_token[tile : tile + 1, 0:1, 0:8] = pl.slice(x_out_flat, [1, 1, 8], [tile * T, 0, 0])
 
-    return pl.reshape(x_out_flat, [LOCAL_PARTS, MAX_SEGMENT_TILES, T, HC_MULT, D])
+    return x_out
 
 @pl.jit
 def prefill_cp_csa_rank(
@@ -2135,6 +2364,7 @@ def prefill_cp_csa_rank(
     query_requests: pl.Tensor[[LOCAL_PARTS, MAX_SEGMENT_TILES, T], pl.INT32],
     overlay_active_lengths: pl.Tensor[[LOCAL_PARTS, MAX_SEGMENT_TILES, OVERLAY_SOURCES], pl.INT32],
     swa_indices: pl.Tensor[[LOCAL_PARTS, MAX_SEGMENT_TILES, T, WIN], pl.INT32],
+    history_slot_mapping: pl.Tensor[[T], pl.INT32],
     final_segment_t: pl.Tensor[[1], pl.INT32],
     reverse_index: pl.Tensor[[NUM_SEGMENTS], pl.INT32],
     owner_rank_table: pl.Tensor[[NUM_SEGMENTS], pl.INT32],
@@ -2187,7 +2417,7 @@ def prefill_cp_csa_rank(
         inner_norm_w, main_state_workspace0, inner_state_workspace0, main_state_workspace1, inner_state_workspace1, compress_state, compress_state_block_table, inner_compress_state,
         inner_compress_state_block_table, kv_cache, cmp_kv, cmp_block_table, idx_kv_cache, idx_kv_scale, idx_block_table, segment_starts_t,
         segment_lengths_t, segment_active_lengths, owner_segments_t, predecessor_segments, query_positions, query_requests,
-        overlay_active_lengths, swa_indices, final_segment_t, reverse_index, owner_rank_table, final_win_seg_src, final_win_row_src, final_slot_mapping,
+        overlay_active_lengths, swa_indices, history_slot_mapping, final_segment_t, reverse_index, owner_rank_table, final_win_seg_src, final_win_row_src, final_slot_mapping,
         leaf_positions_input, leaf_main_slots_input, leaf_idx_slots_input, leaf_main_state_slots_input, leaf_inner_state_slots_input, leaf_num_tokens_input, effective_x_workspace, hidden_tail_window,
         tail_ready, tail_consumed, main_window, idx_window, scale_window, record_window, main_state_window,
         main_state_meta_window, inner_state_window, inner_state_meta_window, compact_ready, compact_consumed, attn_sink, wo_a, wo_b,
@@ -2248,6 +2478,7 @@ def prefill_cp_csa_test(
     overlay_requests: pl.Tensor[[CP_SIZE, LOCAL_PARTS, MAX_SEGMENT_TILES, OVERLAY_ROWS], pl.INT32],
     overlay_active_lengths: pl.Tensor[[CP_SIZE, LOCAL_PARTS, MAX_SEGMENT_TILES, OVERLAY_SOURCES], pl.INT32],
     swa_indices: pl.Tensor[[CP_SIZE, LOCAL_PARTS, MAX_SEGMENT_TILES, T, WIN], pl.INT32],
+    history_slot_mapping: pl.Tensor[[CP_SIZE, T], pl.INT32],
     final_segment_t: pl.Tensor[[1], pl.INT32],
     reverse_index: pl.Tensor[[NUM_SEGMENTS], pl.INT32],
     owner_rank_table: pl.Tensor[[NUM_SEGMENTS], pl.INT32],
@@ -2330,6 +2561,7 @@ def prefill_cp_csa_test(
             query_positions[rank], query_requests[rank],
             overlay_active_lengths[rank],
             swa_indices[rank],
+            history_slot_mapping[rank],
             final_segment_t,
             reverse_index,
             owner_rank_table,
@@ -2371,6 +2603,7 @@ def golden_prefill_cp_csa(tensors):
     lengths = [int(value) for value in ctx["lengths"]]
     owners = ctx["owners"]
     reverse = tensors["reverse_index"].tolist()
+    cache_owner = int(tensors["cache_owner_rank_t"][0, 0])
 
     local_norm = torch.zeros(cp_size, LOCAL_PARTS, MAX_SEGMENT_TILES, T, D, dtype=torch.bfloat16)
     local_q = torch.zeros(cp_size, LOCAL_PARTS, MAX_SEGMENT_TILES, T, H, HEAD_DIM, dtype=torch.bfloat16)
@@ -2464,8 +2697,8 @@ def golden_prefill_cp_csa(tensors):
         main_state = torch.zeros_like(tensors["compress_state"][rank])
         inner_state = torch.zeros_like(tensors["inner_compress_state"][rank])
         if segment == 0 and starts[0] > 0:
-            main_state.copy_(tensors["compress_state"][rank])
-            inner_state.copy_(tensors["inner_compress_state"][rank])
+            main_state.copy_(tensors["compress_state"][cache_owner])
+            inner_state.copy_(tensors["inner_compress_state"][cache_owner])
 
         leaves: list[tuple[torch.Tensor, torch.Tensor]] = []
         if segment > 0 and lengths[segment] > 0:
@@ -2574,6 +2807,17 @@ def golden_prefill_cp_csa(tensors):
     cmp_out = tensors["cmp_kv"].clone()
     idx_out = tensors["idx_kv_cache"].clone()
     scale_out = tensors["idx_kv_scale"].clone()
+    for rank in range(cp_size):
+        for logical in range(starts[0] // COMPRESS_RATIO):
+            for name, result, table_name, width in (
+                ("cmp_kv", cmp_out, "cmp_block_table", HEAD_DIM),
+                ("idx_kv_cache", idx_out, "idx_block_table", IDX_HEAD_DIM),
+                ("idx_kv_scale", scale_out, "idx_block_table", 1),
+            ):
+                source = _lower_row(tensors[table_name][cache_owner], logical, CMP_STORAGE_BLOCK_SIZE)
+                destination = _lower_row(tensors[table_name][rank], logical, CMP_STORAGE_BLOCK_SIZE)
+                if source >= 0 and destination >= 0:
+                    result[rank].view(-1, width)[destination] = tensors[name][cache_owner].view(-1, width)[source]
     for rank in range(cp_size):
         cmp_flat = cmp_out[rank].view(-1, HEAD_DIM)
         idx_flat = idx_out[rank].view(-1, IDX_HEAD_DIM)
@@ -2699,7 +2943,7 @@ def golden_prefill_cp_csa(tensors):
                         overlay[:predecessor_len] = local_kv[rank, part, tile - 1, :predecessor_len]
                 overlay[T : T + current_len] = local_kv[rank, part, tile, :current_len]
                 sparse_source = torch.zeros(ORI_CACHE_ROWS + OVERLAY_ROWS, HEAD_DIM, dtype=torch.bfloat16)
-                sparse_source[:kv_before_commit.shape[1] * BLOCK_SIZE] = kv_before_commit[rank].view(-1, HEAD_DIM)
+                sparse_source[:kv_before_commit.shape[1] * BLOCK_SIZE] = kv_before_commit[cache_owner].view(-1, HEAD_DIM)
                 sparse_source[ORI_CACHE_ROWS:] = overlay
                 sparse_source_cache = sparse_source.view(
                     (ORI_CACHE_ROWS + OVERLAY_ROWS) // BLOCK_SIZE,
@@ -2774,6 +3018,8 @@ if __name__ == "__main__":
     parser.add_argument("-d", "--device", default=",".join(str(i) for i in range(CP_SIZE)))
     parser.add_argument("--cp", type=int, default=CP_SIZE, choices=CP_CHOICES)
     parser.add_argument("--num-tokens", type=int, default=None, help="actual request length; defaults to full capacity")
+    parser.add_argument("--prefix", type=int, default=0,
+                        help="tokens already resident in this request's caches from earlier chunks")
     parser.add_argument("--compile-only", action="store_true")
     parser.add_argument("--no-golden", action="store_true", default=False)
     parser.add_argument("--dump-passes", action="store_true")
@@ -2788,7 +3034,7 @@ if __name__ == "__main__":
         raise SystemExit(f"CP{args.cp} requires {args.cp} devices, got {device_ids}")
     result = run(
         fn=prefill_cp_csa_test,
-        specs=build_cp_tensor_specs(args.cp, num_tokens=args.num_tokens),
+        specs=build_cp_tensor_specs(args.cp, num_tokens=args.num_tokens, prefix=args.prefix),
         golden_fn=None if args.no_golden else golden_prefill_cp_csa,
         compile_only=args.compile_only,
         config=dict(

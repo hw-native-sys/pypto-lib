@@ -231,6 +231,7 @@ from prefill_swa import (
 )
 from prefill_cp_zigzag import MAX_SEGMENT_TILES, CP_PREFILL_CMP_BLOCK_NUM as PREFILL_CMP_BLOCK_NUM
 from prefill_hca import prefill_attention_hca
+from prefill_sparse_attn import HCA_MAX_COMPRESSED_ROWS
 from prefill_csa import (
     LOCAL_LEAVES as CSA_LOCAL_LEAVES, MAX_COMPRESS_LEAVES as CSA_MAX_COMPRESS_LEAVES,
     prefill_attention_csa,
@@ -514,9 +515,12 @@ def _prefill_cp_metadata(
     leaf_main_state_slots_input: pl.Tensor[[LOCAL_PARTS, CSA_MAX_COMPRESS_LEAVES, ATTN_TILE_ROWS], pl.INT64],
     leaf_inner_state_slots_input: pl.Tensor[[LOCAL_PARTS, CSA_MAX_COMPRESS_LEAVES, ATTN_TILE_ROWS], pl.INT64],
     leaf_num_tokens_input: pl.Tensor[[LOCAL_PARTS, CSA_MAX_COMPRESS_LEAVES], pl.INT32],
+    hca_history_slots: pl.Tensor[[LOCAL_PARTS, TAIL_ROWS], pl.INT32],
+    hca_history_positions: pl.Tensor[[LOCAL_PARTS, TAIL_ROWS], pl.INT32],
+    csa_history_slots: pl.Tensor[[TAIL_ROWS], pl.INT32],
     my_rank: pl.Scalar[pl.INT32],
 ):
-    """Build cold-request CP coordinates and physical slots on the owning device."""
+    """Build CP coordinates and physical slots for one chunk on the owning device."""
     query_position_ids_flat = pl.reshape(query_position_ids, [(LOCAL_PARTS) * (MAX_SEGMENT_TILES), TAIL_ROWS])
     query_token_to_request_flat = pl.reshape(query_token_to_request, [(LOCAL_PARTS) * (MAX_SEGMENT_TILES), TAIL_ROWS])
     overlay_position_ids_flat = pl.reshape(overlay_position_ids, [(LOCAL_PARTS) * (MAX_SEGMENT_TILES), OVERLAY_ROWS])
@@ -546,11 +550,12 @@ def _prefill_cp_metadata(
     for cp_request_segments_block in pl.spmd(1, name_hint="cp_request_segments"):
         length = pl.cast(pl.read(control, [0, 2]), pl.INDEX)
         span = pl.cast(pl.read(control, [0, 3]), pl.INDEX)
+        base = pl.cast(pl.read(control, [0, 4]), pl.INDEX)
         pl.write(cache_owner_rank_t, [0], pl.read(control, [0, 1]))
         pl.write(final_segment_t, [0], pl.cast((length - 1) // span, pl.INT32))
         for segment in pl.range(NUM_SEGMENTS):
-            start = segment * span
-            active = pl.max(0, pl.min(span, length - start))
+            start = base + segment * span
+            active = pl.max(0, pl.min(span, base + length - start))
             if segment < CP_SIZE:
                 owner = segment
                 part = pl.cast(0, pl.INDEX)
@@ -572,8 +577,8 @@ def _prefill_cp_metadata(
                 segment = pl.cast(my_rank, pl.INDEX)
             else:
                 segment = pl.cast(NUM_SEGMENTS - 1 - my_rank, pl.INDEX)
-            start = segment * span
-            active = pl.max(0, pl.min(span, length - start))
+            start = base + segment * span
+            active = pl.max(0, pl.min(span, base + length - start))
             end = start + active
             valid = pl.cast(0, pl.INDEX)
             if active > 0:
@@ -588,14 +593,14 @@ def _prefill_cp_metadata(
                     position = pl.cast(end - valid + row, pl.INDEX)
                 pl.write(snapshot_positions, [part, row], pl.cast(position, pl.INT32))
         for row in pl.range(TAIL_ROWS):
-            position = length - TAIL_ROWS + row
+            position = base + length - TAIL_ROWS + row
             source = pl.cast(-1, pl.INT32)
             source_row = pl.cast(-1, pl.INT32)
             slot = pl.cast(-1, pl.INT32)
-            if position >= 0:
-                segment = position // span
-                start = segment * span
-                active = pl.max(0, pl.min(span, length - start))
+            if position >= base:
+                segment = (position - base) // span
+                start = base + segment * span
+                active = pl.max(0, pl.min(span, base + length - start))
                 source = pl.cast(segment, pl.INT32)
                 source_row = pl.cast(position - start - pl.max(0, active - TAIL_ROWS), pl.INT32)
                 page = pl.read(ori_block_table, [position // BLOCK_SIZE])
@@ -604,18 +609,45 @@ def _prefill_cp_metadata(
             pl.write(final_win_seg_src, [row], source)
             pl.write(final_win_row_src, [row], source_row)
             pl.write(final_slot_mapping, [row], slot)
+        # Window an earlier chunk of this request already committed. HCA and CSA
+        # read it out of the paged cache instead of re-projecting hidden states
+        # they no longer hold; -1 means "no history", i.e. a fresh request.
+        for part in pl.range(LOCAL_PARTS):
+            for row in pl.range(TAIL_ROWS):
+                history_slot = pl.cast(-1, pl.INT32)
+                history_position = pl.cast(-1, pl.INT32)
+                if part == 0:
+                    absolute = base - TAIL_ROWS + row
+                    if absolute >= 0:
+                        history_position = pl.cast(absolute, pl.INT32)
+                        history_page = pl.read(ori_block_table, [absolute // BLOCK_SIZE])
+                        if history_page >= 0:
+                            history_slot = pl.cast(
+                                history_page * BLOCK_SIZE + absolute % BLOCK_SIZE, pl.INT32
+                            )
+                pl.write(hca_history_slots, [part, row], history_slot)
+                pl.write(hca_history_positions, [part, row], history_position)
+        for row in pl.range(TAIL_ROWS):
+            csa_slot = pl.cast(-1, pl.INT32)
+            csa_absolute = base - TAIL_ROWS + row
+            if csa_absolute >= 0:
+                csa_page = pl.read(ori_block_table, [csa_absolute // BLOCK_SIZE])
+                if csa_page >= 0:
+                    csa_slot = pl.cast(csa_page * BLOCK_SIZE + csa_absolute % BLOCK_SIZE, pl.INT32)
+            pl.write(csa_history_slots, [row], csa_slot)
 
     # One block owns all small active-length fields to avoid cache-line sharing.
     for cp_query_coordinates_block in pl.spmd(1, name_hint="cp_query_coordinates"):
         length = pl.cast(pl.read(control, [0, 2]), pl.INDEX)
         span = pl.cast(pl.read(control, [0, 3]), pl.INDEX)
+        base = pl.cast(pl.read(control, [0, 4]), pl.INDEX)
         for part in pl.range(LOCAL_PARTS):
             if part == 0:
                 query_segment = pl.cast(my_rank, pl.INDEX)
             else:
                 query_segment = pl.cast(NUM_SEGMENTS - 1 - my_rank, pl.INDEX)
-            start = query_segment * span
-            seg_length = pl.max(0, pl.min(span, length - start))
+            start = base + query_segment * span
+            seg_length = pl.max(0, pl.min(span, base + length - start))
             for tile in pl.range(MAX_SEGMENT_TILES):
                 active = pl.max(0, pl.min(ATTN_TILE_ROWS, seg_length - tile * ATTN_TILE_ROWS))
                 tile_start = start + tile * ATTN_TILE_ROWS
@@ -624,8 +656,8 @@ def _prefill_cp_metadata(
                     pred_length = pl.max(0, pl.min(ATTN_TILE_ROWS, seg_length - (tile - 1) * ATTN_TILE_ROWS))
                 else:
                     if query_segment > 0:
-                        pred_seg_start = (query_segment - 1) * span
-                        pred_seg_length = pl.max(0, pl.min(span, length - pred_seg_start))
+                        pred_seg_start = base + (query_segment - 1) * span
+                        pred_seg_length = pl.max(0, pl.min(span, base + length - pred_seg_start))
                         pred_length = pl.min(TAIL_ROWS, pred_seg_length)
                         pred_start = pred_seg_start + pl.max(0, pred_seg_length - TAIL_ROWS)
                     else:
@@ -657,6 +689,7 @@ def _prefill_cp_metadata(
     for block in pl.spmd(LOCAL_PARTS * MAX_SEGMENT_TILES):
         part = block // MAX_SEGMENT_TILES
         tile = block % MAX_SEGMENT_TILES
+        swa_base = pl.cast(pl.read(control, [0, 4]), pl.INDEX)
         for row in pl.range(ATTN_TILE_ROWS):
             query = pl.read(query_position_ids_flat, [block, row])
             request = pl.read(query_token_to_request_flat, [block, row])
@@ -668,6 +701,15 @@ def _prefill_cp_metadata(
                 key = query - WIN + 1 + col
                 index = pl.cast(-1, pl.INT32)
                 if request >= 0:
+                    # Lower pre-chunk keys to owner-cache rows; overlays use current-chunk keys.
+                    if key >= 0:
+                        if key < swa_base:
+                            history_key = pl.cast(key, pl.INDEX)
+                            history_page = pl.read(ori_block_table, [history_key // BLOCK_SIZE])
+                            if history_page >= 0:
+                                index = pl.cast(
+                                    history_page * BLOCK_SIZE + history_key % BLOCK_SIZE, pl.INT32
+                                )
                     if key >= tile_start:
                         if key < tile_start + active:
                             index = pl.cast(OVERLAY_BASE + ATTN_TILE_ROWS + key - tile_start, pl.INT32)
@@ -681,17 +723,18 @@ def _prefill_cp_metadata(
     for cp_csa_leaf_coordinates_block in pl.spmd(1, name_hint="cp_csa_leaf_coordinates"):
         length = pl.cast(pl.read(control, [0, 2]), pl.INDEX)
         span = pl.cast(pl.read(control, [0, 3]), pl.INDEX)
+        base = pl.cast(pl.read(control, [0, 4]), pl.INDEX)
         for part in pl.range(LOCAL_PARTS):
             if part == 0:
                 leaf_segment = pl.cast(my_rank, pl.INDEX)
             else:
                 leaf_segment = pl.cast(NUM_SEGMENTS - 1 - my_rank, pl.INDEX)
-            start = leaf_segment * span
-            seg_length = pl.max(0, pl.min(span, length - start))
+            start = base + leaf_segment * span
+            seg_length = pl.max(0, pl.min(span, base + length - start))
             seed = pl.cast(0, pl.INDEX)
             if leaf_segment > 0:
                 if seg_length > 0:
-                    predecessor_length = pl.min(TAIL_ROWS, pl.max(0, pl.min(span, length - (leaf_segment - 1) * span)))
+                    predecessor_length = pl.min(TAIL_ROWS, pl.max(0, pl.min(span, base + length - (base + (leaf_segment - 1) * span))))
                     seed = pl.min(start % CSA_COMPRESS_RATIO + CSA_COMPRESS_RATIO, predecessor_length)
             for leaf in pl.range(CSA_MAX_COMPRESS_LEAVES):
                 if leaf == 0:
@@ -763,6 +806,9 @@ def _prefill_cp_metadata(
         leaf_main_state_slots_input,
         leaf_inner_state_slots_input,
         leaf_num_tokens_input,
+        hca_history_slots,
+        hca_history_positions,
+        csa_history_slots,
     )
 
 
@@ -866,6 +912,9 @@ def prefill_fwd(
     leaf_main_state_slots_input: pl.Tensor[[LOCAL_PARTS, CSA_MAX_COMPRESS_LEAVES, ATTN_TILE_ROWS], pl.INT64],
     leaf_inner_state_slots_input: pl.Tensor[[LOCAL_PARTS, CSA_MAX_COMPRESS_LEAVES, ATTN_TILE_ROWS], pl.INT64],
     leaf_num_tokens_input: pl.Tensor[[LOCAL_PARTS, CSA_MAX_COMPRESS_LEAVES], pl.INT32],
+    hca_history_slots: pl.Tensor[[LOCAL_PARTS, TAIL_ROWS], pl.INT32],
+    hca_history_positions: pl.Tensor[[LOCAL_PARTS, TAIL_ROWS], pl.INT32],
+    csa_history_slots: pl.Tensor[[TAIL_ROWS], pl.INT32],
     # Indexed by logical compressed page, whose row count is per-flavour.
     hca_cmp_block_table: pl.Tensor[[PREFILL_CMP_MAX_BLOCKS], pl.INT32],
     csa_cmp_block_table: pl.Tensor[[PREFILL_CMP_MAX_BLOCKS], pl.INT32],
@@ -1007,6 +1056,13 @@ def prefill_fwd(
 
     # Every layer uses the same local storage and monotonically increasing
     # protocol epochs. Empty ranks retain the explicit previous-MoE fence.
+    hca_history_cmp_rows = pl.create_tensor([1], dtype=pl.INT32)
+    with pl.at(level=pl.Level.CORE_GROUP, name_hint="fwd_hca_history_cmp_rows"):
+        fwd_base = pl.read(segment_starts_t, [0])
+        pl.write(
+            hca_history_cmp_rows, [0],
+            pl.cast(pl.min(fwd_base // HCA_COMPRESS_RATIO, HCA_MAX_COMPRESSED_ROWS), pl.INT32),
+        )
     layer_output = pl.create_tensor([LOCAL_PARTS, MAX_SEGMENT_TILES, ATTN_TILE_ROWS, HC_MULT, D], dtype=pl.FP32)
     moe_completion = pl.create_tensor([1, 1, 8], dtype=pl.FP32)
     x_attn = pl.create_tensor([LOCAL_PARTS, MAX_SEGMENT_TILES, ATTN_TILE_ROWS, HC_MULT, D], dtype=pl.FP32)
@@ -1085,6 +1141,9 @@ def prefill_fwd(
         )
         shared_w2_layer: pl.Tensor[[D, MOE_INTER], pl.INT8] = pl.slice(shared_w2, [D, MOE_INTER], [layer_index * D, 0])
         shared_w2_scale_layer: pl.Tensor[[D], pl.FP32] = pl.slice(shared_w2_scale, [D], [layer_index * D])
+        tail_comm_epoch = pl.cast(layer_index, pl.INT32)
+        if pl.read(segment_starts_t, [0]) > 0:
+            tail_comm_epoch = pl.cast(layer_index + pl.min(layer_index, 2), pl.INT32)
         with pl.scope():
             attention_completion = pl.create_tensor([NUM_ATTN_TILES, 1, 8], dtype=pl.FP32)
             if layer_index < 2:
@@ -1097,7 +1156,7 @@ def prefill_fwd(
                     gamma_cq_layer, gamma_ckv_layer,
                     swa_freqs_cos,
                     swa_freqs_sin,
-                    kv_cache_layer,
+                    kv_cache_layer, csa_history_slots,
                     attn_sink_layer,
                     wo_a_layer, wo_b_layer, wo_b_scale_layer,
                     segment_starts_t, segment_tail_positions,
@@ -1115,7 +1174,7 @@ def prefill_fwd(
                     attention_completion,
                     pl.read(cache_owner_rank_t, [0]),
                     my_rank,
-                    layer_index,
+                    tail_comm_epoch,
                 )
             elif layer_index % 2 == 0:
                 type_index = (layer_index - 2) // 2
@@ -1218,6 +1277,7 @@ def prefill_fwd(
                     query_position_ids, query_token_to_request,
                     overlay_active_lengths,
                     swa_indices,
+                    csa_history_slots,
                     final_segment_t,
                     reverse_index,
                     owner_rank_table,
@@ -1246,7 +1306,7 @@ def prefill_fwd(
                     attention_completion,
                     pl.read(cache_owner_rank_t, [0]),
                     my_rank,
-                    layer_index,
+                    tail_comm_epoch,
                     type_index,
                 )
             else:
@@ -1291,6 +1351,9 @@ def prefill_fwd(
                     segment_starts_t, segment_active_lengths,
                     owner_segments_t,
                     predecessor_segments,
+                    hca_history_slots,
+                    hca_history_positions,
+                    hca_history_cmp_rows,
                     query_position_ids,
                     overlay_active_lengths,
                     segment_tail_positions,
@@ -1314,7 +1377,7 @@ def prefill_fwd(
                     x_attn,
                     pl.read(cache_owner_rank_t, [0]),
                     my_rank,
-                    layer_index,
+                    tail_comm_epoch,
                     type_index,
                 )
             if layer_index < 2:
@@ -1377,17 +1440,33 @@ def prefill_fwd(
         # Serving retains these windows without a host reset. Layer epochs
         # restart in each request, so retire all attention credits after the
         # final MoE and before the next HOST dispatch can reuse the windows.
+        tail_completed = pl.cast(FWD_NUM_LAYERS, pl.INT32)
+        hca_completed = pl.cast(HCA_NUM_LAYERS, pl.INT32)
+        csa_completed = pl.cast(CSA_NUM_LAYERS, pl.INT32)
+        retire_prefix = pl.read(segment_starts_t, [0])
+        if retire_prefix > 0:
+            # Each SWA adds one raw-history phase. Each compressed layer adds
+            # one raw/state phase plus enough windows for the full history.
+            tail_completed = pl.cast(FWD_NUM_LAYERS + 2, pl.INT32)
+            hca_completed = pl.cast(
+                HCA_NUM_LAYERS * (2 + (retire_prefix // HCA_COMPRESS_RATIO + CMP_WINDOW_ROWS - 1) // CMP_WINDOW_ROWS),
+                pl.INT32,
+            )
+            csa_completed = pl.cast(
+                CSA_NUM_LAYERS * (2 + (retire_prefix // CSA_COMPRESS_RATIO + RECORDS_PER_WINDOW - 1) // RECORDS_PER_WINDOW),
+                pl.INT32,
+            )
         _clear_prefill_cp_exchange_signals(
             publish_anchor, tail_ready, tail_consumed,
-            pl.cast(FWD_NUM_LAYERS, pl.INT32), my_rank,
+            tail_completed, my_rank,
         )
         _clear_prefill_cp_exchange_signals(
             publish_anchor, hca_compact_ready, hca_compact_consumed,
-            pl.cast(HCA_NUM_LAYERS, pl.INT32), my_rank,
+            hca_completed, my_rank,
         )
         _clear_prefill_cp_exchange_signals(
             publish_anchor, csa_compact_ready, csa_compact_consumed,
-            pl.cast(CSA_NUM_LAYERS, pl.INT32), my_rank,
+            csa_completed, my_rank,
         )
         clear_prefill_moe_signals(publish_anchor, count_signal, prefill_moe_x_signal, prefill_moe_reverse_signal)
 
@@ -1658,6 +1737,9 @@ def _prefill_request(
         leaf_main_state_slots_input = pl.create_tensor([LOCAL_PARTS, CSA_MAX_COMPRESS_LEAVES, ATTN_TILE_ROWS], dtype=pl.INT64)
         leaf_inner_state_slots_input = pl.create_tensor([LOCAL_PARTS, CSA_MAX_COMPRESS_LEAVES, ATTN_TILE_ROWS], dtype=pl.INT64)
         leaf_num_tokens_input = pl.create_tensor([LOCAL_PARTS, CSA_MAX_COMPRESS_LEAVES], dtype=pl.INT32)
+        hca_history_slots = pl.create_tensor([LOCAL_PARTS, TAIL_ROWS], dtype=pl.INT32)
+        hca_history_positions = pl.create_tensor([LOCAL_PARTS, TAIL_ROWS], dtype=pl.INT32)
+        csa_history_slots = pl.create_tensor([TAIL_ROWS], dtype=pl.INT32)
         _prefill_cp_metadata(
             control,
             cp_ori_block_table, cp_csa_compress_state_block_table, cp_csa_inner_compress_state_block_table,
@@ -1686,6 +1768,9 @@ def _prefill_request(
             leaf_main_state_slots_input,
             leaf_inner_state_slots_input,
             leaf_num_tokens_input,
+            hca_history_slots,
+            hca_history_positions,
+            csa_history_slots,
             my_rank,
         )
         cp_x_hc = pl.reshape(local_x_hc, [LOCAL_PARTS, MAX_SEGMENT_TILES, TAIL_ROWS, HC_MULT, D])
@@ -1742,6 +1827,7 @@ def _prefill_request(
             leaf_main_state_slots_input,
             leaf_inner_state_slots_input,
             leaf_num_tokens_input,
+            hca_history_slots, hca_history_positions, csa_history_slots,
             cp_hca_cmp_block_table, cp_csa_cmp_block_table, cp_hidden_tail_window,
             cp_tail_ready, cp_tail_consumed, cp_cmp_window, cp_cmp_meta_window, cp_state_window,
             cp_state_meta_window, cp_hca_compact_ready, cp_hca_compact_consumed, cp_main_window, cp_idx_window,
@@ -2309,8 +2395,13 @@ def build_tensor_specs(
 
     if CP_SIZE != N_RANKS or CP_SIZE <= 1:
         raise ValueError("Prefill requires CP=EP>1; CP1 is deferred.")
-    if start_pos != 0:
-        raise ValueError("Prefill requires position zero; prefix reuse and chunk continuation are deferred.")
+    if start_pos < 0:
+        raise ValueError(f"Prefill start position must be non-negative, got {start_pos}.")
+    if start_pos % BLOCK_SIZE:
+        raise ValueError(
+            f"Prefill continuation starts on a cache page boundary, got {start_pos} "
+            f"which is not a multiple of {BLOCK_SIZE}."
+        )
     if active_ranks != 1:
         raise ValueError("Prefill requires one active request owner.")
     if not 1 <= num_tokens <= CP_EXCHANGE_CP_REQUEST_CAPACITY:
