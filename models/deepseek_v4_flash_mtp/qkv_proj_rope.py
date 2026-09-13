@@ -857,7 +857,8 @@ def qkv_proj_rope(
     # retain it across the RMS reduction instead of rereading/recomputing NOPE.
     # RoPE: out[j] = inv_rms * (x[j] * cos[j] + x[j^1] * sign[j] * sin[j]).
     q_flat = pl.reshape(q, [t_dim, H * HEAD_DIM])
-    for hg_idx in pl.spmd(H // Q_ROPE_H_TILE, name_hint="qproj_dequant_rms_nope_rope", allow_early_resolve=True):
+    with pl.spmd(H // Q_ROPE_H_TILE, name_hint="qproj_dequant_rms_nope_rope", allow_early_resolve=True) as q_rope_tid:
+        hg_idx = pl.tile.get_block_idx()
         hg = hg_idx * Q_ROPE_H_TILE
         for tg_idx in pl.range(t_dim // Q_ROPE_T_TILE):
             tg = tg_idx * Q_ROPE_T_TILE
@@ -984,7 +985,7 @@ def qkv_proj_rope(
         kv_rope_i16 = pl.cast(kv_rope_rot, target_type=pl.BF16, mode="rint")
         kv_view[tg : tg + KV_RMS_T_TILE, NOPE_DIM : NOPE_DIM + ROPE_DIM] = kv_rope_i16
 
-    return q
+    return q_rope_tid
 
 
 @pl.jit.inline(auto_scope=False)

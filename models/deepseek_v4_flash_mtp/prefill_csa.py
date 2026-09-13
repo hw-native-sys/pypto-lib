@@ -2083,7 +2083,8 @@ def prefill_attention_csa(
         for tile in pl.range(NUM_MOE_WAVES):
             completion_token[tile : tile + 1, 0:1, 0:8] = pl.slice(x_out_flat, [1, 1, 8], [tile * T, 0, 0])
 
-    return pl.reshape(x_out_flat, [LOCAL_PARTS, MAX_SEGMENT_TILES, T, HC_MULT, D])
+    x_out = pl.reshape(x_out_flat, [LOCAL_PARTS, MAX_SEGMENT_TILES, T, HC_MULT, D])
+    return x_out
 
 @pl.jit
 def prefill_cp_csa_rank(

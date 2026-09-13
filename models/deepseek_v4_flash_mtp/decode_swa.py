@@ -124,30 +124,24 @@ def attention_swa(
 
     x_normed_t = pl.create_tensor([T, D], dtype=pl.BF16)
     rms_tid = rms_norm(x_mixed, attn_norm_w, x_normed_t)
-    # SDMA CMO L2 warm of this layer's attention weights, in deadline order.
-    wq_a_flat = pl.reshape(wq_a, [D * Q_LORA])
-    wkv_flat = pl.reshape(wkv, [D * HEAD_DIM])
-    wq_b_flat = pl.reshape(wq_b, [Q_LORA * H * HEAD_DIM])
-    wo_a_flat = pl.reshape(wo_a, [O_GROUPS * O_LORA * O_GROUP_IN])
-    wo_b_flat = pl.reshape(wo_b, [D * O_GROUPS * O_LORA])
-    with pl.at(level=pl.Level.CORE_GROUP, name_hint="prefetch_attn_w", deps=[rms_tid]):
-        warm_ctx = pl.prefetch.make_context()
-        pl.prefetch.async_prefetch(wq_a_flat, warm_ctx)
-        pl.prefetch.async_prefetch(wkv_flat, warm_ctx)
-        pl.prefetch.async_prefetch(wq_b_flat, warm_ctx)
-        pl.prefetch.async_prefetch(wo_a_flat, warm_ctx)
-        pl.prefetch.async_prefetch(wo_b_flat, warm_ctx)
     # Defers kv_proj_matmul one hop behind rms_norm so qr_proj_matmul dispatches first.
     late_dep = pl.system.task_dummy(deps=[rms_tid])
     q = pl.create_tensor([T, H, HEAD_DIM], dtype=pl.BF16)
     kv = pl.create_tensor([T, HEAD_DIM], dtype=pl.BF16)
     qr = pl.create_tensor([T, Q_LORA], dtype=pl.INT8)
     qr_scale = pl.create_tensor([T, 1], dtype=pl.FP32)
-    qkv_proj_rope(
+    q_rope_tid = qkv_proj_rope(
         x_normed_t, wq_a, wq_b, wq_b_scale, wkv,
         rope_cos_t, rope_sin_t, gamma_cq, gamma_ckv,
         q, kv, qr, qr_scale, late_dep,
     )
+    # SDMA CMO L2 warm of the o-projection weights, issued once q is written.
+    wo_a_flat = pl.reshape(wo_a, [O_GROUPS * O_LORA * O_GROUP_IN])
+    wo_b_flat = pl.reshape(wo_b, [D * O_GROUPS * O_LORA])
+    with pl.at(level=pl.Level.CORE_GROUP, name_hint="prefetch_o_proj_w", deps=[q_rope_tid]):
+        warm_ctx = pl.prefetch.make_context()
+        pl.prefetch.async_prefetch(wo_a_flat, warm_ctx)
+        pl.prefetch.async_prefetch(wo_b_flat, warm_ctx)
 
     # Commit current decode KV and build its additive padding mask in one task.
     # The SWA attention kernel reads every visible row through metadata-expanded

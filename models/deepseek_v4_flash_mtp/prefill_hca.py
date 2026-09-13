@@ -968,7 +968,8 @@ def prefill_attention_hca(
             completion_token[tile : tile + 1, 0:1, 0:8] = pl.slice(x_out_flat, [1, 1, 8], [tile * TAIL_ROWS, 0, 0])
     _completed = pl.read(completion_token, [0, 0, 0])
 
-    return pl.reshape(x_out_flat, [LOCAL_PARTS, MAX_SEGMENT_TILES, TAIL_ROWS, HC_MULT, D])
+    x_out = pl.reshape(x_out_flat, [LOCAL_PARTS, MAX_SEGMENT_TILES, TAIL_ROWS, HC_MULT, D])
+    return x_out
 
 
 @pl.jit
