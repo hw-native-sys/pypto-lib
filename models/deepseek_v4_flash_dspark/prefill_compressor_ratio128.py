@@ -11,7 +11,7 @@
 import pypto.language as pl
 
 from config import (
-    BLOCK_SIZE,
+    HCA_CMP_STORAGE_BLOCK_SIZE as CMP_STORAGE_BLOCK_SIZE,
     C128_COMPRESSOR_BLOCK_SIZE,
     DECODE_BATCH,
     DECODE_SEQ,
@@ -48,7 +48,7 @@ STATE_LEN = COMPRESS_RATIO
 STATE_STORAGE_LEN = STATE_LEN + DECODE_SEQ
 COMPRESS_STATE_DIM = 2 * OUT_DIM
 MAX_CMP_WRITES = PREFILL_STATE_TILE // COMPRESS_RATIO
-CMP_MAX_BLOCKS = (MAX_SEQ_LEN // COMPRESS_RATIO + BLOCK_SIZE - 1) // BLOCK_SIZE
+CMP_MAX_BLOCKS = (MAX_SEQ_LEN // COMPRESS_RATIO + CMP_STORAGE_BLOCK_SIZE - 1) // CMP_STORAGE_BLOCK_SIZE
 
 # paged compressor state
 HCA_STATE_BLOCK_SIZE = C128_COMPRESSOR_BLOCK_SIZE
@@ -88,7 +88,7 @@ def _prefill_compressor_ratio128_tile(
     norm_w: pl.Tensor[[HEAD_DIM], pl.BF16],
     cmp_freqs_cos: pl.Tensor[[T_DYN, ROPE_HEAD_DIM], pl.BF16],
     cmp_freqs_sin: pl.Tensor[[T_DYN, ROPE_HEAD_DIM], pl.BF16],
-    cmp_kv: pl.InOut[pl.Tensor[[CMP_BLOCK_NUM_DYN, BLOCK_SIZE, 1, HEAD_DIM], pl.BF16]],
+    cmp_kv: pl.InOut[pl.Tensor[[CMP_BLOCK_NUM_DYN, CMP_STORAGE_BLOCK_SIZE, 1, HEAD_DIM], pl.BF16]],
     position_ids: pl.Tensor[[T_DYN], pl.INT32],
     cmp_slot_mapping: pl.Tensor[[T_DYN], pl.INT64],
     state_slot_mapping: pl.Tensor[[T_DYN], pl.INT64],
@@ -107,7 +107,7 @@ def _prefill_compressor_ratio128_tile(
         compress_state,
         [state_block_num * HCA_STATE_BLOCK_SIZE, COMPRESS_STATE_DIM],
     )
-    cmp_kv_flat = pl.reshape(cmp_kv, [cmp_block_num * BLOCK_SIZE, HEAD_DIM])
+    cmp_kv_flat = pl.reshape(cmp_kv, [cmp_block_num * CMP_STORAGE_BLOCK_SIZE, HEAD_DIM])
 
     t_dim = pl.tensor.dim(x, 0)
     x_flat = pl.reshape(x, [t_dim, D])
@@ -421,7 +421,7 @@ def prefill_compressor_ratio128(
     norm_w: pl.Tensor[[HEAD_DIM], pl.BF16],
     cmp_freqs_cos: pl.Tensor[[T_DYN, ROPE_HEAD_DIM], pl.BF16],
     cmp_freqs_sin: pl.Tensor[[T_DYN, ROPE_HEAD_DIM], pl.BF16],
-    cmp_kv: pl.InOut[pl.Tensor[[CMP_BLOCK_NUM_DYN, BLOCK_SIZE, 1, HEAD_DIM], pl.BF16]],
+    cmp_kv: pl.InOut[pl.Tensor[[CMP_BLOCK_NUM_DYN, CMP_STORAGE_BLOCK_SIZE, 1, HEAD_DIM], pl.BF16]],
     position_ids: pl.Tensor[[T_DYN], pl.INT32],
     cmp_slot_mapping: pl.Tensor[[T_DYN], pl.INT64],
     state_slot_mapping: pl.Tensor[[T_DYN], pl.INT64],
@@ -506,7 +506,7 @@ def prefill_compressor_ratio128_test(
     norm_w: pl.Tensor[[HEAD_DIM], pl.BF16],
     cmp_freqs_cos: pl.Tensor[[T_DYN, ROPE_HEAD_DIM], pl.BF16],
     cmp_freqs_sin: pl.Tensor[[T_DYN, ROPE_HEAD_DIM], pl.BF16],
-    cmp_kv: pl.InOut[pl.Tensor[[CMP_BLOCK_NUM_DYN, BLOCK_SIZE, 1, HEAD_DIM], pl.BF16]],
+    cmp_kv: pl.InOut[pl.Tensor[[CMP_BLOCK_NUM_DYN, CMP_STORAGE_BLOCK_SIZE, 1, HEAD_DIM], pl.BF16]],
     position_ids: pl.Tensor[[T_DYN], pl.INT32],
     cmp_slot_mapping: pl.Tensor[[T_DYN], pl.INT64],
     state_slot_mapping: pl.Tensor[[T_DYN], pl.INT64],
@@ -553,7 +553,7 @@ def golden_prefill_compressor_ratio128(tensors):
     kv_state_flat = compress_state_flat[:, :OUT_DIM]
     score_state_flat = compress_state_flat[:, OUT_DIM:]
     state_block_table = tensors["compress_state_block_table"][0]
-    cmp_kv_flat = tensors["cmp_kv"].view(CMP_MAX_BLOCKS * BLOCK_SIZE, HEAD_DIM)
+    cmp_kv_flat = tensors["cmp_kv"].view(CMP_MAX_BLOCKS * CMP_STORAGE_BLOCK_SIZE, HEAD_DIM)
 
     def state_row(abs_pos):
         if abs_pos < 0 or abs_pos >= MAX_SEQ_LEN:
@@ -663,7 +663,7 @@ def build_tensor_specs(start_pos: int = START_POS, token_count: int = PREFILL_SE
         return 0.0982 + 0.0539 * torch.randn(HEAD_DIM)
 
     def init_cmp_kv():
-        return torch.zeros(CMP_MAX_BLOCKS, BLOCK_SIZE, 1, HEAD_DIM, dtype=torch.bfloat16)
+        return torch.zeros(CMP_MAX_BLOCKS, CMP_STORAGE_BLOCK_SIZE, 1, HEAD_DIM, dtype=torch.bfloat16)
 
     def init_position_ids():
         return torch.arange(start_pos, start_pos + token_count, dtype=torch.int32)
@@ -724,7 +724,7 @@ def build_tensor_specs(start_pos: int = START_POS, token_count: int = PREFILL_SE
         TensorSpec("cmp_freqs_sin", [token_count, ROPE_HEAD_DIM], torch.bfloat16, init_value=init_cmp_freqs_sin),
         TensorSpec(
             "cmp_kv",
-            [CMP_MAX_BLOCKS, BLOCK_SIZE, 1, HEAD_DIM],
+            [CMP_MAX_BLOCKS, CMP_STORAGE_BLOCK_SIZE, 1, HEAD_DIM],
             torch.bfloat16,
             init_value=init_cmp_kv,
         ),

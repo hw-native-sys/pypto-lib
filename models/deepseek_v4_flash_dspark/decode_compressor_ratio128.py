@@ -16,13 +16,13 @@ import pypto.language as pl
 from rope_interleave import rope_interleave
 from config import (
     FLASH as M,
-    BLOCK_SIZE,
+    HCA_CMP_STORAGE_BLOCK_SIZE as CMP_STORAGE_BLOCK_SIZE,
     C128_COMPRESSOR_BLOCK_SIZE,
     HCA_STATE_PHYSICAL_BLOCKS,
     DECODE_BATCH,
     TP,
     DECODE_SEQ,
-    KV_CMP_BLOCK_NUM,
+    HCA_KV_CMP_BLOCK_NUM,
     FP32_NEG_INF,
 )
 
@@ -70,9 +70,9 @@ COMPRESS_STATE_MAX_BLOCKS = (MAX_SEQ_LEN + COMPRESS_STATE_BLOCK_SIZE - 1) // COM
 COMPRESS_STATE_BLOCK_NUM = COMPRESS_STATE_PHYSICAL_BLOCKS
 COMPRESS_STATE_DIM = 2 * OUT_DIM
 COMPRESS_STATE_BLOCKS_PER_REQUEST = COMPRESS_STATE_PHYSICAL_BLOCKS // DECODE_BATCH
-CMP_MAX_BLOCKS = (IDX_KV_LEN + BLOCK_SIZE - 1) // BLOCK_SIZE
-CMP_BLOCK_NUM = KV_CMP_BLOCK_NUM
-if IDX_KV_LEN > CMP_MAX_BLOCKS * BLOCK_SIZE:
+CMP_MAX_BLOCKS = (IDX_KV_LEN + CMP_STORAGE_BLOCK_SIZE - 1) // CMP_STORAGE_BLOCK_SIZE
+CMP_BLOCK_NUM = HCA_KV_CMP_BLOCK_NUM
+if IDX_KV_LEN > CMP_MAX_BLOCKS * CMP_STORAGE_BLOCK_SIZE:
     raise ValueError("ratio128 compressed KV cache capacity is smaller than max compressed sequence length")
 
 # tiling
@@ -168,7 +168,7 @@ def compressor_ratio128_projected(
     #   cos[j] = cos_half[j>>1];  sin[j] = sin_half[j>>1] * sign[j], sign = [-1,+1,...]
     cos: pl.Tensor[[B_DYN, ROPE_HEAD_DIM], pl.FP32],
     sin: pl.Tensor[[B_DYN, ROPE_HEAD_DIM], pl.FP32],
-    cmp_kv_cache: pl.Tensor[[CMP_BLOCK_NUM_DYN, BLOCK_SIZE, 1, HEAD_DIM], pl.BF16],
+    cmp_kv_cache: pl.Tensor[[CMP_BLOCK_NUM_DYN, CMP_STORAGE_BLOCK_SIZE, 1, HEAD_DIM], pl.BF16],
     position_ids: pl.Tensor[[T_DYN], pl.INT32],
     cmp_slot_mapping: pl.Tensor[[T_DYN], pl.INT64],
     state_slot_mapping: pl.Tensor[[T_DYN], pl.INT64],
@@ -247,7 +247,7 @@ def compressor_ratio128_projected(
     norm_w_2d = pl.reshape(norm_w, [1, HEAD_DIM])
     normed_kv = pl.create_tensor([RMS_PAD_ROWS, HEAD_DIM], dtype=pl.FP32)
     kv_flat = kv
-    cmp_flat_rows = cmp_block_num * BLOCK_SIZE
+    cmp_flat_rows = cmp_block_num * CMP_STORAGE_BLOCK_SIZE
     cmp_kv_cache_flat = pl.reshape(cmp_kv_cache, [cmp_flat_rows, HEAD_DIM])
 
     with pl.spmd(
@@ -336,7 +336,7 @@ def compressor_ratio128(
     #   cos[j] = cos_half[j>>1];  sin[j] = sin_half[j>>1] * sign[j], sign = [-1,+1,...]
     cos: pl.Tensor[[B_DYN, ROPE_HEAD_DIM], pl.FP32],
     sin: pl.Tensor[[B_DYN, ROPE_HEAD_DIM], pl.FP32],
-    cmp_kv_cache: pl.Tensor[[CMP_BLOCK_NUM_DYN, BLOCK_SIZE, 1, HEAD_DIM], pl.BF16],
+    cmp_kv_cache: pl.Tensor[[CMP_BLOCK_NUM_DYN, CMP_STORAGE_BLOCK_SIZE, 1, HEAD_DIM], pl.BF16],
     position_ids: pl.Tensor[[T_DYN], pl.INT32],
     cmp_slot_mapping: pl.Tensor[[T_DYN], pl.INT64],
     state_slot_mapping: pl.Tensor[[T_DYN], pl.INT64],
@@ -370,7 +370,7 @@ def compressor_test(
     norm_w: pl.Tensor[[HEAD_DIM], pl.BF16],
     cos: pl.Tensor[[B_DYN, ROPE_HEAD_DIM // 2], pl.FP32],
     sin: pl.Tensor[[B_DYN, ROPE_HEAD_DIM // 2], pl.FP32],
-    cmp_kv_cache: pl.InOut[pl.Tensor[[CMP_BLOCK_NUM_DYN, BLOCK_SIZE, 1, HEAD_DIM], pl.BF16]],
+    cmp_kv_cache: pl.InOut[pl.Tensor[[CMP_BLOCK_NUM_DYN, CMP_STORAGE_BLOCK_SIZE, 1, HEAD_DIM], pl.BF16]],
     position_ids: pl.Tensor[[T_DYN], pl.INT32],
     cmp_slot_mapping: pl.Tensor[[T_DYN], pl.INT64],
     state_slot_mapping: pl.Tensor[[T_DYN], pl.INT64],
@@ -519,8 +519,8 @@ def golden_compressor(tensors):
             # Kernel writes committed pooled result only to kv[:, 0, :]; leave
             # speculative-boundary rows and kv[:, 1:, :] NaN (ignored).
             tensors["kv"][b * S : b * S + 1, :] = kv_b[0]
-            cblk = cmp_row // BLOCK_SIZE
-            intra_offset = cmp_row % BLOCK_SIZE
+            cblk = cmp_row // CMP_STORAGE_BLOCK_SIZE
+            intra_offset = cmp_row % CMP_STORAGE_BLOCK_SIZE
             cmp_kv_cache[cblk, intra_offset, 0] = kv_b[0, 0]
 
     tensors["cmp_kv_cache"][:] = cmp_kv_cache
@@ -558,7 +558,7 @@ def build_tensor_specs(start_pos=None, batch=B):
         cmp_offset = COMPRESS_RATIO - (first_pos % COMPRESS_RATIO)
         return (first_pos + cmp_offset - COMPRESS_RATIO).to(torch.int64)
     def init_cmp_kv_cache():
-        return torch.zeros(CMP_BLOCK_NUM, BLOCK_SIZE, 1, HEAD_DIM)
+        return torch.zeros(CMP_BLOCK_NUM, CMP_STORAGE_BLOCK_SIZE, 1, HEAD_DIM)
     def init_compress_state_block_table():
         logical_blocks = torch.arange(COMPRESS_STATE_MAX_BLOCKS, dtype=torch.int32)
         ring_blocks = logical_blocks % COMPRESS_STATE_BLOCKS_PER_REQUEST
@@ -607,7 +607,7 @@ def build_tensor_specs(start_pos=None, batch=B):
             positions,
             init_cmp_block_table(),
             compress_ratio=COMPRESS_RATIO,
-            block_size=BLOCK_SIZE,
+            block_size=CMP_STORAGE_BLOCK_SIZE,
         )
     return [
         TensorSpec("x", [batch * S, D], torch.bfloat16, init_value=init_x),
@@ -620,7 +620,7 @@ def build_tensor_specs(start_pos=None, batch=B):
         TensorSpec("norm_w", [HEAD_DIM], torch.bfloat16, init_value=init_norm_w),
         TensorSpec("cos", [batch, ROPE_HEAD_DIM // 2], torch.float32, init_value=init_cos),
         TensorSpec("sin", [batch, ROPE_HEAD_DIM // 2], torch.float32, init_value=init_sin),
-        TensorSpec("cmp_kv_cache", [CMP_BLOCK_NUM, BLOCK_SIZE, 1, HEAD_DIM], torch.bfloat16, init_value=init_cmp_kv_cache),
+        TensorSpec("cmp_kv_cache", [CMP_BLOCK_NUM, CMP_STORAGE_BLOCK_SIZE, 1, HEAD_DIM], torch.bfloat16, init_value=init_cmp_kv_cache),
         TensorSpec("position_ids", [batch * S], torch.int32, init_value=lambda: init_position_ids().reshape(-1)),
         TensorSpec("cmp_slot_mapping", [batch * S], torch.int64, init_value=lambda: init_cmp_slot_mapping().reshape(-1)),
         TensorSpec("state_slot_mapping", [batch * S], torch.int64, init_value=lambda: init_state_slot_mapping().reshape(-1)),

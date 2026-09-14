@@ -90,6 +90,7 @@ from prefill_o_proj import (
 )
 from prefill_hca import (
     HCA_CMP_BLOCK_NUM,
+    CMP_STORAGE_BLOCK_SIZE as HCA_CMP_STORAGE_BLOCK_SIZE,
     HCA_STATE_BLOCK_NUM,
     HCA_STATE_BLOCK_SIZE,
     HCA_STATE_MAX_BLOCKS,
@@ -166,7 +167,7 @@ def prefill_layer_attention(
     kv_cache: pl.InOut[pl.Tensor[[CSA_ORI_BLOCK_NUM, BLOCK_SIZE, 1, HEAD_DIM], pl.BF16]],
     ori_block_table: pl.Tensor[[REQUESTS_DYN, SPARSE_ORI_MAX_BLOCKS], pl.INT32],
     ori_slot_mapping_full: pl.Tensor[[FWD_GROUP_TOKENS_DYN], pl.INT64],
-    hca_cmp_kv: pl.InOut[pl.Tensor[[HCA_CMP_BLOCK_NUM, BLOCK_SIZE, 1, HEAD_DIM], pl.BF16]],
+    hca_cmp_kv: pl.InOut[pl.Tensor[[HCA_CMP_BLOCK_NUM, HCA_CMP_STORAGE_BLOCK_SIZE, 1, HEAD_DIM], pl.BF16]],
     csa_cmp_kv: pl.InOut[pl.Tensor[[CSA_CMP_BLOCK_NUM, BLOCK_SIZE, 1, HEAD_DIM], pl.BF16]],
     hca_cmp_block_table: pl.Tensor[[REQUESTS_DYN, HCA_CMP_MAX_BLOCKS], pl.INT32],
     csa_cmp_block_table: pl.Tensor[[REQUESTS_DYN, CSA_CMP_MAX_BLOCKS], pl.INT32],
@@ -481,7 +482,7 @@ def l3_prefill_layer(
     kv_cache: pl.InOut[pl.Tensor[[N_RANKS, CSA_ORI_BLOCK_NUM, BLOCK_SIZE, 1, HEAD_DIM], pl.BF16]],
     ori_block_table: pl.Tensor[[N_RANKS, REQUESTS_DYN, SPARSE_ORI_MAX_BLOCKS], pl.INT32],
     ori_slot_mapping_full: pl.Tensor[[N_RANKS, FWD_GROUP_TOKENS_DYN], pl.INT64],
-    hca_cmp_kv: pl.InOut[pl.Tensor[[N_RANKS, HCA_CMP_BLOCK_NUM, BLOCK_SIZE, 1, HEAD_DIM], pl.BF16]],
+    hca_cmp_kv: pl.InOut[pl.Tensor[[N_RANKS, HCA_CMP_BLOCK_NUM, HCA_CMP_STORAGE_BLOCK_SIZE, 1, HEAD_DIM], pl.BF16]],
     csa_cmp_kv: pl.InOut[pl.Tensor[[N_RANKS, CSA_CMP_BLOCK_NUM, BLOCK_SIZE, 1, HEAD_DIM], pl.BF16]],
     hca_cmp_block_table: pl.Tensor[[N_RANKS, REQUESTS_DYN, HCA_CMP_MAX_BLOCKS], pl.INT32],
     csa_cmp_block_table: pl.Tensor[[N_RANKS, REQUESTS_DYN, CSA_CMP_MAX_BLOCKS], pl.INT32],

@@ -13,6 +13,7 @@ import pypto.language as pl
 
 from config import (
     BLOCK_SIZE,
+    HCA_CMP_STORAGE_BLOCK_SIZE,
     FLASH as M,
     FP32_NEG_INF,
     INT8_AMAX_EPS,
@@ -115,8 +116,8 @@ SPARSE_CMP_BIAS_COLS = max(0, SPARSE_BIAS_COLS - WIN)
 
 # HCA streaming tiling.
 HCA_ATTN_TILE = 128
-HCA_CMP_PAGES_PER_WORK = HCA_ATTN_TILE // BLOCK_SIZE
-HCA_CMP_MAX_BLOCKS = (MAX_SEQ_LEN // HCA_COMPRESS_RATIO + BLOCK_SIZE - 1) // BLOCK_SIZE
+HCA_CMP_PAGES_PER_WORK = HCA_ATTN_TILE // HCA_CMP_STORAGE_BLOCK_SIZE
+HCA_CMP_MAX_BLOCKS = (MAX_SEQ_LEN // HCA_COMPRESS_RATIO + HCA_CMP_STORAGE_BLOCK_SIZE - 1) // HCA_CMP_STORAGE_BLOCK_SIZE
 HCA_CMP_WORK_COUNT = (HCA_CMP_MAX_BLOCKS + HCA_CMP_PAGES_PER_WORK - 1) // HCA_CMP_PAGES_PER_WORK
 HCA_CMP_PAD_ROWS = HCA_CMP_WORK_COUNT * HCA_ATTN_TILE
 HCA_WORK_VALID_STRIDE = 16  # one 64-byte cache line per INT32 writer
@@ -338,7 +339,7 @@ def _hca_streaming_wave(
         qk_t = query_base + qk_local_t
         if qk_t < request_end:
             qk_position = pl.max(pl.read(position_ids, [qk_t]), -1)
-            qk_rows = pl.min(HCA_CMP_MAX_BLOCKS * BLOCK_SIZE, (qk_position + 1) // HCA_COMPRESS_RATIO)
+            qk_rows = pl.min(HCA_CMP_MAX_BLOCKS * HCA_CMP_STORAGE_BLOCK_SIZE, (qk_position + 1) // HCA_COMPRESS_RATIO)
             qk_blocks = (qk_rows + HCA_ATTN_TILE - 1) // HCA_ATTN_TILE
             qk_q = pl.load(
                 q_flat, [qk_t * H + qk_head_base, 0], [QK_M_TILE, HEAD_DIM], target_memory=pl.MemorySpace.Mat,
@@ -521,7 +522,7 @@ def _hca_streaming_attn_tile(
     q: pl.Tensor[[T_DYN, H, HEAD_DIM], pl.BF16],
     ori_kv: pl.Tensor[[ORI_BLOCK_NUM_DYN, BLOCK_SIZE, 1, HEAD_DIM], pl.BF16],
     swa_indices: pl.Tensor[[T_DYN, WIN], pl.INT32],
-    cmp_kv: pl.Tensor[[CMP_BLOCK_NUM_DYN, BLOCK_SIZE, 1, HEAD_DIM], pl.BF16],
+    cmp_kv: pl.Tensor[[CMP_BLOCK_NUM_DYN, HCA_CMP_STORAGE_BLOCK_SIZE, 1, HEAD_DIM], pl.BF16],
     cmp_block_table: pl.Tensor[[HCA_CMP_MAX_BLOCKS], pl.INT32],
     position_ids: pl.Tensor[[T_DYN], pl.INT32],
     attn_sink: pl.Tensor[[H], pl.FP32],
@@ -542,7 +543,7 @@ def _hca_streaming_attn_tile(
 ):
     """Stream one dense HCA tile through o-proj."""
     cmp_block_num = pl.tensor.dim(cmp_kv, 0)
-    cmp_cache_rows = cmp_block_num * BLOCK_SIZE
+    cmp_cache_rows = cmp_block_num * HCA_CMP_STORAGE_BLOCK_SIZE
     cmp_kv_flat = pl.reshape(cmp_kv, [cmp_cache_rows, HEAD_DIM])
 
     with pl.manual_scope():
@@ -572,12 +573,12 @@ def _hca_streaming_attn_tile(
             gather_active_count_i32 = pl.read(tile_cmp_work_count, [0])
             if pl.cast(gather_work, pl.INT32) < gather_active_count_i32:
                 gather_dst0 = gather_work * HCA_ATTN_TILE
-                for gather_page in pl.unroll(HCA_CMP_PAGES_PER_WORK):
+                for gather_page in pl.range(HCA_CMP_PAGES_PER_WORK):
                     gather_table_col = gather_work * HCA_CMP_PAGES_PER_WORK + gather_page
-                    gather_local = gather_page * BLOCK_SIZE
+                    gather_local = gather_page * HCA_CMP_STORAGE_BLOCK_SIZE
                     gather_dst = gather_dst0 + gather_local
                     # Preserve the manually managed workspace identity across gather writes.
-                    gather_zero = pl.tile.full([BLOCK_SIZE, HEAD_DIM], dtype=pl.BF16, value=0.0)
+                    gather_zero = pl.tile.full([HCA_CMP_STORAGE_BLOCK_SIZE, HEAD_DIM], dtype=pl.BF16, value=0.0)
                     pl.store(gather_zero, [gather_dst, 0], cmp_work_kv)
                     gather_block_i32 = pl.read(cmp_block_table, [gather_table_col])
                     if gather_block_i32 >= 0:
@@ -585,8 +586,8 @@ def _hca_streaming_attn_tile(
                             if gather_page == 0:
                                 pl.write(cmp_work_valid, [gather_work, 0], pl.cast(1, pl.INT32))
                             gather_block = pl.cast(gather_block_i32, pl.INDEX)
-                            gather_src = gather_block * BLOCK_SIZE
-                            gather_page_kv = pl.load(cmp_kv_flat, [gather_src, 0], [BLOCK_SIZE, HEAD_DIM])
+                            gather_src = gather_block * HCA_CMP_STORAGE_BLOCK_SIZE
+                            gather_page_kv = pl.load(cmp_kv_flat, [gather_src, 0], [HCA_CMP_STORAGE_BLOCK_SIZE, HEAD_DIM])
                             pl.store(gather_page_kv, [gather_dst, 0], cmp_work_kv)
 
         rope_cos_il = pl.create_tensor([T_PAD, ROPE_DIM], dtype=pl.FP32, manual_dep=True)
@@ -1240,7 +1241,7 @@ def hca_streaming_attn_physical(
     q: pl.Tensor[[T_DYN, H, HEAD_DIM], pl.BF16],
     ori_kv: pl.Tensor[[ORI_BLOCK_NUM_DYN, BLOCK_SIZE, 1, HEAD_DIM], pl.BF16],
     swa_indices: pl.Tensor[[T_DYN, WIN], pl.INT32],
-    cmp_kv: pl.Tensor[[CMP_BLOCK_NUM_DYN, BLOCK_SIZE, 1, HEAD_DIM], pl.BF16],
+    cmp_kv: pl.Tensor[[CMP_BLOCK_NUM_DYN, HCA_CMP_STORAGE_BLOCK_SIZE, 1, HEAD_DIM], pl.BF16],
     cmp_block_table: pl.Tensor[[HCA_CMP_MAX_BLOCKS], pl.INT32],
     position_ids: pl.Tensor[[T_DYN], pl.INT32],
     attn_sink: pl.Tensor[[H], pl.FP32],
@@ -1457,6 +1458,7 @@ def golden_prefill_sparse_attn(tensors):
     token_count = q.shape[0]
     ori_kv = tensors["ori_kv"].float()
     cmp_kv = tensors["cmp_kv"].float()
+    cmp_storage_block_size = cmp_kv.shape[1]
     cmp_block_table = tensors["cmp_block_table"]
     local_request_ids = tensors["local_request_ids"]
     swa_indices = tensors["swa_indices"]
@@ -1481,10 +1483,10 @@ def golden_prefill_sparse_attn(tensors):
             gathered.append(ori_kv.reshape(-1, HEAD_DIM)[row])
         for raw_i in cmp_indices[t].tolist():
             cmp_slot = int(raw_i)
-            if cmp_slot < 0 or cmp_slot >= CMP_MAX_BLOCKS * BLOCK_SIZE:
+            if cmp_slot < 0 or cmp_slot >= cmp_block_table.shape[1] * cmp_storage_block_size:
                 continue
-            block_id = int(cmp_block_table[request_id, cmp_slot // BLOCK_SIZE].item())
-            intra = cmp_slot % BLOCK_SIZE
+            block_id = int(cmp_block_table[request_id, cmp_slot // cmp_storage_block_size].item())
+            intra = cmp_slot % cmp_storage_block_size
             if block_id >= 0:
                 gathered.append(cmp_kv[block_id, intra, 0])
 

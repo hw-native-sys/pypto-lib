@@ -88,6 +88,7 @@ O_GROUP_IN = swa.O_GROUP_IN
 LOCAL_O_GROUPS = swa.LOCAL_O_GROUPS
 LOCAL_O_WIDTH = swa.LOCAL_O_WIDTH
 BLOCK_SIZE = swa.BLOCK_SIZE
+HCA_CMP_STORAGE_BLOCK_SIZE = hca.CMP_STORAGE_BLOCK_SIZE
 ATTENTION_WINDOW_ROWS = swa.ATTENTION_WINDOW_ROWS
 O_WINDOW_ROWS = swa.O_WINDOW_ROWS
 
@@ -831,7 +832,7 @@ def decode_layer_hca(
     compress_state: pl.InOut[pl.Tensor[[HCA_COMPRESS_STATE_BLOCK_NUM_DYN, HCA_COMPRESS_STATE_BLOCK_SIZE, HCA_COMPRESS_STATE_DIM], pl.FP32]],
     compress_state_block_table: pl.Tensor[[KV_B_DYN, HCA_COMPRESS_STATE_MAX_BLOCKS], pl.INT32],
     kv_cache: pl.InOut[pl.Tensor[[ORI_BLOCK_NUM_DYN, BLOCK_SIZE, 1, HEAD_DIM], pl.BF16]],
-    cmp_kv: pl.InOut[pl.Tensor[[HCA_CMP_BLOCK_NUM_DYN, BLOCK_SIZE, 1, HEAD_DIM], pl.BF16]],
+    cmp_kv: pl.InOut[pl.Tensor[[HCA_CMP_BLOCK_NUM_DYN, HCA_CMP_STORAGE_BLOCK_SIZE, 1, HEAD_DIM], pl.BF16]],
     cmp_block_table: pl.Tensor[[HCA_B_DYN, HCA_CMP_TABLE_BLOCKS_DYN], pl.INT32],
     ori_slot_mapping: pl.Tensor[[KV_T_DYN], pl.INT64],
     window_swa_indices: pl.Tensor[[T_DYN, WIN], pl.INT32],
@@ -987,7 +988,7 @@ def decode_layer_hca_test(
     compress_state: pl.InOut[pl.Tensor[[HCA_COMPRESS_STATE_BLOCK_NUM_DYN, HCA_COMPRESS_STATE_BLOCK_SIZE, HCA_COMPRESS_STATE_DIM], pl.FP32]],
     compress_state_block_table: pl.Tensor[[KV_B_DYN, HCA_COMPRESS_STATE_MAX_BLOCKS], pl.INT32],
     kv_cache: pl.InOut[pl.Tensor[[ORI_BLOCK_NUM_DYN, BLOCK_SIZE, 1, HEAD_DIM], pl.BF16]],
-    cmp_kv: pl.InOut[pl.Tensor[[HCA_CMP_BLOCK_NUM_DYN, BLOCK_SIZE, 1, HEAD_DIM], pl.BF16]],
+    cmp_kv: pl.InOut[pl.Tensor[[HCA_CMP_BLOCK_NUM_DYN, HCA_CMP_STORAGE_BLOCK_SIZE, 1, HEAD_DIM], pl.BF16]],
     cmp_block_table: pl.Tensor[[HCA_B_DYN, HCA_CMP_TABLE_BLOCKS_DYN], pl.INT32],
     ori_slot_mapping: pl.Tensor[[KV_T_DYN], pl.INT64],
     window_swa_indices: pl.Tensor[[T_DYN, WIN], pl.INT32],
@@ -1130,7 +1131,7 @@ def l3_decode_layer_hca(
     compress_state: pl.InOut[pl.Tensor[[N_RANKS, HCA_COMPRESS_STATE_BLOCK_NUM_DYN, HCA_COMPRESS_STATE_BLOCK_SIZE, HCA_COMPRESS_STATE_DIM], pl.FP32]],
     compress_state_block_table: pl.Tensor[[N_RANKS, KV_B_DYN, HCA_COMPRESS_STATE_MAX_BLOCKS], pl.INT32],
     kv_cache: pl.InOut[pl.Tensor[[N_RANKS, ORI_BLOCK_NUM_DYN, BLOCK_SIZE, 1, HEAD_DIM], pl.BF16]],
-    cmp_kv: pl.InOut[pl.Tensor[[N_RANKS, HCA_CMP_BLOCK_NUM_DYN, BLOCK_SIZE, 1, HEAD_DIM], pl.BF16]],
+    cmp_kv: pl.InOut[pl.Tensor[[N_RANKS, HCA_CMP_BLOCK_NUM_DYN, HCA_CMP_STORAGE_BLOCK_SIZE, 1, HEAD_DIM], pl.BF16]],
     cmp_block_table: pl.Tensor[[N_RANKS, HCA_B_DYN, HCA_CMP_TABLE_BLOCKS_DYN], pl.INT32],
     ori_slot_mapping: pl.Tensor[[N_RANKS, KV_T_DYN], pl.INT64],
     window_swa_indices: pl.Tensor[[N_RANKS, T_DYN, WIN], pl.INT32],
@@ -2482,7 +2483,7 @@ def main():
             "cmp_kv": mapped_pool_ratio_allclose(
                 "cmp_slot_mapping",
                 mapping_shape=mapping_shape,
-                block_size=BLOCK_SIZE,
+                block_size=HCA_CMP_STORAGE_BLOCK_SIZE,
                 leading_rank_axis=True,
                 pool_name="compressed KV cache",
                 atol=1e-3,

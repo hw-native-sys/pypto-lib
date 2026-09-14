@@ -250,10 +250,13 @@ PREFILL_TOKENS = PREFILL_BATCH * PREFILL_SEQ
 
 # Paging constants
 BLOCK_SIZE = 32                           # paged-KV page size / weight-quant block size
+COMPRESSED_BLOCK_TOKENS = 128            # source tokens per compressed cache page (same as MTP)
+HCA_CMP_STORAGE_BLOCK_SIZE = COMPRESSED_BLOCK_TOKENS // 128
 C4A_COMPRESSOR_BLOCK_SIZE = 2             # ratio-4 compressor state page size
 C128_COMPRESSOR_BLOCK_SIZE = 8            # ratio-128 compressor state page size
 KV_ORI_BLOCK_NUM = 512
 KV_CMP_BLOCK_NUM = 256
+HCA_KV_CMP_BLOCK_NUM = KV_CMP_BLOCK_NUM * BLOCK_SIZE // HCA_CMP_STORAGE_BLOCK_SIZE
 IDX_CACHE_BLOCK_NUM = 256
 
 # Persistent compressor state pool capacities shared by prefill and decode.

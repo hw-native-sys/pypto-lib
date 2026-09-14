@@ -13,6 +13,7 @@ import pypto.language as pl
 
 from config import (
     BLOCK_SIZE,
+    HCA_CMP_STORAGE_BLOCK_SIZE as CMP_STORAGE_BLOCK_SIZE,
     DECODE_BATCH,
     FLASH as M,
     HCA_STATE_PHYSICAL_BLOCKS,
@@ -99,7 +100,7 @@ START_POS = 0
 # paged KV cache
 SPARSE_ORI_MAX_BLOCKS = (MAX_SEQ_LEN + BLOCK_SIZE - 1) // BLOCK_SIZE
 SPARSE_ORI_BLOCK_NUM = KV_ORI_BLOCK_NUM
-SPARSE_CMP_MAX_BLOCKS = (MAX_SEQ_LEN // COMPRESS_RATIO + BLOCK_SIZE - 1) // BLOCK_SIZE
+SPARSE_CMP_MAX_BLOCKS = (MAX_SEQ_LEN // COMPRESS_RATIO + CMP_STORAGE_BLOCK_SIZE - 1) // CMP_STORAGE_BLOCK_SIZE
 SPARSE_CMP_BLOCK_NUM = SPARSE_CMP_MAX_BLOCKS
 HCA_ORI_BLOCK_NUM = SPARSE_ORI_BLOCK_NUM
 HCA_CMP_BLOCK_NUM = SPARSE_CMP_BLOCK_NUM
@@ -134,7 +135,7 @@ def prefill_attention_hca(
     kv_cache: pl.Tensor[[ORI_BLOCK_NUM_DYN, BLOCK_SIZE, 1, HEAD_DIM], pl.BF16],
     ori_slot_mapping: pl.Tensor[[T_DYN], pl.INT64],
     ori_block_table: pl.Tensor[[REQUESTS_DYN, SPARSE_ORI_MAX_BLOCKS], pl.INT32],
-    cmp_kv: pl.Tensor[[CMP_BLOCK_NUM_DYN, BLOCK_SIZE, 1, HEAD_DIM], pl.BF16],
+    cmp_kv: pl.Tensor[[CMP_BLOCK_NUM_DYN, CMP_STORAGE_BLOCK_SIZE, 1, HEAD_DIM], pl.BF16],
     cmp_block_table: pl.Tensor[[REQUESTS_DYN, SPARSE_CMP_MAX_BLOCKS], pl.INT32],
     position_ids: pl.Tensor[[T_DYN], pl.INT32],
     cmp_slot_mapping: pl.Tensor[[T_DYN], pl.INT64],
@@ -225,7 +226,7 @@ def prefill_attention_hca(
             swa_indices[idx_t : idx_t + 1, 0:WIN] = swa_row
 
     # Streaming-attention input publication fence.
-    cmp_cache_rows = pl.tensor.dim(cmp_kv, 0) * BLOCK_SIZE
+    cmp_cache_rows = pl.tensor.dim(cmp_kv, 0) * CMP_STORAGE_BLOCK_SIZE
     state_rows = pl.tensor.dim(compress_state, 0) * HCA_STATE_BLOCK_SIZE
     cmp_cache_flat = pl.reshape(cmp_kv, [cmp_cache_rows, HEAD_DIM])
     compress_state_flat = pl.reshape(compress_state, [state_rows, MAIN_COMPRESS_STATE_DIM])
@@ -324,7 +325,7 @@ def prefill_attention_hca_test(
     kv_cache: pl.InOut[pl.Tensor[[ORI_BLOCK_NUM_DYN, BLOCK_SIZE, 1, HEAD_DIM], pl.BF16]],
     ori_slot_mapping: pl.Tensor[[T_DYN], pl.INT64],
     ori_block_table: pl.Tensor[[REQUESTS_DYN, SPARSE_ORI_MAX_BLOCKS], pl.INT32],
-    cmp_kv: pl.InOut[pl.Tensor[[CMP_BLOCK_NUM_DYN, BLOCK_SIZE, 1, HEAD_DIM], pl.BF16]],
+    cmp_kv: pl.InOut[pl.Tensor[[CMP_BLOCK_NUM_DYN, CMP_STORAGE_BLOCK_SIZE, 1, HEAD_DIM], pl.BF16]],
     cmp_block_table: pl.Tensor[[REQUESTS_DYN, SPARSE_CMP_MAX_BLOCKS], pl.INT32],
     position_ids: pl.Tensor[[T_DYN], pl.INT32],
     cmp_slot_mapping: pl.Tensor[[T_DYN], pl.INT64],
@@ -493,9 +494,9 @@ def golden_prefill_attention_hca(tensors):
         request_ids = tensors["local_request_ids"]
         active = request_ids >= 0
         max_position = int(pos[active].max().item()) if active.any() else -1
-        max_visible_cmp = min((max_position + 1) // COMPRESS_RATIO, SPARSE_CMP_MAX_BLOCKS * BLOCK_SIZE)
+        max_visible_cmp = min((max_position + 1) // COMPRESS_RATIO, SPARSE_CMP_MAX_BLOCKS * CMP_STORAGE_BLOCK_SIZE)
         cmp_idx = torch.full((token_count, max(1, max_visible_cmp)), -1, dtype=torch.int32)
-        cmp_cap = SPARSE_CMP_MAX_BLOCKS * BLOCK_SIZE
+        cmp_cap = SPARSE_CMP_MAX_BLOCKS * CMP_STORAGE_BLOCK_SIZE
         for t in range(token_count):
             request_id = int(request_ids[t].item())
             if request_id < 0:
@@ -750,14 +751,14 @@ def build_tensor_specs(start_pos: int = START_POS, token_count: int = PREFILL_SE
         return table.unsqueeze(0)
 
     def init_cmp_kv():
-        cache = torch.zeros(HCA_CMP_BLOCK_NUM, BLOCK_SIZE, 1, HEAD_DIM)
-        cache_flat = cache.view(HCA_CMP_BLOCK_NUM * BLOCK_SIZE, HEAD_DIM)
+        cache = torch.zeros(HCA_CMP_BLOCK_NUM, CMP_STORAGE_BLOCK_SIZE, 1, HEAD_DIM)
+        cache_flat = cache.view(HCA_CMP_BLOCK_NUM * CMP_STORAGE_BLOCK_SIZE, HEAD_DIM)
         table = init_cmp_block_table()[0]
         completed = context_len // COMPRESS_RATIO
         if completed > 0:
             prefix_cmp = ((torch.rand(completed, HEAD_DIM) - 0.5) * 0.1).to(torch.bfloat16)
             for cmp_slot in range(completed):
-                row = cache_row_from_table(table, cmp_slot)
+                row = cache_row_from_table(table, cmp_slot, block_size=CMP_STORAGE_BLOCK_SIZE)
                 if row >= 0:
                     cache_flat[row] = prefix_cmp[cmp_slot]
         return cache
@@ -776,7 +777,7 @@ def build_tensor_specs(start_pos: int = START_POS, token_count: int = PREFILL_SE
         table = init_cmp_block_table()[0]
         records = cmp_write_records()
         for token_id, cmp_slot in records:
-            out[token_id] = cache_row_from_table(table, cmp_slot)
+            out[token_id] = cache_row_from_table(table, cmp_slot, block_size=CMP_STORAGE_BLOCK_SIZE)
         return out
 
     def init_state_slot_mapping():
@@ -844,7 +845,7 @@ def build_tensor_specs(start_pos: int = START_POS, token_count: int = PREFILL_SE
         TensorSpec("ori_block_table", [1, SPARSE_ORI_MAX_BLOCKS], torch.int32, init_value=init_ori_block_table),
         TensorSpec(
             "cmp_kv",
-            [HCA_CMP_BLOCK_NUM, BLOCK_SIZE, 1, HEAD_DIM],
+            [HCA_CMP_BLOCK_NUM, CMP_STORAGE_BLOCK_SIZE, 1, HEAD_DIM],
             torch.bfloat16,
             init_value=init_cmp_kv,
         ),
@@ -887,7 +888,7 @@ def prefill_attention_hca_cp_core(
     kv_cache: pl.Tensor[[ORI_BLOCK_NUM_DYN, BLOCK_SIZE, 1, HEAD_DIM], pl.BF16],
     ori_slot_mapping_full: pl.Tensor[[CP_KV_T_DYN], pl.INT64],
     ori_block_table: pl.Tensor[[REQUESTS_DYN, SPARSE_ORI_MAX_BLOCKS], pl.INT32],
-    cmp_kv: pl.Tensor[[CMP_BLOCK_NUM_DYN, BLOCK_SIZE, 1, HEAD_DIM], pl.BF16],
+    cmp_kv: pl.Tensor[[CMP_BLOCK_NUM_DYN, CMP_STORAGE_BLOCK_SIZE, 1, HEAD_DIM], pl.BF16],
     cmp_block_table: pl.Tensor[[REQUESTS_DYN, SPARSE_CMP_MAX_BLOCKS], pl.INT32],
     position_ids_local: pl.Tensor[[CP_Q_T_DYN], pl.INT32],
     position_ids_full: pl.Tensor[[CP_KV_T_DYN], pl.INT32],
@@ -964,7 +965,7 @@ def prefill_attention_hca_cp_core(
             swa_indices[idx_t : idx_t + 1, 0:WIN] = swa_row
 
     # Streaming-attention input publication fence.
-    cmp_cache_rows = pl.tensor.dim(cmp_kv, 0) * BLOCK_SIZE
+    cmp_cache_rows = pl.tensor.dim(cmp_kv, 0) * CMP_STORAGE_BLOCK_SIZE
     state_rows = pl.tensor.dim(compress_state, 0) * HCA_STATE_BLOCK_SIZE
     cmp_cache_flat = pl.reshape(cmp_kv, [cmp_cache_rows, HEAD_DIM])
     compress_state_flat = pl.reshape(compress_state, [state_rows, MAIN_COMPRESS_STATE_DIM])
@@ -1063,7 +1064,7 @@ def prefill_attention_hca_cp(
     kv_cache: pl.Tensor[[ORI_BLOCK_NUM_DYN, BLOCK_SIZE, 1, HEAD_DIM], pl.BF16],
     ori_slot_mapping_full: pl.Tensor[[CP_KV_T_DYN], pl.INT64],
     ori_block_table: pl.Tensor[[REQUESTS_DYN, SPARSE_ORI_MAX_BLOCKS], pl.INT32],
-    cmp_kv: pl.Tensor[[CMP_BLOCK_NUM_DYN, BLOCK_SIZE, 1, HEAD_DIM], pl.BF16],
+    cmp_kv: pl.Tensor[[CMP_BLOCK_NUM_DYN, CMP_STORAGE_BLOCK_SIZE, 1, HEAD_DIM], pl.BF16],
     cmp_block_table: pl.Tensor[[REQUESTS_DYN, SPARSE_CMP_MAX_BLOCKS], pl.INT32],
     position_ids_local: pl.Tensor[[CP_Q_T_DYN], pl.INT32],
     position_ids_full: pl.Tensor[[CP_KV_T_DYN], pl.INT32],
@@ -1187,7 +1188,7 @@ def prefill_attention_hca_cp_test(
     kv_cache: pl.InOut[pl.Tensor[[ORI_BLOCK_NUM_DYN, BLOCK_SIZE, 1, HEAD_DIM], pl.BF16]],
     ori_slot_mapping_full: pl.Tensor[[CP_KV_T_DYN], pl.INT64],
     ori_block_table: pl.Tensor[[REQUESTS_DYN, SPARSE_ORI_MAX_BLOCKS], pl.INT32],
-    cmp_kv: pl.InOut[pl.Tensor[[CMP_BLOCK_NUM_DYN, BLOCK_SIZE, 1, HEAD_DIM], pl.BF16]],
+    cmp_kv: pl.InOut[pl.Tensor[[CMP_BLOCK_NUM_DYN, CMP_STORAGE_BLOCK_SIZE, 1, HEAD_DIM], pl.BF16]],
     cmp_block_table: pl.Tensor[[REQUESTS_DYN, SPARSE_CMP_MAX_BLOCKS], pl.INT32],
     position_ids_local: pl.Tensor[[CP_Q_T_DYN], pl.INT32],
     position_ids_full: pl.Tensor[[CP_KV_T_DYN], pl.INT32],
@@ -1288,7 +1289,7 @@ def l3_prefill_attention_hca_cp(
     kv_cache: pl.InOut[pl.Tensor[[TP_SIZE, ORI_BLOCK_NUM_DYN, BLOCK_SIZE, 1, HEAD_DIM], pl.BF16]],
     ori_slot_mapping_full: pl.Tensor[[TP_SIZE, CP_KV_T_DYN], pl.INT64],
     ori_block_table: pl.Tensor[[TP_SIZE, REQUESTS_DYN, SPARSE_ORI_MAX_BLOCKS], pl.INT32],
-    cmp_kv: pl.InOut[pl.Tensor[[TP_SIZE, CMP_BLOCK_NUM_DYN, BLOCK_SIZE, 1, HEAD_DIM], pl.BF16]],
+    cmp_kv: pl.InOut[pl.Tensor[[TP_SIZE, CMP_BLOCK_NUM_DYN, CMP_STORAGE_BLOCK_SIZE, 1, HEAD_DIM], pl.BF16]],
     cmp_block_table: pl.Tensor[[TP_SIZE, REQUESTS_DYN, SPARSE_CMP_MAX_BLOCKS], pl.INT32],
     position_ids_local: pl.Tensor[[TP_SIZE, CP_Q_T_DYN], pl.INT32],
     position_ids_full: pl.Tensor[[TP_SIZE, CP_KV_T_DYN], pl.INT32],
@@ -1488,7 +1489,10 @@ def build_ragged2_cp_tensor_specs(tp_size: int = TP_SIZE):
         request_cmp_table = cmp_block_table[request : request + 1]
         request_state_table = compress_state_block_table[request : request + 1]
         ori_mapping = make_ori_slot_mapping(positions_2d, request_ori_table)
-        cmp_mapping = compressed_slot_mapping(positions_2d, request_cmp_table, compress_ratio=COMPRESS_RATIO)
+        cmp_mapping = compressed_slot_mapping(
+            positions_2d, request_cmp_table,
+            compress_ratio=COMPRESS_RATIO, block_size=CMP_STORAGE_BLOCK_SIZE,
+        )
         state_mapping = make_state_slot_mapping(positions_2d, request_state_table, state_block_size=state_size)
         ori_mappings.append(ori_mapping.reshape(-1))
         cmp_mappings.append(cmp_mapping.reshape(-1))
@@ -1505,7 +1509,7 @@ def build_ragged2_cp_tensor_specs(tp_size: int = TP_SIZE):
             row = cache_row_from_table(ori_block_table[request], position)
             kv_cache_flat[row] = ((torch.rand(HEAD_DIM) - 0.5) * 0.1).to(torch.bfloat16)
 
-    cmp_kv = torch.zeros(HCA_CMP_BLOCK_NUM, BLOCK_SIZE, 1, HEAD_DIM, dtype=torch.bfloat16)
+    cmp_kv = torch.zeros(HCA_CMP_BLOCK_NUM, CMP_STORAGE_BLOCK_SIZE, 1, HEAD_DIM, dtype=torch.bfloat16)
     compress_state_shape = (HCA_STATE_BLOCK_NUM, HCA_STATE_BLOCK_SIZE, MAIN_COMPRESS_STATE_DIM)
     compress_state = torch.zeros(compress_state_shape, dtype=torch.float32)
     compress_state_flat = compress_state.view(-1, MAIN_COMPRESS_STATE_DIM)

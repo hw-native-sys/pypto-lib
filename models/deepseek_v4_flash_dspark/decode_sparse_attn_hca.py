@@ -17,7 +17,8 @@ from config import (
     TP,
     DECODE_SEQ,
     BLOCK_SIZE,
-    KV_CMP_BLOCK_NUM,
+    HCA_CMP_STORAGE_BLOCK_SIZE as CMP_STORAGE_BLOCK_SIZE,
+    HCA_KV_CMP_BLOCK_NUM,
     KV_ORI_BLOCK_NUM,
 )
 
@@ -51,12 +52,12 @@ NEG_INF = -1.0e20
 # paged KV cache
 ORI_MAX_BLOCKS = (MAX_SEQ_LEN + BLOCK_SIZE - 1) // BLOCK_SIZE
 ORI_BLOCK_NUM = KV_ORI_BLOCK_NUM
-CMP_BLOCK_NUM = KV_CMP_BLOCK_NUM
+CMP_BLOCK_NUM = HCA_KV_CMP_BLOCK_NUM
 # The logical limit is per request; the physical pool is shared by the batch.
 # Host metadata builders below admit requests only while their summed page count
 # fits HCA_COMPRESSED_POOL_ROWS.
 HCA_MAX_COMPRESSED_ROWS = MAX_SEQ_LEN // COMPRESS_RATIO
-HCA_COMPRESSED_POOL_ROWS = CMP_BLOCK_NUM * BLOCK_SIZE
+HCA_COMPRESSED_POOL_ROWS = CMP_BLOCK_NUM * CMP_STORAGE_BLOCK_SIZE
 
 # tiling
 VALID_TOKEN_TILE = 8
@@ -74,7 +75,7 @@ QK_SCORE_READY_EVENT = 0
 QK_PROB_READY_EVENT = 1
 QK_PV_READY_EVENT = 2
 CMP_ATTN_K_TILE = 128 if TP == 1 else 32
-CMP_PAGES_PER_WORK = CMP_ATTN_K_TILE // BLOCK_SIZE
+CMP_PAGES_PER_WORK = CMP_ATTN_K_TILE // CMP_STORAGE_BLOCK_SIZE
 CMP_GATHER_WORK_TILE = max(1, 8 // CMP_PAGES_PER_WORK)
 ROPE_TILE = 16
 ROPE_INTERLEAVE_TILE = 2 * ROPE_TILE
@@ -92,7 +93,7 @@ if WIN != RAW_K_TILE:
     raise ValueError("HCA raw attention evaluates the window in one tile; WIN must equal RAW_K_TILE")
 if HCA_MAX_COMPRESSED_ROWS > HCA_COMPRESSED_POOL_ROWS:
     raise ValueError("HCA compressed rows exceed the configured pool")
-if ATTN_K_TILE % BLOCK_SIZE != 0:
+if CMP_ATTN_K_TILE % CMP_STORAGE_BLOCK_SIZE != 0:
     raise ValueError("HCA work must contain complete cache pages")
 if BLOCK_SIZE % GATHER_RUN_TILE != 0:
     raise ValueError("a contiguous gather run must stay inside one cache block")
@@ -139,7 +140,7 @@ def sparse_attn_hca(
     ori_kv: pl.Tensor[[ORI_BLOCK_NUM_DYN, BLOCK_SIZE, 1, HEAD_DIM], pl.BF16],
     window_swa_indices: pl.Tensor[[T_DYN, WIN], pl.INT32],
     window_swa_lens: pl.Tensor[[T_DYN], pl.INT32],
-    cmp_kv: pl.Tensor[[CMP_BLOCK_NUM_DYN, BLOCK_SIZE, 1, HEAD_DIM], pl.BF16],
+    cmp_kv: pl.Tensor[[CMP_BLOCK_NUM_DYN, CMP_STORAGE_BLOCK_SIZE, 1, HEAD_DIM], pl.BF16],
     cmp_block_table: pl.Tensor[[B_DYN, CMP_TABLE_BLOCKS_DYN], pl.INT32],
     position_ids: pl.Tensor[[T_DYN], pl.INT32],
     kv_seq_lens: pl.Tensor[[B_DYN], pl.INT32],
@@ -157,7 +158,7 @@ def sparse_attn_hca(
     cmp_table_blocks = pl.tensor.dim(cmp_block_table, 1)
     cmp_work_count = (cmp_table_blocks + CMP_PAGES_PER_WORK - 1) // CMP_PAGES_PER_WORK
     ori_kv_flat = pl.reshape(ori_kv, [ori_block_num * BLOCK_SIZE, HEAD_DIM])
-    cmp_kv_flat = pl.reshape(cmp_kv, [cmp_block_num * BLOCK_SIZE, HEAD_DIM])
+    cmp_kv_flat = pl.reshape(cmp_kv, [cmp_block_num * CMP_STORAGE_BLOCK_SIZE, HEAD_DIM])
     q_flat = pl.reshape(q, [t_dim * H, HEAD_DIM])
     request_count = pl.tensor.dim(cmp_block_table, 0)
     raw_gather_count = request_count
@@ -357,6 +358,7 @@ def sparse_attn_hca(
 
     with pl.scope():
         cmp_work_kv = pl.create_tensor([cmp_gather_count * CMP_ATTN_K_TILE, HEAD_DIM], dtype=pl.BF16)
+        # Each gather item has one writer and owns whole 64-byte lines for scalar mask stores.
         cmp_work_valid = pl.create_tensor([cmp_gather_count, CMP_ATTN_K_TILE], dtype=pl.FP32)
         cmp_gather_blocks = cmp_gather_count
         if cmp_table_blocks >= 8:
@@ -373,26 +375,33 @@ def sparse_attn_hca(
                 gather_work = gather_item - gather_request * cmp_work_count
                 gather_first_col = gather_work * CMP_PAGES_PER_WORK
                 gather_dst0 = gather_item * CMP_ATTN_K_TILE
-                for gather_page in pl.unroll(CMP_PAGES_PER_WORK):
+                for gather_page in pl.range(CMP_PAGES_PER_WORK):
                     gather_page_col = gather_first_col + gather_page
-                    gather_dst = gather_dst0 + gather_page * BLOCK_SIZE
-                    gather_valid_col = gather_page * BLOCK_SIZE
+                    gather_dst = gather_dst0 + gather_page * CMP_STORAGE_BLOCK_SIZE
+                    gather_valid_col = gather_page * CMP_STORAGE_BLOCK_SIZE
                     if CMP_PAGES_PER_WORK > 1:
-                        gather_valid_zero = pl.full([1, BLOCK_SIZE], dtype=pl.FP32, value=0.0)
-                        cmp_work_valid[gather_item : gather_item + 1, gather_valid_col : gather_valid_col + BLOCK_SIZE] = gather_valid_zero
-                    gather_zero_rows = pl.full([BLOCK_SIZE, HEAD_DIM], dtype=pl.BF16, value=0.0)
-                    cmp_work_kv[gather_dst : gather_dst + BLOCK_SIZE, 0:HEAD_DIM] = gather_zero_rows
+                        if CMP_STORAGE_BLOCK_SIZE == 1:
+                            # A one-row cache page needs a scalar mask, not a 4-byte Vec tile.
+                            pl.write(cmp_work_valid, [gather_item, gather_valid_col], 0.0)
+                        else:
+                            gather_valid_zero = pl.full([1, CMP_STORAGE_BLOCK_SIZE], dtype=pl.FP32, value=0.0)
+                            cmp_work_valid[gather_item : gather_item + 1, gather_valid_col : gather_valid_col + CMP_STORAGE_BLOCK_SIZE] = gather_valid_zero
+                    gather_zero_rows = pl.full([CMP_STORAGE_BLOCK_SIZE, HEAD_DIM], dtype=pl.BF16, value=0.0)
+                    cmp_work_kv[gather_dst : gather_dst + CMP_STORAGE_BLOCK_SIZE, 0:HEAD_DIM] = gather_zero_rows
                     if gather_page_col < cmp_table_blocks:
                         gather_page_i32 = pl.read(cmp_block_table, [gather_request, gather_page_col])
                         if gather_page_i32 >= 0:
                             if gather_page_i32 < cmp_block_num:
                                 gather_page_id = pl.cast(gather_page_i32, pl.INDEX)
-                                gather_src = gather_page_id * BLOCK_SIZE
-                                gather_page_rows = cmp_kv_flat[gather_src : gather_src + BLOCK_SIZE, 0:HEAD_DIM]
-                                cmp_work_kv[gather_dst : gather_dst + BLOCK_SIZE, 0:HEAD_DIM] = gather_page_rows
+                                gather_src = gather_page_id * CMP_STORAGE_BLOCK_SIZE
+                                gather_page_rows = cmp_kv_flat[gather_src : gather_src + CMP_STORAGE_BLOCK_SIZE, 0:HEAD_DIM]
+                                cmp_work_kv[gather_dst : gather_dst + CMP_STORAGE_BLOCK_SIZE, 0:HEAD_DIM] = gather_page_rows
                                 if CMP_PAGES_PER_WORK > 1:
-                                    gather_valid_one = pl.full([1, BLOCK_SIZE], dtype=pl.FP32, value=1.0)
-                                    cmp_work_valid[gather_item : gather_item + 1, gather_valid_col : gather_valid_col + BLOCK_SIZE] = gather_valid_one
+                                    if CMP_STORAGE_BLOCK_SIZE == 1:
+                                        pl.write(cmp_work_valid, [gather_item, gather_valid_col], 1.0)
+                                    else:
+                                        gather_valid_one = pl.full([1, CMP_STORAGE_BLOCK_SIZE], dtype=pl.FP32, value=1.0)
+                                        cmp_work_valid[gather_item : gather_item + 1, gather_valid_col : gather_valid_col + CMP_STORAGE_BLOCK_SIZE] = gather_valid_one
 
         # Seed the maximum from the sink and publish one compressed state per query.
         # The sink contributes to the denominator only in the final raw/compressed merge.
@@ -665,7 +674,7 @@ def sparse_attn_hca_tp1(
     ori_kv: pl.Tensor[[ORI_BLOCK_NUM_DYN, BLOCK_SIZE, 1, HEAD_DIM], pl.BF16],
     window_swa_indices: pl.Tensor[[T_DYN, WIN], pl.INT32],
     window_swa_lens: pl.Tensor[[T_DYN], pl.INT32],
-    cmp_kv: pl.Tensor[[CMP_BLOCK_NUM_DYN, BLOCK_SIZE, 1, HEAD_DIM], pl.BF16],
+    cmp_kv: pl.Tensor[[CMP_BLOCK_NUM_DYN, CMP_STORAGE_BLOCK_SIZE, 1, HEAD_DIM], pl.BF16],
     cmp_block_table: pl.Tensor[[B_DYN, CMP_TABLE_BLOCKS_DYN], pl.INT32],
     position_ids: pl.Tensor[[T_DYN], pl.INT32],
     kv_seq_lens: pl.Tensor[[B_DYN], pl.INT32],
@@ -770,7 +779,7 @@ def sparse_attn_hca_test(
     ori_kv: pl.Tensor[[ORI_BLOCK_NUM_DYN, BLOCK_SIZE, 1, HEAD_DIM], pl.BF16],
     window_swa_indices: pl.Tensor[[T_DYN, WIN], pl.INT32],
     window_swa_lens: pl.Tensor[[T_DYN], pl.INT32],
-    cmp_kv: pl.Tensor[[CMP_BLOCK_NUM_DYN, BLOCK_SIZE, 1, HEAD_DIM], pl.BF16],
+    cmp_kv: pl.Tensor[[CMP_BLOCK_NUM_DYN, CMP_STORAGE_BLOCK_SIZE, 1, HEAD_DIM], pl.BF16],
     cmp_block_table: pl.Tensor[[B_DYN, CMP_TABLE_BLOCKS_DYN], pl.INT32],
     position_ids: pl.Tensor[[T_DYN], pl.INT32],
     kv_seq_lens: pl.Tensor[[B_DYN], pl.INT32],
@@ -850,12 +859,12 @@ def golden_sparse_attn(tensors):
             for lane in range(ATTN_K_TILE):
                 logical_row = row_begin + lane
                 if lane < valid_rows:
-                    logical_page = logical_row // BLOCK_SIZE
+                    logical_page = logical_row // CMP_STORAGE_BLOCK_SIZE
                     physical_page = -1
                     if logical_page < cmp_block_table.shape[1]:
                         physical_page = int(cmp_block_table[b, logical_page].item())
                     if 0 <= physical_page < cmp_kv.shape[0]:
-                        rows.append(cmp_kv[physical_page, logical_row % BLOCK_SIZE, 0])
+                        rows.append(cmp_kv[physical_page, logical_row % CMP_STORAGE_BLOCK_SIZE, 0])
                         valid.append(True)
                         continue
                 rows.append(torch.zeros(HEAD_DIM, dtype=cmp_kv.dtype))
@@ -945,7 +954,7 @@ def build_tensor_specs(
             f"compressed_rows must be in [0, {HCA_MAX_COMPRESSED_ROWS}], "
             f"got {compressed_rows_by_request.tolist()}",
         )
-    pages_per_request = ((compressed_rows_by_request.to(torch.int64) + BLOCK_SIZE - 1) // BLOCK_SIZE)
+    pages_per_request = ((compressed_rows_by_request.to(torch.int64) + CMP_STORAGE_BLOCK_SIZE - 1) // CMP_STORAGE_BLOCK_SIZE)
     table_blocks = max(int(pages_per_request.max().item()), 1)
     required_pages = int(pages_per_request.sum().item())
     if required_pages > CMP_BLOCK_NUM:
@@ -1000,7 +1009,7 @@ def build_tensor_specs(
 
     def init_cmp_kv():
         """Initialize the compressed-cache KV pages."""
-        return torch.rand(CMP_BLOCK_NUM, BLOCK_SIZE, 1, HEAD_DIM) - 0.5
+        return torch.rand(CMP_BLOCK_NUM, CMP_STORAGE_BLOCK_SIZE, 1, HEAD_DIM) - 0.5
 
     def init_attn_sink():
         """Initialize the per-head sink logits to zero."""
@@ -1053,7 +1062,7 @@ def build_tensor_specs(
         TensorSpec("ori_kv", [ORI_BLOCK_NUM, BLOCK_SIZE, 1, HEAD_DIM], torch.bfloat16, init_value=init_ori_kv),
         TensorSpec("window_swa_indices", [tokens, WIN], torch.int32, init_value=init_window_swa_indices),
         TensorSpec("window_swa_lens", [tokens], torch.int32, init_value=init_window_swa_lens),
-        TensorSpec("cmp_kv", [CMP_BLOCK_NUM, BLOCK_SIZE, 1, HEAD_DIM], torch.bfloat16, init_value=init_cmp_kv),
+        TensorSpec("cmp_kv", [CMP_BLOCK_NUM, CMP_STORAGE_BLOCK_SIZE, 1, HEAD_DIM], torch.bfloat16, init_value=init_cmp_kv),
         TensorSpec("cmp_block_table", [batch, table_blocks], torch.int32, init_value=init_cmp_block_table),
         TensorSpec("position_ids", [tokens], torch.int32, init_value=init_position_ids),
         TensorSpec("kv_seq_lens", [batch], torch.int32, init_value=init_kv_seq_lens),

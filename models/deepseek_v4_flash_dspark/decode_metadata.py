@@ -16,6 +16,7 @@ import pypto.language as pl
 
 from config import (
     BLOCK_SIZE,
+    HCA_CMP_STORAGE_BLOCK_SIZE,
     C4A_COMPRESSOR_BLOCK_SIZE,
     C128_COMPRESSOR_BLOCK_SIZE,
     CSA_INNER_STATE_PHYSICAL_BLOCKS,
@@ -169,11 +170,11 @@ def build_decode_metadata(
                     cmp_block_table,
                     [
                         request,
-                        pl.cast(logical // BLOCK_SIZE % count, pl.INDEX),
+                        pl.cast(logical // HCA_CMP_STORAGE_BLOCK_SIZE % count, pl.INDEX),
                     ],
                 )
                 hca_cmp_slot = pl.cast(
-                    physical_block * BLOCK_SIZE + logical % BLOCK_SIZE,
+                    physical_block * HCA_CMP_STORAGE_BLOCK_SIZE + logical % HCA_CMP_STORAGE_BLOCK_SIZE,
                     pl.INT64,
                 )
             pl.write(hca_cmp_slot_mapping, [token], hca_cmp_slot)
@@ -429,9 +430,9 @@ def golden_decode_metadata(tensors):
         if (position + 1) % 128 == 0:
             logical = position // 128
             count = int(counts[request, GROUP_CMP])
-            block_index, offset = divmod(logical, BLOCK_SIZE)
+            block_index, offset = divmod(logical, HCA_CMP_STORAGE_BLOCK_SIZE)
             tensors["hca_cmp_slot_mapping"][token] = (
-                int(cmp_table[request, block_index % count]) * BLOCK_SIZE + offset
+                int(cmp_table[request, block_index % count]) * HCA_CMP_STORAGE_BLOCK_SIZE + offset
             )
 
         tensors["csa_cmp_slot_mapping"][token] = -1

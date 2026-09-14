@@ -139,6 +139,7 @@ IDX_PAD = moe_module.IDX_PAD
 N_ROUTES = moe_module.N_ROUTES
 
 HCA_B_DYN = hca.B_DYN
+HCA_CMP_STORAGE_BLOCK_SIZE = hca.CMP_STORAGE_BLOCK_SIZE
 HCA_CMP_TABLE_BLOCKS_DYN = hca.CMP_TABLE_BLOCKS_DYN
 HCA_B = hca.B
 HCA_MAIN_OUT_DIM = hca.MAIN_OUT_DIM
@@ -356,7 +357,7 @@ def decode_fwd(
     hca_cmp_norm_w: pl.Tensor[[FWD_HCA_WEIGHT_BANK_SIZE * HEAD_DIM], pl.BF16],
     hca_compress_state: pl.InOut[pl.Tensor[[FWD_HCA_STATE_BLOCKS_DYN, HCA_COMPRESS_STATE_BLOCK_SIZE, HCA_COMPRESS_STATE_DIM], pl.FP32]],
     hca_compress_state_block_table: pl.Tensor[[KV_B_DYN, HCA_COMPRESS_STATE_MAX_BLOCKS], pl.INT32],
-    hca_cmp_kv: pl.InOut[pl.Tensor[[FWD_HCA_CMP_BLOCKS_DYN, BLOCK_SIZE, 1, HEAD_DIM], pl.BF16]],
+    hca_cmp_kv: pl.InOut[pl.Tensor[[FWD_HCA_CMP_BLOCKS_DYN, HCA_CMP_STORAGE_BLOCK_SIZE, 1, HEAD_DIM], pl.BF16]],
     hca_cmp_block_table: pl.Tensor[[HCA_B_DYN, HCA_CMP_TABLE_BLOCKS_DYN], pl.INT32],
     hca_ori_slot_mapping: pl.Tensor[[KV_T_DYN], pl.INT64],
     hca_window_swa_indices: pl.Tensor[[T_DYN, WIN], pl.INT32],
@@ -908,7 +909,7 @@ def decode_fwd(
             routed_w2_layer_hca: pl.Tensor[[N_LOCAL, D, MOE_INTER], pl.INT8] = pl.slice(routed_w2, [N_LOCAL, D, MOE_INTER], [hca_weight_layer * N_LOCAL, 0, 0])
             raw_kv_layer_hca = pl.slice(raw_kv_pool, [raw_blocks_per_layer, BLOCK_SIZE, 1, HEAD_DIM], [hca_model_layer * raw_blocks_per_layer, 0, 0, 0])
             hca_state_layer_hca = pl.slice(hca_compress_state, [hca_state_blocks_per_layer, HCA_COMPRESS_STATE_BLOCK_SIZE, HCA_COMPRESS_STATE_DIM], [ordinal * hca_state_blocks_per_layer, 0, 0])
-            hca_cmp_kv_layer_hca = pl.slice(hca_cmp_kv, [hca_cmp_blocks_per_layer, BLOCK_SIZE, 1, HEAD_DIM], [ordinal * hca_cmp_blocks_per_layer, 0, 0, 0])
+            hca_cmp_kv_layer_hca = pl.slice(hca_cmp_kv, [hca_cmp_blocks_per_layer, HCA_CMP_STORAGE_BLOCK_SIZE, 1, HEAD_DIM], [ordinal * hca_cmp_blocks_per_layer, 0, 0, 0])
             hc_attn_scale_layer_hca = pl.slice(hc_attn_scale, [3], [hca_weight_layer * 3])
             hc_attn_base_layer_hca = pl.slice(hc_attn_base, [MIX_HC], [hca_weight_layer * MIX_HC])
             attn_norm_w_layer_hca = pl.slice(attn_norm_w, [D], [hca_weight_layer * D])
@@ -1318,7 +1319,7 @@ def l3_decode_fwd_device_state(
     hca_cmp_norm_w: pl.Tensor[[N_RANKS, FWD_HCA_WEIGHT_BANK_SIZE * HEAD_DIM], pl.BF16],
     hca_compress_state: pl.InOut[pl.Tensor[[N_RANKS, FWD_HCA_STATE_BLOCKS_DYN, HCA_COMPRESS_STATE_BLOCK_SIZE, HCA_COMPRESS_STATE_DIM], pl.FP32]],
     hca_compress_state_block_table: pl.Tensor[[N_RANKS, KV_B_DYN, HCA_COMPRESS_STATE_MAX_BLOCKS], pl.INT32],
-    hca_cmp_kv: pl.InOut[pl.Tensor[[N_RANKS, FWD_HCA_CMP_BLOCKS_DYN, BLOCK_SIZE, 1, HEAD_DIM], pl.BF16]],
+    hca_cmp_kv: pl.InOut[pl.Tensor[[N_RANKS, FWD_HCA_CMP_BLOCKS_DYN, HCA_CMP_STORAGE_BLOCK_SIZE, 1, HEAD_DIM], pl.BF16]],
     hca_cmp_block_table: pl.Tensor[[N_RANKS, HCA_B_DYN, HCA_CMP_TABLE_BLOCKS_DYN], pl.INT32],
     hca_ori_slot_mapping: pl.Tensor[[N_RANKS, KV_T_DYN], pl.INT64],
     hca_window_swa_indices: pl.Tensor[[N_RANKS, T_DYN, WIN], pl.INT32],
