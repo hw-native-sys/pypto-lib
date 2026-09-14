@@ -9,7 +9,8 @@
 """DeepSeek-V4 MoE routed local expert compute (decode, EP single-card).
 
 Only the routed-expert path lives here. The shared expert was split out
-into ``expert_shared.py``; both kernels are composed in ``moe.py``.
+into ``expert_shared.py``; both kernels are composed in ``decode_moe.py`` and
+``prefill_moe.py``.
 """
 
 

@@ -47,7 +47,7 @@ from lm_head import (
     golden_lm_head,
     lm_head_with_sampling,
 )
-from moe import (
+from decode_moe import (
     AUX_PAD,
     D,
     HC_DIM,
@@ -939,7 +939,7 @@ def main():
     )
     parser.add_argument(
         "--ep", type=int, default=N_RANKS, choices=[2, 4, 8],
-        help="EP world size / rank count (parsed at import by moe).",
+        help="EP world size / rank count (parsed at import by decode_moe).",
     )
     parser.add_argument(
         "--tp", type=int, default=LM_HEAD_TP_SIZE, choices=[2, 4, 8, 16],

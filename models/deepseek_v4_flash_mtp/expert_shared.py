@@ -10,7 +10,7 @@
 
 Split out of ``expert_routed.py``: only the shared-expert FFN path lives here.
 The routed local experts are computed by ``expert_routed.py``; both kernels
-are composed inside ``moe.py``.
+are composed inside ``decode_moe.py`` and ``prefill_moe.py``.
 
 The shared expert reuses the per-token INT8 quant already produced by
 ``gate`` (``x_norm_i8`` + ``x_norm_scale``) — the same INT8 view

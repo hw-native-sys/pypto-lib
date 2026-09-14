@@ -30,7 +30,7 @@ from rmsnorm import rms_norm
 
 # decode_fwd is self-contained: it imports kernels, constants, and per-kind
 # spec builders directly from the leaf modules (no dependency on decode_layer).
-# Import order matches decode_layer: attention kinds, then config, then moe.
+# Import order matches decode_layer: attention kinds, then config, then decode_moe.
 from decode_swa import (
     B,
     BLOCK_SIZE,
@@ -95,7 +95,7 @@ from decode_prepare import (
     gather_decode_rope_rows,
     pack_x_hc,
 )
-from moe import (
+from decode_moe import (
     AUX_PAD,
     IDX_PAD,
     MOE_INTER,
@@ -1871,7 +1871,7 @@ def main():
 
     parser = argparse.ArgumentParser(description="DeepSeek-V4 Flash packed single-token decode forward driver.")
     parser.add_argument("-p", "--platform", type=str, default="a2a3", choices=["a2a3", "a5"])
-    parser.add_argument("--ep", type=int, default=N_RANKS, choices=[2, 4, 8], help="EP world size / rank count (parsed at import by moe)")
+    parser.add_argument("--ep", type=int, default=N_RANKS, choices=[2, 4, 8], help="EP world size / rank count (parsed at import by decode_moe)")
     parser.add_argument("--tp", type=int, default=LM_HEAD_TP_SIZE, choices=[2, 4, 8, 16], help="LM-head TP world size; must be <= --ep")
     parser.add_argument("-d", "--device", type=str, default=",".join(str(i) for i in range(N_RANKS)), help=f"comma-separated device ids; need at least {N_RANKS}")
     parser.add_argument(

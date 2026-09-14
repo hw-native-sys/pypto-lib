@@ -79,7 +79,7 @@ from decode_csa import (
     golden_attention_csa,
 )
 from config import DECODE_START_POS, FLASH as MODEL_CONFIG
-from moe import (
+from decode_moe import (
     AUX_PAD,
     IDX_PAD,
     MOE_INTER,
@@ -898,7 +898,7 @@ if __name__ == "__main__":
     parser.add_argument("-p", "--platform", type=str, default="a2a3",
                         choices=["a2a3", "a2a3sim", "a5", "a5sim"])
     parser.add_argument("--ep", type=int, default=N_RANKS, choices=[2, 4, 8],
-                        help="EP world size / rank count (parsed at import by moe)")
+                        help="EP world size / rank count (parsed at import by decode_moe)")
     parser.add_argument("-d", "--device", type=str,
                         default=",".join(str(i) for i in range(N_RANKS)),
                         help=f"comma-separated device ids; need at least {N_RANKS}")

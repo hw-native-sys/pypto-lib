@@ -53,7 +53,7 @@ says otherwise — commonly EP2 for the distributed DeepSeek entries.
 Multi-card kernels use HCCL, which silent-crashes inside docker: run them on
 the host, in a shell that has entered the Python environment and sourced
 CANN's `set_env.sh`, e.g.
-`python models/deepseek_v4_flash_mtp/moe.py -p a2a3 --ep 2 -d 0,1`. Ring
+`python models/deepseek_v4_flash_mtp/decode_moe.py -p a2a3 --ep 2 -d 0,1`. Ring
 sizing is not part of that environment — it is per task now, see
 [Ring Heap and Scope Stats](../debug-and-tune/ring-heap-and-scope-stats.md).
 
