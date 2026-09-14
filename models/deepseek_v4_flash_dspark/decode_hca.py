@@ -383,13 +383,14 @@ def decode_hca(
                     stream_l_scaled = pl.mul(stream_alpha, stream_l)
                     stream_cmp_l_scaled = pl.mul(stream_beta, stream_cmp_l)
                     stream_l = pl.add(stream_l_scaled, stream_cmp_l_scaled)
-                    stream_o_scaled = pl.row_expand_mul(stream_o, stream_alpha)
-                    stream_cmp_o_scaled = pl.row_expand_mul(stream_cmp_o, stream_beta)
-                    stream_o = pl.add(stream_o_scaled, stream_cmp_o_scaled)
                     stream_m = stream_m_new
                     stream_sink_tile = pl.add(pl.sub(stream_m, stream_m), stream_sink)
                     stream_denom = pl.add(stream_l, pl.exp(pl.sub(stream_sink_tile, stream_m)))
-                    stream_output = pl.row_expand_div(stream_o, stream_denom)
+                    stream_alpha_norm = pl.div(stream_alpha, stream_denom)
+                    stream_beta_norm = pl.div(stream_beta, stream_denom)
+                    stream_o_scaled = pl.row_expand_mul(stream_o, stream_alpha_norm)
+                    stream_cmp_o_scaled = pl.row_expand_mul(stream_cmp_o, stream_beta_norm)
+                    stream_output = pl.add(stream_o_scaled, stream_cmp_o_scaled)
                     stream_bf16 = pl.cast(stream_output, target_type=pl.BF16, mode="rint")
                     stream_rope = stream_output[0:H_TILE, NOPE_DIM:HEAD_DIM]
                     stream_cos_il = pl.load(rope_cos_il, [merge_t, 0], [1, ROPE_HEAD_DIM])
