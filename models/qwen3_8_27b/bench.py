@@ -46,7 +46,9 @@ STAGES = ("chunk_cumsum", "scaled_dot_kkt", "solve_tril", "wy_fast",
           "chunk_h", "chunk_o")
 # The block's other kernels (Q4), off by default: `--stages gated_rmsnorm`. Their
 # shape is (t, h) only, and their output names come from the module's OUTPUTS.
-BLOCK_KERNELS = ("short_conv", "qk_norm_gate", "gated_rmsnorm")
+# In the order the block runs them.
+BLOCK_KERNELS = ("quant_x", "in_proj_qkv", "in_proj_z", "in_proj_ab", "short_conv",
+                 "qk_norm_gate", "gated_rmsnorm", "out_proj")
 
 from config import GDN_TILING, QWEN3_8_27B
 
@@ -102,7 +104,9 @@ def bench_stage(stage: str, t: int, h: int, hg: int, platform: str, device: int,
 
         kw = dict(h=h) if "h" in inspect.signature(mod.build_kernel).parameters else {}
         fn = mod.build_kernel(t=t, **kw)
-        specs = mod.build_tensor_specs(t=t, **kw)
+        spec_kw = {k: v for k, v in kw.items()
+                   if k in inspect.signature(mod.build_tensor_specs).parameters}
+        specs = mod.build_tensor_specs(t=t, **spec_kw)
     else:
         kernel_kw = dict(hg=hg) if stage in GQA_STAGES else {}
         fn = mod.build_kernel(t=t, h=h, d=D, chunk=CHUNK, **kernel_kw)
