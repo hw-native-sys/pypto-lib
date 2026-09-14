@@ -45,6 +45,7 @@ around it.
 | [wy_fast.py](../../../models/qwen3_8_27b/wy_fast.py) | the WY representation, `W` and `U` |
 | [chunk_h.py](../../../models/qwen3_8_27b/chunk_h.py) | the inter-chunk state recurrence and `V_new` |
 | [chunk_o.py](../../../models/qwen3_8_27b/chunk_o.py) | the chunk output, inter-chunk plus intra-chunk |
+| [short_conv.py](../../../models/qwen3_8_27b/short_conv.py) | the depthwise causal convolution over the q/k/v channels, with silu |
 | [gated_rmsnorm.py](../../../models/qwen3_8_27b/gated_rmsnorm.py) | the gated RMSNorm after the delta rule, and the per-token INT8 quantisation `out_proj` reads |
 
 `solve_tril` is the delta-rule triangular inversion of
@@ -64,10 +65,28 @@ difference from running the stages back to back is that `solve_tril` writes
 `A_inv` as FP16 directly instead of FP32 for a host-side narrowing, since FP16 is
 what its consumer reads.
 
-`gdn_layer.py` is the delta rule alone. Of the rest of the block, the gated
-RMSNorm is built ([gated_rmsnorm.py](../../../models/qwen3_8_27b/gated_rmsnorm.py),
-a standalone kernel not yet composed into a layer); the four input projections,
-the depthwise convolution over q/k/v and `out_proj` are not.
+`gdn_layer.py` is the delta rule alone. Of the rest of the block, the short
+convolution and the gated RMSNorm are built, as standalone kernels not yet
+composed into a layer; the four input projections, the qk-norm and gate, and
+`out_proj` are not.
+
+## The short convolution
+
+[short_conv.py](../../../models/qwen3_8_27b/short_conv.py) is the depthwise
+causal convolution that follows the q/k/v projection: four taps over the token
+axis per channel, fp32 accumulate, silu fused in the epilogue, no bias.
+
+Its input is `[T + K - 1, C]`, carrying the K-1 tokens before the sequence in
+its first rows. That is what keeps every tap offset non-negative, so no block
+needs a head-padding special case; for prefill those rows are zero, and they
+are where a decode cache would sit.
+
+On a2a3 at T = 8192 over all 10240 channels, 50 rounds: **731 us**, 459 GB/s of
+GM traffic against a measured copy roof of 1236 GB/s. CANN's own depthwise
+`conv1d` plus silu takes 1532 us channels-first and 2597 us once the transpose
+our token-major layout would need is charged, so 2.1x and 3.6x. Accuracy
+against the float64 reference is max abs 2.6e-02 on the real layer, inside the
+6e-02 the hand-written PTO-ISA kernel's own tests use for bf16.
 
 ## The gated RMSNorm
 
