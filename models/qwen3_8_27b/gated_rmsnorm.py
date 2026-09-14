@@ -62,27 +62,31 @@ def build_kernel(t: int = T, h: int = H, d: int = D, eps: float = EPS,
         y_q: pl.Out[pl.Tensor[[t, h * d], pl.INT8]],
         y_scale: pl.Out[pl.Tensor[[t], pl.FP32]],
     ):
-        o_rows = pl.reshape(o, [t * h, d])
-        z_rows = pl.reshape(z, [t * h, d])
-        q_rows = pl.reshape(y_q, [t * h, d])
+        o_flat = pl.reshape(o, [t, h * d])
+        z_flat = pl.reshape(z, [t, h * d])
         for blk in pl.spmd(t // TOK_TILE, name_hint="gated_rmsnorm"):
             t0 = blk * TOK_TILE
             w_row = pl.cast(pl.reshape(norm_w[:], [1, d]), target_type=pl.FP32)
             ones_h8 = pl.full([h, 8], dtype=pl.FP32, value=1.0)   # broadcasts the amax partials
             for i in pl.unroll(TOK_TILE):
-                r0 = (t0 + i) * h
-                of = pl.cast(o_rows[r0 : r0 + h, :], target_type=pl.FP32)
+                r0 = t0 + i
+                # one token is h*d contiguous values: load the whole run, then take the
+                # [h, d] view the norm reduces over. Loading [h, d] directly issues h
+                # separate row transfers of d elements.
+                of_run = pl.cast(o_flat[r0 : r0 + 1, :], target_type=pl.FP32)
+                of = pl.reshape(of_run, [h, d])
                 inv_rms = pl.rsqrt(pl.add(pl.mul(pl.row_sum(pl.mul(of, of)), 1.0 / d), eps),
                                    high_precision=True)
-                # the module narrows the normed values, then the weighted ones
-                normed = pl.cast(pl.cast(pl.row_expand_mul(of, inv_rms),
-                                         target_type=pl.BF16, mode="rint"), target_type=pl.FP32)
-                weighted = pl.cast(pl.cast(pl.col_expand_mul(normed, w_row),
-                                           target_type=pl.BF16, mode="rint"), target_type=pl.FP32)
+                # the module narrows the normed values, then the weighted ones; both stay
+                # narrow until used, the fp32 copy of a bf16-rounded value being only buffer
+                normed_bf = pl.cast(pl.row_expand_mul(of, inv_rms), target_type=pl.BF16, mode="rint")
+                normed = pl.cast(normed_bf, target_type=pl.FP32)
+                weighted_bf = pl.cast(pl.col_expand_mul(normed, w_row), target_type=pl.BF16, mode="rint")
 
-                zf = pl.cast(z_rows[r0 : r0 + h, :], target_type=pl.FP32)
+                zf_run = pl.cast(z_flat[r0 : r0 + 1, :], target_type=pl.FP32)
+                zf = pl.reshape(zf_run, [h, d])
                 gate = pl.mul(zf, pl.recip(pl.add(pl.exp(pl.neg(zf)), 1.0)))
-                y = pl.mul(weighted, gate)
+                y = pl.mul(pl.cast(weighted_bf, target_type=pl.FP32), gate)
 
                 # The token's amax must reach every row of the [h, d] tile, and it
                 # cannot be carried through a scalar: a [1, 1] reduction result is a
@@ -99,14 +103,15 @@ def build_kernel(t: int = T, h: int = H, d: int = D, eps: float = EPS,
                 part_8 = pl.maximum(pl.col_max(pl.reshape(pl.col_max(pl.abs(y)), [d // 8, 8])),
                                     pl.full([1, 8], dtype=pl.FP32, value=AMAX_EPS))
                 amax = pl.row_max(pl.col_expand_mul(ones_h8, part_8))
-                pl.write(y_scale, [t0 + i], pl.read(amax, [0, 0]) / SCALE_MAX)
+                pl.write(y_scale, [r0], pl.read(amax, [0, 0]) / SCALE_MAX)
 
                 # No clamp: amax is the tile's own maximum, so |y| * SCALE_MAX / amax
                 # <= 127 and a +-127 clamp cannot bind. The cast rounds to nearest;
                 # an FP16 hop before INT8 would truncate instead, which is a silent
                 # one-step shift on 39% of the output.
                 q = pl.row_expand_mul(y, pl.mul(pl.recip(amax, high_precision=True), SCALE_MAX))
-                q_rows[r0 : r0 + h, :] = pl.cast(q, target_type=pl.INT8, mode="rint")
+                q_i8 = pl.cast(q, target_type=pl.INT8, mode="rint")
+                y_q[r0 : r0 + 1, :] = pl.reshape(q_i8, [1, h * d])
         return y_q
 
     @jit
@@ -116,26 +121,27 @@ def build_kernel(t: int = T, h: int = H, d: int = D, eps: float = EPS,
         norm_w: pl.Tensor[[d], pl.BF16],
         y: pl.Out[pl.Tensor[[t, h * d], pl.BF16]],
     ):
-        o_rows = pl.reshape(o, [t * h, d])
-        z_rows = pl.reshape(z, [t * h, d])
-        y_rows = pl.reshape(y, [t * h, d])
+        o_flat = pl.reshape(o, [t, h * d])
+        z_flat = pl.reshape(z, [t, h * d])
         for blk in pl.spmd(t // TOK_TILE, name_hint="gated_rmsnorm_bf16"):
             t0 = blk * TOK_TILE
             w_row = pl.cast(pl.reshape(norm_w[:], [1, d]), target_type=pl.FP32)
             for i in pl.unroll(TOK_TILE):
-                r0 = (t0 + i) * h
-                of = pl.cast(o_rows[r0 : r0 + h, :], target_type=pl.FP32)
+                r0 = t0 + i
+                of_run = pl.cast(o_flat[r0 : r0 + 1, :], target_type=pl.FP32)
+                of = pl.reshape(of_run, [h, d])
                 inv_rms = pl.rsqrt(pl.add(pl.mul(pl.row_sum(pl.mul(of, of)), 1.0 / d), eps),
                                    high_precision=True)
-                normed = pl.cast(pl.cast(pl.row_expand_mul(of, inv_rms),
-                                         target_type=pl.BF16, mode="rint"), target_type=pl.FP32)
-                weighted = pl.cast(pl.cast(pl.col_expand_mul(normed, w_row),
-                                           target_type=pl.BF16, mode="rint"), target_type=pl.FP32)
+                normed_bf = pl.cast(pl.row_expand_mul(of, inv_rms), target_type=pl.BF16, mode="rint")
+                normed = pl.cast(normed_bf, target_type=pl.FP32)
+                weighted_bf = pl.cast(pl.col_expand_mul(normed, w_row), target_type=pl.BF16, mode="rint")
 
-                zf = pl.cast(z_rows[r0 : r0 + h, :], target_type=pl.FP32)
+                zf_run = pl.cast(z_flat[r0 : r0 + 1, :], target_type=pl.FP32)
+                zf = pl.reshape(zf_run, [h, d])
                 gate = pl.mul(zf, pl.recip(pl.add(pl.exp(pl.neg(zf)), 1.0)))
-                y_rows[r0 : r0 + h, :] = pl.cast(pl.mul(weighted, gate),
-                                                 target_type=pl.BF16, mode="rint")
+                y_bf = pl.cast(pl.mul(pl.cast(weighted_bf, target_type=pl.FP32), gate),
+                               target_type=pl.BF16, mode="rint")
+                y[r0 : r0 + 1, :] = pl.reshape(y_bf, [1, h * d])
         return y
 
     return gdn_gated_rmsnorm if quant else gdn_gated_rmsnorm_bf16
