@@ -46,7 +46,7 @@ STAGES = ("chunk_cumsum", "scaled_dot_kkt", "solve_tril", "wy_fast",
           "chunk_h", "chunk_o")
 # The block's other kernels (Q4), off by default: `--stages gated_rmsnorm`. Their
 # shape is (t, h) only, and their output names come from the module's OUTPUTS.
-BLOCK_KERNELS = ("short_conv", "gated_rmsnorm")
+BLOCK_KERNELS = ("short_conv", "qk_norm_gate", "gated_rmsnorm")
 
 from config import GDN_TILING, QWEN3_8_27B
 

@@ -46,6 +46,7 @@ around it.
 | [chunk_h.py](../../../models/qwen3_8_27b/chunk_h.py) | the inter-chunk state recurrence and `V_new` |
 | [chunk_o.py](../../../models/qwen3_8_27b/chunk_o.py) | the chunk output, inter-chunk plus intra-chunk |
 | [short_conv.py](../../../models/qwen3_8_27b/short_conv.py) | the depthwise causal convolution over the q/k/v channels, with silu |
+| [qk_norm_gate.py](../../../models/qwen3_8_27b/qk_norm_gate.py) | the q/k L2-norm and scaling, and `beta` and the decay gate from the a/b projections |
 | [gated_rmsnorm.py](../../../models/qwen3_8_27b/gated_rmsnorm.py) | the gated RMSNorm after the delta rule, and the per-token INT8 quantisation `out_proj` reads |
 
 `solve_tril` is the delta-rule triangular inversion of
@@ -66,9 +67,9 @@ difference from running the stages back to back is that `solve_tril` writes
 what its consumer reads.
 
 `gdn_layer.py` is the delta rule alone. Of the rest of the block, the short
-convolution and the gated RMSNorm are built, as standalone kernels not yet
-composed into a layer; the four input projections, the qk-norm and gate, and
-`out_proj` are not.
+convolution, the qk-norm and gate, and the gated RMSNorm are built, as
+standalone kernels not yet composed into a layer; the four input projections
+and `out_proj` are not.
 
 ## The short convolution
 
@@ -87,6 +88,24 @@ GM traffic against a measured copy roof of 1236 GB/s. CANN's own depthwise
 our token-major layout would need is charged, so 2.4x and 4.0x. Accuracy
 against the float64 reference is max abs 2.6e-02 on the real layer, inside the
 6e-02 the hand-written PTO-ISA kernel's own tests use for bf16.
+
+## The qk-norm and gate
+
+[qk_norm_gate.py](../../../models/qwen3_8_27b/qk_norm_gate.py) produces the
+four things the delta rule reads: q and k L2-normalised over the head dim with
+the epsilon inside the square root and q scaled by `D^-0.5`, `beta` as a
+sigmoid of one small projection, and the decay `g` from the other.
+
+`beta` comes out head-major, `[H, T]`, because that is what `wy_fast` and
+`scaled_dot_kkt` declare; the kernel transposes on chip rather than leaving it
+to the host. `softplus` is written as `log(1 + exp(x))` with the exponent
+clamped, since the naive form overflows fp32 and this model's `dt_bias`
+already reaches 19.25.
+
+On a2a3 at T = 8192, 50 rounds: **122 us**, 1135 GB/s against a measured copy
+roof of 1236 GB/s, so this kernel is bandwidth-bound. Accuracy against the
+float64 reference is 1.6e-03 relative Frobenius on q and k, and better on
+`beta` and `g`.
 
 ## The gated RMSNorm
 
