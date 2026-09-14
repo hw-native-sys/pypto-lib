@@ -1221,7 +1221,7 @@ def main():
         type=int,
         default=N_RANKS,
         choices=[2, 4, 8],
-        help="EP world size / rank count (parsed at import by moe).",
+        help="EP world size / rank count (parsed at import by decode_moe).",
     )
     parser.add_argument(
         "--tp",

@@ -36,7 +36,7 @@ from lm_head import (
     golden_lm_head,
     lm_head_test,
 )
-from moe import (
+from prefill_moe import (
     PrefillMoELayout,
     make_prefill_moe,
     clear_prefill_moe_signals,
@@ -53,7 +53,7 @@ from moe import (
     TOPK,
     VOCAB,
     build_tensor_specs as build_moe_tensor_specs,
-    golden_moe,
+    golden_prefill_moe,
 )
 from mtp_projection import _quantize_weight_per_out, golden_mtp_projection, mtp_projection
 from prefill_swa import (
@@ -724,7 +724,7 @@ def golden_mtp_prefill_fwd(tensors):
     moe_tensors["x_next"] = tensors["pre_hc_hidden_out"]
     moe_tensors["layer_id"] = MTP_LAYER_ID
     moe_tensors["num_tokens"] = num_tokens
-    golden_moe(moe_tensors)
+    golden_prefill_moe(moe_tensors)
 
     for rank in range(N_RANKS):
         x_head = _golden_hc_head_prefill(
@@ -749,7 +749,7 @@ def main():
     parser.add_argument("-p", "--platform", type=str, default="a2a3", choices=["a2a3", "a5"])
     parser.add_argument(
         "--ep", type=int, default=N_RANKS, choices=[2, 4, 8],
-        help="EP world size / rank count (parsed at import by moe).",
+        help="EP world size / rank count (parsed at import by prefill_moe).",
     )
     parser.add_argument(
         "-d", "--device", type=str, default=",".join(str(i) for i in range(N_RANKS)),

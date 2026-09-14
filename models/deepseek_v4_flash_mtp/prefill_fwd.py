@@ -32,9 +32,9 @@ from pypto.ir import DistributedConfig
 
 # Leaf kernels own attention math; this module owns the full layer schedule.
 import config
-# Import moe first: it applies the EP/FLASH override before the attention modules
+# Import prefill_moe first: it applies the EP/FLASH override before the attention modules
 # bake config-derived MoE shapes.
-from moe import (
+from prefill_moe import (
     PrefillMoELayout,
     make_prefill_moe,
     D,
@@ -2546,7 +2546,7 @@ def main():
     parser = argparse.ArgumentParser(description="DeepSeek-V4 Flash packed-prefill forward driver.")
     parser.add_argument("-p", "--platform", type=str, default="a2a3", choices=["a2a3", "a5"])
     parser.add_argument("--ep", type=int, default=N_RANKS, choices=[2, 4, 8],
-                        help="EP world size / rank count (parsed at import by moe).")
+                        help="EP world size / rank count (parsed at import by prefill_moe).")
     parser.add_argument("--cp", type=int, default=CP_SIZE, choices=[N_RANKS],
                         help="Context parallel group size: the full EP world.")
     parser.add_argument("--tp", type=int, default=LM_HEAD_TP_SIZE, choices=[2, 4, 8, 16],

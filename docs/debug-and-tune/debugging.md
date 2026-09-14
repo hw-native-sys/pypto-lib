@@ -146,7 +146,7 @@ log:
    ```bash
    mkdir -p build_output/device_logs
    export ASCEND_PROCESS_LOG_PATH="$PWD/build_output/device_logs"
-   python models/deepseek_v4_flash_mtp/moe.py -p a2a3 --ep 2 -d 0,1
+   python models/deepseek_v4_flash_mtp/decode_moe.py -p a2a3 --ep 2 -d 0,1
    ```
 
 3. Read the logs under `build_output/device_logs/` to find the **last task

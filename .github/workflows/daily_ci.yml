@@ -277,7 +277,7 @@ jobs:
           #   task-submit --device "$DEVICE_ID" --device-num 4 --timeout 3600 --max-time 900 \
           #     --run "cd $GITHUB_WORKSPACE/checkout && source activate.sh && \
           #       PYTHONPATH=$GITHUB_WORKSPACE/checkout \
-          #       python models/deepseek_v4_flash_mtp/moe.py -p a2a3 --ep 4 -d \$TASK_DEVICE"
+          #       python models/deepseek_v4_flash_mtp/decode_moe.py -p a2a3 --ep 4 -d \$TASK_DEVICE"
           if [ ${#failed[@]} -ne 0 ]; then
             echo "Failed cases (${#failed[@]}):"
             printf '  - %s\n' "${failed[@]}"
