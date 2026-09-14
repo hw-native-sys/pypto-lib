@@ -197,7 +197,7 @@ def decode_swa(
     x_normed_t = pl.create_tensor([t_dim, D], dtype=pl.BF16)
     rms_tid = hc_pre_norm(
         x_hc, hc_attn_fn, hc_attn_scale, hc_attn_base, attn_norm_w,
-        post_t, comb_t, x_normed_t,
+        post_t, comb_t, x_normed_t, False,
     )
 
     q = pl.create_tensor([t_dim, H, HEAD_DIM], dtype=pl.BF16)
@@ -533,7 +533,7 @@ def decode_swa_tp1(
     x_normed_t = pl.create_tensor([t_dim, D], dtype=pl.BF16)
     rms_tid = hc_pre_norm(
         x_hc, hc_attn_fn, hc_attn_scale, hc_attn_base, attn_norm_w,
-        post_t, comb_t, x_normed_t,
+        post_t, comb_t, x_normed_t, False,
     )
     # Dispatch barrier: kv_proj_matmul resolves one hop after rms_norm.
     late_dep = pl.system.task_dummy(deps=[rms_tid])
