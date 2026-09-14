@@ -21,7 +21,6 @@ from decode_swa import (
     BLOCK_SIZE,
     HEAD_DIM,
     H,
-    MAX_SEQ_LEN,
     O_GROUP_IN,
     O_GROUPS,
     O_LORA,
@@ -68,6 +67,7 @@ from moe import (
     golden_moe,
     moe,
 )
+from decode_prepare import ROPE_ROWS_DYN, gather_swa_rope_rows
 from mtp_projection import golden_mtp_projection, mtp_projection
 from rmsnorm import golden_rms_norm, rms_norm
 
@@ -104,8 +104,8 @@ def decode_mtp(
     wkv: pl.Tensor[[D, HEAD_DIM], pl.BF16],
     gamma_cq: pl.Tensor[[Q_LORA], pl.BF16],
     gamma_ckv: pl.Tensor[[HEAD_DIM], pl.BF16],
-    freqs_cos: pl.Tensor[[MAX_SEQ_LEN, ROPE_HEAD_DIM], pl.BF16],
-    freqs_sin: pl.Tensor[[MAX_SEQ_LEN, ROPE_HEAD_DIM], pl.BF16],
+    freqs_cos: pl.Tensor[[T, ROPE_HEAD_DIM], pl.BF16],
+    freqs_sin: pl.Tensor[[T, ROPE_HEAD_DIM], pl.BF16],
     kv_cache: pl.InOut[pl.Tensor[[ORI_BLOCK_NUM_DYN, BLOCK_SIZE, 1, HEAD_DIM], pl.BF16]],
     swa_slot_mapping: pl.Tensor[[T], pl.INT64],
     swa_indices: pl.Tensor[[T, WIN], pl.INT32],
@@ -246,8 +246,8 @@ def l2_decode_mtp(
     wkv: pl.Tensor[[D, HEAD_DIM], pl.BF16],
     gamma_cq: pl.Tensor[[Q_LORA], pl.BF16],
     gamma_ckv: pl.Tensor[[HEAD_DIM], pl.BF16],
-    freqs_cos: pl.Tensor[[2, MAX_SEQ_LEN, ROPE_HEAD_DIM], pl.BF16],
-    freqs_sin: pl.Tensor[[2, MAX_SEQ_LEN, ROPE_HEAD_DIM], pl.BF16],
+    freqs_cos: pl.Tensor[[2, ROPE_ROWS_DYN, ROPE_HEAD_DIM], pl.BF16],
+    freqs_sin: pl.Tensor[[2, ROPE_ROWS_DYN, ROPE_HEAD_DIM], pl.BF16],
     kv_cache: pl.InOut[pl.Tensor[[ORI_BLOCK_NUM_DYN, BLOCK_SIZE, 1, HEAD_DIM], pl.BF16]],
     swa_slot_mapping: pl.Tensor[[T], pl.INT64],
     swa_indices: pl.Tensor[[T, WIN], pl.INT32],
@@ -305,18 +305,11 @@ def l2_decode_mtp(
     my_rank: pl.Scalar[pl.INT32],
     num_tokens: pl.Scalar[pl.INT32],
 ) -> pl.Tensor[[T, HC_MULT, D], pl.BF16]:
-    swa_cos_profile: pl.Tensor[[1, MAX_SEQ_LEN, ROPE_HEAD_DIM], pl.BF16] = pl.slice(
-        freqs_cos, [1, MAX_SEQ_LEN, ROPE_HEAD_DIM], [0, 0, 0]
-    )
-    swa_sin_profile: pl.Tensor[[1, MAX_SEQ_LEN, ROPE_HEAD_DIM], pl.BF16] = pl.slice(
-        freqs_sin, [1, MAX_SEQ_LEN, ROPE_HEAD_DIM], [0, 0, 0]
-    )
-    swa_freqs_cos: pl.Tensor[[MAX_SEQ_LEN, ROPE_HEAD_DIM], pl.BF16] = pl.reshape(
-        swa_cos_profile, [MAX_SEQ_LEN, ROPE_HEAD_DIM]
-    )
-    swa_freqs_sin: pl.Tensor[[MAX_SEQ_LEN, ROPE_HEAD_DIM], pl.BF16] = pl.reshape(
-        swa_sin_profile, [MAX_SEQ_LEN, ROPE_HEAD_DIM]
-    )
+    freqs_cos.bind_dynamic(1, ROPE_ROWS_DYN)
+    freqs_sin.bind_dynamic(1, ROPE_ROWS_DYN)
+    swa_freqs_cos = pl.create_tensor([T, ROPE_HEAD_DIM], dtype=pl.BF16)
+    swa_freqs_sin = pl.create_tensor([T, ROPE_HEAD_DIM], dtype=pl.BF16)
+    gather_swa_rope_rows(freqs_cos, freqs_sin, position_ids, swa_freqs_cos, swa_freqs_sin)
     return decode_mtp(
         hidden_states, prev_pre_hc_hidden, position_ids,
         enorm_w, hnorm_w,
@@ -366,8 +359,8 @@ def l3_decode_mtp(
     wkv: pl.Tensor[[N_RANKS, D, HEAD_DIM], pl.BF16],
     gamma_cq: pl.Tensor[[N_RANKS, Q_LORA], pl.BF16],
     gamma_ckv: pl.Tensor[[N_RANKS, HEAD_DIM], pl.BF16],
-    freqs_cos: pl.Tensor[[N_RANKS, 2, MAX_SEQ_LEN, ROPE_HEAD_DIM], pl.BF16],
-    freqs_sin: pl.Tensor[[N_RANKS, 2, MAX_SEQ_LEN, ROPE_HEAD_DIM], pl.BF16],
+    freqs_cos: pl.Tensor[[N_RANKS, 2, ROPE_ROWS_DYN, ROPE_HEAD_DIM], pl.BF16],
+    freqs_sin: pl.Tensor[[N_RANKS, 2, ROPE_ROWS_DYN, ROPE_HEAD_DIM], pl.BF16],
     kv_cache: pl.InOut[pl.Tensor[[N_RANKS, ORI_BLOCK_NUM_DYN, BLOCK_SIZE, 1, HEAD_DIM], pl.BF16]],
     swa_slot_mapping: pl.Tensor[[N_RANKS, T], pl.INT64],
     swa_indices: pl.Tensor[[N_RANKS, T, WIN], pl.INT32],
@@ -414,6 +407,8 @@ def l3_decode_mtp(
     logit_row_indices: pl.Tensor[[N_RANKS, MAX_LOGIT_ROWS], pl.INT32],
     num_tokens: pl.Scalar[pl.INT32],
 ):
+    freqs_cos.bind_dynamic(2, ROPE_ROWS_DYN)
+    freqs_sin.bind_dynamic(2, ROPE_ROWS_DYN)
     recv_meta_buf = pld.alloc_window_buffer([N_RANKS, N_LOCAL], dtype=pl.INT32)
     recv_x_buf = pld.alloc_window_buffer([N_LOCAL * RECV_MAX, D], dtype=pl.INT8)
     recv_aux_buf = pld.alloc_window_buffer([N_LOCAL * RECV_MAX, AUX_PAD], dtype=pl.FP32)
@@ -613,7 +608,7 @@ def _mtp_head_specs():
 def build_tensor_specs(start_pos=DECODE_START_POS, num_tokens=T, ori_block_num=ORI_BLOCK_NUM):
     import torch
     from golden import ScalarSpec, TensorSpec
-    from utils import build_rope_tables
+    from utils import build_rope_tables, resolve_start_positions
 
     projection_specs = _projection_specs()
     mtp_head_specs = _mtp_head_specs()
@@ -621,32 +616,22 @@ def build_tensor_specs(start_pos=DECODE_START_POS, num_tokens=T, ori_block_num=O
     swa_specs = {spec.name: spec for spec in swa_tensor_specs if isinstance(spec, TensorSpec)}
     moe_tensor_specs = build_moe_tensor_specs(layer_id=MTP_LAYER_ID, num_tokens=num_tokens)
     moe_specs = {spec.name: spec for spec in moe_tensor_specs if isinstance(spec, TensorSpec)}
-    compressed_freqs_cos, compressed_freqs_sin = build_rope_tables(M, 4, dtype=torch.bfloat16)
-
-    def init_freqs_cos():
-        return torch.stack(
-            (swa_specs["freqs_cos"].create_tensor(), compressed_freqs_cos.clone()),
-            dim=0,
-        )
-
-    def init_freqs_sin():
-        return torch.stack(
-            (swa_specs["freqs_sin"].create_tensor(), compressed_freqs_sin.clone()),
-            dim=0,
-        )
+    rope_rows = int(resolve_start_positions(start_pos, batch=B, seq=DECODE_SEQ).max().item()) + DECODE_SEQ
+    swa_freqs_cos, swa_freqs_sin = build_rope_tables(M, 0, max_seq_len=rope_rows, dtype=torch.bfloat16)
+    compressed_freqs_cos, compressed_freqs_sin = build_rope_tables(M, 4, max_seq_len=rope_rows, dtype=torch.bfloat16)
 
     rope_specs = {
         "freqs_cos": TensorSpec(
             "freqs_cos",
-            [2, *swa_specs["freqs_cos"].shape],
-            swa_specs["freqs_cos"].dtype,
-            init_value=init_freqs_cos,
+            [2, rope_rows, ROPE_HEAD_DIM],
+            torch.bfloat16,
+            init_value=lambda: torch.stack((swa_freqs_cos, compressed_freqs_cos), dim=0),
         ),
         "freqs_sin": TensorSpec(
             "freqs_sin",
-            [2, *swa_specs["freqs_sin"].shape],
-            swa_specs["freqs_sin"].dtype,
-            init_value=init_freqs_sin,
+            [2, rope_rows, ROPE_HEAD_DIM],
+            torch.bfloat16,
+            init_value=lambda: torch.stack((swa_freqs_sin, compressed_freqs_sin), dim=0),
         ),
     }
 
@@ -895,8 +880,8 @@ def golden_decode_mtp(tensors):
             "wkv": tensors["wkv"][rank],
             "gamma_cq": tensors["gamma_cq"][rank],
             "gamma_ckv": tensors["gamma_ckv"][rank],
-            "freqs_cos": tensors["freqs_cos"][rank, 0],
-            "freqs_sin": tensors["freqs_sin"][rank, 0],
+            "freqs_cos": tensors["freqs_cos"][rank, 0][tensors["position_ids"][rank].to(torch.int64)],
+            "freqs_sin": tensors["freqs_sin"][rank, 0][tensors["position_ids"][rank].to(torch.int64)],
             "kv_cache": tensors["kv_cache"][rank],
             "swa_slot_mapping": tensors["swa_slot_mapping"][rank],
             "swa_indices": tensors["swa_indices"][rank],
@@ -945,6 +930,7 @@ def golden_decode_mtp(tensors):
 
 def main():
     from golden import ratio_reldiff, run
+    from utils import parse_start_pos_arg
 
     parser = argparse.ArgumentParser(description="DeepSeek-V4 MTP decode layer driver.")
     parser.add_argument(
@@ -963,7 +949,8 @@ def main():
         "-d", "--device", type=str, default=",".join(str(i) for i in range(N_RANKS)),
         help=f"comma-separated device ids; need at least {N_RANKS}",
     )
-    parser.add_argument("--start-pos", type=int, default=DECODE_START_POS)
+    parser.add_argument("--start-pos", type=str, default=str(DECODE_START_POS),
+                        help="Fixture start_pos: one value or a comma-separated per-request list.")
     parser.add_argument("--num-tokens", type=int, default=T)
     parser.add_argument("--ori-block-num", type=int, default=ORI_BLOCK_NUM)
     parser.add_argument("--enable-chip-swimlane", type=int, nargs="?", const=1, default=0, choices=range(5))
@@ -985,7 +972,7 @@ def main():
     result = run(
         fn=l3_decode_mtp,
         specs=build_tensor_specs(
-            start_pos=args.start_pos,
+            start_pos=parse_start_pos_arg(args.start_pos),
             num_tokens=args.num_tokens,
             ori_block_num=args.ori_block_num,
         ),

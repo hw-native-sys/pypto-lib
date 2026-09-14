@@ -33,21 +33,50 @@ from config import (
 
 # --- Paged-KV metadata lowering. ---
 def resolve_start_positions(
-    start_pos: int | None,
+    start_pos: int | list[int] | tuple[int, ...] | torch.Tensor | None,
     *,
     batch: int = DECODE_BATCH,
     seq: int = DECODE_SEQ,
     max_seq_len: int = M.max_position_embeddings,
     default_fn: Callable[[], torch.Tensor] | None = None,
 ) -> torch.Tensor:
-    if start_pos is not None:
+    if isinstance(start_pos, torch.Tensor):
+        starts = start_pos.to(torch.int32).reshape(-1)
+    elif isinstance(start_pos, (list, tuple)):
+        starts = torch.tensor(start_pos, dtype=torch.int32)
+    elif start_pos is not None:
         starts = torch.full((batch,), int(start_pos), dtype=torch.int32)
     elif default_fn is not None:
         starts = default_fn().to(torch.int32)
     else:
         starts = torch.zeros(batch, dtype=torch.int32)
+    if starts.shape != (batch,):
+        raise ValueError(
+            f"decode start positions need {batch} entries, got {starts.numel()}"
+        )
     _validate_starts(starts, seq=seq, max_seq_len=max_seq_len)
     return starts
+
+
+def parse_start_pos_arg(value: str | None) -> int | list[int] | None:
+    """Parse a scalar or comma-separated ``--start-pos`` value."""
+    if value is None:
+        return None
+    parts = [part.strip() for part in value.split(",") if part.strip()]
+    if len(parts) == 1:
+        return int(parts[0])
+    return [int(part) for part in parts]
+
+
+def logical_table_blocks(
+    starts: torch.Tensor,
+    *,
+    seq: int = DECODE_SEQ,
+    block_size: int,
+) -> int:
+    """Runtime block-table width covering every position of the decode step."""
+    last_position = int(starts.to(torch.int64).max().item()) + seq - 1
+    return last_position // block_size + 1
 
 
 # --- Canonical decode fixture start-position sets, one per attention family. ---
@@ -440,6 +469,52 @@ def build_rope_tables(
         dtype=dtype,
         device=device,
     )
+
+
+def token_local_rope(
+    config: Any,
+    compress_ratio: int,
+    position_ids: torch.Tensor,
+    *,
+    max_seq_len: int = M.max_position_embeddings,
+    rope_dim: int | None = None,
+    dtype: torch.dtype | str = torch.bfloat16,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Compute only the ``[N, rope_dim]`` RoPE rows used by ``position_ids``.
+
+    Row ``i`` equals row ``position_ids[i]`` of :func:`build_rope_tables`.
+    """
+    dim = int(rope_dim if rope_dim is not None else config.qk_rope_head_dim)
+    if dim <= 0 or dim % 2 != 0:
+        raise ValueError(f"RoPE dim must be a positive even integer, got {dim}")
+    positions_i64 = position_ids.to(torch.int64).reshape(-1)
+    if bool((positions_i64 < 0).any()) or bool((positions_i64 >= max_seq_len).any()):
+        raise ValueError(f"RoPE positions must be in [0, {max_seq_len})")
+
+    base, original_seq_len = rope_profile_for_compress_ratio(config, compress_ratio)
+    half_dim = dim // 2
+    inv_freq = 1.0 / (float(base) ** (torch.arange(0, dim, 2, dtype=torch.float32) / dim))
+    if original_seq_len > 0:
+        low, high = _find_correction_range(
+            int(config.beta_fast), int(config.beta_slow), dim, float(base), int(original_seq_len),
+        )
+        smooth = 1 - _linear_ramp_factor(low, high, half_dim)
+        inv_freq = inv_freq / float(config.rope_factor) * (1 - smooth) + inv_freq * smooth
+
+    angles = torch.outer(positions_i64.to(torch.float32), inv_freq)
+    cos_half = torch.cos(angles)
+    sin_half = torch.sin(angles)
+    out_dtype = _torch_dtype(dtype)
+    return (
+        torch.cat([cos_half, cos_half], dim=-1).to(out_dtype).contiguous(),
+        torch.cat([sin_half, sin_half], dim=-1).to(out_dtype).contiguous(),
+    )
+
+
+def compressed_boundary_positions(first_positions: torch.Tensor, compress_ratio: int) -> torch.Tensor:
+    """Position whose RoPE row rotates the compressed entry a decode step may write."""
+    first_i64 = first_positions.to(torch.int64)
+    return first_i64 - first_i64 % compress_ratio
 
 
 def materialize_token_rope_tables(

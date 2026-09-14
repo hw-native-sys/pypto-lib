@@ -86,14 +86,14 @@ it proceeds.
 
 ## Writing one
 
-From [decode_csa.py:225-236](../../models/deepseek_v4_flash_mtp/decode_csa.py#L225-L236) —
+From [decode_csa.py:210-221](../../models/deepseek_v4_flash_mtp/decode_csa.py#L210-L221) —
 one scope, one context, the o-projection weights in the order their consumers
 need them, anchored on the task that writes `q`:
 
 ```python
 q_rope_tid = qkv_proj_rope(
     x_normed_t, wq_a, wq_b, wq_b_scale, wkv,
-    rope_cos_t, rope_sin_t, gamma_cq, gamma_ckv,
+    freqs_cos, freqs_sin, gamma_cq, gamma_ckv,
     q, kv, qr, qr_scale, late_dep,
 )
 # SDMA CMO L2 warm of the o-projection weights, issued once q is written.

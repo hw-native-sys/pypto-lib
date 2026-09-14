@@ -106,6 +106,7 @@ O_GROUP_IN = HEADS_PER_GROUP * HEAD_DIM
 # request, one window page, so block count / table length / per-request window
 # block count all collapse to 1.
 BLOCK_NUM = PREFILL_ORI_BLOCK_NUM
+BLOCK_TABLE_BLOCKS = PREFILL_ORI_MAX_BLOCKS
 CMP_BLOCK_NUM = PREFILL_CMP_BLOCK_NUM
 SPARSE_CMP_MAX_BLOCKS = PREFILL_CMP_MAX_BLOCKS
 START_POS = 0
@@ -130,7 +131,7 @@ def prefill_mtp_attention_swa(
     freqs_cos: pl.Tensor[[MAX_SEQ_LEN, ROPE_HEAD_DIM], pl.BF16],
     freqs_sin: pl.Tensor[[MAX_SEQ_LEN, ROPE_HEAD_DIM], pl.BF16],
     kv_cache: pl.InOut[pl.Tensor[[BLOCK_NUM_DYN, BLOCK_SIZE, 1, HEAD_DIM], pl.BF16]],
-    block_table: pl.Tensor[[BLOCK_NUM], pl.INT32],
+    block_table: pl.Tensor[[BLOCK_TABLE_BLOCKS], pl.INT32],
     ori_slot_mapping: pl.Tensor[[T], pl.INT64],
     position_ids: pl.Tensor[[T], pl.INT32],
     attn_sink: pl.Tensor[[H], pl.FP32],
@@ -239,7 +240,7 @@ def prefill_mtp_attention_swa_test(
     freqs_cos: pl.Tensor[[MAX_SEQ_LEN, ROPE_HEAD_DIM], pl.BF16],
     freqs_sin: pl.Tensor[[MAX_SEQ_LEN, ROPE_HEAD_DIM], pl.BF16],
     kv_cache: pl.InOut[pl.Tensor[[BLOCK_NUM_DYN, BLOCK_SIZE, 1, HEAD_DIM], pl.BF16]],
-    block_table: pl.Tensor[[BLOCK_NUM], pl.INT32],
+    block_table: pl.Tensor[[BLOCK_TABLE_BLOCKS], pl.INT32],
     ori_slot_mapping: pl.Tensor[[T], pl.INT64],
     position_ids: pl.Tensor[[T], pl.INT32],
     attn_sink: pl.Tensor[[H], pl.FP32],
@@ -445,10 +446,7 @@ def build_tensor_specs(
     def init_freqs_sin():
         return shared_freqs_sin.clone()
     def init_block_table():
-        tbl = torch.full((BLOCK_NUM,), -1, dtype=torch.int32)
-        for block in range(BLOCK_NUM):
-            tbl[block] = block
-        return tbl
+        return torch.arange(BLOCK_TABLE_BLOCKS, dtype=torch.int32) % BLOCK_NUM
     def init_kv_cache():
         cache = torch.zeros(BLOCK_NUM, BLOCK_SIZE, 1, HEAD_DIM)
         cache_flat = cache.view(BLOCK_NUM * BLOCK_SIZE, HEAD_DIM)
@@ -496,7 +494,7 @@ def build_tensor_specs(
         TensorSpec("freqs_cos", [MAX_SEQ_LEN, ROPE_HEAD_DIM], torch.bfloat16, init_value=init_freqs_cos),
         TensorSpec("freqs_sin", [MAX_SEQ_LEN, ROPE_HEAD_DIM], torch.bfloat16, init_value=init_freqs_sin),
         TensorSpec("kv_cache", [BLOCK_NUM, BLOCK_SIZE, 1, HEAD_DIM], torch.bfloat16, init_value=init_kv_cache),
-        TensorSpec("block_table", [BLOCK_NUM], torch.int32, init_value=init_block_table),
+        TensorSpec("block_table", [BLOCK_TABLE_BLOCKS], torch.int32, init_value=init_block_table),
         TensorSpec("ori_slot_mapping", [T], torch.int64, init_value=init_ori_slot_mapping),
         TensorSpec("position_ids", [T], torch.int32, init_value=init_position_ids),
         TensorSpec("attn_sink", [H], torch.float32, init_value=init_attn_sink),

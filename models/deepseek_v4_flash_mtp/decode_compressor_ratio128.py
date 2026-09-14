@@ -62,7 +62,6 @@ COMPRESS_STATE_BLOCK_SIZE = C128_COMPRESSOR_BLOCK_SIZE
 # Logical state block tables cover MAX_SEQ_LEN while the physical state pool
 # remains bounded to the per-request rolling state capacity.
 COMPRESS_STATE_PHYSICAL_BLOCKS = 64
-COMPRESS_STATE_MAX_BLOCKS = (MAX_SEQ_LEN + COMPRESS_STATE_BLOCK_SIZE - 1) // COMPRESS_STATE_BLOCK_SIZE
 COMPRESS_STATE_BLOCK_NUM = COMPRESS_STATE_PHYSICAL_BLOCKS
 COMPRESS_STATE_DIM = 2 * OUT_DIM
 CMP_MAX_BLOCKS = KV_CMP_MAX_BLOCKS
@@ -463,15 +462,15 @@ def build_tensor_specs(start_pos=None):
     from utils import (
         block_table,
         compressed_slot_mapping,
+        compressed_boundary_positions,
         hca_decode_start_set,
+        logical_table_blocks,
         position_ids_from_starts,
         resolve_start_positions,
         state_slot_mapping,
+        token_local_rope,
     )
     from golden import TensorSpec
-    from utils import build_rope_tables, materialize_half_rope_tables
-
-    shared_freqs_cos, shared_freqs_sin = build_rope_tables(M, COMPRESS_RATIO, dtype=torch.bfloat16)
 
     def init_x():
         return torch.rand(B, S, D)
@@ -489,27 +488,27 @@ def build_tensor_specs(start_pos=None):
         return torch.randn(COMPRESS_RATIO, OUT_DIM) * 0.0340
     def init_norm_w():
         return 0.1001 + 0.0549 * torch.randn(HEAD_DIM)
-    def init_rope_positions():
-        first_pos = init_position_ids().to(torch.int64)[:, 0]
-        cmp_offset = COMPRESS_RATIO - (first_pos % COMPRESS_RATIO)
-        return (first_pos + cmp_offset - COMPRESS_RATIO).to(torch.int64)
+    def init_rope_rows():
+        cmp_positions = compressed_boundary_positions(init_start_pos(), COMPRESS_RATIO)
+        cos, sin = token_local_rope(M, COMPRESS_RATIO, cmp_positions)
+        return cos[:, : ROPE_HEAD_DIM // 2].float().contiguous(), sin[:, : ROPE_HEAD_DIM // 2].float().contiguous()
     def init_cos():
-        return materialize_half_rope_tables(shared_freqs_cos, shared_freqs_sin, init_rope_positions())[0]
+        return init_rope_rows()[0]
     def init_sin():
-        return materialize_half_rope_tables(shared_freqs_cos, shared_freqs_sin, init_rope_positions())[1]
+        return init_rope_rows()[1]
     def init_cmp_kv_cache():
         return torch.zeros(CMP_BLOCK_NUM, CMP_STORAGE_BLOCK_SIZE, 1, HEAD_DIM)
     def init_compress_state_block_table():
         return block_table(
             batch=B,
-            table_blocks=COMPRESS_STATE_MAX_BLOCKS,
+            table_blocks=state_table_blocks(),
             physical_blocks=COMPRESS_STATE_PHYSICAL_BLOCKS,
             permuted=True,
         )
     def init_cmp_block_table():
         return block_table(
             batch=B,
-            table_blocks=CMP_MAX_BLOCKS,
+            table_blocks=logical_table_blocks(init_start_pos(), seq=S, block_size=BLOCK_SIZE),
             physical_blocks=CMP_BLOCK_NUM,
             permuted=True,
         )
@@ -527,6 +526,8 @@ def build_tensor_specs(start_pos=None):
         )
     def init_position_ids():
         return position_ids_from_starts(init_start_pos(), seq=S)
+    def state_table_blocks():
+        return logical_table_blocks(init_start_pos(), seq=S, block_size=COMPRESS_STATE_BLOCK_SIZE)
     def init_state_slot_mapping():
         return state_slot_mapping(
             init_position_ids(),
@@ -545,7 +546,7 @@ def build_tensor_specs(start_pos=None):
         TensorSpec("x", [B, S, D], torch.bfloat16, init_value=init_x),
         TensorSpec("kv", [B, S, HEAD_DIM], torch.float32),
         TensorSpec("compress_state", [COMPRESS_STATE_BLOCK_NUM, COMPRESS_STATE_BLOCK_SIZE, COMPRESS_STATE_DIM], torch.float32, init_value=init_compress_state),
-        TensorSpec("compress_state_block_table", [B, COMPRESS_STATE_MAX_BLOCKS], torch.int32, init_value=init_compress_state_block_table),
+        TensorSpec("compress_state_block_table", [B, state_table_blocks()], torch.int32, init_value=init_compress_state_block_table),
         TensorSpec("wkv", [OUT_DIM, D], torch.bfloat16, init_value=init_wkv),
         TensorSpec("wgate", [OUT_DIM, D], torch.bfloat16, init_value=init_wgate),
         TensorSpec("ape", [COMPRESS_RATIO, OUT_DIM], torch.float32, init_value=init_ape),
@@ -562,12 +563,13 @@ def build_tensor_specs(start_pos=None):
 if __name__ == "__main__":
     import argparse
     from golden import ratio_allclose, run
+    from utils import parse_start_pos_arg
 
     parser = argparse.ArgumentParser()
     parser.add_argument("-p", "--platform", type=str, default="a2a3",
                         choices=["a2a3", "a2a3sim", "a5", "a5sim"])
     parser.add_argument("-d", "--device", type=int, default=0)
-    parser.add_argument("--start-pos", type=int, default=None,
+    parser.add_argument("--start-pos", type=str, default=None,
                         help="Uniform fixture-only start_pos override for all batches; "
                              "default (unset) uses the canonical per-batch HCA set that includes the 8k point.")
     parser.add_argument("--enable-chip-swimlane", type=int, nargs="?", const=1, default=0, choices=range(5))
@@ -576,7 +578,7 @@ if __name__ == "__main__":
 
     result = run(
         fn=compressor_test,
-        specs=build_tensor_specs(args.start_pos),
+        specs=build_tensor_specs(parse_start_pos_arg(args.start_pos)),
         golden_fn=golden_compressor,
         config=dict(
             dump_passes=args.dump_passes,

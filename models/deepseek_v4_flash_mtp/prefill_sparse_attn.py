@@ -830,12 +830,11 @@ def _hca_segment_heads(
                     ]
 
     with pl.spmd(token_rows, name_hint="native_hca_cmp_qk_pv", deps=[wave_completion[0]]) as cmp_qk_tid:
-        # MTP has one compressed work tile and enough token parallelism.  Fold
-        # both QK head blocks into one token task and reuse the compressed KV
-        # tile, matching the proven staged-attention task granularity.
+        # One token task walks its visible compressed work tiles in order and folds
+        # each tile's online-softmax partial into one running (m, l, o) per head row.
         qk_local_t = pl.tile.get_block_idx()
         qk_t = qk_local_t
-        qk_token_base = (qk_local_t * (H // HEAD_TILE) * HCA_CMP_WORK_COUNT * HEAD_TILE)
+        qk_token_base = qk_local_t * H
         if qk_t < active_rows:
             qk_position_i32 = pl.read(position_ids, [qk_t])
             if qk_position_i32 >= 0:
@@ -844,22 +843,13 @@ def _hca_segment_heads(
                 neutral_m = pl.full([HEAD_TILE, 8], dtype=pl.FP32, value=FP32_NEG_INF)
                 neutral_l = pl.full([HEAD_TILE, 8], dtype=pl.FP32, value=0.0)
                 neutral_o = pl.full([HEAD_TILE, HEAD_DIM], dtype=pl.FP32, value=0.0)
+                for qk_h_idx in pl.range(H // HEAD_TILE):
+                    neutral_row = qk_token_base + qk_h_idx * HEAD_TILE
+                    cmp_partial_m[neutral_row:neutral_row + HEAD_TILE, 0:8] = neutral_m
+                    cmp_partial_l[neutral_row:neutral_row + HEAD_TILE, 0:8] = neutral_l
+                    cmp_partial_o[neutral_row:neutral_row + HEAD_TILE, 0:HEAD_DIM] = neutral_o
                 for qk_work in pl.range((qk_visible_rows + HCA_ATTN_TILE - 1) // HCA_ATTN_TILE):
                     qk_work_row = qk_work * HCA_ATTN_TILE
-                    for qk_hb in pl.range(H // QK_M_TILE):
-                        for qk_sub in pl.unroll(QK_M_TILE // HEAD_TILE):
-                            qk_h_idx = (qk_hb * (QK_M_TILE // HEAD_TILE) + qk_sub)
-                            neutral_row = (
-                                qk_token_base
-                                + qk_h_idx
-                                * HCA_CMP_WORK_COUNT
-                                * HEAD_TILE
-                                + qk_work * HEAD_TILE
-                            )
-                            cmp_partial_m[neutral_row:neutral_row + HEAD_TILE, 0:8] = neutral_m
-                            cmp_partial_l[neutral_row:neutral_row + HEAD_TILE, 0:8] = neutral_l
-                            cmp_partial_o[neutral_row:neutral_row + HEAD_TILE, 0:HEAD_DIM] = neutral_o
-
                     qk_valid_rows = pl.min(HCA_ATTN_TILE, qk_visible_rows - qk_work_row)
                     qk_kv = cmp_work_kv[qk_work_row:qk_work_row + HCA_ATTN_TILE, 0:HEAD_DIM]
                     qk_valid_row = cmp_work_valid[qk_work:qk_work + 1, :]
@@ -881,23 +871,33 @@ def _hca_segment_heads(
                         qk_o = pl.matmul(pl.cast(qk_exp, target_type=pl.BF16, mode="rint"), qk_kv, out_dtype=pl.FP32)
                         for qk_sub in pl.unroll(QK_M_TILE // HEAD_TILE):
                             qk_src_h0 = qk_sub * HEAD_TILE
-                            qk_h_idx = (qk_hb * (QK_M_TILE // HEAD_TILE) + qk_sub)
-                            qk_row = (qk_token_base + qk_h_idx * HCA_CMP_WORK_COUNT * HEAD_TILE + qk_work * HEAD_TILE)
-                            qk_m_column = qk_m[qk_src_h0:qk_src_h0 + HEAD_TILE, 0:1]
-                            qk_l_column = qk_l[qk_src_h0:qk_src_h0 + HEAD_TILE, 0:1]
+                            qk_row = qk_token_base + qk_h0 + qk_src_h0
+                            qk_cur_m = qk_m[qk_src_h0:qk_src_h0 + HEAD_TILE, 0:1]
+                            qk_cur_l = qk_l[qk_src_h0:qk_src_h0 + HEAD_TILE, 0:1]
+                            qk_cur_o = qk_o[qk_src_h0:qk_src_h0 + HEAD_TILE, 0:HEAD_DIM]
+                            # Read col0 as a dense [HEAD_TILE, 1] vector: a column
+                            # view of a padded tile keeps the row pitch.
+                            qk_run_m_padded = cmp_partial_m[qk_row:qk_row + HEAD_TILE, 0:8]
+                            qk_run_l_padded = cmp_partial_l[qk_row:qk_row + HEAD_TILE, 0:8]
+                            qk_run_m_transposed = pl.transpose(qk_run_m_padded, axis1=0, axis2=1)
+                            qk_run_l_transposed = pl.transpose(qk_run_l_padded, axis1=0, axis2=1)
+                            qk_run_m = pl.reshape(qk_run_m_transposed[0:1, :], [HEAD_TILE, 1])
+                            qk_run_l = pl.reshape(qk_run_l_transposed[0:1, :], [HEAD_TILE, 1])
+                            qk_run_o = cmp_partial_o[qk_row:qk_row + HEAD_TILE, 0:HEAD_DIM]
+                            qk_next_m = pl.maximum(qk_run_m, qk_cur_m)
+                            qk_alpha = pl.exp(pl.sub(qk_run_m, qk_next_m))
+                            qk_beta = pl.exp(pl.sub(qk_cur_m, qk_next_m))
+                            qk_next_l = pl.add(pl.mul(qk_alpha, qk_run_l), pl.mul(qk_beta, qk_cur_l))
+                            qk_next_o = pl.add(
+                                pl.row_expand_mul(qk_run_o, qk_alpha),
+                                pl.row_expand_mul(qk_cur_o, qk_beta),
+                            )
                             # Write whole scratch rows: a narrow column
                             # store ignores the padded row pitch.
                             qk_stat_zeros = pl.full([HEAD_TILE, 8], dtype=pl.FP32, value=0.0)
-                            cmp_partial_m[
-                                qk_row:qk_row + HEAD_TILE, 0:8
-                            ] = pl.row_expand_add(qk_stat_zeros, qk_m_column)
-                            cmp_partial_l[
-                                qk_row:qk_row + HEAD_TILE, 0:8
-                            ] = pl.row_expand_add(qk_stat_zeros, qk_l_column)
-                            cmp_partial_o[qk_row:qk_row + HEAD_TILE, 0:HEAD_DIM] = qk_o[
-                                qk_src_h0:qk_src_h0 + HEAD_TILE,
-                                0:HEAD_DIM,
-                            ]
+                            cmp_partial_m[qk_row:qk_row + HEAD_TILE, 0:8] = pl.row_expand_add(qk_stat_zeros, qk_next_m)
+                            cmp_partial_l[qk_row:qk_row + HEAD_TILE, 0:8] = pl.row_expand_add(qk_stat_zeros, qk_next_l)
+                            cmp_partial_o[qk_row:qk_row + HEAD_TILE, 0:HEAD_DIM] = qk_next_o
 
     attn_sink_col = pl.reshape(attn_sink, [H, 1])
     with pl.spmd(token_rows, name_hint="native_hca_merge_rope_pack", deps=[raw_heads_tid, cmp_qk_tid]) as merge_tid:
@@ -907,7 +907,6 @@ def _hca_segment_heads(
         merge_local_t = pl.tile.get_block_idx()
         merge_t = merge_local_t
         if merge_t < active_rows:
-            merge_token_base = (merge_local_t * (H // HEAD_TILE) * HCA_CMP_WORK_COUNT * HEAD_TILE)
             merge_position_i32 = pl.read(position_ids, [merge_t])
             merge_visible_rows = (merge_position_i32 + 1) // HCA_COMPRESS_RATIO
             merge_visible_rows = pl.min(merge_visible_rows, pl.cast(HCA_MAX_COMPRESSED_ROWS, pl.INDEX))
@@ -919,9 +918,8 @@ def _hca_segment_heads(
                 merge_m = stream_state_m[merge_stream_row:merge_stream_row + HEAD_TILE, 0:1]
                 merge_l = stream_state_l[merge_stream_row:merge_stream_row + HEAD_TILE, 0:1]
                 merge_o = stream_heads[merge_stream_row:merge_stream_row + HEAD_TILE, 0:HEAD_DIM]
-                merge_partial_base = (merge_token_base + merge_h_idx * HCA_CMP_WORK_COUNT * HEAD_TILE)
-                for merge_work in pl.range((merge_visible_rows + HCA_ATTN_TILE - 1) // HCA_ATTN_TILE):
-                    merge_row = (merge_partial_base + merge_work * HEAD_TILE)
+                for merge_fold in pl.range(pl.min(merge_visible_rows, 1)):
+                    merge_row = merge_stream_row + merge_fold
                     merge_cmp_m_padded = cmp_partial_m[merge_row:merge_row + HEAD_TILE, 0:8]
                     merge_cmp_l_padded = cmp_partial_l[merge_row:merge_row + HEAD_TILE, 0:8]
                     # Read col0 as a dense [HEAD_TILE, 1] vector: a column
@@ -1000,7 +998,7 @@ def _hca_heads(
     token_rows = pl.tensor.dim(q, 0)
     raw_rows = token_rows * WIN
     head_rows = token_rows * H
-    partial_rows = head_rows * HCA_CMP_WORK_COUNT
+    partial_rows = head_rows
     rope_rows = ((token_rows + STAGED_SWA_ROPE_CS_T_TILE - 1) // STAGED_SWA_ROPE_CS_T_TILE) * STAGED_SWA_ROPE_CS_T_TILE
     cmp_block_num = pl.tensor.dim(cmp_kv, 0)
     cmp_page_rows = pl.tensor.dim(cmp_kv, 1)

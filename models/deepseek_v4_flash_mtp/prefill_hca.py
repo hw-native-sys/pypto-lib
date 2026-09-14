@@ -117,16 +117,8 @@ COMPRESS_RATIO = 128
 CMP_STORAGE_BLOCK_SIZE = BLOCK_SIZE // COMPRESS_RATIO
 MAIN_OUT_DIM = HEAD_DIM
 
-# paged KV cache
-PREFILL_MAX_COMPRESSED = max(1, min(IDX_TOPK, WIN + WIN // 2))
-
 assert S == COMPRESS_RATIO, "first prefill HCA bring-up targets one ratio-128 prompt chunk"
 assert WIN == BLOCK_SIZE, "prefill HCA currently assumes one window page per batch"
-# HCA has no indexer: the compressed tail is every slot the cache holds, so the
-# shared prefill pruning width must cover the whole cache, not a top-k budget.
-assert MAX_SEQ_LEN // COMPRESS_RATIO <= PREFILL_MAX_COMPRESSED, (
-    f"prefill HCA compressed tail ({PREFILL_MAX_COMPRESSED} slots) must cover "
-    f"MAX_SEQ_LEN={MAX_SEQ_LEN} ({MAX_SEQ_LEN // COMPRESS_RATIO} slots)")
 
 
 # model config
@@ -323,15 +315,14 @@ def _cmp_slot(boundary_position: int) -> int:
     return (boundary_position + 1) // COMPRESS_RATIO - 1
 
 
-def _cmp_block_tables(cp_size: int):
+def _cmp_block_tables(cp_size: int, request_end: int):
     import torch
 
-    tables = torch.full((cp_size, PREFILL_CMP_MAX_BLOCKS), -1, dtype=torch.int32)
-    for rank in range(cp_size):
-        for logical_block in range(PREFILL_CMP_MAX_BLOCKS):
-            physical = logical_block % CP_PREFILL_CMP_BLOCK_NUM
-            tables[rank, logical_block] = physical
-    return tables
+    # The physical pool covers every compressed row up to the request end.
+    cmp_rows = (request_end + COMPRESS_RATIO - 1) // COMPRESS_RATIO
+    pool_blocks = max(CP_PREFILL_CMP_BLOCK_NUM, (cmp_rows + CMP_STORAGE_BLOCK_SIZE - 1) // CMP_STORAGE_BLOCK_SIZE)
+    logical = torch.arange(PREFILL_CMP_MAX_BLOCKS, dtype=torch.int32)
+    return (logical % pool_blocks).unsqueeze(0).repeat(cp_size, 1)
 
 
 def _state_block_tables(cp_size: int):
@@ -437,7 +428,7 @@ def build_hca_metadata(cp_size: int = CP_SIZE, *, num_tokens: int | None = None,
         "final_owner_part": final_owner_part,
         "owner_rank_table": owner_rank_table,
         "owner_part_table": owner_part_table,
-        "cmp_block_table": _cmp_block_tables(cp_size),
+        "cmp_block_table": _cmp_block_tables(cp_size, max(start + length for start, length in zip(starts, lengths))),
         "compress_state_block_table": _state_block_tables(cp_size),
     }
     return metadata
@@ -536,7 +527,8 @@ def prefill_attention_hca(
     history_raw = pl.create_tensor([TAIL_ROWS, HEAD_DIM], dtype=pl.BF16)
     history_state = pl.create_tensor([TAIL_ROWS, COMPRESS_STATE_DIM], dtype=pl.FP32)
     with pl.at(level=pl.Level.CORE_GROUP, name_hint="cp_hca_attn_cache_init"):
-        attn_cmp_flat[:, :] = pl.full([HCA_MAX_COMPRESSED_ROWS, HEAD_DIM], dtype=pl.BF16, value=0.0)
+        for cmp_row0 in pl.range(0, HCA_MAX_COMPRESSED_ROWS, ROW_TILE):
+            attn_cmp_flat[cmp_row0:cmp_row0 + ROW_TILE, :] = pl.full([ROW_TILE, HEAD_DIM], dtype=pl.BF16, value=0.0)
         for history_row0 in pl.range(0, TAIL_ROWS, ROW_TILE):
             history_raw[history_row0:history_row0 + ROW_TILE, :] = pl.full([ROW_TILE, HEAD_DIM], dtype=pl.BF16, value=0.0)
             history_state[history_row0:history_row0 + ROW_TILE, :] = pl.full([ROW_TILE, COMPRESS_STATE_DIM], dtype=pl.FP32, value=0.0)
@@ -1394,7 +1386,7 @@ def build_cp_tensor_specs(cp_size: int = CP_SIZE, *, num_tokens: int | None = No
 
     cmp_cache = torch.zeros(
         cp_size,
-        CP_PREFILL_CMP_BLOCK_NUM,
+        int(metadata["cmp_block_table"].max()) + 1,
         CMP_STORAGE_BLOCK_SIZE,
         1,
         HEAD_DIM,
@@ -1475,6 +1467,16 @@ def build_cp_tensor_specs(cp_size: int = CP_SIZE, *, num_tokens: int | None = No
     head_position = next(i for i, spec in enumerate(specs) if spec.name == "attn_sink")
     specs.insert(head_position, owner_spec)
     return specs
+
+
+def _visible_cmp_indices(positions):
+    """Compressed slots [0, visible) each query attends, -1 padded; HCA has no top-k pruning."""
+    import torch
+
+    visible = ((positions.to(torch.int64) + 1) // COMPRESS_RATIO).clamp(min=0, max=HCA_MAX_COMPRESSED_ROWS)
+    width = max(1, int(visible.max().item()))
+    slots = torch.arange(width, dtype=torch.int64).unsqueeze(0)
+    return torch.where(slots < visible.unsqueeze(1), slots, torch.full_like(slots, -1)).to(torch.int32)
 
 
 def golden_prefill_cp_hca(tensors):
@@ -1702,7 +1704,7 @@ def golden_prefill_cp_hca(tensors):
                         "cmp_kv": cmp_result[rank],
                         "cmp_block_table": tensors["cmp_block_table"][rank],
                         "cmp_storage_block_size": CMP_STORAGE_BLOCK_SIZE,
-                        "cmp_indices": tensors["cmp_indices"][rank, part, tile],
+                        "cmp_indices": _visible_cmp_indices(positions),
                         "attn_sink": tensors["attn_sink"],
                         "num_tokens": active,
                         "freqs_cos": tensors["freqs_cos"].index_select(0, rope_positions),

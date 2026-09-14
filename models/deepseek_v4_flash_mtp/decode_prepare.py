@@ -15,16 +15,21 @@ from config import (
     C4A_COMPRESSOR_BLOCK_SIZE,
     C128_COMPRESSOR_BLOCK_SIZE,
     DECODE_BATCH,
+    KV_ORI_TABLE_MAX_BLOCKS,
     DECODE_SEQ,
     FLASH as M,
-    IDX_CACHE_MAX_BLOCKS,
-    KV_CMP_MAX_BLOCKS,
-    KV_ORI_TABLE_MAX_BLOCKS,
 )
+from decode_compressor_ratio128 import COMPRESS_STATE_MAX_BLOCKS_DYN as HCA_STATE_TABLE_BLOCKS_DYN
+from decode_compressor_ratio4 import COMPRESS_STATE_TABLE_BLOCKS_DYN as CSA_STATE_TABLE_BLOCKS_DYN
+from decode_indexer import IDX_TABLE_BLOCKS_DYN
+from decode_indexer_compressor import COMPRESS_STATE_TABLE_BLOCKS_DYN as CSA_INNER_STATE_TABLE_BLOCKS_DYN
+from decode_sparse_attn_csa import CMP_TABLE_BLOCKS_DYN as CSA_CMP_TABLE_BLOCKS_DYN
+from decode_sparse_attn_hca import CMP_TABLE_BLOCKS_DYN as HCA_CMP_TABLE_BLOCKS_DYN
 
 
 # Dynamic shape variables.
 VOCAB_DYN = pl.dynamic("PACK_X_HC_VOCAB_DYN")
+ROPE_ROWS_DYN = pl.dynamic("DECODE_ROPE_ROWS_DYN")
 
 # model config
 B = DECODE_BATCH
@@ -33,14 +38,11 @@ T = B * S
 D = M.hidden_size
 HC_MULT = M.hc_mult
 WIN = M.sliding_window
+ROPE_HEAD_DIM = M.qk_rope_head_dim
+HALF_ROPE = ROPE_HEAD_DIM // 2
 
 # paged block-table extents, one per cache
 ORI_TABLE_MAX_BLOCKS = KV_ORI_TABLE_MAX_BLOCKS
-CMP_MAX_BLOCKS = KV_CMP_MAX_BLOCKS
-IDX_MAX_BLOCKS = IDX_CACHE_MAX_BLOCKS
-HCA_STATE_MAX_BLOCKS = 2048
-CSA_STATE_MAX_BLOCKS = 4096
-CSA_INNER_STATE_MAX_BLOCKS = 4096
 
 # block_counts columns
 GROUP_ORI = 0
@@ -56,10 +58,83 @@ CSA_COMPRESS_RATIO = 4
 HCA_CMP_STORAGE_BLOCK_SIZE = BLOCK_SIZE // HCA_COMPRESS_RATIO
 CSA_CMP_STORAGE_BLOCK_SIZE = BLOCK_SIZE // CSA_COMPRESS_RATIO
 
+# rope table profiles: [0] = rope_theta (SWA), [1] = compress_rope_theta (HCA/CSA)
+SWA_ROPE_PROFILE = 0
+COMPRESSED_ROPE_PROFILE = 1
+
 # tiling
 X_HC_HIDDEN_TILE = 512
 MTP_HIDDEN_TILE = 1024
 SPMD_BLOCKS = 48
+
+
+@pl.jit.inline
+def gather_swa_rope_rows(
+    # Inputs: rows [0, ROPE_ROWS_DYN) of each profile must cover every position.
+    freqs_cos: pl.Tensor[[2, ROPE_ROWS_DYN, ROPE_HEAD_DIM], pl.BF16],
+    freqs_sin: pl.Tensor[[2, ROPE_ROWS_DYN, ROPE_HEAD_DIM], pl.BF16],
+    position_ids: pl.Tensor[[T], pl.INT32],
+    # Outputs.
+    swa_cos: pl.Tensor[[T, ROPE_HEAD_DIM], pl.BF16],
+    swa_sin: pl.Tensor[[T, ROPE_HEAD_DIM], pl.BF16],
+):
+    """Gather the SWA-profile RoPE row of every decode token."""
+    rope_rows = pl.tensor.dim(freqs_cos, 1)
+    profile_rows = 2 * rope_rows
+    cos_rows = pl.reshape(freqs_cos, [profile_rows, ROPE_HEAD_DIM])
+    sin_rows = pl.reshape(freqs_sin, [profile_rows, ROPE_HEAD_DIM])
+    with pl.at(level=pl.Level.CORE_GROUP, name_hint="decode_swa_rope_rows"):
+        for token in pl.range(T):
+            swa_row = SWA_ROPE_PROFILE * rope_rows + pl.cast(pl.read(position_ids, [token]), pl.INDEX)
+            swa_cos[token : token + 1, 0:ROPE_HEAD_DIM] = cos_rows[swa_row : swa_row + 1, 0:ROPE_HEAD_DIM]
+            swa_sin[token : token + 1, 0:ROPE_HEAD_DIM] = sin_rows[swa_row : swa_row + 1, 0:ROPE_HEAD_DIM]
+    return swa_cos, swa_sin
+
+
+@pl.jit.inline
+def gather_decode_rope_rows(
+    # Inputs: rows [0, ROPE_ROWS_DYN) of each profile must cover every position.
+    freqs_cos: pl.Tensor[[2, ROPE_ROWS_DYN, ROPE_HEAD_DIM], pl.BF16],
+    freqs_sin: pl.Tensor[[2, ROPE_ROWS_DYN, ROPE_HEAD_DIM], pl.BF16],
+    position_ids: pl.Tensor[[T], pl.INT32],
+    # Outputs.
+    swa_cos: pl.Tensor[[T, ROPE_HEAD_DIM], pl.BF16],
+    swa_sin: pl.Tensor[[T, ROPE_HEAD_DIM], pl.BF16],
+    cmp_cos: pl.Tensor[[T, ROPE_HEAD_DIM], pl.BF16],
+    cmp_sin: pl.Tensor[[T, ROPE_HEAD_DIM], pl.BF16],
+    hca_cmp_cos: pl.Tensor[[B, HALF_ROPE], pl.FP32],
+    hca_cmp_sin: pl.Tensor[[B, HALF_ROPE], pl.FP32],
+    csa_cmp_cos: pl.Tensor[[B, HALF_ROPE], pl.FP32],
+    csa_cmp_sin: pl.Tensor[[B, HALF_ROPE], pl.FP32],
+):
+    """Gather the token and compressed-boundary RoPE rows every decode layer reads.
+
+    ``cmp_*`` rows use the compressed profile at each token position; the
+    ``hca_cmp_*`` / ``csa_cmp_*`` rows rotate the entry a request's step may
+    compress, at ``first_position - first_position % ratio``.
+    """
+    rope_rows = pl.tensor.dim(freqs_cos, 1)
+    profile_rows = 2 * rope_rows
+    cos_rows = pl.reshape(freqs_cos, [profile_rows, ROPE_HEAD_DIM])
+    sin_rows = pl.reshape(freqs_sin, [profile_rows, ROPE_HEAD_DIM])
+    with pl.at(level=pl.Level.CORE_GROUP, name_hint="decode_rope_rows"):
+        for token in pl.range(T):
+            position = pl.cast(pl.read(position_ids, [token]), pl.INDEX)
+            swa_row = SWA_ROPE_PROFILE * rope_rows + position
+            cmp_row = COMPRESSED_ROPE_PROFILE * rope_rows + position
+            swa_cos[token : token + 1, 0:ROPE_HEAD_DIM] = cos_rows[swa_row : swa_row + 1, 0:ROPE_HEAD_DIM]
+            swa_sin[token : token + 1, 0:ROPE_HEAD_DIM] = sin_rows[swa_row : swa_row + 1, 0:ROPE_HEAD_DIM]
+            cmp_cos[token : token + 1, 0:ROPE_HEAD_DIM] = cos_rows[cmp_row : cmp_row + 1, 0:ROPE_HEAD_DIM]
+            cmp_sin[token : token + 1, 0:ROPE_HEAD_DIM] = sin_rows[cmp_row : cmp_row + 1, 0:ROPE_HEAD_DIM]
+        for request in pl.range(B):
+            first_position = pl.cast(pl.read(position_ids, [request * S]), pl.INDEX)
+            hca_row = COMPRESSED_ROPE_PROFILE * rope_rows + first_position - first_position % HCA_COMPRESS_RATIO
+            csa_row = COMPRESSED_ROPE_PROFILE * rope_rows + first_position - first_position % CSA_COMPRESS_RATIO
+            hca_cmp_cos[request : request + 1, 0:HALF_ROPE] = pl.cast(cos_rows[hca_row : hca_row + 1, 0:HALF_ROPE], target_type=pl.FP32)
+            hca_cmp_sin[request : request + 1, 0:HALF_ROPE] = pl.cast(sin_rows[hca_row : hca_row + 1, 0:HALF_ROPE], target_type=pl.FP32)
+            csa_cmp_cos[request : request + 1, 0:HALF_ROPE] = pl.cast(cos_rows[csa_row : csa_row + 1, 0:HALF_ROPE], target_type=pl.FP32)
+            csa_cmp_sin[request : request + 1, 0:HALF_ROPE] = pl.cast(sin_rows[csa_row : csa_row + 1, 0:HALF_ROPE], target_type=pl.FP32)
+    return swa_cos, swa_sin, cmp_cos, cmp_sin, hca_cmp_cos, hca_cmp_sin, csa_cmp_cos, csa_cmp_sin
 
 
 @pl.jit.inline
@@ -126,14 +201,12 @@ def build_decode_metadata(
     # Inputs: bare Tensor parameters have PyPTO's default In direction.
     position_ids: pl.Tensor[[T], pl.INT32],
     ori_block_table: pl.Tensor[[B, ORI_TABLE_MAX_BLOCKS], pl.INT32],
-    hca_cmp_block_table: pl.Tensor[[B, CMP_MAX_BLOCKS], pl.INT32],
-    csa_cmp_block_table: pl.Tensor[[B, CMP_MAX_BLOCKS], pl.INT32],
-    idx_block_table: pl.Tensor[[B, IDX_MAX_BLOCKS], pl.INT32],
-    hca_state_block_table: pl.Tensor[[B, HCA_STATE_MAX_BLOCKS], pl.INT32],
-    csa_state_block_table: pl.Tensor[[B, CSA_STATE_MAX_BLOCKS], pl.INT32],
-    csa_inner_state_block_table: pl.Tensor[
-        [B, CSA_INNER_STATE_MAX_BLOCKS], pl.INT32
-    ],
+    hca_cmp_block_table: pl.Tensor[[B, HCA_CMP_TABLE_BLOCKS_DYN], pl.INT32],
+    csa_cmp_block_table: pl.Tensor[[B, CSA_CMP_TABLE_BLOCKS_DYN], pl.INT32],
+    idx_block_table: pl.Tensor[[B, IDX_TABLE_BLOCKS_DYN], pl.INT32],
+    hca_state_block_table: pl.Tensor[[B, HCA_STATE_TABLE_BLOCKS_DYN], pl.INT32],
+    csa_state_block_table: pl.Tensor[[B, CSA_STATE_TABLE_BLOCKS_DYN], pl.INT32],
+    csa_inner_state_block_table: pl.Tensor[[B, CSA_INNER_STATE_TABLE_BLOCKS_DYN], pl.INT32],
     block_counts: pl.Tensor[[B, N_CACHE_GROUPS], pl.INT32],
     # Outputs.
     ori_slot_mapping: pl.Out[pl.Tensor[[T], pl.INT64]],

@@ -22,8 +22,7 @@ from config import (
     BLOCK_SIZE,
     DECODE_CMP_BLOCK_NUM,
     DECODE_ORI_BLOCK_NUM,
-    KV_CMP_MAX_BLOCKS,
-    KV_ORI_MAX_BLOCKS,
+    KV_ORI_TABLE_MAX_BLOCKS,
     INT8_SCALE_MAX,
     INT8_AMAX_EPS,
 )
@@ -32,6 +31,7 @@ from config import (
 # Dynamic shape variables.
 ORI_BLOCK_NUM_DYN = pl.dynamic("ORI_BLOCK_NUM_DYN")
 CMP_BLOCK_NUM_DYN = pl.dynamic("CMP_BLOCK_NUM_DYN")
+CMP_TABLE_BLOCKS_DYN = pl.dynamic("CSA_CMP_TABLE_BLOCKS_DYN")
 
 # model config
 B = DECODE_BATCH
@@ -55,14 +55,12 @@ O_GROUP_IN = HEADS_PER_GROUP * HEAD_DIM
 COMPRESS_RATIO = 4
 CMP_STORAGE_BLOCK_SIZE = BLOCK_SIZE // COMPRESS_RATIO
 COMPRESS_RATIO_INV = 1.0 / COMPRESS_RATIO
-INDEXER_SCORE_LEN = MAX_SEQ_LEN // 4
 CSA_CMP_GE_BIAS = 1.0  # raw + 1, folded for the ge clamp
 NEG_INF = -1.0e20
 
 # paged KV cache
-ORI_MAX_BLOCKS = KV_ORI_MAX_BLOCKS
+ORI_TABLE_MAX_BLOCKS = KV_ORI_TABLE_MAX_BLOCKS
 ORI_BLOCK_NUM = DECODE_ORI_BLOCK_NUM
-CMP_MAX_BLOCKS = KV_CMP_MAX_BLOCKS
 CMP_BLOCK_NUM = DECODE_CMP_BLOCK_NUM
 
 # tiling
@@ -102,8 +100,8 @@ def sparse_attn_csa(
     ori_kv: pl.Tensor[[ORI_BLOCK_NUM_DYN, BLOCK_SIZE, 1, HEAD_DIM], pl.BF16],
     window_swa_indices: pl.Tensor[[T, WIN], pl.INT32],
     cmp_kv: pl.Tensor[[CMP_BLOCK_NUM_DYN, CMP_STORAGE_BLOCK_SIZE, 1, HEAD_DIM], pl.BF16],
-    cmp_block_table: pl.Tensor[[B, CMP_MAX_BLOCKS], pl.INT32],
-    idx_topk: pl.Tensor[[T, INDEXER_SCORE_LEN], pl.INT32],
+    cmp_block_table: pl.Tensor[[B, CMP_TABLE_BLOCKS_DYN], pl.INT32],
+    idx_topk: pl.Tensor[[T, IDX_TOPK], pl.INT32],
     position_ids: pl.Tensor[[T, 1], pl.INT32],
     attn_sink: pl.Tensor[[H], pl.FP32],
     freqs_cos: pl.Tensor[[T, ROPE_DIM], pl.BF16],
@@ -488,8 +486,8 @@ def sparse_attn_test(
     ori_kv: pl.Tensor[[ORI_BLOCK_NUM_DYN, BLOCK_SIZE, 1, HEAD_DIM], pl.BF16],
     window_swa_indices: pl.Tensor[[T, WIN], pl.INT32],
     cmp_kv: pl.Tensor[[CMP_BLOCK_NUM_DYN, CMP_STORAGE_BLOCK_SIZE, 1, HEAD_DIM], pl.BF16],
-    cmp_block_table: pl.Tensor[[B, CMP_MAX_BLOCKS], pl.INT32],
-    idx_topk: pl.Tensor[[T, INDEXER_SCORE_LEN], pl.INT32],
+    cmp_block_table: pl.Tensor[[B, CMP_TABLE_BLOCKS_DYN], pl.INT32],
+    idx_topk: pl.Tensor[[T, IDX_TOPK], pl.INT32],
     position_ids: pl.Tensor[[T, 1], pl.INT32],
     attn_sink: pl.Tensor[[H], pl.FP32],
     freqs_cos: pl.Tensor[[T, ROPE_DIM], pl.BF16],
@@ -499,6 +497,7 @@ def sparse_attn_test(
     wo_b_scale: pl.Tensor[[D], pl.FP32],
     attn_out: pl.Out[pl.Tensor[[T, D], pl.BF16]],
 ):
+    cmp_block_table.bind_dynamic(1, CMP_TABLE_BLOCKS_DYN)
     sparse_attn_csa(
         q,
         ori_kv, window_swa_indices,
@@ -647,6 +646,7 @@ def build_tensor_specs(
     from utils import build_rope_tables, materialize_token_rope_tables
 
     cmp_valid = IDX_TOPK
+    cmp_table_blocks = (COMPRESS_RATIO * CMP_TOPK) // BLOCK_SIZE + 1
     shared_freqs_cos, shared_freqs_sin = build_rope_tables(M, COMPRESS_RATIO, dtype=torch.bfloat16)
     rope_positions = torch.arange(T, dtype=torch.int32)
     shared_rope_cos, shared_rope_sin = materialize_token_rope_tables(shared_freqs_cos, shared_freqs_sin, rope_positions)
@@ -695,11 +695,11 @@ def build_tensor_specs(
 
     def init_window_block_table():
         """Build the demo block table for the sliding-window cache pages."""
-        return block_table(batch=B, table_blocks=ORI_MAX_BLOCKS, physical_blocks=ORI_BLOCK_NUM)
+        return block_table(batch=B, table_blocks=ORI_TABLE_MAX_BLOCKS, physical_blocks=ORI_BLOCK_NUM)
 
     def init_cmp_block_table():
         """Build the demo block table for the compressed-cache pages."""
-        rows = torch.arange(CMP_MAX_BLOCKS, dtype=torch.int32) % CMP_BLOCK_NUM
+        rows = torch.arange(cmp_table_blocks, dtype=torch.int32) % CMP_BLOCK_NUM
         return rows.unsqueeze(0).expand(B, -1).clone()
 
     def init_cmp_sparse_indices():
@@ -724,9 +724,7 @@ def build_tensor_specs(
         """Raw indexer topk feeding sparse_attn's compressed-slot masking. Only the
         first CMP_TOPK cols are read; identity mask here (see init_position_ids), so
         the masked output equals this fixture pattern."""
-        topk = torch.full((T, INDEXER_SCORE_LEN), -1, dtype=torch.int32)
-        topk[:, :CMP_TOPK] = init_cmp_sparse_indices()
-        return topk
+        return init_cmp_sparse_indices()
 
     def init_position_ids():
         """Large enough that floor((pos + 1) / COMPRESS_RATIO) >= CMP_TOPK, so the
@@ -761,8 +759,8 @@ def build_tensor_specs(
         TensorSpec("ori_kv", [ORI_BLOCK_NUM, BLOCK_SIZE, 1, HEAD_DIM], torch.bfloat16, init_value=init_ori_kv),
         TensorSpec("window_swa_indices", [T, WIN], torch.int32, init_value=init_window_swa_indices),
         TensorSpec("cmp_kv", [CMP_BLOCK_NUM, CMP_STORAGE_BLOCK_SIZE, 1, HEAD_DIM], torch.bfloat16, init_value=init_cmp_kv),
-        TensorSpec("cmp_block_table", [B, CMP_MAX_BLOCKS], torch.int32, init_value=init_cmp_block_table),
-        TensorSpec("idx_topk", [T, INDEXER_SCORE_LEN], torch.int32, init_value=init_idx_topk),
+        TensorSpec("cmp_block_table", [B, cmp_table_blocks], torch.int32, init_value=init_cmp_block_table),
+        TensorSpec("idx_topk", [T, IDX_TOPK], torch.int32, init_value=init_idx_topk),
         TensorSpec("position_ids", [T, 1], torch.int32, init_value=init_position_ids),
         TensorSpec("attn_sink", [H], torch.float32, init_value=init_attn_sink),
         TensorSpec("freqs_cos", [T, ROPE_DIM], torch.bfloat16, init_value=init_cos),

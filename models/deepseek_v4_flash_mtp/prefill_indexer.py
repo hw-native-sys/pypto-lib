@@ -57,10 +57,14 @@ S = 128
 T = B * S
 START_POS = 0
 MAX_CMP_WRITES = max(1, T // COMPRESS_RATIO)
-# CP selector widths.
-CP_INDEXER_SCORE_CAP = 2048
-CP_INDEXER_SORT_LEN = 2048
+# CP selector widths: every visible compressed row is a candidate; exact TopK
+# leaves sort CP_INDEXER_LEAF_LEN candidates each and fold into one pair row.
+CP_INDEXER_SCORE_CAP = MAX_SEQ_LEN // COMPRESS_RATIO
+CP_INDEXER_LEAF_LEN = 2048
 CP_INDEXER_SELECTED_WIDTH = IDX_TOPK
+CP_INDEXER_PAIR_WIDTH = 2 * IDX_TOPK
+CP_SCORE_COLS_DYN = pl.dynamic("CP_INDEXER_SCORE_COLS_DYN")
+assert CP_INDEXER_SCORE_CAP % CP_INDEXER_LEAF_LEN == 0
 
 # tiling
 CACHE_TILE = 32
@@ -353,39 +357,55 @@ def prefill_indexer(
 
 @pl.jit.incore
 def _cp_topk512_query(
-    score_wide: pl.Tensor[[T, CP_INDEXER_SORT_LEN], pl.FP32],
+    score_wide: pl.Tensor[[T, CP_SCORE_COLS_DYN], pl.FP32],
     position_ids: pl.Tensor[[T], pl.INT32],
     num_tokens: pl.Scalar[pl.INT32],
+    candidate_rows: pl.Scalar[pl.INDEX],
+    topk_pairs: pl.Tensor[[T, CP_INDEXER_PAIR_WIDTH], pl.FP32],
     cmp_topk_indices: pl.Tensor[[T, IDX_TOPK], pl.INT32],
 ) -> None:
-    """Select one exact TopK=512 row with the PTOAS-0.60 sort path."""
+    """Select one exact TopK=512 row over every visible candidate, one sort leaf at a time."""
     query = pl.tile.get_block_idx()
     empty_indices = pl.tile.full([1, IDX_TOPK], dtype=pl.INT32, value=-1)
     pl.store(empty_indices, [query, 0], cmp_topk_indices)
 
     if query < num_tokens:
         position = pl.read(position_ids, [query])
-        visible_count = pl.max(pl.min((position + 1) // COMPRESS_RATIO, CP_INDEXER_SCORE_CAP), 0)
+        visible_count = pl.max(pl.min((position + 1) // COMPRESS_RATIO, candidate_rows), 0)
         if visible_count > 0:
-            score_row_raw = pl.load(
-                score_wide,
-                [query, 0],
-                [1, CP_INDEXER_SORT_LEN],
-                valid_shape=[1, visible_count],
-            )
-            score_row = pl.tile.fillpad(score_row_raw, pad_value=pl.PadValue.min)
-            score_floor = pl.tile.full([1, CP_INDEXER_SORT_LEN], dtype=pl.FP32, value=FP32_NEG_INF)
-            score_row = pl.maximum(score_row, score_floor)
-            index_ramp = pl.tile.arange(0, [1, CP_INDEXER_SORT_LEN], dtype=pl.INT32)
-            pairs = pl.tile.sort32(score_row, pl.reinterpret_view(index_ramp, pl.UINT32))
-            pairs = pl.tile.mrgsort(pairs, block_len=64)
-            pairs = pl.tile.mrgsort(pairs, block_len=256)
-            pairs = pl.tile.mrgsort(pairs, block_len=1024)
-            # sort32 produces 32-score runs (64 interleaved pair lanes).
-            # The 64/256/1024 stages therefore fully sort 2048 scores.  A
-            # 4096 stage is only valid for the 8192-score #1080 donor leaf;
-            # on this 2048-score row it lowers to an illegal AIV config.
-            top_pairs = pl.tile.slice(pairs, [1, 2 * IDX_TOPK], [0, 0])
+            leaf_count = (visible_count + CP_INDEXER_LEAF_LEN - 1) // CP_INDEXER_LEAF_LEN
+            for leaf in pl.range(leaf_count):
+                leaf0 = leaf * CP_INDEXER_LEAF_LEN
+                leaf_valid = pl.min(CP_INDEXER_LEAF_LEN, visible_count - leaf0)
+                score_row_raw = pl.load(
+                    score_wide,
+                    [query, leaf0],
+                    [1, CP_INDEXER_LEAF_LEN],
+                    valid_shape=[1, leaf_valid],
+                )
+                score_row = pl.tile.fillpad(score_row_raw, pad_value=pl.PadValue.min)
+                score_floor = pl.tile.full([1, CP_INDEXER_LEAF_LEN], dtype=pl.FP32, value=FP32_NEG_INF)
+                score_row = pl.maximum(score_row, score_floor)
+                index_ramp = pl.tile.arange(0, [1, CP_INDEXER_LEAF_LEN], dtype=pl.INT32)
+                leaf_indices = pl.add(index_ramp, pl.cast(leaf0, pl.INT32))
+                pairs = pl.tile.sort32(score_row, pl.reinterpret_view(leaf_indices, pl.UINT32))
+                pairs = pl.tile.mrgsort(pairs, block_len=64)
+                pairs = pl.tile.mrgsort(pairs, block_len=256)
+                pairs = pl.tile.mrgsort(pairs, block_len=1024)
+                # sort32 produces 32-score runs (64 interleaved pair lanes).
+                # The 64/256/1024 stages therefore fully sort 2048 scores.  A
+                # 4096 stage is only valid for the 8192-score #1080 donor leaf;
+                # on this 2048-score row it lowers to an illegal AIV config.
+                leaf_pairs = pl.tile.slice(pairs, [1, CP_INDEXER_PAIR_WIDTH], [0, 0])
+                if leaf == 0:
+                    pl.store(leaf_pairs, [query, 0], topk_pairs)
+                else:
+                    running_pairs = pl.load(topk_pairs, [query, 0], [1, CP_INDEXER_PAIR_WIDTH])
+                    merge_tmp = pl.tile.create([1, 2 * CP_INDEXER_PAIR_WIDTH], dtype=pl.FP32)
+                    merged_all = pl.tile.mrgsort(running_pairs, leaf_pairs, tmp=merge_tmp)
+                    merged_pairs = pl.tile.slice(merged_all, [1, CP_INDEXER_PAIR_WIDTH], [0, 0])
+                    pl.store(merged_pairs, [query, 0], topk_pairs)
+            top_pairs = pl.load(topk_pairs, [query, 0], [1, CP_INDEXER_PAIR_WIDTH])
             selected_indices = pl.tile.gather_mask(
                 top_pairs,
                 mask_pattern=pl.tile.MaskPattern.P1010,
@@ -543,18 +563,22 @@ def _prefill_indexer_cp_score_topk(
     idx_block_num = pl.tensor.dim(idx_kv_cache, 0)
     kv_cache_i8_flat = pl.reshape(idx_kv_cache, [idx_block_num * BLOCK_SIZE, IDX_HEAD_DIM])
     kv_scale_flat = pl.reshape(idx_kv_scale, [idx_block_num * BLOCK_SIZE, 1])
-    score_wide = pl.create_tensor([T, CP_INDEXER_SORT_LEN], dtype=pl.FP32)
-    for si in pl.parallel(0, T, SCORE_INIT_TILE):
-        with pl.at(level=pl.Level.CORE_GROUP, name_hint="prefill_cp_idx_score_init"):
-            score_init_tile = pl.full([SCORE_INIT_TILE, CP_INDEXER_SORT_LEN], dtype=pl.FP32, value=FP32_NEG_INF)
-            score_wide[si : si + SCORE_INIT_TILE, :] = score_init_tile
+    # Page 0 of the scored root is the zero sentinel; the rest are candidate rows.
+    candidate_rows = pl.min((idx_block_num - 1) * BLOCK_SIZE, CP_INDEXER_SCORE_CAP)
+    score_cols = ((candidate_rows + CP_INDEXER_LEAF_LEN - 1) // CP_INDEXER_LEAF_LEN) * CP_INDEXER_LEAF_LEN
+    score_wide = pl.create_tensor([T, score_cols], dtype=pl.FP32)
+    for si in pl.spmd(T // SCORE_INIT_TILE, name_hint="prefill_cp_idx_score_init"):
+        init_row0 = si * SCORE_INIT_TILE
+        for init_col0 in pl.range(0, score_cols, CP_INDEXER_LEAF_LEN):
+            score_init_tile = pl.full([SCORE_INIT_TILE, CP_INDEXER_LEAF_LEN], dtype=pl.FP32, value=FP32_NEG_INF)
+            score_wide[init_row0 : init_row0 + SCORE_INIT_TILE, init_col0 : init_col0 + CP_INDEXER_LEAF_LEN] = score_init_tile
 
     with pl.spmd(T // SCORE_TOKEN_TILE, name_hint="prefill_cp_idx_score", deps=[prior_dep]) as score_tid:
         score_idx = pl.tile.get_block_idx()
         token0 = score_idx * SCORE_TOKEN_TILE
         last_pos = pl.read(position_ids, [num_tokens - 1])
-        visible_limit = pl.min((last_pos + 1) // COMPRESS_RATIO, CP_INDEXER_SCORE_CAP)
-        for cb in pl.range(CP_INDEXER_SCORE_CAP // CACHE_TILE):
+        visible_limit = pl.min((last_pos + 1) // COMPRESS_RATIO, candidate_rows)
+        for cb in pl.range((visible_limit + CACHE_TILE - 1) // CACHE_TILE):
             cache0 = cb * CACHE_TILE
             logical_block = cache0 // BLOCK_SIZE
             page_offset = cache0 % BLOCK_SIZE
@@ -591,7 +615,7 @@ def _prefill_indexer_cp_score_topk(
                             weighted_sum = pl.row_sum(weighted_heads)
                             weighted_score_s = pl.reshape(weighted_sum, [1, CACHE_TILE])
                             pos = pl.read(position_ids, [t])
-                            visible_t = pl.min((pos + 1) // COMPRESS_RATIO, CP_INDEXER_SCORE_CAP)
+                            visible_t = pl.min((pos + 1) // COMPRESS_RATIO, candidate_rows)
                             if visible_t > cache0:
                                 valid_len_t = pl.min(CACHE_TILE, visible_t - cache0)
                             else:
@@ -605,8 +629,9 @@ def _prefill_indexer_cp_score_topk(
     # Select the model-configured TopK=512 with the incore tile path used by
     # #1080.  The old orchestration-level 4096 merge lowers to an illegal
     # vector configuration on A2/A3.
+    topk_pairs = pl.create_tensor([T, CP_INDEXER_PAIR_WIDTH], dtype=pl.FP32)
     with pl.spmd(T, name_hint="prefill_cp_idx_topk", deps=[score_tid, prior_dep]) as _topk_tid:
-        _cp_topk512_query(score_wide, position_ids, num_tokens, cmp_topk_indices)
+        _cp_topk512_query(score_wide, position_ids, num_tokens, candidate_rows, topk_pairs, cmp_topk_indices)
 
     return cmp_topk_indices, _topk_tid
 

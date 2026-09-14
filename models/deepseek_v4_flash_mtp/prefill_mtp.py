@@ -58,6 +58,7 @@ from moe import (
 from mtp_projection import _quantize_weight_per_out, golden_mtp_projection, mtp_projection
 from prefill_swa import (
     BLOCK_NUM,
+    BLOCK_TABLE_BLOCKS,
     BLOCK_NUM_DYN,
     BLOCK_SIZE,
     H,
@@ -140,7 +141,7 @@ def mtp_prefill_fwd(
     freqs_cos: pl.Tensor[[2, MAX_SEQ_LEN, ROPE_HEAD_DIM], pl.BF16],
     freqs_sin: pl.Tensor[[2, MAX_SEQ_LEN, ROPE_HEAD_DIM], pl.BF16],
     kv_cache: pl.InOut[pl.Tensor[[BLOCK_NUM_DYN, BLOCK_SIZE, 1, HEAD_DIM], pl.BF16]],
-    ori_block_table: pl.Tensor[[BLOCK_NUM], pl.INT32],
+    ori_block_table: pl.Tensor[[BLOCK_TABLE_BLOCKS], pl.INT32],
     ori_slot_mapping: pl.Tensor[[T], pl.INT64],
     position_ids: pl.Tensor[[T], pl.INT32],
     attn_sink: pl.Tensor[[H], pl.FP32],
@@ -283,7 +284,7 @@ def l3_mtp_prefill_fwd(
     freqs_cos: pl.Tensor[[N_RANKS, 2, MAX_SEQ_LEN, ROPE_HEAD_DIM], pl.BF16],
     freqs_sin: pl.Tensor[[N_RANKS, 2, MAX_SEQ_LEN, ROPE_HEAD_DIM], pl.BF16],
     kv_cache: pl.InOut[pl.Tensor[[N_RANKS, BLOCK_NUM_DYN, BLOCK_SIZE, 1, HEAD_DIM], pl.BF16]],
-    ori_block_table: pl.Tensor[[N_RANKS, BLOCK_NUM], pl.INT32],
+    ori_block_table: pl.Tensor[[N_RANKS, BLOCK_TABLE_BLOCKS], pl.INT32],
     ori_slot_mapping: pl.Tensor[[N_RANKS, T], pl.INT64],
     position_ids: pl.Tensor[[N_RANKS, T], pl.INT32],
     attn_sink: pl.Tensor[[N_RANKS, H], pl.FP32],
@@ -585,10 +586,10 @@ def build_tensor_specs(
             table_dtype = base[name].dtype
 
             def init_ori_block_table():
-                table = torch.arange(BLOCK_NUM, dtype=table_dtype).remainder(ori_block_num)
-                return table.view(1, BLOCK_NUM).expand(N_RANKS, -1).contiguous()
+                table = torch.arange(BLOCK_TABLE_BLOCKS, dtype=table_dtype).remainder(ori_block_num)
+                return table.view(1, BLOCK_TABLE_BLOCKS).expand(N_RANKS, -1).contiguous()
 
-            block_table_spec = TensorSpec(name, [N_RANKS, BLOCK_NUM], table_dtype, init_value=init_ori_block_table)
+            block_table_spec = TensorSpec(name, [N_RANKS, BLOCK_TABLE_BLOCKS], table_dtype, init_value=init_ori_block_table)
             specs.append(block_table_spec)
         elif name == "ori_slot_mapping":
             slot_init = base[name].init_value

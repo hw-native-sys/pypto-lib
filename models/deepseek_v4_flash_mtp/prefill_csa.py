@@ -182,13 +182,15 @@ MAIN_STATE_BLOCK_SIZE = 4
 MAIN_STATE_MAX_BLOCKS = (M.max_position_embeddings + MAIN_STATE_BLOCK_SIZE - 1) // MAIN_STATE_BLOCK_SIZE
 
 CP_CANDIDATE_CAPACITY = CP_INDEXER_SCORE_CAP
+GOLDEN_SCORE_ROW_CHUNK = 64
+GOLDEN_SCORE_COL_CHUNK = 16384
 SPARSE_SELECTED_WIDTH = IDX_TOPK
 CSA_TOPK_SEED_ROWS = 16
 PREFILL_CP_CSA_RING_HEAP = (1024 * 1024 * 1024,) * 4
+# Temporary roots hold the prefix history plus this chunk's compressed rows,
+# page 0 being the zero sentinel; their page count is sized at runtime.
 CP_TMP_COMPRESSED_ROWS = (NUM_SEGMENTS * MAX_SEGMENT_TILES * T // COMPRESS_RATIO)
-CP_TMP_DATA_PAGES = (CP_TMP_COMPRESSED_ROWS + BLOCK_SIZE - 1) // BLOCK_SIZE
-CP_TMP_CACHE_PAGES = 1 + CP_TMP_DATA_PAGES
-CP_TMP_CACHE_ROWS = CP_TMP_CACHE_PAGES * BLOCK_SIZE
+CP_TMP_PAGES_DYN = pl.dynamic("CP_CSA_TMP_PAGES_DYN")
 CP_RAW_DATA_PAGES = NUM_SEGMENTS * MAX_SEGMENT_TILES
 CP_RAW_CACHE_PAGES = 1 + CP_RAW_DATA_PAGES + 1
 CP_HISTORY_ROW0 = (1 + CP_RAW_DATA_PAGES) * BLOCK_SIZE
@@ -309,14 +311,16 @@ def validate_cp_indexer_capacity(candidate_history: int) -> None:
         )
 
 
-def _build_block_tables(cp_size: int) -> dict[str, torch.Tensor]:
+def _build_block_tables(cp_size: int, candidate_history: int) -> dict[str, torch.Tensor]:
     def table(logical_blocks: int, physical_blocks: int) -> torch.Tensor:
         logical = torch.arange(logical_blocks, dtype=torch.int32)
         return (logical % physical_blocks).unsqueeze(0).repeat(cp_size, 1)
 
+    # Compressed pools cover every row up to the request end.
+    history_blocks = (candidate_history + CMP_STORAGE_BLOCK_SIZE - 1) // CMP_STORAGE_BLOCK_SIZE
     return {
-        "cmp_block_table": table(PREFILL_CMP_MAX_BLOCKS, CP_PREFILL_CMP_BLOCK_NUM),
-        "idx_block_table": table(PREFILL_IDX_MAX_BLOCKS, PREFILL_IDX_BLOCK_NUM),
+        "cmp_block_table": table(PREFILL_CMP_MAX_BLOCKS, max(CP_PREFILL_CMP_BLOCK_NUM, history_blocks)),
+        "idx_block_table": table(PREFILL_IDX_MAX_BLOCKS, max(PREFILL_IDX_BLOCK_NUM, history_blocks)),
         "compress_state_block_table": table(MAIN_STATE_MAX_BLOCKS, CSA_STATE_PHYSICAL_BLOCKS),
         "inner_compress_state_block_table": table(INNER_STATE_MAX_BLOCKS, CSA_INNER_STATE_PHYSICAL_BLOCKS),
     }
@@ -342,7 +346,7 @@ def _build_metadata_tensors(
     candidate_history = request_end // COMPRESS_RATIO
     validate_cp_indexer_capacity(candidate_history)
 
-    tables = _build_block_tables(cp_size)
+    tables = _build_block_tables(cp_size, candidate_history)
     boundary_positions = torch.full((nseg, MAX_COMPRESSED_ROWS_PER_SEGMENT), -1, dtype=torch.int32)
     main_logical_slots = torch.full_like(boundary_positions, -1)
     idx_logical_slots = torch.full_like(boundary_positions, -1)
@@ -447,20 +451,20 @@ def _build_metadata_tensors(
             final_main_state_mapping[rank, row] = _lower_row(main_table, position, MAIN_STATE_BLOCK_SIZE)
             final_inner_state_mapping[rank, row] = _lower_row(inner_table, position, INNER_STATE_BLOCK_SIZE)
 
-    dense_idx_prefix = torch.full((cp_size, CP_CANDIDATE_CAPACITY), -1, dtype=torch.int32)
-    dense_cmp_prefix = torch.full_like(dense_idx_prefix, -1)
-    for rank in range(cp_size):
-        for logical_slot in range(candidate_history):
-            dense_idx_prefix[rank, logical_slot] = _lower_row(
-                tables["idx_block_table"][rank],
-                logical_slot,
-                CMP_STORAGE_BLOCK_SIZE,
-            )
-            dense_cmp_prefix[rank, logical_slot] = _lower_row(
-                tables["cmp_block_table"][rank],
-                logical_slot,
-                CMP_STORAGE_BLOCK_SIZE,
-            )
+    def lower_prefix(table_name):
+        prefix_rows = torch.full((cp_size, CP_CANDIDATE_CAPACITY), -1, dtype=torch.int32)
+        slots = torch.arange(candidate_history, dtype=torch.int64)
+        blocks = slots // CMP_STORAGE_BLOCK_SIZE
+        for rank in range(cp_size):
+            table = tables[table_name][rank].to(torch.int64)
+            in_table = blocks < table.numel()
+            physical = torch.where(in_table, table[blocks.clamp(max=table.numel() - 1)], torch.full_like(blocks, -1))
+            rows = physical * CMP_STORAGE_BLOCK_SIZE + slots % CMP_STORAGE_BLOCK_SIZE
+            prefix_rows[rank, :candidate_history] = torch.where(physical >= 0, rows, torch.full_like(rows, -1)).to(torch.int32)
+        return prefix_rows
+
+    dense_idx_prefix = lower_prefix("idx_block_table")
+    dense_cmp_prefix = lower_prefix("cmp_block_table")
 
     tensors = {
         "segment_starts": torch.tensor(starts, dtype=torch.int32),
@@ -819,16 +823,11 @@ def build_cp_tensor_specs(cp_size: int = CP_SIZE, *, num_tokens: int | None = No
             if row >= 0:
                 inner_flat[row] = value
 
-    cmp_cache = torch.zeros(
-        cp_size,
-        CP_PREFILL_CMP_BLOCK_NUM,
-        CMP_STORAGE_BLOCK_SIZE,
-        1,
-        HEAD_DIM,
-        dtype=torch.bfloat16,
-    )
-    idx_cache = torch.zeros(cp_size, PREFILL_IDX_BLOCK_NUM, CMP_STORAGE_BLOCK_SIZE, 1, IDX_HEAD_DIM, dtype=torch.int8)
-    idx_scale = torch.zeros(cp_size, PREFILL_IDX_BLOCK_NUM, CMP_STORAGE_BLOCK_SIZE, 1, 1, dtype=torch.float32)
+    cmp_blocks = int(metadata["cmp_block_table"].max()) + 1
+    idx_blocks = int(metadata["idx_block_table"].max()) + 1
+    cmp_cache = torch.zeros(cp_size, cmp_blocks, CMP_STORAGE_BLOCK_SIZE, 1, HEAD_DIM, dtype=torch.bfloat16)
+    idx_cache = torch.zeros(cp_size, idx_blocks, CMP_STORAGE_BLOCK_SIZE, 1, IDX_HEAD_DIM, dtype=torch.int8)
+    idx_scale = torch.zeros(cp_size, idx_blocks, CMP_STORAGE_BLOCK_SIZE, 1, 1, dtype=torch.float32)
     completed = prefix // COMPRESS_RATIO
     logical_cmp = ((torch.rand(completed, HEAD_DIM) - 0.5) .to(torch.bfloat16) .contiguous())
     logical_idx = torch.randint(-31, 32, (completed, IDX_HEAD_DIM), dtype=torch.int8)
@@ -1136,9 +1135,9 @@ def _prefill_cp_csa_history_exchange(
     history_raw: pl.Out[pl.Tensor[[T, HEAD_DIM], pl.BF16]],
     history_main: pl.Out[pl.Tensor[[STATE_LEN, MAIN_STATE_DIM], pl.FP32]],
     history_inner: pl.Out[pl.Tensor[[STATE_LEN, INNER_STATE_DIM], pl.FP32]],
-    cmp_root: pl.InOut[pl.Tensor[[CP_TMP_CACHE_PAGES, BLOCK_SIZE, 1, HEAD_DIM], pl.BF16]],
-    idx_root: pl.InOut[pl.Tensor[[CP_TMP_CACHE_PAGES, BLOCK_SIZE, 1, IDX_HEAD_DIM], pl.INT8]],
-    scale_root: pl.InOut[pl.Tensor[[CP_TMP_CACHE_PAGES, BLOCK_SIZE, 1, 1], pl.FP16]],
+    cmp_root: pl.InOut[pl.Tensor[[CP_TMP_PAGES_DYN, BLOCK_SIZE, 1, HEAD_DIM], pl.BF16]],
+    idx_root: pl.InOut[pl.Tensor[[CP_TMP_PAGES_DYN, BLOCK_SIZE, 1, IDX_HEAD_DIM], pl.INT8]],
+    scale_root: pl.InOut[pl.Tensor[[CP_TMP_PAGES_DYN, BLOCK_SIZE, 1, 1], pl.FP16]],
     base: pl.Scalar[pl.INT32],
     cache_owner_rank: pl.Scalar[pl.INT32],
     my_rank: pl.Scalar[pl.INT32],
@@ -1160,9 +1159,10 @@ def _prefill_cp_csa_history_exchange(
     scale_flat = pl.reshape(idx_kv_scale, [idx_rows, 1])
     main_flat = pl.reshape(compress_state, [main_rows, MAIN_STATE_DIM])
     inner_flat = pl.reshape(inner_compress_state, [inner_rows, INNER_STATE_DIM])
-    cmp_dst = pl.reshape(cmp_root, [CP_TMP_CACHE_ROWS, HEAD_DIM])
-    idx_dst = pl.reshape(idx_root, [CP_TMP_CACHE_ROWS, IDX_HEAD_DIM])
-    scale_dst = pl.reshape(scale_root, [CP_TMP_CACHE_ROWS, 1])
+    root_rows = pl.tensor.dim(cmp_root, 0) * BLOCK_SIZE
+    cmp_dst = pl.reshape(cmp_root, [root_rows, HEAD_DIM])
+    idx_dst = pl.reshape(idx_root, [root_rows, IDX_HEAD_DIM])
+    scale_dst = pl.reshape(scale_root, [root_rows, 1])
     raw_payload = pl.create_tensor([T, HEAD_DIM], dtype=pl.BF16)
     main_payload = pl.create_tensor([STATE_LEN, MAIN_STATE_DIM], dtype=pl.FP32)
     inner_payload = pl.create_tensor([STATE_LEN, INNER_STATE_DIM], dtype=pl.FP32)
@@ -1261,7 +1261,7 @@ def _prefill_cp_csa_history_exchange(
             else:
                 for row in pl.range(RECORDS_PER_WINDOW):
                     logical = (phase - 1) * RECORDS_PER_WINDOW + row
-                    if logical < compressed:
+                    if logical < compressed and BLOCK_SIZE + logical < root_rows:
                         destination = BLOCK_SIZE + logical
                         cmp_dst[destination:destination + 1, :] = main_window[row:row + 1, 0:HEAD_DIM]
                         idx_dst[destination:destination + 1, :] = idx_window[row:row + 1, 0:IDX_HEAD_DIM]
@@ -1385,16 +1385,21 @@ def prefill_attention_csa(
     # Keep the serving/decode pools above as the stable public ABI; receiver
     # commit first lands in these roots, then copies through them to the
     # existing pools so the temporary ABI is part of the real dataflow.
-    cp_tmp_cmp_kv = pl.create_tensor([CP_TMP_CACHE_PAGES, BLOCK_SIZE, 1, HEAD_DIM], dtype=pl.BF16)
-    cp_tmp_idx_kv = pl.create_tensor([CP_TMP_CACHE_PAGES, BLOCK_SIZE, 1, IDX_HEAD_DIM], dtype=pl.INT8)
-    cp_tmp_idx_scale = pl.create_tensor([CP_TMP_CACHE_PAGES, BLOCK_SIZE, 1, 1], dtype=pl.FP16)
+    history_base = pl.read(segment_starts_t, [0])
+    cp_tmp_candidate_rows = pl.min(history_base // COMPRESS_RATIO + CP_TMP_COMPRESSED_ROWS, CP_CANDIDATE_CAPACITY)
+    cp_tmp_cache_pages = 1 + (cp_tmp_candidate_rows + BLOCK_SIZE - 1) // BLOCK_SIZE
+    cp_tmp_cache_rows = cp_tmp_cache_pages * BLOCK_SIZE
+    cp_tmp_scale_groups = cp_tmp_cache_rows // 16
+    cp_tmp_cmp_kv = pl.create_tensor([cp_tmp_cache_pages, BLOCK_SIZE, 1, HEAD_DIM], dtype=pl.BF16)
+    cp_tmp_idx_kv = pl.create_tensor([cp_tmp_cache_pages, BLOCK_SIZE, 1, IDX_HEAD_DIM], dtype=pl.INT8)
+    cp_tmp_idx_scale = pl.create_tensor([cp_tmp_cache_pages, BLOCK_SIZE, 1, 1], dtype=pl.FP16)
     cp_tmp_main_state = pl.create_tensor([CP_TMP_STATE_PAGES, BLOCK_SIZE, MAIN_STATE_DIM], dtype=pl.FP32)
     cp_tmp_inner_state = pl.create_tensor([CP_TMP_STATE_PAGES, BLOCK_SIZE, INNER_STATE_DIM], dtype=pl.FP32)
     cp_tmp_block_table = pl.create_tensor([PREFILL_CMP_MAX_BLOCKS], dtype=pl.INT32)
-    cp_tmp_cmp_flat = pl.reshape(cp_tmp_cmp_kv, [CP_TMP_CACHE_ROWS, HEAD_DIM])
-    cp_tmp_idx_flat = pl.reshape(cp_tmp_idx_kv, [CP_TMP_CACHE_ROWS, IDX_HEAD_DIM])
-    cp_tmp_idx_scale_flat = pl.reshape(cp_tmp_idx_scale, [CP_TMP_CACHE_ROWS, 1])
-    cp_tmp_idx_scale_aligned = pl.reshape(cp_tmp_idx_scale, [CP_TMP_CACHE_ROWS // 16, 16])
+    cp_tmp_cmp_flat = pl.reshape(cp_tmp_cmp_kv, [cp_tmp_cache_rows, HEAD_DIM])
+    cp_tmp_idx_flat = pl.reshape(cp_tmp_idx_kv, [cp_tmp_cache_rows, IDX_HEAD_DIM])
+    cp_tmp_idx_scale_flat = pl.reshape(cp_tmp_idx_scale, [cp_tmp_cache_rows, 1])
+    cp_tmp_idx_scale_aligned = pl.reshape(cp_tmp_idx_scale, [cp_tmp_scale_groups, 16])
     cp_tmp_main_state_flat = pl.reshape(cp_tmp_main_state, [CP_TMP_STATE_ROWS, MAIN_STATE_DIM])
     cp_tmp_inner_state_flat = pl.reshape(cp_tmp_inner_state, [CP_TMP_STATE_ROWS, INNER_STATE_DIM])
     with pl.at(level=pl.Level.CORE_GROUP, name_hint="cp_csa_tmp_root_seed") as cp_tmp_seed_tid:
@@ -1422,7 +1427,7 @@ def prefill_attention_csa(
             ] = pl.full([1, 1, INNER_STATE_DIM], dtype=pl.FP32, value=0.0)
         for table_col in pl.range(PREFILL_CMP_MAX_BLOCKS):
             pl.write(cp_tmp_block_table, [table_col], pl.cast(0, pl.INT32))
-        for logical_page in pl.range(CP_TMP_DATA_PAGES):
+        for logical_page in pl.range(cp_tmp_cache_pages - 1):
             pl.write(cp_tmp_block_table, [logical_page], pl.cast(logical_page + 1, pl.INT32))
     history_raw = pl.create_tensor([T, HEAD_DIM], dtype=pl.BF16)
     history_main = pl.create_tensor([STATE_LEN, MAIN_STATE_DIM], dtype=pl.FP32)
@@ -1433,7 +1438,6 @@ def prefill_attention_csa(
         for row in pl.range(STATE_LEN):
             history_main[row:row + 1, :] = pl.full([1, MAIN_STATE_DIM], dtype=pl.FP32, value=0.0)
             history_inner[row:row + 1, :] = pl.full([1, INNER_STATE_DIM], dtype=pl.FP32, value=0.0)
-    history_base = pl.read(segment_starts_t, [0])
     history_phases = pl.cast(0, pl.INT32)
     history_ready_tid = cp_tmp_seed_tid
     if history_base > 0:
@@ -1916,7 +1920,7 @@ def prefill_attention_csa(
                     if record_valid > 0 and logical_segment >= 0 and boundary >= 0:
                         main_valid = pl.read(record_window, [meta_row, 4])
                         main_slot = pl.read(record_window, [meta_row, 5])
-                        if (main_valid > 0 and main_slot >= 0 and main_slot < CP_CANDIDATE_CAPACITY):
+                        if (main_valid > 0 and main_slot >= 0 and main_slot < cp_tmp_candidate_rows):
                             cp_tmp_destination = BLOCK_SIZE + main_slot
                             received_main_tile = main_window[meta_row : meta_row + 1, 0:HEAD_DIM]
                             cp_tmp_cmp_flat[
@@ -1939,7 +1943,7 @@ def prefill_attention_csa(
                                     cmp_flat[destination : destination + 1, 0:HEAD_DIM] = committed_main_tile
                         idx_valid = pl.read(record_window, [meta_row, 6])
                         idx_slot = pl.read(record_window, [meta_row, 7])
-                        if (idx_valid > 0 and idx_slot >= 0 and idx_slot < CP_CANDIDATE_CAPACITY):
+                        if (idx_valid > 0 and idx_slot >= 0 and idx_slot < cp_tmp_candidate_rows):
                             cp_tmp_idx_destination = BLOCK_SIZE + idx_slot
                             received_idx_tile = idx_window[meta_row : meta_row + 1, 0:IDX_HEAD_DIM]
                             cp_tmp_idx_flat[
@@ -2916,8 +2920,14 @@ def golden_prefill_cp_csa(tensors):
             cache_scale = torch.tensor(cache_scales).view(1, 1, -1)
             query_i32 = query_i8.view(LOCAL_ROWS, IDX_N_HEADS, IDX_HEAD_DIM).to(torch.int32)
             query_scale = query_scale.view(LOCAL_ROWS, IDX_N_HEADS, 1)
-            score = (torch.einsum("thd,cd->thc", query_i32, cache_i8).float() * query_scale * cache_scale)
-            score = (torch.relu(score) * weights.unsqueeze(-1)).sum(dim=1)
+            score = torch.empty(LOCAL_ROWS, max_visible, dtype=torch.float32)
+            for row0 in range(0, LOCAL_ROWS, GOLDEN_SCORE_ROW_CHUNK):
+                row1 = min(row0 + GOLDEN_SCORE_ROW_CHUNK, LOCAL_ROWS)
+                for col0 in range(0, max_visible, GOLDEN_SCORE_COL_CHUNK):
+                    col1 = min(col0 + GOLDEN_SCORE_COL_CHUNK, max_visible)
+                    chunk = torch.einsum("thd,cd->thc", query_i32[row0:row1], cache_i8[col0:col1]).float()
+                    chunk = chunk * query_scale[row0:row1] * cache_scale[:, :, col0:col1]
+                    score[row0:row1, col0:col1] = (torch.relu(chunk) * weights[row0:row1].unsqueeze(-1)).sum(dim=1)
             for row in range(LOCAL_ROWS):
                 visible = min(CP_CANDIDATE_CAPACITY, max(0, (int(positions[row]) + 1) // COMPRESS_RATIO))
                 selected = min(SPARSE_SELECTED_WIDTH, visible)
