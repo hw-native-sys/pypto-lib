@@ -83,10 +83,10 @@ fp32 scale per token and the normed output never reaches GM in bf16. Pass
 `--bf16-out` for the same kernel ending in the module's own cast, which is what
 the epilogue is priced against.
 
-On a2a3 at T = 8192, 50 rounds: **847 us** with the int8 epilogue (297 GB/s of
-GM traffic) and **581 us** without (520 GB/s). The comparison is a `torch_npu`
+On a2a3 at T = 8192, 50 rounds: **695 us** with the int8 epilogue (362 GB/s of
+GM traffic) and **447 us** without (676 GB/s). The comparison is a `torch_npu`
 composition -- `npu_rms_norm`, eager silu and multiply, `npu_dynamic_quant`,
-there being no gated-norm op -- at 2584 and 2431 us, so 3.1x and 4.2x. Accuracy against the
+there being no gated-norm op -- at 2584 and 2431 us, so 3.7x and 5.4x. Accuracy against the
 float64 reference is 3.3e-2 with the epilogue and 3.1e-3 without, so the
 quantisation is the entire gap and the kernel adds nothing measurable to it.
 
