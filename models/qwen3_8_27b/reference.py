@@ -563,6 +563,36 @@ def block(x: torch.Tensor, w: dict[str, torch.Tensor], cfg: Qwen38Config,
     return st
 
 
+_BLOCK_CACHE: dict[tuple, dict] = {}
+
+
+def block_inputs(key: str, t: int, cfg: Qwen38Config, chunk: int,
+                 transform=None, seed: int = 42, weights: str | None = None,
+                 quant_x: bool = False, quant_y: bool = False):
+    """A no-argument callable returning one tensor of the block chain, computed once.
+
+    What :func:`lazy` is for a stage, this is for a kernel of the block: the
+    chain runs on first use and is cached, so several specs drawing from it pay
+    for it once. *weights* is a path to a layer `weights.py` wrote, or None for
+    the random set.
+    """
+    def load():
+        cache_key = (t, cfg.name, chunk, seed, weights, quant_x, quant_y)
+        st = _BLOCK_CACHE.get(cache_key)
+        if st is None:
+            if weights is None:
+                w = make_block_weights(cfg, seed)
+            else:
+                w = torch.load(weights, weights_only=True)
+            st = _BLOCK_CACHE[cache_key] = block(
+                make_block_inputs(t, cfg, seed), w, cfg, chunk,
+                quant_x=quant_x, quant_y=quant_y)
+        value = st[key]
+        return transform(value) if transform is not None else value
+
+    return load
+
+
 # ---------------------------------------------------------------------------
 # Acceptance criterion
 # ---------------------------------------------------------------------------

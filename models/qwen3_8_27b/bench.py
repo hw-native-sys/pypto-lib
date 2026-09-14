@@ -7,7 +7,7 @@
 # See LICENSE in the root of the software repository for the full text of the License.
 # -----------------------------------------------------------------------------------------------------------
 # ci: no-sim
-"""Latency benchmark for the six GDN stages.
+"""Latency benchmark for the six GDN stages, and the block's other kernels on request.
 
 Times each stage on device over a sweep of sequence lengths and head counts, in
 one process: one compile and one timed loop per (stage, shape), no re-runs for
@@ -44,6 +44,9 @@ import time
 
 STAGES = ("chunk_cumsum", "scaled_dot_kkt", "solve_tril", "wy_fast",
           "chunk_h", "chunk_o")
+# The block's other kernels (Q4), off by default: `--stages gated_rmsnorm`. Their
+# shape is (t, h) only, and their output names come from the module's OUTPUTS.
+BLOCK_KERNELS = ("gated_rmsnorm",)
 
 from config import GDN_TILING, QWEN3_8_27B
 
@@ -67,7 +70,8 @@ def _random_specs(stage, specs):
 
     from test_gdn_stages import OUTPUTS
 
-    leave_alone = set(OUTPUTS[stage]) | {"mask", "tril", "neg_eye"}
+    outputs = OUTPUTS[stage] if stage in OUTPUTS else importlib.import_module(stage).OUTPUTS
+    leave_alone = set(outputs) | {"mask", "tril", "neg_eye"}
     out = []
     for spec in specs:
         if spec.name in leave_alone:
@@ -75,7 +79,7 @@ def _random_specs(stage, specs):
             continue
         dtype = spec.dtype
         shape = list(spec.shape)
-        if dtype in (torch.float16, torch.float32):
+        if dtype in (torch.float16, torch.bfloat16, torch.float32):
             init = (lambda s=shape, dt=dtype: torch.randn(s, dtype=dt) * 0.1)
         else:
             init = (lambda s=shape, dt=dtype: torch.zeros(s, dtype=dt))
@@ -91,9 +95,13 @@ def bench_stage(stage: str, t: int, h: int, hg: int, platform: str, device: int,
     from test_gdn_stages import GQA_STAGES
 
     mod = importlib.import_module(stage)
-    kernel_kw = dict(hg=hg) if stage in GQA_STAGES else {}
-    fn = mod.build_kernel(t=t, h=h, d=D, chunk=CHUNK, **kernel_kw)
-    specs = mod.build_tensor_specs(t=t, h=h, d=D, chunk=CHUNK, hg=hg)
+    if stage in BLOCK_KERNELS:
+        fn = mod.build_kernel(t=t, h=h)
+        specs = mod.build_tensor_specs(t=t, h=h)
+    else:
+        kernel_kw = dict(hg=hg) if stage in GQA_STAGES else {}
+        fn = mod.build_kernel(t=t, h=h, d=D, chunk=CHUNK, **kernel_kw)
+        specs = mod.build_tensor_specs(t=t, h=h, d=D, chunk=CHUNK, hg=hg)
     if data == "random":
         specs = _random_specs(stage, specs)
 
@@ -181,7 +189,7 @@ def main() -> int:
 def format_table(records: list[dict]) -> str:
     """Stages down the rows, shapes across the columns, mean Effective µs."""
     shapes = sorted({(r["t"], r["h"]) for r in records})
-    stages = [s for s in STAGES if any(r["stage"] == s for r in records)]
+    stages = [s for s in STAGES + BLOCK_KERNELS if any(r["stage"] == s for r in records)]
     by = {(r["stage"], r["t"], r["h"]): r for r in records}
     head = f"| {'stage':<16} |" + "".join(f" T={t} H={h} |" for t, h in shapes)
     rule = f"|{'-' * 18}|" + "".join("-" * (len(f" T={t} H={h} |") - 1) + "|"

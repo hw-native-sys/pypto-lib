@@ -24,7 +24,7 @@ against it without a translation table.
 | Short convolution | depthwise, kernel 4, over all 10240 q/k/v channels |
 | Chunk length | 128 — our tiling choice, not a model constant |
 | Platform | Ascend A2/A3 (`-p a2a3`); A5 through the daily job |
-| Quantization | the delta rule has none (no weights); the projections around it, not built yet, are planned as W8A8 — int8 weights per output channel, int8 activations per token — and the reference already carries that arithmetic |
+| Quantization | W8A8 around the delta rule, which has none itself (no weights): int8 weights per output channel, int8 activations per token. The gated norm quantises its output today; the projections that consume it are not built yet. Measured cost on the real layer at T = 8192: 3.0e-2 against the float64 truth, ten times the model's own bf16 rounding |
 
 Grouped-query attention is the shape that matters here: value head `h` reads key
 head `h // 3`. q and k carry 16 heads; v, beta, the gate, the state and the
@@ -33,7 +33,9 @@ output are per value head.
 ## The six operators
 
 The layer's core is the chunked delta rule, split the way the reference
-PTO-ISA implementation splits it. Each file is a standalone entry point.
+PTO-ISA implementation splits it. Each file is a standalone entry point. The
+first six are the delta rule; `gated_rmsnorm.py` is the first of the operators
+around it.
 
 | Operator | What it computes |
 | --- | --- |
@@ -43,6 +45,7 @@ PTO-ISA implementation splits it. Each file is a standalone entry point.
 | [wy_fast.py](../../../models/qwen3_8_27b/wy_fast.py) | the WY representation, `W` and `U` |
 | [chunk_h.py](../../../models/qwen3_8_27b/chunk_h.py) | the inter-chunk state recurrence and `V_new` |
 | [chunk_o.py](../../../models/qwen3_8_27b/chunk_o.py) | the chunk output, inter-chunk plus intra-chunk |
+| [gated_rmsnorm.py](../../../models/qwen3_8_27b/gated_rmsnorm.py) | the gated RMSNorm after the delta rule, and the per-token INT8 quantisation `out_proj` reads |
 
 `solve_tril` is the delta-rule triangular inversion of
 [arXiv:2605.21325](https://arxiv.org/abs/2605.21325).
@@ -61,9 +64,31 @@ difference from running the stages back to back is that `solve_tril` writes
 `A_inv` as FP16 directly instead of FP32 for a host-side narrowing, since FP16 is
 what its consumer reads.
 
-This is the delta rule alone. The four input projections, the depthwise
-convolution over q/k/v, the output gate, the gated RMSNorm and `out_proj` are the
-rest of the block and are not built yet.
+`gdn_layer.py` is the delta rule alone. Of the rest of the block, the gated
+RMSNorm is built ([gated_rmsnorm.py](../../../models/qwen3_8_27b/gated_rmsnorm.py),
+a standalone kernel not yet composed into a layer); the four input projections,
+the depthwise convolution over q/k/v and `out_proj` are not.
+
+## The gated RMSNorm
+
+[gated_rmsnorm.py](../../../models/qwen3_8_27b/gated_rmsnorm.py) is the norm
+that follows the delta rule, `y = o * rsqrt(mean(o^2) + eps) * norm_w * silu(z)`
+per (token, head) over the head dim, with the cast sequence the model's own
+`Qwen3_5RMSNormGated` uses: fp32 variance and rsqrt, narrow to the model dtype,
+apply the weight there, apply the gate in fp32.
+
+Its epilogue quantises the result per token, over the whole 6144-wide row,
+because that row is what `out_proj` multiplies: the kernel writes int8 plus one
+fp32 scale per token and the normed output never reaches GM in bf16. Pass
+`--bf16-out` for the same kernel ending in the module's own cast, which is what
+the epilogue is priced against.
+
+On a2a3 at T = 8192, 50 rounds: **908 us** with the int8 epilogue (277 GB/s of
+GM traffic) and **628 us** without (481 GB/s). The comparison is a `torch_npu`
+composition -- `npu_rms_norm`, eager silu and multiply, `npu_dynamic_quant`,
+there being no gated-norm op -- at 2584 and 2431 us. Accuracy against the
+float64 reference is 3.3e-2 with the epilogue and 3.1e-3 without, so the
+quantisation is the entire gap and the kernel adds nothing measurable to it.
 
 ## Validating and benchmarking
 
