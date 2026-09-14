@@ -104,11 +104,26 @@ def comparison(current, baseline, *, mode="history"):
     if not baseline or current.get("status") != "pass" or baseline.get("status") != "pass":
         return {"delta_pct": None, "reason": "no passing baseline/current result"}
     keys = ["case_contract", "device_identity", "fixture_sha256", "golden_sha256"]
-    keys.append("source_sha" if mode == "toolchain" else "toolchain")
+    if mode not in ("history", "toolchain", "ci_history"):
+        raise ContractError("unknown comparison mode")
+    if mode != "ci_history":
+        keys.append("source_sha" if mode == "toolchain" else "toolchain")
+    else:
+        # CI follows upstream HEAD. Hardware/system changes start a new series;
+        # compiler/runtime changes remain visible as whole-stack deltas.
+        for key in ("python", "torch", "numpy", "cann_sha256", "driver_sha256", "bundle"):
+            if (not current.get("toolchain", {}).get(key) or
+                    current["toolchain"][key] != baseline.get("toolchain", {}).get(key)):
+                return {"delta_pct": None, "reason": f"incomparable system component: {key}"}
     for key in keys:
         if not current.get(key) or current[key] != baseline.get(key):
             return {"delta_pct": None, "reason": f"incomparable {key}"}
     now = positive(current["metric_us"], "current metric")
     before = positive(baseline["metric_us"], "baseline metric")
-    return {"delta_pct": (now / before - 1) * 100, "baseline_run_id": baseline.get("run_id"),
+    changes = [key for key in sorted(set(current.get("toolchain", {})) | set(baseline.get("toolchain", {})))
+               if current.get("toolchain", {}).get(key) != baseline.get("toolchain", {}).get(key)]
+    if current.get("source_sha") != baseline.get("source_sha"):
+        changes.insert(0, "pypto-lib")
+    return {"scope": "ci_stack" if mode == "ci_history" else mode, "changed_components": changes,
+            "delta_pct": (now / before - 1) * 100, "baseline_run_id": baseline.get("run_id"),
             "baseline_date": baseline.get("logical_date")}

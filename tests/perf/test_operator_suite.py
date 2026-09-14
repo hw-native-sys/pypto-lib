@@ -176,7 +176,7 @@ def test_comparison_identity_and_sign():
     for key in ("case_contract", "device_identity", "toolchain", "fixture_sha256", "golden_sha256"):
         assert comparison({**current, key: "different"}, baseline)["delta_pct"] is None
     assert comparison(current, baseline, mode="toolchain")["delta_pct"] is None
-    assert comparison({**current, "source_sha": "lib1", "toolchain": "new"}, baseline,
+    assert comparison({**current, "source_sha": "lib1", "toolchain": {"pypto": "new"}}, baseline,
                       mode="toolchain")["delta_pct"] == pytest.approx(10)
     assert comparison(current, None)["delta_pct"] is None
 
@@ -238,3 +238,21 @@ def test_timeout_is_reported_without_another_attempt(tmp_path):
     rc, timed_out = runner.run_process([sys.executable, "-c", "import time; time.sleep(10)"],
                                       tmp_path / "log", tmp_path, os.environ.copy(), 0.1)
     assert (rc, timed_out) == (124, True)
+
+
+def test_ci_history_exposes_stack_changes_but_rejects_system_or_device_changes():
+    system = {key: "fixed" for key in ("python", "torch", "numpy", "cann_sha256", "driver_sha256", "bundle")}
+    baseline = {"status": "pass", "metric_us": 100, "run_id": "previous", "source_sha": "old-lib",
+                "case_contract": "case", "fixture_sha256": "input", "golden_sha256": "golden",
+                "device_identity": {"hostname": "host1"}, "toolchain": {**system, "pypto": "old"}}
+    current = {**baseline, "metric_us": 110, "source_sha": "new-lib", "toolchain": {**system, "pypto": "new"}}
+    result = comparison(current, baseline, mode="ci_history")
+    assert result["delta_pct"] == pytest.approx(10)
+    assert result["scope"] == "ci_stack"
+    assert result["changed_components"] == ["pypto-lib", "pypto"]
+    assert comparison(current, baseline)["delta_pct"] is None
+    for key in system:
+        changed = {**current, "toolchain": {**current["toolchain"], key: "other"}}
+        assert comparison(changed, baseline, mode="ci_history")["delta_pct"] is None
+    current["device_identity"] = {"hostname": "host2"}
+    assert comparison(current, baseline, mode="ci_history")["delta_pct"] is None

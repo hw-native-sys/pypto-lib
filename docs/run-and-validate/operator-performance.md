@@ -1,10 +1,9 @@
 # Operator performance tracking
 
-The `dsv4-operators` suite provides ten fixed A2/A3 workloads for an external
-performance bot. It does not schedule itself or update a baseline automatically.
-Its manifest, device checks, result validation and dry-run use only the Python
-standard library. Running a model additionally requires a compatible PyPTO,
-runtime, PTO ISA, PTOAS, CANN and Torch environment.
+The `dsv4-operators` suite measures ten fixed A2/A3 workloads using the environment
+installed by CI's `setup-ci-job` action. A single CI measurement series follows
+the selected PyPTO/lib revisions; it requires no independent bot or
+Control/Candidate environment deployment.
 
 | Case | Parallelism | Fixed workload |
 | --- | --- | --- |
@@ -31,125 +30,121 @@ compilation. Ring settings are explicit: MTP uses task window/dependency pool
 
 ## Fixed even devices
 
-Copy [the device profile example](../../tools/perf/suites/even_devices.example.json)
-to deployment configuration and replace `device_epoch` with an actual host and
-topology version. Keep a profile fixed across both toolchains and all retries.
-The example uses device 4 for single-device cases, devices `0,2,4,6` for TP4,
-and `0,2,4,6,8,10,12,14` for eight-device cases. MTP LM-head's TP groups are the
-first four and last four devices of that ordered list.
+The [device profile](../../tools/perf/suites/even_devices.example.json) specifies
+single-device `4`, TP4 `0,2,4,6`, and eight-device `0,2,4,6,8,10,12,14` workloads.
+MTP LM-head uses the first four and last four devices as its two TP4 groups.
+Copy the profile to a run directory and replace its example `device_epoch`.
+An optional `hostname` field rejects execution on another host.
 
-Inspect the plan without importing PyPTO, Torch or any device runtime:
-
-```bash
-python tools/perf/run_operator_suite.py \
-  --device-profile tools/perf/suites/even_devices.example.json --dry-run
-```
-
-The bot should acquire the exact eight-device list once for a variant and run
-the cases serially inside it. Single-device and TP4 cases use their fixed
-subsets; the original `TASK_DEVICE` allocation remains intact. With the example
-profile, the submission prefix is:
+The CI job acquires the complete ordered eight-device allocation once, then
+runs the ten cases serially on their fixed subsets. Use this submission prefix:
 
 ```text
 task-submit --device 0,2,4,6,8,10,12,14
 ```
 
-Append the deployment's queue timeout and `--run` command. Inside that task,
-activate the chosen environment, set `PYPTO_ROOT` and `PTO_ISA_ROOT`, and invoke:
+Append the queue timeout and `--run` command. Do not combine this explicit list
+with `--device-num` or use `auto`: automatic pools may exclude the even devices.
+Exact requests wait for those devices through the shared queue lock.
+
+The runner verifies `TASKQUEUE_INSIDE`, the complete `TASK_DEVICE`, the selected
+subsets and the model's actual `RunConfig.device_ids`. It rejects odd, duplicate
+or reordered IDs and nonempty Ascend visible-device masks. Host IDs must be
+unmasked. It records host name, character-device major/minor IDs, kernel version
+and device epoch, and saves `npu-smi` inventory. Trace PID ordering does not prove
+a mapping to device IDs. Change the epoch when hardware or topology changes.
+
+Inspect the workloads without importing PyPTO, Torch or a device runtime:
+
+```bash
+python -S tools/perf/run_operator_suite.py \
+  --device-profile tools/perf/suites/even_devices.example.json --dry-run
+```
+
+Inside the acquired allocation, source CI's `activate.sh`, forward its resolved
+`PYPTO_SRC`, `PTOAS_ROOT`, `PTO_ISA_COMMIT` and `CI_CACHE_ROOT`, and run:
 
 ```bash
 python tools/perf/run_operator_suite.py \
-  --device-profile "$PERF_DEVICE_PROFILE" \
-  --output-dir "$PERF_RUN_DIR" --variant candidate --date 2026-09-14
+  --device-profile "$PERF_DEVICE_PROFILE" --output-dir "$PERF_RUN_DIR" \
+  --date 2026-09-14
 ```
 
-`PERF_DEVICE_PROFILE` must point to the deployment copy, and `PERF_RUN_DIR` must
-be a new directory. Do not combine an explicit list with `--device-num`: that
-option belongs to automatic allocation. An auto pool may select different
-cards or exclude the even devices entirely. Exact requests wait for those cards
-and remain subject to queue locking and concurrency limits.
+Use a new output directory for every attempt. The activation script supplies
+CANN, the bundle and the job venv. Source-checkout installations outside that
+venv are rejected. CI-generated untracked files such as `activate.sh` do not
+make the source dirty; tracked changes do.
 
-The runner verifies `TASKQUEUE_INSIDE`, the complete ordered `TASK_DEVICE`, each
-case's subset, and the model's actual `RunConfig.device_ids`. It rejects odd,
-duplicate or reordered IDs and nonempty Ascend visible-device masks. This first
-version supports unmasked host device IDs only. It does not infer container
-remapping or pretend trace PIDs are device IDs. The report records the ordered
-host device nodes, host name, kernel version and device epoch; `npu-smi` inventory
-is saved separately for inspection. A physical topology change requires a new
-epoch. The queue lock remains necessary; passing `-d` alone provides no exclusion.
+## CI installation provenance
 
-## Measurement and evidence
+The preflight reads the selected PyPTO source and its runtime gitlink, ISA pin
+and PTOAS version. It checks that PyPTO and simpler are imported from the job
+venv and owned by their installed distributions. For cached wheels, their local
+origin must name the selected source tree and, for simpler, the selected ISA.
+The wheel must match the SHA256 in `direct_url.json`. Native libraries, module
+entry files and installed ISA build metadata must match the distribution's
+RECORD hashes. Both required A2/A3 runtime artifacts must declare the selected
+ISA. The CI installer's noneditable source-build fallback is accepted only when
+its origin is the selected checkout, with the same installed-file checks.
 
-Each case is a fresh process with Python/NumPy/Torch seed 1807, five discarded
-warmup rounds and 100 measured rounds in one benchmark loop. The model retains
-its own golden, comparison functions and tolerances. The launcher observes its
-single `golden.run` call, checks the workload and devices, hashes the actual
-input and golden tensors, and writes the returned `RunResult.bench` dispatch
-grid. It does not patch generated kernels or replace numerical references.
+This works when a wheel cache hit leaves no `runtime/build/lib` in the source
+checkout. It records the installed native library hashes, source revisions,
+PTOAS executable and version, bundle, Python/Torch/NumPy and CANN/driver metadata.
+It validates the environment and does not repair, rebuild or activate another
+installation.
+
+## Measurement and comparisons
+
+Every case starts a fresh process with Python/NumPy/Torch seed 1807, five warmups
+and 100 measured rounds in one benchmark loop. The model's golden, comparison
+functions and tolerances are preserved. The observer hashes actual input and
+golden tensors and records the public `RunResult.bench` dispatch grid.
 
 The `dsv4-operators-whole-dispatch-v1` metric sums **all** operator dispatch
-Effective times in each rank's round, computes each rank's 100-round median,
-then reports the minimum rank median. Required communication and signal cleanup
-remain included. Per-dispatch samples, all rank medians, the maximum rank median
-and rank spread are retained. This is an operator tuning metric, not end-to-end
-model step latency. Trace PID keys identify runtime streams; their ordering
-does not establish a PID-to-device mapping.
+Effective times per rank and round, computes each rank's median, and reports the
+minimum rank median. Communication and signal cleanup are included. Raw samples,
+per-dispatch timings, the maximum rank median and rank spread remain available.
+This follows the [performance guide](../debug-and-tune/performance-tuning.md)'s
+operator tuning convention; it is not end-to-end model step latency.
 
-This is a new baseline contract. Do not splice it into historical mean-time,
-EP2/TP2, different-batch, or compute-only series that excluded a separate cleanup
-dispatch. In particular, the earlier EPLB robot's compute-slot figures need a
-contract review before comparison. See the [performance guide](../debug-and-tune/performance-tuning.md).
+This establishes a new baseline. Historical Daily CI means, default EP2/TP2
+workloads and the earlier robot's compute-slot figures are different contracts
+and cannot be spliced into this series.
 
-Zero/nonfinite samples, wrong round or rank counts, repeated invocation IDs,
-unstable callable slots, flattened timing, missing golden fingerprints and
-failed correctness invalidate a metric. A single failed case retains the other
-valid rows. A recognized device fault or case timeout stops the allocation and
-marks remaining cases unrun. The bot must not retry a still-running queue task
-or start another variant on a faulted allocation.
+`--baseline` accepts an earlier run. `--week-baseline` requires exactly seven
+logical dates earlier. Each selected baseline's run ID appears in the report.
+CI supplies a Beijing logical date derived from workflow creation, so a queue
+crossing midnight does not change the measurement's date. Positive changes mean
+slower; failed, missing or incompatible measurements produce N/A.
 
-Every attempt has an immutable run ID and a new output directory. Results are
-checkpointed into `suite-result.json` and `report.md`; each attempted case keeps
-its log and `raw-result.json`. A complete pass requires all ten cases. `--model`
-or `--case` is useful for investigation but produces an incomplete official
-suite and a nonzero exit code.
+CI history compares identical workloads, actual input/golden fingerprints and
+device identity. Python/Torch/NumPy, bundle and CANN/driver changes also start a
+new comparable series. Compiler, runtime, ISA, assembler and lib revisions may
+change: the percentage then describes the **complete CI software stack**, with
+changed components listed. It does not attribute a change to a kernel alone.
+The comparison helper also retains an explicit strict history mode requiring
+identical toolchains for investigations.
 
-`--baseline` selects an earlier result file explicitly. `--week-baseline` must
-be exactly seven logical dates earlier. Reports include the selected baseline
-run ID; dates default to Beijing time unless the scheduler supplies `--date`.
-Positive percentages mean slower. Missing or incompatible evidence is N/A,
-never zero or a carried-forward measurement. Historical comparisons require
-identical toolchain, workload contract, device identity and actual fixture and
-golden hashes; lib SHA may change. The `comparison(..., mode="toolchain")`
-helper instead requires identical lib SHA for same-day Control/Candidate A/B.
+## Failure handling and storage
 
-Source checkouts must be clean. Preflight checks the PyPTO runtime gitlink,
-runtime-owned ISA pin, recorded build ISA, selected PTOAS version, loaded module
-locations and native library hashes. CANN, driver and Python/Torch/NumPy versions
-also belong to the comparison identity. The deployment must additionally check
-its native-build provenance against the selected runtime source before enqueueing;
-an ISA build stamp alone cannot prove which runtime source produced a binary.
+Failed correctness never yields a performance value. Missing ranks or rounds,
+zero/nonfinite samples, duplicate invocation IDs, unstable callable slots,
+flattened timing and missing fingerprints invalidate the measurement. Other
+passing rows remain visible. Device faults and case timeouts stop the allocation;
+remaining cases are marked unrun. An incomplete suite exits nonzero.
 
-## Storage and rollout
+Results are checkpointed into `suite-result.json` and `report.md`. Each attempted
+case retains `raw-result.json` and its log. A recognized fault or unresolved queue
+completion must not cause an automatic retry. `--model` and `--case` are diagnostic
+filters; they leave an incomplete official ten-case suite.
 
-The default uses an in-memory golden and hashes rather than full tensor
-snapshots. Each case builds under its private working directory. Successful
-builds beneath that case's `build_output` are removed after the report is
-written; logs and raw samples remain. Failed builds are retained for diagnosis.
-`--keep-builds` preserves successful builds too, and `--save-data` explicitly
-retains full input/reference snapshots and their builds. Use these options only
-with a deployment retention policy and sufficient disk space. No cache directory
-outside this invocation's private output tree is deleted.
+Default runs hash the inputs and golden in memory rather than saving large
+snapshots. Successful private builds are removed after reporting. `--keep-builds`
+and `--save-data` are explicit diagnostic options and need a retention policy.
+CI should upload only reports, JSON and logs, then remove the invocation's private
+build directory. It must never upload model weights or build trees as history.
 
-The external bot owns scheduling, toolchain activation, exact queue submission,
-native-build provenance, baseline selection, result retention and notification.
-It should run Control and Candidate serially on the same profile and retain both
-run IDs. A failed setup, timeout or missing result must remain visible in its
-notification rather than reusing yesterday's success.
-
-CPU validation is available through `python -m pytest tests/perf`. Before this
-suite replaces Daily CI performance, complete device correctness and 5+100-round
-acceptance for every case in both environments, inspect the dispatch boundaries,
-and obtain complete reports on two consecutive nightly runs. No measured
-baseline or device acceptance is supplied by adding this tooling. Daily CI's
-correctness and performance collection remain active until that migration gate
-has been satisfied.
+CPU checks are available through `python -m pytest tests/perf`. Device acceptance
+of all ten cases at 5+100 rounds and complete nightly reports remain required
+before replacing the existing performance collection. This suite alone does not
+provide a measured baseline or install a schedule.

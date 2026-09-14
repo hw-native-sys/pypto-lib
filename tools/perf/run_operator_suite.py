@@ -18,6 +18,7 @@ from pathlib import Path
 import re
 import shutil
 import signal
+import socket
 import subprocess
 import sys
 import uuid
@@ -70,7 +71,7 @@ def run_process(command, log, cwd, environ, timeout):
 
 
 def render_report(suite):
-    lines = [f"Operator performance: {suite['logical_date']} ({suite['variant']})",
+    lines = [f"Operator performance: {suite['logical_date']} (CI)",
              f"Run: `{suite['run_id']}`; status: **{suite['status']}**.", "",
              "Metric: minimum rank median of summed operator dispatch Effective times (us).",
              "Communication and signal cleanup are included; this is not model step latency.", "",
@@ -84,7 +85,8 @@ def render_report(suite):
         selected = ",".join(map(str, case["devices"]))
         lines.append(f"| {case['case_id']} | {selected} | {case['status']} | {metric} | "
                      f"{delta('previous')} | {delta('week')} |")
-    lines.extend(["", "Positive changes mean slower. N/A means missing or incompatible evidence.", ""])
+    lines.extend(["", "Changes describe the complete CI software stack, not an isolated kernel edit.",
+                  "Positive changes mean slower. N/A means missing or incompatible evidence.", ""])
     for case in suite["cases"]:
         if case.get("error"):
             error = str(case["error"]).replace("\n", " ")
@@ -92,7 +94,9 @@ def render_report(suite):
         for key in ("previous", "week"):
             info = case.get(key)
             if info:
-                detail = info.get("reason") or f"baseline run {info.get('baseline_run_id')}"
+                components = ", ".join(info.get("changed_components", [])) or "none"
+                detail = info.get("reason") or (
+                    f"baseline run {info.get('baseline_run_id')}; changed components: {components}")
                 lines.append(f"- {case['case_id']} {key}: {detail}")
     if suite.get("error"):
         lines.extend(["", str(suite["error"])])
@@ -119,12 +123,12 @@ def execute(args, manifest, profile):
     output.mkdir(parents=True, exist_ok=False)
     run_id = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ") + "-" + uuid.uuid4().hex[:8]
     suite = {"schema_version": 1, "suite_id": manifest["suite_id"], "run_id": run_id,
-             "logical_date": args.date, "variant": args.variant, "status": "running",
+             "logical_date": args.date, "variant": "ci", "status": "running",
              "coverage_complete": False, "allocation": profile["sequences"]["8"],
              "sampling": SAMPLING, "cases": []}
     for case in manifest["cases"]:
         suite["cases"].append({"case_id": case["case_id"], "run_id": run_id, "status": "not_run",
-                               "logical_date": args.date, "variant": args.variant,
+                               "logical_date": args.date, "variant": "ci",
                                "devices": profile["sequences"][str(case["device_count"])],
                                "case_contract": digest([case, manifest["metric"], SAMPLING,
                                                         manifest["contract_id"]])})
@@ -139,6 +143,8 @@ def execute(args, manifest, profile):
             validate_allocation(profile, suite["allocation"], case["devices"])
         if profile["device_epoch"].startswith("set-to-"):
             raise ContractError("replace the example device epoch with the deployment's actual epoch")
+        if profile.get("hostname") and profile["hostname"] != socket.gethostname():
+            raise ContractError("this runner is not the configured performance host")
         source_sha = source_identity()
         toolchain = capture_toolchain()
         host = capture_host(profile, output)
@@ -188,8 +194,8 @@ def execute(args, manifest, profile):
             record.update(validate_result(raw, case, process_rc=rc))
             record.update(status="pass", fixture_sha256=raw["fixture_sha256"],
                           golden_sha256=raw["golden_sha256"])
-            record["previous"] = comparison(record, prior.get(case["case_id"]))
-            record["week"] = comparison(record, week.get(case["case_id"]))
+            record["previous"] = comparison(record, prior.get(case["case_id"]), mode="ci_history")
+            record["week"] = comparison(record, week.get(case["case_id"]), mode="ci_history")
             if raw.get("work_dir"):
                 build = Path(raw["work_dir"])
                 if not build.is_absolute():
@@ -217,7 +223,6 @@ def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--device-profile", required=True, type=Path)
     parser.add_argument("--output-dir", type=Path)
-    parser.add_argument("--variant", choices=("control", "candidate"), default="candidate")
     parser.add_argument("--model", choices=("mtp", "dspark"))
     parser.add_argument("--case", choices=sorted(CASE_IDS))
     parser.add_argument("--date", default=datetime.now(timezone(timedelta(hours=8))).date().isoformat())
