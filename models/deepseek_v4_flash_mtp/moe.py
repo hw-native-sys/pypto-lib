@@ -1240,14 +1240,6 @@ def moe(
         x_norm_i8, x_norm_scale, indices, weights,
     )
 
-    sh = pl.create_tensor([T, D], dtype=pl.BF16)
-    expert_shared(
-        x_norm_i8, x_norm_scale,
-        shared_w1, shared_w1_scale, shared_w3, shared_w3_scale,
-        shared_w2, shared_w2_scale,
-        sh,
-    )
-
     recv_x_out = pl.create_tensor([N_LOCAL, RECV_MAX, D], dtype=pl.INT8)
     recv_scale_out = pl.create_tensor([N_LOCAL, RECV_MAX], dtype=pl.FP32, manual_dep=True)
     recv_w_out = pl.create_tensor([N_LOCAL, RECV_MAX], dtype=pl.FP32, manual_dep=True)
@@ -1259,6 +1251,14 @@ def moe(
         recv_x_out, recv_scale_out, recv_w_out, recv_r_route_out, recv_count_out, recv_meta_local,
         recv_meta, recv_x, recv_aux, recv_route, arrived, data_arrived,
         num_tokens, my_rank, moe_epoch,
+    )
+
+    sh = pl.create_tensor([T, D], dtype=pl.BF16)
+    expert_shared(
+        x_norm_i8, x_norm_scale,
+        shared_w1, shared_w1_scale, shared_w3, shared_w3_scale,
+        shared_w2, shared_w2_scale,
+        sh,
     )
 
     with pl.scope():
