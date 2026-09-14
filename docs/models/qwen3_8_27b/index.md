@@ -24,18 +24,18 @@ against it without a translation table.
 | Short convolution | depthwise, kernel 4, over all 10240 q/k/v channels |
 | Chunk length | 128 — our tiling choice, not a model constant |
 | Platform | Ascend A2/A3 (`-p a2a3`); A5 through the daily job |
-| Quantization | W8A8 around the delta rule, which has none itself (no weights): int8 weights per output channel, int8 activations per token. The gated norm quantises its output today; the projections that consume it are not built yet. Measured cost on the real layer at T = 8192: 3.0e-2 against the float64 truth, ten times the model's own bf16 rounding |
+| Quantization | W8A8 around the delta rule, which has none itself (no weights): int8 weights per output channel, int8 activations per token. `in_proj_qkv`, `in_proj_z` and `out_proj` are int8 both sides; `in_proj_a`, `in_proj_b` and the convolution taps stay bf16, where int8 would move the block output by 3e-5 and save nothing. Measured cost on the real layer at T = 8192: 3.0e-2 against the float64 truth, ten times the model's own bf16 rounding |
 
 Grouped-query attention is the shape that matters here: value head `h` reads key
 head `h // 3`. q and k carry 16 heads; v, beta, the gate, the state and the
 output are per value head.
 
-## The six operators
+## The operators
 
 The layer's core is the chunked delta rule, split the way the reference
 PTO-ISA implementation splits it. Each file is a standalone entry point. The
-first six are the delta rule; `gated_rmsnorm.py` is the first of the operators
-around it.
+first six are the delta rule; the rest are the block around it, in the order
+the block runs them.
 
 | Operator | What it computes |
 | --- | --- |
@@ -45,9 +45,19 @@ around it.
 | [wy_fast.py](../../../models/qwen3_8_27b/wy_fast.py) | the WY representation, `W` and `U` |
 | [chunk_h.py](../../../models/qwen3_8_27b/chunk_h.py) | the inter-chunk state recurrence and `V_new` |
 | [chunk_o.py](../../../models/qwen3_8_27b/chunk_o.py) | the chunk output, inter-chunk plus intra-chunk |
+| [quant_x.py](../../../models/qwen3_8_27b/quant_x.py) | per-token int8 quantisation of the hidden states, shared by the projections that read them |
+| [in_proj_qkv.py](../../../models/qwen3_8_27b/in_proj_qkv.py) | hidden states to q, k and v, A8W8 |
+| [in_proj_z.py](../../../models/qwen3_8_27b/in_proj_z.py) | hidden states to the gated norm's gate, A8W8 |
+| [in_proj_ab.py](../../../models/qwen3_8_27b/in_proj_ab.py) | hidden states to `a` and `b`, the two fused into one bf16 matmul |
 | [short_conv.py](../../../models/qwen3_8_27b/short_conv.py) | the depthwise causal convolution over the q/k/v channels, with silu |
 | [qk_norm_gate.py](../../../models/qwen3_8_27b/qk_norm_gate.py) | the q/k L2-norm and scaling, and `beta` and the decay gate from the a/b projections |
 | [gated_rmsnorm.py](../../../models/qwen3_8_27b/gated_rmsnorm.py) | the gated RMSNorm after the delta rule, and the per-token INT8 quantisation `out_proj` reads |
+| [out_proj.py](../../../models/qwen3_8_27b/out_proj.py) | the normed output back to the residual stream, A8W8 |
+
+The three A8W8 projections are the same arithmetic at three shapes and share
+one implementation, [a8w8_linear.py](../../../models/qwen3_8_27b/a8w8_linear.py);
+each instance file supplies its shape, its tiles and where its weight and
+references come from.
 
 `solve_tril` is the delta-rule triangular inversion of
 [arXiv:2605.21325](https://arxiv.org/abs/2605.21325).
@@ -127,6 +137,58 @@ composition -- `npu_rms_norm`, eager silu and multiply, `npu_dynamic_quant`,
 there being no gated-norm op -- at 2584 and 2431 us, so 4.0x and 6.1x. Accuracy against the
 float64 reference is 3.3e-2 with the epilogue and 3.1e-3 without, so the
 quantisation is the entire gap and the kernel adds nothing measurable to it.
+
+## The projections
+
+The four projections around the delta rule are W8A8: int8 weights with one
+scale per output channel, int8 activations with one scale per token, INT32
+accumulation over a pipelined K loop, dequantised by the two scales and written
+as bf16.
+
+[quant_x.py](../../../models/qwen3_8_27b/quant_x.py) does the activation side
+once for everything that reads the hidden states. The gated norm does the same
+arithmetic on its own output in its epilogue rather than here, because that
+value never reaches GM in bf16.
+
+[a8w8_linear.py](../../../models/qwen3_8_27b/a8w8_linear.py) is the matmul.
+Its one structural choice is that a block walks an `m_group` by `n_group`
+**patch** of output tiles rather than a single tile. One output tile is capped
+near 128x128 by the cube-to-vector crossing -- the cross-core ring is sized by
+the INT32 accumulator and charged to the same vector buffer that holds the
+working copy -- and at one tile per block `in_proj_qkv` is 5120 tasks, more
+than the runtime's ring heap carries. A patch fixes both: it cuts the task
+count and it is what a bigger tile would have bought, since a block reads
+`(m_group * m_tile + n_group * n_tile) * K` bytes for
+`m_group * n_group` tiles of output. Square patches win; the shape alone is
+worth 1.4x at identical tiles.
+
+The cap is on the tile that *crosses*, though, not on what the cube may work
+on, so the inner loop takes two n-tiles against one activation tile and drains
+them separately -- the cube sees a 128x256 region from a single L1 operand
+while each crossing stays 128x128. That is worth another 6 to 8%.
+
+[in_proj_ab.py](../../../models/qwen3_8_27b/in_proj_ab.py) stays bf16 and fuses
+`in_proj_a` and `in_proj_b` into one `[96, 5120]` weight: N = 48 alone is legal
+under the multiple-of-16 tile rule but a poor cube tile, and two passes over
+the hidden states would cost twice what one does.
+
+On a2a3 at T = 8192, 50 rounds, against `torch_npu` 2.10.0 on the same card:
+
+| kernel | PyPTO us | CANN operator | CANN us |
+| --- | ---: | --- | ---: |
+| `quant_x` | 191 | `npu_dynamic_quant` | 105 |
+| `in_proj_qkv` | 1960 | `npu_quant_matmul` | 1660 |
+| `in_proj_z` | 1108 | `npu_quant_matmul` | 993 |
+| `in_proj_ab` | 118 | `F.linear` bf16 | 47 |
+| `out_proj` | 1136 | `npu_quant_matmul` | 977 |
+
+The three GEMMs run at 438 to 465 INT8 TOPS, 1.57 to 1.59x their own bf16
+`F.linear` at the same shapes and 0.84x of CANN's dedicated W8A8 operator. A
+control that drops the dequantisation entirely measures within the noise of the
+full kernel, so that gap is the cube schedule under a 128x128 output tile, not
+the epilogue. Accuracy: each GEMM sits 1.7e-03 from the float64 W8A8 chain it
+implements -- bf16 output rounding and nothing else -- and the quantisation is
+the whole of the rest.
 
 ## Validating and benchmarking
 
