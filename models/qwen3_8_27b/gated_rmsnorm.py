@@ -41,6 +41,8 @@ MIN_EXACT_VS_REFERENCE = 0.95   # of y_q elements identical to the fake-quant re
 # tiling
 TOK_TILE = 16           # tokens per block; 16 scalar scale writes fill one 64-byte line
 
+# `y_scale` is a [1, T] row and not a [T] vector: `out_proj` reshapes its slice
+# to the [M, 1] column it multiplies by, and a tile store must be 2-D anyway.
 OUTPUTS = ("y_q", "y_scale")        # int8 variant; bench.py reads it
 
 
@@ -60,7 +62,7 @@ def build_kernel(t: int = T, h: int = H, d: int = D, eps: float = EPS,
         z: pl.Tensor[[t, h, d], pl.BF16],
         norm_w: pl.Tensor[[d], pl.BF16],
         y_q: pl.Out[pl.Tensor[[t, h * d], pl.INT8]],
-        y_scale: pl.Out[pl.Tensor[[t], pl.FP32]],
+        y_scale: pl.Out[pl.Tensor[[1, t], pl.FP32]],
     ):
         o_flat = pl.reshape(o, [t, h * d])
         z_flat = pl.reshape(z, [t, h * d])
@@ -105,7 +107,7 @@ def build_kernel(t: int = T, h: int = H, d: int = D, eps: float = EPS,
                 part_8 = pl.maximum(pl.col_max(pl.reshape(pl.col_max(pl.abs(y)), [d // 8, 8])),
                                     pl.full([1, 8], dtype=pl.FP32, value=AMAX_EPS))
                 amax = pl.row_max(pl.col_expand_mul(ones_h8, part_8))
-                pl.write(y_scale, [r0], pl.read(amax, [0, 0]) / SCALE_MAX)
+                pl.write(y_scale, [0, r0], pl.read(amax, [0, 0]) / SCALE_MAX)
 
                 # No clamp: amax is the tile's own maximum, so |y| * SCALE_MAX / amax
                 # <= 127 and a +-127 clamp cannot bind. The cast rounds to nearest;
@@ -183,7 +185,7 @@ def golden_quant(y):
 def golden_gdn_gated_rmsnorm(tensors):
     q, scale = golden_quant(golden_y(tensors["o"], tensors["z"], tensors["norm_w"]))
     tensors["y_q"].copy_(q)
-    tensors["y_scale"].copy_(scale)
+    tensors["y_scale"].copy_(scale.reshape(1, -1))
 
 
 def golden_gdn_gated_rmsnorm_bf16(tensors):
@@ -228,7 +230,7 @@ def build_tensor_specs(t: int = T, h: int = H, d: int = D, chunk: int = CHUNK,
     ]
     if quant:
         specs += [TensorSpec("y_q", [t, h * d], torch.int8),
-                  TensorSpec("y_scale", [t], torch.float32)]
+                  TensorSpec("y_scale", [1, t], torch.float32)]
     else:
         specs += [TensorSpec("y", [t, h * d], torch.bfloat16)]
     return specs
@@ -264,7 +266,7 @@ def compare_y_q(t: int, chunk: int, weights: str | None):
         lines = [f"[stats] y_q vs golden: {float((step == 0).float().mean()) * 100:.4f}% exact, "
                  f"max {int(step.max())} step(s) off"]
         if actual_outputs is not None and "y_scale" in actual_outputs:
-            scale_dev = actual_outputs["y_scale"].cpu().float()
+            scale_dev = actual_outputs["y_scale"].cpu().float().reshape(-1)
             q_ref = _draw("y_q", t, chunk, weights)()
             scale_ref = _draw("y_scale", t, chunk, weights)().float()
             ref_ok, ref_detail = ref_gate(actual, q_ref, actual_outputs=actual_outputs, **kw)
