@@ -3033,6 +3033,8 @@ if __name__ == "__main__":
                         help="tokens already resident in this request's caches from earlier chunks")
     parser.add_argument("--compile-only", action="store_true")
     parser.add_argument("--no-golden", action="store_true", default=False)
+    parser.add_argument("--save-data", action="store_true")
+    parser.add_argument("--golden-data", type=str, default=None)
     parser.add_argument("--dump-passes", action="store_true")
     parser.add_argument("--enable-chip-swimlane", type=int, nargs="?", const=1, default=0, choices=range(5))
     args = parser.parse_args()
@@ -3047,6 +3049,8 @@ if __name__ == "__main__":
         fn=prefill_cp_csa_test,
         specs=build_cp_tensor_specs(args.cp, num_tokens=args.num_tokens, prefix=args.prefix),
         golden_fn=None if args.no_golden else golden_prefill_cp_csa,
+        golden_data=args.golden_data,
+        save_data=args.save_data,
         compile_only=args.compile_only,
         config=dict(
             distributed_config=DistributedConfig(device_ids=device_ids[: args.cp], num_sub_workers=0),
