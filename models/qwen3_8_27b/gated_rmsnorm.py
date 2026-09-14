@@ -68,7 +68,9 @@ def build_kernel(t: int = T, h: int = H, d: int = D, eps: float = EPS,
             t0 = blk * TOK_TILE
             w_row = pl.cast(pl.reshape(norm_w[:], [1, d]), target_type=pl.FP32)
             ones_h8 = pl.full([h, 8], dtype=pl.FP32, value=1.0)   # broadcasts the amax partials
-            for i in pl.unroll(TOK_TILE):
+            # stage=2: the tokens are independent, so the next one's loads overlap this
+            # one's arithmetic. The kernel is latency-bound on the per-token chain.
+            for i in pl.pipeline(TOK_TILE, stage=2):
                 r0 = t0 + i
                 # one token is h*d contiguous values: load the whole run, then take the
                 # [h, d] view the norm reduces over. Loading [h, d] directly issues h
@@ -126,7 +128,7 @@ def build_kernel(t: int = T, h: int = H, d: int = D, eps: float = EPS,
         for blk in pl.spmd(t // TOK_TILE, name_hint="gated_rmsnorm_bf16"):
             t0 = blk * TOK_TILE
             w_row = pl.cast(pl.reshape(norm_w[:], [1, d]), target_type=pl.FP32)
-            for i in pl.unroll(TOK_TILE):
+            for i in pl.pipeline(TOK_TILE, stage=2):
                 r0 = t0 + i
                 of_run = pl.cast(o_flat[r0 : r0 + 1, :], target_type=pl.FP32)
                 of = pl.reshape(of_run, [h, d])
