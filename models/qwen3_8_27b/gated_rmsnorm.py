@@ -87,7 +87,7 @@ def build_kernel(t: int = T, h: int = H, d: int = D, eps: float = EPS,
 
                 zf_run = pl.cast(z_flat[r0 : r0 + 1, :], target_type=pl.FP32)
                 zf = pl.reshape(zf_run, [h, d])
-                gate = pl.mul(zf, pl.recip(pl.add(pl.exp(pl.neg(zf)), 1.0)))
+                gate = pl.div(zf, pl.add(pl.exp(pl.neg(zf)), 1.0))
                 y = pl.mul(pl.cast(weighted_bf, target_type=pl.FP32), gate)
 
                 # The token's amax must reach every row of the [h, d] tile, and it
@@ -111,6 +111,7 @@ def build_kernel(t: int = T, h: int = H, d: int = D, eps: float = EPS,
                 # <= 127 and a +-127 clamp cannot bind. The cast rounds to nearest;
                 # an FP16 hop before INT8 would truncate instead, which is a silent
                 # one-step shift on 39% of the output.
+                # recip, not div, here: one reciprocal feeds a whole tile's multiply
                 q = pl.row_expand_mul(y, pl.mul(pl.recip(amax, high_precision=True), SCALE_MAX))
                 q_i8 = pl.cast(q, target_type=pl.INT8, mode="rint")
                 y_q[r0 : r0 + 1, :] = pl.reshape(q_i8, [1, h * d])
@@ -140,7 +141,7 @@ def build_kernel(t: int = T, h: int = H, d: int = D, eps: float = EPS,
 
                 zf_run = pl.cast(z_flat[r0 : r0 + 1, :], target_type=pl.FP32)
                 zf = pl.reshape(zf_run, [h, d])
-                gate = pl.mul(zf, pl.recip(pl.add(pl.exp(pl.neg(zf)), 1.0)))
+                gate = pl.div(zf, pl.add(pl.exp(pl.neg(zf)), 1.0))
                 y_bf = pl.cast(pl.mul(pl.cast(weighted_bf, target_type=pl.FP32), gate),
                                target_type=pl.BF16, mode="rint")
                 y[r0 : r0 + 1, :] = pl.reshape(y_bf, [1, h * d])
@@ -162,7 +163,7 @@ def golden_y(o, z, norm_w, eps: float = EPS):
     normed = (of * inv_rms).to(torch.bfloat16).float()
     weighted = (normed * norm_w.float()).to(torch.bfloat16).float()
     zf = z.float()
-    return (weighted * (zf * torch.reciprocal(torch.exp(-zf) + 1.0))).reshape(t, h * d)
+    return (weighted * (zf / (torch.exp(-zf) + 1.0))).reshape(t, h * d)
 
 
 def golden_quant(y):

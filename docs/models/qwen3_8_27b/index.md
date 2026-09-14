@@ -81,10 +81,10 @@ its first rows. That is what keeps every tap offset non-negative, so no block
 needs a head-padding special case; for prefill those rows are zero, and they
 are where a decode cache would sit.
 
-On a2a3 at T = 8192 over all 10240 channels, 50 rounds: **731 us**, 459 GB/s of
+On a2a3 at T = 8192 over all 10240 channels, 50 rounds: **648 us**, 517 GB/s of
 GM traffic against a measured copy roof of 1236 GB/s. CANN's own depthwise
 `conv1d` plus silu takes 1532 us channels-first and 2597 us once the transpose
-our token-major layout would need is charged, so 2.1x and 3.6x. Accuracy
+our token-major layout would need is charged, so 2.4x and 4.0x. Accuracy
 against the float64 reference is max abs 2.6e-02 on the real layer, inside the
 6e-02 the hand-written PTO-ISA kernel's own tests use for bf16.
 
@@ -102,10 +102,10 @@ fp32 scale per token and the normed output never reaches GM in bf16. Pass
 `--bf16-out` for the same kernel ending in the module's own cast, which is what
 the epilogue is priced against.
 
-On a2a3 at T = 8192, 50 rounds: **695 us** with the int8 epilogue (362 GB/s of
-GM traffic) and **447 us** without (676 GB/s). The comparison is a `torch_npu`
+On a2a3 at T = 8192, 50 rounds: **643 us** with the int8 epilogue (391 GB/s of
+GM traffic) and **398 us** without (759 GB/s). The comparison is a `torch_npu`
 composition -- `npu_rms_norm`, eager silu and multiply, `npu_dynamic_quant`,
-there being no gated-norm op -- at 2584 and 2431 us, so 3.7x and 5.4x. Accuracy against the
+there being no gated-norm op -- at 2584 and 2431 us, so 4.0x and 6.1x. Accuracy against the
 float64 reference is 3.3e-2 with the epilogue and 3.1e-3 without, so the
 quantisation is the entire gap and the kernel adds nothing measurable to it.
 

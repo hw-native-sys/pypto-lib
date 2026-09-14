@@ -65,8 +65,12 @@ def build_kernel(t: int = T, c: int = C, k: int = K, inline: bool = False,
                     src = pl.cast(x_pad[t0 + j : t0 + j + tok_tile, c0 : c0 + ch_tile],
                                   target_type=pl.FP32)
                     acc = pl.add(acc, pl.col_expand_mul(src, w_taps[j : j + 1, :]))
-                gate = pl.recip(pl.add(pl.exp(pl.neg(acc)), 1.0))
-                y[t0 : t0 + tok_tile, c0 : c0 + ch_tile] = pl.cast(pl.mul(acc, gate),
+                # silu as acc / (1 + exp(-acc)): one pass fewer than recip + mul,
+                # which is 11% of this kernel. The coding guide prefers recip + mul
+                # on hot paths, and that holds when the reciprocal is reused; here
+                # it is used once, so the divide simply removes an op.
+                den = pl.add(pl.exp(pl.neg(acc)), 1.0)
+                y[t0 : t0 + tok_tile, c0 : c0 + ch_tile] = pl.cast(pl.div(acc, den),
                                                                    target_type=pl.BF16, mode="rint")
         return y
 
@@ -86,7 +90,7 @@ def golden_y(x_pad, w, k: int = K):
     xf = x_pad.float()
     wf = w.float()
     acc = sum(xf[j : j + t] * wf[j] for j in range(k))
-    return acc * torch.reciprocal(torch.exp(-acc) + 1.0)
+    return acc / (torch.exp(-acc) + 1.0)
 
 
 def golden_gdn_short_conv(tensors):
