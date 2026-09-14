@@ -12,7 +12,7 @@ import pypto.language as pl
 import pypto.language.distributed as pld
 import torch
 
-from models.deepseek_v4_1_flash import config as C
+from models.deepseek_v4_1_flash.config import D, DECODE_MAX_TOKENS, PREFILL_MAX_TOKENS, T_DYN, TP_SIZE
 
 
 def golden_tp_output_all_reduce(output_partials: torch.Tensor) -> torch.Tensor:
@@ -22,10 +22,10 @@ def golden_tp_output_all_reduce(output_partials: torch.Tensor) -> torch.Tensor:
 
 @pl.jit.inline(auto_scope=False)
 def prefill_tp_output_all_reduce(
-    output_partial: pl.Tensor[[C.T_DYN, C.D], pl.FP32],
-    output_window: pld.DistributedTensor[[C.PREFILL_MAX_TOKENS, C.D], pl.FP32],
-    output_arrived: pld.DistributedTensor[[C.TP_SIZE, 1], pl.INT32],
-    output: pl.Tensor[[C.T_DYN, C.D], pl.BF16],
+    output_partial: pl.Tensor[[T_DYN, D], pl.FP32],
+    output_window: pld.DistributedTensor[[PREFILL_MAX_TOKENS, D], pl.FP32],
+    output_arrived: pld.DistributedTensor[[TP_SIZE, 1], pl.INT32],
+    output: pl.Tensor[[T_DYN, D], pl.BF16],
     group_base: pl.Scalar[pl.INT32],
     tp_rank: pl.Scalar[pl.INT32],
     num_tokens: pl.Scalar[pl.INT32],
@@ -36,16 +36,48 @@ def prefill_tp_output_all_reduce(
 
 @pl.jit.inline(auto_scope=False)
 def decode_tp_output_all_reduce(
-    output_partial: pl.Tensor[[C.T_DYN, C.D], pl.FP32],
-    output_window: pld.DistributedTensor[[C.DECODE_MAX_TOKENS, C.D], pl.FP32],
-    output_arrived: pld.DistributedTensor[[C.TP_SIZE, 1], pl.INT32],
-    output: pl.Tensor[[C.T_DYN, C.D], pl.BF16],
+    output_partial: pl.Tensor[[T_DYN, D], pl.FP32],
+    output_window: pld.DistributedTensor[[DECODE_MAX_TOKENS, D], pl.FP32],
+    output_arrived: pld.DistributedTensor[[TP_SIZE, 1], pl.INT32],
+    output: pl.Tensor[[T_DYN, D], pl.BF16],
     group_base: pl.Scalar[pl.INT32],
     tp_rank: pl.Scalar[pl.INT32],
     num_tokens: pl.Scalar[pl.INT32],
     attention_epoch: pl.Scalar[pl.INT32],
 ):
-    raise NotImplementedError("decode TP output all-reduce body is assigned independently")
+    with pl.at(level=pl.Level.CORE_GROUP, name_hint="decode_tp_reuse", allow_early_resolve=False) as reuse_tid:
+        for peer in pl.range(TP_SIZE):
+            pld.system.wait(output_arrived, offsets=[peer, 0], expected=(attention_epoch - 1) * 2,
+                            cmp=pld.WaitCmp.Ge)
+    with pl.at(level=pl.Level.CORE_GROUP, name_hint="decode_tp_publish", deps=[reuse_tid]) as publish_tid:
+        pld.tensor.put(dst=output_window, peer=group_base + tp_rank, src=output_partial,
+                       dst_offsets=[0, 0], src_offsets=[0, 0], shape=[num_tokens, D],
+                       chunk_rows=1, chunk_cols=512, pipeline=True)
+        for peer in pl.range(TP_SIZE):
+            pld.system.notify(output_arrived, peer=group_base + peer, offsets=[tp_rank, 0],
+                              value=1, op=pld.NotifyOp.AtomicAdd)
+    with pl.at(level=pl.Level.CORE_GROUP, name_hint="decode_tp_reduce", deps=[publish_tid],
+               allow_early_resolve=False) as reduce_tid:
+        for peer in pl.range(TP_SIZE):
+            pld.system.wait(output_arrived, offsets=[peer, 0], expected=attention_epoch * 2 - 1,
+                            cmp=pld.WaitCmp.Ge)
+        for t in pl.range(num_tokens):
+            for col in pl.range(0, D, 512):
+                acc = pl.tile.full([1, 512], dtype=pl.FP32, value=0.0)
+                for peer in pl.range(TP_SIZE):
+                    value = pld.tile.remote_load(output_window, peer=group_base + peer,
+                                             offsets=[t, col], shape=[1, 512])
+                    acc = pl.add(acc, value)
+                output = pl.store(pl.cast(acc, pl.BF16, mode="rint"), [t, col], output)
+        for peer in pl.range(TP_SIZE):
+            pld.system.notify(output_arrived, peer=group_base + peer, offsets=[tp_rank, 0],
+                              value=1, op=pld.NotifyOp.AtomicAdd)
+    with pl.at(level=pl.Level.CORE_GROUP, name_hint="decode_tp_consumed", deps=[reduce_tid],
+               allow_early_resolve=False):
+        for peer in pl.range(TP_SIZE):
+            pld.system.wait(output_arrived, offsets=[peer, 0], expected=attention_epoch * 2,
+                            cmp=pld.WaitCmp.Ge)
+    return output
 
 
 __all__ = ["decode_tp_output_all_reduce", "golden_tp_output_all_reduce", "prefill_tp_output_all_reduce"]
