@@ -10,43 +10,51 @@
 
 #include "tensor.h"
 
-// The 128-byte descriptor a kernel reads out of the task payload has been
-// spelled three different ways across three Simpler ABIs.  Keep this external
-// kernel source compilable with all of them, newest first, so a pypto-lib
-// change can land before PyPTO updates its runtime pin.
+// `Tensor` is the 128-byte descriptor a kernel reads out of the task payload:
+// each runtime's own working type (`simpler::tmr::Tensor` /
+// `simpler::hbg::Tensor`), exported unqualified by the per-runtime `tensor.h`
+// umbrella included above so a source compiled under either runtime need not
+// pick one.
 //
-//   TaskTensor  -- simpler#1974 split the fused type: `ChipTensor` kept the
-//                  name but became the 72-byte *argument* as it arrives at the
-//                  boundary, while the 128-byte descriptor became each
-//                  runtime's own type (`simpler::tmr::Tensor` /
-//                  `simpler::hbg::Tensor`), aliased `TaskTensor` by the
-//                  per-runtime `tensor.h` shim this file already includes.
-//   ChipTensor  -- simpler#1681 renamed the descriptor for the address-free
-//                  Buffer ABI, which also added task_interface/buffer.h.
-//   Tensor      -- the original spelling.
+// **Supported Simpler ABI: #2044 and newer.**  The descriptor has been spelled
+// three ways, and this file used to probe for all of them:
 //
-// The first probe is the header the #1974 shim itself pulls in to define
-// `TaskTensor`, so it is true exactly when that alias exists.  It is a version
-// probe, not a runtime selector: both split headers live under src/common and
-// arrive together, whichever runtime is being built for.
+//   Tensor      -- #2044 named the umbrella's export `Tensor` again, once
+//                  #2032 and #2038 had cut the kernel and orchestration include
+//                  paths to `task_interface/buffer.h`, whose global `Tensor`
+//                  was what the older name worked around.  Current.
+//   TaskTensor  -- #1974 split the fused type: `ChipTensor` kept the name but
+//                  became the 72-byte *argument* as it arrives at the boundary,
+//                  while the 128-byte descriptor became each runtime's own
+//                  type, exported as `TaskTensor`.
+//   ChipTensor  -- #1681 renamed the descriptor for the address-free Buffer
+//                  ABI, which also added task_interface/buffer.h.
 //
-// Getting this wrong is silent.  Naming `ChipTensor` against a post-#1974
-// runtime still compiles -- the kernel just reads `owner_task_id`'s bytes as
-// `start_offset` and garbage as `shapes`/`strides`, which surfaces on device
-// as an fftsplus aivector error rather than as a diagnostic.  The static_assert
-// below is what turns that back into a compile-time failure.
-#if __has_include("tensormap_and_ringbuffer/tensor.h")
-using PyPTORuntimeTensor = TaskTensor;
-#elif __has_include("task_interface/buffer.h")
-using PyPTORuntimeTensor = ChipTensor;
-#else
+// The probe is gone because it could not be made honest.  It keyed on
+// `tensormap_and_ringbuffer/tensor.h`, which #1974 added and #2044 left in
+// place, so it kept selecting `TaskTensor` after the rename and broke every
+// translation unit of this extern.  No `__has_include` fixes that: #2044
+// changed only the exported name, adding no header to the kernel include path,
+// so nothing on that path distinguishes it from the #1974 window.
+//
+// Naming one spelling and stating the supported range instead means an
+// unsupported runtime fails loudly here rather than being silently
+// mis-selected, and it gives up nothing reachable: every Simpler revision PyPTO
+// has pinned since the rename is post-#2044, including the one it later rolled
+// back to.  Widening the range again needs a real version signal from Simpler
+// (a version macro, or a header that moves with the ABI), not another proxy.
+//
+// The static_assert is the other half of failing loudly.  Naming `ChipTensor`
+// against a post-#1974 runtime still *compiles* -- the kernel just reads
+// `owner_task_id`'s bytes as `start_offset` and garbage as `shapes`/`strides`,
+// which surfaces on device as an fftsplus aivector error rather than as a
+// diagnostic.
 using PyPTORuntimeTensor = Tensor;
-#endif
 
 static_assert(
     sizeof(PyPTORuntimeTensor) == 128,
     "PyPTORuntimeTensor must be the 128-byte payload descriptor; a 72-byte "
-    "match means this picked up the post-#1974 boundary ChipTensor"
+    "match means this picked up the boundary ChipTensor"
 );
 
 #endif  // PYPTO_QWEN_RUNTIME_TENSOR_COMPAT_HPP
