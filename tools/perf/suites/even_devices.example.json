@@ -1,0 +1,26 @@
+{
+  "schema_version": 1,
+  "device_epoch": "set-to-your-host-and-topology-version",
+  "device_id_domain": "host",
+  "sequences": {
+    "1": [
+      4
+    ],
+    "4": [
+      0,
+      2,
+      4,
+      6
+    ],
+    "8": [
+      0,
+      2,
+      4,
+      6,
+      8,
+      10,
+      12,
+      14
+    ]
+  }
+}

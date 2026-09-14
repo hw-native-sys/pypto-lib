@@ -446,6 +446,31 @@ def l3_lm_head(
         )
 
 
+@pl.jit.host
+def l3_lm_head_projection(
+    hidden_states: pl.Tensor[[WORLD_SIZE, TEST_TOKENS, D], pl.BF16],
+    lm_head_weight: pl.Tensor[[WORLD_SIZE, VOCAB_PER_TP, D], pl.BF16],
+    logits: pl.Out[pl.Tensor[[WORLD_SIZE, MAX_LOGIT_ROWS, VOCAB], pl.FP32]],
+    logit_row_indices: pl.Tensor[[WORLD_SIZE, MAX_LOGIT_ROWS], pl.INT32],
+):
+    """Project and assemble logits without invoking the sampling kernel."""
+    hidden_window_buf = pld.alloc_window_buffer(GROUP_LOGIT_ROWS * D * 2)
+    logits_window_buf = pld.alloc_window_buffer(MAX_LOGIT_ROWS * VOCAB * 4)
+    hidden_done_buf = pld.alloc_window_buffer(TP_SIZE * 4)
+    logits_done_buf = pld.alloc_window_buffer(TP_SIZE * 4)
+
+    for r in pl.range(pld.world_size()):
+        hidden_window = pld.window(hidden_window_buf, [GROUP_LOGIT_ROWS, D], dtype=pl.BF16)
+        hidden_done = pld.window(hidden_done_buf, [TP_SIZE, 1], dtype=pl.INT32)
+        logits_window = pld.window(logits_window_buf, [MAX_LOGIT_ROWS, VOCAB], dtype=pl.FP32)
+        logits_done = pld.window(logits_done_buf, [TP_SIZE, 1], dtype=pl.INT32)
+        lm_head_test(
+            hidden_states[r], lm_head_weight[r], logit_row_indices[r], logits[r],
+            hidden_window, hidden_done, logits_window, logits_done,
+            r // TP_SIZE * TP_SIZE, r % TP_SIZE, DONE_VALUE, device=r,
+        )
+
+
 def golden_lm_head(tensors):
     import torch
 
@@ -610,11 +635,14 @@ if __name__ == "__main__":
                         help="DP groups (world size = tp * dp)")
     parser.add_argument("--num-tokens", type=int, default=TEST_TOKENS,
                         help="Active hidden rows each owner projects")
+    parser.add_argument("--entry", choices=("projection", "sample"), default="sample")
     parser.add_argument("-d", "--device", type=str, default=",".join(str(i) for i in range(WORLD_SIZE)),
                         help=f"comma-separated device ids; need at least {WORLD_SIZE}")
     parser.add_argument("--enable-chip-swimlane", type=int, nargs="?", const=1, default=0, choices=range(5))
     parser.add_argument("--compile-only", action="store_true", default=False)
     parser.add_argument("--runtime-dir", type=str, default=None)
+    parser.add_argument("--save-data", action="store_true")
+    parser.add_argument("--golden-data", type=str, default=None)
     parser.add_argument("--dump-passes", action="store_true", default=False)
     args = parser.parse_args()
 
@@ -633,12 +661,20 @@ if __name__ == "__main__":
         "logits": compare_logits,
         "sampled_ids": compare_sampled_ids,
     }
+    if args.entry == "projection":
+        fn = l3_lm_head_projection
+        specs = [spec for spec in specs if spec.name in (
+            "hidden_states", "lm_head_weight", "logits", "logit_row_indices",
+        )]
+        compare_fn = {"logits": compare_logits}
 
     result = run(
         fn=fn,
         specs=specs,
         golden_fn=golden_fn,
         compare_fn=compare_fn,
+        save_data=args.save_data,
+        golden_data=args.golden_data,
         compile_only=args.compile_only,
         runtime_dir=args.runtime_dir,
         config=dict(
