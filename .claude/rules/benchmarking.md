@@ -23,7 +23,7 @@ Where the numbers come from — see
 
 | Metric | Source | Quote |
 | --- | --- | --- |
-| Wall time | `PYPTO_BENCH=1` → `[RUN] effective_us (N rounds) …` | `median=`; quote `mean=` too when comparing against daily CI, whose per-case number is that field |
+| Wall time | `PYPTO_BENCH=1` → `[RUN] effective_us (N rounds) …` | `median=`; historical Daily CI figures used `mean=`, so compare only matching metric contracts |
 | Core busy time | chip swimlane per-task durations; PMU `*_busy_cycles` vs `pmu_total_cycles` | The bottleneck pipe's ratio |
 
 A `*sim` platform prints `effective_us unavailable: no device-domain spans`. A

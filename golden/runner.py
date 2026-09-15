@@ -449,9 +449,8 @@ def _is_l3(compiled: Any) -> bool:
 
 
 # Default benchmark loop sizes shared by L2 and L3, overridable per run via
-# PYPTO_BENCH_ROUNDS / PYPTO_BENCH_WARMUP (see :func:`_bench_loop_sizes`). Daily
-# CI pins the perf baseline by leaving both unset. L3 differs only in its
-# aggregation: each round contributes the fastest valid rank's Effective time.
+# PYPTO_BENCH_ROUNDS / PYPTO_BENCH_WARMUP (see :func:`_bench_loop_sizes`).
+# Performance callers pin these explicitly; correctness CI disables benchmarking.
 _BENCH_ROUNDS_DEFAULT = 100
 _BENCH_WARMUP_DEFAULT = 5
 
@@ -465,7 +464,7 @@ def _bench_enabled() -> bool:
     """True when ``PYPTO_BENCH`` is set truthy.
 
     Benchmarking is entirely env-driven so no model file needs a ``--benchmark``
-    flag and ``run`` needs no extra parameters: daily CI's a2a3 job sets
+    flag and ``run`` needs no extra parameters. Performance callers set
     ``PYPTO_BENCH=1`` and every ``run`` call then times the kernel over
     :func:`_bench_loop_sizes` rounds (warmup discarded).
     """
@@ -504,7 +503,7 @@ def _bench_loop_sizes() -> tuple[int, int]:
     handful of rounds is usually enough. Both are read per run (not cached), so
     a sweep can vary them between :func:`run` calls in one process.
 
-    Daily CI sets neither, so its numbers stay comparable across runs. Warmup is
+    Performance comparisons must use the same explicit loop sizes. Warmup is
     allowed to be 0; rounds must be at least 1.
     """
     return (
@@ -624,9 +623,8 @@ def _report_bench(stats: Any, compiled: Any, *, l3: bool, resident: bool) -> Non
     Four blocks: the ``effective_us`` headline, L3's per-rank table, the opt-in
     raw dump, and L3's context line. The headline goes first and is the only
     line spelling the metric out; every breakdown line says ``eff_us``, so one
-    glance down a 60-line multi-card dump finds the headline number. Daily CI
-    matches that line's full ``(N rounds) min=... mean=...`` shape, so the
-    spelling is a reader affordance, not a constraint on these lines.
+    glance down a 60-line multi-card dump finds the headline number. Structured
+    performance consumers use the returned benchmark data rather than this text.
     """
     _report_effective(stats)
     if l3:
@@ -713,8 +711,8 @@ def _eff_summary(samples: Any) -> tuple[int, str] | None:
 def _report_effective(stats: Any) -> None:
     """Print the max-rank ``effective_us (...)`` summary.
 
-    Daily CI consumes this line for both L2 and L3. For L3 it is the per-round
-    max across ranks (slowest rank bounds the round); the flatten fallback pools
+    For L3 it is the per-round max across ranks (slowest rank bounds the round);
+    the flatten fallback pools
     every rank's per-dispatch samples into the same window.
 
     The Effective window is the framework's post-graph-build execution window
@@ -1602,7 +1600,7 @@ def _run_pipeline(
     # Benchmark (L2 via _run_benchmark, non-resident L3 via _run_benchmark_l3).
     # Runs only after the correctness dispatch has been validated, for a fresh
     # compile and a runtime-dir replay alike. Entirely env-gated via
-    # PYPTO_BENCH=1 (daily CI).
+    # PYPTO_BENCH=1 (opt-in performance measurement).
     bench = None
     if benchmark_enabled:
         rounds, warmup = _bench_loop_sizes()
