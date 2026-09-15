@@ -155,14 +155,6 @@ def attention_hca(
         freqs_cos, freqs_sin, gamma_cq, gamma_ckv,
         q, kv, qr, qr_scale, late_dep,
     )
-    # SDMA CMO L2 warm of the o-projection weights, issued once q is written.
-    wo_a_flat = pl.reshape(wo_a, [O_GROUPS * O_LORA * O_GROUP_IN])
-    wo_b_flat = pl.reshape(wo_b, [D * O_GROUPS * O_LORA])
-    with pl.at(level=pl.Level.CORE_GROUP, name_hint="prefetch_o_proj_w", deps=[q_rope_tid]):
-        warm_ctx = pl.prefetch.make_context()
-        pl.prefetch.async_prefetch(wo_a_flat, warm_ctx)
-        pl.prefetch.async_prefetch(wo_b_flat, warm_ctx)
-
     ori_block_num = pl.tensor.dim(kv_cache, 0)
     kv_cache_flat = pl.reshape(kv_cache, [ori_block_num * BLOCK_SIZE, HEAD_DIM])
     for wb_blk in pl.spmd(T // HCA_WB_TOKEN_TILE, name_hint="hca_cache_writeback"):
@@ -624,6 +616,7 @@ if __name__ == "__main__":
     parser.add_argument("--enable-chip-swimlane", type=int, nargs="?", const=1, default=0, choices=range(5))
     parser.add_argument("--runtime-dir", type=str, default=None)
     parser.add_argument("--golden-data", type=str, default=None)
+    parser.add_argument("--save-data", action="store_true", default=False)
     parser.add_argument("--dump-passes", action="store_true", default=False)
     args = parser.parse_args()
 
@@ -633,6 +626,7 @@ if __name__ == "__main__":
         golden_fn=golden_attention_hca,
         runtime_dir=args.runtime_dir,
         golden_data=args.golden_data,
+        save_data=args.save_data,
         config=dict(
             dump_passes=args.dump_passes,
             platform=args.platform,
