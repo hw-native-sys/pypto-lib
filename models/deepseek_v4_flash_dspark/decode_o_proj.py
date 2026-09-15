@@ -147,6 +147,8 @@ def decode_o_proj_tp1(
     t_dim = pl.tensor.dim(attn_out, 0)
     act_t_blks = (t_dim + PROJ_B_ACT_TASK_T_TILE - 1) // PROJ_B_ACT_TASK_T_TILE
     proj_a_rows = (t_dim + PROJ_A_ROW_TILE - 1) // PROJ_A_ROW_TILE
+    proj_b_t_rows = (t_dim + PROJ_B_MM_T_TILE - 1) // PROJ_B_MM_T_TILE
+    proj_b_padded_rows = proj_b_t_rows * PROJ_B_MM_T_TILE
 
     # Back-to-back grouped output projection: proj_a[g] -> quant[g] -> proj_b[g]
     # pipelines per group; the per-group amax keeps the quant reduction inside one
@@ -207,13 +209,12 @@ def decode_o_proj_tp1(
                     oq_half = pl.cast(oq_i32, target_type=pl.FP16, mode="round")
                     oq_i8 = pl.cast(oq_half, target_type=pl.INT8, mode="trunc")
                     o_r_i8_pad[qt : qt + QUANT_TOKEN_TILE, col_g : col_g + O_LORA] = oq_i8
-                # Zero the rows past the runtime token count; proj_b_mm reads the full T_PAD extent.
-                for zt in pl.range(t_dim, T_PAD, QUANT_TOKEN_TILE):
+                # Zero the tail of the final active proj_b_mm row tile.
+                for zt in pl.range(t_dim, proj_b_padded_rows, QUANT_TOKEN_TILE):
                     zero_half = pl.full([QUANT_TOKEN_TILE, O_LORA], dtype=pl.FP16, value=0.0)
                     o_r_i8_pad[zt : zt + QUANT_TOKEN_TILE, col_g : col_g + O_LORA] = pl.cast(
                         zero_half, target_type=pl.INT8, mode="trunc")
 
-            proj_b_t_rows = T_PAD // PROJ_B_MM_T_TILE
             with pl.spmd(proj_b_t_rows * (D // PROJ_B_D_TILE), name_hint="proj_b_mm", deps=[q_tid], allow_early_resolve=True) as pb_tid:
                 pb_unit = pl.tile.get_block_idx()
                 tb = pb_unit // (D // PROJ_B_D_TILE)
