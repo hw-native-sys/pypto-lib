@@ -31,7 +31,47 @@ def prefill_tp_output_all_reduce(
     num_tokens: pl.Scalar[pl.INT32],
     attention_epoch: pl.Scalar[pl.INT32],
 ):
-    raise NotImplementedError("prefill TP output all-reduce body is assigned independently")
+    with pl.at(level=pl.Level.CORE_GROUP, name_hint="prefill_tp_reuse", allow_early_resolve=False) as reuse_tid:
+        for peer in pl.range(TP_SIZE):
+            previous_epoch = (attention_epoch - 1) * 2
+            pld.system.wait(output_arrived, offsets=[peer, 0], expected=previous_epoch, cmp=pld.WaitCmp.Ge)
+    with pl.spmd(64, name_hint="prefill_tp_publish", deps=[reuse_tid]) as publish_tid:
+        worker = pl.tile.get_block_idx()
+        for tile in pl.range(worker, num_tokens * (D // 512), 64):
+            row = tile // (D // 512)
+            col = tile % (D // 512) * 512
+            value = pl.load(output_partial, [row, col], [1, 512])
+            pld.tile.remote_store(value, output_window, peer=group_base + tp_rank, offsets=[row, col])
+    with pl.at(level=pl.Level.CORE_GROUP, name_hint="prefill_tp_ready", deps=[publish_tid]) as ready_tid:
+        for peer in pl.range(TP_SIZE):
+            pld.system.notify(
+                output_arrived, peer=group_base + peer, offsets=[tp_rank, 0], value=1, op=pld.NotifyOp.AtomicAdd,
+            )
+    with pl.at(level=pl.Level.CORE_GROUP, name_hint="prefill_tp_wait", deps=[ready_tid],
+               allow_early_resolve=False) as wait_tid:
+        for peer in pl.range(TP_SIZE):
+            ready_epoch = attention_epoch * 2 - 1
+            pld.system.wait(output_arrived, offsets=[peer, 0], expected=ready_epoch, cmp=pld.WaitCmp.Ge)
+    with pl.spmd(64, name_hint="prefill_tp_reduce", deps=[wait_tid]) as reduce_tid:
+        worker = pl.tile.get_block_idx()
+        for tile in pl.range(worker, num_tokens * (D // 512), 64):
+            row = tile // (D // 512)
+            col = tile % (D // 512) * 512
+            acc = pl.tile.full([1, 512], dtype=pl.FP32, value=0.0)
+            for peer in pl.range(TP_SIZE):
+                value = pld.tile.remote_load(output_window, peer=group_base + peer, offsets=[row, col], shape=[1, 512])
+                acc = pl.add(acc, value)
+            output = pl.store(pl.cast(acc, pl.BF16, mode="rint"), [row, col], output)
+    with pl.at(level=pl.Level.CORE_GROUP, name_hint="prefill_tp_release", deps=[reduce_tid]) as release_tid:
+        for peer in pl.range(TP_SIZE):
+            pld.system.notify(
+                output_arrived, peer=group_base + peer, offsets=[tp_rank, 0], value=1, op=pld.NotifyOp.AtomicAdd,
+            )
+    with pl.at(level=pl.Level.CORE_GROUP, name_hint="prefill_tp_consumed", deps=[release_tid],
+               allow_early_resolve=False):
+        for peer in pl.range(TP_SIZE):
+            pld.system.wait(output_arrived, offsets=[peer, 0], expected=attention_epoch * 2, cmp=pld.WaitCmp.Ge)
+    return output
 
 
 @pl.jit.inline(auto_scope=False)
