@@ -1919,6 +1919,8 @@ if __name__ == "__main__":
              "and a comma-separated list sets batch to its length",
     )
     parser.add_argument("--golden-data", type=str, default=None)
+    parser.add_argument("--runtime-dir", type=str, default=None,
+                        help="Replay a compatible compiled build directory")
     parser.add_argument("--save-data", action="store_true", default=False)
     parser.add_argument("--enable-chip-swimlane", type=int, nargs="?", const=1, default=0, choices=range(5))
     parser.add_argument("--compile-only", action="store_true", default=False)
@@ -1961,6 +1963,7 @@ if __name__ == "__main__":
             specs=build_tensor_specs(start_pos=start_pos, batch=batch),
             golden_fn=golden_decode_csa_tp1,
             golden_data=args.golden_data,
+            runtime_dir=args.runtime_dir,
             save_data=args.save_data,
             compile_only=args.compile_only,
             config=dict(
@@ -1968,6 +1971,7 @@ if __name__ == "__main__":
                             platform=args.platform,
                             device_id=device_ids[0],
                             enable_chip_swimlane=args.enable_chip_swimlane,
+                            ring_heap=1_073_741_824,
                         ),
             rtol=1e-2,
             atol=1e-2,
@@ -2016,6 +2020,7 @@ if __name__ == "__main__":
         specs=build_distributed_tensor_specs(local_t, start_pos=start_pos),
         golden_fn=golden_decode_csa,
         golden_data=args.golden_data,
+        runtime_dir=args.runtime_dir,
         save_data=args.save_data,
         compile_only=args.compile_only,
         config=dict(

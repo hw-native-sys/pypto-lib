@@ -98,6 +98,7 @@ TOPK_GROUP_SCRATCH_ROWS = TOPK_GROUP_WORKERS * TOPK_LEAVES_PER_GROUP
 TOPK_ARENA_ROWS = TOPK_GROUP_ROOT_ROWS + TOPK_GROUP_SCRATCH_ROWS
 TOPK_SCORE_WORKERS = 24  # Top-K score workers
 SCORE_TILE = 128
+SCORE_LANE_ROWS = SCORE_TILE // 2
 
 
 @pl.jit.inline
@@ -479,7 +480,7 @@ def indexer_score_topk_forest(
         name_hint="indexer_score_leaf_wave",
         deps=[qh_quant_tid, weights_tid, cache_write_tid],
         allow_early_resolve=True,
-        optimizations=[pl.split(pl.SplitMode.NONE, slot_num=2)],
+        optimizations=[pl.cross_core_slot(slot_num=2)],
     ) as score_tid:
         worker = pl.tile.get_block_idx()
         query_count = pl.tensor.dim(position_ids, 0)
@@ -505,37 +506,61 @@ def indexer_score_topk_forest(
                 valid_count = pl.min(TOPK_CANDIDATES_PER_LEAF, visible_count - logical_begin)
                 query_head_begin = query * IDX_N_HEADS
                 query_vector = qr_hadamard_i8[query_head_begin : query_head_begin + IDX_N_HEADS, 0:IDX_HEAD_DIM]
-                query_scale = pl.reshape(
-                    qr_hadamard_scale_dq[query_head_begin : query_head_begin + IDX_N_HEADS, 0:1],
-                    [1, IDX_N_HEADS],
-                )
-                query_weight = weights[query : query + 1, 0:IDX_N_HEADS]
+                # Both Vector lanes share the head coefficients for this query.
+                for _aiv_coeff in pl.split_aiv(2, mode=pl.SplitMode.NONE):
+                    query_scale = pl.reshape(
+                        qr_hadamard_scale_dq[query_head_begin : query_head_begin + IDX_N_HEADS, 0:1],
+                        [1, IDX_N_HEADS],
+                    )
+                    query_weight = weights[query : query + 1, 0:IDX_N_HEADS]
                 for score_begin in pl.range(0, valid_count, SCORE_TILE):
                     logical_row = logical_begin + score_begin
                     valid_rows = pl.min(SCORE_TILE, valid_count - score_begin)
                     kv_i8 = pl.create_l1([SCORE_TILE, IDX_HEAD_DIM], pl.INT8)
-                    kv_scale = pl.create_tensor([1, SCORE_TILE], dtype=pl.FP32)
                     for page in pl.unroll(SCORE_TILE // BLOCK_SIZE):
                         page_begin = page * BLOCK_SIZE
                         safe_page_begin = pl.min(page_begin, ((valid_rows - 1) // BLOCK_SIZE) * BLOCK_SIZE)
                         logical_page = (logical_row + safe_page_begin) // BLOCK_SIZE
                         physical_block = pl.cast(pl.read(idx_block_table_flat, [batch_idx * IDX_MAX_BLOCKS + logical_page]), pl.INDEX)
                         physical_row = physical_block * BLOCK_SIZE
-                        kv_scale = pl.gather_row(kv_scale, kv_scale_row, [0, page_begin], [0, physical_row], [1, BLOCK_SIZE])
                         kv_i8 = pl.gather_row(
                             kv_i8, kv_cache_i8_flat, [page_begin, 0], [physical_row, 0],
                             [BLOCK_SIZE, IDX_HEAD_DIM],
                         )
                     score_i32 = pl.matmul(kv_i8, query_vector, out_dtype=pl.INT32, b_trans=True)
-                    score_fp32 = pl.cast(score_i32, target_type=pl.FP32, mode="none")
-                    score_fp32 = pl.col_expand_mul(score_fp32, query_scale)
-                    score_fp32 = pl.maximum(score_fp32, 0.0)
-                    score_fp32 = pl.col_expand_mul(score_fp32, query_weight)
-                    score_sum = pl.row_sum(score_fp32)
-                    score_row = pl.reshape(score_sum, [1, SCORE_TILE])
-                    score_row = pl.mul(score_row, kv_scale)
-                    score_valid = pl.fillpad(pl.set_validshape(score_row, 1, valid_rows), pad_value=pl.PadValue.min)
-                    score_arena[query : query + 1, logical_row : logical_row + SCORE_TILE] = score_valid
+                    # Keep all heads for a candidate on one lane; shard candidate rows.
+                    for aiv_id in pl.split_aiv(2, mode=pl.SplitMode.UP_DOWN):
+                        lane_begin = aiv_id * SCORE_LANE_ROWS
+                        lane_valid_rows = pl.max(pl.min(valid_rows - lane_begin, SCORE_LANE_ROWS), 0)
+                        kv_scale = pl.create_tensor([1, SCORE_LANE_ROWS], dtype=pl.FP32)
+                        for scale_page in pl.unroll(SCORE_TILE // (2 * BLOCK_SIZE)):
+                            scale_page_begin = scale_page * BLOCK_SIZE
+                            safe_scale_begin = pl.min(
+                                lane_begin + scale_page_begin,
+                                ((valid_rows - 1) // BLOCK_SIZE) * BLOCK_SIZE,
+                            )
+                            scale_logical_page = (logical_row + safe_scale_begin) // BLOCK_SIZE
+                            scale_block = pl.cast(pl.read(
+                                idx_block_table_flat, [batch_idx * IDX_MAX_BLOCKS + scale_logical_page]
+                            ), pl.INDEX)
+                            scale_physical_row = scale_block * BLOCK_SIZE
+                            kv_scale = pl.gather_row(
+                                kv_scale, kv_scale_row, [0, scale_page_begin],
+                                [0, scale_physical_row], [1, BLOCK_SIZE],
+                            )
+                        score_shard = pl.aiv_shard(score_i32)
+                        score_fp32 = pl.cast(score_shard, target_type=pl.FP32, mode="none")
+                        score_fp32 = pl.col_expand_mul(score_fp32, query_scale)
+                        score_fp32 = pl.maximum(score_fp32, 0.0)
+                        score_fp32 = pl.col_expand_mul(score_fp32, query_weight)
+                        score_sum = pl.row_sum(score_fp32)
+                        score_row = pl.reshape(score_sum, [1, SCORE_LANE_ROWS])
+                        score_row = pl.mul(score_row, kv_scale)
+                        score_valid = pl.fillpad(
+                            pl.set_validshape(score_row, 1, lane_valid_rows), pad_value=pl.PadValue.min
+                        )
+                        lane_row = logical_row + lane_begin
+                        score_arena[query : query + 1, lane_row : lane_row + SCORE_LANE_ROWS] = score_valid
             global_leaf_base = global_leaf_base + leaf_count
 
     max_topk_cache_len = 0
@@ -551,12 +576,13 @@ def indexer_score_topk_forest(
                     topk_scores, topk_idxs,
                 )
         else:
-            with pl.spmd(TOPK_GROUP_WORKERS, name_hint="indexer_topk_group_wave", deps=[score_tid]) as topk_tid:
+            with pl.spmd(TOPK_GROUP_WORKERS, name_hint="indexer_topk_group_wave", deps=[score_tid], allow_early_resolve=True) as topk_tid:
                 indexer_topk_group_wave(position_ids, kv_seq_lens, score_arena, pair_arena)
             with pl.spmd(
                 TOPK_QUERY_WORKERS,
                 name_hint="indexer_topk_query_merge",
                 deps=[topk_tid],
+                allow_early_resolve=True
             ) as _merge_tid:
                 indexer_topk_query_merge(position_ids, kv_seq_lens, pair_arena, topk_scores, topk_idxs)
 
@@ -757,7 +783,7 @@ def indexer_weights_score(
     weights_partial = pl.create_tensor([WEIGHTS_OK * T_PAD, IDX_N_HEADS], dtype=pl.FP32)
     # Caller-ordered weights projection.
     with pl.spmd(
-        WEIGHTS_WORKERS, name_hint="weights_proj", deps=[weights_gate_dep],
+        WEIGHTS_WORKERS, name_hint="weights_proj", deps=[weights_gate_dep], allow_early_resolve=True
     ) as _weights_tid:
         w_worker = pl.tile.get_block_idx()
         for w_unit in pl.range(w_worker, WEIGHTS_OK * row_blocks, WEIGHTS_WORKERS):
