@@ -176,12 +176,14 @@ def decode_o_proj_tp1(
                 pa_rows = pl.min(PROJ_A_ROW_TILE, t_dim - pa_r0)
                 pa_src0 = row_base_o + pa_r0
                 n0 = nf * PROJ_A_MM_N_TILE
-                acc_a = pl.create_tensor([1, PROJ_A_ROW_TILE, PROJ_A_MM_N_TILE], dtype=pl.FP32)
-                for kb in pl.pipeline(0, O_GROUP_IN // A_K_TILE, stage=2):
+                xa_first = pl.slice(o_packed, [PROJ_A_ROW_TILE, A_K_TILE], [pa_src0, 0], valid_shape=[pa_rows, A_K_TILE])
+                wa_first = wo_a[g : g + 1, n0 : n0 + PROJ_A_MM_N_TILE, 0 : A_K_TILE]
+                acc_a = pl.matmul(xa_first, wa_first, out_dtype=pl.FP32, b_trans=True)
+                for kb in pl.pipeline(1, O_GROUP_IN // A_K_TILE, stage=2):
                     k0 = kb * A_K_TILE
                     xa_k_chunk = pl.slice(o_packed, [PROJ_A_ROW_TILE, A_K_TILE], [pa_src0, k0], valid_shape=[pa_rows, A_K_TILE])
                     wa_k_chunk = wo_a[g : g + 1, n0 : n0 + PROJ_A_MM_N_TILE, k0 : k0 + A_K_TILE]
-                    acc_a = pl.matmul_acc(acc_a, xa_k_chunk, wa_k_chunk, b_trans=True, init_cond=(kb == 0))
+                    acc_a = pl.matmul_acc(acc_a, xa_k_chunk, wa_k_chunk, b_trans=True)
                 # acc_a is 3D (wo_a keeps its group axis), which subscript-write cannot express.
                 o_r_pad = pl.assemble(o_r_pad, acc_a, [pa_r0, out_col_g + n0])
 
