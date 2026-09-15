@@ -126,30 +126,63 @@ def parse_cpp(cpp_text: str) -> tuple[str, bool, list[Param]]:
 
 
 # ── Parse the sibling .pto for static buffer sizes ───────────────────────────
-def _parse_dim_list(blob: str, dynamic_dim: int) -> tuple[list[int], set[int]]:
-    """Parse a .pto ``[%cN_index, %argM, ...]`` dim/stride list.
+_PTO_CONST = r"%c(\d+)_index"
+_PTO_ARG = r"%arg(\d+)"
+_PTO_VIEW = re.compile(
+    r"make_tensor_view\s+%arg(\d+),\s*shape\s*=\s*\[([^\]]*)\]"
+    r"(?:,\s*strides\s*=\s*\[([^\]]*)\])?"
+)
+_PTO_SSA_DEF = re.compile(r"^\s*(%[\w.$-]+)\s*=")
+_PTO_MULI = re.compile(r"^\s*%[\w.$-]+\s*=\s*arith\.muli\s+(%[\w.$-]+)\s*,\s*(%[\w.$-]+)\s*:\s*index\b")
+
+
+def _arg_times_const(line: str) -> tuple[int, int] | None:
+    """Return ``(argN, factor)`` for an ``arith.muli`` of a direct arg and an index constant."""
+    m = _PTO_MULI.match(line)
+    if not m:
+        return None
+    for arg_tok, const_tok in ((m.group(1), m.group(2)), (m.group(2), m.group(1))):
+        am = re.fullmatch(_PTO_ARG, arg_tok)
+        cm = re.fullmatch(_PTO_CONST, const_tok)
+        if am and cm:
+            return int(am.group(1)), int(cm.group(1))
+    return None
+
+
+def _parse_dim_list(
+    blob: str, dynamic_dim: int, products: dict[str, tuple[int, int]]
+) -> tuple[list[int], set[int]]:
+    """Parse a .pto ``[%cN_index, %argM, %K, ...]`` dim/stride list.
 
     A constant ``%cN_index`` yields its value; a dynamic ``%argN`` (runtime) or
-    stride yields ``dynamic_dim`` and records the scalar argument. Computed SSA
-    dimensions are rejected because this focused generator cannot bound them
-    safely.
+    stride yields ``dynamic_dim`` and records the scalar argument. An SSA value
+    defined as ``arith.muli %argN, %cK_index`` (either operand order) yields
+    ``dynamic_dim * K`` and records ``%argN``, so the ``main.cpp`` guard on
+    ``%argN <= dynamic_dim`` also bounds the product. Any other computed SSA
+    dimension is rejected because this focused generator cannot bound it safely.
     """
     out: list[int] = []
     dynamic_args: set[int] = set()
     for tok in blob.split(","):
         token = tok.strip()
-        cm = re.fullmatch(r"%c(\d+)_index", token)
+        cm = re.fullmatch(_PTO_CONST, token)
         if cm:
             out.append(int(cm.group(1)))
             continue
-        am = re.fullmatch(r"%arg(\d+)", token)
+        am = re.fullmatch(_PTO_ARG, token)
         if am:
             out.append(dynamic_dim)
             dynamic_args.add(int(am.group(1)))
             continue
+        if token in products:
+            argn, factor = products[token]
+            out.append(dynamic_dim * factor)
+            dynamic_args.add(argn)
+            continue
         raise ValueError(
-            f"cannot safely bound computed PTO dimension {token!r}; "
-            "use incore_profile.py --ptoas-root with the full PTOAS generator"
+            f"cannot safely bound computed PTO dimension {token!r}; only constants, "
+            "direct %argN scalars, and %argN * constant products are resolved. "
+            "Use incore_profile.py --ptoas-root with the full PTOAS generator"
         )
     return out, dynamic_args
 
@@ -160,23 +193,40 @@ def parse_pto_sizes(pto_text: str, dynamic_dim: int = _DEFAULT_DYNAMIC) -> tuple
     Allocates the true linear footprint ``1 + Σ_d (shape[d]-1)*stride[d]`` rather
     than ``prod(shape)``, so a padded/strided view (physical stride larger than
     the shape) is not under-allocated. Constant dims use their value; a dynamic
-    dim (``%argN``) uses ``dynamic_dim``. Keeps the largest footprint across
-    an arg's views (a safe upper bound on what the kernel touches).
+    dim (``%argN``) uses ``dynamic_dim`` and a ``%argN * K`` product uses
+    ``dynamic_dim * K``. Keeps the largest footprint across an arg's views (a
+    safe upper bound on what the kernel touches).
+
+    The .pto is read one op per line. SSA definitions are scoped to their
+    ``func.func`` and resolved to the latest preceding definition, since MLIR
+    reuses value numbers across functions and sibling regions.
     """
     if dynamic_dim <= 0:
         raise ValueError(f"dynamic_dim must be greater than zero, got {dynamic_dim}")
     sizes: dict[int, int] = {}
     dynamic_args: set[int] = set()
-    pat = re.compile(
-        r"make_tensor_view\s+%arg(\d+),\s*shape\s*=\s*\[([^\]]*)\]"
-        r"(?:,\s*strides\s*=\s*\[([^\]]*)\])?"
-    )
-    for m in pat.finditer(pto_text):
+    products: dict[str, tuple[int, int]] = {}
+    for line in pto_text.splitlines():
+        if "func.func" in line:
+            products.clear()
+        m = _PTO_VIEW.search(line)
+        if not m:
+            d = _PTO_SSA_DEF.match(line)
+            if d:
+                product = _arg_times_const(line)
+                if product:
+                    products[d.group(1)] = product
+                else:
+                    products.pop(d.group(1), None)
+            continue
+        view_def = _PTO_SSA_DEF.match(line)
+        if view_def:
+            products.pop(view_def.group(1), None)
         argn = int(m.group(1))
-        shape, shape_args = _parse_dim_list(m.group(2), dynamic_dim)
+        shape, shape_args = _parse_dim_list(m.group(2), dynamic_dim, products)
         dynamic_args.update(shape_args)
         if m.group(3):
-            strides, stride_args = _parse_dim_list(m.group(3), dynamic_dim)
+            strides, stride_args = _parse_dim_list(m.group(3), dynamic_dim, products)
             dynamic_args.update(stride_args)
         else:
             strides = None
@@ -195,6 +245,25 @@ def elem_count_for(param_idx: int, pto_sizes: dict[int, int]) -> int:
     if param_idx in pto_sizes:
         return pto_sizes[param_idx]
     return _DEFAULT_SCRATCH  # e.g. the cube<->vector pipe slot buffer (no make_tensor_view)
+
+
+def parse_pto_param_names(pto_text: str, func_name: str) -> list[str] | None:
+    """Return the positional parameter names (without ``%``) of ``func.func @<func_name>``."""
+    m = re.search(rf"func\.func\s+@{re.escape(func_name)}\s*\(([^)]*)\)", pto_text)
+    if not m:
+        return None
+    return re.findall(r"%([\w.$-]+)\s*:", m.group(1))
+
+
+# PyPTO's synthetic SPMD scalars. The standalone case runs one block of one, so
+# block_idx defaults to 0; every other scalar keeps the historical default of 1.
+_PTO_SUBBLOCK_ARG = "__pypto_spmd_subblock_idx"
+_SCALAR_DEFAULTS = {
+    "__pypto_spmd_block_idx": "0",
+    "__pypto_spmd_block_num": "1",
+    _PTO_SUBBLOCK_ARG: "0",
+}
+_DEFAULT_SCALAR = "1"
 
 
 # ── Code emission ────────────────────────────────────────────────────────────
@@ -379,12 +448,20 @@ if __name__ == "__main__":
 """
 
 
-def emit_kernel_cpp(cpp_text: str, name: str, is_mixed: bool, params: list[Param]) -> str:
+def emit_kernel_cpp(
+    cpp_text: str,
+    name: str,
+    is_mixed: bool,
+    params: list[Param],
+    aiv_param_names: list[str] | None = None,
+) -> str:
     """Compat preamble + the original kernel + (mixed) a merged __global__ dispatcher.
 
     For a mixed kernel the standalone ``<name>_aic`` / ``<name>_aiv`` are
     self-contained (each builds its own GM pipe from the slot buffer), so the
     merged entry just dispatches by core type — no body inlining needed.
+    ``aiv_param_names`` are the ``.pto`` parameter names of ``<name>_aiv`` and
+    identify the extra trailing AIV arguments.
     """
     decl = ", ".join(
         (f"__gm__ {p.cpp_type}* {p.name}" if p.is_ptr else f"{p.cpp_type} {p.name}") for p in params
@@ -410,16 +487,23 @@ def emit_kernel_cpp(cpp_text: str, name: str, is_mixed: bool, params: list[Param
         )
     if is_mixed:
         # The AIV side of a mixed kernel may take extra trailing scalar args
-        # beyond the AIC launch ABI (e.g. block-partition offsets the runtime
-        # derives per AIV subblock). The synthesized single-core dispatcher has
-        # no such runtime, so we pass 0 for each extra arg — that profiles the
-        # first partition, and per-instruction cost is partition-independent.
+        # beyond the AIC launch ABI. PyPTO's is the vector lane index
+        # (__pypto_spmd_subblock_idx), which the runtime supplies per AIV core.
+        # Every vector core of the launched cluster runs this dispatcher, so
+        # forward each core's own lane from get_subblockid(); a literal would make
+        # all lanes run the same subblock. Unrecognized extras still receive 0.
         aiv_call = call
         m_aiv = re.search(rf"\bAICORE\s+void\s+{re.escape(name)}_aiv\s*\(([^)]*)\)", cpp_text)
         if m_aiv:
-            n_extra = len(_split_params(m_aiv.group(1))) - len(params)
-            if n_extra > 0:
-                aiv_call = call + ", " + ", ".join(["0"] * n_extra)
+            n_aiv = len(_split_params(m_aiv.group(1)))
+            names = aiv_param_names if aiv_param_names and len(aiv_param_names) == n_aiv else None
+            extras = []
+            for idx in range(len(params), n_aiv):
+                arg_name = names[idx] if names else "unknown"
+                value = "static_cast<int32_t>(get_subblockid())" if arg_name == _PTO_SUBBLOCK_ARG else "0"
+                extras.append(f"{value} /* {arg_name} */")
+            if extras:
+                aiv_call = call + ", " + ", ".join(extras)
         # extern "C" so the merged dispatcher's launch-ABI symbol matches the
         # non-mangled forward decl in launch.cpp (mirrors the ptoas pure-kernel
         # convention, which is always `extern "C" __global__`).
@@ -458,10 +542,11 @@ def emit_main_cpp(
     counts: dict[str, int],
     dynamic_args: set[int],
     dynamic_dim: int,
+    param_names: list[str] | None = None,
 ) -> str:
     launch_name = "Launch" + name[:1].upper() + name[1:]
     ptrs = [p for p in params if p.is_ptr]
-    scalars = [p for p in params if not p.is_ptr]
+    names = param_names if param_names and len(param_names) == len(params) else None
 
     decls, alloc, reads, copy, free = [], [], [], [], []
     for p in ptrs:
@@ -481,8 +566,14 @@ def emit_main_cpp(
         )
         free.append(f"    if ({n}Device) aclrtFree({n}Device);")
         free.append(f"    if ({n}Host) aclrtFreeHost({n}Host);")
-    for p in scalars:
-        decls.append(f"    {p.cpp_type} {p.name} = 1;")  # safe default (matches legacy)
+    for i, p in enumerate(params):
+        if p.is_ptr:
+            continue
+        # Name each scalar after its .pto parameter so workload wiring can find it.
+        pto_name = names[i] if names else None
+        value = _SCALAR_DEFAULTS.get(pto_name, _DEFAULT_SCALAR) if pto_name else _DEFAULT_SCALAR
+        comment = f"  // %{pto_name}" if pto_name else ""
+        decls.append(f"    {p.cpp_type} {p.name} = {value};{comment}")
 
     guards = []
     for argn in sorted(dynamic_args):
@@ -551,7 +642,10 @@ def generate(
             "The .pto carries the static tensor shapes used for buffer sizing."
         )
     name, is_mixed, params = parse_cpp(cpp_text)
-    pto_sizes, dynamic_args = parse_pto_sizes(pto_path.read_text(encoding="utf-8"), dynamic_dim)
+    pto_text = pto_path.read_text(encoding="utf-8")
+    pto_sizes, dynamic_args = parse_pto_sizes(pto_text, dynamic_dim)
+    param_names = parse_pto_param_names(pto_text, f"{name}_aic" if is_mixed else name)
+    aiv_param_names = parse_pto_param_names(pto_text, f"{name}_aiv") if is_mixed else None
 
     counts: dict[str, int] = {}
     for i, p in enumerate(params):
@@ -561,11 +655,11 @@ def generate(
     out_dir = output_root / "ptoas" / testcase
     out_dir.mkdir(parents=True, exist_ok=True)
     (out_dir / f"{testcase}_kernel.cpp").write_text(
-        emit_kernel_cpp(cpp_text, name, is_mixed, params), encoding="utf-8"
+        emit_kernel_cpp(cpp_text, name, is_mixed, params, aiv_param_names), encoding="utf-8"
     )
     (out_dir / "launch.cpp").write_text(emit_launch_cpp(name, params), encoding="utf-8")
     (out_dir / "main.cpp").write_text(
-        emit_main_cpp(name, params, counts, dynamic_args, dynamic_dim), encoding="utf-8"
+        emit_main_cpp(name, params, counts, dynamic_args, dynamic_dim, param_names), encoding="utf-8"
     )
     (out_dir / "CMakeLists.txt").write_text(
         _CMAKE_TEMPLATE.replace("@TESTCASE@", testcase).replace("@AICORE_ARCH@", aicore_arch),

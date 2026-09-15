@@ -19,10 +19,117 @@ import sys
 import pytest
 
 
-_SCRIPT = Path(__file__).resolve().parents[1] / ".claude/skills/incore-profiling/incore_profile.py"
-_SPEC = importlib.util.spec_from_file_location("incore_profile_under_test", _SCRIPT)
-profile = importlib.util.module_from_spec(_SPEC)
-_SPEC.loader.exec_module(profile)
+_SKILL = Path(__file__).resolve().parents[1] / ".claude/skills/incore-profiling"
+
+
+def _load(name, filename):
+    spec = importlib.util.spec_from_file_location(name, _SKILL / filename)
+    assert spec is not None and spec.loader is not None
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+profile = _load("incore_profile_under_test", "incore_profile.py")
+gen = _load("gen_profiling_case_under_test", "gen_profiling_case.py")
+
+_MIXED_PTO = """\
+module {
+  func.func @k_aic(%arg0: !pto.ptr<i8>, %arg1: !pto.ptr<f32>, %arg2: index, %__pypto_spmd_block_idx: i32, %__pypto_spmd_block_num: i32) {
+  %c32_index = arith.constant 32 : index
+  %c128_index = arith.constant 128 : index
+  %c1_index = arith.constant 1 : index
+  %7 = arith.muli %arg2, %c32_index : index
+  %a_view = pto.make_tensor_view %arg0, shape = [%7, %c128_index], strides = [%c128_index, %c1_index] {layout = #pto.layout<nd>} : !pto.tensor_view<?x?xi8>
+  }
+  func.func @k_aiv(%arg0: !pto.ptr<i8>, %arg1: !pto.ptr<f32>, %arg2: index, %__pypto_spmd_block_idx: i32, %__pypto_spmd_block_num: i32, %__pypto_spmd_subblock_idx: i32) {
+  %c16_index = arith.constant 16 : index
+  %c1_index = arith.constant 1 : index
+  %c32_index = arith.constant 32 : index
+  %7 = arith.muli %c32_index, %arg2 : index
+  %b_view = pto.make_tensor_view %arg1, shape = [%7, %c1_index], strides = [%c1_index, %7] {layout = #pto.layout<dn>} : !pto.tensor_view<?x?xf32>
+  %7 = arith.muli %arg2, %c16_index : index
+  }
+}
+"""
+_MIXED_CPP = """\
+AICORE void k_aic(__gm__ int8_t* v1, __gm__ float* v2, int64_t v3, int32_t v4, int32_t v5) {}
+AICORE void k_aiv(__gm__ int8_t* v1, __gm__ float* v2, int64_t v3, int32_t v4, int32_t v5, int32_t v6) {}
+"""
+
+
+def test_arg_times_constant_extent_is_bounded_by_dynamic_dim():
+    sizes, dynamic_args = gen.parse_pto_sizes(_MIXED_PTO, dynamic_dim=4096)
+    assert sizes == {0: 4096 * 32 * 128, 1: 4096 * 32}
+    assert dynamic_args == {2}
+
+
+def test_other_computed_extent_is_still_rejected():
+    pto = _MIXED_PTO.replace("arith.muli %arg2, %c32_index", "arith.addi %arg2, %c32_index")
+    with pytest.raises(ValueError, match="cannot safely bound"):
+        gen.parse_pto_sizes(pto)
+
+
+def test_ssa_product_does_not_leak_across_functions():
+    pto = "func.func @a(%arg0: index) {\n%7 = arith.muli %arg0, %c4_index : index\n}\n" \
+        "func.func @b(%arg0: !pto.ptr<i8>) {\n" \
+        "%v = pto.make_tensor_view %arg0, shape = [%7], strides = [%c1_index]\n}\n"
+    with pytest.raises(ValueError, match="%7"):
+        gen.parse_pto_sizes(pto)
+
+
+def test_mixed_dispatcher_forwards_each_vector_lane():
+    name, is_mixed, params = gen.parse_cpp(_MIXED_CPP)
+    aiv_names = gen.parse_pto_param_names(_MIXED_PTO, "k_aiv")
+    text = gen.emit_kernel_cpp(_MIXED_CPP, name, is_mixed, params, aiv_names)
+    assert (
+        "k_aiv(v1, v2, v3, v4, v5, static_cast<int32_t>(get_subblockid()) /* __pypto_spmd_subblock_idx */);"
+        in text
+    )
+
+
+def test_spmd_scalar_defaults_run_block_zero_of_one():
+    name, _, params = gen.parse_cpp(_MIXED_CPP)
+    names = gen.parse_pto_param_names(_MIXED_PTO, "k_aic")
+    counts = {p.name: 1 for p in params if p.is_ptr}
+    text = gen.emit_main_cpp(name, params, counts, {2}, 4096, names)
+    assert "int64_t v3 = 1;  // %arg2" in text
+    assert "int32_t v4 = 0;  // %__pypto_spmd_block_idx" in text
+    assert "int32_t v5 = 1;  // %__pypto_spmd_block_num" in text
+    assert "> 4096.0L" in text
+
+
+_NPU_SMI = """\
++------------------------------------------------------------------------------------------------+
+| npu-smi 26.0.rc1                            Version: 26.0.rc1                                  |
++---------------------------+---------------+----------------------------------------------------+
+| NPU   Name                | Health        | Power(W)             Temp(C)                       |
+| Chip                      | Bus-Id        | AICore(%)            Memory-Usage(MB)              |
++===========================+===============+====================================================+
+| 0     910B1               | OK            | 98.1                 48                            |
+| 0                         | 0000:C1:00.0  | 100                  0    / 0                      |
++===========================+===============+====================================================+
+| 1     910B1               | OK            | 102.8                48                            |
+| 0                         | 0000:01:00.0  | 100                  0    / 0                      |
++===========================+===============+====================================================+
+"""
+_SOCS = ["Ascend910B", "Ascend910B1", "Ascend910B2", "Ascend950"]
+
+
+def test_npu_smi_variant_selects_exact_camodel_soc():
+    chips = profile.parse_npu_smi_chip_names(_NPU_SMI)
+    assert chips == ["910B1", "910B1"]
+    assert profile.select_soc_version("a2a3", _SOCS, None, chips) == "Ascend910B1"
+
+
+def test_explicit_soc_version_wins_over_npu_smi():
+    assert profile.select_soc_version("a2a3", _SOCS, "Ascend910B2", ["910B1"]) == "Ascend910B2"
+
+
+@pytest.mark.parametrize("chips", [[], ["910B4"]])
+def test_ambiguous_soc_without_device_variant_requires_override(chips):
+    with pytest.raises(profile.StepError, match="--soc-version"):
+        profile.select_soc_version("a2a3", _SOCS, None, chips)
 
 
 def test_simulator_runtime_initializes_before_transitive_callback(tmp_path):

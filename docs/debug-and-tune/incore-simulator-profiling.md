@@ -40,6 +40,15 @@ Choose the target explicitly:
 | `a2a3` | `dav-c220` | Ascend A2/A3 |
 | `a5` | `dav-c310` | Ascend A5 |
 
+The target selects a SoC family, but the camodel SoC must be the device's
+exact variant. A family-generic SoC is not interchangeable: on a 910B1 host,
+`Ascend910B` finished collection and then failed to parse with "Failed to get
+any available dump file to parse". When `--soc-version` is omitted, the
+workflow uses the chip name that `npu-smi info` reports (`910B1` selects
+`Ascend910B1`). If `npu-smi` is unavailable, or none of its chips match the
+family's installed camodel SoCs, and the family has more than one, the
+workflow stops and requires `--soc-version`.
+
 Do not silently provision a missing `msopprof` worker into a shared CANN
 installation. That writes outside the repository and can mix toolchain
 versions. Prefer installing the complete matching CANN package; any temporary
@@ -105,8 +114,17 @@ For each selected kernel, the workflow:
    kernels unless fail-fast was requested.
 
 Mixed cube/vector kernels use a small dispatcher that launches the appropriate
-AIC and AIV entry points. The standalone case is intentionally single-core; it
-does not reproduce the full persistent or multi-core runtime schedule.
+AIC and AIV entry points. The AIV entry takes one argument the AIC entry does
+not, `__pypto_spmd_subblock_idx`, which the runtime normally supplies per
+vector lane. The dispatcher passes each vector core its own
+`get_subblockid()`, so both lanes execute their own subblock; a constant would
+run one subblock twice and never exercise the other. Equal per-lane instruction
+counts do not show which subblock ran, because a constant produces the same
+counts. Compare a lane-dependent value instead: in the per-core instruction
+CSV, a row or slot offset in the `detail` column should differ between vector
+cores by the lane stride. The standalone case
+launches one core cluster; it does not reproduce the full persistent or
+multi-core runtime schedule.
 
 ## Output layout
 
@@ -164,10 +182,12 @@ the cleaned trace instead.
 
 ## Validate that the standalone workload is real
 
-Generated inputs are synthetic. Integer tensors are commonly zero-filled and
-dynamic scalar tail arguments may default to `1`. If a kernel derives a loop
-bound, task count, valid length, work table, or tensor extent from those
-values, the standalone case may execute only its scalar prologue and
+Generated inputs are synthetic. Integer tensors are commonly zero-filled.
+Scalar tail arguments default to `1`, except `__pypto_spmd_block_idx`, which
+defaults to `0`, so an SPMD kernel runs block 0 of 1. Each scalar in the
+generated `main.cpp` is annotated with its `.pto` parameter name. If a kernel
+derives a loop bound, task count, valid length, work table, or tensor extent
+from those values, the standalone case may execute only its scalar prologue and
 synchronization path.
 
 Treat any of these as a degenerate trace:
@@ -184,9 +204,10 @@ Before trusting such a trace:
 2. Derive hidden dynamic scalars from generated orchestration
    `add_scalar` calls or the kernel signature.
 3. Choose representative values for the control tensors and scalars.
-4. For a direct dynamic extent or stride, regenerate with
-   `--dynamic-dim N`, where `N` is at least the largest scalar value.
-   For a computed SSA extent or stride, use the full PTOAS generator.
+4. For a direct dynamic extent or stride, or one computed as a scalar times a
+   constant, regenerate with `--dynamic-dim N`, where `N` is at least the
+   largest scalar value. For any other computed SSA extent or stride, use the
+   full PTOAS generator.
 5. Replace the control input binaries and wire scalar values without
    exceeding the generated bound.
 6. Rebuild and recollect from the testcase's working directory.
@@ -194,10 +215,14 @@ Before trusting such a trace:
 
 Static `.pto` shapes size the full GM allocations. For a direct `%argN`
 dynamic extent or stride, the bundled generator uses `--dynamic-dim`
-(default `256`) as the allocation bound and emits a runtime guard. It rejects
-computed SSA dimensions because it cannot bound them safely. Regenerate with
-the intended bound instead of patching only the scalar or allocation; changing
-only one can make the standalone case access beyond its generated buffer.
+(default `256`) as the allocation bound and emits a runtime guard that rejects
+a larger scalar. An extent defined as `arith.muli` of a direct `%argN` and an
+index constant `K`, such as `%49 = arith.muli %arg10, %c32_index`, is
+allocated as `--dynamic-dim` times `K` under the same guard on `%argN`. It
+rejects other computed SSA dimensions because it cannot bound them safely.
+Regenerate with the intended bound instead of patching only the scalar or
+allocation; changing only one can make the standalone case access beyond its
+generated buffer.
 
 ## Interpret pipeline evidence
 
@@ -222,6 +247,9 @@ simulator trace.
 | `unknown type name '__biasbuf__'` or undeclared `aicore` | Selected CANN compiler is not Tile-Language capable | Use the CANN installation used for the device build |
 | Header errors under an A5 include path while targeting A2/A3 | Architecture mismatch | Select the matching target and rebuild |
 | `cannot find -lruntime_camodel` | Selected SoC has no camodel library | Choose an installed SoC variant that matches the device |
+| Collection succeeds, then "Failed to get any available dump file to parse" | Family-generic camodel SoC, such as `Ascend910B` on a 910B1 device | Pass `--soc-version` with the exact variant from `npu-smi info` |
+| Workflow stops: multiple camodel SoCs match the target | `npu-smi` is unavailable or reports no matching variant | Pass `--soc-version` explicitly |
+| A mixed kernel's vector lanes read the same lane-dependent offsets | Both lanes ran the same subblock | Regenerate the case; do not replace the dispatcher's `get_subblockid()` with a constant |
 | Missing `msopprof` worker | Incomplete toolkit package | Install the matching operator-development tools; do not silently mutate a shared toolkit |
 | Injection library cannot be preloaded, followed by `aclInit` failure | Worker and companion library are incomplete or mismatched | Install both from the same CANN package |
 | CANN 9 crashes in `RegAtraceInfoInit` during startup | Device and camodel runtime libraries loaded together | Use the generated per-case simulator runtime alias |

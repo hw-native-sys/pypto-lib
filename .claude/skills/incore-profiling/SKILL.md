@@ -72,6 +72,9 @@ python .claude/skills/incore-profiling/incore_profile.py \
 Profile all discovered functions only when requested by omitting `--func`.
 Use `--cann-set-env`, `--soc-version`, `--aicore-arch`, or
 `--pto-isa-root` when auto-discovery selects the wrong installation or SoC.
+Without `--soc-version`, the camodel SoC is the variant `npu-smi info` reports;
+on a host without a matching device the run stops until `--soc-version` names
+the exact variant (never a family-generic SoC such as `Ascend910B`).
 
 To build a case first:
 
@@ -97,8 +100,9 @@ The bundled generator allocates runtime-shaped tensor dimensions using
 `--dynamic-dim` (default `256`). Generated `main.cpp` rejects a direct dynamic
 scalar that exceeds this allocation bound. Set `--dynamic-dim` to at least the
 largest scalar value you plan to wire; regenerate the case instead of patching
-only the scalar. An unresolved computed shape or stride is an error—use a full
-PTOAS source checkout via `--ptoas-root` for those cases.
+only the scalar. A `%argN * constant` extent is bounded the same way. Any other
+computed shape or stride is an error—use a full PTOAS source checkout via
+`--ptoas-root` for those cases.
 
 If the preflight reports a missing worker:
 
@@ -127,7 +131,10 @@ If control tensors or scalar tail arguments collapsed the workload:
 1. Work only in the generated standalone case under the profiling output.
 2. Locate controlling tensors and scalars from the `.pto`, signature, and
    generated orchestration `add_scalar` calls.
-3. Replace the relevant `vN.bin` inputs and patch generated `main.cpp`.
+3. Replace the relevant `vN.bin` inputs and set workload scalars in generated
+   `main.cpp`; each is annotated with its `.pto` parameter name. Leave the
+   generated kernel `.cpp` alone, including the mixed dispatcher's
+   `get_subblockid()` lane argument.
 4. Rebuild and recollect from the standalone case directory.
 5. Record every wired value in the delivered summary.
 

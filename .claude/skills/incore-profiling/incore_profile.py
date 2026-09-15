@@ -21,8 +21,9 @@ Typical usage:
     --run-env SIMPLER_SCHEDULER_TIMEOUT_MS=320000 \
     -- --enable-chip-swimlane
 
-CANN, the camodel SoC, and the compile arch are auto-resolved from --target;
-override with --cann-set-env / --soc-version / --aicore-arch when needed.
+CANN and the compile arch are auto-resolved from --target, and the camodel SoC
+from the variant `npu-smi info` reports; override with --cann-set-env /
+--soc-version / --aicore-arch when needed.
 """
 
 from __future__ import annotations
@@ -132,8 +133,48 @@ def discover_camodel_socs(env: dict[str, str]) -> list[str]:
     return sorted(socs)
 
 
-def select_soc_version(target: str, available: list[str], explicit: str | None) -> str:
-    """Pick a camodel SoC for the target family, honoring an explicit override."""
+def parse_npu_smi_chip_names(text: str) -> list[str]:
+    """Return chip names from the `npu-smi info` summary table in NPU order (e.g. ``910B1``).
+
+    Only an NPU row carries a name after its id; the chip row below it has an
+    empty name column and is skipped.
+    """
+    return re.findall(r"^\|\s*\d+\s+([A-Za-z0-9][\w-]*)\s*\|", text, re.MULTILINE)
+
+
+def detect_npu_chip_names(env: dict[str, str]) -> list[str]:
+    """Chip names reported by `npu-smi info`, or an empty list on a host without it."""
+    npu_smi = shutil.which("npu-smi", path=env.get("PATH")) or shutil.which("npu-smi")
+    if not npu_smi:
+        return []
+    try:
+        cp = subprocess.run(
+            [npu_smi, "info"], env=env, text=True, capture_output=True, timeout=60, check=False
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return []
+    return parse_npu_smi_chip_names(cp.stdout or "") if cp.returncode == 0 else []
+
+
+def _soc_key(name: str) -> str:
+    """Normalize ``Ascend910B1`` / ``Ascend 910B1`` / ``910B1`` to one comparable key."""
+    key = re.sub(r"[\s_-]", "", name).lower()
+    return key.removeprefix("ascend")
+
+
+def select_soc_version(
+    target: str,
+    available: list[str],
+    explicit: str | None,
+    device_chips: list[str] | None = None,
+) -> str:
+    """Pick a camodel SoC for the target family.
+
+    An explicit override wins. Otherwise the exact variant `npu-smi info`
+    reports is preferred: a family-generic SoC (``Ascend910B`` on a 910B1 host)
+    can finish collection yet fail to parse its dump. When the family has
+    several SoCs and no device variant matches, the caller must choose.
+    """
     if explicit:
         return explicit
     keywords = TARGET_PROFILES[target]["soc_keywords"]
@@ -143,14 +184,29 @@ def select_soc_version(target: str, available: list[str], explicit: str | None) 
             f"no camodel SoC found for --target {target}; available: {available}. "
             f"Pass --soc-version explicitly."
         )
-    if len(matches) > 1:
-        log(
-            f"[warn] multiple camodel SoCs match --target {target}: {matches}; "
-            f"auto-selecting {matches[0]}. If the build/run fails with a SoC mismatch "
-            f"or your device is a different variant (check `npu-smi info`), override "
-            f"with --soc-version (e.g. --soc-version Ascend910B1)."
-        )
-    return matches[0]
+    device_socs: list[str] = []
+    for chip in device_chips or []:
+        for soc in matches:
+            if _soc_key(soc) == _soc_key(chip) and soc not in device_socs:
+                device_socs.append(soc)
+    if device_socs:
+        if len(device_socs) > 1:
+            log(
+                f"[warn] npu-smi reports several {target} variants {device_socs}; selecting "
+                f"{device_socs[0]} (first NPU). Pass --soc-version to profile another variant."
+            )
+        else:
+            log(f"camodel SoC {device_socs[0]} selected from npu-smi")
+        return device_socs[0]
+    if len(matches) == 1:
+        return matches[0]
+    reported = device_chips or "npu-smi unavailable"
+    raise StepError(
+        f"multiple camodel SoCs match --target {target}: {matches}, and no device variant "
+        f"matches them ({reported}). Pass --soc-version with the device's exact variant, "
+        f"e.g. --soc-version Ascend910B1; a family-generic SoC such as Ascend910B can "
+        f"collect and then fail to parse."
+    )
 
 
 class StepError(RuntimeError):
@@ -834,7 +890,9 @@ def parse_args(argv: list[str]) -> tuple[argparse.Namespace, list[str]]:
     tool_group.add_argument(
         "--soc-version",
         default=None,
-        help="camodel SoC version; auto-selected within the --target family when omitted",
+        help="camodel SoC version (e.g. Ascend910B1); when omitted, the --target family SoC "
+        "matching `npu-smi info` is used, and an ambiguous family without a matching device "
+        "requires this option",
     )
     tool_group.add_argument(
         "--aicore-arch",
@@ -1274,7 +1332,10 @@ def main(argv: list[str] | None = None) -> int:
         env = validate_toolchain(args)
         assert_bisheng_supports_tl(env, str(args.aicore_arch))
         ensure_msopprof_worker(env, args)
-        args.soc_version = select_soc_version(args.target, discover_camodel_socs(env), args.soc_version)
+        device_chips = [] if args.soc_version else detect_npu_chip_names(env)
+        args.soc_version = select_soc_version(
+            args.target, discover_camodel_socs(env), args.soc_version, device_chips
+        )
     else:
         env = os.environ.copy()
     build_dir = resolve_build_dir(args, build_output_root, run, env)
