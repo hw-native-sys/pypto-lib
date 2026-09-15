@@ -505,8 +505,6 @@ jobs:
           install-torch-npu: 'true'
           ccache-name: ccache-serving
           pip-cache-name: pip-serving-dspark
-          # Match the PyPTO stack validated by the dependent pypto-serving#223.
-          pypto-ref: 747e1e4ba99f13dea1a609d893ac7512e85a5897
 
       - name: Run pypto-serving DeepSeek V4 DSpark tests
         uses: ./.github/actions/pypto-serving-tests

@@ -150,13 +150,12 @@ inputs:
     required: true
   pypto-ref:
     description: >-
-      pypto revision to build instead of origin HEAD (a full commit sha).
-      Empty follows HEAD — the default since #1002, so upstream regressions
-      surface here instead of hiding behind a stale pin. A job passes a sha
-      only as a deliberate, commented quarantine of a broken upstream
-      toolchain, and drops it once upstream heals.
+      pypto revision to build (a full commit sha). Defaults to the revision
+      pypto-serving's CI pins (PYPTO_PIN in its setup-ci-job action), so
+      pypto-lib and serving validate against the same PyPTO stack; bump both
+      together. An explicit empty value follows origin HEAD.
     required: false
-    default: ''
+    default: '747e1e4ba99f13dea1a609d893ac7512e85a5897'
 
 runs:
   using: composite
@@ -365,10 +364,10 @@ runs:
           clone_pypto() { rm -rf "$PYPTO_SRC"; git clone --depth=1 https://github.com/hw-native-sys/pypto.git "$PYPTO_SRC"; }
           retry clone_pypto || exit 1
         fi
-        # An empty pypto-ref follows origin's default branch (HEAD); a pinning
-        # job passes a full commit sha (via this step's env), fetched directly
-        # so cache hit and cache miss land on the same revision. Still
-        # --depth=1: a pin needs one commit, not the history behind it.
+        # pypto-ref is a full commit sha (via this step's env), fetched directly
+        # so cache hit and cache miss land on the same revision; an empty value
+        # follows origin's default branch (HEAD). Still --depth=1: a pin needs
+        # one commit, not the history behind it.
         retry git -C "$PYPTO_SRC" fetch --depth=1 origin "${PYPTO_REF:-HEAD}" || exit 1
         git -C "$PYPTO_SRC" reset --hard FETCH_HEAD
         git -C "$PYPTO_SRC" clean -ffdx
