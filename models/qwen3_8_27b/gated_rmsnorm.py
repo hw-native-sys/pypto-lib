@@ -59,13 +59,12 @@ def build_kernel(t: int = T, h: int = H, d: int = D, eps: float = EPS,
     @jit
     def gdn_gated_rmsnorm(
         o: pl.Tensor[[t, h, d], pl.FP16],
-        z: pl.Tensor[[t, h, d], pl.BF16],
+        z: pl.Tensor[[t, h * d], pl.BF16],
         norm_w: pl.Tensor[[d], pl.BF16],
         y_q: pl.Out[pl.Tensor[[t, h * d], pl.INT8]],
         y_scale: pl.Out[pl.Tensor[[1, t], pl.FP32]],
     ):
         o_flat = pl.reshape(o, [t, h * d])
-        z_flat = pl.reshape(z, [t, h * d])
         for blk in pl.spmd(t // TOK_TILE, name_hint="gated_rmsnorm"):
             t0 = blk * TOK_TILE
             w_row = pl.cast(pl.reshape(norm_w[:], [1, d]), target_type=pl.FP32)
@@ -87,7 +86,7 @@ def build_kernel(t: int = T, h: int = H, d: int = D, eps: float = EPS,
                 normed = pl.cast(normed_bf, target_type=pl.FP32)
                 weighted_bf = pl.cast(pl.col_expand_mul(normed, w_row), target_type=pl.BF16, mode="rint")
 
-                zf_run = pl.cast(z_flat[r0 : r0 + 1, :], target_type=pl.FP32)
+                zf_run = pl.cast(z[r0 : r0 + 1, :], target_type=pl.FP32)
                 zf = pl.reshape(zf_run, [h, d])
                 gate = pl.div(zf, pl.add(pl.exp(pl.neg(zf)), 1.0))
                 y = pl.mul(pl.cast(weighted_bf, target_type=pl.FP32), gate)
@@ -122,12 +121,11 @@ def build_kernel(t: int = T, h: int = H, d: int = D, eps: float = EPS,
     @jit
     def gdn_gated_rmsnorm_bf16(
         o: pl.Tensor[[t, h, d], pl.FP16],
-        z: pl.Tensor[[t, h, d], pl.BF16],
+        z: pl.Tensor[[t, h * d], pl.BF16],
         norm_w: pl.Tensor[[d], pl.BF16],
         y: pl.Out[pl.Tensor[[t, h * d], pl.BF16]],
     ):
         o_flat = pl.reshape(o, [t, h * d])
-        z_flat = pl.reshape(z, [t, h * d])
         for blk in pl.spmd(t // TOK_TILE, name_hint="gated_rmsnorm_bf16"):
             t0 = blk * TOK_TILE
             w_row = pl.cast(pl.reshape(norm_w[:], [1, d]), target_type=pl.FP32)
@@ -141,7 +139,7 @@ def build_kernel(t: int = T, h: int = H, d: int = D, eps: float = EPS,
                 normed = pl.cast(normed_bf, target_type=pl.FP32)
                 weighted_bf = pl.cast(pl.col_expand_mul(normed, w_row), target_type=pl.BF16, mode="rint")
 
-                zf_run = pl.cast(z_flat[r0 : r0 + 1, :], target_type=pl.FP32)
+                zf_run = pl.cast(z[r0 : r0 + 1, :], target_type=pl.FP32)
                 zf = pl.reshape(zf_run, [h, d])
                 gate = pl.div(zf, pl.add(pl.exp(pl.neg(zf)), 1.0))
                 y_bf = pl.cast(pl.mul(pl.cast(weighted_bf, target_type=pl.FP32), gate),
@@ -164,7 +162,8 @@ def golden_y(o, z, norm_w, eps: float = EPS):
     inv_rms = torch.rsqrt((of * of).sum(dim=-1, keepdim=True) * (1.0 / d) + eps)
     normed = (of * inv_rms).to(torch.bfloat16).float()
     weighted = (normed * norm_w.float()).to(torch.bfloat16).float()
-    zf = z.float()
+    # z arrives as the [T, H*D] row `in_proj_z` writes; the norm is over the head
+    zf = z.float().reshape(t, h, d)
     return (weighted * (zf / (torch.exp(-zf) + 1.0))).reshape(t, h * d)
 
 
@@ -219,13 +218,16 @@ def build_tensor_specs(t: int = T, h: int = H, d: int = D, chunk: int = CHUNK,
     import torch
     from golden import TensorSpec
 
-    def draw(key, dtype):
+    def draw(key, dtype, flat: bool = False):
         src = _draw(key, t, chunk, weights)
+        if flat:
+            return lambda: src().to(dtype).reshape(t, -1)
         return lambda: src().to(dtype)
 
     specs = [
         TensorSpec("o", [t, h, d], torch.float16, init_value=draw("o", torch.float16)),
-        TensorSpec("z", [t, h, d], torch.bfloat16, init_value=draw("z", torch.bfloat16)),
+        TensorSpec("z", [t, h * d], torch.bfloat16,
+                   init_value=draw("z", torch.bfloat16, flat=True)),
         TensorSpec("norm_w", [d], torch.bfloat16, init_value=lambda: _norm_weight(weights)),
     ]
     if quant:

@@ -37,7 +37,8 @@ N_GROUP = 4             # and across the channel axis
 
 def build_kernel(m: int, k: int, n: int, name: str = "a8w8_linear",
                  inline: bool = False, m_tile: int = M_TILE, n_tile: int = N_TILE,
-                 k_tile: int = K_TILE, m_group: int = M_GROUP, n_group: int = N_GROUP):
+                 k_tile: int = K_TILE, m_group: int = M_GROUP, n_group: int = N_GROUP,
+                 row_off: int = 0):
     """The projection at one shape.
 
     One output tile is capped near 128x128 by the cube-to-vector crossing: the
@@ -54,6 +55,12 @@ def build_kernel(m: int, k: int, n: int, name: str = "a8w8_linear",
     The inner loop takes two n-tiles at a time against one activation tile, so
     `n_group` must be even. Two accumulators keep each crossing at one tile
     while the cube works a 128x256 region from a single L1 operand.
+
+    `row_off` makes the output `[m + row_off, n]` and writes the result below
+    that many rows. The convolution downstream of `in_proj_qkv` reads the K-1
+    tokens before each of its windows, so in the block the projection writes
+    straight into the padded buffer the convolution wants and no pass copies
+    `[m, n]` into `[m + K - 1, n]`.
     """
     if m % m_tile or n % n_tile or k % k_tile:
         raise ValueError(f"m={m} must be a multiple of m_tile={m_tile}, "
@@ -72,7 +79,7 @@ def build_kernel(m: int, k: int, n: int, name: str = "a8w8_linear",
         a_scale: pl.Tensor[[1, m], pl.FP32],
         w_q: pl.Tensor[[n, k], pl.INT8],
         w_scale: pl.Tensor[[n], pl.FP32],
-        y: pl.Out[pl.Tensor[[m, n], pl.BF16]],
+        y: pl.Out[pl.Tensor[[m + row_off, n], pl.BF16]],
     ):
         # slot_num=1: the cross-core ring is sized by the tile crossing cube to
         # vector, here the INT32 accumulator, and at the default depth of two its
@@ -83,6 +90,7 @@ def build_kernel(m: int, k: int, n: int, name: str = "a8w8_linear",
             pn = (blk // mg) * n_group
             for gm in pl.range(m_group):
                 m0 = (pm + gm) * m_tile
+                yr = m0 + row_off
                 xs = pl.reshape(a_scale[0:1, m0 : m0 + m_tile], [m_tile, 1])
                 # n innermost: the activation tile is the one held across the
                 # inner loop, and it is the operand every tile in the row reads
@@ -106,12 +114,12 @@ def build_kernel(m: int, k: int, n: int, name: str = "a8w8_linear",
                     ws0 = pl.reshape(w_scale[n0 : n0 + n_tile], [1, n_tile])
                     deq0 = pl.row_expand_mul(
                         pl.col_expand_mul(pl.cast(acc0, target_type=pl.FP32), ws0), xs)
-                    y[m0 : m0 + m_tile, n0 : n0 + n_tile] = pl.cast(
+                    y[yr : yr + m_tile, n0 : n0 + n_tile] = pl.cast(
                         deq0, target_type=pl.BF16, mode="rint")
                     ws1 = pl.reshape(w_scale[n1 : n1 + n_tile], [1, n_tile])
                     deq1 = pl.row_expand_mul(
                         pl.col_expand_mul(pl.cast(acc1, target_type=pl.FP32), ws1), xs)
-                    y[m0 : m0 + m_tile, n1 : n1 + n_tile] = pl.cast(
+                    y[yr : yr + m_tile, n1 : n1 + n_tile] = pl.cast(
                         deq1, target_type=pl.BF16, mode="rint")
         return y
 

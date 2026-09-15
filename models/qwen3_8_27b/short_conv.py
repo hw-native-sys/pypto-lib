@@ -34,28 +34,46 @@ GROUP = 16              # row-tiles per block, the pipelined inner loop
 
 
 def build_kernel(t: int = T, c: int = C, k: int = K, inline: bool = False,
-                 tok_tile: int = TOK_TILE, ch_tile: int = CH_TILE, group: int = GROUP):
+                 tok_tile: int = TOK_TILE, ch_tile: int = CH_TILE, group: int = GROUP,
+                 c_off: int = 0, c_out: int | None = None, out_heads: int | None = None,
+                 out_dtype=pl.BF16, name: str = "short_conv"):
     """The operator at one shape. `inline` makes it a callee for `gdn_block`.
 
     A block walks `group` row-tiles of one channel tile, so there is an inner
     loop to pipeline; one tile per block leaves the loads nothing to hide behind.
+
+    `c_off` and `c_out` convolve one contiguous run of channels instead of all
+    of them, and `out_heads` declares the output `[t, out_heads, d]` rather than
+    `[t, c_out]`. The block builds this three times, once per consumer: q and k
+    go to the qk-norm and v goes straight to the delta rule, which wants it in
+    fp16, and each consumer reads the rows of one contiguous tensor. Splitting
+    at the write is what makes that layout free -- the alternative is one wide
+    output that every consumer then has to gather from.
     """
+    c_out = c if c_out is None else c_out
     rows = tok_tile * group
     # A tile that does not divide its axis silently leaves the tail unwritten --
     # the kernel returns a correct-looking result missing t % rows tokens.
-    if t % rows or c % ch_tile:
+    if t % rows or c_out % ch_tile:
         raise ValueError(f"t={t} must be a multiple of tok_tile*group={rows} and "
-                         f"c={c} a multiple of ch_tile={ch_tile}")
+                         f"c_out={c_out} a multiple of ch_tile={ch_tile}")
+    if c_off + c_out > c:
+        raise ValueError(f"channels {c_off}..{c_off + c_out} run past c={c}")
+    if out_heads is not None and c_out % out_heads:
+        raise ValueError(f"c_out={c_out} must divide by out_heads={out_heads}")
+    out_shape = [t, c_out] if out_heads is None else [t, out_heads, c_out // out_heads]
 
     @(pl.jit.inline if inline else pl.jit)
     def gdn_short_conv(
         x_pad: pl.Tensor[[t + k - 1, c], pl.BF16],
         w: pl.Tensor[[k, c], pl.FP32],
-        y: pl.Out[pl.Tensor[[t, c], pl.BF16]],
+        y: pl.Out[pl.Tensor[out_shape, out_dtype]],
     ):
-        for blk in pl.spmd((t // rows) * (c // ch_tile), name_hint="short_conv"):
-            r0 = (blk // (c // ch_tile)) * rows
-            c0 = (blk % (c // ch_tile)) * ch_tile
+        y_flat = pl.reshape(y, [t, c_out])
+        for blk in pl.spmd((t // rows) * (c_out // ch_tile), name_hint=name):
+            r0 = (blk // (c_out // ch_tile)) * rows
+            yc = (blk % (c_out // ch_tile)) * ch_tile
+            c0 = c_off + yc
             w_taps = w[:, c0 : c0 + ch_tile]
             for i in pl.pipeline(group, stage=2):
                 t0 = r0 + i * tok_tile
@@ -70,8 +88,8 @@ def build_kernel(t: int = T, c: int = C, k: int = K, inline: bool = False,
                 # on hot paths, and that holds when the reciprocal is reused; here
                 # it is used once, so the divide simply removes an op.
                 den = pl.add(pl.exp(pl.neg(acc)), 1.0)
-                y[t0 : t0 + tok_tile, c0 : c0 + ch_tile] = pl.cast(pl.div(acc, den),
-                                                                   target_type=pl.BF16, mode="rint")
+                y_flat[t0 : t0 + tok_tile, yc : yc + ch_tile] = pl.cast(
+                    pl.div(acc, den), target_type=out_dtype, mode="rint")
         return y
 
     return gdn_short_conv
