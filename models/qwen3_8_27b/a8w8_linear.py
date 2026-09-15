@@ -89,19 +89,18 @@ def build_kernel(m: int, k: int, n: int, name: str = "a8w8_linear",
                 for gn in pl.range(n_group // 2):
                     n0 = (pn + 2 * gn) * n_tile
                     n1 = n0 + n_tile
-                    acc0 = pl.matmul(a_q[m0 : m0 + m_tile, 0:k_tile],
-                                     w_q[n0 : n0 + n_tile, 0:k_tile],
-                                     b_trans=True, out_dtype=pl.INT32)
-                    acc1 = pl.matmul(a_q[m0 : m0 + m_tile, 0:k_tile],
-                                     w_q[n1 : n1 + n_tile, 0:k_tile],
-                                     b_trans=True, out_dtype=pl.INT32)
-                    for kb in pl.pipeline(1, k // k_tile, stage=2):
+                    # init_cond, not a peeled first block: peeling leaves block 0's
+                    # operand load outside the software pipeline, the one load that
+                    # then has nothing to overlap with.
+                    acc0 = pl.create_tensor([m_tile, n_tile], dtype=pl.INT32)
+                    acc1 = pl.create_tensor([m_tile, n_tile], dtype=pl.INT32)
+                    for kb in pl.pipeline(0, k // k_tile, stage=2):
                         k0 = kb * k_tile
                         at = a_q[m0 : m0 + m_tile, k0 : k0 + k_tile]
                         acc0 = pl.matmul_acc(acc0, at, w_q[n0 : n0 + n_tile, k0 : k0 + k_tile],
-                                             b_trans=True)
+                                             b_trans=True, init_cond=(kb == 0))
                         acc1 = pl.matmul_acc(acc1, at, w_q[n1 : n1 + n_tile, k0 : k0 + k_tile],
-                                             b_trans=True)
+                                             b_trans=True, init_cond=(kb == 0))
                     # dequant: the channel's scale along the row, the token's down
                     # the column
                     ws0 = pl.reshape(w_scale[n0 : n0 + n_tile], [1, n_tile])

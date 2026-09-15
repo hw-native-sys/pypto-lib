@@ -177,13 +177,13 @@ On a2a3 at T = 8192, 50 rounds, against `torch_npu` 2.10.0 on the same card:
 | kernel | PyPTO us | CANN operator | CANN us |
 | --- | ---: | --- | ---: |
 | `quant_x` | 191 | `npu_dynamic_quant` | 105 |
-| `in_proj_qkv` | 1960 | `npu_quant_matmul` | 1660 |
-| `in_proj_z` | 1108 | `npu_quant_matmul` | 993 |
-| `in_proj_ab` | 118 | `F.linear` bf16 | 47 |
-| `out_proj` | 1136 | `npu_quant_matmul` | 977 |
+| `in_proj_qkv` | 1813 | `npu_quant_matmul` | 1660 |
+| `in_proj_z` | 1014 | `npu_quant_matmul` | 993 |
+| `in_proj_ab` | 115 | `F.linear` bf16 | 47 |
+| `out_proj` | 1048 | `npu_quant_matmul` | 977 |
 
-The three GEMMs run at 438 to 465 INT8 TOPS, 1.57 to 1.59x their own bf16
-`F.linear` at the same shapes and 0.84x of CANN's dedicated W8A8 operator. A
+The three GEMMs run at 474 to 508 INT8 TOPS, 1.70 to 1.73x their own bf16
+`F.linear` at the same shapes and 0.90x of CANN's dedicated W8A8 operator. A
 control that drops the dequantisation entirely measures within the noise of the
 full kernel, so that gap is the cube schedule under a 128x128 output tile, not
 the epilogue. Accuracy: each GEMM sits 1.7e-03 from the float64 W8A8 chain it
