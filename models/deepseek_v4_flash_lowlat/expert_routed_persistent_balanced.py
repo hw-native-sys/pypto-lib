@@ -139,11 +139,14 @@ def expert_routed_persistent_planned(
                         # its inferred metadata once moe.py nests this call.
                         lane_r0 = pl.cast(aiv_id * ROW_HALF, pl.INDEX)
 
-                        gate_sh = pl.aiv_shard(gate_acc)
-                        up_sh = pl.aiv_shard(up_acc)
                         x_sc = pl.reshape(
                             recv_scale_dq[s : s + 1, lane_r0 : lane_r0 + ROW_HALF],
                             [ROW_HALF, 1])
+                        w_col = pl.reshape(
+                            recv_weights[s : s + 1, lane_r0 : lane_r0 + ROW_HALF],
+                            [ROW_HALF, 1])
+                        gate_sh = pl.aiv_shard(gate_acc)
+                        up_sh = pl.aiv_shard(up_acc)
                         gate_f = pl.cast(gate_sh, target_type=pl.FP32, mode="none")
                         up_f = pl.cast(up_sh, target_type=pl.FP32, mode="none")
                         gate_f = pl.col_expand_mul(pl.row_expand_mul(gate_f, x_sc), w1_sc)
@@ -176,9 +179,6 @@ def expert_routed_persistent_planned(
                         q_f16 = pl.cast(q_i32, target_type=pl.FP16, mode="round")
                         h_i8 = pl.cast(q_f16, target_type=pl.INT8, mode="trunc")
 
-                        w_col = pl.reshape(
-                            recv_weights[s : s + 1, lane_r0 : lane_r0 + ROW_HALF],
-                            [ROW_HALF, 1])
                         row_scale = pl.mul(h_scale_dq, w_col)
 
                         # V->C: the two lanes' row bands are stitched back into one

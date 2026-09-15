@@ -396,8 +396,8 @@ def indexer(
                 lane_r0 = pl.cast(aiv_id * REDUCE_AIV_TILE, pl.INDEX)
                 kv_lane0 = kv0 + lane_r0
                 cache_lane0 = cache0 + lane_r0
-                score_acc_shard = pl.aiv_shard(score_acc_red)
                 kv_dq_red = kv_scale_flat[kv_lane0 : kv_lane0 + REDUCE_AIV_TILE, :]
+                score_acc_shard = pl.aiv_shard(score_acc_red)
                 score_tile_red = pl.cast(
                     score_acc_shard, target_type=pl.FP32, mode="none"
                 )
