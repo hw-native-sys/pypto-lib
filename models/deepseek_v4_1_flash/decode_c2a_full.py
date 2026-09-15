@@ -1169,11 +1169,10 @@ __all__ = ["golden_decode_c2a_full", "decode_c2a_full", "c2a_full_partial"]
 # dba1be0a40aa45a94ad051997016db3960a90277 (Compressor, Indexer, Attention, sparse_attn); not an
 # execution of the CUDA kernels.  Takes exactly the 40 tensors of golden_decode_c2a_full.
 #
-# Unlike attention_common.golden_compressed_attention it never re-quantizes a whole cache: only
-# rows named by a non-negative slot are rewritten, so untouched cache bytes stay bit-identical and
-# can be checked.  The whole-tensor golden cannot do that, because MXFP4 re-quantization is not
-# byte-idempotent: an E8M0 group whose largest nibble is 3 re-derives a scale one binade lower,
-# moving the bytes while the decoded values stay put.
+# Like attention_common.golden_compressed_attention, only rows named by a non-negative slot are
+# rewritten, so untouched cache bytes stay bit-identical and can be checked.  This matters because
+# MXFP4 re-quantization is not byte-idempotent: an E8M0 group whose largest nibble is 3 re-derives a
+# scale one binade lower, moving the bytes while the decoded values stay put.
 #
 # Cache ABI: compressed-KV and index payloads are PACKED E2M1, two logical values per byte with
 # logical element 2i in the LOW nibble, so the stored last dimension is half the logical width --

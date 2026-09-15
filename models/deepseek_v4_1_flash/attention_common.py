@@ -6,8 +6,9 @@
 # INCLUDING BUT NOT LIMITED TO NON-INFRINGEMENT, MERCHANTABILITY, OR FITNESS FOR A PARTICULAR PURPOSE.
 # See LICENSE in the root of the software repository for the full text of the License.
 # -----------------------------------------------------------------------------------------------------------
-"""Torch reference composition shared by the six V4.1 attention modes."""
+"""Torch references and cache validation shared by the V4.1 attention modes."""
 
+from collections.abc import Callable
 from dataclasses import dataclass
 
 import torch
@@ -16,12 +17,11 @@ from models.deepseek_v4_1_flash.config import FLASH, AttentionMode
 from models.deepseek_v4_1_flash.golden import (
     compressor_ratio1,
     compressor_ratio2_paged,
+    index_key,
     merge_attention_stats,
     paged_indexer,
     paged_sparse_attention,
     paged_sparse_attention_stats,
-    publish_cache,
-    publish_index_key,
     qkv_proj_rope,
     rope_interleave,
     select_candidate_blocks,
@@ -68,14 +68,110 @@ def _project_output(
     return mxfp8_linear(latent.flatten(-2), wo_b, wo_b_scale)
 
 
-def _publish_window(
-    window_cache: torch.Tensor,
-    window_kv: torch.Tensor,
-    window_slots: torch.Tensor,
-) -> torch.Tensor:
-    updated = window_cache.clone()
-    publish_cache(updated, window_kv, window_slots)
-    return updated
+def _copy_cache_rows(destination: torch.Tensor, source: torch.Tensor, rows: torch.Tensor) -> None:
+    destination_rows = destination.flatten(0, 1).view(torch.uint8)
+    source_rows = source.contiguous().view(torch.uint8).reshape_as(destination_rows[rows])
+    destination_rows[rows] = source_rows
+
+
+def _publish_quantized_cache(
+    payload: torch.Tensor,
+    scale: torch.Tensor,
+    values: torch.Tensor,
+    slots: torch.Tensor,
+    quantize: Callable[[torch.Tensor], tuple[torch.Tensor, torch.Tensor]],
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Quantize and replace only mapped rows in a packed cache pair."""
+    updated_payload = payload.clone()
+    updated_scale = scale.clone()
+    valid = slots >= 0
+    rows = slots[valid].to(torch.int64)
+    if rows.numel():
+        row_payload, row_scale = quantize(values[valid])
+        _copy_cache_rows(updated_payload, row_payload, rows)
+        _copy_cache_rows(updated_scale, row_scale, rows)
+    return updated_payload, updated_scale
+
+
+def quantized_cache_compare(
+    payload_name: str,
+    scale_name: str,
+    mapping_name: str,
+    max_relative_l2: float,
+    group_size: int | None = None,
+    scale_format: str | None = None,
+) -> Callable:
+    """Validate mapped cache values and exact storage ownership elsewhere."""
+
+    def compare(
+        _actual: torch.Tensor,
+        _expected: torch.Tensor,
+        *,
+        actual_outputs: dict[str, torch.Tensor],
+        expected_outputs: dict[str, torch.Tensor],
+        inputs: dict[str, torch.Tensor],
+        rtol: float,
+        atol: float,
+    ) -> tuple[bool, str]:
+        del rtol, atol
+        if group_size is None:
+            actual_value = dequantize_mxfp8_cache(
+                actual_outputs[payload_name],
+                actual_outputs[scale_name],
+            )
+            expected_value = dequantize_mxfp8_cache(
+                expected_outputs[payload_name],
+                expected_outputs[scale_name],
+            )
+        else:
+            actual_value = dequantize_mxfp4_cache(
+                actual_outputs[payload_name],
+                actual_outputs[scale_name],
+                group_size=group_size,
+                scale_format=scale_format,
+            )
+            expected_value = dequantize_mxfp4_cache(
+                expected_outputs[payload_name],
+                expected_outputs[scale_name],
+                group_size=group_size,
+                scale_format=scale_format,
+            )
+        physical_rows = actual_value.shape[1] * actual_value.shape[2]
+        actual_rows = actual_value.flatten(1, 2)
+        expected_rows = expected_value.flatten(1, 2)
+        active_actual = []
+        active_expected = []
+        for rank in range(actual_value.shape[0]):
+            active = torch.unique(inputs[mapping_name][rank].flatten().to(torch.int64), sorted=True)
+            active = active[active >= 0]
+            if active.numel() and int(active[-1]) >= physical_rows:
+                return False, f"    {mapping_name} row {int(active[-1])} exceeds {physical_rows}"
+            active_actual.append(actual_rows[rank, active])
+            active_expected.append(expected_rows[rank, active])
+            inactive = torch.ones(physical_rows, dtype=torch.bool)
+            inactive[active] = False
+            for name in (payload_name, scale_name):
+                actual_storage = actual_outputs[name][rank].contiguous().view(torch.uint8).reshape(physical_rows, -1)
+                expected_storage = expected_outputs[name][rank].contiguous().view(torch.uint8).reshape(
+                    physical_rows,
+                    -1,
+                )
+                if not torch.equal(actual_storage[inactive], expected_storage[inactive]):
+                    return False, f"    {name} modified inactive {mapping_name} rows"
+
+        actual_active = torch.cat(active_actual).float()
+        expected_active = torch.cat(active_expected).float()
+        if not torch.isfinite(actual_active).all() or not torch.isfinite(expected_active).all():
+            return False, f"    active {mapping_name} rows contain non-finite values"
+        relative_l2 = (actual_active - expected_active).norm() / expected_active.norm().clamp_min(1e-12)
+        print(f"[PRECISION] {payload_name} active_value_rel_l2={relative_l2.item():.6g}")
+        return (
+            bool(relative_l2 <= max_relative_l2),
+            f"    active {mapping_name} rows must stay within {max_relative_l2:.0%} relative L2",
+        )
+
+    compare.__name__ = f"dequantized_{payload_name}"
+    return compare
 
 
 def golden_swa_attention(
@@ -113,9 +209,13 @@ def golden_swa_attention(
         rope_cos,
         rope_sin,
     )
-    window_value = dequantize_mxfp8_cache(window_cache, window_cache_scale).to(window_kv.dtype)
-    updated_window = _publish_window(window_value, window_kv, window_slots)
-    window_payload, updated_window_scale = quantize_mxfp8_cache(updated_window)
+    window_payload, updated_window_scale = _publish_quantized_cache(
+        window_cache,
+        window_cache_scale,
+        window_kv,
+        window_slots,
+        quantize_mxfp8_cache,
+    )
     quantized_window = dequantize_mxfp8_cache(window_payload, updated_window_scale).to(query.dtype)
     window_stats = paged_sparse_attention_stats(query, quantized_window, window_indices)
     attended = merge_attention_stats((window_stats,), attn_sink).to(query.dtype)
@@ -185,16 +285,24 @@ def golden_compressed_attention(
         rope_cos,
         rope_sin,
     )
-    window_value = dequantize_mxfp8_cache(window_cache, window_cache_scale).to(window_kv.dtype)
-    updated_window = _publish_window(window_value, window_kv, window_slots)
-    window_payload, updated_window_scale = quantize_mxfp8_cache(updated_window)
+    window_payload, updated_window_scale = _publish_quantized_cache(
+        window_cache,
+        window_cache_scale,
+        window_kv,
+        window_slots,
+        quantize_mxfp8_cache,
+    )
     quantized_window = dequantize_mxfp8_cache(window_payload, updated_window_scale).to(query.dtype)
-    updated_compressed = dequantize_mxfp4_cache(
+    compressed_payload = compressed_cache
+    updated_compressed_scale = compressed_cache_scale
+    quantized_compressed = dequantize_mxfp4_cache(
         compressed_cache, compressed_cache_scale, group_size=16, scale_format="e4m3"
     ).to(query.dtype)
-    updated_index = None
+    index_payload = index_cache
+    updated_index_scale = index_cache_scale
+    quantized_index = None
     if index_cache is not None and index_cache_scale is not None:
-        updated_index = dequantize_mxfp4_cache(
+        quantized_index = dequantize_mxfp4_cache(
             index_cache, index_cache_scale, group_size=32, scale_format="e8m0"
         ).to(query.dtype)
     updated_state = None if compressor_state is None else compressor_state.clone()
@@ -204,7 +312,7 @@ def golden_compressed_attention(
     if mode is AttentionMode.FULL:
         if compressor_wkv is None or compressor_norm_weight is None or compressed_slots is None:
             raise ValueError("full mode requires compressor weights and compressed slots")
-        if compressed_rope_cos is None or compressed_rope_sin is None or updated_index is None:
+        if compressed_rope_cos is None or compressed_rope_sin is None or quantized_index is None:
             raise ValueError("full mode requires compressed RoPE rows and an index cache")
         if ratio == 1:
             latent = compressor_ratio1(x, compressor_wkv, compressor_norm_weight)
@@ -229,41 +337,53 @@ def golden_compressed_attention(
             latent[..., -compressed_rope_cos.shape[-1] * 2 :], compressed_rope_cos, compressed_rope_sin
         )
         rotated_latent = torch.cat((latent[..., : -compressed_rope_cos.shape[-1] * 2], latent_tail), dim=-1)
-        publish_cache(updated_compressed, rotated_latent, compressed_slots.masked_fill(~publish_mask, -1))
+        publish_slots = compressed_slots.masked_fill(~publish_mask, -1)
+        compressed_payload, updated_compressed_scale = _publish_quantized_cache(
+            compressed_cache,
+            compressed_cache_scale,
+            rotated_latent,
+            publish_slots,
+            lambda value: quantize_mxfp4_cache(value, group_size=16, scale_format="e4m3"),
+        )
+        quantized_compressed = dequantize_mxfp4_cache(
+            compressed_payload,
+            updated_compressed_scale,
+            group_size=16,
+            scale_format="e4m3",
+        ).to(query.dtype)
         if index_wk is None or index_norm_weight is None:
             raise ValueError("full mode requires index-key weights")
-        publish_index_key(
+        keys = index_key(
             latent,
-            publish_mask,
             index_wk,
             index_norm_weight,
             compressed_rope_cos,
             compressed_rope_sin,
-            compressed_slots,
-            updated_index,
         )
+        index_payload, updated_index_scale = _publish_quantized_cache(
+            index_cache,
+            index_cache_scale,
+            keys,
+            publish_slots,
+            lambda value: quantize_mxfp4_cache(value, group_size=32, scale_format="e8m0"),
+        )
+        quantized_index = dequantize_mxfp4_cache(
+            index_payload,
+            updated_index_scale,
+            group_size=32,
+            scale_format="e8m0",
+        ).to(query.dtype)
 
     if mode in (AttentionMode.FULL, AttentionMode.REINDEX):
         if index_wq_b is None or index_weights_proj is None:
             raise ValueError("indexing modes require query and score weights")
         if (
-            updated_index is None
+            quantized_index is None
             or index_block_table is None
             or request_ids is None
             or compressed_lens is None
         ):
             raise ValueError("indexing modes require cache addressing and causal compressed lengths")
-        if mode is AttentionMode.FULL:
-            index_payload, updated_index_scale = quantize_mxfp4_cache(
-                updated_index, group_size=32, scale_format="e8m0"
-            )
-            quantized_index = dequantize_mxfp4_cache(
-                index_payload, updated_index_scale, group_size=32, scale_format="e8m0"
-            ).to(query.dtype)
-        else:
-            index_payload = index_cache
-            updated_index_scale = index_cache_scale
-            quantized_index = updated_index
         scores, topk_indices = paged_indexer(
             x,
             query_latent,
@@ -289,20 +409,6 @@ def golden_compressed_attention(
     if topk_indices is None:
         raise ValueError("reuse mode requires published compressed Top-K indices")
 
-    if mode is AttentionMode.FULL:
-        compressed_payload, updated_compressed_scale = quantize_mxfp4_cache(
-            updated_compressed, group_size=16, scale_format="e4m3"
-        )
-        quantized_compressed = dequantize_mxfp4_cache(
-            compressed_payload, updated_compressed_scale, group_size=16, scale_format="e4m3"
-        ).to(query.dtype)
-    else:
-        compressed_payload = compressed_cache
-        updated_compressed_scale = compressed_cache_scale
-        quantized_compressed = updated_compressed
-    if updated_index is None:
-        index_payload = None
-        updated_index_scale = None
     attended = paged_sparse_attention(
         query, quantized_window, window_indices, quantized_compressed, topk_indices, attn_sink
     )

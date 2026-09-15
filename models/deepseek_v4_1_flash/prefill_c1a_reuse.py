@@ -8,13 +8,58 @@
 # -----------------------------------------------------------------------------------------------------------
 """Packed-prefill C1A reuse attention."""
 
+import sys
+from pathlib import Path
+
+
+if __package__ in (None, ""):
+    sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
+
+# A5-only; intentionally excluded from the A2/A3 device sweep. `ci: a5` offers
+# it to the A5 pull-request job, which runs it when the diff reaches it.
+# ci: no-sim
+# ci: a5
+
+_SCRIPT_ENTRY_POINT = "__" + "main__"
+if __name__ == _SCRIPT_ENTRY_POINT:
+    if not any(arg == "--tp" or arg.startswith("--tp=") for arg in sys.argv):
+        sys.argv.extend(["--tp", "2"])
+
 import pypto.language as pl
 import pypto.language.distributed as pld
 import torch
 
 from models.deepseek_v4_1_flash import config as C
-from models.deepseek_v4_1_flash.attention_common import AttentionGoldenResult, golden_compressed_attention
+from models.deepseek_v4_1_flash.prefill_c1a_common import prefill_c1a_partial
+from models.deepseek_v4_1_flash.prefill_c1a_test_utils import (
+    CASE_DEFAULT,
+    CASE_MAX_TOKENS,
+    CASE_NAMES,
+    CASE_TOKENS,
+    CACHE_MAX_RELATIVE_L2,
+    COMMON_INPUT_NAMES,
+    apply_distributed_golden,
+    attention_output_compare,
+    make_tensor_specs,
+)
+from models.deepseek_v4_1_flash.attention_common import (
+    AttentionGoldenResult,
+    golden_compressed_attention,
+    quantized_cache_compare,
+)
+from models.deepseek_v4_1_flash.attention_tp import prefill_tp_output_all_reduce
 from models.deepseek_v4_1_flash.config import AttentionMode
+
+
+D = C.D
+TP_SIZE = C.TP_SIZE
+PREFILL_MAX_TOKENS = C.PREFILL_MAX_TOKENS
+
+REUSE_INPUT_NAMES = COMMON_INPUT_NAMES + ("compressed_indices",)
+
+
+if TP_SIZE not in (1, 2, 4):
+    raise ValueError("Prefill C1A currently supports TP1, TP2, and TP4; TP8 requires head-tile padding")
 
 
 def golden_prefill_c1a_reuse(
@@ -89,7 +134,7 @@ def golden_prefill_c1a_reuse(
     )
 
 
-@pl.jit.inline
+@pl.jit.inline(auto_scope=False)
 def prefill_c1a_reuse(
     x: pl.Tensor[[C.T_DYN, C.D], pl.BF16],
     wq_a: pl.Tensor[[C.D, C.Q_LORA], pl.FP8E4M3FN],
@@ -110,7 +155,7 @@ def prefill_c1a_reuse(
     window_indices: pl.Tensor[[C.T_DYN, 128], pl.INT32],
     window_cache: pl.Tensor[[C.ORI_BLOCKS_DYN, 128, 1, C.HEAD_DIM], pl.FP8E4M3FN],
     window_cache_scale: pl.Tensor[[C.ORI_BLOCKS_DYN, 128, 1, C.HEAD_DIM // C.WINDOW_CACHE_GROUP], pl.FP8E8M0],
-    compressed_cache: pl.Tensor[[C.CMP_BLOCKS_DYN, 128, 1, C.HEAD_DIM], pl.FP4],
+    compressed_cache: pl.Tensor[[C.CMP_BLOCKS_DYN, 128, 1, C.HEAD_DIM // 2], pl.UINT8],
     compressed_cache_scale: pl.Tensor[
         [C.CMP_BLOCKS_DYN, 128, 1, C.HEAD_DIM // C.COMPRESSED_CACHE_GROUP], pl.FP8E4M3FN
     ],
@@ -123,13 +168,221 @@ def prefill_c1a_reuse(
     num_tokens: pl.Scalar[pl.INT32],
     attention_epoch: pl.Scalar[pl.INT32],
 ):
-    raise NotImplementedError("prefill_c1a_reuse kernel body is assigned independently")
+    """Read published ratio-1 Top-K rows and compute packed-prefill C1A."""
+    tokens = pl.tensor.dim(x, 0)
+    partial = pl.create_tensor([tokens, D], dtype=pl.FP32)
+    prefill_c1a_partial(
+        x,
+        wq_a,
+        wq_a_scale,
+        q_norm_weight,
+        wq_b,
+        wq_b_scale,
+        wkv,
+        wkv_scale,
+        kv_norm_weight,
+        attn_sink,
+        wo_a,
+        wo_b,
+        wo_b_scale,
+        rope_cos,
+        rope_sin,
+        window_slots,
+        window_indices,
+        window_cache,
+        window_cache_scale,
+        compressed_cache,
+        compressed_cache_scale,
+        compressed_indices,
+        partial,
+        num_tokens,
+    )
+    prefill_tp_output_all_reduce(
+        partial,
+        output_window,
+        output_arrived,
+        output,
+        group_base,
+        tp_rank,
+        num_tokens,
+        attention_epoch,
+    )
+    return output
+
+
+@pl.jit
+def prefill_c1a_reuse_test(
+    x: pl.Tensor[[C.T_DYN, C.D], pl.BF16],
+    wq_a: pl.Tensor[[C.D, C.Q_LORA], pl.FP8E4M3FN],
+    wq_a_scale: pl.Tensor[[C.D // 32, C.Q_LORA], pl.FP8E8M0, pl.MX_B_NN],
+    q_norm_weight: pl.Tensor[[C.Q_LORA], pl.BF16],
+    wq_b: pl.Tensor[[C.Q_LORA, C.LOCAL_H * C.HEAD_DIM], pl.FP8E4M3FN],
+    wq_b_scale: pl.Tensor[[C.Q_LORA // 32, C.LOCAL_H * C.HEAD_DIM], pl.FP8E8M0, pl.MX_B_NN],
+    wkv: pl.Tensor[[C.D, C.HEAD_DIM], pl.FP8E4M3FN],
+    wkv_scale: pl.Tensor[[C.D // 32, C.HEAD_DIM], pl.FP8E8M0, pl.MX_B_NN],
+    kv_norm_weight: pl.Tensor[[C.HEAD_DIM], pl.BF16],
+    attn_sink: pl.Tensor[[C.LOCAL_H], pl.FP32],
+    wo_a: pl.Tensor[[C.LOCAL_O_GROUPS, C.O_LORA, C.O_GROUP_IN], pl.BF16],
+    wo_b: pl.Tensor[[C.LOCAL_O_WIDTH, C.D], pl.FP8E4M3FN],
+    wo_b_scale: pl.Tensor[[C.LOCAL_O_WIDTH // 32, C.D], pl.FP8E8M0, pl.MX_B_NN],
+    rope_cos: pl.Tensor[[C.T_DYN, C.ROPE_DIM // 2], pl.FP32],
+    rope_sin: pl.Tensor[[C.T_DYN, C.ROPE_DIM // 2], pl.FP32],
+    window_slots: pl.Tensor[[C.T_DYN], pl.INT64],
+    window_indices: pl.Tensor[[C.T_DYN, 128], pl.INT32],
+    window_cache: pl.InOut[pl.Tensor[[C.ORI_BLOCKS_DYN, 128, 1, C.HEAD_DIM], pl.FP8E4M3FN]],
+    window_cache_scale: pl.InOut[
+        pl.Tensor[[C.ORI_BLOCKS_DYN, 128, 1, C.HEAD_DIM // C.WINDOW_CACHE_GROUP], pl.FP8E8M0]
+    ],
+    compressed_cache: pl.Tensor[[C.CMP_BLOCKS_DYN, 128, 1, C.HEAD_DIM // 2], pl.UINT8],
+    compressed_cache_scale: pl.Tensor[
+        [C.CMP_BLOCKS_DYN, 128, 1, C.HEAD_DIM // C.COMPRESSED_CACHE_GROUP],
+        pl.FP8E4M3FN,
+    ],
+    compressed_indices: pl.Tensor[[C.T_DYN, C.INDEX_TOPK], pl.INT32],
+    output_window: pld.DistributedTensor[[C.PREFILL_MAX_TOKENS, C.D], pl.FP32],
+    output_arrived: pld.DistributedTensor[[C.TP_SIZE, 1], pl.INT32],
+    output: pl.Out[pl.Tensor[[C.T_DYN, C.D], pl.BF16]],
+    tp_rank: pl.Scalar[pl.INT32],
+    num_tokens: pl.Scalar[pl.INT32],
+):
+    return prefill_c1a_reuse(
+        x, wq_a, wq_a_scale, q_norm_weight, wq_b, wq_b_scale, wkv, wkv_scale,
+        kv_norm_weight, attn_sink, wo_a, wo_b, wo_b_scale, rope_cos, rope_sin,
+        window_slots, window_indices, window_cache, window_cache_scale,
+        compressed_cache, compressed_cache_scale, compressed_indices,
+        output_window, output_arrived, output, 0, tp_rank, num_tokens, 1,
+    )
+
+
+@pl.jit.host
+def l3_prefill_c1a_reuse_test(
+    x: pl.Tensor[[C.TP_SIZE, C.T_DYN, C.D], pl.BF16],
+    wq_a: pl.Tensor[[C.TP_SIZE, C.D, C.Q_LORA], pl.FP8E4M3FN],
+    wq_a_scale: pl.Tensor[[C.TP_SIZE, C.D // 32, C.Q_LORA], pl.FP8E8M0],
+    q_norm_weight: pl.Tensor[[C.TP_SIZE, C.Q_LORA], pl.BF16],
+    wq_b: pl.Tensor[[C.TP_SIZE, C.Q_LORA, C.LOCAL_H * C.HEAD_DIM], pl.FP8E4M3FN],
+    wq_b_scale: pl.Tensor[
+        [C.TP_SIZE, C.Q_LORA // 32, C.LOCAL_H * C.HEAD_DIM],
+        pl.FP8E8M0,
+    ],
+    wkv: pl.Tensor[[C.TP_SIZE, C.D, C.HEAD_DIM], pl.FP8E4M3FN],
+    wkv_scale: pl.Tensor[[C.TP_SIZE, C.D // 32, C.HEAD_DIM], pl.FP8E8M0],
+    kv_norm_weight: pl.Tensor[[C.TP_SIZE, C.HEAD_DIM], pl.BF16],
+    attn_sink: pl.Tensor[[C.TP_SIZE, C.LOCAL_H], pl.FP32],
+    wo_a: pl.Tensor[[C.TP_SIZE, C.LOCAL_O_GROUPS, C.O_LORA, C.O_GROUP_IN], pl.BF16],
+    wo_b: pl.Tensor[[C.TP_SIZE, C.LOCAL_O_WIDTH, C.D], pl.FP8E4M3FN],
+    wo_b_scale: pl.Tensor[
+        [C.TP_SIZE, C.LOCAL_O_WIDTH // 32, C.D],
+        pl.FP8E8M0,
+    ],
+    rope_cos: pl.Tensor[[C.TP_SIZE, C.T_DYN, C.ROPE_DIM // 2], pl.FP32],
+    rope_sin: pl.Tensor[[C.TP_SIZE, C.T_DYN, C.ROPE_DIM // 2], pl.FP32],
+    window_slots: pl.Tensor[[C.TP_SIZE, C.T_DYN], pl.INT64],
+    window_indices: pl.Tensor[[C.TP_SIZE, C.T_DYN, 128], pl.INT32],
+    window_cache: pl.InOut[
+        pl.Tensor[[C.TP_SIZE, C.ORI_BLOCKS_DYN, 128, 1, C.HEAD_DIM], pl.FP8E4M3FN]
+    ],
+    window_cache_scale: pl.InOut[
+        pl.Tensor[
+            [C.TP_SIZE, C.ORI_BLOCKS_DYN, 128, 1, C.HEAD_DIM // C.WINDOW_CACHE_GROUP],
+            pl.FP8E8M0,
+        ]
+    ],
+    compressed_cache: pl.Tensor[
+        [C.TP_SIZE, C.CMP_BLOCKS_DYN, 128, 1, C.HEAD_DIM // 2],
+        pl.UINT8,
+    ],
+    compressed_cache_scale: pl.Tensor[
+        [C.TP_SIZE, C.CMP_BLOCKS_DYN, 128, 1, C.HEAD_DIM // C.COMPRESSED_CACHE_GROUP],
+        pl.FP8E4M3FN,
+    ],
+    compressed_indices: pl.Tensor[[C.TP_SIZE, C.T_DYN, C.INDEX_TOPK], pl.INT32],
+    output: pl.Out[pl.Tensor[[C.TP_SIZE, C.T_DYN, C.D], pl.BF16]],
+    num_tokens: pl.Scalar[pl.INT32],
+):
+    output_window_buf = pld.alloc_window_buffer([PREFILL_MAX_TOKENS, D], dtype=pl.FP32)
+    output_arrived_buf = pld.alloc_window_buffer([TP_SIZE, 1], dtype=pl.INT32)
+    for rank in pl.range(pld.world_size()):
+        output_window = pld.window(output_window_buf, [PREFILL_MAX_TOKENS, D], dtype=pl.FP32)
+        output_arrived = pld.window(output_arrived_buf, [TP_SIZE, 1], dtype=pl.INT32)
+        prefill_c1a_reuse_test(
+            x[rank], wq_a[rank], wq_a_scale[rank], q_norm_weight[rank],
+            wq_b[rank], wq_b_scale[rank], wkv[rank], wkv_scale[rank],
+            kv_norm_weight[rank], attn_sink[rank], wo_a[rank], wo_b[rank],
+            wo_b_scale[rank], rope_cos[rank], rope_sin[rank], window_slots[rank],
+            window_indices[rank], window_cache[rank], window_cache_scale[rank],
+            compressed_cache[rank], compressed_cache_scale[rank], compressed_indices[rank],
+            output_window, output_arrived, output[rank], rank, num_tokens, device=rank,
+        )
+
+
+def build_tensor_specs(token_count=CASE_TOKENS, case_name=CASE_DEFAULT):
+    return make_tensor_specs(REUSE_INPUT_NAMES, ("output",), token_count, case_name)
+
+
+def golden_prefill_c1a_reuse_case(tensors):
+    apply_distributed_golden("reuse", golden_prefill_c1a_reuse, tensors)
 
 
 __all__ = ["golden_prefill_c1a_reuse", "prefill_c1a_reuse"]
 
 
-if __name__ == "__main__":
-    from models.deepseek_v4_1_flash._golden_smoke import run_attention_golden
+if __name__ == _SCRIPT_ENTRY_POINT:
+    import argparse
 
-    run_attention_golden(golden_prefill_c1a_reuse, ratio=1, mode="reuse")
+    from pypto.ir import DistributedConfig
+
+    from golden import run
+    parser = argparse.ArgumentParser(description="DeepSeek V4.1 prefill C1A reuse validation")
+    parser.add_argument("-p", "--platform", default="a5", choices=("a5",))
+    parser.add_argument("-d", "--device", default=",".join(str(rank) for rank in range(C.TP_SIZE)))
+    parser.add_argument("--tp", type=int, default=2, choices=(1, 2, 4))
+    parser.add_argument("--dp", type=int, default=1, choices=(1,))
+    parser.add_argument("--tokens", type=int, default=CASE_TOKENS, help="token count for the causal case")
+    parser.add_argument("--case", default=CASE_DEFAULT, choices=CASE_NAMES)
+    parser.add_argument("--compile-only", action="store_true")
+    parser.add_argument("--save-data", action="store_true")
+    parser.add_argument("--golden-data")
+    parser.add_argument("--dump-passes", action="store_true")
+    parser.add_argument("--runtime-dir")
+    parser.add_argument("--enable-chip-swimlane", type=int, nargs="?", const=1, default=0, choices=range(5))
+    args = parser.parse_args()
+
+    if args.tp != C.TP_SIZE:
+        parser.error(f"--tp was parsed as TP{C.TP_SIZE}, got --tp {args.tp}")
+    if args.case == "causal" and not 1 <= args.tokens <= CASE_MAX_TOKENS:
+        parser.error(f"--tokens must be in [1, {CASE_MAX_TOKENS}]")
+    device_ids = [int(device) for device in args.device.split(",")]
+    if len(device_ids) != C.TP_SIZE:
+        parser.error(f"need exactly {C.TP_SIZE} devices, got {device_ids}")
+
+    window_cache_compare = quantized_cache_compare(
+        "window_cache",
+        "window_cache_scale",
+        "window_slots",
+        CACHE_MAX_RELATIVE_L2,
+    )
+    result = run(
+        fn=l3_prefill_c1a_reuse_test,
+        specs=build_tensor_specs(args.tokens, args.case),
+        golden_fn=golden_prefill_c1a_reuse_case,
+        golden_data=args.golden_data,
+        save_data=args.save_data,
+        compile_only=args.compile_only,
+        runtime_dir=args.runtime_dir,
+        config={
+            "platform": args.platform,
+            "distributed_config": DistributedConfig(device_ids=device_ids, num_sub_workers=0),
+            "dump_passes": args.dump_passes,
+            "enable_chip_swimlane": args.enable_chip_swimlane,
+        },
+        compare_fn={
+            "output": attention_output_compare(),
+            "window_cache": window_cache_compare,
+            "window_cache_scale": window_cache_compare,
+        },
+    )
+    if not result.passed:
+        if result.error:
+            print(result.error)
+        raise SystemExit(1)
