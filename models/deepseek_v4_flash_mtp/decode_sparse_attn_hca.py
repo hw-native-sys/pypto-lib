@@ -152,10 +152,11 @@ def sparse_attn_hca(
 
     # WAR marker (pypto-lib#481): a scalar-driven gather_row does not mark its GM
     # source add_inout, so the KV writebacks would lose their WAR edge against the
-    # qk_pv gather reads. add_inout is param-level, so these no-op self-copies suffice.
+    # qk_pv gather reads. add_inout is param-level, so one-row no-op self-copies
+    # suffice and stay inside a compressed pool smaller than T rows.
     with pl.at(level=pl.Level.CORE_GROUP, name_hint="kv_touch", allow_early_resolve=True) as kv_touch_tid:
-        ori_kv_flat[0:T, 0:HEAD_DIM] = ori_kv_flat[0:T, 0:HEAD_DIM]
-        cmp_kv_flat[0:T, 0:HEAD_DIM] = cmp_kv_flat[0:T, 0:HEAD_DIM]
+        ori_kv_flat[0:1, 0:HEAD_DIM] = ori_kv_flat[0:1, 0:HEAD_DIM]
+        cmp_kv_flat[0:1, 0:HEAD_DIM] = cmp_kv_flat[0:1, 0:HEAD_DIM]
 
     # qk_pv writes per-tile (mi, li, oi) to GM; merge_norm reads them back. Not
     # fused on a2a3: the PV output (Acc) -> online rescale (Vec) needs an
