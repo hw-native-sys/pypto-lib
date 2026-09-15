@@ -175,7 +175,7 @@ def sparse_attn_hca(
     # the visible rows gather finite rows that the NEG_INF bias kills in the softmax.
     qk_items = T * sparse_blocks
     qk_lanes = pl.min(qk_items, NUM_QK_CORES)
-    with pl.spmd(qk_lanes, name_hint="qk_pv", deps=[kv_touch_tid], allow_early_resolve=True) as qk_tid:
+    with pl.spmd(qk_lanes, name_hint="qk_pv", deps=[kv_touch_tid], allow_early_resolve=True):
         qk_core = pl.tile.get_block_idx()
         qk_lane_iters = (qk_items - qk_core + qk_lanes - 1) // qk_lanes
         for qk_it in pl.range(qk_lane_iters):
@@ -258,15 +258,6 @@ def sparse_attn_hca(
                     sparse_blk_mi[qk_row : qk_row + H_TILE, 0 : 1] = qk_mi_neg
                     sparse_blk_li[qk_row : qk_row + H_TILE, 0 : 1] = qk_li_zero
                     sparse_blk_oi[qk_row : qk_row + H_TILE, 0 : HEAD_DIM] = qk_oi_zero
-
-    # SDMA CMO L2 warm of the o-projection weights, issued behind qk_pv so it does
-    # not hold an AIV that a qk_pv lane needs.
-    wo_a_flat = pl.reshape(wo_a, [O_GROUPS * O_LORA * O_GROUP_IN])
-    wo_b_flat = pl.reshape(wo_b, [D * O_GROUPS * O_LORA])
-    with pl.at(level=pl.Level.CORE_GROUP, name_hint="prefetch_o_proj_w", deps=[qk_tid]):
-        warm_ctx = pl.prefetch.make_context()
-        pl.prefetch.async_prefetch(wo_a_flat, warm_ctx)
-        pl.prefetch.async_prefetch(wo_b_flat, warm_ctx)
 
     # Precompute the head-invariant interleaved cos and sign*sin once: they depend
     # only on (token, column), not head, so building them per head would repeat the
