@@ -147,7 +147,7 @@
     {
       "case_id": "mtp-moe-ep8",
       "model": "mtp",
-      "entrypoint": "models/deepseek_v4_flash_mtp/moe.py",
+      "entrypoint": "models/deepseek_v4_flash_mtp/decode_moe.py",
       "device_count": 8,
       "arguments": [
         "--ep",

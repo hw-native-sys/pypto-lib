@@ -289,10 +289,10 @@ def function_from_source(path, name, namespace):
     return namespace[name]
 
 
-@pytest.mark.parametrize("ep", [2, 4, 8])
+@pytest.mark.parametrize("ep", [2, 4, 8, 16])
 @pytest.mark.parametrize("local", [None, 16, 32])
 def test_moe_specializes_before_subkernel_imports(ep, local, monkeypatch):
-    path = ROOT / "models/deepseek_v4_flash_mtp/moe.py"
+    path = ROOT / "models/deepseek_v4_flash_mtp/decode_moe.py"
     tree = ast.parse(path.read_text())
     prefix = []
     for node in tree.body:
@@ -303,7 +303,7 @@ def test_moe_specializes_before_subkernel_imports(ep, local, monkeypatch):
     class Config:
         n_routed_experts: int = 256
     import sys
-    cfg = SimpleNamespace(FLASH=Config(), MOE_TOKENS=8)
+    cfg = SimpleNamespace(FLASH=Config(), MOE_TOKENS=8, EP_WORLD_SIZE=8)
     monkeypatch.setitem(sys.modules, "config", cfg)
     args = [str(path), "--ep", str(ep)]
     if local is not None:
