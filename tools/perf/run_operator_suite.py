@@ -214,7 +214,7 @@ def comparison(current, baseline):
     if not baseline or current.get("status") != "pass" or baseline.get("status") != "pass":
         return {"delta_pct": None, "reason": "no passing baseline/current result"}
     keys = ["case_contract", "device_identity", "fixture_sha256", "golden_sha256"]
-    # CI follows upstream HEAD. System changes start a new series;
+    # CI selects the toolchain revision. System changes start a new series;
     # compiler/runtime changes remain visible as complete-stack deltas.
     for key in ("python", "torch", "numpy", "cann_sha256", "driver_sha256", "bundle"):
         if (not current.get("toolchain", {}).get(key) or
