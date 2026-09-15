@@ -60,8 +60,13 @@ def run_config(platform: str = "a2a3", device: int = 0) -> dict:
 
 
 def build_kernel(t: int = T, h: int = H, d: int = D, chunk: int = CHUNK,
-                 hg: int = HG):
-    """The layer at one shape, composing the six operators as inlined callees."""
+                 hg: int = HG, inline: bool = False):
+    """The layer at one shape, composing the six operators as inlined callees.
+
+    `inline` makes the whole layer one callee in turn, which is how `gdn_block`
+    takes it: the six stages inline into this body and this body inlines into
+    the block's.
+    """
     nchunk = t // chunk
     shape = dict(t=t, h=h, d=d, chunk=chunk)
 
@@ -72,7 +77,7 @@ def build_kernel(t: int = T, h: int = H, d: int = D, chunk: int = CHUNK,
     op_h = chunk_h.build_kernel(**shape, hg=hg, inline=True)
     op_o = chunk_o.build_kernel(**shape, hg=hg, inline=True)
 
-    @pl.jit
+    @(pl.jit.inline if inline else pl.jit)
     def gdn_layer(
         q: pl.Tensor[[t, hg, d], pl.FP16],
         k: pl.Tensor[[t, hg, d], pl.FP16],

@@ -40,10 +40,10 @@ OUTPUTS = ("y",)                    # bench.py reads it
 
 def build_kernel(t: int = T, k: int = K, n: int = N, inline: bool = False,
                  m_tile: int = M_TILE, n_tile: int = N_TILE, k_tile: int = K_TILE,
-                 m_group: int = M_GROUP, n_group: int = N_GROUP):
+                 m_group: int = M_GROUP, n_group: int = N_GROUP, row_off: int = 0):
     return a8w8_linear.build_kernel(t, k, n, name=MODULE, inline=inline, m_tile=m_tile,
                                     n_tile=n_tile, k_tile=k_tile, m_group=m_group,
-                                    n_group=n_group)
+                                    n_group=n_group, row_off=row_off)
 
 
 def build_tensor_specs(t: int = T, k: int = K, n: int = N, weights: str | None = None,

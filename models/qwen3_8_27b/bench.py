@@ -49,6 +49,9 @@ STAGES = ("chunk_cumsum", "scaled_dot_kkt", "solve_tril", "wy_fast",
 # In the order the block runs them.
 BLOCK_KERNELS = ("quant_x", "in_proj_qkv", "in_proj_z", "in_proj_ab", "short_conv",
                  "qk_norm_gate", "gated_rmsnorm", "out_proj")
+# The whole block as one program, for the composed number against the sum of the
+# parts above: `--stages gdn_block`. It carries its own run config.
+COMPOSED = ("gdn_block",)
 
 from config import GDN_TILING, QWEN3_8_27B
 
@@ -97,7 +100,10 @@ def bench_stage(stage: str, t: int, h: int, hg: int, platform: str, device: int,
     from test_gdn_stages import GQA_STAGES
 
     mod = importlib.import_module(stage)
-    if stage in BLOCK_KERNELS:
+    if stage in COMPOSED:
+        fn = mod.build_kernel(t=t)
+        specs = mod.build_tensor_specs(t=t)
+    elif stage in BLOCK_KERNELS:
         # the block's kernels do not share one signature -- the conv has no head
         # axis at all -- so pass h only where it is accepted
         import inspect
@@ -119,7 +125,8 @@ def bench_stage(stage: str, t: int, h: int, hg: int, platform: str, device: int,
         fn=fn,
         specs=specs,
         golden_fn=None,                       # timing only; correctness is test_gdn_stages
-        config=dict(platform=platform, device_id=device),
+        config=(mod.run_config(platform, device) if stage in COMPOSED
+                else dict(platform=platform, device_id=device)),
     )
     rec = dict(stage=stage, t=t, h=h, hg=hg, d=D, chunk=CHUNK, rounds=rounds,
                warmup=warmup, data=data, ok=bool(result.passed),
@@ -198,7 +205,8 @@ def main() -> int:
 def format_table(records: list[dict]) -> str:
     """Stages down the rows, shapes across the columns, mean Effective µs."""
     shapes = sorted({(r["t"], r["h"]) for r in records})
-    stages = [s for s in STAGES + BLOCK_KERNELS if any(r["stage"] == s for r in records)]
+    stages = [s for s in STAGES + BLOCK_KERNELS + COMPOSED
+              if any(r["stage"] == s for r in records)]
     by = {(r["stage"], r["t"], r["h"]): r for r in records}
     head = f"| {'stage':<16} |" + "".join(f" T={t} H={h} |" for t, h in shapes)
     rule = f"|{'-' * 18}|" + "".join("-" * (len(f" T={t} H={h} |") - 1) + "|"
