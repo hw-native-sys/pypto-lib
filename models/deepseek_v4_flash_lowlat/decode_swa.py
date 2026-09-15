@@ -545,7 +545,7 @@ def build_tensor_specs(start_pos=None):
         return init_normalized_cache((ORI_BLOCK_NUM, BLOCK_SIZE, 1, HEAD_DIM))
 
     def init_block_table():
-        return block_table(batch=B, table_blocks=ORI_TABLE_MAX_BLOCKS, physical_blocks=ORI_MAX_BLOCKS)
+        return block_table(batch=B, table_blocks=ORI_TABLE_MAX_BLOCKS, physical_blocks=ORI_BLOCK_NUM)
 
     def init_attn_sink():
         return torch.zeros(H)
@@ -590,8 +590,8 @@ def build_tensor_specs(start_pos=None):
     wo_b_i8, wo_b_scale = quant_w_per_row(wo_b_bf16)
 
     return [
-        TensorSpec("gate_w", [N_EXPERTS, D], torch.float32, init_value=lambda: torch.empty([N_EXPERTS, D], dtype=torch.float32).uniform_(-0.1, 0.1)),
         TensorSpec("x_hc", [T, HC_MULT, D], torch.float32, init_value=init_x_hc),
+        TensorSpec("gate_w", [N_EXPERTS, D], torch.float32, init_value=lambda: torch.empty([N_EXPERTS, D], dtype=torch.float32).uniform_(-0.1, 0.1)),
         TensorSpec("hc_attn_fn", [MIX_HC, HC_DIM], torch.float32, init_value=init_hc_attn_fn),
         TensorSpec("hc_attn_scale", [3], torch.float32, init_value=init_hc_attn_scale),
         TensorSpec("hc_attn_base", [MIX_HC], torch.float32, init_value=init_hc_attn_base),

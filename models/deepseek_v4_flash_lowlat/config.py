@@ -8,13 +8,14 @@
 # -----------------------------------------------------------------------------------------------------------
 """DeepSeek-V4 Flash low-latency configuration: B = 1, S = 8, world 8, TP MoE and vocab, replicated attention."""
 
+import os
 import sys
 from dataclasses import dataclass
 from typing import Literal, Optional, Tuple
 
 
 def _parse_int_argv(name, default):
-    """Read an integer CLI flag before argparse runs; kernels freeze TP shapes at import."""
+    """Read an integer CLI flag before argparse runs; kernels freeze shapes at import."""
     for index, token in enumerate(sys.argv):
         if token == name and index + 1 < len(sys.argv):
             return int(sys.argv[index + 1])
@@ -153,6 +154,8 @@ DEMO = DeepSeekV4Config(
     max_batch_size=4,
 )
 
+CONTEXT_CAPACITY = _parse_int_argv("--max-seq-len", 1048576)
+
 FLASH = DeepSeekV4Config(
     name="flash",
     hidden_size=4096,
@@ -185,7 +188,7 @@ FLASH = DeepSeekV4Config(
     hc_mult=4,
     hc_sinkhorn_iters=20,
     hc_eps=1e-6,
-    max_position_embeddings=16384,  # 8k prompt + 512 decode steps target; official 1M;
+    max_position_embeddings=CONTEXT_CAPACITY,
     rope_theta=10000.0,
     compress_rope_theta=160000.0,
     rope_factor=16.0,
@@ -279,8 +282,11 @@ KV_ORI_MAX_BLOCKS = KV_ORI_TABLE_MAX_BLOCKS
 KV_CMP_MAX_BLOCKS = KV_ORI_TABLE_MAX_BLOCKS
 IDX_CACHE_MAX_BLOCKS = KV_ORI_TABLE_MAX_BLOCKS
 ORI_KV_BLOCK_NUM = 128
-CMP_KV_BLOCK_NUM = 32
-IDX_KV_BLOCK_NUM = 64
+# The default compressed pool holds the complete context for every request.
+# CTX_POOL_SCALE preserves the existing frozen-fixture pool overrides.
+CAPACITY_SCALE = int(os.environ.get("CTX_POOL_SCALE", max(1, (DECODE_BATCH * KV_ORI_TABLE_MAX_BLOCKS + 31) // 32)))
+CMP_KV_BLOCK_NUM = 32 * CAPACITY_SCALE
+IDX_KV_BLOCK_NUM = 64 * CAPACITY_SCALE
 HCA_STATE_PHYSICAL_BLOCKS = 64
 CSA_STATE_PHYSICAL_BLOCKS = 65
 CSA_INNER_STATE_PHYSICAL_BLOCKS = 65

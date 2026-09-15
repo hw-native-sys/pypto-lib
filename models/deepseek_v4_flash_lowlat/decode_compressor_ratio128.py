@@ -20,6 +20,7 @@ from config import (
     C128_COMPRESSOR_BLOCK_SIZE,
     DECODE_BATCH,
     DECODE_SEQ,
+    DECODE_START_POS,
     DECODE_CMP_BLOCK_NUM,
     FP32_NEG_INF,
     KV_CMP_MAX_BLOCKS,
@@ -516,8 +517,12 @@ def build_tensor_specs(start_pos=None):
         )
     def init_default_start_pos():
         # Canonical HCA start-position set (ratio-128 compressor branches + 8k long-context).
+        # At B=1 only the 8k point survives, and [8192, 8192 + S) holds no compress
+        # boundary, so the entry would write nothing it validates. Pull the 8k point
+        # back half a step so its S tokens straddle the 8192 boundary.
         return hca_decode_start_set(
-            batch=B, compress_ratio=COMPRESS_RATIO, state_block_size=COMPRESS_STATE_BLOCK_SIZE)
+            batch=B, compress_ratio=COMPRESS_RATIO, state_block_size=COMPRESS_STATE_BLOCK_SIZE,
+            long_pos=DECODE_START_POS - S // 2)
     def init_start_pos():
         return resolve_start_positions(
             start_pos,

@@ -1008,7 +1008,7 @@ def build_tensor_specs(start_pos=None):
         return init_normalized_cache((ORI_BLOCK_NUM, BLOCK_SIZE, 1, HEAD_DIM))
 
     def init_window_block_table():
-        return block_table(batch=B, table_blocks=ORI_TABLE_MAX_BLOCKS, physical_blocks=ORI_MAX_BLOCKS)
+        return block_table(batch=B, table_blocks=ORI_TABLE_MAX_BLOCKS, physical_blocks=ORI_BLOCK_NUM)
 
     def init_cmp_kv():
         return init_normalized_cache(
@@ -1167,8 +1167,8 @@ def build_tensor_specs(start_pos=None):
     wo_b_i8, wo_b_scale = quant_w_per_row(wo_b_bf16)
 
     return [
-        TensorSpec("gate_w", [N_EXPERTS, D], torch.float32, init_value=lambda: torch.empty([N_EXPERTS, D], dtype=torch.float32).uniform_(-0.1, 0.1)),
         TensorSpec("x_hc", [T, HC_MULT, D], torch.float32, init_value=lambda: shared_x_hc.clone()),
+        TensorSpec("gate_w", [N_EXPERTS, D], torch.float32, init_value=lambda: torch.empty([N_EXPERTS, D], dtype=torch.float32).uniform_(-0.1, 0.1)),
         TensorSpec("hc_attn_fn", [MIX_HC, HC_DIM], torch.float32, init_value=lambda: shared_hc_attn_fn.clone()),
         TensorSpec("hc_attn_scale", [3], torch.float32, init_value=lambda: shared_hc_attn_scale.clone()),
         TensorSpec("hc_attn_base", [MIX_HC], torch.float32, init_value=lambda: shared_hc_attn_base.clone()),
@@ -1303,6 +1303,9 @@ if __name__ == "__main__":
     parser.add_argument("--save-data", action="store_true", default=False)
     parser.add_argument("--dump-passes", action="store_true", default=False)
     parser.add_argument("--compile-only", action="store_true", default=False)
+    from config import CONTEXT_CAPACITY
+
+    parser.add_argument("--max-seq-len", type=int, default=CONTEXT_CAPACITY, help="import-time context capacity (default 1048576)")
     args = parser.parse_args()
 
     device_ids = [int(d) for d in args.device.split(",")]
