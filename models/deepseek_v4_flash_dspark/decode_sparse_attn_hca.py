@@ -666,6 +666,27 @@ def sparse_attn_hca_tp1(
         MERGE_WORKERS, name_hint="hca_stream_merge_pack", deps=[raw_tid, cmp_tid, rope_tid],
     ) as heads_tid:
         worker = pl.tile.get_block_idx()
+        stream_swap_one = pl.tile.full([1, ROPE_DIM], dtype=pl.FP32, value=1.0)
+        stream_swap_lane_ids = pl.tile.arange(0, [1, ROPE_DIM], dtype=pl.INT32)
+        stream_swap_index = pl.cast(stream_swap_lane_ids, target_type=pl.FP32)
+        stream_swap_col = pl.col_expand_mul(stream_swap_one, stream_swap_index)
+        stream_swap_half = pl.mul(stream_swap_col, 0.5)
+        stream_swap_dup = pl.cast(stream_swap_half, target_type=pl.INT32, mode="trunc")
+        stream_swap_dup_f = pl.cast(stream_swap_dup, target_type=pl.FP32)
+        stream_swap_lane = pl.sub(stream_swap_col, pl.mul(stream_swap_dup_f, 2.0))
+        stream_swap_next = pl.add(stream_swap_col, 1.0)
+        stream_swap_back = pl.mul(stream_swap_lane, 2.0)
+        stream_swap = pl.sub(stream_swap_next, stream_swap_back)
+        stream_swap_zero = pl.tile.full([H_TILE, ROPE_DIM], dtype=pl.FP32, value=0.0)
+        stream_swap_source = pl.add(stream_swap, NOPE_DIM)
+        stream_swap_grid = pl.col_expand_add(stream_swap_zero, stream_swap_source)
+        stream_row_ids = pl.tile.arange(0, [1, H_TILE], dtype=pl.INT32)
+        stream_row_ids_f = pl.cast(stream_row_ids, target_type=pl.FP32)
+        stream_row_offsets = pl.mul(stream_row_ids_f, HEAD_DIM)
+        stream_row_offsets_col = pl.reshape(stream_row_offsets, [H_TILE, 1])
+        stream_swap_flat = pl.row_expand_add(stream_swap_grid, stream_row_offsets_col)
+        stream_swap_idx = pl.cast(stream_swap_flat, target_type=pl.INT32)
+        stream_gather_tmp = pl.create_tile([H_TILE, ROPE_DIM], dtype=pl.INT32)
         for stream_idx in pl.range(worker, stream_block_count, MERGE_WORKERS):
             merge_t = stream_idx // (H // H_TILE)
             merge_h_tile = stream_idx - merge_t * (H // H_TILE)
@@ -693,36 +714,24 @@ def sparse_attn_hca_tp1(
             stream_sink_tile = pl.add(pl.sub(stream_m, stream_m), stream_sink)
             stream_denom = pl.add(stream_l, pl.exp(pl.sub(stream_sink_tile, stream_m)))
             stream_output = pl.row_expand_div(stream_o, stream_denom)
-            pl.store(stream_output, [merge_state_row, 0], stream_heads)
-            packed_stream_output = stream_heads[merge_state_row : merge_state_row + H_TILE, 0:HEAD_DIM]
-            stream_bf16 = pl.cast(packed_stream_output, target_type=pl.BF16, mode="rint")
-            stream_rope = packed_stream_output[0:H_TILE, NOPE_DIM:HEAD_DIM]
-            stream_cos_il = rope_cos_il[merge_t : merge_t + 1, 0:ROPE_DIM]
-            stream_sin_signed = rope_sin_signed[merge_t : merge_t + 1, 0:ROPE_DIM]
-            stream_swap_one = pl.full([1, ROPE_DIM], dtype=pl.FP32, value=1.0)
-            stream_swap_index = pl.cast(pl.arange(0, [1, ROPE_DIM], dtype=pl.INT32), target_type=pl.FP32)
-            stream_swap_col = pl.col_expand_mul(stream_swap_one, stream_swap_index)
-            stream_swap_dup = pl.cast(pl.mul(stream_swap_col, 0.5), target_type=pl.INT32, mode="trunc")
-            stream_swap_dup_f = pl.cast(stream_swap_dup, target_type=pl.FP32)
-            stream_swap_lane = pl.sub(stream_swap_col, pl.mul(stream_swap_dup_f, 2.0))
-            stream_swap = pl.sub(pl.add(stream_swap_col, 1.0), pl.mul(stream_swap_lane, 2.0))
-            stream_swap_row = pl.cast(stream_swap, target_type=pl.INT32)
-            stream_swap_zero = pl.full([H_TILE, ROPE_DIM], dtype=pl.INT32, value=0)
-            stream_swap_idx = pl.col_expand_add(stream_swap_zero, stream_swap_row)
-            stream_swapped = pl.gather(stream_rope, dim=-1, index=stream_swap_idx)
+            stream_bf16 = pl.cast(stream_output, target_type=pl.BF16, mode="rint")
+            stream_rope = stream_output[0:H_TILE, NOPE_DIM:HEAD_DIM]
+            stream_cos_il = pl.load(rope_cos_il, [merge_t, 0], [1, ROPE_DIM])
+            stream_sin_signed = pl.load(rope_sin_signed, [merge_t, 0], [1, ROPE_DIM])
+            stream_swapped = pl.tile.gather(stream_output, stream_swap_idx, stream_gather_tmp)
             stream_rope_cos = pl.col_expand_mul(stream_rope, stream_cos_il)
             stream_swap_sin = pl.col_expand_mul(stream_swapped, stream_sin_signed)
             stream_rot = pl.add(stream_rope_cos, stream_swap_sin)
             stream_rope_bf16 = pl.cast(stream_rot, target_type=pl.BF16, mode="rint")
             stream_full_bf16 = pl.concat(stream_bf16[0:H_TILE, 0:NOPE_DIM], stream_rope_bf16)
-            for stream_hi in pl.unroll(H_TILE):
-                stream_head = merge_h0 + stream_hi
-                stream_pack_row = (stream_head // HEADS_PER_GROUP) * T_PAD + merge_t
-                stream_pack_col = (stream_head % HEADS_PER_GROUP) * HEAD_DIM
-                stream_head_row = stream_full_bf16[stream_hi : stream_hi + 1, 0:HEAD_DIM]
-                o_packed_heads[
-                    stream_pack_row : stream_pack_row + 1, stream_pack_col : stream_pack_col + HEAD_DIM,
-                ] = stream_head_row
+            stream_groups = pl.reshape(stream_full_bf16, [PUBLISH_GROUPS, O_GROUP_IN])
+            stream_pack_first = stream_groups[0:1, 0:O_GROUP_IN]
+            stream_pack_second = stream_groups[1:2, 0:O_GROUP_IN]
+            stream_group0 = merge_h0 // HEADS_PER_GROUP
+            stream_pack_row0 = stream_group0 * T_PAD + merge_t
+            stream_pack_row1 = stream_pack_row0 + T_PAD
+            pl.store(stream_pack_first, [stream_pack_row0, 0], o_packed_heads)
+            pl.store(stream_pack_second, [stream_pack_row1, 0], o_packed_heads)
 
     return o_packed_heads, heads_tid
 
