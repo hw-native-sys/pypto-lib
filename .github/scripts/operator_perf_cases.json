@@ -1,0 +1,900 @@
+{
+  "platform": "a2a3",
+  "sampling": {
+    "seed": 1807,
+    "rounds": 100,
+    "warmup": 5,
+    "raw": true
+  },
+  "schema_version": 1,
+  "suite_id": "dsv4-operators",
+  "contract_id": "dsv4-operators-whole-dispatch-v2",
+  "metric": {
+    "unit": "us",
+    "aggregation": "minimum_rank_median",
+    "dispatch_policy": "sum_all_stable_dispatches",
+    "includes_signal_cleanup": true
+  },
+  "device_profile": {
+    "schema_version": 1,
+    "device_epoch": "a2a3-even-v1",
+    "device_id_domain": "host",
+    "sequences": {
+      "1": [
+        4
+      ],
+      "8": [
+        0,
+        2,
+        4,
+        6,
+        8,
+        10,
+        12,
+        14
+      ]
+    }
+  },
+  "cases": [
+    {
+      "case_id": "mtp-attention-csa-8k",
+      "model": "mtp",
+      "entrypoint": "models/deepseek_v4_flash_mtp/decode_csa.py",
+      "device_count": 1,
+      "arguments": [
+        "--start-pos",
+        "8192"
+      ],
+      "workload": {
+        "local_batch": 4,
+        "sequence": 2,
+        "local_tokens": 8,
+        "start_pos": 8192,
+        "scenario_context": 8192,
+        "tp": 1
+      },
+      "required_specs": {
+        "x_out": {
+          "shape": [
+            8,
+            4,
+            4096
+          ],
+          "dtype": "torch.float32"
+        },
+        "position_ids": {
+          "shape": [
+            8
+          ],
+          "dtype": "torch.int32"
+        }
+      },
+      "required_outputs": [
+        "x_out"
+      ],
+      "run_config": {
+        "ring_task_window": 262144,
+        "ring_dep_pool": 262144,
+        "ring_heap": 2147483648
+      }
+    },
+    {
+      "case_id": "mtp-attention-hca-8k",
+      "model": "mtp",
+      "entrypoint": "models/deepseek_v4_flash_mtp/decode_hca.py",
+      "device_count": 1,
+      "arguments": [
+        "--start-pos",
+        "8192"
+      ],
+      "workload": {
+        "local_batch": 4,
+        "sequence": 2,
+        "local_tokens": 8,
+        "start_pos": 8192,
+        "scenario_context": 8192,
+        "tp": 1
+      },
+      "required_specs": {
+        "x_out": {
+          "shape": [
+            8,
+            4,
+            4096
+          ],
+          "dtype": "torch.float32"
+        },
+        "position_ids": {
+          "shape": [
+            8
+          ],
+          "dtype": "torch.int32"
+        }
+      },
+      "required_outputs": [
+        "x_out"
+      ],
+      "run_config": {
+        "ring_task_window": 262144,
+        "ring_dep_pool": 262144,
+        "ring_heap": 2147483648
+      }
+    },
+    {
+      "case_id": "mtp-attention-swa-8k",
+      "model": "mtp",
+      "entrypoint": "models/deepseek_v4_flash_mtp/decode_swa.py",
+      "device_count": 1,
+      "arguments": [
+        "--start-pos",
+        "8192"
+      ],
+      "workload": {
+        "local_batch": 4,
+        "sequence": 2,
+        "local_tokens": 8,
+        "start_pos": 8192,
+        "scenario_context": 8192,
+        "tp": 1
+      },
+      "required_specs": {
+        "x_out": {
+          "shape": [
+            8,
+            4,
+            4096
+          ],
+          "dtype": "torch.float32"
+        },
+        "position_ids": {
+          "shape": [
+            8
+          ],
+          "dtype": "torch.int32"
+        }
+      },
+      "required_outputs": [
+        "x_out"
+      ],
+      "run_config": {
+        "ring_task_window": 262144,
+        "ring_dep_pool": 262144,
+        "ring_heap": 2147483648
+      }
+    },
+    {
+      "case_id": "mtp-moe-ep8-8k",
+      "model": "mtp",
+      "entrypoint": "models/deepseek_v4_flash_mtp/decode_moe.py",
+      "device_count": 8,
+      "arguments": [
+        "--ep",
+        "8",
+        "--layer-id",
+        "0",
+        "--num-tokens",
+        "8",
+        "--experts-per-rank",
+        "16",
+        "--balanced-routing"
+      ],
+      "workload": {
+        "ep": 8,
+        "experts_per_rank": 16,
+        "local_tokens": 8,
+        "layer_id": 0,
+        "routing": "balanced",
+        "scenario_context": 8192
+      },
+      "required_specs": {
+        "x_next": {
+          "shape": [
+            8,
+            8,
+            4,
+            4096
+          ],
+          "dtype": "torch.float32"
+        }
+      },
+      "required_outputs": [
+        "x_next"
+      ],
+      "run_config": {
+        "ring_task_window": 262144,
+        "ring_dep_pool": 262144,
+        "ring_heap": 2147483648
+      }
+    },
+    {
+      "case_id": "mtp-lm-head-8k",
+      "model": "mtp",
+      "entrypoint": "models/deepseek_v4_flash_mtp/lm_head.py",
+      "device_count": 1,
+      "arguments": [
+        "--tp",
+        "1",
+        "--dp",
+        "1",
+        "--num-tokens",
+        "8",
+        "--entry",
+        "projection"
+      ],
+      "workload": {
+        "tp": 1,
+        "dp": 1,
+        "active_logit_rows_per_rank": 8,
+        "sampling": false,
+        "scenario_context": 8192
+      },
+      "required_specs": {
+        "logits": {
+          "shape": [
+            1,
+            8,
+            129280
+          ],
+          "dtype": "torch.float32"
+        }
+      },
+      "required_outputs": [
+        "logits"
+      ],
+      "run_config": {
+        "ring_task_window": 262144,
+        "ring_dep_pool": 262144,
+        "ring_heap": 2147483648
+      }
+    },
+    {
+      "case_id": "mtp-attention-csa-128k",
+      "model": "mtp",
+      "entrypoint": "models/deepseek_v4_flash_mtp/decode_csa.py",
+      "device_count": 1,
+      "arguments": [
+        "--start-pos",
+        "131072"
+      ],
+      "workload": {
+        "local_batch": 4,
+        "sequence": 2,
+        "local_tokens": 8,
+        "start_pos": 131072,
+        "scenario_context": 131072,
+        "tp": 1
+      },
+      "required_specs": {
+        "x_out": {
+          "shape": [
+            8,
+            4,
+            4096
+          ],
+          "dtype": "torch.float32"
+        },
+        "position_ids": {
+          "shape": [
+            8
+          ],
+          "dtype": "torch.int32"
+        }
+      },
+      "required_outputs": [
+        "x_out"
+      ],
+      "run_config": {
+        "ring_task_window": 262144,
+        "ring_dep_pool": 262144,
+        "ring_heap": 2147483648
+      }
+    },
+    {
+      "case_id": "mtp-attention-hca-128k",
+      "model": "mtp",
+      "entrypoint": "models/deepseek_v4_flash_mtp/decode_hca.py",
+      "device_count": 1,
+      "arguments": [
+        "--start-pos",
+        "131072"
+      ],
+      "workload": {
+        "local_batch": 4,
+        "sequence": 2,
+        "local_tokens": 8,
+        "start_pos": 131072,
+        "scenario_context": 131072,
+        "tp": 1
+      },
+      "required_specs": {
+        "x_out": {
+          "shape": [
+            8,
+            4,
+            4096
+          ],
+          "dtype": "torch.float32"
+        },
+        "position_ids": {
+          "shape": [
+            8
+          ],
+          "dtype": "torch.int32"
+        }
+      },
+      "required_outputs": [
+        "x_out"
+      ],
+      "run_config": {
+        "ring_task_window": 262144,
+        "ring_dep_pool": 262144,
+        "ring_heap": 2147483648
+      }
+    },
+    {
+      "case_id": "mtp-attention-swa-128k",
+      "model": "mtp",
+      "entrypoint": "models/deepseek_v4_flash_mtp/decode_swa.py",
+      "device_count": 1,
+      "arguments": [
+        "--start-pos",
+        "131072"
+      ],
+      "workload": {
+        "local_batch": 4,
+        "sequence": 2,
+        "local_tokens": 8,
+        "start_pos": 131072,
+        "scenario_context": 131072,
+        "tp": 1
+      },
+      "required_specs": {
+        "x_out": {
+          "shape": [
+            8,
+            4,
+            4096
+          ],
+          "dtype": "torch.float32"
+        },
+        "position_ids": {
+          "shape": [
+            8
+          ],
+          "dtype": "torch.int32"
+        }
+      },
+      "required_outputs": [
+        "x_out"
+      ],
+      "run_config": {
+        "ring_task_window": 262144,
+        "ring_dep_pool": 262144,
+        "ring_heap": 2147483648
+      }
+    },
+    {
+      "case_id": "mtp-moe-ep8-128k",
+      "model": "mtp",
+      "entrypoint": "models/deepseek_v4_flash_mtp/decode_moe.py",
+      "device_count": 8,
+      "arguments": [
+        "--ep",
+        "8",
+        "--layer-id",
+        "0",
+        "--num-tokens",
+        "8",
+        "--experts-per-rank",
+        "16",
+        "--balanced-routing"
+      ],
+      "workload": {
+        "ep": 8,
+        "experts_per_rank": 16,
+        "local_tokens": 8,
+        "layer_id": 0,
+        "routing": "balanced",
+        "scenario_context": 131072
+      },
+      "required_specs": {
+        "x_next": {
+          "shape": [
+            8,
+            8,
+            4,
+            4096
+          ],
+          "dtype": "torch.float32"
+        }
+      },
+      "required_outputs": [
+        "x_next"
+      ],
+      "run_config": {
+        "ring_task_window": 262144,
+        "ring_dep_pool": 262144,
+        "ring_heap": 2147483648
+      },
+      "measurement_case": "mtp-moe-ep8-8k"
+    },
+    {
+      "case_id": "mtp-lm-head-128k",
+      "model": "mtp",
+      "entrypoint": "models/deepseek_v4_flash_mtp/lm_head.py",
+      "device_count": 1,
+      "arguments": [
+        "--tp",
+        "1",
+        "--dp",
+        "1",
+        "--num-tokens",
+        "8",
+        "--entry",
+        "projection"
+      ],
+      "workload": {
+        "tp": 1,
+        "dp": 1,
+        "active_logit_rows_per_rank": 8,
+        "sampling": false,
+        "scenario_context": 131072
+      },
+      "required_specs": {
+        "logits": {
+          "shape": [
+            1,
+            8,
+            129280
+          ],
+          "dtype": "torch.float32"
+        }
+      },
+      "required_outputs": [
+        "logits"
+      ],
+      "run_config": {
+        "ring_task_window": 262144,
+        "ring_dep_pool": 262144,
+        "ring_heap": 2147483648
+      },
+      "measurement_case": "mtp-lm-head-8k"
+    },
+    {
+      "case_id": "dspark-attention-csa-8k",
+      "model": "dspark",
+      "entrypoint": "models/deepseek_v4_flash_dspark/decode_csa.py",
+      "device_count": 1,
+      "arguments": [
+        "--tp",
+        "1",
+        "--start-pos",
+        "8192,8192,8192,8192,8192,8192,8192,8192,8192,8192,8192,8192,8192,8192,8192,8192"
+      ],
+      "workload": {
+        "local_batch": 16,
+        "sequence": 8,
+        "local_tokens": 128,
+        "start_pos": 8192,
+        "scenario_context": 8192,
+        "tp": 1
+      },
+      "required_specs": {
+        "x_out": {
+          "shape": [
+            128,
+            4,
+            4096
+          ],
+          "dtype": "torch.float32"
+        },
+        "position_ids": {
+          "shape": [
+            128
+          ],
+          "dtype": "torch.int32"
+        }
+      },
+      "required_outputs": [
+        "x_out"
+      ],
+      "run_config": {
+        "ring_task_window": 16384,
+        "ring_dep_pool": 16384,
+        "ring_heap": 1073741824
+      }
+    },
+    {
+      "case_id": "dspark-attention-hca-8k",
+      "model": "dspark",
+      "entrypoint": "models/deepseek_v4_flash_dspark/decode_hca.py",
+      "device_count": 1,
+      "arguments": [
+        "--tp",
+        "1",
+        "--start-pos",
+        "8192,8192,8192,8192,8192,8192,8192,8192,8192,8192,8192,8192,8192,8192,8192,8192"
+      ],
+      "workload": {
+        "local_batch": 16,
+        "sequence": 8,
+        "local_tokens": 128,
+        "start_pos": 8192,
+        "scenario_context": 8192,
+        "tp": 1
+      },
+      "required_specs": {
+        "x_out": {
+          "shape": [
+            128,
+            4,
+            4096
+          ],
+          "dtype": "torch.float32"
+        },
+        "position_ids": {
+          "shape": [
+            128
+          ],
+          "dtype": "torch.int32"
+        }
+      },
+      "required_outputs": [
+        "x_out"
+      ],
+      "run_config": {
+        "ring_task_window": 16384,
+        "ring_dep_pool": 16384,
+        "ring_heap": 1073741824
+      }
+    },
+    {
+      "case_id": "dspark-attention-swa-8k",
+      "model": "dspark",
+      "entrypoint": "models/deepseek_v4_flash_dspark/decode_swa.py",
+      "device_count": 1,
+      "arguments": [
+        "--tp",
+        "1",
+        "--start-pos",
+        "8192,8192,8192,8192,8192,8192,8192,8192,8192,8192,8192,8192,8192,8192,8192,8192"
+      ],
+      "workload": {
+        "local_batch": 16,
+        "sequence": 8,
+        "local_tokens": 128,
+        "start_pos": 8192,
+        "scenario_context": 8192,
+        "tp": 1
+      },
+      "required_specs": {
+        "x_out": {
+          "shape": [
+            128,
+            4,
+            4096
+          ],
+          "dtype": "torch.float32"
+        },
+        "position_ids": {
+          "shape": [
+            128
+          ],
+          "dtype": "torch.int32"
+        }
+      },
+      "required_outputs": [
+        "x_out"
+      ],
+      "run_config": {
+        "ring_task_window": 16384,
+        "ring_dep_pool": 16384,
+        "ring_heap": 1073741824
+      }
+    },
+    {
+      "case_id": "dspark-moe-ep8-8k",
+      "model": "dspark",
+      "entrypoint": "models/deepseek_v4_flash_dspark/moe.py",
+      "device_count": 8,
+      "arguments": [
+        "--ep",
+        "8",
+        "--layer-id",
+        "0",
+        "--num-tokens",
+        "128",
+        "--routing",
+        "balanced"
+      ],
+      "workload": {
+        "ep": 8,
+        "experts_per_rank": 16,
+        "local_tokens": 128,
+        "layer_id": 0,
+        "routing": "balanced",
+        "scenario_context": 8192
+      },
+      "required_specs": {
+        "x_next": {
+          "shape": [
+            1,
+            8,
+            128,
+            4,
+            4096
+          ],
+          "dtype": "torch.float32"
+        }
+      },
+      "required_outputs": [
+        "x_next"
+      ],
+      "run_config": {
+        "ring_task_window": 16384,
+        "ring_dep_pool": 16384,
+        "ring_heap": 1073741824
+      }
+    },
+    {
+      "case_id": "dspark-lm-head-8k",
+      "model": "dspark",
+      "entrypoint": "models/deepseek_v4_flash_dspark/lm_head.py",
+      "device_count": 1,
+      "arguments": [
+        "--tp",
+        "1",
+        "--dp",
+        "1",
+        "--num-tokens",
+        "128",
+        "--entry",
+        "projection"
+      ],
+      "workload": {
+        "tp": 1,
+        "dp": 1,
+        "active_logit_rows_per_rank": 128,
+        "sampling": false,
+        "scenario_context": 8192
+      },
+      "required_specs": {
+        "logits": {
+          "shape": [
+            1,
+            128,
+            129280
+          ],
+          "dtype": "torch.float32"
+        }
+      },
+      "required_outputs": [
+        "logits"
+      ],
+      "run_config": {
+        "ring_task_window": 16384,
+        "ring_dep_pool": 16384,
+        "ring_heap": 1073741824
+      }
+    },
+    {
+      "case_id": "dspark-attention-csa-128k",
+      "model": "dspark",
+      "entrypoint": "models/deepseek_v4_flash_dspark/decode_csa.py",
+      "device_count": 1,
+      "arguments": [
+        "--tp",
+        "1",
+        "--start-pos",
+        "131072,131072,131072,131072,131072,131072,131072,131072,131072,131072,131072,131072,131072,131072,131072,131072"
+      ],
+      "workload": {
+        "local_batch": 16,
+        "sequence": 8,
+        "local_tokens": 128,
+        "start_pos": 131072,
+        "scenario_context": 131072,
+        "tp": 1
+      },
+      "required_specs": {
+        "x_out": {
+          "shape": [
+            128,
+            4,
+            4096
+          ],
+          "dtype": "torch.float32"
+        },
+        "position_ids": {
+          "shape": [
+            128
+          ],
+          "dtype": "torch.int32"
+        }
+      },
+      "required_outputs": [
+        "x_out"
+      ],
+      "run_config": {
+        "ring_task_window": 16384,
+        "ring_dep_pool": 16384,
+        "ring_heap": 1073741824
+      }
+    },
+    {
+      "case_id": "dspark-attention-hca-128k",
+      "model": "dspark",
+      "entrypoint": "models/deepseek_v4_flash_dspark/decode_hca.py",
+      "device_count": 1,
+      "arguments": [
+        "--tp",
+        "1",
+        "--start-pos",
+        "131072,131072,131072,131072,131072,131072,131072,131072,131072,131072,131072,131072,131072,131072,131072,131072"
+      ],
+      "workload": {
+        "local_batch": 16,
+        "sequence": 8,
+        "local_tokens": 128,
+        "start_pos": 131072,
+        "scenario_context": 131072,
+        "tp": 1
+      },
+      "required_specs": {
+        "x_out": {
+          "shape": [
+            128,
+            4,
+            4096
+          ],
+          "dtype": "torch.float32"
+        },
+        "position_ids": {
+          "shape": [
+            128
+          ],
+          "dtype": "torch.int32"
+        }
+      },
+      "required_outputs": [
+        "x_out"
+      ],
+      "run_config": {
+        "ring_task_window": 16384,
+        "ring_dep_pool": 16384,
+        "ring_heap": 1073741824
+      }
+    },
+    {
+      "case_id": "dspark-attention-swa-128k",
+      "model": "dspark",
+      "entrypoint": "models/deepseek_v4_flash_dspark/decode_swa.py",
+      "device_count": 1,
+      "arguments": [
+        "--tp",
+        "1",
+        "--start-pos",
+        "131072,131072,131072,131072,131072,131072,131072,131072,131072,131072,131072,131072,131072,131072,131072,131072"
+      ],
+      "workload": {
+        "local_batch": 16,
+        "sequence": 8,
+        "local_tokens": 128,
+        "start_pos": 131072,
+        "scenario_context": 131072,
+        "tp": 1
+      },
+      "required_specs": {
+        "x_out": {
+          "shape": [
+            128,
+            4,
+            4096
+          ],
+          "dtype": "torch.float32"
+        },
+        "position_ids": {
+          "shape": [
+            128
+          ],
+          "dtype": "torch.int32"
+        }
+      },
+      "required_outputs": [
+        "x_out"
+      ],
+      "run_config": {
+        "ring_task_window": 16384,
+        "ring_dep_pool": 16384,
+        "ring_heap": 1073741824
+      }
+    },
+    {
+      "case_id": "dspark-moe-ep8-128k",
+      "model": "dspark",
+      "entrypoint": "models/deepseek_v4_flash_dspark/moe.py",
+      "device_count": 8,
+      "arguments": [
+        "--ep",
+        "8",
+        "--layer-id",
+        "0",
+        "--num-tokens",
+        "128",
+        "--routing",
+        "balanced"
+      ],
+      "workload": {
+        "ep": 8,
+        "experts_per_rank": 16,
+        "local_tokens": 128,
+        "layer_id": 0,
+        "routing": "balanced",
+        "scenario_context": 131072
+      },
+      "required_specs": {
+        "x_next": {
+          "shape": [
+            1,
+            8,
+            128,
+            4,
+            4096
+          ],
+          "dtype": "torch.float32"
+        }
+      },
+      "required_outputs": [
+        "x_next"
+      ],
+      "run_config": {
+        "ring_task_window": 16384,
+        "ring_dep_pool": 16384,
+        "ring_heap": 1073741824
+      },
+      "measurement_case": "dspark-moe-ep8-8k"
+    },
+    {
+      "case_id": "dspark-lm-head-128k",
+      "model": "dspark",
+      "entrypoint": "models/deepseek_v4_flash_dspark/lm_head.py",
+      "device_count": 1,
+      "arguments": [
+        "--tp",
+        "1",
+        "--dp",
+        "1",
+        "--num-tokens",
+        "128",
+        "--entry",
+        "projection"
+      ],
+      "workload": {
+        "tp": 1,
+        "dp": 1,
+        "active_logit_rows_per_rank": 128,
+        "sampling": false,
+        "scenario_context": 131072
+      },
+      "required_specs": {
+        "logits": {
+          "shape": [
+            1,
+            128,
+            129280
+          ],
+          "dtype": "torch.float32"
+        }
+      },
+      "required_outputs": [
+        "logits"
+      ],
+      "run_config": {
+        "ring_task_window": 16384,
+        "ring_dep_pool": 16384,
+        "ring_heap": 1073741824
+      },
+      "measurement_case": "dspark-lm-head-8k"
+    }
+  ]
+}

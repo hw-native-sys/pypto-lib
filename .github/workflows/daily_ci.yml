@@ -4,15 +4,20 @@ on:
   schedule:
     - cron: '51 20 * * *'  # UTC 20:51 = Shanghai 04:51
   workflow_dispatch:
+    inputs:
+      performance_only:
+        description: Run only the MTP and DSpark operator performance suite
+        type: boolean
+        default: false
 
-# Every job only reads the repo (checkouts use persist-credentials: false, the
-# artifact up/download steps use the run-scoped runtime token, the summary
-# writes $GITHUB_STEP_SUMMARY), so the token needs nothing beyond contents:read.
+# Jobs read the repo; the performance job additionally reads historical Actions
+# artifacts. No job publishes commits or updates a baseline branch.
 permissions:
   contents: read
 
 jobs:
   model-tests-sim:
+    if: ${{ !inputs.performance_only }}
     # Simulator job: no device needed, so it runs on the CPU runner — but on the
     # host, through the same setup-ci-job composite as the a2a3 device job (same
     # user, same bundle venv + activate.sh, same ci-cache). needs-device:false is
@@ -152,6 +157,7 @@ jobs:
           path: checkout/results.tsv
 
   model-tests-a2a3:
+    if: ${{ !inputs.performance_only }}
     # Runs directly on the host like pypto's dist-system-tests — multi-card
     # kernels use HCCL, which needs a host-only env (set_env.sh, HCCL plugin
     # paths); under docker the chip child silent-crashes in comm_init. It holds
@@ -215,24 +221,12 @@ jobs:
           # INFO_V9 markers on every dispatch (correctness runs included, not just
           # benchmark's own fd-captured loop). benchmark() still reads timing.
           PYPTO_RUNTIME_LOG: error
-          PYPTO_BENCH: '1'
+          PYPTO_BENCH: '0'  # Correctness only; the dedicated performance job owns timing.
         run: |
           source activate.sh
           set +e
           : > results.tsv
           failed=()
-          # Perf number per case is the `effective_us (N rounds) min=... mean=...`
-          # headline: the multi-round mean of the Effective window. The pattern
-          # matches that headline's full shape rather than `effective_us .*mean=`,
-          # so a breakdown line can never be picked up instead. L2 is each round's
-          # window; L3 (multi-card) is the per-round max across ranks (slowest rank
-          # bounds the round), or the pooled per-dispatch mean when per-round
-          # segmentation falls back to flattened. A case becomes `-` only when no
-          # timing line was emitted (e.g. the run failed or the runtime lacks
-          # SIMPLER_PROFILING).
-          extract_perf() {
-            grep -oP 'effective_us \(\d+ rounds\) min=[0-9.]+ median=[0-9.]+ mean=\K[0-9.]+' | tail -1
-          }
           run_case() {
             local file="$1" label="$2"; shift 2
             echo "::group::${label}"
@@ -240,24 +234,22 @@ jobs:
             # the top; borrow that many cards with `--device-num N` (defaults to
             # ep2 / 2-card runs). $TASK_DEVICE is the lent set (a single id, or
             # comma-separated for N>1) and is passed straight to -d. The child's
-            # stdout is captured (not streamed) so the perf line can be parsed.
-            local ndev devnum_flag out rc perf
+            # stdout is captured and then printed with the case result.
+            local ndev devnum_flag out rc
             ndev=$(grep -oP '#\s*ci:\s*devices=\K[0-9]+' "$file" | head -1)
             ndev=${ndev:-1}
             devnum_flag=""
             [ "$ndev" -gt 1 ] && devnum_flag="--device-num $ndev"
             out=$( task-submit --device "$DEVICE_ID" $devnum_flag --timeout 3600 --max-time 900 \
-              --run "cd $GITHUB_WORKSPACE/checkout && source activate.sh && PYTHONPATH=$GITHUB_WORKSPACE/checkout python $file -p a2a3 -d \$TASK_DEVICE $*" 2>&1 )
+              --run "cd $GITHUB_WORKSPACE/checkout && source activate.sh && PYPTO_BENCH=0 PYTHONPATH=$GITHUB_WORKSPACE/checkout python $file -p a2a3 -d \$TASK_DEVICE $*" 2>&1 )
             rc=$?
             printf '%s\n' "$out"
-            perf=$(printf '%s\n' "$out" | extract_perf)
-            perf=${perf:--}
             if [ "$rc" -ne 0 ]; then
               failed+=("$label")
               echo "::error file=${file}::FAIL (${label})"
-              printf '%s\tfail\t%s\n' "$label" "$perf" >> results.tsv
+              printf '%s\tfail\n' "$label" >> results.tsv
             else
-              printf '%s\tpass\t%s\n' "$label" "$perf" >> results.tsv
+              printf '%s\tpass\n' "$label" >> results.tsv
             fi
             echo "::endgroup::"
           }
@@ -307,6 +299,7 @@ jobs:
           path: checkout/results.tsv
 
   model-tests-a5:
+    if: ${{ !inputs.performance_only }}
     # Report-only. A measured sweep puts V4-Pro at 13/35 on A5: 13 cases die
     # with `sync_stream_pair: aclrtSync` device faults, 2 with `rtMalloc failed:
     # 207001`, 7 on numerics. Those are pypto/device-side rather than defects in
@@ -404,20 +397,12 @@ jobs:
           PYPTO_WARNING_LEVEL: none
           # Quiet simpler's runtime logger — see the sim job for the full note.
           PYPTO_RUNTIME_LOG: error
-          PYPTO_BENCH: '1'
+          PYPTO_BENCH: '0'  # Correctness only; the dedicated performance job owns timing.
         run: |
           source activate.sh
           set +e
           : > results.tsv
           failed=()
-          # Perf number per case is the `effective_us (N rounds) ... mean=`
-          # headline (same rule and pattern as the a2a3 job): the multi-round mean
-          # of the Effective window. L2 is each round's window; L3 (multi-card) is
-          # the per-round max across ranks, or the pooled per-dispatch mean when
-          # per-round segmentation falls back to flattened.
-          extract_perf() {
-            grep -oP 'effective_us \(\d+ rounds\) min=[0-9.]+ median=[0-9.]+ mean=\K[0-9.]+' | tail -1
-          }
           run_case() {
             local file="$1" label="$2"; shift 2
             echo "::group::${label}"
@@ -425,23 +410,21 @@ jobs:
             # the top; borrow that many cards with --device-num N (defaults to
             # single-card). $TASK_DEVICE is the lent set (single id, or
             # comma-separated for N>1) and is passed straight to -d.
-            local ndev devnum_flag out rc perf
+            local ndev devnum_flag out rc
             ndev=$(grep -oP '#\s*ci:\s*devices=\K[0-9]+' "$file" | head -1)
             ndev=${ndev:-1}
             devnum_flag=""
             [ "$ndev" -gt 1 ] && devnum_flag="--device-num $ndev"
             out=$( task-submit --device "$DEVICE_ID" $devnum_flag --timeout 3600 --max-time 900 \
-              --run "cd $GITHUB_WORKSPACE/checkout && source activate.sh && DEEPSEEK_V4_VARIANT=pro PYTHONPATH=$GITHUB_WORKSPACE/checkout python $file -p a5 -d \$TASK_DEVICE $*" 2>&1 )
+              --run "cd $GITHUB_WORKSPACE/checkout && source activate.sh && PYPTO_BENCH=0 DEEPSEEK_V4_VARIANT=pro PYTHONPATH=$GITHUB_WORKSPACE/checkout python $file -p a5 -d \$TASK_DEVICE $*" 2>&1 )
             rc=$?
             printf '%s\n' "$out"
-            perf=$(printf '%s\n' "$out" | extract_perf)
-            perf=${perf:--}
             if [ "$rc" -ne 0 ]; then
               failed+=("$label")
               echo "::error file=${file}::FAIL (${label})"
-              printf '%s\tfail\t%s\n' "$label" "$perf" >> results.tsv
+              printf '%s\tfail\n' "$label" >> results.tsv
             else
-              printf '%s\tpass\t%s\n' "$label" "$perf" >> results.tsv
+              printf '%s\tpass\n' "$label" >> results.tsv
             fi
             echo "::endgroup::"
           }
@@ -499,6 +482,7 @@ jobs:
           path: checkout/results.tsv
 
   e2e-flash-a5:
+    if: ${{ !inputs.performance_only }}
     name: DeepSeek-V4-Flash EP8 end-to-end (a5)
     # Report-only, like model-tests-a5: the 8-card SDMA/AICPU path on the A5 host
     # has had platform-side outages (every >=2-card program dying with 507015 /
@@ -823,6 +807,105 @@ jobs:
             checkout/e2e-attempt1.log
           if-no-files-found: warn
 
+  operator-performance:
+    name: MTP and DSpark operator performance (a2a3)
+    runs-on: [self-hosted, linux, arm64, npu]
+    # The suite has its own provisional wall-clock budget. Keep job-level
+    # headroom for setup, artifact upload and cancellation cleanup.
+    timeout-minutes: 300
+    concurrency:
+      group: operator-performance-a2a3
+      cancel-in-progress: false
+    permissions:
+      contents: read
+      actions: read
+    defaults:
+      run:
+        working-directory: operator-checkout
+    env:
+      PTOAS_ROOT: ${{ github.workspace }}/operator-checkout/ptoas-bin
+      CMAKE_BUILD_PARALLEL_LEVEL: 16
+      CMAKE_C_COMPILER_LAUNCHER: ccache
+      CMAKE_CXX_COMPILER_LAUNCHER: ccache
+      CCACHE_MAXSIZE: 30G
+      CCACHE_UMASK: '000'
+      OPERATOR_PERF_HOST: ${{ vars.OPERATOR_PERF_HOST }}
+      OPERATOR_PERF_DEVICE_EPOCH: ${{ vars.OPERATOR_PERF_DEVICE_EPOCH }}
+      OPERATOR_PERF_CASE_TIMEOUT: ${{ vars.OPERATOR_PERF_CASE_TIMEOUT }}
+      OPERATOR_PERF_QUEUE_TIMEOUT: ${{ vars.OPERATOR_PERF_QUEUE_TIMEOUT }}
+      OPERATOR_PERF_SUITE_TIMEOUT: ${{ vars.OPERATOR_PERF_SUITE_TIMEOUT }}
+    steps:
+      - name: Record and verify performance host before device setup
+        run: |
+          python3 - <<'PY'
+          import os
+          import socket
+          actual = socket.gethostname()
+          expected = os.environ.get("OPERATOR_PERF_HOST", "")
+          if expected and actual != expected:
+              raise SystemExit("This runner does not match OPERATOR_PERF_HOST")
+          with open(os.environ["GITHUB_ENV"], "a") as output:
+              output.write(f"OPERATOR_PERF_HOST={actual}\n")
+          print(f"Performance host: {actual}; using the shared CI NPU pool")
+          PY
+        working-directory: ${{ github.workspace }}
+
+      - name: Fetch composite action definitions
+        uses: actions/checkout@v4
+        with:
+          sparse-checkout: .github/actions
+          clean: false
+          persist-credentials: false
+
+      - name: Setup CI job
+        uses: ./.github/actions/setup-ci-job
+        with:
+          checkout-path: operator-checkout
+          needs-device: 'true'
+          build-namespace: operator-performance-a2a3
+          pip-cache-name: pip-operator-performance
+          toolchain: bundle
+
+      - name: Run fixed operator performance suite
+        id: perf
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          source activate.sh
+          python .github/scripts/ci_operator_perf.py
+
+      - name: Kill orphaned task-submit tasks
+        if: always()
+        uses: ./.github/actions/kill-orphaned-tasks
+        with:
+          checkout-path: operator-checkout
+
+      - name: Preserve partial operator results
+        if: ${{ always() && steps.perf.outcome != 'skipped' }}
+        env:
+          PERF_STEP_OUTCOME: ${{ steps.perf.outcome }}
+        run: |
+          source activate.sh
+          python .github/scripts/ci_operator_perf.py --finalize
+
+      - name: Upload operator performance results
+        id: upload
+        if: ${{ always() && steps.perf.outcome != 'skipped' }}
+        uses: ./.github/actions/upload-results
+        with:
+          name: operator-perf-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/operator-perf-${{ github.run_id }}-${{ github.run_attempt }}/published
+          if-no-files-found: error
+
+      - name: Remove private operator builds after uploading evidence
+        if: ${{ always() && steps.upload.outcome == 'success' }}
+        env:
+          PERF_WORK: ${{ runner.temp }}/operator-perf-${{ github.run_id }}-${{ github.run_attempt }}/work
+        run: |
+          # Only this invocation's private builds are removed; published logs
+          # and raw results have already been uploaded, including failures.
+          rm -rf -- "$PERF_WORK"
+
   summary:
     name: Aggregate results summary
     # model-tests-a5 is a real dependency: it is the longest job (the V4-Pro
@@ -830,7 +913,7 @@ jobs:
     # is built before results-a5 exists and the A5 column is empty every time.
     # `always()` keeps the summary running when any sweep fails.
     needs: [model-tests-sim, model-tests-a2a3, model-tests-a5, e2e-flash-a5]
-    if: always()
+    if: ${{ always() && !inputs.performance_only }}
     runs-on: ubuntu-latest
     steps:
       - name: Download all results
@@ -850,19 +933,17 @@ jobs:
           ROOT = pathlib.Path("results")
 
           def load(platform):
-              """(status, perf) per case, or (None, None) if the job wrote nothing."""
+              """Case statuses, or None if the job wrote no artifact."""
               tsv = ROOT / f"results-{platform}" / "results.tsv"
               if not tsv.exists():
-                  return None, None
-              status, perf = {}, {}
+                  return None
+              status = {}
               for line in tsv.read_text().splitlines():
                   if not line.strip():
                       continue
                   parts = line.split("\t")
                   status[parts[0]] = parts[1]
-                  if len(parts) >= 3 and parts[2] not in ("", "-"):
-                      perf[parts[0]] = parts[2]
-              return status, perf
+              return status
 
           def no_artifact(platforms):
               names = ", ".join(f"`{p}`" for p in platforms)
@@ -872,12 +953,12 @@ jobs:
                   "fails cases still uploads its table."
               )
 
-          def table(title, platforms, timed, expected_absences=None):
-              """`timed` is the platform whose effective_us column is shown."""
+          def table(title, platforms, expected_absences=None):
+              """Show correctness for each platform, including missing artifacts."""
               expected_absences = expected_absences or {}
               data = {p: load(p) for p in platforms}
-              present = [p for p in platforms if data[p][0] is not None]
-              missing = [p for p in platforms if data[p][0] is None]
+              present = [p for p in platforms if data[p] is not None]
+              missing = [p for p in platforms if data[p] is None]
               print(f"### {title}")
               print()
               if not present:
@@ -887,26 +968,21 @@ jobs:
               header = ["Case"]
               for p in platforms:
                   header.append(p)
-                  if p == timed:
-                      header.append(f"{p} effective (us)")
               print("| " + " | ".join(header) + " |")
               print("| " + " | ".join("---" for _ in header) + " |")
-              perf = data[timed][1] or {}
-              for case in sorted({c for p in present for c in data[p][0]}):
+              for case in sorted({c for p in present for c in data[p]}):
                   row = [f"`{case}`"]
                   for p in platforms:
-                      status = (data[p][0] or {}).get(case, "missing")
-                      if status == "missing" and data[p][0] is not None:
+                      status = (data[p] or {}).get(case, "missing")
+                      if status == "missing" and data[p] is not None:
                           row.append(expected_absences.get((case, p), ICON["missing"]))
                       else:
                           row.append(ICON.get(status, "?"))
-                      if p == timed:
-                          row.append(perf.get(case, "-"))
                   print("| " + " | ".join(row) + " |")
               print()
               print("Passed: " + ", ".join(
-                  f"**{p}** {sum(1 for v in data[p][0].values() if v == 'pass')}"
-                  f"/{len(data[p][0])}" for p in present))
+                  f"**{p}** {sum(1 for v in data[p].values() if v == 'pass')}"
+                  f"/{len(data[p])}" for p in present))
               if missing:
                   print()
                   print(no_artifact(missing) + " Those columns read all `-`.")
@@ -970,11 +1046,10 @@ jobs:
 
           print("## Daily CI Model Test Results")
           print()
-          table("a2a3 and a2a3sim", ["a2a3", "a2a3sim"], "a2a3")
+          table("a2a3 and a2a3sim", ["a2a3", "a2a3sim"])
           table(
               "a5 and a5sim (DeepSeek V4-Pro)",
               ["a5", "a5sim"],
-              "a5",
               {("models/deepseek_v4_pro/prefill_mtp.py", "a5sim"): "only a5"},
           )
           e2e("a5 DeepSeek-V4-Flash EP8 end-to-end token generation (real weights)", "e2e-a5")
