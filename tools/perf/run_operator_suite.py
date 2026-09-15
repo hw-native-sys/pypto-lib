@@ -6,31 +6,273 @@
 # INCLUDING BUT NOT LIMITED TO NON-INFRINGEMENT, MERCHANTABILITY, OR FITNESS FOR A PARTICULAR PURPOSE.
 # See LICENSE in the root of the software repository for the full text of the License.
 # -----------------------------------------------------------------------------------------------------------
-"""Run ten fixed operator workloads inside an exact even-device allocation."""
+"""Run and report the ten fixed MTP/DSpark workloads in CI's environment."""
 
 from __future__ import annotations
 
 import argparse
 from datetime import datetime, timedelta, timezone
+import hashlib
+from importlib import metadata
 import json
+import math
 import os
 from pathlib import Path
+import platform
 import re
 import shutil
 import signal
 import socket
+import stat
+import statistics
 import subprocess
 import sys
 import uuid
 
-sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
+ROOT = Path(__file__).resolve().parents[2]
+MANIFEST = Path(__file__).parent / "suites/dsv4_operators.json"
+CASE_IDS = {
+    f"{model}-{op}" for model in ("mtp", "dspark")
+    for op in ("attention-csa", "attention-hca", "attention-swa", "moe-ep8", "lm-head")
+}
+SAMPLING = {"seed": 1807, "rounds": 100, "warmup": 5, "raw": True}
 
-from tools.perf.operator_contract import (
-    CASE_IDS, ContractError, ROOT, SAMPLING, case_arguments, digest, load_manifest,
-    load_profile, read_json, validate_allocation, write_json,
-)
-from tools.perf.operator_provenance import capture_host, capture_toolchain, source_identity
-from tools.perf.operator_results import comparison, validate_result
+
+class ContractError(ValueError):
+    """Evidence is missing or incompatible with the selected workload."""
+
+
+def read_json(path):
+    with Path(path).open(encoding="utf-8") as stream:
+        return json.load(stream)
+
+
+def digest(value):
+    return hashlib.sha256(json.dumps(value, sort_keys=True, allow_nan=False).encode()).hexdigest()
+
+
+def write_json(path, value):
+    path = Path(path)
+    temporary = path.with_suffix(path.suffix + ".tmp")
+    temporary.write_text(json.dumps(value, indent=2, allow_nan=False) + "\n", encoding="utf-8")
+    os.replace(temporary, path)
+
+
+def devices(value):
+    try:
+        parsed = [int(item) for item in value.split(",")] if isinstance(value, str) else value
+        if not isinstance(parsed, list) or not parsed:
+            raise ValueError
+        if any(type(item) is not int or item < 0 or item % 2 for item in parsed):
+            raise ValueError
+        if len(set(parsed)) != len(parsed) or parsed != sorted(parsed):
+            raise ValueError
+    except (TypeError, ValueError):
+        raise ContractError("devices must be distinct, ascending, non-negative even host IDs") from None
+    return parsed
+
+
+def load_profile(path=None):
+    profile = read_json(path) if path else read_json(MANIFEST)["device_profile"]
+    if profile.get("schema_version") != 1 or profile.get("device_id_domain") != "host":
+        raise ContractError("only schema 1 host device IDs are supported; remapping is not supported")
+    epoch = profile.get("device_epoch")
+    if not isinstance(epoch, str) or not epoch.strip():
+        raise ContractError("a device epoch is required")
+    for count in (1, 4, 8):
+        selected = devices(profile.get("sequences", {}).get(str(count)))
+        if len(selected) != count:
+            raise ContractError(f"the {count}-device sequence has the wrong size")
+    if not set(profile["sequences"]["1"] + profile["sequences"]["4"]) <= set(profile["sequences"]["8"]):
+        raise ContractError("single-card and TP4 devices must be subsets of the EP8 allocation")
+    return profile
+
+
+def validate_allocation(profile, allocated, selected, environ=None):
+    environ = os.environ if environ is None else environ
+    allocation = devices(allocated)
+    if allocation != profile["sequences"]["8"]:
+        raise ContractError("the suite requires the exact eight-device allocation from its profile")
+    if devices(environ.get("TASK_DEVICE", "")) != allocation:
+        raise ContractError("TASK_DEVICE differs from the requested allocation")
+    if environ.get("TASKQUEUE_INSIDE") != "1":
+        raise ContractError("run inside a task-submit allocation")
+    for key in ("ASCEND_RT_VISIBLE_DEVICES", "ASCEND_VISIBLE_DEVICES"):
+        if environ.get(key, "").strip():
+            raise ContractError(f"{key} remaps host IDs; this runner requires an unmasked host")
+    if selected != profile["sequences"].get(str(len(selected))) or not set(selected) <= set(allocation):
+        raise ContractError("case devices differ from the fixed profile or escape the allocation")
+
+
+def load_manifest(path=MANIFEST):
+    manifest = read_json(path)
+    cases = manifest.get("cases", [])
+    if manifest.get("schema_version") != 1 or manifest.get("sampling") != SAMPLING:
+        raise ContractError("unsupported manifest or sampling contract")
+    if len(cases) != 10 or {case.get("case_id") for case in cases} != CASE_IDS:
+        raise ContractError("the suite must contain exactly the ten MTP/DSpark cases")
+    if manifest.get("platform") != "a2a3":
+        raise ContractError("official performance requires a2a3")
+    for case in cases:
+        entry = (ROOT / case["entrypoint"]).resolve()
+        if not entry.is_relative_to(ROOT / "models") or not entry.is_file():
+            raise ContractError("entry point must be an existing model in this checkout")
+        if case["device_count"] not in (1, 4, 8) or not case.get("required_outputs"):
+            raise ContractError("invalid case devices or output contract")
+    return manifest
+
+
+def case_arguments(case, selected):
+    return ["-p", "a2a3", "-d", ",".join(map(str, selected)),
+            *case["arguments"], "--enable-chip-swimlane", "0"]
+
+
+def positive(value, label):
+    if type(value) not in (int, float) or not math.isfinite(value) or value <= 0:
+        raise ContractError(f"{label} must be a finite positive number")
+    return float(value)
+
+
+def check_specs(case, specs, *, require_outputs=False):
+    by_name = {spec["name"]: spec for spec in specs}
+    if len(by_name) != len(specs):
+        raise ContractError("duplicate tensor specifications")
+    for name, expected in case["required_specs"].items():
+        actual = by_name.get(name, {})
+        if any(actual.get(key) != value for key, value in expected.items()):
+            raise ContractError(f"{name} shape/dtype differs from the workload contract")
+    if require_outputs:
+        outputs = {spec["name"] for spec in specs if spec.get("direction") in ("out", "inout")}
+        if not set(case["required_outputs"]) <= outputs:
+            raise ContractError("required results are not validated outputs")
+
+
+def validate_result(payload, case, *, process_rc=0):
+    if process_rc != 0 or payload.get("passed") is not True:
+        raise ContractError(f"operator did not pass correctness (exit {process_rc}): {payload.get('error')}")
+    if payload.get("case_id") != case["case_id"] or payload.get("sampling") != SAMPLING:
+        raise ContractError("case identity or sampling differs from the request")
+    if payload.get("run_config") != case["run_config"]:
+        raise ContractError("runtime settings differ from the case contract")
+    if not payload.get("fixture_sha256") or not payload.get("golden_sha256"):
+        raise ContractError("missing actual input or reference fingerprint")
+    check_specs(case, payload["specs"], require_outputs=True)
+    bench = payload["benchmark"]
+    if (bench["rounds"], bench["warmup"]) != (100, 5):
+        raise ContractError("expected 100 measured rounds after 5 warmup rounds")
+    if any(bench.get(key) is not False for key in (
+        "fallback_flattened", "unstable_dispatch_slots", "all_zero_device",
+    )):
+        raise ContractError("benchmark has unavailable, flattened or unstable timing")
+    count = case["device_count"]
+    if count > 1 and bench.get("distributed_grid") is not True:
+        raise ContractError("distributed round boundaries are missing")
+    rows = bench["samples"]
+    if len(rows) != 100:
+        raise ContractError("incomplete benchmark rounds")
+    pids = set(rows[0])
+    if len(pids) != count:
+        raise ContractError("benchmark rank count differs from allocated devices")
+    samples = {pid: [] for pid in pids}
+    slots = {}
+    identities = {}
+    seen = set()
+    for row in rows:
+        if set(row) != pids:
+            raise ContractError("missing or unexpected rank in a measured round")
+        for pid, dispatches in row.items():
+            if not dispatches or len(dispatches) != len(rows[0][pid]):
+                raise ContractError("dispatch count changed between rounds")
+            total = 0.0
+            for slot, dispatch in enumerate(dispatches):
+                key = (pid, slot)
+                identity = dispatch["task"]
+                if not identity or identities.setdefault(key, identity) != identity:
+                    raise ContractError("dispatch slot changed callable between rounds")
+                inv = dispatch["inv"]
+                if type(inv) is not int or inv < 0 or (pid, inv) in seen:
+                    raise ContractError("duplicate or invalid rank invocation")
+                seen.add((pid, inv))
+                value = positive(dispatch["effective_us"], "effective_us")
+                slots.setdefault(key, []).append(value)
+                total += value
+            samples[pid].append(total)
+    per_rank = [
+        {"trace_pid": pid, "median_us": statistics.median(values), "samples_us": values,
+         "dispatches": [{"slot": slot, "task": identities[(pid, slot)],
+                         "samples_us": values, "median_us": statistics.median(values)}
+                        for (rank, slot), values in sorted(slots.items()) if rank == pid]}
+        for pid, values in sorted(samples.items())
+    ]
+    medians = [rank["median_us"] for rank in per_rank]
+    return {"metric_us": min(medians), "max_rank_median_us": max(medians),
+            "rank_spread_us": max(medians) - min(medians), "ranks": per_rank}
+
+
+def comparison(current, baseline):
+    """A positive percentage means slower; unavailable evidence is never zero."""
+    if not baseline or current.get("status") != "pass" or baseline.get("status") != "pass":
+        return {"delta_pct": None, "reason": "no passing baseline/current result"}
+    keys = ["case_contract", "device_identity", "fixture_sha256", "golden_sha256"]
+    # CI follows upstream HEAD. System changes start a new series;
+    # compiler/runtime changes remain visible as complete-stack deltas.
+    for key in ("python", "torch", "numpy", "cann_sha256", "driver_sha256", "bundle"):
+        if (not current.get("toolchain", {}).get(key) or
+                current["toolchain"][key] != baseline.get("toolchain", {}).get(key)):
+            return {"delta_pct": None, "reason": f"incomparable system component: {key}"}
+    for key in keys:
+        if not current.get(key) or current[key] != baseline.get(key):
+            return {"delta_pct": None, "reason": f"incomparable {key}"}
+    now = positive(current["metric_us"], "current metric")
+    before = positive(baseline["metric_us"], "baseline metric")
+    changes = [key for key in sorted(set(current.get("toolchain", {})) | set(baseline.get("toolchain", {})))
+               if current.get("toolchain", {}).get(key) != baseline.get("toolchain", {}).get(key)]
+    if current.get("source_sha") != baseline.get("source_sha"):
+        changes.insert(0, "pypto-lib")
+    return {"scope": "ci_stack", "changed_components": changes,
+            "delta_pct": (now / before - 1) * 100, "baseline_run_id": baseline.get("run_id"),
+            "baseline_date": baseline.get("logical_date")}
+
+
+def command(argv, cwd=None):
+    return subprocess.check_output(argv, cwd=cwd, text=True, stderr=subprocess.PIPE).strip()
+
+
+def capture_toolchain(driver_info=Path("/usr/local/Ascend/driver/version.info")):
+    """Record versions from setup-ci-job; installation validation belongs to CI."""
+    pypto_root = Path(os.environ["PYPTO_SRC"])
+    cann_info = sorted(Path(os.environ["ASCEND_HOME_PATH"]).glob("*/ascend_toolkit_install.info"))
+    if not cann_info or not driver_info.is_file():
+        raise ContractError("CANN or driver version metadata is missing")
+    return {
+        "pypto": command(["git", "rev-parse", "HEAD"], pypto_root),
+        "runtime": command(["git", "rev-parse", "HEAD"], pypto_root / "runtime"),
+        "pto_isa": os.environ["PTO_ISA_COMMIT"],
+        "ptoas_version": command([str(Path(os.environ["PTOAS_ROOT"]) / "bin/ptoas"), "--version"]),
+        "bundle": Path(os.environ["PYPTO_TOOLCHAIN"]).name,
+        "python": platform.python_version(),
+        "torch": metadata.version("torch"), "numpy": metadata.version("numpy"),
+        "cann_sha256": hashlib.sha256(cann_info[0].read_bytes()).hexdigest(),
+        "driver_sha256": hashlib.sha256(driver_info.read_bytes()).hexdigest(),
+    }
+
+
+def source_identity():
+    return command(["git", "rev-parse", "HEAD"], ROOT)
+
+
+def capture_host(profile, output_dir):
+    inventory = command(["npu-smi", "info"])
+    (Path(output_dir) / "npu-smi-info.txt").write_text(inventory + "\n")
+    mapping = []
+    for device in profile["sequences"]["8"]:
+        node = Path(f"/dev/davinci{device}").stat()
+        if not stat.S_ISCHR(node.st_mode):
+            raise ContractError("allocated device is not a host character device")
+        mapping.append({"host_device_id": device, "major": os.major(node.st_rdev),
+                        "minor": os.minor(node.st_rdev)})
+    return {"hostname": socket.gethostname(), "device_epoch": profile["device_epoch"],
+            "device_id_domain": "host", "devices": mapping, "kernel": platform.release()}
 
 
 DEVICE_FAULT = re.compile(
@@ -141,8 +383,6 @@ def execute(args, manifest, profile):
     try:
         for case in suite["cases"]:
             validate_allocation(profile, suite["allocation"], case["devices"])
-        if profile["device_epoch"].startswith("set-to-"):
-            raise ContractError("replace the example device epoch with the deployment's actual epoch")
         if profile.get("hostname") and profile["hostname"] != socket.gethostname():
             raise ContractError("this runner is not the configured performance host")
         source_sha = source_identity()
@@ -165,9 +405,6 @@ def execute(args, manifest, profile):
     stop = False
     build_dirs = []
     for case, record in zip(manifest["cases"], suite["cases"], strict=True):
-        if args.model and case["model"] != args.model or args.case and case["case_id"] != args.case:
-            record["status"] = "not_selected"
-            continue
         if stop:
             record["error"] = "allocation stopped after device fault or timeout"
             continue
@@ -178,8 +415,6 @@ def execute(args, manifest, profile):
         command = [sys.executable, str(ROOT / "tools/perf/deterministic_run.py"),
                    "--case", case["case_id"], "--devices", ",".join(map(str, record["devices"])),
                    "--output", str(raw_path)]
-        if args.save_data:
-            command.append("--save-data")
         record.update(status="running", source_sha=source_sha, toolchain=toolchain,
                       device_identity={**host, "selected": record["devices"]},
                       command=command, log=str(log.relative_to(output)))
@@ -194,8 +429,8 @@ def execute(args, manifest, profile):
             record.update(validate_result(raw, case, process_rc=rc))
             record.update(status="pass", fixture_sha256=raw["fixture_sha256"],
                           golden_sha256=raw["golden_sha256"])
-            record["previous"] = comparison(record, prior.get(case["case_id"]), mode="ci_history")
-            record["week"] = comparison(record, week.get(case["case_id"]), mode="ci_history")
+            record["previous"] = comparison(record, prior.get(case["case_id"]))
+            record["week"] = comparison(record, week.get(case["case_id"]))
             if raw.get("work_dir"):
                 build = Path(raw["work_dir"])
                 if not build.is_absolute():
@@ -211,26 +446,21 @@ def execute(args, manifest, profile):
     suite["allocation_stopped"] = stop
     suite["status"] = "pass" if suite["coverage_complete"] else "incomplete"
     checkpoint()
-    if not args.keep_builds and not args.save_data:
-        for case_dir, build in build_dirs:
-            # Delete only successful builds inside this run's private case directory.
-            if build.is_relative_to(case_dir / "build_output") and build != case_dir / "build_output":
-                shutil.rmtree(build)
+    for case_dir, build in build_dirs:
+        # Delete only successful builds inside this run's private case directory.
+        if build.is_relative_to(case_dir / "build_output") and build != case_dir / "build_output":
+            shutil.rmtree(build)
     return 0 if suite["coverage_complete"] else 1
 
 
 def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--device-profile", required=True, type=Path)
+    parser.add_argument("--device-profile", type=Path)
     parser.add_argument("--output-dir", type=Path)
-    parser.add_argument("--model", choices=("mtp", "dspark"))
-    parser.add_argument("--case", choices=sorted(CASE_IDS))
     parser.add_argument("--date", default=datetime.now(timezone(timedelta(hours=8))).date().isoformat())
     parser.add_argument("--baseline", type=Path)
     parser.add_argument("--week-baseline", type=Path)
     parser.add_argument("--case-timeout", type=int, default=3600)
-    parser.add_argument("--keep-builds", action="store_true")
-    parser.add_argument("--save-data", action="store_true")
     parser.add_argument("--dry-run", action="store_true")
     args = parser.parse_args(argv)
     manifest = load_manifest()

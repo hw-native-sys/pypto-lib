@@ -22,11 +22,32 @@ import sys
 # Running as a file must work without an editable install of pypto-lib.
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
-from tools.perf.operator_contract import (
+from tools.perf.run_operator_suite import (
     ContractError, ROOT, SAMPLING, case_arguments, check_specs, devices,
     load_manifest, write_json,
 )
-from tools.perf.operator_results import benchmark_payload
+
+
+def benchmark_payload(stats):
+    """Read the public RunResult.bench data without guessing a log layout."""
+    if stats is None:
+        raise ContractError("benchmark unavailable or skipped")
+    def invocation(item):
+        return {"inv": item.inv, "task": item.task, "effective_us": item.effective_us,
+                "task_name": getattr(item, "task_name", item.task)}
+
+    grid = stats.rounds_dispatches
+    if grid:
+        rounds = [{str(pid): [invocation(item) for item in items] for pid, items in row.items()}
+                  for row in grid]
+    else:
+        # Only the single-card consumer may accept this representation.
+        rounds = [{str(item.pid): [invocation(item)]} for item in stats.invocations]
+    return {"rounds": stats.rounds, "warmup": stats.warmup,
+            "fallback_flattened": stats.fallback_flattened,
+            "unstable_dispatch_slots": getattr(stats, "unstable_dispatch_slots", False),
+            "all_zero_device": stats.all_zero_device, "distributed_grid": bool(grid),
+            "samples": rounds}
 
 
 def tensor_fingerprint(values, specs, direction):
@@ -57,7 +78,7 @@ def describe_specs(specs):
             for spec in specs if hasattr(spec, "shape")]
 
 
-def make_capture(original_run, case, output, selected, *, save_data=False):
+def make_capture(original_run, case, output, selected):
     """Install a process-local observer; model code keeps its own golden/tolerances."""
     calls = 0
 
@@ -90,7 +111,7 @@ def make_capture(original_run, case, output, selected, *, save_data=False):
             payload["golden_sha256"] = tensor_fingerprint(values, specs, "output")
 
         kwargs["golden_fn"] = golden
-        kwargs["save_data"] = save_data
+        kwargs["save_data"] = False
         result = original_run(**kwargs)
         payload.update(passed=result.passed, error=result.error, specs=describe_specs(specs),
                        work_dir=str(result.work_dir) if result.work_dir else None)
@@ -107,7 +128,6 @@ def main():
     parser.add_argument("--case", required=True)
     parser.add_argument("--devices", required=True)
     parser.add_argument("--output", required=True, type=Path)
-    parser.add_argument("--save-data", action="store_true")
     args = parser.parse_args()
     manifest = load_manifest()
     case = next(case for case in manifest["cases"] if case["case_id"] == args.case)
@@ -123,7 +143,7 @@ def main():
     random.seed(SAMPLING["seed"])
     np.random.seed(SAMPLING["seed"])
     torch.manual_seed(SAMPLING["seed"])
-    golden.run = make_capture(golden.run, case, args.output, selected, save_data=args.save_data)
+    golden.run = make_capture(golden.run, case, args.output, selected)
     entry = ROOT / case["entrypoint"]
     sys.path.insert(0, str(entry.parent))
     sys.argv = [str(entry), *case_arguments(case, selected)]

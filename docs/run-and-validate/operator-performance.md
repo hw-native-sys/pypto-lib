@@ -1,9 +1,7 @@
 # Operator performance tracking
 
 The `dsv4-operators` suite measures ten fixed A2/A3 workloads using the environment
-installed by CI's `setup-ci-job` action. A single CI measurement series follows
-the selected PyPTO/lib revisions; it requires no independent bot or
-Control/Candidate environment deployment.
+installed by CI's `setup-ci-job` action.
 
 | Case | Parallelism | Fixed workload |
 | --- | --- | --- |
@@ -30,11 +28,11 @@ compilation. Ring settings are explicit: MTP uses task window/dependency pool
 
 ## Fixed even devices
 
-The [device profile](../../tools/perf/suites/even_devices.example.json) specifies
+The [suite configuration](../../tools/perf/suites/dsv4_operators.json) specifies
 single-device `4`, TP4 `0,2,4,6`, and eight-device `0,2,4,6,8,10,12,14` workloads.
 MTP LM-head uses the first four and last four devices as its two TP4 groups.
-Copy the profile to a run directory and replace its example `device_epoch`.
-An optional `hostname` field rejects execution on another host.
+The embedded `device_profile` defaults to epoch `a2a3-even-v1`. A CI-generated
+`--device-profile` can supply the host name and topology epoch.
 
 The CI job acquires the complete ordered eight-device allocation once, then
 runs the ten cases serially on their fixed subsets. Use this submission prefix:
@@ -57,12 +55,11 @@ a mapping to device IDs. Change the epoch when hardware or topology changes.
 Inspect the workloads without importing PyPTO, Torch or a device runtime:
 
 ```bash
-python -S tools/perf/run_operator_suite.py \
-  --device-profile tools/perf/suites/even_devices.example.json --dry-run
+python -S tools/perf/run_operator_suite.py --dry-run
 ```
 
 Inside the acquired allocation, source CI's `activate.sh`, forward its resolved
-`PYPTO_SRC`, `PTOAS_ROOT`, `PTO_ISA_COMMIT` and `CI_CACHE_ROOT`, and run:
+`PYPTO_SRC`, `PTOAS_ROOT` and `PTO_ISA_COMMIT`, and run:
 
 ```bash
 python tools/perf/run_operator_suite.py \
@@ -71,27 +68,14 @@ python tools/perf/run_operator_suite.py \
 ```
 
 Use a new output directory for every attempt. The activation script supplies
-CANN, the bundle and the job venv. Source-checkout installations outside that
-venv are rejected. CI-generated untracked files such as `activate.sh` do not
-make the source dirty; tracked changes do.
+CANN, the bundle and the job venv.
 
-## CI installation provenance
+## CI environment
 
-The preflight reads the selected PyPTO source and its runtime gitlink, ISA pin
-and PTOAS version. It checks that PyPTO and simpler are imported from the job
-venv and owned by their installed distributions. For cached wheels, their local
-origin must name the selected source tree and, for simpler, the selected ISA.
-The wheel must match the SHA256 in `direct_url.json`. Native libraries, module
-entry files and installed ISA build metadata must match the distribution's
-RECORD hashes. Both required A2/A3 runtime artifacts must declare the selected
-ISA. The CI installer's noneditable source-build fallback is accepted only when
-its origin is the selected checkout, with the same installed-file checks.
-
-This works when a wheel cache hit leaves no `runtime/build/lib` in the source
-checkout. It records the installed native library hashes, source revisions,
-PTOAS executable and version, bundle, Python/Torch/NumPy and CANN/driver metadata.
-It validates the environment and does not repair, rebuild or activate another
-installation.
+The existing `setup-ci-job` action owns installation, pin resolution and import
+validation. The suite records lib, PyPTO, runtime and ISA revisions, PTOAS version,
+bundle, Python/Torch/NumPy versions and CANN/driver metadata hashes for historical
+comparisons. It does not install packages or duplicate CI's wheel validation.
 
 ## Measurement and comparisons
 
@@ -122,8 +106,6 @@ device identity. Python/Torch/NumPy, bundle and CANN/driver changes also start a
 new comparable series. Compiler, runtime, ISA, assembler and lib revisions may
 change: the percentage then describes the **complete CI software stack**, with
 changed components listed. It does not attribute a change to a kernel alone.
-The comparison helper also retains an explicit strict history mode requiring
-identical toolchains for investigations.
 
 ## Failure handling and storage
 
@@ -135,12 +117,11 @@ remaining cases are marked unrun. An incomplete suite exits nonzero.
 
 Results are checkpointed into `suite-result.json` and `report.md`. Each attempted
 case retains `raw-result.json` and its log. A recognized fault or unresolved queue
-completion must not cause an automatic retry. `--model` and `--case` are diagnostic
-filters; they leave an incomplete official ten-case suite.
+completion must not cause an automatic retry. Every run attempts the fixed ten
+cases unless a device fault or timeout stops the allocation.
 
-Default runs hash the inputs and golden in memory rather than saving large
-snapshots. Successful private builds are removed after reporting. `--keep-builds`
-and `--save-data` are explicit diagnostic options and need a retention policy.
+Runs hash inputs and golden in memory without saving tensor snapshots.
+Successful private builds are removed after reporting.
 CI should upload only reports, JSON and logs, then remove the invocation's private
 build directory. It must never upload model weights or build trees as history.
 

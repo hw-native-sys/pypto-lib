@@ -15,6 +15,32 @@
     "dispatch_policy": "sum_all_stable_dispatches",
     "includes_signal_cleanup": true
   },
+  "device_profile": {
+    "schema_version": 1,
+    "device_epoch": "a2a3-even-v1",
+    "device_id_domain": "host",
+    "sequences": {
+      "1": [
+        4
+      ],
+      "4": [
+        0,
+        2,
+        4,
+        6
+      ],
+      "8": [
+        0,
+        2,
+        4,
+        6,
+        8,
+        10,
+        12,
+        14
+      ]
+    }
+  },
   "cases": [
     {
       "case_id": "mtp-attention-csa",

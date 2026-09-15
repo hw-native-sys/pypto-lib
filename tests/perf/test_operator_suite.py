@@ -8,20 +8,25 @@
 # -----------------------------------------------------------------------------------------------------------
 """Exercise allocation, raw evidence and failure reporting without a device."""
 
+import ast
+import dataclasses
 import json
 import os
 from pathlib import Path
 import subprocess
 import sys
 from types import SimpleNamespace
+from unittest.mock import Mock
 
 import pytest
+import torch
 
-from tools.perf.operator_contract import (
+from golden import TensorSpec
+from tools.perf.deterministic_run import benchmark_payload, make_capture
+from tools.perf.run_operator_suite import (
     ContractError, ROOT, SAMPLING, case_arguments, devices, load_manifest,
-    load_profile, validate_allocation, write_json,
+    comparison, load_profile, validate_allocation, validate_result, write_json,
 )
-from tools.perf.operator_results import benchmark_payload, comparison, validate_result
 from tools.perf import run_operator_suite as runner
 
 
@@ -32,7 +37,7 @@ def manifest():
 
 @pytest.fixture
 def profile():
-    value = load_profile(ROOT / "tools/perf/suites/even_devices.example.json")
+    value = load_profile()
     value["device_epoch"] = "test-host-epoch-1"
     return value
 
@@ -96,7 +101,7 @@ def test_allocation_subsets_preserve_task_device(profile):
 
 def test_dry_run_without_site_packages():
     command = [sys.executable, "-S", str(ROOT / "tools/perf/run_operator_suite.py"),
-               "--device-profile", str(ROOT / "tools/perf/suites/even_devices.example.json"), "--dry-run"]
+               "--dry-run"]
     result = subprocess.run(command, capture_output=True, text=True, check=True)
     plan = json.loads(result.stdout)
     assert len(plan["cases"]) == 10
@@ -167,20 +172,6 @@ def test_public_benchmark_grid_preserves_invocations():
     assert benchmark_payload(stats)["distributed_grid"] is False
 
 
-def test_comparison_identity_and_sign():
-    baseline = {"status": "pass", "metric_us": 100, "run_id": "prior", "case_contract": "v1",
-                "device_identity": {"epoch": 1}, "toolchain": {"pypto": "a"}, "source_sha": "lib1",
-                "fixture_sha256": "input", "golden_sha256": "output"}
-    current = {**baseline, "metric_us": 110, "source_sha": "lib2"}
-    assert comparison(current, baseline)["delta_pct"] == pytest.approx(10)
-    for key in ("case_contract", "device_identity", "toolchain", "fixture_sha256", "golden_sha256"):
-        assert comparison({**current, key: "different"}, baseline)["delta_pct"] is None
-    assert comparison(current, baseline, mode="toolchain")["delta_pct"] is None
-    assert comparison({**current, "source_sha": "lib1", "toolchain": {"pypto": "new"}}, baseline,
-                      mode="toolchain")["delta_pct"] == pytest.approx(10)
-    assert comparison(current, None)["delta_pct"] is None
-
-
 @pytest.mark.parametrize("failure", [None, "precision", "device"])
 def test_runner_partial_results_and_device_fault_stop(tmp_path, monkeypatch, manifest, profile, failure):
     monkeypatch.setenv("TASKQUEUE_INSIDE", "1")
@@ -206,9 +197,8 @@ def test_runner_partial_results_and_device_fault_stop(tmp_path, monkeypatch, man
         return (1 if fail else 0), False
 
     monkeypatch.setattr(runner, "run_process", process)
-    args = SimpleNamespace(output_dir=tmp_path / "run", date="2026-09-14", variant="candidate",
-                           model=None, case=None, baseline=None, week_baseline=None, case_timeout=1,
-                           keep_builds=False, save_data=False)
+    args = SimpleNamespace(output_dir=tmp_path / "run", date="2026-09-14",
+                           baseline=None, week_baseline=None, case_timeout=1)
     rc = runner.execute(args, manifest, profile)
     suite = json.loads((args.output_dir / "suite-result.json").read_text())
     assert len(suite["cases"]) == 10
@@ -246,13 +236,152 @@ def test_ci_history_exposes_stack_changes_but_rejects_system_or_device_changes()
                 "case_contract": "case", "fixture_sha256": "input", "golden_sha256": "golden",
                 "device_identity": {"hostname": "host1"}, "toolchain": {**system, "pypto": "old"}}
     current = {**baseline, "metric_us": 110, "source_sha": "new-lib", "toolchain": {**system, "pypto": "new"}}
-    result = comparison(current, baseline, mode="ci_history")
+    result = comparison(current, baseline)
     assert result["delta_pct"] == pytest.approx(10)
     assert result["scope"] == "ci_stack"
     assert result["changed_components"] == ["pypto-lib", "pypto"]
-    assert comparison(current, baseline)["delta_pct"] is None
+    assert comparison(current, None)["delta_pct"] is None
+    assert comparison({**current, "status": "fail"}, baseline)["delta_pct"] is None
+    for key in ("case_contract", "fixture_sha256", "golden_sha256"):
+        assert comparison({**current, key: "different"}, baseline)["delta_pct"] is None
     for key in system:
         changed = {**current, "toolchain": {**current["toolchain"], key: "other"}}
-        assert comparison(changed, baseline, mode="ci_history")["delta_pct"] is None
+        assert comparison(changed, baseline)["delta_pct"] is None
     current["device_identity"] = {"hostname": "host2"}
-    assert comparison(current, baseline, mode="ci_history")["delta_pct"] is None
+    assert comparison(current, baseline)["delta_pct"] is None
+
+
+def test_ci_versions_need_no_source_build_or_wheel_metadata(tmp_path, monkeypatch):
+    cann = tmp_path / "cann"
+    info = cann / "aarch64-linux/ascend_toolkit_install.info"
+    info.parent.mkdir(parents=True)
+    info.write_text("version=9.0\n")
+    driver = tmp_path / "driver.info"
+    driver.write_text("driver=v1\n")
+    source = tmp_path / "source"
+    for key, value in {"PYPTO_SRC": str(source), "PTO_ISA_COMMIT": "isa-revision",
+                       "PTOAS_ROOT": str(tmp_path / "assembler"), "ASCEND_HOME_PATH": str(cann),
+                       "PYPTO_TOOLCHAIN": "/opt/pypto/toolchain/test-bundle"}.items():
+        monkeypatch.setenv(key, value)
+    monkeypatch.setattr(runner, "command", lambda argv, cwd=None:
+                        "ptoas 0.61" if cwd is None else "runtime-revision" if cwd.name == "runtime" else "pypto-revision")
+    versions = runner.capture_toolchain(driver)
+    assert versions["pypto"] == "pypto-revision"
+    assert versions["runtime"] == "runtime-revision"
+    assert versions["pto_isa"] == "isa-revision"
+    assert versions["ptoas_version"] == "ptoas 0.61"
+    assert versions["bundle"] == "test-bundle"
+    assert versions["torch"] and versions["numpy"]
+    assert not source.exists()
+    driver.write_text("driver=v2\n")
+    assert runner.capture_toolchain(driver)["driver_sha256"] != versions["driver_sha256"]
+
+
+def function_from_source(path, name, namespace):
+    tree = ast.parse(path.read_text())
+    fn = next(node for node in tree.body if isinstance(node, ast.FunctionDef) and node.name == name)
+    fn.decorator_list = []
+    fn.returns = None
+    for arg in fn.args.args:
+        arg.annotation = None
+    module = ast.fix_missing_locations(ast.Module(body=[fn], type_ignores=[]))
+    exec(compile(module, str(path), "exec"), namespace)
+    return namespace[name]
+
+
+@pytest.mark.parametrize("ep", [2, 4, 8])
+@pytest.mark.parametrize("local", [None, 16, 32])
+def test_moe_specializes_before_subkernel_imports(ep, local, monkeypatch):
+    path = ROOT / "models/deepseek_v4_flash_mtp/moe.py"
+    tree = ast.parse(path.read_text())
+    prefix = []
+    for node in tree.body:
+        if isinstance(node, ast.Import) and node.names[0].name.startswith("pypto"):
+            break
+        prefix.append(node)
+    @dataclasses.dataclass(frozen=True)
+    class Config:
+        n_routed_experts: int = 256
+    import sys
+    cfg = SimpleNamespace(FLASH=Config(), MOE_TOKENS=8)
+    monkeypatch.setitem(sys.modules, "config", cfg)
+    args = [str(path), "--ep", str(ep)]
+    if local is not None:
+        args += [f"--experts-per-rank={local}"]
+    monkeypatch.setattr(sys, "argv", args)
+    namespace = {}
+    exec(compile(ast.Module(body=prefix, type_ignores=[]), str(path), "exec"), namespace)
+    assert cfg.EP_WORLD_SIZE == ep
+    assert cfg.FLASH.n_routed_experts == ep * (32 if local is None else local)
+    assert cfg.RECV_MAX == ep * 8
+
+
+def test_projection_host_uses_two_tp4_groups():
+    calls = Mock()
+    namespace = {
+        "WORLD_SIZE": 8, "TEST_TOKENS": 2, "D": 4, "VOCAB_PER_TP": 3,
+        "MAX_LOGIT_ROWS": 2, "VOCAB": 12, "GROUP_LOGIT_ROWS": 8, "TP_SIZE": 4, "DONE_VALUE": 1,
+        "pl": SimpleNamespace(range=range, BF16="bf16", FP32="fp32", INT32="int32"),
+        "pld": SimpleNamespace(alloc_window_buffer=lambda *args: object(), world_size=lambda: 8,
+                               window=lambda *args, **kwargs: object()),
+        "lm_head_test": calls,
+    }
+    fn = function_from_source(ROOT / "models/deepseek_v4_flash_mtp/lm_head.py",
+                              "l3_lm_head_projection", namespace)
+    fn(torch.zeros(8, 2, 4), torch.zeros(8, 3, 4), torch.zeros(8, 2, 12), torch.zeros(8, 2))
+    assert calls.call_count == 8
+    for rank, call in enumerate(calls.call_args_list):
+        assert call.kwargs == {"device": rank}
+        assert call.args[-3:] == (rank // 4 * 4, rank % 4, 1)
+
+
+def test_projection_golden_does_not_require_sampling_inputs():
+    sample = Mock(side_effect=AssertionError("sampling must not run"))
+    namespace = {"TP_SIZE": 2, "MAX_LOGIT_ROWS": 2, "D": 3, "golden_sample": sample}
+    fn = function_from_source(ROOT / "models/deepseek_v4_flash_mtp/lm_head.py", "golden_lm_head", namespace)
+    hidden = torch.arange(12, dtype=torch.float32).reshape(2, 2, 3)
+    weight = torch.arange(12, dtype=torch.float32).reshape(2, 2, 3)
+    values = {"hidden_states": hidden, "lm_head_weight": weight,
+              "logit_row_indices": torch.tensor([[1, -1], [0, 1]]), "logits": torch.zeros(2, 2, 4)}
+    fn(values)
+    full_weight = weight.reshape(4, 3)
+    torch.testing.assert_close(values["logits"][0, 0], hidden[0, 1] @ full_weight.T)
+    assert torch.equal(values["logits"][0, 1], torch.zeros(4))
+    sample.assert_not_called()
+
+
+def test_capture_preserves_numerics_and_hashes_actual_inputs(tmp_path):
+    case = {"case_id": "small", "required_specs": {"out": {"shape": [2], "dtype": "torch.float32"}}}
+    cfg = {"device_id": 4, "platform": "a2a3"}
+    compare = {"out": object()}
+    def original(**kwargs):
+        assert kwargs["rtol"] == 0.001
+        assert kwargs["atol"] == 0.002
+        assert kwargs["compare_fn"] is compare
+        assert kwargs["config"] == cfg
+        assert kwargs["save_data"] is False
+        specs = kwargs["specs"]
+        specs[0].direction = "in"
+        specs[1].direction = "out"
+        values = {"inp": specs[0].create_tensor(), "out": torch.zeros(2)}
+        kwargs["golden_fn"](values)
+        torch.testing.assert_close(values["out"], values["inp"] * 2)
+        # Failed correctness retains hashes but cannot gain a valid metric.
+        return SimpleNamespace(passed=False, error="deliberate", work_dir=None)
+
+    hashes = []
+    for value in (1, 1, 2):
+        specs = [TensorSpec("inp", [2], torch.float32, init_value=value),
+                 TensorSpec("out", [2], torch.float32)]
+        output = tmp_path / f"capture-{len(hashes)}.json"
+        observer = make_capture(original, case, output, [4])
+        kwargs = dict(specs=specs, config=cfg, rtol=0.001, atol=0.002, compare_fn=compare,
+                      golden_fn=lambda values: values["out"].copy_(values["inp"] * 2))
+        observer(**kwargs)
+        payload = json.loads(output.read_text())
+        assert payload["passed"] is False and "benchmark" not in payload
+        hashes.append(payload["fixture_sha256"])
+        with pytest.raises(ContractError):
+            observer(**kwargs)
+        assert not output.exists()
+    assert hashes[0] == hashes[1] != hashes[2]
