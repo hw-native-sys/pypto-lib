@@ -36,7 +36,6 @@ from decode_swa import (
     O_GROUP_IN,
     O_LORA,
     ORI_BLOCK_NUM,
-    ORI_MAX_BLOCKS,
     ORI_TABLE_MAX_BLOCKS,
     Q_LORA,
     ROPE_HEAD_DIM,
@@ -61,7 +60,6 @@ from decode_hca import (
     attention_hca,
     prepare_hca_metadata,
     HCA_ROPE_ROWS,
-    HCA_CMP_TOPK,
     build_tensor_specs as build_hca_tensor_specs,
     golden_attention_hca,
 )
@@ -260,19 +258,19 @@ def decode_layer(
         rope_sin_t = pl.create_tensor([T, ROPE_HEAD_DIM], dtype=pl.BF16)
         cmp_cos_il = pl.create_tensor([B, ROPE_HEAD_DIM], dtype=pl.FP32)
         cmp_sin_signed = pl.create_tensor([B, ROPE_HEAD_DIM], dtype=pl.FP32)
-        topk_all = pl.create_tensor([T, HCA_CMP_TOPK], dtype=pl.INT32)
+        cmp_seq_lens = pl.create_tensor([T], dtype=pl.INT32)
         q_rope_cos_il = pl.create_tensor([T, ROPE_HEAD_DIM], dtype=pl.FP32)
         q_rope_sin_signed = pl.create_tensor([T, ROPE_HEAD_DIM], dtype=pl.FP32)
         q_rope_swap_idx = pl.create_tensor([T, ROPE_HEAD_DIM], dtype=pl.INT32)
         out_rope_cos_il = pl.create_tensor([T, ROPE_HEAD_DIM], dtype=pl.FP32)
         out_rope_sin_signed = pl.create_tensor([T, ROPE_HEAD_DIM], dtype=pl.FP32)
         out_rope_swap_idx = pl.create_tensor([HCA_ROPE_ROWS, ROPE_HEAD_DIM], dtype=pl.INT32)
-        prepare_hca_metadata(freqs_cos, freqs_sin, position_ids, kv_seq_lens, rope_cos_t, rope_sin_t, cmp_cos_il, cmp_sin_signed, topk_all, q_rope_cos_il, q_rope_sin_signed, q_rope_swap_idx, out_rope_cos_il, out_rope_sin_signed, out_rope_swap_idx)
+        prepare_hca_metadata(freqs_cos, freqs_sin, position_ids, kv_seq_lens, rope_cos_t, rope_sin_t, cmp_cos_il, cmp_sin_signed, cmp_seq_lens, q_rope_cos_il, q_rope_sin_signed, q_rope_swap_idx, out_rope_cos_il, out_rope_sin_signed, out_rope_swap_idx)
         attention_hca(
             x_hc, gate_w,
             hc_attn_fn, hc_attn_scale, hc_attn_base,
             attn_norm_w, wq_a, wq_b, wq_b_scale,
-            wkv, gamma_cq, gamma_ckv, rope_cos_t, rope_sin_t, cmp_cos_il, cmp_sin_signed, topk_all,
+            wkv, gamma_cq, gamma_ckv, rope_cos_t, rope_sin_t, cmp_cos_il, cmp_sin_signed, cmp_seq_lens,
             hca_cmp_wkv, hca_cmp_wgate, hca_cmp_ape, hca_cmp_norm_w,
             hca_compress_state, hca_compress_state_block_table,
             kv_cache, hca_cmp_kv, hca_cmp_block_table,
@@ -791,7 +789,7 @@ def build_tensor_specs(start_pos=DECODE_START_POS, layer_id=10):
     }[attention_kind]
 
     def init_block_table():
-        return block_table(batch=B, table_blocks=ORI_TABLE_MAX_BLOCKS, physical_blocks=ORI_MAX_BLOCKS)
+        return block_table(batch=B, table_blocks=ORI_TABLE_MAX_BLOCKS, physical_blocks=ORI_BLOCK_NUM)
 
     replicated_attention = {
         "hc_attn_fn",
@@ -1009,6 +1007,9 @@ if __name__ == "__main__":
     parser.add_argument("--save-data", action="store_true", default=False,
                         help="persist inputs and golden outputs for replay")
     parser.add_argument("--dump-passes", action="store_true", default=False)
+    from config import CONTEXT_CAPACITY
+
+    parser.add_argument("--max-seq-len", type=int, default=CONTEXT_CAPACITY, help="import-time context capacity (default 1048576)")
     args = parser.parse_args()
 
     device_ids = [int(d) for d in args.device.split(",")]

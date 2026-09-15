@@ -100,7 +100,7 @@ HCA_CMP_TOPK = HCA_SPARSE_CMP_TOPK
 # tiling
 SPARSE_ROPE_TILE = 16
 SPARSE_ROPE_INTERLEAVE_TILE = 2 * SPARSE_ROPE_TILE
-HCA_TOPK_TOKEN_TILE = 8   # tokens per cache-window topk SPMD block
+HCA_LENGTH_TOKEN_TILE = 8
 HCA_WB_TOKEN_TILE = 8  # tokens per cache-writeback SPMD block
 
 
@@ -126,7 +126,7 @@ def prepare_hca_metadata(
     rope_sin_t: pl.Out[pl.Tensor[[T, ROPE_HEAD_DIM], pl.BF16]],
     cmp_cos_il: pl.Out[pl.Tensor[[B, ROPE_HEAD_DIM], pl.FP32]],
     cmp_sin_signed: pl.Out[pl.Tensor[[B, ROPE_HEAD_DIM], pl.FP32]],
-    topk_all: pl.Out[pl.Tensor[[T, HCA_CMP_TOPK], pl.INT32]],
+    cmp_seq_lens: pl.Out[pl.Tensor[[T], pl.INT32]],
     q_rope_cos_il: pl.Out[pl.Tensor[[T, ROPE_HEAD_DIM], pl.FP32]],
     q_rope_sin_signed: pl.Out[pl.Tensor[[T, ROPE_HEAD_DIM], pl.FP32]],
     q_rope_swap_idx: pl.Out[pl.Tensor[[T, ROPE_HEAD_DIM], pl.INT32]],
@@ -156,25 +156,15 @@ def prepare_hca_metadata(
 
     rope_interleave(cmp_cos, cmp_sin, cmp_cos_il, cmp_sin_signed)
 
-    for topk_block in pl.spmd(
-        T // HCA_TOPK_TOKEN_TILE, name_hint="hca_cache_topk", allow_early_resolve=True
-    ):
-        topk_t0 = topk_block * HCA_TOPK_TOKEN_TILE
-        for topk_dt in pl.range(HCA_TOPK_TOKEN_TILE):
-            topk_t = topk_t0 + topk_dt
-            if topk_t < T:
-                topk_b = topk_t // S
-                topk_abs_pos = pl.read(position_ids, [topk_t])
-
-                topk_cmp_valid = pl.min(
-                    HCA_TOPK_LIMIT,
-                    pl.min((topk_abs_pos + 1) // COMPRESS_RATIO, pl.read(kv_seq_lens, [topk_b]) // COMPRESS_RATIO),
-                )
-                for topk_ck in pl.range(HCA_CMP_TOPK):
-                    if topk_ck < topk_cmp_valid:
-                        pl.write(topk_all, [topk_t, topk_ck], pl.cast(topk_ck, pl.INT32))
-                    else:
-                        pl.write(topk_all, [topk_t, topk_ck], pl.cast(-1, pl.INT32))
+    for length_block in pl.spmd(T // HCA_LENGTH_TOKEN_TILE, name_hint="hca_lengths", allow_early_resolve=True):
+        length_t0 = length_block * HCA_LENGTH_TOKEN_TILE
+        for length_dt in pl.range(HCA_LENGTH_TOKEN_TILE):
+            length_t = length_t0 + length_dt
+            length_b = length_t // S
+            length_pos = pl.read(position_ids, [length_t])
+            length_kv = pl.read(kv_seq_lens, [length_b])
+            length_valid = pl.min(HCA_TOPK_LIMIT, pl.min((length_pos + 1) // COMPRESS_RATIO, length_kv // COMPRESS_RATIO))
+            pl.write(cmp_seq_lens, [length_t], pl.cast(pl.max(length_valid, 0), pl.INT32))
     prepare_qkv_rope_metadata(rope_cos_t, rope_sin_t, q_rope_cos_il, q_rope_sin_signed, q_rope_swap_idx)
     prepare_hca_output_rope(rope_cos_t, rope_sin_t, out_rope_cos_il, out_rope_sin_signed, out_rope_swap_idx)
 
@@ -199,7 +189,7 @@ def attention_hca(
     rope_sin_t: pl.Tensor[[T, ROPE_HEAD_DIM], pl.BF16],
     cmp_cos_il: pl.Tensor[[B, ROPE_HEAD_DIM], pl.FP32],
     cmp_sin_signed: pl.Tensor[[B, ROPE_HEAD_DIM], pl.FP32],
-    topk_all: pl.Tensor[[T, HCA_CMP_TOPK], pl.INT32],
+    cmp_seq_lens: pl.Tensor[[T], pl.INT32],
     # main compressor (head_dim=HEAD_DIM, ratio=128, overlap=False)
     cmp_wkv: pl.Tensor[[MAIN_OUT_DIM, D], pl.BF16],
     cmp_wgate: pl.Tensor[[MAIN_OUT_DIM, D], pl.BF16],
@@ -304,7 +294,7 @@ def attention_hca(
     o_packed = pl.create_tensor([O_GROUPS * T, O_GROUP_IN], dtype=pl.BF16)
     merge_tid = sparse_attn_hca_packed(
         q, kv_cache, window_swa_indices, window_swa_lens,
-        cmp_kv, cmp_block_table, topk_all,
+        cmp_kv, cmp_block_table, cmp_seq_lens,
         attn_sink, rope_cos_t, rope_sin_t, o_packed, my_rank, out_rope_cos_il, out_rope_sin_signed, out_rope_swap_idx,
     )
     o_proj_tp_core(
@@ -384,19 +374,19 @@ def attention_hca_test(
     rope_sin_t = pl.create_tensor([T, ROPE_HEAD_DIM], dtype=pl.BF16)
     cmp_cos_il = pl.create_tensor([B, ROPE_HEAD_DIM], dtype=pl.FP32)
     cmp_sin_signed = pl.create_tensor([B, ROPE_HEAD_DIM], dtype=pl.FP32)
-    topk_all = pl.create_tensor([T, HCA_CMP_TOPK], dtype=pl.INT32)
+    cmp_seq_lens = pl.create_tensor([T], dtype=pl.INT32)
     q_rope_cos_il = pl.create_tensor([T, ROPE_HEAD_DIM], dtype=pl.FP32)
     q_rope_sin_signed = pl.create_tensor([T, ROPE_HEAD_DIM], dtype=pl.FP32)
     q_rope_swap_idx = pl.create_tensor([T, ROPE_HEAD_DIM], dtype=pl.INT32)
     out_rope_cos_il = pl.create_tensor([T, ROPE_HEAD_DIM], dtype=pl.FP32)
     out_rope_sin_signed = pl.create_tensor([T, ROPE_HEAD_DIM], dtype=pl.FP32)
     out_rope_swap_idx = pl.create_tensor([HCA_ROPE_ROWS, ROPE_HEAD_DIM], dtype=pl.INT32)
-    prepare_hca_metadata(freqs_cos, freqs_sin, position_ids, kv_seq_lens, rope_cos_t, rope_sin_t, cmp_cos_il, cmp_sin_signed, topk_all, q_rope_cos_il, q_rope_sin_signed, q_rope_swap_idx, out_rope_cos_il, out_rope_sin_signed, out_rope_swap_idx)
+    prepare_hca_metadata(freqs_cos, freqs_sin, position_ids, kv_seq_lens, rope_cos_t, rope_sin_t, cmp_cos_il, cmp_sin_signed, cmp_seq_lens, q_rope_cos_il, q_rope_sin_signed, q_rope_swap_idx, out_rope_cos_il, out_rope_sin_signed, out_rope_swap_idx)
     attention_hca(
         x_hc, gate_w,
         hc_attn_fn, hc_attn_scale, hc_attn_base,
         attn_norm_w, wq_a, wq_b, wq_b_scale, wkv, gamma_cq, gamma_ckv,
-        rope_cos_t, rope_sin_t, cmp_cos_il, cmp_sin_signed, topk_all,
+        rope_cos_t, rope_sin_t, cmp_cos_il, cmp_sin_signed, cmp_seq_lens,
         cmp_wkv, cmp_wgate, cmp_ape, cmp_norm_w,
         compress_state, compress_state_block_table,
         kv_cache, cmp_kv, cmp_block_table,
@@ -728,7 +718,7 @@ def build_tensor_specs(start_pos=None):
         )
 
     def init_window_block_table():
-        return block_table(batch=B, table_blocks=ORI_TABLE_MAX_BLOCKS, physical_blocks=ORI_MAX_BLOCKS)
+        return block_table(batch=B, table_blocks=ORI_TABLE_MAX_BLOCKS, physical_blocks=ORI_BLOCK_NUM)
 
     def init_cmp_block_table():
         return block_table(
@@ -797,8 +787,8 @@ def build_tensor_specs(start_pos=None):
     wo_b_i8, wo_b_scale = quant_w_per_row(wo_b_bf16)
 
     return [
-        TensorSpec("gate_w", [N_EXPERTS, D], torch.float32, init_value=lambda: torch.empty([N_EXPERTS, D], dtype=torch.float32).uniform_(-0.1, 0.1)),
         TensorSpec("x_hc", [T, HC_MULT, D], torch.float32, init_value=init_x_hc),
+        TensorSpec("gate_w", [N_EXPERTS, D], torch.float32, init_value=lambda: torch.empty([N_EXPERTS, D], dtype=torch.float32).uniform_(-0.1, 0.1)),
         TensorSpec("hc_attn_fn", [MIX_HC, HC_DIM], torch.float32, init_value=init_hc_attn_fn),
         TensorSpec("hc_attn_scale", [3], torch.float32, init_value=init_hc_attn_scale),
         TensorSpec("hc_attn_base", [MIX_HC], torch.float32, init_value=init_hc_attn_base),
@@ -916,6 +906,9 @@ if __name__ == "__main__":
     parser.add_argument("--golden-data", type=str, default=None)
     parser.add_argument("--dump-passes", action="store_true", default=False)
     parser.add_argument("--compile-only", action="store_true", default=False)
+    from config import CONTEXT_CAPACITY
+
+    parser.add_argument("--max-seq-len", type=int, default=CONTEXT_CAPACITY, help="import-time context capacity (default 1048576)")
     args = parser.parse_args()
 
     device_ids = [int(d) for d in args.device.split(",")]

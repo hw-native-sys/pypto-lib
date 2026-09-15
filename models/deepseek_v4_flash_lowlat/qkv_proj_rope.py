@@ -502,15 +502,22 @@ def golden_qkv_proj_rope(tensors):
     kv_rope = apply_rope(kv_rope_in, rope_cos, rope_sin).squeeze(1)
     kv_out = torch.cat([kv_nope, kv_rope], dim=-1)
 
-    # The kernel writes one head group only; the rest of q keeps its zero init.
-    q_out_sharded = torch.zeros_like(q_out)
-    h0 = TEST_Q_HEAD_BASE
-    q_out_sharded[:, h0 : h0 + Q_HEADS_LOCAL] = q_out[:, h0 : h0 + Q_HEADS_LOCAL]
-
-    tensors["q"][:]  = q_out_sharded.to(torch.bfloat16)
+    tensors["q"][:]  = q_out.to(torch.bfloat16)
     tensors["kv"][:] = kv_out.to(torch.bfloat16)
     tensors["qr"][:] = qr_i8
     tensors["qr_scale"][:] = qr_scale
+
+
+def golden_qkv_proj_rope_test(tensors):
+    """Torch reference for the standalone entry: all heads, then keep one head group."""
+    import torch
+
+    golden_qkv_proj_rope(tensors)
+    # The kernel writes one head group only; the rest of q keeps its zero init.
+    h0 = TEST_Q_HEAD_BASE
+    q_group = tensors["q"][:, h0 : h0 + Q_HEADS_LOCAL].clone()
+    tensors["q"][:] = torch.zeros_like(tensors["q"])
+    tensors["q"][:, h0 : h0 + Q_HEADS_LOCAL] = q_group
 
 
 def build_tensor_specs(B, S):
@@ -595,7 +602,7 @@ if __name__ == "__main__":
         result = run_jit(
             fn=qkv_proj_rope_test,
             specs=build_tensor_specs(B, S),
-            golden_fn=golden_qkv_proj_rope,
+            golden_fn=golden_qkv_proj_rope_test,
             # W8A8C16 q_proj adds INT8 quant/dequant round-off before per-head RMSNorm.
             rtol=5e-3,
             atol=5e-3,

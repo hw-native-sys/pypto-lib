@@ -9,7 +9,7 @@ tracked runnable set.
 | [qwen3_14b](qwen3_14b/index.md) | Qwen3-14B BF16 prefill and decode with the serving contract, plus A8W8 and TurboQuant variants and the sampling components | Supported — one-card A2/A3 accuracy |
 | [deepseek_v4_flash_mtp](deepseek_v4_flash_mtp/index.md) | DeepSeek V4-Flash at MTP = 1, batch 4 per card: operators, layer and MTP compositions, prefill/decode full forwards | Supported — eight-card accuracy job on relevant PRs |
 | [deepseek_v4_flash_dspark](deepseek_v4_flash_dspark/index.md) | The same V4-Flash checkpoint at batch 64 per card and S = 8 DSpark speculation, with TP-sharded DSA-CP attention; under development | Not supported |
-| `deepseek_v4_flash_lowlat` | The V4-Flash decode path at batch 1, S = 8 DSpark speculation, world 8: replicated attention, tensor-parallel MoE, embedding and LM head; under development, decode only | Not supported |
+| `deepseek_v4_flash_lowlat` | The V4-Flash decode path at batch 1, S = 8 DSpark speculation, world 8, and default context capacity 1,048,576: replicated attention, tensor-parallel MoE, embedding and LM head; under development, decode only | Not supported |
 | [deepseek_v4_1_flash](deepseek_v4_1_flash/index.md) | DeepSeek V4.1 Flash TP4/DP2/EP8 scaffold with low-bit SWA/C2A/C1A caches, hierarchical indexer, mHC, and MoE | Not supported |
 | [glm5_3_flash](glm5_3_flash/index.md) | GLM-5.3-Flash on a2a3 at TP16/EP16 with W8A8 INT8: the hybrid KDA + NoPE-MLA backbone, the kpool DSA indexer, mHC and MoE. Staging area — configuration, goldens and kernel ABIs only | Not supported |
 

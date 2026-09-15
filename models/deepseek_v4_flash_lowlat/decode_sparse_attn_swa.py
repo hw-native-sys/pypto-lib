@@ -328,10 +328,16 @@ def sparse_attn_swa(
     rope_sin_signed = pl.create_tensor([T, ROPE_DIM], dtype=pl.FP32)
     rope_swap_idx = pl.create_tensor([H_TILE, ROPE_DIM], dtype=pl.INT32)
     prepare_swa_output_rope(freqs_cos, freqs_sin, rope_cos_il, rope_sin_signed, rope_swap_idx)
-    merge_tid = sparse_attn_swa_packed(
-        q, ori_kv, swa_indices, swa_lens, sparse_bias, attn_sink,
-        freqs_cos, freqs_sin, o_packed, pl.const(0, pl.INT32), rope_cos_il, rope_sin_signed, rope_swap_idx,
-    )
+    # The packed attention is head-sharded: one call writes group `my_rank`'s heads
+    # only, while the replicated projection reads every group, so run it per group.
+    merge_tids = pl.array.create(O_GROUPS, pl.TASK_ID)
+    for g in pl.range(O_GROUPS):
+        g_tid = sparse_attn_swa_packed(
+            q, ori_kv, swa_indices, swa_lens, sparse_bias, attn_sink,
+            freqs_cos, freqs_sin, o_packed, pl.cast(g, pl.INT32), rope_cos_il, rope_sin_signed, rope_swap_idx,
+        )
+        merge_tids[g] = g_tid
+    merge_tid = pl.system.task_dummy(deps=[merge_tids])
     o_proj_grouped(o_packed, merge_tid, wo_a, wo_b, wo_b_scale, attn_out)
     return attn_out
 
