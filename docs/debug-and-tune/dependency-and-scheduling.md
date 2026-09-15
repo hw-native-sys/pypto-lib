@@ -380,7 +380,7 @@ Everything above describes the machine. This section is the method: a loop that
 turns a level-4 capture into a shorter schedule, one question at a time.
 
 ```text
-1. find the Observed critical path        ── only its tasks can shorten the makespan
+1. find the Observed critical path        ── inspect its tasks, gaps and resource blockers
 2. split every gap on that path           ── FIN detect | undispatched | pickup
 3. flag the producers of a gapped task    ── allow_early_resolve=True on each one
 4. prove the task was actually staged     ── dispatch < producer FIN, per block
@@ -390,8 +390,9 @@ turns a level-4 capture into a shorter schedule, one question at a time.
 
 **1. Find the path.** Reconstruct the Observed critical path from the capture
 (see [Reconstructing the critical path](#reconstructing-the-critical-path)).
-Only tasks on that path can shorten the makespan; time spent on anything else
-is slack until the path itself moves.
+Start with the tasks and gaps on that path. When a gap names a resource
+predecessor, inspect the competing work as well: changing its placement can
+shorten the path without removing a data dependency.
 
 **2. Split every gap on the path.** A gap is not one thing — it is producer-FIN
 detection, ready-but-undispatched scheduler delay, or post-dispatch pickup, and
@@ -420,6 +421,14 @@ c ──► a     on the critical path — wants the early window
 Adding an **unflagged** dummy predecessor to `b` makes `b` structurally
 ineligible and leaves the window to `a`. Add it to `b` only — never to `a`, and
 never to the shared producer `c`, which would delay both.
+
+The diagram covers a `data-wait` edge. A sibling can instead appear on the
+Observed path as a **resource predecessor**: it occupied the core before `a`
+without producing data for `a`. Path membership alone does not rule out
+suppressing that sibling. Use the separate
+[resource-predecessor checks](#suppressing-a-resource-predecessor) below; an
+automatic helper restricted to adjacent data-wait edges does not validate
+this case.
 
 **6. Re-measure, then re-derive the path.** Shortening the head of a path
 usually moves the path. Judge the change on wall time from an unprofiled
@@ -544,9 +553,9 @@ rms_norm"* — and it costs a dispatch to buy the ordering.
 The fourth form is step 5 of the loop: an **unflagged** dummy predecessor makes
 its consumer structurally ineligible for early dispatch — it breaks condition 1
 above — which is how a non-critical sibling is pushed out of a speculative
-window a critical-path task needs. No model in this tree currently ships one,
-because it is a scheduling experiment rather than a structural requirement: it
-is defensible only with before/after level-4 evidence that the sibling stopped
+window a critical-path task needs. The low-latency CSA path uses this form for
+its KV siblings. It is defensible only with before/after level-4 evidence
+that the sibling stopped
 being staged *and* the protected task started, plus a wall-time result. Keep
 `deps=` empty — `task_dummy(deps=[c_tid])` adds a real hop after `c` and tests
 something else entirely.
@@ -554,6 +563,60 @@ something else entirely.
 `task_dummy` accepts only `deps=`; it cannot itself carry
 `allow_early_resolve`. All of these trade throughput for ordering, none changes
 results, and none is justified without a before/after measurement.
+
+### Suppressing a resource predecessor
+
+First establish that the Observed link from sibling `b` to protected task `a`
+is a same-core/resource wait, and that `b` is **not a direct or transitive
+data predecessor** of `a`. Identify their shared direct producer `c`, then retain
+every real predecessor and `b`'s own `allow_early_resolve` setting. Add one
+empty unflagged dummy only to the competing sibling's direct dependencies.
+Reconcile every physical row in matched level-4 graph/timing captures; prove
+that `b` stops staging early and `a` gains the window. Compare each rank's
+`c` AICore-end to `a` AICore-end interval, inspect the new Observed path, and
+measure the unprofiled caller separately.
+
+On 2026-09-10, low-latency CSA applied this to `kv_proj_matmul` and ratio-4
+`kv_score_proj`, protecting `qr_proj_matmul` after RMS. With a2a3, TP8/T8,
+PyPTO `81262894`, simpler `39ce891d`, PTOAS 0.60, ISA `5a4f74cb`, and CANN
+9.0.0, QR early rows changed 8/64 → 64/64; KV projection and compressor rows
+changed 32/64 → 0/64 and 120/128 → 0/128. All eight RMS-end to QR-end
+intervals improved; rank 7 changed 36.803 → 25.114 µs while QR's own grid
+duration changed 17.673 → 18.076 µs. Both captures reconciled 3,912 physical
+rows, and normalized generated PTO kernels were unchanged.
+
+The frozen 43-layer, one-expert-bank forward used one process per arm,
+100 measured rounds / 5 warmups, and the lowest per-rank median:
+18,765.5405 → 18,539.2400 µs (1.206% reduction). Selected-worker IQRs were
+40.1955 and 47.6553 µs. The level-1 layer screen changed 499.519 → 489.740 µs.
+CSA/HCA output goldens passed; HCA's checked grids retained their eligibility
+without this fence. The full forward was execution-only validation. This was
+one A/B pair on this configuration; the diagnostic captures do not attribute
+every microsecond of the caller delta to a particular scheduling interval.
+
+### Anchor read-only prefetch to the intended layer
+
+A task reading only immutable weights has no data dependency on the layer
+input merely because its source call is inside that layer. Check the actual
+weight slice and its consumer before choosing a readiness anchor. For the
+low-latency attention paths, the existing prefetch task reads the current
+layer input before issuing its weight requests:
+
+```python
+with pl.at(level=pl.Level.CORE_GROUP, name_hint="prefetch_attn_w", allow_early_resolve=True):
+    _prefetch_anchor = pl.read(x_hc, [0, 0, 0])
+    warm_ctx = pl.prefetch.make_context()
+    pl.prefetch.async_prefetch(wq_a_flat, warm_ctx)
+    pl.prefetch.async_prefetch(wkv_flat, warm_ctx)
+```
+
+Inspect the generated dependency and the warm's lead relative to input
+readiness. Attribute a read-only task to its layer by the weight slice offset
+even if it has no dataflow descendants; it can still appear on the Observed
+path as a resource blocker. Earlier warming also competes with the preceding
+phase, so test the complete caller. The
+[prefetch placement comparisons](deepseek-v4-decode-optimization.md#anchor-prefetch-without-fragmenting-the-warm)
+include both a successful anchor and earlier/split variants that regressed.
 
 ## Traps this repository has hit
 

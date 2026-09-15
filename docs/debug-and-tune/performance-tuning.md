@@ -648,3 +648,92 @@ If both compute and MTE2 are well below 100 %, open the kernel-insight
 swimlane: gaps usually mean (a) a missing `pl.pipeline` on the K loop,
 (b) suboptimal instruction scheduling, or (c) incorrectly placed
 synchronization barriers.
+
+#### 5. Check the executed load order and live buffers
+
+Moving an independent GM load before a blocking C2V receive is a candidate
+for overlap. Check the generated branch the fixture executes before pricing
+the change: software pipelining may already hoist the load in paired
+iterations, leaving only the odd remainder affected.
+
+```python
+# Before: load the scale after receiving the cube result.
+score_acc_shard = pl.aiv_shard(score_acc_red)
+kv_dq_red = kv_scale_flat[kv_lane0 : kv_lane0 + REDUCE_AIV_TILE, :]
+
+# Candidate: make the independent scale load available before the receive.
+kv_dq_red = kv_scale_flat[kv_lane0 : kv_lane0 + REDUCE_AIV_TILE, :]
+score_acc_shard = pl.aiv_shard(score_acc_red)
+```
+
+Generated `TLOAD` before `TPOP` establishes issue order. Establish hidden
+latency with matching execution evidence and caller timing, and check peak
+Vec allocation because the earlier tile remains live longer.
+
+On 2026-09-10, a2a3 NPU 0, low-latency TP8 component shapes, one frozen
+golden per case and 100 measured rounds / 5 warmups in one process per arm:
+
+| Candidate | Effective mean before → after | Mechanism limit |
+|---|---:|---|
+| Indexer scale load, visibility 2048 | 68.50483 → 67.74870 µs | Paired-loop C++ unchanged; only odd remainder changed |
+| Extracted score/top-k, visibility 512 | 28.56766 → 28.19973 µs | Separate score grid span grew 12.58 → 13.30 µs |
+| Expert activation-scale and routing-weight loads | 120.77950 → 120.68962 µs | Vec peak grew 114,720 → 114,752 B; AIC C++ unchanged |
+
+Score used M32/N64/K128, grid 16, stage 2 and two C2V slots; its Vec peak
+stayed 41,600 B. The expert used a 49-slot fixture, RECV_TILE 16, D4096,
+MOE_INTER 256, grid 24 and stage 2. All component numerical checks passed.
+The toolchain was PyPTO `81262894`, simpler `39ce891d`, PTOAS 0.60, ISA
+`5a4f74cb`, CANN 9.0.0.
+
+The joint 43-layer TP8/T8 forward used 43 address-distinct, equal-valued
+expert banks, one frozen input, 50 measured rounds / 5 warmups and one
+process per arm. Lowest per-rank median changed 19,105.810 → 19,109.509 µs
+(+0.01936%), with IQR 64.621 → 44.839 µs. This establishes neither a caller
+gain nor a stable regression. The score executed the unchanged paired path;
+all seven AIC bodies were unchanged and all 289,984 physical rows across
+both arms reconciled. The full forward passed execution only; a separate
+TP8 CSA layer passed `kv_cache` and `x_next` goldens. Both edits were retained
+for source-order preference, with performance still inconclusive. This joint
+comparison cannot attribute a delta to either edit individually.
+
+#### 6. Inspect the conversion implementation before tuning around it
+
+A TCVT call can select a native conversion or a compatibility sequence with
+temporary storage. For a quantizer whose final FP16 values are already
+rounded, finite and bounded to [-127, 127], compare generated code for the
+destination saturation modes while preserving the preceding arithmetic:
+
+```python
+# Control: explicitly request non-saturating conversion.
+x_i8 = pl.cast(rounded_fp16, pl.INT8, mode="trunc", saturation_mode="off")
+
+# Native saturating candidate for this bounded input domain.
+x_i8 = pl.cast(rounded_fp16, pl.INT8, mode="trunc", saturation_mode="on")
+```
+
+Integer Tensor/Tile destinations default to ON in PyPTO `81262894`; on that
+revision omission and explicit ON produced identical quantization C++.
+An explicit ON argument therefore is not itself an optimization over the
+default. Check the input range and retain the rounding sequence: saturation
+and wrapping differ for overflow, and arbitrary non-finite inputs are outside
+this equivalence.
+
+In the September 8 prototype comparison, OFF selected six vector operations
+and six barriers per 64-element chunk with conversion scratch; ON selected
+native FP16-to-INT8 conversion without compiler-owned scratch. On a2a3,
+8 × 910B1, TP8/T8, frozen 43-layer inputs with 43 distinct equal-valued
+expert banks, 50 measured rounds / 5 warmups, lowest per-rank median changed
+20,690.9495 → 19,299.9490 µs (6.72275% reduction). A separate NPU 0
+8×4096 probe with the same 50/5 protocol changed effective mean
+48.0041 → 14.72616 µs and matched its frozen INT8 golden exactly.
+The prototype used PyPTO `630e585b` plus the saturation API, runtime
+`4e4d3a4a`, PTOAS 0.60, ISA `a8040450`, and CANN 9.0.0.
+
+The September 9 default-update verification used PyPTO `81262894`, simpler
+`39ce891d` and ISA `5a4f74cb`, with the same PTOAS/CANN versions. Omitted
+mode retained scratch-free C++, passed SWA/CSA/HCA frozen layer goldens and
+eight hardware saturation tests, and measured 19,219.050 µs with the 43-bank
+50/5 forward protocol. This was verification on the updated stack, not an
+isolated benefit from deleting the arguments. Full-forward checks were
+execution-only; neither comparison establishes repeated-run stability or
+permits adding overlapping per-task savings into an end-to-end claim.

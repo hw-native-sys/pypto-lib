@@ -125,6 +125,14 @@ selectors. Runtime task IDs are capture-local; do not reuse them after rebuild.
 
 ## 2. Enforce baseline preconditions
 
+This helper validates the adjacent `data-wait` pattern above. An Observed
+resource predecessor is a separate case covered by the canonical
+[resource-predecessor checks](../../../docs/debug-and-tune/dependency-and-scheduling.md#suppressing-a-resource-predecessor).
+When that case is requested, perform those graph, physical-row, staging, and
+caller checks explicitly. Do not treat a helper rejection as validation or
+silently disable its off-path guard. The conditions below apply to the
+helper's data-wait workflow.
+
 Proceed only when the helper proves all of these:
 
 1. `b` is actually early-dispatched (`full N/N physical rows` or explicitly

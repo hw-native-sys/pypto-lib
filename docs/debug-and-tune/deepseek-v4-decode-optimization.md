@@ -664,6 +664,76 @@ benchmarks retain communication windows with automatic resets disabled; the
 kernel clears the counters before the next invocation restarts its epochs.
 The full forward clears them once after the final MoE.
 
+### Anchor prefetch without fragmenting the warm
+
+The following September 6–7 comparisons used a2a3 devices 0–7, TP8/T8,
+43 layers with 43 address-distinct expert banks containing identical frozen
+values, 50 measured rounds / 5 warmups, and the lowest per-rank BENCH median.
+The toolchain was PyPTO `d9d3dd60`, simpler `15f5cbd9`, PTOAS 0.57, ISA
+`96ba706c`, CANN 9.0.0. These are historical measurements on that chain,
+not remeasurements on the newer saturation-enabled stack.
+
+Reading the current layer input inside each existing attention prefetch task
+anchored the warm to data readiness. After producer-side route planning,
+forward time changed 20,694.631 → 19,806.100 µs (4.29% reduction), with IQR
+146.956 → 63.995 µs. Level-1 captures reconciled 18,501 physical rows per
+rank. Later-layer warms previously finished roughly 12 ms before input
+readiness; anchored warms started 1.28–3.88 µs after it. The CSA golden
+passed; the forward check was execution-only.
+
+Moving the 20 HCA warms earlier, to the preceding CSA-attention output,
+changed 19,806.100 → 19,997.230 µs (+0.97%). They finished 227–288 µs
+before HCA input readiness. HCA attention improved 169.373 → 166.579 µs
+in the diagnostic trace, but CSA MoE grew 252.201 → 266.827 µs. The earlier
+anchor was reverted. The neighboring phase matters when choosing lead time;
+these traces did not independently measure cache misses or bandwidth.
+
+Coverage and task placement were then tested separately on later baselines:
+
+| Comparison | Forward before → after | Decision |
+|---|---:|---|
+| Add CSA main-compressor weights, +16 MiB per CSA warm | 19,449.120 → 19,311.670 µs | Keep CSA coverage |
+| Add HCA main-compressor weights as well, +8 MiB per HCA warm | 19,311.670 → 19,361.228 µs | Revert HCA addition |
+| Move output-weight warms to separate query-anchored tasks | 19,311.670 → 20,019.940 µs | Revert |
+| Move the SWA/HCA split warms earlier to normalized-input readiness | 19,311.670 → 20,162.520 µs | Revert |
+| Add gate's 4 MiB bank to the original context | 19,311.670 → 19,274.750 µs | Keep; small single-batch result |
+| Put only the added gate bank in a separate query-anchored task | 19,311.670 → 20,100.910 µs | Revert |
+
+The gate addition left the task count unchanged and passed all three layer
+goldens. The separate-gate variant preserved the original attention warm and
+all 345 non-prefetch kernels, yet regressed by 4.09%. Faster gate execution
+and adequate lead time did not establish a caller benefit. Preserve one
+context as the measured baseline on this configuration; test any split
+against the full caller. Read-only prefetch ownership comes from the weight
+slice, including when the task appears as a resource blocker on the Observed
+path. An asynchronous prefetch task's end marks submission, not measured
+transfer completion: a positive task-end lead alone does not establish that
+the weights arrived in time. See
+[prefetch anchoring](dependency-and-scheduling.md#anchor-read-only-prefetch-to-the-intended-layer).
+
+### Validate side operands before pricing a mixed epilogue
+
+The September 2 output-projection experiment tried to reuse the LM-head
+`aiv_shard` overlap for a dequantization epilogue. The accumulator transfer
+alone did not validate the additional per-row scale. On a2a3, pypto-lib
+`3a3ac56`, PyPTO `a8a2865b`, PTOAS 0.60, ISA `83d01313`, CANN 9.0.0,
+variants that compiled failed `attn_out` against a golden passed by the
+unfused path. No valid performance number was obtained.
+
+The failures included rows 2–7 becoming zero after row expansion, rejection
+of a transposed FP32 `[T,1]` carrier by row alignment, and split-axis
+transpose restrictions. Even an unused experimental scale write affected
+the control result, so experiment-only writes need build-time isolation.
+Validate every side operand through the exact split and transport geometry
+before timing a candidate. A plain accumulator-only epilogue does not test
+that contract.
+
+These are historical failures, not a current prohibition on per-row operands
+or all mixed fusion. A later plain mixed scope with `cross_core_slot` and a
+direct GM scale carrier passed correctness; that does not validate the
+earlier explicit `split_aiv`/`aiv_shard` form. Recheck the exact form on the
+selected toolchain rather than quoting an unvalidated latency saving.
+
 ## See also
 
 - [Performance Tuning](performance-tuning.md) — measurement, capture, and the
