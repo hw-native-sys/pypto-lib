@@ -9,6 +9,7 @@
 """DeepSeek-V4 overlapping ratio-4 decode KV compressor."""
 
 import pypto.language as pl
+from kv_quant import reference_kv_quant_fp8
 
 from config import (
     ACTIVE as M,
@@ -192,7 +193,7 @@ def compressor_ratio4(
     cmp_kv_cache_flat = pl.reshape(cmp_kv_cache, [CMP_BLOCK_NUM * BLOCK_SIZE, HEAD_DIM])
     normed_kv = pl.create_tensor([RMS_PAD_TILE, HEAD_DIM], dtype=pl.FP32)
     norm_w_2d = pl.reshape(norm_w, [1, HEAD_DIM])
-    with pl.at(level=pl.Level.CORE_GROUP, name_hint="rmsnorm_rope_cache_write"):
+    with pl.at(level=pl.Level.CORE_GROUP, name_hint="rmsnorm_rope_cache_write") as completion_tid:
         cos_b = pl.full([RMS_PAD_TILE, ROPE_HEAD_DIM // 2], dtype=pl.FP32, value=0.0)
         sin_b = pl.full([RMS_PAD_TILE, ROPE_HEAD_DIM // 2], dtype=pl.FP32, value=0.0)
         cos_b[0:B, 0 : ROPE_HEAD_DIM // 2] = cos[0:B, 0 : ROPE_HEAD_DIM // 2]
@@ -215,7 +216,17 @@ def compressor_ratio4(
             gamma_bf16 = norm_w_2d[:, k0 : k0 + HEAD_TILE]
             gamma = pl.cast(gamma_bf16, pl.FP32)
             kv_rms_scaled = pl.row_expand_mul(kv_norm_chunk, inv_rms)
-            normed_chunk = pl.col_expand_mul(kv_rms_scaled, gamma)
+            normed_chunk: pl.Tensor[[RMS_PAD_TILE, HEAD_TILE], pl.FP32] = pl.col_expand_mul(kv_rms_scaled, gamma)
+            kvq_values = pl.cast(pl.cast(normed_chunk, pl.BF16, mode="rint"), pl.FP32)
+            kvq_maximum = pl.maximum(pl.row_max(pl.abs(kvq_values)), 1e-4)
+            kvq_bits = pl.reinterpret_view(pl.mul(kvq_maximum, 1.0 / 448.0), pl.INT32)
+            kvq_exponent = pl.shrs(pl.add(kvq_bits, 8388607), 23)
+            kvq_scale = pl.reinterpret_view(pl.shls(kvq_exponent, 23), pl.FP32)
+            kvq_normalized = pl.row_expand_div(kvq_values, kvq_scale)
+            kvq_clipped = pl.minimum(pl.maximum(kvq_normalized, -448.0), 448.0)
+            kvq_payload = pl.cast(kvq_clipped, pl.FP8E4M3FN, mode="rint")
+            kvq_restored = pl.row_expand_mul(pl.cast(kvq_payload, pl.FP32), kvq_scale)
+            normed_chunk = pl.cast(pl.cast(kvq_restored, pl.BF16, mode="rint"), pl.FP32)
             normed_kv[0 : RMS_PAD_TILE, k0 : k0 + HEAD_TILE] = normed_chunk
 
         kv_rope_norm = pooled_kv[0 : RMS_PAD_TILE, NOPE_HEAD_DIM : HEAD_DIM]
@@ -253,8 +264,7 @@ def compressor_ratio4(
                     cmp_kv_cache_flat[cache_row : cache_row + 1, :] = kv_row_bf16
 
     kv_out = pl.reshape(kv_flat, [B, S, HEAD_DIM])
-    return kv_out
-
+    return completion_tid
 
 @pl.jit
 def compressor_test(
@@ -405,6 +415,7 @@ def golden_compressor(tensors):
         y1 = x0 * sin_v + x1 * cos_v
 
         kv_b = torch.cat([kv_b[..., :-rd], torch.stack([y0, y1], dim=-1).flatten(-2)], dim=-1)
+        kv_b[..., :-rd] = reference_kv_quant_fp8(kv_b[..., :-rd])
 
         cmp_row = int(cmp_slot_mapping[b, boundary_s].item())
         if cmp_row >= 0:

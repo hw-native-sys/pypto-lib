@@ -10,6 +10,8 @@
 
 import pypto.language as pl
 
+from indexer_cache_quant import reference_indexer_cache_quant
+
 from config import (
     ACTIVE as M,
     BLOCK_SIZE,
@@ -19,8 +21,6 @@ from config import (
     DECODE_SEQ,
     FP32_NEG_INF,
     IDX_CACHE_MAX_BLOCKS,
-    INT8_AMAX_EPS,
-    INT8_SCALE_MAX,
 )
 from golden import mapped_pool_ratio_allclose
 
@@ -77,7 +77,7 @@ def indexer_compressor(
     sin: pl.Tensor[[B, ROPE_HEAD_DIM // 2], pl.FP32],
     hadamard: pl.Tensor[[HEAD_DIM, HEAD_DIM], pl.BF16],
     idx_kv_cache: pl.InOut[
-        pl.Tensor[[IDX_CACHE_BLOCK_NUM, BLOCK_SIZE, 1, HEAD_DIM], pl.INT8]
+        pl.Tensor[[IDX_CACHE_BLOCK_NUM, BLOCK_SIZE, 1, HEAD_DIM], pl.FP8E4M3FN]
     ],
     idx_kv_scale: pl.InOut[
         pl.Tensor[[IDX_CACHE_BLOCK_NUM, BLOCK_SIZE, 1, 1], pl.FP32]
@@ -285,20 +285,20 @@ def indexer_compressor(
         kv_final_tile = kv_final[0 : RMS_PAD_TILE, 0 : HEAD_DIM]
         kv_blk_bf16 = pl.cast(kv_final_tile, target_type=pl.BF16, mode="rint")
         kv_blk_f32 = pl.cast(kv_blk_bf16, target_type=pl.FP32)
-        kv_abs = pl.abs(kv_blk_f32)
-        kv_row_max = pl.row_max(kv_abs)
-        kv_amax_row = pl.reshape(kv_row_max, [1, RMS_PAD_TILE])
-        kv_amax_floor = pl.full([1, RMS_PAD_TILE], dtype=pl.FP32, value=INT8_AMAX_EPS)
-        kv_amax = pl.maximum(kv_amax_row, kv_amax_floor)
-        kv_scale_max = pl.full([1, RMS_PAD_TILE], dtype=pl.FP32, value=INT8_SCALE_MAX)
-        kv_scale_q_row = pl.div(kv_scale_max, kv_amax)
-        kv_scale_dq_row = pl.recip(kv_scale_q_row)
+        # CANN indexer_quant_cache FP8 defaults round_scale=True, without
+        # an epsilon floor. Add the FP32 mantissa mask before extracting the
+        # exponent to compute the exact upward power-of-two scale. A zero row
+        # retains zero scale and uses the finite inverse 2**127.
+        kv_amax = pl.reshape(pl.row_max(pl.abs(kv_blk_f32)), [1, RMS_PAD_TILE])
+        kv_scale_bits = pl.reinterpret_view(pl.mul(kv_amax, 1.0 / 448.0), pl.INT32)
+        kv_scale_exp = pl.shrs(pl.add(kv_scale_bits, 0x7FFFFF), 23)
+        kv_scale_dq_row = pl.reinterpret_view(pl.shls(kv_scale_exp, 23), pl.FP32)
+        kv_inv_exp = pl.sub(pl.full([1, RMS_PAD_TILE], dtype=pl.INT32, value=254), kv_scale_exp)
+        kv_scale_q_row = pl.reinterpret_view(pl.shls(kv_inv_exp, 23), pl.FP32)
         kv_scale_dq_col = pl.reshape(kv_scale_dq_row, [RMS_PAD_TILE, 1])
         kv_scale_q_col = pl.reshape(kv_scale_q_row, [RMS_PAD_TILE, 1])
         kv_scaled = pl.row_expand_mul(kv_blk_f32, kv_scale_q_col)
-        kv_i32 = pl.cast(kv_scaled, target_type=pl.INT32, mode="rint")
-        kv_half = pl.cast(kv_i32, target_type=pl.FP16, mode="round")
-        kv_i8_blk = pl.cast(kv_half, target_type=pl.INT8, mode="trunc")
+        kv_fp8_blk = pl.cast(kv_scaled, target_type=pl.FP8E4M3FN, mode="rint")
         for inner in pl.range(B):
             write_c_idx = inner
             write_first_pos = pl.read(position_ids, [write_c_idx, 0])
@@ -310,8 +310,8 @@ def indexer_compressor(
                 if cache_row_i64 >= 0:
                     cache_row = pl.cast(cache_row_i64, pl.INDEX)
                     kv_flat[write_c_idx * S : write_c_idx * S + 1, :] = kv_row_fp32
-                    kv_i8_row = kv_i8_blk[inner : inner + 1, :]
-                    idx_kv_cache_flat[cache_row : cache_row + 1, :] = kv_i8_row
+                    kv_fp8_row = kv_fp8_blk[inner : inner + 1, :]
+                    idx_kv_cache_flat[cache_row : cache_row + 1, :] = kv_fp8_row
                     scale_dq = pl.read(kv_scale_dq_col, [inner, 0])
                     pl.write(idx_kv_scale_flat, [cache_row, 0], scale_dq)
 
@@ -332,7 +332,7 @@ def compressor_test(
     cos: pl.Tensor[[B, ROPE_HEAD_DIM // 2], pl.FP32],
     sin: pl.Tensor[[B, ROPE_HEAD_DIM // 2], pl.FP32],
     hadamard: pl.Tensor[[HEAD_DIM, HEAD_DIM], pl.BF16],
-    idx_kv_cache: pl.InOut[pl.Tensor[[IDX_CACHE_BLOCK_NUM, BLOCK_SIZE, 1, HEAD_DIM], pl.INT8]],
+    idx_kv_cache: pl.InOut[pl.Tensor[[IDX_CACHE_BLOCK_NUM, BLOCK_SIZE, 1, HEAD_DIM], pl.FP8E4M3FN]],
     idx_kv_scale: pl.InOut[pl.Tensor[[IDX_CACHE_BLOCK_NUM, BLOCK_SIZE, 1, 1], pl.FP32]],
     position_ids: pl.Tensor[[B, S], pl.INT32],
     idx_slot_mapping: pl.Tensor[[B, S], pl.INT64],
@@ -481,12 +481,10 @@ def golden_compressor(tensors):
             tensors["kv"][b : b + 1, 0:1, :] = kv_b
             blk_id = cache_row // BLOCK_SIZE
             intra = cache_row % BLOCK_SIZE
-            # Quantize the BF16-rounded row to INT8 with a per-position scale.
-            row_bf16 = kv_b[0, 0].to(torch.bfloat16).float()
-            amax = row_bf16.abs().amax().clamp_min(INT8_AMAX_EPS)
-            scale_q = INT8_SCALE_MAX / amax
-            idx_kv_cache[blk_id, intra, 0] = torch.round(row_bf16 * scale_q).to(torch.int32).to(torch.float16).to(torch.int8)
-            idx_kv_scale[blk_id, intra, 0, 0] = 1.0 / scale_q
+            row_fp8, scale = reference_indexer_cache_quant(kv_b[0, 0])
+            idx_kv_cache[blk_id, intra, 0] = row_fp8
+            idx_kv_scale[blk_id, intra, 0, 0] = scale[0]
+
 
     tensors["idx_kv_cache"][:] = idx_kv_cache
     tensors["idx_kv_scale"][:] = idx_kv_scale
@@ -494,7 +492,7 @@ def golden_compressor(tensors):
 
 def mapped_idx_cache_ratio_allclose(*, atol, rtol, max_error_ratio):
     """Compare index-cache writes selected by ``idx_slot_mapping``."""
-    return mapped_pool_ratio_allclose(
+    mapped_compare = mapped_pool_ratio_allclose(
         "idx_slot_mapping",
         mapping_shape=(B, S),
         block_size=BLOCK_SIZE,
@@ -503,6 +501,13 @@ def mapped_idx_cache_ratio_allclose(*, atol, rtol, max_error_ratio):
         rtol=rtol,
         max_error_ratio=max_error_ratio,
     )
+
+    def compare(actual, expected, **kwargs):
+        # CPU isfinite does not implement float8; widening is exact for every
+        # finite FP8 value and retains the mapping validator's exact-tail check.
+        return mapped_compare(actual.float(), expected.float(), **kwargs)
+
+    return compare
 
 
 def mapped_inner_state_ratio_allclose(*, atol, rtol, max_error_ratio):
@@ -564,7 +569,7 @@ def build_tensor_specs(start_pos=None):
     def init_hadamard():
         return torch.rand(HEAD_DIM, HEAD_DIM) * (HEAD_DIM ** -0.5)
     def init_idx_kv_cache():
-        return torch.zeros(IDX_CACHE_BLOCK_NUM, BLOCK_SIZE, 1, HEAD_DIM, dtype=torch.int8)
+        return torch.zeros(IDX_CACHE_BLOCK_NUM, BLOCK_SIZE, 1, HEAD_DIM, dtype=torch.float8_e4m3fn)
     def init_idx_kv_scale():
         return torch.zeros(IDX_CACHE_BLOCK_NUM, BLOCK_SIZE, 1, 1)
     def init_idx_block_table():
@@ -614,7 +619,7 @@ def build_tensor_specs(start_pos=None):
         TensorSpec("cos", [B, ROPE_HEAD_DIM // 2], torch.float32, init_value=init_cos),
         TensorSpec("sin", [B, ROPE_HEAD_DIM // 2], torch.float32, init_value=init_sin),
         TensorSpec("hadamard", [HEAD_DIM, HEAD_DIM], torch.bfloat16, init_value=init_hadamard),
-        TensorSpec("idx_kv_cache", [IDX_CACHE_BLOCK_NUM, BLOCK_SIZE, 1, HEAD_DIM], torch.int8, init_value=init_idx_kv_cache),
+        TensorSpec("idx_kv_cache", [IDX_CACHE_BLOCK_NUM, BLOCK_SIZE, 1, HEAD_DIM], torch.float8_e4m3fn, init_value=init_idx_kv_cache),
         TensorSpec("idx_kv_scale", [IDX_CACHE_BLOCK_NUM, BLOCK_SIZE, 1, 1], torch.float32, init_value=init_idx_kv_scale),
         TensorSpec("position_ids", [B, S], torch.int32, init_value=init_position_ids),
         TensorSpec("idx_slot_mapping", [B, S], torch.int64, init_value=init_idx_slot_mapping),
@@ -657,7 +662,7 @@ if __name__ == "__main__":
                 atol=1e-3, rtol=1e-3, max_error_ratio=0.0),
             # Compare rows selected by the current slot mappings.
             "idx_kv_cache": mapped_idx_cache_ratio_allclose(
-                atol=1, rtol=0, max_error_ratio=0.01),
+                atol=0.001953125, rtol=0.125, max_error_ratio=0.01),
             "idx_kv_scale": mapped_idx_cache_ratio_allclose(
                 atol=1e-4, rtol=1.0 / 128, max_error_ratio=0.01),
         },

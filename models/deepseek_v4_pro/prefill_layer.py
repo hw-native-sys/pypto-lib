@@ -43,6 +43,7 @@ config.MOE_TOKENS = config.PREFILL_TOKENS
 # Import moe first. It applies the EP2 PRO override before dependent
 # modules bake config-derived MoE shapes.
 from moe import (
+    MX_W1_PACKED_ROWS, MX_W3_PACKED_ROWS, MX_W2_PACKED_ROWS, MX_PACKED_LANE_COLS,
     AUX_PAD,
     D,
     HC_DIM,
@@ -126,7 +127,7 @@ assert HCA_CMP_BLOCK_NUM == CSA_CMP_BLOCK_NUM
 # One prefill layer overflows the runtime's default 256 MiB-per-ring output
 # heap and fails with `orch_error_code=2 HEAP_RING_DEADLOCK`. Size every ring:
 # ring 2 alone, which prefill_fwd.py sets, does not clear it.
-LAYER_RING_HEAP = 1024 * 1024 * 1024
+LAYER_RING_HEAP = (1 << 30, 1 << 30, 1 << 30, 2 << 30)
 
 TOK_TILE = T
 PREFILL_CHUNK_TOKENS = T
@@ -201,10 +202,12 @@ def prefill_layer_core(
     hc_attn_scale: pl.Tensor[[3], pl.FP32],
     hc_attn_base: pl.Tensor[[MIX_HC], pl.FP32],
     attn_norm_w: pl.Tensor[[D], pl.BF16],
-    wq_a: pl.Tensor[[D, Q_LORA], pl.BF16],
-    wq_b: pl.Tensor[[Q_LORA, H * HEAD_DIM], pl.INT8],
-    wq_b_scale: pl.Tensor[[H * HEAD_DIM], pl.FP32],
-    wkv: pl.Tensor[[D, HEAD_DIM], pl.BF16],
+    wq_a: pl.Tensor[[D, Q_LORA], pl.FP8E4M3FN],
+    wq_a_scale: pl.Tensor[[D // 32, Q_LORA], pl.FP8E8M0, pl.MX_B_NN],
+    wq_b: pl.Tensor[[Q_LORA, H * HEAD_DIM], pl.FP8E4M3FN],
+    wq_b_scale: pl.Tensor[[Q_LORA // 32, H * HEAD_DIM], pl.FP8E8M0, pl.MX_B_NN],
+    wkv: pl.Tensor[[D, HEAD_DIM], pl.FP8E4M3FN],
+    wkv_scale: pl.Tensor[[D // 32, HEAD_DIM], pl.FP8E8M0, pl.MX_B_NN],
     gamma_cq: pl.Tensor[[Q_LORA], pl.BF16],
     gamma_ckv: pl.Tensor[[HEAD_DIM], pl.BF16],
     freqs_cos: pl.Tensor[[MAX_SEQ_LEN, ROPE_HEAD_DIM], pl.BF16],
@@ -227,8 +230,8 @@ def prefill_layer_core(
     ],
     csa_compress_state_block_table: pl.Tensor[[PREFILL_CSA_STATE_TABLE_DYN], pl.INT32],
     csa_hadamard_idx: pl.Tensor[[IDX_HEAD_DIM, IDX_HEAD_DIM], pl.BF16],
-    csa_idx_wq_b: pl.Tensor[[Q_LORA, IDX_N_HEADS * IDX_HEAD_DIM], pl.INT8],
-    csa_idx_wq_b_scale: pl.Tensor[[IDX_N_HEADS * IDX_HEAD_DIM], pl.FP32],
+    csa_idx_wq_b: pl.Tensor[[Q_LORA, IDX_N_HEADS * IDX_HEAD_DIM], pl.FP8E4M3FN],
+    csa_idx_wq_b_scale: pl.Tensor[[Q_LORA // 32, IDX_N_HEADS * IDX_HEAD_DIM], pl.FP8E8M0, pl.MX_B_NN],
     csa_weights_proj: pl.Tensor[[D, IDX_N_HEADS], pl.BF16],
     csa_inner_wkv: pl.Tensor[[INNER_OUT_DIM, D], pl.BF16],
     csa_inner_wgate: pl.Tensor[[INNER_OUT_DIM, D], pl.BF16],
@@ -243,7 +246,7 @@ def prefill_layer_core(
     ori_slot_mapping: pl.Tensor[[PREFILL_TOKENS_DYN], pl.INT64],
     cmp_kv: pl.InOut[pl.Tensor[[PREFILL_CMP_CACHE_BLOCKS_DYN, BLOCK_SIZE, 1, HEAD_DIM], pl.BF16]],
     cmp_block_table: pl.Tensor[[PREFILL_CMP_BLOCK_TABLE_DYN], pl.INT32],
-    idx_kv_cache: pl.InOut[pl.Tensor[[PREFILL_IDX_CACHE_BLOCKS_DYN, BLOCK_SIZE, 1, IDX_HEAD_DIM], pl.INT8]],
+    idx_kv_cache: pl.InOut[pl.Tensor[[PREFILL_IDX_CACHE_BLOCKS_DYN, BLOCK_SIZE, 1, IDX_HEAD_DIM], pl.FP8E4M3FN]],
     idx_kv_scale: pl.InOut[pl.Tensor[[PREFILL_IDX_CACHE_BLOCKS_DYN, BLOCK_SIZE, 1, 1], pl.FP32]],
     idx_block_table: pl.Tensor[[PREFILL_IDX_BLOCK_TABLE_DYN], pl.INT32],
     position_ids: pl.Tensor[[PREFILL_TOKENS_DYN], pl.INT32],
@@ -254,9 +257,10 @@ def prefill_layer_core(
     csa_state_slot_mapping: pl.Tensor[[PREFILL_TOKENS_DYN], pl.INT64],
     csa_inner_state_slot_mapping: pl.Tensor[[PREFILL_TOKENS_DYN], pl.INT64],
     attn_sink: pl.Tensor[[H], pl.FP32],
-    wo_a: pl.Tensor[[O_GROUPS, O_LORA, O_GROUP_IN], pl.BF16],
-    wo_b: pl.Tensor[[D, O_GROUPS * O_LORA], pl.INT8],
-    wo_b_scale: pl.Tensor[[D], pl.FP32],
+    wo_a: pl.Tensor[[O_GROUPS, O_GROUP_IN, O_LORA], pl.FP8E4M3FN],
+    wo_a_scale: pl.Tensor[[O_GROUPS * (O_GROUP_IN // 32), O_LORA], pl.FP8E8M0],
+    wo_b: pl.Tensor[[O_GROUPS * O_LORA, D], pl.FP8E4M3FN],
+    wo_b_scale: pl.Tensor[[(O_GROUPS * O_LORA) // 32, D], pl.FP8E8M0, pl.MX_B_NN],
     hc_ffn_fn: pl.Tensor[[MIX_HC, HC_DIM], pl.FP32],
     hc_ffn_scale: pl.Tensor[[3], pl.FP32],
     hc_ffn_base: pl.Tensor[[MIX_HC], pl.FP32],
@@ -265,12 +269,13 @@ def prefill_layer_core(
     gate_bias: pl.Tensor[[N_EXPERTS_GLOBAL], pl.FP32],
     tid2eid: pl.Tensor[[VOCAB, TOPK], pl.INT32],
     input_ids: pl.Tensor[[PREFILL_TOKENS_DYN], pl.INT64],
-    routed_w1: pl.Tensor[[N_LOCAL, D, MOE_INTER], pl.FP8E4M3FN],
+    routed_w1: pl.Tensor[[N_LOCAL, MX_W1_PACKED_ROWS, MX_PACKED_LANE_COLS], pl.UINT8],
     routed_w1_scale: pl.Tensor[[N_LOCAL * K_SCALE, MOE_INTER], pl.FP8E8M0, pl.MX_B_NN],
-    routed_w3: pl.Tensor[[N_LOCAL, D, MOE_INTER], pl.FP8E4M3FN],
+    routed_w3: pl.Tensor[[N_LOCAL, MX_W3_PACKED_ROWS, MX_PACKED_LANE_COLS], pl.UINT8],
     routed_w3_scale: pl.Tensor[[N_LOCAL * K_SCALE, MOE_INTER], pl.FP8E8M0, pl.MX_B_NN],
-    routed_w2: pl.Tensor[[N_LOCAL, MOE_INTER, D], pl.FP8E4M3FN],
+    routed_w2: pl.Tensor[[N_LOCAL, MX_W2_PACKED_ROWS, MX_PACKED_LANE_COLS], pl.UINT8],
     routed_w2_scale: pl.Tensor[[N_LOCAL * H_SCALE, D], pl.FP8E8M0, pl.MX_B_NN],
+    mxfp4_pair_lut: pl.Tensor[[2, 256], pl.INT16],
     shared_w1: pl.Tensor[[D, MOE_INTER], pl.FP8E4M3FN],
     shared_w1_scale: pl.Tensor[[K_SCALE, MOE_INTER], pl.FP8E8M0, pl.MX_B_NN],
     shared_w3: pl.Tensor[[D, MOE_INTER], pl.FP8E4M3FN],
@@ -383,30 +388,31 @@ def prefill_layer_core(
             if layer_id < NUM_SWA_LAYERS:
                 prefill_attention_swa(
                     x_hc_tile, hc_attn_fn, hc_attn_scale, hc_attn_base,
-                    attn_norm_w, wq_a, wq_b, wq_b_scale, wkv, gamma_cq, gamma_ckv,
+                    attn_norm_w, wq_a, wq_a_scale, wq_b, wq_b_scale, wkv, wkv_scale, gamma_cq, gamma_ckv,
                     freqs_cos, freqs_sin,
                     kv_cache_req, ori_block_table_req, ori_slot_tile,
                     position_ids_tile,
-                    attn_sink, wo_a, wo_b, wo_b_scale,
+                    attn_sink, wo_a, wo_a_scale, wo_b, wo_b_scale,
                     x_attn_tile, valid_n,
                 )
-            elif layer_id < FIRST_CSA_LAYER or layer_id % 2 != CSA_PARITY:
+            # Clamp early compressed layers to the HCA parity before alternating.
+            elif pl.max(layer_id, FIRST_CSA_LAYER - 1) % 2 != CSA_PARITY:
                 prefill_attention_hca(
                     x_hc_tile, hc_attn_fn, hc_attn_scale, hc_attn_base,
-                    attn_norm_w, wq_a, wq_b, wq_b_scale, wkv, gamma_cq, gamma_ckv,
+                    attn_norm_w, wq_a, wq_a_scale, wq_b, wq_b_scale, wkv, wkv_scale, gamma_cq, gamma_ckv,
                     freqs_cos, freqs_sin,
                     hca_cmp_wkv, hca_cmp_wgate, hca_cmp_ape, hca_cmp_norm_w,
                     hca_compress_state_req, hca_state_table_req,
                     kv_cache_req, ori_slot_tile, ori_block_table_req,
                     cmp_kv_req, cmp_block_table_req,
                     position_ids_tile, hca_cmp_slot_tile, hca_state_slot_tile,
-                    attn_sink, wo_a, wo_b, wo_b_scale,
+                    attn_sink, wo_a, wo_a_scale, wo_b, wo_b_scale,
                     x_attn_tile, valid_n,
                 )
             else:
                 prefill_attention_csa(
                     x_hc_tile, hc_attn_fn, hc_attn_scale, hc_attn_base,
-                    attn_norm_w, wq_a, wq_b, wq_b_scale, wkv, gamma_cq, gamma_ckv,
+                    attn_norm_w, wq_a, wq_a_scale, wq_b, wq_b_scale, wkv, wkv_scale, gamma_cq, gamma_ckv,
                     freqs_cos, freqs_sin,
                     csa_cmp_wkv, csa_cmp_wgate, csa_cmp_ape, csa_cmp_norm_w,
                     csa_compress_state_req, csa_state_table_req,
@@ -418,7 +424,7 @@ def prefill_layer_core(
                     cmp_kv_req, cmp_block_table_req, idx_kv_cache_req, idx_kv_scale_req, idx_block_table_req,
                     position_ids_tile, csa_cmp_slot_tile, csa_idx_slot_tile,
                     csa_state_slot_tile, csa_inner_state_slot_tile,
-                    attn_sink, wo_a, wo_b, wo_b_scale,
+                    attn_sink, wo_a, wo_a_scale, wo_b, wo_b_scale,
                     x_attn_tile, valid_n,
                 )
 
@@ -429,7 +435,7 @@ def prefill_layer_core(
                 norm_w, gate_w, gate_bias, tid2eid, input_ids_tile,
                 routed_w1, routed_w1_scale, routed_w3, routed_w3_scale,
                 routed_w2, routed_w2_scale,
-                shared_w1, shared_w1_scale, shared_w3, shared_w3_scale,
+                mxfp4_pair_lut, shared_w1, shared_w1_scale, shared_w3, shared_w3_scale,
                 shared_w2, shared_w2_scale,
                 x_next_tile,
                 recv_meta, recv_x, recv_scale, recv_aux, recv_route, arrived, data_arrived,
@@ -437,10 +443,18 @@ def prefill_layer_core(
                 layer_id, valid_n, my_rank, moe_epoch,
             )
 
-            # Scatter the tile back into the padded physical output. Each
-            # request's physical span is rounded up to whole-T tiles, so a
-            # full-T write is safe even for a partial logical tail tile.
-            x_next = pl.assemble(x_next, x_next_tile, [tile_base, 0, 0])
+            # Child kernels guarantee active rows; preserve the packed output's padding.
+            x_next_rows = pl.reshape(x_next, [x_next.shape[0] * HC_MULT, D])
+            x_next_tile_rows = pl.reshape(x_next_tile, [TOK_TILE * HC_MULT, D])
+            with pl.spmd(TOK_TILE, name_hint="prefill_layer_scatter"):
+                row = pl.tile.get_block_idx()
+                if row < valid_n:
+                    row_tile = pl.load(
+                        x_next_tile_rows, [row * HC_MULT, 0], [HC_MULT, D]
+                    )
+                    x_next_rows = pl.store(
+                        row_tile, [(tile_base + row) * HC_MULT, 0], x_next_rows
+                    )
 
     # Quiesce every rank's final reduction marker before resetting this rank's
     # inbound epoch slots for the next persistent dispatch. Once all consumed
@@ -481,10 +495,12 @@ def l3_prefill_layer(
     hc_attn_scale: pl.Tensor[[N_RANKS, 3], pl.FP32],
     hc_attn_base: pl.Tensor[[N_RANKS, MIX_HC], pl.FP32],
     attn_norm_w: pl.Tensor[[N_RANKS, D], pl.BF16],
-    wq_a: pl.Tensor[[N_RANKS, D, Q_LORA], pl.BF16],
-    wq_b: pl.Tensor[[N_RANKS, Q_LORA, H * HEAD_DIM], pl.INT8],
-    wq_b_scale: pl.Tensor[[N_RANKS, H * HEAD_DIM], pl.FP32],
-    wkv: pl.Tensor[[N_RANKS, D, HEAD_DIM], pl.BF16],
+    wq_a: pl.Tensor[[N_RANKS, D, Q_LORA], pl.FP8E4M3FN],
+    wq_a_scale: pl.Tensor[[N_RANKS, D // 32, Q_LORA], pl.FP8E8M0],
+    wq_b: pl.Tensor[[N_RANKS, Q_LORA, H * HEAD_DIM], pl.FP8E4M3FN],
+    wq_b_scale: pl.Tensor[[N_RANKS, Q_LORA // 32, H * HEAD_DIM], pl.FP8E8M0],
+    wkv: pl.Tensor[[N_RANKS, D, HEAD_DIM], pl.FP8E4M3FN],
+    wkv_scale: pl.Tensor[[N_RANKS, D // 32, HEAD_DIM], pl.FP8E8M0],
     gamma_cq: pl.Tensor[[N_RANKS, Q_LORA], pl.BF16],
     gamma_ckv: pl.Tensor[[N_RANKS, HEAD_DIM], pl.BF16],
     freqs_cos: pl.Tensor[[N_RANKS, MAX_SEQ_LEN, ROPE_HEAD_DIM], pl.BF16],
@@ -507,8 +523,8 @@ def l3_prefill_layer(
     ],
     csa_compress_state_block_table: pl.Tensor[[N_RANKS, PREFILL_CSA_STATE_TABLE_DYN], pl.INT32],
     csa_hadamard_idx: pl.Tensor[[N_RANKS, IDX_HEAD_DIM, IDX_HEAD_DIM], pl.BF16],
-    csa_idx_wq_b: pl.Tensor[[N_RANKS, Q_LORA, IDX_N_HEADS * IDX_HEAD_DIM], pl.INT8],
-    csa_idx_wq_b_scale: pl.Tensor[[N_RANKS, IDX_N_HEADS * IDX_HEAD_DIM], pl.FP32],
+    csa_idx_wq_b: pl.Tensor[[N_RANKS, Q_LORA, IDX_N_HEADS * IDX_HEAD_DIM], pl.FP8E4M3FN],
+    csa_idx_wq_b_scale: pl.Tensor[[N_RANKS, Q_LORA // 32, IDX_N_HEADS * IDX_HEAD_DIM], pl.FP8E8M0],
     csa_weights_proj: pl.Tensor[[N_RANKS, D, IDX_N_HEADS], pl.BF16],
     csa_inner_wkv: pl.Tensor[[N_RANKS, INNER_OUT_DIM, D], pl.BF16],
     csa_inner_wgate: pl.Tensor[[N_RANKS, INNER_OUT_DIM, D], pl.BF16],
@@ -523,7 +539,7 @@ def l3_prefill_layer(
     ori_slot_mapping: pl.Tensor[[N_RANKS, PREFILL_TOKENS_DYN], pl.INT64],
     cmp_kv: pl.InOut[pl.Tensor[[N_RANKS, PREFILL_CMP_CACHE_BLOCKS_DYN, BLOCK_SIZE, 1, HEAD_DIM], pl.BF16]],
     cmp_block_table: pl.Tensor[[N_RANKS, PREFILL_CMP_BLOCK_TABLE_DYN], pl.INT32],
-    idx_kv_cache: pl.InOut[pl.Tensor[[N_RANKS, PREFILL_IDX_CACHE_BLOCKS_DYN, BLOCK_SIZE, 1, IDX_HEAD_DIM], pl.INT8]],
+    idx_kv_cache: pl.InOut[pl.Tensor[[N_RANKS, PREFILL_IDX_CACHE_BLOCKS_DYN, BLOCK_SIZE, 1, IDX_HEAD_DIM], pl.FP8E4M3FN]],
     idx_kv_scale: pl.InOut[pl.Tensor[[N_RANKS, PREFILL_IDX_CACHE_BLOCKS_DYN, BLOCK_SIZE, 1, 1], pl.FP32]],
     idx_block_table: pl.Tensor[[N_RANKS, PREFILL_IDX_BLOCK_TABLE_DYN], pl.INT32],
     position_ids: pl.Tensor[[N_RANKS, PREFILL_TOKENS_DYN], pl.INT32],
@@ -534,9 +550,10 @@ def l3_prefill_layer(
     csa_state_slot_mapping: pl.Tensor[[N_RANKS, PREFILL_TOKENS_DYN], pl.INT64],
     csa_inner_state_slot_mapping: pl.Tensor[[N_RANKS, PREFILL_TOKENS_DYN], pl.INT64],
     attn_sink: pl.Tensor[[N_RANKS, H], pl.FP32],
-    wo_a: pl.Tensor[[N_RANKS, O_GROUPS, O_LORA, O_GROUP_IN], pl.BF16],
-    wo_b: pl.Tensor[[N_RANKS, D, O_GROUPS * O_LORA], pl.INT8],
-    wo_b_scale: pl.Tensor[[N_RANKS, D], pl.FP32],
+    wo_a: pl.Tensor[[N_RANKS, O_GROUPS, O_GROUP_IN, O_LORA], pl.FP8E4M3FN],
+    wo_a_scale: pl.Tensor[[N_RANKS, O_GROUPS * (O_GROUP_IN // 32), O_LORA], pl.FP8E8M0],
+    wo_b: pl.Tensor[[N_RANKS, O_GROUPS * O_LORA, D], pl.FP8E4M3FN],
+    wo_b_scale: pl.Tensor[[N_RANKS, (O_GROUPS * O_LORA) // 32, D], pl.FP8E8M0],
     hc_ffn_fn: pl.Tensor[[N_RANKS, MIX_HC, HC_DIM], pl.FP32],
     hc_ffn_scale: pl.Tensor[[N_RANKS, 3], pl.FP32],
     hc_ffn_base: pl.Tensor[[N_RANKS, MIX_HC], pl.FP32],
@@ -545,12 +562,13 @@ def l3_prefill_layer(
     gate_bias: pl.Tensor[[N_RANKS, N_EXPERTS_GLOBAL], pl.FP32],
     tid2eid: pl.Tensor[[N_RANKS, VOCAB, TOPK], pl.INT32],
     input_ids: pl.Tensor[[N_RANKS, PREFILL_TOKENS_DYN], pl.INT64],
-    routed_w1: pl.Tensor[[N_RANKS, N_LOCAL, D, MOE_INTER], pl.FP8E4M3FN],
+    routed_w1: pl.Tensor[[N_RANKS, N_LOCAL, MX_W1_PACKED_ROWS, MX_PACKED_LANE_COLS], pl.UINT8],
     routed_w1_scale: pl.Tensor[[N_RANKS, N_LOCAL * K_SCALE, MOE_INTER], pl.FP8E8M0],
-    routed_w3: pl.Tensor[[N_RANKS, N_LOCAL, D, MOE_INTER], pl.FP8E4M3FN],
+    routed_w3: pl.Tensor[[N_RANKS, N_LOCAL, MX_W3_PACKED_ROWS, MX_PACKED_LANE_COLS], pl.UINT8],
     routed_w3_scale: pl.Tensor[[N_RANKS, N_LOCAL * K_SCALE, MOE_INTER], pl.FP8E8M0],
-    routed_w2: pl.Tensor[[N_RANKS, N_LOCAL, MOE_INTER, D], pl.FP8E4M3FN],
+    routed_w2: pl.Tensor[[N_RANKS, N_LOCAL, MX_W2_PACKED_ROWS, MX_PACKED_LANE_COLS], pl.UINT8],
     routed_w2_scale: pl.Tensor[[N_RANKS, N_LOCAL * H_SCALE, D], pl.FP8E8M0],
+    mxfp4_pair_lut: pl.Tensor[[N_RANKS, 2, 256], pl.INT16],
     shared_w1: pl.Tensor[[N_RANKS, D, MOE_INTER], pl.FP8E4M3FN],
     shared_w1_scale: pl.Tensor[[N_RANKS, K_SCALE, MOE_INTER], pl.FP8E8M0],
     shared_w3: pl.Tensor[[N_RANKS, D, MOE_INTER], pl.FP8E4M3FN],
@@ -586,8 +604,8 @@ def l3_prefill_layer(
             x_hc[rank],
             seq_lens[rank], chunk_lens[rank], chunk_offsets[rank], chunk_tile_offsets[rank],
             hc_attn_fn[rank], hc_attn_scale[rank], hc_attn_base[rank],
-            attn_norm_w[rank], wq_a[rank], wq_b[rank], wq_b_scale[rank],
-            wkv[rank], gamma_cq[rank], gamma_ckv[rank], freqs_cos[rank], freqs_sin[rank],
+            attn_norm_w[rank], wq_a[rank], wq_a_scale[rank], wq_b[rank], wq_b_scale[rank],
+            wkv[rank], wkv_scale[rank], gamma_cq[rank], gamma_ckv[rank], freqs_cos[rank], freqs_sin[rank],
             hca_cmp_wkv[rank], hca_cmp_wgate[rank], hca_cmp_ape[rank], hca_cmp_norm_w[rank],
             hca_compress_state[rank], hca_compress_state_block_table[rank],
             csa_cmp_wkv[rank], csa_cmp_wgate[rank], csa_cmp_ape[rank], csa_cmp_norm_w[rank],
@@ -604,12 +622,12 @@ def l3_prefill_layer(
             hca_cmp_slot_mapping[rank], hca_state_slot_mapping[rank],
             csa_cmp_slot_mapping[rank], csa_idx_slot_mapping[rank],
             csa_state_slot_mapping[rank], csa_inner_state_slot_mapping[rank],
-            attn_sink[rank], wo_a[rank], wo_b[rank], wo_b_scale[rank],
+            attn_sink[rank], wo_a[rank], wo_a_scale[rank], wo_b[rank], wo_b_scale[rank],
             hc_ffn_fn[rank], hc_ffn_scale[rank], hc_ffn_base[rank],
             norm_w[rank], gate_w[rank], gate_bias[rank], tid2eid[rank], input_ids[rank],
             routed_w1[rank], routed_w1_scale[rank], routed_w3[rank], routed_w3_scale[rank],
             routed_w2[rank], routed_w2_scale[rank],
-            shared_w1[rank], shared_w1_scale[rank], shared_w3[rank], shared_w3_scale[rank],
+            mxfp4_pair_lut[rank], shared_w1[rank], shared_w1_scale[rank], shared_w3[rank], shared_w3_scale[rank],
             shared_w2[rank], shared_w2_scale[rank],
             x_next[rank],
             recv_meta, recv_x, recv_scale, recv_aux, recv_route, arrived, data_arrived,
@@ -629,10 +647,10 @@ HOST_TENSOR_ORDER = (
     "hc_attn_scale",
     "hc_attn_base",
     "attn_norm_w",
-    "wq_a",
+    "wq_a", 'wq_a_scale',
     "wq_b",
     "wq_b_scale",
-    "wkv",
+    "wkv", 'wkv_scale',
     "gamma_cq",
     "gamma_ckv",
     "freqs_cos",
@@ -675,7 +693,7 @@ HOST_TENSOR_ORDER = (
     "csa_state_slot_mapping",
     "csa_inner_state_slot_mapping",
     "attn_sink",
-    "wo_a",
+    "wo_a", 'wo_a_scale',
     "wo_b",
     "wo_b_scale",
     "hc_ffn_fn",
@@ -692,7 +710,7 @@ HOST_TENSOR_ORDER = (
     "routed_w3_scale",
     "routed_w2",
     "routed_w2_scale",
-    "shared_w1",
+    "mxfp4_pair_lut", "shared_w1",
     "shared_w1_scale",
     "shared_w3",
     "shared_w3_scale",
@@ -1090,10 +1108,10 @@ def build_tensor_specs(layer_id=2, chunk_lens=DEFAULT_CHUNK_LENS, start_position
         ("hc_attn_scale", active["hc_attn_scale"]),
         ("hc_attn_base", active["hc_attn_base"]),
         ("attn_norm_w", active["attn_norm_w"]),
-        ("wq_a", active["wq_a"]),
+        ("wq_a", active["wq_a"]), ('wq_a_scale', active['wq_a_scale']),
         ("wq_b", active["wq_b"]),
         ("wq_b_scale", active["wq_b_scale"]),
-        ("wkv", active["wkv"]),
+        ("wkv", active["wkv"]), ('wkv_scale', active['wkv_scale']),
         ("gamma_cq", active["gamma_cq"]),
         ("gamma_ckv", active["gamma_ckv"]),
         ("freqs_cos", active["freqs_cos"]),
@@ -1115,7 +1133,7 @@ def build_tensor_specs(layer_id=2, chunk_lens=DEFAULT_CHUNK_LENS, start_position
         ("csa_inner_ape", csa["inner_ape"]),
         ("csa_inner_norm_w", csa["inner_norm_w"]),
         ("attn_sink", active["attn_sink"]),
-        ("wo_a", active["wo_a"]),
+        ("wo_a", active["wo_a"]), ('wo_a_scale', active['wo_a_scale']),
         ("wo_b", active["wo_b"]),
         ("wo_b_scale", active["wo_b_scale"]),
     ]
@@ -1244,7 +1262,7 @@ def build_tensor_specs(layer_id=2, chunk_lens=DEFAULT_CHUNK_LENS, start_position
     RESIDENT_WEIGHT_NAMES = frozenset([
         # Attention core weights + RoPE tables
         "hc_attn_fn", "hc_attn_scale", "hc_attn_base", "attn_norm_w",
-        "wq_a", "wq_b", "wq_b_scale", "wkv", "gamma_cq", "gamma_ckv",
+        "wq_a", 'wq_a_scale', "wq_b", "wq_b_scale", "wkv", 'wkv_scale', "gamma_cq", "gamma_ckv",
         "freqs_cos", "freqs_sin",
         # HCA / CSA compressor + indexer weights (states/block tables excluded)
         "hca_cmp_wkv", "hca_cmp_wgate", "hca_cmp_ape", "hca_cmp_norm_w",
@@ -1252,13 +1270,13 @@ def build_tensor_specs(layer_id=2, chunk_lens=DEFAULT_CHUNK_LENS, start_position
         "csa_hadamard_idx", "csa_idx_wq_b", "csa_idx_wq_b_scale", "csa_weights_proj",
         "csa_inner_wkv", "csa_inner_wgate", "csa_inner_ape", "csa_inner_norm_w",
         # Attention output projection
-        "attn_sink", "wo_a", "wo_b", "wo_b_scale",
+        "attn_sink", "wo_a", 'wo_a_scale', "wo_b", "wo_b_scale",
         # MoE FFN / gate / experts + static route table
         "hc_ffn_fn", "hc_ffn_scale", "hc_ffn_base", "norm_w",
         "gate_w", "gate_bias", "tid2eid",
         "routed_w1", "routed_w1_scale", "routed_w3", "routed_w3_scale",
         "routed_w2", "routed_w2_scale",
-        "shared_w1", "shared_w1_scale", "shared_w3", "shared_w3_scale",
+        "mxfp4_pair_lut", "shared_w1", "shared_w1_scale", "shared_w3", "shared_w3_scale",
         "shared_w2", "shared_w2_scale",
     ])
     for spec in tensor_specs:
@@ -1615,6 +1633,7 @@ if __name__ == "__main__":
     import torch
 
     from golden import run
+    from indexer_cache_quant import fp8_cache_compare
 
     parser = argparse.ArgumentParser()
     parser.add_argument("-p", "--platform", type=str, default="a2a3",
@@ -1673,12 +1692,12 @@ if __name__ == "__main__":
             rtol=1.0 / 128,
             max_error_ratio=0.005,
         ),
-        "idx_kv_cache": mapped_pool_ratio_allclose(
+        "idx_kv_cache": fp8_cache_compare(mapped_pool_ratio_allclose(
             "csa_idx_slot_mapping",
-            atol=1,
-            rtol=0,
+            atol=0.001953125,
+            rtol=0.125,
             max_error_ratio=0.01,
-        ),
+        )),
         "idx_kv_scale": mapped_pool_ratio_allclose(
             "csa_idx_slot_mapping",
             atol=1e-4,

@@ -9,6 +9,7 @@
 """DeepSeek-V4 non-overlapping ratio-128 decode KV compressor."""
 
 import pypto.language as pl
+from kv_quant import reference_kv_quant_fp8
 
 from config import (
     ACTIVE as M,
@@ -186,7 +187,7 @@ def compressor_ratio128(
     cmp_flat_rows = cmp_block_num * BLOCK_SIZE
     cmp_kv_cache_flat = pl.reshape(cmp_kv_cache, [cmp_flat_rows, HEAD_DIM])
 
-    with pl.at(level=pl.Level.CORE_GROUP, name_hint="rmsnorm_rope_cache_write", deps=[pool_tid]):
+    with pl.at(level=pl.Level.CORE_GROUP, name_hint="rmsnorm_rope_cache_write", deps=[pool_tid]) as completion_tid:
         cos_b = pl.full([RMS_PAD_TILE, ROPE_HEAD_DIM // 2], dtype=pl.FP32, value=0.0)
         sin_b = pl.full([RMS_PAD_TILE, ROPE_HEAD_DIM // 2], dtype=pl.FP32, value=0.0)
         for rope_c_idx in pl.range(b_dim):
@@ -214,7 +215,17 @@ def compressor_ratio128(
             gamma_bf16 = norm_w_2d[:, norm_h0 : norm_h0 + HEAD_TILE]
             gamma = pl.cast(gamma_bf16, pl.FP32)
             kv_rms_scaled = pl.row_expand_mul(kv_norm_chunk, inv_rms)
-            normed_chunk = pl.col_expand_mul(kv_rms_scaled, gamma)
+            normed_chunk: pl.Tensor[[RMS_PAD_TILE, HEAD_TILE], pl.FP32] = pl.col_expand_mul(kv_rms_scaled, gamma)
+            kvq_values = pl.cast(pl.cast(normed_chunk, pl.BF16, mode="rint"), pl.FP32)
+            kvq_maximum = pl.maximum(pl.row_max(pl.abs(kvq_values)), 1e-4)
+            kvq_bits = pl.reinterpret_view(pl.mul(kvq_maximum, 1.0 / 448.0), pl.INT32)
+            kvq_exponent = pl.shrs(pl.add(kvq_bits, 8388607), 23)
+            kvq_scale = pl.reinterpret_view(pl.shls(kvq_exponent, 23), pl.FP32)
+            kvq_normalized = pl.row_expand_div(kvq_values, kvq_scale)
+            kvq_clipped = pl.minimum(pl.maximum(kvq_normalized, -448.0), 448.0)
+            kvq_payload = pl.cast(kvq_clipped, pl.FP8E4M3FN, mode="rint")
+            kvq_restored = pl.row_expand_mul(pl.cast(kvq_payload, pl.FP32), kvq_scale)
+            normed_chunk = pl.cast(pl.cast(kvq_restored, pl.BF16, mode="rint"), pl.FP32)
             normed_kv[0:RMS_PAD_TILE, norm_h0 : norm_h0 + HEAD_TILE] = normed_chunk
 
         kv_rope_norm = pooled_kv[0:RMS_PAD_TILE, NOPE_HEAD_DIM : HEAD_DIM]
@@ -251,8 +262,7 @@ def compressor_ratio128(
                     cmp_kv_cache_flat[cmp_row : cmp_row + 1, :] = kv_row_bf16
 
     kv_out = pl.reshape(kv_flat, [b_dim, s_dim, HEAD_DIM])
-    return kv_out
-
+    return completion_tid
 
 @pl.jit
 def compressor_test(
@@ -392,6 +402,7 @@ def golden_compressor(tensors):
         y1 = x0 * sin_v + x1 * cos_v
 
         kv_b = torch.cat([kv_b[..., :-rd], torch.stack([y0, y1], dim=-1).flatten(-2)], dim=-1)
+        kv_b[..., :-rd] = reference_kv_quant_fp8(kv_b[..., :-rd])
 
         boundary_positions = torch.nonzero((position_ids[b, :S] + 1) % ratio == 0, as_tuple=False).flatten()
         if int(boundary_positions.numel()) == 0:

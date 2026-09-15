@@ -54,13 +54,12 @@ Converts the HuggingFace-style hybrid MXFP4-MXFP8 checkpoint (43 layers,
 256 routed experts, ``expert_dtype=fp4`` + block-FP8 attention linears) into
 the exact host-tensor ABI ``prefill_fwd.py`` / ``decode_fwd.py`` consume:
 
-- FP8 e4m3 weights (128x128-block UE8M0 scales) are dequantized, then either
-  kept BF16 (``wq_a``, ``wkv``, ``wo_a``), re-quantized to the attention
-  kernels' W8A8 form, or quantized per input group to the shared experts'
-  native MXFP8 Cube ABI.
-- FP4 e2m1 routed-expert weights (packed two-per-byte, per-32-group UE8M0
-  scales along the input dim) are expanded exactly to FP8E4M3 values. Their
-  original E8M0 scales are preserved and packed for ``MX_B_NN``.
+- FP8 e4m3 weights (128x128-block UE8M0 scales) are dequantized and converted
+  to group-32 MXFP8 with the pinned CANN weight converter's scale and rounding
+  rules. Every attention and shared-expert projection uses FP8 KN payloads
+  and E8M0 scales packed for ``MX_B_NN``.
+- FP4 e2m1 routed-expert weights are dequantized and requantized using the
+  same pinned CANN rules before packing the native FP4 tile layout.
 - Per-layer tensors are stacked along dim 1 exactly like
   ``_make_stacked_spec`` (FWD stacks by model layer id 0..42; CSA/HCA stacks
   by kind order = ascending layer id of that compress-ratio kind), sharded
@@ -72,8 +71,7 @@ the exact host-tensor ABI ``prefill_fwd.py`` / ``decode_fwd.py`` consume:
 Synthesized inputs (RoPE tables, ``csa_hadamard_idx``, caches, per-step
 metadata) keep their fixture initializers and are not touched here.
 
-Usage — one-time offline conversion (recommended; the routed experts alone
-re-quantize ~280 GB), then run the drivers against the cache::
+Usage — one-time offline conversion, then run the drivers against the cache::
 
     PYTHONPATH=.:models/deepseek_v4_pro python -c 'import utils; utils.main()' \\
         --variant flash --ep 8 --tp 2 \\
@@ -89,9 +87,11 @@ while the harness builds its inputs.
 import config
 
 import argparse
+import hashlib
 import json
 import math
 import mmap
+import os
 import struct
 import warnings
 from pathlib import Path
@@ -177,6 +177,27 @@ def _pack_mxfp4_nibbles_kn_tiles(nibbles_kn, k_tile, n_tile, split_mode):
     packed = low | (high << 4)
     lane_bytes = k_tile * n_tile // 4
     return packed.contiguous().reshape(n_blocks * k_blocks * 2, lane_bytes)
+
+
+def pack_checkpoint_mxfp4_weight_tiles(weight_packed, k_tile, n_tile):
+    """Reorder checkpoint E2M1 nibbles into the routed Cube tile layout exactly."""
+    payload = weight_packed.contiguous().view(torch.uint8)
+    *lead, n, half_k = payload.shape
+    k = 2 * half_k
+    matrices = payload.reshape(-1, n, half_k)
+    packed_rows = k * n // n_tile
+    packed_cols = n_tile // 2
+    result = torch.empty(
+        [matrices.shape[0], packed_rows, packed_cols], dtype=torch.uint8
+    )
+    for index, matrix in enumerate(matrices):
+        nibbles = torch.empty([n, k], dtype=torch.uint8)
+        nibbles[:, 0::2] = matrix & 0x0F
+        nibbles[:, 1::2] = matrix >> 4
+        result[index] = _pack_mxfp4_nibbles_kn_tiles(
+            nibbles.t(), k_tile, n_tile, "up_down"
+        ).reshape(packed_rows, packed_cols)
+    return result.reshape(*lead, packed_rows, packed_cols)
 
 
 def _mxfp8_grid_to_mxfp4_nibbles(weight):
@@ -410,7 +431,8 @@ def host_quant_mxfp8(
     amax = xg.abs().amax(dim=-1)
     codes = _e8m0_codes_from_amax(amax, FP8_E4M3_MAX)
     scale_f = e8m0_codes_to_fp32(codes)
-    q = (xg / scale_f.unsqueeze(-1)).to(torch.float8_e4m3fn)
+    # Ascend TQUANT saturates finite overflow; the CPU cast otherwise emits NaN.
+    q = (xg / scale_f.unsqueeze(-1)).clamp(-FP8_E4M3_MAX, FP8_E4M3_MAX).to(torch.float8_e4m3fn)
     data = q.reshape(*lead, k)
     if not return_e8m0:
         return data, scale_f.contiguous()
@@ -447,7 +469,7 @@ def gen_mxfp8_weight_kn(
     amax = weight_groups.abs().amax(dim=-1)
     codes_on = _e8m0_codes_from_amax(amax, FP8_E4M3_MAX)
     scale_f = e8m0_codes_to_fp32(codes_on)
-    quantized = (weight_groups / scale_f.unsqueeze(-1)).to(torch.float8_e4m3fn)
+    quantized = (weight_groups / scale_f.unsqueeze(-1)).clamp(-FP8_E4M3_MAX, FP8_E4M3_MAX).to(torch.float8_e4m3fn)
     data_on = quantized.reshape(out, inn)
     data_kn = data_on.transpose(0, 1).contiguous()
     codes_kn = codes_on.transpose(0, 1).contiguous()
@@ -514,6 +536,83 @@ def host_quant_mxfp8_weight_kn(weight_nk):
     )
     scale_nn = pack_b_scale_batched(codes_kn).view(torch.float8_e8m0fnu)
     return data_kn, scale_nn
+
+
+def cann_quant_mxfp8_weight_kn(weight_nk):
+    """CANN ba83ab4 weight conversion: group-32 E4M3 with packed E8M0.
+
+    This follows ``models/deepseek_v4/utils/mx_quantize.py:quantize_mx``:
+    round2decimal shared exponents, nearest element rounding (ties away
+    from zero), and finite saturation. It differs from the OCP activation
+    scale used by :func:`host_quant_mxfp8`.
+    """
+    weight = weight_nk.float()
+    *lead, n, k = weight.shape
+    if k % MX_GROUP or n % SCALE_BLOCK_SIZE:
+        raise ValueError("MXFP8 KN weights require K divisible by 32 and N by 16")
+    grouped = weight.reshape(*lead, n, k // MX_GROUP, MX_GROUP)
+    amax = grouped.abs().amax(dim=-1)
+    # The official converter substitutes FP32_MIN_NORMAL for an all-zero block.
+    safe_amax = torch.where(amax == 0, torch.full_like(amax, 2.0**-126), amax)
+    exponent = torch.floor(torch.log2(safe_amax))
+    mantissa = safe_amax / torch.exp2(exponent)
+    shared = (exponent + (mantissa > 1.75) - 8).clamp(-127, 127)
+    scaled = grouped / torch.exp2(shared).unsqueeze(-1)
+    absolute = scaled.abs()
+    private_exp = torch.floor(torch.log2(absolute + (absolute == 0))).clamp_min(-6)
+    step = torch.exp2(private_exp - 3)
+    rounded = torch.sign(scaled) * torch.floor(absolute / step + 0.5) * step
+    payload = rounded.clamp(-FP8_E4M3_MAX, FP8_E4M3_MAX).to(torch.float8_e4m3fn)
+    data_kn = payload.reshape(*lead, n, k).transpose(-2, -1).contiguous()
+    codes_kn = (shared + 127).to(torch.uint8).transpose(-2, -1).contiguous()
+    return data_kn, pack_b_scale_batched(codes_kn).view(torch.float8_e8m0fnu)
+
+
+def cann_quant_mxfp4_weight_nk(weight_nk):
+    """Pinned CANN group-32 E2M1 weights, low nibble first and logical E8M0.
+
+    CANN requantizes the dequantized checkpoint even when it already contains
+    MXFP4. A source block whose largest magnitude is 3, for example, receives
+    half the original scale and twice the original FP4 payload values.
+    """
+    weight = weight_nk.float()
+    if weight.shape[-1] % MX_GROUP:
+        raise ValueError("MXFP4 weights require K divisible by 32")
+    grouped = weight.reshape(*weight.shape[:-1], -1, MX_GROUP)
+    amax = grouped.abs().amax(dim=-1)
+    safe_amax = torch.where(amax == 0, torch.full_like(amax, 2.0**-126), amax)
+    exponent = torch.floor(torch.log2(safe_amax))
+    mantissa = safe_amax / torch.exp2(exponent)
+    shared = (exponent + (mantissa > 1.75) - 2).clamp(-127, 127)
+    scaled = grouped / torch.exp2(shared).unsqueeze(-1)
+    # E2M1 nearest-away ties occur at these exact midpoints. right=True
+    # selects the larger magnitude at a tie, unlike ordinary OCP rint.
+    midpoints = torch.tensor([0.25, 0.75, 1.25, 1.75, 2.5, 3.5, 5.0])
+    magnitude = torch.bucketize(scaled.abs(), midpoints, right=True).to(torch.uint8)
+    # A negative nonzero value can round to negative zero in CANN.
+    sign = (scaled < 0).to(torch.uint8) * 8
+    nibbles = (magnitude + sign).reshape(weight.shape)
+    packed = nibbles[..., 0::2] | (nibbles[..., 1::2] << 4)
+    return packed.contiguous(), (shared + 127).to(torch.uint8).contiguous()
+
+
+def cann_requant_checkpoint_mxfp4(packed, scale_codes):
+    """Convert official packed weights, avoiding dense expansion when exact.
+
+    Blocks with maximum E2M1 magnitude 4 or 6 already have the CANN scale.
+    Their only possible change is canonicalizing source negative-zero nibbles.
+    Other blocks use the complete CANN quantizer, so this optimization does not
+    assume that every source expert already satisfies the scale invariant.
+    """
+    raw = packed.contiguous().view(torch.uint8)
+    codes = scale_codes.contiguous().view(torch.uint8)
+    low, high = raw & 15, raw >> 4
+    group_max = torch.maximum(low & 7, high & 7).reshape(*raw.shape[:-1], -1, 16).amax(-1)
+    if bool((group_max >= 6).all()):
+        low = torch.where(low == 8, 0, low)
+        high = torch.where(high == 8, 0, high)
+        return (low | (high << 4)).contiguous(), codes
+    return cann_quant_mxfp4_weight_nk(dequant_fp4(raw, codes))
 
 
 def gen_mxfp4_weight_kn(
@@ -713,6 +812,78 @@ _SAFETENSORS_DTYPES = {
     "I64": torch.int64,
 }
 
+FLASH_MODEL_ID = "deepseek-ai/DeepSeek-V4-Flash"
+FLASH_CHECKPOINT_REVISION = "60d8d70770c6776ff598c94bb586a859a38244f1"
+CANN_WEIGHT_REFERENCE_REVISION = "ba83ab4aecb8969c831d28abd02de159d279917b"
+FLASH_CONFIG_SHA256 = "b628e63398a645abc711d92207f8737dd8140f7a4ef1e0a5b3616019e0ddd818"
+FLASH_INDEX_SHA256 = "7e975ba3bef8947a94e7da0abd60888375b232b4dfad883d59653e65c6ba522a"
+FLASH_CACHE_SCHEMA = 3
+FLASH_SHARDS = {
+    "model-00001-of-00046.safetensors": (1059061856, "5176586613905d4beaadbaea1cfecd1693e17f9da4a0ea09d99aab7d3f2f5b7c"),
+    "model-00002-of-00046.safetensors": (3566321192, "f04048189d3b472b26d7d02331edd0412e85b184725041c978fdce793a286a0d"),
+    "model-00003-of-00046.safetensors": (3566321192, "df5f80b9b4ca54edf7bda4e640a1b0d1bb95d5995843198dfcce2af0bfc4cb35"),
+    "model-00004-of-00046.safetensors": (3596229272, "948250b46a6f92df92ef093ab2d0023c31f924232846a84affe84fa3c7794f5c"),
+    "model-00005-of-00046.safetensors": (3568768976, "9fda158bc636215aea4f6834821c81f59eea3733223c874ab66b9f3d6740c4c1"),
+    "model-00006-of-00046.safetensors": (3590024776, "51a65e6d9d0ccb70013e25ae70a50b177af8f97e59ac798c2d0ed5ebb169fe7a"),
+    "model-00007-of-00046.safetensors": (3568768976, "2d782c46d6d293189e01ed13ea108de355fd32a9902cea77b264dfc9c4f10c42"),
+    "model-00008-of-00046.safetensors": (3590024776, "b7d9d8d8932e12ea113f2e83ff412fc1d6b663acedf7f34bbe2bfff41a71c595"),
+    "model-00009-of-00046.safetensors": (3568768976, "3197a42d282a8368d4286d11aed52d7fee7928d7950fee4dc18d5154b8111060"),
+    "model-00010-of-00046.safetensors": (3590024776, "c9cef4200444326f8d802bc1bb5be7c1d15af4bfdec0426db7e841a7bd516a28"),
+    "model-00011-of-00046.safetensors": (3568768976, "916b0b34b713c51dc7a83935ccd9e07c4af017ddfcc5feaeec8faa26f1263f89"),
+    "model-00012-of-00046.safetensors": (3590026352, "05739c7d91a302f41a4627587982016a6cc874f875a3ea299d1f2e1dcea5cbb6"),
+    "model-00013-of-00046.safetensors": (3568770544, "47c5e416b60b9bef9e9005cdad9c991a306ab2dd25a95e1994dda30bd4011905"),
+    "model-00014-of-00046.safetensors": (3590026352, "c881e2671ab45428d824197f174d64fb4403b9530451cb1b0b3899881ab34b7e"),
+    "model-00015-of-00046.safetensors": (3568770544, "cb3daae8e465c5b49f2b439c045971e96cd658fda152882605e9717573d4c8f5"),
+    "model-00016-of-00046.safetensors": (3590026352, "9eba661fba3162a8a051b0283ad3c11c7c17b33d99684e7029ddf732494bd069"),
+    "model-00017-of-00046.safetensors": (3568770544, "0c36cbc026c5067164cb506ac6522078478feb539fef264289ef70f1d1688f54"),
+    "model-00018-of-00046.safetensors": (3590026352, "1298a07452a409ddbcc5172a4f57a011193bea4f16a6a964c3dd8531cbc06b49"),
+    "model-00019-of-00046.safetensors": (3568770544, "d3687748aff78adf42b2bbf7469b8df92e1e3e5dcd90c1c050c8fac62d1fe77a"),
+    "model-00020-of-00046.safetensors": (3590026352, "906c652f3c36b510689c2637ebe5172865cc6ccc17515b9fc70ee9e048e7c5af"),
+    "model-00021-of-00046.safetensors": (3568770544, "f270bf4d0f0067165020baf3c11264a177182918c1ebeec21d2bf33166b44592"),
+    "model-00022-of-00046.safetensors": (3590026352, "d02261b8f1c8d697bac4b23ec9a8423096fb1a1edf923ed1c2faea6cebdb05e8"),
+    "model-00023-of-00046.safetensors": (3568770544, "69fab8bfa1cdfd819382cdef5923dcf10d81879aceb0dc0950be45a6d45771f2"),
+    "model-00024-of-00046.safetensors": (3590026352, "baba23c06a7b80e108334eb9fe30349de851e822e9b72df756614ae6b5088dbf"),
+    "model-00025-of-00046.safetensors": (3568770544, "085b7736ebe3d69574930187f8b213f84b35b36852f0a505067f8755e8b11c89"),
+    "model-00026-of-00046.safetensors": (3590026352, "fdde6791ab713c93cb256d05d9560d5ecfd2b913563658b62d32af9a17a91546"),
+    "model-00027-of-00046.safetensors": (3568770544, "2f207b9aef9c56e38f73234e9c5c118c1898676c8ab83d2be0dd410fb196bd01"),
+    "model-00028-of-00046.safetensors": (3590026352, "2cc519b5a03a30d45717ffb8408a4f833f3a94f70e35a1de38e95a0ffcdc152e"),
+    "model-00029-of-00046.safetensors": (3568770544, "d10bf34c789f9294d2cc50b695d259dc1d0d5b2303105329be370eb55f0fd882"),
+    "model-00030-of-00046.safetensors": (3590026352, "0f1c471fa9d9d3612c94039e9efb2a60f367782918f236e95c45ab3fe36c166c"),
+    "model-00031-of-00046.safetensors": (3568770544, "beafa59d64fae3a5c636be4b2a08956d8d5abaf70856a4a5adb70a200011e43e"),
+    "model-00032-of-00046.safetensors": (3590026352, "5c6b2934d87ada60493e201652d72075c56ce608091a3d395f3d8e31b6ce036a"),
+    "model-00033-of-00046.safetensors": (3568770544, "c05f917e873d2da0513385c3c30758d29b4b9d244ffde2a5258ae2e6745f23da"),
+    "model-00034-of-00046.safetensors": (3590026352, "666b77201ec6946fb1f299f2ebcb462bce53575a97a91fb30db806bbcd099100"),
+    "model-00035-of-00046.safetensors": (3568770544, "5e6b9a54fd149ea4908f81cdffd6b09701d9c98e5e7041bb5bd00c6d5c85623f"),
+    "model-00036-of-00046.safetensors": (3590026352, "ab72ad9d171fc0867350948e5091878b3c2445a5cfb8a83dd8c25d4272628107"),
+    "model-00037-of-00046.safetensors": (3568770544, "93d68bcfc36fdf239f901653c0e96c5d45d8fce4f5be633bbbf93cc75067ec5d"),
+    "model-00038-of-00046.safetensors": (3590026352, "809fb799edcf1d9b4511dea68a1ea35c5fc03858e0611a0010913f1c84e66efe"),
+    "model-00039-of-00046.safetensors": (3568770544, "49dba248917454c0a8ac90cc5a012fee625fea6672ae55c40d32a5922a29dd91"),
+    "model-00040-of-00046.safetensors": (3590026352, "09a7b8b6957ff3426d7461dd49a158f4576c0277ab18b78a881094aef29ba84b"),
+    "model-00041-of-00046.safetensors": (3568770544, "a564ac6c6cc7514beadb2e1d9d1fc2baeed5e680ba1b75cd9afc7a50fb90ee85"),
+    "model-00042-of-00046.safetensors": (3590026352, "bd3f5b898b041559a534c81a2f9bb53a8f9744ee8db37ed11b3a5c9fcf848882"),
+    "model-00043-of-00046.safetensors": (3568770544, "85a414c7991c1276e8db780f6a4390ac25b8f2c7fdb3551831993adb9db69430"),
+    "model-00044-of-00046.safetensors": (3590026352, "438b052b8a2d650939e63704f55f1352b946152ba6633cb256c3864ef21d2f62"),
+    "model-00045-of-00046.safetensors": (1059332516, "9a0fd242134e9ebe4e6993a7631692944838e4fdf20067b3219caa48eab68045"),
+    "model-00046-of-00046.safetensors": (3593956092, "f58f722893a6148216a2155cee4a57fe691cea4d3b323135c433a936b932055d"),
+}
+
+
+def _file_sha256(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as stream:
+        for chunk in iter(lambda: stream.read(8 * 1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def _flash_source_identity() -> dict:
+    return {
+        "model_id": FLASH_MODEL_ID,
+        "revision": FLASH_CHECKPOINT_REVISION,
+        "config_sha256": FLASH_CONFIG_SHA256,
+        "index_sha256": FLASH_INDEX_SHA256,
+    }
+
 
 class FlashCheckpoint:
     """Zero-copy reader for the sharded DeepSeek-V4-Flash safetensors checkpoint."""
@@ -722,8 +893,29 @@ class FlashCheckpoint:
         index_path = self.dir / "model.safetensors.index.json"
         if not index_path.is_file():
             raise FileNotFoundError(f"not a checkpoint dir (missing {index_path})")
+        config_path = self.dir / "config.json"
+        if not config_path.is_file():
+            raise FileNotFoundError(f"checkpoint config missing: {config_path}")
+        for path, expected in ((config_path, FLASH_CONFIG_SHA256), (index_path, FLASH_INDEX_SHA256)):
+            if _file_sha256(path) != expected:
+                raise ValueError(
+                    f"{path.name} does not match {FLASH_MODEL_ID}@{FLASH_CHECKPOINT_REVISION}; "
+                    "use the pinned original Flash checkpoint"
+                )
+        source_config = json.loads(config_path.read_text(encoding="utf-8"))
+        for field in (
+            "hidden_size", "num_attention_heads", "head_dim", "q_lora_rank", "o_lora_rank",
+            "o_groups", "vocab_size", "moe_intermediate_size", "n_routed_experts",
+            "num_experts_per_tok", "num_hidden_layers", "num_hash_layers", "hc_mult",
+            "index_n_heads", "index_head_dim", "index_topk", "expert_dtype",
+        ):
+            if source_config[field] != getattr(ACTIVE_BASE, field):
+                raise ValueError(f"checkpoint {field} does not match the active base model")
+        self.source_identity = _flash_source_identity()
         with open(index_path, encoding="utf-8") as f:
             self._shard_of = json.load(f)["weight_map"]
+        if any(Path(name).name != name for name in self._shard_of.values()):
+            raise ValueError("checkpoint index must reference files inside the checkpoint directory")
         # shard name -> (mmap, {tensor: (dtype_str, shape, start, end)})
         self._shards: dict[str, tuple[mmap.mmap, dict]] = {}
 
@@ -731,11 +923,30 @@ class FlashCheckpoint:
         cached = self._shards.get(shard_name)
         if cached is not None:
             return cached
-        with open(self.dir / shard_name, "rb") as f:
+        path = self.dir / shard_name
+        expected_size, expected_sha256 = FLASH_SHARDS[shard_name]
+        if path.stat().st_size != expected_size or _file_sha256(path) != expected_sha256:
+            raise ValueError(f"checkpoint shard does not match the pinned official snapshot: {shard_name}")
+        with open(path, "rb") as f:
+            file_size = os.fstat(f.fileno()).st_size
             header_len = struct.unpack("<Q", f.read(8))[0]
+            if not 0 < header_len <= min(file_size - 8, 16 * 1024 * 1024):
+                raise ValueError(f"invalid safetensors header size: {shard_name}")
             header = json.loads(f.read(header_len))
             header.pop("__metadata__", None)
             base = 8 + header_len
+            for name, info in header.items():
+                if self._shard_of.get(name) != shard_name or info["dtype"] not in _SAFETENSORS_DTYPES:
+                    raise ValueError(f"invalid tensor entry {name!r} in {shard_name}")
+                start, end = info["data_offsets"]
+                shape = info["shape"]
+                width = torch.empty((), dtype=_SAFETENSORS_DTYPES[info["dtype"]]).element_size()
+                if (
+                    any(not isinstance(dim, int) or dim < 0 for dim in shape)
+                    or not 0 <= start <= end <= file_size - base
+                    or end - start != math.prod(shape) * width
+                ):
+                    raise ValueError(f"invalid tensor shape/offsets for {name!r} in {shard_name}")
             entries = {
                 name: (info["dtype"], info["shape"], base + info["data_offsets"][0], base + info["data_offsets"][1])
                 for name, info in header.items()
@@ -772,6 +983,9 @@ def _e8m0_to_fp32(scale_u8: torch.Tensor) -> torch.Tensor:
 def dequant_fp8_block(weight: torch.Tensor, scale_u8: torch.Tensor) -> torch.Tensor:
     """Dequantize an e4m3 ``[out, in]`` weight with a 128x128-block UE8M0 scale."""
     out_dim, in_dim = weight.shape
+    expected = ((out_dim + FP8_BLOCK - 1) // FP8_BLOCK, (in_dim + FP8_BLOCK - 1) // FP8_BLOCK)
+    if weight.dtype != torch.float8_e4m3fn or tuple(scale_u8.shape) != expected:
+        raise ValueError(f"invalid official FP8 weight/scale: {weight.shape}/{scale_u8.shape}")
     scale = _e8m0_to_fp32(scale_u8)
     scale = scale.repeat_interleave(FP8_BLOCK, dim=0)[:out_dim]
     scale = scale.repeat_interleave(FP8_BLOCK, dim=1)[:, :in_dim]
@@ -791,21 +1005,6 @@ def dequant_fp4(weight_packed: torch.Tensor, scale_u8: torch.Tensor) -> torch.Te
     values = _FP4_TABLE[nibbles.to(torch.int64)]
     scale = _e8m0_to_fp32(scale_u8).repeat_interleave(FP4_GROUP, dim=-1)
     return values * scale
-
-
-def quant_int8_per_out_channel(w: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
-    """Symmetric per-output-channel INT8 quant of an ``[..., out, in]`` weight.
-
-    Identical chain to the fixture helpers (``quant_w_per_output_channel`` /
-    ``quant_w_per_row``): amax over the input dim clamped to INT8_AMAX_EPS,
-    round -> int32 -> clamp +-127 -> fp16 -> int8, FP32 dequant scale amax/127.
-    """
-    w = w.to(torch.float32)
-    amax = w.abs().amax(dim=-1).clamp_min(INT8_AMAX_EPS)
-    scale_quant = INT8_SCALE_MAX / amax
-    w_i32 = torch.round(w * scale_quant.unsqueeze(-1)).to(torch.int32)
-    w_i32 = torch.clamp(w_i32, -int(INT8_SCALE_MAX), int(INT8_SCALE_MAX))
-    return w_i32.to(torch.float16).to(torch.int8), (1.0 / scale_quant).float()
 
 
 # ---------------------------------------------------------------------------
@@ -873,44 +1072,61 @@ class FlashWeightConverter:
         return _replicate(torch.cat(weights, dim=0), self.ep)
 
     # ---- attention linears ----------------------------------------------
+    def _attention_linear(self, layer: int, which: str) -> tuple[torch.Tensor, torch.Tensor]:
+        return cann_quant_mxfp8_weight_kn(self._deq_fp8(f"layers.{layer}.attn.{which}"))
+
     def _wq_b(self, layer: int) -> tuple[torch.Tensor, torch.Tensor]:
-        w_i8, scale = quant_int8_per_out_channel(self._deq_fp8(f"layers.{layer}.attn.wq_b"))
-        return w_i8.t().contiguous(), scale  # kernel layout [Q_LORA, H*HEAD_DIM]
+        return self._attention_linear(layer, "wq_b")
+
+    def _wo_a(self, layer: int) -> tuple[torch.Tensor, torch.Tensor]:
+        weight = self._deq_fp8(f"layers.{layer}.attn.wo_a").view(O_GROUPS, O_LORA, -1)
+        payload, scale = cann_quant_mxfp8_weight_kn(weight)
+        # Every group is independently packed, then concatenated along scale rows.
+        return payload, scale.flatten(0, 1)
 
     def _wo_b(self, layer: int) -> tuple[torch.Tensor, torch.Tensor]:
-        return quant_int8_per_out_channel(self._deq_fp8(f"layers.{layer}.attn.wo_b"))  # [D, O_GROUPS*O_LORA]
+        return self._attention_linear(layer, "wo_b")
 
     def _idx_wq_b(self, layer: int) -> tuple[torch.Tensor, torch.Tensor]:
-        w = self._deq_fp8(f"layers.{layer}.attn.indexer.wq_b")
-        w_i8, scale = quant_int8_per_out_channel(w)
-        return w_i8.t().contiguous(), scale  # kernel layout [Q_LORA, IDX_N_HEADS*IDX_HEAD_DIM]
+        return self._attention_linear(layer, "indexer.wq_b")
 
     def _shared(self, layer: int, which: str) -> tuple[torch.Tensor, torch.Tensor]:
         weight_nk = self._deq_fp8(f"layers.{layer}.ffn.shared_experts.{which}")
-        return host_quant_mxfp8_weight_kn(weight_nk)
+        return cann_quant_mxfp8_weight_kn(weight_nk)
 
     # ---- routed experts (EP-sharded) ------------------------------------
     def _routed_layer(self, layer: int, which: str) -> tuple[torch.Tensor, torch.Tensor]:
-        """One layer's EP-sharded MXFP4-to-MXFP8 expert payloads."""
+        """One layer's EP-sharded CANN-requantized MXFP4 weights and scales."""
+        from expert_routed import MX_K_TILE, MX_MM_INTER_TILE, MX_W2_D_OUT_TILE
+
+        n_tile = MX_W2_D_OUT_TILE if which == "w2" else MX_MM_INTER_TILE
         weights, scales = [], []
         for rank in range(self.ep):
             experts = range(rank * self.n_local, (rank + 1) * self.n_local)
-            packed = torch.stack(
-                [self.ckpt.get(f"layers.{layer}.ffn.experts.{e}.{which}.weight") for e in experts]
-            )
-            scales_u8 = torch.stack(
-                [self.ckpt.get(f"layers.{layer}.ffn.experts.{e}.{which}.scale") for e in experts]
-            )
-            weight_mx, w_scale = mxfp4_to_mxfp8_weight_kn(packed, scales_u8)
-            weights.append(weight_mx)
-            scales.append(w_scale)
+            rank_weights, rank_scales = [], []
+            for expert in experts:
+                key = f"layers.{layer}.ffn.experts.{expert}.{which}"
+                packed, scale = cann_requant_checkpoint_mxfp4(
+                    self.ckpt.get(f"{key}.weight"), self.ckpt.get(f"{key}.scale"))
+                rank_weights.append(packed)
+                rank_scales.append(scale)
+            packed = torch.stack(rank_weights)
+            scales_u8 = torch.stack(rank_scales)
+            weight_tiles = pack_checkpoint_mxfp4_weight_tiles(packed, MX_K_TILE, n_tile)
+            scale_kn = scales_u8.transpose(-2, -1).contiguous()
+            weights.append(weight_tiles)
+            scales.append(pack_b_scale_batched(scale_kn).view(torch.float8_e8m0fnu))
         return torch.stack(weights), torch.stack(scales)
 
     def _routed(self, scale_name: str, which: str) -> torch.Tensor:
+        from expert_routed import MX_MM_INTER_TILE, MX_W2_D_OUT_TILE
+
         k_dim, n_dim = (D, MOE_INTER) if which in ("w1", "w3") else (MOE_INTER, D)
+        n_tile = MX_W2_D_OUT_TILE if which == "w2" else MX_MM_INTER_TILE
         groups = k_dim // FP4_GROUP
         weight = torch.empty(
-            [self.ep, NUM_LAYERS * self.n_local, k_dim, n_dim], dtype=torch.float8_e4m3fn
+            [self.ep, NUM_LAYERS * self.n_local, k_dim * n_dim // n_tile, n_tile // 2],
+            dtype=torch.uint8,
         )
         scale = torch.empty(
             [self.ep, NUM_LAYERS * self.n_local * groups, n_dim], dtype=torch.float8_e8m0fnu
@@ -918,8 +1134,8 @@ class FlashWeightConverter:
         for layer in range(NUM_LAYERS):
             block = slice(layer * self.n_local, (layer + 1) * self.n_local)
             scale_block = slice(layer * self.n_local * groups, (layer + 1) * self.n_local * groups)
-            weight_mx, w_scale = self._routed_layer(layer, which)
-            weight[:, block] = weight_mx
+            weight_tiles, w_scale = self._routed_layer(layer, which)
+            weight[:, block] = weight_tiles
             logical_scale = unpack_b_scale_batched(w_scale.contiguous().view(torch.uint8))
             layer_scale = pack_b_scale_batched(
                 logical_scale.reshape(self.ep, self.n_local * groups, n_dim)
@@ -969,17 +1185,14 @@ class FlashWeightConverter:
                 return rep(fwd(lambda l: self._raw(f"layers.{l}.{name}")), self.ep)
             case "attn_norm_w":
                 return rep(fwd(lambda l: self._raw(f"layers.{l}.attn_norm.weight")), self.ep)
-            case "wq_a":
-                return rep(fwd(
-                    lambda l: self._deq_fp8(f"layers.{l}.attn.wq_a").t().contiguous().to(torch.bfloat16)), self.ep)
-            case "wkv":
-                return rep(fwd(
-                    lambda l: self._deq_fp8(f"layers.{l}.attn.wkv").t().contiguous().to(torch.bfloat16)), self.ep)
+            case "wq_a" | "wkv":
+                return self._stacked_mx_pair(
+                    f"{name}_scale", list(range(NUM_LAYERS)), lambda l: self._attention_linear(l, name))
             case "wq_b":
-                return self._stacked_pair("wq_b_scale", list(range(NUM_LAYERS)), self._wq_b)
+                return self._stacked_mx_pair("wq_b_scale", list(range(NUM_LAYERS)), self._wq_b)
             case "wo_b":
-                return self._stacked_pair("wo_b_scale", list(range(NUM_LAYERS)), self._wo_b)
-            case "wq_b_scale" | "wo_b_scale":
+                return self._stacked_mx_pair("wo_b_scale", list(range(NUM_LAYERS)), self._wo_b)
+            case "wq_a_scale" | "wq_b_scale" | "wkv_scale" | "wo_a_scale" | "wo_b_scale":
                 self.convert(name.removesuffix("_scale"))  # populates the stash
                 return self._stash.pop(name)
             case "gamma_cq":
@@ -989,9 +1202,7 @@ class FlashWeightConverter:
             case "attn_sink":
                 return rep(fwd(lambda l: self._raw(f"layers.{l}.attn.attn_sink")), self.ep)
             case "wo_a":
-                return rep(fwd(
-                    lambda l: self._deq_fp8(f"layers.{l}.attn.wo_a").to(torch.bfloat16).view(O_GROUPS, O_LORA, -1)),
-                    self.ep)
+                return self._stacked_mx_pair("wo_a_scale", list(range(NUM_LAYERS)), self._wo_a)
             # ---- per-FWD-layer stacked MoE weights ----
             case "norm_w":
                 return rep(fwd(lambda l: self._raw(f"layers.{l}.ffn_norm.weight")), self.ep)
@@ -1022,7 +1233,7 @@ class FlashWeightConverter:
             case "csa_cmp_norm_w":
                 return rep(csa(lambda l: self._raw(f"layers.{l}.attn.compressor.norm.weight")), self.ep)
             case "csa_idx_wq_b":
-                return self._stacked_pair("csa_idx_wq_b_scale", CSA_LAYERS, self._idx_wq_b)
+                return self._stacked_mx_pair("csa_idx_wq_b_scale", CSA_LAYERS, self._idx_wq_b)
             case "csa_idx_wq_b_scale":
                 self.convert("csa_idx_wq_b")
                 return self._stash.pop(name)
@@ -1080,9 +1291,11 @@ class FlashWeightConverter:
         out["gamma_cq"] = rep(self._raw(f"layers.{lyr}.attn.q_norm.weight"))
         out["gamma_ckv"] = rep(self._raw(f"layers.{lyr}.attn.kv_norm.weight"))
         out["attn_sink"] = rep(self._raw(f"layers.{lyr}.attn.attn_sink"))
-        out["wq_a"] = rep(self._deq_fp8(f"layers.{lyr}.attn.wq_a").t().contiguous().to(torch.bfloat16))
-        out["wkv"] = rep(self._deq_fp8(f"layers.{lyr}.attn.wkv").t().contiguous().to(torch.bfloat16))
-        out["wo_a"] = rep(self._deq_fp8(f"layers.{lyr}.attn.wo_a").to(torch.bfloat16).view(O_GROUPS, O_LORA, -1))
+        for name in ("wq_a", "wkv"):
+            w, s = self._attention_linear(lyr, name)
+            out[name], out[f"{name}_scale"] = rep(w), rep(s)
+        w, s = self._wo_a(lyr)
+        out["wo_a"], out["wo_a_scale"] = rep(w), rep(s)
         w, s = self._wq_b(lyr)
         out["wq_b"], out["wq_b_scale"] = rep(w), rep(s)
         w, s = self._wo_b(lyr)
@@ -1091,8 +1304,8 @@ class FlashWeightConverter:
         out["gate_bias"] = rep(self._gate_bias(lyr))
         out["tid2eid"] = rep(self._tid2eid(lyr))
         for which in ("w1", "w2", "w3"):
-            weight_mx, w_scale = self._routed_layer(lyr, which)
-            out[f"routed_{which}"] = weight_mx
+            weight_tiles, w_scale = self._routed_layer(lyr, which)
+            out[f"routed_{which}"] = weight_tiles
             logical_scale = unpack_b_scale_batched(w_scale.contiguous().view(torch.uint8))
             flat_scale = logical_scale.flatten(1, 2)
             out[f"routed_{which}_scale"] = pack_b_scale_batched(flat_scale).view(
@@ -1153,8 +1366,8 @@ def apply_real_layer_weights(specs: list, ckpt_dir: str | Path, *, layer_id: int
 # scale conversion hits the converter's stash.
 REAL_WEIGHT_NAMES = (
     "hc_attn_fn", "hc_attn_scale", "hc_attn_base", "attn_norm_w",
-    "wq_a", "wq_b", "wq_b_scale", "wkv", "gamma_cq", "gamma_ckv",
-    "attn_sink", "wo_a", "wo_b", "wo_b_scale",
+    "wq_a", "wq_a_scale", "wq_b", "wq_b_scale", "wkv", "wkv_scale", "gamma_cq", "gamma_ckv",
+    "attn_sink", "wo_a", "wo_a_scale", "wo_b", "wo_b_scale",
     "hc_ffn_fn", "hc_ffn_scale", "hc_ffn_base", "norm_w",
     "gate_w", "gate_bias", "tid2eid",
     "routed_w1", "routed_w1_scale", "routed_w3", "routed_w3_scale",
@@ -1168,6 +1381,67 @@ REAL_WEIGHT_NAMES = (
     "hc_head_fn", "hc_head_scale", "hc_head_base", "final_norm_w",
     "embed_weight", "lm_head_weight",
 )
+
+
+def _flash_cache_identity(*, ep: int, tp: int) -> dict:
+    return {
+        "schema": FLASH_CACHE_SCHEMA,
+        "source": _flash_source_identity(),
+        "reference": {
+            "repository": "https://github.com/Ascend/cann-recipes-infer",
+            "revision": CANN_WEIGHT_REFERENCE_REVISION,
+            "converter": "models/deepseek_v4/utils/mx_quantize.py",
+            "dense_weight_quantization": "group32_e4m3_round2decimal_nearest_satfinite",
+            "scale_layout": "MX_B_NN_independent_layer_and_output_group",
+            "routed_weight_quantization": "group32_e2m1_round2decimal_nearest_satfinite",
+        },
+        "variant": M.name,
+        "ep": ep,
+        "tp": tp,
+        "num_layers": NUM_LAYERS,
+        "csa_layers": CSA_LAYERS,
+        "hca_layers": HCA_LAYERS,
+        "n_routed_experts": N_EXPERTS_FULL // 8 * ep,
+        "weight_names": list(REAL_WEIGHT_NAMES),
+    }
+
+
+def _write_json_atomic(path: Path, content: dict) -> None:
+    temporary = path.with_name(path.name + ".incomplete")
+    with temporary.open("w", encoding="utf-8") as stream:
+        json.dump(content, stream, indent=2, sort_keys=True)
+        stream.write("\n")
+        stream.flush()
+        os.fsync(stream.fileno())
+    os.replace(temporary, path)
+
+
+def _check_cache_identity(manifest: dict, *, ep: int, tp: int) -> None:
+    expected = _flash_cache_identity(ep=ep, tp=tp)
+    if manifest.get("identity") != expected:
+        raise ValueError("weight cache has a stale schema, source, quantization, or EP/TP configuration; reconvert it")
+
+
+def _check_cache_file(directory: Path, name: str, entry: dict, *, digest: bool = True) -> Path:
+    path = directory / f"{name}.pt"
+    if not path.is_file() or path.stat().st_size != entry.get("file_bytes"):
+        raise ValueError(f"weight cache is incomplete or truncated: {path}")
+    if digest and _file_sha256(path) != entry.get("sha256"):
+        raise ValueError(f"weight cache checksum failed: {path}")
+    return path
+
+
+def _load_complete_cache(directory: Path, *, ep: int, tp: int) -> dict:
+    path = directory / "manifest.json"
+    if not path.is_file():
+        raise ValueError(f"weight cache has no completed manifest: {directory}; finish or rerun conversion")
+    manifest = json.loads(path.read_text(encoding="utf-8"))
+    _check_cache_identity(manifest, ep=ep, tp=tp)
+    if manifest.get("complete") is not True or set(manifest.get("tensors", {})) != set(REAL_WEIGHT_NAMES):
+        raise ValueError(f"weight cache is partial: {directory}; finish conversion before inference")
+    for name, entry in manifest["tensors"].items():
+        _check_cache_file(directory, name, entry, digest=False)
+    return manifest
 
 
 # ---------------------------------------------------------------------------
@@ -1188,22 +1462,22 @@ def apply_real_weights(specs: list, weights_dir: str | Path, *, ep: int, tp: int
     if not weights_dir.is_dir():
         raise FileNotFoundError(f"--weights dir not found: {weights_dir}")
     converter = None
+    cache_manifest = None
     if (weights_dir / "model.safetensors.index.json").is_file():
         converter = FlashWeightConverter(FlashCheckpoint(weights_dir), ep=ep, tp=tp)
+    else:
+        cache_manifest = _load_complete_cache(weights_dir, ep=ep, tp=tp)
 
     def make_init(spec):
         def init() -> torch.Tensor:
             if converter is not None:
                 value = converter.convert(spec.name)
             else:
-                path = weights_dir / f"{spec.name}.pt"
-                if not path.is_file():
-                    # ValueError so the harness's input-generation stage reports
-                    # a clean RunResult failure instead of a raw traceback.
-                    raise ValueError(
-                        f"converted weight missing: {path} (run weights_flash.py --ckpt ... --out {weights_dir})"
-                    )
+                entry = cache_manifest["tensors"][spec.name]
+                path = _check_cache_file(weights_dir, spec.name, entry)
                 value = torch.load(path, weights_only=True, mmap=True)
+                if list(value.shape) != entry.get("shape") or str(value.dtype) != entry.get("dtype"):
+                    raise ValueError(f"weight cache tensor metadata mismatch: {path}")
             if list(value.shape) != list(spec.shape) or value.dtype != spec.dtype:
                 raise ValueError(
                     f"{spec.name}: converted weight {tuple(value.shape)}/{value.dtype} does not match "
@@ -1261,19 +1535,54 @@ def main() -> None:
     if unknown:
         raise SystemExit(f"unknown spec names {unknown}; expected among {sorted(REAL_WEIGHT_NAMES)}")
 
+    state_path = out_dir / "conversion-state.json"
+    complete_path = out_dir / "manifest.json"
+    state = {"identity": _flash_cache_identity(ep=ep, tp=tp), "complete": False, "tensors": {}}
+    if state_path.is_file() and not args.force:
+        state = json.loads(state_path.read_text(encoding="utf-8"))
+        _check_cache_identity(state, ep=ep, tp=tp)
+    elif not args.force and any(out_dir.glob("*.pt")):
+        raise SystemExit("existing weight files have no matching conversion state; use --force to replace them")
+    # A reader must never observe a completed manifest while files are being replaced.
+    complete_path.unlink(missing_ok=True)
+    state["complete"] = False
+    _write_json_atomic(state_path, state)
+
     print(f"[CONVERT] variant={M.name} ep={ep} tp={tp} ckpt={args.ckpt} out={out_dir}", flush=True)
     for i, name in enumerate(names):
         path = out_dir / f"{name}.pt"
-        if path.is_file() and not args.force:
-            print(f"[CONVERT] ({i + 1}/{len(names)}) {name}: exists, skipped", flush=True)
+        entry = state["tensors"].get(name)
+        if entry is not None and not args.force:
+            _check_cache_file(out_dir, name, entry)
+            print(f"[CONVERT] ({i + 1}/{len(names)}) {name}: verified, skipped", flush=True)
             continue
         value = converter.convert(name)
-        torch.save(value, path)
+        temporary = path.with_name(path.name + ".incomplete")
+        with temporary.open("wb") as stream:
+            torch.save(value, stream)
+            stream.flush()
+            os.fsync(stream.fileno())
+        entry = {
+            "shape": list(value.shape), "dtype": str(value.dtype),
+            "file_bytes": temporary.stat().st_size, "sha256": _file_sha256(temporary),
+        }
+        os.replace(temporary, path)
+        state["tensors"][name] = entry
+        _write_json_atomic(state_path, state)
         size_gb = value.numel() * value.element_size() / 1024**3
         print(f"[CONVERT] ({i + 1}/{len(names)}) {name}: {tuple(value.shape)} {value.dtype} {size_gb:.2f} GiB",
               flush=True)
         del value
-    print(f"[CONVERT] done: {out_dir}", flush=True)
+    missing = set(REAL_WEIGHT_NAMES) - set(state["tensors"])
+    if missing:
+        print(f"[CONVERT] partial cache: {len(missing)} tensors remain; rerun without --only", flush=True)
+    else:
+        for name, entry in state["tensors"].items():
+            _check_cache_file(out_dir, name, entry, digest=False)
+        state["complete"] = True
+        _write_json_atomic(state_path, state)
+        _write_json_atomic(complete_path, state)
+        print(f"[CONVERT] complete manifest published: {out_dir}", flush=True)
 
 
 # ===========================================================================
@@ -1343,9 +1652,11 @@ def _base_attention_views(tensors, rank, layer, x_hc, x_out, num_tokens):
         "hc_attn_base": fwd("hc_attn_base"),
         "attn_norm_w": fwd("attn_norm_w"),
         "wq_a": fwd("wq_a"),
+        "wq_a_scale": fwd("wq_a_scale"),
         "wq_b": fwd("wq_b"),
         "wq_b_scale": fwd("wq_b_scale"),
         "wkv": fwd("wkv"),
+        "wkv_scale": fwd("wkv_scale"),
         "gamma_cq": fwd("gamma_cq"),
         "gamma_ckv": fwd("gamma_ckv"),
         "freqs_cos": _rope_profile_for_kind(tensors["freqs_cos"][rank], kind),
@@ -1355,6 +1666,7 @@ def _base_attention_views(tensors, rank, layer, x_hc, x_out, num_tokens):
         "ori_slot_mapping": tensors["ori_slot_mapping"][rank],
         "attn_sink": fwd("attn_sink"),
         "wo_a": fwd("wo_a"),
+        "wo_a_scale": fwd("wo_a_scale"),
         "wo_b": fwd("wo_b"),
         "wo_b_scale": fwd("wo_b_scale"),
         "x_out": x_out,
@@ -1453,6 +1765,7 @@ def _moe_views(tensors, layer, x_hc, x_next, num_tokens):
     }
     views.update({
         "x_hc": x_hc,
+        "mxfp4_pair_lut": tensors["mxfp4_pair_lut"],
         "input_ids": tensors["input_ids"],
         "layer_id": layer,
         "num_tokens": num_tokens,
@@ -1930,6 +2243,11 @@ def stacked_mapped_pool_ratio_allclose(
         expected_rows = expected.cpu().reshape(
             rank_count, layer_count, rows_per_layer, -1
         )
+        if actual_rows.dtype == torch.float8_e4m3fn:
+            # CPU float8 does not implement the indexing/isfinite primitives
+            # below. FP32 represents each finite FP8 value exactly, including
+            # the values checked outside the active mapped rows.
+            actual_rows, expected_rows = actual_rows.float(), expected_rows.float()
         failures: list[str] = []
 
         for layer_index, (layer_label, mapping_name) in enumerate(
@@ -2196,14 +2514,14 @@ def build_validate_compare_fn(num_tokens):
             rtol=2e-2,
             max_error_ratio=0.01,
         ),
-        # INT8 index cache: allow one quantization step on a bounded fraction.
+        # FP8 index cache: allow one mantissa step on a bounded fraction.
         "idx_kv_cache": stacked_pool(
             ("csa_idx_slot_mapping",) * CSA_NUM_LAYERS,
             layer_labels=csa_layer_labels,
             block_size=config.BLOCK_SIZE,
             pool_name="idx_kv_cache",
-            atol=1,
-            rtol=0,
+            atol=0.001953125,
+            rtol=0.125,
             max_error_ratio=0.02,
         ),
         "idx_kv_scale": stacked_pool(

@@ -107,7 +107,7 @@ def gate(
     norm_w_2d = pl.reshape(norm_w, [1, D])
     xg_buf = pl.create_tensor([T_PAD, D], dtype=pl.FP32)
     inv_rms_buf = pl.create_tensor([1, T_PAD], dtype=pl.FP32)
-    inv_rms_router_buf = pl.create_tensor([T_PAD, 1], dtype=pl.FP32)
+    x_norm_buf = pl.create_tensor([T_PAD, D], dtype=pl.FP32)
     for init_idx in pl.spmd((T_PAD // GATE_M_TILE) * (D // GATE_D_TILE), name_hint="ffn_norm_zero"):
         init_t = (init_idx // (D // GATE_D_TILE)) * GATE_M_TILE
         init_k = (init_idx % (D // GATE_D_TILE)) * GATE_D_TILE
@@ -144,7 +144,6 @@ def gate(
         rms_root = pl.sqrt(rms_arg)
         inv_rms = pl.recip(rms_root)
         pl.tile.store(inv_rms, [0, tok], inv_rms_buf, shapes=[1, 1])
-        pl.tile.store(inv_rms, [tok, 0], inv_rms_router_buf, shapes=[1, 1])
 
     for quant_idx in pl.spmd((T_PAD // GATE_M_TILE) * (D // QUANT_TASK_TILE), name_hint="x_norm_mx_quant"):
         tile_idx = quant_idx // (D // QUANT_TASK_TILE)
@@ -158,7 +157,11 @@ def gate(
             xg_chunk_t = pl.transpose(xg_chunk, axis1=0, axis2=1)
             x_norm_chunk_t = pl.col_expand_mul(xg_chunk_t, inv_rms_chunk)
             x_norm_chunk = pl.transpose(x_norm_chunk_t, axis1=0, axis2=1)
-            x_quant, scale_quant = pl.quant_mx(x_norm_chunk, group_axis=1)
+            # FFN RMSNorm returns BF16 before both routing and expert quantization.
+            x_norm_bf16 = pl.cast(x_norm_chunk, pl.BF16, mode="rint")
+            x_norm_fp32 = pl.cast(x_norm_bf16, pl.FP32)
+            x_norm_buf = pl.store(x_norm_fp32, [t0, k0], x_norm_buf)
+            x_quant, scale_quant = pl.quant_mx(x_norm_bf16, group_axis=1)
             x_norm_mx = pl.store(x_quant, [t0, k0], x_norm_mx)
             scale_offset = t0 * MX_SCALE_GROUPS + chunk_idx * GATE_M_TILE * (QUANT_TILE // MX_GROUP)
             x_norm_scale = pl.store(
@@ -189,14 +192,12 @@ def gate(
         gate_logits_tile = pl.create_tensor([GATE_M_TILE, GATE_N_TILE], dtype=pl.FP32)
         for kb in pl.pipeline(0, D // GATE_D_TILE, stage=2):
             gd_kd = kb * GATE_D_TILE
-            gd_x = xg_buf[t1 : t1 + GATE_M_TILE, gd_kd : gd_kd + GATE_D_TILE]
+            gd_x = x_norm_buf[t1 : t1 + GATE_M_TILE, gd_kd : gd_kd + GATE_D_TILE]
             gd_w = gate_w[n0 : n0 + GATE_N_TILE, gd_kd : gd_kd + GATE_D_TILE]
             if gd_kd == 0:
                 gate_logits_tile = pl.matmul(gd_x, gd_w, out_dtype=pl.FP32, b_trans=True)
             else:
                 gate_logits_tile = pl.matmul_acc(gate_logits_tile, gd_x, gd_w, b_trans=True)
-        inv_rms_tile = inv_rms_router_buf[t1 : t1 + GATE_M_TILE, 0:1]
-        gate_logits_tile = pl.row_expand_mul(gate_logits_tile, inv_rms_tile)
         gp_relu = pl.maximum(gate_logits_tile, 0.0)
         gp_abs = pl.abs(gate_logits_tile)
         gp_neg_abs = pl.neg(gp_abs)
@@ -328,8 +329,8 @@ def _golden_gate_scores(tensors):
 
     gate_w = tensors["gate_w"].cpu().float()
     gate_bias = tensors["gate_bias"].cpu().float()
-    logits_acc = xg @ gate_w.T
-    logits = inv_rms * logits_acc
+    x_norm = (xg * inv_rms).to(torch.bfloat16).float()
+    logits = x_norm @ gate_w.T
     softplus = logits.clamp(min=0) + torch.log1p(torch.exp(-logits.abs()))
     scores = softplus.sqrt()
     biased = scores + gate_bias.view(1, -1)
@@ -345,7 +346,7 @@ def golden_gate_core(tensors):
 
     from utils import host_mxfp8_activation
 
-    x_norm = xg * inv_rms
+    x_norm = (xg * inv_rms).to(torch.bfloat16).float()
     x_norm[num_tokens:] = 0
     x_norm_padded = torch.zeros(T_PAD, D, dtype=torch.float32)
     x_norm_padded[:T] = x_norm

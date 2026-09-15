@@ -17,7 +17,7 @@ default so existing operator entry points and DailyCI keep their prior behavior.
 | Decode context length | up to 16,384 positions (`KERNEL_MAX_SEQ_LEN`), 128-token pages |
 | Prefill shape | one request of 128 tokens per program |
 | Platform | Ascend A5 (`-p a5`); full forwards are device-only |
-| Expert parallelism | `--ep 2/4/8`, `384 / ep` routed experts per rank |
+| Expert parallelism | `--ep 2/4/8`; real Flash requires EP8 with 32 routed experts per rank |
 | LM-head parallelism | `--tp 2/4/8` vocab shards; `LM_HEAD_TP_SIZE = 8` is the deployment value |
 | Other components | no tensor parallelism — attention is data-parallel, MoE is expert-parallel |
 | Quantization | Hybrid MXFP8-MXFP4 — MXFP8 for the dense path, MXFP4 for the routed-expert weights |
@@ -30,21 +30,27 @@ therefore replaces it with `KERNEL_MAX_SEQ_LEN = 16384` — an 8k prompt plus 51
 decode steps, the budget the Flash cases already exercise. Raise that one
 constant if a case needs a longer context.
 
-The MoE path follows the DeepSeek-V4-Pro AscendC quantization boundary:
+The native MX path follows the CANN DeepSeek V4 deployment quantization boundary:
 
-- Routed W1/W3/W2 checkpoint tensors stay MXFP4 on disk. The host bridge in
-  [utils.py](../../../models/deepseek_v4_pro/utils.py) expands each E2M1
-  nibble exactly to its FP8E4M3 value, preserves the original per-32 E8M0
-  scale, and packs it as ``MX_B_NN`` before Cube multiplication.
+- Routed W1/W3/W2 tensors remain packed MXFP4 on disk and in device memory.
+  [utils.py](../../../models/deepseek_v4_pro/utils.py) canonicalizes source groups
+  to the CANN MXFP4 weight representation and packs their per-32 E8M0 scales
+  as ``MX_B_NN``. [expert_routed.py](../../../models/deepseek_v4_pro/expert_routed.py)
+  expands each E2M1 nibble exactly to FP8E4M3 per tile before Cube multiplication;
+  this device bridge is lossless.
 - Shared W1/W3/W2 use native MXFP8 data and per-32 E8M0 scales.
 - [gate.py](../../../models/deepseek_v4_pro/gate.py) applies ``pl.quant_mx``
   to the normalized MoE input. [moe.py](../../../models/deepseek_v4_pro/moe.py)
-  dispatches both the FP8 data and its scale, and both expert kernels apply
-  ``pl.quant_mx`` again after SwiGLU before W2.
+  dispatches both the FP8 data and its scale. Both expert kernels round W1/W3
+  outputs to BF16, apply clipped SwiGLU, then use the CANN SwiGLU-specific
+  ceiling exponent before W2. This scale rule differs from ordinary dynamic MX
+  activation quantization.
 
-The expert kernels pass ordinary ``pl.load`` results directly to
-``pl.matmul_mx``. PyPTO infers the data and scale staging from the four operand
-positions, including ``LeftScale`` and ``RightScale`` placement. Quantized
+The shared-expert kernels pass ordinary ``pl.load`` results directly to
+``pl.matmul_mx``. The routed experts do not: their W1/W3/W2 payloads are packed
+MXFP4 in device memory and are expanded to MXFP8 through a vector LUT gather
+before the Cube op. Either way PyPTO infers the data and scale staging from the
+four operand positions, including ``LeftScale`` and ``RightScale`` placement. Quantized
 activations remain GM-backed where multiple expert or W2 output blocks reuse
 them; direct vector-to-cube transport would otherwise repeat quantization or
 reduce output-block parallelism.
@@ -140,13 +146,48 @@ prefill_mtp     mtp_projection → prefill_attention_swa → moe → hc_head →
 
 ## Real weights (Flash)
 
-`utils.py` converts the released DeepSeek-V4-Flash checkpoint (hybrid
-MXFP4 routed experts + block-FP8 attention/shared-expert linears) into the
-host-tensor ABI of the two forward drivers. Routed MXFP4 values are expanded
-losslessly to FP8E4M3 while retaining their E8M0 scales; shared-expert weights
-are converted to native MXFP8; attention's existing W8A8 tensors remain
-INT8. Per-layer tensors are stacked and EP/TP-sharded exactly like the
-fixture specs. Convert once offline, then point the drivers at the cache:
+`utils.py` converts the released DeepSeek-V4-Flash checkpoint into the
+native MX tensor ABI of the two forward drivers. Dense attention projections,
+the indexer query projection, and shared experts use MXFP8 with per-32 E8M0
+scales. Routed experts retain packed MXFP4 payloads with per-32 E8M0 scales.
+Per-layer tensors are stacked and EP/TP-sharded exactly like the fixture
+specs.
+
+### Reference and numerical boundaries
+
+The architecture and checkpoint source are the official
+[DeepSeek Flash release](https://huggingface.co/deepseek-ai/DeepSeek-V4-Flash/tree/60d8d70770c6776ff598c94bb586a859a38244f1).
+The A5 quantization reference is
+[CANN recipes](https://gitcode.com/cann/cann-recipes-infer/tree/ba83ab4aecb8969c831d28abd02de159d279917b/models/deepseek_v4).
+The cache records both revisions. The implementation targets this CANN
+deployment convention; it does not promise bitwise identity with the released
+Triton inference path, whose activation grouping and indexer quantization differ.
+
+| Boundary | A5 implementation |
+| --- | --- |
+| Dense/shared weights | Source block-FP8 dequantization, then CANN MXFP8 KN groups of 32 |
+| Routed weights | CANN MXFP4 group conversion; exact E2M1-to-E4M3 device expansion |
+| Ordinary linear input | BF16 input, OCP dynamic MXFP8 groups of 32 |
+| Expert intermediate | BF16 W1/W3 outputs, clipped SwiGLU, ceiling MXFP8 scale before W2 |
+| Routed reduction | BF16 W2 output, then routing multiplier |
+| Q projection | BF16 linear/norm boundaries; Q-head RMS norm has no learned affine weight |
+| Main KV | Non-RoPE channels undergo FP8 quantize/dequantize in groups of 64; RoPE channels bypass quantization |
+| Indexer Q | BF16 Hadamard boundary, E4M3 with a linear per-head scale |
+| Indexer K | BF16 Hadamard boundary, E4M3 with a power-of-two per-row ceiling scale |
+| Residual | BF16 rounding at the hyperconnection post boundary |
+
+Flash uses 43 layers, 4096 hidden channels, 64 attention heads, 256 routed
+experts, top-6 routing, and one shared expert. Layers 0 and 1 use SWA;
+the remaining main layers alternate ratio-4 CSA and ratio-128 HCA, ending
+with CSA. The first three layers use hash routing. The local context limit
+is 16,384 positions, below the checkpoint's architectural one-million limit.
+
+A completed cache has a schema-versioned `manifest.json` containing the source,
+quantization reference, EP/TP configuration, and each tensor's shape, dtype,
+byte size, and SHA-256. Readers reject stale, incomplete, or corrupt caches.
+Conversion writes tensors atomically and publishes the manifest last.
+
+Convert once offline, then point the drivers at the cache:
 
 ```bash
 PYTHONPATH=.:models/deepseek_v4_pro python -c 'import utils; utils.main()' \
@@ -170,15 +211,14 @@ Numeric validation on real weights:
   recomputes with the same weights, so the existing per-layer validation runs
   on real dynamic ranges.
 - `prefill_fwd.py --validate` enables a full-network torch golden
-  (`golden_fwd.py`: embed → 43 chained layer goldens → hc_head → final norm →
+  (`utils.golden_prefill_fwd`: embed → 43 chained layer goldens → hc_head → final norm →
   LM head). End-of-network gates are cosine/rel-L2 on the selected logit rows
   plus greedy-sample agreement; per-element gates on deep hidden states and
   compressor state pools accumulate cross-layer drift and are expected to
   need looser budgets than the single-layer drivers. RoPE tables, the
   indexer Hadamard, caches, and per-step metadata keep their fixture
-  initializers. The drivers stay smoke-only (`golden_fn=None`): a real-weight
-  run validates that the network executes with real dynamic ranges and produces
-  finite logits/sensible tokens, not a golden comparison.
+  initializers. Without `--validate`, a real-weight forward is a runtime smoke
+  test; numerical agreement requires the explicit golden comparison.
 
 Golden data can be computed once and replayed: `prefill_fwd.py --validate
 --save-data` persists the generated inputs and golden outputs under
@@ -208,8 +248,29 @@ python models/deepseek_v4_pro/synthetic_token_loop.py --variant flash \
     --ep 8 --tp 2 -d 0,1,2,3,4,5,6,7 \
     --weights build_output/flash_weights_ep8_tp2 \
     --tokenizer /path/to/DeepSeek-V4-Flash/tokenizer.json \
-    --prompt "The capital of France is" --decode-steps 32
+    --prompt "The capital of France is" --decode-steps 32 \
+    --result-json build_output/flash_e2e.json
 ```
+
+The EP8 resident session prepares about 210 GiB of host tensors in shared memory.
+Ensure the Linux `/dev/shm` mount has enough free space before starting; the
+loader checks capacity before promoting the resident bank. This host preparation
+is included in load time and excluded from token-generation timing.
+
+The optional result JSON records success/failure, generated token IDs/text,
+compile and load time separately, resident time to first token, and inter-token
+wall times. Throughput counts the generated sequence once; EP ranks replicate
+the request. Timings include host coordination and are measured without warmup,
+so they are not serving throughput or isolated kernel latency.
+
+It also records `rank_spread`, one entry per sampling point, and the
+`ranks_bit_identical` verdict over the whole run. Every rank holds the full
+hidden state and the full vocabulary after the MoE combine and the LM-head
+gather, so the ranks should be bit-identical; equal sampled tokens do not show
+that, because drift only becomes a token difference when it flips a near-tie
+argmax. A run can therefore report `pass` with `ranks_bit_identical` false. The
+spread is scanned after each step is timed, so it is outside every latency
+figure.
 
 The full prefill and decode programs carry runtime `num_tokens` and
 `moe_epoch_base` scalars in their compiled ABI. Their `ScalarSpec`s use
@@ -248,6 +309,25 @@ stalls every EP8 prefill before the first token, and a probabilistic
 cross-rank divergence
 ([#1043](https://github.com/hw-native-sys/pypto-lib/issues/1043)) is still
 open, so a run can diverge between ranks without the kernels having changed.
+Read `ranks_bit_identical` rather than the pass/fail status when judging whether
+a given run was affected.
+
+### What the nightly end-to-end job checks
+
+The `e2e-flash-a5` job in `daily_ci.yml` runs this loop on the pinned checkpoint
+and publishes the prompt, the generated text and the timings in the run summary.
+It asserts only that generation happened: eight distinct devices, a token count
+that matches the completed decode steps, and decoded text with lexical content.
+Whether the text is *good* is for a reader of the summary to judge, so an
+operator change that damages the model shows up there as degraded output, or
+below as a failure. It has no `continue-on-error` and no skip path: a runner
+without `PYPTO_DSV4_FLASH_CKPT_DIR` fails the job rather than reporting a green
+night that never sampled a token.
+
+The converted weight cache is reused across nights only while
+`_load_complete_cache` still accepts it against the checked-out conversion code,
+so a change to the quantization path is converted again instead of being masked
+by the previous night's tensors.
 
 ## Files
 

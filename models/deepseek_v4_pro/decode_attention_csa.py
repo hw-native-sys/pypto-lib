@@ -20,7 +20,7 @@ workflow checkpoint. It composes:
 - hc_post
 
 The helper stack in this repo has already moved to the refreshed v4 contracts:
-q_proj runs through the W8A8 path, sparse_attn owns grouped o_proj, and the
+q_proj runs through the native MXFP8 path, sparse_attn owns grouped o_proj, and the
 indexer consumes a prepared `idx_kv_cache` instead of owning the inner
 compressor itself. This file aligns to that stack instead of the older draft
 surface.
@@ -28,6 +28,8 @@ surface.
 
 
 import pypto.language as pl
+from mx_weight_specs import mxfp8_weight_specs
+from indexer_cache_quant import fp8_cache_compare
 
 from golden import mapped_pool_ratio_allclose
 
@@ -44,8 +46,6 @@ from config import (
     KV_CMP_MAX_BLOCKS,
     KV_ORI_MAX_BLOCKS,
     KV_ORI_TABLE_MAX_BLOCKS,
-    INT8_SCALE_MAX,
-    INT8_AMAX_EPS,
 )
 from decode_compressor_ratio4 import compressor_ratio4
 from hc_post import hc_post
@@ -112,10 +112,12 @@ def attention_csa(
     hc_attn_scale: pl.Tensor[[3], pl.FP32],
     hc_attn_base: pl.Tensor[[MIX_HC], pl.FP32],
     attn_norm_w: pl.Tensor[[D], pl.BF16],
-    wq_a: pl.Tensor[[D, Q_LORA], pl.BF16],
-    wq_b: pl.Tensor[[Q_LORA, H * HEAD_DIM], pl.INT8],
-    wq_b_scale: pl.Tensor[[H * HEAD_DIM], pl.FP32],
-    wkv: pl.Tensor[[D, HEAD_DIM], pl.BF16],
+    wq_a: pl.Tensor[[D, Q_LORA], pl.FP8E4M3FN],
+    wq_a_scale: pl.Tensor[[D // 32, Q_LORA], pl.FP8E8M0, pl.MX_B_NN],
+    wq_b: pl.Tensor[[Q_LORA, H * HEAD_DIM], pl.FP8E4M3FN],
+    wq_b_scale: pl.Tensor[[Q_LORA // 32, H * HEAD_DIM], pl.FP8E8M0, pl.MX_B_NN],
+    wkv: pl.Tensor[[D, HEAD_DIM], pl.FP8E4M3FN],
+    wkv_scale: pl.Tensor[[D // 32, HEAD_DIM], pl.FP8E8M0, pl.MX_B_NN],
     gamma_cq: pl.Tensor[[Q_LORA], pl.BF16],
     gamma_ckv: pl.Tensor[[HEAD_DIM], pl.BF16],
     freqs_cos: pl.Tensor[[MAX_SEQ_LEN, ROPE_HEAD_DIM], pl.BF16],
@@ -126,8 +128,8 @@ def attention_csa(
     cmp_norm_w: pl.Tensor[[HEAD_DIM], pl.BF16],
     compress_state: pl.Tensor[[MAIN_STATE_BLOCK_NUM, MAIN_STATE_BLOCK_SIZE, MAIN_STATE_DIM], pl.FP32],
     compress_state_block_table: pl.Tensor[[B, MAIN_STATE_MAX_BLOCKS], pl.INT32],
-    idx_wq_b: pl.Tensor[[Q_LORA, IDX_N_HEADS * IDX_HEAD_DIM], pl.INT8],
-    idx_wq_b_scale: pl.Tensor[[IDX_N_HEADS * IDX_HEAD_DIM], pl.FP32],
+    idx_wq_b: pl.Tensor[[Q_LORA, IDX_N_HEADS * IDX_HEAD_DIM], pl.FP8E4M3FN],
+    idx_wq_b_scale: pl.Tensor[[Q_LORA // 32, IDX_N_HEADS * IDX_HEAD_DIM], pl.FP8E8M0, pl.MX_B_NN],
     weights_proj: pl.Tensor[[D, IDX_N_HEADS], pl.BF16],
     hadamard_idx: pl.Tensor[[IDX_HEAD_DIM, IDX_HEAD_DIM], pl.BF16],
     inner_wkv: pl.Tensor[[INNER_OUT_DIM, D], pl.BF16],
@@ -139,7 +141,7 @@ def attention_csa(
     kv_cache: pl.Tensor[[ORI_BLOCK_NUM, BLOCK_SIZE, 1, HEAD_DIM], pl.BF16],
     cmp_kv: pl.Tensor[[CMP_BLOCK_NUM, BLOCK_SIZE, 1, HEAD_DIM], pl.BF16],
     cmp_block_table: pl.Tensor[[B, CMP_MAX_BLOCKS], pl.INT32],
-    idx_kv_cache: pl.Tensor[[IDX_CACHE_BLOCK_NUM, BLOCK_SIZE, 1, IDX_HEAD_DIM], pl.INT8],
+    idx_kv_cache: pl.Tensor[[IDX_CACHE_BLOCK_NUM, BLOCK_SIZE, 1, IDX_HEAD_DIM], pl.FP8E4M3FN],
     idx_kv_scale: pl.Tensor[[IDX_CACHE_BLOCK_NUM, BLOCK_SIZE, 1, 1], pl.FP32],
     idx_block_table: pl.Tensor[[B, IDX_CACHE_MAX_BLOCKS], pl.INT32],
     ori_slot_mapping: pl.Tensor[[T], pl.INT64],
@@ -152,9 +154,10 @@ def attention_csa(
     position_ids: pl.Tensor[[T], pl.INT32],
     kv_seq_lens: pl.Tensor[[B], pl.INT32],
     attn_sink: pl.Tensor[[H], pl.FP32],
-    wo_a: pl.Tensor[[O_GROUPS, O_LORA, O_GROUP_IN], pl.BF16],
-    wo_b: pl.Tensor[[D, O_GROUPS * O_LORA], pl.INT8],
-    wo_b_scale: pl.Tensor[[D], pl.FP32],
+    wo_a: pl.Tensor[[O_GROUPS, O_GROUP_IN, O_LORA], pl.FP8E4M3FN],
+    wo_a_scale: pl.Tensor[[O_GROUPS * (O_GROUP_IN // 32), O_LORA], pl.FP8E8M0],
+    wo_b: pl.Tensor[[O_GROUPS * O_LORA, D], pl.FP8E4M3FN],
+    wo_b_scale: pl.Tensor[[(O_GROUPS * O_LORA) // 32, D], pl.FP8E8M0, pl.MX_B_NN],
     x_out: pl.Tensor[[T, HC_MULT, D], pl.FP32],
 ):
     x_mixed = pl.create_tensor([T, D], dtype=pl.BF16)
@@ -200,10 +203,10 @@ def attention_csa(
     late_dep = pl.system.task_dummy(deps=[rms_tid])
     q = pl.create_tensor([T, H, HEAD_DIM], dtype=pl.BF16)
     kv = pl.create_tensor([T, HEAD_DIM], dtype=pl.BF16)
-    qr = pl.create_tensor([T, Q_LORA], dtype=pl.INT8)
-    qr_scale = pl.create_tensor([T, 1], dtype=pl.FP32)
-    qkv_proj_rope(
-        x_normed_t, wq_a, wq_b, wq_b_scale, wkv,
+    qr = pl.create_tensor([T, Q_LORA], dtype=pl.FP8E4M3FN)
+    qr_scale = pl.create_tensor([128, Q_LORA // 32], dtype=pl.FP8E8M0, layout=pl.MX_A_ZZ)
+    qkv_done = qkv_proj_rope(
+        x_normed_t, wq_a, wq_a_scale, wq_b, wq_b_scale, wkv, wkv_scale,
         rope_cos_t, rope_sin_t, gamma_cq, gamma_ckv,
         q, kv, qr, qr_scale, late_dep,
     )
@@ -225,13 +228,13 @@ def attention_csa(
     idx_slot_mapping_bsd = pl.reshape(idx_slot_mapping, [B, S])
     state_slot_mapping_bsd = pl.reshape(state_slot_mapping, [B, S])
     inner_state_slot_mapping_bsd = pl.reshape(inner_state_slot_mapping, [B, S])
-    compressor_ratio4(
+    main_done = compressor_ratio4(
         x_normed, cmp_out,
         compress_state, compress_state_block_table,
         cmp_wkv, cmp_wgate, cmp_ape, cmp_norm_w,
         cmp_cos, cmp_sin, cmp_kv,
         position_ids_bsd, cmp_slot_mapping_bsd, state_slot_mapping_bsd,
-        late_dep,
+        qkv_done,
     )
 
     idx_kv_unused = pl.create_tensor([B, S, IDX_HEAD_DIM], dtype=pl.FP32)
@@ -245,7 +248,7 @@ def attention_csa(
         idx_kv_cache, idx_kv_scale, idx_block_table,
         idx_score_unused, idx_topk_full,
         position_ids_bsd, idx_slot_mapping_bsd, inner_state_slot_mapping_bsd,
-        kv_seq_lens, 0, late_dep,
+        kv_seq_lens, 0, main_done,
     )
 
     # sparse_attn now folds the compressed-slot masking + valid-block flags in from
@@ -258,7 +261,7 @@ def attention_csa(
         q, kv_cache, window_swa_indices,
         cmp_kv, cmp_block_table, idx_topk_flat, position_ids_t1,
         attn_sink, rope_cos_t, rope_sin_t,
-        wo_a, wo_b, wo_b_scale, attn_out,
+        wo_a, wo_a_scale, wo_b, wo_b_scale, attn_out,
     )
 
     hc_post(attn_out, x_hc, post_t, comb_t, x_out)
@@ -272,10 +275,12 @@ def attention_csa_test(
     hc_attn_scale: pl.Tensor[[3], pl.FP32],
     hc_attn_base: pl.Tensor[[MIX_HC], pl.FP32],
     attn_norm_w: pl.Tensor[[D], pl.BF16],
-    wq_a: pl.Tensor[[D, Q_LORA], pl.BF16],
-    wq_b: pl.Tensor[[Q_LORA, H * HEAD_DIM], pl.INT8],
-    wq_b_scale: pl.Tensor[[H * HEAD_DIM], pl.FP32],
-    wkv: pl.Tensor[[D, HEAD_DIM], pl.BF16],
+    wq_a: pl.Tensor[[D, Q_LORA], pl.FP8E4M3FN],
+    wq_a_scale: pl.Tensor[[D // 32, Q_LORA], pl.FP8E8M0, pl.MX_B_NN],
+    wq_b: pl.Tensor[[Q_LORA, H * HEAD_DIM], pl.FP8E4M3FN],
+    wq_b_scale: pl.Tensor[[Q_LORA // 32, H * HEAD_DIM], pl.FP8E8M0, pl.MX_B_NN],
+    wkv: pl.Tensor[[D, HEAD_DIM], pl.FP8E4M3FN],
+    wkv_scale: pl.Tensor[[D // 32, HEAD_DIM], pl.FP8E8M0, pl.MX_B_NN],
     gamma_cq: pl.Tensor[[Q_LORA], pl.BF16],
     gamma_ckv: pl.Tensor[[HEAD_DIM], pl.BF16],
     freqs_cos: pl.Tensor[[MAX_SEQ_LEN, ROPE_HEAD_DIM], pl.BF16],
@@ -286,8 +291,8 @@ def attention_csa_test(
     cmp_norm_w: pl.Tensor[[HEAD_DIM], pl.BF16],
     compress_state: pl.InOut[pl.Tensor[[MAIN_STATE_BLOCK_NUM, MAIN_STATE_BLOCK_SIZE, MAIN_STATE_DIM], pl.FP32]],
     compress_state_block_table: pl.Tensor[[B, MAIN_STATE_MAX_BLOCKS], pl.INT32],
-    idx_wq_b: pl.Tensor[[Q_LORA, IDX_N_HEADS * IDX_HEAD_DIM], pl.INT8],
-    idx_wq_b_scale: pl.Tensor[[IDX_N_HEADS * IDX_HEAD_DIM], pl.FP32],
+    idx_wq_b: pl.Tensor[[Q_LORA, IDX_N_HEADS * IDX_HEAD_DIM], pl.FP8E4M3FN],
+    idx_wq_b_scale: pl.Tensor[[Q_LORA // 32, IDX_N_HEADS * IDX_HEAD_DIM], pl.FP8E8M0, pl.MX_B_NN],
     weights_proj: pl.Tensor[[D, IDX_N_HEADS], pl.BF16],
     hadamard_idx: pl.Tensor[[IDX_HEAD_DIM, IDX_HEAD_DIM], pl.BF16],
     inner_wkv: pl.Tensor[[INNER_OUT_DIM, D], pl.BF16],
@@ -299,7 +304,7 @@ def attention_csa_test(
     kv_cache: pl.InOut[pl.Tensor[[ORI_BLOCK_NUM, BLOCK_SIZE, 1, HEAD_DIM], pl.BF16]],
     cmp_kv: pl.InOut[pl.Tensor[[CMP_BLOCK_NUM, BLOCK_SIZE, 1, HEAD_DIM], pl.BF16]],
     cmp_block_table: pl.Tensor[[B, CMP_MAX_BLOCKS], pl.INT32],
-    idx_kv_cache: pl.InOut[pl.Tensor[[IDX_CACHE_BLOCK_NUM, BLOCK_SIZE, 1, IDX_HEAD_DIM], pl.INT8]],
+    idx_kv_cache: pl.InOut[pl.Tensor[[IDX_CACHE_BLOCK_NUM, BLOCK_SIZE, 1, IDX_HEAD_DIM], pl.FP8E4M3FN]],
     idx_kv_scale: pl.InOut[pl.Tensor[[IDX_CACHE_BLOCK_NUM, BLOCK_SIZE, 1, 1], pl.FP32]],
     idx_block_table: pl.Tensor[[B, IDX_CACHE_MAX_BLOCKS], pl.INT32],
     ori_slot_mapping: pl.Tensor[[T], pl.INT64],
@@ -312,15 +317,16 @@ def attention_csa_test(
     position_ids: pl.Tensor[[T], pl.INT32],
     kv_seq_lens: pl.Tensor[[B], pl.INT32],
     attn_sink: pl.Tensor[[H], pl.FP32],
-    wo_a: pl.Tensor[[O_GROUPS, O_LORA, O_GROUP_IN], pl.BF16],
-    wo_b: pl.Tensor[[D, O_GROUPS * O_LORA], pl.INT8],
-    wo_b_scale: pl.Tensor[[D], pl.FP32],
+    wo_a: pl.Tensor[[O_GROUPS, O_GROUP_IN, O_LORA], pl.FP8E4M3FN],
+    wo_a_scale: pl.Tensor[[O_GROUPS * (O_GROUP_IN // 32), O_LORA], pl.FP8E8M0],
+    wo_b: pl.Tensor[[O_GROUPS * O_LORA, D], pl.FP8E4M3FN],
+    wo_b_scale: pl.Tensor[[(O_GROUPS * O_LORA) // 32, D], pl.FP8E8M0, pl.MX_B_NN],
     x_out: pl.Out[pl.Tensor[[T, HC_MULT, D], pl.FP32]],
 ):
     attention_csa(
         x_hc,
         hc_attn_fn, hc_attn_scale, hc_attn_base,
-        attn_norm_w, wq_a, wq_b, wq_b_scale, wkv, gamma_cq, gamma_ckv,
+        attn_norm_w, wq_a, wq_a_scale, wq_b, wq_b_scale, wkv, wkv_scale, gamma_cq, gamma_ckv,
         freqs_cos, freqs_sin,
         cmp_wkv, cmp_wgate, cmp_ape, cmp_norm_w,
         compress_state, compress_state_block_table,
@@ -333,7 +339,7 @@ def attention_csa_test(
         cmp_slot_mapping, idx_slot_mapping,
         state_slot_mapping, inner_state_slot_mapping,
         position_ids, kv_seq_lens,
-        attn_sink, wo_a, wo_b, wo_b_scale,
+        attn_sink, wo_a, wo_a_scale, wo_b, wo_b_scale,
         x_out,
     )
     return (
@@ -392,22 +398,22 @@ def golden_attention_csa(tensors):
 
     q = torch.zeros(T, H, HEAD_DIM, dtype=torch.bfloat16)
     kv = torch.zeros(T, HEAD_DIM, dtype=torch.bfloat16)
-    qr_i8 = torch.zeros(T, Q_LORA, dtype=torch.int8)
-    qr_scale = torch.zeros(T, 1, dtype=torch.float32)
+    qr_fp8 = torch.zeros(T, Q_LORA, dtype=torch.float8_e4m3fn)
+    qr_scale = torch.zeros(128, Q_LORA // 32, dtype=torch.uint8).view(torch.float8_e8m0fnu)
     x_normed = golden_rms_norm(x_mixed, tensors["attn_norm_w"])
     golden_qkv_proj_rope({
         "x": x_normed,
-        "wq_a": tensors["wq_a"],
+        "wq_a": tensors["wq_a"], 'wq_a_scale': tensors['wq_a_scale'],
         "wq_b": tensors["wq_b"],
         "wq_b_scale": tensors["wq_b_scale"],
-        "wkv": tensors["wkv"],
+        "wkv": tensors["wkv"], 'wkv_scale': tensors['wkv_scale'],
         "rope_cos": rope_cos_t,
         "rope_sin": rope_sin_t,
         "gamma_cq": tensors["gamma_cq"],
         "gamma_ckv": tensors["gamma_ckv"],
         "q": q,
         "kv": kv,
-        "qr": qr_i8,
+        "qr": qr_fp8,
         "qr_scale": qr_scale,
     })
 
@@ -440,7 +446,7 @@ def golden_attention_csa(tensors):
     idx_topk_full = torch.full((B, S, INDEXER_SCORE_LEN), -1, dtype=torch.int32)
     golden_indexer({
         "x": x_normed.reshape(B, S, D),
-        "qr": qr_i8,
+        "qr": qr_fp8,
         "qr_scale": qr_scale,
         "wq_b": tensors["idx_wq_b"],
         "wq_b_scale": tensors["idx_wq_b_scale"],
@@ -491,7 +497,7 @@ def golden_attention_csa(tensors):
         "attn_sink": tensors["attn_sink"],
         "freqs_cos": rope_cos_t,
         "freqs_sin": rope_sin_t,
-        "wo_a": tensors["wo_a"],
+        "wo_a": tensors["wo_a"], 'wo_a_scale': tensors['wo_a_scale'],
         "wo_b": tensors["wo_b"],
         "wo_b_scale": tensors["wo_b_scale"],
         "attn_out": attn_out,
@@ -529,30 +535,14 @@ def build_tensor_specs(start_pos=None):
     def round_half_away_from_zero(x):
         return torch.sign(x) * torch.floor(torch.abs(x) + 0.5)
 
-    def quant_w_per_output_channel(w):
-        amax = w.float().abs().amax(dim=0).clamp_min(INT8_AMAX_EPS)
-        scale_quant = INT8_SCALE_MAX / amax
-        scaled = w.float() * scale_quant.view(1, w.shape[1])
-        w_i32 = round_half_away_from_zero(scaled).to(torch.int32)
-        w_i32 = torch.clamp(w_i32, -int(INT8_SCALE_MAX), int(INT8_SCALE_MAX))
-        w_i8 = w_i32.to(torch.float16).to(torch.int8)
-        return w_i8, (1.0 / scale_quant).float()
 
-    def quant_w_per_row(w):
-        amax = w.float().abs().amax(dim=-1).clamp_min(INT8_AMAX_EPS)
-        scale_quant = INT8_SCALE_MAX / amax
-        scaled = w.float() * scale_quant.unsqueeze(-1)
-        w_i32 = round_half_away_from_zero(scaled).to(torch.int32)
-        w_i32 = torch.clamp(w_i32, -int(INT8_SCALE_MAX), int(INT8_SCALE_MAX))
-        w_i8 = w_i32.to(torch.float16).to(torch.int8)
-        return w_i8, (1.0 / scale_quant).float()
 
     def init_x_hc():
         return torch.empty(T, HC_MULT, D).uniform_(-1, 1)
 
     # Real layer-8 (CSA, ratio-4) hc_attn scale/base (fn synthetic at real magnitude). A
     # synthetic scale=0.5/base=0 leaves hc_pre post~=1 + near-uniform comb, cancelling attn_out
-    # and the hc residual to near-zero in x_out where W8A8 noise blows up the relative tail.
+    # and the hc residual to near-zero in x_out where quantization noise blows up the relative tail.
     def init_hc_attn_fn():
         return torch.randn(MIX_HC, HC_DIM) * 0.0519
 
@@ -787,7 +777,6 @@ def build_tensor_specs(start_pos=None):
     shared_hc_attn_scale = init_hc_attn_scale().to(torch.float32)
     shared_hc_attn_base = init_hc_attn_base().to(torch.float32)
     shared_attn_norm_w = init_attn_norm_w().to(torch.float32)
-    shared_wq_a = init_wq_a().to(torch.bfloat16)
     shared_gamma_cq = init_gamma_cq().to(torch.bfloat16)
 
     shared_x_mixed = torch.zeros(T, D, dtype=torch.bfloat16)
@@ -802,28 +791,16 @@ def build_tensor_specs(start_pos=None):
         "post": shared_post,
         "comb": shared_comb,
     })
-    # idx_wq_b is the only quantized indexer weight: simulate the real MXFP8 (e4m3 +
-    # 128x128-block E8M0) grid like the shared experts (199 levels, scaleCV ~0.61, ~1.1% zero
-    # spike) instead of a benign randn INT8. gen_shared_weight reduces over the last (in) dim
-    # and yields scale per output channel, so build [out, in] then transpose to [Q_LORA, out].
-    from decode_indexer import gen_shared_weight
-    idx_wq_b_i8_T, idx_wq_b_scale = gen_shared_weight(
-        (IDX_N_HEADS * IDX_HEAD_DIM, Q_LORA), dequant_std=0.108, chan_cv=0.56)
-    idx_wq_b_i8 = idx_wq_b_i8_T.t().contiguous()
     shared_weights_proj = init_weights_proj().to(torch.bfloat16)
     shared_hadamard_idx = init_hadamard_idx().to(torch.bfloat16)
     shared_idx_kv_cache = init_idx_kv_cache().to(torch.bfloat16)
-    # C8 indexer cache: INT8 + per-position scale from the bf16-rounded draw
-    from decode_indexer import _int8_quant_per_row
-    _idx_kv_i8, _idx_kv_sc = _int8_quant_per_row(
+    # Indexer cache: FP8 + per-position scale from the bf16-rounded draw
+    from indexer_cache_quant import reference_indexer_cache_quant
+    _idx_kv_fp8, _idx_kv_sc = reference_indexer_cache_quant(
         shared_idx_kv_cache.float().reshape(IDX_CACHE_BLOCK_NUM * BLOCK_SIZE, IDX_HEAD_DIM))
-    shared_idx_kv_cache_i8 = _idx_kv_i8.view(IDX_CACHE_BLOCK_NUM, BLOCK_SIZE, 1, IDX_HEAD_DIM)
+    shared_idx_kv_cache_fp8 = _idx_kv_fp8.view(IDX_CACHE_BLOCK_NUM, BLOCK_SIZE, 1, IDX_HEAD_DIM)
     shared_idx_kv_scale = _idx_kv_sc.view(IDX_CACHE_BLOCK_NUM, BLOCK_SIZE, 1, 1)
 
-    wq_b_bf16 = init_wq_b().to(torch.bfloat16)
-    wq_b_i8, wq_b_scale = quant_w_per_output_channel(wq_b_bf16)
-    wo_b_bf16 = init_wo_b().to(torch.bfloat16)
-    wo_b_i8, wo_b_scale = quant_w_per_row(wo_b_bf16)
 
     return [
         TensorSpec("x_hc", [T, HC_MULT, D], torch.float32, init_value=lambda: shared_x_hc.clone()),
@@ -831,10 +808,10 @@ def build_tensor_specs(start_pos=None):
         TensorSpec("hc_attn_scale", [3], torch.float32, init_value=lambda: shared_hc_attn_scale.clone()),
         TensorSpec("hc_attn_base", [MIX_HC], torch.float32, init_value=lambda: shared_hc_attn_base.clone()),
         TensorSpec("attn_norm_w", [D], torch.bfloat16, init_value=lambda: shared_attn_norm_w.clone()),
-        TensorSpec("wq_a", [D, Q_LORA], torch.bfloat16, init_value=lambda: shared_wq_a.clone()),
-        TensorSpec("wq_b", [Q_LORA, H * HEAD_DIM], torch.int8, init_value=lambda: wq_b_i8),
-        TensorSpec("wq_b_scale", [H * HEAD_DIM], torch.float32, init_value=lambda: wq_b_scale),
-        TensorSpec("wkv", [D, HEAD_DIM], torch.bfloat16, init_value=init_wkv),
+        *mxfp8_weight_specs("wq_a", D, Q_LORA, init_value=lambda: init_wq_a().T.contiguous()),
+        *mxfp8_weight_specs("wq_b", Q_LORA, H * HEAD_DIM, init_value=lambda: init_wq_b().T.contiguous()),
+
+        *mxfp8_weight_specs("wkv", D, HEAD_DIM, init_value=lambda: init_wkv().T.contiguous()),
         TensorSpec("gamma_cq", [Q_LORA], torch.bfloat16, init_value=lambda: shared_gamma_cq.clone()),
         TensorSpec("gamma_ckv", [HEAD_DIM], torch.bfloat16, init_value=init_gamma_ckv),
         TensorSpec("freqs_cos", [MAX_SEQ_LEN, ROPE_HEAD_DIM], torch.bfloat16, init_value=lambda: shared_freqs_cos.clone()),
@@ -845,8 +822,8 @@ def build_tensor_specs(start_pos=None):
         TensorSpec("cmp_norm_w", [HEAD_DIM], torch.bfloat16, init_value=init_cmp_norm_w),
         TensorSpec("compress_state", [MAIN_STATE_BLOCK_NUM, MAIN_STATE_BLOCK_SIZE, MAIN_STATE_DIM], torch.float32, init_value=init_compress_state),
         TensorSpec("compress_state_block_table", [B, MAIN_STATE_MAX_BLOCKS], torch.int32, init_value=init_compress_state_block_table),
-        TensorSpec("idx_wq_b", [Q_LORA, IDX_N_HEADS * IDX_HEAD_DIM], torch.int8, init_value=lambda: idx_wq_b_i8),
-        TensorSpec("idx_wq_b_scale", [IDX_N_HEADS * IDX_HEAD_DIM], torch.float32, init_value=lambda: idx_wq_b_scale),
+        *mxfp8_weight_specs("idx_wq_b", Q_LORA, IDX_N_HEADS * IDX_HEAD_DIM, std=0.108),
+
         TensorSpec("weights_proj", [D, IDX_N_HEADS], torch.bfloat16, init_value=lambda: shared_weights_proj.clone()),
         TensorSpec("hadamard_idx", [IDX_HEAD_DIM, IDX_HEAD_DIM], torch.bfloat16, init_value=lambda: shared_hadamard_idx.clone()),
         TensorSpec("inner_wkv", [INNER_OUT_DIM, D], torch.bfloat16, init_value=init_inner_wkv),
@@ -858,7 +835,7 @@ def build_tensor_specs(start_pos=None):
         TensorSpec("kv_cache", [ORI_BLOCK_NUM, BLOCK_SIZE, 1, HEAD_DIM], torch.bfloat16, init_value=init_kv_cache),
         TensorSpec("cmp_kv", [CMP_BLOCK_NUM, BLOCK_SIZE, 1, HEAD_DIM], torch.bfloat16, init_value=init_cmp_kv),
         TensorSpec("cmp_block_table", [B, CMP_MAX_BLOCKS], torch.int32, init_value=init_cmp_block_table),
-        TensorSpec("idx_kv_cache", [IDX_CACHE_BLOCK_NUM, BLOCK_SIZE, 1, IDX_HEAD_DIM], torch.int8, init_value=lambda: shared_idx_kv_cache_i8.clone()),
+        TensorSpec("idx_kv_cache", [IDX_CACHE_BLOCK_NUM, BLOCK_SIZE, 1, IDX_HEAD_DIM], torch.float8_e4m3fn, init_value=lambda: shared_idx_kv_cache_fp8.clone()),
         TensorSpec("idx_kv_scale", [IDX_CACHE_BLOCK_NUM, BLOCK_SIZE, 1, 1], torch.float32, init_value=lambda: shared_idx_kv_scale.clone()),
         TensorSpec("idx_block_table", [B, IDX_CACHE_MAX_BLOCKS], torch.int32, init_value=init_idx_block_table),
         TensorSpec("ori_slot_mapping", [T], torch.int64, init_value=init_ori_slot_mapping),
@@ -871,9 +848,9 @@ def build_tensor_specs(start_pos=None):
         TensorSpec("position_ids", [T], torch.int32, init_value=init_position_ids),
         TensorSpec("kv_seq_lens", [B], torch.int32, init_value=init_kv_seq_lens),
         TensorSpec("attn_sink", [H], torch.float32, init_value=init_attn_sink),
-        TensorSpec("wo_a", [O_GROUPS, O_LORA, O_GROUP_IN], torch.bfloat16, init_value=init_wo_a),
-        TensorSpec("wo_b", [D, O_GROUPS * O_LORA], torch.int8, init_value=lambda: wo_b_i8),
-        TensorSpec("wo_b_scale", [D], torch.float32, init_value=lambda: wo_b_scale),
+        *mxfp8_weight_specs("wo_a", O_GROUP_IN, O_LORA, groups=O_GROUPS, init_value=init_wo_a),
+        *mxfp8_weight_specs("wo_b", O_GROUPS * O_LORA, D, init_value=init_wo_b),
+
         TensorSpec("x_out", [T, HC_MULT, D], torch.float32),
     ]
 
@@ -949,15 +926,15 @@ if __name__ == "__main__":
                 rtol=1e-3,
                 max_error_ratio=0.0,
             ),
-            "idx_kv_cache": mapped_pool_ratio_allclose(
+            "idx_kv_cache": fp8_cache_compare(mapped_pool_ratio_allclose(
                 "idx_slot_mapping",
                 mapping_shape=(T,),
                 block_size=BLOCK_SIZE,
                 pool_name="index cache",
-                atol=1,
-                rtol=0,
+                atol=0.001953125,
+                rtol=0.125,
                 max_error_ratio=0.01,
-            ),
+            )),
             "idx_kv_scale": mapped_pool_ratio_allclose(
                 "idx_slot_mapping",
                 mapping_shape=(T,),

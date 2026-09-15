@@ -9,6 +9,7 @@
 """DeepSeek-V4 prefill attention compressor for ratio-4 overlapping KV cache (rotate=False)."""
 
 import pypto.language as pl
+from kv_quant import reference_kv_quant_fp8
 
 from config import (
     BLOCK_SIZE,
@@ -81,6 +82,7 @@ def prefill_compressor_ratio4(
     cmp_slot_mapping: pl.Tensor[[T], pl.INT64],
     state_slot_mapping: pl.Tensor[[T], pl.INT64],
     completion: pl.Array[1, pl.TASK_ID],
+    late_dep: pl.Scalar[pl.TASK_ID],
 ):
     state_block_num = pl.tensor.dim(compress_state, 0)
     cmp_block_num = pl.tensor.dim(cmp_kv, 0)
@@ -94,7 +96,7 @@ def prefill_compressor_ratio4(
     pooled_kv = pl.create_tensor([MAX_CMP_WRITES, HEAD_DIM], dtype=pl.FP32)
     normed_kv = pl.create_tensor([MAX_CMP_WRITES, HEAD_DIM], dtype=pl.FP32)
 
-    for proj_idx in pl.spmd(PACKED_PROJ_BLOCKS, name_hint="prefill_c4_kv_score_proj"):
+    for proj_idx in pl.spmd(PACKED_PROJ_BLOCKS, name_hint="prefill_c4_kv_score_proj", deps=[late_dep]):
         o0 = proj_idx * OUT_TILE
         kv_acc = pl.create_tensor([T, OUT_TILE], dtype=pl.FP32)
         score_acc = pl.create_tensor([T, OUT_TILE], dtype=pl.FP32)
@@ -286,7 +288,17 @@ def prefill_compressor_ratio4(
         for k0 in pl.range(0, NOPE_HEAD_DIM, HEAD_TILE):
             kv_norm_chunk = pooled_kv[final_base : final_base + PACKED_RMS_TILE, k0 : k0 + HEAD_TILE]
             gamma = pl.cast(norm_w_2d[:, k0 : k0 + HEAD_TILE], pl.FP32)
-            normed_chunk = pl.col_expand_mul(pl.row_expand_mul(kv_norm_chunk, inv_rms), gamma)
+            normed_chunk: pl.Tensor[[PACKED_RMS_TILE, HEAD_TILE], pl.FP32] = pl.col_expand_mul(pl.row_expand_mul(kv_norm_chunk, inv_rms), gamma)
+            kvq_values = pl.cast(pl.cast(normed_chunk, pl.BF16, mode="rint"), pl.FP32)
+            kvq_maximum = pl.maximum(pl.row_max(pl.abs(kvq_values)), 1e-4)
+            kvq_bits = pl.reinterpret_view(pl.mul(kvq_maximum, 1.0 / 448.0), pl.INT32)
+            kvq_exponent = pl.shrs(pl.add(kvq_bits, 8388607), 23)
+            kvq_scale = pl.reinterpret_view(pl.shls(kvq_exponent, 23), pl.FP32)
+            kvq_normalized = pl.row_expand_div(kvq_values, kvq_scale)
+            kvq_clipped = pl.minimum(pl.maximum(kvq_normalized, -448.0), 448.0)
+            kvq_payload = pl.cast(kvq_clipped, pl.FP8E4M3FN, mode="rint")
+            kvq_restored = pl.row_expand_mul(pl.cast(kvq_payload, pl.FP32), kvq_scale)
+            normed_chunk = pl.cast(pl.cast(kvq_restored, pl.BF16, mode="rint"), pl.FP32)
             normed_kv[final_base : final_base + PACKED_RMS_TILE, k0 : k0 + HEAD_TILE] = normed_chunk
         kv_rope_norm = pooled_kv[final_base : final_base + PACKED_RMS_TILE, NOPE_HEAD_DIM : HEAD_DIM]
         gamma_rope = pl.cast(norm_w_2d[:, NOPE_HEAD_DIM : HEAD_DIM], pl.FP32)
@@ -361,7 +373,6 @@ def prefill_compressor_ratio4(
     # The flattened view writes through to the caller-owned root. Returning the
     # root preserves its runtime-sized global-pool metadata in nested callers.
     return cmp_kv, compress_state
-
 
 def golden_prefill_compressor_ratio4(tensors):
     """Packed token-major torch reference for ratio-4 prefill compressor."""
@@ -461,6 +472,7 @@ def golden_prefill_compressor_ratio4(tensors):
         rot_even = rope_even * cos - rope_odd * sin
         rot_odd = rope_even * sin + rope_odd * cos
         normed[:, NOPE_HEAD_DIM:HEAD_DIM] = torch.stack([rot_even, rot_odd], dim=-1).flatten(-2)
+        normed[:, :NOPE_HEAD_DIM] = reference_kv_quant_fp8(normed[:, :NOPE_HEAD_DIM])
         cache_rows[dst_row] = normed.to(torch.bfloat16)[0]
 
     for t in range(int(tensors["num_tokens"])):
@@ -494,9 +506,11 @@ def prefill_compressor_ratio4_test(
     state_slot_mapping: pl.Tensor[[T], pl.INT64],
 ):
     completion = pl.array.create(1, pl.TASK_ID)
+    late_dep = pl.system.task_dummy(deps=[])
     return prefill_compressor_ratio4(
         x, compress_state, compress_state_block_table, wkv, wgate, ape, norm_w, freqs_cos, freqs_sin,
         cmp_kv, position_ids, num_tokens, cmp_slot_mapping, state_slot_mapping, completion,
+        late_dep,
     )
 
 

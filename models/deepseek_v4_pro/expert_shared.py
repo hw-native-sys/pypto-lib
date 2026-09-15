@@ -11,6 +11,8 @@
 
 import pypto.language as pl
 
+from swiglu_quant import reference_swiglu_quant
+
 from config import ACTIVE as M, MOE_TOKENS
 
 
@@ -39,9 +41,13 @@ assert MOE_INTER % MX_MM_INTER_TILE == 0
 assert D % MX_K_TILE == 0
 ACT_INTER_TILE = 1024
 D_OUT_TILE = 256
-QUANT_TILE = 2048 if M.name == "flash" else 1024
+QUANT_TILE = 1024
 assert MX_K_TILE % MX_RIGHT_K_TILE == 0
 assert MX_K_TILE % MX_W2_RIGHT_K_TILE == 0
+
+
+SWIGLU_GROUPS = QUANT_TILE // 32
+SWIGLU_SCALE_TMP = ((64 + (SH_M_TILE // 16) * SWIGLU_GROUPS + 31) // 32) * 32
 
 
 @pl.jit.inline
@@ -61,7 +67,7 @@ def expert_shared(
     for mt in pl.parallel(T_PAD // SH_M_TILE):
         ts0 = mt * SH_M_TILE
 
-        gate_fp32 = pl.create_tensor([SH_M_TILE, MOE_INTER], dtype=pl.FP32)
+        gate_bf16 = pl.create_tensor([SH_M_TILE, MOE_INTER], dtype=pl.BF16)
 
         for nb_idx in pl.spmd(MOE_INTER // MX_MM_INTER_TILE, name_hint="sh_gate_mx_mm"):
             n0 = nb_idx * MX_MM_INTER_TILE
@@ -133,9 +139,9 @@ def expert_shared(
                         w1_part,
                         w1_scale_part,
                     )
-            gate_fp32 = pl.store(gate_acc, [0, n0], gate_fp32)
+            gate_bf16 = pl.store(pl.cast(gate_acc, pl.BF16, mode="rint"), [0, n0], gate_bf16)
 
-        up_fp32 = pl.create_tensor([SH_M_TILE, MOE_INTER], dtype=pl.FP32)
+        up_bf16 = pl.create_tensor([SH_M_TILE, MOE_INTER], dtype=pl.BF16)
 
         for nb_idx in pl.spmd(MOE_INTER // MX_MM_INTER_TILE, name_hint="sh_up_mx_mm"):
             n0 = nb_idx * MX_MM_INTER_TILE
@@ -207,7 +213,7 @@ def expert_shared(
                         w3_part,
                         w3_scale_part,
                     )
-            up_fp32 = pl.store(up_acc, [0, n0], up_fp32)
+            up_bf16 = pl.store(pl.cast(up_acc, pl.BF16, mode="rint"), [0, n0], up_bf16)
 
         h_tile_fp32 = pl.create_tensor([SH_M_TILE, MOE_INTER], dtype=pl.FP32)
         h_tile_mx = pl.create_tensor([SH_M_TILE, MOE_INTER], dtype=pl.FP8E4M3FN)
@@ -219,8 +225,8 @@ def expert_shared(
             for row_block in pl.range(SH_M_TILE // SH_ROW_TILE):
                 row0 = row_block * SH_ROW_TILE
                 for n0 in pl.pipeline(k0, k0 + QUANT_TILE, ACT_INTER_TILE, stage=2):
-                    gate_rows = gate_fp32[row0 : row0 + SH_ROW_TILE, n0 : n0 + ACT_INTER_TILE]
-                    up_rows = up_fp32[row0 : row0 + SH_ROW_TILE, n0 : n0 + ACT_INTER_TILE]
+                    gate_rows = pl.cast(gate_bf16[row0 : row0 + SH_ROW_TILE, n0 : n0 + ACT_INTER_TILE], pl.FP32)
+                    up_rows = pl.cast(up_bf16[row0 : row0 + SH_ROW_TILE, n0 : n0 + ACT_INTER_TILE], pl.FP32)
                     if SWIGLU_LIMIT > 0.0:
                         gate_rows = pl.minimum(gate_rows, SWIGLU_LIMIT)
                         up_max = pl.minimum(up_rows, SWIGLU_LIMIT)
@@ -233,7 +239,24 @@ def expert_shared(
                     gated = pl.mul(silu, up_rows)
                     h_tile_fp32[row0 : row0 + SH_ROW_TILE, n0 : n0 + ACT_INTER_TILE] = gated
             h_fp32 = pl.load(h_tile_fp32, [0, k0], [SH_M_TILE, QUANT_TILE])
-            h_mx, h_scale_mx = pl.quant_mx(h_fp32, group_axis=1)
+            # CANN SwiGLU rounds the group scale upward; ordinary MX quantization uses OCP.
+            sq_input = pl.set_validshape(h_fp32, SH_M_TILE, QUANT_TILE)
+            sq_values = pl.reshape(sq_input, [SH_M_TILE * SWIGLU_GROUPS, 32])
+            sq_reduce_tmp = pl.create_tile([SH_M_TILE * SWIGLU_GROUPS, 32], dtype=pl.FP32)
+            sq_maximum = pl.maximum(pl.row_max(pl.abs(sq_values), tmp_tile=sq_reduce_tmp), 1e-4)
+            sq_bits = pl.reinterpret_view(pl.mul(sq_maximum, 1.0 / 448.0), pl.INT32)
+            sq_exponent = pl.shrs(pl.add(sq_bits, 8388607), 23)
+            sq_scale = pl.reinterpret_view(pl.shls(sq_exponent, 23), pl.FP32)
+            sq_normalized = pl.row_expand_div(sq_values, sq_scale)
+            sq_clipped = pl.minimum(pl.maximum(sq_normalized, -448.0), 448.0)
+            sq_quantized = pl.cast(sq_clipped, pl.FP8E4M3FN, mode="rint")
+            h_mx = pl.reshape(sq_quantized, [SH_M_TILE, QUANT_TILE])
+            sq_signed_exponent = pl.sub(sq_exponent, pl.mul(pl.shrs(sq_exponent, 7), 256))
+            sq_codes = pl.reinterpret_view(pl.cast(sq_signed_exponent, pl.INT8), pl.UINT8)
+            sq_flat = pl.reshape(sq_codes, [1, SH_M_TILE * SWIGLU_GROUPS])
+            sq_temporary = pl.create_tile([1, SWIGLU_SCALE_TMP], dtype=pl.UINT8)
+            sq_packed = pl.tmov_x2zz(sq_flat, sq_temporary, group_axis=1, dst_rows=SH_M_TILE, dst_cols=SWIGLU_GROUPS)
+            h_scale_mx = pl.reinterpret_view(sq_packed, pl.FP8E8M0)
             h_tile_mx = pl.store(h_mx, [0, k0], h_tile_mx)
             scale_offset = q_idx * SH_M_TILE * (QUANT_TILE // MX_GROUP)
             h_scale_backing = pl.store(
@@ -350,7 +373,7 @@ def golden_expert_shared(tensors):
     import torch
     import torch.nn.functional as F
 
-    from utils import decode_e8m0_codes, host_quant_mxfp8, matmul_mx_golden
+    from utils import decode_e8m0_codes, matmul_mx_golden
 
     x_fp8 = tensors["x_local"][:T]
     x_scale = decode_e8m0_codes(
@@ -363,13 +386,13 @@ def golden_expert_shared(tensors):
     w2_fp8 = tensors["shared_w2"]
     w2_scale = decode_e8m0_codes(tensors["shared_w2_scale"], side="b")
 
-    sh_gate = matmul_mx_golden(x_fp8, x_scale, w1_fp8, w1_scale)
-    sh_up = matmul_mx_golden(x_fp8, x_scale, w3_fp8, w3_scale)
+    sh_gate = matmul_mx_golden(x_fp8, x_scale, w1_fp8, w1_scale).to(torch.bfloat16).float()
+    sh_up = matmul_mx_golden(x_fp8, x_scale, w3_fp8, w3_scale).to(torch.bfloat16).float()
     if SWIGLU_LIMIT > 0:
         sh_gate = sh_gate.clamp(max=SWIGLU_LIMIT)
         sh_up = sh_up.clamp(-SWIGLU_LIMIT, SWIGLU_LIMIT)
     sh_h = F.silu(sh_gate) * sh_up
-    sh_h_fp8, sh_h_scale = host_quant_mxfp8(sh_h, return_e8m0=True)
+    sh_h_fp8, sh_h_scale = reference_swiglu_quant(sh_h)
     sh = matmul_mx_golden(sh_h_fp8, sh_h_scale, w2_fp8, w2_scale)
 
     tensors["sh"][:] = sh.to(torch.bfloat16)

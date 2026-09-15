@@ -59,6 +59,8 @@ def hc_post(
                         res_row = res_tile[in_h : in_h + 1, 0:D_TILE]
                         res_weighted_chunk = pl.mul(res_row, comb_w)
                         y_chunk = pl.add(y_chunk, res_weighted_chunk)
+                    # The residual stream rounds to BF16 at every mHC boundary.
+                    y_chunk = pl.cast(pl.cast(y_chunk, target_type=pl.BF16, mode="rint"), target_type=pl.FP32)
                     y_rows[h0 + out_h : h0 + out_h + 1, d0 : d0 + D_TILE] = y_chunk
     else:
         for block in pl.spmd((t_dim // T_TILE) * HC_MULT, name_hint="hc_post"):
@@ -75,6 +77,7 @@ def hc_post(
                     res_wide = residual_flat[t : t + 1, res_d : res_d + D]
                     weighted = pl.mul(res_wide, comb_wide)
                     y_row = pl.add(y_row, weighted)
+                y_row = pl.cast(pl.cast(y_row, target_type=pl.BF16, mode="rint"), target_type=pl.FP32)
                 y_flat[t : t + 1, out_h * D : out_h * D + D] = y_row
     return y
 
@@ -115,6 +118,7 @@ def hc_post_prefill(
                         res_row = residual_flat[t : t + 1, res_d : res_d + D]
                         weighted = pl.mul(res_row, comb_w)
                         y_row = pl.add(y_row, weighted)
+                    y_row = pl.cast(pl.cast(y_row, target_type=pl.BF16, mode="rint"), target_type=pl.FP32)
                     y_flat[t : t + 1, out_h * D : out_h * D + D] = y_row
 
     inactive_tokens = t_dim - active_tokens
@@ -170,7 +174,7 @@ def golden_hc_post(tensors):
         for in_h in range(HC_MULT):
             y_row = y_row + residual[:, in_h, :] * comb[:, in_h, out_h:out_h + 1]
         y_fp32[:, out_h, :] = y_row
-    tensors["y"][:] = y_fp32
+    tensors["y"][:] = y_fp32.to(torch.bfloat16).float()
 
 
 def golden_hc_post_prefill(tensors):

@@ -189,6 +189,10 @@ def _install_pypto_stubs() -> None:
         "INT8",
         "INT32",
         "INT64",
+        # MX scale layouts, not dtypes: the Flash weight annotations name them,
+        # and an annotation is evaluated at import, before a test can collect.
+        "MX_A_ZZ",
+        "MX_B_NN",
         "TASK_ID",
         "UINT8",
         "UINT32",

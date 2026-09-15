@@ -15,6 +15,8 @@ into ``expert_shared.py``; both kernels are composed in ``moe.py``.
 
 import pypto.language as pl
 
+from swiglu_quant import reference_swiglu_quant
+
 from config import ACTIVE as M, DECODE_BATCH, DECODE_SEQ, EP_WORLD_SIZE, RECV_MAX
 
 
@@ -63,6 +65,10 @@ assert MX_MM_TASK_TILE % MX_MM_INTER_TILE == 0
 assert MOE_INTER % QUANT_TILE == 0 and D % MX_W2_TASK_TILE == 0
 assert MX_W2_TASK_TILE % MX_W2_D_OUT_TILE == 0
 assert ROUTE_TASK_TILE % ROUTE_D_OUT_TILE == 0
+
+
+SWIGLU_GROUPS = QUANT_TILE // 32
+SWIGLU_SCALE_TMP = ((64 + (RECV_TILE // 16) * SWIGLU_GROUPS + 31) // 32) * 32
 
 
 @pl.jit.inline(auto_scope=False)
@@ -343,6 +349,9 @@ def expert_routed(
                                 [0, a0],
                                 [RECV_TILE, ACT_INTER_TILE],
                             )
+                            # CANN rounds W1/W3 to BF16 before SwiGLU; do so in this vector task.
+                            gate_2d = pl.cast(pl.cast(gate_2d, pl.BF16, mode="rint"), pl.FP32)
+                            up_2d = pl.cast(pl.cast(up_2d, pl.BF16, mode="rint"), pl.FP32)
                             if SWIGLU_LIMIT > 0.0:
                                 gate_2d = pl.minimum(gate_2d, SWIGLU_LIMIT)
                                 up_2d = pl.maximum(pl.minimum(up_2d, SWIGLU_LIMIT), -SWIGLU_LIMIT)
@@ -352,7 +361,24 @@ def expert_routed(
                             h_fp32 = pl.tile.assemble(h_fp32, gated, [0, h_a0])
                         h_fp32_valid = pl.set_validshape(h_fp32, valid_rows, QUANT_TILE)
                         h_fp32_padded = pl.fillpad(h_fp32_valid, pad_value=pl.PadValue.zero)
-                        h_quant, h_scale = pl.quant_mx(h_fp32_padded, group_axis=1)
+                        # CANN SwiGLU rounds the group scale upward; ordinary MX quantization uses OCP.
+                        sq_input = pl.set_validshape(h_fp32_padded, RECV_TILE, QUANT_TILE)
+                        sq_values = pl.reshape(sq_input, [RECV_TILE * SWIGLU_GROUPS, 32])
+                        sq_reduce_tmp = pl.create_tile([RECV_TILE * SWIGLU_GROUPS, 32], dtype=pl.FP32)
+                        sq_maximum = pl.maximum(pl.row_max(pl.abs(sq_values), tmp_tile=sq_reduce_tmp), 1e-4)
+                        sq_bits = pl.reinterpret_view(pl.mul(sq_maximum, 1.0 / 448.0), pl.INT32)
+                        sq_exponent = pl.shrs(pl.add(sq_bits, 8388607), 23)
+                        sq_scale = pl.reinterpret_view(pl.shls(sq_exponent, 23), pl.FP32)
+                        sq_normalized = pl.row_expand_div(sq_values, sq_scale)
+                        sq_clipped = pl.minimum(pl.maximum(sq_normalized, -448.0), 448.0)
+                        sq_quantized = pl.cast(sq_clipped, pl.FP8E4M3FN, mode="rint")
+                        h_quant = pl.reshape(sq_quantized, [RECV_TILE, QUANT_TILE])
+                        sq_signed_exponent = pl.sub(sq_exponent, pl.mul(pl.shrs(sq_exponent, 7), 256))
+                        sq_codes = pl.reinterpret_view(pl.cast(sq_signed_exponent, pl.INT8), pl.UINT8)
+                        sq_flat = pl.reshape(sq_codes, [1, RECV_TILE * SWIGLU_GROUPS])
+                        sq_temporary = pl.create_tile([1, SWIGLU_SCALE_TMP], dtype=pl.UINT8)
+                        sq_packed = pl.tmov_x2zz(sq_flat, sq_temporary, group_axis=1, dst_rows=RECV_TILE, dst_cols=SWIGLU_GROUPS)
+                        h_scale = pl.reinterpret_view(sq_packed, pl.FP8E8M0)
                         h_tile_mx = pl.store(h_quant, [0, a_base], h_tile_mx)
                         scale_offset = ab_idx * RECV_TILE * (QUANT_TILE // MX_GROUP)
                         h_tile_scale_backing = pl.store(
@@ -503,7 +529,8 @@ def expert_routed(
                                 [0, d0],
                                 [RECV_TILE, ROUTE_D_OUT_TILE],
                             )
-                            y_weighted = pl.row_expand_mul(y_fp32, w_col_blk)
+                            y_bf16 = pl.cast(y_fp32, pl.BF16, mode="rint")
+                            y_weighted = pl.row_expand_mul(pl.cast(y_bf16, pl.FP32), w_col_blk)
                             y_valid = pl.set_validshape(y_weighted, valid_rows, ROUTE_D_OUT_TILE)
                             y_padded = pl.fillpad(y_valid, pad_value=pl.PadValue.zero)
                             recv_y_tile = pl.store(
@@ -556,7 +583,6 @@ def golden_expert_routed(tensors):
 
     from utils import (
         decode_e8m0_codes,
-        host_quant_mxfp8,
         matmul_mx_golden,
         unpack_mxfp4_weight_tiles,
     )
@@ -619,14 +645,14 @@ def golden_expert_routed(tensors):
             MX_W2_D_OUT_TILE,
         )
 
-        gate = matmul_mx_golden(x_sub, x_scale, w1_fp8, w1_scale[e])
-        up = matmul_mx_golden(x_sub, x_scale, w3_fp8, w3_scale[e])
+        gate = matmul_mx_golden(x_sub, x_scale, w1_fp8, w1_scale[e]).to(torch.bfloat16).float()
+        up = matmul_mx_golden(x_sub, x_scale, w3_fp8, w3_scale[e]).to(torch.bfloat16).float()
         if SWIGLU_LIMIT > 0:
             gate = gate.clamp(max=SWIGLU_LIMIT)
             up = up.clamp(-SWIGLU_LIMIT, SWIGLU_LIMIT)
         h = F.silu(gate) * up
-        h_fp8, h_scale = host_quant_mxfp8(h, return_e8m0=True)
-        y = matmul_mx_golden(h_fp8, h_scale, w2_fp8, w2_scale[e])
+        h_fp8, h_scale = reference_swiglu_quant(h)
+        y = matmul_mx_golden(h_fp8, h_scale, w2_fp8, w2_scale[e]).to(torch.bfloat16).float()
         recv_y[e, :n_rows, :] = y * w_per_row
 
     tensors["recv_y"][:] = recv_y.to(torch.bfloat16)

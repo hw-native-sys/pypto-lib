@@ -8,17 +8,17 @@
 # -----------------------------------------------------------------------------------------------------------
 # ci: devices=2
 # ci: no-sim
-"""Run an EP2 prefill-to-decode token session on one worker.
+"""Run an EP2/EP4/EP8 prefill-to-decode token session on one worker.
 
 By default the session uses synthetic zero-valued model weights. It validates
 the serving control/data path rather than model numerics:
 
 ``token ids -> embedding -> full prefill -> LM head/sample -> repeated decode``.
 
-With ``--weights`` (an HF checkpoint dir or a ``weights_flash.py`` .pt cache
+With ``--weights`` (an HF checkpoint dir or a ``utils.py`` .pt cache
 matching ``--ep``/``--tp``) the resident bank is instead materialized from the
-drivers' own TensorSpecs: the 56 real-weight names come from the checkpoint via
-``weights_flash.apply_real_weights`` and the remaining architectural constants
+drivers' own TensorSpecs: the 57 real-weight names come from the checkpoint via
+``utils.apply_real_weights`` and the remaining architectural constants
 (RoPE tables, the indexer Hadamard) keep their fixture initializers, so the
 loop generates with real DeepSeek-V4-Flash numerics. ``--prompt``/
 ``--prompt-file`` then feed a natural-language prompt through the checkpoint's
@@ -42,11 +42,13 @@ import ast
 import gc
 import importlib
 import inspect
+import json
 import os
 from pathlib import Path
 import re
 import subprocess
 import sys
+import time
 from types import SimpleNamespace
 
 import torch
@@ -55,8 +57,149 @@ import torch
 PROMPT_TOKENS = 128
 EP_SIZE = 2
 TP_SIZE = 2
-PREFILL_RING_HEAP = (0, 0, 2 * 1024 * 1024 * 1024, 0)
+# Ring 0 retains the full prefill hidden states (521 MiB for Flash's 43 layers).
+# Ring 1 holds attention and dispatch scratch; 256 MiB cannot cover ring wrap
+# while the first MoE allocation is still live. Rings 2/3 hold routed expert
+# outputs and MXFP4 unpack intermediates until their nested scopes close.
+PREFILL_RING_HEAP = (1024 * 1024 * 1024, 1024 * 1024 * 1024, 2 * 1024 * 1024 * 1024, 2 * 1024 * 1024 * 1024)
 _SSA_SUFFIX = re.compile(r"__ssa_v\d+$")
+
+
+def _latency_summary(samples):
+    """Summarize milliseconds using linearly interpolated sample percentiles."""
+    if not samples:
+        return {"count": 0, "mean_ms": None, "p50_ms": None, "p90_ms": None}
+    ordered = sorted(samples)
+
+    def percentile(fraction):
+        index = (len(ordered) - 1) * fraction
+        lower = int(index)
+        upper = min(lower + 1, len(ordered) - 1)
+        return ordered[lower] + (ordered[upper] - ordered[lower]) * (index - lower)
+
+    return {
+        "count": len(samples),
+        "mean_ms": sum(samples) / len(samples),
+        "p50_ms": percentile(0.5),
+        "p90_ms": percentile(0.9),
+    }
+
+
+def _new_result(args):
+    """Use an explicit field list: never serialize the process environment."""
+    return {
+        "schema_version": 1,
+        "status": "running",
+        "mode": "real-weight" if args.weights is not None else "synthetic",
+        "platform": args.platform,
+        "variant": args.variant,
+        "ep": args.ep,
+        "tp": args.tp,
+        "tp_scope": "lm_head_vocabulary",
+        "devices": [int(device) for device in args.device.split(",")],
+        "weights": str(args.weights) if args.weights is not None else None,
+        "tokenizer": str(args.tokenizer) if args.tokenizer is not None else None,
+        "active_sequences": 1,
+        "rank_semantics": "EP/TP ranks cooperate on one sequence; ranks are not requests",
+        "prompt_tokens": None,
+        "prompt_token_ids": None,
+        "decode_steps_requested": args.decode_steps,
+        "generated_ids": [],
+        "generated_text": None,
+        "eos_id": args.eos_id,
+        "stop_reason": None,
+        "validation": "finite logits, greedy argmax and sampled-token agreement across ranks",
+        # Every rank holds the full hidden state and full vocabulary, so the
+        # ranks should be bit-identical. Token agreement alone cannot show that,
+        # so the per-sampling-point spread is recorded next to it.
+        "rank_spread": [],
+        "ranks_bit_identical": None,
+        "warmup": {"prefill_runs": 0, "decode_steps_discarded": 0},
+        "measurement_scope": {
+            "clock": "time.perf_counter host wall clock",
+            "dispatch": "DistributedWorker.run returns after all ranks complete",
+            "ttft": "resident prefill dispatch start through first validated sampled token",
+            "decode_step": "previous validated token through input refresh, all-rank completion and next validation",
+            "generation": "resident prefill dispatch start through last validated sampled token",
+            "excluded_from_token_rates": "prompt preparation, compilation, model loading and teardown",
+            "warmup": "none; first prefill and every successful decode step are included",
+            "rank_spread": "scanned after the step is timed; excluded from every latency figure",
+            "invocation": "after argument validation through cleanup; excludes interpreter startup and imports",
+        },
+        "timings_ms": {
+            "prompt_prepare": None,
+            "compile_prefill": 0.0,
+            "compile_decode": 0.0,
+            "load_artifacts": None,
+            "prepare_host": None,
+            "prepare_worker": None,
+            "upload_resident": None,
+            "load_total": None,
+            "prefill_dispatch": None,
+            "ttft": None,
+            "decode_step_wall": [],
+            "decode_dispatch": [],
+            "generation_wall": None,
+            "invocation_wall": None,
+        },
+        "reused_artifacts": {
+            "prefill": args.prefill_runtime_dir is not None,
+            "decode": args.decode_runtime_dir is not None,
+        },
+    }
+
+
+def _finish_result(result):
+    """Count the prefill token once and never count replicated rank outputs."""
+    spread = result.get("rank_spread") or []
+    result["ranks_bit_identical"] = (
+        all(entry.get("bit_identical") for entry in spread) if spread else None
+    )
+    timings = result["timings_ms"]
+    decode_samples = timings["decode_step_wall"]
+    # Recover a partial continuation after a failed dispatch when possible.
+    if result["generated_text"] is None and result["generated_ids"] and result["tokenizer"]:
+        try:
+            from tokenizers import Tokenizer
+
+            result["generated_text"] = Tokenizer.from_file(result["tokenizer"]).decode(result["generated_ids"])
+        except Exception:  # noqa: BLE001 - token ids remain available if decoding fails
+            pass
+    output_tokens = len(result["generated_ids"])
+    decode_tokens = len(decode_samples)
+    result["output_tokens_per_sequence"] = output_tokens
+    result["output_tokens_total"] = output_tokens * result["active_sequences"]
+    result["output_token_count_includes_eos"] = True
+    result["decode_steps_done"] = decode_tokens
+    result["decode_latency"] = _latency_summary(decode_samples)
+    result["decode_dispatch_latency"] = _latency_summary(timings["decode_dispatch"])
+
+    def rate(tokens, elapsed_ms):
+        return tokens * 1000.0 / elapsed_ms if tokens and elapsed_ms and elapsed_ms > 0 else None
+
+    decode_rate = rate(decode_tokens, sum(decode_samples))
+    generation_rate = rate(output_tokens, timings["generation_wall"])
+    sequences = result["active_sequences"]
+    result["throughput"] = {
+        "decode_tokens_per_second_per_sequence": decode_rate,
+        "decode_tokens_per_second_aggregate": decode_rate * sequences if decode_rate is not None else None,
+        "generation_tokens_per_second_per_sequence": generation_rate,
+        "generation_tokens_per_second_aggregate": (
+            generation_rate * sequences if generation_rate is not None else None
+        ),
+    }
+
+
+def _write_result(path, result):
+    """Atomically replace a requested result file, including failed-run results."""
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporary = path.with_name(f"{path.name}.{os.getpid()}.tmp")
+    try:
+        temporary.write_text(json.dumps(result, indent=2, ensure_ascii=False, allow_nan=False) + "\n")
+        os.replace(temporary, path)
+    finally:
+        temporary.unlink(missing_ok=True)
 
 
 def _normalized_name(name):
@@ -337,6 +480,10 @@ def _build_resident_hosts(prefill, prefill_compiled, decode_compiled, weight_spe
                 tensor = tensor.to(expected_dtype)
         else:
             tensor = _empty_host_tensor(name, info, prefill.MODEL_CONFIG.vocab_size)
+            if name == "mxfp4_pair_lut":
+                from utils import build_mxfp4_pair_lut
+
+                tensor.copy_(build_mxfp4_pair_lut().unsqueeze(0).expand_as(tensor))
             if name == "tid2eid" and weight_specs is None:
                 _initialize_tid2eid(
                     tensor,
@@ -571,29 +718,78 @@ def _refresh_decode_io(decode, io_tensors, scalars, tables, start_pos, tokens):
     scalars["num_tokens"] = torch.tensor(1, dtype=torch.int32)
 
 
-def _check_sample(io_tensors, vocab_size, stage):
+def _rank_spread(io_tensors, stage):
+    """Largest absolute cross-rank difference at one sampling point.
+
+    Every rank holds the full hidden state and the full vocabulary after the
+    MoE combine and the lm_head gather, so a non-zero spread is a defect even
+    when all ranks still pick the same token. Recording it keeps a run that
+    agreed only by luck distinguishable from one that was actually identical.
+    """
+    logits = io_tensors["logits"][:, 0].float()
+    rows = _active_rows(io_tensors, logits.shape[0])
+    # Compare every active token row, not just the sampled one: a rank can be
+    # identical where it is sampled and still differ earlier in the prompt.
+    active = int(rows.max()) + 1 if rows.numel() else 1
+    spread = {"stage": stage, "active_rows_scanned": active}
+    for name, tensor in (("logits", None),
+                         ("pre_hc_hidden_out", io_tensors.get("pre_hc_hidden_out")),
+                         ("hidden_out", io_tensors.get("hidden_out"))):
+        if name != "logits" and tensor is None:
+            continue
+        selected = (logits if name == "logits"
+                    else tensor[:, :active].reshape(tensor.shape[0], -1).float())
+        finite = torch.isfinite(selected)
+        safe = torch.where(finite, selected, torch.zeros_like(selected))
+        difference = (safe - safe[0:1]).abs()
+        spread[name] = {
+            "max_abs_difference": round(float(difference.max()), 6),
+            "ranks_differing": [rank for rank in range(safe.shape[0])
+                                if bool(difference[rank].any())],
+        }
+    spread["bit_identical"] = not any(
+        entry["ranks_differing"] for entry in spread.values() if isinstance(entry, dict)
+    )
+    return spread
+
+
+def _check_sample(io_tensors, vocab_size, stage, spread_log=None):
+    """Validate one sampling point. `spread_log` only receives failures here.
+
+    A passing point is recorded by the caller once the step has been timed, so
+    the spread scan never inflates the measured per-token latency.
+    """
     logits = io_tensors["logits"][:, 0]
     sampled = io_tensors["sampled_ids"][:, 0, 0]
+
+    def record_failure():
+        if spread_log is not None:
+            spread_log.append(_rank_spread(io_tensors, stage))
+
     finite = torch.isfinite(logits)
     if not bool(finite.all()):
         bad_by_rank = (~finite).sum(dim=-1).tolist()
+        record_failure()
         _report_sample_failure(io_tensors, stage, "non-finite logits")
         raise AssertionError(
             f"{stage}: active logits contain non-finite values by rank: "
             f"{bad_by_rank}"
         )
     if not bool(((sampled >= 0) & (sampled < vocab_size)).all()):
+        record_failure()
         _report_sample_failure(io_tensors, stage, "sample outside vocabulary")
         raise AssertionError(f"{stage}: sampled token is outside the vocabulary: {sampled}")
     argmax = torch.argmax(logits, dim=-1).to(torch.int32)
     greedy_match = bool(torch.equal(sampled, argmax))
     if not greedy_match:
+        record_failure()
         _report_sample_failure(io_tensors, stage, "sample and argmax differ")
         raise AssertionError(
             f"{stage}: sampled token does not match the logits argmax: "
             f"sampled={sampled}, argmax={argmax}"
         )
     if sampled.numel() > 1 and not bool(torch.equal(sampled, sampled[0].expand_as(sampled))):
+        record_failure()
         _report_sample_failure(io_tensors, stage, "ranks sampled different tokens")
         raise AssertionError(f"{stage}: ranks sampled different tokens: {sampled.tolist()}")
     print(
@@ -664,7 +860,24 @@ def _share_io(*io_groups):
             io_tensors[name] = tensor.cpu().contiguous().share_memory_()
 
 
-def _unique_storage_tensors(tensors):
+def _shared_storage_tensors(tensors):
+    """Promote host backing before naming it across forked worker processes."""
+    # torch.load(mmap=True) defaults to MAP_PRIVATE. Merely listing that
+    # storage as inherited does not make post-fork writes visible to a worker.
+    if sys.platform == "linux":
+        storages = {
+            tensor.untyped_storage().data_ptr(): tensor.untyped_storage().nbytes()
+            for tensor in tensors.values() if not tensor.is_shared()
+        }
+        required = sum(storages.values())
+        memory = os.statvfs("/dev/shm")
+        available = memory.f_bavail * memory.f_frsize
+        if required > available:
+            raise MemoryError(
+                f"resident host bank needs {required / 2**30:.2f} GiB of shared memory; "
+                f"/dev/shm has {available / 2**30:.2f} GiB available"
+            )
+    _share_io(tensors)
     inherited = []
     seen = set()
     for tensor in tensors.values():
@@ -675,7 +888,24 @@ def _unique_storage_tensors(tensors):
     return inherited
 
 
-def _run_session(args, prefill_dir, decode_dir, model_dir):
+
+def _decode_step_indices(limit, result, *, eos_id, stop_at_eos):
+    """Stop before dispatch when the latest token, including prefill, is EOS."""
+    for step in range(limit + 1):
+        if stop_at_eos and eos_id is not None and result["generated_ids"][-1] == eos_id:
+            result["stop_reason"] = "eos"
+            return
+        if step == limit:
+            result["stop_reason"] = "decode_limit"
+            return
+        yield step
+
+
+def _run_session(args, prefill_dir, decode_dir, model_dir, result=None):
+    if result is None:
+        result = _new_result(args)
+    timings = result["timings_ms"]
+    load_start = time.perf_counter()
     from pypto.backend import BackendType
     from pypto.ir import (
         DistributedCompiledProgram,
@@ -707,8 +937,13 @@ def _run_session(args, prefill_dir, decode_dir, model_dir):
         _require_runtime_scalar(compiled, "num_tokens", program, torch.int32)
         _require_runtime_scalar(compiled, "moe_epoch_base", program, torch.int32)
 
+    timings["load_artifacts"] = (time.perf_counter() - load_start) * 1000.0
+    host_start = time.perf_counter()
     prompt_ids = getattr(args, "prompt_ids", None)
     prompt_len = int(prompt_ids.numel()) if prompt_ids is not None else args.prefill_tokens
+
+    result["prompt_tokens"] = prompt_len
+    result["prompt_token_ids"] = prompt_ids.tolist() if prompt_ids is not None else None
 
     import_argv = [
         str(model_dir / "synthetic_token_loop.py"),
@@ -810,17 +1045,22 @@ def _run_session(args, prefill_dir, decode_dir, model_dir):
         decode_config = RunConfig(
             platform=args.platform,
             device_id=0,
+            ring_heap=(0, 0, 0, 1024 * 1024 * 1024),
             **swimlane_config,
         )
 
-        inherited = _unique_storage_tensors(resident_hosts)
+        inherited = _shared_storage_tensors(resident_hosts)
+        timings["prepare_host"] = (time.perf_counter() - host_start) * 1000.0
         runtime = None
         handles = {}
         uploaded = []
         try:
+            worker_start = time.perf_counter()
             runtime = _create_persistent_worker(
                 DistributedWorker, [prefill_compiled, decode_compiled], prefill_config, inherited
             )
+            timings["prepare_worker"] = (time.perf_counter() - worker_start) * 1000.0
+            upload_start = time.perf_counter()
             for index, name in enumerate(sorted(resident_names), start=1):
                 print(
                     f"[SESSION] upload resident {index}/{len(resident_names)}: {name}",
@@ -828,11 +1068,16 @@ def _run_session(args, prefill_dir, decode_dir, model_dir):
                 )
                 handles[name] = runtime.alloc_stacked_tensor(resident_hosts[name])
                 uploaded.append(name)
+            timings["upload_resident"] = (time.perf_counter() - upload_start) * 1000.0
             runtime.release_inherited_host_tensor_refs()
             inherited.clear()
             resident_hosts.clear()
             gc.collect()
+            timings["load_total"] = (time.perf_counter() - load_start) * 1000.0
 
+            # run() waits for every rank's result; no additional NPU dispatch or
+            # synchronization is needed. Measure the resident request only.
+            generation_start = time.perf_counter()
             runtime.run(
                 prefill_compiled,
                 *_ordered_args(
@@ -840,13 +1085,24 @@ def _run_session(args, prefill_dir, decode_dir, model_dir):
                 ),
                 config=prefill_config,
             )
+            timings["prefill_dispatch"] = (time.perf_counter() - generation_start) * 1000.0
             tokens = _check_sample(
-                prefill_io, decode.MODEL_CONFIG.vocab_size, "prefill"
+                prefill_io, decode.MODEL_CONFIG.vocab_size, "prefill",
+                spread_log=result["rank_spread"],
             )
+            first_token_time = time.perf_counter()
+            timings["ttft"] = (first_token_time - generation_start) * 1000.0
+            result["rank_spread"].append(_rank_spread(prefill_io, "prefill"))
+            timings["generation_wall"] = timings["ttft"]
             token_history = [tokens.tolist()]
+            result["generated_ids"].append(int(tokens[0]))
 
             eos_id = getattr(args, "eos_id", None)
-            for step in range(args.decode_steps):
+            previous_token_time = first_token_time
+            for step in _decode_step_indices(
+                args.decode_steps, result, eos_id=eos_id, stop_at_eos=args.weights is not None,
+            ):
+                step_start = previous_token_time
                 start_pos = prompt_len + step
                 _refresh_decode_io(
                     decode,
@@ -857,6 +1113,7 @@ def _run_session(args, prefill_dir, decode_dir, model_dir):
                     tokens,
                 )
                 decode_scalars["moe_epoch_base"] = torch.tensor(step * decode.LAST_MOE_EPOCH, dtype=torch.int32)
+                dispatch_start = time.perf_counter()
                 runtime.run(
                     decode_compiled,
                     *_ordered_args(
@@ -864,19 +1121,23 @@ def _run_session(args, prefill_dir, decode_dir, model_dir):
                     ),
                     config=decode_config,
                 )
+                dispatch_ms = (time.perf_counter() - dispatch_start) * 1000.0
                 tokens = _check_sample(
                     decode_io,
                     decode.MODEL_CONFIG.vocab_size,
                     f"decode[{step}]@{start_pos}",
+                    spread_log=result["rank_spread"],
                 )
+                token_time = time.perf_counter()
+                previous_token_time = token_time
+                timings["decode_step_wall"].append((token_time - step_start) * 1000.0)
+                timings["decode_dispatch"].append(dispatch_ms)
+                timings["generation_wall"] = (token_time - generation_start) * 1000.0
+                result["rank_spread"].append(_rank_spread(decode_io, f"decode[{step}]@{start_pos}"))
                 token_history.append(tokens.tolist())
-                if (
-                    args.weights is not None
-                    and eos_id is not None
-                    and int(tokens[0]) == eos_id
-                ):
-                    print(f"[SESSION] eos at decode step {step}", flush=True)
-                    break
+                result["generated_ids"].append(int(tokens[0]))
+            if result["stop_reason"] == "eos":
+                print(f"[SESSION] eos after {len(token_history)} generated token(s)", flush=True)
             print(f"[SESSION] token_history={token_history}", flush=True)
             if getattr(args, "tokenizer", None):
                 try:
@@ -888,6 +1149,7 @@ def _run_session(args, prefill_dir, decode_dir, model_dir):
 
                 generated = [step_tokens[0] for step_tokens in token_history]
                 text = Tokenizer.from_file(args.tokenizer).decode(generated)
+                result["generated_text"] = text
                 print(f"[SESSION] generated ids: {generated}", flush=True)
                 print(f"[SESSION] generated text: {text!r}", flush=True)
         finally:
@@ -916,14 +1178,19 @@ def main():
     parser.add_argument("-p", "--platform", choices=("a5",), default="a5")
     parser.add_argument("--ep", type=int, choices=(2, 4, 8), default=EP_SIZE,
                         help="EP world size / rank count; only EP8 deploys the full 256-expert model")
-    parser.add_argument("--tp", type=int, choices=(TP_SIZE,), default=TP_SIZE)
+    parser.add_argument("--tp", type=int, choices=(TP_SIZE,), default=TP_SIZE,
+                        help="LM-head vocabulary shards within the EP ranks")
     parser.add_argument("-d", "--device", default="0,1")
     parser.add_argument("--decode-steps", type=int, default=2)
     parser.add_argument("--prefill-runtime-dir", type=Path)
     parser.add_argument("--decode-runtime-dir", type=Path)
     parser.add_argument("--compile-only", action="store_true")
+    parser.add_argument(
+        "--result-json", type=Path,
+        help="write status, generated tokens and resident host-wall timings as JSON (also on failure)",
+    )
     parser.add_argument("--weights", type=str, default=None,
-                        help="HF checkpoint dir or weights_flash.py .pt cache dir "
+                        help="HF checkpoint dir or utils.py .pt cache dir "
                              "(must match --ep/--tp); real weights for the resident bank.")
     parser.add_argument("--prompt", type=str, default=None,
                         help="natural-language prompt (requires --weights and a tokenizer)")
@@ -949,56 +1216,86 @@ def main():
     if not 1 <= args.prefill_tokens <= PROMPT_TOKENS:
         raise ValueError(f"--prefill-tokens must be within 1..{PROMPT_TOKENS}")
 
-    args.prompt_ids = None
-    if args.prompt is not None or args.prompt_file is not None:
-        if args.weights is None:
-            raise ValueError("--prompt/--prompt-file require --weights (real-weight run)")
-        if args.prompt is not None and args.prompt_file is not None:
-            raise ValueError("pass either --prompt or --prompt-file, not both")
-        text = args.prompt if args.prompt is not None else Path(args.prompt_file).read_text()
-        if args.tokenizer is None:
-            candidate = Path(args.weights) / "tokenizer.json"
-            if candidate.is_file():
-                args.tokenizer = str(candidate)
-        if args.tokenizer is None:
-            raise ValueError("--tokenizer is required (no tokenizer.json under --weights)")
-        try:
-            from tokenizers import Tokenizer
-        except ImportError as error:
-            raise SystemExit(
-                "--prompt/--prompt-file need the `tokenizers` package (pip install tokenizers)"
-            ) from error
+    result = _new_result(args)
+    invocation_start = time.perf_counter()
+    if args.result_json is not None:
+        _write_result(args.result_json, result)
+    try:
+        prompt_start = time.perf_counter()
+        args.prompt_ids = None
+        if args.prompt is not None or args.prompt_file is not None:
+            if args.weights is None:
+                raise ValueError("--prompt/--prompt-file require --weights (real-weight run)")
+            if args.prompt is not None and args.prompt_file is not None:
+                raise ValueError("pass either --prompt or --prompt-file, not both")
+            text = args.prompt if args.prompt is not None else Path(args.prompt_file).read_text()
+            if args.tokenizer is None:
+                candidate = Path(args.weights) / "tokenizer.json"
+                if candidate.is_file():
+                    args.tokenizer = str(candidate)
+            if args.tokenizer is None:
+                raise ValueError("--tokenizer is required (no tokenizer.json under --weights)")
+            try:
+                from tokenizers import Tokenizer
+            except ImportError as error:
+                raise SystemExit(
+                    "--prompt/--prompt-file need the `tokenizers` package (pip install tokenizers)"
+                ) from error
 
-        tokenizer = Tokenizer.from_file(args.tokenizer)
-        ids = tokenizer.encode(text).ids
-        if not args.no_bos:
-            bos_id = tokenizer.token_to_id("<｜begin▁of▁sentence｜>")
-            if bos_id is not None:
-                ids = [bos_id] + ids
-        if not 1 <= len(ids) <= args.prefill_tokens:
-            raise ValueError(
-                f"prompt is {len(ids)} tokens; must fit the configured active-token limit "
-                f"1..{args.prefill_tokens} (--prefill-tokens)"
-            )
-        args.prompt_ids = torch.tensor(ids, dtype=torch.int64)
-        print(f"[SESSION] prompt: {len(ids)} tokens {ids}", flush=True)
+            tokenizer = Tokenizer.from_file(args.tokenizer)
+            ids = tokenizer.encode(text).ids
+            if not args.no_bos:
+                bos_id = tokenizer.token_to_id("<｜begin▁of▁sentence｜>")
+                if bos_id is not None:
+                    ids = [bos_id] + ids
+            if not 1 <= len(ids) <= args.prefill_tokens:
+                raise ValueError(
+                    f"prompt is {len(ids)} tokens; must fit the configured active-token limit "
+                    f"1..{args.prefill_tokens} (--prefill-tokens)"
+                )
+            args.prompt_ids = torch.tensor(ids, dtype=torch.int64)
+            print(f"[SESSION] prompt: {len(ids)} tokens {ids}", flush=True)
 
-    os.environ["DEEPSEEK_V4_VARIANT"] = args.variant
-    model_dir = Path(__file__).resolve().parent
-    prefill_dir = args.prefill_runtime_dir
-    decode_dir = args.decode_runtime_dir
-    if prefill_dir is None:
-        prefill_dir = _compile_program(model_dir, "prefill_fwd.py", args, args.prefill_tokens, 0)
-    if decode_dir is None:
-        decode_dir = _compile_program(model_dir, "decode_fwd.py", args, 1, PROMPT_TOKENS)
-    print(f"[SESSION] prefill_runtime_dir={prefill_dir.resolve()}", flush=True)
-    print(f"[SESSION] decode_runtime_dir={decode_dir.resolve()}", flush=True)
-    if args.compile_only:
-        return
+        result["tokenizer"] = str(args.tokenizer) if args.tokenizer is not None else None
+        result["prompt_tokens"] = int(args.prompt_ids.numel()) if args.prompt_ids is not None else args.prefill_tokens
+        result["prompt_token_ids"] = args.prompt_ids.tolist() if args.prompt_ids is not None else None
+        result["timings_ms"]["prompt_prepare"] = (time.perf_counter() - prompt_start) * 1000.0
+        os.environ["DEEPSEEK_V4_VARIANT"] = args.variant
+        model_dir = Path(__file__).resolve().parent
+        prefill_dir = args.prefill_runtime_dir
+        decode_dir = args.decode_runtime_dir
+        if prefill_dir is None:
+            compile_start = time.perf_counter()
+            try:
+                prefill_dir = _compile_program(model_dir, "prefill_fwd.py", args, args.prefill_tokens, 0)
+            finally:
+                result["timings_ms"]["compile_prefill"] = (time.perf_counter() - compile_start) * 1000.0
+        if decode_dir is None:
+            compile_start = time.perf_counter()
+            try:
+                decode_dir = _compile_program(model_dir, "decode_fwd.py", args, 1, PROMPT_TOKENS)
+            finally:
+                result["timings_ms"]["compile_decode"] = (time.perf_counter() - compile_start) * 1000.0
+        print(f"[SESSION] prefill_runtime_dir={prefill_dir.resolve()}", flush=True)
+        print(f"[SESSION] decode_runtime_dir={decode_dir.resolve()}", flush=True)
+        if args.compile_only:
+            result["status"] = "compile_only"
+            return
 
-    _run_session(args, prefill_dir.resolve(), decode_dir.resolve(), model_dir)
-    mode = "real-weight" if args.weights is not None else "synthetic"
-    print(f"[SESSION] PASS: EP{args.ep} {mode} token loop completed", flush=True)
+        _run_session(args, prefill_dir.resolve(), decode_dir.resolve(), model_dir, result)
+        result["status"] = "pass"
+        mode = "real-weight" if args.weights is not None else "synthetic"
+        print(f"[SESSION] PASS: EP{args.ep} {mode} token loop completed", flush=True)
+    except BaseException as error:
+        result["status"] = "fail"
+        result["error_type"] = type(error).__name__
+        raise
+    finally:
+        result["timings_ms"]["invocation_wall"] = (time.perf_counter() - invocation_start) * 1000.0
+        _finish_result(result)
+        if args.result_json is not None:
+            _write_result(args.result_json, result)
+            print(f"[SESSION] result JSON: {args.result_json}", flush=True)
 
 
 if __name__ == "__main__":
