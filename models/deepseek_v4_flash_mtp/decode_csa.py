@@ -48,7 +48,7 @@ from hc_pre import hc_pre
 from decode_indexer import (
     IDX_TABLE_BLOCKS_DYN,
     INNER_STATE_TABLE_BLOCKS_DYN,
-    TOPK_LEAF as IDX_TOPK_LEAF,
+    TOPK_LEAF_TILE as IDX_TOPK_LEAF,
     indexer,
 )
 from qkv_proj_rope import qkv_proj_rope
@@ -923,6 +923,7 @@ if __name__ == "__main__":
     parser.add_argument("--golden-data", type=str, default=None,
                         help="Reuse a prior run's data/{in,out} (skips golden recompute); "
                              "requires an unchanged spec set.")
+    parser.add_argument("--save-data", action="store_true", default=False)
     parser.add_argument("--dump-passes", action="store_true", default=False)
     args = parser.parse_args()
 
@@ -932,6 +933,7 @@ if __name__ == "__main__":
         golden_fn=golden_attention_csa,
         runtime_dir=args.runtime_dir,
         golden_data=args.golden_data,
+        save_data=args.save_data,
         config=dict(
             dump_passes=args.dump_passes,
             platform=args.platform,
