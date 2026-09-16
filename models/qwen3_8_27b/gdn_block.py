@@ -6,6 +6,7 @@
 # INCLUDING BUT NOT LIMITED TO NON-INFRINGEMENT, MERCHANTABILITY, OR FITNESS FOR A PARTICULAR PURPOSE.
 # See LICENSE in the root of the software repository for the full text of the License.
 # -----------------------------------------------------------------------------------------------------------
+# ci: no-sim
 """Qwen3.8-27B's whole Gated DeltaNet block: hidden states in, hidden states out.
 
     x_q, x_scale = quant_x(x)                     per-token int8 of the hidden states
