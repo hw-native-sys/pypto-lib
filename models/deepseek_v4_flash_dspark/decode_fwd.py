@@ -484,9 +484,6 @@ def decode_fwd(
             group_tokens = group_tokens + group_owner_tokens
 
     moe_input_ids = pl.create_tensor([MOE_TOKENS], dtype=pl.INT64)
-    moe_stage_token = pl.create_tensor([1], dtype=pl.INT32)
-    with pl.at(level=pl.Level.CORE_GROUP, name_hint="decode_moe_stage_init"):
-        pl.write(moe_stage_token, [0], pl.cast(0, pl.INT32))
     with pl.scope():
         decode_embedding_preamble(
             input_ids, embed_weight, hidden_workspace, x_ping, moe_input_ids,
@@ -591,7 +588,7 @@ def decode_fwd(
                 shared_w2_layer_swa0, shared_w2_scale_layer_swa0,
                 x_moe_next,
                 recv_meta, recv_x, recv_aux, recv_route, arrived, data_arrived,
-                routed_y_buf, combine_arrived, moe_stage_token,
+                routed_y_buf, combine_arrived,
                 pl.const(0, pl.INT32), owner_tokens, my_rank, pl.const(1, pl.INT32),
             )
             for token in pl.spmd(MOE_TOKENS, name_hint="decode_fwd_swa0_active_trim"):
@@ -693,7 +690,7 @@ def decode_fwd(
                 shared_w2_layer_swa1, shared_w2_scale_layer_swa1,
                 x_moe_next,
                 recv_meta, recv_x, recv_aux, recv_route, arrived, data_arrived,
-                routed_y_buf, combine_arrived, moe_stage_token,
+                routed_y_buf, combine_arrived,
                 pl.const(1, pl.INT32), owner_tokens, my_rank, pl.const(2, pl.INT32),
             )
             for token in pl.spmd(MOE_TOKENS, name_hint="decode_fwd_swa1_active_trim"):
@@ -847,7 +844,7 @@ def decode_fwd(
                     shared_w2_layer_csa, shared_w2_scale_layer_csa,
                     x_moe_next,
                     recv_meta, recv_x, recv_aux, recv_route, arrived, data_arrived,
-                    routed_y_buf, combine_arrived, moe_stage_token,
+                    routed_y_buf, combine_arrived,
                     csa_model_layer, owner_tokens, my_rank, csa_model_layer + 1,
                 )
                 for token in pl.spmd(MOE_TOKENS, name_hint="decode_fwd_csa_active_trim"):
@@ -968,7 +965,7 @@ def decode_fwd(
                     shared_w2_layer_hca, shared_w2_scale_layer_hca,
                     x_moe_next,
                     recv_meta, recv_x, recv_aux, recv_route, arrived, data_arrived,
-                    routed_y_buf, combine_arrived, moe_stage_token,
+                    routed_y_buf, combine_arrived,
                     hca_model_layer, owner_tokens, my_rank, hca_model_layer + 1,
                 )
                 for token in pl.spmd(MOE_TOKENS, name_hint="decode_fwd_hca_active_trim"):
@@ -1118,7 +1115,7 @@ def decode_fwd(
                 shared_w2_layer_last, shared_w2_scale_layer_last,
                 x_moe_next,
                 recv_meta, recv_x, recv_aux, recv_route, arrived, data_arrived,
-                routed_y_buf, combine_arrived, moe_stage_token,
+                routed_y_buf, combine_arrived,
                 model_layer_last, owner_tokens, my_rank, pl.const(43, pl.INT32),
             )
             for token in pl.spmd(MOE_TOKENS, name_hint="decode_fwd_last_active_trim"):

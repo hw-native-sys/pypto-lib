@@ -160,7 +160,6 @@ def dispatch(
     my_rank: pl.Scalar[pl.INT32],
     # 1-based MoE call id; `arrived`/`data_arrived` are monotonic so waits use `>= moe_epoch`.
     moe_epoch: pl.Scalar[pl.INT32],
-    stage_ready: pl.Scalar[pl.TASK_ID],
 ) -> pl.Scalar[pl.TASK_ID]:
     # Flat 2-D view kept outside the scope so it stays a tensor view, not a tile.
     recv_x_out_flat = pl.reshape(recv_x_out, [N_LOCAL * RECV_MAX, D])
@@ -168,14 +167,13 @@ def dispatch(
     # Meta and payload arrivals ride two independent windows: `arrived` and
     # `data_arrived`.
 
-    # Count routes, publish counts, barrier on meta, cumsum -> recv_count_out.
-    # Needs every source's counts but none of the bulk payload.
+    # Count routes and publish counts. The peer waits are registered separately
+    # so they do not occupy a core while waiting for a remote rank.
     with pl.at(
         level=pl.Level.CORE_GROUP,
-        name_hint="dispatch_meta",
-        deps=[stage_ready],
+        name_hint="dispatch_meta_publish",
         allow_early_resolve=True,
-    ) as _meta_tid:
+    ) as _meta_push_tid:
         active_tokens = pl.cast(num_tokens, pl.INDEX)
         if active_tokens < 0:
             active_tokens = pl.cast(0, pl.INDEX)
@@ -207,11 +205,21 @@ def dispatch(
             if dst != my_rank:
                 pld.system.notify(target=arrived, peer=dst, offsets=[my_rank, 0], value=1, op=pld.NotifyOp.AtomicAdd)
 
-        # Wait for every source's meta flag.
+    # A deferred waiter must be a registration-only task. It cannot follow the
+    # route counting and publication work in the producer task above.
+    with pl.at(level=pl.Level.CORE_GROUP, name_hint="dispatch_meta_wait") as _meta_wait_tid:
         for src in pl.range(N_RANKS):
             if src != my_rank:
-                pld.system.wait(signal=arrived, offsets=[src, 0], expected=moe_epoch, cmp=pld.WaitCmp.Ge)
+                pld.system.defer_wait(signal=arrived, offsets=[src, 0], expected=moe_epoch, cmp=pld.WaitCmp.Ge)
 
+    # Consume metadata only after both the local publish and every peer arrival
+    # have completed. Keep _meta_tid as the downstream completion anchor.
+    with pl.at(
+        level=pl.Level.CORE_GROUP,
+        name_hint="dispatch_meta_finalize",
+        deps=[_meta_push_tid, _meta_wait_tid],
+        allow_early_resolve=True,
+    ) as _meta_tid:
         # Cumsum recv_meta over sources -> per-expert receive count, which sizes
         # the routed-expert tile loop.
         for e in pl.range(N_LOCAL):
@@ -225,12 +233,7 @@ def dispatch(
     # Move the bulk payload (x / aux / route) to each destination lane. One block
     # per (dst, local expert), each with its own slot counter; token-major order
     # matches the meta pass's per-(dst, loc_e) cumulative count.
-    with pl.spmd(
-        N_RANKS * N_LOCAL,
-        name_hint="dispatch_push",
-        deps=[stage_ready],
-        allow_early_resolve=True,
-    ) as push_tid:
+    with pl.spmd(N_RANKS * N_LOCAL, name_hint="dispatch_push", allow_early_resolve=True) as push_tid:
         push_block = pl.tile.get_block_idx()
         dst = push_block // N_LOCAL
         loc_e = push_block - dst * N_LOCAL
@@ -303,12 +306,7 @@ def dispatch(
     # Scalar metadata stores need whole 64-byte lines per task: RECV_MAX and
     # RECV_TILE are both multiples of 16 FP32/INT32 elements, so an expert row
     # starts on a line and every tile boundary lands on one.
-    # Keep the fixed dispatch tasks in the fan-in. If every expert receives
-    # zero rows, all dynamic gather TaskIds are invalid; these two anchors keep
-    # dispatch_done valid and preserve dispatch -> combine ordering.
-    gather_tids = pl.array.create(N_LOCAL + 2, pl.TASK_ID)
-    gather_tids[0] = _wait_tid
-    gather_tids[1] = _meta_tid
+    gather_tids = pl.array.create(N_LOCAL, pl.TASK_ID)
     for e in pl.parallel(N_LOCAL):
         gather_tile_tids = pl.array.create(TILES_PER_EXPERT, pl.TASK_ID)
         expert_rows = pl.cast(pl.read(recv_count_out, [e, 0]), pl.INDEX)
@@ -340,9 +338,9 @@ def dispatch(
                         pl.write(recv_r_route_out, [e, out_col], pl.read(recv_route, [in_row, 0]))
                     source_begin = source_end
             gather_tile_tids[tile] = gather_tile_tid
-        gather_tids[e + 2] = pl.system.task_dummy(deps=[gather_tile_tids])
+        gather_tids[e] = pl.system.task_dummy(deps=[gather_tile_tids])
 
-    _gather_tid = pl.system.task_dummy(deps=[gather_tids[e] for e in range(N_LOCAL + 2)])
+    _gather_tid = pl.system.task_dummy(deps=[gather_tids[e] for e in range(N_LOCAL)])
     return _gather_tid
 
 
@@ -430,7 +428,6 @@ def _moe_tile(
     data_arrived: pld.DistributedTensor[[N_RANKS, 1], pl.INT32],
     routed_y_buf: pld.DistributedTensor[[N_ROUTES, D], pl.BF16],
     combine_arrived: pld.DistributedTensor[[N_RANKS, 1], pl.INT32],
-    stage_token: pl.Tensor[[1], pl.INT32],
     layer_id: pl.Scalar[pl.INT32],
     num_tokens: pl.Scalar[pl.INT32],
     my_rank: pl.Scalar[pl.INT32],
@@ -455,18 +452,6 @@ def _moe_tile(
         shared_out,
     )
 
-    # The fixed communication windows are reused by every layer. Keep an
-    # explicit rank-local ordering edge even when this rank owns no attention
-    # rows and receives no expert tiles: in that case neither tensor dataflow
-    # nor the dynamic expert fan-in produces a dependency for the next layer.
-    with pl.at(
-        level=pl.Level.CORE_GROUP,
-        name_hint="moe_stage_acquire",
-        allow_early_resolve=False,
-    ) as stage_ready:
-        completed_epoch = pl.read(stage_token, [0])
-        pl.write(stage_token, [0], completed_epoch)
-
     recv_x_out = pl.create_tensor([N_LOCAL, RECV_MAX, D], dtype=pl.INT8)
     recv_scale_out = pl.create_tensor([N_LOCAL, RECV_MAX], dtype=pl.FP32, manual_dep=True)
     recv_w_out = pl.create_tensor([N_LOCAL, RECV_MAX], dtype=pl.FP32, manual_dep=True)
@@ -478,13 +463,9 @@ def _moe_tile(
         recv_x_out, recv_scale_out, recv_w_out, recv_r_route_out, recv_count_out, recv_meta_local,
         recv_meta, recv_x, recv_aux, recv_route, arrived, data_arrived,
         num_tokens, my_rank, moe_epoch,
-        stage_ready,
     )
 
-    # Seed the expert fan-in with dispatch_done. Dynamic expert loops may all
-    # be empty, but combine_notify must still have a valid current-layer dep.
-    expert_completion_tids = pl.array.create(N_LOCAL + 1, pl.TASK_ID)
-    expert_completion_tids[0] = dispatch_done
+    expert_completion_tids = pl.array.create(N_LOCAL, pl.TASK_ID)
     for local_e in pl.parallel(N_LOCAL):
         tile_completion_tids = pl.array.create(TILES_PER_EXPERT, pl.TASK_ID)
         expert_rows = pl.cast(pl.read(recv_count_out, [local_e, 0]), pl.INDEX)
@@ -527,11 +508,9 @@ def _moe_tile(
                     source_begin = source_end
             tile_completion_tids[tile] = scatter_tid
         expert_tiles_done = pl.system.task_dummy(deps=[tile_completion_tids])
-        expert_completion_tids[local_e + 1] = expert_tiles_done
+        expert_completion_tids[local_e] = expert_tiles_done
 
-    scatter_done = pl.system.task_dummy(
-        deps=[expert_completion_tids[local_e] for local_e in range(N_LOCAL + 1)],
-    )
+    scatter_done = pl.system.task_dummy(deps=[expert_completion_tids[local_e] for local_e in range(N_LOCAL)])
 
     completion_tid = combine(
         shared_out, ffn_out,
@@ -576,7 +555,6 @@ def moe(
     data_arrived: pld.DistributedTensor[[N_RANKS, 1], pl.INT32],
     routed_y_buf: pld.DistributedTensor[[N_ROUTES, D], pl.BF16],
     combine_arrived: pld.DistributedTensor[[N_RANKS, 1], pl.INT32],
-    stage_token: pl.Tensor[[1], pl.INT32],
     # scalars last: runtime TaskArgs forbids a tensor arg after a scalar arg.
     layer_id: pl.Scalar[pl.INT32],
     num_tokens: pl.Scalar[pl.INT32],
@@ -592,7 +570,7 @@ def moe(
 
     ffn_out = pl.create_tensor([T, D], dtype=pl.BF16)
     with pl.scope():
-        completion_tid = _moe_tile(
+        _moe_tile(
             x_mixed,
             norm_w, gate_w, gate_bias, tid2eid, input_ids,
             routed_w1, routed_w1_scale, routed_w3, routed_w3_scale,
@@ -602,19 +580,9 @@ def moe(
             ffn_out,
             recv_meta, recv_x, recv_aux, recv_route,
             arrived, data_arrived, routed_y_buf, combine_arrived,
-            stage_token,
             layer_id, num_tokens, my_rank, moe_epoch,
         )
         hc_post(ffn_out, x_hc, post_ffn, comb_ffn, x_next)
-        with pl.at(
-            level=pl.Level.CORE_GROUP,
-            name_hint="moe_stage_publish",
-            deps=[completion_tid],
-            allow_early_resolve=False,
-        ):
-            # Publish only after combine retires. The next layer cannot acquire
-            # the reused communication windows before this write completes.
-            pl.write(stage_token, [0], pl.cast(moe_epoch, pl.INT32))
     return x_next
 
 
@@ -733,7 +701,6 @@ def prefill_moe(
                 ffn_wave,
                 recv_meta, recv_x, recv_aux, recv_route,
                 arrived, data_arrived, routed_y_buf, combine_arrived,
-                stage_token,
                 layer_id, wave_rows_i32, my_rank, moe_epoch,
             )
             with pl.spmd(T, name_hint="prefill_moe_output_store", deps=[completion_tid]) as output_store_tid:
@@ -830,9 +797,6 @@ def moe_test(
     moe_epoch: pl.Scalar[pl.INT32],
     finalize_moe: pl.Scalar[pl.INT32],
 ) -> pl.Tensor[[T, HC_MULT, D], pl.FP32]:
-    stage_token = pl.create_tensor([1], dtype=pl.INT32)
-    with pl.at(level=pl.Level.CORE_GROUP, name_hint="moe_stage_init"):
-        pl.write(stage_token, [0], pl.cast(0, pl.INT32))
     moe(
         x_hc, hc_ffn_fn, hc_ffn_scale, hc_ffn_base,
         norm_w, gate_w, gate_bias, tid2eid, input_ids,
@@ -842,7 +806,7 @@ def moe_test(
         shared_w2, shared_w2_scale,
         x_next,
         recv_meta, recv_x, recv_aux, recv_route, arrived, data_arrived,
-        routed_y_buf, combine_arrived, stage_token,
+        routed_y_buf, combine_arrived,
         layer_id, num_tokens, my_rank, moe_epoch,
     )
     if finalize_moe == 1:
