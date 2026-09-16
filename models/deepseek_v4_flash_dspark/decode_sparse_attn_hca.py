@@ -111,6 +111,29 @@ if T % ATTENTION_PUBLISH_T_TILE != 0:
 
 
 @pl.jit.inline(auto_scope=False)
+def _cmp_query_kv(
+    q: pl.Tensor[[T_DYN, H, HEAD_DIM], pl.BF16],
+    token: pl.Scalar[pl.INDEX],
+):
+    query_3d = pl.load(q, [token, 0, 0], [1, H, HEAD_DIM], target_memory=pl.MemorySpace.Mat)
+    query = pl.reshape(query_3d, [H, HEAD_DIM])
+    return query, query
+
+
+if TP == 1:
+
+    @pl.jit.inline(auto_scope=False)
+    def _cmp_query_kv(
+        q: pl.Tensor[[T_DYN, H, HEAD_DIM], pl.BF16],
+        token: pl.Scalar[pl.INDEX],
+    ):
+        query_3d = pl.load(q, [token, 0, 0], [1, H, HEAD_DIM], target_memory=pl.MemorySpace.Mat)
+        query = pl.reshape(query_3d, [H, HEAD_DIM])
+        kv = pl.create_tile([QK_TRANSFER_SLOTS * CMP_ATTN_K_TILE, HEAD_DIM], dtype=pl.BF16, target_memory=pl.MemorySpace.Mat)
+        return query, kv
+
+
+@pl.jit.inline(auto_scope=False)
 def sparse_attn_hca(
     q: pl.Tensor[[T_DYN, H, HEAD_DIM], pl.BF16],
     ori_kv: pl.Tensor[[ORI_BLOCK_NUM_DYN, BLOCK_SIZE, 1, HEAD_DIM], pl.BF16],
@@ -480,9 +503,7 @@ def sparse_attn_hca(
                     qk_kv_len = pl.max(pl.read(kv_seq_lens, [qk_request]), 0)
                     qk_rows = pl.min(HCA_MAX_COMPRESSED_ROWS, pl.min((qk_position + 1) // COMPRESS_RATIO, qk_kv_len // COMPRESS_RATIO))
                     qk_blocks = pl.min(cmp_work_count, (qk_rows + CMP_ATTN_K_TILE - 1) // CMP_ATTN_K_TILE)
-                    qk_q = pl.load(
-                        q_flat, [qk_t * H, 0], [H, HEAD_DIM], target_memory=pl.MemorySpace.Mat,
-                    )
+                    qk_q, qk_l1 = _cmp_query_kv(q, qk_t)
                     for qk_tick in pl.range(qk_blocks + QK_PRE_LAUNCH):
                         if qk_tick < qk_blocks:
                             qk_sb = qk_tick
@@ -494,11 +515,15 @@ def sparse_attn_hca(
                                 qk_slot = qk_core * QK_TRANSFER_SLOTS + qk_sb % QK_TRANSFER_SLOTS
                                 qk_kv_row = (qk_request * cmp_work_count + qk_sb) * CMP_ATTN_K_TILE
                                 qk_transfer_row = qk_slot * H
-                                qk_kv = pl.load(
-                                    cmp_work_kv, [qk_kv_row, 0], [CMP_ATTN_K_TILE, HEAD_DIM],
-                                    target_memory=pl.MemorySpace.Mat,
-                                )
-                                qk_scores = pl.matmul(qk_q, pl.tile.transpose_view(qk_kv), out_dtype=pl.FP32)
+                                if TP == 1:
+                                    qk_l1_row = (qk_sb % QK_TRANSFER_SLOTS) * CMP_ATTN_K_TILE
+                                    qk_l1 = pl.gather_row(qk_l1, cmp_work_kv, [qk_l1_row, 0], [qk_kv_row, 0], [CMP_ATTN_K_TILE, HEAD_DIM])
+                                    qk_l1_t = pl.tile.transpose_view(qk_l1)
+                                    qk_kv_t = pl.tile.slice(qk_l1_t, [HEAD_DIM, CMP_ATTN_K_TILE], [0, qk_l1_row])
+                                else:
+                                    qk_kv = pl.load(cmp_work_kv, [qk_kv_row, 0], [CMP_ATTN_K_TILE, HEAD_DIM], target_memory=pl.MemorySpace.Mat)
+                                    qk_kv_t = pl.tile.transpose_view(qk_kv)
+                                qk_scores = pl.matmul(qk_q, qk_kv_t, out_dtype=pl.FP32)
                                 pl.store(qk_scores, [qk_transfer_row, 0], score_transfer)
                                 pl.system.sync_set(
                                     QK_SCORE_READY_EVENT, pipe=pl.PipeType.FIX,
@@ -512,17 +537,18 @@ def sparse_attn_hca(
                                 pv_page_ok = pl.min(pv_first_page + 1, cmp_block_num - pv_first_page)
                             if pv_page_ok > 0:
                                 pv_slot = qk_core * QK_TRANSFER_SLOTS + pv_sb % QK_TRANSFER_SLOTS
-                                pv_kv_row = (qk_request * cmp_work_count + pv_sb) * CMP_ATTN_K_TILE
                                 pv_transfer_row = pv_slot * H
                                 pl.system.sync_wait(QK_PROB_READY_EVENT, pipe=pl.PipeType.MTE2, core_type=pl.KernelType.AIC)
                                 pv_probability = pl.load(
                                     probability_transfer, [pv_transfer_row, 0], [H, CMP_ATTN_K_TILE],
                                     target_memory=pl.MemorySpace.Mat,
                                 )
-                                pv_kv = pl.load(
-                                    cmp_work_kv, [pv_kv_row, 0], [CMP_ATTN_K_TILE, HEAD_DIM],
-                                    target_memory=pl.MemorySpace.Mat,
-                                )
+                                if TP == 1:
+                                    pv_l1_row = (pv_sb % QK_TRANSFER_SLOTS) * CMP_ATTN_K_TILE
+                                    pv_kv = pl.tile.slice(qk_l1, [CMP_ATTN_K_TILE, HEAD_DIM], [pv_l1_row, 0])
+                                else:
+                                    pv_kv_row = (qk_request * cmp_work_count + pv_sb) * CMP_ATTN_K_TILE
+                                    pv_kv = pl.load(cmp_work_kv, [pv_kv_row, 0], [CMP_ATTN_K_TILE, HEAD_DIM], target_memory=pl.MemorySpace.Mat)
                                 pv_output = pl.matmul(pv_probability, pv_kv, out_dtype=pl.FP32)
                                 pl.store(pv_output, [pv_transfer_row, 0], pv_transfer)
                                 pl.system.sync_set(
