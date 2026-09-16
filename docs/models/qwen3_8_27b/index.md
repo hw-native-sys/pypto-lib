@@ -291,15 +291,15 @@ python models/qwen3_8_27b/bench.py -p a2a3 -d 0 --seq-len 8192
 Both take `--heads` and `--qk-heads`, defaulting to the model's 48 and 16. Pass
 the same value to both for an ungrouped shape.
 
-The block reference check needs no NPU, only `transformers` (5.17.0):
+The block reference check needs no NPU, only `transformers` (5.17.0), and skips with a message if it is absent. Its default sequence length is 1024, which checks the same thing element for element; the numbers quoted above are at 8192. `weights.py` needs `--fetch` the first time, since it pulls from the checkpoint:
 
 ```bash
-python models/qwen3_8_27b/weights.py --layer 0
+python models/qwen3_8_27b/weights.py --layer 0 --fetch
 python models/qwen3_8_27b/weights.py --quantize
-python models/qwen3_8_27b/test_block_reference.py
-python models/qwen3_8_27b/test_block_reference.py --weights build_output/qwen3_8_27b/linear_attn_layer0.pt
-python models/qwen3_8_27b/test_block_reference.py --weights build_output/qwen3_8_27b/linear_attn_layer0.pt --quant
-python models/qwen3_8_27b/test_block_reference.py --module-dtype float64,bfloat16 --seq-len 1024
+python models/qwen3_8_27b/test_block_reference.py --seq-len 8192
+python models/qwen3_8_27b/test_block_reference.py --seq-len 8192 --weights build_output/qwen3_8_27b/linear_attn_layer0.pt
+python models/qwen3_8_27b/test_block_reference.py --seq-len 8192 --weights build_output/qwen3_8_27b/linear_attn_layer0.pt --quant
+python models/qwen3_8_27b/test_block_reference.py --module-dtype float64,bfloat16
 ```
 
 These are entry points, not pytest cases: the device ones need an NPU and a

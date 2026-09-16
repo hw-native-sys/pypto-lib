@@ -108,6 +108,16 @@ def load_layer(path: str | Path) -> dict[str, torch.Tensor]:
 
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
+    # Accepted and ignored: this is a host-side tool, but CI invokes every runnable
+    # file in a model directory as `python <file> -p <platform> -d <card>`.
+    parser.add_argument("-p", "--platform", type=str, default="a2a3",
+                        choices=["a2a3", "a2a3sim", "a5", "a5sim"],
+                        help="accepted for CI's uniform invocation; nothing here runs on device")
+    parser.add_argument("-d", "--device", type=int, default=0,
+                        help="accepted for CI's uniform invocation; unused")
+    parser.add_argument("--fetch", action="store_true",
+                        help="download the layer from the checkpoint if it is not already "
+                             "on disk; without it a missing file is reported, not fetched")
     parser.add_argument("--layer", type=int, default=0,
                         help="which of the model's linear-attention layers (default 0)")
     parser.add_argument("--out", type=str, default=None,
@@ -118,10 +128,15 @@ def main() -> int:
                              "(fetched first if it is missing)")
     args = parser.parse_args()
 
+    source = default_path(args.layer)
+    if not source.is_file() and not args.fetch:
+        print(f"[weights] layer {args.layer} is not on disk ({source}); "
+              f"pass --fetch to download it from {REPO}")
+        return 0
+
     if args.quantize:
         import reference
 
-        source = default_path(args.layer)
         if not source.is_file():
             weights = fetch_layer(args.layer, revision=args.revision)
             source.parent.mkdir(parents=True, exist_ok=True)
