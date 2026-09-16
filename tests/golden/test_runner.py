@@ -356,6 +356,81 @@ class TestGoldenDataCacheMiss:
         assert str(partial / "in" / "x.pt") in r.error
         assert str(partial / "in" / "state.pt") in r.error
 
+    def test_missing_dir_fails_before_compile(self, three_kinds_specs, tmp_path):
+        missing = tmp_path / "does_not_exist"
+        with patch("pypto.ir.compile") as compile_mock:
+            r = run(
+                fn=object(),
+                specs=three_kinds_specs,
+                golden_fn=None,
+                golden_data=str(missing),
+            )
+
+        assert not r.passed
+        assert "golden_data is not a directory" in (r.error or "")
+        compile_mock.assert_not_called()
+
+
+class TestGoldenDataInputsOnly:
+    """``golden_data`` holds ``in/`` but no ``out/``: a capture from a program
+    with no ``golden_fn``."""
+
+    @pytest.fixture
+    def inputs_only_cache(self, tmp_path):
+        cache = tmp_path / "inputs_only"
+        _save_tensors(cache / "in", {
+            "x": torch.tensor([1.0, 2.0, 3.0, 4.0]),
+            "state": torch.tensor([10.0, 20.0, 30.0, 40.0]),
+        })
+        return cache
+
+    def test_without_golden_fn_replays_inputs_and_skips_validation(
+        self, inputs_only_cache, three_kinds_specs, tmp_path, capsys,
+    ):
+        observed = {}
+
+        def fake_execute(work_dir, tensors, **_kwargs):
+            observed["x"] = tensors[0].clone()
+            observed["state"] = tensors[2].clone()
+            tensors[1][:] = torch.full_like(tensors[1], 9999.0)
+
+        compiled_dir = _make_build_dir(tmp_path)
+        compile_p, exec_p = _patch_compile_and_execute(compiled_dir, fake_execute=fake_execute)
+        with compile_p, exec_p, patch("golden.runner._validate") as validate_mock:
+            r = run(
+                fn=object(),
+                specs=three_kinds_specs,
+                golden_fn=None,
+                golden_data=str(inputs_only_cache),
+            )
+
+        assert r.passed, f"unexpected failure: {r.error}"
+        validate_mock.assert_not_called()
+        torch.testing.assert_close(observed["x"], torch.tensor([1.0, 2.0, 3.0, 4.0]))
+        torch.testing.assert_close(observed["state"], torch.tensor([10.0, 20.0, 30.0, 40.0]))
+        assert not (inputs_only_cache / "out").exists()
+        out = capsys.readouterr().out
+        assert "golden_data has no out/: reusing inputs only" in out
+        assert "validation skipped: golden_data has no out/" in out
+
+    def test_with_golden_fn_still_requires_out(
+        self, inputs_only_cache, three_kinds_specs, tmp_path,
+    ):
+        compiled_dir = _make_build_dir(tmp_path)
+        compile_p, exec_p = _patch_compile_and_execute(compiled_dir)
+        with compile_p, exec_p:
+            r = run(
+                fn=object(),
+                specs=three_kinds_specs,
+                golden_fn=lambda t: None,
+                golden_data=str(inputs_only_cache),
+            )
+
+        assert not r.passed
+        assert "golden_data is missing files" in (r.error or "")
+        assert str(inputs_only_cache / "out" / "y.pt") in r.error
+        assert str(inputs_only_cache / "in" / "x.pt") not in r.error
+
 
 class TestGoldenFnPath:
     """No ``golden_data`` — the classic path that generates inputs, calls

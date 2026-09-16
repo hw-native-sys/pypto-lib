@@ -324,6 +324,7 @@ def _prepare_inputs(
     data_dir: Path | None,
     work_dir: Path,
     save_data: bool = True,
+    require_outputs: bool = True,
 ) -> tuple[dict[str, torch.Tensor], dict[str, ScalarSpec]]:
     """Build the dispatch buffers and effective scalars for the runtime stage.
 
@@ -336,6 +337,9 @@ def _prepare_inputs(
     The returned tensors are the buffers the device is handed, and nothing
     writes to them before :func:`_dispatch` — :func:`_compute_golden` runs
     first and clones what it needs — so no separate pristine copy is kept.
+
+    Set *require_outputs* False to replay the inputs alone: only ``in/`` has to
+    be present, for a *data_dir* captured from a program with no golden.
 
     Raises ``ValueError`` on missing files or scalar dtype mismatch.
     """
@@ -353,9 +357,12 @@ def _prepare_inputs(
             _save_tensors(in_dir, {s.name: s.value for s in scalar_specs})
         return tensors, scalar_specs_eff
 
-    required: list[tuple[str, str]] = []
-    for spec in (*tensor_specs, *scalar_specs):
-        required.extend(_required_files(spec))
+    required = [
+        (subdir, name)
+        for spec in (*tensor_specs, *scalar_specs)
+        for subdir, name in _required_files(spec)
+        if require_outputs or subdir == "in"
+    ]
     _require_files(data_dir, required)
     print(f"[RUN]   cache hit: {data_dir / 'in'}", flush=True)
 
@@ -1501,6 +1508,8 @@ def _run_pipeline(
         cfg = _normalize_config(config)
         _validate_unique_spec_names(specs)
         _validate_stepped_swimlane(scalar_specs, cfg)
+        if data_dir is not None and not data_dir.is_dir():
+            raise ValueError(f"golden_data is not a directory: {data_dir}")
         if prologue is not None:
             compile_state = prologue(scalar_specs, data_dir)
     except ValueError as e:
@@ -1534,16 +1543,27 @@ def _run_pipeline(
         print(f"[RUN] PASS ({total:.2f}s)", flush=True)
         return RunResult(passed=True, execution_time=total, work_dir=work_dir)
 
+    # A data_dir saved by a program with no golden_fn holds in/ but no out/.
+    # Replaying it reuses the inputs; there is simply nothing to validate.
+    inputs_only_replay = (
+        data_dir is not None
+        and golden_fn is None
+        and not (data_dir / "out").is_dir()
+    )
+    if inputs_only_replay:
+        print("[RUN]   golden_data has no out/: reusing inputs only", flush=True)
+
     try:
         with _Stage("generate inputs"):
             tensors, scalar_specs_eff = _prepare_inputs(
                 specs, tensor_specs, scalar_specs, data_dir, work_dir, save_data,
+                require_outputs=not inputs_only_replay,
             )
     except ValueError as e:
         return _fail(str(e))
 
     golden_outputs: dict[str, torch.Tensor] | None = None
-    if golden_fn is not None or golden_data is not None:
+    if not inputs_only_replay and (golden_fn is not None or golden_data is not None):
         golden_outputs = _compute_golden(
             specs, tensor_specs, scalar_specs_eff, tensors,
             work_dir, data_dir, golden_fn, save_data,
@@ -1561,10 +1581,12 @@ def _run_pipeline(
 
     def _pass(bench: Any) -> RunResult:
         total = time.time() - start
-        skip_note = (
-            ", validation skipped: no golden_fn or golden_data"
-            if golden_outputs is None else ""
-        )
+        if inputs_only_replay:
+            skip_note = ", validation skipped: golden_data has no out/"
+        elif golden_outputs is None:
+            skip_note = ", validation skipped: no golden_fn or golden_data"
+        else:
+            skip_note = ""
         print(f"[RUN] PASS ({total:.2f}s{skip_note})", flush=True)
         return RunResult(
             passed=True, execution_time=total, work_dir=work_dir, bench=bench,
@@ -1717,7 +1739,8 @@ def run(
             *golden_data* is set; if neither is given, validation is skipped.
         golden_data: Directory with ``in/{name}.pt`` and ``out/{name}.pt``;
             loads inputs and expected outputs (read-only). Takes precedence
-            over *golden_fn*.
+            over *golden_fn*. With *golden_fn* None, a directory without
+            ``out/`` replays the inputs alone and validation is skipped.
         config: Every setting for both phases, in one dict of
             :class:`pypto.runtime.RunConfig` keyword arguments — ``platform``,
             ``device_id``, ``enable_chip_swimlane``, ``dump_passes``,

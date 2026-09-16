@@ -345,7 +345,7 @@ false; an uncaught compile/runtime exception is already a nonzero failure.
 |------|--------|
 | `compile_only=True` | Stops after the compile phase. Useful for a smoke test that just checks the program lowers cleanly. |
 | `runtime_dir="<path>"` | Skips compile and reuses an existing `build_output/<...>` directory. Useful when iterating on `golden_fn` or validation logic without recompiling. |
-| `golden_data="<path>"` | Loads inputs from `<path>/in/` and goldens from `<path>/out/` instead of generating them. `golden_data` overrides `golden_fn`. Useful for deterministic regressions: a previous run leaves these files in its `data/` dir, so passing that dir reproduces the exact failing inputs. |
+| `golden_data="<path>"` | Loads inputs from `<path>/in/` and goldens from `<path>/out/` instead of generating them. `golden_data` overrides `golden_fn`. With `golden_fn=None` and no `<path>/out/`, only the inputs are replayed and validation is skipped. Useful for deterministic regressions: a previous run leaves these files in its `data/` dir, so passing that dir reproduces the exact failing inputs. |
 | `save_data=True` (default `False`) | Writes the `data/in/` + `data/out/` snapshot so the exact inputs/goldens can be replayed later via `golden_data`. Off by default: runs skip the snapshot and validate against the in-memory golden only. Opt in when you need replay; full-model kernels like `models/qwen3_14b/{prefill_fwd,decode_fwd}.py` expose it as `--save-data`. |
 
 For diagnosing compile errors, runtime hangs, and precision mismatches, see

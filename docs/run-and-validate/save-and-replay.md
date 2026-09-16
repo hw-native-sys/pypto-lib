@@ -46,6 +46,9 @@ result = run(
   the run's work directory.
 - `golden_data=<directory>` reads `in/` and `out/` from that directory.
 - `golden_data` takes precedence over `golden_fn`.
+- With `golden_fn=None`, `save_data=True` writes only `in/`, and a later
+  `golden_data` replay of that directory reuses the inputs and skips
+  validation — see [Inputs-only snapshots](#inputs-only-snapshots).
 - `save_data` defaults to `False`; ordinary validation remains in memory and
   does not create a snapshot.
 
@@ -131,6 +134,30 @@ The harness checks that every required file exists before runtime:
 | initialized output / inout tensor | both `in/<name>.pt` and `out/<name>.pt` |
 
 An incomplete snapshot returns a failed `RunResult` with the missing paths.
+
+### Inputs-only snapshots
+
+An entry that passes `golden_fn=None` (typically a performance-only model
+entry whose torch reference is too expensive or absent) still benefits from a
+snapshot: input generation is skipped on replay. Capturing with `save_data=True`
+writes only `in/`, since there is no golden to save.
+
+Replaying such a directory requires only the `in/` rows of the table above.
+The harness detects the case — `golden_fn` is `None` and the directory has no
+`out/` — and says so:
+
+```text
+[RUN]   golden_data has no out/: reusing inputs only
+[RUN] generate inputs ...
+[RUN]   cache hit: .../data/in
+...
+[RUN] PASS (…s, validation skipped: golden_data has no out/)
+```
+
+The run passes without comparing outputs. If `out/` is expected but was lost
+in a copy, this is the line that reveals it. A directory without `out/` still
+fails when a `golden_fn` is passed, and a directory that has `out/` is always
+validated against it.
 
 ## Invalidation rules
 
