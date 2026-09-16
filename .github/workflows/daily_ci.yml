@@ -4,6 +4,14 @@ on:
   schedule:
     - cron: '51 20 * * *'  # UTC 20:51 = Shanghai 04:51
   workflow_dispatch:
+  # EXPERIMENT ONLY (PR 898), never merge: a push to this branch runs the two
+  # simulator legs and nothing else, against pypto's default branch instead of
+  # the shared pin. The three device jobs are skipped so nothing waits on
+  # hardware, and the a5sim/a2a3sim build trees are the only ones moved off the
+  # pin -- a scheduled run resets them back, since the fetch is unconditional.
+  push:
+    branches:
+      - exp/ptoas-op-fusion-ab
 
 # Every job only reads the repo (checkouts use persist-credentials: false, the
 # artifact up/download steps use the run-scoped runtime token, the summary
@@ -62,6 +70,10 @@ jobs:
           build-namespace: ${{ matrix.platform }}
           pip-cache-name: pip-sim
           toolchain: bundle
+          # EXPERIMENT ONLY (PR 898), never merge: an explicit empty value makes
+          # the action fetch pypto's origin HEAD instead of the shared pin, which
+          # is the point of this run.
+          pypto-ref: ''
 
       - name: Run model tests (${{ matrix.platform }})
         id: sweep
@@ -152,6 +164,8 @@ jobs:
           path: checkout/results.tsv
 
   model-tests-a2a3:
+    # EXPERIMENT ONLY (PR 898): a device job, so a push skips it.
+    if: ${{ github.event_name != 'push' }}
     # Runs directly on the host like pypto's dist-system-tests — multi-card
     # kernels use HCCL, which needs a host-only env (set_env.sh, HCCL plugin
     # paths); under docker the chip child silent-crashes in comm_init. It holds
@@ -307,6 +321,8 @@ jobs:
           path: checkout/results.tsv
 
   model-tests-a5:
+    # EXPERIMENT ONLY (PR 898): a device job, so a push skips it.
+    if: ${{ github.event_name != 'push' }}
     # Report-only. A measured sweep puts V4-Pro at 13/35 on A5: 13 cases die
     # with `sync_stream_pair: aclrtSync` device faults, 2 with `rtMalloc failed:
     # 207001`, 7 on numerics. Those are pypto/device-side rather than defects in
@@ -499,6 +515,8 @@ jobs:
           path: checkout/results.tsv
 
   e2e-flash-a5:
+    # EXPERIMENT ONLY (PR 898): a device job, so a push skips it.
+    if: ${{ github.event_name != 'push' }}
     name: DeepSeek-V4-Flash EP8 end-to-end (a5)
     # The only nightly that runs the whole prompt -> tokens -> text path on real
     # weights; model-tests-a5 covers the operators one by one on synthetic data.
