@@ -142,10 +142,11 @@ def _prepare_sparse_attn_rope(
     rope_swap_idx: pl.Tensor[[HEAD_TILE, ROPE_DIM], pl.INT32],
     tile_base: pl.Scalar[pl.INDEX],
     tile_rows: pl.Scalar[pl.INDEX],
+    input_ready_dep: pl.Scalar[pl.TASK_ID],
 ) -> pl.Scalar[pl.TASK_ID]:
     """Build one dense tile of inverse-RoPE tables."""
     rope_cs_blocks = (tile_rows + ROPE_CS_T_TILE - 1) // ROPE_CS_T_TILE
-    with pl.spmd(ROPE_HALF // ROPE_TILE, name_hint="rope_cs") as rope_cs_tid:
+    with pl.spmd(ROPE_HALF // ROPE_TILE, name_hint="rope_cs", deps=[input_ready_dep]) as rope_cs_tid:
         cp = pl.tile.get_block_idx()
         cp_r0 = cp * ROPE_TILE
         cp_c0 = 2 * cp_r0
@@ -595,6 +596,7 @@ def _hca_streaming_attn_tile(
             freqs_cos, freqs_sin,
             rope_cos_il, rope_sin_signed, rope_swap_idx,
             request_offset + tile_base, tile_rows,
+            packed_init_tid,
         )
 
         # Serial query-wave completion.
@@ -1038,6 +1040,7 @@ def _sparse_attn_heads(
             rope_swap_idx,
             tile_base,
             tile_rows,
+            packed_init_tid,
         )
         merge_tids[0] = pl.system.task_dummy(deps=[packed_init_tid, rope_cs_tid])
         for query_block in pl.unroll(PREFILL_QUERY_BLOCKS):
