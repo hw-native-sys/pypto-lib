@@ -53,6 +53,8 @@ the block runs them.
 | [qk_norm_gate.py](../../../models/qwen3_8_27b/qk_norm_gate.py) | the q/k L2-norm and scaling, and `beta` and the decay gate from the a/b projections |
 | [gated_rmsnorm.py](../../../models/qwen3_8_27b/gated_rmsnorm.py) | the gated RMSNorm after the delta rule, and the per-token INT8 quantisation `out_proj` reads |
 | [out_proj.py](../../../models/qwen3_8_27b/out_proj.py) | the normed output back to the residual stream, A8W8 |
+| [gdn_layer.py](../../../models/qwen3_8_27b/gdn_layer.py) | the delta rule's six stages as one program |
+| [gdn_block.py](../../../models/qwen3_8_27b/gdn_block.py) | all fourteen as one program, hidden states in and out |
 
 The three A8W8 projections are the same arithmetic at three shapes and share
 one implementation, [a8w8_linear.py](../../../models/qwen3_8_27b/a8w8_linear.py);
@@ -76,10 +78,54 @@ difference from running the stages back to back is that `solve_tril` writes
 `A_inv` as FP16 directly instead of FP32 for a host-side narrowing, since FP16 is
 what its consumer reads.
 
-`gdn_layer.py` is the delta rule alone. Of the rest of the block, the short
-convolution, the qk-norm and gate, and the gated RMSNorm are built, as
-standalone kernels not yet composed into a layer; the four input projections
-and `out_proj` are not.
+`gdn_layer.py` is the delta rule alone. The surrounding block is
+[gdn_block.py](../../../models/qwen3_8_27b/gdn_block.py), below.
+
+## The block
+
+[gdn_block.py](../../../models/qwen3_8_27b/gdn_block.py) runs all fourteen
+operators as one program: bf16 hidden states in, bf16 hidden states out, with
+every intermediate allocated inside and never reaching the caller. The delta
+rule inlines into it as one callee in turn, so the six stages inline into
+`gdn_layer` and `gdn_layer` inlines here.
+
+Three interfaces are shaped by the composition rather than by any one operator,
+and each is answered where it costs nothing:
+
+- The convolution reads the K-1 tokens before each of its windows, so
+  `in_proj_qkv` takes a `row_off` and writes straight into the padded buffer
+  the convolution wants; the rows above it are zeroed by a ten-task fill.
+  Nothing copies `[T, C]` into `[T + K - 1, C]`.
+- The convolution writes q, k and v as three tensors rather than one, so each
+  consumer reads the rows of a contiguous buffer -- and v, which goes straight
+  to the delta rule, is written in fp16 at the store instead of by a later
+  cast pass.
+- The gated norm declares `z` in the `[T, H*D]` layout `in_proj_z` writes.
+
+No slicing is needed at any call site: every delta-rule kernel already
+reshapes its rank-3 inputs to `[T, heads*D]` as its first statement, so what
+the consumers need is each tensor contiguous in its own buffer, not a
+particular rank.
+
+**On a2a3 at T = 8192, 20 rounds: 9330 us**, against 9559 for the same
+fourteen kernels timed separately -- so composing is worth about 230 us, and
+that difference is the whole of the inter-kernel overlap the runtime performs.
+Most of it is at the head, where `in_proj_ab`, the halo fill, the gate half of
+`qk_norm_gate` and `chunk_cumsum` all run underneath `quant_x` for free.
+
+**Accuracy is scored as two ratios against the quantization floor, not as an
+element-wise tolerance**, because `out_proj` reads int8. The kernels' own
+dtypes move the normed output by 2.6e-03, that flips 1.0% of its int8 values
+by one step, and those flips alone move the block output by 1.4e-02 -- so an
+element-wise comparison taken after a quantiser measures which side of a
+rounding boundary a value fell on, not whether the kernel is right. The gate
+is instead: total relative error within 1.05x of what W8A8 alone costs, and
+worst token row within 1.25x. Measured **1.006x and 1.002x**, with the worst
+row the sharper of the two -- one dead row in 2048 moves the whole-tensor norm
+by 1.12x and the worst row by 10.6x.
+
+Still out of scope here: variable-length batches (one sequence, `B = 1`), and
+everything in the layer outside the Gated DeltaNet block itself.
 
 ## The short convolution
 
@@ -196,8 +242,8 @@ the whole of the rest.
 of all six stages, and around them of the whole block: the four projections, the
 depthwise convolution, the qk-norm and gate, the gated RMSNorm and `out_proj`,
 read line by line from `Qwen3_5GatedDeltaNet` in `transformers`. That block
-chain is what the operators still to be built will be scored against, so it is
-itself checked against the model's own module:
+chain is what every operator and the composed block are scored against, so it
+is itself checked against the model's own module:
 [test_block_reference.py](../../../models/qwen3_8_27b/test_block_reference.py)
 runs `Qwen3_5GatedDeltaNet` on the same hidden states and weights and compares
 the two at every projection, after the delta rule, after the norm and at the
