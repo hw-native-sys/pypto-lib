@@ -58,6 +58,7 @@ jobs:
       files: ${{ steps.check.outputs.files }}
       run_qwen_serving_tests: ${{ steps.check.outputs.run_qwen_serving_tests }}
       run_deepseek_serving_tests: ${{ steps.check.outputs.run_deepseek_serving_tests }}
+      a5_files: ${{ steps.check.outputs.a5_files }}
     steps:
       - uses: actions/checkout@v4
         with:
@@ -72,6 +73,7 @@ jobs:
 
           echo "run_qwen_serving_tests=false" >> "$GITHUB_OUTPUT"
           echo "run_deepseek_serving_tests=false" >> "$GITHUB_OUTPUT"
+          echo "a5_files=" >> "$GITHUB_OUTPUT"
 
           if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
             echo "has_changes=true" >> "$GITHUB_OUTPUT"
@@ -131,6 +133,18 @@ jobs:
           if [ "${{ github.event_name }}" = "pull_request" ] &&
              printf '%s\n' "$CHANGED_FILES" | grep -qE '^models/deepseek_v4_flash_mtp/'; then
             echo "run_deepseek_serving_tests=true" >> "$GITHUB_OUTPUT"
+          fi
+          # A5 device entries are invisible to the runnable-file rules above,
+          # so they are selected separately: the same reverse-import closure,
+          # against the `# ci: a5` marker. A pull request runs the entries its
+          # own diff reaches and no others.
+          if [ "${{ github.event_name }}" = "pull_request" ]; then
+            A5_FILES=$(
+              printf '%s\n' "$CHANGED_FILES" |
+                python .github/scripts/detect_changes.py --a5-entries
+            )
+            echo "a5_files=$A5_FILES" >> "$GITHUB_OUTPUT"
+            echo "Selected A5 entries: $A5_FILES"
           fi
           echo "Selected files: $FILES"
 
@@ -198,7 +212,8 @@ jobs:
             FILES=$(find examples -name '*.py' ! -name '*_draft.py' | sort)
           fi
           # a5sim carries examples only. Models are validated on a2a3 and
-          # a2a3sim; A5 model coverage is the daily model-tests-a5 device sweep.
+          # a2a3sim; A5 model coverage is the a5-v41-flash job below for the
+          # V4.1-Flash operators and the daily model-tests-a5 sweep for V4-Pro.
           if [ "${{ matrix.platform }}" = "a5sim" ]; then
             FILES=$(printf '%s\n' $FILES | grep '^examples/' || true)
           fi
@@ -328,6 +343,103 @@ jobs:
             exit 1
           fi
           echo "All selected files passed."
+
+      - name: Kill orphaned task-submit tasks
+        if: always()
+        uses: ./.github/actions/kill-orphaned-tasks
+        with:
+          checkout-path: checkout
+
+      - name: Clean up build artifacts
+        if: always()
+        working-directory: checkout
+        run: rm -rf build_output
+
+  a5-v41-flash:
+    needs: detect-changes
+    # Real Ascend 950 (A5) coverage for the implemented V4.1-Flash attention
+    # operators. They are A5-only and hide the `__main__` sentinel so the a2a3
+    # and sim sweeps never pick them up; detect-changes selects them by the
+    # `# ci: a5` marker instead, and only the ones this pull request's own
+    # change reaches. Unlike the nightly model-tests-a5 (report-only while
+    # V4-Pro sits at 13/35 on device) these are green, so this job gates.
+    if: >-
+      github.event_name == 'pull_request' &&
+      needs.detect-changes.outputs.a5_files != ''
+    runs-on: [self-hosted, linux, npu-a5]
+    # Must exceed one task-submit worst case (--timeout 3600 queue wait +
+    # --max-time 900 run) plus build headroom, as in the a2a3 job.
+    timeout-minutes: 120
+    defaults:
+      run:
+        working-directory: checkout
+    env:
+      PTOAS_ROOT: ${{ github.workspace }}/checkout/ptoas-bin
+      CMAKE_BUILD_PARALLEL_LEVEL: 16
+
+    steps:
+      - name: Fetch composite action definitions
+        uses: actions/checkout@v4
+        with:
+          sparse-checkout: .github/actions
+          clean: false
+          persist-credentials: false
+
+      - name: Setup CI job
+        uses: ./.github/actions/setup-ci-job
+        with:
+          checkout-path: checkout
+          needs-device: 'true'
+          # Its own build tree: this can run while the nightly a5-daily job is
+          # building, and concurrent jobs must not share a build namespace.
+          build-namespace: a5-ci
+          pip-cache-name: pip-a5
+          toolchain: bundle
+          # These entries need a newer stack than the serving pins carry, so
+          # this job overrides both and every other job keeps the defaults.
+          # PyPTO: the MX matmul operand staging from pypto #2671, without which
+          # their `pl.matmul_mx` scale operands do not lower. Bumping the ref
+          # also moves ptoas (v0.60 -> v0.61) and pto-isa, which pypto owns.
+          # torch: `float8_e8m0fnu`, the MXFP8 scale dtype, added in 2.7 — a
+          # shim is not an option because pypto maps that IR dtype through its
+          # own table and the golden runner then compares the two for equality.
+          # This pair is the stack the entries were validated on.
+          pypto-ref: 1deae896dfe2c77e6302df1eef712887877264da
+          torch-version: 'torch==2.10.0'
+
+      - name: Run V4.1-Flash operators (a5, via task-submit)
+        shell: bash
+        env:
+          PYPTO_LOG_LEVEL: error
+          PYPTO_WARNING_LEVEL: none
+          PYPTO_RUNTIME_LOG: error
+        run: |
+          source activate.sh
+          set +e
+          # Chosen by detect-changes from this pull request's diff. A new
+          # operator joins by carrying `# ci: a5`; nothing here needs editing.
+          CASES="${{ needs.detect-changes.outputs.a5_files }}"
+          echo "Entries selected for this change:" $CASES
+          failed=()
+          for f in $CASES; do
+            echo "::group::$f"
+            # One card. These entries specialize every shape from --tp at import,
+            # so TP1 exercises the whole operator including the TP reduction at
+            # world size one. The production TP4 shape needs a four-card borrow
+            # and stays out of the PR path.
+            task-submit --device "$DEVICE_ID" --timeout 3600 --max-time 900 \
+              --run "cd $GITHUB_WORKSPACE/checkout && source activate.sh && PYTHONPATH=$GITHUB_WORKSPACE/checkout python $f -p a5 --tp 1 --dp 1 -d \$TASK_DEVICE"
+            if [ $? -ne 0 ]; then
+              failed+=("$f")
+              echo "::error file=${f}::FAIL"
+            fi
+            echo "::endgroup::"
+          done
+          if [ ${#failed[@]} -ne 0 ]; then
+            printf 'FAILED: %s\n' "${failed[@]}"
+            exit 1
+          fi
+          echo "Passed:" $CASES
 
       - name: Kill orphaned task-submit tasks
         if: always()

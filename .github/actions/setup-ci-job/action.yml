@@ -132,6 +132,17 @@ inputs:
       build step move together.
     required: false
     default: 'false'
+  torch-version:
+    description: >-
+      torch requirement for the venv, as a pip specifier. Defaults to what
+      py310-lib resolved torch>=2.0.0 to, which is the version every job built
+      against before the bundle migration.
+
+      Override it only for a job whose kernels need a newer torch, and only with
+      install-torch-npu false: torch_npu hard-requires its own exact torch, so
+      the two cannot both choose one.
+    required: false
+    default: 'torch==2.6.0'
   build-namespace:
     description: >-
       Per-job-type discriminator for the pypto build tree, which is stored at
@@ -698,6 +709,7 @@ runs:
       working-directory: ${{ inputs.checkout-path }}
       env:
         INSTALL_TORCH_NPU: ${{ inputs.install-torch-npu }}
+        TORCH_VERSION: ${{ inputs.torch-version }}
       run: |
         source activate.sh
         # One installer per toolchain, chosen by the bootstrap step that built
@@ -745,12 +757,13 @@ runs:
         # conda this never showed: the base env already carried a torch, which
         # turned out to be the only thing pinning it.
         #
-        # The version is pinned to what py310-lib actually resolved torch>=2.0.0
+        # The default is pinned to what py310-lib actually resolved torch>=2.0.0
         # to, so this migration changes the toolchain and nothing else. Unpinned,
         # pip takes the newest (2.13.0 today). It is also forced from below when
         # install-torch-npu is on: the torch_npu 2.6.0 line requires torch==2.6.0
-        # exactly, and one torch is installed here for every job.
-        TORCH_PIN='torch==2.6.0'
+        # exactly, and one torch is installed here for every job. The
+        # torch-version input overrides it per job; see that input's description.
+        TORCH_PIN="$TORCH_VERSION"
         if ! py_install "$TORCH_PIN" --index-url https://download.pytorch.org/whl/cpu; then
           echo "note: download.pytorch.org unreachable — falling back to PyPI"
           py_install "$TORCH_PIN"

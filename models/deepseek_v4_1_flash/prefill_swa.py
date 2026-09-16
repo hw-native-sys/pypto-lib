@@ -14,8 +14,10 @@ from pathlib import Path
 if __package__ in (None, ""):
     sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
-# A5-only; intentionally excluded from the A2/A3 device sweep.
+# A5-only; intentionally excluded from the A2/A3 device sweep. `ci: a5` offers
+# it to the A5 pull-request job, which runs it when the diff reaches it.
 # ci: no-sim
+# ci: a5
 
 import pypto.language as pl
 import pypto.language.distributed as pld
