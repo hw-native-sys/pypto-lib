@@ -18,7 +18,7 @@ permissions:
 
 jobs:
   inspect:
-    runs-on: [self-hosted, linux, arm64, npu]
+    runs-on: [self-hosted, linux, arm64, cpu]
     timeout-minutes: 5
     steps:
       - name: Read active performance checkpoints and bounded log tails
