@@ -97,7 +97,6 @@ from decode_prepare import (
 )
 from decode_moe import (
     AUX_PAD,
-    IDX_PAD,
     MOE_INTER,
     N_EXPERTS_GLOBAL,
     N_LOCAL,
@@ -301,7 +300,6 @@ def decode_fwd(
     recv_meta: pld.DistributedTensor[[N_RANKS, N_LOCAL], pl.INT32],
     recv_x: pld.DistributedTensor[[N_LOCAL * RECV_MAX, D], pl.INT8],
     recv_aux: pld.DistributedTensor[[N_LOCAL * RECV_MAX, AUX_PAD], pl.FP32],
-    recv_route: pld.DistributedTensor[[N_LOCAL * RECV_MAX, IDX_PAD], pl.INT32],
     arrived: pld.DistributedTensor[[N_RANKS, 1], pl.INT32],
     data_arrived: pld.DistributedTensor[[N_RANKS, 1], pl.INT32],
     routed_y_buf: pld.DistributedTensor[[N_ROUTES, D], pl.BF16],
@@ -428,7 +426,7 @@ def decode_fwd(
             shared_w1_l0, shared_w1_scale_l0, shared_w3_l0, shared_w3_scale_l0,
             shared_w2_l0, shared_w2_scale_l0,
             hidden,
-            recv_meta, recv_x, recv_aux, recv_route, arrived, data_arrived,
+            recv_meta, recv_x, recv_aux, arrived, data_arrived,
             routed_y_buf, combine_arrived,
             pl.cast(0, pl.INT32), nt, my_rank, pl.cast(1, pl.INT32),
         )
@@ -453,7 +451,7 @@ def decode_fwd(
             shared_w1_l1, shared_w1_scale_l1, shared_w3_l1, shared_w3_scale_l1,
             shared_w2_l1, shared_w2_scale_l1,
             hidden,
-            recv_meta, recv_x, recv_aux, recv_route, arrived, data_arrived,
+            recv_meta, recv_x, recv_aux, arrived, data_arrived,
             routed_y_buf, combine_arrived,
             pl.cast(1, pl.INT32), nt, my_rank, pl.cast(2, pl.INT32),
         )
@@ -547,7 +545,7 @@ def decode_fwd(
                 shared_w1_csa, shared_w1_scale_csa, shared_w3_csa, shared_w3_scale_csa,
                 shared_w2_csa, shared_w2_scale_csa,
                 hidden_mid,
-                recv_meta, recv_x, recv_aux, recv_route, arrived, data_arrived,
+                recv_meta, recv_x, recv_aux, arrived, data_arrived,
                 routed_y_buf, combine_arrived,
                 csa_layer, nt, my_rank, csa_moe_epoch,
             )
@@ -617,7 +615,7 @@ def decode_fwd(
                 shared_w1_hca, shared_w1_scale_hca, shared_w3_hca, shared_w3_scale_hca,
                 shared_w2_hca, shared_w2_scale_hca,
                 hidden,
-                recv_meta, recv_x, recv_aux, recv_route, arrived, data_arrived,
+                recv_meta, recv_x, recv_aux, arrived, data_arrived,
                 routed_y_buf, combine_arrived,
                 hca_layer, nt, my_rank, hca_moe_epoch,
             )
@@ -708,7 +706,7 @@ def decode_fwd(
             shared_w1_last, shared_w1_scale_last, shared_w3_last, shared_w3_scale_last,
             shared_w2_last, shared_w2_scale_last,
             pre_hc_hidden_out,
-            recv_meta, recv_x, recv_aux, recv_route, arrived, data_arrived,
+            recv_meta, recv_x, recv_aux, arrived, data_arrived,
             routed_y_buf, combine_arrived,
             csa_layer_last, nt, my_rank, last_moe_epoch,
         )
@@ -821,7 +819,6 @@ def l2_decode_fwd(
     recv_meta: pld.DistributedTensor[[N_RANKS, N_LOCAL], pl.INT32],
     recv_x: pld.DistributedTensor[[N_LOCAL * RECV_MAX, D], pl.INT8],
     recv_aux: pld.DistributedTensor[[N_LOCAL * RECV_MAX, AUX_PAD], pl.FP32],
-    recv_route: pld.DistributedTensor[[N_LOCAL * RECV_MAX, IDX_PAD], pl.INT32],
     arrived: pld.DistributedTensor[[N_RANKS, 1], pl.INT32],
     data_arrived: pld.DistributedTensor[[N_RANKS, 1], pl.INT32],
     routed_y_buf: pld.DistributedTensor[[N_ROUTES, D], pl.BF16],
@@ -900,7 +897,7 @@ def l2_decode_fwd(
         lm_head_weight, logit_row_indices,
         sampling_temperatures, sampling_top_ks, sampling_seeds, sampling_positions,
         pre_hc_hidden_out, x_out, logits, sampled_ids,
-        recv_meta, recv_x, recv_aux, recv_route,
+        recv_meta, recv_x, recv_aux,
         arrived, data_arrived, routed_y_buf, combine_arrived,
         lm_head_hidden_window, lm_head_hidden_done, lm_head_logits_window, lm_head_logits_done,
         num_tokens_per_owner, my_rank,
@@ -1011,7 +1008,6 @@ def l3_decode_fwd(
     # LM-head completion counters separate from the MoE epoch protocol below.
     recv_x_buf = pld.alloc_window_buffer(N_LOCAL * RECV_MAX * D)
     recv_aux_buf = pld.alloc_window_buffer([N_LOCAL * RECV_MAX, AUX_PAD], dtype=pl.FP32)
-    recv_route_buf = pld.alloc_window_buffer([N_LOCAL * RECV_MAX, IDX_PAD], dtype=pl.INT32)
     arrived_buf = pld.alloc_window_buffer([N_RANKS, 1], dtype=pl.INT32)
     data_arrived_buf = pld.alloc_window_buffer([N_RANKS, 1], dtype=pl.INT32)
     routed_y_buf_buf = pld.alloc_window_buffer([N_ROUTES, D], dtype=pl.BF16)
@@ -1027,7 +1023,6 @@ def l3_decode_fwd(
         recv_meta: pld.DistributedTensor[[N_RANKS, N_LOCAL], pl.INT32] = pld.window(recv_meta_buf, [N_RANKS, N_LOCAL], dtype=pl.INT32)
         recv_x: pld.DistributedTensor[[N_LOCAL * RECV_MAX, D], pl.INT8] = pld.window(recv_x_buf, [N_LOCAL * RECV_MAX, D], dtype=pl.INT8)
         recv_aux: pld.DistributedTensor[[N_LOCAL * RECV_MAX, AUX_PAD], pl.FP32] = pld.window(recv_aux_buf, [N_LOCAL * RECV_MAX, AUX_PAD], dtype=pl.FP32)
-        recv_route: pld.DistributedTensor[[N_LOCAL * RECV_MAX, IDX_PAD], pl.INT32] = pld.window(recv_route_buf, [N_LOCAL * RECV_MAX, IDX_PAD], dtype=pl.INT32)
         arrived: pld.DistributedTensor[[N_RANKS, 1], pl.INT32] = pld.window(arrived_buf, [N_RANKS, 1], dtype=pl.INT32)
         data_arrived: pld.DistributedTensor[[N_RANKS, 1], pl.INT32] = pld.window(data_arrived_buf, [N_RANKS, 1], dtype=pl.INT32)
         routed_y_buf: pld.DistributedTensor[[N_ROUTES, D], pl.BF16] = pld.window(routed_y_buf_buf, [N_ROUTES, D], dtype=pl.BF16)
@@ -1060,7 +1055,7 @@ def l3_decode_fwd(
             sampling_temperatures[r], sampling_top_ks[r],
             sampling_seeds[r], sampling_positions[r],
             pre_hc_hidden_out[r], hidden_out[r], logits[r], sampled_ids[r],
-            recv_meta, recv_x, recv_aux, recv_route, arrived,
+            recv_meta, recv_x, recv_aux, arrived,
             data_arrived, routed_y_buf, combine_arrived,
             lm_head_hidden_window, lm_head_hidden_done,
             lm_head_logits_window, lm_head_logits_done,
@@ -1891,6 +1886,11 @@ def main():
     parser.add_argument("--enable-scope-stats", action="store_true", default=False)
     parser.add_argument("--compile-only", action="store_true", default=False)
     parser.add_argument("--dump-passes", action="store_true", default=False)
+    parser.add_argument("--save-data", action="store_true", default=False,
+                        help="Freeze the generated inputs under <work_dir>/data for replay.")
+    parser.add_argument("--golden-data", type=str, default=None,
+                        help="Replay a prior run's data/in instead of regenerating inputs; "
+                             "requires an unchanged spec set.")
     parser.add_argument("--runtime-dir", type=str, default=None)
     args = parser.parse_args()
     assert args.tp <= args.ep, f"decode_fwd device lm_head requires --tp <= --ep, got tp={args.tp}, ep={args.ep}"
@@ -1922,7 +1922,8 @@ def main():
         golden_fn=None,
         compile_only=args.compile_only,
         runtime_dir=args.runtime_dir,
-        save_data=False,
+        golden_data=args.golden_data,
+        save_data=args.save_data,
         config=dict(
             dump_passes=args.dump_passes,
             distributed_config=DistributedConfig(device_ids=device_ids[:N_RANKS], num_sub_workers=0),

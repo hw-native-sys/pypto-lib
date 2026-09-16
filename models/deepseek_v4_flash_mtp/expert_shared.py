@@ -178,7 +178,7 @@ def expert_shared(
                 y_2d = pl.cast(y_2d_i32, target_type=pl.FP32, mode="none")
                 y_2d = pl.col_expand_mul(pl.row_expand_mul(y_2d, h_scale), w2_scale_chunk)
                 # Write valid rows straight to the (unpadded) output, mirroring
-                # expert_routed's direct recv_y store; no sh_pad round-trip.
+                # expert_routed_tile's direct recv_y_tile store; no sh_pad round-trip.
                 y_bf16 = pl.cast(y_2d, target_type=pl.BF16, mode="rint")
                 y_valid = pl.set_validshape(y_bf16, valid_rows, D_OUT_TILE_ACT)
                 sh = pl.assemble(sh, y_valid, [ts0, d0])

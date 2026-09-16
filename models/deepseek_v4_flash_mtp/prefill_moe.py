@@ -42,12 +42,15 @@ import pypto.language as pl
 import pypto.language.distributed as pld
 from pypto.ir import DistributedConfig
 
-from config import FLASH as M, EP_WORLD_SIZE, PREFILL_TOKENS
+from config import FLASH as M, EP_WORLD_SIZE, INT8_AMAX_EPS, INT8_SCALE_MAX, PREFILL_TOKENS
 from hc_pre import hc_pre
 from hc_post import hc_post
 from gate import gate
 from expert_shared import expert_shared
-from expert_routed import make_prefill_expert_grouped
+from expert_routed import (
+    ACT_GATE_INNER, ACT_INTER_TILE, D_OUT_TILE, D_OUT_ACT_TILE, INTER_K_TILE, K_TILE,
+    MM_INTER_TILE, QUANT_TILE, RECV_TILE, W2_ACT_INNER, W2_INNER,
+)
 
 
 T = PREFILL_TOKENS  # standalone test capacity; production callers pick their own layout
@@ -59,6 +62,7 @@ HC_MULT = M.hc_mult
 MIX_HC = M.mix_hc
 HC_DIM = M.hc_dim
 MOE_INTER = M.moe_intermediate_size
+SWIGLU_LIMIT = M.swiglu_limit
 
 N_RANKS = EP_WORLD_SIZE
 N_EXPERTS_GLOBAL = M.n_routed_experts
@@ -131,6 +135,260 @@ def clear_prefill_moe_signals(
             pl.write(count_signal, [src, 0], zero)
             pl.write(x_signal, [src, 0], zero)
             pl.write(reverse_signal, [src, 0], zero)
+
+
+# === Prefill routed experts =================================================
+def make_prefill_expert_grouped(grouped_capacity: int):
+    """Specialize scratch and TaskId-array capacity without module-global overrides.
+
+    The input/output layout is caller-owned; each local expert still occupies
+    a 16-row-aligned slab. TaskId arrays require a compile-time extent, so only
+    storage capacity is specialized while computation remains count-driven.
+    """
+    if grouped_capacity <= 0 or grouped_capacity % RECV_TILE:
+        raise ValueError("grouped expert capacity must be a positive multiple of RECV_TILE")
+    grouped_tile_capacity = grouped_capacity // RECV_TILE
+
+    @pl.jit.inline(auto_scope=False)
+    def prefill_expert_grouped(
+        expert_x: pl.Tensor[[grouped_capacity, D], pl.INT8],
+        expert_scale: pl.Tensor[[grouped_capacity, PREFILL_MOE_EXPERT_SCALE_PAD], pl.FP32],
+        expert_counts: pl.Tensor[[N_LOCAL, 1], pl.INT32],
+        routed_w1: pl.Tensor[[N_LOCAL, MOE_INTER, D], pl.INT8],
+        routed_w1_scale: pl.Tensor[[N_LOCAL, MOE_INTER], pl.FP32],
+        routed_w3: pl.Tensor[[N_LOCAL, MOE_INTER, D], pl.INT8],
+        routed_w3_scale: pl.Tensor[[N_LOCAL, MOE_INTER], pl.FP32],
+        routed_w2: pl.Tensor[[N_LOCAL, D, MOE_INTER], pl.INT8],
+        routed_w2_scale: pl.Tensor[[N_LOCAL, D], pl.FP32],
+        expert_y: pl.Tensor[[grouped_capacity, D], pl.BF16],
+    ) -> pl.Scalar[pl.TASK_ID]:
+        """Count-driven grouped routed-expert compute with MTP quantization.
+
+        ``expert_x`` and ``expert_y`` are expert-major. Each expert starts at the
+        sum of the preceding expert counts rounded up to ``RECV_TILE`` rows. Only
+        columns zero and one of ``expert_scale`` hold the FP32 input dequant scale
+        and routing weight. As in ordinary MTP, W2 dequantization applies the
+        routing weight before the expert output is rounded to BF16.
+
+        The dispatch contract guarantees non-negative counts whose sum is at most
+        the live-route capacity of the EP transport. Extra grouped capacity is
+        padding that keeps every final 16-row tile inside its owning expert.
+        """
+        # Host orchestration reads these bases immediately after the layout task.
+        # Keep automatic dependency tracking so that read waits for this writer.
+        expert_bases = pl.create_tensor([N_LOCAL, 1], dtype=pl.INT32)
+        # Keep the aligned A8 workspace in the caller's MoE stage scope.
+        h_i8 = pl.create_tensor([grouped_capacity, MOE_INTER], dtype=pl.INT8)
+        h_scale_dq = pl.create_tensor([grouped_capacity, 1], dtype=pl.FP32, manual_dep=True)
+        with pl.at(
+            level=pl.Level.CORE_GROUP,
+            name_hint="prefill_exp_group_layout",
+            allow_early_resolve=True,
+        ) as layout_tid:
+            grouped_base = pl.cast(0, pl.INDEX)
+            for local_e in pl.range(N_LOCAL):
+                pl.write(expert_bases, [local_e, 0], pl.cast(grouped_base, pl.INT32))
+                rows = pl.cast(pl.read(expert_counts, [local_e, 0]), pl.INDEX)
+                aligned_rows = ((rows + RECV_TILE - 1) // RECV_TILE) * RECV_TILE
+                grouped_base = grouped_base + aligned_rows
+
+        # Hoisted so the scope-external terminal fence can consume every expert's
+        # completion TaskId after the compute scratch lifetime closes.
+        expert_completion_tids = pl.array.create(N_LOCAL, pl.TASK_ID)
+
+        with pl.scope():
+            # Gate/up projections share one dispatch and intermediate layout while
+            # reading the same separate resident weight roots as decode.
+            for local_i in pl.parallel(N_LOCAL):
+                weight_e = local_i
+                flat_base = pl.cast(pl.read(expert_bases, [local_i, 0]), pl.INDEX)
+                n_rows = pl.read(expert_counts, [local_i, 0])
+                n_tiles = (n_rows + RECV_TILE - 1) // RECV_TILE
+
+                for tile in pl.parallel(n_tiles):
+                    tile_row = tile * RECV_TILE
+                    flat_tile_row = flat_base + tile_row
+                    valid_rows = pl.min(RECV_TILE, n_rows - tile_row)
+
+                    with pl.scope():
+                        w13_tile_i32 = pl.create_tensor([RECV_TILE, 2 * MOE_INTER], dtype=pl.INT32)
+
+                        # Each block owns one gate or up output chunk. Selecting
+                        # its weight root does not add another matrix product or
+                        # materialize a concatenated weight tensor.
+                        with pl.spmd(
+                            (2 * MOE_INTER) // MM_INTER_TILE,
+                            name_hint="prefill_exp_w13_mm",
+                            deps=[layout_tid],
+                        ) as w13_tid:
+                            block = pl.tile.get_block_idx()
+                            n0 = block * MM_INTER_TILE
+                            if n0 < MOE_INTER:
+                                w13_acc = pl.create_tensor([1, RECV_TILE, MM_INTER_TILE], dtype=pl.INT32)
+                                for k0 in pl.pipeline(0, D, K_TILE, stage=2):
+                                    x_chunk = expert_x[flat_tile_row : flat_tile_row + RECV_TILE, k0 : k0 + K_TILE]
+                                    w13_chunk = routed_w1[
+                                        weight_e : weight_e + 1,
+                                        n0 : n0 + MM_INTER_TILE,
+                                        k0 : k0 + K_TILE,
+                                    ]
+                                    w13_acc = pl.matmul_acc(w13_acc, x_chunk, w13_chunk, b_trans=True, init_cond=k0 == 0)
+                                w13_tile_i32[:, n0 : n0 + MM_INTER_TILE] = (
+                                    pl.reshape(w13_acc, [RECV_TILE, MM_INTER_TILE])
+                                )
+                            else:
+                                up_n0 = n0 - MOE_INTER
+                                w13_acc = pl.create_tensor([1, RECV_TILE, MM_INTER_TILE], dtype=pl.INT32)
+                                for k0 in pl.pipeline(0, D, K_TILE, stage=2):
+                                    x_chunk = expert_x[flat_tile_row : flat_tile_row + RECV_TILE, k0 : k0 + K_TILE]
+                                    w13_chunk = routed_w3[
+                                        weight_e : weight_e + 1,
+                                        up_n0 : up_n0 + MM_INTER_TILE,
+                                        k0 : k0 + K_TILE,
+                                    ]
+                                    w13_acc = pl.matmul_acc(w13_acc, x_chunk, w13_chunk, b_trans=True, init_cond=k0 == 0)
+                                w13_tile_i32[:, n0 : n0 + MM_INTER_TILE] = (
+                                    pl.reshape(w13_acc, [RECV_TILE, MM_INTER_TILE])
+                                )
+
+                        h_tile_fp32 = pl.create_tensor([RECV_TILE, MOE_INTER], dtype=pl.FP32)
+                        with pl.spmd(
+                            MOE_INTER // (ACT_GATE_INNER * ACT_INTER_TILE),
+                            name_hint="prefill_exp_gate_up_act",
+                            deps=[w13_tid],
+                        ) as act_tid:
+                            block = pl.tile.get_block_idx()
+                            inter_base = block * (ACT_GATE_INNER * ACT_INTER_TILE)
+                            # Materialize col0 as a dense [RECV_TILE, 1] vector:
+                            # a column view of a padded tile keeps the row pitch.
+                            x_scale_padded = expert_scale[
+                                flat_tile_row : flat_tile_row + RECV_TILE,
+                                0:PREFILL_MOE_EXPERT_SCALE_PAD,
+                            ]
+                            x_scale_transposed = pl.transpose(x_scale_padded, axis1=0, axis2=1)
+                            x_scale_tile = pl.reshape(x_scale_transposed[0:1, :], [RECV_TILE, 1])
+                            for inner in pl.pipeline(ACT_GATE_INNER, stage=2):
+                                inter0 = inter_base + inner * ACT_INTER_TILE
+                                gate_i32 = w13_tile_i32[:, inter0 : inter0 + ACT_INTER_TILE]
+                                up_i32 = w13_tile_i32[:, MOE_INTER + inter0 : MOE_INTER + inter0 + ACT_INTER_TILE]
+                                gate_fp32 = pl.col_expand_mul(
+                                    pl.row_expand_mul(
+                                        pl.cast(gate_i32, target_type=pl.FP32, mode="none"),
+                                        x_scale_tile,
+                                    ),
+                                    routed_w1_scale[local_i : local_i + 1, inter0 : inter0 + ACT_INTER_TILE],
+                                )
+                                up_fp32 = pl.col_expand_mul(
+                                    pl.row_expand_mul(pl.cast(up_i32, target_type=pl.FP32, mode="none"), x_scale_tile),
+                                    routed_w3_scale[local_i : local_i + 1, inter0 : inter0 + ACT_INTER_TILE],
+                                )
+                                if SWIGLU_LIMIT > 0.0:
+                                    gate_fp32 = pl.minimum(gate_fp32, SWIGLU_LIMIT)
+                                    up_fp32 = pl.maximum(pl.minimum(up_fp32, SWIGLU_LIMIT), -SWIGLU_LIMIT)
+                                sigmoid = pl.recip(pl.add(pl.exp(pl.neg(gate_fp32)), 1.0))
+                                activated_chunk = pl.mul(pl.mul(gate_fp32, sigmoid), up_fp32)
+                                h_valid = pl.set_validshape(activated_chunk, valid_rows, ACT_INTER_TILE)
+                                h_tile_fp32[:, inter0 : inter0 + ACT_INTER_TILE] = pl.fillpad(
+                                    h_valid, pad_value=pl.PadValue.zero
+                                )
+
+                        h_tile_i8 = h_i8[flat_tile_row : flat_tile_row + RECV_TILE]
+                        h_tile_scale_dq = h_scale_dq[flat_tile_row : flat_tile_row + RECV_TILE]
+                        with pl.at(level=pl.Level.CORE_GROUP, name_hint="prefill_exp_h_q", deps=[act_tid]):
+                            row_amax = pl.full([1, RECV_TILE], dtype=pl.FP32, value=INT8_AMAX_EPS)
+                            for k0 in pl.pipeline(0, MOE_INTER, QUANT_TILE, stage=2):
+                                h_amax_chunk = h_tile_fp32[:, k0 : k0 + QUANT_TILE]
+                                h_abs = pl.maximum(h_amax_chunk, pl.neg(h_amax_chunk))
+                                row_amax = pl.maximum(row_amax, pl.reshape(pl.row_max(h_abs), [1, RECV_TILE]))
+                            quant_scale = pl.div(
+                                pl.full([1, RECV_TILE], dtype=pl.FP32, value=INT8_SCALE_MAX),
+                                row_amax,
+                            )
+                            h_tile_scale_dq[:, :] = pl.reshape(pl.recip(quant_scale), [RECV_TILE, 1])
+                            quant_scale_col = pl.reshape(quant_scale, [RECV_TILE, 1])
+                            for k0 in pl.pipeline(0, MOE_INTER, QUANT_TILE, stage=2):
+                                h_quant_chunk = h_tile_fp32[:, k0 : k0 + QUANT_TILE]
+                                h_scaled = pl.row_expand_mul(h_quant_chunk, quant_scale_col)
+                                h_i32 = pl.cast(h_scaled, target_type=pl.INT32, mode="rint")
+                                h_fp16 = pl.cast(h_i32, target_type=pl.FP16, mode="round")
+                                h_tile_i8[:, k0 : k0 + QUANT_TILE] = pl.cast(h_fp16, target_type=pl.INT8, mode="trunc")
+
+            # W2 produces weighted BF16 expert output. Each expert accumulates the
+            # TaskId of every live output tile, then one dummy task fences those
+            # producers. The scope-external dummy below fans the per-expert fences
+            # into the single completion TaskId that prefill_moe_combine consumes.
+            for local_e in pl.parallel(N_LOCAL):
+                weight_e = local_e
+                w2_act_tids = pl.array.create(grouped_tile_capacity, pl.TASK_ID)
+                flat_base = pl.cast(pl.read(expert_bases, [local_e, 0]), pl.INDEX)
+                n_rows = pl.read(expert_counts, [local_e, 0])
+                n_tiles = (n_rows + RECV_TILE - 1) // RECV_TILE
+
+                for tile in pl.parallel(n_tiles):
+                    tile_row = tile * RECV_TILE
+                    flat_tile_row = flat_base + tile_row
+                    h_tile_i8 = h_i8[flat_tile_row : flat_tile_row + RECV_TILE]
+                    h_tile_scale_dq = h_scale_dq[flat_tile_row : flat_tile_row + RECV_TILE]
+
+                    y_i32 = pl.create_tensor([RECV_TILE, D], dtype=pl.INT32)
+                    with pl.spmd(
+                        D // (W2_INNER * D_OUT_TILE),
+                        name_hint="prefill_exp_w2_mm",
+                        allow_early_resolve=True,
+                    ) as w2_tid:
+                        block = pl.tile.get_block_idx()
+                        d_base = block * (W2_INNER * D_OUT_TILE)
+                        for inner in pl.range(W2_INNER):
+                            d0 = d_base + inner * D_OUT_TILE
+                            y_acc = pl.create_tensor([1, RECV_TILE, D_OUT_TILE], dtype=pl.INT32)
+                            for k0 in pl.pipeline(0, MOE_INTER, INTER_K_TILE, stage=2):
+                                h_w2_chunk = h_tile_i8[:, k0 : k0 + INTER_K_TILE]
+                                w2_chunk = routed_w2[weight_e : weight_e + 1, d0 : d0 + D_OUT_TILE, k0 : k0 + INTER_K_TILE]
+                                y_acc = pl.matmul_acc(y_acc, h_w2_chunk, w2_chunk, b_trans=True, init_cond=k0 == 0)
+                            y_i32[:, d0 : d0 + D_OUT_TILE] = pl.reshape(y_acc, [RECV_TILE, D_OUT_TILE])
+
+                    with pl.spmd(
+                        D // (W2_ACT_INNER * D_OUT_ACT_TILE),
+                        name_hint="prefill_exp_w2_act",
+                        deps=[w2_tid],
+                        allow_early_resolve=False,
+                    ) as w2_act_tid:
+                        block = pl.tile.get_block_idx()
+                        d_base = block * (W2_ACT_INNER * D_OUT_ACT_TILE)
+                        # Load an aligned tile before extracting the weight column;
+                        # a direct narrow column view would retain the row pitch.
+                        scale_padded = expert_scale[
+                            flat_tile_row : flat_tile_row + RECV_TILE,
+                            0:PREFILL_MOE_EXPERT_SCALE_PAD,
+                        ]
+                        scale_transposed = pl.transpose(scale_padded, axis1=0, axis2=1)
+                        weight_col = pl.reshape(scale_transposed[1:2, :], [RECV_TILE, 1])
+                        row_scale = pl.mul(h_tile_scale_dq, weight_col)
+                        for inner in pl.pipeline(W2_ACT_INNER, stage=2):
+                            d0 = d_base + inner * D_OUT_ACT_TILE
+                            y_fp32 = pl.cast(y_i32[:, d0 : d0 + D_OUT_ACT_TILE], target_type=pl.FP32, mode="none")
+                            y_fp32 = pl.col_expand_mul(
+                                pl.row_expand_mul(y_fp32, row_scale),
+                                routed_w2_scale[local_e : local_e + 1, d0 : d0 + D_OUT_ACT_TILE],
+                            )
+                            expert_y[flat_tile_row : flat_tile_row + RECV_TILE, d0 : d0 + D_OUT_ACT_TILE] = pl.cast(
+                                y_fp32,
+                                target_type=pl.BF16,
+                                mode="rint",
+                            )
+                    w2_act_tids[tile] = w2_act_tid
+
+                expert_completion_tid = pl.system.task_dummy(deps=[w2_act_tids])
+                expert_completion_tids[local_e] = expert_completion_tid
+
+        completion_tid = pl.system.task_dummy(
+            deps=[expert_completion_tids[local_e] for local_e in range(N_LOCAL)]
+        )
+
+        return completion_tid
+
+
+    return prefill_expert_grouped
 
 
 # === Prefill MoE dispatch ===================================================

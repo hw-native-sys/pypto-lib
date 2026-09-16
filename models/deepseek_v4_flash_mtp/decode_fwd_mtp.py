@@ -63,7 +63,6 @@ from decode_fwd import (
     HC_DIM,
     HC_MULT,
     HEAD_DIM,
-    IDX_PAD,
     LM_HEAD_TP_SIZE,
     LM_HEAD_VOCAB,
     MAX_LOGIT_ROWS,
@@ -486,7 +485,6 @@ def l2_decode_fwd_mtp(
     recv_meta: pld.DistributedTensor[[N_RANKS, N_LOCAL], pl.INT32],
     recv_x: pld.DistributedTensor[[N_LOCAL * RECV_MAX, D], pl.INT8],
     recv_aux: pld.DistributedTensor[[N_LOCAL * RECV_MAX, AUX_PAD], pl.FP32],
-    recv_route: pld.DistributedTensor[[N_LOCAL * RECV_MAX, IDX_PAD], pl.INT32],
     arrived: pld.DistributedTensor[[N_RANKS, 1], pl.INT32],
     data_arrived: pld.DistributedTensor[[N_RANKS, 1], pl.INT32],
     routed_y_buf: pld.DistributedTensor[[N_ROUTES, D], pl.BF16],
@@ -564,7 +562,6 @@ def l2_decode_fwd_mtp(
     mtp_recv_meta: pld.DistributedTensor[[N_RANKS, N_LOCAL], pl.INT32],
     mtp_recv_x: pld.DistributedTensor[[N_LOCAL * RECV_MAX, D], pl.INT8],
     mtp_recv_aux: pld.DistributedTensor[[N_LOCAL * RECV_MAX, AUX_PAD], pl.FP32],
-    mtp_recv_route: pld.DistributedTensor[[N_LOCAL * RECV_MAX, IDX_PAD], pl.INT32],
     mtp_arrived: pld.DistributedTensor[[N_RANKS, 1], pl.INT32],
     mtp_data_arrived: pld.DistributedTensor[[N_RANKS, 1], pl.INT32],
     mtp_routed_y_buf: pld.DistributedTensor[[N_ROUTES, D], pl.BF16],
@@ -653,7 +650,7 @@ def l2_decode_fwd_mtp(
         lm_head_weight, logit_row_indices,
         sampling_temperatures, sampling_top_ks, sampling_seeds, sampling_positions,
         pre_hc_hidden_out, hidden_out, logits, sampled_ids,
-        recv_meta, recv_x, recv_aux, recv_route,
+        recv_meta, recv_x, recv_aux,
         arrived, data_arrived, routed_y_buf, combine_arrived,
         lm_head_hidden_window, lm_head_hidden_done, lm_head_logits_window, lm_head_logits_done,
         num_tokens_per_owner, rank,
@@ -713,7 +710,7 @@ def l2_decode_fwd_mtp(
         mtp_sampling_temperatures, mtp_sampling_top_ks,
         mtp_sampling_seeds, mtp_sampling_positions,
         mtp_hidden_out, mtp_next_pre_hc_hidden, mtp_logits, mtp_sampled_ids,
-        mtp_recv_meta, mtp_recv_x, mtp_recv_aux, mtp_recv_route,
+        mtp_recv_meta, mtp_recv_x, mtp_recv_aux,
         mtp_arrived, mtp_data_arrived, mtp_routed_y_buf, mtp_combine_arrived,
         mtp_lm_head_hidden_window, mtp_lm_head_hidden_done, mtp_lm_head_logits_window, mtp_lm_head_logits_done,
         rank, mtp_num_tokens,
@@ -915,7 +912,6 @@ def l3_decode_fwd_mtp(
     recv_meta_buf = pld.alloc_window_buffer([N_RANKS, N_LOCAL], dtype=pl.INT32)
     recv_x_buf = pld.alloc_window_buffer(N_LOCAL * RECV_MAX * D)
     recv_aux_buf = pld.alloc_window_buffer([N_LOCAL * RECV_MAX, AUX_PAD], dtype=pl.FP32)
-    recv_route_buf = pld.alloc_window_buffer([N_LOCAL * RECV_MAX, IDX_PAD], dtype=pl.INT32)
     arrived_buf = pld.alloc_window_buffer([N_RANKS, 1], dtype=pl.INT32)
     data_arrived_buf = pld.alloc_window_buffer([N_RANKS, 1], dtype=pl.INT32)
     routed_y_buf_buf = pld.alloc_window_buffer([N_ROUTES, D], dtype=pl.BF16)
@@ -927,7 +923,6 @@ def l3_decode_fwd_mtp(
     mtp_recv_meta_buf = pld.alloc_window_buffer([N_RANKS, N_LOCAL], dtype=pl.INT32)
     mtp_recv_x_buf = pld.alloc_window_buffer([N_LOCAL * RECV_MAX, D], dtype=pl.INT8)
     mtp_recv_aux_buf = pld.alloc_window_buffer([N_LOCAL * RECV_MAX, AUX_PAD], dtype=pl.FP32)
-    mtp_recv_route_buf = pld.alloc_window_buffer([N_LOCAL * RECV_MAX, IDX_PAD], dtype=pl.INT32)
     mtp_arrived_buf = pld.alloc_window_buffer([N_RANKS, 1], dtype=pl.INT32)
     mtp_data_arrived_buf = pld.alloc_window_buffer([N_RANKS, 1], dtype=pl.INT32)
     mtp_routed_y_buf_buf = pld.alloc_window_buffer([N_ROUTES, D], dtype=pl.BF16)
@@ -940,7 +935,6 @@ def l3_decode_fwd_mtp(
         recv_meta: pld.DistributedTensor[[N_RANKS, N_LOCAL], pl.INT32] = pld.window(recv_meta_buf, [N_RANKS, N_LOCAL], dtype=pl.INT32)
         recv_x: pld.DistributedTensor[[N_LOCAL * RECV_MAX, D], pl.INT8] = pld.window(recv_x_buf, [N_LOCAL * RECV_MAX, D], dtype=pl.INT8)
         recv_aux: pld.DistributedTensor[[N_LOCAL * RECV_MAX, AUX_PAD], pl.FP32] = pld.window(recv_aux_buf, [N_LOCAL * RECV_MAX, AUX_PAD], dtype=pl.FP32)
-        recv_route: pld.DistributedTensor[[N_LOCAL * RECV_MAX, IDX_PAD], pl.INT32] = pld.window(recv_route_buf, [N_LOCAL * RECV_MAX, IDX_PAD], dtype=pl.INT32)
         arrived: pld.DistributedTensor[[N_RANKS, 1], pl.INT32] = pld.window(arrived_buf, [N_RANKS, 1], dtype=pl.INT32)
         data_arrived: pld.DistributedTensor[[N_RANKS, 1], pl.INT32] = pld.window(data_arrived_buf, [N_RANKS, 1], dtype=pl.INT32)
         routed_y_buf: pld.DistributedTensor[[N_ROUTES, D], pl.BF16] = pld.window(routed_y_buf_buf, [N_ROUTES, D], dtype=pl.BF16)
@@ -952,7 +946,6 @@ def l3_decode_fwd_mtp(
         mtp_recv_meta = pld.window(mtp_recv_meta_buf, [N_RANKS, N_LOCAL], dtype=pl.INT32)
         mtp_recv_x = pld.window(mtp_recv_x_buf, [N_LOCAL * RECV_MAX, D], dtype=pl.INT8)
         mtp_recv_aux = pld.window(mtp_recv_aux_buf, [N_LOCAL * RECV_MAX, AUX_PAD], dtype=pl.FP32)
-        mtp_recv_route = pld.window(mtp_recv_route_buf, [N_LOCAL * RECV_MAX, IDX_PAD], dtype=pl.INT32)
         mtp_arrived = pld.window(mtp_arrived_buf, [N_RANKS, 1], dtype=pl.INT32)
         mtp_data_arrived = pld.window(mtp_data_arrived_buf, [N_RANKS, 1], dtype=pl.INT32)
         mtp_routed_y_buf = pld.window(mtp_routed_y_buf_buf, [N_ROUTES, D], dtype=pl.BF16)
@@ -994,7 +987,7 @@ def l3_decode_fwd_mtp(
             sampling_temperatures[rank], sampling_top_ks[rank],
             sampling_seeds[rank], sampling_positions[rank],
             pre_hc_hidden_out[rank], hidden_out[rank], logits[rank], sampled_ids[rank],
-            recv_meta, recv_x, recv_aux, recv_route,
+            recv_meta, recv_x, recv_aux,
             arrived, data_arrived, routed_y_buf, combine_arrived,
             lm_head_hidden_window, lm_head_hidden_done, lm_head_logits_window, lm_head_logits_done,
             num_tokens_per_owner,
@@ -1022,7 +1015,7 @@ def l3_decode_fwd_mtp(
             mtp_sampling_temperatures[rank], mtp_sampling_top_ks[rank],
             mtp_sampling_seeds[rank], mtp_sampling_positions[rank],
             mtp_hidden_out[rank], mtp_next_pre_hc_hidden[rank], mtp_logits[rank], mtp_sampled_ids[rank],
-            mtp_recv_meta, mtp_recv_x, mtp_recv_aux, mtp_recv_route,
+            mtp_recv_meta, mtp_recv_x, mtp_recv_aux,
             mtp_arrived, mtp_data_arrived, mtp_routed_y_buf, mtp_combine_arrived,
             mtp_lm_head_hidden_window, mtp_lm_head_hidden_done, mtp_lm_head_logits_window,
             mtp_lm_head_logits_done,

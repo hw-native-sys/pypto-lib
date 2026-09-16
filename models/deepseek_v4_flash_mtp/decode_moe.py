@@ -7,12 +7,11 @@
 # See LICENSE in the root of the software repository for the full text of the License.
 # -----------------------------------------------------------------------------------------------------------
 # ci: devices=2
-"""DeepSeek-V4 MoE single-layer (decode), FLASH preset. --ep picks the EP world
-size: 2/4/8 run N-rank distributed; each rank keeps 32 experts."""
+"""DeepSeek-V4-Flash decode MoE layer: hc_pre, gate, shared expert, EP dispatch, routed experts, combine, hc_post."""
 
 
 # Sub-kernels freeze EP_WORLD_SIZE / n_routed_experts into their shapes at import
-# time, so read --ep from argv and override config before importing them below.
+# time: read --ep from argv and override config before importing them below.
 import dataclasses
 import sys
 
@@ -33,9 +32,8 @@ def _parse_ep_argv():
 
 EP = _parse_ep_argv()
 
-config.FLASH = dataclasses.replace(
-    config.FLASH, n_routed_experts=config.FLASH.n_routed_experts // config.EP_WORLD_SIZE * EP
-)
+_n_routed_experts = config.FLASH.n_routed_experts // config.EP_WORLD_SIZE * EP
+config.FLASH = dataclasses.replace(config.FLASH, n_routed_experts=_n_routed_experts)
 config.EP_WORLD_SIZE = EP
 config.RECV_MAX = EP * config.MOE_TOKENS
 
@@ -48,69 +46,47 @@ from hc_pre import hc_pre
 from hc_post import hc_post
 from gate import gate
 from expert_shared import expert_shared
-from expert_routed import expert_routed
+from expert_routed import RECV_TILE, expert_routed_tile
 
 
+# model config
 T = MOE_TOKENS
 D = M.hidden_size
 TOPK = M.num_experts_per_tok
 VOCAB = M.vocab_size
-
 HC_MULT = M.hc_mult
 MIX_HC = M.mix_hc
 HC_DIM = M.hc_dim
 MOE_INTER = M.moe_intermediate_size
-
 N_RANKS = EP_WORLD_SIZE
 N_EXPERTS_GLOBAL = M.n_routed_experts
 N_LOCAL = N_EXPERTS_GLOBAL // N_RANKS
 N_ROUTES = T * TOPK
 
-# recv_x/recv_aux laid out [expert, source, slot], flattened to
-# [N_LOCAL * RECV_MAX, D]. Lane (e, src, slot) flat row = e * RECV_MAX +
-# src * MAX_PER_SRC + slot. One source sends <= T rows to a local expert.
+# dispatch lanes: recv_x / recv_aux rows are [expert, source, slot], flat row
+# e * RECV_MAX + src * MAX_PER_SRC + slot
 MAX_PER_SRC = T
-AUX_PAD = 8  # FP32 pack tile width (32 B min tile); cols: 0=scale 1=weight
+AUX_PAD = 8  # recv_aux FP32 row width
 AUX_SCALE = 0
 AUX_W = 1
-IDX_PAD = 8  # INT32 route tile width; route rides a separate window from scale/w
-             # (an FP32 tile can't hold it: INDEX->FP32 casts are unsupported).
+AUX_ROUTE = 2  # route id t * TOPK + k, exact in FP32
+IDX_PAD = 8  # INT32 index row width
+PUSH_GROUPS = max(1, N_LOCAL // N_RANKS)  # dispatch_push blocks per destination rank
 
 assert N_RANKS in _EP_CHOICES, f"--ep must be one of {_EP_CHOICES} (got {N_RANKS})"
-assert N_EXPERTS_GLOBAL == N_RANKS * N_LOCAL
+# Overlapping source lanes would silently overwrite each other's rows.
 assert RECV_MAX == N_RANKS * MAX_PER_SRC
 
 
-@pl.jit.inline
-def clear_moe_signals(
-    completion_anchor: pl.Tensor[[T, HC_MULT, D], pl.FP32],
-    arrived: pld.DistributedTensor[[N_RANKS, 1], pl.INT32],
-    data_arrived: pld.DistributedTensor[[N_RANKS, 1], pl.INT32],
-    combine_arrived: pld.DistributedTensor[[N_RANKS, 1], pl.INT32],
-):
-    """Clear this rank's MoE signal windows after its final MoE completes."""
-    with pl.at(level=pl.Level.CORE_GROUP, name_hint="moe_signal_clear"):
-        # The final MoE output depends on this rank observing every peer's final
-        # meta, payload, and combine notify. No peer can issue another MoE notify
-        # to this rank in the current forward after this dependency is satisfied.
-        _completion_anchor = pl.read(completion_anchor, [0, 0, 0])
-        zero = pl.cast(0, pl.INT32)
-        for src in pl.range(N_RANKS):
-            pl.write(arrived, [src, 0], zero)
-            pl.write(data_arrived, [src, 0], zero)
-            pl.write(combine_arrived, [src, 0], zero)
-
-
 # === Dispatch ================================================================
-# Lane push, count publish, arrival wait, and cumsum gather run in one
-# pl.at(CORE_GROUP) so program order stays push -> notify -> wait -> gather.
+# Route counts, lane push, arrival wait, and gather into per-expert receive buffers.
 @pl.jit.inline
 def dispatch(
     indices: pl.Tensor[[T, TOPK], pl.INT32],
     x_norm_i8: pl.Tensor[[T, D], pl.INT8],
     x_norm_scale: pl.Tensor[[T, 1], pl.FP32],
     weights: pl.Tensor[[T, TOPK], pl.FP32],
-    # per-expert outputs consumed by expert_routed / combine
+    # per-expert outputs consumed by expert_routed_scatter
     recv_x_out: pl.Tensor[[N_LOCAL, RECV_MAX, D], pl.INT8],
     recv_scale_out: pl.Tensor[[N_LOCAL, RECV_MAX], pl.FP32],
     recv_w_out: pl.Tensor[[N_LOCAL, RECV_MAX], pl.FP32],
@@ -121,7 +97,6 @@ def dispatch(
     recv_meta: pld.DistributedTensor[[N_RANKS, N_LOCAL], pl.INT32],
     recv_x: pld.DistributedTensor[[N_LOCAL * RECV_MAX, D], pl.INT8],
     recv_aux: pld.DistributedTensor[[N_LOCAL * RECV_MAX, AUX_PAD], pl.FP32],
-    recv_route: pld.DistributedTensor[[N_LOCAL * RECV_MAX, IDX_PAD], pl.INT32],
     arrived: pld.DistributedTensor[[N_RANKS, 1], pl.INT32],
     data_arrived: pld.DistributedTensor[[N_RANKS, 1], pl.INT32],
     num_tokens: pl.Scalar[pl.INT32],
@@ -132,11 +107,7 @@ def dispatch(
     # Flat 2-D view kept outside the scope so it stays a tensor view, not a tile.
     recv_x_out_flat = pl.reshape(recv_x_out, [N_LOCAL * RECV_MAX, D])
 
-    # Meta and payload arrivals ride two independent windows (`arrived` /
-    # `data_arrived`), so the two phases barrier separately and overlap freely.
-
-    # Count routes, publish counts, barrier on meta, cumsum -> recv_count_out.
-    # Needs every source's counts but none of the bulk payload.
+    # Count routes, publish counts, wait on `arrived`, cumsum -> recv_count_out.
     with pl.at(level=pl.Level.CORE_GROUP, name_hint="dispatch_meta", allow_early_resolve=True) as _meta_tid:
         active_tokens = pl.cast(num_tokens, pl.INDEX)
         if active_tokens < 0:
@@ -149,16 +120,16 @@ def dispatch(
         for d in pl.range(N_RANKS):
             for e in pl.range(N_LOCAL):
                 cursor[d * N_LOCAL + e] = 0
+        meta_indices_tile = pl.tile.load(indices, [0, 0], [T, IDX_PAD], valid_shape=[T, TOPK])
         for t in pl.range(active_tokens):
             for k in pl.range(TOPK):
-                eid = pl.read(indices, [t, k])
+                eid = pl.tile.read(meta_indices_tile, [t, k])
                 dst = eid // N_LOCAL
                 loc_e = eid - dst * N_LOCAL
                 cursor[dst * N_LOCAL + loc_e] = cursor[dst * N_LOCAL + loc_e] + 1
 
-        # One meta row per dst (all N_LOCAL counts, zeros included), then bump the
-        # per-source arrival counter. AtomicAdd on a monotonic window is
-        # order-independent, so a late notify from an earlier epoch cannot clobber it.
+        # One meta row per dst (all N_LOCAL counts, zeros included), then AtomicAdd
+        # the per-source arrival counter.
         meta_tile = pl.tile.full([1, N_LOCAL], dtype=pl.INT32, value=0)
         for dst in pl.range(N_RANKS):
             for e in pl.range(N_LOCAL):
@@ -172,9 +143,7 @@ def dispatch(
             if src != my_rank:
                 pld.system.wait(signal=arrived, offsets=[src, 0], expected=moe_epoch, cmp=pld.WaitCmp.Ge)
 
-        # Cumsum recv_meta over sources -> per-expert receive count. The host reads
-        # recv_count_out to size the routed-expert tile loop, so producing it here
-        # lets routed matmuls submit while the payload is still moving.
+        # Cumsum recv_meta over sources -> per-expert receive count (sizes the routed-expert tile loop).
         for e in pl.range(N_LOCAL):
             acc = pl.const(0, pl.INT32)
             for src in pl.range(N_RANKS):
@@ -183,96 +152,77 @@ def dispatch(
                 acc = acc + count
             pl.write(recv_count_out, [e, 0], acc)
 
-    # Move the bulk payload (x / aux / route) to each destination lane.
-    # Split over LOCAL EXPERT INDEX (N_LOCAL blocks): block loc_e handles expert
-    # loc_e on EVERY destination rank, so the blocking cross-rank puts fan out
-    # across N_LOCAL cores. One slot counter per destination rank; token-major
-    # order matches the meta pass's per-(dst, loc_e) cumulative count.
-    with pl.spmd(N_LOCAL, name_hint="dispatch_push", allow_early_resolve=True) as _push_tid:
-        loc_e = pl.tile.get_block_idx()
+    # Push x / aux to each destination lane, one block per (destination rank, local-expert
+    # group); each (dst, loc_e) lane belongs to one block, filled in token-major order.
+    with pl.spmd(N_RANKS * PUSH_GROUPS, name_hint="dispatch_push", allow_early_resolve=True) as _push_tid:
+        push_block = pl.tile.get_block_idx()
+        push_dst = push_block // PUSH_GROUPS
+        push_group = push_block - push_dst * PUSH_GROUPS
         active_tokens = pl.cast(num_tokens, pl.INDEX)
         if active_tokens < 0:
             active_tokens = pl.cast(0, pl.INDEX)
         if active_tokens > T:
             active_tokens = pl.cast(T, pl.INDEX)
 
-        slot_ctr = pl.array.create(N_RANKS, pl.INT32)
-        for d in pl.range(N_RANKS):
-            slot_ctr[d] = 0
-        e_lane_base = loc_e * RECV_MAX + my_rank * MAX_PER_SRC
+        slot_ctr = pl.array.create(N_LOCAL, pl.INT32)
+        for e in pl.range(N_LOCAL):
+            slot_ctr[e] = 0
 
-        # Pad tiles zeroed once; used cols overwritten per push, then remote_store.
+        indices_tile = pl.tile.load(indices, [0, 0], [T, IDX_PAD], valid_shape=[T, TOPK])
+        weights_tile = pl.tile.load(weights, [0, 0], [T, AUX_PAD], valid_shape=[T, TOPK])
+        # Pad tile zeroed once; used cols overwritten per push, then remote_store.
         aux_tile = pl.tile.full([1, AUX_PAD], dtype=pl.FP32, value=0.0)
-        route_tile = pl.tile.full([1, IDX_PAD], dtype=pl.INT32, value=0)
         for t in pl.range(active_tokens):
             for k in pl.range(TOPK):
-                eid = pl.read(indices, [t, k])
+                eid = pl.tile.read(indices_tile, [t, k])
                 dst = eid // N_LOCAL
                 le = eid - dst * N_LOCAL
-                if le == loc_e:
-                    slot = slot_ctr[dst]
-                    slot_ctr[dst] = slot + 1
-                    # lane (loc_e, my_rank, slot) on peer=dst
-                    row = e_lane_base + slot
-                    pld.tensor.put(
-                        dst=recv_x,
-                        peer=dst,
-                        src=x_norm_i8,
-                        dst_offsets=[row, 0],
-                        src_offsets=[t, 0],
-                        shape=[1, D],
-                    )
-                    pl.tile.write(aux_tile, [0, AUX_SCALE], pl.read(x_norm_scale, [t, 0]))
-                    pl.tile.write(aux_tile, [0, AUX_W], pl.read(weights, [t, k]))
-                    pld.tile.remote_store(aux_tile, target=recv_aux, peer=dst, offsets=[row, 0])
-                    pl.tile.write(route_tile, [0, 0], pl.cast(t * TOPK + k, pl.INT32))
-                    pld.tile.remote_store(route_tile, target=recv_route, peer=dst, offsets=[row, 0])
+                le_group = le - (le // PUSH_GROUPS) * PUSH_GROUPS
+                if dst == push_dst:
+                    if le_group == push_group:
+                        slot = slot_ctr[le]
+                        slot_ctr[le] = slot + 1
+                        # lane (le, my_rank, slot) on peer=dst
+                        push_lane_base = pl.cast(le, pl.INDEX) * RECV_MAX + my_rank * MAX_PER_SRC
+                        row = push_lane_base + pl.cast(slot, pl.INDEX)
+                        pld.tensor.put(
+                            dst=recv_x, peer=push_dst, src=x_norm_i8,
+                            dst_offsets=[row, 0], src_offsets=[t, 0], shape=[1, D],
+                        )
+                        pl.tile.write(aux_tile, [0, AUX_SCALE], pl.read(x_norm_scale, [t, 0]))
+                        pl.tile.write(aux_tile, [0, AUX_W], pl.tile.read(weights_tile, [t, k]))
+                        push_route_i32 = pl.cast(t * TOPK + k, pl.INT32)
+                        pl.tile.write(aux_tile, [0, AUX_ROUTE], pl.cast(push_route_i32, pl.FP32))
+                        pld.tile.remote_store(aux_tile, target=recv_aux, peer=push_dst, offsets=[row, 0])
 
-        # Payload-arrival notify folded into the push: each block signals every peer
-        # after its own puts, so a peer sees N_LOCAL notifies per source per epoch
-        # and the wait below expects N_LOCAL * moe_epoch. Saves the launch of a
-        # separate post-push notify task. Each block bumps the count only after its
-        # own puts issue in program order, which is what gates the gather -- recv_aux
-        # / recv_route ride a non-draining remote_store and a PIPE_ALL barrier is not
-        # a cross-rank DDR fence (PTOAS#872).
-        for dst in pl.range(N_RANKS):
-            if dst != my_rank:
-                pld.system.notify(
-                    target=data_arrived,
-                    peer=dst,
-                    offsets=[my_rank, 0],
-                    value=1,
-                    op=pld.NotifyOp.AtomicAdd,
-                )
+        # Notify this block's destination after its puts: a peer expects PUSH_GROUPS
+        # notifies per source per epoch. Must follow the puts in program order --
+        # recv_aux rides a non-draining remote_store (PTOAS#872).
+        if push_dst != my_rank:
+            pld.system.notify(
+                target=data_arrived, peer=push_dst, offsets=[my_rank, 0],
+                value=1, op=pld.NotifyOp.AtomicAdd,
+            )
 
     with pl.at(
-        level=pl.Level.CORE_GROUP,
-        name_hint="dispatch_wait",
-        deps=[_push_tid],
-        allow_early_resolve=True,
+        level=pl.Level.CORE_GROUP, name_hint="dispatch_wait",
+        deps=[_push_tid], allow_early_resolve=True,
     ) as _wait_tid:
         # Anchor the blocking wait to the local routing producer.
         _idx_anchor = pl.read(indices, [0, 0])
         for src in pl.range(N_RANKS):
             if src != my_rank:
                 pld.system.wait(
-                    signal=data_arrived,
-                    offsets=[src, 0],
-                    expected=pl.cast(moe_epoch * N_LOCAL, pl.INT32),
-                    cmp=pld.WaitCmp.Ge,
+                    signal=data_arrived, offsets=[src, 0],
+                    expected=pl.cast(moe_epoch * PUSH_GROUPS, pl.INT32), cmp=pld.WaitCmp.Ge,
                 )
 
-    # Gather lanes into the per-expert buffers: one SPMD block per local
-    # expert. deps on _wait_tid for the incoming payload; this rank's own
-    # dst == my_rank puts are already ordered by the local RAW edges on
-    # recv_x / recv_aux / recv_route. deps on _meta_tid for recv_meta_local, which is
-    # manual_dep and so has no auto edge from the cumsum.
+    # Gather lanes into per-expert buffers, one block per local expert. deps: _wait_tid for
+    # the peers' payload, _meta_tid for manual_dep recv_meta_local. No early resolve: routed
+    # expert tasks stay off the cores until the gather retires.
     with pl.spmd(
-        N_LOCAL,
-        name_hint="dispatch_gather",
-        deps=[_wait_tid, _meta_tid],
-        # Keep the routed expert tasks off the cores until this gather retires.
-        allow_early_resolve=False,
+        N_LOCAL, name_hint="dispatch_gather",
+        deps=[_wait_tid, _meta_tid], allow_early_resolve=False,
     ) as _gather_tid:
         e = pl.tile.get_block_idx()
         e_base_row = e * RECV_MAX
@@ -287,74 +237,103 @@ def dispatch(
                 recv_x_out_flat[out_row : out_row + 1, :] = recv_x[in_row : in_row + 1, :]
                 pl.write(recv_scale_out, [e, out_col], pl.read(recv_aux, [in_row, AUX_SCALE]))
                 pl.write(recv_w_out, [e, out_col], pl.read(recv_aux, [in_row, AUX_W]))
-                pl.write(recv_r_route_out, [e, out_col], pl.read(recv_route, [in_row, 0]))
+                gather_route = pl.read(recv_aux, [in_row, AUX_ROUTE])
+                pl.write(recv_r_route_out, [e, out_col], pl.cast(gather_route, pl.INT32))
             b = b + n
 
     return _push_tid
 
 
+@pl.jit.inline(auto_scope=False)
+def expert_routed_scatter(
+    recv_x_out: pl.Tensor[[N_LOCAL, RECV_MAX, D], pl.INT8],
+    recv_scale_out: pl.Tensor[[N_LOCAL, RECV_MAX], pl.FP32],
+    recv_w_out: pl.Tensor[[N_LOCAL, RECV_MAX], pl.FP32],
+    recv_count_out: pl.Tensor[[N_LOCAL, 1], pl.INT32],
+    recv_r_route_out: pl.Tensor[[N_LOCAL, RECV_MAX], pl.INT32],
+    recv_meta_local: pl.Tensor[[N_RANKS, N_LOCAL], pl.INT32],
+    routed_w1: pl.Tensor[[N_LOCAL, MOE_INTER, D], pl.INT8],
+    routed_w1_scale: pl.Tensor[[N_LOCAL, MOE_INTER], pl.FP32],
+    routed_w3: pl.Tensor[[N_LOCAL, MOE_INTER, D], pl.INT8],
+    routed_w3_scale: pl.Tensor[[N_LOCAL, MOE_INTER], pl.FP32],
+    routed_w2: pl.Tensor[[N_LOCAL, D, MOE_INTER], pl.INT8],
+    routed_w2_scale: pl.Tensor[[N_LOCAL, D], pl.FP32],
+    routed_y_buf: pld.DistributedTensor[[T * TOPK, D], pl.BF16],
+) -> pl.Scalar[pl.TASK_ID]:
+    # Per receive tile: run the routed expert, then put each row back to its source rank at
+    # its route offset. Rows are src-major; the running recv_meta_local prefix splits a tile
+    # across sources.
+    expert_completion_tids = pl.array.create(N_LOCAL, pl.TASK_ID)
+    for local_e in pl.parallel(N_LOCAL):
+        tile_completion_tids = pl.array.create(RECV_MAX // RECV_TILE, pl.TASK_ID)
+        expert_rows = pl.cast(pl.read(recv_count_out, [local_e, 0]), pl.INDEX)
+        expert_tiles = (expert_rows + RECV_TILE - 1) // RECV_TILE
+        for tile in pl.parallel(expert_tiles):
+            tile_row = tile * RECV_TILE
+            valid_rows = pl.min(RECV_TILE, expert_rows - tile_row)
+            recv_y_tile = pl.create_tensor([RECV_TILE, D], dtype=pl.BF16)
+            tile_ready = expert_routed_tile(
+                recv_x_out, recv_scale_out, recv_w_out,
+                routed_w1, routed_w1_scale, routed_w3, routed_w3_scale, routed_w2, routed_w2_scale,
+                recv_y_tile,
+                local_e, tile_row, valid_rows,
+            )
+            # routed_y_buf rows are unique per route within an epoch; combine_wait orders the
+            # reduction after every scatter through scatter_done.
+            with pl.at(
+                level=pl.Level.CORE_GROUP, name_hint="expert_scatter",
+                deps=[tile_ready], no_dep_args=[routed_y_buf],
+            ) as scatter_tid:
+                tile_end = tile_row + valid_rows
+                source_begin = pl.cast(0, pl.INDEX)
+                for src in pl.range(N_RANKS):
+                    source_rows = pl.cast(pl.read(recv_meta_local, [src, local_e]), pl.INDEX)
+                    source_end = source_begin + source_rows
+                    scatter_begin = pl.max(tile_row, source_begin)
+                    scatter_end = pl.min(tile_end, source_end)
+                    for compact_row in pl.range(scatter_begin, scatter_end):
+                        route = pl.cast(pl.read(recv_r_route_out, [local_e, compact_row]), pl.INDEX)
+                        pld.tensor.put(
+                            dst=routed_y_buf, peer=src, src=recv_y_tile,
+                            dst_offsets=[route, 0], src_offsets=[compact_row - tile_row, 0], shape=[1, D],
+                        )
+                    source_begin = source_end
+            tile_completion_tids[tile] = scatter_tid
+        expert_tiles_done = pl.system.task_dummy(deps=[tile_completion_tids])
+        expert_completion_tids[local_e] = expert_tiles_done
+    scatter_done = pl.system.task_dummy(deps=[expert_completion_tids[local_e] for local_e in range(N_LOCAL)])
+    return scatter_done
+
+
 @pl.jit.inline
 def combine(
-    recv_y: pl.Tensor[[N_LOCAL, RECV_MAX, D], pl.BF16],
-    recv_r_route_out: pl.Tensor[[N_LOCAL, RECV_MAX], pl.INT32],
     sh: pl.Tensor[[T, D], pl.BF16],
     ffn_out: pl.Tensor[[T, D], pl.BF16],
-    recv_meta_local: pl.Tensor[[N_RANKS, N_LOCAL], pl.INT32],
     routed_y_buf: pld.DistributedTensor[[T * TOPK, D], pl.BF16],
     combine_arrived: pld.DistributedTensor[[N_RANKS, 1], pl.INT32],
     num_tokens: pl.Scalar[pl.INT32],
     my_rank: pl.Scalar[pl.INT32],
     moe_epoch: pl.Scalar[pl.INT32],
+    scatter_done: pl.Scalar[pl.TASK_ID],
     dispatch_push_tid: pl.Scalar[pl.TASK_ID],
 ):
-    recv_y_flat = pl.reshape(recv_y, [N_LOCAL * RECV_MAX, D])
-    # One SPMD block per LOCAL EXPERT: block e pushes expert e's live rows back to
-    # their origin rank (= the source lane src they arrived on) at their route offset.
-    # Rows are src-major, so the per-(e, src) base is a loop-carried prefix sum over
-    # src inside the block (same shape as dispatch_gather). Each route maps to a
-    # unique (dst, loc_e) and r_route, so the blocks' puts are write-disjoint.
-    with pl.spmd(N_LOCAL, name_hint="combine") as _combine_tid:
-        e = pl.tile.get_block_idx()
-        e_base_row = e * RECV_MAX
-        b = pl.cast(0, pl.INDEX)
-        for src in pl.range(N_RANKS):
-            n = pl.cast(pl.read(recv_meta_local, [src, e]), pl.INDEX)
-            for slot in pl.range(n):
-                out_col = b + slot
-                r_route = pl.cast(pl.read(recv_r_route_out, [e, out_col]), pl.INDEX)
-                pld.tensor.put(
-                    dst=routed_y_buf,
-                    peer=src,
-                    src=recv_y_flat,
-                    dst_offsets=[r_route, 0],
-                    src_offsets=[e_base_row + out_col, 0],
-                    shape=[1, D],
-                )
-            b = b + n
-
-    # Publish one completion after the complete local scatter grid.
+    # Publish one completion after every local tile scatter retires.
     with pl.at(
-        level=pl.Level.CORE_GROUP,
-        name_hint="combine_wait",
-        deps=[_combine_tid, dispatch_push_tid],
+        level=pl.Level.CORE_GROUP, name_hint="combine_wait",
+        deps=[scatter_done, dispatch_push_tid],
     ) as _cwait_tid:
         for peer in pl.range(N_RANKS):
             if peer != my_rank:
                 pld.system.notify(
-                    target=combine_arrived,
-                    peer=peer,
-                    offsets=[my_rank, 0],
-                    value=1,
-                    op=pld.NotifyOp.AtomicAdd,
+                    target=combine_arrived, peer=peer, offsets=[my_rank, 0],
+                    value=1, op=pld.NotifyOp.AtomicAdd,
                 )
 
         for src in pl.range(N_RANKS):
             if src != my_rank:
                 pld.system.wait(signal=combine_arrived, offsets=[src, 0], expected=moe_epoch, cmp=pld.WaitCmp.Ge)
 
-    # ffn_out[t] = sh[t] + Sigma_k routed_y_buf[t*TOPK+k]. deps on combine_wait for the
-    # peers' writes; this rank's own puts ride the local RAW edge on routed_y_buf,
-    # which is the only thing ordering them now that the wait is off the scatter.
+    # ffn_out[t] = sh[t] + Sigma_k routed_y_buf[t*TOPK+k], after combine_wait.
     active_tokens = pl.cast(num_tokens, pl.INDEX)
     if active_tokens < 0:
         active_tokens = pl.cast(0, pl.INDEX)
@@ -402,7 +381,6 @@ def moe(
     recv_meta: pld.DistributedTensor[[N_RANKS, N_LOCAL], pl.INT32],
     recv_x: pld.DistributedTensor[[N_LOCAL * RECV_MAX, D], pl.INT8],
     recv_aux: pld.DistributedTensor[[N_LOCAL * RECV_MAX, AUX_PAD], pl.FP32],
-    recv_route: pld.DistributedTensor[[N_LOCAL * RECV_MAX, IDX_PAD], pl.INT32],
     arrived: pld.DistributedTensor[[N_RANKS, 1], pl.INT32],
     data_arrived: pld.DistributedTensor[[N_RANKS, 1], pl.INT32],
     routed_y_buf: pld.DistributedTensor[[N_ROUTES, D], pl.BF16],
@@ -447,33 +425,54 @@ def moe(
     dispatch_push_tid = dispatch(
         indices, x_norm_i8, x_norm_scale, weights,
         recv_x_out, recv_scale_out, recv_w_out, recv_r_route_out, recv_count_out, recv_meta_local,
-        recv_meta, recv_x, recv_aux, recv_route, arrived, data_arrived,
+        recv_meta, recv_x, recv_aux, arrived, data_arrived,
         num_tokens, my_rank, moe_epoch,
     )
 
     with pl.scope():
-        recv_y = pl.create_tensor([N_LOCAL, RECV_MAX, D], dtype=pl.BF16)
-        expert_routed(
+        scatter_done = expert_routed_scatter(
             recv_x_out, recv_scale_out, recv_w_out, recv_count_out,
+            recv_r_route_out, recv_meta_local,
             routed_w1, routed_w1_scale, routed_w3, routed_w3_scale,
             routed_w2, routed_w2_scale,
-            recv_y,
+            routed_y_buf,
         )
 
         ffn_out = pl.create_tensor([T, D], dtype=pl.BF16)
         combine(
-            recv_y, recv_r_route_out, sh,
-            ffn_out, recv_meta_local,
+            sh,
+            ffn_out,
             routed_y_buf, combine_arrived,
-            num_tokens, my_rank, moe_epoch, dispatch_push_tid,
+            num_tokens, my_rank, moe_epoch,
+            scatter_done, dispatch_push_tid,
         )
 
         hc_post(ffn_out, x_hc, post_ffn, comb_ffn, x_next)
     return x_next
 
 
+@pl.jit.inline
+def clear_moe_signals(
+    completion_anchor: pl.Tensor[[T, HC_MULT, D], pl.FP32],
+    arrived: pld.DistributedTensor[[N_RANKS, 1], pl.INT32],
+    data_arrived: pld.DistributedTensor[[N_RANKS, 1], pl.INT32],
+    combine_arrived: pld.DistributedTensor[[N_RANKS, 1], pl.INT32],
+):
+    """Clear this rank's MoE signal windows after its final MoE completes."""
+    with pl.at(level=pl.Level.CORE_GROUP, name_hint="moe_signal_clear"):
+        # The final MoE output depends on this rank observing every peer's final
+        # meta, payload, and combine notify. No peer can issue another MoE notify
+        # to this rank in the current forward after this dependency is satisfied.
+        _completion_anchor = pl.read(completion_anchor, [0, 0, 0])
+        zero = pl.cast(0, pl.INT32)
+        for src in pl.range(N_RANKS):
+            pl.write(arrived, [src, 0], zero)
+            pl.write(data_arrived, [src, 0], zero)
+            pl.write(combine_arrived, [src, 0], zero)
+
+
 @pl.jit
-def moe_test(
+def l2_moe(
     # model inputs
     x_hc: pl.Tensor[[T, HC_MULT, D], pl.FP32],
     hc_ffn_fn: pl.Tensor[[MIX_HC, HC_DIM], pl.FP32],
@@ -502,7 +501,6 @@ def moe_test(
     recv_meta: pld.DistributedTensor[[N_RANKS, N_LOCAL], pl.INT32],
     recv_x: pld.DistributedTensor[[N_LOCAL * RECV_MAX, D], pl.INT8],
     recv_aux: pld.DistributedTensor[[N_LOCAL * RECV_MAX, AUX_PAD], pl.FP32],
-    recv_route: pld.DistributedTensor[[N_LOCAL * RECV_MAX, IDX_PAD], pl.INT32],
     arrived: pld.DistributedTensor[[N_RANKS, 1], pl.INT32],
     data_arrived: pld.DistributedTensor[[N_RANKS, 1], pl.INT32],
     routed_y_buf: pld.DistributedTensor[[N_ROUTES, D], pl.BF16],
@@ -522,7 +520,7 @@ def moe_test(
         shared_w1, shared_w1_scale, shared_w3, shared_w3_scale,
         shared_w2, shared_w2_scale,
         x_next,
-        recv_meta, recv_x, recv_aux, recv_route, arrived, data_arrived,
+        recv_meta, recv_x, recv_aux, arrived, data_arrived,
         routed_y_buf, combine_arrived,
         layer_id, num_tokens, my_rank, moe_epoch,
     )
@@ -560,7 +558,6 @@ def l3_moe(
     recv_meta_buf = pld.alloc_window_buffer([N_RANKS, N_LOCAL], dtype=pl.INT32)
     recv_x_buf = pld.alloc_window_buffer([N_LOCAL * RECV_MAX, D], dtype=pl.INT8)
     recv_aux_buf = pld.alloc_window_buffer([N_LOCAL * RECV_MAX, AUX_PAD], dtype=pl.FP32)
-    recv_route_buf = pld.alloc_window_buffer([N_LOCAL * RECV_MAX, IDX_PAD], dtype=pl.INT32)
     arrived_buf = pld.alloc_window_buffer([N_RANKS, 1], dtype=pl.INT32)
     data_arrived_buf = pld.alloc_window_buffer([N_RANKS, 1], dtype=pl.INT32)
     routed_y_buf_buf = pld.alloc_window_buffer([N_ROUTES, D], dtype=pl.BF16)
@@ -570,12 +567,11 @@ def l3_moe(
         recv_meta = pld.window(recv_meta_buf, [N_RANKS, N_LOCAL], dtype=pl.INT32)
         recv_x = pld.window(recv_x_buf, [N_LOCAL * RECV_MAX, D], dtype=pl.INT8)
         recv_aux = pld.window(recv_aux_buf, [N_LOCAL * RECV_MAX, AUX_PAD], dtype=pl.FP32)
-        recv_route = pld.window(recv_route_buf, [N_LOCAL * RECV_MAX, IDX_PAD], dtype=pl.INT32)
         arrived = pld.window(arrived_buf, [N_RANKS, 1], dtype=pl.INT32)
         data_arrived = pld.window(data_arrived_buf, [N_RANKS, 1], dtype=pl.INT32)
         routed_y_buf = pld.window(routed_y_buf_buf, [N_ROUTES, D], dtype=pl.BF16)
         combine_arrived = pld.window(combine_arrived_buf, [N_RANKS, 1], dtype=pl.INT32)
-        moe_test(
+        l2_moe(
             x_hc[r], hc_ffn_fn[r], hc_ffn_scale[r], hc_ffn_base[r],
             norm_w[r], gate_w[r], gate_bias[r], tid2eid[r], input_ids[r],
             routed_w1[r], routed_w1_scale[r], routed_w3[r], routed_w3_scale[r],
@@ -583,7 +579,7 @@ def l3_moe(
             shared_w1[r], shared_w1_scale[r], shared_w3[r], shared_w3_scale[r],
             shared_w2[r], shared_w2_scale[r],
             x_next[r],
-            recv_meta, recv_x, recv_aux, recv_route, arrived, data_arrived,
+            recv_meta, recv_x, recv_aux, arrived, data_arrived,
             routed_y_buf, combine_arrived,
             layer_id, num_tokens, r, pl.const(1, pl.INT32),
             device=r,
@@ -592,13 +588,8 @@ def l3_moe(
 
 # === Golden + test ==========================================================
 def golden_moe(tensors):
-    """Per-rank torch reference. Replays the 4 stages on host. Each rank's
-    output depends only on its own inputs because the dispatch+combine round-
-    trip is r_route-keyed and shape-preserving (test_l3 pattern).
-
-    The per-route result is invariant to the packing layout (each recv row's
-    SwiGLU output depends only on that row's own input), so this src-major host
-    packing matches the device's per-source-lane cumsum layout by construction."""
+    """Per-rank torch reference: hc_pre, gate, src-major dispatch replay, routed and shared
+    experts, r_route-keyed combine, hc_post."""
     import torch
 
     from hc_pre import golden_hc_pre
@@ -613,8 +604,7 @@ def golden_moe(tensors):
     x_next_out = torch.zeros(N_RANKS, T, HC_MULT, D, dtype=torch.float32)
     num_tokens = max(0, min(T, int(tensors.get("num_tokens", T))))
 
-    # Stages 1-2: hc_pre + gate per rank. Rank-independent, so compute once and
-    # reuse for both the dispatch replay and each rank's local stages.
+    # Stages 1-2: hc_pre + gate per rank.
     all_post = []
     all_comb = []
     all_indices = []
@@ -667,12 +657,10 @@ def golden_moe(tensors):
                 eid = int(all_indices[src][t, k].item())
                 send_counts[src, eid // N_LOCAL, eid % N_LOCAL] += 1
 
-    # Stages 4-5: dispatch replay + routed expert per dst. Also rank-independent
-    # (each recv row's SwiGLU output depends only on that row), so compute once.
+    # Stages 4-5: dispatch replay + routed expert per dst.
     dst_recv_y = {}
     for dst in range(N_RANKS):
-        # Pack onto rank dst in src-major order within each local expert — same
-        # convention as dispatch's per-source lane cumsum.
+        # Pack onto rank dst in src-major order within each local expert.
         d_recv_x = torch.zeros(N_LOCAL, RECV_MAX, D, dtype=torch.int8)
         d_recv_scale = torch.zeros(N_LOCAL, RECV_MAX, dtype=torch.float32)
         d_recv_w = torch.zeros(N_LOCAL, RECV_MAX, dtype=torch.float32)
@@ -784,11 +772,8 @@ def build_tensor_specs(layer_id=0, num_tokens=None, balanced_routing=False):
     from expert_routed import gen_routed_weight
     from expert_shared import gen_shared_weight
 
-    # Routed = MXFP4 (gen_routed_weight), shared = MXFP8 (gen_shared_weight). This
-    # is an integration test whose x_next-equivalent output is dominated by near-zero
-    # residual+FFN cancellations, so it keeps the smaller *behaviorally-calibrated* magnitude
-    # (random fixtures blow up the relative metric at the real ~2.5e-2 magnitude); only the
-    # grid SHAPE (FP4/FP8 discreteness, scale CV) matches the real distribution.
+    # Routed = MXFP4 (gen_routed_weight), shared = MXFP8 (gen_shared_weight) grids at
+    # behaviorally-calibrated magnitudes, below the real ~2.5e-2.
     ROUTED_DEQUANT_STD = {"w1": 1.08e-2, "w2": 2.54e-2, "w3": 1.10e-2}
     SHARED_DEQUANT_STD = {"w1": 7.65e-3, "w2": 2.39e-2, "w3": 7.39e-3}
 
@@ -797,9 +782,7 @@ def build_tensor_specs(layer_id=0, num_tokens=None, balanced_routing=False):
     def init_x_hc():
         return torch.randn(N_RANKS, T, HC_MULT, D)
 
-    # Real layer-0 hc_ffn scale/base (fn synthetic at real magnitude). A synthetic
-    # scale=0.5/base=0 leaves hc_pre post~=1 + near-uniform comb, cancelling the FFN output and
-    # hc residual to near-zero in x_next where W8A8 noise blows up the relative tail.
+    # Real layer-0 hc_ffn scale/base (fn synthetic at real magnitude).
     def init_hc_ffn_fn():
         x = torch.randn(MIX_HC, HC_DIM) * 0.0635
         return x.unsqueeze(0).expand(N_RANKS, -1, -1).contiguous()
@@ -837,8 +820,7 @@ def build_tensor_specs(layer_id=0, num_tokens=None, balanced_routing=False):
             topk_slots = torch.arange(TOPK, dtype=torch.int64).unsqueeze(0)
             x = (token_ids * TOPK + topk_slots) % N_EXPERTS_GLOBAL
             return x.to(torch.int32).unsqueeze(0).expand(N_RANKS, -1, -1).contiguous()
-        # Distinct experts per token (sample without replacement) like real top-k,
-        # so the route-keyed distributed combine stays unambiguous.
+        # Distinct experts per token (sample without replacement).
         x = torch.argsort(torch.rand(VOCAB, N_EXPERTS_GLOBAL), dim=1)[:, :TOPK].to(torch.int32)
         return x.unsqueeze(0).expand(N_RANKS, -1, -1).contiguous()
 
@@ -855,8 +837,7 @@ def build_tensor_specs(layer_id=0, num_tokens=None, balanced_routing=False):
     if balanced_routing:
         assert layer_id < M.num_hash_layers, "balanced routing requires a hash-routing layer"
         active_routes = N_RANKS * max(0, min(T, num_tokens)) * TOPK
-        assert active_routes % N_EXPERTS_GLOBAL == 0, \
-            "balanced routing requires the active route count to divide evenly across experts"
+        assert active_routes % N_EXPERTS_GLOBAL == 0, "balanced routing requires active routes divisible by experts"
 
     # Per-rank routed expert weights (different shards).
     routed_w1_i8_list = []
@@ -921,14 +902,8 @@ def build_tensor_specs(layer_id=0, num_tokens=None, balanced_routing=False):
         ScalarSpec("num_tokens",       torch.int32,                      num_tokens),
     ]
 
-    # Keep the static weight parameters device-resident (child_memory), sharded
-    # per rank: each shard is a leading-dim-stacked [N_RANKS, *tail] tensor sliced
-    # as weight[r] and dispatched to device=r; resident="stacked" uploads shard r
-    # to card r once and reuses it across dispatches, skipping the per-dispatch
-    # H2D/D2H. Covers the routed/shared expert weights and their scales, the gate,
-    # the HC-FFN constants, the RMSNorm gamma, and the static tid2eid route table —
-    # but NOT the per-step activation (x_hc), per-step input_ids, or the output.
-    # All resident names are pure inputs, so the flag is always valid.
+    # Device-resident static weights, stacked per rank ([N_RANKS, *tail], shard r on card r).
+    # x_hc, input_ids, and x_next stay per-dispatch.
     RESIDENT_WEIGHT_NAMES = frozenset([
         "hc_ffn_fn", "hc_ffn_scale", "hc_ffn_base", "norm_w",
         "gate_w", "gate_bias", "tid2eid",
@@ -951,24 +926,32 @@ if __name__ == "__main__":
 
     parser = argparse.ArgumentParser()
     parser.add_argument("-p", "--platform", type=str, default="a2a3", choices=["a2a3", "a2a3sim", "a5", "a5sim"])
-    parser.add_argument("--ep", type=int, default=_EP_DEFAULT, choices=list(_EP_CHOICES),
-                        help="EP world size / rank count")
-    parser.add_argument("-d", "--device", type=str, default=",".join(str(i) for i in range(N_RANKS)),
-                        help=f"comma-separated device ids (need {N_RANKS})")
+    parser.add_argument(
+        "--ep", type=int, default=_EP_DEFAULT, choices=list(_EP_CHOICES),
+        help="EP world size / rank count",
+    )
+    parser.add_argument(
+        "-d", "--device", type=str, default=",".join(str(i) for i in range(N_RANKS)),
+        help=f"comma-separated device ids (need {N_RANKS})",
+    )
     parser.add_argument("--layer-id", type=int, default=0)
-    parser.add_argument("--num-tokens", type=int, default=T,
-                        help=f"active token count for MoE dispatch/combine (0..{T})")
-    parser.add_argument("--balanced-routing", action="store_true", default=False,
-                        help="use deterministic hash routes balanced evenly across all experts")
+    parser.add_argument(
+        "--num-tokens", type=int, default=T,
+        help=f"active token count for MoE dispatch/combine (0..{T})",
+    )
+    parser.add_argument(
+        "--balanced-routing", action="store_true", default=False,
+        help="use deterministic hash routes balanced evenly across all experts",
+    )
     parser.add_argument("--enable-chip-swimlane", type=int, nargs="?", const=1, default=0, choices=range(5))
     parser.add_argument("--compile-only", action="store_true", default=False)
     parser.add_argument("--runtime-dir", type=str, default=None)
     parser.add_argument("--save-data", action="store_true", default=False)
-    parser.add_argument("--golden-data", type=str, default=None,
-                        help="dir with cached in/{name}.pt + out/{name}.pt; reuses them "
-                             "instead of regenerating inputs + recomputing golden.")
-    parser.add_argument("--log-level", type=str, default=None,
-                        help="runtime log threshold: debug, v0..v9, info, warn, error, null")
+    parser.add_argument("--golden-data", type=str, default=None, help="dir with cached in/ and out/ tensors to replay")
+    parser.add_argument(
+        "--log-level", type=str, default=None,
+        help="runtime log threshold: debug, v0..v9, info, warn, error, null",
+    )
     parser.add_argument("--dump-passes", action="store_true", default=False)
     args = parser.parse_args()
 
