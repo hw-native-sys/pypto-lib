@@ -281,6 +281,8 @@ relative Frobenius norm; `--chain` instead feeds each operator the previous
 *kernel's* device output, which is what the deployed pipeline does.
 
 ```bash
+python models/qwen3_8_27b/gdn_block.py -p a2a3 -d 0
+python models/qwen3_8_27b/gdn_block.py -p a2a3sim --seq-len 2048
 python models/qwen3_8_27b/gdn_layer.py -p a2a3 -d 0
 python models/qwen3_8_27b/test_gdn_stages.py -p a2a3 -d 0
 python models/qwen3_8_27b/test_gdn_stages.py -p a2a3 -d 0 --chain
@@ -288,8 +290,13 @@ python models/qwen3_8_27b/test_gdn_stages.py -p a2a3sim --seq-len 1024
 python models/qwen3_8_27b/bench.py -p a2a3 -d 0 --seq-len 8192
 ```
 
-Both take `--heads` and `--qk-heads`, defaulting to the model's 48 and 16. Pass
-the same value to both for an ungrouped shape.
+`test_gdn_stages.py` and `bench.py` take `--heads` and `--qk-heads`, defaulting
+to the model's 48 and 16; pass the same value to both for an ungrouped shape.
+The block is marked device-only for CI: on a simulator it takes about eight
+minutes at T = 8192, more than the shared simulator job can spend on one file,
+so CI exercises it on hardware and the operators individually on the simulator.
+By hand it runs on either, and `--seq-len 2048` is the short shape used for
+simulator checks.
 
 The block reference check needs no NPU, only `transformers` (5.17.0), and skips with a message if it is absent. Its default sequence length is 1024, which checks the same thing element for element; the numbers quoted above are at 8192. `weights.py` needs `--fetch` the first time, since it pulls from the checkpoint:
 
