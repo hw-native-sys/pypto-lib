@@ -332,6 +332,7 @@ def draft_layer(
     data_arrived: pld.DistributedTensor[[N_RANKS, 1], pl.INT32],
     routed_y_buf: pld.DistributedTensor[[N_ROUTES, D], pl.BF16],
     combine_arrived: pld.DistributedTensor[[N_RANKS, 1], pl.INT32],
+    moe_stage_token: pl.Tensor[[1], pl.INT32],
     layer_id: pl.Scalar[pl.INT32],
     active_tokens: pl.Scalar[pl.INT32],
     my_rank: pl.Scalar[pl.INT32],
@@ -512,7 +513,7 @@ def draft_layer(
         layer_shared_w1, layer_shared_w1_scale, layer_shared_w3, layer_shared_w3_scale, layer_shared_w2, layer_shared_w2_scale,
         output_hc,
         recv_meta, recv_x, recv_aux, recv_route,
-        arrived, data_arrived, routed_y_buf, combine_arrived,
+        arrived, data_arrived, routed_y_buf, combine_arrived, moe_stage_token,
         layer_id, active_tokens, my_rank, moe_epoch,
     )
     return output_hc, hidden_gather_signal
@@ -711,6 +712,9 @@ def dspark_drafter(
     swa_lens_0 = swa_lens[0]
     swa_lens_1 = swa_lens[1]
     swa_lens_2 = swa_lens[2]
+    moe_stage_token = pl.create_tensor([1], dtype=pl.INT32)
+    with pl.at(level=pl.Level.CORE_GROUP, name_hint="drafter_moe_stage_init"):
+        pl.write(moe_stage_token, [0], pl.cast(0, pl.INT32))
     hidden_1 = intermediate_hidden[0]
     hidden_1, hidden_gather_signal = draft_layer(
         initial_hidden, pl.const(0, pl.INT32),
@@ -730,6 +734,7 @@ def dspark_drafter(
         hidden_1, hidden_gather_window, hidden_gather_signal,
         attention_window, attention_signal, o_window, o_signal, group_base, dsa_cp_rank,
         recv_meta, recv_x, recv_aux, recv_route, arrived, data_arrived, routed_y_buf, combine_arrived,
+        moe_stage_token,
         pl.const(40, pl.INT32), active_tokens, my_rank, pl.const(1, pl.INT32),
     )
 
@@ -752,6 +757,7 @@ def dspark_drafter(
         hidden_2, hidden_gather_window, hidden_gather_signal,
         attention_window, attention_signal, o_window, o_signal, group_base, dsa_cp_rank,
         recv_meta, recv_x, recv_aux, recv_route, arrived, data_arrived, routed_y_buf, combine_arrived,
+        moe_stage_token,
         pl.const(41, pl.INT32), active_tokens, my_rank, pl.const(2, pl.INT32),
     )
 
@@ -774,6 +780,7 @@ def dspark_drafter(
         hidden_3, hidden_gather_window, hidden_gather_signal,
         attention_window, attention_signal, o_window, o_signal, group_base, dsa_cp_rank,
         recv_meta, recv_x, recv_aux, recv_route, arrived, data_arrived, routed_y_buf, combine_arrived,
+        moe_stage_token,
         pl.const(42, pl.INT32), active_tokens, my_rank, pl.const(3, pl.INT32),
     )
     clear_moe_signals(hidden_3, arrived, data_arrived, combine_arrived)

@@ -455,6 +455,9 @@ def decode_layer_swa(
 ):
     """Run one SWA attention and one MoE without clearing shared signals."""
     active_t = pl.tensor.dim(x_hc, 0)
+    moe_stage_token = pl.create_tensor([1], dtype=pl.INT32)
+    with pl.at(level=pl.Level.CORE_GROUP, name_hint="decode_layer_moe_stage_init"):
+        pl.write(moe_stage_token, [0], pl.cast(0, pl.INT32))
     with pl.scope():
         if TP_SIZE == 1:
             decode_swa_tp1(
@@ -504,7 +507,7 @@ def decode_layer_swa(
             shared_w2, shared_w2_scale,
             x_moe_next,
             recv_meta, recv_x, recv_aux, recv_route,
-            arrived, data_arrived, routed_y_buf, combine_arrived,
+            arrived, data_arrived, routed_y_buf, combine_arrived, moe_stage_token,
             layer_id, local_t, my_rank, moe_epoch,
         )
 
@@ -829,6 +832,9 @@ def decode_layer_hca(
 ):
     """Run one HCA attention and one MoE without clearing shared signals."""
     active_t = pl.tensor.dim(x_hc, 0)
+    moe_stage_token = pl.create_tensor([1], dtype=pl.INT32)
+    with pl.at(level=pl.Level.CORE_GROUP, name_hint="decode_layer_moe_stage_init"):
+        pl.write(moe_stage_token, [0], pl.cast(0, pl.INT32))
     with pl.scope():
         if TP_SIZE == 1:
             decode_hca_tp1(
@@ -887,7 +893,7 @@ def decode_layer_hca(
             shared_w2, shared_w2_scale,
             x_moe_next,
             recv_meta, recv_x, recv_aux, recv_route,
-            arrived, data_arrived, routed_y_buf, combine_arrived,
+            arrived, data_arrived, routed_y_buf, combine_arrived, moe_stage_token,
             layer_id, local_t, my_rank, moe_epoch,
         )
 
@@ -1288,6 +1294,9 @@ def decode_layer_csa(
 ):
     """Run one CSA attention and one MoE without clearing shared signals."""
     active_t = pl.tensor.dim(x_hc, 0)
+    moe_stage_token = pl.create_tensor([1], dtype=pl.INT32)
+    with pl.at(level=pl.Level.CORE_GROUP, name_hint="decode_layer_moe_stage_init"):
+        pl.write(moe_stage_token, [0], pl.cast(0, pl.INT32))
     with pl.scope():
         if TP_SIZE == 1:
             decode_csa_tp1(
@@ -1356,7 +1365,7 @@ def decode_layer_csa(
             shared_w2, shared_w2_scale,
             x_moe_next,
             recv_meta, recv_x, recv_aux, recv_route,
-            arrived, data_arrived, routed_y_buf, combine_arrived,
+            arrived, data_arrived, routed_y_buf, combine_arrived, moe_stage_token,
             layer_id, local_t, my_rank, moe_epoch,
         )
 
