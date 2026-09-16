@@ -47,6 +47,7 @@ import out_proj
 import qk_norm_gate
 import quant_x
 import short_conv
+import solve_tril
 from config import GDN_TILING, QWEN3_8_27B
 
 # model shape
@@ -119,7 +120,7 @@ def build_kernel(t: int = T, h: int = H, hg: int = HG, d: int = D, chunk: int = 
         w_out_scale: pl.Tensor[[c], pl.FP32],
         tril: pl.Tensor[[chunk, chunk], pl.FP32],
         mask_strict: pl.Tensor[[chunk, chunk], pl.FP32],
-        neg_eye: pl.Tensor[[chunk, chunk], pl.FP16],
+        neg_eye2: pl.Tensor[[2 * chunk, chunk], pl.FP16],
         out: pl.Out[pl.Tensor[[t, c], pl.BF16]],
     ):
         x_q = pl.create_tensor([t, c], dtype=pl.INT8)
@@ -156,7 +157,7 @@ def build_kernel(t: int = T, h: int = H, hg: int = HG, d: int = D, chunk: int = 
         op_qkng(q_conv, k_conv, a_proj, b_proj, a_log, dt_bias, q_n, k_n, beta, g)
 
         o = pl.create_tensor([t, h, d], dtype=pl.FP16)
-        op_delta(q_n, k_n, v_conv, g, beta, tril, mask_strict, neg_eye, o)
+        op_delta(q_n, k_n, v_conv, g, beta, tril, mask_strict, neg_eye2, o)
 
         y_q = pl.create_tensor([t, cv], dtype=pl.INT8)
         y_scale = pl.create_tensor([1, t], dtype=pl.FP32)
@@ -223,8 +224,8 @@ def build_tensor_specs(t: int = T, h: int = H, hg: int = HG, d: int = D,
         TensorSpec("w_out_scale", [C], torch.float32, init_value=w_out_scale),
         TensorSpec("tril", [chunk, chunk], torch.float32, init_value=init_tril),
         TensorSpec("mask_strict", [chunk, chunk], torch.float32, init_value=init_mask_strict),
-        TensorSpec("neg_eye", [chunk, chunk], torch.float16,
-                   init_value=lambda: -torch.eye(chunk, dtype=torch.float16)),
+        TensorSpec("neg_eye2", [2 * chunk, chunk], torch.float16,
+                   init_value=lambda: solve_tril.neg_eye_stack(chunk)),
         TensorSpec("out", [t, C], torch.bfloat16),
     ]
 

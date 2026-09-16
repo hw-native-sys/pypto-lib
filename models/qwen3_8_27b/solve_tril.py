@@ -15,6 +15,17 @@
 which is exact, not truncated: A is strictly lower triangular, so A^CHUNK = 0 and
 the product (I-A)(I+A^2)(I+A^4)...(I+A^(CHUNK/2)) terminates at the inverse.
 
+`X = I - A` is one matmul at double K, not two at single K:
+
+    [A | -I] @ [[-I], [-I]]  =  A(-I) + (-I)(-I)  =  I - A
+
+Only the matrix unit writes an accumulator -- there is no data path into Acc
+from anywhere else, and `init_cond` seeds it to zero and nothing else -- so the
+identity has to arrive through a matmul whatever happens. Merging the two into
+one K = 2*CHUNK matmul does identical arithmetic and measures **1374.9 ->
+1266.0 us** at T = 8192, H = 48, which puts this kernel's cost partly in
+matmul issue rather than in MACs.
+
 Output is FP32, as the reference's is. The pipeline narrows it to FP16 before
 wy_fast; doing that here would be a vector op and would drag the whole [C, C]
 FP32 tile across the cube/vector boundary.
@@ -52,23 +63,28 @@ def build_kernel(t: int = T, h: int = H, d: int = D, chunk: int = CHUNK,
     @(pl.jit.inline if inline else pl.jit)
     def gdn_solve_tril(
         a_in: pl.Tensor[[t, h, chunk], pl.FP16],
-        neg_eye: pl.Tensor[[chunk, chunk], pl.FP16],
+        neg_eye2: pl.Tensor[[2 * chunk, chunk], pl.FP16],
         t_out: pl.Out[pl.Tensor[[t, h, chunk], out_dtype]],
     ):
         a_flat = pl.reshape(a_in, [t, h * chunk])
         t_flat = pl.reshape(t_out, [t, h * chunk])
-        neg_i = neg_eye[:, :]
-        # No optimizations: the kernel has no vector op, so there is no cross-core
-        # ring to size and nothing for pl.split to halve. Vec usage is 0.
-        for c0 in pl.spmd(t // chunk, name_hint="solve_tril"):
+        # slot_num=1: the concat below is the kernel's one vector op, so a
+        # cross-core ring exists and its default depth reserves more of the
+        # vector buffer than the tile needs.
+        for c0 in pl.spmd(t // chunk, name_hint="solve_tril",
+                          optimizations=[pl.cross_core_slot(slot_num=1)]):
             t0 = c0 * chunk
             for hh in pl.range(h):
                 col = hh * chunk
-                n16 = a_flat[t0 : t0 + chunk, col : col + chunk]
-                xa = pl.matmul(n16, neg_i, out_dtype=pl.FP32)
-                xa = pl.matmul_acc(xa, neg_i, neg_i)            # X = I - A
+                # The A slice is written out three times on purpose: one bound
+                # value cannot feed both a vector op (the concat) and a matmul.
+                lhs = pl.concat(a_flat[t0 : t0 + chunk, col : col + chunk],
+                                neg_eye2[0:chunk, :])
+                xa = pl.matmul(lhs, neg_eye2[:, :], out_dtype=pl.FP32)  # X = I - A
                 x16 = pl.cast(xa, target_type=pl.FP16, mode="rint")
-                y32 = pl.matmul(n16, n16, out_dtype=pl.FP32)
+                y32 = pl.matmul(a_flat[t0 : t0 + chunk, col : col + chunk],
+                                a_flat[t0 : t0 + chunk, col : col + chunk],
+                                out_dtype=pl.FP32)
                 y16 = pl.cast(y32, target_type=pl.FP16, mode="rint")
                 for _ in pl.unroll(ndouble - 1):
                     # accumulate onto the FP32 X in place: no matmul is spent copying
@@ -90,6 +106,17 @@ def build_kernel(t: int = T, h: int = H, d: int = D, chunk: int = CHUNK,
 gdn_solve_tril = build_kernel()
 
 
+def neg_eye_stack(chunk: int):
+    """`-I` stacked twice, `[2*chunk, chunk]`: the right operand of the merged setup.
+
+    `[A | -I] @ [[-I], [-I]]` is `I - A`, so the same block serves both halves
+    of the contraction and the kernel needs one constant rather than two.
+    """
+    import torch
+
+    return -torch.cat([torch.eye(chunk, dtype=torch.float16)] * 2)
+
+
 def build_tensor_specs(t: int = T, h: int = H, d: int = D, chunk: int = CHUNK,
                        hg: int = HG, out_dtype=None):
     # hg only picks which reference chain to draw from; this stage reads no q or k.
@@ -101,8 +128,8 @@ def build_tensor_specs(t: int = T, h: int = H, d: int = D, chunk: int = CHUNK,
     return [
         TensorSpec("a_in", [t, h, chunk], torch.float16,
                    init_value=reference.lazy("solve_tril", "a16", t, h, d, chunk, hg=hg)),
-        TensorSpec("neg_eye", [chunk, chunk], torch.float16,
-                   init_value=lambda: -torch.eye(chunk, dtype=torch.float16)),
+        TensorSpec("neg_eye2", [2 * chunk, chunk], torch.float16,
+                   init_value=lambda: neg_eye_stack(chunk)),
         TensorSpec("t_out", [t, h, chunk],
                    torch.float32 if out_dtype is None else out_dtype),
     ]

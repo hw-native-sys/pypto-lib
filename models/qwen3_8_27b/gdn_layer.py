@@ -86,7 +86,7 @@ def build_kernel(t: int = T, h: int = H, d: int = D, chunk: int = CHUNK,
         beta: pl.Tensor[[h, t], pl.FP32],
         tril: pl.Tensor[[chunk, chunk], pl.FP32],
         mask_strict: pl.Tensor[[chunk, chunk], pl.FP32],
-        neg_eye: pl.Tensor[[chunk, chunk], pl.FP16],
+        neg_eye2: pl.Tensor[[2 * chunk, chunk], pl.FP16],
         o_out: pl.Out[pl.Tensor[[t, h, d], pl.FP16]],
     ):
         # `tril` serves twice: chunk_cumsum contracts against it, and it is also
@@ -99,7 +99,7 @@ def build_kernel(t: int = T, h: int = H, d: int = D, chunk: int = CHUNK,
         op_kkt(k, beta, g_sum, mask_strict, a)
 
         a_inv = pl.create_tensor([t, h, chunk], dtype=pl.FP16)
-        op_tril(a, neg_eye, a_inv)
+        op_tril(a, neg_eye2, a_inv)
 
         w = pl.create_tensor([t, h, d], dtype=pl.FP16)
         u = pl.create_tensor([t, h, d], dtype=pl.FP16)
@@ -146,8 +146,8 @@ def build_tensor_specs(t: int = T, h: int = H, d: int = D, chunk: int = CHUNK,
         TensorSpec("tril", [chunk, chunk], torch.float32, init_value=init_tril),
         TensorSpec("mask_strict", [chunk, chunk], torch.float32,
                    init_value=init_mask_strict),
-        TensorSpec("neg_eye", [chunk, chunk], torch.float16,
-                   init_value=lambda: -torch.eye(chunk, dtype=torch.float16)),
+        TensorSpec("neg_eye2", [2 * chunk, chunk], torch.float16,
+                   init_value=lambda: solve_tril.neg_eye_stack(chunk)),
         TensorSpec("o_out", [t, h, d], torch.float16),
     ]
 
