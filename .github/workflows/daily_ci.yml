@@ -88,6 +88,24 @@ jobs:
                   print(result.stdout[-12000:], result.stderr[-2000:], flush=True)
           tail(root / "published/suite.log")
 
+          for command in (["task-submit", "--maintenance", "status"],
+                          ["task-submit", "--devices", "status"],
+                          ["task-submit", "--list"], ["npu-smi", "info"]):
+              result = subprocess.run(command, capture_output=True, text=True, timeout=30)
+              text = re.sub(r"\x1b\[[0-9;]*m", "", result.stdout)
+              print(f"Read-only command: {command}; exit={result.returncode}", flush=True)
+              if command[-1] == "--list":
+                  for line in text.splitlines():
+                      task = re.search(r"(task_[0-9_]+)\s+(\S+)\s*(\[NPU:[^]]*\])?", line)
+                      if task:
+                          print(" ".join(item for item in task.groups() if item), flush=True)
+                      elif "===" in line or re.search(r"\[[0-9,]+\]", line):
+                          print(line.split("\u2192")[0], flush=True)
+              else:
+                  print(text[-14000:], flush=True)
+              if result.stderr:
+                  print(result.stderr[-2000:], flush=True)
+
           selected = []
           checkout = runner_root / "_work/pypto-lib/pypto-lib/operator-checkout"
           for proc in Path("/proc").glob("[0-9]*"):
