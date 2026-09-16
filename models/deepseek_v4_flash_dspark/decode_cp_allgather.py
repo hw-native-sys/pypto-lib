@@ -275,7 +275,7 @@ def decode_cp_csa_main_typed_allgather_step(
                 )
 
     with pl.at(
-        level=pl.Level.CORE_GROUP, name_hint="cp_csa_main_typed_allgather_payload_wait",
+        level=pl.Level.CORE_GROUP, name_hint="cp_csa_main_typed_allgather_payload_wait", allow_early_resolve=True,
         deps=[push_tid],
     ) as payload_wait_tid:
         for source_tp in pl.range(TP_SIZE):
@@ -288,7 +288,7 @@ def decode_cp_csa_main_typed_allgather_step(
     group_rows = TP_SIZE * local_rows
     full_rows = (group_rows // READBACK_ROW_TILE) * READBACK_ROW_TILE
     with pl.spmd(
-        READBACK_WORKERS, name_hint="cp_csa_main_typed_allgather_readback",
+        READBACK_WORKERS, name_hint="cp_csa_main_typed_allgather_readback", allow_early_resolve=True,
         deps=[push_tid, payload_wait_tid],
     ) as readback_tid:
         worker = pl.tile.get_block_idx()
@@ -314,7 +314,7 @@ def decode_cp_csa_main_typed_allgather_step(
                 )
 
     with pl.at(
-        level=pl.Level.CORE_GROUP, name_hint="cp_csa_main_typed_allgather_readback_wait",
+        level=pl.Level.CORE_GROUP, name_hint="cp_csa_main_typed_allgather_readback_wait", allow_early_resolve=True,
         deps=[readback_tid],
     ) as readback_wait_tid:
         for source_tp in pl.range(TP_SIZE):
@@ -326,7 +326,7 @@ def decode_cp_csa_main_typed_allgather_step(
 
     # Consumers depend on retirement, which follows every typed output store.
     with pl.at(
-        level=pl.Level.CORE_GROUP, name_hint="cp_csa_main_typed_allgather_retire",
+        level=pl.Level.CORE_GROUP, name_hint="cp_csa_main_typed_allgather_retire", allow_early_resolve=True,
         deps=[readback_tid, readback_wait_tid],
     ) as retire_tid:
         completion_anchor = pl.read(values_out, [0, 0])
@@ -388,7 +388,7 @@ def decode_cp_csa_aux_typed_allgather_step(
                 )
 
     with pl.at(
-        level=pl.Level.CORE_GROUP, name_hint="cp_csa_aux_typed_allgather_payload_wait",
+        level=pl.Level.CORE_GROUP, name_hint="cp_csa_aux_typed_allgather_payload_wait", allow_early_resolve=True,
         deps=[push_tid],
     ) as payload_wait_tid:
         for source_tp in pl.range(TP_SIZE):
@@ -401,7 +401,7 @@ def decode_cp_csa_aux_typed_allgather_step(
     group_rows = TP_SIZE * local_rows
     full_rows = (group_rows // READBACK_ROW_TILE) * READBACK_ROW_TILE
     with pl.spmd(
-        CSA_AUX_READBACK_WORKERS, name_hint="cp_csa_aux_typed_allgather_readback",
+        CSA_AUX_READBACK_WORKERS, name_hint="cp_csa_aux_typed_allgather_readback", allow_early_resolve=True,
         deps=[push_tid, payload_wait_tid],
     ) as readback_tid:
         worker = pl.tile.get_block_idx()
@@ -433,7 +433,7 @@ def decode_cp_csa_aux_typed_allgather_step(
                 )
 
     with pl.at(
-        level=pl.Level.CORE_GROUP, name_hint="cp_csa_aux_typed_allgather_readback_wait",
+        level=pl.Level.CORE_GROUP, name_hint="cp_csa_aux_typed_allgather_readback_wait", allow_early_resolve=True,
         deps=[readback_tid],
     ) as readback_wait_tid:
         for source_tp in pl.range(TP_SIZE):
@@ -445,7 +445,7 @@ def decode_cp_csa_aux_typed_allgather_step(
 
     # Consumers depend on retirement, which follows every typed output store.
     with pl.at(
-        level=pl.Level.CORE_GROUP, name_hint="cp_csa_aux_typed_allgather_retire",
+        level=pl.Level.CORE_GROUP, name_hint="cp_csa_aux_typed_allgather_retire", allow_early_resolve=True,
         deps=[readback_tid, readback_wait_tid],
     ) as retire_tid:
         completion_anchor = pl.read(values_out, [0, 0])

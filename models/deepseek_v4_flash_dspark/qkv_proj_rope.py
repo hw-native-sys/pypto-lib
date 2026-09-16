@@ -128,13 +128,29 @@ def materialize_rope_rows(
                 rope_sin_t[rope_t : rope_t + 1, 0:ROPE_DIM] = freqs_sin[rope_pos : rope_pos + 1, 0:ROPE_DIM]
 
 
-@pl.jit.inline
+@pl.jit.inline(auto_scope=False)
 def rope_prepare(
     rope_cos: pl.Tensor[[ROPE_T_DYN, ROPE_DIM], pl.BF16],
     rope_sin: pl.Tensor[[ROPE_T_DYN, ROPE_DIM], pl.BF16],
     rope_cos_il: pl.Tensor[[ROPE_T_DYN, ROPE_DIM], pl.FP32],
     rope_sin_signed: pl.Tensor[[ROPE_T_DYN, ROPE_DIM], pl.FP32],
     rope_swap_idx: pl.Tensor[[ROPE_T_DYN, ROPE_DIM], pl.INT32],
+):
+    """Prepare RoPE rows without an additional scheduling dependency."""
+    prepare_dep = pl.system.task_invalid()
+    rope_prepare_after(
+        rope_cos, rope_sin, rope_cos_il, rope_sin_signed, rope_swap_idx, prepare_dep,
+    )
+
+
+@pl.jit.inline
+def rope_prepare_after(
+    rope_cos: pl.Tensor[[ROPE_T_DYN, ROPE_DIM], pl.BF16],
+    rope_sin: pl.Tensor[[ROPE_T_DYN, ROPE_DIM], pl.BF16],
+    rope_cos_il: pl.Tensor[[ROPE_T_DYN, ROPE_DIM], pl.FP32],
+    rope_sin_signed: pl.Tensor[[ROPE_T_DYN, ROPE_DIM], pl.FP32],
+    rope_swap_idx: pl.Tensor[[ROPE_T_DYN, ROPE_DIM], pl.INT32],
+    prepare_dep: pl.Scalar[pl.TASK_ID],
 ):
     """Build the head-invariant interleaved cos / sign-folded sin / swap-index rope rows."""
     t_dim = pl.tensor.dim(rope_cos, 0)
@@ -149,9 +165,11 @@ def rope_prepare(
     rope_swap_idx_view = pl.reshape(rope_swap_idx, [t_dim, ROPE_DIM])
 
     token_tiles = (t_dim + Q_ROPE_T_TILE - 1) // Q_ROPE_T_TILE
-    for qrp_worker in pl.spmd(
-        pl.min(Q_ROPE_WORKERS, token_tiles), name_hint="q_rope_prepare", allow_early_resolve=True
-    ):
+    with pl.spmd(
+        pl.min(Q_ROPE_WORKERS, token_tiles), name_hint="q_rope_prepare",
+        deps=[prepare_dep], allow_early_resolve=True,
+    ) as prepare_tid:
+        qrp_worker = pl.tile.get_block_idx()
         # The interleave lane, swap index and sign fold only depend on the column
         # index, so they are built once per worker instead of once per tile.
         qrp_ones = pl.full([Q_ROPE_T_TILE, ROPE_DIM], dtype=pl.FP32, value=1.0)
@@ -288,7 +306,7 @@ def q_proj_qr(
             # QR_OK-fold into cube blocks that atomic-add their K partials into a zero-seeded
             # output. Seeded on-core, not through create_tensor init_value=0.
             qr_fp32 = pl.create_tensor([qr_t_matmul, Q_LORA], dtype=pl.FP32)
-            with pl.at(level=pl.Level.CORE_GROUP, name_hint="qr_proj_seed"):
+            with pl.at(level=pl.Level.CORE_GROUP, name_hint="qr_proj_seed", allow_early_resolve=True):
                 for ts0 in pl.range(0, qr_t_matmul, QR_M_TILE):
                     for nseed0 in pl.range(0, Q_LORA, QR_N_TILE):
                         qr_seed = pl.full([QR_M_TILE, QR_N_TILE], dtype=pl.FP32, value=0.0)
@@ -403,7 +421,7 @@ def q_proj_q_matmul(
     qproj_t_matmul = pl.tensor.dim(q_proj_i32, 0)
     qproj_full_rows = (tile_rows // QPROJ_M_TILE) * QPROJ_M_TILE
     with pl.spmd(
-        QPROJ_WORKERS, name_hint="qproj_matmul", deps=[qproj_dep],
+        QPROJ_WORKERS, name_hint="qproj_matmul", allow_early_resolve=True, deps=[qproj_dep],
     ) as qproj_tid:
         qproj_worker = pl.tile.get_block_idx()
         for qproj_n_idx in pl.range(
@@ -680,7 +698,7 @@ def kv_proj_rope(
             # Split-K kv_proj: KV_N_TILE N-groups expanded KV_OK-fold into cube blocks that
             # atomic-add their K partials into a zero-seeded output.
             kv_fp32 = pl.create_tensor([t_matmul, HEAD_DIM], dtype=pl.FP32)
-            with pl.at(level=pl.Level.CORE_GROUP, name_hint="kv_proj_seed"):
+            with pl.at(level=pl.Level.CORE_GROUP, name_hint="kv_proj_seed", allow_early_resolve=True):
                 for kts0 in pl.range(0, t_matmul, KV_M_TILE):
                     for kvseed0 in pl.range(0, HEAD_DIM, KV_N_TILE):
                         kv_seed = pl.full([KV_M_TILE, KV_N_TILE], dtype=pl.FP32, value=0.0)
@@ -688,7 +706,7 @@ def kv_proj_rope(
 
             # KV projection consumes the caller's readiness dependency.
             with pl.spmd(
-                (HEAD_DIM // KV_N_TILE) * KV_OK * kv_m_groups, name_hint="kv_proj_matmul", deps=[late_dep],
+                (HEAD_DIM // KV_N_TILE) * KV_OK * kv_m_groups, name_hint="kv_proj_matmul", allow_early_resolve=True, deps=[late_dep],
             ) as _kv_tid:
                 kbg = pl.tile.get_block_idx()
                 kv_col0 = (kbg // (KV_OK * kv_m_groups)) * KV_N_TILE
@@ -727,7 +745,7 @@ def kv_proj_rope(
             kv_token_tiles = (tile_rows + KV_RMS_T_TILE - 1) // KV_RMS_T_TILE
             for tg_idx in pl.spmd(
                 kv_token_tiles,
-                name_hint="kv_rms_norm_rope",
+                name_hint="kv_rms_norm_rope", allow_early_resolve=True,
                 sync_start=True,
             ):
                 tg = tg_idx * KV_RMS_T_TILE
