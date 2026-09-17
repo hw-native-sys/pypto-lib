@@ -302,6 +302,11 @@ BLOCK_TABLE_DYN = pl.dynamic("GLM53_BLOCK_TABLE_DYN")
 KV_BLOCKS_DYN = pl.dynamic("GLM53_KV_BLOCKS_DYN")
 INDEX_BLOCKS_DYN = pl.dynamic("GLM53_INDEX_BLOCKS_DYN")
 POOLS_DYN = pl.dynamic("GLM53_POOLS_DYN")
+# Depth of a KDA recurrent- or conv-state pool. This is the pool's row count, not
+# the batch size: ``kda_state_rows`` exists precisely so a request can sit on any
+# row, and reusing B_DYN here would assert the two are equal and make that
+# indirection meaningless.
+KDA_STATE_DYN = pl.dynamic("GLM53_KDA_STATE_DYN")
 # Merged vision tokens in one batch: one row per placeholder, unrelated to the
 # text token count.
 VISION_ROWS_DYN = pl.dynamic("GLM53_VISION_ROWS_DYN")
