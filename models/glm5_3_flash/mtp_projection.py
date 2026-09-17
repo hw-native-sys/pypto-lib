@@ -10,9 +10,12 @@
 
     h = eh_proj(concat(enorm(embedding), hnorm(hidden)))        [T, 2D] -> [T, D]
 
-``enorm``, ``hnorm`` and ``eh_proj`` are the only weights unique to the MTP layer;
-everything after the fusion is an ordinary MLA + indexer + sparse-MoE layer, and the
-result goes through ``shared_head.norm`` into the **shared** ``lm_head``.
+``enorm``, ``hnorm`` and ``eh_proj`` are unique to the MTP layer; everything after
+the fusion is an ordinary MLA + indexer + sparse-MoE layer. The layer also ships its
+**own** ``embed_tokens.weight`` and ``shared_head.head.weight`` as distinct index
+entries rather than reusing the target's — whether the values are tied is
+UNVERIFIED, but the loader has to handle two more tensors than the name
+"shared_head" suggests.
 
 Two things separate this layer from the backbone: it has **no** ``hc_*`` weights, so
 it uses a plain residual rather than the four-stream mHC, and
@@ -22,6 +25,23 @@ instead of running its own selection.
 ``num_speculative_tokens`` is 3 in the A3 recipe, and that recipe also sets
 ``enforce_eager: true`` because GLM-5.3-Flash does not support graph-mode
 speculative decoding.
+
+**Unresolved: ``rot.weight``.** The deployment checkpoint sets ``is_rot_used: true``
+and ships a top-level ``rot.weight``, BF16 ``[4096, 4096]``, the only tensor in the
+weight index with no entry in ``quant_model_description.json``. vLLM Ascend's
+``AscendDeepSeekMTP`` consumes exactly this name and flag, applying it to the
+previous hidden state **before** ``hnorm``; but GLM routes to ``Glm5NextMTP``
+instead, which has no ``rot`` and silently drops the tensor. So either this layer
+owes a ``[D, D]`` GEMM that the reference port is missing, or ``eh_proj`` subsumes
+it. Settle that before implementing, because it cannot be folded away: ``hnorm`` is
+a non-linear RMSNorm sitting between ``rot`` and ``eh_proj``, so only the constant
+factor would absorb.
+
+Measured, if it is needed: ``rot.weight`` is not a rotation. It is symmetric with
+``R[i,j] = g(i XOR j)`` — verified bit-exact on 11 rows spanning the full index
+range — i.e. a per-channel diagonal scaling in the Hadamard basis, determined
+entirely by its 4096-element first row. A Walsh-Hadamard transform, a scale, and a
+second transform costs about 340x fewer operations than the dense GEMM.
 """
 
 import pypto.language as pl

@@ -14,19 +14,18 @@ fp16/fp32 forms — so the released FP8-blockwise checkpoint cannot execute here
 int8 is the only quantized path. The deployment weights are therefore the
 msmodelslim W8A8 conversion that vLLM Ascend serves on a 16-card A3 node.
 
-Two W8A8 flavours exist in that ecosystem and both appear in GLM checkpoints:
+The deployment checkpoint is ``Eco-Tech/GLM-5.3-Flash-w8a8`` and its
+``quant_model_description.json`` declares one scheme and one only:
 
-``dynamic``
-    int8 weights with a per-output-channel ``weight_scale`` and the activation
-    quantized per token at run time. This is what the MoE path uses.
+    {"group_size": 0, "model_quant_type": "W8A8_DYNAMIC", "is_rot_used": true}
 
-``static``
-    int8 weights with a per-output-channel ``deq_scale``, and the activation
-    quantized with a fixed ``input_scale`` / ``input_offset`` pair recorded in the
-    checkpoint. msmodelslim emits this for some dense linears.
-
-A ``smooth_scale`` may additionally be folded into the activation quantizer of a
-``down_proj`` (SmoothQuant); the reference below keeps it optional.
+So there is a single flavour: int8 weights with an FP32 per-output-channel
+``weight_scale``, and the activation quantized per token at run time. ``group_size:
+0`` means per-channel rather than grouped. Every quantized weight also ships a
+``weight_offset``, but it is **all zero** — measured across three tensors of 12288,
+2048 and 4096 channels — so the weight quantization is symmetric and the loader
+reads and discards the offset. There is no static-activation path and no
+SmoothQuant vector in this checkpoint.
 """
 
 import torch
@@ -43,11 +42,11 @@ INT8_AMAX_EPS = 1e-4
 def _round_to_int8(scaled: torch.Tensor) -> torch.Tensor:
     """Round the way the device does: int32, then through fp16, then int8.
 
-    The clamp is a no-op on the amax-derived paths, where the scale bounds the
-    result by construction, but it is load-bearing for the static path: a
-    recorded ``input_scale`` cannot bound an activation that exceeds the
-    calibration range, and the bare int8 cast wraps rather than saturates, so
-    128 would become -128.
+    The clamp bounds the result at +/-127 rather than the int8 minimum of -128.
+    That is deliberate and symmetric, but it means this reference cannot reproduce
+    a checkpoint weight bit-exactly: about 0.003% of the elements of
+    ``layers.0.mlp.gate_proj.weight`` are exactly -128. It does not affect the
+    dequant path, since the stored ``weight_scale`` is what the kernel multiplies by.
     """
     rounded = torch.round(scaled).to(torch.int32)
     rounded = torch.clamp(rounded, -int(INT8_SCALE_MAX), int(INT8_SCALE_MAX))
@@ -92,15 +91,6 @@ def quantize_per_token_int8(
     return _round_to_int8(value * scale_quant), 1.0 / scale_quant
 
 
-def quantize_static_int8(
-    x: torch.Tensor,
-    input_scale: torch.Tensor,
-    input_offset: torch.Tensor,
-) -> torch.Tensor:
-    """Asymmetric per-tensor int8 activation quantization with a recorded scale."""
-    value = x.float() / input_scale.float() + input_offset.float()
-    return _round_to_int8(value)
-
 
 def int8_matmul(x_int8: torch.Tensor, weight_int8: torch.Tensor) -> torch.Tensor:
     """``[..., K] x [N, K] -> [..., N]`` int8 matmul accumulating in int32.
@@ -141,35 +131,6 @@ def w8a8_dynamic_linear(
     return result.to(out_dtype)
 
 
-def quant_bias(weight_int8: torch.Tensor, input_offset: torch.Tensor) -> torch.Tensor:
-    """Precompute the asymmetric-quantization correction for the static path.
-
-    With ``x_q = round(x / s + z)`` the int8 accumulator carries an extra
-    ``z * sum_k w_q[n, k]``, so the dequantised result needs
-    ``(acc - z * rowsum(w_q)) * deq_scale``. msmodelslim folds this into a
-    per-output-channel bias at conversion time; it is a weight-time quantity, not a
-    per-token one. Omitting it is a silent accuracy bug, not a crash.
-    """
-    return -input_offset.float() * weight_int8.to(torch.int32).sum(dim=-1).float()
-
-
-def w8a8_static_linear(
-    x: torch.Tensor,
-    weight_int8: torch.Tensor,
-    deq_scale: torch.Tensor,
-    input_scale: torch.Tensor,
-    input_offset: torch.Tensor,
-    bias: torch.Tensor | None = None,
-    out_dtype: torch.dtype = torch.bfloat16,
-) -> torch.Tensor:
-    """The msmodelslim static path: a recorded activation scale and offset."""
-    x_int8 = quantize_static_int8(x, input_scale, input_offset)
-    accumulator = int8_matmul(x_int8, weight_int8).float()
-    accumulator = accumulator + quant_bias(weight_int8, input_offset)
-    result = accumulator * deq_scale.float().reshape(-1)
-    if bias is not None:
-        result = result + bias.float()
-    return result.to(out_dtype)
 
 
 def dequant_swiglu_quant(
@@ -210,10 +171,7 @@ __all__ = [
     "int8_matmul",
     "quantize_per_channel_int8",
     "quantize_per_token_int8",
-    "quant_bias",
-    "quantize_static_int8",
     "w8a8_dynamic_linear",
-    "w8a8_static_linear",
 ]
 
 

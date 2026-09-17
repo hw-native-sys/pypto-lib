@@ -19,12 +19,13 @@ removes the usual DeepSeek MLA rope/nope split and every rope table with it.
     kv_pass  = kv_a_layernorm(kv_a_proj_with_mqa(x))      [T, 512]
 
 ``q_resid`` is also the indexer's input, so this kernel publishes it separately
-rather than fusing the whole prolog. ``q_a_proj``, ``q_b_proj`` and
-``kv_a_proj_with_mqa`` carry ``weight_scale_inv`` in the released checkpoint;
-whether the deployed msmodelslim W8A8 conversion keeps them INT8 or falls back to
-BF16 is the open question tracked with the weight loader — vLLM Ascend builds the
-whole MLA block with ``quant_config=None``, while the a2a3 sibling port keeps
-``wq_b`` INT8 and ``wq_a`` BF16.
+rather than fusing the whole prolog. **Every MLA projection is BF16.** The released FP8 checkpoint quantizes
+``q_a_proj``, ``q_b_proj``, ``kv_a_proj_with_mqa`` and ``o_proj`` blockwise, but the
+deployment checkpoint — ``Eco-Tech/GLM-5.3-Flash-w8a8`` on modelers.cn, which is
+what the 16-card A3 recipe serves — does not: its ``quant_model_description.json``
+marks all of them ``FLOAT``, and the shards confirm it (``q_b_proj.weight`` is BF16
+``[16384, 1536]``). W8A8_DYNAMIC in that checkpoint covers the FFN and nothing else.
+This differs from the a2a3 sibling port, which does keep its ``wq_b`` INT8
 
 **Prior art.** ``ops/pypto_python/impl/mla_prolog_pypto.py`` and its
 ``mla_prolog_quant_pypto.py`` sibling in cann-recipes-infer implement the MLA prolog
@@ -69,8 +70,7 @@ def mla_prolog(
     x: pl.Tensor[[T_DYN, D], pl.BF16],
     w_q_a: pl.Tensor[[Q_LORA, D], pl.BF16],
     q_a_norm_weight: pl.Tensor[[Q_LORA], pl.BF16],
-    w_q_b: pl.Tensor[[LOCAL_H * QK_DIM, Q_LORA], pl.INT8],
-    w_q_b_scale: pl.Tensor[[LOCAL_H * QK_DIM], pl.FP32],
+    w_q_b: pl.Tensor[[LOCAL_H * QK_DIM, Q_LORA], pl.BF16],
     w_kv_a: pl.Tensor[[KV_LORA, D], pl.BF16],
     kv_a_norm_weight: pl.Tensor[[KV_LORA], pl.BF16],
     q_resid: pl.Tensor[[T_DYN, Q_LORA], pl.BF16],

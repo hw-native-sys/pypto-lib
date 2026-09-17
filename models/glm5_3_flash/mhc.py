@@ -28,9 +28,11 @@ Two things differ and both change the ABI:
 
 The coefficients themselves stay FP32: the projection accumulates in FP32 and the
 two sigmoids, the softmax and all 20 Sinkhorn iterations must not be computed in
-BF16. Only ``function`` is stored BF16 — checkpoint shapes, read from the
-safetensors headers, are ``hc_{attn,ffn}_fn`` BF16 ``[24, 16384]``,
-``hc_{attn,ffn}_scale`` FP32 ``[3]`` and ``hc_{attn,ffn}_base`` FP32 ``[24]``.
+BF16. All three weights are stored BF16 in the deployment checkpoint, read from the
+shard headers: ``fn`` ``[24, 16384]``, ``base`` ``[24]`` and ``scale`` ``[3]``, so
+the loader upcasts ``scale`` and ``base`` before the coefficient maths. Note the
+checkpoint spells them ``layers.N.attn_hc.*`` and ``layers.N.ffn_hc.*``, not the
+``hc_attn_*`` / ``hc_ffn_*`` parameter names the reference implementation uses.
 
 **Prior art.** ``ops/pypto_python/impl/hc_pre_pypto.py`` in cann-recipes-infer is a
 pypto implementation of the hyper-connection pre-collapse on this hardware
