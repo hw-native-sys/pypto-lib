@@ -79,6 +79,7 @@ def prefill_cp_token_allgather_step(
                 src=hidden_local,
                 dst_offsets=[target_row, 0], src_offsets=[0, 0], shape=[local_t, D],
                 chunk_rows=COMM_ROW_TILE, chunk_cols=D,
+                pipeline=True,
             )
         for peer_tp in pl.range(TP_SIZE):
             if peer_tp != tp_rank:

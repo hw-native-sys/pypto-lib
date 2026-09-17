@@ -51,10 +51,7 @@ D_TILE = 256
 # and reduce fan-outs land at 48 tasks for a decode-forward tail (3 target layers
 # x MOE_TOKENS rows) instead of queueing four waves of short ones.
 D_SPMD = 2048
-# The same tail hands the cube one row block per 16 rows, which already fills the
-# cube array: splitting K again only adds tasks and atomic traffic. RMS_OK stops
-# at 8 because a narrower sq_part column falls under the 32 B reduction floor.
-LINEAR_OK = 1
+# Each sq_part column spans the 32 B reduction floor.
 RMS_OK = 8
 # Rows every stage pads its row count to, so the taller rms tile still lands
 # inside the shared sq_part / mixes_raw slabs.
@@ -103,32 +100,18 @@ def hc_head(
                 sq_sum = pl.add(sq_sum, pl.reshape(sq_col_tail, [1, RMS_T_TILE]))
         sq_part = pl.assemble(sq_part, sq_sum, [ok, t0])
 
-    # linear: split-K head projection, fanned over (row-block x K-slice); each task
-    # atomic-adds its [LINEAR_T_TILE, HC_PAD] FP32 partial into the seeded mixes_raw
+    # One writer per row block computes the complete head projection.
     mixes_raw = pl.create_tensor([t_linear, HC_PAD], dtype=pl.FP32)
-    with pl.spmd(
-        t_linear // LINEAR_T_TILE,
-        name_hint="hc_head_linear_seed",
-    ) as linear_seed_tid:
-        seed_block = pl.tile.get_block_idx()
-        seed_t0 = seed_block * LINEAR_T_TILE
-        mixes_raw[seed_t0 : seed_t0 + LINEAR_T_TILE, 0:HC_PAD] = pl.full(
-            [LINEAR_T_TILE, HC_PAD],
-            dtype=pl.FP32,
-            value=0.0,
-        )
     if linear_full_rows > 0:
         with pl.spmd(
-            (linear_full_rows // LINEAR_T_TILE) * LINEAR_OK,
+            linear_full_rows // LINEAR_T_TILE,
             name_hint="hc_head_linear",
-            deps=[linear_seed_tid],
         ) as _linear_tid:
             task = pl.tile.get_block_idx()
-            t0 = (task // LINEAR_OK) * LINEAR_T_TILE
-            k_base = (task % LINEAR_OK) * (HC_DIM // LINEAR_OK)
+            t0 = task * LINEAR_T_TILE
             acc_full = pl.create_tensor([LINEAR_T_TILE, HC_PAD], dtype=pl.FP32)
-            for kb in pl.pipeline(0, HC_DIM // LINEAR_OK // LINEAR_K_TILE, stage=2):
-                k0 = k_base + kb * LINEAR_K_TILE
+            for kb in pl.pipeline(0, HC_DIM // LINEAR_K_TILE, stage=2):
+                k0 = kb * LINEAR_K_TILE
                 x_lin_full = x_flat[t0 : t0 + LINEAR_T_TILE, k0 : k0 + LINEAR_K_TILE]
                 w_full = pl.slice(
                     hc_head_fn,
@@ -137,22 +120,19 @@ def hc_head(
                     valid_shape=[HC_MULT, LINEAR_K_TILE],
                 )
                 acc_full = pl.matmul_acc(acc_full, x_lin_full, w_full, b_trans=True, init_cond=(kb == 0))
-            mixes_raw = pl.assemble(mixes_raw, acc_full, [t0, 0], atomic=pl.AtomicType.Add)
+            mixes_raw = pl.assemble(mixes_raw, acc_full, [t0, 0])
 
     # At most one incomplete M=16 block exists. Keep it in a separate conditional
     # task so every aligned block above retains the original static-M Cube path.
     if linear_full_rows < t_dim:
-        with pl.spmd(
-            LINEAR_OK,
+        with pl.at(
+            level=pl.Level.CORE_GROUP,
             name_hint="hc_head_linear_tail",
-            deps=[linear_seed_tid],
-        ) as _linear_tail_tid:
-            tail_task = pl.tile.get_block_idx()
-            k_base = tail_task * (HC_DIM // LINEAR_OK)
+        ):
             tail_rows = t_dim - linear_full_rows
             acc_tail = pl.create_tensor([LINEAR_T_TILE, HC_PAD], dtype=pl.FP32)
-            for kb in pl.pipeline(0, HC_DIM // LINEAR_OK // LINEAR_K_TILE, stage=2):
-                k0 = k_base + kb * LINEAR_K_TILE
+            for kb in pl.pipeline(0, HC_DIM // LINEAR_K_TILE, stage=2):
+                k0 = kb * LINEAR_K_TILE
                 x_lin_tail = pl.slice(
                     x_flat,
                     [LINEAR_T_TILE, LINEAR_K_TILE],
@@ -170,7 +150,6 @@ def hc_head(
                 mixes_raw,
                 acc_tail,
                 [linear_full_rows, 0],
-                atomic=pl.AtomicType.Add,
             )
 
     # reduce: gate + hc mix, fanned over (token-tile x D-slice). The rsqrt/sigmoid gate is

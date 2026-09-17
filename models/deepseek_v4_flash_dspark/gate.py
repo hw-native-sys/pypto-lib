@@ -166,8 +166,9 @@ def gate(
     with pl.at(level=pl.Level.CORE_GROUP, name_hint="gate_pre_route"):
         for zt in pl.range(T):
             if zt >= active_tokens:
-                inactive_x_norm_f16 = pl.full([1, D], dtype=pl.FP16, value=0.0)
-                inactive_x_norm_i8 = pl.cast(inactive_x_norm_f16, target_type=pl.INT8, mode="trunc")
+                # Positive FP16 zero has zero bytes; no numeric conversion is needed.
+                inactive_x_norm_f16 = pl.full([1, D // 2], dtype=pl.FP16, value=0.0)
+                inactive_x_norm_i8 = pl.reinterpret_view(inactive_x_norm_f16, pl.INT8)
                 x_norm_i8[zt : zt + 1, :] = inactive_x_norm_i8
                 pl.write(x_norm_scale, [zt, 0], pl.cast(0.0, pl.FP32))
                 for zk in pl.range(TOPK):

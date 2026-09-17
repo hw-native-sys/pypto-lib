@@ -27,7 +27,7 @@ D = M.hidden_size
 HC_MULT = M.hc_mult
 
 # tiling
-HIDDEN_TILE = 512
+HIDDEN_TILE = 1024
 SPMD_BLOCKS = 48
 
 

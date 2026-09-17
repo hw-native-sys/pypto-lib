@@ -26,7 +26,7 @@ from config import (
     KV_ORI_BLOCK_NUM,
     TP,
 )
-from decode_o_proj import LOCAL_T_PAD
+from decode_o_proj import ATTENTION_PUBLISH_WORKERS, LOCAL_T_PAD
 from qkv_proj_rope import (
     kv_proj_rope,
     q_proj_rope,
@@ -319,55 +319,50 @@ def dspark_attention(
         o_packed_heads,
         [O_GROUPS * LOCAL_T_PAD * HEADS_PER_GROUP, HEAD_DIM],
     )
-    for merge_idx in pl.spmd(T * (H // H_TILE), name_hint="dspark_merge_norm"):
-        merge_token_idx = merge_idx // (H // H_TILE)
-        merge_head0 = (merge_idx % (H // H_TILE)) * H_TILE
-        merge_partial_row0 = merge_token_idx * H + merge_head0
-        running_max = sparse_mi[merge_partial_row0 : merge_partial_row0 + H_TILE, 0:1]
-        running_sum = sparse_li[merge_partial_row0 : merge_partial_row0 + H_TILE, 0:1]
-        running_out = sparse_oi[merge_partial_row0 : merge_partial_row0 + H_TILE, :]
-        sink_col = pl.reshape(attn_sink[merge_head0 : merge_head0 + H_TILE], [H_TILE, 1])
-        sink_exp = pl.exp(pl.sub(sink_col, running_max))
-        denominator = pl.add(running_sum, sink_exp)
-        attn_normed = pl.row_expand_div(running_out, denominator)
+    for merge_worker in pl.spmd(ATTENTION_PUBLISH_WORKERS, name_hint="dspark_merge_norm"):
+        # RoPE swap indices are identical for every token.
+        merge_swap_col = pl.load(rope_swap_idx, [0, 0], [1, ROPE_DIM])
+        merge_swap_offset = pl.add(pl.cast(merge_swap_col, target_type=pl.FP32), NOPE_DIM)
+        merge_swap_grid = pl.col_expand_add(
+            pl.tile.full([H_TILE, ROPE_DIM], dtype=pl.FP32, value=0.0), merge_swap_offset
+        )
+        merge_row_ids = pl.tile.arange(0, [1, H_TILE], dtype=pl.INT32)
+        merge_row_offsets = pl.reshape(
+            pl.mul(pl.cast(merge_row_ids, target_type=pl.FP32), HEAD_DIM), [H_TILE, 1]
+        )
+        merge_swap_flat = pl.row_expand_add(merge_swap_grid, merge_row_offsets)
+        merge_swap_indices = pl.cast(merge_swap_flat, target_type=pl.INT32)
+        merge_gather_tmp = pl.create_tile([H_TILE, ROPE_DIM], dtype=pl.INT32)
+        for merge_idx in pl.range(merge_worker, T * (H // H_TILE), ATTENTION_PUBLISH_WORKERS):
+            merge_token_idx = merge_idx // (H // H_TILE)
+            merge_head0 = (merge_idx % (H // H_TILE)) * H_TILE
+            merge_partial_row0 = merge_token_idx * H + merge_head0
+            running_max = pl.load(sparse_mi, [merge_partial_row0, 0], [H_TILE, 1])
+            running_sum = pl.load(sparse_li, [merge_partial_row0, 0], [H_TILE, 1])
+            running_out = pl.load(sparse_oi, [merge_partial_row0, 0], [H_TILE, HEAD_DIM])
+            sink_col = pl.load(attn_sink_col, [merge_head0, 0], [H_TILE, 1])
+            sink_exp = pl.exp(pl.sub(sink_col, running_max))
+            denominator = pl.add(running_sum, sink_exp)
+            attn_normed = pl.row_expand_div(running_out, denominator)
 
-        attn_normed_bf16 = pl.cast(attn_normed, target_type=pl.BF16, mode="rint")
-        attn_nope = attn_normed_bf16[:, 0:NOPE_DIM]
-        attn_rope = attn_normed[:, NOPE_DIM:HEAD_DIM]
-        rope_even = pl.gather(attn_rope, mask_pattern=pl.tile.MaskPattern.P0101)
-        rope_odd = pl.gather(attn_rope, mask_pattern=pl.tile.MaskPattern.P1010)
-        cos_half = freqs_cos_local[
-            merge_token_idx : merge_token_idx + 1, 0:ROPE_HALF
-        ]
-        sin_half = freqs_sin_local[
-            merge_token_idx : merge_token_idx + 1, 0:ROPE_HALF
-        ]
-        cos_fp32 = pl.cast(cos_half, target_type=pl.FP32, mode="none")
-        sin_fp32 = pl.cast(sin_half, target_type=pl.FP32, mode="none")
-        inverse_even_cos = pl.col_expand_mul(rope_even, cos_fp32)
-        inverse_odd_sin = pl.col_expand_mul(rope_odd, sin_fp32)
-        inverse_even = pl.add(inverse_even_cos, inverse_odd_sin)
-        inverse_even_sin = pl.col_expand_mul(rope_even, sin_fp32)
-        inverse_odd_cos = pl.col_expand_mul(rope_odd, cos_fp32)
-        inverse_odd = pl.sub(inverse_odd_cos, inverse_even_sin)
-        inverse_rope = pl.full([H_TILE, ROPE_DIM], dtype=pl.FP32, value=0.0)
-        inverse_rope = pl.tensor.scatter(inverse_even, mask_pattern=pl.tile.MaskPattern.P0101, dst=inverse_rope)
-        inverse_rope = pl.tensor.scatter(inverse_odd, mask_pattern=pl.tile.MaskPattern.P1010, dst=inverse_rope)
-        inverse_rope_bf16 = pl.cast(inverse_rope, target_type=pl.BF16, mode="rint")
-        for merge_group in pl.unroll(H_TILE // HEADS_PER_GROUP):
-            group = merge_head0 // HEADS_PER_GROUP + merge_group
-            group_head = merge_group * HEADS_PER_GROUP
-            packed_row = (group * LOCAL_T_PAD + merge_token_idx) * HEADS_PER_GROUP
-            o_packed_flat[
-                packed_row : packed_row + HEADS_PER_GROUP, 0:NOPE_DIM
-            ] = attn_nope[
-                group_head : group_head + HEADS_PER_GROUP, 0:NOPE_DIM
-            ]
-            o_packed_flat[
-                packed_row : packed_row + HEADS_PER_GROUP, NOPE_DIM:HEAD_DIM
-            ] = inverse_rope_bf16[
-                group_head : group_head + HEADS_PER_GROUP, 0:ROPE_DIM
-            ]
+            attn_normed_bf16 = pl.cast(attn_normed, target_type=pl.BF16, mode="rint")
+            attn_nope = attn_normed_bf16[:, 0:NOPE_DIM]
+            attn_rope = attn_normed[:, NOPE_DIM:HEAD_DIM]
+            rope_swapped = pl.tile.gather(attn_normed, merge_swap_indices, merge_gather_tmp)
+            cos_fp32 = pl.load(rope_cos_il, [merge_token_idx, 0], [1, ROPE_DIM])
+            sin_signed = pl.load(rope_sin_signed, [merge_token_idx, 0], [1, ROPE_DIM])
+            inverse_cos = pl.col_expand_mul(attn_rope, cos_fp32)
+            inverse_sin = pl.col_expand_mul(rope_swapped, sin_signed)
+            inverse_rope = pl.sub(inverse_cos, inverse_sin)
+            inverse_rope_bf16 = pl.cast(inverse_rope, target_type=pl.BF16, mode="rint")
+            for merge_group in pl.unroll(H_TILE // HEADS_PER_GROUP):
+                group = merge_head0 // HEADS_PER_GROUP + merge_group
+                group_head = merge_group * HEADS_PER_GROUP
+                packed_row = (group * LOCAL_T_PAD + merge_token_idx) * HEADS_PER_GROUP
+                packed_nope = pl.slice(attn_nope, [HEADS_PER_GROUP, NOPE_DIM], [group_head, 0])
+                packed_rope = pl.slice(inverse_rope_bf16, [HEADS_PER_GROUP, ROPE_DIM], [group_head, 0])
+                pl.store(packed_nope, [packed_row, 0], o_packed_flat)
+                pl.store(packed_rope, [packed_row, NOPE_DIM], o_packed_flat)
 
     return kv_cache, o_packed_heads
 

@@ -33,7 +33,7 @@ SWIGLU_LIMIT = M.swiglu_limit
 # tiling
 SH_M_TILE = 64
 SH_ROW_PAD = 8
-SH_ROWS_PER_BLOCK = 8
+SH_ROWS_PER_BLOCK = 2
 T_PAD = ((T + SH_M_TILE - 1) // SH_M_TILE) * SH_M_TILE
 # Decode (T <= SH_M_TILE, single partial block) or prefill (T a multiple of
 # SH_M_TILE, fully valid blocks); a T that is neither would need a dynamic
