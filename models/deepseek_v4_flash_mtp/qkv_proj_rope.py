@@ -1201,6 +1201,8 @@ if __name__ == "__main__":
     parser.add_argument("--runtime-dir", type=str, default=None)
     parser.add_argument("--golden-data", type=str, default=None)
     parser.add_argument("--compile-only", action="store_true", default=False)
+    parser.add_argument("--golden-only", action="store_true", default=False,
+                        help="compute and persist the golden, then stop before the device run")
     parser.add_argument("--dump-passes", action="store_true", default=False)
     args = parser.parse_args()
 
@@ -1233,6 +1235,7 @@ if __name__ == "__main__":
                 enable_chip_swimlane=args.enable_chip_swimlane,
             ),
             compile_only=args.compile_only,
+            golden_only=args.golden_only,
         )
         if not result.passed:
             if result.error:

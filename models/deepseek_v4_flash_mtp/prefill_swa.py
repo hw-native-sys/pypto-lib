@@ -1597,6 +1597,12 @@ if __name__ == "__main__" and _run_cp_fixture:
         default=None,
         help="directory containing cached in/ and out/ tensors",
     )
+    parser.add_argument(
+        "--golden-only",
+        action="store_true",
+        default=False,
+        help="compute and persist the golden, then stop before the device run",
+    )
     parser.add_argument("--cp", type=int, default=CP_SIZE, choices=list(CP_CHOICES))
     parser.add_argument("--num-tokens", type=int, default=None, help="actual request length; defaults to full capacity")
     parser.add_argument("--prefix", type=int, default=0,
@@ -1619,6 +1625,7 @@ if __name__ == "__main__" and _run_cp_fixture:
         golden_data=args.golden_data,
         save_data=args.save_data,
         compile_only=args.compile_only,
+        golden_only=args.golden_only,
         config=dict(
             distributed_config=DistributedConfig(device_ids=device_ids[:args.cp], num_sub_workers=0),
             dump_passes=args.dump_passes,

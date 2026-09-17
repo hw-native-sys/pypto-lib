@@ -651,6 +651,8 @@ if __name__ == "__main__":
     )
     parser.add_argument("-d", "--device", type=int, default=0)
     parser.add_argument("--compile-only", action="store_true", default=False)
+    parser.add_argument("--golden-only", action="store_true", default=False,
+                        help="compute and persist the golden, then stop before the device run")
     parser.add_argument("--enable-chip-swimlane", type=int, nargs="?", const=1, default=0, choices=range(5))
     parser.add_argument("--temperature", type=float, default=None)
     parser.add_argument("--top-k", type=int, default=None)
@@ -667,6 +669,7 @@ if __name__ == "__main__":
         golden_data=args.golden_data,
         save_data=args.save_data,
         compile_only=args.compile_only,
+        golden_only=args.golden_only,
         config=dict(
             platform=args.platform,
             device_id=args.device,

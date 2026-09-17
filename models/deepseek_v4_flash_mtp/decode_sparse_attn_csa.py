@@ -788,6 +788,8 @@ if __name__ == "__main__":
     parser.add_argument("--cache-window-replacement-fixture", action="store_true", default=False,
                         help="Place a sentinel row inside the cache window prefix.")
     parser.add_argument("--golden-data", type=str, default=None)
+    parser.add_argument("--golden-only", action="store_true", default=False,
+                        help="compute and persist the golden, then stop before the device run")
     parser.add_argument("--enable-chip-swimlane", type=int, nargs="?", const=1, default=0, choices=range(5))
     parser.add_argument("--enable-dep-gen", action="store_true", default=False,
                         help="Capture PTO2 dependency edges (deps.json) for the swimlane converter.")
@@ -807,6 +809,7 @@ if __name__ == "__main__":
         ),
         golden_fn=golden_sparse_attn,
         golden_data=args.golden_data,
+        golden_only=args.golden_only,
         config=dict(
             dump_passes=args.dump_passes,
             platform=args.platform,

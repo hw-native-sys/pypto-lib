@@ -893,6 +893,8 @@ if __name__ == "__main__":
     parser.add_argument("--dump-passes", action="store_true", default=False)
     parser.add_argument("--save-data", action="store_true", default=False)
     parser.add_argument("--golden-data", type=str, default=None)
+    parser.add_argument("--golden-only", action="store_true", default=False,
+                        help="compute and persist the golden, then stop before the device run")
     args = parser.parse_args()
 
     result = run(
@@ -900,6 +902,7 @@ if __name__ == "__main__":
         specs=build_tensor_specs(),
         golden_fn=golden_expert_routed,
         golden_data=args.golden_data,
+        golden_only=args.golden_only,
         save_data=args.save_data,
         config=dict(
             dump_passes=args.dump_passes,

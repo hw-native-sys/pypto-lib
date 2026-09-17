@@ -1682,6 +1682,8 @@ def main():
     parser.add_argument("--enable-dep-gen", action="store_true", default=False)
     parser.add_argument("--dump-args", type=int, nargs="?", const=1, default=0, choices=(0, 1, 2, 3))
     parser.add_argument("--compile-only", action="store_true", default=False)
+    parser.add_argument("--golden-only", action="store_true", default=False,
+                        help="compute and persist the golden, then stop before the device run")
     parser.add_argument("--dump-passes", action="store_true", default=False)
     parser.add_argument("--runtime-dir", type=str, default=None)
     parser.add_argument("--weights", type=str, default=None,
@@ -1768,6 +1770,7 @@ def main():
         rtol=1e-2,
         atol=1e-2,
         compile_only=args.compile_only,
+        golden_only=args.golden_only,
         runtime_dir=args.runtime_dir,
         golden_data=args.golden_data,
         save_data=args.save_data,
