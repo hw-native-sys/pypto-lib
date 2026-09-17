@@ -90,7 +90,10 @@ jobs:
 
           for command in (["task-submit", "--maintenance", "status"],
                           ["task-submit", "--devices", "status"],
-                          ["task-submit", "--list"], ["npu-smi", "info"]):
+                          ["task-submit", "--list"], ["npu-smi", "info"],
+                          ["npu-smi", "info", "-t", "health", "-i", "2", "-c", "0"],
+                          ["npu-smi", "info", "-t", "proc-mem", "-i", "2", "-c", "0"],
+                          ["npu-smi", "info", "-t", "op-timeout", "-i", "2", "-c", "0"]):
               result = subprocess.run(command, capture_output=True, text=True, timeout=30)
               text = re.sub(r"\x1b\[[0-9;]*m", "", result.stdout)
               print(f"Read-only command: {command}; exit={result.returncode}", flush=True)
@@ -105,6 +108,37 @@ jobs:
                   print(text[-14000:], flush=True)
               if result.stderr:
                   print(result.stderr[-2000:], flush=True)
+
+          # Read bounded device-log excerpts from the failed run's time window.
+          # Never read task environment snapshots or other tasks' commands.
+          since = datetime.datetime(2026, 9, 17, 0, 55, tzinfo=datetime.timezone.utc).timestamp()
+          window = re.compile(r"2026-09-17[- T](?:01|09):0[5-9]:")
+          errors = re.compile(r"507034|timeout|exception|fault|\berror\b|\[ERROR\]", re.I)
+          log_roots = [Path.home() / "ascend/log", Path("/root/ascend/log"), Path("/var/log/npu/slog")]
+          for log_root in log_roots:
+              print(f"Device log root: {log_root}", flush=True)
+              try:
+                  candidates = []
+                  deadline = time.monotonic() + 10
+                  for index, path in enumerate(log_root.rglob("*")):
+                      if index >= 5000 or time.monotonic() >= deadline:
+                          print("Log discovery limit reached", flush=True)
+                          break
+                      if path.is_file() and not path.is_symlink() and ".log" in path.name:
+                          modified = path.stat().st_mtime
+                          if modified >= since:
+                              candidates.append((modified, path))
+                  print(f"Recent log candidates: {len(candidates)}", flush=True)
+                  for _, path in sorted(candidates, key=lambda item: item[0], reverse=True)[:40]:
+                      with path.open("rb") as stream:
+                          stream.seek(max(0, path.stat().st_size - 65536))
+                          lines = stream.read(65536).decode(errors="replace").splitlines()
+                      matches = [line[:1500] for line in lines if window.search(line) and errors.search(line)]
+                      if matches:
+                          print(f"Device error log: {path}", flush=True)
+                          print("\n".join(matches[-25:]), flush=True)
+              except OSError as error:
+                  print(f"Device log access: {type(error).__name__}: {error}", flush=True)
 
           selected = []
           checkout = runner_root / "_work/pypto-lib/pypto-lib/operator-checkout"
