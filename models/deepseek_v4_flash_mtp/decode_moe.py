@@ -777,6 +777,11 @@ def build_tensor_specs(layer_id=0, num_tokens=None, balanced_routing=False):
     ROUTED_DEQUANT_STD = {"w1": 1.08e-2, "w2": 2.54e-2, "w3": 1.10e-2}
     SHARED_DEQUANT_STD = {"w1": 7.65e-3, "w2": 2.39e-2, "w3": 7.39e-3}
 
+    rank_routes = max(0, min(T, num_tokens)) * TOPK
+    if balanced_routing:
+        assert layer_id < M.num_hash_layers, "balanced routing requires a hash-routing layer"
+        assert rank_routes % N_RANKS == 0, "balanced routing requires per-rank active routes divisible by ranks"
+
     # Shared (replicated) weights are broadcast across ranks; the routed
     # weights are per-rank shards.
     def init_x_hc():
@@ -814,11 +819,28 @@ def build_tensor_specs(layer_id=0, num_tokens=None, balanced_routing=False):
         x = torch.zeros(N_EXPERTS_GLOBAL)
         return x.unsqueeze(0).expand(N_RANKS, -1).contiguous()
 
+    def balanced_eids():
+        # Route slot t * TOPK + k of source r goes to rank (slot + r) % N_RANKS,
+        # so every token fans out to min(TOPK, N_RANKS) ranks and each source
+        # sends every rank the same route count. Source r fills local experts
+        # [r * block, (r + 1) * block) on every rank; the sources tile the
+        # local experts in turn, so expert loads differ by at most one route.
+        route_slots = torch.arange(T * TOPK, dtype=torch.int64)
+        block = rank_routes // N_RANKS
+        eids = torch.empty(N_RANKS, T * TOPK, dtype=torch.int64)
+        for r in range(N_RANKS):
+            dst = (route_slots + r) % N_RANKS
+            local_expert = (route_slots // N_RANKS + block * r) % N_LOCAL
+            eids[r] = dst * N_LOCAL + local_expert
+        return eids.reshape(N_RANKS * T, TOPK)
+
     def init_tid2eid():
         if balanced_routing:
             token_ids = torch.arange(VOCAB, dtype=torch.int64).unsqueeze(1)
             topk_slots = torch.arange(TOPK, dtype=torch.int64).unsqueeze(0)
             x = (token_ids * TOPK + topk_slots) % N_EXPERTS_GLOBAL
+            # Token id r * T + t is source r's token t.
+            x[:N_RANKS * T] = balanced_eids()
             return x.to(torch.int32).unsqueeze(0).expand(N_RANKS, -1, -1).contiguous()
         # Distinct experts per token (sample without replacement).
         x = torch.argsort(torch.rand(VOCAB, N_EXPERTS_GLOBAL), dim=1)[:, :TOPK].to(torch.int32)
@@ -826,18 +848,12 @@ def build_tensor_specs(layer_id=0, num_tokens=None, balanced_routing=False):
 
     def init_input_ids():
         if balanced_routing:
-            # Active tokens across ranks consume consecutive tid2eid rows, making
-            # their route ids one contiguous round-robin sequence over experts.
-            rank_starts = torch.arange(N_RANKS, dtype=torch.int64).unsqueeze(1) * num_tokens
+            # Source r's tokens own tid2eid rows r * T .. r * T + T - 1.
+            rank_starts = torch.arange(N_RANKS, dtype=torch.int64).unsqueeze(1) * T
             token_offsets = torch.arange(T, dtype=torch.int64).unsqueeze(0)
             return rank_starts + token_offsets
         # Distinct per-rank token streams.
         return torch.randint(0, VOCAB, (N_RANKS, T), dtype=torch.int64)
-
-    if balanced_routing:
-        assert layer_id < M.num_hash_layers, "balanced routing requires a hash-routing layer"
-        active_routes = N_RANKS * max(0, min(T, num_tokens)) * TOPK
-        assert active_routes % N_EXPERTS_GLOBAL == 0, "balanced routing requires active routes divisible by experts"
 
     # Per-rank routed expert weights (different shards).
     routed_w1_i8_list = []
@@ -941,7 +957,7 @@ if __name__ == "__main__":
     )
     parser.add_argument(
         "--balanced-routing", action="store_true", default=False,
-        help="use deterministic hash routes balanced evenly across all experts",
+        help="use deterministic hash routes with uniform per-rank-pair dispatch volume",
     )
     parser.add_argument("--enable-chip-swimlane", type=int, nargs="?", const=1, default=0, choices=range(5))
     parser.add_argument("--compile-only", action="store_true", default=False)
