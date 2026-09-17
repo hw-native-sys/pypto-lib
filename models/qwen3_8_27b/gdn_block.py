@@ -121,7 +121,7 @@ def build_kernel(t: int = T, h: int = H, hg: int = HG, d: int = D, chunk: int = 
         w_out_scale: pl.Tensor[[c], pl.FP32],
         tril: pl.Tensor[[chunk, chunk], pl.FP32],
         mask_strict: pl.Tensor[[chunk, chunk], pl.FP32],
-        neg_eye2: pl.Tensor[[2 * chunk, chunk], pl.FP16],
+        eye: pl.Tensor[[chunk, chunk], pl.FP16],
         m_diag: pl.Tensor[[chunk, chunk], pl.FP16],
         m_low: pl.Tensor[[chunk, chunk], pl.FP16],
         out: pl.Out[pl.Tensor[[t, c], pl.BF16]],
@@ -160,7 +160,7 @@ def build_kernel(t: int = T, h: int = H, hg: int = HG, d: int = D, chunk: int = 
         op_qkng(q_conv, k_conv, a_proj, b_proj, a_log, dt_bias, q_n, k_n, beta, g)
 
         o = pl.create_tensor([t, h, d], dtype=pl.FP16)
-        op_delta(q_n, k_n, v_conv, g, beta, tril, mask_strict, neg_eye2,
+        op_delta(q_n, k_n, v_conv, g, beta, tril, mask_strict, eye,
                  m_diag, m_low, o)
 
         y_q = pl.create_tensor([t, cv], dtype=pl.INT8)
@@ -228,8 +228,8 @@ def build_tensor_specs(t: int = T, h: int = H, hg: int = HG, d: int = D,
         TensorSpec("w_out_scale", [C], torch.float32, init_value=w_out_scale),
         TensorSpec("tril", [chunk, chunk], torch.float32, init_value=init_tril),
         TensorSpec("mask_strict", [chunk, chunk], torch.float32, init_value=init_mask_strict),
-        TensorSpec("neg_eye2", [2 * chunk, chunk], torch.float16,
-                   init_value=lambda: solve_tril.neg_eye_stack(chunk)),
+        TensorSpec("eye", [chunk, chunk], torch.float16,
+                   init_value=lambda: solve_tril.eye_block(chunk)),
         TensorSpec("m_diag", [chunk, chunk], torch.float16,
                    init_value=lambda: solve_tril.blk_masks(chunk)[0]),
         TensorSpec("m_low", [chunk, chunk], torch.float16,

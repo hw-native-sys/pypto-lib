@@ -78,7 +78,7 @@ def _random_specs(stage, specs):
     outputs = OUTPUTS[stage] if stage in OUTPUTS else importlib.import_module(stage).OUTPUTS
     # Constants, not data: randomising these would have solve_tril contract against a
     # random matrix instead of -I, and leave the strict causal mask non-triangular.
-    leave_alone = set(outputs) | {"mask", "mask_strict", "tril", "neg_eye2",
+    leave_alone = set(outputs) | {"mask", "mask_strict", "tril", "eye",
                                   "m_diag", "m_low"}
     out = []
     for spec in specs:
