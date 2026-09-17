@@ -201,83 +201,104 @@ def kda_conv_prefill(
         e = pl.cast(pl.read(query_start_loc, [b + 1]), pl.INDEX)
         row = pl.cast(pl.read(state_rows, [b]), pl.INDEX)
         length = e - s
+        # An empty request is legal: query_start_loc is cumulative, and equal adjacent
+        # offsets mean a request contributed no tokens -- the reference skips those.
+        # The row masks below already write nothing in that case, but the token reads
+        # still happen, and for a trailing empty request s equals the token count, so
+        # they would run past the end of the packed stream. Skip the body instead.
+        if length > 0:
 
-        # full[k] is conv_state[row, k] for k < STATE_LEN and mixed_qkv[s + k - STATE_LEN]
-        # otherwise. Written straight through rather than looped: a pl iterator's index
-        # is a Scalar, so it cannot drive the trace-time choice between the two sources.
-        st0 = pl.cast(pl.reshape(pl.slice(conv_state, [1, 1, C_TILE], [row, 0, c0], drop_dims=[0]),
-                                 [1, C_TILE]), pl.FP32)
-        st1 = pl.cast(pl.reshape(pl.slice(conv_state, [1, 1, C_TILE], [row, 1, c0], drop_dims=[0]),
-                                 [1, C_TILE]), pl.FP32)
-        st2 = pl.cast(pl.reshape(pl.slice(conv_state, [1, 1, C_TILE], [row, 2, c0], drop_dims=[0]),
-                                 [1, C_TILE]), pl.FP32)
-        # k - STATE_LEN <= u < length whenever the row below is written, so these reads
-        # stay inside the request.
-        x0 = pl.cast(pl.slice(mixed_qkv, [1, C_TILE], [s, c0]), pl.FP32)
-        x1 = pl.cast(pl.slice(mixed_qkv, [1, C_TILE], [pl.min(s + 1, e - 1), c0]), pl.FP32)
-        x2 = pl.cast(pl.slice(mixed_qkv, [1, C_TILE], [pl.min(s + 2, e - 1), c0]), pl.FP32)
-        w0 = pl.cast(weight[0:1, c0 : c0 + C_TILE], pl.FP32)
-        w1 = pl.cast(weight[1:2, c0 : c0 + C_TILE], pl.FP32)
-        w2 = pl.cast(weight[2:3, c0 : c0 + C_TILE], pl.FP32)
-        w3 = pl.cast(weight[3:4, c0 : c0 + C_TILE], pl.FP32)
+            # full[k] is conv_state[row, k] for k < STATE_LEN and mixed_qkv[s + k - STATE_LEN]
+            # otherwise. Written straight through rather than looped: a pl iterator's index
+            # is a Scalar, so it cannot drive the trace-time choice between the two sources.
+            st0 = pl.cast(pl.reshape(pl.slice(conv_state, [1, 1, C_TILE], [row, 0, c0], drop_dims=[0]),
+                                     [1, C_TILE]), pl.FP32)
+            st1 = pl.cast(pl.reshape(pl.slice(conv_state, [1, 1, C_TILE], [row, 1, c0], drop_dims=[0]),
+                                     [1, C_TILE]), pl.FP32)
+            st2 = pl.cast(pl.reshape(pl.slice(conv_state, [1, 1, C_TILE], [row, 2, c0], drop_dims=[0]),
+                                     [1, C_TILE]), pl.FP32)
+            # k - STATE_LEN <= u < length whenever the row below is written, so these reads
+            # stay inside the request.
+            x0 = pl.cast(pl.slice(mixed_qkv, [1, C_TILE], [s, c0]), pl.FP32)
+            x1 = pl.cast(pl.slice(mixed_qkv, [1, C_TILE], [pl.min(s + 1, e - 1), c0]), pl.FP32)
+            x2 = pl.cast(pl.slice(mixed_qkv, [1, C_TILE], [pl.min(s + 2, e - 1), c0]), pl.FP32)
+            w0 = pl.cast(weight[0:1, c0 : c0 + C_TILE], pl.FP32)
+            w1 = pl.cast(weight[1:2, c0 : c0 + C_TILE], pl.FP32)
+            w2 = pl.cast(weight[2:3, c0 : c0 + C_TILE], pl.FP32)
+            w3 = pl.cast(weight[3:4, c0 : c0 + C_TILE], pl.FP32)
 
-        # out[u] = sum_j w[j] * full[u + j]
-        acc0 = pl.add(pl.add(pl.mul(st0, w0), pl.mul(st1, w1)),
-                      pl.add(pl.mul(st2, w2), pl.mul(x0, w3)))
-        acc1 = pl.add(pl.add(pl.mul(st1, w0), pl.mul(st2, w1)),
-                      pl.add(pl.mul(x0, w2), pl.mul(x1, w3)))
-        acc2 = pl.add(pl.add(pl.mul(st2, w0), pl.mul(x0, w1)),
-                      pl.add(pl.mul(x1, w2), pl.mul(x2, w3)))
+            # out[u] = sum_j w[j] * full[u + j]
+            acc0 = pl.add(pl.add(pl.mul(st0, w0), pl.mul(st1, w1)),
+                          pl.add(pl.mul(st2, w2), pl.mul(x0, w3)))
+            acc1 = pl.add(pl.add(pl.mul(st1, w0), pl.mul(st2, w1)),
+                          pl.add(pl.mul(x0, w2), pl.mul(x1, w3)))
+            acc2 = pl.add(pl.add(pl.mul(st2, w0), pl.mul(x0, w1)),
+                          pl.add(pl.mul(x1, w2), pl.mul(x2, w3)))
 
-        # SiLU and the masked stores, one row at a time. A request shorter than the
-        # window leaves the later rows with zero valid rows, so nothing is written.
-        act0 = pl.mul(acc0, pl.recip(pl.add(pl.exp(pl.neg(acc0)), 1.0)))
-        act1 = pl.mul(acc1, pl.recip(pl.add(pl.exp(pl.neg(acc1)), 1.0)))
-        act2 = pl.mul(acc2, pl.recip(pl.add(pl.exp(pl.neg(acc2)), 1.0)))
-        v0 = pl.min(pl.max(length, 0), 1)
-        v1 = pl.min(pl.max(length - 1, 0), 1)
-        v2 = pl.min(pl.max(length - 2, 0), 1)
-        o0 = pl.set_validshape(pl.cast(act0, pl.BF16, mode="rint"), v0, C_TILE)
-        o1 = pl.set_validshape(pl.cast(act1, pl.BF16, mode="rint"), v1, C_TILE)
-        o2 = pl.set_validshape(pl.cast(act2, pl.BF16, mode="rint"), v2, C_TILE)
-        # The destination is chosen by writing in each branch, not by rebinding a name
-        # to a different tensor: an IfStmt's in-place return must yield one backing
-        # value, and three different tensors cannot be unified into it.
-        if c0 < LOCAL_KDA_QKV_DIM:
-            q_flat[s : s + 1, c0 : c0 + C_TILE] = o0
-            q_flat[s + 1 : s + 2, c0 : c0 + C_TILE] = o1
-            q_flat[s + 2 : s + 3, c0 : c0 + C_TILE] = o2
-        elif c0 < 2 * LOCAL_KDA_QKV_DIM:
-            kc0 = c0 - LOCAL_KDA_QKV_DIM
-            k_flat[s : s + 1, kc0 : kc0 + C_TILE] = o0
-            k_flat[s + 1 : s + 2, kc0 : kc0 + C_TILE] = o1
-            k_flat[s + 2 : s + 3, kc0 : kc0 + C_TILE] = o2
-        else:
-            vc0 = c0 - 2 * LOCAL_KDA_QKV_DIM
-            v_flat[s : s + 1, vc0 : vc0 + C_TILE] = o0
-            v_flat[s + 1 : s + 2, vc0 : vc0 + C_TILE] = o1
-            v_flat[s + 2 : s + 3, vc0 : vc0 + C_TILE] = o2
+            # SiLU and the masked stores, one row at a time. A request shorter than the
+            # window leaves the later rows with zero valid rows, so nothing is written.
+            act0 = pl.mul(acc0, pl.recip(pl.add(pl.exp(pl.neg(acc0)), 1.0)))
+            act1 = pl.mul(acc1, pl.recip(pl.add(pl.exp(pl.neg(acc1)), 1.0)))
+            act2 = pl.mul(acc2, pl.recip(pl.add(pl.exp(pl.neg(acc2)), 1.0)))
+            v0 = pl.min(pl.max(length, 0), 1)
+            v1 = pl.min(pl.max(length - 1, 0), 1)
+            v2 = pl.min(pl.max(length - 2, 0), 1)
+            o0 = pl.set_validshape(pl.cast(act0, pl.BF16, mode="rint"), v0, C_TILE)
+            o1 = pl.set_validshape(pl.cast(act1, pl.BF16, mode="rint"), v1, C_TILE)
+            o2 = pl.set_validshape(pl.cast(act2, pl.BF16, mode="rint"), v2, C_TILE)
+            # The destination is chosen by writing in each branch, not by rebinding a name
+            # to a different tensor: an IfStmt's in-place return must yield one backing
+            # value, and three different tensors cannot be unified into it.
+            if c0 < LOCAL_KDA_QKV_DIM:
+                q_flat[s : s + 1, c0 : c0 + C_TILE] = o0
+                q_flat[s + 1 : s + 2, c0 : c0 + C_TILE] = o1
+                q_flat[s + 2 : s + 3, c0 : c0 + C_TILE] = o2
+            elif c0 < 2 * LOCAL_KDA_QKV_DIM:
+                kc0 = c0 - LOCAL_KDA_QKV_DIM
+                k_flat[s : s + 1, kc0 : kc0 + C_TILE] = o0
+                k_flat[s + 1 : s + 2, kc0 : kc0 + C_TILE] = o1
+                k_flat[s + 2 : s + 3, kc0 : kc0 + C_TILE] = o2
+            else:
+                vc0 = c0 - 2 * LOCAL_KDA_QKV_DIM
+                v_flat[s : s + 1, vc0 : vc0 + C_TILE] = o0
+                v_flat[s + 1 : s + 2, vc0 : vc0 + C_TILE] = o1
+                v_flat[s + 2 : s + 3, vc0 : vc0 + C_TILE] = o2
 
-        # New state row i is full[length + i]: the old state's tail when the request is
-        # shorter than the window, the stream's last rows otherwise. Selected by two
-        # writes whose row counts are complementary, not by an arithmetic blend: the
-        # condition is an index scalar, and index-to-float casts are not supported.
-        # A write with zero valid rows stores nothing, so exactly one of each pair lands.
-        # Both reads are clamped, so the side that is not stored is still in bounds.
-        for i in pl.unroll(STATE_LEN):
-            old_idx = pl.min(length + i, STATE_LEN - 1)
-            new_idx = pl.max(e - STATE_LEN + i, s)
-            keep_old = pl.min(pl.max(STATE_LEN - length - i, 0), 1)
-            take_new = pl.min(pl.max(length + i - STATE_LEN + 1, 0), 1)
-            # set_validshape takes a 2D tile, so the row count is declared before the
-            # reshape to the state's rank-3 view.
-            old_row = pl.reshape(pl.slice(conv_state, [1, 1, C_TILE], [row, old_idx, c0],
-                                          drop_dims=[0]), [1, C_TILE])
-            new_row = pl.slice(mixed_qkv, [1, C_TILE], [new_idx, c0])
-            conv_state[row : row + 1, i : i + 1, c0 : c0 + C_TILE] = pl.reshape(
-                pl.set_validshape(old_row, keep_old, C_TILE), [1, 1, C_TILE])
-            conv_state[row : row + 1, i : i + 1, c0 : c0 + C_TILE] = pl.reshape(
-                pl.set_validshape(new_row, take_new, C_TILE), [1, 1, C_TILE])
+            # New state row i is full[length + i]: the old state's tail when the request is
+            # shorter than the window, the stream's last rows otherwise. Selected by two
+            # writes whose row counts are complementary, not by an arithmetic blend: the
+            # condition is an index scalar, and index-to-float casts are not supported.
+            # A write with zero valid rows stores nothing, so exactly one of each pair lands.
+            # Both reads are clamped, so the side that is not stored is still in bounds.
+            # New state row i is full[length + i]: the old state's tail when the
+            # request is shorter than the window, the stream's last rows otherwise.
+            # Selected by two writes whose row counts are complementary, not by an
+            # arithmetic blend: the condition is an index scalar, and index-to-float
+            # casts are not supported. A write with zero valid rows stores nothing, so
+            # exactly one of each pair lands. Both reads are clamped, so the side that
+            # is not stored is still in bounds.
+            #
+            # Row STATE_LEN - 1 is written out separately because its old-state branch
+            # is dead for every non-empty request -- length + i is then at least
+            # STATE_LEN -- and a view the compiler can prove empty is rejected.
+            for i in pl.unroll(STATE_LEN - 1):
+                old_idx = pl.min(length + i, STATE_LEN - 1)
+                new_idx = pl.max(e - STATE_LEN + i, s)
+                keep_old = pl.min(pl.max(STATE_LEN - length - i, 0), 1)
+                take_new = pl.min(pl.max(length + i - STATE_LEN + 1, 0), 1)
+                old_row = pl.reshape(pl.slice(conv_state, [1, 1, C_TILE], [row, old_idx, c0],
+                                              drop_dims=[0]), [1, C_TILE])
+                new_row = pl.slice(mixed_qkv, [1, C_TILE], [new_idx, c0])
+                # set_validshape takes a 2D tile, so the row count is declared before
+                # the reshape to the state's rank-3 view.
+                conv_state[row : row + 1, i : i + 1, c0 : c0 + C_TILE] = pl.reshape(
+                    pl.set_validshape(old_row, keep_old, C_TILE), [1, 1, C_TILE])
+                conv_state[row : row + 1, i : i + 1, c0 : c0 + C_TILE] = pl.reshape(
+                    pl.set_validshape(new_row, take_new, C_TILE), [1, 1, C_TILE])
+            last = STATE_LEN - 1
+            conv_state[row : row + 1, last : last + 1, c0 : c0 + C_TILE] = pl.reshape(
+                pl.slice(mixed_qkv, [1, C_TILE], [pl.max(e - 1, s), c0]), [1, 1, C_TILE])
+
 
     return query, key, value, conv_state
 
@@ -403,7 +424,9 @@ def _golden_decode_tensors(tensors) -> None:
 
 # Lengths chosen so the state blend is exercised: a 1-token and a 2-token request are
 # both shorter than the window, so their new state mixes old rows with new ones.
-_PREFILL_LENGTHS = {"ragged": [5, 1, 9, 2], "single": [1], "long": [40]}
+# The ragged case carries an empty request, at the end where a token read would run
+# past the packed stream, and requests shorter than the convolution window.
+_PREFILL_LENGTHS = {"ragged": [5, 1, 9, 2, 0], "single": [1], "long": [40]}
 _POOL_ROWS = 6
 
 
@@ -440,7 +463,7 @@ def build_tensor_specs(case: str = "ragged", decode: bool = False):
     for length in lengths:
         starts.append(starts[-1] + length)
     tokens = starts[-1]
-    rows = torch.tensor([4, 1, 5, 0][: len(lengths)], dtype=torch.int32)
+    rows = torch.tensor([4, 1, 5, 0, 2][: len(lengths)], dtype=torch.int32)
     return common(tokens) + [
         TensorSpec("query_start_loc", [len(starts)], i32,
                    init_value=lambda: torch.tensor(starts, dtype=torch.int32)),

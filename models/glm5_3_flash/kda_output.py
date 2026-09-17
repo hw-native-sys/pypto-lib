@@ -114,14 +114,11 @@ def kda_output(
         activated = pl.mul(normed, pl.recip(pl.add(pl.exp(pl.neg(gate)), 1.0)))
         gated_rows[r0 : r0 + ROW_TILE, 0:KDA_DIM] = pl.cast(activated, pl.BF16, mode="rint")
 
-    # The padded tail rows are never written, so zero them: the projection reads whole
-    # tiles and a recycled scratch row would otherwise reach the cube as garbage.
-    if t_pad * LOCAL_KDA_H > t_dim * LOCAL_KDA_H:
-        with pl.spmd(1, name_hint="kda_output_pad"):
-            pad0 = pl.tile.get_block_idx() * ROW_TILE + t_dim * LOCAL_KDA_H
-            gated_rows[pad0 : pad0 + ROW_TILE, 0:KDA_DIM] = pl.full(
-                [ROW_TILE, KDA_DIM], dtype=pl.BF16, value=0.0
-            )
+    # The padded tail rows need no separate zero pass. The norm loop runs one task per
+    # token tile over the padded count, and each task stores a full ROW_TILE, so the
+    # whole allocation is written; the rows past t_dim load through valid_shape, which
+    # zero-fills them. A second store would begin at t_dim * LOCAL_KDA_H and run a
+    # ROW_TILE past the end of the allocation.
 
     gated = pl.reshape(gated_rows, [t_pad, LOCAL_KDA_QKV_DIM])
 

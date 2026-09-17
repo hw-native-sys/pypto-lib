@@ -74,6 +74,10 @@ K_TILE = 128
 # above LOCAL_KDA_H are unused; at TP4, where LOCAL_KDA_H is already 16, there is no
 # padding at all.
 BETA_PAD = 16
+# Padding rows to zero. Folded here rather than in the traced body, which takes only
+# pl.* calls; it floors at one because a zero-task region is not dispatchable, and at
+# TP4 LOCAL_KDA_H already reaches BETA_PAD so that one task writes nothing.
+B_ZERO_TASKS = max(BETA_PAD - LOCAL_KDA_H, 1)
 
 
 def golden_kda_projection(
@@ -158,10 +162,11 @@ def kda_projection(
     with pl.spmd(BETA_PAD, name_hint="kda_projection_b_pad") as b_pad_tid:
         r = pl.tile.get_block_idx()
         w_b_pad[r : r + 1, 0:D] = pl.slice(w_b, [1, D], [pl.min(r, LOCAL_KDA_H - 1), 0])
-    with pl.spmd(BETA_PAD - LOCAL_KDA_H, name_hint="kda_projection_b_zero",
+    with pl.spmd(B_ZERO_TASKS, name_hint="kda_projection_b_zero",
                  deps=[b_pad_tid]) as b_zero_tid:
         r = LOCAL_KDA_H + pl.tile.get_block_idx()
-        w_b_pad[r : r + 1, 0:D] = pl.full([1, D], dtype=pl.BF16, value=0.0)
+        if r < BETA_PAD:
+            w_b_pad[r : r + 1, 0:D] = pl.full([1, D], dtype=pl.BF16, value=0.0)
 
     tiles = (t_dim + T_TILE - 1) // T_TILE
 
@@ -334,9 +339,10 @@ def build_tensor_specs(tokens: int = 67):
         # hide a per-head / per-channel mix-up behind the sigmoid's flat tails.
         TensorSpec("dt_bias", [LOCAL_KDA_QKV_DIM], f32,
                    init_value=lambda: torch.randn(LOCAL_KDA_QKV_DIM) * 2.0),
-        # Distinct per-head values, so a head-axis broadcast error is visible.
+        # Distinct per-head values, so a head-axis broadcast error is visible. Spread
+        # across however many heads the rank owns: four at TP16, sixteen at TP4.
         TensorSpec("a_log", [LOCAL_KDA_H], f32,
-                   init_value=lambda: torch.tensor([-0.7, 0.0, 0.4, 1.1])[:LOCAL_KDA_H]),
+                   init_value=lambda: torch.linspace(-0.7, 1.1, LOCAL_KDA_H)),
         TensorSpec("w_b", [LOCAL_KDA_H, D], bf, init_value=w(LOCAL_KDA_H, D, 0.05)),
         TensorSpec("w_g_a", [KDA_DIM, D], bf, init_value=w(KDA_DIM, D)),
         TensorSpec("w_g_b", [LOCAL_KDA_QKV_DIM, KDA_DIM], bf,
