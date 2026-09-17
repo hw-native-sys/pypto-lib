@@ -52,7 +52,8 @@ class Glm53FlashConfig:
 
     The **deployment** weights are a different artefact: ``Eco-Tech/GLM-5.3-Flash-w8a8``
     on modelers.cn, whose ``quant_model_description.json`` is the authority on what
-    is quantized. Every value below matches both.
+    is quantized. The architecture fields below match both checkpoints; the dtype
+    and quantization fields describe the deployment one.
     """
 
     name: str

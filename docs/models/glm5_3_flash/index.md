@@ -104,8 +104,8 @@ EP dispatch payload reuse it.
 
 The boundary below is read from the deployment checkpoint
 (`Eco-Tech/GLM-5.3-Flash-w8a8` on modelers.cn), not inferred: its
-`quant_model_description.json` labels every tensor, and the shard headers confirm
-the dtypes. The split is sharper than the released FP8 checkpoint's.
+`quant_model_description.json` labels every tensor except `rot.weight`, and the
+shard headers confirm the dtypes. The split is sharper than the released FP8 checkpoint's.
 
 | Tensor | Format |
 | --- | --- |
