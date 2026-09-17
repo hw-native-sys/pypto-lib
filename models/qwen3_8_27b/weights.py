@@ -143,6 +143,10 @@ def main() -> int:
             torch.save(weights, source)
         weights = reference.quantize_weights(load_layer(source))
         out = Path(args.out) if args.out else default_path(args.layer, quantized=True)
+    elif source.is_file():
+        print(f"[weights] layer {args.layer} already on disk ({source})")
+        weights = load_layer(source)
+        out = Path(args.out) if args.out else default_path(args.layer)
     else:
         weights = fetch_layer(args.layer, revision=args.revision)
         out = Path(args.out) if args.out else default_path(args.layer)

@@ -54,6 +54,13 @@ def build_kernel(t: int = T, h: int = H, d: int = D, eps: float = EPS,
     branch on a Python flag nor call a helper; the per-token arithmetic is the
     same text in both, up to the last cast.
     """
+    # A block walks one TOK_TILE of rows, so a token count that does not divide it
+    # leaves the tail silently unwritten -- the same trap `quant_x` and `short_conv`
+    # refuse. The composed block rejects such shapes earlier; this covers the
+    # standalone `--seq-len` path.
+    if t % TOK_TILE:
+        raise ValueError(f"t={t} must be a multiple of TOK_TILE={TOK_TILE}")
+
     jit = pl.jit.inline if inline else pl.jit
 
     @jit
