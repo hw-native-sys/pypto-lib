@@ -43,21 +43,21 @@ from pypto.ir.distributed_compiled_program import DistributedConfig
 from rmsnorm import rms_norm
 
 # Decode attention and MoE leaf modules.
+from config import KV_ORI_MAX_BLOCKS as ORI_MAX_BLOCKS
 from decode_swa import (
     B,
     BLOCK_SIZE,
     D,
     HC_DIM,
     HC_MULT,
+    MAX_SEQ_LEN,
     H,
     HEAD_DIM,
-    MAX_SEQ_LEN,
     MIX_HC,
     O_GROUPS,
     O_GROUP_IN,
     O_LORA,
     ORI_BLOCK_NUM,
-    ORI_MAX_BLOCKS,
     ORI_TABLE_MAX_BLOCKS,
     Q_LORA,
     ROPE_HEAD_DIM,
@@ -71,7 +71,6 @@ from decode_hca import (
     COMPRESS_STATE_BLOCK_NUM as HCA_COMPRESS_STATE_BLOCK_NUM,
     COMPRESS_STATE_BLOCK_SIZE as HCA_COMPRESS_STATE_BLOCK_SIZE,
     COMPRESS_STATE_DIM as HCA_COMPRESS_STATE_DIM,
-    COMPRESS_STATE_MAX_BLOCKS as HCA_COMPRESS_STATE_MAX_BLOCKS,
     CMP_STORAGE_BLOCK_SIZE as HCA_CMP_STORAGE_BLOCK_SIZE,
     MAIN_OUT_DIM as HCA_MAIN_OUT_DIM,
     attention_hca,
@@ -79,27 +78,37 @@ from decode_hca import (
 )
 from decode_csa import (
     CMP_BLOCK_NUM as CSA_CMP_BLOCK_NUM,
-    CMP_MAX_BLOCKS as CSA_CMP_MAX_BLOCKS,
     COMPRESS_RATIO as CSA_COMPRESS_RATIO,
     IDX_CACHE_BLOCK_NUM as CSA_IDX_CACHE_BLOCK_NUM,
-    IDX_CACHE_MAX_BLOCKS as CSA_IDX_CACHE_MAX_BLOCKS,
     IDX_HEAD_DIM as CSA_IDX_HEAD_DIM,
     IDX_N_HEADS as CSA_IDX_N_HEADS,
     INNER_OUT_DIM as CSA_INNER_OUT_DIM,
     INNER_STATE_BLOCK_NUM as CSA_INNER_STATE_BLOCK_NUM,
     INNER_STATE_BLOCK_SIZE as CSA_INNER_STATE_BLOCK_SIZE,
     INNER_STATE_DIM as CSA_INNER_STATE_DIM,
-    INNER_STATE_MAX_BLOCKS as CSA_INNER_STATE_MAX_BLOCKS,
     MAIN_OUT_DIM as CSA_MAIN_OUT_DIM,
     MAIN_STATE_BLOCK_NUM as CSA_MAIN_STATE_BLOCK_NUM,
     MAIN_STATE_BLOCK_SIZE as CSA_MAIN_STATE_BLOCK_SIZE,
     MAIN_STATE_DIM as CSA_MAIN_STATE_DIM,
-    MAIN_STATE_MAX_BLOCKS as CSA_MAIN_STATE_MAX_BLOCKS,
     CMP_STORAGE_BLOCK_SIZE as CSA_CMP_STORAGE_BLOCK_SIZE,
     attention_csa,
     build_tensor_specs as build_csa_tensor_specs,
 )
-from config import DECODE_START_POS, FLASH as MODEL_CONFIG
+from config import (
+    DECODE_START_POS,
+    FLASH as MODEL_CONFIG,
+    IDX_CACHE_MAX_BLOCKS as CSA_IDX_CACHE_MAX_BLOCKS,
+    KV_CMP_MAX_BLOCKS as CSA_CMP_MAX_BLOCKS,
+)
+HCA_COMPRESS_STATE_MAX_BLOCKS = (
+    MAX_SEQ_LEN + HCA_COMPRESS_STATE_BLOCK_SIZE - 1
+) // HCA_COMPRESS_STATE_BLOCK_SIZE
+CSA_MAIN_STATE_MAX_BLOCKS = (
+    MAX_SEQ_LEN + CSA_MAIN_STATE_BLOCK_SIZE - 1
+) // CSA_MAIN_STATE_BLOCK_SIZE
+CSA_INNER_STATE_MAX_BLOCKS = (
+    MAX_SEQ_LEN + CSA_INNER_STATE_BLOCK_SIZE - 1
+) // CSA_INNER_STATE_BLOCK_SIZE
 from moe import (
     AUX_PAD,
     IDX_PAD,
@@ -170,6 +179,8 @@ SHARED_NAMES = [
     "csa_state_slot_mapping",
     "freqs_cos",
     "freqs_sin",
+    "cmp_freqs_cos",
+    "cmp_freqs_sin",
     "hca_cmp_slot_mapping",
     "hca_compress_state_block_table",
     "hca_state_slot_mapping",
@@ -198,7 +209,7 @@ RESIDENT_WEIGHT_NAMES = frozenset(
         for n in (*LAYER_STACKED_NAMES, *CSA_LAYER_STACKED_NAMES, *HCA_LAYER_STACKED_NAMES)
         if n not in CACHE_POOL_NAMES
     ]
-    + ["freqs_cos", "freqs_sin"]
+    + ["freqs_cos", "freqs_sin", "cmp_freqs_cos", "cmp_freqs_sin"]
     + HC_HEAD_NAMES
     + FINAL_NORM_NAMES
 )
@@ -267,8 +278,10 @@ def eplb_decode_logits_inline(
     shared_w3_scale: pl.Tensor[[FWD_NUM_LAYERS * MOE_INTER], pl.FP32],
     shared_w2: pl.Tensor[[FWD_NUM_LAYERS * D, MOE_INTER], pl.INT8],
     shared_w2_scale: pl.Tensor[[FWD_NUM_LAYERS * D], pl.FP32],
-    freqs_cos: pl.Tensor[[2, MAX_SEQ_LEN, ROPE_HEAD_DIM], pl.BF16],
-    freqs_sin: pl.Tensor[[2, MAX_SEQ_LEN, ROPE_HEAD_DIM], pl.BF16],
+    freqs_cos: pl.Tensor[[2, T, ROPE_HEAD_DIM], pl.BF16],
+    freqs_sin: pl.Tensor[[2, T, ROPE_HEAD_DIM], pl.BF16],
+    cmp_freqs_cos: pl.Tensor[[2, B, ROPE_HEAD_DIM // 2], pl.FP32],
+    cmp_freqs_sin: pl.Tensor[[2, B, ROPE_HEAD_DIM // 2], pl.FP32],
     block_table: pl.Tensor[[B, ORI_TABLE_MAX_BLOCKS], pl.INT32],
     ori_slot_mapping: pl.Tensor[[T], pl.INT64],
     swa_slot_mapping: pl.Tensor[[T], pl.INT64],
@@ -316,29 +329,53 @@ def eplb_decode_logits_inline(
 ) -> pl.Tensor[[T, D], pl.BF16]:
     # Main decode now carries SWA and compressed RoPE profiles together.
     # Normalize both profiles before calling the legacy attention contracts.
-    swa_cos_profile: pl.Tensor[[1, MAX_SEQ_LEN, ROPE_HEAD_DIM], pl.BF16] = pl.slice(
-        freqs_cos, [1, MAX_SEQ_LEN, ROPE_HEAD_DIM], [0, 0, 0]
+    swa_cos_profile: pl.Tensor[[1, T, ROPE_HEAD_DIM], pl.BF16] = pl.slice(
+        freqs_cos, [1, T, ROPE_HEAD_DIM], [0, 0, 0]
     )
-    swa_sin_profile: pl.Tensor[[1, MAX_SEQ_LEN, ROPE_HEAD_DIM], pl.BF16] = pl.slice(
-        freqs_sin, [1, MAX_SEQ_LEN, ROPE_HEAD_DIM], [0, 0, 0]
+    swa_sin_profile: pl.Tensor[[1, T, ROPE_HEAD_DIM], pl.BF16] = pl.slice(
+        freqs_sin, [1, T, ROPE_HEAD_DIM], [0, 0, 0]
     )
-    compressed_cos_profile: pl.Tensor[[1, MAX_SEQ_LEN, ROPE_HEAD_DIM], pl.BF16] = pl.slice(
-        freqs_cos, [1, MAX_SEQ_LEN, ROPE_HEAD_DIM], [1, 0, 0]
+    compressed_cos_profile: pl.Tensor[[1, T, ROPE_HEAD_DIM], pl.BF16] = pl.slice(
+        freqs_cos, [1, T, ROPE_HEAD_DIM], [1, 0, 0]
     )
-    compressed_sin_profile: pl.Tensor[[1, MAX_SEQ_LEN, ROPE_HEAD_DIM], pl.BF16] = pl.slice(
-        freqs_sin, [1, MAX_SEQ_LEN, ROPE_HEAD_DIM], [1, 0, 0]
+    compressed_sin_profile: pl.Tensor[[1, T, ROPE_HEAD_DIM], pl.BF16] = pl.slice(
+        freqs_sin, [1, T, ROPE_HEAD_DIM], [1, 0, 0]
     )
-    swa_freqs_cos: pl.Tensor[[MAX_SEQ_LEN, ROPE_HEAD_DIM], pl.BF16] = pl.reshape(
-        swa_cos_profile, [MAX_SEQ_LEN, ROPE_HEAD_DIM]
+    swa_freqs_cos: pl.Tensor[[T, ROPE_HEAD_DIM], pl.BF16] = pl.reshape(
+        swa_cos_profile, [T, ROPE_HEAD_DIM]
     )
-    swa_freqs_sin: pl.Tensor[[MAX_SEQ_LEN, ROPE_HEAD_DIM], pl.BF16] = pl.reshape(
-        swa_sin_profile, [MAX_SEQ_LEN, ROPE_HEAD_DIM]
+    swa_freqs_sin: pl.Tensor[[T, ROPE_HEAD_DIM], pl.BF16] = pl.reshape(
+        swa_sin_profile, [T, ROPE_HEAD_DIM]
     )
-    compressed_freqs_cos: pl.Tensor[[MAX_SEQ_LEN, ROPE_HEAD_DIM], pl.BF16] = pl.reshape(
-        compressed_cos_profile, [MAX_SEQ_LEN, ROPE_HEAD_DIM]
+    compressed_freqs_cos: pl.Tensor[[T, ROPE_HEAD_DIM], pl.BF16] = pl.reshape(
+        compressed_cos_profile, [T, ROPE_HEAD_DIM]
     )
-    compressed_freqs_sin: pl.Tensor[[MAX_SEQ_LEN, ROPE_HEAD_DIM], pl.BF16] = pl.reshape(
-        compressed_sin_profile, [MAX_SEQ_LEN, ROPE_HEAD_DIM]
+    compressed_freqs_sin: pl.Tensor[[T, ROPE_HEAD_DIM], pl.BF16] = pl.reshape(
+        compressed_sin_profile, [T, ROPE_HEAD_DIM]
+    )
+    csa_cmp_freqs_cos_profile: pl.Tensor[[1, B, ROPE_HEAD_DIM // 2], pl.FP32] = pl.slice(
+        cmp_freqs_cos, [1, B, ROPE_HEAD_DIM // 2], [0, 0, 0]
+    )
+    csa_cmp_freqs_cos: pl.Tensor[[B, ROPE_HEAD_DIM // 2], pl.FP32] = pl.reshape(
+        csa_cmp_freqs_cos_profile, [B, ROPE_HEAD_DIM // 2]
+    )
+    csa_cmp_freqs_sin_profile: pl.Tensor[[1, B, ROPE_HEAD_DIM // 2], pl.FP32] = pl.slice(
+        cmp_freqs_sin, [1, B, ROPE_HEAD_DIM // 2], [0, 0, 0]
+    )
+    csa_cmp_freqs_sin: pl.Tensor[[B, ROPE_HEAD_DIM // 2], pl.FP32] = pl.reshape(
+        csa_cmp_freqs_sin_profile, [B, ROPE_HEAD_DIM // 2]
+    )
+    hca_cmp_freqs_cos_profile: pl.Tensor[[1, B, ROPE_HEAD_DIM // 2], pl.FP32] = pl.slice(
+        cmp_freqs_cos, [1, B, ROPE_HEAD_DIM // 2], [1, 0, 0]
+    )
+    hca_cmp_freqs_cos: pl.Tensor[[B, ROPE_HEAD_DIM // 2], pl.FP32] = pl.reshape(
+        hca_cmp_freqs_cos_profile, [B, ROPE_HEAD_DIM // 2]
+    )
+    hca_cmp_freqs_sin_profile: pl.Tensor[[1, B, ROPE_HEAD_DIM // 2], pl.FP32] = pl.slice(
+        cmp_freqs_sin, [1, B, ROPE_HEAD_DIM // 2], [1, 0, 0]
+    )
+    hca_cmp_freqs_sin: pl.Tensor[[B, ROPE_HEAD_DIM // 2], pl.FP32] = pl.reshape(
+        hca_cmp_freqs_sin_profile, [B, ROPE_HEAD_DIM // 2]
     )
     nt = pl.cast(0, pl.INT32)
     for owner_rank in pl.range(N_RANKS):
@@ -534,7 +571,7 @@ def eplb_decode_logits_inline(
                 hidden,
                 hc_attn_fn_csa, hc_attn_scale_csa, hc_attn_base_csa,
                 attn_norm_w_csa, wq_a_csa, wq_b_csa, wq_b_scale_csa,
-                wkv_csa, gamma_cq_csa, gamma_ckv_csa, compressed_freqs_cos, compressed_freqs_sin,
+                wkv_csa, gamma_cq_csa, gamma_ckv_csa, compressed_freqs_cos, compressed_freqs_sin, csa_cmp_freqs_cos, csa_cmp_freqs_sin,
                 csa_cmp_wkv_csa, csa_cmp_wgate_csa, csa_cmp_ape_csa, csa_cmp_norm_w_csa,
                 csa_compress_state_csa, csa_compress_state_block_table,
                 csa_idx_wq_b_csa, csa_idx_wq_b_scale_csa, csa_weights_proj_csa, csa_hadamard_idx_csa,
@@ -608,7 +645,7 @@ def eplb_decode_logits_inline(
                 hidden_mid,
                 hc_attn_fn_hca, hc_attn_scale_hca, hc_attn_base_hca,
                 attn_norm_w_hca, wq_a_hca, wq_b_hca, wq_b_scale_hca,
-                wkv_hca, gamma_cq_hca, gamma_ckv_hca, compressed_freqs_cos, compressed_freqs_sin,
+                wkv_hca, gamma_cq_hca, gamma_ckv_hca, compressed_freqs_cos, compressed_freqs_sin, hca_cmp_freqs_cos, hca_cmp_freqs_sin,
                 hca_cmp_wkv_hca, hca_cmp_wgate_hca, hca_cmp_ape_hca, hca_cmp_norm_w_hca,
                 hca_compress_state_hca, hca_compress_state_block_table,
                 kv_cache_hca, cmp_kv_hca, cmp_block_table,
@@ -692,7 +729,7 @@ def eplb_decode_logits_inline(
             hidden,
             hc_attn_fn_last, hc_attn_scale_last, hc_attn_base_last,
             attn_norm_w_last, wq_a_last, wq_b_last, wq_b_scale_last,
-            wkv_last, gamma_cq_last, gamma_ckv_last, compressed_freqs_cos, compressed_freqs_sin,
+            wkv_last, gamma_cq_last, gamma_ckv_last, compressed_freqs_cos, compressed_freqs_sin, csa_cmp_freqs_cos, csa_cmp_freqs_sin,
             csa_cmp_wkv_last, csa_cmp_wgate_last, csa_cmp_ape_last, csa_cmp_norm_w_last,
             csa_compress_state_last, csa_compress_state_block_table,
             csa_idx_wq_b_last, csa_idx_wq_b_scale_last, csa_weights_proj_last, csa_hadamard_idx_last,
@@ -797,8 +834,10 @@ def eplb_decode_logits(
     shared_w3_scale: pl.Tensor[[FWD_NUM_LAYERS * MOE_INTER], pl.FP32],
     shared_w2: pl.Tensor[[FWD_NUM_LAYERS * D, MOE_INTER], pl.INT8],
     shared_w2_scale: pl.Tensor[[FWD_NUM_LAYERS * D], pl.FP32],
-    freqs_cos: pl.Tensor[[2, MAX_SEQ_LEN, ROPE_HEAD_DIM], pl.BF16],
-    freqs_sin: pl.Tensor[[2, MAX_SEQ_LEN, ROPE_HEAD_DIM], pl.BF16],
+    freqs_cos: pl.Tensor[[2, T, ROPE_HEAD_DIM], pl.BF16],
+    freqs_sin: pl.Tensor[[2, T, ROPE_HEAD_DIM], pl.BF16],
+    cmp_freqs_cos: pl.Tensor[[2, B, ROPE_HEAD_DIM // 2], pl.FP32],
+    cmp_freqs_sin: pl.Tensor[[2, B, ROPE_HEAD_DIM // 2], pl.FP32],
     block_table: pl.Tensor[[B, ORI_TABLE_MAX_BLOCKS], pl.INT32],
     ori_slot_mapping: pl.Tensor[[T], pl.INT64],
     swa_slot_mapping: pl.Tensor[[T], pl.INT64],
@@ -905,6 +944,8 @@ def eplb_decode_logits(
         shared_w2_scale,
         freqs_cos,
         freqs_sin,
+        cmp_freqs_cos,
+        cmp_freqs_sin,
         block_table,
         ori_slot_mapping,
         swa_slot_mapping,
@@ -1012,8 +1053,10 @@ def l3_eplb_decode_logits(
     shared_w3_scale: pl.Tensor[[N_RANKS, FWD_NUM_LAYERS * MOE_INTER], pl.FP32],
     shared_w2: pl.Tensor[[N_RANKS, FWD_NUM_LAYERS * D, MOE_INTER], pl.INT8],
     shared_w2_scale: pl.Tensor[[N_RANKS, FWD_NUM_LAYERS * D], pl.FP32],
-    freqs_cos: pl.Tensor[[N_RANKS, 2, MAX_SEQ_LEN, ROPE_HEAD_DIM], pl.BF16],
-    freqs_sin: pl.Tensor[[N_RANKS, 2, MAX_SEQ_LEN, ROPE_HEAD_DIM], pl.BF16],
+    freqs_cos: pl.Tensor[[N_RANKS, 2, T, ROPE_HEAD_DIM], pl.BF16],
+    freqs_sin: pl.Tensor[[N_RANKS, 2, T, ROPE_HEAD_DIM], pl.BF16],
+    cmp_freqs_cos: pl.Tensor[[N_RANKS, 2, B, ROPE_HEAD_DIM // 2], pl.FP32],
+    cmp_freqs_sin: pl.Tensor[[N_RANKS, 2, B, ROPE_HEAD_DIM // 2], pl.FP32],
     block_table: pl.Tensor[[N_RANKS, B, ORI_TABLE_MAX_BLOCKS], pl.INT32],
     ori_slot_mapping: pl.Tensor[[N_RANKS, T], pl.INT64],
     swa_slot_mapping: pl.Tensor[[N_RANKS, T], pl.INT64],
@@ -1086,7 +1129,7 @@ def l3_eplb_decode_logits(
             hc_ffn_fn[r], hc_ffn_scale[r], hc_ffn_base[r], norm_w[r], gate_w[r], gate_bias[r],
             tid2eid[r], routed_w1[r], routed_w1_scale[r], routed_w3[r], routed_w3_scale[r],
             routed_w2[r], routed_w2_scale[r], shared_w1[r], shared_w1_scale[r], shared_w3[r],
-            shared_w3_scale[r], shared_w2[r], shared_w2_scale[r], freqs_cos[r], freqs_sin[r],
+            shared_w3_scale[r], shared_w2[r], shared_w2_scale[r], freqs_cos[r], freqs_sin[r], cmp_freqs_cos[r], cmp_freqs_sin[r],
             block_table[r], ori_slot_mapping[r], swa_slot_mapping[r], swa_indices[r], swa_lens[r],
             window_swa_indices[r], window_swa_lens[r],
             hca_cmp_slot_mapping[r], hca_state_slot_mapping[r], csa_cmp_slot_mapping[r],
@@ -1210,6 +1253,9 @@ def make_forward_metadata_tensors(
         block_num_dim = shape[1] if shape[0] == N_RANKS else shape[0]
         return block_num_dim // B
 
+    def table_columns(name):
+        return int(base_specs[name].shape[-1])
+
     hca_state_physical_blocks = physical_blocks_from_spec("hca_compress_state")
     csa_state_physical_blocks = physical_blocks_from_spec("csa_compress_state")
     csa_inner_state_physical_blocks = physical_blocks_from_spec("csa_inner_compress_state")
@@ -1312,23 +1358,23 @@ def make_forward_metadata_tensors(
 
     init_by_name = {
         "block_table": lambda: ranked(lambda: init_block_table_single(ORI_TABLE_MAX_BLOCKS, ori_block_num)),
-        "cmp_block_table": lambda: ranked(lambda: init_block_table_single(CSA_CMP_MAX_BLOCKS, cmp_block_num)),
-        "idx_block_table": lambda: ranked(lambda: init_block_table_single(CSA_IDX_CACHE_MAX_BLOCKS, idx_block_num)),
-        "hca_compress_state_block_table": lambda: ranked(lambda: init_state_block_table_single(HCA_COMPRESS_STATE_MAX_BLOCKS, hca_state_physical_blocks)),
-        "csa_compress_state_block_table": lambda: ranked(lambda: init_state_block_table_single(CSA_MAIN_STATE_MAX_BLOCKS, csa_state_physical_blocks)),
-        "csa_inner_compress_state_block_table": lambda: ranked(lambda: init_state_block_table_single(CSA_INNER_STATE_MAX_BLOCKS, csa_inner_state_physical_blocks)),
+        "cmp_block_table": lambda: ranked(lambda: init_block_table_single(table_columns("cmp_block_table"), cmp_block_num)),
+        "idx_block_table": lambda: ranked(lambda: init_block_table_single(table_columns("idx_block_table"), idx_block_num)),
+        "hca_compress_state_block_table": lambda: ranked(lambda: init_state_block_table_single(table_columns("hca_compress_state_block_table"), hca_state_physical_blocks)),
+        "csa_compress_state_block_table": lambda: ranked(lambda: init_state_block_table_single(table_columns("csa_compress_state_block_table"), csa_state_physical_blocks)),
+        "csa_inner_compress_state_block_table": lambda: ranked(lambda: init_state_block_table_single(table_columns("csa_inner_compress_state_block_table"), csa_inner_state_physical_blocks)),
         "ori_slot_mapping": lambda: ranked(init_ori_slot_mapping_single),
         "swa_slot_mapping": lambda: ranked(init_swa_slot_mapping_single),
         "swa_indices": lambda: ranked(init_swa_indices_single),
         "swa_lens": lambda: ranked(init_swa_lens_single),
         "window_swa_indices": lambda: ranked(lambda: init_window_swa_metadata_single()[0]),
         "window_swa_lens": lambda: ranked(lambda: init_window_swa_metadata_single()[1]),
-        "hca_cmp_slot_mapping": lambda: ranked(lambda: init_compressed_slot_mapping_single(HCA_COMPRESS_RATIO, CSA_CMP_MAX_BLOCKS, cmp_block_num)),
-        "csa_cmp_slot_mapping": lambda: ranked(lambda: init_compressed_slot_mapping_single(CSA_COMPRESS_RATIO, CSA_CMP_MAX_BLOCKS, cmp_block_num)),
-        "csa_idx_slot_mapping": lambda: ranked(lambda: init_compressed_slot_mapping_single(CSA_COMPRESS_RATIO, CSA_IDX_CACHE_MAX_BLOCKS, idx_block_num)),
-        "hca_state_slot_mapping": lambda: ranked(lambda: init_state_slot_mapping_single(HCA_COMPRESS_STATE_MAX_BLOCKS, HCA_COMPRESS_STATE_BLOCK_SIZE, hca_state_physical_blocks)),
-        "csa_state_slot_mapping": lambda: ranked(lambda: init_state_slot_mapping_single(CSA_MAIN_STATE_MAX_BLOCKS, CSA_MAIN_STATE_BLOCK_SIZE, csa_state_physical_blocks)),
-        "csa_inner_state_slot_mapping": lambda: ranked(lambda: init_state_slot_mapping_single(CSA_INNER_STATE_MAX_BLOCKS, CSA_INNER_STATE_BLOCK_SIZE, csa_inner_state_physical_blocks)),
+        "hca_cmp_slot_mapping": lambda: ranked(lambda: init_compressed_slot_mapping_single(HCA_COMPRESS_RATIO, table_columns("cmp_block_table"), cmp_block_num)),
+        "csa_cmp_slot_mapping": lambda: ranked(lambda: init_compressed_slot_mapping_single(CSA_COMPRESS_RATIO, table_columns("cmp_block_table"), cmp_block_num)),
+        "csa_idx_slot_mapping": lambda: ranked(lambda: init_compressed_slot_mapping_single(CSA_COMPRESS_RATIO, table_columns("idx_block_table"), idx_block_num)),
+        "hca_state_slot_mapping": lambda: ranked(lambda: init_state_slot_mapping_single(table_columns("hca_compress_state_block_table"), HCA_COMPRESS_STATE_BLOCK_SIZE, hca_state_physical_blocks)),
+        "csa_state_slot_mapping": lambda: ranked(lambda: init_state_slot_mapping_single(table_columns("csa_compress_state_block_table"), CSA_MAIN_STATE_BLOCK_SIZE, csa_state_physical_blocks)),
+        "csa_inner_state_slot_mapping": lambda: ranked(lambda: init_state_slot_mapping_single(table_columns("csa_inner_compress_state_block_table"), CSA_INNER_STATE_BLOCK_SIZE, csa_inner_state_physical_blocks)),
         "position_ids": lambda: ranked(init_position_ids_single),
         "kv_seq_lens": lambda: ranked(init_kv_seq_lens_single),
     }
@@ -1480,6 +1526,20 @@ def build_single_layer_tensor_specs(
         "freqs_sin", [2, *swa_specs["freqs_sin"].shape], swa_specs["freqs_sin"].dtype,
         init_value=init_freqs_sin,
     )
+    cmp_freqs_cos_spec = TensorSpec(
+        "cmp_freqs_cos", [2, B, ROPE_HEAD_DIM // 2], torch.float32,
+        init_value=lambda: torch.stack((
+            csa_specs["cmp_freqs_cos"].create_tensor(),
+            hca_specs["cmp_freqs_cos"].create_tensor(),
+        )),
+    )
+    cmp_freqs_sin_spec = TensorSpec(
+        "cmp_freqs_sin", [2, B, ROPE_HEAD_DIM // 2], torch.float32,
+        init_value=lambda: torch.stack((
+            csa_specs["cmp_freqs_sin"].create_tensor(),
+            hca_specs["cmp_freqs_sin"].create_tensor(),
+        )),
+    )
 
     def init_block_table():
         return block_table(batch=B, table_blocks=ORI_TABLE_MAX_BLOCKS, physical_blocks=ORI_MAX_BLOCKS)
@@ -1497,6 +1557,8 @@ def build_single_layer_tensor_specs(
         "gamma_ckv",
         "freqs_cos",
         "freqs_sin",
+        "cmp_freqs_cos",
+        "cmp_freqs_sin",
         "attn_sink",
         "wo_a",
         "wo_b",
@@ -1532,6 +1594,8 @@ def build_single_layer_tensor_specs(
         ("gamma_ckv", swa_specs["gamma_ckv"]),
         ("freqs_cos", freqs_cos_spec),
         ("freqs_sin", freqs_sin_spec),
+        ("cmp_freqs_cos", cmp_freqs_cos_spec),
+        ("cmp_freqs_sin", cmp_freqs_sin_spec),
         ("kv_cache", swa_specs["kv_cache"]),
         ("block_table", TensorSpec("block_table", [B, ORI_TABLE_MAX_BLOCKS], torch.int32, init_value=init_block_table)),
         ("ori_slot_mapping", active_specs.get("ori_slot_mapping", hca_specs["ori_slot_mapping"])),
@@ -1711,7 +1775,7 @@ def build_tensor_specs(
         "hc_ffn_fn", "hc_ffn_scale", "hc_ffn_base", "norm_w", "gate_w", "gate_bias", "tid2eid",
         "routed_w1", "routed_w1_scale", "routed_w3", "routed_w3_scale", "routed_w2", "routed_w2_scale",
         "shared_w1", "shared_w1_scale", "shared_w3", "shared_w3_scale", "shared_w2", "shared_w2_scale",
-        "freqs_cos", "freqs_sin", "block_table", "ori_slot_mapping", "swa_slot_mapping",
+        "freqs_cos", "freqs_sin", "cmp_freqs_cos", "cmp_freqs_sin", "block_table", "ori_slot_mapping", "swa_slot_mapping",
         "swa_indices", "swa_lens", "window_swa_indices", "window_swa_lens",
         "hca_cmp_slot_mapping", "hca_state_slot_mapping",
         "csa_cmp_slot_mapping", "csa_idx_slot_mapping", "csa_state_slot_mapping",

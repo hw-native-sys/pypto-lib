@@ -47,7 +47,7 @@ from hc_pre import hc_pre
 from hc_post import hc_post
 from gate import gate
 from expert_shared import expert_shared
-from expert_routed import expert_routed, make_prefill_expert_grouped
+from eplb_expert_routed import expert_routed, make_prefill_expert_grouped
 
 
 T = MOE_TOKENS
@@ -1416,7 +1416,7 @@ def golden_moe(tensors):
     from hc_post import golden_hc_post
     from gate import golden_gate_core
     from expert_shared import golden_expert_shared
-    from expert_routed import golden_expert_routed
+    from eplb_expert_routed import golden_expert_routed
 
     T = tensors["x_hc"].shape[1]
     RECV_MAX = N_RANKS * T
@@ -1593,7 +1593,7 @@ def build_tensor_specs(layer_id=0, num_tokens=None, balanced_routing=False, *, t
         num_tokens = T
     import torch
     from golden import ScalarSpec, TensorSpec
-    from expert_routed import gen_routed_weight
+    from eplb_expert_routed import gen_routed_weight
     from expert_shared import gen_shared_weight
 
     # Routed = MXFP4 (gen_routed_weight), shared = MXFP8 (gen_shared_weight). This

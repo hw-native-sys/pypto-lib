@@ -34,7 +34,6 @@ from decode_swa import (
     BLOCK_SIZE,
     HEAD_DIM,
     H,
-    MAX_SEQ_LEN,
     O_GROUP_IN,
     O_GROUPS,
     O_LORA,
@@ -127,8 +126,8 @@ def eplb_mtp_core_logits(
     wkv: pl.Tensor[[D, HEAD_DIM], pl.BF16],
     gamma_cq: pl.Tensor[[Q_LORA], pl.BF16],
     gamma_ckv: pl.Tensor[[HEAD_DIM], pl.BF16],
-    freqs_cos: pl.Tensor[[2, MAX_SEQ_LEN, ROPE_HEAD_DIM], pl.BF16],
-    freqs_sin: pl.Tensor[[2, MAX_SEQ_LEN, ROPE_HEAD_DIM], pl.BF16],
+    freqs_cos: pl.Tensor[[2, T, ROPE_HEAD_DIM], pl.BF16],
+    freqs_sin: pl.Tensor[[2, T, ROPE_HEAD_DIM], pl.BF16],
     kv_cache: pl.InOut[pl.Tensor[[ORI_BLOCK_NUM_DYN, BLOCK_SIZE, 1, HEAD_DIM], pl.BF16]],
     attn_sink: pl.Tensor[[H], pl.FP32],
     wo_a: pl.Tensor[[O_GROUPS, O_LORA, O_GROUP_IN], pl.BF16],
@@ -181,17 +180,17 @@ def eplb_mtp_core_logits(
     # Main MTP now carries SWA and compressed RoPE profiles together.  The
     # EPLB interval still consumes the SWA profile through attention_swa's
     # two-dimensional contract.
-    swa_cos_profile: pl.Tensor[[1, MAX_SEQ_LEN, ROPE_HEAD_DIM], pl.BF16] = pl.slice(
-        freqs_cos, [1, MAX_SEQ_LEN, ROPE_HEAD_DIM], [0, 0, 0]
+    swa_cos_profile: pl.Tensor[[1, T, ROPE_HEAD_DIM], pl.BF16] = pl.slice(
+        freqs_cos, [1, T, ROPE_HEAD_DIM], [0, 0, 0]
     )
-    swa_sin_profile: pl.Tensor[[1, MAX_SEQ_LEN, ROPE_HEAD_DIM], pl.BF16] = pl.slice(
-        freqs_sin, [1, MAX_SEQ_LEN, ROPE_HEAD_DIM], [0, 0, 0]
+    swa_sin_profile: pl.Tensor[[1, T, ROPE_HEAD_DIM], pl.BF16] = pl.slice(
+        freqs_sin, [1, T, ROPE_HEAD_DIM], [0, 0, 0]
     )
-    swa_freqs_cos: pl.Tensor[[MAX_SEQ_LEN, ROPE_HEAD_DIM], pl.BF16] = pl.reshape(
-        swa_cos_profile, [MAX_SEQ_LEN, ROPE_HEAD_DIM]
+    swa_freqs_cos: pl.Tensor[[T, ROPE_HEAD_DIM], pl.BF16] = pl.reshape(
+        swa_cos_profile, [T, ROPE_HEAD_DIM]
     )
-    swa_freqs_sin: pl.Tensor[[MAX_SEQ_LEN, ROPE_HEAD_DIM], pl.BF16] = pl.reshape(
-        swa_sin_profile, [MAX_SEQ_LEN, ROPE_HEAD_DIM]
+    swa_freqs_sin: pl.Tensor[[T, ROPE_HEAD_DIM], pl.BF16] = pl.reshape(
+        swa_sin_profile, [T, ROPE_HEAD_DIM]
     )
     projected_hidden = pl.create_tensor([T, HC_MULT, D], dtype=pl.FP32)
     with pl.scope():
@@ -292,8 +291,8 @@ def l3_eplb_mtp_core(
     wkv: pl.Tensor[[N_RANKS, D, HEAD_DIM], pl.BF16],
     gamma_cq: pl.Tensor[[N_RANKS, Q_LORA], pl.BF16],
     gamma_ckv: pl.Tensor[[N_RANKS, HEAD_DIM], pl.BF16],
-    freqs_cos: pl.Tensor[[N_RANKS, 2, MAX_SEQ_LEN, ROPE_HEAD_DIM], pl.BF16],
-    freqs_sin: pl.Tensor[[N_RANKS, 2, MAX_SEQ_LEN, ROPE_HEAD_DIM], pl.BF16],
+    freqs_cos: pl.Tensor[[N_RANKS, 2, T, ROPE_HEAD_DIM], pl.BF16],
+    freqs_sin: pl.Tensor[[N_RANKS, 2, T, ROPE_HEAD_DIM], pl.BF16],
     kv_cache: pl.InOut[pl.Tensor[[N_RANKS, ORI_BLOCK_NUM_DYN, BLOCK_SIZE, 1, HEAD_DIM], pl.BF16]],
     attn_sink: pl.Tensor[[N_RANKS, H], pl.FP32],
     wo_a: pl.Tensor[[N_RANKS, O_GROUPS, O_LORA, O_GROUP_IN], pl.BF16],
@@ -407,8 +406,9 @@ def build_tensor_specs(
     ori_block_num=ORI_BLOCK_NUM,
 ):
     import torch
+    from config import FLASH as model_config
     from golden import TensorSpec
-    from utils import block_table, paged_slot_mapping, swa_indices_and_lens
+    from utils import block_table, paged_slot_mapping, swa_indices_and_lens, token_local_rope
 
     validate_eplb_topology(
         ep_size=N_RANKS,
@@ -423,6 +423,29 @@ def build_tensor_specs(
     base_specs = replace_eplb_routing_specs(base_specs, active_tokens=num_tokens)
     base_by_name = {spec.name: spec for spec in base_specs}
     position_spec = base_by_name["position_ids"]
+    for rope_name in ("freqs_cos", "freqs_sin"):
+        full_spec = base_by_name[rope_name]
+
+        def init_token_rope(rope_name=rope_name, full_spec=full_spec):
+            positions = position_spec.create_tensor()
+            channel = 0 if rope_name == "freqs_cos" else 1
+            return torch.stack(
+                [
+                    torch.stack([
+                        token_local_rope(
+                            model_config, ratio, positions[rank],
+                            dtype=full_spec.dtype,
+                        )[channel]
+                        for ratio in (0, 4)
+                    ])
+                    for rank in range(N_RANKS)
+                ]
+            ).contiguous()
+
+        base_by_name[rope_name] = TensorSpec(
+            rope_name, [N_RANKS, 2, T, ROPE_HEAD_DIM], full_spec.dtype,
+            init_value=init_token_rope,
+        )
     prepared_metadata = None
 
     def init_hidden_states():
