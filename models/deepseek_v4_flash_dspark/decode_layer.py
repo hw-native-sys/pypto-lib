@@ -275,6 +275,53 @@ def _validate_active_tokens(active_tokens):
         )
 
 
+def _resolve_owner_fixture(start_pos, num_tokens_per_owner):
+    """Resolve the physical local batch and optional owner-major positions."""
+    import torch
+
+    owner_start_positions = None
+    requested_counts = None
+    if num_tokens_per_owner is not None:
+        requested_counts = torch.as_tensor(num_tokens_per_owner, dtype=torch.int32).reshape(-1)
+        if requested_counts.numel() != N_RANKS:
+            raise ValueError(
+                f"num_tokens_per_owner needs {N_RANKS} entries, got {requested_counts.numel()}",
+            )
+        if (
+            bool((requested_counts < 0).any())
+            or bool((requested_counts % DECODE_SEQ != 0).any())
+        ):
+            raise ValueError(
+                f"num_tokens_per_owner values must be non-negative multiples of "
+                f"S={DECODE_SEQ}: {requested_counts.tolist()}",
+            )
+        requests_per_owner = requested_counts // DECODE_SEQ
+        if isinstance(start_pos, (list, tuple)) and len(start_pos) == int(requests_per_owner.sum()):
+            batch = int(requests_per_owner.max())
+            if batch == 0:
+                raise ValueError("packed per-owner start positions need at least one active request")
+            owner_start_positions = torch.zeros(N_RANKS, batch, dtype=torch.int32)
+            offset = 0
+            for rank, request_count in enumerate(requests_per_owner.tolist()):
+                owner_start_positions[rank, :request_count] = torch.tensor(
+                    start_pos[offset : offset + request_count], dtype=torch.int32,
+                )
+                offset += request_count
+
+    if owner_start_positions is None:
+        batch = _active_batch(start_pos)
+    local_t = batch * DECODE_SEQ
+    _validate_active_tokens(local_t)
+    if requested_counts is None:
+        requested_counts = torch.full((N_RANKS,), local_t, dtype=torch.int32)
+    if bool((requested_counts > local_t).any()):
+        raise ValueError(
+            f"num_tokens_per_owner values must be at most physical local_t={local_t}: "
+            f"{requested_counts.tolist()}",
+        )
+    return batch, local_t, requested_counts.contiguous(), owner_start_positions
+
+
 def _distributed_shape(module, name, shape):
     if name == "wo_a":
         return [EP_SIZE, module.LOCAL_O_GROUPS, module.O_LORA, module.O_GROUP_IN]
@@ -311,21 +358,24 @@ def _moe_shapes():
     }
 
 
-def build_layer_shape_report(layer_id, start_pos=None):
+def build_layer_shape_report(layer_id, start_pos=None, num_tokens_per_owner=None):
     """Build current attention specs and audit their future EP-layer shapes."""
     from golden import TensorSpec
 
     kind = attention_kind_for_layer(layer_id)
     module = _ATTENTION_MODULES[kind]
-    batch = _active_batch(start_pos)
-    active_tokens = batch * DECODE_SEQ
-    _validate_active_tokens(active_tokens)
+    batch, active_tokens, _, owner_start_positions = _resolve_owner_fixture(
+        start_pos, num_tokens_per_owner,
+    )
     if batch > module.B:
         raise ValueError(
             f"{kind} batch {batch} exceeds TP{TP_SIZE} local capacity {module.B}",
         )
 
-    specs = module.build_tensor_specs(start_pos=start_pos, batch=batch)
+    report_start_pos = start_pos
+    if owner_start_positions is not None:
+        report_start_pos = [int(owner_start_positions.max())] * batch
+    specs = module.build_tensor_specs(start_pos=report_start_pos, batch=batch)
     distributed_shapes = {}
     for spec in specs:
         if not isinstance(spec, TensorSpec):
@@ -449,12 +499,12 @@ def decode_layer_swa(
     layer_id: pl.Scalar[pl.INT32],
     group_base: pl.Scalar[pl.INT32],
     tp_rank: pl.Scalar[pl.INT32],
+    owner_tokens: pl.Scalar[pl.INT32],
     local_t: pl.Scalar[pl.INT32],
     my_rank: pl.Scalar[pl.INT32],
     moe_epoch: pl.Scalar[pl.INT32],
 ):
     """Run one SWA attention and one MoE without clearing shared signals."""
-    active_t = pl.tensor.dim(x_hc, 0)
     with pl.scope():
         if TP_SIZE == 1:
             decode_swa_tp1(
@@ -487,7 +537,7 @@ def decode_layer_swa(
     with pl.scope():
         x_attn_moe = pl.create_tensor([MOE_TOKENS, HC_MULT, D], dtype=pl.FP32)
         for token in pl.spmd(MOE_TOKENS, name_hint="decode_layer_attn_pack"):
-            if token < active_t:
+            if token < owner_tokens:
                 x_attn_moe[token : token + 1, 0 : HC_MULT, 0 : D] = (
                     x_attn_active[token : token + 1, 0 : HC_MULT, 0 : D]
                 )
@@ -505,12 +555,16 @@ def decode_layer_swa(
             x_moe_next,
             recv_meta, recv_x, recv_aux, recv_route,
             arrived, data_arrived, routed_y_buf, combine_arrived,
-            layer_id, local_t, my_rank, moe_epoch,
+            layer_id, owner_tokens, my_rank, moe_epoch,
         )
 
         for token in pl.spmd(MOE_TOKENS, name_hint="decode_layer_active_trim"):
-            if token < active_t:
+            if token < owner_tokens:
                 x_next[token : token + 1, 0 : HC_MULT, 0 : D] = (x_moe_next[token : token + 1, 0 : HC_MULT, 0 : D])
+            elif token < local_t:
+                x_next[token : token + 1, 0 : HC_MULT, 0 : D] = pl.full(
+                    [1, HC_MULT, D], dtype=pl.FP32, value=0.0,
+                )
     return x_next
 
 
@@ -578,7 +632,7 @@ def decode_layer_swa_test(
     layer_id: pl.Scalar[pl.INT32],
     group_base: pl.Scalar[pl.INT32],
     tp_rank: pl.Scalar[pl.INT32],
-    local_t: pl.Scalar[pl.INT32],
+    num_tokens_per_owner: pl.Tensor[[N_RANKS], pl.INT32],
     my_rank: pl.Scalar[pl.INT32],
     moe_epoch: pl.Scalar[pl.INT32],
 ):
@@ -593,6 +647,13 @@ def decode_layer_swa_test(
     position_ids.bind_dynamic(0, T_DYN)
     x_attn_active.bind_dynamic(0, T_DYN)
     x_next.bind_dynamic(0, T_DYN)
+
+    local_t = pl.cast(pl.tensor.dim(x_hc, 0), pl.INT32)
+    owner_tokens = pl.read(num_tokens_per_owner, [my_rank])
+    if owner_tokens < 0:
+        owner_tokens = pl.cast(0, pl.INT32)
+    if owner_tokens > local_t:
+        owner_tokens = local_t
 
     decode_layer_swa(
         x_hc,
@@ -614,7 +675,7 @@ def decode_layer_swa_test(
         attention_window, attention_signal, o_window, o_signal,
         recv_meta, recv_x, recv_aux, recv_route,
         arrived, data_arrived, routed_y_buf, combine_arrived,
-        layer_id, group_base, tp_rank, local_t, my_rank, moe_epoch,
+        layer_id, group_base, tp_rank, owner_tokens, local_t, my_rank, moe_epoch,
     )
     clear_moe_signals(x_moe_next, arrived, data_arrived, combine_arrived)
     return x_next
@@ -667,6 +728,7 @@ def l3_decode_layer_swa(
     x_attn_active: pl.Out[pl.Tensor[[N_RANKS, T_DYN, HC_MULT, D], pl.FP32]],
     x_moe_next: pl.Out[pl.Tensor[[N_RANKS, MOE_TOKENS, HC_MULT, D], pl.FP32]],
     x_next: pl.Out[pl.Tensor[[N_RANKS, T_DYN, HC_MULT, D], pl.FP32]],
+    num_tokens_per_owner: pl.Tensor[[N_RANKS], pl.INT32],
     layer_id: pl.Scalar[pl.INT32],
     local_t: pl.Scalar[pl.INT32],
 ):
@@ -738,7 +800,7 @@ def l3_decode_layer_swa(
             attention_window, attention_signal, o_window, o_signal,
             recv_meta, recv_x, recv_aux, recv_route,
             arrived, data_arrived, routed_y_buf, combine_arrived,
-            layer_id, group_base, tp_rank, local_t, rank,
+            layer_id, group_base, tp_rank, num_tokens_per_owner, rank,
             pl.const(1, pl.INT32),
             device=rank,
         )
@@ -823,12 +885,12 @@ def decode_layer_hca(
     layer_id: pl.Scalar[pl.INT32],
     group_base: pl.Scalar[pl.INT32],
     tp_rank: pl.Scalar[pl.INT32],
+    owner_tokens: pl.Scalar[pl.INT32],
     local_t: pl.Scalar[pl.INT32],
     my_rank: pl.Scalar[pl.INT32],
     moe_epoch: pl.Scalar[pl.INT32],
 ):
     """Run one HCA attention and one MoE without clearing shared signals."""
-    active_t = pl.tensor.dim(x_hc, 0)
     with pl.scope():
         if TP_SIZE == 1:
             decode_hca_tp1(
@@ -870,7 +932,7 @@ def decode_layer_hca(
     with pl.scope():
         x_attn_moe = pl.create_tensor([MOE_TOKENS, HC_MULT, D], dtype=pl.FP32)
         for token in pl.spmd(MOE_TOKENS, name_hint="decode_layer_attn_pack"):
-            if token < active_t:
+            if token < owner_tokens:
                 x_attn_moe[token : token + 1, 0 : HC_MULT, 0 : D] = (
                     x_attn_active[token : token + 1, 0 : HC_MULT, 0 : D]
                 )
@@ -888,12 +950,16 @@ def decode_layer_hca(
             x_moe_next,
             recv_meta, recv_x, recv_aux, recv_route,
             arrived, data_arrived, routed_y_buf, combine_arrived,
-            layer_id, local_t, my_rank, moe_epoch,
+            layer_id, owner_tokens, my_rank, moe_epoch,
         )
 
         for token in pl.spmd(MOE_TOKENS, name_hint="decode_layer_active_trim"):
-            if token < active_t:
+            if token < owner_tokens:
                 x_next[token : token + 1, 0 : HC_MULT, 0 : D] = (x_moe_next[token : token + 1, 0 : HC_MULT, 0 : D])
+            elif token < local_t:
+                x_next[token : token + 1, 0 : HC_MULT, 0 : D] = pl.full(
+                    [1, HC_MULT, D], dtype=pl.FP32, value=0.0,
+                )
     return x_next
 
 
@@ -975,7 +1041,7 @@ def decode_layer_hca_test(
     layer_id: pl.Scalar[pl.INT32],
     group_base: pl.Scalar[pl.INT32],
     tp_rank: pl.Scalar[pl.INT32],
-    local_t: pl.Scalar[pl.INT32],
+    num_tokens_per_owner: pl.Tensor[[N_RANKS], pl.INT32],
     my_rank: pl.Scalar[pl.INT32],
     moe_epoch: pl.Scalar[pl.INT32],
 ):
@@ -1002,6 +1068,13 @@ def decode_layer_hca_test(
     x_attn_active.bind_dynamic(0, T_DYN)
     x_next.bind_dynamic(0, T_DYN)
 
+    local_t = pl.cast(pl.tensor.dim(x_hc, 0), pl.INT32)
+    owner_tokens = pl.read(num_tokens_per_owner, [my_rank])
+    if owner_tokens < 0:
+        owner_tokens = pl.cast(0, pl.INT32)
+    if owner_tokens > local_t:
+        owner_tokens = local_t
+
     decode_layer_hca(
         x_hc,
         hc_attn_fn, hc_attn_scale, hc_attn_base,
@@ -1027,7 +1100,7 @@ def decode_layer_hca_test(
         attention_window, attention_signal, o_window, o_signal,
         recv_meta, recv_x, recv_aux, recv_route,
         arrived, data_arrived, routed_y_buf, combine_arrived,
-        layer_id, group_base, tp_rank, local_t, my_rank, moe_epoch,
+        layer_id, group_base, tp_rank, owner_tokens, local_t, my_rank, moe_epoch,
     )
     clear_moe_signals(x_moe_next, arrived, data_arrived, combine_arrived)
     return x_next
@@ -1094,6 +1167,7 @@ def l3_decode_layer_hca(
     x_attn_active: pl.Out[pl.Tensor[[N_RANKS, T_DYN, HC_MULT, D], pl.FP32]],
     x_moe_next: pl.Out[pl.Tensor[[N_RANKS, MOE_TOKENS, HC_MULT, D], pl.FP32]],
     x_next: pl.Out[pl.Tensor[[N_RANKS, T_DYN, HC_MULT, D], pl.FP32]],
+    num_tokens_per_owner: pl.Tensor[[N_RANKS], pl.INT32],
     layer_id: pl.Scalar[pl.INT32],
     local_t: pl.Scalar[pl.INT32],
 ):
@@ -1182,7 +1256,7 @@ def l3_decode_layer_hca(
             attention_window, attention_signal, o_window, o_signal,
             recv_meta, recv_x, recv_aux, recv_route,
             arrived, data_arrived, routed_y_buf, combine_arrived,
-            layer_id, group_base, tp_rank, local_t, rank,
+            layer_id, group_base, tp_rank, num_tokens_per_owner, rank,
             pl.const(1, pl.INT32),
             device=rank,
         )
@@ -1282,12 +1356,12 @@ def decode_layer_csa(
     layer_id: pl.Scalar[pl.INT32],
     group_base: pl.Scalar[pl.INT32],
     tp_rank: pl.Scalar[pl.INT32],
+    owner_tokens: pl.Scalar[pl.INT32],
     local_t: pl.Scalar[pl.INT32],
     my_rank: pl.Scalar[pl.INT32],
     moe_epoch: pl.Scalar[pl.INT32],
 ):
     """Run one CSA attention and one MoE without clearing shared signals."""
-    active_t = pl.tensor.dim(x_hc, 0)
     with pl.scope():
         if TP_SIZE == 1:
             decode_csa_tp1(
@@ -1339,7 +1413,7 @@ def decode_layer_csa(
     with pl.scope():
         x_attn_moe = pl.create_tensor([MOE_TOKENS, HC_MULT, D], dtype=pl.FP32)
         for token in pl.spmd(MOE_TOKENS, name_hint="decode_layer_attn_pack"):
-            if token < active_t:
+            if token < owner_tokens:
                 x_attn_moe[token : token + 1, 0 : HC_MULT, 0 : D] = (
                     x_attn_active[token : token + 1, 0 : HC_MULT, 0 : D]
                 )
@@ -1357,12 +1431,16 @@ def decode_layer_csa(
             x_moe_next,
             recv_meta, recv_x, recv_aux, recv_route,
             arrived, data_arrived, routed_y_buf, combine_arrived,
-            layer_id, local_t, my_rank, moe_epoch,
+            layer_id, owner_tokens, my_rank, moe_epoch,
         )
 
         for token in pl.spmd(MOE_TOKENS, name_hint="decode_layer_active_trim"):
-            if token < active_t:
+            if token < owner_tokens:
                 x_next[token : token + 1, 0 : HC_MULT, 0 : D] = (x_moe_next[token : token + 1, 0 : HC_MULT, 0 : D])
+            elif token < local_t:
+                x_next[token : token + 1, 0 : HC_MULT, 0 : D] = pl.full(
+                    [1, HC_MULT, D], dtype=pl.FP32, value=0.0,
+                )
     return x_next
 
 
@@ -1459,7 +1537,7 @@ def decode_layer_csa_test(
     layer_id: pl.Scalar[pl.INT32],
     group_base: pl.Scalar[pl.INT32],
     tp_rank: pl.Scalar[pl.INT32],
-    local_t: pl.Scalar[pl.INT32],
+    num_tokens_per_owner: pl.Tensor[[N_RANKS], pl.INT32],
     my_rank: pl.Scalar[pl.INT32],
     moe_epoch: pl.Scalar[pl.INT32],
 ):
@@ -1492,6 +1570,13 @@ def decode_layer_csa_test(
     x_attn_active.bind_dynamic(0, T_DYN)
     x_next.bind_dynamic(0, T_DYN)
 
+    local_t = pl.cast(pl.tensor.dim(x_hc, 0), pl.INT32)
+    owner_tokens = pl.read(num_tokens_per_owner, [my_rank])
+    if owner_tokens < 0:
+        owner_tokens = pl.cast(0, pl.INT32)
+    if owner_tokens > local_t:
+        owner_tokens = local_t
+
     decode_layer_csa(
         x_hc,
         hc_attn_fn, hc_attn_scale, hc_attn_base,
@@ -1522,7 +1607,7 @@ def decode_layer_csa_test(
         attention_window, attention_signal, o_window, o_signal,
         recv_meta, recv_x, recv_aux, recv_route,
         arrived, data_arrived, routed_y_buf, combine_arrived,
-        layer_id, group_base, tp_rank, local_t, my_rank, moe_epoch,
+        layer_id, group_base, tp_rank, owner_tokens, local_t, my_rank, moe_epoch,
     )
     clear_moe_signals(x_moe_next, arrived, data_arrived, combine_arrived)
     return x_next
@@ -1604,6 +1689,7 @@ def l3_decode_layer_csa(
     x_attn_active: pl.Out[pl.Tensor[[N_RANKS, T_DYN, HC_MULT, D], pl.FP32]],
     x_moe_next: pl.Out[pl.Tensor[[N_RANKS, MOE_TOKENS, HC_MULT, D], pl.FP32]],
     x_next: pl.Out[pl.Tensor[[N_RANKS, T_DYN, HC_MULT, D], pl.FP32]],
+    num_tokens_per_owner: pl.Tensor[[N_RANKS], pl.INT32],
     layer_id: pl.Scalar[pl.INT32],
     local_t: pl.Scalar[pl.INT32],
 ):
@@ -1705,11 +1791,141 @@ def l3_decode_layer_csa(
             attention_window, attention_signal, o_window, o_signal,
             recv_meta, recv_x, recv_aux, recv_route,
             arrived, data_arrived, routed_y_buf, combine_arrived,
-            layer_id, group_base, tp_rank, local_t, rank,
+            layer_id, group_base, tp_rank, num_tokens_per_owner, rank,
             pl.const(1, pl.INT32),
             device=rank,
         )
     return x_next
+
+
+def _build_attention_specs(module, local_t, start_pos, owner_start_positions, expand_spec):
+    """Build one repeated or independently positioned fixture per TP group."""
+    import torch
+    from golden import TensorSpec
+
+    if owner_start_positions is None:
+        return [
+            expand_spec(spec)
+            for spec in module.build_distributed_tensor_specs(local_t, start_pos=start_pos)
+            if isinstance(spec, TensorSpec) and spec.name != "x_out"
+        ]
+
+    group_sources = []
+    for group_base in range(0, N_RANKS, TP_SIZE):
+        group_starts = (
+            owner_start_positions[group_base : group_base + TP_SIZE]
+            .reshape(-1)
+            .tolist()
+        )
+        group_sources.append({
+            source.name: source
+            for source in module.build_distributed_tensor_specs(local_t, start_pos=group_starts)
+            if isinstance(source, TensorSpec) and source.name != "x_out"
+        })
+
+    source_names = set(group_sources[0])
+    if any(set(sources) != source_names for sources in group_sources[1:]):
+        raise ValueError(f"{module.__name__} distributed specs differ across DP groups")
+
+    specs = []
+    for name, source in group_sources[0].items():
+        expected = (source.dtype, len(source.shape))
+        if any(
+            (sources[name].dtype, len(sources[name].shape)) != expected
+            for sources in group_sources[1:]
+        ):
+            raise ValueError(f"{module.__name__} spec {name!r} differs across DP groups")
+        shapes = [list(sources[name].shape) for sources in group_sources]
+        if any(shape[0] != TP_SIZE for shape in shapes):
+            raise ValueError(f"{module.__name__} spec {name!r} lacks its TP rank axis")
+        trailing_shape = [
+            max(shape[axis] for shape in shapes)
+            for axis in range(1, len(shapes[0]))
+        ]
+
+        def init_value(name=name, group_sources=group_sources, trailing_shape=trailing_shape):
+            result = None
+            for group, sources in enumerate(group_sources):
+                value = sources[name].create_tensor()
+                if result is None:
+                    result = value.new_zeros([N_RANKS, *trailing_shape])
+                slices = (slice(group * TP_SIZE, (group + 1) * TP_SIZE),) + tuple(
+                    slice(0, extent) for extent in value.shape[1:]
+                )
+                result[slices] = value
+            return result.contiguous()
+
+        spec = TensorSpec(
+            name, [N_RANKS, *trailing_shape], source.dtype,
+            init_value=init_value,
+        )
+        spec.resident = source.resident
+        specs.append(spec)
+    return specs
+
+
+def _mask_inactive_specs(specs, owner_token_counts, local_t, kind):
+    """Make inactive owner rows and cache writes fail closed in the fixture."""
+    from golden import TensorSpec
+
+    specs_by_name = {spec.name: spec for spec in specs}
+
+    def transform(name, fn):
+        source = specs_by_name.get(name)
+        if source is None or not isinstance(source, TensorSpec):
+            return
+
+        def init_value():
+            return fn(source.create_tensor())
+
+        transformed = TensorSpec(name, list(source.shape), source.dtype, init_value=init_value)
+        transformed.resident = source.resident
+        specs_by_name[name] = transformed
+
+    def mask_local_rows(value, fill_value):
+        value = value.clone()
+        for rank, active_tokens in enumerate(owner_token_counts.tolist()):
+            value[rank, active_tokens:] = fill_value
+        return value.contiguous()
+
+    def mask_group_slots(value):
+        value = value.clone()
+        for rank in range(N_RANKS):
+            group_base = rank - rank % TP_SIZE
+            for owner_offset in range(TP_SIZE):
+                owner_rank = group_base + owner_offset
+                active_tokens = int(owner_token_counts[owner_rank])
+                segment_begin = owner_offset * local_t
+                value[rank, segment_begin + active_tokens : segment_begin + local_t] = -1
+        return value.contiguous()
+
+    def mask_request_rows(value):
+        value = value.clone()
+        for rank, active_tokens in enumerate(owner_token_counts.tolist()):
+            value[rank, active_tokens // DECODE_SEQ :] = 0
+        return value.contiguous()
+
+    transform("x_hc", lambda value: mask_local_rows(value, 0))
+    transform("input_ids", lambda value: mask_local_rows(value, 0))
+    if kind == "swa":
+        slot_names = ("swa_slot_mapping",)
+        index_name, lens_name = "swa_indices", "swa_lens"
+    elif kind == "hca":
+        slot_names = ("ori_slot_mapping", "cmp_slot_mapping", "state_slot_mapping")
+        index_name, lens_name = "window_swa_indices", "window_swa_lens"
+    else:
+        slot_names = (
+            "ori_slot_mapping", "cmp_slot_mapping", "idx_slot_mapping",
+            "state_slot_mapping", "inner_state_slot_mapping",
+        )
+        index_name, lens_name = "window_swa_indices", "window_swa_lens"
+    for name in slot_names:
+        transform(name, mask_group_slots)
+    transform(index_name, lambda value: mask_local_rows(value, -1))
+    transform(lens_name, lambda value: mask_local_rows(value, 0))
+    if kind != "swa":
+        transform("kv_seq_lens", mask_request_rows)
+    return [specs_by_name[spec.name] for spec in specs]
 
 
 def _expand_swa_spec(spec):
@@ -1731,7 +1947,7 @@ def _expand_swa_spec(spec):
     return expanded
 
 
-def build_swa_layer_specs(start_pos=None, layer_id=0):
+def build_swa_layer_specs(start_pos=None, layer_id=0, num_tokens_per_owner=None):
     """Build one current-SWA fixture followed by the current MoE fixture."""
     import inspect
 
@@ -1740,19 +1956,17 @@ def build_swa_layer_specs(start_pos=None, layer_id=0):
 
     if attention_kind_for_layer(layer_id) != "swa":
         raise ValueError(f"layer {layer_id} is not an SWA layer")
-    batch = _active_batch(start_pos)
-    local_t = batch * DECODE_SEQ
-    _validate_active_tokens(local_t)
+    batch, local_t, owner_token_counts, owner_start_positions = _resolve_owner_fixture(
+        start_pos, num_tokens_per_owner,
+    )
     if batch > swa.B:
         raise ValueError(
             f"SWA batch {batch} exceeds TP{TP_SIZE} local capacity {swa.B}",
         )
 
-    specs = []
-    swa_specs = swa.build_distributed_tensor_specs(local_t, start_pos=start_pos)
-    for spec in swa_specs:
-        if isinstance(spec, TensorSpec) and spec.name != "x_out":
-            specs.append(_expand_swa_spec(spec))
+    specs = _build_attention_specs(
+        swa, local_t, start_pos, owner_start_positions, _expand_swa_spec,
+    )
 
     existing = {spec.name for spec in specs}
     for spec in moe_module.build_tensor_specs(
@@ -1782,11 +1996,16 @@ def build_swa_layer_specs(start_pos=None, layer_id=0):
                 [N_RANKS, local_t, HC_MULT, D],
                 torch.float32,
             ),
+            TensorSpec(
+                "num_tokens_per_owner", [N_RANKS], torch.int32,
+                init_value=lambda: owner_token_counts.clone(),
+            ),
             ScalarSpec("layer_id", torch.int32, layer_id),
             ScalarSpec("local_t", torch.int32, local_t),
         ],
     )
 
+    specs = _mask_inactive_specs(specs, owner_token_counts, local_t, "swa")
     specs_by_name = {spec.name: spec for spec in specs}
     parameter_names = [
         name
@@ -1809,6 +2028,7 @@ def golden_decode_layer_swa(tensors):
     import torch
 
     local_t = int(tensors["local_t"])
+    owner_token_counts = tensors["num_tokens_per_owner"]
     tensors["x_attn_active"].zero_()
     for group in range(TP_GROUPS):
         group_begin = group * TP_SIZE
@@ -1819,13 +2039,17 @@ def golden_decode_layer_swa(tensors):
         swa.golden_decode_swa(group_tensors)
 
     x_attn_moe = torch.zeros(N_RANKS, MOE_TOKENS, HC_MULT, D, dtype=torch.float32)
-    x_attn_moe[:, :local_t].copy_(tensors["x_attn_active"])
+    for rank, active_tokens in enumerate(owner_token_counts.tolist()):
+        tensors["x_attn_active"][rank, active_tokens:].zero_()
+        x_attn_moe[rank, :active_tokens].copy_(tensors["x_attn_active"][rank, :active_tokens])
     moe_tensors = dict(tensors)
     moe_tensors["x_hc"] = x_attn_moe
     moe_tensors["x_next"] = tensors["x_moe_next"]
     moe_tensors["num_tokens"] = local_t
     moe_module.golden_moe(moe_tensors)
-    tensors["x_next"].copy_(tensors["x_moe_next"][:, :local_t])
+    tensors["x_next"].zero_()
+    for rank, active_tokens in enumerate(owner_token_counts.tolist()):
+        tensors["x_next"][rank, :active_tokens].copy_(tensors["x_moe_next"][rank, :active_tokens])
 
 
 def _expand_hca_spec(spec):
@@ -1847,7 +2071,7 @@ def _expand_hca_spec(spec):
     return expanded
 
 
-def build_hca_layer_specs(start_pos=None, layer_id=3):
+def build_hca_layer_specs(start_pos=None, layer_id=3, num_tokens_per_owner=None):
     """Build one current-HCA fixture followed by the current MoE fixture."""
     import inspect
 
@@ -1856,19 +2080,17 @@ def build_hca_layer_specs(start_pos=None, layer_id=3):
 
     if attention_kind_for_layer(layer_id) != "hca":
         raise ValueError(f"layer {layer_id} is not an HCA layer")
-    batch = _active_batch(start_pos)
-    local_t = batch * DECODE_SEQ
-    _validate_active_tokens(local_t)
+    batch, local_t, owner_token_counts, owner_start_positions = _resolve_owner_fixture(
+        start_pos, num_tokens_per_owner,
+    )
     if batch > hca.B:
         raise ValueError(
             f"HCA batch {batch} exceeds TP{TP_SIZE} local capacity {hca.B}",
         )
 
-    specs = []
-    hca_specs = hca.build_distributed_tensor_specs(local_t, start_pos=start_pos)
-    for spec in hca_specs:
-        if isinstance(spec, TensorSpec) and spec.name != "x_out":
-            specs.append(_expand_hca_spec(spec))
+    specs = _build_attention_specs(
+        hca, local_t, start_pos, owner_start_positions, _expand_hca_spec,
+    )
 
     existing = {spec.name for spec in specs}
     for spec in moe_module.build_tensor_specs(
@@ -1898,11 +2120,16 @@ def build_hca_layer_specs(start_pos=None, layer_id=3):
                 [N_RANKS, local_t, HC_MULT, D],
                 torch.float32,
             ),
+            TensorSpec(
+                "num_tokens_per_owner", [N_RANKS], torch.int32,
+                init_value=lambda: owner_token_counts.clone(),
+            ),
             ScalarSpec("layer_id", torch.int32, layer_id),
             ScalarSpec("local_t", torch.int32, local_t),
         ],
     )
 
+    specs = _mask_inactive_specs(specs, owner_token_counts, local_t, "hca")
     specs_by_name = {spec.name: spec for spec in specs}
     parameter_names = [
         name
@@ -1925,6 +2152,7 @@ def golden_decode_layer_hca(tensors):
     import torch
 
     local_t = int(tensors["local_t"])
+    owner_token_counts = tensors["num_tokens_per_owner"]
     tensors["x_attn_active"].zero_()
     for group in range(TP_GROUPS):
         group_begin = group * TP_SIZE
@@ -1935,13 +2163,17 @@ def golden_decode_layer_hca(tensors):
         hca.golden_decode_hca(group_tensors)
 
     x_attn_moe = torch.zeros(N_RANKS, MOE_TOKENS, HC_MULT, D, dtype=torch.float32)
-    x_attn_moe[:, :local_t].copy_(tensors["x_attn_active"])
+    for rank, active_tokens in enumerate(owner_token_counts.tolist()):
+        tensors["x_attn_active"][rank, active_tokens:].zero_()
+        x_attn_moe[rank, :active_tokens].copy_(tensors["x_attn_active"][rank, :active_tokens])
     moe_tensors = dict(tensors)
     moe_tensors["x_hc"] = x_attn_moe
     moe_tensors["x_next"] = tensors["x_moe_next"]
     moe_tensors["num_tokens"] = local_t
     moe_module.golden_moe(moe_tensors)
-    tensors["x_next"].copy_(tensors["x_moe_next"][:, :local_t])
+    tensors["x_next"].zero_()
+    for rank, active_tokens in enumerate(owner_token_counts.tolist()):
+        tensors["x_next"][rank, :active_tokens].copy_(tensors["x_moe_next"][rank, :active_tokens])
 
 
 def _expand_csa_spec(spec):
@@ -1963,7 +2195,7 @@ def _expand_csa_spec(spec):
     return expanded
 
 
-def build_csa_layer_specs(start_pos=None, layer_id=2):
+def build_csa_layer_specs(start_pos=None, layer_id=2, num_tokens_per_owner=None):
     """Build one current-CSA fixture followed by the current MoE fixture."""
     import inspect
 
@@ -1972,19 +2204,17 @@ def build_csa_layer_specs(start_pos=None, layer_id=2):
 
     if attention_kind_for_layer(layer_id) != "csa":
         raise ValueError(f"layer {layer_id} is not a CSA layer")
-    batch = _active_batch(start_pos)
-    local_t = batch * DECODE_SEQ
-    _validate_active_tokens(local_t)
+    batch, local_t, owner_token_counts, owner_start_positions = _resolve_owner_fixture(
+        start_pos, num_tokens_per_owner,
+    )
     if batch > csa.B:
         raise ValueError(
             f"CSA batch {batch} exceeds TP{TP_SIZE} local capacity {csa.B}",
         )
 
-    specs = []
-    csa_specs = csa.build_distributed_tensor_specs(local_t, start_pos=start_pos)
-    for spec in csa_specs:
-        if isinstance(spec, TensorSpec) and spec.name != "x_out":
-            specs.append(_expand_csa_spec(spec))
+    specs = _build_attention_specs(
+        csa, local_t, start_pos, owner_start_positions, _expand_csa_spec,
+    )
 
     existing = {spec.name for spec in specs}
     for spec in moe_module.build_tensor_specs(
@@ -2014,11 +2244,16 @@ def build_csa_layer_specs(start_pos=None, layer_id=2):
                 [N_RANKS, local_t, HC_MULT, D],
                 torch.float32,
             ),
+            TensorSpec(
+                "num_tokens_per_owner", [N_RANKS], torch.int32,
+                init_value=lambda: owner_token_counts.clone(),
+            ),
             ScalarSpec("layer_id", torch.int32, layer_id),
             ScalarSpec("local_t", torch.int32, local_t),
         ],
     )
 
+    specs = _mask_inactive_specs(specs, owner_token_counts, local_t, "csa")
     specs_by_name = {spec.name: spec for spec in specs}
     parameter_names = [
         name
@@ -2041,6 +2276,7 @@ def golden_decode_layer_csa(tensors):
     import torch
 
     local_t = int(tensors["local_t"])
+    owner_token_counts = tensors["num_tokens_per_owner"]
     tensors["x_attn_active"].zero_()
     for group in range(TP_GROUPS):
         group_begin = group * TP_SIZE
@@ -2051,13 +2287,17 @@ def golden_decode_layer_csa(tensors):
         csa.golden_decode_csa(group_tensors)
 
     x_attn_moe = torch.zeros(N_RANKS, MOE_TOKENS, HC_MULT, D, dtype=torch.float32)
-    x_attn_moe[:, :local_t].copy_(tensors["x_attn_active"])
+    for rank, active_tokens in enumerate(owner_token_counts.tolist()):
+        tensors["x_attn_active"][rank, active_tokens:].zero_()
+        x_attn_moe[rank, :active_tokens].copy_(tensors["x_attn_active"][rank, :active_tokens])
     moe_tensors = dict(tensors)
     moe_tensors["x_hc"] = x_attn_moe
     moe_tensors["x_next"] = tensors["x_moe_next"]
     moe_tensors["num_tokens"] = local_t
     moe_module.golden_moe(moe_tensors)
-    tensors["x_next"].copy_(tensors["x_moe_next"][:, :local_t])
+    tensors["x_next"].zero_()
+    for rank, active_tokens in enumerate(owner_token_counts.tolist()):
+        tensors["x_next"][rank, :active_tokens].copy_(tensors["x_moe_next"][rank, :active_tokens])
 
 
 def _parse_start_pos(raw):
@@ -2068,6 +2308,40 @@ def _parse_start_pos(raw):
         raise ValueError("--start-pos must contain at least one integer")
     values = [int(part) for part in parts]
     return values[0] if len(values) == 1 else values
+
+
+def _parse_num_tokens_per_owner(raw):
+    if raw is None:
+        return None
+    values = [int(part.strip()) for part in raw.split(",") if part.strip()]
+    if not values:
+        raise ValueError("--num-tokens-per-owner must contain at least one integer")
+    return values[0] if len(values) == 1 else values
+
+
+def _active_owner_rows_compare(compare):
+    """Apply an existing tensor comparator only to each owner's active prefix."""
+    def compare_active(actual, expected, **kwargs):
+        import torch
+
+        owner_counts = kwargs.get("inputs", {}).get("num_tokens_per_owner")
+        if owner_counts is None:
+            return False, "    missing num_tokens_per_owner for active-row comparison"
+        actual_rows = []
+        expected_rows = []
+        for rank, active_tokens in enumerate(owner_counts.tolist()):
+            if active_tokens:
+                actual_rows.append(actual[rank, :active_tokens])
+                expected_rows.append(expected[rank, :active_tokens])
+        if not actual_rows:
+            return True, ""
+        return compare(
+            torch.cat(actual_rows, dim=0),
+            torch.cat(expected_rows, dim=0),
+            **kwargs,
+        )
+
+    return compare_active
 
 
 def main():
@@ -2094,7 +2368,14 @@ def main():
     parser.add_argument("--layer-id", type=int, default=0)
     parser.add_argument(
         "--start-pos", type=str, default=None,
-        help="a scalar selects batch=1; a comma-separated list sets batch to its length",
+        help=(
+            "a scalar selects batch=1; a comma-separated list sets the batch; "
+            "with per-owner token counts, a compact list maps active requests in rank order"
+        ),
+    )
+    parser.add_argument(
+        "--num-tokens-per-owner", type=str, default=None,
+        help=f"one broadcast count or {N_RANKS} comma-separated active-prefix lengths",
     )
     parser.add_argument(
         "--enable-chip-swimlane", type=int, default=0, choices=range(5),
@@ -2114,9 +2395,13 @@ def main():
     if args.tp != TP_SIZE or args.ep != EP_SIZE:
         parser.error(f"parallel sizes froze at import as TP={TP_SIZE}, EP={EP_SIZE}")
     start_pos = _parse_start_pos(args.start_pos)
+    num_tokens_per_owner = _parse_num_tokens_per_owner(args.num_tokens_per_owner)
     kind = attention_kind_for_layer(args.layer_id)
 
-    report = build_layer_shape_report(args.layer_id, start_pos=start_pos)
+    report = build_layer_shape_report(
+        args.layer_id, start_pos=start_pos,
+        num_tokens_per_owner=num_tokens_per_owner,
+    )
     if args.shape_only:
         print(
             f"layer={report['layer_id']} kind={report['kind']} "
@@ -2142,7 +2427,10 @@ def main():
     local_t = report["active_tokens"]
     if kind == "swa":
         layer_fn = l3_decode_layer_swa
-        specs = build_swa_layer_specs(start_pos=start_pos, layer_id=args.layer_id)
+        specs = build_swa_layer_specs(
+            start_pos=start_pos, layer_id=args.layer_id,
+            num_tokens_per_owner=num_tokens_per_owner,
+        )
         golden_fn = golden_decode_layer_swa
         compare_fn = {
             "kv_cache": mapped_pool_ratio_allclose(
@@ -2155,20 +2443,22 @@ def main():
                 rtol=1.0 / 128,
                 max_error_ratio=0.005,
             ),
-            "x_attn_active": ratio_reldiff(
+            "x_attn_active": _active_owner_rows_compare(ratio_reldiff(
                 diff_thd=3e-3, pct_thd=0.008, max_diff_hd=1,
-            ),
-            "x_moe_next": ratio_reldiff(
-                diff_thd=0.01,
-                pct_thd=0.05,
-                valid_rows=local_t,
-                valid_axis=1,
-            ),
-            "x_next": ratio_reldiff(diff_thd=0.01, pct_thd=0.05),
+            )),
+            "x_moe_next": _active_owner_rows_compare(ratio_reldiff(
+                diff_thd=0.01, pct_thd=0.05,
+            )),
+            "x_next": _active_owner_rows_compare(ratio_reldiff(
+                diff_thd=0.01, pct_thd=0.05,
+            )),
         }
     elif kind == "hca":
         layer_fn = l3_decode_layer_hca
-        specs = build_hca_layer_specs(start_pos=start_pos, layer_id=args.layer_id)
+        specs = build_hca_layer_specs(
+            start_pos=start_pos, layer_id=args.layer_id,
+            num_tokens_per_owner=num_tokens_per_owner,
+        )
         golden_fn = golden_decode_layer_hca
         mapping_shape = (N_RANKS, TP_SIZE * local_t)
         compare_fn = {
@@ -2199,20 +2489,22 @@ def main():
                 atol=1e-3,
                 rtol=1.0 / 128,
             ),
-            "x_attn_active": ratio_reldiff(
+            "x_attn_active": _active_owner_rows_compare(ratio_reldiff(
                 diff_thd=3e-3, pct_thd=0.008, max_diff_hd=1,
-            ),
-            "x_moe_next": ratio_reldiff(
-                diff_thd=0.01,
-                pct_thd=0.05,
-                valid_rows=local_t,
-                valid_axis=1,
-            ),
-            "x_next": ratio_reldiff(diff_thd=0.01, pct_thd=0.05),
+            )),
+            "x_moe_next": _active_owner_rows_compare(ratio_reldiff(
+                diff_thd=0.01, pct_thd=0.05,
+            )),
+            "x_next": _active_owner_rows_compare(ratio_reldiff(
+                diff_thd=0.01, pct_thd=0.05,
+            )),
         }
     else:
         layer_fn = l3_decode_layer_csa
-        specs = build_csa_layer_specs(start_pos=start_pos, layer_id=args.layer_id)
+        specs = build_csa_layer_specs(
+            start_pos=start_pos, layer_id=args.layer_id,
+            num_tokens_per_owner=num_tokens_per_owner,
+        )
         golden_fn = golden_decode_layer_csa
         mapping_shape = (N_RANKS, TP_SIZE * local_t)
         compare_fn = {
@@ -2272,16 +2564,15 @@ def main():
                 rtol=1.0 / 128,
                 max_error_ratio=0.01,
             ),
-            "x_attn_active": ratio_reldiff(
+            "x_attn_active": _active_owner_rows_compare(ratio_reldiff(
                 diff_thd=4e-3, pct_thd=0.008, max_diff_hd=2,
-            ),
-            "x_moe_next": ratio_reldiff(
-                diff_thd=0.01,
-                pct_thd=0.05,
-                valid_rows=local_t,
-                valid_axis=1,
-            ),
-            "x_next": ratio_reldiff(diff_thd=0.01, pct_thd=0.05),
+            )),
+            "x_moe_next": _active_owner_rows_compare(ratio_reldiff(
+                diff_thd=0.01, pct_thd=0.05,
+            )),
+            "x_next": _active_owner_rows_compare(ratio_reldiff(
+                diff_thd=0.01, pct_thd=0.05,
+            )),
         }
 
     result = run(
