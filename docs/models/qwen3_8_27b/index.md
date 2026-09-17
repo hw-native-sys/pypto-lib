@@ -107,9 +107,12 @@ reshapes its rank-3 inputs to `[T, heads*D]` as its first statement, so what
 the consumers need is each tensor contiguous in its own buffer, not a
 particular rank.
 
-**On a2a3 at T = 8192, 20 rounds: 9330 us**, against 9559 for the same
-fourteen kernels timed separately -- so composing is worth about 230 us, and
+**On a2a3 at T = 8192: 9353 us**, against 9559 for the same fourteen kernels
+timed separately in the same grant -- so composing is worth about 205 us, and
 that difference is the whole of the inter-kernel overlap the runtime performs.
+Both figures come from one sitting, which is what makes the difference
+meaningful: the block's own between-grant spread is about 150 us, and it
+re-measured 9378 us mean over 50 rounds on a later one.
 Most of it is at the head, where `in_proj_ab`, the halo fill, the gate half of
 `qk_norm_gate` and `chunk_cumsum` all run underneath `quant_x` for free.
 
