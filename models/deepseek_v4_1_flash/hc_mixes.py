@@ -6,7 +6,7 @@
 # INCLUDING BUT NOT LIMITED TO NON-INFRINGEMENT, MERCHANTABILITY, OR FITNESS FOR A PARTICULAR PURPOSE.
 # See LICENSE in the root of the software repository for the full text of the License.
 # -----------------------------------------------------------------------------------------------------------
-"""mHC coefficient generation, stream collapse, residual expansion, and final collapse."""
+"""mHC coefficient generation."""
 
 import math
 import sys
@@ -24,7 +24,7 @@ import torch
 # ci: a5
 
 from models.deepseek_v4_1_flash.config import D, FLASH, HC_DIM, HC_MULT, MIX_HC, T_DYN
-from models.deepseek_v4_1_flash.golden import hc_head, hc_mixes, hc_post, hc_pre
+from models.deepseek_v4_1_flash.golden import hc_mixes
 
 
 HC_DIM_INV = 1.0 / HC_DIM
@@ -40,32 +40,6 @@ RMS_K_TILE = 512
 LINEAR_K_TILE = 256
 LINEAR_OK = 4
 LINEAR_K_PER_SPLIT = HC_DIM // LINEAR_OK
-
-
-def golden_mhc_mixes(
-    x_hc: torch.Tensor,
-    function: torch.Tensor,
-    scale: torch.Tensor,
-    base: torch.Tensor,
-) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    return hc_mixes(x_hc, function, scale, base)
-
-
-def golden_mhc_pre(x_hc: torch.Tensor, pre_mix: torch.Tensor) -> torch.Tensor:
-    return hc_pre(x_hc, pre_mix).to(torch.bfloat16)
-
-
-def golden_mhc_post(
-    sublayer: torch.Tensor,
-    residual: torch.Tensor,
-    post_mix: torch.Tensor,
-    residual_mix: torch.Tensor,
-) -> torch.Tensor:
-    return hc_post(sublayer, residual, post_mix, residual_mix).to(torch.float32)
-
-
-def golden_mhc_head(x_hc: torch.Tensor, pre_mix: torch.Tensor) -> torch.Tensor:
-    return hc_head(x_hc, pre_mix)
 
 
 @pl.jit.inline
@@ -289,117 +263,18 @@ def mhc_mixes(
         pl.store(pl.set_validshape(row3, valid_rows, HC_MULT), [t0, 3 * HC_MULT], residual_mix_flat)
     return pre_mix, post_mix, residual_mix
 
-
-@pl.jit.inline
-def mhc_pre(
-    x_hc: pl.Tensor[[T_DYN, HC_MULT, D], pl.FP32],
-    pre_mix: pl.Tensor[[T_DYN, HC_MULT], pl.FP32],
-    output: pl.Tensor[[T_DYN, D], pl.BF16],
-):
-    t_dim = pl.tensor.dim(x_hc, 0)
-    x_flat = pl.reshape(x_hc, [t_dim, HC_DIM])
-    for block in pl.spmd((t_dim + T_TILE - 1) // T_TILE * (D // 1024), name_hint="mhc_pre"):
-        token_block = block // (D // 1024)
-        d_block = block % (D // 1024)
-        t0 = token_block * T_TILE
-        d_base = d_block * 1024
-        valid_rows = pl.min(T_TILE, t_dim - t0)
-        pre_tile = pl.load(
-            pre_mix,
-            [t0, 0],
-            [T_TILE, HC_PAD],
-            valid_shape=[valid_rows, HC_MULT],
-            target_memory=pl.MemorySpace.Vec,
-        )
-        pre_transposed = pl.transpose(pre_tile, axis1=0, axis2=1)
-        pre0 = pl.reshape(pre_transposed[0:1, 0:T_TILE], [T_TILE, 1])
-        pre1 = pl.reshape(pre_transposed[1:2, 0:T_TILE], [T_TILE, 1])
-        pre2 = pl.reshape(pre_transposed[2:3, 0:T_TILE], [T_TILE, 1])
-        pre3 = pl.reshape(pre_transposed[3:4, 0:T_TILE], [T_TILE, 1])
-        for db in pl.pipeline(1024 // 256, stage=2):
-            d0 = d_base + db * 256
-            x0 = pl.load(
-                x_flat,
-                [t0, d0],
-                [T_TILE, 256],
-                valid_shape=[valid_rows, 256],
-                target_memory=pl.MemorySpace.Vec,
-            )
-            x1 = pl.load(
-                x_flat,
-                [t0, D + d0],
-                [T_TILE, 256],
-                valid_shape=[valid_rows, 256],
-                target_memory=pl.MemorySpace.Vec,
-            )
-            x2 = pl.load(
-                x_flat,
-                [t0, 2 * D + d0],
-                [T_TILE, 256],
-                valid_shape=[valid_rows, 256],
-                target_memory=pl.MemorySpace.Vec,
-            )
-            x3 = pl.load(
-                x_flat,
-                [t0, 3 * D + d0],
-                [T_TILE, 256],
-                valid_shape=[valid_rows, 256],
-                target_memory=pl.MemorySpace.Vec,
-            )
-            y0 = pl.row_expand_mul(x0, pre0)
-            y1 = pl.row_expand_mul(x1, pre1)
-            y2 = pl.row_expand_mul(x2, pre2)
-            y3 = pl.row_expand_mul(x3, pre3)
-            y01 = pl.add(y0, y1)
-            y23 = pl.add(y2, y3)
-            y_tile = pl.add(y01, y23)
-            y_bf16 = pl.cast(y_tile, target_type=pl.BF16, mode="rint")
-            pl.store(pl.set_validshape(y_bf16, valid_rows, 256), [t0, d0], output)
-    return output
-
-
-@pl.jit.inline
-def mhc_post(
-    sublayer: pl.Tensor[[T_DYN, D], pl.BF16],
-    residual: pl.Tensor[[T_DYN, HC_MULT, D], pl.FP32],
-    post_mix: pl.Tensor[[T_DYN, HC_MULT], pl.FP32],
-    residual_mix: pl.Tensor[[T_DYN, HC_MULT, HC_MULT], pl.FP32],
-    output: pl.Tensor[[T_DYN, HC_MULT, D], pl.FP32],
-):
-    t_dim = pl.tensor.dim(sublayer, 0)
-    residual_flat = pl.reshape(residual, [t_dim, HC_DIM])
-    residual_mix_flat = pl.reshape(residual_mix, [t_dim, HC_MULT * HC_MULT])
-    output_flat = pl.reshape(output, [t_dim, HC_DIM])
-    for block in pl.spmd(t_dim * HC_MULT, name_hint="mhc_post"):
-        t = block // HC_MULT
-        out_h = block % HC_MULT
-        for d0 in pl.pipeline(0, D, 256, stage=2):
-            x_tile = pl.cast(sublayer[t : t + 1, d0 : d0 + 256], target_type=pl.FP32)
-            value = pl.mul(x_tile, pl.read(post_mix, [t, out_h]))
-            for in_h in pl.unroll(HC_MULT):
-                residual_tile = residual_flat[t : t + 1, in_h * D + d0 : in_h * D + d0 + 256]
-                value = pl.add(
-                    value,
-                    pl.mul(residual_tile, pl.read(residual_mix_flat, [t, in_h * HC_MULT + out_h])),
-                )
-            output_flat[t : t + 1, out_h * D + d0 : out_h * D + d0 + 256] = pl.cast(
-                pl.cast(value, target_type=pl.BF16, mode="rint"),
-                target_type=pl.FP32,
-            )
-    return output
-
-
-@pl.jit.inline
-def mhc_head(
-    x_hc: pl.Tensor[[T_DYN, HC_MULT, D], pl.FP32],
-    pre_mix: pl.Tensor[[T_DYN, HC_MULT], pl.FP32],
-    output: pl.Tensor[[T_DYN, D], pl.BF16],
-):
-    return mhc_pre(x_hc, pre_mix, output)
+def golden_mhc_mixes(
+    x_hc: torch.Tensor,
+    function: torch.Tensor,
+    scale: torch.Tensor,
+    base: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Generate the reference pre, post, and residual mixing coefficients."""
+    return hc_mixes(x_hc, function, scale, base)
 
 
 @pl.jit
-def mhc_test(
+def mhc_mixes_test(
     x_hc: pl.Tensor[[T_DYN, HC_MULT, D], pl.FP32],
     function: pl.Tensor[[MIX_HC, HC_DIM], pl.FP32],
     scale: pl.Tensor[[3], pl.FP32],
@@ -407,27 +282,18 @@ def mhc_test(
     pre_mix: pl.Out[pl.Tensor[[T_DYN, HC_MULT], pl.FP32]],
     post_mix: pl.Out[pl.Tensor[[T_DYN, HC_MULT], pl.FP32]],
     residual_mix: pl.Out[pl.Tensor[[T_DYN, HC_MULT, HC_MULT], pl.FP32]],
-    sublayer: pl.Out[pl.Tensor[[T_DYN, D], pl.BF16]],
-    post_output: pl.Out[pl.Tensor[[T_DYN, HC_MULT, D], pl.FP32]],
-    head_output: pl.Out[pl.Tensor[[T_DYN, D], pl.BF16]],
 ):
-    """Run the complete mHC PTO pipeline for golden.run validation."""
+    """Run mHC coefficient generation for standalone validation."""
     x_hc.bind_dynamic(0, T_DYN)
     pre_mix.bind_dynamic(0, T_DYN)
     post_mix.bind_dynamic(0, T_DYN)
     residual_mix.bind_dynamic(0, T_DYN)
-    sublayer.bind_dynamic(0, T_DYN)
-    post_output.bind_dynamic(0, T_DYN)
-    head_output.bind_dynamic(0, T_DYN)
     mhc_mixes(x_hc, function, scale, base, pre_mix, post_mix, residual_mix)
-    mhc_pre(x_hc, pre_mix, sublayer)
-    mhc_post(sublayer, x_hc, post_mix, residual_mix, post_output)
-    mhc_head(post_output, pre_mix, head_output)
-    return head_output
+    return residual_mix
 
 
-def build_mhc_tensor_specs(batch: int = 2, sequence: int = 1):
-    """Build deterministic actual-shape inputs and all mHC pipeline outputs."""
+def build_mhc_mixes_tensor_specs(batch: int = 2, sequence: int = 1):
+    """Build deterministic inputs and outputs for coefficient validation."""
     from golden import TensorSpec
 
     tokens = batch * sequence
@@ -453,31 +319,17 @@ def build_mhc_tensor_specs(batch: int = 2, sequence: int = 1):
         TensorSpec("pre_mix", [tokens, HC_MULT], torch.float32),
         TensorSpec("post_mix", [tokens, HC_MULT], torch.float32),
         TensorSpec("residual_mix", [tokens, HC_MULT, HC_MULT], torch.float32),
-        TensorSpec("sublayer", [tokens, D], torch.bfloat16),
-        TensorSpec("post_output", [tokens, HC_MULT, D], torch.float32),
-        TensorSpec("head_output", [tokens, D], torch.bfloat16),
     ]
 
 
-def golden_mhc_pipeline(tensors):
-    """Fill all expected outputs for the complete mHC pipeline."""
+def golden_mhc_mixes_case(tensors):
+    """Fill the expected coefficient outputs."""
     pre_mix, post_mix, residual_mix = golden_mhc_mixes(
         tensors["x_hc"], tensors["function"], tensors["scale"], tensors["base"]
     )
-    sublayer = golden_mhc_pre(tensors["x_hc"], pre_mix)
-    post_output = golden_mhc_post(
-        sublayer,
-        tensors["x_hc"],
-        post_mix,
-        residual_mix,
-    )
-    head_output = golden_mhc_head(post_output, pre_mix)
     tensors["pre_mix"][:] = pre_mix
     tensors["post_mix"][:] = post_mix
     tensors["residual_mix"][:] = residual_mix
-    tensors["sublayer"][:] = sublayer
-    tensors["post_output"][:] = post_output
-    tensors["head_output"][:] = head_output
 
 
 def _precision_compare(name, compare):
@@ -496,38 +348,28 @@ def _precision_compare(name, compare):
 
 
 def main():
-    """Validate the complete mHC pipeline on A5."""
+    """Validate mHC coefficient generation on A5."""
     import argparse
 
     from golden import ratio_allclose, run
-    from models.deepseek_v4_1_flash._golden_smoke import run_mhc_goldens
 
-    run_mhc_goldens(golden_mhc_mixes, golden_mhc_pre, golden_mhc_post, golden_mhc_head)
-
-    parser = argparse.ArgumentParser()
+    parser = argparse.ArgumentParser(description="DeepSeek V4.1 mHC coefficient validation")
     parser.add_argument("-p", "--platform", default="a5", choices=["a5", "a5sim"])
+    parser.add_argument("-d", "--device", type=int, default=0)
     parser.add_argument("--tp", type=int, default=1, choices=[1, 2, 4])
     parser.add_argument("--dp", type=int, default=1, choices=[1, 2])
-    parser.add_argument("-d", "--device", type=int, default=0)
     parser.add_argument("--batch", type=int, default=2)
     parser.add_argument("--sequence", type=int, default=1)
     parser.add_argument("--compile-only", action="store_true")
     args = parser.parse_args()
     result = run(
-        fn=mhc_test,
-        specs=build_mhc_tensor_specs(args.batch, args.sequence),
-        golden_fn=golden_mhc_pipeline,
+        fn=mhc_mixes_test,
+        specs=build_mhc_mixes_tensor_specs(args.batch, args.sequence),
+        golden_fn=golden_mhc_mixes_case,
         config={"platform": args.platform, "device_id": args.device},
         rtol=1e-3,
         atol=1e-3,
         compare_fn={
-            "sublayer": _precision_compare("sublayer", ratio_allclose(atol=1e-4, rtol=1.0 / 128)),
-            "post_output": _precision_compare(
-                "post_output", ratio_allclose(atol=1e-4, rtol=1.0 / 128)
-            ),
-            "head_output": _precision_compare(
-                "head_output", ratio_allclose(atol=1e-4, rtol=1.0 / 128)
-            ),
             "pre_mix": _precision_compare("pre_mix", ratio_allclose(atol=2.5e-5, rtol=5e-3)),
             "post_mix": _precision_compare("post_mix", ratio_allclose(atol=2.5e-5, rtol=5e-3)),
             "residual_mix": _precision_compare(
@@ -541,15 +383,11 @@ def main():
 
 
 __all__ = [
-    "golden_mhc_head",
+    "build_mhc_mixes_tensor_specs",
     "golden_mhc_mixes",
-    "golden_mhc_post",
-    "golden_mhc_pre",
-    "mhc_head",
+    "golden_mhc_mixes_case",
     "mhc_mixes",
-    "mhc_post",
-    "mhc_pre",
-    "mhc_test",
+    "mhc_mixes_test",
 ]
 
 # A2/A3 CI currently discovers runnable model files by the conventional entry
