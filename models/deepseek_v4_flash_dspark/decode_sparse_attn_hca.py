@@ -297,6 +297,7 @@ def sparse_attn_hca(
             raw_qk_task = pl.tile.get_block_idx()
             pl.system.set_ffts(raw_ffts_workspace)
             raw_qk_count = pl.max((t_dim - raw_qk_task + RAW_WORKERS - 1) // RAW_WORKERS, 0)
+            raw_kv_l1 = pl.create_tile([QK_TRANSFER_SLOTS * ATTN_K_TILE, HEAD_DIM], dtype=pl.BF16, target_memory=pl.MemorySpace.Mat)
             for raw_qk_tick in pl.range(raw_qk_count + QK_PRE_LAUNCH):
                 if raw_qk_tick < raw_qk_count:
                     raw_qk_t = raw_qk_task + raw_qk_tick * RAW_WORKERS
@@ -308,23 +309,23 @@ def sparse_attn_hca(
                     raw_qk_drop = pl.max(raw_qk_first_len + raw_qk_token - WIN, 0)
                     raw_qk_base = raw_qk_request * REQUEST_KV_ROWS + raw_qk_drop
                     raw_qk_q = pl.load(q_flat, [raw_qk_t * H, 0], [H, HEAD_DIM], target_memory=pl.MemorySpace.Mat)
-                    raw_qk_kv = pl.load(raw_kv, [raw_qk_base, 0], [ATTN_K_TILE, HEAD_DIM], target_memory=pl.MemorySpace.Mat)
-                    raw_qk_scores = pl.matmul(raw_qk_q, pl.tile.transpose_view(raw_qk_kv), out_dtype=pl.FP32)
+                    raw_qk_l1_row = (raw_qk_tick % QK_TRANSFER_SLOTS) * ATTN_K_TILE
+                    raw_kv_l1 = pl.gather_row(raw_kv_l1, raw_kv, [raw_qk_l1_row, 0], [raw_qk_base, 0], [ATTN_K_TILE, HEAD_DIM])
+                    raw_kv_l1_t = pl.tile.transpose_view(raw_kv_l1)
+                    raw_qk_kv_t = pl.tile.slice(raw_kv_l1_t, [HEAD_DIM, ATTN_K_TILE], [0, raw_qk_l1_row])
+                    raw_qk_scores = pl.matmul(raw_qk_q, raw_qk_kv_t, out_dtype=pl.FP32)
                     pl.store(raw_qk_scores, [raw_qk_row, 0], raw_score_transfer)
                     pl.system.sync_set(QK_SCORE_READY_EVENT, pipe=pl.PipeType.FIX, ffts_mode=2, core_type=pl.KernelType.AIC)
                 if raw_qk_tick >= QK_PRE_LAUNCH:
                     raw_pv_item = raw_qk_tick - QK_PRE_LAUNCH
                     raw_pv_t = raw_qk_task + raw_pv_item * RAW_WORKERS
                     raw_pv_slot = raw_qk_task * QK_TRANSFER_SLOTS + raw_pv_item % QK_TRANSFER_SLOTS
-                    raw_pv_request = raw_pv_t // S
-                    raw_pv_first_len = pl.read(window_swa_lens, [raw_pv_request * S])
-                    raw_pv_drop = pl.max(raw_pv_first_len + raw_pv_t % S - WIN, 0)
-                    raw_pv_base = raw_pv_request * REQUEST_KV_ROWS + raw_pv_drop
                     pl.system.sync_wait(QK_PROB_READY_EVENT, pipe=pl.PipeType.MTE2, core_type=pl.KernelType.AIC)
                     raw_pv_probability = pl.load(
                         raw_probability_transfer, [raw_pv_slot * H, 0], [H, ATTN_K_TILE], target_memory=pl.MemorySpace.Mat,
                     )
-                    raw_pv_kv = pl.load(raw_kv, [raw_pv_base, 0], [ATTN_K_TILE, HEAD_DIM], target_memory=pl.MemorySpace.Mat)
+                    raw_pv_l1_row = (raw_pv_item % QK_TRANSFER_SLOTS) * ATTN_K_TILE
+                    raw_pv_kv = pl.tile.slice(raw_kv_l1, [ATTN_K_TILE, HEAD_DIM], [raw_pv_l1_row, 0])
                     raw_pv_output = pl.matmul(raw_pv_probability, raw_pv_kv, out_dtype=pl.FP32)
                     pl.store(raw_pv_output, [raw_pv_t * H, 0], stream_heads)
 
