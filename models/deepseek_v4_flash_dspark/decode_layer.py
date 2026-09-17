@@ -1800,7 +1800,6 @@ def l3_decode_layer_csa(
 
 def _build_attention_specs(module, local_t, start_pos, owner_start_positions, expand_spec):
     """Build one repeated or independently positioned fixture per TP group."""
-    import torch
     from golden import TensorSpec
 
     if owner_start_positions is None:
