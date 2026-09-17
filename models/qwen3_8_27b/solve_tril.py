@@ -28,13 +28,25 @@ keys are correlated: the row sums reach **37**, the powers stay ~1 instead of
 shrinking, the intermediates pass **7e+05** against FP16's 65504, and the
 kernel returned NaN -- silently, because the composed block's int8 hand-off
 turned it into finite garbage. Splitting bounds each block's powers
-independently while keeping every matmul full-tile, so the fix costs 16 matmuls
+independently while keeping every matmul full-tile, so the fix costs 15 matmuls
 against 13 rather than the 52 that shrinking the tiles would take.
 
-Measured at T = 8192, H = 48: **1622.1 us against 1269.6 for the unsplit form**,
-and on the real layer 2.287e-04 against a 1e-3 gate where the unsplit form is
-non-finite. BLOCK = 16 rather than 32 because the split makes the block size
-free -- 16 matmuls either way -- so it takes the one with the most margin.
+Both identities are formed by `matmul_acc(acc, I, I)`, which adds `I` to an
+accumulator in one matmul. That needs the accumulator to already hold the
+negative -- so `blk_masks` carries a minus sign and both `-D` and `-N` come out
+of the vector multiplies, saving a matmul on the outer identity. `D @ D` and
+`M @ M` square the sign away. It also means the cube needs one `[chunk, chunk]`
+identity rather than `-I` stacked to `[2*chunk, chunk]`.
+
+Measured at T = 8192, H = 48, paired in one grant: **1440.2 us against 1497.2**
+for the same split with each identity built by a negate-then-add pair, at a
+slightly better error (2.198e-04 against 2.286e-04 on the real layer, where the
+gate is 1e-3 and the unsplit form is non-finite). The split as a whole costs
+about a quarter over the unsplit doubling -- 1622.1 against 1269.6, paired in an
+earlier grant -- and none of it reaches the composed block, whose latency is
+unchanged inside its 150 us between-grant spread. BLOCK = 16 rather than 32
+because the split makes the block size free -- 15 matmuls either way -- so it
+takes the one with the most margin.
 
 Output is FP32, as the reference's is. The pipeline narrows it to FP16 before
 wy_fast; doing that here would be a vector op and would drag the whole [C, C]
@@ -78,7 +90,7 @@ def build_kernel(t: int = T, h: int = H, d: int = D, chunk: int = CHUNK,
     @(pl.jit.inline if inline else pl.jit)
     def gdn_solve_tril(
         a_in: pl.Tensor[[t, h, chunk], pl.FP16],
-        neg_eye2: pl.Tensor[[2 * chunk, chunk], pl.FP16],
+        eye: pl.Tensor[[chunk, chunk], pl.FP16],
         m_diag: pl.Tensor[[chunk, chunk], pl.FP16],
         m_low: pl.Tensor[[chunk, chunk], pl.FP16],
         t_out: pl.Out[pl.Tensor[[t, h, chunk], out_dtype]],
@@ -93,20 +105,22 @@ def build_kernel(t: int = T, h: int = H, d: int = D, chunk: int = CHUNK,
             t0 = c0 * chunk
             for hh in pl.range(h):
                 col = hh * chunk
-                neg_i = neg_eye2[0:chunk, :]
-                # The A slice is written out three times on purpose: one bound
-                # value cannot feed several vector ops. D is taken here and N at
-                # its use below -- holding both across the doubling puts the
-                # vector buffer 40 KB over its 188416.
+                ident = eye[:, :]
+                # The A slice is written out twice on purpose: one bound value
+                # cannot feed several vector ops. The masks carry a minus sign, so
+                # this is -D, and -N below; both matmuls that follow want the
+                # negated form. D is taken here and N at its use below -- holding
+                # both across the doubling puts the vector buffer 40 KB over its
+                # 188416.
                 dm = pl.mul(a_flat[t0 : t0 + chunk, col : col + chunk], m_diag[:, :])
 
                 # --- Xd = (I + D)^-1. `I - D` as two single-K matmuls, not one
                 # double-K: the [chunk, 2*chunk] concat operand is 64 KB of vector
                 # buffer, and two of them are 8 KB over the limit.
-                nd = pl.matmul(dm, neg_i, out_dtype=pl.FP32)
-                xa = pl.matmul_acc(nd, neg_i, neg_i)               # X = I - D
+                nd = pl.matmul(dm, ident, out_dtype=pl.FP32)       # -D into an acc
+                xa = pl.matmul_acc(nd, ident, ident)               # X = I - D
                 xc = pl.cast(xa, target_type=pl.FP16, mode="rint")
-                yb = pl.matmul(dm, dm, out_dtype=pl.FP32)          # Y = D @ D
+                yb = pl.matmul(dm, dm, out_dtype=pl.FP32)          # Y = D @ D, sign squared
                 yc = pl.cast(yb, target_type=pl.FP16, mode="rint")
                 for _ in pl.unroll(nd_in - 1):
                     xa = pl.matmul_acc(xa, xc, yc)                 # X += X @ Y
@@ -116,14 +130,17 @@ def build_kernel(t: int = T, h: int = H, d: int = D, chunk: int = CHUNK,
                 xd = pl.matmul_acc(xa, xc, yc)
                 xdf = pl.cast(xd, target_type=pl.FP16, mode="rint")
 
-                # --- M = Xd N, strictly block-lower, so M^nblk = 0
+                # --- -M = Xd (-N), strictly block-lower, so M^nblk = 0. Taking the
+                # negated N here means the product lands in the accumulator with
+                # the sign `I - M` needs, so the identity costs one matmul rather
+                # than a negate-then-add pair. (-M)^2 = M^2, so the squaring below
+                # is unaffected.
                 nm = pl.mul(a_flat[t0 : t0 + chunk, col : col + chunk], m_low[:, :])
-                mm = pl.matmul(xdf, nm, out_dtype=pl.FP32)
-                mf = pl.cast(mm, target_type=pl.FP16, mode="rint")
+                mn = pl.matmul(xdf, nm, out_dtype=pl.FP32)         # -M
+                mf = pl.cast(mn, target_type=pl.FP16, mode="rint")
 
                 # --- (I + M)^-1 = (I - M)(I + M^2)(I + M^4)...
-                nmm = pl.matmul(mf, neg_i, out_dtype=pl.FP32)
-                pa = pl.matmul_acc(nmm, neg_i, neg_i)              # X = I - M
+                pa = pl.matmul_acc(mn, ident, ident)               # X = I - M
                 pc = pl.cast(pa, target_type=pl.FP16, mode="rint")
                 qb = pl.matmul(mf, mf, out_dtype=pl.FP32)          # Y = M @ M
                 qc = pl.cast(qb, target_type=pl.FP16, mode="rint")
@@ -148,7 +165,11 @@ gdn_solve_tril = build_kernel()
 
 
 def blk_masks(chunk: int = CHUNK, block: int = BLOCK):
-    """The block-diagonal indicator and its strictly-block-lower complement.
+    """The negated block-diagonal indicator and its strictly-block-lower complement.
+
+    Negated because both matmuls that consume them want `-D` and `-N`: that is
+    what lets `matmul_acc(acc, I, I)` finish `I - D` and `I - M` in one matmul
+    each. `D @ D` and `M @ M` square the sign away.
 
     Two constants rather than one plus a subtraction: `N = A - D` would need D
     live where the doubling has just finished with it, and holding it there is
@@ -158,18 +179,19 @@ def blk_masks(chunk: int = CHUNK, block: int = BLOCK):
 
     i = torch.arange(chunk)[:, None] // block
     j = torch.arange(chunk)[None, :] // block
-    return (i == j).to(torch.float16), (i > j).to(torch.float16)
+    return -(i == j).to(torch.float16), -(i > j).to(torch.float16)
 
 
-def neg_eye_stack(chunk: int):
-    """`-I` stacked twice, `[2*chunk, chunk]`: the right operand of the merged setup.
+def eye_block(chunk: int):
+    """`I`, `[chunk, chunk]`: the only constant the cube needs.
 
-    `[A | -I] @ [[-I], [-I]]` is `I - A`, so the same block serves both halves
-    of the contraction and the kernel needs one constant rather than two.
+    `matmul_acc(acc, I, I)` adds the identity to an accumulator, which is how both
+    `I - D` and `I - M` are formed. A positive identity serves as well as a
+    negative one here, since the increment squares its sign.
     """
     import torch
 
-    return -torch.cat([torch.eye(chunk, dtype=torch.float16)] * 2)
+    return torch.eye(chunk, dtype=torch.float16)
 
 
 def build_tensor_specs(t: int = T, h: int = H, d: int = D, chunk: int = CHUNK,
@@ -183,8 +205,8 @@ def build_tensor_specs(t: int = T, h: int = H, d: int = D, chunk: int = CHUNK,
     return [
         TensorSpec("a_in", [t, h, chunk], torch.float16,
                    init_value=reference.lazy("solve_tril", "a16", t, h, d, chunk, hg=hg)),
-        TensorSpec("neg_eye2", [2 * chunk, chunk], torch.float16,
-                   init_value=lambda: neg_eye_stack(chunk)),
+        TensorSpec("eye", [chunk, chunk], torch.float16,
+                   init_value=lambda: eye_block(chunk)),
         TensorSpec("m_diag", [chunk, chunk], torch.float16,
                    init_value=lambda: blk_masks(chunk, block)[0]),
         TensorSpec("m_low", [chunk, chunk], torch.float16,
