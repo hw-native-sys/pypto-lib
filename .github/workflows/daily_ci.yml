@@ -114,14 +114,17 @@ jobs:
           since = datetime.datetime(2026, 9, 17, 0, 55, tzinfo=datetime.timezone.utc).timestamp()
           window = re.compile(r"2026-09-17[- T](?:01|09):0[5-9]:")
           errors = re.compile(r"507034|timeout|exception|fault|\berror\b|\[ERROR\]", re.I)
-          log_roots = [Path.home() / "ascend/log", Path("/root/ascend/log"), Path("/var/log/npu/slog")]
+          log_base = Path.home() / "ascend/log"
+          log_roots = [log_base / kind / component for kind in ("debug", "run")
+                       for component in ("plog", "device-4")]
+          log_roots.append(Path("/var/log/npu/slog/host-0"))
           for log_root in log_roots:
               print(f"Device log root: {log_root}", flush=True)
               try:
                   candidates = []
                   deadline = time.monotonic() + 10
                   for index, path in enumerate(log_root.rglob("*")):
-                      if index >= 5000 or time.monotonic() >= deadline:
+                      if index >= 50000 or time.monotonic() >= deadline:
                           print("Log discovery limit reached", flush=True)
                           break
                       if path.is_file() and not path.is_symlink() and ".log" in path.name:
