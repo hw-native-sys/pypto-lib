@@ -317,32 +317,18 @@ jobs:
             echo "No runnable changed files; nothing to test."
             exit 0
           fi
-          failed=()
-          for f in $FILES; do
-            echo "::group::$f"
-            # Files needing multiple NPUs declare `# ci: devices=N` (N>1) near
-            # the top; borrow that many cards with `--device-num N` (defaults to
-            # ep2 / 2-card runs). $TASK_DEVICE is the lent set (a single id, or
-            # comma-separated for N>1) and is passed straight to -d. Higher
-            # world sizes (ep4/ep8) are exercised as explicit --device-num 4/8
-            # steps in daily_ci.yml.
-            ndev=$(grep -oP '#\s*ci:\s*devices=\K[0-9]+' "$f" | head -1)
-            ndev=${ndev:-1}
-            devnum_flag=""
-            [ "$ndev" -gt 1 ] && devnum_flag="--device-num $ndev"
-            task-submit --device "$DEVICE_ID" $devnum_flag --timeout 3600 --max-time 600 \
-              --run "cd $GITHUB_WORKSPACE/checkout && source activate.sh && PYTHONPATH=$GITHUB_WORKSPACE/checkout python $f -p a2a3 -d \$TASK_DEVICE"
-            if [ $? -ne 0 ]; then
-              failed+=("$f")
-              echo "::error file=${f}::FAIL"
-            fi
-            echo "::endgroup::"
-          done
-          if [ ${#failed[@]} -ne 0 ]; then
-            printf 'FAILED: %s\n' "${failed[@]}"
-            exit 1
-          fi
-          echo "All selected files passed."
+          # Only the runtime phase needs a card, and detect-changes already
+          # named every case, so the driver computes the goldens of entries
+          # exposing --golden-only concurrently off the queue and submits each
+          # case the moment its own golden lands. See the module docstring for
+          # the scheduling and the disk bound it runs under.
+          python "$GITHUB_WORKSPACE/checkout/.github/scripts/run_device_cases.py" \
+            --platform a2a3 \
+            --device-id "$DEVICE_ID" \
+            --repo-root "$GITHUB_WORKSPACE/checkout" \
+            --queue-timeout 3600 \
+            --run-timeout 600 \
+            $FILES
 
       - name: Kill orphaned task-submit tasks
         if: always()
