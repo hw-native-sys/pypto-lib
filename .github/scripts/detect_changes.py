@@ -57,6 +57,11 @@ from collections import defaultdict
 # Directories whose .py files participate in the bare-name sibling-import graph.
 SOURCE_ROOTS = ("examples", "models")
 
+A5_ONLY_MODEL_PREFIXES = (
+    "models/deepseek_v4_pro/",
+    "models/deepseek_v4_1_flash/",
+)
+
 # Paths that can change documentation or repository guidance but cannot change
 # generated kernels or runtime behavior. Keep this list explicit: an unknown
 # path must continue to select the full examples suite.
@@ -224,18 +229,14 @@ def select_runnable(changed):
     )
     # Only models/ uses the reverse-import graph: a changed examples/ file is
     # already covered by the full-suite run above, so it needs no closure here.
-    # models/deepseek_v4_pro is the A5-only Pro/Flash implementation. Its Pro
-    # preset is exercised by the dedicated model-tests-a5 daily job, not by PR
-    # a2a3/sim (PR CI has no A5 runner, and on 910B it would duplicate Flash).
-    # Exclude it from PR selection so it neither doubles the sim/a2a3 load nor
-    # runs on the wrong backend. Revisit once a PR A5 job exists.
+    # A5-only model families have separate device coverage.
     models_changed = [
         c
         for c in changed
         if c.endswith(".py")
         and not c.endswith("_draft.py")
         and c.startswith("models/")
-        and not c.startswith("models/deepseek_v4_pro/")
+        and not c.startswith(A5_ONLY_MODEL_PREFIXES)
         and os.path.isfile(c)
     ]
 
@@ -248,7 +249,11 @@ def select_runnable(changed):
             f for f in _iter_source_files() if f.startswith("examples/")
         )
 
-    return sorted(f for f in selected if os.path.isfile(f) and _has_main(f))
+    return sorted(
+        f for f in selected
+        if not f.startswith(A5_ONLY_MODEL_PREFIXES)
+        and os.path.isfile(f) and _has_main(f)
+    )
 
 
 def select_a5(changed):
