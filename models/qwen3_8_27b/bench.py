@@ -76,7 +76,10 @@ def _random_specs(stage, specs):
     from test_gdn_stages import OUTPUTS
 
     outputs = OUTPUTS[stage] if stage in OUTPUTS else importlib.import_module(stage).OUTPUTS
-    leave_alone = set(outputs) | {"mask", "tril", "neg_eye"}
+    # Constants, not data: randomising these would have solve_tril contract against a
+    # random matrix instead of -I, and leave the strict causal mask non-triangular.
+    leave_alone = set(outputs) | {"mask", "mask_strict", "tril", "neg_eye2",
+                                  "m_diag", "m_low"}
     out = []
     for spec in specs:
         if spec.name in leave_alone:
