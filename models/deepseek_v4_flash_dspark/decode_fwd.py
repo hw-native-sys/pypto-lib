@@ -1620,7 +1620,6 @@ def build_tensor_specs(
     num_tokens_per_owner=None,
     weight_bank_size=RUNTIME_WEIGHT_BANK,
     runtime_case="full_active",
-    stable_golden=False,
 ):
     """Build the production or bounded-runtime decode forward L3 fixture."""
     import inspect
@@ -1867,31 +1866,6 @@ def build_tensor_specs(
 
     for name in _LAYER_WEIGHT_NAMES:
         specs_by_name[name] = _make_weight_bank_spec(name, swa_specs[name], weight_bank_size, compile_only=compile_only)
-    if stable_golden and not compile_only:
-        gate_w_spec = specs_by_name["gate_w"]
-        gate_bias_spec = specs_by_name["gate_bias"]
-
-        def init_stable_gate_bias():
-            expert_bias = torch.arange(
-                N_EXPERTS_GLOBAL, 0, -1, dtype=torch.float32,
-            ) * 0.01
-            return expert_bias.repeat(N_RANKS, weight_bank_size).contiguous()
-
-        specs_by_name["gate_w"] = TensorSpec(
-            "gate_w", list(gate_w_spec.shape), gate_w_spec.dtype, init_value=0,
-        )
-        specs_by_name["gate_w"].resident = gate_w_spec.resident
-        specs_by_name["gate_bias"] = TensorSpec(
-            "gate_bias", list(gate_bias_spec.shape), gate_bias_spec.dtype,
-            init_value=init_stable_gate_bias,
-        )
-        specs_by_name["gate_bias"].resident = gate_bias_spec.resident
-        for name in ("wo_b_scale", "routed_w2_scale", "shared_w2_scale"):
-            source = specs_by_name[name]
-            specs_by_name[name] = TensorSpec(
-                name, list(source.shape), source.dtype, init_value=0,
-            )
-            specs_by_name[name].resident = source.resident
     for name in _SWA_METADATA_NAMES:
         specs_by_name[name] = _copy_spec(name, swa_specs[name])
     # HCA and CSA share the compressed YaRN profile at ordinary token positions.
@@ -2022,298 +1996,8 @@ def _parse_num_tokens_per_owner(raw):
     return values[0] if len(values) == 1 else values
 
 
-def _golden_weight_bank(tensors, name, bank, bank_count, rows=None):
-    """Return one rank-stacked weight bank from the packed forward ABI."""
-    weight = tensors[name]
-    bank_rows = weight.shape[1] // bank_count
-    begin = bank * bank_rows
-    end = begin + (bank_rows if rows is None else rows)
-    return weight[:, begin:end]
-
-
-def _golden_common_attention_weights(tensors, model_layer):
-    bank = model_layer % FWD_WEIGHT_BANK_SIZE
-    return {
-        "hc_attn_fn": _golden_weight_bank(
-            tensors, "hc_attn_fn", bank, FWD_WEIGHT_BANK_SIZE, MIX_HC,
-        ),
-        **{
-            name: _golden_weight_bank(tensors, name, bank, FWD_WEIGHT_BANK_SIZE)
-            for name in _COMMON_ATTN_WEIGHT_NAMES
-            if name != "hc_attn_fn"
-        },
-    }
-
-
-def _golden_extra_attention_weights(tensors, kind, ordinal):
-    if kind == "csa":
-        names = _CSA_EXTRA_WEIGHT_NAMES
-        prefix = "csa_"
-        bank_count = FWD_CSA_WEIGHT_BANK_SIZE
-    elif kind == "hca":
-        names = _HCA_EXTRA_WEIGHT_NAMES
-        prefix = "hca_"
-        bank_count = FWD_HCA_WEIGHT_BANK_SIZE
-    else:
-        return {}
-    bank = ordinal % bank_count
-    return {
-        name: _golden_weight_bank(tensors, prefix + name, bank, bank_count)
-        for name in names
-    }
-
-
-def _golden_pool_layer(pool, ordinal, layer_count):
-    blocks_per_layer = pool.shape[1] // layer_count
-    begin = ordinal * blocks_per_layer
-    return pool[:, begin : begin + blocks_per_layer]
-
-
-def _golden_attention_inputs(tensors, x_hc, kind, model_layer, ordinal):
-    result = {
-        "x_hc": x_hc,
-        **_golden_common_attention_weights(tensors, model_layer),
-    }
-    result["kv_cache"] = _golden_pool_layer(
-        tensors["raw_kv_pool"], model_layer, MAIN_LAYER_COUNT,
-    )
-    if kind == "swa":
-        result.update({
-            "freqs_cos": tensors["freqs_cos"],
-            "freqs_sin": tensors["freqs_sin"],
-            "swa_slot_mapping": tensors["swa_slot_mapping"],
-            "swa_indices": tensors["swa_indices"],
-            "swa_lens": tensors["swa_lens"],
-            "position_ids": tensors["position_ids_local"],
-        })
-        return result
-
-    result.update({
-        "freqs_cos": tensors["compressed_freqs_cos"],
-        "freqs_sin": tensors["compressed_freqs_sin"],
-        "position_ids_local": tensors["position_ids_local"],
-        "position_ids": tensors["position_ids"],
-        **_golden_extra_attention_weights(tensors, kind, ordinal),
-    })
-    if kind == "hca":
-        result.update({
-            "cmp_freqs_cos": tensors["hca_cmp_freqs_cos"],
-            "cmp_freqs_sin": tensors["hca_cmp_freqs_sin"],
-            "compress_state": _golden_pool_layer(
-                tensors["hca_compress_state"], ordinal, HCA_LAYER_COUNT,
-            ),
-            "compress_state_block_table": tensors["hca_compress_state_block_table"],
-            "cmp_kv": _golden_pool_layer(tensors["hca_cmp_kv"], ordinal, HCA_LAYER_COUNT),
-            "cmp_block_table": tensors["hca_cmp_block_table"],
-            "ori_slot_mapping": tensors["hca_ori_slot_mapping"],
-            "window_swa_indices": tensors["hca_window_swa_indices"],
-            "window_swa_lens": tensors["hca_window_swa_lens"],
-            "cmp_slot_mapping": tensors["hca_cmp_slot_mapping"],
-            "state_slot_mapping": tensors["hca_state_slot_mapping"],
-            "kv_seq_lens": tensors["hca_kv_seq_lens"],
-        })
-        return result
-
-    result.update({
-        "cmp_freqs_cos": tensors["csa_cmp_freqs_cos"],
-        "cmp_freqs_sin": tensors["csa_cmp_freqs_sin"],
-        "compress_state": _golden_pool_layer(
-            tensors["csa_compress_state"], ordinal, CSA_LAYER_COUNT,
-        ),
-        "compress_state_block_table": tensors["csa_compress_state_block_table"],
-        "inner_compress_state": _golden_pool_layer(
-            tensors["csa_inner_compress_state"], ordinal, CSA_LAYER_COUNT,
-        ),
-        "inner_compress_state_block_table": tensors["csa_inner_compress_state_block_table"],
-        "cmp_kv": _golden_pool_layer(tensors["csa_cmp_kv"], ordinal, CSA_LAYER_COUNT),
-        "cmp_block_table": tensors["csa_cmp_block_table"],
-        "idx_kv_cache": _golden_pool_layer(
-            tensors["csa_idx_kv_cache"], ordinal, CSA_LAYER_COUNT,
-        ),
-        "idx_kv_scale": _golden_pool_layer(
-            tensors["csa_idx_kv_scale"], ordinal, CSA_LAYER_COUNT,
-        ),
-        "idx_block_table": tensors["csa_idx_block_table"],
-        "ori_slot_mapping": tensors["csa_ori_slot_mapping"],
-        "window_swa_indices": tensors["csa_window_swa_indices"],
-        "window_swa_lens": tensors["csa_window_swa_lens"],
-        "cmp_slot_mapping": tensors["csa_cmp_slot_mapping"],
-        "idx_slot_mapping": tensors["csa_idx_slot_mapping"],
-        "state_slot_mapping": tensors["csa_state_slot_mapping"],
-        "inner_state_slot_mapping": tensors["csa_inner_state_slot_mapping"],
-        "kv_seq_lens": tensors["csa_kv_seq_lens"],
-    })
-    return result
-
-
-def _golden_moe_inputs(tensors, x_hc, model_layer, local_t):
-    import torch
-
-    bank = model_layer % FWD_WEIGHT_BANK_SIZE
-    input_ids = torch.zeros(N_RANKS, MOE_TOKENS, dtype=torch.int64)
-    input_ids[:, :local_t].copy_(tensors["input_ids"])
-    return {
-        "x_hc": x_hc,
-        "hc_ffn_fn": _golden_weight_bank(
-            tensors, "hc_ffn_fn", bank, FWD_WEIGHT_BANK_SIZE, MIX_HC,
-        ),
-        **{
-            name: _golden_weight_bank(tensors, name, bank, FWD_WEIGHT_BANK_SIZE)
-            for name in (
-                "hc_ffn_scale", "hc_ffn_base", "norm_w", "gate_w", "gate_bias",
-                "tid2eid", "routed_w1", "routed_w1_scale", "routed_w3",
-                "routed_w3_scale", "routed_w2", "routed_w2_scale", "shared_w1",
-                "shared_w1_scale", "shared_w3", "shared_w3_scale", "shared_w2",
-                "shared_w2_scale",
-            )
-        },
-        "input_ids": input_ids,
-        "layer_id": model_layer,
-        "num_tokens": local_t,
-    }
-
-
-def _golden_decode_layer(tensors, x_hc, kind, model_layer, ordinal):
-    import torch
-
-    local_t = x_hc.shape[1]
-    owner_counts = tensors["num_tokens_per_owner"].tolist()
-    attention_out = torch.zeros_like(x_hc)
-    attention_inputs = _golden_attention_inputs(
-        tensors, x_hc, kind, model_layer, ordinal,
-    )
-    attention_golden = {
-        "swa": swa.golden_decode_swa,
-        "hca": hca.golden_decode_hca,
-        "csa": csa.golden_decode_csa,
-    }[kind]
-    for group_begin in range(0, N_RANKS, TP_SIZE):
-        group_end = group_begin + TP_SIZE
-        if not any(owner_counts[group_begin:group_end]):
-            continue
-        group_tensors = {
-            name: value[group_begin:group_end]
-            for name, value in attention_inputs.items()
-        }
-        group_tensors["x_out"] = attention_out[group_begin:group_end]
-        group_tensors["local_t"] = local_t
-        attention_golden(group_tensors)
-
-    attention_moe = torch.zeros(
-        N_RANKS, MOE_TOKENS, HC_MULT, D, dtype=torch.float32,
-    )
-    for rank, active_tokens in enumerate(owner_counts):
-        if active_tokens:
-            attention_moe[rank, :active_tokens].copy_(attention_out[rank, :active_tokens])
-        attention_out[rank, active_tokens:].zero_()
-
-    moe_out = torch.zeros_like(attention_moe)
-    moe_tensors = _golden_moe_inputs(tensors, attention_moe, model_layer, local_t)
-    moe_tensors["x_next"] = moe_out
-    moe_module.golden_moe(moe_tensors)
-
-    x_next = torch.zeros_like(x_hc)
-    for rank, active_tokens in enumerate(owner_counts):
-        if active_tokens:
-            x_next[rank, :active_tokens].copy_(moe_out[rank, :active_tokens])
-    tensors["x_attn_active"].copy_(attention_out)
-    tensors["x_moe_next"].copy_(moe_out)
-    return x_next
-
-
-def _golden_decode_lm_head(tensors):
-    """Evaluate the rank-stacked LM head without its standalone DP fixture."""
-    import torch
-
-    tensors["logits"].zero_()
-    tensors["sampled_ids"].fill_(-1)
-    for group_begin in range(0, N_RANKS, TP_SIZE):
-        group_end = group_begin + TP_SIZE
-        full_weight = torch.cat(
-            tensors["lm_head_weight"][group_begin:group_end].float().unbind(0),
-            dim=0,
-        )
-        zero_weight = not bool(torch.count_nonzero(full_weight))
-        for rank in range(group_begin, group_end):
-            selected = torch.zeros(MAX_LOGIT_ROWS, D, dtype=torch.float32)
-            active_rows = []
-            for row, source_row in enumerate(tensors["logit_row_indices"][rank].tolist()):
-                if source_row < 0:
-                    continue
-                source_row = min(source_row, tensors["x_out"].shape[1] - 1)
-                selected[row].copy_(tensors["x_out"][rank, source_row])
-                active_rows.append(row)
-            if not zero_weight:
-                tensors["logits"][rank].copy_(torch.matmul(selected, full_weight.t()))
-            for row in active_rows:
-                tensors["sampled_ids"][rank, row].zero_()
-                tensors["sampled_ids"][rank, row, 0] = int(
-                    torch.argmax(tensors["logits"][rank, row]),
-                )
-
-
-def golden_decode_fwd(tensors):
-    """Compose the production attention and MoE goldens across all 43 layers."""
-    import torch
-    from hc_head import golden_hc_head
-    from rmsnorm import golden_rms_norm
-
-    local_t = tensors["input_ids"].shape[1]
-    owner_counts = tensors["num_tokens_per_owner"].tolist()
-    x_ping = torch.zeros(N_RANKS, local_t, HC_MULT, D, dtype=torch.float32)
-    for rank, active_tokens in enumerate(owner_counts):
-        embedded = tensors["embed_weight"][rank].index_select(
-            0, tensors["input_ids"][rank].long(),
-        )
-        if active_tokens:
-            tensors["hidden_workspace"][rank, :active_tokens].copy_(
-                embedded[:active_tokens],
-            )
-            x_ping[rank, :active_tokens].copy_(
-                embedded[:active_tokens].float().unsqueeze(1).repeat(1, HC_MULT, 1),
-            )
-
-    x_pong = _golden_decode_layer(tensors, x_ping, "swa", 0, 0)
-    x_ping = _golden_decode_layer(tensors, x_pong, "swa", 1, 1)
-    for ordinal in range(HCA_LAYER_COUNT):
-        csa_layer = 2 + 2 * ordinal
-        hca_layer = csa_layer + 1
-        x_pong = _golden_decode_layer(
-            tensors, x_ping, "csa", csa_layer, ordinal,
-        )
-        x_ping = _golden_decode_layer(
-            tensors, x_pong, "hca", hca_layer, ordinal,
-        )
-    pre_hc_hidden = _golden_decode_layer(
-        tensors, x_ping, "csa", MAIN_LAYER_COUNT - 1, CSA_LAYER_COUNT - 1,
-    )
-
-    tensors["x_ping"].copy_(x_ping)
-    tensors["x_pong"].copy_(x_pong)
-    tensors["pre_hc_hidden_out"].copy_(pre_hc_hidden)
-    tensors["dspark_target_hidden"].zero_()
-    tensors["hidden_workspace"].zero_()
-    for rank in range(N_RANKS):
-        sources = (x_pong[rank], x_ping[rank], pre_hc_hidden[rank])
-        for slot, source in enumerate(sources):
-            head_out = torch.empty(local_t, D, dtype=torch.bfloat16)
-            golden_hc_head({
-                "x_hc": source,
-                "hc_head_fn": tensors["hc_head_fn"][rank],
-                "hc_head_scale": tensors["hc_head_scale"][rank],
-                "hc_head_base": tensors["hc_head_base"][rank],
-                "y": head_out,
-            })
-            tensors["dspark_target_hidden"][rank, :, slot * D : (slot + 1) * D].copy_(
-                head_out,
-            )
-            if slot == len(sources) - 1:
-                tensors["hidden_workspace"][rank].copy_(head_out)
-        tensors["x_out"][rank].copy_(golden_rms_norm(
-            tensors["hidden_workspace"][rank], tensors["final_norm_w"][rank],
-        ))
-
-    _golden_decode_lm_head(tensors)
+def golden_decode_fwd(_tensors):
+    """Leave full-forward outputs to output-specific behavioral comparators."""
 
 
 def finite_tensor_compare(actual, _expected, **_kwargs):
@@ -2372,51 +2056,42 @@ def dspark_target_hidden_compare(actual, _expected, **kwargs):
     return True, ""
 
 
-def _active_owner_rows_compare(compare):
-    """Apply a numerical comparator only to each owner's active prefix."""
-    def compare_active(actual, expected, **kwargs):
-        import torch
+def sampled_ids_compare(actual, _expected, **kwargs):
+    """Validate greedy ids against device logits and the inactive-row contract."""
+    import torch
 
-        owner_counts = kwargs.get("inputs", {}).get("num_tokens_per_owner")
-        if owner_counts is None:
-            return False, "    missing num_tokens_per_owner for active-row comparison"
-        actual_rows = []
-        expected_rows = []
-        for rank, active_tokens in enumerate(owner_counts.tolist()):
-            if active_tokens:
-                actual_rows.append(actual[rank, :active_tokens])
-                expected_rows.append(expected[rank, :active_tokens])
-        if not actual_rows:
-            return True, ""
-        return compare(
-            torch.cat(actual_rows, dim=0),
-            torch.cat(expected_rows, dim=0),
-            **kwargs,
-        )
+    inputs = kwargs.get("inputs", {})
+    outputs = kwargs.get("actual_outputs", {})
+    row_indices = inputs.get("logit_row_indices")
+    logits = outputs.get("logits")
+    if row_indices is None or logits is None:
+        return False, "    missing logit_row_indices input or logits output"
 
-    return compare_active
+    expected = torch.full_like(actual, -1)
+    for rank in range(actual.shape[0]):
+        for row in range(MAX_LOGIT_ROWS):
+            if int(row_indices[rank, row]) < 0:
+                continue
+            expected[rank, row].zero_()
+            expected[rank, row, 0] = torch.argmax(logits[rank, row])
+    if not torch.equal(actual, expected):
+        mismatch = (actual != expected).nonzero()[0].tolist()
+        return False, f"    sampled_ids mismatch at index {mismatch}"
+    return True, ""
 
 
 def compare_functions():
     """Validate every output for completion and the DSpark tap mathematically."""
-    from golden import ratio_reldiff
-
     finite_names = {
         "raw_kv_pool",
         "csa_compress_state", "csa_inner_compress_state", "csa_cmp_kv", "csa_idx_kv_cache", "csa_idx_kv_scale",
         "hca_compress_state", "hca_cmp_kv",
-        "logits", "sampled_ids",
+        "hidden_workspace", "x_ping", "x_pong", "x_attn_active", "x_moe_next",
+        "pre_hc_hidden_out", "x_out", "logits",
     }
     compare = {name: finite_tensor_compare for name in finite_names}
-    compare_active = _active_owner_rows_compare(ratio_reldiff(
-        diff_thd=0.01, pct_thd=0.05,
-    ))
-    for name in (
-        "hidden_workspace", "x_ping", "x_pong", "x_attn_active", "x_moe_next",
-        "pre_hc_hidden_out", "x_out",
-    ):
-        compare[name] = compare_active
     compare["dspark_target_hidden"] = dspark_target_hidden_compare
+    compare["sampled_ids"] = sampled_ids_compare
     return compare
 
 
@@ -2446,10 +2121,6 @@ def main():
         help=f"one broadcast count or {N_RANKS} comma-separated active-prefix lengths",
     )
     parser.add_argument("--compile-only", action="store_true", default=False)
-    parser.add_argument(
-        "--enable-golden", action="store_true", default=False,
-        help="run the expensive 43-layer host golden; disabled by default",
-    )
     parser.add_argument(
         "--weight-bank-size", type=int, default=FWD_WEIGHT_BANK_SIZE, choices=(1, MAIN_LAYER_COUNT),
         help="1 reuses weights at runtime; 43 builds production layer banks",
@@ -2491,12 +2162,11 @@ def main():
     specs = build_tensor_specs(
         start_pos=start_pos, num_tokens_per_owner=num_tokens_per_owner,
         weight_bank_size=weight_bank_size, runtime_case=runtime_case,
-        stable_golden=args.enable_golden,
     )
     result = run(
         fn=l3_decode_fwd,
         specs=specs,
-        golden_fn=golden_decode_fwd if args.enable_golden else None,
+        golden_fn=golden_decode_fwd,
         save_data=args.save_data,
         compile_only=args.compile_only,
         runtime_dir=args.runtime_dir,

@@ -629,10 +629,10 @@ def decode_layer_swa_test(
     data_arrived: pld.DistributedTensor[[N_RANKS, 1], pl.INT32],
     routed_y_buf: pld.DistributedTensor[[N_ROUTES, D], pl.BF16],
     combine_arrived: pld.DistributedTensor[[N_RANKS, 1], pl.INT32],
+    num_tokens_per_owner: pl.Tensor[[N_RANKS], pl.INT32],
     layer_id: pl.Scalar[pl.INT32],
     group_base: pl.Scalar[pl.INT32],
     tp_rank: pl.Scalar[pl.INT32],
-    num_tokens_per_owner: pl.Tensor[[N_RANKS], pl.INT32],
     my_rank: pl.Scalar[pl.INT32],
     moe_epoch: pl.Scalar[pl.INT32],
 ):
@@ -800,7 +800,7 @@ def l3_decode_layer_swa(
             attention_window, attention_signal, o_window, o_signal,
             recv_meta, recv_x, recv_aux, recv_route,
             arrived, data_arrived, routed_y_buf, combine_arrived,
-            layer_id, group_base, tp_rank, num_tokens_per_owner, rank,
+            num_tokens_per_owner, layer_id, group_base, tp_rank, rank,
             pl.const(1, pl.INT32),
             device=rank,
         )
@@ -1038,10 +1038,10 @@ def decode_layer_hca_test(
     data_arrived: pld.DistributedTensor[[N_RANKS, 1], pl.INT32],
     routed_y_buf: pld.DistributedTensor[[N_ROUTES, D], pl.BF16],
     combine_arrived: pld.DistributedTensor[[N_RANKS, 1], pl.INT32],
+    num_tokens_per_owner: pl.Tensor[[N_RANKS], pl.INT32],
     layer_id: pl.Scalar[pl.INT32],
     group_base: pl.Scalar[pl.INT32],
     tp_rank: pl.Scalar[pl.INT32],
-    num_tokens_per_owner: pl.Tensor[[N_RANKS], pl.INT32],
     my_rank: pl.Scalar[pl.INT32],
     moe_epoch: pl.Scalar[pl.INT32],
 ):
@@ -1256,7 +1256,7 @@ def l3_decode_layer_hca(
             attention_window, attention_signal, o_window, o_signal,
             recv_meta, recv_x, recv_aux, recv_route,
             arrived, data_arrived, routed_y_buf, combine_arrived,
-            layer_id, group_base, tp_rank, num_tokens_per_owner, rank,
+            num_tokens_per_owner, layer_id, group_base, tp_rank, rank,
             pl.const(1, pl.INT32),
             device=rank,
         )
@@ -1534,10 +1534,10 @@ def decode_layer_csa_test(
     data_arrived: pld.DistributedTensor[[N_RANKS, 1], pl.INT32],
     routed_y_buf: pld.DistributedTensor[[N_ROUTES, D], pl.BF16],
     combine_arrived: pld.DistributedTensor[[N_RANKS, 1], pl.INT32],
+    num_tokens_per_owner: pl.Tensor[[N_RANKS], pl.INT32],
     layer_id: pl.Scalar[pl.INT32],
     group_base: pl.Scalar[pl.INT32],
     tp_rank: pl.Scalar[pl.INT32],
-    num_tokens_per_owner: pl.Tensor[[N_RANKS], pl.INT32],
     my_rank: pl.Scalar[pl.INT32],
     moe_epoch: pl.Scalar[pl.INT32],
 ):
@@ -1791,7 +1791,7 @@ def l3_decode_layer_csa(
             attention_window, attention_signal, o_window, o_signal,
             recv_meta, recv_x, recv_aux, recv_route,
             arrived, data_arrived, routed_y_buf, combine_arrived,
-            layer_id, group_base, tp_rank, num_tokens_per_owner, rank,
+            num_tokens_per_owner, layer_id, group_base, tp_rank, rank,
             pl.const(1, pl.INT32),
             device=rank,
         )
