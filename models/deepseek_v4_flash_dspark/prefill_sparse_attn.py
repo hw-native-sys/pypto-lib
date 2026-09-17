@@ -1689,6 +1689,8 @@ if __name__ == "__main__":
     )
     parser.add_argument("-d", "--device", type=int, default=0)
     parser.add_argument("--compile-only", action="store_true", default=False)
+    parser.add_argument("--golden-only", action="store_true", default=False,
+                        help="compute and persist the golden, then stop before the device run")
     ratio_choices = list(SUPPORTED_COMPRESS_RATIOS)
     parser.add_argument("--compress-ratio", type=int, default=DEFAULT_COMPRESS_RATIO, choices=ratio_choices)
     parser.add_argument(
@@ -1721,6 +1723,7 @@ if __name__ == "__main__":
         rtol=1e-3,
         atol=1e-3,
         compile_only=args.compile_only,
+        golden_only=args.golden_only,
         compare_fn={
             "attn_out": ratio_allclose(atol=1e-4, rtol=1.0 / 128),
         },

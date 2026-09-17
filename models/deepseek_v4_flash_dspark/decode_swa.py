@@ -1066,6 +1066,8 @@ if __name__ == "__main__":
     parser.add_argument("--enable-chip-swimlane", type=int, nargs="?", const=1, default=0, choices=range(5))
     parser.add_argument("--enable-dep-gen", action="store_true", default=False)
     parser.add_argument("--compile-only", action="store_true", default=False)
+    parser.add_argument("--golden-only", action="store_true", default=False,
+                        help="compute and persist the golden, then stop before the device run")
     parser.add_argument("--dump-passes", action="store_true", default=False)
     args = parser.parse_args()
 
@@ -1106,6 +1108,7 @@ if __name__ == "__main__":
                 golden_data=args.golden_data,
                 save_data=args.save_data,
                 compile_only=args.compile_only,
+                golden_only=args.golden_only,
                 config=dict(
                     dump_passes=args.dump_passes,
                     platform=args.platform,
@@ -1136,6 +1139,7 @@ if __name__ == "__main__":
                 golden_data=args.golden_data,
                 save_data=args.save_data,
                 compile_only=args.compile_only,
+                golden_only=args.golden_only,
                 config=dict(
                     dump_passes=args.dump_passes,
                     distributed_config=DistributedConfig(device_ids=device_ids, num_sub_workers=0),

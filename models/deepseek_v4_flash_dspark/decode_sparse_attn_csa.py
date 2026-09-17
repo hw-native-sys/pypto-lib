@@ -806,6 +806,8 @@ if __name__ == "__main__":
         help="Mask every raw and compressed row.",
     )
     parser.add_argument("--golden-data", type=str, default=None)
+    parser.add_argument("--golden-only", action="store_true", default=False,
+                        help="compute and persist the golden, then stop before the device run")
     parser.add_argument(
         "--block-holes-fixture", action="store_true", default=False,
         help="Use invalid sparse blocks between valid blocks and signed sink logits.",
@@ -843,6 +845,7 @@ if __name__ == "__main__":
         ),
         golden_fn=golden_sparse_attn,
         golden_data=args.golden_data,
+        golden_only=args.golden_only,
         config=dict(
             dump_passes=args.dump_passes,
             platform=args.platform,

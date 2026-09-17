@@ -2040,6 +2040,8 @@ def run_c2a(operator, mode):
     parser.add_argument("--seed", type=int, default=17)
     parser.add_argument("--epochs", type=int, default=1, help="operator calls per dispatch; timing includes all epochs")
     parser.add_argument("--compile-only", action="store_true")
+    parser.add_argument("--golden-only", action="store_true", default=False,
+                        help="compute and persist the golden, then stop before the device run")
     parser.add_argument("--save-data", action="store_true", help="save validated inputs and golden outputs for replay")
     parser.add_argument("--golden-data", help="replay a compatible data directory containing in/ and out/")
     parser.add_argument("--enable-chip-swimlane", type=int, default=0, choices=range(5))
@@ -2086,6 +2088,7 @@ def run_c2a(operator, mode):
         specs=build_specs(args, mode),
         golden_fn=make_golden(args.epochs),
         compile_only=args.compile_only,
+        golden_only=args.golden_only,
         save_data=args.save_data,
         golden_data=args.golden_data,
         config=dict(
@@ -2099,7 +2102,9 @@ def run_c2a(operator, mode):
     print(f"[C2A] work_dir={result.work_dir}")
     if args.compile_only:
         print("[C2A] Compilation passed; device accuracy was NOT validated.")
-    if args.save_data and result.work_dir:
+    if args.golden_only and result.work_dir:
+        print(f"[C2A] Golden snapshot: {result.work_dir}/data; device accuracy was NOT validated.")
+    elif args.save_data and result.work_dir:
         print(f"[C2A] Validated snapshot: {result.work_dir}/data")
     if not result.passed:
         if result.error:
