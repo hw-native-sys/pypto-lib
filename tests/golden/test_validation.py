@@ -21,6 +21,7 @@ from golden.validation import (
     mapped_pool_ratio_reldiff,
     ratio_allclose,
     ratio_reldiff,
+    rowwise_ratio_reldiff,
     topk_pair_compare,
     validate_golden,
 )
@@ -302,6 +303,76 @@ class TestMappedPoolRatioAllclose:
         assert not ok
         assert "error_count=6/100" in detail
 
+    def test_reldiff_individual_mode_rejects_whole_corrupt_row(self):
+        expected = torch.ones(64, 1, 16, dtype=torch.float32)
+        actual = expected.clone()
+        actual[0, 0] = 2.0
+        mapping = torch.arange(64, dtype=torch.int64)
+        aggregate = mapped_pool_ratio_reldiff(
+            "mapping",
+            mapping_shape=(64,),
+            block_size=1,
+            diff_thd=0.01,
+            pct_thd=0.05,
+            expected_mapped_rows=64,
+        )
+        individual = mapped_pool_ratio_reldiff(
+            "mapping",
+            mapping_shape=(64,),
+            block_size=1,
+            diff_thd=0.01,
+            pct_thd=0.05,
+            expected_mapped_rows=64,
+            compare_mapped_rows_individually=True,
+        )
+
+        aggregate_ok, aggregate_detail = self._call(
+            aggregate, actual, expected, mapping,
+        )
+        individual_ok, individual_detail = self._call(
+            individual, actual, expected, mapping,
+        )
+
+        assert aggregate_ok, aggregate_detail
+        assert not individual_ok
+        assert "row=0" in individual_detail
+        assert "error_count=16/16" in individual_detail
+
+    def test_mapped_comparator_names_record_individual_mode_only_when_enabled(self):
+        allclose = mapped_pool_ratio_allclose(
+            "mapping", mapping_shape=(1,), block_size=2,
+        )
+        aggregate = mapped_pool_ratio_reldiff(
+            "mapping",
+            mapping_shape=(1,),
+            block_size=2,
+            expected_mapped_rows=1,
+        )
+        individual = mapped_pool_ratio_reldiff(
+            "mapping",
+            mapping_shape=(1,),
+            block_size=2,
+            expected_mapped_rows=1,
+            compare_mapped_rows_individually=True,
+        )
+
+        assert allclose.__name__ == (
+            "mapped_pool_ratio_allclose(mapping=mapping, shape=(1,), "
+            "block_size=2, leading_rank_axis=False, atol=None, rtol=None, "
+            "max_error_ratio=0.005)"
+        )
+        assert aggregate.__name__ == (
+            "mapped_pool_ratio_reldiff(mapping=mapping, shape=(1,), "
+            "block_size=2, leading_rank_axis=False, diff_thd=0.01, "
+            "pct_thd=0.05, max_diff_hd=inf, expected_mapped_rows=1)"
+        )
+        assert individual.__name__ == (
+            "mapped_pool_ratio_reldiff(mapping=mapping, shape=(1,), "
+            "block_size=2, leading_rank_axis=False, diff_thd=0.01, "
+            "pct_thd=0.05, max_diff_hd=inf, expected_mapped_rows=1, "
+            "compare_mapped_rows_individually=True)"
+        )
+
     def test_reldiff_rejects_unmapped_mutation(self):
         expected = torch.zeros(2, 2, 1, dtype=torch.float32)
         actual = expected.clone()
@@ -320,6 +391,35 @@ class TestMappedPoolRatioAllclose:
 
         assert not ok
         assert "unmapped physical pool row changed" in detail
+
+    @pytest.mark.parametrize(
+        ("mapping", "expected_rows", "actual_rows"),
+        [
+            (torch.tensor([-1], dtype=torch.int64), 1, 0),
+            (torch.tensor([0], dtype=torch.int64), 0, 1),
+        ],
+    )
+    def test_reldiff_rejects_wrong_mapped_row_coverage(
+        self, mapping, expected_rows, actual_rows, capsys,
+    ):
+        expected = torch.zeros(2, 2, 1, dtype=torch.float32)
+        comparator = mapped_pool_ratio_reldiff(
+            "mapping",
+            mapping_shape=(1,),
+            block_size=2,
+            diff_thd=0.01,
+            pct_thd=0.05,
+            expected_mapped_rows=expected_rows,
+        )
+
+        ok, detail = self._call(comparator, expected.clone(), expected, mapping)
+
+        assert not ok
+        assert f"is {actual_rows}, expected {expected_rows}" in detail
+        assert (
+            f"[GOLDEN METRIC] output=pool active_rows={actual_rows}"
+            in capsys.readouterr().out
+        )
 
 
 class TestValidateGolden:
@@ -964,6 +1064,190 @@ class TestRatioReldiff:
             ratio_reldiff(diff_thd=0.01, pct_thd=1.5)
         with pytest.raises(ValueError, match="max_diff_hd"):
             ratio_reldiff(diff_thd=0.01, max_diff_hd=0.0)
+
+
+class TestRowwiseRatioReldiff:
+    """Tests for logical-row isolation in ratio-based validation."""
+
+    @staticmethod
+    def _call(cmp, actual, expected, inputs=None):
+        return cmp(
+            actual,
+            expected,
+            actual_outputs={"out": actual},
+            expected_outputs={"out": expected},
+            inputs=inputs or {},
+            rtol=1e-5,
+            atol=1e-5,
+        )
+
+    def test_rejects_whole_corrupt_row_hidden_by_global_ratio(self, capsys):
+        expected = torch.ones(8, 8, 100, dtype=torch.float32)
+        actual = expected.clone()
+        actual[0, 0] = 2.0
+        global_compare = ratio_reldiff(diff_thd=0.01, pct_thd=0.05)
+        rowwise_compare = rowwise_ratio_reldiff(
+            output_name="x_next",
+            row_shape=(8, 8),
+            diff_thd=0.01,
+            pct_thd=0.05,
+            expected_active_rows=64,
+        )
+
+        global_ok, global_detail = self._call(
+            global_compare, actual, expected,
+        )
+        rowwise_ok, rowwise_detail = self._call(
+            rowwise_compare, actual, expected,
+        )
+
+        assert global_ok, global_detail
+        assert not rowwise_ok
+        assert "row [0, 0]" in rowwise_detail
+        assert "error_count=100/100" in rowwise_detail
+        assert (
+            "[GOLDEN METRIC] output=x_next active_rows=64"
+            in capsys.readouterr().out
+        )
+
+    def test_optional_aggregate_budget_preserves_tensor_wide_quality(self):
+        expected = torch.ones(2, 2, 10, dtype=torch.float32)
+        actual = expected.clone()
+        actual[0, 0, 0] = 2.0
+        actual[0, 1, 0] = 2.0
+        row_only = rowwise_ratio_reldiff(
+            output_name="x_next",
+            row_shape=(2, 2),
+            diff_thd=0.01,
+            pct_thd=0.10,
+        )
+        row_and_aggregate = rowwise_ratio_reldiff(
+            output_name="x_next",
+            row_shape=(2, 2),
+            diff_thd=0.01,
+            pct_thd=0.10,
+            aggregate_pct_thd=0.02,
+        )
+
+        row_ok, row_detail = self._call(row_only, actual, expected)
+        aggregate_ok, aggregate_detail = self._call(
+            row_and_aggregate,
+            actual,
+            expected,
+        )
+
+        assert row_ok, row_detail
+        assert not aggregate_ok
+        assert "failed aggregate comparison" in aggregate_detail
+        assert "error_count=2/40" in aggregate_detail
+
+    def test_rejects_missing_mapped_row_coverage(self, capsys):
+        expected = torch.ones(2, 2, 4, dtype=torch.float32)
+        comparator = rowwise_ratio_reldiff(
+            output_name="logits",
+            row_shape=(2, 2),
+            mapping_name="mapping",
+            expected_active_rows=1,
+        )
+
+        ok, detail = self._call(
+            comparator,
+            expected.clone(),
+            expected,
+            inputs={"mapping": torch.full((2, 2), -1, dtype=torch.int32)},
+        )
+
+        assert not ok
+        assert "active-row coverage for logits is 0, expected 1" in detail
+        assert (
+            "[GOLDEN METRIC] output=logits active_rows=0"
+            in capsys.readouterr().out
+        )
+
+    def test_rejects_inactive_row_mutation(self):
+        expected = torch.ones(2, 2, 4, dtype=torch.float32)
+        actual = expected.clone()
+        actual[0, 1, 2] = 9.0
+        comparator = rowwise_ratio_reldiff(
+            output_name="logits",
+            row_shape=(2, 2),
+            mapping_name="mapping",
+            expected_active_rows=1,
+        )
+
+        ok, detail = self._call(
+            comparator,
+            actual,
+            expected,
+            inputs={
+                "mapping": torch.tensor([[0, -1], [-1, -1]], dtype=torch.int64),
+            },
+        )
+
+        assert not ok
+        assert "inactive logits row [0, 1] changed" in detail
+
+    def test_rejects_negative_mapping_other_than_minus_one(self):
+        expected = torch.ones(2, 2, 4, dtype=torch.float32)
+        comparator = rowwise_ratio_reldiff(
+            output_name="logits",
+            row_shape=(2, 2),
+            mapping_name="mapping",
+        )
+
+        ok, detail = self._call(
+            comparator,
+            expected.clone(),
+            expected,
+            inputs={
+                "mapping": torch.tensor([[0, -2], [-1, -1]], dtype=torch.int64),
+            },
+        )
+
+        assert not ok
+        assert "only -1 is a negative sentinel" in detail
+
+    def test_name_records_full_contract(self):
+        comparator = rowwise_ratio_reldiff(
+            output_name="logits",
+            row_shape=(8, 8),
+            mapping_name="logit_row_indices",
+            diff_thd=0.02,
+            pct_thd=0.1,
+            expected_active_rows=64,
+        )
+
+        assert comparator.__name__ == (
+            "rowwise_ratio_reldiff(output=logits, row_shape=(8, 8), "
+            "mapping=logit_row_indices, diff_thd=0.02, pct_thd=0.1, "
+            "max_diff_hd=inf, expected_active_rows=64)"
+        )
+
+        aggregate_comparator = rowwise_ratio_reldiff(
+            output_name="x_next",
+            row_shape=(8, 8),
+            diff_thd=0.003,
+            pct_thd=0.1,
+            expected_active_rows=64,
+            aggregate_pct_thd=0.05,
+        )
+        assert aggregate_comparator.__name__ == (
+            "rowwise_ratio_reldiff(output=x_next, row_shape=(8, 8), "
+            "mapping=None, diff_thd=0.003, pct_thd=0.1, max_diff_hd=inf, "
+            "expected_active_rows=64, aggregate_pct_thd=0.05)"
+        )
+
+    @pytest.mark.parametrize(
+        ("kwargs", "message"),
+        [
+            ({"row_shape": ()}, "row_shape"),
+            ({"row_shape": (2, 2), "expected_active_rows": 5}, "expected_active_rows"),
+            ({"row_shape": (2, 2), "aggregate_pct_thd": 1.1}, "aggregate_pct_thd"),
+        ],
+    )
+    def test_rejects_invalid_factory_contract(self, kwargs, message):
+        with pytest.raises(ValueError, match=message):
+            rowwise_ratio_reldiff(output_name="out", **kwargs)
 
 
 class TestValidRows:

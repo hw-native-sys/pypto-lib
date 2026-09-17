@@ -50,6 +50,7 @@ from .validation import (
     mapped_pool_ratio_reldiff,
     ratio_allclose,
     ratio_reldiff,
+    rowwise_ratio_reldiff,
     topk_pair_compare,
     validate_golden,
 )
@@ -62,6 +63,7 @@ __all__ = [
     "mapped_pool_ratio_allclose",
     "mapped_pool_ratio_reldiff",
     "ratio_reldiff",
+    "rowwise_ratio_reldiff",
     "error_distribution",
     "topk_pair_compare",
     "RunResult",

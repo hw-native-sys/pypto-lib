@@ -485,12 +485,16 @@ def _mapped_pool_compare(
     pool_name: str,
     mapped_compare: Callable,
     comparator_name: str,
+    expected_mapped_rows: int | None,
+    compare_mapped_rows_individually: bool,
 ) -> Callable:
     """Apply ``mapped_compare`` to mapped rows and preserve every other row."""
     if not mapping_shape or any(dim <= 0 for dim in mapping_shape):
         raise ValueError(f"mapping_shape must contain positive dimensions, got {mapping_shape}")
     if block_size <= 0:
         raise ValueError(f"block_size must be positive, got {block_size}")
+    if expected_mapped_rows is not None and expected_mapped_rows < 0:
+        raise ValueError("expected_mapped_rows must be non-negative")
     if leading_rank_axis and len(mapping_shape) < 2:
         raise ValueError(
             "leading_rank_axis requires mapping_shape to include a rank axis "
@@ -599,6 +603,18 @@ def _mapped_pool_compare(
                     )
             written_rows[rank, rank_mapping] = True
 
+        mapped_row_count = int(written_rows.count_nonzero().item())
+        if expected_mapped_rows is not None:
+            print(
+                f"[GOLDEN METRIC] output={pool_name} "
+                f"active_rows={mapped_row_count}"
+            )
+            if mapped_row_count != expected_mapped_rows:
+                return False, (
+                    f"    mapped-row coverage for {pool_name} is "
+                    f"{mapped_row_count}, expected {expected_mapped_rows}"
+                )
+
         equal_rows = (actual_rows == expected_rows).all(dim=-1)
         stray_rows = ~written_rows & ~equal_rows
         if stray_rows.any().item():
@@ -630,6 +646,33 @@ def _mapped_pool_compare(
                         f"contain {int(nonfinite.count_nonzero().item())} non-finite value(s)"
                     )
 
+        if compare_mapped_rows_individually:
+            failures = []
+            failed_row_count = 0
+            for rank, row in written_rows.nonzero(as_tuple=False).tolist():
+                ok, detail = mapped_compare(
+                    actual_rows[rank, row],
+                    expected_rows[rank, row],
+                    **kwargs,
+                )
+                if ok:
+                    continue
+                failed_row_count += 1
+                if len(failures) < 10:
+                    location = (
+                        f"rank={rank} row={row}"
+                        if leading_rank_axis
+                        else f"row={row}"
+                    )
+                    failures.append(f"    {location}:\n{detail}")
+            if failed_row_count:
+                return False, (
+                    f"    {failed_row_count} mapped {pool_name} row(s) from "
+                    f"'{mapping_name}' failed individual comparison; first "
+                    f"{len(failures)} failure(s):\n" + "\n".join(failures)
+                )
+            return True, ""
+
         ok, detail = mapped_compare(mapped_actual, mapped_expected, **kwargs)
         if ok:
             return True, ""
@@ -649,6 +692,7 @@ def mapped_pool_ratio_allclose(
     atol: float | None = None,
     rtol: float | None = None,
     max_error_ratio: float = 0.005,
+    expected_mapped_rows: int | None = None,
 ) -> Callable:
     """Compare mapped rows of a block-major pool and preserve all other rows.
 
@@ -661,16 +705,23 @@ def mapped_pool_ratio_allclose(
     Only allocator-mapped rows use the ratio-based numerical comparison and
     floating-point finiteness checks.  Every unmapped row must remain exactly
     equal to its golden snapshot, which detects writes outside the mapping.
+    ``expected_mapped_rows`` optionally rejects missing or extra active rows.
     """
     mapped_compare = ratio_allclose(
         atol=atol,
         rtol=rtol,
         max_error_ratio=max_error_ratio,
     )
+    coverage_suffix = (
+        f", expected_mapped_rows={expected_mapped_rows}"
+        if expected_mapped_rows is not None
+        else ""
+    )
     comparator_name = (
         f"mapped_pool_ratio_allclose(mapping={mapping_name}, shape={mapping_shape}, "
         f"block_size={block_size}, leading_rank_axis={leading_rank_axis}, "
-        f"atol={atol}, rtol={rtol}, max_error_ratio={max_error_ratio})"
+        f"atol={atol}, rtol={rtol}, max_error_ratio={max_error_ratio}"
+        f"{coverage_suffix})"
     )
     return _mapped_pool_compare(
         mapping_name,
@@ -680,6 +731,8 @@ def mapped_pool_ratio_allclose(
         pool_name=pool_name,
         mapped_compare=mapped_compare,
         comparator_name=comparator_name,
+        expected_mapped_rows=expected_mapped_rows,
+        compare_mapped_rows_individually=False,
     )
 
 
@@ -819,6 +872,196 @@ def ratio_reldiff(
     return cmp
 
 
+def rowwise_ratio_reldiff(
+    output_name: str,
+    *,
+    row_shape: tuple[int, ...],
+    mapping_name: str | None = None,
+    diff_thd: float = 0.01,
+    pct_thd: float = 0.05,
+    max_diff_hd: float = float("inf"),
+    expected_active_rows: int | None = None,
+    aggregate_pct_thd: float | None = None,
+) -> Callable:
+    """Apply ``ratio_reldiff`` independently to each active logical row.
+
+    ``row_shape`` is the exact leading shape that identifies logical rows;
+    every remaining output dimension is the payload of one row.  Without a
+    mapping all rows are active.  With ``mapping_name``, non-negative mapping
+    entries select active rows and ``-1`` is the only inactive sentinel.
+    Inactive output rows must remain exactly equal to the Golden snapshot.
+
+    ``expected_active_rows`` optionally freezes coverage and emits a
+    ``[GOLDEN METRIC]`` line.  The per-row comparison prevents a completely
+    corrupt row from consuming only a small fraction of a tensor-wide
+    bad-point budget.  ``aggregate_pct_thd`` optionally retains a stricter
+    tensor-wide bad-point budget in addition to the per-row budget.
+    """
+    if not row_shape or any(dim <= 0 for dim in row_shape):
+        raise ValueError(f"row_shape must contain positive dimensions, got {row_shape}")
+    row_count = 1
+    for dim in row_shape:
+        row_count *= dim
+    if expected_active_rows is not None and not 0 <= expected_active_rows <= row_count:
+        raise ValueError(
+            f"expected_active_rows must be in [0, {row_count}], "
+            f"got {expected_active_rows}"
+        )
+    if aggregate_pct_thd is not None and not 0.0 <= aggregate_pct_thd <= 1.0:
+        raise ValueError(
+            f"aggregate_pct_thd must be in [0, 1], got {aggregate_pct_thd}"
+        )
+
+    row_compare = ratio_reldiff(
+        diff_thd=diff_thd,
+        pct_thd=pct_thd,
+        max_diff_hd=max_diff_hd,
+    )
+    aggregate_compare = None
+    if aggregate_pct_thd is not None:
+        aggregate_compare = ratio_reldiff(
+            diff_thd=diff_thd,
+            pct_thd=aggregate_pct_thd,
+            max_diff_hd=max_diff_hd,
+        )
+    integer_dtypes = (
+        torch.int8,
+        torch.int16,
+        torch.int32,
+        torch.int64,
+        torch.uint8,
+    )
+
+    def row_coordinate(flat_index: int) -> tuple[int, ...]:
+        coordinate = []
+        remaining = flat_index
+        for size in reversed(row_shape):
+            coordinate.append(remaining % size)
+            remaining //= size
+        return tuple(reversed(coordinate))
+
+    def compare(actual: torch.Tensor, expected: torch.Tensor, **kwargs) -> tuple[bool, str]:
+        if actual.shape != expected.shape:
+            return False, (
+                f"    {output_name} shape mismatch: actual={tuple(actual.shape)} "
+                f"expected={tuple(expected.shape)}"
+            )
+        if actual.ndim <= len(row_shape) or tuple(actual.shape[:len(row_shape)]) != row_shape:
+            return False, (
+                f"    '{output_name}' must have leading row shape {row_shape} "
+                f"and at least one payload dimension, got {tuple(actual.shape)}"
+            )
+
+        if mapping_name is None:
+            active_rows = torch.ones(row_shape, dtype=torch.bool)
+        else:
+            mapping = kwargs.get("inputs", {}).get(mapping_name)
+            if mapping is None:
+                return False, (
+                    f"    compare_fn misconfigured: missing input '{mapping_name}'"
+                )
+            if mapping.dtype not in integer_dtypes:
+                return False, (
+                    f"    '{mapping_name}' must have an integer dtype, got {mapping.dtype}"
+                )
+            if tuple(mapping.shape) != row_shape:
+                return False, (
+                    f"    '{mapping_name}' must have shape {row_shape}, "
+                    f"got {tuple(mapping.shape)}"
+                )
+            mapping = mapping.cpu().to(torch.int64)
+            invalid_negative = mapping < -1
+            if invalid_negative.any().item():
+                first = invalid_negative.nonzero(as_tuple=False)[0]
+                coordinate = tuple(int(value) for value in first.tolist())
+                value = int(mapping[coordinate].item())
+                return False, (
+                    f"    '{mapping_name}'{list(coordinate)}={value} is invalid; "
+                    "only -1 is a negative sentinel"
+                )
+            active_rows = mapping >= 0
+
+        active_row_count = int(active_rows.count_nonzero().item())
+        if expected_active_rows is not None:
+            print(
+                f"[GOLDEN METRIC] output={output_name} "
+                f"active_rows={active_row_count}"
+            )
+            if active_row_count != expected_active_rows:
+                return False, (
+                    f"    active-row coverage for {output_name} is "
+                    f"{active_row_count}, expected {expected_active_rows}"
+                )
+
+        actual_rows = actual.cpu().reshape(row_count, -1)
+        expected_rows = expected.cpu().reshape(row_count, -1)
+        active_flat = active_rows.reshape(-1)
+        equal_rows = (actual_rows == expected_rows).all(dim=-1)
+        changed_inactive_rows = ~active_flat & ~equal_rows
+        if changed_inactive_rows.any().item():
+            flat_index = int(
+                changed_inactive_rows.nonzero(as_tuple=False)[0, 0].item()
+            )
+            coordinate = row_coordinate(flat_index)
+            changed_values = int(
+                (actual_rows[flat_index] != expected_rows[flat_index])
+                .count_nonzero()
+                .item()
+            )
+            return False, (
+                f"    inactive {output_name} row {list(coordinate)} changed: "
+                f"changed_values={changed_values} mapping='{mapping_name}'"
+            )
+
+        if aggregate_compare is not None and active_row_count:
+            ok, detail = aggregate_compare(
+                actual_rows[active_flat],
+                expected_rows[active_flat],
+                **kwargs,
+            )
+            if not ok:
+                return False, (
+                    f"    active rows in {output_name} failed aggregate "
+                    f"comparison:\n{detail}"
+                )
+
+        failures = []
+        failed_row_count = 0
+        active_indices = active_flat.nonzero(as_tuple=False).flatten().tolist()
+        for flat_index in active_indices:
+            ok, detail = row_compare(
+                actual_rows[flat_index],
+                expected_rows[flat_index],
+                **kwargs,
+            )
+            if ok:
+                continue
+            failed_row_count += 1
+            if len(failures) < 10:
+                coordinate = row_coordinate(flat_index)
+                failures.append(f"    row {list(coordinate)}:\n{detail}")
+        if failed_row_count:
+            return False, (
+                f"    {failed_row_count} active row(s) in {output_name} failed "
+                f"individual comparison; first {len(failures)} failure(s):\n"
+                + "\n".join(failures)
+            )
+        return True, ""
+
+    aggregate_suffix = (
+        f", aggregate_pct_thd={aggregate_pct_thd}"
+        if aggregate_pct_thd is not None
+        else ""
+    )
+    compare.__name__ = (
+        f"rowwise_ratio_reldiff(output={output_name}, row_shape={row_shape}, "
+        f"mapping={mapping_name}, diff_thd={diff_thd}, pct_thd={pct_thd}, "
+        f"max_diff_hd={max_diff_hd}, expected_active_rows={expected_active_rows}"
+        f"{aggregate_suffix})"
+    )
+    return compare
+
+
 def mapped_pool_ratio_reldiff(
     mapping_name: str,
     *,
@@ -829,17 +1072,36 @@ def mapped_pool_ratio_reldiff(
     diff_thd: float = 0.01,
     pct_thd: float = 0.05,
     max_diff_hd: float = float("inf"),
+    expected_mapped_rows: int | None = None,
+    compare_mapped_rows_individually: bool = False,
 ) -> Callable:
-    """Compare mapped pool rows with ``ratio_reldiff`` and preserve all others."""
+    """Compare mapped rows, preserve all others, and optionally freeze coverage.
+
+    By default all mapped rows share one bad-point budget.  Set
+    ``compare_mapped_rows_individually=True`` to apply that budget separately
+    to every physical row, preventing one fully corrupt row from being diluted
+    by correct mapped rows.
+    """
     mapped_compare = ratio_reldiff(
         diff_thd=diff_thd,
         pct_thd=pct_thd,
         max_diff_hd=max_diff_hd,
     )
+    coverage_suffix = (
+        f", expected_mapped_rows={expected_mapped_rows}"
+        if expected_mapped_rows is not None
+        else ""
+    )
+    individual_suffix = (
+        ", compare_mapped_rows_individually=True"
+        if compare_mapped_rows_individually
+        else ""
+    )
     comparator_name = (
         f"mapped_pool_ratio_reldiff(mapping={mapping_name}, shape={mapping_shape}, "
         f"block_size={block_size}, leading_rank_axis={leading_rank_axis}, "
-        f"diff_thd={diff_thd}, pct_thd={pct_thd}, max_diff_hd={max_diff_hd})"
+        f"diff_thd={diff_thd}, pct_thd={pct_thd}, max_diff_hd={max_diff_hd}"
+        f"{coverage_suffix}{individual_suffix})"
     )
     return _mapped_pool_compare(
         mapping_name,
@@ -849,6 +1111,8 @@ def mapped_pool_ratio_reldiff(
         pool_name=pool_name,
         mapped_compare=mapped_compare,
         comparator_name=comparator_name,
+        expected_mapped_rows=expected_mapped_rows,
+        compare_mapped_rows_individually=compare_mapped_rows_individually,
     )
 
 
