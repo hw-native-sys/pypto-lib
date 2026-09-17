@@ -122,6 +122,8 @@ def build_kernel(t: int = T, h: int = H, hg: int = HG, d: int = D, chunk: int = 
         tril: pl.Tensor[[chunk, chunk], pl.FP32],
         mask_strict: pl.Tensor[[chunk, chunk], pl.FP32],
         neg_eye2: pl.Tensor[[2 * chunk, chunk], pl.FP16],
+        m_diag: pl.Tensor[[chunk, chunk], pl.FP16],
+        m_low: pl.Tensor[[chunk, chunk], pl.FP16],
         out: pl.Out[pl.Tensor[[t, c], pl.BF16]],
     ):
         x_q = pl.create_tensor([t, c], dtype=pl.INT8)
@@ -158,7 +160,8 @@ def build_kernel(t: int = T, h: int = H, hg: int = HG, d: int = D, chunk: int = 
         op_qkng(q_conv, k_conv, a_proj, b_proj, a_log, dt_bias, q_n, k_n, beta, g)
 
         o = pl.create_tensor([t, h, d], dtype=pl.FP16)
-        op_delta(q_n, k_n, v_conv, g, beta, tril, mask_strict, neg_eye2, o)
+        op_delta(q_n, k_n, v_conv, g, beta, tril, mask_strict, neg_eye2,
+                 m_diag, m_low, o)
 
         y_q = pl.create_tensor([t, cv], dtype=pl.INT8)
         y_scale = pl.create_tensor([1, t], dtype=pl.FP32)
@@ -227,13 +230,27 @@ def build_tensor_specs(t: int = T, h: int = H, hg: int = HG, d: int = D,
         TensorSpec("mask_strict", [chunk, chunk], torch.float32, init_value=init_mask_strict),
         TensorSpec("neg_eye2", [2 * chunk, chunk], torch.float16,
                    init_value=lambda: solve_tril.neg_eye_stack(chunk)),
+        TensorSpec("m_diag", [chunk, chunk], torch.float16,
+                   init_value=lambda: solve_tril.blk_masks(chunk)[0]),
+        TensorSpec("m_low", [chunk, chunk], torch.float16,
+                   init_value=lambda: solve_tril.blk_masks(chunk)[1]),
         TensorSpec("out", [t, C], torch.bfloat16),
     ]
 
 
-def golden_gdn_block(tensors):
-    """The fake-quant chain: the block in float64 with the two activation quantisations."""
-    tensors["out"].copy_(_chain(tensors["x"].shape[0], None, quant=True)["out"])
+def golden_gdn_block(weights: str | None = None):
+    """The fake-quant chain: the block in float64 with the two activation quantisations.
+
+    A factory, like `compare_out`, because the weight set has to reach it: the
+    specs draw the device inputs from *weights*, so a golden computed from the
+    random set would be a different problem's answer. `compare_out` scores
+    against its own chain and would not notice, but `--save-data` persists this
+    tensor for a later `--golden-data` replay.
+    """
+    def golden(tensors):
+        tensors["out"].copy_(_chain(tensors["x"].shape[0], weights, quant=True)["out"])
+
+    return golden
 
 
 _CHAIN_CACHE: dict[tuple, dict] = {}
@@ -340,7 +357,7 @@ if __name__ == "__main__":
     result = run(
         fn=build_kernel(t=args.seq_len),
         specs=build_tensor_specs(t=args.seq_len, weights=args.weights),
-        golden_fn=golden_gdn_block,
+        golden_fn=golden_gdn_block(args.weights),
         golden_data=args.golden_data,
         runtime_dir=args.runtime_dir,
         save_data=args.save_data,
