@@ -102,26 +102,51 @@ does it: each row's amax, floored by `INT8_AMAX_EPS = 1e-4`, is rescaled to
 The router kernel produces that INT8 view once and both the shared expert and the
 EP dispatch payload reuse it.
 
-The weight boundary below follows `models/deepseek_v4_flash_mtp`, the only other
-a2a3 W8A8 port in this repo, cross-checked against which GLM modules the released
-checkpoint actually quantizes.
+The boundary below is read from the deployment checkpoint
+(`Eco-Tech/GLM-5.3-Flash-w8a8` on modelers.cn), not inferred: its
+`quant_model_description.json` labels every tensor, and the shard headers confirm
+the dtypes. The split is sharper than the released FP8 checkpoint's.
 
 | Tensor | Format |
 | --- | --- |
-| `q_b_proj`, `o_proj`, indexer `wq_b`, routed experts, shared expert, dense MLP | **INT8** with an FP32 per-output-channel scale |
-| `q_a_proj`, `kv_a_proj_with_mqa`, `kv_b_proj`, indexer `wk` / `weights_proj` / `index_kpool_compress_gate`, **every KDA projection**, `embed_tokens`, `lm_head`, every norm gamma | BF16 |
+| `mlp.experts.N.{gate,up,down}_proj`, `mlp.shared_experts.*`, and the three dense layers' `mlp.{gate,up,down}_proj` — **the FFN and nothing else** | **INT8**, with an FP32 `[out, 1]` per-output-channel `weight_scale` |
+| **All of attention**: every MLA projection (`q_a_proj`, `q_b_proj`, `kv_a_proj_with_mqa`, `kv_b_proj`, `o_proj`), every KDA projection and conv, every indexer weight, all mHC tensors, `mlp.gate.weight`, `e_score_correction_bias`, every norm, `embed_tokens`, `lm_head`, and the whole vision tower | BF16 |
 | MLA 512-latent cache | BF16 |
 | Indexer state cache | FP32 today, 256 wide per token; the sibling port quantizes its indexer cache to INT8 with a per-row FP32 scale, which would save about 2.3 KB per token here |
 | Hyper-connection stream | BF16 — see above, this is where GLM departs from DeepSeek-V4's FP32 stream |
 | Logits | FP32 |
 
-Two things to settle with the deployed checkpoint rather than the released one.
-The official FP8 checkpoint quantizes `q_a_proj`, `q_b_proj`, `kv_a_proj_with_mqa`
-and `o_proj` blockwise and leaves `kv_b_proj` and all of KDA in BF16; vLLM Ascend
-nonetheless builds the whole MLA block, the whole KDA block and the vision tower
-with `quant_config=None`. Which of those the msmodelslim W8A8 conversion keeps
-INT8 is a property of its `quant_model_description.json`, and the weight-loader
-work item owns reading it rather than assuming.
+Of 113,352 labelled tensors, 111,870 are `W8A8_DYNAMIC` and 1,482 are `FLOAT`. Each
+quantized weight also carries a `weight_offset`, but it is **all zero** — measured
+across tensors of 12,288, 2,048 and 4,096 channels — so the weight quantization is
+symmetric and the loader reads and discards the offset. There is no static
+activation path and no SmoothQuant vector.
+
+The consequence for the work list is that W8A8 is confined to the MoE and dense-MLP
+streams. Attention carries no quantization at all, which removes the scale plumbing
+from `mla_prolog`, `mla_epilog` and the indexer projections.
+
+### The checkpoint also ships two matrices that are not weights
+
+`rot.weight`, BF16 `[4096, 4096]`, is the only tensor in the weight index with no
+entry in the quantization description; it is announced solely by `is_rot_used:
+true`. It belongs to the **MTP layer**, not the backbone — vLLM Ascend's
+`AscendDeepSeekMTP` applies it to the previous hidden state before `hnorm`. GLM
+routes to `Glm5NextMTP` instead, which has no `rot` and drops the tensor silently,
+so whether it is required is an open question the MTP owner inherits. It is not a
+rotation, despite the name: it is symmetric with `R[i,j] = g(i xor j)`, a
+per-channel diagonal scaling in the Hadamard basis.
+
+`optional/quarot.safetensors` holds `global_rotation`, F32 `[4096, 4096]`, an exact
+scaled Hadamard (every entry +/-1/64, rows orthonormal) — a textbook QuaRot matrix.
+It is unreachable for this checkpoint: vLLM Ascend looks it up under
+`quant_description["optional"]["quarot"]`, and this description's `optional` is
+empty. Where that matrix is used elsewhere in vLLM Ascend it is folded into weights
+offline, never applied to activations. **No backbone kernel applies a rotation.**
+
+The one rotation that does matter is 128 wide and lives in the indexer: the upstream
+kernel rotates each query head by a Hadamard-128 before quantizing it. See the
+indexer files.
 
 ## Prior art, and what it is actually worth
 
@@ -377,7 +402,7 @@ RoPE machinery, and add the KDA family and the kpool indexer.
 | --- | --- |
 | `config.py` | Complete. Layer schedule, derived per-rank shapes, TP/EP validation, W8A8 metadata |
 | `golden.py` | Complete for the shared transforms: RMSNorm, gated RMSNorm, L2 norm, clamped SwiGLU, the expert body, the sigmoid `noaux_tc` router, and the four mHC references |
-| `quantization.py` | Complete. Per-channel and per-token INT8 with the repo's exact rounding, both W8A8 linear forms with the asymmetric correction, and the fused dequant-SwiGLU-requant epilogue |
+| `quantization.py` | Complete. Per-channel and per-token INT8 with the repo's exact rounding, the dynamic W8A8 linear, and the fused dequant-SwiGLU-requant epilogue |
 | `metadata.py` | Complete. Packed-batch lowering, the three distinct slot mappings (latent, per-token indexer state, pooled state), TP token ownership, and the indexer's pool and tail derivation |
 | `_golden_smoke.py` | Complete. Deterministic CPU fixtures behind every golden that exists |
 | `attention_tp.py` | ABI only, but it is the one shared consumer: `kda_output`, both `mla_epilog` entries and `dense_mlp` all emit an FP32 row-parallel partial, and this is what adds the 16 of them |
@@ -385,9 +410,9 @@ RoPE machinery, and add the KDA family and the kpool indexer.
 
 ## Open questions an owner will hit
 
-- **Which modules the deployed W8A8 checkpoint actually quantizes.** The table
-  above is the plan, not a reading of `quant_model_description.json`. Stream E's
-  weight loader settles it.
+- **Whether the MTP layer owes `rot.weight`.** `is_rot_used: true` and the tensor's
+  presence in the index argue yes; `Glm5NextMTP` dropping it argues no, or argues
+  the reference port has a gap. Stream D settles it before implementing MTP.
 - **How the indexer cache is laid out.** vLLM Ascend splits it into an index-K
   cache and a separate FP32 pooled-state page class with a page of four tokens;
   storing the raw row instead is simpler but larger. Stream C decides, stream E's

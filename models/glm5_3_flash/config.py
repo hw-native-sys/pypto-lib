@@ -49,6 +49,10 @@ class Glm53FlashConfig:
     Field values come from ``zai-org/GLM-5.3-Flash`` ``config.json`` (``text_config``)
     and were cross-checked against ``model.safetensors.index.json``. The checkpoint
     carries 46 layers: ``num_hidden_layers`` backbone layers plus one MTP layer.
+
+    The **deployment** weights are a different artefact: ``Eco-Tech/GLM-5.3-Flash-w8a8``
+    on modelers.cn, whose ``quant_model_description.json`` is the authority on what
+    is quantized. Every value below matches both.
     """
 
     name: str

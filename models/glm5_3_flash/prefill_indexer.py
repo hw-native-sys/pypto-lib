@@ -21,7 +21,8 @@ One file owns the whole selection pipeline for this phase, the way
    ``pool_key = sum(p * key)``. A pool is a candidate only when all four of its
    tokens are valid.
 3. **Scoring.** ``scores = relu(q . pool_keys^T * 128 ** -0.5)`` then a weighted sum
-   over the 32 heads. The ``relu`` before the head reduction is what makes this a
+   over the 32 heads, with the query Hadamard-rotated and quantized first (see
+   below). The ``relu`` before the head reduction is what makes this a
    lightning indexer and not a second attention: a head that disagrees contributes
    zero rather than a negative.
 4. **Selection.** Top ``index_topk / index_kpool`` = 512 pools out of
@@ -52,11 +53,26 @@ time: a narrow (256) sort **faults with 507018**, so the leaf stays wide (2048);
 the merge-stage list must match the leaf, because a 4096 stage on a 2048-score row
 "lowers to an illegal AIV config".
 
-What to delete from the donor: the INT8/Hadamard half (GLM feeds BF16 q against a
-BF16 pooled cache, so the score is one ``pl.matmul(..., out_dtype=pl.FP32,
-b_trans=True)`` with no scale plumbing) and the compressor. What to add: the pooling
-stage, which has no donor anywhere, and a ``selected_valid`` output so the expansion
-can invalidate whole 4-wide groups.
+What to delete from the donor: the compressor, and its ratio-4 slot rewrite. What
+to **keep**: the Hadamard-128 rotation and the INT8 quantization of the indexer
+query. That half is not a donor quirk — it is GLM's own numerics. The upstream
+GLM-5.3-Flash kernel rotates each 128-wide query head by a Hadamard-128 and then
+quantizes to FP8 e4m3 with a power-of-two (ue8m0) scale
+(``vllm_ascend/models/glm5next/ops/kpool_compress.py:48-75``), and the
+Ascend-native GLM-5 recipe does the same rotation
+(``models/glm_5/models/indexer.py:97-100``). **a2a3 cannot do the FP8 half** — its
+cube has no fp8 entry in ``Intrinsic_mmad`` — so the quantization target becomes
+INT8, which is exactly what ``deepseek_v4_flash_mtp/decode_indexer.py:188-214``
+already implements: a cube-only ``pl.matmul`` against a BF16 Hadamard operand,
+then an INT8 amax/quant scope.
+
+Note the deployment checkpoint ships **no** Hadamard matrix of its own — unlike the
+cann-recipes GLM-5 conversion, which bakes a per-layer
+``self_attn.indexer.hadamard_matrix`` into the shards. It has to be generated at
+load time.
+
+What to add: the pooling stage, which has no donor anywhere, and a
+``selected_valid`` output so the expansion can invalidate whole 4-wide groups.
 
 vLLM Ascend is no help: ``sparse_attn_indexer_kpool.py`` raises
 ``NotImplementedError`` and says the upstream is a set of CUDA kernels with "no NPU
@@ -118,7 +134,7 @@ def golden_indexer_kpool(
 @pl.jit.inline
 def indexer_kpool(
     packed_states: pl.Tensor[[TABLE_DYN * BLOCK_SIZE, INDEX_STATE_WIDTH], pl.FP32],
-    compress_ape: pl.Tensor[[INDEX_KPOOL, INDEX_DIM], pl.FP32],
+    compress_ape: pl.Tensor[[INDEX_KPOOL, INDEX_DIM], pl.BF16],
     pool_count: pl.Tensor[[B_DYN], pl.INT32],
     pool_keys: pl.Tensor[[POOLS_DYN, INDEX_DIM], pl.BF16],
     pool_valid: pl.Tensor[[POOLS_DYN], pl.INT32],

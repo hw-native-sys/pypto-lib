@@ -14,25 +14,24 @@ by :mod:`models.glm5_3_flash.mla_absorb`. Both are row-parallel over heads, so t
 result is a partial sum that needs an all-reduce across the 16 ranks before mHC
 folds it back into the residual stream.
 
-``o_proj`` is one of the four MLA projections that carry a ``weight_scale_inv`` in
-the released checkpoint.
+``o_proj`` carries a ``weight_scale_inv`` in the released FP8 checkpoint but is
+**BF16** in the deployment W8A8 one (``[4096, 8192]``, marked ``FLOAT`` in
+``quant_model_description.json``), so neither path quantizes here.
 """
 
 import pypto.language as pl
 import torch
 
 from models.glm5_3_flash.config import D, KV_LORA, LOCAL_H, T_DYN, V_DIM
-from models.glm5_3_flash.quantization import w8a8_dynamic_linear
 
 
 def golden_mla_epilog_prefill(
     attn_out: torch.Tensor,
-    w_o_int8: torch.Tensor,
-    w_o_scale: torch.Tensor,
+    w_o: torch.Tensor,
 ) -> torch.Tensor:
-    """The W8A8 path: per-token activation quant against the INT8 ``o_proj``."""
+    """Head-space projection. ``o_proj`` is BF16 in the deployment checkpoint."""
     flattened = attn_out.reshape(*attn_out.shape[:-2], -1)
-    return w8a8_dynamic_linear(flattened, w_o_int8, w_o_scale, out_dtype=torch.float32)
+    return torch.nn.functional.linear(flattened.float(), w_o.float())
 
 
 def golden_mla_epilog_decode(
@@ -47,8 +46,7 @@ def golden_mla_epilog_decode(
 @pl.jit.inline
 def mla_epilog_prefill(
     attn_out: pl.Tensor[[T_DYN, LOCAL_H, V_DIM], pl.BF16],
-    w_o: pl.Tensor[[D, LOCAL_H * V_DIM], pl.INT8],
-    w_o_scale: pl.Tensor[[D], pl.FP32],
+    w_o: pl.Tensor[[D, LOCAL_H * V_DIM], pl.BF16],
     output: pl.Tensor[[T_DYN, D], pl.FP32],
 ):
     raise NotImplementedError("MLA prefill epilog kernel body is assigned independently")
