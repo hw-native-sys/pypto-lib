@@ -48,6 +48,9 @@ from config import (
 )
 from dspark_attention import dspark_attention
 from dspark_context_kv import dspark_context_kv
+from dspark_proj import K_TILE as MAIN_PROJ_K_TILE
+from dspark_proj import N_TILE as MAIN_PROJ_N_TILE
+from dspark_proj import T_TILE as MAIN_PROJ_T_TILE
 from dspark_proj import dspark_proj
 from decode_o_proj import (
     ATTENTION_PUBLISH_WORKERS,
@@ -517,7 +520,6 @@ def draft_layer(
     )
     return output_hc, hidden_gather_signal
 
-@pl.jit
 def dspark_drafter(
     target_hidden: pl.Tensor[[T_MAIN_DYN, MAIN_IN], pl.BF16],
     main_proj_weight: pl.Tensor[[D, MAIN_IN], pl.BF16],
@@ -647,21 +649,41 @@ def dspark_drafter(
     gamma_ckv_0 = pl.slice(gamma_ckv, [HEAD_DIM], [0])
     gamma_ckv_1 = pl.slice(gamma_ckv, [HEAD_DIM], [HEAD_DIM])
     gamma_ckv_2 = pl.slice(gamma_ckv, [HEAD_DIM], [2 * HEAD_DIM])
-    main_x = pl.create_tensor([target_tokens, D], dtype=pl.BF16)
     query_token_ids = pl.create_tensor([T], dtype=pl.INT64)
     hidden_0_flat = pl.reshape(initial_hidden, [T, HC_MULT * D])
-    main_x, query_token_ids, hidden_0_flat = prepare_dspark_inputs(
-        target_hidden,
-        main_proj_weight,
-        main_norm_weight,
-        num_sampled,
-        last_sampled,
-        next_prefill_tokens,
-        embedding_weight,
-        main_x,
-        query_token_ids,
-        hidden_0_flat,
-    )
+    target_tokens_padded = (target_tokens + MAIN_PROJ_T_TILE - 1) // MAIN_PROJ_T_TILE * MAIN_PROJ_T_TILE
+    projected = pl.create_tensor([target_tokens, D], dtype=pl.BF16)
+    main_x = pl.create_tensor([target_tokens, D], dtype=pl.BF16)
+    for proj_idx in pl.spmd(target_tokens_padded // MAIN_PROJ_T_TILE * (D // MAIN_PROJ_N_TILE), name_hint='dspark_main_proj', allow_early_resolve=True):
+        token_begin = proj_idx // (D // MAIN_PROJ_N_TILE) * MAIN_PROJ_T_TILE
+        hidden_begin = proj_idx % (D // MAIN_PROJ_N_TILE) * MAIN_PROJ_N_TILE
+        projection_rows = pl.min(MAIN_PROJ_T_TILE, target_tokens - token_begin)
+        hidden_k0 = pl.slice(target_hidden, [MAIN_PROJ_T_TILE, MAIN_PROJ_K_TILE], [token_begin, 0], valid_shape=[projection_rows, MAIN_PROJ_K_TILE])
+        weight_k0 = main_proj_weight[hidden_begin:hidden_begin + MAIN_PROJ_N_TILE, 0:MAIN_PROJ_K_TILE]
+        projection = pl.matmul(hidden_k0, weight_k0, b_trans=True, out_dtype=pl.FP32)
+        for reduce_begin in pl.pipeline(MAIN_PROJ_K_TILE, MAIN_IN, MAIN_PROJ_K_TILE, stage=2):
+            hidden_k = pl.slice(target_hidden, [MAIN_PROJ_T_TILE, MAIN_PROJ_K_TILE], [token_begin, reduce_begin], valid_shape=[projection_rows, MAIN_PROJ_K_TILE])
+            weight_k = main_proj_weight[hidden_begin:hidden_begin + MAIN_PROJ_N_TILE, reduce_begin:reduce_begin + MAIN_PROJ_K_TILE]
+            projection = pl.matmul_acc(projection, hidden_k, weight_k, b_trans=True)
+        projection_bf16 = pl.cast(projection, target_type=pl.BF16, mode='rint')
+        projection_valid = pl.set_validshape(projection_bf16, projection_rows, MAIN_PROJ_N_TILE)
+        projected[token_begin:token_begin + MAIN_PROJ_T_TILE, hidden_begin:hidden_begin + MAIN_PROJ_N_TILE] = projection_valid
+    rms_norm(projected, main_norm_weight, main_x)
+    with pl.at(level=pl.Level.CORE_GROUP, name_hint='dspark_query_ids'):
+        for token in pl.range(DSPARK_MOE_TOKENS):
+            token_id = pl.cast(0, pl.INT64)
+            if token < active_tokens:
+                request = token // DSPARK_QUERY_WIDTH
+                query_offset = token % DSPARK_QUERY_WIDTH
+                token_id = pl.cast(DSPARK_NOISE_TOKEN_ID, pl.INT64)
+                if query_offset == 0:
+                    token_id = pl.read(next_prefill_tokens, [request])
+                    if pl.read(num_sampled, [request]) > 0:
+                        token_id = pl.read(last_sampled, [request])
+            pl.write(query_token_ids, [token], token_id)
+    lookup_hidden = pl.create_tensor([DSPARK_MOE_TOKENS, D], dtype=pl.BF16)
+    query_hc = pl.reshape(hidden_0_flat, [DSPARK_MOE_TOKENS, HC_MULT, D])
+    lookup_embedding(query_token_ids, embedding_weight, lookup_hidden, query_hc)
     group_context_tokens = pl.tensor.dim(context_group_position_ids, 0)
     group_main_x = pl.create_tensor([group_context_tokens, D], dtype=pl.BF16)
     _gathered_context, hidden_gather_signal = prefill_cp_token_allgather_step(
@@ -781,13 +803,23 @@ def dspark_drafter(
     padded_head_hidden = pl.create_tensor([T, D], dtype=pl.BF16)
     hc_head(hidden_3, hc_head_fn, hc_head_scale, hc_head_base, padded_head_hidden)
     head_hidden_flat = pl.reshape(head_hidden, [batch * DSPARK_QUERY_WIDTH, D])
-    for token in pl.spmd(T, name_hint="dspark_head_unpad"):
+    with pl.spmd(T, name_hint="dspark_head_unpad") as head_hidden_ready_tid:
+        token = pl.tile.get_block_idx()
         if token < active_tokens:
             head_hidden_flat[token : token + 1, :] = padded_head_hidden[
                 token : token + 1,
                 :,
             ]
-    return head_hidden
+    return head_hidden, head_hidden_ready_tid
+
+
+# Keep the implementation single-sourced: the fused decode path imports the
+# inline form, while the legacy standalone L3 continues to dispatch the
+# orchestration entry with ``device=rank``.
+_dspark_drafter_impl = dspark_drafter
+dspark_drafter_inline = pl.jit.inline(auto_scope=False)(_dspark_drafter_impl)
+dspark_drafter = pl.jit(auto_scope=False)(_dspark_drafter_impl)
+
 
 @pl.jit.host
 def l3_dspark_drafter(

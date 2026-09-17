@@ -33,6 +33,7 @@ def markov_head(
     markov_w2: pl.Tensor[[VOCAB_DYN, MARKOV_RANK], pl.BF16],
     logits_bias: pl.Tensor[[T_DYN, VOCAB_DYN], pl.FP32],
     markov_embed: pl.Tensor[[T_DYN, MARKOV_RANK], pl.BF16],
+    token_ids_ready_tid: pl.Scalar[pl.TASK_ID] = None,
 ):
     t_dim = pl.tensor.dim(token_ids, 0)
     t_linear = ((t_dim + T_TILE - 1) // T_TILE) * T_TILE
@@ -40,6 +41,7 @@ def markov_head(
     with pl.spmd(
         t_dim,
         name_hint="markov_embedding",
+        deps=[token_ids_ready_tid],
         allow_early_resolve=True,
     ) as embedding_tid:
         token_idx = pl.tile.get_block_idx()
@@ -86,12 +88,18 @@ def markov_head_test(
     logits_bias.bind_dynamic(0, T_DYN)
     logits_bias.bind_dynamic(1, VOCAB_DYN)
     markov_embed.bind_dynamic(0, T_DYN)
+    ready_token = pl.create_tensor([1], dtype=pl.INT64)
+    with pl.spmd(1, name_hint="markov_head_test_input_ready") as token_ids_ready_tid:
+        block = pl.tile.get_block_idx()
+        first_token = pl.read(token_ids, [block])
+        pl.write(ready_token, [block], first_token)
     logits_bias, markov_embed, _, _ = markov_head(
         token_ids,
         markov_w1,
         markov_w2,
         logits_bias,
         markov_embed,
+        token_ids_ready_tid,
     )
     return logits_bias, markov_embed
 

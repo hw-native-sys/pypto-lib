@@ -50,7 +50,9 @@ LM_M_TILE = 16
 LM_N_TILE = 128
 LM_K_TILE = 256
 MARKOV_M_TILE = DSPARK_MAX_BATCH
-MARKOV_ID_PAD = 8
+# Keep each request's scratch row on its own 64-byte cache line. Scalar writes
+# from concurrent request blocks otherwise overwrite the neighbouring row.
+MARKOV_ID_PAD = 16
 CONFIDENCE_PAD = 8
 GREEDY_VOCAB_CHUNK = 256
 GREEDY_NUM_CHUNKS = VOCAB // GREEDY_VOCAB_CHUNK
@@ -284,6 +286,7 @@ def greedy_markov_step(
         markov_w2,
         markov_bias,
         markov_embedding,
+        previous_tokens_tid,
     )
 
     confidence_blocks = (batch + CONFIDENCE_PAD - 1) // CONFIDENCE_PAD
@@ -555,7 +558,7 @@ def markov_sample(
         lm_head_weight,
         base_logits,
     )
-    return sample_from_base_logits(
+    draft_token_ids, confidence_probs = sample_from_base_logits(
         head_hidden,
         base_logits,
         num_sampled,
@@ -568,9 +571,9 @@ def markov_sample(
         confidence_probs,
         base_logits_tid,
     )
+    return draft_token_ids, confidence_probs
 
 
-@pl.jit
 def l2_distributed_markov_sample(
     head_hidden: pl.Tensor[[B_DYN, DSPARK_QUERY_WIDTH, D], pl.BF16],
     final_norm_weight: pl.Tensor[[D], pl.BF16],
@@ -618,7 +621,7 @@ def l2_distributed_markov_sample(
         DONE_VALUE,
         final_norm_tid,
     )
-    return sample_from_base_logits(
+    draft_token_ids, confidence_probs = sample_from_base_logits(
         head_hidden,
         base_logits,
         num_sampled,
@@ -631,6 +634,18 @@ def l2_distributed_markov_sample(
         confidence_probs,
         base_logits_tid,
     )
+    return draft_token_ids, confidence_probs
+
+
+# Preserve the standalone orchestration entry while exposing the same body as
+# an inline stage for fused decode programs.
+_distributed_markov_sample_impl = l2_distributed_markov_sample
+l2_distributed_markov_sample_inline = pl.jit.inline(auto_scope=False)(
+    _distributed_markov_sample_impl
+)
+l2_distributed_markov_sample = pl.jit(auto_scope=False)(
+    _distributed_markov_sample_impl
+)
 
 
 @pl.jit.host
