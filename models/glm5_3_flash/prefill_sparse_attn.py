@@ -36,7 +36,7 @@ import pypto.language as pl
 import torch
 
 from models.glm5_3_flash.config import BLOCK_SIZE, B_DYN, KV_LORA, LOCAL_H, QK_DIM
-from models.glm5_3_flash.config import TABLE_DYN, TOPK_INDEX_WIDTH, T_DYN, V_DIM
+from models.glm5_3_flash.config import BLOCK_TABLE_DYN, TABLE_DYN, TOPK_INDEX_WIDTH, T_DYN, V_DIM
 
 
 def golden_prefill_sparse_attn(
@@ -45,6 +45,8 @@ def golden_prefill_sparse_attn(
     w_k: torch.Tensor,
     w_v: torch.Tensor,
     topk_indices: torch.Tensor,
+    block_table: torch.Tensor,
+    request_ids: torch.Tensor,
 ) -> torch.Tensor:
     raise NotImplementedError("prefill sparse attention golden is assigned with the kernel")
 
@@ -53,7 +55,7 @@ def golden_prefill_sparse_attn(
 def prefill_sparse_attn(
     query: pl.Tensor[[T_DYN, LOCAL_H, QK_DIM], pl.BF16],
     latent_cache: pl.Tensor[[TABLE_DYN * BLOCK_SIZE, KV_LORA], pl.BF16],
-    block_table: pl.Tensor[[B_DYN, TABLE_DYN], pl.INT32],
+    block_table: pl.Tensor[[B_DYN, BLOCK_TABLE_DYN], pl.INT32],
     request_ids: pl.Tensor[[T_DYN], pl.INT32],
     w_k: pl.Tensor[[LOCAL_H, QK_DIM, KV_LORA], pl.BF16],
     w_v: pl.Tensor[[LOCAL_H, V_DIM, KV_LORA], pl.BF16],

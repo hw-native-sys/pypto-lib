@@ -22,11 +22,26 @@ import pypto.language as pl
 import torch
 
 from models.glm5_3_flash.config import D, KV_LORA, LOCAL_H, T_DYN, V_DIM
+from models.glm5_3_flash.quantization import w8a8_dynamic_linear
 
 
-def golden_mla_epilog(attn_out: torch.Tensor, w_o: torch.Tensor) -> torch.Tensor:
+def golden_mla_epilog_prefill(
+    attn_out: torch.Tensor,
+    w_o_int8: torch.Tensor,
+    w_o_scale: torch.Tensor,
+) -> torch.Tensor:
+    """The W8A8 path: per-token activation quant against the INT8 ``o_proj``."""
     flattened = attn_out.reshape(*attn_out.shape[:-2], -1)
-    return torch.nn.functional.linear(flattened, w_o)
+    return w8a8_dynamic_linear(flattened, w_o_int8, w_o_scale, out_dtype=torch.float32)
+
+
+def golden_mla_epilog_decode(
+    attn_out: torch.Tensor,
+    w_o_absorbed: torch.Tensor,
+) -> torch.Tensor:
+    """The absorbed path: ``kv_b_proj``'s value half is folded in, so BF16."""
+    flattened = attn_out.reshape(*attn_out.shape[:-2], -1)
+    return torch.nn.functional.linear(flattened.float(), w_o_absorbed.float())
 
 
 @pl.jit.inline
@@ -49,7 +64,8 @@ def mla_epilog_decode(
 
 
 __all__ = [
-    "golden_mla_epilog",
+    "golden_mla_epilog_decode",
+    "golden_mla_epilog_prefill",
     "mla_epilog_decode",
     "mla_epilog_prefill",
 ]

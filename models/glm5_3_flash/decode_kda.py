@@ -49,6 +49,7 @@ def golden_decode_kda(
     decay: torch.Tensor,
     beta: torch.Tensor,
     recurrent_state: torch.Tensor,
+    state_rows: torch.Tensor,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     raise NotImplementedError("recurrent KDA golden is assigned with the kernel")
 

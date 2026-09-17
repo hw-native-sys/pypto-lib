@@ -41,8 +41,17 @@ INT8_AMAX_EPS = 1e-4
 
 
 def _round_to_int8(scaled: torch.Tensor) -> torch.Tensor:
-    """Round the way the device does: int32, then through fp16, then int8."""
-    return torch.round(scaled).to(torch.int32).to(torch.float16).to(torch.int8)
+    """Round the way the device does: int32, then through fp16, then int8.
+
+    The clamp is a no-op on the amax-derived paths, where the scale bounds the
+    result by construction, but it is load-bearing for the static path: a
+    recorded ``input_scale`` cannot bound an activation that exceeds the
+    calibration range, and the bare int8 cast wraps rather than saturates, so
+    128 would become -128.
+    """
+    rounded = torch.round(scaled).to(torch.int32)
+    rounded = torch.clamp(rounded, -int(INT8_SCALE_MAX), int(INT8_SCALE_MAX))
+    return rounded.to(torch.float16).to(torch.int8)
 
 
 def quantize_per_channel_int8(weight: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:

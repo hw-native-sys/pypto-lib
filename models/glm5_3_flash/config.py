@@ -289,10 +289,17 @@ FLASH = Glm53FlashConfig(
 T_DYN = pl.dynamic("GLM53_T_DYN")
 B_DYN = pl.dynamic("GLM53_B_DYN")
 Q_START_DYN = pl.dynamic("GLM53_Q_START_DYN")
+# Total physical blocks in one paged pool. The per-request block table is a
+# different quantity and gets its own symbol, or a signature carrying both
+# would assert they are equal.
 TABLE_DYN = pl.dynamic("GLM53_TABLE_DYN")
+BLOCK_TABLE_DYN = pl.dynamic("GLM53_BLOCK_TABLE_DYN")
 KV_BLOCKS_DYN = pl.dynamic("GLM53_KV_BLOCKS_DYN")
 INDEX_BLOCKS_DYN = pl.dynamic("GLM53_INDEX_BLOCKS_DYN")
 POOLS_DYN = pl.dynamic("GLM53_POOLS_DYN")
+# Merged vision tokens in one batch: one row per placeholder, unrelated to the
+# text token count.
+VISION_ROWS_DYN = pl.dynamic("GLM53_VISION_ROWS_DYN")
 RECV_DYN = pl.dynamic("GLM53_RECV_DYN")
 LOGIT_ROWS_DYN = pl.dynamic("GLM53_LOGIT_ROWS_DYN")
 

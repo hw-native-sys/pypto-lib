@@ -31,6 +31,7 @@ import torch
 
 from models.glm5_3_flash.config import BLOCK_SIZE
 from models.glm5_3_flash.config import INDEX_KPOOL
+from models.glm5_3_flash.config import INDEX_STATE_BLOCK_SIZE
 from models.glm5_3_flash.config import TP_SIZE
 
 
@@ -180,7 +181,7 @@ def build_forward_metadata(
             torch.div(position_ids, INDEX_KPOOL, rounding_mode="floor"),
             request_ids,
             pool_block_table,
-            BLOCK_SIZE,
+            INDEX_STATE_BLOCK_SIZE,
         ).to(torch.int32),
         kda_state_rows=kda_state_rows.to(torch.int32),
         pool_count=pool_count,

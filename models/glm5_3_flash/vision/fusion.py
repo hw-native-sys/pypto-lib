@@ -13,6 +13,10 @@ The processor expands each image into ``image_token_id = 154854`` placeholders
 ``image_end_token_id = 154831``. This kernel finds those rows and overwrites them
 with the merged vision tokens, in order, leaving every other row untouched.
 
+The merged vision tokens and the text tokens are different lengths, so they carry
+different dynamic dimensions — ``VISION_ROWS_DYN`` indexes into ``T_DYN``. A
+signature that reused one symbol for both would silently assert they are equal.
+
 The count must match exactly: one placeholder per merged vision token. A mismatch
 means the host-side ``smart_resize`` and ``get_number_of_image_patches`` disagree
 with the tower's merge arithmetic, which is a load-time error, not a runtime one.
@@ -27,7 +31,7 @@ request, and never in decode.
 import pypto.language as pl
 import torch
 
-from models.glm5_3_flash.config import D, HC_MULT, T_DYN
+from models.glm5_3_flash.config import D, HC_MULT, T_DYN, VISION_ROWS_DYN
 
 
 def golden_vision_fusion(
@@ -44,8 +48,8 @@ def golden_vision_fusion(
 
 @pl.jit.inline
 def vision_fusion(
-    vision_embeds: pl.Tensor[[T_DYN, D], pl.BF16],
-    placeholder_rows: pl.Tensor[[T_DYN], pl.INT32],
+    vision_embeds: pl.Tensor[[VISION_ROWS_DYN, D], pl.BF16],
+    placeholder_rows: pl.Tensor[[VISION_ROWS_DYN], pl.INT32],
     hidden_streams: pl.Tensor[[T_DYN, HC_MULT, D], pl.BF16],
 ):
     raise NotImplementedError("vision fusion kernel body is assigned independently")

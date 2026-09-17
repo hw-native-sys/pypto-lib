@@ -19,6 +19,10 @@ and writes back the last 3 tokens. Decode is a pure state update: shift the wind
 insert the new row, and take a 4-tap dot product. Both paths address the state by
 the request row, not by position, so the conv state never grows with context.
 
+Both goldens take ``state_rows`` as well, because the state pools are addressed
+by request row rather than by batch position: without it a golden cannot model a
+reordered or paged batch, which is exactly the case a state bug hides in.
+
 Both entries emit **q, k and v separately**, already viewed as
 ``[T, LOCAL_KDA_H, KDA_DIM]``, because that is what ``prefill_kda`` and
 ``decode_kda`` consume. Splitting inside the kernel avoids materialising the
@@ -42,6 +46,7 @@ def golden_kda_conv_prefill(
     weight: torch.Tensor,
     conv_state: torch.Tensor,
     query_start_loc: torch.Tensor,
+    state_rows: torch.Tensor,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     raise NotImplementedError("KDA prefill conv golden is assigned with the kernel")
 
@@ -50,6 +55,7 @@ def golden_kda_conv_decode(
     mixed_qkv: torch.Tensor,
     weight: torch.Tensor,
     conv_state: torch.Tensor,
+    state_rows: torch.Tensor,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     raise NotImplementedError("KDA decode conv golden is assigned with the kernel")
 

@@ -32,7 +32,9 @@ def golden_kda_output(
 ) -> torch.Tensor:
     normalized = rms_norm_gated(core_attn_out, norm_weight, out_gate)
     flattened = normalized.reshape(*normalized.shape[:-2], -1)
-    return torch.nn.functional.linear(flattened, w_o)
+    # The kernel emits an FP32 partial for attention_tp to reduce, so the golden
+    # accumulates in FP32 rather than returning the BF16 input dtype.
+    return torch.nn.functional.linear(flattened.float(), w_o.float())
 
 
 @pl.jit.inline

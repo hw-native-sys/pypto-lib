@@ -33,7 +33,8 @@ def golden_expert_routed(
     w_down: torch.Tensor,
     route_weight: torch.Tensor,
 ) -> torch.Tensor:
-    return expert(x, w_gate, w_up, w_down, route_weight.unsqueeze(-1))
+    """``route_weight`` is ``[tokens, 1]``, matching the kernel ABI."""
+    return expert(x, w_gate, w_up, w_down, route_weight)
 
 
 @pl.jit.inline

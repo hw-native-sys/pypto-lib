@@ -42,13 +42,15 @@ import pypto.language as pl
 import torch
 
 from models.glm5_3_flash.config import BLOCK_SIZE, B_DYN, KV_LORA, LOCAL_H
-from models.glm5_3_flash.config import TABLE_DYN, TOPK_INDEX_WIDTH, T_DYN
+from models.glm5_3_flash.config import BLOCK_TABLE_DYN, TABLE_DYN, TOPK_INDEX_WIDTH, T_DYN
 
 
 def golden_decode_sparse_attn(
     absorbed_query: torch.Tensor,
     latent_cache: torch.Tensor,
     topk_indices: torch.Tensor,
+    block_table: torch.Tensor,
+    request_ids: torch.Tensor,
 ) -> torch.Tensor:
     raise NotImplementedError("decode sparse attention golden is assigned with the kernel")
 
@@ -57,7 +59,7 @@ def golden_decode_sparse_attn(
 def decode_sparse_attn(
     absorbed_query: pl.Tensor[[T_DYN, LOCAL_H, KV_LORA], pl.BF16],
     latent_cache: pl.Tensor[[TABLE_DYN * BLOCK_SIZE, KV_LORA], pl.BF16],
-    block_table: pl.Tensor[[B_DYN, TABLE_DYN], pl.INT32],
+    block_table: pl.Tensor[[B_DYN, BLOCK_TABLE_DYN], pl.INT32],
     request_ids: pl.Tensor[[T_DYN], pl.INT32],
     topk_indices: pl.Tensor[[T_DYN, TOPK_INDEX_WIDTH], pl.INT32],
     output: pl.Tensor[[T_DYN, LOCAL_H, KV_LORA], pl.BF16],

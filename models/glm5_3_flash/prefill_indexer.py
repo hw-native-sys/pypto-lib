@@ -156,7 +156,14 @@ LEAF = 2048  # the donor's confirmed fault-free sort width on a2a3; 8192 also wo
 def golden_indexer_topk(
     index_scores: torch.Tensor,
     pool_count: torch.Tensor,
-) -> torch.Tensor:
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Return the selected pool ids and, beside them, which of them are real.
+
+    A query whose visible pool count is below ``KPOOL_SELECT_K`` still fills the
+    full width, so the selection carries padding. ``indexer_expand`` needs to
+    know which entries are padding to blank whole four-wide groups, and the
+    donor kernel emits indices only — this second output is the addition.
+    """
     raise NotImplementedError("indexer top-k golden is assigned with the kernel")
 
 
@@ -165,6 +172,7 @@ def indexer_topk(
     index_scores: pl.Tensor[[T_DYN, POOLS_DYN], pl.FP32],
     pool_count: pl.Tensor[[T_DYN], pl.INT32],
     selected_pools: pl.Tensor[[T_DYN, KPOOL_SELECT_K], pl.INT32],
+    selected_valid: pl.Tensor[[T_DYN, KPOOL_SELECT_K], pl.INT32],
 ):
     raise NotImplementedError("indexer top-k kernel body is assigned independently")
 
