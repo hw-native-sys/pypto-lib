@@ -137,6 +137,14 @@ def decode_kda(
         kn_gm[r0 : r0 + NORM_ROWS, 0:KDA_DIM] = pl.row_expand_mul(
             kt, pl.rsqrt(pl.add(pl.row_sum(pl.mul(kt, kt)), L2_EPS), high_precision=True))
 
+    # A store whose source is a tile reshaped to two leading unit axes lowers to a
+    # tile with a single-element row, which ptoas rejects on its 32-byte row
+    # alignment. Addressing the pool through a flat view of the same buffer keeps
+    # the stored tile the shape the arithmetic already produced.
+    state_2d = pl.reshape(
+        recurrent_state,
+        [pl.tensor.dim(recurrent_state, 0) * LOCAL_KDA_H * KDA_DIM, KDA_DIM])
+
     with pl.spmd(tasks, name_hint="decode_kda", deps=[norm_tid]):
         task = pl.tile.get_block_idx()
         t = task // (LOCAL_KDA_H * lanes)
@@ -153,10 +161,8 @@ def decode_kda(
         beta_s = pl.read(beta, [t, h])
 
         # This task owns value rows [v0, v0 + V_TILE) of one head's state.
-        state_tile = pl.reshape(
-            pl.slice(recurrent_state, [1, 1, V_TILE, KDA_DIM], [row, h, v0, 0], drop_dims=[0, 1]),
-            [V_TILE, KDA_DIM],
-        )
+        srow = (row * LOCAL_KDA_H + h) * KDA_DIM + v0
+        state_tile = pl.slice(state_2d, [V_TILE, KDA_DIM], [srow, 0])
         # kv_mem is built as a column by a reduction, which is the shape the delta and
         # the rank-1 update both want. A matmul would give it as a row, but a matmul
         # result is logically one row and physically a whole M fractal, and that
@@ -180,8 +186,7 @@ def decode_kda(
         updated = pl.add(decayed, pl.col_expand_mul(
             pl.row_expand_mul(pl.full([V_TILE, KDA_DIM], dtype=pl.FP32, value=1.0), delta_col),
             k_row))
-        recurrent_state[row : row + 1, h : h + 1, v0 : v0 + V_TILE, 0:KDA_DIM] = pl.reshape(
-            updated, [1, 1, V_TILE, KDA_DIM])
+        state_2d[srow : srow + V_TILE, 0:KDA_DIM] = updated
 
         # The output is the one place a matmul is right: its result feeds a store, so
         # the fractal padding never reaches another operand.

@@ -163,6 +163,12 @@ def kda_conv_prefill(
     # dispatchable, so the task count floors at one and the body guards itself. Pass 2
     # covers every row in that case.
     bulk_tiles = pl.max((pl.max(t_dim - STATE_LEN, 0) + T_TILE - 1) // T_TILE, 1)
+    # A store whose source is a tile reshaped to two leading unit axes lowers to a
+    # tile with a single-element row, which ptoas rejects on its 32-byte row
+    # alignment. Addressing the pool through a flat view of the same buffer keeps
+    # the stored tile the shape the arithmetic already produced.
+    cs2 = pl.reshape(conv_state, [pl.tensor.dim(conv_state, 0) * STATE_LEN, CONV_DIM])
+
     with pl.spmd(bulk_tiles * (CONV_DIM // C_TILE), name_hint="kda_conv_bulk") as bulk_tid:
         task = pl.tile.get_block_idx()
         lanes = CONV_DIM // C_TILE
@@ -200,6 +206,7 @@ def kda_conv_prefill(
         s = pl.cast(pl.read(query_start_loc, [b]), pl.INDEX)
         e = pl.cast(pl.read(query_start_loc, [b + 1]), pl.INDEX)
         row = pl.cast(pl.read(state_rows, [b]), pl.INDEX)
+        srow = row * STATE_LEN
         length = e - s
         # An empty request is legal: query_start_loc is cumulative, and equal adjacent
         # offsets mean a request contributed no tokens -- the reference skips those.
@@ -211,12 +218,9 @@ def kda_conv_prefill(
             # full[k] is conv_state[row, k] for k < STATE_LEN and mixed_qkv[s + k - STATE_LEN]
             # otherwise. Written straight through rather than looped: a pl iterator's index
             # is a Scalar, so it cannot drive the trace-time choice between the two sources.
-            st0 = pl.cast(pl.reshape(pl.slice(conv_state, [1, 1, C_TILE], [row, 0, c0], drop_dims=[0]),
-                                     [1, C_TILE]), pl.FP32)
-            st1 = pl.cast(pl.reshape(pl.slice(conv_state, [1, 1, C_TILE], [row, 1, c0], drop_dims=[0]),
-                                     [1, C_TILE]), pl.FP32)
-            st2 = pl.cast(pl.reshape(pl.slice(conv_state, [1, 1, C_TILE], [row, 2, c0], drop_dims=[0]),
-                                     [1, C_TILE]), pl.FP32)
+            st0 = pl.cast(pl.slice(cs2, [1, C_TILE], [srow + 0, c0]), pl.FP32)
+            st1 = pl.cast(pl.slice(cs2, [1, C_TILE], [srow + 1, c0]), pl.FP32)
+            st2 = pl.cast(pl.slice(cs2, [1, C_TILE], [srow + 2, c0]), pl.FP32)
             # k - STATE_LEN <= u < length whenever the row below is written, so these reads
             # stay inside the request.
             x0 = pl.cast(pl.slice(mixed_qkv, [1, C_TILE], [s, c0]), pl.FP32)
@@ -286,18 +290,15 @@ def kda_conv_prefill(
                 new_idx = pl.max(e - STATE_LEN + i, s)
                 keep_old = pl.min(pl.max(STATE_LEN - length - i, 0), 1)
                 take_new = pl.min(pl.max(length + i - STATE_LEN + 1, 0), 1)
-                old_row = pl.reshape(pl.slice(conv_state, [1, 1, C_TILE], [row, old_idx, c0],
-                                              drop_dims=[0]), [1, C_TILE])
+                old_row = pl.slice(cs2, [1, C_TILE], [srow + old_idx, c0])
                 new_row = pl.slice(mixed_qkv, [1, C_TILE], [new_idx, c0])
-                # set_validshape takes a 2D tile, so the row count is declared before
-                # the reshape to the state's rank-3 view.
-                conv_state[row : row + 1, i : i + 1, c0 : c0 + C_TILE] = pl.reshape(
-                    pl.set_validshape(old_row, keep_old, C_TILE), [1, 1, C_TILE])
-                conv_state[row : row + 1, i : i + 1, c0 : c0 + C_TILE] = pl.reshape(
-                    pl.set_validshape(new_row, take_new, C_TILE), [1, 1, C_TILE])
-            last = STATE_LEN - 1
-            conv_state[row : row + 1, last : last + 1, c0 : c0 + C_TILE] = pl.reshape(
-                pl.slice(mixed_qkv, [1, C_TILE], [pl.max(e - 1, s), c0]), [1, 1, C_TILE])
+                cs2[srow + i : srow + i + 1, c0 : c0 + C_TILE] = pl.set_validshape(
+                    old_row, keep_old, C_TILE)
+                cs2[srow + i : srow + i + 1, c0 : c0 + C_TILE] = pl.set_validshape(
+                    new_row, take_new, C_TILE)
+            last = srow + STATE_LEN - 1
+            cs2[last : last + 1, c0 : c0 + C_TILE] = pl.slice(
+                mixed_qkv, [1, C_TILE], [pl.max(e - 1, s), c0])
 
 
     return query, key, value, conv_state
@@ -320,21 +321,25 @@ def kda_conv_decode(
 
     # One token per row, so the window is the whole state plus this token and every
     # index is a trace-time constant.
+    # A store whose source is a tile reshaped to two leading unit axes lowers to a
+    # tile with a single-element row, which ptoas rejects on its 32-byte row
+    # alignment. Addressing the pool through a flat view of the same buffer keeps
+    # the stored tile the shape the arithmetic already produced.
+    cs2 = pl.reshape(conv_state, [pl.tensor.dim(conv_state, 0) * STATE_LEN, CONV_DIM])
+
     with pl.spmd(t_dim * (CONV_DIM // C_TILE), name_hint="kda_conv_decode"):
         task = pl.tile.get_block_idx()
         lanes = CONV_DIM // C_TILE
         t = task // lanes
         c0 = (task % lanes) * C_TILE
         row = pl.cast(pl.read(state_rows, [t]), pl.INDEX)
+        srow = row * STATE_LEN
 
         # Straight-line taps: a pl iterator's index is a Scalar, so it cannot drive
         # the trace-time choice between the conv state and the incoming token.
-        st0 = pl.cast(pl.reshape(pl.slice(conv_state, [1, 1, C_TILE], [row, 0, c0], drop_dims=[0]),
-                                 [1, C_TILE]), pl.FP32)
-        st1 = pl.cast(pl.reshape(pl.slice(conv_state, [1, 1, C_TILE], [row, 1, c0], drop_dims=[0]),
-                                 [1, C_TILE]), pl.FP32)
-        st2 = pl.cast(pl.reshape(pl.slice(conv_state, [1, 1, C_TILE], [row, 2, c0], drop_dims=[0]),
-                                 [1, C_TILE]), pl.FP32)
+        st0 = pl.cast(pl.slice(cs2, [1, C_TILE], [srow + 0, c0]), pl.FP32)
+        st1 = pl.cast(pl.slice(cs2, [1, C_TILE], [srow + 1, c0]), pl.FP32)
+        st2 = pl.cast(pl.slice(cs2, [1, C_TILE], [srow + 2, c0]), pl.FP32)
         xt = pl.cast(pl.slice(mixed_qkv, [1, C_TILE], [t, c0]), pl.FP32)
         acc = pl.add(
             pl.add(pl.mul(st0, pl.cast(weight[0:1, c0 : c0 + C_TILE], pl.FP32)),
@@ -352,12 +357,9 @@ def kda_conv_decode(
             v_flat[t : t + 1, c0 - 2 * LOCAL_KDA_QKV_DIM : c0 - 2 * LOCAL_KDA_QKV_DIM + C_TILE] = out_tile
 
         # Shift the window: every source row is read above, before any is overwritten.
-        conv_state[row : row + 1, 0:1, c0 : c0 + C_TILE] = pl.reshape(
-            pl.cast(st1, pl.BF16, mode="rint"), [1, 1, C_TILE])
-        conv_state[row : row + 1, 1:2, c0 : c0 + C_TILE] = pl.reshape(
-            pl.cast(st2, pl.BF16, mode="rint"), [1, 1, C_TILE])
-        conv_state[row : row + 1, 2:3, c0 : c0 + C_TILE] = pl.reshape(
-            pl.slice(mixed_qkv, [1, C_TILE], [t, c0]), [1, 1, C_TILE])
+        cs2[srow : srow + 1, c0 : c0 + C_TILE] = pl.cast(st1, pl.BF16, mode="rint")
+        cs2[srow + 1 : srow + 2, c0 : c0 + C_TILE] = pl.cast(st2, pl.BF16, mode="rint")
+        cs2[srow + 2 : srow + 3, c0 : c0 + C_TILE] = pl.slice(mixed_qkv, [1, C_TILE], [t, c0])
 
     return query, key, value, conv_state
 

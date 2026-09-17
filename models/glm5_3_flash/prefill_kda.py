@@ -172,7 +172,10 @@ def prefill_kda(
     u_gm = pl.create_tensor([LOCAL_KDA_H, scratch_rows, KDA_DIM], dtype=pl.FP32)
     kdec_gm = pl.create_tensor([LOCAL_KDA_H, scratch_rows, KDA_DIM], dtype=pl.BF16)
     a2_gm = pl.create_tensor([LOCAL_KDA_H, scratch_rows, CHUNK], dtype=pl.BF16)
-    eglast_gm = pl.create_tensor([LOCAL_KDA_H, scratch_rows, KDA_DIM], dtype=pl.FP32)
+    # Flat rather than [head, row, dim]: a store whose source is a tile reshaped to
+    # two leading unit axes lowers to a tile with a single-element row, which ptoas
+    # rejects on its 32-byte row alignment. One row per chunk, so the index is plain.
+    eglast_gm = pl.create_tensor([LOCAL_KDA_H * scratch_rows, KDA_DIM], dtype=pl.FP32)
     # The triangular inverse is built one row at a time, so it needs a place to stand.
     ainv_gm = pl.create_tensor([LOCAL_KDA_H, scratch_rows, CHUNK], dtype=pl.FP32)
     # Two alternating slots each, so a squaring never reads the buffer it writes.
@@ -316,8 +319,8 @@ def prefill_kda(
             kdec_gm[h : h + 1, base : base + CHUNK, 0:KDA_DIM] = pl.reshape(
                 pl.cast(pl.mul(k_f, pl.exp(pl.sub(glast_full, gcum))), pl.BF16, mode="rint"),
                 [1, CHUNK, KDA_DIM])
-            eglast_gm[h : h + 1, base : base + 1, 0:KDA_DIM] = pl.reshape(
-                pl.exp(glast), [1, 1, KDA_DIM])
+            eg_row = h * scratch_rows + base
+            eglast_gm[eg_row : eg_row + 1, 0:KDA_DIM] = pl.exp(glast)
             kg_gm[h : h + 1, base : base + CHUNK, 0:KDA_DIM] = pl.reshape(
                 pl.cast(pl.mul(k_f, eg), pl.BF16, mode="rint"), [1, CHUNK, KDA_DIM])
 
@@ -475,11 +478,14 @@ def prefill_kda(
                 pl.matmul(a_inv_bf, v_beta, pl.FP32), [1, CHUNK, KDA_DIM])
     # --- pass 2: the sequential scan over chunks, tiled over the value axis ---
     lanes = KDA_DIM // V_TILE
+    state_2d = pl.reshape(
+        recurrent_state,
+        [pl.tensor.dim(recurrent_state, 0) * LOCAL_KDA_H * KDA_DIM, KDA_DIM])
     # Two slots per task, alternating by chunk. Reading and writing one buffer inside
     # the loop would make each iteration alias its own input, and a read that wins
     # returns uninitialised memory -- which is exactly the NaN a multi-chunk sequence
     # produced while a single-chunk one passed.
-    state_gm = pl.create_tensor([LOCAL_KDA_H * requests * lanes, 2, V_TILE, KDA_DIM],
+    state_gm = pl.create_tensor([LOCAL_KDA_H * requests * lanes * 2 * V_TILE, KDA_DIM],
                                 dtype=pl.FP32)
     with pl.spmd(LOCAL_KDA_H * requests * lanes, name_hint="prefill_kda_scan",
                  deps=[wu_tid]):
@@ -497,11 +503,10 @@ def prefill_kda(
         # keeping [V, K] means the seed and the flush are plain copies. That matters
         # beyond tidiness: the transpose instruction constrains both of its row counts
         # to multiples of 16, which the simulator does not check and the device does.
-        seed = pl.reshape(
-            pl.slice(recurrent_state, [1, 1, V_TILE, KDA_DIM], [row, h, v0, 0],
-                     drop_dims=[0, 1]), [V_TILE, KDA_DIM])
-        state_gm[task : task + 1, 0:1, 0:V_TILE, 0:KDA_DIM] = pl.reshape(
-            seed, [1, 1, V_TILE, KDA_DIM])
+        pool_row = (row * LOCAL_KDA_H + h) * KDA_DIM + v0
+        seed = pl.slice(state_2d, [V_TILE, KDA_DIM], [pool_row, 0])
+        slot0 = task * 2 * V_TILE
+        state_gm[slot0 : slot0 + V_TILE, 0:KDA_DIM] = seed
 
         for s_idx in pl.range(0, length, CHUNK):
             off = bos + s_idx
@@ -510,9 +515,7 @@ def prefill_kda(
             chunk_idx = s_idx // CHUNK
             src = chunk_idx % 2
             dst = (chunk_idx + 1) % 2
-            s_cur = pl.reshape(
-                pl.slice(state_gm, [1, 1, V_TILE, KDA_DIM], [task, src, 0, 0],
-                         drop_dims=[0, 1]), [V_TILE, KDA_DIM])
+            s_cur = pl.slice(state_gm, [V_TILE, KDA_DIM], [(task * 2 + src) * V_TILE, 0])
             s_bf = pl.cast(s_cur, pl.BF16, mode="rint")
             w_c = pl.reshape(
                 pl.slice(w_gm, [1, CHUNK, KDA_DIM], [h, base, 0], drop_dims=[0]),
@@ -541,22 +544,17 @@ def prefill_kda(
                 [CHUNK, KDA_DIM])
             # In [V, K] the chunk-final decay is a per-column factor, so it applies as
             # the row it already is.
-            eglast_row = pl.reshape(
-                pl.slice(eglast_gm, [1, 1, KDA_DIM], [h, base, 0], drop_dims=[0]),
-                [1, KDA_DIM])
-            state_gm[task : task + 1, dst : dst + 1, 0:V_TILE, 0:KDA_DIM] = pl.reshape(
-                pl.add(pl.col_expand_mul(s_cur, eglast_row),
-                       pl.matmul(vi_bf, kdec_c, pl.FP32, a_trans=True)),
-                [1, 1, V_TILE, KDA_DIM])
+            eglast_row = pl.slice(eglast_gm, [1, KDA_DIM], [h * scratch_rows + base, 0])
+            d_row = (task * 2 + dst) * V_TILE
+            state_gm[d_row : d_row + V_TILE, 0:KDA_DIM] = pl.add(
+                pl.col_expand_mul(s_cur, eglast_row),
+                pl.matmul(vi_bf, kdec_c, pl.FP32, a_trans=True))
 
         # Flush. The last chunk wrote the slot with the parity of the chunk count.
         chunks = (length + CHUNK - 1) // CHUNK
         last = chunks % 2
-        final = pl.reshape(
-            pl.slice(state_gm, [1, 1, V_TILE, KDA_DIM], [task, last, 0, 0],
-                     drop_dims=[0, 1]), [V_TILE, KDA_DIM])
-        recurrent_state[row : row + 1, h : h + 1, v0 : v0 + V_TILE, 0:KDA_DIM] = pl.reshape(
-            final, [1, 1, V_TILE, KDA_DIM])
+        final = pl.slice(state_gm, [V_TILE, KDA_DIM], [(task * 2 + last) * V_TILE, 0])
+        state_2d[pool_row : pool_row + V_TILE, 0:KDA_DIM] = final
 
     return output, recurrent_state
 
