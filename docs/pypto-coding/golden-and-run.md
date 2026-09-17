@@ -175,18 +175,21 @@ until a failing run passes.
 
 ### CLI flags
 
-The `__main__` block is argparse plus that call. Beyond `-p` / `-d`, four flags
+The `__main__` block is argparse plus that call. Beyond `-p` / `-d`, five flags
 are conventional, and each one exists to skip work you are not testing:
 
 | Flag | Use it when |
 |---|---|
 | `--compile-only` | Checking that the DSL lowers; no device needed |
+| `--golden-only` | Producing the Torch golden on a host with no device, for a later `--golden-data` run to validate against |
 | `--enable-chip-swimlane [0-4]` | Capturing the task timeline (see [Performance Tuning](../debug-and-tune/performance-tuning.md)) |
 | `--runtime-dir <dir>` | Re-running a build whose generated `.cpp` / `.pto` you edited |
 | `--save-data` / `--golden-data <dir>` | Freezing the reference once, then replaying it (see [Save and Replay](../run-and-validate/save-and-replay.md)) |
 
 Add the replay pair when a kernel is about to be tuned: recomputing a large
-Torch golden on every iteration is usually the slowest part of the loop.
+Torch golden on every iteration is usually the slowest part of the loop. The
+same cost is what `--golden-only` splits off when a device is leased rather
+than owned — see [Save and Replay](../run-and-validate/save-and-replay.md).
 
 ---
 

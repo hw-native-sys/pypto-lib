@@ -1469,6 +1469,7 @@ def _run_pipeline(
     atol: float,
     compare_fn: dict[str, Callable] | None,
     compile_only: bool,
+    golden_only: bool,
     runtime_dir: str | None,
     save_data: bool,
 ) -> RunResult:
@@ -1489,6 +1490,20 @@ def _run_pipeline(
 
     if compile_only and runtime_dir is not None:
         return RunResult(passed=False, error="runtime_dir is incompatible with compile_only")
+    if golden_only and compile_only:
+        return RunResult(passed=False, error="compile_only is incompatible with golden_only")
+    if golden_only and runtime_dir is not None:
+        return RunResult(passed=False, error="runtime_dir is incompatible with golden_only")
+    # golden_only exists to *produce* a golden. golden_data means one already
+    # exists, and _compute_golden would only read it back; golden_fn is the one
+    # input that makes the mode do work.
+    if golden_only and golden_data is not None:
+        return RunResult(passed=False, error="golden_data is incompatible with golden_only")
+    if golden_only and golden_fn is None:
+        return RunResult(passed=False, error="golden_only requires golden_fn")
+    # A golden nobody persisted is wasted work: the mode's whole point is to
+    # hand it to a later golden_data run.
+    save_data = save_data or golden_only
 
     data_dir = Path(golden_data) if golden_data is not None else None
     tensor_specs = [s for s in specs if isinstance(s, TensorSpec)]
@@ -1568,6 +1583,11 @@ def _run_pipeline(
             specs, tensor_specs, scalar_specs_eff, tensors,
             work_dir, data_dir, golden_fn, save_data,
         )
+
+    if golden_only:
+        total = time.time() - start
+        print(f"[RUN] PASS ({total:.2f}s, golden saved to {work_dir / 'data'})", flush=True)
+        return RunResult(passed=True, execution_time=total, work_dir=work_dir)
 
     benchmark_enabled = _bench_enabled()
     stepped = sorted(n for n, s in scalar_specs_eff.items() if s.has_benchmark_step)
@@ -1720,6 +1740,7 @@ def run(
     atol: float = 1e-5,
     compare_fn: dict[str, Callable] | None = None,
     compile_only: bool = False,
+    golden_only: bool = False,
     runtime_dir: str | None = None,
     save_data: bool = False,
 ) -> RunResult:
@@ -1758,6 +1779,13 @@ def run(
         compare_fn: Per-output-name overrides for ``torch.allclose``; see
             :func:`golden.validation.validate_golden`.
         compile_only: Stop after code generation; skip execute and validate.
+        golden_only: Stop after the golden is computed; skip execute and
+            validate. Forces *save_data* True, so the golden lands under
+            ``{work_dir}/data/`` for a later run to replay via *golden_data*.
+            Requires *golden_fn*, and is rejected alongside *golden_data*
+            (nothing to produce), *compile_only*, or *runtime_dir*. Nothing on
+            this path dispatches, so it needs no device — that is the point:
+            the expensive Torch golden moves off the leased die.
         runtime_dir: Pre-compiled ``build_output/`` directory to reuse. Skips
             compile and invalidates cached ``.so``/``.bin`` so cpp edits
             rebuild; the compile-side config is ignored and *compile_only* is
@@ -1789,6 +1817,7 @@ def run(
             atol=atol,
             compare_fn=compare_fn,
             compile_only=compile_only,
+            golden_only=golden_only,
             runtime_dir=runtime_dir,
             save_data=save_data,
         )

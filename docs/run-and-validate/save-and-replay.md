@@ -51,6 +51,9 @@ result = run(
   validation — see [Inputs-only snapshots](#inputs-only-snapshots).
 - `save_data` defaults to `False`; ordinary validation remains in memory and
   does not create a snapshot.
+- `golden_only=True` stops the run right after the golden is computed and
+  forces `save_data=True`; see [Capture without a
+  device](#capture-without-a-device).
 
 If the kernel CLI should expose this behavior, wire both options directly:
 
@@ -101,6 +104,74 @@ find build_output -type d -name data -print
 
 The output location is relative to the directory from which the script was
 launched unless the compile configuration overrides it.
+
+## Capture without a device
+
+Only the runtime phase needs a device. Compile, input generation and the Torch
+golden are CPU work, and on a shared host the golden is usually the longest of
+the four — so a plain `--save-data` capture holds a die for minutes while
+computing something the die never touches.
+
+`--golden-only` stops the run immediately after the golden and persists it:
+
+```bash
+# No device: compile + generate inputs + compute golden.
+PYTHONPATH="$PWD" \
+  python path/to/kernel.py -p a2a3 --golden-only
+```
+
+```text
+[RUN] compile ...
+[RUN] generate inputs ...
+[RUN] compute golden ...
+[RUN] PASS (412.11s, golden saved to build_output/<program-and-timestamp>/data)
+```
+
+Hand that directory to a second invocation, which is the only one that needs a
+card:
+
+```bash
+PYTHONPATH="$PWD" \
+  python path/to/kernel.py -p a2a3 -d 0 \
+    --golden-data "build_output/<program-and-timestamp>/data"
+```
+
+The split changes nothing about validation: the device outputs are still
+compared against the same golden. It only moves where the golden is computed.
+
+`golden_only` forces `save_data=True` — a golden that is not persisted would be
+wasted work, so entries that keep `--save-data` off because their fixtures are
+large will write that snapshot here regardless. Nothing then deletes it for you:
+a manual run leaves both the snapshot and the build around it under
+`build_output/` until you remove them, and a full-model fixture reaches ~1GB
+(`models/qwen3_14b/decode_fwd.py`). CI is the exception — its driver
+(`.github/scripts/run_device_cases.py`) drops each producing build as soon as
+the device run has replayed it, which is also what bounds how many exist at
+once.
+
+`golden_only` requires `golden_fn`, and the harness rejects it alongside
+`golden_data` (the golden already exists, so there is nothing to produce),
+`compile_only` (which stops one phase earlier) and `runtime_dir`.
+
+Wire it next to the other two flags:
+
+```python
+parser.add_argument(
+    "--golden-only",
+    action="store_true",
+    default=False,
+    help="compute and persist the golden, then stop before the device run",
+)
+```
+
+The platform still matters: it is what the compile phase targets, so pass the
+same `-p` the device run will use. `-d` is irrelevant here and can be omitted.
+
+A `-p a2a3 --golden-only` run opens no per-die device node: the only
+`/dev/davinci*` traffic is the driver-library probe that importing `golden`
+(torch_npu / CANN) performs anyway, and the run passes on a host where that
+probe is denied. So the producing half needs no lease at all, not merely a
+shorter one.
 
 ## Replay the snapshot
 
@@ -175,6 +246,8 @@ files.
 `golden_data` and `runtime_dir` are independent:
 
 - `golden_data` skips input generation and golden computation;
+- `golden_only` produces what `golden_data` later consumes, and is rejected
+  together with `runtime_dir`;
 - `runtime_dir` reuses a precompiled work directory and skips PyPTO compile;
 - validation still runs in either case;
 - the `golden_data` cache is read-only during replay.
