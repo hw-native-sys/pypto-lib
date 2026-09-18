@@ -59,7 +59,8 @@
         "--num-tokens",
         "8",
         "--experts-per-rank",
-        "16"
+        "16",
+        "--balanced-routing"
       ],
       "run_config": {
         "ring_task_window": 16384,
@@ -187,7 +188,9 @@
         "--layer-id",
         "0",
         "--num-tokens",
-        "128"
+        "128",
+        "--routing",
+        "balanced"
       ],
       "run_config": {
         "ring_task_window": 16384,
