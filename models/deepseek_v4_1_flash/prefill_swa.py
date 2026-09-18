@@ -594,6 +594,7 @@ def make_hc_program(capacity, world_size, epochs):
         num_tokens: pl.Scalar[pl.INT32],
         attention_epoch: pl.Scalar[pl.INT32],
     ):
+        """Run one rank of HC-orchestrated prefill SWA for ``epochs`` dispatches."""
         x_hc.bind_dynamic(0, T_DYN)
         window_cache.bind_dynamic(0, ORI_BLOCKS_DYN)
         for step in pl.range(epochs):
@@ -635,6 +636,7 @@ def make_hc_program(capacity, world_size, epochs):
         num_tokens: pl.Scalar[pl.INT32],
         attention_epoch: pl.Scalar[pl.INT32],
     ):
+        """Dispatch stacked ranks onto TP windows for the HC prefill program."""
         x_hc.bind_dynamic(1, T_DYN)
         window_cache.bind_dynamic(1, ORI_BLOCKS_DYN)
         data_buf = pld.alloc_window_buffer([capacity, D], dtype=pl.FP32)
@@ -686,6 +688,7 @@ def build_hc_specs(args):
     values = {}
 
     def initialize(name):
+        """Materialize one stacked HC input, sharing DP-group replicas."""
         if not values:
             ranks = []
             for rank in range(world_size):
@@ -785,6 +788,8 @@ def run_prefill_attention_swa():
     args = parser.parse_args()
     args.bench = os.environ.get("PYPTO_BENCH", "0") == "1"
     args.requests = args.requests if args.requests is not None else min(args.tokens, 4)
+    if args.epochs < 1:
+        parser.error("epochs must be at least 1")
     try:
         devices = list(range(TP_SIZE * args.dp)) if args.device is None else [int(d) for d in args.device.split(",")]
     except ValueError:
