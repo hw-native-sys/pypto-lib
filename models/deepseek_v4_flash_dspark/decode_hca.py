@@ -732,7 +732,6 @@ def decode_hca_tp1(
         position_ids, cmp_slot_mapping, state_slot_mapping,
         late_dep, cmp_rope_ready_tid,
     )
-    cache_ready_dep = pl.system.task_dummy(deps=[ori_cache_write_tid, cmp_cache_write_tid])
 
     attn_out = pl.create_tensor([t_dim, D], dtype=pl.BF16)
     with pl.scope():
@@ -742,7 +741,7 @@ def decode_hca_tp1(
             cmp_kv, cmp_block_table,
             position_ids, kv_seq_lens,
             attn_sink, freqs_cos, freqs_sin,
-            o_packed_heads, cache_ready_dep,
+            o_packed_heads, ori_cache_write_tid, cmp_cache_write_tid,
         )
         with pl.scope():
             decode_o_proj_tp1(o_packed_heads, wo_a, wo_b, wo_b_scale, attn_out, heads_dep)
