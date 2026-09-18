@@ -43,7 +43,7 @@ Run an operator file directly to execute its deterministic CPU golden:
 
 ```bash
 source .venv/bin/activate-pypto
-python models/deepseek_v4_1_flash/decode_c1a_reindex.py
+python models/deepseek_v4_1_flash/decode_attn_c1a_reindex.py
 ```
 
 The command prints `[GOLDEN] PASS` and exits nonzero when the reference fails.
@@ -55,9 +55,9 @@ Once a kernel body lands, its owner can extend the same file with the thin
 | Encoder SWA | `prefill_attn_swa.py` (leaf), `prefill_swa.py` (HC orchestration), `decode_swa.py` |
 | Encoder C2A Full | `prefill_attn_c2a_full.py` (leaf), `prefill_c2a_full.py` (HC orchestration), `decode_c2a_full.py` |
 | Encoder C2A Reuse | `prefill_attn_c2a_reuse.py` (leaf), `prefill_c2a_reuse.py` (HC orchestration), `decode_c2a_reuse.py` |
-| Decoder C1A Full | `prefill_c1a_full.py`, `decode_c1a_full.py` |
-| Decoder C1A Reindex | `prefill_c1a_reindex.py`, `decode_c1a_reindex.py` |
-| Decoder C1A Reuse | `prefill_c1a_reuse.py`, `decode_c1a_reuse.py` |
+| Decoder C1A Full | `prefill_c1a_full.py`, `decode_attn_c1a_full.py` (leaf), `decode_c1a_full.py` (HC orchestration) |
+| Decoder C1A Reindex | `prefill_c1a_reindex.py`, `decode_attn_c1a_reindex.py` (leaf), `decode_c1a_reindex.py` (HC orchestration) |
+| Decoder C1A Reuse | `prefill_c1a_reuse.py`, `decode_attn_c1a_reuse.py` (leaf), `decode_c1a_reuse.py` (HC orchestration) |
 | Hierarchical indexer | `hierarchical_sparse_indexer.py` |
 | Hyper-connections | `hc_mixes.py`, `hc_pre.py`, `hc_post.py` |
 | Attention TP transports | `attention_tp.py` |
@@ -71,6 +71,15 @@ Reuse consumes the source layer's physical Top-K rows and has no compressor or
 indexer weights. The hierarchical indexer first selects 2,048 blocks of eight
 compressed positions at layer 20; later reindex layers select their final 512
 positions only inside that candidate mask.
+
+Each decoder C1A mode keeps its attention operator in `decode_attn_c1a_*.py` and
+adds an mHC-wired `decode_c1a_*.py` entry. V4.1 staggers the coefficients:
+the entry collapses with the `pre_mix` the previous sub-layer produced (one-hot
+lane zero at the very first site), applies this site's `post_mix` and
+`residual_mix` immediately, and hands its own computed `pre_mix` to the next
+sub-layer, so it returns the new streams and that coefficient. The full entry
+also hosts the shared HC fixture, goldens, and validation harness the other two
+entries reuse.
 
 The final HC collapse has no learned head parameters: it applies the last
 layer's delayed `pre_mix` directly to the four residual streams. HC mixes are
