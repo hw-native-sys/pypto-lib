@@ -24,7 +24,10 @@ from dspark_drafter import (
 from lm_head import MAX_LOGIT_ROWS
 
 
-ROPE_CANDIDATE_ROWS = S + DSPARK_QUERY_WIDTH
+# The bridge consumes only S + K = 15 rows, but a BF16 GM tile with a
+# 15-row axis is not 32-byte aligned.  Keep one unused padding row so device
+# preparation can publish the candidate slab without a Host-side gather.
+ROPE_CANDIDATE_ROWS = 16
 CONTEXT_T = LOCAL_BATCH * S
 LOCAL_METADATA_ROWS = CONTEXT_T + T_QUERY
 GROUP_METADATA_ROWS = DSPARK_CP_SIZE * LOCAL_METADATA_ROWS

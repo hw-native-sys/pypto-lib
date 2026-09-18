@@ -12,9 +12,23 @@ import pypto.language as pl
 import pypto.language.distributed as pld
 
 import decode_fwd_device_state as target
+
+if target.TP_SIZE != 4:
+    raise ValueError(
+        f"the fused DSpark one-L2 decode path requires --tp=4, got --tp={target.TP_SIZE}",
+    )
+
+import decode_prepare as prepare
 import dspark_decode_bridge as bridge
 import dspark_draft_step_device_state as draft
-from decode_fwd_device_state import decode_fwd_device_state_inline
+from decode_prepare import (
+    CSA_GROUP_STATE_BLOCKS_DYN,
+    HCA_GROUP_STATE_BLOCKS_DYN,
+    build_group_decode_metadata,
+    gather_group_decode_rope_rows,
+)
+from decode_fwd_device_state import decode_fwd_device_state_prepared_inline
+from dspark_device_state import prepare_target_group_from_device_state
 from dspark_decode_bridge import prepare_drafter_after_target
 from dspark_draft_step_device_state import dspark_draft_step_device_state_inline
 ATTENTION_WINDOW_ROWS = target.ATTENTION_WINDOW_ROWS
@@ -93,8 +107,17 @@ T_DYN = target.T_DYN
 VOCAB = target.VOCAB
 VOCAB_PER_TP = target.VOCAB_PER_TP
 WIN = target.WIN
+DECODE_BATCH = prepare.B
+GROUP_DECODE_TOKENS = prepare.T
+LOCAL_DECODE_BATCH = DECODE_BATCH // TP_SIZE
+LOCAL_DECODE_TOKENS = GROUP_DECODE_TOKENS // TP_SIZE
+HCA_STATE_TABLE_BLOCKS = prepare.HCA_STATE_TABLE_BLOCKS
+CSA_STATE_TABLE_BLOCKS = prepare.CSA_STATE_TABLE_BLOCKS
+ORI_TABLE_BLOCKS_DYN = prepare.ORI_TABLE_BLOCKS_DYN
+ROPE_ROWS_DYN = prepare.ROPE_ROWS_DYN
 _DRAFT_ATTENTION_WINDOW_ROWS = draft.ATTENTION_WINDOW_ROWS
 _DRAFT_AUX_PAD = draft.AUX_PAD
+
 _DRAFT_BLOCK_SIZE = draft.BLOCK_SIZE
 B_DYN = draft.B_DYN
 CP_CONTEXT_T_DYN = draft.CP_CONTEXT_T_DYN
@@ -131,7 +154,6 @@ _DRAFT_ROPE_DIM = draft.ROPE_DIM
 _DRAFT_T = draft.T
 _DRAFT_TOPK = draft.TOPK
 _DRAFT_TP_SIZE = draft.TP_SIZE
-T_MAIN_DYN = draft.T_MAIN_DYN
 _DRAFT_T_QUERY = draft.T_QUERY
 _DRAFT_VOCAB = draft.VOCAB
 _DRAFT_VOCAB_PER_TP = draft.VOCAB_PER_TP
@@ -154,23 +176,11 @@ def l2_decode_fwd_dspark(
     gamma_cq: pl.Tensor[[FWD_WEIGHT_BANK_SIZE * Q_LORA], pl.BF16],
     gamma_ckv: pl.Tensor[[FWD_WEIGHT_BANK_SIZE * HEAD_DIM], pl.BF16],
     raw_kv_pool: pl.InOut[pl.Tensor[[FWD_PACKED_RAW_BLOCKS_DYN, BLOCK_SIZE, 1, HEAD_DIM], pl.BF16]],
-    freqs_cos: pl.Tensor[[T_DYN, ROPE_HEAD_DIM], pl.BF16],
-    freqs_sin: pl.Tensor[[T_DYN, ROPE_HEAD_DIM], pl.BF16],
-    compressed_freqs_cos: pl.Tensor[[T_DYN, ROPE_HEAD_DIM], pl.BF16],
-    compressed_freqs_sin: pl.Tensor[[T_DYN, ROPE_HEAD_DIM], pl.BF16],
-    swa_slot_mapping: pl.Tensor[[KV_T_DYN], pl.INT64],
-    swa_indices: pl.Tensor[[T_DYN, WIN], pl.INT32],
-    swa_lens: pl.Tensor[[T_DYN], pl.INT32],
-    position_ids_local: pl.InOut[pl.Tensor[[T_DYN], pl.INT32]],
-    position_ids: pl.Tensor[[KV_T_DYN], pl.INT32],
-    csa_cmp_freqs_cos: pl.Tensor[[KV_T_DYN, ROPE_HEAD_DIM], pl.BF16],
-    csa_cmp_freqs_sin: pl.Tensor[[KV_T_DYN, ROPE_HEAD_DIM], pl.BF16],
     csa_cmp_wkv: pl.Tensor[[FWD_CSA_WEIGHT_BANK_SIZE * CSA_MAIN_OUT_DIM, D], pl.BF16],
     csa_cmp_wgate: pl.Tensor[[FWD_CSA_WEIGHT_BANK_SIZE * CSA_MAIN_OUT_DIM, D], pl.BF16],
     csa_cmp_ape: pl.Tensor[[FWD_CSA_WEIGHT_BANK_SIZE * CSA_COMPRESS_RATIO, CSA_MAIN_OUT_DIM], pl.FP32],
     csa_cmp_norm_w: pl.Tensor[[FWD_CSA_WEIGHT_BANK_SIZE * HEAD_DIM], pl.BF16],
     csa_compress_state: pl.InOut[pl.Tensor[[FWD_CSA_MAIN_STATE_BLOCKS_DYN, CSA_MAIN_STATE_BLOCK_SIZE, CSA_MAIN_STATE_DIM], pl.FP32]],
-    csa_compress_state_block_table: pl.Tensor[[KV_B_DYN, CSA_MAIN_STATE_MAX_BLOCKS], pl.INT32],
     csa_idx_wq_b: pl.Tensor[[FWD_CSA_WEIGHT_BANK_SIZE * Q_LORA, CSA_IDX_N_HEADS * CSA_IDX_HEAD_DIM], pl.INT8],
     csa_idx_wq_b_scale: pl.Tensor[[FWD_CSA_WEIGHT_BANK_SIZE * CSA_IDX_N_HEADS * CSA_IDX_HEAD_DIM], pl.FP32],
     csa_weights_proj: pl.Tensor[[FWD_CSA_WEIGHT_BANK_SIZE * D, CSA_IDX_N_HEADS], pl.BF16],
@@ -180,36 +190,18 @@ def l2_decode_fwd_dspark(
     csa_inner_ape: pl.Tensor[[FWD_CSA_WEIGHT_BANK_SIZE * CSA_COMPRESS_RATIO, CSA_INNER_OUT_DIM], pl.FP32],
     csa_inner_norm_w: pl.Tensor[[FWD_CSA_WEIGHT_BANK_SIZE * CSA_IDX_HEAD_DIM], pl.BF16],
     csa_inner_compress_state: pl.InOut[pl.Tensor[[FWD_CSA_INNER_STATE_BLOCKS_DYN, CSA_INNER_STATE_BLOCK_SIZE, CSA_INNER_STATE_DIM], pl.FP32]],
-    csa_inner_compress_state_block_table: pl.Tensor[[KV_B_DYN, CSA_INNER_STATE_MAX_BLOCKS], pl.INT32],
     csa_cmp_kv: pl.InOut[pl.Tensor[[FWD_CSA_CMP_BLOCKS_DYN, BLOCK_SIZE, 1, HEAD_DIM], pl.BF16]],
     csa_cmp_block_table: pl.Tensor[[CSA_B_DYN, CSA_CMP_MAX_BLOCKS], pl.INT32],
     csa_idx_kv_cache: pl.InOut[pl.Tensor[[FWD_CSA_IDX_BLOCKS_DYN, BLOCK_SIZE, 1, CSA_IDX_HEAD_DIM], pl.INT8]],
     csa_idx_kv_scale: pl.InOut[pl.Tensor[[FWD_CSA_IDX_BLOCKS_DYN, BLOCK_SIZE, 1, 1], pl.FP32]],
     csa_idx_block_table: pl.Tensor[[CSA_B_DYN, CSA_IDX_MAX_BLOCKS], pl.INT32],
-    csa_ori_slot_mapping: pl.Tensor[[KV_T_DYN], pl.INT64],
-    csa_window_swa_indices: pl.Tensor[[T_DYN, WIN], pl.INT32],
-    csa_window_swa_lens: pl.Tensor[[T_DYN], pl.INT32],
-    csa_cmp_slot_mapping: pl.Tensor[[KV_T_DYN], pl.INT64],
-    csa_idx_slot_mapping: pl.Tensor[[KV_T_DYN], pl.INT64],
-    csa_state_slot_mapping: pl.Tensor[[KV_T_DYN], pl.INT64],
-    csa_inner_state_slot_mapping: pl.Tensor[[KV_T_DYN], pl.INT64],
-    csa_kv_seq_lens: pl.InOut[pl.Tensor[[CSA_B_DYN], pl.INT32]],
-    hca_cmp_freqs_cos: pl.Tensor[[KV_B_DYN, ROPE_HEAD_DIM // 2], pl.FP32],
-    hca_cmp_freqs_sin: pl.Tensor[[KV_B_DYN, ROPE_HEAD_DIM // 2], pl.FP32],
     hca_cmp_wkv: pl.Tensor[[FWD_HCA_WEIGHT_BANK_SIZE * HCA_MAIN_OUT_DIM, D], pl.BF16],
     hca_cmp_wgate: pl.Tensor[[FWD_HCA_WEIGHT_BANK_SIZE * HCA_MAIN_OUT_DIM, D], pl.BF16],
     hca_cmp_ape: pl.Tensor[[FWD_HCA_WEIGHT_BANK_SIZE * HCA_COMPRESS_RATIO, HCA_MAIN_OUT_DIM], pl.FP32],
     hca_cmp_norm_w: pl.Tensor[[FWD_HCA_WEIGHT_BANK_SIZE * HEAD_DIM], pl.BF16],
     hca_compress_state: pl.InOut[pl.Tensor[[FWD_HCA_STATE_BLOCKS_DYN, HCA_COMPRESS_STATE_BLOCK_SIZE, HCA_COMPRESS_STATE_DIM], pl.FP32]],
-    hca_compress_state_block_table: pl.Tensor[[KV_B_DYN, HCA_COMPRESS_STATE_MAX_BLOCKS], pl.INT32],
     hca_cmp_kv: pl.InOut[pl.Tensor[[FWD_HCA_CMP_BLOCKS_DYN, BLOCK_SIZE, 1, HEAD_DIM], pl.BF16]],
     hca_cmp_block_table: pl.Tensor[[HCA_B_DYN, HCA_CMP_TABLE_BLOCKS_DYN], pl.INT32],
-    hca_ori_slot_mapping: pl.Tensor[[KV_T_DYN], pl.INT64],
-    hca_window_swa_indices: pl.Tensor[[T_DYN, WIN], pl.INT32],
-    hca_window_swa_lens: pl.Tensor[[T_DYN], pl.INT32],
-    hca_cmp_slot_mapping: pl.Tensor[[KV_T_DYN], pl.INT64],
-    hca_state_slot_mapping: pl.Tensor[[KV_T_DYN], pl.INT64],
-    hca_kv_seq_lens: pl.InOut[pl.Tensor[[HCA_B_DYN], pl.INT32]],
     attn_sink: pl.Tensor[[FWD_WEIGHT_BANK_SIZE * H], pl.FP32],
     wo_a: pl.Tensor[[FWD_WEIGHT_BANK_SIZE * LOCAL_O_GROUPS, O_LORA, O_GROUP_IN], pl.BF16],
     wo_b: pl.Tensor[[FWD_WEIGHT_BANK_SIZE * D, LOCAL_O_WIDTH], pl.INT8],
@@ -221,14 +213,12 @@ def l2_decode_fwd_dspark(
     gate_w: pl.Tensor[[FWD_WEIGHT_BANK_SIZE * N_EXPERTS_GLOBAL, D], pl.FP32],
     gate_bias: pl.Tensor[[FWD_WEIGHT_BANK_SIZE * N_EXPERTS_GLOBAL], pl.FP32],
     tid2eid: pl.Tensor[[FWD_WEIGHT_BANK_SIZE * VOCAB, TOPK], pl.INT32],
-    input_ids: pl.InOut[pl.Tensor[[T_DYN], pl.INT64]],
     num_tokens_per_owner: pl.Tensor[[N_RANKS], pl.INT32],
     hc_head_fn: pl.Tensor[[HC_MULT, HC_DIM], pl.FP32],
     hc_head_scale: pl.Tensor[[1], pl.FP32],
     hc_head_base: pl.Tensor[[HC_MULT], pl.FP32],
     final_norm_w: pl.Tensor[[D], pl.BF16],
     lm_head_weight: pl.Tensor[[VOCAB_PER_TP, D], pl.BF16],
-    logit_row_indices: pl.Tensor[[MAX_LOGIT_ROWS], pl.INT32],
     routed_w1: pl.Tensor[[FWD_WEIGHT_BANK_SIZE * N_LOCAL, MOE_INTER, D], pl.INT8],
     routed_w1_scale: pl.Tensor[[FWD_WEIGHT_BANK_SIZE * N_LOCAL, MOE_INTER], pl.FP32],
     routed_w3: pl.Tensor[[FWD_WEIGHT_BANK_SIZE * N_LOCAL, MOE_INTER, D], pl.INT8],
@@ -255,16 +245,35 @@ def l2_decode_fwd_dspark(
     state_generations: pl.Tensor[[DSPARK_STATE_LOCAL_BATCH], pl.INT32],
     state_tokens: pl.InOut[pl.Tensor[[DSPARK_STATE_CAPACITY, DSPARK_STATE_TOKEN_WIDTH], pl.INT64]],
     state_meta: pl.InOut[pl.Tensor[[DSPARK_STATE_CAPACITY, DSPARK_STATE_META_WIDTH], pl.INT32]],
-    sampled_row_offsets: pl.Tensor[[DSPARK_STATE_LOCAL_BATCH], pl.INT32],
-    hidden_row_offsets: pl.Tensor[[DSPARK_STATE_LOCAL_BATCH], pl.INT32],
     accepted_token_ids: pl.Out[pl.Tensor[[DSPARK_STATE_LOCAL_BATCH, SAMPLED_IDS_PAD], pl.INT32]],
     accepted_counts: pl.Out[pl.Tensor[[DSPARK_STATE_LOCAL_BATCH], pl.INT32]],
-    drafter_target_hidden: pl.Out[pl.Tensor[[T_DYN, MAIN_HIDDEN_DIM], pl.BF16]],
-    drafter_context_positions: pl.Out[pl.Tensor[[T_DYN], pl.INT32]],
-    drafter_context_valid: pl.Out[pl.Tensor[[T_DYN], pl.INT32]],
-    drafter_last_sampled: pl.Out[pl.Tensor[[DSPARK_STATE_LOCAL_BATCH], pl.INT64]],
-    drafter_anchor_positions: pl.Out[pl.Tensor[[DSPARK_STATE_LOCAL_BATCH], pl.INT32]],
-    drafter_row_offsets: pl.Out[pl.Tensor[[DSPARK_STATE_LOCAL_BATCH], pl.INT32]],
+    group_state_slot_ids: pl.Tensor[[DECODE_BATCH], pl.INT32],
+    group_state_generations: pl.Tensor[[DECODE_BATCH], pl.INT32],
+    group_ori_block_table: pl.Tensor[[DECODE_BATCH, ORI_TABLE_BLOCKS_DYN], pl.INT32],
+    group_hca_cmp_block_table: pl.Tensor[
+        [DECODE_BATCH, HCA_CMP_TABLE_BLOCKS_DYN], pl.INT32
+    ],
+    group_csa_cmp_block_table: pl.Tensor[
+        [DECODE_BATCH, CSA_CMP_MAX_BLOCKS], pl.INT32
+    ],
+    group_idx_block_table: pl.Tensor[
+        [DECODE_BATCH, CSA_IDX_MAX_BLOCKS], pl.INT32
+    ],
+    group_hca_state_block_table: pl.Tensor[
+        [DECODE_BATCH, HCA_GROUP_STATE_BLOCKS_DYN], pl.INT32
+    ],
+    group_csa_state_block_table: pl.Tensor[
+        [DECODE_BATCH, CSA_GROUP_STATE_BLOCKS_DYN], pl.INT32
+    ],
+    group_csa_inner_state_block_table: pl.Tensor[
+        [DECODE_BATCH, CSA_GROUP_STATE_BLOCKS_DYN], pl.INT32
+    ],
+    swa_rope_cos_table: pl.Tensor[[ROPE_ROWS_DYN, ROPE_HEAD_DIM], pl.BF16],
+    swa_rope_sin_table: pl.Tensor[[ROPE_ROWS_DYN, ROPE_HEAD_DIM], pl.BF16],
+    ratio4_rope_cos_table: pl.Tensor[[ROPE_ROWS_DYN, ROPE_HEAD_DIM], pl.BF16],
+    ratio4_rope_sin_table: pl.Tensor[[ROPE_ROWS_DYN, ROPE_HEAD_DIM], pl.BF16],
+    ratio128_rope_cos_table: pl.Tensor[[ROPE_ROWS_DYN, ROPE_HEAD_DIM], pl.BF16],
+    ratio128_rope_sin_table: pl.Tensor[[ROPE_ROWS_DYN, ROPE_HEAD_DIM], pl.BF16],
     gather_window: pld.DistributedTensor[[DECODE_GROUP_CAP, D], pl.BF16],
     gather_signal: pld.DistributedTensor[[TP_SIZE, 1], pl.INT32],
     attention_window: pld.DistributedTensor[[ATTENTION_WINDOW_ROWS, O_GROUP_IN], pl.BF16],
@@ -290,8 +299,6 @@ def l2_decode_fwd_dspark(
     draft_main_norm_weight: pl.Tensor[[_DRAFT_D], pl.BF16],
     draft_embedding_weight: pl.Tensor[[_DRAFT_VOCAB, _DRAFT_D], pl.BF16],
     draft_block_tables: pl.Tensor[[_DRAFT_DSPARK_DRAFT_LAYERS, B_DYN, _DRAFT_ORI_MAX_BLOCKS], pl.INT32],
-    draft_rope_cos_candidates: pl.Tensor[[B_DYN, _BRIDGE_ROPE_CANDIDATE_ROWS, _DRAFT_ROPE_DIM], pl.BF16],
-    draft_rope_sin_candidates: pl.Tensor[[B_DYN, _BRIDGE_ROPE_CANDIDATE_ROWS, _DRAFT_ROPE_DIM], pl.BF16],
     draft_hc_attn_fn: pl.Tensor[[_DRAFT_DSPARK_DRAFT_LAYERS * _DRAFT_MIX_HC, _DRAFT_HC_DIM], pl.FP32],
     draft_hc_attn_scale: pl.Tensor[[_DRAFT_DSPARK_DRAFT_LAYERS * 3], pl.FP32],
     draft_hc_attn_base: pl.Tensor[[_DRAFT_DSPARK_DRAFT_LAYERS * _DRAFT_MIX_HC], pl.FP32],
@@ -365,42 +372,267 @@ def l2_decode_fwd_dspark(
     draft_bridge_rope_sin_signal: pld.DistributedTensor[[_DRAFT_DSPARK_CP_SIZE, 1], pl.INT32],
 ):
     """Run the complete recurrent DSpark decode step in one rank-local L2."""
+    group_ori_block_table.bind_dynamic(1, ORI_TABLE_BLOCKS_DYN)
+    group_hca_cmp_block_table.bind_dynamic(1, HCA_CMP_TABLE_BLOCKS_DYN)
+    group_hca_state_block_table.bind_dynamic(1, HCA_GROUP_STATE_BLOCKS_DYN)
+    group_csa_state_block_table.bind_dynamic(1, CSA_GROUP_STATE_BLOCKS_DYN)
+    group_csa_inner_state_block_table.bind_dynamic(1, CSA_GROUP_STATE_BLOCKS_DYN)
+    swa_rope_cos_table.bind_dynamic(0, ROPE_ROWS_DYN)
+    swa_rope_sin_table.bind_dynamic(0, ROPE_ROWS_DYN)
+    ratio4_rope_cos_table.bind_dynamic(0, ROPE_ROWS_DYN)
+    ratio4_rope_sin_table.bind_dynamic(0, ROPE_ROWS_DYN)
+    ratio128_rope_cos_table.bind_dynamic(0, ROPE_ROWS_DYN)
+    ratio128_rope_sin_table.bind_dynamic(0, ROPE_ROWS_DYN)
     with pl.scope():
+        # Match fused MTP's ownership model: position-dependent decode
+        # metadata is invocation-local scratch, not a serving-owned InOut ABI.
+        # The legacy parameters remain in the transitional outer signature
+        # until the compact L3 ABI is validated, but are deliberately shadowed
+        # here so no producer/fanout lifetime can cross decode invocations.
+        prepared_input_ids = pl.create_tensor(
+            [LOCAL_DECODE_TOKENS], dtype=pl.INT64
+        )
+        prepared_position_ids_local = pl.create_tensor(
+            [LOCAL_DECODE_TOKENS], dtype=pl.INT32
+        )
+        prepared_position_ids = pl.create_tensor(
+            [GROUP_DECODE_TOKENS], dtype=pl.INT32
+        )
+        prepared_logit_row_indices = pl.create_tensor(
+            [MAX_LOGIT_ROWS], dtype=pl.INT32
+        )
+        prepared_sampled_row_offsets = pl.create_tensor(
+            [LOCAL_DECODE_BATCH], dtype=pl.INT32
+        )
+        prepared_drafter_target_hidden = pl.create_tensor(
+            [LOCAL_DECODE_TOKENS, MAIN_HIDDEN_DIM], dtype=pl.BF16
+        )
+        prepared_drafter_context_positions = pl.create_tensor(
+            [LOCAL_DECODE_TOKENS], dtype=pl.INT32
+        )
+        prepared_drafter_context_valid = pl.create_tensor(
+            [LOCAL_DECODE_TOKENS], dtype=pl.INT32
+        )
+        prepared_drafter_last_sampled = pl.create_tensor(
+            [LOCAL_DECODE_BATCH], dtype=pl.INT64
+        )
+        prepared_drafter_anchor_positions = pl.create_tensor(
+            [LOCAL_DECODE_BATCH], dtype=pl.INT32
+        )
+        prepared_drafter_row_offsets = pl.create_tensor(
+            [LOCAL_DECODE_BATCH], dtype=pl.INT32
+        )
+        prepared_swa_slot_mapping = pl.create_tensor(
+            [GROUP_DECODE_TOKENS], dtype=pl.INT64
+        )
+        prepared_swa_indices = pl.create_tensor(
+            [LOCAL_DECODE_TOKENS, WIN], dtype=pl.INT32
+        )
+        prepared_swa_lens = pl.create_tensor(
+            [LOCAL_DECODE_TOKENS], dtype=pl.INT32
+        )
+        prepared_csa_ori_slot_mapping = pl.create_tensor(
+            [GROUP_DECODE_TOKENS], dtype=pl.INT64
+        )
+        prepared_csa_window_swa_indices = pl.create_tensor(
+            [LOCAL_DECODE_TOKENS, WIN], dtype=pl.INT32
+        )
+        prepared_csa_window_swa_lens = pl.create_tensor(
+            [LOCAL_DECODE_TOKENS], dtype=pl.INT32
+        )
+        prepared_csa_cmp_slot_mapping = pl.create_tensor(
+            [GROUP_DECODE_TOKENS], dtype=pl.INT64
+        )
+        prepared_csa_idx_slot_mapping = pl.create_tensor(
+            [GROUP_DECODE_TOKENS], dtype=pl.INT64
+        )
+        prepared_csa_state_slot_mapping = pl.create_tensor(
+            [GROUP_DECODE_TOKENS], dtype=pl.INT64
+        )
+        prepared_csa_inner_state_slot_mapping = pl.create_tensor(
+            [GROUP_DECODE_TOKENS], dtype=pl.INT64
+        )
+        prepared_csa_kv_seq_lens = pl.create_tensor(
+            [LOCAL_DECODE_BATCH], dtype=pl.INT32
+        )
+        prepared_hca_ori_slot_mapping = pl.create_tensor(
+            [GROUP_DECODE_TOKENS], dtype=pl.INT64
+        )
+        prepared_hca_window_swa_indices = pl.create_tensor(
+            [LOCAL_DECODE_TOKENS, WIN], dtype=pl.INT32
+        )
+        prepared_hca_window_swa_lens = pl.create_tensor(
+            [LOCAL_DECODE_TOKENS], dtype=pl.INT32
+        )
+        prepared_hca_cmp_slot_mapping = pl.create_tensor(
+            [GROUP_DECODE_TOKENS], dtype=pl.INT64
+        )
+        prepared_hca_state_slot_mapping = pl.create_tensor(
+            [GROUP_DECODE_TOKENS], dtype=pl.INT64
+        )
+        prepared_hca_kv_seq_lens = pl.create_tensor(
+            [LOCAL_DECODE_BATCH], dtype=pl.INT32
+        )
+        prepared_freqs_cos = pl.create_tensor(
+            [LOCAL_DECODE_TOKENS, ROPE_HEAD_DIM], dtype=pl.BF16
+        )
+        prepared_freqs_sin = pl.create_tensor(
+            [LOCAL_DECODE_TOKENS, ROPE_HEAD_DIM], dtype=pl.BF16
+        )
+        prepared_compressed_freqs_cos = pl.create_tensor(
+            [LOCAL_DECODE_TOKENS, ROPE_HEAD_DIM], dtype=pl.BF16
+        )
+        prepared_compressed_freqs_sin = pl.create_tensor(
+            [LOCAL_DECODE_TOKENS, ROPE_HEAD_DIM], dtype=pl.BF16
+        )
+        prepared_csa_cmp_freqs_cos = pl.create_tensor(
+            [GROUP_DECODE_TOKENS, ROPE_HEAD_DIM], dtype=pl.BF16
+        )
+        prepared_csa_cmp_freqs_sin = pl.create_tensor(
+            [GROUP_DECODE_TOKENS, ROPE_HEAD_DIM], dtype=pl.BF16
+        )
+        prepared_hca_cmp_freqs_cos = pl.create_tensor(
+            [DECODE_BATCH, ROPE_HEAD_DIM // 2], dtype=pl.FP32
+        )
+        prepared_hca_cmp_freqs_sin = pl.create_tensor(
+            [DECODE_BATCH, ROPE_HEAD_DIM // 2], dtype=pl.FP32
+        )
+        prepared_hca_compress_state_block_table = pl.create_tensor(
+            [DECODE_BATCH, HCA_STATE_TABLE_BLOCKS], dtype=pl.INT32
+        )
+        prepared_csa_compress_state_block_table = pl.create_tensor(
+            [DECODE_BATCH, CSA_STATE_TABLE_BLOCKS], dtype=pl.INT32
+        )
+        prepared_csa_inner_compress_state_block_table = pl.create_tensor(
+            [DECODE_BATCH, CSA_STATE_TABLE_BLOCKS], dtype=pl.INT32
+        )
+        local_active_widths = pl.create_tensor(
+            [DSPARK_STATE_LOCAL_BATCH], dtype=pl.INT32
+        )
+        group_active_widths = pl.create_tensor([DECODE_BATCH], dtype=pl.INT32)
+        draft_batch = pl.tensor.dim(draft_head_hidden, 0)
+        prepared_draft_rope_cos_candidates = pl.create_tensor(
+            [draft_batch, _BRIDGE_ROPE_CANDIDATE_ROWS, _DRAFT_ROPE_DIM],
+            dtype=pl.BF16,
+        )
+        prepared_draft_rope_sin_candidates = pl.create_tensor(
+            [draft_batch, _BRIDGE_ROPE_CANDIDATE_ROWS, _DRAFT_ROPE_DIM],
+            dtype=pl.BF16,
+        )
+        prepare_target_group_from_device_state(
+            group_state_slot_ids,
+            group_state_generations,
+            state_tokens,
+            state_meta,
+            prepared_input_ids,
+            prepared_position_ids_local,
+            prepared_position_ids,
+            prepared_csa_kv_seq_lens,
+            prepared_hca_kv_seq_lens,
+            prepared_logit_row_indices,
+            prepared_sampled_row_offsets,
+            local_active_widths,
+            group_active_widths,
+            tp_rank,
+        )
+        build_group_decode_metadata(
+            prepared_position_ids,
+            group_active_widths,
+            group_ori_block_table,
+            group_hca_cmp_block_table,
+            group_csa_cmp_block_table,
+            group_idx_block_table,
+            group_hca_state_block_table,
+            group_csa_state_block_table,
+            group_csa_inner_state_block_table,
+            prepared_hca_compress_state_block_table,
+            prepared_csa_compress_state_block_table,
+            prepared_csa_inner_compress_state_block_table,
+            prepared_swa_slot_mapping,
+            prepared_swa_indices,
+            prepared_swa_lens,
+            prepared_hca_ori_slot_mapping,
+            prepared_hca_window_swa_indices,
+            prepared_hca_window_swa_lens,
+            prepared_hca_cmp_slot_mapping,
+            prepared_hca_state_slot_mapping,
+            prepared_csa_ori_slot_mapping,
+            prepared_csa_window_swa_indices,
+            prepared_csa_window_swa_lens,
+            prepared_csa_cmp_slot_mapping,
+            prepared_csa_idx_slot_mapping,
+            prepared_csa_state_slot_mapping,
+            prepared_csa_inner_state_slot_mapping,
+            tp_rank,
+        )
+        gather_group_decode_rope_rows(
+            swa_rope_cos_table,
+            swa_rope_sin_table,
+            ratio4_rope_cos_table,
+            ratio4_rope_sin_table,
+            ratio128_rope_cos_table,
+            ratio128_rope_sin_table,
+            prepared_position_ids,
+            group_active_widths,
+            prepared_freqs_cos,
+            prepared_freqs_sin,
+            prepared_compressed_freqs_cos,
+            prepared_compressed_freqs_sin,
+            prepared_csa_cmp_freqs_cos,
+            prepared_csa_cmp_freqs_sin,
+            prepared_hca_cmp_freqs_cos,
+            prepared_hca_cmp_freqs_sin,
+            prepared_draft_rope_cos_candidates,
+            prepared_draft_rope_sin_candidates,
+            tp_rank,
+        )
         target_accept_ready = pl.create_tensor([1], dtype=pl.INT32)
-        decode_fwd_device_state_inline(
+        decode_fwd_device_state_prepared_inline(
             embed_weight, hc_attn_fn, hc_attn_scale, hc_attn_base, attn_norm_w, wq_a, wq_b,
-            wq_b_scale, wkv, gamma_cq, gamma_ckv, raw_kv_pool, freqs_cos, freqs_sin,
-            compressed_freqs_cos, compressed_freqs_sin, swa_slot_mapping, swa_indices, swa_lens,
-            position_ids_local, position_ids, csa_cmp_freqs_cos, csa_cmp_freqs_sin, csa_cmp_wkv,
+            wq_b_scale, wkv, gamma_cq, gamma_ckv, raw_kv_pool,
+            prepared_freqs_cos, prepared_freqs_sin,
+            prepared_compressed_freqs_cos, prepared_compressed_freqs_sin,
+            prepared_swa_slot_mapping, prepared_swa_indices, prepared_swa_lens,
+            prepared_position_ids_local, prepared_position_ids,
+            prepared_csa_cmp_freqs_cos, prepared_csa_cmp_freqs_sin, csa_cmp_wkv,
             csa_cmp_wgate, csa_cmp_ape, csa_cmp_norm_w, csa_compress_state,
-            csa_compress_state_block_table, csa_idx_wq_b, csa_idx_wq_b_scale, csa_weights_proj,
+            prepared_csa_compress_state_block_table,
+            csa_idx_wq_b, csa_idx_wq_b_scale, csa_weights_proj,
             csa_hadamard_idx, csa_inner_wkv, csa_inner_wgate, csa_inner_ape, csa_inner_norm_w,
-            csa_inner_compress_state, csa_inner_compress_state_block_table, csa_cmp_kv,
+            csa_inner_compress_state, prepared_csa_inner_compress_state_block_table, csa_cmp_kv,
             csa_cmp_block_table, csa_idx_kv_cache, csa_idx_kv_scale, csa_idx_block_table,
-            csa_ori_slot_mapping, csa_window_swa_indices, csa_window_swa_lens,
-            csa_cmp_slot_mapping, csa_idx_slot_mapping, csa_state_slot_mapping,
-            csa_inner_state_slot_mapping, csa_kv_seq_lens, hca_cmp_freqs_cos, hca_cmp_freqs_sin,
+            prepared_csa_ori_slot_mapping,
+            prepared_csa_window_swa_indices, prepared_csa_window_swa_lens,
+            prepared_csa_cmp_slot_mapping, prepared_csa_idx_slot_mapping,
+            prepared_csa_state_slot_mapping, prepared_csa_inner_state_slot_mapping,
+            prepared_csa_kv_seq_lens,
+            prepared_hca_cmp_freqs_cos, prepared_hca_cmp_freqs_sin,
             hca_cmp_wkv, hca_cmp_wgate, hca_cmp_ape, hca_cmp_norm_w, hca_compress_state,
-            hca_compress_state_block_table, hca_cmp_kv, hca_cmp_block_table, hca_ori_slot_mapping,
-            hca_window_swa_indices, hca_window_swa_lens, hca_cmp_slot_mapping,
-            hca_state_slot_mapping, hca_kv_seq_lens, attn_sink, wo_a, wo_b, wo_b_scale, hc_ffn_fn,
-            hc_ffn_scale, hc_ffn_base, norm_w, gate_w, gate_bias, tid2eid, input_ids,
+            prepared_hca_compress_state_block_table,
+            hca_cmp_kv, hca_cmp_block_table, prepared_hca_ori_slot_mapping,
+            prepared_hca_window_swa_indices, prepared_hca_window_swa_lens,
+            prepared_hca_cmp_slot_mapping, prepared_hca_state_slot_mapping,
+            prepared_hca_kv_seq_lens, attn_sink, wo_a, wo_b, wo_b_scale, hc_ffn_fn,
+            hc_ffn_scale, hc_ffn_base, norm_w, gate_w, gate_bias, tid2eid,
+            prepared_input_ids,
             num_tokens_per_owner, hc_head_fn, hc_head_scale, hc_head_base, final_norm_w,
-            lm_head_weight, logit_row_indices, routed_w1, routed_w1_scale, routed_w3,
+            lm_head_weight, prepared_logit_row_indices, routed_w1, routed_w1_scale, routed_w3,
             routed_w3_scale, routed_w2, routed_w2_scale, shared_w1, shared_w1_scale, shared_w3,
             shared_w3_scale, shared_w2, shared_w2_scale, hidden_workspace, x_ping, x_pong,
             x_attn_active, x_moe_next, pre_hc_hidden_out, dspark_target_hidden, x_out, logits,
             sampled_ids, state_slot_ids, state_generations, state_tokens, state_meta,
-            sampled_row_offsets, hidden_row_offsets, accepted_token_ids, accepted_counts,
-            drafter_target_hidden, drafter_context_positions, drafter_context_valid,
-            drafter_last_sampled, drafter_anchor_positions, drafter_row_offsets,
+            prepared_sampled_row_offsets, prepared_sampled_row_offsets,
+            accepted_token_ids, accepted_counts,
+            prepared_drafter_target_hidden,
+            prepared_drafter_context_positions, prepared_drafter_context_valid,
+            prepared_drafter_last_sampled, prepared_drafter_anchor_positions,
+            prepared_drafter_row_offsets,
             target_accept_ready, gather_window,
             gather_signal, attention_window, attention_signal, o_window, o_signal, recv_meta,
             recv_x, recv_aux, recv_route, arrived, data_arrived, routed_y_buf, combine_arrived,
             lm_head_hidden_window, lm_head_hidden_done, lm_head_logits_window, lm_head_logits_done,
             group_base, tp_rank, my_rank
         )
-        draft_batch = pl.tensor.dim(draft_head_hidden, 0)
         draft_group_context_tokens = (
             _DRAFT_DSPARK_CP_SIZE * draft_batch * SAMPLED_IDS_PAD
         )
@@ -420,7 +652,7 @@ def l2_decode_fwd_dspark(
             )
             draft_target_hidden[
                 hidden_row : hidden_row + 1, 0:_DRAFT_MAIN_IN
-            ] = drafter_target_hidden[
+            ] = prepared_drafter_target_hidden[
                 source_row : source_row + 1, 0:_DRAFT_MAIN_IN
             ]
         bridge_num_sampled = pl.create_tensor(
@@ -514,14 +746,14 @@ def l2_decode_fwd_dspark(
             state_generations,
             state_meta,
             accepted_counts,
-            drafter_context_positions,
-            drafter_context_valid,
-            drafter_last_sampled,
-            drafter_anchor_positions,
-            drafter_row_offsets,
+            prepared_drafter_context_positions,
+            prepared_drafter_context_valid,
+            prepared_drafter_last_sampled,
+            prepared_drafter_anchor_positions,
+            prepared_drafter_row_offsets,
             draft_block_tables,
-            draft_rope_cos_candidates,
-            draft_rope_sin_candidates,
+            prepared_draft_rope_cos_candidates,
+            prepared_draft_rope_sin_candidates,
             bridge_num_sampled,
             bridge_last_sampled,
             bridge_next_prefill_tokens,
@@ -602,23 +834,11 @@ def l3_decode_fwd_dspark(
     gamma_cq: pl.Tensor[[N_RANKS, FWD_WEIGHT_BANK_SIZE * Q_LORA], pl.BF16],
     gamma_ckv: pl.Tensor[[N_RANKS, FWD_WEIGHT_BANK_SIZE * HEAD_DIM], pl.BF16],
     raw_kv_pool: pl.InOut[pl.Tensor[[N_RANKS, FWD_PACKED_RAW_BLOCKS_DYN, BLOCK_SIZE, 1, HEAD_DIM], pl.BF16]],
-    freqs_cos: pl.Tensor[[N_RANKS, T_DYN, ROPE_HEAD_DIM], pl.BF16],
-    freqs_sin: pl.Tensor[[N_RANKS, T_DYN, ROPE_HEAD_DIM], pl.BF16],
-    compressed_freqs_cos: pl.Tensor[[N_RANKS, T_DYN, ROPE_HEAD_DIM], pl.BF16],
-    compressed_freqs_sin: pl.Tensor[[N_RANKS, T_DYN, ROPE_HEAD_DIM], pl.BF16],
-    swa_slot_mapping: pl.Tensor[[N_RANKS, KV_T_DYN], pl.INT64],
-    swa_indices: pl.Tensor[[N_RANKS, T_DYN, WIN], pl.INT32],
-    swa_lens: pl.Tensor[[N_RANKS, T_DYN], pl.INT32],
-    position_ids_local: pl.InOut[pl.Tensor[[N_RANKS, T_DYN], pl.INT32]],
-    position_ids: pl.Tensor[[N_RANKS, KV_T_DYN], pl.INT32],
-    csa_cmp_freqs_cos: pl.Tensor[[N_RANKS, KV_T_DYN, ROPE_HEAD_DIM], pl.BF16],
-    csa_cmp_freqs_sin: pl.Tensor[[N_RANKS, KV_T_DYN, ROPE_HEAD_DIM], pl.BF16],
     csa_cmp_wkv: pl.Tensor[[N_RANKS, FWD_CSA_WEIGHT_BANK_SIZE * CSA_MAIN_OUT_DIM, D], pl.BF16],
     csa_cmp_wgate: pl.Tensor[[N_RANKS, FWD_CSA_WEIGHT_BANK_SIZE * CSA_MAIN_OUT_DIM, D], pl.BF16],
     csa_cmp_ape: pl.Tensor[[N_RANKS, FWD_CSA_WEIGHT_BANK_SIZE * CSA_COMPRESS_RATIO, CSA_MAIN_OUT_DIM], pl.FP32],
     csa_cmp_norm_w: pl.Tensor[[N_RANKS, FWD_CSA_WEIGHT_BANK_SIZE * HEAD_DIM], pl.BF16],
     csa_compress_state: pl.InOut[pl.Tensor[[N_RANKS, FWD_CSA_MAIN_STATE_BLOCKS_DYN, CSA_MAIN_STATE_BLOCK_SIZE, CSA_MAIN_STATE_DIM], pl.FP32]],
-    csa_compress_state_block_table: pl.Tensor[[N_RANKS, KV_B_DYN, CSA_MAIN_STATE_MAX_BLOCKS], pl.INT32],
     csa_idx_wq_b: pl.Tensor[[N_RANKS, FWD_CSA_WEIGHT_BANK_SIZE * Q_LORA, CSA_IDX_N_HEADS * CSA_IDX_HEAD_DIM], pl.INT8],
     csa_idx_wq_b_scale: pl.Tensor[[N_RANKS, FWD_CSA_WEIGHT_BANK_SIZE * CSA_IDX_N_HEADS * CSA_IDX_HEAD_DIM], pl.FP32],
     csa_weights_proj: pl.Tensor[[N_RANKS, FWD_CSA_WEIGHT_BANK_SIZE * D, CSA_IDX_N_HEADS], pl.BF16],
@@ -628,36 +848,18 @@ def l3_decode_fwd_dspark(
     csa_inner_ape: pl.Tensor[[N_RANKS, FWD_CSA_WEIGHT_BANK_SIZE * CSA_COMPRESS_RATIO, CSA_INNER_OUT_DIM], pl.FP32],
     csa_inner_norm_w: pl.Tensor[[N_RANKS, FWD_CSA_WEIGHT_BANK_SIZE * CSA_IDX_HEAD_DIM], pl.BF16],
     csa_inner_compress_state: pl.InOut[pl.Tensor[[N_RANKS, FWD_CSA_INNER_STATE_BLOCKS_DYN, CSA_INNER_STATE_BLOCK_SIZE, CSA_INNER_STATE_DIM], pl.FP32]],
-    csa_inner_compress_state_block_table: pl.Tensor[[N_RANKS, KV_B_DYN, CSA_INNER_STATE_MAX_BLOCKS], pl.INT32],
     csa_cmp_kv: pl.InOut[pl.Tensor[[N_RANKS, FWD_CSA_CMP_BLOCKS_DYN, BLOCK_SIZE, 1, HEAD_DIM], pl.BF16]],
     csa_cmp_block_table: pl.Tensor[[N_RANKS, CSA_B_DYN, CSA_CMP_MAX_BLOCKS], pl.INT32],
     csa_idx_kv_cache: pl.InOut[pl.Tensor[[N_RANKS, FWD_CSA_IDX_BLOCKS_DYN, BLOCK_SIZE, 1, CSA_IDX_HEAD_DIM], pl.INT8]],
     csa_idx_kv_scale: pl.InOut[pl.Tensor[[N_RANKS, FWD_CSA_IDX_BLOCKS_DYN, BLOCK_SIZE, 1, 1], pl.FP32]],
     csa_idx_block_table: pl.Tensor[[N_RANKS, CSA_B_DYN, CSA_IDX_MAX_BLOCKS], pl.INT32],
-    csa_ori_slot_mapping: pl.Tensor[[N_RANKS, KV_T_DYN], pl.INT64],
-    csa_window_swa_indices: pl.Tensor[[N_RANKS, T_DYN, WIN], pl.INT32],
-    csa_window_swa_lens: pl.Tensor[[N_RANKS, T_DYN], pl.INT32],
-    csa_cmp_slot_mapping: pl.Tensor[[N_RANKS, KV_T_DYN], pl.INT64],
-    csa_idx_slot_mapping: pl.Tensor[[N_RANKS, KV_T_DYN], pl.INT64],
-    csa_state_slot_mapping: pl.Tensor[[N_RANKS, KV_T_DYN], pl.INT64],
-    csa_inner_state_slot_mapping: pl.Tensor[[N_RANKS, KV_T_DYN], pl.INT64],
-    csa_kv_seq_lens: pl.InOut[pl.Tensor[[N_RANKS, CSA_B_DYN], pl.INT32]],
-    hca_cmp_freqs_cos: pl.Tensor[[N_RANKS, KV_B_DYN, ROPE_HEAD_DIM // 2], pl.FP32],
-    hca_cmp_freqs_sin: pl.Tensor[[N_RANKS, KV_B_DYN, ROPE_HEAD_DIM // 2], pl.FP32],
     hca_cmp_wkv: pl.Tensor[[N_RANKS, FWD_HCA_WEIGHT_BANK_SIZE * HCA_MAIN_OUT_DIM, D], pl.BF16],
     hca_cmp_wgate: pl.Tensor[[N_RANKS, FWD_HCA_WEIGHT_BANK_SIZE * HCA_MAIN_OUT_DIM, D], pl.BF16],
     hca_cmp_ape: pl.Tensor[[N_RANKS, FWD_HCA_WEIGHT_BANK_SIZE * HCA_COMPRESS_RATIO, HCA_MAIN_OUT_DIM], pl.FP32],
     hca_cmp_norm_w: pl.Tensor[[N_RANKS, FWD_HCA_WEIGHT_BANK_SIZE * HEAD_DIM], pl.BF16],
     hca_compress_state: pl.InOut[pl.Tensor[[N_RANKS, FWD_HCA_STATE_BLOCKS_DYN, HCA_COMPRESS_STATE_BLOCK_SIZE, HCA_COMPRESS_STATE_DIM], pl.FP32]],
-    hca_compress_state_block_table: pl.Tensor[[N_RANKS, KV_B_DYN, HCA_COMPRESS_STATE_MAX_BLOCKS], pl.INT32],
     hca_cmp_kv: pl.InOut[pl.Tensor[[N_RANKS, FWD_HCA_CMP_BLOCKS_DYN, BLOCK_SIZE, 1, HEAD_DIM], pl.BF16]],
     hca_cmp_block_table: pl.Tensor[[N_RANKS, HCA_B_DYN, HCA_CMP_TABLE_BLOCKS_DYN], pl.INT32],
-    hca_ori_slot_mapping: pl.Tensor[[N_RANKS, KV_T_DYN], pl.INT64],
-    hca_window_swa_indices: pl.Tensor[[N_RANKS, T_DYN, WIN], pl.INT32],
-    hca_window_swa_lens: pl.Tensor[[N_RANKS, T_DYN], pl.INT32],
-    hca_cmp_slot_mapping: pl.Tensor[[N_RANKS, KV_T_DYN], pl.INT64],
-    hca_state_slot_mapping: pl.Tensor[[N_RANKS, KV_T_DYN], pl.INT64],
-    hca_kv_seq_lens: pl.InOut[pl.Tensor[[N_RANKS, HCA_B_DYN], pl.INT32]],
     attn_sink: pl.Tensor[[N_RANKS, FWD_WEIGHT_BANK_SIZE * H], pl.FP32],
     wo_a: pl.Tensor[[N_RANKS, FWD_WEIGHT_BANK_SIZE * LOCAL_O_GROUPS, O_LORA, O_GROUP_IN], pl.BF16],
     wo_b: pl.Tensor[[N_RANKS, FWD_WEIGHT_BANK_SIZE * D, LOCAL_O_WIDTH], pl.INT8],
@@ -669,14 +871,12 @@ def l3_decode_fwd_dspark(
     gate_w: pl.Tensor[[N_RANKS, FWD_WEIGHT_BANK_SIZE * N_EXPERTS_GLOBAL, D], pl.FP32],
     gate_bias: pl.Tensor[[N_RANKS, FWD_WEIGHT_BANK_SIZE * N_EXPERTS_GLOBAL], pl.FP32],
     tid2eid: pl.Tensor[[N_RANKS, FWD_WEIGHT_BANK_SIZE * VOCAB, TOPK], pl.INT32],
-    input_ids: pl.InOut[pl.Tensor[[N_RANKS, T_DYN], pl.INT64]],
     num_tokens_per_owner: pl.Tensor[[N_RANKS], pl.INT32],
     hc_head_fn: pl.Tensor[[N_RANKS, HC_MULT, HC_DIM], pl.FP32],
     hc_head_scale: pl.Tensor[[N_RANKS, 1], pl.FP32],
     hc_head_base: pl.Tensor[[N_RANKS, HC_MULT], pl.FP32],
     final_norm_w: pl.Tensor[[N_RANKS, D], pl.BF16],
     lm_head_weight: pl.Tensor[[N_RANKS, VOCAB_PER_TP, D], pl.BF16],
-    logit_row_indices: pl.Tensor[[N_RANKS, MAX_LOGIT_ROWS], pl.INT32],
     routed_w1: pl.Tensor[[N_RANKS, FWD_WEIGHT_BANK_SIZE * N_LOCAL, MOE_INTER, D], pl.INT8],
     routed_w1_scale: pl.Tensor[[N_RANKS, FWD_WEIGHT_BANK_SIZE * N_LOCAL, MOE_INTER], pl.FP32],
     routed_w3: pl.Tensor[[N_RANKS, FWD_WEIGHT_BANK_SIZE * N_LOCAL, MOE_INTER, D], pl.INT8],
@@ -703,24 +903,55 @@ def l3_decode_fwd_dspark(
     state_generations: pl.Tensor[[N_RANKS, DSPARK_STATE_LOCAL_BATCH], pl.INT32],
     state_tokens: pl.InOut[pl.Tensor[[N_RANKS, DSPARK_STATE_CAPACITY, DSPARK_STATE_TOKEN_WIDTH], pl.INT64]],
     state_meta: pl.InOut[pl.Tensor[[N_RANKS, DSPARK_STATE_CAPACITY, DSPARK_STATE_META_WIDTH], pl.INT32]],
-    sampled_row_offsets: pl.Tensor[[N_RANKS, DSPARK_STATE_LOCAL_BATCH], pl.INT32],
-    hidden_row_offsets: pl.Tensor[[N_RANKS, DSPARK_STATE_LOCAL_BATCH], pl.INT32],
     accepted_token_ids: pl.Out[pl.Tensor[[N_RANKS, DSPARK_STATE_LOCAL_BATCH, SAMPLED_IDS_PAD], pl.INT32]],
     accepted_counts: pl.Out[pl.Tensor[[N_RANKS, DSPARK_STATE_LOCAL_BATCH], pl.INT32]],
-    drafter_target_hidden: pl.Out[pl.Tensor[[N_RANKS, T_DYN, MAIN_HIDDEN_DIM], pl.BF16]],
-    drafter_context_positions: pl.Out[pl.Tensor[[N_RANKS, T_DYN], pl.INT32]],
-    drafter_context_valid: pl.Out[pl.Tensor[[N_RANKS, T_DYN], pl.INT32]],
-    drafter_last_sampled: pl.Out[pl.Tensor[[N_RANKS, DSPARK_STATE_LOCAL_BATCH], pl.INT64]],
-    drafter_anchor_positions: pl.Out[pl.Tensor[[N_RANKS, DSPARK_STATE_LOCAL_BATCH], pl.INT32]],
-    drafter_row_offsets: pl.Out[pl.Tensor[[N_RANKS, DSPARK_STATE_LOCAL_BATCH], pl.INT32]],
+    group_state_slot_ids: pl.Tensor[[N_RANKS, DECODE_BATCH], pl.INT32],
+    group_state_generations: pl.Tensor[[N_RANKS, DECODE_BATCH], pl.INT32],
+    group_ori_block_table: pl.Tensor[
+        [N_RANKS, DECODE_BATCH, ORI_TABLE_BLOCKS_DYN], pl.INT32
+    ],
+    group_hca_cmp_block_table: pl.Tensor[
+        [N_RANKS, DECODE_BATCH, HCA_CMP_TABLE_BLOCKS_DYN], pl.INT32
+    ],
+    group_csa_cmp_block_table: pl.Tensor[
+        [N_RANKS, DECODE_BATCH, CSA_CMP_MAX_BLOCKS], pl.INT32
+    ],
+    group_idx_block_table: pl.Tensor[
+        [N_RANKS, DECODE_BATCH, CSA_IDX_MAX_BLOCKS], pl.INT32
+    ],
+    group_hca_state_block_table: pl.Tensor[
+        [N_RANKS, DECODE_BATCH, HCA_GROUP_STATE_BLOCKS_DYN], pl.INT32
+    ],
+    group_csa_state_block_table: pl.Tensor[
+        [N_RANKS, DECODE_BATCH, CSA_GROUP_STATE_BLOCKS_DYN], pl.INT32
+    ],
+    group_csa_inner_state_block_table: pl.Tensor[
+        [N_RANKS, DECODE_BATCH, CSA_GROUP_STATE_BLOCKS_DYN], pl.INT32
+    ],
+    swa_rope_cos_table: pl.Tensor[
+        [N_RANKS, ROPE_ROWS_DYN, ROPE_HEAD_DIM], pl.BF16
+    ],
+    swa_rope_sin_table: pl.Tensor[
+        [N_RANKS, ROPE_ROWS_DYN, ROPE_HEAD_DIM], pl.BF16
+    ],
+    ratio4_rope_cos_table: pl.Tensor[
+        [N_RANKS, ROPE_ROWS_DYN, ROPE_HEAD_DIM], pl.BF16
+    ],
+    ratio4_rope_sin_table: pl.Tensor[
+        [N_RANKS, ROPE_ROWS_DYN, ROPE_HEAD_DIM], pl.BF16
+    ],
+    ratio128_rope_cos_table: pl.Tensor[
+        [N_RANKS, ROPE_ROWS_DYN, ROPE_HEAD_DIM], pl.BF16
+    ],
+    ratio128_rope_sin_table: pl.Tensor[
+        [N_RANKS, ROPE_ROWS_DYN, ROPE_HEAD_DIM], pl.BF16
+    ],
     draft_initial_hidden: pl.Out[pl.Tensor[[_DRAFT_N_RANKS, _DRAFT_T, _DRAFT_HC_MULT, _DRAFT_D], pl.FP32]],
     draft_intermediate_hidden: pl.Out[pl.Tensor[[_DRAFT_N_RANKS, _DRAFT_DSPARK_DRAFT_LAYERS, _DRAFT_T, _DRAFT_HC_MULT, _DRAFT_D], pl.FP32]],
     draft_main_proj_weight: pl.Tensor[[_DRAFT_N_RANKS, _DRAFT_D, _DRAFT_MAIN_IN], pl.BF16],
     draft_main_norm_weight: pl.Tensor[[_DRAFT_N_RANKS, _DRAFT_D], pl.BF16],
     draft_embedding_weight: pl.Tensor[[_DRAFT_N_RANKS, _DRAFT_VOCAB, _DRAFT_D], pl.BF16],
     draft_block_tables: pl.Tensor[[_DRAFT_N_RANKS, _DRAFT_DSPARK_DRAFT_LAYERS, B_DYN, _DRAFT_ORI_MAX_BLOCKS], pl.INT32],
-    draft_rope_cos_candidates: pl.Tensor[[_DRAFT_N_RANKS, B_DYN, _BRIDGE_ROPE_CANDIDATE_ROWS, _DRAFT_ROPE_DIM], pl.BF16],
-    draft_rope_sin_candidates: pl.Tensor[[_DRAFT_N_RANKS, B_DYN, _BRIDGE_ROPE_CANDIDATE_ROWS, _DRAFT_ROPE_DIM], pl.BF16],
     draft_hc_attn_fn: pl.Tensor[[_DRAFT_N_RANKS, _DRAFT_DSPARK_DRAFT_LAYERS * _DRAFT_MIX_HC, _DRAFT_HC_DIM], pl.FP32],
     draft_hc_attn_scale: pl.Tensor[[_DRAFT_N_RANKS, _DRAFT_DSPARK_DRAFT_LAYERS * 3], pl.FP32],
     draft_hc_attn_base: pl.Tensor[[_DRAFT_N_RANKS, _DRAFT_DSPARK_DRAFT_LAYERS * _DRAFT_MIX_HC], pl.FP32],
@@ -770,57 +1001,36 @@ def l3_decode_fwd_dspark(
     """Launch one complete DSpark decode L2 on every rank."""
     'Prepare, run target decode, and accept K=7 output in one L3 graph.'
     embed_weight.bind_dynamic(1, EMBED_VOCAB_DYN)
-    input_ids.bind_dynamic(1, T_DYN)
     hidden_workspace.bind_dynamic(1, T_DYN)
     dspark_target_hidden.bind_dynamic(1, T_DYN)
     x_ping.bind_dynamic(1, T_DYN)
     raw_kv_pool.bind_dynamic(1, FWD_PACKED_RAW_BLOCKS_DYN)
-    freqs_cos.bind_dynamic(1, T_DYN)
-    freqs_sin.bind_dynamic(1, T_DYN)
-    compressed_freqs_cos.bind_dynamic(1, T_DYN)
-    compressed_freqs_sin.bind_dynamic(1, T_DYN)
-    swa_slot_mapping.bind_dynamic(1, KV_T_DYN)
-    swa_indices.bind_dynamic(1, T_DYN)
-    swa_lens.bind_dynamic(1, T_DYN)
-    position_ids_local.bind_dynamic(1, T_DYN)
-    position_ids.bind_dynamic(1, KV_T_DYN)
-    csa_cmp_freqs_cos.bind_dynamic(1, KV_T_DYN)
-    csa_cmp_freqs_sin.bind_dynamic(1, KV_T_DYN)
     csa_compress_state.bind_dynamic(1, FWD_CSA_MAIN_STATE_BLOCKS_DYN)
-    csa_compress_state_block_table.bind_dynamic(1, KV_B_DYN)
     csa_inner_compress_state.bind_dynamic(1, FWD_CSA_INNER_STATE_BLOCKS_DYN)
-    csa_inner_compress_state_block_table.bind_dynamic(1, KV_B_DYN)
     csa_cmp_kv.bind_dynamic(1, FWD_CSA_CMP_BLOCKS_DYN)
     csa_cmp_block_table.bind_dynamic(1, CSA_B_DYN)
     csa_idx_kv_cache.bind_dynamic(1, FWD_CSA_IDX_BLOCKS_DYN)
     csa_idx_kv_scale.bind_dynamic(1, FWD_CSA_IDX_BLOCKS_DYN)
     csa_idx_block_table.bind_dynamic(1, CSA_B_DYN)
-    csa_ori_slot_mapping.bind_dynamic(1, KV_T_DYN)
-    csa_window_swa_indices.bind_dynamic(1, T_DYN)
-    csa_window_swa_lens.bind_dynamic(1, T_DYN)
-    csa_cmp_slot_mapping.bind_dynamic(1, KV_T_DYN)
-    csa_idx_slot_mapping.bind_dynamic(1, KV_T_DYN)
-    csa_state_slot_mapping.bind_dynamic(1, KV_T_DYN)
-    csa_inner_state_slot_mapping.bind_dynamic(1, KV_T_DYN)
-    csa_kv_seq_lens.bind_dynamic(1, CSA_B_DYN)
     hca_compress_state.bind_dynamic(1, FWD_HCA_STATE_BLOCKS_DYN)
-    hca_compress_state_block_table.bind_dynamic(1, KV_B_DYN)
     hca_cmp_kv.bind_dynamic(1, FWD_HCA_CMP_BLOCKS_DYN)
     hca_cmp_block_table.bind_dynamic(1, HCA_B_DYN)
     hca_cmp_block_table.bind_dynamic(2, HCA_CMP_TABLE_BLOCKS_DYN)
-    hca_ori_slot_mapping.bind_dynamic(1, KV_T_DYN)
-    hca_window_swa_indices.bind_dynamic(1, T_DYN)
-    hca_window_swa_lens.bind_dynamic(1, T_DYN)
-    hca_cmp_slot_mapping.bind_dynamic(1, KV_T_DYN)
-    hca_state_slot_mapping.bind_dynamic(1, KV_T_DYN)
-    hca_kv_seq_lens.bind_dynamic(1, HCA_B_DYN)
     x_pong.bind_dynamic(1, T_DYN)
     x_attn_active.bind_dynamic(1, T_DYN)
     pre_hc_hidden_out.bind_dynamic(1, T_DYN)
     x_out.bind_dynamic(1, T_DYN)
-    drafter_target_hidden.bind_dynamic(1, T_DYN)
-    drafter_context_positions.bind_dynamic(1, T_DYN)
-    drafter_context_valid.bind_dynamic(1, T_DYN)
+    group_ori_block_table.bind_dynamic(2, ORI_TABLE_BLOCKS_DYN)
+    group_hca_cmp_block_table.bind_dynamic(2, HCA_CMP_TABLE_BLOCKS_DYN)
+    group_hca_state_block_table.bind_dynamic(2, HCA_GROUP_STATE_BLOCKS_DYN)
+    group_csa_state_block_table.bind_dynamic(2, CSA_GROUP_STATE_BLOCKS_DYN)
+    group_csa_inner_state_block_table.bind_dynamic(2, CSA_GROUP_STATE_BLOCKS_DYN)
+    swa_rope_cos_table.bind_dynamic(1, ROPE_ROWS_DYN)
+    swa_rope_sin_table.bind_dynamic(1, ROPE_ROWS_DYN)
+    ratio4_rope_cos_table.bind_dynamic(1, ROPE_ROWS_DYN)
+    ratio4_rope_sin_table.bind_dynamic(1, ROPE_ROWS_DYN)
+    ratio128_rope_cos_table.bind_dynamic(1, ROPE_ROWS_DYN)
+    ratio128_rope_sin_table.bind_dynamic(1, ROPE_ROWS_DYN)
     gather_window_buf = pld.alloc_window_buffer([DECODE_GROUP_CAP, D], dtype=pl.BF16)
     gather_signal_buf = pld.alloc_window_buffer([TP_SIZE, 1], dtype=pl.INT32)
     attention_window_buf = pld.alloc_window_buffer([ATTENTION_WINDOW_ROWS, O_GROUP_IN], dtype=pl.BF16)
@@ -839,10 +1049,7 @@ def l3_decode_fwd_dspark(
     lm_head_hidden_done_buf = pld.alloc_window_buffer([LM_HEAD_TP_SIZE, 1], dtype=pl.INT32)
     lm_head_logits_window_buf = pld.alloc_window_buffer([MAX_LOGIT_ROWS, LM_HEAD_VOCAB], dtype=pl.FP32)
     lm_head_logits_done_buf = pld.alloc_window_buffer([LM_HEAD_TP_SIZE, 1], dtype=pl.INT32)
-    drafter_target_hidden.bind_dynamic(1, T_MAIN_DYN)
     draft_block_tables.bind_dynamic(2, B_DYN)
-    draft_rope_cos_candidates.bind_dynamic(1, B_DYN)
-    draft_rope_sin_candidates.bind_dynamic(1, B_DYN)
     draft_head_hidden.bind_dynamic(1, B_DYN)
     draft_draft_token_ids.bind_dynamic(1, B_DYN)
     draft_confidence_probs.bind_dynamic(1, B_DYN)
@@ -954,46 +1161,43 @@ def l3_decode_fwd_dspark(
         l2_decode_fwd_dspark(
             embed_weight[rank], hc_attn_fn[rank], hc_attn_scale[rank], hc_attn_base[rank],
             attn_norm_w[rank], wq_a[rank], wq_b[rank], wq_b_scale[rank], wkv[rank], gamma_cq[rank],
-            gamma_ckv[rank], raw_kv_pool[rank], freqs_cos[rank], freqs_sin[rank],
-            compressed_freqs_cos[rank], compressed_freqs_sin[rank], swa_slot_mapping[rank],
-            swa_indices[rank], swa_lens[rank], position_ids_local[rank], position_ids[rank],
-            csa_cmp_freqs_cos[rank], csa_cmp_freqs_sin[rank], csa_cmp_wkv[rank],
+            gamma_ckv[rank], raw_kv_pool[rank], csa_cmp_wkv[rank],
             csa_cmp_wgate[rank], csa_cmp_ape[rank], csa_cmp_norm_w[rank], csa_compress_state[rank],
-            csa_compress_state_block_table[rank], csa_idx_wq_b[rank], csa_idx_wq_b_scale[rank],
+            csa_idx_wq_b[rank], csa_idx_wq_b_scale[rank],
             csa_weights_proj[rank], csa_hadamard_idx[rank], csa_inner_wkv[rank],
             csa_inner_wgate[rank], csa_inner_ape[rank], csa_inner_norm_w[rank],
-            csa_inner_compress_state[rank], csa_inner_compress_state_block_table[rank],
+            csa_inner_compress_state[rank],
             csa_cmp_kv[rank], csa_cmp_block_table[rank], csa_idx_kv_cache[rank],
-            csa_idx_kv_scale[rank], csa_idx_block_table[rank], csa_ori_slot_mapping[rank],
-            csa_window_swa_indices[rank], csa_window_swa_lens[rank], csa_cmp_slot_mapping[rank],
-            csa_idx_slot_mapping[rank], csa_state_slot_mapping[rank],
-            csa_inner_state_slot_mapping[rank], csa_kv_seq_lens[rank], hca_cmp_freqs_cos[rank],
-            hca_cmp_freqs_sin[rank], hca_cmp_wkv[rank], hca_cmp_wgate[rank], hca_cmp_ape[rank],
-            hca_cmp_norm_w[rank], hca_compress_state[rank], hca_compress_state_block_table[rank],
-            hca_cmp_kv[rank], hca_cmp_block_table[rank], hca_ori_slot_mapping[rank],
-            hca_window_swa_indices[rank], hca_window_swa_lens[rank], hca_cmp_slot_mapping[rank],
-            hca_state_slot_mapping[rank], hca_kv_seq_lens[rank], attn_sink[rank], wo_a[rank],
+            csa_idx_kv_scale[rank], csa_idx_block_table[rank],
+            hca_cmp_wkv[rank], hca_cmp_wgate[rank], hca_cmp_ape[rank],
+            hca_cmp_norm_w[rank], hca_compress_state[rank],
+            hca_cmp_kv[rank], hca_cmp_block_table[rank], attn_sink[rank], wo_a[rank],
             wo_b[rank], wo_b_scale[rank], hc_ffn_fn[rank], hc_ffn_scale[rank], hc_ffn_base[rank],
-            norm_w[rank], gate_w[rank], gate_bias[rank], tid2eid[rank], input_ids[rank],
+            norm_w[rank], gate_w[rank], gate_bias[rank], tid2eid[rank],
             num_tokens_per_owner, hc_head_fn[rank], hc_head_scale[rank], hc_head_base[rank],
-            final_norm_w[rank], lm_head_weight[rank], logit_row_indices[rank], routed_w1[rank],
+            final_norm_w[rank], lm_head_weight[rank], routed_w1[rank],
             routed_w1_scale[rank], routed_w3[rank], routed_w3_scale[rank], routed_w2[rank],
             routed_w2_scale[rank], shared_w1[rank], shared_w1_scale[rank], shared_w3[rank],
             shared_w3_scale[rank], shared_w2[rank], shared_w2_scale[rank], hidden_workspace[rank],
             x_ping[rank], x_pong[rank], x_attn_active[rank], x_moe_next[rank],
             pre_hc_hidden_out[rank], dspark_target_hidden[rank], x_out[rank], logits[rank],
             sampled_ids[rank], state_slot_ids[rank], state_generations[rank], state_tokens[rank],
-            state_meta[rank], sampled_row_offsets[rank], hidden_row_offsets[rank],
-            accepted_token_ids[rank], accepted_counts[rank], drafter_target_hidden[rank],
-            drafter_context_positions[rank], drafter_context_valid[rank],
-            drafter_last_sampled[rank], drafter_anchor_positions[rank], drafter_row_offsets[rank],
+            state_meta[rank], accepted_token_ids[rank], accepted_counts[rank],
+            group_state_slot_ids[rank], group_state_generations[rank],
+            group_ori_block_table[rank], group_hca_cmp_block_table[rank],
+            group_csa_cmp_block_table[rank], group_idx_block_table[rank],
+            group_hca_state_block_table[rank], group_csa_state_block_table[rank],
+            group_csa_inner_state_block_table[rank],
+            swa_rope_cos_table[rank],
+            swa_rope_sin_table[rank], ratio4_rope_cos_table[rank],
+            ratio4_rope_sin_table[rank], ratio128_rope_cos_table[rank],
+            ratio128_rope_sin_table[rank],
             gather_window, gather_signal, attention_window, attention_signal, o_window, o_signal,
             recv_meta, recv_x, recv_aux, recv_route, arrived, data_arrived, routed_y_buf,
             combine_arrived, lm_head_hidden_window, lm_head_hidden_done, lm_head_logits_window,
             lm_head_logits_done, group_base, tp_rank, rank, draft_main_proj_weight[rank],
             draft_main_norm_weight[rank], draft_embedding_weight[rank],
             draft_block_tables[rank],
-            draft_rope_cos_candidates[rank], draft_rope_sin_candidates[rank],
             draft_hc_attn_fn[rank], draft_hc_attn_scale[rank],
             draft_hc_attn_base[rank], draft_attn_norm_w[rank], draft_wq_a[rank],
             draft_wq_b[rank], draft_wq_b_scale[rank], draft_wkv[rank],

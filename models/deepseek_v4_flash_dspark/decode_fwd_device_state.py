@@ -87,7 +87,7 @@ from dspark_device_state import (
     STATE_META_WIDTH as DSPARK_STATE_META_WIDTH,
     STATE_TOKEN_WIDTH as DSPARK_STATE_TOKEN_WIDTH,
     accept_target_into_device_state,
-    prepare_target_from_device_state,
+    prepare_target_from_device_state_l2,
 )
 
 
@@ -448,7 +448,13 @@ def decode_fwd(
     tp_rank: pl.Scalar[pl.INT32],
     my_rank: pl.Scalar[pl.INT32],
 ):
-    """Run the fixed 2-SWA, 21-CSA, 20-HCA model in one rank child."""
+    """Run target verification from metadata already prepared for this step.
+
+    The fused DSpark program prepares the complete TP-group state once before
+    entering this body.  The standalone L3 below preserves the historical
+    behavior by scheduling ``prepare_target_from_device_state`` immediately
+    before this prepared body.
+    """
     embed_weight.bind_dynamic(0, EMBED_VOCAB_DYN)
     input_ids.bind_dynamic(0, T_DYN)
     hidden_workspace.bind_dynamic(0, T_DYN)
@@ -501,18 +507,6 @@ def decode_fwd(
     drafter_target_hidden.bind_dynamic(0, T_DYN)
     drafter_context_positions.bind_dynamic(0, T_DYN)
     drafter_context_valid.bind_dynamic(0, T_DYN)
-
-    prepare_target_from_device_state(
-        state_slot_ids,
-        state_generations,
-        state_tokens,
-        state_meta,
-        input_ids,
-        position_ids_local,
-        csa_kv_seq_lens,
-        hca_kv_seq_lens,
-        accepted_counts,
-    )
 
     local_t = pl.cast(pl.tensor.dim(input_ids, 0), pl.INT32)
     owner_tokens = pl.read(num_tokens_per_owner, [my_rank])
@@ -1251,13 +1245,15 @@ def decode_fwd(
     return x_out
 
 
-# Keep one implementation available both to the standalone target L3 and to
-# the full target+drafters decode program.
-_decode_fwd_device_state_impl = decode_fwd
-decode_fwd_device_state_inline = pl.jit.inline(auto_scope=False)(
-    _decode_fwd_device_state_impl
+# Keep the prepared implementation available both as a standalone L2 and as
+# an inline body of the complete target+drafter L2.  The standalone L3 adds
+# the legacy local state-prepare task before invoking this body.
+_decode_fwd_device_state_prepared_impl = decode_fwd
+decode_fwd_device_state_prepared_inline = pl.jit.inline(auto_scope=False)(
+    _decode_fwd_device_state_prepared_impl
 )
-decode_fwd = pl.jit(auto_scope=False)(_decode_fwd_device_state_impl)
+decode_fwd_device_state_inline = decode_fwd_device_state_prepared_inline
+decode_fwd = pl.jit(auto_scope=False)(_decode_fwd_device_state_prepared_impl)
 
 
 @pl.jit.host
@@ -1507,6 +1503,22 @@ def l3_decode_fwd_device_state(
         lm_head_logits_done = pld.window(lm_head_logits_done_buf, [LM_HEAD_TP_SIZE, 1], dtype=pl.INT32)
         tp_rank = rank % TP_SIZE
         group_base = rank - tp_rank
+        # Standalone compatibility wrapper: reproduce the original target
+        # behavior while keeping the shared compute body prepare-free.  The
+        # fused DSpark L2 performs its richer TP-group prepare only once and
+        # calls ``decode_fwd_device_state_prepared_inline`` directly.
+        prepare_target_from_device_state_l2(
+            state_slot_ids[rank],
+            state_generations[rank],
+            state_tokens[rank],
+            state_meta[rank],
+            input_ids[rank],
+            position_ids_local[rank],
+            csa_kv_seq_lens[rank],
+            hca_kv_seq_lens[rank],
+            accepted_counts[rank],
+            device=rank,
+        )
         decode_fwd(
             embed_weight[rank],
             hc_attn_fn[rank], hc_attn_scale[rank], hc_attn_base[rank],

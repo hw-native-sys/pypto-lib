@@ -6,7 +6,6 @@
 # INCLUDING BUT NOT LIMITED TO NON-INFRINGEMENT, MERCHANTABILITY, OR FITNESS FOR A PARTICULAR PURPOSE.
 # See LICENSE in the root of the software repository for the full text of the License.
 # -----------------------------------------------------------------------------------------------------------
-# ci: devices=4
 """Compose the unchanged DSpark drafter, Markov sampler, and state commit as one L2."""
 
 import sys
@@ -19,10 +18,7 @@ import sys
 if not any(arg == "--tp" or arg.startswith("--tp=") for arg in sys.argv):
     sys.argv.extend(("--tp", "4"))
 if not any(arg == "--ep" or arg.startswith("--ep=") for arg in sys.argv):
-    # Keep the serving import at EP16, while making the standalone validation
-    # fit on the four-card CI runner.  Both paths exercise the same L2 body;
-    # only the distributed host wrapper's rank count is specialized here.
-    sys.argv.extend(("--ep", "4" if __name__ == "__main__" else "16"))
+    sys.argv.extend(("--ep", "16"))
 
 import pypto.language as pl
 import pypto.language.distributed as pld
@@ -30,9 +26,14 @@ from pypto.ir import DistributedConfig
 
 from dspark_device_state import (
     LOCAL_BATCH as DEVICE_STATE_LOCAL_BATCH,
+    STATE_ANCHOR_POSITION,
     STATE_CAPACITY,
+    STATE_DRAFT_COUNT,
+    STATE_GENERATION,
     STATE_META_WIDTH,
+    STATE_POSITION_LIMIT,
     STATE_TOKEN_WIDTH,
+    STATE_VALID,
     commit_drafts_to_device_state,
 )
 from dspark_drafter import (
@@ -523,8 +524,9 @@ def build_tensor_specs(batch: int):
         meta = torch.zeros(
             N_RANKS, STATE_CAPACITY, STATE_META_WIDTH, dtype=torch.int32
         )
-        meta[:, :batch, 0] = 1
-        meta[:, :batch, 1] = 1
+        meta[:, :batch, STATE_VALID] = 1
+        meta[:, :batch, STATE_GENERATION] = 1
+        meta[:, :batch, STATE_POSITION_LIMIT] = _drafter_module.M.max_position_embeddings
         return meta
 
     specs.extend(
@@ -624,16 +626,19 @@ def golden_dspark_draft_step_device_state(tensors):
             generation = int(tensors["state_generations"][rank, request])
             if (
                 slot >= 0
-                and int(tensors["state_meta"][rank, slot, 0]) == 1
-                and int(tensors["state_meta"][rank, slot, 1]) == generation
+                and int(tensors["state_meta"][rank, slot, STATE_VALID]) == 1
+                and int(tensors["state_meta"][rank, slot, STATE_GENERATION]) == generation
+                and int(tensors["state_meta"][rank, slot, STATE_ANCHOR_POSITION])
+                + DSPARK_QUERY_WIDTH
+                < int(tensors["state_meta"][rank, slot, STATE_POSITION_LIMIT])
             ):
                 tensors["state_tokens"][rank, slot, 1:] = tensors[
                     "draft_token_ids"
                 ][rank, request].to(tensors["state_tokens"].dtype)
-                tensors["state_meta"][rank, slot, 4] = DSPARK_QUERY_WIDTH
+                tensors["state_meta"][rank, slot, STATE_DRAFT_COUNT] = DSPARK_QUERY_WIDTH
 
 
-if __name__ == "__main__":
+def main():
     import argparse
     from golden import run
 
