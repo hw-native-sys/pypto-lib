@@ -367,9 +367,10 @@ jobs:
       github.event_name == 'pull_request' &&
       needs.detect-changes.outputs.a5_files != ''
     runs-on: [self-hosted, linux, npu-a5]
-    # Must exceed one task-submit worst case (--timeout 3600 queue wait +
-    # --max-time 900 run) plus build headroom, as in the a2a3 job.
-    timeout-minutes: 120
+    # Cases run one after another: every entry selected takes about an hour
+    # (63 cases), and this leaves room for one task-submit worst case
+    # (--timeout 3600 queue wait + --max-time 900 run) on top.
+    timeout-minutes: 180
     defaults:
       run:
         working-directory: checkout
@@ -422,18 +423,27 @@ jobs:
           echo "Entries selected for this change:" $CASES
           failed=()
           for f in $CASES; do
-            echo "::group::$f"
-            # One card. These entries specialize every shape from --tp at import,
-            # so TP1 exercises the whole operator including the TP reduction at
-            # world size one. The production TP4 shape needs a four-card borrow
-            # and stays out of the PR path.
-            task-submit --device "$DEVICE_ID" --timeout 3600 --max-time 900 \
-              --run "cd $GITHUB_WORKSPACE/checkout && source activate.sh && PYTHONPATH=$GITHUB_WORKSPACE/checkout python $f -p a5 --tp 1 --dp 1 -d \$TASK_DEVICE"
-            if [ $? -ne 0 ]; then
+            # Every --tp/--dp combination the entry accepts is one case, and
+            # a case needs TP x DP cards (.github/scripts/a5_parallel_cases.py).
+            # Only this change's entries run, so multi-card cases may borrow
+            # past this runner's device whitelist.
+            if ! matrix=$(PYTHONPATH=$GITHUB_WORKSPACE/checkout python .github/scripts/a5_parallel_cases.py "$f"); then
               failed+=("$f")
-              echo "::error file=${f}::FAIL"
+              echo "::error file=${f}::cannot read its --tp/--dp choices"
+              continue
             fi
-            echo "::endgroup::"
+            while read -r cards args; do
+              echo "::group::$f $args"
+              devnum_flag=""
+              [ "$cards" -gt 1 ] && devnum_flag="--device-num $cards --ignore-whitelist"
+              task-submit --device "$DEVICE_ID" $devnum_flag --timeout 3600 --max-time 900 \
+                --run "cd $GITHUB_WORKSPACE/checkout && source activate.sh && PYTHONPATH=$GITHUB_WORKSPACE/checkout python $f -p a5 $args -d \$TASK_DEVICE" < /dev/null
+              if [ $? -ne 0 ]; then
+                failed+=("$f $args")
+                echo "::error file=${f}::FAIL ($args)"
+              fi
+              echo "::endgroup::"
+            done <<< "$matrix"
           done
           if [ ${#failed[@]} -ne 0 ]; then
             printf 'FAILED: %s\n' "${failed[@]}"

@@ -164,8 +164,6 @@ def main():
     parser = argparse.ArgumentParser(description="DeepSeek V4.1 mHC pre validation")
     parser.add_argument("-p", "--platform", default="a5", choices=["a5", "a5sim"])
     parser.add_argument("-d", "--device", type=int, default=0)
-    parser.add_argument("--tp", type=int, default=1, choices=[1, 2, 4])
-    parser.add_argument("--dp", type=int, default=1, choices=[1, 2])
     parser.add_argument("--batch", type=int, default=2)
     parser.add_argument("--sequence", type=int, default=1)
     parser.add_argument("--compile-only", action="store_true")

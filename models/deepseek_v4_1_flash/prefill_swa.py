@@ -82,19 +82,23 @@ def prefill_swa(
     window_cache_scale: pl.Tensor[[ORI_BLOCKS_DYN, 128, 1, HEAD_DIM // WINDOW_CACHE_GROUP], pl.FP8E8M0],
     output_window: pld.DistributedTensor[[PREFILL_MAX_TOKENS, D], pl.FP32],
     output_arrived: pld.DistributedTensor[[TP_SIZE, 1], pl.INT32],
+    hidden: pl.Tensor[[T_DYN, D], pl.BF16],
+    attn_out: pl.Tensor[[T_DYN, D], pl.BF16],
     output: pl.Tensor[[T_DYN, HC_MULT, D], pl.FP32],
     group_base: pl.Scalar[pl.INT32],
     tp_rank: pl.Scalar[pl.INT32],
     num_tokens: pl.Scalar[pl.INT32],
     attention_epoch: pl.Scalar[pl.INT32],
 ):
-    """Collapse HC streams, run packed SWA, then expand the residual."""
+    """Collapse HC streams, run packed SWA, then expand the residual.
+
+    ``hidden`` (the collapsed attention input) and ``attn_out`` (the TP-reduced attention
+    output) are caller workspace, so each stage can be validated on its own input.
+    """
     tokens = pl.tensor.dim(x_hc, 0)
     pre_mix = pl.create_tensor([tokens, HC_MULT], dtype=pl.FP32)
     post_mix = pl.create_tensor([tokens, HC_MULT], dtype=pl.FP32)
     residual_mix = pl.create_tensor([tokens, HC_MULT, HC_MULT], dtype=pl.FP32)
-    hidden = pl.create_tensor([tokens, D], dtype=pl.BF16)
-    attn_out = pl.create_tensor([tokens, D], dtype=pl.BF16)
     mhc_mixes(x_hc, hc_attn_fn, hc_attn_scale, hc_attn_base, pre_mix, post_mix, residual_mix)
     mhc_pre(x_hc, pre_mix, hidden)
     prefill_attn_swa(
@@ -195,6 +199,8 @@ def make_hc_program(capacity, world_size, epochs):
         window_cache: pl.InOut[pl.Tensor[[ORI_BLOCKS_DYN, 128, 1, HEAD_DIM], pl.FP8E4M3FN]],
         window_cache_scale: pl.InOut[pl.Tensor[[ORI_BLOCKS_DYN, 128, 1, HEAD_DIM // WINDOW_CACHE_GROUP], pl.FP8E8M0]],
         output: pl.Out[pl.Tensor[[T_DYN, HC_MULT, D], pl.FP32]],
+        hidden: pl.Out[pl.Tensor[[T_DYN, D], pl.BF16]],
+        attn_out: pl.Out[pl.Tensor[[T_DYN, D], pl.BF16]],
         output_window: pld.DistributedTensor[[capacity, D], pl.FP32],
         output_arrived: pld.DistributedTensor[[TP_SIZE, 1], pl.INT32],
         rank: pl.Scalar[pl.INT32],
@@ -210,10 +216,10 @@ def make_hc_program(capacity, world_size, epochs):
                 wq_a, wq_a_scale, q_norm_weight, wq_b, wq_b_scale,
                 wkv, wkv_scale, kv_norm_weight, attn_sink, wo_a, wo_b, wo_b_scale,
                 rope_cos, rope_sin, window_slots, window_indices, window_cache, window_cache_scale,
-                output_window, output_arrived, output,
+                output_window, output_arrived, hidden, attn_out, output,
                 rank // TP_SIZE * TP_SIZE, rank % TP_SIZE, num_tokens, attention_epoch + step,
             )
-        return output, window_cache, window_cache_scale
+        return output, hidden, attn_out, window_cache, window_cache_scale
 
     @pl.jit.host
     def swa_group(
@@ -240,6 +246,8 @@ def make_hc_program(capacity, world_size, epochs):
         window_cache: pl.InOut[pl.Tensor[[world_size, ORI_BLOCKS_DYN, 128, 1, HEAD_DIM], pl.FP8E4M3FN]],
         window_cache_scale: pl.InOut[pl.Tensor[[world_size, ORI_BLOCKS_DYN, 128, 1, HEAD_DIM // WINDOW_CACHE_GROUP], pl.FP8E8M0]],
         output: pl.Out[pl.Tensor[[world_size, T_DYN, HC_MULT, D], pl.FP32]],
+        hidden: pl.Out[pl.Tensor[[world_size, T_DYN, D], pl.BF16]],
+        attn_out: pl.Out[pl.Tensor[[world_size, T_DYN, D], pl.BF16]],
         num_tokens: pl.Scalar[pl.INT32],
         attention_epoch: pl.Scalar[pl.INT32],
     ):
@@ -257,7 +265,8 @@ def make_hc_program(capacity, world_size, epochs):
                 wkv[rank], wkv_scale[rank], kv_norm_weight[rank], attn_sink[rank],
                 wo_a[rank], wo_b[rank], wo_b_scale[rank], rope_cos[rank], rope_sin[rank],
                 window_slots[rank], window_indices[rank], window_cache[rank], window_cache_scale[rank],
-                output[rank], data, signal, rank, num_tokens, attention_epoch, device=rank,
+                output[rank], hidden[rank], attn_out[rank], data, signal, rank, num_tokens, attention_epoch,
+                device=rank,
             )
 
     return swa_group
@@ -331,16 +340,32 @@ def build_hc_specs(args):
     specs = [TensorSpec(name, [world_size, *shape], dtype, init_value=lambda n=name: initialize(n), resident="stacked")
              for name, shape, dtype in zip(HC_INPUT_NAMES, shapes, dtypes)]
     specs += [TensorSpec("output", [world_size, args.tokens, HC_MULT, D], torch.float32, resident="stacked"),
+              TensorSpec("hidden", [world_size, args.tokens, D], bf, resident="stacked"),
+              TensorSpec("attn_out", [world_size, args.tokens, D], bf, resident="stacked"),
               ScalarSpec("num_tokens", torch.int32, args.tokens),
               ScalarSpec("attention_epoch", torch.int32, 1, compile_runtime=True,
                          benchmark_step=args.epochs if args.bench else None)]
     return specs
 
 
-def golden_prefill_swa_case(tensors):
-    """Reference each TP shard independently, reduce, then expand HC residuals."""
+def reference_attention(tensors, hidden, base):
+    """One TP group's SWA on ``hidden``: the FP32 TP sum in BF16 and each rank's (cache, scale)."""
     from models.deepseek_v4_1_flash.decode_swa import official_reference
 
+    partials, caches = [], []
+    for rank in range(base, base + TP_SIZE):
+        inputs = {name: tensors[name][rank] for name in HC_INPUT_NAMES if name not in (
+            "x_hc", "hc_attn_fn", "hc_attn_scale", "hc_attn_base",
+        )}
+        inputs["x"] = hidden
+        partial, cache, scale = official_reference(inputs)
+        partials.append(partial)
+        caches.append((cache, scale))
+    return sum(partials).bfloat16(), caches
+
+
+def golden_prefill_swa_case(tensors):
+    """Reference each TP shard independently, reduce, then expand HC residuals."""
     world_size = tensors["x_hc"].shape[0]
     for base in range(0, world_size, TP_SIZE):
         pre_mix, post_mix, residual_mix = golden_mhc_mixes(
@@ -348,19 +373,107 @@ def golden_prefill_swa_case(tensors):
             tensors["hc_attn_scale"][base], tensors["hc_attn_base"][base],
         )
         hidden = golden_mhc_pre(tensors["x_hc"][base], pre_mix)
-        partials = []
-        for rank in range(base, base + TP_SIZE):
-            inputs = {name: tensors[name][rank] for name in HC_INPUT_NAMES if name not in (
-                "x_hc", "hc_attn_fn", "hc_attn_scale", "hc_attn_base",
-            )}
-            inputs["x"] = hidden
-            partial, cache, scale = official_reference(inputs)
-            partials.append(partial)
+        reduced, caches = reference_attention(tensors, hidden, base)
+        for rank, (cache, scale) in enumerate(caches, base):
             tensors["window_cache"][rank].copy_(cache)
             tensors["window_cache_scale"][rank].copy_(scale)
-        reduced = sum(partials).bfloat16()
         output = golden_mhc_post(reduced, tensors["x_hc"][base], post_mix, residual_mix)
-        tensors["output"][base:base + TP_SIZE].copy_(output.unsqueeze(0).expand(TP_SIZE, -1, -1, -1))
+        group = slice(base, base + TP_SIZE)
+        tensors["hidden"][group].copy_(hidden.unsqueeze(0).expand(TP_SIZE, -1, -1))
+        tensors["attn_out"][group].copy_(reduced.unsqueeze(0).expand(TP_SIZE, -1, -1))
+        tensors["output"][group].copy_(output.unsqueeze(0).expand(TP_SIZE, -1, -1, -1))
+
+
+# The device collapses the HC streams in another FP32 order than torch and flips isolated BF16
+# ULPs of ``hidden``; the MXFP8 attention can turn one such ULP into a percent-level move of a
+# token row. So every stage is held to its own budget on its own device input: ``hidden``
+# against the golden, the attention re-run on the device's ``hidden`` (teacher forcing), and
+# hc_post replayed on the device's ``attn_out``. A token row moving by one BF16 ULP everywhere
+# is a real error that ratio_allclose's outlier allowance would still admit, hence ROW_BUDGET.
+ROW_BUDGET = 2.0**-8
+
+
+def report(name, actual, expected):
+    """Print one stage's global and worst token-row rel L2; returns both."""
+    diff = actual.double() - expected.double()
+    reference = expected.double()
+    rel_l2 = (diff.norm() / reference.norm().clamp_min(1e-12)).item()
+    rows = diff.flatten(1).norm(dim=-1) / reference.flatten(1).norm(dim=-1).clamp_min(1e-12)
+    print(f"[PRECISION] {name} rel_l2={rel_l2:.8g} max_row_rel_l2={rows.max().item():.8g}")
+    return rel_l2, rows.max().item()
+
+
+def make_staged_compare():
+    """Stage-wise comparators: mHC pre vs golden, SWA teacher-forced, hc_post replayed."""
+    from golden import ratio_allclose
+    from models.deepseek_v4_1_flash.decode_swa import compare_distributed_cache, compare_reduced, compare_scales
+
+    bf16_close = ratio_allclose(atol=1e-4, rtol=1.0 / 128)
+    forced = {}
+
+    def teacher_forced(inputs, actual_outputs, expected_outputs):
+        """The SWA reference on the device's own ``hidden``, computed once per validation."""
+        if not forced:
+            # The golden caches already hold this call's rows, which the reference rewrites from
+            # the device's hidden before reading them; every other row is the initial cache.
+            tensors = {**inputs, "window_cache": expected_outputs["window_cache"],
+                       "window_cache_scale": expected_outputs["window_cache_scale"]}
+            hidden = actual_outputs["hidden"]
+            for name in ("attn_out", "window_cache", "window_cache_scale"):
+                forced[name] = torch.empty_like(actual_outputs[name])
+            for base in range(0, hidden.shape[0], TP_SIZE):
+                reduced, caches = reference_attention(tensors, hidden[base], base)
+                forced["attn_out"][base:base + TP_SIZE].copy_(reduced.unsqueeze(0).expand(TP_SIZE, -1, -1))
+                for rank, (cache, scale) in enumerate(caches, base):
+                    forced["window_cache"][rank].copy_(cache)
+                    forced["window_cache_scale"][rank].copy_(scale)
+        return forced
+
+    def staged(name, check):
+        def compare(actual, expected, *, inputs, actual_outputs, expected_outputs, **kwargs):
+            reference = teacher_forced(inputs, actual_outputs, expected_outputs)
+            return check(actual, reference[name], inputs=inputs, actual_outputs=actual_outputs,
+                         expected_outputs=reference, **kwargs)
+        return compare
+
+    def replicated(actual, base):
+        return all(torch.equal(actual[base], actual[rank]) for rank in range(base + 1, base + TP_SIZE))
+
+    def compare_hidden(actual, expected, **kwargs):
+        passed = True
+        for base in range(0, actual.shape[0], TP_SIZE):
+            _, worst_row = report("hidden", actual[base], expected[base])
+            passed &= bf16_close(actual[base], expected[base], **kwargs)[0] and worst_row <= ROW_BUDGET
+            passed &= replicated(actual, base)
+        return passed, f"hc_pre budget, every token row <= {ROW_BUDGET:.3g} rel L2, TP replicas identical"
+
+    def compare_attn_out(actual, expected, **kwargs):
+        for base in range(0, actual.shape[0], TP_SIZE):
+            report("attn_out(end-to-end, not gated)", actual[base], expected[base])
+        return staged("attn_out", compare_reduced)(actual, expected, **kwargs)
+
+    def compare_hc_output(actual, expected, *, inputs, actual_outputs, **kwargs):
+        passed = True
+        for base in range(0, actual.shape[0], TP_SIZE):
+            x_hc = inputs["x_hc"][base]
+            _, post_mix, residual_mix = golden_mhc_mixes(
+                x_hc, inputs["hc_attn_fn"][base], inputs["hc_attn_scale"][base], inputs["hc_attn_base"][base],
+            )
+            replay = golden_mhc_post(actual_outputs["attn_out"][base], x_hc, post_mix, residual_mix)
+            _, worst_row = report("output(hc_post replay)", actual[base], replay)
+            close, _ = bf16_close(actual[base], replay, inputs=inputs, actual_outputs=actual_outputs, **kwargs)
+            passed &= close and worst_row <= ROW_BUDGET
+            passed &= report("output(end-to-end)", actual[base], expected[base])[0] <= 0.01
+            passed &= replicated(actual, base)
+        return passed, "hc_post replay within hc_post's budget per token row; end-to-end rel L2 <= 1%"
+
+    return {
+        "hidden": compare_hidden,
+        "attn_out": compare_attn_out,
+        "window_cache": staged("window_cache", compare_distributed_cache),
+        "window_cache_scale": staged("window_cache_scale", compare_scales),
+        "output": compare_hc_output,
+    }
 
 
 def run_prefill_swa():
@@ -369,11 +482,6 @@ def run_prefill_swa():
     import os
 
     from golden import run
-    from models.deepseek_v4_1_flash.decode_swa import (
-        compare_distributed_cache,
-        compare_reduced,
-        compare_scales,
-    )
     from pypto.ir import DistributedConfig
 
     parser = argparse.ArgumentParser(description="DeepSeek V4.1 prefill SWA + mHC: A5 precision and timing")
@@ -422,8 +530,7 @@ def run_prefill_swa():
             enable_dep_gen=args.enable_dep_gen,
             ring_heap=PREFILL_ATTN_RING_HEAP,
         ),
-        compare_fn={"output": compare_reduced, "window_cache": compare_distributed_cache,
-                    "window_cache_scale": compare_scales},
+        compare_fn=make_staged_compare(),
     )
     print(f"[SWA+HC] work_dir={result.work_dir}")
     if not result.passed:
