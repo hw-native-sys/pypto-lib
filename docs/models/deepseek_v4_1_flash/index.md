@@ -52,14 +52,14 @@ Once a kernel body lands, its owner can extend the same file with the thin
 
 | Workstream | Files |
 | --- | --- |
-| Encoder SWA | `prefill_swa.py`, `decode_swa.py` |
+| Encoder SWA | `prefill_swa.py`, `decode_swa.py` (`prefill_attention_swa` wraps packed prefill SWA with mHC) |
 | Encoder C2A Full | `prefill_c2a_full.py`, `decode_c2a_full.py` |
 | Encoder C2A Reuse | `prefill_c2a_reuse.py`, `decode_c2a_reuse.py` |
 | Decoder C1A Full | `prefill_c1a_full.py`, `decode_c1a_full.py` |
 | Decoder C1A Reindex | `prefill_c1a_reindex.py`, `decode_c1a_reindex.py` |
 | Decoder C1A Reuse | `prefill_c1a_reuse.py`, `decode_c1a_reuse.py` |
 | Hierarchical indexer | `hierarchical_sparse_indexer.py` |
-| Hyper-connections | `mhc.py` |
+| Hyper-connections | `hc_mixes.py`, `hc_pre.py`, `hc_post.py` |
 | Attention TP transports | `attention_tp.py` |
 | Expert parallelism | `moe.py` |
 | Shared configuration and goldens | `config.py`, `metadata.py`, `golden.py`, `attention_common.py` |
@@ -150,6 +150,8 @@ reference-matching text.
 The implementation milestones are ordered by dependency:
 
 1. Implement and compile the attention TP all-reduce, mHC, and SWA.
+   Packed prefill SWA is wired through mHC: `mhc_mixes` → `mhc_pre` →
+   `prefill_swa` → `mhc_post`. Run `python models/deepseek_v4_1_flash/prefill_swa.py --hc`.
 2. Implement C2A Full, then validate Full-to-Reuse cache and Top-K replay.
 3. Implement C1A Full and the level-one candidate selector, then Reindex and Reuse.
 4. Implement the three-phase EP-MoE dispatch/local-expert/combine body.
