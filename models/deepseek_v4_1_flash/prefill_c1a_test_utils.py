@@ -13,11 +13,13 @@ from collections.abc import Callable
 
 import torch
 
-from golden import ScalarSpec, TensorSpec, ratio_allclose
+from golden import ScalarSpec, TensorSpec
 from models.deepseek_v4_1_flash import config as C
+from models.deepseek_v4_1_flash.attention_common import _project_output
 from models.deepseek_v4_1_flash.golden import paged_indexer, qkv_proj_rope
 from models.deepseek_v4_1_flash.quantization import (
     dequantize_mxfp4_cache,
+    dequantize_mxfp8_cache,
     pack_mx_b_scale,
     quantize_mxfp4_cache,
     quantize_mxfp8_cache,
@@ -30,9 +32,10 @@ CASE_MAX_TOKENS = 128
 CASE_PAGE = 128
 CASE_NAMES = (CASE_DEFAULT, "causal", "mixed", "long")
 
-OUTPUT_ATOL = 1e-2
-OUTPUT_RTOL = 1e-2
-OUTPUT_MAX_ERROR_RATIO = 0.01
+OUTPUT_RMS_ATOL = 1e-6
+OUTPUT_RMS_RTOL = 0.01
+OUTPUT_PEAK_ATOL = 1e-5
+OUTPUT_PEAK_RMS_RATIO = 0.05
 CACHE_MAX_RELATIVE_L2 = 0.01
 MXFP4_CACHE_MAX_RELATIVE_L2 = 0.04
 TOPK_SCORE_ATOL = 5e-5
@@ -272,6 +275,61 @@ def _copy_storage(destination: torch.Tensor, source: torch.Tensor) -> None:
     destination.view(torch.uint8).copy_(source.contiguous().view(torch.uint8))
 
 
+def golden_prefill_c1a_attention(
+    query: torch.Tensor,
+    window_cache: torch.Tensor,
+    window_indices: torch.Tensor,
+    compressed_cache: torch.Tensor,
+    compressed_indices: torch.Tensor,
+    sink: torch.Tensor,
+) -> torch.Tensor:
+    """Mirror C1A tiled online softmax, BF16 PV, and its FP32 first-vector patch."""
+    from models.deepseek_v4_1_flash.prefill_c1a_common import ATTENTION_TILE, M_TILE
+
+    output = torch.empty_like(query)
+    width = query.shape[-1]
+    for token in range(query.shape[0]):
+        q = query[token].float()
+        maximum = q.new_full((q.shape[0],), -1e30)
+        denominator = q.new_zeros(q.shape[0])
+        numerator = torch.zeros_like(q)
+        for cache, indices in ((window_cache, window_indices), (compressed_cache, compressed_indices)):
+            flat_cache = cache.flatten(0, 1).squeeze(-2)
+            for begin in range(0, indices.shape[-1], ATTENTION_TILE):
+                rows = indices[token, begin:begin + ATTENTION_TILE].long()
+                valid = rows >= 0
+                if not bool(valid.any()):
+                    continue
+                kv = flat_cache[rows.clamp_min(0)].clone()
+                kv[~valid] = 0
+                scores = torch.matmul(q, kv.float().T) * width**-0.5
+                scores = scores + (valid.float() - 1).unsqueeze(0) * 1e30
+                next_maximum = torch.maximum(maximum, scores.amax(dim=-1))
+                correction = torch.exp(maximum - next_maximum)
+                probability = torch.exp(scores - next_maximum.unsqueeze(-1)) * valid.unsqueeze(0)
+                denominator = denominator * correction + probability.sum(dim=-1)
+                weighted = torch.matmul(probability.to(torch.bfloat16).float(), kv.float())
+                # The first head in each M_TILE group uses the Vec PV correction for 16 columns.
+                weighted[::M_TILE, :16] = (
+                    probability[::M_TILE].unsqueeze(-1) * kv[:, :16].float().unsqueeze(0)
+                ).sum(dim=1)
+                numerator = numerator * correction.unsqueeze(-1) + weighted
+                maximum = next_maximum
+        final_maximum = torch.maximum(maximum, sink.float())
+        correction = torch.exp(maximum - final_maximum)
+        denominator = denominator * correction + torch.exp(sink.float() - final_maximum)
+        output[token] = (numerator * (correction / denominator).unsqueeze(-1)).to(query.dtype)
+    return output
+
+
+def _reduce_tp_partials(partials: list[torch.Tensor]) -> torch.Tensor:
+    """Sum rank partials in rank order and round the completed reduction to BF16."""
+    reduced = torch.zeros_like(partials[0], dtype=torch.float32)
+    for partial in partials:
+        reduced.add_(partial.float())
+    return reduced.to(torch.bfloat16)
+
+
 def apply_distributed_golden(mode: str, golden_fn: Callable, tensors: dict[str, torch.Tensor]) -> None:
     parameter_names = tuple(inspect.signature(golden_fn).parameters)
     results = []
@@ -279,8 +337,8 @@ def apply_distributed_golden(mode: str, golden_fn: Callable, tensors: dict[str, 
         kwargs = {name: tensors[name][rank] for name in parameter_names}
         results.append(golden_fn(**kwargs))
 
-    reduced = torch.stack([result.output.float() for result in results]).sum(dim=0)
-    tensors["output"][:] = reduced.to(torch.bfloat16).unsqueeze(0)
+    reduced = _reduce_tp_partials([result.output for result in results])
+    tensors["output"][:] = reduced.unsqueeze(0)
     for rank, result in enumerate(results):
         tensors["window_cache"][rank].copy_(result.window_cache)
         _copy_storage(tensors["window_cache_scale"][rank], result.window_cache_scale)
@@ -353,12 +411,18 @@ def topk_indices_compare(mode: str) -> Callable:
         atol: float,
     ) -> tuple[bool, str]:
         del rtol, atol
+        if actual.shape != expected.shape or actual.dtype != expected.dtype:
+            return False, "    Top-K shape and dtype must match the reference"
+        if bool((actual < -1).any()):
+            return False, "    Top-K padding must use -1"
+        valid = actual >= 0
+        if bool((valid[..., 1:] & ~valid[..., :-1]).any()):
+            return False, "    Top-K padding must follow all valid indices"
         if torch.equal(actual, expected):
             return True, ""
 
-        for rank in range(C.TP_SIZE):
-            score_outputs = actual_outputs if mode == "full" else expected_outputs
-            scores = _golden_index_scores(mode, rank, score_outputs, inputs)
+        for rank in range(actual.shape[0]):
+            scores = None
             for token in range(actual.shape[1]):
                 actual_row = actual[rank, token]
                 expected_row = expected[rank, token]
@@ -372,15 +436,21 @@ def topk_indices_compare(mode: str) -> Callable:
                 if torch.unique(actual_valid).numel() != actual_valid.numel():
                     return False, f"    rank {rank} token {token} contains duplicate indices"
 
+                physical_to_logical = _physical_to_logical(inputs, rank, token)
+                if any(row not in physical_to_logical for row in actual_valid.tolist()):
+                    return False, f"    rank {rank} token {token} selected a row outside its request"
+                positions = [physical_to_logical[row] for row in actual_valid.tolist()]
+                if any(left >= right for left, right in zip(positions, positions[1:])):
+                    return False, f"    rank {rank} token {token} indices must follow logical position order"
                 actual_set = set(actual_valid.tolist())
                 expected_set = set(expected_valid.tolist())
                 if actual_set == expected_set:
                     continue
-                physical_to_logical = _physical_to_logical(inputs, rank, token)
                 missing = sorted(expected_set - actual_set)
                 extra = sorted(actual_set - expected_set)
-                if any(row not in physical_to_logical for row in extra):
-                    return False, f"    rank {rank} token {token} selected a row outside its request"
+                if scores is None:
+                    score_outputs = actual_outputs if mode == "full" else expected_outputs
+                    scores = _golden_index_scores(mode, rank, score_outputs, inputs)
                 missing_logical = torch.tensor(
                     [physical_to_logical[row] for row in missing],
                     dtype=torch.int64,
@@ -408,9 +478,99 @@ def topk_indices_compare(mode: str) -> Callable:
     return compare
 
 
-def attention_output_compare() -> Callable:
-    return ratio_allclose(
-        atol=OUTPUT_ATOL,
-        rtol=OUTPUT_RTOL,
-        max_error_ratio=OUTPUT_MAX_ERROR_RATIO,
+def _selected_output_reference(
+    inputs: dict[str, torch.Tensor],
+    expected_outputs: dict[str, torch.Tensor],
+    selected: torch.Tensor,
+) -> torch.Tensor:
+    """Evaluate validated selections against reference cache values and original weights."""
+    partials = []
+    for rank in range(selected.shape[0]):
+        def tensor(name: str) -> torch.Tensor:
+            source = expected_outputs if name in expected_outputs else inputs
+            return source[name][rank]
+
+        query, _, _ = qkv_proj_rope(
+            tensor("x"), tensor("wq_a"), tensor("wq_a_scale"), tensor("q_norm_weight"),
+            tensor("wq_b"), tensor("wq_b_scale"), tensor("wkv"), tensor("wkv_scale"),
+            tensor("kv_norm_weight"), tensor("rope_cos"), tensor("rope_sin"),
+        )
+        window = dequantize_mxfp8_cache(tensor("window_cache"), tensor("window_cache_scale"))
+        compressed = dequantize_mxfp4_cache(
+            tensor("compressed_cache"), tensor("compressed_cache_scale"),
+            group_size=C.COMPRESSED_CACHE_GROUP, scale_format="e4m3",
+        )
+        attended = golden_prefill_c1a_attention(
+            query, window.to(query.dtype), tensor("window_indices"),
+            compressed.to(query.dtype), selected[rank], tensor("attn_sink"),
+        )
+        partials.append(_project_output(
+            attended, tensor("rope_cos"), tensor("rope_sin"), tensor("wo_a"),
+            tensor("wo_b"), tensor("wo_b_scale"), output_dtype=torch.float32,
+        ))
+    return _reduce_tp_partials(partials).unsqueeze(0).expand_as(expected_outputs["output"])
+
+
+def _compare_attention_rows(actual: torch.Tensor, expected: torch.Tensor) -> tuple[bool, str]:
+    """Bound RMS and peak errors separately for every rank/token row."""
+    if actual.shape != expected.shape or actual.dtype != expected.dtype or actual.numel() == 0:
+        return False, "    output shapes and dtypes must match and contain at least one row"
+    actual = actual.double()
+    expected = expected.double()
+    if not bool(torch.isfinite(actual).all() and torch.isfinite(expected).all()):
+        return False, "    output and reference must be finite"
+    error = actual - expected
+    reference_rms = expected.square().mean(dim=-1).sqrt()
+    error_rms = error.square().mean(dim=-1).sqrt()
+    error_peak = error.abs().amax(dim=-1)
+    rms_limit = OUTPUT_RMS_ATOL + OUTPUT_RMS_RTOL * reference_rms
+    peak_limit = OUTPUT_PEAK_ATOL + OUTPUT_PEAK_RMS_RATIO * reference_rms
+    bad = (error_rms > rms_limit) | (error_peak > peak_limit)
+    denominator = reference_rms.clamp_min(OUTPUT_RMS_ATOL)
+    print(
+        f"[PRECISION] output max_row_rel_l2={float((error_rms / denominator).max()):.8g} "
+        f"max_peak_over_rms={float((error_peak / denominator).max()):.8g} "
+        f"bad_rows={int(bad.sum())}/{bad.numel()}"
     )
+    if not bool(bad.any()):
+        return True, ""
+    index = tuple(int(value) for value in torch.nonzero(bad, as_tuple=False)[0])
+    return False, (
+        f"    rank/token {index}: error RMS {float(error_rms[index]):.8g} "
+        f"exceeds limit {float(rms_limit[index]):.8g} or peak {float(error_peak[index]):.8g} "
+        f"exceeds limit {float(peak_limit[index]):.8g}; "
+        f"reference RMS={float(reference_rms[index]):.8g}"
+    )
+
+
+def attention_output_compare(mode: str) -> Callable:
+    """Validate selection quality before comparing the selected output with strict row bounds."""
+    if mode not in ("full", "reindex", "reuse"):
+        raise ValueError(f"unsupported C1A attention mode: {mode}")
+
+    def compare(
+        actual: torch.Tensor,
+        expected: torch.Tensor,
+        *,
+        actual_outputs: dict[str, torch.Tensor],
+        expected_outputs: dict[str, torch.Tensor],
+        inputs: dict[str, torch.Tensor],
+        rtol: float,
+        atol: float,
+    ) -> tuple[bool, str]:
+        reference = expected
+        if mode != "reuse":
+            selected = actual_outputs["topk_indices"]
+            nominal = expected_outputs["topk_indices"]
+            valid, detail = topk_indices_compare(mode)(
+                selected, nominal, actual_outputs=actual_outputs,
+                expected_outputs=expected_outputs, inputs=inputs, rtol=rtol, atol=atol,
+            )
+            if not valid:
+                return False, f"    output reference rejected invalid Top-K: {detail.strip()}"
+            if not torch.equal(selected, nominal):
+                reference = _selected_output_reference(inputs, expected_outputs, selected)
+        return _compare_attention_rows(actual, reference)
+
+    compare.__name__ = "c1a_output_row_rms_and_peak"
+    return compare

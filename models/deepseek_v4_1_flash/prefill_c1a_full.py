@@ -58,6 +58,7 @@ from models.deepseek_v4_1_flash.prefill_c1a_test_utils import (
     MXFP4_CACHE_MAX_RELATIVE_L2,
     apply_distributed_golden,
     attention_output_compare,
+    golden_prefill_c1a_attention,
     make_tensor_specs,
     topk_indices_compare,
 )
@@ -143,6 +144,7 @@ def golden_prefill_c1a_full(
     index_wq_b_scale: torch.Tensor,
     index_weights_proj: torch.Tensor,
 ) -> AttentionGoldenResult:
+    """Return one rank's FP32 partial output and reference cache state."""
     return golden_compressed_attention(
         mode=AttentionMode.FULL,
         ratio=1,
@@ -188,6 +190,8 @@ def golden_prefill_c1a_full(
         index_block_table=index_block_table,
         request_ids=request_ids,
         candidate_mask=None,
+        attention_fn=golden_prefill_c1a_attention,
+        output_dtype=torch.float32,
     )
 
 
@@ -624,7 +628,7 @@ if __name__ == _SCRIPT_ENTRY_POINT:
             "enable_chip_swimlane": args.enable_chip_swimlane,
         },
         compare_fn={
-            "output": attention_output_compare(),
+            "output": attention_output_compare("full"),
             "window_cache": window_cache_compare,
             "window_cache_scale": window_cache_compare,
             "compressed_cache": compressed_cache_compare,

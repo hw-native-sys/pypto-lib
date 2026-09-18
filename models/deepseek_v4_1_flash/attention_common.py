@@ -58,14 +58,16 @@ def _project_output(
     wo_a: torch.Tensor,
     wo_b: torch.Tensor,
     wo_b_scale: torch.Tensor | None,
+    *,
+    output_dtype: torch.dtype | None = None,
 ) -> torch.Tensor:
     rope_dim = cos.shape[-1] * 2
     tail = rope_interleave(attended[..., -rope_dim:], cos, sin, inverse=True)
     attended = torch.cat((attended[..., :-rope_dim], tail), dim=-1)
     groups = wo_a.shape[0]
     grouped = attended.flatten(-2).unflatten(-1, (groups, -1))
-    latent = torch.einsum("tgd,grd->tgr", grouped, wo_a)
-    return mxfp8_linear(latent.flatten(-2), wo_b, wo_b_scale)
+    latent = torch.einsum("tgd,grd->tgr", grouped.float(), wo_a.float()).to(attended.dtype)
+    return mxfp8_linear(latent.flatten(-2), wo_b, wo_b_scale, output_dtype=output_dtype)
 
 
 def _copy_cache_rows(destination: torch.Tensor, source: torch.Tensor, rows: torch.Tensor) -> None:
@@ -270,6 +272,8 @@ def golden_compressed_attention(
     index_block_table: torch.Tensor | None,
     request_ids: torch.Tensor | None,
     candidate_mask: torch.Tensor | None,
+    attention_fn: Callable | None = None,
+    output_dtype: torch.dtype | None = None,
 ) -> AttentionGoldenResult:
     """Evaluate C2A/C1A full, reindex, or reuse with paged cache state."""
     query, window_kv, query_latent = qkv_proj_rope(
@@ -409,10 +413,13 @@ def golden_compressed_attention(
     if topk_indices is None:
         raise ValueError("reuse mode requires published compressed Top-K indices")
 
-    attended = paged_sparse_attention(
+    attend = attention_fn or paged_sparse_attention
+    attended = attend(
         query, quantized_window, window_indices, quantized_compressed, topk_indices, attn_sink
     )
-    output = _project_output(attended, rope_cos, rope_sin, wo_a, wo_b, wo_b_scale)
+    output = _project_output(
+        attended, rope_cos, rope_sin, wo_a, wo_b, wo_b_scale, output_dtype=output_dtype
+    )
     return AttentionGoldenResult(
         output,
         window_payload,

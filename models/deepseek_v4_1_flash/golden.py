@@ -80,7 +80,8 @@ def compressor_ratio1(
     norm_weight: torch.Tensor,
 ) -> torch.Tensor:
     """Reference the ratio-1 compressor: projection followed by RMSNorm."""
-    return rms_norm(torch.matmul(x, wkv), norm_weight)
+    projected = torch.matmul(x.float(), wkv.float()).to(x.dtype)
+    return rms_norm(projected, norm_weight)
 
 
 def compressor_ratio2(
@@ -243,10 +244,11 @@ def paged_indexer(
     q = mxfp8_linear(qr, wq_b, wq_b_scale).unflatten(-1, (index_heads, index_dim))
     rd = cos.shape[-1] * 2
     q = torch.cat((q[..., :-rd], rope_interleave(q[..., -rd:], cos, sin)), dim=-1)
-    weights = torch.matmul(x, weights_proj)
-    weights = weights * index_dim**-0.5 * index_heads**-0.5
-    scores = torch.einsum("thd,tkd->thk", q.float(), keys.float()).relu()
-    scores = (scores * weights.float().unsqueeze(-1)).sum(dim=-2)
+    weights = torch.matmul(x.float(), weights_proj.float()).to(x.dtype)
+    weights = (weights.float() * (index_dim**-0.5 * index_heads**-0.5)).to(x.dtype)
+    dots = torch.einsum("thd,tkd->thk", q.float(), keys.float()).to(q.dtype)
+    weighted = (dots.float().relu() * weights.float().unsqueeze(-1)).to(q.dtype)
+    scores = weighted.float().sum(dim=-2).to(q.dtype).float()
     valid_positions = positions.unsqueeze(0) < compressed_lens.to(torch.long).unsqueeze(-1)
     scores = scores.masked_fill(~valid_positions, -torch.inf)
     if candidates is not None:
@@ -256,8 +258,9 @@ def paged_indexer(
     logical = scores.topk(count, dim=-1, sorted=False).indices.sort(dim=-1).values
     selected_scores = scores.gather(-1, logical)
     selected_rows = physical_rows.gather(-1, logical)
-    selected_rows = torch.where(torch.isfinite(selected_scores), selected_rows, -1).to(torch.int32)
-    physical[:, :count] = selected_rows
+    for token in range(x.shape[0]):
+        valid_rows = selected_rows[token, torch.isfinite(selected_scores[token])].to(torch.int32)
+        physical[token, :valid_rows.numel()] = valid_rows
     return scores, physical
 
 
@@ -269,7 +272,8 @@ def index_key(
     sin: torch.Tensor,
 ) -> torch.Tensor:
     """Project an unrotated compressor latent into a rotated index key."""
-    key = rms_norm(torch.matmul(latent, wk), norm_weight)
+    projected = torch.matmul(latent.float(), wk.float()).to(latent.dtype)
+    key = rms_norm(projected, norm_weight)
     rd = cos.shape[-1] * 2
     return torch.cat((key[..., :-rd], rope_interleave(key[..., -rd:], cos, sin)), dim=-1)
 

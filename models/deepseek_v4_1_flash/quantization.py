@@ -228,9 +228,13 @@ def mxfp8_linear(
     x: torch.Tensor,
     weight: torch.Tensor,
     packed_weight_scale: torch.Tensor | None,
+    *,
+    output_dtype: torch.dtype | None = None,
 ) -> torch.Tensor:
-    """Evaluate a native or dynamically quantized input-major linear projection."""
+    """Evaluate a linear projection with an optional explicit output dtype."""
     if packed_weight_scale is None:
+        if output_dtype is not None:
+            return torch.matmul(x.float(), weight.float()).to(output_dtype)
         return torch.matmul(x, weight)
     activation, activation_scale = _quantize_mxfp8_activation(x)
     logical_scale = unpack_mx_b_scale(packed_weight_scale)
@@ -238,7 +242,7 @@ def mxfp8_linear(
     weight_groups = weight.float().unflatten(0, (-1, MX_GROUP))
     partials = torch.einsum("...gk,gkn->...gn", activation.float(), weight_groups)
     partials = partials * activation_scale.unsqueeze(-1) * weight_scale
-    return partials.sum(dim=-2).to(x.dtype)
+    return partials.sum(dim=-2).to(output_dtype or x.dtype)
 
 
 # E8M0 has no native dtype in some PyTorch versions, so it is always carried as uint8.

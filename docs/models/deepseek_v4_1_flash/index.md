@@ -136,6 +136,43 @@ scales in HBM. The planned kernel loads one FP4 tile, casts that tile to FP8 in
 on-chip memory, and uses the supported MXFP8 Cube path with dynamically
 quantized activations; it does not expand the complete expert tensor.
 
+The paged-attention Torch reference accumulates the BF16 compressor, index-key,
+index-weight, and grouped output projections in FP32. Compressor, index-key,
+and grouped output results are rounded back to the activation dtype before
+the next stage. The prefill C1A indexer rounds projected and scaled index
+weights, QK dot products, weighted scores, and the head-reduction result to
+BF16. Top-K scratch stores those rounded scores in FP32. The Torch reference
+uses the same rounding boundaries.
+This makes accumulation explicit rather than depending on the CPU backend's
+native BF16 matrix multiplication.
+
+For C1A prefill, the attention reference follows the kernel's 32-key online
+softmax tiles, BF16 probability operand for PV, and FP32 correction of the
+first 16 columns of the first head in each 16-head group. Each rank's final
+projection remains FP32 through the rank-ordered TP reduction, with one BF16
+cast after the sum.
+
+Full and Reindex validate Top-K eligibility, uniqueness, logical-position
+ordering, trailing `-1` padding, and cutoff score quality before checking
+the output. If an accepted selection differs from the nominal golden, the
+output reference is recomputed for that selection using the **reference
+cache values and original weights**. Device cache contents and output values
+do not define this reference. Reuse uses its supplied selection directly.
+
+Every output row (one token on one rank) must satisfy both bounds:
+
+```text
+RMS(actual - reference) <= 1e-6 + 0.01 * RMS(reference)
+max(abs(actual - reference)) <= 1e-5 + 0.05 * RMS(reference)
+```
+
+Non-finite values fail. There is no global outlier quota: a bad row cannot
+be diluted by other tokens or ranks, and a small number of large finite
+errors cannot bypass the peak bound. The absolute floors cover near-zero
+rows. Cache comparisons retain their separate quantization and ownership
+checks. Saved `data/out` snapshots encode the reference arithmetic and must
+be regenerated after these rounding rules change.
+
 At the maximum 1,048,576-token context, the low-bit attention cache is about
 0.94 GB per request per card, compared with about 3.37 GB for BF16. At 32
 requests this is about 30.2 GB/card instead of 107.8 GB/card. Ideal per-card

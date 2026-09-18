@@ -43,10 +43,10 @@ rotate_index_query = make_rope(INDEX_H, head_dim=INDEX_DIM, rope_dim=ROPE_DIM)
 def project_index_weights(
     x: pl.Tensor[[T_DYN, D], pl.BF16],
     weight: pl.Tensor[[D, INDEX_H], pl.BF16],
-    output: pl.Tensor[[T_DYN, INDEX_H], pl.FP32],
+    output: pl.Tensor[[T_DYN, INDEX_H], pl.BF16],
     num_tokens: pl.Scalar[pl.INT32],
 ):
-    """Project per-head index scores with the model normalization factor."""
+    """Project BF16 per-head weights with BF16 rounding before and after scaling."""
     for block in pl.spmd((num_tokens + M_TILE - 1) // M_TILE, name_hint="c1a_index_weights"):
         token = block * M_TILE
         rows = pl.min(M_TILE, num_tokens - token)
@@ -61,8 +61,10 @@ def project_index_weights(
                 weights,
                 init_cond=(width_block == 0),
             )
-        scaled = pl.mul(accumulator, INDEX_SCORE_SCALE)
-        output[token:token + M_TILE, :] = pl.set_validshape(scaled, rows, INDEX_H)
+        projected = pl.cast(accumulator, pl.BF16, mode="rint")
+        scaled = pl.mul(pl.cast(projected, pl.FP32), INDEX_SCORE_SCALE)
+        rounded = pl.cast(scaled, pl.BF16, mode="rint")
+        output[token:token + M_TILE, :] = pl.set_validshape(rounded, rows, INDEX_H)
     return output
 
 
@@ -176,7 +178,7 @@ def make_paged_indexer(use_candidates=False, direct_topk=False):
             index_query,
             num_tokens,
         )
-        index_weights = pl.create_tensor([tokens, INDEX_H], dtype=pl.FP32)
+        index_weights = pl.create_tensor([tokens, INDEX_H], dtype=pl.BF16)
         project_index_weights(x, index_weights_proj, index_weights, num_tokens)
 
         score_completion = pl.array.create(1, pl.TASK_ID)
@@ -319,14 +321,18 @@ def make_paged_indexer(use_candidates=False, direct_topk=False):
                         keys = pl.reshape(key_rows, [INDEX_SCORE_TILE, INDEX_DIM])
                         query_row = token * INDEX_H
                         query = pl.load(query_flat, [query_row, 0], [INDEX_H, INDEX_DIM])
-                        head_scores = pl.matmul(query, pl.tile.transpose_view(keys))
-                        head_scores = pl.maximum(head_scores, 0.0)
+                        dot = pl.matmul(query, pl.tile.transpose_view(keys), out_dtype=pl.FP32)
+                        head_scores = pl.cast(dot, pl.BF16, mode="rint")
+                        head_scores = pl.maximum(pl.cast(head_scores, pl.FP32), 0.0)
                         weights = pl.reshape(
                             pl.load(index_weights, [token, 0], [1, INDEX_H]),
                             [INDEX_H, 1],
                         )
-                        weighted = pl.row_expand_mul(head_scores, weights)
-                        computed_score = pl.reshape(pl.col_sum(weighted), [1, INDEX_SCORE_TILE])
+                        weighted = pl.row_expand_mul(head_scores, pl.cast(weights, pl.FP32))
+                        weighted = pl.cast(weighted, pl.BF16, mode="rint")
+                        reduced = pl.col_sum(pl.cast(weighted, pl.FP32))
+                        rounded_score = pl.cast(reduced, pl.BF16, mode="rint")
+                        computed_score = pl.reshape(pl.cast(rounded_score, pl.FP32), [1, INDEX_SCORE_TILE])
                         if use_candidates:
                             candidate_u8 = pl.load(
                                 candidate_mask,
