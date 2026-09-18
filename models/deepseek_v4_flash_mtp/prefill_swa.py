@@ -28,6 +28,7 @@ import torch
 import pypto.language.distributed as pld
 from pypto.ir import DistributedConfig
 from prefill_cp_zigzag import (
+    CP_RAW_SLOT_ROWS,
     CP_CHOICES,
     CP_SIZE,
     CP_TAIL_WINDOW_ROWS,
@@ -39,6 +40,7 @@ from prefill_cp_zigzag import (
     cp_reverse_index,
     cp_segment_layout,
 )
+from prefill_cp_exchange import _prefill_cp_raw_cache_commit
 from prefill_cp_exchange import _prefill_cp_hidden_tail_exchange_wave
 from golden import TensorSpec
 from qkv_proj_rope import build_tensor_specs as build_qkv_tensor_specs, rope_prepare
@@ -675,12 +677,16 @@ def build_metadata(cp_size: int = CP_SIZE, *, num_tokens: int | None = None, pre
     final_seg_src = final_seg_src.to(torch.int32)
     final_row_src = final_row_src.to(torch.int32)
     total = sum(lengths)
-    final_slot = torch.full((TAIL_ROWS,), -1, dtype=torch.int32)
+    final_slot = torch.full((TAIL_ROWS + 2 * cp_size * MAX_SEGMENT_TILES * TAIL_ROWS,), -1, dtype=torch.int32)
     for row in range(TAIL_ROWS):
         abs_pos = prefix + total - TAIL_ROWS + row
         if abs_pos < prefix:
             continue
         final_slot[row] = ring_phys_row(abs_pos)
+
+    for segment, length in enumerate(lengths):
+        for row in range(length):
+            final_slot[TAIL_ROWS + segment * MAX_SEGMENT_TILES * TAIL_ROWS + row] = ring_phys_row(starts[segment] + row)
 
     tensors = {
         "segment_lens": seg_lens_t,
@@ -889,7 +895,7 @@ def prefill_attention_swa(
     owner_rank_table: pl.Tensor[[NUM_SEGMENTS], pl.INT32],
     final_win_seg_src: pl.Tensor[[TAIL_ROWS], pl.INT32],
     final_win_row_src: pl.Tensor[[TAIL_ROWS], pl.INT32],
-    final_slot_mapping: pl.Tensor[[TAIL_ROWS], pl.INT32],
+    final_slot_mapping: pl.Tensor[[CP_RAW_SLOT_ROWS], pl.INT32],
     hidden_tail_window: pld.DistributedTensor[[CP_TAIL_WINDOW_ROWS, D], pl.BF16],
     ready: pld.DistributedTensor[[CP_SIZE, 1], pl.INT32],
     consumed: pld.DistributedTensor[[CP_SIZE, 1], pl.INT32],
@@ -1189,6 +1195,12 @@ def prefill_attention_swa(
         part1_active, stage1_ready_tid,
     )
 
+    cache_ready_tid = pl.system.task_dummy(deps=[raw_commit_tid, attention_done_tid])
+    raw_commit_tid = _prefill_cp_raw_cache_commit(
+        local_kv, final_slot_mapping, reverse_index, owner_rank_table,
+        hidden_tail_window, ready, consumed, kv_cache,
+        cache_owner_rank, my_rank, current_tail_epoch + 1, cache_ready_tid,
+    )
     resource_done_tid = pl.system.task_dummy(deps=[tail_exchange_tid, raw_commit_tid, attention_done_tid])
     with pl.at(level=pl.Level.CORE_GROUP, name_hint="cp_swa_rank_complete", deps=[resource_done_tid]):
         for tile in pl.range(NUM_LOCAL_TILES):
@@ -1231,7 +1243,7 @@ def prefill_cp_swa_rank(
     owner_rank_table: pl.Tensor[[NUM_SEGMENTS], pl.INT32],
     final_win_seg_src: pl.Tensor[[TAIL_ROWS], pl.INT32],
     final_win_row_src: pl.Tensor[[TAIL_ROWS], pl.INT32],
-    final_slot_mapping: pl.Tensor[[TAIL_ROWS], pl.INT32],
+    final_slot_mapping: pl.Tensor[[CP_RAW_SLOT_ROWS], pl.INT32],
     hidden_tail_window: pld.DistributedTensor[[CP_TAIL_WINDOW_ROWS, D], pl.BF16],
     ready: pld.DistributedTensor[[CP_SIZE, 1], pl.INT32],
     consumed: pld.DistributedTensor[[CP_SIZE, 1], pl.INT32],
@@ -1295,7 +1307,7 @@ def prefill_cp_swa_test(
     owner_rank_table: pl.Tensor[[NUM_SEGMENTS], pl.INT32],
     final_win_seg_src: pl.Tensor[[TAIL_ROWS], pl.INT32],
     final_win_row_src: pl.Tensor[[TAIL_ROWS], pl.INT32],
-    final_slot_mapping: pl.Tensor[[TAIL_ROWS], pl.INT32],
+    final_slot_mapping: pl.Tensor[[CP_RAW_SLOT_ROWS], pl.INT32],
     x_out: pl.Out[pl.Tensor[[CP_SIZE, LOCAL_PARTS, MAX_SEGMENT_TILES, TAIL_ROWS, HC_MULT, D], pl.FP32]],
 ):
     """Launch one CP-SWA child per rank."""
@@ -1528,6 +1540,16 @@ def golden_prefill_cp_swa(tensors):
         dst = int(tensors["final_slot_mapping"][row])
         if seg >= 0 and src_row >= 0 and dst >= 0:
             final_cache[:, dst] = logical[seg, src_row]
+    for rank in range(cp):
+        for part in range(LOCAL_PARTS):
+            segment = parts[rank][part]
+            for tile in range(MAX_SEGMENT_TILES):
+                active = int(meta["overlay_active_lengths"][rank, part, tile, 1])
+                for row in range(active):
+                    slot = TAIL_ROWS + segment * MAX_SEGMENT_TILES * TAIL_ROWS + tile * TAIL_ROWS + row
+                    destination = int(tensors["final_slot_mapping"][slot])
+                    if destination >= 0:
+                        final_cache[:, destination] = local_kvs[rank, part, tile, row]
     final_cache = final_cache.reshape_as(tensors["kv_cache"])
     for rank in range(cp):
         if rank == int(tensors["cache_owner_rank_t"][rank, 0]):

@@ -29,6 +29,7 @@ import pypto.language.distributed as pld
 from pypto.ir import DistributedConfig
 from config import PREFILL_IDX_MAX_BLOCKS
 from prefill_compressor_ratio4 import build_tensor_specs as build_compressor_tensor_specs
+from prefill_cp_exchange import _prefill_cp_raw_cache_commit
 from prefill_cp_exchange import (
     CP_CMP_BLOCK_NUM_DYN,
     INNER_STATE_DIM,
@@ -45,6 +46,7 @@ from prefill_cp_exchange import (
     _prefill_cp_csa_compact_transport_wave,
 )
 from prefill_cp_zigzag import (
+    CP_RAW_SLOT_ROWS,
     CP_CHOICES,
     CP_PREFILL_CMP_BLOCK_NUM,
     CP_SIZE,
@@ -587,12 +589,15 @@ def _build_raw_attention_metadata(cp_size: int, *, num_tokens: int | None = None
                             ] = lower_key_build(key_abs, segment, tile, starts, lengths, prefix)
 
     final_seg_src, final_row_src = cp_final_window_sources(lengths)
-    final_slot_mapping = torch.full((T,), -1, dtype=torch.int32)
+    final_slot_mapping = torch.full((T + 2 * cp_size * MAX_SEGMENT_TILES * T,), -1, dtype=torch.int32)
     total = sum(lengths)
     for row in range(T):
         position = prefix + total - T + row
         if position >= prefix:
             final_slot_mapping[row] = ring_phys_row(position)
+    for segment, length in enumerate(lengths):
+        for row in range(length):
+            final_slot_mapping[T + segment * MAX_SEGMENT_TILES * T + row] = ring_phys_row(starts[segment] + row)
     active_segments = [segment for segment, length in enumerate(lengths) if length > 0]
     final_segment = active_segments[-1]
     owner_rank_table, _ = cp_owner_tables(cp_size)
@@ -1063,16 +1068,37 @@ def _cp_csa_compress_pack_part(
                                 pl.write(record_meta, [destination, 5], logical_slot)
                                 pl.write(record_meta, [destination, 6], pl.cast(1, pl.INT32))
                                 pl.write(record_meta, [destination, 7], logical_slot)
+        with pl.at(level=pl.Level.CORE_GROUP, name_hint="cp_csa_capture_checkpoint"):
+            if leaf > 0 and active > 0:
+                checkpoint_leaf_start = pl.read(pos_leaf, [0])
+                checkpoint_end = (checkpoint_leaf_start // BLOCK_SIZE + 1) * BLOCK_SIZE
+                if checkpoint_end <= checkpoint_leaf_start + active:
+                    for checkpoint_row in pl.range(STATE_LEN):
+                        checkpoint_position = checkpoint_end - STATE_LEN + checkpoint_row
+                        checkpoint_main_page = pl.read(main_state_block_table, [checkpoint_position // MAIN_STATE_BLOCK_SIZE])
+                        checkpoint_inner_page = pl.read(inner_state_block_table, [checkpoint_position // INNER_STATE_BLOCK_SIZE])
+                        if checkpoint_main_page >= 0 and checkpoint_inner_page >= 0:
+                            checkpoint_main_source = checkpoint_main_page * MAIN_STATE_BLOCK_SIZE + checkpoint_position % MAIN_STATE_BLOCK_SIZE
+                            checkpoint_inner_source = checkpoint_inner_page * INNER_STATE_BLOCK_SIZE + checkpoint_position % INNER_STATE_BLOCK_SIZE
+                            checkpoint_destination = (leaf - 1) * STATE_LEN + checkpoint_row
+                            main_state_payload[checkpoint_destination:checkpoint_destination + 1, :] = main_state_next_flat[checkpoint_main_source:checkpoint_main_source + 1, :]
+                            inner_state_payload[checkpoint_destination:checkpoint_destination + 1, :] = inner_state_next_flat[checkpoint_inner_source:checkpoint_inner_source + 1, :]
+                            pl.write(main_state_meta, [checkpoint_destination, 0], pl.cast(1, pl.INT32))
+                            pl.write(main_state_meta, [checkpoint_destination, 1], pl.cast(checkpoint_position, pl.INT32))
+                            pl.write(main_state_meta, [checkpoint_destination, 2], pl.cast(checkpoint_position, pl.INT32))
+                            pl.write(inner_state_meta, [checkpoint_destination, 0], pl.cast(1, pl.INT32))
+                            pl.write(inner_state_meta, [checkpoint_destination, 1], pl.cast(checkpoint_position, pl.INT32))
+                            pl.write(inner_state_meta, [checkpoint_destination, 2], pl.cast(checkpoint_position, pl.INT32))
         main_state = main_state_next
         inner_state = inner_state_next
 
     main_state_flat = pl.reshape(main_state, [main_state_rows, MAIN_STATE_DIM])
     inner_state_flat = pl.reshape(inner_state, [inner_state_rows, INNER_STATE_DIM])
     with pl.at(level=pl.Level.CORE_GROUP, name_hint="cp_csa_pack_final_state", deps=[part_meta_seed_tid]):
-        if segment == final_segment:
+        if segment_active_length > 0:
             segment_end = segment_start + segment_active_length
             state_start = pl.max(segment_end - STATE_LEN, 0)
-            for state_row in pl.range(STATE_ROWS_PER_RANK):
+            for state_row in pl.range(STATE_LEN):
                 position = pl.cast(state_start + state_row, pl.INT32)
                 main_block = pl.read(main_state_block_table, [position // MAIN_STATE_BLOCK_SIZE])
                 inner_block = pl.read(inner_state_block_table, [position // INNER_STATE_BLOCK_SIZE])
@@ -1086,7 +1112,7 @@ def _cp_csa_compress_pack_part(
                         + position % INNER_STATE_BLOCK_SIZE
                     )
                     for epoch in pl.range(EPOCHS):
-                        destination = epoch * STATE_ROWS_PER_RANK + state_row
+                        destination = epoch * STATE_ROWS_PER_RANK + MAX_SEGMENT_TILES * STATE_LEN + state_row
                         main_state_payload[destination : destination + 1, :] = (
                             main_state_flat[main_source : main_source + 1, :]
                         )
@@ -1326,7 +1352,7 @@ def prefill_attention_csa(
     owner_rank_table: pl.Tensor[[NUM_SEGMENTS], pl.INT32],
     final_win_seg_src: pl.Tensor[[T], pl.INT32],
     final_win_row_src: pl.Tensor[[T], pl.INT32],
-    final_slot_mapping: pl.Tensor[[T], pl.INT32],
+    final_slot_mapping: pl.Tensor[[CP_RAW_SLOT_ROWS], pl.INT32],
     leaf_positions_input: pl.Tensor[[LOCAL_PARTS, MAX_COMPRESS_LEAVES, T], pl.INT32],
     leaf_main_slots_input: pl.Tensor[[LOCAL_PARTS, MAX_COMPRESS_LEAVES, T], pl.INT64],
     leaf_idx_slots_input: pl.Tensor[[LOCAL_PARTS, MAX_COMPRESS_LEAVES, T], pl.INT64],
@@ -1693,6 +1719,7 @@ def prefill_attention_csa(
     part_leaf_rows = MAX_COMPRESS_LEAVES * T
     leaf_num_tokens_flat = pl.reshape(leaf_num_tokens, [LOCAL_LEAVES])
     final_segment = pl.read(final_segment_t, [0])
+    state_request_end = pl.read(segment_starts_t, [final_segment]) + pl.read(segment_lengths_t, [final_segment])
 
     part0_x = pl.slice(effective_x, [part_leaf_rows, D], [0, 0])
     part0_positions = pl.slice(leaf_positions, [part_leaf_rows], [0])
@@ -1819,45 +1846,19 @@ def prefill_attention_csa(
                     pl.write(packed_record_meta, [destination1, col], pl.read(part1_record_meta, [source, col]))
 
             state_source0 = epoch * STATE_ROWS_PER_RANK
-            for row in pl.range(STATE_ROWS_PER_RANK):
+            for row in pl.range((MAX_SEGMENT_TILES + 1) * STATE_LEN):
                 state_source = state_source0 + row
-                state_destination = state_source
-                if pl.read(owner_segments_t, [0]) == final_segment:
-                    packed_main_state_payload[state_destination : state_destination + 1, :] = part0_main_state_payload[
-                        state_source : state_source + 1, :
-                    ]
-                    packed_inner_state_payload[
-                        state_destination : state_destination + 1, :
-                    ] = part0_inner_state_payload[state_source : state_source + 1, :]
-                    for col in pl.range(STATE_META_DIM):
-                        pl.write(
-                            packed_main_state_meta,
-                            [state_destination, col],
-                            pl.read(part0_main_state_meta, [state_source, col]),
-                        )
-                        pl.write(
-                            packed_inner_state_meta,
-                            [state_destination, col],
-                            pl.read(part0_inner_state_meta, [state_source, col]),
-                        )
-                if pl.read(owner_segments_t, [1]) == final_segment:
-                    packed_main_state_payload[state_destination : state_destination + 1, :] = part1_main_state_payload[
-                        state_source : state_source + 1, :
-                    ]
-                    packed_inner_state_payload[
-                        state_destination : state_destination + 1, :
-                    ] = part1_inner_state_payload[state_source : state_source + 1, :]
-                    for col in pl.range(STATE_META_DIM):
-                        pl.write(
-                            packed_main_state_meta,
-                            [state_destination, col],
-                            pl.read(part1_main_state_meta, [state_source, col]),
-                        )
-                        pl.write(
-                            packed_inner_state_meta,
-                            [state_destination, col],
-                            pl.read(part1_inner_state_meta, [state_source, col]),
-                        )
+                state_destination0 = state_source0 + row
+                state_destination1 = state_source0 + (MAX_SEGMENT_TILES + 1) * STATE_LEN + row
+                packed_main_state_payload[state_destination0 : state_destination0 + 1, :] = part0_main_state_payload[state_source : state_source + 1, :]
+                packed_inner_state_payload[state_destination0 : state_destination0 + 1, :] = part0_inner_state_payload[state_source : state_source + 1, :]
+                packed_main_state_payload[state_destination1 : state_destination1 + 1, :] = part1_main_state_payload[state_source : state_source + 1, :]
+                packed_inner_state_payload[state_destination1 : state_destination1 + 1, :] = part1_inner_state_payload[state_source : state_source + 1, :]
+                for col in pl.range(STATE_META_DIM):
+                    pl.write(packed_main_state_meta, [state_destination0, col], pl.read(part0_main_state_meta, [state_source, col]))
+                    pl.write(packed_inner_state_meta, [state_destination0, col], pl.read(part0_inner_state_meta, [state_source, col]))
+                    pl.write(packed_main_state_meta, [state_destination1, col], pl.read(part1_main_state_meta, [state_source, col]))
+                    pl.write(packed_inner_state_meta, [state_destination1, col], pl.read(part1_inner_state_meta, [state_source, col]))
 
     # Flatten the caller-owned persistent compressed pool.
     cmp_cache_rows = pl.tensor.dim(cmp_kv, 0) * pl.tensor.dim(cmp_kv, 1)
@@ -1978,7 +1979,7 @@ def prefill_attention_csa(
                     meta_row = source_state_row + state_row
                     main_valid = pl.read(main_state_meta_window, [meta_row, 0])
                     main_position = pl.read(main_state_meta_window, [meta_row, 2])
-                    if main_valid > 0 and main_position >= 0:
+                    if main_valid > 0 and main_position >= 0 and main_position >= state_request_end - main_state_rows:
                         cp_tmp_main_state_page = (1 + (main_position // BLOCK_SIZE) % CP_TMP_STATE_DATA_PAGES)
                         cp_tmp_main_state_destination = (
                             cp_tmp_main_state_page * BLOCK_SIZE
@@ -2007,7 +2008,7 @@ def prefill_attention_csa(
                                 main_state_flat[destination : destination + 1, 0:MAIN_STATE_DIM] = committed_main_state
                     inner_valid = pl.read(inner_state_meta_window, [meta_row, 0])
                     inner_position = pl.read(inner_state_meta_window, [meta_row, 2])
-                    if inner_valid > 0 and inner_position >= 0:
+                    if inner_valid > 0 and inner_position >= 0 and inner_position >= state_request_end - inner_state_rows:
                         cp_tmp_inner_state_page = (1 + (inner_position // BLOCK_SIZE) % CP_TMP_STATE_DATA_PAGES)
                         cp_tmp_inner_state_destination = (
                             cp_tmp_inner_state_page * BLOCK_SIZE
@@ -2286,6 +2287,13 @@ def prefill_attention_csa(
         out_part1, part1_active, part0_attn_tid, part1_compressed_ready_tid,
     )
 
+    cache_ready_tid = pl.system.task_dummy(deps=[raw_commit_tid, attention_done_tid])
+    raw_commit_tid = _prefill_cp_raw_cache_commit(
+        local_kv, final_slot_mapping, reverse_index, owner_rank_table,
+        hidden_tail_window, tail_ready, tail_consumed, kv_cache,
+        cache_owner_rank, my_rank, tail_comm_epoch + 1, cache_ready_tid,
+    )
+
     # §8.17.8e.2 leaf-capture completion token. Fan the four leaf-internal
     # commit/transport TaskIds into a single resource_done_tid via
     # pl.system.task_dummy (a no-op task that only waits -- idiom:
@@ -2375,7 +2383,7 @@ def prefill_cp_csa_rank(
     owner_rank_table: pl.Tensor[[NUM_SEGMENTS], pl.INT32],
     final_win_seg_src: pl.Tensor[[T], pl.INT32],
     final_win_row_src: pl.Tensor[[T], pl.INT32],
-    final_slot_mapping: pl.Tensor[[T], pl.INT32],
+    final_slot_mapping: pl.Tensor[[CP_RAW_SLOT_ROWS], pl.INT32],
     leaf_positions_input: pl.Tensor[[LOCAL_PARTS, MAX_COMPRESS_LEAVES, T], pl.INT32],
     leaf_main_slots_input: pl.Tensor[[LOCAL_PARTS, MAX_COMPRESS_LEAVES, T], pl.INT64],
     leaf_idx_slots_input: pl.Tensor[[LOCAL_PARTS, MAX_COMPRESS_LEAVES, T], pl.INT64],
@@ -2489,7 +2497,7 @@ def prefill_cp_csa_test(
     owner_rank_table: pl.Tensor[[NUM_SEGMENTS], pl.INT32],
     final_win_seg_src: pl.Tensor[[T], pl.INT32],
     final_win_row_src: pl.Tensor[[T], pl.INT32],
-    final_slot_mapping: pl.Tensor[[T], pl.INT32],
+    final_slot_mapping: pl.Tensor[[CP_RAW_SLOT_ROWS], pl.INT32],
     leaf_positions_input: pl.Tensor[[CP_SIZE, LOCAL_PARTS, MAX_COMPRESS_LEAVES, T], pl.INT32],
     leaf_main_slots_input: pl.Tensor[[CP_SIZE, LOCAL_PARTS, MAX_COMPRESS_LEAVES, T], pl.INT64],
     leaf_idx_slots_input: pl.Tensor[[CP_SIZE, LOCAL_PARTS, MAX_COMPRESS_LEAVES, T], pl.INT64],
@@ -2691,6 +2699,7 @@ def golden_prefill_cp_csa(tensors):
     cmp_published: dict[int, torch.Tensor] = {}
     idx_published: dict[int, torch.Tensor] = {}
     scale_published: dict[int, torch.Tensor] = {}
+    checkpoint_states = {}
     final_main_state = None
     final_inner_state = None
     final_owner_rank = -1
@@ -2796,6 +2805,14 @@ def golden_prefill_cp_csa(tensors):
                     "inner_state_slot_mapping": inner_state_map,
                 }
             )
+            if leaf > 0 and active > 0:
+                checkpoint_end = (int(positions[0]) // BLOCK_SIZE + 1) * BLOCK_SIZE
+                if checkpoint_end <= int(positions[0]) + active:
+                    for checkpoint_position in range(checkpoint_end - STATE_LEN, checkpoint_end):
+                        main_source = _lower_row(tensors["compress_state_block_table"][rank], checkpoint_position, MAIN_STATE_BLOCK_SIZE)
+                        inner_source = _lower_row(tensors["inner_compress_state_block_table"][rank], checkpoint_position, INNER_STATE_BLOCK_SIZE)
+                        checkpoint_states[checkpoint_position] = (main_state.view(-1, MAIN_STATE_DIM)[main_source].clone(), inner_state.view(-1, INNER_STATE_DIM)[inner_source].clone())
+
             for row in range(active):
                 local_row = int(main_map[row])
                 if local_row >= 0:
@@ -2803,6 +2820,13 @@ def golden_prefill_cp_csa(tensors):
                     cmp_published[logical_slot] = main_cache.view(-1, HEAD_DIM)[local_row].clone()
                     idx_published[logical_slot] = idx_cache.view(-1, IDX_HEAD_DIM)[local_row].clone()
                     scale_published[logical_slot] = idx_scale.view(-1, 1)[local_row].clone()
+
+        if lengths[segment] > 0:
+            segment_end = starts[segment] + lengths[segment]
+            for checkpoint_position in range(max(0, segment_end - STATE_LEN), segment_end):
+                main_source = _lower_row(tensors["compress_state_block_table"][rank], checkpoint_position, MAIN_STATE_BLOCK_SIZE)
+                inner_source = _lower_row(tensors["inner_compress_state_block_table"][rank], checkpoint_position, INNER_STATE_BLOCK_SIZE)
+                checkpoint_states[checkpoint_position] = (main_state.view(-1, MAIN_STATE_DIM)[main_source].clone(), inner_state.view(-1, INNER_STATE_DIM)[inner_source].clone())
 
         if segment == int(ctx["final_segment"]):
             final_main_state = main_state
@@ -2867,6 +2891,15 @@ def golden_prefill_cp_csa(tensors):
                 inner_state_out[receiver].view(-1, INNER_STATE_DIM)[
                     destination
                 ] = final_inner_state.view(-1, INNER_STATE_DIM)[source]
+
+    for position, values in sorted(checkpoint_states.items()):
+        for value, result, table_name, block_size, width in (
+            (values[0], main_state_out, "compress_state_block_table", MAIN_STATE_BLOCK_SIZE, MAIN_STATE_DIM),
+            (values[1], inner_state_out, "inner_compress_state_block_table", INNER_STATE_BLOCK_SIZE, INNER_STATE_DIM),
+        ):
+            if position >= final_end - result[cache_owner].numel() // width:
+                destination = _lower_row(tensors[table_name][cache_owner], position, block_size)
+                result[cache_owner].view(-1, width)[destination] = value
 
     topk_by_rank = []
     for rank in range(cp_size):
@@ -3012,6 +3045,12 @@ def golden_prefill_cp_csa(tensors):
             for rank in range(cp_size):
                 kv_out[rank].view(-1, HEAD_DIM)[destination] = value
 
+    for segment, rows in logical_kv.items():
+        for row in range(lengths[segment]):
+            destination = int(tensors["final_slot_mapping"][T + segment * MAX_SEGMENT_TILES * T + row])
+            if destination >= 0:
+                kv_out.view(cp_size, -1, HEAD_DIM)[:, destination] = rows[row]
+
     for rank in range(cp_size):
         if rank == int(tensors["cache_owner_rank_t"][rank, 0]):
             tensors["compress_state"][rank] = main_state_out[rank]
@@ -3045,6 +3084,28 @@ if __name__ == "__main__":
     device_ids = [int(device) for device in args.device.split(",")]
     if len(device_ids) < args.cp:
         raise SystemExit(f"CP{args.cp} requires {args.cp} devices, got {device_ids}")
+    def compare_raw_cache_pages(actual, expected, **kwargs):
+        """Check each written page so a large cache cannot hide missing rows."""
+        inputs = kwargs["inputs"]
+        owner = int(inputs["cache_owner_rank_t"][0, 0])
+        slots = inputs["final_slot_mapping"][T:]
+        pages = torch.unique(slots[slots >= 0] // BLOCK_SIZE).tolist()
+        compare = ratio_allclose(atol=1e-4, rtol=1.0 / 128)
+        for page in pages:
+            passed, detail = compare(actual[owner, page], expected[owner, page], **kwargs)
+            if not passed:
+                return False, f"raw cache page {page}:\n{detail}"
+        return compare(actual, expected, **kwargs)
+
+    def compare_boundary_state(actual, expected, **kwargs):
+        compare = ratio_allclose(atol=1e-2, rtol=1e-2)
+        for rank in range(actual.shape[0]):
+            for page in range(actual.shape[1]):
+                passed, details = compare(actual[rank, page], expected[rank, page], **kwargs)
+                if not passed:
+                    return False, f"state rank={rank} page={page}: {details}"
+        return compare(actual, expected, **kwargs)
+
     result = run(
         fn=prefill_cp_csa_test,
         specs=build_cp_tensor_specs(args.cp, num_tokens=args.num_tokens, prefix=args.prefix),
@@ -3062,8 +3123,10 @@ if __name__ == "__main__":
         rtol=1e-2,
         atol=1e-2,
         compare_fn={
+            "compress_state": compare_boundary_state,
+            "inner_compress_state": compare_boundary_state,
             "x_out": ratio_reldiff(diff_thd=5e-3, pct_thd=0.005, max_diff_hd=1),
-            "kv_cache": ratio_allclose(atol=1e-4, rtol=1.0 / 128),
+            "kv_cache": compare_raw_cache_pages,
             "idx_kv_cache": ratio_allclose(atol=1, rtol=0, max_error_ratio=0.01),
             "idx_kv_scale": ratio_allclose(atol=1e-4, rtol=1.0 / 128, max_error_ratio=0.01),
         },

@@ -85,10 +85,13 @@ CMP_ROWS_PER_RANK = LOCAL_PARTS * CMP_ROWS_PER_SEGMENT
 CMP_META_DIM = 8
 STATE_META_DIM = 8
 CMP_WINDOW_ROWS = CP_SIZE * CMP_ROWS_PER_RANK
-STATE_WINDOW_ROWS = CP_SIZE * TAIL_ROWS
+HCA_STATE_ROWS_PER_PART = MAX_SEGMENT_TILES * TAIL_ROWS
+HCA_STATE_ROWS_PER_RANK = LOCAL_PARTS * HCA_STATE_ROWS_PER_PART
+HCA_STATE_RECORDS = CP_SIZE * LOCAL_PARTS
+STATE_WINDOW_ROWS = CP_SIZE * HCA_STATE_ROWS_PER_RANK
 
 ROWS_PER_RANK = (LOCAL_PARTS * MAX_SEGMENT_TILES * TAIL_ROWS // CSA_COMPRESS_RATIO)
-STATE_ROWS_PER_RANK = 8
+STATE_ROWS_PER_RANK = LOCAL_PARTS * (MAX_SEGMENT_TILES + 1) * 8
 META_DIM = 8
 RECORDS_PER_WINDOW = CP_SIZE * ROWS_PER_RANK
 STATE_RECORDS_PER_WINDOW = CP_SIZE * STATE_ROWS_PER_RANK
@@ -521,8 +524,8 @@ def _prefill_cp_hca_history_exchange(
 def _prefill_cp_hca_compact_exchange_commit_wave(
     local_cmp_payload: pl.Tensor[[EPOCHS * CMP_ROWS_PER_RANK, HEAD_DIM], pl.BF16],
     local_cmp_meta: pl.Tensor[[EPOCHS * CMP_ROWS_PER_RANK, CMP_META_DIM], pl.INT32],
-    local_state_payload: pl.Tensor[[EPOCHS * TAIL_ROWS, COMPRESS_STATE_DIM], pl.FP32],
-    local_state_meta: pl.Tensor[[EPOCHS, STATE_META_DIM], pl.INT32],
+    local_state_payload: pl.Tensor[[EPOCHS * HCA_STATE_ROWS_PER_RANK, COMPRESS_STATE_DIM], pl.FP32],
+    local_state_meta: pl.Tensor[[EPOCHS * LOCAL_PARTS, STATE_META_DIM], pl.INT32],
     owner_rank_table: pl.Tensor[[NUM_SEGMENTS], pl.INT32],
     owner_part_table: pl.Tensor[[NUM_SEGMENTS], pl.INT32],
     cmp_block_table: pl.Tensor[[PREFILL_CMP_MAX_BLOCKS], pl.INT32],
@@ -530,7 +533,7 @@ def _prefill_cp_hca_compact_exchange_commit_wave(
     cmp_window: pld.DistributedTensor[[CMP_WINDOW_ROWS, HEAD_DIM], pl.BF16],
     cmp_meta_window: pld.DistributedTensor[[CMP_WINDOW_ROWS, CMP_META_DIM], pl.INT32],
     state_window: pld.DistributedTensor[[STATE_WINDOW_ROWS, COMPRESS_STATE_DIM], pl.FP32],
-    state_meta_window: pld.DistributedTensor[[CP_SIZE, STATE_META_DIM], pl.INT32],
+    state_meta_window: pld.DistributedTensor[[HCA_STATE_RECORDS, STATE_META_DIM], pl.INT32],
     ready: pld.DistributedTensor[[CP_SIZE, 1], pl.INT32],
     consumed: pld.DistributedTensor[[CP_SIZE, 1], pl.INT32],
     cmp_kv: pl.InOut[pl.Tensor[[CP_CMP_ROWS_DYN, HEAD_DIM], pl.BF16]],
@@ -563,10 +566,10 @@ def _prefill_cp_hca_compact_exchange_commit_wave(
                 pld.system.wait(signal=consumed, offsets=[peer, 0], expected=comm_epoch, cmp=pld.WaitCmp.Ge)
 
         cmp_src_row = payload_epoch * CMP_ROWS_PER_RANK
-        state_src_row = payload_epoch * TAIL_ROWS
+        state_src_row = payload_epoch * HCA_STATE_ROWS_PER_RANK
         for peer in pl.range(CP_SIZE):
             cmp_dst_row = cp_rank * CMP_ROWS_PER_RANK
-            state_dst_row = cp_rank * TAIL_ROWS
+            state_dst_row = cp_rank * HCA_STATE_ROWS_PER_RANK
             pld.tensor.put(
                 dst=cmp_window, peer=cp_group_base + peer, src=local_cmp_payload,
                 dst_offsets=[cmp_dst_row, 0], src_offsets=[cmp_src_row, 0], shape=[CMP_ROWS_PER_RANK, HEAD_DIM],
@@ -579,12 +582,12 @@ def _prefill_cp_hca_compact_exchange_commit_wave(
             )
             pld.tensor.put(
                 dst=state_window, peer=cp_group_base + peer, src=local_state_payload,
-                dst_offsets=[state_dst_row, 0], src_offsets=[state_src_row, 0], shape=[TAIL_ROWS, COMPRESS_STATE_DIM],
+                dst_offsets=[state_dst_row, 0], src_offsets=[state_src_row, 0], shape=[HCA_STATE_ROWS_PER_RANK, COMPRESS_STATE_DIM],
                 chunk_rows=ROW_TILE, chunk_cols=COMPRESS_STATE_DIM, pipeline=True,
             )
             pld.tensor.put(
                 dst=state_meta_window, peer=cp_group_base + peer, src=local_state_meta,
-                dst_offsets=[cp_rank, 0], src_offsets=[payload_epoch, 0], shape=[1, STATE_META_DIM],
+                dst_offsets=[cp_rank * LOCAL_PARTS, 0], src_offsets=[payload_epoch * LOCAL_PARTS, 0], shape=[LOCAL_PARTS, STATE_META_DIM],
                 chunk_rows=1, chunk_cols=STATE_META_DIM, pipeline=True,
             )
 
@@ -625,12 +628,13 @@ def _prefill_cp_hca_compact_exchange_commit_wave(
                                         )
                                         cmp_kv[cache_row : cache_row + 1, 0:HEAD_DIM] = cmp_row_tile
 
-        for state_owner in pl.range(CP_SIZE):
+        for state_segment in pl.range(NUM_SEGMENTS):
+            state_owner = pl.read(owner_rank_table, [state_segment]) * LOCAL_PARTS + pl.read(owner_part_table, [state_segment])
             state_valid = pl.read(state_meta_window, [state_owner, 0])
             valid_rows = pl.read(state_meta_window, [state_owner, 2])
             end_position = pl.read(state_meta_window, [state_owner, 3])
             if state_valid > 0 and my_rank == cache_owner_rank:
-                for row in pl.range(TAIL_ROWS):
+                for row in pl.range(HCA_STATE_ROWS_PER_PART):
                     if row < valid_rows:
                         absolute_position = end_position - valid_rows + row
                         if absolute_position >= 0:
@@ -640,7 +644,7 @@ def _prefill_cp_hca_compact_exchange_commit_wave(
                                     physical_block = pl.read(compress_state_block_table, [logical_block])
                                     if physical_block >= 0 and physical_block < state_blocks:
                                         intra = pl.cast(absolute_position % HCA_STATE_BLOCK_SIZE, pl.INDEX)
-                                        state_source_row = state_owner * TAIL_ROWS + row
+                                        state_source_row = state_owner * HCA_STATE_ROWS_PER_PART + row
                                         state_row_tile = pl.slice(
                                             state_window,
                                             [1, COMPRESS_STATE_DIM],
@@ -775,10 +779,10 @@ def _prefill_cp_gather_hidden(
     local_hidden: pl.Tensor[[LOCAL_ROWS, D], pl.BF16],
     local_pre_hc_hidden: pl.Tensor[[LOCAL_ROWS, CP_REQUEST_HC_DIM], pl.FP32],
     hidden_window: pld.DistributedTensor[[CP_REQUEST_CAPACITY, D], pl.BF16],
-    pre_hc_tail_window: pld.DistributedTensor[[NUM_SEGMENTS * TAIL_ROWS, CP_REQUEST_HC_DIM], pl.FP32],
+    pre_hc_window: pld.DistributedTensor[[CP_REQUEST_CAPACITY, CP_REQUEST_HC_DIM], pl.FP32],
     complete: pld.DistributedTensor[[CP_SIZE, 1], pl.INT32],
     hidden_out: pl.Tensor[[CP_REQUEST_TOKENS_DYN, D], pl.BF16],
-    pre_hc_hidden_out: pl.Tensor[[TAIL_ROWS, CP_REQUEST_HC_DIM], pl.FP32],
+    pre_hc_hidden_out: pl.Tensor[[CP_REQUEST_TOKENS_DYN, CP_REQUEST_HC_DIM], pl.FP32],
     my_rank: pl.Scalar[pl.INT32],
 ):
     with pl.at(level=pl.Level.CORE_GROUP, name_hint="prefill_gather_hidden"):
@@ -791,10 +795,12 @@ def _prefill_cp_gather_hidden(
                     zero_hidden = pl.tile.full([ROW_TILE, CP_REQUEST_COPY_COLS], value=0.0, dtype=pl.BF16)
                     zero_valid = pl.tile.set_validshape(zero_hidden, valid_rows, CP_REQUEST_COPY_COLS)
                     pl.store(zero_valid, [row_start, column * CP_REQUEST_COPY_COLS], hidden_out)
-            for row_start in pl.range(0, TAIL_ROWS, ROW_TILE):
+            for row_start in pl.range(0, output_rows, ROW_TILE):
+                valid_rows = pl.min(ROW_TILE, output_rows - row_start)
                 for column in pl.range(CP_REQUEST_HC_DIM // CP_REQUEST_COPY_COLS):
-                    zero_tail = pl.tile.full([ROW_TILE, CP_REQUEST_COPY_COLS], value=0.0, dtype=pl.FP32)
-                    pl.store(zero_tail, [row_start, column * CP_REQUEST_COPY_COLS], pre_hc_hidden_out)
+                    zero_pre_hc = pl.tile.full([ROW_TILE, CP_REQUEST_COPY_COLS], value=0.0, dtype=pl.FP32)
+                    zero_pre_hc_valid = pl.tile.set_validshape(zero_pre_hc, valid_rows, CP_REQUEST_COPY_COLS)
+                    pl.store(zero_pre_hc_valid, [row_start, column * CP_REQUEST_COPY_COLS], pre_hc_hidden_out)
         if pl.read(control, [0, 0]) == 1:
             owner = pl.read(control, [0, 1])
             length = pl.read(control, [0, 2])
@@ -805,30 +811,11 @@ def _prefill_cp_gather_hidden(
                 dst_offsets=[my_rank * LOCAL_ROWS, 0], src_offsets=[0, 0],
                 shape=[LOCAL_ROWS, D], chunk_rows=ROW_TILE, chunk_cols=CP_REQUEST_COPY_COLS,
             )
-            for local_part in pl.range(LOCAL_PARTS):
-                if local_part == 0:
-                    local_segment = pl.cast(my_rank, pl.INDEX)
-                else:
-                    local_segment = pl.cast(NUM_SEGMENTS - 1 - my_rank, pl.INDEX)
-                local_length = pl.max(0, pl.min(span, length - local_segment * span))
-                local_tail_start = pl.max(0, local_length - TAIL_ROWS)
-                local_tail_length = pl.min(TAIL_ROWS, local_length)
-                for tail_row in pl.range(0, TAIL_ROWS, ROW_TILE):
-                    active_tail = pl.max(0, pl.min(ROW_TILE, local_tail_length - tail_row))
-                    source_row = local_part * MAX_SEGMENT_TILES * TAIL_ROWS + local_tail_start + tail_row
-                    destination_row = (my_rank * LOCAL_PARTS + local_part) * TAIL_ROWS + tail_row
-                    for column in pl.range(CP_REQUEST_HC_DIM // CP_REQUEST_COPY_COLS):
-                        if active_tail > 0:
-                            valid_tail = pl.load(
-                                local_pre_hc_hidden, [source_row, column * CP_REQUEST_COPY_COLS],
-                                [ROW_TILE, CP_REQUEST_COPY_COLS], valid_shape=[active_tail, CP_REQUEST_COPY_COLS],
-                            )
-                            padded_tail = pl.tile.fillpad(valid_tail, pad_value=pl.PadValue.zero)
-                            full_tail = pl.tile.set_validshape(padded_tail, ROW_TILE, CP_REQUEST_COPY_COLS)
-                            pld.tile.remote_store(full_tail, pre_hc_tail_window, owner, [destination_row, column * CP_REQUEST_COPY_COLS])
-                        else:
-                            empty_tail = pl.tile.full([ROW_TILE, CP_REQUEST_COPY_COLS], value=0.0, dtype=pl.FP32)
-                            pld.tile.remote_store(empty_tail, pre_hc_tail_window, owner, [destination_row, column * CP_REQUEST_COPY_COLS])
+            pld.tensor.put(
+                dst=pre_hc_window, peer=owner, src=local_pre_hc_hidden,
+                dst_offsets=[my_rank * LOCAL_ROWS, 0], src_offsets=[0, 0],
+                shape=[LOCAL_ROWS, CP_REQUEST_HC_DIM], chunk_rows=ROW_TILE, chunk_cols=CP_REQUEST_COPY_COLS,
+            )
             if my_rank != owner:
                 pld.system.notify(target=complete, peer=owner, offsets=[my_rank, 0], value=1, op=pld.NotifyOp.AtomicAdd)
             else:
@@ -853,32 +840,74 @@ def _prefill_cp_gather_hidden(
                                 [ROW_TILE, CP_REQUEST_COPY_COLS], valid_shape=[active, CP_REQUEST_COPY_COLS],
                             )
                             pl.store(restored, [segment_start + local_row, column * CP_REQUEST_COPY_COLS], hidden_out)
-                final_tail_start = pl.max(0, length - TAIL_ROWS)
-                for tail_row in pl.range(pl.min(TAIL_ROWS, length)):
-                    position = final_tail_start + tail_row
-                    tail_segment = position // span
-                    tail_segment_start = tail_segment * span
-                    tail_segment_length = pl.max(0, pl.min(span, length - tail_segment_start))
-                    if tail_segment < CP_SIZE:
-                        tail_rank = tail_segment
-                        tail_part = pl.cast(0, pl.INDEX)
-                    else:
-                        tail_rank = NUM_SEGMENTS - 1 - tail_segment
-                        tail_part = pl.cast(1, pl.INDEX)
-                    tail_offset = position - tail_segment_start - pl.max(0, tail_segment_length - TAIL_ROWS)
-                    source_tail = (tail_rank * LOCAL_PARTS + tail_part) * TAIL_ROWS + tail_offset
-                    for column in pl.range(CP_REQUEST_HC_DIM // CP_REQUEST_COPY_COLS):
-                        restored_tail = pl.load(pre_hc_tail_window, [source_tail, column * CP_REQUEST_COPY_COLS], [1, CP_REQUEST_COPY_COLS])
-                        pl.store(restored_tail, [tail_row, column * CP_REQUEST_COPY_COLS], pre_hc_hidden_out)
+                        for hc_column in pl.range(CP_REQUEST_HC_DIM // CP_REQUEST_COPY_COLS):
+                            restored_pre_hc = pl.load(
+                                pre_hc_window, [source_base, hc_column * CP_REQUEST_COPY_COLS],
+                                [ROW_TILE, CP_REQUEST_COPY_COLS], valid_shape=[active, CP_REQUEST_COPY_COLS],
+                            )
+                            pl.store(restored_pre_hc, [segment_start + local_row, hc_column * CP_REQUEST_COPY_COLS], pre_hc_hidden_out)
         for peer in pl.range(CP_SIZE):
             pl.write(complete, [peer, 0], pl.cast(0, pl.INT32))
     return hidden_out, pre_hc_hidden_out
 
 
 @pl.jit.inline
+def _prefill_cp_raw_cache_commit(
+    local_kv: pl.Tensor[[LOCAL_ROWS, HEAD_DIM], pl.BF16],
+    slots: pl.Tensor,
+    reverse_index: pl.Tensor[[NUM_SEGMENTS], pl.INT32],
+    owner_rank_table: pl.Tensor[[NUM_SEGMENTS], pl.INT32],
+    window: pld.DistributedTensor[[CP_TAIL_WINDOW_ROWS, D], pl.BF16],
+    ready: pld.DistributedTensor[[CP_SIZE, 1], pl.INT32],
+    consumed: pld.DistributedTensor[[CP_SIZE, 1], pl.INT32],
+    kv_cache: pl.Tensor,
+    cache_owner: pl.Scalar[pl.INT32],
+    my_rank: pl.Scalar[pl.INT32],
+    comm_epoch: pl.Scalar[pl.INT32],
+    attention_done: pl.Scalar[pl.TASK_ID],
+) -> pl.Scalar[pl.TASK_ID]:
+    """Persist every current KV row after all old-cache readers finish.
+
+    Reuse the retired hidden-tail window and its credit protocol. One segment's
+    KV fits inside its hidden-tail slot because HEAD_DIM is smaller than D.
+    """
+    packed = pl.create_tensor([LOCAL_PARTS * TAIL_ROWS, D], dtype=pl.BF16)
+    with pl.at(level=pl.Level.CORE_GROUP, name_hint="cp_raw_cache_pack", deps=[attention_done]):
+        for part in pl.range(LOCAL_PARTS):
+            for row in pl.range(0, TAIL_ROWS, ROW_TILE):
+                packed[part * TAIL_ROWS + row:part * TAIL_ROWS + row + ROW_TILE, :] = pl.full(
+                    [ROW_TILE, D], dtype=pl.BF16, value=0.0)
+            for row in pl.range(MAX_SEGMENT_TILES * TAIL_ROWS * HEAD_DIM // D):
+                source = pl.slice(local_kv, [D // HEAD_DIM, HEAD_DIM],
+                                  [part * MAX_SEGMENT_TILES * TAIL_ROWS + row * D // HEAD_DIM, 0])
+                packed_source = pl.reshape(source, [1, D])
+                packed[part * TAIL_ROWS + row:part * TAIL_ROWS + row + 1, :] = packed_source
+
+
+    gathered = pl.create_tensor([CP_TAIL_WINDOW_ROWS, D], dtype=pl.BF16)
+    with pl.at(level=pl.Level.CORE_GROUP, name_hint="cp_raw_cache_exchange"):
+        _prefill_cp_hidden_tail_exchange_wave(
+            packed, reverse_index, owner_rank_table, window, ready, consumed,
+            gathered, my_rank, pl.cast(0, pl.INT32), comm_epoch,
+        )
+    gathered_kv = pl.reshape(gathered, [CP_TAIL_WINDOW_ROWS * D // HEAD_DIM, HEAD_DIM])
+    raw_rows = pl.tensor.dim(kv_cache, 0) * BLOCK_SIZE
+    raw = pl.reshape(kv_cache, [raw_rows, HEAD_DIM])
+    with pl.at(level=pl.Level.CORE_GROUP, name_hint="cp_raw_cache_commit") as commit_tid:
+        if my_rank == cache_owner:
+            for segment in pl.range(NUM_SEGMENTS):
+                for row in pl.range(MAX_SEGMENT_TILES * TAIL_ROWS):
+                    destination = pl.read(slots, [TAIL_ROWS + segment * MAX_SEGMENT_TILES * TAIL_ROWS + row])
+                    if destination >= 0 and destination < raw_rows:
+                        source_row = segment * TAIL_ROWS * D // HEAD_DIM + row
+                        raw[destination:destination + 1, :] = gathered_kv[source_row:source_row + 1, :]
+    return commit_tid
+
+
+@pl.jit.inline
 def _prefill_cp_request_barrier(
     hidden_out: pl.Tensor[[CP_REQUEST_TOKENS_DYN, D], pl.BF16],
-    pre_hc_hidden_out: pl.Tensor[[TAIL_ROWS, CP_REQUEST_HC_DIM], pl.FP32],
+    pre_hc_hidden_out: pl.Tensor[[CP_REQUEST_TOKENS_DYN, CP_REQUEST_HC_DIM], pl.FP32],
     request_barrier_epochs: pld.DistributedTensor[[CP_SIZE, 16], pl.INT32],
     cp_tail_ready: pld.DistributedTensor[[CP_SIZE, 1], pl.INT32],
     cp_tail_consumed: pld.DistributedTensor[[CP_SIZE, 1], pl.INT32],
@@ -961,11 +990,11 @@ def _prefill_cp_request_test(
     tables_window: pld.DistributedTensor[[7, CP_REQUEST_TABLE_COLS], pl.INT32],
     ready: pld.DistributedTensor[[CP_SIZE, 1], pl.INT32],
     hidden_window: pld.DistributedTensor[[CP_REQUEST_CAPACITY, D], pl.BF16],
-    tail_window: pld.DistributedTensor[[NUM_SEGMENTS * TAIL_ROWS, CP_REQUEST_HC_DIM], pl.FP32],
+    tail_window: pld.DistributedTensor[[CP_REQUEST_CAPACITY, CP_REQUEST_HC_DIM], pl.FP32],
     complete: pld.DistributedTensor[[CP_SIZE, 1], pl.INT32],
     request_barrier_epochs: pld.DistributedTensor[[CP_SIZE, 16], pl.INT32],
     hidden_out: pl.InOut[pl.Tensor[[CP_REQUEST_TOKENS_DYN, D], pl.BF16]],
-    tail_out: pl.InOut[pl.Tensor[[TAIL_ROWS, CP_REQUEST_HC_DIM], pl.FP32]],
+    tail_out: pl.InOut[pl.Tensor[[CP_REQUEST_TOKENS_DYN, CP_REQUEST_HC_DIM], pl.FP32]],
     audit: pl.InOut[pl.Tensor[[CP_SIZE, 9, CP_REQUEST_TABLE_COLS], pl.INT32]],
     request_owner: pl.Scalar[pl.INT32],
     my_rank: pl.Scalar[pl.INT32],
@@ -980,7 +1009,7 @@ def _prefill_cp_request_test(
             for col in pl.range(D // CP_REQUEST_COPY_COLS):
                 zero = pl.tile.full([ROW_TILE, CP_REQUEST_COPY_COLS], value=0.0, dtype=pl.BF16)
                 pl.store(zero, [row * ROW_TILE, col * CP_REQUEST_COPY_COLS], hidden_out)
-        for row in pl.spmd(TAIL_ROWS // ROW_TILE):
+        for row in pl.spmd(CP_REQUEST_CAPACITY // ROW_TILE):
             for col in pl.range(CP_REQUEST_HC_DIM // CP_REQUEST_COPY_COLS):
                 zero_tail = pl.tile.full([ROW_TILE, CP_REQUEST_COPY_COLS], value=0.0, dtype=pl.FP32)
                 pl.store(zero_tail, [row * ROW_TILE, col * CP_REQUEST_COPY_COLS], tail_out)
@@ -1087,9 +1116,11 @@ def prefill_cp_exchange_test(
     csa_compress_state_block_table: pl.Tensor[[CP_SIZE, 1, CP_REQUEST_MAIN_TABLE_COLS], pl.INT32],
     csa_inner_compress_state_block_table: pl.Tensor[[CP_SIZE, 1, CP_REQUEST_INNER_TABLE_COLS], pl.INT32],
     hidden_out: pl.Out[pl.Tensor[[CP_SIZE, CP_REQUEST_TOKENS_DYN, D], pl.BF16]],
-    tail_out: pl.Out[pl.Tensor[[CP_SIZE, TAIL_ROWS, CP_REQUEST_HC_DIM], pl.FP32]],
+    tail_out: pl.Out[pl.Tensor[[CP_SIZE, CP_REQUEST_TOKENS_DYN, CP_REQUEST_HC_DIM], pl.FP32]],
     audit: pl.Out[pl.Tensor[[CP_SIZE, CP_SIZE, 9, CP_REQUEST_TABLE_COLS], pl.INT32]],
 ):
+    hidden_out.bind_dynamic(1, CP_REQUEST_TOKENS_DYN)
+    tail_out.bind_dynamic(1, CP_REQUEST_TOKENS_DYN)
     x_hc.bind_dynamic(1, CP_REQUEST_TOKENS_DYN)
     input_ids.bind_dynamic(2, CP_REQUEST_TOKENS_DYN)
     position_ids.bind_dynamic(1, CP_REQUEST_TOKENS_DYN)
@@ -1099,14 +1130,14 @@ def prefill_cp_exchange_test(
     tables_window_buf = pld.alloc_window_buffer([7, CP_REQUEST_TABLE_COLS], dtype=pl.INT32)
     ready_buf = pld.alloc_window_buffer([CP_SIZE, 1], dtype=pl.INT32)
     hidden_window_buf = pld.alloc_window_buffer([CP_REQUEST_CAPACITY, D], dtype=pl.BF16)
-    tail_window_buf = pld.alloc_window_buffer([NUM_SEGMENTS * TAIL_ROWS, CP_REQUEST_HC_DIM], dtype=pl.FP32)
+    tail_window_buf = pld.alloc_window_buffer([CP_REQUEST_CAPACITY, CP_REQUEST_HC_DIM], dtype=pl.FP32)
     complete_buf = pld.alloc_window_buffer([CP_SIZE, 16], dtype=pl.INT32)
     request_barrier_epochs_buf = pld.alloc_window_buffer([CP_SIZE, 16], dtype=pl.INT32)
     for repetition in pl.range(3):
         for request_owner in pl.range(CP_SIZE):
             for rank in pl.range(CP_SIZE):
                 hidden_window = pld.window(hidden_window_buf, [CP_REQUEST_CAPACITY, D], dtype=pl.BF16)
-                tail_window = pld.window(tail_window_buf, [NUM_SEGMENTS * TAIL_ROWS, CP_REQUEST_HC_DIM], dtype=pl.FP32)
+                tail_window = pld.window(tail_window_buf, [CP_REQUEST_CAPACITY, CP_REQUEST_HC_DIM], dtype=pl.FP32)
                 complete = pld.window(complete_buf, [CP_SIZE, 1], dtype=pl.INT32)
                 request_barrier_epochs = pld.window(request_barrier_epochs_buf, [CP_SIZE, 16], dtype=pl.INT32)
                 header_window = pld.window(header_window_buf, [1, 16], dtype=pl.INT32)
@@ -1136,8 +1167,7 @@ def golden_prefill_cp_exchange(tensors):
     for owner in owners:
         length = counts[owner]
         tensors["hidden_out"][owner, :length].copy_(tensors["x_hc"][owner, :length, :D].to(torch.bfloat16))
-        tail_length = min(TAIL_ROWS, length)
-        tensors["tail_out"][owner, :tail_length].copy_(tensors["x_hc"][owner, length - tail_length : length])
+        tensors["tail_out"][owner, :length].copy_(tensors["x_hc"][owner, :length])
     tensors["audit"].zero_()
     for owner in owners:
         length = counts[owner]
@@ -1181,7 +1211,7 @@ def build_tensor_specs(counts, start_pos):
     specs.extend(
         [
             TensorSpec("hidden_out", [CP_SIZE, CP_REQUEST_CAPACITY, D], torch.bfloat16),
-            TensorSpec("tail_out", [CP_SIZE, TAIL_ROWS, CP_REQUEST_HC_DIM], torch.float32),
+            TensorSpec("tail_out", [CP_SIZE, CP_REQUEST_CAPACITY, CP_REQUEST_HC_DIM], torch.float32),
             TensorSpec("audit", [CP_SIZE, CP_SIZE, 9, CP_REQUEST_TABLE_COLS], torch.int32),
         ]
     )

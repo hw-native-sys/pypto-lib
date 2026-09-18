@@ -231,7 +231,7 @@ from prefill_swa import (
     ORI_MAX_BLOCKS, OVERLAY_BASE, OVERLAY_ROWS, OVERLAY_SOURCES, TAIL_ROWS, WIN,
     prefill_attention_swa,
 )
-from prefill_cp_zigzag import MAX_SEGMENT_TILES, CP_PREFILL_CMP_BLOCK_NUM as PREFILL_CMP_BLOCK_NUM
+from prefill_cp_zigzag import CP_RAW_SLOT_ROWS, MAX_SEGMENT_TILES, CP_PREFILL_CMP_BLOCK_NUM as PREFILL_CMP_BLOCK_NUM
 from prefill_hca import prefill_attention_hca
 from prefill_sparse_attn import HCA_MAX_COMPRESSED_ROWS
 from prefill_csa import (
@@ -241,6 +241,7 @@ from prefill_csa import (
 from config import PREFILL_CMP_MAX_BLOCKS
 from prefill_cp_exchange import (
     CMP_META_DIM, CMP_WINDOW_ROWS, META_DIM, RECORDS_PER_WINDOW, SCALE_TILE_COLS,
+    HCA_STATE_RECORDS,
     STATE_META_DIM, STATE_RECORDS_PER_WINDOW, STATE_WINDOW_ROWS,
     _clear_prefill_cp_exchange_signals,
 )
@@ -501,7 +502,7 @@ def _prefill_cp_metadata(
     owner_rank_table: pl.Tensor[[NUM_SEGMENTS], pl.INT32],
     final_win_seg_src: pl.Tensor[[TAIL_ROWS], pl.INT32],
     final_win_row_src: pl.Tensor[[TAIL_ROWS], pl.INT32],
-    final_slot_mapping: pl.Tensor[[TAIL_ROWS], pl.INT32],
+    final_slot_mapping: pl.Tensor[[CP_RAW_SLOT_ROWS], pl.INT32],
     segment_active_lengths: pl.Tensor[[LOCAL_PARTS], pl.INT32],
     cache_owner_rank_t: pl.Tensor[[1], pl.INT32],
     owner_segments_t: pl.Tensor[[LOCAL_PARTS], pl.INT32],
@@ -611,6 +612,17 @@ def _prefill_cp_metadata(
             pl.write(final_win_seg_src, [row], source)
             pl.write(final_win_row_src, [row], source_row)
             pl.write(final_slot_mapping, [row], slot)
+        for cache_segment in pl.range(NUM_SEGMENTS):
+            cache_start = base + cache_segment * span
+            cache_active = pl.max(0, pl.min(span, base + length - cache_start))
+            for cache_row in pl.range(MAX_SEGMENT_TILES * TAIL_ROWS):
+                cache_slot = pl.cast(-1, pl.INT32)
+                if cache_row < cache_active:
+                    cache_position = cache_start + cache_row
+                    cache_page = pl.read(ori_block_table, [cache_position // BLOCK_SIZE])
+                    if cache_page >= 0:
+                        cache_slot = pl.cast(cache_page * BLOCK_SIZE + cache_position % BLOCK_SIZE, pl.INT32)
+                pl.write(final_slot_mapping, [TAIL_ROWS + cache_segment * MAX_SEGMENT_TILES * TAIL_ROWS + cache_row], cache_slot)
         # Window an earlier chunk of this request already committed. HCA and CSA
         # read it out of the paged cache instead of re-projecting hidden states
         # they no longer hold; -1 means "no history", i.e. a fresh request.
@@ -849,7 +861,7 @@ def prefill_fwd(
     owner_rank_table: pl.Tensor[[NUM_SEGMENTS], pl.INT32],
     final_win_seg_src: pl.Tensor[[TAIL_ROWS], pl.INT32],
     final_win_row_src: pl.Tensor[[TAIL_ROWS], pl.INT32],
-    final_slot_mapping: pl.Tensor[[TAIL_ROWS], pl.INT32],
+    final_slot_mapping: pl.Tensor[[CP_RAW_SLOT_ROWS], pl.INT32],
     # --- Shared CP metadata needed by CSA/HCA cores (beyond SWA) ----------
     # Request ownership and segment metadata are shared across model layers.
     # CSA and HCA consume the relevant fields through their stage contracts.
@@ -926,7 +938,7 @@ def prefill_fwd(
     cmp_window: pld.DistributedTensor[[CMP_WINDOW_ROWS, HEAD_DIM], pl.BF16],
     cmp_meta_window: pld.DistributedTensor[[CMP_WINDOW_ROWS, CMP_META_DIM], pl.INT32],
     state_window: pld.DistributedTensor[[STATE_WINDOW_ROWS, HCA_COMPRESS_STATE_DIM], pl.FP32],
-    state_meta_window: pld.DistributedTensor[[CP_SIZE, STATE_META_DIM], pl.INT32],
+    state_meta_window: pld.DistributedTensor[[HCA_STATE_RECORDS, STATE_META_DIM], pl.INT32],
     hca_compact_ready: pld.DistributedTensor[[CP_SIZE, 1], pl.INT32],
     hca_compact_consumed: pld.DistributedTensor[[CP_SIZE, 1], pl.INT32],
     # Domain 3: CSA compact/index/state (one bank reused by CSA layers).
@@ -1136,9 +1148,9 @@ def prefill_fwd(
         )
         shared_w2_layer: pl.Tensor[[D, MOE_INTER], pl.INT8] = pl.slice(shared_w2, [D, MOE_INTER], [layer_index * D, 0])
         shared_w2_scale_layer: pl.Tensor[[D], pl.FP32] = pl.slice(shared_w2_scale, [D], [layer_index * D])
-        tail_comm_epoch = pl.cast(layer_index, pl.INT32)
+        tail_comm_epoch = pl.cast(2 * layer_index, pl.INT32)
         if pl.read(segment_starts_t, [0]) > 0:
-            tail_comm_epoch = pl.cast(layer_index + pl.min(layer_index, 2), pl.INT32)
+            tail_comm_epoch = pl.cast(2 * layer_index + pl.min(layer_index, 2), pl.INT32)
         with pl.scope():
             attention_completion = pl.create_tensor([NUM_ATTN_TILES, 1, 8], dtype=pl.FP32)
             if layer_index < 2:
@@ -1425,14 +1437,14 @@ def prefill_fwd(
         # Serving retains these windows without a host reset. Layer epochs
         # restart in each request, so retire all attention credits after the
         # final MoE and before the next HOST dispatch can reuse the windows.
-        tail_completed = pl.cast(FWD_NUM_LAYERS, pl.INT32)
+        tail_completed = pl.cast(2 * FWD_NUM_LAYERS, pl.INT32)
         hca_completed = pl.cast(HCA_NUM_LAYERS, pl.INT32)
         csa_completed = pl.cast(CSA_NUM_LAYERS, pl.INT32)
         retire_prefix = pl.read(segment_starts_t, [0])
         if retire_prefix > 0:
             # Each SWA adds one raw-history phase. Each compressed layer adds
             # one raw/state phase plus enough windows for the full history.
-            tail_completed = pl.cast(FWD_NUM_LAYERS + 2, pl.INT32)
+            tail_completed = pl.cast(2 * FWD_NUM_LAYERS + 2, pl.INT32)
             hca_completed = pl.cast(
                 HCA_NUM_LAYERS * (2 + (retire_prefix // HCA_COMPRESS_RATIO + CMP_WINDOW_ROWS - 1) // CMP_WINDOW_ROWS),
                 pl.INT32,
@@ -1506,10 +1518,8 @@ from prefill_cp_exchange import (
     D as CP_EXCHANGE_D,
     HCA_STATE_MAX_BLOCKS as CP_EXCHANGE_HCA_STATE_MAX_BLOCKS,
     LOCAL_ROWS as CP_EXCHANGE_LOCAL_ROWS,
-    NUM_SEGMENTS as CP_EXCHANGE_NUM_SEGMENTS,
     PREFILL_CMP_MAX_BLOCKS as CP_EXCHANGE_PREFILL_CMP_MAX_BLOCKS,
     PREFILL_ORI_MAX_BLOCKS as CP_EXCHANGE_PREFILL_ORI_MAX_BLOCKS,
-    TAIL_ROWS as CP_EXCHANGE_TAIL_ROWS,
 )
 from prefill_cp_exchange import (
     _prefill_cp_request_header as prepare_cp_request,
@@ -1575,7 +1585,7 @@ def _prefill_request(
     hc_head_scale: pl.Tensor[[1], pl.FP32],
     hc_head_base: pl.Tensor[[HC_MULT], pl.FP32],
     final_norm_w: pl.Tensor[[D], pl.BF16],
-    pre_hc_hidden_out: pl.InOut[pl.Tensor[[T, HC_MULT, D], pl.FP32]],
+    pre_hc_hidden_out: pl.InOut[pl.Tensor[[FWD_TOKENS_DYN, HC_MULT, D], pl.FP32]],
     x_out: pl.InOut[pl.Tensor[[FWD_TOKENS_DYN, D], pl.BF16]],
     hc_ffn_fn: pl.Tensor[[FWD_NUM_LAYERS * MIX_HC, HC_DIM], pl.FP32],
     hc_ffn_scale: pl.Tensor[[FWD_NUM_LAYERS * 3], pl.FP32],
@@ -1603,7 +1613,7 @@ def _prefill_request(
     cp_cmp_window: pld.DistributedTensor[[CMP_WINDOW_ROWS, HEAD_DIM], pl.BF16],
     cp_cmp_meta_window: pld.DistributedTensor[[CMP_WINDOW_ROWS, CMP_META_DIM], pl.INT32],
     cp_state_window: pld.DistributedTensor[[STATE_WINDOW_ROWS, HCA_COMPRESS_STATE_DIM], pl.FP32],
-    cp_state_meta_window: pld.DistributedTensor[[CP_SIZE, STATE_META_DIM], pl.INT32],
+    cp_state_meta_window: pld.DistributedTensor[[HCA_STATE_RECORDS, STATE_META_DIM], pl.INT32],
     cp_hca_compact_ready: pld.DistributedTensor[[CP_SIZE, 1], pl.INT32],
     cp_hca_compact_consumed: pld.DistributedTensor[[CP_SIZE, 1], pl.INT32],
     cp_main_window: pld.DistributedTensor[[RECORDS_PER_WINDOW, CSA_MAIN_OUT_DIM], pl.BF16],
@@ -1629,7 +1639,7 @@ def _prefill_request(
     entry_tables_window: pld.DistributedTensor[[7, CP_EXCHANGE_CP_REQUEST_TABLE_COLS], pl.INT32],
     entry_ready: pld.DistributedTensor[[CP_EXCHANGE_CP_SIZE, 1], pl.INT32],
     entry_hidden_window: pld.DistributedTensor[[CP_EXCHANGE_CP_REQUEST_CAPACITY, CP_EXCHANGE_D], pl.BF16],
-    entry_pre_hc_tail_window: pld.DistributedTensor[[CP_EXCHANGE_NUM_SEGMENTS * CP_EXCHANGE_TAIL_ROWS, CP_EXCHANGE_CP_REQUEST_HC_DIM], pl.FP32],
+    entry_pre_hc_window: pld.DistributedTensor[[CP_EXCHANGE_CP_REQUEST_CAPACITY, CP_EXCHANGE_CP_REQUEST_HC_DIM], pl.FP32],
     entry_complete: pld.DistributedTensor[[CP_EXCHANGE_CP_SIZE, 1], pl.INT32],
     entry_barrier_epochs: pld.DistributedTensor[[CP_EXCHANGE_CP_SIZE, 16], pl.INT32],
     request_owner: pl.Scalar[pl.INT32],
@@ -1642,7 +1652,7 @@ def _prefill_request(
         for row in pl.spmd(request_rows, name_hint="prefill_empty_hidden"):
             zero = pl.tile.full([1, D], value=0.0, dtype=pl.BF16)
             pl.store(zero, [row, 0], x_out)
-        for row in pl.spmd(T, name_hint="prefill_empty_tail"):
+        for row in pl.spmd(request_rows, name_hint="prefill_empty_pre_hc"):
             zero_tail = pl.tile.full([1, 1, D], value=0.0, dtype=pl.FP32)
             for stream in pl.range(HC_MULT):
                 pl.store(zero_tail, [row, stream, 0], pre_hc_hidden_out)
@@ -1710,7 +1720,7 @@ def _prefill_request(
             owner_rank_table = pl.create_tensor([NUM_SEGMENTS], dtype=pl.INT32)
             final_win_seg_src = pl.create_tensor([TAIL_ROWS], dtype=pl.INT32)
             final_win_row_src = pl.create_tensor([TAIL_ROWS], dtype=pl.INT32)
-            final_slot_mapping = pl.create_tensor([TAIL_ROWS], dtype=pl.INT32)
+            final_slot_mapping = pl.create_tensor([CP_RAW_SLOT_ROWS], dtype=pl.INT32)
             segment_active_lengths = pl.create_tensor([LOCAL_PARTS], dtype=pl.INT32)
             cache_owner_rank_t = pl.create_tensor([1], dtype=pl.INT32)
             owner_segments_t = pl.create_tensor([LOCAL_PARTS], dtype=pl.INT32)
@@ -1805,11 +1815,11 @@ def _prefill_request(
                 my_rank,
             )
             cp_pre_hc_flat = pl.reshape(cp_pre_hc_hidden_out, [CP_LOCAL_ROWS, HC_DIM])
-            output_pre_hc_flat = pl.reshape(pre_hc_hidden_out, [T, HC_DIM])
+            output_pre_hc_flat = pl.reshape(pre_hc_hidden_out, [request_rows, HC_DIM])
             gather_cp_hidden(
                 control,
                 cp_hidden_out, cp_pre_hc_flat,
-                entry_hidden_window, entry_pre_hc_tail_window, entry_complete,
+                entry_hidden_window, entry_pre_hc_window, entry_complete,
                 x_out,
                 output_pre_hc_flat,
                 my_rank,
@@ -1820,12 +1830,12 @@ def _prefill_request(
                 invalid_bits = pl.tile.full([1, D], value=0x7FC0, dtype=pl.INT16)
                 invalid = pl.tile.reinterpret_view(invalid_bits, pl.BF16)
                 pl.store(invalid, [row, 0], x_out)
-            for row in pl.spmd(T, name_hint="prefill_unsupported_tail"):
+            for row in pl.spmd(request_rows, name_hint="prefill_unsupported_pre_hc"):
                 invalid_tail_bits = pl.tile.full([1, 1, D], value=0x7FC00000, dtype=pl.INT32)
                 invalid_tail = pl.tile.reinterpret_view(invalid_tail_bits, pl.FP32)
                 for stream in pl.range(HC_MULT):
                     pl.store(invalid_tail, [row, stream, 0], pre_hc_hidden_out)
-    output_pre_hc_flat = pl.reshape(pre_hc_hidden_out, [T, HC_DIM])
+    output_pre_hc_flat = pl.reshape(pre_hc_hidden_out, [request_rows, HC_DIM])
     cp_request_barrier(
         x_out, output_pre_hc_flat, entry_barrier_epochs,
         cp_tail_ready, cp_tail_consumed,
@@ -1920,7 +1930,7 @@ def l3_prefill_fwd(
     hc_head_scale: pl.Tensor[[N_RANKS, 1], pl.FP32],
     hc_head_base: pl.Tensor[[N_RANKS, HC_MULT], pl.FP32],
     final_norm_w: pl.Tensor[[N_RANKS, D], pl.BF16],
-    pre_hc_hidden_out: pl.Out[pl.Tensor[[N_RANKS, T, HC_MULT, D], pl.FP32]],
+    pre_hc_hidden_out: pl.Out[pl.Tensor[[N_RANKS, FWD_TOKENS_DYN, HC_MULT, D], pl.FP32]],
     lm_head_weight: pl.Tensor[[N_RANKS, VOCAB_PER_TP, D], pl.BF16],
     hidden_out: pl.Out[pl.Tensor[[N_RANKS, FWD_TOKENS_DYN, D], pl.BF16]],
     logits: pl.Out[pl.Tensor[[N_RANKS, MAX_LOGIT_ROWS, LM_HEAD_VOCAB], pl.FP32]],
@@ -1931,6 +1941,7 @@ def l3_prefill_fwd(
     pl.static_assert(CP_SIZE == N_RANKS and CP_SIZE > 1, "Prefill requires CP=EP>1; CP1 is deferred.")
     x_hc.bind_dynamic(1, FWD_TOKENS_DYN)
     hidden_out.bind_dynamic(1, FWD_TOKENS_DYN)
+    pre_hc_hidden_out.bind_dynamic(1, FWD_TOKENS_DYN)
     ori_slot_mapping.bind_dynamic(1, FWD_TOKENS_DYN)
     position_ids.bind_dynamic(1, FWD_TOKENS_DYN)
     input_ids.bind_dynamic(1, FWD_TOKENS_DYN)
@@ -1955,7 +1966,7 @@ def l3_prefill_fwd(
     cp_cmp_window_buf = pld.alloc_window_buffer([CMP_WINDOW_ROWS, HEAD_DIM], dtype=pl.BF16)
     cp_cmp_meta_window_buf = pld.alloc_window_buffer([CMP_WINDOW_ROWS, CMP_META_DIM], dtype=pl.INT32)
     cp_state_window_buf = pld.alloc_window_buffer([STATE_WINDOW_ROWS, HCA_COMPRESS_STATE_DIM], dtype=pl.FP32)
-    cp_state_meta_window_buf = pld.alloc_window_buffer([CP_SIZE, STATE_META_DIM], dtype=pl.INT32)
+    cp_state_meta_window_buf = pld.alloc_window_buffer([HCA_STATE_RECORDS, STATE_META_DIM], dtype=pl.INT32)
     cp_hca_compact_ready_buf = pld.alloc_window_buffer([CP_SIZE, 1], dtype=pl.INT32)
     cp_hca_compact_consumed_buf = pld.alloc_window_buffer([CP_SIZE, 1], dtype=pl.INT32)
     cp_main_window_buf = pld.alloc_window_buffer([RECORDS_PER_WINDOW, CSA_MAIN_OUT_DIM], dtype=pl.BF16)
@@ -1981,7 +1992,7 @@ def l3_prefill_fwd(
     entry_tables_window_buf = pld.alloc_window_buffer([7, CP_EXCHANGE_CP_REQUEST_TABLE_COLS], dtype=pl.INT32)
     entry_ready_buf = pld.alloc_window_buffer([CP_EXCHANGE_CP_SIZE, 1], dtype=pl.INT32)
     entry_hidden_window_buf = pld.alloc_window_buffer([CP_EXCHANGE_CP_REQUEST_CAPACITY, CP_EXCHANGE_D], dtype=pl.BF16)
-    entry_pre_hc_tail_window_buf = pld.alloc_window_buffer([CP_EXCHANGE_NUM_SEGMENTS * CP_EXCHANGE_TAIL_ROWS, CP_EXCHANGE_CP_REQUEST_HC_DIM], dtype=pl.FP32)
+    entry_pre_hc_window_buf = pld.alloc_window_buffer([CP_EXCHANGE_CP_REQUEST_CAPACITY, CP_EXCHANGE_CP_REQUEST_HC_DIM], dtype=pl.FP32)
     # Gather clears and request barrier epochs occupy separate 64-byte cache lines.
     entry_complete_buf = pld.alloc_window_buffer([CP_EXCHANGE_CP_SIZE, 16], dtype=pl.INT32)
     entry_barrier_epochs_buf = pld.alloc_window_buffer([CP_EXCHANGE_CP_SIZE, 16], dtype=pl.INT32)
@@ -1996,7 +2007,7 @@ def l3_prefill_fwd(
             cp_cmp_window = pld.window(cp_cmp_window_buf, [CMP_WINDOW_ROWS, HEAD_DIM], dtype=pl.BF16)
             cp_cmp_meta_window = pld.window(cp_cmp_meta_window_buf, [CMP_WINDOW_ROWS, CMP_META_DIM], dtype=pl.INT32)
             cp_state_window = pld.window(cp_state_window_buf, [STATE_WINDOW_ROWS, HCA_COMPRESS_STATE_DIM], dtype=pl.FP32)
-            cp_state_meta_window = pld.window(cp_state_meta_window_buf, [CP_SIZE, STATE_META_DIM], dtype=pl.INT32)
+            cp_state_meta_window = pld.window(cp_state_meta_window_buf, [HCA_STATE_RECORDS, STATE_META_DIM], dtype=pl.INT32)
             cp_hca_compact_ready = pld.window(cp_hca_compact_ready_buf, [CP_SIZE, 1], dtype=pl.INT32)
             cp_hca_compact_consumed = pld.window(cp_hca_compact_consumed_buf, [CP_SIZE, 1], dtype=pl.INT32)
             cp_main_window = pld.window(cp_main_window_buf, [RECORDS_PER_WINDOW, CSA_MAIN_OUT_DIM], dtype=pl.BF16)
@@ -2022,7 +2033,7 @@ def l3_prefill_fwd(
             entry_tables_window = pld.window(entry_tables_window_buf, [7, CP_EXCHANGE_CP_REQUEST_TABLE_COLS], dtype=pl.INT32)
             entry_ready = pld.window(entry_ready_buf, [CP_EXCHANGE_CP_SIZE, 1], dtype=pl.INT32)
             entry_hidden_window = pld.window(entry_hidden_window_buf, [CP_EXCHANGE_CP_REQUEST_CAPACITY, CP_EXCHANGE_D], dtype=pl.BF16)
-            entry_pre_hc_tail_window = pld.window(entry_pre_hc_tail_window_buf, [CP_EXCHANGE_NUM_SEGMENTS * CP_EXCHANGE_TAIL_ROWS, CP_EXCHANGE_CP_REQUEST_HC_DIM], dtype=pl.FP32)
+            entry_pre_hc_window = pld.window(entry_pre_hc_window_buf, [CP_EXCHANGE_CP_REQUEST_CAPACITY, CP_EXCHANGE_CP_REQUEST_HC_DIM], dtype=pl.FP32)
             entry_complete = pld.window(entry_complete_buf, [CP_EXCHANGE_CP_SIZE, 1], dtype=pl.INT32)
             entry_barrier_epochs = pld.window(entry_barrier_epochs_buf, [CP_EXCHANGE_CP_SIZE, 16], dtype=pl.INT32)
             x_hc_rank = x_hc[r]
@@ -2075,7 +2086,7 @@ def l3_prefill_fwd(
                 cp_prefill_moe_x_target, cp_prefill_moe_x_signal, cp_prefill_moe_scale_target,
                 cp_prefill_moe_reverse_target, cp_prefill_moe_reverse_signal,
                 entry_header_window, entry_input_window, entry_ids_window, entry_tables_window, entry_ready,
-                entry_hidden_window, entry_pre_hc_tail_window, entry_complete, entry_barrier_epochs,
+                entry_hidden_window, entry_pre_hc_window, entry_complete, entry_barrier_epochs,
                 request_owner, r,
                 device=r,
             )
@@ -2470,7 +2481,7 @@ def build_tensor_specs(
         if spec.name in RESIDENT_WEIGHT_NAMES or spec.name in RESIDENT_CACHE_NAMES:
             spec.resident = "stacked"
 
-    specs.append(TensorSpec("pre_hc_hidden_out", [N_RANKS, T, HC_MULT, D], torch.float32))
+    specs.append(TensorSpec("pre_hc_hidden_out", [N_RANKS, num_tiles * T, HC_MULT, D], torch.float32))
     specs.append(TensorSpec(
         "lm_head_weight",
         [N_RANKS, VOCAB_PER_TP, D],

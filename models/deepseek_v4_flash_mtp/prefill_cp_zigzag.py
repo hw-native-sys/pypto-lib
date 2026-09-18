@@ -47,6 +47,8 @@ CP_PREFILL_CMP_BLOCK_NUM = NUM_SEGMENTS * MAX_SEGMENT_TILES
 
 # Rank-major tail-window rows.
 CP_TAIL_WINDOW_ROWS = NUM_SEGMENTS * TAIL_ROWS
+# Tail destinations followed by all current-segment destinations.
+CP_RAW_SLOT_ROWS = TAIL_ROWS + NUM_SEGMENTS * MAX_SEGMENT_TILES * TAIL_ROWS
 
 
 def cp_segment_layout(num_tokens: int, cp_size: int = CP_SIZE, *, prefix: int = 0):
