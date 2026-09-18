@@ -313,6 +313,21 @@ def l3_mtp_prefill_fwd(
         routed_y_buf: pld.DistributedTensor[[N_ROUTES, D], pl.BF16] = pld.window(routed_y_buf_buf, [N_ROUTES, D], dtype=pl.BF16)
         combine_arrived = pld.window(combine_arrived_buf, [N_RANKS, N_LOCAL, SIGNAL_PAD], dtype=pl.INT32)
         consumed = pld.window(consumed_buf, [N_RANKS, SIGNAL_PAD], dtype=pl.INT32)
+        # The rank takes these scales as MX_B_NN; a bare slice is ND, so annotate it.
+        wq_a_scale_r: pl.Tensor[[D // 32, Q_LORA], pl.FP8E8M0, pl.MX_B_NN] = wq_a_scale[r]
+        wq_b_scale_r: pl.Tensor[[Q_LORA // 32, H * HEAD_DIM], pl.FP8E8M0, pl.MX_B_NN] = wq_b_scale[r]
+        wkv_scale_r: pl.Tensor[[D // 32, HEAD_DIM], pl.FP8E8M0, pl.MX_B_NN] = wkv_scale[r]
+        wo_b_scale_r: pl.Tensor[[(O_GROUPS * O_LORA) // 32, D], pl.FP8E8M0, pl.MX_B_NN] = wo_b_scale[r]
+        routed_w1_scale_r: pl.Tensor[
+            [N_LOCAL * K_SCALE, MOE_INTER], pl.FP8E8M0, pl.MX_B_NN
+        ] = routed_w1_scale[r]
+        routed_w3_scale_r: pl.Tensor[
+            [N_LOCAL * K_SCALE, MOE_INTER], pl.FP8E8M0, pl.MX_B_NN
+        ] = routed_w3_scale[r]
+        routed_w2_scale_r: pl.Tensor[[N_LOCAL * H_SCALE, D], pl.FP8E8M0, pl.MX_B_NN] = routed_w2_scale[r]
+        shared_w1_scale_r: pl.Tensor[[K_SCALE, MOE_INTER], pl.FP8E8M0, pl.MX_B_NN] = shared_w1_scale[r]
+        shared_w3_scale_r: pl.Tensor[[K_SCALE, MOE_INTER], pl.FP8E8M0, pl.MX_B_NN] = shared_w3_scale[r]
+        shared_w2_scale_r: pl.Tensor[[H_SCALE, D], pl.FP8E8M0, pl.MX_B_NN] = shared_w2_scale[r]
         mtp_prefill_fwd(
             hidden_states[r],
             prev_hidden_states[r],
@@ -320,17 +335,17 @@ def l3_mtp_prefill_fwd(
             e_proj_w[r], e_proj_w_scale[r], e_proj_smooth[r],
             h_proj_w[r], h_proj_w_scale[r], h_proj_smooth[r],
             hc_attn_fn[r], hc_attn_scale[r], hc_attn_base[r], attn_norm_w[r],
-            wq_a[r], wq_a_scale[r], wq_b[r], wq_b_scale[r], wkv[r], wkv_scale[r], gamma_cq[r], gamma_ckv[r],
+            wq_a[r], wq_a_scale_r, wq_b[r], wq_b_scale_r, wkv[r], wkv_scale_r, gamma_cq[r], gamma_ckv[r],
             freqs_cos[r], freqs_sin[r],
             kv_cache[r], ori_block_table[r], ori_slot_mapping[r],
             position_ids[r],
-            attn_sink[r], wo_a[r], wo_a_scale[r], wo_b[r], wo_b_scale[r],
+            attn_sink[r], wo_a[r], wo_a_scale[r], wo_b[r], wo_b_scale_r,
             hc_ffn_fn[r], hc_ffn_scale[r], hc_ffn_base[r], norm_w[r],
             gate_w[r], gate_bias[r], tid2eid[r], input_ids[r],
-            routed_w1[r], routed_w1_scale[r], routed_w3[r], routed_w3_scale[r],
-            routed_w2[r], routed_w2_scale[r],
-            mxfp4_pair_lut[r], shared_w1[r], shared_w1_scale[r], shared_w3[r], shared_w3_scale[r],
-            shared_w2[r], shared_w2_scale[r],
+            routed_w1[r], routed_w1_scale_r, routed_w3[r], routed_w3_scale_r,
+            routed_w2[r], routed_w2_scale_r,
+            mxfp4_pair_lut[r], shared_w1[r], shared_w1_scale_r, shared_w3[r], shared_w3_scale_r,
+            shared_w2[r], shared_w2_scale_r,
             mtp_hc_head_fn[r], mtp_hc_head_scale[r], mtp_hc_head_base[r], mtp_norm_w[r],
             hidden_out[r], pre_hc_hidden_out[r],
             recv_meta, recv_x, recv_scale, recv_aux, recv_route, arrived, data_arrived,

@@ -1944,10 +1944,20 @@ def make_program(operator, capacity, world_size, epochs):
         for rank in pl.range(pld.world_size()):
             data = pld.window(data_buffer, [capacity, D], dtype=pl.FP32)
             signal = pld.window(signal_buffer, [TP_SIZE, 1], dtype=pl.INT32)
+            # The rank takes these scales as MX_B_NN; a bare slice is ND, so annotate it.
+            wq_a_scale_r: pl.Tensor[[D // 32, Q_LORA], pl.FP8E8M0, pl.MX_B_NN] = wq_a_scale[rank]
+            wq_b_scale_r: pl.Tensor[
+                [Q_LORA // 32, LOCAL_H * HEAD_DIM], pl.FP8E8M0, pl.MX_B_NN
+            ] = wq_b_scale[rank]
+            wkv_scale_r: pl.Tensor[[D // 32, HEAD_DIM], pl.FP8E8M0, pl.MX_B_NN] = wkv_scale[rank]
+            wo_b_scale_r: pl.Tensor[[LOCAL_O_WIDTH // 32, D], pl.FP8E8M0, pl.MX_B_NN] = wo_b_scale[rank]
+            index_wq_b_scale_r: pl.Tensor[
+                [Q_LORA // 32, INDEX_H * INDEX_DIM], pl.FP8E8M0, pl.MX_B_NN
+            ] = index_wq_b_scale[rank]
             c2a_rank(
-                x[rank], wq_a[rank], wq_a_scale[rank], q_norm_weight[rank], wq_b[rank],
-                wq_b_scale[rank], wkv[rank], wkv_scale[rank], kv_norm_weight[rank],
-                attn_sink[rank], wo_a[rank], wo_b[rank], wo_b_scale[rank], rope_cos[rank],
+                x[rank], wq_a[rank], wq_a_scale_r, q_norm_weight[rank], wq_b[rank],
+                wq_b_scale_r, wkv[rank], wkv_scale_r, kv_norm_weight[rank],
+                attn_sink[rank], wo_a[rank], wo_b[rank], wo_b_scale_r, rope_cos[rank],
                 rope_sin[rank], window_slots[rank], window_indices[rank], window_cache[rank],
                 window_cache_scale[rank], compressed_cache[rank], compressed_cache_scale[rank],
                 request_ids[rank], compressed_lens[rank], index_cache[rank],
@@ -1955,7 +1965,7 @@ def make_program(operator, capacity, world_size, epochs):
                 compressed_rope_cos[rank], compressed_rope_sin[rank], compressor_wkv[rank],
                 compressor_wgate[rank], compressor_state_rows[rank], compressor_state[rank],
                 compressor_norm_weight[rank], compressed_slots[rank], index_wk[rank],
-                index_norm_weight[rank], index_wq_b[rank], index_wq_b_scale[rank],
+                index_norm_weight[rank], index_wq_b[rank], index_wq_b_scale_r,
                 index_weights_proj[rank], topk_indices[rank], output[rank], data, signal, rank,
                 num_tokens, attention_epoch, device=rank,
             )

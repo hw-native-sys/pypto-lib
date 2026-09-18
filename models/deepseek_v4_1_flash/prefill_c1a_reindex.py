@@ -58,6 +58,11 @@ from models.deepseek_v4_1_flash.config import AttentionMode
 
 
 D = C.D
+HEAD_DIM = C.HEAD_DIM
+INDEX_DIM = C.INDEX_DIM
+INDEX_H = C.INDEX_H
+LOCAL_H = C.LOCAL_H
+LOCAL_O_WIDTH = C.LOCAL_O_WIDTH
 Q_LORA = C.Q_LORA
 TP_SIZE = C.TP_SIZE
 PREFILL_MAX_TOKENS = C.PREFILL_MAX_TOKENS
@@ -418,16 +423,24 @@ def l3_prefill_c1a_reindex_test(
     for rank in pl.range(pld.world_size()):
         output_window = pld.window(output_window_buf, [PREFILL_MAX_TOKENS, D], dtype=pl.FP32)
         output_arrived = pld.window(output_arrived_buf, [TP_SIZE, 1], dtype=pl.INT32)
+        # The rank takes these scales as MX_B_NN; a bare slice is ND, so annotate it.
+        wq_a_scale_r: pl.Tensor[[D // 32, Q_LORA], pl.FP8E8M0, pl.MX_B_NN] = wq_a_scale[rank]
+        wq_b_scale_r: pl.Tensor[[Q_LORA // 32, LOCAL_H * HEAD_DIM], pl.FP8E8M0, pl.MX_B_NN] = wq_b_scale[rank]
+        wkv_scale_r: pl.Tensor[[D // 32, HEAD_DIM], pl.FP8E8M0, pl.MX_B_NN] = wkv_scale[rank]
+        wo_b_scale_r: pl.Tensor[[LOCAL_O_WIDTH // 32, D], pl.FP8E8M0, pl.MX_B_NN] = wo_b_scale[rank]
+        index_wq_b_scale_r: pl.Tensor[
+            [Q_LORA // 32, INDEX_H * INDEX_DIM], pl.FP8E8M0, pl.MX_B_NN
+        ] = index_wq_b_scale[rank]
         prefill_c1a_reindex_test(
-            x[rank], wq_a[rank], wq_a_scale[rank], q_norm_weight[rank],
-            wq_b[rank], wq_b_scale[rank], wkv[rank], wkv_scale[rank],
+            x[rank], wq_a[rank], wq_a_scale_r, q_norm_weight[rank],
+            wq_b[rank], wq_b_scale_r, wkv[rank], wkv_scale_r,
             kv_norm_weight[rank], attn_sink[rank], wo_a[rank], wo_b[rank],
-            wo_b_scale[rank], rope_cos[rank], rope_sin[rank], window_slots[rank],
+            wo_b_scale_r, rope_cos[rank], rope_sin[rank], window_slots[rank],
             window_indices[rank], window_cache[rank], window_cache_scale[rank],
             compressed_cache[rank], compressed_cache_scale[rank], request_ids[rank],
             compressed_lens[rank], index_cache[rank], index_cache_scale[rank],
             index_block_table[rank], candidate_mask[rank], index_wq_b[rank],
-            index_wq_b_scale[rank], index_weights_proj[rank], topk_indices[rank],
+            index_wq_b_scale_r, index_weights_proj[rank], topk_indices[rank],
             output_window, output_arrived, output[rank], rank, num_tokens, device=rank,
         )
 
