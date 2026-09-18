@@ -672,7 +672,8 @@ def sparse_attn_hca_tp1(
     freqs_cos: pl.Tensor[[T_DYN, ROPE_DIM], pl.BF16],
     freqs_sin: pl.Tensor[[T_DYN, ROPE_DIM], pl.BF16],
     o_packed_heads: pl.Tensor[[O_GROUPS * T_PAD, O_GROUP_IN], pl.BF16],
-    cache_ready_dep: pl.Scalar[pl.TASK_ID],
+    raw_cache_ready_dep: pl.Scalar[pl.TASK_ID],
+    cmp_cache_ready_dep: pl.Scalar[pl.TASK_ID],
 ) -> tuple[pl.Tensor, pl.Scalar[pl.TASK_ID]]:
     """Write HCA heads as grouped ``[T_PAD, O_GROUP_IN]`` slabs."""
     (
@@ -682,7 +683,7 @@ def sparse_attn_hca_tp1(
         raw_tid, cmp_tid, rope_tid,
     ) = sparse_attn_hca(
         q, ori_kv, window_swa_indices, window_swa_lens, cmp_kv, cmp_block_table, position_ids, kv_seq_lens, attn_sink, freqs_cos,
-        freqs_sin, cache_ready_dep, cache_ready_dep,
+        freqs_sin, raw_cache_ready_dep, cmp_cache_ready_dep,
     )
     t_dim = pl.tensor.dim(stream_state_m, 0) // H
     stream_block_count = t_dim * (H // H_TILE)
@@ -791,7 +792,7 @@ def sparse_attn_hca_test(
     o_packed_flat = pl.reshape(o_packed_heads, [O_GROUPS * T_PAD, O_GROUP_IN])
     o_packed_flat, _heads_tid = sparse_attn_hca_tp1(
         q, ori_kv, window_swa_indices, window_swa_lens, cmp_kv, cmp_block_table, position_ids, kv_seq_lens,
-        attn_sink, freqs_cos, freqs_sin, o_packed_flat, cache_ready_dep,
+        attn_sink, freqs_cos, freqs_sin, o_packed_flat, cache_ready_dep, cache_ready_dep,
     )
     return o_packed_heads
 
