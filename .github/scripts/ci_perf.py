@@ -31,6 +31,8 @@ sys.path.insert(0, str(ROOT))
 MANIFEST = Path(__file__).with_name("perf_cases.json")
 CASE_TIMEOUT = 1800  # task-submit --max-time: one model's compile, golden and benchmark
 QUEUE_TIMEOUT = 3600  # task-submit --timeout: queue wait plus execution
+# Ring sizes pinned for every case, independent of the host's PTO2_RING_* exports.
+RING_CONFIG = {"ring_task_window": 16384, "ring_dep_pool": 16384, "ring_heap": 1 << 30}
 
 
 def read_json(path):
@@ -70,8 +72,8 @@ def benchmark_payload(stats):
             "all_zero_device": stats.all_zero_device, "samples": rounds}
 
 
-def make_capture(original_run, case, output, selected):
-    """Wrap golden.run: apply the case's ring settings and save the benchmark."""
+def make_capture(original_run, output, selected):
+    """Wrap golden.run: pin the ring settings and save the benchmark."""
     def capture(**kwargs):
         if output.exists():
             raise ValueError("a case must call golden.run exactly once")
@@ -80,7 +82,7 @@ def make_capture(original_run, case, output, selected):
         actual = list(distributed.device_ids) if distributed else [cfg["device_id"]]
         if actual != selected:
             raise ValueError(f"model runs on devices {actual}, allocation is {selected}")
-        kwargs["config"] = {**cfg, **case.get("run_config", {})}
+        kwargs["config"] = {**cfg, **RING_CONFIG}
         result = original_run(**kwargs)
         payload = {"passed": result.passed, "error": result.error}
         if result.passed:
@@ -99,7 +101,7 @@ def run_case(args):
         raise ValueError(f"allocated {len(selected)} devices, case needs {case['device_count']}")
     import golden
 
-    golden.run = make_capture(golden.run, case, args.output, selected)
+    golden.run = make_capture(golden.run, args.output, selected)
     entry = ROOT / case["entrypoint"]
     sys.path.insert(0, str(entry.parent))
     sys.argv = [str(entry), "-p", "a2a3", "-d", ",".join(map(str, selected)), *case["arguments"],

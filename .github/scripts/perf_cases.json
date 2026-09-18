@@ -12,12 +12,7 @@
       "arguments": [
         "--start-pos",
         "8192"
-      ],
-      "run_config": {
-        "ring_task_window": 16384,
-        "ring_dep_pool": 16384,
-        "ring_heap": 1073741824
-      }
+      ]
     },
     {
       "case_id": "mtp-hca-8k",
@@ -26,12 +21,7 @@
       "arguments": [
         "--start-pos",
         "8192"
-      ],
-      "run_config": {
-        "ring_task_window": 16384,
-        "ring_dep_pool": 16384,
-        "ring_heap": 1073741824
-      }
+      ]
     },
     {
       "case_id": "mtp-swa-8k",
@@ -40,12 +30,7 @@
       "arguments": [
         "--start-pos",
         "8192"
-      ],
-      "run_config": {
-        "ring_task_window": 16384,
-        "ring_dep_pool": 16384,
-        "ring_heap": 1073741824
-      }
+      ]
     },
     {
       "case_id": "mtp-moe-ep16",
@@ -61,12 +46,7 @@
         "--experts-per-rank",
         "16",
         "--balanced-routing"
-      ],
-      "run_config": {
-        "ring_task_window": 16384,
-        "ring_dep_pool": 16384,
-        "ring_heap": 1073741824
-      }
+      ]
     },
     {
       "case_id": "mtp-lm-head-tp4",
@@ -81,12 +61,7 @@
         "8",
         "--entry",
         "projection"
-      ],
-      "run_config": {
-        "ring_task_window": 16384,
-        "ring_dep_pool": 16384,
-        "ring_heap": 1073741824
-      }
+      ]
     },
     {
       "case_id": "mtp-csa-128k",
@@ -95,12 +70,7 @@
       "arguments": [
         "--start-pos",
         "131072"
-      ],
-      "run_config": {
-        "ring_task_window": 16384,
-        "ring_dep_pool": 16384,
-        "ring_heap": 1073741824
-      }
+      ]
     },
     {
       "case_id": "mtp-hca-128k",
@@ -109,12 +79,7 @@
       "arguments": [
         "--start-pos",
         "131072"
-      ],
-      "run_config": {
-        "ring_task_window": 16384,
-        "ring_dep_pool": 16384,
-        "ring_heap": 1073741824
-      }
+      ]
     },
     {
       "case_id": "mtp-swa-128k",
@@ -123,12 +88,7 @@
       "arguments": [
         "--start-pos",
         "131072"
-      ],
-      "run_config": {
-        "ring_task_window": 16384,
-        "ring_dep_pool": 16384,
-        "ring_heap": 1073741824
-      }
+      ]
     },
     {
       "case_id": "dspark-csa-8k",
@@ -139,12 +99,7 @@
         "1",
         "--start-pos",
         "8192,8192,8192,8192,8192,8192,8192,8192,8192,8192,8192,8192,8192,8192,8192,8192"
-      ],
-      "run_config": {
-        "ring_task_window": 16384,
-        "ring_dep_pool": 16384,
-        "ring_heap": 1073741824
-      }
+      ]
     },
     {
       "case_id": "dspark-hca-8k",
@@ -155,12 +110,7 @@
         "1",
         "--start-pos",
         "8192,8192,8192,8192,8192,8192,8192,8192,8192,8192,8192,8192,8192,8192,8192,8192"
-      ],
-      "run_config": {
-        "ring_task_window": 16384,
-        "ring_dep_pool": 16384,
-        "ring_heap": 1073741824
-      }
+      ]
     },
     {
       "case_id": "dspark-swa-8k",
@@ -171,12 +121,7 @@
         "1",
         "--start-pos",
         "8192,8192,8192,8192,8192,8192,8192,8192,8192,8192,8192,8192,8192,8192,8192,8192"
-      ],
-      "run_config": {
-        "ring_task_window": 16384,
-        "ring_dep_pool": 16384,
-        "ring_heap": 1073741824
-      }
+      ]
     },
     {
       "case_id": "dspark-moe-ep16",
@@ -191,12 +136,7 @@
         "128",
         "--routing",
         "balanced"
-      ],
-      "run_config": {
-        "ring_task_window": 16384,
-        "ring_dep_pool": 16384,
-        "ring_heap": 1073741824
-      }
+      ]
     },
     {
       "case_id": "dspark-lm-head-tp4",
@@ -211,12 +151,7 @@
         "128",
         "--entry",
         "projection"
-      ],
-      "run_config": {
-        "ring_task_window": 16384,
-        "ring_dep_pool": 16384,
-        "ring_heap": 1073741824
-      }
+      ]
     },
     {
       "case_id": "dspark-csa-128k",
@@ -227,12 +162,7 @@
         "1",
         "--start-pos",
         "131072,131072,131072,131072,131072,131072,131072,131072,131072,131072,131072,131072,131072,131072,131072,131072"
-      ],
-      "run_config": {
-        "ring_task_window": 16384,
-        "ring_dep_pool": 16384,
-        "ring_heap": 1073741824
-      }
+      ]
     },
     {
       "case_id": "dspark-hca-128k",
@@ -243,12 +173,7 @@
         "1",
         "--start-pos",
         "131072,131072,131072,131072,131072,131072,131072,131072,131072,131072,131072,131072,131072,131072,131072,131072"
-      ],
-      "run_config": {
-        "ring_task_window": 16384,
-        "ring_dep_pool": 16384,
-        "ring_heap": 1073741824
-      }
+      ]
     },
     {
       "case_id": "dspark-swa-128k",
@@ -259,12 +184,7 @@
         "1",
         "--start-pos",
         "131072,131072,131072,131072,131072,131072,131072,131072,131072,131072,131072,131072,131072,131072,131072,131072"
-      ],
-      "run_config": {
-        "ring_task_window": 16384,
-        "ring_dep_pool": 16384,
-        "ring_heap": 1073741824
-      }
+      ]
     }
   ]
 }
