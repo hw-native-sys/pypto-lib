@@ -148,14 +148,15 @@ def compressor_ratio4_pool_projected(
 
     _kv_score_tid = late_dep
 
+    pool_workers = pl.min(b_dim, POOL_WORKERS)
     with pl.spmd(
-        POOL_WORKERS,
+        pool_workers,
         name_hint="scatter_softmax_pool",
         deps=[_kv_score_tid],
         allow_early_resolve=True,
     ) as pool_tid:
         pool_worker = pl.tile.get_block_idx()
-        for c_idx in pl.range(pool_worker, b_dim, POOL_WORKERS):
+        for c_idx in pl.range(pool_worker, b_dim, pool_workers):
             first_pos_b = pl.read(position_ids, [c_idx * s_dim])
             for s_idx in pl.range(s_dim):
                 token = c_idx * s_dim + s_idx
@@ -289,9 +290,10 @@ def compressor_ratio4_cache_write(
     cmp4_score_proj_pad = score_proj_pad
 
     # Recurrent state-ring commit.
-    with pl.spmd(COMMIT_WORKERS, name_hint="compress_state_commit", deps=[pool_tid, late_write_dep]):
+    commit_workers = pl.min(b_dim, COMMIT_WORKERS)
+    with pl.spmd(commit_workers, name_hint="compress_state_commit", deps=[pool_tid, late_write_dep]):
         commit_worker = pl.tile.get_block_idx()
-        for c_idx in pl.range(commit_worker, b_dim, COMMIT_WORKERS):
+        for c_idx in pl.range(commit_worker, b_dim, commit_workers):
             for s_idx in pl.range(s_dim):
                 token = c_idx * s_dim + s_idx
                 state_row_i64 = pl.read(state_slot_mapping, [token])
@@ -309,7 +311,8 @@ def compressor_ratio4_cache_write(
     normed_kv = pl.create_tensor([BS_PAD, HEAD_DIM], dtype=pl.FP32)
     norm_w_2d = pl.reshape(norm_w, [1, HEAD_DIM])
     with pl.spmd(
-        rms_blocks, name_hint="rmsnorm_rope_cache_write", deps=[pool_tid, late_write_dep]
+        rms_blocks, name_hint="rmsnorm_rope_cache_write", deps=[pool_tid, late_write_dep],
+        allow_early_resolve=True,
     ) as cache_write_tid:
         rms_blk = pl.tile.get_block_idx()
         b0 = rms_blk * RMS_PAD_TILE

@@ -80,7 +80,7 @@ Q_ROPE_T_TILE = 8
 # short call sites do not dispatch more blocks than they have work.
 Q_ROPE_WORKERS = 48
 Q_ROPE_H_TILE = 4  # heads per fused qproj dequant/rms/rope task
-Q_DEQUANT_WORKERS = 32
+Q_DEQUANT_WORKERS = 48
 assert QPROJ_MM_N_TILE * QPROJ_M_TILE * 4 <= 128 * 1024  # L0C Acc cap
 assert QPROJ_M_TILE % QPROJ_TAIL_M_TILE == 0
 

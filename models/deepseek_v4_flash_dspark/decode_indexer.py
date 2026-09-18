@@ -79,10 +79,10 @@ QR_PROJ_WORKERS = 24  # Query projection workers
 QH_MM_TILE = 64  # Query Hadamard cube tile
 QH_WORKERS = 24  # Query Hadamard matmul workers
 WEIGHTS_WORKERS = 24  # Weights-projection workers
+TP1_WEIGHTS_WORKERS = 8  # TP1 weights-projection workers
 QH_HEAD_DIM_TILE = 64
-ROPE_ROW_BLOCK = IDX_N_HEADS
-ROPE_ROW_TILE = 32
-ROPE_WORKERS = 48  # Query RoPE workers
+DQ_ROPE_H_TILE = 4  # heads per fused query dequant + RoPE unit
+DQ_ROPE_WORKERS = 48  # fused query dequant + RoPE workers
 TOPK_PAIR_WIDTH = 2 * IDX_TOPK
 
 # Top-K geometry.
@@ -494,7 +494,6 @@ def indexer_qr_rope(
     """Indexer query projection, dequant and RoPE -- everything before the hadamard."""
 
     bs = pl.tensor.dim(x, 0)
-    bs_heads = bs * IDX_N_HEADS
     row_blocks = (bs + MM_ROW_TILE - 1) // MM_ROW_TILE
     qr_acc_pad = pl.create_tensor([T_PAD, IDX_N_HEADS * IDX_HEAD_DIM], dtype=pl.INT32)
     with pl.spmd(
@@ -515,48 +514,37 @@ def indexer_qr_rope(
                     wq_tile = wq_b[q0 : q0 + Q_TILE, o_base + ns : o_base + ns + MM_N_TILE]
                     qr_acc = pl.matmul_acc(qr_acc, qr_tile, wq_tile, init_cond=(q0 == 0))
                 qr_acc_pad[qr_r0 : qr_r0 + MM_ROW_TILE, o_base + ns : o_base + ns + MM_N_TILE] = qr_acc
-    qr_proj = pl.create_tensor([bs, IDX_N_HEADS * IDX_HEAD_DIM], dtype=pl.FP32)
-    for ot in pl.spmd(IDX_N_HEADS * IDX_HEAD_DIM // Q_OUT_TILE, name_hint="idx_qr_proj_dequant", allow_early_resolve=True):
-        o_base = ot * Q_OUT_TILE
-        wq_scale = pl.reshape(wq_b_scale[o_base : o_base + Q_OUT_TILE], [1, Q_OUT_TILE])
-        for dq_t0 in pl.range(0, bs, DEQUANT_T_TILE):
-            acc_fp32 = pl.cast(
-                qr_acc_pad[dq_t0 : dq_t0 + DEQUANT_T_TILE, o_base : o_base + Q_OUT_TILE],
-                target_type=pl.FP32, mode="none")
-            qr_scale_tile = qr_scale[dq_t0 : dq_t0 + DEQUANT_T_TILE, :]
-            qr_dequant = pl.col_expand_mul(pl.row_expand_mul(acc_fp32, qr_scale_tile), wq_scale)
-            qr_proj[dq_t0 : dq_t0 + DEQUANT_T_TILE, o_base : o_base + Q_OUT_TILE] = qr_dequant
-
-    qr_proj_flat = pl.reshape(qr_proj, [bs_heads, IDX_HEAD_DIM])
-    # BF16 query RoPE rotation and lane-swap index.
-    rope_swap_idx_t = pl.create_tensor([ROPE_ROW_TILE, ROPE_HEAD_DIM], dtype=pl.INT32)
-    with pl.at(level=pl.Level.CORE_GROUP, name_hint="qr_rope_swap_idx", allow_early_resolve=True):
-        sw_ones = pl.full([ROPE_ROW_TILE, ROPE_HEAD_DIM], dtype=pl.FP32, value=1.0)
+    # Fused dequant + RoPE: one unit is DEQUANT_T_TILE tokens x DQ_ROPE_H_TILE heads.
+    qr_bf16_2d = pl.reshape(qr_bf16, [T_PAD, IDX_N_HEADS * IDX_HEAD_DIM])
+    dq_rope_units = (bs // DEQUANT_T_TILE) * (IDX_N_HEADS // DQ_ROPE_H_TILE)
+    dq_rope_workers = pl.min(dq_rope_units, DQ_ROPE_WORKERS)
+    for dq_rope_worker in pl.spmd(dq_rope_workers, name_hint="idx_qr_dequant_rope", allow_early_resolve=True):
+        sw_ones = pl.full([DEQUANT_T_TILE, ROPE_HEAD_DIM], dtype=pl.FP32, value=1.0)
         sw_index = pl.cast(pl.arange(0, [1, ROPE_HEAD_DIM], dtype=pl.INT32), target_type=pl.FP32)
         sw_col = pl.col_expand_mul(sw_ones, sw_index)
         sw_dup_f = pl.cast(pl.cast(pl.mul(sw_col, 0.5), target_type=pl.INT32, mode="trunc"), target_type=pl.FP32)
         sw_lane = pl.sub(sw_col, pl.mul(sw_dup_f, 2.0))
-        sw_swap = pl.sub(pl.add(sw_col, 1.0), pl.mul(sw_lane, 2.0))
-        rope_swap_idx_t[0:ROPE_ROW_TILE, 0:ROPE_HEAD_DIM] = pl.cast(sw_swap, target_type=pl.INT32)
-
-    for rope_worker in pl.spmd(ROPE_WORKERS, name_hint="qr_rope", allow_early_resolve=True):
-        # Shared lane-swap index.
-        rope_swap_idx = rope_swap_idx_t[0:ROPE_ROW_TILE, 0:ROPE_HEAD_DIM]
-        for idx in pl.range(rope_worker, bs_heads // ROPE_ROW_TILE, ROPE_WORKERS):
-            o0 = idx * ROPE_ROW_TILE
-            token_idx = o0 // ROPE_ROW_BLOCK
-            cos_row = cos[token_idx : token_idx + 1, 0 : ROPE_HEAD_DIM]
-            sin_row = sin[token_idx : token_idx + 1, 0 : ROPE_HEAD_DIM]
-            qr_nope_slice = qr_proj_flat[o0 : o0 + ROPE_ROW_TILE, 0 : IDX_NOPE_HEAD_DIM]
-            qr_rope_slice = qr_proj_flat[o0 : o0 + ROPE_ROW_TILE, IDX_NOPE_HEAD_DIM : IDX_HEAD_DIM]
-            qr_swapped = pl.gather(qr_rope_slice, dim=-1, index=rope_swap_idx)
-            rope_direct = pl.col_expand_mul(qr_rope_slice, cos_row)
-            rope_swapped = pl.col_expand_mul(qr_swapped, sin_row)
-            rope_rot = pl.add(rope_direct, rope_swapped)
-            qr_nope_bf16 = pl.cast(qr_nope_slice, target_type=pl.BF16, mode="rint")
-            rope_bf16 = pl.cast(rope_rot, target_type=pl.BF16, mode="rint")
-            qr_vec = pl.concat(qr_nope_bf16, rope_bf16)
-            qr_bf16[o0 : o0 + ROPE_ROW_TILE, :] = qr_vec
+        rope_swap_idx = pl.cast(pl.sub(pl.add(sw_col, 1.0), pl.mul(sw_lane, 2.0)), target_type=pl.INT32)
+        for dq_unit in pl.range(dq_rope_worker, dq_rope_units, dq_rope_workers):
+            hg = (dq_unit % (IDX_N_HEADS // DQ_ROPE_H_TILE)) * DQ_ROPE_H_TILE
+            dq_t0 = (dq_unit // (IDX_N_HEADS // DQ_ROPE_H_TILE)) * DEQUANT_T_TILE
+            qr_scale_tile = qr_scale[dq_t0 : dq_t0 + DEQUANT_T_TILE, :]
+            cos_tile = cos[dq_t0 : dq_t0 + DEQUANT_T_TILE, 0 : ROPE_HEAD_DIM]
+            sin_tile = sin[dq_t0 : dq_t0 + DEQUANT_T_TILE, 0 : ROPE_HEAD_DIM]
+            for h_inner in pl.pipeline(DQ_ROPE_H_TILE, stage=2):
+                h0 = (hg + h_inner) * IDX_HEAD_DIM
+                wq_scale = pl.reshape(wq_b_scale[h0 : h0 + IDX_HEAD_DIM], [1, IDX_HEAD_DIM])
+                acc_fp32 = pl.cast(
+                    qr_acc_pad[dq_t0 : dq_t0 + DEQUANT_T_TILE, h0 : h0 + IDX_HEAD_DIM],
+                    target_type=pl.FP32, mode="none")
+                qr_dequant = pl.col_expand_mul(pl.row_expand_mul(acc_fp32, qr_scale_tile), wq_scale)
+                qr_nope_bf16 = pl.cast(qr_dequant[:, 0 : IDX_NOPE_HEAD_DIM], target_type=pl.BF16, mode="rint")
+                qr_rope_slice = qr_dequant[:, IDX_NOPE_HEAD_DIM : IDX_HEAD_DIM]
+                qr_swapped = pl.gather(qr_rope_slice, dim=-1, index=rope_swap_idx)
+                rope_rot = pl.add(pl.mul(qr_rope_slice, cos_tile), pl.mul(qr_swapped, sin_tile))
+                rope_bf16 = pl.cast(rope_rot, target_type=pl.BF16, mode="rint")
+                qr_bf16_2d[dq_t0 : dq_t0 + DEQUANT_T_TILE, h0 : h0 + IDX_NOPE_HEAD_DIM] = qr_nope_bf16
+                qr_bf16_2d[dq_t0 : dq_t0 + DEQUANT_T_TILE, h0 + IDX_NOPE_HEAD_DIM : h0 + IDX_HEAD_DIM] = rope_bf16
 
 
     return idx_qr_mm_tid
@@ -640,9 +628,8 @@ def indexer_qr_hadamard(
     idx_qr_mm_tid = indexer_qr_rope(
         x, qr, qr_scale, wq_b, wq_b_scale, cos, sin, qr_bf16,
     )
-    qh_seq_dep = pl.system.task_dummy(deps=[])
     qh_mm_tid, qh_quant_tid = indexer_qr_hadamard_mm(
-        x, qr_bf16, hadamard, qr_hadamard_i8, qr_hadamard_scale_dq, qh_seq_dep,
+        x, qr_bf16, hadamard, qr_hadamard_i8, qr_hadamard_scale_dq, idx_qr_mm_tid,
     )
     return qh_mm_tid, qh_quant_tid, idx_qr_mm_tid
 
@@ -664,6 +651,7 @@ def indexer_weights_score(
     cache_write_dep: pl.Scalar[pl.TASK_ID],
     weights_gate_dep: pl.Scalar[pl.TASK_ID],
     qh_quant_tid: pl.Scalar[pl.TASK_ID],
+    weights_workers: pl.Scalar[pl.INDEX],
 ) -> tuple[pl.Tensor[[T_DYN, IDX_TOPK], pl.FP32], pl.Tensor[[T_DYN, IDX_TOPK], pl.INT32], pl.Scalar[pl.TASK_ID]]:
     """Weights projection and the score/top-k forest over an already-quantized query."""
     bs = pl.tensor.dim(x, 0)
@@ -674,10 +662,10 @@ def indexer_weights_score(
     weights_partial = pl.create_tensor([WEIGHTS_OK * T_PAD, IDX_N_HEADS], dtype=pl.FP32)
     # Caller-ordered weights projection.
     with pl.spmd(
-        WEIGHTS_WORKERS, name_hint="weights_proj", deps=[weights_gate_dep], allow_early_resolve=True
+        weights_workers, name_hint="weights_proj", deps=[weights_gate_dep], allow_early_resolve=True
     ) as _weights_tid:
         w_worker = pl.tile.get_block_idx()
-        for w_unit in pl.range(w_worker, WEIGHTS_OK * row_blocks, WEIGHTS_WORKERS):
+        for w_unit in pl.range(w_worker, WEIGHTS_OK * row_blocks, weights_workers):
             w_rb = w_unit // WEIGHTS_OK  # row block outermost
             kb = w_unit - w_rb * WEIGHTS_OK
             w_r0 = w_rb * MM_ROW_TILE
@@ -737,15 +725,16 @@ def indexer(
 ):
     qr_hadamard_i8 = pl.create_tensor([T_PAD * IDX_N_HEADS, IDX_HEAD_DIM], dtype=pl.INT8)
     qr_hadamard_scale_dq = pl.create_tensor([T_PAD * IDX_N_HEADS, 1], dtype=pl.FP32)
-    qh_mm_tid, qh_quant_tid, _idx_qr_mm_tid = indexer_qr_hadamard(
+    _qh_mm_tid, qh_quant_tid, _idx_qr_mm_tid = indexer_qr_hadamard(
         x, qr, qr_scale, wq_b, wq_b_scale, cos, sin, hadamard,
         qr_hadamard_i8, qr_hadamard_scale_dq,
     )
+    weights_gate_dep = pl.system.task_dummy(deps=[])
     topk_scores, topk_idxs, _leaf_tid = indexer_weights_score(
         x, weights_proj, qr_hadamard_i8, qr_hadamard_scale_dq,
         idx_kv_cache, idx_kv_scale, idx_block_table,
         topk_scores, topk_idxs, position_ids, kv_seq_lens,
-        cache_write_dep, qh_mm_tid, qh_quant_tid,
+        cache_write_dep, weights_gate_dep, qh_quant_tid, TP1_WEIGHTS_WORKERS,
     )
     return topk_scores, topk_idxs
 

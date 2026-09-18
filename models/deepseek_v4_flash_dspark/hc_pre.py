@@ -40,6 +40,7 @@ D_TILE = 256
 D_SPMD = 4096
 LINEAR_OK = 4
 LINEAR_K_PER_SPLIT = HC_DIM // LINEAR_OK
+LINEAR_WORKERS = 24  # hc_pre_linear workers, one per AIC
 
 # pre0..pre3 / row0..row3 are hand-unrolled over the hc lanes.
 assert HC_MULT == 4, f"hc_pre is specialized to HC_MULT == 4, got {HC_MULT}"
@@ -92,19 +93,22 @@ def hc_pre_gates(
     # linear: split-K matmul -> per-split partials. The t_dim..t_linear pad rows are
     # zero-filled by valid_shape, never materialized.
     mixes_partials = pl.create_tensor([LINEAR_OK * t_linear, MIX_PAD], dtype=pl.FP32)
-    for task in pl.spmd((t_linear // LINEAR_T_TILE) * LINEAR_OK, name_hint="hc_pre_linear", allow_early_resolve=True):
-        t0 = (task // LINEAR_OK) * LINEAR_T_TILE
-        linear_split = task % LINEAR_OK
-        k_base = linear_split * LINEAR_K_PER_SPLIT
-        t_rows = pl.min(LINEAR_T_TILE, t_dim - t0)  # last row-block spills past t_dim; valid_shape zero-fills the tail
-        acc = pl.create_tensor([LINEAR_T_TILE, MIX_PAD], dtype=pl.FP32)
-        for kb in pl.pipeline(0, LINEAR_K_PER_SPLIT // LINEAR_K_TILE, stage=2):
-            k0 = k_base + kb * LINEAR_K_TILE
-            x_linear_chunk = pl.slice(x_flat, [LINEAR_T_TILE, LINEAR_K_TILE], [t0, k0], valid_shape=[t_rows, LINEAR_K_TILE])
-            w_chunk = pl.slice(hc_fn, [MIX_PAD, LINEAR_K_TILE], [0, k0], valid_shape=[MIX_HC, LINEAR_K_TILE])
-            acc = pl.matmul_acc(acc, x_linear_chunk, w_chunk, b_trans=True, init_cond=(kb == 0))
-        partial_row0 = linear_split * t_linear + t0
-        mixes_partials[partial_row0 : partial_row0 + LINEAR_T_TILE, 0:MIX_PAD] = acc
+    linear_units = (t_linear // LINEAR_T_TILE) * LINEAR_OK
+    linear_workers = pl.min(linear_units, LINEAR_WORKERS)
+    for linear_worker in pl.spmd(linear_workers, name_hint="hc_pre_linear", allow_early_resolve=True):
+        for task in pl.range(linear_worker, linear_units, linear_workers):
+            t0 = (task // LINEAR_OK) * LINEAR_T_TILE
+            linear_split = task % LINEAR_OK
+            k_base = linear_split * LINEAR_K_PER_SPLIT
+            t_rows = pl.min(LINEAR_T_TILE, t_dim - t0)  # last row-block spills past t_dim; valid_shape zero-fills the tail
+            acc = pl.create_tensor([LINEAR_T_TILE, MIX_PAD], dtype=pl.FP32)
+            for kb in pl.pipeline(0, LINEAR_K_PER_SPLIT // LINEAR_K_TILE, stage=2):
+                k0 = k_base + kb * LINEAR_K_TILE
+                x_linear_chunk = pl.slice(x_flat, [LINEAR_T_TILE, LINEAR_K_TILE], [t0, k0], valid_shape=[t_rows, LINEAR_K_TILE])
+                w_chunk = pl.slice(hc_fn, [MIX_PAD, LINEAR_K_TILE], [0, k0], valid_shape=[MIX_HC, LINEAR_K_TILE])
+                acc = pl.matmul_acc(acc, x_linear_chunk, w_chunk, b_trans=True, init_cond=(kb == 0))
+            partial_row0 = linear_split * t_linear + t0
+            mixes_partials[partial_row0 : partial_row0 + LINEAR_T_TILE, 0:MIX_PAD] = acc
 
     # Partials are reduced in ascending K order.
     mixes_raw = pl.create_tensor([t_linear, MIX_PAD], dtype=pl.FP32)

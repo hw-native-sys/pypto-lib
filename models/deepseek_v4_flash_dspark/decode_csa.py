@@ -72,6 +72,7 @@ from hc_post import hc_post
 from hc_pre import hc_pre_norm
 from decode_indexer import (
     T_PAD as IDX_T_PAD,
+    WEIGHTS_WORKERS as IDX_WEIGHTS_WORKERS,
     indexer,
     indexer_qr_hadamard_mm,
     indexer_qr_rope,
@@ -190,6 +191,7 @@ CSA_PROJECTION_PACK_WORKERS = 16
 CSA_ALL_VISIBLE_WORKERS = 16
 CSA_WB_TOKEN_TILE = 8
 CSA_WB_WORKERS = 48  # CSA cache-write workers
+TP1_CSA_WB_WORKERS = 8  # TP1 CSA cache-write workers
 
 if T != LOCAL_T:
     raise ValueError(f"CSA token capacity {T} must equal TP local token capacity {LOCAL_T}")
@@ -483,7 +485,7 @@ def decode_csa(
                 idx_kv_cache, idx_kv_scale, idx_block_table,
                 idx_topk_scores, idx_topk,
                 idx_positions, kv_seq_lens,
-                idx_cache_write_tid, idx_hadamard_tid, qh_quant_tid,
+                idx_cache_write_tid, idx_hadamard_tid, qh_quant_tid, IDX_WEIGHTS_WORKERS,
             )
             indexer_phase_deps[IDX_LEAF_DEP_SLOT] = scored_leaf_tid
         leaf_tid = indexer_phase_deps[IDX_LEAF_DEP_SLOT]
@@ -952,9 +954,9 @@ def decode_csa_tp1(
 
         ori_block_num = pl.tensor.dim(kv_cache, 0)
         kv_cache_flat = pl.reshape(kv_cache, [ori_block_num * BLOCK_SIZE, HEAD_DIM])
-        with pl.spmd(CSA_WB_WORKERS, name_hint="csa_cache_writeback"):
+        with pl.spmd(TP1_CSA_WB_WORKERS, name_hint="csa_cache_writeback"):
             wb_worker = pl.tile.get_block_idx()
-            for wb_blk in pl.range(wb_worker, wb_blocks, CSA_WB_WORKERS):
+            for wb_blk in pl.range(wb_worker, wb_blocks, TP1_CSA_WB_WORKERS):
                 wb_t0 = wb_blk * CSA_WB_TOKEN_TILE
                 for write_dt in pl.range(CSA_WB_TOKEN_TILE):
                     write_t = wb_t0 + write_dt
