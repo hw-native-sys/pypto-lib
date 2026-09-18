@@ -53,8 +53,8 @@ Once a kernel body lands, its owner can extend the same file with the thin
 | Workstream | Files |
 | --- | --- |
 | Encoder SWA | `prefill_attn_swa.py` (leaf), `prefill_swa.py` (HC orchestration), `decode_swa.py` |
-| Encoder C2A Full | `prefill_c2a_full.py`, `decode_c2a_full.py` |
-| Encoder C2A Reuse | `prefill_c2a_reuse.py`, `decode_c2a_reuse.py` |
+| Encoder C2A Full | `prefill_attn_c2a_full.py` (leaf), `prefill_c2a_full.py` (HC orchestration), `decode_c2a_full.py` |
+| Encoder C2A Reuse | `prefill_attn_c2a_reuse.py` (leaf), `prefill_c2a_reuse.py` (HC orchestration), `decode_c2a_reuse.py` |
 | Decoder C1A Full | `prefill_c1a_full.py`, `decode_c1a_full.py` |
 | Decoder C1A Reindex | `prefill_c1a_reindex.py`, `decode_c1a_reindex.py` |
 | Decoder C1A Reuse | `prefill_c1a_reuse.py`, `decode_c1a_reuse.py` |
@@ -153,6 +153,9 @@ The implementation milestones are ordered by dependency:
    Packed prefill SWA is wired through mHC: `mhc_mixes` → `mhc_pre` →
    `prefill_attn_swa` → `mhc_post`. Run `python models/deepseek_v4_1_flash/prefill_swa.py`.
 2. Implement C2A Full, then validate Full-to-Reuse cache and Top-K replay.
+   Packed prefill C2A Full and Reuse are wired through mHC the same way,
+   with the attention RMSNorm the block runs between `mhc_pre` and the
+   leaf: `python models/deepseek_v4_1_flash/prefill_c2a_full.py`.
 3. Implement C1A Full and the level-one candidate selector, then Reindex and Reuse.
 4. Implement the three-phase EP-MoE dispatch/local-expert/combine body.
 5. Compose the operators into the 40-layer prefill/decode token loop.
