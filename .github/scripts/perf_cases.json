@@ -48,12 +48,12 @@
       }
     },
     {
-      "case_id": "mtp-moe-ep2",
+      "case_id": "mtp-moe-ep16",
       "entrypoint": "models/deepseek_v4_flash_mtp/decode_moe.py",
-      "device_count": 2,
+      "device_count": 16,
       "arguments": [
         "--ep",
-        "2",
+        "16",
         "--layer-id",
         "0",
         "--num-tokens",
@@ -178,12 +178,12 @@
       }
     },
     {
-      "case_id": "dspark-moe-ep2",
+      "case_id": "dspark-moe-ep16",
       "entrypoint": "models/deepseek_v4_flash_dspark/moe.py",
-      "device_count": 2,
+      "device_count": 16,
       "arguments": [
         "--ep",
-        "2",
+        "16",
         "--layer-id",
         "0",
         "--num-tokens",
