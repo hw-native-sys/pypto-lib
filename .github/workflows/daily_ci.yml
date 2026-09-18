@@ -10,8 +10,9 @@ on:
         type: boolean
         default: false
 
-# Jobs read the repo; the performance job additionally reads historical Actions
-# artifacts. No job publishes commits or updates a baseline branch.
+# Every job only reads the repo (checkouts use persist-credentials: false, the
+# artifact up/download steps use the run-scoped runtime token, the summaries
+# write $GITHUB_STEP_SUMMARY), so the token needs nothing beyond contents:read.
 permissions:
   contents: read
 
@@ -736,15 +737,11 @@ jobs:
   operator-performance:
     name: MTP and DSpark operator performance (a2a3)
     runs-on: [self-hosted, linux, arm64, npu]
-    # The suite has its own provisional wall-clock budget. Keep job-level
-    # headroom for setup, artifact upload and cancellation cleanup.
+    # Sixteen serial task-submit cases, each bounded by --timeout 3600.
     timeout-minutes: 300
     concurrency:
       group: operator-performance-a2a3
       cancel-in-progress: false
-    permissions:
-      contents: read
-      actions: read
     defaults:
       run:
         working-directory: operator-checkout
@@ -755,28 +752,7 @@ jobs:
       CMAKE_CXX_COMPILER_LAUNCHER: ccache
       CCACHE_MAXSIZE: 30G
       CCACHE_UMASK: '000'
-      OPERATOR_PERF_HOST: ${{ vars.OPERATOR_PERF_HOST }}
-      OPERATOR_PERF_DEVICE_EPOCH: ${{ vars.OPERATOR_PERF_DEVICE_EPOCH }}
-      OPERATOR_PERF_CASE_TIMEOUT: ${{ vars.OPERATOR_PERF_CASE_TIMEOUT }}
-      OPERATOR_PERF_GROUP_TIMEOUT: ${{ vars.OPERATOR_PERF_GROUP_TIMEOUT }}
-      OPERATOR_PERF_QUEUE_TIMEOUT: ${{ vars.OPERATOR_PERF_QUEUE_TIMEOUT }}
-      OPERATOR_PERF_SUITE_TIMEOUT: ${{ vars.OPERATOR_PERF_SUITE_TIMEOUT }}
     steps:
-      - name: Record and verify performance host before device setup
-        run: |
-          python3 - <<'PY'
-          import os
-          import socket
-          actual = socket.gethostname()
-          expected = os.environ.get("OPERATOR_PERF_HOST", "")
-          if expected and actual != expected:
-              raise SystemExit("This runner does not match OPERATOR_PERF_HOST")
-          with open(os.environ["GITHUB_ENV"], "a") as output:
-              output.write(f"OPERATOR_PERF_HOST={actual}\n")
-          print(f"Performance host: {actual}; using the shared CI NPU pool")
-          PY
-        working-directory: ${{ github.workspace }}
-
       - name: Fetch composite action definitions
         uses: actions/checkout@v4
         with:
@@ -793,13 +769,13 @@ jobs:
           pip-cache-name: pip-operator-performance
           toolchain: bundle
 
-      - name: Run fixed operator performance suite
+      - name: Run operator performance cases
         id: perf
         env:
-          GH_TOKEN: ${{ github.token }}
+          PERF_DIR: ${{ runner.temp }}/operator-perf-${{ github.run_id }}-${{ github.run_attempt }}
         run: |
           source activate.sh
-          python .github/scripts/ci_operator_perf.py ci
+          python .github/scripts/ci_perf.py ci --output-dir "$PERF_DIR"
 
       - name: Kill orphaned task-submit tasks
         if: always()
@@ -807,13 +783,17 @@ jobs:
         with:
           checkout-path: operator-checkout
 
-      - name: Preserve partial operator results
+      - name: Publish performance summary
         if: ${{ always() && steps.perf.outcome != 'skipped' }}
         env:
-          PERF_STEP_OUTCOME: ${{ steps.perf.outcome }}
+          PERF_DIR: ${{ runner.temp }}/operator-perf-${{ github.run_id }}-${{ github.run_attempt }}
         run: |
-          source activate.sh
-          python .github/scripts/ci_operator_perf.py finalize
+          report="$PERF_DIR/published/report.md"
+          if [ -f "$report" ]; then
+            cat "$report" >> "$GITHUB_STEP_SUMMARY"
+          else
+            echo "Operator performance produced no report." >> "$GITHUB_STEP_SUMMARY"
+          fi
 
       - name: Upload operator performance results
         id: upload
@@ -827,11 +807,8 @@ jobs:
       - name: Remove private operator builds after uploading evidence
         if: ${{ always() && steps.upload.outcome == 'success' }}
         env:
-          PERF_WORK: ${{ runner.temp }}/operator-perf-${{ github.run_id }}-${{ github.run_attempt }}/work
-        run: |
-          # Only this invocation's private builds are removed; published logs
-          # and raw results have already been uploaded, including failures.
-          rm -rf -- "$PERF_WORK"
+          PERF_DIR: ${{ runner.temp }}/operator-perf-${{ github.run_id }}-${{ github.run_attempt }}
+        run: rm -rf -- "$PERF_DIR/work"
 
   summary:
     name: Aggregate results summary
