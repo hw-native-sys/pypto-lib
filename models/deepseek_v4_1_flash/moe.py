@@ -25,6 +25,7 @@ C.RECV_MAX = C.EP_SIZE * C.MOE_TOKENS
 MOE_TOKENS = C.MOE_TOKENS
 D = C.D
 MX_GROUP = C.MX_GROUP
+MOE_INTER = C.MOE_INTER
 TOPK = C.TOPK
 N_LOCAL_EXPERTS = C.N_LOCAL_EXPERTS
 RECV_MAX = C.RECV_MAX
@@ -267,11 +268,24 @@ def l3_moe(
         data_arrived = pld.window(data_arrived_buf, [EP_SIZE, 1], dtype=pl.INT32)
         routed_output = pld.window(routed_output_buf, [MOE_TOKENS * TOPK, D], dtype=pl.BF16)
         combine_arrived = pld.window(combine_arrived_buf, [EP_SIZE, 1], dtype=pl.INT32)
+        # The rank takes these scales as MX_B_NN; a bare slice is ND, so annotate it.
+        routed_w1_scale_r: pl.Tensor[
+            [N_LOCAL_EXPERTS * (D // MX_GROUP), MOE_INTER], pl.FP8E8M0, pl.MX_B_NN
+        ] = routed_w1_scale[r]
+        routed_w2_scale_r: pl.Tensor[
+            [N_LOCAL_EXPERTS * (MOE_INTER // MX_GROUP), D], pl.FP8E8M0, pl.MX_B_NN
+        ] = routed_w2_scale[r]
+        routed_w3_scale_r: pl.Tensor[
+            [N_LOCAL_EXPERTS * (D // MX_GROUP), MOE_INTER], pl.FP8E8M0, pl.MX_B_NN
+        ] = routed_w3_scale[r]
+        shared_w1_scale_r: pl.Tensor[[D // MX_GROUP, MOE_INTER], pl.FP8E8M0, pl.MX_B_NN] = shared_w1_scale[r]
+        shared_w2_scale_r: pl.Tensor[[MOE_INTER // MX_GROUP, D], pl.FP8E8M0, pl.MX_B_NN] = shared_w2_scale[r]
+        shared_w3_scale_r: pl.Tensor[[D // MX_GROUP, MOE_INTER], pl.FP8E8M0, pl.MX_B_NN] = shared_w3_scale[r]
         moe(
             x[r], norm_weight[r], gate_weight[r], correction_bias[r],
-            routed_w1[r], routed_w1_scale[r], routed_w2[r], routed_w2_scale[r],
-            routed_w3[r], routed_w3_scale[r], shared_w1[r], shared_w1_scale[r],
-            shared_w2[r], shared_w2_scale[r], shared_w3[r], shared_w3_scale[r],
+            routed_w1[r], routed_w1_scale_r, routed_w2[r], routed_w2_scale_r,
+            routed_w3[r], routed_w3_scale_r, shared_w1[r], shared_w1_scale_r,
+            shared_w2[r], shared_w2_scale_r, shared_w3[r], shared_w3_scale_r,
             token_owners[r], recv_meta, recv_x, recv_scale, recv_weights, recv_routes,
             arrived, data_arrived, routed_output, combine_arrived, output[r],
             num_tokens, r, pl.const(0, pl.INT32), r, moe_epoch, device=r,

@@ -444,11 +444,29 @@ def l3_decode_layer(
         routed_y_buf = pld.window(routed_y_buf_buf, [N_ROUTES, D], dtype=pl.BF16)
         combine_arrived = pld.window(combine_arrived_buf, [N_RANKS, N_LOCAL, SIGNAL_PAD], dtype=pl.INT32)
         consumed = pld.window(consumed_buf, [N_RANKS, SIGNAL_PAD], dtype=pl.INT32)
+        # The rank takes these scales as MX_B_NN; a bare slice is ND, so annotate it.
+        wq_a_scale_r: pl.Tensor[[D // 32, Q_LORA], pl.FP8E8M0, pl.MX_B_NN] = wq_a_scale[r]
+        wq_b_scale_r: pl.Tensor[[Q_LORA // 32, H * HEAD_DIM], pl.FP8E8M0, pl.MX_B_NN] = wq_b_scale[r]
+        wkv_scale_r: pl.Tensor[[D // 32, HEAD_DIM], pl.FP8E8M0, pl.MX_B_NN] = wkv_scale[r]
+        wo_b_scale_r: pl.Tensor[[(O_GROUPS * O_LORA) // 32, D], pl.FP8E8M0, pl.MX_B_NN] = wo_b_scale[r]
+        csa_idx_wq_b_scale_r: pl.Tensor[
+            [Q_LORA // 32, CSA_IDX_N_HEADS * CSA_IDX_HEAD_DIM], pl.FP8E8M0, pl.MX_B_NN
+        ] = csa_idx_wq_b_scale[r]
+        routed_w1_scale_r: pl.Tensor[
+            [N_LOCAL * K_SCALE, MOE_INTER], pl.FP8E8M0, pl.MX_B_NN
+        ] = routed_w1_scale[r]
+        routed_w3_scale_r: pl.Tensor[
+            [N_LOCAL * K_SCALE, MOE_INTER], pl.FP8E8M0, pl.MX_B_NN
+        ] = routed_w3_scale[r]
+        routed_w2_scale_r: pl.Tensor[[N_LOCAL * H_SCALE, D], pl.FP8E8M0, pl.MX_B_NN] = routed_w2_scale[r]
+        shared_w1_scale_r: pl.Tensor[[K_SCALE, MOE_INTER], pl.FP8E8M0, pl.MX_B_NN] = shared_w1_scale[r]
+        shared_w3_scale_r: pl.Tensor[[K_SCALE, MOE_INTER], pl.FP8E8M0, pl.MX_B_NN] = shared_w3_scale[r]
+        shared_w2_scale_r: pl.Tensor[[H_SCALE, D], pl.FP8E8M0, pl.MX_B_NN] = shared_w2_scale[r]
         decode_layer(
             x_hc[r],
             hc_attn_fn[r], hc_attn_scale[r], hc_attn_base[r],
-            attn_norm_w[r], wq_a[r], wq_a_scale[r], wq_b[r], wq_b_scale[r],
-            wkv[r], wkv_scale[r], gamma_cq[r], gamma_ckv[r], freqs_cos[r], freqs_sin[r],
+            attn_norm_w[r], wq_a[r], wq_a_scale_r, wq_b[r], wq_b_scale_r,
+            wkv[r], wkv_scale_r, gamma_cq[r], gamma_ckv[r], freqs_cos[r], freqs_sin[r],
             kv_cache[r], block_table[r],
             ori_slot_mapping[r],
             window_swa_indices[r], window_swa_lens[r],
@@ -457,21 +475,21 @@ def l3_decode_layer(
             csa_cmp_slot_mapping[r], csa_idx_slot_mapping[r],
             csa_state_slot_mapping[r], csa_inner_state_slot_mapping[r],
             position_ids[r], kv_seq_lens[r],
-            attn_sink[r], wo_a[r], wo_a_scale[r], wo_b[r], wo_b_scale[r],
+            attn_sink[r], wo_a[r], wo_a_scale[r], wo_b[r], wo_b_scale_r,
             hca_cmp_wkv[r], hca_cmp_wgate[r], hca_cmp_ape[r], hca_cmp_norm_w[r],
             hca_compress_state[r], hca_compress_state_block_table[r],
             csa_cmp_wkv[r], csa_cmp_wgate[r], csa_cmp_ape[r], csa_cmp_norm_w[r],
             csa_compress_state[r], csa_compress_state_block_table[r],
-            csa_idx_wq_b[r], csa_idx_wq_b_scale[r], csa_weights_proj[r], csa_hadamard_idx[r],
+            csa_idx_wq_b[r], csa_idx_wq_b_scale_r, csa_weights_proj[r], csa_hadamard_idx[r],
             csa_inner_wkv[r], csa_inner_wgate[r], csa_inner_ape[r], csa_inner_norm_w[r],
             csa_inner_compress_state[r], csa_inner_compress_state_block_table[r],
             cmp_kv[r], cmp_block_table[r], idx_kv_cache[r], idx_kv_scale[r], idx_block_table[r],
             hc_ffn_fn[r], hc_ffn_scale[r], hc_ffn_base[r],
             norm_w[r], gate_w[r], gate_bias[r], tid2eid[r], input_ids[r],
-            routed_w1[r], routed_w1_scale[r], routed_w3[r], routed_w3_scale[r],
-            routed_w2[r], routed_w2_scale[r],
-            mxfp4_pair_lut[r], shared_w1[r], shared_w1_scale[r], shared_w3[r], shared_w3_scale[r],
-            shared_w2[r], shared_w2_scale[r],
+            routed_w1[r], routed_w1_scale_r, routed_w3[r], routed_w3_scale_r,
+            routed_w2[r], routed_w2_scale_r,
+            mxfp4_pair_lut[r], shared_w1[r], shared_w1_scale_r, shared_w3[r], shared_w3_scale_r,
+            shared_w2[r], shared_w2_scale_r,
             x_next[r],
             recv_meta, recv_x, recv_scale, recv_aux, recv_route, arrived, data_arrived,
             routed_y_buf, combine_arrived, consumed,

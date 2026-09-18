@@ -396,16 +396,11 @@ jobs:
           build-namespace: a5-ci
           pip-cache-name: pip-a5
           toolchain: bundle
-          # These entries need a newer stack than the serving pins carry, so
-          # this job overrides both and every other job keeps the defaults.
-          # PyPTO: the MX matmul operand staging from pypto #2671, without which
-          # their `pl.matmul_mx` scale operands do not lower. Bumping the ref
-          # also moves ptoas (v0.60 -> v0.61) and pto-isa, which pypto owns.
-          # torch: `float8_e8m0fnu`, the MXFP8 scale dtype, added in 2.7 — a
-          # shim is not an option because pypto maps that IR dtype through its
-          # own table and the golden runner then compares the two for equality.
-          # This pair is the stack the entries were validated on.
-          pypto-ref: 1deae896dfe2c77e6302df1eef712887877264da
+          # PyPTO follows the shared default like every other job. torch does
+          # not: these entries need `float8_e8m0fnu`, the MXFP8 scale dtype,
+          # added in 2.7 — a shim is not an option because pypto maps that IR
+          # dtype through its own table and the golden runner then compares
+          # the two for equality.
           torch-version: 'torch==2.10.0'
 
       - name: Run V4.1-Flash operators (a5, via task-submit)

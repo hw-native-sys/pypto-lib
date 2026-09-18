@@ -600,18 +600,36 @@ def l3_prefill_layer(
         routed_y_buf = pld.window(routed_y_buf_buf, [N_ROUTES, D], dtype=pl.BF16)
         combine_arrived = pld.window(combine_arrived_buf, [N_RANKS, N_LOCAL, SIGNAL_PAD], dtype=pl.INT32)
         consumed = pld.window(consumed_buf, [N_RANKS, SIGNAL_PAD], dtype=pl.INT32)
+        # The rank takes these scales as MX_B_NN; a bare slice is ND, so annotate it.
+        wq_a_scale_r: pl.Tensor[[D // 32, Q_LORA], pl.FP8E8M0, pl.MX_B_NN] = wq_a_scale[rank]
+        wq_b_scale_r: pl.Tensor[[Q_LORA // 32, H * HEAD_DIM], pl.FP8E8M0, pl.MX_B_NN] = wq_b_scale[rank]
+        wkv_scale_r: pl.Tensor[[D // 32, HEAD_DIM], pl.FP8E8M0, pl.MX_B_NN] = wkv_scale[rank]
+        csa_idx_wq_b_scale_r: pl.Tensor[
+            [Q_LORA // 32, IDX_N_HEADS * IDX_HEAD_DIM], pl.FP8E8M0, pl.MX_B_NN
+        ] = csa_idx_wq_b_scale[rank]
+        wo_b_scale_r: pl.Tensor[[(O_GROUPS * O_LORA) // 32, D], pl.FP8E8M0, pl.MX_B_NN] = wo_b_scale[rank]
+        routed_w1_scale_r: pl.Tensor[
+            [N_LOCAL * K_SCALE, MOE_INTER], pl.FP8E8M0, pl.MX_B_NN
+        ] = routed_w1_scale[rank]
+        routed_w3_scale_r: pl.Tensor[
+            [N_LOCAL * K_SCALE, MOE_INTER], pl.FP8E8M0, pl.MX_B_NN
+        ] = routed_w3_scale[rank]
+        routed_w2_scale_r: pl.Tensor[[N_LOCAL * H_SCALE, D], pl.FP8E8M0, pl.MX_B_NN] = routed_w2_scale[rank]
+        shared_w1_scale_r: pl.Tensor[[K_SCALE, MOE_INTER], pl.FP8E8M0, pl.MX_B_NN] = shared_w1_scale[rank]
+        shared_w3_scale_r: pl.Tensor[[K_SCALE, MOE_INTER], pl.FP8E8M0, pl.MX_B_NN] = shared_w3_scale[rank]
+        shared_w2_scale_r: pl.Tensor[[H_SCALE, D], pl.FP8E8M0, pl.MX_B_NN] = shared_w2_scale[rank]
         prefill_layer_core(
             x_hc[rank],
             seq_lens[rank], chunk_lens[rank], chunk_offsets[rank], chunk_tile_offsets[rank],
             hc_attn_fn[rank], hc_attn_scale[rank], hc_attn_base[rank],
-            attn_norm_w[rank], wq_a[rank], wq_a_scale[rank], wq_b[rank], wq_b_scale[rank],
-            wkv[rank], wkv_scale[rank], gamma_cq[rank], gamma_ckv[rank], freqs_cos[rank], freqs_sin[rank],
+            attn_norm_w[rank], wq_a[rank], wq_a_scale_r, wq_b[rank], wq_b_scale_r,
+            wkv[rank], wkv_scale_r, gamma_cq[rank], gamma_ckv[rank], freqs_cos[rank], freqs_sin[rank],
             hca_cmp_wkv[rank], hca_cmp_wgate[rank], hca_cmp_ape[rank], hca_cmp_norm_w[rank],
             hca_compress_state[rank], hca_compress_state_block_table[rank],
             csa_cmp_wkv[rank], csa_cmp_wgate[rank], csa_cmp_ape[rank], csa_cmp_norm_w[rank],
             csa_compress_state[rank], csa_compress_state_block_table[rank],
             csa_hadamard_idx[rank],
-            csa_idx_wq_b[rank], csa_idx_wq_b_scale[rank], csa_weights_proj[rank],
+            csa_idx_wq_b[rank], csa_idx_wq_b_scale_r, csa_weights_proj[rank],
             csa_inner_wkv[rank], csa_inner_wgate[rank], csa_inner_ape[rank], csa_inner_norm_w[rank],
             csa_inner_compress_state[rank],
             csa_inner_compress_state_block_table[rank],
@@ -622,13 +640,13 @@ def l3_prefill_layer(
             hca_cmp_slot_mapping[rank], hca_state_slot_mapping[rank],
             csa_cmp_slot_mapping[rank], csa_idx_slot_mapping[rank],
             csa_state_slot_mapping[rank], csa_inner_state_slot_mapping[rank],
-            attn_sink[rank], wo_a[rank], wo_a_scale[rank], wo_b[rank], wo_b_scale[rank],
+            attn_sink[rank], wo_a[rank], wo_a_scale[rank], wo_b[rank], wo_b_scale_r,
             hc_ffn_fn[rank], hc_ffn_scale[rank], hc_ffn_base[rank],
             norm_w[rank], gate_w[rank], gate_bias[rank], tid2eid[rank], input_ids[rank],
-            routed_w1[rank], routed_w1_scale[rank], routed_w3[rank], routed_w3_scale[rank],
-            routed_w2[rank], routed_w2_scale[rank],
-            mxfp4_pair_lut[rank], shared_w1[rank], shared_w1_scale[rank], shared_w3[rank], shared_w3_scale[rank],
-            shared_w2[rank], shared_w2_scale[rank],
+            routed_w1[rank], routed_w1_scale_r, routed_w3[rank], routed_w3_scale_r,
+            routed_w2[rank], routed_w2_scale_r,
+            mxfp4_pair_lut[rank], shared_w1[rank], shared_w1_scale_r, shared_w3[rank], shared_w3_scale_r,
+            shared_w2[rank], shared_w2_scale_r,
             x_next[rank],
             recv_meta, recv_x, recv_scale, recv_aux, recv_route, arrived, data_arrived,
             routed_y_buf, combine_arrived, consumed,
