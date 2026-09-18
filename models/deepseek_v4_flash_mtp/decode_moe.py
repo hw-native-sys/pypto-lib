@@ -11,7 +11,8 @@
 
 
 # Sub-kernels freeze EP_WORLD_SIZE / n_routed_experts into their shapes at import
-# time: read --ep from argv and override config before importing them below.
+# time: read --ep / --experts-per-rank from argv and override config before
+# importing them below.
 import dataclasses
 import sys
 
@@ -19,20 +20,22 @@ import config
 
 _EP_CHOICES = (2, 4, 8, 16)
 _EP_DEFAULT = 2
+_EXPERTS_PER_RANK_DEFAULT = config.FLASH.n_routed_experts // config.EP_WORLD_SIZE
 
 
-def _parse_ep_argv():
+def _parse_int_argv(name, default):
     for i, tok in enumerate(sys.argv):
-        if tok == "--ep" and i + 1 < len(sys.argv):
+        if tok == name and i + 1 < len(sys.argv):
             return int(sys.argv[i + 1])
-        if tok.startswith("--ep="):
+        if tok.startswith(name + "="):
             return int(tok.split("=", 1)[1])
-    return _EP_DEFAULT
+    return default
 
 
-EP = _parse_ep_argv()
+EP = _parse_int_argv("--ep", _EP_DEFAULT)
+EXPERTS_PER_RANK = _parse_int_argv("--experts-per-rank", _EXPERTS_PER_RANK_DEFAULT)
 
-_n_routed_experts = config.FLASH.n_routed_experts // config.EP_WORLD_SIZE * EP
+_n_routed_experts = EXPERTS_PER_RANK * EP
 config.FLASH = dataclasses.replace(config.FLASH, n_routed_experts=_n_routed_experts)
 config.EP_WORLD_SIZE = EP
 config.RECV_MAX = EP * config.MOE_TOKENS
@@ -945,6 +948,10 @@ if __name__ == "__main__":
     parser.add_argument(
         "--ep", type=int, default=_EP_DEFAULT, choices=list(_EP_CHOICES),
         help="EP world size / rank count",
+    )
+    parser.add_argument(
+        "--experts-per-rank", type=int, default=EXPERTS_PER_RANK,
+        help=f"routed experts per rank (default {_EXPERTS_PER_RANK_DEFAULT})",
     )
     parser.add_argument(
         "-d", "--device", type=str, default=",".join(str(i) for i in range(N_RANKS)),

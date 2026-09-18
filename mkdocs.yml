@@ -84,7 +84,6 @@ nav:
       - Compile and runtime workflow: run-and-validate/compile-runtime-workflow.md
       - Golden Harness: run-and-validate/golden-harness.md
       - Save and replay golden data: run-and-validate/save-and-replay.md
-      - Operator performance: run-and-validate/operator-performance.md
   - Examples: examples/index.md
   - Models:
       - Overview: models/index.md
