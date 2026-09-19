@@ -65,6 +65,70 @@ Once a kernel body lands, its owner can extend the same file with the thin
 | Shared configuration and goldens | `config.py`, `metadata.py`, `golden.py`, `attention_common.py` |
 | Quantization and RoPE tables | `quantization.py`, `rope_tables.py` |
 
+## Decode composition
+
+[decode_layer.py](../../../models/deepseek_v4_1_flash/decode_layer.py) resolves
+all six modes and source ownership from `FLASH.layer_config`. Its complete
+Block skeleton preserves delayed pre-mix ordering: Attention consumes the
+incoming mix, FFN consumes the Attention pre-mix, and the Block returns the
+FFN pre-mix for the next layer. Run the six small CPU Block references with:
+
+```bash
+python models/deepseek_v4_1_flash/decode_layer.py --stage block --cpu-golden
+```
+
+The full Block device path awaits C1A decode integration, cache ABI agreement,
+and MoE integration. `decode_layer_kernel_skip_reason` lists those dependencies.
+Both the Block factory and `--stage block` device command enforce readiness before JIT
+construction. Block CPU references currently require all capacity rows active;
+the full Block hardware fixture remains pending integration.
+
+The same file provides `--stage attention` (the default) for implemented SWA and
+C2A Full/Reuse paths. It selects the leaf adapter before JIT dependency
+discovery and does not require MoE. `attention_half_skip_reason` gates
+unintegrated C1A paths. `make_decode_layer_program` selects the stage in Python;
+both stages use `make_attention_rank` for the same Attention orchestration.
+For an allocated TP4 group:
+
+```bash
+python models/deepseek_v4_1_flash/decode_layer.py --stage attention -p a5 -d 0,1,2,3 \
+  --tp 4 --layer-id 3 --tokens 33 --active-tokens 31 --requests 6 \
+  --epochs 2 --save-data
+```
+
+Use representative layer IDs 0, 2, and 3 for SWA, C2A Full, and C2A Reuse.
+
+Q/KV preprocessing lives in `qkv_proj_rope.py`. `q_proj_qr` writes the
+normalized Q latent, `q_proj_rope` expands and rotates it, and
+`kv_proj_rope` projects, normalizes, and rotates window KV. SWA and C2A
+prefill/decode use these stages; C2A Full also passes the same normalized
+latent to its indexer. Scratch remains caller-owned to preserve chunk
+reuse and task ordering. Prefill SWA uses the `prefill_*` stages to retain
+its group-32 scale-corrected BF16 Q projection and fixed-worker scheduling.
+Cache publication and TP communication stay in the Attention caller.
+C1A uses its existing preprocessing until its independent golden baseline
+and migration are accepted.
+
+`o_proj.py` combines inverse RoPE, grouped Wo-A, and MXFP8 Wo-B into
+an FP32 TP-local partial output. SWA/C2A call `o_proj`; prefill SWA calls
+`prefill_o_proj` to preserve its fixed-worker RoPE schedule. The caller
+owns the unrotated/latent scratch and runs the original prefill/decode
+TP all-reduce. C1A retains its existing output path pending migration.
+
+TP1 and TP4 are supported by the half-layer validation entry. Each dispatch
+computes mHC mixes/pre and input RMSNorm, invokes Attention with consecutive
+communication epochs, then computes mHC post. Validation reuses each leaf's
+fixture, reference, and precision checks and exposes the intermediate
+boundaries. It checks updated caches and exact non-owner storage.
+
+mHC boundaries cover the full token capacity. RMSNorm and Attention write
+the active prefix; their visible buffers are `InOut` so inactive rows retain
+the caller's values. The Reuse case validates those rows with a nonzero
+sentinel. `attention_hidden` and `attention_pre_mix` are fully written `Out`
+boundaries with shapes `[tokens, 4, 5120]` and `[tokens, 4]` per rank.
+Normalized and hidden precision statistics cover active rows only; the inactive
+suffix is checked independently so it cannot dilute the active error budget.
+
 Full attention owns compressed KV and index-key publication. Reindex consumes
 the C1A cache and the layer-20 candidate mask but computes a new index query.
 Reuse consumes the source layer's physical Top-K rows and has no compressor or

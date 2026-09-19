@@ -31,7 +31,6 @@ from models.deepseek_v4_1_flash.config import (
     LOCAL_H,
     LOCAL_O_GROUPS,
     LOCAL_O_WIDTH,
-    NOPE_DIM,
     O_GROUP_IN,
     O_LORA,
     ORI_BLOCKS_DYN,
@@ -43,137 +42,18 @@ from models.deepseek_v4_1_flash.config import (
     WINDOW_CACHE_GROUP,
 )
 from models.deepseek_v4_1_flash.decode_swa import (
-    EPS,
     M_TILE,
-    MX_M_TILE,
-    N_TILE,
     SOFTMAX_SCALE,
-    grouped_output,
-    project_kv,
-    project_ob,
-    project_qb,
+)
+from models.deepseek_v4_1_flash.o_proj import prefill_o_proj
+from models.deepseek_v4_1_flash.qkv_proj_rope import (
+    WORKER_TILE,
+    prefill_q_proj_qr, prefill_q_proj_rope, prefill_kv_proj_rope,
 )
 
 
 # tiling
 QUERY_TILE = 128
-WORKER_TILE = 64
-PROJECTION_K_TILE = 32
-
-
-@pl.jit.inline
-def prefill_project_qa(
-    x: pl.Tensor[[T_DYN, D], pl.BF16],
-    weight: pl.Tensor[[D, Q_LORA], pl.FP8E4M3FN],
-    scale: pl.Tensor[[D // 32, Q_LORA], pl.FP8E8M0, pl.MX_B_NN],
-    output: pl.Tensor[[T_DYN, Q_LORA], pl.BF16],
-    num_tokens: pl.Scalar[pl.INT32],
-):
-    """Accumulate scale-corrected group-32 QLoRA products in FP32."""
-    scale_storage = pl.tensor.view(scale, [Q_LORA // 16, D // 2], layout=pl.ND)
-    for mt in pl.parallel((num_tokens + MX_M_TILE - 1) // MX_M_TILE):
-        t0 = mt * MX_M_TILE
-        for block in pl.spmd(Q_LORA // N_TILE, name_hint="prefill_swa_q_lora"):
-            n0 = block * N_TILE
-            rows = pl.min(MX_M_TILE, num_tokens - t0)
-            acc = pl.tile.full([MX_M_TILE, N_TILE], dtype=pl.FP32, value=0.0)
-            for kb in pl.range(D // (2 * PROJECTION_K_TILE)):
-                # MX_B_NN stores adjacent K-group scales in interleaved pairs.
-                raw = pl.load(scale_storage, [n0 // 16, kb * 32], [N_TILE // 16, 32])
-                raw_u8 = pl.reinterpret_view(raw, pl.UINT8)
-                codes = pl.cast(pl.reinterpret_view(raw_u8, pl.INT8), pl.INT32)
-                codes = pl.ands(codes, 255)
-                scale_bits = pl.maximum(pl.shls(codes, 23), 4194304)
-                scale_pair = pl.reinterpret_view(scale_bits, pl.FP32)
-                for half in pl.unroll(2):
-                    k0 = (kb * 2 + half) * PROJECTION_K_TILE
-                    if half == 0:
-                        gathered_scale = pl.tile.gather_mask(scale_pair, mask_pattern=pl.tile.MaskPattern.P0101)
-                    else:
-                        gathered_scale = pl.tile.gather_mask(scale_pair, mask_pattern=pl.tile.MaskPattern.P1010)
-                    sb = pl.reshape(gathered_scale, [1, N_TILE])
-                    source = pl.load(x, [t0, k0], [MX_M_TILE, PROJECTION_K_TILE], valid_shape=[rows, PROJECTION_K_TILE])
-                    source = pl.fillpad(source, pad_value=pl.PadValue.zero)
-                    source = pl.set_validshape(source, MX_M_TILE, PROJECTION_K_TILE)
-                    value = pl.cast(source, pl.FP32)
-                    reduce_tmp = pl.create_tile([MX_M_TILE, PROJECTION_K_TILE], dtype=pl.FP32)
-                    maximum = pl.row_max(pl.abs(value), tmp_tile=reduce_tmp)
-                    maximum = pl.maximum(maximum, 1e-4)
-                    bits = pl.reinterpret_view(pl.mul(maximum, 1.0 / 448.0), pl.INT32)
-                    exponent = pl.shrs(pl.add(bits, 8388607), 23)
-                    sa = pl.reinterpret_view(pl.shls(exponent, 23), pl.FP32)
-                    quantized = pl.row_expand_div(value, sa)
-                    payload = pl.cast(quantized, pl.FP8E4M3FN, mode="rint")
-                    a = pl.cast(payload, pl.BF16)
-                    weight_payload = pl.load(weight, [k0, n0], [PROJECTION_K_TILE, N_TILE])
-                    b = pl.cast(weight_payload, pl.BF16)
-                    dot = pl.matmul(a, b)
-                    part = pl.row_expand_mul(dot, sa)
-                    part = pl.col_expand_mul(part, sb)
-                    acc = pl.add(acc, part)
-            result = pl.cast(acc, pl.BF16, mode="rint")
-            result = pl.set_validshape(result, rows, N_TILE)
-            output = pl.store(result, [t0, n0], output)
-    return output
-
-
-def make_prefill_norm(width):
-    @pl.jit.inline
-    def normalize(
-        x: pl.Tensor[[T_DYN, width], pl.BF16],
-        weight: pl.Tensor[[width], pl.BF16],
-        output: pl.Tensor[[T_DYN, width], pl.BF16],
-        num_tokens: pl.Scalar[pl.INT32],
-    ):
-        for worker in pl.spmd(WORKER_TILE, name_hint="prefill_swa_rmsnorm"):
-            for block in pl.range(worker, (num_tokens + 7) // 8, WORKER_TILE):
-                t = block * 8
-                rows = pl.min(8, num_tokens - t)
-                source = pl.slice(x, [8, width], [t, 0], valid_shape=[rows, width])
-                source = pl.set_validshape(pl.fillpad(source, pad_value=pl.PadValue.zero), 8, width)
-                value = pl.cast(source, pl.FP32)
-                square_sum = pl.row_sum(pl.mul(value, value))
-                variance = pl.add(pl.mul(square_sum, 1.0 / width), EPS)
-                inv = pl.rsqrt(variance, high_precision=True)
-                gamma = pl.reshape(pl.cast(weight[:], pl.FP32), [1, width])
-                normalized = pl.col_expand_mul(pl.row_expand_mul(value, inv), gamma)
-                output[t:t + 8, :] = pl.set_validshape(pl.cast(normalized, pl.BF16, mode="rint"), rows, width)
-        return output
-
-    return normalize
-
-
-def make_prefill_rope(heads, inverse=False):
-    sign = -1.0 if inverse else 1.0
-
-    @pl.jit.inline
-    def rotate(
-        x: pl.Tensor[[T_DYN, heads * HEAD_DIM], pl.BF16],
-        cos: pl.Tensor[[T_DYN, ROPE_DIM // 2], pl.FP32],
-        sin: pl.Tensor[[T_DYN, ROPE_DIM // 2], pl.FP32],
-        output: pl.Tensor[[T_DYN, heads * HEAD_DIM], pl.BF16],
-        num_tokens: pl.Scalar[pl.INT32],
-    ):
-        for worker in pl.spmd(WORKER_TILE, name_hint="prefill_swa_rope"):
-            for block in pl.range(worker, num_tokens * heads, WORKER_TILE):
-                t = block // heads
-                h = block % heads
-                base = h * HEAD_DIM
-                output[t:t + 1, base:base + NOPE_DIM] = x[t:t + 1, base:base + NOPE_DIM]
-                tail = pl.cast(x[t:t + 1, base + NOPE_DIM:base + HEAD_DIM], pl.FP32)
-                even = pl.gather(tail, mask_pattern=pl.tile.MaskPattern.P0101)
-                odd = pl.gather(tail, mask_pattern=pl.tile.MaskPattern.P1010)
-                c = cos[t:t + 1, :]
-                s = pl.mul(sin[t:t + 1, :], sign)
-                re = pl.sub(pl.mul(even, c), pl.mul(odd, s))
-                im = pl.add(pl.mul(even, s), pl.mul(odd, c))
-                rotated = pl.full([1, ROPE_DIM], dtype=pl.FP32, value=0.0)
-                rotated = pl.tensor.scatter(re, mask_pattern=pl.tile.MaskPattern.P0101, dst=rotated)
-                rotated = pl.tensor.scatter(im, mask_pattern=pl.tile.MaskPattern.P1010, dst=rotated)
-                output[t:t + 1, base + NOPE_DIM:base + HEAD_DIM] = pl.cast(rotated, pl.BF16, mode="rint")
-        return output
-
-    return rotate
 
 
 @pl.jit.inline
@@ -305,13 +185,6 @@ def prefill_attend_window(
     return output
 
 
-prefill_normalize_q = make_prefill_norm(Q_LORA)
-prefill_normalize_kv = make_prefill_norm(HEAD_DIM)
-prefill_rotate_q = make_prefill_rope(LOCAL_H)
-prefill_rotate_kv = make_prefill_rope(1)
-prefill_rotate_output = make_prefill_rope(LOCAL_H, inverse=True)
-
-
 def golden_prefill_attn_swa(
     x: torch.Tensor,
     wq_a: torch.Tensor,
@@ -382,11 +255,10 @@ def prefill_attn_swa(
         worker = pl.tile.get_block_idx()
         for row in pl.range(worker, num_tokens, WORKER_TILE):
             kv_projection[row:row + 1, :] = pl.full([1, HEAD_DIM], dtype=pl.BF16, value=0.0)
-    project_kv(x, wkv, wkv_scale, kv_projection, num_tokens)
     kv_normalized = pl.create_tensor([tokens, HEAD_DIM], dtype=pl.BF16)
-    prefill_normalize_kv(kv_projection, kv_norm_weight, kv_normalized, num_tokens)
     kv = pl.create_tensor([tokens, HEAD_DIM], dtype=pl.BF16)
-    prefill_rotate_kv(kv_normalized, rope_cos, rope_sin, kv, num_tokens)
+    prefill_kv_proj_rope(x, wkv, wkv_scale, kv_norm_weight, rope_cos, rope_sin,
+                         kv_projection, kv_normalized, kv, num_tokens)
     chunk_done = prefill_publish_window(kv, window_slots, window_cache, window_cache_scale, num_tokens, cache_ready)
 
     chunk_x = pl.create_tensor([QUERY_TILE, D], dtype=pl.BF16)
@@ -416,15 +288,12 @@ def prefill_attn_swa(
                 chunk_cos[row:row + 1, :] = rope_cos[source_row:source_row + 1, :]
                 chunk_sin[row:row + 1, :] = rope_sin[source_row:source_row + 1, :]
                 chunk_indices[row:row + 1, :] = window_indices[source_row:source_row + 1, :]
-        prefill_project_qa(chunk_x, wq_a, wq_a_scale, qa, active)
-        prefill_normalize_q(qa, q_norm_weight, qr, active)
-        project_qb(qr, wq_b, wq_b_scale, qb, active)
-        prefill_rotate_q(qb, chunk_cos, chunk_sin, q, active)
+        prefill_q_proj_qr(chunk_x, wq_a, wq_a_scale, q_norm_weight, qa, qr, active)
+        prefill_q_proj_rope(qr, wq_b, wq_b_scale, chunk_cos, chunk_sin, qb, q, active)
         prefill_gather_window(window_cache, window_cache_scale, chunk_indices, selected, active)
         prefill_attend_window(q, selected, chunk_indices, attn_sink, attended, active)
-        prefill_rotate_output(attended, chunk_cos, chunk_sin, unrotated, active)
-        grouped_output(unrotated, wo_a, latent, active)
-        project_ob(latent, wo_b, wo_b_scale, chunk_partial, active)
+        prefill_o_proj(attended, wo_a, wo_b, wo_b_scale, chunk_cos, chunk_sin,
+                       unrotated, latent, chunk_partial, active)
         with pl.spmd(WORKER_TILE, name_hint="prefill_swa_collect") as collect_tid:
             worker = pl.tile.get_block_idx()
             for row in pl.range(worker, active, WORKER_TILE):
