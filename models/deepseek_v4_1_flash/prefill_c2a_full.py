@@ -60,6 +60,7 @@ from models.deepseek_v4_1_flash.decode_c2a_full import (
     IDX_PACKED,
     IDX_SCALES,
     INPUT_NAMES,
+    STATE_METADATA,
     MUTABLE_NAMES,
     SHARDED_NAMES,
     compare_cache,
@@ -176,7 +177,7 @@ def prefill_c2a_full(
     compressed_cache_scale: pl.Tensor[
         [C.CMP_BLOCKS_DYN, 128, 1, C.HEAD_DIM // C.COMPRESSED_CACHE_GROUP], pl.FP8E4M3FN
     ],
-    request_ids: pl.Tensor[[C.T_DYN], pl.INT32],
+    token_to_req_indices: pl.Tensor[[C.T_DYN], pl.INT32],
     compressed_lens: pl.Tensor[[C.T_DYN], pl.INT32],
     index_cache: pl.Tensor[[C.INDEX_BLOCKS_DYN, 128, 1, C.INDEX_DIM // 2], pl.UINT8],
     index_cache_scale: pl.Tensor[
@@ -188,8 +189,9 @@ def prefill_c2a_full(
     compressed_rope_sin: pl.Tensor[[C.T_DYN, C.ROPE_DIM // 2], pl.FP32],
     compressor_wkv: pl.Tensor[[C.D, C.HEAD_DIM], pl.FP32],
     compressor_wgate: pl.Tensor[[C.D, C.HEAD_DIM], pl.FP32],
-    compressor_state_rows: pl.Tensor[[C.T_DYN], pl.INT64],
-    compressor_state: pl.Tensor[[C.MAX_BATCH_PER_DP, C.STATE_HEADS, C.HEAD_DIM], pl.FP32],
+    query_start_loc: pl.Tensor[[C.Q_START_DYN], pl.INT32],
+    state_block_table: pl.Tensor[[C.B_DYN, 1], pl.INT32],
+    state_cache: pl.Tensor[[C.STATE_BLOCKS_DYN, C.STATE_CAPACITY, C.STATE_WIDTH], pl.FP32],
     compressor_norm_weight: pl.Tensor[[C.HEAD_DIM], pl.BF16],
     compressed_slots: pl.Tensor[[C.T_DYN], pl.INT64],
     index_wk: pl.Tensor[[C.HEAD_DIM, C.INDEX_DIM], pl.BF16],
@@ -225,10 +227,10 @@ def prefill_c2a_full(
     prefill_attn_c2a_full(
         attn_input, wq_a, wq_a_scale, q_norm_weight, wq_b, wq_b_scale, wkv, wkv_scale, kv_norm_weight,
         attn_sink, wo_a, wo_b, wo_b_scale, rope_cos, rope_sin, window_slots, window_indices,
-        window_cache, window_cache_scale, compressed_cache, compressed_cache_scale, request_ids,
+        window_cache, window_cache_scale, compressed_cache, compressed_cache_scale, token_to_req_indices,
         compressed_lens, index_cache, index_cache_scale, index_block_table, position_ids,
         compressed_rope_cos, compressed_rope_sin, compressor_wkv, compressor_wgate,
-        compressor_state_rows, compressor_state, compressor_norm_weight, compressed_slots,
+        query_start_loc, state_block_table, state_cache, compressor_norm_weight, compressed_slots,
         index_wk, index_norm_weight, index_wq_b, index_wq_b_scale, index_weights_proj,
         topk_indices, output_window, output_arrived, attn_output, group_base, tp_rank,
         num_tokens, attention_epoch,
@@ -448,7 +450,7 @@ def make_compare(mode, epochs, initial_state):
     }
     if mode == "full":
         compare["topk_indices"] = staged.compare("topk_indices", compare_per_rank(compare_topk))
-        compare["compressor_state"] = staged.compare("compressor_state", compare_per_rank(compare_state))
+        compare["state_cache"] = staged.compare("state_cache", compare_per_rank(compare_state, STATE_METADATA))
         for name, slots in CACHE_SLOTS.items():
             compare[name] = staged.compare(name, compare_per_rank(compare_cache(name), slots))
     else:
@@ -490,7 +492,7 @@ def make_hc_program(capacity, world_size, epochs):
         ],
         compressed_cache: pl.InOut[pl.Tensor[[C.CMP_BLOCKS_DYN, 128, 1, CMP_PACKED], pl.UINT8]],
         compressed_cache_scale: pl.InOut[pl.Tensor[[C.CMP_BLOCKS_DYN, 128, 1, CMP_SCALES], pl.FP8E4M3FN]],
-        request_ids: pl.Tensor[[C.T_DYN], pl.INT32],
+        token_to_req_indices: pl.Tensor[[C.T_DYN], pl.INT32],
         compressed_lens: pl.Tensor[[C.T_DYN], pl.INT32],
         index_cache: pl.InOut[pl.Tensor[[C.INDEX_BLOCKS_DYN, 128, 1, IDX_PACKED], pl.UINT8]],
         index_cache_scale: pl.InOut[pl.Tensor[[C.INDEX_BLOCKS_DYN, 128, 1, IDX_SCALES], pl.FP8E8M0]],
@@ -500,8 +502,9 @@ def make_hc_program(capacity, world_size, epochs):
         compressed_rope_sin: pl.Tensor[[C.T_DYN, C.ROPE_DIM // 2], pl.FP32],
         compressor_wkv: pl.Tensor[[C.D, C.HEAD_DIM], pl.FP32],
         compressor_wgate: pl.Tensor[[C.D, C.HEAD_DIM], pl.FP32],
-        compressor_state_rows: pl.Tensor[[C.T_DYN], pl.INT64],
-        compressor_state: pl.InOut[pl.Tensor[[C.MAX_BATCH_PER_DP, C.STATE_HEADS, C.HEAD_DIM], pl.FP32]],
+        query_start_loc: pl.Tensor[[C.Q_START_DYN], pl.INT32],
+        state_block_table: pl.Tensor[[C.B_DYN, 1], pl.INT32],
+        state_cache: pl.InOut[pl.Tensor[[C.STATE_BLOCKS_DYN, C.STATE_CAPACITY, C.STATE_WIDTH], pl.FP32]],
         compressor_norm_weight: pl.Tensor[[C.HEAD_DIM], pl.BF16],
         compressed_slots: pl.Tensor[[C.T_DYN], pl.INT64],
         index_wk: pl.Tensor[[C.HEAD_DIM, C.INDEX_DIM], pl.BF16],
@@ -527,24 +530,28 @@ def make_hc_program(capacity, world_size, epochs):
         index_cache.bind_dynamic(0, INDEX_BLOCKS_DYN)
         index_block_table.bind_dynamic(0, B_DYN)
         index_block_table.bind_dynamic(1, TABLE_DYN)
-        for step in pl.range(epochs):
-            prefill_c2a_full(
-                x_hc, pre_mix, hc_attn_fn, hc_attn_scale, hc_attn_base, attn_norm_weight,
-                wq_a, wq_a_scale, q_norm_weight, wq_b, wq_b_scale, wkv, wkv_scale,
-                kv_norm_weight, attn_sink, wo_a, wo_b, wo_b_scale, rope_cos, rope_sin,
-                window_slots, window_indices, window_cache, window_cache_scale,
-                compressed_cache, compressed_cache_scale, request_ids, compressed_lens,
-                index_cache, index_cache_scale, index_block_table, position_ids,
-                compressed_rope_cos, compressed_rope_sin, compressor_wkv, compressor_wgate,
-                compressor_state_rows, compressor_state, compressor_norm_weight,
-                compressed_slots, index_wk, index_norm_weight, index_wq_b, index_wq_b_scale,
-                index_weights_proj, topk_indices, output_window, output_arrived, attn_input,
-                attn_output, next_pre_mix, x_hc_out, rank // TP_SIZE * TP_SIZE, rank % TP_SIZE,
-                num_tokens, attention_epoch + step,
-            )
+        query_start_loc.bind_dynamic(0, C.Q_START_DYN)
+        state_block_table.bind_dynamic(0, C.B_DYN)
+        state_cache.bind_dynamic(0, C.STATE_BLOCKS_DYN)
+        if num_tokens > 0:
+            for step in pl.range(epochs):
+                prefill_c2a_full(
+                    x_hc, pre_mix, hc_attn_fn, hc_attn_scale, hc_attn_base, attn_norm_weight,
+                    wq_a, wq_a_scale, q_norm_weight, wq_b, wq_b_scale, wkv, wkv_scale,
+                    kv_norm_weight, attn_sink, wo_a, wo_b, wo_b_scale, rope_cos, rope_sin,
+                    window_slots, window_indices, window_cache, window_cache_scale,
+                    compressed_cache, compressed_cache_scale, token_to_req_indices, compressed_lens,
+                    index_cache, index_cache_scale, index_block_table, position_ids,
+                    compressed_rope_cos, compressed_rope_sin, compressor_wkv, compressor_wgate,
+                    query_start_loc, state_block_table, state_cache, compressor_norm_weight,
+                    compressed_slots, index_wk, index_norm_weight, index_wq_b, index_wq_b_scale,
+                    index_weights_proj, topk_indices, output_window, output_arrived, attn_input,
+                    attn_output, next_pre_mix, x_hc_out, rank // TP_SIZE * TP_SIZE, rank % TP_SIZE,
+                    num_tokens, attention_epoch + step,
+                )
         return (
             x_hc_out, next_pre_mix, attn_output, attn_input, topk_indices, window_cache, window_cache_scale,
-            compressed_cache, compressed_cache_scale, index_cache, index_cache_scale, compressor_state,
+            compressed_cache, compressed_cache_scale, index_cache, index_cache_scale, state_cache,
         )
 
     @pl.jit.host
@@ -579,7 +586,7 @@ def make_hc_program(capacity, world_size, epochs):
         compressed_cache_scale: pl.InOut[
             pl.Tensor[[world_size, C.CMP_BLOCKS_DYN, 128, 1, CMP_SCALES], pl.FP8E4M3FN]
         ],
-        request_ids: pl.Tensor[[world_size, C.T_DYN], pl.INT32],
+        token_to_req_indices: pl.Tensor[[world_size, C.T_DYN], pl.INT32],
         compressed_lens: pl.Tensor[[world_size, C.T_DYN], pl.INT32],
         index_cache: pl.InOut[pl.Tensor[[world_size, C.INDEX_BLOCKS_DYN, 128, 1, IDX_PACKED], pl.UINT8]],
         index_cache_scale: pl.InOut[pl.Tensor[[world_size, C.INDEX_BLOCKS_DYN, 128, 1, IDX_SCALES], pl.FP8E8M0]],
@@ -589,9 +596,10 @@ def make_hc_program(capacity, world_size, epochs):
         compressed_rope_sin: pl.Tensor[[world_size, C.T_DYN, C.ROPE_DIM // 2], pl.FP32],
         compressor_wkv: pl.Tensor[[world_size, C.D, C.HEAD_DIM], pl.FP32],
         compressor_wgate: pl.Tensor[[world_size, C.D, C.HEAD_DIM], pl.FP32],
-        compressor_state_rows: pl.Tensor[[world_size, C.T_DYN], pl.INT64],
-        compressor_state: pl.InOut[
-            pl.Tensor[[world_size, C.MAX_BATCH_PER_DP, C.STATE_HEADS, C.HEAD_DIM], pl.FP32]
+        query_start_loc: pl.Tensor[[world_size, C.Q_START_DYN], pl.INT32],
+        state_block_table: pl.Tensor[[world_size, C.B_DYN, 1], pl.INT32],
+        state_cache: pl.InOut[
+            pl.Tensor[[world_size, C.STATE_BLOCKS_DYN, C.STATE_CAPACITY, C.STATE_WIDTH], pl.FP32]
         ],
         compressor_norm_weight: pl.Tensor[[world_size, C.HEAD_DIM], pl.BF16],
         compressed_slots: pl.Tensor[[world_size, C.T_DYN], pl.INT64],
@@ -615,6 +623,9 @@ def make_hc_program(capacity, world_size, epochs):
         index_cache.bind_dynamic(1, INDEX_BLOCKS_DYN)
         index_block_table.bind_dynamic(1, B_DYN)
         index_block_table.bind_dynamic(2, TABLE_DYN)
+        query_start_loc.bind_dynamic(1, C.Q_START_DYN)
+        state_block_table.bind_dynamic(1, C.B_DYN)
+        state_cache.bind_dynamic(1, C.STATE_BLOCKS_DYN)
         data_buffer = pld.alloc_window_buffer([capacity, D], dtype=pl.FP32)
         signal_buffer = pld.alloc_window_buffer([TP_SIZE, 1], dtype=pl.INT32)
         for rank in pl.range(pld.world_size()):
@@ -627,10 +638,10 @@ def make_hc_program(capacity, world_size, epochs):
                 attn_sink[rank], wo_a[rank], wo_b[rank], wo_b_scale[rank], rope_cos[rank],
                 rope_sin[rank], window_slots[rank], window_indices[rank], window_cache[rank],
                 window_cache_scale[rank], compressed_cache[rank], compressed_cache_scale[rank],
-                request_ids[rank], compressed_lens[rank], index_cache[rank],
+                token_to_req_indices[rank], compressed_lens[rank], index_cache[rank],
                 index_cache_scale[rank], index_block_table[rank], position_ids[rank],
                 compressed_rope_cos[rank], compressed_rope_sin[rank], compressor_wkv[rank],
-                compressor_wgate[rank], compressor_state_rows[rank], compressor_state[rank],
+                compressor_wgate[rank], query_start_loc[rank], state_block_table[rank], state_cache[rank],
                 compressor_norm_weight[rank], compressed_slots[rank], index_wk[rank],
                 index_norm_weight[rank], index_wq_b[rank], index_wq_b_scale[rank],
                 index_weights_proj[rank], topk_indices[rank], attn_input[rank], attn_output[rank],
@@ -699,7 +710,7 @@ def build_specs(args, mode, initial_state):
         TensorSpec("attn_output", [world_size, args.tokens, D], torch.bfloat16, resident="stacked"),
         TensorSpec("next_pre_mix", [world_size, args.tokens, HC_MULT], torch.float32, resident="stacked"),
         TensorSpec("x_hc_out", [world_size, args.tokens, HC_MULT, D], torch.float32, resident="stacked"),
-        ScalarSpec("num_tokens", torch.int32, args.tokens),
+        ScalarSpec("num_tokens", torch.int32, args.tokens, compile_runtime=True),
         ScalarSpec(
             "attention_epoch",
             torch.int32,

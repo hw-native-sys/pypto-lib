@@ -46,7 +46,7 @@ class AttentionGoldenResult:
     compressed_cache_scale: torch.Tensor | None
     index_cache: torch.Tensor | None
     index_cache_scale: torch.Tensor | None
-    compressor_state: torch.Tensor | None
+    state_cache: torch.Tensor | None
     topk_indices: torch.Tensor | None
     candidate_mask: torch.Tensor | None
 
@@ -255,8 +255,8 @@ def golden_compressed_attention(
     compressor_wkv: torch.Tensor | None,
     compressor_wgate: torch.Tensor | None,
     compressor_norm_weight: torch.Tensor | None,
-    compressor_state_rows: torch.Tensor | None,
-    compressor_state: torch.Tensor | None,
+    state_block_table: torch.Tensor | None,
+    state_cache: torch.Tensor | None,
     compressed_slots: torch.Tensor | None,
     position_ids: torch.Tensor | None,
     compressed_lens: torch.Tensor | None,
@@ -274,6 +274,7 @@ def golden_compressed_attention(
     candidate_mask: torch.Tensor | None,
     attention_fn: Callable | None = None,
     output_dtype: torch.dtype | None = None,
+    query_start_loc: torch.Tensor | None = None,
 ) -> AttentionGoldenResult:
     """Evaluate C2A/C1A full, reindex, or reuse with paged cache state."""
     query, window_kv, query_latent = qkv_proj_rope(
@@ -309,7 +310,7 @@ def golden_compressed_attention(
         quantized_index = dequantize_mxfp4_cache(
             index_cache, index_cache_scale, group_size=32, scale_format="e8m0"
         ).to(query.dtype)
-    updated_state = None if compressor_state is None else compressor_state.clone()
+    updated_state = None if state_cache is None else state_cache.clone()
     topk_indices = compressed_indices
     candidates = candidate_mask
 
@@ -322,14 +323,16 @@ def golden_compressed_attention(
             latent = compressor_ratio1(x, compressor_wkv, compressor_norm_weight)
             publish_mask = compressed_slots >= 0
         elif ratio == 2:
-            if compressor_wgate is None or compressor_state_rows is None or updated_state is None:
+            if compressor_wgate is None or state_block_table is None or updated_state is None:
                 raise ValueError("ratio-2 full mode requires gate weights and recurrent state")
-            if position_ids is None:
-                raise ValueError("ratio-2 full mode requires absolute position ids")
+            if position_ids is None or query_start_loc is None or request_ids is None:
+                raise ValueError("ratio-2 full mode requires positions, query starts and token-to-request indices")
             latent, publish_mask = compressor_ratio2_paged(
                 x,
+                query_start_loc,
                 position_ids,
-                compressor_state_rows,
+                request_ids,
+                state_block_table,
                 updated_state,
                 compressor_wkv,
                 compressor_wgate,

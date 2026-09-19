@@ -88,21 +88,77 @@ quantized in HBM:
   owned by layer 20.
 - Index-key payload: logical `[blocks, 128, 1, 128]`, packed MXFP4 E2M1, with
   `[blocks, 128, 1, 4]` E8M0 group-of-32 scales.
-- Ratio-2 recurrent state: `[32, 2, 512]`, FP32 and request-scoped. Head zero
-  stores one pending KV row and head one stores its gate scores. Ratio 1 has no
+- Ratio-2 recurrent state: `[num_state_blocks, STATE_CAPACITY, 1024]`, FP32.
+  Each row stores the token's 512-channel KV projection followed by its
+  512-channel gate score. `STATE_CAPACITY` is a model configuration constant
+  (currently 4), independent of context length and batch size. Ratio 1 has no
   recurrent compressor state.
 
 Compressed KV and index-key tensors for a source share the same
-`c{ratio}a_cmp_kv` block table. Recurrent state is indexed by the DP-local
-request row and does not grow with context length. Torch goldens quantize on
-cache publication and dequantize on cache reads; BF16 cache values are only an
-intermediate reference representation, not the kernel ABI.
+`c{ratio}a_cmp_kv` block table. Compressor state uses a separate engine-owned
+`state_block_table` and must never use the current batch row as its physical
+address. Torch goldens quantize on cache publication and dequantize on cache
+reads; BF16 cache values are only an intermediate reference representation,
+not the kernel ABI.
+
+### Compressor state ownership
+
+C2A Full prefill and decode take the same state inputs:
+
+| Input | Contract |
+| --- | --- |
+| `query_start_loc` | INT32 `[B + 1]`, starts at zero; nondecreasing packed query boundaries. Equal adjacent entries represent an empty request. |
+| `position_ids` | INT32 `[T]`, nonnegative absolute positions, consecutive within each valid request chunk. |
+| `token_to_req_indices` | INT32 `[T]`, the current batch row `r` for every token in `[query_start_loc[r], query_start_loc[r + 1])`. This is not a persistent request ID. |
+| `state_block_table` | INT32 `[B, 1]`, a stable physical state block per request; `-1` disables that request's compressor. |
+| `state_cache` | FP32 `[num_state_blocks, STATE_CAPACITY, 2 * HEAD_DIM]`, an inout ring owned by the source layer. |
+
+`num_tokens` counts the valid packed prefix and equals `query_start_loc[-1]`;
+`T` may include trailing storage padding. The standalone compressor accepts
+`num_tokens=0` with a positive padded tensor extent: it performs no projection,
+state or output accesses. Empty requests perform no state accesses. Invalid
+request/block indices are checked before table/cache indexing; negative
+positions suppress publication and state writes. A live request must have a
+valid allocation; an invalid block does not provide meaningful compression.
+Callers disable the corresponding compressed/index cache slots for inactive
+tokens as well. The metadata builder produces only the packed valid prefix. The C2A rank
+drivers skip the entire sublayer when `num_tokens=0`; TP peers within a DP
+group must agree on whether that group is idle.
+
+For each valid token at absolute position `p`, the compressor computes
+`block = state_block_table[token_to_req_indices[t], 0]` and ring slot
+`block * STATE_CAPACITY + p % STATE_CAPACITY`. An odd-position token closes a
+pair. At the start of a chunk it reads the predecessor at
+`(p - 1) % STATE_CAPACITY`; within a chunk it reads the preceding projection
+directly. All historical reads complete before state writes. Only the last
+`min(chunk_length, STATE_CAPACITY)` rows of a chunk are written, giving each
+ring slot at most one writer even when the chunk is longer than the ring.
+The pooling softmax, BF16 rounding before RMSNorm, and publication parity are
+unchanged.
+
+The engine retains the same physical block while a request changes batch row.
+It may release/reassign a block only after that request's outstanding state
+users complete; distinct live requests cannot write the same block. Layers
+2, 8 and 14 own independent state caches. `ForwardMetadata.state_block_tables`
+contains a separate engine-supplied table for each source, allowing either
+shared block numbering across those pools or independent allocations. No
+payload is shared between source layers; reuse layers use their source's
+compressed outputs and do not update compressor state.
+
+A new request starts at position zero with no pending pair. Old bytes in a
+reused block are harmless only under this contract: its own even-position
+projection is written before a later call consumes it. Resuming at an odd
+position requires restoring or recomputing that request/source's matching
+predecessor KV and gate state. Restoring only compressed KV, or zeroing state,
+is insufficient. Ring storage does not implement speculative acceptance,
+rollback, or prefix-state restoration; those remain engine responsibilities.
+
 Indexer workspaces store physical flattened cache-row ids, padded with `-1`,
 so separately scheduled window and compressed sparse-attention kernels do not
 depend on a concatenated-cache offset. Candidate masks remain in request-local
 compressed-position space.
 
-`ForwardMetadata` lowers packed query starts, request ids, absolute positions,
+`ForwardMetadata` lowers packed query starts, token-to-request indices, absolute positions,
 previous/new KV lengths, cache slot mappings, sliding-window indices,
 per-token causal compressed lengths, per-request compressed lengths and
 remainders, ragged compressor output starts, source-token rows, and compressed
@@ -208,3 +264,17 @@ The implementation milestones are ordered by dependency:
 
 Until the leaf kernels and weight loader land, this directory is not a runnable
 model and is not exposed to `pypto-serving`.
+
+The compressor ownership regression can run without devices:
+
+```bash
+python -m pytest tests/contract/test_v41_compressor_state.py -q
+python tests/contract/test_v41_compressor_state.py -p a5sim
+```
+
+The second command runs two consecutive kernel calls with reordering, block
+reuse, a chunk longer than the ring, inactive requests, trailing padding, and
+an empty-work case. Use `-p a5 -d <allocated_device>` for the same test on a
+real A5 device. Full attention validation additionally uses
+`decode_c2a_full.py` and `prefill_c2a_full.py`; their fixtures use nonidentity
+state block mappings.
