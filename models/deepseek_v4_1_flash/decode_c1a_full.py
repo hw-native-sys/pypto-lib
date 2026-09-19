@@ -1279,7 +1279,8 @@ def c1a_index(
     weights_tid = project_index_weights(x, index_weights_proj, weights, num_tokens, entry_ready)
     pages = pl.tensor.dim(index_cache, 0)
     keys = pl.create_tensor([pages, 128, INDEX_DIM], dtype=pl.BF16)
-    keys, keys_tid = decode_index_keys(index_cache, index_cache_scale, keys, entry_ready)
+    # Work around pypto#2829: finish weights before decode reuses the paired Vector UB.
+    keys, keys_tid = decode_index_keys(index_cache, index_cache_scale, keys, weights_tid)
     scores = pl.create_tensor([tokens, score_width], dtype=pl.FP32)
     return query, weights, keys, scores, keys_tid, query_tid, weights_tid
 

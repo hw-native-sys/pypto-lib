@@ -47,7 +47,8 @@ def project_index_weights(
     num_tokens: pl.Scalar[pl.INT32],
 ):
     """Project BF16 per-head weights with BF16 rounding before and after scaling."""
-    for block in pl.spmd((num_tokens + M_TILE - 1) // M_TILE, name_hint="c1a_index_weights"):
+    with pl.spmd((num_tokens + M_TILE - 1) // M_TILE, name_hint="c1a_index_weights") as weights_tid:
+        block = pl.tile.get_block_idx()
         token = block * M_TILE
         rows = pl.min(M_TILE, num_tokens - token)
         accumulator = pl.create_tensor([M_TILE, INDEX_H], dtype=pl.FP32)
@@ -65,7 +66,7 @@ def project_index_weights(
         scaled = pl.mul(pl.cast(projected, pl.FP32), INDEX_SCORE_SCALE)
         rounded = pl.cast(scaled, pl.BF16, mode="rint")
         output[token:token + M_TILE, :] = pl.set_validshape(rounded, rows, INDEX_H)
-    return output
+    return weights_tid
 
 
 @pl.jit.inline
@@ -179,7 +180,7 @@ def make_paged_indexer(use_candidates=False, direct_topk=False):
             num_tokens,
         )
         index_weights = pl.create_tensor([tokens, INDEX_H], dtype=pl.BF16)
-        project_index_weights(x, index_weights_proj, index_weights, num_tokens)
+        weights_tid = project_index_weights(x, index_weights_proj, index_weights, num_tokens)
 
         score_completion = pl.array.create(1, pl.TASK_ID)
         score_completion[0] = cache_ready
@@ -193,7 +194,8 @@ def make_paged_indexer(use_candidates=False, direct_topk=False):
                 [tokens, positions, INDEX_DIM],
                 dtype=pl.BF16,
             )
-            with pl.spmd(num_tokens * pages, name_hint="c1a_index_decode", deps=[cache_ready]) as decode_tid:
+            # Work around pypto#2829: finish weights before decode reuses the paired Vector UB.
+            with pl.spmd(num_tokens * pages, name_hint="c1a_index_decode", deps=[cache_ready, weights_tid]) as decode_tid:
                 block = pl.tile.get_block_idx()
                 token = block // pages
                 page = block % pages

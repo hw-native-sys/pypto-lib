@@ -146,6 +146,15 @@ uses the same rounding boundaries.
 This makes accumulation explicit rather than depending on the CPU backend's
 native BF16 matrix multiplication.
 
+C1A Full and Reindex, in both prefill and decode, temporarily order index-key
+decoding after the index-weight projection completes
+([pypto#2829](https://github.com/hw-native-sys/pypto/issues/2829)). On the pinned A5 stack,
+a mixed projection's Cube producer can start while its paired Vector core
+still executes a decoder, overwriting the decoder's UB through the local C2V
+pipe. The explicit task dependency avoids this overlap at the cost of some
+parallelism; it does not change the arithmetic or precision thresholds.
+Reuse has no index-weight projection or index-key decoder.
+
 For C1A prefill, the attention reference follows the kernel's 32-key online
 softmax tiles, BF16 probability operand for PV, and FP32 correction of the
 first 16 columns of the first head in each 16-head group. Each rank's final
