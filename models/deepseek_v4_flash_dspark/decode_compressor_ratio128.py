@@ -100,7 +100,8 @@ RMS_PAD_ROWS = RMS_PAD_BLOCKS * RMS_PAD_TILE
 # afford a wider head tile than HEAD_TILE: each wider tile loads each state block fewer times
 # (HEAD_DIM/POOL_HEAD_TILE tiles/batch instead of HEAD_DIM/HEAD_TILE), cutting load redundancy.
 POOL_HEAD_TILE = 128
-POOL_REQUEST_TILE = 2
+# Keep one request per block so all 16 decode requests can pool concurrently at a compression boundary.
+POOL_REQUEST_TILE = 1
 # Gather rows per softmax_pool iteration. Held independent of the state page size: the
 # two [STATE_LEN, POOL_HEAD_TILE] FP32 pools already take 128 KB of the 184 KB Vec space,
 # leaving room for one double-buffered [POOL_STATE_TILE, POOL_HEAD_TILE] pair.
