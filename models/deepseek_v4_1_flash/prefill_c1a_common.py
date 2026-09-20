@@ -636,9 +636,7 @@ def attend_sparse_cache(
 @pl.jit.inline(auto_scope=False)
 def prefill_c1a_partial(
     x: pl.Tensor[[T_DYN, D], pl.BF16],
-    wq_a: pl.Tensor[[D, Q_LORA], pl.FP8E4M3FN],
-    wq_a_scale: pl.Tensor[[D // 32, Q_LORA], pl.FP8E8M0, pl.MX_B_NN],
-    q_norm_weight: pl.Tensor[[Q_LORA], pl.BF16],
+    query_latent: pl.Tensor[[T_DYN, Q_LORA], pl.BF16],
     wq_b: pl.Tensor[[Q_LORA, LOCAL_H * HEAD_DIM], pl.FP8E4M3FN],
     wq_b_scale: pl.Tensor[[Q_LORA // 32, LOCAL_H * HEAD_DIM], pl.FP8E8M0, pl.MX_B_NN],
     wkv: pl.Tensor[[D, HEAD_DIM], pl.FP8E4M3FN],
@@ -668,12 +666,8 @@ def prefill_c1a_partial(
 ):
     """Compute one TP rank's ratio-1 compressed-attention output."""
     tokens = pl.tensor.dim(x, 0)
-    qa = pl.create_tensor([tokens, Q_LORA], dtype=pl.BF16)
-    project_qa(x, wq_a, wq_a_scale, qa, num_tokens)
-    qr = pl.create_tensor([tokens, Q_LORA], dtype=pl.BF16)
-    normalize_q(qa, q_norm_weight, qr, num_tokens)
     qb = pl.create_tensor([tokens, LOCAL_H * HEAD_DIM], dtype=pl.BF16)
-    project_qb(qr, wq_b, wq_b_scale, qb, num_tokens)
+    project_qb(query_latent, wq_b, wq_b_scale, qb, num_tokens)
     query = pl.create_tensor([tokens, LOCAL_H * HEAD_DIM], dtype=pl.BF16)
     rotate_q(qb, rope_cos, rope_sin, query, num_tokens)
 

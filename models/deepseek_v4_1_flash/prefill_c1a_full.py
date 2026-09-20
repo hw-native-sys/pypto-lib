@@ -330,9 +330,7 @@ def make_prefill_c1a_full(indexer):
         partial = pl.create_tensor([tokens, D], dtype=pl.FP32)
         prefill_c1a_partial(
             x,
-            wq_a,
-            wq_a_scale,
-            q_norm_weight,
+            query_latent,
             wq_b,
             wq_b_scale,
             wkv,

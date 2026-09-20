@@ -30,7 +30,7 @@ import pypto.language.distributed as pld
 import torch
 
 from models.deepseek_v4_1_flash import config as C
-from models.deepseek_v4_1_flash.prefill_c1a_common import prefill_c1a_partial
+from models.deepseek_v4_1_flash.prefill_c1a_common import make_norm, make_projection, prefill_c1a_partial
 from models.deepseek_v4_1_flash.prefill_c1a_test_utils import (
     CASE_DEFAULT,
     CASE_MAX_TOKENS,
@@ -65,6 +65,9 @@ REUSE_INPUT_NAMES = COMMON_INPUT_NAMES + ("compressed_indices",)
 
 if TP_SIZE not in (1, 2, 4):
     raise ValueError("Prefill C1A currently supports TP1, TP2, and TP4; TP8 requires head-tile padding")
+
+project_query_latent = make_projection(C.D, C.Q_LORA)
+normalize_query_latent = make_norm(C.Q_LORA)
 
 
 def golden_prefill_c1a_reuse(
@@ -178,12 +181,14 @@ def prefill_c1a_reuse(
 ):
     """Read published ratio-1 Top-K rows and compute packed-prefill C1A."""
     tokens = pl.tensor.dim(x, 0)
+    query_projection = pl.create_tensor([tokens, Q_LORA], dtype=pl.BF16)
+    project_query_latent(x, wq_a, wq_a_scale, query_projection, num_tokens)
+    query_latent = pl.create_tensor([tokens, Q_LORA], dtype=pl.BF16)
+    normalize_query_latent(query_projection, q_norm_weight, query_latent, num_tokens)
     partial = pl.create_tensor([tokens, D], dtype=pl.FP32)
     prefill_c1a_partial(
         x,
-        wq_a,
-        wq_a_scale,
-        q_norm_weight,
+        query_latent,
         wq_b,
         wq_b_scale,
         wkv,
