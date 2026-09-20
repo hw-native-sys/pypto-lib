@@ -68,6 +68,12 @@ jobs:
           build-namespace: ${{ matrix.platform }}
           pip-cache-name: pip-sim
           toolchain: bundle
+          # a5sim is the MXFP8 leg: both A5 trees hold every MX scale in a
+          # torch.float8_e8m0fnu tensor, which 2.6 does not have. 20 of the 24
+          # a5sim failures in the 2026-09-19 nightly were that one
+          # AttributeError, raised before anything compiled. a2a3sim keeps the
+          # default, which is the version the serving torch_npu pin requires.
+          torch-version: ${{ matrix.platform == 'a5sim' && 'torch==2.10.0' || 'torch==2.6.0' }}
 
       - name: Run model tests (${{ matrix.platform }})
         id: sweep
@@ -107,9 +113,15 @@ jobs:
           # `# ci: no-sim` (full multi-layer / multi-card forwards) are
           # device-only and would just argparse-reject *sim, so skip them here.
           for f in $(find models -name '*.py' ! -name '*_draft.py' | sort); do
-            # Pro runs on a5sim; V4.1 Flash has separate A5 device coverage.
+            # a5sim takes both A5 trees; the a2a3 legs take neither. Of the
+            # V4.1-Flash directory it keeps whatever a simulator can run: the
+            # `# ci: a5` device entries split the `__main__` sentinel and carry
+            # `# ci: no-sim`, so the two filters below drop them, which leaves
+            # the MoE, gate, expert and transport files. Those declare a5sim
+            # among their own `-p` choices and have had no daily run since the
+            # A2/A3 sweeps stopped taking this directory.
             if [ "${{ matrix.platform }}" = "a5sim" ]; then
-              [[ "$f" == models/deepseek_v4_pro/* ]] || continue
+              [[ "$f" == models/deepseek_v4_pro/* || "$f" == models/deepseek_v4_1_flash/* ]] || continue
             elif [[ "$f" == models/deepseek_v4_pro/* || "$f" == models/deepseek_v4_1_flash/* ]]; then
               continue
             fi
@@ -969,7 +981,7 @@ jobs:
           print("## Daily CI Model Test Results")
           print()
           table("a2a3 and a2a3sim", ["a2a3", "a2a3sim"])
-          table("a5sim (DeepSeek V4-Pro)", ["a5sim"])
+          table("a5sim (DeepSeek V4-Pro and V4.1-Flash)", ["a5sim"])
           table("a5 (DeepSeek V4.1-Flash)", ["a5"])
           e2e("a5 DeepSeek-V4-Flash EP8 end-to-end token generation (real weights)", "e2e-a5")
           EOF
