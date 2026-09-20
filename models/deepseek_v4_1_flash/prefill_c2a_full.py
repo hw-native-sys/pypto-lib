@@ -78,7 +78,7 @@ from models.deepseek_v4_1_flash.decode_attn_c2a_full import (
     make_c2a_inputs,
     official_reference_c2a,
 )
-from models.deepseek_v4_1_flash.decode_c2a_reuse import (
+from models.deepseek_v4_1_flash.decode_attn_c2a_reuse import (
     REUSE_INPUT_NAMES,
     REUSE_MUTABLE_NAMES,
     REUSE_SHARDED_NAMES,
