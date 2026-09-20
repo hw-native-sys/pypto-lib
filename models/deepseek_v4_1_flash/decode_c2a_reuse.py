@@ -72,7 +72,7 @@ from models.deepseek_v4_1_flash.decode_c2a_full import (
     official_reference_c2a,
     official_rope,
 )
-from models.deepseek_v4_1_flash.decode_swa import (
+from models.deepseek_v4_1_flash.decode_attn_swa import (
     grouped_output,
     normalize_kv,
     normalize_q,

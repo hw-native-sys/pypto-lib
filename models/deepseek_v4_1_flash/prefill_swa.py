@@ -282,7 +282,7 @@ def make_hc_program(capacity, world_size, epochs):
 def build_hc_specs(args):
     """Stacked TP/DP specs with HC streams in and HC streams out."""
     from golden import ScalarSpec, TensorSpec
-    from models.deepseek_v4_1_flash.decode_swa import make_inputs, make_packed_inputs
+    from models.deepseek_v4_1_flash.decode_attn_swa import make_inputs, make_packed_inputs
 
     world_size = TP_SIZE * args.dp
     packed = True
@@ -357,7 +357,7 @@ def build_hc_specs(args):
 
 def reference_attention(tensors, hidden, base):
     """One TP group's SWA on ``hidden``: the FP32 TP sum in BF16 and each rank's (cache, scale)."""
-    from models.deepseek_v4_1_flash.decode_swa import official_reference
+    from models.deepseek_v4_1_flash.decode_attn_swa import official_reference
 
     partials, caches = [], []
     for rank in range(base, base + TP_SIZE):
@@ -413,7 +413,7 @@ def report(name, actual, expected):
 def make_staged_compare():
     """Stage-wise comparators: mHC pre vs golden, SWA teacher-forced, hc_post replayed."""
     from golden import ratio_allclose
-    from models.deepseek_v4_1_flash.decode_swa import compare_distributed_cache, compare_reduced, compare_scales
+    from models.deepseek_v4_1_flash.decode_attn_swa import compare_distributed_cache, compare_reduced, compare_scales
 
     bf16_close = ratio_allclose(atol=1e-4, rtol=1.0 / 128)
     forced = {}

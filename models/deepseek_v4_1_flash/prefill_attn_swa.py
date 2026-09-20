@@ -42,7 +42,7 @@ from models.deepseek_v4_1_flash.config import (
     TP_SIZE,
     WINDOW_CACHE_GROUP,
 )
-from models.deepseek_v4_1_flash.decode_swa import (
+from models.deepseek_v4_1_flash.decode_attn_swa import (
     EPS,
     M_TILE,
     MX_M_TILE,
@@ -442,7 +442,7 @@ __all__ = ["golden_prefill_attn_swa", "prefill_attn_swa"]
 
 def main():
     """Validate the Prefill SWA leaf operator on A5."""
-    from models.deepseek_v4_1_flash.decode_swa import run_swa
+    from models.deepseek_v4_1_flash.decode_attn_swa import run_swa
 
     run_swa(prefill_attn_swa, "prefill")
 

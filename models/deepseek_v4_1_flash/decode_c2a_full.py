@@ -56,7 +56,7 @@ from models.deepseek_v4_1_flash.config import (
     TP_SIZE,
     AttentionMode,
 )
-from models.deepseek_v4_1_flash.decode_swa import (
+from models.deepseek_v4_1_flash.decode_attn_swa import (
     EPS,
     K_TILE,
     M_TILE,
