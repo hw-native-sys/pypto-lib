@@ -140,17 +140,41 @@ def make_norm(width):
         output: pl.Tensor[[T_DYN, width], pl.BF16],
         num_tokens: pl.Scalar[pl.INT32],
     ):
-        for block in pl.spmd((num_tokens + 7) // 8, name_hint="swa_rmsnorm"):
-            t = block * 8
-            rows = pl.min(8, num_tokens - t)
-            source = pl.slice(x, [8, width], [t, 0], valid_shape=[rows, width])
-            source = pl.set_validshape(pl.fillpad(source, pad_value=pl.PadValue.zero), 8, width)
-            value = pl.cast(source, pl.FP32)
-            inv = pl.rsqrt(pl.add(pl.mul(pl.row_sum(pl.mul(value, value)), 1.0 / width),
-                                 EPS), high_precision=True)
-            gamma = pl.reshape(pl.cast(weight[:], pl.FP32), [1, width])
-            normalized = pl.col_expand_mul(pl.row_expand_mul(value, inv), gamma)
-            output[t:t + 8, :] = pl.set_validshape(pl.cast(normalized, pl.BF16, mode="rint"), rows, width)
+        if width == D:
+            # Chunk the hidden dimension to retain aligned row reductions within Vec capacity.
+            for block in pl.spmd((num_tokens + 7) // 8, name_hint="swa_hidden_rmsnorm"):
+                t = block * 8
+                rows = pl.min(8, num_tokens - t)
+                square_sum = pl.full([1, 8], dtype=pl.FP32, value=0.0)
+                for chunk in pl.pipeline(width // 128, stage=2):
+                    d0 = chunk * 128
+                    source_chunk = pl.slice(x, [8, 128], [t, d0], valid_shape=[rows, 128])
+                    source_chunk = pl.set_validshape(pl.fillpad(source_chunk, pad_value=pl.PadValue.zero), 8, 128)
+                    value_chunk = pl.cast(source_chunk, pl.FP32)
+                    chunk_sum = pl.reshape(pl.row_sum(pl.mul(value_chunk, value_chunk)), [1, 8])
+                    square_sum = pl.add(square_sum, chunk_sum)
+                inverse = pl.rsqrt(pl.add(pl.mul(square_sum, 1.0 / width), EPS), high_precision=True)
+                inverse_col = pl.reshape(inverse, [8, 1])
+                for chunk in pl.pipeline(width // 128, stage=2):
+                    d0 = chunk * 128
+                    source_chunk = pl.slice(x, [8, 128], [t, d0], valid_shape=[rows, 128])
+                    source_chunk = pl.set_validshape(pl.fillpad(source_chunk, pad_value=pl.PadValue.zero), 8, 128)
+                    value_chunk = pl.cast(source_chunk, pl.FP32)
+                    gamma_chunk = pl.reshape(pl.cast(weight[d0:d0 + 128], pl.FP32), [1, 128])
+                    result_chunk = pl.col_expand_mul(pl.row_expand_mul(value_chunk, inverse_col), gamma_chunk)
+                    output[t:t + 8, d0:d0 + 128] = pl.set_validshape(pl.cast(result_chunk, pl.BF16, mode="rint"), rows, 128)
+        else:
+            for block in pl.spmd((num_tokens + 7) // 8, name_hint="swa_rmsnorm"):
+                t = block * 8
+                rows = pl.min(8, num_tokens - t)
+                source = pl.slice(x, [8, width], [t, 0], valid_shape=[rows, width])
+                source = pl.set_validshape(pl.fillpad(source, pad_value=pl.PadValue.zero), 8, width)
+                value = pl.cast(source, pl.FP32)
+                inv = pl.rsqrt(pl.add(pl.mul(pl.row_sum(pl.mul(value, value)), 1.0 / width),
+                                     EPS), high_precision=True)
+                gamma = pl.reshape(pl.cast(weight[:], pl.FP32), [1, width])
+                normalized = pl.col_expand_mul(pl.row_expand_mul(value, inv), gamma)
+                output[t:t + 8, :] = pl.set_validshape(pl.cast(normalized, pl.BF16, mode="rint"), rows, width)
         return output
 
     return normalize
