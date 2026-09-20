@@ -130,7 +130,7 @@ def decode_c1a_reindex(
         window_cache_scale, compressed_cache, compressed_cache_scale, request_ids, compressed_lens,
         index_cache, index_cache_scale, index_block_table, candidate_mask, index_wq_b, index_wq_b_scale,
         index_weights_proj, topk_indices, output_window, output_arrived, attn_out, group_base, tp_rank,
-        num_tokens, attention_epoch,
+        num_tokens, attention_epoch, False,
     )
     mhc_post(attn_out, x_hc, post_mix, residual_mix, output)
     return output

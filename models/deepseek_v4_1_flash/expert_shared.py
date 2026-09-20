@@ -267,6 +267,10 @@ def expert_shared(
             [SH_M_TILE, MOE_INTER // MX_GROUP],
             layout=pl.MX_A_ZZ,
         )
+        # Keep the Cube store and Vector cast in separate tasks, as in the
+        # routed expert. The pinned A5 local C2V startup can overwrite a busy
+        # Vector core's UB before its mixed task starts (pypto#2829).
+        y_tile_fp32 = pl.create_tensor([SH_M_TILE, D], dtype=pl.FP32)
         for db_idx in pl.spmd(D // D_OUT_TILE, name_hint="sh_w2_mm"):
             d0 = db_idx * D_OUT_TILE
             hs0 = pl.load(h_tile_mx, [0, 0], [SH_M_TILE, MX_W2_RIGHT_K_TILE])
@@ -337,7 +341,12 @@ def expert_shared(
                         sw2_part,
                         sw2_scale_part,
                     )
-            y_bf16 = pl.cast(y_acc, target_type=pl.BF16, mode="rint")
+            y_tile_fp32 = pl.store(y_acc, [0, d0], y_tile_fp32)
+
+        for db_idx in pl.spmd(D // D_OUT_TILE, name_hint="sh_w2_output"):
+            d0 = db_idx * D_OUT_TILE
+            y_fp32 = pl.load(y_tile_fp32, [0, d0], [SH_M_TILE, D_OUT_TILE])
+            y_bf16 = pl.cast(y_fp32, target_type=pl.BF16, mode="rint")
             y_valid = pl.set_validshape(y_bf16, SH_VALID_M, D_OUT_TILE)
             sh = pl.store(y_valid, [ts0, d0], sh)
 

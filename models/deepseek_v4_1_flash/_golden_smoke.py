@@ -192,8 +192,6 @@ def run_moe_golden(golden_fn: Callable[..., torch.Tensor]) -> None:
         shared_down_scale,
         torch.randn(64, 128).to(torch.float8_e4m3fn),
         shared_up_scale,
-        token_owners=torch.tensor([0, 1, 2], dtype=torch.int32),
-        tp_size=4,
     )
     if not bool(torch.isfinite(output).all()):
         raise RuntimeError("MoE golden produced non-finite output")

@@ -22,6 +22,8 @@ if __package__ in (None, ""):
 import pypto.language as pl
 import pypto.language.distributed as pld
 
+from models.deepseek_v4_1_flash.attention_tp import OUTPUT_T_DYN
+
 from models.deepseek_v4_1_flash.config import (
     CMP_BLOCKS_DYN,
     COMPRESSED_CACHE_GROUP,
@@ -78,11 +80,12 @@ def decode_attn_c1a_reuse(
     compressed_indices: pl.Tensor[[T_DYN, INDEX_TOPK], pl.INT32],
     output_window: pld.DistributedTensor[[DECODE_MAX_TOKENS, D], pl.FP32],
     output_arrived: pld.DistributedTensor[[TP_SIZE, 1], pl.INT32],
-    output: pl.Tensor[[T_DYN, D], pl.BF16],
+    output: pl.Tensor[[OUTPUT_T_DYN, D], pl.BF16],
     group_base: pl.Scalar[pl.INT32],
     tp_rank: pl.Scalar[pl.INT32],
     num_tokens: pl.Scalar[pl.INT32],
     attention_epoch: pl.Scalar[pl.INT32],
+    reduce_scatter: pl.constexpr = False,
 ):
     cache_ready = c1a_previous_epoch(output_arrived, attention_epoch)
     # Reuse scores caller-supplied top-k rows, so the index query is not consumed.
@@ -93,7 +96,7 @@ def decode_attn_c1a_reuse(
     c1a_finish(
         query, window_cache, window_cache_scale, compressed_cache, compressed_cache_scale, window_indices,
         compressed_indices, attn_sink, wo_a, wo_b, wo_b_scale, rope_cos, rope_sin, output_window,
-        output_arrived, output, group_base, tp_rank, num_tokens, attention_epoch, q_tid, cache_ready,
+        output_arrived, output, group_base, tp_rank, num_tokens, attention_epoch, q_tid, cache_ready, reduce_scatter,
     )
     return output
 
@@ -144,7 +147,7 @@ def decode_attn_c1a_reuse_test(
         x, wq_a, wq_a_scale, q_norm_weight, wq_b, wq_b_scale, wkv, wkv_scale, kv_norm_weight, attn_sink,
         wo_a, wo_b, wo_b_scale, rope_cos, rope_sin, window_slots, window_indices, window_cache,
         window_cache_scale, compressed_cache, compressed_cache_scale, compressed_indices, output_window,
-        output_arrived, output, group_base, tp_rank, num_tokens, attention_epoch,
+        output_arrived, output, group_base, tp_rank, num_tokens, attention_epoch, False,
     )
 
 

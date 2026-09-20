@@ -21,6 +21,8 @@ if __package__ in (None, ""):
 
 import pypto.language as pl
 import pypto.language.distributed as pld
+
+from models.deepseek_v4_1_flash.attention_tp import OUTPUT_T_DYN
 import torch
 
 from golden import TensorSpec, run
@@ -373,12 +375,13 @@ def c1a_reduce(
     partial: pl.Tensor[[T_DYN, D], pl.FP32],
     output_window: pld.DistributedTensor[[DECODE_MAX_TOKENS, D], pl.FP32],
     output_arrived: pld.DistributedTensor[[TP_SIZE, 1], pl.INT32],
-    output: pl.Tensor[[T_DYN, D], pl.BF16],
+    output: pl.Tensor[[OUTPUT_T_DYN, D], pl.BF16],
     group_base: pl.Scalar[pl.INT32],
     tp_rank: pl.Scalar[pl.INT32],
     num_tokens: pl.Scalar[pl.INT32],
     attention_epoch: pl.Scalar[pl.INT32],
     partial_ready: pl.Scalar[pl.TASK_ID],
+    reduce_scatter: pl.constexpr = False,
 ):
     with pl.spmd(32, name_hint="c1a_tp_publish", deps=[partial_ready]) as published:
         worker = pl.tile.get_block_idx()
@@ -398,10 +401,16 @@ def c1a_reduce(
             pld.system.wait(
                 output_arrived, offsets=[peer, 0], expected=attention_epoch * 2 - 1, cmp=pld.WaitCmp.Ge
             )
+    first = pl.cast(0, pl.INT32)
+    count = pl.cast(num_tokens, pl.INT32)
+    if reduce_scatter:
+        width = (num_tokens + TP_SIZE - 1) // TP_SIZE
+        first = pl.cast(pl.min(tp_rank * width, num_tokens), pl.INT32)
+        count = pl.cast(pl.min(width, num_tokens - first), pl.INT32)
     with pl.spmd(32, name_hint="c1a_tp_reduce", deps=[arrived]) as reduced:
         worker = pl.tile.get_block_idx()
-        for tile in pl.range(worker, num_tokens * (D // 512), 32):
-            row = tile // (D // 512)
+        for tile in pl.range(worker, count * (D // 512), 32):
+            row = first + tile // (D // 512)
             col = tile % (D // 512) * 512
             acc = pl.tile.full([1, 512], dtype=pl.FP32, value=0.0)
             for peer in pl.range(TP_SIZE):
@@ -409,7 +418,7 @@ def c1a_reduce(
                     output_window, peer=group_base + peer, offsets=[row, col], shape=[1, 512]
                 )
                 acc = pl.add(acc, peer_value)
-            pl.store(pl.cast(acc, pl.BF16, mode="rint"), [row, col], output)
+            pl.store(pl.cast(acc, pl.BF16, mode="rint"), [row - first, col], output)
     with pl.at(level=pl.Level.CORE_GROUP, name_hint="c1a_tp_release", deps=[reduced]) as released:
         for peer in pl.range(TP_SIZE):
             pld.system.notify(output_arrived, peer=group_base + peer, offsets=[tp_rank, 0],
@@ -570,13 +579,14 @@ def c1a_finish(
     sin: pl.Tensor[[T_DYN, ROPE_DIM // 2], pl.FP32],
     output_window: pld.DistributedTensor[[DECODE_MAX_TOKENS, D], pl.FP32],
     output_arrived: pld.DistributedTensor[[TP_SIZE, 1], pl.INT32],
-    output: pl.Tensor[[T_DYN, D], pl.BF16],
+    output: pl.Tensor[[OUTPUT_T_DYN, D], pl.BF16],
     group_base: pl.Scalar[pl.INT32],
     tp_rank: pl.Scalar[pl.INT32],
     num_tokens: pl.Scalar[pl.INT32],
     attention_epoch: pl.Scalar[pl.INT32],
     q_ready: pl.Scalar[pl.TASK_ID],
     topk_ready: pl.Scalar[pl.TASK_ID],
+    reduce_scatter: pl.constexpr = False,
 ):
     tokens = pl.tensor.dim(query, 0)
     selected = pl.create_tensor([tokens, 640, HEAD_DIM], dtype=pl.BF16)
@@ -599,7 +609,7 @@ def c1a_finish(
     ob_tid = project_ob(latent, wo_b, wo_b_scale, partial, num_tokens, grouped_tid)
     c1a_reduce(
         partial, output_window, output_arrived, output, group_base, tp_rank, num_tokens, attention_epoch,
-        ob_tid,
+        ob_tid, reduce_scatter,
     )
     return output
 
@@ -1577,11 +1587,12 @@ def decode_attn_c1a_full(
     candidate_mask: pl.Tensor[[T_DYN, CMP_POSITIONS_DYN], pl.UINT8],
     output_window: pld.DistributedTensor[[DECODE_MAX_TOKENS, D], pl.FP32],
     output_arrived: pld.DistributedTensor[[TP_SIZE, 1], pl.INT32],
-    output: pl.Tensor[[T_DYN, D], pl.BF16],
+    output: pl.Tensor[[OUTPUT_T_DYN, D], pl.BF16],
     group_base: pl.Scalar[pl.INT32],
     tp_rank: pl.Scalar[pl.INT32],
     num_tokens: pl.Scalar[pl.INT32],
     attention_epoch: pl.Scalar[pl.INT32],
+    reduce_scatter: pl.constexpr = False,
 ):
     cache_ready = c1a_previous_epoch(output_arrived, attention_epoch)
     (qr, query, qr_tid, q_tid) = c1a_prepare(
@@ -1627,7 +1638,7 @@ def decode_attn_c1a_full(
     c1a_finish(
         query, window_cache, window_cache_scale, compressed_cache, compressed_cache_scale, window_indices,
         topk_indices, attn_sink, wo_a, wo_b, wo_b_scale, rope_cos, rope_sin, output_window, output_arrived,
-        output, group_base, tp_rank, num_tokens, attention_epoch, q_tid, topk_tid,
+        output, group_base, tp_rank, num_tokens, attention_epoch, q_tid, topk_tid, reduce_scatter,
     )
     return output, topk_indices, candidate_mask
 
@@ -1715,7 +1726,7 @@ def decode_attn_c1a_full_test(
         index_cache, index_cache_scale, index_block_table, compressed_rope_cos, compressed_rope_sin,
         compressor_wkv, compressor_norm_weight, compressed_slots, index_wk, index_norm_weight, index_wq_b,
         index_wq_b_scale, index_weights_proj, topk_indices, candidate_mask, output_window, output_arrived,
-        output, group_base, tp_rank, num_tokens, attention_epoch,
+        output, group_base, tp_rank, num_tokens, attention_epoch, False,
     )
 
 

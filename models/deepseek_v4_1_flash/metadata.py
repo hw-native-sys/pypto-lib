@@ -13,7 +13,7 @@ from typing import Mapping
 
 import torch
 
-from models.deepseek_v4_1_flash.config import BLOCK_SIZE, FLASH, TP_SIZE
+from models.deepseek_v4_1_flash.config import BLOCK_SIZE, FLASH
 
 
 @dataclass(frozen=True)
@@ -24,7 +24,6 @@ class ForwardMetadata:
     query_lens: torch.Tensor
     logit_row_indices: torch.Tensor
     request_ids: torch.Tensor
-    moe_token_owners: torch.Tensor
     position_ids: torch.Tensor
     kv_seq_lens: torch.Tensor
     new_kv_seq_lens: torch.Tensor
@@ -187,9 +186,6 @@ def build_forward_metadata(
         query_lens=query_lens.to(torch.int32),
         logit_row_indices=logit_rows,
         request_ids=request_ids,
-        moe_token_owners=torch.arange(
-            request_ids.numel(), device=request_ids.device, dtype=torch.int32
-        ).remainder(TP_SIZE),
         position_ids=positions.to(torch.int32),
         kv_seq_lens=kv_seq_lens.to(torch.int32),
         new_kv_seq_lens=new_kv_seq_lens.to(torch.int32),

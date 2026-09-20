@@ -29,7 +29,7 @@ import torch
 from golden import ScalarSpec, TensorSpec, run
 from models.deepseek_v4_1_flash import config as C
 from models.deepseek_v4_1_flash.attention_common import AttentionGoldenResult, golden_compressed_attention
-from models.deepseek_v4_1_flash.attention_tp import decode_tp_output_all_reduce
+from models.deepseek_v4_1_flash.attention_tp import decode_tp_output_all_reduce, OUTPUT_T_DYN
 from models.deepseek_v4_1_flash.config import (
     B_DYN,
     CMP_BLOCKS_DYN,
@@ -1126,11 +1126,12 @@ def decode_c2a_full(
     topk_indices: pl.Tensor[[C.T_DYN, C.INDEX_TOPK], pl.INT32],
     output_window: pld.DistributedTensor[[C.DECODE_MAX_TOKENS, C.D], pl.FP32],
     output_arrived: pld.DistributedTensor[[C.TP_SIZE, 1], pl.INT32],
-    output: pl.Tensor[[C.T_DYN, C.D], pl.BF16],
+    output: pl.Tensor[[OUTPUT_T_DYN, C.D], pl.BF16],
     group_base: pl.Scalar[pl.INT32],
     tp_rank: pl.Scalar[pl.INT32],
     num_tokens: pl.Scalar[pl.INT32],
     attention_epoch: pl.Scalar[pl.INT32],
+    reduce_scatter: pl.constexpr = False,
 ):
     """Write BF16 TP output using zero-initialized windows and consecutive 1-based epochs."""
     # A later epoch must not overwrite cache or transport storage still being read.
@@ -1156,7 +1157,7 @@ def decode_c2a_full(
     )
     decode_tp_output_all_reduce(
         partial, output_window, output_arrived, output, group_base, tp_rank, num_tokens,
-        attention_epoch,
+        attention_epoch, reduce_scatter,
     )
     return output
 
@@ -1879,7 +1880,7 @@ def make_program(operator, capacity, world_size, epochs):
                 compressor_state_rows, compressor_state, compressor_norm_weight,
                 compressed_slots, index_wk, index_norm_weight, index_wq_b, index_wq_b_scale,
                 index_weights_proj, topk_indices, output_window, output_arrived, output,
-                rank // TP_SIZE * TP_SIZE, rank % TP_SIZE, num_tokens, attention_epoch + step,
+                rank // TP_SIZE * TP_SIZE, rank % TP_SIZE, num_tokens, attention_epoch + step, False,
             )
         return (
             output, topk_indices, window_cache, window_cache_scale, compressed_cache,

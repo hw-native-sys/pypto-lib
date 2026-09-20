@@ -24,7 +24,7 @@ import pypto.language.distributed as pld
 import torch
 
 from models.deepseek_v4_1_flash.attention_common import AttentionGoldenResult, golden_swa_attention
-from models.deepseek_v4_1_flash.attention_tp import prefill_tp_output_all_reduce
+from models.deepseek_v4_1_flash.attention_tp import OUTPUT_T_DYN, prefill_tp_output_all_reduce
 from models.deepseek_v4_1_flash.config import (
     D,
     HEAD_DIM,
@@ -364,11 +364,12 @@ def prefill_attn_swa(
     window_cache_scale: pl.Tensor[[ORI_BLOCKS_DYN, 128, 1, HEAD_DIM // WINDOW_CACHE_GROUP], pl.FP8E8M0],
     output_window: pld.DistributedTensor[[PREFILL_MAX_TOKENS, D], pl.FP32],
     output_arrived: pld.DistributedTensor[[TP_SIZE, 1], pl.INT32],
-    output: pl.Tensor[[T_DYN, D], pl.BF16],
+    output: pl.Tensor[[OUTPUT_T_DYN, D], pl.BF16],
     group_base: pl.Scalar[pl.INT32],
     tp_rank: pl.Scalar[pl.INT32],
     num_tokens: pl.Scalar[pl.INT32],
     attention_epoch: pl.Scalar[pl.INT32],
+    reduce_scatter: pl.constexpr = False,
 ):
     """Write packed causal SWA output; active physical write slots must be unique."""
     with pl.at(level=pl.Level.CORE_GROUP, name_hint="swa_prefill_previous_epoch", allow_early_resolve=False) as cache_ready:
@@ -432,7 +433,7 @@ def prefill_attn_swa(
                     partial[start + row:start + row + 1, col:col + 512] = chunk_partial[row:row + 1, col:col + 512]
         chunk_done = collect_tid
     prefill_tp_output_all_reduce(
-        partial, output_window, output_arrived, output, group_base, tp_rank, num_tokens, attention_epoch,
+        partial, output_window, output_arrived, output, group_base, tp_rank, num_tokens, attention_epoch, reduce_scatter,
     )
     return output
 

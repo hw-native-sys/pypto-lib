@@ -106,7 +106,7 @@ def prefill_swa(
         wkv, wkv_scale, kv_norm_weight, attn_sink, wo_a, wo_b, wo_b_scale,
         rope_cos, rope_sin, window_slots, window_indices, window_cache, window_cache_scale,
         output_window, output_arrived, attn_out,
-        group_base, tp_rank, num_tokens, attention_epoch,
+        group_base, tp_rank, num_tokens, attention_epoch, False,
     )
     mhc_post(attn_out, x_hc, post_mix, residual_mix, output)
     return output

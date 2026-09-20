@@ -25,7 +25,7 @@ import torch
 
 from models.deepseek_v4_1_flash import config as C
 from models.deepseek_v4_1_flash.attention_common import AttentionGoldenResult, golden_compressed_attention
-from models.deepseek_v4_1_flash.attention_tp import prefill_tp_output_all_reduce
+from models.deepseek_v4_1_flash.attention_tp import OUTPUT_T_DYN, prefill_tp_output_all_reduce
 from models.deepseek_v4_1_flash.config import D, TP_SIZE, AttentionMode
 from models.deepseek_v4_1_flash.decode_c2a_full import c2a_full_partial, run_c2a
 
@@ -170,11 +170,12 @@ def prefill_attn_c2a_full(
     topk_indices: pl.Tensor[[C.T_DYN, C.INDEX_TOPK], pl.INT32],
     output_window: pld.DistributedTensor[[C.PREFILL_MAX_TOKENS, C.D], pl.FP32],
     output_arrived: pld.DistributedTensor[[C.TP_SIZE, 1], pl.INT32],
-    output: pl.Tensor[[C.T_DYN, C.D], pl.BF16],
+    output: pl.Tensor[[OUTPUT_T_DYN, C.D], pl.BF16],
     group_base: pl.Scalar[pl.INT32],
     tp_rank: pl.Scalar[pl.INT32],
     num_tokens: pl.Scalar[pl.INT32],
     attention_epoch: pl.Scalar[pl.INT32],
+    reduce_scatter: pl.constexpr = False,
 ):
     """Write BF16 TP output using zero-initialized windows and consecutive 1-based epochs."""
     # A later epoch must not overwrite cache or transport storage still being read.
@@ -200,7 +201,7 @@ def prefill_attn_c2a_full(
     )
     prefill_tp_output_all_reduce(
         partial, output_window, output_arrived, output, group_base, tp_rank, num_tokens,
-        attention_epoch,
+        attention_epoch, reduce_scatter,
     )
     return output
 

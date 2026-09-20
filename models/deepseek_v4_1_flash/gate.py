@@ -117,32 +117,33 @@ def gate(
                 [1, GATE_M_TILE], dtype=pl.FP32, value=0.0
             )
 
-    for tok in pl.spmd(active_tokens, name_hint="ffn_norm"):
-        rms_x_bf16 = pl.tile.load(x_mixed, [tok, 0], [1, D])
-        rms_x = pl.cast(rms_x_bf16, pl.FP32)
-        rms_w_bf16 = pl.tile.load(norm_w_2d, [0, 0], [1, D])
-        rms_w = pl.cast(rms_w_bf16, pl.FP32)
-        xg = pl.mul(rms_x, rms_w)
-        pl.tile.store(xg, [tok, 0], xg_buf, shapes=[1, D])
+    if active_tokens > 0:
+        for tok in pl.spmd(active_tokens, name_hint="ffn_norm"):
+            rms_x_bf16 = pl.tile.load(x_mixed, [tok, 0], [1, D])
+            rms_x = pl.cast(rms_x_bf16, pl.FP32)
+            rms_w_bf16 = pl.tile.load(norm_w_2d, [0, 0], [1, D])
+            rms_w = pl.cast(rms_w_bf16, pl.FP32)
+            xg = pl.mul(rms_x, rms_w)
+            pl.tile.store(xg, [tok, 0], xg_buf, shapes=[1, D])
 
-        rms_sq = pl.mul(rms_x, rms_x)
-        sq_rows = pl.reshape(rms_sq, [ROW_TILE, FFN_REDUCE_TILE])
-        sq_partial_tmp = pl.create_tile([ROW_TILE, FFN_REDUCE_TILE], dtype=pl.FP32)
-        sq_partial = pl.row_sum(sq_rows, sq_partial_tmp)
-        sq_reduce_tile = pl.create_tile([ROW_TILE, ROW_TILE], dtype=pl.FP32)
-        sq_partial_row = pl.reshape(sq_partial, [1, ROW_TILE])
-        sq_reduce_tile[0:1, :] = sq_partial_row
-        sq_reduce_valid = pl.set_validshape(sq_reduce_tile, 1, ROW_TILE)
-        sq_sum_tmp = pl.create_tile([ROW_TILE, ROW_TILE], dtype=pl.FP32)
-        sq_sum_raw = pl.row_sum(sq_reduce_valid, sq_sum_tmp)
-        sq_sum_row = pl.reshape(sq_sum_raw, [1, ROW_TILE])
-        sq_sum_valid = pl.set_validshape(sq_sum_row, 1, 1)
-        sq_mean = pl.mul(sq_sum_valid, 1.0 / D)
-        rms_arg = pl.add(sq_mean, NORM_EPS)
-        rms_root = pl.sqrt(rms_arg)
-        inv_rms = pl.recip(rms_root)
-        pl.tile.store(inv_rms, [0, tok], inv_rms_buf, shapes=[1, 1])
-        pl.tile.store(inv_rms, [tok, 0], inv_rms_router_buf, shapes=[1, 1])
+            rms_sq = pl.mul(rms_x, rms_x)
+            sq_rows = pl.reshape(rms_sq, [ROW_TILE, FFN_REDUCE_TILE])
+            sq_partial_tmp = pl.create_tile([ROW_TILE, FFN_REDUCE_TILE], dtype=pl.FP32)
+            sq_partial = pl.row_sum(sq_rows, sq_partial_tmp)
+            sq_reduce_tile = pl.create_tile([ROW_TILE, ROW_TILE], dtype=pl.FP32)
+            sq_partial_row = pl.reshape(sq_partial, [1, ROW_TILE])
+            sq_reduce_tile[0:1, :] = sq_partial_row
+            sq_reduce_valid = pl.set_validshape(sq_reduce_tile, 1, ROW_TILE)
+            sq_sum_tmp = pl.create_tile([ROW_TILE, ROW_TILE], dtype=pl.FP32)
+            sq_sum_raw = pl.row_sum(sq_reduce_valid, sq_sum_tmp)
+            sq_sum_row = pl.reshape(sq_sum_raw, [1, ROW_TILE])
+            sq_sum_valid = pl.set_validshape(sq_sum_row, 1, 1)
+            sq_mean = pl.mul(sq_sum_valid, 1.0 / D)
+            rms_arg = pl.add(sq_mean, NORM_EPS)
+            rms_root = pl.sqrt(rms_arg)
+            inv_rms = pl.recip(rms_root)
+            pl.tile.store(inv_rms, [0, tok], inv_rms_buf, shapes=[1, 1])
+            pl.tile.store(inv_rms, [tok, 0], inv_rms_router_buf, shapes=[1, 1])
 
     for quant_idx in pl.spmd((T_PAD // GATE_M_TILE) * (D // QUANT_TASK_TILE), name_hint="x_norm_mx_quant"):
         tile_idx = quant_idx // (D // QUANT_TASK_TILE)
@@ -179,48 +180,50 @@ def gate(
             biased_scores_buf[:, N_EXPERTS:SCORE_PAD] = biased_pad
 
     route_scores_buf = pl.create_tensor([T_PAD, SCORE_PAD], dtype=pl.FP32)
-    for gb_idx in pl.spmd(active_gate_tiles * (N_EXPERTS // GATE_N_TILE), name_hint="gate"):
-        tg = gb_idx // (N_EXPERTS // GATE_N_TILE)
-        nb = gb_idx % (N_EXPERTS // GATE_N_TILE)
-        t1 = tg * GATE_M_TILE
-        n0 = nb * GATE_N_TILE
-        gate_logits_tile = pl.create_tensor([GATE_M_TILE, GATE_N_TILE], dtype=pl.FP32)
-        for kb in pl.pipeline(0, D // GATE_D_TILE, stage=2):
-            gd_kd = kb * GATE_D_TILE
-            gd_x = xg_buf[t1 : t1 + GATE_M_TILE, gd_kd : gd_kd + GATE_D_TILE]
-            gd_w = gate_w[n0 : n0 + GATE_N_TILE, gd_kd : gd_kd + GATE_D_TILE]
-            if gd_kd == 0:
-                gate_logits_tile = pl.matmul(gd_x, gd_w, out_dtype=pl.FP32, b_trans=True)
-            else:
-                gate_logits_tile = pl.matmul_acc(gate_logits_tile, gd_x, gd_w, b_trans=True)
-        inv_rms_tile = inv_rms_router_buf[t1 : t1 + GATE_M_TILE, 0:1]
-        gate_logits_tile = pl.row_expand_mul(gate_logits_tile, inv_rms_tile)
-        gp_relu = pl.maximum(gate_logits_tile, 0.0)
-        gp_abs = pl.abs(gate_logits_tile)
-        gp_neg_abs = pl.neg(gp_abs)
-        gp_exp_abs = pl.exp(gp_neg_abs)
-        gp_exp_plus = pl.add(gp_exp_abs, 1.0)
-        gp_softplus_tail = pl.log(gp_exp_plus)
-        gp_softplus_log = pl.add(gp_relu, gp_softplus_tail)
-        gp_neg_logits = pl.neg(gate_logits_tile)
-        gp_neg_shift = pl.sub(gp_neg_logits, 10.0)
-        gp_neg_mask_floor = pl.maximum(gp_neg_shift, 0.0)
-        gp_neg_floor_mask = pl.minimum(gp_neg_mask_floor, 1.0)
-        gp_logits_floor = pl.minimum(gate_logits_tile, 0.0)
-        gp_neg_exp = pl.exp(gp_logits_floor)
-        gp_neg_floor = pl.mul(gp_neg_floor_mask, gp_neg_exp)
-        gp_softplus = pl.maximum(gp_softplus_log, gp_neg_floor)
-        gp_score = pl.sqrt(gp_softplus)
-        route_scores_buf[t1 : t1 + GATE_M_TILE, n0 : n0 + GATE_N_TILE] = gp_score
-        gp_bias_row = pl.reshape(gate_bias[n0 : n0 + GATE_N_TILE], [1, GATE_N_TILE])
-        if True:
-            gp_biased = pl.col_expand_add(gp_score, gp_bias_row)
-            biased_scores_buf[t1 : t1 + GATE_M_TILE, n0 : n0 + GATE_N_TILE] = gp_biased
+    if active_gate_tiles > 0:
+        for gb_idx in pl.spmd(active_gate_tiles * (N_EXPERTS // GATE_N_TILE), name_hint="gate"):
+            tg = gb_idx // (N_EXPERTS // GATE_N_TILE)
+            nb = gb_idx % (N_EXPERTS // GATE_N_TILE)
+            t1 = tg * GATE_M_TILE
+            n0 = nb * GATE_N_TILE
+            gate_logits_tile = pl.create_tensor([GATE_M_TILE, GATE_N_TILE], dtype=pl.FP32)
+            for kb in pl.pipeline(0, D // GATE_D_TILE, stage=2):
+                gd_kd = kb * GATE_D_TILE
+                gd_x = xg_buf[t1 : t1 + GATE_M_TILE, gd_kd : gd_kd + GATE_D_TILE]
+                gd_w = gate_w[n0 : n0 + GATE_N_TILE, gd_kd : gd_kd + GATE_D_TILE]
+                if gd_kd == 0:
+                    gate_logits_tile = pl.matmul(gd_x, gd_w, out_dtype=pl.FP32, b_trans=True)
+                else:
+                    gate_logits_tile = pl.matmul_acc(gate_logits_tile, gd_x, gd_w, b_trans=True)
+            inv_rms_tile = inv_rms_router_buf[t1 : t1 + GATE_M_TILE, 0:1]
+            gate_logits_tile = pl.row_expand_mul(gate_logits_tile, inv_rms_tile)
+            gp_relu = pl.maximum(gate_logits_tile, 0.0)
+            gp_abs = pl.abs(gate_logits_tile)
+            gp_neg_abs = pl.neg(gp_abs)
+            gp_exp_abs = pl.exp(gp_neg_abs)
+            gp_exp_plus = pl.add(gp_exp_abs, 1.0)
+            gp_softplus_tail = pl.log(gp_exp_plus)
+            gp_softplus_log = pl.add(gp_relu, gp_softplus_tail)
+            gp_neg_logits = pl.neg(gate_logits_tile)
+            gp_neg_shift = pl.sub(gp_neg_logits, 10.0)
+            gp_neg_mask_floor = pl.maximum(gp_neg_shift, 0.0)
+            gp_neg_floor_mask = pl.minimum(gp_neg_mask_floor, 1.0)
+            gp_logits_floor = pl.minimum(gate_logits_tile, 0.0)
+            gp_neg_exp = pl.exp(gp_logits_floor)
+            gp_neg_floor = pl.mul(gp_neg_floor_mask, gp_neg_exp)
+            gp_softplus = pl.maximum(gp_softplus_log, gp_neg_floor)
+            gp_score = pl.sqrt(gp_softplus)
+            route_scores_buf[t1 : t1 + GATE_M_TILE, n0 : n0 + GATE_N_TILE] = gp_score
+            gp_bias_row = pl.reshape(gate_bias[n0 : n0 + GATE_N_TILE], [1, GATE_N_TILE])
+            if True:
+                gp_biased = pl.col_expand_add(gp_score, gp_bias_row)
+                biased_scores_buf[t1 : t1 + GATE_M_TILE, n0 : n0 + GATE_N_TILE] = gp_biased
 
     active_route_tiles = (active_tokens + GATE_T_TILE - 1) // GATE_T_TILE
     # V4.1 uses score-only top-k: the V4 hash-route loop is dropped so that PTOAS
     # does not emit an invalid function for a route_hash path that does no work.
-    for ts_idx in pl.spmd(active_route_tiles, name_hint="route_sort"):
+    if active_route_tiles > 0:
+        for ts_idx in pl.spmd(active_route_tiles, name_hint="route_sort"):
             t1 = ts_idx * GATE_T_TILE
             # ptoas pto.tmrgsort requires a single source row.
             topk_idx_tile = pl.create_tensor([GATE_T_TILE, TOPK_PAD], dtype=pl.INT32)

@@ -85,7 +85,7 @@ def prefill_c2a_reuse(
         attn_sink, wo_a, wo_b, wo_b_scale, rope_cos, rope_sin, window_slots, window_indices,
         window_cache, window_cache_scale, compressed_cache, compressed_cache_scale,
         compressed_indices, output_window, output_arrived, attn_output, group_base, tp_rank,
-        num_tokens, attention_epoch,
+        num_tokens, attention_epoch, False,
     )
     mhc_post(attn_output, x_hc, post_mix, residual_mix, x_hc_out)
     return x_hc_out

@@ -45,7 +45,7 @@ from models.deepseek_v4_1_flash.attention_common import (
     golden_compressed_attention,
     quantized_cache_compare,
 )
-from models.deepseek_v4_1_flash.attention_tp import prefill_tp_output_all_reduce
+from models.deepseek_v4_1_flash.attention_tp import prefill_tp_output_all_reduce, OUTPUT_T_DYN
 from models.deepseek_v4_1_flash.config import AttentionMode
 from models.deepseek_v4_1_flash.hierarchical_sparse_indexer import hierarchical_sparse_indexer
 from models.deepseek_v4_1_flash.prefill_c1a_test_utils import (
@@ -245,11 +245,12 @@ def make_prefill_c1a_full(indexer):
         candidate_mask: pl.Tensor[[C.T_DYN, C.CMP_POSITIONS_DYN], pl.UINT8],
         output_window: pld.DistributedTensor[[C.PREFILL_MAX_TOKENS, C.D], pl.FP32],
         output_arrived: pld.DistributedTensor[[C.TP_SIZE, 1], pl.INT32],
-        output: pl.Tensor[[C.T_DYN, C.D], pl.BF16],
+        output: pl.Tensor[[OUTPUT_T_DYN, C.D], pl.BF16],
         group_base: pl.Scalar[pl.INT32],
         tp_rank: pl.Scalar[pl.INT32],
         num_tokens: pl.Scalar[pl.INT32],
         attention_epoch: pl.Scalar[pl.INT32],
+        reduce_scatter: pl.constexpr = False,
     ):
         """Publish ratio-1 caches, select sparse rows, and compute packed C1A."""
         tokens = pl.tensor.dim(x, 0)
@@ -360,7 +361,7 @@ def make_prefill_c1a_full(indexer):
             group_base,
             tp_rank,
             num_tokens,
-            attention_epoch,
+            attention_epoch, reduce_scatter,
         )
         return output
 
@@ -446,7 +447,7 @@ def prefill_c1a_full_test(
         compressed_rope_sin, compressor_wkv, compressor_norm_weight,
         compressed_slots, index_wk, index_norm_weight, index_wq_b,
         index_wq_b_scale, index_weights_proj, topk_indices, candidate_mask,
-        output_window, output_arrived, output, 0, tp_rank, num_tokens, 1,
+        output_window, output_arrived, output, 0, tp_rank, num_tokens, 1, False,
     )
 
 

@@ -54,7 +54,7 @@ from models.deepseek_v4_1_flash.attention_common import (
     golden_compressed_attention,
     quantized_cache_compare,
 )
-from models.deepseek_v4_1_flash.attention_tp import prefill_tp_output_all_reduce
+from models.deepseek_v4_1_flash.attention_tp import prefill_tp_output_all_reduce, OUTPUT_T_DYN
 from models.deepseek_v4_1_flash.config import AttentionMode
 
 
@@ -213,11 +213,12 @@ def make_prefill_c1a_reindex(indexer):
         topk_indices: pl.Tensor[[C.T_DYN, C.INDEX_TOPK], pl.INT32],
         output_window: pld.DistributedTensor[[C.PREFILL_MAX_TOKENS, C.D], pl.FP32],
         output_arrived: pld.DistributedTensor[[C.TP_SIZE, 1], pl.INT32],
-        output: pl.Tensor[[C.T_DYN, C.D], pl.BF16],
+        output: pl.Tensor[[OUTPUT_T_DYN, C.D], pl.BF16],
         group_base: pl.Scalar[pl.INT32],
         tp_rank: pl.Scalar[pl.INT32],
         num_tokens: pl.Scalar[pl.INT32],
         attention_epoch: pl.Scalar[pl.INT32],
+        reduce_scatter: pl.constexpr = False,
     ):
         """Refresh ratio-1 Top-K rows inside a supplied candidate set."""
         tokens = pl.tensor.dim(x, 0)
@@ -283,7 +284,7 @@ def make_prefill_c1a_reindex(indexer):
             group_base,
             tp_rank,
             num_tokens,
-            attention_epoch,
+            attention_epoch, reduce_scatter,
         )
         return output
 
@@ -352,7 +353,7 @@ def prefill_c1a_reindex_test(
         compressed_cache, compressed_cache_scale, request_ids, compressed_lens,
         index_cache, index_cache_scale, index_block_table, candidate_mask,
         index_wq_b, index_wq_b_scale, index_weights_proj, topk_indices,
-        output_window, output_arrived, output, 0, tp_rank, num_tokens, 1,
+        output_window, output_arrived, output, 0, tp_rank, num_tokens, 1, False,
     )
 
 

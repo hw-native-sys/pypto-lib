@@ -231,7 +231,7 @@ def prefill_c2a_full(
         compressor_state_rows, compressor_state, compressor_norm_weight, compressed_slots,
         index_wk, index_norm_weight, index_wq_b, index_wq_b_scale, index_weights_proj,
         topk_indices, output_window, output_arrived, attn_output, group_base, tp_rank,
-        num_tokens, attention_epoch,
+        num_tokens, attention_epoch, False,
     )
     mhc_post(attn_output, x_hc, post_mix, residual_mix, x_hc_out)
     return x_hc_out
