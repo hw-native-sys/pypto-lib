@@ -1401,46 +1401,7 @@ def prefill_physical_attention(
     return attention_done
 
 
-@pl.jit.inline
-def sparse_attn(
-    q: pl.Tensor[[T, H, HEAD_DIM], pl.BF16],
-    ori_kv: pl.Tensor[[ORI_BLOCK_NUM_DYN, BLOCK_SIZE, 1, HEAD_DIM], pl.BF16],
-    swa_indices: pl.Tensor[[T, WIN], pl.INT32],
-    cmp_kv: pl.Tensor[[CMP_BLOCK_NUM_DYN, CMP_STORAGE_BLOCK_SIZE_DYN, 1, HEAD_DIM], pl.BF16],
-    cmp_block_table: pl.Tensor[[CMP_MAX_BLOCKS], pl.INT32],
-    cmp_storage_block_size: pl.Scalar[pl.INT32],
-    cmp_indices: pl.Tensor[[T, IDX_TOPK], pl.INT32],
-    valid_block_mask: pl.Tensor[[T, VALID_BLOCK_MASK_COLS], pl.INT32],
-    attn_sink: pl.Tensor[[H], pl.FP32],
-    num_tokens: pl.Scalar[pl.INT32],
-    freqs_cos: pl.Tensor[[T, ROPE_DIM], pl.BF16],
-    freqs_sin: pl.Tensor[[T, ROPE_DIM], pl.BF16],
-    wo_a: pl.Tensor[[O_GROUPS, O_LORA, O_GROUP_IN], pl.BF16],
-    wo_b: pl.Tensor[[D, O_GROUPS * O_LORA], pl.INT8],
-    wo_b_scale: pl.Tensor[[D], pl.FP32],
-    attn_out: pl.Out[pl.Tensor[[T, D], pl.BF16]],
-):
-    """Run paged sparse attention with the same cache reader used by CP."""
-    # Keep the public scalar argument for existing callers. Physical addressing
-    # derives the page size from the cache tensor, as it does in the CP path.
-    with pl.at(level=pl.Level.CORE_GROUP, name_hint="prefill_sparse_sources_ready") as sources_ready:
-        _q_ready = pl.read(q, [0, 0, 0])
-        _raw_ready = pl.read(ori_kv, [0, 0, 0, 0])
-        _compressed_ready = pl.read(cmp_kv, [0, 0, 0, 0])
-        _raw_indices_ready = pl.read(swa_indices, [0, 0])
-        _compressed_indices_ready = pl.read(cmp_indices, [0, 0])
-        _mask_ready = pl.read(valid_block_mask, [0, 0])
-    physical_sparse_attn(
-        q, ori_kv, swa_indices, cmp_kv, cmp_block_table,
-        cmp_indices, valid_block_mask, attn_sink,
-        freqs_cos, freqs_sin, wo_a, wo_b, wo_b_scale,
-        attn_out, num_tokens, sources_ready, sources_ready,
-    )
-    return attn_out
-
-
-@pl.jit
-def prefill_sparse_attn_test(
+def _sparse_attn(
     q: pl.Tensor[[T, H, HEAD_DIM], pl.BF16],
     ori_kv: pl.Tensor[[ORI_BLOCK_NUM_DYN, BLOCK_SIZE, 1, HEAD_DIM], pl.BF16],
     swa_indices: pl.Tensor[[T, WIN], pl.INT32],
@@ -1461,14 +1422,27 @@ def prefill_sparse_attn_test(
     ori_kv.bind_dynamic(0, ORI_BLOCK_NUM_DYN)
     cmp_kv.bind_dynamic(0, CMP_BLOCK_NUM_DYN)
     cmp_kv.bind_dynamic(1, CMP_STORAGE_BLOCK_SIZE_DYN)
-    return sparse_attn(
-        q, ori_kv, swa_indices,
-        cmp_kv, cmp_block_table, cmp_storage_block_size, cmp_indices,
-        valid_block_mask, attn_sink, num_tokens,
-        freqs_cos, freqs_sin,
-        wo_a, wo_b, wo_b_scale,
-        attn_out,
+    """Run paged sparse attention with the same cache reader used by CP."""
+    # Keep the public scalar argument for existing callers. Physical addressing
+    # derives the page size from the cache tensor, as it does in the CP path.
+    with pl.at(level=pl.Level.CORE_GROUP, name_hint="prefill_sparse_sources_ready") as sources_ready:
+        _q_ready = pl.read(q, [0, 0, 0])
+        _raw_ready = pl.read(ori_kv, [0, 0, 0, 0])
+        _compressed_ready = pl.read(cmp_kv, [0, 0, 0, 0])
+        _raw_indices_ready = pl.read(swa_indices, [0, 0])
+        _compressed_indices_ready = pl.read(cmp_indices, [0, 0])
+        _mask_ready = pl.read(valid_block_mask, [0, 0])
+    physical_sparse_attn(
+        q, ori_kv, swa_indices, cmp_kv, cmp_block_table,
+        cmp_indices, valid_block_mask, attn_sink,
+        freqs_cos, freqs_sin, wo_a, wo_b, wo_b_scale,
+        attn_out, num_tokens, sources_ready, sources_ready,
     )
+    return attn_out
+
+
+sparse_attn = pl.jit.inline(_sparse_attn)
+prefill_sparse_attn_test = pl.jit(_sparse_attn)
 
 def golden_prefill_sparse_attn(tensors):
     """Self-contained torch reference for the cache-first sparse-attn entry."""

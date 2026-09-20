@@ -103,11 +103,8 @@ from decode_mtp import (
 from decode_prepare import (
     ROPE_ROWS_DYN,
     VOCAB_DYN as EMBED_VOCAB_DYN,
-    build_decode_metadata,
-    gather_swa_rope_rows,
     build_swa_metadata,
     pack_mtp_hidden,
-    pack_x_hc,
 )
 from lookup_embedding import lookup_embedding
 
@@ -590,40 +587,8 @@ def l2_decode_fwd_mtp(
         sampling_temperatures, sampling_top_ks,
         sampling_seeds, sampling_positions,
     )
-    ori_slot_mapping = pl.create_tensor([T], dtype=pl.INT64)
-    swa_slot_mapping = pl.create_tensor([T], dtype=pl.INT64)
-    swa_indices = pl.create_tensor([T, SWA_WIN], dtype=pl.INT32)
-    swa_lens = pl.create_tensor([T], dtype=pl.INT32)
-    hca_cmp_slot_mapping = pl.create_tensor([T], dtype=pl.INT64)
-    hca_state_slot_mapping = pl.create_tensor([T], dtype=pl.INT64)
-    csa_cmp_slot_mapping = pl.create_tensor([T], dtype=pl.INT64)
-    csa_idx_slot_mapping = pl.create_tensor([T], dtype=pl.INT64)
-    csa_state_slot_mapping = pl.create_tensor([T], dtype=pl.INT64)
-    csa_inner_state_slot_mapping = pl.create_tensor([T], dtype=pl.INT64)
-    build_decode_metadata(
-        position_ids,
-        block_table,
-        hca_cmp_block_table,
-        csa_cmp_block_table,
-        idx_block_table,
-        hca_compress_state_block_table,
-        csa_compress_state_block_table,
-        csa_inner_compress_state_block_table,
-        block_counts,
-        ori_slot_mapping,
-        swa_slot_mapping,
-        swa_indices,
-        swa_lens,
-        hca_cmp_slot_mapping,
-        hca_state_slot_mapping,
-        csa_cmp_slot_mapping,
-        csa_idx_slot_mapping,
-        csa_state_slot_mapping,
-        csa_inner_state_slot_mapping,
-    )
-    x_hc = pl.create_tensor([T, HC_MULT, D], dtype=pl.FP32)
-    pack_x_hc(input_ids, embed_weight, x_hc)
     decode_fwd(
+        embed_weight,
         hc_attn_fn, hc_attn_scale, hc_attn_base,
         attn_norm_w, wq_a, wq_b, wq_b_scale,
         wkv, gamma_cq, gamma_ckv,
@@ -639,13 +604,10 @@ def l2_decode_fwd_mtp(
         routed_w1, routed_w1_scale, routed_w3, routed_w3_scale, routed_w2, routed_w2_scale,
         shared_w1, shared_w1_scale, shared_w3, shared_w3_scale, shared_w2, shared_w2_scale,
         freqs_cos, freqs_sin,
-        x_hc, position_ids, kv_seq_lens,
+        block_table, position_ids, kv_seq_lens,
         hca_compress_state_block_table, csa_compress_state_block_table, csa_inner_compress_state_block_table,
         hca_cmp_block_table, csa_cmp_block_table, idx_block_table,
-        ori_slot_mapping, swa_slot_mapping, swa_indices, swa_lens,
-        hca_cmp_slot_mapping, hca_state_slot_mapping,
-        csa_cmp_slot_mapping, csa_idx_slot_mapping, csa_state_slot_mapping, csa_inner_state_slot_mapping,
-        input_ids,
+        block_counts, input_ids,
         hc_head_fn, hc_head_scale, hc_head_base, final_norm_w,
         lm_head_weight, logit_row_indices,
         sampling_temperatures, sampling_top_ks, sampling_seeds, sampling_positions,
@@ -688,9 +650,6 @@ def l2_decode_fwd_mtp(
         mtp_swa_indices,
         mtp_swa_lens,
     )
-    swa_freqs_cos = pl.create_tensor([T, ROPE_HEAD_DIM], dtype=pl.BF16)
-    swa_freqs_sin = pl.create_tensor([T, ROPE_HEAD_DIM], dtype=pl.BF16)
-    gather_swa_rope_rows(freqs_cos, freqs_sin, mtp_position_ids, swa_freqs_cos, swa_freqs_sin)
     decode_mtp(
         mtp_hidden_states, mtp_prev_pre_hc_hidden, mtp_position_ids,
         mtp_enorm_w, mtp_hnorm_w,
@@ -698,7 +657,7 @@ def l2_decode_fwd_mtp(
         mtp_h_proj_w, mtp_h_proj_w_scale, mtp_h_proj_smooth,
         mtp_hc_attn_fn, mtp_hc_attn_scale, mtp_hc_attn_base,
         mtp_attn_norm_w, mtp_wq_a, mtp_wq_b, mtp_wq_b_scale, mtp_wkv, mtp_gamma_cq, mtp_gamma_ckv,
-        swa_freqs_cos, swa_freqs_sin,
+        freqs_cos, freqs_sin,
         mtp_kv_cache, mtp_swa_slot_mapping, mtp_swa_indices, mtp_swa_lens,
         mtp_attn_sink, mtp_wo_a, mtp_wo_b, mtp_wo_b_scale,
         mtp_hc_ffn_fn, mtp_hc_ffn_scale, mtp_hc_ffn_base,

@@ -181,12 +181,14 @@ prefill_mtp      mtp_projection → prefill_swa → prefill_moe → hc_head → 
 
 `decode_fwd_mtp` holds the persistent MTP serving state inline: it loads each
 request's previous tail/draft, checks the draft against the main-model sample,
-packs the committed window, and commits the result back to the same slot. It
-also owns the device-side preamble for both halves: metadata lowering and input
-packing before the main layers, embedding lookup and MTP hidden packing before
-the draft layer. `decode_fwd` and `decode_mtp` therefore cover the model body
-alone and take the preamble's results as inputs, which their fixtures build in
-torch. `decode_prepare` lowers the packed input
+packs the committed window, and commits the result back to the same slot. Each
+half carries its own device-side preamble: `decode_fwd` lowers the paged-cache
+metadata and packs the embedded input, `decode_mtp` gathers its SWA rope rows.
+`decode_fwd_mtp` adds only what sits between them — the draft embedding lookup,
+the MTP hidden packing, and the draft window's SWA metadata. Both halves are
+plain functions exposed twice, as a `pl.jit.inline` body for this composition
+and as an `l2_` kernel for their standalone entries, so the composed and
+standalone forms cannot drift. `decode_prepare` lowers the packed input
 IDs and the paged-cache metadata on device; `utils` is its host-side torch
 counterpart used by the test fixtures.
 

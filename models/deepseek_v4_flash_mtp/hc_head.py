@@ -41,13 +41,12 @@ LINEAR_OK = 16
 RMS_OK = 16
 
 
-@pl.jit.inline
-def hc_head(
+def _hc_head(
     x_hc: pl.Tensor[[T_DYN, HC_MULT, D], pl.FP32],
     hc_head_fn: pl.Tensor[[HC_MULT, HC_DIM], pl.FP32],
     hc_head_scale: pl.Tensor[[1], pl.FP32],
     hc_head_base: pl.Tensor[[HC_MULT], pl.FP32],
-    y: pl.Tensor[[T_DYN, D], pl.BF16],
+    y: pl.Out[pl.Tensor[[T_DYN, D], pl.BF16]],
 ):
     t_dim = pl.tensor.dim(x_hc, 0)
     # Rounding the row count up to LINEAR_T_TILE would read whole tiles past the end
@@ -173,16 +172,8 @@ def hc_head(
     return y
 
 
-@pl.jit
-def hc_head_test(
-    x_hc: pl.Tensor[[T, HC_MULT, D], pl.FP32],
-    hc_head_fn: pl.Tensor[[HC_MULT, HC_DIM], pl.FP32],
-    hc_head_scale: pl.Tensor[[1], pl.FP32],
-    hc_head_base: pl.Tensor[[HC_MULT], pl.FP32],
-    y: pl.Out[pl.Tensor[[T, D], pl.BF16]],
-):
-    y = hc_head(x_hc, hc_head_fn, hc_head_scale, hc_head_base, y)
-    return y
+hc_head = pl.jit.inline(_hc_head)
+hc_head_test = pl.jit(_hc_head)
 
 
 def golden_hc_head(tensors):

@@ -94,8 +94,7 @@ SWA_TILE_WIN_ROWS = min(ATTN_K_TILE, WIN)
 SWA_RUNS = (SWA_TILE_WIN_ROWS + 2 * (BLOCK_SIZE - 1)) // BLOCK_SIZE
 
 
-@pl.jit.inline
-def sparse_attn_csa(
+def _sparse_attn_csa(
     q: pl.Tensor[[T, H, HEAD_DIM], pl.BF16],
     ori_kv: pl.Tensor[[ORI_BLOCK_NUM_DYN, BLOCK_SIZE, 1, HEAD_DIM], pl.BF16],
     window_swa_indices: pl.Tensor[[T, WIN], pl.INT32],
@@ -109,8 +108,9 @@ def sparse_attn_csa(
     wo_a: pl.Tensor[[O_GROUPS, O_LORA, O_GROUP_IN], pl.BF16],
     wo_b: pl.Tensor[[D, O_GROUPS * O_LORA], pl.INT8],
     wo_b_scale: pl.Tensor[[D], pl.FP32],
-    attn_out: pl.Tensor[[T, D], pl.BF16],
+    attn_out: pl.Out[pl.Tensor[[T, D], pl.BF16]],
 ):
+    cmp_block_table.bind_dynamic(1, CMP_TABLE_BLOCKS_DYN)
     """Run sparse decode attention, inverse RoPE, and grouped output projection."""
     # Compressed index contract: -1 invalid, [0, ...) compressed KV slots.
     ori_block_num = pl.tensor.dim(ori_kv, 0)
@@ -480,34 +480,8 @@ def sparse_attn_csa(
 
     return attn_out
 
-@pl.jit
-def sparse_attn_test(
-    q: pl.Tensor[[T, H, HEAD_DIM], pl.BF16],
-    ori_kv: pl.Tensor[[ORI_BLOCK_NUM_DYN, BLOCK_SIZE, 1, HEAD_DIM], pl.BF16],
-    window_swa_indices: pl.Tensor[[T, WIN], pl.INT32],
-    cmp_kv: pl.Tensor[[CMP_BLOCK_NUM_DYN, CMP_STORAGE_BLOCK_SIZE, 1, HEAD_DIM], pl.BF16],
-    cmp_block_table: pl.Tensor[[B, CMP_TABLE_BLOCKS_DYN], pl.INT32],
-    idx_topk: pl.Tensor[[T, IDX_TOPK], pl.INT32],
-    position_ids: pl.Tensor[[T, 1], pl.INT32],
-    attn_sink: pl.Tensor[[H], pl.FP32],
-    freqs_cos: pl.Tensor[[T, ROPE_DIM], pl.BF16],
-    freqs_sin: pl.Tensor[[T, ROPE_DIM], pl.BF16],
-    wo_a: pl.Tensor[[O_GROUPS, O_LORA, O_GROUP_IN], pl.BF16],
-    wo_b: pl.Tensor[[D, O_GROUPS * O_LORA], pl.INT8],
-    wo_b_scale: pl.Tensor[[D], pl.FP32],
-    attn_out: pl.Out[pl.Tensor[[T, D], pl.BF16]],
-):
-    cmp_block_table.bind_dynamic(1, CMP_TABLE_BLOCKS_DYN)
-    sparse_attn_csa(
-        q,
-        ori_kv, window_swa_indices,
-        cmp_kv, cmp_block_table, idx_topk,
-        position_ids, attn_sink,
-        freqs_cos, freqs_sin,
-        wo_a, wo_b, wo_b_scale,
-        attn_out,
-    )
-    return attn_out
+sparse_attn_csa = pl.jit.inline(_sparse_attn_csa)
+sparse_attn_test = pl.jit(_sparse_attn_csa)
 
 
 def golden_sparse_attn(tensors):

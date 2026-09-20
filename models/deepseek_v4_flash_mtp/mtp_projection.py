@@ -42,8 +42,7 @@ LINEAR_K_TILE = 512
 QUANT_TILE = 1024
 
 
-@pl.jit.inline
-def mtp_projection(
+def _mtp_projection(
     hidden_states: pl.Tensor[[T_DYN, D], pl.BF16],
     prev_hidden_states: pl.Tensor[[T_DYN, HC_MULT, D], pl.FP32],
     enorm_w: pl.Tensor[[D], pl.FP32],
@@ -54,8 +53,11 @@ def mtp_projection(
     h_proj_w: pl.Tensor[[D, D], pl.INT8],
     h_proj_w_scale: pl.Tensor[[D], pl.FP32],
     h_proj_smooth: pl.Tensor[[D], pl.FP32],
-    hidden_states_out: pl.Tensor[[T_DYN, HC_MULT, D], pl.FP32],
+    hidden_states_out: pl.Out[pl.Tensor[[T_DYN, HC_MULT, D], pl.FP32]],
 ):
+    hidden_states.bind_dynamic(0, T_DYN)
+    prev_hidden_states.bind_dynamic(0, T_DYN)
+    hidden_states_out.bind_dynamic(0, T_DYN)
     t_dim = pl.tensor.dim(hidden_states, 0)
     t_linear = ((t_dim + LINEAR_T_TILE - 1) // LINEAR_T_TILE) * LINEAR_T_TILE
     hidden_flat = pl.reshape(hidden_states, [t_dim, D])
@@ -201,30 +203,8 @@ def mtp_projection(
     return hidden_states_out
 
 
-@pl.jit
-def mtp_projection_test(
-    hidden_states: pl.Tensor[[T_DYN, D], pl.BF16],
-    prev_hidden_states: pl.Tensor[[T_DYN, HC_MULT, D], pl.FP32],
-    enorm_w: pl.Tensor[[D], pl.FP32],
-    hnorm_w: pl.Tensor[[D], pl.FP32],
-    e_proj_w: pl.Tensor[[D, D], pl.INT8],
-    e_proj_w_scale: pl.Tensor[[D], pl.FP32],
-    e_proj_smooth: pl.Tensor[[D], pl.FP32],
-    h_proj_w: pl.Tensor[[D, D], pl.INT8],
-    h_proj_w_scale: pl.Tensor[[D], pl.FP32],
-    h_proj_smooth: pl.Tensor[[D], pl.FP32],
-    hidden_states_out: pl.Out[pl.Tensor[[T_DYN, HC_MULT, D], pl.FP32]],
-):
-    hidden_states.bind_dynamic(0, T_DYN)
-    prev_hidden_states.bind_dynamic(0, T_DYN)
-    hidden_states_out.bind_dynamic(0, T_DYN)
-    return mtp_projection(
-        hidden_states, prev_hidden_states,
-        enorm_w, hnorm_w,
-        e_proj_w, e_proj_w_scale, e_proj_smooth,
-        h_proj_w, h_proj_w_scale, h_proj_smooth,
-        hidden_states_out,
-    )
+mtp_projection = pl.jit.inline(_mtp_projection)
+mtp_projection_test = pl.jit(_mtp_projection)
 
 
 def _rms_norm(x, weight):

@@ -48,8 +48,7 @@ TOPK_PAD = 8            # TOPK padded to 32B-aligned width
 SORT_PAD = TOPK_PAD * 2 # (val, idx) interleaved slice width
 assert TOPK <= TOPK_PAD
 
-@pl.jit.inline
-def gate(
+def _gate(
     x_mixed: pl.Tensor[[GATE_T_DYN, D], pl.BF16],
     norm_w: pl.Tensor[[D], pl.BF16],
     gate_w: pl.Tensor[[N_EXPERTS, D], pl.FP32],
@@ -58,11 +57,17 @@ def gate(
     num_tokens: pl.Scalar[pl.INT32],
     tid2eid: pl.Tensor[[VOCAB, TOPK], pl.INT32],
     input_ids: pl.Tensor[[GATE_T_DYN], pl.INT64],
-    x_norm_i8: pl.Tensor[[GATE_T_DYN, D], pl.INT8],
-    x_norm_scale: pl.Tensor[[GATE_T_DYN, 1], pl.FP32],
-    indices: pl.Tensor[[GATE_T_DYN, TOPK], pl.INT32],
-    weights: pl.Tensor[[GATE_T_DYN, TOPK], pl.FP32],
+    x_norm_i8: pl.Out[pl.Tensor[[GATE_T_DYN, D], pl.INT8]],
+    x_norm_scale: pl.Out[pl.Tensor[[GATE_T_DYN, 1], pl.FP32]],
+    indices: pl.Out[pl.Tensor[[GATE_T_DYN, TOPK], pl.INT32]],
+    weights: pl.Out[pl.Tensor[[GATE_T_DYN, TOPK], pl.FP32]],
 ):
+    x_mixed.bind_dynamic(0, GATE_T_DYN)
+    input_ids.bind_dynamic(0, GATE_T_DYN)
+    x_norm_i8.bind_dynamic(0, GATE_T_DYN)
+    x_norm_scale.bind_dynamic(0, GATE_T_DYN)
+    indices.bind_dynamic(0, GATE_T_DYN)
+    weights.bind_dynamic(0, GATE_T_DYN)
     token_rows = pl.tensor.dim(x_mixed, 0)
     padded_rows = ((token_rows + GATE_M_TILE - 1) // GATE_M_TILE) * GATE_M_TILE
     # Deferred RMSNorm (qwen3-style): store xg = x*gamma (NOT *inv_rms), because
@@ -285,36 +290,8 @@ def gate(
     return weights
 
 
-@pl.jit
-def gate_test(
-    x_mixed: pl.Tensor[[GATE_T_DYN, D], pl.BF16],
-    norm_w: pl.Tensor[[D], pl.BF16],
-    gate_w: pl.Tensor[[N_EXPERTS, D], pl.FP32],
-    gate_bias: pl.Tensor[[N_EXPERTS], pl.FP32],
-    layer_id: pl.Scalar[pl.INT32],
-    num_tokens: pl.Scalar[pl.INT32],
-    tid2eid: pl.Tensor[[VOCAB, TOPK], pl.INT32],
-    input_ids: pl.Tensor[[GATE_T_DYN], pl.INT64],
-    x_norm_i8: pl.Out[pl.Tensor[[GATE_T_DYN, D], pl.INT8]],
-    x_norm_scale: pl.Out[pl.Tensor[[GATE_T_DYN, 1], pl.FP32]],
-    indices: pl.Out[pl.Tensor[[GATE_T_DYN, TOPK], pl.INT32]],
-    weights: pl.Out[pl.Tensor[[GATE_T_DYN, TOPK], pl.FP32]],
-):
-    x_mixed.bind_dynamic(0, GATE_T_DYN)
-    input_ids.bind_dynamic(0, GATE_T_DYN)
-    x_norm_i8.bind_dynamic(0, GATE_T_DYN)
-    x_norm_scale.bind_dynamic(0, GATE_T_DYN)
-    indices.bind_dynamic(0, GATE_T_DYN)
-    weights.bind_dynamic(0, GATE_T_DYN)
-
-    gate(
-        x_mixed,
-        norm_w, gate_w, gate_bias,
-        layer_id, num_tokens,
-        tid2eid, input_ids,
-        x_norm_i8, x_norm_scale, indices, weights,
-    )
-    return x_norm_i8, x_norm_scale, indices, weights
+gate = pl.jit.inline(_gate)
+gate_test = pl.jit(_gate)
 
 
 def _per_token_int8_quant(x_bf16):

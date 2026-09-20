@@ -48,8 +48,7 @@ D_OUT_TILE_ACT = 512
 W2_ACT_INNER = 8
 
 
-@pl.jit.inline
-def expert_shared(
+def _expert_shared(
     x_local_i8: pl.Tensor[[SHARED_T_DYN, D], pl.INT8],
     x_local_scale_dq: pl.Tensor[[SHARED_T_DYN, 1], pl.FP32],
     shared_w1: pl.Tensor[[MOE_INTER, D], pl.INT8],
@@ -58,8 +57,11 @@ def expert_shared(
     shared_w3_scale: pl.Tensor[[MOE_INTER], pl.FP32],
     shared_w2: pl.Tensor[[D, MOE_INTER], pl.INT8],
     shared_w2_scale: pl.Tensor[[D], pl.FP32],
-    sh: pl.Tensor[[SHARED_T_DYN, D], pl.BF16],
+    sh: pl.Out[pl.Tensor[[SHARED_T_DYN, D], pl.BF16]],
 ):
+    x_local_i8.bind_dynamic(0, SHARED_T_DYN)
+    x_local_scale_dq.bind_dynamic(0, SHARED_T_DYN)
+    sh.bind_dynamic(0, SHARED_T_DYN)
     token_rows = pl.tensor.dim(x_local_i8, 0)
     # One fixed Cube tile per iteration; its valid rows come from the input
     # capacity, including the decode tile and a final partial prefill tile.
@@ -188,29 +190,8 @@ def expert_shared(
     return sh
 
 
-@pl.jit
-def expert_shared_test(
-    x_local_i8: pl.Tensor[[SHARED_T_DYN, D], pl.INT8],
-    x_local_scale_dq: pl.Tensor[[SHARED_T_DYN, 1], pl.FP32],
-    shared_w1: pl.Tensor[[MOE_INTER, D], pl.INT8],
-    shared_w1_scale: pl.Tensor[[MOE_INTER], pl.FP32],
-    shared_w3: pl.Tensor[[MOE_INTER, D], pl.INT8],
-    shared_w3_scale: pl.Tensor[[MOE_INTER], pl.FP32],
-    shared_w2: pl.Tensor[[D, MOE_INTER], pl.INT8],
-    shared_w2_scale: pl.Tensor[[D], pl.FP32],
-    sh: pl.Out[pl.Tensor[[SHARED_T_DYN, D], pl.BF16]],
-):
-    x_local_i8.bind_dynamic(0, SHARED_T_DYN)
-    x_local_scale_dq.bind_dynamic(0, SHARED_T_DYN)
-    sh.bind_dynamic(0, SHARED_T_DYN)
-
-    expert_shared(
-        x_local_i8, x_local_scale_dq,
-        shared_w1, shared_w1_scale, shared_w3, shared_w3_scale,
-        shared_w2, shared_w2_scale,
-        sh,
-    )
-    return sh
+expert_shared = pl.jit.inline(_expert_shared)
+expert_shared_test = pl.jit(_expert_shared)
 
 
 def golden_expert_shared(tensors):

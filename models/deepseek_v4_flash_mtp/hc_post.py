@@ -34,14 +34,18 @@ assert (DECODE_BATCH * DECODE_SEQ) % T_TILE == 0
 assert (PREFILL_BATCH * PREFILL_SEQ) % T_TILE == 0
 
 
-@pl.jit.inline
-def hc_post(
+def _hc_post(
     x: pl.Tensor[[T_DYN, D], pl.BF16],
     residual: pl.Tensor[[T_DYN, HC_MULT, D], pl.FP32],
     post: pl.Tensor[[T_DYN, HC_MULT], pl.FP32],
     comb: pl.Tensor[[T_DYN, HC_MULT * HC_MULT], pl.FP32],
     y: pl.Out[pl.Tensor[[T_DYN, HC_MULT, D], pl.FP32]],
 ):
+    x.bind_dynamic(0, T_DYN)
+    residual.bind_dynamic(0, T_DYN)
+    post.bind_dynamic(0, T_DYN)
+    comb.bind_dynamic(0, T_DYN)
+    y.bind_dynamic(0, T_DYN)
     t_dim = pl.tensor.dim(x, 0)
 
     residual_flat = pl.reshape(residual, [t_dim, HC_DIM])
@@ -122,22 +126,8 @@ def hc_post_prefill(
     return y
 
 
-@pl.jit
-def hc_post_test(
-    x: pl.Tensor[[T_DYN, D], pl.BF16],
-    residual: pl.Tensor[[T_DYN, HC_MULT, D], pl.FP32],
-    post: pl.Tensor[[T_DYN, HC_MULT], pl.FP32],
-    comb: pl.Tensor[[T_DYN, HC_MULT * HC_MULT], pl.FP32],
-    y: pl.Out[pl.Tensor[[T_DYN, HC_MULT, D], pl.FP32]],
-):
-    x.bind_dynamic(0, T_DYN)
-    residual.bind_dynamic(0, T_DYN)
-    post.bind_dynamic(0, T_DYN)
-    comb.bind_dynamic(0, T_DYN)
-    y.bind_dynamic(0, T_DYN)
-
-    hc_post(x, residual, post, comb, y)
-    return y
+hc_post = pl.jit.inline(_hc_post)
+hc_post_test = pl.jit(_hc_post)
 
 
 def golden_hc_post(tensors):

@@ -59,16 +59,19 @@ LINEAR_K_PER_SPLIT = HC_DIM // LINEAR_OK
 assert HC_MULT == 4, f"hc_pre is specialized to HC_MULT == 4, got {HC_MULT}"
 
 
-@pl.jit.inline
-def hc_pre(
+def _hc_pre(
     x: pl.Tensor[[T_DYN, HC_MULT, D], pl.FP32],
     hc_fn: pl.Tensor[[MIX_HC, HC_DIM], pl.FP32],
     hc_scale: pl.Tensor[[3], pl.FP32],
     hc_base: pl.Tensor[[MIX_HC], pl.FP32],
-    x_mixed: pl.Tensor[[T_DYN, D], pl.BF16],
-    post: pl.Tensor[[T_DYN, HC_MULT], pl.FP32],
-    comb: pl.Tensor[[T_DYN, HC_MULT * HC_MULT], pl.FP32],
+    x_mixed: pl.Out[pl.Tensor[[T_DYN, D], pl.BF16]],
+    post: pl.Out[pl.Tensor[[T_DYN, HC_MULT], pl.FP32]],
+    comb: pl.Out[pl.Tensor[[T_DYN, HC_MULT * HC_MULT], pl.FP32]],
 ):
+    x.bind_dynamic(0, T_DYN)
+    x_mixed.bind_dynamic(0, T_DYN)
+    post.bind_dynamic(0, T_DYN)
+    comb.bind_dynamic(0, T_DYN)
     """One pl.spmd task per work-type, ordered by their GM read/write dependencies.
 
     rms -> linear -> linear_reduce -> split_pre_post / comb_sinkhorn / mix_x. Cross-scope
@@ -259,23 +262,8 @@ def hc_pre(
             x_mixed[t0:t0 + T_TILE, d0:d0 + D_TILE] = y_bf16
     return x_mixed
 
-@pl.jit
-def hc_pre_test(
-    x: pl.Tensor[[T_DYN, HC_MULT, D], pl.FP32],
-    hc_fn: pl.Tensor[[MIX_HC, HC_DIM], pl.FP32],
-    hc_scale: pl.Tensor[[3], pl.FP32],
-    hc_base: pl.Tensor[[MIX_HC], pl.FP32],
-    x_mixed: pl.Out[pl.Tensor[[T_DYN, D], pl.BF16]],
-    post: pl.Out[pl.Tensor[[T_DYN, HC_MULT], pl.FP32]],
-    comb: pl.Out[pl.Tensor[[T_DYN, HC_MULT * HC_MULT], pl.FP32]],
-):
-    x.bind_dynamic(0, T_DYN)
-    x_mixed.bind_dynamic(0, T_DYN)
-    post.bind_dynamic(0, T_DYN)
-    comb.bind_dynamic(0, T_DYN)
-
-    hc_pre(x, hc_fn, hc_scale, hc_base, x_mixed, post, comb)
-    return x_mixed
+hc_pre = pl.jit.inline(_hc_pre)
+hc_pre_test = pl.jit(_hc_pre)
 
 
 def _golden_a2a3_cube_linear(x_flat_2d, hc_fn):

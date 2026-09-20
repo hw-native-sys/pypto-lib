@@ -25,12 +25,14 @@ HIDDEN_TILE = 512
 SPMD_BLOCKS = 48
 
 
-@pl.jit.inline
-def lookup_embedding(
+def _lookup_embedding(
     input_ids: pl.Tensor[[T_DYN], pl.INT64],
     embed_weight: pl.Tensor[[VOCAB_DYN, D], pl.BF16],
-    hidden_states: pl.Tensor[[T_DYN, D], pl.BF16],
+    hidden_states: pl.Out[pl.Tensor[[T_DYN, D], pl.BF16]],
 ) -> pl.Tensor[[T_DYN, D], pl.BF16]:
+    input_ids.bind_dynamic(0, T_DYN)
+    embed_weight.bind_dynamic(0, VOCAB_DYN)
+    hidden_states.bind_dynamic(0, T_DYN)
     token_count = pl.tensor.dim(input_ids, 0)
     work_items = token_count * (D // HIDDEN_TILE)
     for block in pl.spmd(SPMD_BLOCKS, name_hint="lookup_embedding"):
@@ -46,18 +48,8 @@ def lookup_embedding(
     return hidden_states
 
 
-@pl.jit
-def lookup_embedding_test(
-    input_ids: pl.Tensor[[T_DYN], pl.INT64],
-    embed_weight: pl.Tensor[[VOCAB_DYN, D], pl.BF16],
-    hidden_states: pl.Out[pl.Tensor[[T_DYN, D], pl.BF16]],
-) -> pl.Tensor[[T_DYN, D], pl.BF16]:
-    input_ids.bind_dynamic(0, T_DYN)
-    embed_weight.bind_dynamic(0, VOCAB_DYN)
-    hidden_states.bind_dynamic(0, T_DYN)
-
-    lookup_embedding(input_ids, embed_weight, hidden_states)
-    return hidden_states
+lookup_embedding = pl.jit.inline(_lookup_embedding)
+lookup_embedding_test = pl.jit(_lookup_embedding)
 
 
 def golden_lookup_embedding_test(tensors):

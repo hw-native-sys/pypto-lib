@@ -98,12 +98,11 @@ assert TP_SIZE in _TP_CHOICES, f"--tp must be one of {_TP_CHOICES} (got {TP_SIZE
 assert DP_SIZE in _DP_CHOICES, f"--dp must be one of {_DP_CHOICES} (got {DP_SIZE})"
 
 
-@pl.jit.inline(auto_scope=False)
-def lm_head(
-    hidden_states: pl.Tensor,
+def _lm_head(
+    hidden_states: pl.Tensor[[T_DYN, D], pl.BF16],
     lm_head_weight: pl.Tensor[[VOCAB_PER_TP, D], pl.BF16],
     logit_row_indices: pl.Tensor[[MAX_LOGIT_ROWS], pl.INT32],
-    logits: pl.Tensor[[MAX_LOGIT_ROWS, VOCAB], pl.FP32],
+    logits: pl.Out[pl.Tensor[[MAX_LOGIT_ROWS, VOCAB], pl.FP32]],
     hidden_window: pld.DistributedTensor[[GROUP_LOGIT_ROWS, D], pl.BF16],
     hidden_done: pld.DistributedTensor[[TP_SIZE, 1], pl.INT32],
     logits_window: pld.DistributedTensor[[MAX_LOGIT_ROWS, VOCAB], pl.FP32],
@@ -312,30 +311,11 @@ def lm_head(
     return logits
 
 
-@pl.jit
-def lm_head_test(
-    hidden_states: pl.Tensor[[T_DYN, D], pl.BF16],
-    lm_head_weight: pl.Tensor[[VOCAB_PER_TP, D], pl.BF16],
-    logit_row_indices: pl.Tensor[[MAX_LOGIT_ROWS], pl.INT32],
-    logits: pl.Out[pl.Tensor[[MAX_LOGIT_ROWS, VOCAB], pl.FP32]],
-    hidden_window: pld.DistributedTensor[[GROUP_LOGIT_ROWS, D], pl.BF16],
-    hidden_done: pld.DistributedTensor[[TP_SIZE, 1], pl.INT32],
-    logits_window: pld.DistributedTensor[[MAX_LOGIT_ROWS, VOCAB], pl.FP32],
-    logits_done: pld.DistributedTensor[[TP_SIZE, 1], pl.INT32],
-    group_base: pl.Scalar[pl.INT32],
-    tp_rank: pl.Scalar[pl.INT32],
-    done_epoch: pl.Scalar[pl.INT32],
-) -> pl.Tensor[[MAX_LOGIT_ROWS, VOCAB], pl.FP32]:
-    lm_head(
-        hidden_states, lm_head_weight, logit_row_indices, logits,
-        hidden_window, hidden_done, logits_window, logits_done,
-        group_base, tp_rank, done_epoch,
-    )
-    return logits
+lm_head = pl.jit.inline(auto_scope=False)(_lm_head)
+lm_head_test = pl.jit(_lm_head)
 
 
-@pl.jit.inline(auto_scope=False)
-def lm_head_with_sampling(
+def _lm_head_with_sampling(
     hidden_states: pl.Tensor[[T_DYN, D], pl.BF16],
     lm_head_weight: pl.Tensor[[VOCAB_PER_TP, D], pl.BF16],
     logit_row_indices: pl.Tensor[[MAX_LOGIT_ROWS], pl.INT32],
@@ -378,44 +358,8 @@ def lm_head_with_sampling(
     return logits, sampled_ids
 
 
-@pl.jit
-def lm_head_with_sampling_test(
-    hidden_states: pl.Tensor[[T_DYN, D], pl.BF16],
-    lm_head_weight: pl.Tensor[[VOCAB_PER_TP, D], pl.BF16],
-    logit_row_indices: pl.Tensor[[MAX_LOGIT_ROWS], pl.INT32],
-    sampling_temperatures: pl.Tensor[[MAX_LOGIT_ROWS], pl.FP32],
-    sampling_top_ks: pl.Tensor[[MAX_LOGIT_ROWS], pl.INT32],
-    sampling_seeds: pl.Tensor[[MAX_LOGIT_ROWS], pl.INT32],
-    sampling_positions: pl.Tensor[[MAX_LOGIT_ROWS], pl.INT32],
-    logits: pl.Out[pl.Tensor[[MAX_LOGIT_ROWS, VOCAB], pl.FP32]],
-    sampled_ids: pl.Out[pl.Tensor[[MAX_LOGIT_ROWS, SAMPLED_IDS_PAD], pl.INT32]],
-    hidden_window: pld.DistributedTensor[[GROUP_LOGIT_ROWS, D], pl.BF16],
-    hidden_done: pld.DistributedTensor[[TP_SIZE, 1], pl.INT32],
-    logits_window: pld.DistributedTensor[[MAX_LOGIT_ROWS, VOCAB], pl.FP32],
-    logits_done: pld.DistributedTensor[[TP_SIZE, 1], pl.INT32],
-    group_base: pl.Scalar[pl.INT32],
-    tp_rank: pl.Scalar[pl.INT32],
-    done_epoch: pl.Scalar[pl.INT32],
-):
-    """Standalone opaque entry for projection plus sampling tests."""
-    return lm_head_with_sampling(
-        hidden_states,
-        lm_head_weight,
-        logit_row_indices,
-        sampling_temperatures,
-        sampling_top_ks,
-        sampling_seeds,
-        sampling_positions,
-        logits,
-        sampled_ids,
-        hidden_window,
-        hidden_done,
-        logits_window,
-        logits_done,
-        group_base,
-        tp_rank,
-        done_epoch,
-    )
+lm_head_with_sampling = pl.jit.inline(auto_scope=False)(_lm_head_with_sampling)
+lm_head_with_sampling_test = pl.jit(_lm_head_with_sampling)
 
 
 @pl.jit.host
