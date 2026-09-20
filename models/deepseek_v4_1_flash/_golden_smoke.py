@@ -201,3 +201,69 @@ def run_moe_golden(golden_fn: Callable[..., torch.Tensor]) -> None:
     if not bool(torch.isfinite(output).all()):
         raise RuntimeError("MoE golden produced non-finite output")
     print(f"[GOLDEN] PASS {golden_fn.__name__} output={tuple(output.shape)}")
+
+
+def make_decode_layer_golden_inputs(layer_id: int) -> dict:
+    """Build a deterministic small Block fixture for one representative layer."""
+    torch.manual_seed(17 + layer_id)
+    attention = _attention_values()
+    if layer_id >= 20:
+        attention["compressed_lens"] = torch.tensor([1, 2], dtype=torch.int32)
+        attention["compressed_slots"] = torch.tensor([0, 1], dtype=torch.int64)
+        attention["compressor_wkv"] = attention["compressor_wkv"].to(torch.bfloat16)
+    if layer_id in (3, 21):
+        attention["compressed_indices"] = torch.tensor([[0, -1], [0, 1]], dtype=torch.int32)
+
+    routed_w1, routed_w1_scale = quantize_mxfp4_weight(torch.randn(8, 64, 64))
+    routed_w2, routed_w2_scale = quantize_mxfp4_weight(torch.randn(8, 64, 64))
+    routed_w3, routed_w3_scale = quantize_mxfp4_weight(torch.randn(8, 64, 64))
+    shared_scale = pack_mx_b_scale(torch.full((2, 64), 127, dtype=torch.uint8))
+    moe = {
+        "gate_weight": torch.randn(8, 64),
+        "correction_bias": torch.randn(8),
+        "routed_w1": routed_w1,
+        "routed_w1_scale": routed_w1_scale,
+        "routed_w2": routed_w2,
+        "routed_w2_scale": routed_w2_scale,
+        "routed_w3": routed_w3,
+        "routed_w3_scale": routed_w3_scale,
+        "shared_w1": torch.randn(64, 64).to(torch.float8_e4m3fn),
+        "shared_w1_scale": shared_scale,
+        "shared_w2": torch.randn(64, 64).to(torch.float8_e4m3fn),
+        "shared_w2_scale": shared_scale,
+        "shared_w3": torch.randn(64, 64).to(torch.float8_e4m3fn),
+        "shared_w3_scale": shared_scale,
+        "token_owners": torch.tensor([0, 1], dtype=torch.int32),
+        "tp_size": 4,
+    }
+    incoming_pre_mix = torch.zeros(2, 4)
+    incoming_pre_mix[:, 0] = 1.0
+    return {
+        "layer_id": layer_id,
+        "x_hc": torch.randn(2, 4, 64),
+        "incoming_pre_mix": incoming_pre_mix,
+        "hc_attn_fn": torch.randn(24, 256) / 16,
+        "hc_attn_scale": torch.randn(3),
+        "hc_attn_base": torch.randn(24),
+        "attn_norm_weight": torch.ones(64, dtype=torch.bfloat16),
+        "hc_ffn_fn": torch.randn(24, 256) / 16,
+        "hc_ffn_scale": torch.randn(3),
+        "hc_ffn_base": torch.randn(24),
+        "ffn_norm_weight": torch.ones(64, dtype=torch.bfloat16),
+        "attention_inputs": attention,
+        "moe_inputs": moe,
+    }
+
+
+def run_decode_layer_goldens(golden_fn: Callable[..., object], layer_ids) -> None:
+    """Execute the six decode Block goldens without compiling unfinished kernels."""
+    for layer_id in layer_ids:
+        result = golden_fn(**make_decode_layer_golden_inputs(layer_id))
+        if result.output.dtype is not torch.float32:
+            raise RuntimeError(f"layer {layer_id} produced {result.output.dtype}, expected torch.float32")
+        if not bool(torch.isfinite(result.output).all()):
+            raise RuntimeError(f"layer {layer_id} produced non-finite output")
+        print(
+            f"[GOLDEN] PASS decode_layer layer={layer_id} "
+            f"output={tuple(result.output.shape)} next_pre_mix={tuple(result.next_pre_mix.shape)}"
+        )

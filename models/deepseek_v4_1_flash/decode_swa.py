@@ -36,10 +36,15 @@ from models.deepseek_v4_1_flash.config import (
 )
 from models.deepseek_v4_1_flash.decode_attn_swa import decode_attn_swa
 from models.deepseek_v4_1_flash.decode_common import attention_pre
+from models.deepseek_v4_1_flash.decode_layer_plan import (
+    DecodeLayerKind,
+    REPRESENTATIVE_LAYER_IDS,
+    resolve_decode_layer_plan,
+)
 from models.deepseek_v4_1_flash.hc_post import mhc_post
 
-KIND = "SWA"
-REPRESENTATIVE_LAYER_ID = 0
+KIND = DecodeLayerKind.SWA
+REPRESENTATIVE_LAYER_ID = REPRESENTATIVE_LAYER_IDS[KIND]
 ATTENTION_GOLDEN = swa.golden_decode_attn_swa
 KERNEL_READY = True
 LEAF_NAMES = tuple(name for name in swa.INPUT_NAMES if name != "x")
@@ -52,8 +57,9 @@ ATTENTION_SPEC_NAMES = (
 
 
 def skip_reason(layer_id=REPRESENTATIVE_LAYER_ID):
-    if layer_id not in (0, 1):
-        return f"layer {layer_id} is not an SWA layer"
+    kind = resolve_decode_layer_plan(layer_id).kind
+    if kind != KIND:
+        return f"layer {layer_id} resolves to {kind.name}, expected {KIND.name}"
     return None if KERNEL_READY else "SWA attention half-layer composition is pending"
 
 
@@ -361,7 +367,7 @@ def main():
         specs,
         make_golden(args.epochs),
         comparisons(),
-        KIND,
+        KIND.name,
         devices,
     )
 

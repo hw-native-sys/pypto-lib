@@ -37,10 +37,15 @@ from models.deepseek_v4_1_flash.config import (
 )
 from models.deepseek_v4_1_flash.decode_attn_c2a_reuse import decode_attn_c2a_reuse
 from models.deepseek_v4_1_flash.decode_common import attention_pre
+from models.deepseek_v4_1_flash.decode_layer_plan import (
+    DecodeLayerKind,
+    REPRESENTATIVE_LAYER_IDS,
+    resolve_decode_layer_plan,
+)
 from models.deepseek_v4_1_flash.hc_post import mhc_post
 
-KIND = "C2A_REUSE"
-REPRESENTATIVE_LAYER_ID = 3
+KIND = DecodeLayerKind.C2A_REUSE
+REPRESENTATIVE_LAYER_ID = REPRESENTATIVE_LAYER_IDS[KIND]
 ATTENTION_GOLDEN = reuse.golden_decode_attn_c2a_reuse
 KERNEL_READY = True
 LEAF_NAMES = tuple(
@@ -57,8 +62,9 @@ ATTENTION_SPEC_NAMES = (
 
 
 def skip_reason(layer_id=REPRESENTATIVE_LAYER_ID):
-    if layer_id not in (*range(3, 8), *range(9, 14), *range(15, 20)):
-        return f"layer {layer_id} is not a C2A Reuse layer"
+    kind = resolve_decode_layer_plan(layer_id).kind
+    if kind != KIND:
+        return f"layer {layer_id} resolves to {kind.name}, expected {KIND.name}"
     return None if KERNEL_READY else "C2A Reuse attention half-layer composition is pending"
 
 
@@ -406,7 +412,7 @@ def main():
         specs,
         make_golden(args.epochs),
         comparisons(initial_state),
-        KIND,
+        KIND.name,
         devices,
     )
 

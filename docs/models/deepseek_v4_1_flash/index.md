@@ -52,9 +52,9 @@ Once a kernel body lands, its owner can extend the same file with the thin
 
 | Workstream | Files |
 | --- | --- |
-| Encoder SWA | `prefill_attn_swa.py` (leaf), `prefill_swa.py` (HC orchestration), `decode_swa.py` |
-| Encoder C2A Full | `prefill_attn_c2a_full.py` (leaf), `prefill_c2a_full.py` (HC orchestration), `decode_c2a_full.py` |
-| Encoder C2A Reuse | `prefill_attn_c2a_reuse.py` (leaf), `prefill_c2a_reuse.py` (HC orchestration), `decode_c2a_reuse.py` |
+| Encoder SWA | `prefill_attn_swa.py` (leaf), `prefill_swa.py` (HC orchestration), `decode_attn_swa.py` (decode leaf), `decode_swa.py` (decode HC orchestration) |
+| Encoder C2A Full | `prefill_attn_c2a_full.py` (leaf), `prefill_c2a_full.py` (HC orchestration), `decode_attn_c2a_full.py` (decode leaf), `decode_c2a_full.py` (decode HC orchestration) |
+| Encoder C2A Reuse | `prefill_attn_c2a_reuse.py` (leaf), `prefill_c2a_reuse.py` (HC orchestration), `decode_attn_c2a_reuse.py` (decode leaf), `decode_c2a_reuse.py` (decode HC orchestration) |
 | Decoder C1A Full | `prefill_c1a_full.py`, `decode_attn_c1a_full.py` (leaf), `decode_c1a_full.py` (HC orchestration) |
 | Decoder C1A Reindex | `prefill_c1a_reindex.py`, `decode_attn_c1a_reindex.py` (leaf), `decode_c1a_reindex.py` (HC orchestration) |
 | Decoder C1A Reuse | `prefill_c1a_reuse.py`, `decode_attn_c1a_reuse.py` (leaf), `decode_c1a_reuse.py` (HC orchestration) |
@@ -64,6 +64,66 @@ Once a kernel body lands, its owner can extend the same file with the thin
 | Expert parallelism | `moe.py` |
 | Shared configuration and goldens | `config.py`, `metadata.py`, `golden.py`, `attention_common.py` |
 | Quantization and RoPE tables | `quantization.py`, `rope_tables.py` |
+
+## Decode composition
+
+[decode_layer_plan.py](../../../models/deepseek_v4_1_flash/decode_layer_plan.py)
+resolves all six modes and source ownership from `FLASH.layer_config`. Each
+mode has an independently executable Attention half-layer entry:
+
+| Mode | Attention kernel | Composition entry | Representative layer |
+| --- | --- | --- | ---: |
+| SWA | `decode_attn_swa.py` | `decode_swa.py` | 0 |
+| C2A Full | `decode_attn_c2a_full.py` | `decode_c2a_full.py` | 2 |
+| C2A Reuse | `decode_attn_c2a_reuse.py` | `decode_c2a_reuse.py` | 3 |
+| C1A Full | `decode_attn_c1a_full.py` | `decode_c1a_full.py` | 20 |
+| C1A Reindex | `decode_attn_c1a_reindex.py` | `decode_c1a_reindex.py` | 24 |
+| C1A Reuse | `decode_attn_c1a_reuse.py` | `decode_c1a_reuse.py` | 21 |
+
+The mode files own their entry contract and readiness state. SWA and C2A use
+the spec-driven boundary helpers in `decode_common.py`; C1A keeps its native
+static token/page ABI and validation harness. `decode_layer.py` is the thin
+complete Block integration entry. Its Torch golden preserves delayed pre-mix
+ordering: Attention consumes the incoming mix, FFN consumes the Attention
+pre-mix, and the Block returns the FFN pre-mix for the next layer. Run the six
+small CPU Block references with:
+
+```bash
+python models/deepseek_v4_1_flash/decode_layer.py --stage block --cpu-golden
+```
+
+All six Attention half-layers are implemented. The full Block device path still
+awaits EP8 MoE integration and its hardware fixture;
+`decode_layer_kernel_skip_reason` reports that dependency. Both the Block
+factory and `--stage block` device command enforce readiness before JIT
+construction. Block CPU references currently require all capacity rows active.
+
+Every mode file provides hardware validation without requiring MoE. The
+`decode_layer.py --stage attention` compatibility dispatcher accepts the
+spec-driven SWA/C2A ABI; C1A validation uses each mode's native entry directly.
+For an allocated TP4 group:
+
+```bash
+python models/deepseek_v4_1_flash/decode_c2a_reuse.py -p a5 -d 0,1,2,3 \
+  --tp 4 --tokens 33 --active-tokens 31 --requests 6 \
+  --epochs 2 --save-data
+```
+
+Each validation epoch invokes the complete production composition: mHC
+mixes/pre, input RMSNorm, one Attention call, and mHC post. Epochs repeat the
+same fixture inputs for validation and benchmarking; they do not feed one
+epoch's hidden or pre-mix output into the next. Validation reuses each leaf's
+fixture, reference, and precision checks and checks updated caches and exact
+non-owner storage.
+
+mHC boundaries cover the full token capacity. Composition owns the temporary
+collapsed and normalized Attention inputs. `attention_output` remains a
+caller-initialized `InOut` because Reuse writes only the active prefix while
+mHC post consumes the full capacity. The Reuse case validates inactive rows
+with a nonzero sentinel. `attention_hidden` and `attention_pre_mix` are fully
+written `Out` boundaries. Hidden precision statistics cover active rows only;
+the inactive suffix is checked independently so it cannot dilute the active
+error budget.
 
 Full attention owns compressed KV and index-key publication. Reindex consumes
 the C1A cache and the layer-20 candidate mask but computes a new index query.

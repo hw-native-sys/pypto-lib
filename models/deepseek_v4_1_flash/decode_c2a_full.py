@@ -39,10 +39,15 @@ from models.deepseek_v4_1_flash.config import (
 )
 from models.deepseek_v4_1_flash.decode_attn_c2a_full import decode_attn_c2a_full
 from models.deepseek_v4_1_flash.decode_common import attention_pre
+from models.deepseek_v4_1_flash.decode_layer_plan import (
+    DecodeLayerKind,
+    REPRESENTATIVE_LAYER_IDS,
+    resolve_decode_layer_plan,
+)
 from models.deepseek_v4_1_flash.hc_post import mhc_post
 
-KIND = "C2A_FULL"
-REPRESENTATIVE_LAYER_ID = 2
+KIND = DecodeLayerKind.C2A_FULL
+REPRESENTATIVE_LAYER_ID = REPRESENTATIVE_LAYER_IDS[KIND]
 ATTENTION_GOLDEN = full.golden_decode_attn_c2a_full
 KERNEL_READY = True
 LEAF_NAMES = (*tuple(name for name in full.INPUT_NAMES if name != "x"), "topk_indices")
@@ -55,8 +60,9 @@ ATTENTION_SPEC_NAMES = (
 
 
 def skip_reason(layer_id=REPRESENTATIVE_LAYER_ID):
-    if layer_id not in (2, 8, 14):
-        return f"layer {layer_id} is not a C2A Full layer"
+    kind = resolve_decode_layer_plan(layer_id).kind
+    if kind != KIND:
+        return f"layer {layer_id} resolves to {kind.name}, expected {KIND.name}"
     return None if KERNEL_READY else "C2A Full attention half-layer composition is pending"
 
 
@@ -544,7 +550,7 @@ def main():
         specs,
         make_golden(args.epochs),
         comparisons(),
-        KIND,
+        KIND.name,
         devices,
     )
 
