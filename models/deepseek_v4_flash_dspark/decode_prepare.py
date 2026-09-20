@@ -40,8 +40,11 @@ COMMIT_B_DYN = pl.dynamic("DSPARK_STATE_COMMIT_B_DYN")
 B = DECODE_BATCH
 S = DECODE_SEQ
 T = B * S
-LOCAL_B = B // TP
-LOCAL_T = LOCAL_B * S
+# Each rank owns one frozen MoE slab of tokens, not the TP split of the group
+# batch: MOE_TOKENS keeps its EP=16 value, so the two agree only at TP=4, and
+# the target forward takes its local token count off the slab.
+LOCAL_T = MOE_TOKENS
+LOCAL_B = LOCAL_T // S
 LOCAL_BATCH = LOCAL_B          # the name the device-state stages use
 D = M.hidden_size
 MAIN_HIDDEN_DIM = 3 * D

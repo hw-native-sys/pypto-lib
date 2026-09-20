@@ -1129,64 +1129,65 @@ def _decode_fwd(
                         pre_hc_hidden_out[token : token + 1, 0 : HC_MULT, 0 : D] = zero_next_row_last
     clear_moe_signals(x_moe_next, arrived, data_arrived, combine_arrived)
 
-    with pl.scope():
-        if group_tokens > 0:
-            target_hc_stack = pl.create_tensor([MOE_TOKENS * 3, HC_MULT, D], dtype=pl.FP32)
-            for token in pl.spmd(MOE_TOKENS, name_hint="decode_fwd_pack_target_hc"):
-                if token < local_t:
-                    target_row = token * 3
-                    pong_row = x_pong[token : token + 1, 0 : HC_MULT, 0 : D]
-                    target_hc_stack[target_row : target_row + 1, 0 : HC_MULT, 0 : D] = pong_row
-                    ping_row = x_ping[token : token + 1, 0 : HC_MULT, 0 : D]
-                    target_hc_stack[target_row + 1 : target_row + 2, 0 : HC_MULT, 0 : D] = ping_row
-                    hidden_out_row = pre_hc_hidden_out[token : token + 1, 0 : HC_MULT, 0 : D]
-                    target_hc_stack[target_row + 2 : target_row + 3, 0 : HC_MULT, 0 : D] = hidden_out_row
-            target_rows = local_t * 3
-            target_hc_active = pl.slice(target_hc_stack, [target_rows, HC_MULT, D], [0, 0, 0])
-            target_hidden_stack = pl.create_tensor([MOE_TOKENS * 3, D], dtype=pl.BF16)
-            target_hidden_active = pl.slice(target_hidden_stack, [target_rows, D], [0, 0])
-            hc_head(target_hc_active, hc_head_fn, hc_head_scale, hc_head_base, target_hidden_active)
-            for token in pl.spmd(MOE_TOKENS, name_hint="decode_fwd_store_target_hidden"):
-                if token < local_t:
-                    target_row = token * 3
-                    target_hidden_l40 = target_hidden_stack[target_row : target_row + 1, 0:D]
-                    target_hidden_l41 = target_hidden_stack[target_row + 1 : target_row + 2, 0:D]
-                    target_hidden_l42 = target_hidden_stack[target_row + 2 : target_row + 3, 0:D]
-                    dspark_target_hidden[token : token + 1, 0:D] = target_hidden_l40
-                    dspark_target_hidden[token : token + 1, D : 2 * D] = target_hidden_l41
-                    dspark_target_hidden[token : token + 1, 2 * D : 3 * D] = target_hidden_l42
-            for token in pl.spmd(MOE_TOKENS, name_hint="decode_fwd_store_final_hidden"):
-                if token < local_t:
-                    target_row = token * 3
-                    target_hidden_l42 = target_hidden_stack[target_row + 2 : target_row + 3, 0:D]
-                    hidden_workspace[token : token + 1, 0:D] = target_hidden_l42
-            final_norm_tid = rms_norm(hidden_workspace, final_norm_w, x_out)
-            lm_head(
-                x_out,
-                lm_head_weight,
-                logit_row_indices,
-                logits,
-                lm_head_hidden_window,
-                lm_head_hidden_done,
-                lm_head_logits_window,
-                lm_head_logits_done,
-                group_base,
-                tp_rank,
-                pl.const(LM_HEAD_COMM_EPOCH, pl.INT32),
-                final_norm_tid,
-            )
-            greedy_sample(logits, logit_row_indices, sampled_ids)
-        else:
-            for row in pl.spmd(MAX_LOGIT_ROWS, name_hint="decode_fwd_inactive_sample_rows"):
-                for col in pl.range(LM_HEAD_VOCAB // LOGITS_ZERO_TILE):
-                    col_begin = col * LOGITS_ZERO_TILE
-                    zero_logits_tile = pl.full([1, LOGITS_ZERO_TILE], dtype=pl.FP32, value=0.0)
-                    logits[row : row + 1, col_begin : col_begin + LOGITS_ZERO_TILE] = zero_logits_tile
-                if LM_HEAD_VOCAB % LOGITS_ZERO_TILE != 0:
-                    zero_logits_tail = pl.full([1, LM_HEAD_VOCAB % LOGITS_ZERO_TILE], dtype=pl.FP32, value=0.0)
-                    logits[row : row + 1, LM_HEAD_VOCAB // LOGITS_ZERO_TILE * LOGITS_ZERO_TILE :] = zero_logits_tail
-                unset_ids_row = pl.full([1, SAMPLED_IDS_PAD], dtype=pl.INT32, value=-1)
-                sampled_ids[row : row + 1, :] = unset_ids_row
+    # No pl.scope() here: the branches write pl.Out params, and a scope would
+    # confine their phi to it, out of reach of a caller that inlines this body.
+    if group_tokens > 0:
+        target_hc_stack = pl.create_tensor([MOE_TOKENS * 3, HC_MULT, D], dtype=pl.FP32)
+        for token in pl.spmd(MOE_TOKENS, name_hint="decode_fwd_pack_target_hc"):
+            if token < local_t:
+                target_row = token * 3
+                pong_row = x_pong[token : token + 1, 0 : HC_MULT, 0 : D]
+                target_hc_stack[target_row : target_row + 1, 0 : HC_MULT, 0 : D] = pong_row
+                ping_row = x_ping[token : token + 1, 0 : HC_MULT, 0 : D]
+                target_hc_stack[target_row + 1 : target_row + 2, 0 : HC_MULT, 0 : D] = ping_row
+                hidden_out_row = pre_hc_hidden_out[token : token + 1, 0 : HC_MULT, 0 : D]
+                target_hc_stack[target_row + 2 : target_row + 3, 0 : HC_MULT, 0 : D] = hidden_out_row
+        target_rows = local_t * 3
+        target_hc_active = pl.slice(target_hc_stack, [target_rows, HC_MULT, D], [0, 0, 0])
+        target_hidden_stack = pl.create_tensor([MOE_TOKENS * 3, D], dtype=pl.BF16)
+        target_hidden_active = pl.slice(target_hidden_stack, [target_rows, D], [0, 0])
+        hc_head(target_hc_active, hc_head_fn, hc_head_scale, hc_head_base, target_hidden_active)
+        for token in pl.spmd(MOE_TOKENS, name_hint="decode_fwd_store_target_hidden"):
+            if token < local_t:
+                target_row = token * 3
+                target_hidden_l40 = target_hidden_stack[target_row : target_row + 1, 0:D]
+                target_hidden_l41 = target_hidden_stack[target_row + 1 : target_row + 2, 0:D]
+                target_hidden_l42 = target_hidden_stack[target_row + 2 : target_row + 3, 0:D]
+                dspark_target_hidden[token : token + 1, 0:D] = target_hidden_l40
+                dspark_target_hidden[token : token + 1, D : 2 * D] = target_hidden_l41
+                dspark_target_hidden[token : token + 1, 2 * D : 3 * D] = target_hidden_l42
+        for token in pl.spmd(MOE_TOKENS, name_hint="decode_fwd_store_final_hidden"):
+            if token < local_t:
+                target_row = token * 3
+                target_hidden_l42 = target_hidden_stack[target_row + 2 : target_row + 3, 0:D]
+                hidden_workspace[token : token + 1, 0:D] = target_hidden_l42
+        final_norm_tid = rms_norm(hidden_workspace, final_norm_w, x_out)
+        lm_head(
+            x_out,
+            lm_head_weight,
+            logit_row_indices,
+            logits,
+            lm_head_hidden_window,
+            lm_head_hidden_done,
+            lm_head_logits_window,
+            lm_head_logits_done,
+            group_base,
+            tp_rank,
+            pl.const(LM_HEAD_COMM_EPOCH, pl.INT32),
+            final_norm_tid,
+        )
+        greedy_sample(logits, logit_row_indices, sampled_ids)
+    else:
+        for row in pl.spmd(MAX_LOGIT_ROWS, name_hint="decode_fwd_inactive_sample_rows"):
+            for col in pl.range(LM_HEAD_VOCAB // LOGITS_ZERO_TILE):
+                col_begin = col * LOGITS_ZERO_TILE
+                zero_logits_tile = pl.full([1, LOGITS_ZERO_TILE], dtype=pl.FP32, value=0.0)
+                logits[row : row + 1, col_begin : col_begin + LOGITS_ZERO_TILE] = zero_logits_tile
+            if LM_HEAD_VOCAB % LOGITS_ZERO_TILE != 0:
+                zero_logits_tail = pl.full([1, LM_HEAD_VOCAB % LOGITS_ZERO_TILE], dtype=pl.FP32, value=0.0)
+                logits[row : row + 1, LM_HEAD_VOCAB // LOGITS_ZERO_TILE * LOGITS_ZERO_TILE :] = zero_logits_tail
+            unset_ids_row = pl.full([1, SAMPLED_IDS_PAD], dtype=pl.INT32, value=-1)
+            sampled_ids[row : row + 1, :] = unset_ids_row
     return x_out
 
 

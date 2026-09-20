@@ -20,11 +20,11 @@ import pypto.language as pl
 
 from config import (
     BLOCK_SIZE,
-    DECODE_BATCH,
+    DECODE_SEQ,
     DSPARK_SPEC_TOKENS,
     FLASH as M,
     KV_ORI_BLOCK_NUM,
-    TP,
+    MOE_TOKENS,
 )
 from decode_o_proj import ATTENTION_PUBLISH_WORKERS, LOCAL_T_PAD
 from qkv_proj_rope import (
@@ -39,7 +39,9 @@ ORI_BLOCK_NUM_DYN = pl.dynamic("DSPARK_ATTENTION_ORI_BLOCK_NUM_DYN")
 KV_T_DYN = pl.dynamic("DSPARK_ATTENTION_KV_T_DYN")
 
 # model config
-B = DECODE_BATCH // TP
+# The drafter's query batch is one MoE slab of padded draft blocks, not the TP
+# split of the target batch: those agree only at TP=4.
+B = MOE_TOKENS // DECODE_SEQ
 S = DSPARK_SPEC_TOKENS                   # anchor-first draft query rows per request
 T = B * S
 D = M.hidden_size

@@ -66,7 +66,7 @@ decode_fwd
 │                     decode_hca  → moe        (layers 3, 5, …, 41)
 ├── layer 42          decode_csa  → moe
 └── tail              hc_head → rms_norm → lm_head (TP vocab shard)
-                      → greedy_sample → accept_target_into_device_state
+                      → greedy_sample
 ```
 
 `decode_fwd` is the plain forward: it takes its token ids, positions, and
@@ -187,9 +187,14 @@ dspark_markov      lm_head → sequential Markov sampling → confidence head
   prompt-context KV insertion followed by the same seven-query proposal.
   `--mode decode`, the default, starts from the accepted decode rows instead.
 
-The drafter and the target forward are compiled and validated as separate
-programs; there is no single entry composing a full target-plus-draft serving
-step yet.
+The drafter's query batch is one MoE slab of padded draft blocks
+(`MOE_TOKENS / DECODE_SEQ` requests), not the TP split of the target batch, so
+its shapes do not move with `--tp`; only the DSA-CP group width does.
+
+[decode_fwd_dspark.py](../../../models/deepseek_v4_flash_dspark/decode_fwd_dspark.py)
+composes the whole recurrent step — prepare, target forward, accept, drafter,
+Markov sampler, state commit — into one L2, and runs it end to end without a
+golden.
 
 ## Status
 
@@ -202,7 +207,8 @@ simulator.
 ```bash
 python models/deepseek_v4_flash_dspark/decode_layer.py -p a2a3 --tp 2 --ep 2 -d 0,1
 python models/deepseek_v4_flash_dspark/decode_fwd.py -p a2a3 --tp 2 --ep 2 -d 0,1
-python models/deepseek_v4_flash_dspark/dspark_drafter.py -p a2a3 --tp 4 --ep 4 -d 0,1,2,3
+python models/deepseek_v4_flash_dspark/dspark_drafter.py -p a2a3 --tp 2 --ep 2 -d 0,1
+python models/deepseek_v4_flash_dspark/decode_fwd_dspark.py -p a2a3 --tp 2 --ep 2 -d 0,1
 ```
 
 `--tp` and `--ep` are read at import time, because the shapes they derive

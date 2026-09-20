@@ -48,15 +48,13 @@ from pypto.ir import DistributedConfig
 
 from config import (
     BLOCK_SIZE,
-    DECODE_BATCH,
     DECODE_SEQ,
     FLASH as M,
     KV_ORI_BLOCK_NUM,
     MOE_TOKENS,
     PREFILL_TOKENS,
-    TP,
 )
-from dspark_attention import dspark_attention
+from dspark_attention import T as DSPARK_ATTENTION_T, dspark_attention
 from dspark_context_kv import dspark_context_kv
 from decode_o_proj import (
     ATTENTION_PUBLISH_WORKERS,
@@ -119,9 +117,9 @@ DSPARK_MOE_TOKENS = DSPARK_MAX_BATCH * DSPARK_QUERY_PAD
 DSPARK_SWA_INDEX_WIDTH = (M.sliding_window + DSPARK_QUERY_WIDTH + 63) // 64 * 64
 DSPARK_CP_SIZE = PREFILL_CP_SIZE
 
-# The query batch is one MoE slab, not the TP split.  TP=4 covers every
-# request; TP=2 covers half of each rank's, so it is a shape test only.
-assert DSPARK_MAX_BATCH <= DECODE_BATCH // TP
+# The query batch is one MoE slab, not the TP split of the target batch: the two
+# agree only at TP=4, and dspark_attention sizes its query rows off the slab.
+assert DSPARK_QUERY_TOKENS == DSPARK_ATTENTION_T
 assert DSPARK_MOE_TOKENS == MOE_TOKENS
 assert DSPARK_SWA_INDEX_WIDTH >= M.sliding_window + DSPARK_QUERY_WIDTH
 assert DSPARK_QUERY_TOKENS <= LOCAL_T_PAD

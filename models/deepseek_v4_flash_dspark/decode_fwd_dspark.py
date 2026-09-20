@@ -6,6 +6,8 @@
 # INCLUDING BUT NOT LIMITED TO NON-INFRINGEMENT, MERCHANTABILITY, OR FITNESS FOR A PARTICULAR PURPOSE.
 # See LICENSE in the root of the software repository for the full text of the License.
 # -----------------------------------------------------------------------------------------------------------
+# ci: devices=2
+# ci: no-sim
 """One-L2 DSpark target decode, drafter, Markov sampler, and state commit."""
 
 import pypto.language as pl
@@ -58,6 +60,7 @@ DSPARK_STATE_LOCAL_BATCH = prepare.LOCAL_BATCH
 DSPARK_STATE_META_WIDTH = prepare.STATE_META_WIDTH
 DSPARK_STATE_TOKEN_WIDTH = prepare.STATE_TOKEN_WIDTH
 EMBED_VOCAB_DYN = decode.EMBED_VOCAB_DYN
+EP_SIZE = decode.EP_SIZE
 FWD_CSA_CMP_BLOCKS_DYN = decode.FWD_CSA_CMP_BLOCKS_DYN
 FWD_CSA_IDX_BLOCKS_DYN = decode.FWD_CSA_IDX_BLOCKS_DYN
 FWD_CSA_INNER_STATE_BLOCKS_DYN = decode.FWD_CSA_INNER_STATE_BLOCKS_DYN
@@ -113,8 +116,8 @@ VOCAB_PER_TP = decode.VOCAB_PER_TP
 WIN = decode.WIN
 DECODE_BATCH = prepare.B
 GROUP_DECODE_TOKENS = prepare.T
-LOCAL_DECODE_BATCH = DECODE_BATCH // TP_SIZE
-LOCAL_DECODE_TOKENS = GROUP_DECODE_TOKENS // TP_SIZE
+LOCAL_DECODE_BATCH = prepare.LOCAL_BATCH
+LOCAL_DECODE_TOKENS = prepare.LOCAL_T
 HCA_STATE_TABLE_BLOCKS = prepare.HCA_STATE_TABLE_BLOCKS
 CSA_STATE_TABLE_BLOCKS = prepare.CSA_STATE_TABLE_BLOCKS
 ORI_TABLE_BLOCKS_DYN = prepare.ORI_TABLE_BLOCKS_DYN
@@ -164,6 +167,9 @@ DRAFT_VOCAB_PER_TP = lmhead.VOCAB_PER_TP
 BRIDGE_GROUP_METADATA_ROWS = prepare.GROUP_METADATA_ROWS
 BRIDGE_METADATA_WIDTH = prepare.METADATA_WIDTH
 BRIDGE_ROPE_CANDIDATE_ROWS = prepare.ROPE_CANDIDATE_ROWS
+
+# Per-ring heap for the target forward, three draft layers, and their MoE graphs.
+DSPARK_RING_HEAP = (4 * 1024 * 1024 * 1024,) * 4
 
 
 @pl.jit(auto_scope=False)
@@ -375,6 +381,39 @@ def l2_decode_fwd_dspark(
     ratio4_rope_sin_table.bind_dynamic(0, ROPE_ROWS_DYN)
     ratio128_rope_cos_table.bind_dynamic(0, ROPE_ROWS_DYN)
     ratio128_rope_sin_table.bind_dynamic(0, ROPE_ROWS_DYN)
+    # The drafter bridge outlives the target scope: the Markov sampler and the
+    # state commit read it from their own scopes, so it is built at frame level.
+    draft_batch = pl.tensor.dim(draft_head_hidden, 0)
+    draft_group_context_tokens = DRAFT_DSPARK_CP_SIZE * draft_batch * SAMPLED_IDS_PAD
+    bridge_num_sampled = pl.create_tensor([draft_batch], dtype=pl.INT32)
+    bridge_last_sampled = pl.create_tensor([draft_batch], dtype=pl.INT64)
+    bridge_next_prefill_tokens = pl.create_tensor([draft_batch], dtype=pl.INT64)
+    bridge_anchor_positions = pl.create_tensor([draft_batch], dtype=pl.INT32)
+    bridge_state_slot_ids = pl.create_tensor([draft_batch], dtype=pl.INT32)
+    bridge_state_generations = pl.create_tensor([draft_batch], dtype=pl.INT32)
+    bridge_logit_row_indices = pl.create_tensor([DRAFT_MAX_LOGIT_ROWS], dtype=pl.INT32)
+    bridge_context_group_position_ids = pl.create_tensor([draft_group_context_tokens], dtype=pl.INT32)
+    bridge_context_group_slot_mapping = pl.create_tensor(
+        [DRAFT_DSPARK_DRAFT_LAYERS, draft_group_context_tokens],
+        dtype=pl.INT64,
+    )
+    bridge_query_group_position_ids = pl.create_tensor([DRAFT_DSPARK_CP_SIZE * DRAFT_T_QUERY], dtype=pl.INT32)
+    bridge_query_group_slot_mapping = pl.create_tensor(
+        [DRAFT_DSPARK_DRAFT_LAYERS, DRAFT_DSPARK_CP_SIZE * DRAFT_T_QUERY],
+        dtype=pl.INT64,
+    )
+    bridge_context_group_freqs_cos = pl.create_tensor([draft_group_context_tokens, DRAFT_ROPE_DIM], dtype=pl.BF16)
+    bridge_context_group_freqs_sin = pl.create_tensor([draft_group_context_tokens, DRAFT_ROPE_DIM], dtype=pl.BF16)
+    bridge_query_freqs_cos = pl.create_tensor([DRAFT_T_QUERY, DRAFT_ROPE_DIM], dtype=pl.BF16)
+    bridge_query_freqs_sin = pl.create_tensor([DRAFT_T_QUERY, DRAFT_ROPE_DIM], dtype=pl.BF16)
+    bridge_query_group_freqs_cos = pl.create_tensor(
+        [DRAFT_DSPARK_CP_SIZE * DRAFT_T_QUERY, DRAFT_ROPE_DIM],
+        dtype=pl.BF16,
+    )
+    bridge_query_group_freqs_sin = pl.create_tensor(
+        [DRAFT_DSPARK_CP_SIZE * DRAFT_T_QUERY, DRAFT_ROPE_DIM],
+        dtype=pl.BF16,
+    )
     with pl.scope():
         # Match fused MTP's ownership model: position-dependent decode
         # metadata is invocation-local scratch, not a serving-owned InOut ABI.
@@ -424,7 +463,6 @@ def l2_decode_fwd_dspark(
         )
         local_active_widths = pl.create_tensor([DSPARK_STATE_LOCAL_BATCH], dtype=pl.INT32)
         group_active_widths = pl.create_tensor([DECODE_BATCH], dtype=pl.INT32)
-        draft_batch = pl.tensor.dim(draft_head_hidden, 0)
         prepared_draft_rope_cos_candidates = pl.create_tensor(
             [draft_batch, BRIDGE_ROPE_CANDIDATE_ROWS, DRAFT_ROPE_DIM],
             dtype=pl.BF16,
@@ -519,7 +557,6 @@ def l2_decode_fwd_dspark(
             prepared_drafter_row_offsets,
             target_accept_ready,
         )
-        draft_group_context_tokens = DRAFT_DSPARK_CP_SIZE * draft_batch * SAMPLED_IDS_PAD
         draft_context_tokens = draft_group_context_tokens // DRAFT_DSPARK_CP_SIZE
         draft_target_hidden = pl.create_tensor([draft_context_tokens, DRAFT_MAIN_IN], dtype=pl.BF16)
         with pl.spmd(draft_context_tokens, name_hint="dspark_accept_hidden_compact"):
@@ -530,54 +567,9 @@ def l2_decode_fwd_dspark(
             ] = prepared_drafter_target_hidden[
                 source_row : source_row + 1, 0:DRAFT_MAIN_IN
             ]
-        bridge_num_sampled = pl.create_tensor([draft_batch], dtype=pl.INT32)
-        bridge_last_sampled = pl.create_tensor([draft_batch], dtype=pl.INT64)
-        bridge_next_prefill_tokens = pl.create_tensor([draft_batch], dtype=pl.INT64)
-        bridge_anchor_positions = pl.create_tensor([draft_batch], dtype=pl.INT32)
-        bridge_state_slot_ids = pl.create_tensor([draft_batch], dtype=pl.INT32)
-        bridge_state_generations = pl.create_tensor([draft_batch], dtype=pl.INT32)
-        bridge_logit_row_indices = pl.create_tensor([DRAFT_MAX_LOGIT_ROWS], dtype=pl.INT32)
-        bridge_context_group_position_ids = pl.create_tensor([draft_group_context_tokens], dtype=pl.INT32)
-        bridge_context_group_slot_mapping = pl.create_tensor(
-            [DRAFT_DSPARK_DRAFT_LAYERS, draft_group_context_tokens],
-            dtype=pl.INT64,
-        )
-        bridge_query_group_position_ids = pl.create_tensor([DRAFT_DSPARK_CP_SIZE * DRAFT_T_QUERY], dtype=pl.INT32)
-        bridge_query_group_slot_mapping = pl.create_tensor(
-            [DRAFT_DSPARK_DRAFT_LAYERS, DRAFT_DSPARK_CP_SIZE * DRAFT_T_QUERY],
-            dtype=pl.INT64,
-        )
-        bridge_context_group_freqs_cos = pl.create_tensor([draft_group_context_tokens, DRAFT_ROPE_DIM], dtype=pl.BF16)
-        bridge_context_group_freqs_sin = pl.create_tensor([draft_group_context_tokens, DRAFT_ROPE_DIM], dtype=pl.BF16)
-        bridge_query_freqs_cos = pl.create_tensor([DRAFT_T_QUERY, DRAFT_ROPE_DIM], dtype=pl.BF16)
-        bridge_query_freqs_sin = pl.create_tensor([DRAFT_T_QUERY, DRAFT_ROPE_DIM], dtype=pl.BF16)
-        bridge_query_group_freqs_cos = pl.create_tensor(
-            [DRAFT_DSPARK_CP_SIZE * DRAFT_T_QUERY, DRAFT_ROPE_DIM],
-            dtype=pl.BF16,
-        )
-        bridge_query_group_freqs_sin = pl.create_tensor(
-            [DRAFT_DSPARK_CP_SIZE * DRAFT_T_QUERY, DRAFT_ROPE_DIM],
-            dtype=pl.BF16,
-        )
-        (
-            bridge_num_sampled,
-            bridge_last_sampled,
-            bridge_next_prefill_tokens,
-            bridge_anchor_positions,
-            bridge_state_slot_ids,
-            bridge_state_generations,
-            bridge_logit_row_indices,
-            bridge_context_group_position_ids,
-            bridge_context_group_slot_mapping,
-            bridge_query_group_position_ids,
-            bridge_query_group_slot_mapping,
-            bridge_context_group_freqs_cos,
-            bridge_context_group_freqs_sin,
-            bridge_query_freqs_cos,
-            bridge_query_freqs_sin,
-            bridge_query_group_freqs_cos,
-            bridge_query_group_freqs_sin,
-        ) = prepare_drafter_after_target(
+        # Bare call: rebinding the returned outputs would version them inside
+        # this scope, and the later scopes could no longer name them.
+        prepare_drafter_after_target(
             target_accept_ready,
             state_slot_ids, state_generations,
             accepted_counts,
@@ -1093,10 +1085,11 @@ def build_tensor_specs():
             dtype = torch_dtype[str(param.annotation.dtype)]
             value = seeded.get(param.name)
             if value is None and "block_table" in param.name:
-                # every logical page maps to a distinct, in-range physical block
-                blocks = shape[1] * shape[2]
-                value = (torch.arange(blocks, dtype=torch.int32) % shape[2]).reshape(1, shape[1], shape[2])
-                value = value.expand(shape[0], -1, -1).contiguous()
+                # every request maps its own pages onto the same physical window: the
+                # caches are sized for one request's pages, and this harness has no
+                # golden, so the overlap costs nothing and stays in range
+                pages = torch.arange(shape[1] * shape[2], dtype=torch.int32) % shape[2]
+                value = pages.reshape(1, shape[1], shape[2]).expand(shape[0], -1, -1).contiguous()
             elif value is None and "rope" in param.name:
                 angle = torch.arange(shape[1], dtype=torch.float32).unsqueeze(1) * 1e-4
                 trig = torch.cos(angle) if "cos" in param.name else torch.sin(angle)
@@ -1106,3 +1099,66 @@ def build_tensor_specs():
             spec = TensorSpec(param.name, shape, dtype, init_value=value)
         ordered.append(spec)
     return ordered
+
+
+def main():
+    import argparse
+
+    from golden import run
+    from pypto.ir import DistributedConfig
+
+    parser = argparse.ArgumentParser(description="DeepSeek-V4 D-Spark fused decode, drafter, and sampler")
+    parser.add_argument("-p", "--platform", type=str, default="a2a3", choices=("a2a3", "a2a3sim", "a5", "a5sim"))
+    parser.add_argument("--tp", type=int, default=TP_SIZE, choices=(2, 4))
+    parser.add_argument("--ep", type=int, default=EP_SIZE, choices=(2, 4, 8, 16))
+    parser.add_argument(
+        "-d", "--device", type=str, default=None,
+        help=f"comma-separated device ids; EP={EP_SIZE} needs {EP_SIZE}",
+    )
+    parser.add_argument("--compile-only", action="store_true", default=False)
+    parser.add_argument("--enable-scope-stats", action="store_true", default=False)
+    parser.add_argument("--enable-chip-swimlane", type=int, nargs="?", const=1, default=0, choices=range(5))
+    parser.add_argument("--runtime-dir", type=str, default=None)
+    parser.add_argument("--save-data", action="store_true", default=False)
+    parser.add_argument("--dump-passes", action="store_true", default=False)
+    parser.add_argument("--log-level", type=str, default=None)
+    args = parser.parse_args()
+
+    if args.tp != TP_SIZE or args.ep != EP_SIZE:
+        parser.error(f"parallel sizes froze at import as TP={TP_SIZE}, EP={EP_SIZE}")
+
+    if args.device is None:
+        args.device = ",".join(str(rank) for rank in range(EP_SIZE))
+    try:
+        device_ids = [int(device) for device in args.device.split(",")]
+    except ValueError:
+        parser.error(f"--device must be a comma-separated integer list, got {args.device!r}")
+    if len(device_ids) != EP_SIZE:
+        parser.error(f"EP={EP_SIZE} needs exactly {EP_SIZE} devices, got {device_ids}")
+    if len(set(device_ids)) != len(device_ids) or any(device < 0 for device in device_ids):
+        parser.error(f"device IDs must be distinct and non-negative: {device_ids}")
+
+    result = run(
+        fn=l3_decode_fwd_dspark,
+        specs=build_tensor_specs(),
+        save_data=args.save_data,
+        compile_only=args.compile_only,
+        runtime_dir=args.runtime_dir,
+        config=dict(
+            dump_passes=args.dump_passes,
+            distributed_config=DistributedConfig(device_ids=device_ids, num_sub_workers=0),
+            platform=args.platform,
+            enable_scope_stats=args.enable_scope_stats,
+            enable_chip_swimlane=args.enable_chip_swimlane,
+            log_level=args.log_level,
+            ring_heap=DSPARK_RING_HEAP,
+        ),
+    )
+    if not result.passed:
+        if result.error:
+            print(result.error)
+        raise SystemExit(1)
+
+
+if __name__ == "__main__":
+    main()
