@@ -17,20 +17,14 @@ from config import (
     C128_COMPRESSOR_BLOCK_SIZE,
     DECODE_BATCH,
     DECODE_SEQ,
-    EP as N_RANKS,
     FLASH as M,
     HCA_CMP_STORAGE_BLOCK_SIZE,
+    MOE_TOKENS,
     TP,
 )
-from dspark_device_state import (
-    STATE_CAPACITY,
-    STATE_META_WIDTH,
-    STATE_TOKEN_WIDTH,
-    build_group_prepare_tensor_specs,
-    prepare_target_group_from_device_state,
-)
 
 
+# Dynamic shape variables.
 ORI_TABLE_BLOCKS_DYN = pl.dynamic("DSPARK_PREPARE_ORI_TABLE_BLOCKS_DYN")
 HCA_CMP_TABLE_BLOCKS_DYN = pl.dynamic("DSPARK_PREPARE_HCA_CMP_TABLE_BLOCKS_DYN")
 CSA_CMP_TABLE_BLOCKS_DYN = pl.dynamic("DSPARK_PREPARE_CSA_CMP_TABLE_BLOCKS_DYN")
@@ -39,25 +33,49 @@ HCA_GROUP_STATE_BLOCKS_DYN = pl.dynamic("DSPARK_PREPARE_HCA_GROUP_STATE_BLOCKS_D
 CSA_GROUP_STATE_BLOCKS_DYN = pl.dynamic("DSPARK_PREPARE_CSA_GROUP_STATE_BLOCKS_DYN")
 ROPE_ROWS_DYN = pl.dynamic("DSPARK_PREPARE_ROPE_ROWS_DYN")
 DRAFTER_B_DYN = pl.dynamic("DSPARK_PREPARE_DRAFTER_B_DYN")
+DRAFTER_HEAD_B_DYN = pl.dynamic("DSPARK_PREPARE_DRAFTER_HEAD_B_DYN")
+COMMIT_B_DYN = pl.dynamic("DSPARK_STATE_COMMIT_B_DYN")
 
+# model config
 B = DECODE_BATCH
 S = DECODE_SEQ
 T = B * S
 LOCAL_B = B // TP
 LOCAL_T = LOCAL_B * S
+LOCAL_BATCH = LOCAL_B          # the name the device-state stages use
+D = M.hidden_size
+MAIN_HIDDEN_DIM = 3 * D
+DSPARK_QUERY_WIDTH = S - 1
 WIN = M.sliding_window
 ROPE_DIM = M.qk_rope_head_dim
 HALF_ROPE = ROPE_DIM // 2
 HCA_COMPRESS_RATIO = 128
 CSA_COMPRESS_RATIO = 4
+
+# One state replica per TP rank, indexed by the group-local drafter lease; the
+# fused wrapper publishes each updated row to its three peers.
+STATE_CAPACITY = DECODE_BATCH
+STATE_VALID = 0
+STATE_GENERATION = 1
+STATE_ANCHOR_POSITION = 2
+STATE_COMMITTED_COUNT = 3
+STATE_DRAFT_COUNT = 4
+STATE_POSITION_LIMIT = 5
+STATE_META_WIDTH = 6
+STATE_CURRENT_TOKEN = 0
+STATE_FIRST_DRAFT = 1
+STATE_TOKEN_WIDTH = 1 + DSPARK_QUERY_WIDTH
+
+# tiling
 CSA_CMP_STORAGE_BLOCK_SIZE = BLOCK_SIZE
 HCA_STATE_TABLE_BLOCKS = M.max_position_embeddings // C128_COMPRESSOR_BLOCK_SIZE
 HCA_HISTORY_PAGES = HCA_COMPRESS_RATIO // C128_COMPRESSOR_BLOCK_SIZE
 CSA_STATE_STORAGE_LEN = 8 + S
-CSA_STATE_TABLE_BLOCKS = (
-    CSA_STATE_STORAGE_LEN + C4A_COMPRESSOR_BLOCK_SIZE - 1
-) // C4A_COMPRESSOR_BLOCK_SIZE
+CSA_STATE_TABLE_BLOCKS = (CSA_STATE_STORAGE_LEN + C4A_COMPRESSOR_BLOCK_SIZE - 1) // C4A_COMPRESSOR_BLOCK_SIZE
 DRAFTER_CANDIDATE_ROWS = 16
+
+assert S == STATE_TOKEN_WIDTH
+assert S == DSPARK_QUERY_WIDTH + 1
 
 
 @pl.jit.inline(auto_scope=False)
@@ -78,12 +96,8 @@ def gather_group_decode_rope_rows(
     csa_cmp_sin: pl.Tensor[[T, ROPE_DIM], pl.BF16],
     hca_cmp_cos: pl.Tensor[[B, HALF_ROPE], pl.FP32],
     hca_cmp_sin: pl.Tensor[[B, HALF_ROPE], pl.FP32],
-    drafter_cos_candidates: pl.Tensor[
-        [DRAFTER_B_DYN, DRAFTER_CANDIDATE_ROWS, ROPE_DIM], pl.BF16
-    ],
-    drafter_sin_candidates: pl.Tensor[
-        [DRAFTER_B_DYN, DRAFTER_CANDIDATE_ROWS, ROPE_DIM], pl.BF16
-    ],
+    drafter_cos_candidates: pl.Tensor[[DRAFTER_B_DYN, DRAFTER_CANDIDATE_ROWS, ROPE_DIM], pl.BF16],
+    drafter_sin_candidates: pl.Tensor[[DRAFTER_B_DYN, DRAFTER_CANDIDATE_ROWS, ROPE_DIM], pl.BF16],
     tp_rank: pl.Scalar[pl.INT32],
 ):
     """Gather target and drafter RoPE rows from resident full tables."""
@@ -110,10 +124,7 @@ def gather_group_decode_rope_rows(
             group_position = pl.read(position_ids, [token])
             boundary = pl.cast(0, pl.INDEX)
             if (group_position + 1) % CSA_COMPRESS_RATIO == 0:
-                boundary = pl.cast(
-                    group_position - CSA_COMPRESS_RATIO + 1,
-                    pl.INDEX,
-                )
+                boundary = pl.cast(group_position - CSA_COMPRESS_RATIO + 1, pl.INDEX)
             csa_cmp_cos[token : token + 1, :] = ratio4_cos_table[
                 boundary : boundary + 1, :
             ]
@@ -122,10 +133,7 @@ def gather_group_decode_rope_rows(
             ]
         for request in pl.range(B):
             first_position = pl.read(position_ids, [request * S])
-            boundary = pl.cast(
-                first_position - first_position % HCA_COMPRESS_RATIO,
-                pl.INDEX,
-            )
+            boundary = pl.cast(first_position - first_position % HCA_COMPRESS_RATIO, pl.INDEX)
             hca_cmp_cos[request : request + 1, :] = pl.cast(
                 ratio128_cos_table[boundary : boundary + 1, 0:HALF_ROPE],
                 target_type=pl.FP32,
@@ -138,14 +146,8 @@ def gather_group_decode_rope_rows(
             group_request = tp_rank * LOCAL_B + local_request
             active_width = pl.read(active_widths, [group_request])
             anchor = pl.read(position_ids, [group_request * S])
-            candidate_cos = pl.create_tensor(
-                [DRAFTER_CANDIDATE_ROWS, ROPE_DIM],
-                dtype=pl.BF16,
-            )
-            candidate_sin = pl.create_tensor(
-                [DRAFTER_CANDIDATE_ROWS, ROPE_DIM],
-                dtype=pl.BF16,
-            )
+            candidate_cos = pl.create_tensor([DRAFTER_CANDIDATE_ROWS, ROPE_DIM], dtype=pl.BF16)
+            candidate_sin = pl.create_tensor([DRAFTER_CANDIDATE_ROWS, ROPE_DIM], dtype=pl.BF16)
             for offset in pl.range(DRAFTER_CANDIDATE_ROWS):
                 position = pl.cast(0, pl.INDEX)
                 if active_width > 0:
@@ -172,79 +174,6 @@ def gather_group_decode_rope_rows(
     )
 
 
-gather_group_decode_rope_rows_l2 = pl.jit(auto_scope=False)(
-    gather_group_decode_rope_rows._func
-)
-
-
-@pl.jit.host
-def l3_gather_group_decode_rope_rows(
-    swa_cos_table: pl.Tensor[[N_RANKS, ROPE_ROWS_DYN, ROPE_DIM], pl.BF16],
-    swa_sin_table: pl.Tensor[[N_RANKS, ROPE_ROWS_DYN, ROPE_DIM], pl.BF16],
-    ratio4_cos_table: pl.Tensor[[N_RANKS, ROPE_ROWS_DYN, ROPE_DIM], pl.BF16],
-    ratio4_sin_table: pl.Tensor[[N_RANKS, ROPE_ROWS_DYN, ROPE_DIM], pl.BF16],
-    ratio128_cos_table: pl.Tensor[[N_RANKS, ROPE_ROWS_DYN, ROPE_DIM], pl.BF16],
-    ratio128_sin_table: pl.Tensor[[N_RANKS, ROPE_ROWS_DYN, ROPE_DIM], pl.BF16],
-    position_ids: pl.Tensor[[N_RANKS, T], pl.INT32],
-    active_widths: pl.Tensor[[N_RANKS, B], pl.INT32],
-    swa_cos: pl.InOut[pl.Tensor[[N_RANKS, LOCAL_T, ROPE_DIM], pl.BF16]],
-    swa_sin: pl.InOut[pl.Tensor[[N_RANKS, LOCAL_T, ROPE_DIM], pl.BF16]],
-    compressed_cos: pl.InOut[
-        pl.Tensor[[N_RANKS, LOCAL_T, ROPE_DIM], pl.BF16]
-    ],
-    compressed_sin: pl.InOut[
-        pl.Tensor[[N_RANKS, LOCAL_T, ROPE_DIM], pl.BF16]
-    ],
-    csa_cmp_cos: pl.InOut[pl.Tensor[[N_RANKS, T, ROPE_DIM], pl.BF16]],
-    csa_cmp_sin: pl.InOut[pl.Tensor[[N_RANKS, T, ROPE_DIM], pl.BF16]],
-    hca_cmp_cos: pl.InOut[pl.Tensor[[N_RANKS, B, HALF_ROPE], pl.FP32]],
-    hca_cmp_sin: pl.InOut[pl.Tensor[[N_RANKS, B, HALF_ROPE], pl.FP32]],
-    drafter_cos_candidates: pl.InOut[
-        pl.Tensor[
-            [N_RANKS, DRAFTER_B_DYN, DRAFTER_CANDIDATE_ROWS, ROPE_DIM],
-            pl.BF16,
-        ]
-    ],
-    drafter_sin_candidates: pl.InOut[
-        pl.Tensor[
-            [N_RANKS, DRAFTER_B_DYN, DRAFTER_CANDIDATE_ROWS, ROPE_DIM],
-            pl.BF16,
-        ]
-    ],
-):
-    swa_cos_table.bind_dynamic(1, ROPE_ROWS_DYN)
-    swa_sin_table.bind_dynamic(1, ROPE_ROWS_DYN)
-    ratio4_cos_table.bind_dynamic(1, ROPE_ROWS_DYN)
-    ratio4_sin_table.bind_dynamic(1, ROPE_ROWS_DYN)
-    ratio128_cos_table.bind_dynamic(1, ROPE_ROWS_DYN)
-    ratio128_sin_table.bind_dynamic(1, ROPE_ROWS_DYN)
-    drafter_cos_candidates.bind_dynamic(1, DRAFTER_B_DYN)
-    drafter_sin_candidates.bind_dynamic(1, DRAFTER_B_DYN)
-    for rank in pl.range(pld.world_size()):
-        gather_group_decode_rope_rows_l2(
-            swa_cos_table[rank],
-            swa_sin_table[rank],
-            ratio4_cos_table[rank],
-            ratio4_sin_table[rank],
-            ratio128_cos_table[rank],
-            ratio128_sin_table[rank],
-            position_ids[rank],
-            active_widths[rank],
-            swa_cos[rank],
-            swa_sin[rank],
-            compressed_cos[rank],
-            compressed_sin[rank],
-            csa_cmp_cos[rank],
-            csa_cmp_sin[rank],
-            hca_cmp_cos[rank],
-            hca_cmp_sin[rank],
-            drafter_cos_candidates[rank],
-            drafter_sin_candidates[rank],
-            rank % TP,
-            device=rank,
-        )
-
-
 @pl.jit.inline(auto_scope=False)
 def build_group_decode_metadata(
     position_ids: pl.Tensor[[T], pl.INT32],
@@ -256,13 +185,9 @@ def build_group_decode_metadata(
     hca_state_block_table: pl.Tensor[[B, HCA_GROUP_STATE_BLOCKS_DYN], pl.INT32],
     csa_state_block_table: pl.Tensor[[B, CSA_GROUP_STATE_BLOCKS_DYN], pl.INT32],
     csa_inner_state_block_table: pl.Tensor[[B, CSA_GROUP_STATE_BLOCKS_DYN], pl.INT32],
-    group_hca_state_block_table: pl.Tensor[
-        [B, HCA_STATE_TABLE_BLOCKS], pl.INT32
-    ],
+    group_hca_state_block_table: pl.Tensor[[B, HCA_STATE_TABLE_BLOCKS], pl.INT32],
     group_csa_state_block_table: pl.Tensor[[B, CSA_STATE_TABLE_BLOCKS], pl.INT32],
-    group_csa_inner_state_block_table: pl.Tensor[
-        [B, CSA_STATE_TABLE_BLOCKS], pl.INT32
-    ],
+    group_csa_inner_state_block_table: pl.Tensor[[B, CSA_STATE_TABLE_BLOCKS], pl.INT32],
     swa_slot_mapping: pl.Tensor[[T], pl.INT64],
     swa_indices: pl.Tensor[[LOCAL_T, WIN], pl.INT32],
     swa_lens: pl.Tensor[[LOCAL_T], pl.INT32],
@@ -302,51 +227,28 @@ def build_group_decode_metadata(
                                 hca_state_block_table,
                                 [
                                     group_request,
-                                    pl.cast(
-                                        logical_page % hca_state_blocks,
-                                        pl.INDEX,
-                                    ),
+                                    pl.cast(logical_page % hca_state_blocks, pl.INDEX),
                                 ],
                             ),
                         )
                 for table_index in pl.range(CSA_STATE_TABLE_BLOCKS):
-                    pl.write(
-                        group_csa_state_block_table,
-                        [group_request, table_index],
-                        pl.cast(-1, pl.INT32),
-                    )
-                    pl.write(
-                        group_csa_inner_state_block_table,
-                        [group_request, table_index],
-                        pl.cast(-1, pl.INT32),
-                    )
+                    pl.write(group_csa_state_block_table, [group_request, table_index], pl.cast(-1, pl.INT32))
+                    pl.write(group_csa_inner_state_block_table, [group_request, table_index], pl.cast(-1, pl.INT32))
                 last_page = (anchor + S - 1) // C4A_COMPRESSOR_BLOCK_SIZE
                 for delta in pl.range(CSA_STATE_TABLE_BLOCKS):
                     logical_page = last_page - delta
                     if logical_page >= 0:
-                        table_index = pl.cast(
-                            logical_page % CSA_STATE_TABLE_BLOCKS,
-                            pl.INDEX,
-                        )
-                        source_index = pl.cast(
-                            logical_page % csa_state_blocks,
-                            pl.INDEX,
-                        )
+                        table_index = pl.cast(logical_page % CSA_STATE_TABLE_BLOCKS, pl.INDEX)
+                        source_index = pl.cast(logical_page % csa_state_blocks, pl.INDEX)
                         pl.write(
                             group_csa_state_block_table,
                             [group_request, table_index],
-                            pl.read(
-                                csa_state_block_table,
-                                [group_request, source_index],
-                            ),
+                            pl.read(csa_state_block_table, [group_request, source_index]),
                         )
                         pl.write(
                             group_csa_inner_state_block_table,
                             [group_request, table_index],
-                            pl.read(
-                                csa_inner_state_block_table,
-                                [group_request, source_index],
-                            ),
+                            pl.read(csa_inner_state_block_table, [group_request, source_index]),
                         )
     local_token_begin = tp_rank * LOCAL_T
     for local_token in pl.spmd(LOCAL_T, name_hint="dspark_build_swa_metadata"):
@@ -366,15 +268,8 @@ def build_group_decode_metadata(
                     visible_position = start + offset
                     logical_block = visible_position // BLOCK_SIZE
                     block_offset = visible_position % BLOCK_SIZE
-                    physical_block = pl.read(
-                        ori_block_table,
-                        [request, pl.cast(logical_block, pl.INDEX)],
-                    )
-                    pl.write(
-                        index_row,
-                        [0, offset],
-                        pl.cast(physical_block * BLOCK_SIZE + block_offset, pl.INT32),
-                    )
+                    physical_block = pl.read(ori_block_table, [request, pl.cast(logical_block, pl.INDEX)])
+                    pl.write(index_row, [0, offset], pl.cast(physical_block * BLOCK_SIZE + block_offset, pl.INT32))
         swa_indices[local_token : local_token + 1, :] = index_row
         hca_swa_indices[local_token : local_token + 1, :] = index_row
         csa_swa_indices[local_token : local_token + 1, :] = index_row
@@ -404,48 +299,24 @@ def build_group_decode_metadata(
             if active:
                 logical_block = position // BLOCK_SIZE
                 block_offset = position % BLOCK_SIZE
-                ori_physical_block = pl.read(
-                    ori_block_table,
-                    [request, pl.cast(logical_block, pl.INDEX)],
-                )
-                ori_slot = pl.cast(
-                    ori_physical_block * BLOCK_SIZE + block_offset,
-                    pl.INT64,
-                )
+                ori_physical_block = pl.read(ori_block_table, [request, pl.cast(logical_block, pl.INDEX)])
+                ori_slot = pl.cast(ori_physical_block * BLOCK_SIZE + block_offset, pl.INT64)
 
                 if (position + 1) % HCA_COMPRESS_RATIO == 0:
                     cache_row = position // HCA_COMPRESS_RATIO
                     cache_block = cache_row // HCA_CMP_STORAGE_BLOCK_SIZE
                     cache_offset = cache_row % HCA_CMP_STORAGE_BLOCK_SIZE
-                    physical_block = pl.read(
-                        hca_cmp_block_table,
-                        [request, pl.cast(cache_block, pl.INDEX)],
-                    )
-                    hca_cmp_slot = pl.cast(
-                        physical_block * HCA_CMP_STORAGE_BLOCK_SIZE + cache_offset,
-                        pl.INT64,
-                    )
+                    physical_block = pl.read(hca_cmp_block_table, [request, pl.cast(cache_block, pl.INDEX)])
+                    hca_cmp_slot = pl.cast(physical_block * HCA_CMP_STORAGE_BLOCK_SIZE + cache_offset, pl.INT64)
 
                 if (position + 1) % CSA_COMPRESS_RATIO == 0:
                     cache_row = position // CSA_COMPRESS_RATIO
                     cache_block = cache_row // CSA_CMP_STORAGE_BLOCK_SIZE
                     cache_offset = cache_row % CSA_CMP_STORAGE_BLOCK_SIZE
-                    csa_physical_block = pl.read(
-                        csa_cmp_block_table,
-                        [request, pl.cast(cache_block, pl.INDEX)],
-                    )
-                    idx_physical_block = pl.read(
-                        idx_block_table,
-                        [request, pl.cast(cache_block, pl.INDEX)],
-                    )
-                    csa_cmp_slot = pl.cast(
-                        csa_physical_block * CSA_CMP_STORAGE_BLOCK_SIZE + cache_offset,
-                        pl.INT64,
-                    )
-                    csa_idx_slot = pl.cast(
-                        idx_physical_block * CSA_CMP_STORAGE_BLOCK_SIZE + cache_offset,
-                        pl.INT64,
-                    )
+                    csa_physical_block = pl.read(csa_cmp_block_table, [request, pl.cast(cache_block, pl.INDEX)])
+                    idx_physical_block = pl.read(idx_block_table, [request, pl.cast(cache_block, pl.INDEX)])
+                    csa_cmp_slot = pl.cast(csa_physical_block * CSA_CMP_STORAGE_BLOCK_SIZE + cache_offset, pl.INT64)
+                    csa_idx_slot = pl.cast(idx_physical_block * CSA_CMP_STORAGE_BLOCK_SIZE + cache_offset, pl.INT64)
 
                 hca_state_page = position // C128_COMPRESSOR_BLOCK_SIZE
                 hca_state_offset = position % C128_COMPRESSOR_BLOCK_SIZE
@@ -517,442 +388,673 @@ def build_group_decode_metadata(
         group_csa_inner_state_block_table,
     )
 
-
-# Standalone L2 wrapper for validating the metadata portion independently of
-# target compute.  Fused decode continues to call the inline form above.
-build_group_decode_metadata_l2 = pl.jit(auto_scope=False)(
-    build_group_decode_metadata._func
-)
-
-
-@pl.jit(auto_scope=False)
-def l2_decode_prepare_probe(
-    group_state_slot_ids: pl.Tensor[[B], pl.INT32],
-    group_state_generations: pl.Tensor[[B], pl.INT32],
+@pl.jit.inline(auto_scope=False)
+def prepare_target_group_from_device_state(
+    group_state_slot_ids: pl.Tensor[[DECODE_BATCH], pl.INT32],
+    group_state_generations: pl.Tensor[[DECODE_BATCH], pl.INT32],
     state_tokens: pl.Tensor[[STATE_CAPACITY, STATE_TOKEN_WIDTH], pl.INT64],
     state_meta: pl.Tensor[[STATE_CAPACITY, STATE_META_WIDTH], pl.INT32],
-    input_ids: pl.InOut[pl.Tensor[[LOCAL_T], pl.INT64]],
-    position_ids_local: pl.InOut[pl.Tensor[[LOCAL_T], pl.INT32]],
-    position_ids: pl.InOut[pl.Tensor[[T], pl.INT32]],
-    csa_kv_seq_lens: pl.InOut[pl.Tensor[[LOCAL_B], pl.INT32]],
-    hca_kv_seq_lens: pl.InOut[pl.Tensor[[LOCAL_B], pl.INT32]],
-    logit_row_indices: pl.InOut[pl.Tensor[[LOCAL_T], pl.INT32]],
-    sampled_row_offsets: pl.InOut[pl.Tensor[[LOCAL_B], pl.INT32]],
-    ori_block_table: pl.Tensor[[B, ORI_TABLE_BLOCKS_DYN], pl.INT32],
-    hca_cmp_block_table: pl.Tensor[[B, HCA_CMP_TABLE_BLOCKS_DYN], pl.INT32],
-    csa_cmp_block_table: pl.Tensor[[B, CSA_CMP_TABLE_BLOCKS_DYN], pl.INT32],
-    idx_block_table: pl.Tensor[[B, IDX_TABLE_BLOCKS_DYN], pl.INT32],
-    hca_state_block_table: pl.Tensor[
-        [B, HCA_GROUP_STATE_BLOCKS_DYN], pl.INT32
-    ],
-    csa_state_block_table: pl.Tensor[
-        [B, CSA_GROUP_STATE_BLOCKS_DYN], pl.INT32
-    ],
-    csa_inner_state_block_table: pl.Tensor[
-        [B, CSA_GROUP_STATE_BLOCKS_DYN], pl.INT32
-    ],
-    group_hca_state_block_table: pl.InOut[
-        pl.Tensor[[B, HCA_STATE_TABLE_BLOCKS], pl.INT32]
-    ],
-    group_csa_state_block_table: pl.InOut[
-        pl.Tensor[[B, CSA_STATE_TABLE_BLOCKS], pl.INT32]
-    ],
-    group_csa_inner_state_block_table: pl.InOut[
-        pl.Tensor[[B, CSA_STATE_TABLE_BLOCKS], pl.INT32]
-    ],
-    swa_slot_mapping: pl.InOut[pl.Tensor[[T], pl.INT64]],
-    swa_indices: pl.InOut[pl.Tensor[[LOCAL_T, WIN], pl.INT32]],
-    swa_lens: pl.InOut[pl.Tensor[[LOCAL_T], pl.INT32]],
-    hca_ori_slot_mapping: pl.InOut[pl.Tensor[[T], pl.INT64]],
-    hca_swa_indices: pl.InOut[pl.Tensor[[LOCAL_T, WIN], pl.INT32]],
-    hca_swa_lens: pl.InOut[pl.Tensor[[LOCAL_T], pl.INT32]],
-    hca_cmp_slot_mapping: pl.InOut[pl.Tensor[[T], pl.INT64]],
-    hca_state_slot_mapping: pl.InOut[pl.Tensor[[T], pl.INT64]],
-    csa_ori_slot_mapping: pl.InOut[pl.Tensor[[T], pl.INT64]],
-    csa_swa_indices: pl.InOut[pl.Tensor[[LOCAL_T, WIN], pl.INT32]],
-    csa_swa_lens: pl.InOut[pl.Tensor[[LOCAL_T], pl.INT32]],
-    csa_cmp_slot_mapping: pl.InOut[pl.Tensor[[T], pl.INT64]],
-    csa_idx_slot_mapping: pl.InOut[pl.Tensor[[T], pl.INT64]],
-    csa_state_slot_mapping: pl.InOut[pl.Tensor[[T], pl.INT64]],
-    csa_inner_state_slot_mapping: pl.InOut[pl.Tensor[[T], pl.INT64]],
-    swa_cos_table: pl.Tensor[[ROPE_ROWS_DYN, ROPE_DIM], pl.BF16],
-    swa_sin_table: pl.Tensor[[ROPE_ROWS_DYN, ROPE_DIM], pl.BF16],
-    ratio4_cos_table: pl.Tensor[[ROPE_ROWS_DYN, ROPE_DIM], pl.BF16],
-    ratio4_sin_table: pl.Tensor[[ROPE_ROWS_DYN, ROPE_DIM], pl.BF16],
-    ratio128_cos_table: pl.Tensor[[ROPE_ROWS_DYN, ROPE_DIM], pl.BF16],
-    ratio128_sin_table: pl.Tensor[[ROPE_ROWS_DYN, ROPE_DIM], pl.BF16],
-    swa_cos: pl.InOut[pl.Tensor[[LOCAL_T, ROPE_DIM], pl.BF16]],
-    swa_sin: pl.InOut[pl.Tensor[[LOCAL_T, ROPE_DIM], pl.BF16]],
-    compressed_cos: pl.InOut[pl.Tensor[[LOCAL_T, ROPE_DIM], pl.BF16]],
-    compressed_sin: pl.InOut[pl.Tensor[[LOCAL_T, ROPE_DIM], pl.BF16]],
-    csa_cmp_cos: pl.InOut[pl.Tensor[[T, ROPE_DIM], pl.BF16]],
-    csa_cmp_sin: pl.InOut[pl.Tensor[[T, ROPE_DIM], pl.BF16]],
-    hca_cmp_cos: pl.InOut[pl.Tensor[[B, HALF_ROPE], pl.FP32]],
-    hca_cmp_sin: pl.InOut[pl.Tensor[[B, HALF_ROPE], pl.FP32]],
-    drafter_cos_candidates: pl.InOut[
-        pl.Tensor[[DRAFTER_B_DYN, DRAFTER_CANDIDATE_ROWS, ROPE_DIM], pl.BF16]
-    ],
-    drafter_sin_candidates: pl.InOut[
-        pl.Tensor[[DRAFTER_B_DYN, DRAFTER_CANDIDATE_ROWS, ROPE_DIM], pl.BF16]
-    ],
+    input_ids: pl.Tensor[[LOCAL_T], pl.INT64],
+    position_ids_local: pl.Tensor[[LOCAL_T], pl.INT32],
+    position_ids_group: pl.Tensor[[T], pl.INT32],
+    csa_kv_seq_lens: pl.Tensor[[LOCAL_BATCH], pl.INT32],
+    hca_kv_seq_lens: pl.Tensor[[LOCAL_BATCH], pl.INT32],
+    logit_row_indices: pl.Tensor[[LOCAL_T], pl.INT32],
+    sampled_row_offsets: pl.Tensor[[LOCAL_BATCH], pl.INT32],
+    active_widths: pl.Tensor[[LOCAL_BATCH], pl.INT32],
+    group_active_widths: pl.Tensor[[DECODE_BATCH], pl.INT32],
+    tp_rank: pl.Scalar[pl.INT32],
 ):
-    ori_block_table.bind_dynamic(1, ORI_TABLE_BLOCKS_DYN)
-    hca_cmp_block_table.bind_dynamic(1, HCA_CMP_TABLE_BLOCKS_DYN)
-    csa_cmp_block_table.bind_dynamic(1, CSA_CMP_TABLE_BLOCKS_DYN)
-    idx_block_table.bind_dynamic(1, IDX_TABLE_BLOCKS_DYN)
-    hca_state_block_table.bind_dynamic(1, HCA_GROUP_STATE_BLOCKS_DYN)
-    csa_state_block_table.bind_dynamic(1, CSA_GROUP_STATE_BLOCKS_DYN)
-    csa_inner_state_block_table.bind_dynamic(1, CSA_GROUP_STATE_BLOCKS_DYN)
-    swa_cos_table.bind_dynamic(0, ROPE_ROWS_DYN)
-    swa_sin_table.bind_dynamic(0, ROPE_ROWS_DYN)
-    ratio4_cos_table.bind_dynamic(0, ROPE_ROWS_DYN)
-    ratio4_sin_table.bind_dynamic(0, ROPE_ROWS_DYN)
-    ratio128_cos_table.bind_dynamic(0, ROPE_ROWS_DYN)
-    ratio128_sin_table.bind_dynamic(0, ROPE_ROWS_DYN)
-    drafter_cos_candidates.bind_dynamic(0, DRAFTER_B_DYN)
-    drafter_sin_candidates.bind_dynamic(0, DRAFTER_B_DYN)
-    with pl.scope():
-        local_active_widths = pl.create_tensor([LOCAL_B], dtype=pl.INT32)
-        group_active_widths = pl.create_tensor([B], dtype=pl.INT32)
-        prepare_target_group_from_device_state(
-            group_state_slot_ids,
-            group_state_generations,
-            state_tokens,
-            state_meta,
-            input_ids,
-            position_ids_local,
-            position_ids,
-            csa_kv_seq_lens,
-            hca_kv_seq_lens,
-            logit_row_indices,
-            sampled_row_offsets,
-            local_active_widths,
-            group_active_widths,
-            0,
-        )
-        build_group_decode_metadata(
-            position_ids,
-            group_active_widths,
-            ori_block_table,
-            hca_cmp_block_table,
-            csa_cmp_block_table,
-            idx_block_table,
-            hca_state_block_table,
-            csa_state_block_table,
-            csa_inner_state_block_table,
-            group_hca_state_block_table,
-            group_csa_state_block_table,
-            group_csa_inner_state_block_table,
-            swa_slot_mapping,
-            swa_indices,
-            swa_lens,
-            hca_ori_slot_mapping,
-            hca_swa_indices,
-            hca_swa_lens,
-            hca_cmp_slot_mapping,
-            hca_state_slot_mapping,
-            csa_ori_slot_mapping,
-            csa_swa_indices,
-            csa_swa_lens,
-            csa_cmp_slot_mapping,
-            csa_idx_slot_mapping,
-            csa_state_slot_mapping,
-            csa_inner_state_slot_mapping,
-            0,
-        )
-        gather_group_decode_rope_rows(
-            swa_cos_table,
-            swa_sin_table,
-            ratio4_cos_table,
-            ratio4_sin_table,
-            ratio128_cos_table,
-            ratio128_sin_table,
-            position_ids,
-            group_active_widths,
-            swa_cos,
-            swa_sin,
-            compressed_cos,
-            compressed_sin,
-            csa_cmp_cos,
-            csa_cmp_sin,
-            hca_cmp_cos,
-            hca_cmp_sin,
-            drafter_cos_candidates,
-            drafter_sin_candidates,
-            0,
-        )
-    return input_ids, position_ids, swa_slot_mapping
-
-
-@pl.jit.host
-def l3_build_group_decode_metadata(
-    position_ids: pl.Tensor[[N_RANKS, T], pl.INT32],
-    active_widths: pl.Tensor[[N_RANKS, B], pl.INT32],
-    ori_block_table: pl.Tensor[[N_RANKS, B, ORI_TABLE_BLOCKS_DYN], pl.INT32],
-    hca_cmp_block_table: pl.Tensor[
-        [N_RANKS, B, HCA_CMP_TABLE_BLOCKS_DYN], pl.INT32
-    ],
-    csa_cmp_block_table: pl.Tensor[
-        [N_RANKS, B, CSA_CMP_TABLE_BLOCKS_DYN], pl.INT32
-    ],
-    idx_block_table: pl.Tensor[[N_RANKS, B, IDX_TABLE_BLOCKS_DYN], pl.INT32],
-    hca_state_block_table: pl.Tensor[
-        [N_RANKS, B, HCA_GROUP_STATE_BLOCKS_DYN], pl.INT32
-    ],
-    csa_state_block_table: pl.Tensor[
-        [N_RANKS, B, CSA_GROUP_STATE_BLOCKS_DYN], pl.INT32
-    ],
-    csa_inner_state_block_table: pl.Tensor[
-        [N_RANKS, B, CSA_GROUP_STATE_BLOCKS_DYN], pl.INT32
-    ],
-    group_hca_state_block_table: pl.InOut[
-        pl.Tensor[[N_RANKS, B, HCA_STATE_TABLE_BLOCKS], pl.INT32]
-    ],
-    group_csa_state_block_table: pl.InOut[
-        pl.Tensor[[N_RANKS, B, CSA_STATE_TABLE_BLOCKS], pl.INT32]
-    ],
-    group_csa_inner_state_block_table: pl.InOut[
-        pl.Tensor[[N_RANKS, B, CSA_STATE_TABLE_BLOCKS], pl.INT32]
-    ],
-    swa_slot_mapping: pl.InOut[pl.Tensor[[N_RANKS, T], pl.INT64]],
-    swa_indices: pl.InOut[pl.Tensor[[N_RANKS, LOCAL_T, WIN], pl.INT32]],
-    swa_lens: pl.InOut[pl.Tensor[[N_RANKS, LOCAL_T], pl.INT32]],
-    hca_ori_slot_mapping: pl.InOut[pl.Tensor[[N_RANKS, T], pl.INT64]],
-    hca_swa_indices: pl.InOut[pl.Tensor[[N_RANKS, LOCAL_T, WIN], pl.INT32]],
-    hca_swa_lens: pl.InOut[pl.Tensor[[N_RANKS, LOCAL_T], pl.INT32]],
-    hca_cmp_slot_mapping: pl.InOut[pl.Tensor[[N_RANKS, T], pl.INT64]],
-    hca_state_slot_mapping: pl.InOut[pl.Tensor[[N_RANKS, T], pl.INT64]],
-    csa_ori_slot_mapping: pl.InOut[pl.Tensor[[N_RANKS, T], pl.INT64]],
-    csa_swa_indices: pl.InOut[pl.Tensor[[N_RANKS, LOCAL_T, WIN], pl.INT32]],
-    csa_swa_lens: pl.InOut[pl.Tensor[[N_RANKS, LOCAL_T], pl.INT32]],
-    csa_cmp_slot_mapping: pl.InOut[pl.Tensor[[N_RANKS, T], pl.INT64]],
-    csa_idx_slot_mapping: pl.InOut[pl.Tensor[[N_RANKS, T], pl.INT64]],
-    csa_state_slot_mapping: pl.InOut[pl.Tensor[[N_RANKS, T], pl.INT64]],
-    csa_inner_state_slot_mapping: pl.InOut[pl.Tensor[[N_RANKS, T], pl.INT64]],
-):
-    ori_block_table.bind_dynamic(2, ORI_TABLE_BLOCKS_DYN)
-    hca_cmp_block_table.bind_dynamic(2, HCA_CMP_TABLE_BLOCKS_DYN)
-    csa_cmp_block_table.bind_dynamic(2, CSA_CMP_TABLE_BLOCKS_DYN)
-    idx_block_table.bind_dynamic(2, IDX_TABLE_BLOCKS_DYN)
-    hca_state_block_table.bind_dynamic(2, HCA_GROUP_STATE_BLOCKS_DYN)
-    csa_state_block_table.bind_dynamic(2, CSA_GROUP_STATE_BLOCKS_DYN)
-    csa_inner_state_block_table.bind_dynamic(2, CSA_GROUP_STATE_BLOCKS_DYN)
-    for rank in pl.range(pld.world_size()):
-        build_group_decode_metadata_l2(
-            position_ids[rank],
-            active_widths[rank],
-            ori_block_table[rank],
-            hca_cmp_block_table[rank],
-            csa_cmp_block_table[rank],
-            idx_block_table[rank],
-            hca_state_block_table[rank],
-            csa_state_block_table[rank],
-            csa_inner_state_block_table[rank],
-            group_hca_state_block_table[rank],
-            group_csa_state_block_table[rank],
-            group_csa_inner_state_block_table[rank],
-            swa_slot_mapping[rank],
-            swa_indices[rank],
-            swa_lens[rank],
-            hca_ori_slot_mapping[rank],
-            hca_swa_indices[rank],
-            hca_swa_lens[rank],
-            hca_cmp_slot_mapping[rank],
-            hca_state_slot_mapping[rank],
-            csa_ori_slot_mapping[rank],
-            csa_swa_indices[rank],
-            csa_swa_lens[rank],
-            csa_cmp_slot_mapping[rank],
-            csa_idx_slot_mapping[rank],
-            csa_state_slot_mapping[rank],
-            csa_inner_state_slot_mapping[rank],
-            rank % TP,
-            device=rank,
-        )
-
-
-def build_metadata_tensor_specs():
-    """Build a small but active TP4/EP16 metadata-lowering fixture."""
-    import torch
-    from golden import TensorSpec
-
-    position_ids = torch.arange(S, dtype=torch.int32).repeat(N_RANKS, B)
-    position_ids[:, :S] = torch.arange(64, 64 + S, dtype=torch.int32)
-    active_widths = torch.zeros((N_RANKS, B), dtype=torch.int32)
-    active_widths[:, 0] = S
-
-    def spec(name, shape, dtype, init_value=0):
-        return TensorSpec(name, list(shape), dtype, init_value=init_value)
-
-    i32 = torch.int32
-    i64 = torch.int64
-    table4 = (N_RANKS, B, 4)
-    hca_state = (N_RANKS, B, HCA_HISTORY_PAGES + 2)
-    csa_state = (N_RANKS, B, CSA_STATE_TABLE_BLOCKS)
-    return [
-        spec("position_ids", position_ids.shape, i32, position_ids),
-        spec("active_widths", active_widths.shape, i32, active_widths),
-        spec("ori_block_table", table4, i32, 1),
-        spec("hca_cmp_block_table", table4, i32, 2),
-        spec("csa_cmp_block_table", table4, i32, 3),
-        spec("idx_block_table", table4, i32, 4),
-        spec("hca_state_block_table", hca_state, i32, 5),
-        spec("csa_state_block_table", csa_state, i32, 6),
-        spec("csa_inner_state_block_table", csa_state, i32, 7),
-        spec(
-            "group_hca_state_block_table",
-            (N_RANKS, B, HCA_STATE_TABLE_BLOCKS),
-            i32,
-            -1,
-        ),
-        spec(
-            "group_csa_state_block_table",
-            (N_RANKS, B, CSA_STATE_TABLE_BLOCKS),
-            i32,
-            -1,
-        ),
-        spec(
-            "group_csa_inner_state_block_table",
-            (N_RANKS, B, CSA_STATE_TABLE_BLOCKS),
-            i32,
-            -1,
-        ),
-        spec("swa_slot_mapping", (N_RANKS, T), i64, -1),
-        spec("swa_indices", (N_RANKS, LOCAL_T, WIN), i32, -1),
-        spec("swa_lens", (N_RANKS, LOCAL_T), i32),
-        spec("hca_ori_slot_mapping", (N_RANKS, T), i64, -1),
-        spec("hca_swa_indices", (N_RANKS, LOCAL_T, WIN), i32, -1),
-        spec("hca_swa_lens", (N_RANKS, LOCAL_T), i32),
-        spec("hca_cmp_slot_mapping", (N_RANKS, T), i64, -1),
-        spec("hca_state_slot_mapping", (N_RANKS, T), i64, -1),
-        spec("csa_ori_slot_mapping", (N_RANKS, T), i64, -1),
-        spec("csa_swa_indices", (N_RANKS, LOCAL_T, WIN), i32, -1),
-        spec("csa_swa_lens", (N_RANKS, LOCAL_T), i32),
-        spec("csa_cmp_slot_mapping", (N_RANKS, T), i64, -1),
-        spec("csa_idx_slot_mapping", (N_RANKS, T), i64, -1),
-        spec("csa_state_slot_mapping", (N_RANKS, T), i64, -1),
-        spec("csa_inner_state_slot_mapping", (N_RANKS, T), i64, -1),
-    ]
-
-
-def build_rope_tensor_specs():
-    """Build an active-plus-padding fixture for all decode RoPE outputs."""
-    import torch
-    from golden import TensorSpec
-
-    rope_rows = 1024
-    draft_batch = 4
-    position_ids = torch.arange(S, dtype=torch.int32).repeat(N_RANKS, B)
-    position_ids[:, :S] = torch.arange(64, 64 + S, dtype=torch.int32)
-    active_widths = torch.zeros((N_RANKS, B), dtype=torch.int32)
-    active_widths[:, 0] = S
-
-    def spec(name, shape, dtype, init_value=0):
-        return TensorSpec(name, list(shape), dtype, init_value=init_value)
-
-    table_shape = (N_RANKS, rope_rows, ROPE_DIM)
-    local_rope_shape = (N_RANKS, LOCAL_T, ROPE_DIM)
-    group_rope_shape = (N_RANKS, T, ROPE_DIM)
-    candidate_shape = (
-        N_RANKS,
-        draft_batch,
-        DRAFTER_CANDIDATE_ROWS,
-        ROPE_DIM,
+    """Resolve the TP-group target window from replicated persistent state."""
+    for core in pl.spmd(1, name_hint="dspark_group_state_prepare"):
+        local_begin = tp_rank * LOCAL_BATCH
+        local_end = local_begin + LOCAL_BATCH
+        for local_request in pl.range(LOCAL_BATCH):
+            pl.write(csa_kv_seq_lens, [local_request], pl.cast(0, pl.INT32))
+            pl.write(hca_kv_seq_lens, [local_request], pl.cast(0, pl.INT32))
+            pl.write(sampled_row_offsets, [local_request], pl.cast(-1, pl.INT32))
+            pl.write(active_widths, [local_request], pl.cast(0, pl.INT32))
+            for offset in pl.range(S):
+                local_row = local_request * S + offset
+                pl.write(input_ids, [local_row], pl.cast(0, pl.INT64))
+                pl.write(position_ids_local, [local_row], pl.cast(offset, pl.INT32))
+                pl.write(logit_row_indices, [local_row], pl.cast(-1, pl.INT32))
+        for request in pl.range(DECODE_BATCH):
+            pl.write(group_active_widths, [request], pl.cast(0, pl.INT32))
+            group_row = request * S
+            for offset in pl.range(S):
+                pl.write(position_ids_group, [group_row + offset], pl.cast(offset, pl.INT32))
+            slot_raw = pl.read(group_state_slot_ids, [request])
+            slot = pl.cast(pl.max(pl.min(slot_raw, STATE_CAPACITY - 1), 0), pl.INDEX)
+            if slot_raw >= 0 and slot_raw < STATE_CAPACITY:
+                valid = pl.read(state_meta, [slot, STATE_VALID])
+                generation = pl.read(state_meta, [slot, STATE_GENERATION])
+                expected = pl.read(group_state_generations, [request])
+                if valid == 1 and generation == expected:
+                    anchor = pl.read(state_meta, [slot, STATE_ANCHOR_POSITION])
+                    draft_count = pl.read(state_meta, [slot, STATE_DRAFT_COUNT])
+                    position_limit = pl.read(state_meta, [slot, STATE_POSITION_LIMIT])
+                    active_width = pl.cast(1, pl.INT32)
+                    if anchor + draft_count < position_limit:
+                        active_width = pl.cast(draft_count + 1, pl.INT32)
+                    pl.write(group_active_widths, [request], active_width)
+                    for offset in pl.range(S):
+                        pl.write(
+                            position_ids_group,
+                            [group_row + offset],
+                            pl.cast(pl.min(anchor + offset, position_limit - 1), pl.INT32),
+                        )
+                    if request >= local_begin and request < local_end:
+                        local_request = pl.cast(request - local_begin, pl.INDEX)
+                        local_row = local_request * S
+                        for offset in pl.range(S):
+                            token = pl.read(state_tokens, [slot, offset])
+                            pl.write(input_ids, [local_row + offset], token)
+                            pl.write(
+                                position_ids_local,
+                                [local_row + offset],
+                                pl.cast(pl.min(anchor + offset, position_limit - 1), pl.INT32),
+                            )
+                            if offset < active_width:
+                                pl.write(
+                                    logit_row_indices,
+                                    [local_row + offset],
+                                    pl.cast(local_row + offset, pl.INT32),
+                                )
+                        pl.write(csa_kv_seq_lens, [local_request], pl.cast(anchor + active_width, pl.INT32))
+                        pl.write(hca_kv_seq_lens, [local_request], pl.cast(anchor + active_width, pl.INT32))
+                        pl.write(sampled_row_offsets, [local_request], pl.cast(local_row, pl.INT32))
+                        pl.write(active_widths, [local_request], active_width)
+    return (
+        input_ids,
+        position_ids_local,
+        position_ids_group,
+        csa_kv_seq_lens,
+        hca_kv_seq_lens,
+        logit_row_indices,
+        sampled_row_offsets,
+        active_widths,
+        group_active_widths,
     )
-    return [
-        spec("swa_cos_table", table_shape, torch.bfloat16, 1.0),
-        spec("swa_sin_table", table_shape, torch.bfloat16, 2.0),
-        spec("ratio4_cos_table", table_shape, torch.bfloat16, 3.0),
-        spec("ratio4_sin_table", table_shape, torch.bfloat16, 4.0),
-        spec("ratio128_cos_table", table_shape, torch.bfloat16, 5.0),
-        spec("ratio128_sin_table", table_shape, torch.bfloat16, 6.0),
-        spec("position_ids", position_ids.shape, torch.int32, position_ids),
-        spec("active_widths", active_widths.shape, torch.int32, active_widths),
-        spec("swa_cos", local_rope_shape, torch.bfloat16),
-        spec("swa_sin", local_rope_shape, torch.bfloat16),
-        spec("compressed_cos", local_rope_shape, torch.bfloat16),
-        spec("compressed_sin", local_rope_shape, torch.bfloat16),
-        spec("csa_cmp_cos", group_rope_shape, torch.bfloat16),
-        spec("csa_cmp_sin", group_rope_shape, torch.bfloat16),
-        spec("hca_cmp_cos", (N_RANKS, B, HALF_ROPE), torch.float32),
-        spec("hca_cmp_sin", (N_RANKS, B, HALF_ROPE), torch.float32),
-        spec("drafter_cos_candidates", candidate_shape, torch.bfloat16),
-        spec("drafter_sin_candidates", candidate_shape, torch.bfloat16),
-    ]
 
 
-def build_decode_prepare_probe_specs():
-    """Reuse the distributed fixtures as one rank-local fused-L2 probe."""
-    from golden import TensorSpec
+@pl.jit.inline(auto_scope=False)
+def accept_target_into_device_state(
+    state_slot_ids: pl.Tensor[[LOCAL_BATCH], pl.INT32],
+    state_generations: pl.Tensor[[LOCAL_BATCH], pl.INT32],
+    sampled_row_offsets: pl.Tensor[[LOCAL_BATCH], pl.INT32],
+    hidden_row_offsets: pl.Tensor[[LOCAL_BATCH], pl.INT32],
+    state_tokens: pl.InOut[pl.Tensor[[STATE_CAPACITY, STATE_TOKEN_WIDTH], pl.INT64]],
+    state_meta: pl.InOut[pl.Tensor[[STATE_CAPACITY, STATE_META_WIDTH], pl.INT32]],
+    sampled_ids: pl.Tensor[[LOCAL_T, S], pl.INT32],
+    target_hidden: pl.Tensor[[LOCAL_T, MAIN_HIDDEN_DIM], pl.BF16],
+    accepted_token_ids: pl.Out[pl.Tensor[[LOCAL_BATCH, S], pl.INT32]],
+    accepted_counts: pl.Out[pl.Tensor[[LOCAL_BATCH], pl.INT32]],
+    drafter_target_hidden: pl.Out[pl.Tensor[[LOCAL_T, MAIN_HIDDEN_DIM], pl.BF16]],
+    drafter_context_positions: pl.Out[pl.Tensor[[LOCAL_T], pl.INT32]],
+    drafter_context_valid: pl.Out[pl.Tensor[[LOCAL_T], pl.INT32]],
+    drafter_last_sampled: pl.Out[pl.Tensor[[LOCAL_BATCH], pl.INT64]],
+    drafter_anchor_positions: pl.Out[pl.Tensor[[LOCAL_BATCH], pl.INT32]],
+    drafter_row_offsets: pl.Out[pl.Tensor[[LOCAL_BATCH], pl.INT32]],
+    drafter_ready: pl.Out[pl.Tensor[[1], pl.INT32]],
+):
+    """Accept the longest matching prefix and prepare the next drafter inputs."""
+    for core in pl.spmd(1, name_hint="dspark_state_accept"):
+        next_drafter_row = pl.cast(0, pl.INT32)
+        for request in pl.range(core, LOCAL_BATCH):
+            pl.write(accepted_counts, [request], pl.cast(0, pl.INT32))
+            pl.write(drafter_last_sampled, [request], pl.cast(0, pl.INT64))
+            pl.write(drafter_anchor_positions, [request], pl.cast(0, pl.INT32))
+            pl.write(drafter_row_offsets, [request], pl.cast(-1, pl.INT32))
+            for offset in pl.range(S):
+                pl.write(accepted_token_ids, [request, offset], pl.cast(-1, pl.INT32))
+                context_row = request * S + offset
+                pl.write(drafter_context_positions, [context_row], pl.cast(0, pl.INT32))
+                pl.write(drafter_context_valid, [context_row], pl.cast(0, pl.INT32))
+            slot_raw = pl.read(state_slot_ids, [request])
+            sampled_row_raw = pl.read(sampled_row_offsets, [request])
+            slot = pl.cast(pl.max(pl.min(slot_raw, STATE_CAPACITY - 1), 0), pl.INDEX)
+            if slot_raw >= 0 and slot_raw < STATE_CAPACITY and sampled_row_raw >= 0:
+                valid = pl.read(state_meta, [slot, STATE_VALID])
+                generation = pl.read(state_meta, [slot, STATE_GENERATION])
+                expected = pl.read(state_generations, [request])
+                if valid == 1 and generation == expected:
+                    sampled_row = pl.cast(sampled_row_raw, pl.INDEX)
+                    old_anchor = pl.read(state_meta, [slot, STATE_ANCHOR_POSITION])
+                    draft_count = pl.read(state_meta, [slot, STATE_DRAFT_COUNT])
+                    position_limit = pl.read(state_meta, [slot, STATE_POSITION_LIMIT])
+                    effective_draft_count = pl.cast(0, pl.INT32)
+                    if old_anchor + draft_count < position_limit:
+                        effective_draft_count = draft_count
+                    matched = pl.cast(0, pl.INT32)
+                    still_matching = pl.cast(1, pl.INT32)
+                    for draft_offset in pl.range(DSPARK_QUERY_WIDTH):
+                        draft = pl.read(state_tokens, [slot, STATE_FIRST_DRAFT + draft_offset])
+                        predicted = pl.cast(pl.read(sampled_ids, [sampled_row + draft_offset, 0]), pl.INT64)
+                        if (
+                            draft_offset < effective_draft_count
+                            and still_matching == 1
+                            and draft == predicted
+                        ):
+                            matched = pl.cast(draft_offset + 1, pl.INT32)
+                        else:
+                            still_matching = pl.cast(0, pl.INT32)
+                    accepted = pl.cast(matched + 1, pl.INT32)
+                    next_token = pl.cast(pl.read(sampled_ids, [sampled_row + matched, 0]), pl.INT64)
+                    committed = pl.read(state_meta, [slot, STATE_COMMITTED_COUNT])
+                    pl.write(accepted_counts, [request], accepted)
+                    pl.write(drafter_last_sampled, [request], next_token)
+                    pl.write(drafter_anchor_positions, [request], pl.cast(old_anchor + accepted - 1, pl.INT32))
+                    for offset in pl.range(S):
+                        if offset < accepted:
+                            accepted_token = pl.read(sampled_ids, [sampled_row + offset, 0])
+                            pl.write(accepted_token_ids, [request, offset], accepted_token)
+                            context_row = request * S + offset
+                            pl.write(drafter_context_positions, [context_row], pl.cast(old_anchor + offset, pl.INT32))
+                            pl.write(drafter_context_valid, [context_row], pl.cast(1, pl.INT32))
+                    pl.write(state_tokens, [slot, STATE_CURRENT_TOKEN], next_token)
+                    pl.write(state_meta, [slot, STATE_ANCHOR_POSITION], pl.cast(old_anchor + accepted, pl.INT32))
+                    pl.write(state_meta, [slot, STATE_COMMITTED_COUNT], pl.cast(committed + accepted, pl.INT32))
+                    # Old drafts are consumed by this verification.  Publish a
+                    # compact drafter destination only when another full K=7
+                    # query window fits; commit_drafts restores draft_count.
+                    pl.write(state_meta, [slot, STATE_DRAFT_COUNT], pl.cast(0, pl.INT32))
+                    next_anchor = pl.cast(old_anchor + accepted - 1, pl.INT32)
+                    next_target_anchor = pl.cast(old_anchor + accepted, pl.INT32)
+                    if next_target_anchor + DSPARK_QUERY_WIDTH < position_limit:
+                        pl.write(drafter_row_offsets, [request], pl.cast(next_drafter_row * S, pl.INT32))
+                        next_drafter_row = pl.cast(next_drafter_row + 1, pl.INT32)
 
-    candidates = {}
-    for source in (
-        build_group_prepare_tensor_specs(),
-        build_metadata_tensor_specs(),
-        build_rope_tensor_specs(),
-    ):
-        for item in source:
-            value = item.create_tensor()[0].contiguous()
-            candidates[item.name] = TensorSpec(
-                item.name,
-                list(value.shape),
-                item.dtype,
-                init_value=value,
+    with pl.spmd(LOCAL_T, name_hint="dspark_state_pack_hidden") as pack_hidden_tid:
+        token = pl.tile.get_block_idx()
+        request = token // S
+        offset = token % S
+        accepted = pl.read(accepted_counts, [request])
+        destination_base = pl.read(drafter_row_offsets, [request])
+        if destination_base >= 0 and offset < accepted:
+            source_base = pl.read(hidden_row_offsets, [request])
+            source = pl.cast(source_base + offset, pl.INDEX)
+            destination = pl.cast(destination_base + offset, pl.INDEX)
+            drafter_target_hidden[destination : destination + 1, 0:MAIN_HIDDEN_DIM] = (
+                target_hidden[source : source + 1, 0:MAIN_HIDDEN_DIM]
             )
-    return [
-        candidates[name]
-        for name in l2_decode_prepare_probe._param_names()
-    ]
+        elif destination_base >= 0:
+            destination = pl.cast(destination_base + offset, pl.INDEX)
+            drafter_target_hidden[destination : destination + 1, 0:MAIN_HIDDEN_DIM] = pl.full(
+                [1, MAIN_HIDDEN_DIM],
+                dtype=pl.BF16,
+                value=0.0,
+            )
+    with pl.spmd(
+        1,
+        name_hint="dspark_state_publish_drafter_ready",
+        deps=[pack_hidden_tid],
+    ):
+        publish_core = pl.tile.get_block_idx()
+        pl.write(drafter_ready, [publish_core], pl.cast(0, pl.INT32))
+    return (
+        state_tokens,
+        state_meta,
+        accepted_token_ids,
+        accepted_counts,
+        drafter_target_hidden,
+        drafter_context_positions,
+        drafter_context_valid,
+        drafter_last_sampled,
+        drafter_anchor_positions,
+        drafter_row_offsets,
+        drafter_ready,
+    )
 
 
-def main():
-    """Compile or execute one prepare stage without loading model weights."""
-    import argparse
+@pl.jit.inline(auto_scope=False)
+def commit_drafts_to_device_state(
+    state_slot_ids: pl.Tensor[[LOCAL_BATCH], pl.INT32],
+    state_generations: pl.Tensor[[LOCAL_BATCH], pl.INT32],
+    state_tokens: pl.InOut[pl.Tensor[[STATE_CAPACITY, STATE_TOKEN_WIDTH], pl.INT64]],
+    state_meta: pl.InOut[pl.Tensor[[STATE_CAPACITY, STATE_META_WIDTH], pl.INT32]],
+    draft_token_ids: pl.Tensor[[COMMIT_B_DYN, DSPARK_QUERY_WIDTH], pl.INT32],
+):
+    """Commit the Markov output as the next target verification window."""
+    draft_token_ids.bind_dynamic(0, COMMIT_B_DYN)
+    batch = pl.tensor.dim(draft_token_ids, 0)
+    for core in pl.spmd(1, name_hint="dspark_state_commit_drafts"):
+        for request in pl.range(core, batch):
+            slot_raw = pl.read(state_slot_ids, [request])
+            slot = pl.cast(pl.max(pl.min(slot_raw, STATE_CAPACITY - 1), 0), pl.INDEX)
+            if slot_raw >= 0 and slot_raw < STATE_CAPACITY:
+                valid = pl.read(state_meta, [slot, STATE_VALID])
+                generation = pl.read(state_meta, [slot, STATE_GENERATION])
+                expected = pl.read(state_generations, [request])
+                if valid == 1 and generation == expected:
+                    anchor = pl.read(state_meta, [slot, STATE_ANCHOR_POSITION])
+                    position_limit = pl.read(state_meta, [slot, STATE_POSITION_LIMIT])
+                    if anchor + DSPARK_QUERY_WIDTH < position_limit:
+                        for offset in pl.range(DSPARK_QUERY_WIDTH):
+                            token = pl.cast(pl.read(draft_token_ids, [request, offset]), pl.INT64)
+                            pl.write(state_tokens, [slot, STATE_FIRST_DRAFT + offset], token)
+                        pl.write(state_meta, [slot, STATE_DRAFT_COUNT], pl.cast(DSPARK_QUERY_WIDTH, pl.INT32))
+    return state_tokens, state_meta
 
-    from golden import run
-    from pypto.ir import DistributedConfig
 
-    parser = argparse.ArgumentParser(description="Validate DSpark decode device preparation")
-    parser.add_argument(
-        "--stage",
-        choices=("metadata", "rope", "prepare-all"),
-        default="metadata",
+@pl.jit.inline(auto_scope=False)
+def fence_drafter_head_hidden(
+    head_hidden: pl.InOut[pl.Tensor[[DRAFTER_HEAD_B_DYN, DSPARK_QUERY_WIDTH, D], pl.BF16]],
+    drafter_ready: pl.Scalar[pl.TASK_ID],
+):
+    """Order the Markov sampler behind the drafter's last head-hidden write."""
+    head_hidden.bind_dynamic(0, DRAFTER_HEAD_B_DYN)
+    batch = pl.tensor.dim(head_hidden, 0)
+    active_tokens = batch * DSPARK_QUERY_WIDTH
+    head_hidden_flat = pl.reshape(head_hidden, [active_tokens, D])
+    with pl.spmd(
+        active_tokens,
+        name_hint="dspark_drafter_markov_bridge",
+        deps=[drafter_ready],
+    ):
+        token = pl.tile.get_block_idx()
+        head_hidden_flat[token : token + 1, :] = head_hidden_flat[token : token + 1, :]
+
+
+# ---------------------------------------------------------------------------
+# Drafter bridge: compact the accepted rows and publish rank-major drafter
+# metadata.  The geometry below mirrors the dspark_drafter contract, derived
+# from config so that this module never imports the drafter (the drafter
+# rewrites config.TP/EP while it is imported).
+# ---------------------------------------------------------------------------
+DSPARK_DRAFT_LAYERS = 3
+DSPARK_QUERY_PAD = S
+DSPARK_MAX_BATCH = MOE_TOKENS // DSPARK_QUERY_PAD
+DSPARK_CP_SIZE = TP
+T_QUERY = DSPARK_MAX_BATCH * DSPARK_QUERY_WIDTH
+ORI_MAX_BLOCKS = (M.max_position_embeddings + BLOCK_SIZE - 1) // BLOCK_SIZE
+MAX_LOGIT_ROWS = MOE_TOKENS
+
+# The bridge consumes only S + K = 15 rows, but a BF16 GM tile with a
+# 15-row axis is not 32-byte aligned.  Keep one unused padding row so device
+# preparation can publish the candidate slab without a Host-side gather.
+ROPE_CANDIDATE_ROWS = 16
+CONTEXT_T = LOCAL_BATCH * S
+LOCAL_METADATA_ROWS = CONTEXT_T + T_QUERY
+GROUP_METADATA_ROWS = DSPARK_CP_SIZE * LOCAL_METADATA_ROWS
+METADATA_WIDTH = 1 + DSPARK_DRAFT_LAYERS
+META_COMM_ROWS = 16
+ROPE_COMM_ROWS = 8
+BRIDGE_B_DYN = pl.dynamic("DSPARK_BRIDGE_B_DYN")
+BRIDGE_GROUP_CONTEXT_T_DYN = pl.dynamic("DSPARK_BRIDGE_GROUP_CONTEXT_T_DYN")
+
+@pl.jit.inline(auto_scope=False)
+def _allgather_metadata(
+    local_metadata: pl.Tensor[[LOCAL_METADATA_ROWS, METADATA_WIDTH], pl.INT64],
+    group_metadata: pl.Tensor[[GROUP_METADATA_ROWS, METADATA_WIDTH], pl.INT64],
+    metadata_window: pld.DistributedTensor[[GROUP_METADATA_ROWS, METADATA_WIDTH], pl.INT64],
+    metadata_signal: pld.DistributedTensor[[DSPARK_CP_SIZE, 1], pl.INT32],
+    group_base: pl.Scalar[pl.INT32],
+    cp_rank: pl.Scalar[pl.INT32],
+):
+    target_row = cp_rank * LOCAL_METADATA_ROWS
+    with pl.at(
+        level=pl.Level.CORE_GROUP,
+        name_hint="dspark_bridge_metadata_push",
+        allow_early_resolve=True,
+    ) as push_tid:
+        for peer in pl.range(DSPARK_CP_SIZE):
+            pld.tensor.put(
+                dst=metadata_window,
+                peer=group_base + peer,
+                src=local_metadata,
+                dst_offsets=[target_row, 0],
+                src_offsets=[0, 0],
+                shape=[LOCAL_METADATA_ROWS, METADATA_WIDTH],
+                chunk_rows=META_COMM_ROWS,
+                chunk_cols=METADATA_WIDTH,
+            )
+        for peer in pl.range(DSPARK_CP_SIZE):
+            if peer != cp_rank:
+                pld.system.notify(
+                    target=metadata_signal,
+                    peer=group_base + peer,
+                    offsets=[cp_rank, 0],
+                    value=1,
+                    op=pld.NotifyOp.AtomicAdd,
+                )
+    with pl.at(
+        level=pl.Level.CORE_GROUP,
+        name_hint="dspark_bridge_metadata_payload_wait",
+    ) as payload_wait_tid:
+        for source in pl.range(DSPARK_CP_SIZE):
+            if source != cp_rank:
+                pld.system.defer_wait(
+                    signal=metadata_signal,
+                    offsets=[source, 0],
+                    expected=pl.cast(1, pl.INT32),
+                    cmp=pld.WaitCmp.Ge,
+                )
+    with pl.at(
+        level=pl.Level.CORE_GROUP,
+        name_hint="dspark_bridge_metadata_readback",
+        deps=[push_tid, payload_wait_tid],
+    ) as readback_tid:
+        for row in pl.range(0, GROUP_METADATA_ROWS, META_COMM_ROWS):
+            group_metadata[
+                row : row + META_COMM_ROWS, 0:METADATA_WIDTH
+            ] = metadata_window[row : row + META_COMM_ROWS, 0:METADATA_WIDTH]
+        for peer in pl.range(DSPARK_CP_SIZE):
+            if peer != cp_rank:
+                pld.system.notify(
+                    target=metadata_signal,
+                    peer=group_base + peer,
+                    offsets=[cp_rank, 0],
+                    value=1,
+                    op=pld.NotifyOp.AtomicAdd,
+                )
+    with pl.at(
+        level=pl.Level.CORE_GROUP,
+        name_hint="dspark_bridge_metadata_readback_wait",
+    ) as readback_wait_tid:
+        for source in pl.range(DSPARK_CP_SIZE):
+            if source != cp_rank:
+                pld.system.defer_wait(
+                    signal=metadata_signal,
+                    offsets=[source, 0],
+                    expected=pl.cast(2, pl.INT32),
+                    cmp=pld.WaitCmp.Ge,
+                )
+    with pl.at(
+        level=pl.Level.CORE_GROUP,
+        name_hint="dspark_bridge_metadata_retire",
+        deps=[readback_tid, readback_wait_tid],
+    ):
+        anchor = pl.read(group_metadata, [0, 0])
+        for source in pl.range(DSPARK_CP_SIZE):
+            if source != cp_rank:
+                pld.system.notify(
+                    target=metadata_signal,
+                    peer=group_base + cp_rank,
+                    offsets=[source, 0],
+                    value=pl.cast(-2, pl.INT32),
+                    op=pld.NotifyOp.AtomicAdd,
+                )
+        pl.write(group_metadata, [0, 0], anchor)
+    return group_metadata, metadata_signal
+
+
+@pl.jit.inline(auto_scope=False)
+def _allgather_rope(
+    local_rope: pl.Tensor[[LOCAL_METADATA_ROWS, ROPE_DIM], pl.BF16],
+    group_rope: pl.Tensor[[GROUP_METADATA_ROWS, ROPE_DIM], pl.BF16],
+    rope_window: pld.DistributedTensor[[GROUP_METADATA_ROWS, ROPE_DIM], pl.BF16],
+    rope_signal: pld.DistributedTensor[[DSPARK_CP_SIZE, 1], pl.INT32],
+    group_base: pl.Scalar[pl.INT32],
+    cp_rank: pl.Scalar[pl.INT32],
+):
+    target_row = cp_rank * LOCAL_METADATA_ROWS
+    with pl.at(
+        level=pl.Level.CORE_GROUP,
+        name_hint="dspark_bridge_rope_push",
+        allow_early_resolve=True,
+    ) as push_tid:
+        for peer in pl.range(DSPARK_CP_SIZE):
+            pld.tensor.put(
+                dst=rope_window,
+                peer=group_base + peer,
+                src=local_rope,
+                dst_offsets=[target_row, 0],
+                src_offsets=[0, 0],
+                shape=[LOCAL_METADATA_ROWS, ROPE_DIM],
+                chunk_rows=ROPE_COMM_ROWS,
+                chunk_cols=ROPE_DIM,
+            )
+        for peer in pl.range(DSPARK_CP_SIZE):
+            if peer != cp_rank:
+                pld.system.notify(
+                    target=rope_signal,
+                    peer=group_base + peer,
+                    offsets=[cp_rank, 0],
+                    value=1,
+                    op=pld.NotifyOp.AtomicAdd,
+                )
+    with pl.at(
+        level=pl.Level.CORE_GROUP,
+        name_hint="dspark_bridge_rope_payload_wait",
+    ) as payload_wait_tid:
+        for source in pl.range(DSPARK_CP_SIZE):
+            if source != cp_rank:
+                pld.system.defer_wait(
+                    signal=rope_signal,
+                    offsets=[source, 0],
+                    expected=pl.cast(1, pl.INT32),
+                    cmp=pld.WaitCmp.Ge,
+                )
+    with pl.at(
+        level=pl.Level.CORE_GROUP,
+        name_hint="dspark_bridge_rope_readback",
+        deps=[push_tid, payload_wait_tid],
+    ) as readback_tid:
+        for row in pl.range(0, GROUP_METADATA_ROWS, ROPE_COMM_ROWS):
+            group_rope[row : row + ROPE_COMM_ROWS, 0:ROPE_DIM] = rope_window[
+                row : row + ROPE_COMM_ROWS, 0:ROPE_DIM
+            ]
+        for peer in pl.range(DSPARK_CP_SIZE):
+            if peer != cp_rank:
+                pld.system.notify(
+                    target=rope_signal,
+                    peer=group_base + peer,
+                    offsets=[cp_rank, 0],
+                    value=1,
+                    op=pld.NotifyOp.AtomicAdd,
+                )
+    with pl.at(
+        level=pl.Level.CORE_GROUP,
+        name_hint="dspark_bridge_rope_readback_wait",
+    ) as readback_wait_tid:
+        for source in pl.range(DSPARK_CP_SIZE):
+            if source != cp_rank:
+                pld.system.defer_wait(
+                    signal=rope_signal,
+                    offsets=[source, 0],
+                    expected=pl.cast(2, pl.INT32),
+                    cmp=pld.WaitCmp.Ge,
+                )
+    with pl.at(
+        level=pl.Level.CORE_GROUP,
+        name_hint="dspark_bridge_rope_retire",
+        deps=[readback_tid, readback_wait_tid],
+    ):
+        anchor = pl.read(group_rope, [0, 0])
+        for source in pl.range(DSPARK_CP_SIZE):
+            if source != cp_rank:
+                pld.system.notify(
+                    target=rope_signal,
+                    peer=group_base + cp_rank,
+                    offsets=[source, 0],
+                    value=pl.cast(-2, pl.INT32),
+                    op=pld.NotifyOp.AtomicAdd,
+                )
+        pl.write(group_rope, [0, 0], anchor)
+    return group_rope, rope_signal
+
+
+@pl.jit.inline(auto_scope=False)
+def prepare_drafter_after_target(
+    drafter_ready: pl.Tensor[[1], pl.INT32],
+    state_slot_ids: pl.Tensor[[LOCAL_BATCH], pl.INT32],
+    state_generations: pl.Tensor[[LOCAL_BATCH], pl.INT32],
+    accepted_counts: pl.Tensor[[LOCAL_BATCH], pl.INT32],
+    context_positions: pl.Tensor[[CONTEXT_T], pl.INT32],
+    context_valid: pl.Tensor[[CONTEXT_T], pl.INT32],
+    last_sampled: pl.Tensor[[LOCAL_BATCH], pl.INT64],
+    anchor_positions: pl.Tensor[[LOCAL_BATCH], pl.INT32],
+    row_offsets: pl.Tensor[[LOCAL_BATCH], pl.INT32],
+    block_tables: pl.Tensor[[DSPARK_DRAFT_LAYERS, BRIDGE_B_DYN, ORI_MAX_BLOCKS], pl.INT32],
+    rope_cos_candidates: pl.Tensor[[BRIDGE_B_DYN, ROPE_CANDIDATE_ROWS, ROPE_DIM], pl.BF16],
+    rope_sin_candidates: pl.Tensor[[BRIDGE_B_DYN, ROPE_CANDIDATE_ROWS, ROPE_DIM], pl.BF16],
+    num_sampled: pl.Out[pl.Tensor[[BRIDGE_B_DYN], pl.INT32]],
+    compact_last_sampled: pl.Out[pl.Tensor[[BRIDGE_B_DYN], pl.INT64]],
+    next_prefill_tokens: pl.Out[pl.Tensor[[BRIDGE_B_DYN], pl.INT64]],
+    compact_anchor_positions: pl.Out[pl.Tensor[[BRIDGE_B_DYN], pl.INT32]],
+    compact_state_slot_ids: pl.Out[pl.Tensor[[BRIDGE_B_DYN], pl.INT32]],
+    compact_state_generations: pl.Out[pl.Tensor[[BRIDGE_B_DYN], pl.INT32]],
+    logit_row_indices: pl.Out[pl.Tensor[[MAX_LOGIT_ROWS], pl.INT32]],
+    context_group_position_ids: pl.Out[pl.Tensor[[BRIDGE_GROUP_CONTEXT_T_DYN], pl.INT32]],
+    context_group_slot_mapping: pl.Out[pl.Tensor[[DSPARK_DRAFT_LAYERS, BRIDGE_GROUP_CONTEXT_T_DYN], pl.INT64]],
+    query_group_position_ids: pl.Out[pl.Tensor[[DSPARK_CP_SIZE * T_QUERY], pl.INT32]],
+    query_group_slot_mapping: pl.Out[pl.Tensor[[DSPARK_DRAFT_LAYERS, DSPARK_CP_SIZE * T_QUERY], pl.INT64]],
+    context_group_freqs_cos: pl.Out[pl.Tensor[[BRIDGE_GROUP_CONTEXT_T_DYN, ROPE_DIM], pl.BF16]],
+    context_group_freqs_sin: pl.Out[pl.Tensor[[BRIDGE_GROUP_CONTEXT_T_DYN, ROPE_DIM], pl.BF16]],
+    query_freqs_cos: pl.Out[pl.Tensor[[T_QUERY, ROPE_DIM], pl.BF16]],
+    query_freqs_sin: pl.Out[pl.Tensor[[T_QUERY, ROPE_DIM], pl.BF16]],
+    query_group_freqs_cos: pl.Out[pl.Tensor[[DSPARK_CP_SIZE * T_QUERY, ROPE_DIM], pl.BF16]],
+    query_group_freqs_sin: pl.Out[pl.Tensor[[DSPARK_CP_SIZE * T_QUERY, ROPE_DIM], pl.BF16]],
+    metadata_window: pld.DistributedTensor[[GROUP_METADATA_ROWS, METADATA_WIDTH], pl.INT64],
+    metadata_signal: pld.DistributedTensor[[DSPARK_CP_SIZE, 1], pl.INT32],
+    rope_cos_window: pld.DistributedTensor[[GROUP_METADATA_ROWS, ROPE_DIM], pl.BF16],
+    rope_sin_window: pld.DistributedTensor[[GROUP_METADATA_ROWS, ROPE_DIM], pl.BF16],
+    rope_cos_signal: pld.DistributedTensor[[DSPARK_CP_SIZE, 1], pl.INT32],
+    rope_sin_signal: pld.DistributedTensor[[DSPARK_CP_SIZE, 1], pl.INT32],
+    group_base: pl.Scalar[pl.INT32],
+    cp_rank: pl.Scalar[pl.INT32],
+):
+    """Compact accepted rows and publish rank-major drafter metadata."""
+    block_tables.bind_dynamic(1, BRIDGE_B_DYN)
+    rope_cos_candidates.bind_dynamic(0, BRIDGE_B_DYN)
+    rope_sin_candidates.bind_dynamic(0, BRIDGE_B_DYN)
+    num_sampled.bind_dynamic(0, BRIDGE_B_DYN)
+    compact_last_sampled.bind_dynamic(0, BRIDGE_B_DYN)
+    next_prefill_tokens.bind_dynamic(0, BRIDGE_B_DYN)
+    compact_anchor_positions.bind_dynamic(0, BRIDGE_B_DYN)
+    compact_state_slot_ids.bind_dynamic(0, BRIDGE_B_DYN)
+    compact_state_generations.bind_dynamic(0, BRIDGE_B_DYN)
+    context_group_position_ids.bind_dynamic(0, BRIDGE_GROUP_CONTEXT_T_DYN)
+    context_group_slot_mapping.bind_dynamic(1, BRIDGE_GROUP_CONTEXT_T_DYN)
+    context_group_freqs_cos.bind_dynamic(0, BRIDGE_GROUP_CONTEXT_T_DYN)
+    context_group_freqs_sin.bind_dynamic(0, BRIDGE_GROUP_CONTEXT_T_DYN)
+    batch = pl.tensor.dim(num_sampled, 0)
+    group_context_tokens = pl.tensor.dim(context_group_position_ids, 0)
+    local_context_tokens = group_context_tokens // DSPARK_CP_SIZE
+    local_metadata = pl.create_tensor([LOCAL_METADATA_ROWS, METADATA_WIDTH], dtype=pl.INT64)
+    local_rope_cos = pl.create_tensor([LOCAL_METADATA_ROWS, ROPE_DIM], dtype=pl.BF16)
+    local_rope_sin = pl.create_tensor([LOCAL_METADATA_ROWS, ROPE_DIM], dtype=pl.BF16)
+    group_metadata = pl.create_tensor([GROUP_METADATA_ROWS, METADATA_WIDTH], dtype=pl.INT64)
+    group_rope_cos = pl.create_tensor([GROUP_METADATA_ROWS, ROPE_DIM], dtype=pl.BF16)
+    group_rope_sin = pl.create_tensor([GROUP_METADATA_ROWS, ROPE_DIM], dtype=pl.BF16)
+
+    with pl.at(level=pl.Level.CORE_GROUP, name_hint="dspark_bridge_prepare"):
+        ready_offset = pl.read(drafter_ready, [0])
+        for row in pl.range(LOCAL_METADATA_ROWS):
+            pl.write(local_metadata, [row, 0], pl.cast(0, pl.INT64))
+            for layer in pl.range(DSPARK_DRAFT_LAYERS):
+                pl.write(local_metadata, [row, 1 + layer], pl.cast(-1, pl.INT64))
+            local_rope_cos[row : row + 1, 0:ROPE_DIM] = pl.full([1, ROPE_DIM], dtype=pl.BF16, value=0.0)
+            local_rope_sin[row : row + 1, 0:ROPE_DIM] = pl.full([1, ROPE_DIM], dtype=pl.BF16, value=0.0)
+        for request in pl.range(batch):
+            pl.write(num_sampled, [request], pl.cast(0, pl.INT32))
+            pl.write(compact_last_sampled, [request], pl.cast(0, pl.INT64))
+            pl.write(next_prefill_tokens, [request], pl.cast(0, pl.INT64))
+            pl.write(compact_anchor_positions, [request], pl.cast(0, pl.INT32))
+            pl.write(compact_state_slot_ids, [request], pl.cast(-1, pl.INT32))
+            pl.write(compact_state_generations, [request], pl.cast(-1, pl.INT32))
+        for row in pl.range(MAX_LOGIT_ROWS):
+            pl.write(logit_row_indices, [row], pl.cast(-1, pl.INT32))
+
+        for request in pl.range(LOCAL_BATCH):
+            destination_raw = pl.read(row_offsets, [request])
+            if destination_raw >= 0:
+                destination = pl.cast(destination_raw // S, pl.INDEX)
+                accepted = pl.read(accepted_counts, [request])
+                pl.write(num_sampled, [destination], accepted)
+                pl.write(compact_last_sampled, [destination], pl.read(last_sampled, [request]))
+                pl.write(compact_anchor_positions, [destination], pl.read(anchor_positions, [request]))
+                pl.write(compact_state_slot_ids, [destination], pl.read(state_slot_ids, [request]))
+                pl.write(compact_state_generations, [destination], pl.read(state_generations, [request]))
+                for offset in pl.range(S):
+                    source_row = request * S + offset
+                    destination_row = destination * S + offset
+                    valid = pl.read(context_valid, [source_row])
+                    if valid == 1:
+                        position = pl.read(context_positions, [source_row]) + ready_offset
+                        pl.write(local_metadata, [destination_row, 0], pl.cast(position, pl.INT64))
+                        for layer in pl.range(DSPARK_DRAFT_LAYERS):
+                            logical_block = position // BLOCK_SIZE
+                            physical_block = pl.read(block_tables, [layer, request, pl.cast(logical_block, pl.INDEX)])
+                            slot = physical_block * BLOCK_SIZE + position % BLOCK_SIZE
+                            pl.write(local_metadata, [destination_row, 1 + layer], pl.cast(slot, pl.INT64))
+                        context_cos_row = rope_cos_candidates[request : request + 1, offset : offset + 1, 0:ROPE_DIM]
+                        context_cos_flat = pl.reshape(context_cos_row, [1, ROPE_DIM])
+                        local_rope_cos[destination_row : destination_row + 1, 0:ROPE_DIM] = context_cos_flat
+                        context_sin_row = rope_sin_candidates[request : request + 1, offset : offset + 1, 0:ROPE_DIM]
+                        context_sin_flat = pl.reshape(context_sin_row, [1, ROPE_DIM])
+                        local_rope_sin[destination_row : destination_row + 1, 0:ROPE_DIM] = context_sin_flat
+                for query in pl.range(DSPARK_QUERY_WIDTH):
+                    query_row = destination * DSPARK_QUERY_WIDTH + query
+                    query_position = pl.read(anchor_positions, [request]) + 1 + query + ready_offset
+                    metadata_row = CONTEXT_T + query_row
+                    pl.write(local_metadata, [metadata_row, 0], pl.cast(query_position, pl.INT64))
+                    for layer in pl.range(DSPARK_DRAFT_LAYERS):
+                        logical_block = query_position // BLOCK_SIZE
+                        physical_block = pl.read(block_tables, [layer, request, pl.cast(logical_block, pl.INDEX)])
+                        slot = physical_block * BLOCK_SIZE + query_position % BLOCK_SIZE
+                        pl.write(local_metadata, [metadata_row, 1 + layer], pl.cast(slot, pl.INT64))
+                    candidate_row = accepted + query
+                    query_cos_row = rope_cos_candidates[request : request + 1, candidate_row : candidate_row + 1, 0:ROPE_DIM]
+                    query_cos_flat = pl.reshape(query_cos_row, [1, ROPE_DIM])
+                    local_rope_cos[metadata_row : metadata_row + 1, 0:ROPE_DIM] = query_cos_flat
+                    query_sin_row = rope_sin_candidates[request : request + 1, candidate_row : candidate_row + 1, 0:ROPE_DIM]
+                    query_sin_flat = pl.reshape(query_sin_row, [1, ROPE_DIM])
+                    local_rope_sin[metadata_row : metadata_row + 1, 0:ROPE_DIM] = query_sin_flat
+                    pl.write(logit_row_indices, [query_row], pl.cast(query_row, pl.INT32))
+
+    group_metadata, metadata_signal = _allgather_metadata(
+        local_metadata, group_metadata,
+        metadata_window, metadata_signal,
+        group_base, cp_rank,
     )
-    parser.add_argument(
-        "-p", "--platform", choices=("a2a3", "a2a3sim"), default="a2a3"
+    group_rope_cos, rope_cos_signal = _allgather_rope(
+        local_rope_cos, group_rope_cos,
+        rope_cos_window, rope_cos_signal,
+        group_base, cp_rank,
     )
-    parser.add_argument(
-        "-d", "--device", default=",".join(str(rank) for rank in range(N_RANKS))
+    group_rope_sin, rope_sin_signal = _allgather_rope(
+        local_rope_sin, group_rope_sin,
+        rope_sin_window, rope_sin_signal,
+        group_base, cp_rank,
     )
-    parser.add_argument("--compile-only", action="store_true")
-    args = parser.parse_args()
-    device_ids = [int(device) for device in args.device.split(",")]
-    if len(device_ids) != N_RANKS:
-        parser.error(f"expected exactly {N_RANKS} device ids, got {device_ids}")
-    distributed = args.stage != "prepare-all"
-    if args.stage == "metadata":
-        fn = l3_build_group_decode_metadata
-        specs = build_metadata_tensor_specs()
-    elif args.stage == "rope":
-        fn = l3_gather_group_decode_rope_rows
-        specs = build_rope_tensor_specs()
-    else:
-        fn = l2_decode_prepare_probe
-        specs = build_decode_prepare_probe_specs()
-    run_config = dict(platform=args.platform, ring_heap=512 * 1024 * 1024)
-    if distributed:
-        run_config["distributed_config"] = DistributedConfig(
-            device_ids=device_ids, num_sub_workers=0
-        )
-    else:
-        run_config["device_id"] = device_ids[0]
-    result = run(
-        fn=fn,
-        specs=specs,
-        compile_only=args.compile_only,
-        config=run_config,
+
+    with pl.at(level=pl.Level.CORE_GROUP, name_hint="dspark_bridge_unpack"):
+        for row in pl.range(group_context_tokens):
+            source_rank = row // local_context_tokens
+            source_row = row % local_context_tokens
+            metadata_row = source_rank * LOCAL_METADATA_ROWS + source_row
+            pl.write(context_group_position_ids, [row], pl.cast(pl.read(group_metadata, [metadata_row, 0]), pl.INT32))
+            for layer in pl.range(DSPARK_DRAFT_LAYERS):
+                pl.write(context_group_slot_mapping, [layer, row], pl.read(group_metadata, [metadata_row, 1 + layer]))
+            group_cos_src = group_rope_cos[metadata_row : metadata_row + 1, 0:ROPE_DIM]
+            context_group_freqs_cos[row : row + 1, 0:ROPE_DIM] = group_cos_src
+            group_sin_src = group_rope_sin[metadata_row : metadata_row + 1, 0:ROPE_DIM]
+            context_group_freqs_sin[row : row + 1, 0:ROPE_DIM] = group_sin_src
+        for row in pl.range(DSPARK_CP_SIZE * T_QUERY):
+            source_rank = row // T_QUERY
+            source_row = row % T_QUERY
+            metadata_row = source_rank * LOCAL_METADATA_ROWS + CONTEXT_T + source_row
+            pl.write(query_group_position_ids, [row], pl.cast(pl.read(group_metadata, [metadata_row, 0]), pl.INT32))
+            for layer in pl.range(DSPARK_DRAFT_LAYERS):
+                pl.write(query_group_slot_mapping, [layer, row], pl.read(group_metadata, [metadata_row, 1 + layer]))
+            query_group_cos_src = group_rope_cos[metadata_row : metadata_row + 1, 0:ROPE_DIM]
+            query_group_freqs_cos[row : row + 1, 0:ROPE_DIM] = query_group_cos_src
+            query_group_sin_src = group_rope_sin[metadata_row : metadata_row + 1, 0:ROPE_DIM]
+            query_group_freqs_sin[row : row + 1, 0:ROPE_DIM] = query_group_sin_src
+        for row in pl.range(T_QUERY):
+            metadata_row = CONTEXT_T + row
+            local_cos_src = local_rope_cos[metadata_row : metadata_row + 1, 0:ROPE_DIM]
+            query_freqs_cos[row : row + 1, 0:ROPE_DIM] = local_cos_src
+            local_sin_src = local_rope_sin[metadata_row : metadata_row + 1, 0:ROPE_DIM]
+            query_freqs_sin[row : row + 1, 0:ROPE_DIM] = local_sin_src
+    return (
+        num_sampled, compact_last_sampled, next_prefill_tokens, compact_anchor_positions,
+        compact_state_slot_ids, compact_state_generations, logit_row_indices,
+        context_group_position_ids, context_group_slot_mapping,
+        query_group_position_ids, query_group_slot_mapping,
+        context_group_freqs_cos, context_group_freqs_sin,
+        query_freqs_cos, query_freqs_sin,
+        query_group_freqs_cos, query_group_freqs_sin,
     )
-    if not result.passed:
-        if result.error:
-            print(result.error)
-        raise SystemExit(1)

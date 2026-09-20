@@ -18,7 +18,6 @@ import pypto.language.distributed as pld
 from golden import run
 from pypto.ir import DistributedConfig
 
-from dspark_proj import MAIN_HIDDEN_DIM, TARGET_LAYER_IDS
 from moe import (
     AUX_PAD,
     D,
@@ -147,6 +146,9 @@ CSA_INNER_COMPRESS_STATE_DIM = 2 * INNER_OUT_DIM
 # Runtime ring heaps by scope depth.
 PREFILL_RING_HEAP = (2 * 1024 * 1024 * 1024, 2 * 1024 * 1024 * 1024, 4 * 1024 * 1024 * 1024, 8 * 1024 * 1024 * 1024)
 LM_HEAD_COMM_EPOCH = 1
+
+TARGET_LAYER_IDS = (40, 41, 42)  # dspark_target_layer_ids
+MAIN_HIDDEN_DIM = len(TARGET_LAYER_IDS) * D
 
 # tiling
 LOGITS_ZERO_TILE = 4096

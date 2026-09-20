@@ -574,7 +574,7 @@ def markov_sample(
     return draft_token_ids, confidence_probs
 
 
-def l2_distributed_markov_sample(
+def _distributed_markov_sample(
     head_hidden: pl.Tensor[[B_DYN, DSPARK_QUERY_WIDTH, D], pl.BF16],
     final_norm_weight: pl.Tensor[[D], pl.BF16],
     lm_head_weight: pl.Tensor[[VOCAB_PER_TP, D], pl.BF16],
@@ -639,12 +639,11 @@ def l2_distributed_markov_sample(
 
 # Preserve the standalone orchestration entry while exposing the same body as
 # an inline stage for fused decode programs.
-_distributed_markov_sample_impl = l2_distributed_markov_sample
-l2_distributed_markov_sample_inline = pl.jit.inline(auto_scope=False)(
-    _distributed_markov_sample_impl
+distributed_markov_sample = pl.jit.inline(auto_scope=False)(
+    _distributed_markov_sample
 )
 l2_distributed_markov_sample = pl.jit(auto_scope=False)(
-    _distributed_markov_sample_impl
+    _distributed_markov_sample
 )
 
 
