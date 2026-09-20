@@ -494,7 +494,18 @@ jobs:
     # that never sampled a token. A red result here now means one of three
     # things, and e2e.json says which: the runner is not provisioned, the A5
     # host is sick, or the model stopped generating.
-    runs-on: [self-hosted, linux, npu-a5]
+    #
+    # arm64 is part of the selection, not decoration. Two runners answer to
+    # npu-a5: an aarch64 Ascend950DT host, which carries the checkpoint and
+    # the converted cache, and an x86_64 Ascend950PR host, which carries
+    # neither, and a run that landed on the second one failed with the
+    # checkpoint missing. #1178 dropped arm64 from these jobs when the only A5
+    # host was the x86_64 one; the weights now live on the aarch64 host, so the
+    # architecture label is what selects it. Should the weights ever move to a
+    # host of the other architecture, this line moves with them - and until it
+    # does, an unprovisioned aarch64 A5 host fails at the next step by name
+    # rather than quietly testing nothing.
+    runs-on: [self-hosted, linux, npu-a5, arm64]
     # Job setup on a cold ccache (~25) + task-submit's worst case for the one
     # loop call (--timeout 5400 queue wait + --max-time 2400 run = 130) + the
     # one-time weight conversion (~25) + cleanup and upload (~35).
@@ -595,7 +606,28 @@ jobs:
             echo "::error::set PYPTO_DSV4_FLASH_CKPT_DIR in this runner's .env to a deepseek-ai/DeepSeek-V4-Flash checkout at $E2E_CKPT_REVISION (needs model.safetensors.index.json and tokenizer.json)"
             exit 1
           fi
-          weights="${PYPTO_DSV4_FLASH_WEIGHTS_DIR:-$CI_CACHE_ROOT/dsv4-flash-weights/flash_ep8_tp2}"
+          # Named by the runner too, rather than defaulted under CI_CACHE_ROOT.
+          # The converted cache is about 200 GiB and the cache root holds build
+          # output, so a host that was never asked for that space would spend
+          # twenty-five minutes converting and then die out of disk. Which
+          # volume holds it is the host's choice, like every path here.
+          weights="${PYPTO_DSV4_FLASH_WEIGHTS_DIR:-}"
+          if [ -z "$weights" ]; then
+            echo "::error::set PYPTO_DSV4_FLASH_WEIGHTS_DIR in this runner's .env to a directory with room for the ~200 GiB EP8/TP2 cache converted from the checkpoint (this job creates and fills it on the first run)"
+            exit 1
+          fi
+          # Absolute, because this is the one path the job creates instead of
+          # finding: every step here runs in checkout/, so a relative value
+          # would quietly fill the runner's own checkout with 200 GiB and never
+          # fail. The checkpoint needs no such check - it is accepted only if
+          # the two files above are already under it.
+          case "$weights" in
+            /*) ;;
+            *)
+              echo "::error::PYPTO_DSV4_FLASH_WEIGHTS_DIR must be an absolute path; '$weights' would land inside this job's checkout"
+              exit 1
+              ;;
+          esac
           source activate.sh
           # The cache records the quantization rules and converter revision it
           # was built with. A cache the checked-out conversion code no longer
