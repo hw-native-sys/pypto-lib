@@ -55,9 +55,9 @@ Once a kernel body lands, its owner can extend the same file with the thin
 | Encoder SWA | `prefill_attn_swa.py` (leaf), `prefill_swa.py` (HC orchestration), `decode_attn_swa.py` (decode leaf), `decode_swa.py` (decode HC orchestration) |
 | Encoder C2A Full | `prefill_attn_c2a_full.py` (leaf), `prefill_c2a_full.py` (HC orchestration), `decode_attn_c2a_full.py` (decode leaf), `decode_c2a_full.py` (decode HC orchestration) |
 | Encoder C2A Reuse | `prefill_attn_c2a_reuse.py` (leaf), `prefill_c2a_reuse.py` (HC orchestration), `decode_attn_c2a_reuse.py` (decode leaf), `decode_c2a_reuse.py` (decode HC orchestration) |
-| Decoder C1A Full | `prefill_c1a_full.py`, `decode_attn_c1a_full.py` (leaf), `decode_c1a_full.py` (HC orchestration) |
-| Decoder C1A Reindex | `prefill_c1a_reindex.py`, `decode_attn_c1a_reindex.py` (leaf), `decode_c1a_reindex.py` (HC orchestration) |
-| Decoder C1A Reuse | `prefill_c1a_reuse.py`, `decode_attn_c1a_reuse.py` (leaf), `decode_c1a_reuse.py` (HC orchestration) |
+| Decoder C1A Full | `prefill_attn_c1a_full.py`, `decode_attn_c1a_full.py` (leaf), `prefill_c1a_full.py`, `decode_c1a_full.py` (HC orchestration) |
+| Decoder C1A Reindex | `prefill_attn_c1a_reindex.py`, `decode_attn_c1a_reindex.py` (leaf), `prefill_c1a_reindex.py`, `decode_c1a_reindex.py` (HC orchestration) |
+| Decoder C1A Reuse | `prefill_attn_c1a_reuse.py`, `decode_attn_c1a_reuse.py` (leaf), `prefill_c1a_reuse.py`, `decode_c1a_reuse.py` (HC orchestration) |
 | Hierarchical indexer | `hierarchical_sparse_indexer.py` |
 | Hyper-connections | `hc_mixes.py`, `hc_pre.py`, `hc_post.py` |
 | Attention TP transports | `attention_tp.py` |

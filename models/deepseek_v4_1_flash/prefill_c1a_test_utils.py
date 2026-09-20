@@ -189,8 +189,7 @@ def make_fixture_values(token_count: int, case_name: str) -> dict[str, torch.Ten
 
     angles = (compressed_lens - 1).to(torch.float32).unsqueeze(1)
     angles = angles * torch.arange(C.ROPE_DIM // 2, dtype=torch.float32).unsqueeze(0) * 0.001
-
-    return {
+    values = {
         "x": _ranked(torch.randn(token_count, C.D).to(torch.bfloat16)),
         "wq_a": wq_a,
         "wq_a_scale": wq_a_scale,
@@ -242,6 +241,8 @@ def make_fixture_values(token_count: int, case_name: str) -> dict[str, torch.Ten
             torch.randn(C.D, C.INDEX_H).mul_(C.D**-0.5).to(torch.bfloat16)
         ),
     }
+    values["attn_norm_weight"] = _ranked((torch.randn(C.D).mul_(0.1).add_(1)).to(torch.bfloat16))
+    return values
 
 
 def make_tensor_specs(
@@ -269,6 +270,13 @@ def make_tensor_specs(
         specs.append(TensorSpec(name, shape, dtype))
     specs.append(ScalarSpec("num_tokens", torch.int32, token_count))
     return specs
+
+
+def golden_c1a_attention_input(hidden: torch.Tensor, attn_norm_weight: torch.Tensor) -> torch.Tensor:
+    """Apply the official attention RMSNorm after the BF16 mHC collapse."""
+    from models.deepseek_v4_1_flash.golden import rms_norm
+
+    return rms_norm(hidden.to(torch.bfloat16), attn_norm_weight)
 
 
 def _copy_storage(destination: torch.Tensor, source: torch.Tensor) -> None:
@@ -330,15 +338,78 @@ def _reduce_tp_partials(partials: list[torch.Tensor]) -> torch.Tensor:
     return reduced.to(torch.bfloat16)
 
 
-def apply_distributed_golden(mode: str, golden_fn: Callable, tensors: dict[str, torch.Tensor]) -> None:
+def golden_prefill_tp_attention(
+    attention_fn: Callable,
+    hidden: torch.Tensor,
+    attention_args: tuple[torch.Tensor, ...],
+    tp_size: int,
+) -> tuple[torch.Tensor, object]:
+    """Run one prefill attention golden per TP rank and reduce its FP32 partials.
+
+    The exported mHC helpers accept either one rank's attention arguments or rank-stacked
+    arguments (the first dimension is ``tp_size``).  Rank-stacked arguments reproduce the
+    sharded invocation; the local form remains available for CPU-side smoke checks.
+    """
+    ranked_args = bool(
+        attention_args
+        and isinstance(attention_args[0], torch.Tensor)
+        and attention_args[0].ndim >= 2
+        and attention_args[0].shape[0] == tp_size
+    )
+    results = []
+    for rank in range(tp_size):
+        rank_hidden = hidden
+        if hidden.ndim > 0 and hidden.shape[0] == tp_size and hidden.ndim == 3:
+            rank_hidden = hidden[rank]
+        rank_args = attention_args
+        if ranked_args:
+            rank_args = tuple(argument[rank] for argument in attention_args)
+        result = attention_fn(rank_hidden, *rank_args)
+        results.append(result)
+        output = result.output
+        if output.ndim == rank_hidden.ndim + 1 and output.shape[0] == tp_size:
+            partials = [output[peer] for peer in range(tp_size)]
+            return _reduce_tp_partials(partials), result
+
+    return _reduce_tp_partials([result.output for result in results]), results[0]
+
+
+def apply_distributed_golden(
+    mode: str,
+    golden_fn: Callable,
+    tensors: dict[str, torch.Tensor],
+    active_tokens: int | None = None,
+) -> None:
     parameter_names = tuple(inspect.signature(golden_fn).parameters)
+    token_input_names = {
+        "x",
+        "rope_cos",
+        "rope_sin",
+        "window_slots",
+        "window_indices",
+        "request_ids",
+        "compressed_lens",
+        "compressed_rope_cos",
+        "compressed_rope_sin",
+        "compressed_slots",
+        "candidate_mask",
+        "compressed_indices",
+    }
     results = []
     for rank in range(C.TP_SIZE):
-        kwargs = {name: tensors[name][rank] for name in parameter_names}
+        kwargs = {}
+        for name in parameter_names:
+            value = tensors[name][rank]
+            if active_tokens is not None and name in token_input_names and value.ndim > 0:
+                value = value[:active_tokens]
+            kwargs[name] = value
         results.append(golden_fn(**kwargs))
 
     reduced = _reduce_tp_partials([result.output for result in results])
-    tensors["output"][:] = reduced.unsqueeze(0)
+    if active_tokens is None:
+        tensors["output"][:] = reduced.unsqueeze(0)
+    else:
+        tensors["output"][:, :active_tokens] = reduced.unsqueeze(0)
     for rank, result in enumerate(results):
         tensors["window_cache"][rank].copy_(result.window_cache)
         _copy_storage(tensors["window_cache_scale"][rank], result.window_cache_scale)
@@ -357,7 +428,10 @@ def apply_distributed_golden(mode: str, golden_fn: Callable, tensors: dict[str, 
                     end = min(begin + block_size, candidate_mask.shape[1])
                     candidate_mask[token, begin:end] = 1
         if mode in ("full", "reindex"):
-            tensors["topk_indices"][rank].copy_(result.topk_indices)
+            if active_tokens is None:
+                tensors["topk_indices"][rank].copy_(result.topk_indices)
+            else:
+                tensors["topk_indices"][rank, :active_tokens].copy_(result.topk_indices)
 
 
 def _golden_index_scores(
@@ -413,19 +487,22 @@ def topk_indices_compare(mode: str) -> Callable:
         del rtol, atol
         if actual.shape != expected.shape or actual.dtype != expected.dtype:
             return False, "    Top-K shape and dtype must match the reference"
-        if bool((actual < -1).any()):
+        active = min(int(inputs.get("num_tokens", actual.shape[1])), actual.shape[1])
+        actual_active = actual[:, :active]
+        expected_active = expected[:, :active]
+        if bool((actual_active < -1).any()):
             return False, "    Top-K padding must use -1"
-        valid = actual >= 0
+        valid = actual_active >= 0
         if bool((valid[..., 1:] & ~valid[..., :-1]).any()):
             return False, "    Top-K padding must follow all valid indices"
-        if torch.equal(actual, expected):
+        if torch.equal(actual_active, expected_active):
             return True, ""
 
-        for rank in range(actual.shape[0]):
+        for rank in range(actual_active.shape[0]):
             scores = None
-            for token in range(actual.shape[1]):
-                actual_row = actual[rank, token]
-                expected_row = expected[rank, token]
+            for token in range(actual_active.shape[1]):
+                actual_row = actual_active[rank, token]
+                expected_row = expected_active[rank, token]
                 actual_valid = actual_row[actual_row >= 0].to(torch.int64)
                 expected_valid = expected_row[expected_row >= 0].to(torch.int64)
                 if actual_valid.numel() != expected_valid.numel():
@@ -484,6 +561,7 @@ def _selected_output_reference(
     selected: torch.Tensor,
 ) -> torch.Tensor:
     """Evaluate validated selections against reference cache values and original weights."""
+    active = selected.shape[1]
     partials = []
     for rank in range(selected.shape[0]):
         def tensor(name: str) -> torch.Tensor:
@@ -491,9 +569,9 @@ def _selected_output_reference(
             return source[name][rank]
 
         query, _, _ = qkv_proj_rope(
-            tensor("x"), tensor("wq_a"), tensor("wq_a_scale"), tensor("q_norm_weight"),
+            tensor("x")[:active], tensor("wq_a"), tensor("wq_a_scale"), tensor("q_norm_weight"),
             tensor("wq_b"), tensor("wq_b_scale"), tensor("wkv"), tensor("wkv_scale"),
-            tensor("kv_norm_weight"), tensor("rope_cos"), tensor("rope_sin"),
+            tensor("kv_norm_weight"), tensor("rope_cos")[:active], tensor("rope_sin")[:active],
         )
         window = dequantize_mxfp8_cache(tensor("window_cache"), tensor("window_cache_scale"))
         compressed = dequantize_mxfp4_cache(
@@ -501,14 +579,14 @@ def _selected_output_reference(
             group_size=C.COMPRESSED_CACHE_GROUP, scale_format="e4m3",
         )
         attended = golden_prefill_c1a_attention(
-            query, window.to(query.dtype), tensor("window_indices"),
+            query, window.to(query.dtype), tensor("window_indices")[:active],
             compressed.to(query.dtype), selected[rank], tensor("attn_sink"),
         )
         partials.append(_project_output(
-            attended, tensor("rope_cos"), tensor("rope_sin"), tensor("wo_a"),
+            attended, tensor("rope_cos")[:active], tensor("rope_sin")[:active], tensor("wo_a"),
             tensor("wo_b"), tensor("wo_b_scale"), output_dtype=torch.float32,
         ))
-    return _reduce_tp_partials(partials).unsqueeze(0).expand_as(expected_outputs["output"])
+    return _reduce_tp_partials(partials).unsqueeze(0).expand(selected.shape[0], -1, -1)
 
 
 def _compare_attention_rows(actual: torch.Tensor, expected: torch.Tensor) -> tuple[bool, str]:
@@ -558,6 +636,7 @@ def attention_output_compare(mode: str) -> Callable:
         rtol: float,
         atol: float,
     ) -> tuple[bool, str]:
+        active = min(int(inputs.get("num_tokens", actual.shape[1])), actual.shape[1])
         reference = expected
         if mode != "reuse":
             selected = actual_outputs["topk_indices"]
@@ -568,9 +647,94 @@ def attention_output_compare(mode: str) -> Callable:
             )
             if not valid:
                 return False, f"    output reference rejected invalid Top-K: {detail.strip()}"
-            if not torch.equal(selected, nominal):
-                reference = _selected_output_reference(inputs, expected_outputs, selected)
-        return _compare_attention_rows(actual, reference)
+            if not torch.equal(selected[:, :active], nominal[:, :active]):
+                reference = _selected_output_reference(inputs, expected_outputs, selected[:, :active])
+        return _compare_attention_rows(actual[:, :active], reference[:, :active])
 
     compare.__name__ = "c1a_output_row_rms_and_peak"
+    return compare
+
+
+HC_ROW_BUDGET = 2.0**-8
+
+
+def _report_hc_stage(name: str, actual: torch.Tensor, expected: torch.Tensor) -> tuple[float, float]:
+    """Report global and worst token-row relative L2 for one HC stage."""
+    diff = actual.double() - expected.double()
+    reference = expected.double()
+    rel_l2 = (diff.norm() / reference.norm().clamp_min(1e-12)).item()
+    rows = diff.flatten(1).norm(dim=-1) / reference.flatten(1).norm(dim=-1).clamp_min(1e-12)
+    worst_row = rows.max().item()
+    print(f"[PRECISION] {name} rel_l2={rel_l2:.8g} max_row_rel_l2={worst_row:.8g}")
+    return rel_l2, worst_row
+
+
+def _tp_replicated(actual: torch.Tensor) -> bool:
+    return all(torch.equal(actual[0], actual[rank]) for rank in range(1, C.TP_SIZE))
+
+
+def hc_hidden_compare() -> Callable:
+    """Validate mHC collapse precision per token row and TP replication."""
+    from golden import ratio_allclose
+
+    close = ratio_allclose(atol=1e-4, rtol=1.0 / 128)
+
+    def compare(actual: torch.Tensor, expected: torch.Tensor, **kwargs) -> tuple[bool, str]:
+        _, worst_row = _report_hc_stage("hidden", actual[0], expected[0])
+        elementwise, _ = close(actual[0], expected[0], **kwargs)
+        passed = elementwise and worst_row <= HC_ROW_BUDGET and _tp_replicated(actual)
+        return passed, f"hc_pre every token row <= {HC_ROW_BUDGET:.3g} rel L2; TP replicas identical"
+
+    return compare
+
+
+def attn_input_compare() -> Callable:
+    """Validate the post-collapse attention RMSNorm boundary per token row."""
+    from golden import ratio_allclose
+
+    close = ratio_allclose(atol=1e-4, rtol=1.0 / 128)
+
+    def compare(actual: torch.Tensor, expected: torch.Tensor, **kwargs) -> tuple[bool, str]:
+        _, worst_row = _report_hc_stage("attn_input", actual[0], expected[0])
+        elementwise, _ = close(actual[0], expected[0], **kwargs)
+        passed = elementwise and worst_row <= HC_ROW_BUDGET and _tp_replicated(actual)
+        return passed, f"attention RMSNorm every token row <= {HC_ROW_BUDGET:.3g} rel L2; TP replicas identical"
+
+    return compare
+
+
+def hc_output_compare() -> Callable:
+    """Replay mHC post on device attention output and bound full-chain relative L2."""
+    from golden import ratio_allclose
+    from models.deepseek_v4_1_flash.hc_mixes import golden_mhc_mixes
+    from models.deepseek_v4_1_flash.hc_post import golden_mhc_post
+
+    close = ratio_allclose(atol=1e-4, rtol=1.0 / 128)
+
+    def compare(
+        actual: torch.Tensor,
+        expected: torch.Tensor,
+        *,
+        inputs: dict[str, torch.Tensor],
+        actual_outputs: dict[str, torch.Tensor],
+        **kwargs,
+    ) -> tuple[bool, str]:
+        _, post_mix, residual_mix = golden_mhc_mixes(
+            inputs["x_hc"][0], inputs["hc_attn_fn"][0],
+            inputs["hc_attn_scale"][0], inputs["hc_attn_base"][0],
+        )
+        replay = golden_mhc_post(
+            actual_outputs["attn_out"][0], inputs["x_hc"][0], post_mix, residual_mix
+        )
+        _, worst_row = _report_hc_stage("output(hc_post replay)", actual[0], replay)
+        elementwise, _ = close(actual[0], replay, inputs=inputs, actual_outputs=actual_outputs, **kwargs)
+        end_to_end, _ = _report_hc_stage("output(end-to-end)", actual[0], expected[0])
+        passed = (
+            elementwise
+            and worst_row <= HC_ROW_BUDGET
+            and end_to_end <= 0.01
+            and _tp_replicated(actual)
+        )
+        return passed, "hc_post replay within row budget; end-to-end rel L2 <= 1%; TP replicas identical"
+
     return compare
