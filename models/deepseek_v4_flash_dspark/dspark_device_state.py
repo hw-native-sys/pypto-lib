@@ -108,7 +108,7 @@ def prepare_target_group_from_device_state(
                         pl.write(
                             position_ids_group,
                             [group_row + offset],
-                            pl.cast(anchor + offset, pl.INT32),
+                            pl.cast(pl.min(anchor + offset, position_limit - 1), pl.INT32),
                         )
                     if request >= local_begin and request < local_end:
                         local_request = pl.cast(request - local_begin, pl.INDEX)
@@ -119,7 +119,7 @@ def prepare_target_group_from_device_state(
                             pl.write(
                                 position_ids_local,
                                 [local_row + offset],
-                                pl.cast(anchor + offset, pl.INT32),
+                                pl.cast(pl.min(anchor + offset, position_limit - 1), pl.INT32),
                             )
                             if offset < active_width:
                                 pl.write(
@@ -202,7 +202,7 @@ def prepare_target_from_device_state(
                         pl.write(
                             position_ids,
                             [row + offset],
-                            pl.cast(anchor + offset, pl.INT32),
+                            pl.cast(pl.min(anchor + offset, position_limit - 1), pl.INT32),
                         )
                     pl.write(
                         csa_kv_seq_lens,

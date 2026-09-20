@@ -288,12 +288,13 @@ def build_group_decode_metadata(
         # TP rank needs the same full group request table.  This deliberately
         # differs from the attention query metadata below, which is local.
         for group_request in pl.range(B):
-            if pl.read(active_widths, [group_request]) > 0:
+            active_width = pl.read(active_widths, [group_request])
+            if active_width > 0:
                 anchor = pl.read(position_ids, [group_request * S])
-                last_hca_page = (anchor + S - 1) // C128_COMPRESSOR_BLOCK_SIZE
+                last_hca_page = (anchor + active_width - 1) // C128_COMPRESSOR_BLOCK_SIZE
                 for delta in pl.range(HCA_HISTORY_PAGES + 1):
                     logical_page = last_hca_page - delta
-                    if logical_page >= 0:
+                    if logical_page >= 0 and logical_page < HCA_STATE_TABLE_BLOCKS:
                         pl.write(
                             group_hca_state_block_table,
                             [group_request, pl.cast(logical_page, pl.INDEX)],
