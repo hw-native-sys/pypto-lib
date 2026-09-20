@@ -278,17 +278,20 @@ def hc_pre_gates(
     return pre_val_store
 
 
-@pl.jit.inline
-def hc_pre(
+def _hc_pre(
     x: pl.Tensor[[T_DYN, HC_MULT, D], pl.FP32],
     hc_fn: pl.Tensor[[MIX_HC, HC_DIM], pl.FP32],
     hc_scale: pl.Tensor[[3], pl.FP32],
     hc_base: pl.Tensor[[MIX_HC], pl.FP32],
-    x_mixed: pl.Tensor[[T_DYN, D], pl.BF16],
-    post: pl.Tensor[[T_DYN, HC_MULT], pl.FP32],
-    comb: pl.Tensor[[T_DYN, HC_MULT * HC_MULT], pl.FP32],
+    x_mixed: pl.Out[pl.Tensor[[T_DYN, D], pl.BF16]],
+    post: pl.Out[pl.Tensor[[T_DYN, HC_MULT], pl.FP32]],
+    comb: pl.Out[pl.Tensor[[T_DYN, HC_MULT * HC_MULT], pl.FP32]],
 ):
     """Compute HC gates and BF16 pre-mixed activations."""
+    x.bind_dynamic(0, T_DYN)
+    x_mixed.bind_dynamic(0, T_DYN)
+    post.bind_dynamic(0, T_DYN)
+    comb.bind_dynamic(0, T_DYN)
     t_dim = pl.tensor.dim(x, 0)
     token_tiles = (t_dim + T_TILE - 1) // T_TILE
     t_linear = ((t_dim + LINEAR_T_TILE - 1) // LINEAR_T_TILE) * LINEAR_T_TILE
@@ -328,6 +331,8 @@ def hc_pre(
     return x_mixed
 
 
+hc_pre = pl.jit.inline(_hc_pre)
+hc_pre_test = pl.jit(_hc_pre)
 
 
 @pl.jit.inline
@@ -393,25 +398,6 @@ def hc_pre_norm(
             normed_bf16 = rms_norm_apply(mixed_input, norm_w_row, y_inv)
             x_normed[t0:t0 + T_TILE, d0:d0 + D_TILE] = normed_bf16
     return mixed_tid
-
-
-@pl.jit
-def hc_pre_test(
-    x: pl.Tensor[[T_DYN, HC_MULT, D], pl.FP32],
-    hc_fn: pl.Tensor[[MIX_HC, HC_DIM], pl.FP32],
-    hc_scale: pl.Tensor[[3], pl.FP32],
-    hc_base: pl.Tensor[[MIX_HC], pl.FP32],
-    x_mixed: pl.Out[pl.Tensor[[T_DYN, D], pl.BF16]],
-    post: pl.Out[pl.Tensor[[T_DYN, HC_MULT], pl.FP32]],
-    comb: pl.Out[pl.Tensor[[T_DYN, HC_MULT * HC_MULT], pl.FP32]],
-):
-    x.bind_dynamic(0, T_DYN)
-    x_mixed.bind_dynamic(0, T_DYN)
-    post.bind_dynamic(0, T_DYN)
-    comb.bind_dynamic(0, T_DYN)
-
-    hc_pre(x, hc_fn, hc_scale, hc_base, x_mixed, post, comb)
-    return x_mixed
 
 
 def _golden_a2a3_cube_linear(x_flat_2d, hc_fn):

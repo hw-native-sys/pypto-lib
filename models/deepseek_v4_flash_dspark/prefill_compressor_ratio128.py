@@ -407,8 +407,7 @@ def _prefill_compressor_ratio128_tile(
     return cmp_kv, compress_state
 
 
-@pl.jit.inline(auto_scope=False)
-def prefill_compressor_ratio128(
+def _prefill_compressor_ratio128(
     x: pl.Tensor[[T_DYN, D], pl.BF16],
     query_start_loc: pl.Tensor[[QUERY_START_LOC_DYN], pl.INT32],
     compress_state: pl.InOut[
@@ -430,6 +429,16 @@ def prefill_compressor_ratio128(
 
     Each request slice delimited by ``query_start_loc`` must use consecutive positions.
     """
+    x.bind_dynamic(0, T_DYN)
+    query_start_loc.bind_dynamic(0, QUERY_START_LOC_DYN)
+    compress_state.bind_dynamic(0, STATE_BLOCK_NUM_DYN)
+    compress_state_block_table.bind_dynamic(0, REQUESTS_DYN)
+    cmp_kv.bind_dynamic(0, CMP_BLOCK_NUM_DYN)
+    cmp_freqs_cos.bind_dynamic(0, T_DYN)
+    cmp_freqs_sin.bind_dynamic(0, T_DYN)
+    position_ids.bind_dynamic(0, T_DYN)
+    cmp_slot_mapping.bind_dynamic(0, T_DYN)
+    state_slot_mapping.bind_dynamic(0, T_DYN)
     request_count = pl.tensor.dim(query_start_loc, 0) - 1
     rope_dup_idx_template = pl.create_tensor([HCA_C128_RMS_TILE, ROPE_HEAD_DIM], dtype=pl.INT32)
     rope_swap_idx_template = pl.create_tensor([HCA_C128_RMS_TILE, ROPE_HEAD_DIM], dtype=pl.INT32)
@@ -492,52 +501,8 @@ def prefill_compressor_ratio128(
     return cmp_kv, compress_state
 
 
-@pl.jit
-def prefill_compressor_ratio128_test(
-    x: pl.Tensor[[T_DYN, D], pl.BF16],
-    query_start_loc: pl.Tensor[[QUERY_START_LOC_DYN], pl.INT32],
-    compress_state: pl.InOut[
-        pl.Tensor[[STATE_BLOCK_NUM_DYN, HCA_STATE_BLOCK_SIZE, COMPRESS_STATE_DIM], pl.FP32]
-    ],
-    compress_state_block_table: pl.Tensor[[REQUESTS_DYN, HCA_STATE_MAX_BLOCKS], pl.INT32],
-    wkv: pl.Tensor[[OUT_DIM, D], pl.BF16],
-    wgate: pl.Tensor[[OUT_DIM, D], pl.BF16],
-    ape: pl.Tensor[[COMPRESS_RATIO, OUT_DIM], pl.FP32],
-    norm_w: pl.Tensor[[HEAD_DIM], pl.BF16],
-    cmp_freqs_cos: pl.Tensor[[T_DYN, ROPE_HEAD_DIM], pl.BF16],
-    cmp_freqs_sin: pl.Tensor[[T_DYN, ROPE_HEAD_DIM], pl.BF16],
-    cmp_kv: pl.InOut[pl.Tensor[[CMP_BLOCK_NUM_DYN, CMP_STORAGE_BLOCK_SIZE, 1, HEAD_DIM], pl.BF16]],
-    position_ids: pl.Tensor[[T_DYN], pl.INT32],
-    cmp_slot_mapping: pl.Tensor[[T_DYN], pl.INT64],
-    state_slot_mapping: pl.Tensor[[T_DYN], pl.INT64],
-):
-    x.bind_dynamic(0, T_DYN)
-    query_start_loc.bind_dynamic(0, QUERY_START_LOC_DYN)
-    compress_state.bind_dynamic(0, STATE_BLOCK_NUM_DYN)
-    compress_state_block_table.bind_dynamic(0, REQUESTS_DYN)
-    cmp_kv.bind_dynamic(0, CMP_BLOCK_NUM_DYN)
-    cmp_freqs_cos.bind_dynamic(0, T_DYN)
-    cmp_freqs_sin.bind_dynamic(0, T_DYN)
-    position_ids.bind_dynamic(0, T_DYN)
-    cmp_slot_mapping.bind_dynamic(0, T_DYN)
-    state_slot_mapping.bind_dynamic(0, T_DYN)
-
-    return prefill_compressor_ratio128(
-        x,
-        query_start_loc,
-        compress_state,
-        compress_state_block_table,
-        wkv,
-        wgate,
-        ape,
-        norm_w,
-        cmp_freqs_cos,
-        cmp_freqs_sin,
-        cmp_kv,
-        position_ids,
-        cmp_slot_mapping,
-        state_slot_mapping,
-    )
+prefill_compressor_ratio128 = pl.jit.inline(auto_scope=False)(_prefill_compressor_ratio128)
+prefill_compressor_ratio128_test = pl.jit(auto_scope=False)(_prefill_compressor_ratio128)
 
 
 def golden_prefill_compressor_ratio128(tensors):

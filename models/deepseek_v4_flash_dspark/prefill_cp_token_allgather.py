@@ -55,16 +55,17 @@ FIXTURE_ROUNDS = 2
 FIXTURE_LOCAL_T = min(257, PREFILL_LOCAL_CAP)
 
 
-@pl.jit.inline
-def prefill_cp_token_allgather_step(
+def _prefill_cp_token_allgather_step(
     hidden_local: pl.Tensor[[CP_Q_T_DYN, D], pl.BF16],
-    group_out: pl.Tensor[[CP_KV_T_DYN, D], pl.BF16],
-    gather_window: pld.DistributedTensor[[PREFILL_GROUP_CAP, D], pl.BF16],
-    gather_signal: pld.DistributedTensor[[TP_SIZE, 1], pl.INT32],
+    group_out: pl.Out[pl.Tensor[[CP_KV_T_DYN, D], pl.BF16]],
+    gather_window: pl.InOut[pld.DistributedTensor[[PREFILL_GROUP_CAP, D], pl.BF16]],
+    gather_signal: pl.InOut[pld.DistributedTensor[[TP_SIZE, 1], pl.INT32]],
     group_base: pl.Scalar[pl.INT32],
     tp_rank: pl.Scalar[pl.INT32],
 ):
     """Gather rank-major rows and retire the complete two-phase signal epoch."""
+    hidden_local.bind_dynamic(0, CP_Q_T_DYN)
+    group_out.bind_dynamic(0, CP_KV_T_DYN)
     local_rows = pl.tensor.dim(hidden_local, 0)
     local_t = pl.cast(local_rows, pl.INT32)
     target_row = tp_rank * local_t
@@ -146,24 +147,8 @@ def prefill_cp_token_allgather_step(
     return group_out, gather_signal
 
 
-@pl.jit
-def prefill_cp_token_allgather_fixture(
-    hidden_local: pl.Tensor[[CP_Q_T_DYN, D], pl.BF16],
-    group_out: pl.Out[pl.Tensor[[CP_KV_T_DYN, D], pl.BF16]],
-    gather_window: pl.InOut[pld.DistributedTensor[[PREFILL_GROUP_CAP, D], pl.BF16]],
-    gather_signal: pl.InOut[pld.DistributedTensor[[TP_SIZE, 1], pl.INT32]],
-    group_base: pl.Scalar[pl.INT32],
-    tp_rank: pl.Scalar[pl.INT32],
-):
-    """Run one rank of the prefill token-row all-gather."""
-    hidden_local.bind_dynamic(0, CP_Q_T_DYN)
-    group_out.bind_dynamic(0, CP_KV_T_DYN)
-    group_out, gather_signal = prefill_cp_token_allgather_step(
-        hidden_local, group_out,
-        gather_window, gather_signal,
-        group_base, tp_rank,
-    )
-    return group_out, gather_signal
+prefill_cp_token_allgather_step = pl.jit.inline(_prefill_cp_token_allgather_step)
+prefill_cp_token_allgather_fixture = pl.jit(_prefill_cp_token_allgather_step)
 
 
 @pl.jit.host

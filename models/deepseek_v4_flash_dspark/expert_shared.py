@@ -57,8 +57,7 @@ D_OUT_TILE_ACT = 128
 W2_ACT_INNER = 8
 
 
-@pl.jit.inline
-def expert_shared(
+def _expert_shared(
     x_local_i8: pl.Tensor[[T, D], pl.INT8],
     x_local_scale_dq: pl.Tensor[[T, 1], pl.FP32],
     shared_w1: pl.Tensor[[MOE_INTER, D], pl.INT8],
@@ -67,7 +66,7 @@ def expert_shared(
     shared_w3_scale: pl.Tensor[[MOE_INTER], pl.FP32],
     shared_w2: pl.Tensor[[D, MOE_INTER], pl.INT8],
     shared_w2_scale: pl.Tensor[[D], pl.FP32],
-    sh: pl.Tensor[[T, D], pl.BF16],
+    sh: pl.Out[pl.Tensor[[T, D], pl.BF16]],
 ):
     # One M-tile of SH_M_TILE rows per iteration.
     for mt in pl.parallel(N_MTILES):
@@ -268,25 +267,8 @@ def expert_shared(
     return sh
 
 
-@pl.jit
-def expert_shared_test(
-    x_local_i8: pl.Tensor[[T, D], pl.INT8],
-    x_local_scale_dq: pl.Tensor[[T, 1], pl.FP32],
-    shared_w1: pl.Tensor[[MOE_INTER, D], pl.INT8],
-    shared_w1_scale: pl.Tensor[[MOE_INTER], pl.FP32],
-    shared_w3: pl.Tensor[[MOE_INTER, D], pl.INT8],
-    shared_w3_scale: pl.Tensor[[MOE_INTER], pl.FP32],
-    shared_w2: pl.Tensor[[D, MOE_INTER], pl.INT8],
-    shared_w2_scale: pl.Tensor[[D], pl.FP32],
-    sh: pl.Out[pl.Tensor[[T, D], pl.BF16]],
-):
-    expert_shared(
-        x_local_i8, x_local_scale_dq,
-        shared_w1, shared_w1_scale, shared_w3, shared_w3_scale,
-        shared_w2, shared_w2_scale,
-        sh,
-    )
-    return sh
+expert_shared = pl.jit.inline(_expert_shared)
+expert_shared_test = pl.jit(_expert_shared)
 
 
 def golden_expert_shared(tensors):

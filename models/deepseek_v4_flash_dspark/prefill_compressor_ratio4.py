@@ -498,8 +498,7 @@ def _prefill_compressor_ratio4_tile(
     return cmp_kv, compress_state
 
 
-@pl.jit.inline(auto_scope=False)
-def compressor_ratio4(
+def _compressor_ratio4(
     x: pl.Tensor[[T_DYN, D], pl.BF16],
     query_start_loc: pl.Tensor[[QUERY_START_LOC_DYN], pl.INT32],
     compress_state: pl.InOut[
@@ -518,6 +517,16 @@ def compressor_ratio4(
     state_slot_mapping: pl.Tensor[[T_DYN], pl.INT64],
 ):
     """Compress packed requests independently through ordered 512-row state tiles."""
+    x.bind_dynamic(0, T_DYN)
+    query_start_loc.bind_dynamic(0, QUERY_START_LOC_DYN)
+    compress_state.bind_dynamic(0, STATE_BLOCK_NUM_DYN)
+    compress_state_block_table.bind_dynamic(0, REQUESTS_DYN)
+    cmp_kv.bind_dynamic(0, CMP_BLOCK_NUM_DYN)
+    cmp_freqs_cos.bind_dynamic(0, T_DYN)
+    cmp_freqs_sin.bind_dynamic(0, T_DYN)
+    position_ids.bind_dynamic(0, T_DYN)
+    cmp_slot_mapping.bind_dynamic(0, T_DYN)
+    state_slot_mapping.bind_dynamic(0, T_DYN)
     request_count = pl.tensor.dim(query_start_loc, 0) - 1
     rope_dup_idx_template = pl.create_tensor([PACKED_RMS_TILE, ROPE_HEAD_DIM], dtype=pl.INT32)
     rope_swap_idx_template = pl.create_tensor([PACKED_RMS_TILE, ROPE_HEAD_DIM], dtype=pl.INT32)
@@ -575,6 +584,10 @@ def compressor_ratio4(
                     tile_rows,
                 )
     return cmp_kv, compress_state
+
+
+compressor_ratio4 = pl.jit.inline(auto_scope=False)(_compressor_ratio4)
+prefill_compressor_ratio4_test = pl.jit(auto_scope=False)(_compressor_ratio4)
 
 
 def golden_prefill_compressor_ratio4(tensors):
@@ -701,54 +714,6 @@ def golden_prefill_compressor_ratio4(tensors):
             pos = int(position_ids[token_id].item())
             kv_state_flat[dst_row] = kv_proj[token_id]
             score_state_flat[dst_row] = score_proj[token_id] + ape[pos % COMPRESS_RATIO]
-
-
-@pl.jit
-def prefill_compressor_ratio4_test(
-    x: pl.Tensor[[T_DYN, D], pl.BF16],
-    query_start_loc: pl.Tensor[[QUERY_START_LOC_DYN], pl.INT32],
-    compress_state: pl.InOut[
-        pl.Tensor[[STATE_BLOCK_NUM_DYN, CSA_STATE_BLOCK_SIZE, COMPRESS_STATE_DIM], pl.FP32]
-    ],
-    compress_state_block_table: pl.Tensor[[REQUESTS_DYN, CSA_STATE_MAX_BLOCKS], pl.INT32],
-    wkv: pl.Tensor[[OUT_DIM, D], pl.BF16],
-    wgate: pl.Tensor[[OUT_DIM, D], pl.BF16],
-    ape: pl.Tensor[[COMPRESS_RATIO, OUT_DIM], pl.FP32],
-    norm_w: pl.Tensor[[HEAD_DIM], pl.BF16],
-    cmp_freqs_cos: pl.Tensor[[T_DYN, ROPE_HEAD_DIM], pl.BF16],
-    cmp_freqs_sin: pl.Tensor[[T_DYN, ROPE_HEAD_DIM], pl.BF16],
-    cmp_kv: pl.InOut[pl.Tensor[[CMP_BLOCK_NUM_DYN, BLOCK_SIZE, 1, HEAD_DIM], pl.BF16]],
-    position_ids: pl.Tensor[[T_DYN], pl.INT32],
-    cmp_slot_mapping: pl.Tensor[[T_DYN], pl.INT64],
-    state_slot_mapping: pl.Tensor[[T_DYN], pl.INT64],
-):
-    x.bind_dynamic(0, T_DYN)
-    query_start_loc.bind_dynamic(0, QUERY_START_LOC_DYN)
-    compress_state.bind_dynamic(0, STATE_BLOCK_NUM_DYN)
-    compress_state_block_table.bind_dynamic(0, REQUESTS_DYN)
-    cmp_kv.bind_dynamic(0, CMP_BLOCK_NUM_DYN)
-    cmp_freqs_cos.bind_dynamic(0, T_DYN)
-    cmp_freqs_sin.bind_dynamic(0, T_DYN)
-    position_ids.bind_dynamic(0, T_DYN)
-    cmp_slot_mapping.bind_dynamic(0, T_DYN)
-    state_slot_mapping.bind_dynamic(0, T_DYN)
-
-    return compressor_ratio4(
-        x,
-        query_start_loc,
-        compress_state,
-        compress_state_block_table,
-        wkv,
-        wgate,
-        ape,
-        norm_w,
-        cmp_freqs_cos,
-        cmp_freqs_sin,
-        cmp_kv,
-        position_ids,
-        cmp_slot_mapping,
-        state_slot_mapping,
-    )
 
 
 def build_tensor_specs(start_pos: int = START_POS, token_count: int = PREFILL_SEQ):
