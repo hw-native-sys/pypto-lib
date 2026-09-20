@@ -53,6 +53,21 @@ def _function(tree: ast.Module, name: str) -> ast.FunctionDef:
     return next(node for node in ast.walk(tree) if isinstance(node, ast.FunctionDef) and node.name == name)
 
 
+def _top_level_functions(name: str) -> set[str]:
+    return {node.name for node in _tree(name).body if isinstance(node, ast.FunctionDef)}
+
+
+def _string_list_assignment(name: str, variable: str) -> set[str]:
+    tree = _tree(name)
+    assignment = next(
+        node
+        for node in tree.body
+        if isinstance(node, ast.Assign)
+        and any(isinstance(target, ast.Name) and target.id == variable for target in node.targets)
+    )
+    return {element.value for element in assignment.value.elts}
+
+
 @requires_pypto
 def test_decode_layer_schedule_covers_all_40_layers(composition):
     resolve_decode_layer_plan = composition.resolve_decode_layer_plan
@@ -158,6 +173,65 @@ def test_decode_attention_modes_are_split_from_block_composition():
     for module_name in ("decode_attn_c1a_full", "decode_attn_c1a_reindex", "decode_attn_c1a_reuse"):
         names = {node.name for node in _tree(f"{module_name}.py").body if isinstance(node, ast.FunctionDef)}
         assert {"make_program", "main"} <= names
+
+
+def test_attention_pre_and_post_operators_have_single_public_owners():
+    assert {
+        "make_mx_projection",
+        "make_bf16_projection",
+        "make_bf16_projection_with_deps",
+        "make_norm",
+        "make_norm_with_deps",
+        "make_rope",
+        "make_rope_with_deps",
+    } <= _top_level_functions("attention_ops.py")
+    assert {
+        "q_proj_qr",
+        "q_proj_rope",
+        "kv_proj_rope",
+        "qkv_proj_rope",
+        "prefill_q_proj_qr",
+        "prefill_q_proj_rope",
+        "prefill_kv_proj_rope",
+    } <= _string_list_assignment("qkv_proj_rope.py", "__all__")
+    assert {
+        "grouped_output",
+        "grouped_output_with_deps",
+        "o_proj",
+        "prefill_o_proj",
+    } <= _string_list_assignment(
+        "o_proj.py", "__all__"
+    )
+
+    basic_factories = {"make_mx_projection", "make_norm", "make_rope", "make_bf16_projection"}
+    for module_name in ("decode_attn_swa.py", "prefill_attn_swa.py", "prefill_c1a_common.py"):
+        assert _top_level_functions(module_name).isdisjoint(basic_factories)
+
+    for module_name in ("decode_attn_swa.py", "decode_attn_c2a_full.py", "decode_attn_c2a_reuse.py"):
+        names = {node.id for node in ast.walk(_tree(module_name)) if isinstance(node, ast.Name)}
+        assert {"qkv_proj_rope", "o_proj"} <= names
+
+    # C1A decode keeps only its distinct MX projection and uses shared TaskId-aware primitives.
+    c1a_names = _top_level_functions("decode_attn_c1a_full.py")
+    assert "make_mx_projection_with_deps" in c1a_names
+    assert c1a_names.isdisjoint(
+        {"grouped_output", "make_norm", "make_rope", "make_bf16_projection"}
+    )
+    c1a_tree = _tree("decode_attn_c1a_full.py")
+    referenced_names = {node.id for node in ast.walk(c1a_tree) if isinstance(node, ast.Name)}
+    assert {
+        "make_bf16_projection_with_deps",
+        "make_norm_with_deps",
+        "make_rope_with_deps",
+    } <= referenced_names
+    assigned_names = {
+        target.id
+        for node in c1a_tree.body
+        if isinstance(node, ast.Assign)
+        for target in node.targets
+        if isinstance(target, ast.Name)
+    }
+    assert {"qkv_proj_rope_with_deps", "o_proj_with_deps"} <= assigned_names
 
 
 @requires_pypto

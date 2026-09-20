@@ -25,6 +25,11 @@ import torch
 
 from golden import TensorSpec, run
 from models.deepseek_v4_1_flash.attention_common import AttentionGoldenResult, quantized_cache_compare
+from models.deepseek_v4_1_flash.attention_ops import (
+    make_bf16_projection_with_deps,
+    make_norm_with_deps,
+    make_rope_with_deps,
+)
 from models.deepseek_v4_1_flash.config import (
     AttentionMode,
     B_DYN,
@@ -33,7 +38,6 @@ from models.deepseek_v4_1_flash.config import (
     COMPRESSED_CACHE_GROUP,
     D,
     DECODE_MAX_TOKENS,
-    FLASH,
     HEAD_DIM,
     INDEX_BLOCKS_DYN,
     INDEX_CACHE_GROUP,
@@ -54,9 +58,15 @@ from models.deepseek_v4_1_flash.config import (
     WINDOW_CACHE_GROUP,
 )
 from models.deepseek_v4_1_flash.hierarchical_sparse_indexer import hierarchical_sparse_indexer
+from models.deepseek_v4_1_flash.o_proj import (
+    grouped_output_with_deps,
+    make_o_proj_with_deps as build_o_proj_with_deps,
+)
+from models.deepseek_v4_1_flash.qkv_proj_rope import (
+    make_qkv_proj_rope_with_deps as build_qkv_proj_rope_with_deps,
+)
 
 # Model configuration.
-EPS = FLASH.rms_norm_eps
 SOFTMAX_SCALE = HEAD_DIM**-0.5
 ATTEND_TILE = 64
 ATTEND_TILES = (128 + INDEX_TOPK) // ATTEND_TILE
@@ -90,7 +100,7 @@ OUTPUT_RTOL = 1e-2
 OUTPUT_MAX_ERROR_RATIO = 0.01
 
 
-def make_projection(width, output_width, output_dtype=pl.BF16):
+def make_mx_projection_with_deps(width, output_width, output_dtype=pl.BF16):
     """Accumulate scale-corrected group-32 products without whole-weight expansion."""
     fp32_output = output_dtype == pl.FP32
 
@@ -152,68 +162,6 @@ def make_projection(width, output_width, output_dtype=pl.BF16):
         return project_tid
 
     return project
-
-
-def make_norm(width):
-    @pl.jit.inline
-    def normalize(
-        x: pl.Tensor[[T_DYN, width], pl.BF16],
-        weight: pl.Tensor[[width], pl.BF16],
-        output: pl.Tensor[[T_DYN, width], pl.BF16],
-        num_tokens: pl.Scalar[pl.INT32],
-        ready: pl.Scalar[pl.TASK_ID],
-    ):
-        with pl.spmd((num_tokens + 7) // 8, name_hint="c1a_rmsnorm", deps=[ready]) as norm_tid:
-            block = pl.tile.get_block_idx()
-            t = block * 8
-            rows = pl.min(8, num_tokens - t)
-            source = pl.slice(x, [8, width], [t, 0], valid_shape=[rows, width])
-            source = pl.set_validshape(pl.fillpad(source, pad_value=pl.PadValue.zero), 8, width)
-            value = pl.cast(source, pl.FP32)
-            inv = pl.rsqrt(
-                pl.add(pl.mul(pl.row_sum(pl.mul(value, value)), 1.0 / width), EPS), high_precision=True
-            )
-            gamma = pl.reshape(pl.cast(weight[:], pl.FP32), [1, width])
-            normalized = pl.col_expand_mul(pl.row_expand_mul(value, inv), gamma)
-            output[t : t + 8, :] = pl.set_validshape(pl.cast(normalized, pl.BF16, mode="rint"), rows, width)
-        return norm_tid
-
-    return normalize
-
-
-def make_rope(heads, inverse=False, head_dim=HEAD_DIM):
-    sign = -1.0 if inverse else 1.0
-    nope_dim = head_dim - ROPE_DIM
-
-    @pl.jit.inline
-    def rotate(
-        x: pl.Tensor[[T_DYN, heads * head_dim], pl.BF16],
-        cos: pl.Tensor[[T_DYN, ROPE_DIM // 2], pl.FP32],
-        sin: pl.Tensor[[T_DYN, ROPE_DIM // 2], pl.FP32],
-        output: pl.Tensor[[T_DYN, heads * head_dim], pl.BF16],
-        num_tokens: pl.Scalar[pl.INT32],
-        ready: pl.Scalar[pl.TASK_ID],
-    ):
-        with pl.spmd(num_tokens * heads, name_hint="c1a_rope", deps=[ready]) as rope_tid:
-            block = pl.tile.get_block_idx()
-            t = block // heads
-            h = block % heads
-            base = h * head_dim
-            output[t : t + 1, base : base + nope_dim] = x[t : t + 1, base : base + nope_dim]
-            tail = pl.cast(x[t : t + 1, base + nope_dim : base + head_dim], pl.FP32)
-            even = pl.gather(tail, mask_pattern=pl.tile.MaskPattern.P0101)
-            odd = pl.gather(tail, mask_pattern=pl.tile.MaskPattern.P1010)
-            c = cos[t : t + 1, :]
-            s = pl.mul(sin[t : t + 1, :], sign)
-            re = pl.sub(pl.mul(even, c), pl.mul(odd, s))
-            im = pl.add(pl.mul(even, s), pl.mul(odd, c))
-            rotated = pl.full([1, ROPE_DIM], dtype=pl.FP32, value=0.0)
-            rotated = pl.tensor.scatter(re, mask_pattern=pl.tile.MaskPattern.P0101, dst=rotated)
-            rotated = pl.tensor.scatter(im, mask_pattern=pl.tile.MaskPattern.P1010, dst=rotated)
-            output[t : t + 1, base + nope_dim : base + head_dim] = pl.cast(rotated, pl.BF16, mode="rint")
-        return rope_tid
-
-    return rotate
 
 
 @pl.jit.inline
@@ -313,46 +261,21 @@ def attend_combined(
     return attend_tid
 
 
-@pl.jit.inline
-def grouped_output(
-    x: pl.Tensor[[T_DYN, LOCAL_H * HEAD_DIM], pl.BF16],
-    weight: pl.Tensor[[LOCAL_O_GROUPS, O_LORA, O_GROUP_IN], pl.BF16],
-    output: pl.Tensor[[T_DYN, LOCAL_O_WIDTH], pl.BF16],
-    num_tokens: pl.Scalar[pl.INT32],
-    ready: pl.Scalar[pl.TASK_ID],
-):
-    with pl.spmd(
-        (num_tokens + M_TILE - 1) // M_TILE * (LOCAL_O_WIDTH // N_TILE),
-        name_hint="c1a_grouped_output", deps=[ready],
-    ) as grouped_tid:
-        block = pl.tile.get_block_idx()
-        t0 = block // (LOCAL_O_WIDTH // N_TILE) * M_TILE
-        n0 = block % (LOCAL_O_WIDTH // N_TILE) * N_TILE
-        group = n0 // O_LORA
-        local_n = n0 % O_LORA
-        rows = pl.min(M_TILE, num_tokens - t0)
-        acc = pl.create_tensor([M_TILE, N_TILE], dtype=pl.FP32)
-        for kb in pl.range(O_GROUP_IN // K_TILE):
-            k0 = kb * K_TILE
-            a = pl.slice(x, [M_TILE, K_TILE], [t0, group * O_GROUP_IN + k0], valid_shape=[rows, K_TILE])
-            w = pl.reshape(
-                weight[group : group + 1, local_n : local_n + N_TILE, k0 : k0 + K_TILE], [N_TILE, K_TILE]
-            )
-            acc = pl.matmul_acc(acc, a, w, b_trans=True, init_cond=(kb == 0))
-        value = pl.cast(acc, pl.BF16, mode="rint")
-        output[t0 : t0 + M_TILE, n0 : n0 + N_TILE] = pl.set_validshape(value, rows, N_TILE)
-    return grouped_tid
-
-
-project_qa = make_projection(D, Q_LORA)
-project_qb = make_projection(Q_LORA, LOCAL_H * HEAD_DIM)
-project_kv = make_projection(D, HEAD_DIM)
-project_ob = make_projection(LOCAL_O_WIDTH, D, pl.FP32)
-normalize_q = make_norm(Q_LORA)
-normalize_kv = make_norm(HEAD_DIM)
-rotate_q = make_rope(LOCAL_H)
-rotate_kv = make_rope(1)
-rotate_output = make_rope(LOCAL_H, inverse=True)
+project_qa = make_mx_projection_with_deps(D, Q_LORA)
+project_qb = make_mx_projection_with_deps(Q_LORA, LOCAL_H * HEAD_DIM)
+project_kv = make_mx_projection_with_deps(D, HEAD_DIM)
+project_ob = make_mx_projection_with_deps(LOCAL_O_WIDTH, D, pl.FP32)
+normalize_q = make_norm_with_deps(Q_LORA, name_hint="c1a_q_rmsnorm")
+normalize_kv = make_norm_with_deps(HEAD_DIM, name_hint="c1a_kv_rmsnorm")
+rotate_q = make_rope_with_deps(LOCAL_H, name_hint="c1a_q_rope")
+rotate_kv = make_rope_with_deps(1, name_hint="c1a_kv_rope")
+rotate_output = make_rope_with_deps(LOCAL_H, inverse=True, name_hint="c1a_o_rope")
+qkv_proj_rope_with_deps = build_qkv_proj_rope_with_deps(
+    project_qa, normalize_q, project_qb, rotate_q, project_kv, normalize_kv, rotate_kv
+)
+o_proj_with_deps = build_o_proj_with_deps(
+    rotate_output, grouped_output_with_deps, project_ob
+)
 
 
 @pl.jit.inline(auto_scope=False)
@@ -444,20 +367,13 @@ def c1a_prepare(
     cache_ready: pl.Scalar[pl.TASK_ID],
 ):
     tokens = pl.tensor.dim(x, 0)
-    qa = pl.create_tensor([tokens, Q_LORA], dtype=pl.BF16)
-    qa_tid = project_qa(x, wq_a, wq_a_scale, qa, num_tokens, cache_ready)
     qr = pl.create_tensor([tokens, Q_LORA], dtype=pl.BF16)
-    qr_tid = normalize_q(qa, q_norm_weight, qr, num_tokens, qa_tid)
-    qb = pl.create_tensor([tokens, LOCAL_H * HEAD_DIM], dtype=pl.BF16)
-    qb_tid = project_qb(qr, wq_b, wq_b_scale, qb, num_tokens, qr_tid)
     q = pl.create_tensor([tokens, LOCAL_H * HEAD_DIM], dtype=pl.BF16)
-    q_tid = rotate_q(qb, rope_cos, rope_sin, q, num_tokens, qb_tid)
-    projected_kv = pl.create_tensor([tokens, HEAD_DIM], dtype=pl.BF16)
-    kv_tid = project_kv(x, wkv, wkv_scale, projected_kv, num_tokens, cache_ready)
-    normalized_kv = pl.create_tensor([tokens, HEAD_DIM], dtype=pl.BF16)
-    kvn_tid = normalize_kv(projected_kv, kv_norm_weight, normalized_kv, num_tokens, kv_tid)
     kv = pl.create_tensor([tokens, HEAD_DIM], dtype=pl.BF16)
-    kvr_tid = rotate_kv(normalized_kv, rope_cos, rope_sin, kv, num_tokens, kvn_tid)
+    qr_tid, q_tid, kvr_tid = qkv_proj_rope_with_deps(
+        x, wq_a, wq_a_scale, q_norm_weight, wq_b, wq_b_scale, wkv, wkv_scale,
+        kv_norm_weight, rope_cos, rope_sin, qr, q, kv, num_tokens, cache_ready,
+    )
     publish_window(
         kv, window_slots, window_cache, window_cache_scale, num_tokens, cache_ready, kvr_tid,
     )
@@ -591,48 +507,15 @@ def c1a_finish(
     attend_tid = attend_combined(
         query, selected, indices, sink, attended, num_tokens, gather_tid, q_ready,
     )
-    unrotated = pl.create_tensor([tokens, LOCAL_H * HEAD_DIM], dtype=pl.BF16)
-    rotate_tid = rotate_output(attended, cos, sin, unrotated, num_tokens, attend_tid)
-    latent = pl.create_tensor([tokens, LOCAL_O_WIDTH], dtype=pl.BF16)
-    grouped_tid = grouped_output(unrotated, wo_a, latent, num_tokens, rotate_tid)
     partial = pl.create_tensor([tokens, D], dtype=pl.FP32)
-    ob_tid = project_ob(latent, wo_b, wo_b_scale, partial, num_tokens, grouped_tid)
+    ob_tid = o_proj_with_deps(
+        attended, wo_a, wo_b, wo_b_scale, cos, sin, partial, num_tokens, attend_tid
+    )
     c1a_reduce(
         partial, output_window, output_arrived, output, group_base, tp_rank, num_tokens, attention_epoch,
         ob_tid,
     )
     return output
-
-
-def make_bf16_projection(width, output_width):
-    n_tile = min(128, output_width)
-    k_tile = min(256, width)
-
-    @pl.jit.inline
-    def project(
-        source: pl.Tensor[[T_DYN, width], pl.BF16],
-        weight: pl.Tensor[[width, output_width], pl.BF16],
-        output: pl.Tensor[[T_DYN, output_width], pl.BF16],
-        num_tokens: pl.Scalar[pl.INT32],
-        ready: pl.Scalar[pl.TASK_ID],
-    ):
-        with pl.spmd(32, name_hint="c1a_bf16_projection", deps=[ready]) as bf16_tid:
-            worker = pl.tile.get_block_idx()
-            for task in pl.range(worker, (num_tokens + 15) // 16 * (output_width // n_tile), 32):
-                row = task // (output_width // n_tile) * 16
-                col = task % (output_width // n_tile) * n_tile
-                rows = pl.min(16, num_tokens - row)
-                acc = pl.create_tensor([16, n_tile], dtype=pl.FP32)
-                for k in pl.range(0, width, k_tile):
-                    a = pl.slice(source, [16, k_tile], [row, k], valid_shape=[rows, k_tile])
-                    b = pl.slice(weight, [k_tile, n_tile], [k, col])
-                    acc = pl.matmul_acc(acc, a, b, init_cond=(k == 0))
-                output[row : row + 16, col : col + n_tile] = pl.set_validshape(
-                    pl.cast(acc, pl.BF16, mode="rint"), rows, n_tile
-                )
-        return bf16_tid
-
-    return project
 
 
 def make_fp4_publish(width, group, scale_dtype, cache_dim):
@@ -989,9 +872,13 @@ def official_reference_c1a(**args):
                                  index, index_scale, None, topk, candidates)
 
 
-project_index_query = make_projection(Q_LORA, INDEX_H * INDEX_DIM)
-project_index_weights = make_bf16_projection(D, INDEX_H)
-rotate_index_query = make_rope(INDEX_H, head_dim=INDEX_DIM)
+project_index_query = make_mx_projection_with_deps(Q_LORA, INDEX_H * INDEX_DIM)
+project_index_weights = make_bf16_projection_with_deps(
+    D, INDEX_H, name_hint="c1a_index_weights_projection"
+)
+rotate_index_query = make_rope_with_deps(
+    INDEX_H, head_dim=INDEX_DIM, name_hint="c1a_index_query_rope"
+)
 
 
 @pl.jit.inline
@@ -1439,12 +1326,18 @@ def golden_decode_attn_c1a_reindex(
     )
 
 
-project_compressor = make_bf16_projection(D, HEAD_DIM)
-normalize_compressor = make_norm(HEAD_DIM)
-rotate_compressor = make_rope(1)
-project_index_key = make_bf16_projection(HEAD_DIM, INDEX_DIM)
-normalize_index_key = make_norm(INDEX_DIM)
-rotate_index_key = make_rope(1, head_dim=INDEX_DIM)
+project_compressor = make_bf16_projection_with_deps(
+    D, HEAD_DIM, name_hint="c1a_compressor_projection"
+)
+normalize_compressor = make_norm_with_deps(HEAD_DIM, name_hint="c1a_compressor_rmsnorm")
+rotate_compressor = make_rope_with_deps(1, name_hint="c1a_compressor_rope")
+project_index_key = make_bf16_projection_with_deps(
+    HEAD_DIM, INDEX_DIM, name_hint="c1a_index_key_projection"
+)
+normalize_index_key = make_norm_with_deps(INDEX_DIM, name_hint="c1a_index_key_rmsnorm")
+rotate_index_key = make_rope_with_deps(
+    1, head_dim=INDEX_DIM, name_hint="c1a_index_key_rope"
+)
 publish_compressed = make_fp4_publish(HEAD_DIM, 16, pl.FP8E4M3FN, CMP_BLOCKS_DYN)
 publish_index = make_fp4_publish(INDEX_DIM, 32, pl.FP8E8M0, INDEX_BLOCKS_DYN)
 

@@ -30,11 +30,9 @@ import pypto.language.distributed as pld
 import torch
 
 from models.deepseek_v4_1_flash import config as C
+from models.deepseek_v4_1_flash.attention_ops import make_bf16_projection, make_norm, make_rope
+from models.deepseek_v4_1_flash.qkv_proj_rope import q_proj_qr
 from models.deepseek_v4_1_flash.prefill_c1a_common import (
-    make_bf16_projection,
-    make_norm,
-    make_projection,
-    make_rope,
     prefill_c1a_partial,
     publish_compressed_cache,
     publish_index_cache,
@@ -103,8 +101,6 @@ rotate_compressed = make_rope(1)
 project_index_key = make_bf16_projection(C.HEAD_DIM, C.INDEX_DIM)
 normalize_index_key = make_norm(C.INDEX_DIM)
 rotate_index_key = make_rope(1, head_dim=C.INDEX_DIM, rope_dim=C.ROPE_DIM)
-project_index_latent = make_projection(C.D, C.Q_LORA)
-normalize_index_latent = make_norm(C.Q_LORA)
 paged_indexer = make_paged_indexer()
 paged_indexer_direct = make_paged_indexer(direct_topk=True)
 
@@ -300,10 +296,8 @@ def make_prefill_c1a_full(indexer):
             num_tokens,
         )
 
-        index_projection_a = pl.create_tensor([tokens, Q_LORA], dtype=pl.BF16)
-        project_index_latent(x, wq_a, wq_a_scale, index_projection_a, num_tokens)
         query_latent = pl.create_tensor([tokens, Q_LORA], dtype=pl.BF16)
-        normalize_index_latent(index_projection_a, q_norm_weight, query_latent, num_tokens)
+        q_proj_qr(x, wq_a, wq_a_scale, q_norm_weight, query_latent, num_tokens)
         score_width = (positions + TOPK_LEAF - 1) // TOPK_LEAF * TOPK_LEAF
         index_scores = pl.create_tensor([tokens, score_width], dtype=pl.FP32)
         indexer(

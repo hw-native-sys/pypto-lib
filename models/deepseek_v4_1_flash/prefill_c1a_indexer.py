@@ -21,7 +21,7 @@ from models.deepseek_v4_1_flash.config import (
     ROPE_DIM,
     T_DYN,
 )
-from models.deepseek_v4_1_flash.prefill_c1a_common import K_TILE, M_TILE, make_projection, make_rope
+from models.deepseek_v4_1_flash.attention_ops import K_TILE, M_TILE, make_mx_projection, make_rope
 
 
 INDEX_SCORE_SCALE = INDEX_DIM ** -0.5 * INDEX_H ** -0.5
@@ -35,7 +35,7 @@ TOPK_GROUP_LEAVES = 2
 TOPK_GROUPS_PER_TOKEN = (TOPK_MAX_LEAVES + TOPK_GROUP_LEAVES - 1) // TOPK_GROUP_LEAVES
 
 
-project_index_query = make_projection(Q_LORA, INDEX_H * INDEX_DIM)
+project_index_query = make_mx_projection(Q_LORA, INDEX_H * INDEX_DIM)
 rotate_index_query = make_rope(INDEX_H, head_dim=INDEX_DIM, rope_dim=ROPE_DIM)
 
 

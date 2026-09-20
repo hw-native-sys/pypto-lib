@@ -61,9 +61,20 @@ Once a kernel body lands, its owner can extend the same file with the thin
 | Hierarchical indexer | `hierarchical_sparse_indexer.py` |
 | Hyper-connections | `hc_mixes.py`, `hc_pre.py`, `hc_post.py` |
 | Attention TP transports | `attention_tp.py` |
+| Shared Attention primitives | `attention_ops.py` (`make_mx_projection`, BF16 projection, RMSNorm, RoPE, and dependency-aware variants) |
+| Shared Q/KV preprocessing | `qkv_proj_rope.py` (`q_proj_qr`, `q_proj_rope`, `kv_proj_rope`, `qkv_proj_rope` and Prefill variants) |
+| Shared output projection | `o_proj.py` (`grouped_output`, `o_proj`, `prefill_o_proj`) |
 | Expert parallelism | `moe.py` |
 | Shared configuration and goldens | `config.py`, `metadata.py`, `golden.py`, `attention_common.py` |
 | Quantization and RoPE tables | `quantization.py`, `rope_tables.py` |
+
+SWA, C2A, and C1A use the shared Attention primitives and stage compositions
+above. Decode C1A selects the dependency-aware variants because their explicit
+TaskId edges are part of the hardware schedule, while retaining its distinct MX
+projection implementation. It also uses `qkv_proj_rope_with_deps` and
+`o_proj_with_deps` as the shared composition boundaries. The specialized
+Prefill SWA Q-A projection also remains in
+`qkv_proj_rope.py` because it preserves that path's group-32 scale decoding.
 
 ## Decode composition
 

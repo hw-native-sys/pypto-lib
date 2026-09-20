@@ -56,26 +56,10 @@ from models.deepseek_v4_1_flash.config import (
     TP_SIZE,
     AttentionMode,
 )
-from models.deepseek_v4_1_flash.decode_attn_swa import (
-    EPS,
-    K_TILE,
-    M_TILE,
-    N_TILE,
-    SOFTMAX_SCALE,
-    grouped_output,
-    make_projection,
-    make_rope,
-    normalize_kv,
-    normalize_q,
-    project_kv,
-    project_ob,
-    project_qa,
-    project_qb,
-    publish_window,
-    rotate_kv,
-    rotate_output,
-    rotate_q,
-)
+from models.deepseek_v4_1_flash.attention_ops import EPS, K_TILE, M_TILE, N_TILE, make_mx_projection, make_rope
+from models.deepseek_v4_1_flash.decode_attn_swa import SOFTMAX_SCALE, publish_window
+from models.deepseek_v4_1_flash.o_proj import o_proj
+from models.deepseek_v4_1_flash.qkv_proj_rope import qkv_proj_rope
 from models.deepseek_v4_1_flash.metadata import paged_slots, window_metadata
 from models.deepseek_v4_1_flash.quantization import (
     decode_e8m0,
@@ -729,7 +713,7 @@ def attend_sparse(
         result = pl.row_expand_mul(numerator, pl.reshape(pl.div(correction, denominator), [M_TILE, 1]))
         output_flat[q0 : q0 + M_TILE, :] = pl.cast(result, pl.BF16, mode="rint")
     return attend_tid
-project_index_q = make_projection(Q_LORA, INDEX_H * INDEX_DIM)
+project_index_q = make_mx_projection(Q_LORA, INDEX_H * INDEX_DIM)
 rotate_compressed = make_rope(1)
 rotate_index_key = make_wide_rope(1, INDEX_DIM)
 rotate_index_query = make_wide_rope(INDEX_H, INDEX_DIM)
@@ -786,21 +770,13 @@ def c2a_full_partial(
     """Write the FP32 local output and publish this layer's compressed and index caches."""
     tokens = pl.tensor.dim(x, 0)
 
-    qa = pl.create_tensor([tokens, Q_LORA], dtype=pl.BF16)
-    project_qa(x, wq_a, wq_a_scale, qa, num_tokens)
     qr = pl.create_tensor([tokens, Q_LORA], dtype=pl.BF16)
-    normalize_q(qa, q_norm_weight, qr, num_tokens)
-    qb = pl.create_tensor([tokens, LOCAL_H * HEAD_DIM], dtype=pl.BF16)
-    project_qb(qr, wq_b, wq_b_scale, qb, num_tokens)
     query = pl.create_tensor([tokens, LOCAL_H * HEAD_DIM], dtype=pl.BF16)
-    rotate_q(qb, rope_cos, rope_sin, query, num_tokens)
-
-    kv_projection = pl.create_tensor([tokens, HEAD_DIM], dtype=pl.BF16)
-    project_kv(x, wkv, wkv_scale, kv_projection, num_tokens)
-    kv_normalized = pl.create_tensor([tokens, HEAD_DIM], dtype=pl.BF16)
-    normalize_kv(kv_projection, kv_norm_weight, kv_normalized, num_tokens)
     window_kv = pl.create_tensor([tokens, HEAD_DIM], dtype=pl.BF16)
-    rotate_kv(kv_normalized, rope_cos, rope_sin, window_kv, num_tokens)
+    qkv_proj_rope(
+        x, wq_a, wq_a_scale, q_norm_weight, wq_b, wq_b_scale, wkv, wkv_scale,
+        kv_norm_weight, rope_cos, rope_sin, qr, query, window_kv, num_tokens,
+    )
     publish_window(window_kv, window_slots, window_cache, window_cache_scale, num_tokens, cache_ready)
 
     compressor_kv = pl.create_tensor([tokens, HEAD_DIM], dtype=pl.FP32)
@@ -857,11 +833,7 @@ def c2a_full_partial(
             query, selected, combined, attn_sink, attended, start, active, gather_tid
         )
 
-    unrotated = pl.create_tensor([tokens, LOCAL_H * HEAD_DIM], dtype=pl.BF16)
-    rotate_output(attended, rope_cos, rope_sin, unrotated, num_tokens)
-    output_latent = pl.create_tensor([tokens, LOCAL_O_WIDTH], dtype=pl.BF16)
-    grouped_output(unrotated, wo_a, output_latent, num_tokens)
-    project_ob(output_latent, wo_b, wo_b_scale, partial, num_tokens)
+    o_proj(attended, wo_a, wo_b, wo_b_scale, rope_cos, rope_sin, partial, num_tokens)
     return chunk_done
 def golden_decode_attn_c2a_full(
     x: torch.Tensor,

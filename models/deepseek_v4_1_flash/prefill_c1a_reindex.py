@@ -30,11 +30,8 @@ import pypto.language.distributed as pld
 import torch
 
 from models.deepseek_v4_1_flash import config as C
-from models.deepseek_v4_1_flash.prefill_c1a_common import (
-    make_norm,
-    make_projection,
-    prefill_c1a_partial,
-)
+from models.deepseek_v4_1_flash.prefill_c1a_common import prefill_c1a_partial
+from models.deepseek_v4_1_flash.qkv_proj_rope import q_proj_qr
 from models.deepseek_v4_1_flash.prefill_c1a_indexer import TOPK_LEAF, make_paged_indexer
 from models.deepseek_v4_1_flash.prefill_c1a_test_utils import (
     CASE_DEFAULT,
@@ -84,8 +81,6 @@ REINDEX_INPUT_NAMES = COMMON_INPUT_NAMES + (
 if TP_SIZE not in (1, 2, 4):
     raise ValueError("Prefill C1A currently supports TP1, TP2, and TP4; TP8 requires head-tile padding")
 
-project_index_latent = make_projection(C.D, C.Q_LORA)
-normalize_index_latent = make_norm(C.Q_LORA)
 paged_indexer = make_paged_indexer(use_candidates=True)
 paged_indexer_direct = make_paged_indexer(use_candidates=True, direct_topk=True)
 
@@ -223,10 +218,8 @@ def make_prefill_c1a_reindex(indexer):
         tokens = pl.tensor.dim(x, 0)
         positions = pl.tensor.dim(candidate_mask, 1)
 
-        index_projection_a = pl.create_tensor([tokens, Q_LORA], dtype=pl.BF16)
-        project_index_latent(x, wq_a, wq_a_scale, index_projection_a, num_tokens)
         query_latent = pl.create_tensor([tokens, Q_LORA], dtype=pl.BF16)
-        normalize_index_latent(index_projection_a, q_norm_weight, query_latent, num_tokens)
+        q_proj_qr(x, wq_a, wq_a_scale, q_norm_weight, query_latent, num_tokens)
         score_width = (positions + TOPK_LEAF - 1) // TOPK_LEAF * TOPK_LEAF
         index_scores = pl.create_tensor([tokens, score_width], dtype=pl.FP32)
         cache_ready = pl.system.task_dummy(deps=[])
