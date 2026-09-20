@@ -196,16 +196,22 @@ def engram(
     for block in pl.spmd(t_blocks * n_blocks, name_hint="engram_matmul"):
         t0 = (block // n_blocks) * T_TILE
         n0 = (block % n_blocks) * N_TILE
+        valid_rows = pl.min(T_TILE, t_dim - t0)
 
         # gather the 24 n-gram rows for this token tile into [T_TILE, 6144]
         lookup = pl.create_tensor([T_TILE, ENGRAM_K], dtype=pl.BF16)
         for c in pl.range(N_HASH_COLS):
             for tt in pl.range(T_TILE):
-                row = pl.read(hash_ids, [t0 + tt, c])
-                row = pl.max(0, pl.min(NUM_EMBEDDINGS - 1, row))
-                lookup[tt : tt + 1, c * HEAD_DIM : (c + 1) * HEAD_DIM] = engram_table[
-                    row : row + 1, 0:HEAD_DIM
-                ]
+                if t0 + tt < t_dim:
+                    row = pl.read(hash_ids, [t0 + tt, c])
+                    row = pl.max(0, pl.min(NUM_EMBEDDINGS - 1, row))
+                    lookup[tt : tt + 1, c * HEAD_DIM : (c + 1) * HEAD_DIM] = engram_table[
+                        row : row + 1, 0:HEAD_DIM
+                    ]
+                else:
+                    lookup[tt : tt + 1, c * HEAD_DIM : (c + 1) * HEAD_DIM] = pl.full(
+                        [1, HEAD_DIM], dtype=pl.BF16, value=0.0
+                    )
 
         # matmul: [T,6144] @ [6144,N_TILE], bf16 in, fp32 acc
         acc = pl.create_tensor([T_TILE, N_TILE], dtype=pl.FP32)
@@ -214,7 +220,7 @@ def engram(
             a_tile = pl.slice(lookup, [T_TILE, K_TILE], [0, k0])
             w_tile = pl.slice(wkv_weight, [K_TILE, N_TILE], [k0, n0])
             acc = pl.matmul_acc(acc, a_tile, w_tile, init_cond=(kb == 0))
-        kv = pl.assemble(kv, acc, [t0, n0])
+        kv[t0 : t0 + T_TILE, n0 : n0 + N_TILE] = pl.set_validshape(acc, valid_rows, N_TILE)
 
     # ---- Stage 2: per (token block, hc copy) gate and residual add
     engram_gate(kv, weight, x, out)
@@ -288,21 +294,29 @@ def engram_tp(
     lookup_partial = pl.create_tensor([t_dim, ENGRAM_K], dtype=pl.BF16)
     with pl.spmd(t_blocks, name_hint="engram_tp_gather") as gather_tid:
         t0 = pl.tile.get_block_idx() * T_TILE
+        valid_rows = pl.min(T_TILE, t_dim - t0)
         lookup = pl.create_tensor([T_TILE, ENGRAM_K], dtype=pl.BF16)
         for c in pl.range(N_HASH_COLS):
             for tt in pl.range(T_TILE):
-                row = pl.read(hash_ids, [t0 + tt, c])
-                local = row - my_rank * ROWS_PER_RANK
-                clamped = pl.max(0, pl.min(ROWS_PER_RANK - 1, local))
-                if local >= 0 and local < ROWS_PER_RANK:
-                    lookup[tt : tt + 1, c * HEAD_DIM : (c + 1) * HEAD_DIM] = engram_table[
-                        clamped : clamped + 1, 0:HEAD_DIM
-                    ]
+                if t0 + tt < t_dim:
+                    row = pl.read(hash_ids, [t0 + tt, c])
+                    local = row - my_rank * ROWS_PER_RANK
+                    clamped = pl.max(0, pl.min(ROWS_PER_RANK - 1, local))
+                    if local >= 0 and local < ROWS_PER_RANK:
+                        lookup[tt : tt + 1, c * HEAD_DIM : (c + 1) * HEAD_DIM] = engram_table[
+                            clamped : clamped + 1, 0:HEAD_DIM
+                        ]
+                    else:
+                        lookup[tt : tt + 1, c * HEAD_DIM : (c + 1) * HEAD_DIM] = pl.full(
+                            [1, HEAD_DIM], dtype=pl.BF16, value=0.0
+                        )
                 else:
                     lookup[tt : tt + 1, c * HEAD_DIM : (c + 1) * HEAD_DIM] = pl.full(
                         [1, HEAD_DIM], dtype=pl.BF16, value=0.0
                     )
-        lookup_partial[t0 : t0 + T_TILE, 0:ENGRAM_K] = lookup
+        lookup_partial[t0 : t0 + T_TILE, 0:ENGRAM_K] = pl.set_validshape(
+            lookup, valid_rows, ENGRAM_K
+        )
 
     # Publish this rank's partial lookup into its own window slice, then barrier.
     with pl.at(
@@ -352,6 +366,7 @@ def engram_tp(
         block = pl.tile.get_block_idx()
         t0 = (block // n_blocks) * T_TILE
         n0 = (block % n_blocks) * N_TILE
+        valid_rows = pl.min(T_TILE, t_dim - t0)
         a0 = pl.load(
             lookup_window,
             [t0, 0],
@@ -389,7 +404,7 @@ def engram_tp(
                     )
             w_tile = pl.load(wkv_weight, [k0, n0], [K_TILE, N_TILE])
             acc = pl.matmul_acc(acc, a_tile, w_tile)
-        pl.store(acc, [t0, n0], kv)
+        pl.store(pl.set_validshape(acc, valid_rows, N_TILE), [t0, n0], kv)
 
     # ---- Stage 2: per (token block, hc copy) gate and residual add
     engram_gate(kv, weight, x, out)
