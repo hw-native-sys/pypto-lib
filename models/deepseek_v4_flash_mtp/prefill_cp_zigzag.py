@@ -22,7 +22,7 @@ TAIL_ROWS = 128
 HEAD_DIM = M.head_dim
 
 # CP layout
-CP_CHOICES = (1, 2, 4, 8)
+CP_CHOICES = (1, 2, 4, 8, 16)
 CP_DEFAULT = 2
 MAX_SEGMENT_TILES = 4
 EPOCHS = 1

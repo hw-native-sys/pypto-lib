@@ -6,7 +6,7 @@
   },
   "cases": [
     {
-      "case_id": "mtp-csa-8k",
+      "case_id": "dsv4-flash-mtp-decode-csa-8k",
       "entrypoint": "models/deepseek_v4_flash_mtp/decode_csa.py",
       "device_count": 1,
       "arguments": [
@@ -15,7 +15,7 @@
       ]
     },
     {
-      "case_id": "mtp-hca-8k",
+      "case_id": "dsv4-flash-mtp-decode-hca-8k",
       "entrypoint": "models/deepseek_v4_flash_mtp/decode_hca.py",
       "device_count": 1,
       "arguments": [
@@ -24,7 +24,7 @@
       ]
     },
     {
-      "case_id": "mtp-swa-8k",
+      "case_id": "dsv4-flash-mtp-decode-swa-8k",
       "entrypoint": "models/deepseek_v4_flash_mtp/decode_swa.py",
       "device_count": 1,
       "arguments": [
@@ -33,7 +33,7 @@
       ]
     },
     {
-      "case_id": "mtp-moe-ep16",
+      "case_id": "dsv4-flash-mtp-decode-moe-ep16",
       "entrypoint": "models/deepseek_v4_flash_mtp/decode_moe.py",
       "device_count": 16,
       "arguments": [
@@ -49,7 +49,7 @@
       ]
     },
     {
-      "case_id": "mtp-lm-head-tp4",
+      "case_id": "dsv4-flash-mtp-decode-lm-head-tp4",
       "entrypoint": "models/deepseek_v4_flash_mtp/lm_head.py",
       "device_count": 4,
       "arguments": [
@@ -64,7 +64,7 @@
       ]
     },
     {
-      "case_id": "mtp-csa-128k",
+      "case_id": "dsv4-flash-mtp-decode-csa-128k",
       "entrypoint": "models/deepseek_v4_flash_mtp/decode_csa.py",
       "device_count": 1,
       "arguments": [
@@ -73,7 +73,7 @@
       ]
     },
     {
-      "case_id": "mtp-hca-128k",
+      "case_id": "dsv4-flash-mtp-decode-hca-128k",
       "entrypoint": "models/deepseek_v4_flash_mtp/decode_hca.py",
       "device_count": 1,
       "arguments": [
@@ -82,7 +82,7 @@
       ]
     },
     {
-      "case_id": "mtp-swa-128k",
+      "case_id": "dsv4-flash-mtp-decode-swa-128k",
       "entrypoint": "models/deepseek_v4_flash_mtp/decode_swa.py",
       "device_count": 1,
       "arguments": [
@@ -91,7 +91,55 @@
       ]
     },
     {
-      "case_id": "dspark-csa-8k",
+      "case_id": "dsv4-flash-mtp-prefill-csa-cp16-8k",
+      "entrypoint": "models/deepseek_v4_flash_mtp/prefill_csa.py",
+      "device_count": 16,
+      "arguments": [
+        "--cp",
+        "16",
+        "--num-tokens",
+        "8192"
+      ]
+    },
+    {
+      "case_id": "dsv4-flash-mtp-prefill-hca-cp16-8k",
+      "entrypoint": "models/deepseek_v4_flash_mtp/prefill_hca.py",
+      "device_count": 16,
+      "arguments": [
+        "--cp",
+        "16",
+        "--num-tokens",
+        "8192"
+      ]
+    },
+    {
+      "case_id": "dsv4-flash-mtp-prefill-swa-cp16-8k",
+      "entrypoint": "models/deepseek_v4_flash_mtp/prefill_swa.py",
+      "device_count": 16,
+      "arguments": [
+        "--cp",
+        "16",
+        "--num-tokens",
+        "8192"
+      ]
+    },
+    {
+      "case_id": "dsv4-flash-mtp-prefill-moe-ep16",
+      "entrypoint": "models/deepseek_v4_flash_mtp/prefill_moe.py",
+      "device_count": 16,
+      "arguments": [
+        "--ep",
+        "16",
+        "--layer-id",
+        "0",
+        "--tokens",
+        "1024",
+        "--num-tokens",
+        "512"
+      ]
+    },
+    {
+      "case_id": "dsv4-flash-dspark-decode-csa-8k",
       "entrypoint": "models/deepseek_v4_flash_dspark/decode_csa.py",
       "device_count": 1,
       "arguments": [
@@ -102,7 +150,7 @@
       ]
     },
     {
-      "case_id": "dspark-hca-8k",
+      "case_id": "dsv4-flash-dspark-decode-hca-8k",
       "entrypoint": "models/deepseek_v4_flash_dspark/decode_hca.py",
       "device_count": 1,
       "arguments": [
@@ -113,7 +161,7 @@
       ]
     },
     {
-      "case_id": "dspark-swa-8k",
+      "case_id": "dsv4-flash-dspark-decode-swa-8k",
       "entrypoint": "models/deepseek_v4_flash_dspark/decode_swa.py",
       "device_count": 1,
       "arguments": [
@@ -124,7 +172,7 @@
       ]
     },
     {
-      "case_id": "dspark-moe-ep16",
+      "case_id": "dsv4-flash-dspark-decode-moe-ep16",
       "entrypoint": "models/deepseek_v4_flash_dspark/moe.py",
       "device_count": 16,
       "arguments": [
@@ -139,7 +187,7 @@
       ]
     },
     {
-      "case_id": "dspark-lm-head-tp4",
+      "case_id": "dsv4-flash-dspark-decode-lm-head-tp4",
       "entrypoint": "models/deepseek_v4_flash_dspark/lm_head.py",
       "device_count": 4,
       "arguments": [
@@ -154,7 +202,7 @@
       ]
     },
     {
-      "case_id": "dspark-csa-128k",
+      "case_id": "dsv4-flash-dspark-decode-csa-128k",
       "entrypoint": "models/deepseek_v4_flash_dspark/decode_csa.py",
       "device_count": 1,
       "arguments": [
@@ -165,7 +213,7 @@
       ]
     },
     {
-      "case_id": "dspark-hca-128k",
+      "case_id": "dsv4-flash-dspark-decode-hca-128k",
       "entrypoint": "models/deepseek_v4_flash_dspark/decode_hca.py",
       "device_count": 1,
       "arguments": [
@@ -176,7 +224,7 @@
       ]
     },
     {
-      "case_id": "dspark-swa-128k",
+      "case_id": "dsv4-flash-dspark-decode-swa-128k",
       "entrypoint": "models/deepseek_v4_flash_dspark/decode_swa.py",
       "device_count": 1,
       "arguments": [

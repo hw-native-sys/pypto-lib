@@ -8,11 +8,13 @@
 # -----------------------------------------------------------------------------------------------------------
 # ci: devices=2
 """DeepSeek-V4 MoE single-layer (prefill), FLASH preset. --ep picks the EP world
-size: 2/4/8 run N-rank distributed; each rank keeps 32 experts."""
+size: 2/4/8/16 run N-rank distributed; each rank keeps 32 experts. --tokens picks
+the per-rank token capacity."""
 
 
 # Sub-kernels freeze EP_WORLD_SIZE / n_routed_experts into their shapes at import
 # time, so read --ep from argv and override config before importing them below.
+# --tokens is read the same way: it sizes this module's own tensors.
 import dataclasses
 import sys
 
@@ -20,18 +22,19 @@ import config
 
 _EP_CHOICES = (2, 4, 8, 16)
 _EP_DEFAULT = 2
+_TOKENS_DEFAULT = config.PREFILL_TOKENS
 
 
-def _parse_ep_argv():
+def _parse_argv_int(flag: str, default: int) -> int:
     for i, tok in enumerate(sys.argv):
-        if tok == "--ep" and i + 1 < len(sys.argv):
+        if tok == flag and i + 1 < len(sys.argv):
             return int(sys.argv[i + 1])
-        if tok.startswith("--ep="):
+        if tok.startswith(f"{flag}="):
             return int(tok.split("=", 1)[1])
-    return _EP_DEFAULT
+    return default
 
 
-EP = _parse_ep_argv()
+EP = _parse_argv_int("--ep", _EP_DEFAULT)
 
 config.FLASH = dataclasses.replace(
     config.FLASH, n_routed_experts=config.FLASH.n_routed_experts // config.EP_WORLD_SIZE * EP
@@ -42,7 +45,7 @@ import pypto.language as pl
 import pypto.language.distributed as pld
 from pypto.ir import DistributedConfig
 
-from config import FLASH as M, EP_WORLD_SIZE, INT8_AMAX_EPS, INT8_SCALE_MAX, PREFILL_TOKENS
+from config import FLASH as M, EP_WORLD_SIZE, INT8_AMAX_EPS, INT8_SCALE_MAX
 from hc_pre import hc_pre
 from hc_post import hc_post
 from gate import gate
@@ -53,7 +56,9 @@ from expert_routed import (
 )
 
 
-T = PREFILL_TOKENS  # standalone test capacity; production callers pick their own layout
+# Per-rank capacity. --tokens picks a serving layout's share: a single 8192-token
+# batch over EP16 is 512 rows per rank.
+T = _parse_argv_int("--tokens", _TOKENS_DEFAULT)
 D = M.hidden_size
 TOPK = M.num_experts_per_tok
 VOCAB = M.vocab_size
@@ -1707,6 +1712,8 @@ if __name__ == "__main__":
     parser.add_argument("-d", "--device", type=str, default=",".join(str(i) for i in range(N_RANKS)),
                         help=f"comma-separated device ids (need {N_RANKS})")
     parser.add_argument("--layer-id", type=int, default=0)
+    parser.add_argument("--tokens", type=int, default=T,
+                        help=f"per-rank token capacity, read at import time (default {T})")
     parser.add_argument("--num-tokens", type=int, default=T,
                         help=f"active token count for MoE dispatch/combine (0..{T})")
     parser.add_argument("--enable-chip-swimlane", type=int, nargs="?", const=1, default=0, choices=range(5))

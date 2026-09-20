@@ -737,7 +737,7 @@ jobs:
   operator-performance:
     name: MTP and DSpark operator performance (a2a3)
     runs-on: [self-hosted, linux, arm64, npu]
-    # Sixteen serial task-submit cases, each bounded by --timeout 3600.
+    # Twenty serial task-submit cases, each bounded by --timeout 3600.
     timeout-minutes: 300
     concurrency:
       group: operator-performance-a2a3
