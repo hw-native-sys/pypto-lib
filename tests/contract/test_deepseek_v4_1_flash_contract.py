@@ -102,3 +102,67 @@ def test_swa_public_names_match_file_ownership():
     assert not hasattr(decode_attn_swa, "golden_decode_swa")
     assert decode_swa.ATTENTION_GOLDEN is decode_attn_swa.golden_decode_attn_swa
     assert not hasattr(decode_swa, "GOLDEN")
+
+
+def test_c2a_full_composition_is_split_from_leaf():
+    composition = _tree("decode_c2a_full.py")
+    calls = _call_names(_function(composition, "decode_c2a_full"))
+    assert [
+        name for name in calls if name in ("attention_pre", "decode_attn_c2a_full", "mhc_post")
+    ] == ["attention_pre", "decode_attn_c2a_full", "mhc_post"]
+    assert (MODEL_DIR / "decode_attn_c2a_full.py").is_file()
+
+
+def test_c2a_full_composition_keeps_leaf_call_contract():
+    composition = _function(_tree("decode_c2a_full.py"), "decode_c2a_full")
+    call = next(
+        node
+        for node in ast.walk(composition)
+        if isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Name)
+        and node.func.id == "decode_attn_c2a_full"
+    )
+    parameters = _function(_tree("decode_attn_c2a_full.py"), "decode_attn_c2a_full").args.args
+    overrides = {
+        "x": "normalized_attention",
+        "compressed_indices": "topk_indices",
+        "output": "attention_output",
+    }
+    assert [ast.unparse(argument) for argument in call.args] == [
+        overrides.get(parameter.arg, parameter.arg) for parameter in parameters
+    ]
+
+
+def test_c2a_full_composition_has_explicit_abi_and_ci_entry():
+    source = (MODEL_DIR / "decode_c2a_full.py").read_text()
+    assert "# ci: no-sim" in source
+    assert "# ci: a5" in source
+    tree = ast.parse(source)
+    for name in ("decode_c2a_full", "decode_c2a_full_rank"):
+        annotations = [ast.unparse(argument.annotation) for argument in _function(tree, name).args.args]
+        assert all(annotation != "pl.Tensor" for annotation in annotations)
+    production = _function(tree, "decode_c2a_full")
+    assert all("pl.InOut" not in ast.unparse(argument.annotation) for argument in production.args.args)
+    assert all("pl.Out" not in ast.unparse(argument.annotation) for argument in production.args.args)
+
+
+def test_c2a_full_rank_forwards_the_production_contract():
+    tree = _tree("decode_c2a_full.py")
+    production = _function(tree, "decode_c2a_full")
+    rank = _function(tree, "decode_c2a_full_rank")
+    production_args = [argument.arg for argument in production.args.args]
+    assert [argument.arg for argument in rank.args.args] == production_args
+    call = next(node for node in ast.walk(rank) if isinstance(node, ast.Call))
+    assert [ast.unparse(argument) for argument in call.args] == production_args
+
+
+@requires_pypto
+def test_c2a_full_public_names_match_file_ownership():
+    from models.deepseek_v4_1_flash import decode_attn_c2a_full, decode_c2a_full
+
+    assert decode_attn_c2a_full.decode_attn_c2a_full
+    assert decode_attn_c2a_full.golden_decode_attn_c2a_full
+    assert not hasattr(decode_attn_c2a_full, "decode_c2a_full")
+    assert not hasattr(decode_attn_c2a_full, "golden_decode_c2a_full")
+    assert decode_c2a_full.ATTENTION_GOLDEN is decode_attn_c2a_full.golden_decode_attn_c2a_full
+    assert not hasattr(decode_c2a_full, "GOLDEN")

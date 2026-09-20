@@ -27,7 +27,7 @@ from models.deepseek_v4_1_flash.config import (
     CMP_BLOCKS_DYN, D, HC_MULT, HEAD_DIM, LOCAL_H, LOCAL_O_WIDTH,
     ORI_BLOCKS_DYN, Q_LORA, T_DYN, TP_SIZE,
 )
-from models.deepseek_v4_1_flash.decode_c2a_full import CMP_PACKED, CMP_SCALES
+from models.deepseek_v4_1_flash.decode_attn_c2a_full import CMP_PACKED, CMP_SCALES
 from models.deepseek_v4_1_flash.hc_post import mhc_post
 from models.deepseek_v4_1_flash.prefill_c2a_full import attention_hc_pre, run_prefill_c2a
 from models.deepseek_v4_1_flash.prefill_attn_c2a_reuse import prefill_attn_c2a_reuse

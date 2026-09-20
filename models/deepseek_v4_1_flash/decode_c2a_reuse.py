@@ -45,7 +45,7 @@ from models.deepseek_v4_1_flash.config import (
     T_DYN,
     TP_SIZE,
 )
-from models.deepseek_v4_1_flash.decode_c2a_full import (
+from models.deepseek_v4_1_flash.decode_attn_c2a_full import (
     ATTEND_TILE,
     CMP_GROUP,
     CMP_PACKED,

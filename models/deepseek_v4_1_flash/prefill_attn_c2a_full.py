@@ -27,7 +27,7 @@ from models.deepseek_v4_1_flash import config as C
 from models.deepseek_v4_1_flash.attention_common import AttentionGoldenResult, golden_compressed_attention
 from models.deepseek_v4_1_flash.attention_tp import prefill_tp_output_all_reduce
 from models.deepseek_v4_1_flash.config import D, TP_SIZE, AttentionMode
-from models.deepseek_v4_1_flash.decode_c2a_full import c2a_full_partial, run_c2a
+from models.deepseek_v4_1_flash.decode_attn_c2a_full import c2a_full_partial, run_c2a
 
 
 def golden_prefill_attn_c2a_full(

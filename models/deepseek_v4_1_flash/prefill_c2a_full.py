@@ -59,7 +59,7 @@ from models.deepseek_v4_1_flash.config import (
     TABLE_DYN,
     TP_SIZE,
 )
-from models.deepseek_v4_1_flash.decode_c2a_full import (
+from models.deepseek_v4_1_flash.decode_attn_c2a_full import (
     CACHE_SLOTS,
     CMP_PACKED,
     CMP_SCALES,
