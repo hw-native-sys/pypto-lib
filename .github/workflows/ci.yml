@@ -213,7 +213,8 @@ jobs:
           fi
           # a5sim carries examples only. Models are validated on a2a3 and
           # a2a3sim; A5 model coverage is the a5-v41-flash job below for the
-          # V4.1-Flash operators and the daily model-tests-a5 sweep for V4-Pro.
+          # V4.1-Flash entries this change reaches, and the daily
+          # model-tests-a5 sweep for all of them.
           if [ "${{ matrix.platform }}" = "a5sim" ]; then
             FILES=$(printf '%s\n' $FILES | grep '^examples/' || true)
           fi
@@ -361,8 +362,7 @@ jobs:
     # operators. They are A5-only and hide the `__main__` sentinel so the a2a3
     # and sim sweeps never pick them up; detect-changes selects them by the
     # `# ci: a5` marker instead, and only the ones this pull request's own
-    # change reaches. Unlike the nightly model-tests-a5 (report-only while
-    # V4-Pro sits at 13/35 on device) these are green, so this job gates.
+    # change reaches; the nightly model-tests-a5 sweeps the whole set.
     if: >-
       github.event_name == 'pull_request' &&
       needs.detect-changes.outputs.a5_files != ''

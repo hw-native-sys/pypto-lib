@@ -68,6 +68,12 @@ jobs:
           build-namespace: ${{ matrix.platform }}
           pip-cache-name: pip-sim
           toolchain: bundle
+          # a5sim is the MXFP8 leg: both A5 trees hold every MX scale in a
+          # torch.float8_e8m0fnu tensor, which 2.6 does not have. 20 of the 24
+          # a5sim failures in the 2026-09-19 nightly were that one
+          # AttributeError, raised before anything compiled. a2a3sim keeps the
+          # default, which is the version the serving torch_npu pin requires.
+          torch-version: ${{ matrix.platform == 'a5sim' && 'torch==2.10.0' || 'torch==2.6.0' }}
 
       - name: Run model tests (${{ matrix.platform }})
         id: sweep
@@ -107,9 +113,15 @@ jobs:
           # `# ci: no-sim` (full multi-layer / multi-card forwards) are
           # device-only and would just argparse-reject *sim, so skip them here.
           for f in $(find models -name '*.py' ! -name '*_draft.py' | sort); do
-            # Pro runs on a5sim; V4.1 Flash has separate A5 device coverage.
+            # a5sim takes both A5 trees; the a2a3 legs take neither. Of the
+            # V4.1-Flash directory it keeps whatever a simulator can run: the
+            # `# ci: a5` device entries split the `__main__` sentinel and carry
+            # `# ci: no-sim`, so the two filters below drop them, which leaves
+            # the MoE, gate, expert and transport files. Those declare a5sim
+            # among their own `-p` choices and have had no daily run since the
+            # A2/A3 sweeps stopped taking this directory.
             if [ "${{ matrix.platform }}" = "a5sim" ]; then
-              [[ "$f" == models/deepseek_v4_pro/* ]] || continue
+              [[ "$f" == models/deepseek_v4_pro/* || "$f" == models/deepseek_v4_1_flash/* ]] || continue
             elif [[ "$f" == models/deepseek_v4_pro/* || "$f" == models/deepseek_v4_1_flash/* ]]; then
               continue
             fi
@@ -301,31 +313,30 @@ jobs:
 
   model-tests-a5:
     if: ${{ !inputs.performance_only }}
-    # Report-only. A measured sweep puts V4-Pro at 13/35 on A5: 13 cases die
-    # with `sync_stream_pair: aclrtSync` device faults, 2 with `rtMalloc failed:
-    # 207001`, 7 on numerics. Those are pypto/device-side rather than defects in
-    # this repo's kernels, so gating on them would paint the workflow red every
-    # night — which is exactly what has made model-tests-sim's daily failure
-    # invisible. The V4-Pro table is published either way, so the coverage is
-    # real even though the check does not block. Flip this off once the A5
-    # blockers land and the sweep is green.
-    continue-on-error: true
-    # Real Ascend 950 (A5) device job — the dedicated daily coverage of the
-    # DeepSeek V4-Pro variant (the Pro preset in models/deepseek_v4_pro/). Mirrors
-    # model-tests-a2a3 but runs -p a5 on the npu-a5 self-hosted runner and
-    # sweeps ONLY Pro: Pro is covered by a5sim above but remains excluded from
-    # the a2a3/a2a3sim sweeps (it is the A5-targeted variant, so running it on
-    # 910B would be duplicate cost against the wrong backend). It goes through
-    # the same setup-ci-job as the other device jobs (needs-device:true);
-    # the A5 host's own runner .env supplies its CANN_ROOT / cache roots, so
-    # no A5-specific path is named here. NOTE: until the npu-a5 runner is
-    # registered this job stays queued; the summary job does not depend on
-    # it, so the existing daily report keeps producing and the A5 table
-    # fills in once it runs.
+    # Real Ascend 950 (A5) device job — the daily coverage of the DeepSeek
+    # V4.1-Flash operators (models/deepseek_v4_1_flash/). They are A5-only: the
+    # a2a3 sweeps exclude that directory by path and every entry is
+    # `# ci: no-sim`, so a device job is the only place they run at all. The
+    # set is the `# ci: a5` marker, the same one ci.yml's a5-v41-flash selects
+    # from — but that job runs only the entries a pull request's own diff
+    # reaches, and this one runs all of them, every declared parallel case, so
+    # an entry no diff touches cannot rot unnoticed.
+    #
+    # Unlike the V4-Pro sweep it replaces (report-only, 13/35 on device, red
+    # from pypto/device-side faults rather than defects here) these entries are
+    # green on the pull-request job, so this one gates: red means a regression.
+    # V4-Pro keeps its daily correctness run on a5sim above.
+    #
+    # It goes through the same setup-ci-job as the other device jobs
+    # (needs-device:true); the A5 host's own runner .env supplies its CANN_ROOT
+    # / cache roots, so no A5-specific path is named here.
     runs-on: [self-hosted, linux, npu-a5]
-    # Pro is roughly half the a2a3 sweep (no qwen3 / v3_2 / Flash), so
-    # 120 min is generous; keep parity with the other device job's ceiling.
-    timeout-minutes: 120
+    # The cases run one after another, each bounded by task-submit's own
+    # --timeout 3600 queue wait + --max-time 900 run, on top of the build. The
+    # V4-Pro sweep this replaces took 65 min for its 33 single-card cases; this
+    # set is twice as many and borrows up to 8 cards, so it queues for longer
+    # too.
+    timeout-minutes: 240
     defaults:
       run:
         working-directory: checkout
@@ -389,8 +400,17 @@ jobs:
           build-namespace: a5-daily
           pip-cache-name: pip-a5
           toolchain: bundle
+          # The same stack as ci.yml's a5-v41-flash, which gates these entries.
+          # PyPTO follows the shared default (origin HEAD) like every other job
+          # here, so this sweep is also where an upstream break shows up first,
+          # attributable to a night rather than to whichever V4.1 pull request
+          # happens to run next. torch does not follow it: these entries need
+          # `float8_e8m0fnu`, the MXFP8 scale dtype added in 2.7, and a shim is
+          # not an option because pypto maps that IR dtype through its own table
+          # and the golden runner then compares the two for equality.
+          torch-version: 'torch==2.10.0'
 
-      - name: Run V4-Pro tests (a5, via task-submit)
+      - name: Run V4.1-Flash operators (a5, via task-submit)
         id: sweep
         shell: bash
         env:
@@ -405,19 +425,20 @@ jobs:
           : > results.tsv
           failed=()
           run_case() {
-            local file="$1" label="$2"; shift 2
+            local file="$1" cards="$2"; shift 2
+            local label="$file${*:+ $*}"
             echo "::group::${label}"
-            # Files needing multiple NPUs declare `# ci: devices=N` (N>1) near
-            # the top; borrow that many cards with --device-num N (defaults to
-            # single-card). $TASK_DEVICE is the lent set (single id, or
-            # comma-separated for N>1) and is passed straight to -d.
-            local ndev devnum_flag out rc
-            ndev=$(grep -oP '#\s*ci:\s*devices=\K[0-9]+' "$file" | head -1)
-            ndev=${ndev:-1}
+            # A case needs TP x DP cards; --device-num borrows that many from
+            # the host queue and $TASK_DEVICE is the lent set, passed straight
+            # to -d. The multi-card cases reach past this runner's device
+            # whitelist, which is what --ignore-whitelist asks the queue for.
+            local devnum_flag out rc
             devnum_flag=""
-            [ "$ndev" -gt 1 ] && devnum_flag="--device-num $ndev"
+            [ "$cards" -gt 1 ] && devnum_flag="--device-num $cards --ignore-whitelist"
+            # < /dev/null: this runs inside a `while read` over the case
+            # matrix, and task-submit would otherwise eat the rest of it.
             out=$( task-submit --device "$DEVICE_ID" $devnum_flag --timeout 3600 --max-time 900 \
-              --run "cd $GITHUB_WORKSPACE/checkout && source activate.sh && PYPTO_BENCH=0 DEEPSEEK_V4_VARIANT=pro PYTHONPATH=$GITHUB_WORKSPACE/checkout python $file -p a5 -d \$TASK_DEVICE $*" 2>&1 )
+              --run "cd $GITHUB_WORKSPACE/checkout && source activate.sh && PYPTO_BENCH=0 PYTHONPATH=$GITHUB_WORKSPACE/checkout python $file -p a5 $* -d \$TASK_DEVICE" < /dev/null 2>&1 )
             rc=$?
             printf '%s\n' "$out"
             if [ "$rc" -ne 0 ]; then
@@ -429,34 +450,31 @@ jobs:
             fi
             echo "::endgroup::"
           }
-          # Sweep ONLY the V4-Pro variant — its dedicated A5 daily set.
-          #
-          # decode_fwd.py and prefill_fwd.py are out: under the Pro preset they
-          # hold every one of the 61 layers' routed-expert weights resident on
-          # each rank — 48 experts x 63.0 MiB x 61 = 180.1 GiB against a 128 GiB
-          # card — and die uploading them with `rtMalloc failed: 207001`
-          # (ACL_ERROR_RT_MEMORY_ALLOCATION). The failing 60.05 GiB request is
-          # half of the layer-stacked w13 tensor, so it is the shape of the
-          # resident set, not allocator behaviour. `--ep` cannot help either:
-          # moe.py scales the global expert count with the world size, leaving
-          # 48 experts per rank at both --ep 2 and --ep 8. Re-add them once the
-          # drivers stop keeping all 61 layers resident.
-          for f in $(find models/deepseek_v4_pro -name '*.py' ! -name '*_draft.py' \
-              ! -name 'decode_fwd.py' ! -name 'prefill_fwd.py' \
-              ! -name 'synthetic_token_loop.py' | sort); do
-            # Skip shared modules with no __main__ guard (config.py, helper
-            # libs): they are imported, not run.
-            if ! grep -q '__main__' "$f"; then
+          # Every V4.1-Flash entry, by the marker detect_changes.py selects on,
+          # so an operator joins this sweep the same way it joins the
+          # pull-request one: by carrying `# ci: a5`. Nothing here needs
+          # editing. The entries split the `__main__` sentinel to stay out of
+          # the a2a3 discovery, so it cannot be the filter here.
+          for f in $(grep -rlE '^#\s*ci:\s*a5\s*$' models/deepseek_v4_1_flash --include='*.py' | sort); do
+            # Each --tp/--dp combination the entry's own command line accepts is
+            # one case (.github/scripts/a5_parallel_cases.py); an entry that
+            # declares neither runs once.
+            if ! matrix=$(PYTHONPATH=$GITHUB_WORKSPACE/checkout python .github/scripts/a5_parallel_cases.py "$f"); then
+              failed+=("$f")
+              echo "::error file=${f}::cannot read its --tp/--dp choices"
+              printf '%s\tfail\n' "$f" >> results.tsv
               continue
             fi
-            run_case "$f" "$f"
+            while read -r cards args; do
+              run_case "$f" "$cards" $args
+            done <<< "$matrix"
           done
           if [ ${#failed[@]} -ne 0 ]; then
             echo "Failed cases (${#failed[@]}):"
             printf '  - %s\n' "${failed[@]}"
             exit 1
           fi
-          echo "All V4-Pro A5 tests passed."
+          echo "All V4.1-Flash A5 cases passed."
 
       - name: Kill orphaned task-submit tasks
         if: always()
@@ -509,13 +527,13 @@ jobs:
       CMAKE_CXX_COMPILER_LAUNCHER: ccache
       CCACHE_MAXSIZE: 30G
       CCACHE_UMASK: '000'
-      # The only job in this repository that overrides setup-ci-job's shared
-      # pypto pin, and the override is the point: this is the revision the Flash
-      # MXFP8/MXFP4 path was brought up and measured on, and the runtime, PTOAS
-      # and PTO ISA versions all follow from it. Generation has not been shown on
-      # the shared serving pin, so pinning here keeps a red nightly meaning "the
-      # model regressed" rather than "the stack moved". Retire this once Flash
-      # generation is demonstrated on the shared pin.
+      # This job pins its own pypto revision, and the override is the point:
+      # this is the revision the Flash MXFP8/MXFP4 path was brought up and
+      # measured on, and the runtime, PTOAS and PTO ISA versions all follow from
+      # it. Generation has not been shown on the shared serving pin, so pinning
+      # here keeps a red nightly meaning "the model regressed" rather than "the
+      # stack moved". Retire this once Flash generation is demonstrated on the
+      # shared pin.
       E2E_PYPTO_REF: 3d468f0179b9dd42c0628a8a46dc15e3a3ad5f76
       E2E_PROMPT: The capital of France is
       E2E_DECODE_STEPS: '32'
@@ -812,9 +830,9 @@ jobs:
 
   summary:
     name: Aggregate results summary
-    # model-tests-a5 is a real dependency: it is the longest job (the V4-Pro
-    # sweep ran 65 min against the others' ~40), so without it here the summary
-    # is built before results-a5 exists and the A5 column is empty every time.
+    # model-tests-a5 is a real dependency: it is the longest job (hours of
+    # serial device cases against the others' ~40 min), so without it here the
+    # summary is built before results-a5 exists and the A5 table is empty.
     # `always()` keeps the summary running when any sweep fails.
     needs: [model-tests-sim, model-tests-a2a3, model-tests-a5, e2e-flash-a5]
     if: ${{ always() && !inputs.performance_only }}
@@ -830,9 +848,9 @@ jobs:
           python3 - <<'EOF' >> "$GITHUB_STEP_SUMMARY"
           import pathlib
 
-          # Keep the non-Pro A2/A3 cases separate from the Pro A5 cases. The A5
-          # device sweep has one extra device-only case, labelled explicitly in
-          # the A5Sim column when both artifacts are present.
+          # One table per case set. a2a3 and a2a3sim share theirs; the two A5
+          # legs do not, since a5sim sweeps V4-Pro while the a5 device job
+          # sweeps the V4.1-Flash entries case by parallel case.
           ICON = {"pass": ":white_check_mark:", "fail": ":x:", "missing": ":heavy_minus_sign:"}
           ROOT = pathlib.Path("results")
 
@@ -857,9 +875,8 @@ jobs:
                   "fails cases still uploads its table."
               )
 
-          def table(title, platforms, expected_absences=None):
+          def table(title, platforms):
               """Show correctness for each platform, including missing artifacts."""
-              expected_absences = expected_absences or {}
               data = {p: load(p) for p in platforms}
               present = [p for p in platforms if data[p] is not None]
               missing = [p for p in platforms if data[p] is None]
@@ -877,11 +894,7 @@ jobs:
               for case in sorted({c for p in present for c in data[p]}):
                   row = [f"`{case}`"]
                   for p in platforms:
-                      status = (data[p] or {}).get(case, "missing")
-                      if status == "missing" and data[p] is not None:
-                          row.append(expected_absences.get((case, p), ICON["missing"]))
-                      else:
-                          row.append(ICON.get(status, "?"))
+                      row.append(ICON.get((data[p] or {}).get(case, "missing"), "?"))
                   print("| " + " | ".join(row) + " |")
               print()
               print("Passed: " + ", ".join(
@@ -967,10 +980,7 @@ jobs:
           print("## Daily CI Model Test Results")
           print()
           table("a2a3 and a2a3sim", ["a2a3", "a2a3sim"])
-          table(
-              "a5 and a5sim (DeepSeek V4-Pro)",
-              ["a5", "a5sim"],
-              {("models/deepseek_v4_pro/prefill_mtp.py", "a5sim"): "only a5"},
-          )
+          table("a5sim (DeepSeek V4-Pro and V4.1-Flash)", ["a5sim"])
+          table("a5 (DeepSeek V4.1-Flash)", ["a5"])
           e2e("a5 DeepSeek-V4-Flash EP8 end-to-end token generation (real weights)", "e2e-a5")
           EOF
