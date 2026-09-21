@@ -637,7 +637,7 @@ def _decode_hca_tp1(
     x_normed = pl.create_tensor([t_dim, D], dtype=pl.BF16)
     rms_tid = hc_pre_norm(
         x_hc, hc_attn_fn, hc_attn_scale, hc_attn_base, attn_norm_w,
-        post_t, comb_t, x_normed, False,
+        post_t, comb_t, x_normed, True,
     )
 
     # Interleave-duplicated / sign-folded compressed-position rope rows, built once over B rows.
