@@ -51,11 +51,11 @@ W2_ACT_INNER = 8
 def _expert_shared(
     x_local_i8: pl.Tensor[[SHARED_T_DYN, D], pl.INT8],
     x_local_scale_dq: pl.Tensor[[SHARED_T_DYN, 1], pl.FP32],
-    shared_w1: pl.Tensor[[MOE_INTER, D], pl.INT8],
+    shared_w1: pl.Tensor[[MOE_INTER, D], pl.INT8, pl.NZ],
     shared_w1_scale: pl.Tensor[[MOE_INTER], pl.FP32],
-    shared_w3: pl.Tensor[[MOE_INTER, D], pl.INT8],
+    shared_w3: pl.Tensor[[MOE_INTER, D], pl.INT8, pl.NZ],
     shared_w3_scale: pl.Tensor[[MOE_INTER], pl.FP32],
-    shared_w2: pl.Tensor[[D, MOE_INTER], pl.INT8],
+    shared_w2: pl.Tensor[[D, MOE_INTER], pl.INT8, pl.NZ],
     shared_w2_scale: pl.Tensor[[D], pl.FP32],
     sh: pl.Out[pl.Tensor[[SHARED_T_DYN, D], pl.BF16]],
 ):
@@ -74,6 +74,8 @@ def _expert_shared(
 
         # gate (w1) cube matmul -> INT32 GM accumulator.
         for nb_idx in pl.spmd(MOE_INTER // MM_INTER_TILE, name_hint="sh_gate_mm", allow_early_resolve=True):
+            # Weight reads bypass L2.
+            pl.set_cache_policy(shared_w1, pl.CachePolicy.BYPASS)
             n0 = nb_idx * MM_INTER_TILE
             gate_acc = pl.create_tensor([SH_M_TILE, MM_INTER_TILE], dtype=pl.INT32)
             for k0 in pl.pipeline(0, D, K_TILE, stage=2):
@@ -84,6 +86,7 @@ def _expert_shared(
 
         # up (w3) cube matmul -> INT32 GM accumulator.
         for nb_idx in pl.spmd(MOE_INTER // MM_INTER_TILE, name_hint="sh_up_mm", allow_early_resolve=True):
+            pl.set_cache_policy(shared_w3, pl.CachePolicy.BYPASS)
             n0 = nb_idx * MM_INTER_TILE
             up_acc = pl.create_tensor([SH_M_TILE, MM_INTER_TILE], dtype=pl.INT32)
             for k0 in pl.pipeline(0, D, K_TILE, stage=2):
@@ -161,6 +164,7 @@ def _expert_shared(
         # w2 (down) cube matmul -> INT32 GM accumulator.
         y_i32 = pl.create_tensor([SH_M_TILE, D], dtype=pl.INT32)
         for db_idx in pl.spmd(D // D_OUT_TILE, name_hint="sh_w2_mm"):
+            pl.set_cache_policy(shared_w2, pl.CachePolicy.BYPASS)
             d0 = db_idx * D_OUT_TILE
             y_acc = pl.create_tensor([SH_M_TILE, D_OUT_TILE], dtype=pl.INT32)
             for k0 in pl.pipeline(0, MOE_INTER, INTER_K, stage=2):
@@ -196,7 +200,7 @@ expert_shared_test = pl.jit(_expert_shared)
 
 def golden_expert_shared(tensors):
     """Compute the shared-expert reference with INT32 accumulation."""
-    from utils import int8_quant_per_row
+    from utils import int8_quant_per_row, unpack_nz
     import torch
 
     x_local_i8 = tensors["x_local_i8"].to(torch.int32)
@@ -205,8 +209,8 @@ def golden_expert_shared(tensors):
     w3_scale = tensors["shared_w3_scale"].float().unsqueeze(0)
     w2_scale = tensors["shared_w2_scale"].float().unsqueeze(0)
 
-    gate_int = x_local_i8 @ tensors["shared_w1"].to(torch.int32).T
-    up_int = x_local_i8 @ tensors["shared_w3"].to(torch.int32).T
+    gate_int = x_local_i8 @ unpack_nz(tensors["shared_w1"]).to(torch.int32).T
+    up_int = x_local_i8 @ unpack_nz(tensors["shared_w3"]).to(torch.int32).T
     sh_gate = gate_int.float() * x_local_scale_dq * w1_scale
     sh_up = up_int.float() * x_local_scale_dq * w3_scale
     if SWIGLU_LIMIT > 0:
@@ -216,7 +220,7 @@ def golden_expert_shared(tensors):
     sigmoid = torch.reciprocal(torch.exp(-sh_gate) + 1.0)
     sh_h = (sh_gate * sigmoid) * sh_up
     sh_h_i8, sh_h_sd = int8_quant_per_row(sh_h)
-    sh_int = sh_h_i8.to(torch.int32) @ tensors["shared_w2"].to(torch.int32).T
+    sh_int = sh_h_i8.to(torch.int32) @ unpack_nz(tensors["shared_w2"]).to(torch.int32).T
     sh = sh_int.float() * sh_h_sd * w2_scale
 
     tensors["sh"][:] = sh.to(torch.bfloat16)
@@ -257,7 +261,7 @@ def gen_shared_weight(shape, dequant_std, chan_cv):
 
 
 def build_tensor_specs():
-    from utils import int8_quant_per_row
+    from utils import int8_quant_per_row, pack_nz
     import torch
     from golden import TensorSpec
 
@@ -277,11 +281,11 @@ def build_tensor_specs():
     return [
         TensorSpec("x_local_i8", [T, D], torch.int8, init_value=lambda: x_local_i8_pre),
         TensorSpec("x_local_scale_dq", [T, 1], torch.float32, init_value=lambda: x_local_sd_pre.float()),
-        TensorSpec("shared_w1", [MOE_INTER, D], torch.int8, init_value=lambda: sw1_i8),
+        TensorSpec("shared_w1", [MOE_INTER, D], torch.int8, init_value=lambda: pack_nz(sw1_i8)),
         TensorSpec("shared_w1_scale", [MOE_INTER], torch.float32, init_value=lambda: sw1_s),
-        TensorSpec("shared_w3", [MOE_INTER, D], torch.int8, init_value=lambda: sw3_i8),
+        TensorSpec("shared_w3", [MOE_INTER, D], torch.int8, init_value=lambda: pack_nz(sw3_i8)),
         TensorSpec("shared_w3_scale", [MOE_INTER], torch.float32, init_value=lambda: sw3_s),
-        TensorSpec("shared_w2", [D, MOE_INTER], torch.int8, init_value=lambda: sw2_i8),
+        TensorSpec("shared_w2", [D, MOE_INTER], torch.int8, init_value=lambda: pack_nz(sw2_i8)),
         TensorSpec("shared_w2_scale", [D], torch.float32, init_value=lambda: sw2_s),
         TensorSpec("sh", [T, D], torch.bfloat16),
     ]

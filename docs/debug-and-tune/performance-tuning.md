@@ -437,7 +437,54 @@ compute that is already running. It writes no tensor, so it is free to try and
 free to delete — but a partial or oversized warm costs more than it saves. See
 [L2 Prefetch](l2-prefetch.md).
 
-#### 6. `pl.spmd` for parallel sub-kernel dispatch
+#### 6. Stream a weight that has no reuse: NZ layout and `CachePolicy.BYPASS`
+
+A weight read once per dispatch and never re-read is *streamed*, not cached, and
+two declarations make that read cheaper. Both are properties of the weight, so
+both belong on the parameter and the fixture that fills it — neither is a
+compiler inference.
+
+| Declaration | What it changes | What it costs |
+| --- | --- | --- |
+| `pl.Tensor[[E, N, K], pl.INT8, pl.NZ]` | the cube loads the weight NZ→NZ instead of reformatting ND on the way into L1, so the contiguous run is one fractal column block rather than one K-tile row | the fixture must write the bytes in fractal order (`utils.pack_nz`) and the golden must read them back (`utils.unpack_nz`) |
+| `pl.set_cache_policy(w, pl.CachePolicy.BYPASS)` at the top of the reading scope | the load is issued against the device's uncached alias, so it does not evict what *does* have reuse | nothing to the kernel; the author asserts nobody writes those bytes while it runs |
+
+The ND penalty is worth seeing concretely. A logical `[E, N, K]` INT8 weight
+sliced by a K tile gives the DMA `K_TILE` contiguous bytes before the next row
+is `K` bytes away — 512 B runs at `K_TILE = 512`. The same weight in NZ order
+gives 16 rows × one C0 line, an 8 KB run, with the column-block stride between
+them. Same bytes, same footprint, 16× the contiguous run.
+
+**Where NZ fits, and where it does not.** pto-isa declares NZ at a fixed rank-5
+shape with one batch slot, so the layout is only addressable when the *stacked*
+axis is a leading one:
+
+- `[E, N, K]` (routed experts) and `[LAYERS * O_GROUPS, O_LORA, O_GROUP_IN]`
+  (`wo_a`, `wo_b`) work as they stand — a per-layer `pl.slice` narrows a leading axis
+  and the trailing matrix stays whole.
+- `[LAYERS * D, Q_LORA]` (`wq_a`, `wq_b`, `wkv`) does not. One layer's
+  rows sit inside *every* fractal column block, so the window is not contiguous
+  and the compiler refuses it by name. Those are declared `[LAYERS, D, C]`
+  instead — a leading stacked axis — which is what makes NZ available to them.
+- Only one leading axis may be narrowed at a time. The leading axes fold into
+  the single batch slot row-major, so a window on an axis that a spanning axis
+  precedes selects a set no contiguous run describes; the compiler refuses it.
+- An NZ tensor is read-only, but it can be flattened whole for an SDMA warm
+  (rule 5): a rank-1 view of every element is the same byte range either way.
+  `wo_a` and `wo_b` are both NZ and both warmed.
+- The trailing extents must be static, rows a multiple of 16, and columns a
+  whole C0 line (32 B); a slice offset must be a provably non-negative multiple
+  of those, which rules out an offset built by subtraction — and a remainder or
+  quotient is only non-negative once its dividend is, since both truncate
+  toward zero on device.
+
+**Measure both separately.** They are independent, and which one pays depends on
+whether the ND load is already at its bandwidth ceiling: at a coarse blocking
+where ND already saturates, NZ can be worth nothing while the bypass still pays,
+and at a finer blocking the order reverses. One `PYPTO_BENCH` run per variant on
+the same frozen inputs settles it.
+
+#### 7. `pl.spmd` for parallel sub-kernel dispatch
 
 `pl.spmd(N)` dispatches `N` blocks of an InCore body in parallel from
 **one** AICPU schedule entry, instead of N successive `pl.parallel +

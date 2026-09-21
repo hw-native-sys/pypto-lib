@@ -118,9 +118,9 @@ def prefill_indexer(
     x: pl.Tensor[[T, D], pl.BF16],
     qr: pl.Tensor[[T, Q_LORA], pl.INT8],
     qr_scale: pl.Tensor[[T, 1], pl.FP32],
-    wq_b: pl.Tensor[[Q_LORA, IDX_N_HEADS * IDX_HEAD_DIM], pl.INT8],
+    wq_b: pl.Tensor[[Q_LORA, IDX_N_HEADS * IDX_HEAD_DIM], pl.INT8, pl.NZ],
     wq_b_scale: pl.Tensor[[IDX_N_HEADS * IDX_HEAD_DIM], pl.FP32],
-    weights_proj: pl.Tensor[[D, IDX_N_HEADS], pl.BF16],
+    weights_proj: pl.Tensor[[D, IDX_N_HEADS], pl.BF16, pl.NZ],
     cos: pl.Tensor[[T, ROPE_HEAD_DIM // 2], pl.FP32],
     sin: pl.Tensor[[T, ROPE_HEAD_DIM // 2], pl.FP32],
     freqs_cos: pl.Tensor[[MAX_SEQ_LEN, ROPE_HEAD_DIM], pl.BF16],
@@ -425,9 +425,9 @@ def _prefill_indexer_cp_score_topk(
     x: pl.Tensor[[T, D], pl.BF16],
     qr: pl.Tensor[[T, Q_LORA], pl.INT8],
     qr_scale: pl.Tensor[[T, 1], pl.FP32],
-    wq_b: pl.Tensor[[Q_LORA, IDX_N_HEADS * IDX_HEAD_DIM], pl.INT8],
+    wq_b: pl.Tensor[[Q_LORA, IDX_N_HEADS * IDX_HEAD_DIM], pl.INT8, pl.NZ],
     wq_b_scale: pl.Tensor[[IDX_N_HEADS * IDX_HEAD_DIM], pl.FP32],
-    weights_proj: pl.Tensor[[D, IDX_N_HEADS], pl.BF16],
+    weights_proj: pl.Tensor[[D, IDX_N_HEADS], pl.BF16, pl.NZ],
     cos: pl.Tensor[[T, ROPE_HEAD_DIM // 2], pl.FP32],
     sin: pl.Tensor[[T, ROPE_HEAD_DIM // 2], pl.FP32],
     hadamard: pl.Tensor[[IDX_HEAD_DIM, IDX_HEAD_DIM], pl.BF16],
@@ -671,7 +671,7 @@ def topk_prefix_contract_error(topk_indices, position_ids, num_tokens):
 
 
 def golden_prefill_indexer_core(tensors):
-    from utils import int8_quant_per_row
+    from utils import int8_quant_per_row, unpack_nz
     import torch
 
     compressor_tensors = {
@@ -717,7 +717,7 @@ def golden_prefill_indexer_core(tensors):
     # Q: int8 qr x int8 wq_b -> dequant -> per-token interleaved RoPE -> Hadamard rotation.
     qr = tensors["qr"]
     qr_scale = tensors["qr_scale"].float()
-    wq_b = tensors["wq_b"]
+    wq_b = unpack_nz(tensors["wq_b"])
     wq_b_scale = tensors["wq_b_scale"].float()
     hadamard = tensors["hadamard"].float()
     cos = tensors["cos"].float().view(T, 1, -1)
@@ -731,7 +731,7 @@ def golden_prefill_indexer_core(tensors):
     q = torch.cat([q[..., :-rd], torch.stack([y0, y1], dim=-1).flatten(-2)], dim=-1)
     q = q.to(torch.bfloat16).float() @ hadamard
 
-    weights = (tensors["x"].float() @ tensors["weights_proj"].float()) * WEIGHTS_SCALE  # [T, heads]
+    weights = (tensors["x"].float() @ unpack_nz(tensors["weights_proj"]).float()) * WEIGHTS_SCALE  # [T, heads]
 
     # C8: the compressor already stored INT8 KV + a per-position dequant scale. Gather both in
     # compressed-position order through the paged block table (no score-time re-quant).
@@ -782,9 +782,9 @@ def prefill_indexer_test(
     x: pl.Tensor[[T, D], pl.BF16],
     qr: pl.Tensor[[T, Q_LORA], pl.INT8],
     qr_scale: pl.Tensor[[T, 1], pl.FP32],
-    wq_b: pl.Tensor[[Q_LORA, IDX_N_HEADS * IDX_HEAD_DIM], pl.INT8],
+    wq_b: pl.Tensor[[Q_LORA, IDX_N_HEADS * IDX_HEAD_DIM], pl.INT8, pl.NZ],
     wq_b_scale: pl.Tensor[[IDX_N_HEADS * IDX_HEAD_DIM], pl.FP32],
-    weights_proj: pl.Tensor[[D, IDX_N_HEADS], pl.BF16],
+    weights_proj: pl.Tensor[[D, IDX_N_HEADS], pl.BF16, pl.NZ],
     cos: pl.Tensor[[T, ROPE_HEAD_DIM // 2], pl.FP32],
     sin: pl.Tensor[[T, ROPE_HEAD_DIM // 2], pl.FP32],
     freqs_cos: pl.Tensor[[MAX_SEQ_LEN, ROPE_HEAD_DIM], pl.BF16],
@@ -855,7 +855,7 @@ def gen_shared_weight(shape, dequant_std, chan_cv):
 
 
 def build_tensor_specs(start_pos: int = START_POS, num_tokens: int = T):
-    from utils import int8_quant_per_row
+    from utils import int8_quant_per_row, pack_nz
     import torch
     from golden import ScalarSpec, TensorSpec
     from utils import build_rope_tables, materialize_half_rope_tables
@@ -989,7 +989,7 @@ def build_tensor_specs(start_pos: int = START_POS, num_tokens: int = T):
     # idx wq_b uses the real MXFP8 grid (not a benign randn int8); qr is per-row int8 like the
     # runtime W8A8C16 activation path.
     wq_b_i8_T, wq_b_scale = gen_shared_weight((IDX_N_HEADS * IDX_HEAD_DIM, Q_LORA), dequant_std=0.108, chan_cv=0.56)
-    wq_b_i8 = wq_b_i8_T.t().contiguous()
+    wq_b_i8 = pack_nz(wq_b_i8_T.t().contiguous())
     qr_i8, qr_scale = int8_quant_per_row(torch.rand(T, Q_LORA))
 
     return [
@@ -998,7 +998,7 @@ def build_tensor_specs(start_pos: int = START_POS, num_tokens: int = T):
         TensorSpec("qr_scale", [T, 1], torch.float32, init_value=lambda: qr_scale),
         TensorSpec("wq_b", [Q_LORA, IDX_N_HEADS * IDX_HEAD_DIM], torch.int8, init_value=lambda: wq_b_i8),
         TensorSpec("wq_b_scale", [IDX_N_HEADS * IDX_HEAD_DIM], torch.float32, init_value=lambda: wq_b_scale),
-        TensorSpec("weights_proj", [D, IDX_N_HEADS], torch.bfloat16, init_value=init_weights_proj),
+        TensorSpec("weights_proj", [D, IDX_N_HEADS], torch.bfloat16, init_value=lambda: pack_nz(init_weights_proj().to(torch.bfloat16))),
         TensorSpec("cos", [T, ROPE_HEAD_DIM // 2], torch.float32, init_value=init_cos),
         TensorSpec("sin", [T, ROPE_HEAD_DIM // 2], torch.float32, init_value=init_sin),
         TensorSpec("freqs_cos", [MAX_SEQ_LEN, ROPE_HEAD_DIM], torch.bfloat16, init_value=init_freqs_cos),

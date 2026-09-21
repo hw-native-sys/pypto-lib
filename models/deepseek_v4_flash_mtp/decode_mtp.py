@@ -86,20 +86,20 @@ def _decode_mtp(
     position_ids: pl.Tensor[[T], pl.INT32],
     enorm_w: pl.Tensor[[D], pl.FP32],
     hnorm_w: pl.Tensor[[D], pl.FP32],
-    e_proj_w: pl.Tensor[[D, D], pl.INT8],
+    e_proj_w: pl.Tensor[[D, D], pl.INT8, pl.NZ],
     e_proj_w_scale: pl.Tensor[[D], pl.FP32],
     e_proj_smooth: pl.Tensor[[D], pl.FP32],
-    h_proj_w: pl.Tensor[[D, D], pl.INT8],
+    h_proj_w: pl.Tensor[[D, D], pl.INT8, pl.NZ],
     h_proj_w_scale: pl.Tensor[[D], pl.FP32],
     h_proj_smooth: pl.Tensor[[D], pl.FP32],
     hc_attn_fn: pl.Tensor[[MIX_HC, HC_DIM], pl.FP32],
     hc_attn_scale: pl.Tensor[[3], pl.FP32],
     hc_attn_base: pl.Tensor[[MIX_HC], pl.FP32],
     attn_norm_w: pl.Tensor[[D], pl.BF16],
-    wq_a: pl.Tensor[[D, Q_LORA], pl.BF16],
-    wq_b: pl.Tensor[[Q_LORA, H * HEAD_DIM], pl.INT8],
+    wq_a: pl.Tensor[[D, Q_LORA], pl.BF16, pl.NZ],
+    wq_b: pl.Tensor[[Q_LORA, H * HEAD_DIM], pl.INT8, pl.NZ],
     wq_b_scale: pl.Tensor[[H * HEAD_DIM], pl.FP32],
-    wkv: pl.Tensor[[D, HEAD_DIM], pl.BF16],
+    wkv: pl.Tensor[[D, HEAD_DIM], pl.BF16, pl.NZ],
     gamma_cq: pl.Tensor[[Q_LORA], pl.BF16],
     gamma_ckv: pl.Tensor[[HEAD_DIM], pl.BF16],
     freqs_cos: pl.Tensor[[2, ROPE_ROWS_DYN, ROPE_HEAD_DIM], pl.BF16],
@@ -109,8 +109,8 @@ def _decode_mtp(
     swa_indices: pl.Tensor[[T, WIN], pl.INT32],
     swa_lens: pl.Tensor[[T], pl.INT32],
     attn_sink: pl.Tensor[[H], pl.FP32],
-    wo_a: pl.Tensor[[O_GROUPS, O_LORA, O_GROUP_IN], pl.BF16],
-    wo_b: pl.Tensor[[D, O_GROUPS * O_LORA], pl.INT8],
+    wo_a: pl.Tensor[[O_GROUPS, O_LORA, O_GROUP_IN], pl.BF16, pl.NZ],
+    wo_b: pl.Tensor[[O_GROUPS, D, O_LORA], pl.INT8, pl.NZ],
     wo_b_scale: pl.Tensor[[D], pl.FP32],
     hc_ffn_fn: pl.Tensor[[MIX_HC, HC_DIM], pl.FP32],
     hc_ffn_scale: pl.Tensor[[3], pl.FP32],
@@ -120,23 +120,23 @@ def _decode_mtp(
     gate_bias: pl.Tensor[[N_EXPERTS_GLOBAL], pl.FP32],
     tid2eid: pl.Tensor[[MOE_VOCAB, MOE_TOPK], pl.INT32],
     input_ids: pl.Tensor[[T], pl.INT64],
-    routed_w1: pl.Tensor[[N_LOCAL, MOE_INTER, D], pl.INT8],
+    routed_w1: pl.Tensor[[N_LOCAL, MOE_INTER, D], pl.INT8, pl.NZ],
     routed_w1_scale: pl.Tensor[[N_LOCAL, MOE_INTER], pl.FP32],
-    routed_w3: pl.Tensor[[N_LOCAL, MOE_INTER, D], pl.INT8],
+    routed_w3: pl.Tensor[[N_LOCAL, MOE_INTER, D], pl.INT8, pl.NZ],
     routed_w3_scale: pl.Tensor[[N_LOCAL, MOE_INTER], pl.FP32],
-    routed_w2: pl.Tensor[[N_LOCAL, D, MOE_INTER], pl.INT8],
+    routed_w2: pl.Tensor[[N_LOCAL, D, MOE_INTER], pl.INT8, pl.NZ],
     routed_w2_scale: pl.Tensor[[N_LOCAL, D], pl.FP32],
-    shared_w1: pl.Tensor[[MOE_INTER, D], pl.INT8],
+    shared_w1: pl.Tensor[[MOE_INTER, D], pl.INT8, pl.NZ],
     shared_w1_scale: pl.Tensor[[MOE_INTER], pl.FP32],
-    shared_w3: pl.Tensor[[MOE_INTER, D], pl.INT8],
+    shared_w3: pl.Tensor[[MOE_INTER, D], pl.INT8, pl.NZ],
     shared_w3_scale: pl.Tensor[[MOE_INTER], pl.FP32],
-    shared_w2: pl.Tensor[[D, MOE_INTER], pl.INT8],
+    shared_w2: pl.Tensor[[D, MOE_INTER], pl.INT8, pl.NZ],
     shared_w2_scale: pl.Tensor[[D], pl.FP32],
     mtp_hc_head_fn: pl.Tensor[[HC_MULT, HC_DIM], pl.FP32],
     mtp_hc_head_scale: pl.Tensor[[1], pl.FP32],
     mtp_hc_head_base: pl.Tensor[[HC_MULT], pl.FP32],
     mtp_norm_w: pl.Tensor[[D], pl.BF16],
-    lm_head_weight: pl.Tensor[[VOCAB_PER_TP, D], pl.BF16],
+    lm_head_weight: pl.Tensor[[VOCAB_PER_TP, D], pl.BF16, pl.NZ],
     logit_row_indices: pl.Tensor[[MAX_LOGIT_ROWS], pl.INT32],
     sampling_temperatures: pl.Tensor[[MAX_LOGIT_ROWS], pl.FP32],
     sampling_top_ks: pl.Tensor[[MAX_LOGIT_ROWS], pl.INT32],
@@ -260,7 +260,7 @@ def l3_decode_mtp(
     swa_lens: pl.Tensor[[N_RANKS, T], pl.INT32],
     attn_sink: pl.Tensor[[N_RANKS, H], pl.FP32],
     wo_a: pl.Tensor[[N_RANKS, O_GROUPS, O_LORA, O_GROUP_IN], pl.BF16],
-    wo_b: pl.Tensor[[N_RANKS, D, O_GROUPS * O_LORA], pl.INT8],
+    wo_b: pl.Tensor[[N_RANKS, O_GROUPS, D, O_LORA], pl.INT8],
     wo_b_scale: pl.Tensor[[N_RANKS, D], pl.FP32],
     hc_ffn_fn: pl.Tensor[[N_RANKS, MIX_HC, HC_DIM], pl.FP32],
     hc_ffn_scale: pl.Tensor[[N_RANKS, 3], pl.FP32],
@@ -383,6 +383,7 @@ def _projection_specs():
     import torch
     from golden import TensorSpec
     from mtp_projection import _quantize_weight_per_out
+    from utils import pack_nz
 
     e_proj_cache = None
     h_proj_cache = None
@@ -400,7 +401,7 @@ def _projection_specs():
     def init_e_proj_w():
         nonlocal e_proj_cache
         e_proj_cache = init_proj_pair()
-        return e_proj_cache[0]
+        return pack_nz(e_proj_cache[0])
 
     def init_e_proj_w_scale():
         nonlocal e_proj_cache
@@ -411,7 +412,7 @@ def _projection_specs():
     def init_h_proj_w():
         nonlocal h_proj_cache
         h_proj_cache = init_proj_pair()
-        return h_proj_cache[0]
+        return pack_nz(h_proj_cache[0])
 
     def init_h_proj_w_scale():
         nonlocal h_proj_cache
@@ -499,7 +500,7 @@ def _mtp_head_specs():
 def build_tensor_specs(start_pos=DECODE_START_POS, num_tokens=T, ori_block_num=ORI_BLOCK_NUM):
     import torch
     from golden import ScalarSpec, TensorSpec
-    from utils import build_rope_tables, resolve_start_positions
+    from utils import build_rope_tables, pack_nz, resolve_start_positions
 
     projection_specs = _projection_specs()
     mtp_head_specs = _mtp_head_specs()
@@ -528,7 +529,7 @@ def build_tensor_specs(start_pos=DECODE_START_POS, num_tokens=T, ori_block_num=O
 
     def init_lm_head_weight():
         shards = (torch.randn(LM_HEAD_TP_SIZE, VOCAB_PER_TP, D) / D ** 0.5).to(torch.bfloat16)
-        return torch.stack([shards[r % LM_HEAD_TP_SIZE] for r in range(N_RANKS)], dim=0)
+        return pack_nz(torch.stack([shards[r % LM_HEAD_TP_SIZE] for r in range(N_RANKS)], dim=0))
 
     def init_logit_row_indices():
         indices = torch.full((N_RANKS, MAX_LOGIT_ROWS), -1, dtype=torch.int32)

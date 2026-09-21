@@ -105,6 +105,8 @@ def _hc_pre(
     # zero-filled by valid_shape, never materialized.
     mixes_partials = pl.create_tensor([LINEAR_OK * t_linear, MIX_PAD], dtype=pl.FP32)
     for task in pl.spmd((t_linear // LINEAR_T_TILE) * LINEAR_OK, name_hint="hc_pre_linear", allow_early_resolve=True):
+        # Weight reads bypass L2.
+        pl.set_cache_policy(hc_fn, pl.CachePolicy.BYPASS)
         t0 = (task // LINEAR_OK) * LINEAR_T_TILE
         linear_split = task % LINEAR_OK
         k_base = linear_split * LINEAR_K_PER_SPLIT

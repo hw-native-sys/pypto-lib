@@ -160,6 +160,14 @@ FWD_LAYER_STACKED_NAMES = [
     "shared_w1", "shared_w1_scale", "shared_w3", "shared_w3_scale",
     "shared_w2", "shared_w2_scale",
 ]
+# The attention weights that stacked their layers on the row axis. NZ cannot
+# address a row window, so they stack on a new leading axis and a layer is an
+# index; wo_a already stacked that way (its groups lead).
+NZ_ROW_STACKED_NAMES = frozenset({
+    "wq_a", "wq_b", "wkv", "csa_idx_wq_b",
+    "shared_w1", "shared_w3", "shared_w2", "csa_weights_proj",
+})
+
 # CSA-compact stacked weights (sliced by the CSA order index 0..20).
 CSA_LAYER_STACKED_NAMES = [
     "csa_cmp_wkv", "csa_cmp_wgate", "csa_cmp_ape", "csa_cmp_norm_w",
@@ -402,17 +410,17 @@ def _fwd_moe_tail(
     gate_w: pl.Tensor[[N_EXPERTS_GLOBAL, D], pl.FP32],
     gate_bias: pl.Tensor[[N_EXPERTS_GLOBAL], pl.FP32],
     tid2eid: pl.Tensor[[VOCAB, TOPK], pl.INT32],
-    routed_w1: pl.Tensor[[N_LOCAL, MOE_INTER, D], pl.INT8],
+    routed_w1: pl.Tensor[[N_LOCAL, MOE_INTER, D], pl.INT8, pl.NZ],
     routed_w1_scale: pl.Tensor[[N_LOCAL, MOE_INTER], pl.FP32],
-    routed_w3: pl.Tensor[[N_LOCAL, MOE_INTER, D], pl.INT8],
+    routed_w3: pl.Tensor[[N_LOCAL, MOE_INTER, D], pl.INT8, pl.NZ],
     routed_w3_scale: pl.Tensor[[N_LOCAL, MOE_INTER], pl.FP32],
-    routed_w2: pl.Tensor[[N_LOCAL, D, MOE_INTER], pl.INT8],
+    routed_w2: pl.Tensor[[N_LOCAL, D, MOE_INTER], pl.INT8, pl.NZ],
     routed_w2_scale: pl.Tensor[[N_LOCAL, D], pl.FP32],
-    shared_w1: pl.Tensor[[MOE_INTER, D], pl.INT8],
+    shared_w1: pl.Tensor[[MOE_INTER, D], pl.INT8, pl.NZ],
     shared_w1_scale: pl.Tensor[[MOE_INTER], pl.FP32],
-    shared_w3: pl.Tensor[[MOE_INTER, D], pl.INT8],
+    shared_w3: pl.Tensor[[MOE_INTER, D], pl.INT8, pl.NZ],
     shared_w3_scale: pl.Tensor[[MOE_INTER], pl.FP32],
-    shared_w2: pl.Tensor[[D, MOE_INTER], pl.INT8],
+    shared_w2: pl.Tensor[[D, MOE_INTER], pl.INT8, pl.NZ],
     shared_w2_scale: pl.Tensor[[D], pl.FP32],
     moe_x_mixed: pl.InOut[pl.Tensor[[CP_LOCAL_ROWS, D], pl.BF16]],
     moe_post_ffn: pl.InOut[pl.Tensor[[CP_LOCAL_ROWS, HC_MULT], pl.FP32]],
@@ -818,10 +826,10 @@ def prefill_fwd(
     hc_attn_scale: pl.Tensor[[FWD_NUM_LAYERS * 3], pl.FP32],
     hc_attn_base: pl.Tensor[[FWD_NUM_LAYERS * MIX_HC], pl.FP32],
     attn_norm_w: pl.Tensor[[FWD_NUM_LAYERS * D], pl.BF16],
-    wq_a: pl.Tensor[[FWD_NUM_LAYERS * D, Q_LORA], pl.BF16],
-    wq_b: pl.Tensor[[FWD_NUM_LAYERS * Q_LORA, H * HEAD_DIM], pl.INT8],
+    wq_a: pl.Tensor[[FWD_NUM_LAYERS, D, Q_LORA], pl.BF16, pl.NZ],
+    wq_b: pl.Tensor[[FWD_NUM_LAYERS, Q_LORA, H * HEAD_DIM], pl.INT8, pl.NZ],
     wq_b_scale: pl.Tensor[[FWD_NUM_LAYERS * H * HEAD_DIM], pl.FP32],
-    wkv: pl.Tensor[[FWD_NUM_LAYERS * D, HEAD_DIM], pl.BF16],
+    wkv: pl.Tensor[[FWD_NUM_LAYERS, D, HEAD_DIM], pl.BF16, pl.NZ],
     gamma_cq: pl.Tensor[[FWD_NUM_LAYERS * Q_LORA], pl.BF16],
     gamma_ckv: pl.Tensor[[FWD_NUM_LAYERS * HEAD_DIM], pl.BF16],
     freqs_cos: pl.Tensor[[2, MAX_SEQ_LEN, ROPE_HEAD_DIM], pl.BF16],
@@ -834,8 +842,8 @@ def prefill_fwd(
     hca_cmp_kv: pl.InOut[pl.Tensor[[FWD_HCA_CMP_BLOCK_NUM_DYN, HCA_CMP_STORAGE_BLOCK_SIZE, 1, HEAD_DIM], pl.BF16]],
     csa_cmp_kv: pl.InOut[pl.Tensor[[FWD_CSA_CMP_BLOCK_NUM_DYN, CSA_CMP_STORAGE_BLOCK_SIZE, 1, HEAD_DIM], pl.BF16]],
     attn_sink: pl.Tensor[[FWD_NUM_LAYERS * H], pl.FP32],
-    wo_a: pl.Tensor[[FWD_NUM_LAYERS * O_GROUPS, O_LORA, O_GROUP_IN], pl.BF16],
-    wo_b: pl.Tensor[[FWD_NUM_LAYERS * D, O_GROUPS * O_LORA], pl.INT8],
+    wo_a: pl.Tensor[[FWD_NUM_LAYERS * O_GROUPS, O_LORA, O_GROUP_IN], pl.BF16, pl.NZ],
+    wo_b: pl.Tensor[[FWD_NUM_LAYERS * O_GROUPS, D, O_LORA], pl.INT8, pl.NZ],
     wo_b_scale: pl.Tensor[[FWD_NUM_LAYERS * D], pl.FP32],
     segment_starts_t: pl.Tensor[[NUM_SEGMENTS], pl.INT32],
     predecessor_segments: pl.Tensor[[LOCAL_PARTS], pl.INT32],
@@ -885,9 +893,9 @@ def prefill_fwd(
     csa_cmp_norm_w: pl.Tensor[[CSA_NUM_LAYERS * HEAD_DIM], pl.BF16],
     # CSA indexer weights (stacked by CSA_NUM_LAYERS on axis 0).
     csa_hadamard_idx: pl.Tensor[[CSA_NUM_LAYERS * IDX_HEAD_DIM, IDX_HEAD_DIM], pl.BF16],
-    csa_idx_wq_b: pl.Tensor[[CSA_NUM_LAYERS * Q_LORA, IDX_N_HEADS * IDX_HEAD_DIM], pl.INT8],
+    csa_idx_wq_b: pl.Tensor[[CSA_NUM_LAYERS, Q_LORA, IDX_N_HEADS * IDX_HEAD_DIM], pl.INT8, pl.NZ],
     csa_idx_wq_b_scale: pl.Tensor[[CSA_NUM_LAYERS * IDX_N_HEADS * IDX_HEAD_DIM], pl.FP32],
-    csa_weights_proj: pl.Tensor[[CSA_NUM_LAYERS * D, IDX_N_HEADS], pl.BF16],
+    csa_weights_proj: pl.Tensor[[CSA_NUM_LAYERS, D, IDX_N_HEADS], pl.BF16, pl.NZ],
     # CSA inner compressor weights (ratio-4: INNER_OUT_DIM = 2*IDX_HEAD_DIM).
     csa_inner_wkv: pl.Tensor[[CSA_NUM_LAYERS * INNER_OUT_DIM, D], pl.BF16],
     csa_inner_wgate: pl.Tensor[[CSA_NUM_LAYERS * INNER_OUT_DIM, D], pl.BF16],
@@ -949,17 +957,17 @@ def prefill_fwd(
     gate_bias: pl.Tensor[[FWD_NUM_LAYERS * N_EXPERTS_GLOBAL], pl.FP32],
     tid2eid: pl.Tensor[[FWD_NUM_LAYERS * VOCAB, TOPK], pl.INT32],
     input_ids: pl.Tensor[[LOCAL_PARTS, MAX_SEGMENT_TILES, ATTN_TILE_ROWS], pl.INT64],
-    routed_w1: pl.Tensor[[FWD_NUM_LAYERS * N_LOCAL, MOE_INTER, D], pl.INT8],
+    routed_w1: pl.Tensor[[FWD_NUM_LAYERS * N_LOCAL, MOE_INTER, D], pl.INT8, pl.NZ],
     routed_w1_scale: pl.Tensor[[FWD_NUM_LAYERS * N_LOCAL, MOE_INTER], pl.FP32],
-    routed_w3: pl.Tensor[[FWD_NUM_LAYERS * N_LOCAL, MOE_INTER, D], pl.INT8],
+    routed_w3: pl.Tensor[[FWD_NUM_LAYERS * N_LOCAL, MOE_INTER, D], pl.INT8, pl.NZ],
     routed_w3_scale: pl.Tensor[[FWD_NUM_LAYERS * N_LOCAL, MOE_INTER], pl.FP32],
-    routed_w2: pl.Tensor[[FWD_NUM_LAYERS * N_LOCAL, D, MOE_INTER], pl.INT8],
+    routed_w2: pl.Tensor[[FWD_NUM_LAYERS * N_LOCAL, D, MOE_INTER], pl.INT8, pl.NZ],
     routed_w2_scale: pl.Tensor[[FWD_NUM_LAYERS * N_LOCAL, D], pl.FP32],
-    shared_w1: pl.Tensor[[FWD_NUM_LAYERS * MOE_INTER, D], pl.INT8],
+    shared_w1: pl.Tensor[[FWD_NUM_LAYERS, MOE_INTER, D], pl.INT8, pl.NZ],
     shared_w1_scale: pl.Tensor[[FWD_NUM_LAYERS * MOE_INTER], pl.FP32],
-    shared_w3: pl.Tensor[[FWD_NUM_LAYERS * MOE_INTER, D], pl.INT8],
+    shared_w3: pl.Tensor[[FWD_NUM_LAYERS, MOE_INTER, D], pl.INT8, pl.NZ],
     shared_w3_scale: pl.Tensor[[FWD_NUM_LAYERS * MOE_INTER], pl.FP32],
-    shared_w2: pl.Tensor[[FWD_NUM_LAYERS * D, MOE_INTER], pl.INT8],
+    shared_w2: pl.Tensor[[FWD_NUM_LAYERS, D, MOE_INTER], pl.INT8, pl.NZ],
     shared_w2_scale: pl.Tensor[[FWD_NUM_LAYERS * D], pl.FP32],
     # Rank-local resident MoE workspaces, reused by every serialized layer.
     # Compact count/x/scale/reverse windows. all_to_all_v owns reusable,
@@ -1073,22 +1081,20 @@ def prefill_fwd(
         hc_attn_scale_layer: pl.Tensor[[3], pl.FP32] = pl.slice(hc_attn_scale, [3], [layer_index * 3])
         hc_attn_base_layer: pl.Tensor[[MIX_HC], pl.FP32] = pl.slice(hc_attn_base, [MIX_HC], [layer_index * MIX_HC])
         attn_norm_w_layer: pl.Tensor[[D], pl.BF16] = pl.slice(attn_norm_w, [D], [layer_index * D])
-        wq_a_layer: pl.Tensor[[D, Q_LORA], pl.BF16] = pl.slice(wq_a, [D, Q_LORA], [layer_index * D, 0])
-        wq_b_layer: pl.Tensor[[Q_LORA, H * HEAD_DIM], pl.INT8] = pl.slice(
-            wq_b, [Q_LORA, H * HEAD_DIM], [layer_index * Q_LORA, 0]
-        )
+        wq_a_layer: pl.Tensor[[D, Q_LORA], pl.BF16, pl.NZ] = wq_a[layer_index]
+        wq_b_layer: pl.Tensor[[Q_LORA, H * HEAD_DIM], pl.INT8, pl.NZ] = wq_b[layer_index]
         wq_b_scale_layer: pl.Tensor[[H * HEAD_DIM], pl.FP32] = pl.slice(
             wq_b_scale, [H * HEAD_DIM], [layer_index * H * HEAD_DIM]
         )
-        wkv_layer: pl.Tensor[[D, HEAD_DIM], pl.BF16] = pl.slice(wkv, [D, HEAD_DIM], [layer_index * D, 0])
+        wkv_layer: pl.Tensor[[D, HEAD_DIM], pl.BF16, pl.NZ] = wkv[layer_index]
         gamma_cq_layer: pl.Tensor[[Q_LORA], pl.BF16] = pl.slice(gamma_cq, [Q_LORA], [layer_index * Q_LORA])
         gamma_ckv_layer: pl.Tensor[[HEAD_DIM], pl.BF16] = pl.slice(gamma_ckv, [HEAD_DIM], [layer_index * HEAD_DIM])
         attn_sink_layer: pl.Tensor[[H], pl.FP32] = pl.slice(attn_sink, [H], [layer_index * H])
-        wo_a_layer: pl.Tensor[[O_GROUPS, O_LORA, O_GROUP_IN], pl.BF16] = pl.slice(
+        wo_a_layer: pl.Tensor[[O_GROUPS, O_LORA, O_GROUP_IN], pl.BF16, pl.NZ] = pl.slice(
             wo_a, [O_GROUPS, O_LORA, O_GROUP_IN], [layer_index * O_GROUPS, 0, 0]
         )
-        wo_b_layer: pl.Tensor[[D, O_GROUPS * O_LORA], pl.INT8] = pl.slice(
-            wo_b, [D, O_GROUPS * O_LORA], [layer_index * D, 0]
+        wo_b_layer: pl.Tensor[[O_GROUPS, D, O_LORA], pl.INT8, pl.NZ] = pl.slice(
+            wo_b, [O_GROUPS, D, O_LORA], [layer_index * O_GROUPS, 0, 0]
         )
         wo_b_scale_layer: pl.Tensor[[D], pl.FP32] = pl.slice(wo_b_scale, [D], [layer_index * D])
         hc_ffn_fn_layer: pl.Tensor[[MIX_HC, HC_DIM], pl.FP32] = pl.slice(
@@ -1104,37 +1110,33 @@ def prefill_fwd(
             gate_bias, [N_EXPERTS_GLOBAL], [layer_index * N_EXPERTS_GLOBAL]
         )
         tid2eid_layer: pl.Tensor[[VOCAB, TOPK], pl.INT32] = pl.slice(tid2eid, [VOCAB, TOPK], [layer_index * VOCAB, 0])
-        routed_w1_layer: pl.Tensor[[N_LOCAL, MOE_INTER, D], pl.INT8] = pl.slice(
+        routed_w1_layer: pl.Tensor[[N_LOCAL, MOE_INTER, D], pl.INT8, pl.NZ] = pl.slice(
             routed_w1, [N_LOCAL, MOE_INTER, D], [layer_index * N_LOCAL, 0, 0]
         )
         routed_w1_scale_layer: pl.Tensor[[N_LOCAL, MOE_INTER], pl.FP32] = pl.slice(
             routed_w1_scale, [N_LOCAL, MOE_INTER], [layer_index * N_LOCAL, 0]
         )
-        routed_w3_layer: pl.Tensor[[N_LOCAL, MOE_INTER, D], pl.INT8] = pl.slice(
+        routed_w3_layer: pl.Tensor[[N_LOCAL, MOE_INTER, D], pl.INT8, pl.NZ] = pl.slice(
             routed_w3, [N_LOCAL, MOE_INTER, D], [layer_index * N_LOCAL, 0, 0]
         )
         routed_w3_scale_layer: pl.Tensor[[N_LOCAL, MOE_INTER], pl.FP32] = pl.slice(
             routed_w3_scale, [N_LOCAL, MOE_INTER], [layer_index * N_LOCAL, 0]
         )
-        routed_w2_layer: pl.Tensor[[N_LOCAL, D, MOE_INTER], pl.INT8] = pl.slice(
+        routed_w2_layer: pl.Tensor[[N_LOCAL, D, MOE_INTER], pl.INT8, pl.NZ] = pl.slice(
             routed_w2, [N_LOCAL, D, MOE_INTER], [layer_index * N_LOCAL, 0, 0]
         )
         routed_w2_scale_layer: pl.Tensor[[N_LOCAL, D], pl.FP32] = pl.slice(
             routed_w2_scale, [N_LOCAL, D], [layer_index * N_LOCAL, 0]
         )
-        shared_w1_layer: pl.Tensor[[MOE_INTER, D], pl.INT8] = pl.slice(
-            shared_w1, [MOE_INTER, D], [layer_index * MOE_INTER, 0]
-        )
+        shared_w1_layer: pl.Tensor[[MOE_INTER, D], pl.INT8, pl.NZ] = shared_w1[layer_index]
         shared_w1_scale_layer: pl.Tensor[[MOE_INTER], pl.FP32] = pl.slice(
             shared_w1_scale, [MOE_INTER], [layer_index * MOE_INTER]
         )
-        shared_w3_layer: pl.Tensor[[MOE_INTER, D], pl.INT8] = pl.slice(
-            shared_w3, [MOE_INTER, D], [layer_index * MOE_INTER, 0]
-        )
+        shared_w3_layer: pl.Tensor[[MOE_INTER, D], pl.INT8, pl.NZ] = shared_w3[layer_index]
         shared_w3_scale_layer: pl.Tensor[[MOE_INTER], pl.FP32] = pl.slice(
             shared_w3_scale, [MOE_INTER], [layer_index * MOE_INTER]
         )
-        shared_w2_layer: pl.Tensor[[D, MOE_INTER], pl.INT8] = pl.slice(shared_w2, [D, MOE_INTER], [layer_index * D, 0])
+        shared_w2_layer: pl.Tensor[[D, MOE_INTER], pl.INT8, pl.NZ] = shared_w2[layer_index]
         shared_w2_scale_layer: pl.Tensor[[D], pl.FP32] = pl.slice(shared_w2_scale, [D], [layer_index * D])
         tail_comm_epoch = pl.cast(layer_index, pl.INT32)
         if pl.read(segment_starts_t, [0]) > 0:
@@ -1197,14 +1199,12 @@ def prefill_fwd(
                     pl.slice(csa_hadamard_idx, [IDX_HEAD_DIM, IDX_HEAD_DIM], [type_index * IDX_HEAD_DIM, 0])
                 )
                 idx_wq_b_csa: pl.Tensor[
-                    [Q_LORA, IDX_N_HEADS * IDX_HEAD_DIM], pl.INT8
-                ] = pl.slice(csa_idx_wq_b, [Q_LORA, IDX_N_HEADS * IDX_HEAD_DIM], [type_index * Q_LORA, 0])
+                    [Q_LORA, IDX_N_HEADS * IDX_HEAD_DIM], pl.INT8, pl.NZ
+                ] = csa_idx_wq_b[type_index]
                 idx_wq_b_scale_csa: pl.Tensor[[IDX_N_HEADS * IDX_HEAD_DIM], pl.FP32] = (
                     pl.slice(csa_idx_wq_b_scale, [IDX_N_HEADS * IDX_HEAD_DIM], [type_index * IDX_N_HEADS * IDX_HEAD_DIM])
                 )
-                idx_weights_proj_csa: pl.Tensor[[D, IDX_N_HEADS], pl.BF16] = pl.slice(
-                    csa_weights_proj, [D, IDX_N_HEADS], [type_index * D, 0]
-                )
+                idx_weights_proj_csa: pl.Tensor[[D, IDX_N_HEADS], pl.BF16, pl.NZ] = csa_weights_proj[type_index]
                 csa_inner_wkv_csa: pl.Tensor[[INNER_OUT_DIM, D], pl.BF16] = (
                     pl.slice(csa_inner_wkv, [INNER_OUT_DIM, D], [type_index * INNER_OUT_DIM, 0])
                 )
@@ -1526,16 +1526,16 @@ def _prefill_request(
     hc_attn_scale: pl.Tensor[[FWD_NUM_LAYERS * 3], pl.FP32],
     hc_attn_base: pl.Tensor[[FWD_NUM_LAYERS * MIX_HC], pl.FP32],
     attn_norm_w: pl.Tensor[[FWD_NUM_LAYERS * D], pl.BF16],
-    wq_a: pl.Tensor[[FWD_NUM_LAYERS * D, Q_LORA], pl.BF16],
-    wq_b: pl.Tensor[[FWD_NUM_LAYERS * Q_LORA, H * HEAD_DIM], pl.INT8],
+    wq_a: pl.Tensor[[FWD_NUM_LAYERS, D, Q_LORA], pl.BF16, pl.NZ],
+    wq_b: pl.Tensor[[FWD_NUM_LAYERS, Q_LORA, H * HEAD_DIM], pl.INT8, pl.NZ],
     wq_b_scale: pl.Tensor[[FWD_NUM_LAYERS * H * HEAD_DIM], pl.FP32],
-    wkv: pl.Tensor[[FWD_NUM_LAYERS * D, HEAD_DIM], pl.BF16],
+    wkv: pl.Tensor[[FWD_NUM_LAYERS, D, HEAD_DIM], pl.BF16, pl.NZ],
     gamma_cq: pl.Tensor[[FWD_NUM_LAYERS * Q_LORA], pl.BF16],
     gamma_ckv: pl.Tensor[[FWD_NUM_LAYERS * HEAD_DIM], pl.BF16],
     kv_cache: pl.InOut[pl.Tensor[[FWD_ORI_BLOCK_NUM_DYN, BLOCK_SIZE, 1, HEAD_DIM], pl.BF16]],
     attn_sink: pl.Tensor[[FWD_NUM_LAYERS * H], pl.FP32],
-    wo_a: pl.Tensor[[FWD_NUM_LAYERS * O_GROUPS, O_LORA, O_GROUP_IN], pl.BF16],
-    wo_b: pl.Tensor[[FWD_NUM_LAYERS * D, O_GROUPS * O_LORA], pl.INT8],
+    wo_a: pl.Tensor[[FWD_NUM_LAYERS * O_GROUPS, O_LORA, O_GROUP_IN], pl.BF16, pl.NZ],
+    wo_b: pl.Tensor[[FWD_NUM_LAYERS * O_GROUPS, D, O_LORA], pl.INT8, pl.NZ],
     wo_b_scale: pl.Tensor[[FWD_NUM_LAYERS * D], pl.FP32],
     hca_cmp_kv: pl.InOut[pl.Tensor[[FWD_HCA_CMP_BLOCK_NUM_DYN, HCA_CMP_STORAGE_BLOCK_SIZE, 1, HEAD_DIM], pl.BF16]],
     csa_cmp_kv: pl.InOut[pl.Tensor[[FWD_CSA_CMP_BLOCK_NUM_DYN, CSA_CMP_STORAGE_BLOCK_SIZE, 1, HEAD_DIM], pl.BF16]],
@@ -1550,9 +1550,9 @@ def _prefill_request(
     csa_cmp_norm_w: pl.Tensor[[CSA_NUM_LAYERS * HEAD_DIM], pl.BF16],
     csa_compress_state: pl.InOut[pl.Tensor[[FWD_CSA_STATE_BLOCK_NUM_DYN, CSA_STATE_BLOCK_SIZE, CSA_COMPRESS_STATE_DIM], pl.FP32]],
     csa_hadamard_idx: pl.Tensor[[CSA_NUM_LAYERS * IDX_HEAD_DIM, IDX_HEAD_DIM], pl.BF16],
-    csa_idx_wq_b: pl.Tensor[[CSA_NUM_LAYERS * Q_LORA, IDX_N_HEADS * IDX_HEAD_DIM], pl.INT8],
+    csa_idx_wq_b: pl.Tensor[[CSA_NUM_LAYERS, Q_LORA, IDX_N_HEADS * IDX_HEAD_DIM], pl.INT8, pl.NZ],
     csa_idx_wq_b_scale: pl.Tensor[[CSA_NUM_LAYERS * IDX_N_HEADS * IDX_HEAD_DIM], pl.FP32],
-    csa_weights_proj: pl.Tensor[[CSA_NUM_LAYERS * D, IDX_N_HEADS], pl.BF16],
+    csa_weights_proj: pl.Tensor[[CSA_NUM_LAYERS, D, IDX_N_HEADS], pl.BF16, pl.NZ],
     csa_inner_wkv: pl.Tensor[[CSA_NUM_LAYERS * INNER_OUT_DIM, D], pl.BF16],
     csa_inner_wgate: pl.Tensor[[CSA_NUM_LAYERS * INNER_OUT_DIM, D], pl.BF16],
     csa_inner_ape: pl.Tensor[[CSA_NUM_LAYERS * CSA_COMPRESS_RATIO, INNER_OUT_DIM], pl.FP32],
@@ -1584,17 +1584,17 @@ def _prefill_request(
     gate_w: pl.Tensor[[FWD_NUM_LAYERS * N_EXPERTS_GLOBAL, D], pl.FP32],
     gate_bias: pl.Tensor[[FWD_NUM_LAYERS * N_EXPERTS_GLOBAL], pl.FP32],
     tid2eid: pl.Tensor[[FWD_NUM_LAYERS * VOCAB, TOPK], pl.INT32],
-    routed_w1: pl.Tensor[[FWD_NUM_LAYERS * N_LOCAL, MOE_INTER, D], pl.INT8],
+    routed_w1: pl.Tensor[[FWD_NUM_LAYERS * N_LOCAL, MOE_INTER, D], pl.INT8, pl.NZ],
     routed_w1_scale: pl.Tensor[[FWD_NUM_LAYERS * N_LOCAL, MOE_INTER], pl.FP32],
-    routed_w3: pl.Tensor[[FWD_NUM_LAYERS * N_LOCAL, MOE_INTER, D], pl.INT8],
+    routed_w3: pl.Tensor[[FWD_NUM_LAYERS * N_LOCAL, MOE_INTER, D], pl.INT8, pl.NZ],
     routed_w3_scale: pl.Tensor[[FWD_NUM_LAYERS * N_LOCAL, MOE_INTER], pl.FP32],
-    routed_w2: pl.Tensor[[FWD_NUM_LAYERS * N_LOCAL, D, MOE_INTER], pl.INT8],
+    routed_w2: pl.Tensor[[FWD_NUM_LAYERS * N_LOCAL, D, MOE_INTER], pl.INT8, pl.NZ],
     routed_w2_scale: pl.Tensor[[FWD_NUM_LAYERS * N_LOCAL, D], pl.FP32],
-    shared_w1: pl.Tensor[[FWD_NUM_LAYERS * MOE_INTER, D], pl.INT8],
+    shared_w1: pl.Tensor[[FWD_NUM_LAYERS, MOE_INTER, D], pl.INT8, pl.NZ],
     shared_w1_scale: pl.Tensor[[FWD_NUM_LAYERS * MOE_INTER], pl.FP32],
-    shared_w3: pl.Tensor[[FWD_NUM_LAYERS * MOE_INTER, D], pl.INT8],
+    shared_w3: pl.Tensor[[FWD_NUM_LAYERS, MOE_INTER, D], pl.INT8, pl.NZ],
     shared_w3_scale: pl.Tensor[[FWD_NUM_LAYERS * MOE_INTER], pl.FP32],
-    shared_w2: pl.Tensor[[FWD_NUM_LAYERS * D, MOE_INTER], pl.INT8],
+    shared_w2: pl.Tensor[[FWD_NUM_LAYERS, D, MOE_INTER], pl.INT8, pl.NZ],
     shared_w2_scale: pl.Tensor[[FWD_NUM_LAYERS * D], pl.FP32],
     num_tokens_per_owner: pl.Tensor[[N_RANKS], pl.INT32],
     cp_hidden_tail_window: pld.DistributedTensor[[CP_TAIL_WINDOW_ROWS, D], pl.BF16],
@@ -1849,16 +1849,16 @@ def l3_prefill_fwd(
     hc_attn_scale: pl.Tensor[[N_RANKS, FWD_NUM_LAYERS * 3], pl.FP32],
     hc_attn_base: pl.Tensor[[N_RANKS, FWD_NUM_LAYERS * MIX_HC], pl.FP32],
     attn_norm_w: pl.Tensor[[N_RANKS, FWD_NUM_LAYERS * D], pl.BF16],
-    wq_a: pl.Tensor[[N_RANKS, FWD_NUM_LAYERS * D, Q_LORA], pl.BF16],
-    wq_b: pl.Tensor[[N_RANKS, FWD_NUM_LAYERS * Q_LORA, H * HEAD_DIM], pl.INT8],
+    wq_a: pl.Tensor[[N_RANKS, FWD_NUM_LAYERS, D, Q_LORA], pl.BF16],
+    wq_b: pl.Tensor[[N_RANKS, FWD_NUM_LAYERS, Q_LORA, H * HEAD_DIM], pl.INT8],
     wq_b_scale: pl.Tensor[[N_RANKS, FWD_NUM_LAYERS * H * HEAD_DIM], pl.FP32],
-    wkv: pl.Tensor[[N_RANKS, FWD_NUM_LAYERS * D, HEAD_DIM], pl.BF16],
+    wkv: pl.Tensor[[N_RANKS, FWD_NUM_LAYERS, D, HEAD_DIM], pl.BF16],
     gamma_cq: pl.Tensor[[N_RANKS, FWD_NUM_LAYERS * Q_LORA], pl.BF16],
     gamma_ckv: pl.Tensor[[N_RANKS, FWD_NUM_LAYERS * HEAD_DIM], pl.BF16],
     kv_cache: pl.InOut[pl.Tensor[[N_RANKS, FWD_ORI_BLOCK_NUM_DYN, BLOCK_SIZE, 1, HEAD_DIM], pl.BF16]],
     attn_sink: pl.Tensor[[N_RANKS, FWD_NUM_LAYERS * H], pl.FP32],
     wo_a: pl.Tensor[[N_RANKS, FWD_NUM_LAYERS * O_GROUPS, O_LORA, O_GROUP_IN], pl.BF16],
-    wo_b: pl.Tensor[[N_RANKS, FWD_NUM_LAYERS * D, O_GROUPS * O_LORA], pl.INT8],
+    wo_b: pl.Tensor[[N_RANKS, FWD_NUM_LAYERS * O_GROUPS, D, O_LORA], pl.INT8],
     wo_b_scale: pl.Tensor[[N_RANKS, FWD_NUM_LAYERS * D], pl.FP32],
     hca_cmp_kv: pl.InOut[pl.Tensor[[N_RANKS, FWD_HCA_CMP_BLOCK_NUM_DYN, HCA_CMP_STORAGE_BLOCK_SIZE, 1, HEAD_DIM], pl.BF16]],
     csa_cmp_kv: pl.InOut[pl.Tensor[[N_RANKS, FWD_CSA_CMP_BLOCK_NUM_DYN, CSA_CMP_STORAGE_BLOCK_SIZE, 1, HEAD_DIM], pl.BF16]],
@@ -1873,9 +1873,9 @@ def l3_prefill_fwd(
     csa_cmp_norm_w: pl.Tensor[[N_RANKS, CSA_NUM_LAYERS * HEAD_DIM], pl.BF16],
     csa_compress_state: pl.InOut[pl.Tensor[[N_RANKS, FWD_CSA_STATE_BLOCK_NUM_DYN, CSA_STATE_BLOCK_SIZE, CSA_COMPRESS_STATE_DIM], pl.FP32]],
     csa_hadamard_idx: pl.Tensor[[N_RANKS, CSA_NUM_LAYERS * IDX_HEAD_DIM, IDX_HEAD_DIM], pl.BF16],
-    csa_idx_wq_b: pl.Tensor[[N_RANKS, CSA_NUM_LAYERS * Q_LORA, IDX_N_HEADS * IDX_HEAD_DIM], pl.INT8],
+    csa_idx_wq_b: pl.Tensor[[N_RANKS, CSA_NUM_LAYERS, Q_LORA, IDX_N_HEADS * IDX_HEAD_DIM], pl.INT8],
     csa_idx_wq_b_scale: pl.Tensor[[N_RANKS, CSA_NUM_LAYERS * IDX_N_HEADS * IDX_HEAD_DIM], pl.FP32],
-    csa_weights_proj: pl.Tensor[[N_RANKS, CSA_NUM_LAYERS * D, IDX_N_HEADS], pl.BF16],
+    csa_weights_proj: pl.Tensor[[N_RANKS, CSA_NUM_LAYERS, D, IDX_N_HEADS], pl.BF16],
     csa_inner_wkv: pl.Tensor[[N_RANKS, CSA_NUM_LAYERS * INNER_OUT_DIM, D], pl.BF16],
     csa_inner_wgate: pl.Tensor[[N_RANKS, CSA_NUM_LAYERS * INNER_OUT_DIM, D], pl.BF16],
     csa_inner_ape: pl.Tensor[[N_RANKS, CSA_NUM_LAYERS * CSA_COMPRESS_RATIO, INNER_OUT_DIM], pl.FP32],
@@ -1914,11 +1914,11 @@ def l3_prefill_fwd(
     routed_w3_scale: pl.Tensor[[N_RANKS, FWD_NUM_LAYERS * N_LOCAL, MOE_INTER], pl.FP32],
     routed_w2: pl.Tensor[[N_RANKS, FWD_NUM_LAYERS * N_LOCAL, D, MOE_INTER], pl.INT8],
     routed_w2_scale: pl.Tensor[[N_RANKS, FWD_NUM_LAYERS * N_LOCAL, D], pl.FP32],
-    shared_w1: pl.Tensor[[N_RANKS, FWD_NUM_LAYERS * MOE_INTER, D], pl.INT8],
+    shared_w1: pl.Tensor[[N_RANKS, FWD_NUM_LAYERS, MOE_INTER, D], pl.INT8],
     shared_w1_scale: pl.Tensor[[N_RANKS, FWD_NUM_LAYERS * MOE_INTER], pl.FP32],
-    shared_w3: pl.Tensor[[N_RANKS, FWD_NUM_LAYERS * MOE_INTER, D], pl.INT8],
+    shared_w3: pl.Tensor[[N_RANKS, FWD_NUM_LAYERS, MOE_INTER, D], pl.INT8],
     shared_w3_scale: pl.Tensor[[N_RANKS, FWD_NUM_LAYERS * MOE_INTER], pl.FP32],
-    shared_w2: pl.Tensor[[N_RANKS, FWD_NUM_LAYERS * D, MOE_INTER], pl.INT8],
+    shared_w2: pl.Tensor[[N_RANKS, FWD_NUM_LAYERS, D, MOE_INTER], pl.INT8],
     shared_w2_scale: pl.Tensor[[N_RANKS, FWD_NUM_LAYERS * D], pl.FP32],
     hc_head_fn: pl.Tensor[[N_RANKS, HC_MULT, HC_DIM], pl.FP32],
     hc_head_scale: pl.Tensor[[N_RANKS, 1], pl.FP32],
@@ -2119,7 +2119,12 @@ def _make_stacked_spec(name, base_specs, cache_block_nums=None):
 
     spec = base_specs[name]
     count = _layer_count(name)
-    packed_shape = [spec.shape[0], count * spec.shape[1], *spec.shape[2:]]
+    stacks_on_new_axis = name in NZ_ROW_STACKED_NAMES
+    packed_shape = (
+        [spec.shape[0], count, *spec.shape[1:]]
+        if stacks_on_new_axis
+        else [spec.shape[0], count * spec.shape[1], *spec.shape[2:]]
+    )
 
     def init_value():
         if cache_block_nums and name in cache_block_nums:
@@ -2133,6 +2138,8 @@ def _make_stacked_spec(name, base_specs, cache_block_nums=None):
             packed = torch.cat(rows, dim=0)
             return packed.unsqueeze(0).expand(N_RANKS, -1, -1).contiguous()
         base_init = spec.init_value
+        if stacks_on_new_axis:
+            return torch.stack([base_init() for _ in range(count)], dim=1)
         return torch.cat([base_init() for _ in range(count)], dim=1)
 
     # Caches the kernel writes in place (kv_cache) are outputs read back for
@@ -2342,6 +2349,7 @@ def build_tensor_specs(
 ):
     import torch
     from golden import TensorSpec
+    from utils import pack_nz
 
     if CP_SIZE != N_RANKS or CP_SIZE <= 1:
         raise ValueError("Prefill requires CP=EP>1; CP1 is deferred.")
@@ -2361,7 +2369,7 @@ def build_tensor_specs(
 
     def init_lm_head_weight():
         shards = (torch.randn(LM_HEAD_TP_SIZE, VOCAB_PER_TP, D) / D ** 0.5).to(torch.bfloat16)
-        return torch.stack([shards[r % LM_HEAD_TP_SIZE] for r in range(N_RANKS)], dim=0)
+        return pack_nz(torch.stack([shards[r % LM_HEAD_TP_SIZE] for r in range(N_RANKS)], dim=0))
 
     # Active owners carry requests; other ranks have zero tokens and -1 logit indices.
     def init_logit_row_indices():
