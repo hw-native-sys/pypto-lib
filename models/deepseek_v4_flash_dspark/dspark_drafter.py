@@ -158,7 +158,7 @@ MAIN_IN = DSPARK_DRAFT_LAYERS * D
 WIN = M.sliding_window
 
 # tiling
-MAIN_PROJ_T_TILE = 16     # cube M-tile; matmul rows must be a multiple of 16
+MAIN_PROJ_T_TILE = 128    # cube M-tile; matmul rows must be a multiple of 16
 MAIN_PROJ_N_TILE = 128    # 32 output blocks over D
 MAIN_PROJ_K_TILE = 512    # 24 reduction steps over MAIN_IN
 

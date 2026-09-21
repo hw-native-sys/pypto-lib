@@ -32,15 +32,15 @@ N_HASH_LAYERS = M.num_hash_layers
 T_TILE = 8
 NORM_TOKEN_TILE = 4
 GATE_T_TILE = 8
-GATE_M_TILE = 16        # cube M-tile: matmul rows must be a multiple of 16 (fractal)
-GATE_N_TILE = 16        # expert columns per gate spmd block
+GATE_M_TILE = 32        # cube M-tile: matmul rows must be a multiple of 16 (fractal)
+GATE_N_TILE = 32        # expert columns per gate spmd block
 assert N_EXPERTS % GATE_N_TILE == 0
 T_PAD = ((T + GATE_M_TILE - 1) // GATE_M_TILE) * GATE_M_TILE
 D_TILE = 256
 ROW_PAD = 8
 FFN_REDUCE_TILE = D // ROW_PAD
 assert D % ROW_PAD == 0
-GATE_D_TILE = 2048
+GATE_D_TILE = 1024
 assert D % GATE_D_TILE == 0, "gate K-loop must cover D"
 QUANT_TILE = 256
 SCORE_PAD = 256         # padded expert row for sort32 + mrgsort

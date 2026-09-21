@@ -122,6 +122,7 @@ def _expert_shared(
         for row_block in pl.spmd(
             SH_VALID_M // SH_ROWS_PER_BLOCK,
             name_hint="sh_gate_up_act_q",
+            allow_early_resolve=True,
         ):
             row0 = row_block * SH_ROWS_PER_BLOCK
             x_scale = pl.slice(
@@ -229,6 +230,7 @@ def _expert_shared(
         for db_idx in pl.spmd(
             D // (W2_INNER * D_OUT_TILE),
             name_hint="sh_w2_mm",
+            allow_early_resolve=True,
         ):
             d_base = db_idx * (W2_INNER * D_OUT_TILE)
             for dg in pl.range(W2_INNER):
