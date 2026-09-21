@@ -50,6 +50,18 @@ FWD_HCA_WEIGHT_BANK_SIZE = 20 if FWD_WEIGHT_BANK_SIZE == 43 else 1
 
 config.TP = TP_SIZE
 config.EP = EP_SIZE
+# Standalone bring-up compiles for 16 routed experts per rank (the deployment
+# density): the checkpoint's full routing space pushes a dispatched task's
+# producer fanin past the runtime's CHIP_MAX_FANIN=128 cap at the small
+# worlds. Serving imports this module through its own context (argv[0]
+# marker) and keeps the checkpoint's routing space.
+if sys.argv[0] != "pypto-serving-dspark":
+    import dataclasses
+
+    config.FLASH = dataclasses.replace(
+        config.FLASH,
+        n_routed_experts=config.FLASH.n_routed_experts // 16 * EP_SIZE,
+    )
 
 import decode_csa as csa
 import decode_hca as hca

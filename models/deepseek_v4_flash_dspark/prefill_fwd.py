@@ -11,12 +11,37 @@
 """DeepSeek-V4 Flash DSpark 43-layer layer-major DSA-CP prefill forward with LM head and greedy sampling."""
 
 import argparse
+import dataclasses
 import os
+import sys
 
 import pypto.language as pl
 import pypto.language.distributed as pld
 from golden import run
 from pypto.ir import DistributedConfig
+
+import config as _config
+
+
+def _ep_from_argv(default: int = 2) -> int:
+    for index, token in enumerate(sys.argv):
+        if token == "--ep" and index + 1 < len(sys.argv):
+            return int(sys.argv[index + 1])
+        if token.startswith("--ep="):
+            return int(token.split("=", 1)[1])
+    return default
+
+
+# Standalone bring-up compiles for 16 routed experts per rank (the deployment
+# density): the checkpoint's full routing space pushes a dispatched task's
+# producer fanin past the runtime's CHIP_MAX_FANIN=128 cap at the small
+# worlds. Serving imports this module through its own context (argv[0]
+# marker) and keeps the checkpoint's routing space.
+if sys.argv[0] != "pypto-serving-dspark":
+    _config.FLASH = dataclasses.replace(
+        _config.FLASH,
+        n_routed_experts=_config.FLASH.n_routed_experts // 16 * _ep_from_argv(),
+    )
 
 from moe import (
     AUX_PAD,

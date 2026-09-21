@@ -12,7 +12,6 @@
 
 # Sub-kernels freeze EP / n_routed_experts into their shapes at import
 # time, so read --ep from argv and override config before importing them below.
-import dataclasses
 import functools
 import sys
 
@@ -33,7 +32,15 @@ def _parse_ep_argv():
 
 EP = _parse_ep_argv()
 config.EP = EP
-config.FLASH = dataclasses.replace(config.FLASH, n_routed_experts=config.FLASH.n_routed_experts // 16 * EP)
+# The routed-expert count is a property of the checkpoint, not of the world:
+# every rank routes over the full set and owns n_routed / EP local experts.
+# Bring-up used to shrink the set to 16 experts per rank at every world size,
+# which matched the 256-expert checkpoint only at EP16 and gave smaller worlds
+# a routing space the checkpoint never defines.
+if config.FLASH.n_routed_experts % EP:
+    raise ValueError(
+        f"FLASH n_routed_experts={config.FLASH.n_routed_experts} must be divisible by --ep {EP}"
+    )
 config.RECV_MAX = EP * config.MOE_TOKENS
 
 import pypto.language as pl
@@ -69,6 +76,11 @@ MOE_INTER = M.moe_intermediate_size
 N_RANKS = EP
 N_EXPERTS_GLOBAL = M.n_routed_experts
 N_LOCAL = N_EXPERTS_GLOBAL // N_RANKS
+# TaskAllocator heap pressure scales with the per-rank lane count (N_LOCAL);
+# the 256 MiB per-ring runtime default was sized for the bring-up world of 16
+# local experts per rank. Keep EP16 at that default and give smaller worlds
+# proportionally more room (EP2 owns 128 of the checkpoint's 256 experts).
+MOE_RING_HEAP = (1 << 28) * max(1, N_LOCAL // 16)
 N_ROUTES = T * TOPK
 
 # recv_x/recv_aux laid out [expert, source, slot], flattened to
@@ -1409,6 +1421,7 @@ if __name__ == "__main__":
             platform=args.platform,
             enable_chip_swimlane=args.enable_chip_swimlane,
             log_level=args.log_level,
+            ring_heap=MOE_RING_HEAP,
         ),
         rtol=1e-3,
         atol=1e-3,

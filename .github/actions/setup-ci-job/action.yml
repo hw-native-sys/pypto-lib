@@ -34,6 +34,8 @@ description: >-
                                   end-to-end job reads these; together they are
                                   about 350 GiB, so they usually sit on a data
                                   volume rather than beside CI_CACHE_ROOT
+    PYPTO_DSV4_DSPARK_MODEL_DIR   the dspark W8A8 checkpoint — only the serving
+                                  job reads this
 
   The bundle (toolchain: bundle) deliberately has no entry here: its location is
   not a free choice, so there is nothing for a host to declare. The prefix
@@ -230,6 +232,7 @@ runs:
           echo "  PYPTO_DSV4_MODEL_DIR=/path/to/dsv4-flash-w8a8"
           echo "  PYPTO_DSV4_FLASH_CKPT_DIR=/path/to/DeepSeek-V4-Flash"
           echo "  PYPTO_DSV4_FLASH_WEIGHTS_DIR=/path/to/DeepSeek-V4-Flash-ep8-tp2"
+          echo "  PYPTO_DSV4_DSPARK_MODEL_DIR=/path/to/dsv4-flash-dspark-w8a8"
           echo "  CANN_ROOT=/usr/local/Ascend/cann-9.0.0"
           echo "(CANN_ROOT is only needed on device runners; CI_CACHE_ROOT is"
           echo " created if absent. The service reads .env at startup — restart"
