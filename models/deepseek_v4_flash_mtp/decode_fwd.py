@@ -1571,13 +1571,16 @@ def build_preamble_tensor_specs(
         cmp_block_num=cmp_block_num,
         idx_block_num=idx_block_num,
     )
-    embed_weight = torch.randn(MODEL_CONFIG.vocab_size, D, dtype=torch.bfloat16)
+    def init_embed_weight():
+        embed_weight = torch.randn(MODEL_CONFIG.vocab_size, D, dtype=torch.bfloat16)
+        return embed_weight.unsqueeze(0).expand(N_RANKS, -1, -1).contiguous()
+
     return {
         "embed_weight": TensorSpec(
             "embed_weight",
             [N_RANKS, MODEL_CONFIG.vocab_size, D],
             torch.bfloat16,
-            init_value=lambda: embed_weight.unsqueeze(0).expand(N_RANKS, -1, -1).contiguous(),
+            init_value=init_embed_weight,
             resident="stacked",
         ),
         "block_table": metadata_specs["block_table"],

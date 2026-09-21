@@ -13,6 +13,7 @@
 # Sub-kernels freeze EP / n_routed_experts into their shapes at import
 # time, so read --ep from argv and override config before importing them below.
 import dataclasses
+import functools
 import sys
 
 import config
@@ -1148,11 +1149,55 @@ def _profile_routes(active_tokens):
     return routes
 
 
+# Routed = MXFP4 (gen_routed_weight), shared = MXFP8 (gen_shared_weight). This
+# is an integration test whose x_next-equivalent output is dominated by near-zero
+# residual+FFN cancellations, so it keeps the smaller *behaviorally-calibrated* magnitude
+# (random fixtures blow up the relative metric at the real ~2.5e-2 magnitude); only the
+# grid SHAPE (FP4/FP8 discreteness, scale CV) matches the real distribution.
+ROUTED_DEQUANT_STD = {"w1": 1.08e-2, "w2": 2.54e-2, "w3": 1.10e-2}
+SHARED_DEQUANT_STD = {"w1": 7.65e-3, "w2": 2.39e-2, "w3": 7.39e-3}
+
+
+@functools.cache
+def _routed_weights():
+    """Per-rank routed expert weights (different shards), generated once per process."""
+    import torch
+    from expert_routed import gen_routed_weight
+
+    shapes = {
+        "w1": (N_LOCAL, MOE_INTER, D),
+        "w3": (N_LOCAL, MOE_INTER, D),
+        "w2": (N_LOCAL, D, MOE_INTER),
+    }
+    weights = {}
+    for key, shape in shapes.items():
+        per_rank = [gen_routed_weight(shape, ROUTED_DEQUANT_STD[key]) for _ in range(N_RANKS)]
+        weights[f"routed_{key}"] = torch.stack([w_i8 for w_i8, _ in per_rank])
+        weights[f"routed_{key}_scale"] = torch.stack([w_s for _, w_s in per_rank])
+    return weights
+
+
+@functools.cache
+def _shared_weights():
+    """Shared expert weights replicated across ranks, generated once per process."""
+    from expert_shared import gen_shared_weight
+
+    shapes = {
+        "w1": ((MOE_INTER, D), 0.50),
+        "w3": ((MOE_INTER, D), 0.50),
+        "w2": ((D, MOE_INTER), 0.33),
+    }
+    weights = {}
+    for key, (shape, chan_cv) in shapes.items():
+        w_i8, w_s = gen_shared_weight(shape, SHARED_DEQUANT_STD[key], chan_cv=chan_cv)
+        weights[f"shared_{key}"] = w_i8.unsqueeze(0).expand(N_RANKS, -1, -1).contiguous()
+        weights[f"shared_{key}_scale"] = w_s.unsqueeze(0).expand(N_RANKS, -1).contiguous()
+    return weights
+
+
 def _build_tensor_specs(layer_id, num_tokens, routing, fixture_rounds):
     import torch
     from golden import ScalarSpec, TensorSpec
-    from expert_routed import gen_routed_weight
-    from expert_shared import gen_shared_weight
 
     retain_round_axis = fixture_rounds is not None
     rounds = fixture_rounds if retain_round_axis else 1
@@ -1163,14 +1208,6 @@ def _build_tensor_specs(layer_id, num_tokens, routing, fixture_rounds):
     if routing == "real":
         assert layer_id < M.num_hash_layers, "the routing profile requires a hash-routing layer"
         real_routes = _profile_routes(max(0, min(T, num_tokens)))
-
-    # Routed = MXFP4 (gen_routed_weight), shared = MXFP8 (gen_shared_weight). This
-    # is an integration test whose x_next-equivalent output is dominated by near-zero
-    # residual+FFN cancellations, so it keeps the smaller *behaviorally-calibrated* magnitude
-    # (random fixtures blow up the relative metric at the real ~2.5e-2 magnitude); only the
-    # grid SHAPE (FP4/FP8 discreteness, scale CV) matches the real distribution.
-    ROUTED_DEQUANT_STD = {"w1": 1.08e-2, "w2": 2.54e-2, "w3": 1.10e-2}
-    SHARED_DEQUANT_STD = {"w1": 7.65e-3, "w2": 2.39e-2, "w3": 7.39e-3}
 
     # Shared (replicated) weights are broadcast across ranks; the routed
     # weights are per-rank shards.
@@ -1252,42 +1289,6 @@ def _build_tensor_specs(layer_id, num_tokens, routing, fixture_rounds):
         assert active_routes % N_EXPERTS_GLOBAL == 0, \
             "balanced routing requires the active route count to divide evenly across experts"
 
-    # Per-rank routed expert weights (different shards).
-    routed_w1_i8_list = []
-    routed_w1_s_list = []
-    routed_w3_i8_list = []
-    routed_w3_s_list = []
-    routed_w2_i8_list = []
-    routed_w2_s_list = []
-    for _ in range(N_RANKS):
-        w1_i8, w1_s = gen_routed_weight((N_LOCAL, MOE_INTER, D), ROUTED_DEQUANT_STD["w1"])
-        w3_i8, w3_s = gen_routed_weight((N_LOCAL, MOE_INTER, D), ROUTED_DEQUANT_STD["w3"])
-        w2_i8, w2_s = gen_routed_weight((N_LOCAL, D, MOE_INTER), ROUTED_DEQUANT_STD["w2"])
-        routed_w1_i8_list.append(w1_i8)
-        routed_w1_s_list.append(w1_s)
-        routed_w3_i8_list.append(w3_i8)
-        routed_w3_s_list.append(w3_s)
-        routed_w2_i8_list.append(w2_i8)
-        routed_w2_s_list.append(w2_s)
-
-    rw1_i8 = torch.stack(routed_w1_i8_list)
-    rw1_s = torch.stack(routed_w1_s_list)
-    rw3_i8 = torch.stack(routed_w3_i8_list)
-    rw3_s = torch.stack(routed_w3_s_list)
-    rw2_i8 = torch.stack(routed_w2_i8_list)
-    rw2_s = torch.stack(routed_w2_s_list)
-
-    # Shared expert weights — replicated across ranks.
-    sw1_i8, sw1_s = gen_shared_weight((MOE_INTER, D), SHARED_DEQUANT_STD["w1"], chan_cv=0.50)
-    sw3_i8, sw3_s = gen_shared_weight((MOE_INTER, D), SHARED_DEQUANT_STD["w3"], chan_cv=0.50)
-    sw2_i8, sw2_s = gen_shared_weight((D, MOE_INTER), SHARED_DEQUANT_STD["w2"], chan_cv=0.33)
-    sw1_i8 = sw1_i8.unsqueeze(0).expand(N_RANKS, -1, -1).contiguous()
-    sw1_s = sw1_s.unsqueeze(0).expand(N_RANKS, -1).contiguous()
-    sw3_i8 = sw3_i8.unsqueeze(0).expand(N_RANKS, -1, -1).contiguous()
-    sw3_s = sw3_s.unsqueeze(0).expand(N_RANKS, -1).contiguous()
-    sw2_i8 = sw2_i8.unsqueeze(0).expand(N_RANKS, -1, -1).contiguous()
-    sw2_s = sw2_s.unsqueeze(0).expand(N_RANKS, -1).contiguous()
-
     x_hc_shape = [N_RANKS, T, HC_MULT, D]
     input_ids_shape = [N_RANKS, T]
     if retain_round_axis:
@@ -1304,18 +1305,18 @@ def _build_tensor_specs(layer_id, num_tokens, routing, fixture_rounds):
         TensorSpec("gate_bias",     [N_RANKS, N_EXPERTS_GLOBAL],     torch.float32,  init_value=init_gate_bias),
         TensorSpec("tid2eid",       [N_RANKS, VOCAB, TOPK],          torch.int32,    init_value=init_tid2eid),
         TensorSpec("input_ids", input_ids_shape, torch.int64, init_value=init_input_ids),
-        TensorSpec("routed_w1",        [N_RANKS, N_LOCAL, MOE_INTER, D], torch.int8,    init_value=lambda: rw1_i8),
-        TensorSpec("routed_w1_scale",  [N_RANKS, N_LOCAL, MOE_INTER],    torch.float32, init_value=lambda: rw1_s),
-        TensorSpec("routed_w3",        [N_RANKS, N_LOCAL, MOE_INTER, D], torch.int8,    init_value=lambda: rw3_i8),
-        TensorSpec("routed_w3_scale",  [N_RANKS, N_LOCAL, MOE_INTER],    torch.float32, init_value=lambda: rw3_s),
-        TensorSpec("routed_w2",        [N_RANKS, N_LOCAL, D, MOE_INTER], torch.int8,    init_value=lambda: rw2_i8),
-        TensorSpec("routed_w2_scale",  [N_RANKS, N_LOCAL, D],            torch.float32, init_value=lambda: rw2_s),
-        TensorSpec("shared_w1",        [N_RANKS, MOE_INTER, D],          torch.int8,    init_value=lambda: sw1_i8),
-        TensorSpec("shared_w1_scale",  [N_RANKS, MOE_INTER],             torch.float32, init_value=lambda: sw1_s),
-        TensorSpec("shared_w3",        [N_RANKS, MOE_INTER, D],          torch.int8,    init_value=lambda: sw3_i8),
-        TensorSpec("shared_w3_scale",  [N_RANKS, MOE_INTER],             torch.float32, init_value=lambda: sw3_s),
-        TensorSpec("shared_w2",        [N_RANKS, D, MOE_INTER],          torch.int8,    init_value=lambda: sw2_i8),
-        TensorSpec("shared_w2_scale",  [N_RANKS, D],                     torch.float32, init_value=lambda: sw2_s),
+        TensorSpec("routed_w1",        [N_RANKS, N_LOCAL, MOE_INTER, D], torch.int8,    init_value=lambda: _routed_weights()["routed_w1"]),
+        TensorSpec("routed_w1_scale",  [N_RANKS, N_LOCAL, MOE_INTER],    torch.float32, init_value=lambda: _routed_weights()["routed_w1_scale"]),
+        TensorSpec("routed_w3",        [N_RANKS, N_LOCAL, MOE_INTER, D], torch.int8,    init_value=lambda: _routed_weights()["routed_w3"]),
+        TensorSpec("routed_w3_scale",  [N_RANKS, N_LOCAL, MOE_INTER],    torch.float32, init_value=lambda: _routed_weights()["routed_w3_scale"]),
+        TensorSpec("routed_w2",        [N_RANKS, N_LOCAL, D, MOE_INTER], torch.int8,    init_value=lambda: _routed_weights()["routed_w2"]),
+        TensorSpec("routed_w2_scale",  [N_RANKS, N_LOCAL, D],            torch.float32, init_value=lambda: _routed_weights()["routed_w2_scale"]),
+        TensorSpec("shared_w1",        [N_RANKS, MOE_INTER, D],          torch.int8,    init_value=lambda: _shared_weights()["shared_w1"]),
+        TensorSpec("shared_w1_scale",  [N_RANKS, MOE_INTER],             torch.float32, init_value=lambda: _shared_weights()["shared_w1_scale"]),
+        TensorSpec("shared_w3",        [N_RANKS, MOE_INTER, D],          torch.int8,    init_value=lambda: _shared_weights()["shared_w3"]),
+        TensorSpec("shared_w3_scale",  [N_RANKS, MOE_INTER],             torch.float32, init_value=lambda: _shared_weights()["shared_w3_scale"]),
+        TensorSpec("shared_w2",        [N_RANKS, D, MOE_INTER],          torch.int8,    init_value=lambda: _shared_weights()["shared_w2"]),
+        TensorSpec("shared_w2_scale",  [N_RANKS, D],                     torch.float32, init_value=lambda: _shared_weights()["shared_w2_scale"]),
         TensorSpec("x_next", x_hc_shape, torch.float32),
         ScalarSpec("layer_id",         torch.int32,                      layer_id),
         ScalarSpec("num_tokens",       torch.int32,                      num_tokens),
