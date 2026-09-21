@@ -418,13 +418,14 @@ jobs:
           echo "Entries selected for this change:" $CASES
           failed=()
           for f in $CASES; do
-            # Every --tp/--dp combination the entry accepts is one case, and
-            # a case needs TP x DP cards (.github/scripts/a5_parallel_cases.py).
+            # Every --tp/--dp/--ep combination the entry accepts is one
+            # case, and the card count is the world it asks for
+            # (.github/scripts/a5_parallel_cases.py).
             # Only this change's entries run, so multi-card cases may borrow
             # past this runner's device whitelist.
             if ! matrix=$(PYTHONPATH=$GITHUB_WORKSPACE/checkout python .github/scripts/a5_parallel_cases.py "$f"); then
               failed+=("$f")
-              echo "::error file=${f}::cannot read its --tp/--dp choices"
+              echo "::error file=${f}::cannot read its --tp/--dp/--ep choices"
               continue
             fi
             while read -r cards args; do

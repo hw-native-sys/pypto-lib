@@ -10,10 +10,18 @@
 
 The a5-v41-flash job runs an entry once per configuration its own command line
 accepts, so the matrix lives with the operator rather than in CI. This runs the
-entry up to ``parse_args`` and reads the ``choices`` of its ``--tp`` and
-``--dp`` options; every combination is one case, and the case needs TP x DP
-cards. Each output line is ``<cards> <arguments>``, e.g. ``8 --tp 4 --dp 2``.
-An entry that declares neither option prints a single ``1``.
+entry up to ``parse_args`` and reads the ``choices`` of its ``--tp``, ``--dp``
+and ``--ep`` options; every combination the entry accepts is one case. Each
+output line is ``<cards> <arguments>``, e.g. ``8 --tp 4 --dp 2``. An entry that
+declares none of them prints a single ``1``.
+
+Entries come in two shapes. Most size their world as TP x DP; ``--ep``, where
+they declare it at all, does not reach the run, so only ``--tp`` and ``--dp``
+are sent. An expert-parallel entry instead sizes its world with ``--ep`` and
+leaves DP implicit at EP / TP: it declares ``--ep`` and no ``--dp``, needs EP
+cards rather than TP, and has to be sent ``--ep`` too, or it falls back to the
+module default and rejects the card set the job borrowed. TP must divide EP
+there, so the combinations that do not are not cases.
 
 Usage: python .github/scripts/a5_parallel_cases.py <entry.py>
 """
@@ -22,8 +30,6 @@ import argparse
 import itertools
 import runpy
 import sys
-
-PARALLEL_FLAGS = ("--tp", "--dp")
 
 
 class _ParserReached(Exception):
@@ -54,12 +60,26 @@ def _values(parser, flag):
 
 def main():
     parser = _entry_parser(sys.argv[1])
-    for values in itertools.product(*(_values(parser, flag) for flag in PARALLEL_FLAGS)):
+    tp_values = _values(parser, "--tp")
+    dp_values = _values(parser, "--dp")
+    ep_values = _values(parser, "--ep")
+    # Only an entry that leaves DP implicit reads its world size off --ep.
+    if dp_values != [None]:
+        ep_values = [None]
+
+    for tp, dp, ep in itertools.product(tp_values, dp_values, ep_values):
         cards, arguments = 1, []
-        for flag, value in zip(PARALLEL_FLAGS, values):
+        for flag, value in (("--tp", tp), ("--dp", dp)):
             if value is not None:
                 cards *= int(value)
                 arguments += [flag, str(value)]
+        if ep is not None:
+            # ``cards`` is TP here: EP is the world and DP is EP / TP, so a TP
+            # that does not divide EP is not a configuration the entry accepts.
+            if int(ep) % cards:
+                continue
+            cards = int(ep)
+            arguments += ["--ep", str(ep)]
         print(cards, *arguments)
 
 

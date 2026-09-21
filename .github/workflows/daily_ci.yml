@@ -456,12 +456,12 @@ jobs:
           # editing. The entries split the `__main__` sentinel to stay out of
           # the a2a3 discovery, so it cannot be the filter here.
           for f in $(grep -rlE '^#\s*ci:\s*a5\s*$' models/deepseek_v4_1_flash --include='*.py' | sort); do
-            # Each --tp/--dp combination the entry's own command line accepts is
-            # one case (.github/scripts/a5_parallel_cases.py); an entry that
-            # declares neither runs once.
+            # Each --tp/--dp/--ep combination the entry's own command line
+            # accepts is one case (.github/scripts/a5_parallel_cases.py); an
+            # entry that declares none of them runs once.
             if ! matrix=$(PYTHONPATH=$GITHUB_WORKSPACE/checkout python .github/scripts/a5_parallel_cases.py "$f"); then
               failed+=("$f")
-              echo "::error file=${f}::cannot read its --tp/--dp choices"
+              echo "::error file=${f}::cannot read its --tp/--dp/--ep choices"
               printf '%s\tfail\n' "$f" >> results.tsv
               continue
             fi
