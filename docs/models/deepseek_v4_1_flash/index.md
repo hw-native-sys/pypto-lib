@@ -65,6 +65,7 @@ Once a kernel body lands, its owner can extend the same file with the thin
 | Shared Q/KV preprocessing | `qkv_proj_rope.py` (`q_proj_qr`, `q_proj_rope`, `kv_proj_rope`, `qkv_proj_rope` and Prefill variants) |
 | Shared output projection | `o_proj.py` (`grouped_output`, `o_proj`, `prefill_o_proj`) |
 | Expert parallelism | `moe.py` |
+| Layer composition | `prefill_layer.py` |
 | Shared configuration and goldens | `config.py`, `metadata.py`, `golden.py`, `attention_common.py` |
 | Quantization and RoPE tables | `quantization.py`, `rope_tables.py` |
 
@@ -258,7 +259,10 @@ and output groups are sharded across TP ranks. Each rank computes
 complete hidden output. Before EP8 dispatch, token-row ownership is assigned
 round-robin across the four TP ranks. This prevents replicated attention rows
 from being dispatched four times; MoE combine returns the rows to the TP
-layout. DSA context parallelism is intentionally out of scope.
+layout. The routed result therefore arrives partitioned across the group, with
+the rows a rank does not own left at zero, and one FP32 sum over the group
+restores the replicated residual stream the next layer's attention expects.
+DSA context parallelism is intentionally out of scope.
 
 The service capacity contract is 32 active sequences and 4,096 scheduled
 prefill token rows per DP group. With five reserved DSpark draft rows plus one
@@ -340,7 +344,12 @@ The implementation milestones are ordered by dependency:
    leaf: `python models/deepseek_v4_1_flash/prefill_c2a_full.py`.
 3. Implement C1A Full and the level-one candidate selector, then Reindex and Reuse.
 4. Implement the three-phase EP-MoE dispatch/local-expert/combine body.
-5. Compose the operators into the 40-layer prefill/decode token loop.
+5. Compose the operators into one layer, then into the 40-layer prefill/decode
+   token loop. `prefill_layer.py` is the prefill half of the first step: one
+   complete layer, the C2A Reuse attention sublayer followed by the EP MoE
+   sublayer, both through mHC and with the delayed pre-mix passed between them.
+   Run `python models/deepseek_v4_1_flash/prefill_layer.py`, which validates it
+   on two cards at TP1/DP2/EP2; the A5 job also runs TP2/DP2 on four cards.
 
 Until the leaf kernels and weight loader land, this directory is not a runnable
 model and is not exposed to `pypto-serving`.
