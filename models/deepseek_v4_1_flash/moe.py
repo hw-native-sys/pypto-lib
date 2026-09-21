@@ -11,6 +11,7 @@
 """Expert-parallel MoE dispatch, local expert compute, and routed-output combine."""
 
 import math
+import sys
 
 import pypto.language as pl
 import pypto.language.distributed as pld
@@ -1003,10 +1004,10 @@ __all__ = [
 ]
 
 
-if __name__ == "__main__":
+def validate(argv=None):
+    """Validate the complete mHC and MoE block against its golden reference."""
     import argparse
     import pathlib
-    import sys
 
     _model_dir = pathlib.Path(__file__).resolve().parent
     sys.path = [item for item in sys.path if pathlib.Path(item or ".").resolve() != _model_dir]
@@ -1031,7 +1032,7 @@ if __name__ == "__main__":
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--skip-shared", action="store_true", help="diagnostic only: zero shared expert output and still run gate/dispatch/routed/combine")
     parser.add_argument("--skip-transport", action="store_true", help="diagnostic only: bypass dispatch/routed/combine and write shared output on owner rows")
-    args = parser.parse_args()
+    args = parser.parse_args(argv)
 
     torch.manual_seed(args.seed)
     device_ids = [int(d) for d in args.device.split(",") if d != ""]
@@ -1080,7 +1081,25 @@ if __name__ == "__main__":
         atol=1e-3,
         compare_fn=compare_fn,
     )
+    return result
+
+
+def main():
+    """Run local validation and return a failing exit status on precision errors."""
+    result = validate()
     if not result.passed:
-        if result.error:
-            print(result.error)
-        raise SystemExit(1)
+        raise SystemExit(result.error or 1)
+
+
+if "pytest" in sys.modules:
+    import pytest
+
+    @pytest.mark.parametrize("tp,ep", [(2, 4), (4, 4)])
+    def test_precision(tp, ep, a5_args):
+        """Validate TP2/DP2 and TP4/DP1 with EP-sized device allocations."""
+        result = validate(a5_args(tp=tp, ep=ep))
+        assert result.passed, result.error
+
+
+if __name__ == "__main__":
+    main()

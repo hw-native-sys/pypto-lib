@@ -758,7 +758,7 @@ def compare_distributed_cache(actual, expected, *, actual_outputs, expected_outp
     return passed, "Every rank must preserve unmapped cache bytes and pass updated-cache precision"
 
 
-def run_swa(operator, mode):
+def run_swa(operator, mode, argv=None):
     """Run A5 validation for a production SWA operator."""
     capacity = C.DECODE_MAX_TOKENS if mode == "decode" else C.PREFILL_MAX_TOKENS
     parser = argparse.ArgumentParser(description=f"DeepSeek V4.1 {mode} SWA: A5 precision and timing")
@@ -777,7 +777,9 @@ def run_swa(operator, mode):
     parser.add_argument("--golden-data", help="replay a compatible data directory containing in/ and out/")
     parser.add_argument("--enable-chip-swimlane", type=int, default=0, choices=range(5))
     parser.add_argument("--enable-dep-gen", action="store_true")
-    args = parser.parse_args()
+    args = parser.parse_args(argv)
+    if args.tp != TP_SIZE:
+        parser.error(f"--tp {args.tp} does not match import-time TP_SIZE {TP_SIZE}")
     from pypto.ir import DistributedConfig
 
     args.bench = os.environ.get("PYPTO_BENCH", "0") == "1"
@@ -807,21 +809,39 @@ def run_swa(operator, mode):
         compare_fn={"output": compare_reduced, "window_cache": compare_distributed_cache,
                     "window_cache_scale": compare_scales})
     print(f"[SWA] work_dir={result.work_dir}")
-    if not result.passed:
-        raise SystemExit(1)
-    if args.compile_only:
+    if args.compile_only and result.passed:
         print("[SWA] Compilation passed; device accuracy was NOT validated.")
-    elif args.save_data:
+    elif args.save_data and result.passed:
         print(f"[SWA] Validated snapshot: {result.work_dir}/data")
+    return result
 
 
-def main():
+def validate(argv=None):
     """Validate the Decode SWA production operator on A5."""
-    run_swa(decode_attn_swa, "decode")
+    return run_swa(decode_attn_swa, "decode", argv=argv)
 
 
 # A2/A3 CI currently discovers runnable model files by the conventional entry
 # sentinel. Split its spelling so this A5-only command remains directly runnable.
 _SCRIPT_ENTRY_POINT = "__" + "main__"
+
+
+def main():
+    """Run local validation and return a failing exit status on precision errors."""
+    result = validate()
+    if not result.passed:
+        raise SystemExit(result.error or 1)
+
+
+if "pytest" in sys.modules:
+    import pytest
+
+    @pytest.mark.parametrize("tp,dp", [(1, 1), (2, 2), (4, 1)])
+    def test_precision(tp, dp, a5_args):
+        """Validate the operator against its golden reference on A5."""
+        result = validate(a5_args(tp=tp, dp=dp))
+        assert result.passed, result.error
+
+
 if __name__ == _SCRIPT_ENTRY_POINT:
     main()

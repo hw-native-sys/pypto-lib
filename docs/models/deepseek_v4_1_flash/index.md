@@ -358,3 +358,62 @@ an empty-work case. Use `-p a5 -d <allocated_device>` for the same test on a
 real A5 device. Full attention validation additionally uses
 `decode_c2a_full.py` and `prefill_c2a_full.py`; their fixtures use nonidentity
 state block mappings.
+
+## Pytest precision coverage
+
+Each implemented A5 entry contains its own `test_precision` function. Declare
+CI coverage with ordinary pytest parameters in that file, for example:
+
+```python
+@pytest.mark.parametrize("tp,dp", [(1, 1), (2, 2), (4, 1)])
+def test_precision(tp, dp, a5_args):
+    result = validate(a5_args(tp=tp, dp=dp))
+    assert result.passed, result.error
+```
+
+`validate` runs the existing golden harness and returns its result, including
+output and cache precision comparisons. `main` calls the same validation path
+for local execution. CLI choices remain independent of the cases selected for
+PR CI. The standard combinations are `(tp, dp) = (1, 1), (2, 2), (4, 1)`.
+Entries supporting only DP1 or exposing only TP keep TP1 and TP4; single-card
+entries run once. MoE uses EP4 with TP2 or TP4, corresponding to DP2 or DP1.
+Daily CI retains its existing CLI-based Cartesian-product sweep.
+
+The CI runner collects the tests in each selected `# ci: a5` file using pytest,
+then submits each node to `task-submit` with `tp * dp` cards, or `ep` cards
+for expert-parallel entries with implicit `dp = ep / tp`. The queued command
+runs **pytest on that node**, passing declared `--tp`/`--dp`/`--ep` options and allocated `--device`
+IDs. Each node runs in a fresh process because model shapes depend on CLI
+arguments at import time. PRs retain selection by the reverse-import graph.
+Changes to the pytest queue runner or this directory's `conftest.py` select
+all marked V4.1 implementations. Validation entry points reject explicit TP
+arguments that disagree with their import-time TP size.
+Daily CI continues to invoke the local main entry points with its existing matrix.
+
+With the development environment activated, inspect a file's tests:
+
+```bash
+python -m pytest models/deepseek_v4_1_flash/decode_attn_swa.py --collect-only -q
+```
+
+Run an individual precision case through the device queue:
+
+```bash
+task-submit --device auto --device-num 4 --run \
+  'python -m pytest "models/deepseek_v4_1_flash/decode_attn_swa.py::test_precision[4-1]" --tp 4 --dp 1 --device $TASK_DEVICE -v -s'
+```
+
+The fixture checks that test parameters match the process's TP/DP/EP options and
+that the allocated device count matches. For all declared cases, the CI runner
+handles the separate processes and allocations (requires the CI `activate.sh`):
+
+```bash
+python .github/scripts/run_a5_pytest.py models/deepseek_v4_1_flash/decode_attn_swa.py
+```
+
+Local script execution is still supported with all original CLI options:
+
+```bash
+task-submit --device auto --device-num 2 --run \
+  'python models/deepseek_v4_1_flash/decode_attn_swa.py -p a5 --tp 1 --dp 2 -d $TASK_DEVICE'
+```

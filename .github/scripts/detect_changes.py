@@ -30,8 +30,9 @@ Selection rules
 ``# ci: a5`` are device entries the A2/A3 and simulator sweeps must not pick
 up, so they carry no ``__main__`` sentinel and rule 1 cannot see them; the
 dedicated A5 pull-request job asks for them by name. Rule 2 has no counterpart
-there, because A5 coverage for changes outside ``models/`` is the nightly
-sweep's job.
+there, except for the pytest queue runner, whose changes select all V4.1
+entries. Changes to V4.1's conftest also select all its entries because pytest
+loads it implicitly.
 
 Imports resolve two ways. A bare module name (``from qkv_proj_rope import ...``)
 resolves against the importer's own directory, so that part of the graph is
@@ -272,6 +273,14 @@ def select_a5(changed):
         and c.startswith("models/")
         and os.path.isfile(c)
     ]
+    # Pytest loads conftest implicitly; the queue runner is outside models.
+    # Neither has reverse-import edges to the implementation test entries.
+    if set(changed) & {
+        "models/deepseek_v4_1_flash/conftest.py",
+        ".github/scripts/run_a5_pytest.py",
+    }:
+        seeds.extend(f for f in _iter_source_files()
+                     if f.startswith("models/deepseek_v4_1_flash/") and _is_a5_entry(f))
     reverse = build_reverse_graph()
     return sorted(f for f in closure(seeds, reverse) if _is_a5_entry(f))
 

@@ -367,8 +367,8 @@ jobs:
       github.event_name == 'pull_request' &&
       needs.detect-changes.outputs.a5_files != ''
     runs-on: [self-hosted, linux, npu-a5]
-    # Cases run one after another: every entry selected takes about an hour
-    # (63 cases), and this leaves room for one task-submit worst case
+    # Explicit pytest cases run sequentially, with room for one task-submit
+    # worst case
     # (--timeout 3600 queue wait + --max-time 900 run) on top.
     timeout-minutes: 180
     defaults:
@@ -409,43 +409,15 @@ jobs:
           PYPTO_LOG_LEVEL: error
           PYPTO_WARNING_LEVEL: none
           PYPTO_RUNTIME_LOG: error
+          A5_CI_ENTRIES: ${{ needs.detect-changes.outputs.a5_files }}
         run: |
           source activate.sh
-          set +e
-          # Chosen by detect-changes from this pull request's diff. A new
-          # operator joins by carrying `# ci: a5`; nothing here needs editing.
-          CASES="${{ needs.detect-changes.outputs.a5_files }}"
-          echo "Entries selected for this change:" $CASES
-          failed=()
-          for f in $CASES; do
-            # Every --tp/--dp/--ep combination the entry accepts is one
-            # case, and the card count is the world it asks for
-            # (.github/scripts/a5_parallel_cases.py).
-            # Only this change's entries run, so multi-card cases may borrow
-            # past this runner's device whitelist.
-            if ! matrix=$(PYTHONPATH=$GITHUB_WORKSPACE/checkout python .github/scripts/a5_parallel_cases.py "$f"); then
-              failed+=("$f")
-              echo "::error file=${f}::cannot read its --tp/--dp/--ep choices"
-              continue
-            fi
-            while read -r cards args; do
-              echo "::group::$f $args"
-              devnum_flag=""
-              [ "$cards" -gt 1 ] && devnum_flag="--device-num $cards --ignore-whitelist"
-              task-submit --device "$DEVICE_ID" $devnum_flag --timeout 3600 --max-time 900 \
-                --run "cd $GITHUB_WORKSPACE/checkout && source activate.sh && PYTHONPATH=$GITHUB_WORKSPACE/checkout python $f -p a5 $args -d \$TASK_DEVICE" < /dev/null
-              if [ $? -ne 0 ]; then
-                failed+=("$f $args")
-                echo "::error file=${f}::FAIL ($args)"
-              fi
-              echo "::endgroup::"
-            done <<< "$matrix"
-          done
-          if [ ${#failed[@]} -ne 0 ]; then
-            printf 'FAILED: %s\n' "${failed[@]}"
-            exit 1
+          if [ "${PYPTO_USE_UV:-false}" = "true" ]; then
+            uv pip install pytest
+          else
+            python -m pip install pytest
           fi
-          echo "Passed:" $CASES
+          python .github/scripts/run_a5_pytest.py $A5_CI_ENTRIES
 
       - name: Kill orphaned task-submit tasks
         if: always()

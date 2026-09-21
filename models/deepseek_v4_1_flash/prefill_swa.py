@@ -483,7 +483,7 @@ def make_staged_compare():
     }
 
 
-def run_prefill_swa():
+def run_prefill_swa(argv=None):
     """Run A5 validation for packed prefill SWA wired through mHC."""
     import argparse
     import os
@@ -507,7 +507,7 @@ def run_prefill_swa():
     parser.add_argument("--golden-data", help="replay a compatible data directory containing in/ and out/")
     parser.add_argument("--enable-chip-swimlane", type=int, default=0, choices=range(5))
     parser.add_argument("--enable-dep-gen", action="store_true")
-    args = parser.parse_args()
+    args = parser.parse_args(argv)
     args.bench = os.environ.get("PYPTO_BENCH", "0") == "1"
     args.requests = args.requests if args.requests is not None else min(args.tokens, 4)
     if args.epochs < 1:
@@ -540,10 +540,9 @@ def run_prefill_swa():
         compare_fn=make_staged_compare(),
     )
     print(f"[SWA+HC] work_dir={result.work_dir}")
-    if not result.passed:
-        raise SystemExit(1)
-    if args.compile_only:
+    if args.compile_only and result.passed:
         print("[SWA+HC] Compilation passed; device accuracy was NOT validated.")
+    return result
 
 
 __all__ = [
@@ -553,13 +552,31 @@ __all__ = [
 ]
 
 
-def main():
+def validate(argv=None):
     """Validate packed prefill SWA wired through mHC on A5."""
-    run_prefill_swa()
+    return run_prefill_swa(argv=argv)
 
 
 # A2/A3 CI currently discovers runnable model files by the conventional entry
 # sentinel. Split its spelling so this A5-only command remains directly runnable.
 _SCRIPT_ENTRY_POINT = "__" + "main__"
+
+
+def main():
+    """Run local validation and return a failing exit status on precision errors."""
+    result = validate()
+    if not result.passed:
+        raise SystemExit(result.error or 1)
+
+
+if "pytest" in sys.modules:
+    import pytest
+
+    @pytest.mark.parametrize("tp,dp", [(1, 1), (2, 2), (4, 1)])
+    def test_precision(tp, dp, a5_args):
+        """Validate the operator against its golden reference on A5."""
+        result = validate(a5_args(tp=tp, dp=dp))
+        assert result.passed, result.error
+
 if __name__ == _SCRIPT_ENTRY_POINT:
     main()

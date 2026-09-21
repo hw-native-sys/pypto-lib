@@ -594,7 +594,7 @@ def _precision_compare(name, compare):
     return compare_and_report
 
 
-def main():
+def validate(argv=None):
     """Validate the Engram block on A5 (or its simulator), single-rank or TP."""
     import argparse
 
@@ -614,7 +614,7 @@ def main():
     parser.add_argument("--sequence", type=int, default=4)
     parser.add_argument("--compile-only", action="store_true")
     parser.add_argument("--enable-chip-swimlane", type=int, nargs="?", const=1, default=0, choices=range(5))
-    args = parser.parse_args()
+    args = parser.parse_args(argv)
 
     if args.tp != TP_SIZE:
         raise ValueError(f"--tp {args.tp} disagrees with module TP_SIZE {TP_SIZE}")
@@ -662,8 +662,7 @@ def main():
             compare_fn={"out": _precision_compare("out", ratio_allclose(atol=1e-3, rtol=1e-2))},
             compile_only=args.compile_only,
         )
-    if not result.passed:
-        raise SystemExit(result.error or 1)
+    return result
 
 
 __all__ = [
@@ -682,5 +681,23 @@ __all__ = [
 
 
 _SCRIPT_ENTRY_POINT = "__" + "main__"
+
+
+def main():
+    """Run local validation and return a failing exit status on precision errors."""
+    result = validate()
+    if not result.passed:
+        raise SystemExit(result.error or 1)
+
+
+if "pytest" in sys.modules:
+    import pytest
+
+    @pytest.mark.parametrize("tp", [1, 4])
+    def test_precision(tp, a5_args):
+        """Validate the operator against its golden reference on A5."""
+        result = validate(a5_args(tp=tp))
+        assert result.passed, result.error
+
 if __name__ == _SCRIPT_ENTRY_POINT:
     main()

@@ -132,7 +132,7 @@ def _precision_compare(name, compare):
     return compare_and_report
 
 
-def main():
+def validate(argv=None):
     """Validate mHC residual expansion on A5."""
     import argparse
 
@@ -144,7 +144,7 @@ def main():
     parser.add_argument("--batch", type=int, default=2)
     parser.add_argument("--sequence", type=int, default=1)
     parser.add_argument("--compile-only", action="store_true")
-    args = parser.parse_args()
+    args = parser.parse_args(argv)
     result = run(
         fn=mhc_post_test,
         specs=build_mhc_post_tensor_specs(args.batch, args.sequence),
@@ -155,8 +155,7 @@ def main():
         compare_fn={"output": _precision_compare("output", ratio_allclose(atol=1e-4, rtol=1.0 / 128))},
         compile_only=args.compile_only,
     )
-    if not result.passed:
-        raise SystemExit(result.error or 1)
+    return result
 
 
 __all__ = [
@@ -170,5 +169,20 @@ __all__ = [
 # A2/A3 CI currently discovers runnable model files by the conventional entry
 # sentinel. Split its spelling so this A5-only command remains directly runnable.
 _SCRIPT_ENTRY_POINT = "__" + "main__"
+
+
+def main():
+    """Run local validation and return a failing exit status on precision errors."""
+    result = validate()
+    if not result.passed:
+        raise SystemExit(result.error or 1)
+
+
+def test_precision(a5_args):
+    """Validate the operator against its golden reference on A5."""
+    result = validate(a5_args())
+    assert result.passed, result.error
+
+
 if __name__ == _SCRIPT_ENTRY_POINT:
     main()

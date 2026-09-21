@@ -451,7 +451,7 @@ def golden_prefill_c1a_reindex_case(tensors):
 __all__ = ["golden_prefill_c1a_reindex", "prefill_c1a_reindex"]
 
 
-if __name__ == _SCRIPT_ENTRY_POINT:
+def validate(argv=None):
     import argparse
 
     from pypto.ir import DistributedConfig
@@ -470,7 +470,7 @@ if __name__ == _SCRIPT_ENTRY_POINT:
     parser.add_argument("--dump-passes", action="store_true")
     parser.add_argument("--runtime-dir")
     parser.add_argument("--enable-chip-swimlane", type=int, nargs="?", const=1, default=0, choices=range(5))
-    args = parser.parse_args()
+    args = parser.parse_args(argv)
 
     if args.tp != C.TP_SIZE:
         parser.error(f"--tp was parsed as TP{C.TP_SIZE}, got --tp {args.tp}")
@@ -507,7 +507,24 @@ if __name__ == _SCRIPT_ENTRY_POINT:
             "topk_indices": topk_indices_compare("reindex"),
         },
     )
+    return result
+
+
+def main():
+    """Run local validation and return a failing exit status on precision errors."""
+    result = validate()
     if not result.passed:
-        if result.error:
-            print(result.error)
-        raise SystemExit(1)
+        raise SystemExit(result.error or 1)
+
+
+if "pytest" in sys.modules:
+    import pytest
+
+    @pytest.mark.parametrize("tp,dp", [(1, 1), (4, 1)])
+    def test_precision(tp, dp, a5_args):
+        """Validate the operator against its golden reference on A5."""
+        result = validate(a5_args(tp=tp, dp=dp))
+        assert result.passed, result.error
+
+if __name__ == _SCRIPT_ENTRY_POINT:
+    main()

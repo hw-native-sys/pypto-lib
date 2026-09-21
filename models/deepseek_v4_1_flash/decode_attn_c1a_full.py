@@ -1961,7 +1961,7 @@ def topk_indices_compare(mode):
     return compare
 
 
-def run_c1a(mode, kernel_factory, golden_fn):
+def run_c1a(mode, kernel_factory, golden_fn, argv=None):
     """Run A5 validation for a production C1A operator."""
     import argparse
     import inspect
@@ -1992,7 +1992,7 @@ def run_c1a(mode, kernel_factory, golden_fn):
     parser.add_argument("--enable-chip-swimlane", type=int, nargs="?", const=1, default=0, choices=range(5))
     parser.add_argument("--check-fp4", action="store_true", default=False,
                         help="run the CPU E2M1 midpoint check and exit")
-    args = parser.parse_args()
+    args = parser.parse_args(argv)
     if args.check_fp4:
         raise SystemExit(check_fp4_boundaries())
     if args.tp != TP_SIZE:
@@ -2083,18 +2083,34 @@ def run_c1a(mode, kernel_factory, golden_fn):
         atol=1e-3,
         compare_fn=comparisons,
     )
-    if not result.passed:
-        print(result.error)
-        raise SystemExit(1)
+    return result
 
 
-def main():
+def validate(argv=None):
     """Validate the Decode C1A Full production operator on A5."""
-    run_c1a("full", make_program, golden_decode_attn_c1a_full)
+    return run_c1a("full", make_program, golden_decode_attn_c1a_full, argv=argv)
 
 
 # A2/A3 CI currently discovers runnable model files by the conventional entry
 # sentinel. Split its spelling so this A5-only command remains directly runnable.
 _SCRIPT_ENTRY_POINT = "__" + "main__"
+
+
+def main():
+    """Run local validation and return a failing exit status on precision errors."""
+    result = validate()
+    if not result.passed:
+        raise SystemExit(result.error or 1)
+
+
+if "pytest" in sys.modules:
+    import pytest
+
+    @pytest.mark.parametrize("tp,dp", [(1, 1), (4, 1)])
+    def test_precision(tp, dp, a5_args):
+        """Validate the operator against its golden reference on A5."""
+        result = validate(a5_args(tp=tp, dp=dp))
+        assert result.passed, result.error
+
 if __name__ == _SCRIPT_ENTRY_POINT:
     main()

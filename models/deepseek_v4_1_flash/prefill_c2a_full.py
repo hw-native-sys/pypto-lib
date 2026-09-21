@@ -734,7 +734,7 @@ def build_specs(args, mode, initial_state):
     return specs
 
 
-def run_prefill_c2a(make_program, mode):
+def run_prefill_c2a(make_program, mode, argv=None):
     """Validate an mHC-wrapped prefill C2A sublayer on A5; ``make_program`` builds the L3 entry."""
     from pypto.ir import DistributedConfig
 
@@ -749,7 +749,7 @@ def run_prefill_c2a(make_program, mode):
     parser.add_argument("--seed", type=int, default=17)
     parser.add_argument("--epochs", type=int, default=1, help="sublayer calls per dispatch; timing includes all epochs")
     parser.add_argument("--compile-only", action="store_true")
-    args = parser.parse_args()
+    args = parser.parse_args(argv)
 
     args.bench = os.environ.get("PYPTO_BENCH", "0") == "1"
     devices = list(range(TP_SIZE * args.dp))
@@ -782,17 +782,14 @@ def run_prefill_c2a(make_program, mode):
         compare_fn=make_compare(mode, args.epochs, initial_state),
     )
     print(f"[C2A-HC] work_dir={result.work_dir}")
-    if args.compile_only:
+    if args.compile_only and result.passed:
         print("[C2A-HC] Compilation passed; device accuracy was NOT validated.")
-    if not result.passed:
-        if result.error:
-            print(result.error)
-        raise SystemExit(1)
+    return result
 
 
-def main():
+def validate(argv=None):
     """Validate packed prefill C2A Full wired through mHC on A5."""
-    run_prefill_c2a(make_hc_program, "full")
+    return run_prefill_c2a(make_hc_program, "full", argv=argv)
 
 
 __all__ = [
@@ -807,5 +804,23 @@ __all__ = [
 # A2/A3 CI currently discovers runnable model files by the conventional entry
 # sentinel. Split its spelling so this A5-only command remains directly runnable.
 _SCRIPT_ENTRY_POINT = "__" + "main__"
+
+
+def main():
+    """Run local validation and return a failing exit status on precision errors."""
+    result = validate()
+    if not result.passed:
+        raise SystemExit(result.error or 1)
+
+
+if "pytest" in sys.modules:
+    import pytest
+
+    @pytest.mark.parametrize("tp,dp", [(1, 1), (2, 2), (4, 1)])
+    def test_precision(tp, dp, a5_args):
+        """Validate the operator against its golden reference on A5."""
+        result = validate(a5_args(tp=tp, dp=dp))
+        assert result.passed, result.error
+
 if __name__ == _SCRIPT_ENTRY_POINT:
     main()

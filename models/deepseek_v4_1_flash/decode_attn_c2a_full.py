@@ -1935,7 +1935,7 @@ def build_specs(args, mode):
     return specs
 
 
-def run_c2a(operator, mode):
+def run_c2a(operator, mode, argv=None):
     """Validate a C2A full production operator on A5."""
     from pypto.ir import DistributedConfig
 
@@ -1955,7 +1955,9 @@ def run_c2a(operator, mode):
     parser.add_argument("--golden-data", help="replay a compatible data directory containing in/ and out/")
     parser.add_argument("--enable-chip-swimlane", type=int, default=0, choices=range(5))
     parser.add_argument("--enable-dep-gen", action="store_true")
-    args = parser.parse_args()
+    args = parser.parse_args(argv)
+    if args.tp != TP_SIZE:
+        parser.error(f"--tp {args.tp} does not match import-time TP_SIZE {TP_SIZE}")
 
     args.bench = os.environ.get("PYPTO_BENCH", "0") == "1"
     devices = list(range(TP_SIZE * args.dp))
@@ -2012,19 +2014,35 @@ def run_c2a(operator, mode):
         print("[C2A] Compilation passed; device accuracy was NOT validated.")
     if args.save_data and result.work_dir:
         print(f"[C2A] Validated snapshot: {result.work_dir}/data")
-    if not result.passed:
-        if result.error:
-            print(result.error)
-        raise SystemExit(1)
+    return result
 
 
-def main():
+def validate(argv=None):
     """Validate the Decode C2A Full production operator on A5."""
-    run_c2a(decode_attn_c2a_full, "decode")
+    return run_c2a(decode_attn_c2a_full, "decode", argv=argv)
 
 
 # A2/A3 CI currently discovers runnable model files by the conventional entry
 # sentinel. Split its spelling so this A5-only command remains directly runnable.
 _SCRIPT_ENTRY_POINT = "__" + "main__"
+
+
+def main():
+    """Run local validation and return a failing exit status on precision errors."""
+    result = validate()
+    if not result.passed:
+        raise SystemExit(result.error or 1)
+
+
+if "pytest" in sys.modules:
+    import pytest
+
+    @pytest.mark.parametrize("tp,dp", [(1, 1), (2, 2), (4, 1)])
+    def test_precision(tp, dp, a5_args):
+        """Validate the operator against its golden reference on A5."""
+        result = validate(a5_args(tp=tp, dp=dp))
+        assert result.passed, result.error
+
+
 if __name__ == _SCRIPT_ENTRY_POINT:
     main()

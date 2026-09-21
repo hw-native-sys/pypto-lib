@@ -165,13 +165,31 @@ def prefill_attn_c2a_reuse(
 __all__ = ["golden_prefill_attn_c2a_reuse", "prefill_attn_c2a_reuse"]
 
 
-def main():
+def validate(argv=None):
     """Validate the Prefill C2A Reuse leaf operator on A5."""
-    run_c2a_reuse(prefill_attn_c2a_reuse, "prefill")
+    return run_c2a_reuse(prefill_attn_c2a_reuse, "prefill", argv=argv)
 
 
 # A2/A3 CI currently discovers runnable model files by the conventional entry
 # sentinel. Split its spelling so this A5-only command remains directly runnable.
 _SCRIPT_ENTRY_POINT = "__" + "main__"
+
+
+def main():
+    """Run local validation and return a failing exit status on precision errors."""
+    result = validate()
+    if not result.passed:
+        raise SystemExit(result.error or 1)
+
+
+if "pytest" in sys.modules:
+    import pytest
+
+    @pytest.mark.parametrize("tp,dp", [(1, 1), (2, 2), (4, 1)])
+    def test_precision(tp, dp, a5_args):
+        """Validate the operator against its golden reference on A5."""
+        result = validate(a5_args(tp=tp, dp=dp))
+        assert result.passed, result.error
+
 if __name__ == _SCRIPT_ENTRY_POINT:
     main()

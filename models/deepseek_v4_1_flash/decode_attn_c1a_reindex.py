@@ -273,13 +273,31 @@ def make_program(tokens, pages, epochs=1):
     return host
 
 
-def main():
+def validate(argv=None):
     """Validate the Decode C1A Reindex production operator on A5."""
-    run_c1a("reindex", make_program, golden_decode_attn_c1a_reindex)
+    return run_c1a("reindex", make_program, golden_decode_attn_c1a_reindex, argv=argv)
 
 
 # A2/A3 CI currently discovers runnable model files by the conventional entry
 # sentinel. Split its spelling so this A5-only command remains directly runnable.
 _SCRIPT_ENTRY_POINT = "__" + "main__"
+
+
+def main():
+    """Run local validation and return a failing exit status on precision errors."""
+    result = validate()
+    if not result.passed:
+        raise SystemExit(result.error or 1)
+
+
+if "pytest" in sys.modules:
+    import pytest
+
+    @pytest.mark.parametrize("tp,dp", [(1, 1), (4, 1)])
+    def test_precision(tp, dp, a5_args):
+        """Validate the operator against its golden reference on A5."""
+        result = validate(a5_args(tp=tp, dp=dp))
+        assert result.passed, result.error
+
 if __name__ == _SCRIPT_ENTRY_POINT:
     main()

@@ -391,7 +391,7 @@ def comparisons(initial_state=None):
     return compare
 
 
-def main():
+def validate(argv=None):
     parser = common.make_parser(
         "DeepSeek V4.1 C2A Reuse decode Attention composition",
         REPRESENTATIVE_LAYER_ID,
@@ -399,14 +399,14 @@ def main():
         ("mixed", "long", "masked", "zero"),
     )
     parser.set_defaults(requests=6)
-    args = parser.parse_args()
+    args = parser.parse_args(argv)
     devices = common.validate_args(parser, args, allow_inactive=True)
     reason = skip_reason(args.layer_id)
     if reason:
         parser.error(reason)
     initial_state = {}
     specs = build_specs(args, initial_state)
-    common.run_attention(
+    return common.run_attention(
         args,
         make_program(args.tp, args.epochs, specs),
         specs,
@@ -415,6 +415,23 @@ def main():
         KIND.name,
         devices,
     )
+
+
+def main():
+    """Run local validation and return a failing exit status on precision errors."""
+    result = validate()
+    if not result.passed:
+        raise SystemExit(result.error or 1)
+
+
+if "pytest" in sys.modules:
+    import pytest
+
+    @pytest.mark.parametrize("tp", [1, 4])
+    def test_precision(tp, a5_args):
+        """Validate the operator against its golden reference on A5."""
+        result = validate(a5_args(tp=tp))
+        assert result.passed, result.error
 
 
 if __name__ == "__main__":

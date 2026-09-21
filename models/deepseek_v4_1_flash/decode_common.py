@@ -314,8 +314,7 @@ def run_attention(args, program, specs, golden_fn, comparisons, kind_name, devic
         save_data=args.save_data,
     )
     print(f"[HALF] layer={args.layer_id} kind={kind_name} work_dir={result.work_dir}")
-    if not result.passed:
-        raise SystemExit(result.error or 1)
+    return result
 
 
 __all__ = [
