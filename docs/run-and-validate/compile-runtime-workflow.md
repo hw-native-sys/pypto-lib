@@ -160,7 +160,8 @@ A few `ir.compile` parameters have no `RunConfig` field — `skip_ptoas`,
 `verification_level`, `emit_source_loc` — so `config` cannot carry them. They
 are reachable by calling `ir.compile` directly on a `@pl.program` kernel.
 
-To stop after compile without touching the device, see `compile_only` under
+To stop after compile without touching the device, see `compile_only` — and
+`golden_only`, which goes one phase further and still needs no device — under
 [Skipping phases](#skipping-phases).
 
 ### 2. Generate inputs
@@ -344,6 +345,7 @@ false; an uncaught compile/runtime exception is already a nonzero failure.
 | Knob | Effect |
 |------|--------|
 | `compile_only=True` | Stops after the compile phase. Useful for a smoke test that just checks the program lowers cleanly. |
+| `golden_only=True` | Stops after the golden is computed — compile, generate inputs and compute golden run; nothing dispatches. Forces `save_data=True`, so the golden lands in `<work_dir>/data/` for a later `golden_data` run to validate against. Requires `golden_fn`; rejected alongside `golden_data`, `compile_only` or `runtime_dir`. Useful for moving the Torch golden off a leased device: produce it on a card-free host, then hold the card only for runtime + validate. |
 | `runtime_dir="<path>"` | Skips compile and reuses an existing `build_output/<...>` directory. Useful when iterating on `golden_fn` or validation logic without recompiling. |
 | `golden_data="<path>"` | Loads inputs from `<path>/in/` and goldens from `<path>/out/` instead of generating them. `golden_data` overrides `golden_fn`. With `golden_fn=None` and no `<path>/out/`, only the inputs are replayed and validation is skipped. Useful for deterministic regressions: a previous run leaves these files in its `data/` dir, so passing that dir reproduces the exact failing inputs. |
 | `save_data=True` (default `False`) | Writes the `data/in/` + `data/out/` snapshot so the exact inputs/goldens can be replayed later via `golden_data`. Off by default: runs skip the snapshot and validate against the in-memory golden only. Opt in when you need replay; full-model kernels like `models/qwen3_14b/{prefill_fwd,decode_fwd}.py` expose it as `--save-data`. |

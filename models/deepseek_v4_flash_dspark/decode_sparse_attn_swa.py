@@ -583,6 +583,8 @@ if __name__ == "__main__":
     )
     parser.add_argument("--save-data", action="store_true", help="Save inputs and golden outputs for replay.")
     parser.add_argument("--golden-data", type=str, default=None)
+    parser.add_argument("--golden-only", action="store_true", default=False,
+                        help="compute and persist the golden, then stop before the device run")
     parser.add_argument("--enable-chip-swimlane", type=int, nargs="?", const=1, default=0, choices=range(5))
     parser.add_argument(
         "--enable-dep-gen", action="store_true", default=False,
@@ -602,6 +604,7 @@ if __name__ == "__main__":
         specs=build_tensor_specs(args.causal_regression_fixture, args.short_window_fixture, batch=args.batch),
         golden_fn=golden_sparse_attn,
         golden_data=args.golden_data,
+        golden_only=args.golden_only,
         save_data=args.save_data,
         config=dict(
             dump_passes=args.dump_passes,

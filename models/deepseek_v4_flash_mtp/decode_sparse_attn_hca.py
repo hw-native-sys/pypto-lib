@@ -681,6 +681,8 @@ if __name__ == "__main__":
     parser.add_argument("--causal-regression-fixture", action="store_true", default=False,
                         help="Amplify the S=2 future-window-slot regression.")
     parser.add_argument("--golden-data", type=str, default=None)
+    parser.add_argument("--golden-only", action="store_true", default=False,
+                        help="compute and persist the golden, then stop before the device run")
     parser.add_argument("--enable-chip-swimlane", type=int, nargs="?", const=1, default=0, choices=range(5))
     parser.add_argument("--enable-dep-gen", action="store_true", default=False,
                         help="Capture PTO2 dependency edges (deps.json); the swimlane "
@@ -694,6 +696,7 @@ if __name__ == "__main__":
         specs=build_tensor_specs(parse_start_pos_arg(args.start_pos), args.causal_regression_fixture),
         golden_fn=golden_sparse_attn,
         golden_data=args.golden_data,
+        golden_only=args.golden_only,
         config=dict(
             dump_passes=args.dump_passes,
             platform=args.platform,

@@ -645,6 +645,155 @@ class TestCompileOnly:
         execute.assert_not_called()
 
 
+class TestGoldenOnly:
+    """``golden_only=True`` short-circuits after the golden, before the device."""
+
+    @staticmethod
+    def _golden_fn(tensors):
+        tensors["y"][:] = tensors["x"] + 1
+        tensors["state"][:] = tensors["state"] + 100
+
+    def test_golden_only_persists_golden_without_dispatching(
+        self, three_kinds_specs, build_dir,
+    ):
+        """Inputs and golden outputs land under data/; nothing reaches the device."""
+        fake = _FakeCompiled(build_dir)
+
+        def exec_must_not_run(*_args, **_kwargs):
+            pytest.fail("the dispatch must not run when golden_only=True")
+
+        with patch("pypto.ir.compile", return_value=fake), \
+             patch("golden.runner._dispatch", side_effect=_as_dispatch(exec_must_not_run)):
+            r = run(
+                fn=object(),
+                specs=three_kinds_specs,
+                golden_fn=self._golden_fn,
+                golden_only=True,
+            )
+
+        assert r.passed, f"unexpected failure: {r.error}"
+        assert r.work_dir == build_dir
+        data = build_dir / "data"
+        assert (data / "in" / "x.pt").is_file()
+        assert (data / "in" / "state.pt").is_file()
+        # The golden is the deliverable: a later --golden-data run reads these.
+        assert torch.equal(
+            torch.load(data / "out" / "y.pt", weights_only=True),
+            torch.load(data / "in" / "x.pt", weights_only=True) + 1,
+        )
+        assert (data / "out" / "state.pt").is_file()
+
+    def test_golden_only_overrides_save_data_false(self, three_kinds_specs, build_dir):
+        """An unpersisted golden would be wasted work, so save_data is forced."""
+        fake = _FakeCompiled(build_dir)
+
+        with patch("pypto.ir.compile", return_value=fake), \
+             patch("golden.runner._dispatch") as dispatch:
+            r = run(
+                fn=object(),
+                specs=three_kinds_specs,
+                golden_fn=self._golden_fn,
+                golden_only=True,
+                save_data=False,
+            )
+
+        assert r.passed, f"unexpected failure: {r.error}"
+        dispatch.assert_not_called()
+        assert (build_dir / "data" / "out" / "y.pt").is_file()
+
+    def test_golden_only_produces_a_replayable_cache(self, three_kinds_specs, build_dir):
+        """The produced data/ directory validates a later device run as golden_data."""
+        fake = _FakeCompiled(build_dir)
+
+        with patch("pypto.ir.compile", return_value=fake), \
+             patch("golden.runner._dispatch"):
+            produced = run(
+                fn=object(),
+                specs=three_kinds_specs,
+                golden_fn=self._golden_fn,
+                golden_only=True,
+            )
+        assert produced.passed, f"unexpected failure: {produced.error}"
+
+        def fake_execute(_work_dir, tensors, **_kwargs):
+            tensors[1][:] = tensors[0] + 1
+            tensors[2][:] = tensors[2] + 100
+
+        def golden_fn_must_not_run(_tensors):
+            pytest.fail("golden_fn must not recompute on the replay")
+
+        with patch("pypto.ir.compile", return_value=fake), \
+             patch("golden.runner._dispatch", side_effect=_as_dispatch(fake_execute)):
+            replayed = run(
+                fn=object(),
+                specs=three_kinds_specs,
+                golden_fn=golden_fn_must_not_run,
+                golden_data=str(build_dir / "data"),
+            )
+
+        assert replayed.passed, f"unexpected failure: {replayed.error}"
+
+    @pytest.mark.parametrize(
+        "kwargs, expected",
+        [
+            ({"compile_only": True}, "compile_only is incompatible with golden_only"),
+            ({"golden_data": "cache"}, "golden_data is incompatible with golden_only"),
+            ({"golden_fn": None}, "golden_only requires golden_fn"),
+        ],
+    )
+    def test_golden_only_rejects_pointless_combinations(
+        self, three_kinds_specs, kwargs, expected,
+    ):
+        call = {"golden_fn": self._golden_fn, **kwargs}
+        with patch("pypto.ir.compile") as compile_fn:
+            r = run(fn=object(), specs=three_kinds_specs, golden_only=True, **call)
+
+        assert not r.passed
+        assert r.error == expected
+        compile_fn.assert_not_called()
+
+    def test_golden_only_rejects_runtime_dir(self, three_kinds_specs, tmp_path):
+        prebuilt = tmp_path / "prebuilt"
+        prebuilt.mkdir()
+
+        with patch("pypto.ir.compile") as compile_fn:
+            r = run(
+                fn=object(),
+                specs=three_kinds_specs,
+                golden_fn=self._golden_fn,
+                golden_only=True,
+                runtime_dir=str(prebuilt),
+            )
+
+        assert not r.passed
+        assert r.error == "runtime_dir is incompatible with golden_only"
+        compile_fn.assert_not_called()
+
+    def test_golden_only_validates_spec_abi_before_computing_golden(self, build_dir):
+        """A stale spec fails the same way it does under compile_only."""
+        compiled = _artifact(build_dir, _l3_info("x__ssa_v0", shape=[5], dtype=torch.float32))
+        specs = [TensorSpec("x", [4], torch.float32)]
+
+        def golden_fn_must_not_run(_tensors):
+            pytest.fail("golden_fn must not run on a stale spec")
+
+        with (
+            _l3_abi_environment(),
+            patch("pypto.ir.compile", return_value=compiled),
+            patch.object(TensorSpec, "create_tensor") as create_tensor,
+        ):
+            r = run(
+                fn=object(),
+                specs=specs,
+                golden_fn=golden_fn_must_not_run,
+                golden_only=True,
+            )
+
+        assert not r.passed
+        assert "shape" in (r.error or "")
+        create_tensor.assert_not_called()
+
+
 class TestJitCompilePath:
     def test_marked_scalar_uses_signature_mode_and_runtime_marker(self, build_dir):
         compiled = _FakeCompiled(build_dir)

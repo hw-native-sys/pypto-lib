@@ -1950,8 +1950,24 @@ if __name__ == "__main__":
         default=False,
         help="persist inputs + golden for replay (off: large fixtures)",
     )
+    parser.add_argument(
+        "--golden-data",
+        type=str,
+        default=None,
+        help="directory containing cached in/ and out/ tensors, for the default "
+        "single-layer test",
+    )
+    parser.add_argument(
+        "--golden-only",
+        action="store_true",
+        default=False,
+        help="compute and persist the golden of the default single-layer test, "
+        "then stop before the device run",
+    )
     args = parser.parse_args()
 
+    if (args.golden_only or args.golden_data is not None) and args.validate_fwd:
+        parser.error("--golden-only / --golden-data apply to the default single-layer test")
     if args.dep_output_dir is not None and not args.enable_dep_gen:
         parser.error("--dep-output-dir requires --enable-dep-gen")
     if args.skip_reference and not args.validate_fwd:
@@ -2029,7 +2045,9 @@ if __name__ == "__main__":
             rtol=3e-3,
             atol=3e-3,
             compare_fn={"out": ratio_allclose(atol=3e-3, rtol=3e-3, max_error_ratio=0.02)},
+            golden_data=args.golden_data,
             save_data=args.save_data,
+            golden_only=args.golden_only,
         )
         if not result.passed:
             if result.error:

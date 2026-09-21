@@ -1753,6 +1753,8 @@ if __name__ == "__main__":
     parser.add_argument("--prefix", type=int, default=0,
                         help="tokens already resident in this request's caches from earlier chunks")
     parser.add_argument("--compile-only", action="store_true")
+    parser.add_argument("--golden-only", action="store_true", default=False,
+                        help="compute and persist the golden, then stop before the device run")
     parser.add_argument("--save-data", action="store_true")
     parser.add_argument("--golden-data", type=str, default=None)
     parser.add_argument("--dump-passes", action="store_true")
@@ -1771,6 +1773,7 @@ if __name__ == "__main__":
         golden_data=args.golden_data,
         save_data=args.save_data,
         compile_only=args.compile_only,
+        golden_only=args.golden_only,
         config=dict(
             distributed_config=DistributedConfig(device_ids=device_ids[: args.cp], num_sub_workers=0),
             dump_passes=args.dump_passes,

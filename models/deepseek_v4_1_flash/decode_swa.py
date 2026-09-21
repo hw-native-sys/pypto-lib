@@ -950,6 +950,8 @@ def run_swa(operator, mode):
     parser.add_argument("--seed", type=int, default=17)
     parser.add_argument("--epochs", type=int, default=1, help="operator calls per dispatch; timing includes all epochs")
     parser.add_argument("--compile-only", action="store_true")
+    parser.add_argument("--golden-only", action="store_true",
+                        help="compute and persist the golden, then stop before the device run")
     parser.add_argument("--save-data", action="store_true", help="save validated inputs and golden outputs for replay")
     parser.add_argument("--golden-data", help="replay a compatible data directory containing in/ and out/")
     parser.add_argument("--enable-chip-swimlane", type=int, default=0, choices=range(5))
@@ -978,7 +980,8 @@ def run_swa(operator, mode):
         print("[SWA] Resident device timing excludes compilation, input generation and CPU golden; "
               "each dispatch advances the communication epoch. Timing includes all epochs/dispatch.")
     result = run(fn=make_program(operator, capacity, len(devices), args.epochs), specs=build_specs(args, mode),
-        golden_fn=golden_swa, compile_only=args.compile_only, save_data=args.save_data, golden_data=args.golden_data,
+        golden_fn=golden_swa, compile_only=args.compile_only, golden_only=args.golden_only,
+        save_data=args.save_data, golden_data=args.golden_data,
         config=dict(platform=args.platform, distributed_config=DistributedConfig(device_ids=devices, num_sub_workers=0),
                     enable_chip_swimlane=args.enable_chip_swimlane, enable_dep_gen=args.enable_dep_gen),
         compare_fn={"output": compare_reduced, "window_cache": compare_distributed_cache,
@@ -988,6 +991,8 @@ def run_swa(operator, mode):
         raise SystemExit(1)
     if args.compile_only:
         print("[SWA] Compilation passed; device accuracy was NOT validated.")
+    elif args.golden_only:
+        print(f"[SWA] Golden snapshot: {result.work_dir}/data; device accuracy was NOT validated.")
     elif args.save_data:
         print(f"[SWA] Validated snapshot: {result.work_dir}/data")
 

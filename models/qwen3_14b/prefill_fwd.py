@@ -2242,7 +2242,14 @@ if __name__ == "__main__":
                         help="persist inputs + golden for replay (off: large fixtures)")
     parser.add_argument("--no-golden", action="store_true", default=False,
                         help="skip host golden computation and output validation")
+    parser.add_argument("--golden-data", type=str, default=None,
+                        help="directory containing cached in/ and out/ tensors")
+    parser.add_argument("--golden-only", action="store_true", default=False,
+                        help="compute and persist the golden, then stop before the device run")
     args = parser.parse_args()
+
+    if args.golden_only and args.no_golden:
+        parser.error("--golden-only computes the golden; --no-golden skips it")
 
     result = run(
         fn=prefill_fwd,
@@ -2255,6 +2262,7 @@ if __name__ == "__main__":
             chunk_size=args.chunk_size,
         ),
         golden_fn=None if args.no_golden else golden_qwen3_14b_prefill,
+        golden_data=args.golden_data,
         config=dict(
             platform=args.platform,
             device_id=args.device,
@@ -2265,6 +2273,7 @@ if __name__ == "__main__":
         rtol=5e-3,
         atol=5e-3,
         save_data=args.save_data,
+        golden_only=args.golden_only,
     )
     if not result.passed:
         if result.error:

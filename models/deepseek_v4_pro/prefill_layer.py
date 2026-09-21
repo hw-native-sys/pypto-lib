@@ -1669,6 +1669,8 @@ if __name__ == "__main__":
                         help="Comma-separated per-request prior context lengths; defaults to all zeros.")
     parser.add_argument("--enable-chip-swimlane", type=int, nargs="?", const=1, default=0, choices=range(5))
     parser.add_argument("--compile-only", action="store_true", default=False)
+    parser.add_argument("--golden-only", action="store_true", default=False,
+                        help="compute and persist the golden, then stop before the device run")
     parser.add_argument("--save-data", action="store_true", default=False,
                         help="persist inputs and golden outputs for replay")
     parser.add_argument("--golden-data", type=str, default=None,
@@ -1760,6 +1762,7 @@ if __name__ == "__main__":
         golden_data=args.golden_data,
         save_data=args.save_data,
         compile_only=args.compile_only,
+        golden_only=args.golden_only,
         config=dict(
             dump_passes=args.dump_passes,
             distributed_config=DistributedConfig(
