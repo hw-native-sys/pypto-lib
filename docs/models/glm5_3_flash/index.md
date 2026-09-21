@@ -190,6 +190,48 @@ reach GM through a Vec tile or the quantized fix-pipe path. And not in the table
 worth knowing before the first MIX kernel: a2a3 requires dual-AIV dispatch even for
 a no-split MIX kernel, or the AIC cross-core handshake deadlocks.
 
+### What stream B's `a2a3sim` bring-up surfaced
+
+Each of these was a compile or simulator failure, not a guess:
+
+- **The simulator needs a real GCC 15.** A `g++-15` shim pointing at GCC 13 builds
+  simulator kernels that get every BF16 matmul wrong while FP32 still passes, so the
+  failure looks like a kernel bug. `deepseek_v4_flash_mtp/decode_compressor_ratio4.py`
+  is a quick canary: it passes in CI and fails under such a shim.
+- **Do not mix the Tensor and Tile levels.** `pl.slice`, bracket slices, `pl.full`,
+  `pl.matmul_acc` and slice assignment are Tensor level; `pl.load`, `pl.tile.full`,
+  `pl.create_tile` and `pl.store` are Tile level. A Tensor-level result is written with
+  `dest = pl.assemble(dest, pl.set_validshape(src, rows, cols), offset)`, a Tile-level
+  one with `pl.store`; `pl.write` works on a Tensor-level on-core buffer where
+  `pl.tile.write` does not.
+- **`tmp_tile` is Tile-only.** `pl.row_sum` / `pl.row_max` on a Tile must take one;
+  on a Tensor they must not. High-precision `rsqrt` on a Tile is
+  `pl.tile.rsqrt(x, tmp)`, not `high_precision=True`.
+- **FP32 reductions need a 32-byte column**, and a row-major tile needs a 32-byte row,
+  so an `[H, 1]` column wants `H % 8 == 0` and is best built as `[1, H]` then
+  reshaped.
+- **A matmul is only split into L0 tiles when M reaches 16.** Below that the
+  128 x 512 KV operand of the sparse attention stays whole and overflows the 64 KB
+  right buffer; the TP16 attention pads its 4 heads to 16 zero-filled rows for this.
+- **No mutable scalar flags across branches.** A Python int set in one `if` and read in
+  another becomes a phi the backend cannot materialise; write each branch's work in
+  place, as the donors do. Loop-carried tile state goes through `pl.yield_` on every
+  path.
+- **In a mixed cube/vector scope, no branch may decide whether loop-carried state is
+  updated.** When the carried tiles flow through an `if` / `else`, the partitioner
+  materialises their pre-loop `pl.full` initialisation in the cube half as well, and
+  `ccec` rejects `vector_dup` / `set_vector_mask` for `dav-c220-cube`. `a2a3sim`
+  compiles both halves with `g++` and never sees it, so this reaches CI as an a2a3-only
+  failure (run 35555578466). Let the branch pick the block's inputs and keep the merge
+  unconditional, or split the scope by hand with `pl.split_aic` / `pl.split_aiv` as
+  `deepseek_v4_flash_dspark/prefill_sparse_attn.py` does. The check needs no card:
+  compile with `-p a2a3 --compile-only` and assert that the generated
+  `kernels/aic/*.cpp` carries no vector op between `#if defined(__DAV_CUBE__)` and its
+  `#endif` (`TMUL` there is address arithmetic and is expected).
+- **`pl.spmd` takes a Var, not a call.** Bind `pl.tensor.dim(...)` to a name first.
+- **A script-entry file must put the repository root first on `sys.path`**, or
+  `from golden import run` resolves to this directory's own `golden.py`.
+
 ## How this directory is organised for parallel work
 
 Every operator has one ownership file. Each file carries the exact maths in its
@@ -201,14 +243,19 @@ interface without talking to each other.
 A file has **no script-entry guard until its golden is real**. The a2a3 daily CI
 selects a case purely by grepping for that guard, so adding one to a file whose
 golden still raises would put an unimplementable operator into the sweep. Today
-`config.py`, `golden.py`, `quantization.py`, `metadata.py` and `mhc.py` carry real
-references, and three of them run as CI cases:
+`config.py`, `golden.py`, `quantization.py`, `metadata.py`, `mhc.py` and all five
+stream-B MLA files carry real references, and eight of them run as CI cases:
 
 ```bash
 source .venv/bin/activate-pypto
-python models/glm5_3_flash/golden.py        # [GOLDEN] PASS norms / swiglu / moe_gate
-python models/glm5_3_flash/quantization.py  # [GOLDEN] PASS quantization
-python models/glm5_3_flash/mhc.py           # [GOLDEN] PASS mhc
+python models/glm5_3_flash/golden.py              # [GOLDEN] PASS norms / swiglu / moe_gate
+python models/glm5_3_flash/quantization.py        # [GOLDEN] PASS quantization
+python models/glm5_3_flash/mhc.py                 # [GOLDEN] PASS mhc
+python models/glm5_3_flash/mla_prolog.py          # [GOLDEN] PASS mla_prolog + prolog/absorb
+python models/glm5_3_flash/mla_cache.py           # [GOLDEN] PASS mla_cache + device scatter
+python models/glm5_3_flash/mla_epilog.py          # [GOLDEN] PASS mla_epilog + both paths
+python models/glm5_3_flash/prefill_sparse_attn.py # [GOLDEN] PASS + device sparse prefill
+python models/glm5_3_flash/decode_sparse_attn.py  # [GOLDEN] PASS + device sparse decode
 ```
 
 `models/deepseek_v4_1_flash/mhc.py` is the worked example of a finished item: a
@@ -405,6 +452,11 @@ RoPE machinery, and add the KDA family and the kpool indexer.
 | `quantization.py` | Complete. Per-channel and per-token INT8 with the repo's exact rounding, the dynamic W8A8 linear, and the fused dequant-SwiGLU-requant epilogue |
 | `metadata.py` | Complete. Packed-batch lowering, the three distinct slot mappings (latent, per-token indexer state, pooled state), TP token ownership, and the indexer's pool and tail derivation |
 | `_golden_smoke.py` | Complete. Deterministic CPU fixtures behind every golden that exists |
+| `mla_prolog.py` | Goldens, the prolog body (three `b_trans` matmuls and two rms-norm scopes, no split-K yet), the per-token `absorb_query` body, and a device test entry per case. `absorb_output` is weight-time and belongs to the loader. Passes `a2a3sim`; not yet run on an a2a3 device |
+| `mla_cache.py` | Golden, kernel body (`pl.spmd` scatter, one block per row), device test entry and specs. Passes `a2a3sim`; not yet run on an a2a3 device |
+| `mla_epilog.py` | Goldens, both kernel bodies (row-parallel `b_trans` projection over D, FP32 partial sum for the TP16 all-reduce) and a device test entry per path. Passes `a2a3sim`; not yet run on an a2a3 device |
+| `prefill_sparse_attn.py` | Golden, kernel body (one item per token, `pl.yield_`-carried online softmax, value expansion after the block loop) and a device test entry. **Attends in latent space**: absorbing keeps the two expansions out of the per-token block loop, at the cost of two BF16 roundings against the expanded reference. An all-padding block is filled by one wide gather and merged with `beta` = 0 rather than skipped, so no branch carries the online-softmax state. Passes `a2a3sim`; the a2a3 device run is pending a CI re-run |
+| `decode_sparse_attn.py` | Golden, kernel body (24 lanes over (token, sparse block), L1 gather, flash partials, alpha/beta merge, empty-block skip) and a device test entry. Assumes a front-packed index list. Passes `a2a3sim`; not yet run on an a2a3 device |
 | `attention_tp.py` | ABI only, but it is the one shared consumer: `kda_output`, both `mla_epilog` entries and `dense_mlp` all emit an FP32 row-parallel partial, and this is what adds the 16 of them |
 | everything else | ABI and docstring only; the golden and the kernel body are the assignment |
 
@@ -417,6 +469,7 @@ RoPE machinery, and add the KDA family and the kpool indexer.
   cache and a separate FP32 pooled-state page class with a page of four tokens;
   storing the raw row instead is simpler but larger. Stream C decides, stream E's
   cache manager implements.
+- **Whether the indexer's index list is front packed.** `decode_sparse_attn` skips a sparse block whose lane 0 is `-1`, which turns a 40-selection request from 2,176 gathered rows into 128. Stream C owns the emission order; if a list can interleave `-1` with live selections the skip has to go, or the indexer has to compact.
 - **Whether the MLA decode path absorbs.** `kv_b_proj` is BF16 in the checkpoint,
   so folding it into an INT8 `o_proj` changes the numerics of the epilogue.
 - **The cache budget.** At about 18 KB per token per rank the hybrid cache holds
