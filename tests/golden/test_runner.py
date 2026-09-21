@@ -80,6 +80,8 @@ def _l3_abi_environment():
     """Install deterministic CPU-only metadata types for L3 ABI tests."""
     dtype_module = types.ModuleType("pypto.ir.compiled_program")
     dtype_module._to_torch_dtype = lambda dtype: dtype
+    param_info_module = types.ModuleType("pypto.ir.param_info")
+    param_info_module.block_nz_shape = lambda shape, dtype: shape
     with (
         patch.object(
             sys.modules["pypto.ir"],
@@ -87,7 +89,13 @@ def _l3_abi_environment():
             _FakeParamDirection,
             create=True,
         ),
-        patch.dict(sys.modules, {"pypto.ir.compiled_program": dtype_module}),
+        patch.dict(
+            sys.modules,
+            {
+                "pypto.ir.compiled_program": dtype_module,
+                "pypto.ir.param_info": param_info_module,
+            },
+        ),
         patch("golden.runner._is_l3", return_value=True),
     ):
         yield

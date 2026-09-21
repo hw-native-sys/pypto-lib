@@ -205,7 +205,7 @@ the same `optimizations`, `deps` and `allow_early_resolve` kwargs are accepted.
 The two call forms, the argument shape and the full kwarg list are in
 [Loops](loops.md#plspmd-parallel-spmd-dispatch); the dispatch-overhead
 argument for reaching for it is in
-[Performance Tuning](../debug-and-tune/performance-tuning.md#6-plspmd-for-parallel-sub-kernel-dispatch).
+[Performance Tuning](../debug-and-tune/performance-tuning.md#7-plspmd-for-parallel-sub-kernel-dispatch).
 
 ---
 

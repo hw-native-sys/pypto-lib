@@ -120,6 +120,9 @@ def compressor_ratio128(
     with pl.spmd(
         t_matmul * OUT_DIM // (MM_B_TILE * OUT_TILE), name_hint="kv_score_proj", deps=[late_dep]
     ) as _kv_score_tid:
+        # Weight reads bypass L2.
+        pl.set_cache_policy(wkv, pl.CachePolicy.BYPASS)
+        pl.set_cache_policy(wgate, pl.CachePolicy.BYPASS)
         idx = pl.tile.get_block_idx()
         global_row0 = (idx // (OUT_DIM // OUT_TILE)) * MM_B_TILE
         o0 = (idx % (OUT_DIM // OUT_TILE)) * OUT_TILE

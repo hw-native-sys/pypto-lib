@@ -195,6 +195,8 @@ def make_gate(token_tile_rows=GATE_M_TILE, hidden_tile_cols=GATE_D_TILE):
         # stays outermost and // % divide by the compile-time GATE_N_BLOCKS.
         GATE_N_BLOCKS = N_EXPERTS // GATE_N_TILE
         for gb_idx in pl.spmd(active_gate_tiles * GATE_N_BLOCKS, name_hint="gate", allow_early_resolve=True):
+            # Weight reads bypass L2.
+            pl.set_cache_policy(gate_w, pl.CachePolicy.BYPASS)
             tg = gb_idx // GATE_N_BLOCKS
             nb = gb_idx % GATE_N_BLOCKS
             t1 = tg * TOKEN_TILE_ROWS

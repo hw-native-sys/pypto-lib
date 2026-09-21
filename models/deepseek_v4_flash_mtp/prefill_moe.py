@@ -165,9 +165,9 @@ def _make_expert_gate_up_quant_tile(grouped_capacity: int, row_tile: int):
         local_expert_id: pl.Scalar[pl.INDEX],
         valid_rows: pl.Scalar[pl.INDEX],
         layout_tid: pl.Scalar[pl.TASK_ID],
-        routed_w1: pl.Tensor[[N_LOCAL, MOE_INTER, D], pl.INT8],
+        routed_w1: pl.Tensor[[N_LOCAL, MOE_INTER, D], pl.INT8, pl.NZ],
         routed_w1_scale: pl.Tensor[[N_LOCAL, MOE_INTER], pl.FP32],
-        routed_w3: pl.Tensor[[N_LOCAL, MOE_INTER, D], pl.INT8],
+        routed_w3: pl.Tensor[[N_LOCAL, MOE_INTER, D], pl.INT8, pl.NZ],
         routed_w3_scale: pl.Tensor[[N_LOCAL, MOE_INTER], pl.FP32],
     ):
         """Compute gate/up projections, apply SwiGLU, and quantize a token tile."""
@@ -187,7 +187,10 @@ def _make_expert_gate_up_quant_tile(grouped_capacity: int, row_tile: int):
                         w13_acc = pl.matmul_acc(w13_acc, x_chunk, w13_chunk, b_trans=True, init_cond=k0 == 0)
                     w13_tile_i32[:, n0 : n0 + MM_INTER_TILE] = pl.reshape(w13_acc, [ROW_TILE, MM_INTER_TILE])
                 else:
-                    up_n0 = n0 - MOE_INTER
+                    # The up half's own row offset. Written as a remainder rather
+                    # than ``n0 - MOE_INTER``: an NZ row offset must be provably
+                    # non-negative, and a difference proves nothing.
+                    up_n0 = (block % (MOE_INTER // MM_INTER_TILE)) * MM_INTER_TILE
                     w13_acc = pl.create_tensor([1, ROW_TILE, MM_INTER_TILE], dtype=pl.INT32)
                     for k0 in pl.pipeline(0, D, K_TILE, stage=2):
                         x_chunk = expert_x[tile_row_start : tile_row_start + ROW_TILE, k0 : k0 + K_TILE]
@@ -254,7 +257,7 @@ def _make_expert_down_proj_tile(grouped_capacity: int, row_tile: int):
         h_scale_dq: pl.Tensor[[grouped_capacity, 1], pl.FP32],
         tile_row_start: pl.Scalar[pl.INDEX],
         local_expert_id: pl.Scalar[pl.INDEX],
-        routed_w2: pl.Tensor[[N_LOCAL, D, MOE_INTER], pl.INT8],
+        routed_w2: pl.Tensor[[N_LOCAL, D, MOE_INTER], pl.INT8, pl.NZ],
         routed_w2_scale: pl.Tensor[[N_LOCAL, D], pl.FP32],
         expert_y: pl.Tensor[[grouped_capacity, D], pl.BF16],
     ) -> pl.Scalar[pl.TASK_ID]:
@@ -337,11 +340,11 @@ def make_prefill_expert_grouped(grouped_capacity: int):
         expert_x: pl.Tensor[[grouped_capacity, D], pl.INT8],
         expert_scale: pl.Tensor[[grouped_capacity, PREFILL_MOE_EXPERT_SCALE_PAD], pl.FP32],
         expert_counts: pl.Tensor[[N_LOCAL, 1], pl.INT32],
-        routed_w1: pl.Tensor[[N_LOCAL, MOE_INTER, D], pl.INT8],
+        routed_w1: pl.Tensor[[N_LOCAL, MOE_INTER, D], pl.INT8, pl.NZ],
         routed_w1_scale: pl.Tensor[[N_LOCAL, MOE_INTER], pl.FP32],
-        routed_w3: pl.Tensor[[N_LOCAL, MOE_INTER, D], pl.INT8],
+        routed_w3: pl.Tensor[[N_LOCAL, MOE_INTER, D], pl.INT8, pl.NZ],
         routed_w3_scale: pl.Tensor[[N_LOCAL, MOE_INTER], pl.FP32],
-        routed_w2: pl.Tensor[[N_LOCAL, D, MOE_INTER], pl.INT8],
+        routed_w2: pl.Tensor[[N_LOCAL, D, MOE_INTER], pl.INT8, pl.NZ],
         routed_w2_scale: pl.Tensor[[N_LOCAL, D], pl.FP32],
         expert_y: pl.Tensor[[grouped_capacity, D], pl.BF16],
     ) -> pl.Scalar[pl.TASK_ID]:
@@ -1092,17 +1095,17 @@ def make_prefill_moe(layout: PrefillMoELayout):
         gate_bias: pl.Tensor[[N_EXPERTS_GLOBAL], pl.FP32],
         tid2eid: pl.Tensor[[VOCAB, TOPK], pl.INT32],
         input_ids: pl.Tensor[[T], pl.INT64],
-        routed_w1: pl.Tensor[[N_LOCAL, MOE_INTER, D], pl.INT8],
+        routed_w1: pl.Tensor[[N_LOCAL, MOE_INTER, D], pl.INT8, pl.NZ],
         routed_w1_scale: pl.Tensor[[N_LOCAL, MOE_INTER], pl.FP32],
-        routed_w3: pl.Tensor[[N_LOCAL, MOE_INTER, D], pl.INT8],
+        routed_w3: pl.Tensor[[N_LOCAL, MOE_INTER, D], pl.INT8, pl.NZ],
         routed_w3_scale: pl.Tensor[[N_LOCAL, MOE_INTER], pl.FP32],
-        routed_w2: pl.Tensor[[N_LOCAL, D, MOE_INTER], pl.INT8],
+        routed_w2: pl.Tensor[[N_LOCAL, D, MOE_INTER], pl.INT8, pl.NZ],
         routed_w2_scale: pl.Tensor[[N_LOCAL, D], pl.FP32],
-        shared_w1: pl.Tensor[[MOE_INTER, D], pl.INT8],
+        shared_w1: pl.Tensor[[MOE_INTER, D], pl.INT8, pl.NZ],
         shared_w1_scale: pl.Tensor[[MOE_INTER], pl.FP32],
-        shared_w3: pl.Tensor[[MOE_INTER, D], pl.INT8],
+        shared_w3: pl.Tensor[[MOE_INTER, D], pl.INT8, pl.NZ],
         shared_w3_scale: pl.Tensor[[MOE_INTER], pl.FP32],
-        shared_w2: pl.Tensor[[D, MOE_INTER], pl.INT8],
+        shared_w2: pl.Tensor[[D, MOE_INTER], pl.INT8, pl.NZ],
         shared_w2_scale: pl.Tensor[[D], pl.FP32],
         x_next: pl.Tensor[[T, HC_MULT, D], pl.FP32],
         # Caller-owned, layer-reused workspaces.  The multi-layer forward keeps
@@ -1307,17 +1310,17 @@ def prefill_moe_test(
     gate_bias: pl.Tensor[[N_EXPERTS_GLOBAL], pl.FP32],
     tid2eid: pl.Tensor[[VOCAB, TOPK], pl.INT32],
     input_ids: pl.Tensor[[T], pl.INT64],
-    routed_w1: pl.Tensor[[N_LOCAL, MOE_INTER, D], pl.INT8],
+    routed_w1: pl.Tensor[[N_LOCAL, MOE_INTER, D], pl.INT8, pl.NZ],
     routed_w1_scale: pl.Tensor[[N_LOCAL, MOE_INTER], pl.FP32],
-    routed_w3: pl.Tensor[[N_LOCAL, MOE_INTER, D], pl.INT8],
+    routed_w3: pl.Tensor[[N_LOCAL, MOE_INTER, D], pl.INT8, pl.NZ],
     routed_w3_scale: pl.Tensor[[N_LOCAL, MOE_INTER], pl.FP32],
-    routed_w2: pl.Tensor[[N_LOCAL, D, MOE_INTER], pl.INT8],
+    routed_w2: pl.Tensor[[N_LOCAL, D, MOE_INTER], pl.INT8, pl.NZ],
     routed_w2_scale: pl.Tensor[[N_LOCAL, D], pl.FP32],
-    shared_w1: pl.Tensor[[MOE_INTER, D], pl.INT8],
+    shared_w1: pl.Tensor[[MOE_INTER, D], pl.INT8, pl.NZ],
     shared_w1_scale: pl.Tensor[[MOE_INTER], pl.FP32],
-    shared_w3: pl.Tensor[[MOE_INTER, D], pl.INT8],
+    shared_w3: pl.Tensor[[MOE_INTER, D], pl.INT8, pl.NZ],
     shared_w3_scale: pl.Tensor[[MOE_INTER], pl.FP32],
-    shared_w2: pl.Tensor[[D, MOE_INTER], pl.INT8],
+    shared_w2: pl.Tensor[[D, MOE_INTER], pl.INT8, pl.NZ],
     shared_w2_scale: pl.Tensor[[D], pl.FP32],
     # final output
     x_next: pl.Out[pl.Tensor[[T, HC_MULT, D], pl.FP32]],
@@ -1585,6 +1588,7 @@ def _routed_weights():
 def _shared_weights():
     """Shared expert weights replicated across ranks, generated once per process."""
     from expert_shared import gen_shared_weight
+    from utils import pack_nz
 
     shapes = {
         "w1": ((MOE_INTER, D), 0.50),
@@ -1594,7 +1598,8 @@ def _shared_weights():
     weights = {}
     for key, (shape, chan_cv) in shapes.items():
         w_i8, w_s = gen_shared_weight(shape, SHARED_DEQUANT_STD[key], chan_cv=chan_cv)
-        weights[f"shared_{key}"] = w_i8.unsqueeze(0).expand(N_RANKS, -1, -1).contiguous()
+        # The shared expert reads its weights NZ; the golden unpacks them.
+        weights[f"shared_{key}"] = pack_nz(w_i8).unsqueeze(0).expand(N_RANKS, -1, -1).contiguous()
         weights[f"shared_{key}_scale"] = w_s.unsqueeze(0).expand(N_RANKS, -1).contiguous()
     return weights
 

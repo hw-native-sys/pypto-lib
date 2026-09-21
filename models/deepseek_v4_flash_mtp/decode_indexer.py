@@ -107,9 +107,9 @@ def indexer(
     x: pl.Tensor[[B, S, D], pl.BF16],
     qr: pl.Tensor[[T, Q_LORA], pl.INT8],
     qr_scale: pl.Tensor[[T, 1], pl.FP32],
-    wq_b: pl.Tensor[[Q_LORA, IDX_N_HEADS * IDX_HEAD_DIM], pl.INT8],
+    wq_b: pl.Tensor[[Q_LORA, IDX_N_HEADS * IDX_HEAD_DIM], pl.INT8, pl.NZ],
     wq_b_scale: pl.Tensor[[IDX_N_HEADS * IDX_HEAD_DIM], pl.FP32],
-    weights_proj: pl.Tensor[[D, IDX_N_HEADS], pl.BF16],
+    weights_proj: pl.Tensor[[D, IDX_N_HEADS], pl.BF16, pl.NZ],
     # Interleave-duplicated (j>>1) cos and sign-folded sin, built once by the caller:
     #   cos[j] = cos_half[j>>1];  sin[j] = sin_half[j>>1] * sign[j], sign = [-1,+1,...]
     cos: pl.Tensor[[B, ROPE_HEAD_DIM], pl.FP32],
@@ -137,6 +137,8 @@ def indexer(
 ):
     qr_acc_pad = pl.create_tensor([T_PAD, IDX_Q_DIM], dtype=pl.INT32)
     for ot in pl.spmd(IDX_Q_DIM // Q_OUT_TILE, name_hint="idx_qr_proj_matmul", allow_early_resolve=True):
+        # Weight reads bypass L2.
+        pl.set_cache_policy(wq_b, pl.CachePolicy.BYPASS)
         o_base = ot * Q_OUT_TILE
         for ns in pl.range(0, Q_OUT_TILE, MM_N_TILE):
             qr_acc = pl.create_tensor([MM_ROW_TILE, MM_N_TILE], dtype=pl.INT32)
@@ -217,6 +219,7 @@ def indexer(
     x_flat = pl.reshape(x, [T, D])
     weights_partial = pl.create_tensor([WEIGHTS_OK * MM_ROW_TILE, IDX_N_HEADS], dtype=pl.FP32)
     with pl.spmd(WEIGHTS_OK, name_hint="weights_proj", deps=[late_dep]) as _weights_tid:
+        pl.set_cache_policy(weights_proj, pl.CachePolicy.BYPASS)
         kb = pl.tile.get_block_idx()
         k_base = kb * WEIGHTS_K_TILE
         weights_acc = pl.create_tensor([MM_ROW_TILE, IDX_N_HEADS], dtype=pl.FP32)
@@ -552,9 +555,9 @@ def indexer_test(
     x: pl.Tensor[[B, S, D], pl.BF16],
     qr: pl.Tensor[[T, Q_LORA], pl.INT8],
     qr_scale: pl.Tensor[[T, 1], pl.FP32],
-    wq_b: pl.Tensor[[Q_LORA, IDX_N_HEADS * IDX_HEAD_DIM], pl.INT8],
+    wq_b: pl.Tensor[[Q_LORA, IDX_N_HEADS * IDX_HEAD_DIM], pl.INT8, pl.NZ],
     wq_b_scale: pl.Tensor[[IDX_N_HEADS * IDX_HEAD_DIM], pl.FP32],
-    weights_proj: pl.Tensor[[D, IDX_N_HEADS], pl.BF16],
+    weights_proj: pl.Tensor[[D, IDX_N_HEADS], pl.BF16, pl.NZ],
     cos: pl.Tensor[[B, ROPE_HEAD_DIM // 2], pl.FP32],
     sin: pl.Tensor[[B, ROPE_HEAD_DIM // 2], pl.FP32],
     hadamard: pl.Tensor[[IDX_HEAD_DIM, IDX_HEAD_DIM], pl.BF16],
@@ -631,14 +634,14 @@ def golden_indexer(tensors):
     """Torch reference for Indexer.forward decode branch; prefill `start_pos == 0` path is omitted."""
     import torch
     from decode_indexer_compressor import golden_compressor
-    from utils import int8_quant_per_row
+    from utils import int8_quant_per_row, unpack_nz
 
     x = tensors["x"].float()
     qr = tensors["qr"]
     qr_scale = tensors["qr_scale"].float()
-    wq_b = tensors["wq_b"]
+    wq_b = unpack_nz(tensors["wq_b"])
     wq_b_scale = tensors["wq_b_scale"].float()
-    weights_proj = tensors["weights_proj"].float()
+    weights_proj = unpack_nz(tensors["weights_proj"]).float()
     cos = tensors["cos"]
     sin = tensors["sin"]
     hadamard = tensors["hadamard"].float()
@@ -732,6 +735,7 @@ def golden_indexer(tensors):
 def build_tensor_specs(start_pos=None):
     import torch
     from utils import (
+        pack_nz,
         block_table,
         compressed_slot_mapping,
         csa_decode_start_set,
@@ -828,9 +832,9 @@ def build_tensor_specs(start_pos=None):
         TensorSpec("x", [B, S, D], torch.bfloat16, init_value=init_x),
         TensorSpec("qr", [T, Q_LORA], torch.int8, init_value=lambda: qr_i8),
         TensorSpec("qr_scale", [T, 1], torch.float32, init_value=lambda: qr_scale),
-        TensorSpec("wq_b", [Q_LORA, IDX_N_HEADS * IDX_HEAD_DIM], torch.int8, init_value=lambda: wq_b_i8),
+        TensorSpec("wq_b", [Q_LORA, IDX_N_HEADS * IDX_HEAD_DIM], torch.int8, init_value=lambda: pack_nz(wq_b_i8)),
         TensorSpec("wq_b_scale", [IDX_N_HEADS * IDX_HEAD_DIM], torch.float32, init_value=lambda: wq_b_scale),
-        TensorSpec("weights_proj", [D, IDX_N_HEADS], torch.bfloat16, init_value=init_weights_proj),
+        TensorSpec("weights_proj", [D, IDX_N_HEADS], torch.bfloat16, init_value=lambda: pack_nz(init_weights_proj().to(torch.bfloat16))),
         TensorSpec("cos", [B, ROPE_HEAD_DIM // 2], torch.float32, init_value=init_cos),
         TensorSpec("sin", [B, ROPE_HEAD_DIM // 2], torch.float32, init_value=init_sin),
         TensorSpec("hadamard", [IDX_HEAD_DIM, IDX_HEAD_DIM], torch.bfloat16, init_value=init_hadamard),

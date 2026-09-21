@@ -927,8 +927,16 @@ def _check_param_abi(param_infos: Any, specs: list[TensorSpec | ScalarSpec]) -> 
     A compiled ``-1`` dimension is dynamic and accepts the matching concrete
     spec dimension. Type mismatches are collected so one failure reports all of
     them rather than one per recompile. Pure: nothing is written to a spec here.
+
+    An NZ parameter compiles to the blocked rank-5 shape the backend addresses,
+    not the logical shape a spec declares -- the same bytes under two spellings,
+    exactly as ``pypto.ir.compiled_program._arg_shape_as_declared`` blocks a live
+    argument's shape before comparing it to ``info.shape``. This function checks
+    the spec itself rather than a live argument, so it blocks ``spec.shape`` the
+    same way before the comparison below.
     """
     from pypto.ir.compiled_program import _to_torch_dtype
+    from pypto.ir.param_info import block_nz_shape
 
     compiled_names = [_strip_ssa_suffix(info.name) for info in param_infos]
     if len(set(compiled_names)) != len(compiled_names):
@@ -970,17 +978,33 @@ def _check_param_abi(param_infos: Any, specs: list[TensorSpec | ScalarSpec]) -> 
                 )
         else:
             expected_shape = tuple(spec.shape)
+            # An NZ artifact's info.shape is blocked (rank-5) at some entry points and
+            # raw at others, so accept either instead of guessing.
+            candidates = [expected_shape]
+            if getattr(info, "layout", None) == "NZ" and artifact_dtype is not None:
+                try:
+                    candidates.append(tuple(block_nz_shape(expected_shape, artifact_dtype)))
+                except ValueError:
+                    pass
             if artifact_shape is None:
                 mismatches.append(f"{name}: expected tensor shape={expected_shape}, artifact is scalar")
-            elif len(artifact_shape) != len(expected_shape) or any(
-                artifact_dim != -1 and artifact_dim != expected_dim
-                for artifact_dim, expected_dim in zip(
-                    artifact_shape, expected_shape, strict=True
+            else:
+                matched = any(
+                    len(artifact_shape) == len(candidate)
+                    and all(
+                        artifact_dim == -1 or artifact_dim == expected_dim
+                        for artifact_dim, expected_dim in zip(artifact_shape, candidate, strict=True)
+                    )
+                    for candidate in candidates
                 )
-            ):
-                mismatches.append(
-                    f"{name}: shape spec={expected_shape} artifact={artifact_shape}"
-                )
+                if not matched:
+                    reported = next(
+                        (c for c in reversed(candidates) if len(c) == len(artifact_shape)),
+                        expected_shape,
+                    )
+                    mismatches.append(
+                        f"{name}: shape spec={reported} artifact={artifact_shape}"
+                    )
 
         if artifact_dtype != spec.dtype:
             mismatches.append(

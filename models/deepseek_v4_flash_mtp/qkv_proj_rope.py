@@ -241,8 +241,8 @@ def rope_prepare(
 @pl.jit.inline(auto_scope=False)
 def q_proj_rope(
     x: pl.Tensor[[T_DYN, D], pl.BF16],
-    wq_a: pl.Tensor[[D, Q_LORA], pl.BF16],
-    wq_b: pl.Tensor[[Q_LORA, H * HEAD_DIM], pl.INT8],
+    wq_a: pl.Tensor[[D, Q_LORA], pl.BF16, pl.NZ],
+    wq_b: pl.Tensor[[Q_LORA, H * HEAD_DIM], pl.INT8, pl.NZ],
     wq_b_scale: pl.Tensor[[H * HEAD_DIM], pl.FP32],
     gamma_cq: pl.Tensor[[Q_LORA], pl.BF16],
     rope_cos_il: pl.Tensor[[T_DYN, ROPE_DIM], pl.FP32],
@@ -538,7 +538,7 @@ def q_proj_rope(
 @pl.jit.inline(auto_scope=False)
 def kv_proj_rope(
     x: pl.Tensor[[T_DYN, D], pl.BF16],
-    wkv: pl.Tensor[[D, HEAD_DIM], pl.BF16],
+    wkv: pl.Tensor[[D, HEAD_DIM], pl.BF16, pl.NZ],
     gamma_ckv: pl.Tensor[[HEAD_DIM], pl.BF16],
     rope_cos_il: pl.Tensor[[T_DYN, ROPE_DIM], pl.FP32],
     rope_sin_signed: pl.Tensor[[T_DYN, ROPE_DIM], pl.FP32],
@@ -739,10 +739,10 @@ def kv_proj_rope(
 @pl.jit.inline
 def qkv_proj_rope(
     x: pl.Tensor[[T_DYN, D], pl.BF16],
-    wq_a: pl.Tensor[[D, Q_LORA], pl.BF16],
-    wq_b: pl.Tensor[[Q_LORA, H * HEAD_DIM], pl.INT8],
+    wq_a: pl.Tensor[[D, Q_LORA], pl.BF16, pl.NZ],
+    wq_b: pl.Tensor[[Q_LORA, H * HEAD_DIM], pl.INT8, pl.NZ],
     wq_b_scale: pl.Tensor[[H * HEAD_DIM], pl.FP32],
-    wkv: pl.Tensor[[D, HEAD_DIM], pl.BF16],
+    wkv: pl.Tensor[[D, HEAD_DIM], pl.BF16, pl.NZ],
     rope_cos: pl.Tensor[[T_DYN, ROPE_DIM], pl.BF16],
     rope_sin: pl.Tensor[[T_DYN, ROPE_DIM], pl.BF16],
     gamma_cq: pl.Tensor[[Q_LORA], pl.BF16],
@@ -785,6 +785,8 @@ def qkv_proj_rope(
                     [QR_M_TILE, QR_N_TILE], dtype=pl.FP32, value=0.0
                 )
     for qbg_idx in pl.spmd((Q_LORA // QR_N_TILE) * QR_OK, name_hint="qr_proj_matmul", allow_early_resolve=True):
+        # Weight reads bypass L2.
+        pl.set_cache_policy(wq_a, pl.CachePolicy.BYPASS)
         q_a_col0 = (qbg_idx // QR_OK) * QR_N_TILE
         qr_k_base = (qbg_idx % QR_OK) * QR_K_SLICE
         for tc in pl.range(t_matmul // QR_M_TILE):
@@ -841,6 +843,7 @@ def qkv_proj_rope(
     q_proj_i32 = pl.create_tensor([t_matmul, H * HEAD_DIM], dtype=pl.INT32)
     # One output-column fragment per task.
     for qproj_n_idx in pl.spmd((H * HEAD_DIM) // QPROJ_MM_N_TILE, name_hint="qproj_matmul"):
+        pl.set_cache_policy(wq_b, pl.CachePolicy.BYPASS)
         w_col0 = qproj_n_idx * QPROJ_MM_N_TILE
         for tc in pl.range(t_matmul // QPROJ_M_TILE):
             t0 = tc * QPROJ_M_TILE
@@ -921,6 +924,7 @@ def qkv_proj_rope(
     # critical path, so it resolves one hop after rms_norm and lets qr_proj_matmul
     # take the cores first.
     with pl.spmd((HEAD_DIM // KV_N_TILE) * KV_OK, name_hint="kv_proj_matmul", deps=[late_dep]) as _kv_tid:
+        pl.set_cache_policy(wkv, pl.CachePolicy.BYPASS)
         kbg = pl.tile.get_block_idx()
         kv_col0 = (kbg // KV_OK) * KV_N_TILE
         kv_k_base = (kbg % KV_OK) * KV_K_SLICE
@@ -995,8 +999,8 @@ def prefill_attention_prolog(
     hc_attn_scale: pl.Tensor[[3], pl.FP32],
     hc_attn_base: pl.Tensor[[M.mix_hc], pl.FP32],
     attn_norm_w: pl.Tensor[[D], pl.BF16],
-    wq_a: pl.Tensor[[D, Q_LORA], pl.BF16],
-    wq_b: pl.Tensor[[Q_LORA, H * HEAD_DIM], pl.INT8],
+    wq_a: pl.Tensor[[D, Q_LORA], pl.BF16, pl.NZ],
+    wq_b: pl.Tensor[[Q_LORA, H * HEAD_DIM], pl.INT8, pl.NZ],
     wq_b_scale: pl.Tensor[[H * HEAD_DIM], pl.FP32],
     gamma_cq: pl.Tensor[[Q_LORA], pl.BF16],
     rope_cos: pl.Tensor[[T_DYN, ROPE_DIM], pl.BF16],
@@ -1024,10 +1028,10 @@ def prefill_attention_prolog(
 @pl.jit
 def qkv_proj_rope_test(
     x: pl.Tensor[[T_DYN, D], pl.BF16],
-    wq_a: pl.Tensor[[D, Q_LORA], pl.BF16],
-    wq_b: pl.Tensor[[Q_LORA, H * HEAD_DIM], pl.INT8],
+    wq_a: pl.Tensor[[D, Q_LORA], pl.BF16, pl.NZ],
+    wq_b: pl.Tensor[[Q_LORA, H * HEAD_DIM], pl.INT8, pl.NZ],
     wq_b_scale: pl.Tensor[[H * HEAD_DIM], pl.FP32],
-    wkv: pl.Tensor[[D, HEAD_DIM], pl.BF16],
+    wkv: pl.Tensor[[D, HEAD_DIM], pl.BF16, pl.NZ],
     rope_cos: pl.Tensor[[T_DYN, ROPE_DIM], pl.BF16],
     rope_sin: pl.Tensor[[T_DYN, ROPE_DIM], pl.BF16],
     gamma_cq: pl.Tensor[[Q_LORA], pl.BF16],
@@ -1069,13 +1073,13 @@ def qkv_proj_rope_test(
 def golden_qkv_proj_rope(tensors):
     """Torch reference: Q/KV LoRA + RoPE for an already attention-normalized input."""
     import torch
-    from utils import int8_quant_per_row
+    from utils import int8_quant_per_row, unpack_nz
 
     x = tensors["x"].float()
-    wq_a = tensors["wq_a"].float()
-    wq_b = tensors["wq_b"]
+    wq_a = unpack_nz(tensors["wq_a"]).float()
+    wq_b = unpack_nz(tensors["wq_b"])
     wq_b_scale = tensors["wq_b_scale"].float().view(-1)
-    wkv = tensors["wkv"].float()
+    wkv = unpack_nz(tensors["wkv"]).float()
     rope_cos = tensors["rope_cos"].float()
     rope_sin = tensors["rope_sin"].float()
     gamma_cq = tensors["gamma_cq"].float()
@@ -1135,6 +1139,7 @@ def golden_qkv_proj_rope(tensors):
 def build_tensor_specs(B, S):
     import torch
     from golden import TensorSpec
+    from utils import pack_nz
 
     T = B * S
 
@@ -1171,10 +1176,10 @@ def build_tensor_specs(B, S):
 
     return [
         TensorSpec("x",         [T, D],                 torch.bfloat16, init_value=init_x),
-        TensorSpec("wq_a",      [D, Q_LORA],            torch.bfloat16, init_value=init_wq_a),
-        TensorSpec("wq_b",      [Q_LORA, H * HEAD_DIM], torch.int8,     init_value=lambda: wq_b_i8),
+        TensorSpec("wq_a",      [D, Q_LORA],            torch.bfloat16, init_value=lambda: pack_nz(init_wq_a())),
+        TensorSpec("wq_b",      [Q_LORA, H * HEAD_DIM], torch.int8,     init_value=lambda: pack_nz(wq_b_i8)),
         TensorSpec("wq_b_scale", [H * HEAD_DIM], torch.float32, init_value=lambda: wq_b_scale),
-        TensorSpec("wkv",       [D, HEAD_DIM],          torch.bfloat16, init_value=init_wkv),
+        TensorSpec("wkv",       [D, HEAD_DIM],          torch.bfloat16, init_value=lambda: pack_nz(init_wkv())),
         TensorSpec("rope_cos",  [T, ROPE_DIM],          torch.bfloat16, init_value=init_cos),
         TensorSpec("rope_sin",  [T, ROPE_DIM],          torch.bfloat16, init_value=init_sin),
         TensorSpec("gamma_cq",  [Q_LORA],               torch.bfloat16, init_value=init_gamma_cq),

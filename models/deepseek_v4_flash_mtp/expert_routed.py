@@ -46,11 +46,11 @@ def expert_routed_tile(
     recv_x: pl.Tensor[[N_LOCAL_EXPERTS, RECV_MAX, D], pl.INT8],
     recv_scale_dq: pl.Tensor[[N_LOCAL_EXPERTS, RECV_MAX], pl.FP32],
     recv_weights: pl.Tensor[[N_LOCAL_EXPERTS, RECV_MAX], pl.FP32],
-    routed_w1: pl.Tensor[[N_LOCAL_EXPERTS, MOE_INTER, D], pl.INT8],
+    routed_w1: pl.Tensor[[N_LOCAL_EXPERTS, MOE_INTER, D], pl.INT8, pl.NZ],
     routed_w1_scale: pl.Tensor[[N_LOCAL_EXPERTS, MOE_INTER], pl.FP32],
-    routed_w3: pl.Tensor[[N_LOCAL_EXPERTS, MOE_INTER, D], pl.INT8],
+    routed_w3: pl.Tensor[[N_LOCAL_EXPERTS, MOE_INTER, D], pl.INT8, pl.NZ],
     routed_w3_scale: pl.Tensor[[N_LOCAL_EXPERTS, MOE_INTER], pl.FP32],
-    routed_w2: pl.Tensor[[N_LOCAL_EXPERTS, D, MOE_INTER], pl.INT8],
+    routed_w2: pl.Tensor[[N_LOCAL_EXPERTS, D, MOE_INTER], pl.INT8, pl.NZ],
     routed_w2_scale: pl.Tensor[[N_LOCAL_EXPERTS, D], pl.FP32],
     recv_y_tile: pl.Tensor[[RECV_TILE, D], pl.BF16],
     local_e: pl.Scalar[pl.INDEX],
@@ -68,6 +68,7 @@ def expert_routed_tile(
         up_tile_i32 = pl.create_tensor([RECV_TILE, MOE_INTER], dtype=pl.INT32)
 
         with pl.spmd(MOE_INTER // (MM_GATE_INNER * MM_INTER_TILE), name_hint="exp_gate_mm"):
+            pl.set_cache_policy(routed_w1, pl.CachePolicy.BYPASS)
             nb_idx = pl.tile.get_block_idx()
             n_base = nb_idx * (MM_GATE_INNER * MM_INTER_TILE)
             for ng in pl.range(MM_GATE_INNER):
@@ -80,6 +81,7 @@ def expert_routed_tile(
                 gate_tile_i32[:, n0 : n0 + MM_INTER_TILE] = pl.reshape(gate_acc, [RECV_TILE, MM_INTER_TILE])
 
         with pl.spmd(MOE_INTER // (MM_GATE_INNER * MM_INTER_TILE), name_hint="exp_up_mm"):
+            pl.set_cache_policy(routed_w3, pl.CachePolicy.BYPASS)
             ub_idx = pl.tile.get_block_idx()
             u_base = ub_idx * (MM_GATE_INNER * MM_INTER_TILE)
             for ug in pl.range(MM_GATE_INNER):
@@ -135,6 +137,7 @@ def expert_routed_tile(
 
     y_i32 = pl.create_tensor([RECV_TILE, D], dtype=pl.INT32)
     with pl.spmd(D // (W2_INNER * D_OUT_TILE), name_hint="exp_w2_mm", allow_early_resolve=True):
+        pl.set_cache_policy(routed_w2, pl.CachePolicy.BYPASS)
         wb_idx = pl.tile.get_block_idx()
         d_base = wb_idx * (W2_INNER * D_OUT_TILE)
         for dg in pl.range(W2_INNER):
@@ -168,11 +171,11 @@ def expert_routed_test(
     recv_scale_dq: pl.Tensor[[N_LOCAL_EXPERTS, RECV_MAX], pl.FP32],
     recv_weights: pl.Tensor[[N_LOCAL_EXPERTS, RECV_MAX], pl.FP32],
     recv_expert_count: pl.Tensor[[N_LOCAL_EXPERTS, 1], pl.INT32],
-    routed_w1: pl.Tensor[[N_LOCAL_EXPERTS, MOE_INTER, D], pl.INT8],
+    routed_w1: pl.Tensor[[N_LOCAL_EXPERTS, MOE_INTER, D], pl.INT8, pl.NZ],
     routed_w1_scale: pl.Tensor[[N_LOCAL_EXPERTS, MOE_INTER], pl.FP32],
-    routed_w3: pl.Tensor[[N_LOCAL_EXPERTS, MOE_INTER, D], pl.INT8],
+    routed_w3: pl.Tensor[[N_LOCAL_EXPERTS, MOE_INTER, D], pl.INT8, pl.NZ],
     routed_w3_scale: pl.Tensor[[N_LOCAL_EXPERTS, MOE_INTER], pl.FP32],
-    routed_w2: pl.Tensor[[N_LOCAL_EXPERTS, D, MOE_INTER], pl.INT8],
+    routed_w2: pl.Tensor[[N_LOCAL_EXPERTS, D, MOE_INTER], pl.INT8, pl.NZ],
     routed_w2_scale: pl.Tensor[[N_LOCAL_EXPERTS, D], pl.FP32],
     recv_y: pl.Out[pl.Tensor[[N_LOCAL_EXPERTS, RECV_MAX, D], pl.BF16]],
 ):
@@ -196,18 +199,20 @@ def expert_routed_test(
     return recv_y
 
 
-def golden_expert_routed(tensors):
+def golden_expert_routed(tensors, nz_weights=True):
     """Torch reference for the routed expert. recv_y is the per-row routing-
     weight-scaled SwiGLU output, ready for combine reduce to simply sum.
 
     Per-expert layout: recv_x[e, 0:cnt[e], :] is the valid INT8 receive
-    payload; recv_y[e, cnt[e]:, :] stays at zero."""
-    from utils import int8_quant_per_row
+    payload; recv_y[e, cnt[e]:, :] stays at zero. ``nz_weights`` says the routed
+    weights arrive in FRACTAL_NZ order, as the decode kernels declare them."""
+    from utils import int8_quant_per_row, unpack_nz
     import torch
     import torch.nn.functional as F
 
     def dequant_w(w_i8, w_scale):
-        return w_i8.to(torch.float32) * w_scale.unsqueeze(-1)
+        w_logical = unpack_nz(w_i8) if nz_weights else w_i8
+        return w_logical.to(torch.float32) * w_scale.unsqueeze(-1)
 
     recv_x_i8 = tensors["recv_x"]  # INT8, pre-quantized in dispatch
     recv_scale_dq = tensors["recv_scale_dq"].float()  # [E, RECV_MAX]
@@ -241,13 +246,18 @@ def golden_expert_routed(tensors):
     tensors["recv_y"][:] = recv_y.to(torch.bfloat16)
 
 
-def gen_routed_weight(shape, dequant_std):
+def gen_routed_weight(shape, dequant_std, nz=True):
     """Synthesize a per-output-channel INT8 routed-expert weight + FP32 scale on a simulated
     MXFP4 grid (e2m1, per-32-group E8M0 scale); ``dequant_std`` sets the dequantized std.
 
     ``shape`` last dim = reduction (in) dim; ``[E, out, in]`` -> scale ``[E, out]``.
+    With ``nz`` the INT8 weight comes back in FRACTAL_NZ order, which both the
+    decode and prefill kernels declare and their goldens read back through
+    ``unpack_nz``.
     """
     import torch
+
+    from utils import pack_nz
 
     FP4_MAG = torch.tensor([0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0])
     FP4_MID = torch.tensor([0.25, 0.75, 1.25, 1.75, 2.5, 3.5, 5.0])  # nearest-grid bounds
@@ -281,7 +291,8 @@ def gen_routed_weight(shape, dequant_std):
     del W
 
     scale = (scale * (dequant_std / (w_i8.float() * scale).std())).squeeze(-1).float()
-    return w_i8.reshape(*shape), scale.reshape(*lead, out)
+    w_i8 = w_i8.reshape(*shape)
+    return (pack_nz(w_i8) if nz else w_i8), scale.reshape(*lead, out)
 
 
 def build_tensor_specs():

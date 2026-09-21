@@ -47,10 +47,10 @@ def _mtp_projection(
     prev_hidden_states: pl.Tensor[[T_DYN, HC_MULT, D], pl.FP32],
     enorm_w: pl.Tensor[[D], pl.FP32],
     hnorm_w: pl.Tensor[[D], pl.FP32],
-    e_proj_w: pl.Tensor[[D, D], pl.INT8],
+    e_proj_w: pl.Tensor[[D, D], pl.INT8, pl.NZ],
     e_proj_w_scale: pl.Tensor[[D], pl.FP32],
     e_proj_smooth: pl.Tensor[[D], pl.FP32],
-    h_proj_w: pl.Tensor[[D, D], pl.INT8],
+    h_proj_w: pl.Tensor[[D, D], pl.INT8, pl.NZ],
     h_proj_w_scale: pl.Tensor[[D], pl.FP32],
     h_proj_smooth: pl.Tensor[[D], pl.FP32],
     hidden_states_out: pl.Out[pl.Tensor[[T_DYN, HC_MULT, D], pl.FP32]],
@@ -223,15 +223,17 @@ def _rms_norm(x, weight):
 def golden_mtp_projection(tensors):
     import torch
 
+    from utils import unpack_nz
+
     hidden_norm = _rms_norm(tensors["hidden_states"], tensors["enorm_w"])
     hidden_states = hidden_norm * tensors["e_proj_smooth"].float()
     prev_hidden_norm = _rms_norm(tensors["prev_hidden_states"], tensors["hnorm_w"])
     prev_hidden_states = prev_hidden_norm * tensors["h_proj_smooth"].float()
     hidden_i8, hidden_scale = _quantize_rows(hidden_states.float())
     prev_i8, prev_scale = _quantize_rows(prev_hidden_states.float())
-    hidden_e = hidden_i8.to(torch.int32).matmul(tensors["e_proj_w"].to(torch.int32).t()).float()
+    hidden_e = hidden_i8.to(torch.int32).matmul(unpack_nz(tensors["e_proj_w"]).to(torch.int32).t()).float()
     hidden_e = hidden_e * hidden_scale * tensors["e_proj_w_scale"].float().view(1, D)
-    hidden_h = prev_i8.to(torch.int32).matmul(tensors["h_proj_w"].to(torch.int32).t()).float()
+    hidden_h = prev_i8.to(torch.int32).matmul(unpack_nz(tensors["h_proj_w"]).to(torch.int32).t()).float()
     hidden_h = hidden_h * prev_scale * tensors["h_proj_w_scale"].float().view(1, 1, D)
     tensors["hidden_states_out"][:] = (hidden_e.unsqueeze(1) + hidden_h).to(torch.float32)
 
@@ -259,6 +261,7 @@ def _quantize_weight_per_out(w):
 def build_tensor_specs(batch=DECODE_BATCH, seq=DECODE_SEQ):
     import torch
     from golden import TensorSpec
+    from utils import pack_nz
     t = batch * seq
     prev_shape = [t, HC_MULT, D]
 
@@ -275,7 +278,7 @@ def build_tensor_specs(batch=DECODE_BATCH, seq=DECODE_SEQ):
     def init_e_proj_w():
         nonlocal e_proj_cache
         e_proj_cache = init_proj_pair()
-        return e_proj_cache[0]
+        return pack_nz(e_proj_cache[0])
 
     def init_e_proj_w_scale():
         nonlocal e_proj_cache
@@ -286,7 +289,7 @@ def build_tensor_specs(batch=DECODE_BATCH, seq=DECODE_SEQ):
     def init_h_proj_w():
         nonlocal h_proj_cache
         h_proj_cache = init_proj_pair()
-        return h_proj_cache[0]
+        return pack_nz(h_proj_cache[0])
 
     def init_h_proj_w_scale():
         nonlocal h_proj_cache

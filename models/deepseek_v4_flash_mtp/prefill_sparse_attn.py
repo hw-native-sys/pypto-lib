@@ -606,8 +606,8 @@ def _physical_sparse_heads(
 @pl.jit.inline(auto_scope=False)
 def _staged_attn_o_proj(
     o_packed_heads: pl.Tensor[[PREFILL_ATTN_PACKED_ROWS_DYN, HEAD_DIM], pl.BF16],
-    wo_a: pl.Tensor[[O_GROUPS, O_LORA, O_GROUP_IN], pl.BF16],
-    wo_b: pl.Tensor[[D, O_GROUPS * O_LORA], pl.INT8],
+    wo_a: pl.Tensor[[O_GROUPS, O_LORA, O_GROUP_IN], pl.BF16, pl.NZ],
+    wo_b: pl.Tensor[[O_GROUPS, D, O_LORA], pl.INT8, pl.NZ],
     wo_b_scale: pl.Tensor[[D], pl.FP32],
     attn_out: pl.Tensor[[PREFILL_ATTN_ROWS_DYN, D], pl.BF16],
     heads_dep: pl.Scalar[pl.TASK_ID],
@@ -622,39 +622,44 @@ def _staged_attn_o_proj(
     o_r_i8 = pl.create_tensor([projection_rows, O_GROUPS * O_LORA], dtype=pl.INT8)
     act_scale_dq = pl.create_tensor([O_GROUPS, projection_rows], dtype=pl.FP32)
     partials = pl.create_tensor([projection_rows, O_GROUPS * D], dtype=pl.INT32)
-    proj_a_tids = pl.array.create(O_GROUPS * PA_NFRAGS, pl.TASK_ID)
+    proj_a_tids = pl.array.create(O_GROUPS, pl.TASK_ID)
     quant_tids = pl.array.create(O_GROUPS, pl.TASK_ID)
-    proj_b_tids = pl.array.create(STAGED_SWA_PB_DSLABS * O_GROUPS, pl.TASK_ID)
+    proj_b_tids = pl.array.create(O_GROUPS, pl.TASK_ID)
 
     with pl.manual_scope():
         for g in pl.parallel(O_GROUPS):
             row_base_o = g * projection_rows
             out_col_g = g * O_LORA
-            for nf in pl.range(PA_NFRAGS):
+            # Rows and N fragments share one task, and both indices come from the
+            # block index. n0 addresses an NZ fractal row, and a scalar computed
+            # outside the task reaches it as an opaque parameter that no
+            # alignment proof can see through.
+            with pl.spmd(
+                (projection_rows // STAGED_SWA_PROJ_A_ROW_TILE) * PA_NFRAGS,
+                name_hint="staged_swa_proj_a_mm",
+                deps=[heads_dep],
+            ) as pa_tid:
+                pa_blk = pl.tile.get_block_idx()
+                nf = pa_blk % PA_NFRAGS
                 n0 = nf * PROJ_A_MM_N_TILE
-                with pl.spmd(
-                    projection_rows // STAGED_SWA_PROJ_A_ROW_TILE,
-                    name_hint="staged_swa_proj_a_mm",
-                    deps=[heads_dep],
-                ) as pa_tid:
-                    pa_rb = pl.tile.get_block_idx()
-                    pa_r0 = pa_rb * STAGED_SWA_PROJ_A_ROW_TILE
-                    pa_src0 = row_base_o + pa_r0
-                    acc_a = pl.create_tensor([1, STAGED_SWA_PROJ_A_ROW_TILE, PROJ_A_MM_N_TILE], dtype=pl.FP32)
-                    for kb in pl.pipeline(0, O_GROUP_IN // A_K_TILE, stage=2):
-                        k0 = kb * A_K_TILE
-                        xa_k_chunk = o_packed[pa_src0 : pa_src0 + STAGED_SWA_PROJ_A_ROW_TILE, k0 : k0 + A_K_TILE]
-                        wa_k_chunk = wo_a[g : g + 1, n0 : n0 + PROJ_A_MM_N_TILE, k0 : k0 + A_K_TILE]
-                        acc_a = pl.matmul_acc(acc_a, xa_k_chunk, wa_k_chunk, b_trans=True, init_cond=(kb == 0))
-                    o_r = pl.assemble(o_r, acc_a, [pa_r0, out_col_g + n0])
-                proj_a_tids[g * PA_NFRAGS + nf] = pa_tid
+                pa_rb = pa_blk // PA_NFRAGS
+                pa_r0 = pa_rb * STAGED_SWA_PROJ_A_ROW_TILE
+                pa_src0 = row_base_o + pa_r0
+                acc_a = pl.create_tensor([1, STAGED_SWA_PROJ_A_ROW_TILE, PROJ_A_MM_N_TILE], dtype=pl.FP32)
+                for kb in pl.pipeline(0, O_GROUP_IN // A_K_TILE, stage=2):
+                    k0 = kb * A_K_TILE
+                    xa_k_chunk = o_packed[pa_src0 : pa_src0 + STAGED_SWA_PROJ_A_ROW_TILE, k0 : k0 + A_K_TILE]
+                    wa_k_chunk = wo_a[g : g + 1, n0 : n0 + PROJ_A_MM_N_TILE, k0 : k0 + A_K_TILE]
+                    acc_a = pl.matmul_acc(acc_a, xa_k_chunk, wa_k_chunk, b_trans=True, init_cond=(kb == 0))
+                o_r = pl.assemble(o_r, acc_a, [pa_r0, out_col_g + n0])
+            proj_a_tids[g] = pa_tid
 
         for g in pl.parallel(O_GROUPS):
             col_g = g * O_LORA
             with pl.spmd(
                 projection_rows // QUANT_TOKEN_TILE,
                 name_hint="staged_swa_quant",
-                deps=[proj_a_tids[g * PA_NFRAGS + j] for j in range(PA_NFRAGS)],
+                deps=[proj_a_tids[g]],
             ) as q_tid:
                 qt = pl.tile.get_block_idx() * QUANT_TOKEN_TILE
                 g_amax = pl.full([1, QUANT_TOKEN_TILE], dtype=pl.FP32, value=INT8_AMAX_EPS)
@@ -676,35 +681,36 @@ def _staged_attn_o_proj(
                     o_r_i8[qt : qt + QUANT_TOKEN_TILE, col_g + k1 : col_g + k1 + QUANT_TILE] = oq_i8
             quant_tids[g] = q_tid
 
-        for dc in pl.parallel(STAGED_SWA_PB_DSLABS):
-            d0 = dc * STAGED_SWA_PROJ_B_D_TILE
-            for g in pl.range(O_GROUPS):
-                col_g = g * O_LORA
-                with pl.at(level=pl.Level.CORE_GROUP, name_hint="staged_swa_proj_b_mm", deps=[quant_tids[g]]) as pb_tid:
-                    for nf in pl.range(STAGED_SWA_PROJ_B_D_TILE // PROJ_B_MM_N_TILE):
-                        n0 = d0 + nf * PROJ_B_MM_N_TILE
-                        for pb_rb in pl.range(projection_rows // STAGED_SWA_PROJ_B_ROW_TILE):
-                            pb_r0 = pb_rb * STAGED_SWA_PROJ_B_ROW_TILE
-                            acc_b = pl.create_tensor([STAGED_SWA_PROJ_B_ROW_TILE, PROJ_B_MM_N_TILE], dtype=pl.INT32)
-                            for kb in pl.pipeline(0, O_LORA // B_K_TILE, stage=2):
-                                k0 = col_g + kb * B_K_TILE
-                                b_act = o_r_i8[pb_r0 : pb_r0 + STAGED_SWA_PROJ_B_ROW_TILE, k0 : k0 + B_K_TILE]
-                                b_weight = wo_b[n0 : n0 + PROJ_B_MM_N_TILE, k0 : k0 + B_K_TILE]
-                                acc_b = pl.matmul_acc(acc_b, b_act, b_weight, b_trans=True, init_cond=(kb == 0))
-                            partials[
-                                pb_r0 : pb_r0
-                                + STAGED_SWA_PROJ_B_ROW_TILE,
-                                g * D + n0 : g * D
-                                + n0
-                                + PROJ_B_MM_N_TILE,
-                            ] = acc_b
-                proj_b_tids[dc * O_GROUPS + g] = pb_tid
+        # One task per group, D slabs across its blocks: n0 addresses an NZ
+        # fractal row, so it has to be built inside the task from the block
+        # index rather than captured from the enclosing loop.
+        for g in pl.range(O_GROUPS):
+            col_g = g * O_LORA
+            with pl.spmd(
+                STAGED_SWA_PB_DSLABS,
+                name_hint="staged_swa_proj_b_mm",
+                deps=[quant_tids[g]],
+            ) as pb_tid:
+                dc = pl.tile.get_block_idx()
+                d0 = dc * STAGED_SWA_PROJ_B_D_TILE
+                for nf in pl.range(STAGED_SWA_PROJ_B_D_TILE // PROJ_B_MM_N_TILE):
+                    n0 = d0 + nf * PROJ_B_MM_N_TILE
+                    for pb_rb in pl.range(projection_rows // STAGED_SWA_PROJ_B_ROW_TILE):
+                        pb_r0 = pb_rb * STAGED_SWA_PROJ_B_ROW_TILE
+                        acc_b = pl.create_tensor([1, STAGED_SWA_PROJ_B_ROW_TILE, PROJ_B_MM_N_TILE], dtype=pl.INT32)
+                        for kb in pl.pipeline(0, O_LORA // B_K_TILE, stage=2):
+                            k0 = kb * B_K_TILE
+                            b_act = o_r_i8[pb_r0 : pb_r0 + STAGED_SWA_PROJ_B_ROW_TILE, col_g + k0 : col_g + k0 + B_K_TILE]
+                            b_weight = wo_b[g : g + 1, n0 : n0 + PROJ_B_MM_N_TILE, k0 : k0 + B_K_TILE]
+                            acc_b = pl.matmul_acc(acc_b, b_act, b_weight, b_trans=True, init_cond=(kb == 0))
+                        partials = pl.assemble(partials, acc_b, [pb_r0, g * D + n0])
+            proj_b_tids[g] = pb_tid
 
     act_t_blks = (output_rows + PROJ_B_ACT_TASK_T_TILE - 1) // PROJ_B_ACT_TASK_T_TILE
     with pl.spmd(
         (D // PROJ_B_ACT_N_TILE) * act_t_blks,
         name_hint="staged_swa_proj_b_act",
-        deps=[proj_b_tids[i] for i in range(STAGED_SWA_PB_DSLABS * O_GROUPS)],
+        deps=[proj_b_tids[i] for i in range(O_GROUPS)],
     ) as act_tid:
         act_idx = pl.tile.get_block_idx()
         nreg = act_idx // act_t_blks
@@ -1123,8 +1129,8 @@ def hca_attn(
     attn_sink: pl.Tensor[[H], pl.FP32],
     freqs_cos: pl.Tensor[[PREFILL_ATTN_ROWS_DYN, ROPE_DIM], pl.BF16],
     freqs_sin: pl.Tensor[[PREFILL_ATTN_ROWS_DYN, ROPE_DIM], pl.BF16],
-    wo_a: pl.Tensor[[O_GROUPS, O_LORA, O_GROUP_IN], pl.BF16],
-    wo_b: pl.Tensor[[D, O_GROUPS * O_LORA], pl.INT8],
+    wo_a: pl.Tensor[[O_GROUPS, O_LORA, O_GROUP_IN], pl.BF16, pl.NZ],
+    wo_b: pl.Tensor[[O_GROUPS, D, O_LORA], pl.INT8, pl.NZ],
     wo_b_scale: pl.Tensor[[D], pl.FP32],
     attn_out: pl.Tensor[[PREFILL_ATTN_ROWS_DYN, D], pl.BF16],
     active_rows: pl.Scalar[pl.INT32],
@@ -1188,8 +1194,8 @@ def physical_sparse_attn(
     attn_sink: pl.Tensor[[H], pl.FP32],
     freqs_cos: pl.Tensor[[PREFILL_ATTN_ROWS_DYN, ROPE_DIM], pl.BF16],
     freqs_sin: pl.Tensor[[PREFILL_ATTN_ROWS_DYN, ROPE_DIM], pl.BF16],
-    wo_a: pl.Tensor[[O_GROUPS, O_LORA, O_GROUP_IN], pl.BF16],
-    wo_b: pl.Tensor[[D, O_GROUPS * O_LORA], pl.INT8],
+    wo_a: pl.Tensor[[O_GROUPS, O_LORA, O_GROUP_IN], pl.BF16, pl.NZ],
+    wo_b: pl.Tensor[[O_GROUPS, D, O_LORA], pl.INT8, pl.NZ],
     wo_b_scale: pl.Tensor[[D], pl.FP32],
     attn_out: pl.Tensor[[PREFILL_ATTN_ROWS_DYN, D], pl.BF16],
     active_rows: pl.Scalar[pl.INT32],
@@ -1254,8 +1260,8 @@ def staged_sparse_attn(
     attn_sink: pl.Tensor[[H], pl.FP32],
     freqs_cos: pl.Tensor[[PREFILL_ATTN_ROWS_DYN, ROPE_DIM], pl.BF16],
     freqs_sin: pl.Tensor[[PREFILL_ATTN_ROWS_DYN, ROPE_DIM], pl.BF16],
-    wo_a: pl.Tensor[[O_GROUPS, O_LORA, O_GROUP_IN], pl.BF16],
-    wo_b: pl.Tensor[[D, O_GROUPS * O_LORA], pl.INT8],
+    wo_a: pl.Tensor[[O_GROUPS, O_LORA, O_GROUP_IN], pl.BF16, pl.NZ],
+    wo_b: pl.Tensor[[O_GROUPS, D, O_LORA], pl.INT8, pl.NZ],
     wo_b_scale: pl.Tensor[[D], pl.FP32],
     attn_out: pl.Tensor[[PREFILL_ATTN_ROWS_DYN, D], pl.BF16],
     active_rows: pl.Scalar[pl.INT32],
@@ -1317,8 +1323,8 @@ def prefill_staged_attention(
     attn_sink: pl.Tensor[[H], pl.FP32],
     freqs_cos: pl.Tensor[[PREFILL_ATTN_ROWS_DYN, ROPE_DIM], pl.BF16],
     freqs_sin: pl.Tensor[[PREFILL_ATTN_ROWS_DYN, ROPE_DIM], pl.BF16],
-    wo_a: pl.Tensor[[O_GROUPS, O_LORA, O_GROUP_IN], pl.BF16],
-    wo_b: pl.Tensor[[D, O_GROUPS * O_LORA], pl.INT8],
+    wo_a: pl.Tensor[[O_GROUPS, O_LORA, O_GROUP_IN], pl.BF16, pl.NZ],
+    wo_b: pl.Tensor[[O_GROUPS, D, O_LORA], pl.INT8, pl.NZ],
     wo_b_scale: pl.Tensor[[D], pl.FP32],
     residual: pl.Tensor[[PREFILL_ATTN_ROWS_DYN, HC_MULT, D], pl.FP32],
     post: pl.Tensor[[PREFILL_ATTN_ROWS_DYN, HC_MULT], pl.FP32],
@@ -1365,8 +1371,8 @@ def prefill_physical_attention(
     attn_sink: pl.Tensor[[H], pl.FP32],
     freqs_cos: pl.Tensor[[PREFILL_ATTN_ROWS_DYN, ROPE_DIM], pl.BF16],
     freqs_sin: pl.Tensor[[PREFILL_ATTN_ROWS_DYN, ROPE_DIM], pl.BF16],
-    wo_a: pl.Tensor[[O_GROUPS, O_LORA, O_GROUP_IN], pl.BF16],
-    wo_b: pl.Tensor[[D, O_GROUPS * O_LORA], pl.INT8],
+    wo_a: pl.Tensor[[O_GROUPS, O_LORA, O_GROUP_IN], pl.BF16, pl.NZ],
+    wo_b: pl.Tensor[[O_GROUPS, D, O_LORA], pl.INT8, pl.NZ],
     wo_b_scale: pl.Tensor[[D], pl.FP32],
     residual: pl.Tensor[[PREFILL_ATTN_ROWS_DYN, HC_MULT, D], pl.FP32],
     post: pl.Tensor[[PREFILL_ATTN_ROWS_DYN, HC_MULT], pl.FP32],
@@ -1414,8 +1420,8 @@ def _sparse_attn(
     num_tokens: pl.Scalar[pl.INT32],
     freqs_cos: pl.Tensor[[T, ROPE_DIM], pl.BF16],
     freqs_sin: pl.Tensor[[T, ROPE_DIM], pl.BF16],
-    wo_a: pl.Tensor[[O_GROUPS, O_LORA, O_GROUP_IN], pl.BF16],
-    wo_b: pl.Tensor[[D, O_GROUPS * O_LORA], pl.INT8],
+    wo_a: pl.Tensor[[O_GROUPS, O_LORA, O_GROUP_IN], pl.BF16, pl.NZ],
+    wo_b: pl.Tensor[[O_GROUPS, D, O_LORA], pl.INT8, pl.NZ],
     wo_b_scale: pl.Tensor[[D], pl.FP32],
     attn_out: pl.Out[pl.Tensor[[T, D], pl.BF16]],
 ):
@@ -1448,6 +1454,8 @@ def golden_prefill_sparse_attn(tensors):
     """Self-contained torch reference for the cache-first sparse-attn entry."""
     import torch
 
+    from utils import unpack_nz
+
     num_tokens = int(tensors["num_tokens"])
     q = tensors["q"].float()
     ori_kv = tensors["ori_kv"].float()
@@ -1459,8 +1467,8 @@ def golden_prefill_sparse_attn(tensors):
     attn_sink = tensors["attn_sink"].float()
     cos = tensors["freqs_cos"].float()
     sin = tensors["freqs_sin"].float()
-    wo_a = tensors["wo_a"].float()
-    wo_b_i8 = tensors["wo_b"]
+    wo_a = unpack_nz(tensors["wo_a"]).float()
+    wo_b_i8 = unpack_nz(tensors["wo_b"])
     wo_b_scale = tensors["wo_b_scale"].float()
 
     o = torch.zeros(T, H, HEAD_DIM)
@@ -1531,10 +1539,10 @@ def golden_prefill_sparse_attn(tensors):
     scale_q_g = INT8_SCALE_MAX / amax_g
     o_r_i8_g = torch.round(o_r_g * scale_q_g).to(torch.int32).to(torch.float16).to(torch.int8)
     scale_dq_g = 1.0 / scale_q_g                                              # [T, G, 1]
-    wo_b_g = wo_b_i8.reshape(D, O_GROUPS, O_LORA)
+    wo_b_g = wo_b_i8
     out = torch.zeros(T, D, dtype=torch.float32)
     for g in range(O_GROUPS):
-        p_g = o_r_i8_g[:, g].to(torch.int32) @ wo_b_g[:, g].to(torch.int32).T   # [T, D]
+        p_g = o_r_i8_g[:, g].to(torch.int32) @ wo_b_g[g].to(torch.int32).T   # [T, D]
         out = out + p_g.float() * scale_dq_g[:, g]                             # per-row group scale
     out = out * wo_b_scale.unsqueeze(0)                                        # per-channel weight scale
     tensors["attn_out"][:] = out.to(torch.bfloat16)
@@ -1556,7 +1564,7 @@ def build_tensor_specs(
 ):
     import torch
     from golden import ScalarSpec, TensorSpec
-    from utils import build_rope_tables, materialize_token_rope_tables, quant_w_per_channel
+    from utils import build_rope_tables, materialize_token_rope_tables, pack_nz, quant_w_per_channel
 
     if not 0 < num_tokens <= T:
         raise ValueError(f"num_tokens must be in [1, {T}], got {num_tokens}")
@@ -1623,11 +1631,12 @@ def build_tensor_specs(
     def init_freqs_sin():
         return shared_rope_sin.clone()
     def init_wo_a():
-        return ((torch.rand(O_GROUPS, O_LORA, O_GROUP_IN) - 0.5) * O_GROUP_IN ** -0.5).to(torch.bfloat16)
+        return pack_nz(((torch.rand(O_GROUPS, O_LORA, O_GROUP_IN) - 0.5) * O_GROUP_IN ** -0.5).to(torch.bfloat16))
     def init_wo_b():
         return ((torch.rand(D, O_GROUPS * O_LORA) - 0.5) * (O_GROUPS * O_LORA) ** -0.5).to(torch.bfloat16)
 
     wo_b_i8, wo_b_scale = quant_w_per_channel(init_wo_b())
+    wo_b_nz = pack_nz(wo_b_i8.reshape(D, O_GROUPS, O_LORA).permute(1, 0, 2).contiguous())
 
     return [
         TensorSpec("q", [T, H, HEAD_DIM], torch.bfloat16, init_value=init_q),
@@ -1643,7 +1652,7 @@ def build_tensor_specs(
         TensorSpec("freqs_cos", [T, ROPE_DIM], torch.bfloat16, init_value=init_freqs_cos),
         TensorSpec("freqs_sin", [T, ROPE_DIM], torch.bfloat16, init_value=init_freqs_sin),
         TensorSpec("wo_a", [O_GROUPS, O_LORA, O_GROUP_IN], torch.bfloat16, init_value=init_wo_a),
-        TensorSpec("wo_b", [D, O_GROUPS * O_LORA], torch.int8, init_value=lambda: wo_b_i8),
+        TensorSpec("wo_b", [O_GROUPS, D, O_LORA], torch.int8, init_value=lambda: wo_b_nz),
         TensorSpec("wo_b_scale", [D], torch.float32, init_value=lambda: wo_b_scale),
         TensorSpec("attn_out", [T, D], torch.bfloat16),
     ]
