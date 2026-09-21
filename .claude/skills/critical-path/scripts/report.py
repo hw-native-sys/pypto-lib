@@ -169,6 +169,15 @@ def _build_analysis(directory: Path, root: Path, tol: int) -> RunAnalysis:
         raise ValueError(f"{records}: no joined AICore/AICPU task rows")
     raw_aicore = raw.get("aicore_tasks")
     raw_aicpu = raw.get("aicpu_tasks")
+    if raw_aicpu is None:
+        # Newer runtime dumps the AICPU stream as scheduler_tasks.records instead of a
+        # flat aicpu_tasks list. Only the row count is used below, and this is the same
+        # stream the joined rows were matched against.
+        scheduler_tasks = raw.get("scheduler_tasks")
+        if isinstance(scheduler_tasks, dict):
+            raw_aicpu = scheduler_tasks.get("records")
+        elif isinstance(scheduler_tasks, list):
+            raw_aicpu = scheduler_tasks
     if not isinstance(raw_aicore, list) or not isinstance(raw_aicpu, list):
         raise ValueError(f"{records}: missing raw AICore/AICPU task streams")
     if len(raw_aicore) != len(raw_aicpu) or len(rows) != len(raw_aicore):
