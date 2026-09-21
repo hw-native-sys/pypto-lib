@@ -632,8 +632,8 @@ def _decode_hca_tp1(
     x_out.bind_dynamic(0, T_DYN)
     t_dim = pl.tensor.dim(x_hc, 0)
     wb_blocks = t_dim // HCA_WB_TOKEN_TILE
-    post_t = pl.create_tensor([t_dim, HC_MULT], dtype=pl.FP32)
-    comb_t = pl.create_tensor([t_dim, HC_MULT * HC_MULT], dtype=pl.FP32)
+    post_t = pl.create_tensor([t_dim, HC_MULT], dtype=pl.FP32, manual_dep=True)
+    comb_t = pl.create_tensor([t_dim, HC_MULT * HC_MULT], dtype=pl.FP32, manual_dep=True)
     x_normed = pl.create_tensor([t_dim, D], dtype=pl.BF16)
     rms_tid = hc_pre_norm(
         x_hc, hc_attn_fn, hc_attn_scale, hc_attn_base, attn_norm_w,
@@ -695,6 +695,14 @@ def _decode_hca_tp1(
             decode_o_proj_tp1(o_packed_heads, wo_a, wo_b, wo_b_scale, attn_out, heads_dep)
 
     with pl.scope():
+        # post_t/comb_t are written by split_pre_post, but hc_post's ordering is
+        # already implied by the whole attention chain (split_pre_post -> ... ->
+        # proj_b_act -> hc_post), so their OverlapMap edges are redundant.
+        # hc_post is their only consumer, so opting the tensors out for their whole
+        # lifetime (manual_dep) drops exactly the same edge as a per-arg
+        # pl.no_dep(post_t) would -- and pl.no_dep() at this call site does not
+        # compile on this pypto pin (frontend cannot infer the callee's tensor
+        # metadata through the wrapper). Audit with deps_viewer --edge-mode omitted.
         hc_post(attn_out, x_hc, post_t, comb_t, x_out)
     return x_out
 
