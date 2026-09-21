@@ -1,0 +1,1334 @@
+name: Setup CI job (pypto-lib)
+description: >-
+  Shared setup for every self-hosted pypto-lib job — the simulator ones (ci.yml
+  `sim`, daily_ci.yml `model-tests-sim`) and the on-device ones (ci.yml `a2a3` /
+  `serving`, daily_ci.yml `model-tests-a2a3`). All of them run directly on the
+  host, as the same user, through this one action: resilient checkout into a
+  per-job dir, toolchain resolution from the cached pypto source, a ptoas install,
+  a per-job venv + activate.sh, and a from-source build/install of
+  pypto + simpler. Simpler's own installer resolves the pinned pto-isa checkout
+  (pypto's runtime/pto_isa.pin is the single source of truth), so this action
+  never clones it. The device jobs differ only in that they additionally check the
+  NPU and source CANN's set_env.sh — see the needs-device input.
+
+  Unlike pypto (which builds itself), pypto-lib builds against a separate pypto
+  clone kept in a per-job ci-cache/pypto-src-<build-namespace> dir (concurrent
+  jobs must not share one build tree — see the build-namespace input); the
+  toolchain pins (ptoas version/sha, pto-isa commit) are read from that same clone
+  so the installed pypto and the pins always match. The pto-isa commit only
+  namespaces ccache here; it does not select a checkout.
+
+  Each host describes its own layout in the runner's `.env` (the file in the
+  runner application's root dir, which the runner service loads into every job it
+  runs). That is where the absolute paths live — not in git — so no workflow names
+  one and a differently-laid-out host needs no repo change. The runner must set:
+
+    CONDA_ROOT             conda install to layer the per-job venv on
+                           (toolchain: conda only)
+    CI_CACHE_ROOT          dir CI may keep its caches in (created if absent)
+    CANN_ROOT              CANN toolkit — device runners only (needs-device)
+    PYPTO_QWEN3_MODEL_DIR  model weights — only the serving job reads these
+    PYPTO_DSV4_MODEL_DIR
+    PYPTO_DSV4_FLASH_CKPT_DIR     the pinned DeepSeek-V4-Flash checkout and the
+    PYPTO_DSV4_FLASH_WEIGHTS_DIR  cache converted from it — only the daily A5
+                                  end-to-end job reads these; together they are
+                                  about 350 GiB, so they usually sit on a data
+                                  volume rather than beside CI_CACHE_ROOT
+    PYPTO_DSV4_DSPARK_MODEL_DIR   the dspark W8A8 checkpoint — only the serving
+                                  job reads this
+
+  The bundle (toolchain: bundle) deliberately has no entry here: its location is
+  not a free choice, so there is nothing for a host to declare. The prefix
+  /opt/pypto/toolchain/<version> is compiled into the bundle's gcc and python, so
+  a bundle unpacked anywhere else is subtly broken; a host that needs the bytes
+  elsewhere symlinks /opt/pypto at them.
+
+  Beyond those, the host is expected to provide (by name, not by path):
+  task-submit / npu-smi / ccache / git / curl on PATH, and — on the conda path
+  only — a conda env `py310-lib` under CONDA_ROOT. The `.env` makes the
+  *locations* portable; these names are the provisioning contract a runner has to
+  satisfy to be usable at all.
+
+  A bundle runner needs no conda whatsoever: CONDA_ROOT is read only inside the
+  `toolchain: conda` bootstrap step, and nothing else reaches for a conda prefix.
+  Keep it that way. A step that runs before the bootstrap has no activate.sh and
+  is tempted to find an interpreter on its own; conda is the wrong answer, and
+  the right one is to move the step after the bootstrap instead.
+
+  The CPU architecture is detected, not pinned: ptoas is fetched as the CPython
+  3.10 manylinux wheel for $(uname -m) and checked against the matching
+  PTOAS_SHA256_<ARCH> in pypto's toolchain/versions.env, which is also where the
+  ptoas *version* is managed. So a new arch needs no change here — only an entry
+  upstream. Since v0.55 the release no longer ships a per-arch ptoas-bin tarball
+  and its standalone archive requires CPython 3.11, so the wheel is installed
+  into an isolated venv at PTOAS_ROOT, which keeps the PTOAS_ROOT/bin/ptoas
+  layout pypto's discovery already accepts.
+
+  The calling job must define the PTOAS_ROOT, CMAKE_* and the
+  non-path CCACHE_* (MAXSIZE / UMASK) environment variables; they are read from
+  the job environment here. PTOAS_VERSION, PTOAS_SHA256, PTO_ISA_COMMIT and
+  CCACHE_NAMESPACE are resolved and exported by this action, as is every cache
+  path (CCACHE_DIR, PIP_CACHE_DIR, PTOAS_CACHE_DIR, UV_CACHE_DIR, PYPTO_SRC) —
+  they derive from CI_CACHE_ROOT and so cannot live in the caller's static
+  job-level `env:` block.
+
+  Which installer a job gets follows from its toolchain, and the bootstrap step
+  states it in PYPTO_USE_UV. The bundle carries uv, so bundle jobs build the venv
+  with `uv venv` and install with `uv pip`; that venv has no pip in it at all.
+  Conda jobs keep pip, since uv is not in the conda env. A step that runs after
+  this action and installs into the job venv must therefore not hardcode `pip` —
+  on a bundle job it is simply not there (see the pypto-serving-tests action,
+  which branches on PYPTO_USE_UV for exactly this reason).
+
+inputs:
+  ccache-name:
+    description: >-
+      ccache dir under CI_CACHE_ROOT. Jobs share one ccache by default (a compile
+      cache is only useful when it is shared); serving passes its own so its
+      churn cannot LRU-evict the entries the a2a3/sim jobs depend on.
+    required: false
+    default: ccache
+  pip-cache-name:
+    description: >-
+      pip cache dir under CI_CACHE_ROOT. Unlike ccache, pip has no shared-umask
+      knob, so concurrent jobs each take their own dir rather than fight over
+      file ownership.
+    required: true
+  checkout-path:
+    description: >-
+      Workspace-relative dir to check the repo out into (also the venv /
+      activate.sh home). Isolates each job's tree on the shared self-hosted host.
+    required: true
+  needs-device:
+    description: >-
+      When 'true' the job talks to an NPU: verify a card is visible (npu-smi) and
+      have activate.sh source CANN's set_env.sh, which wires up the Ascend/HCCL
+      host environment. When 'false' (the simulator jobs) both are skipped and
+      CANN_ROOT is not required in the runner config — the simulator needs no
+      driver, no card and no Ascend env.
+    required: false
+    default: 'false'
+  toolchain:
+    description: >-
+      Where Python and GCC come from. 'conda' is the historical path: a
+      per-machine conda env under CONDA_ROOT with a --system-site-packages venv
+      layered on it. 'bundle' uses the pinned pypto-toolchain bundle at
+      /opt/pypto/toolchain/current, identical on every host, which also carries
+      the ccache and the uv every bundle job builds and installs with.
+
+      The default was 'conda' while the fleet was migrated a label at a time.
+      That is finished — every caller in this repo (sim, a2a3, the serving jobs,
+      and the a5 daily sweep) passes 'bundle' explicitly — so the default
+      follows, and a job added without this input lands on the path CI actually
+      exercises rather than on one with no coverage that additionally demands
+      CONDA_ROOT and a py310-lib env on the runner.
+
+      'conda' still works and is still the way to revert a single job, but it is
+      now untested. Removing it altogether waits on conda leaving the runners.
+    required: false
+    default: 'bundle'
+  install-torch-npu:
+    description: >-
+      When 'true', install torch_npu into the venv. It is what puts `torch.npu`
+      on the torch module, and only the serving jobs need it — they run
+      pypto-serving's NPU runners, which call torch.npu.mem_get_info to size the
+      KV cache. Nothing in pypto-lib itself touches torch.npu, and the wheel is
+      large, so the other jobs leave it out.
+
+      It hard-pins torch to an exact version, so this and the torch pin in the
+      build step move together.
+    required: false
+    default: 'false'
+  torch-version:
+    description: >-
+      torch requirement for the venv, as a pip specifier. Defaults to what
+      py310-lib resolved torch>=2.0.0 to, which is the version every job built
+      against before the bundle migration.
+
+      Override it only for a job whose kernels need a newer torch, and only with
+      install-torch-npu false: torch_npu hard-requires its own exact torch, so
+      the two cannot both choose one.
+    required: false
+    default: 'torch==2.6.0'
+  build-namespace:
+    description: >-
+      Per-job-type discriminator for the pypto build tree, which is stored at
+      ci-cache/pypto-src-<namespace>-<runner name>. Two jobs must never share one
+      tree: whoever syncs second runs `reset --hard` / `clean -ffdx` /
+      `rm -rf build` under the other's in-flight libbacktrace configure, which
+      surfaces as intermittent "C compiler cannot create executables" / "Unknown
+      BACKTRACE_ELF_SIZE" failures.
+
+      The runner name in the path covers concurrency (an instance runs one job at
+      a time, so each tree has a single writer); this input covers the rest. Job
+      types differ in what they build, so one instance alternating between them
+      would otherwise thrash a single tree — pass a distinct value per job type
+      (the simulator jobs pass their matrix.platform).
+    required: true
+  pypto-ref:
+    description: >-
+      PyPTO revision to build (a full commit sha). An empty value follows
+      origin HEAD; pass an explicit sha only when a job needs a pinned revision.
+    required: false
+    default: ''
+
+runs:
+  using: composite
+  steps:
+    - name: Check runner config and derive cache paths
+      # The runner describes its own host layout in <runner-root>/.env, which the
+      # runner service loads into every job it runs — so these arrive as plain env
+      # vars and nothing here has to know an absolute path. First step on purpose:
+      # a runner missing its .env must fail here with an actionable message, not
+      # 40 minutes later as an opaque "conda: command not found" mid-build.
+      shell: bash
+      env:
+        NEEDS_DEVICE: ${{ inputs.needs-device }}
+        CCACHE_NAME: ${{ inputs.ccache-name }}
+        PIP_CACHE_NAME: ${{ inputs.pip-cache-name }}
+        BUILD_NAMESPACE: ${{ inputs.build-namespace }}
+        TOOLCHAIN_IN: ${{ inputs.toolchain }}
+      run: |
+        set -uo pipefail
+        # Prerequisites CI does not create, so they must already be there. The
+        # simulator needs no Ascend env, so CANN_ROOT is device-jobs-only. Model
+        # dirs are only needed by the serving job, which checks its own.
+        #
+        # Matched bare, with no shell-side default: the input carries one, so an
+        # empty value here means a caller passed `toolchain: ''`. Substituting a
+        # default for it would accept a spelling the `if:` gates on the two
+        # bootstrap steps reject, and the first symptom of that silent skip is an
+        # unrelated "activate.sh: No such file" ten minutes into the build.
+        case "$TOOLCHAIN_IN" in
+          conda|bundle) ;;
+          *)
+            echo "::error::Unsupported toolchain '$TOOLCHAIN_IN'. Use 'conda' or 'bundle'."
+            exit 1
+            ;;
+        esac
+        required=""
+        if [ "$TOOLCHAIN_IN" = "conda" ]; then
+          required="CONDA_ROOT"
+        fi
+        if [ "$NEEDS_DEVICE" = "true" ]; then
+          required="$required CANN_ROOT"
+        fi
+        bad=0
+        for key in $required CI_CACHE_ROOT; do
+          if [ -z "${!key:-}" ]; then
+            echo "::error::$key is not set — add it to this runner's .env"
+            bad=1
+          fi
+        done
+        if [ "$bad" -ne 0 ]; then
+          # The runner's .env takes the whole rest of the line as the value: it
+          # supports neither inline comments nor quoting. Keep these samples bare
+          # so they can be pasted verbatim without smuggling in a trailing "#...".
+          echo "The runner declares its host layout in <runner-root>/.env."
+          echo "One KEY=VALUE per line, no quotes and no trailing comments:"
+          echo "  CONDA_ROOT=/path/to/miniconda3"
+          echo "  CI_CACHE_ROOT=/path/to/ci-cache"
+          echo "  PYPTO_QWEN3_MODEL_DIR=/path/to/Qwen3-14B"
+          echo "  PYPTO_DSV4_MODEL_DIR=/path/to/dsv4-flash-w8a8"
+          echo "  PYPTO_DSV4_FLASH_CKPT_DIR=/path/to/DeepSeek-V4-Flash"
+          echo "  PYPTO_DSV4_FLASH_WEIGHTS_DIR=/path/to/DeepSeek-V4-Flash-ep8-tp2"
+          echo "  PYPTO_DSV4_DSPARK_MODEL_DIR=/path/to/dsv4-flash-dspark-w8a8"
+          echo "  CANN_ROOT=/usr/local/Ascend/cann-9.0.0"
+          echo "(CANN_ROOT is only needed on device runners; CI_CACHE_ROOT is"
+          echo " created if absent. The service reads .env at startup — restart"
+          echo " it after editing.)"
+          exit 1
+        fi
+        for key in $required; do
+          if [ ! -d "${!key}" ]; then
+            echo "::error::$key points at a missing directory: ${!key}"
+            # A value carrying a trailing "#..." is the classic .env mistake:
+            # the runner does not strip inline comments, so the comment lands in
+            # the path. Say so outright instead of leaving a puzzling directory.
+            case "${!key}" in
+              *"#"*) echo "The value contains a '#'. The runner's .env has no"
+                     echo "inline comments — the rest of the line is part of the"
+                     echo "value. Put $key on a line of its own, bare." ;;
+            esac
+            exit 1
+          fi
+        done
+        # CI_CACHE_ROOT is different in kind: CI owns everything under it, so it
+        # only has to be declared, not to pre-exist — a fresh host starts with an
+        # empty (or absent) cache and simply takes the miss.
+        if ! mkdir -p "$CI_CACHE_ROOT"; then
+          echo "::error::CI_CACHE_ROOT is not creatable: $CI_CACHE_ROOT"
+          exit 1
+        fi
+        # Every cache path derives from that one root, so no workflow has to name
+        # an absolute path. These must be exported here rather than sit in the
+        # caller's job-level `env:`, which is static and cannot see this step.
+        #
+        # PYPTO_SRC is additionally keyed by $RUNNER_NAME. CI_CACHE_ROOT is shared
+        # by every runner instance on the host (only _work is per-instance), so a
+        # tree keyed by job type alone is shared by concurrent runs of that job
+        # from different branches — each doing `reset --hard` / `clean -ffdx` /
+        # `rm -rf build` under the other. An instance runs one job at a time, so
+        # keying by it makes each tree single-writer by construction, without
+        # locking or giving up the cache. See issue #802.
+        #
+        # Only this tree needs it: ccache is built for concurrent access and is
+        # worth far more shared, and the ptoas wheel is named by its version.
+        #
+        # UV_CACHE_DIR is deliberately NOT per-job the way PIP_CACHE_DIR is. The
+        # pip dirs are split because pip has no shared-umask knob and concurrent
+        # jobs end up fighting over file ownership; uv's cache is built for
+        # concurrent access, and sharing it is the point — a wheel any job has
+        # already downloaded is hardlinked into the next venv instead of being
+        # fetched and unpacked again (torch, at ~200 MB, dominates this).
+        {
+          echo "CCACHE_DIR=$CI_CACHE_ROOT/$CCACHE_NAME"
+          echo "PIP_CACHE_DIR=$CI_CACHE_ROOT/$PIP_CACHE_NAME"
+          echo "PTOAS_CACHE_DIR=$CI_CACHE_ROOT/ptoas"
+          echo "UV_CACHE_DIR=$CI_CACHE_ROOT/uv"
+          echo "PYPTO_SRC=$CI_CACHE_ROOT/pypto-src-$BUILD_NAMESPACE-$RUNNER_NAME"
+        } >> "$GITHUB_ENV"
+        echo "runner config OK (checked: CI_CACHE_ROOT $required)"
+        # Identity and storage of the host we landed on. These jobs run on a pool
+        # of self-hosted runners that are not necessarily identically provisioned,
+        # and every failure so far has been host state rather than code — so make
+        # the basics visible in every log instead of guessing from a symptom.
+        echo "host=$(hostname) user=$(id -un) uid=$(id -u) umask=$(umask)"
+        stat -c 'cache_root %n %U:%G mode=%a' "$CI_CACHE_ROOT" || true
+        findmnt -no SOURCE,FSTYPE,OPTIONS --target "$CI_CACHE_ROOT" 2>/dev/null \
+          | sed 's/^/cache_fs /' || true
+        df -h "$CI_CACHE_ROOT" | tail -1 | sed 's/^/cache_df /' || true
+        # Prove the cache root is actually usable before anything depends on it:
+        # a fresh dir, a file inside it, and removing both. The pypto sync failed
+        # writing into a directory it had just created, which no ownership check
+        # would have caught.
+        probe="$CI_CACHE_ROOT/.write-probe-$$"
+        if mkdir -p "$probe" && : > "$probe/f" && rm -rf "$probe"; then
+          echo "cache_write probe OK"
+        else
+          echo "::error::cannot create+write+remove under $CI_CACHE_ROOT"
+          stat -c '%n %U:%G mode=%a' "$probe" 2>/dev/null || true
+          rm -rf "$probe" 2>/dev/null || true
+          exit 1
+        fi
+
+    # Self-hosted runners reuse the workspace across runs. A prior run — or a
+    # force-pushed PR ref moving refs/remotes/pull/<n>/merge — can leave the
+    # checkout dir with a stale submodule object store, so actions/checkout's
+    # forced submodule update dies with "fatal: Unable to find current revision
+    # in submodule path ...". Try the fast incremental checkout first; on any
+    # failure purge the dir and re-clone from scratch.
+    - name: Checkout pypto-lib (incremental)
+      id: checkout
+      continue-on-error: true
+      uses: actions/checkout@v4
+      with:
+        path: ${{ inputs.checkout-path }}
+        persist-credentials: false
+
+    - name: Purge stale checkout on failure
+      if: steps.checkout.outcome == 'failure'
+      shell: bash
+      working-directory: ${{ github.workspace }}
+      run: rm -rf "${{ inputs.checkout-path }}"
+
+    - name: Checkout pypto-lib (clean re-clone)
+      if: steps.checkout.outcome == 'failure'
+      uses: actions/checkout@v4
+      with:
+        path: ${{ inputs.checkout-path }}
+        persist-credentials: false
+
+    - name: Resolve toolchain + sync pypto source
+      # Sync the cached pypto checkout ONCE here; the Build step below reuses it,
+      # so the toolchain pins and the installed pypto are always the same
+      # revision. pypto owns ptoas (toolchain/versions.env) and pins pto-isa via
+      # its runtime submodule (runtime/pto_isa.pin); read both — the pto-isa pin
+      # only keys ccache, since simpler resolves the checkout from it itself.
+      shell: bash
+      env:
+        PYPTO_REF: ${{ inputs.pypto-ref }}
+      run: |
+        # $PYPTO_SRC is the per-job build tree exported by the loader step:
+        # ci-cache/pypto-src-<build-namespace>. These jobs run concurrently on the
+        # same host, so they must NOT share one pypto-src dir (their concurrent
+        # sync/build races corrupt libbacktrace's configure) — see build-namespace.
+        # github.com clones/fetches over this runner's link drop mid-transfer
+        # (GnuTLS recv error / early EOF), and there is no pypto gitcode mirror.
+        # Tighten git's stall detection so a dead transfer aborts fast instead of
+        # hanging until EOF; the cache-miss clone below also retries with backoff.
+        git config --global http.postBuffer 1048576000
+        git config --global http.lowSpeedLimit 1000
+        git config --global http.lowSpeedTime 60
+        # Retry any git command up to 4 times with backoff (transient TLS drops).
+        retry() {
+          local attempt=0
+          until "$@"; do
+            attempt=$((attempt + 1))
+            if [ "$attempt" -ge 4 ]; then
+              echo "'$*' failed after $attempt attempts"; return 1
+            fi
+            echo "'$*' attempt $attempt failed; retrying in $((attempt * 10))s"
+            sleep $((attempt * 10))
+          done
+        }
+        if [ -d "$PYPTO_SRC/.git" ]; then
+          echo "Cache hit — reusing pypto checkout"
+        else
+          echo "Cache miss — cloning pypto"
+          mkdir -p "$(dirname "$PYPTO_SRC")"
+          # rm before each attempt so a retried clone never hits a partial dir.
+          clone_pypto() { rm -rf "$PYPTO_SRC"; git clone --depth=1 https://github.com/hw-native-sys/pypto.git "$PYPTO_SRC"; }
+          retry clone_pypto || exit 1
+        fi
+        # pypto-ref is a full commit sha (via this step's env), fetched directly
+        # so cache hit and cache miss land on the same revision; an empty value
+        # follows origin's default branch (HEAD). Still --depth=1: a pin needs
+        # one commit, not the history behind it.
+        retry git -C "$PYPTO_SRC" fetch --depth=1 origin "${PYPTO_REF:-HEAD}" || exit 1
+        git -C "$PYPTO_SRC" reset --hard FETCH_HEAD
+        git -C "$PYPTO_SRC" clean -ffdx
+        git -C "$PYPTO_SRC" submodule foreach --recursive 'git reset --hard && git clean -ffdx' || true
+        retry git -C "$PYPTO_SRC" submodule update --init --recursive --depth=1 || exit 1
+        echo "pypto at $(git -C "$PYPTO_SRC" rev-parse HEAD)"
+        rm -rf "$PYPTO_SRC/build" "$PYPTO_SRC/_skbuild" "$PYPTO_SRC/runtime/build"
+        # PTOAS ships one wheel per arch, with a matching PTOAS_SHA256_<ARCH> in
+        # versions.env — so the arch is detected here rather than pinned, and only
+        # the version has to be managed (upstream, in pypto's versions.env). An
+        # unlisted arch is a hard error: a missing sha would otherwise silently
+        # skip the integrity check.
+        PTOAS_ARCH="$(uname -m)"
+        PTOAS_SHA256=$(sed -n "s/^PTOAS_SHA256_$(echo "$PTOAS_ARCH" | tr '[:lower:]' '[:upper:]')=//p" \
+          "$PYPTO_SRC/toolchain/versions.env" | tr -d '[:space:]')
+        if [ -z "$PTOAS_SHA256" ]; then
+          echo "::error::no PTOAS sha256 for arch '$PTOAS_ARCH' in pypto's toolchain/versions.env"
+          echo "Available:"
+          grep -E '^PTOAS_SHA256_' "$PYPTO_SRC/toolchain/versions.env" | sed 's/=.*//;s/^/  /'
+          exit 1
+        fi
+        # Strip trailing CR/whitespace: a CRLF versions.env or pto_isa.pin would
+        # otherwise leak a '\r' into the cache entry name and break the download.
+        {
+          echo "PTOAS_VERSION=$(grep -E '^PTOAS_VERSION=' "$PYPTO_SRC/toolchain/versions.env" | cut -d= -f2 | tr -d '[:space:]')"
+          echo "PTOAS_ARCH=$PTOAS_ARCH"
+          echo "PTOAS_SHA256=$PTOAS_SHA256"
+          echo "PTO_ISA_COMMIT=$(tr -d '[:space:]' < "$PYPTO_SRC/runtime/pto_isa.pin")"
+        } >> "$GITHUB_ENV"
+
+    - name: Check NPU
+      if: ${{ inputs.needs-device == 'true' }}
+      shell: bash
+      # Since the A5 host's driver upgrade its device nodes are
+      # `crw-rw---- HwHiAiUser:HwHiAiUser`, and the CI user is not in that
+      # group. dcmi_init then cannot open the character device, and npu-smi
+      # exits 187 with "dcmi module initialize failed. ret is -8005" — which
+      # reads like a missing DCMI component but is plain permission denial
+      # (npu-smi lists "Failed to open the character device" among its own
+      # candidate causes). task-submit drops privileges into the HwHiAiUser
+      # group, which is how every model run reaches a card in the first place.
+      #
+      # Direct first: on hosts whose nodes are still world-readable it works,
+      # and the check then costs no device lease and no queue wait.
+      run: |
+        rc=0
+        npu-smi info || rc=$?
+        if [ "$rc" -eq 0 ]; then
+          exit 0
+        fi
+        echo "npu-smi failed directly (exit $rc); the device nodes are likely"
+        echo "group-restricted. Retrying through task-submit ..."
+        # The payload ends on `rc=$?; exit $rc` rather than on `npu-smi info`:
+        # with the probe as the bare last command task-submit reports 215 even
+        # though npu-smi returned 0 (reproduced 3/3 on an A5 host). Setting the
+        # status explicitly makes the outer code npu-smi's own — verified to
+        # pass 0, 9 and 127 through unchanged.
+        #
+        # NPUSMI_RC is a sentinel that separates the two ways this can fail.
+        # task-submit leases a real card, so a busy queue makes it give up on
+        # the wait and exit 1 having never run anything — that says nothing
+        # about the NPU and must not fail a diagnostic step. If the sentinel is
+        # present the probe really ran, and its status is authoritative.
+        rc=0
+        out=$(task-submit --device "${DEVICE_ID:-auto}" --timeout 240 --max-time 60 \
+          --run 'npu-smi info; rc=$?; echo "NPUSMI_RC=$rc"; exit $rc' 2>&1) || rc=$?
+        printf '%s\n' "$out"
+        if ! printf '%s' "$out" | grep -q 'NPUSMI_RC='; then
+          echo "::warning::Could not obtain a card from the device queue within"
+          echo "the wait, so the NPU was never probed. Continuing — every model"
+          echo "run goes through task-submit and will fail loudly if no device"
+          echo "is actually available."
+          exit 0
+        fi
+        exit "$rc"
+
+    # Namespace the cache by pto-isa commit so a pto-isa bump can never serve
+    # stale objects compiled against the old ISA headers (see issue #1139):
+    # a different commit hashes to a different key, forcing a real recompile.
+    - name: Scope ccache to pto-isa version
+      shell: bash
+      run: echo "CCACHE_NAMESPACE=pto-isa-${PTO_ISA_COMMIT}" >> "$GITHUB_ENV"
+
+    - name: Bootstrap conda + per-job venv + write activate.sh
+      if: ${{ inputs.toolchain == 'conda' }}
+      # Per-job venv layered on the conda env; activate.sh lets each later step
+      # (and every task-submit child) enter the env with a single
+      # `source activate.sh`. For device jobs it also sources set_env.sh, which
+      # wires up the Ascend/HCCL host environment. LD_LIBRARY_PATH is prepended
+      # with $CONDA_PREFIX/lib because ptoas needs a newer GLIBCXX than the system.
+      shell: bash
+      working-directory: ${{ inputs.checkout-path }}
+      env:
+        NEEDS_DEVICE: ${{ inputs.needs-device }}
+        # Part of the runner's provisioning contract, like having task-submit and
+        # npu-smi on PATH: the host is expected to provide a conda env under this
+        # name. CONDA_ROOT says where conda lives; this says which env to use, and
+        # `python -m venv --system-site-packages` below layers the per-job venv on
+        # it, so its site-packages are an implicit dependency of every build here.
+        CONDA_ENV: py310-lib
+      run: |
+        source "$CONDA_ROOT/etc/profile.d/conda.sh"
+        if ! conda activate "$CONDA_ENV"; then
+          echo "::error::conda env '$CONDA_ENV' not found under $CONDA_ROOT"
+          echo "This runner must provide it (see the action's provisioning notes)."
+          exit 1
+        fi
+        # Explicit reset: don't rely solely on the checkout's `git clean -ffdx`
+        # to have removed a prior run's venv — a stale venv would let `python -m
+        # venv` reuse it and carry over old site-packages.
+        rm -rf venv
+        python -m venv venv --system-site-packages
+        # uv ships in the toolchain bundle, not in the conda env, so the conda
+        # path keeps installing with pip. Stated rather than defaulted: the
+        # build, ptoas and serving-deps steps below all branch on it.
+        echo "PYPTO_USE_UV=false" >> "$GITHUB_ENV"
+        # simpler's sim toolchain invokes the host compiler as g++-15 / gcc-15
+        # (hardcoded in simpler_setup/toolchain.py), but the conda env ships them
+        # as plain g++ / gcc. Publish those names here instead of relying on a
+        # hand-made symlink on each host, so a fresh runner needs no extra step.
+        #
+        # It must be *this* env's compiler, not some other g++-15 on the box: the
+        # sim kernels compiled with it are dlopen'd into this env's python next to
+        # torch, so they have to link the libstdc++ that process already has.
+        #
+        # Wrappers rather than symlinks: conda's g++ is itself a symlink to the
+        # target-prefixed driver, and the GCC driver infers its target/sysroot
+        # from argv[0]; exec'ing the resolved path keeps argv[0] exactly as a
+        # direct `g++` call would leave it.
+        rm -rf toolchain-bin
+        mkdir -p toolchain-bin
+        for name in gcc g++; do
+          real="$(command -v "$name" || true)"
+          case "$real" in
+            "$CONDA_PREFIX"/*) ;;
+            *) echo "::error::'$name' resolves to '${real:-<nothing>}', which is not in the"
+               echo "conda env $CONDA_PREFIX. The sim toolchain must use the env's own"
+               echo "compiler so its output links the same libstdc++ as this python."
+               exit 1 ;;
+          esac
+          major="$("$real" -dumpversion | cut -d. -f1)"
+          if [ "$major" -lt 15 ]; then
+            echo "::error::$name in $CONDA_PREFIX is GCC $major; the sim kernels are"
+            echo "built with -std=c++23 and need GCC 15 or newer."
+            exit 1
+          fi
+          printf '#!/bin/sh\nexec "%s" "$@"\n' "$real" > "toolchain-bin/$name-15"
+          chmod +x "toolchain-bin/$name-15"
+        done
+        echo "g++-15 -> $(command -v g++) (GCC $("$PWD/toolchain-bin/g++-15" -dumpversion))"
+        # Bake the runner's roots in as literals rather than referencing
+        # $CANN_ROOT/$CONDA_ROOT at source time: activate.sh is also sourced by
+        # task-submit children, whose truncated env snapshot does not carry the
+        # job's GITHUB_ENV. Same reasoning as _PYPTO_ENV_DIR below.
+        {
+          echo "_PYPTO_CONDA_ROOT=$CONDA_ROOT"
+          echo "_PYPTO_CONDA_ENV=$CONDA_ENV"
+        } > activate.sh
+        if [ "$NEEDS_DEVICE" = "true" ]; then
+          echo "_PYPTO_CANN_ROOT=$CANN_ROOT" >> activate.sh
+        fi
+        cat >> activate.sh <<'EOF'
+        source "$_PYPTO_CONDA_ROOT/etc/profile.d/conda.sh"
+        conda activate "$_PYPTO_CONDA_ENV"
+        # Derive the venv from this script's own location instead of
+        # $GITHUB_WORKSPACE: when activate.sh is sourced inside a task-submit
+        # child, a truncated env snapshot could drop $GITHUB_WORKSPACE and point
+        # the source at a wrong/absent path. BASH_SOURCE is snapshot-independent.
+        _PYPTO_ENV_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+        source "$_PYPTO_ENV_DIR/venv/bin/activate"
+        # The g++-15 / gcc-15 shims live next to the venv, so they reach every
+        # context that enters the env — including task-submit children, which a
+        # job-level $GITHUB_PATH entry would not survive.
+        export PATH="$_PYPTO_ENV_DIR/toolchain-bin:$PATH"
+        EOF
+        # The simulator needs no Ascend env, so only device jobs source set_env.sh.
+        if [ "$NEEDS_DEVICE" = "true" ]; then
+          printf '%s\n' 'source "$_PYPTO_CANN_ROOT/set_env.sh"' >> activate.sh
+        fi
+        # ${LD_LIBRARY_PATH:+:...} so an empty inherited value yields no trailing
+        # colon, which the loader would read as the current directory. The
+        # simulator jobs make that reachable: they never source CANN's
+        # set_env.sh, so LD_LIBRARY_PATH is often unset when activate.sh runs.
+        printf '%s\n' 'export LD_LIBRARY_PATH="$CONDA_PREFIX/lib${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"' >> activate.sh
+
+    - name: Enter the toolchain bundle + per-job venv + write activate.sh
+      if: ${{ inputs.toolchain == 'bundle' }}
+      # Same contract as the conda step: a per-job venv and an activate.sh that
+      # any later step, and any task-submit child, enters with one `source`.
+      #
+      # No toolchain-bin shims. Those existed because simpler invokes the host
+      # compiler as g++-15 while the conda env installs it as plain g++; the
+      # bundle's is named g++-15 already, so PATH alone is enough.
+      shell: bash
+      working-directory: ${{ inputs.checkout-path }}
+      env:
+        NEEDS_DEVICE: ${{ inputs.needs-device }}
+      run: |
+        pypto-toolchain verify \
+          --require python=3.10 --require 'gcc>=15' --require 'ccache>=4.8'
+        source /opt/pypto/toolchain/current/activate.sh
+        # The bundle's activate.sh exports PYPTO_TOOLCHAIN as the versioned
+        # prefix, and the per-job file written below is built around it — so an
+        # empty value here would surface much later, as a venv built by the host
+        # python or an activate.sh that sources nothing.
+        if [ -z "${PYPTO_TOOLCHAIN:-}" ]; then
+          echo "::error::the toolchain bundle did not export PYPTO_TOOLCHAIN"
+          exit 1
+        fi
+
+        rm -rf venv toolchain-bin
+        # No --system-site-packages: nothing outside the venv is depended on,
+        # which also retires the trap where a failed install in the venv was
+        # masked by a copy of pypto in the base env.
+        #
+        # `uv venv`, not `python3.10 -m venv`: the bundle carries uv, every
+        # install into this venv goes through it, and skipping ensurepip is most
+        # of why it is quick. The venv therefore has no pip — which is the point,
+        # not an oversight. Anything reaching for `python -m pip` here is
+        # reaching for the wrong tool; use `uv pip`.
+        uv venv --python python3.10 venv
+        echo "PYPTO_USE_UV=true" >> "$GITHUB_ENV"
+
+        # Baked in as a literal, like the conda roots were: activate.sh is also
+        # sourced by task-submit children, whose env snapshot is truncated.
+        echo "_PYPTO_TOOLCHAIN=$PYPTO_TOOLCHAIN" > activate.sh
+        if [ "$NEEDS_DEVICE" = "true" ]; then
+          echo "_PYPTO_CANN_ROOT=$CANN_ROOT" >> activate.sh
+          # Sourced BEFORE the bundle: set_env.sh prepends its own directories
+          # to LD_LIBRARY_PATH and the bundle's libstdc++ has to stay ahead of
+          # them -- ptoas needs GLIBCXX_3.4.29, the host stops at 3.4.28.
+          printf '%s\n' 'source "$_PYPTO_CANN_ROOT/set_env.sh"' >> activate.sh
+        fi
+        cat >> activate.sh <<'EOF'
+        source "$_PYPTO_TOOLCHAIN/activate.sh"
+        _PYPTO_ENV_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+        source "$_PYPTO_ENV_DIR/venv/bin/activate"
+        EOF
+
+        # Prove the file works before the rest of the job depends on it.
+        ( source activate.sh
+          # One name per iteration. `command -v a b c` returns 0 when ANY name
+          # resolves and non-zero only when they all fail, so the multi-name form
+          # this replaces asserted almost nothing — it passed on a bundle with no
+          # uv in it at all, since python3.10 alone satisfied it. uv is now what
+          # builds the venv and installs into it, so a missing one has to fail
+          # here rather than as "uv: command not found" in the build step.
+          for tool in python3.10 g++-15 ccache uv; do
+            command -v "$tool" >/dev/null && continue
+            echo "::error::$tool is not on PATH after sourcing activate.sh"
+            exit 1
+          done
+          python3.10 -c 'import sys; assert sys.version_info[:2]==(3,10)' )
+
+    - name: Put the job venv ahead of CANN's python packages
+      # Appended to whichever bootstrap step above wrote activate.sh, so this is
+      # the last thing that file does: the venv has to win over everything the
+      # earlier lines put on PYTHONPATH.
+      #
+      # CANN's set_env.sh prepends $CANN_ROOT/python/site-packages to PYTHONPATH,
+      # and CANN >= 9.2 ships a `pypto` package there. PYTHONPATH outranks a
+      # venv's own site-packages, so on those hosts that copy shadows the pinned
+      # pypto this job just built: it tries to build its native impl online and
+      # dies on a pybind11 the venv has no reason to carry ("No module named
+      # 'pybind11'", raised from .../cann-<ver>/python/site-packages/pypto/).
+      # The revision the pin chain selects is the only pypto this repo may
+      # import, so re-assert the venv rather than installing pybind11 to make the
+      # wrong copy work.
+      #
+      # Rebuilt on every source rather than appended once: activate.sh is sourced
+      # again in each task-submit child, and set_env.sh re-prepends its own entry
+      # every time, so a "skip if already present" guard would let CANN back in
+      # front from the second source on.
+      shell: bash
+      working-directory: ${{ inputs.checkout-path }}
+      run: |
+        source activate.sh
+        # Baked in as a literal, like the roots above: resolving it needs a
+        # python run, and activate.sh is sourced on every step and every
+        # task-submit child.
+        site="$(python -c 'import sysconfig; print(sysconfig.get_paths()["purelib"])')"
+        echo "_PYPTO_SITE=$site" >> activate.sh
+        cat >> activate.sh <<'EOF'
+        _PYPTO_PP=""
+        _PYPTO_IFS="$IFS"; IFS=":"
+        for _p in ${PYTHONPATH:-}; do
+          case "$_p" in ""|"$_PYPTO_SITE") continue ;; esac
+          _PYPTO_PP="${_PYPTO_PP:+$_PYPTO_PP:}$_p"
+        done
+        IFS="$_PYPTO_IFS"
+        export PYTHONPATH="$_PYPTO_SITE${_PYPTO_PP:+:$_PYPTO_PP}"
+        EOF
+        # Prove it holds through a second source, which is what a task-submit
+        # child does and where an append-once guard would have failed.
+        ( source activate.sh
+          source activate.sh
+          python -c 'import sys, sysconfig; s = sysconfig.get_paths()["purelib"]; sys.exit(0 if sys.path[1] == s else f"::error::venv site-packages is not first on sys.path: {sys.path[1]}")'
+          echo "PYTHONPATH=$PYTHONPATH" )
+
+    - name: Show cache stats (before)
+      shell: bash
+      run: |
+        ccache -s || true
+        # The uv cache is the one thing in this action whose effect is invisible
+        # in the logs: a hit and a miss differ only in how long `uv pip install`
+        # took. That matters because the miss is expensive — torch is 91 MB and
+        # cmake 29 MB, and re-fetching both costs ~2 min of a ~4 min setup — and
+        # because concurrent jobs on one host share this dir, so a cold entry is
+        # paid once per job rather than once per host. Report where uv actually
+        # keeps it and how big it is, before and after, so "the cache is not
+        # retaining across runs" becomes a fact rather than an inference from
+        # install timings.
+        if [ "${PYPTO_USE_UV:-false}" = "true" ]; then
+          ( source activate.sh
+            # `uv cache dir` is authoritative: it reports the directory uv
+            # resolved, which is what proves UV_CACHE_DIR reached it at all.
+            echo "uv_cache configured=${UV_CACHE_DIR:-<unset>} resolved=$(uv cache dir 2>/dev/null || echo '<unknown>')"
+            if [ -d "${UV_CACHE_DIR:-/nonexistent}" ]; then
+              echo "uv_cache size=$(du -sh "$UV_CACHE_DIR" 2>/dev/null | cut -f1) mtime=$(date -r "$UV_CACHE_DIR" '+%F %T' 2>/dev/null)"
+            else
+              echo "uv_cache MISSING — every wheel this job needs is a fresh download"
+            fi )
+        fi
+      working-directory: ${{ inputs.checkout-path }}
+
+    - name: Build and install pypto and simpler
+      # Reuses the pypto source synced by the resolve step above (same revision
+      # the toolchain pins were read from).
+      shell: bash
+      working-directory: ${{ inputs.checkout-path }}
+      env:
+        INSTALL_TORCH_NPU: ${{ inputs.install-torch-npu }}
+        TORCH_VERSION: ${{ inputs.torch-version }}
+      run: |
+        source activate.sh
+        # One installer per toolchain, chosen by the bootstrap step that built
+        # the venv: uv on the bundle path (it is in the bundle, and that venv has
+        # no pip at all), pip on the conda path. Every install below goes through
+        # this, so the two paths cannot drift in their flags.
+        #
+        # uv resolves the target environment from $VIRTUAL_ENV, which activate.sh
+        # has already exported by sourcing venv/bin/activate.
+        py_install() {
+          if [ "${PYPTO_USE_UV:-false}" = "true" ]; then
+            uv pip install "$@"
+          else
+            pip install "$@"
+          fi
+        }
+        # Same split, for producing a wheel instead of installing one.
+        py_build_wheel() {  # <out-dir> <source-dir>
+          if [ "${PYPTO_USE_UV:-false}" = "true" ]; then
+            uv build --wheel --no-build-isolation --out-dir "$1" "$2"
+          else
+            pip wheel --no-build-isolation --no-deps --wheel-dir "$1" "$2"
+          fi
+        }
+        if [ "${PYPTO_USE_UV:-false}" != "true" ]; then
+          python -m pip install --upgrade pip
+        fi
+        # Constrained deliberately. Unconstrained, a transient index failure on
+        # one transitive dependency sends pip backtracking through sixty
+        # releases of scikit-build-core before reporting it, burying the real
+        # message ("no matching distribution for packaging") under a wall of
+        # version lists. pyproject already requires >=0.10.0.
+        # nanobind is capped below 3.0 to match pypto's own build requirement.
+        # It has to be pinned here rather than inherited: the pypto build below
+        # passes --no-build-isolation, so the extension is compiled against this
+        # install and pypto's [build-system] requires is never consulted.
+        # nanobind 3.0 stopped binding a null holder to a parameter typed after a
+        # bound class, which is what pypto's TileView uses for `start_offset`, so
+        # `ir.TileView()` no longer matches its own all-defaulted overload and
+        # every `pl.Tile` annotation fails to parse.
+        py_install 'scikit-build-core>=0.10' 'nanobind<3' cmake ninja
+        # torch BEFORE pypto is built. pypto declares torch>=2.0.0, and if it is
+        # not installed yet pip resolves that from the default index, where the
+        # aarch64 wheel now drags ~1.5 GB of CUDA onto an Ascend host. Under
+        # conda this never showed: the base env already carried a torch, which
+        # turned out to be the only thing pinning it.
+        #
+        # The default is pinned to what py310-lib actually resolved torch>=2.0.0
+        # to, so this migration changes the toolchain and nothing else. Unpinned,
+        # pip takes the newest (2.13.0 today). It is also forced from below when
+        # install-torch-npu is on: the torch_npu 2.6.0 line requires torch==2.6.0
+        # exactly, and one torch is installed here for every job. The
+        # torch-version input overrides it per job; see that input's description.
+        TORCH_PIN="$TORCH_VERSION"
+        if ! py_install "$TORCH_PIN" --index-url https://download.pytorch.org/whl/cpu; then
+          echo "note: download.pytorch.org unreachable — falling back to PyPI"
+          py_install "$TORCH_PIN"
+        fi
+        # torch_npu is what puts `torch.npu` on the torch module. Nothing imports
+        # it explicitly — PyTorch autoloads it through its `torch.backends` entry
+        # point — which is how it stayed an undeclared dependency: under
+        # --system-site-packages the conda env just had it. Only the serving jobs
+        # need it (pypto-serving's NPU runners call torch.npu.mem_get_info to
+        # size the KV cache); nothing in pypto-lib itself touches torch.npu.
+        #
+        # Not on PyPI, which stops at 2.3.1, so the index is named explicitly.
+        # The version must track TORCH_PIN: the wheel's metadata is
+        # `Requires-Dist: torch==2.6.0`, satisfied by the 2.6.0+cpu installed
+        # above because a specifier carrying no local label ignores one.
+        if [ "$INSTALL_TORCH_NPU" = "true" ]; then
+          py_install 'torch_npu==2.6.0.post5' \
+            --index-url https://mirrors.huaweicloud.com/repository/pypi/simple
+          # PyYAML is an undeclared dependency of torch_npu's autoload path, and
+          # torch autoloads that backend on `import torch`: torch_npu.npu.memory
+          # imports _memory_viz, which imports yaml. Nothing in the chain
+          # declares it, so on a serving job `import torch` raises "Failed to
+          # load the backend extension: torch_npu" until something else happens
+          # to pull PyYAML in — transformers does, in the serving action's
+          # dependency step, one step after this one. That ordering is what kept
+          # it invisible; it is a real gap in the environment either way.
+          py_install pyyaml
+        fi
+        # The from-source pypto / simpler builds compile native code (libbacktrace
+        # et al.) with conda's compiler_compat toolchain, which intermittently
+        # fails to configure on this host ("C compiler cannot create executables").
+        # Retry a few times, purging the stale build tree first so a half-written
+        # configure / ccache state from the failed attempt can't poison the retry.
+        # Both ways of building go through it: installing in place and producing
+        # a wheel run the same native build and fail the same way.
+        retry_native() {  # <source-dir> <cmd...>
+          local target="$1" attempt=0
+          shift
+          until "$@"; do
+            attempt=$((attempt + 1))
+            if [ "$attempt" -ge 3 ]; then
+              echo "build of '$target' failed after $attempt attempts"; return 1
+            fi
+            echo "build of '$target' attempt $attempt failed; cleaning and retrying in $((attempt * 10))s"
+            # Purge the retrying target's own build trees (scikit-build-core may
+            # use either build/ or _skbuild/), so a half-written configure state
+            # can't poison the retry.
+            rm -rf "$target/build" "$target/_skbuild"
+            sleep $((attempt * 10))
+          done
+        }
+        retry_build() { retry_native "$1" py_install --no-build-isolation "$1"; }
+
+        # ----------------------------------------------------------------------
+        # Wheel cache — a second layer above ccache, aimed at a different axis.
+        #
+        # ccache caches across *commits*: it makes the TUs a change did not touch
+        # free, and it already hits ~95% here. It can do nothing about the shape
+        # that dominates this repo — pypto and simpler never change because
+        # pypto-lib changed, yet ten job instances across the fleet each build the
+        # same pypto revision in their own tree. What is left after ccache is
+        # cmake configure, the lookups themselves, linking, and zipping the wheel:
+        # 36s for pypto and 16s for simpler on a warm host, most of a ~65s setup.
+        # So cache the product, not the objects.
+        #
+        # Ported from pypto's own setup-ci-job, which solved this first; the
+        # differences are lib-specific and marked below. The one that matters:
+        # pypto builds its own checkout, while this repo builds a separate pypto
+        # clone in $PYPTO_SRC, so every path and tree hash comes from there.
+        #
+        # What is deliberately NOT ported is pypto's prebuild-wheels job. There it
+        # earns its place by starting on pre-commit while its consumers wait
+        # behind clang-tidy (~5 min), so the wheels are published before the gate
+        # opens. This repo's sim and a2a3 jobs wait behind detect-changes alone
+        # (8s), so a prebuild job starts in the same second they do: measured on
+        # run 33349670866 all four jobs began within one second of each other and
+        # each spent ~110s in setup, exactly what the lock below produces on its
+        # own. It would buy a cpu-pool slot and a second build tree, and nothing
+        # else. Should a slow gate ever land in front of these jobs, that changes.
+        #
+        # Slots are content-addressed by the source tree hash, so a slot can
+        # never be stale — a different tree is a different key. What the tree does
+        # NOT cover but still decides the artifact's ABI must be in the key by
+        # hand: architecture, interpreter ABI, toolchain bundle, and the resolved
+        # build tools. A key short one dimension is not a slow cache, it is a
+        # silently mismatched binary.
+        #
+        # The cache is the runner's own disk and nothing is uploaded: these hosts
+        # reach github.com at well under a megabyte per second (a 91 MB torch
+        # wheel took 142s on the 2026-08-28 run), so shipping wheels through
+        # artifacts would cost more than rebuilding them. A job landing on a host
+        # with a cold cache just builds, exactly as before — every failure path
+        # here degrades to the in-place install it replaces, so the cache can
+        # never be the reason a job fails.
+        # ----------------------------------------------------------------------
+        wheel_cache="$CI_CACHE_ROOT/wheels"
+        # EXT_SUFFIX is ".cpython-310-aarch64-linux-gnu.so" — interpreter ABI and
+        # platform in one string, read from the interpreter that will import the
+        # result rather than assembled from parts.
+        abi_tag="$(python -c 'import sysconfig; print(sysconfig.get_config_var("EXT_SUFFIX").lstrip(".").rsplit(".", 1)[0])')"
+        # No `unknown` fallback: a key that keeps abi_tag but has lost the
+        # toolchain is not a cache miss, it is the silently mismatched binary the
+        # block above exists to prevent — so an unresolvable prefix turns the
+        # cache off, like every other missing input here.
+        toolchain_prefix="${PYPTO_TOOLCHAIN:-${CONDA_PREFIX:-}}"
+        toolchain_id="$(basename "${toolchain_prefix:-none}")"
+        # Deliberately NOT lowering PYPTO_DEBUG_INFO_LEVEL: the build keeps
+        # pypto's own default, so a wheel served from a slot is byte-for-byte the
+        # kind of wheel this repo builds today and a device investigation still
+        # has the symbols it would have had. That costs disk — a slot holds a
+        # ~111 MiB pypto wheel rather than the ~18 MiB a lower level would give —
+        # which the two-day prune below bounds, and the hosts have terabytes
+        # free. It needs no key dimension either: the level lives in pypto's
+        # CMakeLists, which is inside the tree hash the slot is addressed by.
+        # The wheel is a function of these four as much as of the source:
+        # scikit-build-core drives the build, nanobind is compiled into the
+        # extension, and the cmake/ninja pair decides what gets emitted. No tree
+        # hash covers them, and this repo pins only two of the four, so the other
+        # two float underneath an unchanged pypto revision.
+        build_inputs="$(python - <<'PY'
+        from importlib.metadata import PackageNotFoundError, version
+        names = ("cmake", "nanobind", "ninja", "scikit-build-core")
+        def resolve(n):
+            try:
+                return f"{n}=={version(n)}"
+            except PackageNotFoundError:
+                return f"{n}=<absent>"
+        print(" ".join(resolve(n) for n in names))
+        PY
+        )"
+        echo "[build inputs] $build_inputs"
+        build_inputs_id="$(printf '%s' "$build_inputs" | sha256sum | cut -c1-12)"
+        # Bump to invalidate every slot on every host at once — the escape hatch
+        # for a change that alters what a slot holds without altering any input
+        # named above.
+        cache_epoch=1
+        cache_ready=true
+        mkdir -p "$wheel_cache" 2>/dev/null || cache_ready=false
+        # Guarded, not bare: an unresolvable tree must turn the cache off, not
+        # take the step down with it. Both trees come from $PYPTO_SRC — the clone
+        # the resolve step synced and the pins were read from — because that, not
+        # this checkout, is what gets built here.
+        pypto_tree="$(git -C "$PYPTO_SRC" rev-parse 'HEAD^{tree}' 2>/dev/null || true)"
+        simpler_tree="$(git -C "$PYPTO_SRC/runtime" rev-parse 'HEAD^{tree}' 2>/dev/null || true)"
+        # ...and the set of runtimes the build host could actually produce.
+        # Installing simpler runs simpler_setup/build_runtimes.py, which asks what
+        # the toolchain supports: gcc alone yields the a2a3sim / a5sim runtimes,
+        # and the onboard a2a3 / a5 pair is added only when ccec and CANN's
+        # cross-compiler are both there. That is exactly the difference between a
+        # sim job and a device job ON THIS HOST — cpu-N and npu-N are runner
+        # instances of the same machine and share one CI_CACHE_ROOT — so without
+        # this dimension a device job could install a simulator-only simpler and
+        # fail at run time rather than at install time.
+        #
+        # Probed with the same predicate build_runtimes.detect_buildable_platforms()
+        # uses, rather than keyed on the needs-device input: the input says what
+        # the job wants, this says what the build produced. CANN identifies itself
+        # in there too, because the onboard runtimes are compiled against that
+        # toolkit and an upgrade must not be served the old ones. CANN_ROOT is a
+        # symlink on at least one runner, so resolve it before taking a basename.
+        simpler_rt="sim"
+        if command -v ccec >/dev/null 2>&1 &&
+           [ -f "${ASCEND_HOME_PATH:-}/tools/hcc/bin/aarch64-target-linux-gnu-g++" ]; then
+          cann_id="$(basename "$(readlink -f "${CANN_ROOT:-}")" 2>/dev/null || echo unknown)"
+          cann_info="$(ls "${CANN_ROOT:-}"/*-linux/ascend_toolkit_install.info 2>/dev/null | head -1)"
+          if [ -n "$cann_info" ]; then
+            cann_id="$cann_id-$(sha256sum "$cann_info" | cut -c1-12)"
+          fi
+          simpler_rt="sim-onboard-$cann_id"
+        fi
+        if [ -z "$pypto_tree" ] || [ -z "$simpler_tree" ] ||
+           [ -z "$toolchain_prefix" ] || [ -z "$build_inputs" ]; then
+          echo "::warning::a key input is unresolvable (tree hash, toolchain" \
+               "prefix or build inputs) — wheel cache disabled for this job"
+          cache_ready=false
+        fi
+        # Probed, not assumed: an older uv has no 'uv build' subcommand at all,
+        # and discovering that as a failed build simultaneously in every job is
+        # the one way this change could take CI down. Falling back to the in-place
+        # install costs exactly what today costs. The pip branch needs no probe:
+        # 'pip wheel' predates any pip that could run here.
+        if [ "${PYPTO_USE_UV:-false}" = "true" ] \
+           && ! uv build --help 2>/dev/null | grep -q -- '--no-build-isolation'; then
+          echo "::warning::this uv cannot build wheels — wheel cache disabled"
+          cache_ready=false
+        fi
+        pypto_key="pypto-${pypto_tree}-${abi_tag}-${toolchain_id}-b${build_inputs_id}-e${cache_epoch}"
+        simpler_key="simpler-${simpler_tree}-${PTO_ISA_COMMIT:-none}-${abi_tag}-${toolchain_id}-${simpler_rt}-b${build_inputs_id}-e${cache_epoch}"
+
+        # 0 = slot is complete, 1 = cache unusable (build in place instead),
+        # 2 = the build itself failed (a real error; do not build it twice).
+        ensure_slot() {  # <slot-dir> <source-dir>
+          [ "$cache_ready" = true ] || return 1
+          [ -f "$1/.ok" ] && return 0
+          # flock serialises the fan-out: the first job to arrive builds, the rest
+          # wait and then install. The wait is not a new cost — without it each of
+          # them would be running that same build, competing for the same cores.
+          #
+          # -w so a wedged holder degrades to an in-place build rather than to
+          # this job's timeout, and the bound is the shortest consumer budget:
+          # sim runs under timeout-minutes: 30, so the wait, the fallback build
+          # and the tests all have to fit inside that. Ten minutes covers a
+          # genuinely cold builder — a fresh ccache namespace after an ISA bump
+          # puts the pypto build in the minutes range — and still leaves the
+          # ~5 minutes an in-place build plus the tests need, with margin.
+          # Upstream's 1800 is safe there only because pypto sets no
+          # timeout-minutes at all and inherits GitHub's six-hour default; at
+          # 1800 here a wedged holder would eat sim's whole budget and the job
+          # would be killed before this fallback could run.
+          # Created with touch first: a failing redirect on `exec` takes the whole
+          # shell down, so the failure has to be caught by a testable command.
+          _lock="$wheel_cache/.lock-$(basename "$1")"
+          touch "$_lock" 2>/dev/null || return 1
+          exec 9>"$_lock"
+          if ! flock -w 600 9; then
+            echo "::warning::wheel cache: lock wait timed out for $(basename "$1")"
+            return 1
+          fi
+          if [ ! -f "$1/.ok" ]; then
+            # 000 for the same reason CCACHE_UMASK is 000: every runner instance
+            # on this host shares one cache root.
+            _old_umask="$(umask)"
+            umask 000
+            # Build OUTSIDE the cache, then copy in, so a full cache partition
+            # stays a caching problem: only the compile is allowed to be fatal.
+            _build="$(mktemp -d "${RUNNER_TEMP:-/tmp}/pypto-wheel-XXXXXX")" ||
+              { umask "$_old_umask"; flock -u 9; return 1; }
+            if ! retry_native "$2" py_build_wheel "$_build" "$2"; then
+              rm -rf "$_build"
+              umask "$_old_umask"
+              flock -u 9
+              echo "::error::building the wheel for $2 failed"
+              return 2
+            fi
+            # A build that reports success but emits nothing is still a build
+            # problem, not a cache one; it must not be retried in place either.
+            if ! ls "$_build"/*.whl >/dev/null 2>&1; then
+              rm -rf "$_build"
+              umask "$_old_umask"
+              flock -u 9
+              echo "::error::the wheel build for $2 produced no wheel"
+              return 2
+            fi
+            # Publish. Every failure below leaves .ok absent, so the function
+            # returns 1 and the caller installs in place — it pays for the build
+            # twice, which is the price of not failing the job at all. .ok is
+            # written last: it is what every other job trusts.
+            if _tmp="$(mktemp -d "$wheel_cache/.tmp-XXXXXX" 2>/dev/null)" &&
+               cp "$_build"/*.whl "$_tmp/" 2>/dev/null &&
+               touch "$_tmp/.ok" 2>/dev/null; then
+              # Atomic publish. -T so a racing publisher's slot is never nested
+              # inside ours; the two have identical content, so losing the race
+              # costs only our copy.
+              mv -T "$_tmp" "$1" 2>/dev/null || rm -rf "$_tmp"
+            else
+              [ -n "${_tmp:-}" ] && rm -rf "$_tmp"
+              echo "::warning::could not publish $(basename "$1") to the wheel" \
+                   "cache — the build itself was fine"
+            fi
+            rm -rf "$_build"
+            umask "$_old_umask"
+          fi
+          flock -u 9
+          [ -f "$1/.ok" ]
+        }
+
+        install_slot() {  # <slot-dir> <requirement>
+          _whl="$(ls "$1"/*.whl 2>/dev/null | head -1)"
+          # A complete slot always holds one. Returning instead of installing a
+          # literal glob keeps a slot that lost a race with the prune from turning
+          # into an unreadable installer error.
+          [ -n "$_whl" ] || return 1
+          # touch BEFORE installing: mtime is the slot's last-use stamp for the
+          # prune below, and stamping first keeps a slot that is being read out of
+          # the prune's reach.
+          touch "$1" 2>/dev/null || true
+          py_install "$2 @ file://$_whl"
+        }
+
+        # LRU prune, before the builds rather than after them: run last, it could
+        # never free space for the job that had just run out of it. install_slot
+        # stamps every hit, so mtime is last use, not creation — a slot the daily
+        # jobs keep re-testing survives. The second sweep collects temp dirs from
+        # a build that was killed mid-flight.
+        if [ "$cache_ready" = true ]; then
+          find "$wheel_cache" -mindepth 1 -maxdepth 1 -type d -mtime +2 -exec rm -rf {} + 2>/dev/null || true
+          find "$wheel_cache" -mindepth 1 -maxdepth 1 -type d -name '.tmp-*' -mmin +180 -exec rm -rf {} + 2>/dev/null || true
+          # Lock files outlive their slots and are empty, so they are collected on
+          # the same schedule. Removing one a live builder holds is harmless:
+          # flock keeps working on the open fd, and a newcomer that recreates the
+          # file and builds concurrently loses the mv -T race and drops its copy.
+          find "$wheel_cache" -mindepth 1 -maxdepth 1 -type f -name '.lock-*' -mtime +2 -delete 2>/dev/null || true
+          du -sh "$wheel_cache" 2>/dev/null | sed 's/^/wheel cache size: /' || true
+        fi
+
+        pypto_slot="$wheel_cache/$pypto_key"
+        rc=0; ensure_slot "$pypto_slot" "$PYPTO_SRC" || rc=$?
+        case "$rc" in
+          0) echo "wheel cache: pypto <- $pypto_key"
+             install_slot "$pypto_slot" 'pypto' || {
+               echo "::warning::wheel cache slot vanished — installing pypto in place"
+               retry_build "$PYPTO_SRC" || exit 1
+             } ;;
+          2) exit 1 ;;
+          *) echo "::warning::wheel cache unusable — installing pypto in place"
+             retry_build "$PYPTO_SRC" || exit 1 ;;
+        esac
+
+        simpler_slot="$wheel_cache/$simpler_key"
+        rc=0; ensure_slot "$simpler_slot" "$PYPTO_SRC/runtime" || rc=$?
+        case "$rc" in
+          0) echo "wheel cache: simpler <- $simpler_key"
+             install_slot "$simpler_slot" 'simpler' || {
+               echo "::warning::wheel cache slot vanished — installing simpler in place"
+               retry_build "$PYPTO_SRC/runtime" || exit 1
+             } ;;
+          2) exit 1 ;;
+          *) echo "::warning::wheel cache unusable — installing simpler in place"
+             retry_build "$PYPTO_SRC/runtime" || exit 1 ;;
+        esac
+        # Fail fast if the venv cannot import what was just installed. It catches
+        # a broken venv here rather than ten minutes later in the test step, and
+        # it is the check that makes a cache hit safe to trust: a wheel served
+        # from a slot has to import as well as one built in place.
+        #
+        # Importing is not enough: a copy outside the venv (CANN >= 9.2 ships its
+        # own pypto under $CANN_ROOT/python/site-packages) imports fine and is
+        # the wrong revision, so assert where each module came from. The
+        # PYTHONPATH guard the bootstrap installed is what keeps this true.
+        python - <<'PYCHECK'
+        import os, sys, sysconfig
+        import pypto, simpler
+        # purelib/platlib resolve from sys.prefix, so inside the venv they are
+        # the directories the install just wrote to - no VIRTUAL_ENV needed.
+        roots = {os.path.realpath(sysconfig.get_paths()[k]) for k in ("purelib", "platlib")}
+        for mod in (pypto, simpler):
+            path = os.path.realpath(mod.__file__)
+            if not any(path.startswith(root + os.sep) for root in roots):
+                sys.exit(f"::error::{mod.__name__} resolved to {path}, outside "
+                         f"this job's venv ({sorted(roots)}) - an outside copy "
+                         "is shadowing the revision the pin chain selected")
+        print("env OK:", pypto.__file__)
+        PYCHECK
+
+    - name: Install runner dependencies
+      shell: bash
+      working-directory: ${{ inputs.checkout-path }}
+      run: |
+        source activate.sh
+        # Same installer split as the build step: the bundle venv has no pip.
+        # Same nanobind cap as the build step above, and for the same reason.
+        if [ "${PYPTO_USE_UV:-false}" = "true" ]; then
+          uv pip install 'nanobind<3'
+        else
+          pip install 'nanobind<3'
+        fi
+        # torch is installed in the build step above, before pypto is resolved.
+
+    - name: Drop the always-rebuilt local wheels from the shared uv cache
+      # Runs even when the build failed: a crashed run leaves its entries behind
+      # too, and this removes them by package name rather than by run.
+      if: ${{ always() && inputs.toolchain == 'bundle' }}
+      shell: bash
+      working-directory: ${{ inputs.checkout-path }}
+      run: |
+        # UV_CACHE_DIR is shared by every job on this host (see "Check runner
+        # config"), and uv bounds it in no way at all: no size cap, no TTL, no
+        # eviction — only the explicit `uv cache clean` / `uv cache prune`
+        # commands, neither of which anything here ran. Measured on the
+        # 2026-08-28 run: 4.1G before one a2a3 job and 6.2G after it, so this
+        # host was taking on ~2 GB per job and had nothing to give it back.
+        #
+        # What grows is pypto and simpler specifically. Both are installed from a
+        # local directory named on the command line, and uv documents that form
+        # as a special case — it always rebuilds and reinstalls a local directory
+        # dependency passed explicitly. Always rebuilt means the cached wheel can
+        # never be hit, so those entries carry no value at all; they are residue,
+        # and each one is an extension-module wheel.
+        #
+        # Clean by package name, which leaves the part of the cache that does pay
+        # for itself — torch, nanobind, cmake, ninja and the rest of the resolved
+        # dependency set — intact for the next job. That part is what took the
+        # setup from 268s to 68s, so it must not be swept away with the residue.
+        #
+        # NOT `uv cache prune --ci`, the usual CI recommendation: it removes
+        # pre-built wheels and *retains* wheels built from source, which is
+        # precisely backwards here.
+        if [ ! -f activate.sh ]; then
+          echo "no activate.sh (bootstrap did not get that far) — skipping"
+          exit 0
+        fi
+        source activate.sh
+        if ! command -v uv >/dev/null 2>&1; then
+          echo "uv not on PATH — skipping"
+          exit 0
+        fi
+        cache_dir="$(uv cache dir 2>/dev/null || echo "${UV_CACHE_DIR:-}")"
+        # One job per host does this, not all of them. `uv cache clean` takes a
+        # lock over the *whole* cache, and the jobs on a host reach this step at
+        # roughly the same time while their neighbours are still installing. Left
+        # to queue, each pays the wait and only the first accomplishes anything.
+        # `flock -n` turns that wait into an immediate exit.
+        #
+        # The lock lives under CI_CACHE_ROOT, which the runner-config step
+        # creates, rather than in the cache dir, which may not exist yet.
+        exec 9>"$CI_CACHE_ROOT/.uv-cleanup.lock" || exit 0
+        if ! flock -n 9; then
+          echo "another job on this host is already cleaning the uv cache — skipping"
+          exit 0
+        fi
+        # df, not du: this runs on the critical path and `du` walks the tree,
+        # which on the cache this step exists to bound is the slowest thing here.
+        df -h "$cache_dir" 2>/dev/null | tail -1 | sed "s|^|cache_df before |" || true
+        # No --force. That flag skips uv's in-use lock, and the cache is shared
+        # with whatever else the host is running; a concurrent install must not
+        # have entries deleted from under it.
+        #
+        # UV_LOCK_TIMEOUT caps how long we wait for that lock (default 300s).
+        # Keep it short: this job's tests are queued behind this step, and the
+        # work is not urgent — whichever job next finds the lock free does it.
+        UV_LOCK_TIMEOUT=30 uv cache clean pypto simpler \
+          || echo "::warning::uv cache clean did not complete (cache left as-is)"
+        df -h "$cache_dir" 2>/dev/null | tail -1 | sed "s|^|cache_df after  |" || true
+
+    - name: Show cache stats (after)
+      shell: bash
+      run: |
+        ccache -s || true
+        # Paired with the "before" reading. A cache that is retaining across
+        # runs grows once and then stays flat; one that is being emptied between
+        # runs grows by the same ~120 MB every time, which is the signature to
+        # look for.
+        if [ "${PYPTO_USE_UV:-false}" = "true" ]; then
+          ( source activate.sh
+            echo "uv_cache size=$(du -sh "$UV_CACHE_DIR" 2>/dev/null | cut -f1) mtime=$(date -r "$UV_CACHE_DIR" '+%F %T' 2>/dev/null)" )
+        fi
+      working-directory: ${{ inputs.checkout-path }}
+
+    - name: Install ptoas (local cache)
+      # $PTOAS_CACHE_DIR (ci-cache/ptoas) comes from the loader step. Runs after
+      # the bootstrap step on purpose: the wheel is cp310-only and the
+      # interpreter it must match is whichever activate.sh selected, conda env
+      # or toolchain bundle — so this step asks that env rather than naming one.
+      shell: bash
+      working-directory: ${{ inputs.checkout-path }}
+      env:
+        CHECKOUT_PATH: ${{ inputs.checkout-path }}
+      run: |
+        # PTOAS_ROOT belongs to the calling job's env: block, so this action
+        # cannot assume it arrived. Checked before the `rm -rf` below, which
+        # unset would aim at nothing.
+        if [ -z "${PTOAS_ROOT:-}" ]; then
+          echo "::error::PTOAS_ROOT is not set — the calling job must define it"
+          exit 1
+        fi
+        # Non-empty is not enough for a `rm -rf`. Every caller points PTOAS_ROOT
+        # at <checkout>/ptoas-bin, and a value one component short of that —
+        # $GITHUB_WORKSPACE/checkout, or the sibling serving-checkout — would
+        # aim the delete at a checkout instead. Canonicalize both sides and
+        # require a strict descendant, so equality with the checkout dir, a
+        # sibling sharing its prefix, and any `..` escape are all rejected
+        # before anything is removed. realpath -m: neither path need exist yet.
+        checkout_dir="$(realpath -m "$GITHUB_WORKSPACE/$CHECKOUT_PATH")"
+        ptoas_root="$(realpath -m "$PTOAS_ROOT")"
+        case "$ptoas_root" in
+          "$checkout_dir"/?*) ;;
+          *)
+            echo "::error::PTOAS_ROOT must be a directory inside $checkout_dir"
+            echo "Got '$PTOAS_ROOT' (resolves to '$ptoas_root'). This step"
+            echo "recreates that directory from scratch, so it must be one this"
+            echo "action owns rather than the checkout itself."
+            exit 1
+            ;;
+        esac
+        # Since v0.55 the release ships no per-arch ptoas-bin tarball, and its
+        # standalone archive requires CPython 3.11 while this CI runs 3.10.
+        # Install the matching cp310 wheel into an isolated venv, which keeps
+        # the PTOAS_ROOT/bin/ptoas layout pypto's ptoas discovery accepts.
+        #
+        # The cache entry is named exactly as the release asset, so it is the
+        # same file the pypto repo's own jobs put in this shared dir.
+        PTOAS_PACKAGE_VERSION="${PTOAS_VERSION#v}"
+        PTOAS_WHEEL_NAME="ptoas-${PTOAS_PACKAGE_VERSION}-cp310-cp310-manylinux_2_34_${PTOAS_ARCH}.whl"
+        CACHE_WHEEL="$PTOAS_CACHE_DIR/$PTOAS_WHEEL_NAME"
+        download_ptoas() {
+          echo "Downloading ptoas ${PTOAS_VERSION} for ${PTOAS_ARCH}"
+          mkdir -p "$PTOAS_CACHE_DIR"
+          # Unique per-process temp file: a shared "$CACHE_WHEEL.tmp" would let
+          # two concurrent cache-miss jobs clobber each other's download. The
+          # dot prefix keeps a partial download from looking like a wheel.
+          local tmp
+          tmp="$(mktemp "$PTOAS_CACHE_DIR/.ptoas-${PTOAS_ARCH}.XXXXXX")"
+          curl --fail --location --retry 3 --retry-all-errors \
+            "https://github.com/hw-native-sys/PTOAS/releases/download/${PTOAS_VERSION}/${PTOAS_WHEEL_NAME}" \
+            -o "$tmp"
+          echo "${PTOAS_SHA256}  $tmp" | sha256sum -c -
+          mv -f "$tmp" "$CACHE_WHEEL"
+        }
+        if [ ! -f "$CACHE_WHEEL" ]; then
+          echo "Cache miss"
+          download_ptoas
+        elif ! echo "${PTOAS_SHA256}  $CACHE_WHEEL" | sha256sum -c -; then
+          echo "Cache corrupted — removing and re-downloading"
+          rm -f "$CACHE_WHEEL"
+          download_ptoas
+        else
+          echo "Cache hit — using $CACHE_WHEEL"
+        fi
+        # activate.sh gives both the interpreter and the LD_LIBRARY_PATH ptoas
+        # needs (it wants a newer GLIBCXX than these hosts carry), for either
+        # toolchain. The venv is created from it rather than from a named conda
+        # env so 'bundle' jobs are not silently pinned to a conda python.
+        source activate.sh
+        # The wheel is cp310-only: pip would reject it with "not a supported
+        # wheel on this platform", which does not say that the *environment* is
+        # the wrong version. Say it here instead.
+        py_version="$(python -c 'import sys; print("%d.%d" % sys.version_info[:2])')"
+        if [ "$py_version" != "3.10" ]; then
+          echo "::error::ptoas ${PTOAS_VERSION} ships a cp310 wheel, but this job's python is $py_version"
+          exit 1
+        fi
+        rm -rf "$PTOAS_ROOT"
+        # Both branches build the same thing: a venv layered on the toolchain
+        # underneath the job venv — conda's py310-lib or the bundle's python3.10
+        # — with --system-site-packages exposing that same prefix.
+        #
+        # They differ only in who builds it, and that is forced: on the bundle
+        # path the job venv is made by `uv venv` and has no pip, so neither
+        # `python -m venv` (which needs ensurepip to seed the child) nor
+        # `$PTOAS_ROOT/bin/python -m pip` is available to it. The base
+        # interpreter is named explicitly rather than left to uv's discovery,
+        # which would otherwise resolve against the active venv.
+        if [ "${PYPTO_USE_UV:-false}" = "true" ]; then
+          base_python="$(python -c 'import sys; print(sys.base_prefix)')/bin/python3.10"
+          uv venv --python "$base_python" --system-site-packages "$PTOAS_ROOT"
+          uv pip install --python "$PTOAS_ROOT/bin/python" "$CACHE_WHEEL"
+        else
+          python -m venv "$PTOAS_ROOT" --system-site-packages
+          "$PTOAS_ROOT/bin/python" -m pip install "$CACHE_WHEEL"
+        fi
+        "$PTOAS_ROOT/bin/ptoas" --version
+
+    - name: Report toolchain versions
+      # One grep-able block naming every component a failure has to be
+      # reproduced against. simpler has no version of its own — it is pypto's
+      # runtime/ gitlink, and reads as a detached HEAD — so resolve it here
+      # rather than leaving the log with only the pypto sha it hides behind.
+      shell: bash
+      env:
+        CHECKOUT_PATH: ${{ inputs.checkout-path }}
+      run: |
+        short() { git -C "$1" rev-parse --short HEAD 2>/dev/null || echo unknown; }
+        echo "::group::Toolchain versions"
+        echo "pypto-lib  $(short "$GITHUB_WORKSPACE/$CHECKOUT_PATH")"
+        echo "pypto      $(short "$PYPTO_SRC")"
+        echo "simpler    $(short "$PYPTO_SRC/runtime") (detached)"
+        echo "ptoas      ${PTOAS_VERSION:-unknown} ($PTOAS_ARCH)"
+        echo "pto-isa    ${PTO_ISA_COMMIT:0:8} (detached)"
+        echo "CANN       $(basename "${CANN_ROOT:-unknown}")"
+        echo "::endgroup::"

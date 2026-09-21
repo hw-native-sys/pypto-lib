@@ -1,0 +1,1087 @@
+# Copyright (c) PyPTO Contributors.
+# This program is free software, you can redistribute it and/or modify it under the terms and conditions of
+# CANN Open Software License Agreement Version 2.0 (the "License").
+# Please refer to the License for details. You may not use this file except in compliance with the License.
+# THIS SOFTWARE IS PROVIDED ON AN "AS IS" BASIS, WITHOUT WARRANTIES OF ANY KIND, EITHER EXPRESS OR IMPLIED,
+# INCLUDING BUT NOT LIMITED TO NON-INFRINGEMENT, MERCHANTABILITY, OR FITNESS FOR A PARTICULAR PURPOSE.
+# See LICENSE in the root of the software repository for the full text of the License.
+# -----------------------------------------------------------------------------------------------------------
+"""DeepSeek-V4 decode indexer with compressed-cache scoring and top-k selection."""
+
+import pypto.language as pl
+
+from config import (
+    ACTIVE as M,
+    BLOCK_SIZE,
+    C4A_COMPRESSOR_BLOCK_SIZE,
+    DECODE_BATCH,
+    DECODE_IDX_BLOCK_NUM,
+    DECODE_SEQ,
+    FP32_NEG_INF,
+    IDX_CACHE_MAX_BLOCKS,
+)
+from decode_indexer_compressor import indexer_compressor
+from qkv_proj_rope import make_mxfp8_projection_from_quantized
+
+# model config
+B = DECODE_BATCH
+S = DECODE_SEQ
+T = B * S
+D = M.hidden_size
+Q_LORA = M.q_lora_rank
+ROPE_HEAD_DIM = M.qk_rope_head_dim
+IDX_N_HEADS = M.index_n_heads
+IDX_HEAD_DIM = M.index_head_dim
+IDX_NOPE_HEAD_DIM = M.index_nope_head_dim
+WEIGHTS_SCALE = M.index_weights_scale
+MAX_SEQ_LEN = M.max_position_embeddings
+OFFSET = M.sliding_window
+
+# indexer config
+COMPRESS_RATIO = 4
+IDX_TOPK = M.index_topk
+INNER_OVERLAP = COMPRESS_RATIO == 4
+INNER_COFF = 1 + int(INNER_OVERLAP)
+INNER_HEAD_DIM = IDX_HEAD_DIM
+INNER_OUT_DIM = INNER_COFF * INNER_HEAD_DIM
+INNER_STATE_BLOCK_SIZE = C4A_COMPRESSOR_BLOCK_SIZE
+INNER_STATE_PHYSICAL_BLOCKS = 65
+INNER_STATE_MAX_BLOCKS = (MAX_SEQ_LEN + INNER_STATE_BLOCK_SIZE - 1) // INNER_STATE_BLOCK_SIZE
+INNER_STATE_BLOCK_NUM = INNER_STATE_PHYSICAL_BLOCKS
+INNER_STATE_DIM = 2 * INNER_OUT_DIM
+
+IDX_KV_LEN = MAX_SEQ_LEN // COMPRESS_RATIO
+IDX_CACHE_BLOCK_NUM = DECODE_IDX_BLOCK_NUM
+SCORE_LEN = IDX_KV_LEN
+SCORE_ATOL = 1e-4
+SCORE_RTOL = 1.0 / 128
+SCORE_HARD_MULTIPLIER = 4.0
+SCORE_HARD_ATOL = 5e-3
+
+# tiling
+CACHE_TILE = 64
+Q_OUT_TILE = 1024
+MM_ROW_TILE = 16
+T_PAD = ((T + MM_ROW_TILE - 1) // MM_ROW_TILE) * MM_ROW_TILE
+D_TILE = 512
+WEIGHTS_K_TILE = D // (4 if M.name == "flash" else 7)
+Q_HEAD_TILE = 32
+Q_HEAD_FLAT_LEN = Q_HEAD_TILE * IDX_HEAD_DIM
+assert IDX_N_HEADS % Q_HEAD_TILE == 0
+# One lane per 128-key compressed block at the 8k operating point (2048 keys),
+# instead of two blocks per lane.
+SCORE_LANE_TILE = 16
+TOPK_HALF_LEN = SCORE_LEN // 2
+TOPK_HALF_PAIR_OFFSET = 2 * TOPK_HALF_LEN
+TOPK_PAIR_WIDTH = 2 * IDX_TOPK
+
+
+project_index_query = make_mxfp8_projection_from_quantized(Q_LORA, IDX_N_HEADS * IDX_HEAD_DIM)
+
+
+@pl.jit.inline
+def indexer(
+    x: pl.Tensor[[B, S, D], pl.BF16],
+    qr: pl.Tensor[[T, Q_LORA], pl.FP8E4M3FN],
+    qr_scale: pl.Tensor[[128, Q_LORA // 32], pl.FP8E8M0, pl.MX_A_ZZ],
+    wq_b: pl.Tensor[[Q_LORA, IDX_N_HEADS * IDX_HEAD_DIM], pl.FP8E4M3FN],
+    wq_b_scale: pl.Tensor[[Q_LORA // 32, IDX_N_HEADS * IDX_HEAD_DIM], pl.FP8E8M0, pl.MX_B_NN],
+    weights_proj: pl.Tensor[[D, IDX_N_HEADS], pl.BF16],
+    cos: pl.Tensor[[B, ROPE_HEAD_DIM // 2], pl.FP32],
+    sin: pl.Tensor[[B, ROPE_HEAD_DIM // 2], pl.FP32],
+    hadamard: pl.Tensor[[IDX_HEAD_DIM, IDX_HEAD_DIM], pl.BF16],
+    inner_kv: pl.Tensor[[B, S, INNER_HEAD_DIM], pl.FP32],
+    inner_compress_state: pl.InOut[
+        pl.Tensor[
+            [INNER_STATE_BLOCK_NUM, INNER_STATE_BLOCK_SIZE, INNER_STATE_DIM],
+            pl.FP32,
+        ]
+    ],
+    inner_compress_state_block_table: pl.Tensor[[B, INNER_STATE_MAX_BLOCKS], pl.INT32],
+    inner_wkv: pl.Tensor[[INNER_OUT_DIM, D], pl.BF16],
+    inner_wgate: pl.Tensor[[INNER_OUT_DIM, D], pl.BF16],
+    inner_ape: pl.Tensor[[COMPRESS_RATIO, INNER_OUT_DIM], pl.FP32],
+    inner_norm_w: pl.Tensor[[INNER_HEAD_DIM], pl.BF16],
+    # FP8 index cache and per-position FP32 dequantization scale.
+    idx_kv_cache: pl.InOut[pl.Tensor[[IDX_CACHE_BLOCK_NUM, BLOCK_SIZE, 1, IDX_HEAD_DIM], pl.FP8E4M3FN]],
+    idx_kv_scale: pl.InOut[pl.Tensor[[IDX_CACHE_BLOCK_NUM, BLOCK_SIZE, 1, 1], pl.FP32]],
+    idx_block_table: pl.Tensor[[B, IDX_CACHE_MAX_BLOCKS], pl.INT32],
+    score: pl.Tensor[[B, S, SCORE_LEN], pl.FP32],
+    topk_idxs: pl.Tensor[[B, S, SCORE_LEN], pl.INT32],
+    position_ids: pl.Tensor[[B, S], pl.INT32],
+    idx_slot_mapping: pl.Tensor[[B, S], pl.INT64],
+    inner_state_slot_mapping: pl.Tensor[[B, S], pl.INT64],
+    kv_seq_lens: pl.Tensor[[B], pl.INT32],
+    offset: pl.Scalar[pl.INT32],
+    late_dep: pl.Scalar[pl.TASK_ID],
+):
+    projected_query = pl.create_tensor([T, IDX_N_HEADS * IDX_HEAD_DIM], dtype=pl.BF16)
+    query_done = project_index_query(qr, qr_scale, wq_b, wq_b_scale, projected_query, late_dep)
+
+    # out[j] = x[j] * cos[j] + x[j ^ 1] * sin_signed[j]
+    cos_full_t = pl.create_tensor([B, IDX_HEAD_DIM], dtype=pl.FP32)
+    sin_full_t = pl.create_tensor([B, IDX_HEAD_DIM], dtype=pl.FP32)
+    with pl.at(level=pl.Level.CORE_GROUP, name_hint="qr_rope_tables"):
+        cos_tile = cos[0:B, 0 : ROPE_HEAD_DIM // 2]
+        sin_tile = sin[0:B, 0 : ROPE_HEAD_DIM // 2]
+        cos_il = pl.full([B, ROPE_HEAD_DIM], dtype=pl.FP32, value=0.0)
+        cos_il = pl.tensor.scatter(cos_tile, mask_pattern=pl.tile.MaskPattern.P0101, dst=cos_il)
+        cos_il = pl.tensor.scatter(cos_tile, mask_pattern=pl.tile.MaskPattern.P1010, dst=cos_il)
+        sin_neg = pl.neg(sin_tile)
+        sin_signed = pl.full([B, ROPE_HEAD_DIM], dtype=pl.FP32, value=0.0)
+        sin_signed = pl.tensor.scatter(sin_neg, mask_pattern=pl.tile.MaskPattern.P0101, dst=sin_signed)
+        sin_signed = pl.tensor.scatter(sin_tile, mask_pattern=pl.tile.MaskPattern.P1010, dst=sin_signed)
+        nope_cos = pl.full([B, IDX_NOPE_HEAD_DIM], dtype=pl.FP32, value=1.0)
+        cos_full = pl.concat(nope_cos, cos_il)
+        cos_full_t[0:B, 0:IDX_HEAD_DIM] = cos_full
+        nope_sin = pl.full([B, IDX_NOPE_HEAD_DIM], dtype=pl.FP32, value=0.0)
+        sin_full = pl.concat(nope_sin, sin_signed)
+        sin_full_t[0:B, 0:IDX_HEAD_DIM] = sin_full
+
+    topk_idx_init_t = pl.create_tensor([1, SCORE_LEN], dtype=pl.UINT32)
+    with pl.at(level=pl.Level.CORE_GROUP, name_hint="topk_idx_table"):
+        topk_idx_values = pl.arange(0, [1, SCORE_LEN], dtype=pl.UINT32)
+        topk_idx_init_t[0:1, 0:SCORE_LEN] = topk_idx_values
+
+    qr_hadamard_fp8 = pl.create_tensor([T * IDX_N_HEADS, IDX_HEAD_DIM], dtype=pl.FP8E4M3FN)
+    qr_hadamard_scale_dq = pl.create_tensor([T * IDX_N_HEADS, 1], dtype=pl.FP32)
+    # Finish all native MX blocks before scheduling ordinary BF16 matmuls.
+    with pl.spmd(T * IDX_N_HEADS // Q_HEAD_TILE, name_hint="qr_head", deps=[query_done]) as _query_head_tid:
+        idx = pl.tile.get_block_idx()
+        o0 = idx * Q_HEAD_TILE
+        tok = o0 // IDX_N_HEADS
+        c0 = (o0 - tok * IDX_N_HEADS) * IDX_HEAD_DIM
+        qr_batch_idx = tok // S
+        projected_flat = projected_query[tok : tok + 1, c0 : c0 + Q_HEAD_FLAT_LEN]
+        projected_fp32 = pl.cast(projected_flat, target_type=pl.FP32)
+        qh_rows = pl.reshape(projected_fp32, [Q_HEAD_TILE, IDX_HEAD_DIM])
+        qh_even = pl.gather(qh_rows, mask_pattern=pl.tile.MaskPattern.P0101)
+        qh_odd = pl.gather(qh_rows, mask_pattern=pl.tile.MaskPattern.P1010)
+        qh_swapped = pl.full([Q_HEAD_TILE, IDX_HEAD_DIM], dtype=pl.FP32, value=0.0)
+        qh_swapped = pl.tensor.scatter(qh_odd, mask_pattern=pl.tile.MaskPattern.P0101, dst=qh_swapped)
+        qh_swapped = pl.tensor.scatter(qh_even, mask_pattern=pl.tile.MaskPattern.P1010, dst=qh_swapped)
+        cos_full_row = cos_full_t[qr_batch_idx : qr_batch_idx + 1, 0:IDX_HEAD_DIM]
+        qh_cos = pl.col_expand_mul(qh_rows, cos_full_row)
+        sin_full_row = sin_full_t[qr_batch_idx : qr_batch_idx + 1, 0:IDX_HEAD_DIM]
+        qh_sin = pl.col_expand_mul(qh_swapped, sin_full_row)
+        qh_rot = pl.add(qh_cos, qh_sin)
+        qh_rot_bf16 = pl.cast(qh_rot, target_type=pl.BF16, mode="rint")
+        qh_acc = pl.matmul(qh_rot_bf16, hadamard, out_dtype=pl.FP32)
+        # CANN rotate_activation returns BF16 before dynamic_block_quant.
+        qh_bf16 = pl.cast(qh_acc, target_type=pl.BF16, mode="rint")
+        qh_values = pl.cast(qh_bf16, target_type=pl.FP32)
+        qh_amax = pl.row_max(pl.maximum(qh_values, pl.neg(qh_values)))
+        # The query operator uses a linear scale and min_scale=0, unlike the
+        # cache writer's power-of-two scale. Preserve its zero-scale behavior.
+        qh_scale = pl.div(qh_amax, 448.0)
+        qr_hadamard_scale_dq[o0 : o0 + Q_HEAD_TILE, :] = qh_scale
+        # A zero query retains scale 0 and emits zero FP8 payload.
+        qh_nonzero_bits = pl.minimum(pl.reinterpret_view(qh_amax, pl.INT32), 1)
+        qh_nonzero = pl.cast(qh_nonzero_bits, target_type=pl.FP32)
+        qh_zero_adjustment = pl.sub(qh_nonzero, 1.0)
+        qh_safe_scale = pl.sub(qh_scale, qh_zero_adjustment)
+        qh_normalized = pl.row_expand_div(qh_values, qh_safe_scale)
+        qh_clipped = pl.minimum(pl.maximum(qh_normalized, -448.0), 448.0)
+        qh_fp8 = pl.cast(qh_clipped, target_type=pl.FP8E4M3FN, mode="rint")
+        qr_hadamard_fp8[o0 : o0 + Q_HEAD_TILE, :] = qh_fp8
+
+    x_flat = pl.reshape(x, [T, D])
+    weights_partial = pl.create_tensor([(D // WEIGHTS_K_TILE) * MM_ROW_TILE, IDX_N_HEADS], dtype=pl.FP32)
+    with pl.spmd(D // WEIGHTS_K_TILE, name_hint="weights_proj", deps=[query_done]) as _weights_tid:
+        kb = pl.tile.get_block_idx()
+        k_base = kb * WEIGHTS_K_TILE
+        weights_acc = pl.create_tensor([MM_ROW_TILE, IDX_N_HEADS], dtype=pl.FP32)
+        for db in pl.range(WEIGHTS_K_TILE // D_TILE):
+            d0 = k_base + db * D_TILE
+            x_rows = pl.min(MM_ROW_TILE, T)
+            x_tile = pl.slice(x_flat, [MM_ROW_TILE, D_TILE], [0, d0], valid_shape=[x_rows, D_TILE])
+            weights_proj_tile = weights_proj[d0 : d0 + D_TILE, :]
+            if db == 0:
+                weights_acc = pl.matmul(x_tile, weights_proj_tile, out_dtype=pl.FP32)
+            else:
+                weights_acc = pl.matmul_acc(weights_acc, x_tile, weights_proj_tile)
+        weights_partial[kb * MM_ROW_TILE : kb * MM_ROW_TILE + MM_ROW_TILE, :] = weights_acc
+
+    weights = pl.create_tensor([T_PAD, IDX_N_HEADS], dtype=pl.FP32)
+    with pl.at(level=pl.Level.CORE_GROUP, name_hint="weights_proj_reduce"):
+        w_sum = weights_partial[0:MM_ROW_TILE, :]
+        for kb in pl.unroll(1, D // WEIGHTS_K_TILE):
+            weights_partial_tile = weights_partial[kb * MM_ROW_TILE : kb * MM_ROW_TILE + MM_ROW_TILE, :]
+            w_sum = pl.add(w_sum, weights_partial_tile)
+        weights_scaled = pl.mul(w_sum, WEIGHTS_SCALE)
+        weights[0:MM_ROW_TILE, :] = weights_scaled
+
+    indexer_compressor(
+        x, inner_kv,
+        inner_compress_state, inner_compress_state_block_table,
+        inner_wkv, inner_wgate, inner_ape, inner_norm_w,
+        cos, sin, hadamard, idx_kv_cache, idx_kv_scale,
+        position_ids, idx_slot_mapping, inner_state_slot_mapping,
+        query_done,
+    )
+
+    kv_cache_fp8_flat = pl.reshape(idx_kv_cache, [IDX_CACHE_BLOCK_NUM * BLOCK_SIZE, IDX_HEAD_DIM])
+    idx_block_table_flat = pl.reshape(idx_block_table, [B * IDX_CACHE_MAX_BLOCKS])
+    kv_scale_rows = pl.reshape(idx_kv_scale, [IDX_CACHE_BLOCK_NUM, BLOCK_SIZE])
+    score_flat = pl.reshape(score, [T, SCORE_LEN])
+    with pl.spmd(
+        SCORE_LANE_TILE,
+        name_hint="score",
+        optimizations=[pl.split(pl.SplitMode.NONE, slot_num=2)],
+    ) as score_tid:
+        score_lane = pl.tile.get_block_idx()
+        for score_tg in pl.unroll(T):
+            score_b = score_tg // S
+            score_s = score_tg - score_b * S
+            score_cache_len = pl.read(kv_seq_lens, [score_b]) // COMPRESS_RATIO
+            score_pos = pl.read(position_ids, [score_b, score_s])
+            score_visible_cache = pl.min(
+                score_cache_len, (score_pos + 1) // COMPRESS_RATIO)
+            score_visible_len = pl.min(score_visible_cache, SCORE_LEN)
+            score_cache_blocks = (
+                score_visible_len + BLOCK_SIZE - 1) // BLOCK_SIZE
+            score_t = score_b * S + score_s
+            score_q0 = score_t * IDX_N_HEADS
+            score_lane_rot = score_lane + (
+                SCORE_LANE_TILE - score_tg % SCORE_LANE_TILE
+            ) % SCORE_LANE_TILE
+            score_first_block = score_lane_rot - SCORE_LANE_TILE * (
+                score_lane_rot // SCORE_LANE_TILE)
+            score_lane_iters = (
+                score_cache_blocks
+                - score_first_block
+                + SCORE_LANE_TILE
+                - 1
+            ) // SCORE_LANE_TILE
+            if score_lane_iters > 0:
+                score_query = qr_hadamard_fp8[
+                    score_q0 : score_q0 + IDX_N_HEADS, 0:IDX_HEAD_DIM]
+                score_query_scale = qr_hadamard_scale_dq[
+                    score_q0 : score_q0 + IDX_N_HEADS, :]
+                score_weight_row = weights[
+                    score_t : score_t + 1, 0:IDX_N_HEADS]
+                score_weight_col = pl.reshape(
+                    score_weight_row, [IDX_N_HEADS, 1])
+                score_head_scale = pl.mul(
+                    score_query_scale, score_weight_col)
+                for score_local_block in pl.pipeline(
+                    0, score_lane_iters, stage=2
+                ):
+                    score_cache_block = (
+                        score_first_block
+                        + score_local_block * SCORE_LANE_TILE
+                    )
+                    score_c0 = score_cache_block * BLOCK_SIZE
+                    score_valid_len = pl.min(
+                        BLOCK_SIZE, score_visible_len - score_c0)
+                    score_block_raw = pl.read(
+                        idx_block_table_flat,
+                        [
+                            score_b * IDX_CACHE_MAX_BLOCKS
+                            + score_cache_block
+                        ],
+                    )
+                    score_block_id = pl.cast(score_block_raw, pl.INDEX)
+                    score_kv0 = score_block_id * BLOCK_SIZE
+                    score_kv_tile = kv_cache_fp8_flat[
+                        score_kv0 : score_kv0 + BLOCK_SIZE, :]
+                    score_acc = pl.matmul(
+                        score_query,
+                        score_kv_tile,
+                        out_dtype=pl.FP32,
+                        b_trans=True,
+                    )
+                    score_relu = pl.maximum(score_acc, 0.0)
+                    score_weighted = pl.row_expand_mul(
+                        score_relu, score_head_scale)
+                    score_head_sum = pl.col_sum(score_weighted)
+                    score_kv_scale = kv_scale_rows[
+                        score_block_id : score_block_id + 1, 0:BLOCK_SIZE]
+                    score_dequant = pl.mul(
+                        score_head_sum, score_kv_scale)
+                    score_shape = pl.set_validshape(
+                        score_dequant, 1, score_valid_len)
+                    score_padded = pl.fillpad(
+                        score_shape, pad_value=pl.PadValue.min)
+                    score_valid = pl.maximum(
+                        score_padded, FP32_NEG_INF)
+                    score_flat[
+                        score_t : score_t + 1,
+                        score_c0 : score_c0 + BLOCK_SIZE,
+                    ] = score_valid
+
+    topk_idxs_flat = pl.reshape(topk_idxs, [T, SCORE_LEN])
+    with pl.spmd(T, name_hint="topk", deps=[score_tid]) as _topk_tid:
+        t = pl.tile.get_block_idx()
+        invalid_idxs = pl.full([1, SCORE_LEN], dtype=pl.INT32, value=-1)
+        topk_idxs_flat[t : t + 1, :] = invalid_idxs
+        topk_batch_idx = t // S
+        token_s = t - topk_batch_idx * S
+        cache_len_b = pl.read(kv_seq_lens, [topk_batch_idx]) // COMPRESS_RATIO
+        topk_pos = pl.read(position_ids, [topk_batch_idx, token_s])
+        topk_visible_cache = pl.min(cache_len_b, (topk_pos + 1) // COMPRESS_RATIO)
+        topk_visible_len = pl.min(topk_visible_cache, SCORE_LEN)
+        if topk_visible_len > 0:
+            offset_i32 = pl.cast(offset, target_type=pl.INT32)
+            score_full_raw = score_flat[t : t + 1, 0:SCORE_LEN]
+            score_full_shape = pl.set_validshape(score_full_raw, 1, topk_visible_len)
+            score_full_padded = pl.fillpad(score_full_shape, pad_value=pl.PadValue.min)
+            score_floor = pl.full([1, SCORE_LEN], dtype=pl.FP32, value=FP32_NEG_INF)
+            score_full = pl.maximum(score_full_padded, score_floor)
+            topk_index_row = topk_idx_init_t[0:1, 0:SCORE_LEN]
+            sorted_32 = pl.sort32(score_full, topk_index_row)
+            sorted_64 = pl.mrgsort(sorted_32, block_len=64)
+            sorted_256 = pl.mrgsort(sorted_64, block_len=256)
+            sorted_full = pl.mrgsort(sorted_256, block_len=1024)
+
+            # Merge the two sorted 2048-score runs.
+            half0_candidates = sorted_full[:, 0:TOPK_PAIR_WIDTH]
+            half1_candidates = sorted_full[:, TOPK_HALF_PAIR_OFFSET : TOPK_HALF_PAIR_OFFSET + TOPK_PAIR_WIDTH]
+            merged_candidates = pl.mrgsort(half0_candidates, half1_candidates)
+            topk_pairs = merged_candidates[:, 0:TOPK_PAIR_WIDTH]
+            topk_idxs_tile = pl.gather(topk_pairs, mask_pattern=pl.tile.MaskPattern.P1010, output_dtype=pl.INT32)
+            valid_topk = pl.min(IDX_TOPK, topk_visible_len)
+            topk_idxs_valid = pl.set_validshape(topk_idxs_tile, 1, valid_topk)
+            topk_idxs_offset = pl.add(topk_idxs_valid, offset_i32)
+            topk_idxs_flat[t : t + 1, 0:IDX_TOPK] = topk_idxs_offset
+
+    return idx_kv_cache, idx_kv_scale, inner_compress_state, score, topk_idxs
+
+
+@pl.jit
+def indexer_test(
+    x: pl.Tensor[[B, S, D], pl.BF16],
+    qr: pl.Tensor[[T, Q_LORA], pl.FP8E4M3FN],
+    qr_scale: pl.Tensor[[128, Q_LORA // 32], pl.FP8E8M0, pl.MX_A_ZZ],
+    wq_b: pl.Tensor[[Q_LORA, IDX_N_HEADS * IDX_HEAD_DIM], pl.FP8E4M3FN],
+    wq_b_scale: pl.Tensor[[Q_LORA // 32, IDX_N_HEADS * IDX_HEAD_DIM], pl.FP8E8M0, pl.MX_B_NN],
+    weights_proj: pl.Tensor[[D, IDX_N_HEADS], pl.BF16],
+    cos: pl.Tensor[[B, ROPE_HEAD_DIM // 2], pl.FP32],
+    sin: pl.Tensor[[B, ROPE_HEAD_DIM // 2], pl.FP32],
+    hadamard: pl.Tensor[[IDX_HEAD_DIM, IDX_HEAD_DIM], pl.BF16],
+    inner_kv: pl.Tensor[[B, S, INNER_HEAD_DIM], pl.FP32],
+    inner_compress_state: pl.InOut[
+        pl.Tensor[
+            [INNER_STATE_BLOCK_NUM, INNER_STATE_BLOCK_SIZE, INNER_STATE_DIM],
+            pl.FP32,
+        ]
+    ],
+    inner_compress_state_block_table: pl.Tensor[[B, INNER_STATE_MAX_BLOCKS], pl.INT32],
+    inner_wkv: pl.Tensor[[INNER_OUT_DIM, D], pl.BF16],
+    inner_wgate: pl.Tensor[[INNER_OUT_DIM, D], pl.BF16],
+    inner_ape: pl.Tensor[[COMPRESS_RATIO, INNER_OUT_DIM], pl.FP32],
+    inner_norm_w: pl.Tensor[[INNER_HEAD_DIM], pl.BF16],
+    idx_kv_cache: pl.InOut[pl.Tensor[[IDX_CACHE_BLOCK_NUM, BLOCK_SIZE, 1, IDX_HEAD_DIM], pl.FP8E4M3FN]],
+    idx_kv_scale: pl.InOut[pl.Tensor[[IDX_CACHE_BLOCK_NUM, BLOCK_SIZE, 1, 1], pl.FP32]],
+    idx_block_table: pl.Tensor[[B, IDX_CACHE_MAX_BLOCKS], pl.INT32],
+    score: pl.Out[pl.Tensor[[B, S, SCORE_LEN], pl.FP32]],
+    topk_idxs: pl.Out[pl.Tensor[[B, S, SCORE_LEN], pl.INT32]],
+    position_ids: pl.Tensor[[B, S], pl.INT32],
+    idx_slot_mapping: pl.Tensor[[B, S], pl.INT64],
+    inner_state_slot_mapping: pl.Tensor[[B, S], pl.INT64],
+    kv_seq_lens: pl.Tensor[[B], pl.INT32],
+    offset: pl.Scalar[pl.INT32],
+):
+    late_dep = pl.system.task_dummy(deps=[])
+    indexer(
+        x, qr, qr_scale, wq_b, wq_b_scale, weights_proj,
+        cos, sin, hadamard,
+        inner_kv, inner_compress_state, inner_compress_state_block_table,
+        inner_wkv, inner_wgate, inner_ape, inner_norm_w,
+        idx_kv_cache, idx_kv_scale, idx_block_table,
+        score, topk_idxs,
+        position_ids, idx_slot_mapping, inner_state_slot_mapping, kv_seq_lens,
+        offset, late_dep,
+    )
+    return score, inner_compress_state, idx_kv_cache, idx_kv_scale, topk_idxs
+
+
+def _golden_index_query_projection(tensors):
+    """Decode both MX scale layouts independently, then round the linear output to BF16."""
+    import torch
+    from qkv_proj_rope import _golden_mx_weight
+
+    qr = tensors["qr"]
+    packed = tensors["qr_scale"].view(torch.uint8)
+    rows, groups = packed.shape
+    codes = packed.reshape(rows // 16, groups // 2, 16, 2)
+    codes = codes.permute(0, 2, 1, 3).contiguous().reshape(rows, groups)[:qr.shape[0]]
+    qr_dequant = qr.float() * torch.exp2(codes.float() - 127).repeat_interleave(32, dim=1)
+    weight = _golden_mx_weight(tensors["wq_b"], tensors["wq_b_scale"])
+    return (qr_dequant @ weight).to(torch.bfloat16).float()
+
+
+def _fp8_quant_query_per_row(x):
+    """CANN dynamic_block_quant: BF16 rows, raw amax/448 scale, saturated E4M3."""
+    import torch
+
+    rows = x.to(torch.bfloat16).float()
+    maximum = rows.abs().amax(dim=-1, keepdim=True)
+    scale = maximum / 448.0
+    denominator = torch.where(maximum == 0, torch.ones_like(scale), scale)
+    payload = (rows / denominator).clamp(-448.0, 448.0).to(torch.float8_e4m3fn)
+    return payload, scale
+
+
+def _native_index_query_fixture(tokens):
+    """Matched native MX payload/scale fixtures with a fixed 128-row QR scale bank."""
+    import torch
+    from qkv_proj_rope import _golden_native_mxfp8, _golden_pack_qr_scale
+
+    source = torch.zeros(128, Q_LORA, dtype=torch.bfloat16)
+    source[:tokens] = torch.rand(tokens, Q_LORA).to(torch.bfloat16)
+    qr, qr_codes = _golden_native_mxfp8(source)
+    qr_scale = _golden_pack_qr_scale(qr_codes).view(torch.float8_e8m0fnu)
+    columns = IDX_N_HEADS * IDX_HEAD_DIM
+    weight = (torch.randn(columns, Q_LORA) * 0.108).to(torch.bfloat16)
+    payload, codes = _golden_native_mxfp8(weight)
+    groups = Q_LORA // 32
+    packed = codes.T.contiguous().reshape(groups // 2, 2, columns // 16, 16).permute(2, 0, 3, 1)
+    scale = packed.contiguous().reshape(groups, columns).view(torch.float8_e8m0fnu)
+    return qr[:tokens].contiguous(), qr_scale, payload.T.contiguous(), scale
+
+
+def golden_indexer(tensors):
+    """Torch reference for Indexer.forward decode branch; prefill `start_pos == 0` path is omitted."""
+    import torch
+    from decode_indexer_compressor import golden_compressor
+
+    x = tensors["x"].float()
+    weights_proj = tensors["weights_proj"].float()
+    cos = tensors["cos"]
+    sin = tensors["sin"]
+    hadamard = tensors["hadamard"].float()
+
+    kv_seq_lens = tensors["kv_seq_lens"].to(torch.int64)
+    offset = int(tensors["offset"])
+
+    bsz, seqlen, _ = x.shape
+    ratio, rd = COMPRESS_RATIO, ROPE_HEAD_DIM
+
+    q = _golden_index_query_projection(tensors).view(B, S, IDX_N_HEADS, IDX_HEAD_DIM)
+
+    x_pair = q[..., -rd:].unflatten(-1, (-1, 2))
+    x0, x1 = x_pair[..., 0], x_pair[..., 1]
+    cos_v = cos.view(B, 1, 1, -1)
+    sin_v = sin.view(B, 1, 1, -1)
+    y0 = (x0 * cos_v - x1 * sin_v).to(torch.bfloat16)
+    y1 = (x0 * sin_v + x1 * cos_v).to(torch.bfloat16)
+
+    q = torch.cat([q[..., :-rd], torch.stack([y0, y1], dim=-1).flatten(-2)], dim=-1)
+
+    q = (q.to(torch.bfloat16).float() @ hadamard).to(torch.bfloat16).float()
+    # Per-head FP8 query values and linear scales feed the score matmul.
+
+    inner_tensors = {
+        "x": tensors["x"],
+        "kv": tensors["inner_kv"],
+        "wkv": tensors["inner_wkv"],
+        "wgate": tensors["inner_wgate"],
+        "ape": tensors["inner_ape"],
+        "norm_w": tensors["inner_norm_w"],
+        "cos": tensors["cos"],
+        "sin": tensors["sin"],
+        "hadamard": tensors["hadamard"],
+        "compress_state": tensors["inner_compress_state"],
+        "compress_state_block_table": tensors["inner_compress_state_block_table"],
+        "idx_kv_cache": tensors["idx_kv_cache"],
+        "idx_kv_scale": tensors["idx_kv_scale"],
+        "position_ids": tensors["position_ids"],
+        "idx_slot_mapping": tensors["idx_slot_mapping"],
+        "inner_state_slot_mapping": tensors["inner_state_slot_mapping"],
+    }
+    golden_compressor(inner_tensors)
+
+    weights = (x @ weights_proj) * WEIGHTS_SCALE
+
+    # The index cache stores FP8 KV rows and per-position dequantization scales.
+    idx_kv_cache_fp8 = tensors["idx_kv_cache"]
+    idx_kv_scale = tensors["idx_kv_scale"].float()
+    idx_block_table = tensors["idx_block_table"]
+    score_full = torch.full((bsz, seqlen, SCORE_LEN), FP32_NEG_INF, dtype=torch.float32)
+    topk_idxs = torch.full((bsz, seqlen, SCORE_LEN), -1, dtype=torch.int32)
+    q_fp8, q_scale = _fp8_quant_query_per_row(q.reshape(B * S * IDX_N_HEADS, IDX_HEAD_DIM))
+    q_fp8 = q_fp8.view(B, S, IDX_N_HEADS, IDX_HEAD_DIM)
+    q_scale = q_scale.view(B, S, IDX_N_HEADS, 1)
+
+    for b in range(bsz):
+        cache_len = int(kv_seq_lens[b].item()) // ratio
+        if cache_len <= 0:
+            continue
+
+        kv_fp8_rows = []
+        kv_scale_rows = []
+        for slot in range(cache_len):
+            blk_id = int(idx_block_table[b, slot // BLOCK_SIZE].item())
+            kv_fp8_rows.append(idx_kv_cache_fp8[blk_id, slot % BLOCK_SIZE, 0])
+            kv_scale_rows.append(idx_kv_scale[blk_id, slot % BLOCK_SIZE, 0, 0])
+        kv_fp8 = torch.stack(kv_fp8_rows, dim=0).view(cache_len, IDX_HEAD_DIM)
+        kv_scale = torch.stack(kv_scale_rows, dim=0).view(cache_len, 1)
+        score_dot = torch.einsum("shd,td->sht", q_fp8[b].float(), kv_fp8.float())
+        score = score_dot.float() * q_scale[b]
+        score = (torch.relu(score) * weights[b].unsqueeze(-1)).sum(dim=1)
+        score = score * kv_scale.view(1, cache_len)
+        for s in range(seqlen):
+            visible_len = min(cache_len, int(tensors["position_ids"][b, s].item() + 1) // ratio, SCORE_LEN)
+            if visible_len <= 0:
+                continue
+            score_full[b, s, :visible_len] = score[s, :visible_len].to(torch.float32)
+            k = min(IDX_TOPK, visible_len)
+            _, idx = score[s, :visible_len].topk(k, dim=-1)
+            topk_idxs[b, s, :k] = idx.to(torch.int32)
+            topk_idxs[b, s, :k] += offset
+
+    tensors["score"][:] = score_full
+
+    tensors["topk_idxs"][:] = topk_idxs.view(B, S, SCORE_LEN)
+
+
+def _scalar_input_as_int(value, name):
+    """Decode a scalar harness input and return either its value or an error string."""
+    if hasattr(value, "numel") and value.numel() != 1:
+        return None, f"{name} must be scalar, got shape {tuple(value.shape)}"
+    if hasattr(value, "item"):
+        value = value.item()
+    elif hasattr(value, "value"):
+        value = value.value
+    try:
+        return int(value), None
+    except (TypeError, ValueError):
+        return None, f"{name} must be integer-like, got {value!r}"
+
+
+def topk_prefix_contract_error(
+    topk_indices,
+    position_ids,
+    kv_seq_lens,
+    offset,
+):
+    """Return an error string for an invalid decode top-k prefix or ``-1`` tail."""
+    import torch
+
+    if topk_indices.ndim != 3 or topk_indices.shape != (B, S, SCORE_LEN):
+        return (
+            f"top-k tensor must have shape {(B, S, SCORE_LEN)}, "
+            f"got {tuple(topk_indices.shape)}"
+        )
+    if position_ids.ndim != 2 or position_ids.shape != (B, S):
+        return f"position_ids must have shape {(B, S)}, got {tuple(position_ids.shape)}"
+    if kv_seq_lens.ndim != 1 or kv_seq_lens.shape[0] != B:
+        return f"kv_seq_lens must have shape {(B,)}, got {tuple(kv_seq_lens.shape)}"
+
+    for b in range(B):
+        cache_len = max(int(kv_seq_lens[b].item()) // COMPRESS_RATIO, 0)
+        for s in range(S):
+            row = topk_indices[b, s]
+            position_visible = max(
+                (int(position_ids[b, s].item()) + 1) // COMPRESS_RATIO,
+                0,
+            )
+            visible = min(cache_len, position_visible, SCORE_LEN)
+            prefix_len = min(IDX_TOPK, visible)
+            prefix = row[:prefix_len]
+            if prefix_len:
+                out_of_range = (prefix < offset) | (prefix >= offset + visible)
+                if out_of_range.any().item():
+                    return (
+                        f"top-k row [{b},{s}] has "
+                        f"{int(out_of_range.count_nonzero().item())} entries outside "
+                        f"[{offset}, {offset + visible}) in its active prefix"
+                    )
+                unique_count = int(torch.unique(prefix).numel())
+                if unique_count != prefix_len:
+                    return (
+                        f"top-k row [{b},{s}] active prefix has "
+                        f"{unique_count}/{prefix_len} unique entries"
+                    )
+            tail_non_padding = int((row[prefix_len:] != -1).count_nonzero().item())
+            if tail_non_padding:
+                return (
+                    f"top-k row [{b},{s}] tail contains "
+                    f"{tail_non_padding} non--1 entries"
+                )
+    return None
+
+
+def decode_topk_compare(
+    actual,
+    expected,
+    *,
+    actual_outputs,
+    expected_outputs,
+    inputs,
+    rtol,
+    atol,
+):
+    """Validate decode top-k structure and allow only score-bounded tie changes."""
+    import torch
+
+    max_show = 10
+
+    position_ids = inputs.get("position_ids")
+    kv_seq_lens = inputs.get("kv_seq_lens")
+    offset_raw = inputs.get("offset", OFFSET)
+    if position_ids is None or kv_seq_lens is None:
+        return False, (
+            "    compare_fn requires position_ids and kv_seq_lens inputs"
+        )
+    offset, scalar_error = _scalar_input_as_int(offset_raw, "offset")
+    if scalar_error:
+        return False, f"    {scalar_error}"
+
+    actual = actual.cpu()
+    expected = expected.cpu()
+    position_ids = position_ids.cpu()
+    kv_seq_lens = kv_seq_lens.cpu()
+    for label, indices in (("actual", actual), ("expected", expected)):
+        contract_error = topk_prefix_contract_error(
+            indices,
+            position_ids,
+            kv_seq_lens,
+            offset,
+        )
+        if contract_error:
+            return False, f"    {label} {contract_error}"
+
+    scores = {}
+    for label, outputs in (("actual", actual_outputs), ("expected", expected_outputs)):
+        score = outputs.get("score")
+        if score is None:
+            return False, f"    compare_fn misconfigured: missing {label} output 'score'"
+        score = score.cpu().to(torch.float32)
+        if score.shape != (B, S, SCORE_LEN):
+            return False, (
+                f"    {label} score must have shape {(B, S, SCORE_LEN)}, "
+                f"got {tuple(score.shape)}"
+            )
+        nonfinite = ~torch.isfinite(score)
+        if nonfinite.any().item():
+            return False, (
+                f"    {label} score contains "
+                f"{int(nonfinite.count_nonzero().item())} non-finite value(s)"
+            )
+        scores[label] = score
+
+    actual_score = scores["actual"]
+    expected_score = scores["expected"]
+    failures = []
+    failure_count = 0
+
+    def record_failure(detail):
+        nonlocal failure_count
+        failure_count += 1
+        if len(failures) < max_show:
+            failures.append(detail)
+
+    for b in range(B):
+        cache_len = max(int(kv_seq_lens[b].item()) // COMPRESS_RATIO, 0)
+        for s in range(S):
+            position_visible = max(
+                (int(position_ids[b, s].item()) + 1) // COMPRESS_RATIO,
+                0,
+            )
+            visible = min(cache_len, position_visible, SCORE_LEN)
+            k = min(IDX_TOPK, visible)
+            if k <= 0:
+                continue
+
+            actual_order = actual[b, s, :k].to(torch.int64) - offset
+            expected_order = expected[b, s, :k].to(torch.int64) - offset
+            mismatch = actual_order != expected_order
+            if not mismatch.any().item():
+                continue
+
+            actual_row = actual_score[b, s, :visible]
+            expected_row = expected_score[b, s, :visible]
+            candidate_tolerance = SCORE_ATOL + SCORE_RTOL * torch.maximum(
+                actual_row.abs(),
+                expected_row.abs(),
+            )
+            candidate_hard_tolerance = torch.maximum(
+                SCORE_HARD_MULTIPLIER * candidate_tolerance,
+                torch.full_like(candidate_tolerance, SCORE_HARD_ATOL),
+            )
+            candidate_error = (actual_row - expected_row).abs()
+
+            # Check pointwise score errors for displaced candidates.
+            displaced = torch.unique(
+                torch.cat((actual_order[mismatch], expected_order[mismatch]))
+            )
+            bad_candidates = displaced[
+                candidate_error[displaced]
+                > candidate_hard_tolerance[displaced]
+            ]
+            for candidate_tensor in bad_candidates:
+                candidate = int(candidate_tensor.item())
+                record_failure(
+                    f"row=[{b},{s}] candidate={candidate} score error "
+                    f"{float(candidate_error[candidate].item()):.6g} exceeds "
+                    f"candidate hard bound "
+                    f"{float(candidate_hard_tolerance[candidate].item()):.6g} "
+                    f"(actual={float(actual_row[candidate].item()):.6g}, "
+                    f"expected={float(expected_row[candidate].item()):.6g})"
+                )
+
+            # Check selected candidates remain descending within score uncertainty.
+            if k >= 2:
+                for label, row in (
+                    ("expected", expected_row),
+                    ("actual", actual_row),
+                ):
+                    selected_lower = (
+                        row[actual_order]
+                        - candidate_hard_tolerance[actual_order]
+                    )
+                    selected_upper = (
+                        row[actual_order]
+                        + candidate_hard_tolerance[actual_order]
+                    )
+                    prior_min_upper = torch.cummin(
+                        selected_upper[:-1],
+                        dim=0,
+                    ).values
+                    clear_reverse = (
+                        selected_lower[1:] > prior_min_upper
+                    ).nonzero(as_tuple=False).flatten()
+                    for position_tensor in clear_reverse:
+                        later_position = int(position_tensor.item()) + 1
+                        earlier_position = int(
+                            selected_upper[:later_position].argmin().item()
+                        )
+                        earlier_candidate = int(
+                            actual_order[earlier_position].item()
+                        )
+                        later_candidate = int(
+                            actual_order[later_position].item()
+                        )
+                        reverse_gap = float(
+                            (
+                                row[later_candidate]
+                                - row[earlier_candidate]
+                            ).item()
+                        )
+                        joint_bound = float(
+                            (
+                                candidate_hard_tolerance[earlier_candidate]
+                                + candidate_hard_tolerance[later_candidate]
+                            ).item()
+                        )
+                        record_failure(
+                            f"row=[{b},{s}] clear inversion on {label} "
+                            f"scores at positions {earlier_position}/"
+                            f"{later_position}: candidate "
+                            f"{earlier_candidate} precedes {later_candidate}; "
+                            f"reverse_gap={reverse_gap:.6g}, "
+                            f"joint_bound={joint_bound:.6g}"
+                        )
+
+            # Check candidate changes across the top-k boundary.
+            if visible > k:
+                missing_mask = ~torch.isin(expected_order, actual_order)
+                added_mask = ~torch.isin(actual_order, expected_order)
+                missing = expected_order[missing_mask]
+                added = actual_order[added_mask]
+                if missing.numel() and added.numel():
+                    for label, row in (
+                        ("expected", expected_row),
+                        ("actual", actual_row),
+                    ):
+                        missing_lower = (
+                            row[missing] - candidate_hard_tolerance[missing]
+                        )
+                        added_upper = (
+                            row[added] + candidate_hard_tolerance[added]
+                        )
+                        best_missing_pos = int(missing_lower.argmax().item())
+                        worst_added_pos = int(added_upper.argmin().item())
+                        boundary_gap = float(
+                            (
+                                missing_lower[best_missing_pos]
+                                - added_upper[worst_added_pos]
+                            ).item()
+                        )
+                        if boundary_gap > 0:
+                            missing_candidate = int(missing[best_missing_pos].item())
+                            added_candidate = int(added[worst_added_pos].item())
+                            record_failure(
+                                f"row=[{b},{s}] clear top-k boundary miss on "
+                                f"{label} scores: omitted candidate "
+                                f"{missing_candidate}, selected candidate "
+                                f"{added_candidate}, uncertainty-adjusted "
+                                f"gap={boundary_gap:.6g}"
+                            )
+
+    if not failure_count:
+        return True, ""
+    lines = [
+        "    decode top-k differs outside candidate-specific score bounds: "
+        f"{failure_count} failure(s) "
+        f"(score_atol={SCORE_ATOL} score_rtol={SCORE_RTOL} "
+        f"score_hard_multiplier={SCORE_HARD_MULTIPLIER} "
+        f"score_hard_atol={SCORE_HARD_ATOL})"
+    ]
+    lines.extend(f"      {detail}" for detail in failures)
+    if failure_count > len(failures):
+        lines.append(f"      ... and {failure_count - len(failures)} more")
+    return False, "\n".join(lines)
+
+
+decode_topk_compare.__name__ = "decode_topk_pair_compare"
+
+
+def score_valid_compare(
+    actual,
+    expected,
+    *,
+    actual_outputs,
+    expected_outputs,
+    inputs,
+    rtol,
+    atol,
+):
+    """Compare visible scores with a ratio budget and hard pointwise ceiling."""
+    import torch
+
+    from golden import ratio_allclose
+
+    if actual.shape != expected.shape:
+        return False, (
+            f"    score shape mismatch: actual={tuple(actual.shape)} "
+            f"expected={tuple(expected.shape)}"
+        )
+    actual_f = actual.cpu().to(torch.float32)
+    expected_f = expected.cpu().to(torch.float32)
+    for label, value in (("actual", actual_f), ("expected", expected_f)):
+        nonfinite = ~torch.isfinite(value)
+        if nonfinite.any().item():
+            return False, (
+                f"    {label} score contains "
+                f"{int(nonfinite.count_nonzero().item())} non-finite value(s)"
+            )
+    valid = expected_f != FP32_NEG_INF
+    actual_valid = actual_f[valid]
+    expected_valid = expected_f[valid]
+    base_ok, base_detail = ratio_allclose(atol=SCORE_ATOL, rtol=SCORE_RTOL)(
+        actual_valid,
+        expected_valid,
+        actual_outputs=actual_outputs,
+        expected_outputs=expected_outputs,
+        inputs=inputs,
+        rtol=rtol,
+        atol=atol,
+    )
+    if not base_ok or actual_valid.numel() == 0:
+        return base_ok, base_detail
+
+    diff = (actual_valid - expected_valid).abs()
+    hard_tolerance = torch.maximum(
+        SCORE_HARD_MULTIPLIER * (
+            SCORE_ATOL
+            + SCORE_RTOL * torch.maximum(
+                actual_valid.abs(),
+                expected_valid.abs(),
+            )
+        ),
+        torch.full_like(actual_valid, SCORE_HARD_ATOL),
+    )
+    hard_bad = diff > hard_tolerance
+    hard_bad_count = int(hard_bad.count_nonzero().item())
+    if not hard_bad_count:
+        return True, ""
+
+    flat_bad = hard_bad.nonzero(as_tuple=False).flatten()
+    lines = []
+    for index in flat_bad[:10].tolist():
+        lines.append(
+            f"      [{index}] actual={float(actual_valid[index]):.8g} "
+            f"expected={float(expected_valid[index]):.8g} "
+            f"diff={float(diff[index]):.4g} "
+            f"hard_tol={float(hard_tolerance[index]):.4g}"
+        )
+    return False, (
+        f"    score hard bound exceeded at {hard_bad_count} point(s): "
+        f"hard_multiplier={SCORE_HARD_MULTIPLIER}, score_atol={SCORE_ATOL}, "
+        f"score_rtol={SCORE_RTOL}, hard_atol={SCORE_HARD_ATOL}\n"
+        + "\n".join(lines)
+    )
+
+
+score_valid_compare.__name__ = "score_valid_region_compare"
+
+
+def build_tensor_specs(start_pos=None):
+    import torch
+    from indexer_cache_quant import reference_indexer_cache_quant as quant_cache
+    from decode_metadata import (
+        block_table,
+        compressed_slot_mapping,
+        csa_decode_start_set,
+        kv_seq_lens_from_starts,
+        position_ids_from_starts,
+        resolve_start_positions,
+        state_slot_mapping,
+    )
+    from golden import ScalarSpec, TensorSpec
+    from rope_tables import build_deepseek_v4_rope_tables, materialize_half_rope_tables
+
+    shared_freqs_cos, shared_freqs_sin = build_deepseek_v4_rope_tables(M, COMPRESS_RATIO, dtype=torch.bfloat16)
+
+    def init_x():
+        return torch.rand(B, S, D)
+    def init_weights_proj():
+        return torch.randn(D, IDX_N_HEADS) * 0.2313
+    def init_rope_positions():
+        return init_position_ids().to(torch.int64)[:, 0]
+    def init_cos():
+        return materialize_half_rope_tables(shared_freqs_cos, shared_freqs_sin, init_rope_positions())[0]
+    def init_sin():
+        return materialize_half_rope_tables(shared_freqs_cos, shared_freqs_sin, init_rope_positions())[1]
+    def init_hadamard():
+        return torch.rand(IDX_HEAD_DIM, IDX_HEAD_DIM) * (IDX_HEAD_DIM ** -0.5)
+    def init_inner_compress_state():
+        state = torch.zeros(INNER_STATE_BLOCK_NUM, INNER_STATE_BLOCK_SIZE, INNER_STATE_DIM)
+        state[:, :, INNER_OUT_DIM:] = FP32_NEG_INF
+        return state
+    def init_inner_compress_state_block_table():
+        return block_table(
+            batch=B,
+            table_blocks=INNER_STATE_MAX_BLOCKS,
+            physical_blocks=INNER_STATE_PHYSICAL_BLOCKS,
+        )
+    def init_inner_wkv():
+        return torch.randn(INNER_OUT_DIM, D) * 0.0293
+    def init_inner_wgate():
+        return torch.randn(INNER_OUT_DIM, D) * 0.0512
+    def init_inner_ape():
+        return torch.randn(COMPRESS_RATIO, INNER_OUT_DIM) * 0.1528
+    def init_inner_norm_w():
+        return 0.6850 + 0.2610 * torch.randn(INNER_HEAD_DIM)
+    def init_idx_block_table():
+        return block_table(
+            batch=B,
+            table_blocks=IDX_CACHE_MAX_BLOCKS,
+            physical_blocks=IDX_CACHE_MAX_BLOCKS,
+        )
+    def init_default_start_pos():
+        return csa_decode_start_set(
+            batch=B, seq=S, compress_ratio=COMPRESS_RATIO,
+            state_block_size=INNER_STATE_BLOCK_SIZE, cache_tile=CACHE_TILE)
+    def init_start_pos():
+        return resolve_start_positions(
+            start_pos,
+            batch=B,
+            seq=S,
+            max_seq_len=MAX_SEQ_LEN,
+            default_fn=init_default_start_pos,
+        )
+    def init_position_ids():
+        return position_ids_from_starts(init_start_pos(), seq=S)
+    def init_kv_seq_lens():
+        return kv_seq_lens_from_starts(init_start_pos(), seq=S)
+    def init_inner_state_slot_mapping():
+        return state_slot_mapping(
+            init_position_ids(),
+            init_inner_compress_state_block_table(),
+            state_block_size=INNER_STATE_BLOCK_SIZE,
+        )
+    def init_idx_slot_mapping():
+        positions = init_position_ids()
+        return compressed_slot_mapping(
+            positions,
+            init_idx_block_table(),
+            compress_ratio=COMPRESS_RATIO,
+            block_size=BLOCK_SIZE,
+        )
+
+    qr_fp8, qr_scale, wq_b_fp8, wq_b_scale = _native_index_query_fixture(T)
+
+    idx_kv_cache_bf16 = torch.rand(IDX_CACHE_BLOCK_NUM, BLOCK_SIZE, 1, IDX_HEAD_DIM).to(torch.bfloat16)
+    idx_kv_fp8, idx_kv_sc = quant_cache(
+        idx_kv_cache_bf16.float().reshape(IDX_CACHE_BLOCK_NUM * BLOCK_SIZE, IDX_HEAD_DIM))
+    idx_kv_fp8 = idx_kv_fp8.view(IDX_CACHE_BLOCK_NUM, BLOCK_SIZE, 1, IDX_HEAD_DIM)
+    idx_kv_sc = idx_kv_sc.view(IDX_CACHE_BLOCK_NUM, BLOCK_SIZE, 1, 1)
+
+    return [
+        TensorSpec("x", [B, S, D], torch.bfloat16, init_value=init_x),
+        TensorSpec("qr", [T, Q_LORA], torch.float8_e4m3fn, init_value=lambda: qr_fp8),
+        TensorSpec("qr_scale", [128, Q_LORA // 32], torch.float8_e8m0fnu, init_value=lambda: qr_scale),
+        TensorSpec("wq_b", [Q_LORA, IDX_N_HEADS * IDX_HEAD_DIM], torch.float8_e4m3fn, init_value=lambda: wq_b_fp8),
+        TensorSpec("wq_b_scale", [Q_LORA // 32, IDX_N_HEADS * IDX_HEAD_DIM], torch.float8_e8m0fnu, init_value=lambda: wq_b_scale),
+        TensorSpec("weights_proj", [D, IDX_N_HEADS], torch.bfloat16, init_value=init_weights_proj),
+        TensorSpec("cos", [B, ROPE_HEAD_DIM // 2], torch.float32, init_value=init_cos),
+        TensorSpec("sin", [B, ROPE_HEAD_DIM // 2], torch.float32, init_value=init_sin),
+        TensorSpec("hadamard", [IDX_HEAD_DIM, IDX_HEAD_DIM], torch.bfloat16, init_value=init_hadamard),
+        TensorSpec("inner_kv", [B, S, INNER_HEAD_DIM], torch.float32),
+        TensorSpec("inner_compress_state", [INNER_STATE_BLOCK_NUM, INNER_STATE_BLOCK_SIZE, INNER_STATE_DIM], torch.float32, init_value=init_inner_compress_state),
+        TensorSpec("inner_compress_state_block_table", [B, INNER_STATE_MAX_BLOCKS], torch.int32, init_value=init_inner_compress_state_block_table),
+        TensorSpec("inner_wkv", [INNER_OUT_DIM, D], torch.bfloat16, init_value=init_inner_wkv),
+        TensorSpec("inner_wgate", [INNER_OUT_DIM, D], torch.bfloat16, init_value=init_inner_wgate),
+        TensorSpec("inner_ape", [COMPRESS_RATIO, INNER_OUT_DIM], torch.float32, init_value=init_inner_ape),
+        TensorSpec("inner_norm_w", [INNER_HEAD_DIM], torch.bfloat16, init_value=init_inner_norm_w),
+        TensorSpec("idx_kv_cache", [IDX_CACHE_BLOCK_NUM, BLOCK_SIZE, 1, IDX_HEAD_DIM], torch.float8_e4m3fn, init_value=lambda: idx_kv_fp8),
+        TensorSpec("idx_kv_scale", [IDX_CACHE_BLOCK_NUM, BLOCK_SIZE, 1, 1], torch.float32, init_value=lambda: idx_kv_sc),
+        TensorSpec("idx_block_table", [B, IDX_CACHE_MAX_BLOCKS], torch.int32, init_value=init_idx_block_table),
+        # Output tails use -inf scores and -1 indices.
+        TensorSpec("score", [B, S, SCORE_LEN], torch.float32),
+        TensorSpec("topk_idxs", [B, S, SCORE_LEN], torch.int32),
+        TensorSpec("position_ids", [B, S], torch.int32, init_value=init_position_ids),
+        TensorSpec("idx_slot_mapping", [B, S], torch.int64, init_value=init_idx_slot_mapping),
+        TensorSpec("inner_state_slot_mapping", [B, S], torch.int64, init_value=init_inner_state_slot_mapping),
+        TensorSpec("kv_seq_lens", [B], torch.int32, init_value=init_kv_seq_lens),
+        ScalarSpec("offset", torch.int32, OFFSET),
+    ]
+
+
+if __name__ == "__main__":
+    import argparse
+    from decode_indexer_compressor import (
+        mapped_idx_cache_ratio_allclose,
+        mapped_inner_state_ratio_allclose,
+    )
+    from golden import run
+
+    parser = argparse.ArgumentParser()
+    parser.add_argument("-p", "--platform", type=str, default="a5",
+                        choices=["a2a3", "a2a3sim", "a5", "a5sim"])
+    parser.add_argument("-d", "--device", type=int, default=0)
+    parser.add_argument("--enable-chip-swimlane", type=int, nargs="?", const=1, default=0, choices=range(5))
+    parser.add_argument("--runtime-dir", type=str, default=None)
+    parser.add_argument("--compile-only", action="store_true")
+    parser.add_argument("--save-data", action="store_true")
+    parser.add_argument("--start-pos", type=int, default=None,
+                        help="Uniform fixture-only start_pos override for all batches; "
+                             "default (unset) uses the canonical per-batch CSA set that includes the 8k point.")
+    parser.add_argument("--dump-passes", action="store_true", default=False)
+    args = parser.parse_args()
+
+    result = run(
+        fn=indexer_test,
+        specs=build_tensor_specs(args.start_pos),
+        golden_fn=golden_indexer,
+        runtime_dir=args.runtime_dir,
+        compile_only=args.compile_only,
+        save_data=args.save_data,
+        config=dict(
+            dump_passes=args.dump_passes,
+            platform=args.platform,
+            device_id=args.device,
+            enable_chip_swimlane=args.enable_chip_swimlane,
+        ),
+        rtol=1e-3,
+        atol=1e-3,
+        compare_fn={
+            "score":        score_valid_compare,
+            "topk_idxs":    decode_topk_compare,
+            "inner_compress_state": mapped_inner_state_ratio_allclose(
+                atol=1e-3, rtol=1e-3, max_error_ratio=0.0),
+            # Compare rows selected by the current slot mappings.
+            "idx_kv_cache": mapped_idx_cache_ratio_allclose(
+                atol=0.001953125, rtol=0.125, max_error_ratio=0.01),
+            "idx_kv_scale": mapped_idx_cache_ratio_allclose(
+                atol=1e-4, rtol=1.0 / 128, max_error_ratio=0.01),
+        },
+    )
+    if not result.passed:
+        if result.error:
+            print(result.error)
+        raise SystemExit(1)

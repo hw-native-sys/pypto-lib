@@ -1,0 +1,238 @@
+{
+  "platform": "a2a3",
+  "sampling": {
+    "rounds": 100,
+    "warmup": 500
+  },
+  "cases": [
+    {
+      "case_id": "dsv4-flash-mtp-decode-csa-8k",
+      "entrypoint": "models/deepseek_v4_flash_mtp/decode_csa.py",
+      "device_count": 1,
+      "arguments": [
+        "--start-pos",
+        "8192"
+      ]
+    },
+    {
+      "case_id": "dsv4-flash-mtp-decode-hca-8k",
+      "entrypoint": "models/deepseek_v4_flash_mtp/decode_hca.py",
+      "device_count": 1,
+      "arguments": [
+        "--start-pos",
+        "8192"
+      ]
+    },
+    {
+      "case_id": "dsv4-flash-mtp-decode-swa-8k",
+      "entrypoint": "models/deepseek_v4_flash_mtp/decode_swa.py",
+      "device_count": 1,
+      "arguments": [
+        "--start-pos",
+        "8192"
+      ]
+    },
+    {
+      "case_id": "dsv4-flash-mtp-decode-moe-ep16",
+      "entrypoint": "models/deepseek_v4_flash_mtp/decode_moe.py",
+      "device_count": 16,
+      "arguments": [
+        "--ep",
+        "16",
+        "--layer-id",
+        "0",
+        "--num-tokens",
+        "8",
+        "--experts-per-rank",
+        "16",
+        "--balanced-routing"
+      ]
+    },
+    {
+      "case_id": "dsv4-flash-mtp-decode-lm-head-tp4",
+      "entrypoint": "models/deepseek_v4_flash_mtp/lm_head.py",
+      "device_count": 4,
+      "arguments": [
+        "--tp",
+        "4",
+        "--dp",
+        "1",
+        "--num-tokens",
+        "8",
+        "--entry",
+        "projection"
+      ]
+    },
+    {
+      "case_id": "dsv4-flash-mtp-decode-csa-128k",
+      "entrypoint": "models/deepseek_v4_flash_mtp/decode_csa.py",
+      "device_count": 1,
+      "arguments": [
+        "--start-pos",
+        "131072"
+      ]
+    },
+    {
+      "case_id": "dsv4-flash-mtp-decode-hca-128k",
+      "entrypoint": "models/deepseek_v4_flash_mtp/decode_hca.py",
+      "device_count": 1,
+      "arguments": [
+        "--start-pos",
+        "131072"
+      ]
+    },
+    {
+      "case_id": "dsv4-flash-mtp-decode-swa-128k",
+      "entrypoint": "models/deepseek_v4_flash_mtp/decode_swa.py",
+      "device_count": 1,
+      "arguments": [
+        "--start-pos",
+        "131072"
+      ]
+    },
+    {
+      "case_id": "dsv4-flash-mtp-prefill-csa-cp16-8k",
+      "entrypoint": "models/deepseek_v4_flash_mtp/prefill_csa.py",
+      "device_count": 16,
+      "arguments": [
+        "--cp",
+        "16",
+        "--num-tokens",
+        "8192"
+      ]
+    },
+    {
+      "case_id": "dsv4-flash-mtp-prefill-hca-cp16-8k",
+      "entrypoint": "models/deepseek_v4_flash_mtp/prefill_hca.py",
+      "device_count": 16,
+      "arguments": [
+        "--cp",
+        "16",
+        "--num-tokens",
+        "8192"
+      ]
+    },
+    {
+      "case_id": "dsv4-flash-mtp-prefill-swa-cp16-8k",
+      "entrypoint": "models/deepseek_v4_flash_mtp/prefill_swa.py",
+      "device_count": 16,
+      "arguments": [
+        "--cp",
+        "16",
+        "--num-tokens",
+        "8192"
+      ]
+    },
+    {
+      "case_id": "dsv4-flash-mtp-prefill-moe-ep16",
+      "entrypoint": "models/deepseek_v4_flash_mtp/prefill_moe.py",
+      "device_count": 16,
+      "arguments": [
+        "--ep",
+        "16",
+        "--layer-id",
+        "0",
+        "--tokens",
+        "1024",
+        "--num-tokens",
+        "512"
+      ]
+    },
+    {
+      "case_id": "dsv4-flash-dspark-decode-csa-8k",
+      "entrypoint": "models/deepseek_v4_flash_dspark/decode_csa.py",
+      "device_count": 1,
+      "arguments": [
+        "--tp",
+        "1",
+        "--start-pos",
+        "8192,8192,8192,8192,8192,8192,8192,8192,8192,8192,8192,8192,8192,8192,8192,8192"
+      ]
+    },
+    {
+      "case_id": "dsv4-flash-dspark-decode-hca-8k",
+      "entrypoint": "models/deepseek_v4_flash_dspark/decode_hca.py",
+      "device_count": 1,
+      "arguments": [
+        "--tp",
+        "1",
+        "--start-pos",
+        "8192,8192,8192,8192,8192,8192,8192,8192,8192,8192,8192,8192,8192,8192,8192,8192"
+      ]
+    },
+    {
+      "case_id": "dsv4-flash-dspark-decode-swa-8k",
+      "entrypoint": "models/deepseek_v4_flash_dspark/decode_swa.py",
+      "device_count": 1,
+      "arguments": [
+        "--tp",
+        "1",
+        "--start-pos",
+        "8192,8192,8192,8192,8192,8192,8192,8192,8192,8192,8192,8192,8192,8192,8192,8192"
+      ]
+    },
+    {
+      "case_id": "dsv4-flash-dspark-decode-moe-ep16",
+      "entrypoint": "models/deepseek_v4_flash_dspark/moe.py",
+      "device_count": 16,
+      "arguments": [
+        "--ep",
+        "16",
+        "--layer-id",
+        "0",
+        "--num-tokens",
+        "128",
+        "--routing",
+        "balanced"
+      ]
+    },
+    {
+      "case_id": "dsv4-flash-dspark-decode-lm-head-tp4",
+      "entrypoint": "models/deepseek_v4_flash_dspark/lm_head.py",
+      "device_count": 4,
+      "arguments": [
+        "--tp",
+        "4",
+        "--dp",
+        "1",
+        "--num-tokens",
+        "128",
+        "--entry",
+        "projection"
+      ]
+    },
+    {
+      "case_id": "dsv4-flash-dspark-decode-csa-128k",
+      "entrypoint": "models/deepseek_v4_flash_dspark/decode_csa.py",
+      "device_count": 1,
+      "arguments": [
+        "--tp",
+        "1",
+        "--start-pos",
+        "131072,131072,131072,131072,131072,131072,131072,131072,131072,131072,131072,131072,131072,131072,131072,131072"
+      ]
+    },
+    {
+      "case_id": "dsv4-flash-dspark-decode-hca-128k",
+      "entrypoint": "models/deepseek_v4_flash_dspark/decode_hca.py",
+      "device_count": 1,
+      "arguments": [
+        "--tp",
+        "1",
+        "--start-pos",
+        "131072,131072,131072,131072,131072,131072,131072,131072,131072,131072,131072,131072,131072,131072,131072,131072"
+      ]
+    },
+    {
+      "case_id": "dsv4-flash-dspark-decode-swa-128k",
+      "entrypoint": "models/deepseek_v4_flash_dspark/decode_swa.py",
+      "device_count": 1,
+      "arguments": [
+        "--tp",
+        "1",
+        "--start-pos",
+        "131072,131072,131072,131072,131072,131072,131072,131072,131072,131072,131072,131072,131072,131072,131072,131072"
+      ]
+    }
+  ]
+}

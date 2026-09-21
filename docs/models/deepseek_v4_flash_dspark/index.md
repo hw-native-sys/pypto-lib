@@ -1,0 +1,239 @@
+# DeepSeek V4-Flash, DSpark point
+
+`models/deepseek_v4_flash_dspark/` is the second deployment point of the same
+V4-Flash checkpoint: a wide-batch serving configuration whose speculation comes
+from a **DSpark drafter** instead of one MTP layer, and whose attention is
+tensor-parallel and context-parallel instead of purely data-parallel.
+
+The model body — 43 layers, the three attention paths, the 256-expert MoE, the
+hyper-connection stack — is the one described on the
+[V4-Flash MTP page](../deepseek_v4_flash_mtp/index.md), and both trees read the
+same `FLASH` preset. This page covers what the DSpark point changes.
+
+## Deployment configuration
+
+[config.py](../../../models/deepseek_v4_flash_dspark/config.py) carries the same
+`DeepSeekV4Config` presets as the MTP tree and its own deployment constants
+below the presets.
+
+| Deployment property | Value |
+| --- | --- |
+| Speculative decoding | DSpark — a three-layer drafter proposes `DSPARK_SPEC_TOKENS = 7` drafts per request, so the target model verifies `S = 8` token rows per step (`DECODE_SEQ`) |
+| Decode batch per card | 64 requests → 512 token rows per step (`DECODE_BATCH`, `DECODE_TOKENS`) |
+| Decode context length | up to 1,048,576 positions, paged in **32-token** pages (`max_position_embeddings`, `BLOCK_SIZE`) |
+| Prefill shape | one packed request stream per CP group, `PREFILL_SEQ = 512` tokens per dispatch; longer prompts arrive as chunks against a resident prefix |
+| Platform | Ascend A2/A3, single node |
+| Tensor parallelism | `--tp 1/2/4`; the deployment point is TP 4 — the grouped output projection and the LM head are vocab/group-sharded over it |
+| Context parallelism | DSA-CP reuses that same physical TP group: each rank owns a slice of the step's token rows, and the attention KV stream is replicated rank-major across the group |
+| Expert parallelism | `--ep 2/4/8/16`; the deployment point is EP 16, and each rank holds `256 / ep` routed experts |
+| Data parallelism | `DP = 4` groups per node, so the deployment point is 16 cards (`TP * DP`) |
+| Quantization | W8A8 INT8, identical to the MTP tree — INT8 weights with FP32 dequant scales, activations quantized per token at the INT8 matmuls |
+
+`BLOCK_SIZE = 32` sets four page sizes at once: the paged KV cache, the
+compressed KV cache, the indexer cache, and — through
+`C4A_COMPRESSOR_BLOCK_SIZE = 2` and `C128_COMPRESSOR_BLOCK_SIZE = 8` — both
+compressor-state pools.
+
+### What DSpark changes
+
+| | MTP point | DSpark point |
+| --- | --- | --- |
+| Drafting | one MTP layer, 1 draft token | a 3-layer drafter, 7 draft tokens, plus a Markov head |
+| Rows per decode step, per card | 4 requests × 2 = 8 | 64 requests × 8 = 512 |
+| Attention parallelism | data-parallel; each rank owns its own micro-batch | TP-sharded output projection over a DSA-CP token split |
+| Page size | 128 | 32 |
+| Context ceiling | `max_position_embeddings` truncated to 16,384 | the checkpoint's own 1,048,576, and the cache capacities are sized from it |
+
+The wider verify window is the reason for the rest of the table: 512 rows per
+step is too much attention work for one card, so the token axis is split across
+the CP group and the output projection is sharded along with it.
+
+## Model structure, top down
+
+### `decode_fwd`
+
+[decode_fwd.py](../../../models/deepseek_v4_flash_dspark/decode_fwd.py) hand-unrolls
+the 43-layer schedule inside one rank-generic `@pl.jit` kernel, launched per
+rank from an `@pl.jit.host` driver — the same shape as the MTP tree's forward,
+with each attention and MoE stage in its own `pl.scope()` under
+`auto_scope=False`:
+
+```
+decode_fwd
+├── preamble          embedding lookup, metadata lowering, CP token all-gather
+├── layers 0, 1       decode_swa  → moe
+├── loop ×20          decode_csa  → moe        (layers 2, 4, …, 40)
+│                     decode_hca  → moe        (layers 3, 5, …, 41)
+├── layer 42          decode_csa  → moe
+└── tail              hc_head → rms_norm → lm_head (TP vocab shard)
+                      → greedy_sample
+```
+
+`decode_fwd` is the plain forward: it takes its token ids, positions, and
+sequence lengths from the host and carries no persistent-state coupling.
+Speculative decoding brackets it with two device-state stages that
+[decode_prepare.py](../../../models/deepseek_v4_flash_dspark/decode_prepare.py)
+exports, and the fused DSpark L2 in
+[decode_fwd_dspark.py](../../../models/deepseek_v4_flash_dspark/decode_fwd_dspark.py)
+is the only place that composes them:
+
+```
+prepare_target_group_from_device_state   late-bind the step from request slots
+decode_fwd_inline                        the forward above, unchanged
+accept_target_into_device_state          accept the longest matching prefix
+```
+
+Every `decode_{swa,csa,hca}` entry has a `_tp1` twin: the single-rank form runs
+the layer without the CP gather and the TP publish, and is what the golden
+compares against. The batch is dynamic: `--start-pos` takes one position per
+request and its length is the batch, defaulting to the 16 per-rank requests the
+MoE token budget is sized for.
+
+### `prefill_fwd`
+
+[prefill_fwd.py](../../../models/deepseek_v4_flash_dspark/prefill_fwd.py) mirrors
+that structure for a packed prompt: the same per-rank kernel shape, the same
+per-stage scopes, `prefill_{swa,hca,csa}` in place of the decode
+orchestrations, and the same `hc_head → rms_norm → lm_head` tail. Prompt
+sequence lengths that do not divide the CP group are padded rather than
+rejected, so one program serves an arbitrary chunk against a resident prefix.
+
+### Attention under DSA-CP
+
+The three attention paths are the MTP tree's, re-cut along the token axis:
+
+```
+decode_swa   hc_pre → rmsnorm → qkv_proj_rope → decode_sparse_attn_swa
+                    → decode_o_proj (TP publish)                      → hc_post
+decode_hca   … → decode_compressor_ratio128 → decode_sparse_attn_hca  → …
+decode_csa   … → decode_compressor_ratio4 (main, inner)
+                 → decode_indexer → decode_indexer_compressor
+                 → decode_sparse_attn_csa                             → …
+```
+
+- [decode_cp_allgather.py](../../../models/deepseek_v4_flash_dspark/decode_cp_allgather.py)
+  gathers projected payloads into rank-major order on **every** rank.
+  Each rank then writes the group's whole KV stream into its own replicated
+  cache, so a compressor or indexer sees the full context while its queries stay
+  on their token owner.
+- SWA projects and normalizes KV on the token owner, then uses
+  `decode_cp_kv_allgather_step` from the same module
+  to gather the 512-wide KV rows. KV projection and normalization weights are
+  replicated across the CP group. The shared 4096-column window remains
+  compatible with the full forward entry; SWA transfers only its KV columns.
+- HCA and CSA project compressor/indexer values and scores on the token owner
+  as well. FP32 projections are transported through lossless BF16 bit views,
+  without numeric conversion; normalized hidden rows are never gathered.
+  HCA uses one 2560-column payload containing compressor values, scores and KV.
+  CSA gathers its 1536-column indexer/KV payload first, then its 4096-column
+  main-compressor payload after the first epoch retires. Their pooling and
+  replicated cache/state updates still consume the full projected stream.
+  The standalone transport fixture selects layouts with
+  `--payload-kind {kv,hca,csa-main,csa-aux}`; `--raw-bits` checks opaque 16-bit
+  payloads bit-for-bit, including BF16 NaN patterns, across two retained-window
+  epochs. Use `--local-t 17` to exercise partial row bands.
+- [decode_o_proj.py](../../../models/deepseek_v4_flash_dspark/decode_o_proj.py)
+  owns the grouped output projection and its TP communication: each rank
+  dequantizes and projects its own `o_groups` shard, then publishes the result
+  to the group so every rank leaves the stage with the complete rows.
+- The prefill side is the same decomposition over
+  [prefill_cp_token_allgather.py](../../../models/deepseek_v4_flash_dspark/prefill_cp_token_allgather.py)
+  and [prefill_o_proj.py](../../../models/deepseek_v4_flash_dspark/prefill_o_proj.py).
+
+### MoE and output stages
+
+[moe.py](../../../models/deepseek_v4_flash_dspark/moe.py) is unchanged in shape
+from the MTP tree — `gate` produces the top-6 routing and the per-token INT8
+view, `dispatch` / `combine` are the EP collectives, `expert_shared` and
+`expert_routed` are the two FFN paths — but it carries `DP * DECODE_TOKENS`
+worth of receive capacity, because a DSpark step dispatches 512 rows per card
+rather than 8.
+
+`hc_head` folds the hyper-connection stack back to one hidden row, the final
+`rms_norm` normalizes it, and [lm_head.py](../../../models/deepseek_v4_flash_dspark/lm_head.py)
+all-gathers the group's hidden rows, projects them against this card's
+`vocab / tp` shard, and all-to-alls the logits back to their row owners.
+
+### The DSpark drafter
+
+The drafter is a small model of its own, run after the target step over the
+target's hidden states:
+
+```
+dspark_proj        main_proj(concat of 3 target layers' hidden) → RMSNorm
+dspark_context_kv  project the target's token stream into each draft layer's
+                   paged SWA cache (per proposal, decode rows or prompt chunk)
+dspark_drafter     ×3  hc_pre → rmsnorm → qkv_proj_rope
+                          → dspark_attention → o_proj publish → hc_post
+                          → moe
+markov_head        low-rank (256) Markov embedding + full-vocabulary logits
+dspark_markov      lm_head → sequential Markov sampling → confidence head
+```
+
+- `dspark_proj`, in
+  [dspark_drafter.py](../../../models/deepseek_v4_flash_dspark/dspark_drafter.py),
+  collapses three target layers' hidden states (`TARGET_LAYER_IDS`, declared by
+  each forward that exposes the tap) into one drafter hidden row. `main_proj` stays BF16: the W8A8 checkpoint quantizes it
+  only under an FP8 quant method.
+- [dspark_attention.py](../../../models/deepseek_v4_flash_dspark/dspark_attention.py)
+  runs one anchor-first draft query block of 7 rows per request against the
+  paged sliding window. Every draft row sees the trailing window plus the whole
+  block through one index list, so there is no causal mask inside the block.
+- [dspark_markov.py](../../../models/deepseek_v4_flash_dspark/dspark_markov.py)
+  emits the 7 drafts sequentially — each step's sampled id feeds the next
+  through a rank-256 Markov transition — and a sigmoid confidence head scores
+  the block for the acceptance policy.
+- `dspark_drafter.py --mode prefill` runs the same program over a prompt:
+  prompt-context KV insertion followed by the same seven-query proposal.
+  `--mode decode`, the default, starts from the accepted decode rows instead.
+
+The drafter's query batch is one MoE slab of padded draft blocks
+(`MOE_TOKENS / DECODE_SEQ` requests), not the TP split of the target batch, so
+its shapes do not move with `--tp`; only the DSA-CP group width does.
+
+[decode_fwd_dspark.py](../../../models/deepseek_v4_flash_dspark/decode_fwd_dspark.py)
+composes the whole recurrent step — prepare, target forward, accept, drafter,
+Markov sampler, state commit — into one L2, and runs it end to end without a
+golden.
+
+## Status
+
+Under development, and not wired into `pypto-serving`. Every executable file
+carries its own Golden Harness fixture; the
+`decode_fwd` / `prefill_fwd` / `decode_layer` / `prefill_layer` compositions and
+the distributed communication oracles are device-only and do not run on a
+simulator. Most kernels are a plain function exposed twice — as the
+`pl.jit.inline` stage the layer and forward kernels compose, and as the `@pl.jit`
+entry its own fixture drives — so the composed and standalone forms cannot
+drift.
+
+```bash
+python models/deepseek_v4_flash_dspark/decode_layer.py -p a2a3 --tp 2 --ep 2 -d 0,1
+python models/deepseek_v4_flash_dspark/decode_fwd.py -p a2a3 --tp 2 --ep 2 -d 0,1
+python models/deepseek_v4_flash_dspark/dspark_drafter.py -p a2a3 --tp 2 --ep 2 -d 0,1
+python models/deepseek_v4_flash_dspark/decode_fwd_dspark.py -p a2a3 --tp 2 --ep 2 -d 0,1
+```
+
+`--tp` and `--ep` are read at import time, because the shapes they derive
+freeze before the kernels are traced; passing a value the module did not import
+with is rejected rather than silently ignored.
+
+## Files
+
+| Group | Files |
+| --- | --- |
+| Full forward | [decode_fwd.py](../../../models/deepseek_v4_flash_dspark/decode_fwd.py), [prefill_fwd.py](../../../models/deepseek_v4_flash_dspark/prefill_fwd.py) |
+| Layer composition | [decode_layer.py](../../../models/deepseek_v4_flash_dspark/decode_layer.py), [prefill_layer.py](../../../models/deepseek_v4_flash_dspark/prefill_layer.py) |
+| DSpark drafter | [dspark_drafter.py](../../../models/deepseek_v4_flash_dspark/dspark_drafter.py), [dspark_attention.py](../../../models/deepseek_v4_flash_dspark/dspark_attention.py), [dspark_context_kv.py](../../../models/deepseek_v4_flash_dspark/dspark_context_kv.py) |
+| DSpark sampling | [dspark_markov.py](../../../models/deepseek_v4_flash_dspark/dspark_markov.py), [markov_head.py](../../../models/deepseek_v4_flash_dspark/markov_head.py) |
+| Decode attention orchestration | [decode_swa.py](../../../models/deepseek_v4_flash_dspark/decode_swa.py), [decode_csa.py](../../../models/deepseek_v4_flash_dspark/decode_csa.py), [decode_hca.py](../../../models/deepseek_v4_flash_dspark/decode_hca.py) |
+| Decode sparse attention | [decode_sparse_attn_swa.py](../../../models/deepseek_v4_flash_dspark/decode_sparse_attn_swa.py), [decode_sparse_attn_csa.py](../../../models/deepseek_v4_flash_dspark/decode_sparse_attn_csa.py), [decode_sparse_attn_hca.py](../../../models/deepseek_v4_flash_dspark/decode_sparse_attn_hca.py) |
+| Decode compressors and indexer | [decode_compressor_ratio4.py](../../../models/deepseek_v4_flash_dspark/decode_compressor_ratio4.py), [decode_compressor_ratio128.py](../../../models/deepseek_v4_flash_dspark/decode_compressor_ratio128.py), [decode_indexer.py](../../../models/deepseek_v4_flash_dspark/decode_indexer.py), [decode_indexer_compressor.py](../../../models/deepseek_v4_flash_dspark/decode_indexer_compressor.py) |
+| Prefill attention and cache | [prefill_swa.py](../../../models/deepseek_v4_flash_dspark/prefill_swa.py), [prefill_csa.py](../../../models/deepseek_v4_flash_dspark/prefill_csa.py), [prefill_hca.py](../../../models/deepseek_v4_flash_dspark/prefill_hca.py), [prefill_sparse_attn.py](../../../models/deepseek_v4_flash_dspark/prefill_sparse_attn.py), [prefill_compressor_ratio4.py](../../../models/deepseek_v4_flash_dspark/prefill_compressor_ratio4.py), [prefill_compressor_ratio128.py](../../../models/deepseek_v4_flash_dspark/prefill_compressor_ratio128.py), [prefill_indexer.py](../../../models/deepseek_v4_flash_dspark/prefill_indexer.py), [prefill_indexer_compressor.py](../../../models/deepseek_v4_flash_dspark/prefill_indexer_compressor.py) |
+| Output projection and CP transport | [decode_o_proj.py](../../../models/deepseek_v4_flash_dspark/decode_o_proj.py), [prefill_o_proj.py](../../../models/deepseek_v4_flash_dspark/prefill_o_proj.py), [decode_cp_allgather.py](../../../models/deepseek_v4_flash_dspark/decode_cp_allgather.py), [prefill_cp_token_allgather.py](../../../models/deepseek_v4_flash_dspark/prefill_cp_token_allgather.py) |
+| Shared transforms | [rmsnorm.py](../../../models/deepseek_v4_flash_dspark/rmsnorm.py), [qkv_proj_rope.py](../../../models/deepseek_v4_flash_dspark/qkv_proj_rope.py), [hc_pre.py](../../../models/deepseek_v4_flash_dspark/hc_pre.py), [hc_post.py](../../../models/deepseek_v4_flash_dspark/hc_post.py), [hc_head.py](../../../models/deepseek_v4_flash_dspark/hc_head.py), [rope_interleave.py](../../../models/deepseek_v4_flash_dspark/rope_interleave.py), [lookup_embedding.py](../../../models/deepseek_v4_flash_dspark/lookup_embedding.py) |
+| MoE and output | [moe.py](../../../models/deepseek_v4_flash_dspark/moe.py), [gate.py](../../../models/deepseek_v4_flash_dspark/gate.py), [expert_shared.py](../../../models/deepseek_v4_flash_dspark/expert_shared.py), [expert_routed.py](../../../models/deepseek_v4_flash_dspark/expert_routed.py), [lm_head.py](../../../models/deepseek_v4_flash_dspark/lm_head.py) |
+| Metadata and host helpers | [decode_prepare.py](../../../models/deepseek_v4_flash_dspark/decode_prepare.py), [prefill_metadata.py](../../../models/deepseek_v4_flash_dspark/prefill_metadata.py), [config.py](../../../models/deepseek_v4_flash_dspark/config.py), [utils.py](../../../models/deepseek_v4_flash_dspark/utils.py) |
+
+`config.py`, `utils.py`, `rope_interleave.py`, and `prefill_o_proj.py` have no
+`__main__` block: they are imported rather than run.

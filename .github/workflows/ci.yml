@@ -1,0 +1,654 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  pre-commit:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.10"
+      - uses: pre-commit/action@v3.0.0
+        with:
+          extra_args: --all-files
+
+  unit-tests:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.10"
+
+      - name: Cache pip packages
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/pip
+          key: ${{ runner.os }}-pip-unit-tests
+          restore-keys: |
+            ${{ runner.os }}-pip-
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install pytest
+          pip install torch --index-url https://download.pytorch.org/whl/cpu
+
+      - name: Run unit tests
+        run: pytest tests -v
+
+  detect-changes:
+    runs-on: ubuntu-latest
+    outputs:
+      has_changes: ${{ steps.check.outputs.has_changes }}
+      files: ${{ steps.check.outputs.files }}
+      run_qwen_serving_tests: ${{ steps.check.outputs.run_qwen_serving_tests }}
+      run_deepseek_serving_tests: ${{ steps.check.outputs.run_deepseek_serving_tests }}
+      run_dspark_serving_tests: ${{ steps.check.outputs.run_dspark_serving_tests }}
+      a5_files: ${{ steps.check.outputs.a5_files }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.10"
+      - id: check
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          echo "run_qwen_serving_tests=false" >> "$GITHUB_OUTPUT"
+          echo "run_deepseek_serving_tests=false" >> "$GITHUB_OUTPUT"
+          echo "run_dspark_serving_tests=false" >> "$GITHUB_OUTPUT"
+          echo "a5_files=" >> "$GITHUB_OUTPUT"
+
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            echo "has_changes=true" >> "$GITHUB_OUTPUT"
+            echo "files=" >> "$GITHUB_OUTPUT"
+            echo "Manual runs retain the full smoke suite."
+            exit 0
+          fi
+
+          if [ "${{ github.event_name }}" = "pull_request" ]; then
+            DIFF_RANGE="${{ github.event.pull_request.base.sha }}...${{ github.event.pull_request.head.sha }}"
+          else
+            BEFORE="${{ github.event.before }}"
+            if [ -z "$BEFORE" ] ||
+               [ "$BEFORE" = "0000000000000000000000000000000000000000" ] ||
+               ! git cat-file -e "$BEFORE^{commit}" 2>/dev/null ||
+               ! git merge-base --is-ancestor "$BEFORE" "${{ github.sha }}"; then
+              echo "has_changes=true" >> "$GITHUB_OUTPUT"
+              echo "files=" >> "$GITHUB_OUTPUT"
+              echo "Push base is unavailable; retaining the full smoke suite."
+              exit 0
+            fi
+            DIFF_RANGE="$BEFORE..${{ github.sha }}"
+          fi
+
+          CHANGED_FILES=$(git diff --name-only "$DIFF_RANGE")
+          # Map the raw diff to the runnable scripts CI must exercise:
+          #  - a changed models/ source file selects every runnable file that
+          #    (transitively) imports it, not just the file itself;
+          #  - runtime-affecting changes outside models/ select all examples;
+          #  - documentation-only paths select no simulator or device work.
+          # See .github/scripts/detect_changes.py for the rules.
+          FILES=$(printf '%s\n' "$CHANGED_FILES" | python .github/scripts/detect_changes.py)
+          if [ "${{ github.event_name }}" = "pull_request" ]; then
+            if [ -n "$FILES" ]; then
+              echo "has_changes=true" >> "$GITHUB_OUTPUT"
+            else
+              echo "has_changes=false" >> "$GITHUB_OUTPUT"
+            fi
+          else
+            # Main pushes retain the historical full examples smoke for every
+            # runtime-affecting change, including model paths intentionally
+            # excluded from the PR runner matrix.
+            RUNTIME_IMPACT=$(
+              printf '%s\n' "$CHANGED_FILES" |
+                python .github/scripts/detect_changes.py --runtime-impact
+            )
+            echo "has_changes=$RUNTIME_IMPACT" >> "$GITHUB_OUTPUT"
+          fi
+          echo "files=$FILES" >> "$GITHUB_OUTPUT"
+
+          # Serving e2e jobs are model-specific and expensive. CI-infra edits
+          # (.github/**) must not trigger them.
+          if [ "${{ github.event_name }}" = "pull_request" ] &&
+             printf '%s\n' "$CHANGED_FILES" | grep -qE '^models/qwen3_14b/'; then
+            echo "run_qwen_serving_tests=true" >> "$GITHUB_OUTPUT"
+          fi
+          if [ "${{ github.event_name }}" = "pull_request" ] &&
+             printf '%s\n' "$CHANGED_FILES" | grep -qE '^models/deepseek_v4_flash_mtp/'; then
+            echo "run_deepseek_serving_tests=true" >> "$GITHUB_OUTPUT"
+          fi
+          if [ "${{ github.event_name }}" = "pull_request" ] &&
+             printf '%s\n' "$CHANGED_FILES" | grep -qE '^models/deepseek_v4_flash_dspark/'; then
+            echo "run_dspark_serving_tests=true" >> "$GITHUB_OUTPUT"
+          fi
+          # A5 device entries are invisible to the runnable-file rules above,
+          # so they are selected separately: the same reverse-import closure,
+          # against the `# ci: a5` marker. A pull request runs the entries its
+          # own diff reaches and no others.
+          if [ "${{ github.event_name }}" = "pull_request" ]; then
+            A5_FILES=$(
+              printf '%s\n' "$CHANGED_FILES" |
+                python .github/scripts/detect_changes.py --a5-entries
+            )
+            echo "a5_files=$A5_FILES" >> "$GITHUB_OUTPUT"
+            echo "Selected A5 entries: $A5_FILES"
+          fi
+          echo "Selected files: $FILES"
+
+  sim:
+    needs: detect-changes
+    if: needs.detect-changes.outputs.has_changes == 'true'
+    # Simulator job: no device needed, so it runs on the CPU runner — but on the
+    # host, through the same setup-ci-job composite as the a2a3 device job (same
+    # user, same bundle venv + activate.sh, same ci-cache). needs-device:false is
+    # the only difference: no npu-smi check and no Ascend env, which the simulator
+    # does not use.
+    runs-on: [self-hosted, linux, arm64, cpu]
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        platform: [a2a3sim, a5sim]
+    defaults:
+      run:
+        working-directory: checkout
+    env:
+      PTOAS_ROOT: ${{ github.workspace }}/checkout/ptoas-bin
+      CMAKE_BUILD_PARALLEL_LEVEL: 16
+      CMAKE_C_COMPILER_LAUNCHER: ccache
+      CMAKE_CXX_COMPILER_LAUNCHER: ccache
+      CCACHE_MAXSIZE: 30G
+      # Shared with the a2a3 job; 000 keeps cache files mutually writable. Both
+      # jobs now run as ci-runner (no container root), but the dir still holds
+      # root-owned entries from the container era, so keep the umask.
+      # The cache *paths* are exported by setup-ci-job from the runner config's
+      # CI_CACHE_ROOT — a static job-level env: cannot see a step's output.
+      CCACHE_UMASK: '000'
+
+    steps:
+      - name: Fetch composite action definitions
+        # Local `uses: ./.github/actions/...` resolves against $GITHUB_WORKSPACE,
+        # but this job checks the repo out into ./checkout — sparse-fetch just
+        # the action defs at the workspace root first (clean: false leaves sibling
+        # subdir checkouts on this persistent runner untouched).
+        uses: actions/checkout@v4
+        with:
+          sparse-checkout: .github/actions
+          clean: false
+          persist-credentials: false
+
+      - name: Setup CI job
+        uses: ./.github/actions/setup-ci-job
+        with:
+          checkout-path: checkout
+          needs-device: 'false'
+          build-namespace: ${{ matrix.platform }}
+          pip-cache-name: pip-sim
+          toolchain: bundle
+
+      - name: Run ${{ matrix.platform }} tests
+        shell: bash
+        env:
+          PYTHONPATH: ${{ github.workspace }}/checkout
+        run: |
+          source activate.sh
+          set +e
+          if [ "${{ github.event_name }}" = "pull_request" ]; then
+            FILES="${{ needs.detect-changes.outputs.files }}"
+          else
+            FILES=$(find examples -name '*.py' ! -name '*_draft.py' | sort)
+          fi
+          # a5sim carries examples only. Models are validated on a2a3 and
+          # a2a3sim; A5 model coverage is the a5-v41-flash job below for the
+          # V4.1-Flash entries this change reaches, and the daily
+          # model-tests-a5 sweep for all of them.
+          if [ "${{ matrix.platform }}" = "a5sim" ]; then
+            FILES=$(printf '%s\n' $FILES | grep '^examples/' || true)
+          fi
+          if [ -z "$FILES" ]; then
+            echo "No runnable changed files; nothing to test."
+            exit 0
+          fi
+          failed=()
+          for f in $FILES; do
+            echo "::group::$f"
+            # Files marked `# ci: no-sim` (full multi-layer / multi-card
+            # forwards) are device-only and would just argparse-reject *sim.
+            if grep -qE '^#\s*ci:\s*no-sim' "$f"; then
+              echo "skip (no-sim): $f"
+              echo "::endgroup::"
+              continue
+            fi
+            if ! python "$f" -p ${{ matrix.platform }}; then
+              failed+=("$f")
+              echo "::error file=${f}::FAIL"
+            fi
+            echo "::endgroup::"
+          done
+          if [ ${#failed[@]} -ne 0 ]; then
+            printf 'FAILED: %s\n' "${failed[@]}"
+            exit 1
+          fi
+          echo "All selected files passed."
+
+      - name: Clean up build artifacts
+        if: always()
+        run: rm -rf build_output
+
+  a2a3:
+    needs: detect-changes
+    if: needs.detect-changes.outputs.has_changes == 'true'
+    # Runs directly on the host like pypto's dist-system-tests — multi-card
+    # kernels use HCCL, which needs a host-only env (set_env.sh, HCCL plugin
+    # paths); under docker the chip child silent-crashes in comm_init. It holds
+    # NO card: every device run is wrapped in `task-submit --device "$DEVICE_ID"`
+    # (mechanism B), which borrows a card (or an N-card set for the multi-card
+    # `# ci: devices=N` files) from the host-level device queue and passes the
+    # lent set as $TASK_DEVICE. The backend controls whether DEVICE_ID is `auto`
+    # (borrow any free card) or a fixed card id. Checkout / install happen under
+    # ./checkout rather than at the workspace root, so the root holds only the
+    # sparsely-fetched action defs and any second repo a job needs (serving's
+    # pypto-serving) sits beside this one instead of inside it.
+    runs-on: [self-hosted, linux, arm64, npu]
+    # Must exceed a single task-submit's worst case (--timeout 3600 queue wait +
+    # --max-time 600 run), or the job dies before task-submit's own timeout can
+    # ever fire — and the first queued case would eat the whole job budget.
+    timeout-minutes: 120
+    defaults:
+      run:
+        working-directory: checkout
+    env:
+      PTOAS_ROOT: ${{ github.workspace }}/checkout/ptoas-bin
+      CMAKE_BUILD_PARALLEL_LEVEL: 16
+      CMAKE_C_COMPILER_LAUNCHER: ccache
+      CMAKE_CXX_COMPILER_LAUNCHER: ccache
+      CCACHE_MAXSIZE: 30G
+      # Shared with the sim job via the same ci-cache dir; 000 keeps cache files
+      # mutually writable. Both jobs now run as ci-runner, but the dir still holds
+      # root-owned entries from the container era, so keep the umask.
+      # The cache *paths* are exported by setup-ci-job from the runner config's
+      # CI_CACHE_ROOT — a static job-level env: cannot see a step's output.
+      CCACHE_UMASK: '000'
+
+    steps:
+      - name: Fetch composite action definitions
+        # Local `uses: ./.github/actions/...` resolves against $GITHUB_WORKSPACE,
+        # but this job checks the repo out into ./checkout — sparse-fetch just
+        # the action defs at the workspace root first (clean: false leaves sibling
+        # subdir checkouts on this persistent runner untouched).
+        uses: actions/checkout@v4
+        with:
+          sparse-checkout: .github/actions
+          clean: false
+          persist-credentials: false
+
+      - name: Setup CI job
+        uses: ./.github/actions/setup-ci-job
+        with:
+          checkout-path: checkout
+          needs-device: 'true'
+          build-namespace: a2a3
+          pip-cache-name: pip-a2a3
+          toolchain: bundle
+
+      - name: Run a2a3 tests (via task-submit)
+        shell: bash
+        run: |
+          source activate.sh
+          set +e
+          if [ "${{ github.event_name }}" = "pull_request" ]; then
+            FILES="${{ needs.detect-changes.outputs.files }}"
+          else
+            FILES=$(find examples -name '*.py' ! -name '*_draft.py' | sort)
+          fi
+          if [ -z "$FILES" ]; then
+            echo "No runnable changed files; nothing to test."
+            exit 0
+          fi
+          failed=()
+          for f in $FILES; do
+            echo "::group::$f"
+            # Files needing multiple NPUs declare `# ci: devices=N` (N>1) near
+            # the top; borrow that many cards with `--device-num N` (defaults to
+            # ep2 / 2-card runs). $TASK_DEVICE is the lent set (a single id, or
+            # comma-separated for N>1) and is passed straight to -d. Higher
+            # world sizes (ep4/ep8) are exercised as explicit --device-num 4/8
+            # steps in daily_ci.yml.
+            ndev=$(grep -oP '#\s*ci:\s*devices=\K[0-9]+' "$f" | head -1)
+            ndev=${ndev:-1}
+            devnum_flag=""
+            [ "$ndev" -gt 1 ] && devnum_flag="--device-num $ndev"
+            task-submit --device "$DEVICE_ID" $devnum_flag --timeout 3600 --max-time 600 \
+              --run "cd $GITHUB_WORKSPACE/checkout && source activate.sh && PYTHONPATH=$GITHUB_WORKSPACE/checkout python $f -p a2a3 -d \$TASK_DEVICE"
+            if [ $? -ne 0 ]; then
+              failed+=("$f")
+              echo "::error file=${f}::FAIL"
+            fi
+            echo "::endgroup::"
+          done
+          if [ ${#failed[@]} -ne 0 ]; then
+            printf 'FAILED: %s\n' "${failed[@]}"
+            exit 1
+          fi
+          echo "All selected files passed."
+
+      - name: Kill orphaned task-submit tasks
+        if: always()
+        uses: ./.github/actions/kill-orphaned-tasks
+        with:
+          checkout-path: checkout
+
+      - name: Clean up build artifacts
+        if: always()
+        working-directory: checkout
+        run: rm -rf build_output
+
+  a5-v41-flash:
+    needs: detect-changes
+    # Real Ascend 950 (A5) coverage for the implemented V4.1-Flash attention
+    # operators. They are A5-only and hide the `__main__` sentinel so the a2a3
+    # and sim sweeps never pick them up; detect-changes selects them by the
+    # `# ci: a5` marker instead, and only the ones this pull request's own
+    # change reaches; the nightly model-tests-a5 sweeps the whole set.
+    if: >-
+      github.event_name == 'pull_request' &&
+      needs.detect-changes.outputs.a5_files != ''
+    runs-on: [self-hosted, linux, npu-a5]
+    # Cases run one after another: every entry selected takes about an hour
+    # (63 cases), and this leaves room for one task-submit worst case
+    # (--timeout 3600 queue wait + --max-time 900 run) on top.
+    timeout-minutes: 180
+    defaults:
+      run:
+        working-directory: checkout
+    env:
+      PTOAS_ROOT: ${{ github.workspace }}/checkout/ptoas-bin
+      CMAKE_BUILD_PARALLEL_LEVEL: 16
+
+    steps:
+      - name: Fetch composite action definitions
+        uses: actions/checkout@v4
+        with:
+          sparse-checkout: .github/actions
+          clean: false
+          persist-credentials: false
+
+      - name: Setup CI job
+        uses: ./.github/actions/setup-ci-job
+        with:
+          checkout-path: checkout
+          needs-device: 'true'
+          # Its own build tree: this can run while the nightly a5-daily job is
+          # building, and concurrent jobs must not share a build namespace.
+          build-namespace: a5-ci
+          pip-cache-name: pip-a5
+          toolchain: bundle
+          # PyPTO follows the shared default like every other job. torch does
+          # not: these entries need `float8_e8m0fnu`, the MXFP8 scale dtype,
+          # added in 2.7 — a shim is not an option because pypto maps that IR
+          # dtype through its own table and the golden runner then compares
+          # the two for equality.
+          torch-version: 'torch==2.10.0'
+
+      - name: Run V4.1-Flash operators (a5, via task-submit)
+        shell: bash
+        env:
+          PYPTO_LOG_LEVEL: error
+          PYPTO_WARNING_LEVEL: none
+          PYPTO_RUNTIME_LOG: error
+        run: |
+          source activate.sh
+          set +e
+          # Chosen by detect-changes from this pull request's diff. A new
+          # operator joins by carrying `# ci: a5`; nothing here needs editing.
+          CASES="${{ needs.detect-changes.outputs.a5_files }}"
+          echo "Entries selected for this change:" $CASES
+          failed=()
+          for f in $CASES; do
+            # Every --tp/--dp/--ep combination the entry accepts is one
+            # case, and the card count is the world it asks for
+            # (.github/scripts/a5_parallel_cases.py).
+            # Only this change's entries run, so multi-card cases may borrow
+            # past this runner's device whitelist.
+            if ! matrix=$(PYTHONPATH=$GITHUB_WORKSPACE/checkout python .github/scripts/a5_parallel_cases.py "$f"); then
+              failed+=("$f")
+              echo "::error file=${f}::cannot read its --tp/--dp/--ep choices"
+              continue
+            fi
+            while read -r cards args; do
+              echo "::group::$f $args"
+              devnum_flag=""
+              [ "$cards" -gt 1 ] && devnum_flag="--device-num $cards --ignore-whitelist"
+              task-submit --device "$DEVICE_ID" $devnum_flag --timeout 3600 --max-time 900 \
+                --run "cd $GITHUB_WORKSPACE/checkout && source activate.sh && PYTHONPATH=$GITHUB_WORKSPACE/checkout python $f -p a5 $args -d \$TASK_DEVICE" < /dev/null
+              if [ $? -ne 0 ]; then
+                failed+=("$f $args")
+                echo "::error file=${f}::FAIL ($args)"
+              fi
+              echo "::endgroup::"
+            done <<< "$matrix"
+          done
+          if [ ${#failed[@]} -ne 0 ]; then
+            printf 'FAILED: %s\n' "${failed[@]}"
+            exit 1
+          fi
+          echo "Passed:" $CASES
+
+      - name: Kill orphaned task-submit tasks
+        if: always()
+        uses: ./.github/actions/kill-orphaned-tasks
+        with:
+          checkout-path: checkout
+
+      - name: Clean up build artifacts
+        if: always()
+        working-directory: checkout
+        run: rm -rf build_output
+
+  serving-qwen:
+    needs: detect-changes
+    # PR-only, qwen3-14b (single card). The 8-card DeepSeek V4 run is split into
+    # its own job (serving-deepseek) so the two models schedule independently and
+    # the expensive 8-card borrow does not serialize behind the single-card run.
+    if: >-
+      github.event_name == 'pull_request' &&
+      needs.detect-changes.outputs.run_qwen_serving_tests == 'true'
+    runs-on: [self-hosted, linux, arm64, npu]
+    # One task-submit worst case: --timeout 3600 queue + --max-time 1800 run,
+    # plus setup/build headroom.
+    timeout-minutes: 120
+    env:
+      PTOAS_ROOT: ${{ github.workspace }}/checkout/ptoas-bin
+      CMAKE_BUILD_PARALLEL_LEVEL: 16
+      CMAKE_C_COMPILER_LAUNCHER: ccache
+      CMAKE_CXX_COMPILER_LAUNCHER: ccache
+      CCACHE_MAXSIZE: 30G
+      # The cache paths are exported by setup-ci-job from the runner config's
+      # CI_CACHE_ROOT — a static job-level env: cannot see a step's output.
+      CCACHE_UMASK: '000'
+
+    steps:
+      - name: Fetch composite action definitions
+        uses: actions/checkout@v4
+        with:
+          sparse-checkout: .github/actions
+          clean: false
+          persist-credentials: false
+
+      - name: Setup CI job
+        uses: ./.github/actions/setup-ci-job
+        with:
+          checkout-path: checkout
+          needs-device: 'true'
+          build-namespace: serving
+          toolchain: bundle
+          # pypto-serving's NPU runners call torch.npu.mem_get_info.
+          install-torch-npu: 'true'
+          # Own ccache: serving's churn must not LRU-evict the a2a3/sim entries.
+          ccache-name: ccache-serving
+          pip-cache-name: pip-serving
+
+      - name: Run pypto-serving Qwen3-14B tests
+        uses: ./.github/actions/pypto-serving-tests
+        with:
+          pypto-lib-checkout-path: checkout
+          pypto-serving-checkout-path: serving-checkout
+          model-name: qwen3-14b
+
+      - name: Kill orphaned task-submit tasks
+        if: always()
+        uses: ./.github/actions/kill-orphaned-tasks
+        with:
+          checkout-path: checkout
+
+      - name: Clean up build artifacts
+        if: always()
+        run: rm -rf serving-checkout/build_output
+
+  serving-deepseek:
+    needs: detect-changes
+    # PR-only, DeepSeek V4 — the 8-card (--device-num 8) serving run, split out
+    # of `serving-qwen` so the 8-card borrow schedules independently of the
+    # single-card run. Same setup contract; gated by its own model guard.
+    if: >-
+      github.event_name == 'pull_request' &&
+      needs.detect-changes.outputs.run_deepseek_serving_tests == 'true'
+    runs-on: [self-hosted, linux, arm64, npu]
+    # One task-submit worst case: --timeout 3600 queue + --max-time 1800 run,
+    # plus setup/build headroom.
+    timeout-minutes: 120
+    env:
+      PTOAS_ROOT: ${{ github.workspace }}/checkout/ptoas-bin
+      CMAKE_BUILD_PARALLEL_LEVEL: 16
+      CMAKE_C_COMPILER_LAUNCHER: ccache
+      CMAKE_CXX_COMPILER_LAUNCHER: ccache
+      CCACHE_MAXSIZE: 30G
+      # The cache paths are exported by setup-ci-job from the runner config's
+      # CI_CACHE_ROOT — a static job-level env: cannot see a step's output.
+      CCACHE_UMASK: '000'
+
+    steps:
+      - name: Fetch composite action definitions
+        uses: actions/checkout@v4
+        with:
+          sparse-checkout: .github/actions
+          clean: false
+          persist-credentials: false
+
+      - name: Setup CI job
+        uses: ./.github/actions/setup-ci-job
+        with:
+          checkout-path: checkout
+          needs-device: 'true'
+          build-namespace: serving
+          toolchain: bundle
+          # pypto-serving's NPU runners call torch.npu.mem_get_info.
+          install-torch-npu: 'true'
+          # Share serving's dedicated ccache so a2a3/sim entries are not evicted.
+          ccache-name: ccache-serving
+          pip-cache-name: pip-serving
+
+      - name: Run pypto-serving DeepSeek V4 tests
+        uses: ./.github/actions/pypto-serving-tests
+        with:
+          pypto-lib-checkout-path: checkout
+          pypto-serving-checkout-path: serving-checkout
+          model-name: deepseek-v4
+          # Only the fused K=1 case runs on device: the k3-s4-b4 case starts a
+          # second 8-card server for the same gate.
+          deepseek-mtp-cases: k1
+
+      - name: Kill orphaned task-submit tasks
+        if: always()
+        uses: ./.github/actions/kill-orphaned-tasks
+        with:
+          checkout-path: checkout
+
+      - name: Clean up build artifacts
+        if: always()
+        run: rm -rf serving-checkout/build_output
+
+  serving-dspark:
+    needs: detect-changes
+    # PR-only, DSpark (deepseek_v4_flash_dspark) — the 8-card EP8 (--device-num 8)
+    # serving run of the one-server speculative K=7 case (greedy generation plus
+    # grouped prefix cache on a single caching-enabled server), split out like
+    # serving-deepseek so the expensive 8-card borrow schedules independently.
+    # Same setup contract; gated by its own model guard.
+    if: >-
+      github.event_name == 'pull_request' &&
+      needs.detect-changes.outputs.run_dspark_serving_tests == 'true'
+    runs-on: [self-hosted, linux, arm64, npu]
+    # One task-submit worst case: --timeout 3600 queue + --max-time 2400 run
+    # (the K=7 boot compiles the fused one-L2 decode entry on top of the weight
+    # upload), plus setup/build headroom.
+    timeout-minutes: 135
+    env:
+      PTOAS_ROOT: ${{ github.workspace }}/checkout/ptoas-bin
+      CMAKE_BUILD_PARALLEL_LEVEL: 16
+      CMAKE_C_COMPILER_LAUNCHER: ccache
+      CMAKE_CXX_COMPILER_LAUNCHER: ccache
+      CCACHE_MAXSIZE: 30G
+      # The cache paths are exported by setup-ci-job from the runner config's
+      # CI_CACHE_ROOT — a static job-level env: cannot see a step's output.
+      CCACHE_UMASK: '000'
+
+    steps:
+      - name: Fetch composite action definitions
+        uses: actions/checkout@v4
+        with:
+          sparse-checkout: .github/actions
+          clean: false
+          persist-credentials: false
+
+      - name: Setup CI job
+        uses: ./.github/actions/setup-ci-job
+        with:
+          checkout-path: checkout
+          needs-device: 'true'
+          build-namespace: serving
+          toolchain: bundle
+          # pypto-serving's NPU runners call torch.npu.mem_get_info.
+          install-torch-npu: 'true'
+          # Share serving's dedicated ccache so a2a3/sim entries are not evicted.
+          ccache-name: ccache-serving
+          pip-cache-name: pip-serving
+
+      - name: Run pypto-serving DSpark tests
+        uses: ./.github/actions/pypto-serving-tests
+        with:
+          pypto-lib-checkout-path: checkout
+          pypto-serving-checkout-path: serving-checkout
+          model-name: deepseek-dspark
+          # Only the K=7 case runs on device: the K=0 case starts a second
+          # 8-card server for the same gate.
+          deepseek-dspark-cases: k7
+
+      - name: Kill orphaned task-submit tasks
+        if: always()
+        uses: ./.github/actions/kill-orphaned-tasks
+        with:
+          checkout-path: checkout
+
+      - name: Clean up build artifacts
+        if: always()
+        run: rm -rf serving-checkout/build_output

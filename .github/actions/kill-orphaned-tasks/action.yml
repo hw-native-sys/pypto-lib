@@ -1,0 +1,62 @@
+name: Kill orphaned task-submit tasks
+description: >-
+  Kill the task-submit tasks THIS job submitted, matched by its checkout dir.
+  If a job is cancelled (cancel-in-progress on a new push) or killed mid-flight,
+  its task-submit tasks keep running server-side (detached, reattachable via
+  `task-submit --wait`) and hold a card shared with other repos/jobs on the host
+  until --max-time bounds them. Matching by the job's checkout dir (embedded in
+  every --run) means two jobs sharing a workspace root never kill each other's
+  tasks. Call this with `if: always()` so it runs even on cancellation.
+
+inputs:
+  checkout-path:
+    description: This job's workspace-relative checkout dir (embedded in every --run).
+    required: true
+
+runs:
+  using: composite
+  steps:
+    - name: Kill orphaned task-submit tasks
+      shell: bash
+      # Pass checkout-path via env rather than inlining ${{ }} into the script,
+      # so a path with spaces or shell metacharacters can't break or inject.
+      env:
+        CHECKOUT_PATH: ${{ inputs.checkout-path }}
+      run: |
+        # Guard against an empty checkout-path: an empty pattern matches every
+        # task on a shared workspace root and would kill other jobs' tasks.
+        # checkout-path is a required input, but fail safe rather than sorry if
+        # a caller ever passes an empty string.
+        if [ -z "$CHECKOUT_PATH" ]; then
+          echo "checkout-path is empty — skipping task-submit cleanup"
+          exit 0
+        fi
+
+        target="$GITHUB_WORKSPACE/$CHECKOUT_PATH"
+        echo "cleaning up task-submit tasks for $target"
+
+        # Match with `--find`, NOT `--list`: --list is a human-facing view that
+        # truncates the command column to 77 chars, so a grep for the full
+        # checkout path never matched and this cleanup silently did nothing for
+        # months. --find matches against the untruncated COMMAND and prints bare
+        # task-ids. It needs task-submit >= 2026-07-14 on the runner.
+        if ! ids=$(task-submit --find "$target"); then
+          echo "::error::task-submit --find failed — is task-submit up to date on this runner?"
+          exit 1
+        fi
+
+        if [ -z "$ids" ]; then
+          echo "  no orphaned tasks"
+          exit 0
+        fi
+
+        # Report what we killed. A cleanup step that prints nothing is
+        # indistinguishable from a cleanup step that is quietly broken.
+        n=0
+        while read -r tid; do
+          [ -n "$tid" ] || continue
+          echo "  killing $tid"
+          task-submit --kill "$tid" || echo "::warning::failed to kill $tid"
+          n=$((n + 1))
+        done <<< "$ids"
+        echo "killed $n orphaned task(s)"

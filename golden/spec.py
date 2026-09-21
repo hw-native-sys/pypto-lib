@@ -1,0 +1,363 @@
+# Copyright (c) PyPTO Contributors.
+# This program is free software, you can redistribute it and/or modify it under the terms and conditions of
+# CANN Open Software License Agreement Version 2.0 (the "License").
+# Please refer to the License for details. You may not use this file except in compliance with the License.
+# THIS SOFTWARE IS PROVIDED ON AN "AS IS" BASIS, WITHOUT WARRANTIES OF ANY KIND, EITHER EXPRESS OR IMPLIED,
+# INCLUDING BUT NOT LIMITED TO NON-INFRINGEMENT, MERCHANTABILITY, OR FITNESS FOR A PARTICULAR PURPOSE.
+# See LICENSE in the root of the software repository for the full text of the License.
+# -----------------------------------------------------------------------------------------------------------
+
+"""Specifications for runtime inputs of the golden testing harness.
+
+Two kinds of specifications are supported:
+
+- :class:`TensorSpec` — describes a ``torch.Tensor`` argument (shape, dtype,
+  initialization strategy, output flag).
+- :class:`ScalarSpec` — describes a scalar argument matching a ``pl.Scalar``
+  parameter on the orchestration function.  Encodes Python values into the
+  ``ctypes._SimpleCData`` form expected by ``pypto.runtime.execute_compiled``.
+"""
+
+from __future__ import annotations
+
+import ctypes
+from collections.abc import Callable
+from dataclasses import dataclass, field
+from typing import Any
+
+import torch
+
+
+@dataclass
+class TensorSpec:
+    """Specification for a runtime tensor.
+
+    Attributes:
+        name: Tensor name, matching the orchestration function's parameter name.
+        shape: Tensor shape as a list of integers.
+        dtype: PyTorch dtype (e.g. ``torch.float32``, ``torch.bfloat16``).
+        init_value: Initial value strategy.  Can be:
+
+            - ``None`` — zero-initialised.
+            - ``int`` or ``float`` — every element set to this constant.
+            - ``torch.Tensor`` — use this tensor directly (must have matching shape/dtype).
+            - ``Callable`` — a no-argument callable that returns a ``torch.Tensor``, or
+              one of the supported ``torch`` factory functions
+              (``torch.randn``, ``torch.rand``, ``torch.zeros``, ``torch.ones``)
+              that will be called with ``(shape, dtype=dtype)``.
+
+            The value is the tensor's initial host content and nothing else.
+            The runtime does not upload a pure ``Out`` parameter's host buffer
+            (see ``docs/pypto-coding/l2-programming.md``), so an
+            ``init_value`` there reaches only the golden reference.
+        resident: Keep this tensor device-resident (``child_memory``): the harness
+            uploads inputs once and reuses them across the validation dispatch and every
+            benchmark round, skipping the per-dispatch host→device upload and
+            device→host readback. Only supported for L3 distributed programs.
+            A pure ``Out`` resident is allocated uninitialized; its zero-filled
+            host placeholder is not uploaded. Declare the parameter ``Out`` or
+            ``InOut`` for either a pure output or a read-write **resident state buffer**
+            (e.g. a KV cache): an ``InOut`` state is uploaded once from
+            ``init_value``, both kinds are updated on-device, and they are read
+            back **once** at the end (via ``copy_stacked_from`` / ``copy_from``)
+            when golden validation is enabled.
+            Values:
+
+            - ``None`` / ``False`` — not resident (default).
+            - an ``int`` worker id (``0``, ``1``, …) — whole-tensor resident on
+              that card (via ``alloc_tensor``). The id MUST be the worker whose
+              kernel consumes this parameter (the ``device=`` it is dispatched
+              to). Use for a parameter consumed as a whole on one card (e.g. a
+              replicated weight only rank ``k`` reads, or single-card / EP-1 L3).
+              ``resident=0`` explicitly means "whole-tensor on card 0".
+            - ``"stacked"`` — leading-dim sharded per rank (via
+              ``alloc_stacked_tensor``): shard ``i`` of a ``[world_size, *tail]``
+              parameter is uploaded to card ``i``. Use for the canonical
+              ``for r in range(world_size): child(x[r], device=r)`` program, where
+              each rank's slice must reside on the card that consumes it.
+
+            ``True`` is rejected as ambiguous — pass an int worker id instead.
+        direction: ``"in"`` / ``"out"`` / ``"inout"``, stamped by the harness
+            from the compiled artifact's ``ParamDirection`` before any tensor is
+            allocated. Not an init argument: the kernel signature owns the
+            direction, and reading :attr:`is_output` / :attr:`is_input` before
+            the stamp raises.
+
+    Example:
+        >>> import torch
+        >>> TensorSpec("query", [32, 128], torch.bfloat16, init_value=torch.randn)
+        >>> TensorSpec("out", [32, 128], torch.float32)  # direction comes from the artifact
+        >>> TensorSpec("wq_a", [2, 4096, 1536], torch.bfloat16, init_value=torch.randn, resident="stacked")
+        >>> TensorSpec("bias", [128], torch.float32, init_value=torch.randn, resident=1)  # whole on card 1
+    """
+
+    name: str
+    shape: list[int]
+    dtype: torch.dtype
+    init_value: int | float | torch.Tensor | Callable | None = field(default=None)
+    resident: int | str | bool | None = None
+    direction: str | None = field(default=None, init=False, repr=False, compare=False)
+
+    def __post_init__(self) -> None:
+        # Validate the ``resident`` mode. A resident output is allowed:
+        # a read-write resident state buffer (e.g. a KV cache) uploaded once,
+        # updated in place on-device across dispatches, and read back once at the
+        # end for validation.
+        r = self.resident
+        if r is None or r is False or r == "stacked":
+            pass
+        elif isinstance(r, bool):  # r is True — bool is an int subclass, check before int
+            raise ValueError(
+                f"TensorSpec {self.name!r}: resident=True is ambiguous; pass an int worker id "
+                f'(e.g. resident=0 for whole-tensor on card 0) or resident="stacked".'
+            )
+        elif isinstance(r, int):
+            if r < 0:
+                raise ValueError(
+                    f"TensorSpec {self.name!r}: resident worker id must be >= 0, got {r}."
+                )
+        else:
+            raise ValueError(
+                f"TensorSpec {self.name!r}: resident must be None/False (off), an int worker id "
+                f'(whole-tensor resident on that card), or "stacked" (leading-dim sharded); '
+                f"got {r!r}."
+            )
+
+    def _stamped_direction(self) -> str:
+        """The artifact-stamped direction; reading it before the stamp is a bug."""
+        if self.direction is None:
+            raise RuntimeError(
+                f"TensorSpec {self.name!r}: direction not stamped -- the compiled "
+                f"artifact's parameter metadata has not been inspected yet"
+            )
+        return self.direction
+
+    @property
+    def is_output(self) -> bool:
+        """True if the compiled parameter is written by the kernel (``Out`` / ``InOut``)."""
+        return self._stamped_direction() in ("out", "inout")
+
+    @property
+    def is_input(self) -> bool:
+        """True if the host tensor's initial content is input data (``In`` / ``InOut``).
+
+        Overlaps :attr:`is_output` on ``InOut``, mirroring ``ParamDirection``.
+        """
+        return self._stamped_direction() in ("in", "inout")
+
+    @property
+    def is_resident(self) -> bool:
+        """True if this spec is device-resident in any mode (int worker id or ``"stacked"``)."""
+        return self.resident is not None and self.resident is not False
+
+    def create_tensor(self) -> torch.Tensor:
+        """Create and return a ``torch.Tensor`` based on this specification.
+
+        Returns:
+            Initialised tensor with the requested shape and dtype.
+        """
+        if self.init_value is None:
+            return torch.zeros(self.shape, dtype=self.dtype)
+        if isinstance(self.init_value, (int, float)):
+            return torch.full(self.shape, self.init_value, dtype=self.dtype)
+        if isinstance(self.init_value, torch.Tensor):
+            return self.init_value.to(dtype=self.dtype)
+        if callable(self.init_value):
+            # Support the standard torch factory functions used as callables
+            fn = self.init_value
+            if fn in (torch.randn, torch.rand, torch.zeros, torch.ones):
+                return fn(self.shape, dtype=self.dtype)
+            # Generic callable: call with no arguments, then cast
+            result: Any = fn()
+            return torch.as_tensor(result, dtype=self.dtype)
+        raise TypeError(f"Unsupported init_value type {type(self.init_value)!r} for tensor {self.name!r}")
+
+
+# ---------------------------------------------------------------------------
+# ScalarSpec
+# ---------------------------------------------------------------------------
+
+# Per-int torch.dtype: (ctypes type, lo, hi).  fp16/bf16 are handled separately
+# since Python ctypes has no native half-precision type.
+_INT_TABLE: dict[torch.dtype, tuple[type, int, int]] = {
+    torch.int8:  (ctypes.c_int8,  -(1 << 7),  (1 << 7) - 1),
+    torch.int32: (ctypes.c_int32, -(1 << 31), (1 << 31) - 1),
+    torch.int64: (ctypes.c_int64, -(1 << 63), (1 << 63) - 1),
+    torch.uint8: (ctypes.c_uint8, 0,          (1 << 8) - 1),
+}
+
+_HALF_DTYPES: tuple[torch.dtype, ...] = (torch.float16, torch.bfloat16)
+
+SUPPORTED_SCALAR_DTYPES: tuple[torch.dtype, ...] = (
+    *_INT_TABLE.keys(),
+    torch.bool,
+    torch.float32,
+    *_HALF_DTYPES,
+)
+
+
+def _validate_primitive(name: str, dtype: torch.dtype, value: Any) -> None:
+    """Type/range validation for a python-primitive *value* against *dtype*.
+
+    Called from :meth:`ScalarSpec.__post_init__` when the user passes an int /
+    float / bool; for ``torch.Tensor`` inputs the dtype is already canonical
+    and only ndim/dtype consistency is checked.
+    """
+    if dtype in _INT_TABLE:
+        # bool is an int subclass — reject explicitly so dtype is unambiguous
+        if isinstance(value, bool) or not isinstance(value, int):
+            raise ValueError(
+                f"ScalarSpec {name!r} dtype={dtype} requires int value, got {type(value).__name__}"
+            )
+        _, lo, hi = _INT_TABLE[dtype]
+        if not lo <= value <= hi:
+            raise ValueError(
+                f"ScalarSpec {name!r} value {value} out of range for {dtype} [{lo}, {hi}]"
+            )
+        return
+    if dtype is torch.bool:
+        if not isinstance(value, bool):
+            raise ValueError(
+                f"ScalarSpec {name!r} dtype=torch.bool requires bool value, got {type(value).__name__}"
+            )
+        return
+    if dtype is torch.float32 or dtype in _HALF_DTYPES:
+        if isinstance(value, bool) or not isinstance(value, (int, float)):
+            raise ValueError(
+                f"ScalarSpec {name!r} dtype={dtype} requires int or float value, got {type(value).__name__}"
+            )
+        return
+    raise ValueError(
+        f"ScalarSpec {name!r}: unsupported dtype {dtype!r}; "
+        f"expected one of {list(SUPPORTED_SCALAR_DTYPES)}"
+    )
+
+
+@dataclass
+class ScalarSpec:
+    """Specification for a scalar runtime argument.
+
+    Attributes:
+        name: Scalar name, matching the orchestration function's ``pl.Scalar``
+            parameter name.
+        dtype: PyTorch dtype, mirroring :class:`TensorSpec`.  Must be one of
+            :data:`SUPPORTED_SCALAR_DTYPES`: ``torch.int8``, ``torch.int32``,
+            ``torch.int64``, ``torch.uint8``, ``torch.bool``, ``torch.float32``,
+            ``torch.float16``, ``torch.bfloat16``.
+        value: Constructor accepts ``int`` / ``float`` / ``bool`` (validated
+            and coerced) or a 0-dim ``torch.Tensor`` whose dtype matches
+            *dtype* (used directly).  After ``__post_init__`` runs, ``value``
+            is **always** a 0-dim ``torch.Tensor`` carrying the dtype-precise
+            representation, so cache I/O is just ``torch.save`` / ``torch.load``.
+        compile_runtime: Whether :func:`golden.run` must leave this scalar
+            unspecialized in the compiled artifact.  Marked scalars are passed
+            to ``JITFunction.compile`` as ``pl.RUNTIME`` and remain real
+            runtime ABI parameters.  This flag has no effect on the direct
+            :func:`golden.run` path, whose input is already an IR program.
+        benchmark_step: Optional additive step for repeated benchmark
+            dispatches.  Dispatch ``i`` receives ``value + i * benchmark_step``
+            (including warmup dispatches); ``None`` keeps the scalar constant.
+            This is intended for persistent-window epochs and is unsupported
+            by the L2 benchmark path.
+
+    Example:
+        >>> ScalarSpec("alpha", torch.float32, 0.125)
+        >>> ScalarSpec("seq_len", torch.int32, 4096)
+        >>> ScalarSpec(
+        ...     "epoch_base", torch.int32, 0,
+        ...     compile_runtime=True, benchmark_step=43,
+        ... )
+    """
+
+    name: str
+    dtype: torch.dtype
+    value: int | float | bool | torch.Tensor
+    compile_runtime: bool = False
+    benchmark_step: int | float | None = None
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.compile_runtime, bool):
+            raise ValueError(
+                f"ScalarSpec {self.name!r}: compile_runtime must be a bool, "
+                f"got {type(self.compile_runtime).__name__}"
+            )
+        if self.dtype not in SUPPORTED_SCALAR_DTYPES:
+            raise ValueError(
+                f"ScalarSpec {self.name!r}: unsupported dtype {self.dtype!r}; "
+                f"expected one of {list(SUPPORTED_SCALAR_DTYPES)}"
+            )
+        if self.benchmark_step is not None:
+            if self.dtype is torch.bool:
+                raise ValueError(
+                    f"ScalarSpec {self.name!r}: benchmark_step is unsupported for torch.bool"
+                )
+            _validate_primitive(
+                f"{self.name} benchmark_step", self.dtype, self.benchmark_step
+            )
+        if isinstance(self.value, torch.Tensor):
+            if self.value.ndim != 0:
+                raise ValueError(
+                    f"ScalarSpec {self.name!r}: value tensor must be 0-dim, "
+                    f"got shape {tuple(self.value.shape)}"
+                )
+            if self.value.dtype != self.dtype:
+                raise ValueError(
+                    f"ScalarSpec {self.name!r}: value tensor dtype {self.value.dtype} "
+                    f"does not match dtype field {self.dtype}"
+                )
+            return
+        _validate_primitive(self.name, self.dtype, self.value)
+        # Coerce to dtype-precise 0-dim tensor so storage matches dtype.
+        self.value = torch.tensor(self.value, dtype=self.dtype)
+
+    @property
+    def has_benchmark_step(self) -> bool:
+        """Whether repeated benchmark dispatches must advance this scalar."""
+        return self.benchmark_step is not None and self.benchmark_step != 0
+
+    def value_for_benchmark_dispatch(self, dispatch_index: int) -> torch.Tensor:
+        """Return the dtype-precise value for one benchmark dispatch.
+
+        Dispatch zero reuses :attr:`value`; later dispatches add
+        :attr:`benchmark_step`.  Constructing a temporary :class:`ScalarSpec`
+        keeps integer overflow and dtype validation identical to normal scalar
+        construction.
+        """
+        if isinstance(dispatch_index, bool) or not isinstance(dispatch_index, int):
+            raise ValueError(
+                f"ScalarSpec {self.name!r}: dispatch_index must be an int, "
+                f"got {type(dispatch_index).__name__}"
+            )
+        if dispatch_index < 0:
+            raise ValueError(
+                f"ScalarSpec {self.name!r}: dispatch_index must be non-negative, "
+                f"got {dispatch_index}"
+            )
+        if not self.has_benchmark_step or dispatch_index == 0:
+            return self.value
+        value = self.to_python() + dispatch_index * self.benchmark_step
+        return ScalarSpec(self.name, self.dtype, value).value
+
+    def to_ctypes(self) -> ctypes._SimpleCData:
+        """Encode to ``ctypes._SimpleCData`` for :func:`pypto.runtime.execute_compiled`.
+
+        Half-precision values are wrapped in ``c_uint16`` carrying the
+        bit pattern (Python ctypes has no native half).
+        """
+        if self.dtype in _INT_TABLE:
+            return _INT_TABLE[self.dtype][0](int(self.value.item()))
+        if self.dtype is torch.bool:
+            return ctypes.c_bool(bool(self.value.item()))
+        if self.dtype is torch.float32:
+            return ctypes.c_float(float(self.value.item()))
+        # fp16 / bf16: read raw 16-bit pattern.
+        bits = self.value.view(torch.int16).item()
+        return ctypes.c_uint16(int(bits) & 0xFFFF)
+
+    def to_python(self) -> int | float | bool:
+        """Return a Python value for ``golden_fn``, matched to device precision.
+
+        Because :attr:`value` is already a dtype-precise 0-dim tensor, the
+        round-trip is just ``.item()``.
+        """
+        return self.value.item()

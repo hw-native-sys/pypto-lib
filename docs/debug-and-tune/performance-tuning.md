@@ -1,0 +1,591 @@
+# Performance Tuning
+
+A practical guide for tuning pypto-lib kernels on Ascend NPU (A3 / 910C).
+The flow is two-tiered: first balance the inter-kernel schedule on the
+AICPU side (chip swimlane), then optimize each kernel's internal pipeline
+(L1/L0 swimlane + PMU).
+
+For the underlying levels see simpler's
+[Hierarchical Level Runtime](https://www.pypto.ai/simpler/hierarchical-level-runtime/):
+L2 = one chip (AICPU + AIC/AIV cores), L1 = die / L2 cache, L0 = single
+compute core.
+
+---
+
+## Measuring — the benchmark loop (`PYPTO_BENCH`)
+
+Tuning needs a number before and after. Set `PYPTO_BENCH=1` and every
+`run` call in the process times the kernel on device after its
+correctness dispatch — no `--benchmark` flag, no edit to the model file:
+
+```bash
+PYPTO_BENCH=1 python models/qwen3_14b/decode_fwd.py -p a2a3 -d 0
+```
+
+```
+[RUN]   effective_us (100 rounds) min=520.1 median=538.4 mean=539.9 max=602.0
+```
+
+**Effective** is the framework's post-graph-build execution window on
+device (`orch` ∪ `sched` — the old device-log "Total"), recovered from the
+runtime's `[STRACE]` markers. Quote `mean=` — this field of this line is the
+per-case number, so two runs are comparable only when both quote it.
+
+Requirements: a real device — a `*sim` platform prints
+`effective_us unavailable: no device-domain spans` — and a runtime built
+with `SIMPLER_PROFILING`. A `runtime_dir=` replay benchmarks the replayed
+build, so a hand-edited `.cpp` can be timed without recompiling; only a spec
+with a stepped scalar skips it, with a `[RUN] benchmark skipped` note.
+
+### Multi-card (L3) output
+
+A distributed program adds a per-rank breakdown and a context line:
+
+```
+[RUN]   effective_us (100 rounds) min=520.1 median=538.4 mean=539.9 max=602.0
+[RUN]     rank 10: eff_us min=500.0 median=510.0 mean=511.0 max=520.0
+[RUN]     rank 11: eff_us min=520.1 median=538.4 mean=539.9 max=602.0
+[RUN] benchmark kernel=moe_ep2 l3_resident=1 rounds=100 ranks=2 host_union_mean_us=900 host_mean_us=950
+```
+
+- The headline is the **per-round max across ranks** — the round ends when
+  the slowest card finishes. The `eff_us` lines expose the cross-card
+  imbalance that max hides; a persistent gap between ranks is a load-balance
+  problem, not a kernel problem.
+- A `rank N: eff_us` line **sums** that card's dispatches within a round (a card
+  runs them serially). When a card dispatches more than once per round, each rank
+  line gains a nested `slot` line per dispatch so you can see which dispatch owns
+  the time:
+
+  ```text
+  [RUN]     rank 10: eff_us min=500.0 median=510.0 mean=510.0 max=520.0
+  [RUN]       slot 0 (prefill_orch): eff_us min=200.0 median=205.0 mean=205.0 max=210.0
+  [RUN]       slot 1 (decode_orch): eff_us min=300.0 median=305.0 mean=305.0 max=310.0
+  [RUN]     rank 11: eff_us min=520.1 median=561.0 mean=561.0 max=602.0
+  [RUN]       slot 0 (decode_orch): eff_us min=520.1 median=561.0 mean=561.0 max=602.0
+  ```
+
+  `slot` is the dispatch's position within its rank's round (slot 1 is the same
+  dispatch in every round), and the name in parentheses is the orchestration
+  function it runs. Once the slot lines appear, every rank's dispatches are
+  listed — including single-dispatch ranks like 11 above, whose slot line
+  necessarily restates its rank line — so the breakdown stays a complete tree.
+  The slot lines are omitted entirely when every card dispatches exactly once per
+  round, and also when a card's dispatch *order* varies between rounds — a slot
+  then names no single callable, so pypto reports no per-dispatch view rather
+  than mislabelling it.
+- `host_union_mean_us` is the cross-rank host-timeline window
+  (`max(end) - min(start)`), so it captures start skew and overlap, but
+  includes host dispatch overhead.
+- `fallback_flattened=1` means a rank's dispatch count was not divisible by
+  `warmup + rounds` (a non-deterministic dispatch shape), so per-round
+  segmentation was abandoned and the numbers are a pooled per-dispatch
+  sample — treat them as indicative only.
+
+### Knobs
+
+| Env | Default | Effect |
+|-----|---------|--------|
+| `PYPTO_BENCH` | off | Enables the timed loop. Any value except `""` / `0` / `false` / `False` is on. |
+| `PYPTO_BENCH_ROUNDS` | `100` | Timed rounds. 100 rounds is ~0.1 s of device time for a decode step but minutes for a long prefill or a multi-card run — drop it while iterating. |
+| `PYPTO_BENCH_WARMUP` | `5` | Leading launches discarded before measurement. The resident L3 path always keeps ≥ 1 (its first warmup launch doubles as the validation dispatch). |
+| `PYPTO_BENCH_RAW` | off | Prints every measured dispatch's Effective sample, one line per rank, in dispatch order. Use it when a summary looks suspicious — start-up drift, a bimodal rank, one card lagging. |
+
+A malformed or out-of-range value warns and falls back to the default
+rather than failing the run. The 100 / 5 default is the baseline every
+reported number should come from; if you change the loop sizes, compare only
+against other runs with the same sizes.
+
+```bash
+# Quick iteration on a long prefill, with the raw per-dispatch samples.
+PYPTO_BENCH=1 PYPTO_BENCH_ROUNDS=10 PYPTO_BENCH_WARMUP=2 PYPTO_BENCH_RAW=1 \
+  python models/deepseek_v4_flash_mtp/prefill_fwd.py -p a2a3 -d 0
+```
+
+When only the timing changes between iterations — not the numerics — save the
+golden once and replay it via `golden_data=`, cutting the torch recompute out
+of every later run. See
+[Save and Replay Golden Data](../run-and-validate/save-and-replay.md).
+
+---
+
+## Part 1 — L2 tuning (inter-kernel schedule)
+
+### Capture
+
+Run the case with `--enable-chip-swimlane`. The runtime writes raw per-task
+chip swimlane records under the build directory and, on a real-device platform,
+converts them to a merged swimlane:
+
+```bash
+python models/qwen3_14b/decode_fwd.py -p a2a3 -d 0 --enable-chip-swimlane
+```
+
+```
+build_output/<ProgramName>_<ts>/dfx_outputs/
+├── chip_swimlane_records.json
+├── deps.json                    # real-device graph pass
+└── merged_swimlane_<ts>.json   # real device only; open this
+```
+
+The flag takes a capture **level**, and a bare flag means level 1 — per-task
+AICore timing, which is what reading the L2 schedule needs. Raise it only when
+the question requires it; each level records more and perturbs the timing it
+measures. Gap attribution and early-dispatch proofs need
+`--enable-chip-swimlane 4` — see
+[Capture levels](dependency-and-scheduling.md#capture-levels).
+
+Two viewers work:
+
+- Open `merged_swimlane_<ts>.json` in <https://ui.perfetto.dev/>.
+- Or open `chip_swimlane_records.json` directly with the
+  [pypto-toolkit VSCode extension](https://marketplace.visualstudio.com/items?itemName=CANN-PUB.pypto-toolkit).
+
+Simulator platforms emit `chip_swimlane_records.json` but intentionally skip
+the merged conversion because their records do not yet include the task
+metadata the converter requires. Use a real-device capture when you need the
+merged Perfetto view and dependency arrows.
+
+The trace shows one lane per AICPU / AIC / AIV with task name, duration
+and dependency edges — gaps and stalls are visible directly.
+
+### Timing one stage of a full network — task-timing slots
+
+A swimlane answers "where did every task go". A narrower question comes up
+constantly on a full network: **what does this one stage cost inside the whole
+program?** simpler answers that with *selective task-timing slots* — 16 fixed
+slots into which the Scheduler folds a tagged task's AICPU dispatch→finish
+window, at the same boundaries the swimlane's `finish_time` uses.
+
+| | Task-timing slot | Chip swimlane |
+|---|---|---|
+| Covers | up to 16 tagged tasks | every task |
+| Switch | tagging in the generated orchestration `.cpp` — no env var, no compile gate, works in `SIMPLER_DFX=0` builds | `--enable-chip-swimlane` |
+| Cost on untagged tasks | one cache-hot sentinel compare | per-task records and collector threads |
+| Output | `[STRACE]` spans named `chip.run.runner_run.device_wall.task_slot_<N>` (`clk=dev`, `ts` / `dur` in ns) | merged Perfetto JSON |
+
+Reach for a slot when a whole-network swimlane is too large to read or perturbs
+the schedule being measured, and you already know which stage you care about.
+Reach for the swimlane when the question is *why* that stage is slow.
+
+They are also how a change the benchmark loop distorts gets attributed. An L2
+warm is the standard example: `PYPTO_BENCH` replays the same weights every round,
+so its L2 is already warm and the end-to-end delta is both flattered and diluted
+— see [L2 Prefetch](l2-prefetch.md#the-benchmark-loop-flatters-a-warm).
+
+**PyPTO exposes no DSL surface for the tag**, so the workflow patches the
+generated orchestration C++ and replays it — the same
+[`runtime_dir` loop](debugging.md#3-reuse-a-compile-with-runtime_dir-edit-cpp-pto-and-retest)
+used for any generated-code edit:
+
+1. Compile once (`--compile-only`, or reuse an existing build directory).
+2. Open the orchestration source — `<work_dir>/orchestration/<prog>.cpp` for an
+   L2 program, `<work_dir>/next_levels/<prog>/orchestration/<prog>.cpp` for an
+   L3 one. Every submit block carries a comment naming its scope and kernel,
+   which is how a stage is located:
+
+   ```cpp
+   // Spmd w1_mm_spmd: w1_mm
+   CoreTaskArgs params_t0;
+   params_t0.add_input(ext_recv_x);
+   params_t0.add_output(ext_gate_i32);
+   params_t0.set_task_timing_slot(0);        // <- the tag
+   params_t0.launch_spec.set_block_num(8);
+   rt_submit_aic_task(0, params_t0);
+   ```
+
+3. **Tag one iteration, not all.** A `pl.range` layer loop becomes a real C++
+   `for` whose induction variable keeps the DSL's own name, so an unguarded tag
+   merges all 20 layers into one useless window. Guard it:
+
+   ```cpp
+   if (ordinal == 10) params_t0.set_task_timing_slot(0);
+   ```
+
+4. Replay the patched build. Editing the `.cpp` is the only signal the harness
+   needs — do not delete the sibling `.o` / `.so`:
+
+   ```bash
+   PYPTO_BENCH=1 python models/deepseek_v4_flash_mtp/decode_fwd.py -p a2a3 -d 0,1 --ep 2 \
+       --runtime-dir build_output/<ProgramName>_<ts>
+   ```
+
+5. Read the `[RUN] task slots` block the benchmark prints (below). Without
+   `PYPTO_BENCH` the one correctness dispatch prints its spans to the runtime
+   log instead, at the default `timing` level — pass `PYPTO_RUNTIME_LOG=timing`
+   if the entry raised the threshold, then grep for `task_slot_`. The benchmark
+   captures stderr itself, so under `PYPTO_BENCH` those log lines never appear.
+
+#### Reading the numbers
+
+- **Each slot reduces to `min(dispatch)` / `max(finish)`.** Reusing one slot
+  across several tasks yields a single merged window from the earliest tagged
+  dispatch to the latest tagged finish — which is exactly how a multi-kernel
+  *stage* is measured. Distinct slots keep each task's own window, so tooling
+  can recover `finish(B) − dispatch(A)`. A MIX task's AIC/AIV0/AIV1 subtasks and
+  an SPMD task's blocks all fold into the one tagged slot.
+- **Read finish-to-finish, not span length.** `dispatch` is the *speculative*
+  publication, so under `allow_early_resolve` the windows overlap heavily and a
+  slot's own `dur` is not that stage's cost. Take
+  `(slot_{k+1}.ts + slot_{k+1}.dur) − (slot_k.ts + slot_k.dur)`, which means
+  tagging the preceding stage too — otherwise the first stage has no anchor.
+- **Slots reset every run.** A plain replay therefore yields one sample per
+  slot. Add `PYPTO_BENCH=1` to the replay for a distribution: every measured
+  round reports its slots, and the harness prints one line per rank and slot —
+
+  ```text
+  [RUN]   task slots: ranks=2
+  [RUN]     rank 1872915 task_slot 4: n=100 fin_us=2177.4 dur_us=8.6 dfin_us=713.9
+  [RUN]     rank 1872915 task_slot 5: n=100 fin_us=2599.3 dur_us=7.9 dfin_us=428.1
+  ```
+
+  `fin_us` is the slot's finish from the run's device-clock origin, `dur_us`
+  its own window, and `dfin_us` the per-round finish minus the previous slot's
+  finish — the finish-to-finish stage cost when slots are numbered in stage
+  order. All three are medians; `PYPTO_BENCH_RAW=1` adds each round's `fin_us`.
+- **The patch lives in `build_output/` only.** Recompiling regenerates the
+  orchestration `.cpp` and silently drops every tag — which is also how the
+  instrumentation is removed.
+
+### What to look for
+
+Look for these shapes on the swimlane that indicate a problem:
+
+| Symptom | Likely cause | Fix |
+|---|---|---|
+| Cores idle while AICPU lane is solid | Kernels too small; AICPU scheduling is the bottleneck | Make kernels larger (item 2) |
+| Long tail on a single AIC/AIV | One kernel is too big and serializes | Split it (item 3) |
+| Cube / vector unit utilization low even though kernel is busy | Tile size under-fills the user-visible on-chip buffers | Re-tile against `Mat` / `Acc` for cube or `Vec` for vector work (item 4) |
+| Cube lane busy while vector lane idle (or vice versa) | Vec/cube epilogue is split into separate kernels | Merge into a mixed kernel (item 2c) |
+| A stage re-reads the same weights every layer, MTE2-bound, with a large unrelated stage in between | The weights are evicted from L2 before the next use | Warm them with `pl.prefetch` (item 5) |
+| Sequential AICPU dispatch trail per region | Region issues one kernel per iteration | Use `pl.spmd` to dispatch a block fan-out once (item 6) |
+
+A gap on this trace is not automatically a scheduling problem: the interval
+before a task splits into producer-FIN detection, ready-but-undispatched
+scheduler delay, and post-dispatch pickup, and each has a different fix. See
+[Dependencies and Scheduling](dependency-and-scheduling.md) for how edges are
+formed, what the four per-task timestamps mean, and how to attribute a gap
+without guessing.
+
+### Tuning rules
+
+#### 1. Use `pl.range` vs. `pl.parallel` correctly
+
+`pl.parallel` declares iterations are independent — the compiler may
+distribute them across cores. `pl.range` is strict sequential and forces
+a dependency chain. Use `pl.parallel` whenever there is no carried state,
+and reserve `pl.range` for accumulators or stateful loops.
+
+```python
+# the batch tile is independent — pl.parallel
+for b0 in pl.parallel(0, BATCH, BATCH_TILE):
+    ...
+```
+
+A `pl.range` over an independent dimension forces the swimlane into a
+single lane; switching to `pl.parallel` is usually the largest single
+win at this stage.
+
+#### 2. Kernels too small — make each kernel do more
+
+When the swimlane shows cores idling while the AICPU lane is fully
+saturated, the AICPU dispatcher is the bottleneck. Target ~50 µs per
+kernel on A3 / 910C (smaller kernels add dispatch overhead that the AICPU
+can't hide). Three ways to grow each kernel:
+
+**a. Fold outer iterations into the core.** Move part of an outer
+`pl.range` / `pl.parallel`'s iterations **into** the `pl.at` region as an
+inner `pl.range`, so each dispatched kernel processes a tile of iterations
+instead of one:
+
+```python
+# Before: one kernel per outer iteration — many tiny dispatches
+for b in pl.parallel(0, BATCH):
+    with pl.at(level=pl.Level.CORE_GROUP, name_hint="step"):
+        ...
+
+# After: fold BATCH_TILE iterations into each kernel via an inner pl.range
+for b0 in pl.parallel(0, BATCH, BATCH_TILE):
+    with pl.at(level=pl.Level.CORE_GROUP, name_hint="step"):
+        for b in pl.range(b0, b0 + BATCH_TILE):
+            ...
+```
+
+**b. Merge consecutive `pl.at` blocks.** Adjacent `pl.at` regions in the
+same scope each become a separate kernel with an AICPU hand-off between
+them. Fuse back-to-back regions into one `pl.at` so a single kernel covers
+the whole sequence:
+
+```python
+# Before: two adjacent regions → two kernels + a hand-off
+with pl.at(level=pl.Level.CORE_GROUP, name_hint="rmsnorm"):
+    ...
+with pl.at(level=pl.Level.CORE_GROUP, name_hint="q_proj"):
+    ...
+
+# After: one region → one kernel
+with pl.at(level=pl.Level.CORE_GROUP, name_hint="rmsnorm_q_proj"):
+    ...   # rmsnorm, then q_proj
+```
+
+**c. Merge cube + vector into a mixed kernel.** When a matmul (cube) and
+its epilogue (cast / add / norm — vector) sit in separate `pl.at` regions,
+every projection generates two kernels and an AICPU hand-off between them.
+Place both inside the **same** `pl.at` and the compiler co-schedules cube
+and vector on the right unit internally, removing the hand-off:
+
+```python
+with pl.at(level=pl.Level.CORE_GROUP, name_hint="q_proj"):
+    for kb in pl.pipeline(0, HIDDEN // K_STEP, stage=2):
+        ...
+        q_acc = pl.matmul_acc(q_acc, tile_a, tile_b)     # cube
+    q_bf16 = pl.cast(q_acc, target_type=pl.BF16)         # vector
+    q_proj[b0:b0 + BATCH_TILE, q0:q0 + Q_OUT_CHUNK] = q_bf16
+```
+
+#### 3. Kernels too big — split and parallelize
+
+When one kernel dominates the swimlane and the rest of the chip waits on
+it, the kernel is too coarse. Pull a `pl.range` out of the `pl.at` and
+convert it to a `pl.parallel` chunk loop so each chunk becomes its own
+InCore kernel scheduled across cores:
+
+```python
+# Before: one giant InCore region over all q_out blocks
+with pl.at(level=pl.Level.CORE_GROUP, name_hint="q_proj"):
+    for q0 in pl.range(0, hidden, Q_OUT_CHUNK):
+        ...
+
+# After: each q-chunk is its own kernel, parallel across cores
+for q0 in pl.parallel(0, hidden, Q_OUT_CHUNK):
+    with pl.at(level=pl.Level.CORE_GROUP, name_hint="q_proj"):
+        ...
+```
+
+#### 4. Tiling — fill the core-internal buffers
+
+Each AIC / AIV core has fixed on-chip buffers. At the DSL level, cube tiles
+directly consume `Mat` (L1 operand storage) and `Acc` (L0C accumulator
+storage), while vector tiles consume `Vec` (UB). The tile sizes declared in
+your `pl.slice` / `pl.matmul` (typically `BATCH_TILE`, `K_STEP`,
+`Q_OUT_CHUNK`, …) control these spaces.
+
+- Too small → buffers are under-utilized, cube/vector throughput drops
+  proportionally, MTE2 issues many small loads.
+- Too large → tile spills, the compiler falls back to smaller transfer
+  units, or compile-time shape checks fail.
+
+**Check actual occupancy.** Every compile writes a per-kernel buffer
+report to
+
+```
+build_output/<ProgramName>_<ts>/report/memory_after_AllocateMemoryAddr.txt
+```
+
+listing, for each compute function, how full each on-chip space runs
+against its hardware limit (on the illustrated 910C configuration: vector
+`Vec` has a 184 KB compiler-safe limit within the 192 KB physical UB; cube
+`Mat` is 512 KB, `Left` / `Right` are 64 KB each, and `Acc` is 128 KB):
+
+```
+--- gather_kv ---
+  Space  |  Used       |  Limit      |  Usage   |  MemRefs
+  -------+-------------+-------------+----------+---------
+  Vec    |   129.0 KB  |   184.0 KB  |   70.1%  |  2
+
+--- kv_proj_matmul ---
+  Space  |  Used       |  Limit      |  Usage   |  MemRefs
+  -------+-------------+-------------+----------+---------
+  Mat    |    80.0 KB  |   512.0 KB  |   15.6%  |  4
+  Left   |    32.0 KB  |    64.0 KB  |   50.0%  |  1
+  Right  |    16.0 KB  |    64.0 KB  |   25.0%  |  1
+  Acc    |     4.0 KB  |   128.0 KB  |    3.1%  |  1
+```
+
+Scan the `Usage` column for `Mat`, `Acc`, and `Vec`. These are the
+user-visible constraints affected by the M/N/K or vector fragment. `Left`
+and `Right` report the L0A/L0B staging chosen by the compiler for the L1
+fragment; they can routinely read close to 100% and are not independent DSL
+tile budgets. Do not shrink a tile merely to reduce a `Left` or `Right`
+percentage.
+
+Grow the space that limits the task: `Mat` for operand fragments, `Acc` for
+the output fragment, or `Vec` for vector working data. An oversized plain
+matmul output may be compiler-subtiled through L0C, so `Acc` is often a
+performance boundary rather than an immediate compile failure; extra tiles
+still add FIXPIPE drains. The exact build report and compile result are
+authoritative.
+
+Practical procedure:
+
+1. Start from the natural problem dimensions (`BATCH`, `HIDDEN`, …).
+2. Pick `K_STEP` and the output-chunk size so `Mat` and `Acc` stay within
+   the intended bounds without forcing inefficient compiler sub-tiling.
+3. Sweep one tile dim up/down by 2× and re-measure with PMU — keep the
+   size that pushes the cube (or vector) unit closer to 100 %.
+
+The K loop is then driven by `pl.pipeline(stage=2 or 4)` so the next
+tile's MTE2 overlaps the current tile's compute (see Part 2 item 2).
+For the complete M/N/K constraint model and empirical sweep method, see
+[Cube Tile Tuning](cube-tile-tuning.md).
+
+#### 5. Warm L2 for a weight set the next stage evicts
+
+When a stage re-reads a fixed weight set every layer and something between two
+layers evicts it, an SDMA cache warm (`pl.prefetch`) can hide the reload behind
+compute that is already running. It writes no tensor, so it is free to try and
+free to delete — but a partial or oversized warm costs more than it saves. See
+[L2 Prefetch](l2-prefetch.md).
+
+#### 6. `pl.spmd` for parallel sub-kernel dispatch
+
+`pl.spmd(N)` dispatches `N` blocks of an InCore body in parallel from
+**one** AICPU schedule entry, instead of N successive `pl.parallel +
+pl.at` dispatches. When a region has many parallel chunks and AICPU
+overhead is visible per iteration on the swimlane, replace the explicit
+`for ... in pl.parallel: with pl.at: ...` pattern with `pl.spmd`:
+
+```python
+# qwen3_14b/decode_layer_a8w8.py: one AICPU dispatch fans out every q_proj block
+for q_grid in pl.spmd(Q_ON * N_SUB, name_hint="q_proj_fused_dequant"):
+    ...
+```
+
+Collapsing N dispatches into one schedule entry cuts AICPU scheduling
+overhead sharply. The win is largest for **MPMD-shaped** regions with
+heavy fan-in / fan-out — where each block depends on (or feeds) many
+others, the AICPU would otherwise track a dependency edge per block, and
+`pl.spmd` replaces that whole fan with a single dispatch and its barrier.
+
+Use `pl.spmd` once the per-iteration body is self-contained and the
+AICPU lane shows a dispatch trail; keep the explicit form when you need
+to nest named sub-regions inside the chunk.
+
+---
+
+## Part 2 — L1 / L0 tuning (intra-kernel)
+
+Once L2 is balanced, individual kernels become the bottleneck. Two
+artifacts drive intra-kernel tuning:
+
+### Capture
+
+PMU counters per kernel:
+
+```bash
+python models/deepseek_v4_flash_mtp/decode_sparse_attn.py -p a2a3 -d 0 --enable-pmu 2
+# → build_output/<...>/dfx_outputs/pmu.csv
+```
+
+Not every kernel exposes `--enable-pmu`; a kernel that does not can still be
+captured by passing `config={"enable_pmu": 2}` to its `run` call (the
+`RunConfig` carries it to the runtime as a DFX option).
+
+For a per-kernel intra-core swimlane, use
+[In-Core Simulator Profiling](incore-simulator-profiling.md).
+It explains how the repository workflow builds a standalone single-core
+testcase from the generated `.cpp` and sibling `.pto`, runs it under
+`msprof op simulator`, validates that data-dependent work actually executed,
+and cleans the Insight trace for Perfetto.
+
+For phase timing inside a multi-core extern on real hardware, use
+[`cce-incore-profiling.md`](cce-incore-profiling.md). It covers
+per-core on-device timestamps, collective-barrier interpretation, and exact
+partitions that reconcile internal phases with the L2 task total.
+
+### Tuning rules
+
+#### 1. Fix tile-shape MTE hints from `perf_hints.log`
+
+Every compile writes a perf-hint log next to the memory report:
+
+```
+build_output/<ProgramName>_<ts>/report/perf_hints.log
+```
+
+The compiler flags every `tile.load` / `tile.store` whose innermost
+(trailing) dimension is smaller than the 512 B L2 cache line — the case
+that forces MTE into many short, cache-line-straddling transfers. Each
+hint carries the exact source location:
+
+```
+[perf_hint PH001] TileInnermostDimGranularity: tile.load has innermost
+dim = 256B; recommended >= 512B for backend a2a3 (L2 cache line = 512B).
+Consider increasing tile shape on the innermost axis.
+at models/deepseek_v4_flash_mtp/qkv_proj_rope.py:68:4
+```
+
+Walk the log and widen the trailing tile dimension at each flagged site
+so the innermost slice is a multiple of 512 B (item 3 gives the per-dtype
+element counts). Bringing every flagged `tile.load` / `tile.store` up to
+≥ 512 B is usually the single biggest MTE-efficiency win at this level.
+
+#### 2. `pl.pipeline` for ping-pong on the K loop
+
+Inside a `pl.at` region, the reduction loop of a matmul (the K loop)
+should be `pl.pipeline(..., stage=2 or 4)`. The compiler replicates the
+loop body `stage` times for ping-pong buffering, so MTE2 (load) overlaps
+with cube/vec compute on alternating tiles.
+
+```python
+# stage=4 for the largest input-projection K dim
+for kb in pl.pipeline(HIDDEN // K_STEP, stage=4):
+    ...
+
+# stage=2 is the common default
+for kb in pl.pipeline(0, hidden // K_STEP, stage=2):
+    ...
+```
+
+A `pl.range` here forces strictly serial K iterations — the cube unit
+will stall on every load. Always prefer `pl.pipeline` in the K loop.
+
+#### 3. Watch `pl.slice` / `pl.assemble` granularity
+
+MTE transfers prefer 512-byte aligned addresses and lengths on A3 / 910C.
+Pick the trailing-dim tile size so the slice is a multiple of 512 B:
+
+- BF16 (2 B/element) → trailing dim multiple of 256 elements
+- FP32 (4 B/element) → trailing dim multiple of 128 elements
+- INT8 (1 B/element) → trailing dim multiple of 512 elements
+
+Misaligned slices fall back to slower paths visible as long MTE2 bars in
+the kernel-insight swimlane. In the qwen3-14b kernels, all `K_STEP` /
+`Q_OUT_CHUNK` constants are picked to keep the inner load 512 B aligned.
+
+#### 4. Read PMU utilization
+
+Recommended PMU counters to collect per kernel:
+
+```
+pmu_total_cycles
+vec_busy_cycles        cube_busy_cycles        scalar_busy_cycles
+mte1_busy_cycles       mte2_busy_cycles        mte3_busy_cycles
+fixpipe_cycles
+```
+
+What each pipe means in context:
+
+| Counter | Cube kernel (AIC) | Vector kernel (AIV) |
+|---|---|---|
+| `mte1_busy_cycles` | L1 → L0 (operand staging into cube) | — |
+| `mte2_busy_cycles` | GM → L1 (operand load from device memory) | GM → UB (input load) |
+| `mte3_busy_cycles` | — | UB → GM (output store) |
+| `fixpipe_cycles`   | L0C → GM (cube result write-out) | — |
+| `cube_busy_cycles` | cube compute | — |
+| `vec_busy_cycles`  | — | vector compute |
+
+The bottleneck pipe should sit near 100 % of `pmu_total_cycles`; the
+others run overlapped underneath it. Targets:
+
+- **Cube kernel**: `max(mte2_busy_cycles, cube_busy_cycles) / pmu_total_cycles ≈ 100 %`.
+  Either the L1 load or the cube compute is saturated — whichever the
+  shape is bound by.
+- **Vector kernel**: `max(mte2_busy_cycles, vec_busy_cycles) / pmu_total_cycles ≈ 100 %`.
+  Either the GM→UB load or the vector compute is saturated. For very
+  store-heavy kernels, `mte3_busy_cycles` can be the bottleneck instead.
+
+If both compute and MTE2 are well below 100 %, open the kernel-insight
+swimlane: gaps usually mean (a) a missing `pl.pipeline` on the K loop,
+(b) suboptimal instruction scheduling, or (c) incorrectly placed
+synchronization barriers.

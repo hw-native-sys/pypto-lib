@@ -1,0 +1,920 @@
+# Copyright (c) PyPTO Contributors.
+# This program is free software, you can redistribute it and/or modify it under the terms and conditions of
+# CANN Open Software License Agreement Version 2.0 (the "License").
+# Please refer to the License for details. You may not use this file except in compliance with the License.
+# THIS SOFTWARE IS PROVIDED ON AN "AS IS" BASIS, WITHOUT WARRANTIES OF ANY KIND, EITHER EXPRESS OR IMPLIED,
+# INCLUDING BUT NOT LIMITED TO NON-INFRINGEMENT, MERCHANTABILITY, OR FITNESS FOR A PARTICULAR PURPOSE.
+# See LICENSE in the root of the software repository for the full text of the License.
+# -----------------------------------------------------------------------------------------------------------
+"""DeepSeek-V4 MoE routed local expert compute (decode, EP single-card).
+
+Only the routed-expert path lives here. The shared expert was split out
+into ``expert_shared.py``; both kernels are composed in ``moe.py``.
+"""
+
+
+import pypto.language as pl
+
+from swiglu_quant import reference_swiglu_quant
+
+from config import ACTIVE as M, DECODE_BATCH, DECODE_SEQ, EP_WORLD_SIZE, RECV_MAX
+
+
+# model config
+B = DECODE_BATCH
+S = DECODE_SEQ
+T = B * S
+D = M.hidden_size
+MOE_INTER = M.moe_intermediate_size
+SWIGLU_LIMIT = M.swiglu_limit
+
+# EP layout / recv buffers (single-card view: kernel only sees the local shard)
+N_LOCAL_EXPERTS = M.n_routed_experts // EP_WORLD_SIZE
+
+# tiling
+RECV_TILE = 16
+MX_GROUP = 32
+K_SCALE = D // MX_GROUP
+H_SCALE = MOE_INTER // MX_GROUP
+MX_K_TILE = 256
+MX_MM_INTER_TILE = 256
+MX_K_SCALE_GROUPS = MX_K_TILE // MX_GROUP
+MX_MM_TASK_TILE = 1024
+MX_W2_D_OUT_TILE = 256
+MX_W2_TASK_TILE = 1024
+MX_PACKED_LANE_ROWS = MX_K_TILE // 2
+MX_PACKED_LANE_COLS = MX_MM_INTER_TILE // 2
+MX_W1_PACKED_TILES = 2 * (D // MX_K_TILE) * (MOE_INTER // MX_MM_INTER_TILE)
+MX_W3_PACKED_TILES = 2 * (D // MX_K_TILE) * (MOE_INTER // MX_MM_INTER_TILE)
+MX_W2_PACKED_TILES = 2 * (MOE_INTER // MX_K_TILE) * (D // MX_W2_D_OUT_TILE)
+MX_W1_PACKED_ROWS = MX_W1_PACKED_TILES * MX_PACKED_LANE_ROWS
+MX_W3_PACKED_ROWS = MX_W3_PACKED_TILES * MX_PACKED_LANE_ROWS
+MX_W2_PACKED_ROWS = MX_W2_PACKED_TILES * MX_PACKED_LANE_ROWS
+ROUTE_D_OUT_TILE = 512
+ROUTE_TASK_TILE = D
+assert MOE_INTER % MX_MM_TASK_TILE == 0
+assert D % MX_K_TILE == 0
+ACT_INTER_TILE = 128
+QUANT_TILE = 1024
+ACT_GATE_INNER = QUANT_TILE // ACT_INTER_TILE
+
+assert RECV_MAX % RECV_TILE == 0, "RECV_MAX must be a whole number of RECV_TILE row-tiles"
+# Every `<dim> // <tile>` used as a loop/task bound must divide exactly, or the
+# bound silently truncates and part of the tensor is never written.
+assert MX_MM_TASK_TILE % MX_MM_INTER_TILE == 0
+assert MOE_INTER % QUANT_TILE == 0 and D % MX_W2_TASK_TILE == 0
+assert MX_W2_TASK_TILE % MX_W2_D_OUT_TILE == 0
+assert ROUTE_TASK_TILE % ROUTE_D_OUT_TILE == 0
+
+
+SWIGLU_GROUPS = QUANT_TILE // 32
+SWIGLU_SCALE_TMP = ((64 + (RECV_TILE // 16) * SWIGLU_GROUPS + 31) // 32) * 32
+
+
+@pl.jit.inline(auto_scope=False)
+def expert_routed(
+    recv_x: pl.Tensor[[N_LOCAL_EXPERTS, RECV_MAX, D], pl.FP8E4M3FN],
+    recv_mx_scale: pl.Tensor[[1, N_LOCAL_EXPERTS * RECV_MAX * K_SCALE], pl.FP8E8M0],
+    recv_weights: pl.Tensor[[N_LOCAL_EXPERTS, RECV_MAX], pl.FP32],
+    recv_expert_count: pl.Tensor[[N_LOCAL_EXPERTS, 1], pl.INT32],
+    routed_w1_packed: pl.Tensor[
+        [N_LOCAL_EXPERTS, MX_W1_PACKED_ROWS, MX_PACKED_LANE_COLS],
+        pl.UINT8,
+    ],
+    routed_w1_scale: pl.Tensor[[N_LOCAL_EXPERTS * K_SCALE, MOE_INTER], pl.FP8E8M0, pl.MX_B_NN],
+    routed_w3_packed: pl.Tensor[
+        [N_LOCAL_EXPERTS, MX_W3_PACKED_ROWS, MX_PACKED_LANE_COLS],
+        pl.UINT8,
+    ],
+    routed_w3_scale: pl.Tensor[[N_LOCAL_EXPERTS * K_SCALE, MOE_INTER], pl.FP8E8M0, pl.MX_B_NN],
+    routed_w2_packed: pl.Tensor[
+        [N_LOCAL_EXPERTS, MX_W2_PACKED_ROWS, MX_PACKED_LANE_COLS],
+        pl.UINT8,
+    ],
+    routed_w2_scale: pl.Tensor[[N_LOCAL_EXPERTS * H_SCALE, D], pl.FP8E8M0, pl.MX_B_NN],
+    mxfp4_pair_lut: pl.Tensor[[2, 256], pl.INT16],
+    recv_y: pl.Tensor[[N_LOCAL_EXPERTS, RECV_MAX, D], pl.BF16],
+):
+    recv_y_flat = pl.reshape(recv_y, [N_LOCAL_EXPERTS * RECV_MAX, D])
+    recv_x_flat = pl.reshape(recv_x, [N_LOCAL_EXPERTS * RECV_MAX, D])
+    recv_mx_scale_view = pl.tensor.view(
+        recv_mx_scale,
+        [N_LOCAL_EXPERTS * RECV_MAX, K_SCALE],
+        layout=pl.MX_A_ZZ,
+    )
+    with pl.scope():
+        h_mx = pl.create_tensor(
+            [N_LOCAL_EXPERTS * RECV_MAX, MOE_INTER], dtype=pl.FP8E4M3FN
+        )
+        h_scale_backing = pl.create_tensor(
+            [1, N_LOCAL_EXPERTS * RECV_MAX * H_SCALE], dtype=pl.FP8E8M0
+        )
+        for local_i in pl.parallel(N_LOCAL_EXPERTS):
+            flat_base = local_i * RECV_MAX
+            routed_w1_packed_e = routed_w1_packed[local_i, :, :]
+            routed_w3_packed_e = routed_w3_packed[local_i, :, :]
+
+            n_rows = pl.read(recv_expert_count, [local_i, 0])
+            n_tiles = (n_rows + RECV_TILE - 1) // RECV_TILE
+
+            w1_mxfp8 = pl.create_tensor([D, MOE_INTER], dtype=pl.FP8E4M3FN)
+            with pl.spmd(
+                2 * (MOE_INTER // MX_MM_TASK_TILE),
+                name_hint="exp_gate_mxfp4_aiv",
+            ) as gate_mxfp4_aiv_tid:
+                block_idx = pl.tile.get_block_idx()
+                nb_idx = block_idx // 2
+                w1_lane = block_idx % 2
+                n_base = nb_idx * MX_MM_TASK_TILE
+                w1_lut_tile = pl.load(
+                    mxfp4_pair_lut,
+                    [w1_lane, 0],
+                    [1, 256],
+                    target_memory=pl.Mem.Vec,
+                )
+                for ng in pl.range(MX_MM_TASK_TILE // MX_MM_INTER_TILE):
+                    n0 = n_base + ng * MX_MM_INTER_TILE
+                    for k0 in pl.range(0, D, MX_K_TILE):
+                        w1_tile_id = (
+                            (n0 // MX_MM_INTER_TILE) * (D // MX_K_TILE)
+                            + k0 // MX_K_TILE
+                        )
+                        w1_packed_row = (
+                            w1_tile_id * 2 * MX_PACKED_LANE_ROWS
+                            + w1_lane * MX_PACKED_LANE_ROWS
+                        )
+                        w1_packed_tile = pl.load(
+                            routed_w1_packed_e,
+                            [w1_packed_row, 0],
+                            [MX_PACKED_LANE_ROWS, MX_PACKED_LANE_COLS],
+                            target_memory=pl.Mem.Vec,
+                        )
+                        w1_packed_u16 = pl.cast(w1_packed_tile, target_type=pl.UINT16)
+                        w1_packed_indices = pl.reinterpret_view(w1_packed_u16, pl.INT16)
+                        w1_gather_tmp = pl.create_tile(
+                            [MX_PACKED_LANE_ROWS, MX_PACKED_LANE_COLS],
+                            dtype=pl.INT16,
+                            target_memory=pl.Mem.Vec,
+                        )
+                        w1_pair_codes = pl.tile.gather(
+                            w1_lut_tile,
+                            w1_packed_indices,
+                            w1_gather_tmp,
+                        )
+                        w1_bytes = pl.reinterpret_view(
+                            w1_pair_codes,
+                            pl.INT8,
+                            shape=[MX_PACKED_LANE_ROWS, MX_MM_INTER_TILE],
+                        )
+                        w1_mxfp8 = pl.store(
+                            pl.reinterpret_view(w1_bytes, pl.FP8E4M3FN),
+                            [k0 + w1_lane * MX_PACKED_LANE_ROWS, n0],
+                            w1_mxfp8,
+                        )
+
+            w3_mxfp8 = pl.create_tensor([D, MOE_INTER], dtype=pl.FP8E4M3FN)
+            with pl.spmd(
+                2 * (MOE_INTER // MX_MM_TASK_TILE),
+                name_hint="exp_up_mxfp4_aiv",
+            ) as up_mxfp4_aiv_tid:
+                block_idx = pl.tile.get_block_idx()
+                nb_idx = block_idx // 2
+                w3_lane = block_idx % 2
+                n_base = nb_idx * MX_MM_TASK_TILE
+                w3_lut_tile = pl.load(
+                    mxfp4_pair_lut,
+                    [w3_lane, 0],
+                    [1, 256],
+                    target_memory=pl.Mem.Vec,
+                )
+                for ng in pl.range(MX_MM_TASK_TILE // MX_MM_INTER_TILE):
+                    n0 = n_base + ng * MX_MM_INTER_TILE
+                    for k0 in pl.range(0, D, MX_K_TILE):
+                        w3_tile_id = (
+                            (n0 // MX_MM_INTER_TILE) * (D // MX_K_TILE)
+                            + k0 // MX_K_TILE
+                        )
+                        w3_packed_row = (
+                            w3_tile_id * 2 * MX_PACKED_LANE_ROWS
+                            + w3_lane * MX_PACKED_LANE_ROWS
+                        )
+                        w3_packed_tile = pl.load(
+                            routed_w3_packed_e,
+                            [w3_packed_row, 0],
+                            [MX_PACKED_LANE_ROWS, MX_PACKED_LANE_COLS],
+                            target_memory=pl.Mem.Vec,
+                        )
+                        w3_packed_u16 = pl.cast(w3_packed_tile, target_type=pl.UINT16)
+                        w3_packed_indices = pl.reinterpret_view(w3_packed_u16, pl.INT16)
+                        w3_gather_tmp = pl.create_tile(
+                            [MX_PACKED_LANE_ROWS, MX_PACKED_LANE_COLS],
+                            dtype=pl.INT16,
+                            target_memory=pl.Mem.Vec,
+                        )
+                        w3_pair_codes = pl.tile.gather(
+                            w3_lut_tile,
+                            w3_packed_indices,
+                            w3_gather_tmp,
+                        )
+                        w3_bytes = pl.reinterpret_view(
+                            w3_pair_codes,
+                            pl.INT8,
+                            shape=[MX_PACKED_LANE_ROWS, MX_MM_INTER_TILE],
+                        )
+                        w3_mxfp8 = pl.store(
+                            pl.reinterpret_view(w3_bytes, pl.FP8E4M3FN),
+                            [k0 + w3_lane * MX_PACKED_LANE_ROWS, n0],
+                            w3_mxfp8,
+                        )
+
+            for t in pl.parallel(n_tiles):
+                t0 = t * RECV_TILE
+                flat_t0 = flat_base + t0
+                valid_rows = pl.min(RECV_TILE, n_rows - t0)
+
+                with pl.scope():
+                    gate_tile_fp32 = pl.create_tensor([RECV_TILE, MOE_INTER], dtype=pl.FP32)
+                    up_tile_fp32 = pl.create_tensor([RECV_TILE, MOE_INTER], dtype=pl.FP32)
+
+                    with pl.spmd(
+                        MOE_INTER // MX_MM_TASK_TILE,
+                        name_hint="exp_gate_mxfp4_aic",
+                        deps=[gate_mxfp4_aiv_tid],
+                    ) as gate_mxfp4_aic_tid:
+                        nb_idx = pl.tile.get_block_idx()
+                        n_base = nb_idx * MX_MM_TASK_TILE
+                        for ng in pl.range(MX_MM_TASK_TILE // MX_MM_INTER_TILE):
+                            n0 = n_base + ng * MX_MM_INTER_TILE
+                            w1_scale_row_base = local_i * K_SCALE
+                            gate_acc = pl.create_tile(
+                                [RECV_TILE, MX_MM_INTER_TILE],
+                                dtype=pl.FP32,
+                                target_memory=pl.Mem.Acc,
+                            )
+                            for k0 in pl.range(0, D, MX_K_TILE):
+                                ks = k0 // MX_GROUP
+                                w1_tile = pl.load(
+                                    w1_mxfp8,
+                                    [k0, n0],
+                                    [MX_K_TILE, MX_MM_INTER_TILE],
+                                    target_memory=pl.Mem.Mat,
+                                )
+                                xs_k = pl.load(recv_x_flat, [flat_t0, k0], [RECV_TILE, MX_K_TILE])
+                                xs_scale_k = pl.load(
+                                    recv_mx_scale_view,
+                                    [flat_t0, ks],
+                                    [RECV_TILE, MX_K_SCALE_GROUPS],
+                                    target_memory=pl.Mem.Mat,
+                                )
+                                w1_scale_k = pl.load(
+                                    routed_w1_scale,
+                                    [w1_scale_row_base + ks, n0],
+                                    [MX_K_SCALE_GROUPS, MX_MM_INTER_TILE],
+                                    target_memory=pl.Mem.Mat,
+                                )
+                                if k0 == 0:
+                                    gate_acc = pl.matmul_mx(xs_k, xs_scale_k, w1_tile, w1_scale_k)
+                                else:
+                                    gate_acc = pl.matmul_mx_acc(
+                                        gate_acc, xs_k, xs_scale_k, w1_tile, w1_scale_k
+                                    )
+                            gate_tile_fp32 = pl.store(gate_acc, [0, n0], gate_tile_fp32)
+
+                    with pl.spmd(
+                        MOE_INTER // MX_MM_TASK_TILE,
+                        name_hint="exp_up_mxfp4_aic",
+                        deps=[up_mxfp4_aiv_tid],
+                    ) as up_mxfp4_aic_tid:
+                        nb_idx = pl.tile.get_block_idx()
+                        n_base = nb_idx * MX_MM_TASK_TILE
+                        for ng in pl.range(MX_MM_TASK_TILE // MX_MM_INTER_TILE):
+                            n0 = n_base + ng * MX_MM_INTER_TILE
+                            w3_scale_row_base = local_i * K_SCALE
+                            up_acc = pl.create_tile(
+                                [RECV_TILE, MX_MM_INTER_TILE],
+                                dtype=pl.FP32,
+                                target_memory=pl.Mem.Acc,
+                            )
+                            for k0 in pl.range(0, D, MX_K_TILE):
+                                ks = k0 // MX_GROUP
+                                w3_tile = pl.load(
+                                    w3_mxfp8,
+                                    [k0, n0],
+                                    [MX_K_TILE, MX_MM_INTER_TILE],
+                                    target_memory=pl.Mem.Mat,
+                                )
+                                xs_k = pl.load(recv_x_flat, [flat_t0, k0], [RECV_TILE, MX_K_TILE])
+                                xs_scale_k = pl.load(
+                                    recv_mx_scale_view,
+                                    [flat_t0, ks],
+                                    [RECV_TILE, MX_K_SCALE_GROUPS],
+                                    target_memory=pl.Mem.Mat,
+                                )
+                                w3_scale_k = pl.load(
+                                    routed_w3_scale,
+                                    [w3_scale_row_base + ks, n0],
+                                    [MX_K_SCALE_GROUPS, MX_MM_INTER_TILE],
+                                    target_memory=pl.Mem.Mat,
+                                )
+                                if k0 == 0:
+                                    up_acc = pl.matmul_mx(xs_k, xs_scale_k, w3_tile, w3_scale_k)
+                                else:
+                                    up_acc = pl.matmul_mx_acc(
+                                        up_acc, xs_k, xs_scale_k, w3_tile, w3_scale_k
+                                    )
+                            up_tile_fp32 = pl.store(up_acc, [0, n0], up_tile_fp32)
+
+                    h_tile_mx = h_mx[flat_t0 : flat_t0 + RECV_TILE]
+                    h_tile_scale_backing = h_scale_backing[
+                        :, flat_t0 * H_SCALE : (flat_t0 + RECV_TILE) * H_SCALE
+                    ]
+                    with pl.spmd(
+                        MOE_INTER // QUANT_TILE,
+                        name_hint="exp_gate_up_act_quant",
+                        deps=[gate_mxfp4_aic_tid, up_mxfp4_aic_tid],
+                    ) as gate_up_act_quant_tid:
+                        ab_idx = pl.tile.get_block_idx()
+                        a_base = ab_idx * QUANT_TILE
+                        h_fp32 = pl.tile.full([RECV_TILE, QUANT_TILE], dtype=pl.FP32, value=0.0)
+                        for ag in pl.pipeline(ACT_GATE_INNER, stage=2):
+                            a0 = a_base + ag * ACT_INTER_TILE
+                            h_a0 = ag * ACT_INTER_TILE
+                            gate_2d = pl.load(
+                                gate_tile_fp32,
+                                [0, a0],
+                                [RECV_TILE, ACT_INTER_TILE],
+                            )
+                            up_2d = pl.load(
+                                up_tile_fp32,
+                                [0, a0],
+                                [RECV_TILE, ACT_INTER_TILE],
+                            )
+                            # CANN rounds W1/W3 to BF16 before SwiGLU; do so in this vector task.
+                            gate_2d = pl.cast(pl.cast(gate_2d, pl.BF16, mode="rint"), pl.FP32)
+                            up_2d = pl.cast(pl.cast(up_2d, pl.BF16, mode="rint"), pl.FP32)
+                            if SWIGLU_LIMIT > 0.0:
+                                gate_2d = pl.minimum(gate_2d, SWIGLU_LIMIT)
+                                up_2d = pl.maximum(pl.minimum(up_2d, SWIGLU_LIMIT), -SWIGLU_LIMIT)
+                            sigmoid = pl.recip(pl.add(pl.exp(pl.neg(gate_2d)), 1.0))
+                            silu = pl.mul(gate_2d, sigmoid)
+                            gated = pl.mul(silu, up_2d)
+                            h_fp32 = pl.tile.assemble(h_fp32, gated, [0, h_a0])
+                        h_fp32_valid = pl.set_validshape(h_fp32, valid_rows, QUANT_TILE)
+                        h_fp32_padded = pl.fillpad(h_fp32_valid, pad_value=pl.PadValue.zero)
+                        # CANN SwiGLU rounds the group scale upward; ordinary MX quantization uses OCP.
+                        sq_input = pl.set_validshape(h_fp32_padded, RECV_TILE, QUANT_TILE)
+                        sq_values = pl.reshape(sq_input, [RECV_TILE * SWIGLU_GROUPS, 32])
+                        sq_reduce_tmp = pl.create_tile([RECV_TILE * SWIGLU_GROUPS, 32], dtype=pl.FP32)
+                        sq_maximum = pl.maximum(pl.row_max(pl.abs(sq_values), tmp_tile=sq_reduce_tmp), 1e-4)
+                        sq_bits = pl.reinterpret_view(pl.mul(sq_maximum, 1.0 / 448.0), pl.INT32)
+                        sq_exponent = pl.shrs(pl.add(sq_bits, 8388607), 23)
+                        sq_scale = pl.reinterpret_view(pl.shls(sq_exponent, 23), pl.FP32)
+                        sq_normalized = pl.row_expand_div(sq_values, sq_scale)
+                        sq_clipped = pl.minimum(pl.maximum(sq_normalized, -448.0), 448.0)
+                        sq_quantized = pl.cast(sq_clipped, pl.FP8E4M3FN, mode="rint")
+                        h_quant = pl.reshape(sq_quantized, [RECV_TILE, QUANT_TILE])
+                        sq_signed_exponent = pl.sub(sq_exponent, pl.mul(pl.shrs(sq_exponent, 7), 256))
+                        sq_codes = pl.reinterpret_view(pl.cast(sq_signed_exponent, pl.INT8), pl.UINT8)
+                        sq_flat = pl.reshape(sq_codes, [1, RECV_TILE * SWIGLU_GROUPS])
+                        sq_temporary = pl.create_tile([1, SWIGLU_SCALE_TMP], dtype=pl.UINT8)
+                        sq_packed = pl.tmov_x2zz(sq_flat, sq_temporary, group_axis=1, dst_rows=RECV_TILE, dst_cols=SWIGLU_GROUPS)
+                        h_scale = pl.reinterpret_view(sq_packed, pl.FP8E8M0)
+                        h_tile_mx = pl.store(h_quant, [0, a_base], h_tile_mx)
+                        scale_offset = ab_idx * RECV_TILE * (QUANT_TILE // MX_GROUP)
+                        h_tile_scale_backing = pl.store(
+                            pl.reshape(h_scale, [1, RECV_TILE * (QUANT_TILE // MX_GROUP)]),
+                            [0, scale_offset],
+                            h_tile_scale_backing,
+                        )
+
+        with pl.scope():
+            for local_e in pl.parallel(N_LOCAL_EXPERTS):
+                e_flat_base = local_e * RECV_MAX
+                routed_w2_packed_e = routed_w2_packed[local_e, :, :]
+
+                e_rows = pl.read(recv_expert_count, [local_e, 0])
+                e_tiles = (e_rows + RECV_TILE - 1) // RECV_TILE
+
+                w2_mxfp8 = pl.create_tensor([MOE_INTER, D], dtype=pl.FP8E4M3FN)
+                with pl.spmd(
+                    2 * (D // MX_W2_TASK_TILE),
+                    name_hint="exp_w2_mxfp4_aiv",
+                ) as w2_mxfp4_aiv_tid:
+                    block_idx = pl.tile.get_block_idx()
+                    wb_idx = block_idx // 2
+                    w2_lane = block_idx % 2
+                    d_base = wb_idx * MX_W2_TASK_TILE
+                    w2_lut_tile = pl.load(
+                        mxfp4_pair_lut,
+                        [w2_lane, 0],
+                        [1, 256],
+                        target_memory=pl.Mem.Vec,
+                    )
+                    for dg in pl.range(MX_W2_TASK_TILE // MX_W2_D_OUT_TILE):
+                        d0 = d_base + dg * MX_W2_D_OUT_TILE
+                        for k0 in pl.range(0, MOE_INTER, MX_K_TILE):
+                            w2_tile_id = (
+                                (d0 // MX_W2_D_OUT_TILE) * (MOE_INTER // MX_K_TILE)
+                                + k0 // MX_K_TILE
+                            )
+                            w2_packed_row = (
+                                w2_tile_id * 2 * MX_PACKED_LANE_ROWS
+                                + w2_lane * MX_PACKED_LANE_ROWS
+                            )
+                            w2_packed_tile = pl.load(
+                                routed_w2_packed_e,
+                                [w2_packed_row, 0],
+                                [MX_PACKED_LANE_ROWS, MX_PACKED_LANE_COLS],
+                                target_memory=pl.Mem.Vec,
+                            )
+                            w2_packed_u16 = pl.cast(w2_packed_tile, target_type=pl.UINT16)
+                            w2_packed_indices = pl.reinterpret_view(w2_packed_u16, pl.INT16)
+                            w2_gather_tmp = pl.create_tile(
+                                [MX_PACKED_LANE_ROWS, MX_PACKED_LANE_COLS],
+                                dtype=pl.INT16,
+                                target_memory=pl.Mem.Vec,
+                            )
+                            w2_pair_codes = pl.tile.gather(
+                                w2_lut_tile,
+                                w2_packed_indices,
+                                w2_gather_tmp,
+                            )
+                            w2_bytes = pl.reinterpret_view(
+                                w2_pair_codes,
+                                pl.INT8,
+                                shape=[MX_PACKED_LANE_ROWS, MX_W2_D_OUT_TILE],
+                            )
+                            w2_mxfp8 = pl.store(
+                                pl.reinterpret_view(w2_bytes, pl.FP8E4M3FN),
+                                [k0 + w2_lane * MX_PACKED_LANE_ROWS, d0],
+                                w2_mxfp8,
+                            )
+
+                for tt in pl.parallel(e_tiles):
+                    tt0 = tt * RECV_TILE
+                    flat_tt0 = e_flat_base + tt0
+                    valid_rows = pl.min(RECV_TILE, e_rows - tt0)
+                    h_tile_mx = h_mx[flat_tt0 : flat_tt0 + RECV_TILE]
+                    h_tile_scale_backing = h_scale_backing[
+                        :, flat_tt0 * H_SCALE : (flat_tt0 + RECV_TILE) * H_SCALE
+                    ]
+                    h_tile_scale_mx = pl.tensor.view(
+                        h_tile_scale_backing,
+                        [RECV_TILE, H_SCALE],
+                        layout=pl.MX_A_ZZ,
+                    )
+                    recv_y_tile_fp32 = pl.create_tensor([RECV_TILE, D], dtype=pl.FP32)
+                    recv_y_tile = pl.create_tensor([RECV_TILE, D], dtype=pl.BF16)
+                    with pl.spmd(
+                        D // MX_W2_TASK_TILE,
+                        name_hint="exp_w2_mxfp4_aic",
+                        deps=[w2_mxfp4_aiv_tid],
+                    ) as w2_mxfp4_aic_tid:
+                        wb_idx = pl.tile.get_block_idx()
+                        d_base = wb_idx * MX_W2_TASK_TILE
+                        for dg in pl.range(MX_W2_TASK_TILE // MX_W2_D_OUT_TILE):
+                            d0 = d_base + dg * MX_W2_D_OUT_TILE
+                            w2_scale_row_base = local_e * H_SCALE
+                            y_acc = pl.create_tile(
+                                [RECV_TILE, MX_W2_D_OUT_TILE],
+                                dtype=pl.FP32,
+                                target_memory=pl.Mem.Acc,
+                            )
+                            for k0 in pl.range(0, MOE_INTER, MX_K_TILE):
+                                ks = k0 // MX_GROUP
+                                w2_tile = pl.load(
+                                    w2_mxfp8,
+                                    [k0, d0],
+                                    [MX_K_TILE, MX_W2_D_OUT_TILE],
+                                    target_memory=pl.Mem.Mat,
+                                )
+                                h_k = pl.load(h_tile_mx, [0, k0], [RECV_TILE, MX_K_TILE])
+                                h_scale_k = pl.load(
+                                    h_tile_scale_mx,
+                                    [0, ks],
+                                    [RECV_TILE, MX_K_SCALE_GROUPS],
+                                    target_memory=pl.Mem.Mat,
+                                )
+                                w2_scale_k = pl.load(
+                                    routed_w2_scale,
+                                    [w2_scale_row_base + ks, d0],
+                                    [MX_K_SCALE_GROUPS, MX_W2_D_OUT_TILE],
+                                    target_memory=pl.Mem.Mat,
+                                )
+                                if k0 == 0:
+                                    y_acc = pl.matmul_mx(h_k, h_scale_k, w2_tile, w2_scale_k)
+                                else:
+                                    y_acc = pl.matmul_mx_acc(
+                                        y_acc, h_k, h_scale_k, w2_tile, w2_scale_k
+                                    )
+                            recv_y_tile_fp32 = pl.store(y_acc, [0, d0], recv_y_tile_fp32)
+
+                    with pl.spmd(
+                        D // ROUTE_TASK_TILE,
+                        name_hint="exp_route_weight",
+                        deps=[w2_mxfp4_aic_tid],
+                    ):
+                        wb_idx = pl.tile.get_block_idx()
+                        d_base = wb_idx * ROUTE_TASK_TILE
+                        w_row_blk = pl.load(
+                            recv_weights,
+                            [local_e, tt0],
+                            [1, RECV_TILE],
+                        )
+                        w_col_blk = pl.reshape(w_row_blk, [RECV_TILE, 1])
+                        for dg in pl.range(ROUTE_TASK_TILE // ROUTE_D_OUT_TILE):
+                            d0 = d_base + dg * ROUTE_D_OUT_TILE
+                            y_fp32 = pl.load(
+                                recv_y_tile_fp32,
+                                [0, d0],
+                                [RECV_TILE, ROUTE_D_OUT_TILE],
+                            )
+                            y_bf16 = pl.cast(y_fp32, pl.BF16, mode="rint")
+                            y_weighted = pl.row_expand_mul(pl.cast(y_bf16, pl.FP32), w_col_blk)
+                            y_valid = pl.set_validshape(y_weighted, valid_rows, ROUTE_D_OUT_TILE)
+                            y_padded = pl.fillpad(y_valid, pad_value=pl.PadValue.zero)
+                            recv_y_tile = pl.store(
+                                pl.cast(y_padded, target_type=pl.BF16, mode="rint"),
+                                [0, d0],
+                                recv_y_tile,
+                            )
+                    recv_y_flat = pl.assemble(recv_y_flat, recv_y_tile, [flat_tt0, 0])
+
+    return recv_y
+
+
+@pl.jit
+def expert_routed_test(
+    recv_x: pl.Tensor[[N_LOCAL_EXPERTS, RECV_MAX, D], pl.FP8E4M3FN],
+    recv_mx_scale: pl.Tensor[[1, N_LOCAL_EXPERTS * RECV_MAX * K_SCALE], pl.FP8E8M0],
+    recv_weights: pl.Tensor[[N_LOCAL_EXPERTS, RECV_MAX], pl.FP32],
+    recv_expert_count: pl.Tensor[[N_LOCAL_EXPERTS, 1], pl.INT32],
+    routed_w1_packed: pl.Tensor[
+        [N_LOCAL_EXPERTS, MX_W1_PACKED_ROWS, MX_PACKED_LANE_COLS],
+        pl.UINT8,
+    ],
+    routed_w1_scale: pl.Tensor[[N_LOCAL_EXPERTS * K_SCALE, MOE_INTER], pl.FP8E8M0, pl.MX_B_NN],
+    routed_w3_packed: pl.Tensor[
+        [N_LOCAL_EXPERTS, MX_W3_PACKED_ROWS, MX_PACKED_LANE_COLS],
+        pl.UINT8,
+    ],
+    routed_w3_scale: pl.Tensor[[N_LOCAL_EXPERTS * K_SCALE, MOE_INTER], pl.FP8E8M0, pl.MX_B_NN],
+    routed_w2_packed: pl.Tensor[
+        [N_LOCAL_EXPERTS, MX_W2_PACKED_ROWS, MX_PACKED_LANE_COLS],
+        pl.UINT8,
+    ],
+    routed_w2_scale: pl.Tensor[[N_LOCAL_EXPERTS * H_SCALE, D], pl.FP8E8M0, pl.MX_B_NN],
+    mxfp4_pair_lut: pl.Tensor[[2, 256], pl.INT16],
+    recv_y: pl.Out[pl.Tensor[[N_LOCAL_EXPERTS, RECV_MAX, D], pl.BF16]],
+):
+    expert_routed(
+        recv_x, recv_mx_scale, recv_weights, recv_expert_count,
+        routed_w1_packed, routed_w1_scale, routed_w3_packed, routed_w3_scale,
+        routed_w2_packed, routed_w2_scale, mxfp4_pair_lut,
+        recv_y,
+    )
+    return recv_y
+
+
+def golden_expert_routed(tensors):
+    """Torch reference for MXFP4-grid W1/W3/W2 with MXFP8 activations."""
+    import torch
+    import torch.nn.functional as F
+
+    from utils import (
+        decode_e8m0_codes,
+        matmul_mx_golden,
+        unpack_mxfp4_weight_tiles,
+    )
+
+    recv_x = tensors["recv_x"]
+    recv_mx_scale = decode_e8m0_codes(
+        tensors["recv_mx_scale"].reshape(N_LOCAL_EXPERTS * RECV_MAX, K_SCALE),
+        side="a",
+    ).reshape(
+        N_LOCAL_EXPERTS, RECV_MAX, K_SCALE,
+    )
+    recv_weights = tensors["recv_weights"].float()
+    recv_expert_count = tensors["recv_expert_count"]
+    w1_scale = decode_e8m0_codes(tensors["routed_w1_scale"], side="b").reshape(
+        N_LOCAL_EXPERTS, K_SCALE, MOE_INTER,
+    )
+    w3_scale = decode_e8m0_codes(tensors["routed_w3_scale"], side="b").reshape(
+        N_LOCAL_EXPERTS, K_SCALE, MOE_INTER,
+    )
+    w2_scale = decode_e8m0_codes(tensors["routed_w2_scale"], side="b").reshape(
+        N_LOCAL_EXPERTS, H_SCALE, D,
+    )
+
+    recv_y = torch.zeros(N_LOCAL_EXPERTS, RECV_MAX, D)
+    for e in range(N_LOCAL_EXPERTS):
+        n_rows = int(recv_expert_count[e, 0].item())
+        if n_rows == 0:
+            continue
+        x_sub = recv_x[e, :n_rows, :]
+        x_scale = recv_mx_scale[e, :n_rows, :]
+        w_per_row = recv_weights[e, :n_rows].reshape(-1, 1)
+        w1_fp8 = unpack_mxfp4_weight_tiles(
+            tensors["routed_w1_packed"][e].reshape(
+                MX_W1_PACKED_TILES,
+                MX_K_TILE * MX_MM_INTER_TILE // 4,
+            ),
+            D,
+            MOE_INTER,
+            MX_K_TILE,
+            MX_MM_INTER_TILE,
+        )
+        w3_fp8 = unpack_mxfp4_weight_tiles(
+            tensors["routed_w3_packed"][e].reshape(
+                MX_W3_PACKED_TILES,
+                MX_K_TILE * MX_MM_INTER_TILE // 4,
+            ),
+            D,
+            MOE_INTER,
+            MX_K_TILE,
+            MX_MM_INTER_TILE,
+        )
+        w2_fp8 = unpack_mxfp4_weight_tiles(
+            tensors["routed_w2_packed"][e].reshape(
+                MX_W2_PACKED_TILES,
+                MX_K_TILE * MX_W2_D_OUT_TILE // 4,
+            ),
+            MOE_INTER,
+            D,
+            MX_K_TILE,
+            MX_W2_D_OUT_TILE,
+        )
+
+        gate = matmul_mx_golden(x_sub, x_scale, w1_fp8, w1_scale[e]).to(torch.bfloat16).float()
+        up = matmul_mx_golden(x_sub, x_scale, w3_fp8, w3_scale[e]).to(torch.bfloat16).float()
+        if SWIGLU_LIMIT > 0:
+            gate = gate.clamp(max=SWIGLU_LIMIT)
+            up = up.clamp(-SWIGLU_LIMIT, SWIGLU_LIMIT)
+        h = F.silu(gate) * up
+        h_fp8, h_scale = reference_swiglu_quant(h)
+        y = matmul_mx_golden(h_fp8, h_scale, w2_fp8, w2_scale[e]).to(torch.bfloat16).float()
+        recv_y[e, :n_rows, :] = y * w_per_row
+
+    tensors["recv_y"][:] = recv_y.to(torch.bfloat16)
+
+
+def gen_routed_mxfp4_weights(n_experts, dequant_std, seed_base=0):
+    """Generate tile-major packed MXFP4 W1/W3/W2 fixtures and E8M0 scales."""
+    import torch
+
+    from utils import (
+        gen_mxfp4_weight_kn_device,
+        pack_b_scale,
+        pack_mxfp4_weight_tiles,
+        unpack_b_scale,
+    )
+
+    w1_list, w1s_list, w3_list, w3s_list, w2_list, w2s_list = [], [], [], [], [], []
+    for e in range(n_experts):
+        seed = seed_base + e * 3
+        w1, w1s = gen_mxfp4_weight_kn_device(MOE_INTER, D, dequant_std["w1"], seed=seed)
+        w3, w3s = gen_mxfp4_weight_kn_device(MOE_INTER, D, dequant_std["w3"], seed=seed + 1)
+        w2, w2s = gen_mxfp4_weight_kn_device(D, MOE_INTER, dequant_std["w2"], seed=seed + 2)
+        w1_list.append(
+            pack_mxfp4_weight_tiles(w1, MX_K_TILE, MX_MM_INTER_TILE).reshape(
+                MX_W1_PACKED_ROWS,
+                MX_PACKED_LANE_COLS,
+            )
+        )
+        w1s_list.append(w1s)
+        w3_list.append(
+            pack_mxfp4_weight_tiles(w3, MX_K_TILE, MX_MM_INTER_TILE).reshape(
+                MX_W3_PACKED_ROWS,
+                MX_PACKED_LANE_COLS,
+            )
+        )
+        w3s_list.append(w3s)
+        w2_list.append(
+            pack_mxfp4_weight_tiles(w2, MX_K_TILE, MX_W2_D_OUT_TILE).reshape(
+                MX_W2_PACKED_ROWS,
+                MX_PACKED_LANE_COLS,
+            )
+        )
+        w2s_list.append(w2s)
+    def pack_expert_scales(scales):
+        logical = torch.stack(
+            [unpack_b_scale(scale.contiguous().view(torch.uint8)) for scale in scales]
+        ).flatten(0, 1)
+        return pack_b_scale(logical).view(torch.float8_e8m0fnu)
+
+    return (
+        torch.stack(w1_list),
+        pack_expert_scales(w1s_list),
+        torch.stack(w3_list),
+        pack_expert_scales(w3s_list),
+        torch.stack(w2_list),
+        pack_expert_scales(w2s_list),
+    )
+
+
+def build_tensor_specs():
+    import torch
+    from golden import TensorSpec
+    from utils import build_mxfp4_pair_lut, host_quant_mxfp8, pack_a_scale
+
+    # Across-layer-mean dequant std (typical layer) of the real routed experts.
+    ROUTED_DEQUANT_STD = {"w1": 2.47e-2, "w2": 2.44e-2, "w3": 2.46e-2}
+
+    total = B * S * M.num_experts_per_tok
+    counts = torch.bincount(
+        torch.randint(0, N_LOCAL_EXPERTS, (total,)),
+        minlength=N_LOCAL_EXPERTS,
+    ).to(torch.int32)
+    counts_2d = counts.reshape(N_LOCAL_EXPERTS, 1)
+
+    x_bf16 = torch.randn(N_LOCAL_EXPERTS, RECV_MAX, D, dtype=torch.bfloat16)
+    valid_mask_3d = (
+        torch.arange(RECV_MAX).reshape(1, RECV_MAX, 1) < counts.reshape(N_LOCAL_EXPERTS, 1, 1)
+    )
+    recv_x_pre = torch.zeros(N_LOCAL_EXPERTS, RECV_MAX, D, dtype=torch.float8_e4m3fn)
+    recv_scale_codes = torch.zeros(N_LOCAL_EXPERTS * RECV_MAX, K_SCALE, dtype=torch.uint8)
+    for e in range(N_LOCAL_EXPERTS):
+        n = int(counts_2d[e, 0].item())
+        if n > 0:
+            xf, xs = host_quant_mxfp8(x_bf16[e, :n, :], return_e8m0=True)
+            recv_x_pre[e, :n, :] = xf
+            recv_scale_codes[e * RECV_MAX : e * RECV_MAX + n, :] = xs.view(torch.uint8)
+    recv_mx_scale_pre = pack_a_scale(recv_scale_codes).view(torch.float8_e8m0fnu)
+    valid_mask_2d = valid_mask_3d.squeeze(-1)
+    recv_x_pre = torch.where(
+        valid_mask_3d,
+        recv_x_pre,
+        torch.zeros_like(recv_x_pre),
+    )
+
+    def init_recv_x():
+        return recv_x_pre
+
+    def init_recv_mx_scale():
+        return recv_mx_scale_pre.reshape(1, -1)
+
+    def init_recv_expert_count():
+        return counts_2d
+
+    recv_weights_pre = torch.rand(N_LOCAL_EXPERTS, RECV_MAX, dtype=torch.float32)
+    recv_weights_pre = torch.where(
+        valid_mask_2d, recv_weights_pre, torch.zeros_like(recv_weights_pre)
+    )
+
+    def init_recv_weights():
+        return recv_weights_pre
+
+    rw1_packed, rw1_scale, rw3_packed, rw3_scale, rw2_packed, rw2_scale = gen_routed_mxfp4_weights(
+        N_LOCAL_EXPERTS, ROUTED_DEQUANT_STD, seed_base=10
+    )
+    mxfp4_pair_lut = build_mxfp4_pair_lut()
+
+    fp8 = torch.float8_e4m3fn
+    fp8_e8m0 = torch.float8_e8m0fnu
+
+    return [
+        TensorSpec("recv_x", [N_LOCAL_EXPERTS, RECV_MAX, D], fp8, init_value=init_recv_x),
+        TensorSpec("recv_mx_scale", [1, N_LOCAL_EXPERTS * RECV_MAX * K_SCALE], fp8_e8m0, init_value=init_recv_mx_scale),
+        TensorSpec("recv_weights", [N_LOCAL_EXPERTS, RECV_MAX], torch.float32, init_value=init_recv_weights),
+        TensorSpec("recv_expert_count", [N_LOCAL_EXPERTS, 1], torch.int32, init_value=init_recv_expert_count),
+        TensorSpec(
+            "routed_w1_packed",
+            [N_LOCAL_EXPERTS, MX_W1_PACKED_ROWS, MX_PACKED_LANE_COLS],
+            torch.uint8,
+            init_value=lambda: rw1_packed,
+        ),
+        TensorSpec("routed_w1_scale", [N_LOCAL_EXPERTS * K_SCALE, MOE_INTER], fp8_e8m0, init_value=lambda: rw1_scale),
+        TensorSpec(
+            "routed_w3_packed",
+            [N_LOCAL_EXPERTS, MX_W3_PACKED_ROWS, MX_PACKED_LANE_COLS],
+            torch.uint8,
+            init_value=lambda: rw3_packed,
+        ),
+        TensorSpec("routed_w3_scale", [N_LOCAL_EXPERTS * K_SCALE, MOE_INTER], fp8_e8m0, init_value=lambda: rw3_scale),
+        TensorSpec(
+            "routed_w2_packed",
+            [N_LOCAL_EXPERTS, MX_W2_PACKED_ROWS, MX_PACKED_LANE_COLS],
+            torch.uint8,
+            init_value=lambda: rw2_packed,
+        ),
+        TensorSpec("routed_w2_scale", [N_LOCAL_EXPERTS * H_SCALE, D], fp8_e8m0, init_value=lambda: rw2_scale),
+        TensorSpec(
+            "mxfp4_pair_lut",
+            [2, 256],
+            torch.int16,
+            init_value=lambda: mxfp4_pair_lut,
+        ),
+        TensorSpec("recv_y", [N_LOCAL_EXPERTS, RECV_MAX, D], torch.bfloat16),
+    ]
+
+
+def active_recv_ratio_reldiff(*, diff_thd, pct_thd):
+    """Validate compact expert rows without borrowing padding capacity.
+
+    ``recv_y`` has a static ``RECV_MAX`` extent for every local expert, but
+    only the prefix described by ``recv_expert_count`` is computed. Numerical
+    tolerance applies to those active rows only; every inactive row must stay
+    bitwise equal to golden so stale or out-of-range writes cannot be hidden by
+    the much larger padded buffer.
+    """
+    import torch
+
+    from golden import ratio_reldiff
+
+    active_compare = ratio_reldiff(diff_thd=diff_thd, pct_thd=pct_thd)
+
+    def compare(actual, expected, **kwargs):
+        if actual.shape != expected.shape:
+            return False, (
+                f"    output shape mismatch: actual={tuple(actual.shape)} "
+                f"expected={tuple(expected.shape)}"
+            )
+        if actual.ndim != 3:
+            return False, f"    recv_y must have rank 3, got {tuple(actual.shape)}"
+
+        counts = kwargs.get("inputs", {}).get("recv_expert_count")
+        if counts is None:
+            return False, "    compare_fn misconfigured: missing input 'recv_expert_count'"
+        counts = counts.cpu().to(torch.int64).reshape(-1)
+        expert_count, recv_max, _ = actual.shape
+        if counts.numel() != expert_count:
+            return False, (
+                f"    recv_expert_count has {counts.numel()} values, "
+                f"expected {expert_count}"
+            )
+        invalid = (counts < 0) | (counts > recv_max)
+        if invalid.any().item():
+            expert = int(invalid.nonzero(as_tuple=False)[0].item())
+            return False, (
+                f"    recv_expert_count[{expert}]={int(counts[expert].item())} "
+                f"is outside [0, {recv_max}]"
+            )
+
+        rows = torch.arange(recv_max, dtype=torch.int64).reshape(1, -1)
+        active = rows < counts.reshape(-1, 1)
+        inactive = ~active
+
+        actual_f = actual.float()
+        expected_f = expected.float()
+        for label, values in (("actual", actual_f), ("expected", expected_f)):
+            invalid_values = ~torch.isfinite(values)
+            if invalid_values.any().item():
+                return False, (
+                    f"    illegal values in {label}: "
+                    f"count={int(invalid_values.sum().item())}"
+                )
+
+        if inactive.any().item() and not torch.equal(actual[inactive], expected[inactive]):
+            changed = int((actual[inactive] != expected[inactive]).sum().item())
+            return False, f"    inactive recv_y rows changed: changed_values={changed}"
+
+        if not active.any().item():
+            return True, ""
+        ok, detail = active_compare(actual[active], expected[active], **kwargs)
+        if ok:
+            return True, ""
+        return False, f"    active recv_y rows:\n{detail}"
+
+    compare.__name__ = (
+        f"active_recv_ratio_reldiff(diff_thd={diff_thd}, pct_thd={pct_thd})"
+    )
+    return compare
+
+
+if __name__ == "__main__":
+    import argparse
+    from golden import run
+
+    parser = argparse.ArgumentParser()
+    parser.add_argument("-p", "--platform", type=str, default="a5",
+                        choices=["a2a3", "a2a3sim", "a5", "a5sim"])
+    parser.add_argument("-d", "--device", type=int, default=0)
+    parser.add_argument("--enable-chip-swimlane", type=int, nargs="?", const=1, default=0, choices=(0, 1, 2, 4))
+    parser.add_argument("--dump-passes", action="store_true", default=False)
+    parser.add_argument("--save-data", action="store_true", default=False)
+    parser.add_argument("--golden-data", type=str, default=None)
+    args = parser.parse_args()
+
+    result = run(
+        fn=expert_routed_test,
+        specs=build_tensor_specs(),
+        golden_fn=golden_expert_routed,
+        golden_data=args.golden_data,
+        save_data=args.save_data,
+        config=dict(
+            dump_passes=args.dump_passes,
+            platform=args.platform,
+            device_id=args.device,
+            enable_chip_swimlane=args.enable_chip_swimlane,
+        ),
+        rtol=1e-3,
+        atol=1e-3,
+        compare_fn={
+            # BF16 recv_y, ~1 ULP. Gen weights reproduce real(L21): 0.016% vs 0.015% of points > 1e-3.
+            "recv_y": active_recv_ratio_reldiff(diff_thd=2e-3, pct_thd=0.01),
+        },
+    )
+    if not result.passed:
+        if result.error:
+            print(result.error)
+        raise SystemExit(1)

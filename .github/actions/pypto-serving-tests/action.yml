@@ -1,0 +1,210 @@
+name: Run pypto-serving model tests
+description: >-
+  Checkout pypto-serving, replace its pypto-lib submodule with the current
+  pypto-lib checkout under test, and run the selected serving tests via
+  task-submit.
+
+inputs:
+  pypto-lib-checkout-path:
+    description: Workspace-relative path to the pypto-lib checkout under test.
+    required: true
+  pypto-serving-checkout-path:
+    description: Workspace-relative path where pypto-serving should be checked out.
+    required: true
+  model-name:
+    description: Serving model guard to run (qwen3-14b, deepseek-v4, or deepseek-dspark).
+    required: true
+  deepseek-mtp-cases:
+    description: >-
+      Which DeepSeek MTP accuracy cases to run: "k1" runs the fused K=1 case
+      alone, "all" runs the whole accuracy file. Each on-device case starts its
+      own 8-card server, so "all" roughly doubles the device time; it also adds
+      the file's host-only unit tests, which "k1" skips.
+    required: false
+    default: "k1"
+  deepseek-dspark-cases:
+    description: >-
+      Which DSpark accuracy cases to run: "k7" runs the one-server
+      speculative K=7 case alone (cold greedy generation plus the grouped
+      prefix-cache phases on a single caching-enabled server), "all" runs the
+      whole accuracy file. "all" starts one 8-card server per on-device case,
+      roughly doubling the device time; it also adds the file's host-only
+      unit tests, which "k7" skips.
+    required: false
+    default: "k7"
+
+runs:
+  using: composite
+  steps:
+    - name: Resolve model dir
+      # setup-ci-job loads the runner config and exports the model dirs;
+      # this only picks the one the selected guard needs and checks the weights
+      # are actually there. First step on purpose: fail here with an actionable
+      # message, not 40 minutes later inside pytest as an opaque
+      # "PYPTO_*_MODEL_DIR not set or not a directory".
+      id: model
+      shell: bash
+      env:
+        MODEL_NAME: ${{ inputs.model-name }}
+      run: |
+        set -uo pipefail
+        case "$MODEL_NAME" in
+          qwen3-14b)       key=PYPTO_QWEN3_MODEL_DIR;      value="${PYPTO_QWEN3_MODEL_DIR:-}" ;;
+          deepseek-v4)     key=PYPTO_DSV4_MODEL_DIR;      value="${PYPTO_DSV4_MODEL_DIR:-}" ;;
+          deepseek-dspark) key=PYPTO_DSV4_DSPARK_MODEL_DIR; value="${PYPTO_DSV4_DSPARK_MODEL_DIR:-}" ;;
+          *) echo "::error::unknown model-name '$MODEL_NAME'"; exit 1 ;;
+        esac
+        if [ -z "$value" ]; then
+          echo "::error::$key is not set — add it to this runner's .env"
+          echo "(<runner-root>/.env, which setup-ci-job reads; restart the"
+          echo "runner service after editing it)"
+          exit 1
+        fi
+        if [ ! -d "$value" ]; then
+          echo "::error::$key points at a missing directory: $value"
+          echo "The $MODEL_NAME weights are not present on this runner."
+          exit 1
+        fi
+        echo "dir=$value" >> "$GITHUB_OUTPUT"
+        echo "$MODEL_NAME model dir resolved from the runner config"
+
+    - name: Checkout pypto-serving
+      uses: actions/checkout@v4
+      with:
+        repository: hw-native-sys/pypto-serving
+        ref: main
+        path: ${{ inputs.pypto-serving-checkout-path }}
+        submodules: recursive
+        persist-credentials: false
+
+    - name: Override pypto-serving submodule with pypto-lib under test
+      shell: bash
+      env:
+        PYPTO_LIB_CHECKOUT: ${{ inputs.pypto-lib-checkout-path }}
+        PYPTO_SERVING_CHECKOUT: ${{ inputs.pypto-serving-checkout-path }}
+      run: |
+        PYPTO_LIB_SHA=$(git -C "$PYPTO_LIB_CHECKOUT" rev-parse HEAD)
+        rm -rf "$PYPTO_SERVING_CHECKOUT/pypto-lib"
+        git clone --no-checkout "$PYPTO_LIB_CHECKOUT" "$PYPTO_SERVING_CHECKOUT/pypto-lib"
+        git -C "$PYPTO_SERVING_CHECKOUT/pypto-lib" checkout "$PYPTO_LIB_SHA"
+        echo "pypto-lib under test: $(git -C "$PYPTO_SERVING_CHECKOUT/pypto-lib" rev-parse HEAD)"
+        echo "pypto-serving base:  $(git -C "$PYPTO_SERVING_CHECKOUT" rev-parse HEAD)"
+
+    - name: Install pypto-serving test dependencies
+      shell: bash
+      working-directory: ${{ inputs.pypto-lib-checkout-path }}
+      run: |
+        source activate.sh
+        # setup-ci-job builds the job venv with `uv venv` on the toolchain
+        # bundle, and that venv carries no pip at all — so the installer is the
+        # one it named in PYPTO_USE_UV, not a hardcoded `pip`.
+        if [ "${PYPTO_USE_UV:-false}" = "true" ]; then
+          uv pip install transformers safetensors pytest fastapi uvicorn msgspec
+        else
+          pip install transformers safetensors pytest fastapi uvicorn msgspec
+        fi
+
+    - name: Run pypto-serving Qwen tests
+      if: ${{ inputs.model-name == 'qwen3-14b' }}
+      shell: bash
+      env:
+        PYPTO_QWEN3_MODEL_DIR: ${{ steps.model.outputs.dir }}
+        PYPTO_LIB_CHECKOUT: ${{ inputs.pypto-lib-checkout-path }}
+        PYPTO_SERVING_CHECKOUT: ${{ inputs.pypto-serving-checkout-path }}
+      run: |
+        source "$GITHUB_WORKSPACE/$PYPTO_LIB_CHECKOUT/activate.sh"
+        run_cmd="source $GITHUB_WORKSPACE/$PYPTO_LIB_CHECKOUT/activate.sh"
+        run_cmd="$run_cmd && cd $GITHUB_WORKSPACE/$PYPTO_SERVING_CHECKOUT"
+        run_cmd="$run_cmd && DEVICE_ID=\$TASK_DEVICE"
+        run_cmd="$run_cmd PYTHONPATH=$GITHUB_WORKSPACE/$PYPTO_SERVING_CHECKOUT"
+        run_cmd="$run_cmd PYPTO_QWEN3_MODEL_DIR=$PYPTO_QWEN3_MODEL_DIR"
+        run_cmd="$run_cmd python -m pytest tests/test_qwen3_accuracy.py -q -s"
+        task-submit --device "$DEVICE_ID" --timeout 3600 --max-time 1800 \
+          --run "$run_cmd"
+
+    - name: Run pypto-serving DeepSeek V4 accuracy test
+      if: ${{ inputs.model-name == 'deepseek-v4' }}
+      shell: bash
+      env:
+        PYPTO_DSV4_MODEL_DIR: ${{ steps.model.outputs.dir }}
+        PYPTO_RUNTIME_LOG: error
+        SIMPLER_OP_EXECUTE_TIMEOUT_US: 400000000
+        SIMPLER_STREAM_SYNC_TIMEOUT_MS: 440000
+        SIMPLER_SCHEDULER_TIMEOUT_MS: 320000
+        SERVING_WORKER_STEP_TIMEOUT: 1800
+        PYPTO_LIB_CHECKOUT: ${{ inputs.pypto-lib-checkout-path }}
+        PYPTO_SERVING_CHECKOUT: ${{ inputs.pypto-serving-checkout-path }}
+        MTP_CASES: ${{ inputs.deepseek-mtp-cases }}
+      run: |
+        # "k1" selects the fused case by node id: one 8-card server start
+        # instead of two. A renamed case id makes pytest exit 4 (no tests ran)
+        # rather than silently widening the run.
+        test_file=tests/test_deepseek_v4_accuracy.py
+        mtp_test=test_deepseek_v4_http_completion_contract
+        case "$MTP_CASES" in
+          k1)  pytest_target="'$test_file::$mtp_test[k1-fused]'" ;;
+          all) pytest_target="$test_file" ;;
+          *) echo "::error::unknown deepseek-mtp-cases '$MTP_CASES' (expected k1 or all)"; exit 1 ;;
+        esac
+        source "$GITHUB_WORKSPACE/$PYPTO_LIB_CHECKOUT/activate.sh"
+        run_cmd="source $GITHUB_WORKSPACE/$PYPTO_LIB_CHECKOUT/activate.sh"
+        run_cmd="$run_cmd && cd $GITHUB_WORKSPACE/$PYPTO_SERVING_CHECKOUT"
+        run_cmd="$run_cmd && TASK_DEVICE=\$TASK_DEVICE"
+        run_cmd="$run_cmd PYTHONPATH=$GITHUB_WORKSPACE/$PYPTO_SERVING_CHECKOUT"
+        run_cmd="$run_cmd PYPTO_DSV4_MODEL_DIR=$PYPTO_DSV4_MODEL_DIR"
+        run_cmd="$run_cmd PYPTO_RUNTIME_LOG=$PYPTO_RUNTIME_LOG"
+        run_cmd="$run_cmd SIMPLER_OP_EXECUTE_TIMEOUT_US=$SIMPLER_OP_EXECUTE_TIMEOUT_US"
+        run_cmd="$run_cmd SIMPLER_STREAM_SYNC_TIMEOUT_MS=$SIMPLER_STREAM_SYNC_TIMEOUT_MS"
+        run_cmd="$run_cmd SIMPLER_SCHEDULER_TIMEOUT_MS=$SIMPLER_SCHEDULER_TIMEOUT_MS"
+        run_cmd="$run_cmd SERVING_WORKER_STEP_TIMEOUT=$SERVING_WORKER_STEP_TIMEOUT"
+        run_cmd="$run_cmd python -m pytest $pytest_target -q -s"
+        task-submit --device auto --device-num 8 --ignore-whitelist \
+          --timeout 3600 --max-time 1800 \
+          --run "$run_cmd"
+
+    - name: Run pypto-serving DSpark accuracy test
+      if: ${{ inputs.model-name == 'deepseek-dspark' }}
+      shell: bash
+      env:
+        PYPTO_DSV4_DSPARK_MODEL_DIR: ${{ steps.model.outputs.dir }}
+        PYPTO_RUNTIME_LOG: error
+        DSPARK_CASES: ${{ inputs.deepseek-dspark-cases }}
+        PYPTO_LIB_CHECKOUT: ${{ inputs.pypto-lib-checkout-path }}
+        PYPTO_SERVING_CHECKOUT: ${{ inputs.pypto-serving-checkout-path }}
+      run: |
+        # "k7" selects the one-server speculative case by node id: a single
+        # caching-enabled K=7 server covers the greedy generation guard and
+        # the grouped prefix-cache guard in one 8-card boot. A renamed case id
+        # makes pytest exit 4 (no tests ran) rather than silently widening
+        # the run.
+        test_file=tests/test_deepseek_dspark_accuracy.py
+        dspark_test=test_dspark_http_k7_one_server
+        case "$DSPARK_CASES" in
+          k7)  pytest_target="$test_file::$dspark_test" ;;
+          all) pytest_target="$test_file" ;;
+          *) echo "::error::unknown deepseek-dspark-cases '$DSPARK_CASES' (expected k7 or all)"; exit 1 ;;
+        esac
+        source "$GITHUB_WORKSPACE/$PYPTO_LIB_CHECKOUT/activate.sh"
+        run_cmd="source $GITHUB_WORKSPACE/$PYPTO_LIB_CHECKOUT/activate.sh"
+        run_cmd="$run_cmd && cd $GITHUB_WORKSPACE/$PYPTO_SERVING_CHECKOUT"
+        run_cmd="$run_cmd && TASK_DEVICE=\$TASK_DEVICE"
+        run_cmd="$run_cmd PYTHONPATH=$GITHUB_WORKSPACE/$PYPTO_SERVING_CHECKOUT"
+        run_cmd="$run_cmd PYPTO_DSV4_DSPARK_MODEL_DIR=$PYPTO_DSV4_DSPARK_MODEL_DIR"
+        # EP8 on the fixed TP4: an 8-card borrow (DP = 8/4 = 2) covers the
+        # deployment axes at half the 16-card cost.
+        run_cmd="$run_cmd PYPTO_DSPARK_EP_SIZE=8"
+        # EP8 doubles each rank's routed experts (256/8 vs 256/16), which
+        # leaves the KV budget ~3.4 GiB negative at npu_memory_utilization
+        # 0.90 with the 16-card ring heaps. Halve the prefill profile (the
+        # test's documented PYPTO_DSPARK_RING_HEAP knob) and shrink the
+        # drafter pooled arena (16 GiB bring-up default -> 4 GiB); the KV
+        # pool then fits with 12 slots and the K=7 wave dispatches. Both are
+        # generous defaults, not kernel-validated minimums; the 16-card
+        # deployment keeps them unchanged.
+        run_cmd="$run_cmd PYPTO_DSPARK_RING_HEAP=1073741824,1073741824,2147483648,4294967296"
+        run_cmd="$run_cmd PYPTO_DSPARK_DRAFTER_RING_HEAP=1073741824,1073741824,1073741824,1073741824"
+        run_cmd="$run_cmd PYPTO_RUNTIME_LOG=$PYPTO_RUNTIME_LOG"
+        run_cmd="$run_cmd python -m pytest $pytest_target -q -s"
+        task-submit --device auto --device-num 8 --ignore-whitelist \
+          --timeout 3600 --max-time 2400 \
+          --run "$run_cmd"
