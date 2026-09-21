@@ -1,6 +1,11 @@
 name: Daily CI
 
 on:
+  # EXPERIMENT ONLY (do not merge): run this workflow on demand from the
+  # experiment branch, with every job the change under test does not touch
+  # gated off below so no shared runner is occupied for nothing.
+  push:
+    branches: [exp/ptoas-op-fusion-ab]
   schedule:
     - cron: '51 20 * * *'  # UTC 20:51 = Shanghai 04:51
   workflow_dispatch:
@@ -32,7 +37,7 @@ jobs:
         # Route the model families to their matching simulator: a2a3sim sweeps
         # every A2/A3 model, while a5sim sweeps the V4.1-Flash tree — the same
         # operators the a5 device job runs, on the cases a simulator can take.
-        platform: [a2a3sim, a5sim]
+        platform: [a5sim]  # EXPERIMENT ONLY: a2a3sim is untouched here.
     defaults:
       run:
         working-directory: checkout
@@ -170,7 +175,8 @@ jobs:
           path: checkout/results.tsv
 
   model-tests-a2a3:
-    if: ${{ !inputs.performance_only }}
+    # EXPERIMENT ONLY: untouched by the change under test.
+    if: ${{ !inputs.performance_only && github.event_name != 'push' }}
     # Runs directly on the host like pypto's dist-system-tests — multi-card
     # kernels use HCCL, which needs a host-only env (set_env.sh, HCCL plugin
     # paths); under docker the chip child silent-crashes in comm_init. It holds
@@ -501,7 +507,9 @@ jobs:
           path: checkout/results.tsv
 
   e2e-flash-a5:
-    if: ${{ !inputs.performance_only }}
+    # EXPERIMENT ONLY: untouched by the change under test, and it would hold
+    # the A5 runner for hours that model-tests-a5 needs.
+    if: ${{ !inputs.performance_only && github.event_name != 'push' }}
     name: DeepSeek-V4-Flash EP8 end-to-end (a5)
     # The only nightly that runs the whole prompt -> tokens -> text path on real
     # weights; model-tests-a5 covers the operators one by one on synthetic data.
@@ -753,6 +761,8 @@ jobs:
           if-no-files-found: error
 
   operator-performance:
+    # EXPERIMENT ONLY: untouched by the change under test.
+    if: ${{ github.event_name != 'push' }}
     name: MTP and DSpark operator performance (a2a3)
     runs-on: [self-hosted, linux, arm64, npu]
     # Twenty serial task-submit cases, each bounded by --timeout 3600.
