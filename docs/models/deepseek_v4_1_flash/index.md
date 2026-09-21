@@ -260,6 +260,12 @@ round-robin across the four TP ranks. This prevents replicated attention rows
 from being dispatched four times; MoE combine returns the rows to the TP
 layout. DSA context parallelism is intentionally out of scope.
 
+`prefill_swa.py` keeps mHC residuals token-sharded across TP ranks. It applies
+mHC-pre and input RMSNorm locally, AllGathers the attention input, and
+ReduceScatters FP32 output-projection partials before local mHC-post.
+`incoming_pre_mix` and `next_pre_mix` carry the staggered mHC state between
+sublayers. The standalone `prefill_attn_swa.py` retains replicated output.
+
 The service capacity contract is 32 active sequences and 4,096 scheduled
 prefill token rows per DP group. With five reserved DSpark draft rows plus one
 target row, the decode ABI reserves 192 token rows per DP group. DP2 therefore
