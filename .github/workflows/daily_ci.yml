@@ -30,7 +30,8 @@ jobs:
       fail-fast: false
       matrix:
         # Route the model families to their matching simulator: a2a3sim sweeps
-        # every non-Pro model, while a5sim sweeps only the A5-targeted Pro tree.
+        # every A2/A3 model, while a5sim sweeps the V4.1-Flash tree — the same
+        # operators the a5 device job runs, on the cases a simulator can take.
         platform: [a2a3sim, a5sim]
     defaults:
       run:
@@ -68,8 +69,8 @@ jobs:
           build-namespace: ${{ matrix.platform }}
           pip-cache-name: pip-sim
           toolchain: bundle
-          # a5sim is the MXFP8 leg: both A5 trees hold every MX scale in a
-          # torch.float8_e8m0fnu tensor, which 2.6 does not have. 20 of the 24
+          # a5sim is the MXFP8 leg: the V4.1-Flash tree holds every MX scale in
+          # a torch.float8_e8m0fnu tensor, which 2.6 does not have. 20 of the 24
           # a5sim failures in the 2026-09-19 nightly were that one
           # AttributeError, raised before anything compiled. a2a3sim keeps the
           # default, which is the version the serving torch_npu pin requires.
@@ -82,9 +83,6 @@ jobs:
           PYTHONPATH: ${{ github.workspace }}/checkout
           PYPTO_LOG_LEVEL: error
           PYPTO_WARNING_LEVEL: none
-          # Keep the Pro simulator leg pinned to the Pro preset even if the
-          # runner environment selects the optional Flash preset.
-          DEEPSEEK_V4_VARIANT: ${{ matrix.platform == 'a5sim' && 'pro' || '' }}
           # Quiet simpler's runtime logger. On a SIMPLER_PROFILING build every
           # simpler_run emits its [STRACE] timing tree at the INFO_V9 tier, and
           # simpler's logger defaults to INFO — so without this the console floods
@@ -113,15 +111,18 @@ jobs:
           # `# ci: no-sim` (full multi-layer / multi-card forwards) are
           # device-only and would just argparse-reject *sim, so skip them here.
           for f in $(find models -name '*.py' ! -name '*_draft.py' | sort); do
-            # a5sim takes both A5 trees; the a2a3 legs take neither. Of the
-            # V4.1-Flash directory it keeps whatever a simulator can run: the
-            # `# ci: a5` device entries split the `__main__` sentinel and carry
-            # `# ci: no-sim`, so the two filters below drop them, which leaves
-            # the MoE, gate, expert and transport files. Those declare a5sim
-            # among their own `-p` choices and have had no daily run since the
-            # A2/A3 sweeps stopped taking this directory.
+            # a5sim takes the V4.1-Flash tree; the a2a3 legs take neither A5
+            # tree. Of that directory a5sim keeps whatever a simulator can run:
+            # the `# ci: a5` device entries split the `__main__` sentinel and
+            # carry `# ci: no-sim`, so the two filters below drop them, which
+            # leaves the MoE, gate, expert and transport files. The V4 tree
+            # (models/deepseek_v4_pro, Pro and Flash presets of the same code)
+            # rode along here until its device sweep was retired; with it gone
+            # the nightly's A5 operator coverage is one family, V4.1-Flash, and
+            # the only V4 left on A5 is the Flash end-to-end job, which runs
+            # that tree on real weights rather than case by case.
             if [ "${{ matrix.platform }}" = "a5sim" ]; then
-              [[ "$f" == models/deepseek_v4_pro/* || "$f" == models/deepseek_v4_1_flash/* ]] || continue
+              [[ "$f" == models/deepseek_v4_1_flash/* ]] || continue
             elif [[ "$f" == models/deepseek_v4_pro/* || "$f" == models/deepseek_v4_1_flash/* ]]; then
               continue
             fi
@@ -322,10 +323,9 @@ jobs:
     # reaches, and this one runs all of them, every declared parallel case, so
     # an entry no diff touches cannot rot unnoticed.
     #
-    # Unlike the V4-Pro sweep it replaces (report-only, 13/35 on device, red
+    # Unlike the V4-Pro sweep it replaced (report-only, 13/35 on device, red
     # from pypto/device-side faults rather than defects here) these entries are
     # green on the pull-request job, so this one gates: red means a regression.
-    # V4-Pro keeps its daily correctness run on a5sim above.
     #
     # It goes through the same setup-ci-job as the other device jobs
     # (needs-device:true); the A5 host's own runner .env supplies its CANN_ROOT
@@ -848,9 +848,8 @@ jobs:
           python3 - <<'EOF' >> "$GITHUB_STEP_SUMMARY"
           import pathlib
 
-          # One table per case set. a2a3 and a2a3sim share theirs; the two A5
-          # legs do not, since a5sim sweeps V4-Pro while the a5 device job
-          # sweeps the V4.1-Flash entries case by parallel case.
+          # One table per model family: a2a3 with a2a3sim, and the two A5 legs
+          # together now that both sweep the V4.1-Flash entries.
           ICON = {"pass": ":white_check_mark:", "fail": ":x:", "missing": ":heavy_minus_sign:"}
           ROOT = pathlib.Path("results")
 
@@ -900,6 +899,66 @@ jobs:
               print("Passed: " + ", ".join(
                   f"**{p}** {sum(1 for v in data[p].values() if v == 'pass')}"
                   f"/{len(data[p])}" for p in present))
+              if missing:
+                  print()
+                  print(no_artifact(missing) + " Those columns read all `-`.")
+              print()
+
+          def v41_table(title, platforms):
+              """One table for the V4.1-Flash entries across both A5 legs.
+
+              The legs key their cases differently: the a5 device job runs every
+              --tp/--dp combination an entry declares and labels each case with
+              its arguments, while a5sim runs the entry once with none. Keying
+              the row on the entry itself puts them side by side; a cell that
+              stands for more than one case carries its pass count and names the
+              cases that failed, so nothing the split tables showed is lost.
+              """
+              data = {p: load(p) for p in platforms}
+              present = [p for p in platforms if data[p] is not None]
+              missing = [p for p in platforms if data[p] is None]
+              print(f"### {title}")
+              print()
+              if not present:
+                  print(no_artifact(missing))
+                  print()
+                  return
+              # platform -> entry -> {case arguments ("" when it has none): status}
+              cases = {p: {} for p in platforms}
+              for p in present:
+                  for label, status in data[p].items():
+                      entry, _, args = label.partition(" ")
+                      cases[p].setdefault(entry, {})[args] = status
+
+              def cell(by_args):
+                  if not by_args:
+                      return ICON["missing"]
+                  bad = sorted(a for a, s in by_args.items() if s != "pass")
+                  icon = ICON["fail"] if bad else ICON["pass"]
+                  if len(by_args) == 1:
+                      # The entry has a single case, so a count would say
+                      # nothing the icon does not.
+                      return icon
+                  text = f"{icon} {len(by_args) - len(bad)}/{len(by_args)}"
+                  if bad:
+                      text += " — failed: " + ", ".join(f"`{a}`" for a in bad)
+                  return text
+
+              print("| Entry | " + " | ".join(platforms) + " |")
+              print("| " + " | ".join("---" for _ in range(1 + len(platforms))) + " |")
+              for entry in sorted({e for p in present for e in cases[p]}):
+                  row = [f"`{entry}`"] + [cell(cases[p].get(entry)) for p in platforms]
+                  print("| " + " | ".join(row) + " |")
+              print()
+              print("Passed: " + ", ".join(
+                  f"**{p}** {sum(1 for v in data[p].values() if v == 'pass')}"
+                  f"/{len(data[p])} cases" for p in present))
+              print()
+              print(
+                  ":heavy_minus_sign: means the entry has no case on that leg: "
+                  "the device entries are `# ci: no-sim`, and the files a "
+                  "simulator can run carry no `# ci: a5` marker."
+              )
               if missing:
                   print()
                   print(no_artifact(missing) + " Those columns read all `-`.")
@@ -980,7 +1039,6 @@ jobs:
           print("## Daily CI Model Test Results")
           print()
           table("a2a3 and a2a3sim", ["a2a3", "a2a3sim"])
-          table("a5sim (DeepSeek V4-Pro and V4.1-Flash)", ["a5sim"])
-          table("a5 (DeepSeek V4.1-Flash)", ["a5"])
+          v41_table("a5 and a5sim (DeepSeek V4.1-Flash)", ["a5", "a5sim"])
           e2e("a5 DeepSeek-V4-Flash EP8 end-to-end token generation (real weights)", "e2e-a5")
           EOF
