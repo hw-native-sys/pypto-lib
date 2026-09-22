@@ -82,7 +82,6 @@ def _moe_core(
     shared_w2_scale: pl.Tensor[[C.MOE_INTER // MX_GROUP, D], pl.FP8E8M0, pl.MX_B_NN],
     shared_w3: pl.Tensor[[D, C.MOE_INTER], pl.FP8E4M3FN],
     shared_w3_scale: pl.Tensor[[D // MX_GROUP, C.MOE_INTER], pl.FP8E8M0, pl.MX_B_NN],
-    token_owners: pl.Tensor[[C.T_DYN], pl.INT32],
     recv_meta: pld.DistributedTensor[[EP_SIZE, N_LOCAL_EXPERTS], pl.INT32],
     recv_x: pld.DistributedTensor[[N_LOCAL_EXPERTS * RECV_MAX, D], pl.INT8],
     recv_scale: pld.DistributedTensor[[N_LOCAL_EXPERTS * RECV_MAX, D // MX_GROUP], pl.UINT8],
@@ -95,8 +94,6 @@ def _moe_core(
     output: pl.Out[pl.Tensor[[C.T_DYN, D], pl.BF16]],
     num_tokens: pl.Scalar[pl.INT32],
     ep_rank: pl.Scalar[pl.INT32],
-    group_base: pl.Scalar[pl.INT32],
-    tp_rank: pl.Scalar[pl.INT32],
     moe_epoch: pl.Scalar[pl.INT32],
 ):
     t = MOE_TOKENS
@@ -128,7 +125,7 @@ def _moe_core(
     if SKIP_TRANSPORT_TEST:
         with pl.spmd(t, name_hint="moe_skip_transport_output", deps=[_output_zero_tid]):
             out_t = pl.tile.get_block_idx()
-            if out_t < num_tokens and pl.read(token_owners, [out_t]) == ep_rank:
+            if out_t < num_tokens:
                 out_row = pl.load(shared_output, [out_t, 0], [1, D])
                 output = pl.store(out_row, [out_t, 0], output)
     else:
@@ -146,7 +143,7 @@ def _moe_core(
         dispatch(indices, x_norm_mx, x_norm_scale, weights, recv_x_local, recv_scale_local_backing,
                  recv_weight_local, recv_route_local, recv_count_local, recv_meta_local,
                  recv_meta, recv_x, recv_scale, recv_weights, recv_routes, arrived,
-                 data_arrived, token_owners, num_tokens, ep_rank, moe_epoch)
+                 data_arrived, num_tokens, ep_rank, moe_epoch)
 
         routed_y = pl.create_tensor([N_LOCAL_EXPERTS, RECV_MAX, D], dtype=pl.BF16)
         # dispatch already filled this backing; expert_routed views it as MX_A_ZZ.
@@ -156,7 +153,7 @@ def _moe_core(
         # combine writes the final output directly: a dynamically shaped intermediate
         # would escape its defining scope during PTOAS SSA conversion.
         combine(routed_y, recv_route_local, shared_output, output, recv_meta_local,
-                routed_output, combine_arrived, token_owners, num_tokens, ep_rank, moe_epoch)
+                routed_output, combine_arrived, num_tokens, ep_rank, moe_epoch)
 
 
 @pl.jit.inline(auto_scope=False)
@@ -200,7 +197,6 @@ def moe(
     shared_w3_scale: pl.Tensor[
         [D // MX_GROUP, C.MOE_INTER], pl.FP8E8M0, pl.MX_B_NN
     ],
-    token_owners: pl.Tensor[[C.T_DYN], pl.INT32],
     next_pre_mix: pl.Out[pl.Tensor[[C.T_DYN, HC_MULT], pl.FP32]],
     x_mixed: pl.Out[pl.Tensor[[C.T_DYN, D], pl.BF16]],
     x_next: pl.Out[pl.Tensor[[C.T_DYN, HC_MULT, D], pl.FP32]],
@@ -221,8 +217,6 @@ def moe(
     combine_arrived: pld.DistributedTensor[[EP_SIZE, 1], pl.INT32],
     num_tokens: pl.Scalar[pl.INT32],
     ep_rank: pl.Scalar[pl.INT32],
-    group_base: pl.Scalar[pl.INT32],
-    tp_rank: pl.Scalar[pl.INT32],
     moe_epoch: pl.Scalar[pl.INT32],
 ) -> pl.Tensor[[C.T_DYN, HC_MULT, D], pl.FP32]:
     """Run delayed mHC pre-mix, MoE, and residual expansion.
@@ -244,9 +238,9 @@ def moe(
 
     # Keep the transport windows and routed result alive through combine.
     with pl.scope():
-        # combine writes owner rows only, and _moe_core zero-initialises the
-        # whole buffer as its first action, so non-owner/inactive rows reach
-        # mhc_post as the pure residual expansion.
+        # combine writes every local active row, and _moe_core zero-initialises
+        # the whole buffer as its first action, so padded rows reach mhc_post
+        # as the pure residual expansion.
         #
         # This must stay a pl.create_tensor(): pl.full() produces a fill value
         # with no inferable tensor metadata, and the specializer resolves
@@ -259,10 +253,10 @@ def moe(
             routed_w1, routed_w1_scale, routed_w2, routed_w2_scale,
             routed_w3, routed_w3_scale, mxfp4_pair_lut, shared_w1, shared_w1_scale,
             shared_w2, shared_w2_scale, shared_w3, shared_w3_scale,
-            token_owners, recv_meta, recv_x, recv_scale, recv_weights,
+            recv_meta, recv_x, recv_scale, recv_weights,
             recv_routes, arrived, data_arrived, routed_output,
             combine_arrived, sublayer,
-            num_tokens, ep_rank, group_base, tp_rank, moe_epoch,
+            num_tokens, ep_rank, moe_epoch,
         )
         mhc_post(sublayer, x_hc, post_mix, residual_mix, x_next)
     return x_next
@@ -309,7 +303,6 @@ def moe_test(
     shared_w3_scale: pl.Tensor[
         [D // MX_GROUP, C.MOE_INTER], pl.FP8E8M0, pl.MX_B_NN
     ],
-    token_owners: pl.Tensor[[C.T_DYN], pl.INT32],
     next_pre_mix: pl.Out[pl.Tensor[[C.T_DYN, HC_MULT], pl.FP32]],
     x_mixed: pl.Out[pl.Tensor[[C.T_DYN, D], pl.BF16]],
     x_next: pl.Out[pl.Tensor[[C.T_DYN, HC_MULT, D], pl.FP32]],
@@ -328,10 +321,8 @@ def moe_test(
     data_arrived: pld.DistributedTensor[[EP_SIZE, 1], pl.INT32],
     routed_output: pld.DistributedTensor[[C.ROUTE_T_DYN, D], pl.BF16],
     combine_arrived: pld.DistributedTensor[[EP_SIZE, 1], pl.INT32],
-    num_tokens: pl.Scalar[pl.INT32],
+    num_tokens: pl.Tensor[[EP_SIZE], pl.INT32],
     ep_rank: pl.Scalar[pl.INT32],
-    group_base: pl.Scalar[pl.INT32],
-    tp_rank: pl.Scalar[pl.INT32],
     moe_epoch: pl.Scalar[pl.INT32],
 ) -> pl.Tensor[[C.T_DYN, HC_MULT, D], pl.FP32]:
     x_hc.bind_dynamic(0, C.T_DYN)
@@ -339,16 +330,17 @@ def moe_test(
     next_pre_mix.bind_dynamic(0, C.T_DYN)
     x_mixed.bind_dynamic(0, C.T_DYN)
     x_next.bind_dynamic(0, C.T_DYN)
+    local_num_tokens = pl.read(num_tokens, [ep_rank])
     return moe(
         x_hc, pre_mix, hc_ffn_fn, hc_ffn_scale, hc_ffn_base,
         norm_weight, gate_weight, correction_bias,
         routed_w1, routed_w1_scale, routed_w2, routed_w2_scale,
         routed_w3, routed_w3_scale, mxfp4_pair_lut, shared_w1, shared_w1_scale,
         shared_w2, shared_w2_scale, shared_w3, shared_w3_scale,
-        token_owners, next_pre_mix, x_mixed, x_next,
+        next_pre_mix, x_mixed, x_next,
         recv_meta, recv_x, recv_scale, recv_weights, recv_routes,
         arrived, data_arrived, routed_output, combine_arrived,
-        num_tokens, ep_rank, group_base, tp_rank, moe_epoch,
+        local_num_tokens, ep_rank, moe_epoch,
     )
 
 
@@ -399,7 +391,6 @@ def l3_moe(
     shared_w3_scale: pl.Tensor[
         [EP_SIZE, D // MX_GROUP, C.MOE_INTER], pl.FP8E8M0
     ],
-    token_owners: pl.Tensor[[EP_SIZE, MOE_TOKENS], pl.INT32],
     next_pre_mix: pl.Out[
         pl.Tensor[[EP_SIZE, MOE_TOKENS, HC_MULT], pl.FP32]
     ],
@@ -409,7 +400,7 @@ def l3_moe(
     x_next: pl.Out[
         pl.Tensor[[EP_SIZE, MOE_TOKENS, HC_MULT, D], pl.FP32]
     ],
-    num_tokens: pl.Scalar[pl.INT32],
+    num_tokens: pl.Tensor[[EP_SIZE], pl.INT32],
     moe_epoch: pl.Scalar[pl.INT32],
 ):
     """EP host driver for the mHC-wrapped Flash MoE block."""
@@ -486,10 +477,10 @@ def l3_moe(
             routed_w1[r], routed_w1_scale_r, routed_w2[r], routed_w2_scale_r,
             routed_w3[r], routed_w3_scale_r, mxfp4_pair_lut[r], shared_w1[r], shared_w1_scale_r,
             shared_w2[r], shared_w2_scale_r, shared_w3[r], shared_w3_scale_r,
-            token_owners[r], next_pre_mix[r], x_mixed[r], x_next[r],
+            next_pre_mix[r], x_mixed[r], x_next[r],
             recv_meta, recv_x, recv_scale, recv_weights, recv_routes,
             arrived, data_arrived, routed_output, combine_arrived,
-            num_tokens, r, pl.const(0, pl.INT32), r, moe_epoch, device=r,
+            num_tokens, r, moe_epoch, device=r,
         )
 
 
@@ -506,9 +497,27 @@ def _e8m0_dtype():
     return getattr(torch, "float8_e8m0fnu", torch.uint8)
 
 
-def _owner_pattern() -> torch.Tensor:
-    # Every rank receives the same TP-owner row map; rank r only writes rows it owns.
-    return torch.arange(MOE_TOKENS, dtype=torch.int32).remainder(EP_SIZE)
+def _normalise_num_tokens(value):
+    """Return validated local-token counts for every EP source rank.
+
+    The public L3 ABI carries one count per EP rank.  Accepting a scalar here
+    keeps the command-line fixture backward compatible by broadcasting it to
+    every rank, while the tensor ABI still represents ragged and empty shards.
+    """
+    counts = torch.as_tensor(value, dtype=torch.int32).reshape(-1)
+    if counts.numel() == 1:
+        counts = counts.repeat(EP_SIZE)
+    if counts.numel() != EP_SIZE:
+        raise ValueError(
+            f"num_tokens must be a scalar or contain {EP_SIZE} counts, "
+            f"got shape {tuple(counts.shape)}"
+        )
+    if bool((counts < 0).any()) or bool((counts > MOE_TOKENS).any()):
+        raise ValueError(
+            f"num_tokens values must be in [0, {MOE_TOKENS}], "
+            f"got {counts.tolist()}"
+        )
+    return counts.contiguous()
 
 
 def _route_bias() -> torch.Tensor:
@@ -535,7 +544,7 @@ def _build_moe_tensor_specs(num_tokens: int = MOE_TOKENS):
         gen_mxfp8_weight_kn_v41,
     )
 
-    active = max(0, min(MOE_TOKENS, int(num_tokens)))
+    counts = _normalise_num_tokens(num_tokens)
     torch.manual_seed(41)
 
     x = (torch.randn(EP_SIZE, MOE_TOKENS, D) * 0.25).to(torch.bfloat16)
@@ -543,7 +552,6 @@ def _build_moe_tensor_specs(num_tokens: int = MOE_TOKENS):
     gate_weight = (torch.randn(C.N_EXPERTS, D) / D ** 0.5)
     gate_weight = gate_weight.unsqueeze(0).expand(EP_SIZE, -1, -1).contiguous()
     correction_bias = _route_bias().unsqueeze(0).expand(EP_SIZE, -1).contiguous()
-    token_owners = _owner_pattern().unsqueeze(0).expand(EP_SIZE, -1).contiguous()
 
     routed_w1_shape = (EP_SIZE, N_LOCAL_EXPERTS, MX_W1_PACKED_ROWS, MX_PACKED_LANE_COLS)
     routed_w1_scale_shape = (EP_SIZE, N_LOCAL_EXPERTS * (D // MX_GROUP), C.MOE_INTER)
@@ -610,14 +618,14 @@ def _build_moe_tensor_specs(num_tokens: int = MOE_TOKENS):
         TensorSpec("shared_w2_scale", [EP_SIZE, C.MOE_INTER // MX_GROUP, D], e8m0, init_value=lambda: shared_w2_scale),
         TensorSpec("shared_w3", [EP_SIZE, D, C.MOE_INTER], fp8, init_value=lambda: shared_w3),
         TensorSpec("shared_w3_scale", [EP_SIZE, D // MX_GROUP, C.MOE_INTER], e8m0, init_value=lambda: shared_w3_scale),
-        TensorSpec("token_owners", [EP_SIZE, MOE_TOKENS], torch.int32, init_value=lambda: token_owners),
         TensorSpec("output", [EP_SIZE, MOE_TOKENS, D], torch.bfloat16),
-        ScalarSpec("num_tokens", torch.int32, active),
+        TensorSpec("num_tokens", [EP_SIZE], torch.int32,
+                   init_value=lambda: counts),
         ScalarSpec("moe_epoch", torch.int32, 1, compile_runtime=True, benchmark_step=1),
     ]
 
     for spec in specs:
-        if spec.name not in {"x", "token_owners", "output", "num_tokens", "moe_epoch"}:
+        if spec.name not in {"x", "output", "num_tokens", "moe_epoch"}:
             spec.resident = "stacked"
     return specs
 
@@ -633,7 +641,7 @@ def build_tensor_specs(num_tokens: int = MOE_TOKENS):
         spec for spec in base_specs
         if spec.name not in {"x", "output", "num_tokens", "moe_epoch"}
     ]
-    scalar_specs = [
+    runtime_specs = [
         spec for spec in base_specs
         if spec.name in {"num_tokens", "moe_epoch"}
     ]
@@ -697,7 +705,7 @@ def build_tensor_specs(num_tokens: int = MOE_TOKENS):
     # Match l3_moe's ABI: mHC inputs, MoE weights/route inputs, outputs,
     # then runtime scalars.
     output_specs = [next_pre_mix_spec, x_mixed_spec, x_next_spec]
-    specs = mhc_specs + common_specs + output_specs + scalar_specs
+    specs = mhc_specs + common_specs + output_specs + runtime_specs
     for spec in specs:
         if spec.name in {
             "hc_ffn_fn", "hc_ffn_scale", "hc_ffn_base",
@@ -714,7 +722,7 @@ def _golden_moe_core(tensors):
     from models.deepseek_v4_1_flash.expert_routed import golden_expert_routed
     from models.deepseek_v4_1_flash.quantization import pack_mx_a_scale, unpack_mx_a_scale
 
-    active = max(0, min(MOE_TOKENS, int(tensors.get("num_tokens", MOE_TOKENS))))
+    counts = _normalise_num_tokens(tensors.get("num_tokens", MOE_TOKENS))
     fp8 = _fp8_dtype()
     e8m0 = _e8m0_dtype()
 
@@ -729,6 +737,7 @@ def _golden_moe_core(tensors):
     dummy_input_ids = torch.zeros(MOE_TOKENS, dtype=torch.int64)
 
     for src in range(EP_SIZE):
+        active = int(counts[src])
         x_norm_mx = torch.zeros(MOE_TOKENS, D, dtype=torch.uint8).view(fp8)
         x_norm_scale = torch.zeros(1, MOE_TOKENS * (D // MX_GROUP), dtype=torch.uint8).view(e8m0)
         indices = torch.zeros(MOE_TOKENS, TOPK, dtype=torch.int32)
@@ -771,19 +780,14 @@ def _golden_moe_core(tensors):
     if SKIP_TRANSPORT_TEST:
         output = torch.zeros(EP_SIZE, MOE_TOKENS, D, dtype=torch.bfloat16)
         for src in range(EP_SIZE):
-            owners = tensors["token_owners"][src].to(torch.int64)
-            for t in range(active):
-                if int(owners[t]) == src:
-                    output[src, t] = all_shared[src][t]
+            for t in range(int(counts[src])):
+                output[src, t] = all_shared[src][t]
         tensors["output"][:] = output
         return
 
     send_counts = torch.zeros(EP_SIZE, EP_SIZE, N_LOCAL_EXPERTS, dtype=torch.int32)
     for src in range(EP_SIZE):
-        owners = tensors["token_owners"][src].to(torch.int64)
-        for t in range(active):
-            if int(owners[t]) != src:
-                continue
+        for t in range(int(counts[src])):
             for k in range(TOPK):
                 eid = int(all_indices[src][t, k].item())
                 dst, local_e = divmod(eid, N_LOCAL_EXPERTS)
@@ -803,11 +807,8 @@ def _golden_moe_core(tensors):
         recv_count[:, 0] = running
 
         for src in range(EP_SIZE):
-            owners = tensors["token_owners"][src].to(torch.int64)
             cursors = torch.zeros(N_LOCAL_EXPERTS, dtype=torch.int32)
-            for t in range(active):
-                if int(owners[t]) != src:
-                    continue
+            for t in range(int(counts[src])):
                 for k in range(TOPK):
                     eid = int(all_indices[src][t, k].item())
                     route_dst, local_e = divmod(eid, N_LOCAL_EXPERTS)
@@ -838,12 +839,9 @@ def _golden_moe_core(tensors):
 
     output = torch.zeros(EP_SIZE, MOE_TOKENS, D, dtype=torch.bfloat16)
     for src in range(EP_SIZE):
-        owners = tensors["token_owners"][src].to(torch.int64)
         routed = torch.zeros(MOE_TOKENS * TOPK, D, dtype=torch.bfloat16)
         cursors = {}
-        for t in range(active):
-            if int(owners[t]) != src:
-                continue
+        for t in range(int(counts[src])):
             for k in range(TOPK):
                 eid = int(all_indices[src][t, k].item())
                 dst, local_e = divmod(eid, N_LOCAL_EXPERTS)
@@ -851,9 +849,7 @@ def _golden_moe_core(tensors):
                 cursor = cursors.get((dst, local_e), 0)
                 cursors[(dst, local_e)] = cursor + 1
                 routed[t * TOPK + k] = dst_recv_y[dst][local_e, src_off + cursor]
-        for t in range(active):
-            if int(owners[t]) != src:
-                continue
+        for t in range(int(counts[src])):
             acc = all_shared[src][t].float()
             for k in range(TOPK):
                 acc = acc + routed[t * TOPK + k].float()
@@ -916,35 +912,23 @@ def golden_moe(tensors):
     tensors["x_next"][:] = x_next
 
 
-def _token_owner_mhc_compare(num_tokens: int):
-    """Apply the MoE budget to owner and non-owner rows alike.
+def _local_mhc_compare(num_tokens):
+    """Compare the complete local-token output for every EP rank.
 
-    ``combine`` writes owner rows only, so a non-owner row arriving here is the
-    pure residual expansion produced by ``mhc_post``.  Its coefficients come
-    from ``mhc_mixes``, which the sibling entry validates on device at
-    ``rtol=5e-3`` / ``atol=2.5e-5``; demanding bitwise equality here would
-    instead assert that torch reproduces the AI core's ``exp``/``rsqrt``
-    exactly, which it cannot.  The BF16 rounding in ``mhc_post`` turns a
-    sub-ulp coefficient difference into a whole-ulp output difference, so an
-    exact gate fails on rounding-boundary flips alone (~0.1% of the elements,
-    while the relative budget passes with ~150x headroom).
-
-    Ownership is still enforced: ``token_owners`` must select exactly one rank
-    per active token, and the owner and non-owner groups are compared
-    independently, so a rank that wrote rows it does not own still fails.
+    The output is defined for the whole fixed-capacity buffer: active rows
+    contain the shared-plus-routed result, while padded rows contain the
+    deterministic mHC residual produced after the MoE sublayer's zero fill.
+    Comparing the complete tensor keeps an inactive row or an empty-rank
+    write from disappearing behind a ``valid_rows`` prefix.
     """
-    import torch
-
     from golden.validation import ratio_reldiff
 
-    active = max(0, min(MOE_TOKENS, int(num_tokens)))
-    budget = dict(
+    counts = _normalise_num_tokens(num_tokens)
+    compare_full = ratio_reldiff(
         diff_thd=3e-3,
         pct_thd=0.02,
         max_diff_hd=1.0,
     )
-    owner_compare = ratio_reldiff(**budget)
-    other_compare = ratio_reldiff(**budget)
 
     def compare(actual, expected, **kwargs):
         if actual.shape != expected.shape:
@@ -952,36 +936,22 @@ def _token_owner_mhc_compare(num_tokens: int):
                 f"    output shape mismatch: actual={tuple(actual.shape)} "
                 f"expected={tuple(expected.shape)}"
             )
-        owners = kwargs["inputs"].get("token_owners")
-        if owners is None or tuple(owners.shape) != tuple(actual.shape[:2]):
-            return False, "    token_owners is missing or has the wrong shape"
+        # Validate the runtime count tensor as part of the comparator contract;
+        # the values determine which prefixes the golden routed path populated.
+        inputs = kwargs.get("inputs", {})
+        if "num_tokens" in inputs:
+            try:
+                runtime_counts = _normalise_num_tokens(inputs["num_tokens"])
+            except (TypeError, ValueError) as exc:
+                return False, f"    invalid num_tokens: {exc}"
+            if not torch.equal(runtime_counts, counts):
+                return False, (
+                    "    num_tokens changed between fixture and comparator: "
+                    f"expected={counts.tolist()} actual={runtime_counts.tolist()}"
+                )
+        return compare_full(actual, expected, **kwargs)
 
-        ranks = torch.arange(actual.shape[0], dtype=torch.int64).reshape(-1, 1)
-        owner_active = owners[:, :active].to(torch.int64).cpu() == ranks
-        if not (owner_active.sum(dim=0) == 1).all().item():
-            return False, "    token_owners must select one rank per active token"
-
-        other_mask = torch.ones(actual.shape[:2], dtype=torch.bool)
-        other_mask[:, :active] = ~owner_active
-        bitwise = int((actual[other_mask] != expected[other_mask]).sum())
-        other_ok, other_message = other_compare(
-            actual[other_mask].unsqueeze(0),
-            expected[other_mask].unsqueeze(0),
-            **kwargs,
-        )
-        if not other_ok:
-            return False, (
-                "    non-owner or inactive rows left the MoE budget "
-                f"({bitwise} elements differ bitwise)\n{other_message}"
-            )
-
-        return owner_compare(
-            actual[:, :active][owner_active].unsqueeze(0),
-            expected[:, :active][owner_active].unsqueeze(0),
-            **kwargs,
-        )
-
-    compare.__name__ = f"token_owner_mhc_compare(num_tokens={active})"
+    compare.__name__ = f"local_mhc_compare(num_tokens={counts.tolist()})"
     return compare
 
 
@@ -1007,6 +977,10 @@ def validate(argv=None):
     parser.add_argument("--tp", type=int, default=C.TP_SIZE, choices=list(C.SUPPORTED_TP_SIZES))
     parser.add_argument("-d", "--device", type=str, default=",".join(str(i) for i in range(EP_SIZE)))
     parser.add_argument("--num-tokens", type=int, default=MOE_TOKENS)
+    parser.add_argument(
+        "--num-tokens-per-rank", type=str, default=None,
+        help="comma-separated local counts (overrides --num-tokens)",
+    )
     parser.add_argument("--moe-epoch", type=int, default=1)
     parser.add_argument("--compile-only", action="store_true")
     parser.add_argument("--runtime-dir", type=str, default=None)
@@ -1017,7 +991,7 @@ def validate(argv=None):
     parser.add_argument("--log-level", type=str, default=None)
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--skip-shared", action="store_true", help="diagnostic only: zero shared expert output and still run gate/dispatch/routed/combine")
-    parser.add_argument("--skip-transport", action="store_true", help="diagnostic only: bypass dispatch/routed/combine and write shared output on owner rows")
+    parser.add_argument("--skip-transport", action="store_true", help="diagnostic only: bypass dispatch/routed/combine and write shared output on local rows")
     args = parser.parse_args(argv)
 
     torch.manual_seed(args.seed)
@@ -1034,12 +1008,24 @@ def validate(argv=None):
     # MoE kernel remains an internal subroutine of ``moe`` and is not exposed
     # as a second standalone runner.
     entry = l3_moe
-    specs = build_tensor_specs(args.num_tokens)
+    count_value = args.num_tokens
+    if args.num_tokens_per_rank is not None:
+        try:
+            count_value = [int(value) for value in args.num_tokens_per_rank.split(",")]
+        except ValueError as exc:
+            raise SystemExit(
+                "--num-tokens-per-rank must be comma-separated integers"
+            ) from exc
+    try:
+        counts = _normalise_num_tokens(count_value)
+    except ValueError as exc:
+        raise SystemExit(str(exc)) from exc
+    specs = build_tensor_specs(counts)
     golden_fn = golden_moe
     compare_fn = {
         "next_pre_mix": ratio_allclose(atol=2.5e-5, rtol=5e-3),
         "x_mixed": ratio_allclose(atol=1e-4, rtol=1.0 / 128),
-        "x_next": _token_owner_mhc_compare(args.num_tokens),
+        "x_next": _local_mhc_compare(counts),
     }
 
     result = run(
