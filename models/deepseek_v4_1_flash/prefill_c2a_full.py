@@ -11,7 +11,7 @@
 One attention sublayer of the text backbone, in the order the official ``Block.forward`` runs it::
 
     attn_pre, attn_post, attn_comb = hc_mixes(x_hc)   # coefficients from this sublayer's input
-    x = attn_norm(hc_pre(x_hc, pre_mix))              # pre_mix: the previous sublayer's delayed mix
+    x = rms_norm(hc_pre(x_hc, pre_mix))              # pre_mix: the previous sublayer's delayed mix
     x = attention(x)                                  # prefill C2A Full or Reuse, TP-reduced
     x_hc = hc_post(x, x_hc, attn_post, attn_comb)
 
@@ -88,51 +88,13 @@ from models.deepseek_v4_1_flash.decode_attn_c2a_reuse import (
     make_c2a_reuse_inputs,
     official_reference_c2a_reuse,
 )
-from models.deepseek_v4_1_flash.golden import hc_mixes, hc_post, hc_pre, rms_norm
+from models.deepseek_v4_1_flash.golden import hc_mixes, hc_post, hc_pre, rms_norm as golden_rms_norm
 from models.deepseek_v4_1_flash.hc_mixes import mhc_mixes
 from models.deepseek_v4_1_flash.hc_post import mhc_post
 from models.deepseek_v4_1_flash.hc_pre import mhc_pre
 from models.deepseek_v4_1_flash.prefill_attn_c2a_full import prefill_attn_c2a_full
 from models.deepseek_v4_1_flash.rope_tables import ROPE_ROWS_DYN, materialize_rope_rows
-
-
-NORM_EPS = FLASH.rms_norm_eps
-NORM_T_TILE = 8
-NORM_D_TILE = 512
-
-
-@pl.jit.inline
-def attn_norm(
-    x: pl.Tensor[[T_DYN, D], pl.BF16],
-    weight: pl.Tensor[[D], pl.BF16],
-    output: pl.Tensor[[T_DYN, D], pl.BF16],
-):
-    """RMSNorm over the hidden size in FP32, rounded once to BF16; tiled so a row never sits in UB whole."""
-    t_dim = pl.tensor.dim(x, 0)
-    for block in pl.spmd((t_dim + NORM_T_TILE - 1) // NORM_T_TILE, name_hint="attn_norm"):
-        t0 = block * NORM_T_TILE
-        valid_rows = pl.min(NORM_T_TILE, t_dim - t0)
-        sq_sum = pl.full([1, NORM_T_TILE], dtype=pl.FP32, value=0.0)
-        for kb in pl.pipeline(D // NORM_D_TILE, stage=2):
-            k0 = kb * NORM_D_TILE
-            source = pl.slice(x, [NORM_T_TILE, NORM_D_TILE], [t0, k0], valid_shape=[valid_rows, NORM_D_TILE])
-            source = pl.set_validshape(pl.fillpad(source, pad_value=pl.PadValue.zero), NORM_T_TILE, NORM_D_TILE)
-            value = pl.cast(source, target_type=pl.FP32)
-            sq_sum = pl.add(sq_sum, pl.reshape(pl.row_sum(pl.mul(value, value)), [1, NORM_T_TILE]))
-        inv_rms = pl.reshape(
-            pl.rsqrt(pl.add(pl.mul(sq_sum, 1.0 / D), NORM_EPS), high_precision=True), [NORM_T_TILE, 1]
-        )
-        for kb in pl.pipeline(D // NORM_D_TILE, stage=2):
-            k0 = kb * NORM_D_TILE
-            source = pl.slice(x, [NORM_T_TILE, NORM_D_TILE], [t0, k0], valid_shape=[valid_rows, NORM_D_TILE])
-            source = pl.set_validshape(pl.fillpad(source, pad_value=pl.PadValue.zero), NORM_T_TILE, NORM_D_TILE)
-            value = pl.cast(source, target_type=pl.FP32)
-            gamma = pl.reshape(pl.cast(weight[k0 : k0 + NORM_D_TILE], target_type=pl.FP32), [1, NORM_D_TILE])
-            normalized = pl.col_expand_mul(pl.row_expand_mul(value, inv_rms), gamma)
-            output[t0 : t0 + NORM_T_TILE, k0 : k0 + NORM_D_TILE] = pl.set_validshape(
-                pl.cast(normalized, target_type=pl.BF16, mode="rint"), valid_rows, NORM_D_TILE
-            )
-    return output
+from models.deepseek_v4_1_flash.rmsnorm import rms_norm
 
 
 @pl.jit.inline
@@ -153,7 +115,7 @@ def attention_hc_pre(
     mhc_mixes(x_hc, hc_attn_fn, hc_attn_scale, hc_attn_base, next_pre_mix, post_mix, residual_mix)
     collapsed = pl.create_tensor([tokens, D], dtype=pl.BF16)
     mhc_pre(x_hc, pre_mix, collapsed)
-    attn_norm(collapsed, attn_norm_weight, x)
+    rms_norm(collapsed, attn_norm_weight, x)
     return x
 
 
@@ -254,8 +216,8 @@ def golden_attention_input(
     pre_mix: torch.Tensor,
     attn_norm_weight: torch.Tensor,
 ) -> torch.Tensor:
-    """Collapse the streams with the delayed pre-mix, round to BF16, then apply attn_norm."""
-    return rms_norm(hc_pre(x_hc, pre_mix).to(torch.bfloat16), attn_norm_weight)
+    """Collapse the streams with the delayed pre-mix, round to BF16, then apply RMSNorm."""
+    return golden_rms_norm(hc_pre(x_hc, pre_mix).to(torch.bfloat16), attn_norm_weight)
 
 
 HC_INPUT_NAMES = ("x_hc", "pre_mix", "hc_attn_fn", "hc_attn_scale", "hc_attn_base", "attn_norm_weight")
@@ -825,7 +787,6 @@ def validate(argv=None):
 
 __all__ = [
     "attention_hc_pre",
-    "attn_norm",
     "golden_attention_input",
     "prefill_c2a_full",
     "run_prefill_c2a",

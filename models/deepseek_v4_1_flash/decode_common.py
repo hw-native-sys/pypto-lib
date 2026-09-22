@@ -17,49 +17,13 @@ import torch
 
 from golden import ScalarSpec, TensorSpec, ratio_allclose, run
 from models.deepseek_v4_1_flash import config as C
-from models.deepseek_v4_1_flash.config import D, FLASH, HC_MULT, T_DYN
-from models.deepseek_v4_1_flash.golden import rms_norm
+from models.deepseek_v4_1_flash.config import D, HC_MULT
+from models.deepseek_v4_1_flash.golden import rms_norm as golden_rms_norm
 from models.deepseek_v4_1_flash.hc_mixes import golden_mhc_mixes, mhc_mixes
 from models.deepseek_v4_1_flash.hc_post import golden_mhc_post
 from models.deepseek_v4_1_flash.hc_pre import golden_mhc_pre, mhc_pre
+from models.deepseek_v4_1_flash.rmsnorm import rms_norm
 from pypto.ir import DistributedConfig
-
-EPS = FLASH.rms_norm_eps
-
-
-@pl.jit.inline
-def normalize_attention(
-    x: pl.Tensor[[T_DYN, D], pl.BF16],
-    weight: pl.Tensor[[D], pl.BF16],
-    output: pl.Tensor[[T_DYN, D], pl.BF16],
-    num_tokens: pl.Scalar[pl.INT32],
-):
-    """Normalize hidden-width rows in 128-column tiles within Vec capacity."""
-    for block in pl.spmd((num_tokens + 7) // 8, name_hint="decode_hidden_rmsnorm"):
-        t = block * 8
-        rows = pl.min(8, num_tokens - t)
-        square_sum = pl.full([1, 8], dtype=pl.FP32, value=0.0)
-        for chunk in pl.pipeline(D // 128, stage=2):
-            d0 = chunk * 128
-            source = pl.slice(x, [8, 128], [t, d0], valid_shape=[rows, 128])
-            source = pl.set_validshape(pl.fillpad(source, pad_value=pl.PadValue.zero), 8, 128)
-            value = pl.cast(source, pl.FP32)
-            square_sum = pl.add(square_sum, pl.reshape(pl.row_sum(pl.mul(value, value)), [1, 8]))
-        inverse = pl.reshape(
-            pl.rsqrt(pl.add(pl.mul(square_sum, 1.0 / D), EPS), high_precision=True),
-            [8, 1],
-        )
-        for chunk in pl.pipeline(D // 128, stage=2):
-            d0 = chunk * 128
-            source = pl.slice(x, [8, 128], [t, d0], valid_shape=[rows, 128])
-            source = pl.set_validshape(pl.fillpad(source, pad_value=pl.PadValue.zero), 8, 128)
-            value = pl.cast(source, pl.FP32)
-            gamma = pl.reshape(pl.cast(weight[d0:d0 + 128], pl.FP32), [1, 128])
-            normalized = pl.col_expand_mul(pl.row_expand_mul(value, inverse), gamma)
-            output[t:t + 8, d0:d0 + 128] = pl.set_validshape(
-                pl.cast(normalized, pl.BF16, mode="rint"), rows, 128
-            )
-    return output
 
 BOUNDARY_PREFIX_NAMES = (
     "x_hc",
@@ -96,7 +60,10 @@ def attention_pre(
     residual_mix = pl.create_tensor([tokens, HC_MULT, HC_MULT], dtype=pl.FP32)
     mhc_mixes(x_hc, hc_attn_fn, hc_attn_scale, hc_attn_base, attention_pre_mix, post_mix, residual_mix)
     mhc_pre(x_hc, incoming_pre_mix, attention_input)
-    normalize_attention(attention_input, attn_norm_weight, normalized_attention, num_tokens)
+    active_tokens = pl.cast(num_tokens, pl.INDEX)
+    active_input = pl.slice(attention_input, [active_tokens, D], [0, 0])
+    active_output = pl.slice(normalized_attention, [active_tokens, D], [0, 0])
+    rms_norm(active_input, attn_norm_weight, active_output)
     return post_mix, residual_mix
 
 
@@ -202,7 +169,7 @@ def golden_attention_pre(tensors):
         tensors["attention_pre_mix"][rank].copy_(pre)
         collapsed = golden_mhc_pre(tensors["x_hc"][rank], tensors["incoming_pre_mix"][rank])
         normalized_rank = torch.full_like(collapsed, 13.0)
-        normalized_rank[:active].copy_(rms_norm(collapsed[:active], tensors["attn_norm_weight"][rank]))
+        normalized_rank[:active].copy_(golden_rms_norm(collapsed[:active], tensors["attn_norm_weight"][rank]))
         normalized.append(normalized_rank)
         post.append(post_mix)
         residual.append(residual_mix)

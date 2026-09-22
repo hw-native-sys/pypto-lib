@@ -28,8 +28,7 @@ from models.deepseek_v4_1_flash.attention_common import quantized_cache_compare
 from models.deepseek_v4_1_flash.hc_mixes import golden_mhc_mixes, mhc_mixes
 from models.deepseek_v4_1_flash.hc_post import golden_mhc_post, mhc_post
 from models.deepseek_v4_1_flash.hc_pre import golden_mhc_pre, mhc_pre
-from models.deepseek_v4_1_flash.golden import rms_norm
-from models.deepseek_v4_1_flash.prefill_c2a_full import attn_norm
+from models.deepseek_v4_1_flash.golden import rms_norm as golden_rms_norm
 from models.deepseek_v4_1_flash.prefill_attn_c1a_reindex import (
     REINDEX_INPUT_NAMES,
     golden_prefill_c1a_reindex as golden_prefill_attn_c1a_reindex,
@@ -50,6 +49,7 @@ from models.deepseek_v4_1_flash.prefill_c1a_test_utils import (
     make_fixture_values,
     topk_indices_compare,
 )
+from models.deepseek_v4_1_flash.rmsnorm import rms_norm
 
 
 D = C.D
@@ -131,7 +131,7 @@ def prefill_c1a_reindex(
     residual_mix = pl.create_tensor([tokens, HC_MULT, HC_MULT], dtype=pl.FP32)
     mhc_mixes(x_hc, hc_attn_fn, hc_attn_scale, hc_attn_base, next_pre_mix, post_mix, residual_mix)
     mhc_pre(x_hc, pre_mix, hidden)
-    attn_norm(hidden, attn_norm_weight, attn_input)
+    rms_norm(hidden, attn_norm_weight, attn_input)
     prefill_attn_c1a_reindex(
         attn_input, wq_a, wq_a_scale, q_norm_weight, wq_b, wq_b_scale, wkv, wkv_scale,
         kv_norm_weight, attn_sink, wo_a, wo_b, wo_b_scale, rope_cos, rope_sin,
@@ -161,7 +161,7 @@ def golden_prefill_c1a_reindex_hc(
         x_hc, hc_attn_fn, hc_attn_scale, hc_attn_base
     )
     hidden = golden_mhc_pre(x_hc, pre_mix)
-    attn_input = rms_norm(hidden.to(torch.bfloat16), attn_norm_weight)
+    attn_input = golden_rms_norm(hidden.to(torch.bfloat16), attn_norm_weight)
     sublayer, result = golden_prefill_tp_attention(
         golden_prefill_attn_c1a_reindex, attn_input, attention_args, TP_SIZE
     )

@@ -49,6 +49,8 @@ from models.deepseek_v4_1_flash.hc_mixes import golden_mhc_mixes, mhc_mixes
 from models.deepseek_v4_1_flash.hc_post import golden_mhc_post, mhc_post
 from models.deepseek_v4_1_flash.hc_pre import golden_mhc_pre, mhc_pre
 from models.deepseek_v4_1_flash.prefill_attn_swa import prefill_attn_swa
+from models.deepseek_v4_1_flash.golden import rms_norm as golden_rms_norm
+from models.deepseek_v4_1_flash.rmsnorm import rms_norm
 
 
 # Prefill SWA plus four-stream mHC overflows the default 256 MiB ring heap.
@@ -62,6 +64,7 @@ def prefill_swa(
     hc_attn_fn: pl.Tensor[[MIX_HC, HC_DIM], pl.FP32],
     hc_attn_scale: pl.Tensor[[3], pl.FP32],
     hc_attn_base: pl.Tensor[[MIX_HC], pl.FP32],
+    attn_norm_weight: pl.Tensor[[D], pl.BF16],
     wq_a: pl.Tensor[[D, Q_LORA], pl.FP8E4M3FN],
     wq_a_scale: pl.Tensor[[D // 32, Q_LORA], pl.FP8E8M0, pl.MX_B_NN],
     q_norm_weight: pl.Tensor[[Q_LORA], pl.BF16],
@@ -99,10 +102,12 @@ def prefill_swa(
     pre_mix = pl.create_tensor([tokens, HC_MULT], dtype=pl.FP32)
     post_mix = pl.create_tensor([tokens, HC_MULT], dtype=pl.FP32)
     residual_mix = pl.create_tensor([tokens, HC_MULT, HC_MULT], dtype=pl.FP32)
+    normalized_hidden = pl.create_tensor([tokens, D], dtype=pl.BF16)
     mhc_mixes(x_hc, hc_attn_fn, hc_attn_scale, hc_attn_base, pre_mix, post_mix, residual_mix)
     mhc_pre(x_hc, pre_mix, hidden)
+    rms_norm(hidden, attn_norm_weight, normalized_hidden)
     prefill_attn_swa(
-        hidden, wq_a, wq_a_scale, q_norm_weight, wq_b, wq_b_scale,
+        normalized_hidden, wq_a, wq_a_scale, q_norm_weight, wq_b, wq_b_scale,
         wkv, wkv_scale, kv_norm_weight, attn_sink, wo_a, wo_b, wo_b_scale,
         rope_cos, rope_sin, window_slots, window_indices, window_cache, window_cache_scale,
         output_window, output_arrived, attn_out,
@@ -117,6 +122,7 @@ def golden_prefill_swa(
     hc_attn_fn: torch.Tensor,
     hc_attn_scale: torch.Tensor,
     hc_attn_base: torch.Tensor,
+    attn_norm_weight: torch.Tensor,
     wq_a: torch.Tensor,
     wq_a_scale: torch.Tensor,
     q_norm_weight: torch.Tensor,
@@ -136,11 +142,12 @@ def golden_prefill_swa(
     window_cache: torch.Tensor,
     window_cache_scale: torch.Tensor,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    """HC mixes, collapse, SWA, then residual expansion. No extra attention RMSNorm."""
+    """HC mixes, collapse, normalize, SWA, then residual expansion."""
     pre_mix, post_mix, residual_mix = golden_mhc_mixes(x_hc, hc_attn_fn, hc_attn_scale, hc_attn_base)
     hidden = golden_mhc_pre(x_hc, pre_mix)
+    normalized_hidden = golden_rms_norm(hidden, attn_norm_weight)
     result = golden_swa_attention(
-        hidden, wq_a, wq_a_scale, q_norm_weight, wq_b, wq_b_scale,
+        normalized_hidden, wq_a, wq_a_scale, q_norm_weight, wq_b, wq_b_scale,
         wkv, wkv_scale, kv_norm_weight, attn_sink,
         wo_a, wo_b, wo_b_scale, rope_cos, rope_sin,
         window_slots, window_indices, window_cache, window_cache_scale,
@@ -150,7 +157,7 @@ def golden_prefill_swa(
 
 
 HC_INPUT_NAMES = (
-    "x_hc", "hc_attn_fn", "hc_attn_scale", "hc_attn_base",
+    "x_hc", "hc_attn_fn", "hc_attn_scale", "hc_attn_base", "attn_norm_weight",
     "wq_a", "wq_a_scale", "q_norm_weight", "wq_b", "wq_b_scale", "wkv", "wkv_scale",
     "kv_norm_weight", "attn_sink", "wo_a", "wo_b", "wo_b_scale", "rope_cos", "rope_sin",
     "window_slots", "window_indices", "window_cache", "window_cache_scale",
@@ -167,6 +174,7 @@ def make_hc_inputs(base: dict, seed: int) -> dict:
     values["hc_attn_fn"] = torch.randn(MIX_HC, HC_DIM, generator=gen) / math.sqrt(HC_DIM)
     values["hc_attn_scale"] = torch.randn(3, generator=gen)
     values["hc_attn_base"] = torch.randn(MIX_HC, generator=gen)
+    values["attn_norm_weight"] = (torch.randn(D, generator=gen) * 0.1 + 1).to(torch.bfloat16)
     if bool((base["x"] == 0).all()):
         values["x_hc"].zero_()
     return values
@@ -180,6 +188,7 @@ def make_hc_program(capacity, world_size, epochs):
         hc_attn_fn: pl.Tensor[[MIX_HC, HC_DIM], pl.FP32],
         hc_attn_scale: pl.Tensor[[3], pl.FP32],
         hc_attn_base: pl.Tensor[[MIX_HC], pl.FP32],
+        attn_norm_weight: pl.Tensor[[D], pl.BF16],
         wq_a: pl.Tensor[[D, Q_LORA], pl.FP8E4M3FN],
         wq_a_scale: pl.Tensor[[D // 32, Q_LORA], pl.FP8E8M0, pl.MX_B_NN],
         q_norm_weight: pl.Tensor[[Q_LORA], pl.BF16],
@@ -212,7 +221,7 @@ def make_hc_program(capacity, world_size, epochs):
         window_cache.bind_dynamic(0, ORI_BLOCKS_DYN)
         for step in pl.range(epochs):
             prefill_swa(
-                x_hc, hc_attn_fn, hc_attn_scale, hc_attn_base,
+                x_hc, hc_attn_fn, hc_attn_scale, hc_attn_base, attn_norm_weight,
                 wq_a, wq_a_scale, q_norm_weight, wq_b, wq_b_scale,
                 wkv, wkv_scale, kv_norm_weight, attn_sink, wo_a, wo_b, wo_b_scale,
                 rope_cos, rope_sin, window_slots, window_indices, window_cache, window_cache_scale,
@@ -227,6 +236,7 @@ def make_hc_program(capacity, world_size, epochs):
         hc_attn_fn: pl.Tensor[[world_size, MIX_HC, HC_DIM], pl.FP32],
         hc_attn_scale: pl.Tensor[[world_size, 3], pl.FP32],
         hc_attn_base: pl.Tensor[[world_size, MIX_HC], pl.FP32],
+        attn_norm_weight: pl.Tensor[[world_size, D], pl.BF16],
         wq_a: pl.Tensor[[world_size, D, Q_LORA], pl.FP8E4M3FN],
         wq_a_scale: pl.Tensor[[world_size, D // 32, Q_LORA], pl.FP8E8M0],
         q_norm_weight: pl.Tensor[[world_size, Q_LORA], pl.BF16],
@@ -267,7 +277,7 @@ def make_hc_program(capacity, world_size, epochs):
             wkv_scale_r: pl.Tensor[[D // 32, HEAD_DIM], pl.FP8E8M0, pl.MX_B_NN] = wkv_scale[rank]
             wo_b_scale_r: pl.Tensor[[LOCAL_O_WIDTH // 32, D], pl.FP8E8M0, pl.MX_B_NN] = wo_b_scale[rank]
             swa_rank(
-                x_hc[rank], hc_attn_fn[rank], hc_attn_scale[rank], hc_attn_base[rank],
+                x_hc[rank], hc_attn_fn[rank], hc_attn_scale[rank], hc_attn_base[rank], attn_norm_weight[rank],
                 wq_a[rank], wq_a_scale_r, q_norm_weight[rank], wq_b[rank], wq_b_scale_r,
                 wkv[rank], wkv_scale_r, kv_norm_weight[rank], attn_sink[rank],
                 wo_a[rank], wo_b[rank], wo_b_scale_r, rope_cos[rank], rope_sin[rank],
@@ -296,7 +306,7 @@ def build_hc_specs(args):
     else:
         pages = args.tokens + 1
     shapes = (
-        [args.tokens, HC_MULT, D], [MIX_HC, HC_DIM], [3], [MIX_HC],
+        [args.tokens, HC_MULT, D], [MIX_HC, HC_DIM], [3], [MIX_HC], [D],
         [D, Q_LORA], [D // 32, Q_LORA], [Q_LORA],
         [Q_LORA, LOCAL_H * HEAD_DIM], [Q_LORA // 32, LOCAL_H * HEAD_DIM],
         [D, HEAD_DIM], [D // 32, HEAD_DIM], [HEAD_DIM], [LOCAL_H],
@@ -305,7 +315,7 @@ def build_hc_specs(args):
         [pages, 128, 1, HEAD_DIM], [pages, 128, 1, HEAD_DIM // 32],
     )
     bf, fp, mx = torch.bfloat16, torch.float8_e4m3fn, torch.float8_e8m0fnu
-    dtypes = (torch.float32, torch.float32, torch.float32, torch.float32,
+    dtypes = (torch.float32, torch.float32, torch.float32, torch.float32, torch.bfloat16,
               fp, mx, bf, fp, mx, fp, mx, bf, torch.float32, bf, fp, mx,
               torch.float32, torch.float32, torch.int64, torch.int32, fp, mx)
     values = {}
@@ -331,6 +341,7 @@ def build_hc_specs(args):
                 ranks.append(make_hc_inputs(value, seed))
             replicated = (
                 "x_hc", "hc_attn_fn", "hc_attn_scale", "hc_attn_base",
+                "attn_norm_weight",
                 "wq_a", "wq_a_scale", "q_norm_weight", "wkv", "wkv_scale",
                 "kv_norm_weight", "rope_cos", "rope_sin", "window_slots", "window_indices",
                 "window_cache", "window_cache_scale",
@@ -362,7 +373,7 @@ def reference_attention(tensors, hidden, base):
     partials, caches = [], []
     for rank in range(base, base + TP_SIZE):
         inputs = {name: tensors[name][rank] for name in HC_INPUT_NAMES if name not in (
-            "x_hc", "hc_attn_fn", "hc_attn_scale", "hc_attn_base",
+            "x_hc", "hc_attn_fn", "hc_attn_scale", "hc_attn_base", "attn_norm_weight",
         )}
         inputs["x"] = hidden
         partial, cache, scale = official_reference(inputs)
@@ -380,7 +391,8 @@ def golden_prefill_swa_case(tensors):
             tensors["hc_attn_scale"][base], tensors["hc_attn_base"][base],
         )
         hidden = golden_mhc_pre(tensors["x_hc"][base], pre_mix)
-        reduced, caches = reference_attention(tensors, hidden, base)
+        normalized_hidden = golden_rms_norm(hidden, tensors["attn_norm_weight"][base])
+        reduced, caches = reference_attention(tensors, normalized_hidden, base)
         for rank, (cache, scale) in enumerate(caches, base):
             tensors["window_cache"][rank].copy_(cache)
             tensors["window_cache_scale"][rank].copy_(scale)
@@ -429,7 +441,8 @@ def make_staged_compare():
             for name in ("attn_out", "window_cache", "window_cache_scale"):
                 forced[name] = torch.empty_like(actual_outputs[name])
             for base in range(0, hidden.shape[0], TP_SIZE):
-                reduced, caches = reference_attention(tensors, hidden[base], base)
+                normalized_hidden = golden_rms_norm(hidden[base], tensors["attn_norm_weight"][base])
+                reduced, caches = reference_attention(tensors, normalized_hidden, base)
                 forced["attn_out"][base:base + TP_SIZE].copy_(reduced.unsqueeze(0).expand(TP_SIZE, -1, -1))
                 for rank, (cache, scale) in enumerate(caches, base):
                     forced["window_cache"][rank].copy_(cache)

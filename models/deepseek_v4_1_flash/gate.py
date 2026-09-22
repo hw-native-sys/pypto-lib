@@ -11,6 +11,7 @@
 import pypto.language as pl
 
 from models.deepseek_v4_1_flash.config import FLASH as M, MOE_TOKENS
+from models.deepseek_v4_1_flash.rmsnorm import rms_norm
 
 FP32_NEG_INF = -3.4028234663852886e38
 
@@ -18,7 +19,6 @@ FP32_NEG_INF = -3.4028234663852886e38
 # model config
 T = MOE_TOKENS
 D = M.hidden_size
-NORM_EPS = M.rms_norm_eps
 N_EXPERTS = M.n_routed_experts
 TOPK = M.num_experts_per_tok
 ROUTE_SCALE = M.routed_scaling_factor
@@ -31,8 +31,6 @@ assert T % GATE_T_TILE == 0
 GATE_M_TILE = 16
 GATE_N_TILE = 16
 T_PAD = ((T + GATE_M_TILE - 1) // GATE_M_TILE) * GATE_M_TILE
-ROW_TILE = 8
-FFN_REDUCE_TILE = D // ROW_TILE
 GATE_D_TILE = 2048 if M.name == "flash" else 512
 assert (D // GATE_D_TILE) % 2 == 0, "gate K-loop trip count must be even (A5 accumulator-buffer constraint)"
 QUANT_TILE = 256
@@ -84,9 +82,8 @@ else:
 
 
 @pl.jit.inline
-def gate(
-    x_mixed: pl.Tensor[[T, D], pl.BF16],
-    norm_w: pl.Tensor[[D], pl.BF16],
+def gate_normalized(
+    x_normed: pl.Tensor[[T, D], pl.BF16],
     gate_w: pl.Tensor[[N_EXPERTS, D], pl.FP32],
     gate_bias: pl.Tensor[[N_EXPERTS], pl.FP32],
     num_tokens: pl.Scalar[pl.INT32],
@@ -102,60 +99,26 @@ def gate(
         active_tokens = pl.cast(T, pl.INDEX)
     active_gate_tiles = (active_tokens + GATE_M_TILE - 1) // GATE_M_TILE
 
-    norm_w_2d = pl.reshape(norm_w, [1, D])
     xg_buf = pl.create_tensor([T_PAD, D], dtype=pl.FP32)
-    inv_rms_buf = pl.create_tensor([1, T_PAD], dtype=pl.FP32)
-    inv_rms_router_buf = pl.create_tensor([T_PAD, 1], dtype=pl.FP32)
-    for init_idx in pl.spmd((T_PAD // GATE_M_TILE) * (D // GATE_D_TILE), name_hint="ffn_norm_zero"):
+    for init_idx in pl.spmd((T_PAD // GATE_M_TILE) * (D // GATE_D_TILE), name_hint="gate_normalized_zero"):
         init_t = (init_idx // (D // GATE_D_TILE)) * GATE_M_TILE
         init_k = (init_idx % (D // GATE_D_TILE)) * GATE_D_TILE
         xg_buf[init_t : init_t + GATE_M_TILE, init_k : init_k + GATE_D_TILE] = pl.full(
             [GATE_M_TILE, GATE_D_TILE], dtype=pl.FP32, value=0.0
         )
-        if init_k == 0:
-            inv_rms_buf[:, init_t : init_t + GATE_M_TILE] = pl.full(
-                [1, GATE_M_TILE], dtype=pl.FP32, value=0.0
-            )
 
-    for tok in pl.spmd(active_tokens, name_hint="ffn_norm"):
-        rms_x_bf16 = pl.tile.load(x_mixed, [tok, 0], [1, D])
-        rms_x = pl.cast(rms_x_bf16, pl.FP32)
-        rms_w_bf16 = pl.tile.load(norm_w_2d, [0, 0], [1, D])
-        rms_w = pl.cast(rms_w_bf16, pl.FP32)
-        xg = pl.mul(rms_x, rms_w)
-        pl.tile.store(xg, [tok, 0], xg_buf, shapes=[1, D])
-
-        rms_sq = pl.mul(rms_x, rms_x)
-        sq_rows = pl.reshape(rms_sq, [ROW_TILE, FFN_REDUCE_TILE])
-        sq_partial_tmp = pl.create_tile([ROW_TILE, FFN_REDUCE_TILE], dtype=pl.FP32)
-        sq_partial = pl.row_sum(sq_rows, sq_partial_tmp)
-        sq_reduce_tile = pl.create_tile([ROW_TILE, ROW_TILE], dtype=pl.FP32)
-        sq_partial_row = pl.reshape(sq_partial, [1, ROW_TILE])
-        sq_reduce_tile[0:1, :] = sq_partial_row
-        sq_reduce_valid = pl.set_validshape(sq_reduce_tile, 1, ROW_TILE)
-        sq_sum_tmp = pl.create_tile([ROW_TILE, ROW_TILE], dtype=pl.FP32)
-        sq_sum_raw = pl.row_sum(sq_reduce_valid, sq_sum_tmp)
-        sq_sum_row = pl.reshape(sq_sum_raw, [1, ROW_TILE])
-        sq_sum_valid = pl.set_validshape(sq_sum_row, 1, 1)
-        sq_mean = pl.mul(sq_sum_valid, 1.0 / D)
-        rms_arg = pl.add(sq_mean, NORM_EPS)
-        rms_root = pl.sqrt(rms_arg)
-        inv_rms = pl.recip(rms_root)
-        pl.tile.store(inv_rms, [0, tok], inv_rms_buf, shapes=[1, 1])
-        pl.tile.store(inv_rms, [tok, 0], inv_rms_router_buf, shapes=[1, 1])
+    for tok in pl.spmd(active_tokens, name_hint="gate_normalized_input"):
+        normalized = pl.cast(pl.tile.load(x_normed, [tok, 0], [1, D]), pl.FP32)
+        pl.tile.store(normalized, [tok, 0], xg_buf, shapes=[1, D])
 
     for quant_idx in pl.spmd((T_PAD // GATE_M_TILE) * (D // QUANT_TASK_TILE), name_hint="x_norm_mx_quant"):
         tile_idx = quant_idx // (D // QUANT_TASK_TILE)
         task_chunk_idx = quant_idx % (D // QUANT_TASK_TILE)
         t0 = tile_idx * GATE_M_TILE
-        inv_rms_chunk = pl.load(inv_rms_buf, [0, t0], [1, GATE_M_TILE])
         for task_chunk in pl.range(QUANT_TASK_TILE // QUANT_TILE):
             chunk_idx = task_chunk_idx * (QUANT_TASK_TILE // QUANT_TILE) + task_chunk
             k0 = chunk_idx * QUANT_TILE
-            xg_chunk = pl.load(xg_buf, [t0, k0], [GATE_M_TILE, QUANT_TILE])
-            xg_chunk_t = pl.transpose(xg_chunk, axis1=0, axis2=1)
-            x_norm_chunk_t = pl.col_expand_mul(xg_chunk_t, inv_rms_chunk)
-            x_norm_chunk = pl.transpose(x_norm_chunk_t, axis1=0, axis2=1)
+            x_norm_chunk = pl.load(xg_buf, [t0, k0], [GATE_M_TILE, QUANT_TILE])
             x_quant, scale_quant = pl.quant_mx(x_norm_chunk, group_axis=1)
             x_norm_mx = pl.store(x_quant, [t0, k0], x_norm_mx)
             scale_offset = t0 * MX_SCALE_GROUPS + chunk_idx * GATE_M_TILE * (QUANT_TILE // MX_GROUP)
@@ -193,8 +156,6 @@ def gate(
                 gate_logits_tile = pl.matmul(gd_x, gd_w, out_dtype=pl.FP32, b_trans=True)
             else:
                 gate_logits_tile = pl.matmul_acc(gate_logits_tile, gd_x, gd_w, b_trans=True)
-        inv_rms_tile = inv_rms_router_buf[t1 : t1 + GATE_M_TILE, 0:1]
-        gate_logits_tile = pl.row_expand_mul(gate_logits_tile, inv_rms_tile)
         gp_relu = pl.maximum(gate_logits_tile, 0.0)
         gp_abs = pl.abs(gate_logits_tile)
         gp_neg_abs = pl.neg(gp_abs)
@@ -256,6 +217,27 @@ def gate(
     return weights
 
 
+@pl.jit.inline
+def gate(
+    x_mixed: pl.Tensor[[T, D], pl.BF16],
+    norm_w: pl.Tensor[[D], pl.BF16],
+    gate_w: pl.Tensor[[N_EXPERTS, D], pl.FP32],
+    gate_bias: pl.Tensor[[N_EXPERTS], pl.FP32],
+    num_tokens: pl.Scalar[pl.INT32],
+    x_norm_mx: pl.Tensor[[T_PAD, D], pl.FP8E4M3FN],
+    x_norm_scale: pl.Tensor[[1, T_PAD * MX_SCALE_GROUPS], pl.FP8E8M0],
+    indices: pl.Tensor[[T, TOPK], pl.INT32],
+    weights: pl.Tensor[[T, TOPK], pl.FP32],
+):
+    """Keep the standalone gate ABI while making FFN RMSNorm explicit."""
+    x_normed = pl.create_tensor([T, D], dtype=pl.BF16)
+    rms_norm(x_mixed, norm_w, x_normed)
+    return gate_normalized(
+        x_normed, gate_w, gate_bias, num_tokens,
+        x_norm_mx, x_norm_scale, indices, weights,
+    )
+
+
 @pl.jit
 def gate_test(
     x_mixed: pl.Tensor[[T, D], pl.BF16],
@@ -284,30 +266,23 @@ def _golden_gate_scores(tensors):
     """Recompute the host router scores from the immutable gate inputs."""
     import torch
 
-    x_f = tensors["x_mixed"].cpu().float().view(T, D)
-    norm_w = tensors["norm_w"].cpu().float()
-    sq_rows = (x_f * x_f).reshape(T, ROW_TILE, FFN_REDUCE_TILE)
-    sq_partial = sq_rows.sum(dim=-1)
-    sq_sum = sq_partial.sum(dim=-1, keepdim=True)
-    inv_rms = torch.rsqrt(sq_sum * (1.0 / D) + NORM_EPS)
-    xg = x_f * norm_w.view(1, D)
+    from models.deepseek_v4_1_flash.rmsnorm import golden_rms_norm
+
+    x_norm = golden_rms_norm(tensors["x_mixed"], tensors["norm_w"]).cpu().float().view(T, D)
 
     gate_w = tensors["gate_w"].cpu().float()
     gate_bias = tensors["gate_bias"].cpu().float()
-    logits_acc = xg @ gate_w.T
-    logits = inv_rms * logits_acc
+    logits = x_norm @ gate_w.T
     softplus = logits.clamp(min=0) + torch.log1p(torch.exp(-logits.abs()))
     scores = softplus.sqrt()
     biased = scores + gate_bias.view(1, -1)
-    return xg, inv_rms, scores, biased
+    return x_norm, torch.ones(T, 1, dtype=torch.float32), scores, biased
 
 
-def golden_gate_core(tensors):
+def _golden_gate_core(tensors, x_norm, scores, biased):
     import torch
 
     num_tokens = max(0, min(T, int(tensors.get("num_tokens", T))))
-
-    xg, inv_rms, scores, biased = _golden_gate_scores(tensors)
 
     from models.deepseek_v4_1_flash.quantization import host_quant_mxfp8_v41, pack_mx_a_scale
 
@@ -327,7 +302,6 @@ def golden_gate_core(tensors):
             packed = packed.contiguous().view(e8m0)
         return quantized, packed
 
-    x_norm = xg * inv_rms
     x_norm[num_tokens:] = 0
     x_norm_padded = torch.zeros(T_PAD, D, dtype=torch.float32)
     x_norm_padded[:T] = x_norm
@@ -352,6 +326,26 @@ def golden_gate_core(tensors):
     tensors["x_norm_scale"][:] = x_norm_scale.reshape(1, -1)
     tensors["indices"][:] = indices.to(torch.int32)
     tensors["weights"][:] = weights.to(torch.float32)
+
+
+def golden_gate_core(tensors):
+    """Reference the standalone gate, including its FFN RMSNorm boundary."""
+    x_norm, _, scores, biased = _golden_gate_scores(tensors)
+    _golden_gate_core(tensors, x_norm, scores, biased)
+
+
+def golden_gate_normalized_core(tensors):
+    """Reference routing when the caller already applied FFN RMSNorm."""
+    import torch
+
+    x_norm = tensors["x_normed"].cpu().to(torch.bfloat16).float().view(T, D)
+    gate_w = tensors["gate_w"].cpu().float()
+    gate_bias = tensors["gate_bias"].cpu().float()
+    logits = x_norm @ gate_w.T
+    softplus = logits.clamp(min=0) + torch.log1p(torch.exp(-logits.abs()))
+    scores = softplus.sqrt()
+    biased = scores + gate_bias.view(1, -1)
+    _golden_gate_core(tensors, x_norm, scores, biased)
 
 
 def gate_indices_compare(

@@ -193,7 +193,10 @@ python models/deepseek_v4_1_flash/decode_c2a_reuse.py -p a5 -d 0,1,2,3 \
 ```
 
 Each validation epoch invokes the complete production composition: mHC
-mixes/pre, input RMSNorm, one Attention call, and mHC post. Epochs repeat the
+mixes/pre, input RMSNorm, one Attention call, and mHC post. The MoE half follows
+the same official Block ordering: its mHC mixes are computed first, the incoming
+Attention pre-mix collapses the residual streams, RMSNorm runs once, then the
+router and experts execute before mHC post. Epochs repeat the
 same fixture inputs for validation and benchmarking; they do not feed one
 epoch's hidden or pre-mix output into the next. Validation reuses each leaf's
 fixture, reference, and precision checks and checks updated caches and exact
@@ -408,7 +411,8 @@ The implementation milestones are ordered by dependency:
 
 1. Implement and compile the attention TP all-reduce, mHC, and SWA.
    Packed prefill SWA is wired through mHC: `mhc_mixes` → `mhc_pre` →
-   `prefill_attn_swa` → `mhc_post`. Run `python models/deepseek_v4_1_flash/prefill_swa.py`.
+   attention RMSNorm → `prefill_attn_swa` → `mhc_post`. Run
+   `python models/deepseek_v4_1_flash/prefill_swa.py`.
 2. Implement C2A Full, then validate Full-to-Reuse cache and Top-K replay.
    Packed prefill C2A Full and Reuse are wired through mHC the same way,
    with the attention RMSNorm the block runs between `mhc_pre` and the

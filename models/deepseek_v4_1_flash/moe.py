@@ -38,7 +38,7 @@ ROUTE_WIDTH = C.ROUTE_WIDTH
 SKIP_SHARED_TEST = "--skip-shared" in __import__("sys").argv
 SKIP_TRANSPORT_TEST = "--skip-transport" in __import__("sys").argv
 
-from models.deepseek_v4_1_flash.gate import gate as npu_gate
+from models.deepseek_v4_1_flash.gate import gate_normalized as npu_gate
 from models.deepseek_v4_1_flash.expert_shared import expert_shared
 from models.deepseek_v4_1_flash.expert_routed import (
     MX_PACKED_LANE_COLS,
@@ -51,6 +51,7 @@ from models.deepseek_v4_1_flash.ep_transport import dispatch, combine
 from models.deepseek_v4_1_flash.hc_mixes import golden_mhc_mixes, mhc_mixes
 from models.deepseek_v4_1_flash.hc_pre import golden_mhc_pre, mhc_pre
 from models.deepseek_v4_1_flash.hc_post import golden_mhc_post, mhc_post
+from models.deepseek_v4_1_flash.rmsnorm import golden_rms_norm, rms_norm
 
 
 def _gen_routed_mx_weights_fixture(n_experts, dequant_std, seed_base=0):
@@ -63,8 +64,7 @@ def _gen_routed_mx_weights_fixture(n_experts, dequant_std, seed_base=0):
 
 @pl.jit.inline(auto_scope=False)
 def _moe_core(
-    x: pl.Tensor[[C.T_DYN, D], pl.BF16],
-    norm_weight: pl.Tensor[[D], pl.BF16],
+    x_normed: pl.Tensor[[C.T_DYN, D], pl.BF16],
     gate_weight: pl.Tensor[[C.N_EXPERTS, D], pl.FP32],
     correction_bias: pl.Tensor[[C.N_EXPERTS], pl.FP32],
     # Device ABI: checkpoint [expert,out,in] FP4 weights stay packed in HBM and
@@ -111,7 +111,7 @@ def _moe_core(
     )
     indices = pl.create_tensor([t, TOPK], dtype=pl.INT32)
     weights = pl.create_tensor([t, TOPK], dtype=pl.FP32)
-    npu_gate(x, norm_weight, gate_weight, correction_bias, num_tokens,
+    npu_gate(x_normed, gate_weight, correction_bias, num_tokens,
              x_norm_mx, x_norm_scale, indices, weights)
 
     shared_output = pl.create_tensor([t, D], dtype=pl.BF16)
@@ -236,11 +236,13 @@ def moe(
     residual_mix = pl.create_tensor(
         [t, HC_MULT, HC_MULT], dtype=pl.FP32
     )
+    ffn_input = pl.create_tensor([t, D], dtype=pl.BF16)
     mhc_mixes(
         x_hc, hc_ffn_fn, hc_ffn_scale, hc_ffn_base,
         next_pre_mix, post_mix, residual_mix,
     )
     mhc_pre(x_hc, pre_mix, x_mixed)
+    rms_norm(x_mixed, norm_weight, ffn_input)
 
     # Keep the transport windows and routed result alive through combine.
     with pl.scope():
@@ -255,7 +257,7 @@ def moe(
         #   "missing inferred tensor metadata for parameter 'ffn_out' of 'combine'"
         sublayer = pl.create_tensor([t, D], dtype=pl.BF16)
         _moe_core(
-            x_mixed, norm_weight, gate_weight, correction_bias,
+            ffn_input, gate_weight, correction_bias,
             routed_w1, routed_w1_scale, routed_w2, routed_w2_scale,
             routed_w3, routed_w3_scale, mxfp4_pair_lut, shared_w1, shared_w1_scale,
             shared_w2, shared_w2_scale, shared_w3, shared_w3_scale,
@@ -709,7 +711,7 @@ def build_tensor_specs(num_tokens: int = MOE_TOKENS):
 def _golden_moe_core(tensors):
     import torch
 
-    from models.deepseek_v4_1_flash.gate import golden_gate_core
+    from models.deepseek_v4_1_flash.gate import golden_gate_normalized_core
     from models.deepseek_v4_1_flash.expert_shared import golden_expert_shared
     from models.deepseek_v4_1_flash.expert_routed import golden_expert_routed
     from models.deepseek_v4_1_flash.quantization import pack_mx_a_scale, unpack_mx_a_scale
@@ -733,9 +735,10 @@ def _golden_moe_core(tensors):
         x_norm_scale = torch.zeros(1, MOE_TOKENS * (D // MX_GROUP), dtype=torch.uint8).view(e8m0)
         indices = torch.zeros(MOE_TOKENS, TOPK, dtype=torch.int32)
         weights = torch.zeros(MOE_TOKENS, TOPK, dtype=torch.float32)
-        golden_gate_core({
-            "x_mixed": tensors["x"][src],
-            "norm_w": tensors["norm_weight"][src],
+        golden_gate_normalized_core({
+            "x_normed": golden_rms_norm(
+                tensors["x"][src], tensors["norm_weight"][src]
+            ),
             "gate_w": tensors["gate_weight"][src],
             "gate_bias": tensors["correction_bias"][src],
             "layer_id": 0,

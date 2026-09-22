@@ -38,10 +38,13 @@ from pathlib import Path
 if __package__ in (None, ""):
     sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
-# A5-only; intentionally excluded from the A2/A3 device sweep. `ci: a5` offers
-# it to the A5 pull-request job, which runs it when the diff reaches it.
+# A5-only; intentionally excluded from the A2/A3 device sweep. The entry stays
+# untagged until its routed-expert fixture matches the packed MxFp4 ABI: it still
+# imports `gen_routed_mx_weights`, which #1338 replaced with
+# `gen_routed_mxfp4_weights`, so `build_specs` raises ImportError before any device
+# work. Re-add `# ci: a5` together with the MxFp4 weight and golden update, and
+# give the file the `validate` / `test_precision` / `main` pair the A5 job expects.
 # ci: no-sim
-# ci: a5
 
 import torch
 

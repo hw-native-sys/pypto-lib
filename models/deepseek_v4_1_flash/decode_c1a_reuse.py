@@ -58,6 +58,7 @@ from models.deepseek_v4_1_flash.decode_attn_c1a_reuse import (
 from models.deepseek_v4_1_flash.hc_mixes import mhc_mixes
 from models.deepseek_v4_1_flash.hc_post import mhc_post
 from models.deepseek_v4_1_flash.hc_pre import mhc_pre
+from models.deepseek_v4_1_flash.rmsnorm import rms_norm
 
 
 @pl.jit.inline(auto_scope=False)
@@ -67,6 +68,7 @@ def decode_c1a_reuse(
     hc_attn_fn: pl.Tensor[[MIX_HC, HC_DIM], pl.FP32],
     hc_attn_scale: pl.Tensor[[3], pl.FP32],
     hc_attn_base: pl.Tensor[[MIX_HC], pl.FP32],
+    attn_norm_weight: pl.Tensor[[D], pl.BF16],
     wq_a: pl.Tensor[[D, Q_LORA], pl.FP8E4M3FN],
     wq_a_scale: pl.Tensor[[D // 32, Q_LORA], pl.FP8E8M0, pl.MX_B_NN],
     q_norm_weight: pl.Tensor[[Q_LORA], pl.BF16],
@@ -103,13 +105,18 @@ def decode_c1a_reuse(
     post_mix = pl.create_tensor([tokens, HC_MULT], dtype=pl.FP32)
     residual_mix = pl.create_tensor([tokens, HC_MULT, HC_MULT], dtype=pl.FP32)
     hidden = pl.create_tensor([tokens, D], dtype=pl.BF16)
+    normalized_hidden = pl.create_tensor([tokens, D], dtype=pl.BF16)
     attn_out = pl.create_tensor([tokens, D], dtype=pl.BF16)
     # The coefficients are staggered: collapse with the pre-mix the previous sub-layer
     # produced, apply post/residual immediately, and hand this site's pre-mix forward.
     mhc_mixes(x_hc, hc_attn_fn, hc_attn_scale, hc_attn_base, next_pre_mix, post_mix, residual_mix)
     mhc_pre(x_hc, pre_mix, hidden)
+    active_tokens = pl.cast(num_tokens, pl.INDEX)
+    active_hidden = pl.slice(hidden, [active_tokens, D], [0, 0])
+    active_normalized = pl.slice(normalized_hidden, [active_tokens, D], [0, 0])
+    rms_norm(active_hidden, attn_norm_weight, active_normalized)
     decode_attn_c1a_reuse(
-        hidden, wq_a, wq_a_scale, q_norm_weight, wq_b, wq_b_scale, wkv, wkv_scale, kv_norm_weight, attn_sink,
+        normalized_hidden, wq_a, wq_a_scale, q_norm_weight, wq_b, wq_b_scale, wkv, wkv_scale, kv_norm_weight, attn_sink,
         wo_a, wo_b, wo_b_scale, rope_cos, rope_sin, window_slots, window_indices, window_cache,
         window_cache_scale, compressed_cache, compressed_cache_scale, compressed_indices, output_window,
         output_arrived, attn_out, group_base, tp_rank, num_tokens, attention_epoch,
@@ -125,6 +132,7 @@ def decode_c1a_reuse_test(
     hc_attn_fn: pl.Tensor[[MIX_HC, HC_DIM], pl.FP32],
     hc_attn_scale: pl.Tensor[[3], pl.FP32],
     hc_attn_base: pl.Tensor[[MIX_HC], pl.FP32],
+    attn_norm_weight: pl.Tensor[[D], pl.BF16],
     wq_a: pl.Tensor[[D, Q_LORA], pl.FP8E4M3FN],
     wq_a_scale: pl.Tensor[[D // 32, Q_LORA], pl.FP8E8M0, pl.MX_B_NN],
     q_norm_weight: pl.Tensor[[Q_LORA], pl.BF16],
@@ -163,7 +171,7 @@ def decode_c1a_reuse_test(
     window_cache.bind_dynamic(0, ORI_BLOCKS_DYN)
     compressed_cache.bind_dynamic(0, CMP_BLOCKS_DYN)
     return decode_c1a_reuse(
-        x_hc, pre_mix, hc_attn_fn, hc_attn_scale, hc_attn_base, wq_a, wq_a_scale, q_norm_weight,
+        x_hc, pre_mix, hc_attn_fn, hc_attn_scale, hc_attn_base, attn_norm_weight, wq_a, wq_a_scale, q_norm_weight,
         wq_b, wq_b_scale, wkv, wkv_scale, kv_norm_weight, attn_sink, wo_a, wo_b, wo_b_scale, rope_cos,
         rope_sin, window_slots, window_indices, window_cache, window_cache_scale, compressed_cache,
         compressed_cache_scale, compressed_indices, output_window, output_arrived, output, next_pre_mix,
@@ -184,6 +192,7 @@ def make_program(tokens, pages, epochs=1):
         hc_attn_fn: pl.Tensor[[TP_SIZE, MIX_HC, HC_DIM], pl.FP32],
         hc_attn_scale: pl.Tensor[[TP_SIZE, 3], pl.FP32],
         hc_attn_base: pl.Tensor[[TP_SIZE, MIX_HC], pl.FP32],
+        attn_norm_weight: pl.Tensor[[TP_SIZE, D], pl.BF16],
         wq_a: pl.Tensor[[TP_SIZE, D, Q_LORA], pl.FP8E4M3FN],
         wq_a_scale: pl.Tensor[[TP_SIZE, D // 32, Q_LORA], pl.FP8E8M0],
         q_norm_weight: pl.Tensor[[TP_SIZE, Q_LORA], pl.BF16],
@@ -227,7 +236,7 @@ def make_program(tokens, pages, epochs=1):
                 wo_b_scale_r: pl.Tensor[[LOCAL_O_WIDTH // 32, D], pl.FP8E8M0, pl.MX_B_NN] = wo_b_scale[rank]
                 decode_c1a_reuse_test(
                     x_hc[rank], pre_mix[rank], hc_attn_fn[rank], hc_attn_scale[rank],
-                    hc_attn_base[rank], wq_a[rank],
+                    hc_attn_base[rank], attn_norm_weight[rank], wq_a[rank],
                     wq_a_scale_r, q_norm_weight[rank], wq_b[rank], wq_b_scale_r, wkv[rank],
                     wkv_scale_r, kv_norm_weight[rank], attn_sink[rank], wo_a[rank], wo_b[rank],
                     wo_b_scale_r, rope_cos[rank], rope_sin[rank], window_slots[rank], window_indices[rank],
