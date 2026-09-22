@@ -282,6 +282,14 @@ def _chain(t: int, weights: str | None, quant: bool, chunk: int = CHUNK):
 # worst token row.
 MAX_OVER_FLOOR = 1.05
 MAX_ROW_OVER_FLOOR = 1.25
+# ...and the distance to the fake-quant chain itself, as a fraction of that
+# floor. The ratios above compare two distances to a third quantity, so they
+# do not on their own constrain how far the kernel is from the answer it
+# should produce: an output mirrored across the truth, `2 * truth - fq`, sits
+# at exactly the floor distance from the truth and passes them at 1.000x while
+# being twice the floor from `fq`.
+MAX_VS_GOLDEN = 1.00
+MAX_ROW_VS_GOLDEN = 1.50
 
 
 def compare_out(t: int, weights: str | None):
@@ -300,6 +308,14 @@ def compare_out(t: int, weights: str | None):
     carries a tolerance of its own. The second one is per token row: a
     corrupted row barely moves the whole-tensor norm -- one dead row in 2048
     is 1.12x the floor -- while moving the worst row by more than 10x.
+
+    Those two ratios are not sufficient on their own. Each compares a distance
+    to the *truth* against another distance to the truth, so neither bounds how
+    far the kernel is from the fake-quant chain it implements: an output
+    mirrored across the truth, `2 * truth - fq`, is exactly the floor distance
+    from the truth and passes both at 1.000x while being twice the floor from
+    the answer it should have produced. Two further gates bound the distance to
+    `fq` directly, whole-tensor and worst row, in the same floor-relative units.
     """
     def compare(actual, expected, **_kwargs):
         dev = actual.double()
@@ -315,13 +331,19 @@ def compare_out(t: int, weights: str | None):
         floor, dev_truth = rel(fq, truth), rel(dev, truth)
         row_floor, dev_row = worst_row(fq, truth), worst_row(dev, truth)
         over, row_over = dev_truth / floor, dev_row / row_floor
+        dev_fq, dev_row_fq = rel(dev, fq), worst_row(dev, fq)
+        near, row_near = dev_fq / floor, dev_row_fq / row_floor
         print(f"[stats] out: rel frob {dev_truth:.3e} vs the float64 truth against a "
               f"quantization floor of {floor:.3e} ({over:.3f}x); worst token row "
               f"{dev_row:.3e} against {row_floor:.3e} ({row_over:.3f}x); "
-              f"{rel(dev, fq):.3e} vs the fake-quant chain", flush=True)
-        ok = over <= MAX_OVER_FLOOR and row_over <= MAX_ROW_OVER_FLOOR
+              f"{dev_fq:.3e} vs the fake-quant chain ({near:.3f} of the floor, "
+              f"worst row {row_near:.3f})", flush=True)
+        ok = (over <= MAX_OVER_FLOOR and row_over <= MAX_ROW_OVER_FLOOR
+              and near <= MAX_VS_GOLDEN and row_near <= MAX_ROW_VS_GOLDEN)
         detail = (f"{over:.3f}x the quantization floor (<={MAX_OVER_FLOOR}), "
-                  f"worst row {row_over:.3f}x (<={MAX_ROW_OVER_FLOOR})")
+                  f"worst row {row_over:.3f}x (<={MAX_ROW_OVER_FLOOR}); "
+                  f"vs the fake-quant chain {near:.3f} (<={MAX_VS_GOLDEN}), "
+                  f"worst row {row_near:.3f} (<={MAX_ROW_VS_GOLDEN})")
         return ok, detail
 
     return compare
