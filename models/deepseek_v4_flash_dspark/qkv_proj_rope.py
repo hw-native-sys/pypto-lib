@@ -272,8 +272,8 @@ def q_proj_qr(
 
     The two staging tensors are held by the caller so the qproj half can be issued
     separately; they are rewritten per dense tile, so a caller that runs more than one
-    tile iteration must let the qproj half finish before the next one starts. Every
-    current caller has t_dim <= PREFILL_DENSE_TILE, i.e. a single iteration.
+    tile iteration must let the qproj half finish before the next one starts.
+    Callers must bound each paired QR/Q invocation to PREFILL_DENSE_TILE rows.
     """
     t_dim = pl.tensor.dim(x, 0)
     for tile_base in pl.range(0, t_dim, PREFILL_DENSE_TILE):
@@ -643,15 +643,27 @@ def q_proj_rope(
     qr_scale: pl.Tensor[[T_DYN, 1], pl.FP32],
 ):
     """Q LoRA, RMSNorm, quantization, and RoPE over bounded dense tiles."""
-    qr_i8_matmul = pl.create_tensor([QPROJ_T_PAD, Q_LORA], dtype=pl.INT8)
-    # The quant scale rides the qr_i8 -> qproj_matmul -> dequant chain.
-    qr_scale_pad_store = pl.create_tensor([QPROJ_T_PAD, 1], dtype=pl.FP32, manual_dep=True)
-    q_proj_qr(x, wq_a, gamma_cq, qr, qr_scale, qr_i8_matmul, qr_scale_pad_store)
-    q_seq_dep = pl.system.task_dummy(deps=[])
-    q_proj_q(
-        x, wq_b, wq_b_scale, rope_cos_il, rope_sin_signed, rope_swap_idx, q,
-        qr_i8_matmul, qr_scale_pad_store, q_seq_dep,
-    )
+    t_dim = pl.tensor.dim(x, 0)
+    for tile_base in pl.range(0, t_dim, PREFILL_DENSE_TILE):
+        tile_rows = pl.min(PREFILL_DENSE_TILE, t_dim - tile_base)
+        with pl.scope():
+            # Consume each tile's QR and scales before staging the next tile.
+            x_tile = pl.slice(x, [tile_rows, D], [tile_base, 0])
+            qr_tile = pl.slice(qr, [tile_rows, Q_LORA], [tile_base, 0])
+            qr_scale_tile = pl.slice(qr_scale, [tile_rows, 1], [tile_base, 0])
+            q_tile = pl.slice(q, [tile_rows, H, HEAD_DIM], [tile_base, 0, 0])
+            cos_tile = pl.slice(rope_cos_il, [tile_rows, ROPE_DIM], [tile_base, 0])
+            sin_tile = pl.slice(rope_sin_signed, [tile_rows, ROPE_DIM], [tile_base, 0])
+            swap_tile = pl.slice(rope_swap_idx, [tile_rows, ROPE_DIM], [tile_base, 0])
+            qr_i8_matmul = pl.create_tensor([QPROJ_T_PAD, Q_LORA], dtype=pl.INT8)
+            # The quant scale rides the qr_i8 -> qproj_matmul -> dequant chain.
+            qr_scale_pad_store = pl.create_tensor([QPROJ_T_PAD, 1], dtype=pl.FP32, manual_dep=True)
+            q_proj_qr(x_tile, wq_a, gamma_cq, qr_tile, qr_scale_tile, qr_i8_matmul, qr_scale_pad_store)
+            q_seq_dep = pl.system.task_dummy(deps=[])
+            q_proj_q(
+                x_tile, wq_b, wq_b_scale, cos_tile, sin_tile, swap_tile, q_tile,
+                qr_i8_matmul, qr_scale_pad_store, q_seq_dep,
+            )
 
 
 
