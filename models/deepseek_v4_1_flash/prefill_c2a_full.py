@@ -12,7 +12,8 @@ One attention sublayer of the text backbone, in the order the official ``Block.f
 
     attn_pre, attn_post, attn_comb = hc_mixes(x_hc)   # coefficients from this sublayer's input
     x = rms_norm(hc_pre(x_hc, pre_mix))              # pre_mix: the previous sublayer's delayed mix
-    x = attention(x)                                  # prefill C2A Full or Reuse, TP-reduced
+    x = allgather(x)                                # normalized input in full token order
+    x = reduce_scatter(attention_partial(x))         # FP32 head-TP sum, local token rows
     x_hc = hc_post(x, x_hc, attn_post, attn_comb)
 
 ``attn_pre`` comes back as ``next_pre_mix``; the FFN sublayer of the same layer collapses its input
@@ -39,6 +40,9 @@ import torch
 
 from golden import ScalarSpec, TensorSpec, ratio_allclose, run
 from models.deepseek_v4_1_flash import config as C
+from models.deepseek_v4_1_flash.attention_sp import (
+    PREFILL_ATTN_RING_HEAP, SP_T_DYN, prefill_sp_input_allgather, prefill_sp_output_reduce_scatter, prefill_sp_post,
+)
 from models.deepseek_v4_1_flash.config import (
     B_DYN,
     CMP_BLOCKS_DYN,
@@ -49,6 +53,7 @@ from models.deepseek_v4_1_flash.config import (
     HEAD_DIM,
     INDEX_H,
     INDEX_DIM,
+    INDEX_TOPK,
     LOCAL_H,
     LOCAL_O_WIDTH,
     Q_LORA,
@@ -75,7 +80,6 @@ from models.deepseek_v4_1_flash.decode_attn_c2a_full import (
     compare_cache,
     compare_output,
     compare_per_rank,
-    compare_replicated,
     compare_state,
     compare_topk,
     make_c2a_inputs,
@@ -90,9 +94,11 @@ from models.deepseek_v4_1_flash.decode_attn_c2a_reuse import (
 )
 from models.deepseek_v4_1_flash.golden import hc_mixes, hc_post, hc_pre, rms_norm as golden_rms_norm
 from models.deepseek_v4_1_flash.hc_mixes import mhc_mixes
-from models.deepseek_v4_1_flash.hc_post import mhc_post
 from models.deepseek_v4_1_flash.hc_pre import mhc_pre
-from models.deepseek_v4_1_flash.prefill_attn_c2a_full import prefill_attn_c2a_full
+from models.deepseek_v4_1_flash.prefill_attn_c2a_full import (
+    PREFILL_C2A_FULL_RING_HEAP, prefill_attn_c2a_full, prefill_attn_c2a_full_partial,
+)
+from models.deepseek_v4_1_flash.hc_post import mhc_post
 from models.deepseek_v4_1_flash.rope_tables import ROPE_ROWS_DYN, materialize_rope_rows
 from models.deepseek_v4_1_flash.rmsnorm import rms_norm
 
@@ -117,6 +123,118 @@ def attention_hc_pre(
     mhc_pre(x_hc, pre_mix, collapsed)
     rms_norm(collapsed, attn_norm_weight, x)
     return x
+
+
+@pl.jit.inline
+def prefill_c2a_full_sp(
+    x_hc: pl.Tensor[[SP_T_DYN, C.HC_MULT, C.D], pl.FP32],
+    pre_mix: pl.Tensor[[SP_T_DYN, C.HC_MULT], pl.FP32],
+    hc_attn_fn: pl.Tensor[[C.MIX_HC, C.HC_DIM], pl.FP32],
+    hc_attn_scale: pl.Tensor[[3], pl.FP32],
+    hc_attn_base: pl.Tensor[[C.MIX_HC], pl.FP32],
+    attn_norm_weight: pl.Tensor[[C.D], pl.BF16],
+    wq_a: pl.Tensor[[C.D, C.Q_LORA], pl.FP8E4M3FN],
+    wq_a_scale: pl.Tensor[[C.D // 32, C.Q_LORA], pl.FP8E8M0, pl.MX_B_NN],
+    q_norm_weight: pl.Tensor[[C.Q_LORA], pl.BF16],
+    wq_b: pl.Tensor[[C.Q_LORA, C.LOCAL_H * C.HEAD_DIM], pl.FP8E4M3FN],
+    wq_b_scale: pl.Tensor[[C.Q_LORA // 32, C.LOCAL_H * C.HEAD_DIM], pl.FP8E8M0, pl.MX_B_NN],
+    wkv: pl.Tensor[[C.D, C.HEAD_DIM], pl.FP8E4M3FN],
+    wkv_scale: pl.Tensor[[C.D // 32, C.HEAD_DIM], pl.FP8E8M0, pl.MX_B_NN],
+    kv_norm_weight: pl.Tensor[[C.HEAD_DIM], pl.BF16],
+    attn_sink: pl.Tensor[[C.LOCAL_H], pl.FP32],
+    wo_a: pl.Tensor[[C.LOCAL_O_GROUPS, C.O_LORA, C.O_GROUP_IN], pl.BF16],
+    wo_b: pl.Tensor[[C.LOCAL_O_WIDTH, C.D], pl.FP8E4M3FN],
+    wo_b_scale: pl.Tensor[[C.LOCAL_O_WIDTH // 32, C.D], pl.FP8E8M0, pl.MX_B_NN],
+    rope_cos: pl.Tensor[[C.T_DYN, C.ROPE_DIM // 2], pl.FP32],
+    rope_sin: pl.Tensor[[C.T_DYN, C.ROPE_DIM // 2], pl.FP32],
+    window_slots: pl.Tensor[[C.T_DYN], pl.INT64],
+    window_indices: pl.Tensor[[C.T_DYN, 128], pl.INT32],
+    window_cache: pl.Tensor[[C.ORI_BLOCKS_DYN, 128, 1, C.HEAD_DIM], pl.FP8E4M3FN],
+    window_cache_scale: pl.Tensor[[C.ORI_BLOCKS_DYN, 128, 1, C.HEAD_DIM // C.WINDOW_CACHE_GROUP], pl.FP8E8M0],
+    compressed_cache: pl.Tensor[[C.CMP_BLOCKS_DYN, 128, 1, C.HEAD_DIM // 2], pl.UINT8],
+    compressed_cache_scale: pl.Tensor[
+        [C.CMP_BLOCKS_DYN, 128, 1, C.HEAD_DIM // C.COMPRESSED_CACHE_GROUP], pl.FP8E4M3FN
+    ],
+    token_to_req_indices: pl.Tensor[[C.T_DYN], pl.INT32],
+    compressed_lens: pl.Tensor[[C.T_DYN], pl.INT32],
+    index_cache: pl.Tensor[[C.INDEX_BLOCKS_DYN, 128, 1, C.INDEX_DIM // 2], pl.UINT8],
+    index_cache_scale: pl.Tensor[
+        [C.INDEX_BLOCKS_DYN, 128, 1, C.INDEX_DIM // C.INDEX_CACHE_GROUP], pl.FP8E8M0
+    ],
+    index_block_table: pl.Tensor[[C.B_DYN, C.TABLE_DYN], pl.INT32],
+    position_ids: pl.Tensor[[C.T_DYN], pl.INT32],
+    compressed_rope_cos: pl.Tensor[[C.T_DYN, C.ROPE_DIM // 2], pl.FP32],
+    compressed_rope_sin: pl.Tensor[[C.T_DYN, C.ROPE_DIM // 2], pl.FP32],
+    compressor_wkv: pl.Tensor[[C.D, C.HEAD_DIM], pl.FP32],
+    compressor_wgate: pl.Tensor[[C.D, C.HEAD_DIM], pl.FP32],
+    query_start_loc: pl.Tensor[[C.Q_START_DYN], pl.INT32],
+    state_block_table: pl.Tensor[[C.B_DYN, 1], pl.INT32],
+    state_cache: pl.Tensor[[C.STATE_BLOCKS_DYN, C.STATE_CAPACITY, C.STATE_WIDTH], pl.FP32],
+    compressor_norm_weight: pl.Tensor[[C.HEAD_DIM], pl.BF16],
+    compressed_slots: pl.Tensor[[C.T_DYN], pl.INT64],
+    index_wk: pl.Tensor[[C.HEAD_DIM, C.INDEX_DIM], pl.BF16],
+    index_norm_weight: pl.Tensor[[C.INDEX_DIM], pl.BF16],
+    index_wq_b: pl.Tensor[[C.Q_LORA, C.INDEX_H * C.INDEX_DIM], pl.FP8E4M3FN],
+    index_wq_b_scale: pl.Tensor[[C.Q_LORA // 32, C.INDEX_H * C.INDEX_DIM], pl.FP8E8M0, pl.MX_B_NN],
+    index_weights_proj: pl.Tensor[[C.D, C.INDEX_H], pl.BF16],
+    topk_indices: pl.Tensor[[C.T_DYN, C.INDEX_TOPK], pl.INT32],
+    input_window: pld.DistributedTensor[[C.PREFILL_MAX_TOKENS, C.D], pl.BF16],
+    input_arrived: pld.DistributedTensor[[C.TP_SIZE, 1], pl.INT32],
+    output_window: pld.DistributedTensor[[C.PREFILL_MAX_TOKENS, C.D], pl.FP32],
+    output_arrived: pld.DistributedTensor[[C.TP_SIZE, 1], pl.INT32],
+    attn_input: pl.Tensor[[C.T_DYN, C.D], pl.BF16],
+    attn_output: pl.Tensor[[SP_T_DYN, C.D], pl.BF16],
+    next_pre_mix: pl.Tensor[[SP_T_DYN, C.HC_MULT], pl.FP32],
+    x_hc_out: pl.Tensor[[SP_T_DYN, C.HC_MULT, C.D], pl.FP32],
+    group_base: pl.Scalar[pl.INT32],
+    tp_rank: pl.Scalar[pl.INT32],
+    num_tokens: pl.Scalar[pl.INT32],
+    attention_epoch: pl.Scalar[pl.INT32],
+):
+    """Run one C2A Full attention sublayer between mHC pre and post.
+
+    ``x_hc`` and ``pre_mix`` contain contiguous local token rows. ``num_tokens`` is
+    the valid global count of this DP group; metadata follows the gathered group order.
+    ``attn_input`` is gathered, while ``attn_output``, ``next_pre_mix`` and ``x_hc_out``
+    stay local. Inactive local outputs are zero. Outputs must not alias inputs.
+    """
+    tokens = pl.tensor.dim(x_hc, 0)
+    post_mix = pl.create_tensor([tokens, HC_MULT], dtype=pl.FP32)
+    residual_mix = pl.create_tensor([tokens, HC_MULT, HC_MULT], dtype=pl.FP32)
+    local_hidden = pl.create_tensor([tokens, D], dtype=pl.BF16)
+    attention_hc_pre(
+        x_hc, pre_mix, hc_attn_fn, hc_attn_scale, hc_attn_base, attn_norm_weight, next_pre_mix,
+        post_mix, residual_mix, local_hidden,
+    )
+    prefill_sp_input_allgather(
+        local_hidden, input_window, input_arrived, attn_input,
+        group_base, tp_rank, num_tokens, attention_epoch,
+    )
+    group_tokens = pl.tensor.dim(attn_input, 0)
+    partial = pl.create_tensor([group_tokens, D], dtype=pl.FP32)
+    for row in pl.spmd(group_tokens, name_hint="sp_topk_padding"):
+        if row >= num_tokens:
+            topk_indices[row:row + 1, :] = pl.full([1, INDEX_TOPK], dtype=pl.INT32, value=-1)
+    if num_tokens > 0:
+        prefill_attn_c2a_full_partial(
+            attn_input, wq_a, wq_a_scale, q_norm_weight, wq_b, wq_b_scale, wkv, wkv_scale, kv_norm_weight,
+            attn_sink, wo_a, wo_b, wo_b_scale, rope_cos, rope_sin, window_slots, window_indices,
+            window_cache, window_cache_scale, compressed_cache, compressed_cache_scale, token_to_req_indices,
+            compressed_lens, index_cache, index_cache_scale, index_block_table, position_ids,
+            compressed_rope_cos, compressed_rope_sin, compressor_wkv, compressor_wgate,
+            query_start_loc, state_block_table, state_cache, compressor_norm_weight, compressed_slots,
+            index_wk, index_norm_weight, index_wq_b, index_wq_b_scale, index_weights_proj,
+            topk_indices, output_arrived, partial,
+            num_tokens, attention_epoch,
+        )
+    prefill_sp_output_reduce_scatter(
+        partial, output_window, output_arrived, attn_output,
+        group_base, tp_rank, num_tokens, attention_epoch,
+    )
+    prefill_sp_post(
+        attn_output, x_hc, post_mix, residual_mix, x_hc_out, next_pre_mix, tp_rank, num_tokens,
+    )
+    return x_hc_out
 
 
 @pl.jit.inline
@@ -220,6 +338,7 @@ def golden_attention_input(
     return golden_rms_norm(hc_pre(x_hc, pre_mix).to(torch.bfloat16), attn_norm_weight)
 
 
+
 HC_INPUT_NAMES = ("x_hc", "pre_mix", "hc_attn_fn", "hc_attn_scale", "hc_attn_base", "attn_norm_weight")
 MODES = {
     "full": (INPUT_NAMES, MUTABLE_NAMES, SHARDED_NAMES, official_reference_c2a),
@@ -256,56 +375,91 @@ def make_attention_inputs(mode, tokens, requests, seed, case):
     return {name: value for name, value in values.items() if name != "x"}
 
 
+def token_shards(value, local_tokens):
+    """Pad scheduled rows and split them in contiguous TP rank order."""
+    padded = value.new_zeros(TP_SIZE * local_tokens, *value.shape[1:])
+    padded[:value.shape[0]].copy_(value)
+    return padded.reshape(TP_SIZE, local_tokens, *value.shape[1:])
+
+
 def reference_attention(mode, epochs, tensors, x, ranks):
-    """Reference one TP group's attention on ``x``: the FP32 TP sum and each rank's last result."""
+    """Evaluate valid global rows and retain each head rank's cache side effects."""
     names, mutable_names, _, reference = MODES[mode]
     partials, results = [], []
+    counts = tensors["num_tokens"]
+    active = int(counts[ranks[0], 0]) if isinstance(counts, torch.Tensor) and counts.ndim == 2 else int(counts)
+    token_names = {
+        "rope_cos", "rope_sin", "window_slots", "window_indices", "token_to_req_indices",
+        "compressed_lens", "position_ids", "compressed_rope_cos", "compressed_rope_sin",
+        "compressed_slots", "compressed_indices",
+    }
     for rank in ranks:
         inputs = {
-            name: x if name == "x" else tensors[name][rank]
+            name: x[:active] if name == "x" else tensors[name][rank]
             for name in names if mode != "full" or name not in FULL_ROPE_NAMES
         }
         if mode == "full":
             for row_name, table_name in FULL_ROPE_NAMES.items():
                 positions_name = "compressed_rope_positions" if row_name.startswith("compressed_") else "position_ids"
-                positions = tensors[positions_name][rank].to(torch.long)
+                positions = tensors[positions_name][rank, :active].to(torch.long)
                 identity = 1.0 if row_name.endswith("cos") else 0.0
                 inputs[row_name] = tensors[table_name][rank][positions.clamp_min(0)].masked_fill(
                     positions[:, None] < 0, identity
                 )
-        for _ in range(epochs):
-            result = reference(inputs)
-            for name in mutable_names:
-                inputs[name] = result[name]
-        partials.append(result["output"].float())
+        for name in token_names.intersection(inputs):
+            inputs[name] = inputs[name][:active]
+        if "query_start_loc" in inputs:
+            inputs["query_start_loc"] = inputs["query_start_loc"].clamp_max(active)
+        output = torch.zeros_like(x, dtype=torch.float32)
+        if active:
+            for _ in range(epochs):
+                # Head partials remain FP32 until the TP sum is complete.
+                result = reference(inputs, fp32_output=True)
+                for name in mutable_names:
+                    inputs[name] = result[name]
+            output[:active].copy_(result["output"])
+        else:
+            result = {name: inputs[name].clone() for name in mutable_names}
+        if mode == "full":
+            topk = torch.full((x.shape[0], C.INDEX_TOPK), -1, dtype=torch.int32)
+            if active:
+                topk[:active].copy_(result["topk_indices"])
+            result["topk_indices"] = topk
+        result["output"] = output
+        partials.append(output)
         results.append(result)
     return sum(partials).bfloat16(), results
 
 
-def make_golden(mode, epochs):
-    """Reference each TP group: mHC pre on the leader, per-rank attention, FP32 TP sum, mHC post."""
+def make_golden(mode, epochs, *, attention_reference=None, state_names=None):
+    """Reconstruct scheduled rows, evaluate full references, then shard local state."""
 
     def golden(tensors):
-        """Fill every chained output and the attention state each rank publishes."""
+        local = tensors["x_hc"].shape[1]
+        tokens = tensors["attn_input"].shape[1]
         for base in range(0, tensors["x_hc"].shape[0], TP_SIZE):
             ranks = range(base, base + TP_SIZE)
-            x_hc = tensors["x_hc"][base]
+            group = slice(base, base + TP_SIZE)
+            active = int(tensors["num_tokens"][base, 0])
+            x_hc = tensors["x_hc"][group].flatten(0, 1)[:tokens].clone()
+            x_hc[active:] = 0
+            incoming = tensors["pre_mix"][group].flatten(0, 1)[:tokens]
             pre, post, comb = hc_mixes(
                 x_hc, tensors["hc_attn_fn"][base], tensors["hc_attn_scale"][base], tensors["hc_attn_base"][base]
             )
-            x = golden_attention_input(x_hc, tensors["pre_mix"][base], tensors["attn_norm_weight"][base])
-            attention, results = reference_attention(mode, epochs, tensors, x, ranks)
+            x = golden_attention_input(x_hc, incoming, tensors["attn_norm_weight"][base])
+            x[active:] = 0
+            reference = attention_reference or reference_attention
+            attention, results = reference(mode, epochs, tensors, x, ranks)
             for rank, result in zip(ranks, results):
-                for name in ATTENTION_STATE[mode]:
+                for name in ATTENTION_STATE[mode] if state_names is None else state_names:
                     tensors[name][rank].copy_(result[name])
-            outputs = {
-                "attn_input": x,
-                "attn_output": attention,
-                "next_pre_mix": pre,
-                "x_hc_out": hc_post(attention, x_hc, post, comb).float(),
-            }
-            for name, value in outputs.items():
-                tensors[name][base : base + TP_SIZE].copy_(value.expand_as(tensors[name][base : base + TP_SIZE]))
+            output = hc_post(attention, x_hc, post, comb).float()
+            output[active:] = 0
+            pre[active:] = 0
+            tensors["attn_input"][group].copy_(x.expand_as(tensors["attn_input"][group]))
+            for name, value in (("attn_output", attention), ("next_pre_mix", pre), ("x_hc_out", output)):
+                tensors[name][group].copy_(token_shards(value, local))
 
     return golden
 
@@ -319,26 +473,33 @@ class StagedAttentionReference:
     budget against this reference while ``attn_input`` itself is checked against the golden input.
     """
 
-    def __init__(self, mode, epochs, initial_state):
+    def __init__(self, mode, epochs, initial_state, *, attention_reference=None, state_names=None):
         """Keep the mode, the epoch count and the pre-run cache and state of every rank."""
         self.mode = mode
         self.epochs = epochs
         self.initial_state = initial_state
         self.outputs = None
+        self.reference = attention_reference or reference_attention
+        self.state_names = ATTENTION_STATE[mode] if state_names is None else state_names
 
     def __call__(self, inputs, actual_outputs):
         """Reference every rank's attention on the device's ``attn_input``, once per run."""
         if self.outputs is None:
             tensors = {**inputs, **self.initial_state}
             x = actual_outputs["attn_input"]
-            names = ("attn_output",) + ATTENTION_STATE[self.mode]
+            names = ("attn_output",) + self.state_names
             outputs = {name: torch.empty_like(actual_outputs[name]) for name in names}
             for base in range(0, x.shape[0], TP_SIZE):
                 ranks = range(base, base + TP_SIZE)
-                attention, results = reference_attention(self.mode, self.epochs, tensors, x[base], ranks)
-                outputs["attn_output"][base : base + TP_SIZE] = attention
+                attention, results = self.reference(self.mode, self.epochs, tensors, x[base], ranks)
+                if isinstance(inputs["num_tokens"], torch.Tensor) and inputs["num_tokens"].ndim == 2:
+                    outputs["attn_output"][base : base + TP_SIZE] = token_shards(
+                        attention, actual_outputs["attn_output"].shape[1]
+                    )
+                else:
+                    outputs["attn_output"][base : base + TP_SIZE] = attention
                 for rank, result in zip(ranks, results):
-                    for name in ATTENTION_STATE[self.mode]:
+                    for name in self.state_names:
                         outputs[name][rank] = result[name]
             self.outputs = outputs
         return self.outputs
@@ -350,7 +511,17 @@ class StagedAttentionReference:
             """Report the end-to-end difference, then compare against the forced reference."""
             if name == "attn_output":
                 for base in range(0, actual.shape[0], TP_SIZE):
-                    _report("attn_output(end-to-end, not gated)", actual[base], expected[base])
+                    counts = inputs["num_tokens"]
+                    if isinstance(counts, torch.Tensor) and counts.ndim == 2:
+                        active = int(counts[base, 0])
+                        if active:
+                            _report(
+                                "attn_output(end-to-end, not gated)",
+                                actual[base : base + TP_SIZE].flatten(0, 1)[:active],
+                                expected[base : base + TP_SIZE].flatten(0, 1)[:active],
+                            )
+                    else:
+                        _report("attn_output(end-to-end, not gated)", actual[base], expected[base])
             forced = self(inputs, actual_outputs)
             return check(
                 actual, forced[name], inputs=inputs, actual_outputs=actual_outputs, expected_outputs=forced, **kwargs
@@ -402,19 +573,53 @@ def compare_x_hc_out(actual, expected, *, inputs, actual_outputs, **kwargs):
     """
     check = ratio_allclose(atol=1e-4, rtol=1.0 / 128)
     passed = True
-    for base in range(0, actual.shape[0], TP_SIZE):
+    for base in range(actual.shape[0]):
         x_hc = inputs["x_hc"][base]
         _, post, comb = hc_mixes(
             x_hc, inputs["hc_attn_fn"][base], inputs["hc_attn_scale"][base], inputs["hc_attn_base"][base]
         )
         replay = hc_post(actual_outputs["attn_output"][base], x_hc, post, comb).float()
+        active = local_active_tokens(inputs, base, actual.shape[1])
+        replay[active:] = 0
+        if not active:
+            empty = bool((actual[base] == 0).all())
+            if not empty:
+                print(f"[PRECISION] x_hc_out rank={base} inactive shard contains nonzero output")
+            passed &= empty
+            continue
         _, worst_row = _report("x_hc_out(replay)", actual[base], replay)
-        valid, _ = check(actual[base], replay, inputs=inputs, actual_outputs=actual_outputs, **kwargs)
+        valid, detail = check(actual[base], replay, inputs=inputs, actual_outputs=actual_outputs, **kwargs)
+        if not valid:
+            print(f"[PRECISION] x_hc_out rank={base}: {detail}")
         passed &= valid and worst_row <= ROW_BUDGET
         passed &= _report("x_hc_out(end-to-end)", actual[base], expected[base])[0] <= 0.01
         passed &= bool(torch.isfinite(actual[base]).all())
-        passed &= all(torch.equal(actual[base], actual[rank]) for rank in range(base + 1, base + TP_SIZE))
+        passed &= bool((actual[base, active:] == 0).all())
     return passed, "hc_post replay within hc_post's budget per token row; end-to-end rel L2 <= 1%"
+
+
+def local_active_tokens(inputs, rank, capacity):
+    """Count valid scheduled rows in one contiguous shard."""
+    return max(0, min(capacity, int(inputs["num_tokens"][rank, 0]) - rank % TP_SIZE * capacity))
+
+
+def compare_shards(name, check, max_row_rel_l2=None):
+    """Validate every active shard separately and require exact zero padding."""
+    def compare(actual, expected, *, inputs, **kwargs):
+        passed = True
+        for rank in range(actual.shape[0]):
+            active = local_active_tokens(inputs, rank, actual.shape[1])
+            passed &= bool((actual[rank, active:] == 0).all())
+            if active:
+                value, reference = actual[rank, :active], expected[rank, :active]
+                valid, detail = check(value, reference, inputs=inputs, **kwargs)
+                if not valid:
+                    print(f"[PRECISION] {name} rank={rank}: {detail}")
+                passed &= valid
+                if max_row_rel_l2 is not None:
+                    passed &= _report(name, value, reference)[1] <= max_row_rel_l2
+        return passed, "every active shard must pass; inactive rows must be exactly zero"
+    return compare
 
 
 def make_compare(mode, epochs, initial_state):
@@ -426,10 +631,10 @@ def make_compare(mode, epochs, initial_state):
             "attn_input", ratio_allclose(atol=1e-4, rtol=1.0 / 128), ROW_BUDGET
         ),
         # next_pre_mix is hc_mixes' FP32 pre coefficient: hc_mixes' budget.
-        "next_pre_mix": compare_group_leaders(
+        "next_pre_mix": compare_shards(
             "next_pre_mix", ratio_allclose(atol=2.5e-5, rtol=5e-3), 5e-3
         ),
-        "attn_output": staged.compare("attn_output", compare_replicated(compare_output)),
+        "attn_output": staged.compare("attn_output", compare_shards("attn_output", compare_output)),
         "x_hc_out": compare_x_hc_out,
     }
     if mode == "full":
@@ -448,8 +653,8 @@ def make_hc_program(capacity, world_size, epochs):
 
     @pl.jit
     def c2a_full_rank(
-        x_hc: pl.Tensor[[C.T_DYN, C.HC_MULT, C.D], pl.FP32],
-        pre_mix: pl.Tensor[[C.T_DYN, C.HC_MULT], pl.FP32],
+        x_hc: pl.Tensor[[SP_T_DYN, C.HC_MULT, C.D], pl.FP32],
+        pre_mix: pl.Tensor[[SP_T_DYN, C.HC_MULT], pl.FP32],
         hc_attn_fn: pl.Tensor[[C.MIX_HC, C.HC_DIM], pl.FP32],
         hc_attn_scale: pl.Tensor[[3], pl.FP32],
         hc_attn_base: pl.Tensor[[C.MIX_HC], pl.FP32],
@@ -499,18 +704,21 @@ def make_hc_program(capacity, world_size, epochs):
         index_weights_proj: pl.Tensor[[C.D, C.INDEX_H], pl.BF16],
         topk_indices: pl.Out[pl.Tensor[[C.T_DYN, C.INDEX_TOPK], pl.INT32]],
         attn_input: pl.Out[pl.Tensor[[C.T_DYN, C.D], pl.BF16]],
-        attn_output: pl.Out[pl.Tensor[[C.T_DYN, C.D], pl.BF16]],
-        next_pre_mix: pl.Out[pl.Tensor[[C.T_DYN, C.HC_MULT], pl.FP32]],
-        x_hc_out: pl.Out[pl.Tensor[[C.T_DYN, C.HC_MULT, C.D], pl.FP32]],
+        attn_output: pl.Out[pl.Tensor[[SP_T_DYN, C.D], pl.BF16]],
+        next_pre_mix: pl.Out[pl.Tensor[[SP_T_DYN, C.HC_MULT], pl.FP32]],
+        x_hc_out: pl.Out[pl.Tensor[[SP_T_DYN, C.HC_MULT, C.D], pl.FP32]],
+        input_window: pld.DistributedTensor[[capacity, C.D], pl.BF16],
+        input_arrived: pld.DistributedTensor[[C.TP_SIZE, 1], pl.INT32],
         output_window: pld.DistributedTensor[[capacity, C.D], pl.FP32],
         output_arrived: pld.DistributedTensor[[C.TP_SIZE, 1], pl.INT32],
         rank: pl.Scalar[pl.INT32],
-        num_tokens: pl.Scalar[pl.INT32],
+        num_tokens: pl.Tensor[[1], pl.INT32],
         attention_epoch: pl.Scalar[pl.INT32],
     ):
         """Bind the runtime shapes and run the sublayer once per epoch on one rank."""
         freqs_cos.bind_dynamic(0, ROPE_ROWS_DYN)
-        x_hc.bind_dynamic(0, T_DYN)
+        x_hc.bind_dynamic(0, SP_T_DYN)
+        attn_input.bind_dynamic(0, T_DYN)
         window_cache.bind_dynamic(0, ORI_BLOCKS_DYN)
         compressed_cache.bind_dynamic(0, CMP_BLOCKS_DYN)
         index_cache.bind_dynamic(0, INDEX_BLOCKS_DYN)
@@ -519,32 +727,32 @@ def make_hc_program(capacity, world_size, epochs):
         query_start_loc.bind_dynamic(0, C.Q_START_DYN)
         state_block_table.bind_dynamic(0, C.B_DYN)
         state_cache.bind_dynamic(0, C.STATE_BLOCKS_DYN)
-        if num_tokens > 0:
-            tokens = pl.tensor.dim(x_hc, 0)
-            rope_cos = pl.create_tensor([tokens, ROPE_DIM // 2], dtype=pl.FP32)
-            rope_sin = pl.create_tensor([tokens, ROPE_DIM // 2], dtype=pl.FP32)
-            compressed_rope_cos = pl.create_tensor([tokens, ROPE_DIM // 2], dtype=pl.FP32)
-            compressed_rope_sin = pl.create_tensor([tokens, ROPE_DIM // 2], dtype=pl.FP32)
-            materialize_rope_rows(freqs_cos, freqs_sin, position_ids, num_tokens, rope_cos, rope_sin)
-            materialize_rope_rows(
-                compressed_freqs_cos, compressed_freqs_sin, compressed_rope_positions, num_tokens,
-                compressed_rope_cos, compressed_rope_sin,
+        active = pl.read(num_tokens, [0])
+        tokens = pl.tensor.dim(attn_input, 0)
+        rope_cos = pl.create_tensor([tokens, ROPE_DIM // 2], dtype=pl.FP32)
+        rope_sin = pl.create_tensor([tokens, ROPE_DIM // 2], dtype=pl.FP32)
+        compressed_rope_cos = pl.create_tensor([tokens, ROPE_DIM // 2], dtype=pl.FP32)
+        compressed_rope_sin = pl.create_tensor([tokens, ROPE_DIM // 2], dtype=pl.FP32)
+        materialize_rope_rows(freqs_cos, freqs_sin, position_ids, active, rope_cos, rope_sin)
+        materialize_rope_rows(
+            compressed_freqs_cos, compressed_freqs_sin, compressed_rope_positions, active,
+            compressed_rope_cos, compressed_rope_sin,
+        )
+        for step in pl.range(epochs):
+            prefill_c2a_full_sp(
+                x_hc, pre_mix, hc_attn_fn, hc_attn_scale, hc_attn_base, attn_norm_weight,
+                wq_a, wq_a_scale, q_norm_weight, wq_b, wq_b_scale, wkv, wkv_scale,
+                kv_norm_weight, attn_sink, wo_a, wo_b, wo_b_scale, rope_cos, rope_sin,
+                window_slots, window_indices, window_cache, window_cache_scale,
+                compressed_cache, compressed_cache_scale, token_to_req_indices, compressed_lens,
+                index_cache, index_cache_scale, index_block_table, position_ids,
+                compressed_rope_cos, compressed_rope_sin, compressor_wkv, compressor_wgate,
+                query_start_loc, state_block_table, state_cache, compressor_norm_weight,
+                compressed_slots, index_wk, index_norm_weight, index_wq_b, index_wq_b_scale,
+                index_weights_proj, topk_indices, input_window, input_arrived, output_window, output_arrived, attn_input,
+                attn_output, next_pre_mix, x_hc_out, rank // TP_SIZE * TP_SIZE, rank % TP_SIZE,
+                active, attention_epoch + step,
             )
-            for step in pl.range(epochs):
-                prefill_c2a_full(
-                    x_hc, pre_mix, hc_attn_fn, hc_attn_scale, hc_attn_base, attn_norm_weight,
-                    wq_a, wq_a_scale, q_norm_weight, wq_b, wq_b_scale, wkv, wkv_scale,
-                    kv_norm_weight, attn_sink, wo_a, wo_b, wo_b_scale, rope_cos, rope_sin,
-                    window_slots, window_indices, window_cache, window_cache_scale,
-                    compressed_cache, compressed_cache_scale, token_to_req_indices, compressed_lens,
-                    index_cache, index_cache_scale, index_block_table, position_ids,
-                    compressed_rope_cos, compressed_rope_sin, compressor_wkv, compressor_wgate,
-                    query_start_loc, state_block_table, state_cache, compressor_norm_weight,
-                    compressed_slots, index_wk, index_norm_weight, index_wq_b, index_wq_b_scale,
-                    index_weights_proj, topk_indices, output_window, output_arrived, attn_input,
-                    attn_output, next_pre_mix, x_hc_out, rank // TP_SIZE * TP_SIZE, rank % TP_SIZE,
-                    num_tokens, attention_epoch + step,
-                )
         return (
             x_hc_out, next_pre_mix, attn_output, attn_input, topk_indices, window_cache, window_cache_scale,
             compressed_cache, compressed_cache_scale, index_cache, index_cache_scale, state_cache,
@@ -552,8 +760,8 @@ def make_hc_program(capacity, world_size, epochs):
 
     @pl.jit.host
     def c2a_full_group(
-        x_hc: pl.Tensor[[world_size, C.T_DYN, C.HC_MULT, C.D], pl.FP32],
-        pre_mix: pl.Tensor[[world_size, C.T_DYN, C.HC_MULT], pl.FP32],
+        x_hc: pl.Tensor[[world_size, SP_T_DYN, C.HC_MULT, C.D], pl.FP32],
+        pre_mix: pl.Tensor[[world_size, SP_T_DYN, C.HC_MULT], pl.FP32],
         hc_attn_fn: pl.Tensor[[world_size, C.MIX_HC, C.HC_DIM], pl.FP32],
         hc_attn_scale: pl.Tensor[[world_size, 3], pl.FP32],
         hc_attn_base: pl.Tensor[[world_size, C.MIX_HC], pl.FP32],
@@ -607,15 +815,16 @@ def make_hc_program(capacity, world_size, epochs):
         index_weights_proj: pl.Tensor[[world_size, C.D, C.INDEX_H], pl.BF16],
         topk_indices: pl.Out[pl.Tensor[[world_size, C.T_DYN, C.INDEX_TOPK], pl.INT32]],
         attn_input: pl.Out[pl.Tensor[[world_size, C.T_DYN, C.D], pl.BF16]],
-        attn_output: pl.Out[pl.Tensor[[world_size, C.T_DYN, C.D], pl.BF16]],
-        next_pre_mix: pl.Out[pl.Tensor[[world_size, C.T_DYN, C.HC_MULT], pl.FP32]],
-        x_hc_out: pl.Out[pl.Tensor[[world_size, C.T_DYN, C.HC_MULT, C.D], pl.FP32]],
-        num_tokens: pl.Scalar[pl.INT32],
+        attn_output: pl.Out[pl.Tensor[[world_size, SP_T_DYN, C.D], pl.BF16]],
+        next_pre_mix: pl.Out[pl.Tensor[[world_size, SP_T_DYN, C.HC_MULT], pl.FP32]],
+        x_hc_out: pl.Out[pl.Tensor[[world_size, SP_T_DYN, C.HC_MULT, C.D], pl.FP32]],
+        num_tokens: pl.Tensor[[world_size, 1], pl.INT32],
         attention_epoch: pl.Scalar[pl.INT32],
     ):
         """Allocate the TP communication windows and launch one rank entry per device."""
         freqs_cos.bind_dynamic(1, ROPE_ROWS_DYN)
-        x_hc.bind_dynamic(1, T_DYN)
+        x_hc.bind_dynamic(1, SP_T_DYN)
+        attn_input.bind_dynamic(1, T_DYN)
         window_cache.bind_dynamic(1, ORI_BLOCKS_DYN)
         compressed_cache.bind_dynamic(1, CMP_BLOCKS_DYN)
         index_cache.bind_dynamic(1, INDEX_BLOCKS_DYN)
@@ -624,9 +833,13 @@ def make_hc_program(capacity, world_size, epochs):
         query_start_loc.bind_dynamic(1, C.Q_START_DYN)
         state_block_table.bind_dynamic(1, C.B_DYN)
         state_cache.bind_dynamic(1, C.STATE_BLOCKS_DYN)
+        input_buffer = pld.alloc_window_buffer([capacity, D], dtype=pl.BF16)
+        input_signal_buffer = pld.alloc_window_buffer([TP_SIZE, 1], dtype=pl.INT32)
         data_buffer = pld.alloc_window_buffer([capacity, D], dtype=pl.FP32)
         signal_buffer = pld.alloc_window_buffer([TP_SIZE, 1], dtype=pl.INT32)
         for rank in pl.range(pld.world_size()):
+            input_data = pld.window(input_buffer, [capacity, D], dtype=pl.BF16)
+            input_signal = pld.window(input_signal_buffer, [TP_SIZE, 1], dtype=pl.INT32)
             data = pld.window(data_buffer, [capacity, D], dtype=pl.FP32)
             signal = pld.window(signal_buffer, [TP_SIZE, 1], dtype=pl.INT32)
             # Each rank consumes packed MX_B_NN scale rows.
@@ -649,7 +862,7 @@ def make_hc_program(capacity, world_size, epochs):
                 compressor_norm_weight[rank], compressed_slots[rank], index_wk[rank],
                 index_norm_weight[rank], index_wq_b[rank], index_wq_b_scale_r,
                 index_weights_proj[rank], topk_indices[rank], attn_input[rank], attn_output[rank],
-                next_pre_mix[rank], x_hc_out[rank], data, signal, rank, num_tokens, attention_epoch,
+                next_pre_mix[rank], x_hc_out[rank], input_data, input_signal, data, signal, rank, num_tokens[rank], attention_epoch,
                 device=rank,
             )
 
@@ -667,6 +880,8 @@ def build_specs(args, mode, initial_state):
     program_names = PROGRAM_INPUT_NAMES if mode == "full" else names
     attention_names = tuple(name for name in program_names if name != "x")
     ranks = {}
+    local = (args.tokens + TP_SIZE - 1) // TP_SIZE
+    counts = getattr(args, "dp_tokens", None) or [args.tokens] * args.dp
 
     def initialize(name):
         """Draw every rank's fixture on the first spec that needs it, then stack one tensor."""
@@ -685,6 +900,21 @@ def build_specs(args, mode, initial_state):
                 for key in attention_names:
                     if key not in sharded_names:
                         ranks[rank][key] = ranks[leader][key]
+            for rank in range(world_size):
+                active = counts[rank // TP_SIZE]
+                start = rank % TP_SIZE * local
+                valid = max(0, min(local, active - start))
+                for key in ("x_hc", "pre_mix"):
+                    original = ranks[rank][key]
+                    shard = original.new_full((local, *original.shape[1:]), 17.0)
+                    shard[:valid].copy_(original[start:start + valid])
+                    ranks[rank][key] = shard
+                for key in ("window_slots", "compressed_slots", "window_indices", "compressed_indices"):
+                    if key in ranks[rank]:
+                        ranks[rank][key] = ranks[rank][key].clone()
+                        ranks[rank][key][active:] = -1
+                if "query_start_loc" in ranks[rank]:
+                    ranks[rank]["query_start_loc"] = ranks[rank]["query_start_loc"].clamp_max(active)
         column = [ranks[rank][name] for rank in range(world_size)]
         if column[0].dtype in (torch.float8_e4m3fn, torch.float8_e8m0fnu):
             stacked = torch.stack([value.view(torch.uint8) for value in column]).view(column[0].dtype)
@@ -699,7 +929,8 @@ def build_specs(args, mode, initial_state):
     specs = [
         TensorSpec(
             name,
-            [world_size, *shapes[name].shape],
+            [world_size, local, *shapes[name].shape[1:]] if name in ("x_hc", "pre_mix")
+            else [world_size, *shapes[name].shape],
             shapes[name].dtype,
             init_value=(lambda name=name: initialize(name)),
             resident="stacked",
@@ -712,10 +943,11 @@ def build_specs(args, mode, initial_state):
         )
     specs += [
         TensorSpec("attn_input", [world_size, args.tokens, D], torch.bfloat16, resident="stacked"),
-        TensorSpec("attn_output", [world_size, args.tokens, D], torch.bfloat16, resident="stacked"),
-        TensorSpec("next_pre_mix", [world_size, args.tokens, HC_MULT], torch.float32, resident="stacked"),
-        TensorSpec("x_hc_out", [world_size, args.tokens, HC_MULT, D], torch.float32, resident="stacked"),
-        ScalarSpec("num_tokens", torch.int32, args.tokens, compile_runtime=True),
+        TensorSpec("attn_output", [world_size, local, D], torch.bfloat16, resident="stacked"),
+        TensorSpec("next_pre_mix", [world_size, local, HC_MULT], torch.float32, resident="stacked"),
+        TensorSpec("x_hc_out", [world_size, local, HC_MULT, D], torch.float32, resident="stacked"),
+        TensorSpec("num_tokens", [world_size, 1], torch.int32, resident="stacked",
+                   init_value=torch.tensor(counts, dtype=torch.int32).repeat_interleave(TP_SIZE).reshape(-1, 1)),
         ScalarSpec(
             "attention_epoch",
             torch.int32,
@@ -737,6 +969,7 @@ def run_prefill_c2a(make_program, mode, argv=None):
     parser.add_argument("--tp", type=int, default=TP_SIZE, choices=[1, 2, 4])
     parser.add_argument("--dp", type=int, default=1, choices=[1, 2])
     parser.add_argument("--tokens", type=int, default=48)
+    parser.add_argument("--dp-tokens", type=str, help="comma-separated active counts, one per DP group")
     parser.add_argument("--requests", type=int, default=6)
     parser.add_argument("--case", default="mixed", choices=["mixed", "long", "masked", "zero"])
     parser.add_argument("--seed", type=int, default=17)
@@ -756,6 +989,9 @@ def run_prefill_c2a(make_program, mode, argv=None):
         parser.error(f"--requests must be in [1, {min(C.MAX_BATCH_PER_DP, args.tokens)}]")
     if not 1 <= args.epochs <= 1000:
         parser.error("--epochs must be in [1, 1000]")
+    args.dp_tokens = [int(value) for value in args.dp_tokens.split(",")] if args.dp_tokens else [args.tokens] * args.dp
+    if len(args.dp_tokens) != args.dp or any(count < 0 or count > args.tokens for count in args.dp_tokens):
+        parser.error("--dp-tokens must provide one count in [0, tokens] per DP group")
     torch.set_num_threads(8)
 
     print(
@@ -771,6 +1007,8 @@ def run_prefill_c2a(make_program, mode, argv=None):
         config=dict(
             platform=args.platform,
             distributed_config=DistributedConfig(device_ids=devices, num_sub_workers=0),
+            # Full retains the K-chunk products for both compressor projections.
+            ring_heap=PREFILL_C2A_FULL_RING_HEAP if mode == "full" else PREFILL_ATTN_RING_HEAP,
         ),
         compare_fn=make_compare(mode, args.epochs, initial_state),
     )

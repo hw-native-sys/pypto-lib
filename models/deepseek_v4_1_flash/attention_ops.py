@@ -359,6 +359,52 @@ def make_bf16_projection(
     return project
 
 
+def make_bf16_projection_staged(width, output_width):
+    """Stage FP32 projection values before a separate BF16 narrowing task.
+
+    The BF16 operand passes through Vector before Cube starts its result transfer
+    (hw-native-sys/pypto#2829). Store FP32 values through Vector as well: direct
+    Acc-to-GM stores were unstable in the concurrent A5 prefill workload.
+    Accumulation and RNE rounding are unchanged.
+    """
+    n_tile = min(N_TILE, output_width)
+    k_tile = min(K_TILE, width)
+
+    @pl.jit.inline
+    def project(
+        source: pl.Tensor[[T_DYN, width], pl.BF16],
+        weight: pl.Tensor[[width, output_width], pl.BF16],
+        output: pl.Tensor[[T_DYN, output_width], pl.BF16],
+        num_tokens: pl.Scalar[pl.INT32],
+    ):
+        tokens = pl.tensor.dim(source, 0)
+        accumulated = pl.create_tensor([tokens, output_width], dtype=pl.FP32)
+        blocks = (num_tokens + M_TILE - 1) // M_TILE * (output_width // n_tile)
+        with pl.spmd(blocks, name_hint="prefill_bf16_projection_cube") as cube_tid:
+            block = pl.tile.get_block_idx()
+            row = block // (output_width // n_tile) * M_TILE
+            col = block % (output_width // n_tile) * n_tile
+            rows = pl.min(M_TILE, num_tokens - row)
+            acc = pl.create_tensor([M_TILE, n_tile], dtype=pl.FP32)
+            for k in pl.range(0, width, k_tile):
+                a = pl.slice(source, [M_TILE, k_tile], [row, k], valid_shape=[rows, k_tile])
+                # Preserve BF16 values while establishing Vector-to-Cube startup.
+                a = pl.cast(pl.cast(a, pl.FP32), pl.BF16, mode="rint")
+                b = pl.slice(weight, [k_tile, n_tile], [k, col])
+                acc = pl.matmul_acc(acc, a, b, init_cond=(k == 0))
+            accumulated[row : row + M_TILE, col : col + n_tile] = pl.set_validshape(pl.mul(acc, 1.0), rows, n_tile)
+        with pl.spmd(blocks, name_hint="prefill_bf16_projection_cast", deps=[cube_tid]):
+            block = pl.tile.get_block_idx()
+            row = block // (output_width // n_tile) * M_TILE
+            col = block % (output_width // n_tile) * n_tile
+            rows = pl.min(M_TILE, num_tokens - row)
+            value = pl.slice(accumulated, [M_TILE, n_tile], [row, col], valid_shape=[rows, n_tile])
+            output[row : row + M_TILE, col : col + n_tile] = pl.cast(value, pl.BF16, mode="rint")
+        return output
+
+    return project
+
+
 def make_bf16_projection_with_deps(
     width,
     output_width,
@@ -395,6 +441,7 @@ __all__ = [
     "MX_M_TILE",
     "N_TILE",
     "make_bf16_projection",
+    "make_bf16_projection_staged",
     "make_bf16_projection_with_deps",
     "make_norm",
     "make_norm_with_deps",

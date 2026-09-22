@@ -217,6 +217,86 @@ def golden_prefill_attn_swa(
 
 
 @pl.jit.inline(auto_scope=False)
+def prefill_attn_swa_partial(
+    x: pl.Tensor[[T_DYN, D], pl.BF16],
+    wq_a: pl.Tensor[[D, Q_LORA], pl.FP8E4M3FN],
+    wq_a_scale: pl.Tensor[[D // 32, Q_LORA], pl.FP8E8M0, pl.MX_B_NN],
+    q_norm_weight: pl.Tensor[[Q_LORA], pl.BF16],
+    wq_b: pl.Tensor[[Q_LORA, LOCAL_H * HEAD_DIM], pl.FP8E4M3FN],
+    wq_b_scale: pl.Tensor[[Q_LORA // 32, LOCAL_H * HEAD_DIM], pl.FP8E8M0, pl.MX_B_NN],
+    wkv: pl.Tensor[[D, HEAD_DIM], pl.FP8E4M3FN],
+    wkv_scale: pl.Tensor[[D // 32, HEAD_DIM], pl.FP8E8M0, pl.MX_B_NN],
+    kv_norm_weight: pl.Tensor[[HEAD_DIM], pl.BF16],
+    attn_sink: pl.Tensor[[LOCAL_H], pl.FP32],
+    wo_a: pl.Tensor[[LOCAL_O_GROUPS, O_LORA, O_GROUP_IN], pl.BF16],
+    wo_b: pl.Tensor[[LOCAL_O_WIDTH, D], pl.FP8E4M3FN],
+    wo_b_scale: pl.Tensor[[LOCAL_O_WIDTH // 32, D], pl.FP8E8M0, pl.MX_B_NN],
+    rope_cos: pl.Tensor[[T_DYN, ROPE_DIM // 2], pl.FP32],
+    rope_sin: pl.Tensor[[T_DYN, ROPE_DIM // 2], pl.FP32],
+    window_slots: pl.Tensor[[T_DYN], pl.INT64],
+    window_indices: pl.Tensor[[T_DYN, 128], pl.INT32],
+    window_cache: pl.Tensor[[ORI_BLOCKS_DYN, 128, 1, HEAD_DIM], pl.FP8E4M3FN],
+    window_cache_scale: pl.Tensor[[ORI_BLOCKS_DYN, 128, 1, HEAD_DIM // WINDOW_CACHE_GROUP], pl.FP8E8M0],
+    output_arrived: pld.DistributedTensor[[TP_SIZE, 1], pl.INT32],
+    partial: pl.Tensor[[T_DYN, D], pl.FP32],
+    num_tokens: pl.Scalar[pl.INT32],
+    attention_epoch: pl.Scalar[pl.INT32],
+):
+    """Write FP32 head-TP partials for packed causal SWA; write slots must be unique."""
+    with pl.at(level=pl.Level.CORE_GROUP, name_hint="swa_prefill_previous_epoch", allow_early_resolve=False) as cache_ready:
+        for peer in pl.range(TP_SIZE):
+            previous_epoch = (attention_epoch - 1) * 2
+            pld.system.wait(output_arrived, offsets=[peer, 0], expected=previous_epoch, cmp=pld.WaitCmp.Ge)
+    tokens = pl.tensor.dim(x, 0)
+    kv_projection = pl.create_tensor([tokens, HEAD_DIM], dtype=pl.BF16)
+    # Gate every projection tile before scratch storage is reused by a new epoch.
+    with pl.spmd(WORKER_TILE, name_hint="prefill_swa_begin", deps=[cache_ready]):
+        worker = pl.tile.get_block_idx()
+        for row in pl.range(worker, num_tokens, WORKER_TILE):
+            kv_projection[row : row + 1, :] = pl.full([1, HEAD_DIM], dtype=pl.BF16, value=0.0)
+    kv = pl.create_tensor([tokens, HEAD_DIM], dtype=pl.BF16)
+    prefill_kv_proj_rope(
+        x, wkv, wkv_scale, kv_norm_weight, rope_cos, rope_sin, kv_projection, kv, num_tokens
+    )
+    chunk_done = prefill_publish_window(kv, window_slots, window_cache, window_cache_scale, num_tokens, cache_ready)
+
+    chunk_x = pl.create_tensor([QUERY_TILE, D], dtype=pl.BF16)
+    chunk_cos = pl.create_tensor([QUERY_TILE, ROPE_DIM // 2], dtype=pl.FP32)
+    chunk_sin = pl.create_tensor([QUERY_TILE, ROPE_DIM // 2], dtype=pl.FP32)
+    chunk_indices = pl.create_tensor([QUERY_TILE, 128], dtype=pl.INT32)
+    qr = pl.create_tensor([QUERY_TILE, Q_LORA], dtype=pl.BF16)
+    q = pl.create_tensor([QUERY_TILE, LOCAL_H * HEAD_DIM], dtype=pl.BF16)
+    selected = pl.create_tensor([QUERY_TILE, 128, HEAD_DIM], dtype=pl.BF16)
+    attended = pl.create_tensor([QUERY_TILE, LOCAL_H * HEAD_DIM], dtype=pl.BF16)
+    chunk_partial = pl.create_tensor([QUERY_TILE, D], dtype=pl.FP32)
+
+    for start in pl.range(0, num_tokens, QUERY_TILE):
+        active = pl.min(QUERY_TILE, num_tokens - start)
+        # The prior chunk must finish reading every reusable scratch buffer.
+        with pl.spmd(WORKER_TILE, name_hint="prefill_swa_stage", deps=[chunk_done]) as stage_tid:
+            worker = pl.tile.get_block_idx()
+            for row in pl.range(worker, active, WORKER_TILE):
+                source_row = start + row
+                for col in pl.range(0, D, 512):
+                    chunk_x[row:row + 1, col:col + 512] = x[source_row:source_row + 1, col:col + 512]
+                chunk_cos[row:row + 1, :] = rope_cos[source_row:source_row + 1, :]
+                chunk_sin[row:row + 1, :] = rope_sin[source_row:source_row + 1, :]
+                chunk_indices[row:row + 1, :] = window_indices[source_row:source_row + 1, :]
+        prefill_q_proj_qr(chunk_x, wq_a, wq_a_scale, q_norm_weight, qr, active)
+        prefill_q_proj_rope(qr, wq_b, wq_b_scale, chunk_cos, chunk_sin, q, active)
+        prefill_gather_window(window_cache, window_cache_scale, chunk_indices, selected, active)
+        prefill_attend_window(q, selected, chunk_indices, attn_sink, attended, active)
+        prefill_o_proj(attended, wo_a, wo_b, wo_b_scale, chunk_cos, chunk_sin, chunk_partial, active)
+        with pl.spmd(WORKER_TILE, name_hint="prefill_swa_collect") as collect_tid:
+            worker = pl.tile.get_block_idx()
+            for row in pl.range(worker, active, WORKER_TILE):
+                for col in pl.range(0, D, 512):
+                    partial[start + row:start + row + 1, col:col + 512] = chunk_partial[row:row + 1, col:col + 512]
+        chunk_done = collect_tid
+    return partial
+
+
+@pl.jit.inline(auto_scope=False)
 def prefill_attn_swa(
     x: pl.Tensor[[T_DYN, D], pl.BF16],
     wq_a: pl.Tensor[[D, Q_LORA], pl.FP8E4M3FN],
@@ -245,65 +325,22 @@ def prefill_attn_swa(
     num_tokens: pl.Scalar[pl.INT32],
     attention_epoch: pl.Scalar[pl.INT32],
 ):
-    """Write packed causal SWA output; active physical write slots must be unique."""
-    with pl.at(level=pl.Level.CORE_GROUP, name_hint="swa_prefill_previous_epoch", allow_early_resolve=False) as cache_ready:
-        for peer in pl.range(TP_SIZE):
-            previous_epoch = (attention_epoch - 1) * 2
-            pld.system.wait(output_arrived, offsets=[peer, 0], expected=previous_epoch, cmp=pld.WaitCmp.Ge)
+    """Return replicated SWA output for the standalone attention interface."""
     tokens = pl.tensor.dim(x, 0)
-    kv_projection = pl.create_tensor([tokens, HEAD_DIM], dtype=pl.BF16)
-    # Gate every projection tile before scratch storage is reused by a new epoch.
-    with pl.spmd(WORKER_TILE, name_hint="prefill_swa_begin", deps=[cache_ready]):
-        worker = pl.tile.get_block_idx()
-        for row in pl.range(worker, num_tokens, WORKER_TILE):
-            kv_projection[row : row + 1, :] = pl.full([1, HEAD_DIM], dtype=pl.BF16, value=0.0)
-    kv = pl.create_tensor([tokens, HEAD_DIM], dtype=pl.BF16)
-    prefill_kv_proj_rope(
-        x, wkv, wkv_scale, kv_norm_weight, rope_cos, rope_sin, kv_projection, kv, num_tokens
-    )
-    chunk_done = prefill_publish_window(kv, window_slots, window_cache, window_cache_scale, num_tokens, cache_ready)
-
-    chunk_x = pl.create_tensor([QUERY_TILE, D], dtype=pl.BF16)
-    chunk_cos = pl.create_tensor([QUERY_TILE, ROPE_DIM // 2], dtype=pl.FP32)
-    chunk_sin = pl.create_tensor([QUERY_TILE, ROPE_DIM // 2], dtype=pl.FP32)
-    chunk_indices = pl.create_tensor([QUERY_TILE, 128], dtype=pl.INT32)
-    qr = pl.create_tensor([QUERY_TILE, Q_LORA], dtype=pl.BF16)
-    q = pl.create_tensor([QUERY_TILE, LOCAL_H * HEAD_DIM], dtype=pl.BF16)
-    selected = pl.create_tensor([QUERY_TILE, 128, HEAD_DIM], dtype=pl.BF16)
-    attended = pl.create_tensor([QUERY_TILE, LOCAL_H * HEAD_DIM], dtype=pl.BF16)
-    chunk_partial = pl.create_tensor([QUERY_TILE, D], dtype=pl.FP32)
     partial = pl.create_tensor([tokens, D], dtype=pl.FP32)
-
-    for start in pl.range(0, num_tokens, QUERY_TILE):
-        active = pl.min(QUERY_TILE, num_tokens - start)
-        # The prior chunk must finish reading every reusable scratch buffer.
-        with pl.spmd(WORKER_TILE, name_hint="prefill_swa_stage", deps=[chunk_done]) as stage_tid:
-            worker = pl.tile.get_block_idx()
-            for row in pl.range(worker, active, WORKER_TILE):
-                source_row = start + row
-                for col in pl.range(0, D, 512):
-                    chunk_x[row:row + 1, col:col + 512] = x[source_row:source_row + 1, col:col + 512]
-                chunk_cos[row:row + 1, :] = rope_cos[source_row:source_row + 1, :]
-                chunk_sin[row:row + 1, :] = rope_sin[source_row:source_row + 1, :]
-                chunk_indices[row:row + 1, :] = window_indices[source_row:source_row + 1, :]
-        prefill_q_proj_qr(chunk_x, wq_a, wq_a_scale, q_norm_weight, qr, active)
-        prefill_q_proj_rope(qr, wq_b, wq_b_scale, chunk_cos, chunk_sin, q, active)
-        prefill_gather_window(window_cache, window_cache_scale, chunk_indices, selected, active)
-        prefill_attend_window(q, selected, chunk_indices, attn_sink, attended, active)
-        prefill_o_proj(attended, wo_a, wo_b, wo_b_scale, chunk_cos, chunk_sin, chunk_partial, active)
-        with pl.spmd(WORKER_TILE, name_hint="prefill_swa_collect") as collect_tid:
-            worker = pl.tile.get_block_idx()
-            for row in pl.range(worker, active, WORKER_TILE):
-                for col in pl.range(0, D, 512):
-                    partial[start + row:start + row + 1, col:col + 512] = chunk_partial[row:row + 1, col:col + 512]
-        chunk_done = collect_tid
+    prefill_attn_swa_partial(
+        x, wq_a, wq_a_scale, q_norm_weight, wq_b, wq_b_scale,
+        wkv, wkv_scale, kv_norm_weight, attn_sink, wo_a, wo_b, wo_b_scale,
+        rope_cos, rope_sin, window_slots, window_indices, window_cache, window_cache_scale,
+        output_arrived, partial, num_tokens, attention_epoch,
+    )
     prefill_tp_output_all_reduce(
         partial, output_window, output_arrived, output, group_base, tp_rank, num_tokens, attention_epoch,
     )
     return output
 
 
-__all__ = ["golden_prefill_attn_swa", "prefill_attn_swa"]
+__all__ = ["golden_prefill_attn_swa", "prefill_attn_swa", "prefill_attn_swa_partial"]
 
 
 def validate(argv=None):

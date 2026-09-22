@@ -82,68 +82,76 @@ from models.deepseek_v4_1_flash.qkv_proj_rope import qkv_proj_rope
 from models.deepseek_v4_1_flash.quantization import decode_e8m0
 
 
-@pl.jit.inline(auto_scope=False)
-def c2a_reuse_partial(
-    x: pl.Tensor[[T_DYN, D], pl.BF16],
-    wq_a: pl.Tensor[[D, Q_LORA], pl.FP8E4M3FN],
-    wq_a_scale: pl.Tensor[[D // 32, Q_LORA], pl.FP8E8M0, pl.MX_B_NN],
-    q_norm_weight: pl.Tensor[[Q_LORA], pl.BF16],
-    wq_b: pl.Tensor[[Q_LORA, LOCAL_H * HEAD_DIM], pl.FP8E4M3FN],
-    wq_b_scale: pl.Tensor[[Q_LORA // 32, LOCAL_H * HEAD_DIM], pl.FP8E8M0, pl.MX_B_NN],
-    wkv: pl.Tensor[[D, HEAD_DIM], pl.FP8E4M3FN],
-    wkv_scale: pl.Tensor[[D // 32, HEAD_DIM], pl.FP8E8M0, pl.MX_B_NN],
-    kv_norm_weight: pl.Tensor[[HEAD_DIM], pl.BF16],
-    attn_sink: pl.Tensor[[LOCAL_H], pl.FP32],
-    wo_a: pl.Tensor[[LOCAL_O_GROUPS, O_LORA, O_GROUP_IN], pl.BF16],
-    wo_b: pl.Tensor[[LOCAL_O_WIDTH, D], pl.FP8E4M3FN],
-    wo_b_scale: pl.Tensor[[LOCAL_O_WIDTH // 32, D], pl.FP8E8M0, pl.MX_B_NN],
-    rope_cos: pl.Tensor[[T_DYN, ROPE_DIM // 2], pl.FP32],
-    rope_sin: pl.Tensor[[T_DYN, ROPE_DIM // 2], pl.FP32],
-    window_slots: pl.Tensor[[T_DYN], pl.INT64],
-    window_indices: pl.Tensor[[T_DYN, 128], pl.INT32],
-    window_cache: pl.Tensor[[ORI_BLOCKS_DYN, 128, 1, HEAD_DIM], pl.FP8E4M3FN],
-    window_cache_scale: pl.Tensor[[ORI_BLOCKS_DYN, 128, 1, HEAD_DIM // 32], pl.FP8E8M0],
-    compressed_cache: pl.Tensor[[CMP_BLOCKS_DYN, 128, 1, CMP_PACKED], pl.UINT8],
-    compressed_cache_scale: pl.Tensor[[CMP_BLOCKS_DYN, 128, 1, CMP_SCALES], pl.FP8E4M3FN],
-    compressed_indices: pl.Tensor[[T_DYN, INDEX_TOPK], pl.INT32],
-    partial: pl.Tensor[[T_DYN, D], pl.FP32],
-    num_tokens: pl.Scalar[pl.INT32],
-    cache_ready: pl.Scalar[pl.TASK_ID],
-):
-    """Write the FP32 local output for a layer that reuses a published selection.
+def make_c2a_reuse_partial(qkv_operator=qkv_proj_rope, output_operator=o_proj, attention_operator=attend_sparse):
+    """Bind preprocessing and projection schedules while preserving the shared C2A core."""
+    @pl.jit.inline(auto_scope=False)
+    def c2a_reuse_partial(
+        x: pl.Tensor[[T_DYN, D], pl.BF16],
+        wq_a: pl.Tensor[[D, Q_LORA], pl.FP8E4M3FN],
+        wq_a_scale: pl.Tensor[[D // 32, Q_LORA], pl.FP8E8M0, pl.MX_B_NN],
+        q_norm_weight: pl.Tensor[[Q_LORA], pl.BF16],
+        wq_b: pl.Tensor[[Q_LORA, LOCAL_H * HEAD_DIM], pl.FP8E4M3FN],
+        wq_b_scale: pl.Tensor[[Q_LORA // 32, LOCAL_H * HEAD_DIM], pl.FP8E8M0, pl.MX_B_NN],
+        wkv: pl.Tensor[[D, HEAD_DIM], pl.FP8E4M3FN],
+        wkv_scale: pl.Tensor[[D // 32, HEAD_DIM], pl.FP8E8M0, pl.MX_B_NN],
+        kv_norm_weight: pl.Tensor[[HEAD_DIM], pl.BF16],
+        attn_sink: pl.Tensor[[LOCAL_H], pl.FP32],
+        wo_a: pl.Tensor[[LOCAL_O_GROUPS, O_LORA, O_GROUP_IN], pl.BF16],
+        wo_b: pl.Tensor[[LOCAL_O_WIDTH, D], pl.FP8E4M3FN],
+        wo_b_scale: pl.Tensor[[LOCAL_O_WIDTH // 32, D], pl.FP8E8M0, pl.MX_B_NN],
+        rope_cos: pl.Tensor[[T_DYN, ROPE_DIM // 2], pl.FP32],
+        rope_sin: pl.Tensor[[T_DYN, ROPE_DIM // 2], pl.FP32],
+        window_slots: pl.Tensor[[T_DYN], pl.INT64],
+        window_indices: pl.Tensor[[T_DYN, 128], pl.INT32],
+        window_cache: pl.Tensor[[ORI_BLOCKS_DYN, 128, 1, HEAD_DIM], pl.FP8E4M3FN],
+        window_cache_scale: pl.Tensor[[ORI_BLOCKS_DYN, 128, 1, HEAD_DIM // 32], pl.FP8E8M0],
+        compressed_cache: pl.Tensor[[CMP_BLOCKS_DYN, 128, 1, CMP_PACKED], pl.UINT8],
+        compressed_cache_scale: pl.Tensor[[CMP_BLOCKS_DYN, 128, 1, CMP_SCALES], pl.FP8E4M3FN],
+        compressed_indices: pl.Tensor[[T_DYN, INDEX_TOPK], pl.INT32],
+        partial: pl.Tensor[[T_DYN, D], pl.FP32],
+        num_tokens: pl.Scalar[pl.INT32],
+        cache_ready: pl.Scalar[pl.TASK_ID],
+    ):
+        """Write the FP32 local output for a layer that reuses a published selection.
 
-    Reuse owns only the sliding-window cache. The compressed pool and the Top-K row
-    list both belong to this ratio's source layer and are read without being written,
-    so there is no compressor, no index-key publication and no indexer here.
-    """
-    tokens = pl.tensor.dim(x, 0)
+        Reuse owns only the sliding-window cache. The compressed pool and the Top-K row
+        list both belong to this ratio's source layer and are read without being written,
+        so there is no compressor, no index-key publication and no indexer here.
+        """
+        tokens = pl.tensor.dim(x, 0)
 
-    qr = pl.create_tensor([tokens, Q_LORA], dtype=pl.BF16)
-    query = pl.create_tensor([tokens, LOCAL_H * HEAD_DIM], dtype=pl.BF16)
-    window_kv = pl.create_tensor([tokens, HEAD_DIM], dtype=pl.BF16)
-    qkv_proj_rope(
-        x, wq_a, wq_a_scale, q_norm_weight, wq_b, wq_b_scale, wkv, wkv_scale,
-        kv_norm_weight, rope_cos, rope_sin, qr, query, window_kv, num_tokens,
-    )
-    publish_window(window_kv, window_slots, window_cache, window_cache_scale, num_tokens, cache_ready)
-
-    attended = pl.create_tensor([tokens, LOCAL_H * HEAD_DIM], dtype=pl.BF16)
-    selected = pl.create_tensor([QUERY_TILE, SPARSE_WIDTH, HEAD_DIM], dtype=pl.BF16)
-    combined = pl.create_tensor([QUERY_TILE, SPARSE_WIDTH], dtype=pl.INT32)
-    chunk_done = cache_ready
-    for start in pl.range(0, num_tokens, QUERY_TILE):
-        active = pl.min(QUERY_TILE, num_tokens - start)
-        gather_tid = gather_sparse(
-            window_cache, window_cache_scale, window_indices, compressed_cache,
-            compressed_cache_scale, compressed_indices, selected, combined, start, active,
-            chunk_done,
+        qr = pl.create_tensor([tokens, Q_LORA], dtype=pl.BF16)
+        query = pl.create_tensor([tokens, LOCAL_H * HEAD_DIM], dtype=pl.BF16)
+        window_kv = pl.create_tensor([tokens, HEAD_DIM], dtype=pl.BF16)
+        qkv_operator(
+            x, wq_a, wq_a_scale, q_norm_weight, wq_b, wq_b_scale, wkv, wkv_scale,
+            kv_norm_weight, rope_cos, rope_sin, qr, query, window_kv, num_tokens,
         )
-        chunk_done = attend_sparse(
-            query, selected, combined, attn_sink, attended, start, active, gather_tid
-        )
+        publish_window(window_kv, window_slots, window_cache, window_cache_scale, num_tokens, cache_ready)
 
-    o_proj(attended, wo_a, wo_b, wo_b_scale, rope_cos, rope_sin, partial, num_tokens)
-    return chunk_done
+        attended = pl.create_tensor([tokens, LOCAL_H * HEAD_DIM], dtype=pl.BF16)
+        selected = pl.create_tensor([QUERY_TILE, SPARSE_WIDTH, HEAD_DIM], dtype=pl.BF16)
+        combined = pl.create_tensor([QUERY_TILE, SPARSE_WIDTH], dtype=pl.INT32)
+        chunk_done = cache_ready
+        for start in pl.range(0, num_tokens, QUERY_TILE):
+            active = pl.min(QUERY_TILE, num_tokens - start)
+            gather_tid = gather_sparse(
+                window_cache, window_cache_scale, window_indices, compressed_cache,
+                compressed_cache_scale, compressed_indices, selected, combined, start, active,
+                chunk_done,
+            )
+            chunk_done = attention_operator(
+                query, selected, combined, attn_sink, attended, start, active, gather_tid
+            )
+
+        output_operator(attended, wo_a, wo_b, wo_b_scale, rope_cos, rope_sin, partial, num_tokens)
+        return chunk_done
+
+    return c2a_reuse_partial
+
+
+c2a_reuse_partial = make_c2a_reuse_partial()
+
 
 
 REUSE_INPUT_NAMES = (
@@ -156,7 +164,7 @@ REUSE_MUTABLE_NAMES = ("window_cache", "window_cache_scale")
 REUSE_SHARDED_NAMES = ("wq_b", "wq_b_scale", "attn_sink", "wo_a", "wo_b", "wo_b_scale")
 
 
-def official_reference_c2a_reuse(inputs: dict) -> dict:
+def official_reference_c2a_reuse(inputs: dict, *, fp32_output=False) -> dict:
     """Ratio-2 reuse attention; publishes only the addressed sliding-window rows.
 
     Same transcription as the full-mode reference, with the compressor, the index-key
@@ -228,7 +236,7 @@ def official_reference_c2a_reuse(inputs: dict) -> dict:
     attended = official_rope(attended, t["rope_cos"], t["rope_sin"], inverse=True)
     grouped = attended.reshape(tokens, groups, group_in)
     projected = _bf16_grouped(grouped, t["wo_a"])
-    output = official_linear(projected.flatten(1), t["wo_b"], t["wo_b_scale"])
+    output = official_linear(projected.flatten(1), t["wo_b"], t["wo_b_scale"], fp32=fp32_output)
 
     return {
         "output": output,
