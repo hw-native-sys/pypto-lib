@@ -38,10 +38,8 @@ from pathlib import Path
 if __package__ in (None, ""):
     sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
-# A5-only; intentionally excluded from the A2/A3 device sweep. `ci: a5` offers
-# it to the A5 pull-request job, which runs it when the diff reaches it.
+# A5-only; intentionally excluded from the A2/A3 device sweep.
 # ci: no-sim
-# ci: a5
 
 import torch
 
