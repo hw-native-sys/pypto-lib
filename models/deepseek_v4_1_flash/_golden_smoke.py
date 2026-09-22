@@ -267,3 +267,41 @@ def run_decode_layer_goldens(golden_fn: Callable[..., object], layer_ids) -> Non
             f"[GOLDEN] PASS decode_layer layer={layer_id} "
             f"output={tuple(result.output.shape)} next_pre_mix={tuple(result.next_pre_mix.shape)}"
         )
+
+
+def run_two_layer_decode_chain(golden_fn: Callable[..., object], *, tp_size: int = 4) -> None:
+    """Run two consecutive Block goldens and check the SP token boundary.
+
+    The device Block still depends on the EP8 MoE implementation.  This CPU
+    check nevertheless exercises the contract owned by Decode: the first
+    layer's output and delayed mHC pre-mix become the next layer's inputs, and
+    TP slabs restore the same token/position order between the two layers.
+    """
+    from models.deepseek_v4_1_flash.decode_sp_integration import (
+        gather_decode_batch,
+        shard_decode_batch,
+    )
+
+    first_inputs = make_decode_layer_golden_inputs(0)
+    first = golden_fn(**first_inputs)
+    second_inputs = make_decode_layer_golden_inputs(2)
+    second_inputs["x_hc"] = first.output
+    second_inputs["incoming_pre_mix"] = first.next_pre_mix
+    second = golden_fn(**second_inputs)
+
+    token_ids = torch.tensor([101, 203], dtype=torch.int64)
+    position_ids = torch.tensor([7, 19], dtype=torch.int32)
+    for name, value in (("first", first.output), ("second", second.output)):
+        gathered = gather_decode_batch(
+            shard_decode_batch(value, token_ids, position_ids, tp_size=tp_size), value.shape[0]
+        )
+        if not torch.equal(gathered.token_ids, token_ids) or not torch.equal(gathered.position_ids, position_ids):
+            raise RuntimeError(f"{name} Decode layer changed token/position ordering")
+        if not bool(torch.isfinite(gathered.hidden).all()):
+            raise RuntimeError(f"{name} Decode layer produced non-finite hidden state")
+    if second.output.shape != first.output.shape or second.next_pre_mix.shape != first.next_pre_mix.shape:
+        raise RuntimeError("consecutive Decode layers changed the residual boundary shape")
+    print(
+        f"[GOLDEN] PASS decode_layer chain layers=(0,2) TP={tp_size} "
+        f"output={tuple(second.output.shape)} token_order={token_ids.tolist()}"
+    )

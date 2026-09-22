@@ -163,6 +163,48 @@ mode has an independently executable Attention half-layer entry:
 | C1A Reindex | `decode_attn_c1a_reindex.py` | `decode_c1a_reindex.py` | 24 |
 | C1A Reuse | `decode_attn_c1a_reuse.py` | `decode_c1a_reuse.py` | 21 |
 
+Decode Attention is sequence parallel over the TP group: each rank owns a
+contiguous slab of the batch's token rows (`T_local = ceil(T / TP)`), the
+normalized Attention input crosses the group once at the block head
+(`decode_tp_input_all_gather`, `[T_local, D] -> [T, D]`), and the row-parallel
+output projection leaves through ReduceScatter(SUM)
+(`decode_tp_output_reduce_scatter`) rather than an all-reduce every rank would
+slice afterwards. The residual stream itself never crosses the group; each rank
+expands only its own rows in `mhc_post`. Every decode Attention mode keeps both
+wirings — the historical all-reduce entries and the `*_sharded` sugar — and each
+harness validates both; `OUTPUT_T_DYN` names the local row extent next to
+`T_DYN` for the full range.
+
+Row ownership is the fixed physical slab `ceil(capacity / TP)`, not
+`ceil(active / TP)`: a padded batch, `T < TP` and a rank whose slab starts past
+the active range all keep the same row mapping the collectives publish, and the
+active count only masks the slab suffix. Padding rows are therefore part of the
+published slab but never part of the gather or the summed rows; every mode
+materializes them as zeros (`zero_bf16_padding` for SWA/C2A, the same call after
+`rms_norm` for C1A) and the ReduceScatter clears its inactive output rows, so
+no stale transport window or harness sentinel reaches the next stage. The
+comparators cover the active slabs and assert that the inactive ReduceScatter
+rows are zero.
+
+The device kernels already take the active count as their `num_tokens` scalar and
+derive the slab width from the tensor shapes, but only C2A Reuse exposes it:
+`validate_args` rejects `active_tokens < tokens` for SWA and C2A Full, and the
+three C1A entries keep the token count in the host signature, so a caller cannot
+express an inactive suffix at all and every capacity row runs as a real query.
+The decode caller contract is therefore a compact batch, `tokens ==
+active_tokens`: a caller holding a reserved-capacity batch compacts it before the
+half-layer, or uses C2A Reuse, the mode that publishes only the active prefix. Its
+`tokens = 32`, `active_tokens = 24` TP4 case is part of the validation matrix.
+
+Computed per-rank traffic of the boundary (elements, not measured elapsed
+time): AllGather publishes `T_local * D * 2` bytes of BF16 and reads
+`T * D * 2`, ReduceScatter publishes and reads `T * D * 4` bytes of FP32
+partials, i.e. `D * (2 * T_local + 10 * T)` bytes per rank per half-layer,
+against `D * 20 * T` for the replicated all-reduce at TP4. At `T = 192`,
+`D = 5120`, TP4 that is about 10.3 MB versus 19.7 MB, and the `4 * T * D * 4`
+byte residual stream never crosses the group. End-to-end latency and bus
+bandwidth still need a measurement.
+
 The mode files own their entry contract and readiness state. SWA and C2A use
 the spec-driven boundary helpers in `decode_common.py`; C1A keeps its native
 static token/page ABI and validation harness. `decode_layer.py` is the thin
@@ -240,6 +282,15 @@ entries reuse.
 The final HC collapse has no learned head parameters: it applies the last
 layer's delayed `pre_mix` directly to the four residual streams. HC mixes are
 depth-local values and are not persisted as sequence state.
+
+The CPU boundary helper
+[`decode_sp_integration.py`](../../../models/deepseek_v4_1_flash/decode_sp_integration.py)
+models the same `ceil(T/TP)` owner slabs, including padding-only ranks. It
+checks that token IDs, positions, and valid masks survive the Attention
+AllGather/ReduceScatter boundary and that two consecutive Block goldens pass
+the first layer's hidden state and delayed `next_pre_mix` into the next layer.
+This validates the Decode-side ABI before the EP8 MoE device kernel is wired
+into the Block stage.
 
 The production cache ABI uses a 128-token scheduler block and keeps payloads
 quantized in HBM:
@@ -335,6 +386,15 @@ available for bring-up. The EP world is reinterpreted as `DP = EP / TP`
 contiguous attention groups; `tp_rank = rank % TP` and
 `group_base = rank - tp_rank`.
 
+This PR completes the decode Attention sequence-parallel boundary only. Each TP
+rank owns a contiguous physical slab (`T_local = ceil(T / TP)`), including
+inactive padding rows; AllGather and ReduceScatter operate on the active prefix
+and preserve the padding contract. A reserved-capacity batch whose active prefix
+stops short of the capacity (`active_tokens < tokens`) is follow-up work for C1A
+Full/Reindex/Reuse, SWA and C2A Full; C2A Reuse is the mode that validates that
+shape. The complete EP8 MoE dispatch/combine path, cross-layer token layout, and
+TP4/EP8 end-to-end model run remain uncovered follow-up work.
+
 The first implementation targets pure head tensor parallelism. Every TP rank
 sees the same token batch. `wq_a`, `wkv`, compressor, indexer, and the
 single-head KV caches are replicated. `wq_b`, query heads, attention sinks,
@@ -347,6 +407,14 @@ layout. The routed result therefore arrives partitioned across the group, with
 the rows a rank does not own left at zero, and one FP32 sum over the group
 restores the replicated residual stream the next layer's attention expects.
 DSA context parallelism is intentionally out of scope.
+
+On the decode side both wirings coexist: the historical entry keeps the
+head-parallel all-reduce, and the `*_sharded` entry uses the sequence-parallel
+boundary above. Weights and KV state stay replicated and query heads and output
+groups stay sharded across TP ranks in both; the sharded one keeps the residual
+stream rank-local. MoE token-owner de-duplication is not part of this boundary:
+an EP integration on the decode side must consume the already sequence-parallel
+local rows directly. Prefill keeps its all-reduce path; this PR is decode-only.
 
 The service capacity contract is 32 active sequences and 4,096 scheduled
 prefill token rows per DP group. With five reserved DSpark draft rows plus one
@@ -419,9 +487,10 @@ reference-matching text.
 
 The implementation milestones are ordered by dependency:
 
-1. Implement and compile the attention TP all-reduce, mHC, and SWA.
-   Packed prefill SWA is wired through mHC: `mhc_mixes` → `mhc_pre` →
-   attention RMSNorm → `prefill_attn_swa` → `mhc_post`. Run
+1. Keep the existing prefill Attention TP all-reduce and validate the
+   decode-only sequence-parallel boundary described above. Packed prefill SWA
+   remains wired through mHC: `mhc_mixes` → `mhc_pre` → attention RMSNorm →
+   `prefill_attn_swa` → `mhc_post`. Run
    `python models/deepseek_v4_1_flash/prefill_swa.py`.
 2. Implement C2A Full, then validate Full-to-Reuse cache and Top-K replay.
    Packed prefill C2A Full and Reuse are wired through mHC the same way,
@@ -466,11 +535,19 @@ def test_precision(tp, dp, a5_args):
 ```
 
 `validate` runs the existing golden harness and returns its result, including
-output and cache precision comparisons. `main` calls the same validation path
-for local execution. CLI choices remain independent of the cases selected for
-PR CI. The standard combinations are `(tp, dp) = (1, 1), (2, 2), (4, 1)`.
-Entries supporting only DP1 or exposing only TP keep TP1 and TP4; single-card
-entries run once. MoE uses EP4 with TP2 or TP4, corresponding to DP2 or DP1.
+output and cache precision comparisons. The decode Attention entries validate
+the replicated and the sequence-parallel wiring in the same call: `validate`
+runs the historical all-reduce path first and the `*_sharded` path second, and
+returns the failing result when either one misses. `main` calls the same
+validation path for local execution. CLI choices remain independent of the
+cases selected for PR CI. The standard combinations are `(tp, dp) = (1, 1),
+(2, 2), (4, 1)`.
+A decode entry and the `_attn_` leaf it composes are selected together, so they
+split the combinations instead of repeating them: the composing entry keeps
+`(1, 1)` and `(4, 1)`, the leaf keeps `(2, 2)` — or `(1, 1)` when the leaf
+exposes DP1 only. Other entries supporting only DP1 or exposing only TP keep TP1
+and TP4; single-card entries run once. MoE uses EP4 with TP2 or TP4,
+corresponding to DP2 or DP1.
 Daily CI retains its existing CLI-based Cartesian-product sweep.
 
 The CI runner collects the tests in each selected `# ci: a5` file using pytest,
@@ -494,7 +571,7 @@ Run an individual precision case through the device queue:
 
 ```bash
 task-submit --device auto --device-num 4 --run \
-  'python -m pytest "models/deepseek_v4_1_flash/decode_attn_swa.py::test_precision[4-1]" --tp 4 --dp 1 --device $TASK_DEVICE -v -s'
+  'python -m pytest "models/deepseek_v4_1_flash/decode_attn_swa.py::test_precision[2-2]" --tp 2 --dp 2 --device $TASK_DEVICE -v -s'
 ```
 
 The fixture checks that test parameters match the process's TP/DP/EP options and

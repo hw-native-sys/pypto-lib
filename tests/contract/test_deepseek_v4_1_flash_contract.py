@@ -281,6 +281,88 @@ def test_decode_layer_golden_runs_every_mode(layer_id, composition):
         assert torch.equal(result.attention.index_cache, original_index)
 
 
+def test_decode_sequence_parallel_validation_reports_either_failure():
+    from types import SimpleNamespace
+
+    from models.deepseek_v4_1_flash.decode_sp_integration import combine_validation
+
+    def result(passed):
+        return SimpleNamespace(passed=passed)
+
+    replicated, sharded = result(True), result(False)
+    assert combine_validation([replicated, sharded]) is sharded, (
+        "a passing replicated run must not hide a sequence-parallel mismatch"
+    )
+    replicated, sharded = result(False), result(True)
+    assert combine_validation([replicated, sharded]) is replicated, (
+        "a passing sequence-parallel run must not hide a replicated mismatch"
+    )
+    replicated, sharded = result(True), result(True)
+    assert combine_validation([replicated, sharded]) is sharded
+    both_failed = [result(False), result(False)]
+    assert combine_validation(both_failed) is both_failed[0]
+    with pytest.raises(ValueError):
+        combine_validation([])
+
+
+def test_decode_sequence_parallel_metadata_supports_empty_owner_slabs():
+    from models.deepseek_v4_1_flash.decode_sp_integration import (
+        sequence_parallel_bounds,
+        validate_two_layer_metadata,
+    )
+
+    assert [sequence_parallel_bounds(2, 4, rank) for rank in range(4)] == [
+        (0, 1, 1),
+        (1, 1, 1),
+        (2, 0, 1),
+        (2, 0, 1),
+    ]
+    gathered = validate_two_layer_metadata(num_tokens=2, tp_size=4)
+    assert gathered.hidden.shape == (2, 4)
+    assert [sequence_parallel_bounds(5, 4, rank) for rank in range(4)] == [
+        (0, 2, 2),
+        (2, 2, 2),
+        (4, 1, 2),
+        (5, 0, 2),
+    ]
+    # A padded batch keeps the physical-slab mapping: capacity 8 with 4 active rows
+    # still publishes two-row slabs, while ceil(active / tp) would say one row and
+    # shift every later rank by a row.
+    assert [sequence_parallel_bounds(4, 4, rank, capacity=8) for rank in range(4)] == [
+        (0, 2, 2),
+        (2, 2, 2),
+        (4, 0, 2),
+        (4, 0, 2),
+    ]
+
+
+@requires_pypto
+def test_decode_sequence_parallel_fixtures_differ_per_rank():
+    from types import SimpleNamespace
+
+    from models.deepseek_v4_1_flash.decode_common import make_boundary_specs
+
+    def args(**overrides):
+        values = dict(tokens=8, tp=4, seed=17, active_tokens=8, epochs=1, bench=False)
+        values.update(overrides)
+        return SimpleNamespace(**values)
+
+    def stacked(specs, name):
+        value = next(spec.init_value for spec in specs if spec.name == name)
+        return value() if callable(value) else value
+
+    for name in ("x_hc", "incoming_pre_mix"):
+        replicated = stacked(make_boundary_specs(args(), sharded=False), name)
+        assert all(torch.equal(replicated[0], replicated[rank]) for rank in range(1, 4)), (
+            f"{name}: the replicated wiring must replicate the batch"
+        )
+        sharded = stacked(make_boundary_specs(args(), sharded=True), name)
+        assert not any(torch.equal(sharded[0], sharded[rank]) for rank in range(1, 4)), (
+            f"{name}: sequence-parallel slabs must differ per rank, otherwise a gather "
+            "that mis-orders the slabs still compares equal"
+        )
+
+
 @requires_pypto
 @pytest.mark.parametrize("layer_id", (0, 2, 3, 20, 24, 21))
 def test_attention_half_readiness_is_independent_of_moe(layer_id, composition):

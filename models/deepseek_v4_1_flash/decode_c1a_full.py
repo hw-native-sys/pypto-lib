@@ -35,6 +35,9 @@ import torch
 
 from golden import TensorSpec, run
 from models.deepseek_v4_1_flash.attention_common import quantized_cache_compare
+from models.deepseek_v4_1_flash import decode_common as common
+from models.deepseek_v4_1_flash.decode_common import zero_bf16_padding
+from models.deepseek_v4_1_flash.attention_tp import OUTPUT_T_DYN, decode_tp_input_all_gather
 from models.deepseek_v4_1_flash.config import (
     B_DYN,
     CMP_BLOCKS_DYN,
@@ -74,6 +77,7 @@ from models.deepseek_v4_1_flash.decode_attn_c1a_full import (
     build_validation_values,
     check_fp4_boundaries,
     decode_attn_c1a_full,
+    decode_attn_c1a_full_sharded,
     exact_bytes,
     golden_decode_attn_c1a_full,
     topk_indices_compare,
@@ -145,18 +149,17 @@ def decode_c1a_full(
     post_mix = pl.create_tensor([tokens, HC_MULT], dtype=pl.FP32)
     residual_mix = pl.create_tensor([tokens, HC_MULT, HC_MULT], dtype=pl.FP32)
     hidden = pl.create_tensor([tokens, D], dtype=pl.BF16)
-    normalized_hidden = pl.create_tensor([tokens, D], dtype=pl.BF16)
+    normed = pl.create_tensor([tokens, D], dtype=pl.BF16)
     attn_out = pl.create_tensor([tokens, D], dtype=pl.BF16)
     # The coefficients are staggered: collapse with the pre-mix the previous sub-layer
     # produced, apply post/residual immediately, and hand this site's pre-mix forward.
     mhc_mixes(x_hc, hc_attn_fn, hc_attn_scale, hc_attn_base, next_pre_mix, post_mix, residual_mix)
     mhc_pre(x_hc, pre_mix, hidden)
-    active_tokens = pl.cast(num_tokens, pl.INDEX)
-    active_hidden = pl.slice(hidden, [active_tokens, D], [0, 0])
-    active_normalized = pl.slice(normalized_hidden, [active_tokens, D], [0, 0])
-    rms_norm(active_hidden, attn_norm_weight, active_normalized)
+    # The block normalizes the collapsed stream before attention; the operator takes the
+    # normalized hidden, so the norm sits between the collapse and the call.
+    rms_norm(hidden, attn_norm_weight, normed)
     decode_attn_c1a_full(
-        normalized_hidden, wq_a, wq_a_scale, q_norm_weight, wq_b, wq_b_scale, wkv, wkv_scale, kv_norm_weight, attn_sink,
+        normed, wq_a, wq_a_scale, q_norm_weight, wq_b, wq_b_scale, wkv, wkv_scale, kv_norm_weight, attn_sink,
         wo_a, wo_b, wo_b_scale, rope_cos, rope_sin, window_slots, window_indices, window_cache,
         window_cache_scale, compressed_cache, compressed_cache_scale, request_ids, compressed_lens,
         index_cache, index_cache_scale, index_block_table, compressed_rope_cos, compressed_rope_sin,
@@ -166,6 +169,105 @@ def decode_c1a_full(
     )
     mhc_post(attn_out, x_hc, post_mix, residual_mix, output)
     return output
+
+
+@pl.jit.inline(auto_scope=False)
+def decode_c1a_full_sharded(
+    x_hc: pl.Tensor[[OUTPUT_T_DYN, HC_MULT, D], pl.FP32],
+    pre_mix: pl.Tensor[[OUTPUT_T_DYN, HC_MULT], pl.FP32],
+    hc_attn_fn: pl.Tensor[[MIX_HC, HC_DIM], pl.FP32],
+    hc_attn_scale: pl.Tensor[[3], pl.FP32],
+    hc_attn_base: pl.Tensor[[MIX_HC], pl.FP32],
+    attn_norm_weight: pl.Tensor[[D], pl.BF16],
+    wq_a: pl.Tensor[[D, Q_LORA], pl.FP8E4M3FN],
+    wq_a_scale: pl.Tensor[[D // 32, Q_LORA], pl.FP8E8M0, pl.MX_B_NN],
+    q_norm_weight: pl.Tensor[[Q_LORA], pl.BF16],
+    wq_b: pl.Tensor[[Q_LORA, LOCAL_H * HEAD_DIM], pl.FP8E4M3FN],
+    wq_b_scale: pl.Tensor[[Q_LORA // 32, LOCAL_H * HEAD_DIM], pl.FP8E8M0, pl.MX_B_NN],
+    wkv: pl.Tensor[[D, HEAD_DIM], pl.FP8E4M3FN],
+    wkv_scale: pl.Tensor[[D // 32, HEAD_DIM], pl.FP8E8M0, pl.MX_B_NN],
+    kv_norm_weight: pl.Tensor[[HEAD_DIM], pl.BF16],
+    attn_sink: pl.Tensor[[LOCAL_H], pl.FP32],
+    wo_a: pl.Tensor[[LOCAL_O_GROUPS, O_LORA, O_GROUP_IN], pl.BF16],
+    wo_b: pl.Tensor[[LOCAL_O_WIDTH, D], pl.FP8E4M3FN],
+    wo_b_scale: pl.Tensor[[LOCAL_O_WIDTH // 32, D], pl.FP8E8M0, pl.MX_B_NN],
+    rope_cos: pl.Tensor[[T_DYN, ROPE_DIM // 2], pl.FP32],
+    rope_sin: pl.Tensor[[T_DYN, ROPE_DIM // 2], pl.FP32],
+    window_slots: pl.Tensor[[T_DYN], pl.INT64],
+    window_indices: pl.Tensor[[T_DYN, 128], pl.INT32],
+    window_cache: pl.Tensor[[ORI_BLOCKS_DYN, 128, 1, HEAD_DIM], pl.FP8E4M3FN],
+    window_cache_scale: pl.Tensor[[ORI_BLOCKS_DYN, 128, 1, HEAD_DIM // WINDOW_CACHE_GROUP], pl.FP8E8M0],
+    compressed_cache: pl.Tensor[[CMP_BLOCKS_DYN, 128, 1, HEAD_DIM // 2], pl.UINT8],
+    compressed_cache_scale: pl.Tensor[
+        [CMP_BLOCKS_DYN, 128, 1, HEAD_DIM // COMPRESSED_CACHE_GROUP], pl.FP8E4M3FN
+    ],
+    request_ids: pl.Tensor[[T_DYN], pl.INT32],
+    compressed_lens: pl.Tensor[[T_DYN], pl.INT32],
+    index_cache: pl.Tensor[[INDEX_BLOCKS_DYN, 128, 1, INDEX_DIM // 2], pl.UINT8],
+    index_cache_scale: pl.Tensor[[INDEX_BLOCKS_DYN, 128, 1, INDEX_DIM // INDEX_CACHE_GROUP], pl.FP8E8M0],
+    index_block_table: pl.Tensor[[B_DYN, TABLE_DYN], pl.INT32],
+    compressed_rope_cos: pl.Tensor[[T_DYN, ROPE_DIM // 2], pl.FP32],
+    compressed_rope_sin: pl.Tensor[[T_DYN, ROPE_DIM // 2], pl.FP32],
+    compressor_wkv: pl.Tensor[[D, HEAD_DIM], pl.BF16],
+    compressor_norm_weight: pl.Tensor[[HEAD_DIM], pl.BF16],
+    compressed_slots: pl.Tensor[[T_DYN], pl.INT64],
+    index_wk: pl.Tensor[[HEAD_DIM, INDEX_DIM], pl.BF16],
+    index_norm_weight: pl.Tensor[[INDEX_DIM], pl.BF16],
+    index_wq_b: pl.Tensor[[Q_LORA, INDEX_H * INDEX_DIM], pl.FP8E4M3FN],
+    index_wq_b_scale: pl.Tensor[[Q_LORA // 32, INDEX_H * INDEX_DIM], pl.FP8E8M0, pl.MX_B_NN],
+    index_weights_proj: pl.Tensor[[D, INDEX_H], pl.BF16],
+    topk_indices: pl.Tensor[[T_DYN, INDEX_TOPK], pl.INT32],
+    candidate_mask: pl.Tensor[[T_DYN, CMP_POSITIONS_DYN], pl.UINT8],
+    gathered: pl.Tensor[[T_DYN, D], pl.BF16],
+    input_window: pld.DistributedTensor[[DECODE_MAX_TOKENS, D], pl.BF16],
+    input_arrived: pld.DistributedTensor[[TP_SIZE, 1], pl.INT32],
+    output_window: pld.DistributedTensor[[DECODE_MAX_TOKENS, D], pl.FP32],
+    output_arrived: pld.DistributedTensor[[TP_SIZE, 1], pl.INT32],
+    output: pl.Tensor[[OUTPUT_T_DYN, HC_MULT, D], pl.FP32],
+    next_pre_mix: pl.Tensor[[OUTPUT_T_DYN, HC_MULT], pl.FP32],
+    group_base: pl.Scalar[pl.INT32],
+    tp_rank: pl.Scalar[pl.INT32],
+    num_tokens: pl.Scalar[pl.INT32],
+    attention_epoch: pl.Scalar[pl.INT32],
+):
+    tokens = pl.tensor.dim(x_hc, 0)
+    post_mix = pl.create_tensor([tokens, HC_MULT], dtype=pl.FP32)
+    residual_mix = pl.create_tensor([tokens, HC_MULT, HC_MULT], dtype=pl.FP32)
+    hidden = pl.create_tensor([tokens, D], dtype=pl.BF16)
+    normed = pl.create_tensor([tokens, D], dtype=pl.BF16)
+    attn_out = pl.create_tensor([tokens, D], dtype=pl.BF16)
+    # The coefficients are staggered: collapse with the pre-mix the previous sub-layer
+    # produced, apply post/residual immediately, and hand this site's pre-mix forward.
+    mhc_mixes(x_hc, hc_attn_fn, hc_attn_scale, hc_attn_base, next_pre_mix, post_mix, residual_mix)
+    mhc_pre(x_hc, pre_mix, hidden)
+    # The block normalizes the collapsed stream before attention; the operator takes the
+    # normalized hidden, so the norm sits between the collapse and the call.
+    rms_norm(hidden, attn_norm_weight, normed)
+    # Sequence parallel: the residual stream stays local, only the normalized
+    # Attention input crosses the TP group ([T_local, D] -> [T, D]).
+    local_first = pl.min(tp_rank * tokens, num_tokens)
+    # The slab's padding rows are published but never gathered; clear them so the
+    # transport window never carries a stale value (the spec-driven modes use the same
+    # zero_bf16_padding policy).
+    zero_bf16_padding(normed, pl.max(0, pl.min(tokens, num_tokens - local_first)))
+    gathered = decode_tp_input_all_gather(
+        normed, input_window, input_arrived, gathered, group_base, tp_rank, num_tokens, attention_epoch
+    )
+    decode_attn_c1a_full_sharded(
+        gathered, wq_a, wq_a_scale, q_norm_weight, wq_b, wq_b_scale, wkv, wkv_scale, kv_norm_weight, attn_sink,
+        wo_a, wo_b, wo_b_scale, rope_cos, rope_sin, window_slots, window_indices, window_cache,
+        window_cache_scale, compressed_cache, compressed_cache_scale, request_ids, compressed_lens,
+        index_cache, index_cache_scale, index_block_table, compressed_rope_cos, compressed_rope_sin,
+        compressor_wkv, compressor_norm_weight, compressed_slots, index_wk, index_norm_weight, index_wq_b,
+        index_wq_b_scale, index_weights_proj, topk_indices, candidate_mask, output_window, output_arrived,
+        attn_out, group_base, tp_rank, num_tokens, attention_epoch,
+    )
+    mhc_post(attn_out, x_hc, post_mix, residual_mix, output)
+    return output
+
+
+
+
 
 
 @pl.jit
@@ -236,7 +338,8 @@ def decode_c1a_full_test(
     index_block_table.bind_dynamic(1, TABLE_DYN)
     candidate_mask.bind_dynamic(1, CMP_POSITIONS_DYN)
     return decode_c1a_full(
-        x_hc, pre_mix, hc_attn_fn, hc_attn_scale, hc_attn_base, attn_norm_weight, wq_a, wq_a_scale, q_norm_weight,
+        x_hc, pre_mix, hc_attn_fn, hc_attn_scale, hc_attn_base, attn_norm_weight, wq_a, wq_a_scale,
+        q_norm_weight,
         wq_b, wq_b_scale,
         wkv, wkv_scale, kv_norm_weight, attn_sink, wo_a, wo_b, wo_b_scale, rope_cos, rope_sin, window_slots,
         window_indices, window_cache, window_cache_scale, compressed_cache, compressed_cache_scale,
@@ -248,16 +351,103 @@ def decode_c1a_full_test(
     )
 
 
+@pl.jit
+def decode_c1a_full_sharded_test(
+    x_hc: pl.Tensor[[OUTPUT_T_DYN, HC_MULT, D], pl.FP32],
+    pre_mix: pl.Tensor[[OUTPUT_T_DYN, HC_MULT], pl.FP32],
+    hc_attn_fn: pl.Tensor[[MIX_HC, HC_DIM], pl.FP32],
+    hc_attn_scale: pl.Tensor[[3], pl.FP32],
+    hc_attn_base: pl.Tensor[[MIX_HC], pl.FP32],
+    attn_norm_weight: pl.Tensor[[D], pl.BF16],
+    wq_a: pl.Tensor[[D, Q_LORA], pl.FP8E4M3FN],
+    wq_a_scale: pl.Tensor[[D // 32, Q_LORA], pl.FP8E8M0, pl.MX_B_NN],
+    q_norm_weight: pl.Tensor[[Q_LORA], pl.BF16],
+    wq_b: pl.Tensor[[Q_LORA, LOCAL_H * HEAD_DIM], pl.FP8E4M3FN],
+    wq_b_scale: pl.Tensor[[Q_LORA // 32, LOCAL_H * HEAD_DIM], pl.FP8E8M0, pl.MX_B_NN],
+    wkv: pl.Tensor[[D, HEAD_DIM], pl.FP8E4M3FN],
+    wkv_scale: pl.Tensor[[D // 32, HEAD_DIM], pl.FP8E8M0, pl.MX_B_NN],
+    kv_norm_weight: pl.Tensor[[HEAD_DIM], pl.BF16],
+    attn_sink: pl.Tensor[[LOCAL_H], pl.FP32],
+    wo_a: pl.Tensor[[LOCAL_O_GROUPS, O_LORA, O_GROUP_IN], pl.BF16],
+    wo_b: pl.Tensor[[LOCAL_O_WIDTH, D], pl.FP8E4M3FN],
+    wo_b_scale: pl.Tensor[[LOCAL_O_WIDTH // 32, D], pl.FP8E8M0, pl.MX_B_NN],
+    rope_cos: pl.Tensor[[T_DYN, ROPE_DIM // 2], pl.FP32],
+    rope_sin: pl.Tensor[[T_DYN, ROPE_DIM // 2], pl.FP32],
+    window_slots: pl.Tensor[[T_DYN], pl.INT64],
+    window_indices: pl.Tensor[[T_DYN, 128], pl.INT32],
+    window_cache: pl.InOut[pl.Tensor[[ORI_BLOCKS_DYN, 128, 1, HEAD_DIM], pl.FP8E4M3FN]],
+    window_cache_scale: pl.InOut[
+        pl.Tensor[[ORI_BLOCKS_DYN, 128, 1, HEAD_DIM // WINDOW_CACHE_GROUP], pl.FP8E8M0]
+    ],
+    compressed_cache: pl.InOut[pl.Tensor[[CMP_BLOCKS_DYN, 128, 1, HEAD_DIM // 2], pl.UINT8]],
+    compressed_cache_scale: pl.InOut[
+        pl.Tensor[[CMP_BLOCKS_DYN, 128, 1, HEAD_DIM // COMPRESSED_CACHE_GROUP], pl.FP8E4M3FN]
+    ],
+    request_ids: pl.Tensor[[T_DYN], pl.INT32],
+    compressed_lens: pl.Tensor[[T_DYN], pl.INT32],
+    index_cache: pl.InOut[pl.Tensor[[INDEX_BLOCKS_DYN, 128, 1, INDEX_DIM // 2], pl.UINT8]],
+    index_cache_scale: pl.InOut[
+        pl.Tensor[[INDEX_BLOCKS_DYN, 128, 1, INDEX_DIM // INDEX_CACHE_GROUP], pl.FP8E8M0]
+    ],
+    index_block_table: pl.Tensor[[B_DYN, TABLE_DYN], pl.INT32],
+    compressed_rope_cos: pl.Tensor[[T_DYN, ROPE_DIM // 2], pl.FP32],
+    compressed_rope_sin: pl.Tensor[[T_DYN, ROPE_DIM // 2], pl.FP32],
+    compressor_wkv: pl.Tensor[[D, HEAD_DIM], pl.BF16],
+    compressor_norm_weight: pl.Tensor[[HEAD_DIM], pl.BF16],
+    compressed_slots: pl.Tensor[[T_DYN], pl.INT64],
+    index_wk: pl.Tensor[[HEAD_DIM, INDEX_DIM], pl.BF16],
+    index_norm_weight: pl.Tensor[[INDEX_DIM], pl.BF16],
+    index_wq_b: pl.Tensor[[Q_LORA, INDEX_H * INDEX_DIM], pl.FP8E4M3FN],
+    index_wq_b_scale: pl.Tensor[[Q_LORA // 32, INDEX_H * INDEX_DIM], pl.FP8E8M0, pl.MX_B_NN],
+    index_weights_proj: pl.Tensor[[D, INDEX_H], pl.BF16],
+    topk_indices: pl.Out[pl.Tensor[[T_DYN, INDEX_TOPK], pl.INT32]],
+    candidate_mask: pl.Out[pl.Tensor[[T_DYN, CMP_POSITIONS_DYN], pl.UINT8]],
+    gathered: pl.InOut[pl.Tensor[[T_DYN, D], pl.BF16]],
+    input_window: pld.DistributedTensor[[DECODE_MAX_TOKENS, D], pl.BF16],
+    input_arrived: pld.DistributedTensor[[TP_SIZE, 1], pl.INT32],
+    output_window: pld.DistributedTensor[[DECODE_MAX_TOKENS, D], pl.FP32],
+    output_arrived: pld.DistributedTensor[[TP_SIZE, 1], pl.INT32],
+    output: pl.Out[pl.Tensor[[OUTPUT_T_DYN, HC_MULT, D], pl.FP32]],
+    next_pre_mix: pl.Out[pl.Tensor[[OUTPUT_T_DYN, HC_MULT], pl.FP32]],
+    group_base: pl.Scalar[pl.INT32],
+    tp_rank: pl.Scalar[pl.INT32],
+    num_tokens: pl.Scalar[pl.INT32],
+    attention_epoch: pl.Scalar[pl.INT32],
+):
+    x_hc.bind_dynamic(0, OUTPUT_T_DYN)
+    window_cache.bind_dynamic(0, ORI_BLOCKS_DYN)
+    compressed_cache.bind_dynamic(0, CMP_BLOCKS_DYN)
+    index_cache.bind_dynamic(0, INDEX_BLOCKS_DYN)
+    index_block_table.bind_dynamic(0, B_DYN)
+    index_block_table.bind_dynamic(1, TABLE_DYN)
+    candidate_mask.bind_dynamic(1, CMP_POSITIONS_DYN)
+    gathered.bind_dynamic(0, T_DYN)
+    return decode_c1a_full_sharded(
+        x_hc, pre_mix, hc_attn_fn, hc_attn_scale, hc_attn_base, attn_norm_weight, wq_a, wq_a_scale,
+        q_norm_weight,
+        wq_b, wq_b_scale,
+        wkv, wkv_scale, kv_norm_weight, attn_sink, wo_a, wo_b, wo_b_scale, rope_cos, rope_sin, window_slots,
+        window_indices, window_cache, window_cache_scale, compressed_cache, compressed_cache_scale,
+        request_ids, compressed_lens, index_cache, index_cache_scale, index_block_table, compressed_rope_cos,
+        compressed_rope_sin, compressor_wkv, compressor_norm_weight, compressed_slots, index_wk,
+        index_norm_weight, index_wq_b, index_wq_b_scale, index_weights_proj, topk_indices, candidate_mask,
+        gathered, input_window, input_arrived, output_window, output_arrived, output, next_pre_mix,
+        group_base, tp_rank, num_tokens,
+        attention_epoch,
+    )
+
+
 __all__ = [
     "build_hc_validation_values",
     "decode_c1a_full",
+    "decode_c1a_full_sharded",
     "golden_c1a_hc_case",
     "golden_decode_c1a_full_case",
     "run_c1a_hc",
 ]
 
 
-def make_program(tokens, pages, epochs=1):
+def _make_program(tokens, pages, epochs=1):
     """Build a distributed host using static packed-FP4 storage dimensions."""
     TOKENS = tokens
     PAGES = pages
@@ -352,24 +542,144 @@ def make_program(tokens, pages, epochs=1):
     return host
 
 
-def build_hc_validation_values(mode, tokens, pages, seed=17, case="random"):
-    """Attention fixture plus the HC stream and mixing parameters."""
+def make_program(tokens, pages, epochs=1, sharded=False):
+    """Build a distributed host; ``sharded`` selects the sequence-parallel wiring."""
+    if sharded:
+        return _make_program_sharded(tokens, pages, epochs)
+    return _make_program(tokens, pages, epochs)
+
+
+def _make_program_sharded(tokens, pages, epochs=1):
+    """Build the sequence-parallel host: ranks own token slabs, gather for Attention."""
+    TOKENS = tokens
+    PAGES = pages
+    EPOCHS = epochs
+    LOCAL_TOKENS = (TOKENS + TP_SIZE - 1) // TP_SIZE
+
+    @pl.jit.host
+    def host(
+        x_hc: pl.Tensor[[TP_SIZE, LOCAL_TOKENS, HC_MULT, D], pl.FP32],
+        pre_mix: pl.Tensor[[TP_SIZE, LOCAL_TOKENS, HC_MULT], pl.FP32],
+        hc_attn_fn: pl.Tensor[[TP_SIZE, MIX_HC, HC_DIM], pl.FP32],
+        hc_attn_scale: pl.Tensor[[TP_SIZE, 3], pl.FP32],
+        hc_attn_base: pl.Tensor[[TP_SIZE, MIX_HC], pl.FP32],
+        attn_norm_weight: pl.Tensor[[TP_SIZE, D], pl.BF16],
+        wq_a: pl.Tensor[[TP_SIZE, D, Q_LORA], pl.FP8E4M3FN],
+        wq_a_scale: pl.Tensor[[TP_SIZE, D // 32, Q_LORA], pl.FP8E8M0],
+        q_norm_weight: pl.Tensor[[TP_SIZE, Q_LORA], pl.BF16],
+        wq_b: pl.Tensor[[TP_SIZE, Q_LORA, LOCAL_H * HEAD_DIM], pl.FP8E4M3FN],
+        wq_b_scale: pl.Tensor[[TP_SIZE, Q_LORA // 32, LOCAL_H * HEAD_DIM], pl.FP8E8M0],
+        wkv: pl.Tensor[[TP_SIZE, D, HEAD_DIM], pl.FP8E4M3FN],
+        wkv_scale: pl.Tensor[[TP_SIZE, D // 32, HEAD_DIM], pl.FP8E8M0],
+        kv_norm_weight: pl.Tensor[[TP_SIZE, HEAD_DIM], pl.BF16],
+        attn_sink: pl.Tensor[[TP_SIZE, LOCAL_H], pl.FP32],
+        wo_a: pl.Tensor[[TP_SIZE, LOCAL_O_GROUPS, O_LORA, O_GROUP_IN], pl.BF16],
+        wo_b: pl.Tensor[[TP_SIZE, LOCAL_O_WIDTH, D], pl.FP8E4M3FN],
+        wo_b_scale: pl.Tensor[[TP_SIZE, LOCAL_O_WIDTH // 32, D], pl.FP8E8M0],
+        rope_cos: pl.Tensor[[TP_SIZE, TOKENS, ROPE_DIM // 2], pl.FP32],
+        rope_sin: pl.Tensor[[TP_SIZE, TOKENS, ROPE_DIM // 2], pl.FP32],
+        window_slots: pl.Tensor[[TP_SIZE, TOKENS], pl.INT64],
+        window_indices: pl.Tensor[[TP_SIZE, TOKENS, 128], pl.INT32],
+        window_cache: pl.InOut[pl.Tensor[[TP_SIZE, PAGES, 128, 1, HEAD_DIM], pl.FP8E4M3FN]],
+        window_cache_scale: pl.InOut[
+            pl.Tensor[[TP_SIZE, PAGES, 128, 1, HEAD_DIM // WINDOW_CACHE_GROUP], pl.FP8E8M0]
+        ],
+        compressed_cache: pl.InOut[pl.Tensor[[TP_SIZE, PAGES, 128, 1, HEAD_DIM // 2], pl.UINT8]],
+        compressed_cache_scale: pl.InOut[
+            pl.Tensor[[TP_SIZE, PAGES, 128, 1, HEAD_DIM // COMPRESSED_CACHE_GROUP], pl.FP8E4M3FN]
+        ],
+        request_ids: pl.Tensor[[TP_SIZE, TOKENS], pl.INT32],
+        compressed_lens: pl.Tensor[[TP_SIZE, TOKENS], pl.INT32],
+        index_cache: pl.InOut[pl.Tensor[[TP_SIZE, PAGES, 128, 1, INDEX_DIM // 2], pl.UINT8]],
+        index_cache_scale: pl.InOut[
+            pl.Tensor[[TP_SIZE, PAGES, 128, 1, INDEX_DIM // INDEX_CACHE_GROUP], pl.FP8E8M0]
+        ],
+        index_block_table: pl.Tensor[[TP_SIZE, 1, PAGES], pl.INT32],
+        compressed_rope_cos: pl.Tensor[[TP_SIZE, TOKENS, ROPE_DIM // 2], pl.FP32],
+        compressed_rope_sin: pl.Tensor[[TP_SIZE, TOKENS, ROPE_DIM // 2], pl.FP32],
+        compressor_wkv: pl.Tensor[[TP_SIZE, D, HEAD_DIM], pl.BF16],
+        compressor_norm_weight: pl.Tensor[[TP_SIZE, HEAD_DIM], pl.BF16],
+        compressed_slots: pl.Tensor[[TP_SIZE, TOKENS], pl.INT64],
+        index_wk: pl.Tensor[[TP_SIZE, HEAD_DIM, INDEX_DIM], pl.BF16],
+        index_norm_weight: pl.Tensor[[TP_SIZE, INDEX_DIM], pl.BF16],
+        index_wq_b: pl.Tensor[[TP_SIZE, Q_LORA, INDEX_H * INDEX_DIM], pl.FP8E4M3FN],
+        index_wq_b_scale: pl.Tensor[[TP_SIZE, Q_LORA // 32, INDEX_H * INDEX_DIM], pl.FP8E8M0],
+        index_weights_proj: pl.Tensor[[TP_SIZE, D, INDEX_H], pl.BF16],
+        topk_indices: pl.Out[pl.Tensor[[TP_SIZE, TOKENS, INDEX_TOPK], pl.INT32]],
+        candidate_mask: pl.Out[pl.Tensor[[TP_SIZE, TOKENS, PAGES * 128], pl.UINT8]],
+        output: pl.Out[pl.Tensor[[TP_SIZE, LOCAL_TOKENS, HC_MULT, D], pl.FP32]],
+        next_pre_mix: pl.Out[pl.Tensor[[TP_SIZE, LOCAL_TOKENS, HC_MULT], pl.FP32]],
+        gathered: pl.Out[pl.Tensor[[TP_SIZE, TOKENS, D], pl.BF16]],
+    ):
+        transport = pld.alloc_window_buffer([DECODE_MAX_TOKENS, D], dtype=pl.FP32)
+        signals = pld.alloc_window_buffer([TP_SIZE, 1], dtype=pl.INT32)
+        input_transport = pld.alloc_window_buffer([DECODE_MAX_TOKENS, D], dtype=pl.BF16)
+        input_signals = pld.alloc_window_buffer([TP_SIZE, 1], dtype=pl.INT32)
+        for epoch in pl.range(1, EPOCHS + 1):
+            for rank in pl.unroll(TP_SIZE):
+                output_window = pld.window(transport, [DECODE_MAX_TOKENS, D], dtype=pl.FP32)
+                output_arrived = pld.window(signals, [TP_SIZE, 1], dtype=pl.INT32)
+                # The rank takes these scales as MX_B_NN; a bare slice is ND, so annotate it.
+                wq_a_scale_r: pl.Tensor[[D // 32, Q_LORA], pl.FP8E8M0, pl.MX_B_NN] = wq_a_scale[rank]
+                wq_b_scale_r: pl.Tensor[
+                    [Q_LORA // 32, LOCAL_H * HEAD_DIM], pl.FP8E8M0, pl.MX_B_NN
+                ] = wq_b_scale[rank]
+                wkv_scale_r: pl.Tensor[[D // 32, HEAD_DIM], pl.FP8E8M0, pl.MX_B_NN] = wkv_scale[rank]
+                wo_b_scale_r: pl.Tensor[[LOCAL_O_WIDTH // 32, D], pl.FP8E8M0, pl.MX_B_NN] = wo_b_scale[rank]
+                index_wq_b_scale_r: pl.Tensor[
+                    [Q_LORA // 32, INDEX_H * INDEX_DIM], pl.FP8E8M0, pl.MX_B_NN
+                ] = index_wq_b_scale[rank]
+                input_window = pld.window(input_transport, [DECODE_MAX_TOKENS, D], dtype=pl.BF16)
+                input_arrived = pld.window(input_signals, [TP_SIZE, 1], dtype=pl.INT32)
+                decode_c1a_full_sharded_test(
+                    x_hc[rank], pre_mix[rank], hc_attn_fn[rank], hc_attn_scale[rank],
+                    hc_attn_base[rank], attn_norm_weight[rank], wq_a[rank],
+                    wq_a_scale_r, q_norm_weight[rank], wq_b[rank], wq_b_scale_r, wkv[rank],
+                    wkv_scale_r, kv_norm_weight[rank], attn_sink[rank], wo_a[rank], wo_b[rank],
+                    wo_b_scale_r, rope_cos[rank], rope_sin[rank], window_slots[rank], window_indices[rank],
+                    window_cache[rank], window_cache_scale[rank], compressed_cache[rank],
+                    compressed_cache_scale[rank], request_ids[rank], compressed_lens[rank], index_cache[rank],
+                    index_cache_scale[rank], index_block_table[rank], compressed_rope_cos[rank],
+                    compressed_rope_sin[rank], compressor_wkv[rank], compressor_norm_weight[rank],
+                    compressed_slots[rank], index_wk[rank], index_norm_weight[rank], index_wq_b[rank],
+                    index_wq_b_scale_r, index_weights_proj[rank], topk_indices[rank], candidate_mask[rank],
+                    gathered[rank], input_window, input_arrived, output_window, output_arrived,
+                    output[rank], next_pre_mix[rank], 0, rank, TOKENS, epoch, device=rank,
+                )
+    return host
+
+
+def build_hc_validation_values(mode, tokens, pages, seed=17, case="random", sharded=False):
+    """Attention fixture plus the HC stream and mixing parameters.
+
+    With ``sharded`` each rank holds its own contiguous slab of the batch's token
+    rows, while every per-token Attention operand stays full range (each rank keeps
+    a replica, exactly like the kernel's parameter list).
+    """
     import math
 
     values = build_validation_values(mode, tokens, pages, seed, case)
     del values["x"]
     generator = torch.Generator().manual_seed(seed)
-    values["x_hc"] = torch.randn(TP_SIZE, tokens, HC_MULT, D, generator=generator)
+    local_tokens = (tokens + TP_SIZE - 1) // TP_SIZE if sharded else tokens
+    values["x_hc"] = torch.randn(TP_SIZE, local_tokens, HC_MULT, D, generator=generator)
     # The coefficients are staggered: this site collapses with the pre-mix the previous
     # sub-layer produced (identity one-hot at the very first site). The fixture carries a
     # general sigmoid-distributed mix instead of the seed so every lane participates.
-    values["pre_mix"] = torch.sigmoid(torch.randn(TP_SIZE, tokens, HC_MULT, generator=generator))
+    values["pre_mix"] = torch.sigmoid(torch.randn(TP_SIZE, local_tokens, HC_MULT, generator=generator))
     values["hc_attn_fn"] = torch.randn(TP_SIZE, MIX_HC, HC_DIM, generator=generator) / math.sqrt(HC_DIM)
     values["hc_attn_scale"] = torch.randn(TP_SIZE, 3, generator=generator)
     values["hc_attn_base"] = torch.randn(TP_SIZE, MIX_HC, generator=generator)
-    values["attn_norm_weight"] = (torch.randn(TP_SIZE, D, generator=generator) * 0.1 + 1).to(torch.bfloat16)
-    values["output"] = torch.zeros(TP_SIZE, tokens, HC_MULT, D, dtype=torch.float32)
-    values["next_pre_mix"] = torch.zeros(TP_SIZE, tokens, HC_MULT, dtype=torch.float32)
+    # The block normalizes the collapsed stream before attention; the checkpoint carries one
+    # weight per layer, so the fixture does too. BF16: the harness takes each spec's dtype from
+    # the fixture tensor, and the kernel declares the weight in the activation dtype.
+    values["attn_norm_weight"] = (
+        torch.randn(TP_SIZE, D, generator=generator) * 0.1 + 1.0
+    ).to(torch.bfloat16)
+    values["output"] = torch.zeros(TP_SIZE, local_tokens, HC_MULT, D, dtype=torch.float32)
+    values["next_pre_mix"] = torch.zeros(TP_SIZE, local_tokens, HC_MULT, dtype=torch.float32)
+    # Attention-input gather scratch: one full-token buffer per rank.
+    values["gathered"] = torch.zeros(TP_SIZE, tokens, D, dtype=torch.bfloat16)
     return values
 
 
@@ -394,6 +704,30 @@ def output_hc_compare(actual, expected, **kwargs):
     return budget(actual, expected, **kwargs)
 
 
+def output_hc_compare_sharded(actual, expected, *, inputs=None, **kwargs):
+    """Apply the HC output budget only to valid rows of each TP slab."""
+    for rank in range(actual.shape[0]):
+        if inputs is None or "num_tokens" not in inputs:
+            valid = expected[rank].reshape(expected.shape[1], -1).norm(dim=1) > 0
+            if not bool(valid.any()):
+                continue
+            actual_rows, expected_rows = actual[rank][valid], expected[rank][valid]
+        else:
+            active = int(inputs["num_tokens"])
+            width = actual.shape[1]
+            first = min(rank * width, active)
+            count = max(0, min(width, active - first))
+            if count == 0:
+                continue
+            actual_rows, expected_rows = actual[rank][:count], expected[rank][:count]
+        if actual_rows.shape[0] == 0:
+            continue
+        passed, detail = output_hc_compare(actual_rows, expected_rows, inputs={}, **kwargs)
+        if not passed:
+            return False, f"rank {rank}: {detail}"
+    return True, "valid sequence-parallel HC rows pass"
+
+
 def next_pre_mix_compare(actual, expected, **kwargs):
     """Report the staggered coefficient diagnostics under the mHC budget.
 
@@ -412,6 +746,27 @@ def next_pre_mix_compare(actual, expected, **kwargs):
     return budget(actual, expected, **kwargs)
 
 
+def gathered_hc_compare(actual, expected, **kwargs):
+    """BF16 gather scratch: the operands were already rounded once upstream.
+
+    Each rank collapses and normalizes locally in BF16 before the AllGather, so a
+    one-step BF16 disagreement at a rounding boundary is the expected noise floor;
+    the harness default (1e-3) is tighter than a single BF16 ULP. The error this
+    still catches is a mis-mapped row or a wrong gather order, which is off by
+    orders of magnitude more.
+    """
+    a, e = actual.float(), expected.float()
+    error = (a - e).norm() / e.norm().clamp_min(1e-12)
+    print(
+        f"[PRECISION] gathered rel_l2={error.item():.6g} "
+        f"max_abs={(a - e).abs().max().item():.6g}"
+    )
+    from golden import ratio_allclose
+
+    budget = ratio_allclose(atol=2 ** -6, rtol=2 ** -6)
+    return budget(actual, expected, **kwargs)
+
+
 def hc_topk_indices_compare(mode):
     """Tie-tolerant top-k comparison for the mHC entries.
 
@@ -423,33 +778,58 @@ def hc_topk_indices_compare(mode):
 
     def compare(actual, expected, **kwargs):
         inputs = kwargs.get("inputs")
+        actual_outputs = kwargs.get("actual_outputs")
         if inputs is not None and "x" not in inputs:
-            hidden = [
-                golden_rms_norm(
-                    golden_mhc_pre(inputs["x_hc"][rank], inputs["pre_mix"][rank]),
-                    inputs["attn_norm_weight"][rank],
-                )
-                for rank in range(TP_SIZE)
-            ]
-            inputs["x"] = torch.stack(hidden)
+            # Sequence-parallel C1A computes index scores after the TP
+            # AllGather.  Rebuild scores from that complete normalized input,
+            # never from a rank's local x_hc slab.
+            gathered = actual_outputs.get("gathered") if actual_outputs is not None else None
+            if gathered is not None:
+                inputs["x"] = gathered
+            else:
+                hidden = [
+                    golden_rms_norm(
+                        golden_mhc_pre(inputs["x_hc"][rank], inputs["pre_mix"][rank]),
+                        inputs["attn_norm_weight"][rank],
+                    )
+                    for rank in range(TP_SIZE)
+                ]
+                inputs["x"] = torch.stack(hidden)
         return inner(actual, expected, **kwargs)
 
     compare.__name__ = f"hc_tied_cutoff_topk_{mode}"
     return compare
 
 
-def golden_c1a_hc_case(tensors, attn_golden, epochs=1):
+def golden_c1a_hc_case(tensors, attn_golden, epochs=1, sharded=False):
     """Reference for an mHC-wired entry: mixes -> attention -> expansion.
 
     One DP group collapses its stream with the staggered pre-mix the fixture carries, normalizes
     it, runs the attention golden per rank, hands this site's computed pre-mix
     to the next sub-layer, publishes the cache state the operator returned, reduces the
-    attention partials, and expands the reduced result back onto the four streams.
+    attention partials, and expands the reduced result back onto the four streams. With
+    ``sharded`` the ranks hold disjoint token rows: the normalized inputs are gathered in
+    rank order for the attention pass and each rank only expands the rows it owns.
     """
     parameters = [name for name in inspect.signature(attn_golden).parameters if name != "x"]
+    full_tokens = tensors["rope_cos"].shape[1]
+
+    def publish(rank, result):
+        for name in CACHE_STATE_NAMES:
+            value = getattr(result, name, None)
+            if value is not None and name in tensors:
+                destination = tensors[name][rank]
+                if name == "candidate_mask":
+                    value = value.clone()
+                    destination.zero_()
+                    destination[:, : value.shape[1]].copy_(value.to(destination.dtype))
+                else:
+                    destination.view(torch.uint8).copy_(value.contiguous().view(torch.uint8))
+
     for _ in range(epochs):
         partials = []
         mixes = []
+        normalized_local = []
         for rank in range(TP_SIZE):
             x_hc = tensors["x_hc"][rank]
             next_pre_mix, post_mix, residual_mix = golden_mhc_mixes(
@@ -457,34 +837,51 @@ def golden_c1a_hc_case(tensors, attn_golden, epochs=1):
             )
             tensors["next_pre_mix"][rank].copy_(next_pre_mix)
             hidden = golden_mhc_pre(x_hc, tensors["pre_mix"][rank])
-            normalized_hidden = golden_rms_norm(hidden, tensors["attn_norm_weight"][rank])
-            result = attn_golden(x=normalized_hidden, **{name: tensors[name][rank] for name in parameters})
-            partials.append(result.output.float())
+            normalized = golden_rms_norm(hidden, tensors["attn_norm_weight"][rank])
             mixes.append((x_hc, post_mix, residual_mix))
-            for name in CACHE_STATE_NAMES:
-                value = getattr(result, name, None)
-                if value is not None and name in tensors:
-                    destination = tensors[name][rank]
-                    if name == "candidate_mask":
-                        value = value.clone()
-                        destination.zero_()
-                        destination[:, : value.shape[1]].copy_(value.to(destination.dtype))
-                    else:
-                        destination.view(torch.uint8).copy_(value.contiguous().view(torch.uint8))
+            if sharded:
+                normalized_local.append(normalized)
+                continue
+            result = attn_golden(x=normalized, **{name: tensors[name][rank] for name in parameters})
+            partials.append(result.output.float())
+            publish(rank, result)
+        if sharded:
+            # The ranks contribute contiguous rows; padding past the token count falls away.
+            gathered = torch.cat(normalized_local, dim=0)[:full_tokens]
+            # Every rank runs the full-range pass with its own weight shard, so the
+            # partials still have to be summed (the ReduceScatter the kernel performs).
+            for rank in range(TP_SIZE):
+                result = attn_golden(x=gathered, **{name: tensors[name][rank] for name in parameters})
+                partials.append(result.output.float())
+                publish(rank, result)
+                # The harness compares the scratch too, so the reference fills it in.
+                tensors["gathered"][rank].zero_()
+                tensors["gathered"][rank][: gathered.shape[0]].copy_(gathered)
         reduced = torch.zeros_like(partials[0])
         for partial in partials:
             reduced += partial
         sublayer = reduced.to(torch.bfloat16)
+        if sharded:
+            width = (full_tokens + TP_SIZE - 1) // TP_SIZE
+            for rank, (x_hc, post_mix, residual_mix) in enumerate(mixes):
+                first = min(rank * width, full_tokens)
+                count = max(0, min(width, full_tokens - first))
+                tensors["output"][rank].zero_()
+                if count:
+                    tensors["output"][rank][:count].copy_(
+                        golden_mhc_post(sublayer[first : first + count], x_hc[:count], post_mix[:count], residual_mix[:count])
+                    )
+            continue
         for rank, (x_hc, post_mix, residual_mix) in enumerate(mixes):
             tensors["output"][rank].copy_(golden_mhc_post(sublayer, x_hc, post_mix, residual_mix))
 
 
-def golden_decode_c1a_full_case(tensors, epochs=1):
+def golden_decode_c1a_full_case(tensors, epochs=1, sharded=False):
     """Fill the mHC-wired full attention entry expectations from the operator reference."""
-    golden_c1a_hc_case(tensors, golden_decode_attn_c1a_full, epochs)
+    golden_c1a_hc_case(tensors, golden_decode_attn_c1a_full, epochs, sharded)
 
 
-def run_c1a_hc(mode, kernel_factory, golden_case, argv=None):
+def run_c1a_hc(mode, kernel_factory, golden_case, argv=None, sharded=False):
     """Run A5 validation for an mHC-wired C1A operator."""
     import argparse
 
@@ -515,6 +912,8 @@ def run_c1a_hc(mode, kernel_factory, golden_case, argv=None):
     parser.add_argument("--check-fp4", action="store_true", default=False,
                         help="run the CPU E2M1 midpoint check and exit")
     args = parser.parse_args(argv)
+    if sharded:
+        common.validate_sp_tokens(parser, args)
     if args.check_fp4:
         raise SystemExit(check_fp4_boundaries())
     if args.tp != TP_SIZE:
@@ -528,7 +927,7 @@ def run_c1a_hc(mode, kernel_factory, golden_case, argv=None):
     if not 1 <= args.tokens <= min(DECODE_MAX_TOKENS, args.pages * 128) or args.pages < 1 or args.epochs < 1:
         parser.error(f"require 1 <= tokens <= min({DECODE_MAX_TOKENS}, pages * 128), pages >= 1, epochs >= 1")
     host = kernel_factory(args.tokens, args.pages, args.epochs)
-    values = build_hc_validation_values(mode, args.tokens, args.pages, args.seed, args.case)
+    values = build_hc_validation_values(mode, args.tokens, args.pages, args.seed, args.case, sharded)
     # Clone per call: the harness builds the golden scratch from these same specs, and a
     # tensor init_value whose dtype already matches comes back as itself.
     specs = [
@@ -537,7 +936,7 @@ def run_c1a_hc(mode, kernel_factory, golden_case, argv=None):
     ]
 
     def golden_fn(tensors):
-        golden_case(tensors, args.epochs)
+        golden_case(tensors, args.epochs, sharded)
 
     # Published cache rows are compared as dequantized values, because a one-ULP difference can
     # move a published code one E2M1/E4M3 step; which rows may change at all stays byte exact.
@@ -549,7 +948,8 @@ def run_c1a_hc(mode, kernel_factory, golden_case, argv=None):
         "topk_indices": exact_bytes if mode == "reuse" else hc_topk_indices_compare(mode),
         "candidate_mask": exact_bytes,
         "next_pre_mix": next_pre_mix_compare,
-        "output": output_hc_compare,
+        "output": output_hc_compare_sharded if sharded else output_hc_compare,
+        "gathered": gathered_hc_compare,
     }
     comparisons["window_cache_scale"] = comparisons["window_cache"]
     if mode == "full":
@@ -591,8 +991,18 @@ def run_c1a_hc(mode, kernel_factory, golden_case, argv=None):
 
 
 def validate(argv=None):
-    """Validate the mHC-wired decode C1A full attention entry on A5."""
-    return run_c1a_hc("full", make_program, golden_decode_c1a_full_case, argv=argv)
+    """Validate the replicated and the sequence-parallel wiring on A5."""
+    result = run_c1a_hc("full", make_program, golden_decode_c1a_full_case, argv=argv)
+    # The sequence-parallel wiring: the same shapes and numbers, but the attention input
+    # arrives through the layer-head AllGather and the output leaves through ReduceScatter.
+    result_sharded = run_c1a_hc(
+        "full",
+        lambda tokens, pages, epochs: make_program(tokens, pages, epochs, sharded=True),
+        golden_decode_c1a_full_case,
+        argv=argv,
+        sharded=True,
+    )
+    return common.combine_validation([result, result_sharded])
 
 
 # A2/A3 CI currently discovers runnable model files by the conventional entry

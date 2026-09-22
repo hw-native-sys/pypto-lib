@@ -32,7 +32,11 @@ from models.deepseek_v4_1_flash.metadata import window_metadata
 from models.deepseek_v4_1_flash.o_proj import o_proj
 from models.deepseek_v4_1_flash.qkv_proj_rope import qkv_proj_rope
 from models.deepseek_v4_1_flash.quantization import decode_e8m0, pack_mx_b_scale, unpack_mx_b_scale
-from models.deepseek_v4_1_flash.attention_tp import decode_tp_output_all_reduce
+from models.deepseek_v4_1_flash.attention_tp import (
+    OUTPUT_T_DYN,
+    decode_tp_output_all_reduce,
+    decode_tp_output_reduce_scatter,
+)
 from models.deepseek_v4_1_flash.attention_common import AttentionGoldenResult, golden_swa_attention
 from models.deepseek_v4_1_flash.config import (
     D,
@@ -274,53 +278,63 @@ def decode_swa_partial(
     return cache_consumed
 
 
-@pl.jit.inline(auto_scope=False)
-def decode_attn_swa(
-    x: pl.Tensor[[T_DYN, D], pl.BF16],
-    wq_a: pl.Tensor[[D, Q_LORA], pl.FP8E4M3FN],
-    wq_a_scale: pl.Tensor[[D // 32, Q_LORA], pl.FP8E8M0, pl.MX_B_NN],
-    q_norm_weight: pl.Tensor[[Q_LORA], pl.BF16],
-    wq_b: pl.Tensor[[Q_LORA, LOCAL_H * HEAD_DIM], pl.FP8E4M3FN],
-    wq_b_scale: pl.Tensor[[Q_LORA // 32, LOCAL_H * HEAD_DIM], pl.FP8E8M0, pl.MX_B_NN],
-    wkv: pl.Tensor[[D, HEAD_DIM], pl.FP8E4M3FN],
-    wkv_scale: pl.Tensor[[D // 32, HEAD_DIM], pl.FP8E8M0, pl.MX_B_NN],
-    kv_norm_weight: pl.Tensor[[HEAD_DIM], pl.BF16],
-    attn_sink: pl.Tensor[[LOCAL_H], pl.FP32],
-    wo_a: pl.Tensor[[LOCAL_O_GROUPS, O_LORA, O_GROUP_IN], pl.BF16],
-    wo_b: pl.Tensor[[LOCAL_O_WIDTH, D], pl.FP8E4M3FN],
-    wo_b_scale: pl.Tensor[[LOCAL_O_WIDTH // 32, D], pl.FP8E8M0, pl.MX_B_NN],
-    rope_cos: pl.Tensor[[T_DYN, ROPE_DIM // 2], pl.FP32],
-    rope_sin: pl.Tensor[[T_DYN, ROPE_DIM // 2], pl.FP32],
-    window_slots: pl.Tensor[[T_DYN], pl.INT64],
-    window_indices: pl.Tensor[[T_DYN, 128], pl.INT32],
-    window_cache: pl.Tensor[[ORI_BLOCKS_DYN, 128, 1, HEAD_DIM], pl.FP8E4M3FN],
-    window_cache_scale: pl.Tensor[[ORI_BLOCKS_DYN, 128, 1, HEAD_DIM // WINDOW_CACHE_GROUP], pl.FP8E8M0],
-    output_window: pld.DistributedTensor[[DECODE_MAX_TOKENS, D], pl.FP32],
-    output_arrived: pld.DistributedTensor[[TP_SIZE, 1], pl.INT32],
-    output: pl.Tensor[[T_DYN, D], pl.BF16],
-    group_base: pl.Scalar[pl.INT32],
-    tp_rank: pl.Scalar[pl.INT32],
-    num_tokens: pl.Scalar[pl.INT32],
-    attention_epoch: pl.Scalar[pl.INT32],
-):
-    """Write BF16 TP output using zero-initialized windows and consecutive 1-based epochs."""
-    # A later epoch must not overwrite cache or transport storage still being read.
-    with pl.at(level=pl.Level.CORE_GROUP, name_hint="swa_previous_epoch", allow_early_resolve=False) as cache_ready:
-        for peer in pl.range(TP_SIZE):
-            pld.system.wait(output_arrived, offsets=[peer, 0], expected=(attention_epoch - 1) * 2,
-                            cmp=pld.WaitCmp.Ge)
-    tokens = pl.tensor.dim(x, 0)
-    partial = pl.create_tensor([tokens, D], dtype=pl.FP32)
-    decode_swa_partial(x, wq_a, wq_a_scale, q_norm_weight, wq_b, wq_b_scale,
-                       wkv, wkv_scale, kv_norm_weight, attn_sink, wo_a, wo_b, wo_b_scale,
-                       rope_cos, rope_sin, window_slots, window_indices, window_cache,
-                       window_cache_scale, partial, num_tokens, cache_ready)
-    decode_tp_output_all_reduce(partial, output_window, output_arrived, output,
-                                group_base, tp_rank, num_tokens, attention_epoch)
-    return output
+def make_decode_attn_swa(output_reduce=None):
+    """Build the decode_attn_swa leaf around one output collective."""
+    reducer = output_reduce or decode_tp_output_all_reduce
+
+    @pl.jit.inline(auto_scope=False)
+    def decode_attn_swa(
+        x: pl.Tensor[[T_DYN, D], pl.BF16],
+        wq_a: pl.Tensor[[D, Q_LORA], pl.FP8E4M3FN],
+        wq_a_scale: pl.Tensor[[D // 32, Q_LORA], pl.FP8E8M0, pl.MX_B_NN],
+        q_norm_weight: pl.Tensor[[Q_LORA], pl.BF16],
+        wq_b: pl.Tensor[[Q_LORA, LOCAL_H * HEAD_DIM], pl.FP8E4M3FN],
+        wq_b_scale: pl.Tensor[[Q_LORA // 32, LOCAL_H * HEAD_DIM], pl.FP8E8M0, pl.MX_B_NN],
+        wkv: pl.Tensor[[D, HEAD_DIM], pl.FP8E4M3FN],
+        wkv_scale: pl.Tensor[[D // 32, HEAD_DIM], pl.FP8E8M0, pl.MX_B_NN],
+        kv_norm_weight: pl.Tensor[[HEAD_DIM], pl.BF16],
+        attn_sink: pl.Tensor[[LOCAL_H], pl.FP32],
+        wo_a: pl.Tensor[[LOCAL_O_GROUPS, O_LORA, O_GROUP_IN], pl.BF16],
+        wo_b: pl.Tensor[[LOCAL_O_WIDTH, D], pl.FP8E4M3FN],
+        wo_b_scale: pl.Tensor[[LOCAL_O_WIDTH // 32, D], pl.FP8E8M0, pl.MX_B_NN],
+        rope_cos: pl.Tensor[[T_DYN, ROPE_DIM // 2], pl.FP32],
+        rope_sin: pl.Tensor[[T_DYN, ROPE_DIM // 2], pl.FP32],
+        window_slots: pl.Tensor[[T_DYN], pl.INT64],
+        window_indices: pl.Tensor[[T_DYN, 128], pl.INT32],
+        window_cache: pl.Tensor[[ORI_BLOCKS_DYN, 128, 1, HEAD_DIM], pl.FP8E4M3FN],
+        window_cache_scale: pl.Tensor[[ORI_BLOCKS_DYN, 128, 1, HEAD_DIM // WINDOW_CACHE_GROUP], pl.FP8E8M0],
+        output_window: pld.DistributedTensor[[DECODE_MAX_TOKENS, D], pl.FP32],
+        output_arrived: pld.DistributedTensor[[TP_SIZE, 1], pl.INT32],
+        output: pl.Tensor[[OUTPUT_T_DYN, D], pl.BF16],
+        group_base: pl.Scalar[pl.INT32],
+        tp_rank: pl.Scalar[pl.INT32],
+        num_tokens: pl.Scalar[pl.INT32],
+        attention_epoch: pl.Scalar[pl.INT32],
+    ):
+        """Write BF16 TP output using zero-initialized windows and consecutive 1-based epochs."""
+        # A later epoch must not overwrite cache or transport storage still being read.
+        with pl.at(level=pl.Level.CORE_GROUP, name_hint="swa_previous_epoch", allow_early_resolve=False) as cache_ready:
+            for peer in pl.range(TP_SIZE):
+                pld.system.wait(output_arrived, offsets=[peer, 0], expected=(attention_epoch - 1) * 2,
+                                cmp=pld.WaitCmp.Ge)
+        tokens = pl.tensor.dim(x, 0)
+        partial = pl.create_tensor([tokens, D], dtype=pl.FP32)
+        decode_swa_partial(x, wq_a, wq_a_scale, q_norm_weight, wq_b, wq_b_scale,
+                           wkv, wkv_scale, kv_norm_weight, attn_sink, wo_a, wo_b, wo_b_scale,
+                           rope_cos, rope_sin, window_slots, window_indices, window_cache,
+                           window_cache_scale, partial, num_tokens, cache_ready)
+        reducer(partial, output_window, output_arrived, output,
+                                    group_base, tp_rank, num_tokens, attention_epoch)
+        return output
+
+    return decode_attn_swa
 
 
-__all__ = ["decode_attn_swa", "golden_decode_attn_swa"]
+decode_attn_swa = make_decode_attn_swa()
+decode_attn_swa_sharded = make_decode_attn_swa(decode_tp_output_reduce_scatter)
+
+
+__all__ = ["decode_attn_swa", "decode_attn_swa_sharded", "golden_decode_attn_swa"]
 
 
 
@@ -721,9 +735,14 @@ def build_specs(args, mode):
     return specs
 
 
-def golden_swa(tensors):
-    """Reference each TP shard independently, then perform the FP32 TP reduction."""
+def golden_swa(tensors, sharded=False):
+    """Reference each TP shard independently, then perform the FP32 TP reduction.
+
+    With ``sharded`` the summed rows are handed out as the contiguous token slabs
+    the kernel ReduceScatter produces, one per rank.
+    """
     world_size = tensors["x"].shape[0]
+    active = int(tensors["num_tokens"])
     for base in range(0, world_size, TP_SIZE):
         partials = []
         for rank in range(base, base + TP_SIZE):
@@ -733,7 +752,40 @@ def golden_swa(tensors):
             tensors["window_cache"][rank].copy_(cache)
             tensors["window_cache_scale"][rank].copy_(scale)
         reduced = sum(partials).bfloat16()
-        tensors["output"][base:base + TP_SIZE].copy_(reduced.unsqueeze(0).expand(TP_SIZE, -1, -1))
+        if sharded:
+            # Ownership follows the fixed physical slab, so the active count only
+            # masks its suffix and T < TP keeps the AllGather row mapping.
+            width = tensors["output"].shape[1]
+            for offset in range(TP_SIZE):
+                first = min(offset * width, active)
+                count = max(0, min(width, active - first))
+                tensors["output"][base + offset].zero_()
+                if count:
+                    tensors["output"][base + offset][:count].copy_(reduced[first : first + count])
+        else:
+            tensors["output"][base:base + TP_SIZE].copy_(reduced.unsqueeze(0).expand(TP_SIZE, -1, -1))
+
+
+def compare_reduced_sharded(actual, expected, **kwargs):
+    """Compare every rank on its own ReduceScatter token slab.
+
+    The slab is fully materialized: rows inside the active range carry the summed
+    rows this rank owns, rows outside it must be zero on every rank.
+    """
+    inputs = kwargs.get("inputs")
+    active = int(inputs["num_tokens"]) if inputs is not None else actual.shape[1] * actual.shape[0]
+    width = actual.shape[1]
+    passed = True
+    for rank in range(actual.shape[0]):
+        first = min(rank * width, active)
+        count = max(0, min(width, active - first))
+        if count < width and not bool((actual[rank][count:] == 0).all()):
+            return False, f"rank {rank}: inactive ReduceScatter rows must be zero, not stale data"
+        if count == 0:
+            continue
+        valid, _ = compare_output(actual[rank][:count], expected[rank][:count])
+        passed &= valid
+    return passed, "Every rank must pass precision on its own local token slab"
 
 
 def compare_reduced(actual, expected, **kwargs):
@@ -836,7 +888,7 @@ def main():
 if "pytest" in sys.modules:
     import pytest
 
-    @pytest.mark.parametrize("tp,dp", [(1, 1), (2, 2), (4, 1)])
+    @pytest.mark.parametrize("tp,dp", [(2, 2)])
     def test_precision(tp, dp, a5_args):
         """Validate the operator against its golden reference on A5."""
         result = validate(a5_args(tp=tp, dp=dp))

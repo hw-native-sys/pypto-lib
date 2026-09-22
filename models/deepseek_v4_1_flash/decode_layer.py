@@ -188,9 +188,13 @@ def main():
     if args.cpu_golden:
         if args.stage != "block":
             parser.error("--cpu-golden requires --stage block")
-        from models.deepseek_v4_1_flash._golden_smoke import run_decode_layer_goldens
+        from models.deepseek_v4_1_flash._golden_smoke import (
+            run_decode_layer_goldens,
+            run_two_layer_decode_chain,
+        )
 
         run_decode_layer_goldens(golden_decode_layer, REPRESENTATIVE_LAYER_IDS.values())
+        run_two_layer_decode_chain(golden_decode_layer)
         return
     if args.stage == "block":
         parser.error(decode_layer_kernel_skip_reason(args.layer_id) or "Block hardware fixture is pending")
