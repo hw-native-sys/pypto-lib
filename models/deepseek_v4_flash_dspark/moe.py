@@ -11,7 +11,9 @@
 
 
 # Sub-kernels freeze EP / n_routed_experts into their shapes at import
-# time, so read --ep from argv and override config before importing them below.
+# time: read --ep / --experts-per-rank from argv and override config before
+# importing them below.
+import dataclasses
 import functools
 import sys
 
@@ -19,28 +21,29 @@ import config
 
 _EP_CHOICES = (2, 4, 8, 16)
 _EP_DEFAULT = 2
+# Fixed reference for the default density -- not config.EP, which a caller
+# (e.g. dspark_drafter.py) may already have overwritten before importing this.
+_CHECKPOINT_N_ROUTED_EXPERTS = config.FLASH.n_routed_experts
 
 
-def _parse_ep_argv():
+def _parse_int_argv(name, default):
     for i, tok in enumerate(sys.argv):
-        if tok == "--ep" and i + 1 < len(sys.argv):
+        if tok == name and i + 1 < len(sys.argv):
             return int(sys.argv[i + 1])
-        if tok.startswith("--ep="):
+        if tok.startswith(name + "="):
             return int(tok.split("=", 1)[1])
-    return _EP_DEFAULT
+    return default
 
 
-EP = _parse_ep_argv()
+EP = _parse_int_argv("--ep", _EP_DEFAULT)
+# Capped by EP so the default density (32/rank) can't overflow the checkpoint's
+# 256 experts past EP8 -- gate.py's score buffers are fixed at that width.
+_EXPERTS_PER_RANK_DEFAULT = min(_CHECKPOINT_N_ROUTED_EXPERTS // 8, _CHECKPOINT_N_ROUTED_EXPERTS // EP)
+EXPERTS_PER_RANK = _parse_int_argv("--experts-per-rank", _EXPERTS_PER_RANK_DEFAULT)
+if EXPERTS_PER_RANK <= 0:
+    raise ValueError(f"--experts-per-rank must be a positive integer (got {EXPERTS_PER_RANK})")
+config.FLASH = dataclasses.replace(config.FLASH, n_routed_experts=EXPERTS_PER_RANK * EP)
 config.EP = EP
-# The routed-expert count is a property of the checkpoint, not of the world:
-# every rank routes over the full set and owns n_routed / EP local experts.
-# Bring-up used to shrink the set to 16 experts per rank at every world size,
-# which matched the 256-expert checkpoint only at EP16 and gave smaller worlds
-# a routing space the checkpoint never defines.
-if config.FLASH.n_routed_experts % EP:
-    raise ValueError(
-        f"FLASH n_routed_experts={config.FLASH.n_routed_experts} must be divisible by --ep {EP}"
-    )
 config.RECV_MAX = EP * config.MOE_TOKENS
 
 import pypto.language as pl
@@ -76,10 +79,7 @@ MOE_INTER = M.moe_intermediate_size
 N_RANKS = EP
 N_EXPERTS_GLOBAL = M.n_routed_experts
 N_LOCAL = N_EXPERTS_GLOBAL // N_RANKS
-# TaskAllocator heap pressure scales with the per-rank lane count (N_LOCAL);
-# the 256 MiB per-ring runtime default was sized for the bring-up world of 16
-# local experts per rank. Keep EP16 at that default and give smaller worlds
-# proportionally more room (EP2 owns 128 of the checkpoint's 256 experts).
+# TaskAllocator ring heap, scaled from the 256 MiB runtime default per 16 local experts.
 MOE_RING_HEAP = (1 << 28) * max(1, N_LOCAL // 16)
 N_ROUTES = T * TOPK
 
@@ -1375,6 +1375,8 @@ if __name__ == "__main__":
                         choices=["a2a3", "a2a3sim", "a5", "a5sim"])
     parser.add_argument("--ep", type=int, default=_EP_DEFAULT, choices=list(_EP_CHOICES),
                         help="EP world size / rank count")
+    parser.add_argument("--experts-per-rank", type=int, default=EXPERTS_PER_RANK,
+                        help=f"routed experts per rank (default {_EXPERTS_PER_RANK_DEFAULT})")
     parser.add_argument("-d", "--device", type=str, default=",".join(str(i) for i in range(N_RANKS)),
                         help=f"comma-separated device ids (need {N_RANKS})")
     parser.add_argument("--layer-id", type=int, default=0)

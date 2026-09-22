@@ -11,41 +11,17 @@
 """DeepSeek-V4 Flash DSpark 43-layer layer-major DSA-CP prefill forward with LM head and greedy sampling."""
 
 import argparse
-import dataclasses
 import os
-import sys
 
 import pypto.language as pl
 import pypto.language.distributed as pld
 from golden import run
 from pypto.ir import DistributedConfig
 
-import config as _config
-
-
-def _ep_from_argv(default: int = 2) -> int:
-    for index, token in enumerate(sys.argv):
-        if token == "--ep" and index + 1 < len(sys.argv):
-            return int(sys.argv[index + 1])
-        if token.startswith("--ep="):
-            return int(token.split("=", 1)[1])
-    return default
-
-
-# Standalone bring-up compiles for 16 routed experts per rank (the deployment
-# density): the checkpoint's full routing space pushes a dispatched task's
-# producer fanin past the runtime's CHIP_MAX_FANIN=128 cap at the small
-# worlds. Serving imports this module through its own context (argv[0]
-# marker) and keeps the checkpoint's routing space.
-if sys.argv[0] != "pypto-serving-dspark":
-    _config.FLASH = dataclasses.replace(
-        _config.FLASH,
-        n_routed_experts=_config.FLASH.n_routed_experts // 16 * _ep_from_argv(),
-    )
-
 from moe import (
     AUX_PAD,
     D,
+    EXPERTS_PER_RANK,
     HC_DIM,
     HC_MULT,
     IDX_PAD,
@@ -168,8 +144,9 @@ CSA_COMPRESS_STATE_DIM = 2 * CSA_MAIN_OUT_DIM
 CSA_INNER_COMPRESS_STATE_DIM = 2 * INNER_OUT_DIM
 # Layer schedule: SWA 0-1, CSA even 2-42, and HCA odd 3-41.
 
-# Runtime ring heaps by scope depth.
-PREFILL_RING_HEAP = (2 * 1024 * 1024 * 1024, 2 * 1024 * 1024 * 1024, 4 * 1024 * 1024 * 1024, 8 * 1024 * 1024 * 1024)
+# Runtime ring heaps by scope depth, halved to fit the EP8 density default
+# (32 experts/rank) -- matches pypto-serving's own halved EP8 CI profile.
+PREFILL_RING_HEAP = (1 * 1024 * 1024 * 1024, 1 * 1024 * 1024 * 1024, 2 * 1024 * 1024 * 1024, 4 * 1024 * 1024 * 1024)
 LM_HEAD_COMM_EPOCH = 1
 
 TARGET_LAYER_IDS = (40, 41, 42)  # dspark_target_layer_ids
@@ -2242,6 +2219,10 @@ def main():
     parser.add_argument(
         "--ep", type=int, default=N_RANKS, choices=[2, 4, 8, 16],
         help="EP world size / rank count (parsed at import by moe).",
+    )
+    parser.add_argument(
+        "--experts-per-rank", type=int, default=EXPERTS_PER_RANK,
+        help="routed experts per rank (parsed at import by moe).",
     )
     parser.add_argument(
         "--tp", type=int, default=TP_SIZE, choices=[1, 2, 4],

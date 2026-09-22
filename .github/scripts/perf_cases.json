@@ -178,6 +178,8 @@
       "arguments": [
         "--ep",
         "16",
+        "--experts-per-rank",
+        "16",
         "--layer-id",
         "0",
         "--num-tokens",

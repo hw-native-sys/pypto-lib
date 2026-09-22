@@ -49,19 +49,6 @@ FWD_CSA_WEIGHT_BANK_SIZE = 21 if FWD_WEIGHT_BANK_SIZE == 43 else 1
 FWD_HCA_WEIGHT_BANK_SIZE = 20 if FWD_WEIGHT_BANK_SIZE == 43 else 1
 
 config.TP = TP_SIZE
-config.EP = EP_SIZE
-# Standalone bring-up compiles for 16 routed experts per rank (the deployment
-# density): the checkpoint's full routing space pushes a dispatched task's
-# producer fanin past the runtime's CHIP_MAX_FANIN=128 cap at the small
-# worlds. Serving imports this module through its own context (argv[0]
-# marker) and keeps the checkpoint's routing space.
-if sys.argv[0] != "pypto-serving-dspark":
-    import dataclasses
-
-    config.FLASH = dataclasses.replace(
-        config.FLASH,
-        n_routed_experts=config.FLASH.n_routed_experts // 16 * EP_SIZE,
-    )
 
 import decode_csa as csa
 import decode_hca as hca
@@ -2026,6 +2013,10 @@ def main():
     parser.add_argument("-p", "--platform", type=str, default="a2a3", choices=("a2a3", "a2a3sim", "a5", "a5sim"))
     parser.add_argument("--tp", type=int, default=TP_SIZE, choices=_TP_CHOICES)
     parser.add_argument("--ep", type=int, default=EP_SIZE, choices=_EP_CHOICES)
+    parser.add_argument(
+        "--experts-per-rank", type=int, default=moe_module.EXPERTS_PER_RANK,
+        help="routed experts per rank (parsed at import by moe)",
+    )
     parser.add_argument(
         "-d", "--device", type=str, default=None,
         help=f"comma-separated device ids; EP={EP_SIZE} needs {EP_SIZE}",

@@ -281,10 +281,10 @@ FP32_NEG_INF = -3.4028234663852886e38     # most-negative finite fp32 (softmax m
 # Parallelism constants
 TP = 4    # tensor-parallel ranks per DP group
 DP = 4    # DP groups per node
-EP = 16   # expert-parallel world size (moe overrides it from --ep)
+EP = 8    # expert-parallel world size (moe overrides it from --ep)
 
 # MoE constants
-MOE_TOKENS = DECODE_TOKENS * DP // EP
+MOE_TOKENS = DECODE_TOKENS // TP
 DECODE_RECV_MAX = DP * DECODE_TOKENS
 PREFILL_RECV_MAX = DP * PREFILL_TOKENS
 RECV_MAX = DECODE_RECV_MAX

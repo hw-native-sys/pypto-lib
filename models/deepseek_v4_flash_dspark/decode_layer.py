@@ -44,7 +44,6 @@ if EP_SIZE % TP_SIZE != 0:
     raise ValueError(f"EP={EP_SIZE} must be divisible by TP={TP_SIZE}")
 
 config.TP = TP_SIZE
-config.EP = EP_SIZE
 
 import decode_csa as csa
 import decode_hca as hca
