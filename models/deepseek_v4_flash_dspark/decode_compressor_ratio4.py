@@ -59,6 +59,19 @@ CMP_MAX_BLOCKS = (MAX_SEQ_LEN // COMPRESS_RATIO + BLOCK_SIZE - 1) // BLOCK_SIZE
 CMP_BLOCK_NUM = KV_CMP_BLOCK_NUM
 CMP_BLOCK_NUM_DYN = pl.dynamic("CMP_BLOCK_NUM_DYN")
 
+# vLLM-native persistent pages. Main compressor state uses a 131072-byte FP32
+# backing page with eight live state rows; raw and compressed KV use separate
+# 131072-byte BF16 page pools.
+VLLM_COMPRESS_STATE_PAGE_ROWS = 16
+VLLM_COMPRESS_STATE_LIVE_ROWS = 8
+VLLM_KV_PAGE_ROWS = 128
+VLLM_COMPRESS_STATE_PAGE_NUM_DYN = pl.dynamic(
+    "VLLM_CSA_COMPRESS_STATE_PAGES_DYN"
+)
+VLLM_CMP_KV_PAGE_NUM_DYN = pl.dynamic("VLLM_CSA_CMP_KV_PAGES_DYN")
+VLLM_STATE_TABLE_BLOCKS_DYN = pl.dynamic("VLLM_CSA_MAIN_STATE_TABLE_DYN")
+VLLM_CMP_TABLE_BLOCKS_DYN = pl.dynamic("VLLM_CSA_CMP_TABLE_DYN")
+
 # tiling
 K_TILE = 512
 OUT_TILE = 64
@@ -360,6 +373,427 @@ def compressor_ratio4_cache_write(
                     kv_row_fp32, target_type=pl.BF16, mode="rint")
 
     return cache_write_tid
+
+
+@pl.jit.inline(auto_scope=False)
+def compressor_ratio4_pool_projected_vllm(
+    compress_state_pages: pl.Tensor[
+        [
+            VLLM_COMPRESS_STATE_PAGE_NUM_DYN,
+            VLLM_COMPRESS_STATE_PAGE_ROWS,
+            COMPRESS_STATE_DIM,
+        ],
+        pl.FP32,
+    ],
+    compress_state_block_table: pl.Tensor[
+        [B_DYN, VLLM_STATE_TABLE_BLOCKS_DYN], pl.INT32
+    ],
+    ape: pl.Tensor[[COMPRESS_RATIO, OUT_DIM], pl.FP32],
+    position_ids: pl.Tensor[[T_DYN], pl.INT32],
+    token_valid: pl.Tensor[[T_DYN], pl.INT32],
+    pooled_kv: pl.Out[pl.Tensor[[BS_PAD, HEAD_DIM], pl.FP32]],
+    kv_proj_pad: pl.Out[pl.Tensor[[BS_PAD, OUT_DIM], pl.FP32]],
+    score_proj_pad: pl.Out[pl.Tensor[[BS_PAD, OUT_DIM], pl.FP32]],
+    late_dep: pl.Scalar[pl.TASK_ID],
+):
+    """Pool against state rows in vLLM's native FP32 backing pages."""
+    b_dim = pl.tensor.dim(compress_state_block_table, 0)
+    tokens = pl.tensor.dim(position_ids, 0)
+    s_dim = tokens // b_dim
+    state_page_count = pl.tensor.dim(compress_state_pages, 0)
+    compress_state_flat = pl.reshape(
+        compress_state_pages,
+        [state_page_count * VLLM_COMPRESS_STATE_PAGE_ROWS, COMPRESS_STATE_DIM],
+    )
+    pool_workers = pl.min(b_dim, POOL_WORKERS)
+    with pl.spmd(
+        pool_workers,
+        name_hint="scatter_softmax_pool_vllm",
+        deps=[late_dep],
+        allow_early_resolve=True,
+    ) as pool_tid:
+        worker = pl.tile.get_block_idx()
+        for request in pl.range(worker, b_dim, pool_workers):
+            request_begin = request * s_dim
+            first_position = pl.read(position_ids, [request_begin])
+            for step in pl.range(s_dim):
+                token = request_begin + step
+                pooled_kv[token : token + 1, :] = pl.full(
+                    [1, HEAD_DIM], dtype=pl.FP32, value=0.0,
+                )
+                valid = pl.read(token_valid, [token])
+                position = pl.read(position_ids, [token])
+                if valid != 0 and (position + 1) % COMPRESS_RATIO == 0:
+                    window_start = position - STATE_LEN + 1
+                    for h0 in pl.range(0, HEAD_DIM, POOL_HEAD_TILE):
+                        last_ape_row = pl.cast(
+                            position % COMPRESS_RATIO, target_type=pl.INDEX,
+                        )
+                        mi = pl.add(
+                            score_proj_pad[
+                                token : token + 1,
+                                HEAD_DIM + h0 : HEAD_DIM + h0 + POOL_HEAD_TILE,
+                            ],
+                            ape[
+                                last_ape_row : last_ape_row + 1,
+                                HEAD_DIM + h0 : HEAD_DIM + h0 + POOL_HEAD_TILE,
+                            ],
+                        )
+                        li = pl.exp(pl.sub(mi, mi))
+                        oi = kv_proj_pad[
+                            token : token + 1,
+                            HEAD_DIM + h0 : HEAD_DIM + h0 + POOL_HEAD_TILE,
+                        ]
+                        for state_idx in pl.range(STATE_LEN - 1):
+                            logical_position = window_start + state_idx
+                            value = pl.full(
+                                [1, POOL_HEAD_TILE], dtype=pl.FP32, value=0.0,
+                            )
+                            score = pl.full(
+                                [1, POOL_HEAD_TILE],
+                                dtype=pl.FP32,
+                                value=FP32_NEG_INF,
+                            )
+                            state_half = 0
+                            if state_idx >= COMPRESS_RATIO:
+                                state_half = HEAD_DIM
+                            if logical_position >= 0 and logical_position < first_position:
+                                logical_page = (
+                                    logical_position
+                                    // VLLM_COMPRESS_STATE_LIVE_ROWS
+                                )
+                                physical_page_i32 = pl.read(
+                                    compress_state_block_table,
+                                    [request, logical_page],
+                                )
+                                if physical_page_i32 > 0:
+                                    physical_page = pl.cast(
+                                        physical_page_i32, pl.INDEX,
+                                    )
+                                    intra = (
+                                        logical_position
+                                        % VLLM_COMPRESS_STATE_LIVE_ROWS
+                                    )
+                                    state_row = (
+                                        physical_page
+                                        * VLLM_COMPRESS_STATE_PAGE_ROWS
+                                        + intra
+                                    )
+                                    value = compress_state_flat[
+                                        state_row : state_row + 1,
+                                        state_half + h0 : state_half + h0 + POOL_HEAD_TILE,
+                                    ]
+                                    score = compress_state_flat[
+                                        state_row : state_row + 1,
+                                        OUT_DIM + state_half + h0 : OUT_DIM + state_half + h0 + POOL_HEAD_TILE,
+                                    ]
+                            if (
+                                logical_position >= first_position
+                                and logical_position <= position
+                            ):
+                                overlay_token = (
+                                    request_begin
+                                    + logical_position
+                                    - first_position
+                                )
+                                overlay_valid = pl.read(token_valid, [overlay_token])
+                                if overlay_valid != 0:
+                                    ape_row = pl.cast(
+                                        logical_position % COMPRESS_RATIO,
+                                        target_type=pl.INDEX,
+                                    )
+                                    value = kv_proj_pad[
+                                        overlay_token : overlay_token + 1,
+                                        state_half + h0 : state_half + h0 + POOL_HEAD_TILE,
+                                    ]
+                                    score = pl.add(
+                                        score_proj_pad[
+                                            overlay_token : overlay_token + 1,
+                                            state_half + h0 : state_half + h0 + POOL_HEAD_TILE,
+                                        ],
+                                        ape[
+                                            ape_row : ape_row + 1,
+                                            state_half + h0 : state_half + h0 + POOL_HEAD_TILE,
+                                        ],
+                                    )
+                            mi_next = pl.maximum(mi, score)
+                            alpha = pl.exp(pl.sub(mi, mi_next))
+                            beta = pl.exp(pl.sub(score, mi_next))
+                            li = pl.add(pl.mul(alpha, li), beta)
+                            oi = pl.add(pl.mul(oi, alpha), pl.mul(value, beta))
+                            mi = mi_next
+                        pooled_kv[
+                            token : token + 1,
+                            h0 : h0 + POOL_HEAD_TILE,
+                        ] = pl.div(oi, li)
+    return pool_tid
+
+
+@pl.jit.inline(auto_scope=False)
+def compressor_ratio4_cache_write_vllm(
+    kv: pl.Tensor[[T_DYN, HEAD_DIM], pl.FP32],
+    pooled_kv: pl.Tensor[[BS_PAD, HEAD_DIM], pl.FP32],
+    norm_w: pl.Tensor[[HEAD_DIM], pl.BF16],
+    cos: pl.Tensor[[T_DYN, ROPE_HEAD_DIM], pl.FP32],
+    sin: pl.Tensor[[T_DYN, ROPE_HEAD_DIM], pl.FP32],
+    compress_state_pages: pl.Tensor[
+        [
+            VLLM_COMPRESS_STATE_PAGE_NUM_DYN,
+            VLLM_COMPRESS_STATE_PAGE_ROWS,
+            COMPRESS_STATE_DIM,
+        ],
+        pl.FP32,
+    ],
+    cmp_kv_pages: pl.Tensor[
+        [VLLM_CMP_KV_PAGE_NUM_DYN, VLLM_KV_PAGE_ROWS, 1, HEAD_DIM], pl.BF16
+    ],
+    cmp_block_table: pl.Tensor[
+        [B_DYN, VLLM_CMP_TABLE_BLOCKS_DYN], pl.INT32
+    ],
+    compress_state_block_table: pl.Tensor[
+        [B_DYN, VLLM_STATE_TABLE_BLOCKS_DYN], pl.INT32
+    ],
+    ape: pl.Tensor[[COMPRESS_RATIO, OUT_DIM], pl.FP32],
+    kv_proj_pad: pl.Tensor[[BS_PAD, OUT_DIM], pl.FP32],
+    score_proj_pad: pl.Tensor[[BS_PAD, OUT_DIM], pl.FP32],
+    position_ids: pl.Tensor[[T_DYN], pl.INT32],
+    token_valid: pl.Tensor[[T_DYN], pl.INT32],
+    pool_tid: pl.Scalar[pl.TASK_ID],
+    late_write_dep: pl.Scalar[pl.TASK_ID],
+):
+    """Commit vLLM-native state and compressed KV without private slot maps."""
+    b_dim = pl.tensor.dim(compress_state_block_table, 0)
+    tokens = pl.tensor.dim(position_ids, 0)
+    s_dim = tokens // b_dim
+    rms_blocks = (tokens + RMS_PAD_TILE - 1) // RMS_PAD_TILE
+    state_page_count = pl.tensor.dim(compress_state_pages, 0)
+    compress_state_flat = pl.reshape(
+        compress_state_pages,
+        [state_page_count * VLLM_COMPRESS_STATE_PAGE_ROWS, COMPRESS_STATE_DIM],
+    )
+
+    commit_workers = pl.min(b_dim, COMMIT_WORKERS)
+    with pl.spmd(
+        commit_workers,
+        name_hint="compress_state_commit_vllm",
+        deps=[pool_tid, late_write_dep],
+    ) as state_commit_tid:
+        worker = pl.tile.get_block_idx()
+        for request in pl.range(worker, b_dim, commit_workers):
+            for step in pl.range(s_dim):
+                token = request * s_dim + step
+                valid = pl.read(token_valid, [token])
+                if valid != 0:
+                    position = pl.read(position_ids, [token])
+                    logical_page = position // VLLM_COMPRESS_STATE_LIVE_ROWS
+                    physical_page_i32 = pl.read(
+                        compress_state_block_table, [request, logical_page],
+                    )
+                    if physical_page_i32 > 0:
+                        physical_page = pl.cast(physical_page_i32, pl.INDEX)
+                        intra = position % VLLM_COMPRESS_STATE_LIVE_ROWS
+                        ape_row = pl.cast(
+                            position % COMPRESS_RATIO, target_type=pl.INDEX,
+                        )
+                        state_row = (
+                            physical_page * VLLM_COMPRESS_STATE_PAGE_ROWS + intra
+                        )
+                        compress_state_flat[
+                            state_row : state_row + 1, 0:OUT_DIM,
+                        ] = kv_proj_pad[token : token + 1, 0:OUT_DIM]
+                        compress_state_flat[
+                            state_row : state_row + 1,
+                            OUT_DIM:COMPRESS_STATE_DIM,
+                        ] = pl.add(
+                            score_proj_pad[token : token + 1, 0:OUT_DIM],
+                            ape[ape_row : ape_row + 1, 0:OUT_DIM],
+                        )
+
+    normed_kv = pl.create_tensor([BS_PAD, HEAD_DIM], dtype=pl.FP32)
+    norm_w_2d = pl.reshape(norm_w, [1, HEAD_DIM])
+    with pl.spmd(
+        rms_blocks,
+        name_hint="rmsnorm_rope_cache_write_vllm",
+        deps=[pool_tid, state_commit_tid],
+        allow_early_resolve=True,
+    ) as cache_write_tid:
+        rms_block = pl.tile.get_block_idx()
+        row_begin = rms_block * RMS_PAD_TILE
+        rows = pl.min(RMS_PAD_TILE, tokens - row_begin)
+        cos_block = pl.slice(
+            cos,
+            [RMS_PAD_TILE, ROPE_HEAD_DIM],
+            [row_begin, 0],
+            valid_shape=[rows, ROPE_HEAD_DIM],
+        )
+        sin_block = pl.slice(
+            sin,
+            [RMS_PAD_TILE, ROPE_HEAD_DIM],
+            [row_begin, 0],
+            valid_shape=[rows, ROPE_HEAD_DIM],
+        )
+        partial_sq = pl.full([1, RMS_PAD_TILE], dtype=pl.FP32, value=0.0)
+        for k0 in pl.range(0, HEAD_DIM, HEAD_TILE):
+            values = pooled_kv[
+                row_begin : row_begin + RMS_PAD_TILE, k0 : k0 + HEAD_TILE
+            ]
+            partial_sq = pl.add(
+                partial_sq,
+                pl.reshape(pl.row_sum(pl.mul(values, values)), [1, RMS_PAD_TILE]),
+            )
+        variance = pl.reshape(
+            pl.add(pl.mul(partial_sq, HEAD_DIM_INV), EPS),
+            [RMS_PAD_TILE, 1],
+        )
+        inv_rms = pl.recip(pl.sqrt(variance))
+        for k0 in pl.range(0, NOPE_HEAD_DIM, HEAD_TILE):
+            values = pooled_kv[
+                row_begin : row_begin + RMS_PAD_TILE, k0 : k0 + HEAD_TILE
+            ]
+            gamma = pl.cast(
+                norm_w_2d[:, k0 : k0 + HEAD_TILE], target_type=pl.FP32,
+            )
+            normed_kv[
+                row_begin : row_begin + RMS_PAD_TILE, k0 : k0 + HEAD_TILE
+            ] = pl.col_expand_mul(pl.row_expand_mul(values, inv_rms), gamma)
+
+        rope_values = pooled_kv[
+            row_begin : row_begin + RMS_PAD_TILE, NOPE_HEAD_DIM:HEAD_DIM
+        ]
+        rope_gamma = pl.cast(
+            norm_w_2d[:, NOPE_HEAD_DIM:HEAD_DIM], target_type=pl.FP32,
+        )
+        rope_normed = pl.col_expand_mul(
+            pl.row_expand_mul(rope_values, inv_rms), rope_gamma,
+        )
+        rope_ones = pl.full(
+            [RMS_PAD_TILE, ROPE_HEAD_DIM], dtype=pl.FP32, value=1.0,
+        )
+        rope_columns = pl.col_expand_mul(
+            rope_ones,
+            pl.cast(
+                pl.arange(0, [1, ROPE_HEAD_DIM], dtype=pl.INT32),
+                target_type=pl.FP32,
+            ),
+        )
+        duplicate = pl.cast(
+            pl.cast(pl.mul(rope_columns, 0.5), target_type=pl.INT32, mode="trunc"),
+            target_type=pl.FP32,
+        )
+        lane = pl.sub(rope_columns, pl.mul(duplicate, 2.0))
+        swap = pl.cast(
+            pl.sub(pl.add(rope_columns, 1.0), pl.mul(lane, 2.0)),
+            target_type=pl.INT32,
+        )
+        rotated = pl.add(
+            pl.mul(rope_normed, cos_block),
+            pl.mul(pl.gather(rope_normed, dim=-1, index=swap), sin_block),
+        )
+        normed_kv[
+            row_begin : row_begin + RMS_PAD_TILE, NOPE_HEAD_DIM:HEAD_DIM
+        ] = rotated
+
+        for inner in pl.range(rows):
+            token = row_begin + inner
+            valid = pl.read(token_valid, [token])
+            position = pl.read(position_ids, [token])
+            if valid != 0 and (position + 1) % COMPRESS_RATIO == 0:
+                request = token // s_dim
+                compressed_row = (position + 1) // COMPRESS_RATIO - 1
+                logical_page = compressed_row // VLLM_KV_PAGE_ROWS
+                physical_page_i32 = pl.read(
+                    cmp_block_table, [request, logical_page],
+                )
+                if physical_page_i32 > 0:
+                    physical_page = pl.cast(physical_page_i32, pl.INDEX)
+                    intra = compressed_row % VLLM_KV_PAGE_ROWS
+                    row = normed_kv[
+                        token : token + 1, 0:HEAD_DIM
+                    ]
+                    kv[token : token + 1, :] = row
+                    cmp_kv_pages[
+                        physical_page : physical_page + 1,
+                        intra : intra + 1,
+                        0:1,
+                        0:HEAD_DIM,
+                    ] = pl.reshape(
+                        pl.cast(row, target_type=pl.BF16, mode="rint"),
+                        [1, 1, 1, HEAD_DIM],
+                    )
+    return cache_write_tid
+
+
+@pl.jit.inline
+def compressor_ratio4_vllm(
+    x: pl.Tensor[[T_DYN, D], pl.BF16],
+    kv: pl.Tensor[[T_DYN, HEAD_DIM], pl.FP32],
+    compress_state_pages: pl.Tensor[
+        [
+            VLLM_COMPRESS_STATE_PAGE_NUM_DYN,
+            VLLM_COMPRESS_STATE_PAGE_ROWS,
+            COMPRESS_STATE_DIM,
+        ],
+        pl.FP32,
+    ],
+    cmp_kv_pages: pl.Tensor[
+        [VLLM_CMP_KV_PAGE_NUM_DYN, VLLM_KV_PAGE_ROWS, 1, HEAD_DIM],
+        pl.BF16,
+    ],
+    compress_state_block_table: pl.Tensor[
+        [B_DYN, VLLM_STATE_TABLE_BLOCKS_DYN], pl.INT32
+    ],
+    wkv: pl.Tensor[[OUT_DIM, D], pl.BF16],
+    wgate: pl.Tensor[[OUT_DIM, D], pl.BF16],
+    ape: pl.Tensor[[COMPRESS_RATIO, OUT_DIM], pl.FP32],
+    norm_w: pl.Tensor[[HEAD_DIM], pl.BF16],
+    cos: pl.Tensor[[T_DYN, ROPE_HEAD_DIM], pl.FP32],
+    sin: pl.Tensor[[T_DYN, ROPE_HEAD_DIM], pl.FP32],
+    cmp_block_table: pl.Tensor[
+        [B_DYN, VLLM_CMP_TABLE_BLOCKS_DYN], pl.INT32
+    ],
+    position_ids: pl.Tensor[[T_DYN], pl.INT32],
+    token_valid: pl.Tensor[[T_DYN], pl.INT32],
+    late_dep: pl.Scalar[pl.TASK_ID],
+    persistent_dep: pl.Scalar[pl.TASK_ID],
+) -> tuple[pl.Tensor, pl.Scalar[pl.TASK_ID], pl.Scalar[pl.TASK_ID]]:
+    """Run the main ratio-4 compressor on vLLM-native pages."""
+    pooled_kv = pl.create_tensor([BS_PAD, HEAD_DIM], dtype=pl.FP32)
+    kv_proj_pad = pl.create_tensor([BS_PAD, OUT_DIM], dtype=pl.FP32)
+    score_proj_pad = pl.create_tensor([BS_PAD, OUT_DIM], dtype=pl.FP32)
+    projection_tid = compressor_ratio4_project(
+        x, wkv, wgate, kv_proj_pad, score_proj_pad, late_dep,
+    )
+    pool_dep = pl.system.task_dummy(deps=[projection_tid, persistent_dep])
+    pool_tid = compressor_ratio4_pool_projected_vllm(
+        compress_state_pages,
+        compress_state_block_table,
+        ape,
+        position_ids,
+        token_valid,
+        pooled_kv,
+        kv_proj_pad,
+        score_proj_pad,
+        pool_dep,
+    )
+    cache_write_tid = compressor_ratio4_cache_write_vllm(
+        kv,
+        pooled_kv,
+        norm_w,
+        cos,
+        sin,
+        compress_state_pages,
+        cmp_kv_pages,
+        cmp_block_table,
+        compress_state_block_table,
+        ape,
+        kv_proj_pad,
+        score_proj_pad,
+        position_ids,
+        token_valid,
+        pool_tid,
+        persistent_dep,
+    )
+    return kv, cache_write_tid, projection_tid
 
 
 @pl.jit.inline

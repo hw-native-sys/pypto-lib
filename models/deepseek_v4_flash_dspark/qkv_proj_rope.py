@@ -267,6 +267,7 @@ def q_proj_qr(
     qr_scale: pl.Tensor[[T_DYN, 1], pl.FP32],
     qr_i8_matmul: pl.Out[pl.Tensor[[QPROJ_T_PAD, Q_LORA], pl.INT8]],
     qr_scale_pad_store: pl.Out[pl.Tensor[[QPROJ_T_PAD, 1], pl.FP32]],
+    completion: pl.Array[1, pl.TASK_ID],
 ):
     """Q LoRA, RMSNorm and quantization -- the half the indexer query chain needs.
 
@@ -282,21 +283,26 @@ def q_proj_qr(
             x_view = pl.reshape(x, [t_dim, D])
             qr_t_matmul = ((tile_rows + QR_M_TILE - 1) // QR_M_TILE) * QR_M_TILE
             qr_full_rows = (tile_rows // QR_DENSE_M_TILE) * QR_DENSE_M_TILE
-            qproj_t_matmul = ((tile_rows + QPROJ_TAIL_M_TILE - 1) // QPROJ_TAIL_M_TILE) * QPROJ_TAIL_M_TILE
 
             # Split-K qr_proj (M=t_dim, K=D=4096, N=Q_LORA=1024): QR_N_TILE N-groups expanded
             # QR_OK-fold into cube blocks that atomic-add their K partials into a zero-seeded
             # output. Seeded on-core, not through create_tensor init_value=0.
             qr_fp32 = pl.create_tensor([qr_t_matmul, Q_LORA], dtype=pl.FP32)
-            with pl.at(level=pl.Level.CORE_GROUP, name_hint="qr_proj_seed"):
+            with pl.at(
+                level=pl.Level.CORE_GROUP, name_hint="qr_proj_seed",
+            ) as qr_seed_tid:
                 for ts0 in pl.range(0, qr_t_matmul, QR_M_TILE):
                     for nseed0 in pl.range(0, Q_LORA, QR_N_TILE):
                         qr_seed = pl.full([QR_M_TILE, QR_N_TILE], dtype=pl.FP32, value=0.0)
                         qr_fp32[ts0 : ts0 + QR_M_TILE, nseed0 : nseed0 + QR_N_TILE] = qr_seed
 
-            for qbg_idx in pl.spmd(
-                (Q_LORA // QR_N_TILE) * QR_OK, name_hint="qr_proj_matmul", allow_early_resolve=True
-            ):
+            with pl.spmd(
+                (Q_LORA // QR_N_TILE) * QR_OK,
+                name_hint="qr_proj_matmul",
+                deps=[qr_seed_tid],
+                allow_early_resolve=True,
+            ) as qr_mm_tid:
+                qbg_idx = pl.tile.get_block_idx()
                 q_a_col0 = (qbg_idx // QR_OK) * QR_N_TILE
                 qr_k_base = (qbg_idx % QR_OK) * QR_SPLIT_K_TILE
                 for dense_t0 in pl.range(0, qr_full_rows, QR_DENSE_M_TILE):
@@ -329,7 +335,13 @@ def q_proj_qr(
 
             # Two passes per block: pass 1 computes amax; pass 2 recomputes norm and quantizes.
             qr_token_tiles = (tile_rows + T_TILE - 1) // T_TILE
-            for tg_idx in pl.spmd(qr_token_tiles, name_hint="qr_rms_norm_quant", allow_early_resolve=True):
+            with pl.spmd(
+                qr_token_tiles,
+                name_hint="qr_rms_norm_quant",
+                deps=[qr_mm_tid],
+                allow_early_resolve=True,
+            ) as qr_quant_tid:
+                tg_idx = pl.tile.get_block_idx()
                 tg = tg_idx * T_TILE
                 valid_rows = pl.min(T_TILE, tile_rows - tg)
                 out_tg = tile_base + tg
@@ -389,6 +401,7 @@ def q_proj_qr(
                             target_memory=pl.MemorySpace.Vec,
                         )
                         pl.store(qr_q_tail, [out_tg, qa], qr_view)
+            completion[0] = qr_quant_tid
 
 
 @pl.jit.inline(auto_scope=False)
@@ -455,12 +468,14 @@ def q_proj_q_dequant(
     q_proj_i32: pl.Tensor[[QPROJ_MM_T_DYN, H * HEAD_DIM], pl.INT32],
     tile_base: pl.Scalar[pl.INDEX],
     tile_rows: pl.Scalar[pl.INDEX],
+    qproj_tid: pl.Scalar[pl.TASK_ID],
 ):
     """Dequantize, normalize, and rotate one projected Q tile."""
     t_dim = pl.tensor.dim(q, 0)
     q_flat = pl.reshape(q, [t_dim, H * HEAD_DIM])
     for dq_worker in pl.spmd(
         Q_DEQUANT_WORKERS, name_hint="qproj_dequant_rms_nope_rope",
+        deps=[qproj_tid],
         allow_early_resolve=True,
     ):
         for dq_work in pl.range(
@@ -624,6 +639,7 @@ def q_proj_q(
             q_proj_q_dequant(
                 wq_b_scale, rope_cos_il, rope_sin_signed, rope_swap_idx, q,
                 qr_scale_pad_store, q_proj_i32, tile_base, tile_rows,
+                _qproj_tid,
             )
     return q
 
@@ -646,8 +662,18 @@ def q_proj_rope(
     qr_i8_matmul = pl.create_tensor([QPROJ_T_PAD, Q_LORA], dtype=pl.INT8)
     # The quant scale rides the qr_i8 -> qproj_matmul -> dequant chain.
     qr_scale_pad_store = pl.create_tensor([QPROJ_T_PAD, 1], dtype=pl.FP32, manual_dep=True)
-    q_proj_qr(x, wq_a, gamma_cq, qr, qr_scale, qr_i8_matmul, qr_scale_pad_store)
-    q_seq_dep = pl.system.task_dummy(deps=[])
+    q_seq_deps = pl.array.create(1, pl.TASK_ID)
+    q_proj_qr(
+        x,
+        wq_a,
+        gamma_cq,
+        qr,
+        qr_scale,
+        qr_i8_matmul,
+        qr_scale_pad_store,
+        q_seq_deps,
+    )
+    q_seq_dep = pl.system.task_dummy(deps=[q_seq_deps[0]])
     q_proj_q(
         x, wq_b, wq_b_scale, rope_cos_il, rope_sin_signed, rope_swap_idx, q,
         qr_i8_matmul, qr_scale_pad_store, q_seq_dep,
@@ -680,7 +706,9 @@ def kv_proj_rope(
             # Split-K kv_proj: KV_N_TILE N-groups expanded KV_OK-fold into cube blocks that
             # atomic-add their K partials into a zero-seeded output.
             kv_fp32 = pl.create_tensor([t_matmul, HEAD_DIM], dtype=pl.FP32)
-            with pl.at(level=pl.Level.CORE_GROUP, name_hint="kv_proj_seed"):
+            with pl.at(
+                level=pl.Level.CORE_GROUP, name_hint="kv_proj_seed",
+            ) as kv_seed_tid:
                 for kts0 in pl.range(0, t_matmul, KV_M_TILE):
                     for kvseed0 in pl.range(0, HEAD_DIM, KV_N_TILE):
                         kv_seed = pl.full([KV_M_TILE, KV_N_TILE], dtype=pl.FP32, value=0.0)
@@ -688,7 +716,9 @@ def kv_proj_rope(
 
             # KV projection consumes the caller's readiness dependency.
             with pl.spmd(
-                (HEAD_DIM // KV_N_TILE) * KV_OK * kv_m_groups, name_hint="kv_proj_matmul", deps=[late_dep],
+                (HEAD_DIM // KV_N_TILE) * KV_OK * kv_m_groups,
+                name_hint="kv_proj_matmul",
+                deps=[late_dep, kv_seed_tid],
             ) as _kv_tid:
                 kbg = pl.tile.get_block_idx()
                 kv_col0 = (kbg // (KV_OK * kv_m_groups)) * KV_N_TILE
@@ -725,11 +755,13 @@ def kv_proj_rope(
             # [KV_RMS_T_TILE, HEAD_DIM] row block. NOPE columns [0:NOPE_DIM) and rope columns
             # [NOPE_DIM:HEAD_DIM) are disjoint, so each task writes a conflict-free row block.
             kv_token_tiles = (tile_rows + KV_RMS_T_TILE - 1) // KV_RMS_T_TILE
-            for tg_idx in pl.spmd(
+            with pl.spmd(
                 kv_token_tiles,
                 name_hint="kv_rms_norm_rope",
+                deps=[_kv_tid],
                 sync_start=True,
             ):
+                tg_idx = pl.tile.get_block_idx()
                 tg = tg_idx * KV_RMS_T_TILE
                 valid_rows = pl.min(KV_RMS_T_TILE, tile_rows - tg)
                 out_tg = tile_base + tg

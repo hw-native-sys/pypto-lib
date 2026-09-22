@@ -26,6 +26,10 @@ B_DYN = pl.dynamic("B_DYN")  # per-request axis (block tables)
 T_DYN = pl.dynamic("T_DYN")  # T = B * S
 ORI_BLOCK_NUM_DYN = pl.dynamic("ORI_BLOCK_NUM_DYN")
 CMP_BLOCK_NUM_DYN = pl.dynamic("CMP_BLOCK_NUM_DYN")
+VLLM_KV_CACHE_PAGE_NUM_DYN = pl.dynamic("VLLM_KV_CACHE_PAGE_NUM_DYN")
+VLLM_CMP_KV_PAGE_NUM_DYN = pl.dynamic("VLLM_CMP_KV_PAGE_NUM_DYN")
+VLLM_ORI_TABLE_WIDTH_DYN = pl.dynamic("VLLM_ORI_TABLE_WIDTH_DYN")
+VLLM_CMP_TABLE_WIDTH_DYN = pl.dynamic("VLLM_CMP_TABLE_WIDTH_DYN")
 
 # model config
 B = DECODE_BATCH // TP
@@ -48,6 +52,7 @@ HEADS_PER_GROUP = H // O_GROUPS
 O_GROUP_IN = HEADS_PER_GROUP * HEAD_DIM
 COMPRESS_RATIO = 4
 COMPRESS_RATIO_INV = 1.0 / COMPRESS_RATIO
+VLLM_PAGE_ROWS = 128
 CSA_CMP_GE_BIAS = 1.0  # raw + 1, folded for the ge clamp
 NEG_INF = -1.0e20
 
@@ -106,15 +111,17 @@ if T % ATTENTION_PUBLISH_T_TILE != 0:
 @pl.jit.inline(auto_scope=False)
 def sparse_attn_csa(
     q: pl.Tensor[[T_DYN, H, HEAD_DIM], pl.BF16],
-    ori_kv: pl.Tensor[[ORI_BLOCK_NUM_DYN, BLOCK_SIZE, 1, HEAD_DIM], pl.BF16],
+    ori_kv: pl.Tensor,
     window_swa_indices: pl.Tensor[[T_DYN, WIN], pl.INT32],
-    cmp_kv: pl.Tensor[[CMP_BLOCK_NUM_DYN, BLOCK_SIZE, 1, HEAD_DIM], pl.BF16],
-    cmp_block_table: pl.Tensor[[B_DYN, CMP_MAX_BLOCKS], pl.INT32],
+    cmp_kv: pl.Tensor,
+    cmp_block_table: pl.Tensor,
     idx_topk: pl.Tensor[[T_DYN, IDX_TOPK], pl.INT32],
     position_ids: pl.Tensor[[T_DYN, 1], pl.INT32],
     attn_sink: pl.Tensor[[H], pl.FP32],
     freqs_cos: pl.Tensor[[T_DYN, ROPE_DIM], pl.BF16],
     freqs_sin: pl.Tensor[[T_DYN, ROPE_DIM], pl.BF16],
+    plan_dep: pl.Scalar[pl.TASK_ID],
+    page_rows: pl.constexpr,
 ):
     """Plan and run CSA QK/PV over sparse blocks, and build inverse-RoPE metadata."""
     # Compressed index contract.
@@ -122,8 +129,9 @@ def sparse_attn_csa(
     t_dim = pl.tensor.dim(q, 0)
     t_heads = t_dim * H
     rope_cs_blocks = t_dim // ROPE_CS_T_TILE
-    ori_kv_flat = pl.reshape(ori_kv, [ori_block_num * BLOCK_SIZE, HEAD_DIM])
-
+    ori_kv_flat = pl.reshape(
+        ori_kv, [ori_block_num * page_rows, HEAD_DIM],
+    )
     # pypto-lib#481 original-cache WAR marker.
     with pl.at(level=pl.Level.CORE_GROUP, name_hint="kv_touch", allow_early_resolve=True):
         ori_kv_flat[0:1, 0:HEAD_DIM] = ori_kv_flat[0:1, 0:HEAD_DIM]
@@ -135,7 +143,12 @@ def sparse_attn_csa(
     # Every token tile is independent: it reads its own idx_topk / position_ids /
     # window_swa_indices rows and writes its own cmp_sparse_indices, valid_block_mask
     # and sparse_bias rows, so the tiles spread over lanes instead of one core.
-    with pl.spmd(CSA_PLAN_WORKERS, name_hint="csa_slots_build_valid_qk_plan", allow_early_resolve=True) as qk_plan_tid:
+    with pl.spmd(
+        CSA_PLAN_WORKERS,
+        name_hint="csa_slots_build_valid_qk_plan",
+        deps=[plan_dep],
+        allow_early_resolve=True,
+    ) as qk_plan_tid:
         plan_worker = pl.tile.get_block_idx()
         # Valid compressed slots.
         for bias_t0 in pl.range(plan_worker * BIAS_T_TILE, t_dim, CSA_PLAN_WORKERS * BIAS_T_TILE):
@@ -178,7 +191,9 @@ def sparse_attn_csa(
 
     # QK/PV scratch tensors.
     cmp_block_num = pl.tensor.dim(cmp_kv, 0)
-    cmp_kv_flat = pl.reshape(cmp_kv, [cmp_block_num * BLOCK_SIZE, HEAD_DIM])
+    cmp_kv_flat = pl.reshape(
+        cmp_kv, [cmp_block_num * page_rows, HEAD_DIM],
+    )
     q_flat = pl.reshape(q, [t_heads, HEAD_DIM])
     attn_sink_col = pl.reshape(attn_sink, [H, 1])
     attn_mi = pl.create_tensor([t_heads, 1], dtype=pl.FP32)
@@ -286,11 +301,28 @@ def sparse_attn_csa(
                                     if qk_cmp_k < CMP_TOPK:
                                         qk_ridx = pl.read(cmp_sparse_indices, [qk_t, qk_cmp_k])
                                         if qk_ridx >= 0:
-                                            qk_page = pl.cast(pl.read(cmp_block_table, [qk_b, qk_ridx // BLOCK_SIZE]), pl.INDEX)
-                                            qk_src = qk_page * BLOCK_SIZE + qk_ridx % BLOCK_SIZE
-                                            qk_kv_half = pl.gather_row(
-                                                qk_kv_half, cmp_kv_flat, [qk_row, 0], [qk_src, 0], [1, HEAD_DIM],
+                                            qk_page_i32 = pl.read(
+                                                cmp_block_table,
+                                                [qk_b, qk_ridx // page_rows],
                                             )
+                                            qk_page_valid = qk_page_i32 >= 0
+                                            if page_rows == VLLM_PAGE_ROWS:
+                                                qk_page_valid = qk_page_i32 > 0
+                                            if qk_page_valid:
+                                                qk_page = pl.cast(
+                                                    qk_page_i32, pl.INDEX,
+                                                )
+                                                qk_src = (
+                                                    qk_page * page_rows
+                                                    + qk_ridx % page_rows
+                                                )
+                                                qk_kv_half = pl.gather_row(
+                                                    qk_kv_half,
+                                                    cmp_kv_flat,
+                                                    [qk_row, 0],
+                                                    [qk_src, 0],
+                                                    [1, HEAD_DIM],
+                                                )
                             pl.store(qk_kv_half, [qk_kv_row + qk_lane_kv, 0], kv_transfer)
                     if qk_tick > 0 and qk_tick <= SPARSE_BLOCKS:
                         softmax_sb = qk_tick - 1
@@ -402,9 +434,9 @@ def sparse_attn_csa(
 @pl.jit.inline
 def sparse_attn_csa_tp1(
     q: pl.Tensor[[T_DYN, H, HEAD_DIM], pl.BF16],
-    ori_kv: pl.Tensor[[ORI_BLOCK_NUM_DYN, BLOCK_SIZE, 1, HEAD_DIM], pl.BF16],
+    ori_kv: pl.Tensor,
     window_swa_indices: pl.Tensor[[T_DYN, WIN], pl.INT32],
-    cmp_kv: pl.Tensor[[CMP_BLOCK_NUM_DYN, BLOCK_SIZE, 1, HEAD_DIM], pl.BF16],
+    cmp_kv: pl.Tensor,
     cmp_block_table: pl.Tensor[[B_DYN, CMP_MAX_BLOCKS], pl.INT32],
     idx_topk: pl.Tensor[[T_DYN, IDX_TOPK], pl.INT32],
     position_ids: pl.Tensor[[T_DYN, 1], pl.INT32],
@@ -412,7 +444,12 @@ def sparse_attn_csa_tp1(
     freqs_cos: pl.Tensor[[T_DYN, ROPE_DIM], pl.BF16],
     freqs_sin: pl.Tensor[[T_DYN, ROPE_DIM], pl.BF16],
     o_packed_heads: pl.Tensor[[O_GROUPS * T_PAD, O_GROUP_IN], pl.BF16],
-) -> tuple[pl.Tensor, pl.Scalar[pl.TASK_ID]]:
+    plan_dep: pl.Scalar[pl.TASK_ID],
+    page_rows: pl.constexpr,
+) -> tuple[
+    pl.Tensor[[O_GROUPS * T_PAD, O_GROUP_IN], pl.BF16],
+    pl.Scalar[pl.TASK_ID],
+]:
     """Write CSA heads as ``[group, T_PAD, O_GROUP_IN]`` slabs.
 
     Only the first runtime ``t_dim`` rows in each group are valid. The
@@ -426,6 +463,7 @@ def sparse_attn_csa_tp1(
         q, ori_kv, window_swa_indices,
         cmp_kv, cmp_block_table, idx_topk,
         position_ids, attn_sink, freqs_cos, freqs_sin,
+        plan_dep, page_rows,
     )
     t_dim = pl.tensor.dim(q, 0)
 
@@ -477,6 +515,87 @@ def sparse_attn_csa_tp1(
     return o_packed_heads, merge_tid
 
 
+@pl.jit.inline
+def sparse_attn_csa_tp1_vllm(
+    q: pl.Tensor[[T_DYN, H, HEAD_DIM], pl.BF16],
+    kv_cache_pages: pl.Tensor[
+        [VLLM_KV_CACHE_PAGE_NUM_DYN, VLLM_PAGE_ROWS, 1, HEAD_DIM], pl.BF16
+    ],
+    ori_block_table: pl.Tensor[
+        [B_DYN, VLLM_ORI_TABLE_WIDTH_DYN], pl.INT32
+    ],
+    cmp_kv_pages: pl.Tensor[
+        [VLLM_CMP_KV_PAGE_NUM_DYN, VLLM_PAGE_ROWS, 1, HEAD_DIM], pl.BF16
+    ],
+    cmp_block_table: pl.Tensor[
+        [B_DYN, VLLM_CMP_TABLE_WIDTH_DYN], pl.INT32
+    ],
+    idx_topk: pl.Tensor[[T_DYN, IDX_TOPK], pl.INT32],
+    position_ids: pl.Tensor[[T_DYN, 1], pl.INT32],
+    token_valid: pl.Tensor[[T_DYN], pl.INT32],
+    attn_sink: pl.Tensor[[H], pl.FP32],
+    freqs_cos: pl.Tensor[[T_DYN, ROPE_DIM], pl.BF16],
+    freqs_sin: pl.Tensor[[T_DYN, ROPE_DIM], pl.BF16],
+    o_packed_heads: pl.Tensor[[O_GROUPS * T_PAD, O_GROUP_IN], pl.BF16],
+    ready_dep: pl.Scalar[pl.TASK_ID],
+) -> tuple[
+    pl.Tensor[[O_GROUPS * T_PAD, O_GROUP_IN], pl.BF16],
+    pl.Scalar[pl.TASK_ID],
+]:
+    """Run CSA on raw and compressed blocks from separate vLLM page pools."""
+    t_dim = pl.tensor.dim(q, 0)
+    window_indices = pl.create_tensor([t_dim, WIN], dtype=pl.INT32)
+    with pl.spmd(
+        CSA_PLAN_WORKERS,
+        name_hint="csa_vllm_window_plan",
+        deps=[ready_dep],
+        allow_early_resolve=True,
+    ) as window_plan_tid:
+        worker = pl.tile.get_block_idx()
+        for token in pl.range(worker, t_dim, CSA_PLAN_WORKERS):
+            request = token // S
+            position = pl.cast(pl.read(position_ids, [token, 0]), pl.INDEX)
+            valid = pl.read(token_valid, [token])
+            window_len = pl.min(position + 1, WIN)
+            window_begin = position - window_len + 1
+            for column in pl.range(WIN):
+                physical_row = -1
+                if valid > 0 and column < window_len:
+                    logical_row = window_begin + column
+                    logical_page = logical_row // VLLM_PAGE_ROWS
+                    page_i32 = pl.read(
+                        ori_block_table, [request, logical_page],
+                    )
+                    if page_i32 > 0:
+                        page = pl.cast(page_i32, pl.INDEX)
+                        physical_row = (
+                            page * VLLM_PAGE_ROWS
+                            + logical_row % VLLM_PAGE_ROWS
+                        )
+                pl.write(
+                    window_indices,
+                    [token, column],
+                    pl.cast(physical_row, pl.INT32),
+                )
+
+    output, completion = sparse_attn_csa_tp1(
+        q,
+        kv_cache_pages,
+        window_indices,
+        cmp_kv_pages,
+        cmp_block_table,
+        idx_topk,
+        position_ids,
+        attn_sink,
+        freqs_cos,
+        freqs_sin,
+        o_packed_heads,
+        window_plan_tid,
+        VLLM_PAGE_ROWS,
+    )
+    return output, completion
+
+
 @pl.jit
 def sparse_attn_csa_test(
     q: pl.Tensor[[T_DYN, H, HEAD_DIM], pl.BF16],
@@ -500,11 +619,14 @@ def sparse_attn_csa_test(
     freqs_sin.bind_dynamic(0, T_DYN)
 
     o_packed_flat = pl.reshape(o_packed_heads, [O_GROUPS * T_PAD, O_GROUP_IN])
+    plan_dep = pl.system.task_dummy(deps=[])
     o_packed_flat, _ = sparse_attn_csa_tp1(
         q, ori_kv, window_swa_indices,
         cmp_kv, cmp_block_table, idx_topk,
         position_ids, attn_sink, freqs_cos, freqs_sin,
         o_packed_flat,
+        plan_dep,
+        BLOCK_SIZE,
     )
     return o_packed_heads
 
