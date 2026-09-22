@@ -9,8 +9,8 @@
 """V4.1 EP8 transport migrated from V4-Pro and Flash-MTP.
 
 Each function documents its migration source; the data layout follows V4-Pro and the
-signal layout is the [EP, 1] form required by issue #1205, with TP-owner filtering
-applied in the dispatch-count and payload stages.
+signal layout is the [EP, 1] form required by issue #1205. The transport expects one
+unique local token shard per rank and does not perform Attention-TP owner filtering.
 """
 import pypto.language as pl
 import pypto.language.distributed as pld
@@ -53,7 +53,6 @@ def dispatch(
     recv_routes: pld.DistributedTensor[[N_LOCAL * RECV_MAX, IDX_PAD], pl.INT32],
     arrived: pld.DistributedTensor[[N_RANKS, 1], pl.INT32],
     data_arrived: pld.DistributedTensor[[N_RANKS, 1], pl.INT32],
-    token_owners: pl.Tensor[[T], pl.INT32],
     num_tokens: pl.Scalar[pl.INT32],
     my_rank: pl.Scalar[pl.INT32],
     moe_epoch: pl.Scalar[pl.INT32],
@@ -111,19 +110,17 @@ def dispatch(
         if active_tokens > T:
             active_tokens = pl.cast(T, pl.INDEX)
         for t in pl.range(active_tokens):
-            is_owner = pl.read(token_owners, [t]) == my_rank
             for k in pl.range(TOPK):
-                if is_owner:
-                    r = t * TOPK + k
-                    aux_tile = pl.tile.full([1, AUX_PAD], dtype=pl.FP32, value=0.0)
-                    aux_weight = pl.read(weights, [t, k])
-                    pl.tile.write(aux_tile, [0, AUX_W], aux_weight)
-                    pl.store(aux_tile, [r, 0], aux_src)
+                r = t * TOPK + k
+                aux_tile = pl.tile.full([1, AUX_PAD], dtype=pl.FP32, value=0.0)
+                aux_weight = pl.read(weights, [t, k])
+                pl.tile.write(aux_tile, [0, AUX_W], aux_weight)
+                pl.store(aux_tile, [r, 0], aux_src)
 
-                    route_tile = pl.tile.full([1, IDX_PAD], dtype=pl.INT32, value=0)
-                    route_index = pl.cast(r, pl.INT32)
-                    pl.tile.write(route_tile, [0, 0], route_index)
-                    pl.store(route_tile, [r, 0], route_src)
+                route_tile = pl.tile.full([1, IDX_PAD], dtype=pl.INT32, value=0)
+                route_index = pl.cast(r, pl.INT32)
+                pl.tile.write(route_tile, [0, 0], route_index)
+                pl.store(route_tile, [r, 0], route_src)
             for group in pl.range(K_SCALE):
                 scale = pl.read(
                     x_norm_scale_physical,
@@ -151,13 +148,11 @@ def dispatch(
             for e in pl.range(N_LOCAL):
                 cursor[d * N_LOCAL + e] = 0
         for t in pl.range(active_tokens):
-            is_owner = pl.read(token_owners, [t]) == my_rank
             for k in pl.range(TOPK):
-                if is_owner:
-                    eid = pl.read(indices, [t, k])
-                    dst = eid // N_LOCAL
-                    loc_e = eid - dst * N_LOCAL
-                    cursor[dst * N_LOCAL + loc_e] = cursor[dst * N_LOCAL + loc_e] + 1
+                eid = pl.read(indices, [t, k])
+                dst = eid // N_LOCAL
+                loc_e = eid - dst * N_LOCAL
+                cursor[dst * N_LOCAL + loc_e] = cursor[dst * N_LOCAL + loc_e] + 1
 
         # Publish one complete metadata tile per destination: metadata is a tile
         # remote_store, not a sequence of scalar puts, so each destination observes
@@ -214,34 +209,32 @@ def dispatch(
         e_lane_base = loc_e * RECV_MAX + my_rank * MAX_PER_SRC
 
         for t in pl.range(active_tokens):
-            is_owner = pl.read(token_owners, [t]) == my_rank
             for k in pl.range(TOPK):
-                if is_owner:
-                    eid = pl.read(indices, [t, k])
-                    dst = eid // N_LOCAL
-                    le = eid - dst * N_LOCAL
-                    if le == loc_e:
-                        slot = slot_ctr[dst]
-                        slot_ctr[dst] = slot + 1
-                        # lane (loc_e, my_rank, slot) on peer=dst
-                        row = e_lane_base + slot
-                        r_route = t * TOPK + k
-                        pld.tensor.put(
-                            dst=recv_x, peer=dst, src=x_norm_mx_raw,
-                            dst_offsets=[row, 0], src_offsets=[t, 0], shape=[1, D],
-                        )
-                        pld.tensor.put(
-                            dst=recv_scale, peer=dst, src=scale_src,
-                            dst_offsets=[row, 0], src_offsets=[t, 0], shape=[1, K_SCALE],
-                        )
-                        pld.tensor.put(
-                            dst=recv_weights, peer=dst, src=aux_src,
-                            dst_offsets=[row, 0], src_offsets=[r_route, 0], shape=[1, AUX_PAD],
-                        )
-                        pld.tensor.put(
-                            dst=recv_routes, peer=dst, src=route_src,
-                            dst_offsets=[row, 0], src_offsets=[r_route, 0], shape=[1, IDX_PAD],
-                        )
+                eid = pl.read(indices, [t, k])
+                dst = eid // N_LOCAL
+                le = eid - dst * N_LOCAL
+                if le == loc_e:
+                    slot = slot_ctr[dst]
+                    slot_ctr[dst] = slot + 1
+                    # lane (loc_e, my_rank, slot) on peer=dst
+                    row = e_lane_base + slot
+                    r_route = t * TOPK + k
+                    pld.tensor.put(
+                        dst=recv_x, peer=dst, src=x_norm_mx_raw,
+                        dst_offsets=[row, 0], src_offsets=[t, 0], shape=[1, D],
+                    )
+                    pld.tensor.put(
+                        dst=recv_scale, peer=dst, src=scale_src,
+                        dst_offsets=[row, 0], src_offsets=[t, 0], shape=[1, K_SCALE],
+                    )
+                    pld.tensor.put(
+                        dst=recv_weights, peer=dst, src=aux_src,
+                        dst_offsets=[row, 0], src_offsets=[r_route, 0], shape=[1, AUX_PAD],
+                    )
+                    pld.tensor.put(
+                        dst=recv_routes, peer=dst, src=route_src,
+                        dst_offsets=[row, 0], src_offsets=[r_route, 0], shape=[1, IDX_PAD],
+                    )
 
         # Publish this block's epoch only after its self-draining payload puts.
         # One cache-line-padded slot per source/block avoids shared-word and
@@ -325,7 +318,6 @@ def combine(
     recv_meta_local: pl.Tensor[[N_RANKS, N_LOCAL], pl.INT32],
     routed_output: pld.DistributedTensor[[T * TOPK, D], pl.BF16],
     combine_arrived: pld.DistributedTensor[[N_RANKS, 1], pl.INT32],
-    token_owners: pl.Tensor[[T], pl.INT32],
     num_tokens: pl.Scalar[pl.INT32],
     my_rank: pl.Scalar[pl.INT32],
     moe_epoch: pl.Scalar[pl.INT32],
@@ -370,11 +362,10 @@ def combine(
     # ffn_out[t] = sh[t] + Sigma_k routed_output[t*TOPK+k]. The wait orders
     # remote payload publication; routed_output rides pl.no_dep, so this rank's
     # own puts are ordered by the _cscatter_tid -> _cwait_tid -> _reduce_tid chain.
-    # Accumulate the shared-expert and TOP-K routed results per token; only the owner
-    # rank writes the replicated rows back.
+    # Accumulate the shared-expert and TOP-K routed results for every local token.
     with pl.spmd(T, name_hint="combine_reduce", deps=[_cwait_tid]) as _reduce_tid:
         t = pl.tile.get_block_idx()
-        if t < num_tokens and pl.read(token_owners, [t]) == my_rank:
+        if t < num_tokens:
             acc = pl.cast(pl.load(shared_output, [t, 0], [1, D]), target_type=pl.FP32)
             for k in pl.range(TOPK):
                 acc = pl.add(acc, pl.cast(pl.load(routed_output, [t * TOPK + k, 0], [1, D]), target_type=pl.FP32))
@@ -386,7 +377,7 @@ def combine(
 # Standalone transport tests
 # ---------------------------------------------------------------------------
 # Dispatch checks the packed receive buffers; combine checks route scatter and
-# owner-side reduction.
+# source-rank reduction.
 
 
 @pl.jit
@@ -395,7 +386,6 @@ def dispatch_test(
     x_norm_mx: pl.Tensor[[T, D], pl.FP8E4M3FN],
     x_norm_scale: pl.Tensor[[1, T * K_SCALE], pl.FP8E8M0],
     weights: pl.Tensor[[T, TOPK], pl.FP32],
-    token_owners: pl.Tensor[[T], pl.INT32],
     recv_x_out: pl.Out[pl.Tensor[[N_LOCAL, RECV_MAX, D], pl.FP8E4M3FN]],
     recv_scale_out: pl.Out[
         pl.Tensor[[1, N_LOCAL * RECV_MAX * K_SCALE], pl.FP8E8M0]
@@ -415,17 +405,18 @@ def dispatch_test(
     ],
     arrived: pld.DistributedTensor[[N_RANKS, 1], pl.INT32],
     data_arrived: pld.DistributedTensor[[N_RANKS, 1], pl.INT32],
-    num_tokens: pl.Scalar[pl.INT32],
+    num_tokens: pl.Tensor[[N_RANKS], pl.INT32],
     my_rank: pl.Scalar[pl.INT32],
     moe_epoch: pl.Scalar[pl.INT32],
 ):
+    local_num_tokens = pl.read(num_tokens, [my_rank])
     dispatch(
         indices, x_norm_mx, x_norm_scale, weights,
         recv_x_out, recv_scale_out, recv_weight_out, recv_route_out,
         recv_count_out, recv_meta_local,
         recv_meta, recv_x, recv_scale, recv_weights, recv_routes,
-        arrived, data_arrived, token_owners,
-        num_tokens, my_rank, moe_epoch,
+        arrived, data_arrived,
+        local_num_tokens, my_rank, moe_epoch,
     )
     return (
         recv_x_out, recv_scale_out, recv_weight_out, recv_route_out,
@@ -439,7 +430,6 @@ def l3_dispatch(
     x_norm_mx: pl.Tensor[[N_RANKS, T, D], pl.FP8E4M3FN],
     x_norm_scale: pl.Tensor[[N_RANKS, 1, T * K_SCALE], pl.FP8E8M0],
     weights: pl.Tensor[[N_RANKS, T, TOPK], pl.FP32],
-    token_owners: pl.Tensor[[T], pl.INT32],
     recv_x_out: pl.Out[
         pl.Tensor[[N_RANKS, N_LOCAL, RECV_MAX, D], pl.FP8E4M3FN]
     ],
@@ -458,7 +448,7 @@ def l3_dispatch(
     recv_meta_local: pl.Out[
         pl.Tensor[[N_RANKS, N_RANKS, N_LOCAL], pl.INT32]
     ],
-    num_tokens: pl.Scalar[pl.INT32],
+    num_tokens: pl.Tensor[[N_RANKS], pl.INT32],
     moe_epoch: pl.Scalar[pl.INT32],
 ):
     recv_meta_buf = pld.alloc_window_buffer([N_RANKS, N_LOCAL], dtype=pl.INT32)
@@ -503,7 +493,6 @@ def l3_dispatch(
         )
         dispatch_test(
             indices[r], x_norm_mx[r], x_norm_scale[r], weights[r],
-            token_owners,
             recv_x_out[r], recv_scale_out[r], recv_weight_out[r],
             recv_route_out[r], recv_count_out[r], recv_meta_local[r],
             recv_meta, recv_x, recv_scale, recv_weights, recv_routes,
@@ -518,18 +507,18 @@ def combine_test(
     recv_route_out: pl.Tensor[[N_LOCAL, RECV_MAX], pl.INT32],
     shared_output: pl.Tensor[[T, D], pl.BF16],
     recv_meta_local: pl.Tensor[[N_RANKS, N_LOCAL], pl.INT32],
-    token_owners: pl.Tensor[[T], pl.INT32],
     ffn_out: pl.Out[pl.Tensor[[T, D], pl.BF16]],
     routed_output: pld.DistributedTensor[[N_ROUTES, D], pl.BF16],
     combine_arrived: pld.DistributedTensor[[N_RANKS, 1], pl.INT32],
-    num_tokens: pl.Scalar[pl.INT32],
+    num_tokens: pl.Tensor[[N_RANKS], pl.INT32],
     my_rank: pl.Scalar[pl.INT32],
     moe_epoch: pl.Scalar[pl.INT32],
 ):
+    local_num_tokens = pl.read(num_tokens, [my_rank])
     combine(
         recv_y, recv_route_out, shared_output, ffn_out, recv_meta_local,
-        routed_output, combine_arrived, token_owners,
-        num_tokens, my_rank, moe_epoch,
+        routed_output, combine_arrived,
+        local_num_tokens, my_rank, moe_epoch,
     )
     return ffn_out
 
@@ -540,9 +529,8 @@ def l3_combine(
     recv_route_out: pl.Tensor[[N_RANKS, N_LOCAL, RECV_MAX], pl.INT32],
     shared_output: pl.Tensor[[N_RANKS, T, D], pl.BF16],
     recv_meta_local: pl.Tensor[[N_RANKS, N_RANKS, N_LOCAL], pl.INT32],
-    token_owners: pl.Tensor[[T], pl.INT32],
     ffn_out: pl.Out[pl.Tensor[[N_RANKS, T, D], pl.BF16]],
-    num_tokens: pl.Scalar[pl.INT32],
+    num_tokens: pl.Tensor[[N_RANKS], pl.INT32],
     moe_epoch: pl.Scalar[pl.INT32],
 ):
     routed_output_buf = pld.alloc_window_buffer([N_ROUTES, D], dtype=pl.BF16)
@@ -556,7 +544,7 @@ def l3_combine(
         )
         combine_test(
             recv_y[r], recv_route_out[r], shared_output[r],
-            recv_meta_local[r], token_owners, ffn_out[r],
+            recv_meta_local[r], ffn_out[r],
             routed_output, combine_arrived,
             num_tokens, r, moe_epoch,
             device=r,
@@ -590,18 +578,43 @@ def _unpack_a_scale(packed_codes):
 
 
 def _transport_routes(num_tokens):
-    """Create one deterministic global route table for every source rank."""
+    """Create one deterministic route table for every source rank.
+
+    ``num_tokens`` may be a scalar (broadcast to all sources) or a length-
+    ``N_RANKS`` sequence.  The latter is the public EP fixture ABI: each rank
+    owns a possibly different local prefix, including an empty prefix.
+    """
     import torch
 
+    counts = _normalise_counts(num_tokens)
     routes = torch.zeros(N_RANKS, T, TOPK, dtype=torch.int32)
     for src in range(N_RANKS):
-        for t in range(num_tokens):
+        for t in range(int(counts[src])):
             for k in range(TOPK):
                 route = t * TOPK + k
                 dst = route % N_RANKS
                 local_e = (route // N_RANKS) % N_LOCAL
                 routes[src, t, k] = dst * N_LOCAL + local_e
     return routes
+
+
+def _normalise_counts(value):
+    """Return validated per-source local token counts as an int32 tensor."""
+    import torch
+
+    counts = torch.as_tensor(value, dtype=torch.int32).reshape(-1)
+    if counts.numel() == 1:
+        counts = counts.repeat(N_RANKS)
+    if counts.numel() != N_RANKS:
+        raise ValueError(
+            f"num_tokens must be a scalar or contain {N_RANKS} counts, "
+            f"got shape {tuple(counts.shape)}"
+        )
+    if bool((counts < 0).any()) or bool((counts > T).any()):
+        raise ValueError(
+            f"num_tokens values must be in [0, {T}], got {counts.tolist()}"
+        )
+    return counts.contiguous()
 
 
 def _exact_compare(actual, expected, **_kwargs):
@@ -631,8 +644,8 @@ def build_dispatch_specs(num_tokens=T):
     from golden.spec import ScalarSpec, TensorSpec
     pack_a_scale = _pack_a_scale
 
-    active = max(0, min(T, int(num_tokens)))
-    routes = _transport_routes(active)
+    counts = _normalise_counts(num_tokens)
+    routes = _transport_routes(counts)
     x = (torch.randn(N_RANKS, T, D) * 0.25).to(torch.float8_e4m3fn)
     scale_logical = torch.full(
         (N_RANKS * T, K_SCALE), 127, dtype=torch.uint8
@@ -643,8 +656,6 @@ def build_dispatch_specs(num_tokens=T):
     weights = torch.linspace(
         0.25, 1.0, steps=N_RANKS * T * TOPK, dtype=torch.float32
     ).reshape(N_RANKS, T, TOPK)
-    owners = torch.arange(T, dtype=torch.int32) % N_RANKS
-
     return [
         TensorSpec("indices", [N_RANKS, T, TOPK], torch.int32,
                    init_value=lambda: routes),
@@ -654,8 +665,6 @@ def build_dispatch_specs(num_tokens=T):
                    torch.float8_e8m0fnu, init_value=lambda: scale),
         TensorSpec("weights", [N_RANKS, T, TOPK], torch.float32,
                    init_value=lambda: weights),
-        TensorSpec("token_owners", [T], torch.int32,
-                   init_value=lambda: owners),
         TensorSpec("recv_x_out", [N_RANKS, N_LOCAL, RECV_MAX, D],
                    torch.float8_e4m3fn),
         TensorSpec("recv_scale_out",
@@ -668,7 +677,8 @@ def build_dispatch_specs(num_tokens=T):
         TensorSpec("recv_count_out", [N_RANKS, N_LOCAL, 1], torch.int32),
         TensorSpec("recv_meta_local", [N_RANKS, N_RANKS, N_LOCAL],
                    torch.int32),
-        ScalarSpec("num_tokens", torch.int32, active),
+        TensorSpec("num_tokens", [N_RANKS], torch.int32,
+                   init_value=lambda: counts),
         ScalarSpec("moe_epoch", torch.int32, 1, compile_runtime=True,
                    benchmark_step=1),
     ]
@@ -680,9 +690,8 @@ def golden_dispatch(tensors):
     pack_a_scale = _pack_a_scale
     unpack_a_scale = _unpack_a_scale
 
-    active = max(0, min(T, int(tensors["num_tokens"])))
+    counts = _normalise_counts(tensors["num_tokens"])
     indices = tensors["indices"].to(torch.int64)
-    owners = tensors["token_owners"].to(torch.int64)
     x = tensors["x_norm_mx"]
     weights = tensors["weights"]
     scale_bytes = tensors["x_norm_scale"].view(torch.uint8).reshape(
@@ -708,9 +717,8 @@ def golden_dispatch(tensors):
     cursors = torch.zeros(N_RANKS, N_RANKS, N_LOCAL, dtype=torch.int32)
 
     for src in range(N_RANKS):
+        active = int(counts[src])
         for t in range(active):
-            if int(owners[t]) != src:
-                continue
             for k in range(TOPK):
                 route = t * TOPK + k
                 expert = int(indices[src, t, k])
@@ -743,9 +751,8 @@ def build_combine_specs(num_tokens=T):
 
     from golden.spec import ScalarSpec, TensorSpec
 
-    active = max(0, min(T, int(num_tokens)))
-    indices = _transport_routes(active)
-    owners = torch.arange(T, dtype=torch.int32) % N_RANKS
+    counts = _normalise_counts(num_tokens)
+    indices = _transport_routes(counts)
     recv_y = torch.zeros(
         N_RANKS, N_LOCAL, RECV_MAX, D, dtype=torch.bfloat16
     )
@@ -755,9 +762,8 @@ def build_combine_specs(num_tokens=T):
     meta = torch.zeros(N_RANKS, N_RANKS, N_LOCAL, dtype=torch.int32)
     cursors = torch.zeros(N_RANKS, N_RANKS, N_LOCAL, dtype=torch.int32)
     for src in range(N_RANKS):
+        active = int(counts[src])
         for t in range(active):
-            if int(owners[t]) != src:
-                continue
             for k in range(TOPK):
                 route = t * TOPK + k
                 expert = int(indices[src, t, k])
@@ -773,6 +779,7 @@ def build_combine_specs(num_tokens=T):
 
     shared = torch.zeros(N_RANKS, T, D, dtype=torch.bfloat16)
     for r in range(N_RANKS):
+        active = int(counts[r])
         for t in range(active):
             shared[r, t] = 0.5 * (t + 1)
 
@@ -785,10 +792,9 @@ def build_combine_specs(num_tokens=T):
                    init_value=lambda: shared),
         TensorSpec("recv_meta_local", [N_RANKS, N_RANKS, N_LOCAL],
                    torch.int32, init_value=lambda: meta),
-        TensorSpec("token_owners", [T], torch.int32,
-                   init_value=lambda: owners),
         TensorSpec("ffn_out", [N_RANKS, T, D], torch.bfloat16),
-        ScalarSpec("num_tokens", torch.int32, active),
+        TensorSpec("num_tokens", [N_RANKS], torch.int32,
+                   init_value=lambda: counts),
         ScalarSpec("moe_epoch", torch.int32, 1, compile_runtime=True,
                    benchmark_step=1),
     ]
@@ -797,8 +803,7 @@ def build_combine_specs(num_tokens=T):
 def golden_combine(tensors):
     import torch
 
-    active = max(0, min(T, int(tensors["num_tokens"])))
-    owners = tensors["token_owners"].to(torch.int64)
+    counts = _normalise_counts(tensors["num_tokens"])
     shared = tensors["shared_output"].float()
     recv_y = tensors["recv_y"].float()
     recv_route = tensors["recv_route_out"].to(torch.int64)
@@ -815,9 +820,8 @@ def golden_combine(tensors):
                 base += count
     out = torch.zeros(N_RANKS, T, D, dtype=torch.bfloat16)
     for src in range(N_RANKS):
+        active = int(counts[src])
         for t in range(active):
-            if int(owners[t]) != src:
-                continue
             value = shared[src, t].clone()
             for k in range(TOPK):
                 value += routed[src, t * TOPK + k]
@@ -841,10 +845,17 @@ def _run_one_test(kind, args):
             device_ids=device_ids, num_sub_workers=0
         ),
     )
+    counts = args.num_tokens
+    if args.num_tokens_per_rank is not None:
+        try:
+            counts = [int(value) for value in args.num_tokens_per_rank.split(",")]
+        except ValueError as exc:
+            raise ValueError("--num-tokens-per-rank must be comma-separated integers") from exc
+    counts = _normalise_counts(counts)
     if kind == "dispatch":
         result = run(
             fn=l3_dispatch,
-            specs=build_dispatch_specs(args.num_tokens),
+            specs=build_dispatch_specs(counts),
             golden_fn=golden_dispatch,
             compile_only=args.compile_only,
             save_data=args.save_data,
@@ -861,7 +872,7 @@ def _run_one_test(kind, args):
     else:
         result = run(
             fn=l3_combine,
-            specs=build_combine_specs(args.num_tokens),
+            specs=build_combine_specs(counts),
             golden_fn=golden_combine,
             compile_only=args.compile_only,
             save_data=args.save_data,
@@ -896,12 +907,21 @@ if __name__ == "__main__":
         str(i) for i in range(N_RANKS)
     ))
     parser.add_argument("--num-tokens", type=int, default=T)
+    parser.add_argument(
+        "--num-tokens-per-rank", type=str, default=None,
+        help="comma-separated local counts (overrides --num-tokens)",
+    )
     parser.add_argument("--compile-only", action="store_true")
     parser.add_argument("--save-data", action="store_true")
     parser.add_argument("--dump-passes", action="store_true")
     args = parser.parse_args()
     if not 0 <= args.num_tokens <= T:
         parser.error(f"--num-tokens must be in [0, {T}]")
+    if args.num_tokens_per_rank is not None:
+        try:
+            _normalise_counts([int(value) for value in args.num_tokens_per_rank.split(",")])
+        except (ValueError, TypeError) as exc:
+            parser.error(str(exc))
     if args.test in ("dispatch", "both"):
         _run_one_test("dispatch", args)
     if args.test in ("combine", "both"):
