@@ -55,6 +55,7 @@ from decode_compressor_ratio4 import (
     compressor_ratio4_cache_write,
     compressor_ratio4_project,
     compressor_ratio4_pool_projected,
+    compressor_ratio4_vllm,
 )
 from decode_cp_allgather import (
     CSA_MAIN_PROJ_BITS_DIM,
@@ -76,6 +77,7 @@ from decode_indexer import (
     indexer,
     indexer_qr_hadamard_mm,
     indexer_qr_rope,
+    indexer_vllm,
     indexer_weights_score,
 )
 from decode_indexer_compressor import (
@@ -83,6 +85,7 @@ from decode_indexer_compressor import (
     indexer_compressor,
     indexer_compressor_project,
     indexer_compressor_pool_projected,
+    indexer_compressor_vllm,
     indexer_compressor_write,
 )
 from qkv_proj_rope import (
@@ -117,6 +120,7 @@ from decode_sparse_attn_csa import (
     T_PAD,
     sparse_attn_csa,
     sparse_attn_csa_tp1,
+    sparse_attn_csa_tp1_vllm,
 )
 
 # Dynamic shape variables.
@@ -127,6 +131,23 @@ CMP_BLOCK_NUM_DYN = pl.dynamic("CMP_BLOCK_NUM_DYN")
 IDX_CACHE_BLOCK_NUM_DYN = pl.dynamic("IDX_CACHE_BLOCK_NUM_DYN")
 MAIN_STATE_BLOCK_NUM_DYN = pl.dynamic("CSA_STATE_BLOCK_NUM_DYN")
 INNER_STATE_BLOCK_NUM_DYN = pl.dynamic("INNER_STATE_BLOCK_NUM_DYN")
+VLLM_COMPRESS_STATE_PAGE_NUM_DYN = pl.dynamic(
+    "VLLM_COMPRESS_STATE_PAGE_NUM_DYN"
+)
+VLLM_KV_CACHE_PAGE_NUM_DYN = pl.dynamic("VLLM_KV_CACHE_PAGE_NUM_DYN")
+VLLM_CMP_KV_PAGE_NUM_DYN = pl.dynamic("VLLM_CMP_KV_PAGE_NUM_DYN")
+VLLM_MAIN_STATE_TABLE_WIDTH_DYN = pl.dynamic(
+    "VLLM_MAIN_STATE_TABLE_WIDTH_DYN"
+)
+VLLM_INNER_STATE_TABLE_WIDTH_DYN = pl.dynamic(
+    "VLLM_INNER_STATE_TABLE_WIDTH_DYN"
+)
+VLLM_ORI_TABLE_WIDTH_DYN = pl.dynamic("VLLM_ORI_TABLE_WIDTH_DYN")
+VLLM_CMP_TABLE_WIDTH_DYN = pl.dynamic("VLLM_CMP_TABLE_WIDTH_DYN")
+VLLM_INNER_INDEX_PAGE_NUM_DYN = pl.dynamic(
+    "VLLM_INNER_INDEX_PAGE_NUM_DYN"
+)
+VLLM_INDEX_TABLE_WIDTH_DYN = pl.dynamic("VLLM_INDEX_TABLE_WIDTH_DYN")
 
 # model config
 B = DECODE_BATCH // TP_SIZE
@@ -192,11 +213,343 @@ CSA_ALL_VISIBLE_WORKERS = 16
 CSA_WB_TOKEN_TILE = 8
 CSA_WB_WORKERS = 48  # CSA cache-write workers
 TP1_CSA_WB_WORKERS = 8  # TP1 CSA cache-write workers
+VLLM_KV_PAGE_ROWS = 128
+VLLM_COMPRESS_STATE_PAGE_ROWS = 16
+VLLM_COMPRESS_STATE_LIVE_ROWS = 8
+VLLM_INDEX_PAGE_ROWS = 130
 
 if T != LOCAL_T:
     raise ValueError(f"CSA token capacity {T} must equal TP local token capacity {LOCAL_T}")
 if T_PAD != LOCAL_T_PAD:
     raise ValueError(f"CSA token capacity {T_PAD} must equal TP local token capacity {LOCAL_T_PAD}")
+
+
+def _decode_csa_attn_tp1(
+    x_normed: pl.Tensor[[T_DYN, D], pl.BF16],
+    wq_a: pl.Tensor[[D, Q_LORA], pl.BF16],
+    wq_b: pl.Tensor[[Q_LORA, H * HEAD_DIM], pl.INT8],
+    wq_b_scale: pl.Tensor[[H * HEAD_DIM], pl.FP32],
+    wkv: pl.Tensor[[D, HEAD_DIM], pl.BF16],
+    gamma_cq: pl.Tensor[[Q_LORA], pl.BF16],
+    gamma_ckv: pl.Tensor[[HEAD_DIM], pl.BF16],
+    freqs_cos: pl.Tensor[[T_DYN, ROPE_HEAD_DIM], pl.BF16],
+    freqs_sin: pl.Tensor[[T_DYN, ROPE_HEAD_DIM], pl.BF16],
+    cmp_freqs_cos: pl.Tensor[[T_DYN, ROPE_HEAD_DIM], pl.BF16],
+    cmp_freqs_sin: pl.Tensor[[T_DYN, ROPE_HEAD_DIM], pl.BF16],
+    cmp_wkv: pl.Tensor[[MAIN_OUT_DIM, D], pl.BF16],
+    cmp_wgate: pl.Tensor[[MAIN_OUT_DIM, D], pl.BF16],
+    cmp_ape: pl.Tensor[[COMPRESS_RATIO, MAIN_OUT_DIM], pl.FP32],
+    cmp_norm_w: pl.Tensor[[HEAD_DIM], pl.BF16],
+    compress_state_pages: pl.InOut[
+        pl.Tensor[
+            [
+                VLLM_COMPRESS_STATE_PAGE_NUM_DYN,
+                VLLM_COMPRESS_STATE_PAGE_ROWS,
+                MAIN_STATE_DIM,
+            ],
+            pl.FP32,
+        ]
+    ],
+    kv_cache_pages: pl.InOut[
+        pl.Tensor[
+            [VLLM_KV_CACHE_PAGE_NUM_DYN, VLLM_KV_PAGE_ROWS, 1, HEAD_DIM],
+            pl.BF16,
+        ]
+    ],
+    cmp_kv_pages: pl.InOut[
+        pl.Tensor[
+            [VLLM_CMP_KV_PAGE_NUM_DYN, VLLM_KV_PAGE_ROWS, 1, HEAD_DIM],
+            pl.BF16,
+        ]
+    ],
+    compress_state_block_table: pl.Tensor[
+        [B_DYN, VLLM_MAIN_STATE_TABLE_WIDTH_DYN], pl.INT32
+    ],
+    idx_wq_b: pl.Tensor[
+        [Q_LORA, IDX_N_HEADS * IDX_HEAD_DIM], pl.INT8
+    ],
+    idx_wq_b_scale: pl.Tensor[
+        [IDX_N_HEADS * IDX_HEAD_DIM], pl.FP32
+    ],
+    weights_proj: pl.Tensor[[D, IDX_N_HEADS], pl.BF16],
+    hadamard_idx: pl.Tensor[[IDX_HEAD_DIM, IDX_HEAD_DIM], pl.BF16],
+    inner_wkv: pl.Tensor[[INNER_OUT_DIM, D], pl.BF16],
+    inner_wgate: pl.Tensor[[INNER_OUT_DIM, D], pl.BF16],
+    inner_ape: pl.Tensor[[COMPRESS_RATIO, INNER_OUT_DIM], pl.FP32],
+    inner_norm_w: pl.Tensor[[IDX_HEAD_DIM], pl.BF16],
+    inner_index_pages: pl.InOut[
+        pl.Tensor[
+            [
+                VLLM_INNER_INDEX_PAGE_NUM_DYN,
+                VLLM_INDEX_PAGE_ROWS,
+                IDX_HEAD_DIM,
+            ],
+            pl.INT8,
+        ]
+    ],
+    inner_compress_state_block_table: pl.Tensor[
+        [B_DYN, VLLM_INNER_STATE_TABLE_WIDTH_DYN], pl.INT32
+    ],
+    ori_block_table: pl.Tensor[
+        [B_DYN, VLLM_ORI_TABLE_WIDTH_DYN], pl.INT32
+    ],
+    cmp_block_table: pl.Tensor[
+        [B_DYN, VLLM_CMP_TABLE_WIDTH_DYN], pl.INT32
+    ],
+    index_block_table: pl.Tensor[
+        [B_DYN, VLLM_INDEX_TABLE_WIDTH_DYN], pl.INT32
+    ],
+    position_ids: pl.Tensor[[T_DYN], pl.INT32],
+    token_valid: pl.Tensor[[T_DYN], pl.INT32],
+    kv_seq_lens: pl.Tensor[[B_DYN], pl.INT32],
+    attn_sink: pl.Tensor[[H], pl.FP32],
+    wo_a: pl.Tensor[[O_GROUPS, O_LORA, O_GROUP_IN], pl.BF16],
+    wo_b: pl.Tensor[[D, O_GROUPS * O_LORA], pl.INT8],
+    wo_b_scale: pl.Tensor[[D], pl.FP32],
+    attn_out: pl.Out[pl.Tensor[[T_DYN, D], pl.BF16]],
+):
+    """CSA attention-only path over vLLM's native paged cache layout."""
+    x_normed.bind_dynamic(0, T_DYN)
+    freqs_cos.bind_dynamic(0, T_DYN)
+    freqs_sin.bind_dynamic(0, T_DYN)
+    cmp_freqs_cos.bind_dynamic(0, T_DYN)
+    cmp_freqs_sin.bind_dynamic(0, T_DYN)
+    position_ids.bind_dynamic(0, T_DYN)
+    token_valid.bind_dynamic(0, T_DYN)
+    attn_out.bind_dynamic(0, T_DYN)
+    kv_seq_lens.bind_dynamic(0, B_DYN)
+    compress_state_pages.bind_dynamic(0, VLLM_COMPRESS_STATE_PAGE_NUM_DYN)
+    kv_cache_pages.bind_dynamic(0, VLLM_KV_CACHE_PAGE_NUM_DYN)
+    cmp_kv_pages.bind_dynamic(0, VLLM_CMP_KV_PAGE_NUM_DYN)
+    compress_state_block_table.bind_dynamic(0, B_DYN)
+    compress_state_block_table.bind_dynamic(
+        1, VLLM_MAIN_STATE_TABLE_WIDTH_DYN,
+    )
+    inner_index_pages.bind_dynamic(0, VLLM_INNER_INDEX_PAGE_NUM_DYN)
+    inner_compress_state_block_table.bind_dynamic(0, B_DYN)
+    inner_compress_state_block_table.bind_dynamic(
+        1, VLLM_INNER_STATE_TABLE_WIDTH_DYN,
+    )
+    ori_block_table.bind_dynamic(0, B_DYN)
+    ori_block_table.bind_dynamic(1, VLLM_ORI_TABLE_WIDTH_DYN)
+    cmp_block_table.bind_dynamic(0, B_DYN)
+    cmp_block_table.bind_dynamic(1, VLLM_CMP_TABLE_WIDTH_DYN)
+    index_block_table.bind_dynamic(0, B_DYN)
+    index_block_table.bind_dynamic(1, VLLM_INDEX_TABLE_WIDTH_DYN)
+
+    t_dim = pl.tensor.dim(x_normed, 0)
+    b_dim = pl.tensor.dim(kv_seq_lens, 0)
+    s_dim = t_dim // b_dim
+    idx_cos_il = pl.create_tensor([t_dim, ROPE_HEAD_DIM], dtype=pl.FP32)
+    idx_sin_signed = pl.create_tensor(
+        [t_dim, ROPE_HEAD_DIM], dtype=pl.FP32,
+    )
+    cmp_cos_il = pl.create_tensor([t_dim, ROPE_HEAD_DIM], dtype=pl.FP32)
+    cmp_sin_signed = pl.create_tensor(
+        [t_dim, ROPE_HEAD_DIM], dtype=pl.FP32,
+    )
+    with pl.at(
+        level=pl.Level.CORE_GROUP, name_hint="csa_vllm_rope_interleave",
+    ) as rope_tid:
+        ones = pl.full([4, ROPE_HEAD_DIM], dtype=pl.FP32, value=1.0)
+        columns = pl.col_expand_mul(
+            ones,
+            pl.cast(
+                pl.arange(0, [1, ROPE_HEAD_DIM], dtype=pl.INT32),
+                target_type=pl.FP32,
+            ),
+        )
+        duplicate = pl.cast(
+            pl.cast(
+                pl.mul(columns, 0.5), target_type=pl.INT32, mode="trunc",
+            ),
+            target_type=pl.FP32,
+        )
+        duplicate_index = pl.cast(duplicate, target_type=pl.INT32)
+        lane = pl.sub(columns, pl.mul(duplicate, 2.0))
+        sign = pl.sub(pl.mul(lane, 2.0), 1.0)
+        for token_begin in pl.range(0, t_dim, 4):
+            idx_cos_half = pl.cast(
+                freqs_cos[
+                    token_begin : token_begin + 4, 0:HALF_ROPE
+                ],
+                target_type=pl.FP32,
+            )
+            idx_cos_il[
+                token_begin : token_begin + 4, 0:ROPE_HEAD_DIM
+            ] = pl.gather(idx_cos_half, dim=-1, index=duplicate_index)
+            idx_sin_half = pl.cast(
+                freqs_sin[
+                    token_begin : token_begin + 4, 0:HALF_ROPE
+                ],
+                target_type=pl.FP32,
+            )
+            idx_sin_signed[
+                token_begin : token_begin + 4, 0:ROPE_HEAD_DIM
+            ] = pl.mul(
+                pl.gather(idx_sin_half, dim=-1, index=duplicate_index), sign,
+            )
+            cmp_cos_half = pl.cast(
+                cmp_freqs_cos[
+                    token_begin : token_begin + 4, 0:HALF_ROPE
+                ],
+                target_type=pl.FP32,
+            )
+            cmp_cos_il[
+                token_begin : token_begin + 4, 0:ROPE_HEAD_DIM
+            ] = pl.gather(cmp_cos_half, dim=-1, index=duplicate_index)
+            cmp_sin_half = pl.cast(
+                cmp_freqs_sin[
+                    token_begin : token_begin + 4, 0:HALF_ROPE
+                ],
+                target_type=pl.FP32,
+            )
+            cmp_sin_signed[
+                token_begin : token_begin + 4, 0:ROPE_HEAD_DIM
+            ] = pl.mul(
+                pl.gather(cmp_sin_half, dim=-1, index=duplicate_index), sign,
+            )
+
+    q = pl.create_tensor([t_dim, H, HEAD_DIM], dtype=pl.BF16)
+    kv = pl.create_tensor([t_dim, HEAD_DIM], dtype=pl.BF16)
+    qr = pl.create_tensor([t_dim, Q_LORA], dtype=pl.INT8)
+    qr_scale = pl.create_tensor([t_dim, 1], dtype=pl.FP32)
+    topk_scores = pl.create_tensor([t_dim, IDX_TOPK], dtype=pl.FP32)
+    topk_indices = pl.create_tensor([t_dim, IDX_TOPK], dtype=pl.INT32)
+    position_ids_2d = pl.reshape(position_ids, [t_dim, 1])
+    late_dep = pl.system.task_dummy(deps=[rope_tid])
+    qkv_proj_rope(
+        x_normed,
+        wq_a,
+        wq_b,
+        wq_b_scale,
+        wkv,
+        freqs_cos,
+        freqs_sin,
+        gamma_cq,
+        gamma_ckv,
+        q,
+        kv,
+        qr,
+        qr_scale,
+        late_dep,
+    )
+
+    with pl.spmd(
+        TP1_CSA_WB_WORKERS, name_hint="csa_vllm_raw_cache_write",
+    ) as raw_cache_tid:
+        worker = pl.tile.get_block_idx()
+        for token in pl.range(worker, t_dim, TP1_CSA_WB_WORKERS):
+            if pl.read(token_valid, [token]) != 0:
+                request = token // s_dim
+                position = pl.read(position_ids, [token])
+                logical_page = position // VLLM_KV_PAGE_ROWS
+                physical_page_i32 = pl.read(
+                    ori_block_table, [request, logical_page],
+                )
+                if physical_page_i32 > 0:
+                    physical_page = pl.cast(physical_page_i32, pl.INDEX)
+                    intra = position % VLLM_KV_PAGE_ROWS
+                    kv_cache_pages[
+                        physical_page : physical_page + 1,
+                        intra : intra + 1,
+                        0:1,
+                        0:HEAD_DIM,
+                    ] = pl.reshape(
+                        kv[token : token + 1, 0:HEAD_DIM],
+                        [1, 1, 1, HEAD_DIM],
+                    )
+
+    cmp_out = pl.create_tensor([t_dim, HEAD_DIM], dtype=pl.FP32)
+    cmp_out, cmp_cache_tid, cmp_projection_tid = compressor_ratio4_vllm(
+        x_normed,
+        cmp_out,
+        compress_state_pages,
+        cmp_kv_pages,
+        compress_state_block_table,
+        cmp_wkv,
+        cmp_wgate,
+        cmp_ape,
+        cmp_norm_w,
+        cmp_cos_il,
+        cmp_sin_signed,
+        cmp_block_table,
+        position_ids,
+        token_valid,
+        late_dep,
+        raw_cache_tid,
+    )
+    idx_out = pl.create_tensor([t_dim, IDX_HEAD_DIM], dtype=pl.FP32)
+    idx_cache_tid = indexer_compressor_vllm(
+        x_normed,
+        idx_out,
+        inner_index_pages,
+        inner_compress_state_block_table,
+        inner_wkv,
+        inner_wgate,
+        inner_ape,
+        inner_norm_w,
+        cmp_cos_il,
+        cmp_sin_signed,
+        hadamard_idx,
+        index_block_table,
+        position_ids,
+        token_valid,
+        late_dep,
+        cmp_projection_tid,
+    )
+    topk_scores, topk_indices, topk_tid = indexer_vllm(
+        x_normed,
+        qr,
+        qr_scale,
+        idx_wq_b,
+        idx_wq_b_scale,
+        weights_proj,
+        idx_cos_il,
+        idx_sin_signed,
+        hadamard_idx,
+        inner_index_pages,
+        index_block_table,
+        topk_scores,
+        topk_indices,
+        position_ids,
+        kv_seq_lens,
+        idx_cache_tid,
+    )
+
+    attention_ready = pl.system.task_dummy(
+        deps=[raw_cache_tid, cmp_cache_tid, topk_tid],
+    )
+    o_packed_heads = pl.create_tensor(
+        [O_GROUPS * T_PAD, O_GROUP_IN], dtype=pl.BF16,
+    )
+    o_packed_heads, heads_dep = sparse_attn_csa_tp1_vllm(
+        q,
+        kv_cache_pages,
+        ori_block_table,
+        cmp_kv_pages,
+        cmp_block_table,
+        topk_indices,
+        position_ids_2d,
+        token_valid,
+        attn_sink,
+        freqs_cos,
+        freqs_sin,
+        o_packed_heads,
+        attention_ready,
+    )
+    return decode_o_proj_tp1(
+        o_packed_heads,
+        wo_a,
+        wo_b,
+        wo_b_scale,
+        attn_out,
+        heads_dep,
+    )
+
+
+decode_csa_attn_tp1 = pl.jit.inline(_decode_csa_attn_tp1)
+decode_csa_attn_tp1_test = pl.jit(_decode_csa_attn_tp1)
 
 
 def _decode_csa(
@@ -348,9 +701,10 @@ def _decode_csa(
 
         qr_i8_matmul = pl.create_tensor([QPROJ_T_PAD, Q_LORA], dtype=pl.INT8)
         qr_scale_pad = pl.create_tensor([QPROJ_T_PAD, 1], dtype=pl.FP32)
+        q_seq_deps = pl.array.create(1, pl.TASK_ID)
         q_proj_qr(
             x_normed_t, wq_a, gamma_cq, qr, qr_scale,
-            qr_i8_matmul, qr_scale_pad,
+            qr_i8_matmul, qr_scale_pad, q_seq_deps,
         )
 
         # Cube projection chain.
@@ -401,8 +755,11 @@ def _decode_csa(
         )
         qproj_t_matmul = ((t_dim + QPROJ_TAIL_M_TILE - 1) // QPROJ_TAIL_M_TILE) * QPROJ_TAIL_M_TILE
         q_proj_i32 = pl.create_tensor([qproj_t_matmul, H * HEAD_DIM], dtype=pl.INT32)
+        qproj_ready_tid = pl.system.task_dummy(
+            deps=[idx_projection_tid, q_seq_deps[0]],
+        )
         q_proj_i32, qproj_tid = q_proj_q_matmul(
-            wq_b, qr_i8_matmul, q_proj_i32, t_dim, idx_projection_tid,
+            wq_b, qr_i8_matmul, q_proj_i32, t_dim, qproj_ready_tid,
         )
         cmp_projection_tid = compressor_ratio4_project(
             x_normed_t, cmp_wkv, cmp_wgate, cmp_values_local, cmp_scores_local,
@@ -480,6 +837,7 @@ def _decode_csa(
             wq_b_scale,
             q_cos_il, q_sin_signed, q_swap_idx, q,
             qr_scale_pad, q_proj_i32, 0, t_dim,
+            qproj_tid,
         )
         if max_indexer_cache_len <= IDX_TOPK:
             # One worker owns each whole index row, including its -1 padding.
@@ -518,7 +876,7 @@ def _decode_csa(
         post_leaf_fence_tid = pl.system.task_dummy(deps=[leaf_tid])
 
         # Indexer score and Top-K selection.
-        compressor_ratio4_cache_write(
+        cmp_cache_write_tid = compressor_ratio4_cache_write(
             cmp_out, cmp_pooled_kv, cmp_norm_w,
             cmp_cos_il_full, cmp_sin_signed_full, cmp_kv, cmp_slots,
             compress_state, cmp_state_table, cmp_ape,
@@ -527,7 +885,11 @@ def _decode_csa(
         )
         ori_block_num = pl.tensor.dim(kv_cache, 0)
         kv_cache_flat = pl.reshape(kv_cache, [ori_block_num * BLOCK_SIZE, HEAD_DIM])
-        with pl.spmd(CSA_WB_WORKERS, name_hint="csa_cache_writeback", deps=[kv_gather_done_tid]):
+        with pl.spmd(
+            CSA_WB_WORKERS,
+            name_hint="csa_cache_writeback",
+            deps=[kv_gather_done_tid],
+        ) as raw_cache_write_tid:
             wb_worker = pl.tile.get_block_idx()
             for wb_blk in pl.range(wb_worker, kv_wb_blocks, CSA_WB_WORKERS):
                 wb_t0 = wb_blk * CSA_WB_TOKEN_TILE
@@ -539,6 +901,13 @@ def _decode_csa(
                         kv_row = kv_full[write_t : write_t + 1, 0 : HEAD_DIM]
                         kv_cache_flat[write_row : write_row + 1, 0 : HEAD_DIM] = kv_row
 
+        attention_ready_tid = pl.system.task_dummy(
+            deps=[
+                post_leaf_fence_tid,
+                cmp_cache_write_tid,
+                raw_cache_write_tid,
+            ],
+        )
         (
             attn_mi, attn_li, attn_oi,
             rope_cos_il, rope_sin_signed, rope_swap_idx,
@@ -547,6 +916,7 @@ def _decode_csa(
             q, kv_cache, window_swa_indices,
             cmp_kv, cmp_block_table, idx_topk,
             position_ids_t1, attn_sink, freqs_cos, freqs_sin,
+            attention_ready_tid, BLOCK_SIZE,
         )
 
         attention_grouped = pl.create_tensor([O_GROUPS * LOCAL_T_PAD, O_GROUP_IN], dtype=pl.BF16)
@@ -890,7 +1260,9 @@ def _decode_csa_tp1(
 
         ori_block_num = pl.tensor.dim(kv_cache, 0)
         kv_cache_flat = pl.reshape(kv_cache, [ori_block_num * BLOCK_SIZE, HEAD_DIM])
-        with pl.spmd(TP1_CSA_WB_WORKERS, name_hint="csa_cache_writeback"):
+        with pl.spmd(
+            TP1_CSA_WB_WORKERS, name_hint="csa_cache_writeback",
+        ) as raw_cache_write_tid:
             wb_worker = pl.tile.get_block_idx()
             for wb_blk in pl.range(wb_worker, wb_blocks, TP1_CSA_WB_WORKERS):
                 wb_t0 = wb_blk * CSA_WB_TOKEN_TILE
@@ -920,7 +1292,7 @@ def _decode_csa_tp1(
             position_ids, idx_slot_mapping, inner_state_slot_mapping,
             late_dep, cmp_kv_score_tid,
         )
-        idx_topk_scores, idx_topk = indexer(
+        idx_topk_scores, idx_topk, idx_topk_tid = indexer(
             x_normed_t, qr, qr_scale, idx_wq_b, idx_wq_b_scale,
             weights_proj, idx_cos_il, idx_sin_signed,
             hadamard_idx,
@@ -931,12 +1303,17 @@ def _decode_csa_tp1(
 
         # sparse_attn_csa folds the compressed-slot masking + valid-block flags in from the
         # raw indexer topk + position.
+        attention_ready_tid = pl.system.task_dummy(
+            deps=[raw_cache_write_tid, cmp_cache_write_tid, idx_topk_tid],
+        )
         o_packed_heads = pl.create_tensor([O_GROUPS * T_PAD, O_GROUP_IN], dtype=pl.BF16)
         o_packed_heads, heads_dep = sparse_attn_csa_tp1(
             q, kv_cache, window_swa_indices,
             cmp_kv, cmp_block_table, idx_topk, position_ids_t1,
             attn_sink, freqs_cos, freqs_sin,
             o_packed_heads,
+            attention_ready_tid,
+            BLOCK_SIZE,
         )
         attn_out = decode_o_proj_tp1(o_packed_heads, wo_a, wo_b, wo_b_scale, attn_out, heads_dep)
         hc_post(attn_out, x_hc, post_t, comb_t, x_out)
