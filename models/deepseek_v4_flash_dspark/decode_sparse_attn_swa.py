@@ -326,7 +326,8 @@ def sparse_attn_swa_tp1(
             n_sink_delta = pl.sub(n_sink, m_mi)
             n_sink_exp = pl.exp(n_sink_delta)
             n_denom = pl.add(m_li, n_sink_exp)
-            n_normalized = pl.row_expand_div(m_oi, n_denom)
+            n_denom_inv = pl.recip(n_denom)
+            n_normalized = pl.row_expand_mul(m_oi, n_denom_inv)
             n_full = n_normalized[0:H_TILE, 0:HEAD_DIM]
             n_bf16 = pl.cast(n_full, target_type=pl.BF16, mode="rint")
 
