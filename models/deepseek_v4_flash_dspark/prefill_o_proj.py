@@ -36,10 +36,9 @@ O_PROJ_SCRATCH_D = D
 O_PROJ_SCRATCH_COLS = O_PROJ_FULL_ROWS
 O_PROJ_WO_A_WINDOW_ROWS = O_PROJ_FULL_ROWS if TP_SIZE > 1 else 1
 O_PROJ_WO_A_WINDOW_COLS = O_GROUP_IN if TP_SIZE > 1 else 1
-# wo_b's group axis is the sole NZ leading/batch axis (matches decode_o_proj.py's
-# [O_GROUPS, D, O_LORA] convention): flattened group-major as [GROUPS*D, O_LORA],
-# the same shape wo_a already uses ([GROUPS*O_LORA, O_GROUP_IN]) -- TP-sharded on
-# groups, not on a folded [D, O_GROUPS*O_LORA] column range.
+# wo_b is group-major [O_GROUPS, D, O_LORA] (decode_o_proj.py's layout) and
+# flattens to [GROUPS*D, O_LORA], the form wo_a uses ([GROUPS*O_LORA, O_GROUP_IN]):
+# TP shards whole groups rather than a folded [D, O_GROUPS*O_LORA] column range.
 O_PROJ_FULL_ROWS_B = O_GROUPS * D
 O_PROJ_LOCAL_ROWS_B = O_PROJ_LOCAL_GROUPS * D
 O_PROJ_WO_B_WINDOW_ROWS = O_PROJ_FULL_ROWS_B if TP_SIZE > 1 else 1
@@ -47,6 +46,10 @@ O_PROJ_WO_B_WINDOW_COLS = O_LORA if TP_SIZE > 1 else 1
 
 # tiling
 O_PROJ_WEIGHT_COPY_TILE = 16
+# wo_b rows are one group's O_LORA wide, so scale the row tile by the group
+# count to keep each copy the byte size of a 16-row tile spanning every group.
+O_PROJ_WO_B_COPY_TILE = O_PROJ_WEIGHT_COPY_TILE * O_GROUPS
+O_PROJ_WO_B_PUSH_ROWS = O_PROJ_WEIGHT_COPY_TILE * O_PROJ_LOCAL_GROUPS
 
 
 @pl.jit.inline(auto_scope=False)
@@ -89,7 +92,7 @@ def gather_o_proj_full_weights(
             dst=wo_b_window, peer=peer, src=wo_b_local_flat,
             dst_offsets=[tp_rank * O_PROJ_LOCAL_ROWS_B, 0], src_offsets=[0, 0],
             shape=[O_PROJ_LOCAL_ROWS_B, O_LORA],
-            chunk_rows=O_PROJ_WEIGHT_COPY_TILE, chunk_cols=O_LORA,
+            chunk_rows=O_PROJ_WO_B_PUSH_ROWS, chunk_cols=O_LORA,
         )
         if peer_tp != tp_rank:
             pld.system.notify(
@@ -118,14 +121,14 @@ def gather_o_proj_full_weights(
 
     wo_b_full_flat = pl.reshape(wo_b_full, [O_PROJ_FULL_ROWS_B, O_LORA])
     with pl.spmd(
-        O_PROJ_FULL_ROWS_B // O_PROJ_WEIGHT_COPY_TILE, name_hint="o_proj_wo_b_readback",
+        O_PROJ_FULL_ROWS_B // O_PROJ_WO_B_COPY_TILE, name_hint="o_proj_wo_b_readback",
         deps=[push_tid, ready_wait_tid],
     ) as wo_b_readback_tid:
         order = pl.read(order_fence, [0])
         if order >= 0:
-            row = pl.tile.get_block_idx() * O_PROJ_WEIGHT_COPY_TILE
+            row = pl.tile.get_block_idx() * O_PROJ_WO_B_COPY_TILE
             tile = pl.load(
-                wo_b_window, [row, 0], [O_PROJ_WEIGHT_COPY_TILE, O_LORA],
+                wo_b_window, [row, 0], [O_PROJ_WO_B_COPY_TILE, O_LORA],
                 target_memory=pl.MemorySpace.Vec,
             )
             pl.store(tile, [row, 0], wo_b_full_flat)
@@ -176,12 +179,12 @@ if TP_SIZE == 1:
 
         wo_b_local_flat = pl.reshape(wo_b_local, [O_PROJ_FULL_ROWS_B, O_LORA])
         wo_b_full_flat = pl.reshape(wo_b_full, [O_PROJ_FULL_ROWS_B, O_LORA])
-        with pl.spmd(O_PROJ_FULL_ROWS_B // O_PROJ_WEIGHT_COPY_TILE, name_hint="o_proj_tp1_wo_b_copy") as wo_b_copy_tid:
+        with pl.spmd(O_PROJ_FULL_ROWS_B // O_PROJ_WO_B_COPY_TILE, name_hint="o_proj_tp1_wo_b_copy") as wo_b_copy_tid:
             order = pl.read(order_fence, [0])
             if order >= 0:
-                row = pl.tile.get_block_idx() * O_PROJ_WEIGHT_COPY_TILE
+                row = pl.tile.get_block_idx() * O_PROJ_WO_B_COPY_TILE
                 tile = pl.load(
-                    wo_b_local_flat, [row, 0], [O_PROJ_WEIGHT_COPY_TILE, O_LORA],
+                    wo_b_local_flat, [row, 0], [O_PROJ_WO_B_COPY_TILE, O_LORA],
                     target_memory=pl.MemorySpace.Vec,
                 )
                 pl.store(tile, [row, 0], wo_b_full_flat)

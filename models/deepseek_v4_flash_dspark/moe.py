@@ -880,10 +880,6 @@ def l3_moe(
             data_arrived = pld.window(data_arrived_buf, [N_RANKS, 1], dtype=pl.INT32)
             routed_y_buf = pld.window(routed_y_buf_buf, [N_ROUTES, D], dtype=pl.BF16)
             combine_arrived = pld.window(combine_arrived_buf, [N_RANKS, 1], dtype=pl.INT32)
-            # Per-rank weight shards: reassert FRACTAL_NZ on the sliced view.
-            # The [N_RANKS, ...] leading axis above stays plain; slicing off it
-            # keeps the same NZ-blocked trailing layout, but the type itself
-            # needs re-annotating for the callee below.
             moe_test(
                 x_hc[round_id, r], hc_ffn_fn[r], hc_ffn_scale[r], hc_ffn_base[r],
                 norm_w[r], gate_w[r], gate_bias[r], tid2eid[r], input_ids[round_id, r],
