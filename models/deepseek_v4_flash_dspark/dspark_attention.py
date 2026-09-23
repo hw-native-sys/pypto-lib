@@ -28,8 +28,8 @@ from config import (
 )
 from decode_o_proj import ATTENTION_PUBLISH_WORKERS, LOCAL_T_PAD
 from qkv_proj_rope import (
-    kv_proj_rope_bypass as kv_proj_rope,
-    q_proj_rope_bypass as q_proj_rope,
+    kv_proj_rope,
+    q_proj_rope,
     rope_prepare,
 )
 

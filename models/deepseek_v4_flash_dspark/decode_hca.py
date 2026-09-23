@@ -54,12 +54,7 @@ from config import (
 )
 from hc_pre import hc_pre_norm
 from hc_post import hc_post
-from qkv_proj_rope import (
-    kv_proj_rope_bypass as kv_proj_rope,
-    q_proj_rope_bypass as q_proj_rope,
-    qkv_proj_rope_bypass as qkv_proj_rope,
-    rope_prepare,
-)
+from qkv_proj_rope import kv_proj_rope, q_proj_rope, qkv_proj_rope, rope_prepare
 from decode_cp_allgather import (
     decode_cp_hca_projection_allgather_step,
     KV_B_DYN,

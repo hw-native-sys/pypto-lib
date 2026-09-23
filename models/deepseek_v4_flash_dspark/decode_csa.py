@@ -88,11 +88,11 @@ from decode_indexer_compressor import (
 from qkv_proj_rope import (
     QPROJ_TAIL_M_TILE,
     QPROJ_T_PAD,
-    kv_proj_rope_bypass as kv_proj_rope,
+    kv_proj_rope,
     q_proj_q_dequant,
-    q_proj_q_matmul_bypass as q_proj_q_matmul,
-    q_proj_qr_bypass as q_proj_qr,
-    qkv_proj_rope_bypass as qkv_proj_rope,
+    q_proj_q_matmul,
+    q_proj_qr,
+    qkv_proj_rope,
     rope_prepare,
 )
 from decode_o_proj import (

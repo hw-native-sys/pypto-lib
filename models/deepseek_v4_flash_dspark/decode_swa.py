@@ -54,12 +54,7 @@ from decode_cp_allgather import (
     DECODE_GROUP_CAP,
     decode_cp_kv_allgather_step,
 )
-from qkv_proj_rope import (
-    kv_proj_rope_bypass as kv_proj_rope,
-    q_proj_rope_bypass as q_proj_rope,
-    qkv_proj_rope_bypass as qkv_proj_rope,
-    rope_prepare,
-)
+from qkv_proj_rope import kv_proj_rope, q_proj_rope, qkv_proj_rope, rope_prepare
 from decode_o_proj import (
     ATTENTION_WINDOW_ROWS,
     GROUP_T_PAD,
