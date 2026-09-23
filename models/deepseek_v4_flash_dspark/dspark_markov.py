@@ -173,6 +173,13 @@ def normalize_head_hidden(
 def compute_base_logits(
     head_hidden: pl.Tensor[[B_DYN, DSPARK_QUERY_WIDTH, D], pl.BF16],
     final_norm_weight: pl.Tensor[[D], pl.BF16],
+    # Plain, not pl.NZ: at full un-sharded VOCAB rows, the strided GM->L1 NZ
+    # load's row gap (VOCAB - tile rows) exceeds the 16-bit encoding the
+    # hardware's TLoadGm2L1Nz2nz burst supports (pto-isa#317); the compiler
+    # rejects it as an unsafe silent-wrong-data load. The TP-sharded
+    # [VOCAB_PER_TP, D] lm_head_weight (shared with lm_head.py, consumed
+    # through the distributed lm_head() path below) stays well under that
+    # limit and keeps pl.NZ.
     lm_head_weight: pl.Tensor[[VOCAB, D], pl.BF16],
     base_logits: pl.Tensor[[DSPARK_MOE_TOKENS, VOCAB], pl.FP32],
 ):
@@ -191,9 +198,14 @@ def compute_base_logits(
         name_hint="dspark_base_logits",
         deps=[final_norm_tid],
     ) as base_logits_tid:
+        # Weight reads bypass L2.
+        pl.set_cache_policy(lm_head_weight, pl.CachePolicy.BYPASS)
         task = pl.tile.get_block_idx()
         row_block = task // vocab_blocks
-        vocab_block = task - row_block * vocab_blocks
+        # A true modulo (not `task - row_block * vocab_blocks`) so the NZ
+        # offset prover recognizes vocab_offset as non-negative: a difference
+        # never qualifies, but Mod(nonneg, positive constant) does.
+        vocab_block = task % vocab_blocks
         row_offset = row_block * LM_M_TILE
         vocab_offset = vocab_block * LM_N_TILE
         hidden_tile = normalized[
@@ -295,6 +307,8 @@ def greedy_markov_step(
         name_hint="dspark_confidence_head",
         deps=[markov_embedding_tid],
     ) as confidence_tid:
+        # Weight reads bypass L2.
+        pl.set_cache_policy(confidence_head_weight, pl.CachePolicy.BYPASS)
         confidence_block = pl.tile.get_block_idx()
         request_base = confidence_block * CONFIDENCE_PAD
         valid_rows = pl.min(CONFIDENCE_PAD, batch - request_base)
@@ -577,7 +591,7 @@ def markov_sample(
 def _distributed_markov_sample(
     head_hidden: pl.Tensor[[B_DYN, DSPARK_QUERY_WIDTH, D], pl.BF16],
     final_norm_weight: pl.Tensor[[D], pl.BF16],
-    lm_head_weight: pl.Tensor[[VOCAB_PER_TP, D], pl.BF16],
+    lm_head_weight: pl.Tensor[[VOCAB_PER_TP, D], pl.BF16, pl.NZ],
     logit_row_indices: pl.Tensor[[MAX_LOGIT_ROWS], pl.INT32],
     num_sampled: pl.Tensor[[B_DYN], pl.INT32],
     last_sampled: pl.Tensor[[B_DYN], pl.INT64],
@@ -719,6 +733,7 @@ def build_tensor_specs(batch: int, *, distributed: bool = False):
     """Build a deterministic nonzero Markov validation case."""
     import torch
     from golden import TensorSpec
+    from utils import pack_nz
 
     if batch not in DSPARK_SUPPORTED_BATCHES:
         raise ValueError(f"unsupported DSpark batch {batch}; expected one of {DSPARK_SUPPORTED_BATCHES}")
@@ -755,7 +770,7 @@ def build_tensor_specs(batch: int, *, distributed: bool = False):
                     # the SP owners prove their hidden rows are not duplicated.
                     for owner_tp in range(TP_SIZE):
                         weight[rank, 4 + owner_tp, 2 + owner_tp] = 8.0
-            return weight
+            return pack_nz(weight)
         weight = torch.zeros(VOCAB, D, dtype=torch.bfloat16)
         weight[0, :LM_K_TILE] = 1.0 / LM_K_TILE
         return weight
@@ -902,7 +917,12 @@ def build_tensor_specs(batch: int, *, distributed: bool = False):
 
 
 def golden_nonzero_markov(tensors):
-    """Validate the complete nonzero support and sequential Markov chain."""
+    """Validate the complete nonzero support and sequential Markov chain.
+
+    ``tensors["lm_head_weight"]`` is always plain here: the non-distributed
+    caller's own weight never carries pl.NZ (see ``compute_base_logits``),
+    and the distributed caller unpacks its NZ-packed shards before calling in.
+    """
     import torch
 
     hidden_fp32 = tensors["head_hidden"].float()
@@ -945,11 +965,16 @@ def golden_distributed_markov(tensors):
     """Apply the single-rank golden to every DP-owned TP-group result."""
     import torch
 
+    from utils import unpack_nz
+
     for rank in range(WORLD_SIZE):
         group_base = rank // TP_SIZE * TP_SIZE
+        # Unpack before concatenating: each rank's shard is its own independent
+        # NZ block, and the packed bytes of two shards do not concatenate into
+        # a valid larger NZ block.
         full_lm_head_weight = torch.cat(
             [
-                tensors["lm_head_weight"][group_base + tp_rank]
+                unpack_nz(tensors["lm_head_weight"][group_base + tp_rank])
                 for tp_rank in range(TP_SIZE)
             ],
             dim=0,

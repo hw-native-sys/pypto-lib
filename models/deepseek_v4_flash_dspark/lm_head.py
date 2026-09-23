@@ -102,7 +102,7 @@ assert VOCAB < GREEDY_INDEX_SENTINEL, "sentinel must lose every row_min against 
 @pl.jit.inline(auto_scope=False)
 def lm_head(
     hidden_states: pl.Tensor,
-    lm_head_weight: pl.Tensor[[VOCAB_PER_TP, D], pl.BF16],
+    lm_head_weight: pl.Tensor[[VOCAB_PER_TP, D], pl.BF16, pl.NZ],
     logit_row_indices: pl.Tensor[[MAX_LOGIT_ROWS], pl.INT32],
     logits: pl.Tensor[[MAX_LOGIT_ROWS, VOCAB], pl.FP32],
     hidden_window: pld.DistributedTensor[[GROUP_LOGIT_ROWS, D], pl.BF16],
@@ -212,6 +212,8 @@ def lm_head(
         deps=[_dgather_tid],
         optimizations=[pl.cross_core_slot(slot_num=2)],
     ) as _push_tid:
+        # Weight reads bypass L2.
+        pl.set_cache_policy(lm_head_weight, pl.CachePolicy.BYPASS)
         lm_core = pl.tile.get_block_idx()
         vocab_base = tp_rank * VOCAB_PER_TP
         for mm_ob in pl.range(lm_core, VOCAB_FULL_TILES, FUSED_LM_HEAD_CORES):
@@ -337,7 +339,7 @@ def lm_head(
 @pl.jit
 def l2_lm_head(
     hidden_states: pl.Tensor[[T_DYN, D], pl.BF16],
-    lm_head_weight: pl.Tensor[[VOCAB_PER_TP, D], pl.BF16],
+    lm_head_weight: pl.Tensor[[VOCAB_PER_TP, D], pl.BF16, pl.NZ],
     logit_row_indices: pl.Tensor[[MAX_LOGIT_ROWS], pl.INT32],
     logits: pl.Out[pl.Tensor[[MAX_LOGIT_ROWS, VOCAB], pl.FP32]],
     hidden_window: pld.DistributedTensor[[GROUP_LOGIT_ROWS, D], pl.BF16],
@@ -427,7 +429,7 @@ def greedy_sample(
 @pl.jit
 def l2_lm_head_sample(
     hidden_states: pl.Tensor[[T_DYN, D], pl.BF16],
-    lm_head_weight: pl.Tensor[[VOCAB_PER_TP, D], pl.BF16],
+    lm_head_weight: pl.Tensor[[VOCAB_PER_TP, D], pl.BF16, pl.NZ],
     logit_row_indices: pl.Tensor[[MAX_LOGIT_ROWS], pl.INT32],
     logits: pl.Out[pl.Tensor[[MAX_LOGIT_ROWS, VOCAB], pl.FP32]],
     sampled_ids: pl.Out[pl.Tensor[[MAX_LOGIT_ROWS, SAMPLED_IDS_PAD], pl.INT32]],
@@ -526,10 +528,12 @@ def l3_lm_head(
 def golden_lm_head(tensors):
     import torch
 
+    from utils import unpack_nz
+
     hidden = tensors["hidden_states"].float()
     # Card r holds shard r % TP_SIZE; concatenating shards in index order
     # reproduces the global vocabulary order.
-    weight = tensors["lm_head_weight"].float()
+    weight = unpack_nz(tensors["lm_head_weight"]).float()
     full_weight = torch.cat([weight[tp] for tp in range(TP_SIZE)], dim=0)
     full_logits = []
     for owner_rank in range(WORLD_SIZE):
@@ -546,6 +550,7 @@ def golden_lm_head(tensors):
 def build_tensor_specs(num_tokens=TEST_TOKENS):
     import torch
     from golden import TensorSpec
+    from utils import pack_nz
 
     active = max(min(num_tokens, MAX_LOGIT_ROWS), 0)
 
@@ -554,7 +559,7 @@ def build_tensor_specs(num_tokens=TEST_TOKENS):
 
     def init_lm_head_weight():
         shards = (torch.randn(TP_SIZE, VOCAB_PER_TP, D) / D ** 0.5).to(torch.bfloat16)
-        return torch.stack([shards[r % TP_SIZE] for r in range(WORLD_SIZE)], dim=0)
+        return pack_nz(torch.stack([shards[r % TP_SIZE] for r in range(WORLD_SIZE)], dim=0))
 
     def init_logit_row_indices():
         indices = torch.full((WORLD_SIZE, MAX_LOGIT_ROWS), -1, dtype=torch.int32)

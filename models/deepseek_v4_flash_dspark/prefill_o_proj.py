@@ -36,8 +36,14 @@ O_PROJ_SCRATCH_D = D
 O_PROJ_SCRATCH_COLS = O_PROJ_FULL_ROWS
 O_PROJ_WO_A_WINDOW_ROWS = O_PROJ_FULL_ROWS if TP_SIZE > 1 else 1
 O_PROJ_WO_A_WINDOW_COLS = O_GROUP_IN if TP_SIZE > 1 else 1
-O_PROJ_WO_B_WINDOW_ROWS = D if TP_SIZE > 1 else 1
-O_PROJ_WO_B_WINDOW_COLS = O_PROJ_FULL_ROWS if TP_SIZE > 1 else 1
+# wo_b's group axis is the sole NZ leading/batch axis (matches decode_o_proj.py's
+# [O_GROUPS, D, O_LORA] convention): flattened group-major as [GROUPS*D, O_LORA],
+# the same shape wo_a already uses ([GROUPS*O_LORA, O_GROUP_IN]) -- TP-sharded on
+# groups, not on a folded [D, O_GROUPS*O_LORA] column range.
+O_PROJ_FULL_ROWS_B = O_GROUPS * D
+O_PROJ_LOCAL_ROWS_B = O_PROJ_LOCAL_GROUPS * D
+O_PROJ_WO_B_WINDOW_ROWS = O_PROJ_FULL_ROWS_B if TP_SIZE > 1 else 1
+O_PROJ_WO_B_WINDOW_COLS = O_LORA if TP_SIZE > 1 else 1
 
 # tiling
 O_PROJ_WEIGHT_COPY_TILE = 16
@@ -46,9 +52,9 @@ O_PROJ_WEIGHT_COPY_TILE = 16
 @pl.jit.inline(auto_scope=False)
 def gather_o_proj_full_weights(
     wo_a_local: pl.Tensor[[O_PROJ_LOCAL_GROUPS, O_LORA, O_GROUP_IN], pl.BF16],
-    wo_b_local: pl.Tensor[[D, O_PROJ_LOCAL_COLS], pl.INT8],
+    wo_b_local: pl.Tensor[[O_PROJ_LOCAL_GROUPS, D, O_LORA], pl.INT8],
     wo_a_full: pl.Tensor[[O_PROJ_SCRATCH_GROUPS, O_PROJ_SCRATCH_RANK, O_PROJ_SCRATCH_INPUT], pl.BF16],
-    wo_b_full: pl.Tensor[[O_PROJ_SCRATCH_D, O_PROJ_SCRATCH_COLS], pl.INT8],
+    wo_b_full: pl.Tensor[[O_PROJ_SCRATCH_GROUPS, O_PROJ_SCRATCH_D, O_LORA], pl.INT8],
     wo_a_window: pld.DistributedTensor[[O_PROJ_WO_A_WINDOW_ROWS, O_PROJ_WO_A_WINDOW_COLS], pl.BF16],
     wo_b_window: pld.DistributedTensor[[O_PROJ_WO_B_WINDOW_ROWS, O_PROJ_WO_B_WINDOW_COLS], pl.INT8],
     weight_ready: pld.DistributedTensor[[TP_SIZE, 1], pl.INT32],
@@ -69,6 +75,7 @@ def gather_o_proj_full_weights(
                 )
 
     wo_a_local_flat = pl.reshape(wo_a_local, [O_PROJ_LOCAL_COLS, O_GROUP_IN])
+    wo_b_local_flat = pl.reshape(wo_b_local, [O_PROJ_LOCAL_ROWS_B, O_LORA])
     with pl.spmd(TP_SIZE, name_hint="o_proj_weight_push", deps=[reuse_wait_tid], allow_early_resolve=True) as push_tid:
         peer_tp = pl.tile.get_block_idx()
         peer = group_base + pl.cast(peer_tp, pl.INT32)
@@ -79,10 +86,10 @@ def gather_o_proj_full_weights(
             chunk_rows=O_PROJ_WEIGHT_COPY_TILE, chunk_cols=O_GROUP_IN,
         )
         pld.tensor.put(
-            dst=wo_b_window, peer=peer, src=wo_b_local,
-            dst_offsets=[0, tp_rank * O_PROJ_LOCAL_COLS], src_offsets=[0, 0],
-            shape=[D, O_PROJ_LOCAL_COLS],
-            chunk_rows=O_PROJ_WEIGHT_COPY_TILE, chunk_cols=O_PROJ_LOCAL_COLS,
+            dst=wo_b_window, peer=peer, src=wo_b_local_flat,
+            dst_offsets=[tp_rank * O_PROJ_LOCAL_ROWS_B, 0], src_offsets=[0, 0],
+            shape=[O_PROJ_LOCAL_ROWS_B, O_LORA],
+            chunk_rows=O_PROJ_WEIGHT_COPY_TILE, chunk_cols=O_LORA,
         )
         if peer_tp != tp_rank:
             pld.system.notify(
@@ -109,18 +116,19 @@ def gather_o_proj_full_weights(
             tile = pl.load(wo_a_window, [row, 0], [O_PROJ_WEIGHT_COPY_TILE, O_GROUP_IN], target_memory=pl.MemorySpace.Vec)
             pl.store(tile, [row, 0], wo_a_full_flat)
 
+    wo_b_full_flat = pl.reshape(wo_b_full, [O_PROJ_FULL_ROWS_B, O_LORA])
     with pl.spmd(
-        D // O_PROJ_WEIGHT_COPY_TILE, name_hint="o_proj_wo_b_readback",
+        O_PROJ_FULL_ROWS_B // O_PROJ_WEIGHT_COPY_TILE, name_hint="o_proj_wo_b_readback",
         deps=[push_tid, ready_wait_tid],
     ) as wo_b_readback_tid:
         order = pl.read(order_fence, [0])
         if order >= 0:
             row = pl.tile.get_block_idx() * O_PROJ_WEIGHT_COPY_TILE
             tile = pl.load(
-                wo_b_window, [row, 0], [O_PROJ_WEIGHT_COPY_TILE, O_PROJ_FULL_ROWS],
+                wo_b_window, [row, 0], [O_PROJ_WEIGHT_COPY_TILE, O_LORA],
                 target_memory=pl.MemorySpace.Vec,
             )
-            pl.store(tile, [row, 0], wo_b_full)
+            pl.store(tile, [row, 0], wo_b_full_flat)
 
     with pl.at(
         level=pl.Level.CORE_GROUP, name_hint="o_proj_weight_consumed",
@@ -141,9 +149,9 @@ if TP_SIZE == 1:
     @pl.jit.inline(auto_scope=False)
     def gather_o_proj_full_weights(
         wo_a_local: pl.Tensor[[O_PROJ_LOCAL_GROUPS, O_LORA, O_GROUP_IN], pl.BF16],
-        wo_b_local: pl.Tensor[[D, O_PROJ_LOCAL_COLS], pl.INT8],
+        wo_b_local: pl.Tensor[[O_PROJ_LOCAL_GROUPS, D, O_LORA], pl.INT8],
         wo_a_full: pl.Tensor[[O_PROJ_SCRATCH_GROUPS, O_PROJ_SCRATCH_RANK, O_PROJ_SCRATCH_INPUT], pl.BF16],
-        wo_b_full: pl.Tensor[[O_PROJ_SCRATCH_D, O_PROJ_SCRATCH_COLS], pl.INT8],
+        wo_b_full: pl.Tensor[[O_PROJ_SCRATCH_GROUPS, O_PROJ_SCRATCH_D, O_LORA], pl.INT8],
         wo_a_window: pld.DistributedTensor[[O_PROJ_WO_A_WINDOW_ROWS, O_PROJ_WO_A_WINDOW_COLS], pl.BF16],
         wo_b_window: pld.DistributedTensor[[O_PROJ_WO_B_WINDOW_ROWS, O_PROJ_WO_B_WINDOW_COLS], pl.INT8],
         weight_ready: pld.DistributedTensor[[TP_SIZE, 1], pl.INT32],
@@ -166,15 +174,17 @@ if TP_SIZE == 1:
                 )
                 pl.store(tile, [row, 0], wo_a_full_flat)
 
-        with pl.spmd(D // O_PROJ_WEIGHT_COPY_TILE, name_hint="o_proj_tp1_wo_b_copy") as wo_b_copy_tid:
+        wo_b_local_flat = pl.reshape(wo_b_local, [O_PROJ_FULL_ROWS_B, O_LORA])
+        wo_b_full_flat = pl.reshape(wo_b_full, [O_PROJ_FULL_ROWS_B, O_LORA])
+        with pl.spmd(O_PROJ_FULL_ROWS_B // O_PROJ_WEIGHT_COPY_TILE, name_hint="o_proj_tp1_wo_b_copy") as wo_b_copy_tid:
             order = pl.read(order_fence, [0])
             if order >= 0:
                 row = pl.tile.get_block_idx() * O_PROJ_WEIGHT_COPY_TILE
                 tile = pl.load(
-                    wo_b_local, [row, 0], [O_PROJ_WEIGHT_COPY_TILE, O_PROJ_FULL_ROWS],
+                    wo_b_local_flat, [row, 0], [O_PROJ_WEIGHT_COPY_TILE, O_LORA],
                     target_memory=pl.MemorySpace.Vec,
                 )
-                pl.store(tile, [row, 0], wo_b_full)
+                pl.store(tile, [row, 0], wo_b_full_flat)
         return pl.system.task_dummy(deps=[wo_a_copy_tid, wo_b_copy_tid])
 
 

@@ -137,8 +137,8 @@ if T_PAD % PROJ_B_MM_T_TILE != 0:
 @pl.jit.inline
 def decode_o_proj_tp1(
     o_packed: pl.Tensor[[O_GROUPS * T_PAD, O_GROUP_IN], pl.BF16],
-    wo_a: pl.Tensor[[O_GROUPS, O_LORA, O_GROUP_IN], pl.BF16],
-    wo_b: pl.Tensor[[D, O_GROUPS * O_LORA], pl.INT8],
+    wo_a: pl.Tensor[[O_GROUPS, O_LORA, O_GROUP_IN], pl.BF16, pl.NZ],
+    wo_b: pl.Tensor[[O_GROUPS, D, O_LORA], pl.INT8, pl.NZ],
     wo_b_scale: pl.Tensor[[D], pl.FP32],
     attn_out: pl.Tensor[[T_DYN, D], pl.BF16],
     heads_dep: pl.Scalar[pl.TASK_ID],
@@ -171,9 +171,11 @@ def decode_o_proj_tp1(
 
             with pl.spmd(proj_a_rows * (O_LORA // PROJ_A_MM_N_TILE), name_hint="proj_a_mm", deps=[heads_dep],
                          allow_early_resolve=True) as pa_tid:
+                # Weight reads bypass L2.
+                pl.set_cache_policy(wo_a, pl.CachePolicy.BYPASS)
                 pa_unit = pl.tile.get_block_idx()
                 pa_rb = pa_unit // (O_LORA // PROJ_A_MM_N_TILE)  # row block outermost
-                nf = pa_unit - pa_rb * (O_LORA // PROJ_A_MM_N_TILE)
+                nf = pa_unit % (O_LORA // PROJ_A_MM_N_TILE)
                 pa_r0 = pa_rb * PROJ_A_ROW_TILE
                 pa_rows = pl.min(PROJ_A_ROW_TILE, t_dim - pa_r0)
                 pa_src0 = row_base_o + pa_r0
@@ -216,20 +218,24 @@ def decode_o_proj_tp1(
                         zero_half, target_type=pl.INT8, mode="trunc")
 
             with pl.spmd(proj_b_t_rows * (D // PROJ_B_D_TILE), name_hint="proj_b_mm", deps=[q_tid], allow_early_resolve=True) as pb_tid:
+                # Weight reads bypass L2.
+                pl.set_cache_policy(wo_b, pl.CachePolicy.BYPASS)
                 pb_unit = pl.tile.get_block_idx()
                 tb = pb_unit // (D // PROJ_B_D_TILE)
-                dc = pb_unit - tb * (D // PROJ_B_D_TILE)
+                dc = pb_unit % (D // PROJ_B_D_TILE)
                 t0 = tb * PROJ_B_MM_T_TILE
                 d0 = dc * PROJ_B_D_TILE
                 for nf in pl.range(PROJ_B_D_TILE // PROJ_B_MM_N_TILE):
                     n0 = d0 + nf * PROJ_B_MM_N_TILE
-                    acc_b = pl.create_tensor([PROJ_B_MM_T_TILE, PROJ_B_MM_N_TILE], dtype=pl.INT32)
+                    acc_b = pl.create_tensor([1, PROJ_B_MM_T_TILE, PROJ_B_MM_N_TILE], dtype=pl.INT32)
                     for kb in pl.pipeline(0, O_LORA // B_K_TILE, stage=2):
                         k0 = col_g + kb * B_K_TILE
+                        wb_k0 = kb * B_K_TILE
                         b_act = o_r_i8_pad[t0 : t0 + PROJ_B_MM_T_TILE, k0 : k0 + B_K_TILE]
-                        b_weight = wo_b[n0 : n0 + PROJ_B_MM_N_TILE, k0 : k0 + B_K_TILE]
+                        b_weight = wo_b[g : g + 1, n0 : n0 + PROJ_B_MM_N_TILE, wb_k0 : wb_k0 + B_K_TILE]
                         acc_b = pl.matmul_acc(acc_b, b_act, b_weight, b_trans=True, init_cond=(kb == 0))
-                    partials[t0 : t0 + PROJ_B_MM_T_TILE, g * D + n0 : g * D + n0 + PROJ_B_MM_N_TILE] = acc_b
+                    acc_b_2d = pl.reshape(acc_b, [PROJ_B_MM_T_TILE, PROJ_B_MM_N_TILE])
+                    partials[t0 : t0 + PROJ_B_MM_T_TILE, g * D + n0 : g * D + n0 + PROJ_B_MM_N_TILE] = acc_b_2d
             proj_b_tids[g] = pb_tid
 
     # proj_b_act sums the O_GROUPS INT32 partials -- each dequantized by its group's
@@ -494,8 +500,8 @@ def tp_o_rs_reduce(
 @pl.jit.inline
 def o_proj_reduce_scatter(
     attention_local_groups: pl.Tensor[[LOCAL_O_GROUPS, GROUP_T_PAD, O_GROUP_IN], pl.BF16],
-    wo_a: pl.Tensor[[LOCAL_O_GROUPS, O_LORA, O_GROUP_IN], pl.BF16],
-    wo_b: pl.Tensor[[D, LOCAL_O_WIDTH], pl.INT8],
+    wo_a: pl.Tensor[[LOCAL_O_GROUPS, O_LORA, O_GROUP_IN], pl.BF16, pl.NZ],
+    wo_b: pl.Tensor[[LOCAL_O_GROUPS, D, O_LORA], pl.INT8, pl.NZ],
     wo_b_scale: pl.Tensor[[D], pl.FP32],
     local_t: pl.Scalar[pl.INT32],
     local_out: pl.Tensor[[T_DYN, D], pl.BF16],
@@ -512,7 +518,6 @@ def o_proj_reduce_scatter(
     owner_rows = (local_t + ACT_T_TILE - 1) // ACT_T_TILE
 
     attn_2d = pl.reshape(attention_local_groups, [LOCAL_O_GROUPS * GROUP_T_PAD, O_GROUP_IN])
-    wo_a_flat = pl.reshape(wo_a, [LOCAL_O_WIDTH, O_GROUP_IN])
     # Owner-private buffers and group-local A -> quant -> B dependencies.
     publish_all = pl.create_tensor([O_WINDOW_ROWS, D], dtype=pl.BF16)
     put_rows = (local_t + O_RS_PUT_T_TILE - 1) // O_RS_PUT_T_TILE
@@ -536,22 +541,25 @@ def o_proj_reduce_scatter(
             o_a_col = local_group * O_LORA
 
             with pl.spmd(own_a_rows * (O_LORA // O_A_N_TILE), name_hint="tp_o_a") as pa_tid:
+                # Weight reads bypass L2.
+                pl.set_cache_policy(wo_a, pl.CachePolicy.BYPASS)
                 pa_unit = pl.tile.get_block_idx()
                 pa_rb = pa_unit // (O_LORA // O_A_N_TILE)
-                pa_nb = pa_unit - pa_rb * (O_LORA // O_A_N_TILE)
+                pa_nb = pa_unit % (O_LORA // O_A_N_TILE)
                 pa_t0 = pa_rb * O_A_T_TILE
                 pa_n0 = pa_nb * O_A_N_TILE
                 pa_rows = pl.min(O_A_T_TILE, local_t - pa_t0)
                 pa_src = attention_row + pa_t0
                 pa_wrow = o_a_col + pa_n0
                 pa_x0 = pl.slice(attn_2d, [O_A_T_TILE, O_A_K_TILE], [pa_src, 0], valid_shape=[pa_rows, O_A_K_TILE])
-                pa_w0 = wo_a_flat[pa_wrow : pa_wrow + O_A_N_TILE, 0:O_A_K_TILE]
+                pa_w0 = wo_a[local_group : local_group + 1, pa_n0 : pa_n0 + O_A_N_TILE, 0:O_A_K_TILE]
                 pa_acc = pl.matmul(pa_x0, pa_w0, b_trans=True, out_dtype=pl.FP32)
                 for pa_k0 in pl.pipeline(O_A_K_TILE, O_GROUP_IN, O_A_K_TILE, stage=2):
                     pa_xk = pl.slice(attn_2d, [O_A_T_TILE, O_A_K_TILE], [pa_src, pa_k0], valid_shape=[pa_rows, O_A_K_TILE])
-                    pa_wk = wo_a_flat[pa_wrow : pa_wrow + O_A_N_TILE, pa_k0 : pa_k0 + O_A_K_TILE]
+                    pa_wk = wo_a[local_group : local_group + 1, pa_n0 : pa_n0 + O_A_N_TILE, pa_k0 : pa_k0 + O_A_K_TILE]
                     pa_acc = pl.matmul_acc(pa_acc, pa_xk, pa_wk, b_trans=True)
-                pa_valid = pl.set_validshape(pa_acc, pa_rows, O_A_N_TILE)
+                pa_acc_2d = pl.reshape(pa_acc, [O_A_T_TILE, O_A_N_TILE])
+                pa_valid = pl.set_validshape(pa_acc_2d, pa_rows, O_A_N_TILE)
                 own_a_fp32[pa_t0 : pa_t0 + O_A_T_TILE, pa_wrow : pa_wrow + O_A_N_TILE] = pa_valid
 
             with pl.spmd(O_A_QUANT_WORKERS, name_hint="tp_o_a_quant", deps=[pa_tid]) as q_tid:
@@ -587,22 +595,25 @@ def o_proj_reduce_scatter(
                     )
 
             with pl.spmd(own_b_rows * (D // O_B_D_TILE), name_hint="tp_o_b", deps=[q_tid]):
+                # Weight reads bypass L2.
+                pl.set_cache_policy(wo_b, pl.CachePolicy.BYPASS)
                 pb_unit = pl.tile.get_block_idx()
                 pb_tb = pb_unit // (D // O_B_D_TILE)
-                pb_db = pb_unit - pb_tb * (D // O_B_D_TILE)
+                pb_db = pb_unit % (D // O_B_D_TILE)
                 pb_t0 = pb_tb * O_B_T_TILE
                 pb_d0 = pb_db * O_B_D_TILE
                 for pb_n0 in pl.range(pb_d0, pb_d0 + O_B_D_TILE, O_B_N_TILE):
                     pb_x0 = own_a_i8[pb_t0 : pb_t0 + O_B_T_TILE, o_a_col : o_a_col + O_B_K_TILE]
-                    pb_w0 = wo_b[pb_n0 : pb_n0 + O_B_N_TILE, o_a_col : o_a_col + O_B_K_TILE]
+                    pb_w0 = wo_b[local_group : local_group + 1, pb_n0 : pb_n0 + O_B_N_TILE, 0:O_B_K_TILE]
                     pb_acc = pl.matmul(pb_x0, pb_w0, b_trans=True, out_dtype=pl.INT32)
                     for pb_k0 in pl.pipeline(O_B_K_TILE, O_LORA, O_B_K_TILE, stage=2):
                         pb_bk = o_a_col + pb_k0
                         pb_xk = own_a_i8[pb_t0 : pb_t0 + O_B_T_TILE, pb_bk : pb_bk + O_B_K_TILE]
-                        pb_wk = wo_b[pb_n0 : pb_n0 + O_B_N_TILE, pb_bk : pb_bk + O_B_K_TILE]
+                        pb_wk = wo_b[local_group : local_group + 1, pb_n0 : pb_n0 + O_B_N_TILE, pb_k0 : pb_k0 + O_B_K_TILE]
                         pb_acc = pl.matmul_acc(pb_acc, pb_xk, pb_wk, b_trans=True)
+                    pb_acc_2d = pl.reshape(pb_acc, [O_B_T_TILE, O_B_N_TILE])
                     pb_col = local_group * D + pb_n0
-                    own_b_i32[pb_t0 : pb_t0 + O_B_T_TILE, pb_col : pb_col + O_B_N_TILE] = pb_acc
+                    own_b_i32[pb_t0 : pb_t0 + O_B_T_TILE, pb_col : pb_col + O_B_N_TILE] = pb_acc_2d
 
         with pl.spmd(
             O_RS_DEQUANT_WORKERS,
@@ -730,17 +741,20 @@ def golden_decode_o_proj_tp1(o_packed_heads, wo_a, wo_b, wo_b_scale, tokens):
     """Project full-group packed attention rows with the TP1 quantization path."""
     import torch
 
+    from utils import unpack_nz
+
+    wo_a = unpack_nz(wo_a)
+    wo_b_groups = unpack_nz(wo_b)
     attention = o_packed_heads.reshape(O_GROUPS, T_PAD, O_GROUP_IN)[:, :tokens].float()
     o_a = torch.einsum("gti,gri->gtr", attention, wo_a.float())
     row_amax = o_a.abs().amax(dim=-1, keepdim=True).clamp_min(INT8_AMAX_EPS)
     scale_q = INT8_SCALE_MAX / row_amax
     o_a_i8 = torch.round(o_a * scale_q).to(torch.int32).to(torch.float16).to(torch.int8)
     scale_dq = 1.0 / scale_q
-    wo_b_groups = wo_b.reshape(D, O_GROUPS, O_LORA)
     attn_out = torch.zeros(tokens, D, dtype=torch.float32)
     for group in range(O_GROUPS):
         group_i32 = o_a_i8[group].to(torch.int32)
-        weight_i32 = wo_b_groups[:, group].to(torch.int32)
+        weight_i32 = wo_b_groups[group].to(torch.int32)
         group_partial = group_i32 @ weight_i32.T
         attn_out = attn_out + group_partial.float() * scale_dq[group]
     attn_out = attn_out * wo_b_scale.float().unsqueeze(0)

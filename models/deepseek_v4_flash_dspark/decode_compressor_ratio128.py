@@ -129,6 +129,9 @@ def compressor_ratio128_project(
     with pl.spmd(
         t_groups * (OUT_DIM // OUT_TILE), name_hint="kv_score_proj", deps=[late_dep]
     ) as _kv_score_tid:
+        # Weight reads bypass L2.
+        pl.set_cache_policy(wkv, pl.CachePolicy.BYPASS)
+        pl.set_cache_policy(wgate, pl.CachePolicy.BYPASS)
         idx = pl.tile.get_block_idx()
         group_row0 = (idx // (OUT_DIM // OUT_TILE)) * group_rows
         o0 = (idx % (OUT_DIM // OUT_TILE)) * OUT_TILE

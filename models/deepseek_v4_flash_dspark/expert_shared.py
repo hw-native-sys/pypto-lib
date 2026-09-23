@@ -60,11 +60,11 @@ W2_ACT_INNER = 8
 def _expert_shared(
     x_local_i8: pl.Tensor[[T, D], pl.INT8],
     x_local_scale_dq: pl.Tensor[[T, 1], pl.FP32],
-    shared_w1: pl.Tensor[[MOE_INTER, D], pl.INT8],
+    shared_w1: pl.Tensor[[MOE_INTER, D], pl.INT8, pl.NZ],
     shared_w1_scale: pl.Tensor[[MOE_INTER], pl.FP32],
-    shared_w3: pl.Tensor[[MOE_INTER, D], pl.INT8],
+    shared_w3: pl.Tensor[[MOE_INTER, D], pl.INT8, pl.NZ],
     shared_w3_scale: pl.Tensor[[MOE_INTER], pl.FP32],
-    shared_w2: pl.Tensor[[D, MOE_INTER], pl.INT8],
+    shared_w2: pl.Tensor[[D, MOE_INTER], pl.INT8, pl.NZ],
     shared_w2_scale: pl.Tensor[[D], pl.FP32],
     sh: pl.Out[pl.Tensor[[T, D], pl.BF16]],
 ):
@@ -81,6 +81,8 @@ def _expert_shared(
             name_hint="sh_gate_mm",
             allow_early_resolve=True,
         ):
+            # Weight reads bypass L2.
+            pl.set_cache_policy(shared_w1, pl.CachePolicy.BYPASS)
             for ng in pl.range(nb_idx, MOE_INTER // MM_INTER_TILE, SH_MM_BLOCKS):
                 n0 = ng * MM_INTER_TILE
                 gate_acc = pl.create_tensor([SH_M_TILE, MM_INTER_TILE], dtype=pl.INT32)
@@ -96,6 +98,8 @@ def _expert_shared(
             name_hint="sh_up_mm",
             allow_early_resolve=True,
         ):
+            # Weight reads bypass L2.
+            pl.set_cache_policy(shared_w3, pl.CachePolicy.BYPASS)
             for ng in pl.range(nb_idx, MOE_INTER // MM_INTER_TILE, SH_MM_BLOCKS):
                 n0 = ng * MM_INTER_TILE
                 up_acc = pl.create_tensor([SH_M_TILE, MM_INTER_TILE], dtype=pl.INT32)
@@ -232,6 +236,8 @@ def _expert_shared(
             name_hint="sh_w2_mm",
             allow_early_resolve=True,
         ):
+            # Weight reads bypass L2.
+            pl.set_cache_policy(shared_w2, pl.CachePolicy.BYPASS)
             d_base = db_idx * (W2_INNER * D_OUT_TILE)
             for dg in pl.range(W2_INNER):
                 d0 = d_base + dg * D_OUT_TILE
@@ -278,13 +284,14 @@ def golden_expert_shared(tensors):
 
     Input is the per-token INT8 quant produced by gate (shared with
     dispatch / routed expert); we dequant inside to match the kernel's
-    dequant-then-matmul pattern."""
-    from utils import int8_quant_per_row
+    dequant-then-matmul pattern. The shared weights arrive in FRACTAL_NZ
+    order, as the kernel declares them."""
+    from utils import int8_quant_per_row, unpack_nz
     import torch
     import torch.nn.functional as F
 
     def dequant_w(w_i8, w_scale):
-        return w_i8.to(torch.float32) * w_scale.unsqueeze(-1)
+        return unpack_nz(w_i8).to(torch.float32) * w_scale.unsqueeze(-1)
 
     x_local_i8 = tensors["x_local_i8"]                       # [T, D] int8
     x_local_scale_dq = tensors["x_local_scale_dq"].float()   # [T, 1]
@@ -318,9 +325,13 @@ def gen_shared_weight(shape, dequant_std, chan_cv):
     expert_routed.gen_routed_weight.)
 
     ``shape`` last dim = reduction (in) dim; leading dims map to the per-output-channel
-    scale shape ([out, in] -> scale [out]).
+    scale shape ([out, in] -> scale [out]). The returned INT8 weight comes back in
+    FRACTAL_NZ order, matching what the kernel declares; the golden reads it back through
+    ``unpack_nz``.
     """
     import torch
+
+    from utils import pack_nz
 
     FP8_MAX, TINY = 448.0, 1e-20
 
@@ -337,7 +348,7 @@ def gen_shared_weight(shape, dequant_std, chan_cv):
     scale = amax / INT8_SCALE_MAX
     w_i8 = torch.round(Wq / scale).clamp_(-INT8_SCALE_MAX, INT8_SCALE_MAX).to(torch.int8)
     scale = (scale * (dequant_std / (w_i8.float() * scale).std())).squeeze(-1).float()
-    return w_i8, scale
+    return pack_nz(w_i8), scale
 
 
 def build_tensor_specs():

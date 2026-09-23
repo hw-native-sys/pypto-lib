@@ -490,6 +490,9 @@ def indexer_qr_rope(
     x: pl.Tensor[[T_DYN, D], pl.BF16],
     qr: pl.Tensor[[T_DYN, Q_LORA], pl.INT8],
     qr_scale: pl.Tensor[[T_DYN, 1], pl.FP32],
+    # NOT pl.NZ: the fused row-block/output-tile spmd index makes o_base's
+    # trailing-dim offset a subtraction, which NZ addressability cannot prove
+    # non-negative (mtp's analogue keeps ot as the bare spmd index instead).
     wq_b: pl.Tensor[[Q_LORA, IDX_N_HEADS * IDX_HEAD_DIM], pl.INT8],
     wq_b_scale: pl.Tensor[[IDX_N_HEADS * IDX_HEAD_DIM], pl.FP32],
     cos: pl.Tensor[[T_DYN, ROPE_HEAD_DIM], pl.FP32],
@@ -504,6 +507,8 @@ def indexer_qr_rope(
     with pl.spmd(
         QR_PROJ_WORKERS, name_hint="idx_qr_proj_matmul", allow_early_resolve=True,
     ) as idx_qr_mm_tid:
+        # Weight reads bypass L2.
+        pl.set_cache_policy(wq_b, pl.CachePolicy.BYPASS)
         qr_proj_worker = pl.tile.get_block_idx()
         for qr_unit in pl.range(qr_proj_worker, IDX_N_HEADS * IDX_HEAD_DIM // Q_OUT_TILE * row_blocks, QR_PROJ_WORKERS):
             qr_rb = qr_unit // (IDX_N_HEADS * IDX_HEAD_DIM // Q_OUT_TILE)
@@ -620,6 +625,9 @@ def indexer_qr_hadamard(
     x: pl.Tensor[[T_DYN, D], pl.BF16],
     qr: pl.Tensor[[T_DYN, Q_LORA], pl.INT8],
     qr_scale: pl.Tensor[[T_DYN, 1], pl.FP32],
+    # NOT pl.NZ: the fused row-block/output-tile spmd index makes o_base's
+    # trailing-dim offset a subtraction, which NZ addressability cannot prove
+    # non-negative (mtp's analogue keeps ot as the bare spmd index instead).
     wq_b: pl.Tensor[[Q_LORA, IDX_N_HEADS * IDX_HEAD_DIM], pl.INT8],
     wq_b_scale: pl.Tensor[[IDX_N_HEADS * IDX_HEAD_DIM], pl.FP32],
     cos: pl.Tensor[[T_DYN, ROPE_HEAD_DIM], pl.FP32],
@@ -643,6 +651,9 @@ def indexer_qr_hadamard(
 @pl.jit.inline(auto_scope=False)
 def indexer_weights_score(
     x: pl.Tensor[[T_DYN, D], pl.BF16],
+    # NOT pl.NZ: the fused row-block/K-split spmd index makes k_base's
+    # leading-dim offset a subtraction, which NZ addressability cannot prove
+    # non-negative.
     weights_proj: pl.Tensor[[D, IDX_N_HEADS], pl.BF16],
     qr_hadamard_i8: pl.Tensor[[T_PAD * IDX_N_HEADS, IDX_HEAD_DIM], pl.INT8],
     qr_hadamard_scale_dq: pl.Tensor[[T_PAD * IDX_N_HEADS, 1], pl.FP32],
@@ -669,6 +680,8 @@ def indexer_weights_score(
     with pl.spmd(
         weights_workers, name_hint="weights_proj", deps=[weights_gate_dep], allow_early_resolve=True
     ) as _weights_tid:
+        # Weight reads bypass L2.
+        pl.set_cache_policy(weights_proj, pl.CachePolicy.BYPASS)
         w_worker = pl.tile.get_block_idx()
         for w_unit in pl.range(w_worker, WEIGHTS_OK * row_blocks, weights_workers):
             w_rb = w_unit // WEIGHTS_OK  # row block outermost
@@ -712,8 +725,14 @@ def indexer(
     x: pl.Tensor[[T_DYN, D], pl.BF16],
     qr: pl.Tensor[[T_DYN, Q_LORA], pl.INT8],
     qr_scale: pl.Tensor[[T_DYN, 1], pl.FP32],
+    # NOT pl.NZ: the fused row-block/output-tile spmd index makes o_base's
+    # trailing-dim offset a subtraction, which NZ addressability cannot prove
+    # non-negative (mtp's analogue keeps ot as the bare spmd index instead).
     wq_b: pl.Tensor[[Q_LORA, IDX_N_HEADS * IDX_HEAD_DIM], pl.INT8],
     wq_b_scale: pl.Tensor[[IDX_N_HEADS * IDX_HEAD_DIM], pl.FP32],
+    # NOT pl.NZ: the fused row-block/K-split spmd index makes k_base's
+    # leading-dim offset a subtraction, which NZ addressability cannot prove
+    # non-negative.
     weights_proj: pl.Tensor[[D, IDX_N_HEADS], pl.BF16],
     cos: pl.Tensor[[T_DYN, ROPE_HEAD_DIM], pl.FP32],
     sin: pl.Tensor[[T_DYN, ROPE_HEAD_DIM], pl.FP32],
@@ -749,8 +768,14 @@ def indexer_test(
     x: pl.Tensor[[T_DYN, D], pl.BF16],
     qr: pl.Tensor[[T_DYN, Q_LORA], pl.INT8],
     qr_scale: pl.Tensor[[T_DYN, 1], pl.FP32],
+    # NOT pl.NZ: the fused row-block/output-tile spmd index makes o_base's
+    # trailing-dim offset a subtraction, which NZ addressability cannot prove
+    # non-negative (mtp's analogue keeps ot as the bare spmd index instead).
     wq_b: pl.Tensor[[Q_LORA, IDX_N_HEADS * IDX_HEAD_DIM], pl.INT8],
     wq_b_scale: pl.Tensor[[IDX_N_HEADS * IDX_HEAD_DIM], pl.FP32],
+    # NOT pl.NZ: the fused row-block/K-split spmd index makes k_base's
+    # leading-dim offset a subtraction, which NZ addressability cannot prove
+    # non-negative.
     weights_proj: pl.Tensor[[D, IDX_N_HEADS], pl.BF16],
     cos: pl.Tensor[[T_DYN, ROPE_HEAD_DIM], pl.FP32],
     sin: pl.Tensor[[T_DYN, ROPE_HEAD_DIM], pl.FP32],

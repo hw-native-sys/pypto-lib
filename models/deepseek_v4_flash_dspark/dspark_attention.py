@@ -28,8 +28,8 @@ from config import (
 )
 from decode_o_proj import ATTENTION_PUBLISH_WORKERS, LOCAL_T_PAD
 from qkv_proj_rope import (
-    kv_proj_rope,
-    q_proj_rope,
+    kv_proj_rope_bypass as kv_proj_rope,
+    q_proj_rope_bypass as q_proj_rope,
     rope_prepare,
 )
 
@@ -79,8 +79,8 @@ NEG_INF = -1.0e20
 def dspark_attention(
     x: pl.Tensor[[T, D], pl.BF16],
     kv_x: pl.Tensor[[KV_T_DYN, D], pl.BF16],
-    wq_a: pl.Tensor[[D, Q_LORA], pl.BF16],
-    wq_b: pl.Tensor[[Q_LORA, H * HEAD_DIM], pl.INT8],
+    wq_a: pl.Tensor[[D, Q_LORA], pl.BF16, pl.NZ],
+    wq_b: pl.Tensor[[Q_LORA, H * HEAD_DIM], pl.INT8, pl.NZ],
     wq_b_scale: pl.Tensor[[H * HEAD_DIM], pl.FP32],
     wkv: pl.Tensor[[D, HEAD_DIM], pl.BF16],
     gamma_cq: pl.Tensor[[Q_LORA], pl.BF16],
@@ -372,8 +372,8 @@ def dspark_attention(
 @pl.jit
 def dspark_attention_test(
     x: pl.Tensor[[T, D], pl.BF16],
-    wq_a: pl.Tensor[[D, Q_LORA], pl.BF16],
-    wq_b: pl.Tensor[[Q_LORA, H * HEAD_DIM], pl.INT8],
+    wq_a: pl.Tensor[[D, Q_LORA], pl.BF16, pl.NZ],
+    wq_b: pl.Tensor[[Q_LORA, H * HEAD_DIM], pl.INT8, pl.NZ],
     wq_b_scale: pl.Tensor[[H * HEAD_DIM], pl.FP32],
     wkv: pl.Tensor[[D, HEAD_DIM], pl.BF16],
     gamma_cq: pl.Tensor[[Q_LORA], pl.BF16],
@@ -499,6 +499,7 @@ def build_tensor_specs(start_pos=None):
     from golden import TensorSpec
     from utils import (
         block_table,
+        pack_nz,
         paged_slot_mapping,
         position_ids_from_starts,
         quant_w_per_channel,
@@ -596,8 +597,8 @@ def build_tensor_specs(start_pos=None):
 
     return [
         TensorSpec("x", [T, D], torch.bfloat16, init_value=init_x),
-        TensorSpec("wq_a", [D, Q_LORA], torch.bfloat16, init_value=init_wq_a),
-        TensorSpec("wq_b", [Q_LORA, H * HEAD_DIM], torch.int8, init_value=lambda: wq_b_i8),
+        TensorSpec("wq_a", [D, Q_LORA], torch.bfloat16, init_value=lambda: pack_nz(init_wq_a())),
+        TensorSpec("wq_b", [Q_LORA, H * HEAD_DIM], torch.int8, init_value=lambda: pack_nz(wq_b_i8)),
         TensorSpec("wq_b_scale", [H * HEAD_DIM], torch.float32, init_value=lambda: wq_b_scale),
         TensorSpec("wkv", [D, HEAD_DIM], torch.bfloat16, init_value=init_wkv),
         TensorSpec("gamma_cq", [Q_LORA], torch.bfloat16, init_value=lambda: torch.ones(Q_LORA)),

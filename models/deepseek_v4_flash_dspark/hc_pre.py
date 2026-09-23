@@ -96,6 +96,8 @@ def hc_pre_gates(
     linear_units = (t_linear // LINEAR_T_TILE) * LINEAR_OK
     linear_workers = pl.min(linear_units, LINEAR_WORKERS)
     for linear_worker in pl.spmd(linear_workers, name_hint="hc_pre_linear", allow_early_resolve=True):
+        # Weight reads bypass L2.
+        pl.set_cache_policy(hc_fn, pl.CachePolicy.BYPASS)
         for task in pl.range(linear_worker, linear_units, linear_workers):
             t0 = (task // LINEAR_OK) * LINEAR_T_TILE
             linear_split = task % LINEAR_OK

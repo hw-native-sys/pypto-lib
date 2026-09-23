@@ -108,6 +108,8 @@ def _hc_head(
             linear_full_rows // LINEAR_T_TILE,
             name_hint="hc_head_linear",
         ) as _linear_tid:
+            # Weight reads bypass L2.
+            pl.set_cache_policy(hc_head_fn, pl.CachePolicy.BYPASS)
             task = pl.tile.get_block_idx()
             t0 = task * LINEAR_T_TILE
             acc_full = pl.create_tensor([LINEAR_T_TILE, HC_PAD], dtype=pl.FP32)
@@ -130,6 +132,7 @@ def _hc_head(
             level=pl.Level.CORE_GROUP,
             name_hint="hc_head_linear_tail",
         ):
+            pl.set_cache_policy(hc_head_fn, pl.CachePolicy.BYPASS)
             tail_rows = t_dim - linear_full_rows
             acc_tail = pl.create_tensor([LINEAR_T_TILE, HC_PAD], dtype=pl.FP32)
             for kb in pl.pipeline(0, HC_DIM // LINEAR_K_TILE, stage=2):

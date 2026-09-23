@@ -95,6 +95,9 @@ def indexer_compressor_project(
     with pl.spmd(
         KV_SCORE_WORKERS, name_hint="kv_score_proj", deps=[late_dep, chain_dep],
     ) as _kv_score_tid:
+        # Weight reads bypass L2.
+        pl.set_cache_policy(wkv, pl.CachePolicy.BYPASS)
+        pl.set_cache_policy(wgate, pl.CachePolicy.BYPASS)
         kv_worker = pl.tile.get_block_idx()
         for idx in pl.range(kv_worker, t_matmul * OUT_DIM // (MM_B_TILE * PROJ_OUT_TILE), KV_SCORE_WORKERS):
             global_row0 = (idx // (OUT_DIM // PROJ_OUT_TILE)) * MM_B_TILE

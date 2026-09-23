@@ -531,7 +531,7 @@ def _hca_streaming_attn_tile(
     freqs_cos: pl.Tensor[[T_DYN, ROPE_DIM], pl.BF16],
     freqs_sin: pl.Tensor[[T_DYN, ROPE_DIM], pl.BF16],
     wo_a: pl.Tensor[[O_GROUPS, O_LORA, O_GROUP_IN], pl.BF16],
-    wo_b: pl.Tensor[[D, O_GROUPS * O_LORA], pl.INT8],
+    wo_b: pl.Tensor[[O_GROUPS, D, O_LORA], pl.INT8],
     wo_b_scale: pl.Tensor[[D], pl.FP32],
     attn_out: pl.Tensor[[T_DYN, D], pl.BF16],
     o_packed_heads: pl.Tensor[[O_GROUPS * T_PAD * HEADS_PER_GROUP, HEAD_DIM], pl.BF16],
@@ -1083,7 +1083,7 @@ def _sparse_attn_heads(
 def _sparse_attn_o_proj(
     o_packed_heads: pl.Tensor[[O_GROUPS * T_PAD * HEADS_PER_GROUP, HEAD_DIM], pl.BF16],
     wo_a: pl.Tensor[[O_GROUPS, O_LORA, O_GROUP_IN], pl.BF16],
-    wo_b: pl.Tensor[[D, O_GROUPS * O_LORA], pl.INT8],
+    wo_b: pl.Tensor[[O_GROUPS, D, O_LORA], pl.INT8],
     wo_b_scale: pl.Tensor[[D], pl.FP32],
     attn_out: pl.Tensor[[T_DYN, D], pl.BF16],
     tile_base: pl.Scalar[pl.INDEX],
@@ -1185,18 +1185,20 @@ def _sparse_attn_o_proj(
                         n0 = d0 + nf * PROJ_B_MM_N_TILE
                         for pb_rb in pl.range(proj_b_rows):
                             pb_r0 = pb_rb * PROJ_B_ROW_TILE
-                            acc_b = pl.create_tensor([PROJ_B_ROW_TILE, PROJ_B_MM_N_TILE], dtype=pl.INT32)
+                            acc_b = pl.create_tensor([1, PROJ_B_ROW_TILE, PROJ_B_MM_N_TILE], dtype=pl.INT32)
                             for kb in pl.pipeline(0, O_LORA // B_K_TILE, stage=2):
                                 k0 = col_g + kb * B_K_TILE
+                                wb_k0 = kb * B_K_TILE
                                 b_act = o_r_i8[
                                     pb_r0 : pb_r0 + PROJ_B_ROW_TILE,
                                     k0 : k0 + B_K_TILE,
                                 ]
-                                b_weight = wo_b[n0 : n0 + PROJ_B_MM_N_TILE, k0 : k0 + B_K_TILE]
+                                b_weight = wo_b[g : g + 1, n0 : n0 + PROJ_B_MM_N_TILE, wb_k0 : wb_k0 + B_K_TILE]
                                 acc_b = pl.matmul_acc(acc_b, b_act, b_weight, b_trans=True, init_cond=(kb == 0))
+                            acc_b_2d = pl.reshape(acc_b, [PROJ_B_ROW_TILE, PROJ_B_MM_N_TILE])
                             partials[
                                 pb_r0 : pb_r0 + PROJ_B_ROW_TILE, g * D + n0 : g * D + n0 + PROJ_B_MM_N_TILE
-                            ] = acc_b
+                            ] = acc_b_2d
                 proj_b_tids[dc * O_GROUPS + g] = pb_tid
 
     # Dequantize and sum per-group INT32 partials into the BF16 output.
@@ -1248,7 +1250,7 @@ def hca_streaming_attn_physical(
     freqs_cos: pl.Tensor[[T_DYN, ROPE_DIM], pl.BF16],
     freqs_sin: pl.Tensor[[T_DYN, ROPE_DIM], pl.BF16],
     wo_a: pl.Tensor[[O_GROUPS, O_LORA, O_GROUP_IN], pl.BF16],
-    wo_b: pl.Tensor[[D, O_GROUPS * O_LORA], pl.INT8],
+    wo_b: pl.Tensor[[O_GROUPS, D, O_LORA], pl.INT8],
     wo_b_scale: pl.Tensor[[D], pl.FP32],
     attn_out: pl.Tensor[[T_DYN, D], pl.BF16],
     cache_ready_dep: pl.Scalar[pl.TASK_ID],
@@ -1307,7 +1309,7 @@ def sparse_attn_compute(
     freqs_cos: pl.Tensor[[T_DYN, ROPE_DIM], pl.BF16],
     freqs_sin: pl.Tensor[[T_DYN, ROPE_DIM], pl.BF16],
     wo_a: pl.Tensor[[O_GROUPS, O_LORA, O_GROUP_IN], pl.BF16],
-    wo_b: pl.Tensor[[D, O_GROUPS * O_LORA], pl.INT8],
+    wo_b: pl.Tensor[[O_GROUPS, D, O_LORA], pl.INT8],
     wo_b_scale: pl.Tensor[[D], pl.FP32],
     attn_out: pl.Tensor[[T_DYN, D], pl.BF16],
     o_proj_weight_dep: pl.Scalar[pl.TASK_ID],
@@ -1372,7 +1374,7 @@ def sparse_attn_physical(
     freqs_cos: pl.Tensor[[T_DYN, ROPE_DIM], pl.BF16],
     freqs_sin: pl.Tensor[[T_DYN, ROPE_DIM], pl.BF16],
     wo_a: pl.Tensor[[O_GROUPS, O_LORA, O_GROUP_IN], pl.BF16],
-    wo_b: pl.Tensor[[D, O_GROUPS * O_LORA], pl.INT8],
+    wo_b: pl.Tensor[[O_GROUPS, D, O_LORA], pl.INT8],
     wo_b_scale: pl.Tensor[[D], pl.FP32],
     attn_out: pl.Tensor[[T_DYN, D], pl.BF16],
     o_proj_weight_dep: pl.Scalar[pl.TASK_ID],
@@ -1414,7 +1416,7 @@ def prefill_sparse_attn_test(
     freqs_cos: pl.Tensor[[T_DYN, ROPE_DIM], pl.BF16],
     freqs_sin: pl.Tensor[[T_DYN, ROPE_DIM], pl.BF16],
     wo_a: pl.Tensor[[O_GROUPS, O_LORA, O_GROUP_IN], pl.BF16],
-    wo_b: pl.Tensor[[D, O_GROUPS * O_LORA], pl.INT8],
+    wo_b: pl.Tensor[[O_GROUPS, D, O_LORA], pl.INT8],
     wo_b_scale: pl.Tensor[[D], pl.FP32],
     attn_out: pl.Out[pl.Tensor[[T_DYN, D], pl.BF16]],
 ):
@@ -1541,10 +1543,10 @@ def golden_prefill_sparse_attn(tensors):
     scale_q_g = INT8_SCALE_MAX / amax_g
     o_r_i8_g = torch.round(o_r_g * scale_q_g).to(torch.int32).to(torch.float16).to(torch.int8)
     scale_dq_g = 1.0 / scale_q_g  # [T, G, 1]
-    wo_b_g = wo_b_i8.reshape(D, O_GROUPS, O_LORA)
+    wo_b_g = wo_b_i8  # already [GROUPS, D, O_LORA]
     out = torch.zeros(token_count, D, dtype=torch.float32)
     for g in range(O_GROUPS):
-        p_g = o_r_i8_g[:, g].to(torch.int32) @ wo_b_g[:, g].to(torch.int32).T  # [T, D]
+        p_g = o_r_i8_g[:, g].to(torch.int32) @ wo_b_g[g].to(torch.int32).T  # [T, D]
         out = out + p_g.float() * scale_dq_g[:, g]  # per-row group scale
     out = out * wo_b_scale.unsqueeze(0)  # per-channel weight scale
     tensors["attn_out"][:] = out.to(torch.bfloat16)
@@ -1655,6 +1657,9 @@ def build_tensor_specs(
         return ((torch.rand(D, O_GROUPS * O_LORA) - 0.5) * (O_GROUPS * O_LORA) ** -0.5).to(torch.bfloat16)
 
     wo_b_i8, wo_b_scale = quant_w_per_channel(init_wo_b())
+    # wo_b's group axis matches wo_a's own [GROUPS, ...] convention: fold the
+    # flat [D, GROUPS*O_LORA] quant result into [GROUPS, D, O_LORA].
+    wo_b_i8_groups = wo_b_i8.reshape(D, O_GROUPS, O_LORA).permute(1, 0, 2).contiguous()
 
     return [
         TensorSpec("q", [token_count, H, HEAD_DIM], torch.bfloat16, init_value=init_q),
@@ -1678,7 +1683,7 @@ def build_tensor_specs(
         TensorSpec("freqs_cos", [token_count, ROPE_DIM], torch.bfloat16, init_value=init_freqs_cos),
         TensorSpec("freqs_sin", [token_count, ROPE_DIM], torch.bfloat16, init_value=init_freqs_sin),
         TensorSpec("wo_a", [O_GROUPS, O_LORA, O_GROUP_IN], torch.bfloat16, init_value=init_wo_a),
-        TensorSpec("wo_b", [D, O_GROUPS * O_LORA], torch.int8, init_value=lambda: wo_b_i8),
+        TensorSpec("wo_b", [O_GROUPS, D, O_LORA], torch.int8, init_value=lambda: wo_b_i8_groups),
         TensorSpec("wo_b_scale", [D], torch.float32, init_value=lambda: wo_b_scale),
         TensorSpec("attn_out", [token_count, D], torch.bfloat16),
     ]
