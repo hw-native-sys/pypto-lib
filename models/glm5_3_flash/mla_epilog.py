@@ -10,7 +10,7 @@
 
 Prefill projects ``[T, LOCAL_H * V_DIM]`` through the plain ``o_proj``; decode
 projects ``[T, LOCAL_H * KV_LORA]`` through the value-absorbed ``o_proj`` produced
-by :mod:`models.glm5_3_flash.mla_absorb`. Both are row-parallel over heads, so the
+by :mod:`models.glm5_3_flash.mla_prolog`. Both are row-parallel over heads, so the
 result is a partial sum that needs an all-reduce across the 16 ranks before mHC
 folds it back into the residual stream.
 
