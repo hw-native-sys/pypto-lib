@@ -884,19 +884,13 @@ def l3_moe(
             # The [N_RANKS, ...] leading axis above stays plain; slicing off it
             # keeps the same NZ-blocked trailing layout, but the type itself
             # needs re-annotating for the callee below.
-            routed_w1_r: pl.Tensor[[N_LOCAL, MOE_INTER, D], pl.INT8, pl.NZ] = routed_w1[r]
-            routed_w3_r: pl.Tensor[[N_LOCAL, MOE_INTER, D], pl.INT8, pl.NZ] = routed_w3[r]
-            routed_w2_r: pl.Tensor[[N_LOCAL, D, MOE_INTER], pl.INT8, pl.NZ] = routed_w2[r]
-            shared_w1_r: pl.Tensor[[MOE_INTER, D], pl.INT8, pl.NZ] = shared_w1[r]
-            shared_w3_r: pl.Tensor[[MOE_INTER, D], pl.INT8, pl.NZ] = shared_w3[r]
-            shared_w2_r: pl.Tensor[[D, MOE_INTER], pl.INT8, pl.NZ] = shared_w2[r]
             moe_test(
                 x_hc[round_id, r], hc_ffn_fn[r], hc_ffn_scale[r], hc_ffn_base[r],
                 norm_w[r], gate_w[r], gate_bias[r], tid2eid[r], input_ids[round_id, r],
-                routed_w1_r, routed_w1_scale[r], routed_w3_r, routed_w3_scale[r],
-                routed_w2_r, routed_w2_scale[r],
-                shared_w1_r, shared_w1_scale[r], shared_w3_r, shared_w3_scale[r],
-                shared_w2_r, shared_w2_scale[r],
+                routed_w1[r], routed_w1_scale[r], routed_w3[r], routed_w3_scale[r],
+                routed_w2[r], routed_w2_scale[r],
+                shared_w1[r], shared_w1_scale[r], shared_w3[r], shared_w3_scale[r],
+                shared_w2[r], shared_w2_scale[r],
                 x_next[round_id, r],
                 recv_meta, recv_x, recv_aux, recv_route, arrived, data_arrived,
                 routed_y_buf, combine_arrived,

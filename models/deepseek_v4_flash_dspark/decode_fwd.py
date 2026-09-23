@@ -1398,19 +1398,10 @@ def l3_decode_fwd(
         lm_head_logits_done = pld.window(lm_head_logits_done_buf, [LM_HEAD_TP_SIZE, 1], dtype=pl.INT32)
         tp_rank = rank % TP_SIZE
         group_base = rank - tp_rank
-        wq_a_r: pl.Tensor[[FWD_WEIGHT_BANK_SIZE, D, Q_LORA], pl.BF16, pl.NZ] = wq_a[rank]
-        wq_b_r: pl.Tensor[[FWD_WEIGHT_BANK_SIZE, Q_LORA, H * HEAD_DIM], pl.INT8, pl.NZ] = wq_b[rank]
-        lm_head_weight_r: pl.Tensor[[VOCAB_PER_TP, D], pl.BF16, pl.NZ] = lm_head_weight[rank]
-        routed_w1_r: pl.Tensor[[FWD_WEIGHT_BANK_SIZE * N_LOCAL, MOE_INTER, D], pl.INT8, pl.NZ] = routed_w1[rank]
-        routed_w3_r: pl.Tensor[[FWD_WEIGHT_BANK_SIZE * N_LOCAL, MOE_INTER, D], pl.INT8, pl.NZ] = routed_w3[rank]
-        routed_w2_r: pl.Tensor[[FWD_WEIGHT_BANK_SIZE * N_LOCAL, D, MOE_INTER], pl.INT8, pl.NZ] = routed_w2[rank]
-        shared_w1_r: pl.Tensor[[FWD_WEIGHT_BANK_SIZE, MOE_INTER, D], pl.INT8, pl.NZ] = shared_w1[rank]
-        shared_w3_r: pl.Tensor[[FWD_WEIGHT_BANK_SIZE, MOE_INTER, D], pl.INT8, pl.NZ] = shared_w3[rank]
-        shared_w2_r: pl.Tensor[[FWD_WEIGHT_BANK_SIZE, D, MOE_INTER], pl.INT8, pl.NZ] = shared_w2[rank]
         l2_decode_fwd(
             embed_weight[rank],
             hc_attn_fn[rank], hc_attn_scale[rank], hc_attn_base[rank],
-            attn_norm_w[rank], wq_a_r, wq_b_r,
+            attn_norm_w[rank], wq_a[rank], wq_b[rank],
             wq_b_scale[rank], wkv[rank], gamma_cq[rank], gamma_ckv[rank],
             raw_kv_pool[rank], freqs_cos[rank], freqs_sin[rank],
             compressed_freqs_cos[rank], compressed_freqs_sin[rank],
@@ -1447,14 +1438,14 @@ def l3_decode_fwd(
             norm_w[rank], gate_w[rank], gate_bias[rank], tid2eid[rank],
             input_ids[rank], num_tokens_per_owner,
             hc_head_fn[rank], hc_head_scale[rank], hc_head_base[rank],
-            final_norm_w[rank], lm_head_weight_r,
+            final_norm_w[rank], lm_head_weight[rank],
             logit_row_indices[rank],
-            routed_w1_r, routed_w1_scale[rank],
-            routed_w3_r, routed_w3_scale[rank],
-            routed_w2_r, routed_w2_scale[rank],
-            shared_w1_r, shared_w1_scale[rank],
-            shared_w3_r, shared_w3_scale[rank],
-            shared_w2_r, shared_w2_scale[rank],
+            routed_w1[rank], routed_w1_scale[rank],
+            routed_w3[rank], routed_w3_scale[rank],
+            routed_w2[rank], routed_w2_scale[rank],
+            shared_w1[rank], shared_w1_scale[rank],
+            shared_w3[rank], shared_w3_scale[rank],
+            shared_w2[rank], shared_w2_scale[rank],
             hidden_workspace[rank],
             x_ping[rank], x_pong[rank],
             x_attn_active[rank], x_moe_next[rank],
