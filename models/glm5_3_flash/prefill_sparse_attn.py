@@ -21,6 +21,15 @@ Causality and padding are already folded into the index list by the indexer — 
 that should not be visible is ``-1`` — so this kernel must not re-apply a causal
 mask, only honour the ``-1`` sentinel.
 
+**``topk_indices`` is front packed, and this kernel requires it**, exactly as the
+decode path does. Every valid position precedes every ``-1``, so a row's padding is
+one suffix — the indexer's ABI, see
+:func:`models.glm5_3_flash.prefill_indexer.indexer_expand`. This kernel tests lane 0
+of a 128-wide block to treat it as all padding, and lane 0 of the row to emit a zero
+row; against an interleaved list both would drop the live entries behind the first
+``-1``. The per-lane ``-1`` handling inside a gathered block is unconditional and
+does not depend on the packing.
+
 Like the decode path, the indexer emits **logical per-request positions**, so the
 block table is part of this kernel's ABI: resolving it host-side would mean a
 per-layer index translation outside the kernel.
@@ -142,8 +151,10 @@ def prefill_sparse_attn(
     ``H_PAD`` = 16 all follow :mod:`models.glm5_3_flash.decode_sparse_attn`; causality
     and request padding are already folded into the index list.
 
-    An all-padding block takes one wide gather of the pool's first ``ATTN_K_TILE`` rows
-    and then runs the block like any other, rather than skipping the merge: with the
+    A block whose lane 0 is ``-1`` is all padding — the front-packing ABI is what
+    makes that one lane conclusive — and takes one wide gather of the pool's first
+    ``ATTN_K_TILE`` rows, then runs like any other block rather than skipping the
+    merge: with the
     bias row left at ``NEG_INF`` its ``beta`` is zero, so it contributes nothing. The
     branch must not decide whether the carried state is updated. A branch the carried
     tiles flow through forces the partitioner to materialise their pre-loop
@@ -310,6 +321,10 @@ def build_prefill_sparse_attn_specs(requests: int = 2, rows: int = 6, pages_per_
     Row ``rows`` selects nothing, which is the padded-batch row the kernel must answer
     with zeros rather than a division by zero; the one-block path it would otherwise
     have covered is still covered by row 0.
+
+    Every row is front packed, which is the indexer's ABI: the ``-1`` lanes are one
+    suffix per row. A fixture that interleaved them would be invalid input, not a
+    harder case, so none is built here.
     """
     from golden import TensorSpec
 

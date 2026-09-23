@@ -455,8 +455,8 @@ RoPE machinery, and add the KDA family and the kpool indexer.
 | `mla_prolog.py` | Goldens, the prolog body (three `b_trans` matmuls and two rms-norm scopes, no split-K yet), the per-token `absorb_query` body, and a device test entry per case. `absorb_output` is weight-time and belongs to the loader. Passes `a2a3sim` and a2a3 |
 | `mla_cache.py` | Golden, kernel body (`pl.spmd` scatter, one block per row), device test entry and specs. Passes `a2a3sim` and a2a3 |
 | `mla_epilog.py` | Goldens, both kernel bodies (row-parallel `b_trans` projection over D, FP32 partial sum for the TP16 all-reduce) and a device test entry per path. Passes `a2a3sim` and a2a3 |
-| `prefill_sparse_attn.py` | Golden, kernel body (one item per token, `pl.yield_`-carried online softmax, value expansion after the block loop) and a device test entry. **Attends in latent space**: absorbing keeps the two expansions out of the per-token block loop, at the cost of two BF16 roundings against the expanded reference. An all-padding block is filled by one wide gather and merged with `beta` = 0 rather than skipped, so no branch carries the online-softmax state. Passes `a2a3sim` and a2a3 |
-| `decode_sparse_attn.py` | Golden, kernel body (24 lanes over (token, sparse block), L1 gather, flash partials, alpha/beta merge, empty-block skip) and a device test entry. Assumes a front-packed index list. Passes `a2a3sim` and a2a3 |
+| `prefill_sparse_attn.py` | Golden, kernel body (one item per token, `pl.yield_`-carried online softmax, value expansion after the block loop) and a device test entry. **Attends in latent space**: absorbing keeps the two expansions out of the per-token block loop, at the cost of two BF16 roundings against the expanded reference. An all-padding block is filled by one wide gather and merged with `beta` = 0 rather than skipped, so no branch carries the online-softmax state. Requires the front-packed `topk_indices` ABI. Passes `a2a3sim` and a2a3 |
+| `decode_sparse_attn.py` | Golden, kernel body (24 lanes over (token, sparse block), L1 gather, flash partials, alpha/beta merge, empty-block skip) and a device test entry. Requires the front-packed `topk_indices` ABI. Passes `a2a3sim` and a2a3 |
 | `attention_tp.py` | ABI only, but it is the one shared consumer: `kda_output`, both `mla_epilog` entries and `dense_mlp` all emit an FP32 row-parallel partial, and this is what adds the 16 of them |
 | everything else | ABI and docstring only; the golden and the kernel body are the assignment |
 
@@ -469,7 +469,6 @@ RoPE machinery, and add the KDA family and the kpool indexer.
   cache and a separate FP32 pooled-state page class with a page of four tokens;
   storing the raw row instead is simpler but larger. Stream C decides, stream E's
   cache manager implements.
-- **Whether the indexer's index list is front packed.** `decode_sparse_attn` skips a sparse block whose lane 0 is `-1`, which turns a 40-selection request from 2,176 gathered rows into 128. Stream C owns the emission order; if a list can interleave `-1` with live selections the skip has to go, or the indexer has to compact.
 - **Whether the MLA decode path absorbs.** `kv_b_proj` is BF16 in the checkpoint,
   so folding it into an INT8 `o_proj` changes the numerics of the epilogue.
 - **The cache budget.** At about 18 KB per token per rank the hybrid cache holds

@@ -30,7 +30,10 @@ One file owns the whole selection pipeline for this phase, the way
 5. **Expansion.** Each selected pool becomes 4 raw cache rows; the incomplete tail
    pool is always appended (``index_kpool_always_select_tail``); the result is
    padded with ``-1`` to a fixed ``TOPK_INDEX_WIDTH`` = 2051 so FULL_DECODE_ONLY
-   graph capture sees a static shape.
+   graph capture sees a static shape. **The live rows are front packed**: every
+   valid position precedes every ``-1``, so a row's `-1` entries form one
+   suffix. This is an ABI guarantee the sparse attention relies on — see
+   :func:`indexer_expand`.
 
 All 32 indexer heads live on **every** rank: the score sums over heads before the
 top-k, so head-sharding would force a cross-rank reduction of partial scores on
@@ -214,6 +217,21 @@ def indexer_expand(
     kv_len: pl.Tensor[[T_DYN], pl.INT32],
     topk_indices: pl.Tensor[[T_DYN, TOPK_INDEX_WIDTH], pl.INT32],
 ):
+    """Expand the selected pools into raw cache rows, front packed per row.
+
+    **ABI**: ``topk_indices`` is front packed. Each row holds its valid logical
+    positions in its leading lanes and pads the remaining suffix with ``-1``; a
+    ``-1`` never sits between two valid entries. Both sparse attention kernels
+    read this as a contract rather than a convention: they test one lane to
+    decide that a 128-wide block, or a whole row, carries no selection, so an
+    interleaved ``-1`` would silently drop the live entries behind it. See
+    :mod:`models.glm5_3_flash.decode_sparse_attn` and
+    :mod:`models.glm5_3_flash.prefill_sparse_attn`.
+
+    Selection order within the packed prefix is free — the attention is a
+    permutation-invariant softmax over the gathered rows — so this constrains
+    only where the padding goes.
+    """
     raise NotImplementedError("indexer expand kernel body is assigned independently")
 
 

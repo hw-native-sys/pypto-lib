@@ -19,6 +19,16 @@ the gather is ragged across rows even within one request. FULL_DECODE_ONLY graph
 capture needs the shapes static, so the index list stays padded to
 ``TOPK_INDEX_WIDTH`` and the ``-1`` sentinel does the masking.
 
+**``topk_indices`` is front packed, and this kernel requires it.** Every valid
+position precedes every ``-1``, so a row's padding is one suffix and a ``-1`` never
+sits between two live entries. That is the indexer's ABI — see
+:func:`models.glm5_3_flash.decode_indexer.indexer_expand` — not an observation about
+the current reference. The kernel reads one lane to decide that a 128-wide block, or
+a whole row, selects nothing; against an interleaved list those tests would drop the
+live entries behind the first ``-1``. Honouring ``-1`` per lane inside a block is
+unconditional and stays correct either way; only the block-level and row-level
+short-circuits depend on the packing.
+
 **The indexer emits logical per-request positions, not physical cache rows**, so the
 block table is part of this kernel's ABI rather than something the host resolves.
 Resolving it host-side would push a per-layer index translation into the captured
@@ -133,10 +143,11 @@ def decode_sparse_attn(
     so no causal mask is applied here.
 
     A block whose lane 0 is ``-1`` is skipped outright and emits ``(NEG_INF, 0, 0)``,
-    which the merge's ``beta`` discards. This assumes the index list is **front
-    packed** — selections first, padding after — which is what the reference emits;
-    the 2,176 lanes cover a 1 M context, so a short request would otherwise gather
-    2,176 rows to use 40 of them. ``NEG_INF`` is a finite floor precisely so that
+    which the merge's ``beta`` discards. This reads the indexer's front-packing ABI
+    (module docstring): lane 0 being ``-1`` means the whole block is padding, because
+    padding is a suffix. The skip is what keeps a short request cheap — the 2,176
+    lanes cover a 1 M context, so without it a 40-selection row would gather 2,176
+    rows to use 40 of them. ``NEG_INF`` is a finite floor precisely so that
     ``NEG_INF - NEG_INF`` is 0 rather than NaN when every block of a row is skipped.
 
     **Precondition**: every row has at least one valid lane, which
@@ -290,6 +301,10 @@ def build_decode_sparse_attn_specs(requests: int = 2, pages_per_request: int = 4
     and the ``SPARSE_BLOCKS`` padding are both exercised. The counts ramp past
     ``ATTN_K_TILE`` so rows span one to four sparse blocks and the merge sees more
     than one live partial.
+
+    Every row is front packed, which is the indexer's ABI: the ``-1`` lanes are one
+    suffix per row. A fixture that interleaved them would be invalid input, not a
+    harder case, so none is built here.
     """
     from golden import TensorSpec
 
