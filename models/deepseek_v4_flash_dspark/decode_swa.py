@@ -503,7 +503,7 @@ def _decode_swa_tp1(
         q, kv, qr, qr_scale, late_dep,
     )
 
-    # Commit current decode KV and build its additive padding mask by token tile.
+    # Commit current decode KV and build its additive padding mask in parallel.
     # The SWA attention kernel reads every visible row through metadata-expanded
     # physical cache indices, so all cache writes must complete before it starts.
     ori_block_num = pl.tensor.dim(kv_cache, 0)
@@ -511,13 +511,15 @@ def _decode_swa_tp1(
     sparse_bias = pl.create_tensor([t_dim, WIN], dtype=pl.FP32)
     # SWA_TRANSACTION_ROWS guarantees that later speculative writes cannot
     # alias history still visible to an earlier query in this same step.
-    for v_blk in pl.spmd(bias_blocks, name_hint="swa_cache_insert_valid_bias"):
-        v_t0 = v_blk * BIAS_T_TILE
-        for write_t in pl.range(v_t0, v_t0 + BIAS_T_TILE):
+    for write_blk in pl.spmd(bias_blocks, name_hint="swa_cache_insert"):
+        write_t0 = write_blk * BIAS_T_TILE
+        for write_t in pl.range(write_t0, write_t0 + BIAS_T_TILE):
             write_row_i64 = pl.read(swa_slot_mapping, [write_t])
             if write_row_i64 >= 0:
                 write_row = pl.cast(write_row_i64, pl.INDEX)
                 kv_cache_flat[write_row : write_row + 1, 0 : HEAD_DIM] = kv[write_t : write_t + 1, 0 : HEAD_DIM]
+    for v_blk in pl.spmd(bias_blocks, name_hint="swa_valid_bias"):
+        v_t0 = v_blk * BIAS_T_TILE
         v_col = pl.cast(pl.arange(0, [1, WIN], dtype=pl.INT32), target_type=pl.FP32)
         v_col_m = pl.col_expand(pl.full([BIAS_T_TILE, WIN], dtype=pl.FP32, value=0.0), v_col)
         v_lens = pl.cast(pl.reshape(swa_lens[v_t0 : v_t0 + BIAS_T_TILE], [BIAS_T_TILE, 1]), target_type=pl.FP32)

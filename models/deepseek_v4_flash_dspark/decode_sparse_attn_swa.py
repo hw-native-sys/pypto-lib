@@ -57,6 +57,8 @@ AIV_CORES = 48
 QK_TASKS = AIC_CORES                  # 1 AIC + 2 AIV records each -> 24 AIC + 48 AIV
 MERGE_TASKS = AIV_CORES               # pure AIV, one full wave
 GATHER_RUN = 16          # window sub-tile probed for physical contiguity -> one bulk DMA
+GATHER_PARTS = 2
+GATHER_PART_ROWS = WIN // GATHER_PARTS
 REQUEST_KV_ROWS = WIN + S - 1
 H_TILE = 32
 QK_PRE_LAUNCH = 2
@@ -82,6 +84,8 @@ ATTENTION_WINDOW_ROWS = LOCAL_O_GROUPS * GROUP_T_PAD
 
 if BLOCK_SIZE % GATHER_RUN != 0:
     raise ValueError("a contiguous run must not straddle two paged blocks")
+if WIN % (GATHER_PARTS * GATHER_RUN) != 0:
+    raise ValueError("the SWA window must contain complete gather partitions")
 if WIN != ATTN_K_TILE:
     raise ValueError(f"SWA decode expects WIN ({WIN}) == ATTN_K_TILE ({ATTN_K_TILE})")
 if H_TILE % HEADS_PER_GROUP != 0:
@@ -117,16 +121,30 @@ def sparse_attn_swa(
     # drops only the rows that have slid out of its window.
     swa_kv_flat = pl.create_tensor([request_count * REQUEST_KV_ROWS, HEAD_DIM], dtype=pl.BF16)
     gather_tids = pl.array.create(1, pl.TASK_ID)
-    with pl.spmd(request_count, name_hint="swa_gather_kv") as gather_tid:
-        g_req = pl.tile.get_block_idx()
+    with pl.spmd(request_count * GATHER_PARTS, name_hint="swa_gather_kv") as gather_tid:
+        g_worker = pl.tile.get_block_idx()
+        g_req = g_worker // GATHER_PARTS
+        g_part = g_worker % GATHER_PARTS
         g_t0 = g_req * S
         g_base = g_req * REQUEST_KV_ROWS
         g_first_len = pl.read(swa_lens, [g_t0])
-        g_zero_rows = pl.full([REQUEST_KV_ROWS, HEAD_DIM], dtype=pl.BF16, value=0.0)
-        swa_kv_flat[g_base : g_base + REQUEST_KV_ROWS, 0 : HEAD_DIM] = g_zero_rows
+        g_part_row0 = g_part * GATHER_PART_ROWS
+        if g_part == 0:
+            g_zero_rows = pl.full([GATHER_PART_ROWS, HEAD_DIM], dtype=pl.BF16, value=0.0)
+            swa_kv_flat[g_base : g_base + GATHER_PART_ROWS, 0 : HEAD_DIM] = g_zero_rows
+        else:
+            g_zero_tail = pl.full(
+                [REQUEST_KV_ROWS - GATHER_PART_ROWS, HEAD_DIM],
+                dtype=pl.BF16,
+                value=0.0,
+            )
+            swa_kv_flat[
+                g_base + GATHER_PART_ROWS : g_base + REQUEST_KV_ROWS,
+                0 : HEAD_DIM,
+            ] = g_zero_tail
 
-        for g_sub in pl.range((WIN - 1) // GATHER_RUN):
-            g_sr0 = g_sub * GATHER_RUN
+        for g_sub in pl.range(GATHER_PART_ROWS // GATHER_RUN):
+            g_sr0 = g_part_row0 + g_sub * GATHER_RUN
             g_sdst = g_base + g_sr0
             if g_sr0 + GATHER_RUN <= g_first_len:
                 g_first = pl.read(swa_indices, [g_t0, g_sr0])
@@ -153,22 +171,22 @@ def sparse_attn_swa(
                             g_dst = g_base + g_row
                             swa_kv_flat[g_dst : g_dst + 1, 0 : HEAD_DIM] = ori_kv_flat[g_slot : g_slot + 1, 0 : HEAD_DIM]
 
-        for g_row in pl.range(((WIN - 1) // GATHER_RUN) * GATHER_RUN, WIN):
-            if g_row < g_first_len:
-                g_slot_i32 = pl.read(swa_indices, [g_t0, g_row])
-                if g_slot_i32 >= 0:
-                    g_slot = pl.cast(g_slot_i32, pl.INDEX)
-                    g_dst = g_base + g_row
-                    swa_kv_flat[g_dst : g_dst + 1, 0 : HEAD_DIM] = ori_kv_flat[g_slot : g_slot + 1, 0 : HEAD_DIM]
-
         for g_token in pl.unroll(S - 1):
             g_t = g_t0 + g_token + 1
             g_len = pl.read(swa_lens, [g_t])
             g_slot_i32 = pl.read(swa_indices, [g_t, g_len - 1])
+            g_dst_row = g_first_len + g_token
             if g_slot_i32 >= 0:
-                g_slot = pl.cast(g_slot_i32, pl.INDEX)
-                g_dst = g_base + g_first_len + g_token
-                swa_kv_flat[g_dst : g_dst + 1, 0 : HEAD_DIM] = ori_kv_flat[g_slot : g_slot + 1, 0 : HEAD_DIM]
+                if g_part == 0 and g_dst_row < GATHER_PART_ROWS:
+                    g_slot = pl.cast(g_slot_i32, pl.INDEX)
+                    g_dst = g_base + g_dst_row
+                    g_slot_row = ori_kv_flat[g_slot : g_slot + 1, 0 : HEAD_DIM]
+                    swa_kv_flat[g_dst : g_dst + 1, 0 : HEAD_DIM] = g_slot_row
+                if g_part == GATHER_PARTS - 1 and g_dst_row >= GATHER_PART_ROWS:
+                    g_slot = pl.cast(g_slot_i32, pl.INDEX)
+                    g_dst = g_base + g_dst_row
+                    g_slot_row = ori_kv_flat[g_slot : g_slot + 1, 0 : HEAD_DIM]
+                    swa_kv_flat[g_dst : g_dst + 1, 0 : HEAD_DIM] = g_slot_row
 
     gather_tids[0] = gather_tid
 
