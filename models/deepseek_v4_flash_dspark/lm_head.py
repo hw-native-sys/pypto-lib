@@ -59,10 +59,11 @@ TEST_TOKENS = 2 * MAX_LOGIT_ROWS  # standalone fixture: hidden rows per card
 # One whole owner per block is the widest M the Acc space admits, and it halves
 # the weight tile re-reads a narrower row tile forces.
 FUSED_K_TILE = 256
-FUSED_VOCAB_TILE = 128
+FUSED_VOCAB_TILE = 256 if TP_SIZE == 1 else 128
+FUSED_CROSS_CORE_SLOTS = 1 if TP_SIZE == 1 else 2
 MM_ROW_TILE = 128
-HIDDEN_GATHER_TILE = 1024
-HIDDEN_GATHER_ROW_TILE = min(GROUP_LOGIT_ROWS, 64)
+HIDDEN_GATHER_TILE = D if TP_SIZE == 1 else 1024
+HIDDEN_GATHER_ROW_TILE = GROUP_LOGIT_ROWS if TP_SIZE == 1 else min(GROUP_LOGIT_ROWS, 64)
 PUSH_ROW_TILE = 16  # rows pushed per dispatch_push block (fewer, larger ring puts)
 LOGITS_GATHER_ROW_TILE = min(MAX_LOGIT_ROWS, 8)
 LOGITS_COMM_TILE = 2048
@@ -80,7 +81,10 @@ VOCAB_TAIL = VOCAB_PER_TP % FUSED_VOCAB_TILE
 VOCAB_FULL_TILES = VOCAB_PER_TP // FUSED_VOCAB_TILE
 LOGITS_COMM_TAIL = VOCAB_PER_TP % LOGITS_COMM_TILE
 N_LOGITS_COMM_TILES = VOCAB_PER_TP // LOGITS_COMM_TILE
-LOGITS_COMM_BLOCKS = min(FUSED_LM_HEAD_CORES, N_LOGITS_COMM_TILES + (1 if LOGITS_COMM_TAIL != 0 else 0))
+LOGITS_COMM_BLOCKS = 1 if TP_SIZE == 1 else min(
+    FUSED_LM_HEAD_CORES,
+    N_LOGITS_COMM_TILES + (1 if LOGITS_COMM_TAIL != 0 else 0),
+)
 LOGITS_TAIL_BLOCK = N_LOGITS_COMM_TILES % LOGITS_COMM_BLOCKS
 GREEDY_GRID_ROWS = VOCAB // GREEDY_ROW_WIDTH
 GREEDY_BLOCK_SPAN = GREEDY_BLOCK_ROWS * GREEDY_ROW_WIDTH
@@ -149,27 +153,28 @@ def lm_head(
                 source_row = pl.cast(safe_raw, target_type=pl.INDEX)
                 selected_hidden[row : row + 1, :] = hidden_states[source_row : source_row + 1, :]
 
-        # Self-target rides the same put; put drains before the notify issues.
-        for peer_tp in pl.range(TP_SIZE):
-            pld.tensor.put(
-                dst=hidden_window,
-                peer=group_base + peer_tp,
-                src=selected_hidden,
-                dst_offsets=[tp_rank * MAX_LOGIT_ROWS + r0, 0],
-                src_offsets=[r0, 0],
-                shape=[PUSH_ROW_TILE, D],
-            )
-
-        # Notify folded into the push: one notify per block per source per epoch.
-        for peer_tp in pl.range(TP_SIZE):
-            if peer_tp != tp_rank:
-                pld.system.notify(
-                    target=hidden_done,
+        if TP_SIZE != 1:
+            # Self-target rides the same put; put drains before the notify issues.
+            for peer_tp in pl.range(TP_SIZE):
+                pld.tensor.put(
+                    dst=hidden_window,
                     peer=group_base + peer_tp,
-                    offsets=[tp_rank, 0],
-                    value=1,
-                    op=pld.NotifyOp.AtomicAdd,
+                    src=selected_hidden,
+                    dst_offsets=[tp_rank * MAX_LOGIT_ROWS + r0, 0],
+                    src_offsets=[r0, 0],
+                    shape=[PUSH_ROW_TILE, D],
                 )
+
+            # Notify folded into the push: one notify per block per source per epoch.
+            for peer_tp in pl.range(TP_SIZE):
+                if peer_tp != tp_rank:
+                    pld.system.notify(
+                        target=hidden_done,
+                        peer=group_base + peer_tp,
+                        offsets=[tp_rank, 0],
+                        value=1,
+                        op=pld.NotifyOp.AtomicAdd,
+                    )
 
     # Start the wait after this rank has published. Signal credits persist until
     # the final clear, so peer notifies may safely arrive before this task starts;
@@ -197,9 +202,12 @@ def lm_head(
         gblock = pl.tile.get_block_idx()
         gk0 = (gblock % (D // HIDDEN_GATHER_TILE)) * HIDDEN_GATHER_TILE
         gr0 = (gblock // (D // HIDDEN_GATHER_TILE)) * HIDDEN_GATHER_ROW_TILE
-        owner_hiddens[gr0 : gr0 + HIDDEN_GATHER_ROW_TILE, gk0 : gk0 + HIDDEN_GATHER_TILE] = hidden_window[
-            gr0 : gr0 + HIDDEN_GATHER_ROW_TILE, gk0 : gk0 + HIDDEN_GATHER_TILE
-        ]
+        if TP_SIZE == 1:
+            _local_hidden = pl.read(selected_hidden, [0, 0])
+        else:
+            owner_hiddens[gr0 : gr0 + HIDDEN_GATHER_ROW_TILE, gk0 : gk0 + HIDDEN_GATHER_TILE] = hidden_window[
+                gr0 : gr0 + HIDDEN_GATHER_ROW_TILE, gk0 : gk0 + HIDDEN_GATHER_TILE
+            ]
 
     # Fused cube+comm kernel: matmul one [MM_ROW_TILE, FUSED_VOCAB_TILE] tile,
     # carry the accumulator across the C->V edge with pl.aiv_shard, and
@@ -210,7 +218,7 @@ def lm_head(
         FUSED_LM_HEAD_CORES,
         name_hint="lm_head_matmul_push",
         deps=[_dgather_tid],
-        optimizations=[pl.cross_core_slot(slot_num=2)],
+        optimizations=[pl.cross_core_slot(slot_num=FUSED_CROSS_CORE_SLOTS)],
     ) as _push_tid:
         # Weight reads bypass L2.
         pl.set_cache_policy(lm_head_weight, pl.CachePolicy.BYPASS)
@@ -223,7 +231,14 @@ def lm_head(
                 mm_acc = pl.create_tensor([MM_ROW_TILE, FUSED_VOCAB_TILE], dtype=pl.FP32)
                 for mm_kb in pl.pipeline(0, D // FUSED_K_TILE, stage=2):
                     mm_k0 = mm_kb * FUSED_K_TILE
-                    mm_hidden_tile = owner_hiddens[mm_r0 : mm_r0 + MM_ROW_TILE, mm_k0 : mm_k0 + FUSED_K_TILE]
+                    if TP_SIZE == 1:
+                        mm_hidden_tile = selected_hidden[
+                            mm_r0 : mm_r0 + MM_ROW_TILE, mm_k0 : mm_k0 + FUSED_K_TILE
+                        ]
+                    else:
+                        mm_hidden_tile = owner_hiddens[
+                            mm_r0 : mm_r0 + MM_ROW_TILE, mm_k0 : mm_k0 + FUSED_K_TILE
+                        ]
                     mm_weight_tile = lm_head_weight[mm_o0 : mm_o0 + FUSED_VOCAB_TILE, mm_k0 : mm_k0 + FUSED_K_TILE]
                     mm_acc = pl.matmul_acc(mm_acc, mm_hidden_tile, mm_weight_tile, b_trans=True, init_cond=(mm_kb == 0))
 
@@ -233,10 +248,16 @@ def lm_head(
                     mm_shard = pl.aiv_shard(mm_acc)
                     owner_tp = mm_rb // (MAX_LOGIT_ROWS // MM_ROW_TILE)
                     owner_r0 = (mm_rb % (MAX_LOGIT_ROWS // MM_ROW_TILE)) * MM_ROW_TILE + aiv_id * LANE_ROWS
-                    pld.tensor.remote_store(
-                        mm_shard, logits_window, group_base + owner_tp,
-                        [owner_r0, vocab_base + mm_o0],
-                    )
+                    if TP_SIZE == 1:
+                        logits[
+                            owner_r0 : owner_r0 + LANE_ROWS,
+                            vocab_base + mm_o0 : vocab_base + mm_o0 + FUSED_VOCAB_TILE,
+                        ] = mm_shard
+                    else:
+                        pld.tensor.remote_store(
+                            mm_shard, logits_window, group_base + owner_tp,
+                            [owner_r0, vocab_base + mm_o0],
+                        )
 
         # Ragged tail: its own matmul on one block; the accumulator is already
         # VOCAB_TAIL wide. Hoisted out of the strided loop: a dynamic branch would
@@ -249,9 +270,14 @@ def lm_head(
                     tail_acc = pl.create_tensor([MM_ROW_TILE, VOCAB_TAIL], dtype=pl.FP32)
                     for tail_kb in pl.pipeline(0, D // FUSED_K_TILE, stage=2):
                         tail_k0 = tail_kb * FUSED_K_TILE
-                        tail_hidden_tile = owner_hiddens[
-                            tail_r0 : tail_r0 + MM_ROW_TILE, tail_k0 : tail_k0 + FUSED_K_TILE
-                        ]
+                        if TP_SIZE == 1:
+                            tail_hidden_tile = selected_hidden[
+                                tail_r0 : tail_r0 + MM_ROW_TILE, tail_k0 : tail_k0 + FUSED_K_TILE
+                            ]
+                        else:
+                            tail_hidden_tile = owner_hiddens[
+                                tail_r0 : tail_r0 + MM_ROW_TILE, tail_k0 : tail_k0 + FUSED_K_TILE
+                            ]
                         tail_weight_tile = lm_head_weight[
                             mm_tail_o0 : mm_tail_o0 + VOCAB_TAIL,
                             tail_k0 : tail_k0 + FUSED_K_TILE,
@@ -262,10 +288,16 @@ def lm_head(
                         tail_shard = pl.aiv_shard(tail_acc)
                         owner_tp = tail_rb // (MAX_LOGIT_ROWS // MM_ROW_TILE)
                         owner_r0 = (tail_rb % (MAX_LOGIT_ROWS // MM_ROW_TILE)) * MM_ROW_TILE + aiv_id * LANE_ROWS
-                        pld.tensor.remote_store(
-                            tail_shard, logits_window, group_base + owner_tp,
-                            [owner_r0, vocab_base + mm_tail_o0],
-                        )
+                        if TP_SIZE == 1:
+                            logits[
+                                owner_r0 : owner_r0 + LANE_ROWS,
+                                vocab_base + mm_tail_o0 : vocab_base + mm_tail_o0 + VOCAB_TAIL,
+                            ] = tail_shard
+                        else:
+                            pld.tensor.remote_store(
+                                tail_shard, logits_window, group_base + owner_tp,
+                                [owner_r0, vocab_base + mm_tail_o0],
+                            )
 
         # Notify folded into the push: each block signals every peer after its own
         # stores, so a peer sees FUSED_LM_HEAD_CORES notifies per source per epoch.
@@ -302,24 +334,27 @@ def lm_head(
         LOGITS_COMM_BLOCKS, name_hint="lm_head_combine_gather", deps=[_cwait_tid]
     ) as _gather_tid:
         gblk = pl.tile.get_block_idx()
-        for src_tp in pl.range(TP_SIZE):
-            src_vocab_base = src_tp * VOCAB_PER_TP
-            for ob in pl.range(gblk, N_LOGITS_COMM_TILES, LOGITS_COMM_BLOCKS):
-                o0 = ob * LOGITS_COMM_TILE
-                lo = src_vocab_base + o0
-                for gr in pl.range(0, MAX_LOGIT_ROWS, LOGITS_GATHER_ROW_TILE):
-                    logits[gr : gr + LOGITS_GATHER_ROW_TILE, lo : lo + LOGITS_COMM_TILE] = logits_window[
-                        gr : gr + LOGITS_GATHER_ROW_TILE, lo : lo + LOGITS_COMM_TILE
-                    ]
-
-            if LOGITS_COMM_TAIL != 0:
-                if gblk == LOGITS_TAIL_BLOCK:
-                    tail_o0 = N_LOGITS_COMM_TILES * LOGITS_COMM_TILE
-                    tl = src_vocab_base + tail_o0
-                    for tr in pl.range(0, MAX_LOGIT_ROWS, LOGITS_GATHER_ROW_TILE):
-                        logits[tr : tr + LOGITS_GATHER_ROW_TILE, tl : tl + LOGITS_COMM_TAIL] = logits_window[
-                            tr : tr + LOGITS_GATHER_ROW_TILE, tl : tl + LOGITS_COMM_TAIL
+        if TP_SIZE == 1:
+            _local_logit = pl.read(logits, [0, 0])
+        else:
+            for src_tp in pl.range(TP_SIZE):
+                src_vocab_base = src_tp * VOCAB_PER_TP
+                for ob in pl.range(gblk, N_LOGITS_COMM_TILES, LOGITS_COMM_BLOCKS):
+                    o0 = ob * LOGITS_COMM_TILE
+                    lo = src_vocab_base + o0
+                    for gr in pl.range(0, MAX_LOGIT_ROWS, LOGITS_GATHER_ROW_TILE):
+                        logits[gr : gr + LOGITS_GATHER_ROW_TILE, lo : lo + LOGITS_COMM_TILE] = logits_window[
+                            gr : gr + LOGITS_GATHER_ROW_TILE, lo : lo + LOGITS_COMM_TILE
                         ]
+
+                if LOGITS_COMM_TAIL != 0:
+                    if gblk == LOGITS_TAIL_BLOCK:
+                        tail_o0 = N_LOGITS_COMM_TILES * LOGITS_COMM_TILE
+                        tl = src_vocab_base + tail_o0
+                        for tr in pl.range(0, MAX_LOGIT_ROWS, LOGITS_GATHER_ROW_TILE):
+                            logits[tr : tr + LOGITS_GATHER_ROW_TILE, tl : tl + LOGITS_COMM_TAIL] = logits_window[
+                                tr : tr + LOGITS_GATHER_ROW_TILE, tl : tl + LOGITS_COMM_TAIL
+                            ]
 
     # Every local wait has observed all current-round peer notifies before the
     # logits gather can complete. Clear only this rank's counters so a retained
@@ -596,6 +631,8 @@ if __name__ == "__main__":
     parser.add_argument("--enable-scope-stats", action="store_true", default=False)
     parser.add_argument("--compile-only", action="store_true", default=False)
     parser.add_argument("--runtime-dir", type=str, default=None)
+    parser.add_argument("--save-data", action="store_true", default=False)
+    parser.add_argument("--golden-data", type=str, default=None)
     parser.add_argument("--dump-passes", action="store_true", default=False)
     args = parser.parse_args()
 
@@ -625,6 +662,8 @@ if __name__ == "__main__":
         fn=fn,
         specs=specs,
         golden_fn=golden_fn,
+        save_data=args.save_data,
+        golden_data=args.golden_data,
         compile_only=args.compile_only,
         runtime_dir=args.runtime_dir,
         config=dict(
