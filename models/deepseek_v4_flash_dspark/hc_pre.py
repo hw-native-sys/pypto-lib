@@ -34,6 +34,7 @@ HC_PAD = 8  # hc (4) padded for 32B-aligned vector ops
 T_TILE = 8  # other values miscompare
 LINEAR_T_TILE = 16  # cube matmul rows must be a 16-row boxed tile
 COMB_T_TILE = 8
+PRE_POST_WORKERS = 16
 RMS_K_TILE = 512
 LINEAR_K_TILE = 256
 D_TILE = 256
@@ -129,29 +130,30 @@ def hc_pre_gates(
     # lives in comb_sinkhorn.
     # Only the final partial token tile uses these fixed-size staging buffers.
     post_tail_store = pl.create_tensor([T_TILE, HC_PAD], dtype=pl.FP32)
-    for ob in pl.spmd(token_tiles, name_hint="split_pre_post", allow_early_resolve=True):
-        t0 = ob * T_TILE
-        valid_rows = pl.min(T_TILE, t_dim - t0)
-        inv_col = inv_rms[t0:t0 + T_TILE, 0:1]
+    for ob_worker in pl.spmd(pl.min(token_tiles, PRE_POST_WORKERS), name_hint="split_pre_post", allow_early_resolve=True):
+        for ob in pl.range(ob_worker, token_tiles, pl.min(token_tiles, PRE_POST_WORKERS)):
+            t0 = ob * T_TILE
+            valid_rows = pl.min(T_TILE, t_dim - t0)
+            inv_col = inv_rms[t0:t0 + T_TILE, 0:1]
 
-        pre_base = pl.reshape(hc_base[0:HC_PAD], [1, HC_PAD])
-        pre_scaled = pl.mul(pl.row_expand_mul(mixes_raw[t0:t0 + T_TILE, 0:HC_PAD], inv_col), scale0)
-        pre_logits = pl.add(pre_scaled, pl.col_expand(pre_scaled, pre_base))
-        pre_sig = pl.recip(pl.add(pl.exp(pl.neg(pre_logits)), 1.0))
-        pre_val = pl.add(pre_sig, HC_EPS)
-        pre_val_store[t0:t0 + T_TILE, 0:HC_PAD] = pre_val
+            pre_base = pl.reshape(hc_base[0:HC_PAD], [1, HC_PAD])
+            pre_scaled = pl.mul(pl.row_expand_mul(mixes_raw[t0:t0 + T_TILE, 0:HC_PAD], inv_col), scale0)
+            pre_logits = pl.add(pre_scaled, pl.col_expand(pre_scaled, pre_base))
+            pre_sig = pl.recip(pl.add(pl.exp(pl.neg(pre_logits)), 1.0))
+            pre_val = pl.add(pre_sig, HC_EPS)
+            pre_val_store[t0:t0 + T_TILE, 0:HC_PAD] = pre_val
 
-        post_base = pl.reshape(hc_base[HC_MULT:HC_MULT + HC_PAD], [1, HC_PAD])
-        post_scaled = pl.mul(pl.row_expand_mul(mixes_raw[t0:t0 + T_TILE, HC_MULT:HC_MULT + HC_PAD], inv_col), scale1)
-        post_logits = pl.add(post_scaled, pl.col_expand(post_scaled, post_base))
-        post_sig = pl.recip(pl.add(pl.exp(pl.neg(post_logits)), 1.0))
-        post_pad = pl.mul(post_sig, 2.0)
-        if valid_rows == T_TILE:
-            post[t0:t0 + T_TILE, 0:HC_MULT] = pl.slice(post_pad, [T_TILE, HC_PAD], [0, 0], valid_shape=[T_TILE, HC_MULT])
-        else:
-            post_tail_store[0:T_TILE, 0:HC_PAD] = post_pad
-            post_tile = pl.load(post_tail_store, [0, 0], [T_TILE, HC_PAD], valid_shape=[valid_rows, HC_MULT], target_memory=pl.MemorySpace.Vec)
-            pl.store(post_tile, [t0, 0], post)
+            post_base = pl.reshape(hc_base[HC_MULT:HC_MULT + HC_PAD], [1, HC_PAD])
+            post_scaled = pl.mul(pl.row_expand_mul(mixes_raw[t0:t0 + T_TILE, HC_MULT:HC_MULT + HC_PAD], inv_col), scale1)
+            post_logits = pl.add(post_scaled, pl.col_expand(post_scaled, post_base))
+            post_sig = pl.recip(pl.add(pl.exp(pl.neg(post_logits)), 1.0))
+            post_pad = pl.mul(post_sig, 2.0)
+            if valid_rows == T_TILE:
+                post[t0:t0 + T_TILE, 0:HC_MULT] = pl.slice(post_pad, [T_TILE, HC_PAD], [0, 0], valid_shape=[T_TILE, HC_MULT])
+            else:
+                post_tail_store[0:T_TILE, 0:HC_PAD] = post_pad
+                post_tile = pl.load(post_tail_store, [0, 0], [T_TILE, HC_PAD], valid_shape=[valid_rows, HC_MULT], target_memory=pl.MemorySpace.Vec)
+                pl.store(post_tile, [t0, 0], post)
 
     # comb_sinkhorn: comb gate from mixes_raw cols 8/12/16/20, softmax, then a
     # column-first 20-iteration Sinkhorn -> comb.

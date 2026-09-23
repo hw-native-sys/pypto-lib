@@ -57,6 +57,11 @@ COMPRESS_STATE_BLOCK_NUM = CSA_INNER_STATE_PHYSICAL_BLOCKS
 COMPRESS_STATE_BLOCKS_PER_REQUEST = COMPRESS_STATE_BLOCK_NUM // DECODE_BATCH
 COMPRESS_STATE_DIM = 2 * OUT_DIM
 IDX_MAX_BLOCKS = (MAX_SEQ_LEN // COMPRESS_RATIO + BLOCK_SIZE - 1) // BLOCK_SIZE
+# Compact-row slots per request. A request holds one row per compression boundary
+# it covers; the count varies with the request's start position when S is not a
+# multiple of COMPRESS_RATIO, so the stride reserves the maximum and the cache
+# write skips the slots that fall past the request's last token.
+COMPACT_PER_REQUEST = (S + COMPRESS_RATIO - 1) // COMPRESS_RATIO
 IDX_CACHE_BLOCK_NUM_DYN = pl.dynamic("IDX_CACHE_BLOCK_NUM_DYN")
 COMPRESS_STATE_BLOCK_NUM_DYN = pl.dynamic("INNER_STATE_BLOCK_NUM_DYN")
 
@@ -67,9 +72,9 @@ PROJ_OUT_TILE = 32
 assert PROJ_OUT_TILE % 16 == 0, "cube tile cols must be a multiple of 16"
 MM_B_TILE = 16
 KV_SCORE_WORKERS = 24  # KV-score projection workers
-POOL_WORKERS = 48  # Pool workers
+POOL_WORKERS = 16  # Pool workers
 RMS_WORKERS = 2  # RMSNorm + RoPE workers
-COMMIT_WORKERS = 48
+COMMIT_WORKERS = 16
 GROUP_BS = DECODE_BATCH * DECODE_SEQ
 BS_PAD = ((GROUP_BS + MM_B_TILE - 1) // MM_B_TILE) * MM_B_TILE
 HEAD_TILE = 64
@@ -288,7 +293,12 @@ def indexer_compressor_pool_projected(
                 token = b0 + inner
                 token_pos = pl.read(position_ids, [token])
                 if (token_pos + 1) % COMPRESS_RATIO == 0:
-                    compact_token = token // COMPRESS_RATIO
+                    # Compact slot: request base plus the boundary's rank inside
+                    # the request, counted from the request's first boundary.
+                    request = token // S
+                    local = token - request * S
+                    first_offset = COMPRESS_RATIO - 1 - (token_pos - local) % COMPRESS_RATIO
+                    compact_token = request * COMPACT_PER_REQUEST + (local - first_offset) // COMPRESS_RATIO
                     normed_kv[compact_token : compact_token + 1, 0:NOPE_HEAD_DIM] = normed_nope[inner : inner + 1, :]
                     normed_kv[compact_token : compact_token + 1, NOPE_HEAD_DIM:HEAD_DIM] = normed_rope[inner : inner + 1, :]
 
@@ -341,7 +351,7 @@ def indexer_compressor_write(
 ):
     """Rotate compact boundary rows and write their quantized indexer KV cache."""
     bs = pl.tensor.dim(position_ids, 0)
-    compact_rows = bs // COMPRESS_RATIO
+    compact_rows = (bs // S) * COMPACT_PER_REQUEST
     rms_blocks = (compact_rows + RMS_PAD_TILE - 1) // RMS_PAD_TILE
     kv_flat = kv
     idx_block_num = pl.tensor.dim(idx_kv_cache, 0)
@@ -390,14 +400,17 @@ def indexer_compressor_write(
         kv_i8_blk = pl.cast(kv_half, target_type=pl.INT8, mode="trunc")
         for inner in pl.range(wr_blk_rows):
             compact_token = wr_b0 + inner
-            request = compact_token // (S // COMPRESS_RATIO)
+            request = compact_token // COMPACT_PER_REQUEST
             first_pos = pl.read(position_ids, [request * S])
-            token = compact_token * COMPRESS_RATIO + COMPRESS_RATIO - 1 - first_pos % COMPRESS_RATIO
-            cache_row_i64 = pl.read(idx_slot_mapping, [token])
-            if cache_row_i64 >= 0:
-                cache_row = pl.cast(cache_row_i64, pl.INDEX)
-                kv_flat[token : token + 1, :] = kv_final[compact_token : compact_token + 1, 0 : HEAD_DIM]
-                idx_kv_cache_flat[cache_row : cache_row + 1, :] = kv_i8_blk[inner : inner + 1, :]
+            local = (COMPRESS_RATIO - 1 - first_pos % COMPRESS_RATIO
+                     + (compact_token - request * COMPACT_PER_REQUEST) * COMPRESS_RATIO)
+            if local < S:
+                token = request * S + local
+                cache_row_i64 = pl.read(idx_slot_mapping, [token])
+                if cache_row_i64 >= 0:
+                    cache_row = pl.cast(cache_row_i64, pl.INDEX)
+                    kv_flat[token : token + 1, :] = kv_final[compact_token : compact_token + 1, 0 : HEAD_DIM]
+                    idx_kv_cache_flat[cache_row : cache_row + 1, :] = kv_i8_blk[inner : inner + 1, :]
 
     # Serialized indexer-cache scale commit.
     with pl.at(
@@ -407,17 +420,20 @@ def indexer_compressor_write(
         allow_early_resolve=True,
     ) as scale_commit_tid:
         for compact_token in pl.range(compact_rows):
-            request = compact_token // (S // COMPRESS_RATIO)
+            request = compact_token // COMPACT_PER_REQUEST
             first_pos = pl.read(position_ids, [request * S])
-            token = compact_token * COMPRESS_RATIO + COMPRESS_RATIO - 1 - first_pos % COMPRESS_RATIO
-            cache_row_i64 = pl.read(idx_slot_mapping, [token])
-            if cache_row_i64 >= 0:
-                cache_row = pl.cast(cache_row_i64, pl.INDEX)
-                pl.write(
-                    idx_kv_scale_flat,
-                    [cache_row, 0],
-                    pl.read(idx_kv_scale_values, [compact_token, 0]),
-                )
+            local = (COMPRESS_RATIO - 1 - first_pos % COMPRESS_RATIO
+                     + (compact_token - request * COMPACT_PER_REQUEST) * COMPRESS_RATIO)
+            if local < S:
+                token = request * S + local
+                cache_row_i64 = pl.read(idx_slot_mapping, [token])
+                if cache_row_i64 >= 0:
+                    cache_row = pl.cast(cache_row_i64, pl.INDEX)
+                    pl.write(
+                        idx_kv_scale_flat,
+                        [cache_row, 0],
+                        pl.read(idx_kv_scale_values, [compact_token, 0]),
+                    )
 
     return hadamard_tid, scale_commit_tid
 

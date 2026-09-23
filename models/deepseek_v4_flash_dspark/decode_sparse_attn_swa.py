@@ -67,8 +67,9 @@ ATTN_K_TILE = 128
 ROPE_TILE = 16
 ROPE_INTERLEAVE_TILE = 2 * ROPE_TILE
 T_PAD = ((T + 16 - 1) // 16) * 16  # T padded up to the 16-row cube M floor
-ROPE_CS_T_TILE = 8  # rope cos/sin row block; T is a multiple of 8 by the batch contract
-BIAS_T_TILE = 8     # swa_valid_bias row block, same contract
+ROPE_CS_T_TILE = S  # rope cos/sin row block: one request per block
+ROPE_CS_WORKERS = 16
+BIAS_T_TILE = 8     # swa_valid_bias row block; 32B-aligned FP32 rows
 TOPK = WIN               # SWA sparse-K width: sliding window only
 SPARSE_BLOCKS = 1        # the SWA window fits one attention K tile
 PADDED_TOPK = SPARSE_BLOCKS * ATTN_K_TILE
@@ -242,7 +243,7 @@ def sparse_attn_swa(
     rope_cos_il = pl.create_tensor([T_PAD, ROPE_DIM], dtype=pl.FP32)
     rope_sin_signed = pl.create_tensor([T_PAD, ROPE_DIM], dtype=pl.FP32)
     rope_swap_idx = pl.create_tensor([H_TILE, ROPE_DIM], dtype=pl.INT32)
-    with pl.at(level=pl.Level.CORE_GROUP, name_hint="rope_cs") as rope_tid:
+    with pl.at(level=pl.Level.CORE_GROUP, name_hint="rope_swap") as swap_tid:
         swap_ones = pl.full([H_TILE, ROPE_DIM], dtype=pl.FP32, value=1.0)
         swap_range_i32 = pl.arange(0, [1, ROPE_DIM], dtype=pl.INT32)
         swap_range = pl.cast(swap_range_i32, target_type=pl.FP32)
@@ -256,22 +257,24 @@ def sparse_attn_swa(
         swap_idx_f = pl.sub(swap_next, swap_stride)
         rope_swap_idx[:, :] = pl.cast(swap_idx_f, target_type=pl.INT32)
 
-        cs_ones = pl.full([ROPE_CS_T_TILE, ROPE_INTERLEAVE_TILE], dtype=pl.FP32, value=1.0)
-        cs_range_i32 = pl.arange(0, [1, ROPE_INTERLEAVE_TILE], dtype=pl.INT32)
-        cs_range = pl.cast(cs_range_i32, target_type=pl.FP32)
-        cs_col = pl.col_expand_mul(cs_ones, cs_range)
-        cs_half = pl.mul(cs_col, 0.5)
-        cs_dup_i32 = pl.cast(cs_half, target_type=pl.INT32, mode="trunc")
-        cs_dup_f = pl.cast(cs_dup_i32, target_type=pl.FP32)
-        cs_dup_idx = pl.cast(cs_dup_f, target_type=pl.INT32)
-        cs_lane = pl.sub(cs_col, pl.mul(cs_dup_f, 2.0))
-        cs_sign_base = pl.sub(pl.mul(cs_lane, 2.0), 1.0)
-        cs_sign = pl.neg(cs_sign_base)
-        for cp in pl.range(HALF_ROPE // ROPE_TILE):
-            cp_r0 = cp * ROPE_TILE
-            cp_c0 = 2 * cp_r0
-            for cs_rb in pl.range(rope_cs_blocks):
-                cs_t0 = cs_rb * ROPE_CS_T_TILE
+    with pl.spmd(pl.min(rope_cs_blocks, ROPE_CS_WORKERS), name_hint="rope_cs", deps=[swap_tid]) as rope_tid:
+        for cs_block in pl.range(pl.tile.get_block_idx(), rope_cs_blocks, pl.min(rope_cs_blocks, ROPE_CS_WORKERS)):
+            cs_rb = cs_block
+            cs_t0 = cs_rb * ROPE_CS_T_TILE
+            cs_ones = pl.full([ROPE_CS_T_TILE, ROPE_INTERLEAVE_TILE], dtype=pl.FP32, value=1.0)
+            cs_range_i32 = pl.arange(0, [1, ROPE_INTERLEAVE_TILE], dtype=pl.INT32)
+            cs_range = pl.cast(cs_range_i32, target_type=pl.FP32)
+            cs_col = pl.col_expand_mul(cs_ones, cs_range)
+            cs_half = pl.mul(cs_col, 0.5)
+            cs_dup_i32 = pl.cast(cs_half, target_type=pl.INT32, mode="trunc")
+            cs_dup_f = pl.cast(cs_dup_i32, target_type=pl.FP32)
+            cs_dup_idx = pl.cast(cs_dup_f, target_type=pl.INT32)
+            cs_lane = pl.sub(cs_col, pl.mul(cs_dup_f, 2.0))
+            cs_sign_base = pl.sub(pl.mul(cs_lane, 2.0), 1.0)
+            cs_sign = pl.neg(cs_sign_base)
+            for cp in pl.range(HALF_ROPE // ROPE_TILE):
+                cp_r0 = cp * ROPE_TILE
+                cp_c0 = 2 * cp_r0
                 cs_cos = pl.cast(freqs_cos[cs_t0 : cs_t0 + ROPE_CS_T_TILE, cp_r0 : cp_r0 + ROPE_TILE], target_type=pl.FP32)
                 cs_sin = pl.cast(freqs_sin[cs_t0 : cs_t0 + ROPE_CS_T_TILE, cp_r0 : cp_r0 + ROPE_TILE], target_type=pl.FP32)
                 cs_cos_dup = pl.gather(cs_cos, dim=-1, index=cs_dup_idx)

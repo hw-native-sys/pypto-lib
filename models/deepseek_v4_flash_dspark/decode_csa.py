@@ -189,6 +189,7 @@ CSA_PROJECTION_PACK_ROW_TILE = 8
 CSA_PROJECTION_PACK_WORKERS = 16
 CSA_ALL_VISIBLE_WORKERS = 16
 CSA_WB_TOKEN_TILE = 8
+CSA_ROPE_WORKERS = 16
 CSA_WB_WORKERS = 48  # CSA cache-write workers
 TP1_CSA_WB_WORKERS = 8  # TP1 CSA cache-write workers
 
@@ -850,15 +851,16 @@ def _decode_csa_tp1(
     idx_sin_signed = pl.create_tensor([t_dim, ROPE_HEAD_DIM], dtype=pl.FP32)
     cmp_cos_il = pl.create_tensor([t_dim, ROPE_HEAD_DIM], dtype=pl.FP32)
     cmp_sin_signed = pl.create_tensor([t_dim, ROPE_HEAD_DIM], dtype=pl.FP32)
-    with pl.at(level=pl.Level.CORE_GROUP, name_hint="csa_rope_interleave") as rope_tid:
-        il_ones = pl.full([4, ROPE_HEAD_DIM], dtype=pl.FP32, value=1.0)
-        il_lane_ids = pl.cast(pl.arange(0, [1, ROPE_HEAD_DIM], dtype=pl.INT32), target_type=pl.FP32)
-        il_col = pl.col_expand_mul(il_ones, il_lane_ids)
-        il_dup_f = pl.cast(pl.cast(pl.mul(il_col, 0.5), target_type=pl.INT32, mode="trunc"), target_type=pl.FP32)
-        il_dup_idx = pl.cast(il_dup_f, target_type=pl.INT32)
-        il_lane = pl.sub(il_col, pl.mul(il_dup_f, 2.0))
-        il_sign = pl.sub(pl.mul(il_lane, 2.0), 1.0)
-        for rope_t0 in pl.range(0, t_dim, 4):
+    with pl.spmd(pl.min(t_dim // 4, CSA_ROPE_WORKERS), name_hint="csa_rope_interleave") as rope_tid:
+        for rope_block in pl.range(pl.tile.get_block_idx(), t_dim // 4, pl.min(t_dim // 4, CSA_ROPE_WORKERS)):
+            rope_t0 = rope_block * 4
+            il_ones = pl.full([4, ROPE_HEAD_DIM], dtype=pl.FP32, value=1.0)
+            il_lane_ids = pl.cast(pl.arange(0, [1, ROPE_HEAD_DIM], dtype=pl.INT32), target_type=pl.FP32)
+            il_col = pl.col_expand_mul(il_ones, il_lane_ids)
+            il_dup_f = pl.cast(pl.cast(pl.mul(il_col, 0.5), target_type=pl.INT32, mode="trunc"), target_type=pl.FP32)
+            il_dup_idx = pl.cast(il_dup_f, target_type=pl.INT32)
+            il_lane = pl.sub(il_col, pl.mul(il_dup_f, 2.0))
+            il_sign = pl.sub(pl.mul(il_lane, 2.0), 1.0)
             idx_cos_half = pl.cast(freqs_cos[rope_t0 : rope_t0 + 4, 0:HALF_ROPE], target_type=pl.FP32)
             idx_cos_il[rope_t0 : rope_t0 + 4, :] = pl.gather(idx_cos_half, dim=-1, index=il_dup_idx)
             idx_sin_half = pl.cast(freqs_sin[rope_t0 : rope_t0 + 4, 0:HALF_ROPE], target_type=pl.FP32)

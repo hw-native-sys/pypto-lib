@@ -691,10 +691,8 @@ def _decode_hca_tp1(
             o_packed_heads, ori_cache_write_tid, cmp_cache_write_tid,
         )
         with pl.scope():
-            decode_o_proj_tp1(o_packed_heads, wo_a, wo_b, wo_b_scale, attn_out, heads_dep)
-
-    with pl.scope():
-        hc_post(attn_out, x_hc, post_t, comb_t, x_out)
+            attn_out = decode_o_proj_tp1(o_packed_heads, wo_a, wo_b, wo_b_scale, attn_out, heads_dep)
+            hc_post(attn_out, x_hc, post_t, comb_t, x_out)
     return x_out
 
 

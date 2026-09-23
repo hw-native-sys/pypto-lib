@@ -8,6 +8,7 @@
 # -----------------------------------------------------------------------------------------------------------
 """Unit tests for the DSpark block-table and compressor-state slot helpers."""
 
+import ast
 import sys
 from pathlib import Path
 
@@ -20,6 +21,30 @@ MODEL_DIR = Path(__file__).resolve().parents[2] / "models" / "deepseek_v4_flash_
 sys.path.insert(0, str(MODEL_DIR))
 
 from utils import block_table, state_slot_mapping  # noqa: E402
+
+
+@pytest.mark.parametrize("batch", [4, 16, 64])
+@pytest.mark.parametrize("sequence", [6, 8])
+@pytest.mark.parametrize("tp", [1, 2, 4])
+def test_output_projection_tile_fits_local_capacity(batch, sequence, tp) -> None:
+    source = ast.parse((MODEL_DIR / "decode_o_proj.py").read_text())
+    nodes = [
+        node for node in source.body
+        if (isinstance(node, ast.FunctionDef) and node.name == "_token_tile")
+        or (isinstance(node, ast.Assign)
+            and any(isinstance(target, ast.Name) and target.id == "O_B_T_TILE" for target in node.targets))
+    ]
+    assert len(nodes) == 2
+    local_tokens = batch * sequence // tp
+    local_capacity = (local_tokens + 15) // 16 * 16
+    namespace = {"TOKEN_TILE": 16, "LOCAL_T_PAD": local_capacity, "GROUP_T_PAD": tp * local_capacity}
+    exec(compile(ast.Module(body=nodes, type_ignores=[]), "decode_o_proj_tiles", "exec"), namespace)
+    tile = namespace["O_B_T_TILE"]
+    assert local_capacity % tile == 0
+    assert namespace["GROUP_T_PAD"] % tile == 0
+    for active_rows in range(1, local_tokens + 1):
+        padded_rows = (active_rows + tile - 1) // tile * tile
+        assert padded_rows <= local_capacity
 
 
 def test_block_table_can_model_hca_deployment_request_slots() -> None:

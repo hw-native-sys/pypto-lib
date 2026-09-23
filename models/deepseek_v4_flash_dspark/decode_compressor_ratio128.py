@@ -81,13 +81,13 @@ K_TILE = 512
 OUT_TILE = 64
 HEAD_TILE = 64
 B_TILE = 8
-MM_B_TILE = 16
+MM_B_TILE = 128
 # Token tiles handled sequentially inside one kv_score_proj block. The grid is
 # (token group, output tile); every token tile in a group shares the same o0, so
 # the [OUT_TILE, K_TILE] weight tiles are fetched once per group instead of once
 # per token tile. Coarsening the grid only -- the [MM_B_TILE, OUT_TILE]
 # accumulator shape is unchanged, so the cube tile stays row-compact.
-KV_SCORE_T_GROUP = 2
+KV_SCORE_T_GROUP = 1
 # Scratch spans the CP group's whole token stream, not the rank-local B * S.
 GROUP_BS = DECODE_BATCH * DECODE_SEQ
 BS_PAD = ((GROUP_BS + MM_B_TILE - 1) // MM_B_TILE) * MM_B_TILE
@@ -100,8 +100,8 @@ RMS_PAD_ROWS = RMS_PAD_BLOCKS * RMS_PAD_TILE
 # afford a wider head tile than HEAD_TILE: each wider tile loads each state block fewer times
 # (HEAD_DIM/POOL_HEAD_TILE tiles/batch instead of HEAD_DIM/HEAD_TILE), cutting load redundancy.
 POOL_HEAD_TILE = 128
-# Keep one request per block so all 16 decode requests can pool concurrently at a compression boundary.
-POOL_REQUEST_TILE = 1
+# Persistent workers pool and commit complete requests.
+POOL_WORKERS = 16
 # Gather rows per softmax_pool iteration. Held independent of the state page size: the
 # two [STATE_LEN, POOL_HEAD_TILE] FP32 pools already take 128 KB of the 184 KB Vec space,
 # leaving room for one double-buffered [POOL_STATE_TILE, POOL_HEAD_TILE] pair.
@@ -138,11 +138,14 @@ def compressor_ratio128_project(
         for tt in pl.range(KV_SCORE_T_GROUP):
             global_row0 = group_row0 + tt * MM_B_TILE
             if global_row0 < t_matmul:
-                kv_acc = pl.create_tensor([MM_B_TILE, OUT_TILE], dtype=pl.FP32)
-                score_acc = pl.create_tensor([MM_B_TILE, OUT_TILE], dtype=pl.FP32)
-                for kb in pl.pipeline(0, D // K_TILE, stage=2):
+                x_rows = pl.min(MM_B_TILE, bs - global_row0)
+                x_first = pl.slice(x_flat, [MM_B_TILE, K_TILE], [global_row0, 0], valid_shape=[x_rows, K_TILE])
+                wkv_first = wkv[o0 : o0 + OUT_TILE, 0:K_TILE]
+                wgate_first = wgate[o0 : o0 + OUT_TILE, 0:K_TILE]
+                kv_acc = pl.matmul(x_first, wkv_first, out_dtype=pl.FP32, b_trans=True)
+                score_acc = pl.matmul(x_first, wgate_first, out_dtype=pl.FP32, b_trans=True)
+                for kb in pl.pipeline(1, D // K_TILE, stage=2):
                     k0 = kb * K_TILE
-                    x_rows = pl.min(MM_B_TILE, bs - global_row0)
                     x_tile = pl.slice(x_flat, [MM_B_TILE, K_TILE], [global_row0, k0], valid_shape=[x_rows, K_TILE])
                     # Weights stored transposed [OUT_DIM, D] and consumed via b_trans=True so the
                     # GM->L1 load is a DN2ZN (each [OUT_TILE, K_TILE] row is K-contiguous = long
@@ -150,8 +153,8 @@ def compressor_ratio128_project(
                     # bursts). Cuts the transaction-bound MTE2 cost. Matches ratio4/CSA layout.
                     wkv_tile = wkv[o0 : o0 + OUT_TILE, k0 : k0 + K_TILE]
                     wgate_tile = wgate[o0 : o0 + OUT_TILE, k0 : k0 + K_TILE]
-                    kv_acc = pl.matmul_acc(kv_acc, x_tile, wkv_tile, b_trans=True, init_cond=(k0 == 0))
-                    score_acc = pl.matmul_acc(score_acc, x_tile, wgate_tile, b_trans=True, init_cond=(k0 == 0))
+                    kv_acc = pl.matmul_acc(kv_acc, x_tile, wkv_tile, b_trans=True)
+                    score_acc = pl.matmul_acc(score_acc, x_tile, wgate_tile, b_trans=True)
 
                 kv_proj_pad[global_row0 : global_row0 + MM_B_TILE, o0 : o0 + OUT_TILE] = kv_acc
                 score_proj_pad[global_row0 : global_row0 + MM_B_TILE, o0 : o0 + OUT_TILE] = score_acc
@@ -192,11 +195,11 @@ def compressor_ratio128_projected(
     compress_state_rows = pl.reshape(compress_state, [compress_state_rows_num, COMPRESS_STATE_DIM])
     pooled_kv = pl.create_tensor([RMS_PAD_ROWS, HEAD_DIM], dtype=pl.FP32)
     with pl.spmd(
-        (b_dim + POOL_REQUEST_TILE - 1) // POOL_REQUEST_TILE,
+        pl.min(b_dim, POOL_WORKERS),
         name_hint="scatter_softmax_pool", deps=[late_dep],
     ) as pool_tid:
-        request_start = pl.tile.get_block_idx() * POOL_REQUEST_TILE
-        for request_idx in pl.range(request_start, pl.min(request_start + POOL_REQUEST_TILE, b_dim)):
+        request_start = pl.tile.get_block_idx()
+        for request_idx in pl.range(request_start, b_dim, pl.min(b_dim, POOL_WORKERS)):
             for s_sc in pl.pipeline(s_dim, stage=2):
                 proj_row = request_idx * s_dim + s_sc
                 token_pos = pl.read(position_ids, [request_idx * s_dim + s_sc])

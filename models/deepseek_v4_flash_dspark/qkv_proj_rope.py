@@ -47,8 +47,7 @@ EPS = M.rms_norm_eps
 MAX_SEQ_LEN = M.max_position_embeddings
 
 # tiling
-Q_PROJ_TILE = 256  # qproj K-tile (Q_LORA reduction)
-QPROJ_MM_N_TILE = 512  # qproj output-column tile
+QPROJ_MM_N_TILE = 256  # qproj output-column tile
 Q_LORA_TILE = 256  # qr rms-norm / quant N granularity
 KV_TILE = 64  # kv rms-norm / rope / NOPE N granularity
 QUANT_TILE = 256
@@ -67,10 +66,10 @@ KV_K_TILE = 256  # kv_proj D (K) reduction tile   | divides KV_SPLIT_K_TILE
 KV_OK = 2  # kv_proj split-K factor         | D//KV_OK cores share each N-group
 KV_OM = 3  # maximum kv_proj split-M factor
 KV_SPLIT_K_TILE = D // KV_OK  # kv_proj K per split (=2048)
-QPROJ_M_TILE = 64  # dense qproj token tile; fills the 128 KiB L0C accumulator
+QPROJ_M_TILE = 64  # dense qproj token tile; 64 KiB L0C accumulator
 # qproj_matmul runs on persistent workers, one per physical AIC.
 QPROJ_WORKERS = 24
-QPROJ_TAIL_M_TILE = MATMUL_T_TILE  # partial-M path validated by decode/small physical T
+QPROJ_TAIL_M_TILE = 64
 # Staging rows for the qr -> qproj handoff: a dense tile is capped at
 # PREFILL_DENSE_TILE rows, so this bounds qproj_t_matmul for every caller.
 QPROJ_T_PAD = ((PREFILL_DENSE_TILE + QPROJ_TAIL_M_TILE - 1) // QPROJ_TAIL_M_TILE) * QPROJ_TAIL_M_TILE
@@ -78,7 +77,8 @@ KV_RMS_T_TILE = 32  # kv rms-norm + rope fused token (T) tile
 Q_ROPE_T_TILE = 8
 # q_rope_prepare runs on persistent workers, capped at the tile count so the
 # short call sites do not dispatch more blocks than they have work.
-Q_ROPE_WORKERS = 48
+Q_ROPE_WORKERS = 16
+QR_NORM_WORKERS = 16
 Q_ROPE_H_TILE = 4  # heads per fused qproj dequant/rms/rope task
 Q_DEQUANT_WORKERS = 48
 assert QPROJ_MM_N_TILE * QPROJ_M_TILE * 4 <= 128 * 1024  # L0C Acc cap
@@ -331,66 +331,67 @@ def q_proj_qr(
 
             # Two passes per block: pass 1 computes amax; pass 2 recomputes norm and quantizes.
             qr_token_tiles = (tile_rows + T_TILE - 1) // T_TILE
-            for tg_idx in pl.spmd(qr_token_tiles, name_hint="qr_rms_norm_quant", allow_early_resolve=True):
-                tg = tg_idx * T_TILE
-                valid_rows = pl.min(T_TILE, tile_rows - tg)
-                out_tg = tile_base + tg
-                qr_sq_sum = pl.full([1, T_TILE], dtype=pl.FP32, value=0.0)
-                qr_amax_g = pl.full([1, T_TILE], dtype=pl.FP32, value=0.0)
-                for qr_rms_col0 in pl.pipeline(0, Q_LORA, Q_LORA_TILE, stage=2):
-                    qr_rms_chunk = qr_fp32[tg : tg + T_TILE, qr_rms_col0 : qr_rms_col0 + Q_LORA_TILE]
-                    qr_rms_sq = pl.mul(qr_rms_chunk, qr_rms_chunk)
-                    qr_rms_row_sum = pl.reshape(pl.row_sum(qr_rms_sq), [1, T_TILE])
-                    qr_sq_sum = pl.add(qr_sq_sum, qr_rms_row_sum)
-                    gamma_rms_cast = pl.cast(gamma_cq[qr_rms_col0 : qr_rms_col0 + Q_LORA_TILE], target_type=pl.FP32)
-                    gamma_rms_chunk = pl.reshape(gamma_rms_cast, [1, Q_LORA_TILE])
-                    qr_g = pl.col_expand_mul(qr_rms_chunk, gamma_rms_chunk)
-                    qr_g_abs = pl.abs(qr_g)
-                    qr_g_row_max = pl.reshape(pl.row_max(qr_g_abs), [1, T_TILE])
-                    qr_amax_g = pl.maximum(qr_amax_g, qr_g_row_max)
-                qr_inv_rms = pl.rsqrt(pl.add(pl.mul(qr_sq_sum, 1.0 / Q_LORA), EPS), high_precision=True)
-                qr_inv_rms_t = pl.reshape(qr_inv_rms, [T_TILE, 1])
-                qr_amax_floor = pl.full([1, T_TILE], dtype=pl.FP32, value=INT8_AMAX_EPS)
-                qr_amax_normed = pl.mul(qr_inv_rms, qr_amax_g)
-                qr_tile_amax = pl.maximum(qr_amax_floor, qr_amax_normed)
+            for tg_idx_worker in pl.spmd(pl.min(qr_token_tiles, QR_NORM_WORKERS), name_hint="qr_rms_norm_quant", allow_early_resolve=True):
+                for tg_idx in pl.range(tg_idx_worker, qr_token_tiles, pl.min(qr_token_tiles, QR_NORM_WORKERS)):
+                    tg = tg_idx * T_TILE
+                    valid_rows = pl.min(T_TILE, tile_rows - tg)
+                    out_tg = tile_base + tg
+                    qr_sq_sum = pl.full([1, T_TILE], dtype=pl.FP32, value=0.0)
+                    qr_amax_g = pl.full([1, T_TILE], dtype=pl.FP32, value=0.0)
+                    for qr_rms_col0 in pl.pipeline(0, Q_LORA, Q_LORA_TILE, stage=2):
+                        qr_rms_chunk = qr_fp32[tg : tg + T_TILE, qr_rms_col0 : qr_rms_col0 + Q_LORA_TILE]
+                        qr_rms_sq = pl.mul(qr_rms_chunk, qr_rms_chunk)
+                        qr_rms_row_sum = pl.reshape(pl.row_sum(qr_rms_sq), [1, T_TILE])
+                        qr_sq_sum = pl.add(qr_sq_sum, qr_rms_row_sum)
+                        gamma_rms_cast = pl.cast(gamma_cq[qr_rms_col0 : qr_rms_col0 + Q_LORA_TILE], target_type=pl.FP32)
+                        gamma_rms_chunk = pl.reshape(gamma_rms_cast, [1, Q_LORA_TILE])
+                        qr_g = pl.col_expand_mul(qr_rms_chunk, gamma_rms_chunk)
+                        qr_g_abs = pl.abs(qr_g)
+                        qr_g_row_max = pl.reshape(pl.row_max(qr_g_abs), [1, T_TILE])
+                        qr_amax_g = pl.maximum(qr_amax_g, qr_g_row_max)
+                    qr_inv_rms = pl.rsqrt(pl.add(pl.mul(qr_sq_sum, 1.0 / Q_LORA), EPS), high_precision=True)
+                    qr_inv_rms_t = pl.reshape(qr_inv_rms, [T_TILE, 1])
+                    qr_amax_floor = pl.full([1, T_TILE], dtype=pl.FP32, value=INT8_AMAX_EPS)
+                    qr_amax_normed = pl.mul(qr_inv_rms, qr_amax_g)
+                    qr_tile_amax = pl.maximum(qr_amax_floor, qr_amax_normed)
 
-                qr_scale_quant_row = pl.div(pl.full([1, T_TILE], dtype=pl.FP32, value=INT8_SCALE_MAX), qr_tile_amax)
-                qr_scale_quant_t = pl.reshape(qr_scale_quant_row, [T_TILE, 1])
-                qr_tile_scale_dq = pl.reshape(pl.recip(qr_scale_quant_row), [T_TILE, 1])
-                qr_scale_pad_store = pl.assemble(qr_scale_pad_store, qr_tile_scale_dq, [tg, 0])
-                if valid_rows == T_TILE:
-                    qr_scale_view[out_tg : out_tg + T_TILE, :] = qr_tile_scale_dq
-                else:
-                    qr_scale_tail = pl.load(
-                        qr_scale_pad_store,
-                        [tg, 0],
-                        [T_TILE, 1],
-                        valid_shape=[valid_rows, 1],
-                        target_memory=pl.MemorySpace.Vec,
-                    )
-                    pl.store(qr_scale_tail, [out_tg, 0], qr_scale_view)
-
-                for qa in pl.pipeline(0, Q_LORA, QUANT_TILE, stage=2):
-                    qr_chunk = qr_fp32[tg : tg + T_TILE, qa : qa + QUANT_TILE]
-                    gamma_q_cast = pl.cast(gamma_cq[qa : qa + QUANT_TILE], target_type=pl.FP32)
-                    gamma_q_chunk = pl.reshape(gamma_q_cast, [1, QUANT_TILE])
-                    qr_q_normed = pl.col_expand_mul(pl.row_expand_mul(qr_chunk, qr_inv_rms_t), gamma_q_chunk)
-                    qr_q_scaled = pl.row_expand_mul(qr_q_normed, qr_scale_quant_t)
-                    qr_q_i32 = pl.cast(qr_q_scaled, target_type=pl.INT32, mode="rint")
-                    qr_q_half = pl.cast(qr_q_i32, target_type=pl.FP16, mode="round")
-                    qr_q_i8 = pl.cast(qr_q_half, target_type=pl.INT8, mode="trunc")
-                    qr_i8_matmul[tg : tg + T_TILE, qa : qa + QUANT_TILE] = qr_q_i8
+                    qr_scale_quant_row = pl.div(pl.full([1, T_TILE], dtype=pl.FP32, value=INT8_SCALE_MAX), qr_tile_amax)
+                    qr_scale_quant_t = pl.reshape(qr_scale_quant_row, [T_TILE, 1])
+                    qr_tile_scale_dq = pl.reshape(pl.recip(qr_scale_quant_row), [T_TILE, 1])
+                    qr_scale_pad_store = pl.assemble(qr_scale_pad_store, qr_tile_scale_dq, [tg, 0])
                     if valid_rows == T_TILE:
-                        qr_view[out_tg : out_tg + T_TILE, qa : qa + QUANT_TILE] = qr_q_i8
+                        qr_scale_view[out_tg : out_tg + T_TILE, :] = qr_tile_scale_dq
                     else:
-                        qr_q_tail = pl.load(
-                            qr_i8_matmul,
-                            [tg, qa],
-                            [T_TILE, QUANT_TILE],
-                            valid_shape=[valid_rows, QUANT_TILE],
+                        qr_scale_tail = pl.load(
+                            qr_scale_pad_store,
+                            [tg, 0],
+                            [T_TILE, 1],
+                            valid_shape=[valid_rows, 1],
                             target_memory=pl.MemorySpace.Vec,
                         )
-                        pl.store(qr_q_tail, [out_tg, qa], qr_view)
+                        pl.store(qr_scale_tail, [out_tg, 0], qr_scale_view)
+
+                    for qa in pl.pipeline(0, Q_LORA, QUANT_TILE, stage=2):
+                        qr_chunk = qr_fp32[tg : tg + T_TILE, qa : qa + QUANT_TILE]
+                        gamma_q_cast = pl.cast(gamma_cq[qa : qa + QUANT_TILE], target_type=pl.FP32)
+                        gamma_q_chunk = pl.reshape(gamma_q_cast, [1, QUANT_TILE])
+                        qr_q_normed = pl.col_expand_mul(pl.row_expand_mul(qr_chunk, qr_inv_rms_t), gamma_q_chunk)
+                        qr_q_scaled = pl.row_expand_mul(qr_q_normed, qr_scale_quant_t)
+                        qr_q_i32 = pl.cast(qr_q_scaled, target_type=pl.INT32, mode="rint")
+                        qr_q_half = pl.cast(qr_q_i32, target_type=pl.FP16, mode="round")
+                        qr_q_i8 = pl.cast(qr_q_half, target_type=pl.INT8, mode="trunc")
+                        qr_i8_matmul[tg : tg + T_TILE, qa : qa + QUANT_TILE] = qr_q_i8
+                        if valid_rows == T_TILE:
+                            qr_view[out_tg : out_tg + T_TILE, qa : qa + QUANT_TILE] = qr_q_i8
+                        else:
+                            qr_q_tail = pl.load(
+                                qr_i8_matmul,
+                                [tg, qa],
+                                [T_TILE, QUANT_TILE],
+                                valid_shape=[valid_rows, QUANT_TILE],
+                                target_memory=pl.MemorySpace.Vec,
+                            )
+                            pl.store(qr_q_tail, [out_tg, qa], qr_view)
 
 
 @pl.jit.inline(auto_scope=False)
@@ -414,33 +415,17 @@ def q_proj_q_matmul(
             qproj_worker, (H * HEAD_DIM) // QPROJ_MM_N_TILE, QPROJ_WORKERS,
         ):
             w_col0 = qproj_n_idx * QPROJ_MM_N_TILE
+            wq_full = wq_b[0:Q_LORA, w_col0 : w_col0 + QPROJ_MM_N_TILE]
             for t0 in pl.range(0, qproj_full_rows, QPROJ_M_TILE):
-                col_acc = pl.create_tensor([QPROJ_M_TILE, QPROJ_MM_N_TILE], dtype=pl.INT32)
-                for qr_proj_col0 in pl.pipeline(0, Q_LORA, Q_PROJ_TILE, stage=2):
-                    qr_i8_chunk = qr_i8_matmul[
-                        t0 : t0 + QPROJ_M_TILE,
-                        qr_proj_col0 : qr_proj_col0 + Q_PROJ_TILE,
-                    ]
-                    wq_chunk = wq_b[qr_proj_col0 : qr_proj_col0 + Q_PROJ_TILE, w_col0 : w_col0 + QPROJ_MM_N_TILE]
-                    col_acc = pl.matmul_acc(col_acc, qr_i8_chunk, wq_chunk, init_cond=(qr_proj_col0 == 0))
+                qr_full = qr_i8_matmul[t0 : t0 + QPROJ_M_TILE, 0:Q_LORA]
+                col_acc = pl.matmul(qr_full, wq_full, out_dtype=pl.INT32)
                 q_proj_i32[t0 : t0 + QPROJ_M_TILE, w_col0 : w_col0 + QPROJ_MM_N_TILE] = col_acc
 
             tail_w_col0 = w_col0
             for tail_t0 in pl.range(qproj_full_rows, qproj_t_matmul, QPROJ_TAIL_M_TILE):
                 qproj_tail_rows = pl.min(QPROJ_TAIL_M_TILE, tile_rows - tail_t0)
-                tail_acc = pl.create_tensor([QPROJ_TAIL_M_TILE, QPROJ_MM_N_TILE], dtype=pl.INT32)
-                for tail_qr_col0 in pl.pipeline(0, Q_LORA, Q_PROJ_TILE, stage=2):
-                    qr_i8_tail = pl.slice(
-                        qr_i8_matmul,
-                        [QPROJ_TAIL_M_TILE, Q_PROJ_TILE],
-                        [tail_t0, tail_qr_col0],
-                        valid_shape=[qproj_tail_rows, Q_PROJ_TILE],
-                    )
-                    wq_tail = wq_b[
-                        tail_qr_col0 : tail_qr_col0 + Q_PROJ_TILE,
-                        tail_w_col0 : tail_w_col0 + QPROJ_MM_N_TILE,
-                    ]
-                    tail_acc = pl.matmul_acc(tail_acc, qr_i8_tail, wq_tail, init_cond=(tail_qr_col0 == 0))
+                qr_i8_tail = pl.slice(qr_i8_matmul, [QPROJ_TAIL_M_TILE, Q_LORA], [tail_t0, 0], valid_shape=[qproj_tail_rows, Q_LORA])
+                tail_acc = pl.matmul(qr_i8_tail, wq_full, out_dtype=pl.INT32)
                 q_proj_i32[
                     tail_t0 : tail_t0 + QPROJ_TAIL_M_TILE,
                     tail_w_col0 : tail_w_col0 + QPROJ_MM_N_TILE,
@@ -467,18 +452,23 @@ def q_proj_q_dequant(
         Q_DEQUANT_WORKERS, name_hint="qproj_dequant_rms_nope_rope",
         allow_early_resolve=True,
     ):
+        dq_head_tile = Q_ROPE_H_TILE
+        if tile_rows >= Q_DEQUANT_WORKERS * Q_ROPE_T_TILE and tile_rows % (Q_DEQUANT_WORKERS * Q_ROPE_T_TILE) == 0:
+            dq_head_tile = H
+        elif tile_rows >= Q_DEQUANT_WORKERS * Q_ROPE_T_TILE * 16 // H and tile_rows % (Q_DEQUANT_WORKERS * Q_ROPE_T_TILE * 16 // H) == 0:
+            dq_head_tile = 16
         for dq_work in pl.range(
-            dq_worker, ((tile_rows + Q_ROPE_T_TILE - 1) // Q_ROPE_T_TILE) * (H // Q_ROPE_H_TILE), Q_DEQUANT_WORKERS,
+            dq_worker, ((tile_rows + Q_ROPE_T_TILE - 1) // Q_ROPE_T_TILE) * (H // dq_head_tile), Q_DEQUANT_WORKERS,
         ):
-            hg = (dq_work % (H // Q_ROPE_H_TILE)) * Q_ROPE_H_TILE
-            tg = (dq_work // (H // Q_ROPE_H_TILE)) * Q_ROPE_T_TILE
+            hg = (dq_work % (H // dq_head_tile)) * dq_head_tile
+            tg = (dq_work // (H // dq_head_tile)) * Q_ROPE_T_TILE
             out_tg = tile_base + tg
             if tg + Q_ROPE_T_TILE <= tile_rows:
                 qr_scale_dq_t = qr_scale_pad_store[tg : tg + Q_ROPE_T_TILE, :]
                 q_cos_il = rope_cos_il[out_tg : out_tg + Q_ROPE_T_TILE, :]
                 q_sin_signed = rope_sin_signed[out_tg : out_tg + Q_ROPE_T_TILE, :]
                 q_swap_idx = rope_swap_idx[out_tg : out_tg + Q_ROPE_T_TILE, :]
-                for h_inner in pl.pipeline(Q_ROPE_H_TILE, stage=2):
+                for h_inner in pl.pipeline(dq_head_tile, stage=2):
                     h = hg + h_inner
                     h0 = h * HEAD_DIM
                     q_head_acc = q_proj_i32[tg : tg + Q_ROPE_T_TILE, h0 : h0 + HEAD_DIM]
@@ -559,7 +549,7 @@ def q_proj_q_dequant(
                     dtype=pl.INT32,
                     target_memory=pl.MemorySpace.Vec,
                 )
-                for h_inner_tail in pl.range(Q_ROPE_H_TILE):
+                for h_inner_tail in pl.range(dq_head_tile):
                     h_tail = hg + h_inner_tail
                     h0_tail = h_tail * HEAD_DIM
                     q_head_acc_tail = pl.load(

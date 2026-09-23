@@ -75,16 +75,29 @@ GROUP_T_PAD = TP_SIZE * LOCAL_T_PAD
 ATTENTION_WINDOW_ROWS = LOCAL_O_GROUPS * GROUP_T_PAD
 O_WINDOW_ROWS = TP_SIZE * LOCAL_T_PAD
 
+
+def _token_tile(capacity, ceiling):
+    """Largest TOKEN_TILE multiple up to `ceiling` that divides `capacity`."""
+    for tile in range(min(ceiling, capacity) // TOKEN_TILE * TOKEN_TILE, 0, -TOKEN_TILE):
+        if capacity % tile == 0:
+            return tile
+    return TOKEN_TILE
+
+
 # local output projection tiling
 A_K_TILE = 256
 PROJ_A_MM_N_TILE = 128
+PROJ_A_LARGE_N_TILE = 256
 PROJ_A_ROW_TILE = 128  # proj_a token block; one block covers T_PAD, 8 tasks/group
 B_K_TILE = 256
 # Keep the INT32 proj-b accumulator within the A2/A3 tile buffer.
-PROJ_B_MM_T_TILE = 128
+PROJ_B_MM_T_TILE = _token_tile(T_PAD, 128)
+PROJ_B_SMALL_T_TILE = _token_tile(T_PAD, 32)
+PROJ_B_MEDIUM_T_TILE = _token_tile(T_PAD, 96)
 PROJ_B_MM_N_TILE = 256
 PROJ_B_ACT_N_TILE = 512
 QUANT_TOKEN_TILE = 8
+QUANT_TASK_T_TILE = 32
 PROJ_B_D_TILE = 512  # proj_b_mm D chunk per task; coarser starves the 24 AIC cores
 PROJ_B_ACT_T_TILE = 8
 PROJ_B_ACT_TASK_T_TILE = 32  # proj_b_act token block per task
@@ -95,7 +108,7 @@ O_A_K_TILE = 256
 O_A_N_TILE = 128
 QUANT_T_TILE = 8
 O_A_QUANT_WORKERS = 6   # per owner-group; 4 x 2 x 6 -> one AIV wave
-O_B_T_TILE = 128
+O_B_T_TILE = _token_tile(LOCAL_T_PAD, 128)
 O_B_K_TILE = 256
 O_B_N_TILE = 256
 O_B_D_TILE = 512
@@ -126,6 +139,8 @@ if O_RS_REDUCE_WORKERS % TP_SIZE != 0:
     raise ValueError(f"TP size {TP_SIZE} must divide O-B ReduceScatter workers {O_RS_REDUCE_WORKERS}")
 if O_RS_PUBLISH_WORKERS % TP_SIZE != 0:
     raise ValueError(f"TP size {TP_SIZE} must divide O-B publish workers {O_RS_PUBLISH_WORKERS}")
+if LOCAL_T_PAD % O_B_T_TILE != 0:
+    raise ValueError(f"O-B token tile {O_B_T_TILE} must divide local token capacity {LOCAL_T_PAD}")
 if GROUP_T_PAD % O_B_T_TILE != 0:
     raise ValueError(f"O-B token tile {O_B_T_TILE} must divide token capacity {GROUP_T_PAD}")
 if T_PAD % PROJ_B_MM_T_TILE != 0:
@@ -135,20 +150,22 @@ if T_PAD % PROJ_B_MM_T_TILE != 0:
 
 
 @pl.jit.inline
-def decode_o_proj_tp1(
+def _decode_o_proj_tp1_tiled(
     o_packed: pl.Tensor[[O_GROUPS * T_PAD, O_GROUP_IN], pl.BF16],
     wo_a: pl.Tensor[[O_GROUPS, O_LORA, O_GROUP_IN], pl.BF16, pl.NZ],
     wo_b: pl.Tensor[[O_GROUPS, D, O_LORA], pl.INT8, pl.NZ],
     wo_b_scale: pl.Tensor[[D], pl.FP32],
     attn_out: pl.Tensor[[T_DYN, D], pl.BF16],
     heads_dep: pl.Scalar[pl.TASK_ID],
+    ROW_TILE: pl.constexpr,
+    A_COL_TILE: pl.constexpr,
 ):
     """Project local-token, full-group attention heads into BF16 hidden rows."""
     t_dim = pl.tensor.dim(attn_out, 0)
     act_t_blks = (t_dim + PROJ_B_ACT_TASK_T_TILE - 1) // PROJ_B_ACT_TASK_T_TILE
     proj_a_rows = (t_dim + PROJ_A_ROW_TILE - 1) // PROJ_A_ROW_TILE
-    proj_b_t_rows = (t_dim + PROJ_B_MM_T_TILE - 1) // PROJ_B_MM_T_TILE
-    proj_b_padded_rows = proj_b_t_rows * PROJ_B_MM_T_TILE
+    proj_b_t_rows = (t_dim + ROW_TILE - 1) // ROW_TILE
+    proj_b_padded_rows = proj_b_t_rows * ROW_TILE
 
     # Back-to-back grouped output projection: proj_a[g] -> quant[g] -> proj_b[g]
     # pipelines per group; the per-group amax keeps the quant reduction inside one
@@ -169,31 +186,30 @@ def decode_o_proj_tp1(
             row_base_o = g * T_PAD
             out_col_g = g * O_LORA
 
-            with pl.spmd(proj_a_rows * (O_LORA // PROJ_A_MM_N_TILE), name_hint="proj_a_mm", deps=[heads_dep],
+            with pl.spmd(proj_a_rows * (O_LORA // A_COL_TILE), name_hint="proj_a_mm", deps=[heads_dep],
                          allow_early_resolve=True) as pa_tid:
-                # Weight reads bypass L2.
-                pl.set_cache_policy(wo_a, pl.CachePolicy.BYPASS)
                 pa_unit = pl.tile.get_block_idx()
-                pa_rb = pa_unit // (O_LORA // PROJ_A_MM_N_TILE)  # row block outermost
-                nf = pa_unit % (O_LORA // PROJ_A_MM_N_TILE)
+                pa_rb = pa_unit // (O_LORA // A_COL_TILE)  # row block outermost
+                nf = pa_unit % (O_LORA // A_COL_TILE)
                 pa_r0 = pa_rb * PROJ_A_ROW_TILE
                 pa_rows = pl.min(PROJ_A_ROW_TILE, t_dim - pa_r0)
                 pa_src0 = row_base_o + pa_r0
-                n0 = nf * PROJ_A_MM_N_TILE
+                n0 = nf * A_COL_TILE
                 xa_first = pl.slice(o_packed, [PROJ_A_ROW_TILE, A_K_TILE], [pa_src0, 0], valid_shape=[pa_rows, A_K_TILE])
-                wa_first = wo_a[g : g + 1, n0 : n0 + PROJ_A_MM_N_TILE, 0 : A_K_TILE]
+                wa_first = wo_a[g : g + 1, n0 : n0 + A_COL_TILE, 0 : A_K_TILE]
                 acc_a = pl.matmul(xa_first, wa_first, out_dtype=pl.FP32, b_trans=True)
                 for kb in pl.pipeline(1, O_GROUP_IN // A_K_TILE, stage=2):
                     k0 = kb * A_K_TILE
                     xa_k_chunk = pl.slice(o_packed, [PROJ_A_ROW_TILE, A_K_TILE], [pa_src0, k0], valid_shape=[pa_rows, A_K_TILE])
-                    wa_k_chunk = wo_a[g : g + 1, n0 : n0 + PROJ_A_MM_N_TILE, k0 : k0 + A_K_TILE]
+                    wa_k_chunk = wo_a[g : g + 1, n0 : n0 + A_COL_TILE, k0 : k0 + A_K_TILE]
                     acc_a = pl.matmul_acc(acc_a, xa_k_chunk, wa_k_chunk, b_trans=True)
                 # acc_a is 3D (wo_a keeps its group axis), which subscript-write cannot express.
                 o_r_pad = pl.assemble(o_r_pad, acc_a, [pa_r0, out_col_g + n0])
 
             col_g = g * O_LORA
-            with pl.at(level=pl.Level.CORE_GROUP, name_hint="quant", deps=[pa_tid], allow_early_resolve=True) as q_tid:
-                for qt in pl.pipeline(0, t_dim, QUANT_TOKEN_TILE, stage=2):
+            with pl.spmd((t_dim + QUANT_TASK_T_TILE - 1) // QUANT_TASK_T_TILE, name_hint="quant", deps=[pa_tid], allow_early_resolve=True) as q_tid:
+                quant_start = pl.tile.get_block_idx() * QUANT_TASK_T_TILE
+                for qt in pl.pipeline(quant_start, pl.min(quant_start + QUANT_TASK_T_TILE, t_dim), QUANT_TOKEN_TILE, stage=2):
                     oc_amax = o_r_pad[qt : qt + QUANT_TOKEN_TILE, col_g : col_g + O_LORA]
                     g_abs = pl.abs(oc_amax)
                     g_row_max = pl.row_max(g_abs)
@@ -212,31 +228,45 @@ def decode_o_proj_tp1(
                     oq_i8 = pl.cast(oq_half, target_type=pl.INT8, mode="trunc")
                     o_r_i8_pad[qt : qt + QUANT_TOKEN_TILE, col_g : col_g + O_LORA] = oq_i8
                 # Zero the tail of the final active proj_b_mm row tile.
-                for zt in pl.range(t_dim, proj_b_padded_rows, QUANT_TOKEN_TILE):
-                    zero_half = pl.full([QUANT_TOKEN_TILE, O_LORA], dtype=pl.FP16, value=0.0)
-                    o_r_i8_pad[zt : zt + QUANT_TOKEN_TILE, col_g : col_g + O_LORA] = pl.cast(
-                        zero_half, target_type=pl.INT8, mode="trunc")
+                if quant_start + QUANT_TASK_T_TILE >= t_dim:
+                    for zt in pl.range(t_dim, proj_b_padded_rows, QUANT_TOKEN_TILE):
+                        zero_half = pl.full([QUANT_TOKEN_TILE, O_LORA], dtype=pl.FP16, value=0.0)
+                        o_r_i8_pad[zt : zt + QUANT_TOKEN_TILE, col_g : col_g + O_LORA] = pl.cast(
+                            zero_half, target_type=pl.INT8, mode="trunc")
 
-            with pl.spmd(proj_b_t_rows * (D // PROJ_B_D_TILE), name_hint="proj_b_mm", deps=[q_tid], allow_early_resolve=True) as pb_tid:
-                # Weight reads bypass L2.
-                pl.set_cache_policy(wo_b, pl.CachePolicy.BYPASS)
-                pb_unit = pl.tile.get_block_idx()
-                tb = pb_unit // (D // PROJ_B_D_TILE)
-                dc = pb_unit % (D // PROJ_B_D_TILE)
-                t0 = tb * PROJ_B_MM_T_TILE
-                d0 = dc * PROJ_B_D_TILE
-                for nf in pl.range(PROJ_B_D_TILE // PROJ_B_MM_N_TILE):
-                    n0 = d0 + nf * PROJ_B_MM_N_TILE
-                    acc_b = pl.create_tensor([1, PROJ_B_MM_T_TILE, PROJ_B_MM_N_TILE], dtype=pl.INT32)
-                    for kb in pl.pipeline(0, O_LORA // B_K_TILE, stage=2):
-                        k0 = col_g + kb * B_K_TILE
-                        wb_k0 = kb * B_K_TILE
-                        b_act = o_r_i8_pad[t0 : t0 + PROJ_B_MM_T_TILE, k0 : k0 + B_K_TILE]
-                        b_weight = wo_b[g : g + 1, n0 : n0 + PROJ_B_MM_N_TILE, wb_k0 : wb_k0 + B_K_TILE]
-                        acc_b = pl.matmul_acc(acc_b, b_act, b_weight, b_trans=True, init_cond=(kb == 0))
-                    acc_b_2d = pl.reshape(acc_b, [PROJ_B_MM_T_TILE, PROJ_B_MM_N_TILE])
-                    partials[t0 : t0 + PROJ_B_MM_T_TILE, g * D + n0 : g * D + n0 + PROJ_B_MM_N_TILE] = acc_b_2d
-            proj_b_tids[g] = pb_tid
+            if ROW_TILE > 96:
+                with pl.spmd(D // PROJ_B_D_TILE, name_hint="proj_b_mm", deps=[q_tid], allow_early_resolve=True) as pb_tid:
+                    dc = pl.tile.get_block_idx()
+                    d0 = dc * PROJ_B_D_TILE
+                    for nf in pl.range(PROJ_B_D_TILE // PROJ_B_MM_N_TILE):
+                        n0 = d0 + nf * PROJ_B_MM_N_TILE
+                        b_weight_resident = wo_b[g : g + 1, n0 : n0 + PROJ_B_MM_N_TILE, 0:O_LORA]
+                        for tb in pl.range(proj_b_t_rows):
+                            t0 = tb * ROW_TILE
+                            b_act_full = o_r_i8_pad[t0 : t0 + ROW_TILE, col_g : col_g + O_LORA]
+                            acc_b = pl.matmul(b_act_full, b_weight_resident, out_dtype=pl.INT32, b_trans=True)
+                            acc_b_2d = pl.reshape(acc_b, [ROW_TILE, PROJ_B_MM_N_TILE])
+                            partials[t0 : t0 + ROW_TILE, g * D + n0 : g * D + n0 + PROJ_B_MM_N_TILE] = acc_b_2d
+                proj_b_tids[g] = pb_tid
+            else:
+                with pl.spmd(proj_b_t_rows * (D // PROJ_B_D_TILE), name_hint="proj_b_mm", deps=[q_tid], allow_early_resolve=True) as pb_tid:
+                    pb_unit = pl.tile.get_block_idx()
+                    tb = pb_unit // (D // PROJ_B_D_TILE)
+                    dc = pb_unit % (D // PROJ_B_D_TILE)
+                    t0 = tb * ROW_TILE
+                    d0 = dc * PROJ_B_D_TILE
+                    for nf in pl.range(PROJ_B_D_TILE // PROJ_B_MM_N_TILE):
+                        n0 = d0 + nf * PROJ_B_MM_N_TILE
+                        acc_b = pl.create_tensor([1, ROW_TILE, PROJ_B_MM_N_TILE], dtype=pl.INT32)
+                        for kb in pl.pipeline(0, O_LORA // B_K_TILE, stage=2):
+                            k0 = col_g + kb * B_K_TILE
+                            wb_k0 = kb * B_K_TILE
+                            b_act = o_r_i8_pad[t0 : t0 + ROW_TILE, k0 : k0 + B_K_TILE]
+                            b_weight = wo_b[g : g + 1, n0 : n0 + PROJ_B_MM_N_TILE, wb_k0 : wb_k0 + B_K_TILE]
+                            acc_b = pl.matmul_acc(acc_b, b_act, b_weight, b_trans=True, init_cond=(kb == 0))
+                        acc_b_2d = pl.reshape(acc_b, [ROW_TILE, PROJ_B_MM_N_TILE])
+                        partials[t0 : t0 + ROW_TILE, g * D + n0 : g * D + n0 + PROJ_B_MM_N_TILE] = acc_b_2d
+                proj_b_tids[g] = pb_tid
 
     # proj_b_act sums the O_GROUPS INT32 partials -- each dequantized by its group's
     # per-row act scale -- then applies the per-channel weight scale -> BF16. Explicit
@@ -264,6 +294,26 @@ def decode_o_proj_tp1(
             out_bf16 = pl.cast(out_t, target_type=pl.BF16, mode="rint")
             attn_out[b_tb : b_tb + PROJ_B_ACT_T_TILE, ob_n0 : ob_n0 + PROJ_B_ACT_N_TILE] = out_bf16
 
+    return attn_out
+
+
+@pl.jit.inline(auto_scope=False)
+def decode_o_proj_tp1(
+    o_packed: pl.Tensor[[O_GROUPS * T_PAD, O_GROUP_IN], pl.BF16],
+    wo_a: pl.Tensor[[O_GROUPS, O_LORA, O_GROUP_IN], pl.BF16, pl.NZ],
+    wo_b: pl.Tensor[[O_GROUPS, D, O_LORA], pl.INT8, pl.NZ],
+    wo_b_scale: pl.Tensor[[D], pl.FP32],
+    attn_out: pl.Tensor[[T_DYN, D], pl.BF16],
+    heads_dep: pl.Scalar[pl.TASK_ID],
+):
+    """Project attention outputs with a row tile selected by token count."""
+    t_dim = pl.tensor.dim(attn_out, 0)
+    if t_dim <= 32:
+        attn_out = _decode_o_proj_tp1_tiled(o_packed, wo_a, wo_b, wo_b_scale, attn_out, heads_dep, PROJ_B_SMALL_T_TILE, PROJ_A_MM_N_TILE)
+    elif t_dim <= 96:
+        attn_out = _decode_o_proj_tp1_tiled(o_packed, wo_a, wo_b, wo_b_scale, attn_out, heads_dep, PROJ_B_MEDIUM_T_TILE, PROJ_A_MM_N_TILE)
+    else:
+        attn_out = _decode_o_proj_tp1_tiled(o_packed, wo_a, wo_b, wo_b_scale, attn_out, heads_dep, PROJ_B_MM_T_TILE, PROJ_A_LARGE_N_TILE)
     return attn_out
 
 
