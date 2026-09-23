@@ -36,7 +36,7 @@ import torch
 from golden import TensorSpec, run
 from models.deepseek_v4_1_flash.attention_common import quantized_cache_compare
 from models.deepseek_v4_1_flash import decode_common as common
-from models.deepseek_v4_1_flash.decode_common import zero_bf16_padding
+from models.deepseek_v4_1_flash.decode_common import mhc_pre_norm, slab_owner
 from models.deepseek_v4_1_flash.attention_tp import OUTPUT_T_DYN, decode_tp_input_all_gather
 from models.deepseek_v4_1_flash.config import (
     B_DYN,
@@ -84,9 +84,8 @@ from models.deepseek_v4_1_flash.decode_attn_c1a_full import (
 )
 from models.deepseek_v4_1_flash.hc_mixes import golden_mhc_mixes, mhc_mixes
 from models.deepseek_v4_1_flash.hc_post import golden_mhc_post, mhc_post
-from models.deepseek_v4_1_flash.hc_pre import golden_mhc_pre, mhc_pre
+from models.deepseek_v4_1_flash.hc_pre import golden_mhc_pre
 from models.deepseek_v4_1_flash.golden import rms_norm as golden_rms_norm
-from models.deepseek_v4_1_flash.rmsnorm import rms_norm
 
 
 @pl.jit.inline(auto_scope=False)
@@ -153,11 +152,9 @@ def decode_c1a_full(
     attn_out = pl.create_tensor([tokens, D], dtype=pl.BF16)
     # The coefficients are staggered: collapse with the pre-mix the previous sub-layer
     # produced, apply post/residual immediately, and hand this site's pre-mix forward.
+    # The collapse + norm block itself is shared with the spec-driven modes.
     mhc_mixes(x_hc, hc_attn_fn, hc_attn_scale, hc_attn_base, next_pre_mix, post_mix, residual_mix)
-    mhc_pre(x_hc, pre_mix, hidden)
-    # The block normalizes the collapsed stream before attention; the operator takes the
-    # normalized hidden, so the norm sits between the collapse and the call.
-    rms_norm(hidden, attn_norm_weight, normed)
+    mhc_pre_norm(x_hc, pre_mix, attn_norm_weight, hidden, normed, num_tokens)
     decode_attn_c1a_full(
         normed, wq_a, wq_a_scale, q_norm_weight, wq_b, wq_b_scale, wkv, wkv_scale, kv_norm_weight, attn_sink,
         wo_a, wo_b, wo_b_scale, rope_cos, rope_sin, window_slots, window_indices, window_cache,
@@ -236,20 +233,13 @@ def decode_c1a_full_sharded(
     hidden = pl.create_tensor([tokens, D], dtype=pl.BF16)
     normed = pl.create_tensor([tokens, D], dtype=pl.BF16)
     attn_out = pl.create_tensor([tokens, D], dtype=pl.BF16)
-    # The coefficients are staggered: collapse with the pre-mix the previous sub-layer
-    # produced, apply post/residual immediately, and hand this site's pre-mix forward.
-    mhc_mixes(x_hc, hc_attn_fn, hc_attn_scale, hc_attn_base, next_pre_mix, post_mix, residual_mix)
-    mhc_pre(x_hc, pre_mix, hidden)
-    # The block normalizes the collapsed stream before attention; the operator takes the
-    # normalized hidden, so the norm sits between the collapse and the call.
-    rms_norm(hidden, attn_norm_weight, normed)
     # Sequence parallel: the residual stream stays local, only the normalized
-    # Attention input crosses the TP group ([T_local, D] -> [T, D]).
-    local_first = pl.min(tp_rank * tokens, num_tokens)
-    # The slab's padding rows are published but never gathered; clear them so the
-    # transport window never carries a stale value (the spec-driven modes use the same
-    # zero_bf16_padding policy).
-    zero_bf16_padding(normed, pl.max(0, pl.min(tokens, num_tokens - local_first)))
+    # Attention input crosses the TP group ([T_local, D] -> [T, D]).  The shared
+    # block takes this rank's own row count, so it zeroes the slab's padding rows
+    # before they are published.
+    _, local_count = slab_owner(tp_rank, tokens, num_tokens)
+    mhc_mixes(x_hc, hc_attn_fn, hc_attn_scale, hc_attn_base, next_pre_mix, post_mix, residual_mix)
+    mhc_pre_norm(x_hc, pre_mix, attn_norm_weight, hidden, normed, local_count)
     gathered = decode_tp_input_all_gather(
         normed, input_window, input_arrived, gathered, group_base, tp_rank, num_tokens, attention_epoch
     )
@@ -443,7 +433,10 @@ __all__ = [
     "decode_c1a_full_sharded",
     "golden_c1a_hc_case",
     "golden_decode_c1a_full_case",
+    "make_wiring_program",
+    "parse_c1a_hc_args",
     "run_c1a_hc",
+    "validate_c1a_wirings",
 ]
 
 
@@ -704,30 +697,6 @@ def output_hc_compare(actual, expected, **kwargs):
     return budget(actual, expected, **kwargs)
 
 
-def output_hc_compare_sharded(actual, expected, *, inputs=None, **kwargs):
-    """Apply the HC output budget only to valid rows of each TP slab."""
-    for rank in range(actual.shape[0]):
-        if inputs is None or "num_tokens" not in inputs:
-            valid = expected[rank].reshape(expected.shape[1], -1).norm(dim=1) > 0
-            if not bool(valid.any()):
-                continue
-            actual_rows, expected_rows = actual[rank][valid], expected[rank][valid]
-        else:
-            active = int(inputs["num_tokens"])
-            width = actual.shape[1]
-            first = min(rank * width, active)
-            count = max(0, min(width, active - first))
-            if count == 0:
-                continue
-            actual_rows, expected_rows = actual[rank][:count], expected[rank][:count]
-        if actual_rows.shape[0] == 0:
-            continue
-        passed, detail = output_hc_compare(actual_rows, expected_rows, inputs={}, **kwargs)
-        if not passed:
-            return False, f"rank {rank}: {detail}"
-    return True, "valid sequence-parallel HC rows pass"
-
-
 def next_pre_mix_compare(actual, expected, **kwargs):
     """Report the staggered coefficient diagnostics under the mHC budget.
 
@@ -881,11 +850,13 @@ def golden_decode_c1a_full_case(tensors, epochs=1, sharded=False):
     golden_c1a_hc_case(tensors, golden_decode_attn_c1a_full, epochs, sharded)
 
 
-def run_c1a_hc(mode, kernel_factory, golden_case, argv=None, sharded=False):
-    """Run A5 validation for an mHC-wired C1A operator."""
-    import argparse
+def parse_c1a_hc_args(mode, argv=None):
+    """Parse and validate one mHC C1A Attention harness command line.
 
-    from pypto.ir import DistributedConfig
+    Both wirings share one parse so ``--wiring`` can decide up front which of
+    them run, and so a replay directory is never handed to two ABIs.
+    """
+    import argparse
 
     parser = argparse.ArgumentParser(description=f"TP1/2/4 A5 mHC C1A {mode} validation")
     parser.add_argument("--tp", type=int, default=TP_SIZE, choices=[1, 2, 4])
@@ -911,11 +882,12 @@ def run_c1a_hc(mode, kernel_factory, golden_case, argv=None, sharded=False):
     parser.add_argument("--enable-chip-swimlane", type=int, nargs="?", const=1, default=0, choices=range(5))
     parser.add_argument("--check-fp4", action="store_true", default=False,
                         help="run the CPU E2M1 midpoint check and exit")
+    common.add_wiring_argument(parser)
     args = parser.parse_args(argv)
-    if sharded:
-        common.validate_sp_tokens(parser, args)
     if args.check_fp4:
         raise SystemExit(check_fp4_boundaries())
+    if common.WIRING_SHARDED in common.selected_wirings(args.wiring):
+        common.validate_sp_tokens(parser, args)
     if args.tp != TP_SIZE:
         parser.error(f"--tp {args.tp} does not match the TP_SIZE {TP_SIZE} the operator was built for")
     try:
@@ -926,6 +898,44 @@ def run_c1a_hc(mode, kernel_factory, golden_case, argv=None, sharded=False):
         parser.error(f"device IDs must be {TP_SIZE} distinct nonnegative integers, one per rank")
     if not 1 <= args.tokens <= min(DECODE_MAX_TOKENS, args.pages * 128) or args.pages < 1 or args.epochs < 1:
         parser.error(f"require 1 <= tokens <= min({DECODE_MAX_TOKENS}, pages * 128), pages >= 1, epochs >= 1")
+    return args, devices
+
+
+def make_wiring_program(factory, wiring):
+    """Bind one wiring to a C1A host factory.
+
+    Every mode's ``make_program`` already dispatches on ``sharded``; this binds
+    the wiring to the caller's own factory so a wrapper cannot substitute another
+    mode's host.
+    """
+    if wiring == common.WIRING_SHARDED:
+        return lambda tokens, pages, epochs: factory(tokens, pages, epochs, sharded=True)
+    return factory
+
+
+def validate_c1a_wirings(mode, factory, golden_case, argv=None):
+    """Validate every wiring ``--wiring`` selects and combine the results."""
+    args, devices = parse_c1a_hc_args(mode, argv)
+    return common.combine_validation(
+        [
+            run_c1a_hc(
+                mode,
+                make_wiring_program(factory, wiring),
+                golden_case,
+                args=args,
+                devices=devices,
+                sharded=wiring == common.WIRING_SHARDED,
+            )
+            for wiring in common.selected_wirings(args.wiring)
+        ]
+    )
+
+
+def run_c1a_hc(mode, kernel_factory, golden_case, *, args, devices, sharded=False):
+    """Run A5 validation for one mHC-wired C1A operator and one wiring."""
+    from pypto.ir import DistributedConfig
+
+    wiring = common.WIRING_SHARDED if sharded else common.WIRING_REPLICATED
     host = kernel_factory(args.tokens, args.pages, args.epochs)
     values = build_hc_validation_values(mode, args.tokens, args.pages, args.seed, args.case, sharded)
     # Clone per call: the harness builds the golden scratch from these same specs, and a
@@ -948,7 +958,13 @@ def run_c1a_hc(mode, kernel_factory, golden_case, argv=None, sharded=False):
         "topk_indices": exact_bytes if mode == "reuse" else hc_topk_indices_compare(mode),
         "candidate_mask": exact_bytes,
         "next_pre_mix": next_pre_mix_compare,
-        "output": output_hc_compare_sharded if sharded else output_hc_compare,
+        # The C1A specs are tensors only, so the comparator cannot read the batch
+        # size off the harness: it takes the entry's own token count.
+        "output": (
+            common.compare_owner_rows(output_hc_compare, name="HC output", active=args.tokens)
+            if sharded
+            else output_hc_compare
+        ),
         "gathered": gathered_hc_compare,
     }
     comparisons["window_cache_scale"] = comparisons["window_cache"]
@@ -975,8 +991,8 @@ def run_c1a_hc(mode, kernel_factory, golden_case, argv=None, sharded=False):
         golden_fn=golden_fn,
         compile_only=args.compile_only,
         save_data=args.save_data,
-        golden_data=args.golden_data,
-        runtime_dir=args.runtime_dir,
+        golden_data=common.wiring_replay_dir(args.golden_data, wiring),
+        runtime_dir=common.wiring_replay_dir(args.runtime_dir, wiring),
         config=dict(
             platform=args.platform,
             dump_passes=args.dump_passes,
@@ -991,18 +1007,8 @@ def run_c1a_hc(mode, kernel_factory, golden_case, argv=None, sharded=False):
 
 
 def validate(argv=None):
-    """Validate the replicated and the sequence-parallel wiring on A5."""
-    result = run_c1a_hc("full", make_program, golden_decode_c1a_full_case, argv=argv)
-    # The sequence-parallel wiring: the same shapes and numbers, but the attention input
-    # arrives through the layer-head AllGather and the output leaves through ReduceScatter.
-    result_sharded = run_c1a_hc(
-        "full",
-        lambda tokens, pages, epochs: make_program(tokens, pages, epochs, sharded=True),
-        golden_decode_c1a_full_case,
-        argv=argv,
-        sharded=True,
-    )
-    return common.combine_validation([result, result_sharded])
+    """Validate every wiring ``--wiring`` selects on A5."""
+    return validate_c1a_wirings("full", make_program, golden_decode_c1a_full_case, argv)
 
 
 # A2/A3 CI currently discovers runnable model files by the conventional entry

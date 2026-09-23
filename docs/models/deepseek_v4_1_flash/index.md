@@ -172,8 +172,16 @@ output projection leaves through ReduceScatter(SUM)
 slice afterwards. The residual stream itself never crosses the group; each rank
 expands only its own rows in `mhc_post`. Every decode Attention mode keeps both
 wirings — the historical all-reduce entries and the `*_sharded` sugar — and each
-harness validates both; `OUTPUT_T_DYN` names the local row extent next to
-`T_DYN` for the full range.
+harness validates both by default; `OUTPUT_T_DYN` names the local row extent next
+to `T_DYN` for the full range.
+
+`--wiring {both,replicated,sharded}` selects which of the two runs a harness
+executes (default `both`, what CI uses). The wirings are separate ABIs — the
+sharded side shards the token extent and adds `gathered` — so a replay tree
+belongs to exactly one of them: with `--golden-data`/`--runtime-dir`, the
+directory for wiring `W` is always `<dir>/W`, e.g. `--golden-data out/data` reads
+`out/data/replicated` and `out/data/sharded`. A tree saved from one wiring is
+therefore never offered to the other.
 
 Row ownership is the fixed physical slab `ceil(capacity / TP)`, not
 `ceil(active / TP)`: a padded batch, `T < TP` and a rank whose slab starts past
@@ -285,12 +293,23 @@ depth-local values and are not persisted as sequence state.
 
 The CPU boundary helper
 [`decode_sp_integration.py`](../../../models/deepseek_v4_1_flash/decode_sp_integration.py)
-models the same `ceil(T/TP)` owner slabs, including padding-only ranks. It
-checks that token IDs, positions, and valid masks survive the Attention
-AllGather/ReduceScatter boundary and that two consecutive Block goldens pass
-the first layer's hidden state and delayed `next_pre_mix` into the next layer.
-This validates the Decode-side ABI before the EP8 MoE device kernel is wired
-into the Block stage.
+models the same physical-slab owner mapping (`ceil(capacity / TP)`, padding-only
+ranks included). Two *separate* checks cover the sequence-parallel hand-off:
+
+- **Owner-slab metadata check** (CPU, `validate_two_layer_metadata`, exercised by
+  `test_decode_sequence_parallel_metadata_covers_padded_and_short_batches`). It
+  splits the first layer's residual output and delayed `next_pre_mix` into owner
+  slabs, verifies each slab against `sequence_parallel_bounds`, asserts the
+  padding contract (zero payload rows, `token_id=-1`, mask false) on *both*
+  layers before anything is gathered, gathers the slabs back byte-exactly, and
+  lets the second layer consume those gathered rows, so a rank-order, padding or
+  delayed-coefficient slip cannot hide behind an identity round trip. This
+  validates the Decode-side ABI on CPU only.
+- **Block golden chain** (device path, `decode_layer.py --stage block` and
+  `test_decode_sequence_parallel_two_layer_chain`). It currently **skips**, so it
+  proves nothing yet: the full Block device path awaits EP8 MoE integration and
+  the Block golden awaits the upstream `golden_moe` ABI (#1308). A passing
+  owner-slab metadata check does not mean the Block chain passed.
 
 The production cache ABI uses a 128-token scheduler block and keeps payloads
 quantized in HBM:

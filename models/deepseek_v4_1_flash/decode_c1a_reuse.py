@@ -51,8 +51,8 @@ from models.deepseek_v4_1_flash.config import (
     WINDOW_CACHE_GROUP,
 )
 from models.deepseek_v4_1_flash.attention_tp import OUTPUT_T_DYN, decode_tp_input_all_gather
-from models.deepseek_v4_1_flash.decode_c1a_full import golden_c1a_hc_case, run_c1a_hc
-from models.deepseek_v4_1_flash.decode_common import combine_validation, zero_bf16_padding
+from models.deepseek_v4_1_flash.decode_c1a_full import golden_c1a_hc_case, validate_c1a_wirings
+from models.deepseek_v4_1_flash.decode_common import mhc_pre_norm, slab_owner
 from models.deepseek_v4_1_flash.decode_attn_c1a_reuse import (
     decode_attn_c1a_reuse,
     decode_attn_c1a_reuse_sharded,
@@ -60,8 +60,6 @@ from models.deepseek_v4_1_flash.decode_attn_c1a_reuse import (
 )
 from models.deepseek_v4_1_flash.hc_mixes import mhc_mixes
 from models.deepseek_v4_1_flash.hc_post import mhc_post
-from models.deepseek_v4_1_flash.hc_pre import mhc_pre
-from models.deepseek_v4_1_flash.rmsnorm import rms_norm
 
 
 @pl.jit.inline(auto_scope=False)
@@ -112,11 +110,9 @@ def decode_c1a_reuse(
     attn_out = pl.create_tensor([tokens, D], dtype=pl.BF16)
     # The coefficients are staggered: collapse with the pre-mix the previous sub-layer
     # produced, apply post/residual immediately, and hand this site's pre-mix forward.
+    # The collapse + norm block itself is shared with the spec-driven modes.
     mhc_mixes(x_hc, hc_attn_fn, hc_attn_scale, hc_attn_base, next_pre_mix, post_mix, residual_mix)
-    mhc_pre(x_hc, pre_mix, hidden)
-    # The block normalizes the collapsed stream before attention; the operator takes the
-    # normalized hidden, so the norm sits between the collapse and the call.
-    rms_norm(hidden, attn_norm_weight, normed)
+    mhc_pre_norm(x_hc, pre_mix, attn_norm_weight, hidden, normed, num_tokens)
     decode_attn_c1a_reuse(
         normed, wq_a, wq_a_scale, q_norm_weight, wq_b, wq_b_scale, wkv, wkv_scale, kv_norm_weight, attn_sink,
         wo_a, wo_b, wo_b_scale, rope_cos, rope_sin, window_slots, window_indices, window_cache,
@@ -176,19 +172,13 @@ def decode_c1a_reuse_sharded(
     hidden = pl.create_tensor([tokens, D], dtype=pl.BF16)
     normed = pl.create_tensor([tokens, D], dtype=pl.BF16)
     attn_out = pl.create_tensor([tokens, D], dtype=pl.BF16)
-    # The coefficients are staggered: collapse with the pre-mix the previous sub-layer
-    # produced, apply post/residual immediately, and hand this site's pre-mix forward.
-    mhc_mixes(x_hc, hc_attn_fn, hc_attn_scale, hc_attn_base, next_pre_mix, post_mix, residual_mix)
-    mhc_pre(x_hc, pre_mix, hidden)
-    # The block normalizes the collapsed stream before attention; the operator takes the
-    # normalized hidden, so the norm sits between the collapse and the call.
-    rms_norm(hidden, attn_norm_weight, normed)
     # Sequence parallel: the residual stream stays local, only the normalized
-    # Attention input crosses the TP group ([T_local, D] -> [T, D]).
-    local_first = pl.min(tp_rank * tokens, num_tokens)
-    # Slab padding rows are published but never gathered; clear them so the transport
-    # window never carries a stale value.
-    zero_bf16_padding(normed, pl.max(0, pl.min(tokens, num_tokens - local_first)))
+    # Attention input crosses the TP group ([T_local, D] -> [T, D]).  The shared
+    # block takes this rank's own row count, so it zeroes the slab's padding rows
+    # before they are published.
+    _, local_count = slab_owner(tp_rank, tokens, num_tokens)
+    mhc_mixes(x_hc, hc_attn_fn, hc_attn_scale, hc_attn_base, next_pre_mix, post_mix, residual_mix)
+    mhc_pre_norm(x_hc, pre_mix, attn_norm_weight, hidden, normed, local_count)
     gathered = decode_tp_input_all_gather(
         normed, input_window, input_arrived, gathered, group_base, tp_rank, num_tokens, attention_epoch
     )
@@ -479,17 +469,8 @@ def golden_decode_c1a_reuse_case(tensors, epochs=1, sharded=False):
 
 
 def validate(argv=None):
-    """Validate the replicated and the sequence-parallel wiring on A5."""
-    result = run_c1a_hc("reuse", make_program, golden_decode_c1a_reuse_case, argv=argv)
-    # The sequence-parallel wiring: layer-head AllGather, ReduceScatter output.
-    result_sharded = run_c1a_hc(
-        "reuse",
-        lambda tokens, pages, epochs: make_program(tokens, pages, epochs, sharded=True),
-        golden_decode_c1a_reuse_case,
-        argv=argv,
-        sharded=True,
-    )
-    return combine_validation([result, result_sharded])
+    """Validate every wiring ``--wiring`` selects on A5."""
+    return validate_c1a_wirings("reuse", make_program, golden_decode_c1a_reuse_case, argv)
 
 
 # A2/A3 CI currently discovers runnable model files by the conventional entry

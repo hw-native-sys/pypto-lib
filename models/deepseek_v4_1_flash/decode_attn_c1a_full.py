@@ -323,6 +323,8 @@ def make_c1a_reduce(scatter=False):
         count = pl.cast(num_tokens, pl.INT32)
         if scatter:
             # Ownership uses the fixed physical slab, not the active row count.
+            # Mirrors decode_common.slab_owner / decode_sp_integration's
+            # sequence_parallel_bounds; keep the three in step.
             width = pl.tensor.dim(output, 0)
             first = pl.cast(pl.min(tp_rank * width, num_tokens), pl.INT32)
             count = pl.cast(pl.max(0, pl.min(width, num_tokens - first)), pl.INT32)

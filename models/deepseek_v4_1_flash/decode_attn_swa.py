@@ -766,28 +766,6 @@ def golden_swa(tensors, sharded=False):
             tensors["output"][base:base + TP_SIZE].copy_(reduced.unsqueeze(0).expand(TP_SIZE, -1, -1))
 
 
-def compare_reduced_sharded(actual, expected, **kwargs):
-    """Compare every rank on its own ReduceScatter token slab.
-
-    The slab is fully materialized: rows inside the active range carry the summed
-    rows this rank owns, rows outside it must be zero on every rank.
-    """
-    inputs = kwargs.get("inputs")
-    active = int(inputs["num_tokens"]) if inputs is not None else actual.shape[1] * actual.shape[0]
-    width = actual.shape[1]
-    passed = True
-    for rank in range(actual.shape[0]):
-        first = min(rank * width, active)
-        count = max(0, min(width, active - first))
-        if count < width and not bool((actual[rank][count:] == 0).all()):
-            return False, f"rank {rank}: inactive ReduceScatter rows must be zero, not stale data"
-        if count == 0:
-            continue
-        valid, _ = compare_output(actual[rank][:count], expected[rank][:count])
-        passed &= valid
-    return passed, "Every rank must pass precision on its own local token slab"
-
-
 def compare_reduced(actual, expected, **kwargs):
     passed = True
     for base in range(0, actual.shape[0], TP_SIZE):

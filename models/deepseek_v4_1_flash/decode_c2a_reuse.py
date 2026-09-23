@@ -37,7 +37,7 @@ from models.deepseek_v4_1_flash.config import (
 )
 from models.deepseek_v4_1_flash.attention_tp import OUTPUT_T_DYN, decode_tp_input_all_gather
 from models.deepseek_v4_1_flash.decode_attn_c2a_reuse import decode_attn_c2a_reuse, decode_attn_c2a_reuse_sharded
-from models.deepseek_v4_1_flash.decode_common import attention_pre
+from models.deepseek_v4_1_flash.decode_common import attention_pre, slab_owner
 from models.deepseek_v4_1_flash.decode_layer_plan import (
     DecodeLayerKind,
     REPRESENTATIVE_LAYER_IDS,
@@ -219,9 +219,7 @@ def decode_c2a_reuse_sharded(
     # Local rows follow the fixed physical slab (``ceil(tokens / TP)``), the same
     # mapping the Attention-input AllGather publishes.  The active count only masks
     # the slab suffix, so T < TP and empty owners keep their row indices.
-    width = tokens
-    first = pl.min(tp_rank * width, num_tokens)
-    local_count = pl.max(0, pl.min(width, num_tokens - first))
+    _, local_count = slab_owner(tp_rank, tokens, num_tokens)
     attention_input = pl.create_tensor([tokens, D], dtype=pl.BF16)
     normalized_attention = pl.create_tensor([tokens, D], dtype=pl.BF16)
     post_mix, residual_mix = attention_pre(
@@ -760,7 +758,7 @@ def comparisons_sharded(initial_state=None):
 
 
 def validate(argv=None):
-    """Validate the replicated and the sequence-parallel wiring on A5."""
+    """Validate every wiring ``--wiring`` selects on A5."""
     parser = common.make_parser(
         "DeepSeek V4.1 C2A Reuse decode Attention composition",
         REPRESENTATIVE_LAYER_ID,
@@ -773,31 +771,39 @@ def validate(argv=None):
     reason = skip_reason(args.layer_id)
     if reason:
         parser.error(reason)
-    initial_state = {}
-    specs = build_specs(args, initial_state)
-    result = common.run_attention(
-        args,
-        make_program(args.tp, args.epochs, specs),
-        specs,
-        make_golden(args.epochs),
-        comparisons(initial_state),
-        KIND.name,
-        devices,
-    )
-    # The sequence-parallel wiring: layer-head AllGather, ReduceScatter output.
-    common.validate_sp_tokens(parser, args)
-    sharded_state = {}
-    sharded = build_specs_sharded(args, sharded_state)
-    result_sharded = common.run_attention(
-        args,
-        make_program(args.tp, args.epochs, sharded, sharded=True),
-        sharded,
-        make_golden_sharded(args.epochs),
-        comparisons_sharded(sharded_state),
-        f"{KIND.name} sequence-parallel",
-        devices,
-    )
-    return common.combine_validation([result, result_sharded])
+    wirings = common.selected_wirings(args.wiring)
+    results = []
+    if common.WIRING_REPLICATED in wirings:
+        initial_state = {}
+        specs = build_specs(args, initial_state)
+        results.append(
+            common.run_attention(
+                args,
+                make_program(args.tp, args.epochs, specs),
+                specs,
+                make_golden(args.epochs),
+                comparisons(initial_state),
+                KIND.name,
+                devices,
+            )
+        )
+    if common.WIRING_SHARDED in wirings:
+        # The sequence-parallel wiring: layer-head AllGather, ReduceScatter output.
+        common.validate_sp_tokens(parser, args)
+        sharded_state = {}
+        sharded = build_specs_sharded(args, sharded_state)
+        results.append(
+            common.run_attention(
+                args,
+                make_program(args.tp, args.epochs, sharded, sharded=True),
+                sharded,
+                make_golden_sharded(args.epochs),
+                comparisons_sharded(sharded_state),
+                f"{KIND.name} sequence-parallel",
+                devices,
+            )
+        )
+    return common.combine_validation(results)
 
 
 def main():

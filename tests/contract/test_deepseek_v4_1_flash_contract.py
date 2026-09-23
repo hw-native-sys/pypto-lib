@@ -336,6 +336,173 @@ def test_decode_sequence_parallel_metadata_supports_empty_owner_slabs():
     ]
 
 
+def test_decode_sequence_parallel_metadata_covers_padded_and_short_batches():
+    from models.deepseek_v4_1_flash.decode_sp_integration import validate_two_layer_metadata
+
+    # T < TP: three empty owners still take part and the gathered batch is intact.
+    assert validate_two_layer_metadata(num_tokens=1, tp_size=4).hidden.shape == (1, 4)
+    # A padded batch: rank 3's slab starts past the active range, rank 2 owns one
+    # row of a two-row slab and must leave the other one zero.  The returned
+    # tensor is the second layer's, i.e. the first layer's rows plus one.
+    padded = validate_two_layer_metadata(num_tokens=5, tp_size=4, capacity=8)
+    assert padded.hidden.shape == (5, 4)
+    assert padded.hidden[-1].tolist() == [17.0, 18.0, 19.0, 20.0]
+
+
+def test_decode_owner_slab_checks_cover_padding_on_every_layer():
+    from models.deepseek_v4_1_flash.decode_sp_integration import (
+        DecodeTokenShard,
+        check_owner_slabs,
+        shard_decode_batch,
+        transform_owner_rows,
+    )
+
+    num_tokens, tp_size, capacity = 5, 4, 8
+    hidden = torch.arange(num_tokens * 4, dtype=torch.float32).reshape(num_tokens, 4)
+    token_ids = torch.arange(100, 100 + num_tokens, dtype=torch.int64)
+    position_ids = torch.arange(17, 17 + num_tokens, dtype=torch.int32)
+    shards = shard_decode_batch(hidden, token_ids, position_ids, tp_size=tp_size, capacity=capacity)
+
+    # A layer updates the rows it owns only: the padding of the two-row slabs
+    # survives untouched (rank 2 owns one row, rank 3 none).
+    second = transform_owner_rows(shards, num_tokens=num_tokens, transform=lambda rows: rows + 1, capacity=capacity)
+    check_owner_slabs(second, hidden + 1, num_tokens, capacity=capacity, name="residual rows", layer="the second layer")
+    counts = (2, 2, 1, 0)
+    assert [bool((shard.hidden[count:] == 0).all()) for shard, count in zip(second, counts)] == [True] * tp_size
+    check_owner_slabs(second, hidden + 1, num_tokens, capacity=capacity, name="residual rows", layer="the second layer")
+
+    # A layer that rewrites its whole slab -- padding included -- is rejected on
+    # that layer, before the gather would have dropped the stale rows silently.
+    polluted = tuple(
+        DecodeTokenShard(shard.hidden + 1, shard.token_ids, shard.position_ids, shard.valid_mask) for shard in shards
+    )
+    with pytest.raises(RuntimeError, match="non-zero residual rows padding"):
+        check_owner_slabs(polluted, hidden + 1, num_tokens, capacity=capacity, name="residual rows", layer="the second layer")
+
+
+def test_decode_swa_sharded_reduce_comparison_asserts_zero_padding():
+    source = (MODEL_DIR / "decode_swa.py").read_text()
+    segment = ast.get_source_segment(source, _function(ast.parse(source), "comparisons_sharded"))
+    assert segment is not None
+    # The ReduceScatter publishes a fully materialized slab, so the sharded
+    # comparison has to assert the inactive rows instead of ignoring them.
+    assert '"attention_output"' in segment
+    assert "make_compare_sharded_rows(swa.compare_output)" in segment or "require_zero_padding=True" in segment
+
+
+@requires_pypto
+def test_decode_swa_sharded_reduce_rejects_stale_padding():
+    from models.deepseek_v4_1_flash import decode_swa
+
+    compare = decode_swa.comparisons_sharded()["attention_output"]
+    # tokens=7 over TP4 slabs of width 2: rank 3 owns one row and must zero the
+    # other, which is what the ReduceScatter publishes.
+    ranks, width, dim = 4, 2, 8
+    golden = torch.zeros(ranks, width, dim, dtype=torch.float32)
+    actual = torch.zeros(ranks, width, dim, dtype=torch.float32)
+    for rank, count in enumerate((2, 2, 2, 1)):
+        golden[rank, :count] = 1.0
+        actual[rank, :count] = 1.0
+    assert compare(actual, golden, inputs={})[0]
+    stale = actual.clone()
+    stale[3, 1:] = 5.0
+    passed, detail = compare(stale, golden, inputs={})
+    assert not passed and "inactive" in detail
+
+
+def test_decode_wiring_selection_namespaces_replay_directories():
+    from models.deepseek_v4_1_flash.decode_common import (
+        selected_wirings,
+        wiring_replay_dir,
+    )
+
+    assert selected_wirings("both") == ("replicated", "sharded")
+    assert selected_wirings("replicated") == ("replicated",)
+    assert selected_wirings("sharded") == ("sharded",)
+    with pytest.raises(ValueError):
+        selected_wirings("nope")
+    # The two wirings are different ABIs, so one replay tree is never shared.
+    assert wiring_replay_dir("out/data", "replicated") == "out/data/replicated"
+    assert wiring_replay_dir("out/data", "sharded") == "out/data/sharded"
+    assert wiring_replay_dir(None, "sharded") is None
+    with pytest.raises(ValueError):
+        wiring_replay_dir("out/data", "both")
+
+
+def test_decode_owner_slab_comparisons_follow_ownership_not_capacity():
+    import torch
+
+    from models.deepseek_v4_1_flash.decode_common import (
+        active_rows_from_golden,
+        compare_owner_rows,
+    )
+
+    def owned_rows(rank, width, num_tokens):
+        first = min(rank * width, num_tokens)
+        return max(0, min(width, num_tokens - first))
+
+    def slabs(num_tokens, width, ranks=4):
+        golden = torch.zeros(ranks, width, 2, 4)
+        actual = torch.zeros(ranks, width, 2, 4)
+        for rank in range(ranks):
+            count = owned_rows(rank, width, num_tokens)
+            golden[rank, :count] = 1.0
+            actual[rank, :count] = 1.0
+            # A kernel need not clear rows it does not own, so the slab's padding
+            # stays stale; only ownership decides what is compared.
+            actual[rank, count:] = 9.0
+        return actual, golden
+
+    def equal(actual, expected, **_kwargs):
+        return bool(torch.equal(actual, expected)), "owned rows differ"
+
+    plain = compare_owner_rows(equal, name="HC output")
+    zeroed = compare_owner_rows(equal, name="HC output", require_zero_padding=True)
+    # (num_tokens, slab width): T < TP, a partially filled slab, and a full one.
+    for num_tokens, width in ((1, 1), (7, 2), (32, 8)):
+        actual, golden = slabs(num_tokens, width)
+        assert plain(actual, golden, inputs={})[0], (num_tokens, width)
+        assert active_rows_from_golden(golden) == num_tokens
+    actual, golden = slabs(7, 2)
+    # Only a ReduceScatter contract reads the inactive rows, and it must see them.
+    assert not zeroed(actual, golden, inputs={})[0]
+    assert zeroed(*slabs(32, 8), inputs={})[0]
+    # An explicit batch size wins over the harness scalar, and the C1A path has
+    # only the explicit one: its fixtures never expose ``num_tokens``.
+    explicit = compare_owner_rows(equal, name="HC output", active=7)
+    assert explicit(actual, golden, inputs={"num_tokens": 8})[0]
+    assert not explicit(torch.full((4, 2, 2, 4), 2.0), golden, inputs={})[0]
+
+
+@requires_pypto
+def test_decode_c1a_wiring_flag_selects_the_run_and_the_replay_tree():
+    from models.deepseek_v4_1_flash.decode_c1a_full import parse_c1a_hc_args
+
+    args, devices = parse_c1a_hc_args("full", ["--wiring", "sharded", "--tokens", "7"])
+    assert args.wiring == "sharded"
+    assert args.local_tokens == 2
+    # A single wiring still gets the default device set (0 .. TP-1).
+    assert devices == list(range(len(devices)))
+    args, _ = parse_c1a_hc_args("full", ["--golden-data", "out/data"])
+    assert args.wiring == "both"
+    with pytest.raises(SystemExit):
+        parse_c1a_hc_args("full", ["--wiring", "nope"])
+
+
+@requires_pypto
+def test_decode_sequence_parallel_two_layer_chain(composition):
+    from models.deepseek_v4_1_flash._golden_smoke import run_two_layer_decode_chain
+
+    try:
+        run_two_layer_decode_chain(composition.golden_decode_layer, tp_size=4)
+    except KeyError as error:
+        if "missing golden_moe input tensors" not in str(error):
+            raise
+        # The Block golden needs the upstream golden_moe ABI (#1308), which is
+        # still open.  This check starts running the moment that lands.
+        pytest.skip("upstream golden_moe ABI mismatch blocks the Block golden chain")
+
+
 @requires_pypto
 def test_decode_sequence_parallel_fixtures_differ_per_rank():
     from types import SimpleNamespace

@@ -12,6 +12,8 @@ import argparse
 from dataclasses import replace
 from types import SimpleNamespace
 
+from pathlib import Path
+
 import pypto.language as pl
 import torch
 
@@ -22,7 +24,7 @@ from models.deepseek_v4_1_flash.golden import rms_norm as golden_rms_norm
 from models.deepseek_v4_1_flash.hc_mixes import golden_mhc_mixes, mhc_mixes
 from models.deepseek_v4_1_flash.hc_post import golden_mhc_post
 from models.deepseek_v4_1_flash.hc_pre import golden_mhc_pre, mhc_pre
-from models.deepseek_v4_1_flash.decode_sp_integration import combine_validation
+from models.deepseek_v4_1_flash.decode_sp_integration import combine_validation, sequence_parallel_bounds
 from models.deepseek_v4_1_flash.rmsnorm import rms_norm
 from pypto.ir import DistributedConfig
 
@@ -58,6 +60,65 @@ BOUNDARY_OUTPUT_NAMES = (
 SCALAR_NAMES = ("num_tokens", "attention_epoch")
 
 
+@pl.jit.inline
+def slab_owner(
+    tp_rank: pl.Scalar[pl.INT32],
+    slab: pl.Scalar[pl.INT32],
+    num_tokens: pl.Scalar[pl.INT32],
+):
+    """Return ``(first, count)``: the active rows the physical slab *tp_rank* owns.
+
+    ``slab`` is the rank's fixed physical extent (``pl.tensor.dim(x, 0)`` of the
+    per-rank tensor), never the active count, so a padded batch, ``T < TP`` and a
+    rank whose slab starts past the active range keep the same row mapping on both
+    sides of every collective.  This mirrors
+    ``decode_sp_integration.sequence_parallel_bounds`` on the CPU side; keep the
+    two in step.
+    """
+    first = pl.cast(pl.min(tp_rank * slab, num_tokens), pl.INT32)
+    count = pl.cast(pl.max(0, pl.min(slab, num_tokens - first)), pl.INT32)
+    return first, count
+
+
+def owner_rows(actual, rank: int, active: int, *, tp_size: int | None = None) -> tuple[int, int, int]:
+    """Return ``(first, count, width)`` of *rank* inside a per-rank slab tensor.
+
+    The CPU mirror of :func:`slab_owner` for goldens and comparators: ``actual`` is
+    a ``[ranks, slab, ...]`` tensor, so its second extent is the physical slab and
+    its first one the number of ranks that participate (``tp_size`` when several
+    DP groups share the tensor).
+    """
+    width = actual.shape[1]
+    world = tp_size or actual.shape[0]
+    first, count, _ = sequence_parallel_bounds(active, world, rank % world, capacity=width * world)
+    return first, count, width
+
+
+@pl.jit.inline
+def mhc_pre_norm(
+    x_hc: pl.Tensor,
+    incoming_pre_mix: pl.Tensor,
+    attn_norm_weight: pl.Tensor,
+    attention_input: pl.Tensor,
+    normalized_attention: pl.Tensor,
+    owned_rows: pl.Scalar[pl.INT32],
+):
+    """Collapse the mHC streams and normalize the rows this call owns.
+
+    The block runs between ``mhc_pre`` and the Attention operator, and it is the
+    single implementation behind both the spec-driven boundary
+    (:func:`attention_pre`) and the C1A compositions, which keep their mixes in
+    the caller.  ``owned_rows`` is the caller's row count, never a global one:
+    the replicated wiring passes the active batch size, the sequence-parallel
+    wiring passes the rank's local count from :func:`slab_owner`.  It only masks
+    the slab suffix, which is zeroed here so a published slab never carries a
+    stale value in its padding rows.
+    """
+    mhc_pre(x_hc, incoming_pre_mix, attention_input)
+    rms_norm(attention_input, attn_norm_weight, normalized_attention)
+    zero_bf16_padding(normalized_attention, pl.min(owned_rows, pl.tensor.dim(normalized_attention, 0)))
+
+
 @pl.jit.inline(auto_scope=False)
 def attention_pre(
     x_hc: pl.Tensor,
@@ -76,9 +137,7 @@ def attention_pre(
     post_mix = pl.create_tensor([tokens, HC_MULT], dtype=pl.FP32)
     residual_mix = pl.create_tensor([tokens, HC_MULT, HC_MULT], dtype=pl.FP32)
     mhc_mixes(x_hc, hc_attn_fn, hc_attn_scale, hc_attn_base, attention_pre_mix, post_mix, residual_mix)
-    mhc_pre(x_hc, incoming_pre_mix, attention_input)
-    rms_norm(attention_input, attn_norm_weight, normalized_attention)
-    zero_bf16_padding(normalized_attention, pl.min(num_tokens, pl.tensor.dim(normalized_attention, 0)))
+    mhc_pre_norm(x_hc, incoming_pre_mix, attn_norm_weight, attention_input, normalized_attention, num_tokens)
     return post_mix, residual_mix
 
 
@@ -223,7 +282,6 @@ def golden_attention_pre_sharded(tensors):
     active = int(tensors["num_tokens"])
     # Ownership follows the physical slab, while ``active`` only masks its
     # suffix.  This preserves rank mapping when active tokens are padded.
-    width = tensors["x_hc"].shape[1]
     normalized, post, residual = [], [], []
     for rank in range(world):
         pre, post_mix, residual_mix = golden_mhc_mixes(
@@ -234,8 +292,7 @@ def golden_attention_pre_sharded(tensors):
         )
         tensors["attention_pre_mix"][rank].copy_(pre)
         collapsed = golden_mhc_pre(tensors["x_hc"][rank], tensors["incoming_pre_mix"][rank])
-        first = min((rank % C.TP_SIZE) * width, active)
-        count = max(0, min(width, active - first))
+        _first, count, _width = owner_rows(tensors["x_hc"], rank, active, tp_size=C.TP_SIZE)
         normalized_rank = torch.full_like(collapsed, 13.0)
         if count:
             normalized_rank[:count].copy_(
@@ -249,8 +306,7 @@ def golden_attention_pre_sharded(tensors):
         slabs = []
         for offset in range(C.TP_SIZE):
             rank = base + offset
-            first = min(offset * width, active)
-            count = max(0, min(width, active - first))
+            _first, count, _width = owner_rows(tensors["x_hc"], offset, active, tp_size=C.TP_SIZE)
             slabs.append(normalized[rank][:count])
         gathered = torch.cat(slabs, dim=0)[:active]
         for rank in range(base, base + C.TP_SIZE):
@@ -264,11 +320,9 @@ def golden_attention_post(tensors, post, residual):
     """Populate the common post-Attention mHC boundary."""
     active = int(tensors["num_tokens"])
     sharded = "gathered" in tensors
-    width = tensors["attention_output"].shape[1] if sharded else tensors["attention_output"].shape[0]
     for rank in range(tensors["x_hc"].shape[0]):
         if sharded:
-            first = rank * width
-            count = max(0, min(width, active - first))
+            _first, count, _width = owner_rows(tensors["attention_output"], rank, active, tp_size=C.TP_SIZE)
             tensors["attention_hidden"][rank].zero_()
             tensors["attention_output"][rank][count:].zero_()
             if count:
@@ -315,50 +369,72 @@ def make_compare_attention_hidden(compare_output):
     return compare_attention_hidden
 
 
-def make_compare_attention_hidden_sharded(compare_output):
-    """Compare every rank's local mHC rows under the leaf's own budget."""
+def active_rows_from_golden(expected):
+    """Infer the batch's active token count from an ownership-padded golden.
 
-    def compare_attention_hidden(actual, expected, **kwargs):
-        inputs = kwargs.get("inputs")
-        active = int(inputs["num_tokens"]) if inputs is not None and "num_tokens" in inputs else actual.shape[1] * actual.shape[0]
-        width = actual.shape[1]
-        for rank in range(actual.shape[0]):
-            first = min(rank * width, active)
-            count = max(0, min(width, active - first))
-            if count == 0:
-                continue
-            passed, detail = compare_output(actual[rank][:count], expected[rank][:count], **kwargs)
-            if not passed:
-                return False, f"rank {rank}: {detail}"
-        return True, "every rank's local mHC rows pass the leaf budget"
+    ``expected`` is one ``[ranks, slab, ...]`` tensor whose inactive slab rows
+    the golden leaves at zero, so the last non-zero row of the last owning rank
+    names the batch size.  It is the fallback for entries that do not hand the
+    batch size to the comparator: the C1A compositions build their specs from
+    tensors only, so the harness exposes no ``num_tokens`` scalar for them.
+    Reading the count out of the reference is exact wherever the padding
+    contract holds, and a batch's own rows are real data rather than all-zero
+    placeholders.
+    """
+    width = expected.shape[1]
+    rows = expected.reshape(expected.shape[0], width, -1)
+    owned = (rows.abs().sum(dim=-1) > 0).sum(dim=-1)
+    active = 0
+    for rank, count in enumerate(owned.tolist()):
+        if count:
+            active = max(active, rank * width + min(count, width))
+    return active
 
-    return compare_attention_hidden
 
+def compare_owner_rows(compare_output, *, name="per-rank", require_zero_padding=False, active=None):
+    """Compare only the rows each rank owns inside its physical slab.
 
-def make_compare_sharded_rows(compare_output):
-    """Compare only valid rows of a per-rank ReduceScatter output.
-
-    The slab is fully materialized: rows inside the active range carry the summed
-    rows this rank owns, rows outside it must be zero on every rank.
+    The single implementation behind every sequence-parallel comparator: the
+    ownership rule comes from :func:`owner_rows`, so a slab width, padding or
+    rank-order change is fixed in one place.  The batch size comes from
+    ``active`` when the caller knows it, else from the ``num_tokens`` scalar the
+    harness exposes, else from the golden through :func:`active_rows_from_golden`
+    -- never from the tensor's capacity, which overstates ownership whenever a
+    slab ends partially filled.  ``require_zero_padding`` adds the
+    materialization contract of a ReduceScatter output, whose inactive rows the
+    kernel writes as zeros.
     """
 
     def compare(actual, expected, **kwargs):
         inputs = kwargs.get("inputs")
-        active = int(inputs["num_tokens"]) if inputs is not None and "num_tokens" in inputs else actual.shape[1] * actual.shape[0]
-        width = actual.shape[1]
+        num_tokens = active
+        if num_tokens is None and inputs is not None:
+            num_tokens = inputs.get("num_tokens")
+        if num_tokens is None:
+            num_tokens = active_rows_from_golden(expected)
+        num_tokens = int(num_tokens)
         for rank in range(actual.shape[0]):
-            first = min(rank * width, active)
-            count = max(0, min(width, active - first))
-            if count < width and not bool((actual[rank][count:] == 0).all()):
-                return False, f"rank {rank}: inactive ReduceScatter rows must be zero, not stale data"
+            _first, count, width = owner_rows(actual, rank, num_tokens, tp_size=C.TP_SIZE)
+            if require_zero_padding and count < width and not bool((actual[rank][count:] == 0).all()):
+                return False, f"rank {rank}: inactive {name} rows must be zero, not stale data"
             if count == 0:
                 continue
             passed, detail = compare_output(actual[rank][:count], expected[rank][:count], **kwargs)
             if not passed:
                 return False, f"rank {rank}: {detail}"
-        return True, "valid sequence-parallel rows pass"
+        return True, f"every rank's own {name} rows pass"
 
     return compare
+
+
+def make_compare_attention_hidden_sharded(compare_output):
+    """Compare every rank's local mHC rows under the leaf's own budget."""
+    return compare_owner_rows(compare_output, name="mHC")
+
+
+def make_compare_sharded_rows(compare_output):
+    """Compare a per-rank ReduceScatter output and assert its inactive rows are zero."""
+    return compare_owner_rows(compare_output, name="ReduceScatter", require_zero_padding=True)
 
 
 def make_boundary_comparisons(compare_output, sharded=False):
@@ -390,6 +466,49 @@ def compare_attention_gather(actual, expected, **kwargs):
     return budget(actual, expected, **kwargs)
 
 
+# Every decode Attention entry runs the replicated and the sequence-parallel
+# wiring in one call. Their ABIs differ (the sharded side shards the token
+# extent and adds ``gathered``), so any tree that is replayed or persisted
+# belongs to exactly one wiring.
+WIRING_REPLICATED = "replicated"
+WIRING_SHARDED = "sharded"
+WIRING_CHOICES = ("both", WIRING_REPLICATED, WIRING_SHARDED)
+
+
+def add_wiring_argument(parser):
+    """Add the wiring selector every decode Attention entry shares."""
+    parser.add_argument(
+        "--wiring", choices=WIRING_CHOICES, default="both",
+        help=(
+            "which wiring to run; a replay tree is namespaced per wiring "
+            "(<dir>/replicated, <dir>/sharded) because the two ABIs differ"
+        ),
+    )
+
+
+def selected_wirings(wiring: str) -> tuple[str, ...]:
+    """Return the wirings one ``--wiring`` choice runs, in execution order."""
+    if wiring not in WIRING_CHOICES:
+        raise ValueError(f"unknown wiring {wiring!r}; expected one of {WIRING_CHOICES}")
+    if wiring == "both":
+        return (WIRING_REPLICATED, WIRING_SHARDED)
+    return (wiring,)
+
+
+def wiring_replay_dir(base: str | None, wiring: str) -> str | None:
+    """Namespace a replay directory per wiring.
+
+    The wiring name is the subdirectory, so ``--golden-data``/``--runtime-dir``
+    can never hand one ABI the artifacts of the other: wiring ``W`` always reads
+    ``<base>/W``, whether one wiring or both run in this invocation.
+    """
+    if base is None:
+        return None
+    if wiring not in (WIRING_REPLICATED, WIRING_SHARDED):
+        raise ValueError(f"a replay directory needs a concrete wiring, got {wiring!r}")
+    return str(Path(base) / wiring)
+
+
 def make_parser(description, default_layer_id, default_tokens, cases, default_seed=17):
     parser = argparse.ArgumentParser(description=description)
     parser.add_argument("--stage", choices=("attention", "block"), default="attention")
@@ -406,6 +525,7 @@ def make_parser(description, default_layer_id, default_tokens, cases, default_se
     parser.add_argument("--case", choices=cases, default=cases[0])
     parser.add_argument("--compile-only", action="store_true")
     parser.add_argument("--save-data", action="store_true")
+    add_wiring_argument(parser)
     return parser
 
 
@@ -480,10 +600,12 @@ __all__ = [
     "BOUNDARY_OUTPUT_NAMES",
     "BOUNDARY_PREFIX_NAMES",
     "SCALAR_NAMES",
+    "active_rows_from_golden",
     "assemble_specs",
     "attention_pre",
     "check_program_specs",
     "compare_attention_gather",
+    "compare_owner_rows",
     "compare_unchanged",
     "combine_validation",
     "golden_attention_post",
@@ -494,8 +616,13 @@ __all__ = [
     "make_compare_attention_hidden_sharded",
     "make_compare_sharded_rows",
     "make_parser",
+    "mhc_pre_norm",
+    "owner_rows",
     "run_attention",
+    "selected_wirings",
+    "slab_owner",
     "validate_args",
     "validate_sp_tokens",
+    "wiring_replay_dir",
     "zero_bf16_padding",
 ]

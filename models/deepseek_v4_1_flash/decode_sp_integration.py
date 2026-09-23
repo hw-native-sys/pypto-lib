@@ -165,33 +165,140 @@ def gather_decode_batch(shards: tuple[DecodeTokenShard, ...] | list[DecodeTokenS
     return DecodeTokenShard(hidden, token_ids, position_ids, valid_mask)
 
 
-def validate_two_layer_metadata(*, num_tokens: int = 2, tp_size: int = 4) -> DecodeTokenShard:
-    """Exercise token IDs, positions, masks, and final ordering for two layers."""
+def check_owner_slabs(
+    shards: Sequence[DecodeTokenShard],
+    expected: torch.Tensor,
+    num_tokens: int,
+    *,
+    capacity: int | None = None,
+    name: str = "rows",
+    layer: str = "a Decode layer",
+) -> None:
+    """Verify one layer's slabs against the ownership rule and its padding.
+
+    Every rank must hold the slab :func:`sequence_parallel_bounds` gives it, its
+    owned rows must carry the reference values, and the rows it does not own must
+    keep the *padding contract* the collectives publish: zero payload rows,
+    ``token_id=-1`` and ``valid_mask`` false.  Checking the padding on every layer
+    -- not only on the freshly split input -- is what keeps a layer that writes
+    stale data outside its range from passing through the gather unnoticed.
+    """
+    if expected.shape[0] != num_tokens:
+        raise ValueError(f"expected {expected.shape[0]} rows for {num_tokens} active tokens")
+    slab_capacity = capacity if capacity is not None else num_tokens
+    for rank, shard in enumerate(shards):
+        first, count, width = sequence_parallel_bounds(num_tokens, len(shards), rank, slab_capacity)
+        if shard.hidden.shape[0] != width:
+            raise RuntimeError(f"{layer}: rank {rank} has a slab width the ownership rule does not give")
+        if not torch.equal(shard.hidden[:count], expected[first : first + count]):
+            raise RuntimeError(f"{layer}: rank {rank} owns the wrong {name}")
+        if count < width:
+            if not bool((shard.hidden[count:] == 0).all()):
+                raise RuntimeError(f"{layer}: rank {rank} leaves non-zero {name} padding")
+            if not bool((shard.token_ids[count:] == -1).all()) or bool(shard.valid_mask[count:].any()):
+                raise RuntimeError(f"{layer}: rank {rank} leaves active padding metadata")
+
+
+def transform_owner_rows(
+    shards: Sequence[DecodeTokenShard],
+    *,
+    num_tokens: int,
+    transform,
+    capacity: int | None = None,
+) -> tuple[DecodeTokenShard, ...]:
+    """Apply one layer's row-wise update to the rows each rank owns.
+
+    A layer only computes the rows it owns; its slab's padding has to survive the
+    update untouched, which is why the caller passes a row transform instead of a
+    whole-slab expression.  ``transform`` receives the owned rows and returns the
+    replacement values.
+    """
+    slab_capacity = capacity if capacity is not None else num_tokens
+    updated: list[DecodeTokenShard] = []
+    for rank, shard in enumerate(shards):
+        _, count, _ = sequence_parallel_bounds(num_tokens, len(shards), rank, slab_capacity)
+        hidden = shard.hidden.clone()
+        if count:
+            hidden[:count] = transform(hidden[:count])
+        updated.append(
+            DecodeTokenShard(hidden, shard.token_ids.clone(), shard.position_ids.clone(), shard.valid_mask.clone())
+        )
+    return tuple(updated)
+
+
+def validate_two_layer_metadata(
+    *, num_tokens: int = 2, tp_size: int = 4, capacity: int | None = None
+) -> DecodeTokenShard:
+    """Exercise the owner slabs two consecutive Decode layers hand over.
+
+    The second layer consumes the *owner-local slabs* of the first one instead of
+    re-splitting the global tensor, and every slab of both layers is checked
+    against the independently computed :func:`sequence_parallel_bounds` mapping
+    plus the padding contract (see :func:`check_owner_slabs`) before anything is
+    gathered.  A rank order, padding or delayed-coefficient mistake therefore
+    shows up as a value mismatch, where a shard/gather round trip alone cannot
+    fail.
+    """
     hidden = torch.arange(num_tokens * 4, dtype=torch.float32).reshape(num_tokens, 4)
+    pre_mix = torch.arange(num_tokens * 2, dtype=torch.float32).reshape(num_tokens, 2) + 0.5
     token_ids = torch.arange(100, 100 + num_tokens, dtype=torch.int64)
     position_ids = torch.arange(17, 17 + num_tokens, dtype=torch.int32)
-    first = gather_decode_batch(
-        shard_decode_batch(hidden, token_ids, position_ids, tp_size=tp_size), num_tokens
+
+    shards = shard_decode_batch(hidden, token_ids, position_ids, tp_size=tp_size, capacity=capacity)
+    pre_mix_shards = shard_decode_batch(pre_mix, token_ids, position_ids, tp_size=tp_size, capacity=capacity)
+    check_owner_slabs(shards, hidden, num_tokens, capacity=capacity, name="residual rows", layer="the first Decode layer")
+    check_owner_slabs(
+        pre_mix_shards, pre_mix, num_tokens, capacity=capacity, name="delayed mHC rows", layer="the first Decode layer"
     )
-    second_input = tuple(
-        DecodeTokenShard(shard.hidden + 1, shard.token_ids, shard.position_ids, shard.valid_mask)
-        for shard in shard_decode_batch(hidden, token_ids, position_ids, tp_size=tp_size)
+
+    gathered = gather_decode_batch(shards, num_tokens)
+    gathered_pre_mix = gather_decode_batch(pre_mix_shards, num_tokens)
+    if not torch.equal(gathered.hidden, hidden) or not torch.equal(gathered_pre_mix.hidden, pre_mix):
+        raise RuntimeError("the Attention boundary changed the residual stream or the delayed mHC rows")
+    if not torch.equal(gathered.token_ids, token_ids) or not torch.equal(gathered.position_ids, position_ids):
+        raise RuntimeError("token/position IDs changed order across the Attention boundary")
+    if not bool(gathered.valid_mask.all()):
+        raise RuntimeError("valid mask lost an active token across the Attention boundary")
+
+    # Layer 2 works on the slabs the boundary published; nothing re-splits the
+    # global tensor, so the mapping actually has to be right.  It updates the rows
+    # it owns only, and both of its slabs are re-checked -- padding included --
+    # before the gather that would otherwise drop the padding silently.
+    second_shards = transform_owner_rows(
+        shards, num_tokens=num_tokens, transform=lambda rows: rows + 1, capacity=capacity
     )
-    second = gather_decode_batch(second_input, num_tokens)
-    if not torch.equal(first.token_ids, token_ids) or not torch.equal(second.token_ids, token_ids):
-        raise RuntimeError("token IDs changed order across consecutive Decode layers")
-    if not torch.equal(first.position_ids, position_ids) or not torch.equal(second.position_ids, position_ids):
-        raise RuntimeError("position IDs changed order across consecutive Decode layers")
-    if not bool(first.valid_mask.all() and second.valid_mask.all()):
+    second_pre_mix_shards = transform_owner_rows(
+        pre_mix_shards, num_tokens=num_tokens, transform=lambda rows: rows * 2, capacity=capacity
+    )
+    check_owner_slabs(
+        second_shards, hidden + 1, num_tokens, capacity=capacity, name="residual rows", layer="the second Decode layer"
+    )
+    check_owner_slabs(
+        second_pre_mix_shards,
+        pre_mix * 2,
+        num_tokens,
+        capacity=capacity,
+        name="delayed mHC rows",
+        layer="the second Decode layer",
+    )
+    second = gather_decode_batch(second_shards, num_tokens)
+    second_pre_mix = gather_decode_batch(second_pre_mix_shards, num_tokens)
+    if not torch.equal(second.hidden, hidden + 1) or not torch.equal(second_pre_mix.hidden, pre_mix * 2):
+        raise RuntimeError("the second Decode layer did not inherit the first layer's slabs")
+    if not torch.equal(second.token_ids, token_ids) or not torch.equal(second.position_ids, position_ids):
+        raise RuntimeError("token/position IDs changed order across consecutive Decode layers")
+    if not bool(second.valid_mask.all()):
         raise RuntimeError("valid mask lost an active token across Decode layers")
     return second
 
 
 __all__ = [
     "DecodeTokenShard",
+    "check_owner_slabs",
     "combine_validation",
     "gather_decode_batch",
     "sequence_parallel_bounds",
     "shard_decode_batch",
+    "transform_owner_rows",
     "validate_two_layer_metadata",
 ]
