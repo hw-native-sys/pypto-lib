@@ -109,7 +109,6 @@ from prefill_o_proj import (
 from hc_head import hc_head
 from lm_head import (
     GROUP_LOGIT_ROWS,
-    LM_HEAD_WEIGHT_LAYOUT,
     MAX_LOGIT_ROWS,
     SAMPLED_IDS_PAD,
     TP_SIZE as LM_HEAD_TP_SIZE,
@@ -361,7 +360,7 @@ def prefill_fwd(
     hc_head_scale: pl.Tensor[[1], pl.FP32],
     hc_head_base: pl.Tensor[[HC_MULT], pl.FP32],
     final_norm_w: pl.Tensor[[D], pl.BF16],
-    lm_head_weight: pl.Tensor[[VOCAB_PER_TP, D], pl.BF16, LM_HEAD_WEIGHT_LAYOUT],
+    lm_head_weight: pl.Tensor[[VOCAB_PER_TP, D], pl.BF16, pl.NZ],
     logit_row_indices: pl.Tensor[[MAX_LOGIT_ROWS], pl.INT32],
     dspark_target_hidden: pl.Out[pl.Tensor[[FWD_TOKENS_DYN, MAIN_HIDDEN_DIM], pl.BF16]],
     x_out: pl.Out[pl.Tensor[[FWD_GROUP_TOKENS_DYN, D], pl.BF16]],
@@ -1965,8 +1964,7 @@ def build_tensor_specs(
         from utils import pack_nz
 
         shards = (torch.randn(TP_SIZE, VOCAB_PER_TP, D) / D**0.5).to(torch.bfloat16)
-        stacked = torch.stack([shards[rank % TP_SIZE] for rank in range(N_RANKS)], dim=0)
-        return stacked if TP_SIZE == 1 else pack_nz(stacked)
+        return pack_nz(torch.stack([shards[rank % TP_SIZE] for rank in range(N_RANKS)], dim=0))
 
     # Group leaders publish one last-token row per packed request.
     request_last_rows = (2, 6) if fixture_case == "ragged2" else (num_tokens - 1,)
@@ -2148,8 +2146,7 @@ def logits_compare(actual, _expected, **kwargs):
     weight = inputs.get("lm_head_weight")
     if device_x_out is None or row_indices is None or weight is None:
         return False, "    missing device x_out or LM-head inputs"
-    if TP_SIZE != 1:
-        weight = unpack_nz(weight)
+    weight = unpack_nz(weight)
     if not bool(torch.isfinite(actual).all()):
         return False, "    logits contain NaN or Inf"
     for rank in range(actual.shape[0]):
