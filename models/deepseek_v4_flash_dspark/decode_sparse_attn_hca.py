@@ -76,7 +76,9 @@ QK_PROB_READY_EVENT = 1
 QK_PV_READY_EVENT = 2
 CMP_ATTN_K_TILE = 128 if TP == 1 else 32
 CMP_PAGES_PER_WORK = CMP_ATTN_K_TILE // CMP_STORAGE_BLOCK_SIZE
-CMP_GATHER_WORK_TILE = max(1, 8 // CMP_PAGES_PER_WORK)
+CMP_GATHER_WORK_TILE = 8 if TP == 1 else max(1, 8 // CMP_PAGES_PER_WORK)
+CMP_GATHER_MIN_PAGES = 8 * CMP_PAGES_PER_WORK if TP == 1 else 8
+CMP_GATHER_MIN_REQUESTS = 16 if TP == 1 else 1
 ROPE_TILE = 16
 ROPE_INTERLEAVE_TILE = 2 * ROPE_TILE
 ROPE_CS_T_TILE = S  # rope cos/sin row block: one request per block
@@ -361,15 +363,17 @@ def sparse_attn_hca(
         # Each gather item publishes a complete KV tile and validity row.
         cmp_work_valid = pl.create_tensor([cmp_gather_count, CMP_ATTN_K_TILE], dtype=pl.FP32)
         cmp_gather_blocks = cmp_gather_count
-        if cmp_table_blocks >= 8:
-            cmp_gather_blocks = (cmp_gather_count + CMP_GATHER_WORK_TILE - 1) // CMP_GATHER_WORK_TILE
+        if cmp_table_blocks >= CMP_GATHER_MIN_PAGES:
+            if request_count >= CMP_GATHER_MIN_REQUESTS:
+                cmp_gather_blocks = (cmp_gather_count + CMP_GATHER_WORK_TILE - 1) // CMP_GATHER_WORK_TILE
         with pl.spmd(cmp_gather_blocks, name_hint="hca_cmp_work_gather", deps=[cmp_cache_ready_dep]) as cmp_gather_tid:
             gather_block = pl.tile.get_block_idx()
             gather_begin = gather_block
             gather_end = gather_block + 1
-            if cmp_table_blocks >= 8:
-                gather_begin = gather_block * CMP_GATHER_WORK_TILE
-                gather_end = pl.min(gather_begin + CMP_GATHER_WORK_TILE, cmp_gather_count)
+            if cmp_table_blocks >= CMP_GATHER_MIN_PAGES:
+                if request_count >= CMP_GATHER_MIN_REQUESTS:
+                    gather_begin = gather_block * CMP_GATHER_WORK_TILE
+                    gather_end = pl.min(gather_begin + CMP_GATHER_WORK_TILE, cmp_gather_count)
             for gather_item in pl.range(gather_begin, gather_end):
                 gather_request = gather_item // cmp_work_count
                 gather_work = gather_item - gather_request * cmp_work_count
