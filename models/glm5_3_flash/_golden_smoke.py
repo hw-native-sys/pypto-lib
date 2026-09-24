@@ -283,6 +283,45 @@ def run_mla_cache_golden(golden_cache_write) -> None:
     _report("mla_cache")
 
 
+def run_indexer_cache_golden(golden_cache_write) -> None:
+    """Check that the indexer state write packs both halves and skips ``-1`` slots."""
+    torch.manual_seed(31)
+    rows, dim = 16, 8
+    cache = torch.randn(rows, 2 * dim, dtype=torch.float32)
+    original = cache.clone()
+    index_k = torch.randn(4, dim, dtype=torch.bfloat16)
+    gate_scores = torch.randn(4, dim, dtype=torch.float32)
+    # Row 2 owns no cache position.
+    slots = torch.tensor([5, 0, -1, 11], dtype=torch.int32)
+
+    updated = golden_cache_write(cache, index_k, gate_scores, slots)
+    _check(updated.shape == cache.shape, f"cache shape {tuple(updated.shape)}")
+    _check(updated.dtype is cache.dtype, f"cache dtype {updated.dtype}")
+    _check(torch.equal(cache, original), "the reference must not write the cache in place")
+    written = [slot for slot in slots.tolist() if slot >= 0]
+    for row, slot in enumerate(slots.tolist()):
+        if slot < 0:
+            continue
+        # The key half is widened from BF16, which is exact; the gate half is copied.
+        _check(
+            torch.equal(updated[slot, :dim], index_k[row].to(torch.float32)),
+            f"slot {slot} did not receive its key half",
+        )
+        _check(
+            torch.equal(updated[slot, dim:], gate_scores[row]),
+            f"slot {slot} did not receive its gate half",
+        )
+    untouched = [index for index in range(rows) if index not in written]
+    _check(
+        torch.equal(updated[untouched], original[untouched]),
+        "the write disturbed rows outside its slot mapping",
+    )
+    # A -1 slot must not wrap into the tail of the pool.
+    _check(torch.equal(updated[-1], original[-1]), "a -1 slot wrapped into the last row")
+
+    _report("indexer_cache")
+
+
 def _sparse_attention_fixture(seed: int):
     """Build one small paged selection: cache, block table, indices and query."""
     torch.manual_seed(seed)
@@ -416,6 +455,7 @@ def run_mla_epilog_goldens(golden_epilog_prefill, golden_epilog_decode) -> None:
 
 __all__ = [
     "run_decode_sparse_attn_golden",
+    "run_indexer_cache_golden",
     "run_mhc_goldens",
     "run_mla_cache_golden",
     "run_mla_epilog_goldens",
