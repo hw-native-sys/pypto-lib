@@ -395,6 +395,7 @@ def build_group_decode_metadata(
 def prepare_target_group_from_device_state(
     group_state_slot_ids: pl.Tensor[[DECODE_BATCH], pl.INT32],
     group_state_generations: pl.Tensor[[DECODE_BATCH], pl.INT32],
+    valid_draft_counts: pl.Tensor[[DECODE_BATCH], pl.INT32],
     state_tokens: pl.Tensor[[STATE_CAPACITY, STATE_TOKEN_WIDTH], pl.INT64],
     state_meta: pl.Tensor[[STATE_CAPACITY, STATE_META_WIDTH], pl.INT32],
     input_ids: pl.Tensor[[LOCAL_T], pl.INT64],
@@ -408,7 +409,7 @@ def prepare_target_group_from_device_state(
     group_active_widths: pl.Tensor[[DECODE_BATCH], pl.INT32],
     tp_rank: pl.Scalar[pl.INT32],
 ):
-    """Resolve the TP-group target window from replicated persistent state."""
+    """Resolve the TP-group target window, capped by valid draft counts."""
     for core in pl.spmd(1, name_hint="dspark_group_state_prepare"):
         local_begin = tp_rank * LOCAL_BATCH
         local_end = local_begin + LOCAL_BATCH
@@ -435,7 +436,10 @@ def prepare_target_group_from_device_state(
                 expected = pl.read(group_state_generations, [request])
                 if valid == 1 and generation == expected:
                     anchor = pl.read(state_meta, [slot, STATE_ANCHOR_POSITION])
-                    draft_count = pl.read(state_meta, [slot, STATE_DRAFT_COUNT])
+                    draft_count = pl.cast(pl.min(
+                        pl.read(state_meta, [slot, STATE_DRAFT_COUNT]),
+                        pl.max(pl.read(valid_draft_counts, [request]), 0),
+                    ), pl.INT32)
                     position_limit = pl.read(state_meta, [slot, STATE_POSITION_LIMIT])
                     active_width = pl.cast(1, pl.INT32)
                     if anchor + draft_count < position_limit:
@@ -485,6 +489,8 @@ def prepare_target_group_from_device_state(
 def accept_target_into_device_state(
     state_slot_ids: pl.Tensor[[LOCAL_BATCH], pl.INT32],
     state_generations: pl.Tensor[[LOCAL_BATCH], pl.INT32],
+    valid_draft_counts: pl.Tensor[[DECODE_BATCH], pl.INT32],
+    tp_rank: pl.Scalar[pl.INT32],
     sampled_row_offsets: pl.Tensor[[LOCAL_BATCH], pl.INT32],
     hidden_row_offsets: pl.Tensor[[LOCAL_BATCH], pl.INT32],
     state_tokens: pl.InOut[pl.Tensor[[STATE_CAPACITY, STATE_TOKEN_WIDTH], pl.INT64]],
@@ -501,7 +507,7 @@ def accept_target_into_device_state(
     drafter_row_offsets: pl.Out[pl.Tensor[[LOCAL_BATCH], pl.INT32]],
     drafter_ready: pl.Out[pl.Tensor[[1], pl.INT32]],
 ):
-    """Accept the longest matching prefix and prepare the next drafter inputs."""
+    """Accept only a validated draft prefix and prepare the next drafter inputs."""
     for core in pl.spmd(1, name_hint="dspark_state_accept"):
         next_drafter_row = pl.cast(0, pl.INT32)
         for request in pl.range(core, LOCAL_BATCH):
@@ -524,7 +530,10 @@ def accept_target_into_device_state(
                 if valid == 1 and generation == expected:
                     sampled_row = pl.cast(sampled_row_raw, pl.INDEX)
                     old_anchor = pl.read(state_meta, [slot, STATE_ANCHOR_POSITION])
-                    draft_count = pl.read(state_meta, [slot, STATE_DRAFT_COUNT])
+                    draft_count = pl.cast(pl.min(
+                        pl.read(state_meta, [slot, STATE_DRAFT_COUNT]),
+                        pl.max(pl.read(valid_draft_counts, [tp_rank * LOCAL_BATCH + request]), 0),
+                    ), pl.INT32)
                     position_limit = pl.read(state_meta, [slot, STATE_POSITION_LIMIT])
                     effective_draft_count = pl.cast(0, pl.INT32)
                     if old_anchor + draft_count < position_limit:

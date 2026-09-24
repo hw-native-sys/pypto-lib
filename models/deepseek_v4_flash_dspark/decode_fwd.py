@@ -66,6 +66,8 @@ from decode_hca import decode_hca, decode_hca_tp1
 from decode_swa import decode_swa, decode_swa_tp1
 from hc_head import hc_head
 from lm_head import (
+    GRAMMAR_SEGMENT_WORDS,
+    GREEDY_GRID_ROWS,
     GROUP_LOGIT_ROWS,
     MAX_LOGIT_ROWS,
     SAMPLED_IDS_PAD,
@@ -396,6 +398,7 @@ def _decode_fwd(
     dspark_target_hidden: pl.Out[pl.Tensor[[T_DYN, MAIN_HIDDEN_DIM], pl.BF16]],
     x_out: pl.Out[pl.Tensor[[T_DYN, D], pl.BF16]],
     logits: pl.Out[pl.Tensor[[MAX_LOGIT_ROWS, LM_HEAD_VOCAB], pl.FP32]],
+    grammar_mask: pl.Tensor[[MAX_LOGIT_ROWS, GREEDY_GRID_ROWS, GRAMMAR_SEGMENT_WORDS], pl.INT16],
     sampled_ids: pl.Out[pl.Tensor[[MAX_LOGIT_ROWS, SAMPLED_IDS_PAD], pl.INT32]],
     gather_window: pld.DistributedTensor[[DECODE_GROUP_CAP, D], pl.BF16],
     gather_signal: pld.DistributedTensor[[TP_SIZE, 1], pl.INT32],
@@ -1162,7 +1165,7 @@ def _decode_fwd(
             pl.const(LM_HEAD_COMM_EPOCH, pl.INT32),
             final_norm_tid,
         )
-        greedy_sample(logits, logit_row_indices, sampled_ids)
+        greedy_sample(logits, logit_row_indices, grammar_mask, sampled_ids)
     else:
         for row in pl.spmd(MAX_LOGIT_ROWS, name_hint="decode_fwd_inactive_sample_rows"):
             for col in pl.range(LM_HEAD_VOCAB // LOGITS_ZERO_TILE):
@@ -1293,6 +1296,7 @@ def l3_decode_fwd(
     dspark_target_hidden: pl.Out[pl.Tensor[[N_RANKS, T_DYN, MAIN_HIDDEN_DIM], pl.BF16]],
     x_out: pl.Out[pl.Tensor[[N_RANKS, T_DYN, D], pl.BF16]],
     logits: pl.Out[pl.Tensor[[N_RANKS, MAX_LOGIT_ROWS, LM_HEAD_VOCAB], pl.FP32]],
+    grammar_mask: pl.Tensor[[N_RANKS, MAX_LOGIT_ROWS, GREEDY_GRID_ROWS, GRAMMAR_SEGMENT_WORDS], pl.INT16],
     sampled_ids: pl.Out[pl.Tensor[[N_RANKS, MAX_LOGIT_ROWS, SAMPLED_IDS_PAD], pl.INT32]],
 ):
     """Allocate each communication window once and submit one decode forward child."""
@@ -1439,7 +1443,7 @@ def l3_decode_fwd(
             x_attn_active[rank], x_moe_next[rank],
             pre_hc_hidden_out[rank], dspark_target_hidden[rank],
             x_out[rank], logits[rank],
-            sampled_ids[rank],
+            grammar_mask[rank], sampled_ids[rank],
             gather_window, gather_signal,
             attention_window, attention_signal, o_window, o_signal,
             recv_meta, recv_x, recv_aux, recv_route,
@@ -1867,6 +1871,10 @@ def build_tensor_specs(
         ),
         "x_out": TensorSpec("x_out", [N_RANKS, local_t, D], torch.bfloat16),
         "logits": TensorSpec("logits", [N_RANKS, MAX_LOGIT_ROWS, LM_HEAD_VOCAB], torch.float32),
+        "grammar_mask": TensorSpec(
+            "grammar_mask", [N_RANKS, MAX_LOGIT_ROWS, GREEDY_GRID_ROWS, GRAMMAR_SEGMENT_WORDS], torch.int16,
+            init_value=-1,
+        ),
         "sampled_ids": TensorSpec(
             "sampled_ids", [N_RANKS, MAX_LOGIT_ROWS, SAMPLED_IDS_PAD], torch.int32, 
         ),
