@@ -438,7 +438,7 @@ RoPE machinery, and add the KDA family and the kpool indexer.
 | `mtp_projection.py` | `mtp_projection.py` | Same `enorm` / `hnorm` / `eh_proj` shape |
 | `mla_prolog.py` | `qkv_proj_rope.py` | Delete the whole RoPE half; add the `kv_b_proj` absorption |
 | `prefill_sparse_attn.py`, `decode_sparse_attn.py` | `prefill_sparse_attn.py`, `decode_sparse_attn_csa.py` | Delete the sliding-window gather, the ratio-4 slot rewrite, the attention sink and the inverse RoPE |
-| `prefill_indexer.py`, `decode_indexer.py` | same names | Delete the INT8/Hadamard half and the compressor; add the k-pooling stage |
+| `prefill_indexer.py`, `decode_indexer.py` | same names | Delete the compressor and its ratio-4 slot rewrite, but **keep** the Hadamard rotation and the INT8 query quantization — upstream quantizes the rotated query to FP8 and a2a3's cube has no fp8 entry, so INT8 is GLM's own numerics here, not a donor quirk; add the k-pooling stage |
 | `(new) prefill_moe.py`, `decode_moe.py` | same names | EP16 instead of EP8; 18 local experts |
 | `(new) prefill_fwd.py`, `decode_fwd.py` | same names | The 3:1 KDA/DSA schedule replaces the SWA/CSA/HCA schedule |
 | `kda_*.py`, the k-pooling stage | **no donor in this repo** | See the prior-art table above |

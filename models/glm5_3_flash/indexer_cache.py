@@ -45,9 +45,20 @@ def golden_indexer_cache_write(
     gate_scores: torch.Tensor,
     slots: torch.Tensor,
 ) -> torch.Tensor:
+    """Scatter one step's packed indexer state, skipping ``-1`` slots.
+
+    A slot of ``-1`` marks a row that owns no cache position — a padded row in a
+    packed decode batch — and is skipped, exactly as
+    :func:`models.glm5_3_flash.mla_cache.golden_mla_cache_write` skips it for the
+    latent pool. ``index_slots`` and ``mla_slots`` are the same kind of quantity, both
+    built by :func:`models.glm5_3_flash.metadata.paged_slots`, so without the guard a
+    negative slot would be a wrapped index into the tail of the pool. The kernel body
+    owes the same guard.
+    """
     packed = torch.cat([index_k, gate_scores], dim=-1)
     updated = cache.clone()
-    updated[slots.to(torch.long)] = packed.to(cache.dtype)
+    written = slots >= 0
+    updated[slots.to(torch.long)[written]] = packed.to(cache.dtype)[written]
     return updated
 
 
