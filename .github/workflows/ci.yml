@@ -501,7 +501,10 @@ jobs:
     # PR-only, DeepSeek V4 — the 8-card (--device-num 8) serving run, split out
     # of `serving-qwen` so the 8-card borrow schedules independently of the
     # single-card run. Same setup contract; gated by its own model guard.
+    # Disabled until pypto-serving loads the NZ-layout weights; drop the
+    # leading `false &&` to re-enable.
     if: >-
+      false &&
       github.event_name == 'pull_request' &&
       needs.detect-changes.outputs.run_deepseek_serving_tests == 'true'
     runs-on: [self-hosted, linux, arm64, npu]
@@ -566,7 +569,10 @@ jobs:
     # grouped prefix cache on a single caching-enabled server), split out like
     # serving-deepseek so the expensive 8-card borrow schedules independently.
     # Same setup contract; gated by its own model guard.
+    # Disabled until pypto-serving loads the NZ-layout weights; drop the
+    # leading `false &&` to re-enable.
     if: >-
+      false &&
       github.event_name == 'pull_request' &&
       needs.detect-changes.outputs.run_dspark_serving_tests == 'true'
     runs-on: [self-hosted, linux, arm64, npu]
