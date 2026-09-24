@@ -48,6 +48,22 @@ The wider verify window is the reason for the rest of the table: 512 rows per
 step is too much attention work for one card, so the token axis is split across
 the CP group and the output projection is sharded along with it.
 
+### TP1 long-context CSA indexer
+
+For TP1 with an even verify length, fewer than 64 requests, and at least
+32768 compressed history rows in the batch, the CSA indexer scores two
+adjacent tokens together. The tokens share a paged KV load. The FIX pipe
+converts the INT32 query-key product to FP16 with ReLU and a 1/1024 scale;
+a second cube matmul applies block-diagonal head weights with the inverse
+scale folded in. Each token retains its own visibility mask and Top-K row.
+The vector cores apply KV scales and perform the existing Top-K sort/merge.
+Other shapes retain the direct or buffered score path.
+
+The paired query tile has 128 head rows and 256 KV columns, filling the
+128 KiB INT32 accumulator. FP16 score and weight rounding can change indices
+near the Top-K boundary; validate both indexer score/selection checks and
+full CSA outputs when changing these tiles or the input distribution.
+
 ## Model structure, top down
 
 ### `decode_fwd`
