@@ -419,13 +419,90 @@ sees the same token batch. `wq_a`, `wkv`, compressor, indexer, and the
 single-head KV caches are replicated. `wq_b`, query heads, attention sinks,
 and output groups are sharded across TP ranks. Each rank computes
 16 query heads and two output groups; one FP32 TP all-reduce reconstructs the
-complete hidden output. Before EP8 dispatch, token-row ownership is assigned
-round-robin across the four TP ranks. This prevents replicated attention rows
-from being dispatched four times; MoE combine returns the rows to the TP
-layout. The routed result therefore arrives partitioned across the group, with
-the rows a rank does not own left at zero, and one FP32 sum over the group
-restores the replicated residual stream the next layer's attention expects.
-DSA context parallelism is intentionally out of scope.
+complete hidden output for standalone Attention callers. The sequence-parallel
+prefill compositions below instead reduce-scatter those FP32 partials directly.
+The existing owner-filtered MoE entry and the decode integration have separate
+ABIs; adapting them to the standard EP boundary is tracked in
+[issue #1275](https://github.com/hw-native-sys/pypto-lib/issues/1275). DSA context
+parallelism is intentionally out of scope.
+
+`prefill_swa.py` keeps mHC residuals token-sharded across TP ranks. It applies
+mHC-pre and input RMSNorm locally, AllGathers the attention input, and
+ReduceScatters FP32 output-projection partials before local mHC-post.
+`incoming_pre_mix` and `next_pre_mix` carry the staggered mHC state between
+sublayers. The standalone `prefill_attn_swa.py` retains replicated output.
+
+The C2A compositions (`prefill_c2a_full.py`, `prefill_c2a_reuse.py`) and
+`prefill_c1a_sp.py --mode {full,reindex,reuse}` use the same local residual
+boundary. `attn_input` holds the gathered `[T,D]` input; `attn_output`,
+`next_pre_mix`, and `x_hc_out` hold only the local contiguous token shard.
+C1A exposes `make_rank(mode, epochs)` for a caller supplying real weights,
+state and communication windows, and `make_program(mode, world_size, epochs)`
+for a complete L3 launch. C2A exposes `prefill_c2a_full_sp`,
+`prefill_c2a_reuse_sp`, and `make_hc_program`; its original inline sublayers
+retain the replicated ABI used by `prefill_layer.py`.
+The standalone `prefill_attn_c1a_*` and `prefill_attn_c2a_*` entries retain
+replicated output. The compatibility mHC wrappers in `prefill_c1a_full.py`,
+`prefill_c1a_reindex.py`, and `prefill_c1a_reuse.py` also use replicated residuals;
+SP callers use `prefill_c1a_sp.py` and its local-state ABI instead.
+All SP paths write active mHC-post values and inactive zeros in one producer.
+Prefill stages BF16 compressor, index-weight, index-key and grouped output
+projections through FP32 GM scratch before RNE narrowing. Their mixed
+producers, C1A index scoring and C2A attention require Vector input before
+the first Cube-to-Vector result transfer. This startup dependency addresses
+the pending-producer overlap described in
+[pypto #2829](https://github.com/hw-native-sys/pypto/issues/2829).
+The staged producers use FP32 Vector stores; direct Acc-to-GM stores were
+unstable in the concurrent A5 prefill workload.
+C2A prefill uses the group-32 Q-A projection and three BF16 weight terms
+for its FP32 compressor weights. A Vector task materializes those terms
+in GM; at most 16 synchronously started mixed workers accumulate high
+and residual products separately in 320-column K chunks. A separate
+Vector task uses compensated summation across the 16 chunks to reduce
+error near pooled BF16 rounding boundaries. At 4,096 tokens the staged
+products occupy 256 MiB per projection, in addition to weight scratch.
+These schedules cost scratch storage and extra tasks; decode keeps its
+original operators. References retain FP32 head partials until the final
+TP sum. Bounded head-RoPE and index permutation workers keep the
+4,096-token capacity within the runtime's logical block limit.
+C2A Full provisions 2 GiB per runtime heap ring for its retained compressor
+products; C2A Reuse and SWA provision 1 GiB per ring for
+that capacity; callers composing larger programs must size the retained live set.
+
+All compositions require equal physical shard capacity `ceil(T/TP)` within a
+TP group, including ranks with no active rows. The L3 `num_tokens` input is
+`[world_size,1]`, with one group-global valid count repeated across its TP
+ranks. Positions, request IDs, RoPE rows, slots, Top-K rows and cache metadata
+remain in the full gathered token order. The C2A Full L3 entry gathers
+RoPE rows from serving-owned full tables before the epoch loop. The caller
+must pass that same mapping to the next local sublayer and give it only
+`max(0, min(T_local, num_tokens - tp_rank*T_local))` active rows. Padding never
+becomes a valid token. There is no residual-stream AllGather or additional TP
+sum at these exits. Embedding, EP dispatch/combine, and final serving output
+redistribution belong to their respective callers.
+
+Each gather and reduction has separate retained windows and consecutive
+one-based epochs. Their publish/consume handshakes include empty ranks and
+empty DP groups. The current independent entry fixtures repeat a sublayer
+with the same inputs while reusing windows; they are not a multi-layer model
+or a real-checkpoint validation. CPU regressions separately check that the
+local residual and delayed pre-mix can pass through two consecutive boundaries.
+
+Example eight-card prefill checks (use the environment's device allocator):
+
+```bash
+python models/deepseek_v4_1_flash/prefill_c2a_full.py --tp 4 --dp 2 --tokens 7 --requests 3 --dp-tokens 7,1 --epochs 3 -d 0,1,2,3,4,5,6,7
+python models/deepseek_v4_1_flash/prefill_c1a_sp.py --tp 4 --dp 2 --mode full --case mixed --dp-tokens 8,5 --epochs 3 -d 0,1,2,3,4,5,6,7
+```
+
+The C2A checks retain the existing Attention budget (relative L2 <= 1%, each
+row <= 2%, cosine >= 0.9999), replay mHC-post on the actual device Attention
+output, and require exact zero inactive shards and unchanged inactive cache
+storage. C1A retains its existing per-row RMS and peak error bounds. Both
+check every local shard independently. These layout boundaries follow the
+[reference decoder](https://github.com/vllm-project/vllm-ascend/blob/36b7582431326361dd4dae79a78a555e76e715f9/vllm_ascend/models/deepseek_v41/model.py)
+and [SP helpers](https://github.com/vllm-project/vllm-ascend/blob/36b7582431326361dd4dae79a78a555e76e715f9/vllm_ascend/models/common/ops/sequence_parallel.py)
+at revision `36b7582431326361dd4dae79a78a555e76e715f9`.
 
 On the decode side both wirings coexist: the historical entry keeps the
 head-parallel all-reduce, and the `*_sharded` entry uses the sequence-parallel
@@ -472,7 +549,7 @@ first 16 columns of the first head in each 16-head group. Each rank's final
 projection remains FP32 through the rank-ordered TP reduction, with one BF16
 cast after the sum.
 
-Full and Reindex validate Top-K eligibility, uniqueness, logical-position
+C1A Full and Reindex validate Top-K eligibility, uniqueness, logical-position
 ordering, trailing `-1` padding, and cutoff score quality before checking
 the output. If an accepted selection differs from the nominal golden, the
 output reference is recomputed for that selection using the **reference
@@ -516,6 +593,8 @@ The implementation milestones are ordered by dependency:
    with the attention RMSNorm the block runs between `mhc_pre` and the
    leaf: `python models/deepseek_v4_1_flash/prefill_c2a_full.py`.
 3. Implement C1A Full and the level-one candidate selector, then Reindex and Reuse.
+   Run their sequence-parallel mHC composition with `prefill_c1a_sp.py --mode full`,
+   `--mode reindex`, or `--mode reuse`.
 4. Implement the three-phase EP-MoE dispatch/local-expert/combine body.
 5. Compose the operators into one layer, then into the 40-layer prefill/decode
    token loop. `prefill_layer.py` is the prefill half of the first step: one

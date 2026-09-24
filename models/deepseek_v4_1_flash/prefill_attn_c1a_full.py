@@ -35,7 +35,7 @@ from models.deepseek_v4_1_flash.prefill_c1a_common import (
     publish_compressed_cache,
     publish_index_cache,
 )
-from models.deepseek_v4_1_flash.attention_ops import make_bf16_projection, make_norm, make_rope
+from models.deepseek_v4_1_flash.attention_ops import make_bf16_projection_staged, make_norm, make_rope
 from models.deepseek_v4_1_flash.qkv_proj_rope import q_proj_qr
 from models.deepseek_v4_1_flash.prefill_c1a_indexer import make_paged_indexer
 from models.deepseek_v4_1_flash.attention_common import (
@@ -94,10 +94,10 @@ FULL_INPUT_NAMES = COMMON_INPUT_NAMES + (
 if TP_SIZE not in (1, 2, 4):
     raise ValueError("Prefill C1A currently supports TP1, TP2, and TP4; TP8 requires head-tile padding")
 
-project_compressed = make_bf16_projection(C.D, C.HEAD_DIM)
+project_compressed = make_bf16_projection_staged(C.D, C.HEAD_DIM)
 normalize_compressed = make_norm(C.HEAD_DIM)
 rotate_compressed = make_rope(1)
-project_index_key = make_bf16_projection(C.HEAD_DIM, C.INDEX_DIM)
+project_index_key = make_bf16_projection_staged(C.HEAD_DIM, C.INDEX_DIM)
 normalize_index_key = make_norm(C.INDEX_DIM)
 rotate_index_key = make_rope(1, head_dim=C.INDEX_DIM, rope_dim=C.ROPE_DIM)
 paged_indexer = make_paged_indexer()
@@ -193,7 +193,7 @@ def golden_prefill_attn_c1a_full(
     )
 
 
-def make_prefill_attn_c1a_full(indexer):
+def make_prefill_attn_c1a_full(indexer, reducer=prefill_tp_output_all_reduce, output_tokens=C.T_DYN):
     @pl.jit.inline(auto_scope=False)
     def prefill_attn_c1a_full_impl(
         x: pl.Tensor[[C.T_DYN, C.D], pl.BF16],
@@ -240,7 +240,7 @@ def make_prefill_attn_c1a_full(indexer):
         candidate_mask: pl.Tensor[[C.T_DYN, C.CMP_POSITIONS_DYN], pl.UINT8],
         output_window: pld.DistributedTensor[[C.PREFILL_MAX_TOKENS, C.D], pl.FP32],
         output_arrived: pld.DistributedTensor[[C.TP_SIZE, 1], pl.INT32],
-        output: pl.Tensor[[C.T_DYN, C.D], pl.BF16],
+        output: pl.Tensor[[output_tokens, C.D], pl.BF16],
         group_base: pl.Scalar[pl.INT32],
         tp_rank: pl.Scalar[pl.INT32],
         num_tokens: pl.Scalar[pl.INT32],
@@ -248,99 +248,98 @@ def make_prefill_attn_c1a_full(indexer):
     ):
         """Publish ratio-1 caches, select sparse rows, and compute packed C1A."""
         tokens = pl.tensor.dim(x, 0)
-
-        compressed_projection = pl.create_tensor([tokens, HEAD_DIM], dtype=pl.BF16)
-        project_compressed(x, compressor_wkv, compressed_projection, num_tokens)
-        compressed_latent = pl.create_tensor([tokens, HEAD_DIM], dtype=pl.BF16)
-        normalize_compressed(
-            compressed_projection,
-            compressor_norm_weight,
-            compressed_latent,
-            num_tokens,
-        )
-        compressed_rotated = pl.create_tensor([tokens, HEAD_DIM], dtype=pl.BF16)
-        rotate_compressed(
-            compressed_latent,
-            compressed_rope_cos,
-            compressed_rope_sin,
-            compressed_rotated,
-            num_tokens,
-        )
-        publish_compressed_cache(
-            compressed_rotated,
-            compressed_slots,
-            compressed_cache,
-            compressed_cache_scale,
-            num_tokens,
-        )
-
-        index_projection = pl.create_tensor([tokens, INDEX_DIM], dtype=pl.BF16)
-        project_index_key(compressed_latent, index_wk, index_projection, num_tokens)
-        index_normalized = pl.create_tensor([tokens, INDEX_DIM], dtype=pl.BF16)
-        normalize_index_key(index_projection, index_norm_weight, index_normalized, num_tokens)
-        index_rotated = pl.create_tensor([tokens, INDEX_DIM], dtype=pl.BF16)
-        rotate_index_key(
-            index_normalized,
-            compressed_rope_cos,
-            compressed_rope_sin,
-            index_rotated,
-            num_tokens,
-        )
-        index_ready = publish_index_cache(
-            index_rotated,
-            compressed_slots,
-            index_cache,
-            index_cache_scale,
-            num_tokens,
-        )
-
-        query_latent = pl.create_tensor([tokens, Q_LORA], dtype=pl.BF16)
-        q_proj_qr(x, wq_a, wq_a_scale, q_norm_weight, query_latent, num_tokens)
-        indexer_completion = indexer(
-            x,
-            query_latent,
-            request_ids,
-            compressed_lens,
-            index_cache,
-            index_cache_scale,
-            index_block_table,
-            rope_cos,
-            rope_sin,
-            index_wq_b,
-            index_wq_b_scale,
-            index_weights_proj,
-            candidate_mask,
-            topk_indices,
-            num_tokens,
-            index_ready,
-        )
-
         partial = pl.create_tensor([tokens, D], dtype=pl.FP32)
-        prefill_c1a_partial(
-            x,
-            query_latent,
-            wq_b,
-            wq_b_scale,
-            wkv,
-            wkv_scale,
-            kv_norm_weight,
-            attn_sink,
-            wo_a,
-            wo_b,
-            wo_b_scale,
-            rope_cos,
-            rope_sin,
-            window_slots,
-            window_indices,
-            window_cache,
-            window_cache_scale,
-            compressed_cache,
-            compressed_cache_scale,
-            topk_indices,
-            partial,
-            num_tokens,
-        )
-        prefill_tp_output_all_reduce(
+        if num_tokens > 0:
+            compressed_projection = pl.create_tensor([tokens, HEAD_DIM], dtype=pl.BF16)
+            project_compressed(x, compressor_wkv, compressed_projection, num_tokens)
+            compressed_latent = pl.create_tensor([tokens, HEAD_DIM], dtype=pl.BF16)
+            normalize_compressed(
+                compressed_projection,
+                compressor_norm_weight,
+                compressed_latent,
+                num_tokens,
+            )
+            compressed_rotated = pl.create_tensor([tokens, HEAD_DIM], dtype=pl.BF16)
+            rotate_compressed(
+                compressed_latent,
+                compressed_rope_cos,
+                compressed_rope_sin,
+                compressed_rotated,
+                num_tokens,
+            )
+            publish_compressed_cache(
+                compressed_rotated,
+                compressed_slots,
+                compressed_cache,
+                compressed_cache_scale,
+                num_tokens,
+            )
+
+            index_projection = pl.create_tensor([tokens, INDEX_DIM], dtype=pl.BF16)
+            project_index_key(compressed_latent, index_wk, index_projection, num_tokens)
+            index_normalized = pl.create_tensor([tokens, INDEX_DIM], dtype=pl.BF16)
+            normalize_index_key(index_projection, index_norm_weight, index_normalized, num_tokens)
+            index_rotated = pl.create_tensor([tokens, INDEX_DIM], dtype=pl.BF16)
+            rotate_index_key(
+                index_normalized,
+                compressed_rope_cos,
+                compressed_rope_sin,
+                index_rotated,
+                num_tokens,
+            )
+            index_ready = publish_index_cache(
+                index_rotated,
+                compressed_slots,
+                index_cache,
+                index_cache_scale,
+                num_tokens,
+            )
+
+            query_latent = pl.create_tensor([tokens, Q_LORA], dtype=pl.BF16)
+            q_proj_qr(x, wq_a, wq_a_scale, q_norm_weight, query_latent, num_tokens)
+            indexer_completion = indexer(
+                x,
+                query_latent,
+                request_ids,
+                compressed_lens,
+                index_cache,
+                index_cache_scale,
+                index_block_table,
+                rope_cos,
+                rope_sin,
+                index_wq_b,
+                index_wq_b_scale,
+                index_weights_proj,
+                candidate_mask,
+                topk_indices,
+                num_tokens,
+                index_ready,
+            )
+            prefill_c1a_partial(
+                x,
+                query_latent,
+                wq_b,
+                wq_b_scale,
+                wkv,
+                wkv_scale,
+                kv_norm_weight,
+                attn_sink,
+                wo_a,
+                wo_b,
+                wo_b_scale,
+                rope_cos,
+                rope_sin,
+                window_slots,
+                window_indices,
+                window_cache,
+                window_cache_scale,
+                compressed_cache,
+                compressed_cache_scale,
+                topk_indices,
+                partial,
+                num_tokens,
+            )
+        reducer(
             partial,
             output_window,
             output_arrived,

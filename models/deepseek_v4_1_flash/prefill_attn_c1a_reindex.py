@@ -168,7 +168,7 @@ def golden_prefill_attn_c1a_reindex(
     )
 
 
-def make_prefill_attn_c1a_reindex(indexer):
+def make_prefill_attn_c1a_reindex(indexer, reducer=prefill_tp_output_all_reduce, output_tokens=C.T_DYN):
     @pl.jit.inline(auto_scope=False)
     def prefill_attn_c1a_reindex_impl(
         x: pl.Tensor[[C.T_DYN, C.D], pl.BF16],
@@ -208,7 +208,7 @@ def make_prefill_attn_c1a_reindex(indexer):
         topk_indices: pl.Tensor[[C.T_DYN, C.INDEX_TOPK], pl.INT32],
         output_window: pld.DistributedTensor[[C.PREFILL_MAX_TOKENS, C.D], pl.FP32],
         output_arrived: pld.DistributedTensor[[C.TP_SIZE, 1], pl.INT32],
-        output: pl.Tensor[[C.T_DYN, C.D], pl.BF16],
+        output: pl.Tensor[[output_tokens, C.D], pl.BF16],
         group_base: pl.Scalar[pl.INT32],
         tp_rank: pl.Scalar[pl.INT32],
         num_tokens: pl.Scalar[pl.INT32],
@@ -216,55 +216,54 @@ def make_prefill_attn_c1a_reindex(indexer):
     ):
         """Refresh ratio-1 Top-K rows inside a supplied candidate set."""
         tokens = pl.tensor.dim(x, 0)
-
-        query_latent = pl.create_tensor([tokens, Q_LORA], dtype=pl.BF16)
-        q_proj_qr(x, wq_a, wq_a_scale, q_norm_weight, query_latent, num_tokens)
-        cache_ready = pl.system.task_dummy(deps=[])
-        indexer_completion = indexer(
-            x,
-            query_latent,
-            request_ids,
-            compressed_lens,
-            index_cache,
-            index_cache_scale,
-            index_block_table,
-            rope_cos,
-            rope_sin,
-            index_wq_b,
-            index_wq_b_scale,
-            index_weights_proj,
-            candidate_mask,
-            topk_indices,
-            num_tokens,
-            cache_ready,
-        )
-
         partial = pl.create_tensor([tokens, D], dtype=pl.FP32)
-        prefill_c1a_partial(
-            x,
-            query_latent,
-            wq_b,
-            wq_b_scale,
-            wkv,
-            wkv_scale,
-            kv_norm_weight,
-            attn_sink,
-            wo_a,
-            wo_b,
-            wo_b_scale,
-            rope_cos,
-            rope_sin,
-            window_slots,
-            window_indices,
-            window_cache,
-            window_cache_scale,
-            compressed_cache,
-            compressed_cache_scale,
-            topk_indices,
-            partial,
-            num_tokens,
-        )
-        prefill_tp_output_all_reduce(
+        if num_tokens > 0:
+            query_latent = pl.create_tensor([tokens, Q_LORA], dtype=pl.BF16)
+            q_proj_qr(x, wq_a, wq_a_scale, q_norm_weight, query_latent, num_tokens)
+            cache_ready = pl.system.task_dummy(deps=[])
+            indexer_completion = indexer(
+                x,
+                query_latent,
+                request_ids,
+                compressed_lens,
+                index_cache,
+                index_cache_scale,
+                index_block_table,
+                rope_cos,
+                rope_sin,
+                index_wq_b,
+                index_wq_b_scale,
+                index_weights_proj,
+                candidate_mask,
+                topk_indices,
+                num_tokens,
+                cache_ready,
+            )
+            prefill_c1a_partial(
+                x,
+                query_latent,
+                wq_b,
+                wq_b_scale,
+                wkv,
+                wkv_scale,
+                kv_norm_weight,
+                attn_sink,
+                wo_a,
+                wo_b,
+                wo_b_scale,
+                rope_cos,
+                rope_sin,
+                window_slots,
+                window_indices,
+                window_cache,
+                window_cache_scale,
+                compressed_cache,
+                compressed_cache_scale,
+                topk_indices,
+                partial,
+                num_tokens,
+            )
+        reducer(
             partial,
             output_window,
             output_arrived,

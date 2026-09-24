@@ -76,6 +76,42 @@ def grouped_output(
 
 
 @pl.jit.inline
+def prefill_grouped_output(
+    x: pl.Tensor[[T_DYN, LOCAL_H * HEAD_DIM], pl.BF16],
+    weight: pl.Tensor[[LOCAL_O_GROUPS, O_LORA, O_GROUP_IN], pl.BF16],
+    output: pl.Tensor[[T_DYN, LOCAL_O_WIDTH], pl.BF16],
+    num_tokens: pl.Scalar[pl.INT32],
+):
+    """Stage Wo-A values with Vector startup and FP32 Vector stores before narrowing."""
+    tokens = pl.tensor.dim(x, 0)
+    accumulated = pl.create_tensor([tokens, LOCAL_O_WIDTH], dtype=pl.FP32)
+    blocks = (num_tokens + M_TILE - 1) // M_TILE * (LOCAL_O_WIDTH // N_TILE)
+    with pl.spmd(blocks, name_hint="prefill_grouped_o_a_cube") as cube_tid:
+        block = pl.tile.get_block_idx()
+        t0 = block // (LOCAL_O_WIDTH // N_TILE) * M_TILE
+        n0 = block % (LOCAL_O_WIDTH // N_TILE) * N_TILE
+        group = n0 // O_LORA
+        local_n = n0 % O_LORA
+        rows = pl.min(M_TILE, num_tokens - t0)
+        acc = pl.create_tensor([M_TILE, N_TILE], dtype=pl.FP32)
+        for kb in pl.range(O_GROUP_IN // K_TILE):
+            k0 = kb * K_TILE
+            a = pl.slice(x, [M_TILE, K_TILE], [t0, group * O_GROUP_IN + k0], valid_shape=[rows, K_TILE])
+            a = pl.cast(pl.cast(a, pl.FP32), pl.BF16, mode="rint")
+            w = pl.reshape(weight[group : group + 1, local_n : local_n + N_TILE, k0 : k0 + K_TILE], [N_TILE, K_TILE])
+            acc = pl.matmul_acc(acc, a, w, b_trans=True, init_cond=(kb == 0))
+        accumulated[t0 : t0 + M_TILE, n0 : n0 + N_TILE] = pl.set_validshape(pl.mul(acc, 1.0), rows, N_TILE)
+    with pl.spmd(blocks, name_hint="prefill_grouped_o_a_cast", deps=[cube_tid]):
+        block = pl.tile.get_block_idx()
+        t0 = block // (LOCAL_O_WIDTH // N_TILE) * M_TILE
+        n0 = block % (LOCAL_O_WIDTH // N_TILE) * N_TILE
+        rows = pl.min(M_TILE, num_tokens - t0)
+        value = pl.slice(accumulated, [M_TILE, N_TILE], [t0, n0], valid_shape=[rows, N_TILE])
+        output[t0 : t0 + M_TILE, n0 : n0 + N_TILE] = pl.cast(value, pl.BF16, mode="rint")
+    return output
+
+
+@pl.jit.inline
 def grouped_output_with_deps(
     x: pl.Tensor[[T_DYN, LOCAL_H * HEAD_DIM], pl.BF16],
     weight: pl.Tensor[[LOCAL_O_GROUPS, O_LORA, O_GROUP_IN], pl.BF16],
@@ -153,7 +189,7 @@ _prefill_rotate_output = make_rope(
 )
 
 o_proj = _make_o_proj(_rotate_output, grouped_output, _project_ob)
-prefill_o_proj = _make_o_proj(_prefill_rotate_output, grouped_output, _project_ob)
+prefill_o_proj = _make_o_proj(_prefill_rotate_output, prefill_grouped_output, _project_ob)
 
 
 __all__ = [
@@ -161,5 +197,6 @@ __all__ = [
     "grouped_output_with_deps",
     "make_o_proj_with_deps",
     "o_proj",
+    "prefill_grouped_output",
     "prefill_o_proj",
 ]

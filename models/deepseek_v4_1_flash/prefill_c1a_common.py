@@ -30,7 +30,7 @@ from models.deepseek_v4_1_flash.config import (
     T_DYN,
     WINDOW_CACHE_GROUP,
 )
-from models.deepseek_v4_1_flash.o_proj import o_proj
+from models.deepseek_v4_1_flash.o_proj import prefill_o_proj
 from models.deepseek_v4_1_flash.qkv_proj_rope import kv_proj_rope, q_proj_rope
 
 M_TILE = 16
@@ -493,7 +493,7 @@ def prefill_c1a_partial(
         attended,
         num_tokens,
     )
-    o_proj(attended, wo_a, wo_b, wo_b_scale, rope_cos, rope_sin, output, num_tokens)
+    prefill_o_proj(attended, wo_a, wo_b, wo_b_scale, rope_cos, rope_sin, output, num_tokens)
     return output
 
 

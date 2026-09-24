@@ -21,7 +21,9 @@ from models.deepseek_v4_1_flash.config import (
     ROPE_DIM,
     T_DYN,
 )
-from models.deepseek_v4_1_flash.attention_ops import K_TILE, M_TILE, make_mx_projection, make_rope
+from models.deepseek_v4_1_flash.attention_ops import (
+    M_TILE, make_bf16_projection_staged, make_mx_projection, make_rope,
+)
 from models.deepseek_v4_1_flash.hierarchical_sparse_indexer import _hierarchical_sparse_indexer
 
 
@@ -41,6 +43,9 @@ project_index_query = make_mx_projection(Q_LORA, INDEX_H * INDEX_DIM)
 rotate_index_query = make_rope(INDEX_H, head_dim=INDEX_DIM, rope_dim=ROPE_DIM)
 
 
+_project_index_weights = make_bf16_projection_staged(D, INDEX_H)
+
+
 @pl.jit.inline
 def project_index_weights(
     x: pl.Tensor[[T_DYN, D], pl.BF16],
@@ -49,22 +54,14 @@ def project_index_weights(
     num_tokens: pl.Scalar[pl.INT32],
 ):
     """Project BF16 per-head weights with BF16 rounding before and after scaling."""
-    with pl.spmd((num_tokens + M_TILE - 1) // M_TILE, name_hint="c1a_index_weights") as weights_tid:
+    tokens = pl.tensor.dim(x, 0)
+    projected_weights = pl.create_tensor([tokens, INDEX_H], dtype=pl.BF16)
+    _project_index_weights(x, weight, projected_weights, num_tokens)
+    with pl.spmd((num_tokens + M_TILE - 1) // M_TILE, name_hint="c1a_index_weights_scale") as weights_tid:
         block = pl.tile.get_block_idx()
         token = block * M_TILE
         rows = pl.min(M_TILE, num_tokens - token)
-        accumulator = pl.create_tensor([M_TILE, INDEX_H], dtype=pl.FP32)
-        for width_block in pl.range(D // K_TILE):
-            offset = width_block * K_TILE
-            source = pl.slice(x, [M_TILE, K_TILE], [token, offset], valid_shape=[rows, K_TILE])
-            weights = weight[offset:offset + K_TILE, :]
-            accumulator = pl.matmul_acc(
-                accumulator,
-                source,
-                weights,
-                init_cond=(width_block == 0),
-            )
-        projected = pl.cast(accumulator, pl.BF16, mode="rint")
+        projected = pl.slice(projected_weights, [M_TILE, INDEX_H], [token, 0], valid_shape=[rows, INDEX_H])
         scaled = pl.mul(pl.cast(projected, pl.FP32), INDEX_SCORE_SCALE)
         rounded = pl.cast(scaled, pl.BF16, mode="rint")
         output[token:token + M_TILE, :] = pl.set_validshape(rounded, rows, INDEX_H)
@@ -301,7 +298,10 @@ def make_paged_indexer(use_candidates=False, direct_topk=False, max_logits_bytes
                         key_fp32 = pl.tile.transpose(scaled_transposed, 0, 1)
                         keys = pl.cast(pl.reshape(key_fp32, [INDEX_SCORE_TILE, INDEX_DIM]), pl.BF16, mode="rint")
                         query_row = token * INDEX_H
-                        query = pl.load(query_flat, [query_row, 0], [INDEX_H, INDEX_DIM])
+                        query = pl.load(
+                            query_flat, [query_row, 0], [INDEX_H, INDEX_DIM],
+                            target_memory=pl.MemorySpace.Vec,
+                        )
                         # Materialize ND layout before the A5 vector-to-cube NZ transfer.
                         keys_transposed = pl.tile.transpose(keys, 0, 1)
                         dot = pl.matmul(query, keys_transposed, out_dtype=pl.FP32)
