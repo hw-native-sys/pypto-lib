@@ -742,6 +742,8 @@ def run_prefill_c2a(make_program, mode, argv=None):
     parser.add_argument("--seed", type=int, default=17)
     parser.add_argument("--epochs", type=int, default=1, help="sublayer calls per dispatch; timing includes all epochs")
     parser.add_argument("--compile-only", action="store_true")
+    parser.add_argument("--checkpoint", default=None, help="official DeepSeek-V4.1-Flash checkpoint root")
+    parser.add_argument("--checkpoint-layer", type=int, default=None)
     args = parser.parse_args(argv)
 
     args.bench = os.environ.get("PYPTO_BENCH", "0") == "1"
@@ -763,9 +765,26 @@ def run_prefill_c2a(make_program, mode, argv=None):
         f"DP={args.dp} case={args.case} seed={args.seed} epochs/dispatch={args.epochs} devices={devices}"
     )
     initial_state = {}
+    specs = build_specs(args, mode, initial_state)
+    if args.checkpoint:
+        from models.deepseek_v4_1_flash.prefill_checkpoint_weights import (
+            PrefillCheckpoint,
+            bind_checkpoint_weights,
+        )
+
+        layer_id = args.checkpoint_layer
+        if layer_id is None:
+            layer_id = 2 if mode == "full" else 3
+        checkpoint = PrefillCheckpoint(args.checkpoint)
+        weights = (
+            checkpoint.c2a_full_weights(layer_id, len(devices))
+            if mode == "full" else checkpoint.c2a_reuse_weights(layer_id, len(devices))
+        )
+        bind_checkpoint_weights(specs, weights)
+        print(f"[C2A-HC] checkpoint layer={layer_id} root={args.checkpoint}")
     result = run(
         fn=make_program(C.PREFILL_MAX_TOKENS, len(devices), args.epochs),
-        specs=build_specs(args, mode, initial_state),
+        specs=specs,
         golden_fn=make_golden(mode, args.epochs),
         compile_only=args.compile_only,
         config=dict(
