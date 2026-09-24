@@ -193,7 +193,52 @@ def golden_prefill_attn_c1a_full(
     )
 
 
-def make_prefill_attn_c1a_full(indexer):
+@pl.jit.inline(auto_scope=False)
+def publish_c1a_global_kv(
+    x: pl.Tensor[[C.T_DYN, C.D], pl.BF16],
+    compressed_rope_cos: pl.Tensor[[C.T_DYN, C.ROPE_DIM // 2], pl.FP32],
+    compressed_rope_sin: pl.Tensor[[C.T_DYN, C.ROPE_DIM // 2], pl.FP32],
+    compressor_wkv: pl.Tensor[[C.D, C.HEAD_DIM], pl.BF16],
+    compressor_norm_weight: pl.Tensor[[C.HEAD_DIM], pl.BF16],
+    compressed_slots: pl.Tensor[[C.T_DYN], pl.INT64],
+    index_wk: pl.Tensor[[C.HEAD_DIM, C.INDEX_DIM], pl.BF16],
+    index_norm_weight: pl.Tensor[[C.INDEX_DIM], pl.BF16],
+    compressed_cache: pl.Tensor[[C.CMP_BLOCKS_DYN, 128, 1, C.HEAD_DIM // 2], pl.UINT8],
+    compressed_cache_scale: pl.Tensor[
+        [C.CMP_BLOCKS_DYN, 128, 1, C.HEAD_DIM // C.COMPRESSED_CACHE_GROUP], pl.FP8E4M3FN
+    ],
+    index_cache: pl.Tensor[[C.INDEX_BLOCKS_DYN, 128, 1, C.INDEX_DIM // 2], pl.UINT8],
+    index_cache_scale: pl.Tensor[
+        [C.INDEX_BLOCKS_DYN, 128, 1, C.INDEX_DIM // C.INDEX_CACHE_GROUP], pl.FP8E8M0
+    ],
+    num_tokens: pl.Scalar[pl.INT32],
+):
+    """Publish ratio-one global KV and index K from the final encoder stream."""
+    tokens = pl.tensor.dim(x, 0)
+    compressed_projection = pl.create_tensor([tokens, HEAD_DIM], dtype=pl.BF16)
+    project_compressed(x, compressor_wkv, compressed_projection, num_tokens)
+    compressed_latent = pl.create_tensor([tokens, HEAD_DIM], dtype=pl.BF16)
+    normalize_compressed(compressed_projection, compressor_norm_weight, compressed_latent, num_tokens)
+    compressed_rotated = pl.create_tensor([tokens, HEAD_DIM], dtype=pl.BF16)
+    rotate_compressed(
+        compressed_latent, compressed_rope_cos, compressed_rope_sin, compressed_rotated, num_tokens
+    )
+    publish_compressed_cache(
+        compressed_rotated, compressed_slots, compressed_cache, compressed_cache_scale, num_tokens
+    )
+    index_projection = pl.create_tensor([tokens, INDEX_DIM], dtype=pl.BF16)
+    project_index_key(compressed_latent, index_wk, index_projection, num_tokens)
+    index_normalized = pl.create_tensor([tokens, INDEX_DIM], dtype=pl.BF16)
+    normalize_index_key(index_projection, index_norm_weight, index_normalized, num_tokens)
+    index_rotated = pl.create_tensor([tokens, INDEX_DIM], dtype=pl.BF16)
+    rotate_index_key(index_normalized, compressed_rope_cos, compressed_rope_sin, index_rotated, num_tokens)
+    return publish_index_cache(
+        index_rotated, compressed_slots, index_cache, index_cache_scale, num_tokens
+    )
+
+
+
+def make_prefill_attn_c1a_full(indexer, *, publish_global=True):
     @pl.jit.inline(auto_scope=False)
     def prefill_attn_c1a_full_impl(
         x: pl.Tensor[[C.T_DYN, C.D], pl.BF16],
@@ -249,50 +294,17 @@ def make_prefill_attn_c1a_full(indexer):
         """Publish ratio-1 caches, select sparse rows, and compute packed C1A."""
         tokens = pl.tensor.dim(x, 0)
 
-        compressed_projection = pl.create_tensor([tokens, HEAD_DIM], dtype=pl.BF16)
-        project_compressed(x, compressor_wkv, compressed_projection, num_tokens)
-        compressed_latent = pl.create_tensor([tokens, HEAD_DIM], dtype=pl.BF16)
-        normalize_compressed(
-            compressed_projection,
-            compressor_norm_weight,
-            compressed_latent,
-            num_tokens,
-        )
-        compressed_rotated = pl.create_tensor([tokens, HEAD_DIM], dtype=pl.BF16)
-        rotate_compressed(
-            compressed_latent,
-            compressed_rope_cos,
-            compressed_rope_sin,
-            compressed_rotated,
-            num_tokens,
-        )
-        publish_compressed_cache(
-            compressed_rotated,
-            compressed_slots,
-            compressed_cache,
-            compressed_cache_scale,
-            num_tokens,
-        )
-
-        index_projection = pl.create_tensor([tokens, INDEX_DIM], dtype=pl.BF16)
-        project_index_key(compressed_latent, index_wk, index_projection, num_tokens)
-        index_normalized = pl.create_tensor([tokens, INDEX_DIM], dtype=pl.BF16)
-        normalize_index_key(index_projection, index_norm_weight, index_normalized, num_tokens)
-        index_rotated = pl.create_tensor([tokens, INDEX_DIM], dtype=pl.BF16)
-        rotate_index_key(
-            index_normalized,
-            compressed_rope_cos,
-            compressed_rope_sin,
-            index_rotated,
-            num_tokens,
-        )
-        index_ready = publish_index_cache(
-            index_rotated,
-            compressed_slots,
-            index_cache,
-            index_cache_scale,
-            num_tokens,
-        )
+        if publish_global:
+            index_ready = publish_c1a_global_kv(
+                x, compressed_rope_cos, compressed_rope_sin, compressor_wkv,
+                compressor_norm_weight, compressed_slots, index_wk, index_norm_weight,
+                compressed_cache, compressed_cache_scale, index_cache, index_cache_scale,
+                num_tokens,
+            )
+        else:
+            # The encoder-stream publisher has finished in an earlier device
+            # dispatch. This task ID anchors the indexer's local dependency DAG.
+            index_ready = pl.system.task_dummy(deps=[])
 
         query_latent = pl.create_tensor([tokens, Q_LORA], dtype=pl.BF16)
         q_proj_qr(x, wq_a, wq_a_scale, q_norm_weight, query_latent, num_tokens)
@@ -357,6 +369,7 @@ def make_prefill_attn_c1a_full(indexer):
 
 prefill_attn_c1a_full = make_prefill_attn_c1a_full(paged_indexer)
 prefill_attn_c1a_full_watch = make_prefill_attn_c1a_full(paged_indexer_direct)
+prefill_attn_c1a_seeded = make_prefill_attn_c1a_full(paged_indexer, publish_global=False)
 
 
 @pl.jit
@@ -425,7 +438,13 @@ def prefill_attn_c1a_full_test(
     tp_rank: pl.Scalar[pl.INT32],
     num_tokens: pl.Scalar[pl.INT32],
 ):
-    return prefill_attn_c1a_full(
+    publish_c1a_global_kv(
+        x, compressed_rope_cos, compressed_rope_sin, compressor_wkv,
+        compressor_norm_weight, compressed_slots, index_wk, index_norm_weight,
+        compressed_cache, compressed_cache_scale, index_cache, index_cache_scale,
+        num_tokens,
+    )
+    return prefill_attn_c1a_seeded(
         x, wq_a, wq_a_scale, q_norm_weight, wq_b, wq_b_scale, wkv, wkv_scale,
         kv_norm_weight, attn_sink, wo_a, wo_b, wo_b_scale, rope_cos, rope_sin,
         window_slots, window_indices, window_cache, window_cache_scale,

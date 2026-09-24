@@ -61,6 +61,7 @@ PREFILL_ATTN_RING_HEAP = (1024 * 1024 * 1024,) * 4
 @pl.jit.inline(auto_scope=False)
 def prefill_swa(
     x_hc: pl.Tensor[[T_DYN, HC_MULT, D], pl.FP32],
+    pre_mix: pl.Tensor[[T_DYN, HC_MULT], pl.FP32],
     hc_attn_fn: pl.Tensor[[MIX_HC, HC_DIM], pl.FP32],
     hc_attn_scale: pl.Tensor[[3], pl.FP32],
     hc_attn_base: pl.Tensor[[MIX_HC], pl.FP32],
@@ -87,23 +88,23 @@ def prefill_swa(
     output_arrived: pld.DistributedTensor[[TP_SIZE, 1], pl.INT32],
     hidden: pl.Tensor[[T_DYN, D], pl.BF16],
     attn_out: pl.Tensor[[T_DYN, D], pl.BF16],
+    next_pre_mix: pl.Tensor[[T_DYN, HC_MULT], pl.FP32],
     output: pl.Tensor[[T_DYN, HC_MULT, D], pl.FP32],
     group_base: pl.Scalar[pl.INT32],
     tp_rank: pl.Scalar[pl.INT32],
     num_tokens: pl.Scalar[pl.INT32],
     attention_epoch: pl.Scalar[pl.INT32],
 ):
-    """Collapse HC streams, run packed SWA, then expand the residual.
+    """Collapse with the previous sublayer's mix, run SWA, then expand the residual.
 
     ``hidden`` (the collapsed attention input) and ``attn_out`` (the TP-reduced attention
-    output) are caller workspace, so each stage can be validated on its own input.
+    output) are caller workspace. ``next_pre_mix`` feeds this layer's FFN sublayer.
     """
     tokens = pl.tensor.dim(x_hc, 0)
-    pre_mix = pl.create_tensor([tokens, HC_MULT], dtype=pl.FP32)
     post_mix = pl.create_tensor([tokens, HC_MULT], dtype=pl.FP32)
     residual_mix = pl.create_tensor([tokens, HC_MULT, HC_MULT], dtype=pl.FP32)
     normalized_hidden = pl.create_tensor([tokens, D], dtype=pl.BF16)
-    mhc_mixes(x_hc, hc_attn_fn, hc_attn_scale, hc_attn_base, pre_mix, post_mix, residual_mix)
+    mhc_mixes(x_hc, hc_attn_fn, hc_attn_scale, hc_attn_base, next_pre_mix, post_mix, residual_mix)
     mhc_pre(x_hc, pre_mix, hidden)
     rms_norm(hidden, attn_norm_weight, normalized_hidden)
     prefill_attn_swa(
@@ -119,6 +120,7 @@ def prefill_swa(
 
 def golden_prefill_swa(
     x_hc: torch.Tensor,
+    pre_mix: torch.Tensor,
     hc_attn_fn: torch.Tensor,
     hc_attn_scale: torch.Tensor,
     hc_attn_base: torch.Tensor,
@@ -141,9 +143,9 @@ def golden_prefill_swa(
     window_indices: torch.Tensor,
     window_cache: torch.Tensor,
     window_cache_scale: torch.Tensor,
-) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    """HC mixes, collapse, normalize, SWA, then residual expansion."""
-    pre_mix, post_mix, residual_mix = golden_mhc_mixes(x_hc, hc_attn_fn, hc_attn_scale, hc_attn_base)
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Use the delayed input mix while producing the next mix for the FFN."""
+    next_pre_mix, post_mix, residual_mix = golden_mhc_mixes(x_hc, hc_attn_fn, hc_attn_scale, hc_attn_base)
     hidden = golden_mhc_pre(x_hc, pre_mix)
     normalized_hidden = golden_rms_norm(hidden, attn_norm_weight)
     result = golden_swa_attention(
@@ -153,11 +155,11 @@ def golden_prefill_swa(
         window_slots, window_indices, window_cache, window_cache_scale,
     )
     output = golden_mhc_post(result.output.to(torch.bfloat16), x_hc, post_mix, residual_mix)
-    return output, result.window_cache, result.window_cache_scale
+    return output, next_pre_mix, result.window_cache, result.window_cache_scale
 
 
 HC_INPUT_NAMES = (
-    "x_hc", "hc_attn_fn", "hc_attn_scale", "hc_attn_base", "attn_norm_weight",
+    "x_hc", "pre_mix", "hc_attn_fn", "hc_attn_scale", "hc_attn_base", "attn_norm_weight",
     "wq_a", "wq_a_scale", "q_norm_weight", "wq_b", "wq_b_scale", "wkv", "wkv_scale",
     "kv_norm_weight", "attn_sink", "wo_a", "wo_b", "wo_b_scale", "rope_cos", "rope_sin",
     "window_slots", "window_indices", "window_cache", "window_cache_scale",
@@ -171,6 +173,7 @@ def make_hc_inputs(base: dict, seed: int) -> dict:
     values = dict(base)
     values.pop("x")
     values["x_hc"] = torch.randn(tokens, HC_MULT, D, generator=gen)
+    values["pre_mix"] = torch.sigmoid(torch.randn(tokens, HC_MULT, generator=gen))
     values["hc_attn_fn"] = torch.randn(MIX_HC, HC_DIM, generator=gen) / math.sqrt(HC_DIM)
     values["hc_attn_scale"] = torch.randn(3, generator=gen)
     values["hc_attn_base"] = torch.randn(MIX_HC, generator=gen)
@@ -185,6 +188,7 @@ def make_hc_program(capacity, world_size, epochs):
     @pl.jit
     def swa_rank(
         x_hc: pl.Tensor[[T_DYN, HC_MULT, D], pl.FP32],
+        pre_mix: pl.Tensor[[T_DYN, HC_MULT], pl.FP32],
         hc_attn_fn: pl.Tensor[[MIX_HC, HC_DIM], pl.FP32],
         hc_attn_scale: pl.Tensor[[3], pl.FP32],
         hc_attn_base: pl.Tensor[[MIX_HC], pl.FP32],
@@ -210,6 +214,7 @@ def make_hc_program(capacity, world_size, epochs):
         output: pl.Out[pl.Tensor[[T_DYN, HC_MULT, D], pl.FP32]],
         hidden: pl.Out[pl.Tensor[[T_DYN, D], pl.BF16]],
         attn_out: pl.Out[pl.Tensor[[T_DYN, D], pl.BF16]],
+        next_pre_mix: pl.Out[pl.Tensor[[T_DYN, HC_MULT], pl.FP32]],
         output_window: pld.DistributedTensor[[capacity, D], pl.FP32],
         output_arrived: pld.DistributedTensor[[TP_SIZE, 1], pl.INT32],
         rank: pl.Scalar[pl.INT32],
@@ -221,18 +226,19 @@ def make_hc_program(capacity, world_size, epochs):
         window_cache.bind_dynamic(0, ORI_BLOCKS_DYN)
         for step in pl.range(epochs):
             prefill_swa(
-                x_hc, hc_attn_fn, hc_attn_scale, hc_attn_base, attn_norm_weight,
+                x_hc, pre_mix, hc_attn_fn, hc_attn_scale, hc_attn_base, attn_norm_weight,
                 wq_a, wq_a_scale, q_norm_weight, wq_b, wq_b_scale,
                 wkv, wkv_scale, kv_norm_weight, attn_sink, wo_a, wo_b, wo_b_scale,
                 rope_cos, rope_sin, window_slots, window_indices, window_cache, window_cache_scale,
-                output_window, output_arrived, hidden, attn_out, output,
+                output_window, output_arrived, hidden, attn_out, next_pre_mix, output,
                 rank // TP_SIZE * TP_SIZE, rank % TP_SIZE, num_tokens, attention_epoch + step,
             )
-        return output, hidden, attn_out, window_cache, window_cache_scale
+        return output, hidden, attn_out, next_pre_mix, window_cache, window_cache_scale
 
     @pl.jit.host
     def swa_group(
         x_hc: pl.Tensor[[world_size, T_DYN, HC_MULT, D], pl.FP32],
+        pre_mix: pl.Tensor[[world_size, T_DYN, HC_MULT], pl.FP32],
         hc_attn_fn: pl.Tensor[[world_size, MIX_HC, HC_DIM], pl.FP32],
         hc_attn_scale: pl.Tensor[[world_size, 3], pl.FP32],
         hc_attn_base: pl.Tensor[[world_size, MIX_HC], pl.FP32],
@@ -258,6 +264,7 @@ def make_hc_program(capacity, world_size, epochs):
         output: pl.Out[pl.Tensor[[world_size, T_DYN, HC_MULT, D], pl.FP32]],
         hidden: pl.Out[pl.Tensor[[world_size, T_DYN, D], pl.BF16]],
         attn_out: pl.Out[pl.Tensor[[world_size, T_DYN, D], pl.BF16]],
+        next_pre_mix: pl.Out[pl.Tensor[[world_size, T_DYN, HC_MULT], pl.FP32]],
         num_tokens: pl.Scalar[pl.INT32],
         attention_epoch: pl.Scalar[pl.INT32],
     ):
@@ -277,12 +284,14 @@ def make_hc_program(capacity, world_size, epochs):
             wkv_scale_r: pl.Tensor[[D // 32, HEAD_DIM], pl.FP8E8M0, pl.MX_B_NN] = wkv_scale[rank]
             wo_b_scale_r: pl.Tensor[[LOCAL_O_WIDTH // 32, D], pl.FP8E8M0, pl.MX_B_NN] = wo_b_scale[rank]
             swa_rank(
-                x_hc[rank], hc_attn_fn[rank], hc_attn_scale[rank], hc_attn_base[rank], attn_norm_weight[rank],
+                x_hc[rank], pre_mix[rank], hc_attn_fn[rank], hc_attn_scale[rank], hc_attn_base[rank],
+                attn_norm_weight[rank],
                 wq_a[rank], wq_a_scale_r, q_norm_weight[rank], wq_b[rank], wq_b_scale_r,
                 wkv[rank], wkv_scale_r, kv_norm_weight[rank], attn_sink[rank],
                 wo_a[rank], wo_b[rank], wo_b_scale_r, rope_cos[rank], rope_sin[rank],
                 window_slots[rank], window_indices[rank], window_cache[rank], window_cache_scale[rank],
-                output[rank], hidden[rank], attn_out[rank], data, signal, rank, num_tokens, attention_epoch,
+                output[rank], hidden[rank], attn_out[rank], next_pre_mix[rank], data, signal,
+                rank, num_tokens, attention_epoch,
                 device=rank,
             )
 
@@ -306,7 +315,7 @@ def build_hc_specs(args):
     else:
         pages = args.tokens + 1
     shapes = (
-        [args.tokens, HC_MULT, D], [MIX_HC, HC_DIM], [3], [MIX_HC], [D],
+        [args.tokens, HC_MULT, D], [args.tokens, HC_MULT], [MIX_HC, HC_DIM], [3], [MIX_HC], [D],
         [D, Q_LORA], [D // 32, Q_LORA], [Q_LORA],
         [Q_LORA, LOCAL_H * HEAD_DIM], [Q_LORA // 32, LOCAL_H * HEAD_DIM],
         [D, HEAD_DIM], [D // 32, HEAD_DIM], [HEAD_DIM], [LOCAL_H],
@@ -315,7 +324,7 @@ def build_hc_specs(args):
         [pages, 128, 1, HEAD_DIM], [pages, 128, 1, HEAD_DIM // 32],
     )
     bf, fp, mx = torch.bfloat16, torch.float8_e4m3fn, torch.float8_e8m0fnu
-    dtypes = (torch.float32, torch.float32, torch.float32, torch.float32, torch.bfloat16,
+    dtypes = (torch.float32, torch.float32, torch.float32, torch.float32, torch.float32, torch.bfloat16,
               fp, mx, bf, fp, mx, fp, mx, bf, torch.float32, bf, fp, mx,
               torch.float32, torch.float32, torch.int64, torch.int32, fp, mx)
     values = {}
@@ -340,7 +349,7 @@ def build_hc_specs(args):
                         value["attn_sink"].fill_(1000)
                 ranks.append(make_hc_inputs(value, seed))
             replicated = (
-                "x_hc", "hc_attn_fn", "hc_attn_scale", "hc_attn_base",
+                "x_hc", "pre_mix", "hc_attn_fn", "hc_attn_scale", "hc_attn_base",
                 "attn_norm_weight",
                 "wq_a", "wq_a_scale", "q_norm_weight", "wkv", "wkv_scale",
                 "kv_norm_weight", "rope_cos", "rope_sin", "window_slots", "window_indices",
@@ -360,6 +369,7 @@ def build_hc_specs(args):
     specs += [TensorSpec("output", [world_size, args.tokens, HC_MULT, D], torch.float32, resident="stacked"),
               TensorSpec("hidden", [world_size, args.tokens, D], bf, resident="stacked"),
               TensorSpec("attn_out", [world_size, args.tokens, D], bf, resident="stacked"),
+              TensorSpec("next_pre_mix", [world_size, args.tokens, HC_MULT], torch.float32, resident="stacked"),
               ScalarSpec("num_tokens", torch.int32, args.tokens),
               ScalarSpec("attention_epoch", torch.int32, 1, compile_runtime=True,
                          benchmark_step=args.epochs if args.bench else None)]
@@ -373,7 +383,7 @@ def reference_attention(tensors, hidden, base):
     partials, caches = [], []
     for rank in range(base, base + TP_SIZE):
         inputs = {name: tensors[name][rank] for name in HC_INPUT_NAMES if name not in (
-            "x_hc", "hc_attn_fn", "hc_attn_scale", "hc_attn_base", "attn_norm_weight",
+            "x_hc", "pre_mix", "hc_attn_fn", "hc_attn_scale", "hc_attn_base", "attn_norm_weight",
         )}
         inputs["x"] = hidden
         partial, cache, scale = official_reference(inputs)
@@ -386,11 +396,11 @@ def golden_prefill_swa_case(tensors):
     """Reference each TP shard independently, reduce, then expand HC residuals."""
     world_size = tensors["x_hc"].shape[0]
     for base in range(0, world_size, TP_SIZE):
-        pre_mix, post_mix, residual_mix = golden_mhc_mixes(
+        next_pre_mix, post_mix, residual_mix = golden_mhc_mixes(
             tensors["x_hc"][base], tensors["hc_attn_fn"][base],
             tensors["hc_attn_scale"][base], tensors["hc_attn_base"][base],
         )
-        hidden = golden_mhc_pre(tensors["x_hc"][base], pre_mix)
+        hidden = golden_mhc_pre(tensors["x_hc"][base], tensors["pre_mix"][base])
         normalized_hidden = golden_rms_norm(hidden, tensors["attn_norm_weight"][base])
         reduced, caches = reference_attention(tensors, normalized_hidden, base)
         for rank, (cache, scale) in enumerate(caches, base):
@@ -400,6 +410,7 @@ def golden_prefill_swa_case(tensors):
         group = slice(base, base + TP_SIZE)
         tensors["hidden"][group].copy_(hidden.unsqueeze(0).expand(TP_SIZE, -1, -1))
         tensors["attn_out"][group].copy_(reduced.unsqueeze(0).expand(TP_SIZE, -1, -1))
+        tensors["next_pre_mix"][group].copy_(next_pre_mix.unsqueeze(0).expand(TP_SIZE, -1, -1))
         tensors["output"][group].copy_(output.unsqueeze(0).expand(TP_SIZE, -1, -1, -1))
 
 
@@ -487,12 +498,16 @@ def make_staged_compare():
             passed &= replicated(actual, base)
         return passed, "hc_post replay within hc_post's budget per token row; end-to-end rel L2 <= 1%"
 
+    def compare_next_pre_mix(actual, expected, **kwargs):
+        return bf16_close(actual, expected, **kwargs)
+
     return {
         "hidden": compare_hidden,
         "attn_out": compare_attn_out,
         "window_cache": staged("window_cache", compare_distributed_cache),
         "window_cache_scale": staged("window_cache_scale", compare_scales),
         "output": compare_hc_output,
+        "next_pre_mix": compare_next_pre_mix,
     }
 
 
@@ -514,6 +529,8 @@ def run_prefill_swa(argv=None):
     parser.add_argument("--requests", type=int, help="packed requests; default min(tokens, 4)")
     parser.add_argument("--case", default="mixed", choices=["mixed", "prefix", "shuffle", "masked", "zero", "sink"])
     parser.add_argument("--seed", type=int, default=17)
+    parser.add_argument("--checkpoint", help="official V4.1-Flash checkpoint root for real layer weights")
+    parser.add_argument("--checkpoint-layer", type=int, default=0, choices=(0, 1))
     parser.add_argument("--epochs", type=int, default=1, help="operator calls per dispatch; timing includes all epochs")
     parser.add_argument("--compile-only", action="store_true")
     parser.add_argument("--save-data", action="store_true")
@@ -536,9 +553,20 @@ def run_prefill_swa(argv=None):
     torch.set_num_threads(8)
     print(f"[SWA+HC] tokens={args.tokens} requests={args.requests} TP={TP_SIZE} DP={args.dp} "
           f"case={args.case} seed={args.seed} devices={devices}")
+    specs = build_hc_specs(args)
+    if args.checkpoint:
+        from models.deepseek_v4_1_flash.prefill_checkpoint_weights import (
+            PrefillCheckpoint,
+            bind_checkpoint_weights,
+        )
+
+        bind_checkpoint_weights(
+            specs, PrefillCheckpoint(args.checkpoint).swa_attention_weights(args.checkpoint_layer, len(devices))
+        )
+        print(f"[SWA+HC] loaded checkpoint attention weights for layer {args.checkpoint_layer}")
     result = run(
         fn=make_hc_program(PREFILL_MAX_TOKENS, len(devices), args.epochs),
-        specs=build_hc_specs(args),
+        specs=specs,
         golden_fn=golden_prefill_swa_case,
         compile_only=args.compile_only,
         save_data=args.save_data,
