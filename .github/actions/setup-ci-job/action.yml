@@ -8,8 +8,8 @@ description: >-
   a per-job venv + activate.sh, and a from-source build/install of
   pypto + simpler. Simpler's own installer resolves the pinned pto-isa checkout
   (pypto's runtime/pto_isa.pin is the single source of truth), so this action
-  never clones it. The device jobs differ only in that they additionally check the
-  NPU and source CANN's set_env.sh — see the needs-device input.
+  never clones it. The device jobs differ only in that they additionally source
+  CANN's set_env.sh — see the needs-device input.
 
   Unlike pypto (which builds itself), pypto-lib builds against a separate pypto
   clone kept in a per-job ci-cache/pypto-src-<build-namespace> dir (concurrent
@@ -44,7 +44,7 @@ description: >-
   elsewhere symlinks /opt/pypto at them.
 
   Beyond those, the host is expected to provide (by name, not by path):
-  task-submit / npu-smi / ccache / git / curl on PATH, and — on the conda path
+  task-submit / ccache / git / curl on PATH, and — on the conda path
   only — a conda env `py310-lib` under CONDA_ROOT. The `.env` makes the
   *locations* portable; these names are the provisioning contract a runner has to
   satisfy to be usable at all.
@@ -101,11 +101,11 @@ inputs:
     required: true
   needs-device:
     description: >-
-      When 'true' the job talks to an NPU: verify a card is visible (npu-smi) and
-      have activate.sh source CANN's set_env.sh, which wires up the Ascend/HCCL
-      host environment. When 'false' (the simulator jobs) both are skipped and
-      CANN_ROOT is not required in the runner config — the simulator needs no
-      driver, no card and no Ascend env.
+      When 'true' the job talks to an NPU: have activate.sh source CANN's
+      set_env.sh, which wires up the Ascend/HCCL host environment. When 'false'
+      (the simulator jobs) CANN setup is skipped and CANN_ROOT is not required in
+      the runner config — the simulator needs no driver, no card and no Ascend
+      env.
     required: false
     default: 'false'
   toolchain:
@@ -415,52 +415,6 @@ runs:
           echo "PTO_ISA_COMMIT=$(tr -d '[:space:]' < "$PYPTO_SRC/runtime/pto_isa.pin")"
         } >> "$GITHUB_ENV"
 
-    - name: Check NPU
-      if: ${{ inputs.needs-device == 'true' }}
-      shell: bash
-      # Since the A5 host's driver upgrade its device nodes are
-      # `crw-rw---- HwHiAiUser:HwHiAiUser`, and the CI user is not in that
-      # group. dcmi_init then cannot open the character device, and npu-smi
-      # exits 187 with "dcmi module initialize failed. ret is -8005" — which
-      # reads like a missing DCMI component but is plain permission denial
-      # (npu-smi lists "Failed to open the character device" among its own
-      # candidate causes). task-submit drops privileges into the HwHiAiUser
-      # group, which is how every model run reaches a card in the first place.
-      #
-      # Direct first: on hosts whose nodes are still world-readable it works,
-      # and the check then costs no device lease and no queue wait.
-      run: |
-        rc=0
-        npu-smi info || rc=$?
-        if [ "$rc" -eq 0 ]; then
-          exit 0
-        fi
-        echo "npu-smi failed directly (exit $rc); the device nodes are likely"
-        echo "group-restricted. Retrying through task-submit ..."
-        # The payload ends on `rc=$?; exit $rc` rather than on `npu-smi info`:
-        # with the probe as the bare last command task-submit reports 215 even
-        # though npu-smi returned 0 (reproduced 3/3 on an A5 host). Setting the
-        # status explicitly makes the outer code npu-smi's own — verified to
-        # pass 0, 9 and 127 through unchanged.
-        #
-        # NPUSMI_RC is a sentinel that separates the two ways this can fail.
-        # task-submit leases a real card, so a busy queue makes it give up on
-        # the wait and exit 1 having never run anything — that says nothing
-        # about the NPU and must not fail a diagnostic step. If the sentinel is
-        # present the probe really ran, and its status is authoritative.
-        rc=0
-        out=$(task-submit --device "${DEVICE_ID:-auto}" --timeout 240 --max-time 60 \
-          --run 'npu-smi info; rc=$?; echo "NPUSMI_RC=$rc"; exit $rc' 2>&1) || rc=$?
-        printf '%s\n' "$out"
-        if ! printf '%s' "$out" | grep -q 'NPUSMI_RC='; then
-          echo "::warning::Could not obtain a card from the device queue within"
-          echo "the wait, so the NPU was never probed. Continuing — every model"
-          echo "run goes through task-submit and will fail loudly if no device"
-          echo "is actually available."
-          exit 0
-        fi
-        exit "$rc"
-
     # Namespace the cache by pto-isa commit so a pto-isa bump can never serve
     # stale objects compiled against the old ISA headers (see issue #1139):
     # a different commit hashes to a different key, forcing a real recompile.
@@ -479,8 +433,8 @@ runs:
       working-directory: ${{ inputs.checkout-path }}
       env:
         NEEDS_DEVICE: ${{ inputs.needs-device }}
-        # Part of the runner's provisioning contract, like having task-submit and
-        # npu-smi on PATH: the host is expected to provide a conda env under this
+        # Part of the runner's provisioning contract, like having task-submit on
+        # PATH: the host is expected to provide a conda env under this
         # name. CONDA_ROOT says where conda lives; this says which env to use, and
         # `python -m venv --system-site-packages` below layers the per-job venv on
         # it, so its site-packages are an implicit dependency of every build here.
