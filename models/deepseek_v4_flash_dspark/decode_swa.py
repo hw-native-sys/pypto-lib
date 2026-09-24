@@ -484,7 +484,8 @@ def _decode_swa_tp1(
     # the ABI for host admission and golden semantics only.
     t_dim = pl.tensor.dim(x_hc, 0)
     bias_blocks = t_dim // BIAS_T_TILE
-    post_t = pl.create_tensor([t_dim, HC_MULT], dtype=pl.FP32)
+    # split_pre_post -> hc_post is covered by x_normed_t -> attn_out.
+    post_t = pl.create_tensor([t_dim, HC_MULT], dtype=pl.FP32, manual_dep=True)
     comb_t = pl.create_tensor([t_dim, HC_MULT * HC_MULT], dtype=pl.FP32)
     x_normed_t = pl.create_tensor([t_dim, D], dtype=pl.BF16)
     rms_tid = hc_pre_norm(
