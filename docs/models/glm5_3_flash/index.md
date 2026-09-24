@@ -350,6 +350,49 @@ Phase one is streams A-E: **269-434 engineer-days** across five owners, before a
 | `mhc_post` | ADAPT | S | 1.5-3 | `mhc_pre`, `mhc_mixes` |
 | `mhc_head` | ADAPT | S | 1-2 | `mhc_post` |
 
+#### What front-packed `topk_indices` costs `indexer_expand`
+
+Both sparse attention kernels test **one lane** to conclude that a 128-wide block,
+or a whole row, carries no selection, so `indexer_expand` owes them a front-packed
+row: every valid position first, `-1` as one suffix, never between two live entries.
+That contract is stated on `indexer_expand` in both indexer files. This section is
+the other half — how the expansion has to be written to honour it, and why the
+obvious layout does not.
+
+The width invites the wrong answer. `TOPK_INDEX_WIDTH` = 2051 is
+`index_topk + index_kpool - 1`, which reads as "512 pools x 4 rows, then up to 3 tail
+rows at 2048", and a fixed-offset expansion following that reading puts a gap of `-1`
+between the expanded pools and the always-selected tail whenever a query has fewer
+than 512 live pools. **The tail belongs at `4 * live_pools`, not at 2048**, so the
+expansion keeps a per-row write cursor — a prefix count over the 512 selections —
+rather than a static layout. 2051 stays the correct width: it is reached when 512
+full pools and a 3-row tail are all live.
+
+The fixed-offset layout is wrong in a way that hides well, which is the reason to
+name it here. A gap that starts mid-block is still handled correctly by the
+consumers — the block holding the boundary has a live lane 0, so it is entered and
+its `-1` lanes are masked per lane, and every fully-padding block after it is
+skipped because it is genuinely all padding. The failure is narrower: a request with
+`kv_len < index_kpool` has no complete pool at all, so lane 0 is `-1` while the tail
+rows sit at 2048. Both kernels then take their row-level short-circuit and emit a
+zero row, dropping a tail that is the request's entire visible context. It is the
+first decode step of a 1-3 token prompt, it is legal, and no fixture in the tree
+covers it.
+
+Two consequences for the neighbouring work items:
+
+- `indexer_topk512` needs no extra work for this. The donor's `_cp_topk512_query`
+  already fills the row with `-1` and then writes only `min(visible_count, K)` lanes
+  from the score-sorted pairs, so its padding is a suffix by construction.
+- `indexer_share_mtp` saves less than it looks. The `1 + MTP_SPEC_TOKENS` rows of a
+  request share a selection, but their `kv_len` differ by up to 3, so `tail_count`
+  and the write cursor are per row. Sharing removes the scoring and the top-k, not
+  the expansion.
+
+A padded row in a packed decode batch — one that owns no cache slot — expands to an
+all-`-1` row, and that is the only case in which the consumers' row-level
+short-circuit is meant to fire.
+
 ### Stream D — MoE, primitives, output head, MTP
 
 *43 sparse layers, 3 dense layers, the draft step · 12 files · 14 work items · 61-100 engineer-days*
