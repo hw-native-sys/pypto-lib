@@ -358,7 +358,7 @@ def sparse_attn_hca(
 
     with pl.scope():
         cmp_work_kv = pl.create_tensor([cmp_gather_count * CMP_ATTN_K_TILE, HEAD_DIM], dtype=pl.BF16)
-        # Each gather item has one writer and owns whole 64-byte lines for scalar mask stores.
+        # Each gather item publishes a complete KV tile and validity row.
         cmp_work_valid = pl.create_tensor([cmp_gather_count, CMP_ATTN_K_TILE], dtype=pl.FP32)
         cmp_gather_blocks = cmp_gather_count
         if cmp_table_blocks >= 8:
@@ -375,33 +375,22 @@ def sparse_attn_hca(
                 gather_work = gather_item - gather_request * cmp_work_count
                 gather_first_col = gather_work * CMP_PAGES_PER_WORK
                 gather_dst0 = gather_item * CMP_ATTN_K_TILE
+                gather_tile = pl.tile.full([CMP_ATTN_K_TILE, HEAD_DIM], dtype=pl.BF16, value=0.0)
+                gather_mask = pl.tile.full([1, CMP_ATTN_K_TILE], dtype=pl.FP32, value=0.0)
                 for gather_page in pl.range(CMP_PAGES_PER_WORK):
                     gather_page_col = gather_first_col + gather_page
-                    gather_dst = gather_dst0 + gather_page * CMP_STORAGE_BLOCK_SIZE
-                    gather_valid_col = gather_page * CMP_STORAGE_BLOCK_SIZE
-                    if CMP_PAGES_PER_WORK > 1:
-                        if CMP_STORAGE_BLOCK_SIZE == 1:
-                            # A one-row cache page needs a scalar mask, not a 4-byte Vec tile.
-                            pl.write(cmp_work_valid, [gather_item, gather_valid_col], 0.0)
-                        else:
-                            gather_valid_zero = pl.full([1, CMP_STORAGE_BLOCK_SIZE], dtype=pl.FP32, value=0.0)
-                            cmp_work_valid[gather_item : gather_item + 1, gather_valid_col : gather_valid_col + CMP_STORAGE_BLOCK_SIZE] = gather_valid_zero
-                    gather_zero_rows = pl.full([CMP_STORAGE_BLOCK_SIZE, HEAD_DIM], dtype=pl.BF16, value=0.0)
-                    cmp_work_kv[gather_dst : gather_dst + CMP_STORAGE_BLOCK_SIZE, 0:HEAD_DIM] = gather_zero_rows
                     if gather_page_col < cmp_table_blocks:
                         gather_page_i32 = pl.read(cmp_block_table, [gather_request, gather_page_col])
                         if gather_page_i32 >= 0:
                             if gather_page_i32 < cmp_block_num:
                                 gather_page_id = pl.cast(gather_page_i32, pl.INDEX)
                                 gather_src = gather_page_id * CMP_STORAGE_BLOCK_SIZE
-                                gather_page_rows = cmp_kv_flat[gather_src : gather_src + CMP_STORAGE_BLOCK_SIZE, 0:HEAD_DIM]
-                                cmp_work_kv[gather_dst : gather_dst + CMP_STORAGE_BLOCK_SIZE, 0:HEAD_DIM] = gather_page_rows
-                                if CMP_PAGES_PER_WORK > 1:
-                                    if CMP_STORAGE_BLOCK_SIZE == 1:
-                                        pl.write(cmp_work_valid, [gather_item, gather_valid_col], 1.0)
-                                    else:
-                                        gather_valid_one = pl.full([1, CMP_STORAGE_BLOCK_SIZE], dtype=pl.FP32, value=1.0)
-                                        cmp_work_valid[gather_item : gather_item + 1, gather_valid_col : gather_valid_col + CMP_STORAGE_BLOCK_SIZE] = gather_valid_one
+                                gather_col = gather_page * CMP_STORAGE_BLOCK_SIZE
+                                gather_tile = pl.gather_row(gather_tile, cmp_kv_flat, [gather_col, 0], [gather_src, 0], [CMP_STORAGE_BLOCK_SIZE, HEAD_DIM])
+                                for gather_mask_col in pl.unroll(CMP_STORAGE_BLOCK_SIZE):
+                                    pl.tile.write(gather_mask, [0, gather_col + gather_mask_col], 1.0)
+                pl.store(gather_tile, [gather_dst0, 0], cmp_work_kv)
+                pl.store(gather_mask, [gather_item, 0], cmp_work_valid)
 
         # Seed the maximum from the sink and publish one compressed state per query.
         # The sink contributes to the denominator only in the final raw/compressed merge.
