@@ -238,10 +238,12 @@ def _scatter_local_tokens(
     """Scatter compact local MoE rows back into the original TP token positions."""
     tokens = pl.tensor.dim(output, 0)
     local_tokens = _local_token_count(num_tokens, tp_rank)
-    for row in pl.spmd(tokens, name_hint="prefill_moe_scatter_zero"):
+    with pl.spmd(tokens, name_hint="prefill_moe_scatter_zero") as zero_tid:
+        row = pl.tile.get_block_idx()
         zero = pl.tile.full([1, D], dtype=pl.BF16, value=0.0)
         pl.tile.store(zero, [row, 0], output, shapes=[1, D])
-    for row in pl.spmd(tokens, name_hint="prefill_moe_scatter"):
+    with pl.spmd(tokens, name_hint="prefill_moe_scatter", deps=[zero_tid]):
+        row = pl.tile.get_block_idx()
         if row < local_tokens:
             dst_row = row * TP_SIZE + tp_rank
             value = pl.tile.load(compact, [row, 0], [1, D])
