@@ -108,6 +108,8 @@ from prefill_o_proj import (
 )
 from hc_head import hc_head
 from lm_head import (
+    GRAMMAR_SEGMENT_WORDS,
+    GREEDY_GRID_ROWS,
     GROUP_LOGIT_ROWS,
     MAX_LOGIT_ROWS,
     SAMPLED_IDS_PAD,
@@ -365,6 +367,7 @@ def prefill_fwd(
     dspark_target_hidden: pl.Out[pl.Tensor[[FWD_TOKENS_DYN, MAIN_HIDDEN_DIM], pl.BF16]],
     x_out: pl.Out[pl.Tensor[[FWD_GROUP_TOKENS_DYN, D], pl.BF16]],
     logits: pl.Out[pl.Tensor[[MAX_LOGIT_ROWS, LM_HEAD_VOCAB], pl.FP32]],
+    grammar_mask: pl.Tensor[[MAX_LOGIT_ROWS, GREEDY_GRID_ROWS, GRAMMAR_SEGMENT_WORDS], pl.INT16],
     sampled_ids: pl.Out[pl.Tensor[[MAX_LOGIT_ROWS, SAMPLED_IDS_PAD], pl.INT32]],
     recv_meta: pld.DistributedTensor[[N_RANKS, N_LOCAL], pl.INT32],
     recv_x: pld.DistributedTensor[[N_LOCAL * RECV_MAX, D], pl.INT8],
@@ -1119,7 +1122,7 @@ def prefill_fwd(
                 group_base, tp_rank,
                 pl.const(LM_HEAD_COMM_EPOCH, pl.INT32), final_norm_tid,
             )
-            greedy_sample(logits, logit_row_indices, sampled_ids)
+            greedy_sample(logits, logit_row_indices, grammar_mask, sampled_ids)
         else:
             for token in pl.spmd(local_tokens, name_hint="prefill_fwd_inactive_target_hidden"):
                 for head in pl.range(MAIN_HIDDEN_DIM // D):
@@ -1242,6 +1245,7 @@ def l3_prefill_fwd(
     dspark_target_hidden: pl.Out[pl.Tensor[[N_RANKS, FWD_TOKENS_DYN, MAIN_HIDDEN_DIM], pl.BF16]],
     x_out: pl.Out[pl.Tensor[[N_RANKS, FWD_GROUP_TOKENS_DYN, D], pl.BF16]],
     logits: pl.Out[pl.Tensor[[N_RANKS, MAX_LOGIT_ROWS, LM_HEAD_VOCAB], pl.FP32]],
+    grammar_mask: pl.Tensor[[N_RANKS, MAX_LOGIT_ROWS, GREEDY_GRID_ROWS, GRAMMAR_SEGMENT_WORDS], pl.INT16],
     sampled_ids: pl.Out[pl.Tensor[[N_RANKS, MAX_LOGIT_ROWS, SAMPLED_IDS_PAD], pl.INT32]],
 ):
     """Run layer-major DSA-CP over a caller-padded physical token extent.
@@ -1380,7 +1384,7 @@ def l3_prefill_fwd(
             hc_head_fn[r], hc_head_scale[r], hc_head_base[r],
             final_norm_w[r], lm_head_weight[r], logit_row_indices[r],
             dspark_target_hidden[r],
-            x_out[r], logits[r], sampled_ids[r],
+            x_out[r], logits[r], grammar_mask[r], sampled_ids[r],
             recv_meta, recv_x, recv_aux, recv_route,
             arrived, data_arrived, routed_y_buf, combine_arrived,
             stage_done,
@@ -1979,6 +1983,10 @@ def build_tensor_specs(
         ),
         TensorSpec("x_out", [N_RANKS, stage_tokens, D], torch.bfloat16),
         TensorSpec("logits", [N_RANKS, MAX_LOGIT_ROWS, LM_HEAD_VOCAB], torch.float32),
+        TensorSpec(
+            "grammar_mask", [N_RANKS, MAX_LOGIT_ROWS, GREEDY_GRID_ROWS, GRAMMAR_SEGMENT_WORDS],
+            torch.int16, init_value=-1,
+        ),
         TensorSpec("sampled_ids", [N_RANKS, MAX_LOGIT_ROWS, SAMPLED_IDS_PAD], torch.int32),
     ]
     for spec in head_specs:

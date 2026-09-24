@@ -248,6 +248,8 @@ def l2_decode_fwd_dspark(
     dspark_target_hidden: pl.InOut[pl.Tensor[[T_DYN, MAIN_HIDDEN_DIM], pl.BF16]],
     x_out: pl.Out[pl.Tensor[[T_DYN, D], pl.BF16]],
     logits: pl.Out[pl.Tensor[[MAX_LOGIT_ROWS, LM_HEAD_VOCAB], pl.FP32]],
+    grammar_mask: pl.Tensor[[MAX_LOGIT_ROWS, decode.GREEDY_GRID_ROWS, decode.GRAMMAR_SEGMENT_WORDS], pl.INT16],
+    valid_draft_counts: pl.Tensor[[DECODE_BATCH], pl.INT32],
     sampled_ids: pl.InOut[pl.Tensor[[MAX_LOGIT_ROWS, SAMPLED_IDS_PAD], pl.INT32]],
     state_slot_ids: pl.Tensor[[DSPARK_STATE_LOCAL_BATCH], pl.INT32],
     state_generations: pl.Tensor[[DSPARK_STATE_LOCAL_BATCH], pl.INT32],
@@ -470,7 +472,7 @@ def l2_decode_fwd_dspark(
             dtype=pl.BF16,
         )
         prepare_target_group_from_device_state(
-            group_state_slot_ids, group_state_generations,
+            group_state_slot_ids, group_state_generations, valid_draft_counts,
             state_tokens, state_meta,
             prepared_input_ids, prepared_position_ids_local, prepared_position_ids,
             prepared_csa_kv_seq_lens, prepared_hca_kv_seq_lens,
@@ -538,14 +540,14 @@ def l2_decode_fwd_dspark(
             routed_w3_scale, routed_w2, routed_w2_scale, shared_w1, shared_w1_scale, shared_w3,
             shared_w3_scale, shared_w2, shared_w2_scale, hidden_workspace, x_ping, x_pong,
             x_attn_active, x_moe_next, pre_hc_hidden_out, dspark_target_hidden, x_out, logits,
-            sampled_ids, gather_window,
+            grammar_mask, sampled_ids, gather_window,
             gather_signal, attention_window, attention_signal, o_window, o_signal, recv_meta,
             recv_x, recv_aux, recv_route, arrived, data_arrived, routed_y_buf, combine_arrived,
             lm_head_hidden_window, lm_head_hidden_done, lm_head_logits_window, lm_head_logits_done,
             group_base, tp_rank, my_rank
         )
         accept_target_into_device_state(
-            state_slot_ids, state_generations,
+            state_slot_ids, state_generations, valid_draft_counts, tp_rank,
             prepared_sampled_row_offsets, prepared_sampled_row_offsets,
             state_tokens, state_meta,
             sampled_ids, dspark_target_hidden,
@@ -714,6 +716,8 @@ def l3_decode_fwd_dspark(
     dspark_target_hidden: pl.InOut[pl.Tensor[[N_RANKS, T_DYN, MAIN_HIDDEN_DIM], pl.BF16]],
     x_out: pl.Out[pl.Tensor[[N_RANKS, T_DYN, D], pl.BF16]],
     logits: pl.Out[pl.Tensor[[N_RANKS, MAX_LOGIT_ROWS, LM_HEAD_VOCAB], pl.FP32]],
+    grammar_mask: pl.Tensor[[N_RANKS, MAX_LOGIT_ROWS, decode.GREEDY_GRID_ROWS, decode.GRAMMAR_SEGMENT_WORDS], pl.INT16],
+    valid_draft_counts: pl.Tensor[[N_RANKS, DECODE_BATCH], pl.INT32],
     sampled_ids: pl.InOut[pl.Tensor[[N_RANKS, MAX_LOGIT_ROWS, SAMPLED_IDS_PAD], pl.INT32]],
     state_slot_ids: pl.Tensor[[N_RANKS, DSPARK_STATE_LOCAL_BATCH], pl.INT32],
     state_generations: pl.Tensor[[N_RANKS, DSPARK_STATE_LOCAL_BATCH], pl.INT32],
@@ -935,7 +939,8 @@ def l3_decode_fwd_dspark(
             shared_w3_scale[rank], shared_w2[rank], shared_w2_scale[rank], hidden_workspace[rank],
             x_ping[rank], x_pong[rank], x_attn_active[rank], x_moe_next[rank],
             pre_hc_hidden_out[rank], dspark_target_hidden[rank], x_out[rank], logits[rank],
-            sampled_ids[rank], state_slot_ids[rank], state_generations[rank], state_tokens[rank],
+            grammar_mask[rank], valid_draft_counts[rank], sampled_ids[rank],
+            state_slot_ids[rank], state_generations[rank], state_tokens[rank],
             state_meta[rank], accepted_token_ids[rank], accepted_counts[rank],
             group_state_slot_ids[rank], group_state_generations[rank],
             group_ori_block_table[rank], group_hca_cmp_block_table[rank],
@@ -1066,6 +1071,7 @@ def build_tensor_specs():
         "group_state_generations": group_generations,
         "state_tokens": tokens,
         "state_meta": meta,
+        "valid_draft_counts": torch.full((N_RANKS, DECODE_BATCH), DRAFT_DSPARK_QUERY_WIDTH, dtype=torch.int32),
     }
 
     def resolve(shape):
@@ -1073,7 +1079,7 @@ def build_tensor_specs():
 
     torch_dtype = {
         "bfloat16": torch.bfloat16, "fp32": torch.float32, "float32": torch.float32,
-        "int8": torch.int8, "int32": torch.int32, "int64": torch.int64,
+        "int8": torch.int8, "int16": torch.int16, "int32": torch.int32, "int64": torch.int64,
     }
     ordered = []
     for param in inspect.signature(l3_decode_fwd_dspark._func).parameters.values():
@@ -1092,6 +1098,8 @@ def build_tensor_specs():
                 angle = torch.arange(shape[1], dtype=torch.float32).unsqueeze(1) * 1e-4
                 trig = torch.cos(angle) if "cos" in param.name else torch.sin(angle)
                 value = trig.expand(-1, shape[2]).to(torch.bfloat16).expand(shape[0], -1, -1).contiguous()
+            elif param.name == "grammar_mask":
+                value = torch.full(shape, -1, dtype=dtype)
             elif value is None:
                 value = torch.full(shape, -1 if "token_ids" in param.name else 0, dtype=dtype)
             spec = TensorSpec(param.name, shape, dtype, init_value=value)
