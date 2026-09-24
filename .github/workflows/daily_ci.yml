@@ -24,7 +24,7 @@ jobs:
     # user, same bundle venv + activate.sh, same ci-cache). needs-device:false is
     # the only difference: no npu-smi check and no Ascend env, which the simulator
     # does not use.
-    runs-on: [self-hosted, linux, arm64, cpu]
+    runs-on: [self-hosted, linux, cpu]
     timeout-minutes: 120
     strategy:
       fail-fast: false
