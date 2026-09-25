@@ -17,6 +17,7 @@ from lm_head import (
     DONE_VALUE,
     GROUP_LOGIT_ROWS,
     LM_HEAD_RING_HEAP,
+    LM_HEAD_WEIGHT_LAYOUT,
     MAX_LOGIT_ROWS,
     TP_SIZE,
     VOCAB_PER_TP,
@@ -591,7 +592,7 @@ def markov_sample(
 def _distributed_markov_sample(
     head_hidden: pl.Tensor[[B_DYN, DSPARK_QUERY_WIDTH, D], pl.BF16],
     final_norm_weight: pl.Tensor[[D], pl.BF16],
-    lm_head_weight: pl.Tensor[[VOCAB_PER_TP, D], pl.BF16, pl.NZ],
+    lm_head_weight: pl.Tensor[[VOCAB_PER_TP, D], pl.BF16, LM_HEAD_WEIGHT_LAYOUT],
     logit_row_indices: pl.Tensor[[MAX_LOGIT_ROWS], pl.INT32],
     num_sampled: pl.Tensor[[B_DYN], pl.INT32],
     last_sampled: pl.Tensor[[B_DYN], pl.INT64],
@@ -770,7 +771,7 @@ def build_tensor_specs(batch: int, *, distributed: bool = False):
                     # the SP owners prove their hidden rows are not duplicated.
                     for owner_tp in range(TP_SIZE):
                         weight[rank, 4 + owner_tp, 2 + owner_tp] = 8.0
-            return pack_nz(weight)
+            return weight if TP_SIZE == 1 else pack_nz(weight)
         weight = torch.zeros(VOCAB, D, dtype=torch.bfloat16)
         weight[0, :LM_K_TILE] = 1.0 / LM_K_TILE
         return weight
@@ -972,13 +973,16 @@ def golden_distributed_markov(tensors):
         # Unpack before concatenating: each rank's shard is its own independent
         # NZ block, and the packed bytes of two shards do not concatenate into
         # a valid larger NZ block.
-        full_lm_head_weight = torch.cat(
-            [
-                unpack_nz(tensors["lm_head_weight"][group_base + tp_rank])
-                for tp_rank in range(TP_SIZE)
-            ],
-            dim=0,
-        )
+        if TP_SIZE == 1:
+            full_lm_head_weight = tensors["lm_head_weight"][group_base].float()
+        else:
+            full_lm_head_weight = torch.cat(
+                [
+                    unpack_nz(tensors["lm_head_weight"][group_base + tp_rank])
+                    for tp_rank in range(TP_SIZE)
+                ],
+                dim=0,
+            )
         rank_tensors = {
             "head_hidden": tensors["head_hidden"][rank],
             "final_norm_weight": tensors["final_norm_weight"][rank],

@@ -67,6 +67,7 @@ from decode_swa import decode_swa, decode_swa_tp1
 from hc_head import hc_head
 from lm_head import (
     GROUP_LOGIT_ROWS,
+    LM_HEAD_WEIGHT_LAYOUT,
     MAX_LOGIT_ROWS,
     SAMPLED_IDS_PAD,
     TP_SIZE as LM_HEAD_TP_SIZE,
@@ -373,7 +374,7 @@ def _decode_fwd(
     hc_head_scale: pl.Tensor[[1], pl.FP32],
     hc_head_base: pl.Tensor[[HC_MULT], pl.FP32],
     final_norm_w: pl.Tensor[[D], pl.BF16],
-    lm_head_weight: pl.Tensor[[VOCAB_PER_TP, D], pl.BF16, pl.NZ],
+    lm_head_weight: pl.Tensor[[VOCAB_PER_TP, D], pl.BF16, LM_HEAD_WEIGHT_LAYOUT],
     logit_row_indices: pl.Tensor[[MAX_LOGIT_ROWS], pl.INT32],
     routed_w1: pl.Tensor[[FWD_WEIGHT_BANK_SIZE * N_LOCAL, MOE_INTER, D], pl.INT8, pl.NZ],
     routed_w1_scale: pl.Tensor[[FWD_WEIGHT_BANK_SIZE * N_LOCAL, MOE_INTER], pl.FP32],
