@@ -225,13 +225,46 @@ small CPU Block references with:
 python models/deepseek_v4_1_flash/decode_layer.py --stage block --cpu-golden
 ```
 
-All six Attention half-layers are implemented. The full Block device path still
-awaits EP8 MoE integration and its hardware fixture;
-`decode_layer_kernel_skip_reason` reports that dependency. Both the Block
-factory and `--stage block` device command enforce readiness before JIT
-construction. Block CPU references currently require all capacity rows active.
+All six Attention half-layers and the packed EP8 MoE Block composition are
+implemented for the encoder modes. The complete Block factory requires an
+explicit `TensorSpec` fixture and rejects the C1A decoder modes because they
+are outside the causal encoder. Block CPU references currently require all
+capacity rows active.
 
-Every mode file provides hardware validation without requiring MoE. The
+The causal-encoder forward is assembled in
+[`decode_causal_encoder.py`](../../../models/deepseek_v4_1_flash/decode_causal_encoder.py).
+It statically executes the first 20 Hugging Face layers in this order:
+
+- layers 0-1: SWA;
+- layer 2: C2A Full, publishing compressed KV and Top-K state;
+- layers 3-7: C2A Reuse of layer 2;
+- layer 8: C2A Full, then layers 9-13 reuse layer 8;
+- layer 14: C2A Full, then layers 15-19 reuse layer 14.
+
+Each entry preserves the official delayed mHC ordering
+(`mHC -> Attention -> mHC -> MoE -> mHC`) and carries the FFN `pre_mix` and
+the latest C2A cache/indices into the next layer. The deterministic CPU golden
+and its numerical checks run with:
+
+```bash
+task-submit --no-device --run \
+  "python models/deepseek_v4_1_flash/decode_causal_encoder.py --cpu-golden"
+task-submit --no-device --run \
+  "python -m pytest models/deepseek_v4_1_flash/decode_causal_encoder.py -q"
+```
+
+The fused device host is exposed by `make_causal_encoder_device_program`; use
+`--compile-only` for an A5 simulator compile and `--run-encoder` for a device
+execution with the configured EP fixture. With four available cards, the
+compile-only bring-up uses TP2/EP4:
+
+```bash
+task-submit --no-device --run \
+  "python models/deepseek_v4_1_flash/decode_causal_encoder.py \
+  --tp 2 --ep 4 --compile-only --run-encoder --platform a5sim --devices 0,1,2,3"
+```
+
+Every Attention mode provides independent hardware validation. The
 `decode_layer.py --stage attention` compatibility dispatcher accepts the
 spec-driven SWA/C2A ABI; C1A validation uses each mode's native entry directly.
 For an allocated TP4 group:
@@ -305,11 +338,12 @@ ranks included). Two *separate* checks cover the sequence-parallel hand-off:
   lets the second layer consume those gathered rows, so a rank-order, padding or
   delayed-coefficient slip cannot hide behind an identity round trip. This
   validates the Decode-side ABI on CPU only.
-- **Block golden chain** (device path, `decode_layer.py --stage block` and
-  `test_decode_sequence_parallel_two_layer_chain`). It currently **skips**, so it
-  proves nothing yet: the full Block device path awaits EP8 MoE integration and
-  the Block golden awaits the upstream `golden_moe` ABI (#1308). A passing
-  owner-slab metadata check does not mean the Block chain passed.
+- **Block golden chain** (CPU composition, `decode_layer.py --stage block` and
+  `test_decode_sequence_parallel_two_layer_chain`). It now runs the local packed
+  MoE fallback and checks that the first layer's residual output and delayed
+  `next_pre_mix` survive the sequence-parallel hand-off. The fused multi-card
+  device entry additionally keeps its per-layer state private and publishes only
+  the final boundary.
 
 The production cache ABI uses a 128-token scheduler block and keeps payloads
 quantized in HBM:
