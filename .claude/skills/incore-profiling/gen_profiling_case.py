@@ -126,13 +126,14 @@ def parse_cpp(cpp_text: str) -> tuple[str, bool, list[Param]]:
 
 
 # ── Parse the sibling .pto for static buffer sizes ───────────────────────────
-def _parse_dim_list(blob: str, dynamic_dim: int) -> tuple[list[int], set[int]]:
+def _parse_dim_list(
+    blob: str, dynamic_dim: int, computed_refs: dict[str, set[int]]
+) -> tuple[list[int], set[int]]:
     """Parse a .pto ``[%cN_index, %argM, ...]`` dim/stride list.
 
     A constant ``%cN_index`` yields its value; a dynamic ``%argN`` (runtime) or
     stride yields ``dynamic_dim`` and records the scalar argument. Computed SSA
-    dimensions are rejected because this focused generator cannot bound them
-    safely.
+    dimensions use the same conservative bound and retain their scalar inputs.
     """
     out: list[int] = []
     dynamic_args: set[int] = set()
@@ -147,10 +148,8 @@ def _parse_dim_list(blob: str, dynamic_dim: int) -> tuple[list[int], set[int]]:
             out.append(dynamic_dim)
             dynamic_args.add(int(am.group(1)))
             continue
-        raise ValueError(
-            f"cannot safely bound computed PTO dimension {token!r}; "
-            "use incore_profile.py --ptoas-root with the full PTOAS generator"
-        )
+        out.append(dynamic_dim)
+        dynamic_args.update(computed_refs.get(token, set()))
     return out, dynamic_args
 
 
@@ -167,16 +166,19 @@ def parse_pto_sizes(pto_text: str, dynamic_dim: int = _DEFAULT_DYNAMIC) -> tuple
         raise ValueError(f"dynamic_dim must be greater than zero, got {dynamic_dim}")
     sizes: dict[int, int] = {}
     dynamic_args: set[int] = set()
+    computed_refs: dict[str, set[int]] = {}
+    for name, expr in re.findall(r"(%[A-Za-z0-9_]+)\s*=\s*([^\n:]+)", pto_text):
+        computed_refs[name] = {int(n) for n in re.findall(r"%arg(\d+)", expr)}
     pat = re.compile(
         r"make_tensor_view\s+%arg(\d+),\s*shape\s*=\s*\[([^\]]*)\]"
         r"(?:,\s*strides\s*=\s*\[([^\]]*)\])?"
     )
     for m in pat.finditer(pto_text):
         argn = int(m.group(1))
-        shape, shape_args = _parse_dim_list(m.group(2), dynamic_dim)
+        shape, shape_args = _parse_dim_list(m.group(2), dynamic_dim, computed_refs)
         dynamic_args.update(shape_args)
         if m.group(3):
-            strides, stride_args = _parse_dim_list(m.group(3), dynamic_dim)
+            strides, stride_args = _parse_dim_list(m.group(3), dynamic_dim, computed_refs)
             dynamic_args.update(stride_args)
         else:
             strides = None
