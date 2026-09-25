@@ -92,7 +92,29 @@ def default_pto_isa_root() -> Path:
     """
     # Imported here so `--help` and the pure-report paths keep working in a
     # checkout without pypto installed.
-    from pypto.runtime import ensure_pto_isa_root
+    try:
+        from pypto.runtime import ensure_pto_isa_root
+    except ImportError:
+        try:
+            from pypto.runtime.simpler_setup.pto_isa import ensure_pto_isa_root
+        except ImportError as exc:
+            candidates = []
+            ambient = os.environ.get("PTO_ISA_ROOT")
+            if ambient:
+                candidates.append(Path(ambient))
+            candidates.extend(
+                [
+                    REPO_ROOT.parent / "pto-isa",
+                    REPO_ROOT.parent / "pypto" / "build" / "pto-isa",
+                ]
+            )
+            for candidate in candidates:
+                if (candidate / "CMakeLists.txt").is_file():
+                    return candidate.resolve()
+            raise RuntimeError(
+                "cannot resolve pto-isa: installed pypto has no resolver; "
+                "pass --pto-isa-root or set PTO_ISA_ROOT"
+            ) from exc
 
     return Path(ensure_pto_isa_root())
 
