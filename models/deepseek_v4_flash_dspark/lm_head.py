@@ -374,8 +374,10 @@ def greedy_sample(
 ):
     """Select the first maximum allowed token id per active row; inactive rows read -1.
 
-    The mask uses 16 bits per word for each greedy scan segment; all -1 allows
-    every token.
+    The mask uses 16 bits per word for each greedy scan segment. The final
+    padding word of segment zero is -1 for an unconstrained row and 0 for a
+    constrained row; it never overlaps vocabulary bits. An all--1 mask takes
+    the native argmax fast path without expanding the bitset.
     """
     # One pass per row into a [BLOCK_ROWS, ROW_WIDTH] accumulator carrying the
     # running maximum and the block that set it; a lane's column is its position.
@@ -386,56 +388,115 @@ def greedy_sample(
         if pl.read(logit_row_indices, [row]) < 0:
             sampled_ids[row : row + 1, :] = pl.full([1, SAMPLED_IDS_PAD], dtype=pl.INT32, value=-1)
         else:
-            row_base = row * GREEDY_GRID_ROWS
-            best_value = pl.cast(FP32_NEG_INF, pl.FP32)
-            best_index = pl.cast(GREEDY_INDEX_SENTINEL, pl.INT32)
-            for block in pl.range(GREEDY_GRID_ROWS // GREEDY_BLOCK_ROWS):
-                block_row = row_base + block * GREEDY_BLOCK_ROWS
-                scores = logits_grid[block_row : block_row + GREEDY_BLOCK_ROWS, 0:GREEDY_ROW_WIDTH]
+            # The last padding word of segment zero is a row-mode header.
+            # -1 selects the native argmax without reading or expanding mask bits.
+            if pl.read(grammar_mask, [row, 0, GRAMMAR_SEGMENT_WORDS - 1]) == -1:
+                row_base = row * GREEDY_GRID_ROWS
+                running_max = pl.full([GREEDY_BLOCK_ROWS, GREEDY_ROW_WIDTH], dtype=pl.FP32, value=FP32_NEG_INF)
+                running_base = pl.full([GREEDY_BLOCK_ROWS, GREEDY_ROW_WIDTH], dtype=pl.INT32, value=0)
+                for block in pl.range(GREEDY_GRID_ROWS // GREEDY_BLOCK_ROWS):
+                    block_row = row_base + block * GREEDY_BLOCK_ROWS
+                    scores = logits_grid[block_row : block_row + GREEDY_BLOCK_ROWS, 0:GREEDY_ROW_WIDTH]
+                    # Strict greater-than, so a lane keeps the earliest block it peaked at.
+                    is_newer = pl.cmp(scores, running_max, cmp_type=4)
+                    newer = pl.cast(is_newer, target_type=pl.INT32)
+                    running_max = pl.maximum(running_max, scores)
+                    block_base = pl.cast(block * GREEDY_BLOCK_SPAN, pl.INT32)
+                    to_new = pl.neg(pl.sub(running_base, block_base))
+                    running_base = pl.add(running_base, pl.mul(newer, to_new))
+
+                # Broadcast the lane maxima back and column-reduce: every entry is then the
+                # row maximum. A scalar pl.max over the lanes miscompiles on fp32
+                # (ptoas_bitcast has no float overload).
+                lane_maxima = pl.row_max(running_max)
+                lane_zeros = pl.full([GREEDY_BLOCK_ROWS, GREEDY_ROW_WIDTH], dtype=pl.FP32, value=0.0)
+                lane_broadcast = pl.row_expand_add(lane_zeros, lane_maxima)
+                best_value = pl.read(pl.col_max(lane_broadcast), [0, 0])
+
+                # Flat index of every lane still at the row maximum, sentinel for the rest.
+                # The lane * width term folds into the scalar combine below, keeping the
+                # ramp a broadcast row rather than an (illegal) 2D arange.
+                ramp_zeros = pl.full([GREEDY_BLOCK_ROWS, GREEDY_ROW_WIDTH], dtype=pl.INT32, value=0)
+                column_ramp = pl.col_expand(ramp_zeros, pl.arange(0, [1, GREEDY_ROW_WIDTH], dtype=pl.INT32))
+                flat_index = pl.add(running_base, column_ramp)
+                is_max = pl.cmp(running_max, best_value, cmp_type=0)
+                hit = pl.cast(is_max, target_type=pl.INT32)
+                offset_index = pl.sub(flat_index, GREEDY_INDEX_SENTINEL)
+                candidates = pl.add(pl.mul(hit, offset_index), GREEDY_INDEX_SENTINEL)
+                lane_indices = pl.row_min(candidates)
+                best_index = pl.read(lane_indices, [0, 0])
+                for lane in pl.range(1, GREEDY_BLOCK_ROWS):
+                    lane_term = pl.cast(lane * GREEDY_ROW_WIDTH, pl.INT32)
+                    lane_best = pl.read(lane_indices, [lane, 0]) + lane_term
+                    best_index = pl.min(best_index, lane_best)
+
+            else:
+                row_base = row * GREEDY_GRID_ROWS
                 token_ids = pl.col_expand(
                     pl.full([GREEDY_BLOCK_ROWS, GRAMMAR_LOOKUP_WIDTH], dtype=pl.INT32, value=0),
                     pl.arange(0, [1, GRAMMAR_LOOKUP_WIDTH], dtype=pl.INT32),
                 )
                 word_indices = pl.shr(token_ids, 4)
-                mask_words = pl.gather(
-                    grammar_mask[row, block * GREEDY_BLOCK_ROWS : (block + 1) * GREEDY_BLOCK_ROWS, :],
-                    dim=-1,
-                    index=word_indices,
+                bit_indices = pl.sub(token_ids, pl.mul(word_indices, 16))
+                # Build the 16 bit selectors once, including signed INT16 bit 15.
+                bit_basis = pl.shr(
+                    pl.full([1, 16], dtype=pl.INT32, value=32768),
+                    pl.sub(
+                        pl.full([1, 16], dtype=pl.INT32, value=15),
+                        pl.arange(0, [1, 16], dtype=pl.INT32),
+                    ),
                 )
-                bit_indices = pl.cast(pl.sub(token_ids, pl.mul(word_indices, 16)), pl.INT16)
-                bits = pl.and_(
-                    pl.shr(mask_words, bit_indices),
-                    pl.full([GREEDY_BLOCK_ROWS, GRAMMAR_LOOKUP_WIDTH], dtype=pl.INT16, value=1),
+                pl.write(bit_basis, [0, 15], pl.cast(-32768, pl.INT32))
+                bit_basis_rows = pl.col_expand(
+                    pl.full([GREEDY_BLOCK_ROWS, 16], dtype=pl.INT16, value=0),
+                    pl.cast(bit_basis, pl.INT16),
                 )
-                forbidden = pl.cast(pl.cmp(bits, 0, cmp_type=0), target_type=pl.FP32)
-                masked_scores = pl.create_tensor([GREEDY_BLOCK_ROWS, GREEDY_ROW_WIDTH], dtype=pl.FP32)
-                masked_scores[:, :] = pl.add(
-                    scores, pl.mul(forbidden[:, 0:GREEDY_ROW_WIDTH], -1.0e30)
-                )
-                lane_maxima = pl.row_max(masked_scores)
+                bit_selectors = pl.gather(bit_basis_rows, dim=-1, index=bit_indices)
+                running_max = pl.full([GREEDY_BLOCK_ROWS, GREEDY_ROW_WIDTH], dtype=pl.FP32, value=FP32_NEG_INF)
+                running_base = pl.full([GREEDY_BLOCK_ROWS, GREEDY_ROW_WIDTH], dtype=pl.INT32, value=0)
+                for block in pl.range(GREEDY_GRID_ROWS // GREEDY_BLOCK_ROWS):
+                    block_row = row_base + block * GREEDY_BLOCK_ROWS
+                    scores = logits_grid[block_row : block_row + GREEDY_BLOCK_ROWS, 0:GREEDY_ROW_WIDTH]
+                    mask_words = pl.gather(
+                        grammar_mask[row, block * GREEDY_BLOCK_ROWS : (block + 1) * GREEDY_BLOCK_ROWS, :],
+                        dim=-1,
+                        index=word_indices,
+                    )
+                    bits = pl.and_(mask_words, bit_selectors)
+                    # Compare signed bit values numerically, including INT16 bit 15.
+                    forbidden = pl.cmp(pl.cast(bits, pl.FP32), 0.0, cmp_type=0)
+                    masked_scores = pl.create_tensor([GREEDY_BLOCK_ROWS, GREEDY_ROW_WIDTH], dtype=pl.FP32)
+                    masked_scores[:, :] = pl.add(
+                        scores, pl.mul(forbidden[:, 0:GREEDY_ROW_WIDTH], -1.0e30)
+                    )
+                    newer = pl.cast(pl.cmp(masked_scores, running_max, cmp_type=4), target_type=pl.INT32)
+                    running_max = pl.maximum(running_max, masked_scores)
+                    block_base = pl.cast(block * GREEDY_BLOCK_SPAN, pl.INT32)
+                    to_new = pl.neg(pl.sub(running_base, block_base))
+                    running_base = pl.add(running_base, pl.mul(newer, to_new))
+
+                lane_maxima = pl.row_max(running_max)
                 lane_broadcast = pl.row_expand_add(
                     pl.full([GREEDY_BLOCK_ROWS, GREEDY_ROW_WIDTH], dtype=pl.FP32, value=0.0),
                     lane_maxima,
                 )
-                block_value = pl.read(pl.col_max(lane_broadcast), [0, 0])
+                best_value = pl.read(pl.col_max(lane_broadcast), [0, 0])
                 column_ramp = pl.col_expand(
                     pl.full([GREEDY_BLOCK_ROWS, GREEDY_ROW_WIDTH], dtype=pl.INT32, value=0),
                     pl.arange(0, [1, GREEDY_ROW_WIDTH], dtype=pl.INT32),
                 )
-                hit = pl.cast(pl.cmp(masked_scores, block_value, cmp_type=0), target_type=pl.INT32)
+                flat_index = pl.add(running_base, column_ramp)
+                hit = pl.cast(pl.cmp(running_max, best_value, cmp_type=0), target_type=pl.INT32)
                 candidates = pl.add(
-                    pl.mul(hit, pl.sub(column_ramp, GREEDY_INDEX_SENTINEL)),
+                    pl.mul(hit, pl.sub(flat_index, GREEDY_INDEX_SENTINEL)),
                     GREEDY_INDEX_SENTINEL,
                 )
                 lane_indices = pl.row_min(candidates)
-                block_index = pl.read(lane_indices, [0, 0])
+                best_index = pl.read(lane_indices, [0, 0])
                 for lane in pl.range(1, GREEDY_BLOCK_ROWS):
                     lane_term = pl.cast(lane * GREEDY_ROW_WIDTH, pl.INT32)
                     lane_best = pl.read(lane_indices, [lane, 0]) + lane_term
-                    block_index = pl.min(block_index, lane_best)
-                if block_value > best_value:
-                    best_value = block_value
-                    best_index = pl.cast(block_index + block * GREEDY_BLOCK_SPAN, pl.INT32)
+                    best_index = pl.min(best_index, lane_best)
 
             sampled_row = pl.create_tensor([1, SAMPLED_IDS_PAD], dtype=pl.INT32)
             sampled_row[:, :] = pl.full([1, SAMPLED_IDS_PAD], dtype=pl.INT32, value=0)
