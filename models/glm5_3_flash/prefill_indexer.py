@@ -8,8 +8,8 @@
 # -----------------------------------------------------------------------------------------------------------
 """The kpool DSA indexer, prefill path: projections, pooling, scoring, selection.
 
-One file owns the whole selection pipeline for this phase, the way
-``models/deepseek_v4_flash_mtp/prefill_indexer.py`` does. The stages are:
+The projection lives here; ``indexer.py`` implements and shares the remaining
+selection stages with decode. The stages are:
 
 1. **Projections.** ``q = wq_b(q_resid)`` [T, 32, 128]; ``k = k_norm(wk(x))``
    [T, 128], and note ``k_norm`` carries a **bias**, unlike every other norm in
@@ -82,14 +82,34 @@ vLLM Ascend is no help: ``sparse_attn_indexer_kpool.py`` raises
 equivalent yet".
 """
 
+import sys
+from pathlib import Path
+
+if __package__ in (None, ""):
+    sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
+
 import pypto.language as pl
 import torch
+import torch.nn.functional as F
 
-from models.glm5_3_flash.config import B_DYN, BLOCK_SIZE, D, INDEX_DIM, INDEX_H
-from models.glm5_3_flash.config import INDEX_KPOOL, INDEX_STATE_WIDTH, KPOOL_SELECT_K
-from models.glm5_3_flash.config import POOLS_DYN, Q_LORA, TABLE_DYN, TOPK_INDEX_WIDTH, T_DYN
+from models.glm5_3_flash.config import D, INDEX_DIM, INDEX_H
+from models.glm5_3_flash.config import KPOOL_SELECT_K
+from models.glm5_3_flash.config import Q_LORA, T_DYN
+from models.glm5_3_flash.decode_indexer import build_indexer_proj_tensor_specs
+from models.glm5_3_flash.golden import layer_norm
+from models.glm5_3_flash.indexer import (
+    golden_indexer_expand, golden_indexer_kpool, golden_indexer_score,
+    golden_indexer_topk, indexer_expand, indexer_kpool, indexer_score, indexer_topk,
+    indexer_select, indexer_share_mtp, golden_indexer_share_mtp,
+)
 
 
+MM_T_TILE = 16          # cube M tile of every indexer projection
+PROJ_N_TILE = 128       # output-column tile of the wide index_q projection
+PROJ_K_TILE = 256       # reduction tile shared by the four projections
+NORM_T_TILE = 8         # token tile of the key LayerNorm
+HEAD_WEIGHT_SCALE = INDEX_H**-0.5
+K_NORM_EPS = 1e-6  # Glm5NextTextIndexer builds k_norm as nn.LayerNorm(eps=1e-6)
 LEAF = 2048  # the donor's confirmed fault-free sort width on a2a3; 8192 also works
              # but needs the extra 4096 merge stage (see the module docstring)
 PAIR_WIDTH = 2 * KPOOL_SELECT_K
@@ -105,7 +125,51 @@ def golden_indexer_proj(
     w_weights: torch.Tensor,
     w_compress_gate: torch.Tensor,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
-    raise NotImplementedError("indexer projection golden is assigned with the kernel")
+    """Project one packed token batch into the indexer's four per-token quantities.
+
+    Mirrors the projection half of ``Glm5NextTextIndexer.forward``::
+
+        q            = wq_b(q_resid)                        [T, INDEX_H, INDEX_DIM]
+        k            = k_norm(wk(x))                        [T, INDEX_DIM]
+        gate_scores  = index_kpool_compress_gate @ x        [T, INDEX_DIM]
+        head_weights = weights_proj(x) * INDEX_H ** -0.5    [T, INDEX_H]
+
+    ``k_norm`` is a **LayerNorm**, not an RMSNorm — see
+    :func:`models.glm5_3_flash.golden.layer_norm`. It is the one normalisation in this
+    model that subtracts the mean and carries a bias, and its ``eps`` is ``1e-6``
+    rather than the model's ``rms_norm_eps``.
+
+    ``head_weights`` and ``gate_scores`` stay FP32: the first is explicitly cast and
+    scaled in FP32 by the reference, and the second is what the indexer state cache
+    stores, so rounding it here would round it twice. ``q`` and ``k`` keep the
+    activation dtype — the Hadamard rotation and the INT8 quantization of the query
+    belong to the scoring stage, not here.
+
+    Every matmul accumulates in FP32 and rounds once, which is what a kernel with an
+    FP32 accumulator produces.
+
+    Args:
+        x: ``[T, D]`` packed hidden states.
+        q_resid: ``[T, Q_LORA]`` from :func:`models.glm5_3_flash.mla_prolog.golden_mla_prolog`.
+        w_q_b: ``[INDEX_H * INDEX_DIM, Q_LORA]`` indexer query up-projection.
+        w_k: ``[INDEX_DIM, D]`` indexer key projection.
+        k_norm_weight: ``[INDEX_DIM]`` gamma of the key LayerNorm.
+        k_norm_bias: ``[INDEX_DIM]`` beta of the key LayerNorm.
+        w_weights: ``[INDEX_H, D]`` per-head score weighting.
+        w_compress_gate: ``[INDEX_DIM, D]`` k-pooling gate projection.
+
+    Returns:
+        ``index_q`` ``[T, INDEX_H, INDEX_DIM]``, ``index_k`` ``[T, INDEX_DIM]``,
+        ``head_weights`` ``[T, INDEX_H]`` FP32 and ``gate_scores`` ``[T, INDEX_DIM]`` FP32.
+    """
+    dtype = x.dtype
+    index_q = F.linear(q_resid.float(), w_q_b.float()).unflatten(-1, (INDEX_H, INDEX_DIM)).to(dtype)
+    index_k = layer_norm(
+        F.linear(x.float(), w_k.float()), k_norm_weight, k_norm_bias, eps=K_NORM_EPS
+    ).to(dtype)
+    head_weights = F.linear(x.float(), w_weights.float()) * (INDEX_H**-0.5)
+    gate_scores = F.linear(x.float(), w_compress_gate.float())
+    return index_q, index_k, head_weights, gate_scores
 
 
 @pl.jit.inline
@@ -123,117 +187,275 @@ def indexer_proj(
     head_weights: pl.Tensor[[T_DYN, INDEX_H], pl.FP32],
     gate_scores: pl.Tensor[[T_DYN, INDEX_DIM], pl.FP32],
 ):
-    raise NotImplementedError("indexer projection kernel body is assigned independently")
+    """Project one packed token batch into the indexer's four per-token quantities.
 
+    Five scopes. ``index_q`` is the only wide output — ``INDEX_H * INDEX_DIM`` = 4,096
+    columns — so it fans over (output-column tile, token tile) like the MLA query
+    up-projection. The other three projections are 32 or 128 columns wide, so an
+    output-column fan-out would leave one block holding everything; they fan over
+    token tiles instead and keep their whole N in one accumulator.
 
-def golden_indexer_kpool(
-    packed_states: torch.Tensor,
-    compress_ape: torch.Tensor,
-) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    """Return the pooled keys, their raw token indices and their validity."""
-    raise NotImplementedError("kpool compress golden is assigned with the kernel")
+    Every weight is stored ``[out, in]`` and consumed with ``b_trans=True``, so each
+    ``[N_TILE, K_TILE]`` fragment loads K-contiguous.
 
+    ``k_norm`` is a **LayerNorm**: the fourth scope subtracts the row mean before the
+    reciprocal square root and adds a bias afterwards, and its ``eps`` is
+    ``K_NORM_EPS`` = 1e-6 rather than the model's ``rms_norm_eps``. It is the only
+    normalisation in this model shaped that way, so it cannot borrow an RMSNorm scope.
+    ``INDEX_DIM`` is 128, one tile, so the norm needs no reduction loop.
 
-@pl.jit.inline
-def indexer_kpool(
-    packed_states: pl.Tensor[[TABLE_DYN * BLOCK_SIZE, INDEX_STATE_WIDTH], pl.FP32],
-    compress_ape: pl.Tensor[[INDEX_KPOOL, INDEX_DIM], pl.BF16],
-    pool_count: pl.Tensor[[B_DYN], pl.INT32],
-    pool_keys: pl.Tensor[[POOLS_DYN, INDEX_DIM], pl.BF16],
-    pool_valid: pl.Tensor[[POOLS_DYN], pl.INT32],
-):
-    raise NotImplementedError("kpool prefill compress kernel body is assigned independently")
+    ``head_weights`` and ``gate_scores`` are written FP32 straight from the
+    accumulator: the first is scaled by ``INDEX_H ** -0.5`` in FP32 by the reference,
+    and the second is what the indexer state cache stores, so rounding either to BF16
+    here would round it twice.
 
-
-def golden_indexer_score(
-    index_q: torch.Tensor,
-    pool_keys: torch.Tensor,
-    head_weights: torch.Tensor,
-    pool_visible: torch.Tensor,
-) -> torch.Tensor:
-    raise NotImplementedError("indexer score golden is assigned with the kernel")
-
-
-@pl.jit.inline
-def indexer_score(
-    index_q: pl.Tensor[[T_DYN, INDEX_H, INDEX_DIM], pl.BF16],
-    pool_keys: pl.Tensor[[POOLS_DYN, INDEX_DIM], pl.BF16],
-    head_weights: pl.Tensor[[T_DYN, INDEX_H], pl.FP32],
-    pool_valid: pl.Tensor[[POOLS_DYN], pl.INT32],
-    pool_last_position: pl.Tensor[[POOLS_DYN], pl.INT32],
-    query_position: pl.Tensor[[T_DYN], pl.INT32],
-    index_scores: pl.Tensor[[T_DYN, POOLS_DYN], pl.FP32],
-):
-    raise NotImplementedError("indexer score kernel body is assigned independently")
-
-
-PAIR_WIDTH = 2 * KPOOL_SELECT_K
-LEAF = 2048  # the donor's confirmed fault-free sort width on a2a3; 8192 also works
-             # but needs the extra 4096 merge stage (see the module docstring)
-
-
-def golden_indexer_topk(
-    index_scores: torch.Tensor,
-    pool_count: torch.Tensor,
-) -> tuple[torch.Tensor, torch.Tensor]:
-    """Return the selected pool ids and, beside them, which of them are real.
-
-    A query whose visible pool count is below ``KPOOL_SELECT_K`` still fills the
-    full width, so the selection carries padding. ``indexer_expand`` needs to
-    know which entries are padding to blank whole four-wide groups, and the
-    donor kernel emits indices only — this second output is the addition.
+    Returns the four outputs so the caller can chain them.
     """
-    raise NotImplementedError("indexer top-k golden is assigned with the kernel")
+    t_dim = pl.tensor.dim(x, 0)
+    t_mm = ((t_dim + MM_T_TILE - 1) // MM_T_TILE) * MM_T_TILE
+
+    index_q_flat = pl.reshape(index_q, [t_dim, INDEX_H * INDEX_DIM])
+    for q_idx in pl.spmd((INDEX_H * INDEX_DIM) // PROJ_N_TILE, name_hint="indexer_q_proj"):
+        n0 = q_idx * PROJ_N_TILE
+        for tc in pl.range(t_mm // MM_T_TILE):
+            t0 = tc * MM_T_TILE
+            valid_rows = pl.min(MM_T_TILE, t_dim - t0)
+            q_acc = pl.create_tensor([MM_T_TILE, PROJ_N_TILE], dtype=pl.FP32)
+            for kb in pl.pipeline(Q_LORA // PROJ_K_TILE, stage=2):
+                k0 = kb * PROJ_K_TILE
+                q_tile = pl.slice(
+                    q_resid, [MM_T_TILE, PROJ_K_TILE], [t0, k0],
+                    valid_shape=[valid_rows, PROJ_K_TILE],
+                )
+                wq_tile = w_q_b[n0 : n0 + PROJ_N_TILE, k0 : k0 + PROJ_K_TILE]
+                q_acc = pl.matmul_acc(q_acc, q_tile, wq_tile, b_trans=True, init_cond=(kb == 0))
+            index_q_flat = pl.assemble(
+                index_q_flat,
+                pl.set_validshape(pl.cast(q_acc, target_type=pl.BF16, mode="rint"),
+                                  valid_rows, PROJ_N_TILE),
+                [t0, n0],
+            )
+
+    k_fp32 = pl.create_tensor([t_mm, INDEX_DIM], dtype=pl.FP32)
+    for kt in pl.spmd(t_mm // MM_T_TILE, name_hint="indexer_k_proj"):
+        t0 = kt * MM_T_TILE
+        valid_rows = pl.min(MM_T_TILE, t_dim - t0)
+        k_acc = pl.create_tensor([MM_T_TILE, INDEX_DIM], dtype=pl.FP32)
+        for kb in pl.pipeline(D // PROJ_K_TILE, stage=2):
+            k0 = kb * PROJ_K_TILE
+            x_tile = pl.slice(
+                x, [MM_T_TILE, PROJ_K_TILE], [t0, k0], valid_shape=[valid_rows, PROJ_K_TILE]
+            )
+            wk_tile = w_k[0:INDEX_DIM, k0 : k0 + PROJ_K_TILE]
+            k_acc = pl.matmul_acc(k_acc, x_tile, wk_tile, b_trans=True, init_cond=(kb == 0))
+        k_fp32[t0 : t0 + MM_T_TILE, 0:INDEX_DIM] = k_acc
+
+    for ht in pl.spmd(t_mm // MM_T_TILE, name_hint="indexer_head_weights"):
+        t0 = ht * MM_T_TILE
+        valid_rows = pl.min(MM_T_TILE, t_dim - t0)
+        head_acc = pl.create_tensor([MM_T_TILE, INDEX_H], dtype=pl.FP32)
+        for kb in pl.pipeline(D // PROJ_K_TILE, stage=2):
+            k0 = kb * PROJ_K_TILE
+            xh_tile = pl.slice(
+                x, [MM_T_TILE, PROJ_K_TILE], [t0, k0], valid_shape=[valid_rows, PROJ_K_TILE]
+            )
+            ww_tile = w_weights[0:INDEX_H, k0 : k0 + PROJ_K_TILE]
+            head_acc = pl.matmul_acc(head_acc, xh_tile, ww_tile, b_trans=True, init_cond=(kb == 0))
+        head_weights = pl.assemble(
+            head_weights,
+            pl.set_validshape(pl.mul(head_acc, HEAD_WEIGHT_SCALE), valid_rows, INDEX_H),
+            [t0, 0],
+        )
+
+    for gt in pl.spmd(t_mm // MM_T_TILE, name_hint="indexer_gate_proj"):
+        t0 = gt * MM_T_TILE
+        valid_rows = pl.min(MM_T_TILE, t_dim - t0)
+        gate_acc = pl.create_tensor([MM_T_TILE, INDEX_DIM], dtype=pl.FP32)
+        for kb in pl.pipeline(D // PROJ_K_TILE, stage=2):
+            k0 = kb * PROJ_K_TILE
+            xg_tile = pl.slice(
+                x, [MM_T_TILE, PROJ_K_TILE], [t0, k0], valid_shape=[valid_rows, PROJ_K_TILE]
+            )
+            wg_tile = w_compress_gate[0:INDEX_DIM, k0 : k0 + PROJ_K_TILE]
+            gate_acc = pl.matmul_acc(gate_acc, xg_tile, wg_tile, b_trans=True, init_cond=(kb == 0))
+        gate_scores = pl.assemble(
+            gate_scores, pl.set_validshape(gate_acc, valid_rows, INDEX_DIM), [t0, 0]
+        )
+
+    for nt in pl.spmd((t_dim + NORM_T_TILE - 1) // NORM_T_TILE, name_hint="indexer_k_norm"):
+        t0 = nt * NORM_T_TILE
+        valid_rows = pl.min(NORM_T_TILE, t_dim - t0)
+        raw = pl.load(
+            k_fp32,
+            [t0, 0],
+            [NORM_T_TILE, INDEX_DIM],
+            valid_shape=[valid_rows, INDEX_DIM],
+            target_memory=pl.MemorySpace.Vec,
+        )
+        mean_tmp = pl.create_tile(
+            [NORM_T_TILE, INDEX_DIM], dtype=pl.FP32, target_memory=pl.MemorySpace.Vec
+        )
+        centered = pl.row_expand_sub(
+            raw, pl.mul(pl.row_sum(raw, mean_tmp), 1.0 / INDEX_DIM)
+        )
+        var_tmp = pl.create_tile(
+            [NORM_T_TILE, INDEX_DIM], dtype=pl.FP32, target_memory=pl.MemorySpace.Vec
+        )
+        variance = pl.mul(
+            pl.row_sum(pl.mul(centered, centered), var_tmp), 1.0 / INDEX_DIM
+        )
+        rsqrt_tmp = pl.create_tile(
+            [NORM_T_TILE, 1], dtype=pl.FP32, target_memory=pl.MemorySpace.Vec
+        )
+        inv_std = pl.tile.rsqrt(pl.add(variance, K_NORM_EPS), rsqrt_tmp)
+        gamma = pl.reshape(
+            pl.cast(
+                pl.load(k_norm_weight, [0], [INDEX_DIM], target_memory=pl.MemorySpace.Vec),
+                target_type=pl.FP32,
+            ),
+            [1, INDEX_DIM],
+        )
+        beta = pl.reshape(
+            pl.cast(
+                pl.load(k_norm_bias, [0], [INDEX_DIM], target_memory=pl.MemorySpace.Vec),
+                target_type=pl.FP32,
+            ),
+            [1, INDEX_DIM],
+        )
+        normed = pl.col_expand_add(
+            pl.col_expand_mul(pl.row_expand_mul(centered, inv_std), gamma), beta
+        )
+        pl.store(
+            pl.set_validshape(pl.cast(normed, target_type=pl.BF16, mode="rint"),
+                              valid_rows, INDEX_DIM),
+            [t0, 0],
+            index_k,
+        )
+    return index_q, index_k, head_weights, gate_scores
 
 
-@pl.jit.inline
-def indexer_topk(
-    index_scores: pl.Tensor[[T_DYN, POOLS_DYN], pl.FP32],
-    pool_count: pl.Tensor[[T_DYN], pl.INT32],
-    selected_pools: pl.Tensor[[T_DYN, KPOOL_SELECT_K], pl.INT32],
-    selected_valid: pl.Tensor[[T_DYN, KPOOL_SELECT_K], pl.INT32],
+
+@pl.jit
+def indexer_proj_test(
+    x: pl.Tensor[[T_DYN, D], pl.BF16],
+    q_resid: pl.Tensor[[T_DYN, Q_LORA], pl.BF16],
+    w_q_b: pl.Tensor[[INDEX_H * INDEX_DIM, Q_LORA], pl.BF16],
+    w_k: pl.Tensor[[INDEX_DIM, D], pl.BF16],
+    k_norm_weight: pl.Tensor[[INDEX_DIM], pl.BF16],
+    k_norm_bias: pl.Tensor[[INDEX_DIM], pl.BF16],
+    w_weights: pl.Tensor[[INDEX_H, D], pl.BF16],
+    w_compress_gate: pl.Tensor[[INDEX_DIM, D], pl.BF16],
+    index_q: pl.Out[pl.Tensor[[T_DYN, INDEX_H, INDEX_DIM], pl.BF16]],
+    index_k: pl.Out[pl.Tensor[[T_DYN, INDEX_DIM], pl.BF16]],
+    head_weights: pl.Out[pl.Tensor[[T_DYN, INDEX_H], pl.FP32]],
+    gate_scores: pl.Out[pl.Tensor[[T_DYN, INDEX_DIM], pl.FP32]],
 ):
-    raise NotImplementedError("indexer top-k kernel body is assigned independently")
+    """Run one indexer projection for golden.run validation."""
+    x.bind_dynamic(0, T_DYN)
+    q_resid.bind_dynamic(0, T_DYN)
+    index_q.bind_dynamic(0, T_DYN)
+    index_k.bind_dynamic(0, T_DYN)
+    head_weights.bind_dynamic(0, T_DYN)
+    gate_scores.bind_dynamic(0, T_DYN)
+    indexer_proj(
+        x,
+        q_resid,
+        w_q_b,
+        w_k,
+        k_norm_weight,
+        k_norm_bias,
+        w_weights,
+        w_compress_gate,
+        index_q,
+        index_k,
+        head_weights,
+        gate_scores,
+    )
+    return index_q, index_k, head_weights, gate_scores
 
 
-def golden_indexer_expand(
-    selected_pools: torch.Tensor,
-    pool_valid: torch.Tensor,
-    tail_start: torch.Tensor,
-    tail_count: torch.Tensor,
-    kv_len: torch.Tensor,
-) -> torch.Tensor:
-    raise NotImplementedError("indexer expand golden is assigned with the kernel")
+def golden_indexer_proj_case(tensors):
+    """Fill projection outputs using the prefill reference."""
+    index_q, index_k, head_weights, gate_scores = golden_indexer_proj(
+        tensors["x"],
+        tensors["q_resid"],
+        tensors["w_q_b"],
+        tensors["w_k"],
+        tensors["k_norm_weight"],
+        tensors["k_norm_bias"],
+        tensors["w_weights"],
+        tensors["w_compress_gate"],
+    )
+    tensors["index_q"][:] = index_q
+    tensors["index_k"][:] = index_k
+    tensors["head_weights"][:] = head_weights
+    tensors["gate_scores"][:] = gate_scores
 
 
-@pl.jit.inline
-def indexer_expand(
-    selected_pools: pl.Tensor[[T_DYN, KPOOL_SELECT_K], pl.INT32],
-    pool_valid: pl.Tensor[[T_DYN, KPOOL_SELECT_K], pl.INT32],
-    tail_start: pl.Tensor[[T_DYN], pl.INT32],
-    tail_count: pl.Tensor[[T_DYN], pl.INT32],
-    kv_len: pl.Tensor[[T_DYN], pl.INT32],
-    topk_indices: pl.Tensor[[T_DYN, TOPK_INDEX_WIDTH], pl.INT32],
-):
-    """Expand the selected pools into raw cache rows, front packed per row.
+def _check_layer_norm_matches_torch():
+    g = torch.Generator().manual_seed(19)
+    x = torch.randn(5, INDEX_DIM, generator=g) + 12
+    w = torch.randn(INDEX_DIM, generator=g).bfloat16()
+    b = torch.randn(INDEX_DIM, generator=g).bfloat16()
+    torch.testing.assert_close(layer_norm(x, w, b), F.layer_norm(x, (INDEX_DIM,), w.float(), b.float(), 1e-06), rtol=2e-05, atol=2e-05)
 
-    **ABI**: ``topk_indices`` is front packed. Each row holds its valid logical
-    positions in its leading lanes and pads the remaining suffix with ``-1``; a
-    ``-1`` never sits between two valid entries. Both sparse attention kernels
-    read this as a contract rather than a convention: they test one lane to
-    decide that a 128-wide block, or a whole row, carries no selection, so an
-    interleaved ``-1`` would silently drop the live entries behind it. See
-    :mod:`models.glm5_3_flash.decode_sparse_attn` and
-    :mod:`models.glm5_3_flash.prefill_sparse_attn`.
 
-    Selection order within the packed prefix is free — the attention is a
-    permutation-invariant softmax over the gathered rows — so this constrains
-    only where the padding goes.
+def run_projection_goldens():
+    """Check reference equations and boundary cases on CPU."""
+    _check_layer_norm_matches_torch()
+    print("[GOLDEN] PASS projection boundary checks")
+
+
+def main():
+    """Prove the golden on CPU, then validate the projection on device.
+
+    The shared selection stages have their own entry in ``indexer.py``. This entry
+    covers the projection. Each output is one rounding of an FP32 accumulation, except the
+    key, which carries the LayerNorm on top of it and so gets the wider budget.
     """
-    raise NotImplementedError("indexer expand kernel body is assigned independently")
+    import argparse
+
+    from golden import ratio_allclose, run
+    from models.glm5_3_flash._golden_smoke import run_indexer_proj_golden
+
+    run_indexer_proj_golden(golden_indexer_proj)
+
+    parser = argparse.ArgumentParser()
+    parser.add_argument("-p", "--platform", default="a2a3",
+                        choices=["a2a3", "a2a3sim", "a5", "a5sim"])
+    parser.add_argument("-d", "--device", type=int, default=0)
+    parser.add_argument("--tokens", type=int, default=20)
+    parser.add_argument("--compile-only", action="store_true")
+    parser.add_argument("--golden-only", action="store_true")
+    args = parser.parse_args()
+    run_projection_goldens()
+    if args.golden_only:
+        return
+
+    compare = ratio_allclose(atol=1e-4, rtol=1.0 / 128)
+    key_compare = ratio_allclose(atol=1e-3, rtol=1.0 / 64)
+    result = run(
+        fn=indexer_proj_test,
+        specs=build_indexer_proj_tensor_specs(args.tokens),
+        golden_fn=golden_indexer_proj_case,
+        config={"platform": args.platform, "device_id": args.device},
+        rtol=1.0 / 128,
+        atol=1e-4,
+        compare_fn={
+            "index_q": compare,
+            "index_k": key_compare,
+            "head_weights": compare,
+            "gate_scores": compare,
+        },
+        compile_only=args.compile_only,
+    )
+    print(result)
+    if not result.passed:
+        raise SystemExit(result.error or 1)
 
 
 __all__ = [
+    "indexer_proj_test",
     "LEAF",
     "PAIR_WIDTH",
     "golden_indexer_expand",
@@ -244,6 +466,13 @@ __all__ = [
     "indexer_expand",
     "indexer_kpool",
     "indexer_proj",
+    "indexer_select",
+    "indexer_share_mtp",
+    "golden_indexer_share_mtp",
     "indexer_score",
     "indexer_topk",
 ]
+
+
+if __name__ == "__main__":
+    main()

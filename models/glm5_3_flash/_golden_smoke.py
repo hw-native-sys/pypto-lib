@@ -24,6 +24,7 @@ golden harness in ``golden/`` once the kernel exists.
 import torch
 
 from models.glm5_3_flash.config import BLOCK_SIZE, FLASH
+from models.glm5_3_flash.golden import layer_norm
 
 
 def _check(condition: bool, message: str) -> None:
@@ -322,6 +323,70 @@ def run_indexer_cache_golden(golden_cache_write) -> None:
     _report("indexer_cache")
 
 
+def run_indexer_proj_golden(golden_proj) -> None:
+    """Check the indexer projections, and that the key norm is a LayerNorm."""
+    import torch.nn.functional as F
+
+    torch.manual_seed(37)
+    tokens, hidden, q_lora = 5, 64, 48
+    heads, dim = FLASH.index_n_heads, FLASH.index_head_dim
+
+    x = torch.randn(tokens, hidden, dtype=torch.bfloat16)
+    q_resid = torch.randn(tokens, q_lora, dtype=torch.bfloat16)
+    w_q_b = torch.randn(heads * dim, q_lora, dtype=torch.bfloat16) * 0.05
+    w_k = torch.randn(dim, hidden, dtype=torch.bfloat16) * 0.05
+    k_norm_weight = torch.randn(dim, dtype=torch.bfloat16)
+    k_norm_bias = torch.randn(dim, dtype=torch.bfloat16)
+    w_weights = torch.randn(heads, hidden, dtype=torch.bfloat16) * 0.05
+    w_compress_gate = torch.randn(dim, hidden, dtype=torch.bfloat16) * 0.05
+
+    index_q, index_k, head_weights, gate_scores = golden_proj(
+        x, q_resid, w_q_b, w_k, k_norm_weight, k_norm_bias, w_weights, w_compress_gate
+    )
+    _check(index_q.shape == (tokens, heads, dim), f"index_q shape {tuple(index_q.shape)}")
+    _check(index_k.shape == (tokens, dim), f"index_k shape {tuple(index_k.shape)}")
+    _check(head_weights.shape == (tokens, heads), f"head_weights shape {tuple(head_weights.shape)}")
+    _check(gate_scores.shape == (tokens, dim), f"gate_scores shape {tuple(gate_scores.shape)}")
+    _check(index_q.dtype is torch.bfloat16, f"index_q dtype {index_q.dtype}")
+    _check(index_k.dtype is torch.bfloat16, f"index_k dtype {index_k.dtype}")
+    # The two cached / reduced quantities must not be rounded to the activation dtype.
+    _check(head_weights.dtype is torch.float32, f"head_weights dtype {head_weights.dtype}")
+    _check(gate_scores.dtype is torch.float32, f"gate_scores dtype {gate_scores.dtype}")
+
+    # The query is the projection of q_resid, reshaped, and nothing else: the Hadamard
+    # rotation and the INT8 quantization belong to the scoring stage.
+    replayed = F.linear(q_resid.float(), w_q_b.float()).unflatten(-1, (heads, dim))
+    _check(
+        torch.equal(index_q, replayed.to(torch.bfloat16)),
+        "index_q must be the plain reshaped projection of q_resid",
+    )
+
+    # head_weights carries the INDEX_H ** -0.5 factor.
+    unscaled = F.linear(x.float(), w_weights.float())
+    _check(
+        torch.allclose(head_weights, unscaled * heads**-0.5, atol=1e-5),
+        "head_weights must carry the index-head scaling",
+    )
+
+    # k_norm is a LayerNorm: shifting its input row by a constant must leave the result
+    # unchanged, which is false for the RMSNorm every other norm in this model uses.
+    raw = F.linear(x.float(), w_k.float())
+    shifted = layer_norm(raw + 3.0, k_norm_weight, k_norm_bias, eps=1e-6)
+    unshifted = layer_norm(raw, k_norm_weight, k_norm_bias, eps=1e-6)
+    _check(
+        torch.allclose(shifted.float(), unshifted.float(), atol=2e-2),
+        "the key norm must subtract the row mean",
+    )
+    reference = layer_norm(raw, k_norm_weight, k_norm_bias, eps=1e-6).to(torch.bfloat16)
+    deviation = (index_k.float() - reference.float()).abs().max()
+    _check(
+        float(deviation) < 5e-2 * max(float(reference.float().abs().max()), 1e-3),
+        f"index_k deviates from the LayerNorm reference by {float(deviation)}",
+    )
+
+    _report("indexer_proj")
+
+
 def _sparse_attention_fixture(seed: int):
     """Build one small paged selection: cache, block table, indices and query."""
     torch.manual_seed(seed)
@@ -456,6 +521,7 @@ def run_mla_epilog_goldens(golden_epilog_prefill, golden_epilog_decode) -> None:
 __all__ = [
     "run_decode_sparse_attn_golden",
     "run_indexer_cache_golden",
+    "run_indexer_proj_golden",
     "run_mhc_goldens",
     "run_mla_cache_golden",
     "run_mla_epilog_goldens",

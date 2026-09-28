@@ -283,7 +283,7 @@ contracts and publishes them first.
 | --- | --- | ---: | ---: | ---: | --- |
 | **A** | KDA linear attention — 34 of the 45 backbone layers | 5 | 10 | 50-82 | `kda_chunk_delta_prefill` — the chunked delta rule, 20-32 days on its own |
 | **B** | NoPE MLA sparse attention — 11 sparse layers + the MTP layer | 5 | 6 | 45-72 | `mla_sparse_attn_prefill` — gather-and-attend over 2051 selected rows, 15-25 days |
-| **C** | kpool DSA indexer and mHC — 12 indexer instances; mHC on all 45 layers | 4 | 11 | 38-60 | `indexer_cache` — it blocks five downstream items, so land it in week one |
+| **C** | kpool DSA indexer and mHC — 12 indexer instances; mHC on all 45 layers | 5 | 11 | 38-60 | `indexer_cache` — it blocks five downstream items, so land it in week one |
 | **D** | MoE, primitives, output head, MTP — 43 sparse layers, 3 dense layers, the draft step | 12 | 14 | 61-100 | `moe_dispatch_ep16` — the 16-rank all-to-all, 14-22 days |
 | **E** | Runtime, weight loading, composition — the whole model | 9 | 6 | 76-120 | `layer_composition` — 40-60 days, and by definition it lands last |
 | *(staged)* | Vision tower — prefill of multimodal requests only | 5 | 6 | 23-35 | `vision_attention` — non-causal varlen attention, no donor in this repo |
@@ -330,9 +330,9 @@ Phase one is streams A-E: **269-434 engineer-days** across five owners, before a
 
 ### Stream C — kpool DSA indexer and mHC
 
-*12 indexer instances; mHC on all 45 layers · 4 files · 11 work items · 38-60 engineer-days*
+*12 indexer instances; mHC on all 45 layers · 5 files · 11 work items · 38-60 engineer-days*
 
-**Files.** `prefill_indexer.py`, `decode_indexer.py`, `indexer_cache.py`, `mhc.py`
+**Files.** `prefill_indexer.py`, `decode_indexer.py`, `indexer.py`, `indexer_cache.py`, `mhc.py`
 
 **Where to start.** `deepseek_v4_flash_mtp/{prefill,decode}_indexer.py` for the selection pipeline (its `_cp_topk512_query` is the same K over the same candidate cap), and `hc_{pre,post,head}.py` for mHC. The k-pooling stage has no donor anywhere.
 
@@ -349,6 +349,79 @@ Phase one is streams A-E: **269-434 engineer-days** across five owners, before a
 | `indexer_expand_tail` | NEW | S | 2-3 | — |
 | `mhc_post` | ADAPT | S | 1.5-3 | `mhc_pre`, `mhc_mixes` |
 | `mhc_head` | ADAPT | S | 1-2 | `mhc_post` |
+
+#### Implemented stream C entry points
+
+The projection kernels and their Torch references live in `prefill_indexer.py`
+and `decode_indexer.py`. Both phases import the common pooling, scoring, top-k,
+sharing and expansion kernels from `indexer.py`; `indexer_select` composes these
+stages. `indexer_cache.py` provides the raw-state scatter. All four mHC kernels,
+including coefficient generation, have executable validation in `mhc.py`.
+
+The completed selection ABI adds metadata absent from the original placeholders:
+
+| Tensor | Shape / meaning |
+| --- | --- |
+| `pool_slots` | `[P, 4]` physical raw-state cache slots; `-1` makes a pool incomplete |
+| `pool_request`, `pool_last_position` | `[P]` candidate owner and last request-local token position |
+| `query_request`, `query_position` | `[T]` query owner and last visible token position |
+| `query_source` | `[T]` selection anchor; identity for ordinary prefill/decode |
+| `pool_count` | `[T]` complete visible pools for anchors, zero for shared rows |
+| `hadamard` | BF16 `[128, 128]` normalized Sylvester matrix, generated once by the loader |
+| `tail_start`, `tail_count`, `kv_len` | `[T]` per-query expansion bounds |
+
+`build_indexer_metadata` lowers a raw-state block table and populated cache lengths
+into these tensors. Its candidate rows are compacted across requests, with at
+least one invalid dummy row for empty contexts. They are temporary selection
+inputs, not physical pooled-cache addresses. The helper validates request IDs,
+positions and block-table capacity. `indexer_topk` translates candidate row IDs
+back into request-local pool IDs. `indexer_expand` then returns logical token
+positions; sparse attention performs the separate MLA-page lookup.
+
+Pooling uses a stable per-channel softmax across four tokens. Incomplete pools
+produce zero keys and a false validity flag. Scoring masks both other requests
+and future pools before top-k. The a2a3 scoring implementation rotates **both**
+queries and pooled keys into the same Hadamard basis, dynamically quantizes each
+128-wide row to symmetric INT8, uses INT32 cube accumulation, and dequantizes
+before scaling, ReLU and head weighting. Raw state remains FP32 and pooled keys
+remain BF16; the INT8 tensors are scoring scratch. This is an a2a3 numerical
+contract, not bit-exact reproduction of the upstream FP8 scoring path. Real-weight
+selection quality and device performance still require model-level evaluation.
+
+MTP sharing is explicit and optional (`share_mtp=True`). Rows share an anchor only
+within the same request **and the same number of visible complete pools**. A pool
+boundary starts another anchor, preventing a newly complete pool from disappearing
+from the candidate set. Up to four speculative rows per request are accepted.
+Only anchors run score matmuls and top-k; each row still expands its own tail.
+
+mHC keeps BF16 streams and FP32 coefficients/accumulation. Coefficient generation
+uses a BF16 projection followed by the FP32 RMS factor, sigmoids and 20 Sinkhorn
+iterations. Its 8x8 vector tile contains four copies of the logical 4x4 residual
+matrix; multiplying both reduction sums by one half preserves the equations
+without padded lanes in the iterative state.
+
+Validation commands (simulator; replace `a2a3sim` with an allocated device target
+for onboard validation):
+
+```bash
+python models/glm5_3_flash/prefill_indexer.py -p a2a3sim --tokens 1
+python models/glm5_3_flash/decode_indexer.py -p a2a3sim --tokens 20
+python models/glm5_3_flash/indexer.py -p a2a3sim
+python models/glm5_3_flash/indexer.py -p a2a3sim --case select --share-mtp
+python models/glm5_3_flash/indexer.py -p a2a3sim --case select --edge
+python models/glm5_3_flash/indexer.py -p a2a3sim --case topk --long-topk --ties
+python models/glm5_3_flash/mhc.py -p a2a3sim --tokens 20
+python models/glm5_3_flash/indexer.py --golden-only
+python models/glm5_3_flash/mhc.py --golden-only
+python models/glm5_3_flash/prefill_indexer.py --golden-only
+python models/glm5_3_flash/decode_indexer.py --golden-only
+```
+
+Validation helpers and CLI entry points live beside their kernels in the same
+files. The indexer harness covers shuffled pages, multiple requests, 0-3 token contexts,
+causal masks, pool-boundary reanchoring, non-prefix candidate masks, top-k across
+4099 candidates, tied scores, and a full 2051-position output. The CPU golden checks also
+check stable pooling with extreme logits and the replicated Sinkhorn equations.
 
 #### What front-packed `topk_indices` costs `indexer_expand`
 
@@ -385,9 +458,10 @@ Two consequences for the neighbouring work items:
   already fills the row with `-1` and then writes only `min(visible_count, K)` lanes
   from the score-sorted pairs, so its padding is a suffix by construction.
 - `indexer_share_mtp` saves less than it looks. The `1 + MTP_SPEC_TOKENS` rows of a
-  request share a selection, but their `kv_len` differ by up to 3, so `tail_count`
-  and the write cursor are per row. Sharing removes the scoring and the top-k, not
-  the expansion.
+  request can share a selection while the complete-pool count stays unchanged.
+  Their `kv_len` differ by up to 3, so `tail_count` and the write cursor are per row;
+  crossing a pool boundary requires another anchor. Sharing removes repeated
+  scoring and top-k within each group, while expansion remains per row.
 
 A padded row in a packed decode batch — one that owns no cache slot — expands to an
 all-`-1` row, and that is the only case in which the consumers' row-level
