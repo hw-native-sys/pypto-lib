@@ -203,6 +203,7 @@ def _run_lm_head(argv):
     from models.deepseek_v4_1_flash.lm_head import (
         DP_SIZE,
         TP_SIZE,
+        WORLD_SIZE,
         build_tensor_specs,
         compare_logits,
         compare_sampled_ids,
@@ -216,7 +217,7 @@ def _run_lm_head(argv):
     parser.add_argument("--tp", type=int, default=TP_SIZE)
     parser.add_argument("--dp", type=int, default=DP_SIZE)
     parser.add_argument("--num-tokens", type=int, default=16)
-    parser.add_argument("-d", "--device", type=str, default=",".join(str(i) for i in range(DP_SIZE)))
+    parser.add_argument("-d", "--device", type=str, default=",".join(str(i) for i in range(WORLD_SIZE)))
     parser.add_argument("--compile-only", action="store_true", default=False)
     args, _unknown = parser.parse_known_args(argv)
     if args.tp != TP_SIZE or args.dp != DP_SIZE:
@@ -232,7 +233,9 @@ def _run_lm_head(argv):
         compare_fn={"logits": compare_logits, "sampled_ids": compare_sampled_ids},
         compile_only=args.compile_only,
         config=dict(
-            distributed_config=DistributedConfig(device_ids=device_ids[:DP_SIZE], num_sub_workers=0),
+            distributed_config=DistributedConfig(
+                device_ids=device_ids[:WORLD_SIZE], num_sub_workers=0
+            ),
             platform=args.platform,
         ),
         rtol=1e-3,

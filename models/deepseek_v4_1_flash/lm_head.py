@@ -11,9 +11,10 @@
 
 Hidden states must already have passed the final RMSNorm.
 
-The DP world is cut into ``--dp // --tp`` groups. Every card is both an owner and
-a TP rank: it holds vocab shard ``rank % TP_SIZE`` and serves only its own group,
-so every ``peer`` is ``group_base + tp_rank``.
+``--dp`` is the number of DP groups (attention-DP owners per TP group), matching
+MTP/dspark. Total cards are ``WORLD_SIZE = TP_SIZE * DP_SIZE``. Every card is
+both an owner and a TP rank: it holds vocab shard ``rank % TP_SIZE`` and serves
+only its own group, so every ``peer`` is ``group_base + tp_rank``.
 
 Dispatch all-gathers the hidden rows, the matmul projects every group row against
 this card's vocab shard, and combine all-to-alls the logits so each owner ends up
@@ -24,6 +25,11 @@ block count.
 
 Per-card cost tracks ``VOCAB_PER_TP``, not the DP world size: the matmul M extent
 is always ``TP_SIZE * MAX_LOGIT_ROWS``.
+
+Retained CommDomains reuse the same done windows across forwards by passing an
+incrementing ``done_epoch`` (1, 2, …). Counters are never cleared: wait expects
+``done_epoch * notifies_per_source``, so a fixed epoch plus clear would race with
+the next round's AtomicAdd.
 
 TP1 bring-up uses ``MAX_LOGIT_ROWS=16`` so ``GROUP_LOGIT_ROWS`` stays a multiple of
 16 without MTP's AIV/MATMUL_ROWS padding path. Do not size the fixture from
@@ -69,9 +75,9 @@ def _parse_int_argv(name, default=None):
 
 
 TP_SIZE: int = _parse_int_argv("--tp") or _TP_DEFAULT
-# --dp only sizes the standalone l3_lm_head fixture: how many DP ranks it builds.
-# The kernel itself carries no DP extent, so composed callers never pass it.
+# DP groups built by the l3_lm_head fixture; the kernel carries no DP extent.
 DP_SIZE: int = _parse_int_argv("--dp") or 1
+WORLD_SIZE = TP_SIZE * DP_SIZE
 VOCAB_PER_TP = VOCAB // TP_SIZE
 
 # Small decode fixture size (not DECODE_MAX_TOKENS). TP1 * 16 == 16 satisfies
@@ -88,7 +94,10 @@ LOGITS_COMM_TILE = 2048
 VOCAB_TAIL = VOCAB_PER_TP % FUSED_VOCAB_TILE
 LOGITS_COMM_TAIL = VOCAB_PER_TP % LOGITS_COMM_TILE
 FUSED_LM_HEAD_CORES = 24
-DONE_VALUE = 1
+# Host passes done_epoch = epoch_idx + 1 for each retained-CommDomain forward.
+# --repeat N runs N forwards with epoch 1..N on the same windows (no clear).
+_REPEAT_CHOICES = (1, 2, 4)
+REPEAT: int = _parse_int_argv("--repeat") or 1
 
 # Greedy sampling uses exact 256-token chunks so the real vocabulary has no
 # padded tail. The 505 chunk maxima are padded to 512 for the final merge sort.
@@ -115,7 +124,7 @@ assert GREEDY_NUM_VOCAB_CHUNKS <= GREEDY_CHUNK_PAD
 assert GROUP_LOGIT_ROWS % 16 == 0, "matmul M extent must be a multiple of 16"
 assert TP_SIZE in _TP_CHOICES, f"--tp must be one of {_TP_CHOICES} (got {TP_SIZE})"
 assert DP_SIZE in _DP_CHOICES, f"--dp must be one of {_DP_CHOICES} (got {DP_SIZE})"
-assert DP_SIZE % TP_SIZE == 0, f"--dp must be a multiple of --tp, got dp={DP_SIZE}, tp={TP_SIZE}"
+assert REPEAT in _REPEAT_CHOICES, f"--repeat must be one of {_REPEAT_CHOICES} (got {REPEAT})"
 
 
 @pl.jit.inline(auto_scope=False)
@@ -309,15 +318,8 @@ def lm_head(
                     tl = src_vocab_base + tail_o0
                     logits[:, tl : tl + LOGITS_COMM_TAIL] = logits_window[:, tl : tl + LOGITS_COMM_TAIL]
 
-    # Every local wait has observed all current-round peer notifies before the
-    # logits gather can complete. Clear only this rank's counters so a retained
-    # CommDomain can safely reuse the fixed done_epoch on the next forward.
-    with pl.at(level=pl.Level.CORE_GROUP, name_hint="lm_head_signal_clear"):
-        _completion_anchor = pl.read(logits, [0, 0])
-        zero = pl.cast(0, pl.INT32)
-        for src_tp in pl.range(TP_SIZE):
-            pl.write(hidden_done, [src_tp, 0], zero)
-            pl.write(logits_done, [src_tp, 0], zero)
+    # Counters stay cumulative. The next retained-CommDomain forward must pass
+    # done_epoch = previous + 1 so waits observe the new AtomicAdd totals.
     return logits
 
 
@@ -482,13 +484,13 @@ def lm_head_with_sampling_test(
 
 @pl.jit.host
 def l3_lm_head(
-    hidden_states: pl.Tensor[[DP_SIZE, TEST_TOKENS, D], pl.BF16],
-    lm_head_weight: pl.Tensor[[DP_SIZE, VOCAB_PER_TP, D], pl.BF16],
-    logits: pl.Out[pl.Tensor[[DP_SIZE, MAX_LOGIT_ROWS, VOCAB], pl.FP32]],
+    hidden_states: pl.Tensor[[WORLD_SIZE, TEST_TOKENS, D], pl.BF16],
+    lm_head_weight: pl.Tensor[[WORLD_SIZE, VOCAB_PER_TP, D], pl.BF16],
+    logits: pl.Out[pl.Tensor[[WORLD_SIZE, MAX_LOGIT_ROWS, VOCAB], pl.FP32]],
     sampled_ids: pl.Out[
-        pl.Tensor[[DP_SIZE, MAX_LOGIT_ROWS, SAMPLED_IDS_PAD], pl.INT32]
+        pl.Tensor[[WORLD_SIZE, MAX_LOGIT_ROWS, SAMPLED_IDS_PAD], pl.INT32]
     ],
-    logit_row_indices: pl.Tensor[[DP_SIZE, MAX_LOGIT_ROWS], pl.INT32],
+    logit_row_indices: pl.Tensor[[WORLD_SIZE, MAX_LOGIT_ROWS], pl.INT32],
 ):
     # Windows are group-local: hidden_window holds one row slot per group member,
     # and every card receives only its own full-vocabulary logits.
@@ -497,17 +499,50 @@ def l3_lm_head(
     hidden_done_buf = pld.alloc_window_buffer(TP_SIZE * 4)
     logits_done_buf = pld.alloc_window_buffer(TP_SIZE * 4)
 
-    for r in pl.range(pld.world_size()):
-        hidden_window = pld.window(hidden_window_buf, [GROUP_LOGIT_ROWS, D], dtype=pl.BF16)
-        hidden_done = pld.window(hidden_done_buf, [TP_SIZE, 1], dtype=pl.INT32)
-        logits_window = pld.window(logits_window_buf, [MAX_LOGIT_ROWS, VOCAB], dtype=pl.FP32)
-        logits_done = pld.window(logits_done_buf, [TP_SIZE, 1], dtype=pl.INT32)
-        lm_head_with_sampling_test(
-            hidden_states[r], lm_head_weight[r], logit_row_indices[r], logits[r],
-            sampled_ids[r],
-            hidden_window, hidden_done, logits_window, logits_done,
-            r // TP_SIZE * TP_SIZE, r % TP_SIZE, DONE_VALUE, device=r,
-        )
+    # REPEAT forwards share the same windows; epoch_idx+1 is the done_epoch so
+    # wait expected values track cumulative AtomicAdd totals without clearing.
+    for epoch_idx in pl.range(REPEAT):
+        for r in pl.range(pld.world_size()):
+            hidden_window = pld.window(hidden_window_buf, [GROUP_LOGIT_ROWS, D], dtype=pl.BF16)
+            hidden_done = pld.window(hidden_done_buf, [TP_SIZE, 1], dtype=pl.INT32)
+            logits_window = pld.window(logits_window_buf, [MAX_LOGIT_ROWS, VOCAB], dtype=pl.FP32)
+            logits_done = pld.window(logits_done_buf, [TP_SIZE, 1], dtype=pl.INT32)
+            lm_head_with_sampling_test(
+                hidden_states[r], lm_head_weight[r], logit_row_indices[r], logits[r],
+                sampled_ids[r],
+                hidden_window, hidden_done, logits_window, logits_done,
+                r // TP_SIZE * TP_SIZE, r % TP_SIZE, epoch_idx + 1, device=r,
+            )
+
+
+@pl.jit.host
+def l3_lm_head_twice(
+    hidden_states: pl.Tensor[[WORLD_SIZE, TEST_TOKENS, D], pl.BF16],
+    lm_head_weight: pl.Tensor[[WORLD_SIZE, VOCAB_PER_TP, D], pl.BF16],
+    logits: pl.Out[pl.Tensor[[WORLD_SIZE, MAX_LOGIT_ROWS, VOCAB], pl.FP32]],
+    sampled_ids: pl.Out[
+        pl.Tensor[[WORLD_SIZE, MAX_LOGIT_ROWS, SAMPLED_IDS_PAD], pl.INT32]
+    ],
+    logit_row_indices: pl.Tensor[[WORLD_SIZE, MAX_LOGIT_ROWS], pl.INT32],
+):
+    """Two retained-CommDomain forwards (done_epoch 1 then 2) for CI consecutive-call coverage."""
+    hidden_window_buf = pld.alloc_window_buffer(GROUP_LOGIT_ROWS * D * 2)
+    logits_window_buf = pld.alloc_window_buffer(MAX_LOGIT_ROWS * VOCAB * 4)
+    hidden_done_buf = pld.alloc_window_buffer(TP_SIZE * 4)
+    logits_done_buf = pld.alloc_window_buffer(TP_SIZE * 4)
+
+    for epoch_idx in pl.range(2):
+        for r in pl.range(pld.world_size()):
+            hidden_window = pld.window(hidden_window_buf, [GROUP_LOGIT_ROWS, D], dtype=pl.BF16)
+            hidden_done = pld.window(hidden_done_buf, [TP_SIZE, 1], dtype=pl.INT32)
+            logits_window = pld.window(logits_window_buf, [MAX_LOGIT_ROWS, VOCAB], dtype=pl.FP32)
+            logits_done = pld.window(logits_done_buf, [TP_SIZE, 1], dtype=pl.INT32)
+            lm_head_with_sampling_test(
+                hidden_states[r], lm_head_weight[r], logit_row_indices[r], logits[r],
+                sampled_ids[r],
+                hidden_window, hidden_done, logits_window, logits_done,
+                r // TP_SIZE * TP_SIZE, r % TP_SIZE, epoch_idx + 1, device=r,
+            )
 
 
 def golden_lm_head(tensors):
@@ -519,7 +554,7 @@ def golden_lm_head(tensors):
     weight = tensors["lm_head_weight"].float()
     full_weight = torch.cat([weight[tp] for tp in range(TP_SIZE)], dim=0)
     full_logits = []
-    for owner_rank in range(DP_SIZE):
+    for owner_rank in range(WORLD_SIZE):
         selected = torch.zeros((MAX_LOGIT_ROWS, D), dtype=torch.float32)
         for row in range(MAX_LOGIT_ROWS):
             source_row = int(tensors["logit_row_indices"][owner_rank, row])
@@ -543,47 +578,47 @@ def build_tensor_specs(num_tokens=TEST_TOKENS):
     active = max(min(num_tokens, MAX_LOGIT_ROWS), 0)
 
     def init_hidden_states():
-        return (torch.randn(DP_SIZE, TEST_TOKENS, D) * 0.1).to(torch.bfloat16)
+        return (torch.randn(WORLD_SIZE, TEST_TOKENS, D) * 0.1).to(torch.bfloat16)
 
     def init_lm_head_weight():
         shards = (torch.randn(TP_SIZE, VOCAB_PER_TP, D) / D ** 0.5).to(torch.bfloat16)
-        return torch.stack([shards[r % TP_SIZE] for r in range(DP_SIZE)], dim=0)
+        return torch.stack([shards[r % TP_SIZE] for r in range(WORLD_SIZE)], dim=0)
 
     def init_logit_row_indices():
-        indices = torch.full((DP_SIZE, MAX_LOGIT_ROWS), -1, dtype=torch.int32)
+        indices = torch.full((WORLD_SIZE, MAX_LOGIT_ROWS), -1, dtype=torch.int32)
         indices[:, :active] = torch.arange(active, dtype=torch.int32)
         return indices
 
     return [
         TensorSpec(
             "hidden_states",
-            [DP_SIZE, TEST_TOKENS, D],
+            [WORLD_SIZE, TEST_TOKENS, D],
             torch.bfloat16,
             init_value=init_hidden_states,
         ),
-        # One vocab shard per DP rank: card r carries a copy of shard
+        # One vocab shard per world rank: card r carries a copy of shard
         # r % TP_SIZE, matching how resident args are handed out per rank. Keep
         # each rank-local shard on its consuming card across dispatches.
         TensorSpec(
             "lm_head_weight",
-            [DP_SIZE, VOCAB_PER_TP, D],
+            [WORLD_SIZE, VOCAB_PER_TP, D],
             torch.bfloat16,
             init_value=init_lm_head_weight,
             resident="stacked",
         ),
         TensorSpec(
             "logits",
-            [DP_SIZE, MAX_LOGIT_ROWS, VOCAB],
+            [WORLD_SIZE, MAX_LOGIT_ROWS, VOCAB],
             torch.float32,
         ),
         TensorSpec(
             "sampled_ids",
-            [DP_SIZE, MAX_LOGIT_ROWS, SAMPLED_IDS_PAD],
+            [WORLD_SIZE, MAX_LOGIT_ROWS, SAMPLED_IDS_PAD],
             torch.int32,
         ),
         TensorSpec(
             "logit_row_indices",
-            [DP_SIZE, MAX_LOGIT_ROWS],
+            [WORLD_SIZE, MAX_LOGIT_ROWS],
             torch.int32,
             init_value=init_logit_row_indices,
         ),
@@ -634,11 +669,13 @@ __all__ = [
     "DP_SIZE",
     "GROUP_LOGIT_ROWS",
     "MAX_LOGIT_ROWS",
+    "REPEAT",
     "SAMPLED_IDS_PAD",
     "TEST_TOKENS",
     "TP_SIZE",
     "VOCAB",
     "VOCAB_PER_TP",
+    "WORLD_SIZE",
     "build_tensor_specs",
     "compare_logits",
     "compare_sampled_ids",
@@ -646,6 +683,7 @@ __all__ = [
     "golden_lm_head_all_ranks",
     "greedy_sample",
     "l3_lm_head",
+    "l3_lm_head_twice",
     "lm_head",
     "lm_head_test",
     "lm_head_with_sampling",
@@ -671,11 +709,14 @@ def validate(argv=None):
     parser.add_argument("--tp", type=int, default=TP_SIZE, choices=list(_TP_CHOICES),
                         help="LM-head tensor-parallel world size")
     parser.add_argument("--dp", type=int, default=DP_SIZE, choices=list(_DP_CHOICES),
-                        help="Attention-DP world size (hidden-row owners)")
+                        help="DP groups (world size = tp * dp)")
+    parser.add_argument("--repeat", type=int, default=REPEAT, choices=list(_REPEAT_CHOICES),
+                        help="retained-CommDomain forwards with done_epoch 1..N")
     parser.add_argument("--num-tokens", type=int, default=TEST_TOKENS,
-                        help="Active hidden rows each owner projects")
-    parser.add_argument("-d", "--device", type=str, default=",".join(str(i) for i in range(DP_SIZE)),
-                        help=f"comma-separated device ids; need at least {DP_SIZE}")
+                        help="Active hidden rows each owner projects (0 = empty shard)")
+    parser.add_argument("-d", "--device", type=str,
+                        default=",".join(str(i) for i in range(WORLD_SIZE)),
+                        help=f"comma-separated device ids; need at least {WORLD_SIZE}")
     parser.add_argument("--enable-chip-swimlane", type=int, nargs="?", const=1, default=0, choices=range(5))
     parser.add_argument("--compile-only", action="store_true", default=False)
     parser.add_argument("--runtime-dir", type=str, default=None)
@@ -683,12 +724,12 @@ def validate(argv=None):
     args = parser.parse_args(argv)
 
     device_ids = [int(d) for d in args.device.split(",")]
-    required_devices = DP_SIZE
+    required_devices = WORLD_SIZE
     assert len(device_ids) >= required_devices, (
         f"need at least {required_devices} devices, got {device_ids}"
     )
-    assert args.tp == TP_SIZE and args.dp == DP_SIZE
-    assert 1 <= args.num_tokens <= TEST_TOKENS
+    assert args.tp == TP_SIZE and args.dp == DP_SIZE and args.repeat == REPEAT
+    assert 0 <= args.num_tokens <= TEST_TOKENS
 
     return run(
         fn=l3_lm_head,
@@ -729,6 +770,49 @@ def test_precision(a5_args):
     assert result.passed, result.error
 
 
+def test_empty_shard(a5_args):
+    """Empty logit rows (all -1 indices) stay zero and still sample consistently."""
+    result = validate(a5_args() + ["--num-tokens", "0"])
+    assert result.passed, result.error
+
+
+def test_repeat_forward(a5_args):
+    """Two retained-CommDomain forwards with done_epoch 1 then 2 (TP1 CI path)."""
+    from golden import run
+
+    device_args = a5_args()
+    # Reuse validate's device list; run the twice-host without import-time --repeat.
+    import argparse
+
+    parser = argparse.ArgumentParser()
+    parser.add_argument("-p", "--platform", type=str, default="a5")
+    parser.add_argument("-d", "--device", type=str, required=True)
+    parser.add_argument("--tp", type=int, default=TP_SIZE)
+    parser.add_argument("--dp", type=int, default=DP_SIZE)
+    known, _ = parser.parse_known_args(device_args)
+    device_ids = [int(d) for d in known.device.split(",")]
+    assert len(device_ids) >= WORLD_SIZE
+    result = run(
+        fn=l3_lm_head_twice,
+        specs=build_tensor_specs(TEST_TOKENS),
+        golden_fn=golden_lm_head,
+        compare_fn={
+            "logits": compare_logits,
+            "sampled_ids": compare_sampled_ids,
+        },
+        config=dict(
+            distributed_config=DistributedConfig(
+                device_ids=device_ids[:WORLD_SIZE],
+                num_sub_workers=0,
+            ),
+            platform=known.platform,
+        ),
+        rtol=1e-3,
+        atol=1e-3,
+    )
+    assert result.passed, result.error
+
+
 if __name__ == _SCRIPT_ENTRY_POINT:
     main()
 
@@ -737,7 +821,7 @@ def golden_lm_head_all_ranks(tensors, *, n_ranks):
     """LM-head replay generalized to ``n_ranks`` owners.
 
     Mirrors ``lm_head.golden_lm_head`` but iterates the caller's EP world instead
-    of the standalone fixture's DP_SIZE (which defaults to 1 and would
+    of the standalone fixture's WORLD_SIZE (which defaults to 1 and would
     fill only the first TP group's rows when EP > TP). Card ``r`` holds vocab
     shard ``r % TP_SIZE``, so concatenating the first TP_SIZE shards in index
     order reproduces the global vocabulary every owner assembles.
