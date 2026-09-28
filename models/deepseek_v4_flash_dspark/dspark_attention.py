@@ -26,7 +26,7 @@ from config import (
     KV_ORI_BLOCK_NUM,
     MOE_TOKENS,
 )
-from decode_o_proj import ATTENTION_PUBLISH_WORKERS, LOCAL_T_PAD
+from decode_o_proj import LOCAL_T_PAD
 from qkv_proj_rope import (
     kv_proj_rope,
     q_proj_rope,
@@ -184,10 +184,15 @@ def dspark_attention(
                     visible_kv[g_dst : g_dst + 1, 0:HEAD_DIM] = pl.full([1, HEAD_DIM], dtype=pl.BF16, value=0.0)
 
     q_flat = pl.reshape(q, [T * H, HEAD_DIM])
+    # Save online-softmax state for the fused publish phase after QK/PV.
     sparse_mi = pl.create_tensor([T * H, 1], dtype=pl.FP32)
     sparse_li = pl.create_tensor([T * H, 1], dtype=pl.FP32)
     sparse_oi = pl.create_tensor([T * H, HEAD_DIM], dtype=pl.FP32)
     attn_sink_col = pl.reshape(attn_sink, [H, 1])
+    o_packed_flat = pl.reshape(
+        o_packed_heads,
+        [O_GROUPS * LOCAL_T_PAD * HEADS_PER_GROUP, HEAD_DIM],
+    )
     transfer_slots = NUM_QK_CORES * QK_TRANSFER_SLOTS
     transfer_heads = transfer_slots * H
     score_transfer = pl.create_tensor([transfer_heads, ATTN_K_TILE], dtype=pl.FP32)
@@ -317,54 +322,66 @@ def dspark_attention(
                 pl.store(running_left, [qk_output_row, 0], sparse_oi)
                 pl.store(running_right, [qk_output_row, HEAD_DIM // 2], sparse_oi)
 
-    o_packed_flat = pl.reshape(
-        o_packed_heads,
-        [O_GROUPS * LOCAL_T_PAD * HEADS_PER_GROUP, HEAD_DIM],
-    )
-    for merge_worker in pl.spmd(ATTENTION_PUBLISH_WORKERS, name_hint="dspark_merge_norm"):
-        # RoPE swap indices are identical for every token.
-        merge_swap_col = pl.load(rope_swap_idx, [0, 0], [1, ROPE_DIM])
-        merge_swap_offset = pl.add(pl.cast(merge_swap_col, target_type=pl.FP32), NOPE_DIM)
-        merge_swap_grid = pl.col_expand_add(
-            pl.tile.full([H_TILE, ROPE_DIM], dtype=pl.FP32, value=0.0), merge_swap_offset
-        )
-        merge_row_ids = pl.tile.arange(0, [1, H_TILE], dtype=pl.INT32)
-        merge_row_offsets = pl.reshape(
-            pl.mul(pl.cast(merge_row_ids, target_type=pl.FP32), HEAD_DIM), [H_TILE, 1]
-        )
-        merge_swap_flat = pl.row_expand_add(merge_swap_grid, merge_row_offsets)
-        merge_swap_indices = pl.cast(merge_swap_flat, target_type=pl.INT32)
-        merge_gather_tmp = pl.create_tile([H_TILE, ROPE_DIM], dtype=pl.INT32)
-        for merge_idx in pl.range(merge_worker, T * (H // H_TILE), ATTENTION_PUBLISH_WORKERS):
-            merge_token_idx = merge_idx // (H // H_TILE)
-            merge_head0 = (merge_idx % (H // H_TILE)) * H_TILE
-            merge_partial_row0 = merge_token_idx * H + merge_head0
-            running_max = pl.load(sparse_mi, [merge_partial_row0, 0], [H_TILE, 1])
-            running_sum = pl.load(sparse_li, [merge_partial_row0, 0], [H_TILE, 1])
-            running_out = pl.load(sparse_oi, [merge_partial_row0, 0], [H_TILE, HEAD_DIM])
-            sink_col = pl.load(attn_sink_col, [merge_head0, 0], [H_TILE, 1])
-            sink_exp = pl.exp(pl.sub(sink_col, running_max))
-            denominator = pl.add(running_sum, sink_exp)
-            attn_normed = pl.row_expand_div(running_out, denominator)
+        # Publish this core's completed query rows without launching another task.
+        for merge_aiv in pl.split_aiv(2, mode=pl.SplitMode.NONE):
+            merge_lane_head0 = merge_aiv * (H // 2)
+            merge_swap_col = pl.load(rope_swap_idx, [0, 0], [1, ROPE_DIM])
+            merge_swap_offset = pl.add(pl.cast(merge_swap_col, target_type=pl.FP32), NOPE_DIM)
+            merge_swap_grid = pl.col_expand_add(
+                pl.tile.full([H_TILE, ROPE_DIM], dtype=pl.FP32, value=0.0),
+                merge_swap_offset,
+            )
+            merge_row_ids = pl.tile.arange(0, [1, H_TILE], dtype=pl.INT32)
+            merge_row_offsets = pl.reshape(
+                pl.mul(pl.cast(merge_row_ids, target_type=pl.FP32), HEAD_DIM),
+                [H_TILE, 1],
+            )
+            merge_swap_flat = pl.row_expand_add(merge_swap_grid, merge_row_offsets)
+            merge_swap_indices = pl.cast(merge_swap_flat, target_type=pl.INT32)
+            merge_gather_tmp = pl.create_tile([H_TILE, ROPE_DIM], dtype=pl.INT32)
+            for merge_t in pl.range(qk_core, T, NUM_QK_CORES):
+                merge_cos = pl.load(rope_cos_il, [merge_t, 0], [1, ROPE_DIM])
+                merge_sin = pl.load(rope_sin_signed, [merge_t, 0], [1, ROPE_DIM])
+                for merge_tile in pl.unroll((H // 2) // H_TILE):
+                    merge_lane_head = merge_tile * H_TILE
+                    merge_head0 = merge_lane_head0 + merge_lane_head
+                    merge_partial_row0 = merge_t * H + merge_head0
+                    merge_m = pl.load(sparse_mi, [merge_partial_row0, 0], [H_TILE, 1])
+                    merge_l = pl.load(sparse_li, [merge_partial_row0, 0], [H_TILE, 1])
+                    merge_out = pl.load(sparse_oi, [merge_partial_row0, 0], [H_TILE, HEAD_DIM])
+                    merge_sink = pl.load(attn_sink_col, [merge_head0, 0], [H_TILE, 1])
+                    merge_sink_exp = pl.exp(pl.sub(merge_sink, merge_m))
+                    merge_denom = pl.add(merge_l, merge_sink_exp)
+                    merge_normed = pl.row_expand_div(merge_out, merge_denom)
+                    merge_normed_bf16 = pl.cast(merge_normed, target_type=pl.BF16, mode="rint")
+                    merge_nope = merge_normed_bf16[:, 0:NOPE_DIM]
+                    merge_rope = merge_normed[:, NOPE_DIM:HEAD_DIM]
+                    merge_swapped = pl.tile.gather(
+                        merge_normed,
+                        merge_swap_indices,
+                        merge_gather_tmp,
+                    )
+                    inverse_cos = pl.col_expand_mul(merge_rope, merge_cos)
+                    inverse_sin = pl.col_expand_mul(merge_swapped, merge_sin)
+                    inverse_rope = pl.sub(inverse_cos, inverse_sin)
+                    inverse_rope_bf16 = pl.cast(inverse_rope, target_type=pl.BF16, mode="rint")
 
-            attn_normed_bf16 = pl.cast(attn_normed, target_type=pl.BF16, mode="rint")
-            attn_nope = attn_normed_bf16[:, 0:NOPE_DIM]
-            attn_rope = attn_normed[:, NOPE_DIM:HEAD_DIM]
-            rope_swapped = pl.tile.gather(attn_normed, merge_swap_indices, merge_gather_tmp)
-            cos_fp32 = pl.load(rope_cos_il, [merge_token_idx, 0], [1, ROPE_DIM])
-            sin_signed = pl.load(rope_sin_signed, [merge_token_idx, 0], [1, ROPE_DIM])
-            inverse_cos = pl.col_expand_mul(attn_rope, cos_fp32)
-            inverse_sin = pl.col_expand_mul(rope_swapped, sin_signed)
-            inverse_rope = pl.sub(inverse_cos, inverse_sin)
-            inverse_rope_bf16 = pl.cast(inverse_rope, target_type=pl.BF16, mode="rint")
-            for merge_group in pl.unroll(H_TILE // HEADS_PER_GROUP):
-                group = merge_head0 // HEADS_PER_GROUP + merge_group
-                group_head = merge_group * HEADS_PER_GROUP
-                packed_row = (group * LOCAL_T_PAD + merge_token_idx) * HEADS_PER_GROUP
-                packed_nope = pl.slice(attn_nope, [HEADS_PER_GROUP, NOPE_DIM], [group_head, 0])
-                packed_rope = pl.slice(inverse_rope_bf16, [HEADS_PER_GROUP, ROPE_DIM], [group_head, 0])
-                pl.store(packed_nope, [packed_row, 0], o_packed_flat)
-                pl.store(packed_rope, [packed_row, NOPE_DIM], o_packed_flat)
+                    for merge_group in pl.unroll(H_TILE // HEADS_PER_GROUP):
+                        group = merge_head0 // HEADS_PER_GROUP + merge_group
+                        group_head = merge_group * HEADS_PER_GROUP
+                        packed_row = (group * LOCAL_T_PAD + merge_t) * HEADS_PER_GROUP
+                        packed_nope = pl.slice(
+                            merge_nope,
+                            [HEADS_PER_GROUP, NOPE_DIM],
+                            [group_head, 0],
+                        )
+                        packed_rope = pl.slice(
+                            inverse_rope_bf16,
+                            [HEADS_PER_GROUP, ROPE_DIM],
+                            [group_head, 0],
+                        )
+                        pl.store(packed_nope, [packed_row, 0], o_packed_flat)
+                        pl.store(packed_rope, [packed_row, NOPE_DIM], o_packed_flat)
 
     return kv_cache, o_packed_heads
 
