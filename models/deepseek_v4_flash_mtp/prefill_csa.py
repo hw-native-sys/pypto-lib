@@ -9,6 +9,11 @@
 """DeepSeek-V4 packed prefill CSA attention: HC pre/post, ratio-4 compressor, indexer, sparse attention, cache writeback."""
 # ci: devices=2
 
+from attention_cli import add_model_argument, select_model
+
+if __name__ == "__main__":
+    select_model()
+
 import sys
 
 # Standalone CI passes its borrowed device list without a --cp argument.
@@ -186,7 +191,8 @@ GOLDEN_SCORE_ROW_CHUNK = 64
 GOLDEN_SCORE_COL_CHUNK = 16384
 SPARSE_SELECTED_WIDTH = IDX_TOPK
 CSA_TOPK_SEED_ROWS = 16
-PREFILL_CP_CSA_RING_HEAP = (1024 * 1024 * 1024,) * 4
+# Pro's grouped output-projection scratch is 3.5 times the Flash size.
+PREFILL_CP_CSA_RING_HEAP = ((4 if M.name == "pro" else 1) * 1024 * 1024 * 1024,) * 4
 # Temporary roots hold the prefix history plus this chunk's compressed rows,
 # page 0 being the zero sentinel; their page count is sized at runtime.
 CP_TMP_COMPRESSED_ROWS = (NUM_SEGMENTS * MAX_SEGMENT_TILES * T // COMPRESS_RATIO)
@@ -3062,6 +3068,7 @@ def golden_prefill_cp_csa(tensors):
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Standalone DeepSeek V4 context-parallel CSA test.")
+    add_model_argument(parser)
     parser.add_argument("-p", "--platform", default="a2a3", choices=["a2a3", "a2a3sim", "a5", "a5sim"])
     parser.add_argument("-d", "--device", default=",".join(str(i) for i in range(CP_SIZE)))
     parser.add_argument("--cp", type=int, default=CP_SIZE, choices=CP_CHOICES)

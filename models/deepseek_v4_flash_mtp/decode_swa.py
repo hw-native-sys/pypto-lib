@@ -14,6 +14,11 @@ in this path (model.py:478-479 selects base rope_theta when compress_ratio==0).
 Companion files: attention_csa_draft.py (ratio=4)
                  attention_hca_draft.py (ratio=128)."""
 
+from attention_cli import add_model_argument, select_model
+
+if __name__ == "__main__":
+    select_model()
+
 
 import pypto.language as pl
 
@@ -410,6 +415,7 @@ if __name__ == "__main__":
     from utils import parse_start_pos_arg
 
     parser = argparse.ArgumentParser()
+    add_model_argument(parser)
     parser.add_argument("-p", "--platform", type=str, default="a2a3",
                         choices=["a2a3", "a2a3sim", "a5", "a5sim"])
     parser.add_argument("-d", "--device", type=int, default=0)
