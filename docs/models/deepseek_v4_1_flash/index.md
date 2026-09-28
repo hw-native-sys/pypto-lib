@@ -130,7 +130,8 @@ Once a kernel body lands, its owner can extend the same file with the thin
 | Decoder C1A Reindex | `prefill_attn_c1a_reindex.py`, `decode_attn_c1a_reindex.py` (leaf), `prefill_c1a_reindex.py`, `decode_c1a_reindex.py` (HC orchestration) |
 | Decoder C1A Reuse | `prefill_attn_c1a_reuse.py`, `decode_attn_c1a_reuse.py` (leaf), `prefill_c1a_reuse.py`, `decode_c1a_reuse.py` (HC orchestration) |
 | Hierarchical indexer | `hierarchical_sparse_indexer.py` |
-| Hyper-connections | `hc_mixes.py`, `hc_pre.py`, `hc_post.py` |
+| Hyper-connections | `hc_mixes.py`, `hc_pre.py`, `hc_post.py`, `hc_head.py` (final collapse via `mhc_pre`, no learned head weights) |
+| Model boundary (embed / LM) | `input_pack.py` (`pack_x_hc`), `rmsnorm.py` (final norm), `lm_head.py` (TP vocab shard + greedy), `boundary_fwd.py` (embed→hc_head→rms_norm self-test; skips backbone) |
 | Attention TP transports | `attention_tp.py` |
 | Shared Attention primitives | `attention_ops.py` (`make_mx_projection`, BF16 projection, RMSNorm, RoPE, and dependency-aware variants) |
 | Shared Q/KV preprocessing | `qkv_proj_rope.py` (`q_proj_qr`, `q_proj_rope`, `kv_proj_rope`, `qkv_proj_rope` and Prefill variants) |
