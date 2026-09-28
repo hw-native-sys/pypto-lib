@@ -650,6 +650,7 @@ __all__ = [
     "lm_head_test",
     "lm_head_with_sampling",
     "lm_head_with_sampling_test",
+    "validate",
 ]
 
 
@@ -658,8 +659,10 @@ __all__ = [
 _SCRIPT_ENTRY_POINT = "__" + "main__"
 
 
-if __name__ == _SCRIPT_ENTRY_POINT:
+def validate(argv=None):
+    """Validate TP-sharded LM head + greedy sampling on A5."""
     import argparse
+
     from golden import run
 
     parser = argparse.ArgumentParser()
@@ -677,7 +680,7 @@ if __name__ == _SCRIPT_ENTRY_POINT:
     parser.add_argument("--compile-only", action="store_true", default=False)
     parser.add_argument("--runtime-dir", type=str, default=None)
     parser.add_argument("--dump-passes", action="store_true", default=False)
-    args = parser.parse_args()
+    args = parser.parse_args(argv)
 
     device_ids = [int(d) for d in args.device.split(",")]
     required_devices = DP_SIZE
@@ -687,19 +690,14 @@ if __name__ == _SCRIPT_ENTRY_POINT:
     assert args.tp == TP_SIZE and args.dp == DP_SIZE
     assert 1 <= args.num_tokens <= TEST_TOKENS
 
-    fn = l3_lm_head
-    specs = build_tensor_specs(args.num_tokens)
-    golden_fn = golden_lm_head
-    compare_fn = {
-        "logits": compare_logits,
-        "sampled_ids": compare_sampled_ids,
-    }
-
-    result = run(
-        fn=fn,
-        specs=specs,
-        golden_fn=golden_fn,
-        compare_fn=compare_fn,
+    return run(
+        fn=l3_lm_head,
+        specs=build_tensor_specs(args.num_tokens),
+        golden_fn=golden_lm_head,
+        compare_fn={
+            "logits": compare_logits,
+            "sampled_ids": compare_sampled_ids,
+        },
         compile_only=args.compile_only,
         runtime_dir=args.runtime_dir,
         config=dict(
@@ -714,10 +712,25 @@ if __name__ == _SCRIPT_ENTRY_POINT:
         rtol=1e-3,
         atol=1e-3,
     )
+
+
+def main():
+    """Run local validation and return a failing exit status on precision errors."""
+    result = validate()
     if not result.passed:
         if result.error:
             print(result.error)
         raise SystemExit(1)
+
+
+def test_precision(a5_args):
+    """Validate LM head + greedy sampling against its golden on A5."""
+    result = validate(a5_args())
+    assert result.passed, result.error
+
+
+if __name__ == _SCRIPT_ENTRY_POINT:
+    main()
 
 
 def golden_lm_head_all_ranks(tensors, *, n_ranks):

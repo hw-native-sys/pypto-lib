@@ -269,5 +269,11 @@ def main():
         print("[BOUNDARY] embed→hc_head→rms_norm and lm_head+greedy PASS")
 
 
+def test_precision(a5_args):
+    """Validate the embed → HC head → RMSNorm chain against its golden on A5."""
+    result = validate_embed_to_norm(a5_args())
+    assert result.passed, result.error
+
+
 if __name__ == _SCRIPT_ENTRY_POINT:
     main()
