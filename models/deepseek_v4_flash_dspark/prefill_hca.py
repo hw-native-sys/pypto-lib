@@ -937,10 +937,11 @@ def prefill_attention_hca_cp_core(
         pl.write(cache_ready_fence, [ready_block], ready_bit)
 
     # Per-request HCA streaming over rank-local packed query intervals.
+    attn_out_local_view = pl.reshape(attn_out_local, [q_dim, D])
     with pl.spmd(q_dim, name_hint="prefill_hca_cp_pad_output_init") as pad_output_tid:
         pad_t = pl.tile.get_block_idx()
         if pl.read(local_request_ids, [pad_t]) < 0:
-            attn_out_local[pad_t : pad_t + 1, :] = pl.full([1, D], dtype=pl.BF16, value=0.0)
+            attn_out_local_view[pad_t : pad_t + 1, :] = pl.full([1, D], dtype=pl.BF16, value=0.0)
     # Serial chain over requests, array carry as in the non-CP path above.
     request_deps = pl.array.create(1, pl.TASK_ID)
     request_deps[0] = pl.system.task_dummy(deps=[cache_ready_dep, pad_output_tid])

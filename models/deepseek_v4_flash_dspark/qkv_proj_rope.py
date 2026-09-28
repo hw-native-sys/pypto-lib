@@ -280,6 +280,8 @@ def q_proj_qr(
         tile_rows = pl.min(PREFILL_DENSE_TILE, t_dim - tile_base)
         with pl.scope():
             x_view = pl.reshape(x, [t_dim, D])
+            qr_i8_matmul_view = pl.reshape(qr_i8_matmul, [QPROJ_T_PAD, Q_LORA])
+            qr_scale_pad_store_view = pl.reshape(qr_scale_pad_store, [QPROJ_T_PAD, 1])
             qr_t_matmul = ((tile_rows + QR_M_TILE - 1) // QR_M_TILE) * QR_M_TILE
             qr_full_rows = (tile_rows // QR_DENSE_M_TILE) * QR_DENSE_M_TILE
             qproj_t_matmul = ((tile_rows + QPROJ_TAIL_M_TILE - 1) // QPROJ_TAIL_M_TILE) * QPROJ_TAIL_M_TILE
@@ -358,12 +360,12 @@ def q_proj_qr(
                     qr_scale_quant_row = pl.div(pl.full([1, T_TILE], dtype=pl.FP32, value=INT8_SCALE_MAX), qr_tile_amax)
                     qr_scale_quant_t = pl.reshape(qr_scale_quant_row, [T_TILE, 1])
                     qr_tile_scale_dq = pl.reshape(pl.recip(qr_scale_quant_row), [T_TILE, 1])
-                    qr_scale_pad_store = pl.assemble(qr_scale_pad_store, qr_tile_scale_dq, [tg, 0])
+                    qr_scale_pad_store_view = pl.assemble(qr_scale_pad_store_view, qr_tile_scale_dq, [tg, 0])
                     if valid_rows == T_TILE:
                         qr_scale_view[out_tg : out_tg + T_TILE, :] = qr_tile_scale_dq
                     else:
                         qr_scale_tail = pl.load(
-                            qr_scale_pad_store,
+                            qr_scale_pad_store_view,
                             [tg, 0],
                             [T_TILE, 1],
                             valid_shape=[valid_rows, 1],
@@ -380,12 +382,12 @@ def q_proj_qr(
                         qr_q_i32 = pl.cast(qr_q_scaled, target_type=pl.INT32, mode="rint")
                         qr_q_half = pl.cast(qr_q_i32, target_type=pl.FP16, mode="round")
                         qr_q_i8 = pl.cast(qr_q_half, target_type=pl.INT8, mode="trunc")
-                        qr_i8_matmul[tg : tg + T_TILE, qa : qa + QUANT_TILE] = qr_q_i8
+                        qr_i8_matmul_view[tg : tg + T_TILE, qa : qa + QUANT_TILE] = qr_q_i8
                         if valid_rows == T_TILE:
                             qr_view[out_tg : out_tg + T_TILE, qa : qa + QUANT_TILE] = qr_q_i8
                         else:
                             qr_q_tail = pl.load(
-                                qr_i8_matmul,
+                                qr_i8_matmul_view,
                                 [tg, qa],
                                 [T_TILE, QUANT_TILE],
                                 valid_shape=[valid_rows, QUANT_TILE],
