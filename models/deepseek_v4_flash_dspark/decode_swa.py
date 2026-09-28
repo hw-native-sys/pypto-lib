@@ -229,7 +229,7 @@ def _decode_swa(
     )
 
     kv_full = pl.create_tensor([kv_dim, HEAD_DIM], dtype=pl.BF16)
-    _gathered_kv, gather_signal, gather_done_tid = decode_cp_kv_allgather_step(
+    gather_signal, gather_done_tid = decode_cp_kv_allgather_step(
         kv_local, kv_full, gather_window, gather_signal, group_base, tp_rank, rms_tid,
     )
 
@@ -363,7 +363,6 @@ def _decode_swa(
 
     with pl.scope():
         hc_post(attn_out, x_hc, post_t, comb_t, x_out)
-    return x_out
 
 
 decode_swa = pl.jit.inline(auto_scope=False)(_decode_swa)

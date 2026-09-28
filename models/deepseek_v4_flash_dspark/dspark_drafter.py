@@ -399,10 +399,9 @@ def draft_layer(
     rms_norm(query_mixed_active, layer_attn_norm_w, query_normed)
     query_group = pl.create_tensor([DSPARK_CP_SIZE * T_QUERY, D], dtype=pl.BF16)
     with pl.scope():
-        query_group_view = pl.reshape(query_group, [DSPARK_CP_SIZE * T_QUERY, D])
         _gathered_query, hidden_gather_signal = prefill_cp_token_allgather_step(
             query_normed,
-            query_group_view,
+            query_group,
             hidden_gather_window,
             hidden_gather_signal,
             group_base,

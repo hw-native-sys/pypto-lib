@@ -533,11 +533,11 @@ def decode_cp_kv_allgather_step(
     ) as _readback_tid:
         worker = pl.tile.get_block_idx()
         for tile_row in pl.range(worker * READBACK_ROW_TILE, full_rows, READBACK_WORKERS * READBACK_ROW_TILE):
-            window_tile = gather_window[tile_row : tile_row + READBACK_ROW_TILE, 0:HEAD_DIM]
-            group_out[tile_row : tile_row + READBACK_ROW_TILE, 0:HEAD_DIM] = window_tile
+            window_tile = pl.load(gather_window, [tile_row, 0], [READBACK_ROW_TILE, HEAD_DIM])
+            pl.store(window_tile, [tile_row, 0], group_out)
         for tail_row in pl.range(full_rows + worker, group_rows, READBACK_WORKERS):
-            window_row = gather_window[tail_row : tail_row + 1, 0:HEAD_DIM]
-            group_out[tail_row : tail_row + 1, 0:HEAD_DIM] = window_row
+            window_row = pl.load(gather_window, [tail_row, 0], [1, HEAD_DIM])
+            pl.store(window_row, [tail_row, 0], group_out)
         for peer_tp in pl.range(TP_SIZE):
             if peer_tp != tp_rank:
                 pld.system.notify(
@@ -574,7 +574,7 @@ def decode_cp_kv_allgather_step(
                 )
         pl.write(group_out, [0, 0], completion_anchor)
 
-    return group_out, gather_signal, retire_tid
+    return gather_signal, retire_tid
 
 
 

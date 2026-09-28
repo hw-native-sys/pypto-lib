@@ -1031,10 +1031,10 @@ def prepare_drafter_after_target(
             pl.write(context_group_position_ids, [row], pl.cast(pl.read(group_metadata, [metadata_row, 0]), pl.INT32))
             for layer in pl.range(DSPARK_DRAFT_LAYERS):
                 pl.write(context_group_slot_mapping, [layer, row], pl.read(group_metadata, [metadata_row, 1 + layer]))
-            group_cos_src = group_rope_cos[metadata_row : metadata_row + 1, 0:ROPE_DIM]
-            context_group_freqs_cos[row : row + 1, 0:ROPE_DIM] = group_cos_src
-            group_sin_src = group_rope_sin[metadata_row : metadata_row + 1, 0:ROPE_DIM]
-            context_group_freqs_sin[row : row + 1, 0:ROPE_DIM] = group_sin_src
+            group_cos_src = pl.load(group_rope_cos, [metadata_row, 0], [1, ROPE_DIM])
+            pl.store(group_cos_src, [row, 0], context_group_freqs_cos)
+            group_sin_src = pl.load(group_rope_sin, [metadata_row, 0], [1, ROPE_DIM])
+            pl.store(group_sin_src, [row, 0], context_group_freqs_sin)
         for row in pl.range(DSPARK_CP_SIZE * T_QUERY):
             source_rank = row // T_QUERY
             source_row = row % T_QUERY
@@ -1052,12 +1052,3 @@ def prepare_drafter_after_target(
             query_freqs_cos[row : row + 1, 0:ROPE_DIM] = local_cos_src
             local_sin_src = local_rope_sin[metadata_row : metadata_row + 1, 0:ROPE_DIM]
             query_freqs_sin[row : row + 1, 0:ROPE_DIM] = local_sin_src
-    return (
-        num_sampled, compact_last_sampled, next_prefill_tokens, compact_anchor_positions,
-        compact_state_slot_ids, compact_state_generations, logit_row_indices,
-        context_group_position_ids, context_group_slot_mapping,
-        query_group_position_ids, query_group_slot_mapping,
-        context_group_freqs_cos, context_group_freqs_sin,
-        query_freqs_cos, query_freqs_sin,
-        query_group_freqs_cos, query_group_freqs_sin,
-    )

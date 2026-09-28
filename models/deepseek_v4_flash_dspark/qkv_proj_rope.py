@@ -28,7 +28,6 @@ from config import (
 T_DYN = pl.dynamic("QKV_Q_T_DYN")  # T = B * S
 KV_T_DYN = pl.dynamic("QKV_KV_T_DYN")
 ROPE_T_DYN = pl.dynamic("QKV_ROPE_T_DYN")
-QPROJ_MM_T_DYN = pl.dynamic("QKV_QPROJ_MM_T_DYN")
 
 # Bounded physical-row tile for Q/KV projection scratch.
 PREFILL_DENSE_TILE = 512
@@ -280,8 +279,6 @@ def q_proj_qr(
         tile_rows = pl.min(PREFILL_DENSE_TILE, t_dim - tile_base)
         with pl.scope():
             x_view = pl.reshape(x, [t_dim, D])
-            qr_i8_matmul_view = pl.reshape(qr_i8_matmul, [QPROJ_T_PAD, Q_LORA])
-            qr_scale_pad_store_view = pl.reshape(qr_scale_pad_store, [QPROJ_T_PAD, 1])
             qr_t_matmul = ((tile_rows + QR_M_TILE - 1) // QR_M_TILE) * QR_M_TILE
             qr_full_rows = (tile_rows // QR_DENSE_M_TILE) * QR_DENSE_M_TILE
             qproj_t_matmul = ((tile_rows + QPROJ_TAIL_M_TILE - 1) // QPROJ_TAIL_M_TILE) * QPROJ_TAIL_M_TILE
@@ -360,12 +357,12 @@ def q_proj_qr(
                     qr_scale_quant_row = pl.div(pl.full([1, T_TILE], dtype=pl.FP32, value=INT8_SCALE_MAX), qr_tile_amax)
                     qr_scale_quant_t = pl.reshape(qr_scale_quant_row, [T_TILE, 1])
                     qr_tile_scale_dq = pl.reshape(pl.recip(qr_scale_quant_row), [T_TILE, 1])
-                    qr_scale_pad_store_view = pl.assemble(qr_scale_pad_store_view, qr_tile_scale_dq, [tg, 0])
+                    qr_scale_pad_store = pl.assemble(qr_scale_pad_store, qr_tile_scale_dq, [tg, 0])
                     if valid_rows == T_TILE:
                         qr_scale_view[out_tg : out_tg + T_TILE, :] = qr_tile_scale_dq
                     else:
                         qr_scale_tail = pl.load(
-                            qr_scale_pad_store_view,
+                            qr_scale_pad_store,
                             [tg, 0],
                             [T_TILE, 1],
                             valid_shape=[valid_rows, 1],
@@ -382,12 +379,12 @@ def q_proj_qr(
                         qr_q_i32 = pl.cast(qr_q_scaled, target_type=pl.INT32, mode="rint")
                         qr_q_half = pl.cast(qr_q_i32, target_type=pl.FP16, mode="round")
                         qr_q_i8 = pl.cast(qr_q_half, target_type=pl.INT8, mode="trunc")
-                        qr_i8_matmul_view[tg : tg + T_TILE, qa : qa + QUANT_TILE] = qr_q_i8
+                        qr_i8_matmul[tg : tg + T_TILE, qa : qa + QUANT_TILE] = qr_q_i8
                         if valid_rows == T_TILE:
                             qr_view[out_tg : out_tg + T_TILE, qa : qa + QUANT_TILE] = qr_q_i8
                         else:
                             qr_q_tail = pl.load(
-                                qr_i8_matmul_view,
+                                qr_i8_matmul,
                                 [tg, qa],
                                 [T_TILE, QUANT_TILE],
                                 valid_shape=[valid_rows, QUANT_TILE],
@@ -400,12 +397,12 @@ def q_proj_qr(
 def q_proj_q_matmul(
     wq_b: pl.Tensor[[Q_LORA, H * HEAD_DIM], pl.INT8, pl.NZ],
     qr_i8_matmul: pl.Tensor[[QPROJ_T_PAD, Q_LORA], pl.INT8],
-    q_proj_i32: pl.Tensor[[QPROJ_MM_T_DYN, H * HEAD_DIM], pl.INT32],
+    q_proj_i32: pl.Tensor[[QPROJ_T_PAD, H * HEAD_DIM], pl.INT32],
     tile_rows: pl.Scalar[pl.INDEX],
     qproj_dep: pl.Scalar[pl.TASK_ID],
 ):
     """Project one bounded Q tile and expose its cube task ID."""
-    qproj_t_matmul = pl.tensor.dim(q_proj_i32, 0)
+    qproj_t_matmul = ((tile_rows + QPROJ_TAIL_M_TILE - 1) // QPROJ_TAIL_M_TILE) * QPROJ_TAIL_M_TILE
     qproj_full_rows = (tile_rows // QPROJ_M_TILE) * QPROJ_M_TILE
     with pl.spmd(
         QPROJ_WORKERS, name_hint="qproj_matmul", deps=[qproj_dep],
@@ -432,7 +429,7 @@ def q_proj_q_matmul(
                     tail_t0 : tail_t0 + QPROJ_TAIL_M_TILE,
                     tail_w_col0 : tail_w_col0 + QPROJ_MM_N_TILE,
                 ] = tail_acc
-    return q_proj_i32, qproj_tid
+    return qproj_tid
 
 
 @pl.jit.inline(auto_scope=False)
@@ -443,7 +440,7 @@ def q_proj_q_dequant(
     rope_swap_idx: pl.Tensor[[T_DYN, ROPE_DIM], pl.INT32],
     q: pl.Tensor[[T_DYN, H, HEAD_DIM], pl.BF16],
     qr_scale_pad_store: pl.Tensor[[QPROJ_T_PAD, 1], pl.FP32],
-    q_proj_i32: pl.Tensor[[QPROJ_MM_T_DYN, H * HEAD_DIM], pl.INT32],
+    q_proj_i32: pl.Tensor[[QPROJ_T_PAD, H * HEAD_DIM], pl.INT32],
     tile_base: pl.Scalar[pl.INDEX],
     tile_rows: pl.Scalar[pl.INDEX],
 ):
@@ -612,9 +609,8 @@ def q_proj_q(
     for tile_base in pl.range(0, t_dim, PREFILL_DENSE_TILE):
         tile_rows = pl.min(PREFILL_DENSE_TILE, t_dim - tile_base)
         with pl.scope():
-            qproj_t_matmul = ((tile_rows + QPROJ_TAIL_M_TILE - 1) // QPROJ_TAIL_M_TILE) * QPROJ_TAIL_M_TILE
-            q_proj_i32 = pl.create_tensor([qproj_t_matmul, H * HEAD_DIM], dtype=pl.INT32)
-            q_proj_i32, _qproj_tid = q_proj_q_matmul(
+            q_proj_i32 = pl.create_tensor([QPROJ_T_PAD, H * HEAD_DIM], dtype=pl.INT32)
+            _qproj_tid = q_proj_q_matmul(
                 wq_b, qr_i8_matmul, q_proj_i32, tile_rows, qproj_dep,
             )
             q_proj_q_dequant(

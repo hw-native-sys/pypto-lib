@@ -86,7 +86,6 @@ from decode_indexer_compressor import (
     indexer_compressor_write,
 )
 from qkv_proj_rope import (
-    QPROJ_TAIL_M_TILE,
     QPROJ_T_PAD,
     kv_proj_rope,
     q_proj_q_dequant,
@@ -399,9 +398,8 @@ def _decode_csa(
             x_normed_t, inner_wkv, inner_wgate, idx_values_local, idx_scores_local,
             projection_dep, idx_qr_mm_tid,
         )
-        qproj_t_matmul = ((t_dim + QPROJ_TAIL_M_TILE - 1) // QPROJ_TAIL_M_TILE) * QPROJ_TAIL_M_TILE
-        q_proj_i32 = pl.create_tensor([qproj_t_matmul, H * HEAD_DIM], dtype=pl.INT32)
-        q_proj_i32, qproj_tid = q_proj_q_matmul(
+        q_proj_i32 = pl.create_tensor([QPROJ_T_PAD, H * HEAD_DIM], dtype=pl.INT32)
+        qproj_tid = q_proj_q_matmul(
             wq_b, qr_i8_matmul, q_proj_i32, t_dim, idx_projection_tid,
         )
         cmp_projection_tid = compressor_ratio4_project(

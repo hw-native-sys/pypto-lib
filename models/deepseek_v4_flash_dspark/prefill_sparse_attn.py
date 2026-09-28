@@ -627,7 +627,7 @@ def _hca_streaming_attn_tile(
         heads_complete_tid = pl.system.task_dummy(deps=[wave_completion[0]])
 
         # Final query-wave dependency for o-proj.
-        attn_out, act_tid = _sparse_attn_o_proj(
+        act_tid = _sparse_attn_o_proj(
             o_packed_heads,
             wo_a, wo_b, wo_b_scale,
             attn_out,
@@ -1090,7 +1090,7 @@ def _sparse_attn_o_proj(
     tile_rows: pl.Scalar[pl.INDEX],
     heads_dep: pl.Scalar[pl.TASK_ID],
     weight_dep: pl.Scalar[pl.TASK_ID],
-) -> tuple[pl.Tensor, pl.Scalar[pl.TASK_ID]]:
+) -> pl.Scalar[pl.TASK_ID]:
     """Project one local-token dense tile into BF16 hidden rows."""
     o_packed = pl.reshape(o_packed_heads, [O_GROUPS * T_PAD, O_GROUP_IN])
 
@@ -1234,7 +1234,7 @@ def _sparse_attn_o_proj(
                 out_t0 = tile_base + b_tb
                 pl.assemble(attn_out, out_valid, [out_t0, ob_n0])
 
-    return attn_out, act_tid
+    return act_tid
 
 
 @pl.jit.inline(auto_scope=False)
@@ -1350,7 +1350,7 @@ def sparse_attn_compute(
                 tile_base,
                 tile_rows,
             )
-            attn_out, _act_tid = _sparse_attn_o_proj(
+            _act_tid = _sparse_attn_o_proj(
                 o_packed_heads,
                 wo_a,
                 wo_b,
