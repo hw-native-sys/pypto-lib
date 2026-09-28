@@ -62,6 +62,7 @@ VISIBLE_ROWS = WIN + S                   # trailing window + whole draft block
 
 # tiling
 ATTN_K_TILE = 64
+ATTN_K_TAIL_TILE = 16                    # ragged visible-context row granularity
 NUM_QK_CORES = 24
 QK_PRE_LAUNCH = 2
 QK_TRANSFER_SLOTS = QK_PRE_LAUNCH + 1
@@ -206,43 +207,110 @@ def dspark_attention(
         pl.system.set_ffts(ffts_workspace)
         for qk_t in pl.range(qk_core, T, NUM_QK_CORES):
             qk_b = qk_t // S
+            qk_len = pl.read(swa_lens, [qk_b])
             qk_q = pl.load(
                 q_flat, [qk_t * H, 0], [H, HEAD_DIM], target_memory=pl.MemorySpace.Mat,
             )
             for qk_tick in pl.range(SPARSE_BLOCKS + QK_PRE_LAUNCH):
                 if qk_tick < SPARSE_BLOCKS:
                     qk_sb = qk_tick
-                    if qk_sb * ATTN_K_TILE < pl.read(swa_lens, [qk_b]):
+                    if qk_sb * ATTN_K_TILE < qk_len:
                         qk_slot = qk_core * QK_TRANSFER_SLOTS + qk_sb % QK_TRANSFER_SLOTS
                         qk_kv_row = qk_b * INDEX_WIDTH + qk_sb * ATTN_K_TILE
                         qk_transfer_row = qk_slot * H
-                        qk_kv = pl.load(
-                            visible_kv, [qk_kv_row, 0], [ATTN_K_TILE, HEAD_DIM],
-                            target_memory=pl.MemorySpace.Mat,
-                        )
-                        qk_scores = pl.matmul(qk_q, pl.tile.transpose_view(qk_kv), out_dtype=pl.FP32)
-                        pl.store(qk_scores, [qk_transfer_row, 0], score_transfer)
+                        qk_rows = qk_len - qk_sb * ATTN_K_TILE
+                        if qk_rows <= ATTN_K_TAIL_TILE:
+                            qk_kv_16 = pl.load(
+                                visible_kv, [qk_kv_row, 0], [ATTN_K_TAIL_TILE, HEAD_DIM],
+                                target_memory=pl.MemorySpace.Mat,
+                            )
+                            qk_scores_16 = pl.matmul(
+                                qk_q, pl.tile.transpose_view(qk_kv_16), out_dtype=pl.FP32,
+                            )
+                            pl.store(qk_scores_16, [qk_transfer_row, 0], score_transfer)
+                        elif qk_rows <= 2 * ATTN_K_TAIL_TILE:
+                            qk_kv_32 = pl.load(
+                                visible_kv, [qk_kv_row, 0], [2 * ATTN_K_TAIL_TILE, HEAD_DIM],
+                                target_memory=pl.MemorySpace.Mat,
+                            )
+                            qk_scores_32 = pl.matmul(
+                                qk_q, pl.tile.transpose_view(qk_kv_32), out_dtype=pl.FP32,
+                            )
+                            pl.store(qk_scores_32, [qk_transfer_row, 0], score_transfer)
+                        elif qk_rows <= 3 * ATTN_K_TAIL_TILE:
+                            qk_kv_48 = pl.load(
+                                visible_kv, [qk_kv_row, 0], [3 * ATTN_K_TAIL_TILE, HEAD_DIM],
+                                target_memory=pl.MemorySpace.Mat,
+                            )
+                            qk_scores_48 = pl.matmul(
+                                qk_q, pl.tile.transpose_view(qk_kv_48), out_dtype=pl.FP32,
+                            )
+                            pl.store(qk_scores_48, [qk_transfer_row, 0], score_transfer)
+                        else:
+                            qk_kv_64 = pl.load(
+                                visible_kv, [qk_kv_row, 0], [ATTN_K_TILE, HEAD_DIM],
+                                target_memory=pl.MemorySpace.Mat,
+                            )
+                            qk_scores_64 = pl.matmul(
+                                qk_q, pl.tile.transpose_view(qk_kv_64), out_dtype=pl.FP32,
+                            )
+                            pl.store(qk_scores_64, [qk_transfer_row, 0], score_transfer)
                         pl.system.sync_set(
                             QK_SCORE_READY_EVENT, pipe=pl.PipeType.FIX,
                             ffts_mode=2, core_type=pl.KernelType.AIC,
                         )
                 if qk_tick >= QK_PRE_LAUNCH:
                     pv_sb = qk_tick - QK_PRE_LAUNCH
-                    if pv_sb * ATTN_K_TILE < pl.read(swa_lens, [qk_b]):
+                    if pv_sb * ATTN_K_TILE < qk_len:
                         pv_slot = qk_core * QK_TRANSFER_SLOTS + pv_sb % QK_TRANSFER_SLOTS
                         pv_kv_row = qk_b * INDEX_WIDTH + pv_sb * ATTN_K_TILE
                         pv_transfer_row = pv_slot * H
+                        pv_rows = qk_len - pv_sb * ATTN_K_TILE
                         pl.system.sync_wait(QK_PROB_READY_EVENT, pipe=pl.PipeType.MTE2, core_type=pl.KernelType.AIC)
-                        pv_probability = pl.load(
-                            probability_transfer, [pv_transfer_row, 0], [H, ATTN_K_TILE],
-                            target_memory=pl.MemorySpace.Mat,
-                        )
-                        pv_kv = pl.load(
-                            visible_kv, [pv_kv_row, 0], [ATTN_K_TILE, HEAD_DIM],
-                            target_memory=pl.MemorySpace.Mat,
-                        )
-                        pv_output = pl.matmul(pv_probability, pv_kv, out_dtype=pl.FP32)
-                        pl.store(pv_output, [pv_transfer_row, 0], pv_transfer)
+                        if pv_rows <= ATTN_K_TAIL_TILE:
+                            pv_probability_16 = pl.load(
+                                probability_transfer, [pv_transfer_row, 0], [H, ATTN_K_TAIL_TILE],
+                                target_memory=pl.MemorySpace.Mat,
+                            )
+                            pv_kv_16 = pl.load(
+                                visible_kv, [pv_kv_row, 0], [ATTN_K_TAIL_TILE, HEAD_DIM],
+                                target_memory=pl.MemorySpace.Mat,
+                            )
+                            pv_output_16 = pl.matmul(pv_probability_16, pv_kv_16, out_dtype=pl.FP32)
+                            pl.store(pv_output_16, [pv_transfer_row, 0], pv_transfer)
+                        elif pv_rows <= 2 * ATTN_K_TAIL_TILE:
+                            pv_probability_32 = pl.load(
+                                probability_transfer, [pv_transfer_row, 0], [H, 2 * ATTN_K_TAIL_TILE],
+                                target_memory=pl.MemorySpace.Mat,
+                            )
+                            pv_kv_32 = pl.load(
+                                visible_kv, [pv_kv_row, 0], [2 * ATTN_K_TAIL_TILE, HEAD_DIM],
+                                target_memory=pl.MemorySpace.Mat,
+                            )
+                            pv_output_32 = pl.matmul(pv_probability_32, pv_kv_32, out_dtype=pl.FP32)
+                            pl.store(pv_output_32, [pv_transfer_row, 0], pv_transfer)
+                        elif pv_rows <= 3 * ATTN_K_TAIL_TILE:
+                            pv_probability_48 = pl.load(
+                                probability_transfer, [pv_transfer_row, 0], [H, 3 * ATTN_K_TAIL_TILE],
+                                target_memory=pl.MemorySpace.Mat,
+                            )
+                            pv_kv_48 = pl.load(
+                                visible_kv, [pv_kv_row, 0], [3 * ATTN_K_TAIL_TILE, HEAD_DIM],
+                                target_memory=pl.MemorySpace.Mat,
+                            )
+                            pv_output_48 = pl.matmul(pv_probability_48, pv_kv_48, out_dtype=pl.FP32)
+                            pl.store(pv_output_48, [pv_transfer_row, 0], pv_transfer)
+                        else:
+                            pv_probability_64 = pl.load(
+                                probability_transfer, [pv_transfer_row, 0], [H, ATTN_K_TILE],
+                                target_memory=pl.MemorySpace.Mat,
+                            )
+                            pv_kv_64 = pl.load(
+                                visible_kv, [pv_kv_row, 0], [ATTN_K_TILE, HEAD_DIM],
+                                target_memory=pl.MemorySpace.Mat,
+                            )
+                            pv_output_64 = pl.matmul(pv_probability_64, pv_kv_64, out_dtype=pl.FP32)
+                            pl.store(pv_output_64, [pv_transfer_row, 0], pv_transfer)
                         pl.system.sync_set(
                             QK_PV_READY_EVENT, pipe=pl.PipeType.FIX,
                             ffts_mode=2, core_type=pl.KernelType.AIC,
@@ -251,7 +319,6 @@ def dspark_attention(
             for qk_aiv in pl.split_aiv(2, mode=pl.SplitMode.NONE):
                 pl.system.set_ffts(ffts_workspace)
                 qk_lane_head = qk_aiv * (H // 2)
-                qk_reduce_tmp = pl.create_tile([H // 2, ATTN_K_TILE], dtype=pl.FP32, target_memory=pl.MemorySpace.Vec)
                 running_m = pl.load(attn_sink_col, [qk_lane_head, 0], [H // 2, 1], target_memory=pl.MemorySpace.Vec)
                 running_l = pl.tile.muls(running_m, 0.0)
                 running_left = pl.tile.full([H // 2, HEAD_DIM // 2], dtype=pl.FP32, value=0.0)
@@ -262,34 +329,99 @@ def dspark_attention(
                 ):
                     if qk_tick < SPARSE_BLOCKS:
                         qk_sb = qk_tick
-                        if qk_sb * ATTN_K_TILE < pl.read(swa_lens, [qk_b]):
+                        if qk_sb * ATTN_K_TILE < qk_len:
                             qk_slot = qk_core * QK_TRANSFER_SLOTS + qk_sb % QK_TRANSFER_SLOTS
                             qk_transfer_row = qk_slot * H
                             qk_s0 = qk_sb * ATTN_K_TILE
+                            qk_rows = qk_len - qk_s0
                             pl.system.sync_wait(QK_SCORE_READY_EVENT, pipe=pl.PipeType.MTE2, core_type=pl.KernelType.AIV)
-                            qk_scores_half = pl.load(
-                                score_transfer, [qk_transfer_row + qk_lane_head, 0], [H // 2, ATTN_K_TILE],
-                                target_memory=pl.MemorySpace.Vec,
-                            )
-                            qk_bias = pl.load(
-                                sparse_bias, [qk_b, qk_s0], [1, ATTN_K_TILE], target_memory=pl.MemorySpace.Vec,
-                            )
-                            qk_scaled = pl.mul(qk_scores_half, SOFTMAX_SCALE)
-                            qk_masked = pl.col_expand_add(qk_scaled, qk_bias)
-                            qk_mi = pl.row_max(qk_masked, qk_reduce_tmp)
-                            qk_exp = pl.exp(pl.row_expand_sub(qk_masked, qk_mi))
-                            qk_li = pl.row_sum(qk_exp, qk_reduce_tmp)
-                            qk_probability = pl.cast(qk_exp, target_type=pl.BF16, mode="rint")
-                            pl.store(qk_probability, [qk_transfer_row + qk_lane_head, 0], probability_transfer)
-                            pl.store(qk_mi, [qk_transfer_row + qk_lane_head, 0], mi_transfer)
-                            pl.store(qk_li, [qk_transfer_row + qk_lane_head, 0], li_transfer)
+                            if qk_rows <= ATTN_K_TAIL_TILE:
+                                qk_reduce_tmp_16 = pl.create_tile(
+                                    [H // 2, ATTN_K_TAIL_TILE], dtype=pl.FP32, target_memory=pl.MemorySpace.Vec,
+                                )
+                                qk_scores_half_16 = pl.load(
+                                    score_transfer, [qk_transfer_row + qk_lane_head, 0], [H // 2, ATTN_K_TAIL_TILE],
+                                    target_memory=pl.MemorySpace.Vec,
+                                )
+                                qk_bias_16 = pl.load(
+                                    sparse_bias, [qk_b, qk_s0], [1, ATTN_K_TAIL_TILE], target_memory=pl.MemorySpace.Vec,
+                                )
+                                qk_scaled_16 = pl.mul(qk_scores_half_16, SOFTMAX_SCALE)
+                                qk_masked_16 = pl.col_expand_add(qk_scaled_16, qk_bias_16)
+                                qk_mi_16 = pl.row_max(qk_masked_16, qk_reduce_tmp_16)
+                                qk_exp_16 = pl.exp(pl.row_expand_sub(qk_masked_16, qk_mi_16))
+                                qk_li_16 = pl.row_sum(qk_exp_16, qk_reduce_tmp_16)
+                                qk_probability_16 = pl.cast(qk_exp_16, target_type=pl.BF16, mode="rint")
+                                pl.store(qk_probability_16, [qk_transfer_row + qk_lane_head, 0], probability_transfer)
+                                pl.store(qk_mi_16, [qk_transfer_row + qk_lane_head, 0], mi_transfer)
+                                pl.store(qk_li_16, [qk_transfer_row + qk_lane_head, 0], li_transfer)
+                            elif qk_rows <= 2 * ATTN_K_TAIL_TILE:
+                                qk_reduce_tmp_32 = pl.create_tile(
+                                    [H // 2, 2 * ATTN_K_TAIL_TILE], dtype=pl.FP32, target_memory=pl.MemorySpace.Vec,
+                                )
+                                qk_scores_half_32 = pl.load(
+                                    score_transfer, [qk_transfer_row + qk_lane_head, 0], [H // 2, 2 * ATTN_K_TAIL_TILE],
+                                    target_memory=pl.MemorySpace.Vec,
+                                )
+                                qk_bias_32 = pl.load(
+                                    sparse_bias, [qk_b, qk_s0], [1, 2 * ATTN_K_TAIL_TILE], target_memory=pl.MemorySpace.Vec,
+                                )
+                                qk_scaled_32 = pl.mul(qk_scores_half_32, SOFTMAX_SCALE)
+                                qk_masked_32 = pl.col_expand_add(qk_scaled_32, qk_bias_32)
+                                qk_mi_32 = pl.row_max(qk_masked_32, qk_reduce_tmp_32)
+                                qk_exp_32 = pl.exp(pl.row_expand_sub(qk_masked_32, qk_mi_32))
+                                qk_li_32 = pl.row_sum(qk_exp_32, qk_reduce_tmp_32)
+                                qk_probability_32 = pl.cast(qk_exp_32, target_type=pl.BF16, mode="rint")
+                                pl.store(qk_probability_32, [qk_transfer_row + qk_lane_head, 0], probability_transfer)
+                                pl.store(qk_mi_32, [qk_transfer_row + qk_lane_head, 0], mi_transfer)
+                                pl.store(qk_li_32, [qk_transfer_row + qk_lane_head, 0], li_transfer)
+                            elif qk_rows <= 3 * ATTN_K_TAIL_TILE:
+                                qk_reduce_tmp_48 = pl.create_tile(
+                                    [H // 2, 3 * ATTN_K_TAIL_TILE], dtype=pl.FP32, target_memory=pl.MemorySpace.Vec,
+                                )
+                                qk_scores_half_48 = pl.load(
+                                    score_transfer, [qk_transfer_row + qk_lane_head, 0], [H // 2, 3 * ATTN_K_TAIL_TILE],
+                                    target_memory=pl.MemorySpace.Vec,
+                                )
+                                qk_bias_48 = pl.load(
+                                    sparse_bias, [qk_b, qk_s0], [1, 3 * ATTN_K_TAIL_TILE], target_memory=pl.MemorySpace.Vec,
+                                )
+                                qk_scaled_48 = pl.mul(qk_scores_half_48, SOFTMAX_SCALE)
+                                qk_masked_48 = pl.col_expand_add(qk_scaled_48, qk_bias_48)
+                                qk_mi_48 = pl.row_max(qk_masked_48, qk_reduce_tmp_48)
+                                qk_exp_48 = pl.exp(pl.row_expand_sub(qk_masked_48, qk_mi_48))
+                                qk_li_48 = pl.row_sum(qk_exp_48, qk_reduce_tmp_48)
+                                qk_probability_48 = pl.cast(qk_exp_48, target_type=pl.BF16, mode="rint")
+                                pl.store(qk_probability_48, [qk_transfer_row + qk_lane_head, 0], probability_transfer)
+                                pl.store(qk_mi_48, [qk_transfer_row + qk_lane_head, 0], mi_transfer)
+                                pl.store(qk_li_48, [qk_transfer_row + qk_lane_head, 0], li_transfer)
+                            else:
+                                qk_reduce_tmp_64 = pl.create_tile(
+                                    [H // 2, ATTN_K_TILE], dtype=pl.FP32, target_memory=pl.MemorySpace.Vec,
+                                )
+                                qk_scores_half_64 = pl.load(
+                                    score_transfer, [qk_transfer_row + qk_lane_head, 0], [H // 2, ATTN_K_TILE],
+                                    target_memory=pl.MemorySpace.Vec,
+                                )
+                                qk_bias_64 = pl.load(
+                                    sparse_bias, [qk_b, qk_s0], [1, ATTN_K_TILE], target_memory=pl.MemorySpace.Vec,
+                                )
+                                qk_scaled_64 = pl.mul(qk_scores_half_64, SOFTMAX_SCALE)
+                                qk_masked_64 = pl.col_expand_add(qk_scaled_64, qk_bias_64)
+                                qk_mi_64 = pl.row_max(qk_masked_64, qk_reduce_tmp_64)
+                                qk_exp_64 = pl.exp(pl.row_expand_sub(qk_masked_64, qk_mi_64))
+                                qk_li_64 = pl.row_sum(qk_exp_64, qk_reduce_tmp_64)
+                                qk_probability_64 = pl.cast(qk_exp_64, target_type=pl.BF16, mode="rint")
+                                pl.store(qk_probability_64, [qk_transfer_row + qk_lane_head, 0], probability_transfer)
+                                pl.store(qk_mi_64, [qk_transfer_row + qk_lane_head, 0], mi_transfer)
+                                pl.store(qk_li_64, [qk_transfer_row + qk_lane_head, 0], li_transfer)
                             pl.system.sync_set(
                                 QK_PROB_READY_EVENT, pipe=pl.PipeType.MTE3,
                                 ffts_mode=2, core_type=pl.KernelType.AIV,
                             )
                     if qk_tick >= QK_PRE_LAUNCH:
                         pv_sb = qk_tick - QK_PRE_LAUNCH
-                        if pv_sb * ATTN_K_TILE < pl.read(swa_lens, [qk_b]):
+                        if pv_sb * ATTN_K_TILE < qk_len:
                             pv_slot = qk_core * QK_TRANSFER_SLOTS + pv_sb % QK_TRANSFER_SLOTS
                             pv_transfer_row = pv_slot * H
                             pl.system.sync_wait(QK_PV_READY_EVENT, pipe=pl.PipeType.MTE2, core_type=pl.KernelType.AIV)
