@@ -9,11 +9,6 @@
 """DeepSeek-V4 packed prefill CSA attention: HC pre/post, ratio-4 compressor, indexer, sparse attention, cache writeback."""
 # ci: devices=2
 
-from attention_cli import add_model_argument, select_model
-
-if __name__ == "__main__":
-    select_model()
-
 import sys
 
 # Standalone CI passes its borrowed device list without a --cp argument.
@@ -3068,7 +3063,6 @@ def golden_prefill_cp_csa(tensors):
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Standalone DeepSeek V4 context-parallel CSA test.")
-    add_model_argument(parser)
     parser.add_argument("-p", "--platform", default="a2a3", choices=["a2a3", "a2a3sim", "a5", "a5sim"])
     parser.add_argument("-d", "--device", default=",".join(str(i) for i in range(CP_SIZE)))
     parser.add_argument("--cp", type=int, default=CP_SIZE, choices=CP_CHOICES)

@@ -9,11 +9,6 @@
 """DeepSeek V4 CP SWA prefill and the MTP cached-tail adapter."""
 # ci: devices=2
 
-from attention_cli import add_model_argument, select_model
-
-if __name__ == "__main__":
-    select_model()
-
 import sys
 from math import gcd
 
@@ -1645,7 +1640,6 @@ if __name__ == "__main__" and not _run_cp_fixture:
     from golden import ratio_allclose, ratio_reldiff, run
 
     parser = argparse.ArgumentParser(description="Standalone DeepSeek V4 packed prefill SWA correctness test.")
-    add_model_argument(parser)
     parser.add_argument("-p", "--platform", type=str, default="a2a3", choices=["a2a3", "a2a3sim", "a5", "a5sim"])
     parser.add_argument("-d", "--device", type=int, default=0)
     parser.add_argument("--compile-only", action="store_true", default=False)
@@ -1689,7 +1683,6 @@ if __name__ == "__main__" and _run_cp_fixture:
     import argparse
 
     parser = argparse.ArgumentParser(description="Standalone DeepSeek V4 context-parallel SWA test.")
-    add_model_argument(parser)
     parser.add_argument("-p", "--platform", default="a2a3", choices=["a2a3", "a2a3sim", "a5", "a5sim"])
     parser.add_argument("-d", "--device", default=",".join(str(i) for i in range(CP_SIZE)))
     parser.add_argument("--compile-only", action="store_true", default=False)
