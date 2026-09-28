@@ -26,11 +26,6 @@ compressor itself. This file aligns to that stack instead of the older draft
 surface.
 """
 
-from attention_cli import add_model_argument, select_model
-
-if __name__ == "__main__":
-    select_model()
-
 
 import pypto.language as pl
 
@@ -846,7 +841,6 @@ if __name__ == "__main__":
     from utils import parse_start_pos_arg
 
     parser = argparse.ArgumentParser()
-    add_model_argument(parser)
     parser.add_argument("-p", "--platform", type=str, default="a2a3", choices=["a2a3", "a2a3sim", "a5", "a5sim"])
     parser.add_argument("-d", "--device", type=int, default=0)
     parser.add_argument("--start-pos", type=str, default=None,
