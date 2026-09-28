@@ -235,12 +235,26 @@ def test_attention_pre_and_post_operators_have_single_public_owners():
 
 
 @requires_pypto
-@pytest.mark.parametrize("layer_id", (0, 2, 3, 20, 24, 21))
-def test_decode_layer_unfinished_device_dependencies_are_explicit(layer_id, composition):
+@pytest.mark.parametrize(
+    ("layer_id", "expected_block_reason"),
+    (
+        (0, None),
+        (2, None),
+        (3, None),
+        (20, "C1A_FULL"),
+        (24, "C1A_REINDEX"),
+        (21, "C1A_REUSE"),
+    ),
+)
+def test_decode_layer_block_dependencies_are_explicit(layer_id, expected_block_reason, composition):
     decode_layer_kernel_skip_reason = composition.decode_layer_kernel_skip_reason
     reason = decode_layer_kernel_skip_reason(layer_id)
-    assert reason is not None and "EP8 MoE kernel" in reason
-    assert "attention kernel" not in reason
+    if expected_block_reason is None:
+        assert reason is None
+    else:
+        assert reason is not None
+        assert f"{expected_block_reason} Block composition is not part of the causal encoder" in reason
+    assert "EP8 MoE kernel" not in (reason or "")
 
 
 @requires_pypto
@@ -493,14 +507,7 @@ def test_decode_c1a_wiring_flag_selects_the_run_and_the_replay_tree():
 def test_decode_sequence_parallel_two_layer_chain(composition):
     from models.deepseek_v4_1_flash._golden_smoke import run_two_layer_decode_chain
 
-    try:
-        run_two_layer_decode_chain(composition.golden_decode_layer, tp_size=4)
-    except KeyError as error:
-        if "missing golden_moe input tensors" not in str(error):
-            raise
-        # The Block golden needs the upstream golden_moe ABI (#1308), which is
-        # still open.  This check starts running the moment that lands.
-        pytest.skip("upstream golden_moe ABI mismatch blocks the Block golden chain")
+    run_two_layer_decode_chain(composition.golden_decode_layer, tp_size=4)
 
 
 @requires_pypto
@@ -739,7 +746,16 @@ def test_block_golden_rejects_inactive_capacity(composition):
 
 @requires_pypto
 def test_stage_selection_checks_only_required_dependencies(composition, attention_common):
-    with pytest.raises(NotImplementedError, match="MoE"):
+    with pytest.raises(ValueError, match="TensorSpec"):
         composition.make_decode_layer_program(0, attention_common.C.EP_SIZE, 1, stage="block")
+    specs = composition.build_decode_block_specs(0, world_size=attention_common.C.EP_SIZE)
+    program = composition.make_decode_layer_program(
+        0,
+        attention_common.C.EP_SIZE,
+        1,
+        stage="block",
+        specs=specs,
+    )
+    assert type(program).__name__ == "JITFunction"
     with pytest.raises(ValueError, match="unknown decode stage"):
         composition.make_decode_layer_program(0, 1, 1, stage="ffn")

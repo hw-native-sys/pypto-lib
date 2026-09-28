@@ -272,11 +272,9 @@ def run_decode_layer_goldens(golden_fn: Callable[..., object], layer_ids) -> Non
 def run_two_layer_decode_chain(golden_fn: Callable[..., object], *, tp_size: int = 4) -> None:
     """Run two consecutive Block goldens across the sequence-parallel boundary.
 
-    The device Block still depends on the EP8 MoE implementation.  This CPU
-    check nevertheless exercises the contract owned by Decode: the first layer's
-    residual output and its delayed mHC pre-mix are split into owner slabs, are
-    handed to the second layer through the same gather the collectives perform,
-    and have to come back unchanged.  Slabs are compared against
+    The first layer's residual output and its delayed mHC pre-mix are split into
+    owner slabs, handed to the second layer through the same gather the
+    collectives perform, and required to come back unchanged. Slabs are compared against
     ``sequence_parallel_bounds``, the ownership rule the kernels use, so a rank
     order or padding mistake fails here instead of cancelling out in an identity
     round trip.

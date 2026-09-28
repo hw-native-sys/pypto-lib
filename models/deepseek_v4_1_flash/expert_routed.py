@@ -157,10 +157,11 @@ def expert_routed(
                                     target_memory=pl.Mem.Vec,
                                 )
                                 w1_packed_u16 = pl.cast(w1_packed_tile, target_type=pl.UINT16)
-                                w1_packed_indices = pl.reinterpret_view(w1_packed_u16, pl.INT16)
+                                w1_packed_i16 = pl.reinterpret_view(w1_packed_u16, pl.INT16)
+                                w1_packed_indices = pl.cast(w1_packed_i16, target_type=pl.INT32)
                                 w1_gather_tmp = pl.create_tile(
                                     [MX_PACKED_LANE_ROWS, MX_PACKED_LANE_COLS],
-                                    dtype=pl.INT16,
+                                    dtype=pl.INT32,
                                     target_memory=pl.Mem.Vec,
                                 )
                                 w1_pair_codes = pl.tile.gather(
@@ -212,10 +213,11 @@ def expert_routed(
                                     target_memory=pl.Mem.Vec,
                                 )
                                 w3_packed_u16 = pl.cast(w3_packed_tile, target_type=pl.UINT16)
-                                w3_packed_indices = pl.reinterpret_view(w3_packed_u16, pl.INT16)
+                                w3_packed_i16 = pl.reinterpret_view(w3_packed_u16, pl.INT16)
+                                w3_packed_indices = pl.cast(w3_packed_i16, target_type=pl.INT32)
                                 w3_gather_tmp = pl.create_tile(
                                     [MX_PACKED_LANE_ROWS, MX_PACKED_LANE_COLS],
-                                    dtype=pl.INT16,
+                                    dtype=pl.INT32,
                                     target_memory=pl.Mem.Vec,
                                 )
                                 w3_pair_codes = pl.tile.gather(
@@ -436,10 +438,11 @@ def expert_routed(
                                         target_memory=pl.Mem.Vec,
                                     )
                                     w2_packed_u16 = pl.cast(w2_packed_tile, target_type=pl.UINT16)
-                                    w2_packed_indices = pl.reinterpret_view(w2_packed_u16, pl.INT16)
+                                    w2_packed_i16 = pl.reinterpret_view(w2_packed_u16, pl.INT16)
+                                    w2_packed_indices = pl.cast(w2_packed_i16, target_type=pl.INT32)
                                     w2_gather_tmp = pl.create_tile(
                                         [MX_PACKED_LANE_ROWS, MX_PACKED_LANE_COLS],
-                                        dtype=pl.INT16,
+                                        dtype=pl.INT32,
                                         target_memory=pl.Mem.Vec,
                                     )
                                     w2_pair_codes = pl.tile.gather(
