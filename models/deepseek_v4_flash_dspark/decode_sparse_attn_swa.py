@@ -61,6 +61,7 @@ GATHER_PARTS = 2
 GATHER_PART_ROWS = WIN // GATHER_PARTS
 REQUEST_KV_ROWS = WIN + S - 1
 H_TILE = 32
+MERGE_H_TILE = 16
 QK_PRE_LAUNCH = 2
 QK_TRANSFER_SLOTS = QK_PRE_LAUNCH + 1
 QK_SCORE_READY_EVENT = 0
@@ -90,6 +91,8 @@ if WIN != ATTN_K_TILE:
     raise ValueError(f"SWA decode expects WIN ({WIN}) == ATTN_K_TILE ({ATTN_K_TILE})")
 if H_TILE % HEADS_PER_GROUP != 0:
     raise ValueError(f"SWA head tile {H_TILE} must contain complete output groups")
+if MERGE_H_TILE % HEADS_PER_GROUP != 0:
+    raise ValueError(f"SWA merge head tile {MERGE_H_TILE} must contain complete output groups")
 if O_GROUPS % TP != 0:
     raise ValueError(f"output groups {O_GROUPS} must be divisible by TP size {TP}")
 if T % ATTENTION_PUBLISH_T_TILE != 0:
@@ -341,29 +344,29 @@ def sparse_attn_swa_tp1(
         freqs_cos, freqs_sin,
     )
     t_dim = pl.tensor.dim(q, 0)
-    t_hblocks = t_dim * (H // H_TILE)
+    t_hblocks = t_dim * (H // MERGE_H_TILE)
 
     with pl.spmd(MERGE_TASKS, name_hint="merge_norm", deps=[qk_tid, rope_tid], allow_early_resolve=True) as merge_tid:
         m_task = pl.tile.get_block_idx()
         for m_idx in pl.range(m_task, t_hblocks, MERGE_TASKS):
-            m_t = m_idx // (H // H_TILE)
-            m_h_idx = m_idx - m_t * (H // H_TILE)
-            m_h0 = m_h_idx * H_TILE
+            m_t = m_idx // (H // MERGE_H_TILE)
+            m_h_idx = m_idx - m_t * (H // MERGE_H_TILE)
+            m_h0 = m_h_idx * MERGE_H_TILE
             m_blk_base = m_t * H + m_h0
-            m_mi = sparse_blk_mi[m_blk_base : m_blk_base + H_TILE, 0:1]
-            m_li = sparse_blk_li[m_blk_base : m_blk_base + H_TILE, 0:1]
-            m_oi = sparse_blk_oi[m_blk_base : m_blk_base + H_TILE, 0:HEAD_DIM]
+            m_mi = sparse_blk_mi[m_blk_base : m_blk_base + MERGE_H_TILE, 0:1]
+            m_li = sparse_blk_li[m_blk_base : m_blk_base + MERGE_H_TILE, 0:1]
+            m_oi = sparse_blk_oi[m_blk_base : m_blk_base + MERGE_H_TILE, 0:HEAD_DIM]
 
-            n_sink = pl.reshape(attn_sink[m_h0 : m_h0 + H_TILE], [H_TILE, 1])
+            n_sink = pl.reshape(attn_sink[m_h0 : m_h0 + MERGE_H_TILE], [MERGE_H_TILE, 1])
             n_sink_delta = pl.sub(n_sink, m_mi)
             n_sink_exp = pl.exp(n_sink_delta)
             n_denom = pl.add(m_li, n_sink_exp)
             n_normalized = pl.row_expand_div(m_oi, n_denom)
-            n_full = n_normalized[0:H_TILE, 0:HEAD_DIM]
+            n_full = n_normalized[0:MERGE_H_TILE, 0:HEAD_DIM]
             n_bf16 = pl.cast(n_full, target_type=pl.BF16, mode="rint")
 
             m_rope = n_full[:, NOPE_DIM:HEAD_DIM]
-            m_swapped = pl.gather(m_rope, dim=-1, index=rope_swap_idx[:, :])
+            m_swapped = pl.gather(m_rope, dim=-1, index=rope_swap_idx[0:MERGE_H_TILE, :])
             m_cos_il = rope_cos_il[m_t : m_t + 1, 0:ROPE_DIM]
             m_sin_signed = rope_sin_signed[m_t : m_t + 1, 0:ROPE_DIM]
             m_rope_cos = pl.col_expand_mul(m_rope, m_cos_il)
@@ -372,7 +375,7 @@ def sparse_attn_swa_tp1(
             n_rope_bf16 = pl.cast(m_rot, target_type=pl.BF16, mode="rint")
 
             m_g0 = m_h0 // HEADS_PER_GROUP
-            for m_sg in pl.unroll(H_TILE // HEADS_PER_GROUP):
+            for m_sg in pl.unroll(MERGE_H_TILE // HEADS_PER_GROUP):
                 m_src_h0 = m_sg * HEADS_PER_GROUP
                 n_pack_row = (m_g0 + m_sg) * T_PAD + m_t
                 n_dst_head = n_pack_row * HEADS_PER_GROUP
