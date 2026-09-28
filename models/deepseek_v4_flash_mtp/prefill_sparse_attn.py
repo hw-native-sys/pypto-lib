@@ -639,15 +639,16 @@ def _staged_attn_o_proj(
     output_group_rows = O_GROUPS * projection_rows
     attn_out_view = pl.reshape(attn_out, [output_rows, D])
     o_packed = pl.reshape(o_packed_heads, [output_group_rows, O_GROUP_IN])
-    o_r = pl.create_tensor([projection_rows, O_GROUPS * O_LORA], dtype=pl.FP32)
-    o_r_i8 = pl.create_tensor([projection_rows, O_GROUPS * O_LORA], dtype=pl.INT8)
-    act_scale_dq = pl.create_tensor([O_GROUPS, projection_rows], dtype=pl.FP32)
-    partials = pl.create_tensor([projection_rows, O_GROUPS * D], dtype=pl.INT32)
+    o_r = pl.create_tensor([projection_rows, O_GROUPS * O_LORA], dtype=pl.FP32, manual_dep=True)
+    o_r_i8 = pl.create_tensor([projection_rows, O_GROUPS * O_LORA], dtype=pl.INT8, manual_dep=True)
+    act_scale_dq = pl.create_tensor([O_GROUPS, projection_rows], dtype=pl.FP32, manual_dep=True)
+    partials = pl.create_tensor([projection_rows, O_GROUPS * D], dtype=pl.INT32, manual_dep=True)
     proj_a_tids = pl.array.create(O_GROUPS, pl.TASK_ID)
     quant_tids = pl.array.create(O_GROUPS, pl.TASK_ID)
     proj_b_tids = pl.array.create(O_GROUPS, pl.TASK_ID)
 
-    with pl.manual_scope():
+    # Explicit scratch ordering with automatic allocator retention.
+    with pl.scope():
         for g in pl.parallel(O_GROUPS):
             row_base_o = g * projection_rows
             out_col_g = g * O_LORA
@@ -1050,8 +1051,9 @@ def _hca_heads(
     completion = pl.array.create(1, pl.TASK_ID)
     completion[0] = packed_init_tid
 
-    with pl.manual_scope():
-        tile_cmp_visible_rows = pl.create_tensor([1], dtype=pl.INT32)
+    # Explicit scratch ordering with automatic allocator retention.
+    with pl.scope():
+        tile_cmp_visible_rows = pl.create_tensor([1], dtype=pl.INT32, manual_dep=True)
         with pl.at(
             level=pl.Level.CORE_GROUP,
             name_hint="native_hca_cmp_plan",
@@ -1102,14 +1104,14 @@ def _hca_heads(
             cache_ready_dep,
         )
 
-        raw_kv = pl.create_tensor([raw_rows, HEAD_DIM], dtype=pl.BF16)
-        raw_valid = pl.create_tensor([token_rows, WIN], dtype=pl.FP32)
-        stream_state_m = pl.create_tensor([head_rows, 1], dtype=pl.FP32)
-        stream_state_l = pl.create_tensor([head_rows, 1], dtype=pl.FP32)
-        stream_heads = pl.create_tensor([head_rows, HEAD_DIM], dtype=pl.FP32)
-        cmp_partial_m = pl.create_tensor([partial_rows, 8], dtype=pl.FP32)
-        cmp_partial_l = pl.create_tensor([partial_rows, 8], dtype=pl.FP32)
-        cmp_partial_o = pl.create_tensor([partial_rows, HEAD_DIM], dtype=pl.FP32)
+        raw_kv = pl.create_tensor([raw_rows, HEAD_DIM], dtype=pl.BF16, manual_dep=True)
+        raw_valid = pl.create_tensor([token_rows, WIN], dtype=pl.FP32, manual_dep=True)
+        stream_state_m = pl.create_tensor([head_rows, 1], dtype=pl.FP32, manual_dep=True)
+        stream_state_l = pl.create_tensor([head_rows, 1], dtype=pl.FP32, manual_dep=True)
+        stream_heads = pl.create_tensor([head_rows, HEAD_DIM], dtype=pl.FP32, manual_dep=True)
+        cmp_partial_m = pl.create_tensor([partial_rows, 8], dtype=pl.FP32, manual_dep=True)
+        cmp_partial_l = pl.create_tensor([partial_rows, 8], dtype=pl.FP32, manual_dep=True)
+        cmp_partial_o = pl.create_tensor([partial_rows, HEAD_DIM], dtype=pl.FP32, manual_dep=True)
         wave_completion = pl.array.create(1, pl.TASK_ID)
         wave_completion[0] = pl.system.task_dummy(deps=[cmp_gather_tid, rope_cs_tid])
         _hca_segment_heads(
