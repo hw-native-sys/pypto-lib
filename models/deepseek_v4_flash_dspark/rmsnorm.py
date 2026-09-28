@@ -159,7 +159,7 @@ def rms_norm_spmd(
 def rms_norm(
     x: pl.Tensor[[T_DYN, D], pl.BF16],
     norm_w: pl.Tensor[[D], pl.BF16],
-    x_normed: pl.Out[pl.Tensor[[T_DYN, D], pl.BF16]],
+    x_normed: pl.Tensor[[T_DYN, D], pl.BF16],
 ):
     t_dim = pl.tensor.dim(x, 0)
     token_tiles = (t_dim + T_TILE - 1) // T_TILE
