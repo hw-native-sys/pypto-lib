@@ -26,6 +26,32 @@ that every kernel imports as a bare sibling module.
 | Other components | no tensor parallelism — attention is data-parallel (each rank owns its own decode micro-batch) and the MoE is expert-parallel |
 | Quantization | W8A8 INT8: INT8 weights with FP32 dequant scales, activations quantized per token at the INT8 matmuls |
 
+### Standalone Pro attention
+
+The six attention entry points `decode_swa.py`, `decode_csa.py`,
+`decode_hca.py`, `prefill_swa.py`, `prefill_csa.py`, and `prefill_hca.py`
+accept `--model pro`. The default remains `--model flash`; `config.py`
+and the full-model entry points retain their Flash defaults.
+
+The standalone selector binds the existing Pro preset before importing shared
+kernels, so the kernel shapes and torch references use hidden size 7168,
+128 attention heads, Q LoRA rank 1536, 16 output groups, and indexer top-k 1024.
+The attention quantization remains the W8A8 layout described below.
+Select one preset per process; changing it after importing kernels does not
+rebuild their module-level shapes.
+
+Run from the repository root with its directory on `PYTHONPATH`, using allocated
+devices (the device IDs below are examples):
+
+```bash
+python models/deepseek_v4_flash_mtp/decode_swa.py --model pro -p a2a3 -d 0
+python models/deepseek_v4_flash_mtp/decode_csa.py --model pro -p a2a3 -d 0
+python models/deepseek_v4_flash_mtp/decode_hca.py --model pro -p a2a3 -d 0
+python models/deepseek_v4_flash_mtp/prefill_swa.py --model pro -p a2a3 --cp 2 -d 0,1
+python models/deepseek_v4_flash_mtp/prefill_csa.py --model pro -p a2a3 --cp 2 -d 0,1
+python models/deepseek_v4_flash_mtp/prefill_hca.py --model pro -p a2a3 --cp 2 -d 0,1
+```
+
 ### What is quantized
 
 Activations are quantized **dynamically per token**: each row's amax (floored
