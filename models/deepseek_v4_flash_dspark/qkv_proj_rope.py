@@ -295,7 +295,10 @@ def q_proj_qr(
                         qr_fp32[ts0 : ts0 + QR_M_TILE, nseed0 : nseed0 + QR_N_TILE] = qr_seed
 
             for qbg_idx in pl.spmd(
-                (Q_LORA // QR_N_TILE) * QR_OK, name_hint="qr_proj_matmul", allow_early_resolve=True
+                (Q_LORA // QR_N_TILE) * QR_OK,
+                name_hint="qr_proj_matmul",
+                allow_early_resolve=True,
+                sync_start=True,
             ):
                 # Weight reads bypass L2.
                 pl.set_cache_policy(wq_a, pl.CachePolicy.BYPASS)
@@ -406,7 +409,10 @@ def q_proj_q_matmul(
     qproj_t_matmul = pl.tensor.dim(q_proj_i32, 0)
     qproj_full_rows = (tile_rows // QPROJ_M_TILE) * QPROJ_M_TILE
     with pl.spmd(
-        QPROJ_WORKERS, name_hint="qproj_matmul", deps=[qproj_dep],
+        QPROJ_WORKERS,
+        name_hint="qproj_matmul",
+        deps=[qproj_dep],
+        sync_start=True,
     ) as qproj_tid:
         # Weight reads bypass L2.
         pl.set_cache_policy(wq_b, pl.CachePolicy.BYPASS)
