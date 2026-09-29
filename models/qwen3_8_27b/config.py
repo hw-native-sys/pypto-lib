@@ -99,3 +99,6 @@ QWEN3_8_27B = Qwen38Config(
 )
 
 GDN_TILING = GdnTiling(chunk=128)
+
+# The prefill case every kernel's standalone entry defaults to.
+PREFILL_SEQ = 8192

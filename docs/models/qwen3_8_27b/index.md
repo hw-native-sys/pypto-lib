@@ -68,21 +68,16 @@ rest of the block and are not built yet.
 ## Validating and benchmarking
 
 [reference.py](../../../models/qwen3_8_27b/reference.py) is a float64 torch chain
-of all six stages. [test_gdn_stages.py](../../../models/qwen3_8_27b/test_gdn_stages.py)
-feeds each operator the reference outputs of the ones before it and scores it on
-relative Frobenius norm; `--chain` instead feeds each operator the previous
-*kernel's* device output, which is what the deployed pipeline does.
+of all six stages. Each operator file is its own test: it builds its inputs from
+that chain, computes a golden and scores the device result on relative Frobenius
+norm. `PYPTO_BENCH=1` turns any of them into a benchmark, and the harness prints
+the median `effective_us`.
 
 ```bash
 python models/qwen3_8_27b/gdn_layer.py -p a2a3 -d 0
-python models/qwen3_8_27b/test_gdn_stages.py -p a2a3 -d 0
-python models/qwen3_8_27b/test_gdn_stages.py -p a2a3 -d 0 --chain
-python models/qwen3_8_27b/test_gdn_stages.py -p a2a3sim --seq-len 1024
-python models/qwen3_8_27b/bench.py -p a2a3 -d 0 --seq-len 8192
+python models/qwen3_8_27b/solve_tril.py -p a2a3 -d 0
+python models/qwen3_8_27b/chunk_h.py -p a2a3sim --seq-len 1024
 ```
-
-Both take `--heads` and `--qk-heads`, defaulting to the model's 48 and 16. Pass
-the same value to both for an ungrouped shape.
 
 These are device entry points, not pytest cases: they need an NPU and a compile,
 so they carry no `test_` functions and CI never collects them.
