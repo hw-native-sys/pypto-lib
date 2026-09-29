@@ -216,80 +216,6 @@ def chunk_o(q: torch.Tensor, k: torch.Tensor, v_new: torch.Tensor,
     return out
 
 
-# Pipeline order. Each stage consumes the outputs of the ones before it.
-STAGES = ("chunk_cumsum", "scaled_dot_kkt", "solve_tril", "wy_fast",
-          "chunk_h", "chunk_o")
-
-_CACHE: dict[tuple, dict] = {}
-
-
-def compute(upto: str, t: int, h: int, d: int, chunk: int,
-            hg: int | None = None, seed: int = 42) -> dict[str, torch.Tensor]:
-    """Reference inputs plus every stage output through *upto*, cached and extended.
-
-    Values crossing a stage boundary are narrowed to the dtype the kernels
-    exchange -- FP16 for A, A_inv, W, U, V_new and the state snapshots -- so a
-    stage's reference input is bit-identical to what the preceding kernel would
-    have handed it, and a comparison measures that stage alone.
-
-    *upto* is a stage name or ``"inputs"``. Calling it twice on the same shape
-    only computes the stages that are missing.
-    """
-    hg = h if hg is None else hg
-    want = 0 if upto == "inputs" else STAGES.index(upto) + 1
-    key = (t, h, d, chunk, hg, seed)
-    st = _CACHE.get(key)
-    if st is None:
-        st = _CACHE[key] = dict(make_inputs(t, h, d, hg, seed), _done=0)
-    while st["_done"] < want:
-        stage = STAGES[st["_done"]]
-        if stage == "chunk_cumsum":
-            st["g_sum"] = cumsum(st["g"], chunk)
-        elif stage == "scaled_dot_kkt":
-            st["a"] = kkt(st["k"], st["beta"], st["g_sum"], chunk)
-            st["a16"] = st["a"].to(torch.float16)
-        elif stage == "solve_tril":
-            st["a_inv"] = solve_tril(st["a16"], chunk)
-            st["a_inv16"] = st["a_inv"].to(torch.float16)
-        elif stage == "wy_fast":
-            st["w"], st["u"] = wy_fast(st["k"], st["v"], st["beta"],
-                                       st["a_inv16"], st["g_sum"], chunk)
-            st["w16"] = st["w"].to(torch.float16)
-            st["u16"] = st["u"].to(torch.float16)
-        elif stage == "chunk_h":
-            st["state"], st["v_new"], st["final_state"] = chunk_h(
-                st["k"], st["w16"], st["u16"], st["g_sum"], chunk)
-            st["state16"] = st["state"].to(torch.float16)
-            st["v_new16"] = st["v_new"].to(torch.float16)
-        elif stage == "chunk_o":
-            st["o"] = chunk_o(st["q"], st["k"], st["v_new16"], st["state16"],
-                              st["g_sum"], chunk)
-        st["_done"] += 1
-    return st
-
-
-def stage_inputs(stage: str, t: int, h: int, d: int, chunk: int,
-                 hg: int | None = None, seed: int = 42) -> dict[str, torch.Tensor]:
-    """Everything *stage* consumes: the reference chain up to its predecessor."""
-    i = STAGES.index(stage)
-    return compute("inputs" if i == 0 else STAGES[i - 1], t, h, d, chunk, hg, seed)
-
-
-def lazy(stage: str, key: str, t: int, h: int, d: int, chunk: int,
-         transform=None, hg: int | None = None, seed: int = 42):
-    """A no-argument callable returning one reference tensor, computed on first use.
-
-    `TensorSpec(init_value=...)` takes a callable, and deferring the chain this
-    way keeps spec construction free -- the benchmark builds specs only to read
-    their shapes and dtypes, and never pays for the host reference.
-    """
-    def load():
-        value = stage_inputs(stage, t, h, d, chunk, hg, seed)[key]
-        return transform(value) if transform is not None else value
-
-    return load
-
-
 # ---------------------------------------------------------------------------
 # Acceptance criterion
 # ---------------------------------------------------------------------------
@@ -316,3 +242,25 @@ def stats_ok(actual: torch.Tensor, expected: torch.Tensor,
     if not elementwise:
         return False, "every element outside the relative bound; " + detail
     return frob <= FTOL, detail
+
+
+def delta_rule(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor,
+               beta: torch.Tensor, g: torch.Tensor, chunk: int) -> dict[str, torch.Tensor]:
+    """All six stages on the given inputs; every intermediate, `o` the output.
+
+    Values crossing a stage boundary are narrowed to the dtype the kernels
+    exchange -- FP16 for A, A_inv, W, U, V_new and the state snapshots -- so a
+    stage reads what the preceding kernel would have handed it.
+    """
+    st = dict(q=q, k=k, v=v, beta=beta, g=g)
+    st["g_sum"] = cumsum(g, chunk)
+    st["a16"] = kkt(k, beta, st["g_sum"], chunk).to(torch.float16)
+    st["a_inv16"] = solve_tril(st["a16"], chunk).to(torch.float16)
+    w, u = wy_fast(k, v, beta, st["a_inv16"], st["g_sum"], chunk)
+    st["w16"] = w.to(torch.float16)
+    st["u16"] = u.to(torch.float16)
+    state, v_new, st["final_state"] = chunk_h(k, st["w16"], st["u16"], st["g_sum"], chunk)
+    st["state16"] = state.to(torch.float16)
+    st["v_new16"] = v_new.to(torch.float16)
+    st["o"] = chunk_o(q, k, st["v_new16"], st["state16"], st["g_sum"], chunk)
+    return st

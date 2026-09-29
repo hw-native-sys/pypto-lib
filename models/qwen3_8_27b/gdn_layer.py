@@ -15,37 +15,29 @@
     S, Vnew = chunk_h(k, W, U, g_sum)             inter-chunk state recurrence
     O       = chunk_o(q, k, Vnew, S, g_sum)       chunk output
 
-Everything between `g_sum` and `O` is internal: A, A_inv, W, U, the per-chunk
-state snapshots and V_new are allocated here and never leave. Only q, k, v, the
-gate and beta come in, and only O goes out.
-
-This is the delta rule alone. The projections that produce q, k, v, beta and the
-gate, the short convolution over them, the output gate and `out_proj` are the
-surrounding block and are not built yet -- see the model's docs page.
-
-The dtype at each boundary is the one the standalone stages exchange, so this
-composition is numerically the pipeline `test_gdn_stages.py --chain` validates,
-with one difference: solve_tril writes A_inv as FP16 directly rather than FP32
-for the host to narrow, which is what its consumer reads anyway.
+Only q, k, v, the gate and beta come in, and only O goes out.
 """
 import pypto.language as pl
 
-import chunk_cumsum
-import chunk_h
-import chunk_o
-import scaled_dot_kkt
+from chunk_cumsum import DISPATCH_TOKENS, gdn_chunk_cumsum
+from chunk_h import gdn_chunk_h
+from chunk_o import gdn_chunk_o
+from config import GDN_TILING, PREFILL_SEQ, QWEN3_8_27B
+from scaled_dot_kkt import gdn_scaled_dot_kkt
 import solve_tril
-import wy_fast
-from config import GDN_TILING, QWEN3_8_27B
+from solve_tril import gdn_solve_tril
+from wy_fast import gdn_wy_fast
 
-# model shape
+# Dynamic shape variables.
+T_DYN = pl.dynamic("T_DYN")                 # tokens
+
+# model config
 H = QWEN3_8_27B.linear_num_value_heads      # value heads
 HG = QWEN3_8_27B.linear_num_key_heads       # QK heads; H // HG value heads share one
 D = QWEN3_8_27B.linear_value_head_dim       # head dimension
-CHUNK = GDN_TILING.chunk                    # chunk size in tokens, our tiling choice
-
-# case shape
-T = 8192                # tokens (single sequence, B = 1)
+VAL_WIDTH = H * D
+CHUNK_TILE = GDN_TILING.chunk               # chunk size in tokens, our tiling choice
+T = PREFILL_SEQ                             # tokens (single sequence, B = 1)
 
 # A, A_inv, W, U, the state snapshots and V_new are all [T, H, *] and live at once:
 # about 600 MiB at T = 8192, H = 48, against the runtime's default 256 MiB per ring.
@@ -54,66 +46,78 @@ T = 8192                # tokens (single sequence, B = 1)
 LAYER_RING_HEAP = 1024 * 1024 * 1024
 
 
-def run_config(platform: str = "a2a3", device: int = 0) -> dict:
+def run_config(platform: str = "a2a3", device: int = 0, swimlane: int = 0) -> dict:
     """The config `golden.run` needs for this layer. The ring heap is not optional."""
-    return dict(platform=platform, device_id=device, ring_heap=LAYER_RING_HEAP)
+    return dict(platform=platform, device_id=device, ring_heap=LAYER_RING_HEAP,
+                enable_chip_swimlane=swimlane)
 
 
-def build_kernel(t: int = T, h: int = H, d: int = D, chunk: int = CHUNK,
-                 hg: int = HG):
-    """The layer at one shape, composing the six operators as inlined callees."""
-    nchunk = t // chunk
-    shape = dict(t=t, h=h, d=d, chunk=chunk)
+def _gdn_layer(
+    q: pl.Tensor[[T_DYN, HG, D], pl.FP16],
+    k: pl.Tensor[[T_DYN, HG, D], pl.FP16],
+    v: pl.Tensor[[T_DYN, H, D], pl.FP16],
+    g: pl.Tensor[[T_DYN, H], pl.FP32],
+    beta: pl.Tensor[[H, T_DYN], pl.FP32],
+    tril: pl.Tensor[[CHUNK_TILE, CHUNK_TILE], pl.FP32],
+    mask_strict: pl.Tensor[[CHUNK_TILE, CHUNK_TILE], pl.FP32],
+    eye: pl.Tensor[[CHUNK_TILE, CHUNK_TILE], pl.FP16],
+    m_diag: pl.Tensor[[CHUNK_TILE, CHUNK_TILE], pl.FP16],
+    m_low: pl.Tensor[[CHUNK_TILE, CHUNK_TILE], pl.FP16],
+    o_out: pl.Out[pl.Tensor[[T_DYN, H, D], pl.FP16]],
+):
+    """The token count must be a multiple of chunk_cumsum's DISPATCH_TOKENS, the coarsest tile here."""
+    q.bind_dynamic(0, T_DYN)
+    k.bind_dynamic(0, T_DYN)
+    v.bind_dynamic(0, T_DYN)
+    g.bind_dynamic(0, T_DYN)
+    beta.bind_dynamic(1, T_DYN)
+    o_out.bind_dynamic(0, T_DYN)
+    t_dim = pl.tensor.dim(q, 0)
+    nchunk = t_dim // CHUNK_TILE
+    # `tril` serves twice: chunk_cumsum contracts against it, and it is also
+    # chunk_o's causal mask -- both want the inclusive lower triangle. Only
+    # scaled_dot_kkt's is strict, so that one is a second constant.
+    g_sum = pl.create_tensor([H, t_dim], dtype=pl.FP32)
+    gdn_chunk_cumsum(g, tril, g_sum)
 
-    op_cumsum = chunk_cumsum.build_kernel(**shape, inline=True)
-    op_kkt = scaled_dot_kkt.build_kernel(**shape, hg=hg, inline=True)
-    op_tril = solve_tril.build_kernel(**shape, inline=True, out_dtype=pl.FP16)
-    op_wy = wy_fast.build_kernel(**shape, hg=hg, inline=True)
-    op_h = chunk_h.build_kernel(**shape, hg=hg, inline=True)
-    op_o = chunk_o.build_kernel(**shape, hg=hg, inline=True)
+    a = pl.create_tensor([t_dim, H, CHUNK_TILE], dtype=pl.FP16)
+    gdn_scaled_dot_kkt(k, beta, g_sum, mask_strict, a)
 
-    @pl.jit
-    def gdn_layer(
-        q: pl.Tensor[[t, hg, d], pl.FP16],
-        k: pl.Tensor[[t, hg, d], pl.FP16],
-        v: pl.Tensor[[t, h, d], pl.FP16],
-        g: pl.Tensor[[t, h], pl.FP32],
-        beta: pl.Tensor[[h, t], pl.FP32],
-        tril: pl.Tensor[[chunk, chunk], pl.FP32],
-        mask_strict: pl.Tensor[[chunk, chunk], pl.FP32],
-        neg_eye: pl.Tensor[[chunk, chunk], pl.FP16],
-        o_out: pl.Out[pl.Tensor[[t, h, d], pl.FP16]],
-    ):
-        # `tril` serves twice: chunk_cumsum contracts against it, and it is also
-        # chunk_o's causal mask -- both want the inclusive lower triangle. Only
-        # scaled_dot_kkt's is strict, so that one is a second constant.
-        g_sum = pl.create_tensor([h, t], dtype=pl.FP32)
-        op_cumsum(g, tril, g_sum)
+    a_inv = pl.create_tensor([t_dim, H, CHUNK_TILE], dtype=pl.FP16)
+    gdn_solve_tril(a, eye, m_diag, m_low, a_inv)
 
-        a = pl.create_tensor([t, h, chunk], dtype=pl.FP16)
-        op_kkt(k, beta, g_sum, mask_strict, a)
+    w = pl.create_tensor([t_dim, H, D], dtype=pl.FP16)
+    u = pl.create_tensor([t_dim, H, D], dtype=pl.FP16)
+    gdn_wy_fast(k, v, a_inv, beta, g_sum, w, u)
 
-        a_inv = pl.create_tensor([t, h, chunk], dtype=pl.FP16)
-        op_tril(a, neg_eye, a_inv)
+    state_rows = nchunk * VAL_WIDTH
+    state = pl.create_tensor([state_rows, D], dtype=pl.FP16)
+    v_new = pl.create_tensor([t_dim, H, D], dtype=pl.FP16)
+    gdn_chunk_h(k, w, u, g_sum, state, v_new)
 
-        w = pl.create_tensor([t, h, d], dtype=pl.FP16)
-        u = pl.create_tensor([t, h, d], dtype=pl.FP16)
-        op_wy(k, v, a_inv, beta, g_sum, w, u)
-
-        state = pl.create_tensor([nchunk * h * d, d], dtype=pl.FP16)
-        v_new = pl.create_tensor([t, h, d], dtype=pl.FP16)
-        op_h(k, w, u, g_sum, state, v_new)
-
-        op_o(q, k, v_new, state, g_sum, tril, o_out)
-        return o_out
-
-    return gdn_layer
+    gdn_chunk_o(q, k, v_new, state, g_sum, tril, o_out)
+    return o_out
 
 
-gdn_layer = build_kernel()
+gdn_layer = pl.jit.inline(_gdn_layer)
+gdn_layer_test = pl.jit(_gdn_layer)
 
 
-def build_tensor_specs(t: int = T, h: int = H, d: int = D, chunk: int = CHUNK,
+
+_INPUTS: dict = {}
+
+
+def _inputs(t: int, h: int, d: int, hg: int) -> dict:
+    """The drawn q, k, v, beta and g, memoised so the five specs pay for them once."""
+    import reference
+
+    key = (t, h, d, hg)
+    if key not in _INPUTS:
+        _INPUTS[key] = reference.make_inputs(t, h, d, hg)
+    return _INPUTS[key]
+
+
+def build_tensor_specs(t: int = T, h: int = H, d: int = D, chunk: int = CHUNK_TILE,
                        hg: int = HG):
     import torch
     from golden import TensorSpec
@@ -129,7 +133,11 @@ def build_tensor_specs(t: int = T, h: int = H, d: int = D, chunk: int = CHUNK,
         return (rows > cols).float()
 
     def draw(key, transform=None):
-        return reference.lazy("chunk_cumsum", key, t, h, d, chunk, transform, hg=hg)
+        def make():
+            value = _inputs(t, h, d, hg)[key]
+            return transform(value) if transform is not None else value
+
+        return make
 
     return [
         TensorSpec("q", [t, hg, d], torch.float16, init_value=draw("q")),
@@ -141,27 +149,32 @@ def build_tensor_specs(t: int = T, h: int = H, d: int = D, chunk: int = CHUNK,
         TensorSpec("tril", [chunk, chunk], torch.float32, init_value=init_tril),
         TensorSpec("mask_strict", [chunk, chunk], torch.float32,
                    init_value=init_mask_strict),
-        TensorSpec("neg_eye", [chunk, chunk], torch.float16,
-                   init_value=lambda: -torch.eye(chunk, dtype=torch.float16)),
+        TensorSpec("eye", [chunk, chunk], torch.float16,
+                   init_value=lambda: solve_tril.eye_block(chunk)),
+        TensorSpec("m_diag", [chunk, chunk], torch.float16,
+                   init_value=lambda: solve_tril.blk_masks(chunk)[0]),
+        TensorSpec("m_low", [chunk, chunk], torch.float16,
+                   init_value=lambda: solve_tril.blk_masks(chunk)[1]),
         TensorSpec("o_out", [t, h, d], torch.float16),
     ]
 
 
 def golden_gdn_layer(tensors):
-    """The whole chain in float64, scored end to end rather than stage by stage."""
+    """The whole chain in float64 on the tensors the kernel was given, scored end to end."""
     import reference
 
-    t, h, d = tensors["v"].shape
     chunk = tensors["tril"].shape[0]
-    hg = tensors["q"].shape[1]
-    tensors["o_out"].copy_(reference.compute("chunk_o", t, h, d, chunk, hg=hg)["o"])
+    st = reference.delta_rule(tensors["q"].double(), tensors["k"].double(),
+                              tensors["v"].double(), tensors["beta"].t().double(),
+                              tensors["g"].double(), chunk)
+    tensors["o_out"].copy_(st["o"])
 
 
 def _stats_ok(actual, expected, **_kwargs):
-    """megagdn-pto's criterion (tests/utils.py: NumericalAccuracy)."""
+    """Relative Frobenius norm against the float64 golden, with the peak reported."""
     import reference
 
-    ok, detail = reference.stats_ok(actual, expected, chunk=CHUNK)
+    ok, detail = reference.stats_ok(actual, expected, chunk=CHUNK_TILE)
     print(f"[stats] {detail}", flush=True)
     return ok, detail
 
@@ -171,31 +184,26 @@ if __name__ == "__main__":
     from golden import run
 
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
-    parser.add_argument("-p", "--platform", type=str, default="a2a3",
-                        choices=["a2a3", "a2a3sim", "a5", "a5sim"])
+    parser.add_argument("-p", "--platform", type=str, default="a2a3", choices=["a2a3", "a2a3sim", "a5", "a5sim"])
     parser.add_argument("-d", "--device", type=int, default=0)
     parser.add_argument("--seq-len", type=int, default=T)
-    parser.add_argument("--heads", type=int, default=H, help="value heads H")
-    parser.add_argument("--qk-heads", type=int, default=HG,
-                        help="QK heads Hg; pass the same value as --heads for no "
-                             "grouping")
     parser.add_argument("--save-data", action="store_true", default=False)
     parser.add_argument("--golden-data", type=str, default=None)
     parser.add_argument("--runtime-dir", type=str, default=None)
+    parser.add_argument("--enable-chip-swimlane", type=int, nargs="?", const=1, default=0,
+                        choices=range(5))
     args = parser.parse_args()
-
-    if args.heads % args.qk_heads:
-        parser.error(f"H={args.heads} must be divisible by Hg={args.qk_heads}")
-    shape = dict(t=args.seq_len, h=args.heads, hg=args.qk_heads)
+    if args.seq_len % DISPATCH_TOKENS:
+        parser.error(f"--seq-len must be a multiple of {DISPATCH_TOKENS}")
 
     result = run(
-        fn=build_kernel(**shape),
-        specs=build_tensor_specs(**shape),
+        fn=gdn_layer_test,
+        specs=build_tensor_specs(t=args.seq_len),
         golden_fn=golden_gdn_layer,
         golden_data=args.golden_data,
         runtime_dir=args.runtime_dir,
         save_data=args.save_data,
-        config=run_config(args.platform, args.device),
+        config=run_config(args.platform, args.device, args.enable_chip_swimlane),
         rtol=1e-2, atol=1e-5,
         compare_fn={"o_out": _stats_ok},
     )
