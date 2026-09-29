@@ -12,105 +12,133 @@
     intra = (Q @ K^T * exp(min(g_i - g_j, 0)) * causal) @ V_new
     O     = inter + intra
 
-S is the state snapshot entering the chunk and V_new the residual-corrected
-values, both from chunk_h. The causal mask includes the diagonal, unlike
-scaled_dot_kkt's strictly-lower one: a token attends to itself in the output but
-not in the key-key matrix.
+The causal mask includes the diagonal, unlike scaled_dot_kkt's strictly-lower one.
 """
 import pypto.language as pl
 
-from config import GDN_TILING, QWEN3_8_27B
+from config import GDN_TILING, PREFILL_SEQ, QWEN3_8_27B
 
-# model shape
+# Dynamic shape variables.
+T_DYN = pl.dynamic("T_DYN")                 # tokens
+STATE_DYN = pl.dynamic("GDN_STATE_DYN")     # (T // CHUNK_TILE) * H * D, the snapshot rows
+
+# model config
 H = QWEN3_8_27B.linear_num_value_heads      # value heads
 HG = QWEN3_8_27B.linear_num_key_heads       # QK heads; H // HG value heads share one
 D = QWEN3_8_27B.linear_value_head_dim       # head dimension
-CHUNK = GDN_TILING.chunk                    # chunk size in tokens, our tiling choice
-
-# case shape
-T = 8192                # tokens (single sequence, B = 1)
+CHUNK_TILE = GDN_TILING.chunk               # chunk size in tokens, our tiling choice
+T = PREFILL_SEQ                             # tokens (single sequence, B = 1)
 
 
-def build_kernel(t: int = T, h: int = H, d: int = D, chunk: int = CHUNK,
-                 hg: int = HG, inline: bool = False):
-    """The stage kernel at one shape.
+GRP = H // HG                               # value heads sharing one key head
+KEY_WIDTH = HG * D
+VAL_WIDTH = H * D
 
-    `hg` is the number of QK heads, `h` the number of value heads; they differ
-    under GQA. Pass `hg=h` for an ungrouped shape. `inline` makes the kernel a
-    callee for `gdn_layer` rather than a program of its own.
+
+def _gdn_chunk_o(
+    q: pl.Tensor[[T_DYN, HG, D], pl.FP16],
+    k: pl.Tensor[[T_DYN, HG, D], pl.FP16],
+    v: pl.Tensor[[T_DYN, H, D], pl.FP16],
+    state: pl.Tensor[[STATE_DYN, D], pl.FP16],
+    g_sum: pl.Tensor[[H, T_DYN], pl.FP32],
+    mask: pl.Tensor[[CHUNK_TILE, CHUNK_TILE], pl.FP32],
+    o_out: pl.Out[pl.Tensor[[T_DYN, H, D], pl.FP16]],
+):
+    """The token count must be a multiple of CHUNK_TILE, and `state` hold (T // CHUNK_TILE) * H * D rows."""
+    q.bind_dynamic(0, T_DYN)
+    k.bind_dynamic(0, T_DYN)
+    v.bind_dynamic(0, T_DYN)
+    state.bind_dynamic(0, STATE_DYN)
+    g_sum.bind_dynamic(1, T_DYN)
+    o_out.bind_dynamic(0, T_DYN)
+    t_dim = pl.tensor.dim(q, 0)
+    q_flat = pl.reshape(q, [t_dim, KEY_WIDTH])
+    k_flat = pl.reshape(k, [t_dim, KEY_WIDTH])
+    v_flat = pl.reshape(v, [t_dim, VAL_WIDTH])
+    o_flat = pl.reshape(o_out, [t_dim, VAL_WIDTH])
+    for c0 in pl.spmd(t_dim // CHUNK_TILE, name_hint="chunk_o",
+                      optimizations=[pl.cross_core_slot(slot_num=1),
+                                     pl.split(pl.SplitMode.UP_DOWN)]):
+        t0 = c0 * CHUNK_TILE
+        for hh in pl.range(H):
+            d0 = hh * D
+            # GQA: Q and K come from key head hh // GRP; V, O and the state
+            # snapshot are per value head.
+            dg0 = (hh // GRP) * D
+            qc = q_flat[t0 : t0 + CHUNK_TILE, dg0 : dg0 + D]
+            g_row = g_sum[hh : hh + 1, t0 : t0 + CHUNK_TILE]
+            g_col = pl.reshape(g_row, [CHUNK_TILE, 1])
+            # exp before the [1,C]->[C,1] reshape, not after (pypto#2947)
+            eg = pl.reshape(pl.exp(g_row), [CHUNK_TILE, 1])
+
+            row = c0 * VAL_WIDTH + d0
+            s_blk = state[row : row + D, 0 : D]
+            inter = pl.row_expand_mul(pl.matmul(qc, s_blk), eg)
+
+            # A matmul result, not pl.create_tensor: the accumulator must be a tile
+            # private to this core group, not a tensor every chunk in flight shares.
+            kc = k_flat[t0 : t0 + CHUNK_TILE, dg0 : dg0 + D]
+            qk = pl.matmul(qc, kc, b_trans=True)
+            diff = pl.full([CHUNK_TILE, CHUNK_TILE], dtype=pl.FP32, value=0.0)
+            diff = pl.row_expand_add(diff, g_col)
+            diff = pl.col_expand_sub(diff, g_row)
+            decay = pl.exp(pl.minimum(diff, 0.0))
+            gate = pl.mul(decay, mask[:, :])
+            # a matmul's result dtype follows its CONSUMER, not its operands
+            gated = pl.cast(pl.mul(qk, gate), target_type=pl.FP16, mode="rint")
+            vc = v_flat[t0 : t0 + CHUNK_TILE, d0 : d0 + D]
+            intra = pl.matmul(gated, vc, out_dtype=pl.FP32)
+
+            o_flat[t0 : t0 + CHUNK_TILE, d0 : d0 + D] = pl.cast(pl.add(inter, intra),
+                                                           target_type=pl.FP16, mode="rint")
+    return o_out
+
+
+gdn_chunk_o = pl.jit.inline(_gdn_chunk_o)
+gdn_chunk_o_test = pl.jit(_gdn_chunk_o)
+
+
+
+_INPUTS: dict = {}
+
+
+def _inputs(t: int, h: int, d: int, chunk: int, hg: int) -> dict:
+    """The chain this stage consumes, run here rather than shared with the other stages.
+
+    Memoised so the several specs that draw from it pay for it once.
     """
-    nchunk = t // chunk                    # state snapshots, one per chunk
-    grp = h // hg
+    import torch
 
-    @(pl.jit.inline if inline else pl.jit)
-    def gdn_chunk_o(
-        q: pl.Tensor[[t, hg, d], pl.FP16],
-        k: pl.Tensor[[t, hg, d], pl.FP16],
-        v: pl.Tensor[[t, h, d], pl.FP16],
-        state: pl.Tensor[[nchunk * h * d, d], pl.FP16],
-        g_sum: pl.Tensor[[h, t], pl.FP32],
-        mask: pl.Tensor[[chunk, chunk], pl.FP32],
-        o_out: pl.Out[pl.Tensor[[t, h, d], pl.FP16]],
-    ):
-        q_flat = pl.reshape(q, [t, hg * d])
-        k_flat = pl.reshape(k, [t, hg * d])
-        v_flat = pl.reshape(v, [t, h * d])
-        o_flat = pl.reshape(o_out, [t, h * d])
-        for c0 in pl.spmd(t // chunk, name_hint="chunk_o",
-                          optimizations=[pl.cross_core_slot(slot_num=1),
-                                         pl.split(pl.SplitMode.UP_DOWN)]):
-            t0 = c0 * chunk
-            for hh in pl.range(h):
-                d0 = hh * d
-                # GQA: Q and K come from key head hh // grp; V, O and the state
-                # snapshot are per value head.
-                dg0 = (hh // grp) * d
-                qc = q_flat[t0 : t0 + chunk, dg0 : dg0 + d]
-                g_row = g_sum[hh : hh + 1, t0 : t0 + chunk]
-                g_col = pl.reshape(g_row, [chunk, 1])
-                # exp on the ROW vector, reshaped after -- NOT pl.exp(g_col). Under
-                # pl.split a view op reading the per-lane slice used to fold onto the
-                # sliced buffer's base, so lane 1 applied lane 0's gate. Fixed upstream
-                # 2026-09-02; this spelling still builds against stock pypto and
-                # generates the same code.
-                eg = pl.reshape(pl.exp(g_row), [chunk, 1])
+    import reference
 
-                row = c0 * (h * d) + d0
-                s_blk = state[row : row + d, 0 : d]
-                inter = pl.row_expand_mul(pl.matmul(qc, s_blk), eg)
-
-                # The accumulator has to be a matmul result -- a tile the matrix unit
-                # owns, private to this core group. pl.create_tensor allocates a runtime
-                # TENSOR instead: one buffer shared by every chunk running in parallel,
-                # which corrupts intermittently.
-                kc = k_flat[t0 : t0 + chunk, dg0 : dg0 + d]
-                qk = pl.matmul(qc, kc, b_trans=True)
-                diff = pl.full([chunk, chunk], dtype=pl.FP32, value=0.0)
-                diff = pl.row_expand_add(diff, g_col)
-                diff = pl.col_expand_sub(diff, g_row)
-                decay = pl.exp(pl.minimum(diff, 0.0))
-                gate = pl.mul(decay, mask[:, :])
-                # a matmul's result dtype follows its CONSUMER, not its operands
-                gated = pl.cast(pl.mul(qk, gate), target_type=pl.FP16, mode="rint")
-                vc = v_flat[t0 : t0 + chunk, d0 : d0 + d]
-                intra = pl.matmul(gated, vc, out_dtype=pl.FP32)
-
-                o_flat[t0 : t0 + chunk, d0 : d0 + d] = pl.cast(pl.add(inter, intra),
-                                                               target_type=pl.FP16, mode="rint")
-        return o_out
-
-    return gdn_chunk_o
+    key = (t, h, d, chunk, hg)
+    if key not in _INPUTS:
+        st = reference.make_inputs(t, h, d, hg)
+        st["g_sum"] = reference.cumsum(st["g"], chunk)
+        a16 = reference.kkt(st["k"], st["beta"], st["g_sum"], chunk).to(torch.float16)
+        a_inv16 = reference.solve_tril(a16, chunk).to(torch.float16)
+        w, u = reference.wy_fast(st["k"], st["v"], st["beta"], a_inv16, st["g_sum"], chunk)
+        state, v_new, _ = reference.chunk_h(st["k"], w.to(torch.float16), u.to(torch.float16),
+        st["g_sum"], chunk)
+        st["state"] = state
+        st["v_new16"] = v_new.to(torch.float16)
+        _INPUTS[key] = st
+    return _INPUTS[key]
 
 
-gdn_chunk_o = build_kernel()
-
-
-def build_tensor_specs(t: int = T, h: int = H, d: int = D, chunk: int = CHUNK,
+def build_tensor_specs(t: int = T, h: int = H, d: int = D, chunk: int = CHUNK_TILE,
                        hg: int = HG):
     import torch
     from golden import TensorSpec
 
     import reference
+
+    def draw(key, transform=None):
+        def make():
+            value = _inputs(t, h, d, chunk, hg)[key]
+            return transform(value) if transform is not None else value
+
+        return make
 
     nc = t // chunk
 
@@ -121,15 +149,15 @@ def build_tensor_specs(t: int = T, h: int = H, d: int = D, chunk: int = CHUNK,
 
     return [
         TensorSpec("q", [t, hg, d], torch.float16,
-                   init_value=reference.lazy("chunk_o", "q", t, h, d, chunk, hg=hg)),
+                   init_value=draw("q")),
         TensorSpec("k", [t, hg, d], torch.float16,
-                   init_value=reference.lazy("chunk_o", "k", t, h, d, chunk, hg=hg)),
+                   init_value=draw("k")),
         TensorSpec("v", [t, h, d], torch.float16,
-                   init_value=reference.lazy("chunk_o", "v_new16", t, h, d, chunk, hg=hg)),
+                   init_value=draw("v_new16")),
         TensorSpec("state", [nc * h * d, d], torch.float16,
-                   init_value=reference.lazy("chunk_o", "state", t, h, d, chunk, reference.flat_state, hg=hg)),
+                   init_value=draw("state", reference.flat_state)),
         TensorSpec("g_sum", [h, t], torch.float32,
-                   init_value=reference.lazy("chunk_o", "g_sum", t, h, d, chunk, reference.to_hT, hg=hg)),
+                   init_value=draw("g_sum", reference.to_hT)),
         TensorSpec("mask", [chunk, chunk], torch.float32, init_value=init_mask),
         TensorSpec("o_out", [t, h, d], torch.float16),
     ]
@@ -142,15 +170,15 @@ def golden_gdn_chunk_o(tensors):
     h = tensors["v"].shape[1]             # V, O and the state are per value head
     chunk = tensors["mask"].shape[0]
     state = tensors["state"].reshape(t // chunk, h, d, d)
-    tensors["o_out"].copy_(reference.chunk_o(
-        tensors["q"], tensors["k"], tensors["v"], state, tensors["g_sum"].t(), chunk))
+    o = reference.chunk_o(tensors["q"], tensors["k"], tensors["v"], state, tensors["g_sum"].t(), chunk)
+    tensors["o_out"].copy_(o)
 
 
 def _stats_ok(actual, expected, **_kwargs):
-    """megagdn-pto's criterion for this stage (tests/utils.py: NumericalAccuracy)."""
+    """Relative Frobenius norm against the float64 golden, with the peak reported."""
     import reference
 
-    ok, detail = reference.stats_ok(actual, expected, chunk=CHUNK)
+    ok, detail = reference.stats_ok(actual, expected, chunk=CHUNK_TILE)
     print(f"[stats] {detail}", flush=True)
     return ok, detail
 
@@ -160,17 +188,19 @@ if __name__ == "__main__":
     from golden import run
 
     parser = argparse.ArgumentParser()
-    parser.add_argument("-p", "--platform", type=str, default="a2a3",
-                        choices=["a2a3", "a2a3sim", "a5", "a5sim"])
+    parser.add_argument("-p", "--platform", type=str, default="a2a3", choices=["a2a3", "a2a3sim", "a5", "a5sim"])
     parser.add_argument("-d", "--device", type=int, default=0)
+    parser.add_argument("--seq-len", type=int, default=T)
     parser.add_argument("--save-data", action="store_true", default=False)
     parser.add_argument("--golden-data", type=str, default=None)
     parser.add_argument("--runtime-dir", type=str, default=None)
     args = parser.parse_args()
+    if args.seq_len % CHUNK_TILE:
+        parser.error(f"--seq-len must be a multiple of CHUNK_TILE={CHUNK_TILE}")
 
     result = run(
-        fn=gdn_chunk_o,
-        specs=build_tensor_specs(),
+        fn=gdn_chunk_o_test,
+        specs=build_tensor_specs(t=args.seq_len),
         golden_fn=golden_gdn_chunk_o,
         golden_data=args.golden_data,
         runtime_dir=args.runtime_dir,
