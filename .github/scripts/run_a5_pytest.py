@@ -24,7 +24,12 @@ def collect(entry, output):
     output.unlink(missing_ok=True)
     command = [sys.executable, "-m", "pytest", entry, "--collect-only", "-q",
                "--rootdir", str(ROOT), "--import-mode=importlib", "--a5-case-list", str(output)]
-    subprocess.run(command, cwd=ROOT, check=True)
+    result = subprocess.run(command, cwd=ROOT, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                            text=True, check=False)
+    if result.returncode:
+        if result.stdout:
+            print(result.stdout, end="" if result.stdout.endswith("\n") else "\n", flush=True)
+        raise subprocess.CalledProcessError(result.returncode, command)
     cases = json.loads(output.read_text())
     if not cases:
         raise ValueError(f"{entry}: no pytest precision cases collected")
@@ -53,11 +58,11 @@ def main():
                                if "# ci: a5" in path.read_text().splitlines()]
     if args.results:
         args.results.write_text("")
-    failed = False
+    failed_cases = []
 
     def report(label, passed):
-        nonlocal failed
-        failed |= not passed
+        if not passed:
+            failed_cases.append(label)
         if args.results:
             with args.results.open("a") as stream:
                 stream.write(f"{label}\t{'pass' if passed else 'fail'}\n")
@@ -83,7 +88,13 @@ def main():
                 if not passed:
                     print(f"::error file={entry}::FAIL {case['nodeid']}", flush=True)
                 print("::endgroup::", flush=True)
-    return int(failed)
+    if failed_cases:
+        print("FAILED CASES:", flush=True)
+        for label in failed_cases:
+            print(f"  {label}", flush=True)
+        return 1
+    print("All selected cases passed.", flush=True)
+    return 0
 
 
 if __name__ == "__main__":

@@ -234,6 +234,7 @@ def _scatter_local_tokens(
     output: pl.Tensor[[T_DYN, D], pl.BF16],
     num_tokens: pl.Scalar[pl.INT32],
     tp_rank: pl.Scalar[pl.INT32],
+    compact_ready: pl.Scalar[pl.TASK_ID],
 ):
     """Scatter compact local MoE rows back into the original TP token positions."""
     tokens = pl.tensor.dim(output, 0)
@@ -242,7 +243,7 @@ def _scatter_local_tokens(
         row = pl.tile.get_block_idx()
         zero = pl.tile.full([1, D], dtype=pl.BF16, value=0.0)
         pl.tile.store(zero, [row, 0], output, shapes=[1, D])
-    with pl.spmd(tokens, name_hint="prefill_moe_scatter", deps=[zero_tid]):
+    with pl.spmd(tokens, name_hint="prefill_moe_scatter", deps=[zero_tid, compact_ready]):
         row = pl.tile.get_block_idx()
         if row < local_tokens:
             dst_row = row * TP_SIZE + tp_rank
@@ -318,7 +319,7 @@ def prefill_moe_sublayer(
     npu_rms_norm(local_ffn_input, ffn_norm_weight, local_ffn_normed)
     local_num_tokens = _local_token_count(num_tokens, tp_rank)
     with pl.scope():
-        moe_core(
+        local_ffn_ready = moe_core(
             local_ffn_normed, gate_weight, correction_bias,
             routed_w1, routed_w1_scale, routed_w2, routed_w2_scale, routed_w3, routed_w3_scale,
             mxfp4_pair_lut, shared_w1, shared_w1_scale, shared_w2, shared_w2_scale,
@@ -326,7 +327,7 @@ def prefill_moe_sublayer(
             arrived, data_arrived, routed_output, combine_arrived, local_ffn_owned,
             local_num_tokens, ep_rank, moe_epoch,
         )
-        _scatter_local_tokens(local_ffn_owned, ffn_owned, num_tokens, tp_rank)
+        _scatter_local_tokens(local_ffn_owned, ffn_owned, num_tokens, tp_rank, local_ffn_ready)
     return ffn_owned
 
 

@@ -56,6 +56,41 @@ def mhc_post(
             )
     return output
 
+
+@pl.jit.inline
+def mhc_post_after(
+    sublayer: pl.Tensor,
+    residual: pl.Tensor,
+    post_mix: pl.Tensor,
+    residual_mix: pl.Tensor,
+    output: pl.Tensor,
+    sublayer_ready: pl.Scalar[pl.TASK_ID],
+    mixes_ready: pl.Scalar[pl.TASK_ID],
+):
+    """Run mHC residual expansion after the sublayer output is complete."""
+    t_dim = pl.tensor.dim(sublayer, 0)
+    residual_flat = pl.reshape(residual, [t_dim, HC_DIM])
+    residual_mix_flat = pl.reshape(residual_mix, [t_dim, HC_MULT * HC_MULT])
+    output_flat = pl.reshape(output, [t_dim, HC_DIM])
+    with pl.spmd(t_dim * HC_MULT, name_hint="mhc_post", deps=[sublayer_ready, mixes_ready]):
+        block = pl.tile.get_block_idx()
+        t = block // HC_MULT
+        out_h = block % HC_MULT
+        for d0 in pl.pipeline(0, D, 256, stage=2):
+            x_tile = pl.cast(sublayer[t : t + 1, d0 : d0 + 256], target_type=pl.FP32)
+            value = pl.mul(x_tile, pl.read(post_mix, [t, out_h]))
+            for in_h in pl.unroll(HC_MULT):
+                residual_tile = residual_flat[t : t + 1, in_h * D + d0 : in_h * D + d0 + 256]
+                value = pl.add(
+                    value,
+                    pl.mul(residual_tile, pl.read(residual_mix_flat, [t, in_h * HC_MULT + out_h])),
+                )
+            output_flat[t : t + 1, out_h * D + d0 : out_h * D + d0 + 256] = pl.cast(
+                pl.cast(value, target_type=pl.BF16, mode="rint"),
+                target_type=pl.FP32,
+            )
+    return output
+
 def golden_mhc_post(
     sublayer: torch.Tensor,
     residual: torch.Tensor,

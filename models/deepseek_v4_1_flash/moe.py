@@ -48,7 +48,7 @@ from models.deepseek_v4_1_flash.expert_routed import (
 from models.deepseek_v4_1_flash.ep_transport import SIGNAL_PAD, combine, dispatch
 from models.deepseek_v4_1_flash.hc_mixes import golden_mhc_mixes, mhc_mixes
 from models.deepseek_v4_1_flash.hc_pre import golden_mhc_pre, mhc_pre
-from models.deepseek_v4_1_flash.hc_post import golden_mhc_post, mhc_post
+from models.deepseek_v4_1_flash.hc_post import golden_mhc_post, mhc_post_after
 from models.deepseek_v4_1_flash.rmsnorm import golden_rms_norm, rms_norm
 
 
@@ -93,7 +93,7 @@ def _moe_core(
     combine_arrived: pld.DistributedTensor[
         [EP_SIZE, N_LOCAL_EXPERTS, SIGNAL_PAD], pl.INT32
     ],
-    output: pl.Out[pl.Tensor[[C.LOCAL_T_DYN, D], pl.BF16]],
+    output: pl.Tensor[[C.LOCAL_T_DYN, D], pl.BF16],
     num_tokens: pl.Scalar[pl.INT32],
     ep_rank: pl.Scalar[pl.INT32],
     moe_epoch: pl.Scalar[pl.INT32],
@@ -125,7 +125,7 @@ def _moe_core(
                       shared_output)
 
     if SKIP_TRANSPORT_TEST:
-        with pl.spmd(t, name_hint="moe_skip_transport_output", deps=[_output_zero_tid]):
+        with pl.spmd(t, name_hint="moe_skip_transport_output", deps=[_output_zero_tid]) as output_ready:
             out_t = pl.tile.get_block_idx()
             if out_t < num_tokens:
                 out_row = pl.load(shared_output, [out_t, 0], [1, D])
@@ -161,9 +161,10 @@ def _moe_core(
         )
         # combine writes the final output directly: a dynamically shaped intermediate
         # would escape its defining scope during PTOAS SSA conversion.
-        combine(routed_y, recv_route_local, shared_output, output, recv_meta_local,
-                routed_output, combine_arrived, _output_zero_tid, expert_ready,
-                num_tokens, ep_rank, moe_epoch)
+        output_ready = combine(routed_y, recv_route_local, shared_output, output, recv_meta_local,
+                               routed_output, combine_arrived, _output_zero_tid, expert_ready,
+                               num_tokens, ep_rank, moe_epoch)
+    return output_ready
 
 
 @pl.jit.inline(auto_scope=False)
@@ -245,7 +246,7 @@ def moe(
         [t, HC_MULT, HC_MULT], dtype=pl.FP32
     )
     ffn_input = pl.create_tensor([t, D], dtype=pl.BF16)
-    mhc_mixes(
+    mixes_ready = mhc_mixes(
         x_hc, hc_ffn_fn, hc_ffn_scale, hc_ffn_base,
         next_pre_mix, post_mix, residual_mix,
     )
@@ -264,7 +265,7 @@ def moe(
         # pl.full() fails to compile with
         #   "missing inferred tensor metadata for parameter 'ffn_out' of 'combine'"
         sublayer = pl.create_tensor([t, D], dtype=pl.BF16)
-        _moe_core(
+        sublayer_ready = _moe_core(
             ffn_input, gate_weight, correction_bias,
             routed_w1, routed_w1_scale, routed_w2, routed_w2_scale,
             routed_w3, routed_w3_scale, mxfp4_pair_lut, shared_w1, shared_w1_scale,
@@ -274,7 +275,7 @@ def moe(
             combine_arrived, sublayer,
             num_tokens, ep_rank, moe_epoch,
         )
-        mhc_post(sublayer, x_hc, post_mix, residual_mix, x_next)
+        mhc_post_after(sublayer, x_hc, post_mix, residual_mix, x_next, sublayer_ready, mixes_ready)
     return x_next
 
 

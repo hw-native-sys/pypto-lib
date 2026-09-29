@@ -114,7 +114,8 @@ def mhc_mixes(
     scale0 = pl.read(scale, [0])
     scale1 = pl.read(scale, [1])
     scale2 = pl.read(scale, [2])
-    for block in pl.spmd((t_dim + T_TILE - 1) // T_TILE, name_hint="mhc_split"):
+    with pl.spmd((t_dim + T_TILE - 1) // T_TILE, name_hint="mhc_split") as split_ready:
+        block = pl.tile.get_block_idx()
         t0 = block * T_TILE
         valid_rows = pl.min(T_TILE, t_dim - t0)
         inv = inv_rms[t0 : t0 + T_TILE, 0:1]
@@ -138,7 +139,8 @@ def mhc_mixes(
         pre_mix[t0 : t0 + T_TILE, 0:HC_MULT] = pre_tile
         post_mix[t0 : t0 + T_TILE, 0:HC_MULT] = post_tile
 
-    for block in pl.spmd((t_dim + COMB_T_TILE - 1) // COMB_T_TILE, name_hint="mhc_sinkhorn"):
+    with pl.spmd((t_dim + COMB_T_TILE - 1) // COMB_T_TILE, name_hint="mhc_sinkhorn") as sinkhorn_ready:
+        block = pl.tile.get_block_idx()
         t0 = block * COMB_T_TILE
         valid_rows = pl.min(COMB_T_TILE, t_dim - t0)
         comb_inv = pl.load(
@@ -261,7 +263,8 @@ def mhc_mixes(
         pl.store(pl.set_validshape(row1, valid_rows, HC_MULT), [t0, 1 * HC_MULT], residual_mix_flat)
         pl.store(pl.set_validshape(row2, valid_rows, HC_MULT), [t0, 2 * HC_MULT], residual_mix_flat)
         pl.store(pl.set_validshape(row3, valid_rows, HC_MULT), [t0, 3 * HC_MULT], residual_mix_flat)
-    return pre_mix, post_mix, residual_mix
+    mixes_ready = pl.system.task_dummy(deps=[split_ready, sinkhorn_ready])
+    return mixes_ready
 
 def golden_mhc_mixes(
     x_hc: torch.Tensor,

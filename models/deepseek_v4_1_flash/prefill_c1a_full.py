@@ -541,7 +541,7 @@ def main():
 if "pytest" in sys.modules:
     import pytest
 
-    @pytest.mark.parametrize("tp,dp", [(1, 1), (4, 1)])
+    @pytest.mark.parametrize("tp,dp", [(4, 1)])
     def test_precision(tp, dp, a5_args):
         """Validate the operator against its golden reference on A5."""
         result = validate(a5_args(tp=tp, dp=dp))

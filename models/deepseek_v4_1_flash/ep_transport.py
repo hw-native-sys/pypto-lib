@@ -388,6 +388,7 @@ def combine(
                 acc = pl.add(acc, pl.cast(pl.load(routed_output, [t * TOPK + k, 0], [1, D]), target_type=pl.FP32))
             ffn_out = pl.store(pl.cast(acc, target_type=pl.BF16, mode="rint"), [t, 0], ffn_out)
     # No consumed window is declared, so no recycle signal is published.
+    return _reduce_tid
 
 
 # ---------------------------------------------------------------------------
@@ -543,7 +544,7 @@ def combine_test(
         zero_row = pl.tile.full([1, D], dtype=pl.BF16, value=0.0)
         ffn_out = pl.store(zero_row, [t, 0], ffn_out)
     expert_ready = pl.system.task_dummy(deps=[])
-    combine(
+    _combine_ready = combine(
         recv_y, recv_route_out, shared_output, ffn_out, recv_meta_local,
         routed_output, combine_arrived,
         output_ready, expert_ready,
