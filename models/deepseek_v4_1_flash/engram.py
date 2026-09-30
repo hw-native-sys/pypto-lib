@@ -54,6 +54,7 @@ import torch
 from models.deepseek_v4_1_flash.config import D, FLASH, HC_MULT, T_DYN
 
 
+
 N_HASH_COLS = (FLASH.engram_max_ngram_size - 1) * FLASH.engram_n_heads  # 24
 HEAD_DIM = FLASH.engram_head_dim  # 256
 ENGRAM_K = N_HASH_COLS * HEAD_DIM  # 6144 flattened lookup width
@@ -698,6 +699,54 @@ if "pytest" in sys.modules:
         """Validate the operator against its golden reference on A5."""
         result = validate(a5_args(tp=tp))
         assert result.passed, result.error
+
+
+
+# Resident CED prefill precision variants.
+_PREFILL_AUX_NORM_EPS = FLASH.rms_norm_eps
+
+
+_PREFILL_AUX_T = pl.dynamic("FP32_AUX_T")
+
+
+@pl.jit.inline(auto_scope=False)
+def prefill_engram_gate_inline(
+    x: pl.Tensor[[_PREFILL_AUX_T, HC_MULT, D], pl.FP32],
+    kv: pl.Tensor[[_PREFILL_AUX_T, (HC_MULT + 1) * D], pl.FP32],
+    weight: pl.Tensor[[HC_MULT, D], pl.FP32],
+    output: pl.Tensor[[_PREFILL_AUX_T, HC_MULT, D], pl.FP32],
+):
+    """Apply the released normalized signed-square-root gate without narrowing."""
+    tokens = pl.tensor.dim(x, 0)
+    flat = pl.reshape(x, [tokens, HC_MULT * D])
+    result = pl.reshape(output, [tokens, HC_MULT * D])
+    with pl.spmd(((tokens + 15) // 16) * HC_MULT, name_hint="fp32_engram_gate"):
+        block = pl.tile.get_block_idx()
+        first = (block // HC_MULT) * 16
+        stream = block % HC_MULT
+        rows = pl.min(16, tokens - first)
+        sq_x = pl.full([1, 16], dtype=pl.FP32, value=0.0)
+        sq_k = pl.full([1, 16], dtype=pl.FP32, value=0.0)
+        dot = pl.full([1, 16], dtype=pl.FP32, value=0.0)
+        for column in pl.range(0, D, 256):
+            a = pl.slice(flat, [16, 256], [first, stream * D + column], valid_shape=[rows, 256])
+            key = pl.slice(kv, [16, 256], [first, stream * D + column], valid_shape=[rows, 256])
+            w = pl.slice(weight, [1, 256], [stream, column])
+            sq_x = pl.add(sq_x, pl.reshape(pl.row_sum(pl.mul(a, a)), [1, 16]))
+            sq_k = pl.add(sq_k, pl.reshape(pl.row_sum(pl.mul(key, key)), [1, 16]))
+            dot = pl.add(dot, pl.reshape(pl.row_sum(pl.mul(pl.col_expand_mul(a, w), key)), [1, 16]))
+        inv_x = pl.rsqrt(pl.add(pl.mul(sq_x, 1.0 / D), _PREFILL_AUX_NORM_EPS), high_precision=True)
+        inv_k = pl.rsqrt(pl.add(pl.mul(sq_k, 1.0 / D), _PREFILL_AUX_NORM_EPS), high_precision=True)
+        dot = pl.mul(pl.mul(pl.mul(dot, inv_x), inv_k), D**-0.5)
+        magnitude = pl.sqrt(pl.maximum(pl.abs(dot), 1e-6))
+        sign = pl.sub(pl.mul(pl.cmp(dot, 0.0, cmp_type=5), 2.0), 1.0)
+        gate = pl.reshape(pl.recip(pl.add(pl.exp(pl.neg(pl.mul(sign, magnitude))), 1.0)), [16, 1])
+        for column in pl.range(0, D, 256):
+            a = pl.slice(flat, [16, 256], [first, stream * D + column], valid_shape=[rows, 256])
+            value = pl.slice(kv, [16, 256], [first, HC_MULT * D + column], valid_shape=[rows, 256])
+            merged = pl.add(a, pl.row_expand_mul(value, gate))
+            result = pl.assemble(result, merged, [first, stream * D + column])
+    return output
 
 if __name__ == _SCRIPT_ENTRY_POINT:
     main()

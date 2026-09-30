@@ -13,6 +13,8 @@ import pypto.language as pl
 from models.deepseek_v4_1_flash.config import FLASH as M, MOE_TOKENS
 from models.deepseek_v4_1_flash.rmsnorm import rms_norm
 
+from models.deepseek_v4_1_flash.config import FLASH
+
 FP32_NEG_INF = -3.4028234663852886e38
 
 
@@ -737,6 +739,79 @@ def fp8_bits_equal(actual, expected, **_kwargs):
         f"expected=0x{int(expected_bits.flatten()[first]):02x}"
     )
 
+
+
+
+# Resident CED prefill precision variants.
+_PREFILL_MOE_TOPK = FLASH.num_experts_per_tok
+
+
+_PREFILL_MOE_T = pl.dynamic("V41_FP32_MOE_T")
+
+
+_PREFILL_MOE_ROUTE_SCALE = FLASH.routed_scaling_factor
+
+
+_PREFILL_MOE_EXPERTS = FLASH.n_routed_experts
+
+
+_PREFILL_MOE_WORKERS = 32
+
+
+@pl.jit.inline(auto_scope=False)
+def prefill_gate_select_inline(
+    logits: pl.Tensor[[_PREFILL_MOE_T, _PREFILL_MOE_EXPERTS], pl.FP32],
+    bias: pl.Tensor[[_PREFILL_MOE_EXPERTS], pl.FP32],
+    indices: pl.Tensor[[_PREFILL_MOE_T, _PREFILL_MOE_TOPK], pl.INT32],
+    weights: pl.Tensor[[_PREFILL_MOE_T, _PREFILL_MOE_TOPK], pl.FP32],
+):
+    """Select six experts by biased sqrt-softplus, weighting by unbiased scores."""
+    logits.bind_dynamic(0, _PREFILL_MOE_T)
+    indices.bind_dynamic(0, _PREFILL_MOE_T)
+    weights.bind_dynamic(0, _PREFILL_MOE_T)
+    rows = pl.tensor.dim(logits, 0)
+    # Eight packed rows occupy 192 bytes, so each task owns whole 64-byte
+    # cache lines for scalar top-k writes, including the final partial task.
+    for worker in pl.spmd(_PREFILL_MOE_WORKERS, name_hint="fp32_gate_select"):
+        for block in pl.range(worker, (rows + 7) // 8, _PREFILL_MOE_WORKERS):
+            for row in pl.range(block * 8, pl.min(rows, block * 8 + 8)):
+                value = pl.slice(logits, [1, _PREFILL_MOE_EXPERTS], [row, 0])
+                exponential = pl.exp(pl.neg(pl.abs(value)))
+                # log1p(e) = 2*atanh(e/(2+e)); here 0<=e<=1 and |z|<=1/3.
+                # The odd series through z^17 has truncation error below 2e-10.
+                z = pl.div(exponential, pl.add(exponential, 2.0), high_precision=True)
+                z2 = pl.mul(z, z)
+                polynomial = pl.add(pl.mul(z2, 1.0 / 17.0), 1.0 / 15.0)
+                polynomial = pl.add(pl.mul(z2, polynomial), 1.0 / 13.0)
+                polynomial = pl.add(pl.mul(z2, polynomial), 1.0 / 11.0)
+                polynomial = pl.add(pl.mul(z2, polynomial), 1.0 / 9.0)
+                polynomial = pl.add(pl.mul(z2, polynomial), 1.0 / 7.0)
+                polynomial = pl.add(pl.mul(z2, polynomial), 1.0 / 5.0)
+                polynomial = pl.add(pl.mul(z2, polynomial), 1.0 / 3.0)
+                polynomial = pl.add(pl.mul(z2, polynomial), 1.0)
+                softplus_tail = pl.mul(pl.mul(z, 2.0), polynomial)
+                scores = pl.sqrt(pl.add(pl.maximum(value, 0.0), softplus_tail))
+                biased = pl.add(scores, pl.reshape(bias, [1, _PREFILL_MOE_EXPERTS]))
+                ids = pl.create_tensor([1, _PREFILL_MOE_EXPERTS], dtype=pl.UINT32)
+                ids[:, :] = pl.arange(0, [1, _PREFILL_MOE_EXPERTS], dtype=pl.UINT32)
+                sorted32 = pl.sort32(biased, ids)
+                sorted64 = pl.mrgsort(sorted32, block_len=64)
+                sorted_pairs = pl.mrgsort(sorted64[:, 0:256], sorted64[:, 256:512], sorted64[:, 512:768])
+                selected = pl.gather(
+                    sorted_pairs[:, 0:16], mask_pattern=pl.tile.MaskPattern.P1010, output_dtype=pl.INT32
+                )
+                selected_scores = pl.gather(scores, dim=-1, index=selected)
+                total = pl.read(selected_scores, [0, 0])
+                for slot in pl.unroll(1, _PREFILL_MOE_TOPK):
+                    total = pl.add(total, pl.read(selected_scores, [0, slot]))
+                total = pl.add(total, 1e-20)
+                for slot in pl.unroll(_PREFILL_MOE_TOPK):
+                    route_weight = pl.mul(
+                        pl.div(pl.read(selected_scores, [0, slot]), total), _PREFILL_MOE_ROUTE_SCALE
+                    )
+                    pl.write(indices, [row, slot], pl.read(selected, [0, slot]))
+                    pl.write(weights, [row, slot], route_weight)
+    return indices, weights
 
 if __name__ == "__main__":
     # Drop this model directory when run as a script so the local golden.py does not

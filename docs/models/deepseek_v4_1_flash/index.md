@@ -694,3 +694,62 @@ Local script execution is still supported with all original CLI options:
 task-submit --device auto --device-num 2 --run \
   'python models/deepseek_v4_1_flash/decode_attn_swa.py -p a5 --tp 1 --dp 2 -d $TASK_DEVICE'
 ```
+
+## CED prefill on A5
+
+[prefill_fwd.py](../../../models/deepseek_v4_1_flash/prefill_fwd.py) composes
+fresh prefill into one complete L2 invocation per A5 rank. Its L3 entry launches
+four ranks once. Each rank executes encoder layers 0–19, publishes layer-20
+global KV/index keys from all encoder rows, gathers each request's final causal
+window with its delayed mHC pre-mix, and executes decoder layers 20–39 and the
+vocabulary head.
+
+The original FP8/FP4 checkpoint weights remain resident in packed device banks.
+Each rank owns 96 of the 384 routed experts per layer; attention and shared-expert
+weights are replicated. Projections decode the original values to FP32 on device.
+Expert routing, row compaction, cache publication and the CED handoff all execute
+inside L2. The four ranks exchange individual routed contributions and add them
+in ascending global expert-ID order, then add the shared expert.
+
+[prefill_fwd.py](../../../models/deepseek_v4_1_flash/prefill_fwd.py) provides the
+real-checkpoint runner and independent CPU validation. The same file contains the
+L2/L3 entries and checkpoint loader. Precision variants live with their existing
+operator owners; CED metadata and independent references live in
+`metadata.py` and `golden.py`. One option controls both
+device and reference arithmetic:
+
+- `--precision fp32` (default) keeps activations, caches and contractions in FP32.
+- `--precision official` applies the released BF16 boundaries, FP8 activation and
+  window-cache quantization, FP4 compressed/index-cache quantization, and online
+  attention with BF16 probabilities. Activation/cache buffers hold the resulting
+  values in FP32; the weight banks retain the original packed checkpoint format.
+
+FP32 is the accuracy acceptance path. The official policy remains experimental:
+[issue #1394](https://github.com/hw-native-sys/pypto-lib/issues/1394) tracks its
+pre-existing whole-model discrepancy against a reference using the same policy.
+
+The host prepares tokenizer hashes, metadata and checkpoint packing before the
+single distributed dispatch. Four A5 cards are required. The resident weight
+banks occupy about 74.13 GiB per rank, plus the FP32 vocabulary head, activations,
+caches and runtime memory. Fresh positive request lengths must fit 4096 packed
+rows and at most 32 physical pages per layer:
+`requests * ceil(max_request_length / 128) <= 32`.
+Cached-prefix continuation is not supported by this entry.
+
+With the environment activated, run using a checkpoint containing its released
+`inference/config.json`, `inference/engram.py`, and `tokenizer.json`:
+
+```bash
+task-submit --device auto --device-num 4 --max-time 5400 --run \
+  'PYTHONPATH=. python -m models.deepseek_v4_1_flash.prefill_fwd \
+    --checkpoint /path/to/DeepSeek-V4.1-Flash --lengths 129,7 --capacity 144 \
+    --devices "$TASK_DEVICE" --precision fp32 --report build_output/ced-fp32.json'
+```
+
+The CPU reference evolves from embeddings with separate caches and routing.
+It contracts in FP64 and rounds to FP32; the official policy additionally models
+quantization, BF16 boundaries, group-32 contractions and online-64 attention.
+The validator checks rank consistency, encoder/decoder residuals and pre-mixes,
+final normalization, logits, cache values and untouched sentinels. Global relative
+L2 above 2%, worst-row L2 above 5%, or non-finite outputs fail with a nonzero exit
+code. Its JSON report also records per-layer expert-route and top-1 agreement.
