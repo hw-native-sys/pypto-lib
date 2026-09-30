@@ -15,6 +15,9 @@ from models.deepseek_v4_1_flash.config import FLASH
 from models.deepseek_v4_1_flash.config import CMP_POSITIONS_DYN, T_DYN
 from models.deepseek_v4_1_flash.golden import select_candidate_blocks
 
+from models.deepseek_v4_1_flash.config import INDEX_H
+from models.deepseek_v4_1_flash.config import INDEX_TOPK
+
 
 CANDIDATE_BLOCK_SIZE = FLASH.candidate_block_size
 CANDIDATE_TOPK_BLOCKS = FLASH.candidate_topk_blocks
@@ -261,6 +264,139 @@ def hierarchical_sparse_indexer(
 
 __all__ = ["golden_hierarchical_sparse_indexer", "hierarchical_sparse_indexer"]
 
+
+
+
+# Resident CED prefill precision variants.
+_PREFILL_AUX_INDEX_SCALE = FLASH.index_head_dim**-0.5 * INDEX_H**-0.5
+
+
+_PREFILL_AUX_B = pl.dynamic("FP32_AUX_B")
+
+
+_PREFILL_AUX_T = pl.dynamic("FP32_AUX_T")
+
+
+_PREFILL_AUX_K = pl.dynamic("FP32_AUX_K")
+
+
+_PREFILL_AUX_W = pl.dynamic("FP32_AUX_W")
+
+
+_PREFILL_AUX_P = pl.dynamic("FP32_AUX_P")
+
+
+@pl.jit.inline(auto_scope=False)
+def prefill_index_scores_inline(
+    dots: pl.Tensor[[_PREFILL_AUX_K, _PREFILL_AUX_P], pl.FP32],
+    weights: pl.Tensor[[_PREFILL_AUX_T, INDEX_H], pl.FP32],
+    physical_blocks: pl.Tensor[[_PREFILL_AUX_T, _PREFILL_AUX_B], pl.INT32],
+    lengths: pl.Tensor[[_PREFILL_AUX_T], pl.INT32],
+    output: pl.Tensor[[_PREFILL_AUX_T, _PREFILL_AUX_W], pl.FP32],
+):
+    """Reduce rectified index-head dots into causal request-local scores."""
+    tokens = pl.tensor.dim(weights, 0)
+    blocks = pl.tensor.dim(physical_blocks, 1)
+    # Keep the launch grid bounded; the logical page count grows with context.
+    for worker in pl.spmd(32, name_hint="fp32_index_scores"):
+        for work in pl.range(worker, tokens * blocks, 32):
+            row = work // blocks
+            block = work % blocks
+            physical = pl.read(physical_blocks, [row, block])
+            visible = pl.read(lengths, [row])
+            score = pl.tile.full([1, 128], dtype=pl.FP32, value=0.0)
+            for head in pl.range(INDEX_H):
+                dot = pl.load(dots, [row * INDEX_H + head, physical * 128], [1, 128])
+                weight = pl.read(weights, [row, head])
+                score = pl.add(score, pl.mul(pl.maximum(dot, 0.0), weight))
+            score = pl.mul(score, _PREFILL_AUX_INDEX_SCALE)
+            positions = pl.add(pl.tile.arange(0, [1, 128], dtype=pl.INT32), pl.cast(block * 128, pl.INT32))
+            valid = pl.cmp(positions, visible, cmp_type=2)
+            score = pl.tile.select(valid, score, pl.tile.full([1, 128], dtype=pl.FP32, value=-1e30))
+            pl.store(score, [row, block * 128], output)
+    return output
+
+
+@pl.jit.inline(auto_scope=False)
+def prefill_index_scores_official_inline(
+    dots: pl.Tensor[[_PREFILL_AUX_K, _PREFILL_AUX_P], pl.FP32],
+    weights: pl.Tensor[[_PREFILL_AUX_T, INDEX_H], pl.FP32],
+    physical_blocks: pl.Tensor[[_PREFILL_AUX_T, _PREFILL_AUX_B], pl.INT32],
+    lengths: pl.Tensor[[_PREFILL_AUX_T], pl.INT32],
+    output: pl.Tensor[[_PREFILL_AUX_T, _PREFILL_AUX_W], pl.FP32],
+):
+    """Apply the released BF16 index-score boundaries in FP32 transfer storage."""
+    tokens = pl.tensor.dim(weights, 0)
+    blocks = pl.tensor.dim(physical_blocks, 1)
+    for worker in pl.spmd(32, name_hint="prefill_index_scores_official"):
+        for work in pl.range(worker, tokens * blocks, 32):
+            row = work // blocks
+            block = work % blocks
+            physical = pl.read(physical_blocks, [row, block])
+            visible = pl.read(lengths, [row])
+            projected = pl.cast(
+                pl.cast(pl.load(weights, [row, 0], [1, INDEX_H]), pl.BF16, mode="rint"), pl.FP32
+            )
+            scaled = pl.cast(
+                pl.cast(pl.mul(projected, _PREFILL_AUX_INDEX_SCALE), pl.BF16, mode="rint"), pl.FP32
+            )
+            score = pl.tile.full([1, 128], dtype=pl.FP32, value=0.0)
+            for head in pl.range(INDEX_H):
+                dot = pl.load(dots, [row * INDEX_H + head, physical * 128], [1, 128])
+                dot = pl.cast(pl.cast(dot, pl.BF16, mode="rint"), pl.FP32)
+                weight = pl.tile.read(scaled, [0, head])
+                product = pl.mul(pl.maximum(dot, 0.0), weight)
+                product = pl.cast(pl.cast(product, pl.BF16, mode="rint"), pl.FP32)
+                score = pl.add(score, product)
+            score = pl.cast(pl.cast(score, pl.BF16, mode="rint"), pl.FP32)
+            positions = pl.add(pl.tile.arange(0, [1, 128], dtype=pl.INT32), pl.cast(block * 128, pl.INT32))
+            valid = pl.cmp(positions, visible, cmp_type=2)
+            score = pl.tile.select(valid, score, pl.tile.full([1, 128], dtype=pl.FP32, value=-1e30))
+            pl.store(score, [row, block * 128], output)
+    return output
+
+
+@pl.jit.inline(auto_scope=False)
+def prefill_index_topk_inline(
+    scores: pl.Tensor[[_PREFILL_AUX_T, _PREFILL_AUX_W], pl.FP32],
+    physical_blocks: pl.Tensor[[_PREFILL_AUX_T, _PREFILL_AUX_B], pl.INT32],
+    lengths: pl.Tensor[[_PREFILL_AUX_T], pl.INT32],
+    output: pl.Tensor[[_PREFILL_AUX_T, INDEX_TOPK], pl.INT32],
+):
+    """Select up to 512 keys within fresh prefill's maximum 4096 positions."""
+    tokens = pl.tensor.dim(scores, 0)
+    width = pl.tensor.dim(scores, 1)
+    with pl.spmd(tokens, name_hint="fp32_index_topk"):
+        row = pl.tile.get_block_idx()
+        visible = pl.read(lengths, [row])
+        # Four-way merges need 8192 values: 32 -> 128 -> 512 -> 2048 -> 8192.
+        # Padding only to 4096 leaves two runs for the final four-way merge.
+        raw = pl.load(scores, [row, 0], [1, 8192], valid_shape=[1, width])
+        values = pl.tile.fillpad(raw, pad_value=pl.PadValue.min)
+        positions = pl.tile.arange(0, [1, 8192], dtype=pl.INT32)
+        pairs = pl.tile.sort32(values, pl.reinterpret_view(positions, pl.UINT32))
+        pairs = pl.tile.mrgsort(pairs, block_len=64)
+        pairs = pl.tile.mrgsort(pairs, block_len=256)
+        pairs = pl.tile.mrgsort(pairs, block_len=1024)
+        pairs = pl.tile.mrgsort(pairs, block_len=4096)
+        selected_pairs = pl.tile.slice(pairs, [1, 2 * INDEX_TOPK], [0, 0])
+        selected = pl.tile.gather_mask(
+            selected_pairs, mask_pattern=pl.tile.MaskPattern.P1010, output_dtype=pl.INT32
+        )
+        # Reorder the selected 512 keys with exactly two merge stages.
+        ordering = pl.neg(pl.cast(selected, pl.FP32))
+        ordered = pl.tile.sort32(ordering, pl.reinterpret_view(selected, pl.UINT32))
+        ordered = pl.tile.mrgsort(ordered, block_len=64)
+        ordered = pl.tile.mrgsort(ordered, block_len=256)
+        logical = pl.tile.gather_mask(ordered, mask_pattern=pl.tile.MaskPattern.P1010, output_dtype=pl.INT32)
+        result = pl.tile.full([1, INDEX_TOPK], dtype=pl.INT32, value=-1)
+        for lane in pl.range(INDEX_TOPK):
+            index = pl.tile.read(logical, [0, lane])
+            if index >= 0 and index < visible:
+                block = pl.read(physical_blocks, [row, index // 128])
+                pl.tile.write(result, [0, lane], pl.cast(block * 128 + index % 128, pl.INT32))
+        pl.store(result, [row, 0], output)
+    return output
 
 if __name__ == "__main__":
     from models.deepseek_v4_1_flash._golden_smoke import run_hierarchical_indexer_golden

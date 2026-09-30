@@ -12,6 +12,10 @@ import pypto.language as pl
 
 from models.deepseek_v4_1_flash.config import FLASH as M, MOE_TOKENS
 
+from models.deepseek_v4_1_flash.attention_ops import prefill_packed_linear_inline
+from models.deepseek_v4_1_flash.config import FLASH
+from models.deepseek_v4_1_flash.quantization import prefill_round_inline
+
 
 # model config
 T = MOE_TOKENS
@@ -432,6 +436,107 @@ def build_tensor_specs():
         TensorSpec("sh", [T, D], torch.bfloat16),
     ]
 
+
+
+
+# Resident CED prefill precision variants.
+_PREFILL_MOE_TILE = 256
+
+
+_PREFILL_MOE_INTER = FLASH.moe_intermediate_size
+
+
+_PREFILL_MOE_LIMIT = FLASH.swiglu_limit
+
+
+_PREFILL_MOE_WORKERS = 32
+
+
+_PREFILL_MOE_M = pl.dynamic("V41_FP32_MOE_M")
+
+
+@pl.jit.inline(auto_scope=False)
+def prefill_swiglu_inline(
+    gate: pl.Tensor[[_PREFILL_MOE_M, _PREFILL_MOE_INTER], pl.FP32],
+    up: pl.Tensor[[_PREFILL_MOE_M, _PREFILL_MOE_INTER], pl.FP32],
+    route_weights: pl.Tensor[[_PREFILL_MOE_M], pl.FP32],
+    output: pl.Tensor[[_PREFILL_MOE_M, _PREFILL_MOE_INTER], pl.FP32],
+):
+    """Clamp the released SwiGLU inputs and apply route weights before W2."""
+    gate.bind_dynamic(0, _PREFILL_MOE_M)
+    up.bind_dynamic(0, _PREFILL_MOE_M)
+    route_weights.bind_dynamic(0, _PREFILL_MOE_M)
+    output.bind_dynamic(0, _PREFILL_MOE_M)
+    rows = pl.tensor.dim(gate, 0)
+    for worker in pl.spmd(_PREFILL_MOE_WORKERS, name_hint="fp32_swiglu"):
+        for task in pl.range(worker, rows * (_PREFILL_MOE_INTER // _PREFILL_MOE_TILE), _PREFILL_MOE_WORKERS):
+            row = task // (_PREFILL_MOE_INTER // _PREFILL_MOE_TILE)
+            col = task % (_PREFILL_MOE_INTER // _PREFILL_MOE_TILE) * _PREFILL_MOE_TILE
+            g = pl.minimum(pl.load(gate, [row, col], [1, _PREFILL_MOE_TILE]), _PREFILL_MOE_LIMIT)
+            u = pl.maximum(
+                pl.minimum(pl.load(up, [row, col], [1, _PREFILL_MOE_TILE]), _PREFILL_MOE_LIMIT),
+                -_PREFILL_MOE_LIMIT,
+            )
+            sigmoid = pl.div(
+                pl.exp(pl.minimum(g, 0.0)), pl.add(pl.exp(pl.neg(pl.abs(g))), 1.0), high_precision=True
+            )
+            value = pl.mul(pl.mul(g, sigmoid), u)
+            value = pl.mul(value, pl.read(route_weights, [row]))
+            pl.store(value, [row, col], output)
+    return output
+
+
+_PREFILL_MOE_D = FLASH.hidden_size
+
+
+_PREFILL_MOE_T = pl.dynamic("V41_FP32_MOE_T")
+
+
+_PREFILL_WEIGHT_OPS_BLOCKS8 = pl.dynamic("V41_WEIGHT_BLOCKS8")
+
+
+@pl.jit.inline(auto_scope=False)
+def prefill_shared_expert_inline(
+    hidden: pl.Tensor[[_PREFILL_MOE_T, _PREFILL_MOE_D], pl.FP32],
+    bank: pl.Tensor[[_PREFILL_WEIGHT_OPS_BLOCKS8, 1024], pl.INT8],
+    scales: pl.Tensor[[_PREFILL_WEIGHT_OPS_BLOCKS8], pl.UINT8],
+    offsets: pl.Tensor[[3], pl.INT32],
+    output: pl.Tensor[[_PREFILL_MOE_T, _PREFILL_MOE_D], pl.FP32],
+    official: pl.Scalar[pl.INT32],
+):
+    """Compute the shared expert for addition after all routed rank partials."""
+    rows = pl.tensor.dim(hidden, 0)
+    source = pl.reshape(hidden, [rows, _PREFILL_MOE_D])
+    destination = pl.reshape(output, [rows, _PREFILL_MOE_D])
+    gate = pl.create_tensor([rows, _PREFILL_MOE_INTER], dtype=pl.FP32)
+    up = pl.create_tensor([rows, _PREFILL_MOE_INTER], dtype=pl.FP32)
+    activated = pl.create_tensor([rows, _PREFILL_MOE_INTER], dtype=pl.FP32)
+    rounded = pl.create_tensor([rows, _PREFILL_MOE_INTER], dtype=pl.FP32)
+    weights = pl.create_tensor([rows], dtype=pl.FP32)
+    weights_row = pl.reshape(weights, [1, rows])
+    for worker in pl.spmd(_PREFILL_MOE_WORKERS, name_hint="prefill_shared_weights"):
+        for group in pl.range(worker, (rows + 15) // 16, _PREFILL_MOE_WORKERS):
+            active = pl.min(16, rows - group * 16)
+            ones = pl.tile.full([1, 16], dtype=pl.FP32, value=1.0)
+            pl.store(pl.set_validshape(ones, 1, active), [0, group * 16], weights_row)
+    prefill_packed_linear_inline(
+        source, bank, scales, pl.cast(pl.read(offsets, [0]), pl.INDEX), gate, official, pl.cast(2, pl.INT32)
+    )
+    prefill_packed_linear_inline(
+        source, bank, scales, pl.cast(pl.read(offsets, [1]), pl.INDEX), up, official, pl.cast(2, pl.INT32)
+    )
+    prefill_swiglu_inline(gate, up, weights, activated)
+    prefill_round_inline(activated, rounded, official)
+    prefill_packed_linear_inline(
+        rounded,
+        bank,
+        scales,
+        pl.cast(pl.read(offsets, [2]), pl.INDEX),
+        destination,
+        official,
+        pl.cast(2, pl.INT32),
+    )
+    return output
 
 if __name__ == "__main__":
     # Drop this model directory when run as a script so the local golden.py does not
