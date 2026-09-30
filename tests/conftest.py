@@ -186,6 +186,7 @@ def _install_pypto_stubs() -> None:
         "FP8E4M3FN",
         "FP8E8M0",
         "FP32",
+        "INDEX",
         "INT8",
         "INT32",
         "INT64",

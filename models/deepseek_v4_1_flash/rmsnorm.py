@@ -25,6 +25,8 @@ import torch
 from models.deepseek_v4_1_flash.config import D, FLASH, T_DYN
 
 
+
+
 NORM_EPS = FLASH.rms_norm_eps
 NORM_T_TILE = 8
 NORM_D_TILE = 512
@@ -163,6 +165,53 @@ if "pytest" in sys.modules:
         """Validate the operator against its golden reference on A5."""
         result = validate(a5_args())
         assert result.passed, result.error
+
+
+
+# Resident CED prefill precision variants.
+_PREFILL_OPS_INPUT_WIDTH = pl.dynamic("V41_FP32_INPUT_WIDTH")
+
+
+_PREFILL_OPS_ROWS = pl.dynamic("V41_FP32_ROWS")
+
+
+@pl.jit.inline(auto_scope=False)
+def prefill_rmsnorm_inline(
+    x: pl.Tensor[[_PREFILL_OPS_ROWS, _PREFILL_OPS_INPUT_WIDTH], pl.FP32],
+    weight: pl.Tensor[[_PREFILL_OPS_INPUT_WIDTH], pl.FP32],
+    output: pl.Tensor[[_PREFILL_OPS_ROWS, _PREFILL_OPS_INPUT_WIDTH], pl.FP32],
+    epsilon: pl.Scalar[pl.FP32],
+):
+    """FP32 RMSNorm without a BF16 activation boundary."""
+    rows = pl.tensor.dim(x, 0)
+    width = pl.tensor.dim(x, 1)
+    weight_rows = pl.reshape(weight, [1, width])
+    for worker in pl.spmd(32, name_hint="prefill_rmsnorm"):
+        for block in pl.range(worker, (rows + 7) // 8, 32):
+            row = block * 8
+            active_rows = pl.min(8, rows - row)
+            total = pl.full([1, 8], dtype=pl.FP32, value=0.0)
+            correction = pl.full([1, 8], dtype=pl.FP32, value=0.0)
+            for c0 in pl.range(0, width, 512):
+                active = pl.min(512, width - c0)
+                part = pl.slice(x, [8, 512], [row, c0], valid_shape=[active_rows, active])
+                part = pl.set_validshape(pl.fillpad(part, pad_value=pl.PadValue.zero), 8, 512)
+                subtotal = pl.reshape(pl.row_sum(pl.mul(part, part)), [1, 8])
+                corrected = pl.sub(subtotal, correction)
+                updated = pl.add(total, corrected)
+                correction = pl.sub(pl.sub(updated, total), corrected)
+                total = updated
+            mean = pl.mul(total, 1.0 / pl.cast(pl.cast(width, pl.INT32), pl.FP32))
+            inverse = pl.reshape(pl.rsqrt(pl.add(mean, epsilon), high_precision=True), [8, 1])
+            for c0 in pl.range(0, width, 512):
+                active = pl.min(512, width - c0)
+                part = pl.slice(x, [8, 512], [row, c0], valid_shape=[active_rows, active])
+                part = pl.set_validshape(pl.fillpad(part, pad_value=pl.PadValue.zero), 8, 512)
+                gamma = pl.slice(weight_rows, [1, 512], [0, c0], valid_shape=[1, active])
+                gamma = pl.set_validshape(pl.fillpad(gamma, pad_value=pl.PadValue.zero), 1, 512)
+                normalized = pl.col_expand_mul(pl.row_expand_mul(part, inverse), gamma)
+                output[row : row + 8, c0 : c0 + 512] = pl.set_validshape(normalized, active_rows, active)
+    return output
 
 if __name__ == _SCRIPT_ENTRY_POINT:
     main()
