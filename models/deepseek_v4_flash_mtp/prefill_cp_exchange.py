@@ -71,6 +71,7 @@ IDX_TOPK = M.index_topk
 
 # CP exchange layout
 LOCAL_PARTS = 2
+TAIL_GATHER_SPLIT = 4  # row-slice blocks per segment in cp_hidden_tail_gather
 NUM_LOCAL_TILES = LOCAL_PARTS * MAX_SEGMENT_TILES
 LOCAL_ROWS = NUM_LOCAL_TILES * TAIL_ROWS
 LOCAL_SPARSE_ROWS = LOCAL_ROWS * PREFILL_SPARSE_PAD
@@ -397,15 +398,18 @@ def _prefill_cp_hidden_tail_exchange_wave(
                 value=1, op=pld.NotifyOp.AtomicAdd,
             )
 
-    with pl.spmd(NUM_SEGMENTS, name_hint="cp_hidden_tail_gather", deps=[publish_tid]) as gather_tid:
-        seg = pl.tile.get_block_idx()
+    # Each segment's tail is copied by TAIL_GATHER_SPLIT blocks, one row slice each.
+    with pl.spmd(NUM_SEGMENTS * TAIL_GATHER_SPLIT, name_hint="cp_hidden_tail_gather", deps=[publish_tid]) as gather_tid:
+        gather_block = pl.tile.get_block_idx()
+        seg = gather_block // TAIL_GATHER_SPLIT
+        slice_row0 = (gather_block % TAIL_GATHER_SPLIT) * (TAIL_ROWS // TAIL_GATHER_SPLIT)
         gather_pos = reverse_index[seg]
         owner = owner_rank_table[seg]
         if owner != cp_rank:
             pld.system.wait(signal=ready, offsets=[owner, 0], expected=epoch_value, cmp=pld.WaitCmp.Ge)
         gather_src_row = gather_pos * TAIL_ROWS
         gather_dst_row = payload_epoch * CP_TAIL_WINDOW_ROWS + seg * TAIL_ROWS
-        for t0 in pl.range(0, TAIL_ROWS, ROW_TILE):
+        for t0 in pl.range(slice_row0, slice_row0 + TAIL_ROWS // TAIL_GATHER_SPLIT, ROW_TILE):
             hidden_tile = hidden_window[gather_src_row + t0:gather_src_row + t0 + ROW_TILE, 0:D]
             logical_hidden_out[gather_dst_row + t0:gather_dst_row + t0 + ROW_TILE, 0:D] = hidden_tile
 
