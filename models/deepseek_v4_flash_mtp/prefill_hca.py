@@ -138,6 +138,14 @@ assert CMP_ROWS_PER_SEGMENT == MAX_COMPRESSED_ROWS_PER_SEGMENT
 MAX_COMPRESS_LEAVES = 1 + MAX_SEGMENT_TILES
 # Concurrent scalar stores must not share a 64-byte DDR cache line.
 LEAF_NUM_TOKENS_STRIDE = 16
+LEAF_LOWER_ROW_TILE = 16  # rows per cp_hca_leaf_lowering block
+# Must stay a multiple of 16. The block scatters scalar pl.write into leaf_positions
+# (INT32) and leaf_cmp_slots / leaf_state_slots (INT64) at runtime-computed indices,
+# and a scalar write lands a whole 64-byte line at a time -- two blocks sharing a line
+# would silently drop each other's stores. Each block owns rows [base + 16k, +16) with
+# base = ll_part * MAX_COMPRESS_LEAVES * TAIL_ROWS (a multiple of 16), so 16 x INT32 is
+# exactly one line and 16 x INT64 is two. The compiler warns because it cannot prove
+# this statically (ScalarWriteLineShared); shrinking this tile would make it real.
 ROWS_PER_AUGMENTED_PART = MAX_COMPRESS_LEAVES * TAIL_ROWS
 LOCAL_AUGMENTED_ROWS = LOCAL_PARTS * ROWS_PER_AUGMENTED_PART
 LOCAL_ROWS = NUM_LOCAL_TILES * TAIL_ROWS
@@ -535,6 +543,7 @@ def prefill_attention_hca(
             history_state[history_row0:history_row0 + ROW_TILE, :] = pl.full([ROW_TILE, COMPRESS_STATE_DIM], dtype=pl.FP32, value=0.0)
         for logical in pl.range(PREFILL_CMP_MAX_BLOCKS):
             pl.write(attn_cmp_table, [logical], pl.cast(logical, pl.INT32))
+
     attn_cmp_kv = pl.reshape(attn_cmp_flat, [HCA_MAX_COMPRESSED_ROWS, 1, 1, HEAD_DIM])
     cmp_cache_rows = pl.tensor.dim(cmp_kv, 0)
     cmp_kv_flat = pl.reshape(cmp_kv, [cmp_cache_rows, HEAD_DIM])
@@ -599,64 +608,90 @@ def prefill_attention_hca(
     leaf_num_tokens = pl.create_tensor([LOCAL_PARTS, LEAF_NUM_TOKENS_STRIDE], dtype=pl.INT32)
     leaf_cmp_slots = pl.create_tensor([LOCAL_AUGMENTED_ROWS], dtype=pl.INT64)
     leaf_state_slots = pl.create_tensor([LOCAL_AUGMENTED_ROWS], dtype=pl.INT64)
-    with pl.spmd(LOCAL_PARTS, name_hint="cp_hca_leaf_lowering", deps=[tail_exchange_tid]) as leaf_lowering_tid:
-        part = pl.tile.get_block_idx()
-        predecessor = pl.read(predecessor_segments, [part])
-        predecessor_valid = pl.read(overlay_active_lengths, [part, 0, 0])
-        if predecessor < 0:
-            predecessor_valid = pl.cast(0, pl.INT32)
-            if pl.read(history_slot_mapping, [part, TAIL_ROWS - 1]) >= 0:
-                predecessor_valid = pl.cast(pl.min(TAIL_ROWS, pl.max(0, pl.read(segment_starts_t, [0]))), pl.INT32)
+    # Leaf token counts: a handful of per-part scalars, split out so the row lowering
+    # below can fan out freely. Two blocks, microseconds each.
+    with pl.spmd(LOCAL_PARTS, name_hint="cp_hca_leaf_token_counts", deps=[tail_exchange_tid]):
+        count_part = pl.tile.get_block_idx()
+        count_predecessor = pl.read(predecessor_segments, [count_part])
+        count_valid = pl.read(overlay_active_lengths, [count_part, 0, 0])
+        if count_predecessor < 0:
+            count_valid = pl.cast(0, pl.INT32)
+            if pl.read(history_slot_mapping, [count_part, TAIL_ROWS - 1]) >= 0:
+                count_valid = pl.cast(pl.min(TAIL_ROWS, pl.max(0, pl.read(segment_starts_t, [0]))), pl.INT32)
         # The predecessor leaf feeds two consumers with different needs. Attention
         # counts every visible key, including a continued chunk's history window.
         # The compressor consumes hidden states, and a history window has none --
         # its rows are already compressed in the persistent cache -- so it must
         # see zero tokens there or it would compress 128 zero rows.
-        compressor_tokens = predecessor_valid
-        if predecessor < 0:
-            compressor_tokens = pl.cast(0, pl.INT32)
+        count_tokens = count_valid
+        if count_predecessor < 0:
+            count_tokens = pl.cast(0, pl.INT32)
         leaf_token_row = pl.full([1, LEAF_NUM_TOKENS_STRIDE], dtype=pl.INT32, value=0)
-        pl.write(leaf_token_row, [0, 0], compressor_tokens)
-        for leaf_row in pl.range(TAIL_ROWS):
-            leaf_index = part * MAX_COMPRESS_LEAVES * TAIL_ROWS + leaf_row
-            effective_x[leaf_index:leaf_index + 1, :] = pl.full([1, D], dtype=pl.BF16, value=0.0)
-            pl.write(leaf_positions, [leaf_index], pl.cast(0, pl.INT32))
-            pl.write(leaf_cmp_slots, [leaf_index], pl.cast(-1, pl.INT64))
-            pl.write(leaf_state_slots, [leaf_index], pl.cast(-1, pl.INT64))
-            if predecessor < 0 and leaf_row < predecessor_valid:
-                # History rows carry real absolute positions; leaving them at 0
-                # would put them outside every query's sliding window.
-                history_row = TAIL_ROWS - predecessor_valid + leaf_row
-                pl.write(leaf_positions, [leaf_index], pl.read(history_positions, [part, history_row]))
-            if predecessor >= 0 and leaf_row < predecessor_valid:
-                source = predecessor * TAIL_ROWS + leaf_row
-                effective_x[leaf_index:leaf_index + 1, :] = logical_hidden[source:source + 1, :]
-                position = pl.read(segment_tail_positions, [predecessor, leaf_row])
-                pl.write(leaf_positions, [leaf_index], position)
-                if position >= 0:
-                    logical_block = position // HCA_STATE_BLOCK_SIZE
-                    physical_block = pl.read(compress_state_block_table, [logical_block])
-                    if physical_block >= 0:
-                        predecessor_state_row = (
-                            pl.cast(physical_block, pl.INT64)
-                            * HCA_STATE_BLOCK_SIZE
-                            + position % HCA_STATE_BLOCK_SIZE
-                        )
-                        pl.write(leaf_state_slots, [leaf_index], predecessor_state_row)
-        for tile in pl.range(MAX_SEGMENT_TILES):
-            leaf = 1 + tile
-            active = pl.read(overlay_active_lengths, [part, tile, 1])
-            pl.write(leaf_token_row, [0, leaf], active)
-            local_row0 = (part * MAX_SEGMENT_TILES + tile) * TAIL_ROWS
-            leaf_row0 = (part * MAX_COMPRESS_LEAVES + leaf) * TAIL_ROWS
-            for leaf_row in pl.range(TAIL_ROWS):
-                destination = leaf_row0 + leaf_row
+        pl.write(leaf_token_row, [0, 0], count_tokens)
+        for count_tile in pl.range(MAX_SEGMENT_TILES):
+            pl.write(leaf_token_row, [0, 1 + count_tile],
+                     pl.read(overlay_active_lengths, [count_part, count_tile, 1]))
+        leaf_num_tokens[count_part:count_part + 1, 0:LEAF_NUM_TOKENS_STRIDE] = leaf_token_row
+
+    # Row lowering fanned over (part, leaf, row tile). The rows are independent, but
+    # this ran as LOCAL_PARTS blocks of ~336 us each, leaving 46 of 48 AIV cores idle;
+    # SWA's equivalent (cp_swa_augmented_hidden_lowering) has long been at 80 blocks.
+    with pl.spmd(
+        LOCAL_PARTS * MAX_COMPRESS_LEAVES * (TAIL_ROWS // LEAF_LOWER_ROW_TILE),
+        name_hint="cp_hca_leaf_lowering",
+        deps=[tail_exchange_tid],
+    ) as leaf_lowering_tid:
+        ll_blk = pl.tile.get_block_idx()
+        ll_part = ll_blk // (MAX_COMPRESS_LEAVES * (TAIL_ROWS // LEAF_LOWER_ROW_TILE))
+        ll_rem = ll_blk - ll_part * (MAX_COMPRESS_LEAVES * (TAIL_ROWS // LEAF_LOWER_ROW_TILE))
+        ll_leaf = ll_rem // (TAIL_ROWS // LEAF_LOWER_ROW_TILE)
+        ll_row0 = (ll_rem - ll_leaf * (TAIL_ROWS // LEAF_LOWER_ROW_TILE)) * LEAF_LOWER_ROW_TILE
+        if ll_leaf == 0:
+            predecessor = pl.read(predecessor_segments, [ll_part])
+            predecessor_valid = pl.read(overlay_active_lengths, [ll_part, 0, 0])
+            if predecessor < 0:
+                predecessor_valid = pl.cast(0, pl.INT32)
+                if pl.read(history_slot_mapping, [ll_part, TAIL_ROWS - 1]) >= 0:
+                    predecessor_valid = pl.cast(pl.min(TAIL_ROWS, pl.max(0, pl.read(segment_starts_t, [0]))), pl.INT32)
+            for leaf_row in pl.range(ll_row0, ll_row0 + LEAF_LOWER_ROW_TILE):
+                leaf_index = ll_part * MAX_COMPRESS_LEAVES * TAIL_ROWS + leaf_row
+                effective_x[leaf_index:leaf_index + 1, :] = pl.full([1, D], dtype=pl.BF16, value=0.0)
+                pl.write(leaf_positions, [leaf_index], pl.cast(0, pl.INT32))
+                pl.write(leaf_cmp_slots, [leaf_index], pl.cast(-1, pl.INT64))
+                pl.write(leaf_state_slots, [leaf_index], pl.cast(-1, pl.INT64))
+                if predecessor < 0 and leaf_row < predecessor_valid:
+                    # History rows carry real absolute positions; leaving them at 0
+                    # would put them outside every query's sliding window.
+                    history_row = TAIL_ROWS - predecessor_valid + leaf_row
+                    pl.write(leaf_positions, [leaf_index], pl.read(history_positions, [ll_part, history_row]))
+                if predecessor >= 0 and leaf_row < predecessor_valid:
+                    source = predecessor * TAIL_ROWS + leaf_row
+                    effective_x[leaf_index:leaf_index + 1, :] = logical_hidden[source:source + 1, :]
+                    position = pl.read(segment_tail_positions, [predecessor, leaf_row])
+                    pl.write(leaf_positions, [leaf_index], position)
+                    if position >= 0:
+                        logical_block = position // HCA_STATE_BLOCK_SIZE
+                        physical_block = pl.read(compress_state_block_table, [logical_block])
+                        if physical_block >= 0:
+                            predecessor_state_row = (
+                                pl.cast(physical_block, pl.INT64)
+                                * HCA_STATE_BLOCK_SIZE
+                                + position % HCA_STATE_BLOCK_SIZE
+                            )
+                            pl.write(leaf_state_slots, [leaf_index], predecessor_state_row)
+        else:
+            tile = ll_leaf - 1
+            active = pl.read(overlay_active_lengths, [ll_part, tile, 1])
+            local_row0 = (ll_part * MAX_SEGMENT_TILES + tile) * TAIL_ROWS
+            leaf_row0 = (ll_part * MAX_COMPRESS_LEAVES + ll_leaf) * TAIL_ROWS
+            for leaf_row2 in pl.range(ll_row0, ll_row0 + LEAF_LOWER_ROW_TILE):
+                destination = leaf_row0 + leaf_row2
                 effective_x[destination:destination + 1, :] = pl.full([1, D], dtype=pl.BF16, value=0.0)
                 pl.write(leaf_positions, [destination], pl.cast(0, pl.INT32))
                 pl.write(leaf_cmp_slots, [destination], pl.cast(-1, pl.INT64))
                 pl.write(leaf_state_slots, [destination], pl.cast(-1, pl.INT64))
-                if leaf_row < active:
-                    source = local_row0 + leaf_row
+                if leaf_row2 < active:
+                    source = local_row0 + leaf_row2
                     effective_x[destination:destination + 1, :] = normed[source:source + 1, :]
                     position = pl.read(query_positions_flat, [source])
                     pl.write(leaf_positions, [destination], position)
@@ -671,7 +706,6 @@ def prefill_attention_hca(
                         pl.write(leaf_state_slots, [destination], local_state_row)
                     if (position + 1) % COMPRESS_RATIO == 0:
                         pl.write(leaf_cmp_slots, [destination], pl.cast(0, pl.INT64))
-        leaf_num_tokens[part:part + 1, 0:LEAF_NUM_TOKENS_STRIDE] = leaf_token_row
 
     # Recipes projects KV locally from the augmented hidden sequence rather
     # than exchanging projected KV.  `effective_x` is already laid out as
@@ -1757,6 +1791,7 @@ if __name__ == "__main__":
     parser.add_argument("--golden-data", type=str, default=None)
     parser.add_argument("--dump-passes", action="store_true")
     parser.add_argument("--enable-chip-swimlane", type=int, nargs="?", const=1, default=0, choices=range(5))
+    parser.add_argument("--enable-dep-gen", action="store_true", default=False)
     args = parser.parse_args()
 
     from golden import ratio_allclose, ratio_reldiff, run
@@ -1776,6 +1811,7 @@ if __name__ == "__main__":
             dump_passes=args.dump_passes,
             platform=args.platform,
             enable_chip_swimlane=args.enable_chip_swimlane,
+            enable_dep_gen=args.enable_dep_gen,
             ring_heap=PREFILL_CP_HCA_RING_HEAP,
         ),
         rtol=1e-2,

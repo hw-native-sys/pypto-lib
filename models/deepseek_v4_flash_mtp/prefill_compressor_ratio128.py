@@ -129,19 +129,22 @@ def prefill_compressor_ratio128(
                     map_seen = map_seen + 1
 
     # Finish the previous leaf's state reads before scattering raw projections and scores.
-    with pl.spmd(T, name_hint="prefill_hca_c128_state_scatter_pre", deps=[state_reuse_ready]) as _state_scatter_tid:
-        scatter_t = pl.tile.get_block_idx()
-        if scatter_t < num_tokens:
-            scatter_row_raw = pl.read(state_slot_mapping, [scatter_t])
-            if scatter_row_raw >= 0:
-                scatter_row = pl.cast(scatter_row_raw, pl.INDEX)
-                scatter_pos = pl.read(position_ids, [scatter_t])
-                scatter_ape_slot = pl.cast(scatter_pos % COMPRESS_RATIO, pl.INDEX)
-                compress_state_flat[scatter_row : scatter_row + 1, 0:OUT_DIM] = kv_proj_scratch[scatter_t : scatter_t + 1, 0:OUT_DIM]
-                compress_state_flat[scatter_row : scatter_row + 1, OUT_DIM:COMPRESS_STATE_DIM] = pl.add(
-                    score_proj_scratch[scatter_t : scatter_t + 1, 0:OUT_DIM],
-                    ape[scatter_ape_slot : scatter_ape_slot + 1, 0:OUT_DIM],
-                )
+    with pl.spmd(((T) + 8 - 1) // 8, name_hint="prefill_hca_c128_state_scatter_pre", deps=[state_reuse_ready]) as _state_scatter_tid:
+        # One block owns 8 rows; the rows are independent.
+        scatter_t_blk = pl.tile.get_block_idx()
+        for scatter_t_i in pl.range(8):
+            scatter_t = scatter_t_blk * 8 + scatter_t_i
+            if scatter_t < num_tokens:
+                scatter_row_raw = pl.read(state_slot_mapping, [scatter_t])
+                if scatter_row_raw >= 0:
+                    scatter_row = pl.cast(scatter_row_raw, pl.INDEX)
+                    scatter_pos = pl.read(position_ids, [scatter_t])
+                    scatter_ape_slot = pl.cast(scatter_pos % COMPRESS_RATIO, pl.INDEX)
+                    compress_state_flat[scatter_row : scatter_row + 1, 0:OUT_DIM] = kv_proj_scratch[scatter_t : scatter_t + 1, 0:OUT_DIM]
+                    compress_state_flat[scatter_row : scatter_row + 1, OUT_DIM:COMPRESS_STATE_DIM] = pl.add(
+                        score_proj_scratch[scatter_t : scatter_t + 1, 0:OUT_DIM],
+                        ape[scatter_ape_slot : scatter_ape_slot + 1, 0:OUT_DIM],
+                    )
 
     with pl.spmd(MAX_CMP_WRITES * (HEAD_DIM // HEAD_TILE), name_hint="prefill_hca_c128_softmax_pool") as state_read_done:
         pool_idx = pl.tile.get_block_idx()

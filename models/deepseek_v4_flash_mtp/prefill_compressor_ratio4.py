@@ -54,7 +54,8 @@ K_TILE = 512                  # projection D (K) reduction tile
 OUT_TILE = 64                 # projection OUT_DIM (N) tile
 HEAD_D_TILE = 512             # head-dim tile for the softmax pool
 HEAD_TILE = 64
-STATE_UPDATE_TOKEN_TILE = 2
+STATE_UPDATE_TOKEN_TILE = 16  # 640 -> 80 blocks; the 2-row block ran ~4.8 us with 323 of
+# 640 under 5 us, so dispatch was a large fraction of its own work.
 STATE_UPDATE_OUT_TILE = 256
 PACKED_RMS_TILE = 16
 
