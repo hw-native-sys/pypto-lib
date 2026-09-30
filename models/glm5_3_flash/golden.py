@@ -48,6 +48,28 @@ def rms_norm_gated(
     return (value * torch.sigmoid(gate.float())).to(dtype)
 
 
+def layer_norm(
+    x: torch.Tensor,
+    weight: torch.Tensor,
+    bias: torch.Tensor,
+    eps: float = 1e-6,
+) -> torch.Tensor:
+    """Apply LayerNorm in FP32 and restore the activation dtype.
+
+    The indexer's ``k_norm`` is the **only** normalisation in this model that is not
+    an RMSNorm: ``Glm5NextTextIndexer.__init__`` builds it as
+    ``nn.LayerNorm(index_head_dim, eps=1e-6)``, so it subtracts the mean, divides by
+    the biased standard deviation, and carries a bias. Its ``eps`` is also its own —
+    ``1e-6``, not the model's ``rms_norm_eps``. A kernel that reuses an RMSNorm scope
+    here is wrong twice over.
+    """
+    dtype = x.dtype
+    value = x.float()
+    value = value - value.mean(dim=-1, keepdim=True)
+    value = value * torch.rsqrt(value.square().mean(dim=-1, keepdim=True) + eps)
+    return (value * weight.float() + bias.float()).to(dtype)
+
+
 def l2norm(x: torch.Tensor, eps: float = 1e-6) -> torch.Tensor:
     """FLA-compatible L2 normalisation used on the KDA query and key.
 
@@ -185,6 +207,7 @@ __all__ = [
     "hc_post",
     "hc_pre",
     "hc_seed",
+    "layer_norm",
     "l2norm",
     "rms_norm",
     "rms_norm_gated",
