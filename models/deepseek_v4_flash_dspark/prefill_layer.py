@@ -383,7 +383,7 @@ def prefill_layer_moe(
         for src in pl.range(N_RANKS):
             pl.write(arrived, [src, 0], epoch_base)
             pl.write(data_arrived, [src, 0], expert_epoch_base)
-            pl.write(combine_arrived, [src, 0], expert_epoch_base)
+            pl.write(combine_arrived, [src, 0], epoch_base)
             pl.write(stage_done, [src, 0], epoch_base)
         for peer in pl.range(N_RANKS):
             if peer != my_rank:
