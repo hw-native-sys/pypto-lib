@@ -368,18 +368,16 @@ def combine(
     my_rank: pl.Scalar[pl.INT32],
     moe_epoch: pl.Scalar[pl.INT32],
 ) -> pl.Scalar[pl.TASK_ID]:
-    with pl.spmd(N_LOCAL, name_hint="combine_notify", deps=[scatter_done]) as notify_tid:
-        local_e = pl.tile.get_block_idx()
-        if local_e < N_LOCAL:
-            for peer in pl.range(N_RANKS):
-                if peer != my_rank:
-                    pld.system.notify(
-                        target=combine_arrived,
-                        peer=peer,
-                        offsets=[my_rank, 0],
-                        value=1,
-                        op=pld.NotifyOp.AtomicAdd,
-                    )
+    with pl.spmd(N_RANKS, name_hint="combine_notify", deps=[scatter_done]) as notify_tid:
+        peer = pl.tile.get_block_idx()
+        if peer != my_rank:
+            pld.system.notify(
+                target=combine_arrived,
+                peer=peer,
+                offsets=[my_rank, 0],
+                value=1,
+                op=pld.NotifyOp.AtomicAdd,
+            )
 
     with pl.at(level=pl.Level.CORE_GROUP, name_hint="combine_wait", deps=[notify_tid]) as _cwait_tid:
         for peer in pl.range(N_RANKS):
@@ -387,7 +385,7 @@ def combine(
                 pld.system.defer_wait(
                     signal=combine_arrived,
                     offsets=[peer, 0],
-                    expected=pl.cast(moe_epoch * N_LOCAL, pl.INT32),
+                    expected=moe_epoch,
                     cmp=pld.WaitCmp.Ge,
                 )
 
