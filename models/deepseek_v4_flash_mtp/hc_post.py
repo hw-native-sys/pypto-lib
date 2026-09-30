@@ -30,7 +30,9 @@ HC_DIM = M.hc_dim
 T_TILE = 4
 PREFILL_T_TILE = 8
 INACTIVE_FILL_T_TILE = 16
-INACTIVE_FILL_D_TILE = 256
+INACTIVE_FILL_D_TILE = 4096
+PREFILL_POST_T_TILE = 4  # token rows per hc_post_prefill_split block: more blocks for a short tail
+PREFILL_FILL_T_TILE = 32  # inactive rows zeroed per hc_post_prefill_split fill block
 assert (DECODE_BATCH * DECODE_SEQ) % T_TILE == 0
 assert (PREFILL_BATCH * PREFILL_SEQ) % T_TILE == 0
 
@@ -94,21 +96,26 @@ def hc_post_prefill(
     active_tiles = (active_tokens + PREFILL_T_TILE - 1) // PREFILL_T_TILE
 
     if active_tokens > 0:
-        for block in pl.spmd(active_tiles * HC_MULT, name_hint="hc_post_prefill"):
-            token_block = block // HC_MULT
-            out_h = block % HC_MULT
+        # One block owns all HC_MULT outputs of a token tile, so each token's
+        # activation and residual lanes are read once. Every output element keeps
+        # the x*post + sum_h res_h*comb_h order.
+        for token_block in pl.spmd(active_tiles, name_hint="hc_post_prefill"):
             t0 = token_block * PREFILL_T_TILE
             for t in pl.pipeline(t0, t0 + PREFILL_T_TILE, stage=2):
                 if t < active_tokens:
-                    post_w = pl.read(post, [t, out_h])
                     x_row = pl.cast(x[t : t + 1, 0:D], target_type=pl.FP32)
-                    y_row = pl.mul(x_row, post_w)
-                    for in_h in pl.pipeline(HC_MULT, stage=4):
-                        comb_w = pl.read(comb, [t, in_h * HC_MULT + out_h])
-                        res_d = in_h * D
-                        res_row = residual_flat[t : t + 1, res_d : res_d + D]
-                        y_row = pl.add(y_row, pl.mul(res_row, comb_w))
-                    y_flat[t : t + 1, out_h * D : out_h * D + D] = y_row
+                    res_row0 = residual_flat[t : t + 1, 0 * D : 1 * D]
+                    res_row1 = residual_flat[t : t + 1, 1 * D : 2 * D]
+                    res_row2 = residual_flat[t : t + 1, 2 * D : 3 * D]
+                    res_row3 = residual_flat[t : t + 1, 3 * D : 4 * D]
+                    for out_h in pl.range(HC_MULT):
+                        post_w = pl.read(post, [t, out_h])
+                        y_row = pl.mul(x_row, post_w)
+                        y_row = pl.add(y_row, pl.mul(res_row0, pl.read(comb, [t, 0 * HC_MULT + out_h])))
+                        y_row = pl.add(y_row, pl.mul(res_row1, pl.read(comb, [t, 1 * HC_MULT + out_h])))
+                        y_row = pl.add(y_row, pl.mul(res_row2, pl.read(comb, [t, 2 * HC_MULT + out_h])))
+                        y_row = pl.add(y_row, pl.mul(res_row3, pl.read(comb, [t, 3 * HC_MULT + out_h])))
+                        y_flat[t : t + 1, out_h * D : out_h * D + D] = y_row
 
     inactive_tokens = t_dim - active_tokens
     if inactive_tokens > 0:
@@ -124,6 +131,71 @@ def hc_post_prefill(
                     for fill_d0 in pl.range(0, D, INACTIVE_FILL_D_TILE):
                         out_d0 = out_h * D + fill_d0
                         y_flat[fill_t : fill_t + 1, out_d0 : out_d0 + INACTIVE_FILL_D_TILE] = zero
+    return y
+
+
+@pl.jit.inline
+def hc_post_prefill_split(
+    x: pl.Tensor[[T_DYN, D], pl.BF16],
+    residual: pl.Tensor[[T_DYN, HC_MULT, D], pl.FP32],
+    post: pl.Tensor[[T_DYN, HC_MULT], pl.FP32],
+    comb: pl.Tensor[[T_DYN, HC_MULT * HC_MULT], pl.FP32],
+    y: pl.Out[pl.Tensor[[T_DYN, HC_MULT, D], pl.FP32]],
+    num_tokens: pl.Scalar[pl.INT32],
+    pad_dep: pl.Scalar[pl.TASK_ID],
+):
+    """``hc_post_prefill`` with a coarse inactive-tail fill gated by ``pad_dep``.
+
+    The fill reads nothing and runs while the program start is scheduler-bound
+    with idle cores, so it costs dispatch slots rather than core time: few large
+    blocks keep it off the scheduler's critical window.
+    """
+    t_dim = pl.tensor.dim(x, 0)
+    active_tokens = pl.cast(num_tokens, pl.INDEX)
+    if active_tokens < 0:
+        active_tokens = pl.cast(0, pl.INDEX)
+    if active_tokens > t_dim:
+        active_tokens = t_dim
+
+    residual_flat = pl.reshape(residual, [t_dim, HC_DIM])
+    y_flat = pl.reshape(y, [t_dim, HC_DIM])
+    active_tiles = (active_tokens + PREFILL_POST_T_TILE - 1) // PREFILL_POST_T_TILE
+
+    if active_tokens > 0:
+        # One block owns all HC_MULT outputs of a token tile, so each token's
+        # activation and residual lanes are read once. Every output element keeps
+        # the x*post + sum_h res_h*comb_h order.
+        for token_block in pl.spmd(active_tiles, name_hint="hc_post_prefill"):
+            t0 = token_block * PREFILL_POST_T_TILE
+            for t in pl.pipeline(t0, t0 + PREFILL_POST_T_TILE, stage=2):
+                if t < active_tokens:
+                    x_row = pl.cast(x[t : t + 1, 0:D], target_type=pl.FP32)
+                    res_row0 = residual_flat[t : t + 1, 0 * D : 1 * D]
+                    res_row1 = residual_flat[t : t + 1, 1 * D : 2 * D]
+                    res_row2 = residual_flat[t : t + 1, 2 * D : 3 * D]
+                    res_row3 = residual_flat[t : t + 1, 3 * D : 4 * D]
+                    for out_h in pl.range(HC_MULT):
+                        post_w = pl.read(post, [t, out_h])
+                        y_row = pl.mul(x_row, post_w)
+                        y_row = pl.add(y_row, pl.mul(res_row0, pl.read(comb, [t, 0 * HC_MULT + out_h])))
+                        y_row = pl.add(y_row, pl.mul(res_row1, pl.read(comb, [t, 1 * HC_MULT + out_h])))
+                        y_row = pl.add(y_row, pl.mul(res_row2, pl.read(comb, [t, 2 * HC_MULT + out_h])))
+                        y_row = pl.add(y_row, pl.mul(res_row3, pl.read(comb, [t, 3 * HC_MULT + out_h])))
+                        y_flat[t : t + 1, out_h * D : out_h * D + D] = y_row
+
+    inactive_tokens = t_dim - active_tokens
+    if inactive_tokens > 0:
+        # Coarse fill: each block zeroes PREFILL_FILL_T_TILE rows across all HC lanes,
+        # so the program-start scheduler sees a handful of blocks, not one per lane.
+        inactive_tiles = (inactive_tokens + PREFILL_FILL_T_TILE - 1) // PREFILL_FILL_T_TILE
+        for fill_tile in pl.spmd(inactive_tiles, name_hint="hc_post_inactive_pad", deps=[pad_dep]):
+            fill_t0 = active_tokens + fill_tile * PREFILL_FILL_T_TILE
+            zero = pl.full([1, INACTIVE_FILL_D_TILE], dtype=pl.FP32, value=0.0)
+            for fill_dt in pl.range(PREFILL_FILL_T_TILE):
+                fill_t = fill_t0 + fill_dt
+                if fill_t < t_dim:
+                    for fill_d0 in pl.range(0, HC_MULT * D, INACTIVE_FILL_D_TILE):
+                        y_flat[fill_t : fill_t + 1, fill_d0 : fill_d0 + INACTIVE_FILL_D_TILE] = zero
     return y
 
 

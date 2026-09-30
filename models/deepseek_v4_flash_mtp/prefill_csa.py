@@ -176,6 +176,8 @@ OVERLAY_SOURCES = 2
 MAX_SEED_ROWS = COMPRESS_RATIO + 3
 MAX_COMPRESSED_ROWS_PER_TILE = T // COMPRESS_RATIO
 MAX_COMPRESSED_ROWS_PER_SEGMENT = (MAX_SEGMENT_TILES * MAX_COMPRESSED_ROWS_PER_TILE)
+MERGE_ROW_TILE = 4  # rows per cp_csa_merge_part_* block; >=2 for the 64-byte meta line
+LEAF_STAGE_ROW_TILE = 16  # rows per cp_csa_leaf_data_stage block -> 80 blocks
 assert ROWS_PER_RANK == LOCAL_PARTS * MAX_COMPRESSED_ROWS_PER_SEGMENT
 
 MAIN_STATE_BLOCK_SIZE = 4
@@ -1643,27 +1645,39 @@ def prefill_attention_csa(
     leaf_main_state_slots = pl.reshape(leaf_main_state_slots_input, [LOCAL_LEAVES * T])
     leaf_inner_state_slots = pl.reshape(leaf_inner_state_slots_input, [LOCAL_LEAVES * T])
     leaf_num_tokens = leaf_num_tokens_input
-    with pl.at(level=pl.Level.CORE_GROUP, name_hint="cp_csa_leaf_data_stage"):
-        for part in pl.range(LOCAL_PARTS):
-            predecessor = pl.read(predecessor_segments_local, [part])
+    # Fanned over (part, leaf, row tile), the same shape as cp_hca_leaf_lowering.
+    # This was one CORE_GROUP block of ~249 us with 47 of 48 AIV cores idle. Rows are
+    # independent and every write here is a whole-row tensor assignment (no scalar
+    # pl.write), so there is no 64-byte cache-line constraint on the tile size.
+    with pl.spmd(
+        LOCAL_PARTS * MAX_COMPRESS_LEAVES * (T // LEAF_STAGE_ROW_TILE),
+        name_hint="cp_csa_leaf_data_stage",
+    ):
+        ls_blk = pl.tile.get_block_idx()
+        ls_part = ls_blk // (MAX_COMPRESS_LEAVES * (T // LEAF_STAGE_ROW_TILE))
+        ls_rem = ls_blk - ls_part * (MAX_COMPRESS_LEAVES * (T // LEAF_STAGE_ROW_TILE))
+        ls_leaf = ls_rem // (T // LEAF_STAGE_ROW_TILE)
+        ls_row0 = (ls_rem - ls_leaf * (T // LEAF_STAGE_ROW_TILE)) * LEAF_STAGE_ROW_TILE
+        if ls_leaf == 0:
+            predecessor = pl.read(predecessor_segments_local, [ls_part])
             predecessor_length = pl.cast(0, pl.INT32)
             if predecessor >= 0:
                 predecessor_length = pl.cast(pl.min(pl.read(segment_lengths_t, [predecessor]), T), pl.INT32)
-            seed_length = pl.read(leaf_num_tokens, [part, 0])
+            seed_length = pl.read(leaf_num_tokens, [ls_part, 0])
             seed_source0 = predecessor_length - seed_length
-            for row in pl.range(T):
-                leaf_row = (part * MAX_COMPRESS_LEAVES) * T + row
-                if row < seed_length:
-                    source = predecessor * T + seed_source0 + row
-                    effective_x[leaf_row : leaf_row + 1, :] = logical_hidden[source : source + 1, :]
-            for tile in pl.range(MAX_SEGMENT_TILES):
-                leaf = 1 + tile
-                active = pl.read(leaf_num_tokens, [part, leaf])
-                for row in pl.range(T):
-                    source = (part * MAX_SEGMENT_TILES + tile) * T + row
-                    leaf_row = (part * MAX_COMPRESS_LEAVES + leaf) * T + row
-                    if row < active:
-                        effective_x[leaf_row : leaf_row + 1, :] = normed[source : source + 1, :]
+            for ls_row_a in pl.range(ls_row0, ls_row0 + LEAF_STAGE_ROW_TILE):
+                ls_dst_a = (ls_part * MAX_COMPRESS_LEAVES) * T + ls_row_a
+                if ls_row_a < seed_length:
+                    ls_src_a = predecessor * T + seed_source0 + ls_row_a
+                    effective_x[ls_dst_a : ls_dst_a + 1, :] = logical_hidden[ls_src_a : ls_src_a + 1, :]
+        else:
+            ls_tile = ls_leaf - 1
+            active = pl.read(leaf_num_tokens, [ls_part, ls_leaf])
+            for ls_row_b in pl.range(ls_row0, ls_row0 + LEAF_STAGE_ROW_TILE):
+                ls_src_b = (ls_part * MAX_SEGMENT_TILES + ls_tile) * T + ls_row_b
+                ls_dst_b = (ls_part * MAX_COMPRESS_LEAVES + ls_leaf) * T + ls_row_b
+                if ls_row_b < active:
+                    effective_x[ls_dst_b : ls_dst_b + 1, :] = normed[ls_src_b : ls_src_b + 1, :]
 
     scratch_main0_flat = pl.reshape(main_state_workspace0, [main_state_rows, MAIN_STATE_DIM])
     scratch_main1_flat = pl.reshape(main_state_workspace1, [main_state_rows, MAIN_STATE_DIM])
@@ -1814,70 +1828,89 @@ def prefill_attention_csa(
         )
 
     # Compressor-to-communication boundary.
-    with pl.at(level=pl.Level.CORE_GROUP, name_hint="cp_csa_merge_part_payloads", deps=[packed_state_meta_seed_tid]):
-        for epoch in pl.range(EPOCHS):
-            source_row0 = epoch * MAX_COMPRESSED_ROWS_PER_SEGMENT
-            destination_epoch0 = epoch * ROWS_PER_RANK
-            destination_part1 = (destination_epoch0 + MAX_COMPRESSED_ROWS_PER_SEGMENT)
-            for row in pl.range(MAX_COMPRESSED_ROWS_PER_SEGMENT):
-                source = source_row0 + row
-                destination0 = destination_epoch0 + row
-                destination1 = destination_part1 + row
-                packed_main_payload[destination0 : destination0 + 1, :] = (part0_main_payload[source : source + 1, :])
-                packed_main_payload[destination1 : destination1 + 1, :] = (part1_main_payload[source : source + 1, :])
-                packed_idx_payload[destination0 : destination0 + 1, :] = (part0_idx_payload[source : source + 1, :])
-                packed_idx_payload[destination1 : destination1 + 1, :] = (part1_idx_payload[source : source + 1, :])
-                packed_idx_scale_payload[
-                    destination0 : destination0 + 1, :
-                ] = part0_idx_scale_payload[source : source + 1, :]
-                packed_idx_scale_payload[
-                    destination1 : destination1 + 1, :
-                ] = part1_idx_scale_payload[source : source + 1, :]
-                for col in pl.range(META_DIM):
-                    pl.write(packed_record_meta, [destination0, col], pl.read(part0_record_meta, [source, col]))
-                    pl.write(packed_record_meta, [destination1, col], pl.read(part1_record_meta, [source, col]))
+    # Rows are independent; this was one CORE_GROUP block copying ~192 KB at ~0.9 GB/s.
+    # MERGE_ROW_TILE must stay a multiple of 2: the meta writes are scalar pl.write of
+    # META_DIM (=8) INT32 = 32 B per row, so a 1-row block would hand two blocks halves
+    # of the same 64-byte line. 4 rows = 128 B, and both destination ranges start at a
+    # multiple of 4, so every block owns whole lines.
+    with pl.spmd(
+        EPOCHS * (MAX_COMPRESSED_ROWS_PER_SEGMENT // MERGE_ROW_TILE),
+        name_hint="cp_csa_merge_part_payloads",
+        deps=[packed_state_meta_seed_tid],
+    ):
+        mp_blk = pl.tile.get_block_idx()
+        mp_epoch = mp_blk // (MAX_COMPRESSED_ROWS_PER_SEGMENT // MERGE_ROW_TILE)
+        mp_row0 = (mp_blk - mp_epoch * (MAX_COMPRESSED_ROWS_PER_SEGMENT // MERGE_ROW_TILE)) * MERGE_ROW_TILE
+        source_row0 = mp_epoch * MAX_COMPRESSED_ROWS_PER_SEGMENT
+        destination_epoch0 = mp_epoch * ROWS_PER_RANK
+        destination_part1 = (destination_epoch0 + MAX_COMPRESSED_ROWS_PER_SEGMENT)
+        for row in pl.range(mp_row0, mp_row0 + MERGE_ROW_TILE):
+            source = source_row0 + row
+            destination0 = destination_epoch0 + row
+            destination1 = destination_part1 + row
+            packed_main_payload[destination0 : destination0 + 1, :] = (part0_main_payload[source : source + 1, :])
+            packed_main_payload[destination1 : destination1 + 1, :] = (part1_main_payload[source : source + 1, :])
+            packed_idx_payload[destination0 : destination0 + 1, :] = (part0_idx_payload[source : source + 1, :])
+            packed_idx_payload[destination1 : destination1 + 1, :] = (part1_idx_payload[source : source + 1, :])
+            packed_idx_scale_payload[
+                destination0 : destination0 + 1, :
+            ] = part0_idx_scale_payload[source : source + 1, :]
+            packed_idx_scale_payload[
+                destination1 : destination1 + 1, :
+            ] = part1_idx_scale_payload[source : source + 1, :]
+            for col in pl.range(META_DIM):
+                pl.write(packed_record_meta, [destination0, col], pl.read(part0_record_meta, [source, col]))
+                pl.write(packed_record_meta, [destination1, col], pl.read(part1_record_meta, [source, col]))
 
-            state_source0 = epoch * STATE_ROWS_PER_RANK
-            for row in pl.range(STATE_ROWS_PER_RANK):
-                state_source = state_source0 + row
-                state_destination = state_source
-                if pl.read(owner_segments_t, [0]) == final_segment:
-                    packed_main_state_payload[state_destination : state_destination + 1, :] = part0_main_state_payload[
-                        state_source : state_source + 1, :
-                    ]
-                    packed_inner_state_payload[
-                        state_destination : state_destination + 1, :
-                    ] = part0_inner_state_payload[state_source : state_source + 1, :]
-                    for col in pl.range(STATE_META_DIM):
-                        pl.write(
-                            packed_main_state_meta,
-                            [state_destination, col],
-                            pl.read(part0_main_state_meta, [state_source, col]),
-                        )
-                        pl.write(
-                            packed_inner_state_meta,
-                            [state_destination, col],
-                            pl.read(part0_inner_state_meta, [state_source, col]),
-                        )
-                if pl.read(owner_segments_t, [1]) == final_segment:
-                    packed_main_state_payload[state_destination : state_destination + 1, :] = part1_main_state_payload[
-                        state_source : state_source + 1, :
-                    ]
-                    packed_inner_state_payload[
-                        state_destination : state_destination + 1, :
-                    ] = part1_inner_state_payload[state_source : state_source + 1, :]
-                    for col in pl.range(STATE_META_DIM):
-                        pl.write(
-                            packed_main_state_meta,
-                            [state_destination, col],
-                            pl.read(part1_main_state_meta, [state_source, col]),
-                        )
-                        pl.write(
-                            packed_inner_state_meta,
-                            [state_destination, col],
-                            pl.read(part1_inner_state_meta, [state_source, col]),
-                        )
 
+    with pl.spmd(
+        EPOCHS * (STATE_ROWS_PER_RANK // MERGE_ROW_TILE),
+        name_hint="cp_csa_merge_part_state",
+        deps=[packed_state_meta_seed_tid],
+    ):
+        ms_blk = pl.tile.get_block_idx()
+        epoch = ms_blk // (STATE_ROWS_PER_RANK // MERGE_ROW_TILE)
+        ms_row0 = (ms_blk - epoch * (STATE_ROWS_PER_RANK // MERGE_ROW_TILE)) * MERGE_ROW_TILE
+        state_source0 = epoch * STATE_ROWS_PER_RANK
+        for row in pl.range(ms_row0, ms_row0 + MERGE_ROW_TILE):
+            state_source = state_source0 + row
+            state_destination = state_source
+            if pl.read(owner_segments_t, [0]) == final_segment:
+                packed_main_state_payload[state_destination : state_destination + 1, :] = part0_main_state_payload[
+                    state_source : state_source + 1, :
+                ]
+                packed_inner_state_payload[
+                    state_destination : state_destination + 1, :
+                ] = part0_inner_state_payload[state_source : state_source + 1, :]
+                for col in pl.range(STATE_META_DIM):
+                    pl.write(
+                        packed_main_state_meta,
+                        [state_destination, col],
+                        pl.read(part0_main_state_meta, [state_source, col]),
+                    )
+                    pl.write(
+                        packed_inner_state_meta,
+                        [state_destination, col],
+                        pl.read(part0_inner_state_meta, [state_source, col]),
+                    )
+            if pl.read(owner_segments_t, [1]) == final_segment:
+                packed_main_state_payload[state_destination : state_destination + 1, :] = part1_main_state_payload[
+                    state_source : state_source + 1, :
+                ]
+                packed_inner_state_payload[
+                    state_destination : state_destination + 1, :
+                ] = part1_inner_state_payload[state_source : state_source + 1, :]
+                for col in pl.range(STATE_META_DIM):
+                    pl.write(
+                        packed_main_state_meta,
+                        [state_destination, col],
+                        pl.read(part1_main_state_meta, [state_source, col]),
+                    )
+                    pl.write(
+                        packed_inner_state_meta,
+                        [state_destination, col],
+                        pl.read(part1_inner_state_meta, [state_source, col]),
+                    )
     # Flatten the caller-owned persistent compressed pool.
     cmp_cache_rows = pl.tensor.dim(cmp_kv, 0) * pl.tensor.dim(cmp_kv, 1)
     cmp_flat = pl.reshape(cmp_kv, [cmp_cache_rows, HEAD_DIM])
@@ -2207,63 +2240,69 @@ def prefill_attention_csa(
     # Lower the legacy overlay-validity metadata into the physical-row ABI
     # consumed by the DSpark direct-gather donor.  The shared host input keeps
     # its old meaning for SWA/HCA; only this CSA-local tensor changes contract.
-    with pl.spmd(LOCAL_ROWS, name_hint="cp_csa_raw_physical_lower", deps=[raw_seed_tid]) as raw_index_tid:
-        lower_row = pl.tile.get_block_idx()
-        lower_stage = pl.full([1, WIN], dtype=pl.INT32, value=-1)
-        lower_query = pl.read(query_positions_flat, [lower_row])
-        lower_request = pl.read(query_requests_flat, [lower_row])
-        if lower_request >= 0:
-            for lower_col in pl.range(WIN):
-                lower_pseudo = pl.read(swa_indices_flat, [lower_row, lower_col])
-                if lower_pseudo >= 0:
-                    lower_key = lower_query - WIN + 1 + lower_col
-                    lower_relative = lower_key - request_start
-                    if lower_relative < 0:
-                        lower_history = T + lower_relative
-                        if lower_history >= 0:
-                            pl.write(
-                                lower_stage, [0, lower_col],
-                                pl.cast(CP_HISTORY_ROW0 + lower_history, pl.INT32),
-                            )
-                    if lower_relative >= 0:
-                        lower_logical_page = (lower_relative // BLOCK_SIZE)
-                        if lower_logical_page < CP_RAW_DATA_PAGES:
-                            lower_physical_page = pl.read(cp_tmp_raw_table, [lower_logical_page])
-                            if lower_physical_page > 0:
-                                lower_physical_row = (lower_physical_page * BLOCK_SIZE + lower_relative % BLOCK_SIZE)
-                                pl.write(lower_stage, [0, lower_col], pl.cast(lower_physical_row, pl.INT32))
-        raw_physical_indices[lower_row : lower_row + 1, 0:WIN] = lower_stage
+    with pl.spmd(((LOCAL_ROWS) + 8 - 1) // 8, name_hint="cp_csa_raw_physical_lower", deps=[raw_seed_tid]) as raw_index_tid:
+        # One block owns 8 rows; the rows are independent.
+        lower_row_blk = pl.tile.get_block_idx()
+        for lower_row_i in pl.range(8):
+            lower_row = lower_row_blk * 8 + lower_row_i
+            lower_stage = pl.full([1, WIN], dtype=pl.INT32, value=-1)
+            lower_query = pl.read(query_positions_flat, [lower_row])
+            lower_request = pl.read(query_requests_flat, [lower_row])
+            if lower_request >= 0:
+                for lower_col in pl.range(WIN):
+                    lower_pseudo = pl.read(swa_indices_flat, [lower_row, lower_col])
+                    if lower_pseudo >= 0:
+                        lower_key = lower_query - WIN + 1 + lower_col
+                        lower_relative = lower_key - request_start
+                        if lower_relative < 0:
+                            lower_history = T + lower_relative
+                            if lower_history >= 0:
+                                pl.write(
+                                    lower_stage, [0, lower_col],
+                                    pl.cast(CP_HISTORY_ROW0 + lower_history, pl.INT32),
+                                )
+                        if lower_relative >= 0:
+                            lower_logical_page = (lower_relative // BLOCK_SIZE)
+                            if lower_logical_page < CP_RAW_DATA_PAGES:
+                                lower_physical_page = pl.read(cp_tmp_raw_table, [lower_logical_page])
+                                if lower_physical_page > 0:
+                                    lower_physical_row = (lower_physical_page * BLOCK_SIZE + lower_relative % BLOCK_SIZE)
+                                    pl.write(lower_stage, [0, lower_col], pl.cast(lower_physical_row, pl.INT32))
+            raw_physical_indices[lower_row : lower_row + 1, 0:WIN] = lower_stage
 
-    with pl.spmd(LOCAL_ROWS, name_hint="cp_csa_physical_valid_mask", deps=[raw_index_tid]) as raw_mask_tid:
-        mask_row = pl.tile.get_block_idx()
-        mask_tile = mask_row // T
-        mask_tile_row = mask_row - mask_tile * T
-        mask_active = pl.read(overlay_active_flat, [mask_tile, 1])
-        mask_visible_topk = pl.cast(0, pl.INT32)
-        if mask_tile_row < mask_active:
-            mask_position = pl.read(query_positions_flat, [mask_row])
-            mask_visible_topk = pl.cast(
-                pl.min(pl.max((mask_position + 1) // COMPRESS_RATIO, pl.cast(0, pl.INT32)), IDX_TOPK),
-                pl.INT32,
-            )
-        mask_stage = pl.full([1, VALID_BLOCK_MASK_COLS], dtype=pl.INT32, value=0)
-        for sparse_block in pl.range(PREFILL_SPARSE_PAD // BLOCK_SIZE):
-            block_valid = pl.cast(0, pl.INT32)
-            block_col0 = sparse_block * BLOCK_SIZE
-            if block_col0 < WIN:
-                for block_col in pl.range(BLOCK_SIZE):
-                    sparse_index = pl.read(raw_physical_indices, [mask_row, block_col0 + block_col])
-                    if sparse_index >= 0:
+    with pl.spmd(((LOCAL_ROWS) + 8 - 1) // 8, name_hint="cp_csa_physical_valid_mask", deps=[raw_index_tid]) as raw_mask_tid:
+        # One block owns 8 rows; the rows are independent.
+        mask_row_blk = pl.tile.get_block_idx()
+        for mask_row_i in pl.range(8):
+            mask_row = mask_row_blk * 8 + mask_row_i
+            mask_tile = mask_row // T
+            mask_tile_row = mask_row - mask_tile * T
+            mask_active = pl.read(overlay_active_flat, [mask_tile, 1])
+            mask_visible_topk = pl.cast(0, pl.INT32)
+            if mask_tile_row < mask_active:
+                mask_position = pl.read(query_positions_flat, [mask_row])
+                mask_visible_topk = pl.cast(
+                    pl.min(pl.max((mask_position + 1) // COMPRESS_RATIO, pl.cast(0, pl.INT32)), IDX_TOPK),
+                    pl.INT32,
+                )
+            mask_stage = pl.full([1, VALID_BLOCK_MASK_COLS], dtype=pl.INT32, value=0)
+            for sparse_block in pl.range(PREFILL_SPARSE_PAD // BLOCK_SIZE):
+                block_valid = pl.cast(0, pl.INT32)
+                block_col0 = sparse_block * BLOCK_SIZE
+                if block_col0 < WIN:
+                    for block_col in pl.range(BLOCK_SIZE):
+                        sparse_index = pl.read(raw_physical_indices, [mask_row, block_col0 + block_col])
+                        if sparse_index >= 0:
+                            block_valid = pl.cast(1, pl.INT32)
+                else:
+                    # TopK writes a dense valid prefix followed by -1.  Recipes'
+                    # block-liveness mask is therefore just a comparison against
+                    # this compressed block's first column.
+                    compressed_block0 = block_col0 - WIN
+                    if compressed_block0 < mask_visible_topk:
                         block_valid = pl.cast(1, pl.INT32)
-            else:
-                # TopK writes a dense valid prefix followed by -1.  Recipes'
-                # block-liveness mask is therefore just a comparison against
-                # this compressed block's first column.
-                compressed_block0 = block_col0 - WIN
-                if compressed_block0 < mask_visible_topk:
-                    block_valid = pl.cast(1, pl.INT32)
-            pl.write(mask_stage, [0, sparse_block], block_valid)
-        valid_mask[mask_row : mask_row + 1, 0:VALID_BLOCK_MASK_COLS] = mask_stage
+                pl.write(mask_stage, [0, sparse_block], block_valid)
+            valid_mask[mask_row : mask_row + 1, 0:VALID_BLOCK_MASK_COLS] = mask_stage
 
     raw_attention_ready_tid = pl.system.task_dummy(deps=[raw_predecessor_tid, raw_index_tid])
     compressed_attention_ready_tid = pl.system.task_dummy(deps=[raw_mask_tid, part0_indexer_ready_tid])
@@ -3074,6 +3113,7 @@ if __name__ == "__main__":
     parser.add_argument("--golden-data", type=str, default=None)
     parser.add_argument("--dump-passes", action="store_true")
     parser.add_argument("--enable-chip-swimlane", type=int, nargs="?", const=1, default=0, choices=range(5))
+    parser.add_argument("--enable-dep-gen", action="store_true", default=False)
     args = parser.parse_args()
     from golden import ratio_allclose, ratio_reldiff, run
 
@@ -3094,6 +3134,7 @@ if __name__ == "__main__":
             dump_passes=args.dump_passes,
             platform=args.platform,
             enable_chip_swimlane=args.enable_chip_swimlane,
+            enable_dep_gen=args.enable_dep_gen,
             ring_heap=PREFILL_CP_CSA_RING_HEAP,
         ),
         rtol=1e-2,

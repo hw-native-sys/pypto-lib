@@ -379,29 +379,32 @@ def _prefill_indexer_compressor_with_completion(
                 keepalive_value = pl.read(idx_kv_scale_flat, [keepalive_row, 0])
                 pl.write(idx_kv_scale_flat, [keepalive_row, 0], keepalive_value)
 
-    with pl.spmd(T, name_hint="prefill_idx_c4_state_update") as state_update_tid:
-        update_t = pl.tile.get_block_idx()
-        if update_t < num_tokens:
-            state_row_raw = pl.read(inner_state_slot_mapping, [update_t])
-            if state_row_raw >= 0:
-                state_row = pl.cast(state_row_raw, pl.INDEX)
-                update_pos = pl.read(position_ids, [update_t])
-                ape_slot = pl.cast(update_pos % COMPRESS_RATIO, pl.INDEX)
-                pool_dep = pl.mul(pooled_kv[0:1, 0:OUT_TILE], 0.0)
-                for update_ob in pl.range(OUT_DIM // OUT_TILE):
-                    update_o0 = update_ob * OUT_TILE
-                    ape_row = ape[ape_slot : ape_slot + 1, update_o0 : update_o0 + OUT_TILE]
-                    compress_state_flat[state_row : state_row + 1, update_o0 : update_o0 + OUT_TILE] = pl.add(
-                        kv_proj_scratch[update_t : update_t + 1, update_o0 : update_o0 + OUT_TILE],
-                        pool_dep,
-                    )
-                    compress_state_flat[
-                        state_row : state_row + 1,
-                        OUT_DIM + update_o0 : OUT_DIM + update_o0 + OUT_TILE,
-                    ] = pl.add(
-                        pl.add(score_proj_scratch[update_t : update_t + 1, update_o0 : update_o0 + OUT_TILE], ape_row),
-                        pool_dep,
-                    )
+    with pl.spmd(((T) + 8 - 1) // 8, name_hint="prefill_idx_c4_state_update") as state_update_tid:
+        # One block owns 8 rows; the rows are independent.
+        update_t_blk = pl.tile.get_block_idx()
+        for update_t_i in pl.range(8):
+            update_t = update_t_blk * 8 + update_t_i
+            if update_t < num_tokens:
+                state_row_raw = pl.read(inner_state_slot_mapping, [update_t])
+                if state_row_raw >= 0:
+                    state_row = pl.cast(state_row_raw, pl.INDEX)
+                    update_pos = pl.read(position_ids, [update_t])
+                    ape_slot = pl.cast(update_pos % COMPRESS_RATIO, pl.INDEX)
+                    pool_dep = pl.mul(pooled_kv[0:1, 0:OUT_TILE], 0.0)
+                    for update_ob in pl.range(OUT_DIM // OUT_TILE):
+                        update_o0 = update_ob * OUT_TILE
+                        ape_row = ape[ape_slot : ape_slot + 1, update_o0 : update_o0 + OUT_TILE]
+                        compress_state_flat[state_row : state_row + 1, update_o0 : update_o0 + OUT_TILE] = pl.add(
+                            kv_proj_scratch[update_t : update_t + 1, update_o0 : update_o0 + OUT_TILE],
+                            pool_dep,
+                        )
+                        compress_state_flat[
+                            state_row : state_row + 1,
+                            OUT_DIM + update_o0 : OUT_DIM + update_o0 + OUT_TILE,
+                        ] = pl.add(
+                            pl.add(score_proj_scratch[update_t : update_t + 1, update_o0 : update_o0 + OUT_TILE], ape_row),
+                            pool_dep,
+                        )
 
     completion[0] = pl.system.task_dummy(deps=[cache_write_tid, scale_scatter_tid, state_update_tid])
 

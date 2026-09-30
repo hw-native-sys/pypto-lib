@@ -11,8 +11,7 @@ attention-normalized inputs for both decode and prefill attention paths."""
 
 import pypto.language as pl
 
-from hc_pre import hc_pre
-from rmsnorm import rms_norm
+from hc_pre import hc_pre_norm
 
 from config import (
     FLASH as M,
@@ -40,6 +39,8 @@ H = M.num_attention_heads
 HEAD_DIM = M.head_dim
 ROPE_DIM = M.qk_rope_head_dim
 ROPE_DIM_SCALE = float(ROPE_DIM)
+ROPE_DIM_INV = 1.0 / ROPE_DIM
+HEAD_DIM_F = float(HEAD_DIM)
 ROPE_HALF = ROPE_DIM // 2
 NOPE_DIM = M.nope_head_dim
 Q_LORA = M.q_lora_rank
@@ -72,7 +73,10 @@ KV_K_SLICE = D // KV_OK # kv_proj K per split (=1024)     | KV_K_SLICE//KV_K_TIL
 QPROJ_M_TILE = MATMUL_T_TILE  # qproj token (M) tile; decode pads from 8 real rows to 16
 KV_RMS_T_TILE = 8       # kv rms-norm + rope fused token (T) tile
 Q_ROPE_T_TILE = 8
+ROPE_ROWS_T_TILE = 32   # position rows gathered per qkv_rope_rows block
+ROPE_PREP_T_TILE = 32   # token rows per q_rope_prepare block
 Q_ROPE_H_TILE = 4       # heads per fused qproj dequant/rms/rope task; cos/sin build amortizes over them
+Q_DEQUANT_WORKERS = 48  # qproj dequant/rms/rope persistent workers, one per physical AIV
 assert H % Q_ROPE_H_TILE == 0
 assert (DECODE_BATCH * DECODE_SEQ) % T_TILE == 0
 assert (PREFILL_BATCH * PREFILL_SEQ) % T_TILE == 0
@@ -94,10 +98,18 @@ assert (PREFILL_BATCH * PREFILL_SEQ) % Q_ROPE_T_TILE == 0
 DENSE_QPROJ_M_TILE = 64  # dense qproj token tile; fills the 128 KiB L0C accumulator
 QPROJ_TAIL_M_TILE = MATMUL_T_TILE  # partial-M path, as validated by small physical T
 DENSE_KV_OK = 2  # dense kv_proj split-K factor
+KV_COL_GROUPS = HEAD_DIM // KV_N_TILE  # dense kv_proj N-groups
 DENSE_KV_SPLIT_K_TILE = D // DENSE_KV_OK
 assert QPROJ_MM_N_TILE * DENSE_QPROJ_M_TILE * 4 <= 128 * 1024  # L0C Acc cap
 assert DENSE_QPROJ_M_TILE % QPROJ_TAIL_M_TILE == 0
 assert D % DENSE_KV_OK == 0 and DENSE_KV_SPLIT_K_TILE % KV_K_TILE == 0
+# Dense qr/kv LoRA row tiles. Each row tile restreams its whole K x N weight
+# slice, so 16-row tiles made these projections MTE2-bound on weight reloads.
+# Incomplete row tiles keep the proven 16-row partial-M shape.
+QR_DENSE_M_TILE = 64
+KV_DENSE_M_TILE = 64
+DENSE_KV_OM = 3  # maximum kv_proj split-M factor
+assert QR_DENSE_M_TILE % QR_M_TILE == 0 and KV_DENSE_M_TILE % KV_M_TILE == 0
 
 
 @pl.jit.inline
@@ -112,11 +124,11 @@ def materialize_rope_rows(
     t_dim = pl.tensor.dim(position_ids, 0)
     cos_rows = pl.reshape(rope_cos_t, [t_dim, ROPE_DIM])
     sin_rows = pl.reshape(rope_sin_t, [t_dim, ROPE_DIM])
-    for rope_t0 in pl.spmd(t_dim // KV_RMS_T_TILE, name_hint="qkv_rope_rows"):
-        t0 = rope_t0 * KV_RMS_T_TILE
-        for rope_dt in pl.range(KV_RMS_T_TILE):
+    for rope_t0 in pl.spmd(pl.max(1, (t_dim + ROPE_ROWS_T_TILE - 1) // ROPE_ROWS_T_TILE), name_hint="qkv_rope_rows"):
+        t0 = rope_t0 * ROPE_ROWS_T_TILE
+        for rope_dt in pl.range(ROPE_ROWS_T_TILE):
             rope_t = t0 + rope_dt
-            if rope_t < num_tokens:
+            if rope_t < num_tokens and rope_t < t_dim:
                 rope_pos = pl.cast(pl.read(position_ids, [rope_t]), pl.INDEX)
                 cos_rows[rope_t : rope_t + 1, 0:ROPE_DIM] = freqs_cos[rope_pos : rope_pos + 1, 0:ROPE_DIM]
                 sin_rows[rope_t : rope_t + 1, 0:ROPE_DIM] = freqs_sin[rope_pos : rope_pos + 1, 0:ROPE_DIM]
@@ -238,6 +250,135 @@ def rope_prepare(
             )
 
 
+@pl.jit.inline
+def rope_prepare_prefill(
+    rope_cos: pl.Tensor[[T_DYN, ROPE_DIM], pl.BF16],
+    rope_sin: pl.Tensor[[T_DYN, ROPE_DIM], pl.BF16],
+    rope_cos_il: pl.Tensor[[T_DYN, ROPE_DIM], pl.FP32],
+    rope_sin_signed: pl.Tensor[[T_DYN, ROPE_DIM], pl.FP32],
+    rope_swap_idx: pl.Tensor[[T_DYN, ROPE_DIM], pl.INT32],
+):
+    """``rope_prepare`` with ROPE_PREP_T_TILE-row blocks for long prefill token axes."""
+    t_dim = pl.tensor.dim(rope_cos, 0)
+    rope_cos_view = pl.reshape(rope_cos, [t_dim, ROPE_DIM])
+    rope_sin_view = pl.reshape(rope_sin, [t_dim, ROPE_DIM])
+    # The tail guard below writes the outputs from inside a conditional region.
+    # Binding them to the scalar extent keeps the region result off the dynamic
+    # symbol, which has no definition in an inlining caller that passes a
+    # statically shaped token axis.
+    rope_cos_il_view = pl.reshape(rope_cos_il, [t_dim, ROPE_DIM])
+    rope_sin_signed_view = pl.reshape(rope_sin_signed, [t_dim, ROPE_DIM])
+    rope_swap_idx_view = pl.reshape(rope_swap_idx, [t_dim, ROPE_DIM])
+
+    token_tiles = (t_dim + ROPE_PREP_T_TILE - 1) // ROPE_PREP_T_TILE
+    for qrp_idx in pl.spmd(token_tiles, name_hint="q_rope_prepare", allow_early_resolve=True):
+        qrp_t0 = qrp_idx * ROPE_PREP_T_TILE
+        qrp_valid_rows = pl.min(ROPE_PREP_T_TILE, t_dim - qrp_t0)
+        qrp_ones = pl.full([ROPE_PREP_T_TILE, ROPE_DIM], dtype=pl.FP32, value=1.0)
+        qrp_idx_i32 = pl.arange(0, [1, ROPE_DIM], dtype=pl.INT32)
+        qrp_idx_fp32 = pl.cast(qrp_idx_i32, target_type=pl.FP32)
+        qrp_col = pl.col_expand_mul(qrp_ones, qrp_idx_fp32)
+        qrp_half = pl.mul(qrp_col, 0.5)
+        qrp_dup_i32 = pl.cast(qrp_half, target_type=pl.INT32, mode="trunc")
+        qrp_dup_f = pl.cast(qrp_dup_i32, target_type=pl.FP32)
+        qrp_dup_idx = pl.cast(qrp_dup_f, target_type=pl.INT32)
+        qrp_lane = pl.sub(qrp_col, pl.mul(qrp_dup_f, 2.0))
+        qrp_next_col = pl.add(qrp_col, 1.0)
+        qrp_lane_offset = pl.mul(qrp_lane, 2.0)
+        qrp_swap_f = pl.sub(qrp_next_col, qrp_lane_offset)
+        qrp_swap_idx = pl.cast(qrp_swap_f, target_type=pl.INT32)
+        qrp_sign = pl.sub(pl.mul(qrp_lane, 2.0), 1.0)
+        # Flat duplicate index into a [1, ROPE_PREP_T_TILE * ROPE_DIM] row view:
+        # one gather row instead of a ROPE_PREP_T_TILE-iteration row loop.
+        qrp_flat_k = pl.cast(pl.arange(0, [1, ROPE_PREP_T_TILE * ROPE_DIM], dtype=pl.INT32), target_type=pl.FP32)
+        qrp_flat_row = pl.cast(pl.cast(pl.mul(qrp_flat_k, ROPE_DIM_INV), target_type=pl.INT32, mode="trunc"), target_type=pl.FP32)
+        qrp_flat_col = pl.sub(qrp_flat_k, pl.mul(qrp_flat_row, ROPE_DIM_SCALE))
+        qrp_flat_dup = pl.cast(pl.cast(pl.mul(qrp_flat_col, 0.5), target_type=pl.INT32, mode="trunc"), target_type=pl.FP32)
+        qrp_flat_dup_idx = pl.cast(pl.add(pl.mul(qrp_flat_row, ROPE_DIM_SCALE), qrp_flat_dup), target_type=pl.INT32)
+        if qrp_valid_rows == ROPE_PREP_T_TILE:
+            qrp_cos_rows_full = rope_cos_view[qrp_t0 : qrp_t0 + ROPE_PREP_T_TILE, :]
+            qrp_sin_rows_full = rope_sin_view[qrp_t0 : qrp_t0 + ROPE_PREP_T_TILE, :]
+            qrp_cos_full = pl.cast(qrp_cos_rows_full, target_type=pl.FP32)
+            qrp_sin_full = pl.cast(qrp_sin_rows_full, target_type=pl.FP32)
+            qrp_cos_il_full = pl.reshape(
+                pl.gather(pl.reshape(qrp_cos_full, [1, ROPE_PREP_T_TILE * ROPE_DIM]), dim=-1, index=qrp_flat_dup_idx),
+                [ROPE_PREP_T_TILE, ROPE_DIM],
+            )
+            qrp_sin_il_full = pl.reshape(
+                pl.gather(pl.reshape(qrp_sin_full, [1, ROPE_PREP_T_TILE * ROPE_DIM]), dim=-1, index=qrp_flat_dup_idx),
+                [ROPE_PREP_T_TILE, ROPE_DIM],
+            )
+            qrp_sin_signed_full = pl.mul(qrp_sin_il_full, qrp_sign)
+            rope_cos_il_view[qrp_t0 : qrp_t0 + ROPE_PREP_T_TILE, :] = qrp_cos_il_full
+            rope_sin_signed_view[qrp_t0 : qrp_t0 + ROPE_PREP_T_TILE, :] = qrp_sin_signed_full
+            rope_swap_idx_view[qrp_t0 : qrp_t0 + ROPE_PREP_T_TILE, :] = qrp_swap_idx
+        else:
+            qrp_cos_rows_tail = pl.load(
+                rope_cos_view,
+                [qrp_t0, 0],
+                [ROPE_PREP_T_TILE, ROPE_DIM],
+                valid_shape=[qrp_valid_rows, ROPE_DIM],
+                target_memory=pl.MemorySpace.Vec,
+            )
+            qrp_sin_rows_tail = pl.load(
+                rope_sin_view,
+                [qrp_t0, 0],
+                [ROPE_PREP_T_TILE, ROPE_DIM],
+                valid_shape=[qrp_valid_rows, ROPE_DIM],
+                target_memory=pl.MemorySpace.Vec,
+            )
+            qrp_tail_col = pl.col_expand_mul(
+                pl.tile.full([ROPE_PREP_T_TILE, ROPE_DIM], dtype=pl.FP32, value=1.0),
+                pl.cast(pl.tile.arange(0, [1, ROPE_DIM], dtype=pl.INT32), target_type=pl.FP32),
+            )
+            qrp_tail_dup_f = pl.cast(
+                pl.cast(pl.mul(qrp_tail_col, 0.5), target_type=pl.INT32, mode="trunc"),
+                target_type=pl.FP32,
+            )
+            qrp_tail_lane = pl.sub(qrp_tail_col, pl.mul(qrp_tail_dup_f, 2.0))
+            qrp_tail_swap_f = pl.sub(pl.add(qrp_tail_col, 1.0), pl.mul(qrp_tail_lane, 2.0))
+            # Row-major flattening offsets stay in fp32: col-expand is defined for
+            # half / float only.
+            qrp_row_seed = pl.mul(
+                pl.cast(pl.tile.arange(0, [1, ROPE_PREP_T_TILE], dtype=pl.INT32), target_type=pl.FP32),
+                ROPE_DIM_SCALE,
+            )
+            qrp_row_grid = pl.col_expand_mul(
+                pl.tile.full([ROPE_DIM, ROPE_PREP_T_TILE], dtype=pl.FP32, value=1.0),
+                qrp_row_seed,
+            )
+            qrp_row_offset = pl.transpose(qrp_row_grid, axis1=0, axis2=1)
+            qrp_dup_idx_tail = pl.cast(pl.add(qrp_tail_dup_f, qrp_row_offset), target_type=pl.INT32)
+            qrp_gather_tmp = pl.create_tile(
+                [ROPE_PREP_T_TILE, ROPE_DIM],
+                dtype=pl.INT32,
+                target_memory=pl.MemorySpace.Vec,
+            )
+            qrp_cos_il_tail = pl.tile.gather(
+                pl.cast(qrp_cos_rows_tail, target_type=pl.FP32),
+                qrp_dup_idx_tail,
+                qrp_gather_tmp,
+            )
+            qrp_sin_il_tail = pl.tile.gather(
+                pl.cast(qrp_sin_rows_tail, target_type=pl.FP32),
+                qrp_dup_idx_tail,
+                qrp_gather_tmp,
+            )
+            qrp_tail_sign = pl.sub(pl.mul(qrp_tail_lane, 2.0), 1.0)
+            qrp_sin_signed_tail = pl.mul(qrp_sin_il_tail, qrp_tail_sign)
+            pl.store(pl.set_validshape(qrp_cos_il_tail, qrp_valid_rows, ROPE_DIM), [qrp_t0, 0], rope_cos_il_view)
+            pl.store(
+                pl.set_validshape(qrp_sin_signed_tail, qrp_valid_rows, ROPE_DIM),
+                [qrp_t0, 0],
+                rope_sin_signed_view,
+            )
+            pl.store(
+                pl.set_validshape(pl.cast(qrp_tail_swap_f, target_type=pl.INT32), qrp_valid_rows, ROPE_DIM),
+                [qrp_t0, 0],
+                rope_swap_idx_view,
+            )
+
+
 @pl.jit.inline(auto_scope=False)
 def q_proj_rope(
     x: pl.Tensor[[T_DYN, D], pl.BF16],
@@ -259,6 +400,7 @@ def q_proj_rope(
         with pl.scope():
             x_view = pl.reshape(x, [t_dim, D])
             qr_t_matmul = ((tile_rows + QR_M_TILE - 1) // QR_M_TILE) * QR_M_TILE
+            qr_full_rows = (tile_rows // QR_DENSE_M_TILE) * QR_DENSE_M_TILE
             qproj_t_matmul = ((tile_rows + QPROJ_TAIL_M_TILE - 1) // QPROJ_TAIL_M_TILE) * QPROJ_TAIL_M_TILE
             qproj_full_rows = (tile_rows // DENSE_QPROJ_M_TILE) * DENSE_QPROJ_M_TILE
 
@@ -275,7 +417,16 @@ def q_proj_rope(
             for qbg_idx in pl.spmd((Q_LORA // QR_N_TILE) * QR_OK, name_hint="qr_proj_matmul", allow_early_resolve=True):
                 q_a_col0 = (qbg_idx // QR_OK) * QR_N_TILE
                 qr_k_base = (qbg_idx % QR_OK) * QR_K_SLICE
-                for t0 in pl.range(0, qr_t_matmul, QR_M_TILE):
+                for dense_t0 in pl.range(0, qr_full_rows, QR_DENSE_M_TILE):
+                    dense_x0 = tile_base + dense_t0
+                    dense_acc = pl.create_tensor([QR_DENSE_M_TILE, QR_N_TILE], dtype=pl.FP32)
+                    for dense_k in pl.pipeline(0, QR_K_SLICE // QR_K_TILE, stage=2):
+                        dense_d0 = qr_k_base + dense_k * QR_K_TILE
+                        dense_x = x_view[dense_x0 : dense_x0 + QR_DENSE_M_TILE, dense_d0 : dense_d0 + QR_K_TILE]
+                        dense_w = wq_a[dense_d0 : dense_d0 + QR_K_TILE, q_a_col0 : q_a_col0 + QR_N_TILE]
+                        dense_acc = pl.matmul_acc(dense_acc, dense_x, dense_w, init_cond=(dense_k == 0))
+                    qr_fp32 = pl.assemble(qr_fp32, dense_acc, [dense_t0, q_a_col0], atomic=pl.AtomicType.Add)
+                for t0 in pl.range(qr_full_rows, qr_t_matmul, QR_M_TILE):
                     q_acc = pl.create_tensor([QR_M_TILE, QR_N_TILE], dtype=pl.FP32)
                     for db in pl.pipeline(QR_K_SLICE // QR_K_TILE, stage=2):
                         qr_d0 = qr_k_base + db * QR_K_TILE
@@ -401,17 +552,33 @@ def q_proj_rope(
             # Fused qproj dequant, per-head RMSNorm, NOPE writeback, and interleaved RoPE.
             # RoPE: out[j] = inv_rms * (x[j] * cos[j] + x[j^1] * sign[j] * sin[j]).
             q_flat = pl.reshape(q, [t_dim, H * HEAD_DIM])
-            for hg_idx in pl.spmd(
-                H // Q_ROPE_H_TILE, name_hint="qproj_dequant_rms_nope_rope", allow_early_resolve=True
+            # Persistent workers stride over (row tile, head group) items so every AIV
+            # core shares the work and no single block runs long enough to hold a core
+            # that short critical-path blocks have already been dispatched to.
+            for dq_worker in pl.spmd(
+                Q_DEQUANT_WORKERS, name_hint="qproj_dequant_rms_nope_rope", allow_early_resolve=True
             ):
-                hg = hg_idx * Q_ROPE_H_TILE
-                for tg in pl.range(0, tile_rows, Q_ROPE_T_TILE):
+                # Flat pair-swap index into a [1, Q_ROPE_T_TILE * ROPE_DIM] row view: one gather row
+                # instead of a Q_ROPE_T_TILE-iteration row loop.
+                dq_flat_k = pl.cast(pl.arange(0, [1, Q_ROPE_T_TILE * ROPE_DIM], dtype=pl.INT32), target_type=pl.FP32)
+                dq_flat_row = pl.cast(pl.cast(pl.mul(dq_flat_k, ROPE_DIM_INV), target_type=pl.INT32, mode="trunc"), target_type=pl.FP32)
+                dq_flat_col = pl.sub(dq_flat_k, pl.mul(dq_flat_row, ROPE_DIM_SCALE))
+                dq_flat_pair = pl.cast(pl.cast(pl.mul(dq_flat_col, 0.5), target_type=pl.INT32, mode="trunc"), target_type=pl.FP32)
+                dq_flat_lane = pl.sub(dq_flat_col, pl.mul(dq_flat_pair, 2.0))
+                dq_flat_swap_idx = pl.cast(
+                    pl.add(pl.mul(dq_flat_row, ROPE_DIM_SCALE), pl.sub(pl.add(dq_flat_col, 1.0), pl.mul(dq_flat_lane, 2.0))),
+                    target_type=pl.INT32,
+                )
+                for dq_work in pl.range(
+                    dq_worker, ((tile_rows + Q_ROPE_T_TILE - 1) // Q_ROPE_T_TILE) * (H // Q_ROPE_H_TILE), Q_DEQUANT_WORKERS,
+                ):
+                    hg = (dq_work % (H // Q_ROPE_H_TILE)) * Q_ROPE_H_TILE
+                    tg = (dq_work // (H // Q_ROPE_H_TILE)) * Q_ROPE_T_TILE
                     out_tg = tile_base + tg
                     if tg + Q_ROPE_T_TILE <= tile_rows:
                         qr_scale_dq_t = qr_scale_pad_store[tg : tg + Q_ROPE_T_TILE, :]
                         q_cos_il = rope_cos_il[out_tg : out_tg + Q_ROPE_T_TILE, :]
                         q_sin_signed = rope_sin_signed[out_tg : out_tg + Q_ROPE_T_TILE, :]
-                        q_swap_idx = rope_swap_idx[out_tg : out_tg + Q_ROPE_T_TILE, :]
                         for h_inner in pl.pipeline(Q_ROPE_H_TILE, stage=2):
                             h = hg + h_inner
                             h0 = h * HEAD_DIM
@@ -434,7 +601,10 @@ def q_proj_rope(
 
                             q_rope_chunk_raw = q_head_dq[:, NOPE_DIM:HEAD_DIM]
                             q_rope_chunk = pl.row_expand_mul(q_rope_chunk_raw, q_head_inv_rms_t)
-                            q_rope_swapped = pl.gather(q_rope_chunk, dim=-1, index=q_swap_idx)
+                            q_rope_swapped = pl.reshape(
+                                pl.gather(pl.reshape(q_rope_chunk, [1, Q_ROPE_T_TILE * ROPE_DIM]), dim=-1, index=dq_flat_swap_idx),
+                                [Q_ROPE_T_TILE, ROPE_DIM],
+                            )
                             q_rope_base = pl.mul(q_rope_chunk, q_cos_il)
                             q_rope_delta = pl.mul(q_rope_swapped, q_sin_signed)
                             q_rope_rot = pl.add(q_rope_base, q_rope_delta)
@@ -553,6 +723,7 @@ def kv_proj_rope(
         with pl.scope():
             x_view = pl.reshape(x, [t_dim, D])
             t_matmul = ((tile_rows + MATMUL_T_TILE - 1) // MATMUL_T_TILE) * MATMUL_T_TILE
+            kv_full_rows = (tile_rows // KV_DENSE_M_TILE) * KV_DENSE_M_TILE
 
             # Split-K kv_proj: KV_N_TILE N-groups expanded DENSE_KV_OK-fold into cube blocks that
             # atomic-add their K partials into a zero-seeded output.
@@ -564,11 +735,26 @@ def kv_proj_rope(
                         kv_fp32[kts0 : kts0 + KV_M_TILE, kvseed0 : kvseed0 + KV_N_TILE] = kv_seed
 
             # `late_dep` fences kv_proj one hop behind rms_norm so qr_proj_matmul takes the cores first.
-            with pl.spmd((HEAD_DIM // KV_N_TILE) * DENSE_KV_OK, name_hint="kv_proj_matmul", deps=[late_dep]) as _kv_tid:
+            with pl.spmd(
+                KV_COL_GROUPS * DENSE_KV_OK * DENSE_KV_OM, name_hint="kv_proj_matmul", deps=[late_dep],
+            ) as _kv_tid:
                 kbg = pl.tile.get_block_idx()
-                kv_col0 = (kbg // DENSE_KV_OK) * KV_N_TILE
+                # The block count is a compile-time constant and every weight offset
+                # decodes from the block index with constant divisors: NZ refuses an
+                # offset it cannot prove non-negative.
                 kv_k_base = (kbg % DENSE_KV_OK) * DENSE_KV_SPLIT_K_TILE
-                for t0 in pl.range(0, t_matmul, KV_M_TILE):
+                kv_col0 = ((kbg // DENSE_KV_OK) % KV_COL_GROUPS) * KV_N_TILE
+                kv_m_group = kbg // (DENSE_KV_OK * KV_COL_GROUPS)
+                for dense_t0 in pl.range(kv_m_group * KV_DENSE_M_TILE, kv_full_rows, DENSE_KV_OM * KV_DENSE_M_TILE):
+                    dense_x0 = tile_base + dense_t0
+                    dense_acc = pl.create_tensor([KV_DENSE_M_TILE, KV_N_TILE], dtype=pl.FP32)
+                    for dense_k in pl.pipeline(DENSE_KV_SPLIT_K_TILE // KV_K_TILE, stage=2):
+                        dense_d0 = kv_k_base + dense_k * KV_K_TILE
+                        dense_x = x_view[dense_x0 : dense_x0 + KV_DENSE_M_TILE, dense_d0 : dense_d0 + KV_K_TILE]
+                        dense_w = wkv[dense_d0 : dense_d0 + KV_K_TILE, kv_col0 : kv_col0 + KV_N_TILE]
+                        dense_acc = pl.matmul_acc(dense_acc, dense_x, dense_w, init_cond=(dense_k == 0))
+                    kv_fp32 = pl.assemble(kv_fp32, dense_acc, [dense_t0, kv_col0], atomic=pl.AtomicType.Add)
+                for t0 in pl.range(kv_full_rows + kv_m_group * KV_M_TILE, t_matmul, DENSE_KV_OM * KV_M_TILE):
                     kv_acc = pl.create_tensor([KV_M_TILE, KV_N_TILE], dtype=pl.FP32)
                     for db in pl.pipeline(DENSE_KV_SPLIT_K_TILE // KV_K_TILE, stage=2):
                         d0 = kv_k_base + db * KV_K_TILE
@@ -618,8 +804,21 @@ def kv_proj_rope(
                     kv_rope_norm_chunk = pl.col_expand_mul(pl.row_expand_mul(kv_rope_chunk, kv_inv_rms_t), gamma_rope)
                     kv_cos_il_full = rope_cos_il[out_tg : out_tg + KV_RMS_T_TILE, :]
                     kv_sin_signed_full = rope_sin_signed[out_tg : out_tg + KV_RMS_T_TILE, :]
-                    kv_swap_idx_full = rope_swap_idx[out_tg : out_tg + KV_RMS_T_TILE, :]
-                    kv_swapped_full = pl.gather(kv_rope_norm_chunk, dim=-1, index=kv_swap_idx_full)
+                    # Flat pair-swap index into a [1, KV_RMS_T_TILE * ROPE_DIM] row view: one gather row
+                    # instead of a KV_RMS_T_TILE-iteration row loop.
+                    kvr_flat_k = pl.cast(pl.arange(0, [1, KV_RMS_T_TILE * ROPE_DIM], dtype=pl.INT32), target_type=pl.FP32)
+                    kvr_flat_row = pl.cast(pl.cast(pl.mul(kvr_flat_k, ROPE_DIM_INV), target_type=pl.INT32, mode="trunc"), target_type=pl.FP32)
+                    kvr_flat_col = pl.sub(kvr_flat_k, pl.mul(kvr_flat_row, ROPE_DIM_SCALE))
+                    kvr_flat_pair = pl.cast(pl.cast(pl.mul(kvr_flat_col, 0.5), target_type=pl.INT32, mode="trunc"), target_type=pl.FP32)
+                    kvr_flat_lane = pl.sub(kvr_flat_col, pl.mul(kvr_flat_pair, 2.0))
+                    kvr_flat_swap_idx = pl.cast(
+                        pl.add(pl.mul(kvr_flat_row, ROPE_DIM_SCALE), pl.sub(pl.add(kvr_flat_col, 1.0), pl.mul(kvr_flat_lane, 2.0))),
+                        target_type=pl.INT32,
+                    )
+                    kv_swapped_full = pl.reshape(
+                        pl.gather(pl.reshape(kv_rope_norm_chunk, [1, KV_RMS_T_TILE * ROPE_DIM]), dim=-1, index=kvr_flat_swap_idx),
+                        [KV_RMS_T_TILE, ROPE_DIM],
+                    )
                     kv_rope_rot_full = pl.add(
                         pl.mul(kv_rope_norm_chunk, kv_cos_il_full),
                         pl.mul(kv_swapped_full, kv_sin_signed_full),
@@ -1018,8 +1217,12 @@ def prefill_attention_prolog(
     """Shared HC mixing, attention normalization, and query projection."""
     rows = pl.tensor.dim(x_hc, 0)
     mixed = pl.create_tensor([rows, D], dtype=pl.BF16)
-    hc_pre(x_hc, hc_attn_fn, hc_attn_scale, hc_attn_base, mixed, post, comb)
-    rms_tid = rms_norm(mixed, attn_norm_w, normed)
+    # hc_pre_norm folds mix_x into the attention RMSNorm: one block per T_TILE row tile
+    # across all of D, instead of (D // D_SPMD) mix_x blocks plus a separate rms_norm.
+    # It is bit-identical to hc_pre followed by rms_norm (see its docstring), and SWA
+    # has been on this path since step 4 -- HCA and CSA were still on the older one.
+    rms_tid = hc_pre_norm(x_hc, hc_attn_fn, hc_attn_scale, hc_attn_base, attn_norm_w,
+                          mixed, post, comb, normed)
     rope_prepare(rope_cos, rope_sin, cos_il, sin_signed, swap_idx)
     q_proj_rope(normed, wq_a, wq_b, wq_b_scale, gamma_cq, cos_il, sin_signed, swap_idx, q, qr, qr_scale)
     return rms_tid
