@@ -193,6 +193,7 @@ __all__ = [
 
 
 if __name__ == "__main__":
+    from models.glm5_3_flash._golden_smoke import run_expert_golden
     from models.glm5_3_flash._golden_smoke import run_moe_gate_golden
     from models.glm5_3_flash._golden_smoke import run_norm_goldens
     from models.glm5_3_flash._golden_smoke import run_swiglu_golden
@@ -200,3 +201,4 @@ if __name__ == "__main__":
     run_norm_goldens(rms_norm, rms_norm_gated, l2norm)
     run_swiglu_golden(swiglu)
     run_moe_gate_golden(gate)
+    run_expert_golden(expert)

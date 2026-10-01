@@ -172,121 +172,126 @@ def prefill_sparse_attn(
 
     # Head-major: the value expansion needs its M rows contiguous per head.
     context = pl.create_tensor([LOCAL_H * t_dim, KV_LORA], dtype=pl.BF16)
-    with pl.spmd(t_dim, name_hint="prefill_sparse_flash") as flash_tid:
-        token = pl.tile.get_block_idx()
-        request = pl.cast(pl.read(request_ids, [token]), pl.INDEX)
-        q_tile = pl.fillpad(
-            pl.slice(
-                absorbed_rows,
-                [H_PAD, KV_LORA],
-                [token * LOCAL_H, 0],
-                valid_shape=[H_TILE, KV_LORA],
-            ),
-            pad_value=pl.PadValue.zero,
-        )
-        running_m = pl.reshape(pl.full([1, H_PAD], dtype=pl.FP32, value=NEG_INF), [H_PAD, 1])
-        running_l = pl.reshape(pl.full([1, H_PAD], dtype=pl.FP32, value=0.0), [H_PAD, 1])
-        running_o = pl.full([H_PAD, KV_LORA], dtype=pl.FP32, value=0.0)
-        for sb, (m_iter, l_iter, o_iter) in pl.range(
-            SPARSE_BLOCKS, init_values=(running_m, running_l, running_o)
-        ):
-            w0 = sb * ATTN_K_TILE
-            kv_tile = pl.create_l1([ATTN_K_TILE, KV_LORA], pl.BF16)
-            bias_row = pl.full([1, ATTN_K_TILE], dtype=pl.FP32, value=NEG_INF)
-            # Lane 0 is -1 only when the whole block is padding.
-            if pl.read(topk_indices, [token, w0]) >= 0:
-                for r in pl.range(ATTN_K_TILE):
-                    if w0 + r < TOPK_INDEX_WIDTH:
-                        position = pl.read(topk_indices, [token, w0 + r])
-                        if position >= 0:
-                            logical = pl.cast(position, pl.INDEX)
-                            page = pl.cast(
-                                pl.read(block_table, [request, logical // BLOCK_SIZE]), pl.INDEX
-                            )
-                            source = page * BLOCK_SIZE + logical % BLOCK_SIZE
-                            kv_tile = pl.gather_row(
-                                kv_tile, latent_cache, [r, 0], [source, 0], [1, KV_LORA]
-                            )
-                            pl.write(bias_row, [0, r], 0.0)
+    # A zero-token call would leave both launches with zero blocks, which the
+    # compiler must lower as a guarded empty launch (LegalizeSpmdLaunches);
+    # proving the positive count at the source keeps the launch unguarded and
+    # skips the whole block when there is nothing to attend.
+    if t_dim > 0:
+        with pl.spmd(t_dim, name_hint="prefill_sparse_flash") as flash_tid:
+            token = pl.tile.get_block_idx()
+            request = pl.cast(pl.read(request_ids, [token]), pl.INDEX)
+            q_tile = pl.fillpad(
+                pl.slice(
+                    absorbed_rows,
+                    [H_PAD, KV_LORA],
+                    [token * LOCAL_H, 0],
+                    valid_shape=[H_TILE, KV_LORA],
+                ),
+                pad_value=pl.PadValue.zero,
+            )
+            running_m = pl.reshape(pl.full([1, H_PAD], dtype=pl.FP32, value=NEG_INF), [H_PAD, 1])
+            running_l = pl.reshape(pl.full([1, H_PAD], dtype=pl.FP32, value=0.0), [H_PAD, 1])
+            running_o = pl.full([H_PAD, KV_LORA], dtype=pl.FP32, value=0.0)
+            for sb, (m_iter, l_iter, o_iter) in pl.range(
+                SPARSE_BLOCKS, init_values=(running_m, running_l, running_o)
+            ):
+                w0 = sb * ATTN_K_TILE
+                kv_tile = pl.create_l1([ATTN_K_TILE, KV_LORA], pl.BF16)
+                bias_row = pl.full([1, ATTN_K_TILE], dtype=pl.FP32, value=NEG_INF)
+                # Lane 0 is -1 only when the whole block is padding.
+                if pl.read(topk_indices, [token, w0]) >= 0:
+                    for r in pl.range(ATTN_K_TILE):
+                        if w0 + r < TOPK_INDEX_WIDTH:
+                            position = pl.read(topk_indices, [token, w0 + r])
+                            if position >= 0:
+                                logical = pl.cast(position, pl.INDEX)
+                                page = pl.cast(
+                                    pl.read(block_table, [request, logical // BLOCK_SIZE]), pl.INDEX
+                                )
+                                source = page * BLOCK_SIZE + logical % BLOCK_SIZE
+                                kv_tile = pl.gather_row(
+                                    kv_tile, latent_cache, [r, 0], [source, 0], [1, KV_LORA]
+                                )
+                                pl.write(bias_row, [0, r], 0.0)
+                            else:
+                                kv_tile = pl.gather_row(
+                                    kv_tile, latent_cache, [r, 0], [0, 0], [1, KV_LORA]
+                                )
                         else:
                             kv_tile = pl.gather_row(
                                 kv_tile, latent_cache, [r, 0], [0, 0], [1, KV_LORA]
                             )
-                    else:
-                        kv_tile = pl.gather_row(
-                            kv_tile, latent_cache, [r, 0], [0, 0], [1, KV_LORA]
-                        )
+                else:
+                    kv_tile = pl.gather_row(
+                        kv_tile, latent_cache, [0, 0], [0, 0], [ATTN_K_TILE, KV_LORA]
+                    )
+
+                raw = pl.matmul(q_tile, kv_tile, b_trans=True, out_dtype=pl.FP32)
+                scores = pl.col_expand_add(pl.mul(raw, SOFTMAX_SCALE), bias_row)
+                block_m = pl.row_max(scores)
+                weights = pl.exp(pl.row_expand_sub(scores, block_m))
+                block_l = pl.row_sum(weights)
+                block_o = pl.matmul(
+                    pl.cast(weights, target_type=pl.BF16, mode="rint"),
+                    kv_tile,
+                    out_dtype=pl.FP32,
+                )
+                next_m = pl.maximum(m_iter, block_m)
+                alpha = pl.exp(pl.sub(m_iter, next_m))
+                beta = pl.exp(pl.sub(block_m, next_m))
+                next_l = pl.add(pl.mul(alpha, l_iter), pl.mul(beta, block_l))
+                next_o = pl.add(
+                    pl.row_expand_mul(o_iter, alpha), pl.row_expand_mul(block_o, beta)
+                )
+                running_m, running_l, running_o = pl.yield_(next_m, next_l, next_o)
+
+            # Lane 0 of the row is -1 only when the row selects nothing at all.
+            if pl.read(topk_indices, [token, 0]) >= 0:
+                normalized = pl.cast(
+                    pl.row_expand_div(running_o, running_l), target_type=pl.BF16, mode="rint"
+                )
+                for head in pl.unroll(H_TILE):
+                    ctx_row = head * t_dim + token
+                    context[ctx_row : ctx_row + 1, 0:KV_LORA] = normalized[head : head + 1, 0:KV_LORA]
             else:
-                kv_tile = pl.gather_row(
-                    kv_tile, latent_cache, [0, 0], [0, 0], [ATTN_K_TILE, KV_LORA]
-                )
+                empty_row = pl.full([1, KV_LORA], dtype=pl.BF16, value=0.0)
+                for head in pl.unroll(H_TILE):
+                    ctx_row = head * t_dim + token
+                    context[ctx_row : ctx_row + 1, 0:KV_LORA] = empty_row
 
-            raw = pl.matmul(q_tile, kv_tile, b_trans=True, out_dtype=pl.FP32)
-            scores = pl.col_expand_add(pl.mul(raw, SOFTMAX_SCALE), bias_row)
-            block_m = pl.row_max(scores)
-            weights = pl.exp(pl.row_expand_sub(scores, block_m))
-            block_l = pl.row_sum(weights)
-            block_o = pl.matmul(
-                pl.cast(weights, target_type=pl.BF16, mode="rint"),
-                kv_tile,
-                out_dtype=pl.FP32,
-            )
-            next_m = pl.maximum(m_iter, block_m)
-            alpha = pl.exp(pl.sub(m_iter, next_m))
-            beta = pl.exp(pl.sub(block_m, next_m))
-            next_l = pl.add(pl.mul(alpha, l_iter), pl.mul(beta, block_l))
-            next_o = pl.add(
-                pl.row_expand_mul(o_iter, alpha), pl.row_expand_mul(block_o, beta)
-            )
-            running_m, running_l, running_o = pl.yield_(next_m, next_l, next_o)
-
-        # Lane 0 of the row is -1 only when the row selects nothing at all.
-        if pl.read(topk_indices, [token, 0]) >= 0:
-            normalized = pl.cast(
-                pl.row_expand_div(running_o, running_l), target_type=pl.BF16, mode="rint"
-            )
-            for head in pl.unroll(H_TILE):
-                ctx_row = head * t_dim + token
-                context[ctx_row : ctx_row + 1, 0:KV_LORA] = normalized[head : head + 1, 0:KV_LORA]
-        else:
-            empty_row = pl.full([1, KV_LORA], dtype=pl.BF16, value=0.0)
-            for head in pl.unroll(H_TILE):
-                ctx_row = head * t_dim + token
-                context[ctx_row : ctx_row + 1, 0:KV_LORA] = empty_row
-
-    output_flat = pl.reshape(output, [t_dim, LOCAL_H * V_DIM])
-    w_v_flat = pl.reshape(w_v, [LOCAL_H * V_DIM, KV_LORA])
-    t_mm = ((t_dim + MM_T_TILE - 1) // MM_T_TILE) * MM_T_TILE
-    with pl.spmd(
-        LOCAL_H * (V_DIM // EXPAND_N_TILE), name_hint="prefill_value_expand", deps=[flash_tid]
-    ):
-        expand_idx = pl.tile.get_block_idx()
-        head = expand_idx // (V_DIM // EXPAND_N_TILE)
-        n0 = (expand_idx % (V_DIM // EXPAND_N_TILE)) * EXPAND_N_TILE
-        for tc in pl.range(t_mm // MM_T_TILE):
-            t0 = tc * MM_T_TILE
-            valid_rows = pl.min(MM_T_TILE, t_dim - t0)
-            acc = pl.create_tensor([MM_T_TILE, EXPAND_N_TILE], dtype=pl.FP32)
-            for kb in pl.pipeline(KV_LORA // EXPAND_K_TILE, stage=2):
-                k0 = kb * EXPAND_K_TILE
-                ctx_tile = pl.slice(
-                    context,
-                    [MM_T_TILE, EXPAND_K_TILE],
-                    [head * t_dim + t0, k0],
-                    valid_shape=[valid_rows, EXPAND_K_TILE],
+        output_flat = pl.reshape(output, [t_dim, LOCAL_H * V_DIM])
+        w_v_flat = pl.reshape(w_v, [LOCAL_H * V_DIM, KV_LORA])
+        t_mm = ((t_dim + MM_T_TILE - 1) // MM_T_TILE) * MM_T_TILE
+        with pl.spmd(
+            LOCAL_H * (V_DIM // EXPAND_N_TILE), name_hint="prefill_value_expand", deps=[flash_tid]
+        ):
+            expand_idx = pl.tile.get_block_idx()
+            head = expand_idx // (V_DIM // EXPAND_N_TILE)
+            n0 = (expand_idx % (V_DIM // EXPAND_N_TILE)) * EXPAND_N_TILE
+            for tc in pl.range(t_mm // MM_T_TILE):
+                t0 = tc * MM_T_TILE
+                valid_rows = pl.min(MM_T_TILE, t_dim - t0)
+                acc = pl.create_tensor([MM_T_TILE, EXPAND_N_TILE], dtype=pl.FP32)
+                for kb in pl.pipeline(KV_LORA // EXPAND_K_TILE, stage=2):
+                    k0 = kb * EXPAND_K_TILE
+                    ctx_tile = pl.slice(
+                        context,
+                        [MM_T_TILE, EXPAND_K_TILE],
+                        [head * t_dim + t0, k0],
+                        valid_shape=[valid_rows, EXPAND_K_TILE],
+                    )
+                    w_tile = pl.slice(
+                        w_v_flat,
+                        [EXPAND_N_TILE, EXPAND_K_TILE],
+                        [head * V_DIM + n0, k0],
+                    )
+                    acc = pl.matmul_acc(acc, ctx_tile, w_tile, b_trans=True, init_cond=(kb == 0))
+                expanded = pl.cast(acc, target_type=pl.BF16, mode="rint")
+                output_flat = pl.assemble(
+                    output_flat,
+                    pl.set_validshape(expanded, valid_rows, EXPAND_N_TILE),
+                    [t0, head * V_DIM + n0],
                 )
-                w_tile = pl.slice(
-                    w_v_flat,
-                    [EXPAND_N_TILE, EXPAND_K_TILE],
-                    [head * V_DIM + n0, k0],
-                )
-                acc = pl.matmul_acc(acc, ctx_tile, w_tile, b_trans=True, init_cond=(kb == 0))
-            expanded = pl.cast(acc, target_type=pl.BF16, mode="rint")
-            output_flat = pl.assemble(
-                output_flat,
-                pl.set_validshape(expanded, valid_rows, EXPAND_N_TILE),
-                [t0, head * V_DIM + n0],
-            )
     return output
 
 
