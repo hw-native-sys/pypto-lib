@@ -9,6 +9,8 @@
 """DeepSeek-V4 decode indexer projections, Top-K selection, and cache quantization."""
 
 
+import os
+
 import pypto.language as pl
 
 from config import (
@@ -103,6 +105,17 @@ SCORE_READY_EVENT = 0
 SCORE_CONSUMED_EVENT = 1
 SCORE_LANE_ROWS = SCORE_TILE // 2
 SCORE_ARENA_ROWS = max(T_PAD, TOPK_SCORE_WORKERS * 2)
+CUBE_SCORE_TILE = 256  # Matches the fixed score tile in score_fused.cpp.
+
+# Opt-in A2/A3 Cube contraction with compensated operands. The original path
+# remains available for coefficient ranges or devices outside the validated contract.
+INDEXER_SCORE_IMPL = os.environ.get("DSPARK_INDEXER_SCORE_IMPL", "vector")
+if INDEXER_SCORE_IMPL not in ("vector", "cube_compensated"):
+    raise ValueError("DSPARK_INDEXER_SCORE_IMPL must be vector or cube_compensated")
+if INDEXER_SCORE_IMPL == "cube_compensated":
+    if (IDX_N_HEADS, IDX_HEAD_DIM, BLOCK_SIZE, S, COMPRESS_RATIO, TOPK_MAX_CANDIDATES, TOPK_CANDIDATES_PER_LEAF) != (64, 128, 32, 8, 4, 262144, 8192):
+        raise ValueError("Compensated Cube score kernel requires the DSpark Flash 64-head, S=8 configuration")
+    from cube_indexer_score import indexer_cube_score_topk
 
 
 @pl.jit.inline
@@ -336,7 +349,7 @@ def indexer_topk_single_leaf_publish(
 
 
 @pl.jit.inline(auto_scope=False)
-def indexer_score_topk_forest(
+def indexer_score_topk_forest_vector(
     qr_hadamard_i8: pl.Tensor[[T_PAD * IDX_N_HEADS, IDX_HEAD_DIM], pl.INT8],
     qr_hadamard_scale_dq: pl.Tensor[[T_PAD * IDX_N_HEADS, 1], pl.FP32],
     weights: pl.Tensor[[T_PAD, IDX_N_HEADS], pl.FP32],
@@ -614,6 +627,92 @@ def indexer_score_topk_forest(
                 indexer_topk_query_merge(position_ids, kv_seq_lens, pair_arena, topk_scores, topk_idxs)
 
     return topk_scores, topk_idxs, score_tid
+
+
+@pl.jit.inline(auto_scope=False)
+def indexer_score_topk_forest_cube(
+    qr_hadamard_i8: pl.Tensor[[T_PAD * IDX_N_HEADS, IDX_HEAD_DIM], pl.INT8],
+    qr_hadamard_scale_dq: pl.Tensor[[T_PAD * IDX_N_HEADS, 1], pl.FP32],
+    weights: pl.Tensor[[T_PAD, IDX_N_HEADS], pl.FP32],
+    idx_kv_cache: pl.Tensor[[IDX_CACHE_BLOCK_NUM_DYN, BLOCK_SIZE, 1, IDX_HEAD_DIM], pl.INT8],
+    idx_kv_scale: pl.Tensor[[IDX_CACHE_BLOCK_NUM_DYN, BLOCK_SIZE, 1, 1], pl.FP32],
+    idx_block_table: pl.Tensor[[B_DYN, IDX_MAX_BLOCKS], pl.INT32],
+    position_ids: pl.Tensor[[T_DYN], pl.INT32],
+    kv_seq_lens: pl.Tensor[[B_DYN], pl.INT32],
+    topk_scores: pl.Out[pl.Tensor[[T_DYN, IDX_TOPK], pl.FP32]],
+    topk_idxs: pl.Out[pl.Tensor[[T_DYN, IDX_TOPK], pl.INT32]],
+    qh_quant_tid: pl.Scalar[pl.TASK_ID],
+    weights_tid: pl.Scalar[pl.TASK_ID],
+    cache_write_tid: pl.Scalar[pl.TASK_ID],
+):
+    """Compensated Cube reduction with leaf-local Vector scale and Top-K."""
+    query_count = pl.tensor.dim(position_ids, 0)
+    batch_count = pl.tensor.dim(idx_block_table, 0)
+    max_cache_len = 0
+    for batch in pl.range(batch_count):
+        max_cache_len = pl.max(max_cache_len, pl.read(kv_seq_lens, [batch]) // COMPRESS_RATIO)
+    max_leaves = pl.max((pl.min(max_cache_len, TOPK_MAX_CANDIDATES) + TOPK_CANDIDATES_PER_LEAF - 1) // TOPK_CANDIDATES_PER_LEAF, 1)
+    coefficients_hi = pl.create_tensor([T_PAD, IDX_N_HEADS], dtype=pl.FP16)
+    coefficients_lo = pl.create_tensor([T_PAD, 2 * IDX_N_HEADS], dtype=pl.FP16)
+    math_constants = pl.create_tensor([1, 5376], dtype=pl.FP32)
+
+    with pl.spmd(TOPK_QUERY_WORKERS, name_hint="indexer_cube_coefficients", deps=[qh_quant_tid, weights_tid], allow_early_resolve=True) as coeff_tid:
+        worker = pl.tile.get_block_idx()
+        for query in pl.range(worker, query_count, TOPK_QUERY_WORKERS):
+            head_begin = query * IDX_N_HEADS
+            qs = pl.reshape(qr_hadamard_scale_dq[head_begin:head_begin + IDX_N_HEADS, 0:1], [1, IDX_N_HEADS])
+            coefficient_fp32 = pl.mul(qs, weights[query:query + 1, 0:IDX_N_HEADS])
+            coefficient = pl.mul(coefficient_fp32, 16384.0)
+            coefficient_hi = pl.cast(coefficient, target_type=pl.FP16, mode="rint")
+            coefficient_hi_fp32 = pl.cast(coefficient_hi, target_type=pl.FP32, mode="none")
+            coefficient_residual = pl.sub(coefficient, coefficient_hi_fp32)
+            coefficient_lo = pl.cast(coefficient_residual, target_type=pl.FP16, mode="rint")
+            coefficient_lo_fp32 = pl.cast(coefficient_lo, target_type=pl.FP32, mode="none")
+            coefficient_tail_fp32 = pl.sub(coefficient_residual, coefficient_lo_fp32)
+            coefficient_tail = pl.cast(coefficient_tail_fp32, target_type=pl.FP16, mode="rint")
+            coefficients_hi[query:query + 1, 0:IDX_N_HEADS] = coefficient_hi
+            coefficients_lo[query:query + 1, 0:IDX_N_HEADS] = coefficient_lo
+            coefficients_lo[query:query + 1, IDX_N_HEADS:2 * IDX_N_HEADS] = coefficient_tail
+        if worker == 0:
+            # The constant GEMMs reinterpret the biased INT32 accumulator as
+            # exact FP32, then generate a conservative FP16 high limb and its
+            # exact FP16 remainder. A=16384 keeps nonzero R limbs normal.
+            neg_magic = pl.tile.full([1, 1024], dtype=pl.FP16, value=0.0)
+            neg_identity = pl.tile.full([1, 4096], dtype=pl.FP16, value=0.0)
+            add_offset = pl.tile.full([1, 1024], dtype=pl.FP16, value=0.0)
+            for head in pl.unroll(64):
+                pl.tile.write(neg_magic, [0, head * 16], pl.cast(-0.75, pl.FP16))
+                pl.tile.write(neg_identity, [0, head * 65], pl.cast(-1.0, pl.FP16))
+                pl.tile.write(add_offset, [0, head * 16], pl.cast(0.00006103515625, pl.FP16))
+            pl.store(pl.reinterpret_view(neg_magic, pl.FP32, shape=[1, 512]), [0, 0], math_constants)
+            pl.store(pl.reinterpret_view(neg_identity, pl.FP32, shape=[1, 2048]), [0, 512], math_constants)
+            pl.store(pl.reinterpret_view(add_offset, pl.FP32, shape=[1, 512]), [0, 2560], math_constants)
+            right_zero = pl.tile.full([1, 4096], dtype=pl.FP16, value=0.0)
+            pl.store(pl.reinterpret_view(right_zero, pl.FP32, shape=[1, 2048]), [0, 3072], math_constants)
+            right_first = pl.tile.full([1, 256], dtype=pl.FP16, value=1024.0)
+            pl.store(pl.reinterpret_view(right_first, pl.FP32, shape=[1, 128]), [0, 3072], math_constants)
+            bias = pl.tile.full([1, 256], dtype=pl.INT32, value=1145043968)
+            pl.store(pl.reinterpret_view(bias, pl.FP32), [0, 5120], math_constants)
+
+    pair_arena = pl.create_tensor([TOPK_ARENA_ROWS, TOPK_PAIR_WIDTH], dtype=pl.FP32)
+    pipe_workspace = pl.create_tensor([TOPK_SCORE_WORKERS, 8 * CUBE_SCORE_TILE], dtype=pl.FP32)
+    with pl.spmd(TOPK_SCORE_WORKERS, name_hint="indexer_score_topk_leaf", deps=[coeff_tid, cache_write_tid], allow_early_resolve=True) as score_tid:
+        pair_arena = indexer_cube_score_topk(
+            pair_arena, pipe_workspace,
+            qr_hadamard_i8, coefficients_hi, coefficients_lo,
+            idx_kv_cache, idx_kv_scale, idx_block_table,
+            position_ids, kv_seq_lens, math_constants, max_leaves, IDX_MAX_BLOCKS,
+        )
+    with pl.spmd(TOPK_QUERY_WORKERS, name_hint="indexer_topk_query_merge", deps=[score_tid], allow_early_resolve=True):
+        indexer_topk_query_merge(position_ids, kv_seq_lens, pair_arena, topk_scores, topk_idxs)
+    return topk_scores, topk_idxs, score_tid
+
+
+indexer_score_topk_forest = (
+    indexer_score_topk_forest_cube
+    if INDEXER_SCORE_IMPL == "cube_compensated"
+    else indexer_score_topk_forest_vector
+)
 
 
 @pl.jit.inline(auto_scope=False)
@@ -1350,6 +1449,9 @@ if __name__ == "__main__":
                         help="Fixture-only start position: one value for a uniform batch or "
                              "a comma-separated value per request.")
     parser.add_argument("--dump-passes", action="store_true", default=False)
+    parser.add_argument("--compile-only", action="store_true")
+    parser.add_argument("--save-data", action="store_true")
+    parser.add_argument("--golden-data", type=str, default=None)
     args = parser.parse_args()
     if args.batch < 1 or args.batch > B:
         parser.error(f"--batch must be in [1, {B}], got {args.batch}")
@@ -1368,6 +1470,9 @@ if __name__ == "__main__":
         specs=build_tensor_specs(start_pos, batch=args.batch),
         golden_fn=golden_indexer,
         runtime_dir=args.runtime_dir,
+        compile_only=args.compile_only,
+        save_data=args.save_data,
+        golden_data=args.golden_data,
         config=dict(
             dump_passes=args.dump_passes,
             platform=args.platform,
