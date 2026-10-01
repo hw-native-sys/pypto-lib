@@ -37,6 +37,10 @@ config.TP = TP_SIZE
 import pypto.language as pl
 import pypto.language.distributed as pld
 
+from _collective_helpers import (
+    make_clear_peer_credits,
+    make_wait_for_peer_credits_blocking,
+)
 from config import (
     DECODE_TOKENS,
     FLASH as M,
@@ -89,6 +93,9 @@ FIXTURE_LOCAL_T = DECODE_LOCAL_CAP
 
 if DECODE_GROUP_CAP % TP_SIZE != 0:
     raise ValueError(f"decode tokens {DECODE_GROUP_CAP} must be divisible by TP size {TP_SIZE}")
+
+wait_for_peer_credits_blocking = make_wait_for_peer_credits_blocking(TP_SIZE)
+clear_peer_credits = make_clear_peer_credits(TP_SIZE)
 
 
 @pl.jit.incore
@@ -167,17 +174,16 @@ def decode_cp_hca_projection_allgather_step(
                 )
 
     # Block on the peer payload arrivals, after the local push has been issued.
+    # Intentional: decode CP allgather uses blocking wait (prefill twin uses defer_wait) —
+    # see _collective_helpers; do not silently unify.
     with pl.at(
         level=pl.Level.CORE_GROUP,
         name_hint="cp_hca_projection_allgather_payload_wait",
         deps=[_push_tid],
     ) as _payload_wait_tid:
-        for source_tp in pl.range(TP_SIZE):
-            if source_tp != tp_rank:
-                pld.system.wait(
-                    signal=gather_signal, offsets=[source_tp, 0],
-                    expected=pl.cast(PAYLOAD_EXPECTED, pl.INT32), cmp=pld.WaitCmp.Ge,
-                )
+        gather_signal = wait_for_peer_credits_blocking(
+            gather_signal, tp_rank, pl.cast(PAYLOAD_EXPECTED, pl.INT32),
+        )
 
     # Copy peer payloads and publish local readback completion.
     group_rows = TP_SIZE * local_rows
@@ -201,12 +207,9 @@ def decode_cp_hca_projection_allgather_step(
         deps=[_readback_tid],
         no_dep_args=[gather_signal],
     ) as _readback_wait_tid:
-        for source_tp in pl.range(TP_SIZE):
-            if source_tp != tp_rank:
-                pld.system.wait(
-                    signal=gather_signal, offsets=[source_tp, 0],
-                    expected=pl.cast(READBACK_EXPECTED, pl.INT32), cmp=pld.WaitCmp.Ge,
-                )
+        gather_signal = wait_for_peer_credits_blocking(
+            gather_signal, tp_rank, pl.cast(READBACK_EXPECTED, pl.INT32),
+        )
 
     # Retire peer credits and anchor output consumption to signal retirement.
     with pl.at(
@@ -216,14 +219,12 @@ def decode_cp_hca_projection_allgather_step(
         no_dep_args=[gather_signal],
     ) as retire_tid:
         completion_anchor = pl.read(group_out, [0, 0])
-        reset_value = pl.cast(-READBACK_EXPECTED, pl.INT32)
-        self_rank = group_base + tp_rank
-        for source_tp in pl.range(TP_SIZE):
-            if source_tp != tp_rank:
-                pld.system.notify(
-                    target=gather_signal, peer=self_rank,
-                    offsets=[source_tp, 0], value=reset_value, op=pld.NotifyOp.AtomicAdd,
-                )
+        gather_signal = clear_peer_credits(
+            gather_signal,
+            tp_rank,
+            group_base + tp_rank,
+            pl.cast(-READBACK_EXPECTED, pl.INT32),
+        )
         pl.write(group_out, [0, 0], completion_anchor)
 
     return group_out, gather_signal, retire_tid
@@ -278,12 +279,9 @@ def decode_cp_csa_main_typed_allgather_step(
         level=pl.Level.CORE_GROUP, name_hint="cp_csa_main_typed_allgather_payload_wait",
         deps=[push_tid],
     ) as payload_wait_tid:
-        for source_tp in pl.range(TP_SIZE):
-            if source_tp != tp_rank:
-                pld.system.wait(
-                    signal=gather_signal, offsets=[source_tp, 0],
-                    expected=pl.cast(PAYLOAD_EXPECTED, pl.INT32), cmp=pld.WaitCmp.Ge,
-                )
+        gather_signal = wait_for_peer_credits_blocking(
+            gather_signal, tp_rank, pl.cast(PAYLOAD_EXPECTED, pl.INT32),
+        )
 
     group_rows = TP_SIZE * local_rows
     full_rows = (group_rows // READBACK_ROW_TILE) * READBACK_ROW_TILE
@@ -317,12 +315,9 @@ def decode_cp_csa_main_typed_allgather_step(
         level=pl.Level.CORE_GROUP, name_hint="cp_csa_main_typed_allgather_readback_wait",
         deps=[readback_tid],
     ) as readback_wait_tid:
-        for source_tp in pl.range(TP_SIZE):
-            if source_tp != tp_rank:
-                pld.system.wait(
-                    signal=gather_signal, offsets=[source_tp, 0],
-                    expected=pl.cast(READBACK_EXPECTED, pl.INT32), cmp=pld.WaitCmp.Ge,
-                )
+        gather_signal = wait_for_peer_credits_blocking(
+            gather_signal, tp_rank, pl.cast(READBACK_EXPECTED, pl.INT32),
+        )
 
     # Consumers depend on retirement, which follows every typed output store.
     with pl.at(
@@ -330,14 +325,12 @@ def decode_cp_csa_main_typed_allgather_step(
         deps=[readback_tid, readback_wait_tid],
     ) as retire_tid:
         completion_anchor = pl.read(values_out, [0, 0])
-        reset_value = pl.cast(-READBACK_EXPECTED, pl.INT32)
-        self_rank = group_base + tp_rank
-        for source_tp in pl.range(TP_SIZE):
-            if source_tp != tp_rank:
-                pld.system.notify(
-                    target=gather_signal, peer=self_rank,
-                    offsets=[source_tp, 0], value=reset_value, op=pld.NotifyOp.AtomicAdd,
-                )
+        gather_signal = clear_peer_credits(
+            gather_signal,
+            tp_rank,
+            group_base + tp_rank,
+            pl.cast(-READBACK_EXPECTED, pl.INT32),
+        )
         pl.write(values_out, [0, 0], completion_anchor)
 
     return gather_signal, retire_tid
@@ -391,12 +384,9 @@ def decode_cp_csa_aux_typed_allgather_step(
         level=pl.Level.CORE_GROUP, name_hint="cp_csa_aux_typed_allgather_payload_wait",
         deps=[push_tid],
     ) as payload_wait_tid:
-        for source_tp in pl.range(TP_SIZE):
-            if source_tp != tp_rank:
-                pld.system.wait(
-                    signal=gather_signal, offsets=[source_tp, 0],
-                    expected=pl.cast(CSA_AUX_PAYLOAD_EXPECTED, pl.INT32), cmp=pld.WaitCmp.Ge,
-                )
+        gather_signal = wait_for_peer_credits_blocking(
+            gather_signal, tp_rank, pl.cast(CSA_AUX_PAYLOAD_EXPECTED, pl.INT32),
+        )
 
     group_rows = TP_SIZE * local_rows
     full_rows = (group_rows // READBACK_ROW_TILE) * READBACK_ROW_TILE
@@ -436,12 +426,9 @@ def decode_cp_csa_aux_typed_allgather_step(
         level=pl.Level.CORE_GROUP, name_hint="cp_csa_aux_typed_allgather_readback_wait",
         deps=[readback_tid],
     ) as readback_wait_tid:
-        for source_tp in pl.range(TP_SIZE):
-            if source_tp != tp_rank:
-                pld.system.wait(
-                    signal=gather_signal, offsets=[source_tp, 0],
-                    expected=pl.cast(CSA_AUX_READBACK_EXPECTED, pl.INT32), cmp=pld.WaitCmp.Ge,
-                )
+        gather_signal = wait_for_peer_credits_blocking(
+            gather_signal, tp_rank, pl.cast(CSA_AUX_READBACK_EXPECTED, pl.INT32),
+        )
 
     # Consumers depend on retirement, which follows every typed output store.
     with pl.at(
@@ -449,14 +436,12 @@ def decode_cp_csa_aux_typed_allgather_step(
         deps=[readback_tid, readback_wait_tid],
     ) as retire_tid:
         completion_anchor = pl.read(values_out, [0, 0])
-        reset_value = pl.cast(-CSA_AUX_READBACK_EXPECTED, pl.INT32)
-        self_rank = group_base + tp_rank
-        for source_tp in pl.range(TP_SIZE):
-            if source_tp != tp_rank:
-                pld.system.notify(
-                    target=gather_signal, peer=self_rank,
-                    offsets=[source_tp, 0], value=reset_value, op=pld.NotifyOp.AtomicAdd,
-                )
+        gather_signal = clear_peer_credits(
+            gather_signal,
+            tp_rank,
+            group_base + tp_rank,
+            pl.cast(-CSA_AUX_READBACK_EXPECTED, pl.INT32),
+        )
         pl.write(values_out, [0, 0], completion_anchor)
 
     return gather_signal, retire_tid
@@ -516,12 +501,9 @@ def decode_cp_kv_allgather_step(
         name_hint="cp_kv_allgather_payload_wait",
         deps=[_push_tid],
     ) as _payload_wait_tid:
-        for source_tp in pl.range(TP_SIZE):
-            if source_tp != tp_rank:
-                pld.system.wait(
-                    signal=gather_signal, offsets=[source_tp, 0],
-                    expected=pl.cast(PAYLOAD_EXPECTED, pl.INT32), cmp=pld.WaitCmp.Ge,
-                )
+        gather_signal = wait_for_peer_credits_blocking(
+            gather_signal, tp_rank, pl.cast(PAYLOAD_EXPECTED, pl.INT32),
+        )
 
     # Copy peer payloads and publish local readback completion.
     group_rows = TP_SIZE * local_rows
@@ -550,12 +532,9 @@ def decode_cp_kv_allgather_step(
         name_hint="cp_kv_allgather_readback_wait",
         deps=[_readback_tid],
     ) as _readback_wait_tid:
-        for source_tp in pl.range(TP_SIZE):
-            if source_tp != tp_rank:
-                pld.system.wait(
-                    signal=gather_signal, offsets=[source_tp, 0],
-                    expected=pl.cast(READBACK_EXPECTED, pl.INT32), cmp=pld.WaitCmp.Ge,
-                )
+        gather_signal = wait_for_peer_credits_blocking(
+            gather_signal, tp_rank, pl.cast(READBACK_EXPECTED, pl.INT32),
+        )
 
     # Retire peer credits and anchor output consumption to signal retirement.
     with pl.at(
@@ -564,14 +543,12 @@ def decode_cp_kv_allgather_step(
         deps=[_readback_tid, _readback_wait_tid],
     ) as retire_tid:
         completion_anchor = pl.read(group_out, [0, 0])
-        reset_value = pl.cast(-READBACK_EXPECTED, pl.INT32)
-        self_rank = group_base + tp_rank
-        for source_tp in pl.range(TP_SIZE):
-            if source_tp != tp_rank:
-                pld.system.notify(
-                    target=gather_signal, peer=self_rank,
-                    offsets=[source_tp, 0], value=reset_value, op=pld.NotifyOp.AtomicAdd,
-                )
+        gather_signal = clear_peer_credits(
+            gather_signal,
+            tp_rank,
+            group_base + tp_rank,
+            pl.cast(-READBACK_EXPECTED, pl.INT32),
+        )
         pl.write(group_out, [0, 0], completion_anchor)
 
     return gather_signal, retire_tid
