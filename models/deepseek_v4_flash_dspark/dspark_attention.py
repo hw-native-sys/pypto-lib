@@ -201,7 +201,7 @@ def dspark_attention(
     mi_transfer = pl.create_tensor([transfer_heads, 1], dtype=pl.FP32)
     li_transfer = pl.create_tensor([transfer_heads, 1], dtype=pl.FP32)
     ffts_workspace = pl.create_tensor([256], dtype=pl.INT64)
-    with pl.spmd(NUM_QK_CORES, name_hint="dspark_qk_pv") as qk_tid:
+    with pl.spmd(NUM_QK_CORES, name_hint="dspark_qk_pv", sync_start=True) as qk_tid:
         qk_core = pl.tile.get_block_idx()
         pl.system.set_ffts(ffts_workspace)
         for qk_t in pl.range(qk_core, T, NUM_QK_CORES):
