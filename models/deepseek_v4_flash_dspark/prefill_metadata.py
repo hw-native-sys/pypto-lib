@@ -16,6 +16,9 @@ REQUESTS_DYN = pl.dynamic("PREFILL_METADATA_REQUESTS_DYN")
 QUERY_START_LOC_DYN = pl.dynamic("PREFILL_METADATA_QUERY_START_LOC_DYN")
 LOCAL_TOKENS_DYN = pl.dynamic("PREFILL_METADATA_LOCAL_TOKENS_DYN")
 
+# tiling
+METADATA_TOKEN_TILE = 512
+
 
 @pl.jit.inline
 def lower_local_request_ids(
@@ -28,18 +31,40 @@ def lower_local_request_ids(
     base = pl.cast(local_base, pl.INT32)
     local_token_count = pl.tensor.dim(local_request_ids, 0)
 
-    with pl.spmd(1, name_hint="prefill_lower_local_request_ids"):
-        block_idx = pl.tile.get_block_idx()
-        if block_idx == 0:
-            for local_token in pl.range(local_token_count):
-                packed_token = base + pl.cast(local_token, pl.INT32)
-                pl.write(local_request_ids, [local_token], pl.cast(-1, pl.INT32))
+    local_request_ids_row = pl.reshape(local_request_ids, [1, local_token_count])
+    metadata_token_span = local_token_count + METADATA_TOKEN_TILE - 1
+    for token_block in pl.spmd(
+        metadata_token_span // METADATA_TOKEN_TILE,
+        name_hint="prefill_lower_local_request_ids",
+    ):
+        token_start = token_block * METADATA_TOKEN_TILE
+        valid_tokens = pl.min(METADATA_TOKEN_TILE, local_token_count - token_start)
+        packed_base = base + pl.cast(token_start, pl.INT32)
+        request_ids_tile = pl.full([1, METADATA_TOKEN_TILE], dtype=pl.INT32, value=-1)
+        if request_count == 1:
+            request_start = pl.read(query_start_loc, [0])
+            request_end = pl.read(query_start_loc, [1])
+            packed_end = packed_base + pl.cast(valid_tokens, pl.INT32)
+            request_margin = pl.min(packed_base - request_start, request_end - packed_end)
+            if request_margin >= 0:
+                request_ids_tile = pl.full([1, METADATA_TOKEN_TILE], dtype=pl.INT32, value=0)
+            else:
+                for tile_token in pl.range(valid_tokens):
+                    packed_token = packed_base + pl.cast(tile_token, pl.INT32)
+                    if packed_token >= request_start:
+                        if packed_token < request_end:
+                            pl.write(request_ids_tile, [0, tile_token], pl.cast(0, pl.INT32))
+        else:
+            for tile_token in pl.range(valid_tokens):
+                packed_token = packed_base + pl.cast(tile_token, pl.INT32)
                 for request in pl.range(request_count):
                     request_start = pl.read(query_start_loc, [request])
                     request_end = pl.read(query_start_loc, [request + 1])
                     if packed_token >= request_start:
                         if packed_token < request_end:
-                            pl.write(local_request_ids, [local_token], pl.cast(request, pl.INT32))
+                            pl.write(request_ids_tile, [0, tile_token], pl.cast(request, pl.INT32))
+        request_ids_valid = pl.set_validshape(request_ids_tile, 1, valid_tokens)
+        local_request_ids_row[0:1, token_start : token_start + METADATA_TOKEN_TILE] = request_ids_valid
     return local_request_ids
 
 

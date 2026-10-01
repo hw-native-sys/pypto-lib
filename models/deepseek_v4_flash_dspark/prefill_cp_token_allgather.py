@@ -49,6 +49,7 @@ PREFILL_LOCAL_CAP = PREFILL_GROUP_CAP // TP_SIZE
 # tiling
 COMM_ROW_TILE = 8
 READBACK_ROW_TILE = 16
+READBACK_WORKERS = 16
 
 # fixture
 FIXTURE_ROUNDS = 2
@@ -95,20 +96,25 @@ def _prefill_cp_token_allgather_step(
                     expected=pl.cast(1, pl.INT32), cmp=pld.WaitCmp.Ge,
                 )
 
-    # Readers own disjoint row tiles; release the window after every reader.
+    # Fixed readers own strided row tiles; release the window after every reader.
     group_rows = TP_SIZE * local_rows
-    readback_tiles = (group_rows + READBACK_ROW_TILE - 1) // READBACK_ROW_TILE
+    full_rows = (group_rows // READBACK_ROW_TILE) * READBACK_ROW_TILE
     with pl.spmd(
-        readback_tiles,
+        READBACK_WORKERS,
         name_hint="prefill_cp_token_allgather_readback",
         deps=[_push_tid, _payload_wait_tid],
     ) as _readback_tid:
-        tile_row = pl.tile.get_block_idx() * READBACK_ROW_TILE
-        valid_rows = pl.min(READBACK_ROW_TILE, group_rows - tile_row)
-        window_tile = pl.slice(
-            gather_window, [READBACK_ROW_TILE, D], [tile_row, 0], valid_shape=[valid_rows, D],
-        )
-        group_out[tile_row : tile_row + READBACK_ROW_TILE, 0:D] = window_tile
+        worker = pl.tile.get_block_idx()
+        for tile_row in pl.range(
+            worker * READBACK_ROW_TILE,
+            full_rows,
+            READBACK_WORKERS * READBACK_ROW_TILE,
+        ):
+            window_tile = gather_window[tile_row : tile_row + READBACK_ROW_TILE, 0:D]
+            group_out[tile_row : tile_row + READBACK_ROW_TILE, 0:D] = window_tile
+        for tail_row in pl.range(full_rows + worker, group_rows, READBACK_WORKERS):
+            window_row = gather_window[tail_row : tail_row + 1, 0:D]
+            group_out[tail_row : tail_row + 1, 0:D] = window_row
     with pl.at(
         level=pl.Level.CORE_GROUP,
         name_hint="prefill_cp_token_allgather_readback_notify",
