@@ -126,6 +126,9 @@ HCA_GATHER_TOKEN_TILE = 2
 HCA_QUERY_STATS_ROWS = HCA_QUERY_TILE * H
 HCA_QK_CORES = HCA_QUERY_TILE * (H // QK_M_TILE)
 
+assert T_PAD % HCA_QUERY_TILE == 0, "HCA query waves must stay within the dense tile"
+assert HCA_QUERY_TILE % HCA_GATHER_TOKEN_TILE == 0, "HCA gather must cover every query"
+
 assert WIN == PREFILL_ATTN_TILE, (
     f"Sparse prefill expects WIN ({WIN}) == PREFILL_ATTN_TILE ({PREFILL_ATTN_TILE})"
 )
@@ -522,8 +525,9 @@ def _hca_streaming_attn_tile(
     q: pl.Tensor[[T_DYN, H, HEAD_DIM], pl.BF16],
     ori_kv: pl.Tensor[[ORI_BLOCK_NUM_DYN, BLOCK_SIZE, 1, HEAD_DIM], pl.BF16],
     swa_indices: pl.Tensor[[T_DYN, WIN], pl.INT32],
-    cmp_kv: pl.Tensor[[CMP_BLOCK_NUM_DYN, HCA_CMP_STORAGE_BLOCK_SIZE, 1, HEAD_DIM], pl.BF16],
-    cmp_block_table: pl.Tensor[[HCA_CMP_MAX_BLOCKS], pl.INT32],
+    cmp_work_kv: pl.Tensor[[HCA_CMP_PAD_ROWS, HEAD_DIM], pl.BF16],
+    cmp_work_valid: pl.Tensor[[HCA_CMP_WORK_COUNT, HCA_WORK_VALID_STRIDE], pl.INT32],
+    cmp_gather_tid: pl.Scalar[pl.TASK_ID],
     position_ids: pl.Tensor[[T_DYN], pl.INT32],
     attn_sink: pl.Tensor[[H], pl.FP32],
     request_offset: pl.Scalar[pl.INDEX],
@@ -542,54 +546,7 @@ def _hca_streaming_attn_tile(
     tile_rows: pl.Scalar[pl.INDEX],
 ):
     """Stream one dense HCA tile through o-proj."""
-    cmp_block_num = pl.tensor.dim(cmp_kv, 0)
-    cmp_cache_rows = cmp_block_num * HCA_CMP_STORAGE_BLOCK_SIZE
-    cmp_kv_flat = pl.reshape(cmp_kv, [cmp_cache_rows, HEAD_DIM])
-
     with pl.manual_scope():
-        tile_cmp_work_count = pl.create_tensor([1], dtype=pl.INT32)
-        with pl.at(
-            level=pl.Level.CORE_GROUP, name_hint="prefill_hca_stream_cmp_plan", deps=[packed_init_tid],
-        ) as cmp_plan_tid:
-            # Maximum compressed-history rows for this tile.
-            plan_last_t = request_offset + tile_base + tile_rows - 1
-            plan_max_pos = pl.read(position_ids, [plan_last_t])
-            plan_visible_rows = (plan_max_pos + 1) // HCA_COMPRESS_RATIO
-            if plan_visible_rows < 0:
-                plan_visible_rows = pl.cast(0, pl.INDEX)
-            plan_work_count = (plan_visible_rows + HCA_ATTN_TILE - 1) // HCA_ATTN_TILE
-            max_work_count = pl.cast(HCA_CMP_WORK_COUNT, pl.INDEX)
-            plan_work_count = pl.min(plan_work_count, max_work_count)
-            pl.write(tile_cmp_work_count, [0], pl.cast(plan_work_count, pl.INT32))
-
-        # Tile-local HCA workspaces.
-        cmp_work_kv = pl.create_tensor([HCA_CMP_PAD_ROWS, HEAD_DIM], dtype=pl.BF16, manual_dep=True)
-        cmp_work_valid = pl.create_tensor([HCA_CMP_WORK_COUNT, HCA_WORK_VALID_STRIDE], dtype=pl.INT32, manual_dep=True)
-        with pl.spmd(
-            HCA_CMP_WORK_COUNT, name_hint="prefill_hca_stream_cmp_gather", deps=[cmp_plan_tid],
-        ) as cmp_gather_tid:
-            gather_work = pl.tile.get_block_idx()
-            pl.write(cmp_work_valid, [gather_work, 0], pl.cast(0, pl.INT32))
-            gather_active_count_i32 = pl.read(tile_cmp_work_count, [0])
-            if pl.cast(gather_work, pl.INT32) < gather_active_count_i32:
-                gather_dst0 = gather_work * HCA_ATTN_TILE
-                for gather_page in pl.range(HCA_CMP_PAGES_PER_WORK):
-                    gather_table_col = gather_work * HCA_CMP_PAGES_PER_WORK + gather_page
-                    gather_local = gather_page * HCA_CMP_STORAGE_BLOCK_SIZE
-                    gather_dst = gather_dst0 + gather_local
-                    # Preserve the manually managed workspace identity across gather writes.
-                    gather_zero = pl.tile.full([HCA_CMP_STORAGE_BLOCK_SIZE, HEAD_DIM], dtype=pl.BF16, value=0.0)
-                    pl.store(gather_zero, [gather_dst, 0], cmp_work_kv)
-                    gather_block_i32 = pl.read(cmp_block_table, [gather_table_col])
-                    if gather_block_i32 >= 0:
-                        if gather_block_i32 < cmp_block_num:
-                            if gather_page == 0:
-                                pl.write(cmp_work_valid, [gather_work, 0], pl.cast(1, pl.INT32))
-                            gather_block = pl.cast(gather_block_i32, pl.INDEX)
-                            gather_src = gather_block * HCA_CMP_STORAGE_BLOCK_SIZE
-                            gather_page_kv = pl.load(cmp_kv_flat, [gather_src, 0], [HCA_CMP_STORAGE_BLOCK_SIZE, HEAD_DIM])
-                            pl.store(gather_page_kv, [gather_dst, 0], cmp_work_kv)
-
         rope_cos_il = pl.create_tensor([T_PAD, ROPE_DIM], dtype=pl.FP32, manual_dep=True)
         rope_sin_signed = pl.create_tensor([T_PAD, ROPE_DIM], dtype=pl.FP32, manual_dep=True)
         rope_swap_idx = pl.create_tensor([HEAD_TILE, ROPE_DIM], dtype=pl.INT32, manual_dep=True)
@@ -1258,8 +1215,57 @@ def hca_streaming_attn_physical(
     active_rows: pl.Scalar[pl.INDEX],
 ):
     """Run ratio-128 attention over streamed history."""
+    cmp_block_num = pl.tensor.dim(cmp_kv, 0)
+    cmp_cache_rows = cmp_block_num * HCA_CMP_STORAGE_BLOCK_SIZE
+    cmp_kv_flat = pl.reshape(cmp_kv, [cmp_cache_rows, HEAD_DIM])
+
     tile_completion = pl.array.create(1, pl.TASK_ID)
     tile_completion[0] = cache_ready_dep
+    request_cmp_work_count = pl.create_tensor([1], dtype=pl.INT32)
+    with pl.at(
+        level=pl.Level.CORE_GROUP, name_hint="prefill_hca_stream_cmp_plan", deps=[tile_completion[0]],
+    ) as cmp_plan_tid:
+        # Gather once for this request; each query still masks its own causal history.
+        plan_work_count = pl.cast(0, pl.INDEX)
+        if active_rows > 0:
+            plan_last_t = request_offset + active_rows - 1
+            plan_max_pos = pl.read(position_ids, [plan_last_t])
+            plan_visible_rows = (plan_max_pos + 1) // HCA_COMPRESS_RATIO
+            if plan_visible_rows < 0:
+                plan_visible_rows = pl.cast(0, pl.INDEX)
+            plan_work_count = (plan_visible_rows + HCA_ATTN_TILE - 1) // HCA_ATTN_TILE
+            max_work_count = pl.cast(HCA_CMP_WORK_COUNT, pl.INDEX)
+            plan_work_count = pl.min(plan_work_count, max_work_count)
+        pl.write(request_cmp_work_count, [0], pl.cast(plan_work_count, pl.INT32))
+
+    # Keep compressed history alive across every dense tile of this request.
+    cmp_work_kv = pl.create_tensor([HCA_CMP_PAD_ROWS, HEAD_DIM], dtype=pl.BF16, manual_dep=True)
+    cmp_work_valid = pl.create_tensor([HCA_CMP_WORK_COUNT, HCA_WORK_VALID_STRIDE], dtype=pl.INT32, manual_dep=True)
+    with pl.spmd(
+        HCA_CMP_WORK_COUNT, name_hint="prefill_hca_stream_cmp_gather", deps=[cmp_plan_tid],
+    ) as cmp_gather_tid:
+        gather_work = pl.tile.get_block_idx()
+        pl.write(cmp_work_valid, [gather_work, 0], pl.cast(0, pl.INT32))
+        gather_active_count_i32 = pl.read(request_cmp_work_count, [0])
+        if pl.cast(gather_work, pl.INT32) < gather_active_count_i32:
+            gather_dst0 = gather_work * HCA_ATTN_TILE
+            for gather_page in pl.range(HCA_CMP_PAGES_PER_WORK):
+                gather_table_col = gather_work * HCA_CMP_PAGES_PER_WORK + gather_page
+                gather_local = gather_page * HCA_CMP_STORAGE_BLOCK_SIZE
+                gather_dst = gather_dst0 + gather_local
+                # Preserve the manually managed workspace identity across gather writes.
+                gather_zero = pl.tile.full([HCA_CMP_STORAGE_BLOCK_SIZE, HEAD_DIM], dtype=pl.BF16, value=0.0)
+                pl.store(gather_zero, [gather_dst, 0], cmp_work_kv)
+                gather_block_i32 = pl.read(cmp_block_table, [gather_table_col])
+                if gather_block_i32 >= 0:
+                    if gather_block_i32 < cmp_block_num:
+                        if gather_page == 0:
+                            pl.write(cmp_work_valid, [gather_work, 0], pl.cast(1, pl.INT32))
+                        gather_block = pl.cast(gather_block_i32, pl.INDEX)
+                        gather_src = gather_block * HCA_CMP_STORAGE_BLOCK_SIZE
+                        gather_page_kv = pl.load(cmp_kv_flat, [gather_src, 0], [HCA_CMP_STORAGE_BLOCK_SIZE, HEAD_DIM])
+                        pl.store(gather_page_kv, [gather_dst, 0], cmp_work_kv)
+
     for tile_base in pl.range(0, active_rows, T_PAD):
         with pl.scope():
             tile_rows = pl.min(T_PAD, active_rows - tile_base)
@@ -1276,7 +1282,7 @@ def hca_streaming_attn_physical(
 
             _hca_streaming_attn_tile(
                 q, ori_kv, swa_indices,
-                cmp_kv, cmp_block_table,
+                cmp_work_kv, cmp_work_valid, cmp_gather_tid,
                 position_ids, attn_sink, request_offset, active_rows,
                 freqs_cos, freqs_sin,
                 wo_a, wo_b, wo_b_scale,

@@ -96,6 +96,8 @@ TOPK_GROUP_ROOT_ROWS = PREFILL_DENSE_TILE * TOPK_GROUPS_PER_QUERY
 TOPK_GROUP_SCRATCH_ROWS = TOPK_GROUP_WORKERS * TOPK_GROUP_TILE
 TOPK_ARENA_ROWS = TOPK_GROUP_ROOT_ROWS + TOPK_GROUP_SCRATCH_ROWS
 TOPK_SCORE_WORKERS = 24
+INDEXER_SCORE_TILE = 128
+INDEXER_PACK_WORKERS = 48
 
 # Four pairwise merge levels cover at most 16 roots.
 assert TOPK_GROUPS_PER_QUERY <= 16
@@ -277,58 +279,152 @@ def _prefill_indexer_score_topk(
     idx_cache_rows = idx_block_num * BLOCK_SIZE
     kv_cache_i8_flat = pl.reshape(idx_kv_cache, [idx_cache_rows, IDX_HEAD_DIM])
     kv_scale_flat = pl.reshape(idx_kv_scale, [idx_cache_rows, 1])
+    # One bounded staging area is shared by the queries in this tile. Mixed-request
+    # tiles retain paged scoring, so workspace size does not grow with batch size.
+    packed_info = pl.create_tensor([16], dtype=pl.INT32, manual_dep=True)
+    packed_kv = pl.create_tensor([INDEXER_MAX_CANDIDATES, IDX_HEAD_DIM], dtype=pl.INT8, manual_dep=True)
+    packed_scale = pl.create_tensor([INDEXER_MAX_CANDIDATES, 1], dtype=pl.FP32, manual_dep=True)
+    packed_valid = pl.create_tensor([1, INDEXER_MAX_CANDIDATES], dtype=pl.FP32, manual_dep=True)
+    with pl.at(level=pl.Level.CORE_GROUP, name_hint="prefill_idx_pack_plan", deps=[completion[0]]) as plan_tid:
+        shared_request = pl.cast(-1, pl.INT32)
+        max_visible = 0
+        if tile_rows > 0:
+            shared_request = pl.read(local_request_ids, [tile_base])
+            for query in pl.range(tile_rows):
+                request_id = pl.read(local_request_ids, [tile_base + query])
+                position = pl.read(position_ids, [tile_base + query])
+                if request_id != shared_request:
+                    shared_request = pl.cast(-1, pl.INT32)
+                visible = pl.max(pl.min((position + 1) // COMPRESS_RATIO, INDEXER_MAX_CANDIDATES), 0)
+                max_visible = pl.max(max_visible, visible)
+        pl.write(packed_info, [0], shared_request)
+        pl.write(packed_info, [1], pl.cast(max_visible, pl.INT32))
+
+    with pl.spmd(INDEXER_PACK_WORKERS, name_hint="prefill_idx_pack_kv", deps=[plan_tid]) as pack_tid:
+        worker = pl.tile.get_block_idx()
+        shared_request = pl.read(packed_info, [0])
+        max_visible = pl.read(packed_info, [1])
+        if shared_request >= 0:
+            packed_rows = ((max_visible + INDEXER_SCORE_TILE - 1) // INDEXER_SCORE_TILE) * INDEXER_SCORE_TILE
+            for page in pl.range(worker, packed_rows // BLOCK_SIZE, INDEXER_PACK_WORKERS):
+                logical_row = page * BLOCK_SIZE
+                physical_block_raw = pl.cast(-1, pl.INT32)
+                if logical_row < max_visible:
+                    physical_block_raw = pl.read(idx_block_table, [shared_request, page])
+                if physical_block_raw >= 0 and physical_block_raw < idx_block_num:
+                    physical_row = pl.cast(physical_block_raw, pl.INDEX) * BLOCK_SIZE
+                    keys = pl.load(kv_cache_i8_flat, [physical_row, 0], [BLOCK_SIZE, IDX_HEAD_DIM])
+                    scales = pl.load(kv_scale_flat, [physical_row, 0], [BLOCK_SIZE, 1])
+                    valid = pl.tile.full([1, BLOCK_SIZE], dtype=pl.FP32, value=1.0)
+                    pl.store(keys, [logical_row, 0], packed_kv)
+                    pl.store(scales, [logical_row, 0], packed_scale)
+                    pl.store(valid, [0, logical_row], packed_valid)
+                else:
+                    zero_keys_fp16 = pl.tile.full([BLOCK_SIZE, IDX_HEAD_DIM], dtype=pl.FP16, value=0.0)
+                    zero_keys = pl.cast(zero_keys_fp16, target_type=pl.INT8, mode="trunc")
+                    zero_scale_row = pl.tile.full([1, BLOCK_SIZE], dtype=pl.FP32, value=0.0)
+                    zero_scales = pl.tile.transpose_view(zero_scale_row)
+                    zero_valid = pl.tile.full([1, BLOCK_SIZE], dtype=pl.FP32, value=0.0)
+                    pl.store(zero_keys, [logical_row, 0], packed_kv)
+                    pl.store(zero_scales, [logical_row, 0], packed_scale)
+                    pl.store(zero_valid, [0, logical_row], packed_valid)
+
     with pl.spmd(
-        TOPK_SCORE_WORKERS, name_hint="prefill_idx_score_leaf_wave", deps=[completion[0]],
+        TOPK_SCORE_WORKERS, name_hint="prefill_idx_score_leaf_wave", deps=[pack_tid],
         optimizations=[pl.split(pl.SplitMode.NONE, slot_num=2)],
     ) as score_tid:
         worker = pl.tile.get_block_idx()
-        global_leaf_base = 0
-        for query in pl.range(tile_rows):
-            output_query = tile_base + query
-            position = pl.read(position_ids, [output_query])
-            request_id = pl.read(local_request_ids, [output_query])
-            visible_count = 0
-            if request_id >= 0:
+        shared_request = pl.read(packed_info, [0])
+        if shared_request >= 0:
+            global_leaf_base = 0
+            for query in pl.range(tile_rows):
+                position = pl.read(position_ids, [tile_base + query])
                 visible_count = pl.max(pl.min((position + 1) // COMPRESS_RATIO, INDEXER_MAX_CANDIDATES), 0)
-            leaf_count = (visible_count + TOPK_LEAF_TILE - 1) // TOPK_LEAF_TILE
-            base_mod = global_leaf_base % TOPK_SCORE_WORKERS
-            first_leaf = (worker + base_mod) % TOPK_SCORE_WORKERS
-            for leaf in pl.range(first_leaf, leaf_count, TOPK_SCORE_WORKERS):
-                logical_begin = leaf * TOPK_LEAF_TILE
-                valid_count = pl.min(TOPK_LEAF_TILE, visible_count - logical_begin)
-                query_head_begin = query * IDX_N_HEADS
-                query_vector = qr_hadamard_i8[query_head_begin : query_head_begin + IDX_N_HEADS, 0:IDX_HEAD_DIM]
-                query_scale_heads = qr_hadamard_scale_dq[query_head_begin : query_head_begin + IDX_N_HEADS, 0:1]
-                query_scale = pl.reshape(query_scale_heads, [1, IDX_N_HEADS])
-                query_weight = weights[query : query + 1, 0:IDX_N_HEADS]
-                for page in pl.pipeline(0, (valid_count + BLOCK_SIZE - 1) // BLOCK_SIZE, stage=2):
-                    page_begin = page * BLOCK_SIZE
-                    logical_row = logical_begin + page_begin
-                    logical_page = logical_row // BLOCK_SIZE
-                    physical_block_raw = pl.cast(-1, pl.INT32)
-                    if request_id >= 0:
-                        physical_block_raw = pl.read(idx_block_table, [request_id, logical_page])
-                    score_valid = pl.full([1, BLOCK_SIZE], dtype=pl.FP32, value=FP32_NEG_INF)
-                    if physical_block_raw >= 0 and physical_block_raw < idx_block_num:
-                        physical_block = pl.cast(physical_block_raw, pl.INDEX)
-                        physical_row = physical_block * BLOCK_SIZE
-                        kv_i8 = kv_cache_i8_flat[physical_row : physical_row + BLOCK_SIZE, 0:IDX_HEAD_DIM]
-                        score_i32 = pl.matmul(kv_i8, query_vector, out_dtype=pl.INT32, b_trans=True)
-                        score_fp32 = pl.cast(score_i32, target_type=pl.FP32, mode="none")
-                        score_fp32 = pl.col_expand_mul(score_fp32, query_scale)
-                        score_fp32 = pl.maximum(score_fp32, 0.0)
-                        score_fp32 = pl.col_expand_mul(score_fp32, query_weight)
-                        kv_scale = kv_scale_flat[physical_row : physical_row + BLOCK_SIZE, 0:1]
-                        score_sum = pl.row_sum(score_fp32)
-                        score_scaled = pl.mul(score_sum, kv_scale)
-                        score_row = pl.reshape(score_scaled, [1, BLOCK_SIZE])
-                        valid_rows = pl.min(BLOCK_SIZE, valid_count - page_begin)
-                        score_valid_view = pl.set_validshape(score_row, 1, valid_rows)
-                        score_padded = pl.fillpad(score_valid_view, pad_value=pl.PadValue.min)
-                        score_floor = pl.full([1, BLOCK_SIZE], dtype=pl.FP32, value=FP32_NEG_INF)
-                        score_valid = pl.maximum(score_padded, score_floor)
-                    score_arena[query : query + 1, logical_row : logical_row + BLOCK_SIZE] = score_valid
-            global_leaf_base = global_leaf_base + leaf_count
+                leaf_count = (visible_count + TOPK_LEAF_TILE - 1) // TOPK_LEAF_TILE
+                first_leaf = (worker + global_leaf_base % TOPK_SCORE_WORKERS) % TOPK_SCORE_WORKERS
+                for leaf in pl.range(first_leaf, leaf_count, TOPK_SCORE_WORKERS):
+                    logical_begin = leaf * TOPK_LEAF_TILE
+                    valid_count = pl.min(TOPK_LEAF_TILE, visible_count - logical_begin)
+                    query_head_begin = query * IDX_N_HEADS
+                    packed_query_vector = pl.load(
+                        qr_hadamard_i8, [query_head_begin, 0], [IDX_N_HEADS, IDX_HEAD_DIM],
+                        target_memory=pl.MemorySpace.Mat,
+                    )
+                    packed_scale_heads = pl.load(qr_hadamard_scale_dq, [query_head_begin, 0], [IDX_N_HEADS, 1])
+                    packed_query_scale = pl.reshape(packed_scale_heads, [1, IDX_N_HEADS])
+                    packed_query_weight = pl.load(weights, [query, 0], [1, IDX_N_HEADS])
+                    packed_reduce_tmp = pl.tile.create([INDEXER_SCORE_TILE, IDX_N_HEADS], dtype=pl.FP32)
+                    for block in pl.pipeline(0, (valid_count + INDEXER_SCORE_TILE - 1) // INDEXER_SCORE_TILE, stage=2):
+                        logical_row = logical_begin + block * INDEXER_SCORE_TILE
+                        packed_keys = pl.load(
+                            packed_kv, [logical_row, 0], [INDEXER_SCORE_TILE, IDX_HEAD_DIM],
+                            target_memory=pl.MemorySpace.Mat,
+                        )
+                        packed_score_i32 = pl.matmul(packed_keys, pl.tile.transpose_view(packed_query_vector), out_dtype=pl.INT32)
+                        packed_score_fp32 = pl.cast(packed_score_i32, target_type=pl.FP32, mode="none")
+                        packed_score_fp32 = pl.col_expand_mul(packed_score_fp32, packed_query_scale)
+                        packed_score_fp32 = pl.maximum(packed_score_fp32, 0.0)
+                        packed_score_fp32 = pl.col_expand_mul(packed_score_fp32, packed_query_weight)
+                        packed_kv_scale = pl.load(packed_scale, [logical_row, 0], [INDEXER_SCORE_TILE, 1])
+                        packed_score_sum = pl.row_sum(packed_score_fp32, packed_reduce_tmp)
+                        packed_score_scaled = pl.mul(packed_score_sum, packed_kv_scale)
+                        packed_score_row = pl.reshape(packed_score_scaled, [1, INDEXER_SCORE_TILE])
+                        packed_page_valid = pl.load(packed_valid, [0, logical_row], [1, INDEXER_SCORE_TILE])
+                        packed_page_mask = pl.tile.cmps(packed_page_valid, 0.0, cmp_type=1)
+                        packed_score_masked = pl.tile.select(packed_page_mask, packed_score_row, FP32_NEG_INF)
+                        valid_rows = pl.min(INDEXER_SCORE_TILE, visible_count - logical_row)
+                        packed_score_valid_view = pl.set_validshape(packed_score_masked, 1, valid_rows)
+                        packed_score_padded = pl.fillpad(packed_score_valid_view, pad_value=pl.PadValue.min)
+                        pl.store(packed_score_padded, [query, logical_row], score_arena)
+                global_leaf_base = global_leaf_base + leaf_count
+        else:
+            global_leaf_base = 0
+            for query in pl.range(tile_rows):
+                output_query = tile_base + query
+                position = pl.read(position_ids, [output_query])
+                request_id = pl.read(local_request_ids, [output_query])
+                visible_count = 0
+                if request_id >= 0:
+                    visible_count = pl.max(pl.min((position + 1) // COMPRESS_RATIO, INDEXER_MAX_CANDIDATES), 0)
+                leaf_count = (visible_count + TOPK_LEAF_TILE - 1) // TOPK_LEAF_TILE
+                base_mod = global_leaf_base % TOPK_SCORE_WORKERS
+                first_leaf = (worker + base_mod) % TOPK_SCORE_WORKERS
+                for leaf in pl.range(first_leaf, leaf_count, TOPK_SCORE_WORKERS):
+                    logical_begin = leaf * TOPK_LEAF_TILE
+                    valid_count = pl.min(TOPK_LEAF_TILE, visible_count - logical_begin)
+                    query_head_begin = query * IDX_N_HEADS
+                    query_vector = qr_hadamard_i8[query_head_begin : query_head_begin + IDX_N_HEADS, 0:IDX_HEAD_DIM]
+                    query_scale_heads = qr_hadamard_scale_dq[query_head_begin : query_head_begin + IDX_N_HEADS, 0:1]
+                    query_scale = pl.reshape(query_scale_heads, [1, IDX_N_HEADS])
+                    query_weight = weights[query : query + 1, 0:IDX_N_HEADS]
+                    for page in pl.pipeline(0, (valid_count + BLOCK_SIZE - 1) // BLOCK_SIZE, stage=2):
+                        page_begin = page * BLOCK_SIZE
+                        logical_row = logical_begin + page_begin
+                        logical_page = logical_row // BLOCK_SIZE
+                        physical_block_raw = pl.cast(-1, pl.INT32)
+                        if request_id >= 0:
+                            physical_block_raw = pl.read(idx_block_table, [request_id, logical_page])
+                        score_valid = pl.full([1, BLOCK_SIZE], dtype=pl.FP32, value=FP32_NEG_INF)
+                        if physical_block_raw >= 0 and physical_block_raw < idx_block_num:
+                            physical_block = pl.cast(physical_block_raw, pl.INDEX)
+                            physical_row = physical_block * BLOCK_SIZE
+                            kv_i8 = kv_cache_i8_flat[physical_row : physical_row + BLOCK_SIZE, 0:IDX_HEAD_DIM]
+                            score_i32 = pl.matmul(kv_i8, query_vector, out_dtype=pl.INT32, b_trans=True)
+                            score_fp32 = pl.cast(score_i32, target_type=pl.FP32, mode="none")
+                            score_fp32 = pl.col_expand_mul(score_fp32, query_scale)
+                            score_fp32 = pl.maximum(score_fp32, 0.0)
+                            score_fp32 = pl.col_expand_mul(score_fp32, query_weight)
+                            kv_scale = kv_scale_flat[physical_row : physical_row + BLOCK_SIZE, 0:1]
+                            score_sum = pl.row_sum(score_fp32)
+                            score_scaled = pl.mul(score_sum, kv_scale)
+                            score_row = pl.reshape(score_scaled, [1, BLOCK_SIZE])
+                            valid_rows = pl.min(BLOCK_SIZE, valid_count - page_begin)
+                            score_valid_view = pl.set_validshape(score_row, 1, valid_rows)
+                            score_padded = pl.fillpad(score_valid_view, pad_value=pl.PadValue.min)
+                            score_floor = pl.full([1, BLOCK_SIZE], dtype=pl.FP32, value=FP32_NEG_INF)
+                            score_valid = pl.maximum(score_padded, score_floor)
+                        score_arena[query : query + 1, logical_row : logical_row + BLOCK_SIZE] = score_valid
+                global_leaf_base = global_leaf_base + leaf_count
 
     with pl.spmd(TOPK_GROUP_WORKERS, name_hint="prefill_idx_topk_group_wave", deps=[score_tid]) as topk_tid:
         _topk_group_wave(position_ids, local_request_ids, score_arena, pair_arena, tile_base, tile_rows)
