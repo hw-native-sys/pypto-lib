@@ -54,7 +54,6 @@ def _gdn_chunk_h(
     w_flat = pl.reshape(w, [t_dim, VAL_WIDTH])
     u_flat = pl.reshape(u, [t_dim, VAL_WIDTH])
     v_flat = pl.reshape(v_new, [t_dim, VAL_WIDTH])
-    # Without pl.split the kernel needs 197632 B of a 188416 B vector buffer.
     for hh in pl.spmd(H, name_hint="chunk_h",
                       optimizations=[pl.cross_core_slot(slot_num=1),
                                      pl.split(pl.SplitMode.UP_DOWN)]):

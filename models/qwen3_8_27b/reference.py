@@ -43,13 +43,11 @@ def make_inputs(t: int, h: int, d: int, hg: int | None = None,
 
     `hg` is the number of QK heads; `h` the number of value heads. They differ
     under GQA (Qwen3.8-27B is 48 against 16), and each value head reads key head
-    `h // (H // Hg)` -- the model's own implementation reaches the same place by
-    `repeat_interleave`, megagdn's reference by that index. Defaults to `h`.
+    `h // (H // Hg)`. Defaults to `h`.
 
-    Same draw as the reference harness (`megagdn-pto/tests/utils.py:
-    generate_random_inputs`): q and k L2-normalised along the head dimension, v
-    unnormalised noise, beta uniform on [0, 1) and the gate logits log-sigmoid,
-    so `g` is negative and its chunk-local prefix sum decays.
+    q and k are L2-normalised along the head dimension, v is unnormalised noise,
+    beta is uniform on [0, 1) and the gate logits are log-sigmoid, so `g` is
+    negative and its chunk-local prefix sum decays.
 
     Each tensor draws from its own generator, so changing one shape does not
     reshuffle the others -- `g` at a given (t, h) is the same whatever D is.
@@ -220,8 +218,8 @@ def chunk_o(q: torch.Tensor, k: torch.Tensor, v_new: torch.Tensor,
 # Acceptance criterion
 # ---------------------------------------------------------------------------
 
-# megagdn-pto/tests/utils.py: NumericalAccuracy. rtol is scaled by the chunk
-# size because a chunk-length reduction accumulates that many rounding steps.
+# rtol scales with the chunk size: that is how many rounding steps a
+# chunk-length reduction accumulates.
 RTOL = 5e-3
 ATOL = 1.5e-4
 FTOL = 1e-3
@@ -229,7 +227,7 @@ FTOL = 1e-3
 
 def stats_ok(actual: torch.Tensor, expected: torch.Tensor,
              chunk: int = 1) -> tuple[bool, str]:
-    """The reference harness's acceptance test, and the numbers behind it."""
+    """The acceptance test, and the numbers behind it."""
     act = actual.to(REF_DTYPE)
     exp = expected.to(REF_DTYPE)
     diff = (act - exp).abs()
