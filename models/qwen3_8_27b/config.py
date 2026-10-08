@@ -76,8 +76,7 @@ class Qwen38Config:
 class GdnTiling:
     """Tiling the GDN kernels choose. Not from the model config."""
 
-    # The chunk length the delta rule is blocked over. megagdn-pto fixes it at 128
-    # and so do we; the reference Triton kernels default to 64.
+    # The chunk length the delta rule is blocked over.
     chunk: int
 
 

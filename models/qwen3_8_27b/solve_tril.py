@@ -68,17 +68,12 @@ def _gdn_solve_tril(
         for hh in pl.range(H):
             col = hh * CHUNK_TILE
             ident = eye[:, :]
-            # The A slice is written out twice on purpose: one bound value
-            # cannot feed several vector ops. The masks carry a minus sign, so
-            # this is -D, and -N below; both matmuls that follow want the
-            # negated form. D is taken here and N at its use below -- holding
-            # both across the doubling puts the vector buffer 40 KB over its
-            # 188416.
+            # The A slice is read twice: one bound value cannot feed several
+            # vector ops. The masks carry a minus sign, so this is -D and -N
+            # below, the negated form both matmuls want.
             dm = pl.mul(a_flat[t0 : t0 + CHUNK_TILE, col : col + CHUNK_TILE], m_diag[:, :])
 
-            # --- Xd = (I + D)^-1. `I - D` as two single-K matmuls, not one
-            # double-K: the [chunk, 2*chunk] concat operand is 64 KB of vector
-            # buffer, and two of them are 8 KB over the limit.
+            # Xd = (I + D)^-1, as two single-K matmuls rather than one double-K.
             nd = pl.matmul(dm, ident, out_dtype=pl.FP32)       # -D into an acc
             xa = pl.matmul_acc(nd, ident, ident)               # X = I - D
             xc = pl.cast(xa, target_type=pl.FP16, mode="rint")
