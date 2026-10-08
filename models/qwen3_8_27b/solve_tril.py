@@ -30,7 +30,7 @@ HG = QWEN3_8_27B.linear_num_key_heads       # QK heads; H // HG value heads shar
 D = QWEN3_8_27B.linear_value_head_dim       # head dimension; unused here, drawn inputs match the pipeline
 CHUNK_TILE = GDN_TILING.chunk               # chunk size in tokens, our tiling choice
 A_WIDTH = H * CHUNK_TILE
-BLOCK = 16              # doubling block; see the split above. 32 also passes, 64 does not
+BLOCK_TILE = 16              # doubling block; see the split above. 32 also passes, 64 does not
 T = PREFILL_SEQ                             # tokens (single sequence, B = 1)
 
 
@@ -39,10 +39,10 @@ T = PREFILL_SEQ                             # tokens (single sequence, B = 1)
 # no other symptom, so refuse the shape instead.
 if CHUNK_TILE & (CHUNK_TILE - 1):
     raise ValueError(f"CHUNK_TILE must be a power of two, got {CHUNK_TILE}")
-if BLOCK & (BLOCK - 1) or BLOCK < 4 or CHUNK_TILE % BLOCK or BLOCK >= CHUNK_TILE:
-    raise ValueError(f"BLOCK must be a power of two in [4, {CHUNK_TILE}), got {BLOCK}")
-NBLK = CHUNK_TILE // BLOCK
-ND_IN = BLOCK.bit_length() - 2          # X updates for (I + D)^-1, since D^BLOCK = 0
+if BLOCK_TILE & (BLOCK_TILE - 1) or BLOCK_TILE < 4 or CHUNK_TILE % BLOCK_TILE or BLOCK_TILE >= CHUNK_TILE:
+    raise ValueError(f"BLOCK_TILE must be a power of two in [4, {CHUNK_TILE}), got {BLOCK_TILE}")
+NBLK = CHUNK_TILE // BLOCK_TILE
+ND_IN = BLOCK_TILE.bit_length() - 2          # X updates for (I + D)^-1, since D^BLOCK_TILE = 0
 ND_OUT = NBLK.bit_length() - 2          # X updates for (I + M)^-1, since M^NBLK = 0
 
 
@@ -120,7 +120,7 @@ gdn_solve_tril = pl.jit.inline(_gdn_solve_tril)
 gdn_solve_tril_test = pl.jit(_gdn_solve_tril)
 
 
-def blk_masks(chunk: int = CHUNK_TILE, block: int = BLOCK):
+def blk_masks(chunk: int = CHUNK_TILE, block: int = BLOCK_TILE):
     """The negated block-diagonal indicator and its strictly-block-lower complement.
 
     Negated because both matmuls that consume them want `-D` and `-N`: that is
@@ -172,7 +172,7 @@ def _inputs(t: int, h: int, d: int, chunk: int, hg: int) -> dict:
 
 
 def build_tensor_specs(t: int = T, h: int = H, d: int = D, chunk: int = CHUNK_TILE,
-                       hg: int = HG, block: int = BLOCK):
+                       hg: int = HG, block: int = BLOCK_TILE):
     # hg only picks which reference chain to draw from; this stage reads no q or k.
     import torch
     from golden import TensorSpec
