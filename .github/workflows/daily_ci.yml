@@ -180,7 +180,7 @@ jobs:
     # or a fixed card id. Checkout / install happen under ./checkout rather
     # than at the workspace root, so the root holds only the sparsely-fetched
     # action defs and any second repo a job needs sits beside this one.
-    runs-on: [self-hosted, linux, arm64, npu]
+    runs-on: [self-hosted, linux, npu, a3]
     # Must exceed a single task-submit's worst case (--timeout 3600 queue wait +
     # --max-time 900 run), or the job dies before task-submit's own timeout can
     # ever fire — and the first queued case would eat the whole job budget.
@@ -799,7 +799,7 @@ jobs:
 
   operator-performance:
     name: MTP and DSpark operator performance (a2a3)
-    runs-on: [self-hosted, linux, arm64, npu]
+    runs-on: [self-hosted, linux, npu, a3]
     # Twenty serial task-submit cases, each bounded by --timeout 3600.
     timeout-minutes: 300
     concurrency:

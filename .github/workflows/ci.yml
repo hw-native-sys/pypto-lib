@@ -267,7 +267,7 @@ jobs:
     # ./checkout rather than at the workspace root, so the root holds only the
     # sparsely-fetched action defs and any second repo a job needs (serving's
     # pypto-serving) sits beside this one instead of inside it.
-    runs-on: [self-hosted, linux, npu, a2]
+    runs-on: [self-hosted, linux, npu, a3]
     # Must exceed a single task-submit's worst case (--timeout 3600 queue wait +
     # --max-time 600 run), or the job dies before task-submit's own timeout can
     # ever fire — and the first queued case would eat the whole job budget.
@@ -443,7 +443,7 @@ jobs:
     if: >-
       github.event_name == 'pull_request' &&
       needs.detect-changes.outputs.run_qwen_serving_tests == 'true'
-    runs-on: [self-hosted, linux, arm64, npu]
+    runs-on: [self-hosted, linux, npu, a3]
     # One task-submit worst case: --timeout 3600 queue + --max-time 1800 run,
     # plus setup/build headroom.
     timeout-minutes: 120
@@ -503,7 +503,7 @@ jobs:
     if: >-
       github.event_name == 'pull_request' &&
       needs.detect-changes.outputs.run_deepseek_serving_tests == 'true'
-    runs-on: [self-hosted, linux, arm64, npu]
+    runs-on: [self-hosted, linux, npu, a3]
     # One task-submit worst case: --timeout 3600 queue + --max-time 1800 run,
     # plus setup/build headroom.
     timeout-minutes: 120
@@ -568,7 +568,7 @@ jobs:
     if: >-
       github.event_name == 'pull_request' &&
       needs.detect-changes.outputs.run_dspark_serving_tests == 'true'
-    runs-on: [self-hosted, linux, arm64, npu]
+    runs-on: [self-hosted, linux, npu, a3]
     # One task-submit worst case: --timeout 3600 queue + --max-time 2400 run
     # (the K=7 boot compiles the fused one-L2 decode entry on top of the weight
     # upload), plus setup/build headroom.
