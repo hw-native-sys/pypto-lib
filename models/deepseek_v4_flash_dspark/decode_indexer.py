@@ -522,6 +522,7 @@ def indexer_score_topk_forest(
             name_hint="indexer_score_topk_leaf",
             deps=[qh_quant_tid, weights_tid, cache_write_tid],
             allow_early_resolve=True,
+            sync_start=True,
             optimizations=[pl.cross_core_slot(slot_num=1)],
         ) as direct_leaf_tid:
             worker = pl.tile.get_block_idx()
