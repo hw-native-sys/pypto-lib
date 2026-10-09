@@ -9,6 +9,8 @@
 """DeepSeek-V4 decode Indexer: q projection, Hadamard INT8 quant, inner compressor, paged C8 score and Top-K."""
 
 
+from math import gcd
+
 import pypto.language as pl
 
 from config import (
@@ -68,12 +70,12 @@ MM_N_TILE = 512       # idx qr_proj Mat N tile
 MM_ROW_TILE = 16
 T_PAD = ((T + MM_ROW_TILE - 1) // MM_ROW_TILE) * MM_ROW_TILE
 assert T_PAD == MM_ROW_TILE, "weights_proj single-row-tile scope assumes decode T <= MM_ROW_TILE"
-D_TILE = 512
 # weights_proj: WEIGHTS_OK tasks, each a [MM_ROW_TILE, IDX_N_HEADS] matmul over one WEIGHTS_K_TILE K range,
 # summed by a separate reduce scope (a zero-seed + atomic-add assemble races on the full-extent seed).
 # The inner K loop is a pl.range: a 2-iteration pl.pipeline(stage=2) miscompiles over matmul.
 WEIGHTS_OK = 4
 WEIGHTS_K_TILE = D // WEIGHTS_OK
+D_TILE = gcd(512, WEIGHTS_K_TILE)
 assert WEIGHTS_K_TILE % D_TILE == 0
 QH_MM_TILE = 64       # q @ hadamard row tile; L0C caps QH_MM_TILE * IDX_HEAD_DIM * 4B <= 64KiB
 QH_QUANT_TILE = 64

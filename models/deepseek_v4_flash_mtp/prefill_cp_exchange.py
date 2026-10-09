@@ -11,6 +11,8 @@
 
 """Context-parallel prefill tail exchange, compact-cache exchange, and sparse-source staging."""
 
+from math import gcd
+
 import pypto.language as pl
 import pypto.language.distributed as pld
 
@@ -98,6 +100,7 @@ MAIN_CACHE_ROWS = PREFILL_CMP_BLOCK_NUM * CSA_CMP_STORAGE_BLOCK_SIZE
 MAIN_STATE_ROWS = CSA_STATE_PHYSICAL_BLOCKS * MAIN_STATE_BLOCK_SIZE
 INNER_STATE_ROWS = CSA_INNER_STATE_PHYSICAL_BLOCKS * INNER_STATE_BLOCK_SIZE
 CP_LAST_HIDDEN_EPOCH = 1
+HIDDEN_TAIL_D_TILE = gcd(4096, D)
 
 
 # Serving request transfer uses bounded tiles, independent of prompt length.
@@ -105,7 +108,7 @@ CP_REQUEST_INPUT_STREAMS_DYN = pl.dynamic("CP_REQUEST_INPUT_STREAMS_DYN")
 CP_REQUEST_TOKENS_DYN = pl.dynamic("CP_REQUEST_TOKENS_DYN")
 CP_REQUEST_HC_DIM = M.hc_mult * D
 CP_REQUEST_COPY_COLS = 512
-_CP_REQUEST_HIDDEN_TILE_COLS = 2048
+_CP_REQUEST_HIDDEN_TILE_COLS = gcd(2048, D)
 # A sender tile indexes one stream at a time (``[ROW_TILE, 1, TILE_COLS]``), so a
 # tile that straddled two streams would silently read the wrong columns.
 assert D % _CP_REQUEST_HIDDEN_TILE_COLS == 0, "Hidden tiles must not cross the stream boundary."
@@ -388,7 +391,7 @@ def _prefill_cp_hidden_tail_exchange_wave(
                 src_offsets=[src_row_base, 0],
                 shape=[TAIL_ROWS, D],
                 chunk_rows=ROW_TILE,
-                chunk_cols=D,
+                chunk_cols=HIDDEN_TAIL_D_TILE,
                 pipeline=True,
             )
         if peer != cp_rank:
