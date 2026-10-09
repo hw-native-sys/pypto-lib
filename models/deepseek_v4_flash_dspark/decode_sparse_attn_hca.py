@@ -294,7 +294,13 @@ def sparse_attn_hca(
         raw_probability_transfer = pl.create_tensor([raw_transfer_rows, ATTN_K_TILE], dtype=pl.BF16)
         raw_ffts_workspace = pl.create_tensor([256], dtype=pl.INT64)
 
-        with pl.spmd(RAW_WORKERS, name_hint="hca_raw_attn", deps=[raw_gather_tid, raw_valid_tid], allow_early_resolve=True) as raw_heads_tid:
+        with pl.spmd(
+            RAW_WORKERS,
+            name_hint="hca_raw_attn",
+            deps=[raw_gather_tid, raw_valid_tid],
+            allow_early_resolve=True,
+            sync_start=True,
+        ) as raw_heads_tid:
             raw_qk_task = pl.tile.get_block_idx()
             pl.system.set_ffts(raw_ffts_workspace)
             raw_qk_count = pl.max((t_dim - raw_qk_task + RAW_WORKERS - 1) // RAW_WORKERS, 0)
@@ -403,7 +409,13 @@ def sparse_attn_hca(
         mi_transfer = pl.create_tensor([transfer_heads, 1], dtype=pl.FP32)
         li_transfer = pl.create_tensor([transfer_heads, 1], dtype=pl.FP32)
         ffts_workspace = pl.create_tensor([256], dtype=pl.INT64)
-        with pl.spmd(NUM_QK_CORES, name_hint="hca_cmp_qk_pv", deps=[cmp_gather_tid], allow_early_resolve=True) as cmp_qk_tid:
+        with pl.spmd(
+            NUM_QK_CORES,
+            name_hint="hca_cmp_qk_pv",
+            deps=[cmp_gather_tid],
+            allow_early_resolve=True,
+            sync_start=True,
+        ) as cmp_qk_tid:
             qk_core = pl.tile.get_block_idx()
             pl.system.set_ffts(ffts_workspace)
             if cmp_work_count == 1:
