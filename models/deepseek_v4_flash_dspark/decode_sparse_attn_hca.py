@@ -293,21 +293,22 @@ def sparse_attn_hca(
         raw_score_transfer = pl.create_tensor([raw_transfer_rows, ATTN_K_TILE], dtype=pl.FP32)
         raw_probability_transfer = pl.create_tensor([raw_transfer_rows, ATTN_K_TILE], dtype=pl.BF16)
         raw_ffts_workspace = pl.create_tensor([256], dtype=pl.INT64)
-
+        raw_workers = pl.min(RAW_WORKERS, pl.system.available_cluster_count())
         with pl.spmd(
-            RAW_WORKERS,
+            raw_workers,
             name_hint="hca_raw_attn",
             deps=[raw_gather_tid, raw_valid_tid],
             allow_early_resolve=True,
             sync_start=True,
         ) as raw_heads_tid:
             raw_qk_task = pl.tile.get_block_idx()
+            raw_stride = pl.tile.get_block_num()
             pl.system.set_ffts(raw_ffts_workspace)
-            raw_qk_count = pl.max((t_dim - raw_qk_task + RAW_WORKERS - 1) // RAW_WORKERS, 0)
+            raw_qk_count = pl.max((t_dim - raw_qk_task + raw_stride - 1) // raw_stride, 0)
             raw_kv_l1 = pl.create_tile([QK_TRANSFER_SLOTS * ATTN_K_TILE, HEAD_DIM], dtype=pl.BF16, target_memory=pl.MemorySpace.Mat)
             for raw_qk_tick in pl.range(raw_qk_count + QK_PRE_LAUNCH):
                 if raw_qk_tick < raw_qk_count:
-                    raw_qk_t = raw_qk_task + raw_qk_tick * RAW_WORKERS
+                    raw_qk_t = raw_qk_task + raw_qk_tick * raw_stride
                     raw_qk_slot = raw_qk_task * QK_TRANSFER_SLOTS + raw_qk_tick % QK_TRANSFER_SLOTS
                     raw_qk_row = raw_qk_slot * H
                     raw_qk_request = raw_qk_t // S
@@ -325,7 +326,7 @@ def sparse_attn_hca(
                     pl.system.sync_set(QK_SCORE_READY_EVENT, pipe=pl.PipeType.FIX, ffts_mode=2, core_type=pl.KernelType.AIC)
                 if raw_qk_tick >= QK_PRE_LAUNCH:
                     raw_pv_item = raw_qk_tick - QK_PRE_LAUNCH
-                    raw_pv_t = raw_qk_task + raw_pv_item * RAW_WORKERS
+                    raw_pv_t = raw_qk_task + raw_pv_item * raw_stride
                     raw_pv_slot = raw_qk_task * QK_TRANSFER_SLOTS + raw_pv_item % QK_TRANSFER_SLOTS
                     pl.system.sync_wait(QK_PROB_READY_EVENT, pipe=pl.PipeType.MTE2, core_type=pl.KernelType.AIC)
                     raw_pv_probability = pl.load(
@@ -341,7 +342,7 @@ def sparse_attn_hca(
                 raw_qk_head = raw_qk_aiv * (H // 2)
                 raw_qk_reduce_tmp = pl.create_tile([H // 2, ATTN_K_TILE], dtype=pl.FP32, target_memory=pl.MemorySpace.Vec)
                 for raw_qk_item in pl.range(raw_qk_count):
-                    raw_qk_t = raw_qk_task + raw_qk_item * RAW_WORKERS
+                    raw_qk_t = raw_qk_task + raw_qk_item * raw_stride
                     raw_qk_slot = raw_qk_task * QK_TRANSFER_SLOTS + raw_qk_item % QK_TRANSFER_SLOTS
                     raw_qk_row = raw_qk_slot * H + raw_qk_head
                     pl.system.sync_wait(QK_SCORE_READY_EVENT, pipe=pl.PipeType.MTE2, core_type=pl.KernelType.AIV)
@@ -409,20 +410,22 @@ def sparse_attn_hca(
         mi_transfer = pl.create_tensor([transfer_heads, 1], dtype=pl.FP32)
         li_transfer = pl.create_tensor([transfer_heads, 1], dtype=pl.FP32)
         ffts_workspace = pl.create_tensor([256], dtype=pl.INT64)
+        cmp_qk_workers = pl.min(NUM_QK_CORES, pl.system.available_cluster_count())
         with pl.spmd(
-            NUM_QK_CORES,
+            cmp_qk_workers,
             name_hint="hca_cmp_qk_pv",
             deps=[cmp_gather_tid],
             allow_early_resolve=True,
             sync_start=True,
         ) as cmp_qk_tid:
             qk_core = pl.tile.get_block_idx()
+            qk_workers = pl.tile.get_block_num()
             pl.system.set_ffts(ffts_workspace)
             if cmp_work_count == 1:
-                fast_count = pl.max((t_dim - qk_core + NUM_QK_CORES - 1) // NUM_QK_CORES, 0)
+                fast_count = pl.max((t_dim - qk_core + qk_workers - 1) // qk_workers, 0)
                 for fast_tick in pl.range(fast_count + CMP_QUERY_LOOKAHEAD):
                     if fast_tick < fast_count:
-                        fast_t = qk_core + fast_tick * NUM_QK_CORES
+                        fast_t = qk_core + fast_tick * qk_workers
                         fast_request = fast_t // S
                         fast_position = pl.max(pl.read(position_ids, [fast_t]), -1)
                         fast_length = pl.max(pl.read(kv_seq_lens, [fast_request]), 0)
@@ -441,7 +444,7 @@ def sparse_attn_hca(
                                 pl.system.sync_set(QK_SCORE_READY_EVENT, pipe=pl.PipeType.FIX, ffts_mode=2, core_type=pl.KernelType.AIC)
                     if fast_tick >= CMP_QUERY_LOOKAHEAD:
                         fast_pv_item = fast_tick - CMP_QUERY_LOOKAHEAD
-                        fast_pv_t = qk_core + fast_pv_item * NUM_QK_CORES
+                        fast_pv_t = qk_core + fast_pv_item * qk_workers
                         fast_pv_request = fast_pv_t // S
                         fast_pv_position = pl.max(pl.read(position_ids, [fast_pv_t]), -1)
                         fast_pv_length = pl.max(pl.read(kv_seq_lens, [fast_pv_request]), 0)
@@ -464,7 +467,7 @@ def sparse_attn_hca(
                     fast_head = fast_aiv * (H // 2)
                     fast_tmp = pl.create_tile([H // 2, CMP_ATTN_K_TILE], dtype=pl.FP32, target_memory=pl.MemorySpace.Vec)
                     for fast_item in pl.range(fast_count):
-                        fast_vec_t = qk_core + fast_item * NUM_QK_CORES
+                        fast_vec_t = qk_core + fast_item * qk_workers
                         fast_vec_request = fast_vec_t // S
                         fast_vec_position = pl.max(pl.read(position_ids, [fast_vec_t]), -1)
                         fast_vec_length = pl.max(pl.read(kv_seq_lens, [fast_vec_request]), 0)
@@ -508,7 +511,7 @@ def sparse_attn_hca(
                             pl.store(fast_neutral_o, [fast_vec_t * H + fast_head, 0], cmp_partial_o)
                             pl.store(fast_neutral_o, [fast_vec_t * H + fast_head, HEAD_DIM // 2], cmp_partial_o)
             else:
-                for qk_t in pl.range(qk_core, t_dim, NUM_QK_CORES):
+                for qk_t in pl.range(qk_core, t_dim, qk_workers):
                     qk_request = qk_t // S
                     qk_position = pl.max(pl.read(position_ids, [qk_t]), -1)
                     qk_kv_len = pl.max(pl.read(kv_seq_lens, [qk_request]), 0)

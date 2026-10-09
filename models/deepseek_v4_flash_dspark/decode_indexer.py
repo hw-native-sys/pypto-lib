@@ -517,8 +517,9 @@ def indexer_score_topk_forest(
                                 pl.store(buf_empty_pairs, [buf_half_slot, 0], pair_arena)
         score_tid = buffered_leaf_tid
     else:
+        score_workers = pl.min(TOPK_SCORE_WORKERS, pl.system.available_cluster_count())
         with pl.spmd(
-            TOPK_SCORE_WORKERS,
+            score_workers,
             name_hint="indexer_score_topk_leaf",
             deps=[qh_quant_tid, weights_tid, cache_write_tid],
             allow_early_resolve=True,
@@ -533,7 +534,7 @@ def indexer_score_topk_forest(
                 max_cache_len = pl.max(max_cache_len, batch_cache_len)
             max_leaves = pl.max((pl.min(max_cache_len, TOPK_MAX_CANDIDATES) + TOPK_CANDIDATES_PER_LEAF - 1) // TOPK_CANDIDATES_PER_LEAF, 1)
             single_leaf = pl.cast(max_leaves == 1, pl.INDEX)
-            for item in pl.range(worker, query_count // SCORE_QUERY_TILE * max_leaves, TOPK_SCORE_WORKERS):
+            for item in pl.range(worker, query_count // SCORE_QUERY_TILE * max_leaves, score_workers):
                 query = (item // max_leaves) * SCORE_QUERY_TILE
                 leaf = item % max_leaves
                 batch_idx = query // S
