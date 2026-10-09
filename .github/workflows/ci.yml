@@ -237,7 +237,13 @@ jobs:
               echo "::endgroup::"
               continue
             fi
-            if ! python "$f" -p ${{ matrix.platform }}; then
+            run_env=()
+            # This TP2 fused projection can exceed the default 20 s no-progress
+            # watchdog on the shared x86 simulator runner.
+            if [ "$f" = "models/deepseek_v4_flash_dspark/lm_head.py" ]; then
+              run_env=(SIMPLER_SCHEDULER_TIMEOUT_MS=120000)
+            fi
+            if ! env "${run_env[@]}" python "$f" -p ${{ matrix.platform }}; then
               failed+=("$f")
               echo "::error file=${f}::FAIL"
             fi
