@@ -96,6 +96,8 @@ TOPK_QUERY_WORKERS = 48  # Top-K query-merge workers
 TOPK_ARENA_ROWS = T_PAD * TOPK_ROWS_PER_QUERY
 TOPK_SCORE_WORKERS = 24  # Top-K score workers
 SCORE_TILE = 256
+STREAM_TILE = 1024  # Contiguous candidates per two-slot transfer.
+STREAM_PANEL_TILE = 64  # M384 QK and the preceding reduction fit L0C together.
 BUFFERED_SCORE_TILE = 768
 BUFFERED_SCORE_LANE_TILE = BUFFERED_SCORE_TILE // 2
 BUFFERED_SCORE_SCALE = 1024.0
@@ -108,6 +110,9 @@ SCORE_LANE_ROWS = SCORE_TILE // 2
 # B * S, so an even S pairs for every batch size; an odd S scores one token at
 # a time and the block-diagonal weight degenerates to a single row.
 SCORE_QUERY_TILE = 2 if S % 2 == 0 else 1
+STREAM_QUERY_TILE = 6 if S == 6 else 2
+STREAM_ENABLED = int(TP == 1 and S == 6)
+STREAM_COEF_ROWS = (T_PAD + STREAM_QUERY_TILE - 1) // STREAM_QUERY_TILE * MM_ROW_TILE
 SCORE_ARENA_ROWS = max(T_PAD, TOPK_SCORE_WORKERS * SCORE_QUERY_TILE * 2)
 # Cube score reduction. FIXPIPE drains the INT32 QK accumulator into an FP16 Mat
 # tile, applying ReLU on the accumulator and this dequantization scale on the way
@@ -208,6 +213,7 @@ def indexer_topk_query_merge_one(
     pair_arena: pl.Tensor[[TOPK_ARENA_ROWS, TOPK_PAIR_WIDTH], pl.FP32],
     topk_scores: pl.Tensor[[T_DYN, IDX_TOPK], pl.FP32],
     topk_indices: pl.Tensor[[T_DYN, IDX_TOPK], pl.INT32],
+    roots_per_leaf: pl.constexpr,
 ):
     """Merge half-leaf roots and materialize one query's Top-512."""
     batch_idx = query // S
@@ -217,7 +223,7 @@ def indexer_topk_query_merge_one(
     visible_count = pl.min(cache_bound, TOPK_MAX_CANDIDATES)
     if visible_count > 0:
         leaf_count = (visible_count + TOPK_CANDIDATES_PER_LEAF - 1) // TOPK_CANDIDATES_PER_LEAF
-        half_count = leaf_count * 2
+        half_count = leaf_count * roots_per_leaf
         arena_base = query * TOPK_ROWS_PER_QUERY
         for child in pl.range(1, half_count):
             merge2_top512_pairs(pair_arena, arena_base, arena_base + child, arena_base)
@@ -246,6 +252,7 @@ def indexer_topk_query_merge(
     pair_arena: pl.Tensor[[TOPK_ARENA_ROWS, TOPK_PAIR_WIDTH], pl.FP32],
     topk_scores: pl.Tensor[[T_DYN, IDX_TOPK], pl.FP32],
     topk_indices: pl.Tensor[[T_DYN, IDX_TOPK], pl.INT32],
+    roots_per_leaf: pl.constexpr,
 ):
     """Merge query roots on one persistent worker per physical AIV."""
     worker = pl.tile.get_block_idx()
@@ -258,6 +265,7 @@ def indexer_topk_query_merge(
             pair_arena,
             topk_scores,
             topk_indices,
+            roots_per_leaf,
         )
 
 
@@ -349,6 +357,157 @@ def indexer_topk_single_leaf_publish(
 
 
 @pl.jit.inline(auto_scope=False)
+def indexer_score_topk_stream(
+    qr_hadamard_i8: pl.Tensor[[T_PAD * IDX_N_HEADS, IDX_HEAD_DIM], pl.INT8],
+    score_coefficient: pl.Tensor[[STREAM_COEF_ROWS, IDX_N_HEADS * STREAM_QUERY_TILE], pl.FP16],
+    idx_kv_cache: pl.Tensor[[IDX_CACHE_BLOCK_NUM_DYN, BLOCK_SIZE, 1, IDX_HEAD_DIM], pl.INT8],
+    idx_kv_scale: pl.Tensor[[IDX_CACHE_BLOCK_NUM_DYN, BLOCK_SIZE, 1, 1], pl.FP32],
+    idx_block_table: pl.Tensor[[B_DYN, IDX_MAX_BLOCKS], pl.INT32],
+    position_ids: pl.Tensor[[T_DYN], pl.INT32],
+    kv_seq_lens: pl.Tensor[[B_DYN], pl.INT32],
+    pair_arena: pl.Tensor[[TOPK_ARENA_ROWS, TOPK_PAIR_WIDTH], pl.FP32],
+    qh_quant_tid: pl.Scalar[pl.TASK_ID],
+    weights_tid: pl.Scalar[pl.TASK_ID],
+    cache_write_tid: pl.Scalar[pl.TASK_ID],
+):
+    """Stream contiguous score panels into one UB Top-K root per query/leaf."""
+    b_dim = pl.tensor.dim(idx_block_table, 0)
+    cache_rows = pl.tensor.dim(idx_kv_cache, 0) * BLOCK_SIZE
+    table_len = b_dim * IDX_MAX_BLOCKS
+    kv_cache_i8_flat = pl.reshape(idx_kv_cache, [cache_rows, IDX_HEAD_DIM])
+    kv_scale_row = pl.reshape(idx_kv_scale, [1, cache_rows])
+    idx_block_table_flat = pl.reshape(idx_block_table, [table_len])
+    transfer = pl.create_tensor(
+        [TOPK_SCORE_WORKERS * 2 * STREAM_QUERY_TILE, STREAM_TILE], dtype=pl.FP32
+    )
+    ffts = pl.create_tensor([256], dtype=pl.INT64)
+    with pl.spmd(
+        TOPK_SCORE_WORKERS, name_hint="indexer_score_topk_stream",
+        deps=[qh_quant_tid, weights_tid, cache_write_tid], allow_early_resolve=True,
+    ) as stream_tid:
+        worker = pl.tile.get_block_idx()
+        query_count = pl.tensor.dim(position_ids, 0)
+        max_cache_len = 0
+        for batch in pl.range(query_count // S):
+            max_cache_len = pl.max(max_cache_len, pl.read(kv_seq_lens, [batch]) // COMPRESS_RATIO)
+        max_leaves = pl.max((pl.min(max_cache_len, TOPK_MAX_CANDIDATES) + TOPK_CANDIDATES_PER_LEAF - 1) // TOPK_CANDIDATES_PER_LEAF, 1)
+        pl.system.set_ffts(ffts)
+        for item in pl.range(worker, query_count // STREAM_QUERY_TILE * max_leaves, TOPK_SCORE_WORKERS):
+            query = item // max_leaves * STREAM_QUERY_TILE
+            leaf = item % max_leaves
+            batch = query // S
+            cache_len = pl.read(kv_seq_lens, [batch]) // COMPRESS_RATIO
+            position = pl.read(position_ids, [query + STREAM_QUERY_TILE - 1])
+            visible = pl.max(pl.min(pl.min(cache_len, (position + 1) // COMPRESS_RATIO), TOPK_MAX_CANDIDATES), 0)
+            begin = leaf * TOPK_CANDIDATES_PER_LEAF
+            if begin < visible:
+                valid = pl.min(visible - begin, TOPK_CANDIDATES_PER_LEAF)
+                steps = (valid + STREAM_TILE - 1) // STREAM_TILE
+                query_l1 = pl.tile.load(qr_hadamard_i8, [query * IDX_N_HEADS, 0], [STREAM_QUERY_TILE * IDX_N_HEADS, IDX_HEAD_DIM], target_memory=pl.Mem.Mat)
+                query_left = pl.tile.move(query_l1, target_memory=pl.Mem.Left)
+                coef_l1 = pl.tile.load(score_coefficient, [query // STREAM_QUERY_TILE * MM_ROW_TILE, 0], [MM_ROW_TILE, STREAM_QUERY_TILE * IDX_N_HEADS], target_memory=pl.Mem.Mat)
+                coef_left = pl.tile.move(coef_l1, target_memory=pl.Mem.Left)
+                for step in pl.range(steps):
+                    if step >= 2:
+                        pl.system.sync_wait(SCORE_CONSUMED_EVENT, pipe=pl.PipeType.MTE2, core_type=pl.KernelType.AIC)
+                    transfer_row = (worker * 2 + step % 2) * STREAM_QUERY_TILE
+                    # Keep the two Key slots live independently of Score L1.
+                    # Stage QK(i) before reducing Score(i-1).
+                    key_pool = pl.tile.create([2 * STREAM_PANEL_TILE, IDX_HEAD_DIM], pl.INT8, target_memory=pl.Mem.Mat)
+                    previous_score = pl.tile.create([STREAM_QUERY_TILE * IDX_N_HEADS, STREAM_PANEL_TILE], pl.FP16, target_memory=pl.Mem.Mat)
+                    for page in pl.unroll(STREAM_PANEL_TILE // BLOCK_SIZE):
+                        logical = pl.min(begin + step * STREAM_TILE + page * BLOCK_SIZE, (visible - 1) // BLOCK_SIZE * BLOCK_SIZE)
+                        block = pl.cast(pl.read(idx_block_table_flat, [batch * IDX_MAX_BLOCKS + logical // BLOCK_SIZE]), pl.INDEX)
+                        key_pool = pl.tile.gather_row(key_pool, kv_cache_i8_flat, [page * BLOCK_SIZE, 0], [block * BLOCK_SIZE, 0], [BLOCK_SIZE, IDX_HEAD_DIM])
+                    for panel in pl.unroll(STREAM_TILE // STREAM_PANEL_TILE):
+                        key = pl.tile.extract(pl.tile.transpose_view(key_pool), 0, panel % 2 * STREAM_PANEL_TILE, [IDX_HEAD_DIM, STREAM_PANEL_TILE], target_memory=pl.Mem.Right)
+                        if panel + 1 < STREAM_TILE // STREAM_PANEL_TILE:
+                            for page in pl.unroll(STREAM_PANEL_TILE // BLOCK_SIZE):
+                                logical = pl.min(begin + step * STREAM_TILE + (panel + 1) * STREAM_PANEL_TILE + page * BLOCK_SIZE, (visible - 1) // BLOCK_SIZE * BLOCK_SIZE)
+                                block = pl.cast(pl.read(idx_block_table_flat, [batch * IDX_MAX_BLOCKS + logical // BLOCK_SIZE]), pl.INDEX)
+                                key_pool = pl.tile.gather_row(key_pool, kv_cache_i8_flat, [(panel + 1) % 2 * STREAM_PANEL_TILE + page * BLOCK_SIZE, 0], [block * BLOCK_SIZE, 0], [BLOCK_SIZE, IDX_HEAD_DIM])
+                        current_score = pl.tile.create([STREAM_QUERY_TILE * IDX_N_HEADS, STREAM_PANEL_TILE], pl.FP16, target_memory=pl.Mem.Mat)
+                        if panel > 0:
+                            previous_right = pl.tile.move(previous_score, target_memory=pl.Mem.Right)
+                            qk = pl.tile.matmul(query_left, key)
+                            reduced = pl.tile.matmul(coef_left, previous_right)
+                            current_score = pl.tile.assemble(current_score, qk, [0, 0], pre_quant=SCORE_FIXPIPE_SCALE, pre_relu=True)
+                            pl.tile.store(pl.tile.set_validshape(reduced, STREAM_QUERY_TILE, STREAM_PANEL_TILE), [transfer_row, (panel - 1) * STREAM_PANEL_TILE], transfer)
+                        else:
+                            qk = pl.tile.matmul(query_left, key)
+                            current_score = pl.tile.assemble(current_score, qk, [0, 0], pre_quant=SCORE_FIXPIPE_SCALE, pre_relu=True)
+                        previous_score = current_score
+                    last_right = pl.tile.move(previous_score, target_memory=pl.Mem.Right)
+                    last_reduced = pl.tile.matmul(coef_left, last_right)
+                    pl.tile.store(pl.tile.set_validshape(last_reduced, STREAM_QUERY_TILE, STREAM_PANEL_TILE), [transfer_row, STREAM_TILE - STREAM_PANEL_TILE], transfer)
+                    pl.system.sync_set(SCORE_READY_EVENT, pipe=pl.PipeType.FIX, ffts_mode=2, core_type=pl.KernelType.AIC)
+                for drain in pl.range(pl.min(steps, 2)):
+                    pl.system.sync_wait(SCORE_CONSUMED_EVENT, pipe=pl.PipeType.MTE2, core_type=pl.KernelType.AIC)
+
+        for lane in pl.split_aiv(2, mode=pl.SplitMode.NONE):
+            pl.system.set_ffts(ffts)
+            for item in pl.range(worker, query_count // STREAM_QUERY_TILE * max_leaves, TOPK_SCORE_WORKERS):
+                query = item // max_leaves * STREAM_QUERY_TILE
+                leaf = item % max_leaves
+                batch = query // S
+                cache_len = pl.read(kv_seq_lens, [batch]) // COMPRESS_RATIO
+                last_position = pl.read(position_ids, [query + STREAM_QUERY_TILE - 1])
+                visible = pl.max(pl.min(pl.min(cache_len, (last_position + 1) // COMPRESS_RATIO), TOPK_MAX_CANDIDATES), 0)
+                begin = leaf * TOPK_CANDIDATES_PER_LEAF
+                if begin < visible:
+                    valid = pl.min(visible - begin, TOPK_CANDIDATES_PER_LEAF)
+                    steps = (valid + STREAM_TILE - 1) // STREAM_TILE
+                    root = pl.tile.full([STREAM_QUERY_TILE // 2, TOPK_PAIR_WIDTH], pl.FP32, value=FP32_NEG_INF)
+                    segments = pl.tile.full([STREAM_QUERY_TILE, STREAM_TILE], pl.FP32, value=FP32_NEG_INF)
+                    for step in pl.range(steps):
+                        scale = pl.tile.create([1, STREAM_TILE], pl.FP32, target_memory=pl.Mem.Vec)
+                        for page in pl.unroll(STREAM_TILE // BLOCK_SIZE):
+                            logical = pl.min(begin + step * STREAM_TILE + page * BLOCK_SIZE, (visible - 1) // BLOCK_SIZE * BLOCK_SIZE)
+                            block = pl.cast(pl.read(idx_block_table_flat, [batch * IDX_MAX_BLOCKS + logical // BLOCK_SIZE]), pl.INDEX)
+                            scale = pl.tile.gather_row(scale, kv_scale_row, [0, page * BLOCK_SIZE], [0, block * BLOCK_SIZE], [1, BLOCK_SIZE])
+                        transfer_row = (worker * 2 + step % 2) * STREAM_QUERY_TILE + lane * (STREAM_QUERY_TILE // 2)
+                        pl.system.sync_wait(SCORE_READY_EVENT, pipe=pl.PipeType.MTE2, core_type=pl.KernelType.AIV)
+                        raw = pl.tile.load(transfer, [transfer_row, 0], [STREAM_QUERY_TILE // 2, STREAM_TILE])
+                        pl.system.sync_set(SCORE_CONSUMED_EVENT, pipe=pl.PipeType.MTE2, ffts_mode=2, core_type=pl.KernelType.AIV)
+                        for local in pl.unroll(STREAM_QUERY_TILE // 2):
+                            raw_row = pl.tile.extract(raw, local, 0, [1, STREAM_TILE], target_memory=pl.Mem.Vec)
+                            scaled = pl.tile.mul(raw_row, scale)
+                            segments = pl.tile.assemble(segments, scaled, [local * 2 + step % 2, 0])
+                        # Drain an odd final macro-step and mask each query's
+                        # causal tail before sorting the contiguous UB segment.
+                        if step % 2 == 1 or step + 1 == steps:
+                            segment_begin = begin + step // 2 * (2 * STREAM_TILE)
+                            for local in pl.unroll(STREAM_QUERY_TILE // 2):
+                                position = pl.read(position_ids, [query + lane * (STREAM_QUERY_TILE // 2) + local])
+                                query_visible = pl.max(pl.min(pl.min(cache_len, (position + 1) // COMPRESS_RATIO), TOPK_MAX_CANDIDATES), 0)
+                                segment_valid = pl.max(pl.min(query_visible - segment_begin, (step % 2 + 1) * STREAM_TILE), 0)
+                                if segment_valid > 0:
+                                    segment_rows = pl.tile.reshape(segments, [STREAM_QUERY_TILE // 2, 2 * STREAM_TILE])
+                                    data = pl.tile.extract(segment_rows, local, 0, [1, 2 * STREAM_TILE], target_memory=pl.Mem.Vec)
+                                    data = pl.tile.set_validshape(data, 1, segment_valid)
+                                    data = pl.tile.fillpad(data, pad_value=pl.PadValue.min)
+                                    data = pl.maximum(data, FP32_NEG_INF)
+                                    indices = pl.tile.add(pl.tile.arange(0, [1, 2 * STREAM_TILE], dtype=pl.INT32), pl.cast(segment_begin, pl.INT32))
+                                    pairs = pl.tile.sort32(data, pl.tile.reinterpret_view(indices, pl.UINT32))
+                                    pairs = pl.tile.mrgsort(pairs, block_len=64)
+                                    pairs = pl.tile.mrgsort(pairs, block_len=256)
+                                    pairs = pl.tile.mrgsort(pairs, block_len=1024)
+                                    new_root = pl.tile.extract(pairs, 0, 0, [1, TOPK_PAIR_WIDTH], target_memory=pl.Mem.Vec)
+                                    if step < 2:
+                                        root = pl.tile.assemble(root, new_root, [local, 0])
+                                    else:
+                                        tmp = pl.tile.create([1, 2 * TOPK_PAIR_WIDTH], pl.FP32)
+                                        old_root = pl.tile.extract(root, local, 0, [1, TOPK_PAIR_WIDTH], target_memory=pl.Mem.Vec)
+                                        merged = pl.tile.mrgsort(new_root, old_root, tmp=tmp)
+                                        next_root = pl.tile.extract(merged, 0, 0, [1, TOPK_PAIR_WIDTH], target_memory=pl.Mem.Vec)
+                                        root = pl.tile.assemble(root, next_root, [local, 0])
+                    for local in pl.unroll(STREAM_QUERY_TILE // 2):
+                        final_root = pl.tile.extract(root, local, 0, [1, TOPK_PAIR_WIDTH], target_memory=pl.Mem.Vec)
+                        pl.tile.store(final_root, [(query + lane * (STREAM_QUERY_TILE // 2) + local) * TOPK_ROWS_PER_QUERY + leaf, 0], pair_arena)
+    return stream_tid
+
+
+@pl.jit.inline(auto_scope=False)
 def indexer_score_topk_forest(
     qr_hadamard_i8: pl.Tensor[[T_PAD * IDX_N_HEADS, IDX_HEAD_DIM], pl.INT8],
     qr_hadamard_scale_dq: pl.Tensor[[T_PAD * IDX_N_HEADS, 1], pl.FP32],
@@ -356,6 +515,7 @@ def indexer_score_topk_forest(
     score_coefficient: pl.Tensor[
         [T_PAD // SCORE_QUERY_TILE * MM_ROW_TILE, IDX_N_HEADS * SCORE_QUERY_TILE], pl.FP16
     ],
+    stream_coefficient: pl.Tensor[[STREAM_COEF_ROWS, IDX_N_HEADS * STREAM_QUERY_TILE], pl.FP16],
     idx_kv_cache: pl.Tensor[[IDX_CACHE_BLOCK_NUM_DYN, BLOCK_SIZE, 1, IDX_HEAD_DIM], pl.INT8],
     idx_kv_scale: pl.Tensor[[IDX_CACHE_BLOCK_NUM_DYN, BLOCK_SIZE, 1, 1], pl.FP32],
     idx_block_table: pl.Tensor[[B_DYN, IDX_MAX_BLOCKS], pl.INT32],
@@ -367,7 +527,7 @@ def indexer_score_topk_forest(
     weights_tid: pl.Scalar[pl.TASK_ID],
     cache_write_tid: pl.Scalar[pl.TASK_ID],
 ):
-    """Score and select half-leaves, then merge their Top-K rows."""
+    """Score with streamed roots at TP1/S6 long history, otherwise half-leaves."""
     b_dim = pl.tensor.dim(idx_block_table, 0)
     idx_block_num = pl.tensor.dim(idx_kv_cache, 0)
     idx_table_len = b_dim * IDX_MAX_BLOCKS
@@ -395,6 +555,7 @@ def indexer_score_topk_forest(
     large_batch = pl.cast(b_dim >= 64, pl.INDEX)
     long_history = pl.cast(max_topk_cache_len >= 32768, pl.INDEX)
     buffered_score = large_batch * long_history
+    stream_score = pl.cast(b_dim < 64, pl.INDEX) * long_history * STREAM_ENABLED
     if buffered_score > 0:
         buf_score_transfer = pl.create_tensor([TOPK_SCORE_WORKERS * 2 * IDX_N_HEADS, BUFFERED_SCORE_TILE], dtype=pl.FP16)
         buf_score_ffts = pl.create_tensor([256], dtype=pl.INT64)
@@ -516,6 +677,12 @@ def indexer_score_topk_forest(
                                 buf_empty_pairs = pl.tile.full([1, TOPK_PAIR_WIDTH], dtype=pl.FP32, value=FP32_NEG_INF)
                                 pl.store(buf_empty_pairs, [buf_half_slot, 0], pair_arena)
         score_tid = buffered_leaf_tid
+    elif stream_score > 0:
+        score_tid = indexer_score_topk_stream(
+            qr_hadamard_i8, stream_coefficient, idx_kv_cache, idx_kv_scale,
+            idx_block_table, position_ids, kv_seq_lens, pair_arena,
+            qh_quant_tid, weights_tid, cache_write_tid,
+        )
     else:
         with pl.spmd(
             TOPK_SCORE_WORKERS,
@@ -696,9 +863,12 @@ def indexer_score_topk_forest(
         if max_topk_cache_len <= TOPK_CANDIDATES_PER_LEAF:
             with pl.spmd(TOPK_QUERY_WORKERS, name_hint="indexer_topk_single_leaf_publish", deps=[score_tid], allow_early_resolve=True):
                 indexer_topk_single_leaf_publish(position_ids, kv_seq_lens, score_arena, topk_scores, topk_idxs)
+        elif stream_score > 0:
+            with pl.spmd(TOPK_QUERY_WORKERS, name_hint="indexer_topk_query_merge", deps=[score_tid], allow_early_resolve=True):
+                indexer_topk_query_merge(position_ids, kv_seq_lens, pair_arena, topk_scores, topk_idxs, 1)
         else:
             with pl.spmd(TOPK_QUERY_WORKERS, name_hint="indexer_topk_query_merge", deps=[score_tid], allow_early_resolve=True):
-                indexer_topk_query_merge(position_ids, kv_seq_lens, pair_arena, topk_scores, topk_idxs)
+                indexer_topk_query_merge(position_ids, kv_seq_lens, pair_arena, topk_scores, topk_idxs, 2)
 
     return topk_scores, topk_idxs, score_tid
 
@@ -918,6 +1088,7 @@ def indexer_weights_score(
         [T_PAD // SCORE_QUERY_TILE * MM_ROW_TILE, IDX_N_HEADS * SCORE_QUERY_TILE],
         dtype=pl.FP16,
     )
+    stream_coefficient = pl.create_tensor([STREAM_COEF_ROWS, IDX_N_HEADS * STREAM_QUERY_TILE], dtype=pl.FP16)
     with pl.spmd(
         row_blocks,
         name_hint="weights_proj_reduce",
@@ -941,6 +1112,16 @@ def indexer_weights_score(
             )
         w_scaled = pl.tile.muls(w_sum, WEIGHTS_SCALE)
         pl.tile.store(w_scaled, [w_r0, 0], weights)
+        # Stream coefficients are needed only by TP1/S6's long-history path.
+        prepare_stream = 0
+        if STREAM_ENABLED != 0:
+            coef_max_cache = 0
+            coef_batch_count = pl.tensor.dim(kv_seq_lens, 0)
+            for coef_batch in pl.range(coef_batch_count):
+                coef_cache = pl.read(kv_seq_lens, [coef_batch]) // COMPRESS_RATIO
+                coef_max_cache = pl.max(coef_max_cache, coef_cache)
+            prepare_stream = pl.cast(coef_max_cache >= 32768, pl.INDEX)
+            prepare_stream = prepare_stream * pl.cast(coef_batch_count < 64, pl.INDEX)
         # One block-diagonal weight matrix per query pair: token t occupies row t
         # and the head block [t*IDX_N_HEADS, (t+1)*IDX_N_HEADS), everything else
         # zero, so a single matmul reduces both tokens of the pair.
@@ -980,9 +1161,17 @@ def indexer_weights_score(
                     [w_pair_row + w_token, w_token * IDX_N_HEADS],
                     score_coefficient,
                 )
+                if prepare_stream > 0:
+                    if w_query < pl.tensor.dim(x, 0):
+                        stream_row = pl.tile.full([1, IDX_N_HEADS * STREAM_QUERY_TILE], dtype=pl.FP16, value=0.0)
+                        pl.tile.store(stream_row, [w_query // STREAM_QUERY_TILE * MM_ROW_TILE + w_query % STREAM_QUERY_TILE, 0], stream_coefficient)
+                        pl.tile.store(coefficient_row, [w_query // STREAM_QUERY_TILE * MM_ROW_TILE + w_query % STREAM_QUERY_TILE, (w_query % STREAM_QUERY_TILE) * IDX_N_HEADS], stream_coefficient)
+                        if w_query % STREAM_QUERY_TILE == 0:
+                            stream_padding = pl.tile.full([MM_ROW_TILE - STREAM_QUERY_TILE, IDX_N_HEADS * STREAM_QUERY_TILE], dtype=pl.FP16, value=0.0)
+                            pl.tile.store(stream_padding, [w_query // STREAM_QUERY_TILE * MM_ROW_TILE + STREAM_QUERY_TILE, 0], stream_coefficient)
 
     topk_scores, topk_idxs, leaf_tid = indexer_score_topk_forest(
-        qr_hadamard_i8, qr_hadamard_scale_dq, weights, score_coefficient,
+        qr_hadamard_i8, qr_hadamard_scale_dq, weights, score_coefficient, stream_coefficient,
         idx_kv_cache, idx_kv_scale, idx_block_table,
         position_ids, kv_seq_lens,
         topk_scores, topk_idxs,
