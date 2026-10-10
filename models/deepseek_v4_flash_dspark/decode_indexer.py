@@ -1111,7 +1111,6 @@ def indexer_weights_score(
                 ),
             )
         w_scaled = pl.tile.muls(w_sum, WEIGHTS_SCALE)
-        pl.tile.store(w_scaled, [w_r0, 0], weights)
         # Stream coefficients are needed only by TP1/S6's long-history path.
         prepare_stream = 0
         if STREAM_ENABLED != 0:
@@ -1122,19 +1121,22 @@ def indexer_weights_score(
                 coef_max_cache = pl.max(coef_max_cache, coef_cache)
             prepare_stream = pl.cast(coef_max_cache >= 32768, pl.INDEX)
             prepare_stream = prepare_stream * pl.cast(coef_batch_count < 64, pl.INDEX)
+        if prepare_stream == 0:
+            pl.tile.store(w_scaled, [w_r0, 0], weights)
         # One block-diagonal weight matrix per query pair: token t occupies row t
         # and the head block [t*IDX_N_HEADS, (t+1)*IDX_N_HEADS), everything else
         # zero, so a single matmul reduces both tokens of the pair.
         for w_pair in pl.unroll(MM_ROW_TILE // SCORE_QUERY_TILE):
             w_pair_row = (w_r0 // SCORE_QUERY_TILE + w_pair) * MM_ROW_TILE
-            pl.tile.store(
-                pl.tile.full(
-                    [MM_ROW_TILE, IDX_N_HEADS * SCORE_QUERY_TILE],
-                    dtype=pl.FP16, value=0.0,
-                ),
-                [w_pair_row, 0],
-                score_coefficient,
-            )
+            if prepare_stream == 0:
+                pl.tile.store(
+                    pl.tile.full(
+                        [MM_ROW_TILE, IDX_N_HEADS * SCORE_QUERY_TILE],
+                        dtype=pl.FP16, value=0.0,
+                    ),
+                    [w_pair_row, 0],
+                    score_coefficient,
+                )
             for w_token in pl.unroll(SCORE_QUERY_TILE):
                 w_member = w_pair * SCORE_QUERY_TILE + w_token
                 w_query = w_r0 + w_member
@@ -1156,11 +1158,12 @@ def indexer_weights_score(
                     target_type=pl.FP16,
                     mode="rint",
                 )
-                pl.tile.store(
-                    coefficient_row,
-                    [w_pair_row + w_token, w_token * IDX_N_HEADS],
-                    score_coefficient,
-                )
+                if prepare_stream == 0:
+                    pl.tile.store(
+                        coefficient_row,
+                        [w_pair_row + w_token, w_token * IDX_N_HEADS],
+                        score_coefficient,
+                    )
                 if prepare_stream > 0:
                     if w_query < pl.tensor.dim(x, 0):
                         stream_row = pl.tile.full([1, IDX_N_HEADS * STREAM_QUERY_TILE], dtype=pl.FP16, value=0.0)
