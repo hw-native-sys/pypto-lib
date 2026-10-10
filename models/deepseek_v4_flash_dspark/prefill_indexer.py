@@ -88,6 +88,7 @@ ROPE_ROW_TILE = IDX_N_HEADS  # one token owns IDX_N_HEADS contiguous q rows + on
 QH_MM_TILE = 64
 WEIGHTS_TAIL_ROW_TILE = 16
 TOPK_LEAF_TILE = 8192
+TOPK_SHORT_LEAF_TILE = 2048
 TOPK_GROUP_TILE = 2
 TOPK_MAX_LEAVES = (INDEXER_MAX_CANDIDATES + TOPK_LEAF_TILE - 1) // TOPK_LEAF_TILE
 TOPK_GROUPS_PER_QUERY = (TOPK_MAX_LEAVES + TOPK_GROUP_TILE - 1) // TOPK_GROUP_TILE
@@ -99,6 +100,7 @@ TOPK_SCORE_WORKERS = 24
 
 # Four pairwise merge levels cover at most 16 roots.
 assert TOPK_GROUPS_PER_QUERY <= 16
+assert TOPK_SHORT_LEAF_TILE >= IDX_TOPK
 
 
 @pl.jit.inline
@@ -146,19 +148,42 @@ def _topk_leaf(
     output_slot: pl.Scalar[pl.INDEX],
 ) -> None:
     logical_begin_i32 = pl.cast(logical_begin, pl.INT32)
-    leaf_index_ramp = pl.tile.arange(0, [1, TOPK_LEAF_TILE], dtype=pl.INT32)
-    leaf_indices = pl.add(leaf_index_ramp, logical_begin_i32)
-    leaf_scores_raw = pl.load(score_arena, [query, logical_begin], [1, TOPK_LEAF_TILE], valid_shape=[1, valid_count])
-    leaf_scores = pl.tile.fillpad(leaf_scores_raw, pad_value=pl.PadValue.min)
-    leaf_floor = pl.tile.full([1, TOPK_LEAF_TILE], dtype=pl.FP32, value=FP32_NEG_INF)
-    leaf_scores = pl.maximum(leaf_scores, leaf_floor)
-    pairs = pl.tile.sort32(leaf_scores, pl.reinterpret_view(leaf_indices, pl.UINT32))
-    pairs = pl.tile.mrgsort(pairs, block_len=64)
-    pairs = pl.tile.mrgsort(pairs, block_len=256)
-    pairs = pl.tile.mrgsort(pairs, block_len=1024)
-    pairs = pl.tile.mrgsort(pairs, block_len=4096)
-    top_pairs = pl.tile.slice(pairs, [1, TOPK_PAIR_WIDTH], [0, 0])
-    pl.store(top_pairs, [output_slot, 0], pair_arena)
+    if valid_count <= IDX_TOPK:
+        short_index_ramp = pl.tile.arange(0, [1, TOPK_SHORT_LEAF_TILE], dtype=pl.INT32)
+        short_indices = pl.add(short_index_ramp, logical_begin_i32)
+        short_scores_raw = pl.load(
+            score_arena,
+            [query, logical_begin],
+            [1, TOPK_SHORT_LEAF_TILE],
+            valid_shape=[1, valid_count],
+        )
+        short_scores = pl.tile.fillpad(short_scores_raw, pad_value=pl.PadValue.min)
+        short_floor = pl.tile.full([1, TOPK_SHORT_LEAF_TILE], dtype=pl.FP32, value=FP32_NEG_INF)
+        short_scores = pl.maximum(short_scores, short_floor)
+        short_pairs = pl.tile.sort32(short_scores, pl.reinterpret_view(short_indices, pl.UINT32))
+        short_pairs = pl.tile.mrgsort(short_pairs, block_len=64)
+        short_pairs = pl.tile.mrgsort(short_pairs, block_len=256)
+        short_top_pairs = pl.tile.slice(short_pairs, [1, TOPK_PAIR_WIDTH], [0, 0])
+        pl.store(short_top_pairs, [output_slot, 0], pair_arena)
+    else:
+        leaf_index_ramp = pl.tile.arange(0, [1, TOPK_LEAF_TILE], dtype=pl.INT32)
+        leaf_indices = pl.add(leaf_index_ramp, logical_begin_i32)
+        leaf_scores_raw = pl.load(
+            score_arena,
+            [query, logical_begin],
+            [1, TOPK_LEAF_TILE],
+            valid_shape=[1, valid_count],
+        )
+        leaf_scores = pl.tile.fillpad(leaf_scores_raw, pad_value=pl.PadValue.min)
+        leaf_floor = pl.tile.full([1, TOPK_LEAF_TILE], dtype=pl.FP32, value=FP32_NEG_INF)
+        leaf_scores = pl.maximum(leaf_scores, leaf_floor)
+        pairs = pl.tile.sort32(leaf_scores, pl.reinterpret_view(leaf_indices, pl.UINT32))
+        pairs = pl.tile.mrgsort(pairs, block_len=64)
+        pairs = pl.tile.mrgsort(pairs, block_len=256)
+        pairs = pl.tile.mrgsort(pairs, block_len=1024)
+        pairs = pl.tile.mrgsort(pairs, block_len=4096)
+        top_pairs = pl.tile.slice(pairs, [1, TOPK_PAIR_WIDTH], [0, 0])
+        pl.store(top_pairs, [output_slot, 0], pair_arena)
 
 
 @pl.jit.incore
