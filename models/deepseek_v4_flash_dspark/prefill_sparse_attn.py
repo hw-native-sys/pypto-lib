@@ -77,7 +77,10 @@ QK_TRANSFER_SLOTS = QK_PRE_LAUNCH + 1
 QK_SCORE_READY_EVENT = 0
 QK_PROB_READY_EVENT = 1
 QK_PV_READY_EVENT = 2
-GATHER_TOKEN_TILE = 2
+GATHER_TOKEN_TILE = 8
+SPARSE_OPT_GATHER_ROW_TILE = 32
+SPARSE_OPT_CMP_GATHER_ROW_TILE = 16
+SPARSE_OPT_CMP_GATHER_TOKEN_TILE = 32
 BIAS_TOKEN_TILE = 16
 QUANT_TOKEN_TILE = 8
 O_PROJ_PAD_ROWS = 256  # internal physical-tail alignment across Cube, quant and epilogue
@@ -672,7 +675,8 @@ def _sparse_attn_wave(
     q_flat = pl.reshape(q, [t_dim * H, HEAD_DIM])
     attn_sink_col = pl.reshape(attn_sink, [H, 1])
     gather_blocks = PREFILL_QUERY_TILE // GATHER_TOKEN_TILE
-    gather_cmp_blocks = gather_blocks * (PREFILL_ATTN_BLOCKS - 1)
+    gather_cmp_token_blocks = PREFILL_QUERY_TILE // SPARSE_OPT_CMP_GATHER_TOKEN_TILE
+    gather_cmp_blocks = gather_cmp_token_blocks * (PREFILL_ATTN_BLOCKS - 1)
 
     # Stage original-window rows in reverse token-tile order.
     with pl.spmd(
@@ -683,6 +687,23 @@ def _sparse_attn_wave(
         gather_schedule_block = pl.tile.get_block_idx()
         gather_token_block = gather_blocks - 1 - gather_schedule_block
         gather_local_t0 = gather_token_block * GATHER_TOKEN_TILE
+        gather_bias_t0 = query_base + gather_local_t0
+        if gather_bias_t0 < t_dim and gather_bias_t0 < active_rows:
+            gather_bias_rows = pl.min(GATHER_TOKEN_TILE, pl.min(t_dim, active_rows) - gather_bias_t0)
+            gather_bias_win_rows = pl.slice(swa_indices, [GATHER_TOKEN_TILE, WIN], [gather_bias_t0, 0], valid_shape=[gather_bias_rows, WIN])
+            gather_bias_win_idx = pl.cast(gather_bias_win_rows, target_type=pl.FP32)
+            gather_bias_win_flag = pl.minimum(pl.maximum(pl.add(gather_bias_win_idx, 1.0), 0.0), 1.0)
+            gather_bias_win = pl.mul(pl.sub(gather_bias_win_flag, 1.0), -FP32_NEG_INF)
+            sparse_bias[gather_local_t0 : gather_local_t0 + GATHER_TOKEN_TILE, 0:WIN] = gather_bias_win
+            if SPARSE_CMP_BIAS_COLS > 0:
+                gather_bias_cmp_rows = pl.slice(cmp_indices, [GATHER_TOKEN_TILE, SPARSE_CMP_BIAS_COLS], [gather_bias_t0, 0], valid_shape=[gather_bias_rows, SPARSE_CMP_BIAS_COLS])
+                gather_bias_cmp_idx = pl.cast(gather_bias_cmp_rows, target_type=pl.FP32)
+                gather_bias_cmp_flag = pl.minimum(pl.maximum(pl.add(gather_bias_cmp_idx, 1.0), 0.0), 1.0)
+                gather_bias_cmp = pl.mul(pl.sub(gather_bias_cmp_flag, 1.0), -FP32_NEG_INF)
+                sparse_bias[gather_local_t0 : gather_local_t0 + GATHER_TOKEN_TILE, WIN:SPARSE_BIAS_COLS] = gather_bias_cmp
+            if PREFILL_SPARSE_PAD > SPARSE_BIAS_COLS:
+                gather_bias_pad = pl.full([GATHER_TOKEN_TILE, PREFILL_SPARSE_PAD - SPARSE_BIAS_COLS], dtype=pl.FP32, value=FP32_NEG_INF)
+                sparse_bias[gather_local_t0 : gather_local_t0 + GATHER_TOKEN_TILE, SPARSE_BIAS_COLS:PREFILL_SPARSE_PAD] = gather_bias_pad
         for gather_dt in pl.range(GATHER_TOKEN_TILE):
             gather_local_t = gather_local_t0 + gather_dt
             gather_t = query_base + gather_local_t
@@ -693,11 +714,24 @@ def _sparse_attn_wave(
                     if pl.read(valid_block_mask, [gather_t, 0]) > 0:
                         stage = pl.full([PREFILL_ATTN_TILE, HEAD_DIM], dtype=pl.BF16, value=0.0)
                         if request_id >= 0:
-                            for gather_ki in pl.range(PREFILL_ATTN_TILE):
-                                gather_raw = pl.read(swa_indices, [gather_t, gather_ki])
-                                if gather_raw >= 0:
-                                    src = pl.cast(gather_raw, pl.INDEX)
-                                    stage[gather_ki : gather_ki + 1, :] = ori_kv_flat[src : src + 1, :]
+                            gather_ori_indices = pl.load(swa_indices, [gather_t, 0], [1, PREFILL_ATTN_TILE], target_memory=pl.MemorySpace.Vec)
+                            for gather_g0 in pl.range(0, PREFILL_ATTN_TILE, SPARSE_OPT_GATHER_ROW_TILE):
+                                gather_first = pl.tile.read(gather_ori_indices, [0, gather_g0])
+                                gather_contiguous = gather_first >= 0
+                                for gather_ci, (contiguous_iter,) in pl.range(1, SPARSE_OPT_GATHER_ROW_TILE, init_values=(gather_contiguous,)):
+                                    gather_next = pl.tile.read(gather_ori_indices, [0, gather_g0 + gather_ci])
+                                    gather_matches = contiguous_iter and gather_next == gather_first + gather_ci
+                                    gather_contiguous = pl.yield_(gather_matches)
+                                if gather_contiguous:
+                                    src = pl.cast(gather_first, pl.INDEX)
+                                    stage[gather_g0 : gather_g0 + SPARSE_OPT_GATHER_ROW_TILE, :] = ori_kv_flat[src : src + SPARSE_OPT_GATHER_ROW_TILE, :]
+                                else:
+                                    for gather_ci in pl.range(SPARSE_OPT_GATHER_ROW_TILE):
+                                        gather_ki = gather_g0 + gather_ci
+                                        gather_raw = pl.tile.read(gather_ori_indices, [0, gather_ki])
+                                        if gather_raw >= 0:
+                                            src = pl.cast(gather_raw, pl.INDEX)
+                                            stage[gather_ki : gather_ki + 1, :] = ori_kv_flat[src : src + 1, :]
                         sparse_kv[block_base : block_base + PREFILL_ATTN_TILE, :] = stage
 
     with pl.spmd(
@@ -707,11 +741,11 @@ def _sparse_attn_wave(
     ) as gather_cmp_tid:
         gather_block = pl.tile.get_block_idx()
         gather_schedule_block = gather_block // (PREFILL_ATTN_BLOCKS - 1)
-        gather_token_block = gather_blocks - 1 - gather_schedule_block
+        gather_token_block = gather_cmp_token_blocks - 1 - gather_schedule_block
         gather_sb = gather_block - gather_schedule_block * (PREFILL_ATTN_BLOCKS - 1) + 1
-        gather_local_t0 = gather_token_block * GATHER_TOKEN_TILE
+        gather_local_t0 = gather_token_block * SPARSE_OPT_CMP_GATHER_TOKEN_TILE
         gather_k0 = gather_sb * PREFILL_ATTN_TILE
-        for gather_dt in pl.range(GATHER_TOKEN_TILE):
+        for gather_dt in pl.range(SPARSE_OPT_CMP_GATHER_TOKEN_TILE):
             gather_local_t = gather_local_t0 + gather_dt
             gather_t = query_base + gather_local_t
             if gather_t < t_dim:
@@ -722,66 +756,39 @@ def _sparse_attn_wave(
                     if gather_block_valid > 0:
                         stage = pl.full([PREFILL_ATTN_TILE, HEAD_DIM], dtype=pl.BF16, value=0.0)
                         if request_id >= 0:
-                            for gather_ki in pl.range(PREFILL_ATTN_TILE):
-                                gather_cmp_k = gather_k0 + gather_ki - WIN
-                                if gather_cmp_k < IDX_TOPK:
-                                    gather_raw = pl.read(cmp_indices, [gather_t, gather_cmp_k])
-                                    if gather_raw >= 0:
-                                        cmp_slot = gather_raw
-                                        blk_slot = cmp_slot // BLOCK_SIZE
-                                        blk_raw = pl.read(cmp_block_table, [request_id, blk_slot])
-                                        if blk_raw >= 0 and blk_raw < cmp_block_num:
-                                            blk = pl.cast(blk_raw, pl.INDEX)
-                                            src = blk * BLOCK_SIZE + (cmp_slot - blk_slot * BLOCK_SIZE)
-                                            stage[gather_ki : gather_ki + 1, :] = cmp_kv_flat[src : src + 1, :]
+                            gather_cmp_offset = gather_k0 - WIN
+                            gather_cmp_cols = pl.min(PREFILL_ATTN_TILE, IDX_TOPK - gather_cmp_offset)
+                            gather_indices = pl.load(cmp_indices, [gather_t, gather_cmp_offset], [1, PREFILL_ATTN_TILE], valid_shape=[1, gather_cmp_cols], target_memory=pl.MemorySpace.Vec)
+                            for gather_g0 in pl.range(0, PREFILL_ATTN_TILE, SPARSE_OPT_CMP_GATHER_ROW_TILE):
+                                gather_first = pl.tile.read(gather_indices, [0, gather_g0])
+                                gather_page = gather_first // BLOCK_SIZE
+                                gather_intra = gather_first - gather_page * BLOCK_SIZE
+                                gather_contiguous = gather_first >= 0 and gather_g0 + SPARSE_OPT_CMP_GATHER_ROW_TILE <= gather_cmp_cols
+                                gather_contiguous = gather_contiguous and gather_intra + SPARSE_OPT_CMP_GATHER_ROW_TILE <= BLOCK_SIZE
+                                for gather_ci, (contiguous_iter,) in pl.range(1, SPARSE_OPT_CMP_GATHER_ROW_TILE, init_values=(gather_contiguous,)):
+                                    gather_next = pl.tile.read(gather_indices, [0, gather_g0 + gather_ci])
+                                    gather_matches = contiguous_iter and gather_next == gather_first + gather_ci
+                                    gather_contiguous = pl.yield_(gather_matches)
+                                if gather_contiguous:
+                                    blk_raw = pl.read(cmp_block_table, [request_id, gather_page])
+                                    if blk_raw >= 0 and blk_raw < cmp_block_num:
+                                        blk = pl.cast(blk_raw, pl.INDEX)
+                                        src = blk * BLOCK_SIZE + gather_intra
+                                        stage[gather_g0 : gather_g0 + SPARSE_OPT_CMP_GATHER_ROW_TILE, :] = cmp_kv_flat[src : src + SPARSE_OPT_CMP_GATHER_ROW_TILE, :]
+                                else:
+                                    for gather_ci in pl.range(SPARSE_OPT_CMP_GATHER_ROW_TILE):
+                                        gather_ki = gather_g0 + gather_ci
+                                        gather_cmp_k = gather_cmp_offset + gather_ki
+                                        if gather_cmp_k < IDX_TOPK:
+                                            gather_raw = pl.tile.read(gather_indices, [0, gather_ki])
+                                            if gather_raw >= 0:
+                                                blk_slot = gather_raw // BLOCK_SIZE
+                                                blk_raw = pl.read(cmp_block_table, [request_id, blk_slot])
+                                                if blk_raw >= 0 and blk_raw < cmp_block_num:
+                                                    blk = pl.cast(blk_raw, pl.INDEX)
+                                                    src = blk * BLOCK_SIZE + (gather_raw - blk_slot * BLOCK_SIZE)
+                                                    stage[gather_ki : gather_ki + 1, :] = cmp_kv_flat[src : src + 1, :]
                         sparse_kv[block_base : block_base + PREFILL_ATTN_TILE, :] = stage
-
-    # Keep the existing 16-row vectorized bias path inside each query wave.
-    with pl.spmd(
-        PREFILL_QUERY_TILE // BIAS_TOKEN_TILE,
-        name_hint="build_bias",
-        deps=[prior_merge_tid],
-    ) as bias_tid:
-        bias_blk = pl.tile.get_block_idx()
-        bias_local_t0 = bias_blk * BIAS_TOKEN_TILE
-        bias_t0 = query_base + bias_local_t0
-        if bias_t0 < active_rows:
-            bias_rows = pl.min(BIAS_TOKEN_TILE, active_rows - bias_t0)
-            bias_win_rows = pl.slice(
-                swa_indices,
-                [BIAS_TOKEN_TILE, WIN],
-                [bias_t0, 0],
-                valid_shape=[bias_rows, WIN],
-            )
-            bias_win_idx = pl.cast(bias_win_rows, target_type=pl.FP32)
-            bias_win_raw_flag = pl.minimum(pl.maximum(pl.add(bias_win_idx, 1.0), 0.0), 1.0)
-            bias_win = pl.mul(pl.sub(bias_win_raw_flag, 1.0), -FP32_NEG_INF)
-            sparse_bias[bias_local_t0 : bias_local_t0 + BIAS_TOKEN_TILE, 0:WIN] = bias_win
-            if SPARSE_CMP_BIAS_COLS > 0:
-                bias_cmp_rows = pl.slice(
-                    cmp_indices,
-                    [BIAS_TOKEN_TILE, SPARSE_CMP_BIAS_COLS],
-                    [bias_t0, 0],
-                    valid_shape=[bias_rows, SPARSE_CMP_BIAS_COLS],
-                )
-                bias_cmp_idx = pl.cast(bias_cmp_rows, target_type=pl.FP32)
-                bias_cmp_raw_flag = pl.minimum(pl.maximum(pl.add(bias_cmp_idx, 1.0), 0.0), 1.0)
-                bias_cmp = pl.mul(pl.sub(bias_cmp_raw_flag, 1.0), -FP32_NEG_INF)
-                sparse_bias[
-                    bias_local_t0 : bias_local_t0 + BIAS_TOKEN_TILE,
-                    WIN:SPARSE_BIAS_COLS,
-                ] = bias_cmp
-            if PREFILL_SPARSE_PAD > SPARSE_BIAS_COLS:
-                bias_pad_cols = PREFILL_SPARSE_PAD - SPARSE_BIAS_COLS
-                bias_pad = pl.full(
-                    [BIAS_TOKEN_TILE, bias_pad_cols],
-                    dtype=pl.FP32,
-                    value=FP32_NEG_INF,
-                )
-                sparse_bias[
-                    bias_local_t0 : bias_local_t0 + BIAS_TOKEN_TILE,
-                    SPARSE_BIAS_COLS:PREFILL_SPARSE_PAD,
-                ] = bias_pad
 
     # Pipeline K blocks and keep the online-softmax state local to each query.
     transfer_slots = NUM_QK_CORES * QK_TRANSFER_SLOTS
@@ -792,7 +799,7 @@ def _sparse_attn_wave(
     mi_transfer = pl.create_tensor([transfer_heads, 1], dtype=pl.FP32)
     li_transfer = pl.create_tensor([transfer_heads, 1], dtype=pl.FP32)
     ffts_workspace = pl.create_tensor([256], dtype=pl.INT64)
-    with pl.spmd(NUM_QK_CORES, name_hint="qk_pv", deps=[gather_ori_tid, gather_cmp_tid, bias_tid], allow_early_resolve=True) as qk_tid:
+    with pl.spmd(NUM_QK_CORES, name_hint="qk_pv", deps=[gather_ori_tid, gather_cmp_tid], allow_early_resolve=True) as qk_tid:
         qk_core = pl.tile.get_block_idx()
         pl.system.set_ffts(ffts_workspace)
         qk_rows = pl.min(PREFILL_QUERY_TILE, pl.max(pl.min(t_dim, active_rows) - query_base, 0))
@@ -1014,10 +1021,11 @@ def _sparse_attn_heads(
     tile_base: pl.Scalar[pl.INDEX],
     tile_rows: pl.Scalar[pl.INDEX],
 ) -> tuple[pl.Tensor, pl.Scalar[pl.TASK_ID]]:
-    """Write one bounded dense tile through static 128-row waves."""
+    """Write one bounded dense tile through serial 128-row waves."""
+    # Query waves share their large KV/statistics workspace.  Keeping the
+    # waves chained lets the allocator recycle it instead of retaining one
+    # full sparse workspace per query block.
     merge_tids = pl.array.create(1, pl.TASK_ID)
-    # Keep the manual-dependency zero-fill in the same chain as every head writer and the output projection.
-    merge_tids[0] = packed_init_tid
     with pl.scope():
         sparse_kv = pl.create_tensor(
             [PREFILL_QUERY_TILE * PREFILL_SPARSE_PAD, HEAD_DIM],
@@ -1043,7 +1051,8 @@ def _sparse_attn_heads(
             tile_rows,
             packed_init_tid,
         )
-        merge_tids[0] = pl.system.task_dummy(deps=[packed_init_tid, rope_cs_tid])
+        ready_tid = pl.system.task_dummy(deps=[packed_init_tid, rope_cs_tid])
+        merge_tids[0] = ready_tid
         for query_block in pl.unroll(PREFILL_QUERY_BLOCKS):
             dense_query_base = query_block * PREFILL_QUERY_TILE
             query_base = tile_base + dense_query_base
