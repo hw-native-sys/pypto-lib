@@ -39,8 +39,12 @@ from models.glm5_3_flash.quantization import INT8_AMAX_EPS, INT8_SCALE_MAX, quan
 
 ROW_PAD = 8
 REDUCE_TILE = D // ROW_PAD
+NORM_T_TILE = 8
+NORM_D_TILE = 512
+NORM_T_CROSSOVER = 64
 EPS = FLASH.rms_norm_eps
 assert D % ROW_PAD == 0
+assert D % NORM_D_TILE == 0
 
 
 def golden_rmsnorm(x: torch.Tensor, weight: torch.Tensor) -> torch.Tensor:
@@ -68,18 +72,49 @@ def golden_add_rmsnorm(
 
 
 @pl.jit.inline
-def rmsnorm(
+def _rmsnorm_eight_rows(
     x: pl.Tensor[[T_DYN, D], pl.BF16],
     weight: pl.Tensor[[D], pl.BF16],
     output: pl.Tensor[[T_DYN, D], pl.BF16],
 ):
-    """Normalize one 4096-wide token per task, accumulating the RMS in FP32."""
+    """Normalize up to eight tokens per task with FP32 accumulation."""
+    t_dim = pl.tensor.dim(x, 0)
+    for block in pl.spmd((t_dim + NORM_T_TILE - 1) // NORM_T_TILE, name_hint="glm53_rmsnorm"):
+        t0 = block * NORM_T_TILE
+        valid_rows = pl.min(NORM_T_TILE, t_dim - t0)
+        sq_sum = pl.full([1, NORM_T_TILE], dtype=pl.FP32, value=0.0)
+        for kb in pl.pipeline(D // NORM_D_TILE, stage=2):
+            k0 = kb * NORM_D_TILE
+            source = pl.slice(x, [NORM_T_TILE, NORM_D_TILE], [t0, k0], valid_shape=[valid_rows, NORM_D_TILE])
+            source = pl.set_validshape(pl.fillpad(source, pad_value=pl.PadValue.zero), NORM_T_TILE, NORM_D_TILE)
+            value = pl.cast(source, pl.FP32)
+            sq_sum = pl.add(sq_sum, pl.reshape(pl.row_sum(pl.mul(value, value)), [1, NORM_T_TILE]))
+        inv_rms = pl.reshape(pl.rsqrt(pl.add(pl.mul(sq_sum, 1.0 / D), EPS), high_precision=True), [NORM_T_TILE, 1])
+        for kb in pl.pipeline(D // NORM_D_TILE, stage=2):
+            k0 = kb * NORM_D_TILE
+            source = pl.slice(x, [NORM_T_TILE, NORM_D_TILE], [t0, k0], valid_shape=[valid_rows, NORM_D_TILE])
+            source = pl.set_validshape(pl.fillpad(source, pad_value=pl.PadValue.zero), NORM_T_TILE, NORM_D_TILE)
+            value = pl.cast(source, pl.FP32)
+            gamma = pl.reshape(pl.cast(weight[k0 : k0 + NORM_D_TILE], pl.FP32), [1, NORM_D_TILE])
+            normalized = pl.col_expand_mul(pl.row_expand_mul(value, inv_rms), gamma)
+            output[t0 : t0 + NORM_T_TILE, k0 : k0 + NORM_D_TILE] = pl.set_validshape(
+                pl.cast(normalized, pl.BF16, mode="rint"), valid_rows, NORM_D_TILE
+            )
+    return output
+
+
+@pl.jit.inline
+def _rmsnorm_single_row(
+    x: pl.Tensor[[T_DYN, D], pl.BF16],
+    weight: pl.Tensor[[D], pl.BF16],
+    output: pl.Tensor[[T_DYN, D], pl.BF16],
+):
+    """Keep the one-token task path for small batches."""
     t_dim = pl.tensor.dim(x, 0)
     weight_2d = pl.reshape(weight, [1, D])
-    for t in pl.spmd(t_dim, name_hint="glm53_rmsnorm"):
+    for t in pl.spmd(t_dim, name_hint="glm53_rmsnorm_single"):
         x_fp32 = pl.cast(pl.tile.load(x, [t, 0], [1, D]), pl.FP32)
         w_fp32 = pl.cast(pl.tile.load(weight_2d, [0, 0], [1, D]), pl.FP32)
-
         squares = pl.reshape(pl.mul(x_fp32, x_fp32), [ROW_PAD, REDUCE_TILE])
         partial_tmp = pl.create_tile([ROW_PAD, REDUCE_TILE], dtype=pl.FP32)
         partial = pl.row_sum(squares, partial_tmp)
@@ -93,6 +128,20 @@ def rmsnorm(
         inv_rms = pl.tile.rsqrt(pl.add(pl.mul(sq_sum, 1.0 / D), EPS), rsqrt_tmp)
         normalized = pl.mul(pl.mul(x_fp32, pl.tile.read(inv_rms, [0, 0])), w_fp32)
         pl.tile.store(pl.cast(normalized, pl.BF16, mode="rint"), [t, 0], output, shapes=[1, D])
+    return output
+
+
+@pl.jit.inline
+def rmsnorm(
+    x: pl.Tensor[[T_DYN, D], pl.BF16],
+    weight: pl.Tensor[[D], pl.BF16],
+    output: pl.Tensor[[T_DYN, D], pl.BF16],
+):
+    """Use eight-row tasks when enough tokens amortize their extra reads."""
+    if pl.tensor.dim(x, 0) < NORM_T_CROSSOVER:
+        _rmsnorm_single_row(x, weight, output)
+    else:
+        _rmsnorm_eight_rows(x, weight, output)
     return output
 
 
