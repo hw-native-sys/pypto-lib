@@ -11,7 +11,7 @@
 
 import pypto.language as pl
 
-from config import FLASH as M, DECODE_BATCH, DECODE_SEQ, PREFILL_BATCH, PREFILL_SEQ
+from config import FLASH as M, DECODE_BATCH, DECODE_SEQ
 
 
 # Dynamic shape variables.
@@ -36,7 +36,7 @@ LINEAR_T_TILE = 16
 RMS_K_TILE = 512
 LINEAR_K_TILE = 256
 D_TILE = 512
-D_SPMD = 512
+D_SPMD = 4096
 LINEAR_OK = 16
 RMS_OK = 16
 
@@ -69,20 +69,11 @@ def _hc_head(
             sq_sum = pl.add(sq_sum, pl.reshape(sq_col, [1, T_TILE]))
         sq_part = pl.assemble(sq_part, sq_sum, [ok, t0])
 
-    # linear: split-K head projection, fanned over (row-block x K-slice); each task
-    # atomic-adds its [LINEAR_T_TILE, HC_PAD] FP32 partial into the kernel-zeroed mixes_raw
-    mixes_raw = pl.create_tensor([t_linear, HC_PAD], dtype=pl.FP32)
-    with pl.spmd(t_linear // LINEAR_T_TILE, name_hint="hc_head_linear_seed") as linear_seed_tid:
-        seed_block = pl.tile.get_block_idx()
-        seed_t0 = seed_block * LINEAR_T_TILE
-        zeros = pl.full([LINEAR_T_TILE, HC_PAD], dtype=pl.FP32, value=0.0)
-        mixes_raw[seed_t0 : seed_t0 + LINEAR_T_TILE, 0:HC_PAD] = zeros
+    # Each split-K task writes its own partial. The final vector stage sums
+    # those partials in a fixed order, avoiding FP32 atomic-order variation.
+    mixes_partial = pl.create_tensor([LINEAR_OK * t_linear, HC_PAD], dtype=pl.FP32)
     if linear_full_rows > 0:
-        with pl.spmd(
-            (linear_full_rows // LINEAR_T_TILE) * LINEAR_OK,
-            name_hint="hc_head_linear",
-            deps=[linear_seed_tid],
-        ) as _linear_tid:
+        with pl.spmd((linear_full_rows // LINEAR_T_TILE) * LINEAR_OK, name_hint="hc_head_linear") as _linear_tid:
             # Weight reads bypass L2.
             pl.set_cache_policy(hc_head_fn, pl.CachePolicy.BYPASS)
             task = pl.tile.get_block_idx()
@@ -92,23 +83,15 @@ def _hc_head(
             for kb in pl.pipeline(0, HC_DIM // LINEAR_OK // LINEAR_K_TILE, stage=2):
                 k0 = k_base + kb * LINEAR_K_TILE
                 x_lin_full = x_flat[t0 : t0 + LINEAR_T_TILE, k0 : k0 + LINEAR_K_TILE]
-                w_full = pl.slice(
-                    hc_head_fn,
-                    [HC_PAD, LINEAR_K_TILE],
-                    [0, k0],
-                    valid_shape=[HC_MULT, LINEAR_K_TILE],
-                )
+                w_full = pl.slice(hc_head_fn, [HC_PAD, LINEAR_K_TILE], [0, k0], valid_shape=[HC_MULT, LINEAR_K_TILE])
                 acc_full = pl.matmul_acc(acc_full, x_lin_full, w_full, b_trans=True, init_cond=(kb == 0))
-            mixes_raw = pl.assemble(mixes_raw, acc_full, [t0, 0], atomic=pl.AtomicType.Add)
+            partial_row = (task % LINEAR_OK) * t_linear + t0
+            mixes_partial = pl.assemble(mixes_partial, acc_full, [partial_row, 0])
 
     # At most one incomplete row block exists. Keep it in a separate conditional
     # task so every aligned block above retains the original static-M Cube path.
     if linear_full_rows < t_dim:
-        with pl.spmd(
-            LINEAR_OK,
-            name_hint="hc_head_linear_tail",
-            deps=[linear_seed_tid],
-        ) as _linear_tail_tid:
+        with pl.spmd(LINEAR_OK, name_hint="hc_head_linear_tail") as _linear_tail_tid:
             pl.set_cache_policy(hc_head_fn, pl.CachePolicy.BYPASS)
             tail_task = pl.tile.get_block_idx()
             k_base = tail_task * (HC_DIM // LINEAR_OK)
@@ -122,19 +105,9 @@ def _hc_head(
                     [linear_full_rows, k0],
                     valid_shape=[tail_rows, LINEAR_K_TILE],
                 )
-                w_tail = pl.slice(
-                    hc_head_fn,
-                    [HC_PAD, LINEAR_K_TILE],
-                    [0, k0],
-                    valid_shape=[HC_MULT, LINEAR_K_TILE],
-                )
+                w_tail = pl.slice(hc_head_fn, [HC_PAD, LINEAR_K_TILE], [0, k0], valid_shape=[HC_MULT, LINEAR_K_TILE])
                 acc_tail = pl.matmul_acc(acc_tail, x_lin_tail, w_tail, b_trans=True, init_cond=(kb == 0))
-            mixes_raw = pl.assemble(
-                mixes_raw,
-                acc_tail,
-                [linear_full_rows, 0],
-                atomic=pl.AtomicType.Add,
-            )
+            mixes_partial = pl.assemble(mixes_partial, acc_tail, [tail_task * t_linear + linear_full_rows, 0])
 
     # reduce: gate + hc mix, fanned over (token-tile x D-slice). The rsqrt/sigmoid gate is
     # recomputed per task instead of being published by its own scope.
@@ -149,7 +122,10 @@ def _hc_head(
         ssq = pl.row_sum(pl.transpose(ssq_slab, axis1=0, axis2=1))
         inv_row = pl.rsqrt(pl.add(pl.mul(ssq, HC_DIM_INV), EPS), high_precision=True)
         inv_col = pl.reshape(inv_row, [T_TILE, 1])
-        mix = mixes_raw[t0 : t0 + T_TILE, 0:HC_VPAD]
+        mix = pl.full([T_TILE, HC_VPAD], dtype=pl.FP32, value=0.0)
+        for partial in pl.pipeline(LINEAR_OK, stage=2):
+            partial_row_start = partial * t_linear + t0
+            mix = pl.add(mix, mixes_partial[partial_row_start : partial_row_start + T_TILE, 0:HC_VPAD])
         scaled = pl.mul(pl.row_expand_mul(mix, inv_col), scale)
         logits = pl.add(scaled, pl.col_expand(scaled, base))
         pre_val = pl.add(pl.recip(pl.add(pl.exp(pl.neg(logits)), 1.0)), HC_EPS)
@@ -235,8 +211,7 @@ def build_tensor_specs():
     return [
         TensorSpec("x_hc", [T, HC_MULT, D], torch.float32, init_value=init_x_hc),
         TensorSpec("hc_head_fn", [HC_MULT, HC_DIM], torch.float32, init_value=init_hc_head_fn),
-        TensorSpec("hc_head_scale", [1], torch.float32,
-                   init_value=lambda: torch.tensor([0.076099])),
+        TensorSpec("hc_head_scale", [1], torch.float32, init_value=lambda: torch.tensor([0.076099])),
         TensorSpec("hc_head_base", [HC_MULT], torch.float32,
                    init_value=lambda: torch.tensor([5.9166, -3.6223, -2.9324, -3.3124])),
         TensorSpec("y", [T, D], torch.bfloat16),
@@ -249,8 +224,7 @@ if __name__ == "__main__":
     from golden import ratio_allclose, run
 
     parser = argparse.ArgumentParser()
-    parser.add_argument("-p", "--platform", type=str, default="a2a3",
-                        choices=["a2a3", "a2a3sim", "a5", "a5sim"])
+    parser.add_argument("-p", "--platform", type=str, default="a2a3", choices=["a2a3", "a2a3sim", "a5", "a5sim"])
     parser.add_argument("-d", "--device", type=int, default=0)
     parser.add_argument("--seed", type=int, default=0)
     # Int mode (0=off; 1=timing only, most accurate; 2=timing + dep graph, two runs).
