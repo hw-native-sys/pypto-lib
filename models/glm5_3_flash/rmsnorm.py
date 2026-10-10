@@ -37,13 +37,9 @@ from models.glm5_3_flash.golden import rms_norm
 from models.glm5_3_flash.quantization import INT8_AMAX_EPS, INT8_SCALE_MAX, quantize_per_token_int8
 
 
-ROW_PAD = 8
-REDUCE_TILE = D // ROW_PAD
 NORM_T_TILE = 8
 NORM_D_TILE = 512
-NORM_T_CROSSOVER = 64
 EPS = FLASH.rms_norm_eps
-assert D % ROW_PAD == 0
 assert D % NORM_D_TILE == 0
 
 
@@ -72,7 +68,7 @@ def golden_add_rmsnorm(
 
 
 @pl.jit.inline
-def _rmsnorm_eight_rows(
+def rmsnorm(
     x: pl.Tensor[[T_DYN, D], pl.BF16],
     weight: pl.Tensor[[D], pl.BF16],
     output: pl.Tensor[[T_DYN, D], pl.BF16],
@@ -104,48 +100,6 @@ def _rmsnorm_eight_rows(
 
 
 @pl.jit.inline
-def _rmsnorm_single_row(
-    x: pl.Tensor[[T_DYN, D], pl.BF16],
-    weight: pl.Tensor[[D], pl.BF16],
-    output: pl.Tensor[[T_DYN, D], pl.BF16],
-):
-    """Keep the one-token task path for small batches."""
-    t_dim = pl.tensor.dim(x, 0)
-    weight_2d = pl.reshape(weight, [1, D])
-    for t in pl.spmd(t_dim, name_hint="glm53_rmsnorm_single"):
-        x_fp32 = pl.cast(pl.tile.load(x, [t, 0], [1, D]), pl.FP32)
-        w_fp32 = pl.cast(pl.tile.load(weight_2d, [0, 0], [1, D]), pl.FP32)
-        squares = pl.reshape(pl.mul(x_fp32, x_fp32), [ROW_PAD, REDUCE_TILE])
-        partial_tmp = pl.create_tile([ROW_PAD, REDUCE_TILE], dtype=pl.FP32)
-        partial = pl.row_sum(squares, partial_tmp)
-        reduce_tile = pl.create_tile([ROW_PAD, ROW_PAD], dtype=pl.FP32)
-        reduce_tile[0:1, :] = pl.reshape(partial, [1, ROW_PAD])
-        reduce_tile = pl.set_validshape(reduce_tile, 1, ROW_PAD)
-        sq_sum_tmp = pl.create_tile([ROW_PAD, ROW_PAD], dtype=pl.FP32)
-        sq_sum = pl.row_sum(reduce_tile, sq_sum_tmp)
-        sq_sum = pl.set_validshape(pl.reshape(sq_sum, [1, ROW_PAD]), 1, 1)
-        rsqrt_tmp = pl.create_tile([1, ROW_PAD], dtype=pl.FP32)
-        inv_rms = pl.tile.rsqrt(pl.add(pl.mul(sq_sum, 1.0 / D), EPS), rsqrt_tmp)
-        normalized = pl.mul(pl.mul(x_fp32, pl.tile.read(inv_rms, [0, 0])), w_fp32)
-        pl.tile.store(pl.cast(normalized, pl.BF16, mode="rint"), [t, 0], output, shapes=[1, D])
-    return output
-
-
-@pl.jit.inline
-def rmsnorm(
-    x: pl.Tensor[[T_DYN, D], pl.BF16],
-    weight: pl.Tensor[[D], pl.BF16],
-    output: pl.Tensor[[T_DYN, D], pl.BF16],
-):
-    """Use eight-row tasks when enough tokens amortize their extra reads."""
-    if pl.tensor.dim(x, 0) < NORM_T_CROSSOVER:
-        _rmsnorm_single_row(x, weight, output)
-    else:
-        _rmsnorm_eight_rows(x, weight, output)
-    return output
-
-
-@pl.jit.inline
 def rmsnorm_quant(
     x: pl.Tensor[[T_DYN, D], pl.BF16],
     weight: pl.Tensor[[D], pl.BF16],
@@ -156,58 +110,67 @@ def rmsnorm_quant(
 ):
     """Fuse BF16 RMSNorm with the dense MLP's per-token INT8 view."""
     t_dim = pl.tensor.dim(x, 0)
-    weight_2d = pl.reshape(weight, [1, D])
     active_tokens = pl.cast(num_tokens, pl.INDEX)
     if active_tokens < 0:
         active_tokens = pl.cast(0, pl.INDEX)
     if active_tokens > t_dim:
         active_tokens = t_dim
-    for t in pl.spmd(t_dim, name_hint="glm53_rmsnorm_quant"):
-        x_fp32 = pl.cast(pl.tile.load(x, [t, 0], [1, D]), pl.FP32)
-        w_fp32 = pl.cast(pl.tile.load(weight_2d, [0, 0], [1, D]), pl.FP32)
-        squares = pl.reshape(pl.mul(x_fp32, x_fp32), [ROW_PAD, REDUCE_TILE])
-        sq_partial_tmp = pl.create_tile([ROW_PAD, REDUCE_TILE], dtype=pl.FP32)
-        sq_partial = pl.row_sum(squares, sq_partial_tmp)
-        sq_reduce = pl.create_tile([ROW_PAD, ROW_PAD], dtype=pl.FP32)
-        sq_reduce[0:1, :] = pl.reshape(sq_partial, [1, ROW_PAD])
-        sq_reduce = pl.set_validshape(sq_reduce, 1, ROW_PAD)
-        sq_sum_tmp = pl.create_tile([ROW_PAD, ROW_PAD], dtype=pl.FP32)
-        sq_sum = pl.row_sum(sq_reduce, sq_sum_tmp)
-        sq_sum = pl.set_validshape(pl.reshape(sq_sum, [1, ROW_PAD]), 1, 1)
-        rsqrt_tmp = pl.create_tile([1, ROW_PAD], dtype=pl.FP32)
-        inv_rms = pl.tile.rsqrt(pl.add(pl.mul(sq_sum, 1.0 / D), EPS), rsqrt_tmp)
-        normalized_fp32 = pl.mul(pl.mul(x_fp32, pl.tile.read(inv_rms, [0, 0])), w_fp32)
-        normalized_bf16 = pl.cast(normalized_fp32, pl.BF16, mode="rint")
-        pl.tile.store(normalized_bf16, [t, 0], output, shapes=[1, D])
-
-        if t < active_tokens:
-            normalized = pl.cast(normalized_bf16, pl.FP32)
-            abs_rows = pl.reshape(pl.abs(normalized), [ROW_PAD, REDUCE_TILE])
-            partial_tmp = pl.create_tile([ROW_PAD, REDUCE_TILE], dtype=pl.FP32)
-            partial = pl.row_max(abs_rows, partial_tmp)
-            reduce_tile = pl.create_tile([ROW_PAD, ROW_PAD], dtype=pl.FP32)
-            reduce_tile[0:1, :] = pl.reshape(partial, [1, ROW_PAD])
-            reduce_tile = pl.set_validshape(reduce_tile, 1, ROW_PAD)
-            amax_tmp = pl.create_tile([ROW_PAD, ROW_PAD], dtype=pl.FP32)
-            amax = pl.row_max(reduce_tile, amax_tmp)
-            amax = pl.set_validshape(pl.reshape(amax, [1, ROW_PAD]), 1, 1)
-            floor = pl.set_validshape(pl.tile.full([1, ROW_PAD], dtype=pl.FP32, value=INT8_AMAX_EPS), 1, 1)
-            amax = pl.maximum(amax, floor)
-            scale = pl.div(amax, INT8_SCALE_MAX)
-            scaled = pl.mul(normalized, pl.div(INT8_SCALE_MAX, pl.tile.read(amax, [0, 0])))
-            rounded = pl.cast(scaled, pl.INT32, mode="rint")
-            rounded = pl.minimum(
-                pl.maximum(rounded, pl.tile.full([1, D], dtype=pl.INT32, value=-127)),
-                pl.tile.full([1, D], dtype=pl.INT32, value=127),
+    for block in pl.spmd((t_dim + NORM_T_TILE - 1) // NORM_T_TILE, name_hint="glm53_rmsnorm_quant"):
+        t0 = block * NORM_T_TILE
+        valid_rows = pl.min(NORM_T_TILE, t_dim - t0)
+        sq_sum = pl.full([1, NORM_T_TILE], dtype=pl.FP32, value=0.0)
+        for kb in pl.pipeline(D // NORM_D_TILE, stage=2):
+            k0 = kb * NORM_D_TILE
+            source = pl.slice(x, [NORM_T_TILE, NORM_D_TILE], [t0, k0], valid_shape=[valid_rows, NORM_D_TILE])
+            source = pl.set_validshape(pl.fillpad(source, pad_value=pl.PadValue.zero), NORM_T_TILE, NORM_D_TILE)
+            value = pl.cast(source, pl.FP32)
+            sq_sum = pl.add(sq_sum, pl.reshape(pl.row_sum(pl.mul(value, value)), [1, NORM_T_TILE]))
+        inv_rms = pl.reshape(pl.rsqrt(pl.add(pl.mul(sq_sum, 1.0 / D), EPS), high_precision=True), [NORM_T_TILE, 1])
+        for kb in pl.pipeline(D // NORM_D_TILE, stage=2):
+            k0 = kb * NORM_D_TILE
+            source = pl.slice(x, [NORM_T_TILE, NORM_D_TILE], [t0, k0], valid_shape=[valid_rows, NORM_D_TILE])
+            source = pl.set_validshape(pl.fillpad(source, pad_value=pl.PadValue.zero), NORM_T_TILE, NORM_D_TILE)
+            value = pl.cast(source, pl.FP32)
+            gamma = pl.reshape(pl.cast(weight[k0 : k0 + NORM_D_TILE], pl.FP32), [1, NORM_D_TILE])
+            normalized = pl.col_expand_mul(pl.row_expand_mul(value, inv_rms), gamma)
+            normalized_bf16 = pl.cast(normalized, pl.BF16, mode="rint")
+            output[t0 : t0 + NORM_T_TILE, k0 : k0 + NORM_D_TILE] = pl.set_validshape(
+                normalized_bf16, valid_rows, NORM_D_TILE
             )
-            quantized = pl.cast(pl.cast(rounded, pl.FP16, mode="round"), pl.INT8, mode="trunc")
-            pl.tile.store(quantized, [t, 0], output_int8, shapes=[1, D])
-            pl.tile.store(scale, [t, 0], output_scale, shapes=[1, 1])
-        else:
-            zero_int8 = pl.cast(pl.tile.full([1, D], dtype=pl.FP16, value=0.0), pl.INT8, mode="trunc")
-            pl.tile.store(zero_int8, [t, 0], output_int8, shapes=[1, D])
-            zero_scale = pl.set_validshape(pl.tile.full([1, ROW_PAD], dtype=pl.FP32, value=0.0), 1, 1)
-            pl.tile.store(zero_scale, [t, 0], output_scale, shapes=[1, 1])
+        # Preserve the scalar row quantization order for FP32 halfway cases.
+        for row in pl.range(NORM_T_TILE):
+            t = t0 + row
+            if t < t_dim:
+                if t < active_tokens:
+                    norm_row_fp32 = pl.cast(pl.tile.load(output, [t, 0], [1, D]), pl.FP32)
+                    abs_rows = pl.reshape(pl.abs(norm_row_fp32), [NORM_T_TILE, NORM_D_TILE])
+                    partial_tmp = pl.create_tile([NORM_T_TILE, NORM_D_TILE], dtype=pl.FP32)
+                    partial = pl.row_max(abs_rows, partial_tmp)
+                    reduce_tile = pl.create_tile([NORM_T_TILE, NORM_T_TILE], dtype=pl.FP32)
+                    reduce_tile[0:1, :] = pl.reshape(partial, [1, NORM_T_TILE])
+                    reduce_tile = pl.set_validshape(reduce_tile, 1, NORM_T_TILE)
+                    amax_tmp = pl.create_tile([NORM_T_TILE, NORM_T_TILE], dtype=pl.FP32)
+                    amax = pl.row_max(reduce_tile, amax_tmp)
+                    amax = pl.set_validshape(pl.reshape(amax, [1, NORM_T_TILE]), 1, 1)
+                    floor = pl.set_validshape(
+                        pl.tile.full([1, NORM_T_TILE], dtype=pl.FP32, value=INT8_AMAX_EPS), 1, 1
+                    )
+                    amax = pl.maximum(amax, floor)
+                    scale = pl.div(amax, INT8_SCALE_MAX)
+                    scaled = pl.mul(norm_row_fp32, pl.div(INT8_SCALE_MAX, pl.tile.read(amax, [0, 0])))
+                    rounded = pl.cast(scaled, pl.INT32, mode="rint")
+                    rounded = pl.minimum(
+                        pl.maximum(rounded, pl.tile.full([1, D], dtype=pl.INT32, value=-127)),
+                        pl.tile.full([1, D], dtype=pl.INT32, value=127),
+                    )
+                    quantized = pl.cast(pl.cast(rounded, pl.FP16, mode="round"), pl.INT8, mode="trunc")
+                    pl.tile.store(quantized, [t, 0], output_int8, shapes=[1, D])
+                    pl.tile.store(scale, [t, 0], output_scale, shapes=[1, 1])
+                else:
+                    zero_int8 = pl.cast(pl.tile.full([1, D], dtype=pl.FP16, value=0.0), pl.INT8, mode="trunc")
+                    pl.tile.store(zero_int8, [t, 0], output_int8, shapes=[1, D])
+                    zero_scale = pl.set_validshape(pl.tile.full([1, NORM_T_TILE], dtype=pl.FP32, value=0.0), 1, 1)
+                    pl.tile.store(zero_scale, [t, 0], output_scale, shapes=[1, 1])
     return output, output_int8, output_scale
 
 
@@ -221,27 +184,40 @@ def add_rmsnorm(
 ):
     """Fuse the BF16 residual update and the subsequent RMSNorm."""
     t_dim = pl.tensor.dim(x, 0)
-    weight_2d = pl.reshape(weight, [1, D])
-    for t in pl.spmd(t_dim, name_hint="glm53_add_residual"):
-        x_fp32 = pl.cast(pl.tile.load(x, [t, 0], [1, D]), pl.FP32)
-        residual_fp32 = pl.cast(pl.tile.load(residual, [t, 0], [1, D]), pl.FP32)
-        updated = pl.cast(pl.add(x_fp32, residual_fp32), pl.BF16, mode="rint")
-        pl.tile.store(updated, [t, 0], updated_residual, shapes=[1, D])
-        updated_fp32 = pl.cast(updated, pl.FP32)
-        w_fp32 = pl.cast(pl.tile.load(weight_2d, [0, 0], [1, D]), pl.FP32)
-        squares = pl.reshape(pl.mul(updated_fp32, updated_fp32), [ROW_PAD, REDUCE_TILE])
-        partial_tmp = pl.create_tile([ROW_PAD, REDUCE_TILE], dtype=pl.FP32)
-        partial = pl.row_sum(squares, partial_tmp)
-        reduce_tile = pl.create_tile([ROW_PAD, ROW_PAD], dtype=pl.FP32)
-        reduce_tile[0:1, :] = pl.reshape(partial, [1, ROW_PAD])
-        reduce_tile = pl.set_validshape(reduce_tile, 1, ROW_PAD)
-        sq_sum_tmp = pl.create_tile([ROW_PAD, ROW_PAD], dtype=pl.FP32)
-        sq_sum = pl.row_sum(reduce_tile, sq_sum_tmp)
-        sq_sum = pl.set_validshape(pl.reshape(sq_sum, [1, ROW_PAD]), 1, 1)
-        rsqrt_tmp = pl.create_tile([1, ROW_PAD], dtype=pl.FP32)
-        inv_rms = pl.tile.rsqrt(pl.add(pl.mul(sq_sum, 1.0 / D), EPS), rsqrt_tmp)
-        normalized = pl.mul(pl.mul(updated_fp32, pl.tile.read(inv_rms, [0, 0])), w_fp32)
-        pl.tile.store(pl.cast(normalized, pl.BF16, mode="rint"), [t, 0], output, shapes=[1, D])
+    for block in pl.spmd((t_dim + NORM_T_TILE - 1) // NORM_T_TILE, name_hint="glm53_add_residual"):
+        t0 = block * NORM_T_TILE
+        valid_rows = pl.min(NORM_T_TILE, t_dim - t0)
+        sq_sum = pl.full([1, NORM_T_TILE], dtype=pl.FP32, value=0.0)
+        for kb in pl.pipeline(D // NORM_D_TILE, stage=2):
+            k0 = kb * NORM_D_TILE
+            x_tile = pl.slice(x, [NORM_T_TILE, NORM_D_TILE], [t0, k0], valid_shape=[valid_rows, NORM_D_TILE])
+            x_tile = pl.set_validshape(pl.fillpad(x_tile, pad_value=pl.PadValue.zero), NORM_T_TILE, NORM_D_TILE)
+            residual_tile = pl.slice(
+                residual, [NORM_T_TILE, NORM_D_TILE], [t0, k0], valid_shape=[valid_rows, NORM_D_TILE]
+            )
+            residual_tile = pl.set_validshape(
+                pl.fillpad(residual_tile, pad_value=pl.PadValue.zero), NORM_T_TILE, NORM_D_TILE
+            )
+            updated = pl.cast(pl.add(pl.cast(x_tile, pl.FP32), pl.cast(residual_tile, pl.FP32)), pl.BF16, mode="rint")
+            updated_residual[t0 : t0 + NORM_T_TILE, k0 : k0 + NORM_D_TILE] = pl.set_validshape(
+                updated, valid_rows, NORM_D_TILE
+            )
+            updated_fp32 = pl.cast(updated, pl.FP32)
+            sq_sum = pl.add(sq_sum, pl.reshape(pl.row_sum(pl.mul(updated_fp32, updated_fp32)), [1, NORM_T_TILE]))
+        inv_rms = pl.reshape(pl.rsqrt(pl.add(pl.mul(sq_sum, 1.0 / D), EPS), high_precision=True), [NORM_T_TILE, 1])
+        for kb in pl.pipeline(D // NORM_D_TILE, stage=2):
+            k0 = kb * NORM_D_TILE
+            updated_source = pl.slice(
+                updated_residual, [NORM_T_TILE, NORM_D_TILE], [t0, k0], valid_shape=[valid_rows, NORM_D_TILE]
+            )
+            updated_padded = pl.set_validshape(
+                pl.fillpad(updated_source, pad_value=pl.PadValue.zero), NORM_T_TILE, NORM_D_TILE
+            )
+            gamma = pl.reshape(pl.cast(weight[k0 : k0 + NORM_D_TILE], pl.FP32), [1, NORM_D_TILE])
+            normalized = pl.col_expand_mul(pl.row_expand_mul(pl.cast(updated_padded, pl.FP32), inv_rms), gamma)
+            output[t0 : t0 + NORM_T_TILE, k0 : k0 + NORM_D_TILE] = pl.set_validshape(
+                pl.cast(normalized, pl.BF16, mode="rint"), valid_rows, NORM_D_TILE
+            )
     return output, updated_residual
 
 
