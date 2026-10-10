@@ -1021,9 +1021,23 @@ def _sparse_attn_heads(
     tile_base: pl.Scalar[pl.INDEX],
     tile_rows: pl.Scalar[pl.INDEX],
 ) -> tuple[pl.Tensor, pl.Scalar[pl.TASK_ID]]:
-    """Write one bounded dense tile through independent 128-row waves."""
-    merge_tids = pl.array.create(PREFILL_QUERY_BLOCKS, pl.TASK_ID)
+    """Write one bounded dense tile through serial 128-row waves."""
+    # Query waves share their large KV/statistics workspace.  Keeping the
+    # waves chained lets the allocator recycle it instead of retaining one
+    # full sparse workspace per query block.
+    merge_tids = pl.array.create(1, pl.TASK_ID)
     with pl.scope():
+        sparse_kv = pl.create_tensor(
+            [PREFILL_QUERY_TILE * PREFILL_SPARSE_PAD, HEAD_DIM],
+            dtype=pl.BF16,
+        )
+        sparse_bias = pl.create_tensor(
+            [PREFILL_QUERY_TILE, PREFILL_SPARSE_PAD],
+            dtype=pl.FP32,
+        )
+        sparse_blk_mi = pl.create_tensor([PREFILL_QUERY_STATS_ROWS, 1], dtype=pl.FP32)
+        sparse_blk_li = pl.create_tensor([PREFILL_QUERY_STATS_ROWS, 1], dtype=pl.FP32)
+        sparse_blk_oi = pl.create_tensor([PREFILL_QUERY_STATS_ROWS, HEAD_DIM], dtype=pl.FP32)
         rope_cos_il = pl.create_tensor([T_PAD, ROPE_DIM], dtype=pl.FP32, manual_dep=True)
         rope_sin_signed = pl.create_tensor([T_PAD, ROPE_DIM], dtype=pl.FP32, manual_dep=True)
         rope_swap_idx = pl.create_tensor([HEAD_TILE, ROPE_DIM], dtype=pl.INT32, manual_dep=True)
@@ -1038,16 +1052,13 @@ def _sparse_attn_heads(
             packed_init_tid,
         )
         ready_tid = pl.system.task_dummy(deps=[packed_init_tid, rope_cs_tid])
+        merge_tids[0] = ready_tid
         for query_block in pl.unroll(PREFILL_QUERY_BLOCKS):
             dense_query_base = query_block * PREFILL_QUERY_TILE
             query_base = tile_base + dense_query_base
-            merge_tid = ready_tid
+            prior_merge_tid = merge_tids[0]
+            merge_tid = prior_merge_tid
             if dense_query_base < tile_rows:
-                sparse_kv = pl.create_tensor([PREFILL_QUERY_TILE * PREFILL_SPARSE_PAD, HEAD_DIM], dtype=pl.BF16, manual_dep=True)
-                sparse_bias = pl.create_tensor([PREFILL_QUERY_TILE, PREFILL_SPARSE_PAD], dtype=pl.FP32)
-                sparse_blk_mi = pl.create_tensor([PREFILL_QUERY_STATS_ROWS, 1], dtype=pl.FP32)
-                sparse_blk_li = pl.create_tensor([PREFILL_QUERY_STATS_ROWS, 1], dtype=pl.FP32)
-                sparse_blk_oi = pl.create_tensor([PREFILL_QUERY_STATS_ROWS, HEAD_DIM], dtype=pl.FP32)
                 merge_tid = _sparse_attn_wave(
                     q,
                     ori_kv,
@@ -1068,14 +1079,13 @@ def _sparse_attn_heads(
                     rope_cos_il,
                     rope_sin_signed,
                     rope_swap_idx,
-                    ready_tid,
+                    prior_merge_tid,
                     query_base,
                     dense_query_base,
                 )
-            merge_tids[query_block] = merge_tid
+            merge_tids[0] = merge_tid
 
-    heads_tid = pl.system.task_dummy(deps=[merge_tids[i] for i in range(PREFILL_QUERY_BLOCKS)])
-    return o_packed_heads, heads_tid
+    return o_packed_heads, merge_tids[0]
 
 
 @pl.jit.inline(auto_scope=False)
