@@ -106,6 +106,7 @@ CP_REQUEST_INPUT_STREAMS_DYN = pl.dynamic("CP_REQUEST_INPUT_STREAMS_DYN")
 CP_REQUEST_TOKENS_DYN = pl.dynamic("CP_REQUEST_TOKENS_DYN")
 CP_REQUEST_HC_DIM = M.hc_mult * D
 CP_REQUEST_COPY_COLS = 512
+CP_GATHER_ROW_TILE = 32
 _CP_REQUEST_HIDDEN_TILE_COLS = 2048
 # A sender tile indexes one stream at a time (``[ROW_TILE, 1, TILE_COLS]``), so a
 # tile that straddled two streams would silently read the wrong columns.
@@ -866,32 +867,40 @@ def _prefill_cp_gather_hidden(
                     else:
                         source_rank = NUM_SEGMENTS - 1 - segment
                         source_part = pl.cast(1, pl.INDEX)
-                    for local_row in pl.range(0, segment_length, ROW_TILE):
-                        active = pl.min(ROW_TILE, segment_length - local_row)
+                    for local_row in pl.range(0, segment_length, CP_GATHER_ROW_TILE):
+                        active = pl.min(CP_GATHER_ROW_TILE, segment_length - local_row)
                         source_base = source_rank * LOCAL_ROWS + source_part * MAX_SEGMENT_TILES * TAIL_ROWS + local_row
-                        for column in pl.range(D // CP_REQUEST_COPY_COLS):
+                        for column in pl.range(D // _CP_REQUEST_HIDDEN_TILE_COLS):
                             restored = pl.load(
-                                hidden_window, [source_base, column * CP_REQUEST_COPY_COLS],
-                                [ROW_TILE, CP_REQUEST_COPY_COLS], valid_shape=[active, CP_REQUEST_COPY_COLS],
+                                hidden_window, [source_base, column * _CP_REQUEST_HIDDEN_TILE_COLS],
+                                [CP_GATHER_ROW_TILE, _CP_REQUEST_HIDDEN_TILE_COLS], valid_shape=[active, _CP_REQUEST_HIDDEN_TILE_COLS],
                             )
-                            pl.store(restored, [segment_start + local_row, column * CP_REQUEST_COPY_COLS], hidden_out)
+                            pl.store(restored, [segment_start + local_row, column * _CP_REQUEST_HIDDEN_TILE_COLS], hidden_out)
                 final_tail_start = pl.max(0, length - TAIL_ROWS)
-                for tail_row in pl.range(pl.min(TAIL_ROWS, length)):
-                    position = final_tail_start + tail_row
-                    tail_segment = position // span
+                # Copy each intersection with the final tail in bounded row tiles.
+                # A tile stays within one segment's packed tail window.
+                for tail_segment in pl.range(NUM_SEGMENTS):
                     tail_segment_start = tail_segment * span
                     tail_segment_length = pl.max(0, pl.min(span, length - tail_segment_start))
+                    copy_start = pl.max(final_tail_start, tail_segment_start)
+                    copy_end = pl.min(length, tail_segment_start + tail_segment_length)
+                    copy_length = pl.max(0, copy_end - copy_start)
                     if tail_segment < CP_SIZE:
                         tail_rank = tail_segment
                         tail_part = pl.cast(0, pl.INDEX)
                     else:
                         tail_rank = NUM_SEGMENTS - 1 - tail_segment
                         tail_part = pl.cast(1, pl.INDEX)
-                    tail_offset = position - tail_segment_start - pl.max(0, tail_segment_length - TAIL_ROWS)
+                    tail_offset = copy_start - tail_segment_start - pl.max(0, tail_segment_length - TAIL_ROWS)
                     source_tail = (tail_rank * LOCAL_PARTS + tail_part) * TAIL_ROWS + tail_offset
-                    for column in pl.range(CP_REQUEST_HC_DIM // CP_REQUEST_COPY_COLS):
-                        restored_tail = pl.load(pre_hc_tail_window, [source_tail, column * CP_REQUEST_COPY_COLS], [1, CP_REQUEST_COPY_COLS])
-                        pl.store(restored_tail, [tail_row, column * CP_REQUEST_COPY_COLS], pre_hc_hidden_out)
+                    for tail_row in pl.range(0, copy_length, ROW_TILE):
+                        active_tail = pl.min(ROW_TILE, copy_length - tail_row)
+                        for column in pl.range(CP_REQUEST_HC_DIM // CP_REQUEST_COPY_COLS):
+                            restored_tail = pl.load(
+                                pre_hc_tail_window, [source_tail + tail_row, column * CP_REQUEST_COPY_COLS],
+                                [ROW_TILE, CP_REQUEST_COPY_COLS], valid_shape=[active_tail, CP_REQUEST_COPY_COLS],
+                            )
+                            pl.store(restored_tail, [copy_start - final_tail_start + tail_row, column * CP_REQUEST_COPY_COLS], pre_hc_hidden_out)
         for peer in pl.range(CP_SIZE):
             pl.write(complete, [peer, 0], pl.cast(0, pl.INT32))
     return hidden_out, pre_hc_hidden_out
