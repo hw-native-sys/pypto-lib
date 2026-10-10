@@ -26,6 +26,7 @@ B_DYN = pl.dynamic("B_DYN")  # per-request axis (block tables)
 T_DYN = pl.dynamic("T_DYN")  # T = B * S
 ORI_BLOCK_NUM_DYN = pl.dynamic("ORI_BLOCK_NUM_DYN")
 CMP_BLOCK_NUM_DYN = pl.dynamic("CMP_BLOCK_NUM_DYN")
+PACKED_ROWS_DYN = pl.dynamic("PACKED_ROWS_DYN")
 
 # model config
 B = DECODE_BATCH // TP
@@ -105,7 +106,7 @@ if T % ATTENTION_PUBLISH_T_TILE != 0:
 
 
 @pl.jit.inline(auto_scope=False)
-def sparse_attn_csa(
+def _sparse_attn_csa(
     q: pl.Tensor[[T_DYN, H, HEAD_DIM], pl.BF16],
     ori_kv: pl.Tensor[[ORI_BLOCK_NUM_DYN, BLOCK_SIZE, 1, HEAD_DIM], pl.BF16],
     window_swa_indices: pl.Tensor[[T_DYN, WIN], pl.INT32],
@@ -116,8 +117,10 @@ def sparse_attn_csa(
     attn_sink: pl.Tensor[[H], pl.FP32],
     freqs_cos: pl.Tensor[[T_DYN, ROPE_DIM], pl.BF16],
     freqs_sin: pl.Tensor[[T_DYN, ROPE_DIM], pl.BF16],
+    o_packed_heads: pl.Tensor[[PACKED_ROWS_DYN, O_GROUP_IN], pl.BF16],
+    FUSE_FINAL: pl.constexpr,
 ):
-    """Plan and run CSA QK/PV over sparse blocks, and build inverse-RoPE metadata."""
+    """Run CSA sparse attention with optional in-core normalization and head publication."""
     # Compressed index contract.
     ori_block_num = pl.tensor.dim(ori_kv, 0)
     t_dim = pl.tensor.dim(q, 0)
@@ -177,14 +180,51 @@ def sparse_attn_csa(
                 bias_pad = pl.full([BIAS_T_TILE, PADDED_TOPK - TOPK], dtype=pl.FP32, value=NEG_INF)
                 sparse_bias[bias_t0 : bias_t0 + BIAS_T_TILE, TOPK:PADDED_TOPK] = bias_pad
 
+    # Interleaved inverse-RoPE frequency rows.
+    rope_cos_il = pl.create_tensor([T_PAD, ROPE_DIM], dtype=pl.FP32)
+    rope_sin_signed = pl.create_tensor([T_PAD, ROPE_DIM], dtype=pl.FP32)
+    # Inverse-RoPE lane-swap index.
+    rope_swap_idx = pl.create_tensor([H_TILE, ROPE_DIM], dtype=pl.INT32)
+    with pl.at(level=pl.Level.CORE_GROUP, name_hint="rope_swap") as swap_tid:
+        sw_ones = pl.full([H_TILE, ROPE_DIM], dtype=pl.FP32, value=1.0)
+        sw_idx_f = pl.cast(pl.arange(0, [1, ROPE_DIM], dtype=pl.INT32), target_type=pl.FP32)
+        sw_col = pl.col_expand_mul(sw_ones, sw_idx_f)
+        sw_dup_i32 = pl.cast(pl.mul(sw_col, 0.5), target_type=pl.INT32, mode="trunc")
+        sw_dup_f = pl.cast(sw_dup_i32, target_type=pl.FP32)
+        sw_lane = pl.sub(sw_col, pl.mul(sw_dup_f, 2.0))
+        sw_swap_f = pl.sub(pl.add(sw_col, 1.0), pl.mul(sw_lane, 2.0))
+        rope_swap_idx[0:H_TILE, 0:ROPE_DIM] = pl.cast(sw_swap_f, target_type=pl.INT32)
+
+    with pl.spmd(pl.min(rope_cs_blocks, ROPE_CS_WORKERS), name_hint="rope_cs", deps=[swap_tid], allow_early_resolve=True) as rope_tid:
+        for cs_block in pl.range(pl.tile.get_block_idx(), rope_cs_blocks, pl.min(rope_cs_blocks, ROPE_CS_WORKERS)):
+            cs_t0 = cs_block * ROPE_CS_T_TILE
+            cs_ones = pl.full([ROPE_CS_T_TILE, ROPE_DIM], dtype=pl.FP32, value=1.0)
+            cs_idx_f = pl.cast(pl.arange(0, [1, ROPE_DIM], dtype=pl.INT32), target_type=pl.FP32)
+            cs_col = pl.col_expand_mul(cs_ones, cs_idx_f)
+            cs_dup_i32 = pl.cast(pl.mul(cs_col, 0.5), target_type=pl.INT32, mode="trunc")
+            cs_dup_f = pl.cast(cs_dup_i32, target_type=pl.FP32)
+            cs_dup_idx = pl.cast(cs_dup_f, target_type=pl.INT32)
+            cs_lane = pl.sub(cs_col, pl.mul(cs_dup_f, 2.0))
+            cs_sign = pl.neg(pl.sub(pl.mul(cs_lane, 2.0), 1.0))
+            cs_cos = pl.cast(freqs_cos[cs_t0 : cs_t0 + ROPE_CS_T_TILE, 0:HALF_ROPE], target_type=pl.FP32)
+            cs_sin = pl.cast(freqs_sin[cs_t0 : cs_t0 + ROPE_CS_T_TILE, 0:HALF_ROPE], target_type=pl.FP32)
+            rope_cos_il[cs_t0 : cs_t0 + ROPE_CS_T_TILE, 0:ROPE_DIM] = pl.gather(cs_cos, dim=-1, index=cs_dup_idx)
+            cs_sin_il = pl.gather(cs_sin, dim=-1, index=cs_dup_idx)
+            rope_sin_signed[cs_t0 : cs_t0 + ROPE_CS_T_TILE, 0:ROPE_DIM] = pl.mul(cs_sin_il, cs_sign)
+
     # QK/PV scratch tensors.
     cmp_block_num = pl.tensor.dim(cmp_kv, 0)
     cmp_kv_flat = pl.reshape(cmp_kv, [cmp_block_num * BLOCK_SIZE, HEAD_DIM])
     q_flat = pl.reshape(q, [t_heads, HEAD_DIM])
     attn_sink_col = pl.reshape(attn_sink, [H, 1])
-    attn_mi = pl.create_tensor([t_heads, 1], dtype=pl.FP32)
-    attn_li = pl.create_tensor([t_heads, 1], dtype=pl.FP32)
-    attn_oi = pl.create_tensor([t_heads, HEAD_DIM], dtype=pl.FP32)
+    # TP1 only publishes packed heads; TP>1 retains the statistics contract.
+    if FUSE_FINAL:
+        stats_heads = 1
+    else:
+        stats_heads = t_heads
+    attn_mi = pl.create_tensor([stats_heads, 1], dtype=pl.FP32)
+    attn_li = pl.create_tensor([stats_heads, 1], dtype=pl.FP32)
+    attn_oi = pl.create_tensor([stats_heads, HEAD_DIM], dtype=pl.FP32)
 
     transfer_slots = NUM_QK_CORES * QK_TRANSFER_SLOTS
     transfer_heads = transfer_slots * H
@@ -196,7 +236,7 @@ def sparse_attn_csa(
     mi_transfer = pl.create_tensor([transfer_heads, 1], dtype=pl.FP32)
     li_transfer = pl.create_tensor([transfer_heads, 1], dtype=pl.FP32)
     ffts_workspace = pl.create_tensor([256], dtype=pl.INT64)
-    with pl.spmd(NUM_QK_CORES, name_hint="qk_pv", deps=[qk_plan_tid], allow_early_resolve=True) as qk_tid:
+    with pl.spmd(NUM_QK_CORES, name_hint="qk_pv", deps=[qk_plan_tid, rope_tid], allow_early_resolve=True) as qk_tid:
         qk_core = pl.tile.get_block_idx()
         pl.system.set_ffts(ffts_workspace)
         for qk_t in pl.range(qk_core, t_dim, NUM_QK_CORES):
@@ -248,7 +288,6 @@ def sparse_attn_csa(
                 pl.system.set_ffts(ffts_workspace)
                 qk_lane_head = qk_aiv * (H // 2)
                 qk_lane_kv = qk_aiv * (ATTN_K_TILE // 2)
-                qk_reduce_tmp = pl.create_tile([H // 2, ATTN_K_TILE], dtype=pl.FP32, target_memory=pl.MemorySpace.Vec)
                 running_m = pl.load(attn_sink_col, [qk_lane_head, 0], [H // 2, 1], target_memory=pl.MemorySpace.Vec)
                 running_l = pl.tile.muls(running_m, 0.0)
                 running_left = pl.tile.full([H // 2, HEAD_DIM // 2], dtype=pl.FP32, value=0.0)
@@ -309,6 +348,7 @@ def sparse_attn_csa(
                             )
                             qk_scaled = pl.mul(qk_scores_half, SOFTMAX_SCALE)
                             qk_masked = pl.col_expand_add(qk_scaled, qk_bias)
+                            qk_reduce_tmp = pl.create_tile([H // 2, ATTN_K_TILE], dtype=pl.FP32, target_memory=pl.MemorySpace.Vec)
                             qk_mi = pl.row_max(qk_masked, qk_reduce_tmp)
                             qk_exp = pl.exp(pl.row_expand_sub(qk_masked, qk_mi))
                             qk_li = pl.row_sum(qk_exp, qk_reduce_tmp)
@@ -352,53 +392,93 @@ def sparse_attn_csa(
                             m_valid, l_valid, left_valid, right_valid = pl.yield_(next_m, next_l, next_left, next_right)
                         else:
                             m_valid, l_valid, left_valid, right_valid = pl.yield_(m_iter, l_iter, left_iter, right_iter)
+                        # Publish on the final logical block, including an invalid final block.
+                        if FUSE_FINAL and pv_sb == SPARSE_BLOCKS - 1:
+                            m_swap = pl.load(rope_swap_idx, [0, 0], [H_TILE, ROPE_DIM])
+                            m_swap_f = pl.cast(m_swap, target_type=pl.FP32)
+                            m_swap_source = pl.add(m_swap_f, NOPE_DIM)
+                            m_row_ids = pl.tile.arange(0, [1, H_TILE], dtype=pl.INT32)
+                            m_row_ids_f = pl.cast(m_row_ids, target_type=pl.FP32)
+                            m_row_offsets = pl.mul(m_row_ids_f, HEAD_DIM)
+                            m_row_offsets_col = pl.reshape(m_row_offsets, [H_TILE, 1])
+                            m_swap_flat = pl.row_expand_add(m_swap_source, m_row_offsets_col)
+                            m_swap_idx = pl.cast(m_swap_flat, target_type=pl.INT32)
+                            m_gather_tmp = pl.create_tile([H_TILE, ROPE_DIM], dtype=pl.INT32)
+                            for pub_h in pl.unroll((H // 2) // H_TILE):
+                                pub_head = pub_h * H_TILE
+                                m_h0 = qk_lane_head + pub_head
+                                # Extract ND rows before restoring column statistics, preserving head offsets.
+                                m_mi_row = pl.reshape(m_valid, [1, H // 2])
+                                m_mi_part = pl.tile.extract(m_mi_row, 0, pub_head, [1, H_TILE], target_memory=pl.MemorySpace.Vec)
+                                m_mi = pl.reshape(m_mi_part, [H_TILE, 1])
+                                m_li_row = pl.reshape(l_valid, [1, H // 2])
+                                m_li_part = pl.tile.extract(m_li_row, 0, pub_head, [1, H_TILE], target_memory=pl.MemorySpace.Vec)
+                                m_li = pl.reshape(m_li_part, [H_TILE, 1])
+                                m_left = pl.slice(left_valid, [H_TILE, HEAD_DIM // 2], [pub_head, 0])
+                                m_right = pl.slice(right_valid, [H_TILE, HEAD_DIM // 2], [pub_head, 0])
+                                m_oi = pl.concat(m_left, m_right)
+                                n_sink_bias = pl.load(attn_sink_col, [m_h0, 0], [H_TILE, 1])
+                                n_sink_tile = pl.add(pl.sub(m_mi, m_mi), n_sink_bias)
+                                n_denom = pl.add(m_li, pl.exp(pl.sub(n_sink_tile, m_mi)))
+                                n_full = pl.row_expand_div(m_oi, n_denom)
+                                n_bf16 = pl.cast(n_full, target_type=pl.BF16, mode="rint")
+
+                                # Inverse-RoPE head tile.
+                                m_rope = n_full[0:H_TILE, NOPE_DIM:HEAD_DIM]
+                                m_cos_il = pl.load(rope_cos_il, [qk_t, 0], [1, ROPE_DIM])
+                                m_sin_signed = pl.load(rope_sin_signed, [qk_t, 0], [1, ROPE_DIM])
+                                m_swapped = pl.tile.gather(n_full, m_swap_idx, m_gather_tmp)
+                                m_rot = pl.add(pl.col_expand_mul(m_rope, m_cos_il), pl.col_expand_mul(m_swapped, m_sin_signed))
+                                n_rope_bf16 = pl.cast(m_rot, target_type=pl.BF16, mode="rint")
+                                n_full_bf16 = pl.concat(n_bf16[0:H_TILE, 0:NOPE_DIM], n_rope_bf16)
+
+                                n_group_bf16 = pl.reshape(n_full_bf16, [PUBLISH_GROUPS, O_GROUP_IN])
+                                n_pack_first = n_group_bf16[0:1, 0:O_GROUP_IN]
+                                n_pack_second = n_group_bf16[1:2, 0:O_GROUP_IN]
+                                n_pack_row = (m_h0 // HEADS_PER_GROUP) * T_PAD + qk_t
+                                n_pack_row_second = n_pack_row + T_PAD
+                                pl.store(n_pack_first, [n_pack_row, 0], o_packed_heads)
+                                pl.store(n_pack_second, [n_pack_row_second, 0], o_packed_heads)
                         m_after, l_after, left_after, right_after = pl.yield_(m_valid, l_valid, left_valid, right_valid)
                     else:
                         m_after, l_after, left_after, right_after = pl.yield_(m_iter, l_iter, left_iter, right_iter)
                     running_m, running_l, running_left, running_right = pl.yield_(m_after, l_after, left_after, right_after)
-                qk_output_row = qk_t * H + qk_lane_head
-                pl.store(running_m, [qk_output_row, 0], attn_mi)
-                pl.store(running_l, [qk_output_row, 0], attn_li)
-                pl.store(running_left, [qk_output_row, 0], attn_oi)
-                pl.store(running_right, [qk_output_row, HEAD_DIM // 2], attn_oi)
-
-    # Interleaved inverse-RoPE frequency rows.
-    rope_cos_il = pl.create_tensor([T_PAD, ROPE_DIM], dtype=pl.FP32)
-    rope_sin_signed = pl.create_tensor([T_PAD, ROPE_DIM], dtype=pl.FP32)
-    # Inverse-RoPE lane-swap index.
-    rope_swap_idx = pl.create_tensor([H_TILE, ROPE_DIM], dtype=pl.INT32)
-    with pl.at(level=pl.Level.CORE_GROUP, name_hint="rope_swap") as swap_tid:
-        sw_ones = pl.full([H_TILE, ROPE_DIM], dtype=pl.FP32, value=1.0)
-        sw_idx_f = pl.cast(pl.arange(0, [1, ROPE_DIM], dtype=pl.INT32), target_type=pl.FP32)
-        sw_col = pl.col_expand_mul(sw_ones, sw_idx_f)
-        sw_dup_i32 = pl.cast(pl.mul(sw_col, 0.5), target_type=pl.INT32, mode="trunc")
-        sw_dup_f = pl.cast(sw_dup_i32, target_type=pl.FP32)
-        sw_lane = pl.sub(sw_col, pl.mul(sw_dup_f, 2.0))
-        sw_swap_f = pl.sub(pl.add(sw_col, 1.0), pl.mul(sw_lane, 2.0))
-        rope_swap_idx[0:H_TILE, 0:ROPE_DIM] = pl.cast(sw_swap_f, target_type=pl.INT32)
-
-    with pl.spmd(pl.min(rope_cs_blocks, ROPE_CS_WORKERS), name_hint="rope_cs", deps=[swap_tid], allow_early_resolve=True) as rope_tid:
-        for cs_block in pl.range(pl.tile.get_block_idx(), rope_cs_blocks, pl.min(rope_cs_blocks, ROPE_CS_WORKERS)):
-            cs_t0 = cs_block * ROPE_CS_T_TILE
-            cs_ones = pl.full([ROPE_CS_T_TILE, ROPE_DIM], dtype=pl.FP32, value=1.0)
-            cs_idx_f = pl.cast(pl.arange(0, [1, ROPE_DIM], dtype=pl.INT32), target_type=pl.FP32)
-            cs_col = pl.col_expand_mul(cs_ones, cs_idx_f)
-            cs_dup_i32 = pl.cast(pl.mul(cs_col, 0.5), target_type=pl.INT32, mode="trunc")
-            cs_dup_f = pl.cast(cs_dup_i32, target_type=pl.FP32)
-            cs_dup_idx = pl.cast(cs_dup_f, target_type=pl.INT32)
-            cs_lane = pl.sub(cs_col, pl.mul(cs_dup_f, 2.0))
-            cs_sign = pl.neg(pl.sub(pl.mul(cs_lane, 2.0), 1.0))
-            cs_cos = pl.cast(freqs_cos[cs_t0 : cs_t0 + ROPE_CS_T_TILE, 0:HALF_ROPE], target_type=pl.FP32)
-            cs_sin = pl.cast(freqs_sin[cs_t0 : cs_t0 + ROPE_CS_T_TILE, 0:HALF_ROPE], target_type=pl.FP32)
-            rope_cos_il[cs_t0 : cs_t0 + ROPE_CS_T_TILE, 0:ROPE_DIM] = pl.gather(cs_cos, dim=-1, index=cs_dup_idx)
-            cs_sin_il = pl.gather(cs_sin, dim=-1, index=cs_dup_idx)
-            rope_sin_signed[cs_t0 : cs_t0 + ROPE_CS_T_TILE, 0:ROPE_DIM] = pl.mul(cs_sin_il, cs_sign)
+                if not FUSE_FINAL:
+                    qk_output_row = qk_t * H + qk_lane_head
+                    pl.store(running_m, [qk_output_row, 0], attn_mi)
+                    pl.store(running_l, [qk_output_row, 0], attn_li)
+                    pl.store(running_left, [qk_output_row, 0], attn_oi)
+                    pl.store(running_right, [qk_output_row, HEAD_DIM // 2], attn_oi)
 
     return (
         attn_mi, attn_li, attn_oi,
         rope_cos_il, rope_sin_signed, rope_swap_idx,
         qk_tid, rope_tid,
     )
+
+
+@pl.jit.inline(auto_scope=False)
+def sparse_attn_csa(
+    q: pl.Tensor[[T_DYN, H, HEAD_DIM], pl.BF16],
+    ori_kv: pl.Tensor[[ORI_BLOCK_NUM_DYN, BLOCK_SIZE, 1, HEAD_DIM], pl.BF16],
+    window_swa_indices: pl.Tensor[[T_DYN, WIN], pl.INT32],
+    cmp_kv: pl.Tensor[[CMP_BLOCK_NUM_DYN, BLOCK_SIZE, 1, HEAD_DIM], pl.BF16],
+    cmp_block_table: pl.Tensor[[B_DYN, CMP_MAX_BLOCKS], pl.INT32],
+    idx_topk: pl.Tensor[[T_DYN, IDX_TOPK], pl.INT32],
+    position_ids: pl.Tensor[[T_DYN, 1], pl.INT32],
+    attn_sink: pl.Tensor[[H], pl.FP32],
+    freqs_cos: pl.Tensor[[T_DYN, ROPE_DIM], pl.BF16],
+    freqs_sin: pl.Tensor[[T_DYN, ROPE_DIM], pl.BF16],
+):
+    """Retain the statistics and inverse-RoPE metadata contract for TP>1."""
+    unused_packed = pl.create_tensor([1, O_GROUP_IN], dtype=pl.BF16)
+    (attn_mi, attn_li, attn_oi, rope_cos_il, rope_sin_signed, rope_swap_idx,
+     qk_tid, rope_tid) = _sparse_attn_csa(
+        q, ori_kv, window_swa_indices, cmp_kv, cmp_block_table, idx_topk,
+        position_ids, attn_sink, freqs_cos, freqs_sin, unused_packed, False,
+    )
+    return (attn_mi, attn_li, attn_oi, rope_cos_il, rope_sin_signed,
+            rope_swap_idx, qk_tid, rope_tid)
 
 
 @pl.jit.inline
@@ -415,68 +495,12 @@ def sparse_attn_csa_tp1(
     freqs_sin: pl.Tensor[[T_DYN, ROPE_DIM], pl.BF16],
     o_packed_heads: pl.Tensor[[O_GROUPS * T_PAD, O_GROUP_IN], pl.BF16],
 ) -> tuple[pl.Tensor, pl.Scalar[pl.TASK_ID]]:
-    """Write CSA heads as ``[group, T_PAD, O_GROUP_IN]`` slabs.
-
-    Only the first runtime ``t_dim`` rows in each group are valid. The
-    returned task ID covers every write to the packed output tensor.
-    """
-    (
-        attn_mi, attn_li, attn_oi,
-        rope_cos_il, rope_sin_signed, rope_swap_idx,
-        qk_tid, rope_tid,
-    ) = sparse_attn_csa(
-        q, ori_kv, window_swa_indices,
-        cmp_kv, cmp_block_table, idx_topk,
-        position_ids, attn_sink, freqs_cos, freqs_sin,
+    """Normalize, inverse-rotate and pack heads in the final QK/PV task."""
+    (_mi, _li, _oi, _cos, _sin, _swap, qk_tid, _rope_tid) = _sparse_attn_csa(
+        q, ori_kv, window_swa_indices, cmp_kv, cmp_block_table, idx_topk,
+        position_ids, attn_sink, freqs_cos, freqs_sin, o_packed_heads, True,
     )
-    t_dim = pl.tensor.dim(q, 0)
-
-    merge_sink = pl.reshape(attn_sink, [H, 1])
-    with pl.spmd(MERGE_WORKERS, name_hint="merge_norm", deps=[qk_tid, rope_tid]) as merge_tid:
-        m_worker = pl.tile.get_block_idx()
-        m_swap = pl.load(rope_swap_idx, [0, 0], [H_TILE, ROPE_DIM])
-        m_swap_f = pl.cast(m_swap, target_type=pl.FP32)
-        m_swap_source = pl.add(m_swap_f, NOPE_DIM)
-        m_row_ids = pl.tile.arange(0, [1, H_TILE], dtype=pl.INT32)
-        m_row_ids_f = pl.cast(m_row_ids, target_type=pl.FP32)
-        m_row_offsets = pl.mul(m_row_ids_f, HEAD_DIM)
-        m_row_offsets_col = pl.reshape(m_row_offsets, [H_TILE, 1])
-        m_swap_flat = pl.row_expand_add(m_swap_source, m_row_offsets_col)
-        m_swap_idx = pl.cast(m_swap_flat, target_type=pl.INT32)
-        m_gather_tmp = pl.create_tile([H_TILE, ROPE_DIM], dtype=pl.INT32)
-        for m_idx in pl.range(m_worker, t_dim * (H // H_TILE), MERGE_WORKERS):
-            m_t = m_idx // (H // H_TILE)
-            m_h_idx = m_idx - m_t * (H // H_TILE)
-            m_h0 = m_h_idx * H_TILE
-            m_row = m_idx * H_TILE
-            m_mi = pl.load(attn_mi, [m_row, 0], [H_TILE, 1])
-            m_li = pl.load(attn_li, [m_row, 0], [H_TILE, 1])
-            m_oi = pl.load(attn_oi, [m_row, 0], [H_TILE, HEAD_DIM])
-
-            n_sink_bias = pl.load(merge_sink, [m_h0, 0], [H_TILE, 1])
-            n_sink_tile = pl.add(pl.sub(m_mi, m_mi), n_sink_bias)
-            n_denom = pl.add(m_li, pl.exp(pl.sub(n_sink_tile, m_mi)))
-            n_full = pl.row_expand_div(m_oi, n_denom)
-            n_bf16 = pl.cast(n_full, target_type=pl.BF16, mode="rint")
-
-            # Inverse-RoPE head tile.
-            m_rope = n_full[0:H_TILE, NOPE_DIM:HEAD_DIM]
-            m_cos_il = pl.load(rope_cos_il, [m_t, 0], [1, ROPE_DIM])
-            m_sin_signed = pl.load(rope_sin_signed, [m_t, 0], [1, ROPE_DIM])
-            m_swapped = pl.tile.gather(n_full, m_swap_idx, m_gather_tmp)
-            m_rot = pl.add(pl.col_expand_mul(m_rope, m_cos_il), pl.col_expand_mul(m_swapped, m_sin_signed))
-            n_rope_bf16 = pl.cast(m_rot, target_type=pl.BF16, mode="rint")
-            n_full_bf16 = pl.concat(n_bf16[0:H_TILE, 0:NOPE_DIM], n_rope_bf16)
-
-            n_group_bf16 = pl.reshape(n_full_bf16, [PUBLISH_GROUPS, O_GROUP_IN])
-            n_pack_first = n_group_bf16[0:1, 0:O_GROUP_IN]
-            n_pack_second = n_group_bf16[1:2, 0:O_GROUP_IN]
-            n_pack_row = (m_h0 // HEADS_PER_GROUP) * T_PAD + m_t
-            n_pack_row_second = n_pack_row + T_PAD
-            pl.store(n_pack_first, [n_pack_row, 0], o_packed_heads)
-            pl.store(n_pack_second, [n_pack_row_second, 0], o_packed_heads)
-
-    return o_packed_heads, merge_tid
+    return o_packed_heads, qk_tid
 
 
 @pl.jit
