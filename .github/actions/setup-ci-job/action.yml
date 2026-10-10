@@ -1266,7 +1266,29 @@ runs:
           python -m venv "$PTOAS_ROOT" --system-site-packages
           "$PTOAS_ROOT/bin/python" -m pip install "$CACHE_WHEEL"
         fi
-        "$PTOAS_ROOT/bin/ptoas" --version
+        # CANN's set_env.sh (sourced by activate.sh on device jobs) prepends its
+        # own site-packages to PYTHONPATH, which outranks ptoas-bin's, so `ptoas`
+        # imports CANN's online-build ptoas and dies on the missing pybind11.
+        # Re-assert ptoas-bin's site right after the job venv's — as the bootstrap
+        # guard already does for the job venv — and rebuild on every source so a
+        # re-prepended CANN entry cannot get back in front.
+        _PYPTO_PTOAS_SITE="$("$PTOAS_ROOT/bin/python" -c 'import sysconfig; print(sysconfig.get_paths()["purelib"])')"
+        echo "_PYPTO_PTOAS_SITE=$_PYPTO_PTOAS_SITE" >> activate.sh
+        cat >> activate.sh <<'EOF'
+        _PYPTO_PP=""
+        _PYPTO_IFS="$IFS"; IFS=":"
+        for _p in ${PYTHONPATH:-}; do
+          case "$_p" in ""|"$_PYPTO_SITE"|"$_PYPTO_PTOAS_SITE") continue ;; esac
+          _PYPTO_PP="${_PYPTO_PP:+$_PYPTO_PP:}$_p"
+        done
+        IFS="$_PYPTO_IFS"
+        export PYTHONPATH="$_PYPTO_SITE:$_PYPTO_PTOAS_SITE${_PYPTO_PP:+:$_PYPTO_PP}"
+        EOF
+        ( source activate.sh
+          source activate.sh
+          "$PTOAS_ROOT/bin/ptoas" --version
+          "$PTOAS_ROOT/bin/python" -c 'import os, sys, sysconfig, ptoas; s=os.path.realpath(sysconfig.get_paths()["purelib"]); p=os.path.realpath(ptoas.__file__); sys.exit(0 if p.startswith(s+os.sep) else f"::error::ptoas -> {p} (outside ptoas-bin {s})")'
+        )
 
     - name: Report toolchain versions
       # One grep-able block naming every component a failure has to be
