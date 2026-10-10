@@ -1020,11 +1020,15 @@ def prefill_attention_hca(
         part0_predecessor_valid = pl.cast(0, pl.INT32)
         if pl.read(history_slot_mapping, [0, TAIL_ROWS - 1]) >= 0:
             part0_predecessor_valid = pl.cast(pl.min(TAIL_ROWS, pl.max(0, pl.read(segment_starts_t, [0]))), pl.INT32)
+    # This dense identity-mapped cache only needs rows visible to this part.
+    part0_last_position = pl.read(query_positions_flat, [part0_rows - 1])
+    part0_cmp_rows = pl.max(1, pl.min(HCA_MAX_COMPRESSED_ROWS, (part0_last_position + 1) // COMPRESS_RATIO))
+    part0_cmp_kv = pl.slice(attn_cmp_kv, [part0_cmp_rows, 1, 1, HEAD_DIM], [0, 0, 0, 0])
     part0_attn_tid = hca_attn(
         q_part0,
         full_kv_part0,
         part0_predecessor_valid,
-        attn_cmp_kv,
+        part0_cmp_kv,
         attn_cmp_table,
         positions_part0,
         attn_sink,
@@ -1050,11 +1054,15 @@ def prefill_attention_hca(
         part1_predecessor_valid = pl.cast(0, pl.INT32)
         if pl.read(history_slot_mapping, [1, TAIL_ROWS - 1]) >= 0:
             part1_predecessor_valid = pl.cast(pl.min(TAIL_ROWS, pl.max(0, pl.read(segment_starts_t, [0]))), pl.INT32)
+    # This dense identity-mapped cache only needs rows visible to this part.
+    part1_last_position = pl.read(query_positions_flat, [part1_row0 + part1_rows - 1])
+    part1_cmp_rows = pl.max(1, pl.min(HCA_MAX_COMPRESSED_ROWS, (part1_last_position + 1) // COMPRESS_RATIO))
+    part1_cmp_kv = pl.slice(attn_cmp_kv, [part1_cmp_rows, 1, 1, HEAD_DIM], [0, 0, 0, 0])
     attention_done_tid = hca_attn(
         q_part1,
         full_kv_part1,
         part1_predecessor_valid,
-        attn_cmp_kv,
+        part1_cmp_kv,
         attn_cmp_table,
         positions_part1,
         attn_sink,

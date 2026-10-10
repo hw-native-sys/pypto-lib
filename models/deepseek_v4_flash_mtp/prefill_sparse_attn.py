@@ -147,6 +147,7 @@ HCA_HIST_PACK_ROW_TILE = 16   # packed-history destination rows per block
 # 512-row segment (CP8 at 8192 tokens) left tokens 384..511 with an unwritten mask
 # under a tile of 8. Tying the two tiles together makes the coverage unconditional.
 HCA_HIST_MASK_TOKEN_TILE = HCA_HIST_PACK_ROW_TILE
+HCA_QUERY_TILE = 6
 HCA_ATTN_TILE = 128
 HCA_MAX_COMPRESSED_ROWS = (M.max_position_embeddings + HCA_COMPRESS_RATIO - 1) // HCA_COMPRESS_RATIO
 HCA_CMP_WORK_COUNT = (HCA_MAX_COMPRESSED_ROWS + HCA_ATTN_TILE - 1) // HCA_ATTN_TILE
@@ -1174,106 +1175,110 @@ def _hca_segment_heads(
 
 
     q_flat = pl.reshape(q, [query_head_rows, HEAD_DIM])
-    with pl.spmd(token_rows, name_hint="native_hca_raw_qk_pv", deps=[raw_gather_tid]) as raw_heads_tid:
-        raw_local_t = pl.tile.get_block_idx()
-        raw_t = raw_local_t
-        if raw_t < active_rows:
-            raw_src = raw_local_t + 1 + predecessor_valid
-            raw_kv_tile = hist_view[raw_src:raw_src + WIN, 0:HEAD_DIM]
-            raw_valid_row = raw_valid_view[raw_local_t:raw_local_t + 1, 0:WIN]
-            raw_valid_zero = pl.full([QK_M_TILE, WIN], dtype=pl.FP32, value=0.0)
-            raw_valid_tile = pl.col_expand_add(raw_valid_zero, raw_valid_row)
-            raw_bias = pl.mul(pl.sub(raw_valid_tile, 1.0), -FP32_NEG_INF)
-            raw_token_row = raw_local_t * H
-            for raw_hb in pl.pipeline(H // QK_M_TILE, stage=2):
-                raw_h0 = raw_hb * QK_M_TILE
-                raw_q_row = raw_t * H + raw_h0
-                raw_q = q_flat[raw_q_row:raw_q_row + QK_M_TILE, 0:HEAD_DIM]
-                raw_scores = pl.matmul(raw_q, raw_kv_tile, b_trans=True, out_dtype=pl.FP32)
-                raw_scores = pl.add(pl.mul(raw_scores, SOFTMAX_SCALE), raw_bias)
-                raw_m = pl.row_max(raw_scores)
-                raw_exp = pl.exp(pl.row_expand_sub(raw_scores, raw_m))
-                raw_exp = pl.mul(raw_exp, raw_valid_tile)
-                raw_l = pl.row_sum(raw_exp)
-                raw_o = pl.matmul(pl.cast(raw_exp, target_type=pl.BF16, mode="rint"), raw_kv_tile, out_dtype=pl.FP32)
-                for raw_sub in pl.unroll(QK_M_TILE // HEAD_TILE):
-                    raw_src_h0 = raw_sub * HEAD_TILE
-                    raw_dst = raw_token_row + raw_h0 + raw_src_h0
-                    stream_state_m[raw_dst:raw_dst + HEAD_TILE, 0:1] = raw_m[raw_src_h0:raw_src_h0 + HEAD_TILE, 0:1]
-                    stream_state_l[raw_dst:raw_dst + HEAD_TILE, 0:1] = raw_l[raw_src_h0:raw_src_h0 + HEAD_TILE, 0:1]
-                    stream_heads[raw_dst:raw_dst + HEAD_TILE, 0:HEAD_DIM] = raw_o[
-                        raw_src_h0:raw_src_h0 + HEAD_TILE, 0:HEAD_DIM
-                    ]
+    with pl.spmd((token_rows + HCA_QUERY_TILE - 1) // HCA_QUERY_TILE, name_hint="native_hca_raw_qk_pv", deps=[raw_gather_tid]) as raw_heads_tid:
+        raw_query_begin = pl.tile.get_block_idx() * HCA_QUERY_TILE
+        for raw_query_offset in pl.range(HCA_QUERY_TILE):
+            raw_local_t = raw_query_begin + raw_query_offset
+            raw_t = raw_local_t
+            if raw_t < active_rows and raw_t < token_rows:
+                raw_src = raw_local_t + 1 + predecessor_valid
+                raw_kv_tile = hist_view[raw_src:raw_src + WIN, 0:HEAD_DIM]
+                raw_valid_row = raw_valid_view[raw_local_t:raw_local_t + 1, 0:WIN]
+                raw_valid_zero = pl.full([QK_M_TILE, WIN], dtype=pl.FP32, value=0.0)
+                raw_valid_tile = pl.col_expand_add(raw_valid_zero, raw_valid_row)
+                raw_bias = pl.mul(pl.sub(raw_valid_tile, 1.0), -FP32_NEG_INF)
+                raw_token_row = raw_local_t * H
+                for raw_hb in pl.pipeline(H // QK_M_TILE, stage=2):
+                    raw_h0 = raw_hb * QK_M_TILE
+                    raw_q_row = raw_t * H + raw_h0
+                    raw_q = q_flat[raw_q_row:raw_q_row + QK_M_TILE, 0:HEAD_DIM]
+                    raw_scores = pl.matmul(raw_q, raw_kv_tile, b_trans=True, out_dtype=pl.FP32)
+                    raw_scores = pl.add(pl.mul(raw_scores, SOFTMAX_SCALE), raw_bias)
+                    raw_m = pl.row_max(raw_scores)
+                    raw_exp = pl.exp(pl.row_expand_sub(raw_scores, raw_m))
+                    raw_exp = pl.mul(raw_exp, raw_valid_tile)
+                    raw_l = pl.row_sum(raw_exp)
+                    raw_o = pl.matmul(pl.cast(raw_exp, target_type=pl.BF16, mode="rint"), raw_kv_tile, out_dtype=pl.FP32)
+                    for raw_sub in pl.unroll(QK_M_TILE // HEAD_TILE):
+                        raw_src_h0 = raw_sub * HEAD_TILE
+                        raw_dst = raw_token_row + raw_h0 + raw_src_h0
+                        stream_state_m[raw_dst:raw_dst + HEAD_TILE, 0:1] = raw_m[raw_src_h0:raw_src_h0 + HEAD_TILE, 0:1]
+                        stream_state_l[raw_dst:raw_dst + HEAD_TILE, 0:1] = raw_l[raw_src_h0:raw_src_h0 + HEAD_TILE, 0:1]
+                        stream_heads[raw_dst:raw_dst + HEAD_TILE, 0:HEAD_DIM] = raw_o[
+                            raw_src_h0:raw_src_h0 + HEAD_TILE, 0:HEAD_DIM
+                        ]
 
-    with pl.spmd(token_rows, name_hint="native_hca_cmp_qk_pv", deps=[wave_completion[0]]) as cmp_qk_tid:
-        # One token task walks its visible compressed work tiles in order and folds
-        # each tile's online-softmax partial into one running (m, l, o) per head row.
-        qk_local_t = pl.tile.get_block_idx()
-        qk_t = qk_local_t
-        qk_token_base = qk_local_t * H
-        if qk_t < active_rows:
-            qk_position_i32 = pl.read(position_ids, [qk_t])
-            if qk_position_i32 >= 0:
-                qk_visible_rows = (qk_position_i32 + 1) // HCA_COMPRESS_RATIO
-                qk_visible_rows = pl.min(qk_visible_rows, cmp_work_rows_avail)
-                neutral_m = pl.full([HEAD_TILE, 8], dtype=pl.FP32, value=FP32_NEG_INF)
-                neutral_l = pl.full([HEAD_TILE, 8], dtype=pl.FP32, value=0.0)
-                neutral_o = pl.full([HEAD_TILE, HEAD_DIM], dtype=pl.FP32, value=0.0)
-                for qk_h_idx in pl.range(H // HEAD_TILE):
-                    neutral_row = qk_token_base + qk_h_idx * HEAD_TILE
-                    cmp_partial_m[neutral_row:neutral_row + HEAD_TILE, 0:8] = neutral_m
-                    cmp_partial_l[neutral_row:neutral_row + HEAD_TILE, 0:8] = neutral_l
-                    cmp_partial_o[neutral_row:neutral_row + HEAD_TILE, 0:HEAD_DIM] = neutral_o
-                for qk_work in pl.range((qk_visible_rows + HCA_ATTN_TILE - 1) // HCA_ATTN_TILE):
-                    qk_work_row = qk_work * HCA_ATTN_TILE
-                    qk_valid_rows = pl.min(HCA_ATTN_TILE, qk_visible_rows - qk_work_row)
-                    qk_kv = cmp_work_kv[qk_work_row:qk_work_row + HCA_ATTN_TILE, 0:HEAD_DIM]
-                    qk_valid_row = cmp_work_valid[qk_work:qk_work + 1, :]
-                    qk_valid_zero = pl.full([QK_M_TILE, HCA_ATTN_TILE], dtype=pl.FP32, value=0.0)
-                    qk_valid = pl.col_expand_add(qk_valid_zero, qk_valid_row)
-                    qk_bias = pl.mul(pl.sub(qk_valid, 1.0), -FP32_NEG_INF)
-                    for qk_hb in pl.pipeline(H // QK_M_TILE, stage=2):
-                        qk_h0 = qk_hb * QK_M_TILE
-                        qk_q_row = qk_t * H + qk_h0
-                        qk_q = q_flat[qk_q_row:qk_q_row + QK_M_TILE, 0:HEAD_DIM]
-                        qk_scores = pl.matmul(qk_q, qk_kv, b_trans=True, out_dtype=pl.FP32)
-                        qk_scores = pl.add(pl.mul(qk_scores, SOFTMAX_SCALE), qk_bias)
-                        qk_scores = pl.set_validshape(qk_scores, QK_M_TILE, qk_valid_rows)
-                        qk_scores = pl.fillpad(qk_scores, pad_value=pl.PadValue.min)
-                        qk_m = pl.row_max(qk_scores)
-                        qk_exp = pl.exp(pl.row_expand_sub(qk_scores, qk_m))
-                        qk_exp = pl.mul(qk_exp, qk_valid)
-                        qk_l = pl.row_sum(qk_exp)
-                        qk_o = pl.matmul(pl.cast(qk_exp, target_type=pl.BF16, mode="rint"), qk_kv, out_dtype=pl.FP32)
-                        for qk_sub in pl.unroll(QK_M_TILE // HEAD_TILE):
-                            qk_src_h0 = qk_sub * HEAD_TILE
-                            qk_row = qk_token_base + qk_h0 + qk_src_h0
-                            qk_cur_m = qk_m[qk_src_h0:qk_src_h0 + HEAD_TILE, 0:1]
-                            qk_cur_l = qk_l[qk_src_h0:qk_src_h0 + HEAD_TILE, 0:1]
-                            qk_cur_o = qk_o[qk_src_h0:qk_src_h0 + HEAD_TILE, 0:HEAD_DIM]
-                            # Read col0 as a dense [HEAD_TILE, 1] vector: a column
-                            # view of a padded tile keeps the row pitch.
-                            qk_run_m_padded = cmp_partial_m[qk_row:qk_row + HEAD_TILE, 0:8]
-                            qk_run_l_padded = cmp_partial_l[qk_row:qk_row + HEAD_TILE, 0:8]
-                            qk_run_m_transposed = pl.transpose(qk_run_m_padded, axis1=0, axis2=1)
-                            qk_run_l_transposed = pl.transpose(qk_run_l_padded, axis1=0, axis2=1)
-                            qk_run_m = pl.reshape(qk_run_m_transposed[0:1, :], [HEAD_TILE, 1])
-                            qk_run_l = pl.reshape(qk_run_l_transposed[0:1, :], [HEAD_TILE, 1])
-                            qk_run_o = cmp_partial_o[qk_row:qk_row + HEAD_TILE, 0:HEAD_DIM]
-                            qk_next_m = pl.maximum(qk_run_m, qk_cur_m)
-                            qk_alpha = pl.exp(pl.sub(qk_run_m, qk_next_m))
-                            qk_beta = pl.exp(pl.sub(qk_cur_m, qk_next_m))
-                            qk_next_l = pl.add(pl.mul(qk_alpha, qk_run_l), pl.mul(qk_beta, qk_cur_l))
-                            qk_next_o = pl.add(
-                                pl.row_expand_mul(qk_run_o, qk_alpha),
-                                pl.row_expand_mul(qk_cur_o, qk_beta),
-                            )
-                            # Write whole scratch rows: a narrow column
-                            # store ignores the padded row pitch.
-                            qk_stat_zeros = pl.full([HEAD_TILE, 8], dtype=pl.FP32, value=0.0)
-                            cmp_partial_m[qk_row:qk_row + HEAD_TILE, 0:8] = pl.row_expand_add(qk_stat_zeros, qk_next_m)
-                            cmp_partial_l[qk_row:qk_row + HEAD_TILE, 0:8] = pl.row_expand_add(qk_stat_zeros, qk_next_l)
-                            cmp_partial_o[qk_row:qk_row + HEAD_TILE, 0:HEAD_DIM] = qk_next_o
+    with pl.spmd((token_rows + HCA_QUERY_TILE - 1) // HCA_QUERY_TILE, name_hint="native_hca_cmp_qk_pv", deps=[wave_completion[0]]) as cmp_qk_tid:
+        cmp_query_begin = pl.tile.get_block_idx() * HCA_QUERY_TILE
+        for cmp_query_offset in pl.range(HCA_QUERY_TILE):
+            # Each query walks its visible compressed work tiles in order and folds
+            # each tile's online-softmax partial into one running (m, l, o) per head row.
+            qk_local_t = cmp_query_begin + cmp_query_offset
+            qk_t = qk_local_t
+            qk_token_base = qk_local_t * H
+            if qk_t < active_rows and qk_t < token_rows:
+                qk_position_i32 = pl.read(position_ids, [qk_t])
+                if qk_position_i32 >= 0:
+                    qk_visible_rows = (qk_position_i32 + 1) // HCA_COMPRESS_RATIO
+                    qk_visible_rows = pl.min(qk_visible_rows, cmp_work_rows_avail)
+                    neutral_m = pl.full([HEAD_TILE, 8], dtype=pl.FP32, value=FP32_NEG_INF)
+                    neutral_l = pl.full([HEAD_TILE, 8], dtype=pl.FP32, value=0.0)
+                    neutral_o = pl.full([HEAD_TILE, HEAD_DIM], dtype=pl.FP32, value=0.0)
+                    for qk_h_idx in pl.range(H // HEAD_TILE):
+                        neutral_row = qk_token_base + qk_h_idx * HEAD_TILE
+                        cmp_partial_m[neutral_row:neutral_row + HEAD_TILE, 0:8] = neutral_m
+                        cmp_partial_l[neutral_row:neutral_row + HEAD_TILE, 0:8] = neutral_l
+                        cmp_partial_o[neutral_row:neutral_row + HEAD_TILE, 0:HEAD_DIM] = neutral_o
+                    for qk_work in pl.range((qk_visible_rows + HCA_ATTN_TILE - 1) // HCA_ATTN_TILE):
+                        qk_work_row = qk_work * HCA_ATTN_TILE
+                        qk_valid_rows = pl.min(HCA_ATTN_TILE, qk_visible_rows - qk_work_row)
+                        qk_kv = cmp_work_kv[qk_work_row:qk_work_row + HCA_ATTN_TILE, 0:HEAD_DIM]
+                        qk_valid_row = cmp_work_valid[qk_work:qk_work + 1, :]
+                        qk_valid_zero = pl.full([QK_M_TILE, HCA_ATTN_TILE], dtype=pl.FP32, value=0.0)
+                        qk_valid = pl.col_expand_add(qk_valid_zero, qk_valid_row)
+                        qk_bias = pl.mul(pl.sub(qk_valid, 1.0), -FP32_NEG_INF)
+                        for qk_hb in pl.pipeline(H // QK_M_TILE, stage=2):
+                            qk_h0 = qk_hb * QK_M_TILE
+                            qk_q_row = qk_t * H + qk_h0
+                            qk_q = q_flat[qk_q_row:qk_q_row + QK_M_TILE, 0:HEAD_DIM]
+                            qk_scores = pl.matmul(qk_q, qk_kv, b_trans=True, out_dtype=pl.FP32)
+                            qk_scores = pl.add(pl.mul(qk_scores, SOFTMAX_SCALE), qk_bias)
+                            qk_scores = pl.set_validshape(qk_scores, QK_M_TILE, qk_valid_rows)
+                            qk_scores = pl.fillpad(qk_scores, pad_value=pl.PadValue.min)
+                            qk_m = pl.row_max(qk_scores)
+                            qk_exp = pl.exp(pl.row_expand_sub(qk_scores, qk_m))
+                            qk_exp = pl.mul(qk_exp, qk_valid)
+                            qk_l = pl.row_sum(qk_exp)
+                            qk_o = pl.matmul(pl.cast(qk_exp, target_type=pl.BF16, mode="rint"), qk_kv, out_dtype=pl.FP32)
+                            for qk_sub in pl.unroll(QK_M_TILE // HEAD_TILE):
+                                qk_src_h0 = qk_sub * HEAD_TILE
+                                qk_row = qk_token_base + qk_h0 + qk_src_h0
+                                qk_cur_m = qk_m[qk_src_h0:qk_src_h0 + HEAD_TILE, 0:1]
+                                qk_cur_l = qk_l[qk_src_h0:qk_src_h0 + HEAD_TILE, 0:1]
+                                qk_cur_o = qk_o[qk_src_h0:qk_src_h0 + HEAD_TILE, 0:HEAD_DIM]
+                                # Read col0 as a dense [HEAD_TILE, 1] vector: a column
+                                # view of a padded tile keeps the row pitch.
+                                qk_run_m_padded = cmp_partial_m[qk_row:qk_row + HEAD_TILE, 0:8]
+                                qk_run_l_padded = cmp_partial_l[qk_row:qk_row + HEAD_TILE, 0:8]
+                                qk_run_m_transposed = pl.transpose(qk_run_m_padded, axis1=0, axis2=1)
+                                qk_run_l_transposed = pl.transpose(qk_run_l_padded, axis1=0, axis2=1)
+                                qk_run_m = pl.reshape(qk_run_m_transposed[0:1, :], [HEAD_TILE, 1])
+                                qk_run_l = pl.reshape(qk_run_l_transposed[0:1, :], [HEAD_TILE, 1])
+                                qk_run_o = cmp_partial_o[qk_row:qk_row + HEAD_TILE, 0:HEAD_DIM]
+                                qk_next_m = pl.maximum(qk_run_m, qk_cur_m)
+                                qk_alpha = pl.exp(pl.sub(qk_run_m, qk_next_m))
+                                qk_beta = pl.exp(pl.sub(qk_cur_m, qk_next_m))
+                                qk_next_l = pl.add(pl.mul(qk_alpha, qk_run_l), pl.mul(qk_beta, qk_cur_l))
+                                qk_next_o = pl.add(
+                                    pl.row_expand_mul(qk_run_o, qk_alpha),
+                                    pl.row_expand_mul(qk_cur_o, qk_beta),
+                                )
+                                # Write whole scratch rows: a narrow column
+                                # store ignores the padded row pitch.
+                                qk_stat_zeros = pl.full([HEAD_TILE, 8], dtype=pl.FP32, value=0.0)
+                                cmp_partial_m[qk_row:qk_row + HEAD_TILE, 0:8] = pl.row_expand_add(qk_stat_zeros, qk_next_m)
+                                cmp_partial_l[qk_row:qk_row + HEAD_TILE, 0:8] = pl.row_expand_add(qk_stat_zeros, qk_next_l)
+                                cmp_partial_o[qk_row:qk_row + HEAD_TILE, 0:HEAD_DIM] = qk_next_o
 
     attn_sink_col = pl.reshape(attn_sink, [H, 1])
     with pl.spmd(token_rows, name_hint="native_hca_merge_rope_pack", deps=[raw_heads_tid, cmp_qk_tid]) as merge_tid:
