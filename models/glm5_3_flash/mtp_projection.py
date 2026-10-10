@@ -19,8 +19,14 @@ UNVERIFIED, but the loader has to handle two more tensors than the name
 
 Two things separate this layer from the backbone: it has **no** ``hc_*`` weights, so
 it uses a plain residual rather than the four-stream mHC, and
-``index_share_for_mtp_iteration`` lets it reuse the target step's top-k indices
-instead of running its own selection.
+``index_share_for_mtp_iteration`` gates an index-sharing scheme whose settled
+semantics (issue #1267) differ from a casual reading: the MTP layer computes
+its **own** top-k on step 0 of each proposal and reuses that selection per
+request for the proposal's later draft steps — it never consumes the target
+step's indices. On the reuse steps the K/gate projections and the cache/pool
+writes still run; only the query projection, scoring and Top-K are skipped.
+Each new proposal recomputes, and a rejected draft restores the cache
+metadata to the accepted length.
 
 ``num_speculative_tokens`` is 3 in the A3 recipe, and that recipe also sets
 ``enforce_eager: true`` because GLM-5.3-Flash does not support graph-mode
