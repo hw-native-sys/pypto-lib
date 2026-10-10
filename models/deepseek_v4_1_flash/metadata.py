@@ -9,21 +9,17 @@
 """Torch metadata lowering for packed prefill and continuous-batch decode."""
 
 from dataclasses import dataclass
+import json
+import math
+import struct
+from pathlib import Path
 from numbers import Integral
-from typing import Any, Literal, Mapping, Sequence
+from typing import Any, Mapping, Sequence
 
 import torch
 
 from models.deepseek_v4_1_flash import config as C
-from models.deepseek_v4_1_flash.config import (
-    AttentionMode, BLOCK_SIZE, DeepSeekV41LayerConfig, FLASH, TP_SIZE,
-)
-from models.deepseek_v4_1_flash.golden import (
-    PrefillAttentionCaches, PrefillAttentionMetadata, hc_post, hc_pre,
-    prefill_attention_reference, prefill_engram_reference, prefill_hc_mixes,
-    prefill_moe_reference, prefill_publish_decoder_reference, prefill_rms_norm,
-    prefill_round_activation,
-)
+from models.deepseek_v4_1_flash.config import BLOCK_SIZE, FLASH, TP_SIZE
 from models.deepseek_v4_1_flash.rope_tables import precompute_rope_tables
 
 
@@ -259,60 +255,7 @@ def build_forward_metadata(
     )
 
 
-# Fresh-prompt CED metadata and independent reference state.
-
-@dataclass(frozen=True)
-class PrefillLayerPlan:
-    """The checkpoint layer and its encoder/decoder stage."""
-
-    layer: DeepSeekV41LayerConfig
-    stage: Literal["encoder", "decoder"]
-
-    @property
-    def layer_id(self) -> int:
-        return self.layer.layer_id
-
-
-def resolve_prefill_layer_plan(layer_id: int) -> PrefillLayerPlan:
-    """Resolve CED semantics without selecting a device implementation."""
-    layer = FLASH.layer_config(layer_id)
-    encoder = layer_id < FLASH.num_hidden_layers // 2
-    modes = (AttentionMode.SWA, AttentionMode.FULL, AttentionMode.REUSE) if encoder else (
-        AttentionMode.FULL, AttentionMode.REINDEX, AttentionMode.REUSE
-    )
-    ratios = (0, 2) if encoder else (1,)
-    if layer.mode not in modes or layer.compression_ratio not in ratios:
-        raise ValueError(f"unsupported CED prefill configuration at layer {layer_id}")
-    return PrefillLayerPlan(layer, "encoder" if encoder else "decoder")
-
-
-@dataclass(frozen=True)
-class PrefillState:
-    """Expanded mHC residual and delayed pre-mix in FP32 transport buffers."""
-
-    x_hc: torch.Tensor
-    pre_mix: torch.Tensor
-
-    def __post_init__(self) -> None:
-        if self.x_hc.ndim not in (3, 4) or self.pre_mix.ndim != self.x_hc.ndim - 1:
-            raise ValueError("x_hc and pre_mix must have token-major or rank/token-major shapes")
-        if self.x_hc.shape[:-1] != self.pre_mix.shape:
-            raise ValueError("x_hc and pre_mix must share rank, token, and mHC dimensions")
-        if self.x_hc.shape[-2:] != (FLASH.hc_mult, FLASH.hidden_size):
-            raise ValueError("x_hc does not have the configured mHC and hidden dimensions")
-        if self.x_hc.dtype != torch.float32 or self.pre_mix.dtype != torch.float32:
-            raise ValueError("mHC residual and delayed pre-mix transport buffers must be FP32")
-
-    @property
-    def num_tokens(self) -> int:
-        return self.x_hc.shape[-3]
-
-    def take_rows(self, rows: torch.Tensor) -> "PrefillState":
-        """Gather identical packed rows from the residual and its delayed mix."""
-        return PrefillState(
-            self.x_hc.index_select(-3, rows.to(self.x_hc.device)),
-            self.pre_mix.index_select(-2, rows.to(self.pre_mix.device)),
-        )
+# Fresh-prompt CED replay metadata.
 
 
 @dataclass(frozen=True)
@@ -389,348 +332,575 @@ def select_decoder_replay(
     )
 
 
-@dataclass(frozen=True)
-class PrefillLayerInputs:
-    plan: PrefillLayerPlan
-    mode: str
-    ratio: int
-    weights: dict[str, torch.Tensor]
-    metadata: PrefillAttentionMetadata
-    caches: PrefillAttentionCaches
-    compressed_indices: torch.Tensor | None
-    candidate_mask: torch.Tensor | None
-    previous_rows: torch.Tensor
-    source_rows: torch.Tensor
-
-    @property
-    def num_tokens(self) -> int:
-        return self.metadata.rope_cos.shape[0]
+_DTYPES = {
+    "F32": torch.float32,
+    "BF16": torch.bfloat16,
+    "F8_E4M3": torch.float8_e4m3fn,
+    "F8_E8M0": torch.float8_e8m0fnu,
+    "I8": torch.int8,
+}
 
 
-@dataclass(frozen=True)
-class PrefillPublisherInputs:
-    weights: dict[str, torch.Tensor]
-    metadata: PrefillAttentionMetadata
-    caches: PrefillAttentionCaches
+def decode_checkpoint_linear(weight: torch.Tensor, scale: torch.Tensor | None = None) -> torch.Tensor:
+    """Decode stored weights without activation quantization or requantizing weights.
+
+    The returned matrix is output-major [N,K], matching the checkpoint and
+    torch.nn.functional.linear. MXFP8 uses 32x32 scale blocks; MXFP4 packs the
+    even input column in the low nibble and uses one scale per 32 input columns.
+    """
+    if weight.dtype in (torch.float32, torch.bfloat16):
+        if scale is not None:
+            raise ValueError("unquantized checkpoint weights must not have a scale")
+        return weight.float().contiguous()
+    if scale is None or scale.dtype != torch.float8_e8m0fnu:
+        raise ValueError("quantized checkpoint weights require E8M0 scales")
+    codes = scale.contiguous().view(torch.uint8).int()
+    if bool((codes == 255).any()):
+        raise ValueError("checkpoint E8M0 scales must be finite")
+    factors = torch.exp2(codes.float() - 127)
+    if weight.dtype == torch.float8_e4m3fn:
+        if weight.ndim != 2 or tuple(weight.shape) != (scale.shape[0] * 32, scale.shape[1] * 32):
+            raise ValueError("MXFP8 checkpoint weight/scale shapes disagree")
+        result = weight.float() * factors.repeat_interleave(32, 0).repeat_interleave(32, 1)
+    elif weight.dtype == torch.int8:
+        if (
+            weight.ndim != 2
+            or weight.shape[0] != scale.shape[0]
+            or weight.shape[1] * 2 != scale.shape[1] * 32
+        ):
+            raise ValueError("MXFP4 checkpoint weight/scale shapes disagree")
+        packed = weight.contiguous().view(torch.uint8)
+        nibbles = torch.stack((packed & 15, packed >> 4), dim=-1).flatten(-2)
+        magnitude = torch.tensor([0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0], device=weight.device)
+        values = magnitude[(nibbles & 7).long()]
+        values = torch.where((nibbles & 8) != 0, -values, values)
+        result = values * factors.repeat_interleave(32, -1)
+    else:
+        raise ValueError(f"unsupported checkpoint linear dtype {weight.dtype}")
+    if not bool(torch.isfinite(result).all()):
+        raise ValueError("decoded checkpoint linear contains non-finite values")
+    return result.contiguous()
 
 
-class PrefillContext:
-    """Own one fresh request batch through encoder, publication, and decoder.
+class PrefillCheckpoint:
+    """Read requested original tensors and decode linear matrices as output-major FP32."""
 
-    All lengths are positive and their packed total fits capacity <= 4096.
-    The rectangular request layout uses at most 32 physical pages per layer,
-    excluding the sentinel, so dense index-dot storage remains bounded.
-    Every context allocates its own cache storage for a fresh prompt batch.
+    def __init__(self, root: str | Path):
+        self.root = Path(root).resolve()
+        config = json.loads((self.root / "config.json").read_text())
+        text = config["text_config"]
+        quant = config.get("quantization_config", {})
+        if quant.get("quant_method") != "fp8" or quant.get("weight_block_size") != [32, 32]:
+            raise ValueError("checkpoint must use the official block-32 FP8/FP4 format")
+        required = {
+            "hidden_size": C.D,
+            "num_hidden_layers": C.FLASH.num_hidden_layers,
+            "num_attention_heads": C.H,
+            "head_dim": C.HEAD_DIM,
+            "sliding_window": C.FLASH.sliding_window,
+            "kv_source_layer_ids": list(C.FLASH.kv_source_layer_ids),
+            "index_source_layer_ids": list(C.FLASH.index_source_layer_ids),
+        }
+        for name, expected in required.items():
+            if text.get(name) != expected:
+                raise ValueError(f"checkpoint {name}={text.get(name)!r}, expected {expected!r}")
+        index = json.loads((self.root / "model.safetensors.index.json").read_text())
+        self.weight_map = index["weight_map"]
+        self._headers = {}
+
+    def tensor(self, name: str) -> torch.Tensor:
+        """Return an owned CPU tensor without loading the rest of its shard."""
+        shard = self.weight_map[name]
+        path = (self.root / shard).resolve()
+        if not path.is_relative_to(self.root):
+            raise ValueError(f"checkpoint shard leaves its root: {shard}")
+        with path.open("rb") as file:
+            header_size = struct.unpack("<Q", file.read(8))[0]
+            if header_size > 64 * 1024 * 1024:
+                raise ValueError(f"safetensors header is too large: {shard}")
+            if shard not in self._headers:
+                self._headers[shard] = json.loads(file.read(header_size))
+            entry = self._headers[shard][name]
+            dtype = _DTYPES[entry["dtype"]]
+            shape = entry["shape"]
+            start, end = entry["data_offsets"]
+            expected_bytes = math.prod(shape) * torch.empty((), dtype=dtype).element_size()
+            if start < 0 or end - start != expected_bytes or 8 + header_size + end > path.stat().st_size:
+                raise ValueError(f"invalid safetensors range for {name}")
+            file.seek(8 + header_size + start)
+            payload = bytearray(file.read(expected_bytes))
+        if len(payload) != expected_bytes:
+            raise ValueError(f"truncated safetensors payload for {name}")
+        return torch.frombuffer(payload, dtype=dtype).reshape(shape)
+
+    def tensor_rows(self, name: str, rows: torch.Tensor) -> torch.Tensor:
+        """Read selected table rows, including from the very large Engram tables."""
+        if rows.dtype not in (torch.uint8, torch.int8, torch.int16, torch.int32, torch.int64):
+            raise ValueError("table row ids must have an integer dtype")
+        ids = rows.to(dtype=torch.int64, device="cpu").flatten()
+        shard = self.weight_map[name]
+        path = (self.root / shard).resolve()
+        if not path.is_relative_to(self.root):
+            raise ValueError(f"checkpoint shard leaves its root: {shard}")
+        with path.open("rb") as file:
+            header_size = struct.unpack("<Q", file.read(8))[0]
+            if header_size > 64 * 1024 * 1024:
+                raise ValueError(f"safetensors header is too large: {shard}")
+            if shard not in self._headers:
+                self._headers[shard] = json.loads(file.read(header_size))
+            entry = self._headers[shard][name]
+            dtype, shape = _DTYPES[entry["dtype"]], entry["shape"]
+            if len(shape) != 2 or bool(((ids < 0) | (ids >= shape[0])).any()):
+                raise ValueError(f"invalid table rows for {name}")
+            row_bytes = shape[1] * torch.empty((), dtype=dtype).element_size()
+            start, end = entry["data_offsets"]
+            if (
+                start < 0
+                or end - start != shape[0] * row_bytes
+                or 8 + header_size + end > path.stat().st_size
+            ):
+                raise ValueError(f"invalid safetensors range for {name}")
+            unique, inverse = torch.unique(ids, sorted=True, return_inverse=True)
+            payload = bytearray(unique.numel() * row_bytes)
+            for index, row in enumerate(unique.tolist()):
+                file.seek(8 + header_size + start + row * row_bytes)
+                data = file.read(row_bytes)
+                if len(data) != row_bytes:
+                    raise ValueError(f"truncated safetensors row for {name}")
+                payload[index * row_bytes : (index + 1) * row_bytes] = data
+        if not ids.numel():
+            return torch.empty(*rows.shape, shape[1], dtype=dtype)
+        table = torch.frombuffer(payload, dtype=dtype).reshape(-1, shape[1])
+        # CPU indexing is unavailable for FP8; index its byte representation.
+        return (
+            table.view(torch.uint8)
+            .reshape(unique.numel(), row_bytes)[inverse]
+            .contiguous()
+            .view(dtype)
+            .reshape(*rows.shape, shape[1])
+        )
+
+
+    def linear(self, stem: str) -> torch.Tensor:
+        weight = self.tensor(stem + ".weight")
+        scale = self.tensor(stem + ".scale") if weight.dtype in (torch.int8, torch.float8_e4m3fn) else None
+        return decode_checkpoint_linear(weight, scale)
+
+
+class ResidentPrefillWeights:
+    """Pack the released weights into the existing TP1/EP4 operator layouts.
+
+    Routed weights retain their FP4 nibbles; MXFP8 payloads retain their bytes.
+    Scale bytes are reordered into the native MX_B_NN layout. Only projections
+    whose released inference dtype is BF16 or FP32 are decoded on the host.
+    Offsets count elements in their named bank. Large byte banks use 128-column
+    rows so runtime shapes and slice coordinates fit their uint32 ABI.
     """
 
-    def __init__(
-        self,
-        checkpoint: Any,
-        lengths: Sequence[int],
-        capacity: int | None = None,
-        *,
-        precision: str = "fp32",
-    ):
-        if not lengths or any(not isinstance(n, Integral) or isinstance(n, bool) or n < 1 for n in lengths):
-            raise ValueError("fresh prefill needs a nonempty sequence of positive integer lengths")
-        self.lengths = tuple(int(n) for n in lengths)
-        self.num_tokens = sum(self.lengths)
-        if capacity is None:
-            capacity = self.num_tokens
-        if not isinstance(capacity, Integral) or isinstance(capacity, bool):
-            raise ValueError("prefill capacity must be an integer")
-        if not self.num_tokens <= capacity <= C.PREFILL_MAX_TOKENS:
-            raise ValueError(f"fresh packed rows must fit capacity <= {C.PREFILL_MAX_TOKENS}")
-        requests, maximum = len(self.lengths), max(self.lengths)
-        pages = (maximum + 127) // 128
-        # Index queries currently score every physical cache row. Bound the
-        # rectangular layout before allocating metadata or any persistent cache:
-        # 4096 * 32 heads * (32 + 1 sentinel) * 128 rows * 4 bytes = 2.0625 GiB.
-        if requests * pages > 32:
-            raise ValueError(
-                "fresh FP32 prefill requires requests * ceil(max(lengths) / 128) <= 32 physical pages"
-            )
-        if precision not in ("fp32", "official"):
-            raise ValueError("precision must be 'fp32' or 'official'")
-        self.precision = precision
+    ranks = 4
+    bank_columns = 128
+    local_experts = C.FLASH.n_routed_experts // ranks
+    fp8_names = (
+        "attn.wq_a",
+        "attn.wq_b",
+        "attn.wkv",
+        "attn.wo_b",
+        "attn.indexer.wq_b",
+        "ffn.shared_experts.w1",
+        "ffn.shared_experts.w3",
+        "ffn.shared_experts.w2",
+        "engram.wkv",
+    )
+    bf16_names = (
+        "attn_norm.weight",
+        "ffn_norm.weight",
+        "attn.q_norm.weight",
+        "attn.kv_norm.weight",
+        "attn.wo_a.weight",
+        "attn.compressor.wkv.weight",
+        "attn.compressor.norm.weight",
+        "attn.indexer.wk.weight",
+        "attn.indexer.k_norm.weight",
+        "attn.indexer.weights_proj.weight",
+    )
+    dense_names = (
+        "hc_attn_fn",
+        "hc_attn_scale",
+        "hc_attn_base",
+        "hc_ffn_fn",
+        "hc_ffn_scale",
+        "hc_ffn_base",
+        "attn.attn_sink",
+        "ffn.gate.weight",
+        "ffn.gate.bias",
+        "attn.compressor.wkv.weight",
+        "attn.compressor.wgate.weight",
+        "engram.q_weight",
+    )
+    expert_names = ("w1", "w3", "w2")
+
+    def __init__(self, checkpoint: PrefillCheckpoint):
         self.checkpoint = checkpoint
-        self.capacity = int(capacity)
-        self.window_table = torch.arange(requests * pages, dtype=torch.int32).reshape(requests, pages)
-        self.global_tables = {}
-        for source in C.FLASH.kv_source_layer_ids:
-            pages = max(1, (maximum // C.FLASH.compress_ratios[source] + 127) // 128)
-            self.global_tables[source] = torch.arange(requests * pages, dtype=torch.int32).reshape(
-                requests, pages
+        layers = C.FLASH.num_hidden_layers
+        self.fp8_offsets = torch.full((layers, len(self.fp8_names)), -1, dtype=torch.int64)
+        self.fp8_scale_offsets = torch.full_like(self.fp8_offsets, -1)
+        self.bf16_offsets = torch.full((layers, len(self.bf16_names)), -1, dtype=torch.int64)
+        self.dense_offsets = torch.full((layers, len(self.dense_names)), -1, dtype=torch.int64)
+        self.expert_offsets = torch.empty((layers, 3), dtype=torch.int64)
+        self.expert_scale_offsets = torch.empty_like(self.expert_offsets)
+        self.fp8_entries, self.bf16_entries, self.dense_entries = [], [], []
+        self.fp8_values = self.scale_values = self.bf16_values = self.dense_values = 0
+        for layer in range(layers):
+            for column, suffix in enumerate(self.fp8_names):
+                stem = f"layers.{layer}.{suffix}"
+                if stem + ".weight" not in checkpoint.weight_map:
+                    continue
+                header = self._header(stem + ".weight")
+                n, k = header["shape"]
+                scale = self._header(stem + ".scale")
+                if (
+                    header["dtype"] != "F8_E4M3"
+                    or n % 32
+                    or k % 64
+                    or scale["dtype"] != "F8_E8M0"
+                    or scale["shape"] != [n // 32, k // 32]
+                ):
+                    raise ValueError(f"unsupported native MXFP8 weight layout: {stem}")
+                assert n * k % self.bank_columns == 0
+                assert (n * k // 32) % self.bank_columns == 0
+                self.fp8_offsets[layer, column] = self.fp8_values
+                self.fp8_scale_offsets[layer, column] = self.scale_values
+                self.fp8_entries.append((stem, self.fp8_values, self.scale_values))
+                self.fp8_values += n * k
+                self.scale_values += n * k // 32
+            for column, suffix in enumerate(self.bf16_names):
+                name = f"layers.{layer}.{suffix}"
+                if name not in checkpoint.weight_map:
+                    continue
+                if column == 5 and C.FLASH.compress_ratios[layer] != 1:
+                    continue
+                header = self._header(name)
+                if header["dtype"] not in ("F32", "BF16", "F8_E4M3"):
+                    raise ValueError(f"unsupported BF16 inference weight: {name}")
+                if header["dtype"] == "F8_E4M3" and column != 4:
+                    raise ValueError(f"unexpected quantized BF16 inference weight: {name}")
+                self.bf16_offsets[layer, column] = self.bf16_values
+                self.bf16_entries.append((name, column, self.bf16_values))
+                self.bf16_values += math.prod(header["shape"])
+            for column, suffix in enumerate(self.dense_names):
+                name = f"layers.{layer}.{suffix}"
+                if name not in checkpoint.weight_map:
+                    continue
+                if column in (9, 10) and C.FLASH.compress_ratios[layer] != 2:
+                    continue
+                header = self._header(name)
+                if header["dtype"] not in ("F32", "BF16"):
+                    raise ValueError(f"unsupported FP32 inference weight: {name}")
+                # Keep native matrix bases aligned after small mHC scalar vectors.
+                self.dense_values = (self.dense_values + 127) // 128 * 128
+                self.dense_offsets[layer, column] = self.dense_values
+                self.dense_entries.append((name, column, self.dense_values))
+                self.dense_values += math.prod(header["shape"])
+        self.fp4_values = 0
+        for layer in range(layers):
+            for column in range(3):
+                self.expert_offsets[layer, column] = self.fp4_values
+                self.expert_scale_offsets[layer, column] = self.scale_values
+                self.fp4_values += self.local_experts * C.D * C.MOE_INTER // 2
+                self.scale_values += self.local_experts * C.D * C.MOE_INTER // 32
+        assert (C.D * C.MOE_INTER // 2) % self.bank_columns == 0
+        assert (C.D * C.MOE_INTER // 32) % self.bank_columns == 0
+        for values in (self.fp4_values, self.fp8_values, self.scale_values):
+            assert values % self.bank_columns == 0
+            assert values // self.bank_columns < 2**32
+        for offsets in (
+            self.fp8_offsets, self.fp8_scale_offsets, self.expert_offsets, self.expert_scale_offsets,
+        ):
+            assert bool((offsets[offsets >= 0] % self.bank_columns == 0).all())
+        assert self.bf16_values * 2 < 2**32
+        assert self.dense_values * 4 < 2**32
+
+    def _header(self, name: str) -> dict[str, Any]:
+        checkpoint = self.checkpoint
+        shard = checkpoint.weight_map[name]
+        if shard not in checkpoint._headers:
+            path = (checkpoint.root / shard).resolve()
+            if not path.is_relative_to(checkpoint.root):
+                raise ValueError(f"checkpoint shard leaves its root: {shard}")
+            with path.open("rb") as file:
+                size = struct.unpack("<Q", file.read(8))[0]
+                if size > 64 * 1024 * 1024:
+                    raise ValueError(f"safetensors header is too large: {shard}")
+                checkpoint._headers[shard] = json.loads(file.read(size))
+        return checkpoint._headers[shard][name]
+
+    @property
+    def tensor_layouts(self):
+        """Return contiguous bank allocation shapes and exact storage dtypes."""
+        return {
+            "bank4": ((self.fp4_values // self.bank_columns, self.bank_columns), torch.uint8),
+            "bank8": ((self.fp8_values // self.bank_columns, self.bank_columns), torch.float8_e4m3fn),
+            "scales8": ((self.scale_values // self.bank_columns, self.bank_columns), torch.float8_e8m0fnu),
+            "bf16": ((self.bf16_values,), torch.bfloat16),
+            "dense": ((self.dense_values,), torch.float32),
+        }
+
+    @property
+    def bytes_per_rank(self):
+        return sum(
+            math.prod(shape) * torch.empty((), dtype=dtype).element_size()
+            for shape, dtype in self.tensor_layouts.values()
+        )
+
+    @property
+    def offset_tensors(self):
+        return {
+            name: getattr(self, name)
+            for name in (
+                "fp8_offsets",
+                "fp8_scale_offsets",
+                "bf16_offsets",
+                "dense_offsets",
+                "expert_offsets",
+                "expert_scale_offsets",
             )
-        self.state_tables = {
-            source: torch.arange(requests, dtype=torch.int32).reshape(-1, 1)
-            for source in C.FLASH.kv_source_layer_ids
-            if source < C.FLASH.num_hidden_layers // 2
         }
-        starts = torch.tensor([0, *torch.tensor(self.lengths).cumsum(0).tolist()], dtype=torch.int32)
-        self.metadata = build_forward_metadata(
-            starts,
-            torch.zeros(requests, dtype=torch.int32),
-            self.window_table,
-            self.global_tables,
-            self.state_tables,
-        )
-        self.replay = select_decoder_replay(self.metadata, self.window_table)
-        self.decoder_num_tokens = self.replay.source_rows.numel()
-        self.encoder_rows = torch.arange(self.num_tokens, dtype=torch.int64)
-        self.decoder_rows = self.replay.source_rows
-        self.rope = {compressed: precompute_rope_tables(maximum, compressed) for compressed in (False, True)}
-        # Each extra physical page is an untouched sentinel.
-        self.window = {
-            layer: torch.zeros(self.window_table.numel() + 1, 128, C.HEAD_DIM)
-            for layer in range(C.FLASH.num_hidden_layers)
-        }
-        self.global_cache = {
-            source: torch.zeros(table.numel() + 1, 128, C.HEAD_DIM)
-            for source, table in self.global_tables.items()
-        }
-        self.index_cache = {
-            source: torch.zeros(table.numel() + 1, 128, C.INDEX_DIM)
-            for source, table in self.global_tables.items()
-        }
-        self.state_cache = {
-            source: torch.zeros(requests + 1, C.STATE_CAPACITY, 2 * C.HEAD_DIM)
-            for source in self.state_tables
-        }
-        self.last_topk: dict[int, torch.Tensor] = {}
-        self.candidates: torch.Tensor | None = None
-        self.last_routes: torch.Tensor | None = None
-        self.decoder_published = False
 
-    def initial_state(self, token_sequences: Sequence[torch.Tensor | Sequence[int]]) -> PrefillState:
-        """Expand original embedding rows and use the official initial one-hot mix."""
-        if len(token_sequences) != len(self.lengths):
-            raise ValueError("token sequences must have one span per request")
-        sequences = []
-        for expected, sequence in zip(self.lengths, token_sequences):
-            value = torch.as_tensor(sequence, device="cpu")
-            if (
-                value.ndim != 1
-                or value.numel() != expected
-                or value.dtype not in (torch.uint8, torch.int8, torch.int16, torch.int32, torch.int64)
-            ):
-                raise ValueError("token ids must be integer vectors matching the configured lengths")
-            sequences.append(value.long())
-        input_ids = torch.cat(sequences)
-        embedding = prefill_round_activation(self.checkpoint.tensor_rows("embed.weight", input_ids).float(), self.precision)
-        expanded = embedding.unsqueeze(1).repeat(1, C.HC_MULT, 1)
-        pre_mix = torch.zeros(self.num_tokens, C.HC_MULT, dtype=torch.float32)
-        pre_mix[:, 0] = 1
-        return PrefillState(expanded, pre_mix)
+    def upload(self, runtime, rank: int, handles):
+        """Upload a rank's persistent banks with one projection staged at a time."""
+        from models.deepseek_v4_1_flash.quantization import pack_mx_b_scale, pack_mxfp4_weight_tiles
 
-    def layer_inputs(
-        self,
-        layer_id: int,
-        *,
-        weights: dict[str, torch.Tensor] | None = None,
-        load_weights: bool = True,
-    ) -> PrefillLayerInputs:
-        """Resolve fresh encoder/full-tail decoder metadata without model arithmetic."""
-        plan = resolve_prefill_layer_plan(layer_id)
-        encoder = plan.stage == "encoder"
-        mode, ratio = plan.layer.mode.value.lower(), plan.layer.compression_ratio
-        source = plan.layer.kv_source_layer_id
-        positions = self.metadata.position_ids if encoder else self.replay.position_ids
-        requests = self.metadata.token_to_req_indices if encoder else self.replay.token_to_req_indices
-        cosine, sine = self.rope[bool(ratio)]
-        request_lengths = torch.tensor(self.lengths, dtype=torch.int32)[requests.long()]
-        global_widths = (request_lengths // ratio).clamp(max=C.INDEX_TOPK) if ratio else torch.zeros_like(request_lengths)
-        values = dict(
-            rope_cos=cosine[positions.long()],
-            rope_sin=sine[positions.long()],
-            window_slots=self.metadata.window_slots if encoder else self.replay.window_slots,
-            window_indices=self.metadata.window_indices if encoder else self.replay.window_indices,
-            request_ids=requests,
-            query_start_loc=self.metadata.query_start_loc if encoder else self.replay.query_start_loc,
-            position_ids=positions,
-            attention_extents=torch.stack((request_lengths.clamp(max=C.FLASH.sliding_window), global_widths), -1),
-        )
-        previous_rows = torch.full_like(positions, -1, dtype=torch.int32)
-        if ratio:
-            compressed_positions = (
-                self.metadata.compressed_rope_position_ids[source].clamp_min(0) if encoder else positions
+        if rank not in range(self.ranks):
+            raise ValueError("resident prefill requires four contiguous expert shards")
+        checkpoint = self.checkpoint
+
+        def copy(bank, data, offset):
+            data = data.contiguous()
+            if bank in ("bank4", "bank8", "scales8"):
+                assert int(offset) % self.bank_columns == 0
+                assert data.numel() % self.bank_columns == 0
+            runtime.copy_to(
+                handles[bank].data_ptr,
+                data.data_ptr(),
+                data.numel() * data.element_size(),
+                dst_offset=int(offset) * data.element_size(),
+                worker_id=rank,
             )
-            values.update(
-                compressed_lens=self.metadata.compressed_lens[source]
-                if encoder
-                else self.replay.compressed_lens,
-                index_block_table=self.global_tables[source],
-                compressed_slots=(
-                    self.metadata.compressed_slots[source]
-                    if encoder
-                    else torch.full_like(positions, -1, dtype=torch.int64)
-                ),
-                compressed_rope_cos=cosine[compressed_positions.long()],
-                compressed_rope_sin=sine[compressed_positions.long()],
-                state_block_table=self.state_tables.get(source),
-            )
-            if ratio == 2:
-                complete = positions.remainder(2) == 1
-                previous_rows[complete] = torch.arange(positions.numel(), dtype=torch.int32)[complete] - 1
-        caches = PrefillAttentionCaches(
-            self.window[layer_id],
-            self.global_cache.get(source),
-            self.index_cache.get(source),
-            self.state_cache.get(source),
-        )
-        if weights is None:
-            weights = self.checkpoint.attention(layer_id) if load_weights else {}
-        return PrefillLayerInputs(
-            plan,
-            mode,
-            ratio,
-            weights,
-            PrefillAttentionMetadata(**values),
-            caches,
-            self.last_topk.get(source),
-            self.candidates if mode == "reindex" else None,
-            previous_rows,
-            self.encoder_rows if encoder else self.decoder_rows,
-        )
 
-    def update_attention(self, layer_id: int, result: Any) -> None:
-        """Advance owned caches from a device or reference result, without diagnostics."""
-        plan = resolve_prefill_layer_plan(layer_id)
-        source = plan.layer.kv_source_layer_id
-        caches = result.caches
-        self.window[layer_id] = caches.window
-        if plan.layer.compression_ratio:
-            if caches.compressed is None or caches.index is None:
-                raise ValueError("compressed layers must return their global and index caches")
-            self.global_cache[source], self.index_cache[source] = caches.compressed, caches.index
-            topk = getattr(result, "topk_indices", None)
-            if topk is not None:
-                self.last_topk[source] = topk
-            if caches.state is not None:
-                self.state_cache[source] = caches.state
-            if plan.stage == "decoder" and plan.layer.is_kv_source:
-                self.candidates = getattr(result, "candidate_mask", None)
+        for stem, offset, scale_offset in self.fp8_entries:
+            weight = checkpoint.tensor(stem + ".weight")
+            codes = checkpoint.tensor(stem + ".scale").view(torch.uint8)
+            logical_scale = codes.repeat_interleave(32, dim=0).t().contiguous()
+            copy("bank8", weight.t(), offset)
+            copy("scales8", pack_mx_b_scale(logical_scale).view(torch.float8_e8m0fnu), scale_offset)
+        for name, column, offset in self.bf16_entries:
+            if column == 4:
+                value = checkpoint.linear(name.removesuffix(".weight")).to(torch.bfloat16)
+            else:
+                value = checkpoint.tensor(name).to(torch.bfloat16)
+            if column in (5, 7, 9):
+                value = value.t()
+            copy("bf16", value, offset)
+        for name, column, offset in self.dense_entries:
+            value = checkpoint.tensor(name).float()
+            if column in (9, 10):
+                value = value.t()
+            elif column == 11:
+                value = value * checkpoint.tensor(name.replace("q_weight", "k_weight")).float()
+            copy("dense", value, offset)
+        for layer in range(C.FLASH.num_hidden_layers):
+            for column, projection in enumerate(self.expert_names):
+                k, n = (C.MOE_INTER, C.D) if projection == "w2" else (C.D, C.MOE_INTER)
+                logical_scales = torch.empty((self.local_experts * (k // 32), n), dtype=torch.uint8)
+                offset = int(self.expert_offsets[layer, column])
+                for local in range(self.local_experts):
+                    expert = rank * self.local_experts + local
+                    stem = f"layers.{layer}.ffn.experts.{expert}.{projection}"
+                    weight = checkpoint.tensor(stem + ".weight")
+                    scale = checkpoint.tensor(stem + ".scale")
+                    if (
+                        weight.dtype != torch.int8
+                        or tuple(weight.shape) != (n, k // 2)
+                        or scale.dtype != torch.float8_e8m0fnu
+                        or tuple(scale.shape) != (n, k // 32)
+                    ):
+                        raise ValueError(f"unsupported native MXFP4 weight layout: {stem}")
+                    packed = pack_mxfp4_weight_tiles(weight, 256, 256)
+                    copy("bank4", packed, offset + local * (n * k // 2))
+                    logical_scales[local * (k // 32) : (local + 1) * (k // 32)] = scale.view(torch.uint8).t()
+                copy(
+                    "scales8",
+                    pack_mx_b_scale(logical_scales).view(torch.float8_e8m0fnu),
+                    self.expert_scale_offsets[layer, column],
+                )
 
-    def publisher_inputs(self, *, weights=None, load_weights=True) -> PrefillPublisherInputs:
-        """Layer20 global publication always sees every newly encoded prompt row."""
-        layer_id = C.FLASH.num_hidden_layers // 2
-        cosine, sine = self.rope[True]
-        positions = self.metadata.position_ids.long()
-        metadata = PrefillAttentionMetadata(
-            cosine[positions],
-            sine[positions],
-            self.metadata.window_slots,
-            self.metadata.window_indices,
-            request_ids=self.metadata.token_to_req_indices,
-            compressed_slots=self.metadata.compressed_slots[layer_id],
-            compressed_rope_cos=cosine[positions],
-            compressed_rope_sin=sine[positions],
-            query_start_loc=self.metadata.query_start_loc,
-            position_ids=self.metadata.position_ids,
-        )
-        if weights is None:
-            weights = self.checkpoint.publisher(layer_id) if load_weights else {}
-        return PrefillPublisherInputs(
-            weights,
-            metadata,
-            PrefillAttentionCaches(
-                self.window[layer_id], self.global_cache[layer_id], self.index_cache[layer_id]
-            ),
-        )
+    def lookup_rows(self, token_ids: torch.Tensor, engram_hashes: Mapping[int, torch.Tensor]):
+        """Read only the prompt's embedding and Engram rows at official BF16 boundaries."""
+        checkpoint = self.checkpoint
+        embedding = checkpoint.tensor_rows("embed.weight", token_ids).to(torch.bfloat16)
+        engram = {}
+        for layer in C.FLASH.engram_layer_ids:
+            stem = f"layers.{layer}.engram.embed"
+            hashes = engram_hashes[layer]
+            payload = checkpoint.tensor_rows(stem + ".weight", hashes)
+            scale = checkpoint.tensor_rows(stem + ".scale", hashes)
+            rows = payload.float() * scale.float().repeat_interleave(32, dim=-1)
+            engram[layer] = rows.to(torch.bfloat16).flatten(1)
+        return embedding, engram
 
-    def update_publisher(self, caches: PrefillAttentionCaches) -> None:
-        layer_id = C.FLASH.num_hidden_layers // 2
-        if caches.compressed is None or caches.index is None:
-            raise ValueError("decoder publisher must return both global and index caches")
-        self.global_cache[layer_id], self.index_cache[layer_id] = caches.compressed, caches.index
-        self.decoder_published = True
 
-    def take_decoder_rows(self, x_hc, pre_mix):
-        """Gather both encoder streams with exactly the accepted CED replay map."""
-        state = PrefillState(x_hc, pre_mix)
-        if state.num_tokens != self.num_tokens:
-            raise ValueError("decoder handoff must contain every configured encoder row")
-        result = state.take_rows(self.decoder_rows)
-        return result.x_hc, result.pre_mix
+def prepare_resident_inputs(
+    checkpoint: PrefillCheckpoint,
+    weights: ResidentPrefillWeights,
+    token_ids: torch.Tensor | Sequence[int],
+    capacity: int,
+) -> dict[str, torch.Tensor]:
+    """Prepare one rank's fresh prompt and causal CED replay for the native kernels."""
+    import importlib.util
+    import sys
+    from types import SimpleNamespace
 
-    def attention(self, layer_id: int, x: torch.Tensor) -> torch.Tensor:
-        """Run the independent CPU attention reference and advance its private state."""
-        if layer_id >= C.FLASH.num_hidden_layers // 2 and not self.decoder_published:
-            raise ValueError("publish final encoder rows before decoder attention")
-        values = self.layer_inputs(layer_id)
-        if x.shape != (values.num_tokens, C.D) or x.dtype != torch.float32:
-            raise ValueError("attention input must be normalized FP32 rows for this stage")
-        result = prefill_attention_reference(
-            x,
-            values.weights,
-            values.metadata,
-            values.caches,
-            mode=values.mode,
-            ratio=values.ratio,
-            compressed_indices=values.compressed_indices,
-            candidate_mask=values.candidate_mask,
-            precision=self.precision,
-        )
-        self.update_attention(layer_id, result)
-        return result.output
+    ids = torch.as_tensor(token_ids, device="cpu")
+    if ids.ndim != 1 or ids.dtype not in (torch.int32, torch.int64):
+        raise ValueError("token_ids must be a one-dimensional integer sequence")
+    if not isinstance(capacity, Integral) or isinstance(capacity, bool) or capacity % 16:
+        raise ValueError("prefill capacity must be an integer multiple of 16")
+    count = ids.numel()
+    if not 1 <= count <= capacity <= C.PREFILL_MAX_TOKENS:
+        raise ValueError("a nonempty prompt must fit the configured prefill capacity")
+    if bool(((ids < 0) | (ids >= C.FLASH.vocab_size)).any()):
+        raise ValueError("token id is outside the checkpoint vocabulary")
+    ids = ids.long()
+    if getattr(weights, "_hash_capacity", 0) < capacity:
+        from tokenizers import Tokenizer
 
-    def attention_block(self, layer_id: int, x_hc, pre_mix):
-        """CPU delayed-HC attention sublayer; caller applies Engram and the FFN."""
-        stem = f"layers.{layer_id}."
-        pre, post, comb = prefill_hc_mixes(
-            x_hc,
-            *[
-                self.checkpoint.tensor(stem + name).float()
-                for name in ("hc_attn_fn", "hc_attn_scale", "hc_attn_base")
-            ],
+        spec = importlib.util.spec_from_file_location(
+            "pypto_v41_checkpoint_engram", checkpoint.root / "inference/engram.py"
         )
-        x = prefill_rms_norm(
-            prefill_round_activation(hc_pre(x_hc, pre_mix), self.precision),
-            self.checkpoint.tensor(stem + "attn_norm.weight").float(), precision=self.precision,
-        )
-        return prefill_round_activation(hc_post(self.attention(layer_id, x), x_hc, post, comb), self.precision), pre
+        if spec is None or spec.loader is None:
+            raise ValueError("checkpoint does not contain the official Engram implementation")
+        official = importlib.util.module_from_spec(spec)
+        sys.modules[spec.name] = official
+        spec.loader.exec_module(official)
+        backend = Tokenizer.from_file(str(checkpoint.root / "tokenizer.json"))
 
-    def publish_decoder(self, x_hc, pre_mix):
-        """CPU reference for global publication from the full final encoder state."""
-        if PrefillState(x_hc, pre_mix).num_tokens != self.num_tokens:
-            raise ValueError("decoder publication requires the full encoder state")
-        layer_id = C.FLASH.num_hidden_layers // 2
-        x = prefill_rms_norm(
-            prefill_round_activation(hc_pre(x_hc, pre_mix), self.precision),
-            self.checkpoint.tensor(f"layers.{layer_id}.attn_norm.weight").float(),
-            precision=self.precision,
-        )
-        values = self.publisher_inputs()
-        caches = prefill_publish_decoder_reference(
-            x, values.weights, values.metadata, values.caches, precision=self.precision
-        )
-        self.update_publisher(caches)
-        return caches
+        class TokenizerView:
+            backend_tokenizer = backend
 
-    def block_reference(self, layer_id: int, state: PrefillState, *, hash_ids=None) -> PrefillState:
-        """Complete CPU block: optional Engram, delayed-HC attention, then delayed-HC MoE."""
-        if state.x_hc.ndim != 3:
-            raise ValueError("FP32 reference blocks consume unstacked token-major states")
-        x_hc = state.x_hc
-        if layer_id in C.FLASH.engram_layer_ids:
-            if hash_ids is None or hash_ids.shape[0] != state.num_tokens:
-                raise ValueError("Engram reference needs this layer's hash ids for every token")
-            x_hc = prefill_engram_reference(
-                x_hc, self.checkpoint.engram(layer_id, hash_ids), precision=self.precision
-            )
-        mid, attention_pre = self.attention_block(layer_id, x_hc, state.pre_mix)
-        stem = f"layers.{layer_id}."
-        pre, post, comb = prefill_hc_mixes(
-            mid,
-            *[
-                self.checkpoint.tensor(stem + name).float()
-                for name in ("hc_ffn_fn", "hc_ffn_scale", "hc_ffn_base")
-            ],
+            def __len__(self):
+                return backend.get_vocab_size(with_added_tokens=True)
+
+        args = SimpleNamespace(**json.loads((checkpoint.root / "inference/config.json").read_text()))
+        args.max_batch_size, args.max_seq_len = 1, capacity
+        weights._hash_state = official.NgramHashState(
+            args, official.EngramLayout.from_args(args), TokenizerView()
         )
-        x = prefill_rms_norm(
-            prefill_round_activation(hc_pre(mid, attention_pre), self.precision),
-            self.checkpoint.tensor(stem + "ffn_norm.weight").float(), precision=self.precision,
-        )
-        ffn = prefill_moe_reference(x, self.checkpoint, layer_id, precision=self.precision)
-        self.last_routes = ffn["indices"]
-        return PrefillState(prefill_round_activation(hc_post(ffn["output"], mid, post, comb), self.precision), pre)
+        weights._hash_capacity = capacity
+    hashes = weights._hash_state(ids.unsqueeze(0), 0)[0]
+    engram_hashes = {
+        layer: hashes[:, index] for index, layer in enumerate(C.FLASH.engram_layer_ids)
+    }
+    embedding, lookups = weights.lookup_rows(ids, engram_hashes)
+
+    data_pages = (capacity + C.BLOCK_SIZE - 1) // C.BLOCK_SIZE
+    pages = data_pages + 1
+    table = torch.arange(data_pages, dtype=torch.int32).reshape(1, -1)
+    compressed_tables = {source: table for source in C.FLASH.kv_source_layer_ids}
+    state_table = torch.zeros((1, 1), dtype=torch.int32)
+    state_tables = {
+        source: state_table
+        for source in C.FLASH.kv_source_layer_ids
+        if C.FLASH.compress_ratios[source] == 2
+    }
+    encoder = build_forward_metadata(
+        torch.tensor([0, count], dtype=torch.int32),
+        torch.zeros(1, dtype=torch.int32),
+        table,
+        compressed_tables,
+        state_tables,
+    )
+    decoder = select_decoder_replay(encoder, table)
+    decoder_count = decoder.source_rows.numel()
+    c2_source = next(source for source in C.FLASH.kv_source_layer_ids if C.FLASH.compress_ratios[source] == 2)
+    publisher_source = C.FLASH.num_hidden_layers // 2
+    plain_cos, plain_sin = precompute_rope_tables(count, False)
+    compressed_cos, compressed_sin = precompute_rope_tables(count, True)
+
+    def pad(value, fill=0):
+        result = torch.full((capacity, *value.shape[1:]), fill, dtype=value.dtype)
+        result[: value.shape[0]] = value
+        return result
+
+    def rope_rows(cosine, sine, positions):
+        cos = torch.ones((capacity, C.ROPE_DIM // 2), dtype=torch.float32)
+        sin = torch.zeros_like(cos)
+        active = positions >= 0
+        rows = torch.arange(positions.numel())[active]
+        cos[rows] = cosine[positions[active].long()]
+        sin[rows] = sine[positions[active].long()]
+        return cos, sin
+
+    encoder_plain = rope_rows(plain_cos, plain_sin, encoder.position_ids)
+    encoder_compressed = rope_rows(compressed_cos, compressed_sin, encoder.position_ids)
+    decoder_compressed = rope_rows(compressed_cos, compressed_sin, decoder.position_ids)
+    pair_cos, pair_sin = rope_rows(
+        compressed_cos, compressed_sin, encoder.compressed_rope_position_ids[c2_source]
+    )
+    initial_pre = torch.zeros((capacity, C.HC_MULT), dtype=torch.float32)
+    initial_pre[:, 0] = 1.0
+    index_tables = torch.full((2, 1, pages), -1, dtype=torch.int32)
+    index_tables[:, :, :data_pages] = table
+    logit_rows = torch.full((16,), -1, dtype=torch.int32)
+    logit_rows[0] = decoder_count - 1
+    window_shape = (C.FLASH.num_hidden_layers, pages, C.BLOCK_SIZE, 1)
+    source_shape = (len(C.FLASH.kv_source_layer_ids), pages, C.BLOCK_SIZE, 1)
+    values = {
+        "embedding": pad(embedding),
+        "embedding_ids": torch.arange(capacity, dtype=torch.int64),
+        "initial_pre": initial_pre,
+        "identity_rows": pad(torch.arange(count, dtype=torch.int32), -1),
+        "engram_lookup": torch.stack([pad(lookups[layer]) for layer in C.FLASH.engram_layer_ids]),
+        "counts": torch.tensor([count, decoder_count], dtype=torch.int32),
+        "replay_rows": pad(decoder.source_rows.int(), -1),
+        "position_ids": torch.stack((pad(encoder.position_ids, -1), pad(decoder.position_ids, -1))),
+        "rope_cos": torch.stack((encoder_plain[0], encoder_compressed[0], decoder_compressed[0])),
+        "rope_sin": torch.stack((encoder_plain[1], encoder_compressed[1], decoder_compressed[1])),
+        "compressed_cos": pair_cos,
+        "compressed_sin": pair_sin,
+        "publisher_cos": encoder_compressed[0],
+        "publisher_sin": encoder_compressed[1],
+        "window_slots": torch.stack((pad(encoder.window_slots, -1), pad(decoder.window_slots, -1))),
+        "window_indices": torch.stack((pad(encoder.window_indices, -1), pad(decoder.window_indices, -1))),
+        "compressed_slots": pad(encoder.compressed_slots[c2_source], -1),
+        "publisher_slots": pad(encoder.compressed_slots[publisher_source], -1),
+        "token_requests": torch.stack((pad(encoder.token_to_req_indices, -1), pad(decoder.token_to_req_indices, -1))),
+        "compressed_lens": torch.stack((pad(encoder.compressed_lens[c2_source]), pad(decoder.compressed_lens))),
+        "query_starts": torch.stack((encoder.query_start_loc, decoder.query_start_loc.int())),
+        "index_block_tables": index_tables,
+        "state_block_table": state_table,
+        "window_cache": torch.zeros((*window_shape, C.HEAD_DIM), dtype=torch.uint8).view(torch.float8_e4m3fn),
+        "window_scales": torch.full(
+            (*window_shape, C.HEAD_DIM // C.WINDOW_CACHE_GROUP), 127, dtype=torch.uint8
+        ).view(torch.float8_e8m0fnu),
+        "compressed_cache": torch.zeros((*source_shape, C.HEAD_DIM // 2), dtype=torch.uint8),
+        "compressed_scales": torch.full(
+            (*source_shape, C.HEAD_DIM // C.COMPRESSED_CACHE_GROUP), 0x38, dtype=torch.uint8
+        ).view(torch.float8_e4m3fn),
+        "index_cache": torch.zeros((*source_shape, C.INDEX_DIM // 2), dtype=torch.uint8),
+        "index_scales": torch.full(
+            (*source_shape, C.INDEX_DIM // C.INDEX_CACHE_GROUP), 127, dtype=torch.uint8
+        ).view(torch.float8_e8m0fnu),
+        "state_cache": torch.zeros((len(state_tables), 2, C.STATE_CAPACITY, C.STATE_WIDTH), dtype=torch.float32),
+        "logit_rows": logit_rows,
+    }
+    if not hasattr(weights, "_output_weights"):
+        head = checkpoint.tensor("head.weight")
+        if head.dtype != torch.bfloat16 or tuple(head.shape) != (C.FLASH.vocab_size, C.D):
+            raise ValueError("the native LM head requires the released BF16 checkpoint matrix")
+        weights._output_weights = {
+            "head": head,
+            "final_norm": checkpoint.tensor("norm.weight").to(torch.bfloat16),
+        }
+    values.update(weights._output_weights)
+    values.update(weights.offset_tensors)
+    return values

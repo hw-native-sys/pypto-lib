@@ -13,7 +13,6 @@ import pypto.language as pl
 from models.deepseek_v4_1_flash.config import FLASH as M, MOE_TOKENS
 from models.deepseek_v4_1_flash.rmsnorm import rms_norm
 
-from models.deepseek_v4_1_flash.config import FLASH
 
 FP32_NEG_INF = -3.4028234663852886e38
 
@@ -43,6 +42,8 @@ MX_SCALE_GROUPS = D // MX_GROUP
 SCORE_PAD = 256 if M.name == "flash" else 384
 TOPK_PAD = 8
 SORT_PAD = TOPK_PAD * 2
+QUANT_GROUPS = QUANT_TILE // 32
+QUANT_SCALE_TMP = ((64 + (GATE_M_TILE // 16) * QUANT_GROUPS + 31) // 32) * 32
 
 
 if M.name == "flash":
@@ -124,7 +125,25 @@ def gate_normalized(
             chunk_idx = task_chunk_idx * (QUANT_TASK_TILE // QUANT_TILE) + task_chunk
             k0 = chunk_idx * QUANT_TILE
             x_norm_chunk = pl.load(xg_buf, [t0, k0], [GATE_M_TILE, QUANT_TILE])
-            x_quant, scale_quant = pl.quant_mx(x_norm_chunk, group_axis=1)
+            quant_groups = pl.reshape(x_norm_chunk, [GATE_M_TILE * QUANT_GROUPS, 32])
+            quant_tmp = pl.create_tile([GATE_M_TILE * QUANT_GROUPS, 32], dtype=pl.FP32)
+            quant_maximum = pl.maximum(pl.row_max(pl.abs(quant_groups), tmp_tile=quant_tmp), 1e-4)
+            quant_bits = pl.reinterpret_view(pl.mul(quant_maximum, 1.0 / 448.0), pl.INT32)
+            quant_exponent = pl.shrs(pl.add(quant_bits, 8388607), 23)
+            quant_scale = pl.reinterpret_view(pl.shls(quant_exponent, 23), pl.FP32)
+            quant_normalized = pl.row_expand_div(quant_groups, quant_scale)
+            quant_clipped = pl.minimum(pl.maximum(quant_normalized, -448.0), 448.0)
+            quant_payload = pl.cast(quant_clipped, pl.FP8E4M3FN, mode="rint")
+            x_quant = pl.reshape(quant_payload, [GATE_M_TILE, QUANT_TILE])
+            quant_signed = pl.sub(quant_exponent, pl.mul(pl.shrs(quant_exponent, 7), 256))
+            quant_codes = pl.reinterpret_view(pl.cast(quant_signed, pl.INT8), pl.UINT8)
+            quant_flat = pl.reshape(quant_codes, [1, GATE_M_TILE * QUANT_GROUPS])
+            quant_pack_tmp = pl.create_tile([1, QUANT_SCALE_TMP], dtype=pl.UINT8)
+            quant_packed = pl.tmov_x2zz(
+                quant_flat, quant_pack_tmp, group_axis=1,
+                dst_rows=GATE_M_TILE, dst_cols=QUANT_GROUPS,
+            )
+            scale_quant = pl.reinterpret_view(quant_packed, pl.FP8E8M0)
             x_norm_mx = pl.store(x_quant, [t0, k0], x_norm_mx)
             scale_offset = t0 * MX_SCALE_GROUPS + chunk_idx * GATE_M_TILE * (QUANT_TILE // MX_GROUP)
             x_norm_scale = pl.store(
@@ -294,14 +313,7 @@ def _golden_gate_core(tensors, x_norm, scores, biased):
     from models.deepseek_v4_1_flash.quantization import host_quant_mxfp8_v41, pack_mx_a_scale
 
     def host_mxfp8_activation(value):
-        # pl.quant_mx implements the OCP MX shared exponent
-        # ``X = 2 ** (floor(log2(amax)) - emax)``, i.e. it rounds the amax exponent
-        # down (emax = floor(log2(448)) = 8). The golden must therefore share the
-        # floor-based path in host_quant_mxfp8_v41: the ceil rounding used by
-        # _quantize_mxfp8_activation doubled the scale and halved the payload for
-        # the ~19.3% of groups whose amax log2 fraction lands in [log2(448/256), 1),
-        # which saturated the amax element on device and produced a systematic error.
-        # The packed layout is MX_A_ZZ, matching the kernel's flat store order.
+        # The released activation quantizer rounds E8M0 scales upward.
         quantized, codes = host_quant_mxfp8_v41(value, return_e8m0=True)
         packed = pack_mx_a_scale(codes)
         e8m0 = getattr(torch, "float8_e8m0fnu", None)
@@ -739,79 +751,6 @@ def fp8_bits_equal(actual, expected, **_kwargs):
         f"expected=0x{int(expected_bits.flatten()[first]):02x}"
     )
 
-
-
-
-# Resident CED prefill precision variants.
-_PREFILL_MOE_TOPK = FLASH.num_experts_per_tok
-
-
-_PREFILL_MOE_T = pl.dynamic("V41_FP32_MOE_T")
-
-
-_PREFILL_MOE_ROUTE_SCALE = FLASH.routed_scaling_factor
-
-
-_PREFILL_MOE_EXPERTS = FLASH.n_routed_experts
-
-
-_PREFILL_MOE_WORKERS = 32
-
-
-@pl.jit.inline(auto_scope=False)
-def prefill_gate_select_inline(
-    logits: pl.Tensor[[_PREFILL_MOE_T, _PREFILL_MOE_EXPERTS], pl.FP32],
-    bias: pl.Tensor[[_PREFILL_MOE_EXPERTS], pl.FP32],
-    indices: pl.Tensor[[_PREFILL_MOE_T, _PREFILL_MOE_TOPK], pl.INT32],
-    weights: pl.Tensor[[_PREFILL_MOE_T, _PREFILL_MOE_TOPK], pl.FP32],
-):
-    """Select six experts by biased sqrt-softplus, weighting by unbiased scores."""
-    logits.bind_dynamic(0, _PREFILL_MOE_T)
-    indices.bind_dynamic(0, _PREFILL_MOE_T)
-    weights.bind_dynamic(0, _PREFILL_MOE_T)
-    rows = pl.tensor.dim(logits, 0)
-    # Eight packed rows occupy 192 bytes, so each task owns whole 64-byte
-    # cache lines for scalar top-k writes, including the final partial task.
-    for worker in pl.spmd(_PREFILL_MOE_WORKERS, name_hint="fp32_gate_select"):
-        for block in pl.range(worker, (rows + 7) // 8, _PREFILL_MOE_WORKERS):
-            for row in pl.range(block * 8, pl.min(rows, block * 8 + 8)):
-                value = pl.slice(logits, [1, _PREFILL_MOE_EXPERTS], [row, 0])
-                exponential = pl.exp(pl.neg(pl.abs(value)))
-                # log1p(e) = 2*atanh(e/(2+e)); here 0<=e<=1 and |z|<=1/3.
-                # The odd series through z^17 has truncation error below 2e-10.
-                z = pl.div(exponential, pl.add(exponential, 2.0), high_precision=True)
-                z2 = pl.mul(z, z)
-                polynomial = pl.add(pl.mul(z2, 1.0 / 17.0), 1.0 / 15.0)
-                polynomial = pl.add(pl.mul(z2, polynomial), 1.0 / 13.0)
-                polynomial = pl.add(pl.mul(z2, polynomial), 1.0 / 11.0)
-                polynomial = pl.add(pl.mul(z2, polynomial), 1.0 / 9.0)
-                polynomial = pl.add(pl.mul(z2, polynomial), 1.0 / 7.0)
-                polynomial = pl.add(pl.mul(z2, polynomial), 1.0 / 5.0)
-                polynomial = pl.add(pl.mul(z2, polynomial), 1.0 / 3.0)
-                polynomial = pl.add(pl.mul(z2, polynomial), 1.0)
-                softplus_tail = pl.mul(pl.mul(z, 2.0), polynomial)
-                scores = pl.sqrt(pl.add(pl.maximum(value, 0.0), softplus_tail))
-                biased = pl.add(scores, pl.reshape(bias, [1, _PREFILL_MOE_EXPERTS]))
-                ids = pl.create_tensor([1, _PREFILL_MOE_EXPERTS], dtype=pl.UINT32)
-                ids[:, :] = pl.arange(0, [1, _PREFILL_MOE_EXPERTS], dtype=pl.UINT32)
-                sorted32 = pl.sort32(biased, ids)
-                sorted64 = pl.mrgsort(sorted32, block_len=64)
-                sorted_pairs = pl.mrgsort(sorted64[:, 0:256], sorted64[:, 256:512], sorted64[:, 512:768])
-                selected = pl.gather(
-                    sorted_pairs[:, 0:16], mask_pattern=pl.tile.MaskPattern.P1010, output_dtype=pl.INT32
-                )
-                selected_scores = pl.gather(scores, dim=-1, index=selected)
-                total = pl.read(selected_scores, [0, 0])
-                for slot in pl.unroll(1, _PREFILL_MOE_TOPK):
-                    total = pl.add(total, pl.read(selected_scores, [0, slot]))
-                total = pl.add(total, 1e-20)
-                for slot in pl.unroll(_PREFILL_MOE_TOPK):
-                    route_weight = pl.mul(
-                        pl.div(pl.read(selected_scores, [0, slot]), total), _PREFILL_MOE_ROUTE_SCALE
-                    )
-                    pl.write(indices, [row, slot], pl.read(selected, [0, slot]))
-                    pl.write(weights, [row, slot], route_weight)
-    return indices, weights
 
 if __name__ == "__main__":
     # Drop this model directory when run as a script so the local golden.py does not

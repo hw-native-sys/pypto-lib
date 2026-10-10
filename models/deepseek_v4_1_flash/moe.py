@@ -171,7 +171,22 @@ def _moe_core(
             ep_rank,
             moe_epoch,
         )
-    return output_ready
+    # All ranks finish reading this round before any rank reuses its windows.
+    with pl.at(level=pl.Level.CORE_GROUP, name_hint="moe_round_release", deps=[output_ready]) as released:
+        for peer in pl.range(EP_SIZE):
+            if peer != ep_rank:
+                pld.system.notify(
+                    target=combine_arrived, peer=peer, offsets=[ep_rank, 1, 0],
+                    value=1, op=pld.NotifyOp.AtomicAdd,
+                )
+    with pl.at(level=pl.Level.CORE_GROUP, name_hint="moe_round_released", deps=[released]) as round_ready:
+        for peer in pl.range(EP_SIZE):
+            if peer != ep_rank:
+                pld.system.defer_wait(
+                    signal=combine_arrived, offsets=[peer, 1, 0],
+                    expected=moe_epoch, cmp=pld.WaitCmp.Ge,
+                )
+    return round_ready
 
 
 @pl.jit.inline(auto_scope=False)

@@ -6,7 +6,7 @@
 # INCLUDING BUT NOT LIMITED TO NON-INFRINGEMENT, MERCHANTABILITY, OR FITNESS FOR A PARTICULAR PURPOSE.
 # See LICENSE in the root of the software repository for the full text of the License.
 # -----------------------------------------------------------------------------------------------------------
-"""Torch references for the checkpoint and persistent-cache MX formats."""
+"""Checkpoint layouts and the released group-32 MX activation quantization."""
 
 import math
 
@@ -14,7 +14,6 @@ import torch
 
 from models.deepseek_v4_1_flash.config import MX_GROUP
 
-import pypto.language as pl
 
 
 FP4_VALUES = torch.tensor(
@@ -336,19 +335,10 @@ def mxfp8_linear(
 FP8_E4M3_MAX = 448.0
 
 def _e8m0_codes_from_amax(amax: torch.Tensor, fp_max: float = FP8_E4M3_MAX) -> torch.Tensor:
-    """Ascend OCP shared-exponent E8M0 codes for each group maximum.
+    """OCP shared-exponent scales used by random weight fixtures.
 
-    ``pl.quant_mx`` implements the OCP MX shared exponent
-    ``X = 2 ** (floor(log2(amax)) - emax)``, i.e. it rounds the amax exponent down
-    (``emax = floor(log2(448)) = 8``). Whenever the log2 fraction of amax lands in
-    ``[log2(448/256), 1)`` - about 19.3% of groups - the payload ``amax / X`` falls
-    in ``(448, 512)`` and saturates at the E4M3FN maximum of 448.
-
-    Rounding up with ``ceil(log2(amax / 448))``, as this helper did before, made the
-    golden scale twice the device value and the payload half the size for those same
-    ~19.3% of groups, which showed up as a systematic 1%-5% relative error on the w2
-    output (measured match rate 19.35% vs the theoretical 19.26%). The rounding
-    direction must match the device.
+    Released activation quantization uses the upward E8M0 scale in
+    ``host_quant_mxfp8_v41`` instead.
     """
     format_emax = int(math.floor(math.log2(fp_max)))
     _, exponent = torch.frexp(amax.float())
@@ -374,21 +364,14 @@ def unpack_mx_a_scale(scale: torch.Tensor) -> torch.Tensor:
 
 
 def host_quant_mxfp8_v41(x: torch.Tensor, *, return_e8m0: bool = False):
-    value = x.float()
-    groups = value.reshape(*value.shape[:-1], -1, MX_GROUP)
-    amax = groups.abs().amax(dim=-1)
-    codes = _e8m0_codes_from_amax(amax)
-    scale = _e8m0_to_fp32(codes)
-    payload = (groups / scale.unsqueeze(-1)).clamp(-448.0, 448.0).to(torch.float8_e4m3fn).reshape_as(value)
-    if not return_e8m0:
-        return payload, scale
-    return payload, codes.to(torch.uint8)
+    """Quantize with the released group-32 upward E8M0 activation scale."""
+    return host_quant_swiglu_mxfp8_v41(x, return_e8m0=return_e8m0)
 
 
 def host_quant_swiglu_mxfp8_v41(
     x: torch.Tensor, *, return_e8m0: bool = False
 ):
-    """Match CANN SwiGLU's group-32 MXFP8 quantization and upward scale."""
+    """Match the released group-32 MXFP8 quantization and upward scale."""
     value = x.float()
     groups = value.reshape(*value.shape[:-1], -1, MX_GROUP)
     maximum = groups.abs().amax(dim=-1).clamp_min(1e-4)
@@ -448,256 +431,3 @@ def matmul_mx_golden_v41(a, a_scale, b, b_scale):
     a_f = a.float() * _e8m0_to_fp32(a_codes).repeat_interleave(MX_GROUP, -1)
     b_f = b.float() * _e8m0_to_fp32(b_codes).repeat_interleave(MX_GROUP, -2)
     return torch.matmul(a_f.to(torch.float32), b_f.to(torch.float32))
-
-
-# Resident CED prefill precision variants.
-_PREFILL_OPS_ROWS = pl.dynamic("V41_FP32_ROWS")
-
-
-_PREFILL_OPS_INPUT_WIDTH = pl.dynamic("V41_FP32_INPUT_WIDTH")
-
-
-@pl.jit.inline(auto_scope=False)
-def prefill_round_bf16_inline(
-    x: pl.Tensor[[_PREFILL_OPS_ROWS, _PREFILL_OPS_INPUT_WIDTH], pl.FP32],
-    output: pl.Tensor[[_PREFILL_OPS_ROWS, _PREFILL_OPS_INPUT_WIDTH], pl.FP32],
-):
-    """Round FP32 transport values to BF16 with nearest-even ties."""
-    rows = pl.tensor.dim(x, 0)
-    width = pl.tensor.dim(x, 1)
-    column_tiles = (width + 1023) // 1024
-    for worker in pl.spmd(32, name_hint="prefill_round_bf16"):
-        for block in pl.range(worker, rows * column_tiles, 32):
-            row = block // column_tiles
-            column = block % column_tiles * 1024
-            active = pl.min(1024, width - column)
-            values = pl.slice(x, [1, 1024], [row, column], valid_shape=[1, active])
-            rounded = pl.cast(pl.cast(values, pl.BF16, mode="rint"), pl.FP32)
-            output[row : row + 1, column : column + 1024] = rounded
-    return output
-
-
-def _prefill_make_quantization(group, fp8, e8m0, name):
-    @pl.jit.inline(auto_scope=False)
-    def quantize(
-        x: pl.Tensor[[_PREFILL_OPS_ROWS, _PREFILL_OPS_INPUT_WIDTH], pl.FP32],
-        output: pl.Tensor[[_PREFILL_OPS_ROWS, _PREFILL_OPS_INPUT_WIDTH], pl.FP32],
-    ):
-        rows = pl.tensor.dim(x, 0)
-        width = pl.tensor.dim(x, 1)
-        column_tiles = (width + 1023) // 1024
-        for worker in pl.spmd(32, name_hint=name):
-            for block in pl.range(worker, rows * column_tiles, 32):
-                row = block // column_tiles
-                column = block % column_tiles * 1024
-                active = pl.min(1024, width - column)
-                source = pl.slice(x, [1, 1024], [row, column], valid_shape=[1, active])
-                source = pl.set_validshape(pl.fillpad(source, pad_value=pl.PadValue.zero), 1, 1024)
-                narrowed = pl.cast(pl.cast(source, pl.BF16, mode="rint"), pl.FP32)
-                values = pl.reshape(narrowed, [1024 // group, group])
-                amax = pl.reshape(pl.row_max(pl.abs(values)), [1, 1024 // group])
-                if fp8:
-                    scaled = pl.mul(pl.maximum(amax, 1e-4), 1.0 / 448.0)
-                elif e8m0:
-                    scaled = pl.mul(pl.maximum(amax, 7.052966104933725e-38), 1.0 / 6.0)
-                else:
-                    bounded = pl.maximum(amax, 0.01171875)
-                    six = pl.full([1, 1024 // group], dtype=pl.FP32, value=6.0)
-                    scaled = pl.div(bounded, six, high_precision=True)
-                if e8m0:
-                    bits = pl.reinterpret_view(scaled, pl.INT32)
-                    exponent = pl.shrs(pl.add(bits, 8388607), 23)
-                    scale = pl.reinterpret_view(pl.shls(exponent, 23), pl.FP32)
-                else:
-                    scale = pl.cast(pl.cast(scaled, pl.FP8E4M3FN, mode="rint"), pl.FP32)
-                group_scale = pl.reshape(scale, [1024 // group, 1])
-                ones = pl.full([1024 // group, group], dtype=pl.FP32, value=1.0)
-                divisor = pl.row_expand_mul(ones, group_scale)
-                normalized = pl.div(values, divisor, high_precision=True)
-                if fp8:
-                    normalized = pl.minimum(pl.maximum(normalized, -448.0), 448.0)
-                    payload = pl.cast(pl.cast(normalized, pl.FP8E4M3FN, mode="rint"), pl.FP32)
-                else:
-                    magnitude = pl.minimum(pl.abs(normalized), 6.0)
-                    # Even E2M1 codes win exact midpoint ties.
-                    step0 = pl.shrs(pl.sub(pl.reinterpret_view(pl.sub(magnitude, 0.25), pl.INT32), 1), 31)
-                    step1 = pl.shrs(pl.reinterpret_view(pl.sub(magnitude, 0.75), pl.INT32), 31)
-                    step2 = pl.shrs(pl.sub(pl.reinterpret_view(pl.sub(magnitude, 1.25), pl.INT32), 1), 31)
-                    step3 = pl.shrs(pl.reinterpret_view(pl.sub(magnitude, 1.75), pl.INT32), 31)
-                    step4 = pl.shrs(pl.sub(pl.reinterpret_view(pl.sub(magnitude, 2.5), pl.INT32), 1), 31)
-                    step5 = pl.shrs(pl.reinterpret_view(pl.sub(magnitude, 3.5), pl.INT32), 31)
-                    step6 = pl.shrs(pl.sub(pl.reinterpret_view(pl.sub(magnitude, 5.0), pl.INT32), 1), 31)
-                    first = pl.add(pl.add(step0, step1), pl.add(step2, step3))
-                    second = pl.add(pl.add(step4, step5), pl.add(step6, 7))
-                    code = pl.add(first, second)
-                    base = pl.mul(pl.cast(code, pl.FP32), 0.5)
-                    extra4 = pl.cast(pl.minimum(pl.maximum(pl.sub(code, 4), 0), 1), pl.FP32)
-                    extra5 = pl.cast(pl.minimum(pl.maximum(pl.sub(code, 5), 0), 1), pl.FP32)
-                    extra6 = pl.cast(pl.minimum(pl.maximum(pl.sub(code, 6), 0), 1), pl.FP32)
-                    magnitude_payload = pl.add(
-                        pl.add(base, pl.mul(pl.add(extra4, extra5), 0.5)), pl.mul(extra6, 1.5)
-                    )
-                    sign = pl.ands(pl.reinterpret_view(values, pl.INT32), -2147483648)
-                    payload = pl.reinterpret_view(
-                        pl.or_(pl.reinterpret_view(magnitude_payload, pl.INT32), sign), pl.FP32
-                    )
-                decoded = pl.row_expand_mul(payload, group_scale)
-                rounded = pl.cast(pl.cast(decoded, pl.BF16, mode="rint"), pl.FP32)
-                result = pl.set_validshape(pl.reshape(rounded, [1, 1024]), 1, active)
-                output[row : row + 1, column : column + 1024] = result
-        return output
-
-    return quantize
-
-
-prefill_quantize_fp8_inline = _prefill_make_quantization(32, True, True, "prefill_quantize_fp8")
-
-
-prefill_quantize_index_fp4_inline = _prefill_make_quantization(32, False, True, "prefill_quantize_index_fp4")
-
-
-prefill_quantize_kv_fp4_inline = _prefill_make_quantization(16, False, False, "prefill_quantize_kv_fp4")
-
-
-_PREFILL_WEIGHT_OPS_BLOCKS4 = pl.dynamic("V41_WEIGHT_BLOCKS4")
-
-
-_PREFILL_WEIGHT_OPS_INPUT_WIDTH = pl.dynamic("V41_WEIGHT_INPUT_WIDTH")
-
-
-_PREFILL_WEIGHT_OPS_OUTPUT_WIDTH = pl.dynamic("V41_WEIGHT_OUTPUT_WIDTH")
-
-
-@pl.jit.inline(auto_scope=False)
-def prefill_decode_fp4_inline(
-    bank: pl.Tensor[[_PREFILL_WEIGHT_OPS_BLOCKS4, 512], pl.INT8],
-    scales: pl.Tensor[[_PREFILL_WEIGHT_OPS_BLOCKS4, 32], pl.UINT8],
-    block_offset: pl.Scalar[pl.INDEX],
-    output: pl.Tensor[[_PREFILL_WEIGHT_OPS_INPUT_WIDTH, _PREFILL_WEIGHT_OPS_OUTPUT_WIDTH], pl.FP32],
-):
-    """Decode output-major E2M1 blocks to input-major FP32 without requantization.
-
-    Each bank row packs a 32x32 weight block, with even input columns in low
-    nibbles. Its 32 scale bytes are one E8M0 factor per output row. Matrix blocks
-    are ordered by output block, then input block; both matrix widths are
-    multiples of 32. Callers validate finite checkpoint scales before upload.
-    """
-    bank.bind_dynamic(0, _PREFILL_WEIGHT_OPS_BLOCKS4)
-    output.bind_dynamic(0, _PREFILL_WEIGHT_OPS_INPUT_WIDTH)
-    output.bind_dynamic(1, _PREFILL_WEIGHT_OPS_OUTPUT_WIDTH)
-    width = pl.tensor.dim(output, 0)
-    columns = pl.tensor.dim(output, 1)
-    input_blocks = width // 32
-    matrix_blocks = (columns // 32) * input_blocks
-    # Resolve the large bank address in orchestration's 64-bit Tensor view.
-    # InCore loads use only matrix-local offsets, bounded by one projection.
-    matrix = pl.slice(bank, [matrix_blocks, 512], [block_offset, 0])
-    matrix_scales = pl.slice(scales, [matrix_blocks, 32], [block_offset, 0])
-    for worker in pl.spmd(32, name_hint="prefill_decode_fp4"):
-        for block in pl.range(worker, matrix_blocks, 32):
-            row = block
-            packed = pl.load(matrix, [row, 0], [1, 512])
-            packed_i32 = pl.reshape(pl.cast(packed, pl.INT32), [32, 16])
-            low = pl.ands(packed_i32, 15)
-            high = pl.ands(pl.shrs(packed_i32, 4), 15)
-            low_m = pl.cast(pl.ands(low, 7), pl.FP32)
-            high_m = pl.cast(pl.ands(high, 7), pl.FP32)
-            low_value = pl.add(
-                pl.add(pl.mul(low_m, 0.5), pl.mul(pl.maximum(pl.sub(low_m, 4.0), 0.0), 0.5)),
-                pl.maximum(pl.sub(low_m, 6.0), 0.0),
-            )
-            high_value = pl.add(
-                pl.add(pl.mul(high_m, 0.5), pl.mul(pl.maximum(pl.sub(high_m, 4.0), 0.0), 0.5)),
-                pl.maximum(pl.sub(high_m, 6.0), 0.0),
-            )
-            low_signed = pl.reinterpret_view(
-                pl.or_(pl.reinterpret_view(low_value, pl.INT32), pl.shls(pl.ands(low, 8), 28)), pl.FP32
-            )
-            high_signed = pl.reinterpret_view(
-                pl.or_(pl.reinterpret_view(high_value, pl.INT32), pl.shls(pl.ands(high, 8), 28)), pl.FP32
-            )
-            # Mask scatter zero-fills unselected lanes on A5. Merge separate
-            # halves by bits so the second scatter cannot erase the first.
-            low_lanes = pl.tile.full([32, 32], dtype=pl.FP32, value=0.0)
-            high_lanes = pl.tile.full([32, 32], dtype=pl.FP32, value=0.0)
-            low_lanes = pl.tile.scatter_mask(low_lanes, low_signed, pl.tile.MaskPattern.P0101)
-            high_lanes = pl.tile.scatter_mask(high_lanes, high_signed, pl.tile.MaskPattern.P1010)
-            values = pl.reinterpret_view(
-                pl.or_(pl.reinterpret_view(low_lanes, pl.INT32), pl.reinterpret_view(high_lanes, pl.INT32)),
-                pl.FP32,
-            )
-            scale_bytes = pl.reinterpret_view(pl.load(matrix_scales, [row, 0], [1, 32]), pl.INT8)
-            code = pl.ands(pl.cast(scale_bytes, pl.INT32), 255)
-            # E8M0 code zero is 2^-127, a valid FP32 subnormal; other finite
-            # codes directly supply the FP32 biased exponent bits.
-            zero_code = pl.shrs(pl.sub(code, 1), 31)
-            bits = pl.or_(pl.shls(code, 23), pl.ands(zero_code, 4194304))
-            factor = pl.reinterpret_view(bits, pl.FP32)
-            decoded = pl.row_expand_mul(values, pl.reshape(factor, [32, 1]))
-            transposed = pl.transpose(decoded, 0, 1)
-            pl.store(transposed, [(block % input_blocks) * 32, (block // input_blocks) * 32], output)
-    return output
-
-
-_PREFILL_WEIGHT_OPS_BLOCKS8 = pl.dynamic("V41_WEIGHT_BLOCKS8")
-
-
-@pl.jit.inline(auto_scope=False)
-def prefill_decode_fp8_inline(
-    bank: pl.Tensor[[_PREFILL_WEIGHT_OPS_BLOCKS8, 1024], pl.INT8],
-    scales: pl.Tensor[[_PREFILL_WEIGHT_OPS_BLOCKS8], pl.UINT8],
-    block_offset: pl.Scalar[pl.INDEX],
-    output: pl.Tensor[[_PREFILL_WEIGHT_OPS_INPUT_WIDTH, _PREFILL_WEIGHT_OPS_OUTPUT_WIDTH], pl.FP32],
-):
-    """Exactly decode E4M3/E8M0 32x32 blocks into input-major FP32 weights."""
-    bank.bind_dynamic(0, _PREFILL_WEIGHT_OPS_BLOCKS8)
-    output.bind_dynamic(0, _PREFILL_WEIGHT_OPS_INPUT_WIDTH)
-    output.bind_dynamic(1, _PREFILL_WEIGHT_OPS_OUTPUT_WIDTH)
-    width = pl.tensor.dim(output, 0)
-    columns = pl.tensor.dim(output, 1)
-    input_blocks = width // 32
-    matrix_blocks = (columns // 32) * input_blocks
-    matrix = pl.slice(bank, [matrix_blocks, 1024], [block_offset, 0])
-    matrix_scales = pl.slice(scales, [matrix_blocks], [block_offset])
-    scale_rows = pl.reshape(matrix_scales, [1, matrix_blocks])
-    for worker in pl.spmd(32, name_hint="prefill_decode_fp8"):
-        for block in pl.range(worker, matrix_blocks, 32):
-            source = block
-            packed = pl.reshape(pl.load(matrix, [source, 0], [1, 1024]), [32, 32])
-            values = pl.cast(pl.reinterpret_view(packed, pl.FP8E4M3FN), pl.FP32)
-            scale_byte = pl.load(scale_rows, [0, source], [1, 32], valid_shape=[1, 1])
-            code = pl.ands(pl.cast(pl.reinterpret_view(scale_byte, pl.INT8), pl.INT32), 255)
-            zero_code = pl.shrs(pl.sub(code, 1), 31)
-            bits = pl.or_(pl.shls(code, 23), pl.ands(zero_code, 4194304))
-            factors = pl.reinterpret_view(bits, pl.FP32)
-            decoded = pl.mul(values, pl.tile.read(factors, [0, 0]))
-            transposed = pl.transpose(decoded, 0, 1)
-            output = pl.store(transposed, [(block % input_blocks) * 32, (block // input_blocks) * 32], output)
-    return output
-
-
-_PREFILL_COMPUTE_T = pl.dynamic("V41_COMPUTE_T")
-
-
-_PREFILL_COMPUTE_K = pl.dynamic("V41_COMPUTE_K")
-
-
-@pl.jit.inline(auto_scope=False)
-def prefill_round_inline(
-    x: pl.Tensor[[_PREFILL_COMPUTE_T, _PREFILL_COMPUTE_K], pl.FP32],
-    output: pl.Tensor[[_PREFILL_COMPUTE_T, _PREFILL_COMPUTE_K], pl.FP32],
-    official: pl.Scalar[pl.INT32],
-):
-    rows = pl.tensor.dim(x, 0)
-    width = pl.tensor.dim(x, 1)
-    for worker in pl.spmd(32, name_hint="prefill_precision_copy"):
-        for job in pl.range(worker, ((rows + 7) // 8) * ((width + 511) // 512), 32):
-            row = job // ((width + 511) // 512) * 8
-            col = job % ((width + 511) // 512) * 512
-            active_rows = pl.min(8, rows - row)
-            active_width = pl.min(512, width - col)
-            value = pl.slice(x, [8, 512], [row, col], valid_shape=[active_rows, active_width])
-            if official == 1:
-                value = pl.cast(pl.cast(value, pl.BF16, mode="rint"), pl.FP32)
-            output[row : row + 8, col : col + 512] = value
-    return output

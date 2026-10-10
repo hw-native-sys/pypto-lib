@@ -22,14 +22,6 @@ from models.deepseek_v4_1_flash.config import (
     MOE_RECV_MAX as RECV_MAX,
 )
 
-from models.deepseek_v4_1_flash.attention_ops import prefill_linear_inline
-from models.deepseek_v4_1_flash.attention_ops import prefill_linear_quantized_inline
-from models.deepseek_v4_1_flash.config import FLASH
-from models.deepseek_v4_1_flash.expert_shared import prefill_swiglu_inline
-from models.deepseek_v4_1_flash.gate import prefill_gate_select_inline
-from models.deepseek_v4_1_flash.quantization import prefill_decode_fp4_inline
-from models.deepseek_v4_1_flash.quantization import prefill_quantize_fp8_inline
-from models.deepseek_v4_1_flash.quantization import prefill_round_bf16_inline
 
 DECODE_BATCH = 8
 DECODE_SEQ = 1
@@ -366,6 +358,8 @@ def expert_routed_scatter(
                                 ab_idx = pl.tile.get_block_idx()
                                 a_base = ab_idx * QUANT_TILE
                                 h_fp32 = pl.tile.full([RECV_TILE, QUANT_TILE], dtype=pl.FP32, value=0.0)
+                                route_weight = pl.load(recv_weights, [local_i, t0], [1, RECV_TILE])
+                                route_weight = pl.reshape(route_weight, [RECV_TILE, 1])
                                 for ag in pl.pipeline(ACT_GATE_INNER, stage=2):
                                     a0 = a_base + ag * ACT_INTER_TILE
                                     h_a0 = ag * ACT_INTER_TILE
@@ -387,11 +381,12 @@ def expert_routed_scatter(
                                         up_2d = pl.maximum(pl.minimum(up_2d, SWIGLU_LIMIT), -SWIGLU_LIMIT)
                                     sigmoid = pl.recip(pl.add(pl.exp(pl.neg(gate_2d)), 1.0))
                                     silu = pl.mul(gate_2d, sigmoid)
-                                    gated = pl.mul(silu, up_2d)
+                                    gated = pl.row_expand_mul(pl.mul(silu, up_2d), route_weight)
+                                    gated = pl.cast(pl.cast(gated, pl.BF16, mode="rint"), pl.FP32)
                                     h_fp32 = pl.tile.assemble(h_fp32, gated, [0, h_a0])
                                 h_fp32_valid = pl.set_validshape(h_fp32, valid_rows, QUANT_TILE)
                                 h_fp32_padded = pl.fillpad(h_fp32_valid, pad_value=pl.PadValue.zero)
-                                # CANN SwiGLU rounds the group scale upward; ordinary MX quantization uses OCP.
+                                # The released activation quantizer rounds the group scale upward.
                                 sq_input = pl.set_validshape(h_fp32_padded, RECV_TILE, QUANT_TILE)
                                 sq_values = pl.reshape(sq_input, [RECV_TILE * SWIGLU_GROUPS, 32])
                                 sq_reduce_tmp = pl.create_tile([RECV_TILE * SWIGLU_GROUPS, 32], dtype=pl.FP32)
@@ -549,17 +544,11 @@ def expert_routed_scatter(
 
                             with pl.spmd(
                                 D // ROUTE_TASK_TILE,
-                                name_hint="exp_route_weight",
+                                name_hint="exp_output_round",
                                 deps=[w2_mxfp4_aic_tid],
-                            ) as route_weight_tid:
+                            ) as output_round_tid:
                                 wb_idx = pl.tile.get_block_idx()
                                 d_base = wb_idx * ROUTE_TASK_TILE
-                                w_row_blk = pl.load(
-                                    recv_weights,
-                                    [local_e, tt0],
-                                    [1, RECV_TILE],
-                                )
-                                w_col_blk = pl.reshape(w_row_blk, [RECV_TILE, 1])
                                 for dg in pl.range(ROUTE_TASK_TILE // ROUTE_D_OUT_TILE):
                                     d0 = d_base + dg * ROUTE_D_OUT_TILE
                                     y_fp32 = pl.load(
@@ -567,9 +556,7 @@ def expert_routed_scatter(
                                         [0, d0],
                                         [RECV_TILE, ROUTE_D_OUT_TILE],
                                     )
-                                    y_bf16 = pl.cast(y_fp32, pl.BF16, mode="rint")
-                                    y_weighted = pl.row_expand_mul(pl.cast(y_bf16, pl.FP32), w_col_blk)
-                                    y_valid = pl.set_validshape(y_weighted, valid_rows, ROUTE_D_OUT_TILE)
+                                    y_valid = pl.set_validshape(y_fp32, valid_rows, ROUTE_D_OUT_TILE)
                                     y_padded = pl.fillpad(y_valid, pad_value=pl.PadValue.zero)
                                     recv_y_tile = pl.store(
                                         pl.cast(y_padded, target_type=pl.BF16, mode="rint"),
@@ -579,7 +566,7 @@ def expert_routed_scatter(
                             with pl.at(
                                 level=pl.Level.CORE_GROUP,
                                 name_hint="expert_tile_scatter",
-                                deps=[route_weight_tid],
+                                deps=[output_round_tid],
                                 no_dep_args=[routed_output],
                             ) as scatter_tid:
                                 tile_end = tt0 + valid_rows
@@ -695,10 +682,10 @@ def golden_expert_routed(tensors):
         if SWIGLU_LIMIT > 0:
             gate = gate.clamp(max=SWIGLU_LIMIT)
             up = up.clamp(-SWIGLU_LIMIT, SWIGLU_LIMIT)
-        h = F.silu(gate) * up
+        h = (F.silu(gate) * up * w_per_row).bfloat16().float()
         h_fp8, h_scale_codes = host_quant_swiglu_mxfp8(h, return_e8m0=True)
         y = matmul_mx_golden(h_fp8, h_scale_codes, w2_fp8, w2_scale[e]).to(torch.bfloat16).float()
-        recv_y[e, :n_rows, :] = y * w_per_row
+        recv_y[e, :n_rows, :] = y
 
     tensors["recv_y"][:] = recv_y.to(torch.bfloat16)
 
@@ -940,205 +927,3 @@ def active_recv_ratio_reldiff(*, diff_thd, pct_thd):
         f"active_recv_ratio_reldiff(diff_thd={diff_thd}, pct_thd={pct_thd})"
     )
     return compare
-
-
-
-# Resident CED prefill precision variants.
-_PREFILL_MOE_T = pl.dynamic("V41_FP32_MOE_T")
-
-
-_PREFILL_MOE_WORKERS = 32
-
-
-_PREFILL_MOE_M = pl.dynamic("V41_FP32_MOE_M")
-
-
-_PREFILL_MOE_D = FLASH.hidden_size
-
-
-_PREFILL_MOE_TILE = 256
-
-
-@pl.jit.inline(auto_scope=False)
-def prefill_scatter_add_inline(
-    expert_output: pl.Tensor[[_PREFILL_MOE_M, _PREFILL_MOE_D], pl.FP32],
-    token_rows: pl.Tensor[[_PREFILL_MOE_M], pl.INT32],
-    accumulator: pl.Tensor[[_PREFILL_MOE_T, _PREFILL_MOE_D], pl.FP32],
-):
-    """Add one expert's rows; token_rows must be unique within the call."""
-    expert_output.bind_dynamic(0, _PREFILL_MOE_M)
-    token_rows.bind_dynamic(0, _PREFILL_MOE_M)
-    accumulator.bind_dynamic(0, _PREFILL_MOE_T)
-    rows = pl.tensor.dim(expert_output, 0)
-    for worker in pl.spmd(_PREFILL_MOE_WORKERS, name_hint="fp32_expert_scatter_add"):
-        for task in pl.range(worker, rows * (_PREFILL_MOE_D // _PREFILL_MOE_TILE), _PREFILL_MOE_WORKERS):
-            row = task // (_PREFILL_MOE_D // _PREFILL_MOE_TILE)
-            col = task % (_PREFILL_MOE_D // _PREFILL_MOE_TILE) * _PREFILL_MOE_TILE
-            destination = pl.read(token_rows, [row])
-            before = pl.load(accumulator, [destination, col], [1, _PREFILL_MOE_TILE])
-            value = pl.load(expert_output, [row, col], [1, _PREFILL_MOE_TILE])
-            pl.store(pl.add(before, value), [destination, col], accumulator)
-    return accumulator
-
-
-_PREFILL_MOE_INTER = FLASH.moe_intermediate_size
-
-
-@pl.jit.inline(auto_scope=False)
-def _prefill_expert_linear_inline(
-    hidden: pl.Tensor[[_PREFILL_MOE_M, _PREFILL_MOE_D], pl.FP32],
-    weight: pl.Tensor[[_PREFILL_MOE_D, _PREFILL_MOE_INTER], pl.FP32],
-    output: pl.Tensor[[_PREFILL_MOE_M, _PREFILL_MOE_INTER], pl.FP32],
-    official: pl.Scalar[pl.INT32],
-):
-    rows = pl.tensor.dim(hidden, 0)
-    source = pl.reshape(hidden, [rows, _PREFILL_MOE_D])
-    matrix = pl.reshape(weight, [_PREFILL_MOE_D, _PREFILL_MOE_INTER])
-    destination = pl.reshape(output, [rows, _PREFILL_MOE_INTER])
-    if official != 0:
-        quantized = pl.create_tensor([rows, _PREFILL_MOE_D], dtype=pl.FP32)
-        prefill_quantize_fp8_inline(source, quantized)
-        prefill_linear_quantized_inline(quantized, matrix, destination)
-    else:
-        prefill_linear_inline(source, matrix, destination)
-    return output
-
-
-_PREFILL_MOE_ROUTES = pl.dynamic("V41_MOE_ROUTES")
-
-
-_PREFILL_WEIGHT_OPS_BLOCKS4 = pl.dynamic("V41_WEIGHT_BLOCKS4")
-
-
-_PREFILL_MOE_TOPK = FLASH.num_experts_per_tok
-
-
-_PREFILL_MOE_EXPERTS = FLASH.n_routed_experts
-
-
-_PREFILL_MOE_LOCAL_EXPERTS = _PREFILL_MOE_EXPERTS // 4
-
-
-@pl.jit.inline(auto_scope=False)
-def prefill_routed_moe_inline(
-    hidden: pl.Tensor[[_PREFILL_MOE_T, _PREFILL_MOE_D], pl.FP32],
-    bank: pl.Tensor[[_PREFILL_WEIGHT_OPS_BLOCKS4, 512], pl.INT8],
-    scales: pl.Tensor[[_PREFILL_WEIGHT_OPS_BLOCKS4, 32], pl.UINT8],
-    expert_offsets: pl.Tensor[[_PREFILL_MOE_LOCAL_EXPERTS, 3], pl.INT32],
-    gate_weight: pl.Tensor[[_PREFILL_MOE_D, _PREFILL_MOE_EXPERTS], pl.FP32],
-    gate_bias: pl.Tensor[[_PREFILL_MOE_EXPERTS], pl.FP32],
-    output: pl.Tensor[[_PREFILL_MOE_ROUTES, _PREFILL_MOE_D], pl.FP32],
-    routes: pl.Tensor[[_PREFILL_MOE_T, _PREFILL_MOE_TOPK], pl.INT32],
-    rank: pl.Scalar[pl.INDEX],
-    official: pl.Scalar[pl.INT32],
-):
-    """Compute one contiguous rank's 96 routed experts without host routing.
-
-    Gate selection covers all 384 experts. Each expert sees compact rows in
-    original token order and writes its own token/top-k contribution slots.
-    The caller adds all six contributions in global expert order, then shared.
-    """
-    hidden.bind_dynamic(0, _PREFILL_MOE_T)
-    bank.bind_dynamic(0, _PREFILL_WEIGHT_OPS_BLOCKS4)
-    output.bind_dynamic(0, _PREFILL_MOE_ROUTES)
-    routes.bind_dynamic(0, _PREFILL_MOE_T)
-    rows = pl.tensor.dim(hidden, 0)
-    source = pl.reshape(hidden, [rows, _PREFILL_MOE_D])
-    route_ids = pl.create_tensor([rows, _PREFILL_MOE_TOPK], dtype=pl.INT32)
-    capacity = ((rows + 15) // 16) * 16
-    logits = pl.create_tensor([rows, _PREFILL_MOE_EXPERTS], dtype=pl.FP32)
-    route_weights = pl.create_tensor([rows, _PREFILL_MOE_TOPK], dtype=pl.FP32)
-    prefill_linear_inline(source, gate_weight, logits)
-    prefill_gate_select_inline(logits, gate_bias, route_ids, route_weights)
-    # A sliced layer's packed routes may start inside a cache line. Parallel
-    # selection writes aligned scratch; serialize publication to that view.
-    for worker in pl.spmd(1, name_hint="prefill_route_publish"):
-        for row in pl.range(rows):
-            for slot in pl.unroll(_PREFILL_MOE_TOPK):
-                pl.write(routes, [row, slot], pl.read(route_ids, [row, slot]))
-    # Padding gives every expert's scalar-written map and count its own lines.
-    route_map = pl.create_tensor([_PREFILL_MOE_LOCAL_EXPERTS, capacity], dtype=pl.INT32)
-    counts = pl.create_tensor([_PREFILL_MOE_LOCAL_EXPERTS, 16], dtype=pl.INT32)
-    for worker in pl.spmd(_PREFILL_MOE_WORKERS, name_hint="prefill_route_map"):
-        for expert in pl.range(worker, _PREFILL_MOE_LOCAL_EXPERTS, _PREFILL_MOE_WORKERS):
-            count = pl.cast(0, pl.INDEX)
-            for token in pl.range(rows):
-                for slot in pl.unroll(_PREFILL_MOE_TOPK):
-                    if pl.read(routes, [token, slot]) == rank * _PREFILL_MOE_LOCAL_EXPERTS + expert:
-                        pl.write(
-                            route_map, [expert, count], pl.cast(token * _PREFILL_MOE_TOPK + slot, pl.INT32)
-                        )
-                        count = count + 1
-            pl.write(counts, [expert, 0], pl.cast(count, pl.INT32))
-        for task in pl.range(
-            worker, rows * _PREFILL_MOE_TOPK * (_PREFILL_MOE_D // _PREFILL_MOE_TILE), _PREFILL_MOE_WORKERS
-        ):
-            pl.store(
-                pl.tile.full([1, _PREFILL_MOE_TILE], dtype=pl.FP32, value=0.0),
-                [
-                    task // (_PREFILL_MOE_D // _PREFILL_MOE_TILE),
-                    (task % (_PREFILL_MOE_D // _PREFILL_MOE_TILE)) * _PREFILL_MOE_TILE,
-                ],
-                output,
-            )
-    for expert in pl.range(_PREFILL_MOE_LOCAL_EXPERTS):
-        count = pl.cast(pl.read(counts, [expert, 0]), pl.INDEX)
-        if count > 0:
-            with pl.scope():
-                # Scratch belongs to this expert until every consumer retires.
-                # Reusing outer buffers would require explicit WAR dependencies.
-                compact_x = pl.create_tensor([capacity, _PREFILL_MOE_D], dtype=pl.FP32)
-                compact_weights = pl.create_tensor([capacity], dtype=pl.FP32)
-                compact_rows = pl.create_tensor([capacity], dtype=pl.INT32)
-                gate = pl.create_tensor([capacity, _PREFILL_MOE_INTER], dtype=pl.FP32)
-                up = pl.create_tensor([capacity, _PREFILL_MOE_INTER], dtype=pl.FP32)
-                activated = pl.create_tensor([capacity, _PREFILL_MOE_INTER], dtype=pl.FP32)
-                expert_output = pl.create_tensor([capacity, _PREFILL_MOE_D], dtype=pl.FP32)
-                w1 = pl.create_tensor([_PREFILL_MOE_D, _PREFILL_MOE_INTER], dtype=pl.FP32)
-                w3 = pl.create_tensor([_PREFILL_MOE_D, _PREFILL_MOE_INTER], dtype=pl.FP32)
-                w2 = pl.create_tensor([_PREFILL_MOE_INTER, _PREFILL_MOE_D], dtype=pl.FP32)
-                for worker in pl.spmd(_PREFILL_MOE_WORKERS, name_hint="prefill_expert_gather"):
-                    # Sixteen rows keep scalar route/weight writes line-disjoint.
-                    for group in pl.range(worker, (count + 15) // 16, _PREFILL_MOE_WORKERS):
-                        for row in pl.range(group * 16, pl.min(count, group * 16 + 16)):
-                            route = pl.cast(pl.read(route_map, [expert, row]), pl.INDEX)
-                            token = route // _PREFILL_MOE_TOPK
-                            slot = route % _PREFILL_MOE_TOPK
-                            for col in pl.range(0, _PREFILL_MOE_D, _PREFILL_MOE_TILE):
-                                pl.store(
-                                    pl.load(hidden, [token, col], [1, _PREFILL_MOE_TILE]),
-                                    [row, col],
-                                    compact_x,
-                                )
-                            pl.write(compact_weights, [row], pl.read(route_weights, [token, slot]))
-                            pl.write(compact_rows, [row], pl.cast(route, pl.INT32))
-                x = pl.slice(compact_x, [count, _PREFILL_MOE_D], [0, 0])
-                g = pl.slice(gate, [count, _PREFILL_MOE_INTER], [0, 0])
-                u = pl.slice(up, [count, _PREFILL_MOE_INTER], [0, 0])
-                h = pl.slice(activated, [count, _PREFILL_MOE_INTER], [0, 0])
-                y = pl.slice(expert_output, [count, _PREFILL_MOE_D], [0, 0])
-                weights = pl.slice(compact_weights, [count], [0])
-                token_rows = pl.slice(compact_rows, [count], [0])
-                prefill_decode_fp4_inline(
-                    bank, scales, pl.cast(pl.read(expert_offsets, [expert, 0]), pl.INDEX), w1
-                )
-                _prefill_expert_linear_inline(x, w1, g, official)
-                prefill_decode_fp4_inline(
-                    bank, scales, pl.cast(pl.read(expert_offsets, [expert, 1]), pl.INDEX), w3
-                )
-                _prefill_expert_linear_inline(x, w3, u, official)
-                prefill_swiglu_inline(g, u, weights, h)
-                prefill_decode_fp4_inline(
-                    bank, scales, pl.cast(pl.read(expert_offsets, [expert, 2]), pl.INDEX), w2
-                )
-                if official != 0:
-                    rounded = pl.create_tensor([count, _PREFILL_MOE_INTER], dtype=pl.FP32)
-                    quantized = pl.create_tensor([count, _PREFILL_MOE_INTER], dtype=pl.FP32)
-                    prefill_round_bf16_inline(h, rounded)
-                    prefill_quantize_fp8_inline(rounded, quantized)
-                    prefill_linear_quantized_inline(quantized, w2, y)
-                else:
-                    prefill_linear_inline(h, w2, y)
-                prefill_scatter_add_inline(y, token_rows, output)
-    return output, routes
-

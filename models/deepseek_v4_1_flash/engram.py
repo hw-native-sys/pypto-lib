@@ -23,9 +23,8 @@ the precomputed per-position table row ids and evaluates, per token tile,
 released module (folded host-side into a single FP32 tensor so the kernel does
 not pay a BF16 rounding on the gate path). ``token_mask`` is a no-op here
 (text-only, no image spans), so the gate is never forced to zero. The table
-stays BF16 (a stand-in for the released FP8 rows; the golden reference
-dequantizes the same BF16 values, and the acceptance budget covers the
-FP8-vs-BF16 gap).
+stores BF16 lookup values. ``engram_mx`` accepts selected checkpoint rows
+already decoded to BF16 and projects them using the original MXFP8 weights.
 
 Tensor-parallel mode (``--tp P``): the table is row-sharded across ``P`` ranks
 (``ParallelEmbedding`` style, ``ROWS_PER_RANK = NUM_EMBEDDINGS // P`` rows per
@@ -48,11 +47,12 @@ if __package__ in (None, ""):
 # ci: a5
 
 import pypto.language as pl
+
 import pypto.language.distributed as pld
 import torch
 
+from models.deepseek_v4_1_flash.attention_ops import make_mx_projection
 from models.deepseek_v4_1_flash.config import D, FLASH, HC_MULT, T_DYN
-
 
 
 N_HASH_COLS = (FLASH.engram_max_ngram_size - 1) * FLASH.engram_n_heads  # 24
@@ -92,6 +92,7 @@ if NUM_EMBEDDINGS % TP_SIZE:
 ROWS_PER_RANK = NUM_EMBEDDINGS // TP_SIZE
 # Static row capacity of the per-rank lookup window used by the TP all-reduce.
 TP_MAX_TOKENS = 256
+quantized_projection = make_mx_projection(ENGRAM_K, KV_OUT, output_dtype=pl.BF16, name_hint="engram_mx_projection")
 
 
 @pl.jit.inline
@@ -140,14 +141,14 @@ def engram_gate(
             xw_d = pl.col_expand_mul(x_d, w_d)
             dot = pl.add(dot, pl.reshape(pl.row_sum(pl.mul(xw_d, key_d)), [1, T_TILE]))
 
-        # gate = sigmoid(sign(dot) * sqrt(max(|dot|, clamp)))
-        # sign(dot)*sqrt(|dot|) == dot / sqrt(|dot|); the clamp keeps the
-        # denominator positive, matching copysign(sqrt(|dot|), dot).
+        # Preserve the sign when the square-root argument is clamped.
         inv_x = pl.rsqrt(pl.add(pl.mul(sq_x, D_INV), NORM_EPS))
         inv_k = pl.rsqrt(pl.add(pl.mul(sq_k, D_INV), NORM_EPS))
         dot = pl.mul(pl.mul(pl.mul(dot, inv_x), inv_k), DOT_SCALE)
         mag = pl.maximum(pl.abs(dot), CLAMP)
-        signed = pl.div(dot, pl.sqrt(mag))
+        sign = pl.ands(pl.reinterpret_view(dot, pl.INT32), -2147483648)
+        root_bits = pl.reinterpret_view(pl.sqrt(mag), pl.INT32)
+        signed = pl.reinterpret_view(pl.or_(root_bits, sign), pl.FP32)
         gate = pl.reshape(
             pl.recip(pl.add(pl.exp(pl.neg(signed)), 1.0)), [T_TILE, 1]
         )
@@ -225,6 +226,58 @@ def engram(
 
     # ---- Stage 2: per (token block, hc copy) gate and residual add
     engram_gate(kv, weight, x, out)
+    return out
+
+
+def make_engram_cast(width, source_dtype, output_dtype):
+    """Adapt projected and residual tensor storage around the common gate."""
+    @pl.jit.inline
+    def convert(
+        source: pl.Tensor[[T_DYN, width], source_dtype],
+        output: pl.Tensor[[T_DYN, width], output_dtype],
+    ):
+        rows = pl.tensor.dim(source, 0)
+        for block in pl.spmd(((rows + T_TILE - 1) // T_TILE) * (width // D_TILE), name_hint="engram_cast"):
+            row = block // (width // D_TILE) * T_TILE
+            column = block % (width // D_TILE) * D_TILE
+            active = pl.min(T_TILE, rows - row)
+            values = pl.load(source, [row, column], [T_TILE, D_TILE], valid_shape=[active, D_TILE])
+            values = pl.cast(values, output_dtype, mode="rint")
+            output = pl.store(values, [row, column], output)
+        return output
+
+    return convert
+
+
+engram_kv_to_fp32 = make_engram_cast(KV_OUT, pl.BF16, pl.FP32)
+engram_residual_to_bf16 = make_engram_cast(HC_MULT * D, pl.FP32, pl.BF16)
+engram_residual_to_fp32 = make_engram_cast(HC_MULT * D, pl.BF16, pl.FP32)
+
+
+@pl.jit.inline(auto_scope=False)
+def engram_mx(
+    lookup: pl.Tensor[[T_DYN, ENGRAM_K], pl.BF16],
+    wkv_weight: pl.Tensor[[ENGRAM_K, KV_OUT], pl.FP8E4M3FN],
+    wkv_scale: pl.Tensor[[ENGRAM_K // 32, KV_OUT], pl.FP8E8M0, pl.MX_B_NN],
+    weight: pl.Tensor[[HC_MULT, D], pl.FP32],
+    x: pl.Tensor[[T_DYN, HC_MULT, D], pl.FP32],
+    out: pl.Tensor[[T_DYN, HC_MULT, D], pl.FP32],
+):
+    """Project selected BF16 lookup rows with checkpoint MXFP8 weights."""
+    rows = pl.tensor.dim(lookup, 0)
+    kv_model = pl.create_tensor([rows, KV_OUT], dtype=pl.BF16)
+    kv = pl.create_tensor([rows, KV_OUT], dtype=pl.FP32)
+    x_model = pl.create_tensor([rows, HC_MULT, D], dtype=pl.BF16)
+    y_model = pl.create_tensor([rows, HC_MULT, D], dtype=pl.BF16)
+    x_flat = pl.reshape(x, [rows, HC_MULT * D])
+    x_model_flat = pl.reshape(x_model, [rows, HC_MULT * D])
+    y_model_flat = pl.reshape(y_model, [rows, HC_MULT * D])
+    out_flat = pl.reshape(out, [rows, HC_MULT * D])
+    quantized_projection(lookup, wkv_weight, wkv_scale, kv_model, pl.cast(rows, pl.INT32))
+    engram_kv_to_fp32(kv_model, kv)
+    engram_residual_to_bf16(x_flat, x_model_flat)
+    engram_gate(kv, weight, x_model, y_model)
+    engram_residual_to_fp32(y_model_flat, out_flat)
     return out
 
 
@@ -671,6 +724,7 @@ __all__ = [
     "build_engram_tp_tensor_specs",
     "engram",
     "engram_gate",
+    "engram_mx",
     "engram_test",
     "engram_tp",
     "engram_tp_group",
@@ -700,53 +754,6 @@ if "pytest" in sys.modules:
         result = validate(a5_args(tp=tp))
         assert result.passed, result.error
 
-
-
-# Resident CED prefill precision variants.
-_PREFILL_AUX_NORM_EPS = FLASH.rms_norm_eps
-
-
-_PREFILL_AUX_T = pl.dynamic("FP32_AUX_T")
-
-
-@pl.jit.inline(auto_scope=False)
-def prefill_engram_gate_inline(
-    x: pl.Tensor[[_PREFILL_AUX_T, HC_MULT, D], pl.FP32],
-    kv: pl.Tensor[[_PREFILL_AUX_T, (HC_MULT + 1) * D], pl.FP32],
-    weight: pl.Tensor[[HC_MULT, D], pl.FP32],
-    output: pl.Tensor[[_PREFILL_AUX_T, HC_MULT, D], pl.FP32],
-):
-    """Apply the released normalized signed-square-root gate without narrowing."""
-    tokens = pl.tensor.dim(x, 0)
-    flat = pl.reshape(x, [tokens, HC_MULT * D])
-    result = pl.reshape(output, [tokens, HC_MULT * D])
-    with pl.spmd(((tokens + 15) // 16) * HC_MULT, name_hint="fp32_engram_gate"):
-        block = pl.tile.get_block_idx()
-        first = (block // HC_MULT) * 16
-        stream = block % HC_MULT
-        rows = pl.min(16, tokens - first)
-        sq_x = pl.full([1, 16], dtype=pl.FP32, value=0.0)
-        sq_k = pl.full([1, 16], dtype=pl.FP32, value=0.0)
-        dot = pl.full([1, 16], dtype=pl.FP32, value=0.0)
-        for column in pl.range(0, D, 256):
-            a = pl.slice(flat, [16, 256], [first, stream * D + column], valid_shape=[rows, 256])
-            key = pl.slice(kv, [16, 256], [first, stream * D + column], valid_shape=[rows, 256])
-            w = pl.slice(weight, [1, 256], [stream, column])
-            sq_x = pl.add(sq_x, pl.reshape(pl.row_sum(pl.mul(a, a)), [1, 16]))
-            sq_k = pl.add(sq_k, pl.reshape(pl.row_sum(pl.mul(key, key)), [1, 16]))
-            dot = pl.add(dot, pl.reshape(pl.row_sum(pl.mul(pl.col_expand_mul(a, w), key)), [1, 16]))
-        inv_x = pl.rsqrt(pl.add(pl.mul(sq_x, 1.0 / D), _PREFILL_AUX_NORM_EPS), high_precision=True)
-        inv_k = pl.rsqrt(pl.add(pl.mul(sq_k, 1.0 / D), _PREFILL_AUX_NORM_EPS), high_precision=True)
-        dot = pl.mul(pl.mul(pl.mul(dot, inv_x), inv_k), D**-0.5)
-        magnitude = pl.sqrt(pl.maximum(pl.abs(dot), 1e-6))
-        sign = pl.sub(pl.mul(pl.cmp(dot, 0.0, cmp_type=5), 2.0), 1.0)
-        gate = pl.reshape(pl.recip(pl.add(pl.exp(pl.neg(pl.mul(sign, magnitude))), 1.0)), [16, 1])
-        for column in pl.range(0, D, 256):
-            a = pl.slice(flat, [16, 256], [first, stream * D + column], valid_shape=[rows, 256])
-            value = pl.slice(kv, [16, 256], [first, HC_MULT * D + column], valid_shape=[rows, 256])
-            merged = pl.add(a, pl.row_expand_mul(value, gate))
-            result = pl.assemble(result, merged, [first, stream * D + column])
-    return output
 
 if __name__ == _SCRIPT_ENTRY_POINT:
     main()

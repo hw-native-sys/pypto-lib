@@ -193,35 +193,3 @@ def compressor_ratio2(
         state_block_table, state_cache, num_tokens, pair_tid,
     )
     return pool_tid, state_tid
-
-
-# Resident CED prefill precision variants.
-_PREFILL_AUX_T = pl.dynamic("FP32_AUX_T")
-
-
-@pl.jit.inline(auto_scope=False)
-def prefill_pool_pairs_inline(
-    kv: pl.Tensor[[_PREFILL_AUX_T, HEAD_DIM], pl.FP32],
-    score: pl.Tensor[[_PREFILL_AUX_T, HEAD_DIM], pl.FP32],
-    previous_rows: pl.Tensor[[_PREFILL_AUX_T], pl.INT32],
-    output: pl.Tensor[[_PREFILL_AUX_T, HEAD_DIM], pl.FP32],
-):
-    """Pool complete ratio-two groups; negative previous rows produce zero."""
-    tokens = pl.tensor.dim(kv, 0)
-    with pl.spmd(tokens, name_hint="fp32_compressor_pair"):
-        row = pl.tile.get_block_idx()
-        previous = pl.read(previous_rows, [row])
-        for column in pl.range(0, HEAD_DIM, 256):
-            pooled = pl.full([1, 256], dtype=pl.FP32, value=0.0)
-            if previous >= 0:
-                a = pl.slice(kv, [1, 256], [previous, column])
-                b = pl.slice(kv, [1, 256], [row, column])
-                sa = pl.slice(score, [1, 256], [previous, column])
-                sb = pl.slice(score, [1, 256], [row, column])
-                maximum = pl.maximum(sa, sb)
-                pa = pl.exp(pl.sub(sa, maximum))
-                pb = pl.exp(pl.sub(sb, maximum))
-                divisor = pl.add(pa, pb)
-                pooled = pl.add(pl.mul(a, pl.div(pa, divisor)), pl.mul(b, pl.div(pb, divisor)))
-            output = pl.assemble(output, pooled, [row, column])
-    return output
