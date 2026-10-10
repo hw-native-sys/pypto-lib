@@ -1,17 +1,17 @@
 # DeepSeek V4.1 Flash
 
-`models/deepseek_v4_1_flash/` is the implementation staging area for the
-DeepSeek-V4.1-Flash checkpoint. The first milestone establishes the text-model
+`models/deepseek_v4_1_flash/` implements the DeepSeek-V4.1-Flash text backbone:
 configuration, layer schedule, cache ownership, inference metadata, Torch
-goldens, and prefill/decode kernel contracts. Checkpoint loading and optimized
-PyPTO leaf kernels remain follow-up work.
+goldens, native prefill/decode operators, checkpoint loading and resident CED
+prefill composition.
 
 ## Checkpoint shape
 
 The `FLASH` preset in
 [config.py](../../../models/deepseek_v4_1_flash/config.py) mirrors the released
-checkpoint's 40-layer text backbone and quantization metadata. Auxiliary
-drafting, n-gram, and multimodal components are intentionally out of scope.
+checkpoint's 40-layer text backbone and quantization metadata. Engram n-gram
+embeddings are included. Auxiliary drafting and multimodal components remain
+outside this implementation.
 
 | Property | Value |
 | --- | ---: |
@@ -104,22 +104,13 @@ The external serving adapter and other attention modes are not migrated here.
 needs to generate a complete profile. It is not needed in the compiled dispatch
 path when serving already supplies full tables.
 
-## Parallel-development structure
+## Operator structure
 
-Each attention mode and execution phase has one ownership file. Every file
-contains a Torch golden and an explicit `@pl.jit.inline` ABI; kernel bodies are
-the remaining parallel work.
-
-Run an operator file directly to execute its deterministic CPU golden:
-
-```bash
-source .venv/bin/activate-pypto
-python models/deepseek_v4_1_flash/decode_attn_c1a_reindex.py
-```
-
-The command prints `[GOLDEN] PASS` and exits nonzero when the reference fails.
-Once a kernel body lands, its owner can extend the same file with the thin
-`@pl.jit` entry, `build_tensor_specs()`, and device `run(...)` block.
+Each attention mode and execution phase has one ownership file with native
+PyPTO operators, Torch goldens and validation entries. Direct operator commands
+may execute on A5; follow the
+[compile/runtime workflow](../../run-and-validate/compile-runtime-workflow.md)
+and run device validation through `task-submit` on shared hosts.
 
 | Workstream | Files |
 | --- | --- |
@@ -697,59 +688,86 @@ task-submit --device auto --device-num 2 --run \
 
 ## CED prefill on A5
 
-[prefill_fwd.py](../../../models/deepseek_v4_1_flash/prefill_fwd.py) composes
-fresh prefill into one complete L2 invocation per A5 rank. Its L3 entry launches
-four ranks once. Each rank executes encoder layers 0–19, publishes layer-20
-global KV/index keys from all encoder rows, gathers each request's final causal
-window with its delayed mHC pre-mix, and executes decoder layers 20–39 and the
-vocabulary head.
+[prefill_fwd.py](../../../models/deepseek_v4_1_flash/prefill_fwd.py) composes the
+existing native operators into one complete L2 invocation per A5 rank. Each
+invocation runs encoder layers 0–19, publishes layer-20 global KV/index keys from
+all encoder rows, gathers the final causal window with its delayed mHC pre-mix,
+and runs decoder layers 20–39, final normalization, the vocabulary head and greedy
+sampling. Decoder queries retain their original positions and causal visibility.
 
-The original FP8/FP4 checkpoint weights remain resident in packed device banks.
-Each rank owns 96 of the 384 routed experts per layer; attention and shared-expert
-weights are replicated. Projections decode the original values to FP32 on device.
-Expert routing, row compaction, cache publication and the CED handoff all execute
-inside L2. The four ranks exchange individual routed contributions and add them
-in ascending global expert-ID order, then add the shared expert.
+The composition calls the existing mHC pre/mixes/post, attention, RMSNorm, MoE,
+embedding, HC head and LM head operators. It uses the released BF16 activation
+boundaries, MXFP8 projections and window caches, MXFP4 routed weights, and FP4
+compressed/index caches with their released scale formats. There is no FP32
+execution-policy switch. FP32 remains
+where the native operators require it, including mHC coefficients, residual
+transport, reductions and logits.
 
-[prefill_fwd.py](../../../models/deepseek_v4_1_flash/prefill_fwd.py) provides the
-real-checkpoint runner and independent CPU validation. The same file contains the
-L2/L3 entries and checkpoint loader. Precision variants live with their existing
-operator owners; CED metadata and independent references live in
-`metadata.py` and `golden.py`. One option controls both
-device and reference arithmetic:
+The parallel layout is **TP1 / EP4 / DP4**: four A5 ranks process four independent
+prompts, and each rank owns 96 of the 384 routed experts per layer. Attention and
+shared-expert weights are replicated. The existing MoE dispatch and combine
+operators exchange routed work between expert owners. Checkpoint payloads and
+scales are reordered into the existing native layouts without requantization.
 
-- `--precision fp32` (default) keeps activations, caches and contractions in FP32.
-- `--precision official` applies the released BF16 boundaries, FP8 activation and
-  window-cache quantization, FP4 compressed/index-cache quantization, and online
-  attention with BF16 probabilities. Activation/cache buffers hold the resulting
-  values in FP32; the weight banks retain the original packed checkpoint format.
+The checkpoint reader, resident packing and host metadata live in
+[metadata.py](../../../models/deepseek_v4_1_flash/metadata.py). All forty layers'
+compute weights remain resident across generation steps. Embedding and Engram
+tables stay on the host; only the selected rows are uploaded. The weight banks
+occupy about **75.52 GiB per rank**, plus the original BF16 vocabulary head,
+activations, caches and runtime memory.
 
-FP32 is the accuracy acceptance path. The official policy remains experimental:
-[issue #1394](https://github.com/hw-native-sys/pypto-lib/issues/1394) tracks its
-pre-existing whole-model discrepancy against a reference using the same policy.
+The runner generates one token per full-prefix evaluation. Each step rebuilds
+fresh caches and executes both CED stages; this entry does not perform cached
+incremental decode. Final normalization, vocabulary projection and greedy token
+selection execute on the devices. The host checks finite logits and verifies that
+the selected token matches the copied logits' argmax. These checks establish
+execution and sampling consistency; they do not compare whole-model precision
+against an independent numerical reference.
 
-The host prepares tokenizer hashes, metadata and checkpoint packing before the
-single distributed dispatch. Four A5 cards are required. The resident weight
-banks occupy about 74.13 GiB per rank, plus the FP32 vocabulary head, activations,
-caches and runtime memory. Fresh positive request lengths must fit 4096 packed
-rows and at most 32 physical pages per layer:
-`requests * ceil(max_request_length / 128) <= 32`.
-Cached-prefix continuation is not supported by this entry.
+First compile `l3_prefill_fwd` and assemble its A5 binaries on the CPU, outside a
+device allocation:
 
-With the environment activated, run using a checkpoint containing its released
-`inference/config.json`, `inference/engram.py`, and `tokenizer.json`:
+```bash
+python - --tp 1 --ep 4 --dp 4 --capacity 128 <<'PY'
+from pypto.ir import DistributedConfig
+from pypto.runtime import RunConfig
+from pypto.runtime.distributed_runner import _assemble_chip_callables
+from models.deepseek_v4_1_flash.prefill_fwd import l3_prefill_fwd
+
+compiled = l3_prefill_fwd.compile(config=RunConfig(
+    platform="a5",
+    distributed_config=DistributedConfig(device_ids=[0, 1, 2, 3], num_sub_workers=0),
+))
+_assemble_chip_callables(compiled)
+print(compiled.output_dir)
+PY
+```
+
+The pinned PyPTO version exposes binary assembly through this internal helper;
+`compile()` alone generates the sources, and `prepare()` also initializes device
+workers. Run the assembly step in the same environment used for execution so that
+the runner can reuse the compiled kernels and orchestration shared library.
+
+Pass the printed artifact directory to the runner's required `--runtime-dir`.
+Compilation and execution must use the same capacity and parallel layout. See the
+[compile/runtime workflow](../../run-and-validate/compile-runtime-workflow.md).
+The prompt plus requested generated tokens must fit the compiled capacity, which
+must be a multiple of 16.
+
+With the environment activated and a checkpoint containing its released
+`inference/`, `encoding/`, and tokenizer files, run the artifact on task-allocated
+A5 devices:
 
 ```bash
 task-submit --device auto --device-num 4 --max-time 5400 --run \
   'PYTHONPATH=. python -m models.deepseek_v4_1_flash.prefill_fwd \
-    --checkpoint /path/to/DeepSeek-V4.1-Flash --lengths 129,7 --capacity 144 \
-    --devices "$TASK_DEVICE" --precision fp32 --report build_output/ced-fp32.json'
+    --checkpoint /path/to/DeepSeek-V4.1-Flash \
+    --runtime-dir /path/to/compiled-artifact \
+    --tp 1 --ep 4 --dp 4 --capacity 128 --max-new-tokens 16 \
+    --devices "$TASK_DEVICE" --report build_output/ced-generation.json'
 ```
 
-The CPU reference evolves from embeddings with separate caches and routing.
-It contracts in FP64 and rounds to FP32; the official policy additionally models
-quantization, BF16 boundaries, group-32 contractions and online-64 attention.
-The validator checks rank consistency, encoder/decoder residuals and pre-mixes,
-final normalization, logits, cache values and untouched sentinels. Global relative
-L2 above 2%, worst-row L2 above 5%, or non-finite outputs fail with a nonzero exit
-code. Its JSON report also records per-layer expert-route and top-1 agreement.
+The default prompts cover arithmetic, a factual answer, translation and sequence
+continuation. Supply exactly four `--prompt` arguments to replace them. The JSON
+report records each prompt's generated token IDs, text, EOS status, parallel
+layout and execution time.

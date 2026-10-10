@@ -16,7 +16,6 @@ import pypto.language as pl
 import pypto.language.distributed as pld
 from models.deepseek_v4_1_flash import config as C
 
-from models.deepseek_v4_1_flash.config import N_EXPERTS
 
 T = C.MOE_TOKENS
 D = C.D
@@ -186,7 +185,7 @@ def dispatch(
         N_RANKS * N_LOCAL,
         name_hint="dispatch_push",
         deps=[_reuse_tid, _stage_tid],
-        allow_early_resolve=True,
+        allow_early_resolve=False,
     ) as _push_tid:
         push_block = pl.tile.get_block_idx()
         dst = push_block // N_LOCAL
@@ -266,26 +265,31 @@ def dispatch(
             peer=dst,
             offsets=[e_lane_base, 0],
         )
-        if dst != my_rank:
-            pld.system.notify(
-                target=data_arrived,
-                peer=dst,
-                offsets=[my_rank, 0, 0],
-                value=1,
-                op=pld.NotifyOp.AtomicAdd,
-            )
+    # Publish one epoch only after every local payload store completes.
+    with pl.at(
+        level=pl.Level.CORE_GROUP,
+        name_hint="dispatch_publish_epoch",
+        deps=[_push_tid],
+        allow_early_resolve=False,
+    ) as _publish_tid:
+        for dst in pl.range(N_RANKS):
+            if dst != my_rank:
+                pld.system.notify(
+                    target=data_arrived, peer=dst, offsets=[my_rank, 0, 0],
+                    value=moe_epoch, op=pld.NotifyOp.Set,
+                )
 
     with pl.at(
         level=pl.Level.CORE_GROUP,
         name_hint="dispatch_wait",
-        deps=[_push_tid],
+        deps=[_publish_tid],
     ) as _wait_tid:
         for src in pl.range(N_RANKS):
             if src != my_rank:
                 pld.system.defer_wait(
                     signal=data_arrived,
                     offsets=[src, 0, 0],
-                    expected=pl.cast(moe_epoch * N_LOCAL, pl.INT32),
+                    expected=moe_epoch,
                     cmp=pld.WaitCmp.Ge,
                 )
 
@@ -404,22 +408,18 @@ def combine_scattered(
     my_rank: pl.Scalar[pl.INT32],
     moe_epoch: pl.Scalar[pl.INT32],
 ):
-    with pl.spmd(
-        N_LOCAL,
+    with pl.at(
+        level=pl.Level.CORE_GROUP,
         name_hint="combine_notify",
         deps=[scatter_done],
+        allow_early_resolve=False,
     ) as notify_tid:
-        local_e = pl.tile.get_block_idx()
-        if local_e < N_LOCAL:
-            for peer in pl.range(N_RANKS):
-                if peer != my_rank:
-                    pld.system.notify(
-                        target=combine_arrived,
-                        peer=peer,
-                        offsets=[my_rank, 0, 0],
-                        value=1,
-                        op=pld.NotifyOp.AtomicAdd,
-                    )
+        for peer in pl.range(N_RANKS):
+            if peer != my_rank:
+                pld.system.notify(
+                    target=combine_arrived, peer=peer, offsets=[my_rank, 0, 0],
+                    value=moe_epoch, op=pld.NotifyOp.Set,
+                )
 
     with pl.at(
         level=pl.Level.CORE_GROUP,
@@ -431,7 +431,7 @@ def combine_scattered(
                 pld.system.defer_wait(
                     signal=combine_arrived,
                     offsets=[src, 0, 0],
-                    expected=pl.cast(moe_epoch * N_LOCAL, pl.INT32),
+                    expected=moe_epoch,
                     cmp=pld.WaitCmp.Ge,
                 )
 
@@ -1034,126 +1034,6 @@ def _run_one_test(kind, args):
             print(result.error)
         raise SystemExit(1)
 
-
-
-
-# Resident CED prefill precision variants.
-_PREFILL_COMM_ROUTE_ROWS = pl.dynamic("V41_COMM_ROUTE_ROWS")
-
-
-_PREFILL_COMM_WINDOW_ROWS = pl.dynamic("V41_COMM_WINDOW_ROWS")
-
-
-_PREFILL_COMM_SIGNAL_PAD = 128
-
-
-_PREFILL_COMM_ROWS = pl.dynamic("V41_COMM_ROWS")
-
-
-_PREFILL_COMM_N_RANKS = 4
-
-
-@pl.jit.inline(auto_scope=False)
-def prefill_combine_routed_experts(
-    local: pl.Tensor[[_PREFILL_COMM_ROUTE_ROWS, D], pl.FP32],
-    routes: pl.Tensor[[_PREFILL_COMM_ROWS, TOPK], pl.INT32],
-    gathered: pld.DistributedTensor[[_PREFILL_COMM_WINDOW_ROWS, D], pl.FP32],
-    ready: pld.DistributedTensor[[_PREFILL_COMM_N_RANKS, _PREFILL_COMM_SIGNAL_PAD], pl.INT32],
-    consumed: pld.DistributedTensor[[_PREFILL_COMM_N_RANKS, _PREFILL_COMM_SIGNAL_PAD], pl.INT32],
-    output: pl.Tensor[[_PREFILL_COMM_ROWS, D], pl.FP32],
-    rank: pl.Scalar[pl.INT32],
-    epoch: pl.Scalar[pl.INT32],
-    capacity: pl.Scalar[pl.INT32],
-):
-    """Add routed outputs in ascending expert order, then release the window.
-
-    Local rows are token-major route slots. Rank r owns expert IDs
-    [r * 96, (r + 1) * 96); each token has six distinct valid route IDs.
-    The window has four slots of capacity * six rows. Epochs are consecutive
-    and one-based; the caller adds the shared expert after this reduction.
-    """
-    local.bind_dynamic(0, _PREFILL_COMM_ROUTE_ROWS)
-    routes.bind_dynamic(0, _PREFILL_COMM_ROWS)
-    gathered.bind_dynamic(0, _PREFILL_COMM_WINDOW_ROWS)
-    rows = pl.tensor.dim(routes, 0)
-    with pl.spmd(
-        _PREFILL_COMM_N_RANKS, name_hint="prefill_ep_publish", allow_early_resolve=False
-    ) as publish_tid:
-        peer = pl.tile.get_block_idx()
-        if peer != rank:
-            if epoch > 1:
-                pld.system.wait(
-                    signal=consumed,
-                    offsets=[peer, 0],
-                    expected=epoch - 1,
-                    cmp=pld.WaitCmp.Ge,
-                )
-        pld.tensor.put(
-            dst=gathered,
-            peer=peer,
-            src=local,
-            dst_offsets=[rank * capacity * TOPK, 0],
-            src_offsets=[0, 0],
-            shape=[rows * TOPK, D],
-            chunk_rows=1,
-            chunk_cols=D,
-            pipeline=True,
-        )
-        if peer != rank:
-            pld.system.notify(
-                target=ready,
-                peer=peer,
-                offsets=[rank, 0],
-                value=1,
-                op=pld.NotifyOp.AtomicAdd,
-            )
-
-    with pl.at(
-        level=pl.Level.CORE_GROUP,
-        name_hint="prefill_ep_wait",
-        deps=[publish_tid],
-        allow_early_resolve=False,
-    ) as wait_tid:
-        for peer in pl.range(_PREFILL_COMM_N_RANKS):
-            if peer != rank:
-                pld.system.wait(signal=ready, offsets=[peer, 0], expected=epoch, cmp=pld.WaitCmp.Ge)
-
-    with pl.spmd(32, name_hint="prefill_ep_sum", deps=[wait_tid]) as sum_tid:
-        worker = pl.tile.get_block_idx()
-        for row in pl.range(worker, rows, 32):
-            total = pl.tile.full([1, D], dtype=pl.FP32, value=0.0)
-            previous = pl.const(-1, pl.INT32)
-            for order in pl.range(TOPK):
-                selected = pl.const(N_EXPERTS, pl.INT32)
-                selected_slot = pl.cast(0, pl.INDEX)
-                for slot in pl.range(TOPK):
-                    expert = pl.read(routes, [row, slot])
-                    if expert > previous:
-                        if expert < selected:
-                            selected = expert
-                            selected_slot = slot
-                owner = pl.cast(selected // (N_EXPERTS // _PREFILL_COMM_N_RANKS), pl.INDEX)
-                source_row = owner * capacity * TOPK + row * TOPK + selected_slot
-                value = pl.load(gathered, [source_row, 0], [1, D])
-                total = pl.add(total, value)
-                previous = selected
-            output = pl.store(total, [row, 0], output)
-
-    with pl.at(
-        level=pl.Level.CORE_GROUP,
-        name_hint="prefill_ep_release",
-        deps=[sum_tid],
-    ) as release_tid:
-        for peer in pl.range(_PREFILL_COMM_N_RANKS):
-            if peer != rank:
-                pld.system.notify(
-                    target=consumed,
-                    peer=peer,
-                    offsets=[rank, 0],
-                    value=1,
-                    op=pld.NotifyOp.AtomicAdd,
-                )
-    return output, release_tid
 
 if __name__ == "__main__":
     import argparse

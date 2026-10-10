@@ -25,8 +25,6 @@ import torch
 from models.deepseek_v4_1_flash.config import D, HC_DIM, HC_MULT, T_DYN
 from models.deepseek_v4_1_flash.golden import hc_pre
 
-from models.deepseek_v4_1_flash.config import FLASH
-
 
 HC_PAD = 8
 T_TILE = 8
@@ -208,50 +206,6 @@ def test_precision(a5_args):
     result = validate(a5_args())
     assert result.passed, result.error
 
-
-
-
-# Resident CED prefill precision variants.
-_PREFILL_MOE_T = pl.dynamic("V41_FP32_MOE_T")
-
-
-_PREFILL_MOE_WORKERS = 32
-
-
-_PREFILL_MOE_HC = FLASH.hc_mult
-
-
-_PREFILL_MOE_D = FLASH.hidden_size
-
-
-_PREFILL_MOE_TILE = 256
-
-
-@pl.jit.inline(auto_scope=False)
-def prefill_hc_pre_inline(
-    x_hc: pl.Tensor[[_PREFILL_MOE_T, _PREFILL_MOE_HC, _PREFILL_MOE_D], pl.FP32],
-    pre_mix: pl.Tensor[[_PREFILL_MOE_T, _PREFILL_MOE_HC], pl.FP32],
-    output: pl.Tensor[[_PREFILL_MOE_T, _PREFILL_MOE_D], pl.FP32],
-):
-    """Collapse the four residual streams without narrowing."""
-    x_hc.bind_dynamic(0, _PREFILL_MOE_T)
-    pre_mix.bind_dynamic(0, _PREFILL_MOE_T)
-    output.bind_dynamic(0, _PREFILL_MOE_T)
-    rows = pl.tensor.dim(x_hc, 0)
-    flat = pl.reshape(x_hc, [rows, _PREFILL_MOE_HC * _PREFILL_MOE_D])
-    for worker in pl.spmd(_PREFILL_MOE_WORKERS, name_hint="fp32_hc_pre"):
-        for task in pl.range(worker, rows * (_PREFILL_MOE_D // _PREFILL_MOE_TILE), _PREFILL_MOE_WORKERS):
-            row = task // (_PREFILL_MOE_D // _PREFILL_MOE_TILE)
-            col = task % (_PREFILL_MOE_D // _PREFILL_MOE_TILE) * _PREFILL_MOE_TILE
-            value = pl.mul(pl.load(flat, [row, col], [1, _PREFILL_MOE_TILE]), pl.read(pre_mix, [row, 0]))
-            for stream in pl.unroll(1, _PREFILL_MOE_HC):
-                part = pl.mul(
-                    pl.load(flat, [row, stream * _PREFILL_MOE_D + col], [1, _PREFILL_MOE_TILE]),
-                    pl.read(pre_mix, [row, stream]),
-                )
-                value = pl.add(value, part)
-            pl.store(value, [row, col], output)
-    return output
 
 if __name__ == _SCRIPT_ENTRY_POINT:
     main()

@@ -933,7 +933,7 @@ def test_decode_moe_orders_output_zero_before_combine_reduce():
     assert "output_ready" in {ast.unparse(element) for element in deps.elts}
 
 
-def test_decode_moe_uses_dspark_dispatch_and_accumulated_epochs():
+def test_decode_moe_uses_dspark_dispatch_signal_layout():
     source = (MODEL_DIR / "ep_transport.py").read_text()
 
     assert "SIGNAL_PAD = 128" in source
@@ -941,10 +941,7 @@ def test_decode_moe_uses_dspark_dispatch_and_accumulated_epochs():
     assert "N_RANKS * N_LOCAL," in source
     assert "offsets=[my_rank, 0, 0]" in source
     assert "offsets=[src, 0, 0]" in source
-    assert "op=pld.NotifyOp.AtomicAdd" in source
-    assert "expected=pl.cast(moe_epoch * N_LOCAL, pl.INT32)" in source
     assert "pld.system.defer_wait(" in source
-    assert "op=pld.NotifyOp.Set" not in source
     assert "for tile in pl.range(SCALE_PACK_TILES):" in source
     assert "gather_tile_tids[tile] = pl.system.task_dummy(deps=[])" in source
 
@@ -982,7 +979,8 @@ def test_decode_moe_orders_dispatch_and_expert_completion_edges():
     assert "deps=[up_mxfp4_aiv_tid, input_ready]" in expert_source
     assert "tile_completion_tids[t] = gate_up_act_quant_tid" in expert_source
     assert "deps=[w2_mxfp4_aiv_tid, hidden_completion_tids[local_e]]" in expert_source
-    assert "deps=[route_weight_tid]" in expert_source
+    assert "deps=[w2_mxfp4_aic_tid]" in expert_source
+    assert "deps=[output_round_tid]" in expert_source
     assert 'name_hint="expert_tile_scatter"' in expert_source
     assert "src=recv_y_tile" in expert_source
     assert "tile_completion_tids[tt] = scatter_tid" in expert_source
@@ -1177,30 +1175,18 @@ def _ced_metadata(lengths):
 
 
 @requires_pypto
-def test_ced_decoder_replay_gathers_matching_state_and_delayed_mix():
-    from models.deepseek_v4_1_flash import config as C
-    from models.deepseek_v4_1_flash.metadata import PrefillState
+def test_ced_decoder_replay_selects_each_request_tail():
     from models.deepseek_v4_1_flash.metadata import select_decoder_replay
 
     metadata, table = _ced_metadata([129, 7])
-    hidden = torch.zeros(136, C.HC_MULT, C.D)
-    hidden[:, 0, 0] = torch.arange(136)
-    state = PrefillState(hidden, hidden[:, :, 0].clone())
     replay = select_decoder_replay(metadata, table)
-    selected = state.take_rows(replay.source_rows)
-    assert state.num_tokens == 136
-    assert selected.num_tokens == 135
     assert replay.query_lens.tolist() == [128, 7]
     assert replay.source_rows.tolist() == list(range(1, 136))
-    assert torch.equal(selected.x_hc[:, 0, 0], torch.arange(1, 136).float())
-    assert torch.equal(selected.pre_mix[:, 0], selected.x_hc[:, 0, 0])
     assert replay.logit_row_indices.tolist() == [127, 134]
 
 
 @requires_pypto
 def test_ced_replay_masks_request_boundaries_and_rejects_prefixes():
-    from models.deepseek_v4_1_flash import config as C
-    from models.deepseek_v4_1_flash.metadata import PrefillState
     from models.deepseek_v4_1_flash.metadata import select_decoder_replay
 
     metadata, table = _ced_metadata([0, 1, 127, 128, 129])
@@ -1215,8 +1201,6 @@ def test_ced_replay_masks_request_boundaries_and_rejects_prefixes():
     metadata.kv_seq_lens[0] = 1
     with pytest.raises(ValueError, match="cached prefixes"):
         select_decoder_replay(metadata, table)
-    with pytest.raises(ValueError, match="share"):
-        PrefillState(torch.zeros(1, C.HC_MULT, C.D), torch.zeros(1, C.HC_MULT - 1))
 
 
 @requires_pypto
@@ -1224,7 +1208,7 @@ def test_ced_original_weight_codes_scales_and_selected_rows(tmp_path):
     import json
     import struct
 
-    from models.deepseek_v4_1_flash.prefill_fwd import PrefillCheckpoint, decode_checkpoint_linear
+    from models.deepseek_v4_1_flash.metadata import PrefillCheckpoint, decode_checkpoint_linear
 
     codes = torch.arange(16, dtype=torch.uint8).repeat(2)
     packed = (codes[::2] | (codes[1::2] << 4)).repeat(2, 1).view(torch.int8)
@@ -1247,106 +1231,33 @@ def test_ced_original_weight_codes_scales_and_selected_rows(tmp_path):
 
 
 @requires_pypto
-def test_ced_reference_contractions_match_independent_cancellation_and_sink_oracle():
-    from models.deepseek_v4_1_flash.golden import prefill_einsum as einsum
-    from models.deepseek_v4_1_flash.golden import prefill_linear as linear
-    import math
-    from models.deepseek_v4_1_flash.golden import prefill_matmul as matmul
-    from models.deepseek_v4_1_flash.golden import prefill_sparse_attention_reference as sparse_attention_reference
+@pytest.mark.parametrize("count, capacity", [(127, 128), (128, 128), (129, 256)])
+def test_ced_native_inputs_preserve_causal_replay_and_complete_publication(count, capacity):
+    from models.deepseek_v4_1_flash import config as C
+    from models.deepseek_v4_1_flash.metadata import prepare_resident_inputs
 
-    x = torch.tensor([[2.0**24, 1., -(2.0**24)]])
-    weight = torch.ones(1, 3)
-    expected = torch.tensor([[math.fsum(float(value) for value in x[0])]])
-    for result in (linear(x, weight), matmul(x, weight.T), einsum("mk,nk->mn", x, weight)):
-        assert result.dtype == torch.float32 and torch.equal(result, expected)
-    query = torch.tensor([[[2.0**24, 1., -(2.0**24), 1.]]])
-    cache = torch.zeros(1, 128, 4)
-    cache[0, 0] = 1
-    result = sparse_attention_reference(query, cache, torch.tensor([[0]], dtype=torch.int32), None, None, torch.zeros(1))
-    # Exact QK=2, scale=1/sqrt(4); the zero-valued sink contributes exp(0).
-    torch.testing.assert_close(result, torch.full_like(query, 1 / (1 + math.exp(-1))))
-
-
-@requires_pypto
-def test_ced_fresh_geometry_limits_fail_before_cache_allocation(monkeypatch):
-    from models.deepseek_v4_1_flash.metadata import PrefillContext
-
-    class AllocationReached(Exception):
-        pass
-
-    def stop(*_args, **_kwargs):
-        raise AllocationReached
-
-    monkeypatch.setattr(torch, "arange", stop)
-    for lengths, capacity in (([0], None), ([2], 1), ([4097], None), ([129] * 17, None)):
-        with pytest.raises(ValueError):
-            PrefillContext(None, lengths, capacity)
-    with pytest.raises(AllocationReached):
-        PrefillContext(None, [4096])
-
-
-@requires_pypto
-def test_ced_ratio_two_pairs_and_full_encoder_publication_keep_request_ownership():
-    from models.deepseek_v4_1_flash.metadata import PrefillContext
-
-    context = PrefillContext(None, [129, 7])
-    assert context.precision == "fp32"
-    inputs = context.layer_inputs(2, load_weights=False)
-    expected = torch.full((136,), -1, dtype=torch.int32)
-    expected[1:129:2] = torch.arange(0, 128, 2, dtype=torch.int32)
-    expected[130:136:2] = torch.arange(129, 135, 2, dtype=torch.int32)
-    assert torch.equal(inputs.previous_rows, expected)
-    assert inputs.metadata.compressed_slots[[128, 129]].tolist() == [-1, -1]
-    publisher = context.publisher_inputs(load_weights=False).metadata
-    assert publisher.compressed_slots.numel() == 136 and bool((publisher.compressed_slots >= 0).all())
-
-
-@requires_pypto
-def test_ced_context_uses_released_rope_profiles_for_every_layer():
-    from models.deepseek_v4_1_flash.metadata import PrefillContext
-    import math
-
-    context = PrefillContext(None, [129, 7])
-    for layer in range(40):
-        data = context.layer_inputs(layer, load_weights=False).metadata
-        positions = context.metadata.position_ids if layer < 20 else context.replay.position_ids
-        base = 10000.0 if layer < 2 else 160000.0
-        frequency = torch.tensor([base ** (-2 * k / 64) for k in range(32)], dtype=torch.float64)
-        if layer >= 2:
-            low = max(math.floor(64 * math.log(65536 / (32 * 2 * math.pi)) / (2 * math.log(base))), 0)
-            high = min(math.ceil(64 * math.log(65536 / (2 * math.pi)) / (2 * math.log(base))), 63)
-            ramp = ((torch.arange(32, dtype=torch.float64) - low) / max(high - low, 1e-3)).clamp(0, 1)
-            frequency = frequency * (1 - ramp) + frequency / 16 * ramp
-        phase = positions.double()[:, None] * frequency
-        torch.testing.assert_close(data.rope_cos, phase.cos().float(), rtol=1e-6, atol=1e-5)
-        torch.testing.assert_close(data.rope_sin, phase.sin().float(), rtol=1e-6, atol=1e-5)
-
-
-@requires_pypto
-def test_ced_precision_modes_preserve_default_and_released_rounding_boundaries():
-    from models.deepseek_v4_1_flash.metadata import PrefillContext
-    from models.deepseek_v4_1_flash.golden import prefill_linear as linear
-    from models.deepseek_v4_1_flash.golden import prefill_quantize_dequantize as quantize_dequantize
-    from models.deepseek_v4_1_flash.golden import prefill_round_activation as round_activation
-
-    x = torch.tensor([[1 + 2.0**-9] * 32])
-    weight = torch.ones(1, 32)
-    assert linear(x, weight).item() == 32 + 2.0**-4
-    assert linear(x, weight, precision="official", format="bf16").item() == 32
-    assert linear(x, weight, precision="official", format="mxfp8").item() == 32
-    assert round_activation(x) is x
-    # An amax of six fixes the index scale at one. Halfway values choose even
-    # FP4 codes, including signed zero; these are literal released code points.
-    values = torch.tensor([[.25, .75, 1.25, 1.75, 2.5, 3.5, 5., -.25, 6.] + [0.] * 23])
-    rounded = quantize_dequantize(values, "index_fp4")
-    assert rounded[0, :9].tolist() == [0., 1., 1., 2., 2., 4., 4., -0., 6.]
-    assert rounded[0, 7].signbit()
-    with pytest.raises(ValueError, match="precision"):
-        PrefillContext(None, [1], precision="unknown")
-    context = PrefillContext(None, [17, 129], precision="official")
-    encoder = context.layer_inputs(2, load_weights=False).metadata.attention_extents
-    decoder = context.layer_inputs(20, load_weights=False).metadata.attention_extents
-    # Global keys follow each request's actual window width, before online64
-    # grouping, rather than always starting at padded column128.
-    assert encoder[[0, 17]].tolist() == [[17, 8], [128, 64]]
-    assert decoder[[0, 17]].tolist() == [[17, 17], [128, 129]]
+    weights = SimpleNamespace(
+        _hash_capacity=capacity,
+        _hash_state=lambda ids, start: torch.zeros(1, count, 2, 24, dtype=torch.int64),
+        lookup_rows=lambda ids, hashes: (
+            torch.zeros(count, C.D, dtype=torch.bfloat16),
+            {layer: torch.zeros(count, 6144, dtype=torch.bfloat16) for layer in C.FLASH.engram_layer_ids},
+        ),
+        _output_weights={"head": torch.empty(0), "final_norm": torch.ones(C.D, dtype=torch.bfloat16)},
+        offset_tensors={},
+    )
+    values = prepare_resident_inputs(None, weights, torch.arange(count), capacity)
+    first = max(0, count - 128)
+    replay_count = count - first
+    assert values["counts"].tolist() == [count, replay_count]
+    assert values["replay_rows"][:replay_count].tolist() == list(range(first, count))
+    assert bool((values["replay_rows"][replay_count:] == -1).all())
+    assert values["window_indices"][1, 0, 0].item() == first
+    assert bool((values["window_indices"][1, 0, 1:] == -1).all())
+    assert values["compressed_lens"][1, :replay_count].tolist() == list(range(first + 1, count + 1))
+    assert values["publisher_slots"][:count].tolist() == list(range(count))
+    assert values["compressed_slots"][:4].tolist() == [-1, 0, -1, 1]
+    assert torch.equal(values["compressed_cos"][1], values["publisher_cos"][0])
+    assert torch.equal(values["compressed_sin"][3], values["publisher_sin"][2])
+    assert values["logit_rows"].tolist() == [replay_count - 1] + [-1] * 15
+    assert bool((values["index_block_tables"][:, :, -1] == -1).all())

@@ -12,9 +12,6 @@ import pypto.language as pl
 
 from models.deepseek_v4_1_flash.config import FLASH as M, MOE_TOKENS
 
-from models.deepseek_v4_1_flash.attention_ops import prefill_packed_linear_inline
-from models.deepseek_v4_1_flash.config import FLASH
-from models.deepseek_v4_1_flash.quantization import prefill_round_inline
 
 
 # model config
@@ -53,6 +50,8 @@ assert MX_W2_K_TILE % MX_W2_RIGHT_K_TILE == 0
 ACT_INTER_TILE = 256
 D_OUT_TILE = 256
 QUANT_TILE = 768
+QUANT_GROUPS = QUANT_TILE // 32
+QUANT_SCALE_TMP = ((64 + (SH_M_TILE // 16) * QUANT_GROUPS + 31) // 32) * 32
 assert MOE_INTER % QUANT_TILE == 0
 assert QUANT_TILE % ACT_INTER_TILE == 0
 assert MX_K_TILE % MX_RIGHT_K_TILE == 0
@@ -245,6 +244,8 @@ def expert_shared(
                 for n0 in pl.pipeline(k0, k0 + QUANT_TILE, ACT_INTER_TILE, stage=2):
                     gate_rows = gate_fp32[row0 : row0 + SH_ROW_TILE, n0 : n0 + ACT_INTER_TILE]
                     up_rows = up_fp32[row0 : row0 + SH_ROW_TILE, n0 : n0 + ACT_INTER_TILE]
+                    gate_rows = pl.cast(pl.cast(gate_rows, pl.BF16, mode="rint"), pl.FP32)
+                    up_rows = pl.cast(pl.cast(up_rows, pl.BF16, mode="rint"), pl.FP32)
                     if SWIGLU_LIMIT > 0.0:
                         gate_rows = pl.minimum(gate_rows, SWIGLU_LIMIT)
                         up_max = pl.minimum(up_rows, SWIGLU_LIMIT)
@@ -255,9 +256,28 @@ def expert_shared(
                     sigmoid = pl.recip(gate_exp_one)
                     silu = pl.mul(gate_rows, sigmoid)
                     gated = pl.mul(silu, up_rows)
+                    gated = pl.cast(pl.cast(gated, pl.BF16, mode="rint"), pl.FP32)
                     h_tile_fp32[row0 : row0 + SH_ROW_TILE, n0 : n0 + ACT_INTER_TILE] = gated
             h_fp32 = pl.load(h_tile_fp32, [0, k0], [SH_M_TILE, QUANT_TILE])
-            h_mx, h_scale_mx = pl.quant_mx(h_fp32, group_axis=1)
+            quant_groups = pl.reshape(h_fp32, [SH_M_TILE * QUANT_GROUPS, 32])
+            quant_tmp = pl.create_tile([SH_M_TILE * QUANT_GROUPS, 32], dtype=pl.FP32)
+            quant_maximum = pl.maximum(pl.row_max(pl.abs(quant_groups), tmp_tile=quant_tmp), 1e-4)
+            quant_bits = pl.reinterpret_view(pl.mul(quant_maximum, 1.0 / 448.0), pl.INT32)
+            quant_exponent = pl.shrs(pl.add(quant_bits, 8388607), 23)
+            quant_scale = pl.reinterpret_view(pl.shls(quant_exponent, 23), pl.FP32)
+            quant_normalized = pl.row_expand_div(quant_groups, quant_scale)
+            quant_clipped = pl.minimum(pl.maximum(quant_normalized, -448.0), 448.0)
+            quant_payload = pl.cast(quant_clipped, pl.FP8E4M3FN, mode="rint")
+            h_mx = pl.reshape(quant_payload, [SH_M_TILE, QUANT_TILE])
+            quant_signed = pl.sub(quant_exponent, pl.mul(pl.shrs(quant_exponent, 7), 256))
+            quant_codes = pl.reinterpret_view(pl.cast(quant_signed, pl.INT8), pl.UINT8)
+            quant_flat = pl.reshape(quant_codes, [1, SH_M_TILE * QUANT_GROUPS])
+            quant_pack_tmp = pl.create_tile([1, QUANT_SCALE_TMP], dtype=pl.UINT8)
+            quant_packed = pl.tmov_x2zz(
+                quant_flat, quant_pack_tmp, group_axis=1,
+                dst_rows=SH_M_TILE, dst_cols=QUANT_GROUPS,
+            )
+            h_scale_mx = pl.reinterpret_view(quant_packed, pl.FP8E8M0)
             h_tile_mx = pl.store(h_mx, [0, k0], h_tile_mx)
             scale_offset = q_idx * SH_M_TILE * (QUANT_TILE // MX_GROUP)
             h_scale_backing = pl.store(
@@ -271,7 +291,9 @@ def expert_shared(
             [SH_M_TILE, MOE_INTER // MX_GROUP],
             layout=pl.MX_A_ZZ,
         )
-        for db_idx in pl.spmd(D // D_OUT_TILE, name_hint="sh_w2_mm"):
+        # Wait for the paired Vector core before the Cube core publishes C2V
+        # tiles; otherwise A5 can overwrite a preceding Vector task's UB.
+        for db_idx in pl.spmd(D // D_OUT_TILE, name_hint="sh_w2_mm", sync_start=True):
             d0 = db_idx * D_OUT_TILE
             hs0 = pl.load(h_tile_mx, [0, 0], [SH_M_TILE, MX_W2_RIGHT_K_TILE])
             hs_scale0 = pl.load(
@@ -385,12 +407,12 @@ def golden_expert_shared(tensors):
     w2_fp8 = tensors["shared_w2"]
     w2_scale = decode_e8m0_codes(tensors["shared_w2_scale"], side="b")
 
-    sh_gate = matmul_mx_golden(x_fp8, x_scale, w1_fp8, w1_scale)
-    sh_up = matmul_mx_golden(x_fp8, x_scale, w3_fp8, w3_scale)
+    sh_gate = matmul_mx_golden(x_fp8, x_scale, w1_fp8, w1_scale).bfloat16().float()
+    sh_up = matmul_mx_golden(x_fp8, x_scale, w3_fp8, w3_scale).bfloat16().float()
     if SWIGLU_LIMIT > 0:
         sh_gate = sh_gate.clamp(max=SWIGLU_LIMIT)
         sh_up = sh_up.clamp(-SWIGLU_LIMIT, SWIGLU_LIMIT)
-    sh_h = F.silu(sh_gate) * sh_up
+    sh_h = (F.silu(sh_gate) * sh_up).bfloat16().float()
     sh_h_fp8, sh_h_scale = host_quant_mxfp8(sh_h, return_e8m0=True)
     sh = matmul_mx_golden(sh_h_fp8, sh_h_scale, w2_fp8, w2_scale)
 
@@ -436,107 +458,6 @@ def build_tensor_specs():
         TensorSpec("sh", [T, D], torch.bfloat16),
     ]
 
-
-
-
-# Resident CED prefill precision variants.
-_PREFILL_MOE_TILE = 256
-
-
-_PREFILL_MOE_INTER = FLASH.moe_intermediate_size
-
-
-_PREFILL_MOE_LIMIT = FLASH.swiglu_limit
-
-
-_PREFILL_MOE_WORKERS = 32
-
-
-_PREFILL_MOE_M = pl.dynamic("V41_FP32_MOE_M")
-
-
-@pl.jit.inline(auto_scope=False)
-def prefill_swiglu_inline(
-    gate: pl.Tensor[[_PREFILL_MOE_M, _PREFILL_MOE_INTER], pl.FP32],
-    up: pl.Tensor[[_PREFILL_MOE_M, _PREFILL_MOE_INTER], pl.FP32],
-    route_weights: pl.Tensor[[_PREFILL_MOE_M], pl.FP32],
-    output: pl.Tensor[[_PREFILL_MOE_M, _PREFILL_MOE_INTER], pl.FP32],
-):
-    """Clamp the released SwiGLU inputs and apply route weights before W2."""
-    gate.bind_dynamic(0, _PREFILL_MOE_M)
-    up.bind_dynamic(0, _PREFILL_MOE_M)
-    route_weights.bind_dynamic(0, _PREFILL_MOE_M)
-    output.bind_dynamic(0, _PREFILL_MOE_M)
-    rows = pl.tensor.dim(gate, 0)
-    for worker in pl.spmd(_PREFILL_MOE_WORKERS, name_hint="fp32_swiglu"):
-        for task in pl.range(worker, rows * (_PREFILL_MOE_INTER // _PREFILL_MOE_TILE), _PREFILL_MOE_WORKERS):
-            row = task // (_PREFILL_MOE_INTER // _PREFILL_MOE_TILE)
-            col = task % (_PREFILL_MOE_INTER // _PREFILL_MOE_TILE) * _PREFILL_MOE_TILE
-            g = pl.minimum(pl.load(gate, [row, col], [1, _PREFILL_MOE_TILE]), _PREFILL_MOE_LIMIT)
-            u = pl.maximum(
-                pl.minimum(pl.load(up, [row, col], [1, _PREFILL_MOE_TILE]), _PREFILL_MOE_LIMIT),
-                -_PREFILL_MOE_LIMIT,
-            )
-            sigmoid = pl.div(
-                pl.exp(pl.minimum(g, 0.0)), pl.add(pl.exp(pl.neg(pl.abs(g))), 1.0), high_precision=True
-            )
-            value = pl.mul(pl.mul(g, sigmoid), u)
-            value = pl.mul(value, pl.read(route_weights, [row]))
-            pl.store(value, [row, col], output)
-    return output
-
-
-_PREFILL_MOE_D = FLASH.hidden_size
-
-
-_PREFILL_MOE_T = pl.dynamic("V41_FP32_MOE_T")
-
-
-_PREFILL_WEIGHT_OPS_BLOCKS8 = pl.dynamic("V41_WEIGHT_BLOCKS8")
-
-
-@pl.jit.inline(auto_scope=False)
-def prefill_shared_expert_inline(
-    hidden: pl.Tensor[[_PREFILL_MOE_T, _PREFILL_MOE_D], pl.FP32],
-    bank: pl.Tensor[[_PREFILL_WEIGHT_OPS_BLOCKS8, 1024], pl.INT8],
-    scales: pl.Tensor[[_PREFILL_WEIGHT_OPS_BLOCKS8], pl.UINT8],
-    offsets: pl.Tensor[[3], pl.INT32],
-    output: pl.Tensor[[_PREFILL_MOE_T, _PREFILL_MOE_D], pl.FP32],
-    official: pl.Scalar[pl.INT32],
-):
-    """Compute the shared expert for addition after all routed rank partials."""
-    rows = pl.tensor.dim(hidden, 0)
-    source = pl.reshape(hidden, [rows, _PREFILL_MOE_D])
-    destination = pl.reshape(output, [rows, _PREFILL_MOE_D])
-    gate = pl.create_tensor([rows, _PREFILL_MOE_INTER], dtype=pl.FP32)
-    up = pl.create_tensor([rows, _PREFILL_MOE_INTER], dtype=pl.FP32)
-    activated = pl.create_tensor([rows, _PREFILL_MOE_INTER], dtype=pl.FP32)
-    rounded = pl.create_tensor([rows, _PREFILL_MOE_INTER], dtype=pl.FP32)
-    weights = pl.create_tensor([rows], dtype=pl.FP32)
-    weights_row = pl.reshape(weights, [1, rows])
-    for worker in pl.spmd(_PREFILL_MOE_WORKERS, name_hint="prefill_shared_weights"):
-        for group in pl.range(worker, (rows + 15) // 16, _PREFILL_MOE_WORKERS):
-            active = pl.min(16, rows - group * 16)
-            ones = pl.tile.full([1, 16], dtype=pl.FP32, value=1.0)
-            pl.store(pl.set_validshape(ones, 1, active), [0, group * 16], weights_row)
-    prefill_packed_linear_inline(
-        source, bank, scales, pl.cast(pl.read(offsets, [0]), pl.INDEX), gate, official, pl.cast(2, pl.INT32)
-    )
-    prefill_packed_linear_inline(
-        source, bank, scales, pl.cast(pl.read(offsets, [1]), pl.INDEX), up, official, pl.cast(2, pl.INT32)
-    )
-    prefill_swiglu_inline(gate, up, weights, activated)
-    prefill_round_inline(activated, rounded, official)
-    prefill_packed_linear_inline(
-        rounded,
-        bank,
-        scales,
-        pl.cast(pl.read(offsets, [2]), pl.INDEX),
-        destination,
-        official,
-        pl.cast(2, pl.INT32),
-    )
-    return output
 
 if __name__ == "__main__":
     # Drop this model directory when run as a script so the local golden.py does not

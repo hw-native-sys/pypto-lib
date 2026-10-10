@@ -26,6 +26,8 @@ from models.deepseek_v4_1_flash.config import D, HC_MULT, T_DYN
 
 TOKEN_DYN = T_DYN
 VOCAB_DYN = pl.dynamic("PACK_X_HC_VOCAB_DYN")
+SOURCE_ROWS = pl.dynamic("PACK_SOURCE_ROWS")
+ROW_WIDTH = pl.dynamic("PACK_ROW_WIDTH")
 
 HIDDEN_TILE = 512
 SPMD_BLOCKS = 48
@@ -33,6 +35,29 @@ TEST_VOCAB_SIZE = 256
 DEFAULT_TOKENS = 8
 
 assert D % HIDDEN_TILE == 0
+
+
+@pl.jit.inline
+def gather_rows(
+    source: pl.Tensor[[SOURCE_ROWS, ROW_WIDTH], pl.FP32],
+    row_ids: pl.Tensor[[TOKEN_DYN], pl.INT32],
+    output: pl.Tensor[[TOKEN_DYN, ROW_WIDTH], pl.FP32],
+):
+    """Gather complete rows, zeroing negative IDs used for inactive padding."""
+    rows = pl.tensor.dim(output, 0)
+    width = pl.tensor.dim(output, 1)
+    for worker in pl.spmd(SPMD_BLOCKS, name_hint="gather_rows"):
+        for row in pl.range(worker, rows, SPMD_BLOCKS):
+            source_row = pl.cast(pl.read(row_ids, [row]), pl.INDEX)
+            for col in pl.range(0, width, HIDDEN_TILE):
+                active = pl.min(HIDDEN_TILE, width - col)
+                if source_row >= 0:
+                    value = pl.load(source, [source_row, col], [1, HIDDEN_TILE], valid_shape=[1, active])
+                    pl.store(value, [row, col], output)
+                else:
+                    empty = pl.tile.full([1, HIDDEN_TILE], dtype=pl.FP32, value=0.0)
+                    pl.store(pl.set_validshape(empty, 1, active), [row, col], output)
+    return output
 
 
 @pl.jit.inline
