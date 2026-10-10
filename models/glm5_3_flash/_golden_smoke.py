@@ -129,6 +129,45 @@ def run_swiglu_golden(golden_swiglu) -> None:
     _report("swiglu")
 
 
+def run_expert_golden(golden_expert) -> None:
+    """Check one clamped-SwiGLU expert FFN: routed, shared and dense share it."""
+    torch.manual_seed(29)
+    tokens, hidden, inter = 6, 64, 128
+    x = torch.randn(tokens, hidden, dtype=torch.bfloat16)
+    w_gate = torch.randn(inter, hidden, dtype=torch.bfloat16)
+    w_up = torch.randn(inter, hidden, dtype=torch.bfloat16)
+    w_down = torch.randn(hidden, inter, dtype=torch.bfloat16)
+
+    out = golden_expert(x, w_gate, w_up, w_down)
+    _check(out.shape == (tokens, hidden), f"expert output shape {tuple(out.shape)}")
+
+    route_weight = torch.rand(tokens, 1, dtype=torch.bfloat16)
+    out_routed = golden_expert(x, w_gate, w_up, w_down, route_weight)
+    _check(out_routed.shape == out.shape, f"routed expert output shape {tuple(out_routed.shape)}")
+    # The routing weight is folded into the BF16 hidden before ``down``, so the
+    # comparison to ``out * weight`` carries a few BF16 ULPs of requant noise
+    # amplified by the down projection. A per-row relative check admits that.
+    expected = out.float() * route_weight.float()
+    row_denom = expected.abs().amax(dim=-1, keepdim=True).clamp_min(1e-6)
+    row_reldiff = (out_routed.float() - expected).abs().amax(dim=-1) / row_denom.squeeze(-1)
+    _check(
+        bool((row_reldiff < 0.01).all()),
+        f"routed expert must fold the per-row weight into its output "
+        f"(max row reldiff {row_reldiff.max().item():.5f})",
+    )
+    # The plain path must reproduce the same maths with a unit weight.
+    _check(
+        torch.allclose(
+            golden_expert(x, w_gate, w_up, w_down, torch.ones(tokens, 1)).float(),
+            out.float(),
+            atol=1e-3,
+        ),
+        "expert must be invariant to a unit routing weight",
+    )
+
+    _report("expert")
+
+
 def run_norm_goldens(golden_rms_norm, golden_rms_norm_gated, golden_l2norm) -> None:
     """Exercise the three normalisations the backbone shares."""
     torch.manual_seed(19)
@@ -416,6 +455,7 @@ def run_mla_epilog_goldens(golden_epilog_prefill, golden_epilog_decode) -> None:
 
 __all__ = [
     "run_decode_sparse_attn_golden",
+    "run_expert_golden",
     "run_mhc_goldens",
     "run_mla_cache_golden",
     "run_mla_epilog_goldens",
