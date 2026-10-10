@@ -369,6 +369,7 @@ def indexer_score_topk_stream(
     qh_quant_tid: pl.Scalar[pl.TASK_ID],
     weights_tid: pl.Scalar[pl.TASK_ID],
     cache_write_tid: pl.Scalar[pl.TASK_ID],
+    max_leaves: pl.Scalar[pl.INDEX],
 ):
     """Stream contiguous score panels into one UB Top-K root per query/leaf."""
     b_dim = pl.tensor.dim(idx_block_table, 0)
@@ -387,10 +388,6 @@ def indexer_score_topk_stream(
     ) as stream_tid:
         worker = pl.tile.get_block_idx()
         query_count = pl.tensor.dim(position_ids, 0)
-        max_cache_len = 0
-        for batch in pl.range(query_count // S):
-            max_cache_len = pl.max(max_cache_len, pl.read(kv_seq_lens, [batch]) // COMPRESS_RATIO)
-        max_leaves = pl.max((pl.min(max_cache_len, TOPK_MAX_CANDIDATES) + TOPK_CANDIDATES_PER_LEAF - 1) // TOPK_CANDIDATES_PER_LEAF, 1)
         pl.system.set_ffts(ffts)
         for item in pl.range(worker, query_count // STREAM_QUERY_TILE * max_leaves, TOPK_SCORE_WORKERS):
             query = item // max_leaves * STREAM_QUERY_TILE
@@ -526,6 +523,8 @@ def indexer_score_topk_forest(
     qh_quant_tid: pl.Scalar[pl.TASK_ID],
     weights_tid: pl.Scalar[pl.TASK_ID],
     cache_write_tid: pl.Scalar[pl.TASK_ID],
+    max_topk_cache_len: pl.Scalar[pl.INDEX],
+    stream_score: pl.Scalar[pl.INDEX],
 ):
     """Score with streamed roots at TP1/S6 long history, otherwise half-leaves."""
     b_dim = pl.tensor.dim(idx_block_table, 0)
@@ -548,14 +547,9 @@ def indexer_score_topk_forest(
     score_arena = pl.create_tensor(
         [SCORE_ARENA_ROWS, TOPK_CANDIDATES_PER_LEAF], dtype=pl.FP32
     )
-    max_topk_cache_len = 0
-    for topk_batch in pl.range(b_dim):
-        topk_cache_len = pl.read(kv_seq_lens, [topk_batch]) // COMPRESS_RATIO
-        max_topk_cache_len = pl.max(max_topk_cache_len, topk_cache_len)
     large_batch = pl.cast(b_dim >= 64, pl.INDEX)
     long_history = pl.cast(max_topk_cache_len >= 32768, pl.INDEX)
     buffered_score = large_batch * long_history
-    stream_score = pl.cast(b_dim < 64, pl.INDEX) * long_history * STREAM_ENABLED
     if buffered_score > 0:
         buf_score_transfer = pl.create_tensor([TOPK_SCORE_WORKERS * 2 * IDX_N_HEADS, BUFFERED_SCORE_TILE], dtype=pl.FP16)
         buf_score_ffts = pl.create_tensor([256], dtype=pl.INT64)
@@ -678,10 +672,12 @@ def indexer_score_topk_forest(
                                 pl.store(buf_empty_pairs, [buf_half_slot, 0], pair_arena)
         score_tid = buffered_leaf_tid
     elif stream_score > 0:
+        stream_history = pl.min(max_topk_cache_len, TOPK_MAX_CANDIDATES)
+        stream_leaves = pl.max((stream_history + TOPK_CANDIDATES_PER_LEAF - 1) // TOPK_CANDIDATES_PER_LEAF, 1)
         score_tid = indexer_score_topk_stream(
             qr_hadamard_i8, stream_coefficient, idx_kv_cache, idx_kv_scale,
             idx_block_table, position_ids, kv_seq_lens, pair_arena,
-            qh_quant_tid, weights_tid, cache_write_tid,
+            qh_quant_tid, weights_tid, cache_write_tid, stream_leaves,
         )
     else:
         with pl.spmd(
@@ -1089,6 +1085,13 @@ def indexer_weights_score(
         dtype=pl.FP16,
     )
     stream_coefficient = pl.create_tensor([STREAM_COEF_ROWS, IDX_N_HEADS * STREAM_QUERY_TILE], dtype=pl.FP16)
+    topk_batch_count = pl.tensor.dim(idx_block_table, 0)
+    max_topk_cache_len = 0
+    for topk_batch in pl.range(topk_batch_count):
+        topk_cache_len = pl.read(kv_seq_lens, [topk_batch]) // COMPRESS_RATIO
+        max_topk_cache_len = pl.max(max_topk_cache_len, topk_cache_len)
+    stream_score = pl.cast(max_topk_cache_len >= 32768, pl.INDEX) * STREAM_ENABLED
+    stream_score = stream_score * pl.cast(topk_batch_count < 64, pl.INDEX)
     with pl.spmd(
         row_blocks,
         name_hint="weights_proj_reduce",
@@ -1111,24 +1114,14 @@ def indexer_weights_score(
                 ),
             )
         w_scaled = pl.tile.muls(w_sum, WEIGHTS_SCALE)
-        # Stream coefficients are needed only by TP1/S6's long-history path.
-        prepare_stream = 0
-        if STREAM_ENABLED != 0:
-            coef_max_cache = 0
-            coef_batch_count = pl.tensor.dim(kv_seq_lens, 0)
-            for coef_batch in pl.range(coef_batch_count):
-                coef_cache = pl.read(kv_seq_lens, [coef_batch]) // COMPRESS_RATIO
-                coef_max_cache = pl.max(coef_max_cache, coef_cache)
-            prepare_stream = pl.cast(coef_max_cache >= 32768, pl.INDEX)
-            prepare_stream = prepare_stream * pl.cast(coef_batch_count < 64, pl.INDEX)
-        if prepare_stream == 0:
+        if stream_score == 0:
             pl.tile.store(w_scaled, [w_r0, 0], weights)
         # One block-diagonal weight matrix per query pair: token t occupies row t
         # and the head block [t*IDX_N_HEADS, (t+1)*IDX_N_HEADS), everything else
         # zero, so a single matmul reduces both tokens of the pair.
         for w_pair in pl.unroll(MM_ROW_TILE // SCORE_QUERY_TILE):
             w_pair_row = (w_r0 // SCORE_QUERY_TILE + w_pair) * MM_ROW_TILE
-            if prepare_stream == 0:
+            if stream_score == 0:
                 pl.tile.store(
                     pl.tile.full(
                         [MM_ROW_TILE, IDX_N_HEADS * SCORE_QUERY_TILE],
@@ -1158,13 +1151,13 @@ def indexer_weights_score(
                     target_type=pl.FP16,
                     mode="rint",
                 )
-                if prepare_stream == 0:
+                if stream_score == 0:
                     pl.tile.store(
                         coefficient_row,
                         [w_pair_row + w_token, w_token * IDX_N_HEADS],
                         score_coefficient,
                     )
-                if prepare_stream > 0:
+                if stream_score > 0:
                     if w_query < pl.tensor.dim(x, 0):
                         stream_row = pl.tile.full([1, IDX_N_HEADS * STREAM_QUERY_TILE], dtype=pl.FP16, value=0.0)
                         pl.tile.store(stream_row, [w_query // STREAM_QUERY_TILE * MM_ROW_TILE + w_query % STREAM_QUERY_TILE, 0], stream_coefficient)
@@ -1179,6 +1172,7 @@ def indexer_weights_score(
         position_ids, kv_seq_lens,
         topk_scores, topk_idxs,
         qh_quant_tid, weights_tid, cache_write_dep,
+        max_topk_cache_len, stream_score,
     )
     return topk_scores, topk_idxs, leaf_tid
 
