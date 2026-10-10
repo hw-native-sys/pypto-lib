@@ -82,6 +82,10 @@ class Glm53FlashConfig:
     index_kpool: int
     index_kpool_compress: bool
     index_kpool_always_select_tail: bool
+    # Settled ABI (issue #1267): when on, the MTP layer selects its own top-k
+    # on a proposal's step 0 and the proposal's later draft steps reuse the
+    # request's selected_pools/selected_valid; the expansion is rebuilt per
+    # row. The sharing path is not implemented in phase one.
     index_share_for_mtp_iteration: bool
 
     # KDA linear attention (``linear_attn_config``).
