@@ -38,9 +38,8 @@ from decode_attn_c1a_full import (
     c1a_previous_epoch,
     golden_decode_attn_c1a_reindex,
     run_c1a,
-    score_reindex,
-    select_index_topk,
 )
+from decode_indexer import score_reindex, select_index_topk
 
 
 # model config
@@ -111,13 +110,14 @@ def make_decode_attn_c1a_reindex(output_reduce=None):
             rope_sin, window_slots, window_cache, window_cache_scale, num_tokens, cache_ready,
         )
         width = pl.tensor.dim(candidate_mask, 1)
-        (index_query, index_weights, keys, scores, keys_tid, query_tid, weights_tid) = c1a_index(
-            x, qr, index_wq_b, index_wq_b_scale, index_weights_proj, rope_cos, rope_sin, index_cache,
-            index_cache_scale, num_tokens, width, cache_ready, qr_tid,
+        (index_query, index_query_scale, index_weights, scores, query_tid, weights_tid) = c1a_index(
+            x, qr, index_wq_b, index_wq_b_scale, index_weights_proj, rope_cos, rope_sin,
+            num_tokens, width, cache_ready, qr_tid,
         )
         scores_tid = score_reindex(
-            index_query, index_weights, keys, index_block_table, request_ids, compressed_lens, candidate_mask,
-            scores, num_tokens, keys_tid, query_tid, weights_tid,
+            index_query, index_query_scale, index_weights, index_cache, index_cache_scale,
+            index_block_table, request_ids, compressed_lens, candidate_mask,
+            scores, num_tokens, cache_ready, query_tid, weights_tid,
         )
         topk_tid = select_index_topk(
             scores, index_block_table, request_ids, topk_indices, num_tokens, scores_tid,
