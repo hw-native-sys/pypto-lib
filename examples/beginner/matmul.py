@@ -58,7 +58,7 @@ def golden_matmul(tensors):
 
 if __name__ == "__main__":
     import argparse
-    from golden import run
+    from examples.fp32_mode_diagnostic_draft import diagnose
 
     parser = argparse.ArgumentParser()
     parser.add_argument("-p", "--platform", type=str, default="a2a3",
@@ -67,7 +67,7 @@ if __name__ == "__main__":
     parser.add_argument("--enable-chip-swimlane", type=int, nargs="?", const=1, default=0, choices=range(5))
     args = parser.parse_args()
 
-    result = run(
+    result = diagnose(
         fn=matmul,
         specs=build_tensor_specs(),
         golden_fn=golden_matmul,
