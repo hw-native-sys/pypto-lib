@@ -270,22 +270,23 @@ def dispatch(
             pld.system.notify(
                 target=data_arrived,
                 peer=dst,
-                offsets=[my_rank, 0, 0],
+                offsets=[my_rank, loc_e, 0],
                 value=1,
                 op=pld.NotifyOp.AtomicAdd,
             )
 
-    with pl.at(
-        level=pl.Level.CORE_GROUP,
+    with pl.spmd(
+        N_LOCAL,
         name_hint="dispatch_wait",
         deps=[_push_tid],
     ) as _wait_tid:
+        local_e = pl.tile.get_block_idx()
         for src in pl.range(N_RANKS):
             if src != my_rank:
-                pld.system.defer_wait(
+                pld.system.wait(
                     signal=data_arrived,
-                    offsets=[src, 0, 0],
-                    expected=pl.cast(moe_epoch * N_LOCAL, pl.INT32),
+                    offsets=[src, local_e, 0],
+                    expected=moe_epoch,
                     cmp=pld.WaitCmp.Ge,
                 )
 
@@ -416,27 +417,28 @@ def combine_scattered(
                     pld.system.notify(
                         target=combine_arrived,
                         peer=peer,
-                        offsets=[my_rank, 0, 0],
+                        offsets=[my_rank, local_e, 0],
                         value=1,
                         op=pld.NotifyOp.AtomicAdd,
                     )
 
-    with pl.at(
-        level=pl.Level.CORE_GROUP,
+    with pl.spmd(
+        N_LOCAL,
         name_hint="combine_wait",
         deps=[notify_tid],
     ) as _cwait_tid:
+        local_e = pl.tile.get_block_idx()
         for src in pl.range(N_RANKS):
             if src != my_rank:
-                pld.system.defer_wait(
+                pld.system.wait(
                     signal=combine_arrived,
-                    offsets=[src, 0, 0],
-                    expected=pl.cast(moe_epoch * N_LOCAL, pl.INT32),
+                    offsets=[src, local_e, 0],
+                    expected=moe_epoch,
                     cmp=pld.WaitCmp.Ge,
                 )
 
-    # The notify fan-out starts only after every local scatter. Waiting for the
-    # accumulated peer epochs closes both local and remote routed-output writes.
+    # The notify fan-out starts only after every local scatter. Waiting for
+    # each peer's expert epoch closes local and remote routed-output writes.
     # Accumulate the shared-expert and TOP-K routed results for every local token.
     with pl.spmd(
         T,
