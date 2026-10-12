@@ -16,8 +16,6 @@ if __package__ in (None, ""):
 
 # A5-only; keep this standalone composition in the device CI entry set.
 # ci: no-sim
-# ci: a5
-
 import pypto.language as pl
 import pypto.language.distributed as pld
 from models.deepseek_v4_1_flash import config as C

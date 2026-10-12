@@ -7,7 +7,6 @@
 # See LICENSE in the root of the software repository for the full text of the License.
 # -----------------------------------------------------------------------------------------------------------
 # ci: devices=2
-# ci: a5
 """DSpark-style expert-parallel MoE with immediate routed-output scatter."""
 
 import math

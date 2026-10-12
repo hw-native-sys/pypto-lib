@@ -46,11 +46,7 @@ import pypto.language as pl
 import pypto.language.distributed as pld
 from pypto.ir import DistributedConfig
 
-# A5-only; intentionally excluded from the A2/A3 device sweep. `ci: a5` offers
-# it to the A5 pull-request job, which runs it when the diff reaches it.
 # ci: no-sim
-# ci: a5
-
 # Import model dims only. config also parses --tp/--ep for attention/EP; lm_head
 # parallelism is parsed locally below (TP1/DP1 bring-up defaults).
 from models.deepseek_v4_1_flash.config import D, VOCAB

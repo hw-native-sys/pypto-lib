@@ -16,11 +16,7 @@ if __package__ in (None, ""):
 
 import pypto.language as pl
 
-# A5-only; intentionally excluded from the A2/A3 device sweep. `ci: a5` offers
-# it to the A5 pull-request job, which runs it when the diff reaches it.
 # ci: no-sim
-# ci: a5
-
 from models.deepseek_v4_1_flash.config import D, HC_MULT, T_DYN
 
 

@@ -261,12 +261,10 @@ python models/glm5_3_flash/decode_sparse_attn.py  # [GOLDEN] PASS + device spars
 `models/deepseek_v4_1_flash/mhc.py` is the worked example of a finished item: a
 golden, the four kernel bodies, a `@pl.jit` test entry, `build_mhc_tensor_specs`
 and a precision comparison, in 559 lines. Read it for the shape, not for the
-kernels — it is tagged `# ci: a5` and `# ci: no-sim`, and it even splits the
-spelling of the entry sentinel (`_SCRIPT_ENTRY_POINT = "__" + "main__"`) so the
-a2a3 sweep cannot pick it up. That idiom is the escape hatch if this directory ever
-needs a file that is runnable by hand but must stay out of the a2a3 job.
+kernels — its directory targets A5 in `.github/ci_platforms.json`, and
+`# ci: no-sim` excludes device-only entries from simulator runs.
 
-For kernels you actually intend to run here, prefer the untagged a2a3 files:
+For kernels you actually intend to run here, prefer the a2a3 files:
 `models/deepseek_v4_flash_mtp/` has implemented `hc_pre.py`, `hc_post.py` and
 `hc_head.py`, `gate.py`, `expert_routed.py`, `expert_shared.py`, `decode_indexer.py`,
 `prefill_indexer.py` and `decode_sparse_attn_csa.py`, all of which the a2a3 daily

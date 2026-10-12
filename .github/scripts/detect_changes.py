@@ -26,13 +26,11 @@ Selection rules
    kernels or runtime behavior. Unknown paths remain runtime-affecting so the
    safe default is still the full smoke suite.
 
-``--a5-entries`` applies rule 1 to a different entry marker. Files tagged
-``# ci: a5`` are device entries the A2/A3 and simulator sweeps must not pick
-up, so they carry no ``__main__`` sentinel and rule 1 cannot see them; the
-dedicated A5 pull-request job asks for them by name. Rule 2 has no counterpart
-there, except for the pytest queue runner, whose changes select all V4.1
-entries. Changes to V4.1's conftest also select all its entries because pytest
-loads it implicitly.
+Platform ownership comes from ``.github/ci_platforms.json``. Directory rules
+use the longest matching prefix; an unmapped source directory is an error.
+Runnable entries have a script guard and a platform CLI, or implementation-local
+pytest tests. Golden-only helpers and checkpoint-specific drivers are excluded.
+Simulator selection additionally excludes ``# ci: no-sim`` entries.
 
 Imports resolve two ways. A bare module name (``from qkv_proj_rope import ...``)
 resolves against the importer's own directory, so that part of the graph is
@@ -49,18 +47,48 @@ single line to stdout.
 
 from __future__ import annotations
 
+import argparse
 import ast
+import json
 import os
 import re
+from pathlib import Path
 import sys
 from collections import defaultdict
 
 # Directories whose .py files participate in the bare-name sibling-import graph.
 SOURCE_ROOTS = ("examples", "models")
 
-A5_ONLY_MODEL_PREFIXES = (
-    "models/deepseek_v4_1_flash/",
-)
+PLATFORM_CONFIG = Path(__file__).resolve().parents[1] / "ci_platforms.json"
+
+
+def platforms_for(path):
+    """Resolve platform families without importing model configuration."""
+    rules = json.loads(PLATFORM_CONFIG.read_text())
+    matches = [prefix for prefix in rules if path.startswith(prefix)]
+    if not matches:
+        raise ValueError(f"No CI platform rule for {path}")
+    return rules[max(matches, key=len)]
+
+
+def has_pytest_entry(path):
+    """Recognize implementation-local precision tests without importing kernels."""
+    return bool(re.search(r"^\s*def test_\w+\(", _read(path), re.MULTILINE))
+
+
+def supports_platform(path, platform):
+    family = platform.removesuffix("sim")
+    return family in platforms_for(path) and not (
+        platform.endswith("sim")
+        and re.search(r"^#\s*ci:\s*no-sim\b", _read(path), re.MULTILINE)
+    )
+
+
+def all_entries(platform, root=None):
+    return sorted(path for path in _iter_source_files()
+                  if (root is None or path.startswith(root + "/"))
+                  and _has_main(path) and supports_platform(path, platform))
+
 
 # Paths that can change documentation or repository guidance but cannot change
 # generated kernels or runtime behavior. Keep this list explicit: an unknown
@@ -81,11 +109,6 @@ NON_RUNTIME_PREFIXES = (
     "docs/",
     "tests/docs/",
 )
-
-# Device entries claimed by the A5 pull-request job, spelled like the
-# repository's other CI hints (`# ci: no-sim`, `# ci: devices=N`).
-_A5_ENTRY_RE = re.compile(r"^#\s*ci:\s*a5\s*$", re.MULTILINE)
-
 
 def _iter_source_files():
     for root in SOURCE_ROOTS:
@@ -157,12 +180,25 @@ def _imported_names(path):
     return found
 
 
+def has_platform_cli(path):
+    """Recognize the platform argument required by the generic script runners."""
+    try:
+        tree = ast.parse(_read(path))
+    except SyntaxError:
+        return False
+    return any(
+        isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Attribute)
+        and node.func.attr == "add_argument"
+        and any(isinstance(arg, ast.Constant) and arg.value == "--platform" for arg in node.args)
+        for node in ast.walk(tree)
+    )
+
+
 def _has_main(path):
-    return "__main__" in _read(path)
-
-
-def _is_a5_entry(path):
-    return bool(_A5_ENTRY_RE.search(_read(path)))
+    source = _read(path)
+    script_guard = "__main__" in source or "if __name__ == _SCRIPT_ENTRY_POINT:" in source
+    return has_pytest_entry(path) or (script_guard and has_platform_cli(path))
 
 
 def build_reverse_graph():
@@ -217,82 +253,48 @@ def has_runtime_impact(changed):
     return any(path and not _is_non_runtime_path(path) for path in changed)
 
 
-def select_runnable(changed):
-    """Return runnable scripts required for the supplied changed paths."""
+def select_runnable(changed, platform="a2a3"):
+    """Select affected entries, then filter by directory platform ownership."""
     changed = [path for path in changed if path]
-
-    # Documentation-only paths select no device work. Any unknown or explicitly
-    # runtime-affecting non-model path still selects the full examples suite.
-    non_models_touched = any(
-        not path.startswith("models/") and not _is_non_runtime_path(path)
-        for path in changed
-    )
-    # Only models/ uses the reverse-import graph: a changed examples/ file is
-    # already covered by the full-suite run above, so it needs no closure here.
-    # A5-only model families have separate device coverage.
-    models_changed = [
-        c
-        for c in changed
-        if c.endswith(".py")
-        and not c.endswith("_draft.py")
-        and c.startswith("models/")
-        and not c.startswith(A5_ONLY_MODEL_PREFIXES)
-        and os.path.isfile(c)
-    ]
-
-    reverse = build_reverse_graph()
-
-    selected = closure(models_changed, reverse)
-
-    if non_models_touched:
-        selected.update(
-            f for f in _iter_source_files() if f.startswith("examples/")
-        )
-
-    return sorted(
-        f for f in selected
-        if not f.startswith(A5_ONLY_MODEL_PREFIXES)
-        and os.path.isfile(f) and _has_main(f)
-    )
+    seeds = [path for path in changed if path.startswith("models/")
+             and path.endswith(".py") and not path.endswith("_draft.py")
+             and os.path.isfile(path)]
+    selected = closure(seeds, build_reverse_graph())
+    for path in changed:
+        if path.startswith("models/") and path.endswith("/conftest.py"):
+            selected.update(f for f in _iter_source_files()
+                            if f.startswith(os.path.dirname(path) + "/"))
+    if any(not path.startswith("models/") and not _is_non_runtime_path(path) for path in changed):
+        selected.update(f for f in _iter_source_files() if f.startswith("examples/"))
+    return sorted(f for f in selected if os.path.isfile(f) and _has_main(f)
+                  and supports_platform(f, platform))
 
 
 def select_a5(changed):
-    """Return the ``# ci: a5`` device entries required for the changed paths.
-
-    Rule 1 against the A5 entry marker: seed with the changed model sources and
-    keep the tagged entries their reverse-import closure reaches. There is no
-    per-directory exclusion here — the marker is what makes a file A5 work, so a
-    change that reaches no tagged entry selects nothing and the job never starts.
-    """
-    seeds = [
-        c
-        for c in changed
-        if c.endswith(".py")
-        and not c.endswith("_draft.py")
-        and c.startswith("models/")
-        and os.path.isfile(c)
-    ]
-    # Pytest loads conftest implicitly; the queue runner is outside models.
-    # Neither has reverse-import edges to the implementation test entries.
-    if set(changed) & {
-        "models/deepseek_v4_1_flash/conftest.py",
-        ".github/scripts/run_a5_pytest.py",
-    }:
-        seeds.extend(f for f in _iter_source_files()
-                     if f.startswith("models/deepseek_v4_1_flash/") and _is_a5_entry(f))
-    reverse = build_reverse_graph()
-    return sorted(f for f in closure(seeds, reverse) if _is_a5_entry(f))
+    return select_runnable(changed, "a5")
 
 
 def main():
-    changed = [line.strip() for line in sys.stdin if line.strip()]
-    if "--runtime-impact" in sys.argv[1:]:
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--runtime-impact", action="store_true")
+    parser.add_argument("--a5-entries", action="store_true")
+    parser.add_argument("--platform", choices=("a2a3", "a2a3sim", "a5", "a5sim"), default="a2a3")
+    parser.add_argument("--all", action="store_true")
+    parser.add_argument("--root", choices=SOURCE_ROOTS)
+    parser.add_argument("--filter", action="store_true", help="filter supplied entry paths by platform")
+    args = parser.parse_args()
+    changed = [line.strip() for line in sys.stdin if line.strip()] if not args.all else []
+    platform = "a5" if args.a5_entries else args.platform
+    if args.runtime_impact:
         print("true" if has_runtime_impact(changed) else "false")
         return
-    if "--a5-entries" in sys.argv[1:]:
-        print(" ".join(select_a5(changed)))
-        return
-    print(" ".join(select_runnable(changed)))
+    if args.all:
+        selected = all_entries(platform, args.root)
+    elif args.filter:
+        selected = [path for path in changed if supports_platform(path, platform)]
+    else:
+        selected = select_runnable(changed, platform)
+    print(" ".join(selected))
 
 
 if __name__ == "__main__":

@@ -41,13 +41,12 @@ this repo's pinned pypto does not export, so treat it as an algorithm and tiling
 reference rather than code.
 
 **Donors, in the right order.** ``models/deepseek_v4_flash_mtp/hc_pre.py`` (434
-lines), ``hc_post.py`` (237) and ``hc_head.py`` (288) are implemented, carry no
-``# ci:`` tag — so the a2a3 daily sweep runs them — and are the ones to port.
+lines), ``hc_post.py`` (237) and ``hc_head.py`` (288) are implemented, belong to an
+a2a3 directory in the CI platform configuration — and are the ones to port.
 ``models/deepseek_v4_flash_dspark/`` has a second implemented set (573 / 239 / 386)
 for the larger batch. ``models/deepseek_v4_1_flash/mhc.py`` (559 lines, landed as
 #1247) consolidates the four into one file and is the cleanest read, **but it is
-a5-only** (``# ci: no-sim`` + ``# ci: a5``, and it splits the entry sentinel so the
-a2a3 sweep cannot pick it up), so take its structure, not its tiling.
+a5-only** (its directory targets A5 in the CI platform configuration), so take its structure, not its tiling.
 
 Against any of them the port is: the FP32 stream becomes BF16, the learned head
 becomes an unweighted mean, and the router-side scoring is unrelated.

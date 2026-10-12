@@ -625,19 +625,8 @@ The implementation milestones are ordered by dependency:
 Until the leaf kernels and weight loader land, this directory is not a runnable
 model and is not exposed to `pypto-serving`.
 
-The compressor ownership regression can run without devices:
-
-```bash
-python -m pytest tests/contract/test_v41_compressor_state.py -q
-python tests/contract/test_v41_compressor_state.py -p a5sim
-```
-
-The second command runs two consecutive kernel calls with reordering, block
-reuse, a chunk longer than the ring, inactive requests, trailing padding, and
-an empty-work case. Use `-p a5 -d <allocated_device>` for the same test on a
-real A5 device. Full attention validation additionally uses
-`decode_c2a_full.py` and `prefill_c2a_full.py`; their fixtures use nonidentity
-state block mappings.
+Full attention validation uses `decode_c2a_full.py` and
+`prefill_c2a_full.py`; their fixtures use nonidentity state block mappings.
 
 ## Pytest precision coverage
 
@@ -665,9 +654,10 @@ split the combinations instead of repeating them: the composing entry keeps
 exposes DP1 only. Other entries supporting only DP1 or exposing only TP keep TP1
 and TP4; single-card entries run once. MoE uses EP4 with TP2 or TP4,
 corresponding to DP2 or DP1.
-Daily CI retains its existing CLI-based Cartesian-product sweep.
+Daily CI retains the CLI-based Cartesian-product sweep; PR CI uses pytest
+cases for entries with implementation-local tests.
 
-The CI runner collects the tests in each selected `# ci: a5` file using pytest,
+The CI runner collects the tests in each selected A5 file with implementation-local precision tests using pytest,
 then submits each node to `task-submit` with `tp * dp` cards, or `ep` cards
 for expert-parallel entries with implicit `dp = ep / tp`. The queued command
 runs **pytest on that node**, passing declared `--tp`/`--dp`/`--ep` options and allocated `--device`
@@ -764,3 +754,13 @@ The validator checks rank consistency, encoder/decoder residuals and pre-mixes,
 final normalization, logits, cache values and untouched sentinels. Global relative
 L2 above 2%, worst-row L2 above 5%, or non-finite outputs fail with a nonzero exit
 code. Its JSON report also records per-layer expert-route and top-1 agreement.
+
+CI platform ownership is configured by directory in
+[`.github/ci_platforms.json`](../../../.github/ci_platforms.json).
+The PR and daily jobs share this configuration. Each model directory has an
+explicit hardware-family entry; examples target both families. A simulator leg
+is selected alongside each device platform unless the entry declares
+`# ci: no-sim`. Files ending in `_draft.py` and shared modules without runnable
+entries are excluded. Script entries must accept `--platform`; golden-only
+helpers and checkpoint-specific drivers are excluded from the generic sweeps.
+File-level platform markers are unnecessary.

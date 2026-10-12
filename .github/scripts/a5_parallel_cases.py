@@ -6,9 +6,9 @@
 # INCLUDING BUT NOT LIMITED TO NON-INFRINGEMENT, MERCHANTABILITY, OR FITNESS FOR A PARTICULAR PURPOSE.
 # See LICENSE in the root of the software repository for the full text of the License.
 # -----------------------------------------------------------------------------------------------------------
-"""List the parallel configurations an A5 device entry declares.
+"""List the parallel configurations a V4.1 A5 device entry declares.
 
-The a5-v41-flash job runs an entry once per configuration its own command line
+The V4.1 A5 CLI sweep runs an entry once per configuration its own command line
 accepts, so the matrix lives with the operator rather than in CI. This runs the
 entry up to ``parse_args`` and reads the ``choices`` of its ``--tp``, ``--dp``
 and ``--ep`` options; every combination the entry accepts is one case. Each
@@ -28,6 +28,8 @@ Usage: python .github/scripts/a5_parallel_cases.py <entry.py>
 
 import argparse
 import itertools
+import json
+from pathlib import Path
 import runpy
 import sys
 
@@ -59,7 +61,17 @@ def _values(parser, flag):
 
 
 def main():
-    parser = _entry_parser(sys.argv[1])
+    cli = argparse.ArgumentParser(description=__doc__)
+    cli.add_argument("entry")
+    cli.add_argument("--output", type=Path, help="write the case matrix as JSON")
+    options = cli.parse_args()
+    root = Path(__file__).resolve().parents[2]
+    entry = Path(options.entry).resolve()
+    if not entry.is_relative_to(root / "models/deepseek_v4_1_flash"):
+        cli.error("parallel case discovery is restricted to models/deepseek_v4_1_flash")
+    sys.path.insert(0, str(root))
+    parser = _entry_parser(str(entry))
+    cases = []
     tp_values = _values(parser, "--tp")
     dp_values = _values(parser, "--dp")
     ep_values = _values(parser, "--ep")
@@ -80,7 +92,12 @@ def main():
                 continue
             cards = int(ep)
             arguments += ["--ep", str(ep)]
-        print(cards, *arguments)
+        cases.append({"cards": cards, "arguments": arguments})
+    if options.output:
+        options.output.write_text(json.dumps(cases))
+    else:
+        for case in cases:
+            print(case["cards"], *case["arguments"])
 
 
 if __name__ == "__main__":

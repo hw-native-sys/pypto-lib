@@ -9,8 +9,6 @@
 """Packed-prefill C1A reuse attention wired through mHC."""
 
 # ci: no-sim
-# ci: a5
-
 import math
 import sys
 from pathlib import Path

@@ -109,23 +109,7 @@ jobs:
           # Run every model file once with no extra args. Files marked
           # `# ci: no-sim` (full multi-layer / multi-card forwards) are
           # device-only and would just argparse-reject *sim, so skip them here.
-          for f in $(find models -name '*.py' ! -name '*_draft.py' | sort); do
-            # a5sim takes the V4.1-Flash tree; the a2a3 legs skip it.
-            # The `# ci: a5` device entries split the `__main__` sentinel
-            # and carry `# ci: no-sim`, so the filters below leave only
-            # the operator files that a simulator can run.
-            if [ "${{ matrix.platform }}" = "a5sim" ]; then
-              [[ "$f" == models/deepseek_v4_1_flash/* ]] || continue
-            elif [[ "$f" == models/deepseek_v4_1_flash/* ]]; then
-              continue
-            fi
-            # Shared modules (config.py, helper libs) have no __main__ guard —
-            # they are imported by kernels, not run. Running them import-exits 0
-            # and shows a misleading pass, so drop them from the report entirely
-            # (matches detect_changes.py's `_has_main` runnable definition).
-            if ! grep -q '__main__' "$f"; then
-              continue
-            fi
+          for f in $(python .github/scripts/detect_changes.py --all --root models --platform ${{ matrix.platform }}); do
             if grep -qE '^#\s*ci:\s*no-sim' "$f"; then
               echo "::group::${f}"
               echo "skip (no-sim): ${f}"
@@ -260,13 +244,7 @@ jobs:
             echo "::endgroup::"
           }
           # Run every model file once at its default world size (ep2 / 2-card).
-          for f in $(find models -name '*.py' ! -name '*_draft.py' \
-              ! -path 'models/deepseek_v4_1_flash/*' | sort); do
-            # Skip shared modules with no __main__ guard (config.py, helper libs):
-            # they are imported, not run, so they don't belong in the report.
-            if ! grep -q '__main__' "$f"; then
-              continue
-            fi
+          for f in $(python .github/scripts/detect_changes.py --all --root models --platform a2a3); do
             run_case "$f" "$f"
           done
           # Higher world sizes (ep4/ep8) are added manually as dedicated wraps
@@ -306,28 +284,11 @@ jobs:
 
   model-tests-a5:
     if: ${{ !inputs.performance_only }}
-    # Real Ascend 950 (A5) device job — the daily coverage of the DeepSeek
-    # V4.1-Flash operators (models/deepseek_v4_1_flash/). They are A5-only: the
-    # a2a3 sweeps exclude that directory by path and every entry is
-    # `# ci: no-sim`, so a device job is the only place they run at all. The
-    # set is the `# ci: a5` marker, the same one ci.yml's a5-v41-flash selects
-    # from — but that job runs only the entries a pull request's own diff
-    # reaches, and this one runs all of them, every declared parallel case, so
-    # an entry no diff touches cannot rot unnoticed.
-    #
-    # Unlike the V4-Pro sweep it replaced (report-only, 13/35 on device, red
-    # from pypto/device-side faults rather than defects here) these entries are
-    # green on the pull-request job, so this one gates: red means a regression.
-    #
-    # It goes through the same setup-ci-job as the other device jobs
-    # (needs-device:true); the A5 host's own runner .env supplies its CANN_ROOT
-    # / cache roots, so no A5-specific path is named here.
+    # All A5 model entries selected by the shared directory platform map.
     runs-on: [self-hosted, linux, npu-a5]
     # The cases run one after another, each bounded by task-submit's own
-    # --timeout 3600 queue wait + --max-time 900 run, on top of the build. The
-    # V4-Pro sweep this replaces took 65 min for its 33 single-card cases; this
-    # set is twice as many and borrows up to 8 cards, so it queues for longer
-    # too.
+    # --timeout 3600 queue wait + --max-time 900 run, on top of the build.
+    # The declared parallel cases can borrow up to 8 cards.
     timeout-minutes: 240
     defaults:
       run:
@@ -392,7 +353,7 @@ jobs:
           build-namespace: a5-daily
           pip-cache-name: pip-a5
           toolchain: bundle
-          # The same stack as ci.yml's a5-v41-flash, which gates these entries.
+          # The same stack as ci.yml's a5 job, which gates these entries.
           # PyPTO follows the shared default (origin HEAD) like every other job
           # here, so this sweep is also where an upstream break shows up first,
           # attributable to a night rather than to whichever V4.1 pull request
@@ -402,7 +363,7 @@ jobs:
           # and the golden runner then compares the two for equality.
           torch-version: 'torch==2.10.0'
 
-      - name: Run V4.1-Flash operators (a5, via task-submit)
+      - name: Run A5 model entries via task-submit
         id: sweep
         shell: bash
         env:
@@ -413,74 +374,16 @@ jobs:
           PYPTO_BENCH: '0'  # Correctness only; the dedicated performance job owns timing.
         run: |
           source activate.sh
-          set +e
-          : > results.tsv
-          failed=()
-          run_case() {
-            local file="$1" cards="$2"; shift 2
-            local label="$file${*:+ $*}"
-            echo "::group::${label}"
-            # A case needs TP x DP cards; --device-num borrows that many from
-            # the host queue and $TASK_DEVICE is the lent set, passed straight
-            # to -d. The multi-card cases reach past this runner's device
-            # whitelist, which is what --ignore-whitelist asks the queue for.
-            local devnum_flag out rc
-            devnum_flag=""
-            [ "$cards" -gt 1 ] && devnum_flag="--device-num $cards --ignore-whitelist"
-            # < /dev/null: this runs inside a `while read` over the case
-            # matrix, and task-submit would otherwise eat the rest of it.
-            out=$( task-submit --device "$DEVICE_ID" $devnum_flag --timeout 3600 --max-time 900 \
-              --run "cd $GITHUB_WORKSPACE/checkout && source activate.sh && PYPTO_BENCH=0 PYTHONPATH=$GITHUB_WORKSPACE/checkout python $file -p a5 $* -d \$TASK_DEVICE" < /dev/null 2>&1 )
-            rc=$?
-            printf '%s\n' "$out"
-            if [ "$rc" -ne 0 ]; then
-              failed+=("$label")
-              echo "::error file=${file}::FAIL (${label})"
-              printf '%s\tfail\n' "$label" >> results.tsv
-            else
-              printf '%s\tpass\n' "$label" >> results.tsv
-            fi
-            echo "::endgroup::"
-          }
-          # Every V4.1-Flash entry, by the marker detect_changes.py selects on,
-          # so an operator joins this sweep the same way it joins the
-          # pull-request one: by carrying `# ci: a5`. Nothing here needs
-          # editing. The entries split the `__main__` sentinel to stay out of
-          # the a2a3 discovery, so it cannot be the filter here.
-          #
-          # Resolve the whole matrix before running any of it and write every
-          # declared case down as `missing` first. Each case then overwrites
-          # its own row when it runs, so a sweep that is cancelled or dies
-          # halfway still uploads the full matrix with the cases it never
-          # reached marked as such — where a table built only from what ran
-          # would show a smaller matrix passing in full.
-          plan=$(mktemp)
-          for f in $(grep -rlE '^#\s*ci:\s*a5\s*$' models/deepseek_v4_1_flash --include='*.py' | sort); do
-            # Each --tp/--dp/--ep combination the entry's own command line
-            # accepts is one case (.github/scripts/a5_parallel_cases.py); an
-            # entry that declares none of them runs once.
-            if ! matrix=$(PYTHONPATH=$GITHUB_WORKSPACE/checkout python .github/scripts/a5_parallel_cases.py "$f"); then
-              failed+=("$f")
-              echo "::error file=${f}::cannot read its --tp/--dp/--ep choices"
-              printf '%s\tfail\n' "$f" >> results.tsv
-              continue
-            fi
-            # <cards> <arguments>, one line per case, arguments single-spaced —
-            # so this label and run_case's are the same string.
-            while read -r cards args; do
-              printf '%s\t%s\t%s\n' "$f" "$cards" "$args" >> "$plan"
-              printf '%s\tmissing\n' "$f${args:+ $args}" >> results.tsv
-            done <<< "$matrix"
-          done
-          while IFS=$'\t' read -r f cards args; do
-            run_case "$f" "$cards" $args
-          done < "$plan"
-          if [ ${#failed[@]} -ne 0 ]; then
-            echo "Failed cases (${#failed[@]}):"
-            printf '  - %s\n' "${failed[@]}"
-            exit 1
+          if [ "${PYPTO_USE_UV:-false}" = "true" ]; then
+            uv pip install pytest
+          else
+            python -m pip install pytest
           fi
-          echo "All V4.1-Flash A5 cases passed."
+          FILES=$(python .github/scripts/detect_changes.py --all --root models --platform a5)
+          : > results.tsv
+          if [ -n "$FILES" ]; then
+            python .github/scripts/run_a5_pytest.py --mode cli --results results.tsv $FILES
+          fi
 
       - name: Kill orphaned task-submit tasks
         if: always()
@@ -499,7 +402,7 @@ jobs:
         # bit: every nightly from 2026-08-07 to 2026-08-11 died in checkout
         # (dead git proxy, fixed by this job's first step) yet re-uploaded a
         # byte-identical results-a5 leftover from the 08-05 sweep, so the
-        # summary kept presenting six-day-old V4-Pro numbers as current.
+        # summary kept presenting six-day-old numbers as current.
         if: ${{ always() && steps.sweep.outcome != 'skipped' }}
         uses: ./.github/actions/upload-results
         with:
@@ -603,7 +506,7 @@ jobs:
           import pathlib
 
           # One table per model family: a2a3 with a2a3sim, and the two A5 legs
-          # together now that both sweep the V4.1-Flash entries.
+          # together, using the shared directory platform configuration.
           ICON = {"pass": ":white_check_mark:", "fail": ":x:", "missing": ":heavy_minus_sign:"}
           ROOT = pathlib.Path("results")
 
@@ -658,12 +561,12 @@ jobs:
                   print(no_artifact(missing) + " Those columns read all `-`.")
               print()
 
-          def v41_table(title, platforms):
-              """One table for the V4.1-Flash entries across both A5 legs.
+          def a5_table(title, platforms):
+              """One table for A5 entries across device and simulator legs.
 
               The legs key their cases differently: the a5 device job runs every
-              --tp/--dp combination an entry declares and labels each case with
-              its arguments, while a5sim runs the entry once with none. Keying
+              pytest node or CLI combination an entry declares and labels each
+              case accordingly, while a5sim runs the entry once with no extra arguments. Keying
               the row on the entry itself puts them side by side; a cell that
               stands for more than one case carries its pass count and names the
               cases that failed, so nothing the split tables showed is lost.
@@ -682,6 +585,9 @@ jobs:
               for p in present:
                   for label, status in data[p].items():
                       entry, _, args = label.partition(" ")
+                      if "::" in entry:
+                          entry, _, node = entry.partition("::")
+                          args = node + (" " + args if args else "")
                       cases[p].setdefault(entry, {})[args] = status
 
               def cell(by_args):
@@ -728,9 +634,8 @@ jobs:
               print()
               print(
                   ":heavy_minus_sign: means the entry has no case on that leg: "
-                  "the device entries are `# ci: no-sim`, and the files a "
-                  "simulator can run carry no `# ci: a5` marker. A count is out "
-                  "of every `--tp`/`--dp` case the entry declares, so a sweep "
+                  "device-only entries carry `# ci: no-sim`. A count is out "
+                  "of every pytest or CLI case the entry declares, so a sweep "
                   "that ended early reads :warning: and names the cases it "
                   "never reached."
               )
@@ -742,5 +647,5 @@ jobs:
           print("## Daily CI Model Test Results")
           print()
           table("a2a3 and a2a3sim", ["a2a3", "a2a3sim"])
-          v41_table("a5 and a5sim (DeepSeek V4.1-Flash)", ["a5", "a5sim"])
+          a5_table("a5 and a5sim", ["a5", "a5sim"])
           EOF

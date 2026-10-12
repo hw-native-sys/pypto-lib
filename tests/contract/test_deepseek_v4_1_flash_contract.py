@@ -11,6 +11,7 @@
 import ast
 import importlib.util
 import inspect
+import json
 import sys
 from collections import Counter
 from pathlib import Path
@@ -679,7 +680,9 @@ def test_attention_half_compositions_have_explicit_abi_and_ci_entry(module_name)
     path = MODEL_DIR / f"{module_name}.py"
     source = path.read_text()
     assert "# ci: no-sim" in source
-    assert "# ci: a5" in source
+    assert json.loads((MODEL_DIR.parents[1] / ".github/ci_platforms.json").read_text())[
+        "models/deepseek_v4_1_flash/"
+    ] == ["a5"]
 
     tree = ast.parse(source)
     production = _function(tree, module_name)

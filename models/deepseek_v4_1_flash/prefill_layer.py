@@ -41,8 +41,6 @@ if __package__ in (None, ""):
 # A5-only; intentionally excluded from the A2/A3 device sweep. The complete-layer
 # entry exercises the packed MxFp4 routed-weight ABI and the TP-to-EP local-token path.
 # ci: no-sim
-# ci: a5
-
 import torch
 
 import pypto.language as pl

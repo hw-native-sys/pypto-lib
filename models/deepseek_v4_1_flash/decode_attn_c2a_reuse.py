@@ -18,8 +18,6 @@ if __package__ in (None, ""):
 
 # A5-only; intentionally excluded from the A2/A3 device sweep.
 # ci: no-sim
-# ci: a5
-
 import pypto.language as pl
 import pypto.language.distributed as pld
 import torch
