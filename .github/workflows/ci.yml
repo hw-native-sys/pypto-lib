@@ -308,6 +308,7 @@ jobs:
           build-namespace: a2a3
           pip-cache-name: pip-a2a3
           toolchain: bundle
+          pypto-ref: 7c85bf65f359d6ce69b25283a16a2bf96690a722
 
       - name: Run a2a3 tests (via task-submit)
         shell: bash
