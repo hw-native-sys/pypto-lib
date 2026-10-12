@@ -77,10 +77,12 @@ jobs:
           echo "run_dspark_serving_tests=false" >> "$GITHUB_OUTPUT"
           echo "a5_files=" >> "$GITHUB_OUTPUT"
 
-          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+          # EXPERIMENT ONLY: PR #898 exercises the latest main smoke suite.
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ] ||
+             [ "${{ github.event.pull_request.number }}" = "898" ]; then
             echo "has_changes=true" >> "$GITHUB_OUTPUT"
             echo "files=" >> "$GITHUB_OUTPUT"
-            echo "Manual runs retain the full smoke suite."
+            echo "Manual and experiment runs retain the full smoke suite."
             exit 0
           fi
 
