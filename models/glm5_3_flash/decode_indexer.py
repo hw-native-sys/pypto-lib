@@ -44,8 +44,8 @@ is a vestigial field inherited from the GLM-MoE-DSA base: ``Glm5NextTextConfig``
 sets ``rope_parameters = AttributeError()``, the model forward passes
 ``position_embeddings=None``, and ``Glm5NextTextIndexer.forward`` never touches a
 cos/sin table. Combined with ``qk_rope_head_dim = 0``, this model has no rope
-anywhere, so none of the ``rope_tables.py`` machinery that ``deepseek_v4_pro`` and
-``deepseek_v4_flash_mtp`` carry is needed.
+anywhere, so none of the ``rope_tables.py`` machinery that
+``deepseek_v4_flash_mtp`` carries is needed.
 
 **Donors, all a2a3 and all already run by the daily sweep.**
 ``models/deepseek_v4_flash_mtp/decode_indexer.py`` is the shape to port. Its

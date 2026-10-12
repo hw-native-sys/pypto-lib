@@ -110,19 +110,13 @@ jobs:
           # `# ci: no-sim` (full multi-layer / multi-card forwards) are
           # device-only and would just argparse-reject *sim, so skip them here.
           for f in $(find models -name '*.py' ! -name '*_draft.py' | sort); do
-            # a5sim takes the V4.1-Flash tree; the a2a3 legs take neither A5
-            # tree. Of that directory a5sim keeps whatever a simulator can run:
-            # the `# ci: a5` device entries split the `__main__` sentinel and
-            # carry `# ci: no-sim`, so the two filters below drop them, which
-            # leaves the MoE, gate, expert and transport files. The V4 tree
-            # (models/deepseek_v4_pro, Pro and Flash presets of the same code)
-            # rode along here until its device sweep was retired; with it gone
-            # the nightly's A5 operator coverage is one family, V4.1-Flash, and
-            # the only V4 left on A5 is the Flash end-to-end job, which runs
-            # that tree on real weights rather than case by case.
+            # a5sim takes the V4.1-Flash tree; the a2a3 legs skip it.
+            # The `# ci: a5` device entries split the `__main__` sentinel
+            # and carry `# ci: no-sim`, so the filters below leave only
+            # the operator files that a simulator can run.
             if [ "${{ matrix.platform }}" = "a5sim" ]; then
               [[ "$f" == models/deepseek_v4_1_flash/* ]] || continue
-            elif [[ "$f" == models/deepseek_v4_pro/* || "$f" == models/deepseek_v4_1_flash/* ]]; then
+            elif [[ "$f" == models/deepseek_v4_1_flash/* ]]; then
               continue
             fi
             # Shared modules (config.py, helper libs) have no __main__ guard —
@@ -267,7 +261,6 @@ jobs:
           }
           # Run every model file once at its default world size (ep2 / 2-card).
           for f in $(find models -name '*.py' ! -name '*_draft.py' \
-              ! -path 'models/deepseek_v4_pro/*' \
               ! -path 'models/deepseek_v4_1_flash/*' | sort); do
             # Skip shared modules with no __main__ guard (config.py, helper libs):
             # they are imported, not run, so they don't belong in the report.
@@ -513,290 +506,6 @@ jobs:
           name: results-a5
           path: checkout/results.tsv
 
-  e2e-flash-a5:
-    if: ${{ !inputs.performance_only }}
-    name: DeepSeek-V4-Flash EP8 end-to-end (a5)
-    # The only nightly that runs the whole prompt -> tokens -> text path on real
-    # weights; model-tests-a5 covers the operators one by one on synthetic data.
-    #
-    # Deliberately no continue-on-error and no skip-when-unstaged path. The
-    # arrangement this replaces had both, and on 2026-09-14 it reported success
-    # in 71 seconds on a runner with no checkpoint: a green tick for a night
-    # that never sampled a token. A red result here now means one of three
-    # things, and e2e.json says which: the runner is not provisioned, the A5
-    # host is sick, or the model stopped generating.
-    #
-    # arm64 is part of the selection, not decoration. Two runners answer to
-    # npu-a5: an aarch64 Ascend950DT host, which carries the checkpoint and
-    # the converted cache, and an x86_64 Ascend950PR host, which carries
-    # neither, and a run that landed on the second one failed with the
-    # checkpoint missing. #1178 dropped arm64 from these jobs when the only A5
-    # host was the x86_64 one; the weights now live on the aarch64 host, so the
-    # architecture label is what selects it. Should the weights ever move to a
-    # host of the other architecture, this line moves with them - and until it
-    # does, an unprovisioned aarch64 A5 host fails at the next step by name
-    # rather than quietly testing nothing.
-    runs-on: [self-hosted, linux, npu-a5, arm64]
-    # Job setup on a cold ccache (~25) + task-submit's worst case for the one
-    # loop call (--timeout 5400 queue wait + --max-time 2400 run = 130) + the
-    # one-time weight conversion (~25) + cleanup and upload (~35).
-    timeout-minutes: 320
-    defaults:
-      run:
-        working-directory: checkout
-    env:
-      PTOAS_ROOT: ${{ github.workspace }}/checkout/ptoas-bin
-      CMAKE_BUILD_PARALLEL_LEVEL: 16
-      CMAKE_C_COMPILER_LAUNCHER: ccache
-      CMAKE_CXX_COMPILER_LAUNCHER: ccache
-      CCACHE_MAXSIZE: 30G
-      CCACHE_UMASK: '000'
-      # This job pins its own pypto revision, and the override is the point:
-      # this is the revision the Flash MXFP8/MXFP4 path was brought up and
-      # measured on, and the runtime, PTOAS and PTO ISA versions all follow from
-      # it. Generation has not been shown on the shared serving pin, so pinning
-      # here keeps a red nightly meaning "the model regressed" rather than "the
-      # stack moved". Retire this once Flash generation is demonstrated on the
-      # shared pin.
-      E2E_PYPTO_REF: 3d468f0179b9dd42c0628a8a46dc15e3a3ad5f76
-      E2E_PROMPT: The capital of France is
-      E2E_DECODE_STEPS: '32'
-      E2E_CKPT_REVISION: 60d8d70770c6776ff598c94bb586a859a38244f1
-
-    steps:
-      - name: Point git at the runner's live proxy
-        # Same workaround as model-tests-a5 (stale file-scope git proxy on the
-        # A5 host); command-scope config, no host state touched.
-        working-directory: ${{ github.workspace }}
-        shell: bash
-        run: |
-          live="${https_proxy:-${HTTPS_PROXY:-}}"
-          if [ -n "$live" ]; then
-            {
-              echo "GIT_CONFIG_COUNT=2"
-              echo "GIT_CONFIG_KEY_0=http.proxy"
-              echo "GIT_CONFIG_VALUE_0=$live"
-              echo "GIT_CONFIG_KEY_1=https.proxy"
-              echo "GIT_CONFIG_VALUE_1=$live"
-            } >> "$GITHUB_ENV"
-            echo "git proxy pinned to the runner's live proxy for this job"
-          else
-            echo "no proxy in the runner environment — leaving git alone"
-          fi
-
-      - name: Fetch composite action definitions
-        uses: actions/checkout@v4
-        with:
-          sparse-checkout: .github/actions
-          clean: false
-          persist-credentials: false
-
-      - name: Setup CI job
-        uses: ./.github/actions/setup-ci-job
-        with:
-          checkout-path: checkout
-          needs-device: 'true'
-          # Own pypto build tree: this job must never share one with the
-          # model-tests-a5 sweep (see build-namespace in the action).
-          build-namespace: a5-e2e
-          pip-cache-name: pip-a5
-          toolchain: bundle
-          # Every MX scale is a torch.float8_e8m0fnu tensor, and 2.6.0 has no
-          # such dtype, so a job that imports the model would die on the
-          # attribute. install-torch-npu stays false here, as that input requires.
-          torch-version: 'torch==2.10.0'
-          pypto-ref: ${{ env.E2E_PYPTO_REF }}
-
-      - name: Install the checkpoint tokenizer
-        shell: bash
-        run: |
-          source activate.sh
-          # setup-ci-job builds the job venv with `uv venv`, and that venv carries
-          # no pip at all, so the installer is the one it named in PYPTO_USE_UV.
-          # A bare `pip install` here resolves to the interpreter's own pip and
-          # lands in ~/.local, where the import below cannot see it.
-          if ! python -c 'import tokenizers' 2>/dev/null; then
-            if [ "${PYPTO_USE_UV:-false}" = "true" ]; then
-              uv pip install 'tokenizers>=0.15'
-            else
-              python -m pip install 'tokenizers>=0.15'
-            fi
-          fi
-          python -c 'import tokenizers; print("tokenizers", tokenizers.__version__)'
-
-      - name: Resolve the pinned checkpoint and its converted weight cache
-        id: weights
-        shell: bash
-        run: |
-          # The runner describes where its data lives through its own .env, the
-          # same way PYPTO_QWEN3_MODEL_DIR / PYPTO_DSV4_MODEL_DIR already do. No
-          # default path and no skip: an unprovisioned runner fails here saying
-          # exactly what to provide.
-          ckpt="${PYPTO_DSV4_FLASH_CKPT_DIR:-}"
-          if [ -z "$ckpt" ] || [ ! -f "$ckpt/model.safetensors.index.json" ] || [ ! -f "$ckpt/tokenizer.json" ]; then
-            echo "::error::set PYPTO_DSV4_FLASH_CKPT_DIR in this runner's .env to a deepseek-ai/DeepSeek-V4-Flash checkout at $E2E_CKPT_REVISION (needs model.safetensors.index.json and tokenizer.json)"
-            exit 1
-          fi
-          # Named by the runner too, rather than defaulted under CI_CACHE_ROOT.
-          # The converted cache is about 200 GiB and the cache root holds build
-          # output, so a host that was never asked for that space would spend
-          # twenty-five minutes converting and then die out of disk. Which
-          # volume holds it is the host's choice, like every path here.
-          weights="${PYPTO_DSV4_FLASH_WEIGHTS_DIR:-}"
-          if [ -z "$weights" ]; then
-            echo "::error::set PYPTO_DSV4_FLASH_WEIGHTS_DIR in this runner's .env to a directory with room for the ~200 GiB EP8/TP2 cache converted from the checkpoint (this job creates and fills it on the first run)"
-            exit 1
-          fi
-          # Absolute, because this is the one path the job creates instead of
-          # finding: every step here runs in checkout/, so a relative value
-          # would quietly fill the runner's own checkout with 200 GiB and never
-          # fail. The checkpoint needs no such check - it is accepted only if
-          # the two files above are already under it.
-          case "$weights" in
-            /*) ;;
-            *)
-              echo "::error::PYPTO_DSV4_FLASH_WEIGHTS_DIR must be an absolute path; '$weights' would land inside this job's checkout"
-              exit 1
-              ;;
-          esac
-          source activate.sh
-          # The cache records the quantization rules and converter revision it
-          # was built with. A cache the checked-out conversion code no longer
-          # accepts would make this run test yesterday's tensors, so stop and say
-          # so. Deliberately never delete it: the directory can be operator-owned
-          # and shared, and this job is in no position to decide 200 GiB is junk.
-          if [ -f "$weights/manifest.json" ]; then
-            if ! reason=$(PYTHONPATH="$GITHUB_WORKSPACE/checkout:$GITHUB_WORKSPACE/checkout/models/deepseek_v4_pro" \
-                DEEPSEEK_V4_VARIANT=flash python -c \
-                'import pathlib, sys, utils; utils._load_complete_cache(pathlib.Path(sys.argv[1]), ep=8, tp=2)' \
-                "$weights" 2>&1); then
-              echo "$reason" | tail -n 5
-              echo "::error::the converted cache at $weights is not the one this checkout would build. Remove it, or point PYPTO_DSV4_FLASH_WEIGHTS_DIR at a fresh directory, and this job will convert again."
-              exit 1
-            fi
-            echo "reusing the converted cache at $weights"
-          else
-            echo "converting the pinned checkpoint into $weights (~25 min)"
-            mkdir -p "$weights"
-            # utils.py has no __main__ guard (it is a helper module, not a case),
-            # so the converter runs through main(). Its FlashCheckpoint reader
-            # verifies config.json and the shard index against the pinned
-            # revision, so the wrong checkpoint fails here, not at token time.
-            PYTHONPATH="$GITHUB_WORKSPACE/checkout:$GITHUB_WORKSPACE/checkout/models/deepseek_v4_pro" \
-              python -c 'import utils; utils.main()' \
-              --variant flash --ep 8 --tp 2 --ckpt "$ckpt" --out "$weights"
-          fi
-          echo "checkpoint: $ckpt"
-          echo "weights:    $weights"
-          { echo "ckpt=$ckpt"; echo "weights=$weights"; } >> "$GITHUB_OUTPUT"
-
-      - name: Run the measured EP8 token loop through task-submit
-        id: loop
-        shell: bash
-        env:
-          PYPTO_LOG_LEVEL: error
-          PYPTO_WARNING_LEVEL: none
-          PYPTO_RUNTIME_LOG: error
-          CKPT: ${{ steps.weights.outputs.ckpt }}
-          WEIGHTS: ${{ steps.weights.outputs.weights }}
-        run: |
-          source activate.sh
-          # No retry. The cross-rank drift of issue #1043 is intermittent, and
-          # retrying until it passes is how a nightly stops reporting it.
-          rm -f e2e-loop.json
-          set +e
-          task-submit --device auto --device-num 8 --ignore-whitelist --timeout 5400 --max-time 2400 \
-            --run "cd $GITHUB_WORKSPACE/checkout && source activate.sh && PYTHONPATH=$GITHUB_WORKSPACE/checkout \
-              python models/deepseek_v4_pro/synthetic_token_loop.py --variant flash --ep 8 --tp 2 \
-                -d \$TASK_DEVICE --weights '$WEIGHTS' --tokenizer '$CKPT/tokenizer.json' \
-                --prompt '$E2E_PROMPT' --decode-steps $E2E_DECODE_STEPS \
-                --result-json $GITHUB_WORKSPACE/checkout/e2e-loop.json" 2>&1 | tee e2e.log
-          echo "exit_code=${PIPESTATUS[0]}" >> "$GITHUB_OUTPUT"
-
-      - name: Validate the measured result and publish it
-        # Always: a job that died before the loop still owes the summary a reason.
-        if: always()
-        shell: bash
-        env:
-          LOOP_EXIT_CODE: ${{ steps.loop.outputs.exit_code }}
-        run: |
-          source activate.sh
-          python3 - <<'EOF'
-          import json
-          import os
-          import pathlib
-          import sys
-
-          # The token loop writes its own structured result, validates finite
-          # logits, greedy/sampled agreement and cross-rank token agreement, and
-          # refuses to load a cache that does not match the pinned checkpoint.
-          # This step decides only what the loop cannot: that it ran at all and
-          # produced real text. What the text says is for a reader of the summary
-          # to judge; an operator change that breaks the model shows up there, or
-          # as a failure below.
-          steps_requested = int(os.environ["E2E_DECODE_STEPS"])
-          code = int(os.environ.get("LOOP_EXIT_CODE") or 1)
-          path = pathlib.Path("e2e-loop.json")
-          result, error = {}, None
-          try:
-              if not path.is_file():
-                  raise ValueError("the token loop wrote no result; it did not run or did not finish")
-              result = json.loads(path.read_text())
-              if code != 0:
-                  raise ValueError(f"token-loop task exited with {code}; see e2e.log")
-              for name, want in (("status", "pass"), ("mode", "real-weight"),
-                                 ("variant", "flash"), ("ep", 8), ("tp", 2),
-                                 ("decode_steps_requested", steps_requested)):
-                  if result.get(name) != want:
-                      raise ValueError(f"result has unexpected {name}: {result.get(name)!r}")
-              if len(set(result.get("devices") or [])) != 8:
-                  raise ValueError("the loop did not use eight distinct allocated devices")
-              ids = result.get("generated_ids") or []
-              done = result.get("decode_steps_done")
-              if not isinstance(done, int) or done < 1 or len(ids) != done + 1:
-                  raise ValueError("no measured decode step completed, or the token count disagrees")
-              text = result.get("generated_text")
-              if not isinstance(text, str) or not any(c.isalnum() for c in text):
-                  raise ValueError(f"generation produced no lexical text: {text!r}")
-              # A result without the cross-rank measurement cannot be called a
-              # pass: recording it is half of why this job exists.
-              if type(result.get("ranks_bit_identical")) is not bool:
-                  raise ValueError("the loop recorded no cross-rank verdict")
-          except Exception as exc:  # noqa: BLE001 - the message is the report
-              error = str(exc)
-          # rank_spread is one entry per sampling point and is large; the verdict
-          # over the whole run is what the summary shows.
-          report = {k: v for k, v in result.items() if k != "rank_spread"}
-          report.update(status="fail" if error else "pass", exit_code=code,
-                        error=error, prompt=os.environ["E2E_PROMPT"])
-          pathlib.Path("e2e.json").write_text(
-              json.dumps(report, indent=1, ensure_ascii=False) + "\n")
-          print(json.dumps(report, indent=1, ensure_ascii=False))
-          sys.exit(1 if error else 0)
-          EOF
-
-      - name: Kill orphaned task-submit tasks
-        if: always()
-        uses: ./.github/actions/kill-orphaned-tasks
-        with:
-          checkout-path: checkout
-
-      - name: Clean up build artifacts
-        if: always()
-        working-directory: checkout
-        run: rm -rf build_output
-
-      - name: Upload results artifact
-        if: always()
-        uses: ./.github/actions/upload-results
-        with:
-          name: results-e2e-a5
-          path: |
-            checkout/e2e.json
-            checkout/e2e-loop.json
-            checkout/e2e.log
-          if-no-files-found: error
-
   operator-performance:
     name: MTP and DSpark operator performance (a2a3)
     runs-on: [self-hosted, linux, npu, a3]
@@ -879,7 +588,7 @@ jobs:
     # serial device cases against the others' ~40 min), so without it here the
     # summary is built before results-a5 exists and the A5 table is empty.
     # `always()` keeps the summary running when any sweep fails.
-    needs: [model-tests-sim, model-tests-a2a3, model-tests-a5, e2e-flash-a5]
+    needs: [model-tests-sim, model-tests-a2a3, model-tests-a5]
     if: ${{ always() && !inputs.performance_only }}
     runs-on: ubuntu-latest
     steps:
@@ -1030,81 +739,8 @@ jobs:
                   print(no_artifact(missing) + " Those columns read all `-`.")
               print()
 
-          def e2e(title, name):
-              """The DeepSeek-V4-Flash EP8 token loop: one run, shown as prompt -> text.
-
-              The job writes e2e.json (status/prompt/generated_text/...) so the
-              reviewer sees the actual continuation every day, not just a tick:
-              a run that completes but babbles is the failure mode worth catching.
-              """
-              print(f"### {title}")
-              print()
-              path = ROOT / f"results-{name}" / "e2e.json"
-              if not path.exists():
-                  print(no_artifact([name]))
-                  print()
-                  return
-              import json
-              r = json.loads(path.read_text())
-              status = r.get("status", "missing")
-              icon = {"pass": ":white_check_mark: pass",
-                      "fail": ":x: fail"}.get(status, f"? {status}")
-              print(f"**Status:** {icon}")
-              done = r.get("decode_steps_done")
-              req = r.get("decode_steps_requested")
-              eos = r.get("eos_step")
-              steps = f"{done}/{req} decode steps" if done is not None else f"{req} decode steps requested"
-              if eos is not None:
-                  steps += f" (eos at step {eos})"
-              print(f" · EP8/TP2, real weights, {steps}")
-              print()
-              print("| | |")
-              print("|---|---|")
-              print(f"| Prompt | `{r.get('prompt', '')}` |")
-              def cell(value):
-                  # One table cell wrapped in a code span: a pipe or newline would
-                  # break the row and a backtick would end the span early.
-                  return str(value).replace("|", "\\|").replace("\n", "⏎ ").replace("`", "'")
-              text = r.get("generated_text")
-              partial = r.get("generated_text_partial")
-              if text is not None:
-                  print(f"| Generated text | `{cell(text)}` |")
-              elif partial:
-                  n = r.get("decode_steps_done") or 0
-                  print(f"| Generated text (partial: prefill + {n} decode step(s) before the failure) | `{cell(partial)}` |")
-              else:
-                  print("| Generated text | _(none — the loop did not sample a single token)_ |")
-              timings = r.get("timings_ms", {})
-              latency = r.get("decode_latency", {})
-              throughput = r.get("throughput", {})
-              for label, value in (
-                  ("Output tokens", r.get("output_tokens_total")),
-                  ("Resident TTFT (ms)", timings.get("ttft")),
-                  ("Decode mean / p50 / p90 (ms)",
-                   " / ".join(f"{latency[key]:.3f}" for key in ("mean_ms", "p50_ms", "p90_ms"))
-                   if latency.get("count", 0) else None),
-                  ("Decode tokens/s (one sequence, all EP/TP ranks)",
-                   throughput.get("decode_tokens_per_second_per_sequence")),
-              ):
-                  if value is not None:
-                      print(f"| {label} | `{cell(value)}` |")
-              # Every rank holds the full hidden state and the full vocabulary,
-              # so they should be bit-identical. Equal sampled tokens do not show
-              # that, and issue #1043 still makes them drift, so say which
-              # happened: it separates "the model changed" from "#1043 fired".
-              identical = r.get("ranks_bit_identical")
-              if identical is not None:
-                  print(f"| Ranks bit-identical | `{'yes' if identical else 'no (issue #1043)'}` |")
-              if r.get("error"):
-                  err = str(r["error"]).replace("|", "\\|")
-                  print(f"| Error | `{err}` |")
-              print()
-              print("Full log: `e2e.log` in the `results-e2e-a5` artifact of this run.")
-              print()
-
           print("## Daily CI Model Test Results")
           print()
           table("a2a3 and a2a3sim", ["a2a3", "a2a3sim"])
           v41_table("a5 and a5sim (DeepSeek V4.1-Flash)", ["a5", "a5sim"])
-          e2e("a5 DeepSeek-V4-Flash EP8 end-to-end token generation (real weights)", "e2e-a5")
           EOF

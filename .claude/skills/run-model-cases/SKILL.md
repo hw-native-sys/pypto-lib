@@ -91,8 +91,6 @@ card. Their CLIs also accept a simulator, but a simulator run can fail in the
 runtime stage on workspace provisioning while the same case validates on a
 device — prefer the device form when a card is available.
 
-DeepSeek V4 Pro mirrors this tree on A5 (`-p a5`).
-
 ## Escalating within a tree
 
 Start at the case that answers the question. Fall back to a cheaper one only

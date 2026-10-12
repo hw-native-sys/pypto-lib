@@ -68,8 +68,8 @@ Three things are not:
   is dead here: `Glm5NextTextConfig` sets `rope_parameters = AttributeError()`,
   `Glm5NextTextModel.forward` passes `position_embeddings=None`, and
   `Glm5NextTextIndexer.forward` never touches a cos/sin table. So this port needs
-  none of the `rope_tables.py` / interleaved-rope machinery that both
-  `deepseek_v4_pro` and `deepseek_v4_flash_mtp` carry.
+  none of the `rope_tables.py` / interleaved-rope machinery that
+  `deepseek_v4_flash_mtp` carries.
 
 Two more differences bite at the kernel level: the router scores with `sigmoid`
 where DeepSeek-V4.1 uses `sqrt(softplus(.))`, and 288 experts do not fit the

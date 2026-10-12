@@ -137,7 +137,7 @@ Four opt-outs, from narrowest to widest. Each is an assertion the compiler
 |-----------|--------------------|-------------------|
 | `pl.at(..., no_dep_args=[t])` | One tensor, one task | the `gate_up_dual_proj` scope in `models/qwen3_14b/decode_layer_a8w8.py` |
 | `pl.no_dep(t)` at a call argument | One tensor, one task (`@pl.program` form) | — |
-| `pl.create_tensor(..., manual_dep=True)` | One tensor, its whole lifetime | `post_ffn` in `models/deepseek_v4_pro/moe.py` |
+| `pl.create_tensor(..., manual_dep=True)` | One tensor, its whole lifetime | `post_ffn` in `models/deepseek_v4_flash_dspark/moe.py` |
 | `with pl.manual_scope():` | Every task in the region | `_decode_layer` in `models/qwen3_14b/decode_fwd.py` |
 
 Prefer the narrowest one that expresses the claim. `manual_scope` says "I own
@@ -533,8 +533,7 @@ with non-deterministic indices — the signature of a race, not of a numerics
 bug. The live fix is a no-op self-copy that marks the parameter `inout` before
 the gather, so the writeback takes a WAW edge on it; `add_inout` is a
 param-level property, so one tile touch is enough. See the `kv_touch` scope in
-`models/deepseek_v4_pro/decode_sparse_attn.py` and its siblings in the
-`_csa` variants.
+`models/deepseek_v4_flash_mtp/decode_sparse_attn_csa.py`.
 
 **A GM round-trip registered as `add_output`.** A GM tensor written by one task
 and read by a later one must be registered on the producing task as

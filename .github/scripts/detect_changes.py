@@ -59,7 +59,6 @@ from collections import defaultdict
 SOURCE_ROOTS = ("examples", "models")
 
 A5_ONLY_MODEL_PREFIXES = (
-    "models/deepseek_v4_pro/",
     "models/deepseek_v4_1_flash/",
 )
 
