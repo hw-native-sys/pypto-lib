@@ -420,10 +420,9 @@ def emit_kernel_cpp(cpp_text: str, name: str, is_mixed: bool, params: list[Param
         )
     if is_mixed:
         # The AIV side of a mixed kernel may take extra trailing scalar args
-        # beyond the AIC launch ABI (e.g. block-partition offsets the runtime
-        # derives per AIV subblock). The synthesized single-core dispatcher has
-        # no such runtime, so we pass 0 for each extra arg — that profiles the
-        # first partition, and per-instruction cost is partition-independent.
+        # beyond the AIC launch ABI. Start with 0 placeholders; generate()
+        # replaces the subblock argument with the physical AIV lane when the
+        # sibling PTO IR identifies it. Other extras still need workload wiring.
         aiv_call = call
         m_aiv = re.search(rf"\bAICORE\s+void\s+{re.escape(name)}_aiv\s*\(([^)]*)\)", cpp_text)
         if m_aiv:
@@ -439,6 +438,69 @@ def emit_kernel_cpp(cpp_text: str, name: str, is_mixed: bool, params: list[Param
             f"#if defined(__DAV_VEC__)\n  {name}_aiv({aiv_call});\n#endif\n}}\n"
         )
     return out
+
+
+def wire_subblock_lane(kernel_cpp: Path, pto_path: Path, name: str) -> str:
+    """Use each physical AIV lane for a PTO subblock argument in a standalone case.
+
+    The normal runtime supplies ``__pypto_spmd_subblock_idx`` per AIV through
+    its dispatch payload. A standalone CCE launch has one shared scalar pack,
+    so a generated literal/default value would send both AIVs down one path.
+    This replacement applies only when the sibling PTO IR identifies the exact
+    vector function argument as the subblock index.
+    """
+    pto_text = pto_path.read_text(encoding="utf-8")
+    vec_func = re.search(rf"func\.func\s+@{re.escape(name)}_aiv\s*\(([^)]*)\)", pto_text)
+    if vec_func is None:
+        return ""
+    pto_args = re.findall(r"%([\w]+)\s*:", vec_func.group(1))
+    matches = [i for i, arg in enumerate(pto_args) if arg == "__pypto_spmd_subblock_idx"]
+    if not matches:
+        return ""
+    if len(matches) != 1:
+        raise ValueError(f"ambiguous AIV subblock argument in {pto_path}")
+    lane_index = matches[0]
+
+    cpp_text = kernel_cpp.read_text(encoding="utf-8")
+    aiv_func = re.search(rf"\bAICORE\s+void\s+{re.escape(name)}_aiv\s*\(([^)]*)\)", cpp_text)
+    if aiv_func is None or len(_split_params(aiv_func.group(1))) != len(pto_args):
+        raise ValueError(f"AIV C++/PTO argument mismatch for {name}")
+    entry = re.search(
+        rf'extern\s+"C"\s+__global__\s+AICORE\s+void\s+{re.escape(name)}\s*\(([^)]*)\)\s*\{{',
+        cpp_text,
+    )
+    if entry is None:
+        raise ValueError(f"missing standalone global entry for AIV subblock kernel {name}")
+    marker = "// Standalone profiling: use this AIV's physical subblock id."
+    if marker in cpp_text[entry.end() :]:
+        return "get_subblockid()"
+
+    entry_args = _split_params(entry.group(1))
+    if lane_index < len(entry_args):
+        lane_decl = entry_args[lane_index]
+        if "*" in lane_decl:
+            raise ValueError(f"AIV subblock argument is not scalar: {lane_decl}")
+        lane_name = lane_decl.split()[-1]
+        replacement = (
+            f"\n  {marker}\n#if defined(__DAV_VEC__)\n"
+            f"  {lane_name} = get_subblockid();\n#endif"
+        )
+        cpp_text = cpp_text[: entry.end()] + replacement + cpp_text[entry.end() :]
+    else:
+        call = re.search(rf"\b{re.escape(name)}_aiv\s*\(([^()]*)\)\s*;", cpp_text[entry.end() :])
+        if call is None:
+            raise ValueError(f"missing standalone AIV call for subblock kernel {name}")
+        call_start = entry.end() + call.start()
+        call_end = entry.end() + call.end()
+        call_args = _split_params(call.group(1))
+        if len(call_args) != len(pto_args) or call_args[lane_index] != "0":
+            raise ValueError(f"unexpected standalone AIV subblock argument for {name}")
+        call_args[lane_index] = "get_subblockid()"
+        patched_call = f"{name}_aiv({', '.join(call_args)});"
+        cpp_text = cpp_text[:call_start] + marker + "\n  " + patched_call + cpp_text[call_end:]
+
+    kernel_cpp.write_text(cpp_text, encoding="utf-8")
+    return "get_subblockid()"
 
 
 def emit_launch_cpp(name: str, params: list[Param]) -> str:
@@ -573,6 +635,7 @@ def generate(
     (out_dir / f"{testcase}_kernel.cpp").write_text(
         emit_kernel_cpp(cpp_text, name, is_mixed, params), encoding="utf-8"
     )
+    wire_subblock_lane(out_dir / f"{testcase}_kernel.cpp", pto_path, name)
     (out_dir / "launch.cpp").write_text(emit_launch_cpp(name, params), encoding="utf-8")
     (out_dir / "main.cpp").write_text(
         emit_main_cpp(name, params, counts, dynamic_args, dynamic_dim), encoding="utf-8"
