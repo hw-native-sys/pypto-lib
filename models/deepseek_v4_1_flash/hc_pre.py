@@ -17,15 +17,17 @@ if __package__ in (None, ""):
 import pypto.language as pl
 import torch
 
+# A5-only; intentionally excluded from the A2/A3 device sweep. `ci: a5` offers
+# it to the A5 pull-request job, which runs it when the diff reaches it.
 # ci: no-sim
+# ci: a5
 from models.deepseek_v4_1_flash.config import D, HC_DIM, HC_MULT, T_DYN
 from models.deepseek_v4_1_flash.golden import hc_pre
 
 from models.deepseek_v4_1_flash.config import FLASH
 
 
-HC_PAD = 8
-T_TILE = 8
+D_TILE = 2560
 
 
 @pl.jit.inline
@@ -36,64 +38,25 @@ def mhc_pre(
 ):
     t_dim = pl.tensor.dim(x_hc, 0)
     x_flat = pl.reshape(x_hc, [t_dim, HC_DIM])
-    for block in pl.spmd((t_dim + T_TILE - 1) // T_TILE * (D // 1024), name_hint="mhc_pre"):
-        token_block = block // (D // 1024)
-        d_block = block % (D // 1024)
-        t0 = token_block * T_TILE
-        d_base = d_block * 1024
-        valid_rows = pl.min(T_TILE, t_dim - t0)
-        pre_tile = pl.load(
-            pre_mix,
-            [t0, 0],
-            [T_TILE, HC_PAD],
-            valid_shape=[valid_rows, HC_MULT],
-            target_memory=pl.MemorySpace.Vec,
-        )
-        pre_transposed = pl.transpose(pre_tile, axis1=0, axis2=1)
-        pre0 = pl.reshape(pre_transposed[0:1, 0:T_TILE], [T_TILE, 1])
-        pre1 = pl.reshape(pre_transposed[1:2, 0:T_TILE], [T_TILE, 1])
-        pre2 = pl.reshape(pre_transposed[2:3, 0:T_TILE], [T_TILE, 1])
-        pre3 = pl.reshape(pre_transposed[3:4, 0:T_TILE], [T_TILE, 1])
-        for db in pl.pipeline(1024 // 256, stage=2):
-            d0 = d_base + db * 256
-            x0 = pl.load(
-                x_flat,
-                [t0, d0],
-                [T_TILE, 256],
-                valid_shape=[valid_rows, 256],
-                target_memory=pl.MemorySpace.Vec,
-            )
-            x1 = pl.load(
-                x_flat,
-                [t0, D + d0],
-                [T_TILE, 256],
-                valid_shape=[valid_rows, 256],
-                target_memory=pl.MemorySpace.Vec,
-            )
-            x2 = pl.load(
-                x_flat,
-                [t0, 2 * D + d0],
-                [T_TILE, 256],
-                valid_shape=[valid_rows, 256],
-                target_memory=pl.MemorySpace.Vec,
-            )
-            x3 = pl.load(
-                x_flat,
-                [t0, 3 * D + d0],
-                [T_TILE, 256],
-                valid_shape=[valid_rows, 256],
-                target_memory=pl.MemorySpace.Vec,
-            )
-            y0 = pl.row_expand_mul(x0, pre0)
-            y1 = pl.row_expand_mul(x1, pre1)
-            y2 = pl.row_expand_mul(x2, pre2)
-            y3 = pl.row_expand_mul(x3, pre3)
-            y01 = pl.add(y0, y1)
-            y23 = pl.add(y2, y3)
-            y_tile = pl.add(y01, y23)
+    for t in pl.spmd(t_dim, name_hint="mhc_pre", allow_early_resolve=True):
+        pre0 = pl.read(pre_mix, [t, 0])
+        pre1 = pl.read(pre_mix, [t, 1])
+        pre2 = pl.read(pre_mix, [t, 2])
+        pre3 = pl.read(pre_mix, [t, 3])
+        for d0 in pl.pipeline(0, D, D_TILE, stage=2):
+            x0 = pl.load(x_flat, [t, d0], [1, D_TILE])
+            x1 = pl.load(x_flat, [t, D + d0], [1, D_TILE])
+            x2 = pl.load(x_flat, [t, 2 * D + d0], [1, D_TILE])
+            x3 = pl.load(x_flat, [t, 3 * D + d0], [1, D_TILE])
+            y0 = pl.mul(x0, pre0)
+            y1 = pl.mul(x1, pre1)
+            y2 = pl.mul(x2, pre2)
+            y3 = pl.mul(x3, pre3)
+            y_tile = pl.add(pl.add(y0, y1), pl.add(y2, y3))
             y_bf16 = pl.cast(y_tile, target_type=pl.BF16, mode="rint")
-            pl.store(pl.set_validshape(y_bf16, valid_rows, 256), [t0, d0], output)
+            pl.store(y_bf16, [t, d0], output)
     return output
+
 
 def golden_mhc_pre(x_hc: torch.Tensor, pre_mix: torch.Tensor) -> torch.Tensor:
     """Collapse the HC streams with the Torch reference."""

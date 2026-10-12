@@ -18,7 +18,10 @@ if __package__ in (None, ""):
 import pypto.language as pl
 import torch
 
+# A5-only; intentionally excluded from the A2/A3 device sweep. `ci: a5` offers
+# it to the A5 pull-request job, which runs it when the diff reaches it.
 # ci: no-sim
+# ci: a5
 from models.deepseek_v4_1_flash.config import D, FLASH, HC_DIM, HC_MULT, MIX_HC, T_DYN
 from models.deepseek_v4_1_flash.golden import hc_mixes
 
@@ -32,8 +35,8 @@ MIX_PAD = 32
 HC_PAD = 8
 T_TILE = 8
 LINEAR_T_TILE = 16
-COMB_T_TILE = 8
-RMS_K_TILE = 512
+COMB_T_TILE = 1
+RMS_K_TILE = 1024
 LINEAR_K_TILE = 256
 LINEAR_OK = 4
 LINEAR_K_PER_SPLIT = HC_DIM // LINEAR_OK
@@ -98,169 +101,79 @@ def mhc_mixes(
         partial = split * t_linear + t0
         mixes_partials[partial : partial + LINEAR_T_TILE, 0:MIX_PAD] = acc
 
-    mixes_raw = pl.create_tensor([t_linear, MIX_PAD], dtype=pl.FP32)
-    for block in pl.spmd(t_linear // LINEAR_T_TILE, name_hint="mhc_linear_reduce"):
-        t0 = block * LINEAR_T_TILE
-        total = mixes_partials[t0 : t0 + LINEAR_T_TILE, 0:MIX_PAD]
-        for split in pl.range(1, LINEAR_OK):
-            partial = split * t_linear + t0
-            total = pl.add(total, mixes_partials[partial : partial + LINEAR_T_TILE, 0:MIX_PAD])
-        mixes_raw[t0 : t0 + LINEAR_T_TILE, 0:MIX_PAD] = total
-
-    base_view = pl.reshape(base, [1, MIX_HC])
     scale0 = pl.read(scale, [0])
     scale1 = pl.read(scale, [1])
     scale2 = pl.read(scale, [2])
-    with pl.spmd((t_dim + T_TILE - 1) // T_TILE, name_hint="mhc_split") as split_ready:
-        block = pl.tile.get_block_idx()
-        t0 = block * T_TILE
-        valid_rows = pl.min(T_TILE, t_dim - t0)
-        inv = inv_rms[t0 : t0 + T_TILE, 0:1]
-        pre_base = pl.reshape(base[0:HC_PAD], [1, HC_PAD])
-        pre_logits = pl.add(
-            pl.mul(pl.row_expand_mul(mixes_raw[t0 : t0 + T_TILE, 0:HC_PAD], inv), scale0),
-            pl.col_expand(mixes_raw[t0 : t0 + T_TILE, 0:HC_PAD], pre_base),
-        )
-        pre_value = pl.add(pl.recip(pl.add(pl.exp(pl.neg(pre_logits)), 1.0)), HC_EPS)
-        post_base = pl.reshape(base[HC_MULT : HC_MULT + HC_PAD], [1, HC_PAD])
-        post_logits = pl.add(
-            pl.mul(
-                pl.row_expand_mul(mixes_raw[t0 : t0 + T_TILE, HC_MULT : HC_MULT + HC_PAD], inv),
-                scale1,
-            ),
-            pl.col_expand(mixes_raw[t0 : t0 + T_TILE, HC_MULT : HC_MULT + HC_PAD], post_base),
-        )
-        post_value = pl.mul(pl.recip(pl.add(pl.exp(pl.neg(post_logits)), 1.0)), 2.0)
-        pre_tile = pl.slice(pre_value, [T_TILE, HC_PAD], [0, 0], valid_shape=[valid_rows, HC_MULT])
-        post_tile = pl.slice(post_value, [T_TILE, HC_PAD], [0, 0], valid_shape=[valid_rows, HC_MULT])
-        pre_mix[t0 : t0 + T_TILE, 0:HC_MULT] = pre_tile
-        post_mix[t0 : t0 + T_TILE, 0:HC_MULT] = post_tile
-
-    with pl.spmd((t_dim + COMB_T_TILE - 1) // COMB_T_TILE, name_hint="mhc_sinkhorn") as sinkhorn_ready:
+    with pl.spmd((t_dim + COMB_T_TILE - 1) // COMB_T_TILE, name_hint="mhc_split_sinkhorn") as mixes_ready:
         block = pl.tile.get_block_idx()
         t0 = block * COMB_T_TILE
         valid_rows = pl.min(COMB_T_TILE, t_dim - t0)
-        comb_inv = pl.load(
-            inv_rms,
+        inv_scalar = pl.read(inv_rms, [t0, 0])
+        total = pl.load(
+            mixes_partials,
             [t0, 0],
-            [COMB_T_TILE, 1],
-            valid_shape=[valid_rows, 1],
+            [COMB_T_TILE, MIX_PAD],
+            valid_shape=[valid_rows, MIX_HC],
             target_memory=pl.MemorySpace.Vec,
         )
+        partial1 = pl.load(
+            mixes_partials,
+            [t_linear + t0, 0],
+            [COMB_T_TILE, MIX_PAD],
+            valid_shape=[valid_rows, MIX_HC],
+            target_memory=pl.MemorySpace.Vec,
+        )
+        partial2 = pl.load(
+            mixes_partials,
+            [2 * t_linear + t0, 0],
+            [COMB_T_TILE, MIX_PAD],
+            valid_shape=[valid_rows, MIX_HC],
+            target_memory=pl.MemorySpace.Vec,
+        )
+        partial3 = pl.load(
+            mixes_partials,
+            [3 * t_linear + t0, 0],
+            [COMB_T_TILE, MIX_PAD],
+            valid_shape=[valid_rows, MIX_HC],
+            target_memory=pl.MemorySpace.Vec,
+        )
+        total = pl.add(pl.add(total, partial1), pl.add(partial2, partial3))
+        pre_logits = pl.tile.full([1, HC_PAD], dtype=pl.FP32, value=0.0)
+        post_logits = pl.tile.full([1, HC_PAD], dtype=pl.FP32, value=0.0)
+        for j in pl.unroll(HC_PAD):
+            pre_value_j = pl.tile.read(total, [0, j]) * inv_scalar * scale0 + pl.read(base, [j])
+            post_value_j = (
+                pl.tile.read(total, [0, HC_MULT + j % HC_MULT]) * inv_scalar * scale1
+                + pl.read(base, [HC_MULT + j % HC_MULT])
+            )
+            pl.tile.write(pre_logits, [0, j], pre_value_j)
+            pl.tile.write(post_logits, [0, j], post_value_j)
+        pre_value = pl.add(pl.recip(pl.add(pl.exp(pl.neg(pre_logits)), 1.0)), HC_EPS)
+        post_value = pl.mul(pl.recip(pl.add(pl.exp(pl.neg(post_logits)), 1.0)), 2.0)
+        pl.store(pl.set_validshape(pre_value, valid_rows, HC_MULT), [t0, 0], pre_mix)
+        pl.store(pl.set_validshape(post_value, valid_rows, HC_MULT), [t0, 0], post_mix)
         comb_offset = HC_MULT * 2
-        row_max_tmp = pl.create_tile([COMB_T_TILE, HC_PAD], dtype=pl.FP32, target_memory=pl.MemorySpace.Vec)
-        row_sum_tmp = pl.create_tile([COMB_T_TILE, HC_PAD], dtype=pl.FP32, target_memory=pl.MemorySpace.Vec)
-        mix0 = pl.load(
-            mixes_raw,
-            [t0, comb_offset + 0 * HC_MULT],
-            [COMB_T_TILE, HC_PAD],
-            valid_shape=[valid_rows, HC_MULT],
-            target_memory=pl.MemorySpace.Vec,
-        )
-        mix1 = pl.load(
-            mixes_raw,
-            [t0, comb_offset + 1 * HC_MULT],
-            [COMB_T_TILE, HC_PAD],
-            valid_shape=[valid_rows, HC_MULT],
-            target_memory=pl.MemorySpace.Vec,
-        )
-        mix2 = pl.load(
-            mixes_raw,
-            [t0, comb_offset + 2 * HC_MULT],
-            [COMB_T_TILE, HC_PAD],
-            valid_shape=[valid_rows, HC_MULT],
-            target_memory=pl.MemorySpace.Vec,
-        )
-        mix3 = pl.load(
-            mixes_raw,
-            [t0, comb_offset + 3 * HC_MULT],
-            [COMB_T_TILE, HC_PAD],
-            valid_shape=[valid_rows, HC_MULT],
-            target_memory=pl.MemorySpace.Vec,
-        )
-        base0 = pl.load(
-            base_view,
-            [0, comb_offset + 0 * HC_MULT],
-            [1, HC_PAD],
-            valid_shape=[1, HC_MULT],
-            target_memory=pl.MemorySpace.Vec,
-        )
-        base1 = pl.load(
-            base_view,
-            [0, comb_offset + 1 * HC_MULT],
-            [1, HC_PAD],
-            valid_shape=[1, HC_MULT],
-            target_memory=pl.MemorySpace.Vec,
-        )
-        base2 = pl.load(
-            base_view,
-            [0, comb_offset + 2 * HC_MULT],
-            [1, HC_PAD],
-            valid_shape=[1, HC_MULT],
-            target_memory=pl.MemorySpace.Vec,
-        )
-        base3 = pl.load(
-            base_view,
-            [0, comb_offset + 3 * HC_MULT],
-            [1, HC_PAD],
-            valid_shape=[1, HC_MULT],
-            target_memory=pl.MemorySpace.Vec,
-        )
-        logits0 = pl.fillpad(
-            pl.add(pl.mul(pl.row_expand_mul(mix0, comb_inv), scale2), pl.col_expand(mix0, base0)),
-            pad_value=pl.PadValue.min,
-        )
-        logits1 = pl.fillpad(
-            pl.add(pl.mul(pl.row_expand_mul(mix1, comb_inv), scale2), pl.col_expand(mix1, base1)),
-            pad_value=pl.PadValue.min,
-        )
-        logits2 = pl.fillpad(
-            pl.add(pl.mul(pl.row_expand_mul(mix2, comb_inv), scale2), pl.col_expand(mix2, base2)),
-            pad_value=pl.PadValue.min,
-        )
-        logits3 = pl.fillpad(
-            pl.add(pl.mul(pl.row_expand_mul(mix3, comb_inv), scale2), pl.col_expand(mix3, base3)),
-            pad_value=pl.PadValue.min,
-        )
-        max0 = pl.row_max(logits0, row_max_tmp)
-        max1 = pl.row_max(logits1, row_max_tmp)
-        max2 = pl.row_max(logits2, row_max_tmp)
-        max3 = pl.row_max(logits3, row_max_tmp)
-        exp0 = pl.exp(pl.row_expand_sub(logits0, max0))
-        exp1 = pl.exp(pl.row_expand_sub(logits1, max1))
-        exp2 = pl.exp(pl.row_expand_sub(logits2, max2))
-        exp3 = pl.exp(pl.row_expand_sub(logits3, max3))
-        row0 = pl.add(pl.row_expand_div(exp0, pl.row_sum(exp0, row_sum_tmp)), HC_EPS)
-        row1 = pl.add(pl.row_expand_div(exp1, pl.row_sum(exp1, row_sum_tmp)), HC_EPS)
-        row2 = pl.add(pl.row_expand_div(exp2, pl.row_sum(exp2, row_sum_tmp)), HC_EPS)
-        row3 = pl.add(pl.row_expand_div(exp3, pl.row_sum(exp3, row_sum_tmp)), HC_EPS)
-        row0 = pl.fillpad(pl.set_validshape(row0, valid_rows, HC_MULT), pad_value=pl.PadValue.zero)
-        row1 = pl.fillpad(pl.set_validshape(row1, valid_rows, HC_MULT), pad_value=pl.PadValue.zero)
-        row2 = pl.fillpad(pl.set_validshape(row2, valid_rows, HC_MULT), pad_value=pl.PadValue.zero)
-        row3 = pl.fillpad(pl.set_validshape(row3, valid_rows, HC_MULT), pad_value=pl.PadValue.zero)
-        col_sum = pl.add(pl.add(row0, row1), pl.add(row2, row3))
-        col_sum = pl.add(col_sum, HC_EPS)
-        row0 = pl.div(row0, col_sum)
-        row1 = pl.div(row1, col_sum)
-        row2 = pl.div(row2, col_sum)
-        row3 = pl.div(row3, col_sum)
-        sinkhorn_sum_tmp = pl.create_tile([COMB_T_TILE, HC_PAD], dtype=pl.FP32, target_memory=pl.MemorySpace.Vec)
+        logits = pl.tile.full([HC_PAD, HC_PAD], dtype=pl.FP32, value=0.0)
+        for i in pl.unroll(HC_PAD):
+            for j in pl.unroll(HC_PAD):
+                lane = comb_offset + (i % HC_MULT) * HC_MULT + j % HC_MULT
+                value = pl.tile.read(total, [0, lane]) * inv_scalar * scale2 + pl.read(base, [lane])
+                pl.tile.write(logits, [i, j], value)
+        row_tmp = pl.create_tile([HC_PAD, HC_PAD], dtype=pl.FP32, target_memory=pl.MemorySpace.Vec)
+        rows = pl.exp(pl.row_expand_sub(logits, pl.row_max(logits, row_tmp)))
+        rows = pl.add(pl.row_expand_div(rows, pl.mul(pl.row_sum(rows, row_tmp), 0.5)), HC_EPS)
+        rows = pl.col_expand_div(rows, pl.add(pl.mul(pl.col_sum(rows), 0.5), HC_EPS))
         for _ in pl.pipeline(HC_SINKHORN_ITER - 1, stage=2):
-            row0 = pl.row_expand_div(row0, pl.add(pl.row_sum(row0, sinkhorn_sum_tmp), HC_EPS))
-            row1 = pl.row_expand_div(row1, pl.add(pl.row_sum(row1, sinkhorn_sum_tmp), HC_EPS))
-            row2 = pl.row_expand_div(row2, pl.add(pl.row_sum(row2, sinkhorn_sum_tmp), HC_EPS))
-            row3 = pl.row_expand_div(row3, pl.add(pl.row_sum(row3, sinkhorn_sum_tmp), HC_EPS))
-            col_sum = pl.add(pl.add(row0, row1), pl.add(row2, row3))
-            col_sum = pl.add(col_sum, HC_EPS)
-            row0 = pl.div(row0, col_sum)
-            row1 = pl.div(row1, col_sum)
-            row2 = pl.div(row2, col_sum)
-            row3 = pl.div(row3, col_sum)
-        pl.store(pl.set_validshape(row0, valid_rows, HC_MULT), [t0, 0 * HC_MULT], residual_mix_flat)
-        pl.store(pl.set_validshape(row1, valid_rows, HC_MULT), [t0, 1 * HC_MULT], residual_mix_flat)
-        pl.store(pl.set_validshape(row2, valid_rows, HC_MULT), [t0, 2 * HC_MULT], residual_mix_flat)
-        pl.store(pl.set_validshape(row3, valid_rows, HC_MULT), [t0, 3 * HC_MULT], residual_mix_flat)
-    mixes_ready = pl.system.task_dummy(deps=[split_ready, sinkhorn_ready])
+            rows = pl.row_expand_div(rows, pl.add(pl.mul(pl.row_sum(rows, row_tmp), 0.5), HC_EPS))
+            rows = pl.col_expand_div(rows, pl.add(pl.mul(pl.col_sum(rows), 0.5), HC_EPS))
+        for row in pl.unroll(HC_MULT):
+            logical_row = pl.slice(
+                rows,
+                [1, HC_PAD],
+                [row, 0],
+                valid_shape=[1, HC_MULT],
+            )
+            pl.store(logical_row, [t0, row * HC_MULT], residual_mix_flat)
     return mixes_ready
 
 def golden_mhc_mixes(
