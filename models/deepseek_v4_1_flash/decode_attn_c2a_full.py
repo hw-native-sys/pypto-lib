@@ -104,6 +104,7 @@ PAIR_WIDTH = 2 * INDEX_TOPK
 SORT_FLOOR = -3.0e38
 MASK_BIAS = 1.0e30
 COMPRESSOR_K_TILE = 64
+COMPRESSOR_GEMM_K_TILE = 256
 INDEX_DIM_SCALE = INDEX_DIM**-0.5
 INDEX_HEAD_SCALE = INDEX_H**-0.5
 
@@ -151,47 +152,55 @@ def compressor_project(
     score_out: pl.Tensor[[T_DYN, HEAD_DIM], pl.FP32],
     num_tokens: pl.Scalar[pl.INT32],
 ):
-    """Project the ratio-2 compressor value and gate streams in FP32.
-
-    The weights are FP32 and the activation is BF16, so each weight tile is split
-    into two BF16 terms whose Cube products are both exact in the FP32
-    accumulator. The value and gate streams run as separate regions because one
-    FP32 weight tile plus its two BF16 terms already fills most of the Vec buffer.
-    """
-    for block in pl.spmd(
-        (num_tokens + M_TILE - 1) // M_TILE * (HEAD_DIM // N_TILE),
-        name_hint="c2a_compressor_value",
-    ):
-        t0 = block // (HEAD_DIM // N_TILE) * M_TILE
-        n0 = block % (HEAD_DIM // N_TILE) * N_TILE
+    """Stage three BF16 weight terms with separate high and residual accumulators."""
+    high_weight = pl.create_tensor([2 * D, HEAD_DIM], dtype=pl.BF16)
+    low_weight = pl.create_tensor([2 * D, HEAD_DIM], dtype=pl.BF16)
+    tail_weight = pl.create_tensor([2 * D, HEAD_DIM], dtype=pl.BF16)
+    split_blocks = D // COMPRESSOR_K_TILE * (HEAD_DIM // N_TILE)
+    with pl.spmd(16, name_hint="c2a_compressor_split") as split_tid:
+        worker = pl.tile.get_block_idx()
+        for block in pl.range(worker, split_blocks, 16):
+            k0 = block // (HEAD_DIM // N_TILE) * COMPRESSOR_K_TILE
+            n0 = block % (HEAD_DIM // N_TILE) * N_TILE
+            for stream in pl.unroll(2):
+                if stream == 0:
+                    weight = wkv[k0 : k0 + COMPRESSOR_K_TILE, n0 : n0 + N_TILE]
+                else:
+                    weight = wgate[k0 : k0 + COMPRESSOR_K_TILE, n0 : n0 + N_TILE]
+                high = pl.cast(weight, pl.BF16, mode="rint")
+                residual = pl.sub(weight, pl.cast(high, pl.FP32))
+                low = pl.cast(residual, pl.BF16, mode="rint")
+                tail = pl.cast(pl.sub(residual, pl.cast(low, pl.FP32)), pl.BF16, mode="rint")
+                row = stream * D + k0
+                high_weight[row : row + COMPRESSOR_K_TILE, n0 : n0 + N_TILE] = high
+                low_weight[row : row + COMPRESSOR_K_TILE, n0 : n0 + N_TILE] = low
+                tail_weight[row : row + COMPRESSOR_K_TILE, n0 : n0 + N_TILE] = tail
+    output_blocks = (num_tokens + M_TILE - 1) // M_TILE * (HEAD_DIM // N_TILE)
+    with pl.spmd(output_blocks * 2, name_hint="c2a_compressor_cube", deps=[split_tid]):
+        block = pl.tile.get_block_idx()
+        tile = block // 2
+        stream = block % 2
+        t0 = tile // (HEAD_DIM // N_TILE) * M_TILE
+        n0 = tile % (HEAD_DIM // N_TILE) * N_TILE
         rows = pl.min(M_TILE, num_tokens - t0)
-        acc = pl.create_tensor([M_TILE, N_TILE], dtype=pl.FP32)
-        for kb in pl.range(D // COMPRESSOR_K_TILE):
-            k0 = kb * COMPRESSOR_K_TILE
-            a = pl.slice(x, [M_TILE, COMPRESSOR_K_TILE], [t0, k0], valid_shape=[rows, COMPRESSOR_K_TILE])
-            weight = wkv[k0 : k0 + COMPRESSOR_K_TILE, n0 : n0 + N_TILE]
-            high = pl.cast(weight, pl.BF16, mode="rint")
-            low = pl.cast(pl.sub(weight, pl.cast(high, pl.FP32)), pl.BF16, mode="rint")
-            acc = pl.matmul_acc(acc, a, high, init_cond=(kb == 0))
-            acc = pl.matmul_acc(acc, a, low)
-        kv_out[t0 : t0 + M_TILE, n0 : n0 + N_TILE] = pl.set_validshape(acc, rows, N_TILE)
-    for block in pl.spmd(
-        (num_tokens + M_TILE - 1) // M_TILE * (HEAD_DIM // N_TILE),
-        name_hint="c2a_compressor_gate",
-    ):
-        t0 = block // (HEAD_DIM // N_TILE) * M_TILE
-        n0 = block % (HEAD_DIM // N_TILE) * N_TILE
-        rows = pl.min(M_TILE, num_tokens - t0)
-        acc = pl.create_tensor([M_TILE, N_TILE], dtype=pl.FP32)
-        for kb in pl.range(D // COMPRESSOR_K_TILE):
-            k0 = kb * COMPRESSOR_K_TILE
-            a = pl.slice(x, [M_TILE, COMPRESSOR_K_TILE], [t0, k0], valid_shape=[rows, COMPRESSOR_K_TILE])
-            weight = wgate[k0 : k0 + COMPRESSOR_K_TILE, n0 : n0 + N_TILE]
-            high = pl.cast(weight, pl.BF16, mode="rint")
-            low = pl.cast(pl.sub(weight, pl.cast(high, pl.FP32)), pl.BF16, mode="rint")
-            acc = pl.matmul_acc(acc, a, high, init_cond=(kb == 0))
-            acc = pl.matmul_acc(acc, a, low)
-        score_out[t0 : t0 + M_TILE, n0 : n0 + N_TILE] = pl.set_validshape(acc, rows, N_TILE)
+        high_acc = pl.create_tensor([M_TILE, N_TILE], dtype=pl.FP32)
+        residual_acc = pl.create_tensor([M_TILE, N_TILE], dtype=pl.FP32)
+        for kb in pl.range(D // COMPRESSOR_GEMM_K_TILE):
+            k0 = kb * COMPRESSOR_GEMM_K_TILE
+            row = stream * D + k0
+            a = pl.slice(x, [M_TILE, COMPRESSOR_GEMM_K_TILE], [t0, k0], valid_shape=[rows, COMPRESSOR_GEMM_K_TILE])
+            a = pl.cast(pl.cast(a, pl.FP32), pl.BF16, mode="rint")
+            gemm_high = high_weight[row : row + COMPRESSOR_GEMM_K_TILE, n0 : n0 + N_TILE]
+            gemm_low = low_weight[row : row + COMPRESSOR_GEMM_K_TILE, n0 : n0 + N_TILE]
+            gemm_tail = tail_weight[row : row + COMPRESSOR_GEMM_K_TILE, n0 : n0 + N_TILE]
+            high_acc = pl.matmul_acc(high_acc, a, gemm_high, init_cond=(kb == 0))
+            residual_acc = pl.matmul_acc(residual_acc, a, gemm_low, init_cond=(kb == 0))
+            residual_acc = pl.matmul_acc(residual_acc, a, gemm_tail)
+        result = pl.set_validshape(pl.add(high_acc, residual_acc), rows, N_TILE)
+        if stream == 0:
+            kv_out[t0 : t0 + M_TILE, n0 : n0 + N_TILE] = result
+        else:
+            score_out[t0 : t0 + M_TILE, n0 : n0 + N_TILE] = result
     return kv_out, score_out
 
 
@@ -708,12 +717,12 @@ def make_attend_sparse(*, vector_query=False):
             maximum = pl.full([1, M_TILE], dtype=pl.FP32, value=-1e30)
             denominator = pl.full([1, M_TILE], dtype=pl.FP32, value=0.0)
             numerator = pl.full([M_TILE, HEAD_DIM], dtype=pl.FP32, value=0.0)
+            q = query_flat[q0 : q0 + M_TILE, :]
+            if vector_query:
+                # Route the BF16 query through Vector before the first score push.
+                q = pl.cast(pl.cast(q, pl.FP32), pl.BF16, mode="rint")
             for part in pl.range(SPARSE_PARTS):
                 k0 = r * SPARSE_WIDTH + part * ATTEND_TILE
-                q = query_flat[q0 : q0 + M_TILE, :]
-                if vector_query:
-                    # An exact BF16 roundtrip requires Vector startup before the first score push.
-                    q = pl.cast(pl.cast(q, pl.FP32), pl.BF16, mode="rint")
                 kv = key_flat[k0 : k0 + ATTEND_TILE, :]
                 scores = pl.mul(pl.matmul(q, kv, b_trans=True), SOFTMAX_SCALE)
                 idx = pl.cast(combined[r : r + 1, part * ATTEND_TILE : part * ATTEND_TILE + ATTEND_TILE], pl.FP32)
@@ -861,7 +870,7 @@ def make_c2a_full_partial(
         attended = pl.create_tensor([tokens, LOCAL_H * HEAD_DIM], dtype=pl.BF16)
         selected = pl.create_tensor([QUERY_TILE, SPARSE_WIDTH, HEAD_DIM], dtype=pl.BF16)
         combined = pl.create_tensor([QUERY_TILE, SPARSE_WIDTH], dtype=pl.INT32)
-        chunk_done = select_tid
+        chunk_done = pl.system.task_dummy(deps=[select_tid, state_tid])
         for start in pl.range(0, num_tokens, QUERY_TILE):
             active = pl.min(QUERY_TILE, num_tokens - start)
             gather_tid = gather_sparse(
@@ -1201,7 +1210,7 @@ def official_reference_c2a(inputs: dict, *, fp32_output=False) -> dict:
     window_slots = t["window_slots"].long()
     window_valid = window_slots >= 0
     window_rows = window_slots[window_valid]
-    _write_rows(window_cache, window_rows, window_payload[window_valid], head_dim)
+    _write_rows(window_cache, window_rows, window_payload.view(torch.uint8)[window_valid], head_dim)
     _write_rows(window_cache_scale, window_rows, window_codes[window_valid], head_dim // MX_GROUP)
 
     # c. Ratio-2 compressor: per-channel two-way softmax over the pair, pooled row rounded to
