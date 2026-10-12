@@ -19,6 +19,8 @@ from typing import Any, Mapping
 if __package__ in (None, ""):
     sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
+# Packed MXFP4/MXFP8 validation requires the A5 device backend.
+# ci: no-sim
 import torch
 import torch.nn.functional as F
 import pypto.language as pl
@@ -1135,6 +1137,8 @@ def validate(argv=None):
             dump_passes=args.dump_passes,
             enable_chip_swimlane=args.enable_chip_swimlane,
             distributed_config=DistributedConfig(device_ids=devices, num_sub_workers=0),
+            # Attention and the packed EP MoE keep intermediate tensors live together.
+            ring_heap=1073741824,
         ),
         compare_fn={
             "window_cache": decode_attn_swa.compare_distributed_cache,

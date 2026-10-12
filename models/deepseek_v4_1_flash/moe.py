@@ -15,6 +15,8 @@ import sys
 import pypto.language as pl
 import pypto.language.distributed as pld
 from pypto.ir import DistributedConfig
+# Packed MXFP4/MXFP8 validation requires the A5 device backend.
+# ci: no-sim
 import torch
 
 from models.deepseek_v4_1_flash import config as C
@@ -1151,9 +1153,9 @@ def main():
 if "pytest" in sys.modules:
     import pytest
 
-    @pytest.mark.parametrize("tp,ep", [(2, 4), (4, 4)])
+    @pytest.mark.parametrize("tp,ep", [(1, 2), (2, 4), (4, 4)])
     def test_precision(tp, ep, a5_args):
-        """Validate TP2/DP2 and TP4/DP1 with EP-sized device allocations."""
+        """Validate TP1/EP2, TP2/EP4 and TP4/EP4 with EP-sized allocations."""
         result = validate(a5_args(tp=tp, ep=ep))
         assert result.passed, result.error
 

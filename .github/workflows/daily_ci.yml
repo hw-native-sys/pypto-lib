@@ -382,6 +382,8 @@ jobs:
           FILES=$(python .github/scripts/detect_changes.py --all --root models --platform a5)
           : > results.tsv
           if [ -n "$FILES" ]; then
+            # Daily retains every declared TP/DP/EP combination, including
+            # TP2/TP4 cases excluded from the TP1 pull-request smoke gate.
             python .github/scripts/run_a5_pytest.py --mode cli --results results.tsv $FILES
           fi
 

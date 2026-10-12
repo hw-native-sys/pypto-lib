@@ -363,11 +363,11 @@ jobs:
 
   a5:
     needs: detect-changes
-    # Directory-selected A5 device coverage, with pytest or script execution.
+    # Directory-selected A5 coverage; V4.1 uses TP1 and at most two cards.
+    # Daily model-tests-a5 retains the complete TP2/TP4 CLI combination sweep.
     if: needs.detect-changes.outputs.a5_files != ''
     runs-on: [self-hosted, linux, npu-a5]
-    # Explicit pytest cases run sequentially, with room for one task-submit
-    # worst case
+    # Queue up to two cases concurrently, with room for one task-submit worst case
     # (--timeout 3600 queue wait + --max-time 900 run) on top.
     timeout-minutes: 180
     defaults:
@@ -416,7 +416,18 @@ jobs:
           else
             python -m pip install pytest
           fi
-          python .github/scripts/run_a5_pytest.py $A5_CI_ENTRIES
+          python .github/scripts/run_a5_pytest.py --tp1-only --max-cards 2 --jobs 2 $A5_CI_ENTRIES
+
+      - name: Upload A5 failure diagnostics
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: a5-failure-diagnostics
+          retention-days: 7
+          if-no-files-found: ignore
+          path: |
+            checkout/build_output/**/report/codegen_errors.txt
+            checkout/build_output/**/*.pto
 
       - name: Kill orphaned task-submit tasks
         if: always()

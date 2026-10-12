@@ -18,6 +18,8 @@ if __package__ in (None, ""):
 
 import pypto.language as pl
 import pypto.language.distributed as pld
+# The sequence-parallel validation entry accepts only the A5 device platform.
+# ci: no-sim
 import torch
 from pypto.ir import DistributedConfig
 
