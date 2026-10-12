@@ -37,6 +37,7 @@ from models.deepseek_v4_1_flash.config import (
     CMP_POSITIONS_DYN,
     COMPRESSED_CACHE_GROUP,
     D,
+    FLASH,
     DECODE_MAX_TOKENS,
     HEAD_DIM,
     INDEX_BLOCKS_DYN,
@@ -1104,81 +1105,224 @@ score_full = make_index_scores(False)
 score_reindex = make_index_scores(True)
 
 
+# Model page geometry and bounded on-chip page cache.
+_TOPK_PAGE = 128
+_TOPK_PAIR_WIDTH = 2 * INDEX_TOPK
+_TOPK_CACHED_PAGES = (FLASH.max_position_embeddings + 127) // 128
+# Tiling and finite-score padding.
+_TOPK_LEAF_TILE = 2048
+_TOPK_SORT_FLOOR = -3.4028234663852886e38
+_TOPK_INVALID_SCORE_BITS = -8388608
+
+
 @pl.jit.inline
+def _sort_index_topk_leaf(
+    scores: pl.Tensor[[T_DYN, CMP_POSITIONS_DYN], pl.FP32],
+    pair_arena: pl.Tensor,
+    token: pl.Scalar[pl.INDEX],
+    logical_begin: pl.Scalar[pl.INDEX],
+    valid_count: pl.Scalar[pl.INDEX],
+    output_slot: pl.Scalar[pl.INDEX],
+):
+    """Sort one padded leaf and retain its Top-512 pair prefix."""
+    raw = pl.load(scores, [token, logical_begin], [1, _TOPK_LEAF_TILE], valid_shape=[1, valid_count])
+    padded = pl.tile.fillpad(raw, pad_value=pl.PadValue.min)
+    values = pl.maximum(padded, pl.tile.full([1, _TOPK_LEAF_TILE], dtype=pl.FP32, value=_TOPK_SORT_FLOOR))
+    indices = pl.add(pl.tile.arange(0, [1, _TOPK_LEAF_TILE], dtype=pl.INT32), pl.cast(logical_begin, pl.INT32))
+    pairs = pl.tile.sort32(values, pl.reinterpret_view(indices, pl.UINT32))
+    pairs = pl.tile.mrgsort(pairs, block_len=64)
+    pairs = pl.tile.mrgsort(pairs, block_len=256)
+    pairs = pl.tile.mrgsort(pairs, block_len=1024)
+    pl.store(pl.tile.slice(pairs, [1, _TOPK_PAIR_WIDTH], [0, 0]), [output_slot, 0], pair_arena)
+
+
+@pl.jit.inline
+def _merge_index_topk_rows(
+    pair_arena: pl.Tensor,
+    left_slot: pl.Scalar[pl.INDEX],
+    right_slot: pl.Scalar[pl.INDEX],
+    output_slot: pl.Scalar[pl.INDEX],
+):
+    left = pl.load(pair_arena, [left_slot, 0], [1, _TOPK_PAIR_WIDTH])
+    right = pl.load(pair_arena, [right_slot, 0], [1, _TOPK_PAIR_WIDTH])
+    merge_tmp = pl.tile.create([1, 2 * _TOPK_PAIR_WIDTH], dtype=pl.FP32)
+    merged = pl.tile.mrgsort(left, right, tmp=merge_tmp)
+    pl.store(pl.tile.slice(merged, [1, _TOPK_PAIR_WIDTH], [0, 0]), [output_slot, 0], pair_arena)
+
+
+@pl.jit.inline
+def _materialize_index_topk(
+    scores: pl.Tensor[[T_DYN, CMP_POSITIONS_DYN], pl.FP32],
+    block_table: pl.Tensor[[B_DYN, TABLE_DYN], pl.INT32],
+    request_ids: pl.Tensor[[T_DYN], pl.INT32],
+    output: pl.Tensor[[T_DYN, INDEX_TOPK], pl.INT32],
+    token: pl.Scalar[pl.INDEX],
+    width: pl.Scalar[pl.INDEX],
+    cutoff: pl.Scalar[pl.FP32],
+    tie_quota: pl.Scalar[pl.INDEX],
+):
+    """Compact winners in logical order and gather physical pages from UB."""
+    request = pl.cast(pl.read(request_ids, [token]), pl.INDEX)
+    table_width = pl.tensor.dim(block_table, 1)
+    valid_pages = pl.min(table_width, _TOPK_CACHED_PAGES)
+    raw_pages = pl.load(block_table, [request, 0], [1, _TOPK_CACHED_PAGES], valid_shape=[1, valid_pages])
+    pages = pl.tile.fillpad(raw_pages, pad_value=pl.PadValue.zero)
+    pl.store(pl.tile.full([1, INDEX_TOPK], dtype=pl.INT32, value=-1), [token, 0], output)
+    ones = pl.tile.full([1, 256], dtype=pl.FP32, value=1.0)
+    lanes = pl.tile.arange(0, [1, 256], dtype=pl.INT32)
+    lane_origin = pl.tile.full([1, 256], dtype=pl.INT32, value=256)
+    # Unique integer lane keys: selected=256-lane, discarded=0.
+    priority_fp32 = pl.cast(pl.sub(lane_origin, lanes), pl.FP32)
+    tmp = pl.tile.create([1, 256], dtype=pl.UINT8)
+    count = pl.cast(0, pl.INDEX)
+    remaining = tie_quota
+    for start in pl.range(0, width, 256):
+        if count < INDEX_TOPK:
+            valid = pl.min(256, width - start)
+            raw = pl.load(scores, [token, start], [1, 256], valid_shape=[1, valid])
+            values = pl.tile.fillpad(raw, pad_value=pl.PadValue.min)
+            strict = pl.tile.select(pl.tile.cmps(values, cutoff, cmp_type=4), ones, 0.0)
+            ties = pl.tile.full([1, 256], dtype=pl.FP32, value=0.0)
+            if remaining > 0:
+                eq = pl.tile.select(pl.tile.cmps(values, cutoff, cmp_type=0), ones, 0.0)
+                eq_valid = pl.tile.cmps(lanes, pl.cast(valid, pl.INT32), cmp_type=2)
+                eq = pl.tile.select(eq_valid, eq, 0.0)
+                eq_sums64 = pl.col_sum(pl.reshape(eq, [4, 64]))
+                eq_sums8 = pl.col_sum(pl.reshape(eq_sums64, [8, 8]))
+                available = pl.cast(0, pl.INDEX)
+                for eq_lane in pl.unroll(8):
+                    eq_partial = pl.cast(pl.tile.read(eq_sums8, [0, eq_lane]), pl.INT32)
+                    available = available + pl.cast(eq_partial, pl.INDEX)
+                take = pl.min(available, remaining)
+                if take > 0:
+                    if take == available:
+                        ties = eq
+                    else:
+                        # Only the chunk crossing the tie quota needs this boundary.
+                        tie_keys = pl.mul(eq, priority_fp32)
+                        tie_pairs = pl.tile.sort32(tie_keys, pl.reinterpret_view(lanes, pl.UINT32))
+                        tie_pairs = pl.tile.mrgsort(tie_pairs, block_len=64)
+                        tie_left = pl.tile.slice(tie_pairs, [1, 256], [0, 0])
+                        tie_right = pl.tile.slice(tie_pairs, [1, 256], [0, 256])
+                        tie_tmp = pl.tile.create([1, 512], dtype=pl.FP32)
+                        tie_merged = pl.tile.mrgsort(tie_left, tie_right, tmp=tie_tmp)
+                        equal_keys = pl.tile.gather_mask(tie_merged, mask_pattern=pl.tile.MaskPattern.P0101)
+                        last_key = pl.cast(pl.tile.read(equal_keys, [0, take - 1]), pl.INT32)
+                        boundary = pl.cast(256, pl.INT32) - last_key
+                        ties = pl.tile.select(pl.tile.cmps(lanes, boundary, cmp_type=3), eq, 0.0)
+                    remaining = remaining - take
+            keep = pl.maximum(strict, ties)
+            keep_valid = pl.tile.set_validshape(keep, 1, valid)
+            keep_padded = pl.tile.fillpad(keep_valid, pad_value=pl.PadValue.zero)
+            keep_sums64 = pl.col_sum(pl.reshape(keep_padded, [4, 64]))
+            keep_sums8 = pl.col_sum(pl.reshape(keep_sums64, [8, 8]))
+            keep_count = pl.cast(0, pl.INDEX)
+            for keep_lane in pl.unroll(8):
+                keep_partial = pl.cast(pl.tile.read(keep_sums8, [0, keep_lane]), pl.INT32)
+                keep_count = keep_count + pl.cast(keep_partial, pl.INDEX)
+            selected_count = pl.min(keep_count, INDEX_TOPK - count)
+            if selected_count > 0:
+                order_keys = pl.mul(keep_padded, priority_fp32)
+                order_pairs = pl.tile.sort32(order_keys, pl.reinterpret_view(lanes, pl.UINT32))
+                order_pairs = pl.tile.mrgsort(order_pairs, block_len=64)
+                order_left = pl.tile.slice(order_pairs, [1, 256], [0, 0])
+                order_right = pl.tile.slice(order_pairs, [1, 256], [0, 256])
+                order_tmp = pl.tile.create([1, 512], dtype=pl.FP32)
+                order_merged = pl.tile.mrgsort(order_left, order_right, tmp=order_tmp)
+                order_keys = pl.tile.gather_mask(order_merged, mask_pattern=pl.tile.MaskPattern.P0101)
+                offsets_i32 = pl.sub(lane_origin, pl.cast(order_keys, pl.INT32))
+                compact_valid = pl.tile.set_validshape(offsets_i32, 1, selected_count)
+                compact_safe = pl.tile.fillpad(compact_valid, pad_value=pl.PadValue.zero)
+                logical = pl.add(compact_safe, pl.cast(start, pl.INT32))
+                page_indices = pl.tile.shrs(logical, 7)
+                if start < _TOPK_CACHED_PAGES * _TOPK_PAGE:
+                    page_ids = pl.tile.gather(pages, page_indices, tmp)
+                else:
+                    # A scan chunk spans at most two pages; keep gathers within this bank.
+                    first_page = start // _TOPK_PAGE
+                    bank_valid = pl.min(8, table_width - first_page)
+                    bank_raw = pl.load(block_table, [request, first_page], [1, 8], valid_shape=[1, bank_valid])
+                    bank = pl.tile.fillpad(bank_raw, pad_value=pl.PadValue.zero)
+                    local_pages = pl.sub(page_indices, pl.cast(first_page, pl.INT32))
+                    page_ids = pl.tile.gather(bank, local_pages, tmp)
+                offsets = pl.sub(logical, pl.mul(page_indices, _TOPK_PAGE))
+                physical = pl.add(pl.mul(page_ids, _TOPK_PAGE), offsets)
+                pl.store(pl.tile.set_validshape(physical, 1, selected_count), [token, count], output)
+                count = count + selected_count
+    return output
+
+@pl.jit.inline(auto_scope=False)
 def select_index_topk(
-    index_scores: pl.Tensor,
+    index_scores: pl.Tensor[[T_DYN, CMP_POSITIONS_DYN], pl.FP32],
     block_table: pl.Tensor[[B_DYN, TABLE_DYN], pl.INT32],
     request_ids: pl.Tensor[[T_DYN], pl.INT32],
     output: pl.Tensor[[T_DYN, INDEX_TOPK], pl.INT32],
     num_tokens: pl.Scalar[pl.INT32],
     scores_ready: pl.Scalar[pl.TASK_ID],
 ):
+    """Select exact Top-512 indices from dynamic C1A score rows."""
     width = pl.tensor.dim(index_scores, 1)
-    # scores is device-only scratch; fence the reader explicitly.
-    with pl.spmd(32, name_hint="c1a_index_topk", deps=[scores_ready]) as topk_tid:
+    tokens = pl.tensor.dim(index_scores, 0)
+    leaf_count = (width + _TOPK_LEAF_TILE - 1) // _TOPK_LEAF_TILE
+    arena_rows = tokens * leaf_count
+    pair_arena = pl.create_tensor([arena_rows, _TOPK_PAIR_WIDTH], dtype=pl.FP32)
+    with pl.spmd(32, name_hint="c1a_index_topk_short", deps=[scores_ready]) as short_tid:
         worker = pl.tile.get_block_idx()
         for token in pl.range(worker, num_tokens, 32):
-            heap_bits = pl.tile.full([1, INDEX_TOPK], dtype=pl.INT32, value=-8388608)
-            heap = pl.reinterpret_view(heap_bits, pl.FP32)
-            for start in pl.range(0, width, 256):
-                scores = pl.load(
-                    index_scores, [token, start], [1, 256], valid_shape=[1, pl.min(256, width - start)]
+            if width <= INDEX_TOPK:
+                invalid_bits = pl.tile.full([1, 8], dtype=pl.INT32, value=_TOPK_INVALID_SCORE_BITS)
+                invalid_score = pl.tile.read(pl.reinterpret_view(invalid_bits, pl.FP32), [0, 0])
+                _materialize_index_topk(
+                    index_scores, block_table, request_ids, output,
+                    token, width, invalid_score, pl.cast(0, pl.INDEX),
                 )
-                for lane in pl.range(pl.min(256, width - start)):
-                    value = pl.tile.read(scores, [0, lane])
-                    minimum = pl.tile.read(heap, [0, 0])
-                    if value > minimum:
-                        node = pl.cast(0, pl.INDEX)
-                        moving = True
-                        for depth in pl.range(10):
-                            if moving:
-                                left = node * 2 + 1
-                                if left < INDEX_TOPK:
-                                    child = left
-                                    left_value = pl.tile.read(heap, [0, left])
-                                    if left + 1 < INDEX_TOPK:
-                                        right_value = pl.tile.read(heap, [0, left + 1])
-                                        if right_value < left_value:
-                                            child = left + 1
-                                    child_value = pl.tile.read(heap, [0, child])
-                                    if child_value < value:
-                                        pl.tile.write(heap, [0, node], child_value)
-                                        node = child
-                                    else:
-                                        moving = False
-                                else:
-                                    moving = False
-                        pl.tile.write(heap, [0, node], value)
-            cutoff = pl.tile.read(heap, [0, 0])
-            above = pl.cast(0, pl.INDEX)
-            for lane in pl.range(INDEX_TOPK):
-                value = pl.tile.read(heap, [0, lane])
-                if value > cutoff:
-                    above = above + 1
-            remaining = INDEX_TOPK - above
-            # Recreate -inf after the heap has overwritten its storage.
-            negative_bits = pl.tile.full([1, 8], dtype=pl.INT32, value=-8388608)
-            invalid_score = pl.tile.read(pl.reinterpret_view(negative_bits, pl.FP32), [0, 0])
-            selected = pl.tile.full([1, INDEX_TOPK], dtype=pl.INT32, value=-1)
-            count = pl.cast(0, pl.INDEX)
-            request = pl.cast(pl.read(request_ids, [token]), pl.INDEX)
-            for start in pl.range(0, width, 256):
-                scan_scores = pl.load(index_scores, [token, start], [1, 256],
-                                      valid_shape=[1, pl.min(256, width - start)])
-                for lane in pl.range(pl.min(256, width - start)):
-                    value = pl.tile.read(scan_scores, [0, lane])
-                    keep = value > cutoff
-                    if value == cutoff and value > invalid_score and remaining > 0:
-                        keep = True
-                        remaining = remaining - 1
-                    if keep and count < INDEX_TOPK:
-                        logical = start + lane
-                        page = pl.read(block_table, [request, logical // 128])
-                        physical = pl.cast(page * 128 + logical % 128, pl.INT32)
-                        pl.tile.write(selected, [0, count], physical)
-                        count = count + 1
-            pl.store(selected, [token, 0], output)
-    return topk_tid
+    total_leaves = pl.cast(num_tokens, pl.INDEX) * leaf_count
+    with pl.spmd(32, name_hint="c1a_index_topk_leaf", deps=[scores_ready]) as leaf_tid:
+        worker = pl.tile.get_block_idx()
+        for work in pl.range(worker, total_leaves, 32):
+            if width > INDEX_TOPK:
+                token = work // leaf_count
+                leaf = work - token * leaf_count
+                logical_begin = leaf * _TOPK_LEAF_TILE
+                valid_count = pl.min(_TOPK_LEAF_TILE, width - logical_begin)
+                if valid_count > 0:
+                    output_slot = token * leaf_count + leaf
+                    _sort_index_topk_leaf(index_scores, pair_arena, token, logical_begin, valid_count, output_slot)
+    with pl.spmd(32, name_hint="c1a_index_topk_merge", deps=[short_tid, leaf_tid]) as merge_tid:
+        worker = pl.tile.get_block_idx()
+        for token in pl.range(worker, num_tokens, 32):
+            if width > INDEX_TOPK:
+                base = token * leaf_count
+                count = leaf_count
+                # INT32 logical positions require at most 21 binary merge levels.
+                for _ in pl.range(21):
+                    if count > 1:
+                        output_count = (count + 1) // 2
+                        for output_slot in pl.range(output_count):
+                            left = base + output_slot * 2
+                            right = left + 1
+                            if right < base + count:
+                                _merge_index_topk_rows(pair_arena, left, right, base + output_slot)
+                            else:
+                                forwarded = pl.load(pair_arena, [left, 0], [1, _TOPK_PAIR_WIDTH])
+                                pl.store(forwarded, [base + output_slot, 0], pair_arena)
+                        count = output_count
+                root = pl.load(pair_arena, [base, 0], [1, _TOPK_PAIR_WIDTH])
+                root_scores = pl.tile.gather_mask(root, mask_pattern=pl.tile.MaskPattern.P0101)
+                cutoff = pl.tile.read(root_scores, [0, INDEX_TOPK - 1])
+                root_ones = pl.tile.full([1, INDEX_TOPK], dtype=pl.FP32, value=1.0)
+                above_flags = pl.tile.select(pl.tile.cmps(root_scores, cutoff, cmp_type=4), root_ones, 0.0)
+                sums64 = pl.col_sum(pl.reshape(above_flags, [8, 64]))
+                sums8 = pl.col_sum(pl.reshape(sums64, [8, 8]))
+                above = pl.cast(0, pl.INDEX)
+                for lane in pl.unroll(8):
+                    partial = pl.cast(pl.tile.read(sums8, [0, lane]), pl.INT32)
+                    above = above + pl.cast(partial, pl.INDEX)
+                _materialize_index_topk(
+                    index_scores, block_table, request_ids, output,
+                    token, width, cutoff, INDEX_TOPK - above,
+                )
+    return merge_tid
 
 
 @pl.jit.inline(auto_scope=False)
