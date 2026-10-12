@@ -59,6 +59,7 @@ CMP_MAX_BLOCKS = (MAX_SEQ_LEN // COMPRESS_RATIO + BLOCK_SIZE - 1) // BLOCK_SIZE
 
 # tiling
 H_TILE = 16
+QK_H_TILE = min(H, 64)
 MERGE_WORKERS = 48
 QK_PRE_LAUNCH = 2
 QK_TRANSFER_SLOTS = QK_PRE_LAUNCH + 1
@@ -227,7 +228,7 @@ def _sparse_attn_csa(
     attn_oi = pl.create_tensor([stats_heads, HEAD_DIM], dtype=pl.FP32)
 
     transfer_slots = NUM_QK_CORES * QK_TRANSFER_SLOTS
-    transfer_heads = transfer_slots * H
+    transfer_heads = transfer_slots * QK_H_TILE
     transfer_kv_rows = transfer_slots * ATTN_K_TILE
     kv_transfer = pl.create_tensor([transfer_kv_rows, HEAD_DIM], dtype=pl.BF16)
     score_transfer = pl.create_tensor([transfer_heads, ATTN_K_TILE], dtype=pl.FP32)
@@ -239,10 +240,12 @@ def _sparse_attn_csa(
     with pl.spmd(NUM_QK_CORES, name_hint="qk_pv", deps=[qk_plan_tid, rope_tid], allow_early_resolve=True) as qk_tid:
         qk_core = pl.tile.get_block_idx()
         pl.system.set_ffts(ffts_workspace)
-        for qk_t in pl.range(qk_core, t_dim, NUM_QK_CORES):
+        for qk_item in pl.range(qk_core, t_dim * (H // QK_H_TILE), NUM_QK_CORES):
+            qk_t = qk_item // (H // QK_H_TILE)
+            qk_head_base = (qk_item % (H // QK_H_TILE)) * QK_H_TILE
             qk_b = qk_t // S
             qk_q = pl.load(
-                q_flat, [qk_t * H, 0], [H, HEAD_DIM], target_memory=pl.MemorySpace.Mat,
+                q_flat, [qk_t * H + qk_head_base, 0], [QK_H_TILE, HEAD_DIM], target_memory=pl.MemorySpace.Mat,
             )
             qk_l1 = pl.create_tile([QK_TRANSFER_SLOTS * ATTN_K_TILE, HEAD_DIM], dtype=pl.BF16, target_memory=pl.MemorySpace.Mat)
             for qk_tick in pl.range(SPARSE_BLOCKS + QK_PRE_LAUNCH):
@@ -251,7 +254,7 @@ def _sparse_attn_csa(
                     if pl.read(valid_block_mask, [qk_t, qk_sb]) > 0:
                         qk_slot = qk_core * QK_TRANSFER_SLOTS + qk_sb % QK_TRANSFER_SLOTS
                         qk_kv_row = qk_slot * ATTN_K_TILE
-                        qk_transfer_row = qk_slot * H
+                        qk_transfer_row = qk_slot * QK_H_TILE
                         pl.system.sync_wait(QK_KV_READY_EVENT, pipe=pl.PipeType.MTE2, core_type=pl.KernelType.AIC)
                         qk_l1_row = (qk_sb % QK_TRANSFER_SLOTS) * ATTN_K_TILE
                         qk_l1 = pl.gather_row(
@@ -269,10 +272,10 @@ def _sparse_attn_csa(
                     pv_sb = qk_tick - QK_PRE_LAUNCH
                     if pl.read(valid_block_mask, [qk_t, pv_sb]) > 0:
                         pv_slot = qk_core * QK_TRANSFER_SLOTS + pv_sb % QK_TRANSFER_SLOTS
-                        pv_transfer_row = pv_slot * H
+                        pv_transfer_row = pv_slot * QK_H_TILE
                         pl.system.sync_wait(QK_PROB_READY_EVENT, pipe=pl.PipeType.MTE2, core_type=pl.KernelType.AIC)
                         pv_probability = pl.load(
-                            probability_transfer, [pv_transfer_row, 0], [H, ATTN_K_TILE],
+                            probability_transfer, [pv_transfer_row, 0], [QK_H_TILE, ATTN_K_TILE],
                             target_memory=pl.MemorySpace.Mat,
                         )
                         pv_l1_row = (pv_sb % QK_TRANSFER_SLOTS) * ATTN_K_TILE
@@ -286,12 +289,12 @@ def _sparse_attn_csa(
 
             for qk_aiv in pl.split_aiv(2, mode=pl.SplitMode.NONE):
                 pl.system.set_ffts(ffts_workspace)
-                qk_lane_head = qk_aiv * (H // 2)
+                qk_lane_head = qk_aiv * (QK_H_TILE // 2)
                 qk_lane_kv = qk_aiv * (ATTN_K_TILE // 2)
-                running_m = pl.load(attn_sink_col, [qk_lane_head, 0], [H // 2, 1], target_memory=pl.MemorySpace.Vec)
+                running_m = pl.load(attn_sink_col, [qk_head_base + qk_lane_head, 0], [QK_H_TILE // 2, 1], target_memory=pl.MemorySpace.Vec)
                 running_l = pl.tile.muls(running_m, 0.0)
-                running_left = pl.tile.full([H // 2, HEAD_DIM // 2], dtype=pl.FP32, value=0.0)
-                running_right = pl.tile.full([H // 2, HEAD_DIM // 2], dtype=pl.FP32, value=0.0)
+                running_left = pl.tile.full([QK_H_TILE // 2, HEAD_DIM // 2], dtype=pl.FP32, value=0.0)
+                running_right = pl.tile.full([QK_H_TILE // 2, HEAD_DIM // 2], dtype=pl.FP32, value=0.0)
                 for qk_tick, (m_iter, l_iter, left_iter, right_iter) in pl.range(
                     SPARSE_BLOCKS + QK_PRE_LAUNCH + 1,
                     init_values=(running_m, running_l, running_left, running_right),
@@ -301,7 +304,7 @@ def _sparse_attn_csa(
                         if pl.read(valid_block_mask, [qk_t, qk_sb]) > 0:
                             qk_slot = qk_core * QK_TRANSFER_SLOTS + qk_sb % QK_TRANSFER_SLOTS
                             qk_kv_row = qk_slot * ATTN_K_TILE
-                            qk_transfer_row = qk_slot * H
+                            qk_transfer_row = qk_slot * QK_H_TILE
                             qk_s0 = qk_sb * ATTN_K_TILE
                             qk_kv_half = pl.tile.full([ATTN_K_TILE // 2, HEAD_DIM], dtype=pl.BF16, value=0.0)
                             if qk_s0 < WIN:
@@ -336,11 +339,11 @@ def _sparse_attn_csa(
                         softmax_sb = qk_tick - 1
                         if pl.read(valid_block_mask, [qk_t, softmax_sb]) > 0:
                             qk_slot = qk_core * QK_TRANSFER_SLOTS + softmax_sb % QK_TRANSFER_SLOTS
-                            qk_transfer_row = qk_slot * H
+                            qk_transfer_row = qk_slot * QK_H_TILE
                             qk_s0 = softmax_sb * ATTN_K_TILE
                             pl.system.sync_wait(QK_SCORE_READY_EVENT, pipe=pl.PipeType.MTE2, core_type=pl.KernelType.AIV)
                             qk_scores_half = pl.load(
-                                score_transfer, [qk_transfer_row + qk_lane_head, 0], [H // 2, ATTN_K_TILE],
+                                score_transfer, [qk_transfer_row + qk_lane_head, 0], [QK_H_TILE // 2, ATTN_K_TILE],
                                 target_memory=pl.MemorySpace.Vec,
                             )
                             qk_bias = pl.load(
@@ -348,7 +351,7 @@ def _sparse_attn_csa(
                             )
                             qk_scaled = pl.mul(qk_scores_half, SOFTMAX_SCALE)
                             qk_masked = pl.col_expand_add(qk_scaled, qk_bias)
-                            qk_reduce_tmp = pl.create_tile([H // 2, ATTN_K_TILE], dtype=pl.FP32, target_memory=pl.MemorySpace.Vec)
+                            qk_reduce_tmp = pl.create_tile([QK_H_TILE // 2, ATTN_K_TILE], dtype=pl.FP32, target_memory=pl.MemorySpace.Vec)
                             qk_mi = pl.row_max(qk_masked, qk_reduce_tmp)
                             qk_exp = pl.exp(pl.row_expand_sub(qk_masked, qk_mi))
                             qk_li = pl.row_sum(qk_exp, qk_reduce_tmp)
@@ -371,21 +374,21 @@ def _sparse_attn_csa(
                         pv_sb = qk_tick - QK_PRE_LAUNCH - 1
                         if pl.read(valid_block_mask, [qk_t, pv_sb]) > 0:
                             pv_slot = qk_core * QK_TRANSFER_SLOTS + pv_sb % QK_TRANSFER_SLOTS
-                            pv_transfer_row = pv_slot * H
+                            pv_transfer_row = pv_slot * QK_H_TILE
                             pl.system.sync_wait(QK_PV_READY_EVENT, pipe=pl.PipeType.MTE2, core_type=pl.KernelType.AIV)
-                            pv_m = pl.load(mi_transfer, [pv_transfer_row + qk_lane_head, 0], [H // 2, 1], target_memory=pl.MemorySpace.Vec)
-                            pv_l = pl.load(li_transfer, [pv_transfer_row + qk_lane_head, 0], [H // 2, 1], target_memory=pl.MemorySpace.Vec)
+                            pv_m = pl.load(mi_transfer, [pv_transfer_row + qk_lane_head, 0], [QK_H_TILE // 2, 1], target_memory=pl.MemorySpace.Vec)
+                            pv_l = pl.load(li_transfer, [pv_transfer_row + qk_lane_head, 0], [QK_H_TILE // 2, 1], target_memory=pl.MemorySpace.Vec)
                             next_m = pl.maximum(m_iter, pv_m)
                             alpha = pl.exp(pl.sub(m_iter, next_m))
                             beta = pl.exp(pl.sub(pv_m, next_m))
                             next_l = pl.add(pl.mul(alpha, l_iter), pl.mul(beta, pv_l))
                             pv_left = pl.load(
-                                pv_transfer, [pv_transfer_row + qk_lane_head, 0], [H // 2, HEAD_DIM // 2],
+                                pv_transfer, [pv_transfer_row + qk_lane_head, 0], [QK_H_TILE // 2, HEAD_DIM // 2],
                                 target_memory=pl.MemorySpace.Vec,
                             )
                             next_left = pl.add(pl.row_expand_mul(left_iter, alpha), pl.row_expand_mul(pv_left, beta))
                             pv_right = pl.load(
-                                pv_transfer, [pv_transfer_row + qk_lane_head, HEAD_DIM // 2], [H // 2, HEAD_DIM // 2],
+                                pv_transfer, [pv_transfer_row + qk_lane_head, HEAD_DIM // 2], [QK_H_TILE // 2, HEAD_DIM // 2],
                                 target_memory=pl.MemorySpace.Vec,
                             )
                             next_right = pl.add(pl.row_expand_mul(right_iter, alpha), pl.row_expand_mul(pv_right, beta))
@@ -404,14 +407,14 @@ def _sparse_attn_csa(
                             m_swap_flat = pl.row_expand_add(m_swap_source, m_row_offsets_col)
                             m_swap_idx = pl.cast(m_swap_flat, target_type=pl.INT32)
                             m_gather_tmp = pl.create_tile([H_TILE, ROPE_DIM], dtype=pl.INT32)
-                            for pub_h in pl.unroll((H // 2) // H_TILE):
+                            for pub_h in pl.unroll((QK_H_TILE // 2) // H_TILE):
                                 pub_head = pub_h * H_TILE
-                                m_h0 = qk_lane_head + pub_head
+                                m_h0 = qk_head_base + qk_lane_head + pub_head
                                 # Extract ND rows before restoring column statistics, preserving head offsets.
-                                m_mi_row = pl.reshape(m_valid, [1, H // 2])
+                                m_mi_row = pl.reshape(m_valid, [1, QK_H_TILE // 2])
                                 m_mi_part = pl.tile.extract(m_mi_row, 0, pub_head, [1, H_TILE], target_memory=pl.MemorySpace.Vec)
                                 m_mi = pl.reshape(m_mi_part, [H_TILE, 1])
-                                m_li_row = pl.reshape(l_valid, [1, H // 2])
+                                m_li_row = pl.reshape(l_valid, [1, QK_H_TILE // 2])
                                 m_li_part = pl.tile.extract(m_li_row, 0, pub_head, [1, H_TILE], target_memory=pl.MemorySpace.Vec)
                                 m_li = pl.reshape(m_li_part, [H_TILE, 1])
                                 m_left = pl.slice(left_valid, [H_TILE, HEAD_DIM // 2], [pub_head, 0])
@@ -444,7 +447,7 @@ def _sparse_attn_csa(
                         m_after, l_after, left_after, right_after = pl.yield_(m_iter, l_iter, left_iter, right_iter)
                     running_m, running_l, running_left, running_right = pl.yield_(m_after, l_after, left_after, right_after)
                 if not FUSE_FINAL:
-                    qk_output_row = qk_t * H + qk_lane_head
+                    qk_output_row = qk_t * H + qk_head_base + qk_lane_head
                     pl.store(running_m, [qk_output_row, 0], attn_mi)
                     pl.store(running_l, [qk_output_row, 0], attn_li)
                     pl.store(running_left, [qk_output_row, 0], attn_oi)

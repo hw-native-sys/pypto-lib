@@ -9,6 +9,7 @@
 # ci: devices=2
 """DeepSeek-V4 decode output projections and their TP communication."""
 
+from math import gcd
 import sys
 
 import config
@@ -68,7 +69,7 @@ O_RS_REDUCE_WORKERS = 48   # 128 row blocks; 8 left 40 of 48 AIV idle
 O_RS_PUBLISH_WORKERS = 32
 O_RS_DEQUANT_WORKERS = 12    # per owner; 4 owners -> one AIV wave
 O_RS_PUT_T_TILE = 8
-O_RS_D_TILE = 4096
+O_RS_D_TILE = gcd(4096, D)
 LOCAL_T_PAD = (LOCAL_T + TOKEN_TILE - 1) // TOKEN_TILE * TOKEN_TILE
 T_PAD = LOCAL_T_PAD
 GROUP_T_PAD = TP_SIZE * LOCAL_T_PAD

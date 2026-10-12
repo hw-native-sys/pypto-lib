@@ -9,6 +9,8 @@
 """DeepSeek-V4 decode indexer projections, Top-K selection, and cache quantization."""
 
 
+from math import gcd
+
 import pypto.language as pl
 
 from config import (
@@ -70,9 +72,9 @@ QR_MM_N_TILE = 256
 QR_MM_T_PAD = ((T + QR_MM_ROW_TILE - 1) // QR_MM_ROW_TILE) * QR_MM_ROW_TILE
 DEQUANT_T_TILE = min(T, 8)
 HEAD_DIM_TILE = 32
-D_TILE = 512
 WEIGHTS_OK = 4  # Weights-projection K tile count
 WEIGHTS_K_TILE = D // WEIGHTS_OK
+D_TILE = gcd(512, WEIGHTS_K_TILE)
 QH_QUANT_TILE = 64
 QH_QUANT_WORKERS = 48  # Query Hadamard quantization workers
 QR_PROJ_WORKERS = 24  # Query projection workers
@@ -154,9 +156,9 @@ def indexer_topk_half_leaf(
     valid_count: pl.Scalar[pl.INDEX],
     output_slot: pl.Scalar[pl.INDEX],
 ) -> None:
-    """Sort a contiguous half-leaf and store its Top-512 pairs."""
+    """Sort a contiguous half-leaf and store its Top-K pairs."""
     logical_begin_i32 = pl.cast(logical_begin, pl.INT32)
-    if valid_count <= 512:
+    if valid_count <= 512 and IDX_TOPK == 512:
         short_indices = pl.add(pl.tile.arange(0, [1, 512], dtype=pl.INT32), logical_begin_i32)
         short_raw = pl.load(score_arena, [score_row, 0], [1, 512], valid_shape=[1, valid_count])
         short_scores = pl.tile.fillpad(short_raw, pad_value=pl.PadValue.min)
@@ -173,9 +175,9 @@ def indexer_topk_half_leaf(
         small_pairs = pl.sort32(small_scores, pl.reinterpret_view(small_indices, pl.UINT32))
         small_pairs = pl.mrgsort(small_pairs, block_len=64)
         small_pairs = pl.mrgsort(small_pairs, block_len=256)
-        small_left = pl.tile.slice(small_pairs, [1, TOPK_PAIR_WIDTH], [0, 0])
-        small_right = pl.tile.slice(small_pairs, [1, TOPK_PAIR_WIDTH], [0, 1024])
-        small_tmp = pl.tile.create([1, 2 * TOPK_PAIR_WIDTH], dtype=pl.FP32)
+        small_left = pl.tile.slice(small_pairs, [1, 1024], [0, 0])
+        small_right = pl.tile.slice(small_pairs, [1, 1024], [0, 1024])
+        small_tmp = pl.tile.create([1, 2048], dtype=pl.FP32)
         small_merged = pl.tile.mrgsort(small_left, small_right, tmp=small_tmp)
         small_top = pl.tile.slice(small_merged, [1, TOPK_PAIR_WIDTH], [0, 0])
         pl.store(small_top, [output_slot, 0], pair_arena)
@@ -277,7 +279,7 @@ def indexer_topk_leaf_publish(
     topk_scores: pl.Tensor[[T_DYN, IDX_TOPK], pl.FP32],
     topk_indices: pl.Tensor[[T_DYN, IDX_TOPK], pl.INT32],
 ) -> None:
-    """Sort one populated leaf and directly publish its Top-512 pairs."""
+    """Sort one populated leaf and directly publish its Top-K pairs."""
     if valid_count <= 2048:
         short_indices = pl.tile.arange(0, [1, 2048], dtype=pl.INT32)
         short_raw = pl.load(score_arena, [query, 0], [1, 2048], valid_shape=[1, valid_count])

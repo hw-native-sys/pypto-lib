@@ -9,6 +9,8 @@
 """DeepSeek-V4 hc_pre -- hyper-connection pre-mix, unified over decode and prefill."""
 
 
+from math import gcd
+
 import pypto.language as pl
 
 from config import FLASH as M, DECODE_BATCH, DECODE_SEQ, TP, PREFILL_BATCH, PREFILL_SEQ
@@ -38,7 +40,7 @@ PRE_POST_WORKERS = 16
 RMS_K_TILE = 512
 LINEAR_K_TILE = 256
 D_TILE = 256
-D_SPMD = 4096
+D_SPMD = gcd(4096, D)
 LINEAR_OK = 4
 LINEAR_K_PER_SPLIT = HC_DIM // LINEAR_OK
 LINEAR_WORKERS = 24  # hc_pre_linear workers, one per AIC
