@@ -10,6 +10,8 @@
 
 import pypto.language as pl
 
+from models.deepseek_v4_1_flash.sparse_attention import attend_packed
+
 from models.deepseek_v4_1_flash.config import (
     CMP_BLOCKS_DYN,
     COMPRESSED_CACHE_GROUP,
@@ -256,7 +258,7 @@ def publish_index_cache(
     return publish_tid
 
 
-@pl.jit.inline
+@pl.jit.inline(auto_scope=False)
 def attend_sparse_cache(
     query: pl.Tensor[[T_DYN, LOCAL_H * HEAD_DIM], pl.BF16],
     window_indices: pl.Tensor[[T_DYN, 128], pl.INT32],
@@ -272,183 +274,11 @@ def attend_sparse_cache(
     output: pl.Tensor[[T_DYN, LOCAL_H * HEAD_DIM], pl.BF16],
     num_tokens: pl.Scalar[pl.INT32],
 ):
-    """Merge window MXFP8 and compressed MXFP4 attention in one online softmax."""
-    window_rows = pl.tensor.dim(window_cache, 0) * 128
-    window_flat = pl.reshape(window_cache, [window_rows, HEAD_DIM])
-    window_scale_flat = pl.reshape(window_scale, [window_rows, HEAD_DIM // 32])
-    compressed_rows = pl.tensor.dim(compressed_cache, 0) * 128
-    compressed_flat = pl.reshape(compressed_cache, [compressed_rows, HEAD_DIM // 2])
-    compressed_scale_flat = pl.reshape(
-        compressed_scale,
-        [compressed_rows, HEAD_DIM // COMPRESSED_CACHE_GROUP],
+    """Gather each cache row once, then compute sparse attention on Cube."""
+    return attend_packed(
+        query, window_indices, window_cache, window_scale, compressed_indices,
+        compressed_cache, compressed_scale, sink, output, num_tokens,
     )
-    query_flat = pl.reshape(query, [pl.tensor.dim(query, 0) * LOCAL_H, HEAD_DIM])
-    output_flat = pl.reshape(output, [pl.tensor.dim(output, 0) * LOCAL_H, HEAD_DIM])
-    head_blocks = LOCAL_H // M_TILE
-    for block in pl.spmd(num_tokens * head_blocks, name_hint="c1a_sparse_attention"):
-        token = block // head_blocks
-        head = block % head_blocks * M_TILE
-        query_row = token * LOCAL_H + head
-        query_tile = query_flat[query_row:query_row + M_TILE, :]
-        maximum = pl.full([1, M_TILE], dtype=pl.FP32, value=-1e30)
-        denominator = pl.full([1, M_TILE], dtype=pl.FP32, value=0.0)
-        numerator = pl.full([M_TILE, HEAD_DIM], dtype=pl.FP32, value=0.0)
-        numerator_patch = pl.full([1, 16], dtype=pl.FP32, value=0.0)
-
-        for part in pl.range(128 // ATTENTION_TILE):
-            kv = pl.full([ATTENTION_TILE, HEAD_DIM], dtype=pl.BF16, value=0.0)
-            valid = pl.full([1, ATTENTION_TILE], dtype=pl.FP32, value=0.0)
-            for lane in pl.range(ATTENTION_TILE):
-                index_column = part * ATTENTION_TILE + lane
-                row_i32 = pl.read(window_indices, [token, index_column])
-                if row_i32 >= 0:
-                    row = pl.cast(row_i32, pl.INDEX)
-                    payload = pl.reshape(
-                        pl.cast(window_flat[row:row + 1, :], pl.FP32),
-                        [HEAD_DIM // 32, 32],
-                    )
-                    scale_row = pl.slice(
-                        window_scale_flat,
-                        [1, 32],
-                        [row, 0],
-                        valid_shape=[1, HEAD_DIM // 32],
-                    )
-                    raw_codes = pl.reinterpret_view(scale_row, pl.UINT8)
-                    signed_codes = pl.cast(pl.reinterpret_view(raw_codes, pl.INT8), pl.INT32)
-                    codes = pl.ands(signed_codes, 255)
-                    scale_bits = pl.maximum(pl.shls(codes, 23), 4194304)
-                    scale_value = pl.reinterpret_view(scale_bits, pl.FP32)
-                    scale = pl.reshape(scale_value[:, :HEAD_DIM // 32], [HEAD_DIM // 32, 1])
-                    decoded = pl.cast(pl.row_expand_mul(payload, scale), pl.BF16, mode="rint")
-                    kv[lane:lane + 1, :] = pl.reshape(decoded, [1, HEAD_DIM])
-                    pl.write(valid, [0, lane], 1.0)
-            scores = pl.mul(pl.matmul(query_tile, kv, b_trans=True), SOFTMAX_SCALE)
-            bias = pl.mul(pl.sub(valid, 1.0), 1e30)
-            scores = pl.col_expand_add(scores, bias)
-            next_maximum = pl.maximum(maximum, pl.reshape(pl.row_max(scores), [1, M_TILE]))
-            correction = pl.exp(pl.sub(maximum, next_maximum))
-            score_exp = pl.exp(pl.row_expand_sub(scores, pl.reshape(next_maximum, [M_TILE, 1])))
-            probability = pl.col_expand_mul(score_exp, valid)
-            denominator = pl.add(
-                pl.mul(denominator, correction),
-                pl.reshape(pl.row_sum(probability), [1, M_TILE]),
-            )
-            weighted = pl.matmul(pl.cast(probability, pl.BF16, mode="rint"), kv)
-            # Recompute the first A5 PV output vector on Vec before overwriting it below.
-            patch_products = pl.row_expand_mul(
-                pl.cast(kv[:, :16], pl.FP32),
-                pl.reshape(probability[0:1, :], [ATTENTION_TILE, 1]),
-            )
-            weighted_patch = pl.reshape(
-                pl.row_sum(pl.transpose(patch_products, axis1=0, axis2=1)),
-                [1, 16],
-            )
-            numerator_patch = pl.add(
-                pl.mul(numerator_patch, pl.read(correction, [0, 0])),
-                weighted_patch,
-            )
-            numerator = pl.add(
-                pl.row_expand_mul(numerator, pl.reshape(correction, [M_TILE, 1])),
-                weighted,
-            )
-            maximum = next_maximum
-
-        for part in pl.range(INDEX_TOPK // ATTENTION_TILE):
-            kv = pl.full([ATTENTION_TILE, HEAD_DIM], dtype=pl.BF16, value=0.0)
-            valid = pl.full([1, ATTENTION_TILE], dtype=pl.FP32, value=0.0)
-            for lane in pl.range(ATTENTION_TILE):
-                index_column = part * ATTENTION_TILE + lane
-                row_i32 = pl.read(compressed_indices, [token, index_column])
-                if row_i32 >= 0:
-                    row = pl.cast(row_i32, pl.INDEX)
-                    payload_bytes = compressed_flat[row:row + 1, :]
-                    payload_signed = pl.reinterpret_view(payload_bytes, pl.INT8)
-                    payload_i32 = pl.ands(pl.cast(payload_signed, pl.INT32), 255)
-                    low = pl.ands(payload_i32, 15)
-                    high = pl.ands(pl.shrs(payload_i32, 4), 15)
-                    low = pl.reshape(low, [1, HEAD_DIM // 2])
-                    high = pl.reshape(high, [1, HEAD_DIM // 2])
-                    combined_codes = pl.concat(low, high)
-                    output_ids = pl.tile.arange(0, [1, HEAD_DIM], dtype=pl.INT32)
-                    pair_ids = pl.shrs(output_ids, 1)
-                    parity = pl.ands(output_ids, 1)
-                    code_indices = pl.add(pair_ids, pl.mul(parity, HEAD_DIM // 2))
-                    payload_codes = pl.gather(combined_codes, index=code_indices)
-                    magnitude_codes = pl.ands(payload_codes, 7)
-                    magnitude = pl.mul(pl.cast(magnitude_codes, pl.FP32), 0.5)
-                    extra = pl.minimum(pl.maximum(pl.sub(magnitude_codes, 4), 0), 1)
-                    magnitude = pl.add(
-                        magnitude,
-                        pl.mul(pl.cast(extra, pl.FP32), 0.5),
-                    )
-                    extra = pl.minimum(pl.maximum(pl.sub(magnitude_codes, 5), 0), 1)
-                    magnitude = pl.add(
-                        magnitude,
-                        pl.mul(pl.cast(extra, pl.FP32), 0.5),
-                    )
-                    extra = pl.minimum(pl.maximum(pl.sub(magnitude_codes, 6), 0), 1)
-                    magnitude = pl.add(
-                        magnitude,
-                        pl.mul(pl.cast(extra, pl.FP32), 1.5),
-                    )
-                    sign = pl.cast(pl.ands(pl.shrs(payload_codes, 3), 1), pl.FP32)
-                    sign_value = pl.add(pl.mul(sign, -2.0), 1.0)
-                    decoded_payload = pl.mul(magnitude, sign_value)
-                    payload = pl.reshape(
-                        decoded_payload,
-                        [HEAD_DIM // COMPRESSED_CACHE_GROUP, COMPRESSED_CACHE_GROUP],
-                    )
-                    scale = pl.reshape(
-                        pl.cast(compressed_scale_flat[row:row + 1, :], pl.FP32),
-                        [HEAD_DIM // COMPRESSED_CACHE_GROUP, 1],
-                    )
-                    decoded = pl.cast(pl.row_expand_mul(payload, scale), pl.BF16, mode="rint")
-                    kv[lane:lane + 1, :] = pl.reshape(decoded, [1, HEAD_DIM])
-                    pl.write(valid, [0, lane], 1.0)
-            scores = pl.mul(pl.matmul(query_tile, kv, b_trans=True), SOFTMAX_SCALE)
-            bias = pl.mul(pl.sub(valid, 1.0), 1e30)
-            scores = pl.col_expand_add(scores, bias)
-            next_maximum = pl.maximum(maximum, pl.reshape(pl.row_max(scores), [1, M_TILE]))
-            correction = pl.exp(pl.sub(maximum, next_maximum))
-            score_exp = pl.exp(pl.row_expand_sub(scores, pl.reshape(next_maximum, [M_TILE, 1])))
-            probability = pl.col_expand_mul(score_exp, valid)
-            denominator = pl.add(
-                pl.mul(denominator, correction),
-                pl.reshape(pl.row_sum(probability), [1, M_TILE]),
-            )
-            weighted = pl.matmul(pl.cast(probability, pl.BF16, mode="rint"), kv)
-            # Recompute the first A5 PV output vector on Vec before overwriting it below.
-            patch_products = pl.row_expand_mul(
-                pl.cast(kv[:, :16], pl.FP32),
-                pl.reshape(probability[0:1, :], [ATTENTION_TILE, 1]),
-            )
-            weighted_patch = pl.reshape(
-                pl.row_sum(pl.transpose(patch_products, axis1=0, axis2=1)),
-                [1, 16],
-            )
-            numerator_patch = pl.add(
-                pl.mul(numerator_patch, pl.read(correction, [0, 0])),
-                weighted_patch,
-            )
-            numerator = pl.add(
-                pl.row_expand_mul(numerator, pl.reshape(correction, [M_TILE, 1])),
-                weighted,
-            )
-            maximum = next_maximum
-
-        sinks = pl.reshape(sink[head:head + M_TILE], [1, M_TILE])
-        final_maximum = pl.maximum(maximum, sinks)
-        correction = pl.exp(pl.sub(maximum, final_maximum))
-        denominator = pl.add(
-            pl.mul(denominator, correction),
-            pl.exp(pl.sub(sinks, final_maximum)),
-        )
-        normalization = pl.reshape(pl.div(correction, denominator), [M_TILE, 1])
-        result = pl.row_expand_mul(numerator, normalization)
-        output_flat[query_row:query_row + M_TILE, :] = pl.cast(result, pl.BF16, mode="rint")
-        patch_result = pl.mul(numerator_patch, pl.read(normalization, [0, 0]))
-        output_flat[query_row:query_row + 1, :16] = pl.cast(patch_result, pl.BF16, mode="rint")
-    return output
 
 
 @pl.jit.inline(auto_scope=False)

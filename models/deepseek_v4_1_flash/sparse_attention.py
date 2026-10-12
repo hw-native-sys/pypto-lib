@@ -1,0 +1,604 @@
+# Copyright (c) PyPTO Contributors.
+# This program is free software, you can redistribute it and/or modify it under the terms and conditions of
+# CANN Open Software License Agreement Version 2.0 (the "License").
+# Please refer to the License for details. You may not use this file except in compliance with the License.
+# THIS SOFTWARE IS PROVIDED ON AN "AS IS" BASIS, WITHOUT WARRANTIES OF ANY KIND, EITHER EXPRESS OR IMPLIED,
+# INCLUDING BUT NOT LIMITED TO NON-INFRINGEMENT, MERCHANTABILITY, OR FITNESS FOR A PARTICULAR PURPOSE.
+# See LICENSE in the root of the software repository for the full text of the License.
+# -----------------------------------------------------------------------------------------------------------
+"""PyPTO sparse MLA with packed-cache dequantization and sink-aware Cube attention."""
+
+# ci: no-sim
+
+import sys
+from pathlib import Path
+
+if __package__ in (None, ""):
+    sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
+
+import pypto.language as pl
+
+from models.deepseek_v4_1_flash.config import (
+    CMP_BLOCKS_DYN, HEAD_DIM, INDEX_TOPK, LOCAL_H, ORI_BLOCKS_DYN, T_DYN, TP_SIZE,
+)
+
+# Dynamic shape variables.
+SELECTED_ROWS = pl.dynamic("SPARSE_SELECTED_ROWS")
+BF16_HEADS = pl.dynamic("SPARSE_BF16_HEADS")
+BF16_PAGES_W = pl.dynamic("SPARSE_BF16_PAGES_W")
+BF16_PAGES_C = pl.dynamic("SPARSE_BF16_PAGES_C")
+
+# Model config.
+SELECTED_KEYS = 128 + INDEX_TOPK
+SCALE = HEAD_DIM**-0.5
+FP4_FP16_BASE = 0x3800
+FP4_FP16_SHIFT = 9
+FP4_SIGN_SHIFT = 12
+
+# Tiling.
+CUBE_HEADS = max(16, LOCAL_H)
+HEAD_TILE = min(32, CUBE_HEADS)
+QUERY_HEAD_TILE = min(16, LOCAL_H)
+KEY_TILE = 128
+GATHER_KEY_TILE = 32
+TOKEN_TILE = 512
+WORKERS = 32
+
+
+@pl.jit.inline(auto_scope=False)
+def gather_packed(
+    window: pl.Tensor[[ORI_BLOCKS_DYN, 128, 1, HEAD_DIM], pl.FP8E4M3FN],
+    window_scale: pl.Tensor[[ORI_BLOCKS_DYN, 128, 1, HEAD_DIM // 32], pl.FP8E8M0],
+    compressed: pl.Tensor[[CMP_BLOCKS_DYN, 128, 1, HEAD_DIM // 2], pl.UINT8],
+    compressed_scale: pl.Tensor[[CMP_BLOCKS_DYN, 128, 1, HEAD_DIM // 16], pl.FP8E4M3FN],
+    wi: pl.Tensor[[T_DYN, 128], pl.INT32],
+    ci: pl.Tensor[[T_DYN, INDEX_TOPK], pl.INT32],
+    selected: pl.Tensor[[SELECTED_ROWS, SELECTED_KEYS, HEAD_DIM], pl.BF16],
+    indices: pl.Tensor[[SELECTED_ROWS, SELECTED_KEYS], pl.INT32],
+    num_tokens: pl.Scalar[pl.INT32],
+    ready: pl.Scalar[pl.TASK_ID],
+):
+    """Gather packed cache rows and dequantize them once for all query heads."""
+    window_rows = pl.tensor.dim(window, 0) * 128
+    compressed_rows = pl.tensor.dim(compressed, 0) * 128
+    w = pl.reshape(window, [window_rows, HEAD_DIM])
+    ws = pl.reshape(window_scale, [window_rows, HEAD_DIM // 32])
+    c = pl.reshape(compressed, [compressed_rows, HEAD_DIM // 2])
+    cs = pl.reshape(compressed_scale, [compressed_rows, HEAD_DIM // 16])
+    selected_rows = pl.tensor.dim(selected, 0) * SELECTED_KEYS
+    dst = pl.reshape(selected, [selected_rows, HEAD_DIM])
+    workers = pl.max(1, pl.min(num_tokens * (SELECTED_KEYS // GATHER_KEY_TILE), WORKERS))
+    with pl.spmd(workers, name_hint="sparse_packed_gather", deps=[ready]) as gathered:
+        worker = pl.tile.get_block_idx()
+        for block in pl.range(worker, num_tokens * (SELECTED_KEYS // GATHER_KEY_TILE), workers):
+            token = block // (SELECTED_KEYS // GATHER_KEY_TILE)
+            column = block % (SELECTED_KEYS // GATHER_KEY_TILE) * GATHER_KEY_TILE
+            if column < 128:
+                ids = pl.tile.load(wi, [token, column], [1, GATHER_KEY_TILE])
+                safe_ids = pl.maximum(ids, 0)
+                w_payload = pl.tile.create([GATHER_KEY_TILE, HEAD_DIM], dtype=pl.FP8E4M3FN)
+                w_factors = pl.tile.create([GATHER_KEY_TILE, 32], dtype=pl.FP8E8M0)
+                for lane in pl.range(GATHER_KEY_TILE):
+                    physical = pl.cast(pl.tile.read(safe_ids, [0, lane]), pl.INDEX)
+                    w_payload = pl.tile.gather_row(w_payload, w, [lane, 0], [physical, 0], [1, HEAD_DIM])
+                    w_factors = pl.tile.gather_row(w_factors, ws, [lane, 0], [physical, 0], [1, HEAD_DIM // 32])
+                w_bytes = pl.reinterpret_view(w_factors, pl.UINT8)
+                w_signed = pl.reinterpret_view(w_bytes, pl.INT8)
+                w_wide = pl.cast(w_signed, pl.INT32)
+                w_codes = pl.ands(w_wide, 255)
+                w_exponents = pl.shls(w_codes, 23)
+                w_scale_bits = pl.maximum(w_exponents, 4194304)
+                # Compact sixteen scale codes from each padded 32-byte row.
+                w_columns = pl.tile.arange(0, [1, GATHER_KEY_TILE * (HEAD_DIM // 32)], dtype=pl.INT32)
+                w_row_ids = pl.shrs(w_columns, 4)
+                w_row_bias = pl.shls(w_row_ids, 4)
+                w_order = pl.add(w_columns, w_row_bias)
+                w_gather_tmp = pl.tile.create([1, GATHER_KEY_TILE * (HEAD_DIM // 32)], dtype=pl.INT32)
+                w_valid_bits = pl.tile.gather(w_scale_bits, w_order, w_gather_tmp)
+                w_scales = pl.reinterpret_view(w_valid_bits, pl.FP32)
+                w_scale_column = pl.reshape(w_scales, [GATHER_KEY_TILE * (HEAD_DIM // 32), 1])
+                w_values = pl.cast(w_payload, pl.FP32)
+                w_grouped = pl.reshape(w_values, [GATHER_KEY_TILE * (HEAD_DIM // 32), 32])
+                w_scaled = pl.row_expand_mul(w_grouped, w_scale_column)
+                w_decoded = pl.cast(w_scaled, pl.BF16, mode="rint")
+                decoded = pl.reshape(w_decoded, [GATHER_KEY_TILE, HEAD_DIM])
+            else:
+                ids = pl.tile.load(ci, [token, column - 128], [1, GATHER_KEY_TILE])
+                safe_ids = pl.maximum(ids, 0)
+                c_payload = pl.tile.create([GATHER_KEY_TILE, HEAD_DIM // 2], dtype=pl.UINT8)
+                c_factors = pl.tile.create([GATHER_KEY_TILE, HEAD_DIM // 16], dtype=pl.FP8E4M3FN)
+                for lane in pl.range(GATHER_KEY_TILE):
+                    physical = pl.cast(pl.tile.read(safe_ids, [0, lane]), pl.INDEX)
+                    c_payload = pl.tile.gather_row(c_payload, c, [lane, 0], [physical, 0], [1, HEAD_DIM // 2])
+                    c_factors = pl.tile.gather_row(c_factors, cs, [lane, 0], [physical, 0], [1, HEAD_DIM // 16])
+                c_signed = pl.reinterpret_view(c_payload, pl.INT8)
+                c_wide = pl.cast(c_signed, pl.INT16)
+                byte_values = pl.ands(c_wide, 255)
+                low = pl.ands(byte_values, 15)
+                high = pl.shrs(byte_values, 4)
+                # E2M1 magnitudes map exactly to FP16 exponent and mantissa bits.
+                low_code = pl.ands(low, 7)
+                low_exponent = pl.shls(low_code, FP4_FP16_SHIFT)
+                low_base = pl.add(low_exponent, FP4_FP16_BASE)
+                low_subnormal = pl.minimum(pl.sub(low_code, 2), 0)
+                low_adjust = pl.shls(low_subnormal, FP4_FP16_SHIFT)
+                low_magnitude = pl.add(low_base, low_adjust)
+                low_nonzero = pl.minimum(low_code, 1)
+                low_bits = pl.mul(low_magnitude, low_nonzero)
+                low_sign_code = pl.ands(low, 8)
+                low_sign = pl.shls(low_sign_code, FP4_SIGN_SHIFT)
+                low_signed = pl.or_(low_bits, low_sign)
+                low_values = pl.reinterpret_view(low_signed, pl.FP16)
+                high_code = pl.ands(high, 7)
+                high_exponent = pl.shls(high_code, FP4_FP16_SHIFT)
+                high_base = pl.add(high_exponent, FP4_FP16_BASE)
+                high_subnormal = pl.minimum(pl.sub(high_code, 2), 0)
+                high_adjust = pl.shls(high_subnormal, FP4_FP16_SHIFT)
+                high_magnitude = pl.add(high_base, high_adjust)
+                high_nonzero = pl.minimum(high_code, 1)
+                high_bits = pl.mul(high_magnitude, high_nonzero)
+                high_sign_code = pl.ands(high, 8)
+                high_sign = pl.shls(high_sign_code, FP4_SIGN_SHIFT)
+                high_signed = pl.or_(high_bits, high_sign)
+                high_values = pl.reinterpret_view(high_signed, pl.FP16)
+                # Each mask scatter zero-fills its unused lanes.
+                low_lanes = pl.tile.full([GATHER_KEY_TILE, HEAD_DIM], dtype=pl.FP16, value=0.0)
+                high_lanes = pl.tile.full([GATHER_KEY_TILE, HEAD_DIM], dtype=pl.FP16, value=0.0)
+                low_lanes = pl.tile.scatter_mask(low_lanes, low_values, pl.tile.MaskPattern.P0101)
+                high_lanes = pl.tile.scatter_mask(high_lanes, high_values, pl.tile.MaskPattern.P1010)
+                low_lane_bits = pl.reinterpret_view(low_lanes, pl.INT16)
+                high_lane_bits = pl.reinterpret_view(high_lanes, pl.INT16)
+                c_value_bits = pl.or_(low_lane_bits, high_lane_bits)
+                c_values = pl.reinterpret_view(c_value_bits, pl.FP16)
+                c_grouped = pl.reshape(c_values, [GATHER_KEY_TILE * (HEAD_DIM // 16), 16])
+                # Finite E2M1 x E4M3 products are exactly representable in FP16.
+                c_scales = pl.cast(c_factors, pl.FP16, mode="rint")
+                c_scale_column = pl.reshape(c_scales, [GATHER_KEY_TILE * (HEAD_DIM // 16), 1])
+                c_scaled = pl.row_expand_mul(c_grouped, c_scale_column)
+                c_decoded = pl.cast(c_scaled, pl.BF16, mode="rint")
+                decoded = pl.reshape(c_decoded, [GATHER_KEY_TILE, HEAD_DIM])
+            pl.tile.store(decoded, [token * SELECTED_KEYS + column, 0], dst)
+            zero = pl.tile.full([1, HEAD_DIM], dtype=pl.BF16, value=0.0)
+            for lane in pl.range(GATHER_KEY_TILE):
+                if pl.tile.read(ids, [0, lane]) < 0:
+                    pl.tile.store(zero, [token * SELECTED_KEYS + column + lane, 0], dst)
+            pl.tile.store(ids, [token, column], indices)
+    return selected, indices, gathered
+
+
+@pl.jit.inline(auto_scope=False)
+def _attend_cube(
+    query: pl.Tensor[[T_DYN, CUBE_HEADS * HEAD_DIM], pl.BF16],
+    selected: pl.Tensor[[SELECTED_ROWS, SELECTED_KEYS, HEAD_DIM], pl.BF16],
+    indices: pl.Tensor[[SELECTED_ROWS, SELECTED_KEYS], pl.INT32],
+    sink: pl.Tensor[[CUBE_HEADS], pl.FP32],
+    output: pl.Tensor[[T_DYN, CUBE_HEADS * HEAD_DIM], pl.BF16],
+    num_tokens: pl.Scalar[pl.INT32],
+    selected_ready: pl.Scalar[pl.TASK_ID],
+    query_ready: pl.Scalar[pl.TASK_ID],
+):
+    tokens = pl.tensor.dim(query, 0)
+    head_rows = tokens * CUBE_HEADS
+    cache_rows = pl.tensor.dim(selected, 0) * SELECTED_KEYS
+    qflat = pl.reshape(query, [head_rows, HEAD_DIM])
+    kflat = pl.reshape(selected, [cache_rows, HEAD_DIM])
+    oflat = pl.reshape(output, [head_rows, HEAD_DIM])
+    workers = pl.max(1, pl.min(num_tokens * ((CUBE_HEADS + HEAD_TILE - 1) // HEAD_TILE), WORKERS))
+    with pl.spmd(workers, name_hint="sparse_online_cube", deps=[selected_ready, query_ready], optimizations=[pl.cross_core_slot(slot_num=1)]) as attended:
+        worker = pl.tile.get_block_idx()
+        for block in pl.range(worker, num_tokens * ((CUBE_HEADS + HEAD_TILE - 1) // HEAD_TILE), workers):
+            token = block // ((CUBE_HEADS + HEAD_TILE - 1) // HEAD_TILE)
+            head = block % ((CUBE_HEADS + HEAD_TILE - 1) // HEAD_TILE) * HEAD_TILE
+            q0 = token * CUBE_HEADS + head
+            q = qflat[q0:q0 + HEAD_TILE, :]
+            maximum = pl.full([1, HEAD_TILE], dtype=pl.FP32, value=-1e30)
+            denominator = pl.full([1, HEAD_TILE], dtype=pl.FP32, value=0.0)
+            numerator = pl.full([HEAD_TILE, HEAD_DIM], dtype=pl.FP32, value=0.0)
+            for part in pl.range(SELECTED_KEYS // KEY_TILE):
+                k0 = token * SELECTED_KEYS + part * KEY_TILE
+                kv = kflat[k0:k0 + KEY_TILE, :]
+                qk = pl.matmul(q, kv, b_trans=True, out_dtype=pl.FP32)
+                scores = pl.mul(qk, SCALE)
+                idx0 = part * KEY_TILE
+                idx = pl.cast(indices[token:token + 1, idx0:idx0 + KEY_TILE], pl.FP32)
+                valid = pl.add(idx, 1.0)
+                valid = pl.maximum(valid, 0.0)
+                valid = pl.minimum(valid, 1.0)
+                penalty = pl.mul(pl.sub(valid, 1.0), 1e30)
+                scores = pl.col_expand_add(scores, penalty)
+                score_max = pl.reshape(pl.row_max(scores), [1, HEAD_TILE])
+                next_max = pl.maximum(maximum, score_max)
+                correction = pl.exp(pl.sub(maximum, next_max))
+                max_col = pl.reshape(next_max, [HEAD_TILE, 1])
+                shifted = pl.row_expand_sub(scores, max_col)
+                probabilities = pl.exp(shifted)
+                probabilities = pl.col_expand_mul(probabilities, valid)
+                previous_denominator = pl.mul(denominator, correction)
+                part_denominator = pl.reshape(pl.row_sum(probabilities), [1, HEAD_TILE])
+                denominator = pl.add(previous_denominator, part_denominator)
+                weights = pl.cast(probabilities, pl.BF16, mode="rint")
+                weighted = pl.matmul(weights, kv, out_dtype=pl.FP32)
+                correction_col = pl.reshape(correction, [HEAD_TILE, 1])
+                previous_numerator = pl.row_expand_mul(numerator, correction_col)
+                numerator = pl.add(previous_numerator, weighted)
+                maximum = next_max
+            sinks = pl.reshape(sink[head:head + HEAD_TILE], [1, HEAD_TILE])
+            final_max = pl.maximum(maximum, sinks)
+            correction = pl.exp(pl.sub(maximum, final_max))
+            corrected_denominator = pl.mul(denominator, correction)
+            sink_weight = pl.exp(pl.sub(sinks, final_max))
+            denominator = pl.add(corrected_denominator, sink_weight)
+            multiplier = pl.reshape(pl.div(correction, denominator), [HEAD_TILE, 1])
+            result = pl.row_expand_mul(numerator, multiplier)
+            result = pl.cast(result, pl.BF16, mode="rint")
+            oflat[q0:q0 + HEAD_TILE, :] = result
+    return attended
+
+
+@pl.jit.inline(auto_scope=False)
+def _attend_padded(
+    query: pl.Tensor[[T_DYN, LOCAL_H * HEAD_DIM], pl.BF16],
+    selected: pl.Tensor[[SELECTED_ROWS, SELECTED_KEYS, HEAD_DIM], pl.BF16],
+    indices: pl.Tensor[[SELECTED_ROWS, SELECTED_KEYS], pl.INT32],
+    sink: pl.Tensor[[LOCAL_H], pl.FP32],
+    output: pl.Tensor[[T_DYN, LOCAL_H * HEAD_DIM], pl.BF16],
+    num_tokens: pl.Scalar[pl.INT32],
+    selected_ready: pl.Scalar[pl.TASK_ID],
+    query_ready: pl.Scalar[pl.TASK_ID],
+):
+    # Cube uses at least 16 rows. TP8 retains only its eight real heads.
+    rows = pl.tensor.dim(query, 0)
+    qflat = pl.reshape(query, [rows * LOCAL_H, HEAD_DIM])
+    padded_query = pl.create_tensor([rows, CUBE_HEADS * HEAD_DIM], dtype=pl.BF16)
+    pqflat = pl.reshape(padded_query, [rows * CUBE_HEADS, HEAD_DIM])
+    padded_sink = pl.create_tensor([CUBE_HEADS], dtype=pl.FP32)
+    padded_sink_row = pl.reshape(padded_sink, [1, CUBE_HEADS])
+    sink_row = pl.reshape(sink, [1, LOCAL_H])
+    workers = pl.max(1, pl.min(num_tokens, WORKERS))
+    with pl.spmd(workers, name_hint="sparse_pad_heads", deps=[query_ready]) as padded:
+        worker = pl.tile.get_block_idx()
+        if worker == 0:
+            sinks = pl.full([1, CUBE_HEADS], dtype=pl.FP32, value=0.0)
+            sinks[:, 0:LOCAL_H] = sink_row[:, :]
+            padded_sink_row[:, :] = sinks
+        for token in pl.range(worker, num_tokens, workers):
+            q0 = token * LOCAL_H
+            pq0 = token * CUBE_HEADS
+            q = pl.full([CUBE_HEADS, HEAD_DIM], dtype=pl.BF16, value=0.0)
+            q[0:LOCAL_H, :] = qflat[q0:q0 + LOCAL_H, :]
+            pqflat[pq0:pq0 + CUBE_HEADS, :] = q
+
+    padded_output = pl.create_tensor([rows, CUBE_HEADS * HEAD_DIM], dtype=pl.BF16)
+    cube_ready = _attend_cube(
+        padded_query, selected, indices, padded_sink, padded_output,
+        num_tokens, selected_ready, padded,
+    )
+    poflat = pl.reshape(padded_output, [rows * CUBE_HEADS, HEAD_DIM])
+    oflat = pl.reshape(output, [rows * LOCAL_H, HEAD_DIM])
+    with pl.spmd(workers, name_hint="sparse_unpad_heads", deps=[cube_ready]) as attended:
+        worker = pl.tile.get_block_idx()
+        for token in pl.range(worker, num_tokens, workers):
+            p0 = token * CUBE_HEADS
+            o0 = token * LOCAL_H
+            oflat[o0:o0 + LOCAL_H, :] = poflat[p0:p0 + LOCAL_H, :]
+    return attended
+
+
+attend_selected = _attend_cube if LOCAL_H >= 16 else _attend_padded
+
+
+@pl.jit.inline(auto_scope=False)
+def _attend_bf16_block(
+    query: pl.Tensor[[T_DYN, BF16_HEADS, HEAD_DIM], pl.FP32],
+    window: pl.Tensor[[BF16_PAGES_W, 128, HEAD_DIM], pl.FP32],
+    wi: pl.Tensor[[T_DYN, 128], pl.INT32],
+    compressed: pl.Tensor[[BF16_PAGES_C, 128, HEAD_DIM], pl.FP32],
+    ci: pl.Tensor[[T_DYN, INDEX_TOPK], pl.INT32],
+    sink: pl.Tensor[[BF16_HEADS], pl.FP32],
+    extents: pl.Tensor[[T_DYN, 2], pl.INT32],
+    output: pl.Tensor[[T_DYN, BF16_HEADS, HEAD_DIM], pl.FP32],
+    previous: pl.Scalar[pl.TASK_ID],
+):
+    rows = pl.tensor.dim(query, 0)
+    head_rows = rows * LOCAL_H
+    qflat = pl.reshape(query, [head_rows, HEAD_DIM])
+    qbf16 = pl.create_tensor([rows, LOCAL_H * HEAD_DIM], dtype=pl.BF16)
+    qbflat = pl.reshape(qbf16, [head_rows, HEAD_DIM])
+    workers_q = pl.max(1, pl.min(rows * (LOCAL_H // QUERY_HEAD_TILE), WORKERS))
+    with pl.spmd(workers_q, name_hint="sparse_bf16_query", deps=[previous]) as query_ready:
+        worker = pl.tile.get_block_idx()
+        for block in pl.range(worker, rows * (LOCAL_H // QUERY_HEAD_TILE), workers_q):
+            q0 = block * QUERY_HEAD_TILE
+            q_values = qflat[q0:q0 + QUERY_HEAD_TILE, :]
+            qbflat[q0:q0 + QUERY_HEAD_TILE, :] = pl.cast(q_values, pl.BF16, mode="rint")
+
+    wrows = pl.tensor.dim(window, 0) * 128
+    crows = pl.tensor.dim(compressed, 0) * 128
+    w = pl.reshape(window, [wrows, HEAD_DIM])
+    c = pl.reshape(compressed, [crows, HEAD_DIM])
+    selected = pl.create_tensor([rows, SELECTED_KEYS, HEAD_DIM], dtype=pl.BF16)
+    dst = pl.reshape(selected, [rows * SELECTED_KEYS, HEAD_DIM])
+    indices = pl.create_tensor([rows, SELECTED_KEYS], dtype=pl.INT32)
+    workers_kv = pl.max(1, pl.min(rows * (SELECTED_KEYS // 16), WORKERS))
+    with pl.spmd(workers_kv, name_hint="sparse_bf16_gather", deps=[previous]) as selected_ready:
+        worker = pl.tile.get_block_idx()
+        for block in pl.range(worker, rows * (SELECTED_KEYS // 16), workers_kv):
+            token = block // (SELECTED_KEYS // 16)
+            column = block % (SELECTED_KEYS // 16) * 16
+            ww = pl.read(extents, [token, 0])
+            cc = pl.read(extents, [token, 1])
+            values = pl.tile.full([16, HEAD_DIM], dtype=pl.BF16, value=0.0)
+            valid = pl.tile.full([1, 16], dtype=pl.INT32, value=-1)
+            for lane in pl.range(16):
+                position = column + lane
+                row = pl.cast(-1, pl.INT32)
+                value = pl.tile.full([1, HEAD_DIM], dtype=pl.FP32, value=0.0)
+                if position < ww:
+                    row = pl.read(wi, [token, position])
+                    if row >= 0:
+                        value = pl.tile.load(w, [pl.cast(row, pl.INDEX), 0], [1, HEAD_DIM])
+                elif position < ww + cc:
+                    row = pl.read(ci, [token, position - ww])
+                    if row >= 0:
+                        value = pl.tile.load(c, [pl.cast(row, pl.INDEX), 0], [1, HEAD_DIM])
+                converted = pl.cast(value, pl.BF16, mode="rint")
+                values = pl.tile.assemble(values, converted, [lane, 0])
+                pl.tile.write(valid, [0, lane], row)
+            pl.tile.store(values, [token * SELECTED_KEYS + column, 0], dst)
+            pl.tile.store(valid, [token, column], indices)
+
+    result = pl.create_tensor([rows, LOCAL_H * HEAD_DIM], dtype=pl.BF16)
+    attended = attend_selected(qbf16, selected, indices, sink, result, rows, selected_ready, query_ready)
+    rflat = pl.reshape(result, [head_rows, HEAD_DIM])
+    oflat = pl.reshape(output, [head_rows, HEAD_DIM])
+    with pl.spmd(workers_q, name_hint="sparse_bf16_output", deps=[attended]) as converted:
+        worker = pl.tile.get_block_idx()
+        for block in pl.range(worker, rows * (LOCAL_H // QUERY_HEAD_TILE), workers_q):
+            q0 = block * QUERY_HEAD_TILE
+            out_values = rflat[q0:q0 + QUERY_HEAD_TILE, :]
+            oflat[q0:q0 + QUERY_HEAD_TILE, :] = pl.cast(out_values, pl.FP32)
+    return converted
+
+
+@pl.jit.inline(auto_scope=False)
+def _attend_packed_block(
+    query: pl.Tensor[[T_DYN, LOCAL_H * HEAD_DIM], pl.BF16],
+    window_indices: pl.Tensor[[T_DYN, 128], pl.INT32],
+    window: pl.Tensor[[ORI_BLOCKS_DYN, 128, 1, HEAD_DIM], pl.FP8E4M3FN],
+    window_scale: pl.Tensor[[ORI_BLOCKS_DYN, 128, 1, HEAD_DIM // 32], pl.FP8E8M0],
+    compressed_indices: pl.Tensor[[T_DYN, INDEX_TOPK], pl.INT32],
+    compressed: pl.Tensor[[CMP_BLOCKS_DYN, 128, 1, HEAD_DIM // 2], pl.UINT8],
+    compressed_scale: pl.Tensor[[CMP_BLOCKS_DYN, 128, 1, HEAD_DIM // 16], pl.FP8E4M3FN],
+    sink: pl.Tensor[[LOCAL_H], pl.FP32],
+    output: pl.Tensor[[T_DYN, LOCAL_H * HEAD_DIM], pl.BF16],
+    selected: pl.Tensor[[SELECTED_ROWS, SELECTED_KEYS, HEAD_DIM], pl.BF16],
+    indices: pl.Tensor[[SELECTED_ROWS, SELECTED_KEYS], pl.INT32],
+    num_tokens: pl.Scalar[pl.INT32],
+    query_ready: pl.Scalar[pl.TASK_ID],
+):
+    selected, indices, gathered = gather_packed(
+        window, window_scale, compressed, compressed_scale,
+        window_indices, compressed_indices, selected, indices, num_tokens, query_ready,
+    )
+    attended = attend_selected(query, selected, indices, sink, output, num_tokens, gathered, query_ready)
+    return attended
+
+
+@pl.jit.inline(auto_scope=False)
+def attend_packed(
+    query: pl.Tensor[[T_DYN, LOCAL_H * HEAD_DIM], pl.BF16],
+    window_indices: pl.Tensor[[T_DYN, 128], pl.INT32],
+    window: pl.Tensor[[ORI_BLOCKS_DYN, 128, 1, HEAD_DIM], pl.FP8E4M3FN],
+    window_scale: pl.Tensor[[ORI_BLOCKS_DYN, 128, 1, HEAD_DIM // 32], pl.FP8E8M0],
+    compressed_indices: pl.Tensor[[T_DYN, INDEX_TOPK], pl.INT32],
+    compressed: pl.Tensor[[CMP_BLOCKS_DYN, 128, 1, HEAD_DIM // 2], pl.UINT8],
+    compressed_scale: pl.Tensor[[CMP_BLOCKS_DYN, 128, 1, HEAD_DIM // 16], pl.FP8E4M3FN],
+    sink: pl.Tensor[[LOCAL_H], pl.FP32],
+    output: pl.Tensor[[T_DYN, LOCAL_H * HEAD_DIM], pl.BF16],
+    num_tokens: pl.Scalar[pl.INT32],
+):
+    marker = pl.create_tensor([1, 16], dtype=pl.FP32)
+    with pl.spmd(1, name_hint="sparse_query_ready") as ready:
+        block = pl.tile.get_block_idx()
+        marker[block:block + 1, :] = pl.cast(query[0:1, 0:16], pl.FP32)
+
+    capacity = pl.max(1, pl.min(TOKEN_TILE, num_tokens))
+    selected = pl.create_tensor([capacity, SELECTED_KEYS, HEAD_DIM], dtype=pl.BF16)
+    indices = pl.create_tensor([capacity, SELECTED_KEYS], dtype=pl.INT32)
+    for offset in pl.range(0, num_tokens, TOKEN_TILE):
+        count = pl.min(TOKEN_TILE, num_tokens - offset)
+        q = pl.slice(query, [count, LOCAL_H * HEAD_DIM], [offset, 0])
+        wi = pl.slice(window_indices, [count, 128], [offset, 0])
+        ci = pl.slice(compressed_indices, [count, INDEX_TOPK], [offset, 0])
+        out = pl.slice(output, [count, LOCAL_H * HEAD_DIM], [offset, 0])
+        ready = _attend_packed_block(
+            q, wi, window, window_scale,
+            ci, compressed, compressed_scale,
+            sink, out, selected, indices, count, ready,
+        )
+    return output
+
+
+@pl.jit.inline(auto_scope=False)
+def attend_bf16(
+    query: pl.Tensor[[T_DYN, BF16_HEADS, HEAD_DIM], pl.FP32],
+    window: pl.Tensor[[BF16_PAGES_W, 128, HEAD_DIM], pl.FP32],
+    wi: pl.Tensor[[T_DYN, 128], pl.INT32],
+    compressed: pl.Tensor[[BF16_PAGES_C, 128, HEAD_DIM], pl.FP32],
+    ci: pl.Tensor[[T_DYN, INDEX_TOPK], pl.INT32],
+    sink: pl.Tensor[[BF16_HEADS], pl.FP32],
+    extents: pl.Tensor[[T_DYN, 2], pl.INT32],
+    output: pl.Tensor[[T_DYN, BF16_HEADS, HEAD_DIM], pl.FP32],
+):
+    rows = pl.tensor.dim(query, 0)
+    heads = pl.tensor.dim(query, 1)
+    qflat = pl.reshape(query, [rows * LOCAL_H, HEAD_DIM])
+    marker = pl.create_tensor([1, 16], dtype=pl.FP32)
+    with pl.spmd(1, name_hint="sparse_bf16_ready") as ready:
+        block = pl.tile.get_block_idx()
+        marker[block:block + 1, :] = qflat[0:1, 0:16]
+
+    for offset in pl.range(0, rows, TOKEN_TILE):
+        count = pl.min(TOKEN_TILE, rows - offset)
+        q = pl.slice(query, [count, heads, HEAD_DIM], [offset, 0, 0])
+        widx = pl.slice(wi, [count, 128], [offset, 0])
+        cidx = pl.slice(ci, [count, INDEX_TOPK], [offset, 0])
+        limits = pl.slice(extents, [count, 2], [offset, 0])
+        out = pl.slice(output, [count, heads, HEAD_DIM], [offset, 0, 0])
+        ready = _attend_bf16_block(q, window, widx, compressed, cidx, sink, limits, out, ready)
+    return output
+
+
+@pl.jit(auto_scope=False)
+def sparse_mla(
+    query: pl.Tensor[[T_DYN, LOCAL_H * HEAD_DIM], pl.BF16],
+    window_indices: pl.Tensor[[T_DYN, 128], pl.INT32],
+    window: pl.Tensor[[ORI_BLOCKS_DYN, 128, 1, HEAD_DIM], pl.FP8E4M3FN],
+    window_scale: pl.Tensor[[ORI_BLOCKS_DYN, 128, 1, HEAD_DIM // 32], pl.FP8E8M0],
+    compressed_indices: pl.Tensor[[T_DYN, INDEX_TOPK], pl.INT32],
+    compressed: pl.Tensor[[CMP_BLOCKS_DYN, 128, 1, HEAD_DIM // 2], pl.UINT8],
+    compressed_scale: pl.Tensor[[CMP_BLOCKS_DYN, 128, 1, HEAD_DIM // 16], pl.FP8E4M3FN],
+    sink: pl.Tensor[[LOCAL_H], pl.FP32],
+    output: pl.Out[pl.Tensor[[T_DYN, LOCAL_H * HEAD_DIM], pl.BF16]],
+):
+    rows = pl.tensor.dim(query, 0)
+    output = attend_packed(
+        query, window_indices, window, window_scale, compressed_indices,
+        compressed, compressed_scale, sink, output, rows,
+    )
+    return output
+
+
+@pl.jit(auto_scope=False)
+def sparse_mla_bf16(
+    query: pl.Tensor[[T_DYN, LOCAL_H, HEAD_DIM], pl.FP32],
+    window: pl.Tensor[[ORI_BLOCKS_DYN, 128, HEAD_DIM], pl.FP32],
+    window_indices: pl.Tensor[[T_DYN, 128], pl.INT32],
+    compressed: pl.Tensor[[CMP_BLOCKS_DYN, 128, HEAD_DIM], pl.FP32],
+    compressed_indices: pl.Tensor[[T_DYN, INDEX_TOPK], pl.INT32],
+    sink: pl.Tensor[[LOCAL_H], pl.FP32],
+    extents: pl.Tensor[[T_DYN, 2], pl.INT32],
+    output: pl.Out[pl.Tensor[[T_DYN, LOCAL_H, HEAD_DIM], pl.FP32]],
+):
+    output = attend_bf16(query, window, window_indices, compressed, compressed_indices, sink, extents, output)
+    return output
+
+
+def main():
+    import argparse
+
+    import torch
+
+    from golden import TensorSpec, run
+    from models.deepseek_v4_1_flash.quantization import (
+        dequantize_mxfp4_cache, dequantize_mxfp8_cache,
+        quantize_mxfp4_cache, quantize_mxfp8_cache,
+    )
+
+    parser = argparse.ArgumentParser(description="Validate sparse MLA on Ascend950")
+    parser.add_argument("-p", "--platform", default="a5", choices=["a5"])
+    parser.add_argument("-d", "--device", type=int, default=0)
+    parser.add_argument("--tp", type=int, default=TP_SIZE, choices=[1, 2, 4, 8])
+    parser.add_argument("--rows", type=int, default=7)
+    parser.add_argument("--mode", default="both", choices=["packed", "bf16", "both"])
+    parser.add_argument("--compile-only", action="store_true")
+    parser.add_argument("--fixture", type=Path)
+    parser.add_argument("--runtime-dir", type=str)
+    args = parser.parse_args()
+    if args.tp != TP_SIZE:
+        raise ValueError(f"--tp {args.tp} does not match configured TP_SIZE {TP_SIZE}")
+    if args.runtime_dir and args.mode == "both":
+        raise ValueError("--runtime-dir requires one --mode")
+    if args.rows < 1:
+        raise ValueError("--rows must be positive")
+    fixture = torch.load(args.fixture, weights_only=True) if args.fixture else None
+    if fixture is None:
+        torch.manual_seed(4102026)
+        query = (torch.randn(args.rows, LOCAL_H, HEAD_DIM) * 0.7).bfloat16()
+        window = (torch.randn(256, HEAD_DIM) * 0.6).bfloat16()
+        compressed = (torch.randn(512, HEAD_DIM) * 0.6).bfloat16()
+        window_indices = torch.randint(0, 256, (args.rows, 128), dtype=torch.int32)
+        compressed_indices = torch.randint(0, 512, (args.rows, INDEX_TOPK), dtype=torch.int32)
+        window_indices[0] = -1
+        compressed_indices[0] = -1
+        sink = torch.linspace(-2, 3, LOCAL_H)
+        extents = torch.tensor([128, INDEX_TOPK], dtype=torch.int32).repeat(args.rows, 1)
+        wp, ws = quantize_mxfp8_cache(window.reshape(-1, 128, 1, HEAD_DIM))
+        ws = ws.view(torch.float8_e8m0fnu)
+        cp, cs = quantize_mxfp4_cache(compressed.reshape(-1, 128, 1, HEAD_DIM), 16, "e4m3")
+        wd = dequantize_mxfp8_cache(wp, ws).bfloat16().reshape(-1, HEAD_DIM)
+        cd = dequantize_mxfp4_cache(cp, cs, 16, "e4m3").bfloat16().reshape(-1, HEAD_DIM)
+    else:
+        query = fixture["q"]
+        if list(query.shape) != [args.rows, LOCAL_H, HEAD_DIM]:
+            raise ValueError("Fixture query shape does not match --rows and --tp")
+        window, compressed = fixture["w"], fixture["c"]
+        window_indices, compressed_indices = fixture["wi"], fixture["ci"]
+        sink, extents = fixture["sink"], fixture["extents"]
+        wp, ws, cp, cs = fixture["wp"], fixture["ws"], fixture["cp"], fixture["cs"]
+
+    modes = ["packed", "bf16"] if args.mode == "both" else [args.mode]
+    records = []
+    for mode in modes:
+        if fixture is None:
+            wkeys, ckeys = (wd, cd) if mode == "packed" else (window, compressed)
+            expected = torch.empty_like(query, dtype=torch.float32)
+            for row in range(args.rows):
+                ids = torch.cat([window_indices[row], compressed_indices[row]])
+                wvalues = wkeys[window_indices[row].clamp_min(0).long()]
+                cvalues = ckeys[compressed_indices[row].clamp_min(0).long()]
+                keys = torch.cat([wvalues, cvalues]).float()
+                keys[ids < 0] = 0
+                scores = query[row].float() @ keys.T * SCALE
+                scores[:, ids < 0] = -float("inf")
+                probability = torch.cat([scores, sink[:, None]], dim=1).softmax(dim=1)
+                expected[row] = probability[:, :-1] @ keys
+        else:
+            expected = fixture[f"expected_{mode}"]
+        if mode == "packed":
+            inputs = dict(query=query.flatten(1), window_indices=window_indices, window=wp, window_scale=ws,
+                          compressed_indices=compressed_indices, compressed=cp, compressed_scale=cs, sink=sink)
+            reference = expected.flatten(1)
+            result_dtype = torch.bfloat16
+            entry = sparse_mla
+        else:
+            inputs = dict(query=query.float(), window=window.float().reshape(-1, 128, HEAD_DIM),
+                          window_indices=window_indices, compressed=compressed.float().reshape(-1, 128, HEAD_DIM),
+                          compressed_indices=compressed_indices, sink=sink, extents=extents)
+            reference = expected
+            result_dtype = torch.float32
+            entry = sparse_mla_bf16
+        specs = [TensorSpec(name, list(value.shape), value.dtype, init_value=value) for name, value in inputs.items()]
+        specs.append(TensorSpec("output", list(reference.shape), result_dtype))
+
+        def golden(tensors):
+            tensors["output"].copy_(reference.bfloat16().to(result_dtype))
+
+        def compare(actual, _expected, **_kwargs):
+            difference = (actual.float() - reference).abs()
+            norm = float(reference.norm())
+            relative_l2 = float(difference.norm()) / norm if norm else float(difference.norm())
+            bad = int((difference > 0.003 + 0.03 * reference.abs()).sum())
+            finite = bool(actual.isfinite().all())
+            return finite and relative_l2 < 0.006 and bad == 0, f"relative_l2={relative_l2:.6f}, bad={bad}"
+
+        result = run(
+            entry,
+            specs,
+            golden_fn=golden,
+            compare_fn={"output": compare},
+            config=dict(platform=args.platform, device_id=args.device),
+            compile_only=args.compile_only,
+            runtime_dir=args.runtime_dir,
+            save_data=True,
+        )
+        records.append(dict(mode=mode, passed=result.passed, work_dir=str(result.work_dir)))
+        if not result.passed:
+            raise RuntimeError(result.error)
+        status = "COMPILE_ONLY" if args.compile_only else "DEVICE_VALIDATED"
+        print(status, mode, result.work_dir)
+    return records
+
+
+if __name__ == "__main__":
+    _main_results = main()

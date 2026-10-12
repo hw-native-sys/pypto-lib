@@ -20,6 +20,8 @@ if __package__ in (None, ""):
 # ci: a5
 
 import pypto.language as pl
+
+from models.deepseek_v4_1_flash.sparse_attention import attend_selected, gather_packed
 import pypto.language.distributed as pld
 import torch
 
@@ -203,7 +205,7 @@ def publish_window(
     return cache, scales
 
 
-@pl.jit.inline
+@pl.jit.inline(auto_scope=False)
 def attend_combined(
     query: pl.Tensor[[T_DYN, LOCAL_H * HEAD_DIM], pl.BF16],
     selected: pl.Tensor[[T_DYN, 640, HEAD_DIM], pl.BF16],
@@ -214,52 +216,9 @@ def attend_combined(
     selected_ready: pl.Scalar[pl.TASK_ID],
     query_ready: pl.Scalar[pl.TASK_ID],
 ):
-    tokens = pl.tensor.dim(query, 0)
-    head_rows = tokens * LOCAL_H
-    cache_rows = tokens * 640
-    qflat = pl.reshape(query, [head_rows, HEAD_DIM])
-    kflat = pl.reshape(selected, [cache_rows, HEAD_DIM])
-    oflat = pl.reshape(output, [head_rows, HEAD_DIM])
-    with pl.spmd(
-        num_tokens * (LOCAL_H // M_TILE), name_hint="c1a_online_attention",
-        deps=[selected_ready, query_ready],
-    ) as attend_tid:
-        block = pl.tile.get_block_idx()
-        t = block // (LOCAL_H // M_TILE)
-        h = block % (LOCAL_H // M_TILE) * M_TILE
-        q0 = t * LOCAL_H + h
-        maximum = pl.full([1, M_TILE], dtype=pl.FP32, value=-1e30)
-        denominator = pl.full([1, M_TILE], dtype=pl.FP32, value=0.0)
-        numerator = pl.full([M_TILE, HEAD_DIM], dtype=pl.FP32, value=0.0)
-        for part in pl.range(ATTEND_TILES):
-            k0 = t * 640 + part * ATTEND_TILE
-            q = qflat[q0 : q0 + M_TILE, :]
-            kv = kflat[k0 : k0 + 64, :]
-            scores = pl.matmul(q, kv, b_trans=True)
-            scores = pl.mul(scores, SOFTMAX_SCALE)
-            idx = pl.cast(indices[t : t + 1, part * 64 : part * 64 + 64], pl.FP32)
-            valid = pl.minimum(pl.maximum(pl.add(idx, 1.0), 0.0), 1.0)
-            bias = pl.mul(pl.sub(valid, 1.0), 1e30)
-            scores = pl.col_expand_add(scores, bias)
-            next_max = pl.maximum(maximum, pl.reshape(pl.row_max(scores), [1, M_TILE]))
-            correction = pl.exp(pl.sub(maximum, next_max))
-            probabilities = pl.col_expand_mul(
-                pl.exp(pl.row_expand_sub(scores, pl.reshape(next_max, [M_TILE, 1]))), valid
-            )
-            denominator = pl.add(
-                pl.mul(denominator, correction), pl.reshape(pl.row_sum(probabilities), [1, M_TILE])
-            )
-            weights = pl.cast(probabilities, pl.BF16, mode="rint")
-            weighted = pl.matmul(weights, kv)
-            numerator = pl.add(pl.row_expand_mul(numerator, pl.reshape(correction, [M_TILE, 1])), weighted)
-            maximum = next_max
-        sinks = pl.reshape(sink[h : h + M_TILE], [1, M_TILE])
-        final_max = pl.maximum(maximum, sinks)
-        correction = pl.exp(pl.sub(maximum, final_max))
-        denominator = pl.add(pl.mul(denominator, correction), pl.exp(pl.sub(sinks, final_max)))
-        result = pl.row_expand_mul(numerator, pl.reshape(pl.div(correction, denominator), [M_TILE, 1]))
-        oflat[q0 : q0 + M_TILE, :] = pl.cast(result, pl.BF16, mode="rint")
-    return attend_tid
+    return attend_selected(
+        query, selected, indices, sink, output, num_tokens, selected_ready, query_ready,
+    )
 
 
 project_qa = make_mx_projection_with_deps(D, Q_LORA)
@@ -414,7 +373,7 @@ def c1a_prepare(
     return qr, q, qr_tid, q_tid
 
 
-@pl.jit.inline
+@pl.jit.inline(auto_scope=False)
 def gather_combined(
     window_cache: pl.Tensor[[ORI_BLOCKS_DYN, 128, 1, HEAD_DIM], pl.FP8E4M3FN],
     window_scale: pl.Tensor[[ORI_BLOCKS_DYN, 128, 1, HEAD_DIM // 32], pl.FP8E8M0],
@@ -427,80 +386,10 @@ def gather_combined(
     num_tokens: pl.Scalar[pl.INT32],
     selected_ready: pl.Scalar[pl.TASK_ID],
 ):
-    window_rows = pl.tensor.dim(window_cache, 0) * 128
-    compressed_rows = pl.tensor.dim(compressed_cache, 0) * 128
-    flat_window = pl.reshape(window_cache, [window_rows, HEAD_DIM])
-    flat_window_scale = pl.reshape(window_scale, [window_rows, HEAD_DIM // 32])
-    # Cache addressing remains in packed byte carriers.
-    flat_compressed = pl.reshape(compressed_cache, [1, compressed_rows * (HEAD_DIM // 2)])
-    flat_compressed_scale = pl.reshape(compressed_scale, [compressed_rows, HEAD_DIM // 16])
-    selected_rows = pl.tensor.dim(selected, 0) * 640
-    flat_selected = pl.reshape(selected, [selected_rows, HEAD_DIM])
-    with pl.spmd(32, name_hint="c1a_gather_combined", deps=[selected_ready]) as gather_tid:
-        worker = pl.tile.get_block_idx()
-        for task in pl.range(worker, num_tokens * 40, 32):
-            t = task // 40
-            first = task % 40 * 16
-            id_tile = pl.tile.full([1, 16], dtype=pl.INT32, value=-1)
-            for lane in pl.range(16):
-                i = first + lane
-                row = pl.cast(-1, pl.INT32)
-                if i < 128:
-                    row = pl.read(window_indices, [t, i])
-                else:
-                    row = pl.read(compressed_indices, [t, i - 128])
-                pl.tile.write(id_tile, [0, lane], row)
-                destination = t * 640 + i
-                if row >= 0:
-                    physical = pl.cast(row, pl.INDEX)
-                    if i < 128:
-                        payload = pl.load(flat_window, [physical, 0], [1, HEAD_DIM])
-                        values = pl.reshape(pl.cast(payload, pl.FP32), [HEAD_DIM // 32, 32])
-                        raw = pl.load(flat_window_scale, [physical, 0], [1, 32],
-                                      valid_shape=[1, HEAD_DIM // 32])
-                        signed = pl.cast(pl.reinterpret_view(pl.reinterpret_view(raw, pl.UINT8), pl.INT8),
-                                         pl.INT32)
-                        codes = pl.ands(signed, 255)
-                        scales = pl.reinterpret_view(pl.maximum(pl.shls(codes, 23), 4194304), pl.FP32)
-                        factors = pl.reshape(pl.tile.slice(scales, [1, HEAD_DIM // 32], [0, 0]),
-                                             [HEAD_DIM // 32, 1])
-                        decoded_window = pl.reshape(pl.row_expand_mul(values, factors), [1, HEAD_DIM])
-                        pl.store(pl.cast(decoded_window, pl.BF16, mode="rint"),
-                                 [destination, 0], flat_selected)
-                    else:
-                        packed_row = pl.slice(flat_compressed, [1, HEAD_DIM // 2],
-                                             [0, physical * (HEAD_DIM // 2)])
-                        byte_values = pl.ands(pl.cast(pl.reinterpret_view(packed_row, pl.INT8), pl.INT32), 255)
-                        low = pl.ands(byte_values, 15)
-                        high = pl.shrs(byte_values, 4)
-                        # The mask-form tile scatter drops the even lanes on A5, so the
-                        # halves go through the tensor form.
-                        carrier = pl.create_tensor([1, HEAD_DIM], dtype=pl.INT32)
-                        placed_low = pl.tensor.scatter(low, mask_pattern=pl.tile.MaskPattern.P0101, dst=carrier)
-                        placed = pl.tensor.scatter(high, mask_pattern=pl.tile.MaskPattern.P1010, dst=placed_low)
-                        magnitude_code = pl.cast(pl.ands(placed, 7), pl.FP32)
-                        magnitude = pl.add(pl.mul(pl.minimum(magnitude_code, 4.0), 0.5),
-                                           pl.add(pl.maximum(pl.sub(magnitude_code, 4.0), 0.0),
-                                                  pl.maximum(pl.sub(magnitude_code, 6.0), 0.0)))
-                        bits = pl.or_(
-                            pl.reinterpret_view(magnitude, pl.INT32), pl.shls(pl.ands(placed, 8), 28)
-                        )
-                        decoded_value = pl.cast(pl.reinterpret_view(bits, pl.FP32), pl.BF16)
-                        compressed_factors = pl.cast(
-                            pl.slice(flat_compressed_scale, [1, HEAD_DIM // 16], [physical, 0]), pl.FP32
-                        )
-                        scaled = pl.mul(
-                            pl.reshape(pl.cast(decoded_value, pl.FP32), [HEAD_DIM // 16, 16]),
-                            pl.reshape(compressed_factors, [HEAD_DIM // 16, 1]),
-                        )
-                        flat_selected[destination : destination + 1, 0:HEAD_DIM] = pl.cast(
-                            pl.reshape(scaled, [1, HEAD_DIM]), pl.BF16, mode="rint"
-                        )
-                else:
-                    zero = pl.tile.full([1, HEAD_DIM], dtype=pl.BF16, value=0.0)
-                    pl.store(zero, [destination, 0], flat_selected)
-            pl.store(id_tile, [t, first], indices)
-    return selected, indices, gather_tid
+    return gather_packed(
+        window_cache, window_scale, compressed_cache, compressed_scale,
+        window_indices, compressed_indices, selected, indices, num_tokens, selected_ready,
+    )
 
 
 def make_c1a_finish(output_reduce=None):

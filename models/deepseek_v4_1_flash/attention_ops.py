@@ -10,6 +10,9 @@
 
 import pypto.language as pl
 
+from models.deepseek_v4_1_flash.config import LOCAL_H
+from models.deepseek_v4_1_flash.sparse_attention import attend_bf16
+
 from models.deepseek_v4_1_flash.config import D, FLASH, HEAD_DIM, ROPE_DIM, T_DYN
 
 from models.deepseek_v4_1_flash.config import INDEX_TOPK
@@ -717,7 +720,7 @@ def prefill_linear_quantized_inline(
 
 
 @pl.jit.inline(auto_scope=False)
-def prefill_sparse_attention_official_inline(
+def _prefill_sparse_attention_official_legacy_inline(
     query: pl.Tensor[[_PREFILL_OPS_ROWS, _PREFILL_OPS_HEADS, HEAD_DIM], pl.FP32],
     window_cache: pl.Tensor[[_PREFILL_OPS_WINDOW_BLOCKS, 128, HEAD_DIM], pl.FP32],
     window_indices: pl.Tensor[[_PREFILL_OPS_ROWS, 128], pl.INT32],
@@ -827,6 +830,31 @@ def prefill_sparse_attention_official_inline(
             result = pl.cast(pl.cast(result, pl.BF16, mode="rint"), pl.FP32)
             pv_result = pl.reshape(pl.set_validshape(result, active_heads, 64), [1, 16, 64])
             output[row : row + 1, head : head + 16, channel : channel + 64] = pv_result
+    return output
+
+
+@pl.jit.inline(auto_scope=False)
+def prefill_sparse_attention_official_inline(
+    query: pl.Tensor[[_PREFILL_OPS_ROWS, _PREFILL_OPS_HEADS, HEAD_DIM], pl.FP32],
+    window_cache: pl.Tensor[[_PREFILL_OPS_WINDOW_BLOCKS, 128, HEAD_DIM], pl.FP32],
+    window_indices: pl.Tensor[[_PREFILL_OPS_ROWS, 128], pl.INT32],
+    global_cache: pl.Tensor[[_PREFILL_OPS_GLOBAL_BLOCKS, 128, HEAD_DIM], pl.FP32],
+    global_indices: pl.Tensor[[_PREFILL_OPS_ROWS, INDEX_TOPK], pl.INT32],
+    sink: pl.Tensor[[_PREFILL_OPS_HEADS], pl.FP32],
+    extents: pl.Tensor[[_PREFILL_OPS_ROWS, 2], pl.INT32],
+    output: pl.Tensor[[_PREFILL_OPS_ROWS, _PREFILL_OPS_HEADS, HEAD_DIM], pl.FP32],
+):
+    """Sparse attention with Cube QK/PV and an arbitrary-head fallback."""
+    if pl.tensor.dim(query, 1) == LOCAL_H:
+        output = attend_bf16(
+            query, window_cache, window_indices, global_cache, global_indices,
+            sink, extents, output,
+        )
+    else:
+        output = _prefill_sparse_attention_official_legacy_inline(
+            query, window_cache, window_indices, global_cache, global_indices,
+            sink, extents, output,
+        )
     return output
 
 
