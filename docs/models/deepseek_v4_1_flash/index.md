@@ -170,6 +170,17 @@ half-layer entry, while `decode_layer.py` composes the selected branch with MoE:
 cache-source ownership, residual ping-pong buffers, and per-layer communication
 epochs are visible in the forward itself. Its L3 entry allocates one set of TP
 Attention and EP MoE windows and reuses them across the complete backbone.
+Encoder layers 0–19 and decoder layers 20–39 are separate per-rank JIT
+orchestrations, dispatched in order with the same residual, pre-mix, cache
+pools, and communication windows. The `decode_fwd` inline entry composes both
+stages for callers that need a single L2 orchestration.
+
+The `decode_fwd.py` A5 fixture defaults to TP1/EP8/DP8 on eight cards. Each
+rank has 12 requests with six active tokens each; the residual and pre-mix
+buffers retain the 192-row physical slab required by the current mHC path.
+Running the script executes both stages in one dispatch sequence. This is a
+smoke run without a forward golden, not a numerical validation of the 40-layer
+output.
 
 Decode Attention is sequence parallel over the TP group: each rank owns a
 contiguous slab of the batch's token rows (`T_local = ceil(T / TP)`), the

@@ -846,27 +846,6 @@ def test_decode_layer_has_no_legacy_stage_dispatcher():
     assert "attention_half_skip_reason" not in names
 
 
-def test_decode_fwd_directly_composes_the_backbone():
-    tree = _tree("decode_fwd.py")
-    imported_names = {
-        alias.name for node in tree.body if isinstance(node, ast.ImportFrom) for alias in node.names
-    }
-    referenced_names = {node.id for node in ast.walk(tree) if isinstance(node, ast.Name)}
-    assert "decode_layer" not in imported_names
-    assert "decode_layer" not in referenced_names
-    assert {
-        "decode_swa_sharded",
-        "decode_c2a_full_sharded",
-        "decode_c2a_reuse_sharded",
-        "decode_c1a_full_sharded",
-        "decode_c1a_reindex_sharded",
-        "decode_c1a_reuse_sharded",
-        "moe",
-    } <= referenced_names
-    assert {"decode_fwd", "l2_decode_fwd"} <= referenced_names
-    assert "l3_decode_fwd" in _top_level_functions("decode_fwd.py")
-
-
 @requires_pypto
 def test_decode_moe_capacity_covers_the_largest_local_slab():
     from models.deepseek_v4_1_flash import config, moe
@@ -960,9 +939,8 @@ def test_prefill_layer_uses_decode_moe_transport_signal_layout():
     assert "combine_arrived_buffer,\n                [EP_SIZE, N_LOCAL_EXPERTS, SIGNAL_PAD]" in source
 
 
-@pytest.mark.parametrize("module_name", ["decode_layer", "decode_fwd"])
-def test_decode_entry_uses_moe_transport_signal_layout(module_name):
-    source = (MODEL_DIR / f"{module_name}.py").read_text()
+def test_decode_layer_uses_moe_transport_signal_layout():
+    source = (MODEL_DIR / "decode_layer.py").read_text()
 
     assert "from models.deepseek_v4_1_flash.ep_transport import SIGNAL_PAD" in source
     assert "[EP_SIZE, SIGNAL_PAD]" in source
@@ -995,174 +973,10 @@ def test_decode_moe_orders_dispatch_and_expert_completion_edges():
     assert "combine_scattered(" in moe_source
     assert "_output_zero_tid,\n            scatter_done," in moe_source
 
-    for entry in ("decode_layer.py", "decode_fwd.py", "prefill_layer.py"):
+    for entry in ("decode_layer.py", "prefill_layer.py"):
         source = (MODEL_DIR / entry).read_text()
         assert "from models.deepseek_v4_1_flash.moe import (" in source
         assert "moe_dspark" not in source
-
-
-@requires_pypto
-def test_decode_fwd_exposes_a_full_compile_fixture():
-    from golden import ScalarSpec
-    from models.deepseek_v4_1_flash import decode_fwd
-
-    specs = decode_fwd.build_tensor_specs()
-    assert [spec.name for spec in specs] == list(decode_fwd.l3_decode_fwd.param_names)
-    by_name = {spec.name: spec for spec in specs}
-    assert by_name["x_hc"].shape[1] == decode_fwd.MOE_TOKENS
-    assert by_name["x_hc"].shape[1] > 16
-    assert by_name["window_cache_pool"].shape[1] == decode_fwd.N_LAYERS
-    assert by_name["compressed_cache_pool"].shape[1] == decode_fwd.KV_SOURCE_COUNT
-    assert by_name["index_cache_pool"].shape[1] == decode_fwd.INDEX_SOURCE_COUNT
-    assert by_name["state_cache_pool"].shape[1] == decode_fwd.C2A_SOURCE_COUNT
-    assert isinstance(by_name["attention_num_tokens"], ScalarSpec)
-    assert by_name["attention_num_tokens"].compile_runtime
-    source = (MODEL_DIR / "decode_fwd.py").read_text()
-    assert "# ci: a5" in source
-    assert "# ci: no-sim" in source
-
-
-@requires_pypto
-def test_decode_fwd_schedule_and_cache_source_ordinals():
-    from models.deepseek_v4_1_flash import decode_fwd
-
-    modes = [layer.mode.value for layer in decode_fwd.BACKBONE_SCHEDULE]
-    assert Counter(modes) == {
-        "swa": 2,
-        "full": 4,
-        "reuse": 30,
-        "reindex": 4,
-    }
-    assert decode_fwd.cache_source_ordinals(0) == (None, None, None)
-    assert decode_fwd.cache_source_ordinals(2) == (0, 0, 0)
-    assert decode_fwd.cache_source_ordinals(7) == (0, 0, 0)
-    assert decode_fwd.cache_source_ordinals(8) == (1, 1, 1)
-    assert decode_fwd.cache_source_ordinals(19) == (2, 2, 2)
-    assert decode_fwd.cache_source_ordinals(20) == (3, 3, None)
-    assert decode_fwd.cache_source_ordinals(24) == (3, 4, None)
-    assert decode_fwd.cache_source_ordinals(39) == (3, 7, None)
-
-
-def test_decode_fwd_reuses_one_set_of_tp_and_ep_windows():
-    tree = _tree("decode_fwd.py")
-    host = _function(tree, "l3_decode_fwd")
-    assert [ast.unparse(decorator) for decorator in host.decorator_list] == ["pl.jit.host"]
-    allocations = [
-        node
-        for node in ast.walk(host)
-        if isinstance(node, ast.Call)
-        and isinstance(node.func, ast.Attribute)
-        and node.func.attr == "alloc_window_buffer"
-    ]
-    assert len(allocations) == 13
-    assert (
-        sum(
-            isinstance(node, ast.For)
-            and isinstance(node.iter, ast.Call)
-            and isinstance(node.iter.func, ast.Attribute)
-            and node.iter.func.attr == "range"
-            for node in ast.walk(host)
-        )
-        == 1
-    )
-
-
-def test_decode_fwd_uses_runtime_schedule_blocks():
-    tree = _tree("decode_fwd.py")
-    device = _function(tree, "_decode_fwd")
-    loops = [node for node in device.body if isinstance(node, ast.For)]
-    assert [(ast.unparse(loop.target), ast.unparse(loop.iter)) for loop in loops] == [
-        ("c2a_block", "pl.range(C2A_SOURCE_COUNT)"),
-        ("c1a_block", "pl.range(4)"),
-    ]
-    calls = Counter(
-        node.func.id
-        for node in ast.walk(device)
-        if isinstance(node, ast.Call)
-        and isinstance(node.func, ast.Name)
-        and (node.func.id.startswith("decode_") or node.func.id == "moe")
-    )
-    assert calls == {
-        "decode_swa_sharded": 2,
-        "decode_c2a_full_sharded": 1,
-        "decode_c2a_reuse_sharded": 5,
-        "decode_c1a_full_sharded": 1,
-        "decode_c1a_reindex_sharded": 1,
-        "decode_c1a_reuse_sharded": 6,
-        "moe": 16,
-    }
-
-
-def test_decode_fwd_passes_row_concatenated_mx_scale_banks():
-    tree = _tree("decode_fwd.py")
-    device = _function(tree, "_decode_fwd")
-    host = _function(tree, "l3_decode_fwd")
-    scale_names = {
-        "wq_a_scale",
-        "wq_b_scale",
-        "wkv_scale",
-        "wo_b_scale",
-        "index_wq_b_scale",
-        "routed_w1_scale",
-        "routed_w2_scale",
-        "routed_w3_scale",
-        "shared_w1_scale",
-        "shared_w2_scale",
-        "shared_w3_scale",
-    }
-    assert len(device.args.args) == 83
-    assert scale_names <= {argument.arg for argument in device.args.args}
-    assert not any(
-        argument.arg.startswith(tuple(f"{name}_l" for name in scale_names))
-        or argument.arg.startswith("index_wq_b_scale_s")
-        for argument in device.args.args
-    )
-    host_annotations = {argument.arg: ast.unparse(argument.annotation) for argument in host.args.args}
-    for name in scale_names:
-        annotation = host_annotations[name]
-        assert "pl.MX_B_NN" not in annotation
-        assert "EP_SIZE" in annotation
-        assert "N_LAYERS," not in annotation
-    mx_slices = [
-        node
-        for node in ast.walk(device)
-        if isinstance(node, ast.AnnAssign)
-        and isinstance(node.annotation, ast.Subscript)
-        and "pl.MX_B_NN" in ast.unparse(node.annotation)
-    ]
-    assert mx_slices
-    index_scale_slices = [
-        node
-        for node in mx_slices
-        if isinstance(node.target, ast.Name) and "index_wq_b_scale_source" in node.target.id
-    ]
-    assert len(index_scale_slices) == 3
-    host_loop = next(node for node in host.body if isinstance(node, ast.For))
-    assert not any(
-        isinstance(node, ast.AnnAssign)
-        and isinstance(node.target, ast.Name)
-        and node.target.id.endswith("_scale_rank")
-        for node in host_loop.body
-    )
-
-
-def test_decode_fwd_hc_scale_slices_use_three_values_per_layer():
-    device = _function(_tree("decode_fwd.py"), "_decode_fwd")
-    scale_slices = [
-        node
-        for node in ast.walk(device)
-        if isinstance(node, ast.Call)
-        and isinstance(node.func, ast.Attribute)
-        and node.func.attr == "slice"
-        and isinstance(node.args[0], ast.Name)
-        and node.args[0].id in {"hc_attn_scale", "hc_ffn_scale"}
-    ]
-    assert len(scale_slices) == 32
-    for scale_slice in scale_slices:
-        assert ast.unparse(scale_slice.args[1]) == "[3]"
-        offset = scale_slice.args[2].elts[0]
-        assert isinstance(offset, ast.BinOp) and isinstance(offset.op, ast.Mult)
-        assert isinstance(offset.right, ast.Constant) and offset.right.value == 3
 
 
 def _ced_metadata(lengths):

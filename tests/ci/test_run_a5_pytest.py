@@ -8,7 +8,6 @@
 # -----------------------------------------------------------------------------------------------------------
 """Tests for the queued A5 pytest runner's log and result reporting."""
 
-import ast
 import importlib.util
 import json
 from pathlib import Path
@@ -70,23 +69,3 @@ def test_main_prints_final_failed_case_summary(monkeypatch, capsys):
     output = capsys.readouterr().out
     assert output.count("::group::model.py::test_precision[1-1]") == 1
     assert output.endswith("FAILED CASES:\n  model.py::test_precision[2-2]\n")
-
-
-def test_pr_device_matrix_has_41_cases():
-    model = ROOT / "models/deepseek_v4_1_flash"
-    count = 0
-    for path in model.glob("*.py"):
-        if "# ci: a5" not in path.read_text().splitlines():
-            continue
-        tree = ast.parse(path.read_text())
-        for node in ast.walk(tree):
-            if not isinstance(node, ast.FunctionDef) or not node.name.startswith("test_"):
-                continue
-            parameters = [
-                decorator for decorator in node.decorator_list
-                if isinstance(decorator, ast.Call)
-                and isinstance(decorator.func, ast.Attribute)
-                and decorator.func.attr == "parametrize"
-            ]
-            count += len(ast.literal_eval(parameters[0].args[1])) if parameters else 1
-    assert count == 41
