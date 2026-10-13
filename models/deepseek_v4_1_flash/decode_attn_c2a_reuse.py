@@ -188,7 +188,9 @@ def official_reference_c2a_reuse(inputs: dict, *, fp32_output=False) -> dict:
     window_slots = t["window_slots"].long()
     window_valid = window_slots >= 0
     window_rows = window_slots[window_valid]
-    _write_rows(window_cache, window_rows, window_payload[window_valid], head_dim)
+    # Boolean indexing of Float8 on CPU requires an exact FP32 roundtrip.
+    visible_payload = window_payload.float()[window_valid].to(window_payload.dtype)
+    _write_rows(window_cache, window_rows, visible_payload, head_dim)
     _write_rows(window_cache_scale, window_rows, window_codes[window_valid], head_dim // MX_GROUP)
 
     window_values = (
