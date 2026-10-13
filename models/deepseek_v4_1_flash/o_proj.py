@@ -182,7 +182,7 @@ def make_o_proj_with_deps(rotate, grouped, project):
 
 
 _project_ob = make_mx_projection(LOCAL_O_WIDTH, D, pl.FP32, name_hint="attention_o_b")
-_rotate_output = make_rope(LOCAL_H, inverse=True, name_hint="attention_o_rope")
+_rotate_output = make_rope(LOCAL_H, inverse=True, max_workers=64, name_hint="attention_o_rope")
 _prefill_rotate_output = make_rope(
     LOCAL_H,
     inverse=True,

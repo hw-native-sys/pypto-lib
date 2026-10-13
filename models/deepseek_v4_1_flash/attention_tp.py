@@ -136,57 +136,79 @@ def make_decode_tp_output_reduce(scatter=False):
         num_tokens: pl.Scalar[pl.INT32],
         attention_epoch: pl.Scalar[pl.INT32],
     ):
-        first = pl.cast(0, pl.INT32)
-        count = pl.cast(num_tokens, pl.INT32)
-        if scatter:
-            # The output tensor is the fixed physical slab.  Ownership must use
-            # that capacity, not active ``num_tokens``; otherwise T<TP and
-            # inactive suffixes shift rows between ranks.
-            width = pl.tensor.dim(output, 0)
-            first = pl.cast(pl.min(tp_rank * width, num_tokens), pl.INT32)
-            count = pl.cast(pl.max(0, pl.min(width, num_tokens - first)), pl.INT32)
-        with pl.at(level=pl.Level.CORE_GROUP, name_hint="decode_tp_reuse", allow_early_resolve=False) as reuse_tid:
-            for peer in pl.range(TP_SIZE):
-                pld.system.wait(output_arrived, offsets=[peer, 0], expected=(attention_epoch - 1) * 2,
+        if TP_SIZE == 1:
+            with pl.at(level=pl.Level.CORE_GROUP, name_hint="decode_tp1_reuse",
+                       allow_early_resolve=False) as reuse_tid:
+                pld.system.wait(output_arrived, offsets=[0, 0], expected=(attention_epoch - 1) * 2,
                                 cmp=pld.WaitCmp.Ge)
-        with pl.at(level=pl.Level.CORE_GROUP, name_hint="decode_tp_publish", deps=[reuse_tid]) as publish_tid:
-            pld.tensor.put(dst=output_window, peer=group_base + tp_rank, src=output_partial,
-                           dst_offsets=[0, 0], src_offsets=[0, 0], shape=[num_tokens, D],
-                           chunk_rows=1, chunk_cols=512, pipeline=True)
-            for peer in pl.range(TP_SIZE):
-                pld.system.notify(output_arrived, peer=group_base + peer, offsets=[tp_rank, 0],
-                                  value=1, op=pld.NotifyOp.AtomicAdd)
-        with pl.at(level=pl.Level.CORE_GROUP, name_hint="decode_tp_reduce", deps=[publish_tid],
-                   allow_early_resolve=False) as reduce_tid:
-            for peer in pl.range(TP_SIZE):
-                pld.system.wait(output_arrived, offsets=[peer, 0], expected=attention_epoch * 2 - 1,
-                                cmp=pld.WaitCmp.Ge)
-            for t in pl.range(first, first + count):
-                for col in pl.range(0, D, 512):
-                    acc = pl.tile.full([1, 512], dtype=pl.FP32, value=0.0)
-                    for peer in pl.range(TP_SIZE):
-                        value = pld.tile.remote_load(output_window, peer=group_base + peer,
-                                                     offsets=[t, col], shape=[1, 512])
-                        acc = pl.add(acc, value)
-                    output = pl.store(pl.cast(acc, pl.BF16, mode="rint"), [t - first, col], output)
+            rows = pl.tensor.dim(output, 0)
+            with pl.spmd(32, name_hint="decode_tp1_output", deps=[reuse_tid]) as local_tid:
+                worker = pl.tile.get_block_idx()
+                for tile in pl.range(worker, rows * (D // 512), 32):
+                    row = tile // (D // 512)
+                    col = tile % (D // 512) * 512
+                    if row < num_tokens:
+                        value = pl.load(output_partial, [row, col], [1, 512])
+                        output = pl.store(pl.cast(value, pl.BF16, mode="rint"), [row, col], output)
+                    else:
+                        output = pl.store(pl.tile.full([1, 512], dtype=pl.BF16, value=0.0), [row, col], output)
+            with pl.at(level=pl.Level.CORE_GROUP, name_hint="decode_tp1_release", deps=[local_tid],
+                       allow_early_resolve=False):
+                pld.system.notify(output_arrived, peer=group_base + tp_rank, offsets=[0, 0],
+                                  value=2, op=pld.NotifyOp.AtomicAdd)
+                pld.system.wait(output_arrived, offsets=[0, 0], expected=attention_epoch * 2, cmp=pld.WaitCmp.Ge)
+        else:
+            first = pl.cast(0, pl.INT32)
+            count = pl.cast(num_tokens, pl.INT32)
             if scatter:
-                # The physical slab is fully materialized.  Rows outside this
-                # rank's active range (an empty owner, or the padded tail of the
-                # last owner) are written as zeros, so no stale window or sentinel
-                # value is ever handed to the next stage.
-                for t in pl.range(count, pl.tensor.dim(output, 0)):
+                # The output tensor is the fixed physical slab.  Ownership must use
+                # that capacity, not active ``num_tokens``; otherwise T<TP and
+                # inactive suffixes shift rows between ranks.
+                width = pl.tensor.dim(output, 0)
+                first = pl.cast(pl.min(tp_rank * width, num_tokens), pl.INT32)
+                count = pl.cast(pl.max(0, pl.min(width, num_tokens - first)), pl.INT32)
+            with pl.at(level=pl.Level.CORE_GROUP, name_hint="decode_tp_reuse", allow_early_resolve=False) as reuse_tid:
+                for peer in pl.range(TP_SIZE):
+                    pld.system.wait(output_arrived, offsets=[peer, 0], expected=(attention_epoch - 1) * 2,
+                                    cmp=pld.WaitCmp.Ge)
+            with pl.at(level=pl.Level.CORE_GROUP, name_hint="decode_tp_publish", deps=[reuse_tid]) as publish_tid:
+                pld.tensor.put(dst=output_window, peer=group_base + tp_rank, src=output_partial,
+                               dst_offsets=[0, 0], src_offsets=[0, 0], shape=[num_tokens, D],
+                               chunk_rows=1, chunk_cols=512, pipeline=True)
+                for peer in pl.range(TP_SIZE):
+                    pld.system.notify(output_arrived, peer=group_base + peer, offsets=[tp_rank, 0],
+                                      value=1, op=pld.NotifyOp.AtomicAdd)
+            with pl.at(level=pl.Level.CORE_GROUP, name_hint="decode_tp_reduce", deps=[publish_tid],
+                       allow_early_resolve=False) as reduce_tid:
+                for peer in pl.range(TP_SIZE):
+                    pld.system.wait(output_arrived, offsets=[peer, 0], expected=attention_epoch * 2 - 1,
+                                    cmp=pld.WaitCmp.Ge)
+                for t in pl.range(first, first + count):
                     for col in pl.range(0, D, 512):
-                        output = pl.store(
-                            pl.tile.full([1, 512], dtype=pl.BF16, value=0.0), [t, col], output
-                        )
-            for peer in pl.range(TP_SIZE):
-                pld.system.notify(output_arrived, peer=group_base + peer, offsets=[tp_rank, 0],
-                                  value=1, op=pld.NotifyOp.AtomicAdd)
-        with pl.at(level=pl.Level.CORE_GROUP, name_hint="decode_tp_consumed", deps=[reduce_tid],
-                   allow_early_resolve=False):
-            for peer in pl.range(TP_SIZE):
-                pld.system.wait(output_arrived, offsets=[peer, 0], expected=attention_epoch * 2,
-                                cmp=pld.WaitCmp.Ge)
+                        acc = pl.tile.full([1, 512], dtype=pl.FP32, value=0.0)
+                        for peer in pl.range(TP_SIZE):
+                            value = pld.tile.remote_load(output_window, peer=group_base + peer,
+                                                         offsets=[t, col], shape=[1, 512])
+                            acc = pl.add(acc, value)
+                        output = pl.store(pl.cast(acc, pl.BF16, mode="rint"), [t - first, col], output)
+                if scatter:
+                    # The physical slab is fully materialized.  Rows outside this
+                    # rank's active range (an empty owner, or the padded tail of the
+                    # last owner) are written as zeros, so no stale window or sentinel
+                    # value is ever handed to the next stage.
+                    for t in pl.range(count, pl.tensor.dim(output, 0)):
+                        for col in pl.range(0, D, 512):
+                            output = pl.store(
+                                pl.tile.full([1, 512], dtype=pl.BF16, value=0.0), [t, col], output
+                            )
+                for peer in pl.range(TP_SIZE):
+                    pld.system.notify(output_arrived, peer=group_base + peer, offsets=[tp_rank, 0],
+                                      value=1, op=pld.NotifyOp.AtomicAdd)
+            with pl.at(level=pl.Level.CORE_GROUP, name_hint="decode_tp_consumed", deps=[reduce_tid],
+                       allow_early_resolve=False):
+                for peer in pl.range(TP_SIZE):
+                    pld.system.wait(output_arrived, offsets=[peer, 0], expected=attention_epoch * 2,
+                                    cmp=pld.WaitCmp.Ge)
         return output
 
     return decode_tp_output_reduce
@@ -219,60 +241,82 @@ def decode_tp_input_all_gather(
     row still publishes zeros and still takes part in the handshake, so ``T < TP``
     and empty owners need no special case in the caller.
     """
-    width = pl.tensor.dim(local_input, 0)
-    # Every rank publishes one physical slab, including a fully padded slab on
-    # ranks beyond the active range.  Zero-length remote puts are not a valid
-    # synchronization primitive on A5 and can leave the peer waits stuck; the
-    # gathered result still reads only rows ``[0, num_tokens)``.
-    local_count = pl.cast(width, pl.INT32)
-    with pl.at(level=pl.Level.CORE_GROUP, name_hint="decode_tp_input_reuse",
-               allow_early_resolve=False) as reuse_tid:
-        for peer in pl.range(TP_SIZE):
-            pld.system.wait(input_arrived, offsets=[peer, 0], expected=(attention_epoch - 1) * 2,
+    if TP_SIZE == 1:
+        with pl.at(level=pl.Level.CORE_GROUP, name_hint="decode_tp1_input_reuse",
+                   allow_early_resolve=False) as reuse_tid:
+            pld.system.wait(input_arrived, offsets=[0, 0], expected=(attention_epoch - 1) * 2,
                             cmp=pld.WaitCmp.Ge)
-    with pl.at(level=pl.Level.CORE_GROUP, name_hint="decode_tp_input_publish",
-               deps=[reuse_tid]) as publish_tid:
-        pld.tensor.put(dst=input_window, peer=group_base + tp_rank, src=local_input,
-                       dst_offsets=[0, 0], src_offsets=[0, 0], shape=[local_count, D],
-                       chunk_rows=1, chunk_cols=512, pipeline=True)
-        for peer in pl.range(TP_SIZE):
-            pld.system.notify(input_arrived, peer=group_base + peer, offsets=[tp_rank, 0],
-                              value=1, op=pld.NotifyOp.AtomicAdd)
-    with pl.at(level=pl.Level.CORE_GROUP, name_hint="decode_tp_input_wait", deps=[publish_tid],
-               allow_early_resolve=False) as arrived_tid:
-        for peer in pl.range(TP_SIZE):
-            pld.system.wait(input_arrived, offsets=[peer, 0], expected=attention_epoch * 2 - 1,
-                            cmp=pld.WaitCmp.Ge)
-    with pl.spmd(64, name_hint="decode_tp_input_gather", deps=[arrived_tid]) as gather_tid:
-        worker = pl.tile.get_block_idx()
-        for tile in pl.range(worker, num_tokens * (D // 512), 64):
-            row = tile // (D // 512)
-            col = tile % (D // 512) * 512
-            peer = row // width
-            value = pld.tile.remote_load(input_window, peer=group_base + peer,
-                                         offsets=[row - peer * width, col], shape=[1, 512])
-            gathered = pl.store(value, [row, col], gathered)
-    with pl.spmd(64, name_hint="decode_tp_input_zero_padding", deps=[gather_tid]) as zeroed_tid:
-        # Rows past the active range are never gathered; they are still written
-        # as zeros so the whole scratch is deterministic on every rank.  The
-        # harness seeds the buffer with a sentinel to prove this write happens.
-        worker = pl.tile.get_block_idx()
         rows = pl.tensor.dim(gathered, 0)
-        for tile in pl.range(worker, rows * (D // 512), 64):
-            row = tile // (D // 512)
-            if row >= num_tokens:
+        with pl.spmd(64, name_hint="decode_tp1_input", deps=[reuse_tid]) as local_tid:
+            worker = pl.tile.get_block_idx()
+            for tile in pl.range(worker, rows * (D // 512), 64):
+                row = tile // (D // 512)
                 col = tile % (D // 512) * 512
-                gathered = pl.store(pl.tile.full([1, 512], dtype=pl.BF16, value=0.0), [row, col], gathered)
-    with pl.at(level=pl.Level.CORE_GROUP, name_hint="decode_tp_input_release",
-               deps=[zeroed_tid]) as released_tid:
-        for peer in pl.range(TP_SIZE):
-            pld.system.notify(input_arrived, peer=group_base + peer, offsets=[tp_rank, 0],
-                              value=1, op=pld.NotifyOp.AtomicAdd)
-    with pl.at(level=pl.Level.CORE_GROUP, name_hint="decode_tp_input_consumed",
-               deps=[released_tid], allow_early_resolve=False):
-        for peer in pl.range(TP_SIZE):
-            pld.system.wait(input_arrived, offsets=[peer, 0], expected=attention_epoch * 2,
-                            cmp=pld.WaitCmp.Ge)
+                if row < num_tokens:
+                    value = pl.load(local_input, [row, col], [1, 512])
+                else:
+                    value = pl.tile.full([1, 512], dtype=pl.BF16, value=0.0)
+                gathered = pl.store(value, [row, col], gathered)
+        with pl.at(level=pl.Level.CORE_GROUP, name_hint="decode_tp1_input_release", deps=[local_tid],
+                   allow_early_resolve=False):
+            pld.system.notify(input_arrived, peer=group_base + tp_rank, offsets=[0, 0],
+                              value=2, op=pld.NotifyOp.AtomicAdd)
+            pld.system.wait(input_arrived, offsets=[0, 0], expected=attention_epoch * 2, cmp=pld.WaitCmp.Ge)
+    else:
+        width = pl.tensor.dim(local_input, 0)
+        # Every rank publishes one physical slab, including a fully padded slab on
+        # ranks beyond the active range.  Zero-length remote puts are not a valid
+        # synchronization primitive on A5 and can leave the peer waits stuck; the
+        # gathered result still reads only rows ``[0, num_tokens)``.
+        local_count = pl.cast(width, pl.INT32)
+        with pl.at(level=pl.Level.CORE_GROUP, name_hint="decode_tp_input_reuse",
+                   allow_early_resolve=False) as reuse_tid:
+            for peer in pl.range(TP_SIZE):
+                pld.system.wait(input_arrived, offsets=[peer, 0], expected=(attention_epoch - 1) * 2,
+                                cmp=pld.WaitCmp.Ge)
+        with pl.at(level=pl.Level.CORE_GROUP, name_hint="decode_tp_input_publish",
+                   deps=[reuse_tid]) as publish_tid:
+            pld.tensor.put(dst=input_window, peer=group_base + tp_rank, src=local_input,
+                           dst_offsets=[0, 0], src_offsets=[0, 0], shape=[local_count, D],
+                           chunk_rows=1, chunk_cols=512, pipeline=True)
+            for peer in pl.range(TP_SIZE):
+                pld.system.notify(input_arrived, peer=group_base + peer, offsets=[tp_rank, 0],
+                                  value=1, op=pld.NotifyOp.AtomicAdd)
+        with pl.at(level=pl.Level.CORE_GROUP, name_hint="decode_tp_input_wait", deps=[publish_tid],
+                   allow_early_resolve=False) as arrived_tid:
+            for peer in pl.range(TP_SIZE):
+                pld.system.wait(input_arrived, offsets=[peer, 0], expected=attention_epoch * 2 - 1,
+                                cmp=pld.WaitCmp.Ge)
+        with pl.spmd(64, name_hint="decode_tp_input_gather", deps=[arrived_tid]) as gather_tid:
+            worker = pl.tile.get_block_idx()
+            for tile in pl.range(worker, num_tokens * (D // 512), 64):
+                row = tile // (D // 512)
+                col = tile % (D // 512) * 512
+                peer = row // width
+                value = pld.tile.remote_load(input_window, peer=group_base + peer,
+                                             offsets=[row - peer * width, col], shape=[1, 512])
+                gathered = pl.store(value, [row, col], gathered)
+        with pl.spmd(64, name_hint="decode_tp_input_zero_padding", deps=[gather_tid]) as zeroed_tid:
+            # Rows past the active range are never gathered; they are still written
+            # as zeros so the whole scratch is deterministic on every rank.  The
+            # harness seeds the buffer with a sentinel to prove this write happens.
+            worker = pl.tile.get_block_idx()
+            rows = pl.tensor.dim(gathered, 0)
+            for tile in pl.range(worker, rows * (D // 512), 64):
+                row = tile // (D // 512)
+                if row >= num_tokens:
+                    col = tile % (D // 512) * 512
+                    gathered = pl.store(pl.tile.full([1, 512], dtype=pl.BF16, value=0.0), [row, col], gathered)
+        with pl.at(level=pl.Level.CORE_GROUP, name_hint="decode_tp_input_release",
+                   deps=[zeroed_tid]) as released_tid:
+            for peer in pl.range(TP_SIZE):
+                pld.system.notify(input_arrived, peer=group_base + peer, offsets=[tp_rank, 0],
+                                  value=1, op=pld.NotifyOp.AtomicAdd)
+        with pl.at(level=pl.Level.CORE_GROUP, name_hint="decode_tp_input_consumed",
+                   deps=[released_tid], allow_early_resolve=False):
+            for peer in pl.range(TP_SIZE):
+                pld.system.wait(input_arrived, offsets=[peer, 0], expected=attention_epoch * 2,
+                                cmp=pld.WaitCmp.Ge)
     return gathered
 
 

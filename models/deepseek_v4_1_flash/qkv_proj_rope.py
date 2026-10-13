@@ -316,7 +316,7 @@ _project_qb = make_mx_projection(Q_LORA, LOCAL_H * HEAD_DIM, name_hint="attentio
 _project_kv = make_mx_projection(D, HEAD_DIM, name_hint="attention_kv")
 _normalize_q = make_norm(Q_LORA, name_hint="attention_q_norm")
 _normalize_kv = make_norm(HEAD_DIM, name_hint="attention_kv_norm")
-_rotate_q = make_rope(LOCAL_H, name_hint="attention_q_rope")
+_rotate_q = make_rope(LOCAL_H, max_workers=64, name_hint="attention_q_rope")
 _rotate_kv = make_rope(1, name_hint="attention_kv_rope")
 
 _prefill_normalize_q = make_norm(
