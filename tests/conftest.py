@@ -44,6 +44,10 @@ def _install_pypto_stubs() -> None:
         Ascend910B = "Ascend910B"
         Ascend950 = "Ascend950"
 
+    class ExecutionMode(enum.Enum):
+        ONBOARD = "ONBOARD"
+        SIM = "SIM"
+
     # golden's run() drives both phases off one RunConfig, so the stub has to
     # answer the same reads the real one does: the platform axes, the compile
     # mapping and the DFX view. A bare kwargs bag would let every one of those
@@ -97,7 +101,13 @@ def _install_pypto_stubs() -> None:
                 setattr(self, name, kwargs.get(name, 0))
 
     class RunConfig:
-        def __init__(self, platform="a2a3sim", **kwargs):
+        def __init__(
+            self, platform=None, *, backend_type=BackendType.Ascend910B,
+            execution_mode=ExecutionMode.SIM, **kwargs,
+        ):
+            if platform is None:
+                arch = "a5" if backend_type == BackendType.Ascend950 else "a2a3"
+                platform = arch + ("sim" if execution_mode is ExecutionMode.SIM else "")
             if platform not in _PLATFORM_BACKEND:
                 raise ValueError(
                     f"Invalid platform {platform!r}. "
@@ -110,6 +120,7 @@ def _install_pypto_stubs() -> None:
                     f"{unknown[0]!r}"
                 )
             self.platform = platform
+            self.execution_mode = ExecutionMode.SIM if platform.endswith("sim") else ExecutionMode.ONBOARD
             for name, default in _RUN_CONFIG_FIELDS.items():
                 setattr(self, name, kwargs.get(name, default))
 
@@ -213,8 +224,10 @@ def _install_pypto_stubs() -> None:
     ir.DistributedCompiledProgram = object
     ir.DistributedConfig = _DistributedConfig
     runtime.execute_compiled = _unavailable
+    runtime.ExecutionMode = ExecutionMode
     runtime.RunConfig = RunConfig
     runtime.DfxOptions = DfxOptions
+
     # golden's run() reads the level before overriding it so it can put the
     # process-global threshold back afterwards; the stub answers both halves.
     log_config.configure_log = lambda *_a, **_k: None
