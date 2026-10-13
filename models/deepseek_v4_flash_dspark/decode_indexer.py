@@ -392,8 +392,11 @@ def indexer_score_topk_stream(
         query_count = pl.tensor.dim(position_ids, 0)
         pl.system.set_ffts(ffts)
         for item in pl.range(worker, query_count // STREAM_QUERY_TILE * max_leaves, TOPK_SCORE_WORKERS):
-            query = item // max_leaves * STREAM_QUERY_TILE
-            leaf = item % max_leaves
+            # Visit all query groups for each leaf before moving to the next
+            # leaf so short causal tails do not skew the persistent workers.
+            query_groups = query_count // STREAM_QUERY_TILE
+            query = item % query_groups * STREAM_QUERY_TILE
+            leaf = item // query_groups
             batch = query // S
             cache_len = pl.read(kv_seq_lens, [batch]) // COMPRESS_RATIO
             position = pl.read(position_ids, [query + STREAM_QUERY_TILE - 1])
@@ -446,8 +449,9 @@ def indexer_score_topk_stream(
         for lane in pl.split_aiv(2, mode=pl.SplitMode.NONE):
             pl.system.set_ffts(ffts)
             for item in pl.range(worker, query_count // STREAM_QUERY_TILE * max_leaves, TOPK_SCORE_WORKERS):
-                query = item // max_leaves * STREAM_QUERY_TILE
-                leaf = item % max_leaves
+                query_groups = query_count // STREAM_QUERY_TILE
+                query = item % query_groups * STREAM_QUERY_TILE
+                leaf = item // query_groups
                 batch = query // S
                 cache_len = pl.read(kv_seq_lens, [batch]) // COMPRESS_RATIO
                 last_position = pl.read(position_ids, [query + STREAM_QUERY_TILE - 1])

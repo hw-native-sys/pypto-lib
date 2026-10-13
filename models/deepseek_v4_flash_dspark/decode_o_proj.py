@@ -38,6 +38,8 @@ config.TP = TP_SIZE
 import pypto.language as pl
 import pypto.language.distributed as pld
 
+from hc_post import HC_D_BLOCKS, HC_D_TILE
+
 from config import (
     DECODE_TOKENS,
     FLASH as M,
@@ -151,19 +153,17 @@ if T_PAD % PROJ_B_MM_T_TILE != 0:
 
 
 @pl.jit.inline
-def _decode_o_proj_tp1_tiled(
+def _decode_o_proj_tp1_partials(
     o_packed: pl.Tensor[[O_GROUPS * T_PAD, O_GROUP_IN], pl.BF16],
     wo_a: pl.Tensor[[O_GROUPS, O_LORA, O_GROUP_IN], pl.BF16, pl.NZ],
     wo_b: pl.Tensor[[O_GROUPS, D, O_LORA], pl.INT8, pl.NZ],
-    wo_b_scale: pl.Tensor[[D], pl.FP32],
-    attn_out: pl.Tensor[[T_DYN, D], pl.BF16],
+    t_dim: pl.Scalar[pl.INDEX],
     heads_dep: pl.Scalar[pl.TASK_ID],
+    proj_b_tids: pl.Array[O_GROUPS, pl.TASK_ID],
     ROW_TILE: pl.constexpr,
     A_COL_TILE: pl.constexpr,
 ):
-    """Project local-token, full-group attention heads into BF16 hidden rows."""
-    t_dim = pl.tensor.dim(attn_out, 0)
-    act_t_blks = (t_dim + PROJ_B_ACT_TASK_T_TILE - 1) // PROJ_B_ACT_TASK_T_TILE
+    """Compute INT32 group partials and their FP32 activation scales."""
     proj_a_rows = (t_dim + PROJ_A_ROW_TILE - 1) // PROJ_A_ROW_TILE
     proj_b_t_rows = (t_dim + ROW_TILE - 1) // ROW_TILE
     proj_b_padded_rows = proj_b_t_rows * ROW_TILE
@@ -180,7 +180,6 @@ def _decode_o_proj_tp1_tiled(
     # Per-group INT32 partials: proj_b_mm writes group g's contribution to output
     # channel n at partials[:, g*D + n]. No atomic-add -> no zero-seed.
     partials = pl.create_tensor([T_PAD, O_GROUPS * D], dtype=pl.INT32)
-    proj_b_tids = pl.array.create(O_GROUPS, pl.TASK_ID)
 
     with pl.manual_scope():
         for g in pl.parallel(O_GROUPS):
@@ -256,18 +255,55 @@ def _decode_o_proj_tp1_tiled(
                     dc = pb_unit % (D // PROJ_B_D_TILE)
                     t0 = tb * ROW_TILE
                     d0 = dc * PROJ_B_D_TILE
+                    # Both N256 outputs consume the same activation. Keep it in
+                    # L1 while streaming weights through the existing K pipeline.
+                    activation_l1 = pl.load(
+                        o_r_i8_pad, [t0, col_g], [ROW_TILE, O_LORA],
+                        target_memory=pl.MemorySpace.Mat,
+                    )
                     for nf in pl.range(PROJ_B_D_TILE // PROJ_B_MM_N_TILE):
                         n0 = d0 + nf * PROJ_B_MM_N_TILE
-                        acc_b = pl.create_tensor([1, ROW_TILE, PROJ_B_MM_N_TILE], dtype=pl.INT32)
+                        resident_acc_b = pl.create_tile(
+                            [ROW_TILE, PROJ_B_MM_N_TILE], dtype=pl.INT32,
+                            target_memory=pl.MemorySpace.Acc,
+                        )
                         for kb in pl.pipeline(0, O_LORA // B_K_TILE, stage=2):
-                            k0 = col_g + kb * B_K_TILE
                             wb_k0 = kb * B_K_TILE
-                            b_act = o_r_i8_pad[t0 : t0 + ROW_TILE, k0 : k0 + B_K_TILE]
-                            b_weight = wo_b[g : g + 1, n0 : n0 + PROJ_B_MM_N_TILE, wb_k0 : wb_k0 + B_K_TILE]
-                            acc_b = pl.matmul_acc(acc_b, b_act, b_weight, b_trans=True, init_cond=(kb == 0))
-                        acc_b_2d = pl.reshape(acc_b, [ROW_TILE, PROJ_B_MM_N_TILE])
-                        partials[t0 : t0 + ROW_TILE, g * D + n0 : g * D + n0 + PROJ_B_MM_N_TILE] = acc_b_2d
+                            b_weight_l1 = pl.load(
+                                wo_b, [g, n0, wb_k0], [1, PROJ_B_MM_N_TILE, B_K_TILE],
+                                target_memory=pl.MemorySpace.Mat,
+                            )
+                            b_weight_2d = pl.reshape(b_weight_l1, [PROJ_B_MM_N_TILE, B_K_TILE])
+                            b_weight_t = pl.tile.transpose_view(b_weight_2d)
+                            b_act_l1 = pl.tile.slice(activation_l1, [ROW_TILE, B_K_TILE], [0, wb_k0])
+                            # Mat operands retain the compiler's K128 L0 ping-pong.
+                            resident_acc_b = pl.tile.matmul_acc(
+                                resident_acc_b, b_act_l1, b_weight_t, init_cond=(kb == 0),
+                            )
+                        partials = pl.store(resident_acc_b, [t0, g * D + n0], partials)
                 proj_b_tids[g] = pb_tid
+
+    return partials, act_scale_dq
+
+
+@pl.jit.inline
+def _decode_o_proj_tp1_tiled(
+    o_packed: pl.Tensor[[O_GROUPS * T_PAD, O_GROUP_IN], pl.BF16],
+    wo_a: pl.Tensor[[O_GROUPS, O_LORA, O_GROUP_IN], pl.BF16, pl.NZ],
+    wo_b: pl.Tensor[[O_GROUPS, D, O_LORA], pl.INT8, pl.NZ],
+    wo_b_scale: pl.Tensor[[D], pl.FP32],
+    attn_out: pl.Tensor[[T_DYN, D], pl.BF16],
+    heads_dep: pl.Scalar[pl.TASK_ID],
+    ROW_TILE: pl.constexpr,
+    A_COL_TILE: pl.constexpr,
+):
+    """Project local-token attention heads into BF16 hidden rows."""
+    t_dim = pl.tensor.dim(attn_out, 0)
+    act_t_blks = (t_dim + PROJ_B_ACT_TASK_T_TILE - 1) // PROJ_B_ACT_TASK_T_TILE
+    proj_b_tids = pl.array.create(O_GROUPS, pl.TASK_ID)
+    partials, act_scale_dq = _decode_o_proj_tp1_partials(
+        o_packed, wo_a, wo_b, t_dim, heads_dep, proj_b_tids, ROW_TILE, A_COL_TILE,
+    )
 
     # proj_b_act sums the O_GROUPS INT32 partials -- each dequantized by its group's
     # per-row act scale -- then applies the per-channel weight scale -> BF16. Explicit
@@ -316,6 +352,118 @@ def decode_o_proj_tp1(
     else:
         attn_out = _decode_o_proj_tp1_tiled(o_packed, wo_a, wo_b, wo_b_scale, attn_out, heads_dep, PROJ_B_MM_T_TILE, PROJ_A_LARGE_N_TILE)
     return attn_out
+
+
+HC_MULT = M.hc_mult
+HC_ACT_TASK_T_TILE = 4
+
+
+@pl.jit.inline
+def _decode_o_proj_tp1_hc_tiled(
+    o_packed: pl.Tensor[[O_GROUPS * T_PAD, O_GROUP_IN], pl.BF16],
+    wo_a: pl.Tensor[[O_GROUPS, O_LORA, O_GROUP_IN], pl.BF16, pl.NZ],
+    wo_b: pl.Tensor[[O_GROUPS, D, O_LORA], pl.INT8, pl.NZ],
+    wo_b_scale: pl.Tensor[[D], pl.FP32],
+    residual: pl.Tensor[[T_DYN, HC_MULT, D], pl.FP32],
+    post: pl.Tensor[[T_DYN, HC_MULT], pl.FP32],
+    comb: pl.Tensor[[T_DYN, HC_MULT * HC_MULT], pl.FP32],
+    x_out: pl.Tensor[[T_DYN, HC_MULT, D], pl.FP32],
+    heads_dep: pl.Scalar[pl.TASK_ID],
+    ROW_TILE: pl.constexpr,
+    A_COL_TILE: pl.constexpr,
+):
+    """Fuse O-B dequantization, BF16 rounding and FP32 HC post-mix."""
+    t_dim = pl.tensor.dim(x_out, 0)
+    proj_b_tids = pl.array.create(O_GROUPS, pl.TASK_ID)
+    partials, act_scale_dq = _decode_o_proj_tp1_partials(
+        o_packed, wo_a, wo_b, t_dim, heads_dep, proj_b_tids, ROW_TILE, A_COL_TILE,
+    )
+
+    _decode_o_proj_hc_post(partials, act_scale_dq, wo_b_scale, residual, post, comb, x_out, proj_b_tids)
+    return x_out
+
+
+@pl.jit.inline(auto_scope=False)
+def _decode_o_proj_hc_post(
+    partials: pl.Tensor[[T_PAD, O_GROUPS * D], pl.INT32],
+    act_scale_dq: pl.Tensor[[O_GROUPS, T_PAD], pl.FP32],
+    wo_b_scale: pl.Tensor[[D], pl.FP32],
+    residual: pl.Tensor[[T_DYN, HC_MULT, D], pl.FP32],
+    post: pl.Tensor[[T_DYN, HC_MULT], pl.FP32],
+    comb: pl.Tensor[[T_DYN, HC_MULT * HC_MULT], pl.FP32],
+    x_out: pl.Tensor[[T_DYN, HC_MULT, D], pl.FP32],
+    proj_b_tids: pl.Array[O_GROUPS, pl.TASK_ID],
+):
+    """Dequantize projection partials and mix HC rows with bounded UB storage."""
+    t_dim = pl.tensor.dim(x_out, 0)
+    act_t_blks = (t_dim + HC_ACT_TASK_T_TILE - 1) // HC_ACT_TASK_T_TILE
+    y_flat = pl.reshape(x_out, [t_dim, HC_MULT * D])
+    with pl.spmd(act_t_blks * HC_D_BLOCKS, name_hint="proj_b_act_hc_post",
+                 deps=[proj_b_tids[i] for i in range(O_GROUPS)], allow_early_resolve=True) as _act_tid:
+        act_idx = pl.tile.get_block_idx()
+        t0 = act_idx // HC_D_BLOCKS * HC_ACT_TASK_T_TILE
+        d0 = act_idx % HC_D_BLOCKS * HC_D_TILE
+        wb_scale = pl.load(wo_b_scale, [d0], [HC_D_TILE], target_memory=pl.MemorySpace.Vec)
+        wb_scale_row = pl.reshape(wb_scale, [1, HC_D_TILE])
+        for t in pl.range(t0, pl.min(t0 + HC_ACT_TASK_T_TILE, t_dim)):
+            acc = pl.tile.full([1, HC_D_TILE], dtype=pl.FP32, value=0.0)
+            for act_g in pl.pipeline(O_GROUPS, stage=2):
+                p_col0 = act_g * D + d0
+                p_g = pl.load(partials, [t, p_col0], [1, HC_D_TILE], target_memory=pl.MemorySpace.Vec)
+                g_scale = pl.read(act_scale_dq, [act_g, t])
+                p_g_f32 = pl.cast(p_g, target_type=pl.FP32, mode="none")
+                acc = pl.add(acc, pl.mul(p_g_f32, g_scale))
+            out_t = pl.mul(acc, wb_scale_row)
+            # Preserve the projection's BF16 rounding before FP32 HC math.
+            out_bf16 = pl.cast(out_t, target_type=pl.BF16, mode="rint")
+            x_row = pl.cast(out_bf16, target_type=pl.FP32)
+            residual_tile = pl.load(
+                residual, [t, 0, d0], [1, HC_MULT, HC_D_TILE],
+                target_memory=pl.MemorySpace.Vec,
+            )
+            residual_bank = pl.reshape(residual_tile, [HC_MULT, HC_D_TILE])
+            for out_h in pl.unroll(HC_MULT):
+                post_w = pl.read(post, [t, out_h])
+                y_row = pl.mul(x_row, post_w)
+                for in_h in pl.unroll(HC_MULT):
+                    comb_w = pl.read(comb, [t, in_h * HC_MULT + out_h])
+                    res_row = pl.tile.slice(residual_bank, [1, HC_D_TILE], [in_h, 0])
+                    y_row = pl.add(y_row, pl.mul(res_row, comb_w))
+                out_d0 = out_h * D + d0
+                y_flat = pl.store(y_row, [t, out_d0], y_flat)
+    return x_out
+
+
+@pl.jit.inline(auto_scope=False)
+def decode_o_proj_tp1_hc(
+    o_packed: pl.Tensor[[O_GROUPS * T_PAD, O_GROUP_IN], pl.BF16],
+    wo_a: pl.Tensor[[O_GROUPS, O_LORA, O_GROUP_IN], pl.BF16, pl.NZ],
+    wo_b: pl.Tensor[[O_GROUPS, D, O_LORA], pl.INT8, pl.NZ],
+    wo_b_scale: pl.Tensor[[D], pl.FP32],
+    residual: pl.Tensor[[T_DYN, HC_MULT, D], pl.FP32],
+    post: pl.Tensor[[T_DYN, HC_MULT], pl.FP32],
+    comb: pl.Tensor[[T_DYN, HC_MULT * HC_MULT], pl.FP32],
+    x_out: pl.Tensor[[T_DYN, HC_MULT, D], pl.FP32],
+    heads_dep: pl.Scalar[pl.TASK_ID],
+):
+    """Fuse TP1 projection and HC post with bounded residual tiles."""
+    t_dim = pl.tensor.dim(x_out, 0)
+    if t_dim <= 32:
+        _decode_o_proj_tp1_hc_tiled(
+            o_packed, wo_a, wo_b, wo_b_scale, residual, post, comb, x_out,
+            heads_dep, PROJ_B_SMALL_T_TILE, PROJ_A_MM_N_TILE,
+        )
+    elif t_dim <= 96:
+        _decode_o_proj_tp1_hc_tiled(
+            o_packed, wo_a, wo_b, wo_b_scale, residual, post, comb, x_out,
+            heads_dep, PROJ_B_MEDIUM_T_TILE, PROJ_A_MM_N_TILE,
+        )
+    else:
+        _decode_o_proj_tp1_hc_tiled(
+            o_packed, wo_a, wo_b, wo_b_scale, residual, post, comb, x_out,
+            heads_dep, PROJ_B_MM_T_TILE, PROJ_A_LARGE_N_TILE,
+        )
+    return x_out
 
 
 @pl.jit.incore

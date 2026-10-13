@@ -101,7 +101,7 @@ from decode_o_proj import (
     LOCAL_T,
     LOCAL_T_PAD,
     O_WINDOW_ROWS,
-    decode_o_proj_tp1,
+    decode_o_proj_tp1_hc,
     o_group_a2a,
     o_proj_reduce_scatter,
 )
@@ -937,8 +937,9 @@ def _decode_csa_tp1(
             attn_sink, freqs_cos, freqs_sin,
             o_packed_heads,
         )
-        attn_out = decode_o_proj_tp1(o_packed_heads, wo_a, wo_b, wo_b_scale, attn_out, heads_dep)
-        hc_post(attn_out, x_hc, post_t, comb_t, x_out)
+        decode_o_proj_tp1_hc(
+            o_packed_heads, wo_a, wo_b, wo_b_scale, x_hc, post_t, comb_t, x_out, heads_dep,
+        )
     return x_out
 
 
