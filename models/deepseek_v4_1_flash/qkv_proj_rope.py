@@ -9,19 +9,91 @@
 """Shared V4.1 Q/KV projection, normalization, and RoPE stages."""
 
 import pypto.language as pl
+import torch
 
-from models.deepseek_v4_1_flash.attention_ops import (
+from attention_ops import (
     MX_M_TILE,
     N_TILE,
     make_norm,
     make_mx_projection,
     make_rope,
 )
-from models.deepseek_v4_1_flash.config import D, HEAD_DIM, LOCAL_H, Q_LORA, ROPE_DIM, T_DYN
+from config import FLASH as M, T_DYN, TP_SIZE
+
+
+
+from quantization import mxfp8_linear
+from rmsnorm import golden_rms_norm_reference
+
+
+# model config
+LOCAL_H = M.num_attention_heads // TP_SIZE
+D = M.hidden_size
+HEAD_DIM = M.head_dim
+ROPE_DIM = M.qk_rope_head_dim
+Q_LORA = M.q_lora_rank
 
 
 _PREFILL_WORKERS = 64
 _PREFILL_PROJECTION_K_TILE = 32
+
+
+from quantization import prefill_round_activation
+
+
+def prefill_rotate(value, cosine, sine, *, inverse=False, precision="fp32"):
+    """Rotate adjacent pairs in FP32, then restore the selected activation precision."""
+    width = cosine.shape[-1] * 2
+    return prefill_round_activation(torch.cat(
+        (
+            value[..., :-width],
+            golden_rope_interleave(value[..., -width:], cosine, sine, inverse=inverse),
+        ),
+        dim=-1,
+    ), precision)
+
+
+def golden_rope_interleave(
+    x: torch.Tensor,
+    cos: torch.Tensor,
+    sin: torch.Tensor,
+    inverse: bool = False,
+) -> torch.Tensor:
+    """Apply adjacent-pair rotary embedding to the final dimension."""
+    value = x.float().unflatten(-1, (-1, 2))
+    real, imag = value.unbind(dim=-1)
+    if inverse:
+        sin = -sin
+    while cos.ndim < real.ndim:
+        cos = cos.unsqueeze(-2)
+        sin = sin.unsqueeze(-2)
+    rotated = torch.stack((real * cos - imag * sin, imag * cos + real * sin), dim=-1)
+    return rotated.flatten(-2).to(x.dtype)
+
+
+def golden_qkv_proj_rope(
+    x: torch.Tensor,
+    wq_a: torch.Tensor,
+    wq_a_scale: torch.Tensor | None,
+    q_norm_weight: torch.Tensor,
+    wq_b: torch.Tensor,
+    wq_b_scale: torch.Tensor | None,
+    wkv: torch.Tensor,
+    wkv_scale: torch.Tensor | None,
+    kv_norm_weight: torch.Tensor,
+    cos: torch.Tensor,
+    sin: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Project normalized query latent and shared KV, then rotate their RoPE tails."""
+    qr = golden_rms_norm_reference(mxfp8_linear(x, wq_a, wq_a_scale), q_norm_weight)
+    head_dim = wkv.shape[-1]
+    num_heads = wq_b.shape[-1] // head_dim
+    q = mxfp8_linear(qr, wq_b, wq_b_scale).unflatten(-1, (num_heads, head_dim))
+    kv = golden_rms_norm_reference(mxfp8_linear(x, wkv, wkv_scale), kv_norm_weight)
+    rd = cos.shape[-1] * 2
+    q = torch.cat((q[..., :-rd], golden_rope_interleave(q[..., -rd:], cos, sin)), dim=-1)
+    kv = torch.cat((kv[..., :-rd], golden_rope_interleave(kv[..., -rd:], cos, sin)), dim=-1)
+    return q, kv, qr
 
 
 @pl.jit.inline

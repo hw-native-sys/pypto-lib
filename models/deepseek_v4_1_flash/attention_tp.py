@@ -12,14 +12,13 @@ import pypto.language as pl
 import pypto.language.distributed as pld
 import torch
 
-from models.deepseek_v4_1_flash.config import (
-    D,
-    DECODE_MAX_TOKENS,
-    LOCAL_T_DYN,
-    PREFILL_MAX_TOKENS,
-    T_DYN,
-    TP_SIZE,
-)
+from config import DECODE_MAX_TOKENS, PREFILL_MAX_TOKENS, FLASH as M, LOCAL_T_DYN, T_DYN, TP_SIZE
+
+
+
+# model config
+D = M.hidden_size
+
 
 # Token extent of the sequence-parallel shard a rank keeps after the attention
 # output reduce-scatter; the plain all-reduce path keeps the full extent.

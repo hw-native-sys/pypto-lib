@@ -8,37 +8,24 @@
 # -----------------------------------------------------------------------------------------------------------
 """Continuous-batch decode C1A reuse attention."""
 
-import sys
-from pathlib import Path
-
-if __package__ in (None, ""):
-    sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
-
-# ci: no-sim
 import pypto.language as pl
 import pypto.language.distributed as pld
 
-from models.deepseek_v4_1_flash.config import (
-    CMP_BLOCKS_DYN,
+from config import (
     COMPRESSED_CACHE_GROUP,
-    D,
     DECODE_MAX_TOKENS,
-    HEAD_DIM,
-    INDEX_TOPK,
-    LOCAL_H,
-    LOCAL_O_GROUPS,
-    LOCAL_O_WIDTH,
-    ORI_BLOCKS_DYN,
-    O_GROUP_IN,
-    O_LORA,
-    Q_LORA,
-    ROPE_DIM,
-    TP_SIZE,
-    T_DYN,
     WINDOW_CACHE_GROUP,
+    FLASH as M,
+    CMP_BLOCKS_DYN,
+    ORI_BLOCKS_DYN,
+    T_DYN,
+    TP_SIZE,
 )
-from models.deepseek_v4_1_flash.attention_tp import OUTPUT_T_DYN
-from models.deepseek_v4_1_flash.decode_attn_c1a_full import (
+
+
+
+from attention_tp import OUTPUT_T_DYN
+from decode_attn_c1a_full import (
     c1a_finish,
     c1a_finish_sharded,
     c1a_prepare,
@@ -46,6 +33,19 @@ from models.deepseek_v4_1_flash.decode_attn_c1a_full import (
     golden_decode_attn_c1a_reuse,
     run_c1a,
 )
+
+
+# model config
+LOCAL_H = M.num_attention_heads // TP_SIZE
+LOCAL_O_GROUPS = M.o_groups // TP_SIZE
+LOCAL_O_WIDTH = M.o_groups // TP_SIZE * M.o_lora_rank
+D = M.hidden_size
+HEAD_DIM = M.head_dim
+ROPE_DIM = M.qk_rope_head_dim
+Q_LORA = M.q_lora_rank
+O_LORA = M.o_lora_rank
+O_GROUP_IN = M.num_attention_heads * M.head_dim // M.o_groups
+INDEX_TOPK = M.index_topk
 
 
 def make_decode_attn_c1a_reuse(output_reduce=None):
@@ -222,11 +222,6 @@ def validate(argv=None):
     return run_c1a("reuse", make_program, golden_decode_attn_c1a_reuse, argv=argv)
 
 
-# A2/A3 CI currently discovers runnable model files by the conventional entry
-# sentinel. Split its spelling so this A5-only command remains directly runnable.
-_SCRIPT_ENTRY_POINT = "__" + "main__"
-
-
 def main():
     """Run local validation and return a failing exit status on precision errors."""
     result = validate()
@@ -234,14 +229,5 @@ def main():
         raise SystemExit(result.error or 1)
 
 
-if "pytest" in sys.modules:
-    import pytest
-
-    @pytest.mark.parametrize("tp,dp", [(1, 1)])
-    def test_precision(tp, dp, a5_args):
-        """Validate the operator against its golden reference on A5."""
-        result = validate(a5_args(tp=tp, dp=dp))
-        assert result.passed, result.error
-
-if __name__ == _SCRIPT_ENTRY_POINT:
+if __name__ == "__main__":
     main()

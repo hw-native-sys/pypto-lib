@@ -15,21 +15,20 @@ into ``expert_shared.py``; both kernels are composed in ``moe.py``.
 import pypto.language as pl
 import pypto.language.distributed as pld
 
-from models.deepseek_v4_1_flash import config as C
-from models.deepseek_v4_1_flash.config import (
-    EP_SIZE as EP_WORLD_SIZE,
-    FLASH as M,
-    MOE_RECV_MAX as RECV_MAX,
-)
+from config import FLASH as M
 
-from models.deepseek_v4_1_flash.attention_ops import prefill_linear_inline
-from models.deepseek_v4_1_flash.attention_ops import prefill_linear_quantized_inline
-from models.deepseek_v4_1_flash.config import FLASH
-from models.deepseek_v4_1_flash.expert_shared import prefill_swiglu_inline
-from models.deepseek_v4_1_flash.gate import prefill_gate_select_inline
-from models.deepseek_v4_1_flash.quantization import prefill_decode_fp4_inline
-from models.deepseek_v4_1_flash.quantization import prefill_quantize_fp8_inline
-from models.deepseek_v4_1_flash.quantization import prefill_round_bf16_inline
+from config import EP_SIZE as EP_WORLD_SIZE, MOE_RECV_MAX as RECV_MAX
+from config import ROUTE_T_DYN
+
+
+from attention_ops import prefill_linear_inline
+from attention_ops import prefill_linear_quantized_inline
+
+from expert_shared import prefill_swiglu_inline
+from gate import prefill_gate_select_inline
+from quantization import prefill_decode_fp4_inline
+from quantization import prefill_quantize_fp8_inline
+from quantization import prefill_round_bf16_inline
 
 DECODE_BATCH = 8
 DECODE_SEQ = 1
@@ -116,7 +115,7 @@ def expert_routed_scatter(
     mxfp4_pair_lut: pl.Tensor[[2, 256], pl.INT16],
     recv_route: pl.Tensor[[N_LOCAL_EXPERTS, RECV_MAX], pl.INT32],
     recv_meta: pl.Tensor[[EP_WORLD_SIZE, N_LOCAL_EXPERTS], pl.INT32],
-    routed_output: pld.DistributedTensor[[C.ROUTE_T_DYN, D], pl.BF16],
+    routed_output: pld.DistributedTensor[[ROUTE_T_DYN, D], pl.BF16],
     input_ready: pl.Scalar[pl.TASK_ID],
 ):
     recv_x_flat = pl.reshape(recv_x, [N_LOCAL_EXPERTS * RECV_MAX, D])
@@ -625,7 +624,7 @@ def golden_expert_routed(tensors):
     import torch
     import torch.nn.functional as F
 
-    from models.deepseek_v4_1_flash.quantization import (
+    from quantization import (
         decode_e8m0_codes_v41 as decode_e8m0_codes,
         host_quant_swiglu_mxfp8_v41 as host_quant_swiglu_mxfp8,
         matmul_mx_golden_v41 as matmul_mx_golden,
@@ -707,7 +706,7 @@ def gen_routed_mxfp4_weights(n_experts, dequant_std, seed_base=0):
     """Generate checkpoint-style packed MXFP4 routed weights and scales."""
     import torch
 
-    from models.deepseek_v4_1_flash.quantization import (
+    from quantization import (
         pack_mx_b_scale,
         pack_mxfp4_weight_tiles,
         quantize_mxfp4_weight,
@@ -766,7 +765,7 @@ def gen_routed_mxfp4_weights(n_experts, dequant_std, seed_base=0):
 def build_tensor_specs():
     import torch
     from golden.spec import TensorSpec
-    from models.deepseek_v4_1_flash.quantization import (
+    from quantization import (
         build_mxfp4_pair_lut, host_quant_mxfp8_v41 as host_quant_mxfp8,
         pack_mx_a_scale as pack_a_scale,
     )
@@ -942,7 +941,6 @@ def active_recv_ratio_reldiff(*, diff_thd, pct_thd):
     return compare
 
 
-
 # Resident CED prefill precision variants.
 _PREFILL_MOE_T = pl.dynamic("V41_FP32_MOE_T")
 
@@ -953,7 +951,7 @@ _PREFILL_MOE_WORKERS = 32
 _PREFILL_MOE_M = pl.dynamic("V41_FP32_MOE_M")
 
 
-_PREFILL_MOE_D = FLASH.hidden_size
+_PREFILL_MOE_D = M.hidden_size
 
 
 _PREFILL_MOE_TILE = 256
@@ -981,7 +979,7 @@ def prefill_scatter_add_inline(
     return accumulator
 
 
-_PREFILL_MOE_INTER = FLASH.moe_intermediate_size
+_PREFILL_MOE_INTER = M.moe_intermediate_size
 
 
 @pl.jit.inline(auto_scope=False)
@@ -1010,13 +1008,13 @@ _PREFILL_MOE_ROUTES = pl.dynamic("V41_MOE_ROUTES")
 _PREFILL_WEIGHT_OPS_BLOCKS4 = pl.dynamic("V41_WEIGHT_BLOCKS4")
 
 
-_PREFILL_MOE_TOPK = FLASH.num_experts_per_tok
+_PREFILL_MOE_TOPK = M.num_experts_per_tok
 
 
-_PREFILL_MOE_EXPERTS = FLASH.n_routed_experts
+_PREFILL_MOE_EXPERTS = M.n_routed_experts
 
 
-_PREFILL_MOE_LOCAL_EXPERTS = _PREFILL_MOE_EXPERTS // 4
+_PREFILL_MOE_LOCAL_EXPERTS = _PREFILL_MOE_EXPERTS // EP_WORLD_SIZE
 
 
 @pl.jit.inline(auto_scope=False)
@@ -1032,7 +1030,7 @@ def prefill_routed_moe_inline(
     rank: pl.Scalar[pl.INDEX],
     official: pl.Scalar[pl.INT32],
 ):
-    """Compute one contiguous rank's 96 routed experts without host routing.
+    """Compute one rank's contiguous routed experts without host routing.
 
     Gate selection covers all 384 experts. Each expert sees compact rows in
     original token order and writes its own token/top-k contribution slots.

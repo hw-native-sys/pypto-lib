@@ -14,16 +14,36 @@ from collections.abc import Callable
 import torch
 
 from golden import ScalarSpec, TensorSpec
-from models.deepseek_v4_1_flash import config as C
-from models.deepseek_v4_1_flash.attention_common import _project_output
-from models.deepseek_v4_1_flash.golden import paged_indexer, qkv_proj_rope
-from models.deepseek_v4_1_flash.quantization import (
+
+from config import FLASH as M, TP_SIZE, COMPRESSED_CACHE_GROUP, INDEX_CACHE_GROUP
+
+
+
+from attention_common import _project_output
+from hierarchical_sparse_indexer import golden_paged_indexer as paged_indexer
+from qkv_proj_rope import golden_qkv_proj_rope as qkv_proj_rope
+from quantization import (
     dequantize_mxfp4_cache,
     dequantize_mxfp8_cache,
     pack_mx_b_scale,
     quantize_mxfp4_cache,
     quantize_mxfp8_cache,
 )
+
+
+# model config
+LOCAL_H = M.num_attention_heads // TP_SIZE
+LOCAL_O_GROUPS = M.o_groups // TP_SIZE
+LOCAL_O_WIDTH = M.o_groups // TP_SIZE * M.o_lora_rank
+D = M.hidden_size
+HEAD_DIM = M.head_dim
+ROPE_DIM = M.qk_rope_head_dim
+Q_LORA = M.q_lora_rank
+O_LORA = M.o_lora_rank
+O_GROUP_IN = M.num_attention_heads * M.head_dim // M.o_groups
+INDEX_H = M.index_n_heads
+INDEX_DIM = M.index_head_dim
+INDEX_TOPK = M.index_topk
 
 
 CASE_DEFAULT = "multi_1k"
@@ -67,7 +87,7 @@ COMMON_INPUT_NAMES = (
 
 
 def _ranked(value: torch.Tensor) -> torch.Tensor:
-    return value.unsqueeze(0).repeat(C.TP_SIZE, *([1] * value.ndim)).contiguous()
+    return value.unsqueeze(0).repeat(TP_SIZE, *([1] * value.ndim)).contiguous()
 
 
 def _fp8_weight(input_width: int, output_width: int) -> tuple[torch.Tensor, torch.Tensor]:
@@ -79,7 +99,7 @@ def _fp8_weight(input_width: int, output_width: int) -> tuple[torch.Tensor, torc
 
 
 def _ranked_fp8_weight(input_width: int, output_width: int, shared: bool) -> tuple[torch.Tensor, torch.Tensor]:
-    pairs = [_fp8_weight(input_width, output_width) for _ in range(1 if shared else C.TP_SIZE)]
+    pairs = [_fp8_weight(input_width, output_width) for _ in range(1 if shared else TP_SIZE)]
     if shared:
         weight = _ranked(pairs[0][0])
         scale = _ranked(pairs[0][1])
@@ -119,7 +139,7 @@ def _case_metadata(token_count: int, case_name: str) -> tuple[torch.Tensor, ...]
     slots = block_table[request_ids.to(torch.long), pages] * CASE_PAGE + offsets
 
     window_indices = torch.full((request_ids.numel(), CASE_PAGE), -1, dtype=torch.int32)
-    compressed_indices = torch.full((request_ids.numel(), C.INDEX_TOPK), -1, dtype=torch.int32)
+    compressed_indices = torch.full((request_ids.numel(), INDEX_TOPK), -1, dtype=torch.int32)
     candidate_mask = torch.zeros(request_ids.numel(), table_pages * CASE_PAGE, dtype=torch.uint8)
     for token in range(request_ids.numel()):
         request = int(request_ids[token])
@@ -128,7 +148,7 @@ def _case_metadata(token_count: int, case_name: str) -> tuple[torch.Tensor, ...]
         physical = block_table[request, logical // CASE_PAGE] * CASE_PAGE + logical % CASE_PAGE
         window_count = min(visible, CASE_PAGE)
         window_indices[token, :window_count] = physical[-window_count:].to(torch.int32)
-        compressed_count = min(visible, C.INDEX_TOPK)
+        compressed_count = min(visible, INDEX_TOPK)
         compressed_indices[token, :compressed_count] = physical[:compressed_count].to(torch.int32)
         candidate_mask[token, :visible] = 1
 
@@ -156,57 +176,57 @@ def make_fixture_values(token_count: int, case_name: str) -> dict[str, torch.Ten
     ) = _case_metadata(token_count, case_name)
     token_count = request_ids.numel()
     cache_blocks = block_table.numel()
-    wq_a, wq_a_scale = _ranked_fp8_weight(C.D, C.Q_LORA, shared=True)
+    wq_a, wq_a_scale = _ranked_fp8_weight(D, Q_LORA, shared=True)
     wq_b, wq_b_scale = _ranked_fp8_weight(
-        C.Q_LORA,
-        C.LOCAL_H * C.HEAD_DIM,
+        Q_LORA,
+        LOCAL_H * HEAD_DIM,
         shared=False,
     )
-    wkv, wkv_scale = _ranked_fp8_weight(C.D, C.HEAD_DIM, shared=True)
-    wo_b, wo_b_scale = _ranked_fp8_weight(C.LOCAL_O_WIDTH, C.D, shared=False)
+    wkv, wkv_scale = _ranked_fp8_weight(D, HEAD_DIM, shared=True)
+    wo_b, wo_b_scale = _ranked_fp8_weight(LOCAL_O_WIDTH, D, shared=False)
     index_wq_b, index_wq_b_scale = _ranked_fp8_weight(
-        C.Q_LORA,
-        C.INDEX_H * C.INDEX_DIM,
+        Q_LORA,
+        INDEX_H * INDEX_DIM,
         shared=True,
     )
 
-    window_value = torch.randn(cache_blocks, CASE_PAGE, 1, C.HEAD_DIM).mul_(0.05)
+    window_value = torch.randn(cache_blocks, CASE_PAGE, 1, HEAD_DIM).mul_(0.05)
     window_cache, window_cache_scale = quantize_mxfp8_cache(window_value)
     window_cache_scale = window_cache_scale.view(torch.float8_e8m0fnu)
-    compressed_value = torch.randn(cache_blocks, CASE_PAGE, 1, C.HEAD_DIM).mul_(0.05)
+    compressed_value = torch.randn(cache_blocks, CASE_PAGE, 1, HEAD_DIM).mul_(0.05)
     compressed_cache, compressed_cache_scale = quantize_mxfp4_cache(
         compressed_value,
-        group_size=C.COMPRESSED_CACHE_GROUP,
+        group_size=COMPRESSED_CACHE_GROUP,
         scale_format="e4m3",
     )
-    index_value = torch.randn(cache_blocks, CASE_PAGE, 1, C.INDEX_DIM).mul_(0.05)
+    index_value = torch.randn(cache_blocks, CASE_PAGE, 1, INDEX_DIM).mul_(0.05)
     index_cache, index_cache_scale = quantize_mxfp4_cache(
         index_value,
-        group_size=C.INDEX_CACHE_GROUP,
+        group_size=INDEX_CACHE_GROUP,
         scale_format="e8m0",
     )
     index_cache_scale = index_cache_scale.view(torch.float8_e8m0fnu)
 
     angles = (compressed_lens - 1).to(torch.float32).unsqueeze(1)
-    angles = angles * torch.arange(C.ROPE_DIM // 2, dtype=torch.float32).unsqueeze(0) * 0.001
+    angles = angles * torch.arange(ROPE_DIM // 2, dtype=torch.float32).unsqueeze(0) * 0.001
     values = {
-        "x": _ranked(torch.randn(token_count, C.D).to(torch.bfloat16)),
+        "x": _ranked(torch.randn(token_count, D).to(torch.bfloat16)),
         "wq_a": wq_a,
         "wq_a_scale": wq_a_scale,
-        "q_norm_weight": _ranked(torch.ones(C.Q_LORA, dtype=torch.bfloat16)),
+        "q_norm_weight": _ranked(torch.ones(Q_LORA, dtype=torch.bfloat16)),
         "wq_b": wq_b,
         "wq_b_scale": wq_b_scale,
         "wkv": wkv,
         "wkv_scale": wkv_scale,
-        "kv_norm_weight": _ranked(torch.ones(C.HEAD_DIM, dtype=torch.bfloat16)),
-        "attn_sink": torch.zeros(C.TP_SIZE, C.LOCAL_H, dtype=torch.float32),
+        "kv_norm_weight": _ranked(torch.ones(HEAD_DIM, dtype=torch.bfloat16)),
+        "attn_sink": torch.zeros(TP_SIZE, LOCAL_H, dtype=torch.float32),
         "wo_a": torch.randn(
-            C.TP_SIZE,
-            C.LOCAL_O_GROUPS,
-            C.O_LORA,
-            C.O_GROUP_IN,
+            TP_SIZE,
+            LOCAL_O_GROUPS,
+            O_LORA,
+            O_GROUP_IN,
             dtype=torch.bfloat16,
-        ).mul_(C.O_GROUP_IN**-0.5),
+        ).mul_(O_GROUP_IN**-0.5),
         "wo_b": wo_b,
         "wo_b_scale": wo_b_scale,
         "rope_cos": _ranked(torch.cos(angles)),
@@ -227,21 +247,21 @@ def make_fixture_values(token_count: int, case_name: str) -> dict[str, torch.Ten
         "compressed_rope_cos": _ranked(torch.cos(angles)),
         "compressed_rope_sin": _ranked(torch.sin(angles)),
         "compressor_wkv": _ranked(
-            torch.randn(C.D, C.HEAD_DIM).mul_(C.D**-0.5).to(torch.bfloat16)
+            torch.randn(D, HEAD_DIM).mul_(D**-0.5).to(torch.bfloat16)
         ),
-        "compressor_norm_weight": _ranked(torch.ones(C.HEAD_DIM, dtype=torch.bfloat16)),
+        "compressor_norm_weight": _ranked(torch.ones(HEAD_DIM, dtype=torch.bfloat16)),
         "compressed_slots": _ranked(slots),
         "index_wk": _ranked(
-            torch.randn(C.HEAD_DIM, C.INDEX_DIM).mul_(C.HEAD_DIM**-0.5).to(torch.bfloat16)
+            torch.randn(HEAD_DIM, INDEX_DIM).mul_(HEAD_DIM**-0.5).to(torch.bfloat16)
         ),
-        "index_norm_weight": _ranked(torch.ones(C.INDEX_DIM, dtype=torch.bfloat16)),
+        "index_norm_weight": _ranked(torch.ones(INDEX_DIM, dtype=torch.bfloat16)),
         "index_wq_b": index_wq_b,
         "index_wq_b_scale": index_wq_b_scale,
         "index_weights_proj": _ranked(
-            torch.randn(C.D, C.INDEX_H).mul_(C.D**-0.5).to(torch.bfloat16)
+            torch.randn(D, INDEX_H).mul_(D**-0.5).to(torch.bfloat16)
         ),
     }
-    values["attn_norm_weight"] = _ranked((torch.randn(C.D).mul_(0.1).add_(1)).to(torch.bfloat16))
+    values["attn_norm_weight"] = _ranked((torch.randn(D).mul_(0.1).add_(1)).to(torch.bfloat16))
     return values
 
 
@@ -259,13 +279,13 @@ def make_tensor_specs(
     ]
     for name in output_names:
         if name == "topk_indices":
-            shape = [C.TP_SIZE, token_count, C.INDEX_TOPK]
+            shape = [TP_SIZE, token_count, INDEX_TOPK]
             dtype = torch.int32
         elif name == "candidate_mask":
             shape = list(values["candidate_mask"].shape)
             dtype = torch.uint8
         else:
-            shape = [C.TP_SIZE, token_count, C.D]
+            shape = [TP_SIZE, token_count, D]
             dtype = torch.bfloat16
         specs.append(TensorSpec(name, shape, dtype))
     specs.append(ScalarSpec("num_tokens", torch.int32, token_count))
@@ -274,7 +294,7 @@ def make_tensor_specs(
 
 def golden_c1a_attention_input(hidden: torch.Tensor, attn_norm_weight: torch.Tensor) -> torch.Tensor:
     """Apply the official attention RMSNorm after the BF16 mHC collapse."""
-    from models.deepseek_v4_1_flash.golden import rms_norm
+    from rmsnorm import golden_rms_norm_reference as rms_norm
 
     return rms_norm(hidden.to(torch.bfloat16), attn_norm_weight)
 
@@ -292,7 +312,7 @@ def golden_prefill_c1a_attention(
     sink: torch.Tensor,
 ) -> torch.Tensor:
     """Mirror C1A tiled online softmax, BF16 PV, and its FP32 first-vector patch."""
-    from models.deepseek_v4_1_flash.prefill_c1a_common import ATTENTION_TILE, M_TILE
+    from prefill_c1a_common import ATTENTION_TILE, M_TILE
 
     output = torch.empty_like(query)
     width = query.shape[-1]
@@ -396,7 +416,7 @@ def apply_distributed_golden(
         "compressed_indices",
     }
     results = []
-    for rank in range(C.TP_SIZE):
+    for rank in range(TP_SIZE):
         kwargs = {}
         for name in parameter_names:
             value = tensors[name][rank]
@@ -420,7 +440,7 @@ def apply_distributed_golden(
             _copy_storage(tensors["index_cache_scale"][rank], result.index_cache_scale)
             candidate_mask = tensors["candidate_mask"][rank]
             candidate_mask.zero_()
-            block_size = C.FLASH.candidate_block_size
+            block_size = M.candidate_block_size
             for token in range(result.candidate_mask.shape[0]):
                 selected = torch.nonzero(result.candidate_mask[token], as_tuple=False).flatten()
                 for block in torch.unique(selected // block_size):
@@ -443,7 +463,7 @@ def _golden_index_scores(
     index_payload = cache_outputs["index_cache"] if mode == "full" else inputs["index_cache"]
     index_scale = cache_outputs["index_cache_scale"] if mode == "full" else inputs["index_cache_scale"]
     index_value = dequantize_mxfp4_cache(
-        index_payload[rank], index_scale[rank], group_size=C.INDEX_CACHE_GROUP, scale_format="e8m0"
+        index_payload[rank], index_scale[rank], group_size=INDEX_CACHE_GROUP, scale_format="e8m0"
     ).to(torch.bfloat16)
     _, _, query_latent = qkv_proj_rope(
         inputs["x"][rank], inputs["wq_a"][rank], inputs["wq_a_scale"][rank],
@@ -457,7 +477,7 @@ def _golden_index_scores(
         index_value, inputs["index_block_table"][rank], inputs["compressed_lens"][rank],
         inputs["index_wq_b"][rank], inputs["index_wq_b_scale"][rank],
         inputs["index_weights_proj"][rank], inputs["rope_cos"][rank], inputs["rope_sin"][rank],
-        candidates=candidates, topk=C.INDEX_TOPK,
+        candidates=candidates, topk=INDEX_TOPK,
     )
     return scores
 
@@ -576,7 +596,7 @@ def _selected_output_reference(
         window = dequantize_mxfp8_cache(tensor("window_cache"), tensor("window_cache_scale"))
         compressed = dequantize_mxfp4_cache(
             tensor("compressed_cache"), tensor("compressed_cache_scale"),
-            group_size=C.COMPRESSED_CACHE_GROUP, scale_format="e4m3",
+            group_size=COMPRESSED_CACHE_GROUP, scale_format="e4m3",
         )
         attended = golden_prefill_c1a_attention(
             query, window.to(query.dtype), tensor("window_indices")[:active],
@@ -670,7 +690,7 @@ def _report_hc_stage(name: str, actual: torch.Tensor, expected: torch.Tensor) ->
 
 
 def _tp_replicated(actual: torch.Tensor) -> bool:
-    return all(torch.equal(actual[0], actual[rank]) for rank in range(1, C.TP_SIZE))
+    return all(torch.equal(actual[0], actual[rank]) for rank in range(1, TP_SIZE))
 
 
 def hc_hidden_compare() -> Callable:
@@ -706,8 +726,8 @@ def attn_input_compare() -> Callable:
 def hc_output_compare() -> Callable:
     """Replay mHC post on device attention output and bound full-chain relative L2."""
     from golden import ratio_allclose
-    from models.deepseek_v4_1_flash.hc_mixes import golden_mhc_mixes
-    from models.deepseek_v4_1_flash.hc_post import golden_mhc_post
+    from hc_mixes import golden_mhc_mixes
+    from hc_post import golden_mhc_post
 
     close = ratio_allclose(atol=1e-4, rtol=1.0 / 128)
 

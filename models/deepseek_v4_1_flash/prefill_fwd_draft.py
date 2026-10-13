@@ -6,7 +6,9 @@
 # INCLUDING BUT NOT LIMITED TO NON-INFRINGEMENT, MERCHANTABILITY, OR FITNESS FOR A PARTICULAR PURPOSE.
 # See LICENSE in the root of the software repository for the full text of the License.
 # -----------------------------------------------------------------------------------------------------------
-"""Resident four-rank CED prefill: one complete L2 invocation on each A5.
+# ci: devices=2
+# ci: no-sim
+"""Resident expert-parallel CED prefill: one complete L2 invocation on each A5.
 
 The host entry only creates communication windows and launches ranks. Encoder,
 global publication, decoder replay, routing and the vocabulary head execute
@@ -17,49 +19,39 @@ their exact decoded values feed the selected arithmetic policy.
 import pypto.language as pl
 import pypto.language.distributed as pld
 
-from models.deepseek_v4_1_flash.config import (
-    D,
-    FLASH,
-    HC_MULT,
-    HEAD_DIM,
-    INDEX_DIM,
-    INDEX_TOPK,
-    ROPE_DIM,
-    STATE_CAPACITY,
-)
-from models.deepseek_v4_1_flash.engram import prefill_engram_gate_inline as engram_gate_inline
-from models.deepseek_v4_1_flash.prefill_c1a_common import (
+from config import FLASH as M, STATE_CAPACITY, EP_SIZE
+
+from engram import prefill_engram_gate_inline as engram_gate_inline
+from prefill_c1a_common import (
     prefill_attention_inline as attention_inline,
     prefill_publish_decoder_inline as publish_decoder_inline,
 )
-from models.deepseek_v4_1_flash.attention_ops import (
+from attention_ops import (
     prefill_norm_inline as norm_inline,
     prefill_packed_linear_inline as packed_linear_inline,
 )
-from models.deepseek_v4_1_flash.quantization import prefill_round_inline as round_inline
-from models.deepseek_v4_1_flash.hc_post import (
+from quantization import prefill_round_inline as round_inline
+from hc_post import (
     prefill_add_inline as add_inline,
     prefill_hc_post_inline as hc_post_inline,
 )
-from models.deepseek_v4_1_flash.hc_mixes import (
+from hc_mixes import (
     prefill_hc_coefficients_inline as hc_coefficients_inline,
     prefill_hc_normalize_logits_inline as hc_normalize_logits_inline,
 )
-from models.deepseek_v4_1_flash.hc_pre import prefill_hc_pre_inline as hc_pre_inline
-from models.deepseek_v4_1_flash.expert_routed import prefill_routed_moe_inline as routed_moe_inline
-from models.deepseek_v4_1_flash.expert_shared import prefill_shared_expert_inline as shared_expert_inline
-from models.deepseek_v4_1_flash.attention_ops import prefill_linear_inline as linear_inline
-from models.deepseek_v4_1_flash.ep_transport import prefill_combine_routed_experts as combine_routed_experts
+from hc_pre import prefill_hc_pre_inline as hc_pre_inline
+from expert_routed import prefill_routed_moe_inline as routed_moe_inline
+from expert_shared import prefill_shared_expert_inline as shared_expert_inline
+from attention_ops import prefill_linear_inline as linear_inline
+from moe import prefill_combine_routed_experts as combine_routed_experts
 
 from concurrent.futures import ThreadPoolExecutor
-from models.deepseek_v4_1_flash import config as C
-from models.deepseek_v4_1_flash.golden import hc_pre, rms_norm
-from models.deepseek_v4_1_flash.golden import (
-    prefill_linear as reference_linear,
-    prefill_round_activation as round_activation,
-)
-from models.deepseek_v4_1_flash.metadata import PrefillContext
-from models.deepseek_v4_1_flash.metadata import PrefillState
+from hc_pre import golden_hc_pre as hc_pre
+from rmsnorm import golden_rms_norm_reference as rms_norm
+from attention_ops import prefill_linear as reference_linear
+from quantization import prefill_round_activation as round_activation
+from utils import PrefillContext
+from utils import PrefillState
 from pathlib import Path
 from pypto.ir import DistributedConfig
 from pypto.runtime import RunConfig, StackedDeviceTensor
@@ -74,11 +66,25 @@ import sys
 import time
 import torch
 
-RANKS = 4
-LOCAL_EXPERTS = FLASH.n_routed_experts // RANKS
-VOCAB = FLASH.vocab_size
-TOPK = FLASH.num_experts_per_tok
-EXPERTS = FLASH.n_routed_experts
+
+# model config
+D = M.hidden_size
+H = M.num_attention_heads
+HEAD_DIM = M.head_dim
+ROPE_DIM = M.qk_rope_head_dim
+O_LORA = M.o_lora_rank
+O_GROUPS = M.o_groups
+O_GROUP_IN = M.num_attention_heads * M.head_dim // M.o_groups
+HC_MULT = M.hc_mult
+INDEX_DIM = M.index_head_dim
+INDEX_TOPK = M.index_topk
+MOE_INTER = M.moe_intermediate_size
+
+RANKS = EP_SIZE
+LOCAL_EXPERTS = M.n_routed_experts // RANKS
+VOCAB = M.vocab_size
+TOPK = M.num_experts_per_tok
+EXPERTS = M.n_routed_experts
 T = pl.dynamic("V41_PREFILL_ROWS")
 TE = pl.dynamic("V41_ENCODER_ROWS")
 TD = pl.dynamic("V41_DECODER_ROWS")
@@ -974,13 +980,13 @@ class PrefillCheckpoint:
         if quant.get("quant_method") != "fp8" or quant.get("weight_block_size") != [32, 32]:
             raise ValueError("checkpoint must use the official block-32 FP8/FP4 format")
         required = {
-            "hidden_size": C.D,
-            "num_hidden_layers": C.FLASH.num_hidden_layers,
-            "num_attention_heads": C.H,
-            "head_dim": C.HEAD_DIM,
-            "sliding_window": C.FLASH.sliding_window,
-            "kv_source_layer_ids": list(C.FLASH.kv_source_layer_ids),
-            "index_source_layer_ids": list(C.FLASH.index_source_layer_ids),
+            "hidden_size": D,
+            "num_hidden_layers": M.num_hidden_layers,
+            "num_attention_heads": H,
+            "head_dim": HEAD_DIM,
+            "sliding_window": M.sliding_window,
+            "kv_source_layer_ids": list(M.kv_source_layer_ids),
+            "index_source_layer_ids": list(M.index_source_layer_ids),
         }
         for name, expected in required.items():
             if text.get(name) != expected:
@@ -1089,7 +1095,7 @@ class PrefillCheckpoint:
             return "bf16"
         parts = stem.split(".")
         if len(parts) == 5 and parts[0] == "layers" and parts[2:4] == ["attn", "compressor"]:
-            if C.FLASH.compress_ratios[int(parts[1])] > 1:
+            if M.compress_ratios[int(parts[1])] > 1:
                 return "fp32"
         return formats[storage]
 
@@ -1109,7 +1115,7 @@ class PrefillCheckpoint:
 
     def attention(self, layer_id: int) -> dict[str, torch.Tensor | dict[str, str]]:
         """Return an unsharded attention bundle with no activation/cache scales."""
-        if not 0 <= layer_id < C.FLASH.num_hidden_layers:
+        if not 0 <= layer_id < M.num_hidden_layers:
             raise ValueError("attention layer must belong to the text backbone")
         stem = f"layers.{layer_id}.attn."
         result = {name: self.linear(stem + name) for name in ("wq_a", "wq_b", "wkv", "wo_b")}
@@ -1117,17 +1123,17 @@ class PrefillCheckpoint:
             q_norm_weight=self.tensor(stem + "q_norm.weight").float(),
             kv_norm_weight=self.tensor(stem + "kv_norm.weight").float(),
             attn_sink=self.tensor(stem + "attn_sink").float(),
-            wo_a=self.linear(stem + "wo_a").reshape(C.O_GROUPS, C.O_LORA, C.O_GROUP_IN),
+            wo_a=self.linear(stem + "wo_a").reshape(O_GROUPS, O_LORA, O_GROUP_IN),
         )
         formats = {name: self.linear_format(stem + name) for name in ("wq_a", "wq_b", "wkv", "wo_a", "wo_b")}
-        if layer_id in C.FLASH.kv_source_layer_ids:
+        if layer_id in M.kv_source_layer_ids:
             publisher = self.publisher(layer_id)
             formats.update(publisher.pop("formats"))
             result.update(publisher)
-            if C.FLASH.compress_ratios[layer_id] == 2:
+            if M.compress_ratios[layer_id] == 2:
                 result["compressor_wgate"] = self.linear(stem + "compressor.wgate")
                 formats["compressor_wgate"] = self.linear_format(stem + "compressor.wgate")
-        if layer_id in C.FLASH.index_source_layer_ids:
+        if layer_id in M.index_source_layer_ids:
             result.update(
                 index_wq_b=self.linear(stem + "indexer.wq_b"),
                 index_weights_proj=self.linear(stem + "indexer.weights_proj"),
@@ -1155,7 +1161,7 @@ class PrefillCheckpoint:
 
     def engram(self, layer_id: int, hash_ids: torch.Tensor) -> dict[str, torch.Tensor | dict[str, str]]:
         """Decode selected table rows and the projection without BF16 narrowing."""
-        if layer_id not in C.FLASH.engram_layer_ids:
+        if layer_id not in M.engram_layer_ids:
             raise ValueError("Engram weights belong to encoder layers 1 and 14")
         stem = f"layers.{layer_id}.engram."
         payload = self.tensor_rows(stem + "embed.weight", hash_ids)
@@ -1171,7 +1177,7 @@ class PrefillCheckpoint:
 
 
 class ResidentPrefillWeights:
-    """Plan four resident expert shards without expanding quantized weights.
+    """Plan resident expert shards without expanding quantized weights.
 
     FP8 matrices use 32-by-32 blocks; FP4 matrices use 32-by-16 byte blocks
     and 32 E8M0 scale bytes. Blocks are ordered by output block, then input
@@ -1179,8 +1185,8 @@ class ResidentPrefillWeights:
     Each upload reads only one checkpoint tensor at a time.
     """
 
-    ranks = 4
-    local_experts = C.FLASH.n_routed_experts // ranks
+    ranks = RANKS
+    local_experts = M.n_routed_experts // ranks
     # These columns are the flat tensor ABI shared with prefill_fwd.
     fp8_names = (
         "attn.wq_a",
@@ -1249,7 +1255,7 @@ class ResidentPrefillWeights:
                 self.dense_offsets[layer, column] = self.dense_values
                 self.dense_entries.append((name, column, self.dense_values, values))
                 self.dense_values += values
-        expert_blocks = C.D * C.MOE_INTER // 1024
+        expert_blocks = D * MOE_INTER // 1024
         self.fp4_blocks = 40 * self.local_experts * 3 * expert_blocks
         self.expert_offsets.copy_(
             torch.arange(40 * self.local_experts * 3, dtype=torch.int32).reshape(40, self.local_experts, 3)
@@ -1292,7 +1298,7 @@ class ResidentPrefillWeights:
     def upload(self, runtime, rank, handles):
         """Fill allocated rank-local banks through bounded host staging tensors."""
         if rank not in range(self.ranks):
-            raise ValueError("resident prefill requires four contiguous expert shards")
+            raise ValueError(f"resident prefill requires {self.ranks} contiguous expert shards")
         checkpoint = self.checkpoint
 
         def copy(name, data, element_offset):
@@ -1385,12 +1391,12 @@ def checkpoint_inputs(checkpoint, lengths, prompts=None):
         if not tokens:
             raise ValueError("prompt must encode at least one token")
         sequences.append(torch.tensor((tokens * ((length + len(tokens) - 1) // len(tokens)))[:length]))
-    padded = torch.full((len(lengths), max(lengths)), FLASH.engram_pad_token_id, dtype=torch.long)
+    padded = torch.full((len(lengths), max(lengths)), M.engram_pad_token_id, dtype=torch.long)
     for request, sequence in enumerate(sequences):
         padded[request, : sequence.numel()] = sequence
     batched = hash_state(padded, 0)
     hashes = torch.cat([batched[request, :length] for request, length in enumerate(lengths)])
-    return sequences, {layer: hashes[:, index] for index, layer in enumerate(FLASH.engram_layer_ids)}
+    return sequences, {layer: hashes[:, index] for index, layer in enumerate(M.engram_layer_ids)}
 
 
 def build_reference(checkpoint, context, sequences, hashes):
@@ -1441,16 +1447,16 @@ def resident_inputs(checkpoint, context, sequences, hashes, weights):
     for request, length in enumerate(context.lengths):
         start = int(enc_meta.query_start_loc[request])
         end = start + length
-        for row in range(max(start, end - C.STATE_CAPACITY), end):
-            state_slots[row] = request * C.STATE_CAPACITY + int(enc_meta.position_ids[row]) % C.STATE_CAPACITY
+        for row in range(max(start, end - STATE_CAPACITY), end):
+            state_slots[row] = request * STATE_CAPACITY + int(enc_meta.position_ids[row]) % STATE_CAPACITY
     lookups = []
-    for layer in FLASH.engram_layer_ids:
+    for layer in M.engram_layer_ids:
         stem = f"layers.{layer}.engram.embed."
         payload = checkpoint.tensor_rows(stem + "weight", hashes[layer])
         scale = checkpoint.tensor_rows(stem + "scale", hashes[layer])
         lookups.append((payload.float() * scale.float().repeat_interleave(32, -1)).flatten(1))
     global_blocks = max(value.shape[0] for value in context.global_cache.values())
-    sources = list(FLASH.kv_source_layer_ids)
+    sources = list(M.kv_source_layer_ids)
     values = {
         "embedding": checkpoint.tensor_rows("embed.weight", torch.cat(sequences)).float(),
         "engram_lookup": torch.stack(lookups),
@@ -1480,8 +1486,8 @@ def resident_inputs(checkpoint, context, sequences, hashes, weights):
         "replay_rows": context.decoder_rows.int(),
         "last_rows": (context.replay.query_start_loc[1:] - 1).int(),
         "window_cache": torch.stack(list(context.window.values())),
-        "global_cache": torch.zeros(len(sources), global_blocks, 128, C.HEAD_DIM),
-        "index_cache": torch.zeros(len(sources), global_blocks, 128, C.INDEX_DIM),
+        "global_cache": torch.zeros(len(sources), global_blocks, 128, HEAD_DIM),
+        "index_cache": torch.zeros(len(sources), global_blocks, 128, INDEX_DIM),
         "state_cache": torch.stack(list(context.state_cache.values())),
         "final_norm": checkpoint.tensor("norm.weight").float(),
         "head": checkpoint.tensor("head.weight").float().t().contiguous(),
@@ -1495,21 +1501,21 @@ def run_resident(checkpoint, context, sequences, hashes, device_ids):
     weights = ResidentPrefillWeights(checkpoint)
     config = RunConfig(
         platform="a5",
-        ring_heap=(2 * 1024**3,) * 4,
+        ring_heap=(2 * 1024**3,) * RANKS,
         distributed_config=DistributedConfig(device_ids=device_ids, num_sub_workers=0),
     )
     compiled = l3_prefill_fwd.compile(config=config)
     inputs = resident_inputs(checkpoint, context, sequences, hashes, weights)
     enc, dec, requests = context.num_tokens, context.decoder_num_tokens, len(context.lengths)
     outputs = {
-        "encoder_out": ((enc, C.HC_MULT, C.D), torch.float32),
-        "encoder_pre": ((enc, C.HC_MULT), torch.float32),
-        "decoder_out": ((dec, C.HC_MULT, C.D), torch.float32),
-        "decoder_pre": ((dec, C.HC_MULT), torch.float32),
-        "encoder_routes": ((20, enc, FLASH.num_experts_per_tok), torch.int32),
-        "decoder_routes": ((20, dec, FLASH.num_experts_per_tok), torch.int32),
-        "normalized": ((dec, C.D), torch.float32),
-        "logits": ((requests, FLASH.vocab_size), torch.float32),
+        "encoder_out": ((enc, HC_MULT, D), torch.float32),
+        "encoder_pre": ((enc, HC_MULT), torch.float32),
+        "decoder_out": ((dec, HC_MULT, D), torch.float32),
+        "decoder_pre": ((dec, HC_MULT), torch.float32),
+        "encoder_routes": ((20, enc, M.num_experts_per_tok), torch.int32),
+        "decoder_routes": ((20, dec, M.num_experts_per_tok), torch.int32),
+        "normalized": ((dec, D), torch.float32),
+        "logits": ((requests, M.vocab_size), torch.float32),
     }
     banks = {
         "bank8": "fp8_bank",
@@ -1538,11 +1544,11 @@ def run_resident(checkpoint, context, sequences, hashes, device_ids):
             weights.upload(runtime, rank, {target: per_rank[rank][name] for name, target in banks.items()})
             print("CED_RANK_WEIGHTS_READY", rank, flush=True)
 
-        with ThreadPoolExecutor(max_workers=4) as executor:
-            list(executor.map(upload, range(4)))
+        with ThreadPoolExecutor(max_workers=RANKS) as executor:
+            list(executor.map(upload, range(RANKS)))
         stacked = {
             name: StackedDeviceTensor(
-                [rank[name] for rank in per_rank], (4, *per_rank[0][name].shape), tuple(range(4))
+                [rank[name] for rank in per_rank], (RANKS, *per_rank[0][name].shape), tuple(range(RANKS))
             )
             for name in PREFILL_TENSORS
         }
@@ -1556,7 +1562,7 @@ def run_resident(checkpoint, context, sequences, hashes, device_ids):
         print("CED_DEVICE_COMPLETE", flush=True)
         for name in (*outputs, "window_cache", "global_cache", "index_cache", "state_cache"):
             first = per_rank[0][name]
-            value = torch.empty((4, *first.shape), dtype=first.dtype)
+            value = torch.empty((RANKS, *first.shape), dtype=first.dtype)
             runtime.copy_stacked_from(stacked[name], value)
             actual[name] = value
     return actual
@@ -1573,8 +1579,8 @@ def main(argv=None):
     parser.add_argument("--precision", choices=("fp32", "official"), default="fp32")
     options = parser.parse_args(argv)
     device_ids = [int(value) for value in (options.devices or "").split(",") if value]
-    if len(device_ids) != 4 or len(set(device_ids)) != 4:
-        raise ValueError("provide exactly four distinct task-allocated A5 devices")
+    if len(device_ids) != RANKS or len(set(device_ids)) != RANKS:
+        raise ValueError(f"provide exactly {RANKS} distinct task-allocated A5 devices")
     torch.set_num_threads(8)
     checkpoint = PrefillCheckpoint(options.checkpoint)
     lengths = [int(n) for n in options.lengths.split(",")]
@@ -1589,7 +1595,7 @@ def main(argv=None):
         "precision": options.precision,
         "reference_accumulation": "fp64",
         "platform": "a5",
-        "device_count": 4,
+        "device_count": RANKS,
         "host_invocations": 1,
         "l2_invocations_per_rank": 1,
         "full_40_layers": True,
@@ -1610,7 +1616,7 @@ def main(argv=None):
         return result
 
     for name, value in actual.items():
-        if any(not torch.equal(value[0], value[rank]) for rank in range(1, 4)):
+        if any(not torch.equal(value[0], value[rank]) for rank in range(1, RANKS)):
             failures.append("rank_consistency_" + name)
     report["ranks_identical"] = not failures
     for phase in ("encoder", "decoder"):
@@ -1658,8 +1664,5 @@ def main(argv=None):
     return report
 
 
-_SCRIPT_ENTRY_POINT = "__" + "main__"
-
-
-if __name__ == _SCRIPT_ENTRY_POINT:
+if __name__ == "__main__":
     main()

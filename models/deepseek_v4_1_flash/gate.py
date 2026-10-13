@@ -9,11 +9,16 @@
 """DeepSeek-V4.1 MoE FFN router (decode): RMSNorm + gate + topk + normalize."""
 
 import pypto.language as pl
+import torch
+import torch.nn.functional as F
 
-from models.deepseek_v4_1_flash.config import FLASH as M, MOE_TOKENS
-from models.deepseek_v4_1_flash.rmsnorm import rms_norm
+from config import FLASH as M
 
-from models.deepseek_v4_1_flash.config import FLASH
+from config import MOE_TOKENS
+
+
+from rmsnorm import rms_norm
+
 
 FP32_NEG_INF = -3.4028234663852886e38
 
@@ -81,6 +86,30 @@ else:
             mask_pattern=pl.tile.MaskPattern.P1010,
             output_dtype=pl.INT32,
         )
+
+
+PREFILL_ROUTE_SCALE = M.routed_scaling_factor
+PREFILL_TOPK = M.num_experts_per_tok
+
+def prefill_gate_reference(logits, bias):
+    """Independent Torch router math; correction bias affects selection only."""
+    scores = F.softplus(logits.float()).sqrt()
+    indices = torch.argsort(-(scores + bias.float()), dim=-1, stable=True)[..., :PREFILL_TOPK]
+    selected = scores.gather(-1, indices)
+    return indices, selected / (selected.sum(-1, keepdim=True) + 1e-20) * PREFILL_ROUTE_SCALE
+
+
+def golden_gate_reference(
+    x: torch.Tensor,
+    weight: torch.Tensor,
+    correction_bias: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Compute sqrt-softplus routing, with bias affecting selection only."""
+    scores = F.softplus(F.linear(x.float(), weight.float()) / M.gate_temperature).sqrt()
+    indices = (scores + correction_bias.float()).topk(M.num_experts_per_tok, dim=-1).indices
+    weights = scores.gather(-1, indices)
+    weights = weights / (weights.sum(dim=-1, keepdim=True) + 1e-20)
+    return weights * M.routed_scaling_factor, indices.to(torch.int32)
 
 
 @pl.jit.inline
@@ -273,7 +302,7 @@ def _golden_gate_scores(tensors):
     """Recompute the host router scores from the immutable gate inputs."""
     import torch
 
-    from models.deepseek_v4_1_flash.rmsnorm import golden_rms_norm
+    from rmsnorm import golden_rms_norm
 
     x_norm = golden_rms_norm(tensors["x_mixed"], tensors["norm_w"]).cpu().float().view(T, D)
 
@@ -291,7 +320,7 @@ def _golden_gate_core(tensors, x_norm, scores, biased):
 
     num_tokens = max(0, min(T, int(tensors.get("num_tokens", T))))
 
-    from models.deepseek_v4_1_flash.quantization import host_quant_mxfp8_v41, pack_mx_a_scale
+    from quantization import host_quant_mxfp8_v41, pack_mx_a_scale
 
     def host_mxfp8_activation(value):
         # pl.quant_mx implements the OCP MX shared exponent
@@ -676,7 +705,6 @@ def gate_active_rows(num_tokens):
     return min(T, ((active_count + GATE_M_TILE - 1) // GATE_M_TILE) * GATE_M_TILE)
 
 
-
 def mxfp8_activation_value_compare(actual, expected, *, actual_outputs, expected_outputs, **_kwargs):
     """Compare MXFP8 activations by dequantised value, not by non-unique bytes.
 
@@ -686,7 +714,7 @@ def mxfp8_activation_value_compare(actual, expected, *, actual_outputs, expected
     """
     import torch
 
-    from models.deepseek_v4_1_flash.quantization import _e8m0_to_fp32, unpack_mx_a_scale
+    from quantization import _e8m0_to_fp32, unpack_mx_a_scale
 
     def decode(outputs, payload_name):
         payload = outputs[payload_name].cpu().float()
@@ -740,19 +768,17 @@ def fp8_bits_equal(actual, expected, **_kwargs):
     )
 
 
-
-
 # Resident CED prefill precision variants.
-_PREFILL_MOE_TOPK = FLASH.num_experts_per_tok
+_PREFILL_MOE_TOPK = M.num_experts_per_tok
 
 
 _PREFILL_MOE_T = pl.dynamic("V41_FP32_MOE_T")
 
 
-_PREFILL_MOE_ROUTE_SCALE = FLASH.routed_scaling_factor
+_PREFILL_MOE_ROUTE_SCALE = M.routed_scaling_factor
 
 
-_PREFILL_MOE_EXPERTS = FLASH.n_routed_experts
+_PREFILL_MOE_EXPERTS = M.n_routed_experts
 
 
 _PREFILL_MOE_WORKERS = 32
@@ -814,12 +840,6 @@ def prefill_gate_select_inline(
     return indices, weights
 
 if __name__ == "__main__":
-    # Drop this model directory when run as a script so the local golden.py does not
-    # shadow the repository golden package.
-    import pathlib
-    import sys
-    _model_dir = pathlib.Path(__file__).resolve().parent
-    sys.path = [item for item in sys.path if pathlib.Path(item or ".").resolve() != _model_dir]
     import argparse
     import torch
     from golden.runner import run

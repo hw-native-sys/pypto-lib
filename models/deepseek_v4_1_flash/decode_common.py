@@ -18,15 +18,25 @@ import pypto.language as pl
 import torch
 
 from golden import ScalarSpec, TensorSpec, ratio_allclose, run
-from models.deepseek_v4_1_flash import config as C
-from models.deepseek_v4_1_flash.config import D, HC_MULT
-from models.deepseek_v4_1_flash.golden import rms_norm as golden_rms_norm
-from models.deepseek_v4_1_flash.hc_mixes import golden_mhc_mixes, mhc_mixes
-from models.deepseek_v4_1_flash.hc_post import golden_mhc_post
-from models.deepseek_v4_1_flash.hc_pre import golden_mhc_pre, mhc_pre
-from models.deepseek_v4_1_flash.decode_sp_integration import combine_validation, sequence_parallel_bounds
-from models.deepseek_v4_1_flash.rmsnorm import rms_norm
+
+from config import FLASH as M, TP_SIZE, DECODE_MAX_TOKENS
+
+
+
+from rmsnorm import golden_rms_norm_reference as golden_rms_norm
+from hc_mixes import golden_mhc_mixes, mhc_mixes
+from hc_post import golden_mhc_post
+from hc_pre import golden_mhc_pre, mhc_pre
+from decode_sp_integration import combine_validation, sequence_parallel_bounds
+from rmsnorm import rms_norm
 from pypto.ir import DistributedConfig
+
+
+# model config
+D = M.hidden_size
+HC_MULT = M.hc_mult
+HC_DIM = M.hc_dim
+MIX_HC = M.mix_hc
 
 
 @pl.jit.inline
@@ -157,17 +167,17 @@ def make_boundary_specs(args, sharded=False):
     generator = torch.Generator().manual_seed(args.seed + 1000)
     specs = []
     shapes = {
-        "x_hc": [local, C.HC_MULT, C.D],
-        "incoming_pre_mix": [local, C.HC_MULT],
-        "hc_attn_fn": [C.MIX_HC, C.HC_DIM],
+        "x_hc": [local, HC_MULT, D],
+        "incoming_pre_mix": [local, HC_MULT],
+        "hc_attn_fn": [MIX_HC, HC_DIM],
         "hc_attn_scale": [3],
-        "hc_attn_base": [C.MIX_HC],
-        "attn_norm_weight": [C.D],
+        "hc_attn_base": [MIX_HC],
+        "attn_norm_weight": [D],
     }
     for name, shape in shapes.items():
         value = torch.randn(shape, generator=generator)
         if name == "hc_attn_fn":
-            value /= C.HC_DIM**0.5
+            value /= HC_DIM**0.5
         elif name == "attn_norm_weight":
             value = torch.ones(shape, dtype=torch.bfloat16)
         elif name == "incoming_pre_mix":
@@ -185,16 +195,16 @@ def make_boundary_specs(args, sharded=False):
             TensorSpec(name, [args.tp, *shape], value.dtype, init_value=stacked, resident="stacked")
         )
     for name, shape, dtype in (
-        ("attention_output", [local, C.D], torch.bfloat16),
-        ("attention_hidden", [local, C.HC_MULT, C.D], torch.float32),
-        ("attention_pre_mix", [local, C.HC_MULT], torch.float32),
+        ("attention_output", [local, D], torch.bfloat16),
+        ("attention_hidden", [local, HC_MULT, D], torch.float32),
+        ("attention_pre_mix", [local, HC_MULT], torch.float32),
     ):
         sentinel = 13.0 if name == "attention_output" else 0.0
         specs.append(TensorSpec(name, [args.tp, *shape], dtype, init_value=sentinel, resident="stacked"))
     if sharded:
         specs.append(
             TensorSpec(
-                "gathered", [args.tp, args.tokens, C.D], torch.bfloat16,
+                "gathered", [args.tp, args.tokens, D], torch.bfloat16,
                 init_value=13.0, resident="stacked",
             )
         )
@@ -230,7 +240,7 @@ def assemble_specs(args, leaf_specs, spec_names, aliases=None, sharded=False):
 
 def check_program_specs(world_size, specs, spec_names):
     """Validate host ordering and return tensor shapes/dtypes keyed by name."""
-    if world_size != C.TP_SIZE:
+    if world_size != TP_SIZE:
         raise ValueError("Attention world size must match TP_SIZE")
     if tuple(spec.name for spec in specs) != tuple(spec_names):
         raise ValueError("Attention specs must match the host parameter names and order")
@@ -293,7 +303,7 @@ def golden_attention_pre_sharded(tensors):
         )
         tensors["attention_pre_mix"][rank].copy_(pre)
         collapsed = golden_mhc_pre(tensors["x_hc"][rank], tensors["incoming_pre_mix"][rank])
-        _first, count, _width = owner_rows(tensors["x_hc"], rank, active, tp_size=C.TP_SIZE)
+        _first, count, _width = owner_rows(tensors["x_hc"], rank, active, tp_size=TP_SIZE)
         normalized_rank = torch.full_like(collapsed, 13.0)
         if count:
             normalized_rank[:count].copy_(
@@ -303,14 +313,14 @@ def golden_attention_pre_sharded(tensors):
         post.append(post_mix)
         residual.append(residual_mix)
     per_rank_full = [None] * world
-    for base in range(0, world, C.TP_SIZE):
+    for base in range(0, world, TP_SIZE):
         slabs = []
-        for offset in range(C.TP_SIZE):
+        for offset in range(TP_SIZE):
             rank = base + offset
-            _first, count, _width = owner_rows(tensors["x_hc"], offset, active, tp_size=C.TP_SIZE)
+            _first, count, _width = owner_rows(tensors["x_hc"], offset, active, tp_size=TP_SIZE)
             slabs.append(normalized[rank][:count])
         gathered = torch.cat(slabs, dim=0)[:active]
-        for rank in range(base, base + C.TP_SIZE):
+        for rank in range(base, base + TP_SIZE):
             tensors["gathered"][rank].zero_()
             tensors["gathered"][rank][: gathered.shape[0]].copy_(gathered)
             per_rank_full[rank] = gathered
@@ -323,7 +333,7 @@ def golden_attention_post(tensors, post, residual):
     sharded = "gathered" in tensors
     for rank in range(tensors["x_hc"].shape[0]):
         if sharded:
-            _first, count, _width = owner_rows(tensors["attention_output"], rank, active, tp_size=C.TP_SIZE)
+            _first, count, _width = owner_rows(tensors["attention_output"], rank, active, tp_size=TP_SIZE)
             tensors["attention_hidden"][rank].zero_()
             tensors["attention_output"][rank][count:].zero_()
             if count:
@@ -415,7 +425,7 @@ def compare_owner_rows(compare_output, *, name="per-rank", require_zero_padding=
             num_tokens = active_rows_from_golden(expected)
         num_tokens = int(num_tokens)
         for rank in range(actual.shape[0]):
-            _first, count, width = owner_rows(actual, rank, num_tokens, tp_size=C.TP_SIZE)
+            _first, count, width = owner_rows(actual, rank, num_tokens, tp_size=TP_SIZE)
             if require_zero_padding and count < width and not bool((actual[rank][count:] == 0).all()):
                 return False, f"rank {rank}: inactive {name} rows must be zero, not stale data"
             if count == 0:
@@ -516,7 +526,7 @@ def make_parser(description, default_layer_id, default_tokens, cases, default_se
     parser.add_argument("--cpu-golden", action="store_true")
     parser.add_argument("-p", "--platform", default="a5")
     parser.add_argument("-d", "--device", default=None)
-    parser.add_argument("--tp", type=int, choices=(1, 4), default=4)
+    parser.add_argument("--tp", type=int, choices=(1, 4), default=TP_SIZE)
     parser.add_argument("--layer-id", type=int, default=default_layer_id)
     parser.add_argument("--tokens", type=int, default=default_tokens)
     parser.add_argument("--active-tokens", type=int)
@@ -535,7 +545,7 @@ def validate_args(parser, args, *, allow_inactive=False):
         parser.error("Block CPU goldens are provided by decode_layer.py")
     if args.stage == "block":
         parser.error("Block composition is provided by decode_layer.py")
-    if not 1 <= args.tokens <= C.DECODE_MAX_TOKENS or not 1 <= args.epochs <= 1000:
+    if not 1 <= args.tokens <= DECODE_MAX_TOKENS or not 1 <= args.epochs <= 1000:
         parser.error("tokens or epochs out of range")
     args.active_tokens = args.tokens if args.active_tokens is None else args.active_tokens
     if not 1 <= args.active_tokens <= args.tokens or not 1 <= args.requests <= args.active_tokens:
@@ -550,7 +560,7 @@ def validate_args(parser, args, *, allow_inactive=False):
             "--active-tokens needs a reference that publishes the active prefix"
         )
     args.dp, args.bench = 1, False
-    if args.tp != C.TP_SIZE:
+    if args.tp != TP_SIZE:
         parser.error("--tp must match the import-time tensor parallel configuration")
     devices = (
         list(range(args.tp))

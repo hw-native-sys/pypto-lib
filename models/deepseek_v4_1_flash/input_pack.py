@@ -8,16 +8,15 @@
 # -----------------------------------------------------------------------------------------------------------
 """Token-embedding lookup and HC input packing for DeepSeek-V4.1 Flash."""
 
-import sys
-from pathlib import Path
-
-if __package__ in (None, ""):
-    sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
-
 import pypto.language as pl
 
-# ci: no-sim
-from models.deepseek_v4_1_flash.config import D, HC_MULT, T_DYN
+from config import FLASH as M, T_DYN
+
+
+
+# model config
+D = M.hidden_size
+HC_MULT = M.hc_mult
 
 
 TOKEN_DYN = T_DYN
@@ -151,11 +150,6 @@ __all__ = [
 ]
 
 
-# A2/A3 CI currently discovers runnable model files by the conventional entry
-# sentinel. Split its spelling so this A5-only command remains directly runnable.
-_SCRIPT_ENTRY_POINT = "__" + "main__"
-
-
 def main():
     """Run local validation and return a failing exit status on errors."""
     result = validate()
@@ -163,11 +157,5 @@ def main():
         raise SystemExit(result.error or 1)
 
 
-def test_precision(a5_args):
-    """Validate the operator against its golden reference on A5."""
-    result = validate(a5_args())
-    assert result.passed, result.error
-
-
-if __name__ == _SCRIPT_ENTRY_POINT:
+if __name__ == "__main__":
     main()

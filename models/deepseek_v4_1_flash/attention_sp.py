@@ -11,7 +11,13 @@
 import pypto.language as pl
 import pypto.language.distributed as pld
 
-from models.deepseek_v4_1_flash.config import D, HC_MULT, PREFILL_MAX_TOKENS, T_DYN, TP_SIZE
+from config import PREFILL_MAX_TOKENS, FLASH as M, T_DYN, TP_SIZE
+
+
+
+# model config
+D = M.hidden_size
+HC_MULT = M.hc_mult
 
 
 # Dynamic shape variables.

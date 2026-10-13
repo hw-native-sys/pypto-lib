@@ -8,43 +8,35 @@
 # -----------------------------------------------------------------------------------------------------------
 """Packed-prefill sliding-window attention for encoder layers 0 and 1."""
 
-import sys
-from pathlib import Path
 
-if __package__ in (None, ""):
-    sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
-
-# ci: no-sim
 import pypto.language as pl
 import pypto.language.distributed as pld
 import torch
 
-from models.deepseek_v4_1_flash.attention_common import AttentionGoldenResult, golden_swa_attention
-from models.deepseek_v4_1_flash.attention_tp import prefill_tp_output_all_reduce
-from models.deepseek_v4_1_flash.config import (
-    D,
-    HEAD_DIM,
-    LOCAL_H,
-    LOCAL_O_GROUPS,
-    LOCAL_O_WIDTH,
-    O_GROUP_IN,
-    O_LORA,
-    ORI_BLOCKS_DYN,
-    PREFILL_MAX_TOKENS,
-    Q_LORA,
-    ROPE_DIM,
-    T_DYN,
-    TP_SIZE,
-    WINDOW_CACHE_GROUP,
-)
-from models.deepseek_v4_1_flash.attention_ops import M_TILE
-from models.deepseek_v4_1_flash.decode_attn_swa import SOFTMAX_SCALE
-from models.deepseek_v4_1_flash.o_proj import prefill_o_proj
-from models.deepseek_v4_1_flash.qkv_proj_rope import (
+from attention_common import AttentionGoldenResult, golden_swa_attention
+from attention_tp import prefill_tp_output_all_reduce
+from config import PREFILL_MAX_TOKENS, WINDOW_CACHE_GROUP, FLASH as M, ORI_BLOCKS_DYN, T_DYN, TP_SIZE
+
+from attention_ops import M_TILE
+from decode_attn_swa import SOFTMAX_SCALE
+from o_proj import prefill_o_proj
+from qkv_proj_rope import (
     prefill_kv_proj_rope,
     prefill_q_proj_qr,
     prefill_q_proj_rope,
 )
+
+
+# model config
+LOCAL_H = M.num_attention_heads // TP_SIZE
+LOCAL_O_GROUPS = M.o_groups // TP_SIZE
+LOCAL_O_WIDTH = M.o_groups // TP_SIZE * M.o_lora_rank
+D = M.hidden_size
+HEAD_DIM = M.head_dim
+ROPE_DIM = M.qk_rope_head_dim
+Q_LORA = M.q_lora_rank
+O_LORA = M.o_lora_rank
+O_GROUP_IN = M.num_attention_heads * M.head_dim // M.o_groups
 
 
 # tiling
@@ -179,8 +171,6 @@ def prefill_attend_window(
             result = pl.row_expand_mul(numerator, pl.reshape(normalized_correction, [M_TILE, 1]))
             oflat[q0:q0 + M_TILE, :] = pl.cast(result, pl.BF16, mode="rint")
     return output
-
-
 
 
 def golden_prefill_attn_swa(
@@ -341,14 +331,9 @@ __all__ = ["golden_prefill_attn_swa", "prefill_attn_swa", "prefill_attn_swa_part
 
 def validate(argv=None):
     """Validate the Prefill SWA leaf operator on A5."""
-    from models.deepseek_v4_1_flash.decode_attn_swa import run_swa
+    from decode_attn_swa import run_swa
 
     return run_swa(prefill_attn_swa, "prefill", argv=argv)
-
-
-# A2/A3 CI currently discovers runnable model files by the conventional entry
-# sentinel. Split its spelling so this A5-only command remains directly runnable.
-_SCRIPT_ENTRY_POINT = "__" + "main__"
 
 
 def main():
@@ -358,14 +343,5 @@ def main():
         raise SystemExit(result.error or 1)
 
 
-if "pytest" in sys.modules:
-    import pytest
-
-    @pytest.mark.parametrize("tp,dp", [(1, 1), (2, 2)])
-    def test_precision(tp, dp, a5_args):
-        """Validate the operator against its golden reference on A5."""
-        result = validate(a5_args(tp=tp, dp=dp))
-        assert result.passed, result.error
-
-if __name__ == _SCRIPT_ENTRY_POINT:
+if __name__ == "__main__":
     main()

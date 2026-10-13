@@ -28,8 +28,8 @@ Selection rules
 
 Platform ownership comes from ``.github/ci_platforms.json``. Directory rules
 use the longest matching prefix; an unmapped source directory is an error.
-Runnable entries have a script guard and a platform CLI, or implementation-local
-pytest tests. Golden-only helpers and checkpoint-specific drivers are excluded.
+Runnable entries have a script guard and a platform CLI or a validation entry
+that delegates argument parsing. Golden-only helpers and checkpoint-specific drivers are excluded.
 Simulator selection additionally excludes ``# ci: no-sim`` entries.
 
 Imports resolve two ways. A bare module name (``from qkv_proj_rope import ...``)
@@ -69,11 +69,6 @@ def platforms_for(path):
     if not matches:
         raise ValueError(f"No CI platform rule for {path}")
     return rules[max(matches, key=len)]
-
-
-def has_pytest_entry(path):
-    """Recognize implementation-local precision tests without importing kernels."""
-    return bool(re.search(r"^\s*def test_\w+\(", _read(path), re.MULTILINE))
 
 
 def supports_platform(path, platform):
@@ -198,7 +193,9 @@ def has_platform_cli(path):
 def _has_main(path):
     source = _read(path)
     script_guard = "__main__" in source or "if __name__ == _SCRIPT_ENTRY_POINT:" in source
-    return has_pytest_entry(path) or (script_guard and has_platform_cli(path))
+    return script_guard and (has_platform_cli(path) or bool(
+        re.search(r"^def validate\(", source, re.MULTILINE)
+    ))
 
 
 def build_reverse_graph():

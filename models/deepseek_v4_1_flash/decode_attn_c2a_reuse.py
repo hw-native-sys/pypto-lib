@@ -8,46 +8,41 @@
 # -----------------------------------------------------------------------------------------------------------
 """Continuous-batch decode C2A reuse using the shared A5 attention kernels."""
 
-import argparse
-import os
-import sys
 from pathlib import Path
 
-if __package__ in (None, ""):
-    sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
+import argparse
+import os
 
-# A5-only; intentionally excluded from the A2/A3 device sweep.
-# ci: no-sim
 import pypto.language as pl
 import pypto.language.distributed as pld
 import torch
 
 from golden import ScalarSpec, TensorSpec, run
-from models.deepseek_v4_1_flash import config as C
-from models.deepseek_v4_1_flash.attention_common import AttentionGoldenResult
-from models.deepseek_v4_1_flash.attention_tp import (
+
+from config import (
+    FLASH as M,
+    MAX_BATCH_PER_DP,
+    CMP_BLOCKS_DYN,
+    ORI_BLOCKS_DYN,
+    T_DYN,
+    TP_SIZE,
+    BLOCK_SIZE,
+    COMPRESSED_CACHE_GROUP,
+    DECODE_MAX_TOKENS,
+    PREFILL_MAX_TOKENS,
+    WINDOW_CACHE_GROUP,
+)
+
+from config import EP_SIZE
+
+
+from attention_common import AttentionGoldenResult
+from attention_tp import (
     OUTPUT_T_DYN,
     decode_tp_output_all_reduce,
     decode_tp_output_reduce_scatter,
 )
-from models.deepseek_v4_1_flash.config import (
-    CMP_BLOCKS_DYN,
-    D,
-    HEAD_DIM,
-    INDEX_TOPK,
-    LOCAL_H,
-    LOCAL_O_GROUPS,
-    LOCAL_O_WIDTH,
-    MAX_BATCH_PER_DP,
-    O_GROUP_IN,
-    O_LORA,
-    ORI_BLOCKS_DYN,
-    Q_LORA,
-    ROPE_DIM,
-    T_DYN,
-    TP_SIZE,
-)
-from models.deepseek_v4_1_flash.decode_attn_c2a_full import (
+from decode_attn_c2a_full import (
     ATTEND_TILE,
     CMP_GROUP,
     CMP_PACKED,
@@ -74,10 +69,23 @@ from models.deepseek_v4_1_flash.decode_attn_c2a_full import (
     official_reference_c2a,
     official_rope,
 )
-from models.deepseek_v4_1_flash.decode_attn_swa import publish_window
-from models.deepseek_v4_1_flash.o_proj import o_proj
-from models.deepseek_v4_1_flash.qkv_proj_rope import qkv_proj_rope
-from models.deepseek_v4_1_flash.quantization import decode_e8m0
+from decode_attn_swa import publish_window
+from o_proj import o_proj
+from qkv_proj_rope import qkv_proj_rope
+from quantization import decode_e8m0
+
+
+# model config
+LOCAL_H = M.num_attention_heads // TP_SIZE
+LOCAL_O_GROUPS = M.o_groups // TP_SIZE
+LOCAL_O_WIDTH = M.o_groups // TP_SIZE * M.o_lora_rank
+D = M.hidden_size
+HEAD_DIM = M.head_dim
+ROPE_DIM = M.qk_rope_head_dim
+Q_LORA = M.q_lora_rank
+O_LORA = M.o_lora_rank
+O_GROUP_IN = M.num_attention_heads * M.head_dim // M.o_groups
+INDEX_TOPK = M.index_topk
 
 
 def make_c2a_reuse_partial(qkv_operator=qkv_proj_rope, output_operator=o_proj, attention_operator=attend_sparse):
@@ -149,7 +157,6 @@ def make_c2a_reuse_partial(qkv_operator=qkv_proj_rope, output_operator=o_proj, a
 
 
 c2a_reuse_partial = make_c2a_reuse_partial()
-
 
 
 REUSE_INPUT_NAMES = (
@@ -291,8 +298,8 @@ def golden_decode_attn_c2a_reuse(
     compressed_indices: "torch.Tensor",
 ) -> "AttentionGoldenResult":
     """Evaluate C2A decode reuse against published compressed cache rows."""
-    from models.deepseek_v4_1_flash.attention_common import golden_compressed_attention
-    from models.deepseek_v4_1_flash.config import AttentionMode
+    from attention_common import golden_compressed_attention
+    from config import AttentionMode
 
     return golden_compressed_attention(
         mode=AttentionMode.REUSE,
@@ -348,33 +355,33 @@ def make_decode_attn_c2a_reuse(output_reduce=None):
 
     @pl.jit.inline(auto_scope=False)
     def decode_attn_c2a_reuse(
-        x: pl.Tensor[[C.T_DYN, C.D], pl.BF16],
-        wq_a: pl.Tensor[[C.D, C.Q_LORA], pl.FP8E4M3FN],
-        wq_a_scale: pl.Tensor[[C.D // 32, C.Q_LORA], pl.FP8E8M0, pl.MX_B_NN],
-        q_norm_weight: pl.Tensor[[C.Q_LORA], pl.BF16],
-        wq_b: pl.Tensor[[C.Q_LORA, C.LOCAL_H * C.HEAD_DIM], pl.FP8E4M3FN],
-        wq_b_scale: pl.Tensor[[C.Q_LORA // 32, C.LOCAL_H * C.HEAD_DIM], pl.FP8E8M0, pl.MX_B_NN],
-        wkv: pl.Tensor[[C.D, C.HEAD_DIM], pl.FP8E4M3FN],
-        wkv_scale: pl.Tensor[[C.D // 32, C.HEAD_DIM], pl.FP8E8M0, pl.MX_B_NN],
-        kv_norm_weight: pl.Tensor[[C.HEAD_DIM], pl.BF16],
-        attn_sink: pl.Tensor[[C.LOCAL_H], pl.FP32],
-        wo_a: pl.Tensor[[C.LOCAL_O_GROUPS, C.O_LORA, C.O_GROUP_IN], pl.BF16],
-        wo_b: pl.Tensor[[C.LOCAL_O_WIDTH, C.D], pl.FP8E4M3FN],
-        wo_b_scale: pl.Tensor[[C.LOCAL_O_WIDTH // 32, C.D], pl.FP8E8M0, pl.MX_B_NN],
-        rope_cos: pl.Tensor[[C.T_DYN, C.ROPE_DIM // 2], pl.FP32],
-        rope_sin: pl.Tensor[[C.T_DYN, C.ROPE_DIM // 2], pl.FP32],
-        window_slots: pl.Tensor[[C.T_DYN], pl.INT64],
-        window_indices: pl.Tensor[[C.T_DYN, 128], pl.INT32],
-        window_cache: pl.Tensor[[C.ORI_BLOCKS_DYN, 128, 1, C.HEAD_DIM], pl.FP8E4M3FN],
-        window_cache_scale: pl.Tensor[[C.ORI_BLOCKS_DYN, 128, 1, C.HEAD_DIM // C.WINDOW_CACHE_GROUP], pl.FP8E8M0],
-        compressed_cache: pl.Tensor[[C.CMP_BLOCKS_DYN, 128, 1, C.HEAD_DIM // 2], pl.UINT8],
+        x: pl.Tensor[[T_DYN, D], pl.BF16],
+        wq_a: pl.Tensor[[D, Q_LORA], pl.FP8E4M3FN],
+        wq_a_scale: pl.Tensor[[D // 32, Q_LORA], pl.FP8E8M0, pl.MX_B_NN],
+        q_norm_weight: pl.Tensor[[Q_LORA], pl.BF16],
+        wq_b: pl.Tensor[[Q_LORA, LOCAL_H * HEAD_DIM], pl.FP8E4M3FN],
+        wq_b_scale: pl.Tensor[[Q_LORA // 32, LOCAL_H * HEAD_DIM], pl.FP8E8M0, pl.MX_B_NN],
+        wkv: pl.Tensor[[D, HEAD_DIM], pl.FP8E4M3FN],
+        wkv_scale: pl.Tensor[[D // 32, HEAD_DIM], pl.FP8E8M0, pl.MX_B_NN],
+        kv_norm_weight: pl.Tensor[[HEAD_DIM], pl.BF16],
+        attn_sink: pl.Tensor[[LOCAL_H], pl.FP32],
+        wo_a: pl.Tensor[[LOCAL_O_GROUPS, O_LORA, O_GROUP_IN], pl.BF16],
+        wo_b: pl.Tensor[[LOCAL_O_WIDTH, D], pl.FP8E4M3FN],
+        wo_b_scale: pl.Tensor[[LOCAL_O_WIDTH // 32, D], pl.FP8E8M0, pl.MX_B_NN],
+        rope_cos: pl.Tensor[[T_DYN, ROPE_DIM // 2], pl.FP32],
+        rope_sin: pl.Tensor[[T_DYN, ROPE_DIM // 2], pl.FP32],
+        window_slots: pl.Tensor[[T_DYN], pl.INT64],
+        window_indices: pl.Tensor[[T_DYN, 128], pl.INT32],
+        window_cache: pl.Tensor[[ORI_BLOCKS_DYN, 128, 1, HEAD_DIM], pl.FP8E4M3FN],
+        window_cache_scale: pl.Tensor[[ORI_BLOCKS_DYN, 128, 1, HEAD_DIM // WINDOW_CACHE_GROUP], pl.FP8E8M0],
+        compressed_cache: pl.Tensor[[CMP_BLOCKS_DYN, 128, 1, HEAD_DIM // 2], pl.UINT8],
         compressed_cache_scale: pl.Tensor[
-            [C.CMP_BLOCKS_DYN, 128, 1, C.HEAD_DIM // C.COMPRESSED_CACHE_GROUP], pl.FP8E4M3FN
+            [CMP_BLOCKS_DYN, 128, 1, HEAD_DIM // COMPRESSED_CACHE_GROUP], pl.FP8E4M3FN
         ],
-        compressed_indices: pl.Tensor[[C.T_DYN, C.INDEX_TOPK], pl.INT32],
-        output_window: pld.DistributedTensor[[C.DECODE_MAX_TOKENS, C.D], pl.FP32],
-        output_arrived: pld.DistributedTensor[[C.TP_SIZE, 1], pl.INT32],
-        output: pl.Tensor[[OUTPUT_T_DYN, C.D], pl.BF16],
+        compressed_indices: pl.Tensor[[T_DYN, INDEX_TOPK], pl.INT32],
+        output_window: pld.DistributedTensor[[DECODE_MAX_TOKENS, D], pl.FP32],
+        output_arrived: pld.DistributedTensor[[TP_SIZE, 1], pl.INT32],
+        output: pl.Tensor[[OUTPUT_T_DYN, D], pl.BF16],
         group_base: pl.Scalar[pl.INT32],
         tp_rank: pl.Scalar[pl.INT32],
         num_tokens: pl.Scalar[pl.INT32],
@@ -452,31 +459,31 @@ def make_program(operator, capacity, world_size, epochs):
 
     @pl.jit
     def c2a_reuse_rank(
-        x: pl.Tensor[[C.T_DYN, C.D], pl.BF16],
-        wq_a: pl.Tensor[[C.D, C.Q_LORA], pl.FP8E4M3FN],
-        wq_a_scale: pl.Tensor[[C.D // 32, C.Q_LORA], pl.FP8E8M0, pl.MX_B_NN],
-        q_norm_weight: pl.Tensor[[C.Q_LORA], pl.BF16],
-        wq_b: pl.Tensor[[C.Q_LORA, C.LOCAL_H * C.HEAD_DIM], pl.FP8E4M3FN],
-        wq_b_scale: pl.Tensor[[C.Q_LORA // 32, C.LOCAL_H * C.HEAD_DIM], pl.FP8E8M0, pl.MX_B_NN],
-        wkv: pl.Tensor[[C.D, C.HEAD_DIM], pl.FP8E4M3FN],
-        wkv_scale: pl.Tensor[[C.D // 32, C.HEAD_DIM], pl.FP8E8M0, pl.MX_B_NN],
-        kv_norm_weight: pl.Tensor[[C.HEAD_DIM], pl.BF16],
-        attn_sink: pl.Tensor[[C.LOCAL_H], pl.FP32],
-        wo_a: pl.Tensor[[C.LOCAL_O_GROUPS, C.O_LORA, C.O_GROUP_IN], pl.BF16],
-        wo_b: pl.Tensor[[C.LOCAL_O_WIDTH, C.D], pl.FP8E4M3FN],
-        wo_b_scale: pl.Tensor[[C.LOCAL_O_WIDTH // 32, C.D], pl.FP8E8M0, pl.MX_B_NN],
-        rope_cos: pl.Tensor[[C.T_DYN, C.ROPE_DIM // 2], pl.FP32],
-        rope_sin: pl.Tensor[[C.T_DYN, C.ROPE_DIM // 2], pl.FP32],
-        window_slots: pl.Tensor[[C.T_DYN], pl.INT64],
-        window_indices: pl.Tensor[[C.T_DYN, 128], pl.INT32],
-        window_cache: pl.InOut[pl.Tensor[[C.ORI_BLOCKS_DYN, 128, 1, C.HEAD_DIM], pl.FP8E4M3FN]],
-        window_cache_scale: pl.InOut[pl.Tensor[[C.ORI_BLOCKS_DYN, 128, 1, C.HEAD_DIM // C.WINDOW_CACHE_GROUP], pl.FP8E8M0]],
-        compressed_cache: pl.Tensor[[C.CMP_BLOCKS_DYN, 128, 1, CMP_PACKED], pl.UINT8],
-        compressed_cache_scale: pl.Tensor[[C.CMP_BLOCKS_DYN, 128, 1, CMP_SCALES], pl.FP8E4M3FN],
-        compressed_indices: pl.Tensor[[C.T_DYN, C.INDEX_TOPK], pl.INT32],
-        output: pl.InOut[pl.Tensor[[C.T_DYN, C.D], pl.BF16]],
-        output_window: pld.DistributedTensor[[capacity, C.D], pl.FP32],
-        output_arrived: pld.DistributedTensor[[C.TP_SIZE, 1], pl.INT32],
+        x: pl.Tensor[[T_DYN, D], pl.BF16],
+        wq_a: pl.Tensor[[D, Q_LORA], pl.FP8E4M3FN],
+        wq_a_scale: pl.Tensor[[D // 32, Q_LORA], pl.FP8E8M0, pl.MX_B_NN],
+        q_norm_weight: pl.Tensor[[Q_LORA], pl.BF16],
+        wq_b: pl.Tensor[[Q_LORA, LOCAL_H * HEAD_DIM], pl.FP8E4M3FN],
+        wq_b_scale: pl.Tensor[[Q_LORA // 32, LOCAL_H * HEAD_DIM], pl.FP8E8M0, pl.MX_B_NN],
+        wkv: pl.Tensor[[D, HEAD_DIM], pl.FP8E4M3FN],
+        wkv_scale: pl.Tensor[[D // 32, HEAD_DIM], pl.FP8E8M0, pl.MX_B_NN],
+        kv_norm_weight: pl.Tensor[[HEAD_DIM], pl.BF16],
+        attn_sink: pl.Tensor[[LOCAL_H], pl.FP32],
+        wo_a: pl.Tensor[[LOCAL_O_GROUPS, O_LORA, O_GROUP_IN], pl.BF16],
+        wo_b: pl.Tensor[[LOCAL_O_WIDTH, D], pl.FP8E4M3FN],
+        wo_b_scale: pl.Tensor[[LOCAL_O_WIDTH // 32, D], pl.FP8E8M0, pl.MX_B_NN],
+        rope_cos: pl.Tensor[[T_DYN, ROPE_DIM // 2], pl.FP32],
+        rope_sin: pl.Tensor[[T_DYN, ROPE_DIM // 2], pl.FP32],
+        window_slots: pl.Tensor[[T_DYN], pl.INT64],
+        window_indices: pl.Tensor[[T_DYN, 128], pl.INT32],
+        window_cache: pl.InOut[pl.Tensor[[ORI_BLOCKS_DYN, 128, 1, HEAD_DIM], pl.FP8E4M3FN]],
+        window_cache_scale: pl.InOut[pl.Tensor[[ORI_BLOCKS_DYN, 128, 1, HEAD_DIM // WINDOW_CACHE_GROUP], pl.FP8E8M0]],
+        compressed_cache: pl.Tensor[[CMP_BLOCKS_DYN, 128, 1, CMP_PACKED], pl.UINT8],
+        compressed_cache_scale: pl.Tensor[[CMP_BLOCKS_DYN, 128, 1, CMP_SCALES], pl.FP8E4M3FN],
+        compressed_indices: pl.Tensor[[T_DYN, INDEX_TOPK], pl.INT32],
+        output: pl.InOut[pl.Tensor[[T_DYN, D], pl.BF16]],
+        output_window: pld.DistributedTensor[[capacity, D], pl.FP32],
+        output_arrived: pld.DistributedTensor[[TP_SIZE, 1], pl.INT32],
         rank: pl.Scalar[pl.INT32],
         num_tokens: pl.Scalar[pl.INT32],
         attention_epoch: pl.Scalar[pl.INT32],
@@ -498,29 +505,29 @@ def make_program(operator, capacity, world_size, epochs):
 
     @pl.jit.host
     def c2a_reuse_group(
-        x: pl.Tensor[[world_size, C.T_DYN, C.D], pl.BF16],
-        wq_a: pl.Tensor[[world_size, C.D, C.Q_LORA], pl.FP8E4M3FN],
-        wq_a_scale: pl.Tensor[[world_size, C.D // 32, C.Q_LORA], pl.FP8E8M0],
-        q_norm_weight: pl.Tensor[[world_size, C.Q_LORA], pl.BF16],
-        wq_b: pl.Tensor[[world_size, C.Q_LORA, C.LOCAL_H * C.HEAD_DIM], pl.FP8E4M3FN],
-        wq_b_scale: pl.Tensor[[world_size, C.Q_LORA // 32, C.LOCAL_H * C.HEAD_DIM], pl.FP8E8M0],
-        wkv: pl.Tensor[[world_size, C.D, C.HEAD_DIM], pl.FP8E4M3FN],
-        wkv_scale: pl.Tensor[[world_size, C.D // 32, C.HEAD_DIM], pl.FP8E8M0],
-        kv_norm_weight: pl.Tensor[[world_size, C.HEAD_DIM], pl.BF16],
-        attn_sink: pl.Tensor[[world_size, C.LOCAL_H], pl.FP32],
-        wo_a: pl.Tensor[[world_size, C.LOCAL_O_GROUPS, C.O_LORA, C.O_GROUP_IN], pl.BF16],
-        wo_b: pl.Tensor[[world_size, C.LOCAL_O_WIDTH, C.D], pl.FP8E4M3FN],
-        wo_b_scale: pl.Tensor[[world_size, C.LOCAL_O_WIDTH // 32, C.D], pl.FP8E8M0],
-        rope_cos: pl.Tensor[[world_size, C.T_DYN, C.ROPE_DIM // 2], pl.FP32],
-        rope_sin: pl.Tensor[[world_size, C.T_DYN, C.ROPE_DIM // 2], pl.FP32],
-        window_slots: pl.Tensor[[world_size, C.T_DYN], pl.INT64],
-        window_indices: pl.Tensor[[world_size, C.T_DYN, 128], pl.INT32],
-        window_cache: pl.InOut[pl.Tensor[[world_size, C.ORI_BLOCKS_DYN, 128, 1, C.HEAD_DIM], pl.FP8E4M3FN]],
-        window_cache_scale: pl.InOut[pl.Tensor[[world_size, C.ORI_BLOCKS_DYN, 128, 1, C.HEAD_DIM // C.WINDOW_CACHE_GROUP], pl.FP8E8M0]],
-        compressed_cache: pl.Tensor[[world_size, C.CMP_BLOCKS_DYN, 128, 1, CMP_PACKED], pl.UINT8],
-        compressed_cache_scale: pl.Tensor[[world_size, C.CMP_BLOCKS_DYN, 128, 1, CMP_SCALES], pl.FP8E4M3FN],
-        compressed_indices: pl.Tensor[[world_size, C.T_DYN, C.INDEX_TOPK], pl.INT32],
-        output: pl.InOut[pl.Tensor[[world_size, C.T_DYN, C.D], pl.BF16]],
+        x: pl.Tensor[[world_size, T_DYN, D], pl.BF16],
+        wq_a: pl.Tensor[[world_size, D, Q_LORA], pl.FP8E4M3FN],
+        wq_a_scale: pl.Tensor[[world_size, D // 32, Q_LORA], pl.FP8E8M0],
+        q_norm_weight: pl.Tensor[[world_size, Q_LORA], pl.BF16],
+        wq_b: pl.Tensor[[world_size, Q_LORA, LOCAL_H * HEAD_DIM], pl.FP8E4M3FN],
+        wq_b_scale: pl.Tensor[[world_size, Q_LORA // 32, LOCAL_H * HEAD_DIM], pl.FP8E8M0],
+        wkv: pl.Tensor[[world_size, D, HEAD_DIM], pl.FP8E4M3FN],
+        wkv_scale: pl.Tensor[[world_size, D // 32, HEAD_DIM], pl.FP8E8M0],
+        kv_norm_weight: pl.Tensor[[world_size, HEAD_DIM], pl.BF16],
+        attn_sink: pl.Tensor[[world_size, LOCAL_H], pl.FP32],
+        wo_a: pl.Tensor[[world_size, LOCAL_O_GROUPS, O_LORA, O_GROUP_IN], pl.BF16],
+        wo_b: pl.Tensor[[world_size, LOCAL_O_WIDTH, D], pl.FP8E4M3FN],
+        wo_b_scale: pl.Tensor[[world_size, LOCAL_O_WIDTH // 32, D], pl.FP8E8M0],
+        rope_cos: pl.Tensor[[world_size, T_DYN, ROPE_DIM // 2], pl.FP32],
+        rope_sin: pl.Tensor[[world_size, T_DYN, ROPE_DIM // 2], pl.FP32],
+        window_slots: pl.Tensor[[world_size, T_DYN], pl.INT64],
+        window_indices: pl.Tensor[[world_size, T_DYN, 128], pl.INT32],
+        window_cache: pl.InOut[pl.Tensor[[world_size, ORI_BLOCKS_DYN, 128, 1, HEAD_DIM], pl.FP8E4M3FN]],
+        window_cache_scale: pl.InOut[pl.Tensor[[world_size, ORI_BLOCKS_DYN, 128, 1, HEAD_DIM // WINDOW_CACHE_GROUP], pl.FP8E8M0]],
+        compressed_cache: pl.Tensor[[world_size, CMP_BLOCKS_DYN, 128, 1, CMP_PACKED], pl.UINT8],
+        compressed_cache_scale: pl.Tensor[[world_size, CMP_BLOCKS_DYN, 128, 1, CMP_SCALES], pl.FP8E4M3FN],
+        compressed_indices: pl.Tensor[[world_size, T_DYN, INDEX_TOPK], pl.INT32],
+        output: pl.InOut[pl.Tensor[[world_size, T_DYN, D], pl.BF16]],
         num_tokens: pl.Scalar[pl.INT32],
         attention_epoch: pl.Scalar[pl.INT32],
     ):
@@ -599,8 +606,8 @@ def input_metadata(tokens, requests, active, case, mode):
         raise ValueError(f"mode must be 'decode' or 'prefill', got {mode!r}")
     lengths, prefixes = _plan(active, requests, case, mode)
     maximum = max(prefix + length - 1 for prefix, length in zip(prefixes, lengths))
-    window_pages = requests * (maximum // C.BLOCK_SIZE + 1) + 1
-    compressed_pages = requests * max(4, (maximum // RATIO) // C.BLOCK_SIZE + 1) + 1
+    window_pages = requests * (maximum // BLOCK_SIZE + 1) + 1
+    compressed_pages = requests * max(4, (maximum // RATIO) // BLOCK_SIZE + 1) + 1
     return (
         ("x", [tokens, D], bf),
         ("wq_a", [D, Q_LORA], fp),
@@ -618,11 +625,11 @@ def input_metadata(tokens, requests, active, case, mode):
         ("rope_cos", [tokens, ROPE_DIM // 2], torch.float32),
         ("rope_sin", [tokens, ROPE_DIM // 2], torch.float32),
         ("window_slots", [tokens], torch.int64),
-        ("window_indices", [tokens, C.FLASH.sliding_window], torch.int32),
-        ("window_cache", [window_pages, C.BLOCK_SIZE, 1, HEAD_DIM], fp),
-        ("window_cache_scale", [window_pages, C.BLOCK_SIZE, 1, HEAD_DIM // C.WINDOW_CACHE_GROUP], mx),
-        ("compressed_cache", [compressed_pages, C.BLOCK_SIZE, 1, CMP_PACKED], torch.uint8),
-        ("compressed_cache_scale", [compressed_pages, C.BLOCK_SIZE, 1, CMP_SCALES], fp),
+        ("window_indices", [tokens, M.sliding_window], torch.int32),
+        ("window_cache", [window_pages, BLOCK_SIZE, 1, HEAD_DIM], fp),
+        ("window_cache_scale", [window_pages, BLOCK_SIZE, 1, HEAD_DIM // WINDOW_CACHE_GROUP], mx),
+        ("compressed_cache", [compressed_pages, BLOCK_SIZE, 1, CMP_PACKED], torch.uint8),
+        ("compressed_cache_scale", [compressed_pages, BLOCK_SIZE, 1, CMP_SCALES], fp),
         ("compressed_indices", [tokens, INDEX_TOPK], torch.int32),
     )
 
@@ -700,10 +707,10 @@ def run_c2a_reuse(operator, mode, argv=None):
     parser = argparse.ArgumentParser(
         description=f"DeepSeek V4.1 {mode} C2A reuse: A5 precision and timing"
     )
-    parser.add_argument("-p", "--platform", default="a5", choices=["a5"])
+    parser.add_argument("-p", "--platform", default="a5", choices=["a5", "a5sim"])
     parser.add_argument("-d", "--device", default=None, help="comma-separated device IDs; default: 0 through TP*DP-1")
     parser.add_argument("--tp", type=int, default=TP_SIZE, choices=[1, 2, 4])
-    parser.add_argument("--ep", type=int, default=C.EP_SIZE, choices=[2, 4, 8])
+    parser.add_argument("--ep", type=int, default=EP_SIZE, choices=[2, 4, 8])
     parser.add_argument("--dp", type=int, default=1, choices=[1, 2])
     parser.add_argument("--tokens", "--batch", type=int, default=32)
     parser.add_argument("--requests", type=int, default=None)
@@ -731,7 +738,7 @@ def run_c2a_reuse(operator, mode, argv=None):
         devices = [int(value) for value in args.device.split(",")]
     if len(devices) != TP_SIZE * args.dp or len(set(devices)) != len(devices) or min(devices) < 0:
         parser.error(f"--device must name {TP_SIZE * args.dp} distinct non-negative device IDs")
-    capacity = C.DECODE_MAX_TOKENS if mode == "decode" else C.PREFILL_MAX_TOKENS
+    capacity = DECODE_MAX_TOKENS if mode == "decode" else PREFILL_MAX_TOKENS
     if not 1 <= args.tokens <= capacity:
         parser.error(f"--tokens must be in [1, {capacity}]")
     if not 1 <= args.active_tokens <= args.tokens:
@@ -796,11 +803,6 @@ def validate(argv=None):
     return run_c2a_reuse(decode_attn_c2a_reuse, "decode", argv=argv)
 
 
-# A2/A3 CI currently discovers runnable model files by the conventional entry
-# sentinel. Split its spelling so this A5-only command remains directly runnable.
-_SCRIPT_ENTRY_POINT = "__" + "main__"
-
-
 def main():
     """Run local validation and return a failing exit status on precision errors."""
     result = validate()
@@ -808,15 +810,5 @@ def main():
         raise SystemExit(result.error or 1)
 
 
-if "pytest" in sys.modules:
-    import pytest
-
-    @pytest.mark.parametrize("tp,dp", [(1, 1), (2, 2)])
-    def test_precision(tp, dp, a5_args):
-        """Validate the operator against its golden reference on A5."""
-        result = validate(a5_args(tp=tp, dp=dp))
-        assert result.passed, result.error
-
-
-if __name__ == _SCRIPT_ENTRY_POINT:
+if __name__ == "__main__":
     main()

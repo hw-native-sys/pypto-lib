@@ -6,6 +6,8 @@
 # INCLUDING BUT NOT LIMITED TO NON-INFRINGEMENT, MERCHANTABILITY, OR FITNESS FOR A PARTICULAR PURPOSE.
 # See LICENSE in the root of the software repository for the full text of the License.
 # -----------------------------------------------------------------------------------------------------------
+# ci: devices=2
+# ci: no-sim
 """One complete packed-prefill text-backbone layer: attention and MoE sublayers through mHC.
 
 The official ``Block.forward`` runs a layer as two mHC sublayers::
@@ -33,14 +35,9 @@ import argparse
 import functools
 import os
 import sys
-from pathlib import Path
-
-if __package__ in (None, ""):
-    sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
 # A5-only; intentionally excluded from the A2/A3 device sweep. The complete-layer
 # entry exercises the packed MxFp4 routed-weight ABI and the TP-to-EP local-token path.
-# ci: no-sim
 import torch
 
 import pypto.language as pl
@@ -48,7 +45,7 @@ import pypto.language.distributed as pld
 
 
 def _command_line_int(flag, default):
-    """Read one integer flag before argparse; config and the MoE shapes freeze at import."""
+    """Read one integer flag before argparse; parallel sizes and MoE shapes freeze at import."""
     for index, argument in enumerate(sys.argv):
         if argument == flag and index + 1 < len(sys.argv):
             return int(sys.argv[index + 1])
@@ -60,37 +57,55 @@ def _command_line_int(flag, default):
 LAYER_TP = _command_line_int("--tp", 1)
 LAYER_DP = _command_line_int("--dp", 2)
 LAYER_TOKENS = _command_line_int("--tokens", 48)
-# One layer owns both sublayers, so the EP world is the attention world: config derives
-# DP = EP / TP, and the MoE shapes below derive from EP. config reads the command line
-# itself and has its own defaults, so hand it this entry's before it is imported.
+# One layer owns both sublayers: EP = TP * DP.
+# Supply entry defaults before importing parallel sizes and MoE kernels.
 if not any(argument == "--tp" or argument.startswith("--tp=") for argument in sys.argv):
     sys.argv += ["--tp", str(LAYER_TP)]
 if not any(argument == "--ep" or argument.startswith("--ep=") for argument in sys.argv):
     sys.argv += ["--ep", str(LAYER_TP * LAYER_DP)]
 
-from models.deepseek_v4_1_flash import config as C
 
-# gate.py and the EP transport freeze their token extent at import; the layer routes the
-# packed prefill tokens of one call.
-C.MOE_TOKENS = LAYER_TOKENS
-C.MOE_RECV_MAX = C.EP_SIZE * C.MOE_TOKENS
-
-from models.deepseek_v4_1_flash.config import (  # noqa: E402
+from config import (
+    FLASH as M,
     CMP_BLOCKS_DYN,
-    D,
-    HC_DIM,
-    HC_MULT,
-    HEAD_DIM,
-    LOCAL_H,
-    LOCAL_O_WIDTH,
-    MIX_HC,
     ORI_BLOCKS_DYN,
-    Q_LORA,
     T_DYN,
+    ROUTE_T_DYN,
     TP_SIZE,
+    MAX_BATCH_PER_DP,
+    PREFILL_MAX_TOKENS,
+    WINDOW_CACHE_GROUP,
+    set_moe_tokens,
 )
-from models.deepseek_v4_1_flash.attention_tp import prefill_tp_output_all_reduce  # noqa: E402
-from models.deepseek_v4_1_flash.decode_attn_c2a_full import (  # noqa: E402
+
+
+# Set the packed token extent before the transport and MoE kernels are imported.
+set_moe_tokens(LAYER_TOKENS)
+from config import MOE_TOKENS, EP_SIZE
+
+
+# model config
+LOCAL_H = M.num_attention_heads // TP_SIZE
+LOCAL_O_GROUPS = M.o_groups // TP_SIZE
+LOCAL_O_WIDTH = M.o_groups // TP_SIZE * M.o_lora_rank
+DP_SIZE = EP_SIZE // TP_SIZE
+D = M.hidden_size
+HEAD_DIM = M.head_dim
+ROPE_DIM = M.qk_rope_head_dim
+Q_LORA = M.q_lora_rank
+O_LORA = M.o_lora_rank
+O_GROUP_IN = M.num_attention_heads * M.head_dim // M.o_groups
+HC_MULT = M.hc_mult
+HC_DIM = M.hc_dim
+MIX_HC = M.mix_hc
+INDEX_TOPK = M.index_topk
+N_EXPERTS = M.n_routed_experts
+TOPK = M.num_experts_per_tok
+MOE_INTER = M.moe_intermediate_size
+
+
+from attention_tp import prefill_tp_output_all_reduce  # noqa: E402
+from decode_attn_c2a_full import (  # noqa: E402
     CMP_PACKED,
     CMP_SCALES,
     compare_cache,
@@ -98,12 +113,16 @@ from models.deepseek_v4_1_flash.decode_attn_c2a_full import (  # noqa: E402
     compare_per_rank,
     compare_replicated,
 )
-from models.deepseek_v4_1_flash.decode_attn_c2a_reuse import REUSE_MUTABLE_NAMES  # noqa: E402
-from models.deepseek_v4_1_flash.golden import gate, hc_mixes, hc_post, hc_pre, rms_norm  # noqa: E402
-from models.deepseek_v4_1_flash.hc_mixes import mhc_mixes  # noqa: E402
-from models.deepseek_v4_1_flash.hc_post import mhc_post  # noqa: E402
-from models.deepseek_v4_1_flash.hc_pre import mhc_pre  # noqa: E402
-from models.deepseek_v4_1_flash.prefill_c2a_full import (  # noqa: E402
+from decode_attn_c2a_reuse import REUSE_MUTABLE_NAMES  # noqa: E402
+from gate import golden_gate_reference as gate
+from hc_mixes import golden_mhc_mixes as hc_mixes
+from hc_post import golden_hc_post as hc_post
+from hc_pre import golden_hc_pre as hc_pre
+from rmsnorm import golden_rms_norm_reference as rms_norm
+from hc_mixes import mhc_mixes  # noqa: E402
+from hc_post import mhc_post  # noqa: E402
+from hc_pre import mhc_pre  # noqa: E402
+from prefill_c2a_full import (  # noqa: E402
     ATTENTION_STATE,
     HC_INPUT_NAMES,
     MODES,
@@ -116,10 +135,10 @@ from models.deepseek_v4_1_flash.prefill_c2a_full import (  # noqa: E402
     make_hc_inputs,
     reference_attention,
 )
-from models.deepseek_v4_1_flash.prefill_c2a_reuse import prefill_c2a_reuse  # noqa: E402
-from models.deepseek_v4_1_flash.quantization import build_mxfp4_pair_lut  # noqa: E402
-from models.deepseek_v4_1_flash.rmsnorm import rms_norm as npu_rms_norm  # noqa: E402
-from models.deepseek_v4_1_flash.moe import (  # noqa: E402
+from prefill_c2a_reuse import prefill_c2a_reuse  # noqa: E402
+from quantization import build_mxfp4_pair_lut  # noqa: E402
+from rmsnorm import rms_norm as npu_rms_norm  # noqa: E402
+from moe import (  # noqa: E402
     AUX_WIDTH,
     EP_SIZE,
     MX_GROUP,
@@ -129,7 +148,7 @@ from models.deepseek_v4_1_flash.moe import (  # noqa: E402
     _golden_moe_core as golden_moe_core,
     _moe_core as moe_core,
 )
-from models.deepseek_v4_1_flash.expert_routed import (  # noqa: E402
+from expert_routed import (  # noqa: E402
     MX_PACKED_LANE_COLS,
     MX_W1_PACKED_ROWS,
     MX_W2_PACKED_ROWS,
@@ -137,18 +156,16 @@ from models.deepseek_v4_1_flash.expert_routed import (  # noqa: E402
     ROUTED_DEQUANT_STD,
     gen_routed_mxfp4_weights,
 )
-from models.deepseek_v4_1_flash.ep_transport import SIGNAL_PAD  # noqa: E402
+from moe import SIGNAL_PAD
 
 from golden import ScalarSpec, TensorSpec, ratio_allclose, run  # noqa: E402
 from golden.validation import ratio_reldiff  # noqa: E402
 
 
-MOE_INTER = C.MOE_INTER
-N_EXPERTS = C.N_EXPERTS
 # The packed prefill token extent of one layer call.
-TOKENS = C.MOE_TOKENS
+TOKENS = MOE_TOKENS
 # The routed-result window holds one row per token per selected expert.
-ROUTE_ROWS = C.MOE_TOKENS * C.TOPK
+ROUTE_ROWS = MOE_TOKENS * TOPK
 # End-to-end bound for the stages the MoE feeds. It is loose on purpose: the MoE quantizes
 # its input to MXFP8 per group of 32, and that step amplifies about tenfold - measured on
 # this fixture, a 0.19% difference in the collapsed stream becomes 1.9% once quantized,
@@ -282,7 +299,7 @@ def prefill_moe_sublayer(
     data_arrived: pld.DistributedTensor[
         [EP_SIZE, N_LOCAL_EXPERTS, SIGNAL_PAD], pl.INT32
     ],
-    routed_output: pld.DistributedTensor[[C.ROUTE_T_DYN, D], pl.BF16],
+    routed_output: pld.DistributedTensor[[ROUTE_T_DYN, D], pl.BF16],
     combine_arrived: pld.DistributedTensor[
         [EP_SIZE, N_LOCAL_EXPERTS, SIGNAL_PAD], pl.INT32
     ],
@@ -335,7 +352,7 @@ def prefill_ffn_restore(
     ffn_owned: pl.Tensor[[T_DYN, D], pl.BF16],
     post_mix: pl.Tensor[[T_DYN, HC_MULT], pl.FP32],
     residual_mix: pl.Tensor[[T_DYN, HC_MULT, HC_MULT], pl.FP32],
-    ffn_window: pld.DistributedTensor[[C.PREFILL_MAX_TOKENS, D], pl.FP32],
+    ffn_window: pld.DistributedTensor[[PREFILL_MAX_TOKENS, D], pl.FP32],
     ffn_arrived: pld.DistributedTensor[[TP_SIZE, 1], pl.INT32],
     ffn_output: pl.Tensor[[T_DYN, D], pl.BF16],
     x_hc_out: pl.Tensor[[T_DYN, HC_MULT, D], pl.FP32],
@@ -398,8 +415,8 @@ def make_ffn_hc_inputs(seed):
 @functools.lru_cache(maxsize=None)
 def make_moe_replicated_inputs(seed):
     """Gate and shared-expert weights at the deployment magnitudes, identical on every rank."""
-    from models.deepseek_v4_1_flash.moe import _route_bias
-    from models.deepseek_v4_1_flash.quantization import gen_mxfp8_weight_kn_v41
+    from moe import _route_bias
+    from quantization import gen_mxfp8_weight_kn_v41
 
     gen = torch.Generator().manual_seed(seed)
     shared_std = {"w1": 1.71e-2, "w2": 1.68e-2, "w3": 1.70e-2}
@@ -788,20 +805,20 @@ def make_layer_program(capacity, world_size):
         wkv_scale: pl.Tensor[[D // 32, HEAD_DIM], pl.FP8E8M0, pl.MX_B_NN],
         kv_norm_weight: pl.Tensor[[HEAD_DIM], pl.BF16],
         attn_sink: pl.Tensor[[LOCAL_H], pl.FP32],
-        wo_a: pl.Tensor[[C.LOCAL_O_GROUPS, C.O_LORA, C.O_GROUP_IN], pl.BF16],
+        wo_a: pl.Tensor[[LOCAL_O_GROUPS, O_LORA, O_GROUP_IN], pl.BF16],
         wo_b: pl.Tensor[[LOCAL_O_WIDTH, D], pl.FP8E4M3FN],
         wo_b_scale: pl.Tensor[[LOCAL_O_WIDTH // 32, D], pl.FP8E8M0, pl.MX_B_NN],
-        rope_cos: pl.Tensor[[TOKENS, C.ROPE_DIM // 2], pl.FP32],
-        rope_sin: pl.Tensor[[TOKENS, C.ROPE_DIM // 2], pl.FP32],
+        rope_cos: pl.Tensor[[TOKENS, ROPE_DIM // 2], pl.FP32],
+        rope_sin: pl.Tensor[[TOKENS, ROPE_DIM // 2], pl.FP32],
         window_slots: pl.Tensor[[TOKENS], pl.INT64],
         window_indices: pl.Tensor[[TOKENS, 128], pl.INT32],
         window_cache: pl.InOut[pl.Tensor[[ORI_BLOCKS_DYN, 128, 1, HEAD_DIM], pl.FP8E4M3FN]],
         window_cache_scale: pl.InOut[
-            pl.Tensor[[ORI_BLOCKS_DYN, 128, 1, HEAD_DIM // C.WINDOW_CACHE_GROUP], pl.FP8E8M0]
+            pl.Tensor[[ORI_BLOCKS_DYN, 128, 1, HEAD_DIM // WINDOW_CACHE_GROUP], pl.FP8E8M0]
         ],
         compressed_cache: pl.Tensor[[CMP_BLOCKS_DYN, 128, 1, CMP_PACKED], pl.UINT8],
         compressed_cache_scale: pl.Tensor[[CMP_BLOCKS_DYN, 128, 1, CMP_SCALES], pl.FP8E4M3FN],
-        compressed_indices: pl.Tensor[[TOKENS, C.INDEX_TOPK], pl.INT32],
+        compressed_indices: pl.Tensor[[TOKENS, INDEX_TOPK], pl.INT32],
         attn_input: pl.Out[pl.Tensor[[TOKENS, D], pl.BF16]],
         attn_output: pl.Out[pl.Tensor[[TOKENS, D], pl.BF16]],
         attn_pre_mix: pl.Out[pl.Tensor[[TOKENS, HC_MULT], pl.FP32]],
@@ -863,7 +880,7 @@ def make_layer_program(capacity, world_size):
         data_arrived: pld.DistributedTensor[
             [EP_SIZE, N_LOCAL_EXPERTS, SIGNAL_PAD], pl.INT32
         ],
-        routed_output: pld.DistributedTensor[[C.ROUTE_T_DYN, D], pl.BF16],
+        routed_output: pld.DistributedTensor[[ROUTE_T_DYN, D], pl.BF16],
         combine_arrived: pld.DistributedTensor[
             [EP_SIZE, N_LOCAL_EXPERTS, SIGNAL_PAD], pl.INT32
         ],
@@ -923,20 +940,20 @@ def make_layer_program(capacity, world_size):
         wkv_scale: pl.Tensor[[world_size, D // 32, HEAD_DIM], pl.FP8E8M0],
         kv_norm_weight: pl.Tensor[[world_size, HEAD_DIM], pl.BF16],
         attn_sink: pl.Tensor[[world_size, LOCAL_H], pl.FP32],
-        wo_a: pl.Tensor[[world_size, C.LOCAL_O_GROUPS, C.O_LORA, C.O_GROUP_IN], pl.BF16],
+        wo_a: pl.Tensor[[world_size, LOCAL_O_GROUPS, O_LORA, O_GROUP_IN], pl.BF16],
         wo_b: pl.Tensor[[world_size, LOCAL_O_WIDTH, D], pl.FP8E4M3FN],
         wo_b_scale: pl.Tensor[[world_size, LOCAL_O_WIDTH // 32, D], pl.FP8E8M0],
-        rope_cos: pl.Tensor[[world_size, TOKENS, C.ROPE_DIM // 2], pl.FP32],
-        rope_sin: pl.Tensor[[world_size, TOKENS, C.ROPE_DIM // 2], pl.FP32],
+        rope_cos: pl.Tensor[[world_size, TOKENS, ROPE_DIM // 2], pl.FP32],
+        rope_sin: pl.Tensor[[world_size, TOKENS, ROPE_DIM // 2], pl.FP32],
         window_slots: pl.Tensor[[world_size, TOKENS], pl.INT64],
         window_indices: pl.Tensor[[world_size, TOKENS, 128], pl.INT32],
         window_cache: pl.InOut[pl.Tensor[[world_size, ORI_BLOCKS_DYN, 128, 1, HEAD_DIM], pl.FP8E4M3FN]],
         window_cache_scale: pl.InOut[
-            pl.Tensor[[world_size, ORI_BLOCKS_DYN, 128, 1, HEAD_DIM // C.WINDOW_CACHE_GROUP], pl.FP8E8M0]
+            pl.Tensor[[world_size, ORI_BLOCKS_DYN, 128, 1, HEAD_DIM // WINDOW_CACHE_GROUP], pl.FP8E8M0]
         ],
         compressed_cache: pl.Tensor[[world_size, CMP_BLOCKS_DYN, 128, 1, CMP_PACKED], pl.UINT8],
         compressed_cache_scale: pl.Tensor[[world_size, CMP_BLOCKS_DYN, 128, 1, CMP_SCALES], pl.FP8E4M3FN],
-        compressed_indices: pl.Tensor[[world_size, TOKENS, C.INDEX_TOPK], pl.INT32],
+        compressed_indices: pl.Tensor[[world_size, TOKENS, INDEX_TOPK], pl.INT32],
         hc_ffn_fn: pl.Tensor[[world_size, MIX_HC, HC_DIM], pl.FP32],
         hc_ffn_scale: pl.Tensor[[world_size, 3], pl.FP32],
         hc_ffn_base: pl.Tensor[[world_size, MIX_HC], pl.FP32],
@@ -1167,12 +1184,11 @@ def run_prefill_layer(make_program, mode, argv=None):
     )
     parser.add_argument("-p", "--platform", default="a5", choices=["a5"])
     parser.add_argument("-d", "--device", default=None, help="comma-separated device IDs; default: 0 through EP-1")
-    # The A5 job runs one case per TP/DP combination declared here. TP4 needs eight cards and
-    # has not been run; widen the choice once it has.
+    # TP4 needs eight cards and has not been validated.
     parser.add_argument("--tp", type=int, default=LAYER_TP, choices=[1, 2])
     parser.add_argument("--dp", type=int, default=LAYER_DP, choices=[2])
     parser.add_argument("--tokens", type=int, default=LAYER_TOKENS)
-    # config reads --ep from the command line (the import above supplies TP x DP when it is
+    # config.py reads --ep from the command line (the import above supplies TP x DP when it is
     # absent). Declare it so argparse consumes it as itself instead of prefix-matching it to
     # another long option.
     parser.add_argument("--ep", type=int, default=EP_SIZE, help="set from --tp x --dp; read by config")
@@ -1182,8 +1198,8 @@ def run_prefill_layer(make_program, mode, argv=None):
     parser.add_argument("--compile-only", action="store_true")
     args = parser.parse_args(argv)
 
-    # config and the MoE shapes were frozen from the same command line before argparse ran.
-    if (args.tp, args.dp, args.ep, args.tokens) != (TP_SIZE, C.DP_SIZE, EP_SIZE, C.MOE_TOKENS):
+    # Parallel sizes and MoE shapes were frozen from the same command line before argparse ran.
+    if (args.tp, args.dp, args.ep, args.tokens) != (TP_SIZE, DP_SIZE, EP_SIZE, MOE_TOKENS):
         parser.error("--tp/--dp/--ep/--tokens are read before argparse; pass them once on the command line")
     args.bench = os.environ.get("PYPTO_BENCH", "0") == "1"
     devices = list(range(EP_SIZE))
@@ -1191,19 +1207,19 @@ def run_prefill_layer(make_program, mode, argv=None):
         devices = [int(value) for value in args.device.split(",")]
     if len(devices) != EP_SIZE or len(set(devices)) != len(devices) or min(devices) < 0:
         parser.error(f"--device must name {EP_SIZE} distinct non-negative device IDs")
-    if not 1 <= args.tokens <= C.PREFILL_MAX_TOKENS:
-        parser.error(f"--tokens must be in [1, {C.PREFILL_MAX_TOKENS}]")
-    if not 1 <= args.requests <= min(C.MAX_BATCH_PER_DP, args.tokens):
-        parser.error(f"--requests must be in [1, {min(C.MAX_BATCH_PER_DP, args.tokens)}]")
+    if not 1 <= args.tokens <= PREFILL_MAX_TOKENS:
+        parser.error(f"--tokens must be in [1, {PREFILL_MAX_TOKENS}]")
+    if not 1 <= args.requests <= min(MAX_BATCH_PER_DP, args.tokens):
+        parser.error(f"--requests must be in [1, {min(MAX_BATCH_PER_DP, args.tokens)}]")
     torch.set_num_threads(8)
 
     print(
-        f"[LAYER] mode={mode} tokens={args.tokens} requests={args.requests} TP={TP_SIZE} DP={C.DP_SIZE} "
+        f"[LAYER] mode={mode} tokens={args.tokens} requests={args.requests} TP={TP_SIZE} DP={DP_SIZE} "
         f"EP={EP_SIZE} experts/rank={N_LOCAL_EXPERTS} case={args.case} seed={args.seed} devices={devices}"
     )
     initial_state = {}
     result = run(
-        fn=make_program(C.PREFILL_MAX_TOKENS, EP_SIZE),
+        fn=make_program(PREFILL_MAX_TOKENS, EP_SIZE),
         specs=build_specs(args, mode, initial_state),
         golden_fn=make_layer_golden(mode),
         compile_only=args.compile_only,
@@ -1242,18 +1258,5 @@ __all__ = [
 ]
 
 
-if "pytest" in sys.modules:
-    import pytest
-
-    @pytest.mark.parametrize("tp,dp", [(1, 2), (2, 2)])
-    def test_precision(tp, dp, a5_args):
-        """Validate TP1/DP2 and TP2/DP2 complete prefill layer cases on A5."""
-        result = validate(a5_args(tp=tp, dp=dp))
-        assert result.passed, result.error
-
-
-# A2/A3 CI currently discovers runnable model files by the conventional entry
-# sentinel. Split its spelling so this A5-only command remains directly runnable.
-_SCRIPT_ENTRY_POINT = "__" + "main__"
-if __name__ == _SCRIPT_ENTRY_POINT:
+if __name__ == "__main__":
     main()

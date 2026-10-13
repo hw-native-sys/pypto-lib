@@ -12,9 +12,13 @@ import math
 
 import torch
 
-from models.deepseek_v4_1_flash.config import MX_GROUP
+from config import FLASH as M
 
 import pypto.language as pl
+
+
+# model config
+MX_GROUP = M.weight_block_size[0]
 
 
 FP4_VALUES = torch.tensor(
@@ -29,6 +33,57 @@ FP4_E4M3_CODES = torch.tensor(
      0x80, 0xB0, 0xB8, 0xBC, 0xC0, 0xC4, 0xC8, 0xCC],
     dtype=torch.int16,
 )
+
+
+def _prefill_operand(value):
+    """Round an operand to model-state precision before widening accumulation."""
+    if not isinstance(value, torch.Tensor) or not value.is_floating_point():
+        raise TypeError("FP32 contraction operands must be real floating-point tensors")
+    return value.to(torch.float32).to(torch.float64)
+
+
+def prefill_round_activation(x, precision="fp32"):
+    """Store BF16 values in FP32 transport buffers only in official mode."""
+    if precision not in ("fp32", "official"):
+        raise ValueError("precision must be 'fp32' or 'official'")
+    return x.bfloat16().float() if precision == "official" else x
+
+
+def prefill_quantize_dequantize(x, kind):
+    """Independent released FP8/FP4 roundtrip, including BF16 boundaries.
+
+    FP4 ties select the even code by distance, independently of the device's
+    midpoint comparisons. Power-of-two scales use frexp, not device bit logic.
+    """
+    if kind not in ("mxfp8", "index_fp4", "kv_fp4"):
+        raise ValueError("unknown activation/cache quantization kind")
+    group_size = 16 if kind == "kv_fp4" else 32
+    if x.shape[-1] % group_size:
+        raise ValueError("quantized width must be a multiple of its group size")
+    value = x.bfloat16().float().unflatten(-1, (-1, group_size))
+    maximum = value.abs().amax(-1, keepdim=True)
+    if kind == "kv_fp4":
+        scale = (maximum.clamp_min(6 * 2.0**-9) / 6).to(torch.float8_e4m3fn).float()
+    else:
+        floor, inverse = (1e-4, 1 / 448) if kind == "mxfp8" else (6 * 2.0**-126, 1 / 6)
+        fraction, exponent = torch.frexp(maximum.clamp_min(floor) * inverse)
+        scale = torch.ldexp(torch.ones_like(fraction), exponent - (fraction == 0.5).int())
+    normalized = value / scale
+    if kind == "mxfp8":
+        quantized = normalized.clamp(-448, 448).to(torch.float8_e4m3fn).float()
+    else:
+        magnitude = normalized.abs().clamp(max=6)
+        levels = magnitude.new_tensor([0, 0.5, 1, 1.5, 2, 3, 4, 6])
+        best = torch.zeros_like(magnitude, dtype=torch.long)
+        distance = magnitude
+        # Even codes precede odd codes, so equal distances implement RN-even.
+        for code in (2, 4, 6, 1, 3, 5, 7):
+            candidate = (magnitude - levels[code]).abs()
+            closer = candidate < distance
+            best = torch.where(closer, code, best)
+            distance = torch.where(closer, candidate, distance)
+        quantized = torch.copysign(levels[best], normalized)
+    return (quantized * scale).flatten(-2).bfloat16().float()
 
 
 def build_mxfp4_pair_lut() -> torch.Tensor:

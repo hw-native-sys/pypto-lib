@@ -8,26 +8,204 @@
 # -----------------------------------------------------------------------------------------------------------
 """First-level candidate-block selection for the decoder hierarchical sparse indexer."""
 
+from collections.abc import Callable
+
 import pypto.language as pl
 import torch
+import torch.nn.functional as F
 
-from models.deepseek_v4_1_flash.config import FLASH
-from models.deepseek_v4_1_flash.config import CMP_POSITIONS_DYN, T_DYN
-from models.deepseek_v4_1_flash.golden import select_candidate_blocks
-
-from models.deepseek_v4_1_flash.config import INDEX_H
-from models.deepseek_v4_1_flash.config import INDEX_TOPK
+from config import FLASH as M, CMP_POSITIONS_DYN, T_DYN
 
 
-CANDIDATE_BLOCK_SIZE = FLASH.candidate_block_size
-CANDIDATE_TOPK_BLOCKS = FLASH.candidate_topk_blocks
+
+from qkv_proj_rope import golden_rope_interleave
+from quantization import mxfp8_linear
+from rmsnorm import golden_rms_norm_reference
+
+
+# model config
+INDEX_H = M.index_n_heads
+INDEX_TOPK = M.index_topk
+
+
+CANDIDATE_BLOCK_SIZE = M.candidate_block_size
+CANDIDATE_TOPK_BLOCKS = M.candidate_topk_blocks
 CANDIDATE_PAIR_WIDTH = 2 * CANDIDATE_TOPK_BLOCKS
 CANDIDATE_SCORE_TILE = 1024
 CANDIDATE_LEAF = 8192
 CANDIDATE_SHORT_LEAF = 2048
-CANDIDATE_MAX_BLOCKS = FLASH.max_position_embeddings // CANDIDATE_BLOCK_SIZE
+CANDIDATE_MAX_BLOCKS = M.max_position_embeddings // CANDIDATE_BLOCK_SIZE
 CANDIDATE_MAX_LEAVES = (CANDIDATE_MAX_BLOCKS + CANDIDATE_LEAF - 1) // CANDIDATE_LEAF
 INDEX_SCORE_POSITIONS_DYN = pl.dynamic("V41_INDEX_SCORE_POSITIONS_DYN")
+
+
+from attention_ops import prefill_einsum
+from attention_ops import prefill_linear
+from attention_ops import prefill_matmul
+from qkv_proj_rope import prefill_rotate
+from quantization import prefill_quantize_dequantize
+from quantization import prefill_round_activation
+
+
+def _prefill_paged_indexer(
+    x: torch.Tensor,
+    qr: torch.Tensor,
+    request_ids: torch.Tensor,
+    index_cache: torch.Tensor,
+    block_table: torch.Tensor,
+    compressed_lens: torch.Tensor,
+    wq_b: torch.Tensor,
+    weights_proj: torch.Tensor,
+    cos: torch.Tensor,
+    sin: torch.Tensor,
+    candidates: torch.Tensor | None = None,
+    topk: int = M.index_topk,
+    *,
+    precision="fp32",
+    formats=None,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Score request-local paged index keys and return scores plus physical rows."""
+    if compressed_lens.ndim != 1 or compressed_lens.shape[0] != x.shape[0]:
+        raise ValueError("compressed_lens must contain one causal length per query token")
+    max_len = int(compressed_lens.max().item()) if compressed_lens.numel() else 0
+    scores = x.new_full((x.shape[0], max_len), -torch.inf, dtype=torch.float32)
+    physical = torch.full((x.shape[0], topk), -1, dtype=torch.int32, device=x.device)
+    if max_len == 0:
+        return scores, physical
+
+    positions = torch.arange(max_len, device=x.device)
+    request_rows = request_ids.to(torch.long).unsqueeze(-1)
+    blocks = torch.div(positions, 128, rounding_mode="floor")
+    offsets = positions.remainder(128)
+    physical_rows = block_table[request_rows, blocks] * 128 + offsets
+    flat_keys = index_cache.flatten(0, 1).squeeze(-2)
+    keys = flat_keys[physical_rows.to(torch.long)]
+
+    index_dim = index_cache.shape[-1]
+    index_heads = weights_proj.shape[-1]
+    if precision == "official":
+        formats = formats or {}
+        q = prefill_linear(qr, wq_b.T, precision=precision, format=formats["index_wq_b"])
+        q = q.unflatten(-1, (index_heads, index_dim))
+        q = prefill_quantize_dequantize(prefill_rotate(q, cos, sin, precision=precision), "index_fp4")
+        weights = prefill_linear(x, weights_proj.T, precision=precision, format=formats["index_weights_proj"])
+        weights = prefill_round_activation(weights * (index_dim**-0.5 * index_heads**-0.5), precision)
+        dots = prefill_round_activation(prefill_einsum("thd,tkd->thk", q, keys), precision)
+        weighted = prefill_round_activation(dots.relu() * weights.unsqueeze(-1), precision)
+        scores = prefill_round_activation(weighted.sum(dim=-2), precision)
+    else:
+        q = prefill_matmul(qr, wq_b).unflatten(-1, (index_heads, index_dim))
+        rd = cos.shape[-1] * 2
+        q = torch.cat((q[..., :-rd], golden_rope_interleave(q[..., -rd:], cos, sin)), dim=-1)
+        weights = prefill_matmul(x.float(), weights_proj.float()).to(x.dtype)
+        weights = (weights.float() * (index_dim**-0.5 * index_heads**-0.5)).to(x.dtype)
+        dots = prefill_einsum("thd,tkd->thk", q.float(), keys.float()).to(q.dtype)
+        weighted = (dots.float().relu() * weights.float().unsqueeze(-1)).to(q.dtype)
+        scores = weighted.float().sum(dim=-2).to(q.dtype).float()
+    valid_positions = positions.unsqueeze(0) < compressed_lens.to(torch.long).unsqueeze(-1)
+    scores = scores.masked_fill(~valid_positions, -torch.inf)
+    if candidates is not None:
+        scores = scores.masked_fill(~candidates[..., :max_len].to(torch.bool), -torch.inf)
+
+    count = min(topk, max_len)
+    logical = scores.topk(count, dim=-1, sorted=False).indices.sort(dim=-1).values
+    selected_scores = scores.gather(-1, logical)
+    selected_rows = physical_rows.gather(-1, logical)
+    for token in range(x.shape[0]):
+        valid_rows = selected_rows[token, torch.isfinite(selected_scores[token])].to(torch.int32)
+        physical[token, : valid_rows.numel()] = valid_rows
+    return scores, physical
+
+
+def golden_index_key(
+    latent: torch.Tensor,
+    wk: torch.Tensor,
+    norm_weight: torch.Tensor,
+    cos: torch.Tensor,
+    sin: torch.Tensor,
+) -> torch.Tensor:
+    """Project an unrotated compressor latent into a rotated index key."""
+    projected = torch.matmul(latent.float(), wk.float()).to(latent.dtype)
+    key = golden_rms_norm_reference(projected, norm_weight)
+    rd = cos.shape[-1] * 2
+    return torch.cat((key[..., :-rd], golden_rope_interleave(key[..., -rd:], cos, sin)), dim=-1)
+
+
+def golden_paged_indexer(
+    x: torch.Tensor,
+    qr: torch.Tensor,
+    request_ids: torch.Tensor,
+    index_cache: torch.Tensor,
+    block_table: torch.Tensor,
+    compressed_lens: torch.Tensor,
+    wq_b: torch.Tensor,
+    wq_b_scale: torch.Tensor | None,
+    weights_proj: torch.Tensor,
+    cos: torch.Tensor,
+    sin: torch.Tensor,
+    candidates: torch.Tensor | None = None,
+    topk: int = M.index_topk,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Score request-local paged index keys and return scores plus physical rows."""
+    if compressed_lens.ndim != 1 or compressed_lens.shape[0] != x.shape[0]:
+        raise ValueError("compressed_lens must contain one causal length per query token")
+    max_len = int(compressed_lens.max().item()) if compressed_lens.numel() else 0
+    scores = x.new_full((x.shape[0], max_len), -torch.inf, dtype=torch.float32)
+    physical = torch.full((x.shape[0], topk), -1, dtype=torch.int32, device=x.device)
+    if max_len == 0:
+        return scores, physical
+
+    positions = torch.arange(max_len, device=x.device)
+    request_rows = request_ids.to(torch.long).unsqueeze(-1)
+    blocks = torch.div(positions, 128, rounding_mode="floor")
+    offsets = positions.remainder(128)
+    physical_rows = block_table[request_rows, blocks] * 128 + offsets
+    flat_keys = index_cache.flatten(0, 1).squeeze(-2)
+    keys = flat_keys[physical_rows.to(torch.long)]
+
+    index_dim = index_cache.shape[-1]
+    index_heads = weights_proj.shape[-1]
+    q = mxfp8_linear(qr, wq_b, wq_b_scale).unflatten(-1, (index_heads, index_dim))
+    rd = cos.shape[-1] * 2
+    q = torch.cat((q[..., :-rd], golden_rope_interleave(q[..., -rd:], cos, sin)), dim=-1)
+    weights = torch.matmul(x.float(), weights_proj.float()).to(x.dtype)
+    weights = (weights.float() * (index_dim**-0.5 * index_heads**-0.5)).to(x.dtype)
+    dots = torch.einsum("thd,tkd->thk", q.float(), keys.float()).to(q.dtype)
+    weighted = (dots.float().relu() * weights.float().unsqueeze(-1)).to(q.dtype)
+    scores = weighted.float().sum(dim=-2).to(q.dtype).float()
+    valid_positions = positions.unsqueeze(0) < compressed_lens.to(torch.long).unsqueeze(-1)
+    scores = scores.masked_fill(~valid_positions, -torch.inf)
+    if candidates is not None:
+        scores = scores.masked_fill(~candidates[..., :max_len].to(torch.bool), -torch.inf)
+
+    count = min(topk, max_len)
+    logical = scores.topk(count, dim=-1, sorted=False).indices.sort(dim=-1).values
+    selected_scores = scores.gather(-1, logical)
+    selected_rows = physical_rows.gather(-1, logical)
+    for token in range(x.shape[0]):
+        valid_rows = selected_rows[token, torch.isfinite(selected_scores[token])].to(torch.int32)
+        physical[token, :valid_rows.numel()] = valid_rows
+    return scores, physical
+
+
+def select_candidate_blocks(
+    logits: torch.Tensor,
+    compressed_lens: torch.Tensor | int,
+    topk_blocks: int = M.candidate_topk_blocks,
+    block_size: int = M.candidate_block_size,
+) -> torch.Tensor:
+    """Return the first-level candidate mask used by late index-source layers."""
+    width = logits.shape[-1]
+    padded = F.pad(logits, (0, -width % block_size), value=-torch.inf)
+    scores = padded.unflatten(-1, (-1, block_size)).amax(dim=-1)
+    last = (torch.as_tensor(compressed_lens, device=logits.device) - 1) // block_size
+    while last.ndim < scores.ndim:
+        last = last.unsqueeze(-1)
+    block_ids = torch.arange(scores.shape[-1], device=logits.device)
+    scores = scores.masked_fill(block_ids == last, torch.inf)
+    top = scores.topk(min(topk_blocks, scores.shape[-1]), dim=-1)
+    keep = torch.zeros_like(scores, dtype=torch.bool).scatter_(-1, top.indices, top.values > -torch.inf)
+    return keep.repeat_interleave(block_size, dim=-1)[..., :width]
 
 
 def golden_hierarchical_sparse_indexer(
@@ -35,7 +213,7 @@ def golden_hierarchical_sparse_indexer(
     compressed_lens: torch.Tensor,
 ) -> torch.Tensor:
     return select_candidate_blocks(
-        index_scores, compressed_lens, FLASH.candidate_topk_blocks, FLASH.candidate_block_size
+        index_scores, compressed_lens, M.candidate_topk_blocks, M.candidate_block_size
     )
 
 
@@ -265,10 +443,8 @@ def hierarchical_sparse_indexer(
 __all__ = ["golden_hierarchical_sparse_indexer", "hierarchical_sparse_indexer"]
 
 
-
-
 # Resident CED prefill precision variants.
-_PREFILL_AUX_INDEX_SCALE = FLASH.index_head_dim**-0.5 * INDEX_H**-0.5
+_PREFILL_AUX_INDEX_SCALE = M.index_head_dim**-0.5 * INDEX_H**-0.5
 
 
 _PREFILL_AUX_B = pl.dynamic("FP32_AUX_B")
@@ -398,7 +574,14 @@ def prefill_index_topk_inline(
         pl.store(result, [row, 0], output)
     return output
 
-if __name__ == "__main__":
-    from models.deepseek_v4_1_flash._golden_smoke import run_hierarchical_indexer_golden
+def run_hierarchical_indexer_golden(golden_fn: Callable[..., torch.Tensor]) -> None:
+    width = 2050 * 8
+    scores = -torch.arange(width, dtype=torch.float32).reshape(1, width)
+    candidate_mask = golden_fn(scores, torch.tensor([width]))
+    if not bool(candidate_mask[..., -8:].all()) or int(candidate_mask.sum()) > 2048 * 8:
+        raise RuntimeError("candidate selector did not pin the newest partial block")
+    print(f"[GOLDEN] PASS {golden_fn.__name__} output={tuple(candidate_mask.shape)}")
 
+
+if __name__ == "__main__":
     run_hierarchical_indexer_golden(golden_hierarchical_sparse_indexer)

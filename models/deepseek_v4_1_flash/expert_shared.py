@@ -10,11 +10,14 @@
 
 import pypto.language as pl
 
-from models.deepseek_v4_1_flash.config import FLASH as M, MOE_TOKENS
+from config import FLASH as M
 
-from models.deepseek_v4_1_flash.attention_ops import prefill_packed_linear_inline
-from models.deepseek_v4_1_flash.config import FLASH
-from models.deepseek_v4_1_flash.quantization import prefill_round_inline
+from config import MOE_TOKENS
+
+
+from attention_ops import prefill_packed_linear_inline
+
+from quantization import prefill_round_inline
 
 
 # model config
@@ -57,6 +60,25 @@ assert MOE_INTER % QUANT_TILE == 0
 assert QUANT_TILE % ACT_INTER_TILE == 0
 assert MX_K_TILE % MX_RIGHT_K_TILE == 0
 assert MX_K_TILE % MX_W2_RIGHT_K_TILE == 0
+
+
+from attention_ops import prefill_linear
+from quantization import prefill_round_activation
+import torch.nn.functional as F
+
+PREFILL_LIMIT = M.swiglu_limit
+
+def prefill_expert_reference(x, matrices, route_weights=None, *, precision="fp32", formats=None):
+    """Apply routing weights before the released BF16 hidden boundary and W2."""
+    w1, w3, w2 = matrices
+    formats = formats or ("fp32",) * 3
+    gate = prefill_linear(x, w1, precision=precision, format=formats[0]).clamp(max=PREFILL_LIMIT)
+    up = prefill_linear(x, w3, precision=precision, format=formats[1]).clamp(-PREFILL_LIMIT, PREFILL_LIMIT)
+    hidden = F.silu(gate) * up
+    if route_weights is not None:
+        hidden = hidden * route_weights[:, None]
+    hidden = prefill_round_activation(hidden, precision)
+    return prefill_linear(hidden, w2, precision=precision, format=formats[2])
 
 
 @pl.jit.inline
@@ -372,7 +394,7 @@ def golden_expert_shared(tensors):
     import torch
     import torch.nn.functional as F
 
-    from models.deepseek_v4_1_flash.quantization import decode_e8m0_codes_v41 as decode_e8m0_codes, host_quant_mxfp8_v41 as host_quant_mxfp8, matmul_mx_golden_v41 as matmul_mx_golden
+    from quantization import decode_e8m0_codes_v41 as decode_e8m0_codes, host_quant_mxfp8_v41 as host_quant_mxfp8, matmul_mx_golden_v41 as matmul_mx_golden
 
     x_fp8 = tensors["x_local"][:T]
     x_scale = decode_e8m0_codes(
@@ -400,14 +422,14 @@ def golden_expert_shared(tensors):
 def build_tensor_specs():
     import torch
     from golden.spec import TensorSpec
-    from models.deepseek_v4_1_flash.quantization import gen_mxfp8_weight_kn_v41 as gen_mxfp8_weight_kn_device, host_quant_mxfp8_v41 as host_mxfp8_activation
+    from quantization import gen_mxfp8_weight_kn_v41 as gen_mxfp8_weight_kn_device, host_quant_mxfp8_v41 as host_mxfp8_activation
 
     x_local_bf16 = torch.randn(T_PAD, D, dtype=torch.bfloat16)
     if T < T_PAD:
         x_local_bf16[T:, :] = 0
     x_local_fp8, x_local_scale_codes = host_mxfp8_activation(x_local_bf16, return_e8m0=True)
     # matmul_mx expects the physical MX_A_ZZ scale order.
-    from models.deepseek_v4_1_flash.quantization import pack_mx_a_scale
+    from quantization import pack_mx_a_scale
     x_local_scale_codes = pack_mx_a_scale(x_local_scale_codes)
     fp8_e8m0 = getattr(torch, "float8_e8m0fnu", torch.uint8)
     x_local_scale = x_local_scale_codes.contiguous().view(fp8_e8m0)
@@ -437,16 +459,14 @@ def build_tensor_specs():
     ]
 
 
-
-
 # Resident CED prefill precision variants.
 _PREFILL_MOE_TILE = 256
 
 
-_PREFILL_MOE_INTER = FLASH.moe_intermediate_size
+_PREFILL_MOE_INTER = M.moe_intermediate_size
 
 
-_PREFILL_MOE_LIMIT = FLASH.swiglu_limit
+_PREFILL_MOE_LIMIT = M.swiglu_limit
 
 
 _PREFILL_MOE_WORKERS = 32
@@ -486,7 +506,7 @@ def prefill_swiglu_inline(
     return output
 
 
-_PREFILL_MOE_D = FLASH.hidden_size
+_PREFILL_MOE_D = M.hidden_size
 
 
 _PREFILL_MOE_T = pl.dynamic("V41_FP32_MOE_T")
@@ -539,12 +559,6 @@ def prefill_shared_expert_inline(
     return output
 
 if __name__ == "__main__":
-    # Drop this model directory when run as a script so the local golden.py does not
-    # shadow the repository golden package.
-    import pathlib
-    import sys
-    _model_dir = pathlib.Path(__file__).resolve().parent
-    sys.path = [item for item in sys.path if pathlib.Path(item or ".").resolve() != _model_dir]
     import argparse
     from golden.validation import ratio_reldiff
     from golden.runner import run

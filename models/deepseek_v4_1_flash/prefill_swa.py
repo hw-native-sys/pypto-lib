@@ -8,46 +8,23 @@
 # -----------------------------------------------------------------------------------------------------------
 """Token-sharded packed-prefill SWA with local mHC and head-TP attention."""
 
-import sys
-from pathlib import Path
 
-if __package__ in (None, ""):
-    sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
-
-# ci: no-sim
 import math
 
 import pypto.language as pl
 import pypto.language.distributed as pld
 import torch
 
-from models.deepseek_v4_1_flash.attention_common import golden_swa_attention
-from models.deepseek_v4_1_flash.config import (
-    D,
-    HC_DIM,
-    HC_MULT,
-    HEAD_DIM,
-    LOCAL_H,
-    LOCAL_O_GROUPS,
-    LOCAL_O_WIDTH,
-    MIX_HC,
-    O_GROUP_IN,
-    O_LORA,
-    ORI_BLOCKS_DYN,
-    PREFILL_MAX_TOKENS,
-    Q_LORA,
-    ROPE_DIM,
-    T_DYN,
-    TP_SIZE,
-    WINDOW_CACHE_GROUP,
-)
-from models.deepseek_v4_1_flash.hc_mixes import golden_mhc_mixes
-from models.deepseek_v4_1_flash.hc_post import golden_mhc_post
-from models.deepseek_v4_1_flash.hc_pre import golden_mhc_pre
-from models.deepseek_v4_1_flash.decode_common import attention_pre
-from models.deepseek_v4_1_flash.golden import rms_norm as golden_rms_norm
-from models.deepseek_v4_1_flash.prefill_attn_swa import prefill_attn_swa_partial
-from models.deepseek_v4_1_flash.attention_sp import (
+from attention_common import golden_swa_attention
+from config import PREFILL_MAX_TOKENS, WINDOW_CACHE_GROUP, FLASH as M, ORI_BLOCKS_DYN, T_DYN, TP_SIZE
+
+from hc_mixes import golden_mhc_mixes
+from hc_post import golden_mhc_post
+from hc_pre import golden_mhc_pre
+from decode_common import attention_pre
+from rmsnorm import golden_rms_norm_reference as golden_rms_norm
+from prefill_attn_swa import prefill_attn_swa_partial
+from attention_sp import (
     SP_T_DYN,
     prefill_sp_input_allgather,
     prefill_sp_output_reduce_scatter,
@@ -55,6 +32,20 @@ from models.deepseek_v4_1_flash.attention_sp import (
     PREFILL_ATTN_RING_HEAP,
 )
 
+
+# model config
+LOCAL_H = M.num_attention_heads // TP_SIZE
+LOCAL_O_GROUPS = M.o_groups // TP_SIZE
+LOCAL_O_WIDTH = M.o_groups // TP_SIZE * M.o_lora_rank
+D = M.hidden_size
+HEAD_DIM = M.head_dim
+ROPE_DIM = M.qk_rope_head_dim
+Q_LORA = M.q_lora_rank
+O_LORA = M.o_lora_rank
+O_GROUP_IN = M.num_attention_heads * M.head_dim // M.o_groups
+HC_MULT = M.hc_mult
+HC_DIM = M.hc_dim
+MIX_HC = M.mix_hc
 
 
 @pl.jit.inline(auto_scope=False)
@@ -341,7 +332,7 @@ def make_hc_program(capacity, world_size, epochs):
 def build_hc_specs(args):
     """Stacked TP/DP specs with HC streams in and HC streams out."""
     from golden import ScalarSpec, TensorSpec
-    from models.deepseek_v4_1_flash.decode_attn_swa import make_inputs, make_packed_inputs
+    from decode_attn_swa import make_inputs, make_packed_inputs
 
     world_size = TP_SIZE * args.dp
     packed = True
@@ -435,7 +426,7 @@ def build_hc_specs(args):
 
 def reference_attention(tensors, hidden, base):
     """One TP group's SWA on ``hidden``: the FP32 TP sum in BF16 and each rank's (cache, scale)."""
-    from models.deepseek_v4_1_flash.decode_attn_swa import official_reference
+    from decode_attn_swa import official_reference
 
     partials, caches = [], []
     active = int(tensors["num_tokens"][base, 0]) if "num_tokens" in tensors else hidden.shape[0]
@@ -518,7 +509,7 @@ def make_staged_compare(
 ):
     """Stage-wise comparators: mHC pre vs golden, SWA teacher-forced, hc_post replayed."""
     from golden import ratio_allclose
-    from models.deepseek_v4_1_flash.decode_attn_swa import compare_distributed_cache, compare_output, compare_scales
+    from decode_attn_swa import compare_distributed_cache, compare_output, compare_scales
 
     bf16_close = ratio_allclose(atol=1e-4, rtol=1.0 / 128)
     forced = {}
@@ -644,7 +635,7 @@ def run_prefill_swa(argv=None):
     from pypto.ir import DistributedConfig
 
     parser = argparse.ArgumentParser(description="DeepSeek V4.1 prefill SWA + mHC: A5 precision and timing")
-    parser.add_argument("-p", "--platform", default="a5", choices=["a5"])
+    parser.add_argument("-p", "--platform", default="a5", choices=["a5", "a5sim"])
     parser.add_argument("-d", "--device", default=None, help="comma-separated device IDs; default: 0 through TP*DP-1")
     parser.add_argument("--tp", type=int, default=TP_SIZE, choices=[1, 2, 4])
     parser.add_argument("--ep", type=int, default=8, choices=[2, 4, 8])
@@ -732,11 +723,6 @@ def validate(argv=None):
     return run_prefill_swa(argv=argv)
 
 
-# A2/A3 CI currently discovers runnable model files by the conventional entry
-# sentinel. Split its spelling so this A5-only command remains directly runnable.
-_SCRIPT_ENTRY_POINT = "__" + "main__"
-
-
 def main():
     """Run local validation and return a failing exit status on precision errors."""
     result = validate()
@@ -744,14 +730,5 @@ def main():
         raise SystemExit(result.error or 1)
 
 
-if "pytest" in sys.modules:
-    import pytest
-
-    @pytest.mark.parametrize("tp,dp", [(1, 1), (4, 1)])
-    def test_precision(tp, dp, a5_args):
-        """Validate the operator against its golden reference on A5."""
-        result = validate(a5_args(tp=tp, dp=dp))
-        assert result.passed, result.error
-
-if __name__ == _SCRIPT_ENTRY_POINT:
+if __name__ == "__main__":
     main()

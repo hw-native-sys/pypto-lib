@@ -10,21 +10,23 @@
 
 import pypto.language as pl
 
-from models.deepseek_v4_1_flash.config import (
-    D,
-    INDEX_BLOCKS_DYN,
-    INDEX_CACHE_GROUP,
-    INDEX_DIM,
-    INDEX_H,
-    INDEX_TOPK,
-    Q_LORA,
-    ROPE_DIM,
-    T_DYN,
-)
-from models.deepseek_v4_1_flash.attention_ops import (
+from config import INDEX_CACHE_GROUP, FLASH as M, INDEX_BLOCKS_DYN, T_DYN
+
+
+
+from attention_ops import (
     M_TILE, make_bf16_projection_staged, make_mx_projection, make_rope,
 )
-from models.deepseek_v4_1_flash.hierarchical_sparse_indexer import _hierarchical_sparse_indexer
+from hierarchical_sparse_indexer import _hierarchical_sparse_indexer
+
+
+# model config
+D = M.hidden_size
+ROPE_DIM = M.qk_rope_head_dim
+Q_LORA = M.q_lora_rank
+INDEX_H = M.index_n_heads
+INDEX_DIM = M.index_head_dim
+INDEX_TOPK = M.index_topk
 
 
 INDEX_SCORE_SCALE = INDEX_DIM ** -0.5 * INDEX_H ** -0.5

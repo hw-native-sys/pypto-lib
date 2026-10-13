@@ -13,26 +13,173 @@ from dataclasses import dataclass
 
 import torch
 
-from models.deepseek_v4_1_flash.config import FLASH, AttentionMode
-from models.deepseek_v4_1_flash.golden import (
-    compressor_ratio1,
-    compressor_ratio2_paged,
-    index_key,
-    merge_attention_stats,
-    paged_indexer,
-    paged_sparse_attention,
-    paged_sparse_attention_stats,
-    qkv_proj_rope,
-    rope_interleave,
-    select_candidate_blocks,
-)
-from models.deepseek_v4_1_flash.quantization import (
+from config import FLASH as M, AttentionMode
+from compressor import golden_compressor_ratio1 as compressor_ratio1
+from compressor import golden_compressor_ratio2_paged as compressor_ratio2_paged
+from hierarchical_sparse_indexer import golden_index_key as index_key
+from attention_ops import golden_merge_attention_stats as merge_attention_stats
+from hierarchical_sparse_indexer import golden_paged_indexer as paged_indexer
+from attention_ops import golden_paged_sparse_attention as paged_sparse_attention
+from attention_ops import golden_paged_sparse_attention_stats as paged_sparse_attention_stats
+from qkv_proj_rope import golden_qkv_proj_rope as qkv_proj_rope
+from qkv_proj_rope import golden_rope_interleave as rope_interleave
+from hierarchical_sparse_indexer import select_candidate_blocks
+from quantization import (
     dequantize_mxfp4_cache,
     dequantize_mxfp8_cache,
     mxfp8_linear,
     quantize_mxfp4_cache,
     quantize_mxfp8_cache,
 )
+
+
+from attention_ops import _prefill_project
+from attention_ops import prefill_einsum
+from attention_ops import prefill_publish
+from attention_ops import prefill_sparse_attention_reference
+from compressor import _prefill_compressor_ratio2_paged
+from hierarchical_sparse_indexer import _prefill_paged_indexer
+from qkv_proj_rope import prefill_rotate
+from quantization import prefill_quantize_dequantize
+from quantization import prefill_round_activation
+from rmsnorm import prefill_rms_norm
+
+
+def _prefill_publish_latent(latent, weights, metadata, caches, *, precision="fp32"):
+    if metadata.compressed_rope_cos is None or metadata.compressed_rope_sin is None:
+        raise ValueError("global publication needs source-position compressed RoPE")
+    cosine, sine = metadata.compressed_rope_cos, metadata.compressed_rope_sin
+    # Index keys consume the unrotated latent, before compressed-cache quantization.
+    keys = prefill_rms_norm(
+        _prefill_project(latent, weights, "index_wk", precision), weights["index_norm_weight"], precision=precision
+    )
+    global_values = prefill_rotate(latent, cosine, sine, precision=precision)
+    index_values = prefill_rotate(keys, cosine, sine, precision=precision)
+    if precision == "official":
+        global_values = prefill_quantize_dequantize(global_values, "kv_fp4")
+        index_values = prefill_quantize_dequantize(index_values, "index_fp4")
+    prefill_publish(caches.compressed, global_values, metadata.compressed_slots)
+    prefill_publish(caches.index, index_values, metadata.compressed_slots)
+
+
+def prefill_publish_decoder_reference(x, weights, metadata, caches, *, precision="fp32"):
+    """Publish full encoder rows after layer20's HC collapse and attention norm."""
+    if x.dtype != torch.float32:
+        raise ValueError("decoder publication requires FP32 transport buffers")
+    result = caches.clone()
+    latent = prefill_rms_norm(
+        _prefill_project(x, weights, "compressor_wkv", precision), weights["compressor_norm_weight"], precision=precision
+    )
+    _prefill_publish_latent(latent, weights, metadata, result, precision=precision)
+    return result
+
+
+def prefill_attention_reference(
+    x,
+    weights,
+    metadata,
+    caches,
+    *,
+    mode,
+    ratio=0,
+    compressed_indices=None,
+    candidate_mask=None,
+    precision="fp32",
+):
+    """Evaluate one unsharded attention stage on normalized FP32 token rows.
+
+    All linear matrices are output-major [N,K]. Full decoder mode may consume
+    already-published global caches by passing negative compressed_slots; the
+    learned index query and candidate selection still run on decoder rows.
+    """
+    from utils import PrefillAttentionResult
+
+    if x.dtype != torch.float32:
+        raise ValueError("FP32 attention requires normalized FP32 inputs")
+    if any(
+        v is not None and v.dtype != torch.float32
+        for v in (caches.window, caches.compressed, caches.index, caches.state)
+    ):
+        raise ValueError("FP32 attention cache state must remain FP32")
+    mode = getattr(mode, "value", mode).rsplit("_", 1)[-1].lower()
+    result = caches.clone()
+    qr = prefill_rms_norm(_prefill_project(x, weights, "wq_a", precision), weights["q_norm_weight"], precision=precision)
+    width = weights["wkv"].shape[0]
+    query = _prefill_project(qr, weights, "wq_b", precision).unflatten(-1, (-1, width))
+    query = prefill_rotate(query, metadata.rope_cos, metadata.rope_sin, precision=precision)
+    kv = prefill_rms_norm(_prefill_project(x, weights, "wkv", precision), weights["kv_norm_weight"], precision=precision)
+    kv = prefill_rotate(kv, metadata.rope_cos, metadata.rope_sin, precision=precision)
+    if precision == "official":
+        kv = prefill_quantize_dequantize(kv, "mxfp8")
+    prefill_publish(result.window, kv, metadata.window_slots)
+
+    if mode == "full" and (
+        ratio == 2 or (metadata.compressed_slots is not None and bool((metadata.compressed_slots >= 0).any()))
+    ):
+        if ratio == 1:
+            latent = prefill_rms_norm(
+                _prefill_project(x, weights, "compressor_wkv", precision), weights["compressor_norm_weight"], precision=precision
+            )
+        elif ratio == 2:
+            latent, publication_mask = _prefill_compressor_ratio2_paged(
+                x,
+                metadata.query_start_loc,
+                metadata.position_ids,
+                metadata.request_ids,
+                metadata.state_block_table,
+                result.state,
+                weights["compressor_wkv"].T,
+                weights["compressor_wgate"].T,
+                weights["compressor_norm_weight"],
+                precision=precision,
+            )
+            if bool(((metadata.compressed_slots >= 0) & ~publication_mask).any()):
+                raise ValueError("ratio-two publication slots include incomplete pairs")
+        else:
+            raise ValueError("compressed full mode requires ratio one or two")
+        _prefill_publish_latent(latent, weights, metadata, result, precision=precision)
+
+    topk, candidates = compressed_indices, candidate_mask
+    if mode in ("full", "reindex"):
+        scores, topk = _prefill_paged_indexer(
+            x,
+            qr,
+            metadata.request_ids,
+            result.index,
+            metadata.index_block_table,
+            metadata.compressed_lens,
+            weights["index_wq_b"].T,
+            weights["index_weights_proj"].T,
+            metadata.rope_cos,
+            metadata.rope_sin,
+            candidates=candidate_mask,
+            precision=precision,
+            formats=weights.get("formats"),
+        )
+        if ratio == 1 and mode == "full":
+            candidates = select_candidate_blocks(scores, metadata.compressed_lens)
+    elif mode not in ("swa", "reuse"):
+        raise ValueError(f"unknown FP32 attention mode {mode}")
+    if mode != "swa" and topk is None:
+        raise ValueError("compressed attention requires source Top-K indices")
+
+    attended = prefill_sparse_attention_reference(
+        query,
+        result.window,
+        metadata.window_indices,
+        result.compressed,
+        topk,
+        weights["attn_sink"],
+        precision=precision,
+        extents=metadata.attention_extents,
+    )
+    rotated = prefill_rotate(attended, metadata.rope_cos, metadata.rope_sin, inverse=True, precision=precision)
+    groups = weights["wo_a"].shape[0]
+    grouped = rotated.reshape(x.shape[0], groups, -1)
+    wo_a = weights["wo_a"].bfloat16().float() if precision == "official" else weights["wo_a"]
+    projected = prefill_round_activation(prefill_einsum("tgk,gnk->tgn", grouped, wo_a), precision)
+    output = _prefill_project(projected.flatten(1), weights, "wo_b", precision)
+    return PrefillAttentionResult(output, result, topk, candidates)
 
 
 @dataclass(frozen=True)
@@ -404,14 +551,14 @@ def golden_compressed_attention(
             rope_cos,
             rope_sin,
             candidates=candidate_mask,
-            topk=FLASH.index_topk,
+            topk=M.index_topk,
         )
         if ratio == 1 and mode is AttentionMode.FULL:
             candidates = select_candidate_blocks(
                 scores,
                 compressed_lens,
-                FLASH.candidate_topk_blocks,
-                FLASH.candidate_block_size,
+                M.candidate_topk_blocks,
+                M.candidate_block_size,
             )
     if topk_indices is None:
         raise ValueError("reuse mode requires published compressed Top-K indices")

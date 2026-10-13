@@ -9,28 +9,26 @@
 """mHC coefficient generation."""
 
 import math
-import sys
-from pathlib import Path
-
-if __package__ in (None, ""):
-    sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
 import pypto.language as pl
 import torch
+import torch.nn.functional as F
 
-# A5-only; intentionally excluded from the A2/A3 device sweep. `ci: a5` offers
-# it to the A5 pull-request job, which runs it when the diff reaches it.
-# ci: no-sim
-# ci: a5
-from models.deepseek_v4_1_flash.config import D, FLASH, HC_DIM, HC_MULT, MIX_HC, T_DYN
-from models.deepseek_v4_1_flash.golden import hc_mixes
+from config import FLASH as M, T_DYN
 
+
+
+# model config
+D = M.hidden_size
+HC_MULT = M.hc_mult
+HC_DIM = M.hc_dim
+MIX_HC = M.mix_hc
 
 
 HC_DIM_INV = 1.0 / HC_DIM
-HC_SINKHORN_ITER = FLASH.hc_sinkhorn_iters
-HC_EPS = FLASH.hc_eps
-NORM_EPS = FLASH.rms_norm_eps
+HC_SINKHORN_ITER = M.hc_sinkhorn_iters
+HC_EPS = M.hc_eps
+NORM_EPS = M.rms_norm_eps
 MIX_PAD = 32
 HC_PAD = 8
 T_TILE = 8
@@ -40,6 +38,59 @@ RMS_K_TILE = 1024
 LINEAR_K_TILE = 256
 LINEAR_OK = 4
 LINEAR_K_PER_SPLIT = HC_DIM // LINEAR_OK
+
+
+from attention_ops import prefill_linear
+
+PREFILL_EPS = M.hc_eps
+PREFILL_HC = M.hc_mult
+PREFILL_ITERATIONS = M.hc_sinkhorn_iters
+
+def prefill_hc_mixes(x, function, scale, base, *, norm_eps=None):
+    """Project HC logits in FP64, retaining FP32 RMS and coefficient math."""
+    flat = x.flatten(-2).float()
+    epsilon = M.rms_norm_eps if norm_eps is None else norm_eps
+    inverse_rms = torch.rsqrt(flat.square().mean(dim=-1, keepdim=True) + epsilon)
+    logits = prefill_linear(flat, function) * inverse_rms
+    return prefill_hc_coefficients_reference(logits, scale.float(), base.float())
+
+
+def prefill_hc_coefficients_reference(logits, scale, base):
+    """Independent Torch sigmoid and Sinkhorn coefficient transform."""
+    pre = torch.sigmoid(logits[..., :PREFILL_HC] * scale[0] + base[:PREFILL_HC]) + PREFILL_EPS
+    post = 2 * torch.sigmoid(logits[..., PREFILL_HC:2 * PREFILL_HC] * scale[1] + base[PREFILL_HC:2 * PREFILL_HC])
+    residual = (logits[..., 2 * PREFILL_HC:] * scale[2] + base[2 * PREFILL_HC:]).unflatten(-1, (PREFILL_HC, PREFILL_HC))
+    residual = residual.softmax(-1) + PREFILL_EPS
+    residual = residual / (residual.sum(-2, keepdim=True) + PREFILL_EPS)
+    for _ in range(PREFILL_ITERATIONS - 1):
+        residual = residual / (residual.sum(-1, keepdim=True) + PREFILL_EPS)
+        residual = residual / (residual.sum(-2, keepdim=True) + PREFILL_EPS)
+    return pre, post, residual
+
+
+def golden_mhc_mixes(
+    x_hc: torch.Tensor,
+    function: torch.Tensor,
+    scale: torch.Tensor,
+    base: torch.Tensor,
+    iterations: int = M.hc_sinkhorn_iters,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Project one HC stream into pre, post, and doubly-stochastic residual mixes."""
+    flat = x_hc.flatten(-2).float()
+    inverse_rms = torch.rsqrt(flat.square().mean(dim=-1, keepdim=True) + M.rms_norm_eps)
+    mixes = F.linear(flat, function.float()) * inverse_rms
+    hc = M.hc_mult
+    pre_raw, post_raw, residual_raw = mixes.split((hc, hc, hc * hc), dim=-1)
+    pre = torch.sigmoid(pre_raw * scale[0] + base[:hc]) + M.hc_eps
+    post = 2 * torch.sigmoid(post_raw * scale[1] + base[hc : 2 * hc])
+    residual_base = base[2 * hc :].unflatten(-1, (hc, hc))
+    residual = (residual_raw.unflatten(-1, (hc, hc)) * scale[2] + residual_base).softmax(dim=-1)
+    residual = residual + M.hc_eps
+    residual = residual / (residual.sum(dim=-2, keepdim=True) + M.hc_eps)
+    for _ in range(iterations - 1):
+        residual = residual / (residual.sum(dim=-1, keepdim=True) + M.hc_eps)
+        residual = residual / (residual.sum(dim=-2, keepdim=True) + M.hc_eps)
+    return pre, post, residual
 
 
 @pl.jit.inline
@@ -176,15 +227,6 @@ def mhc_mixes(
             pl.store(logical_row, [t0, row * HC_MULT], residual_mix_flat)
     return mixes_ready
 
-def golden_mhc_mixes(
-    x_hc: torch.Tensor,
-    function: torch.Tensor,
-    scale: torch.Tensor,
-    base: torch.Tensor,
-) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    """Generate the reference pre, post, and residual mixing coefficients."""
-    return hc_mixes(x_hc, function, scale, base)
-
 
 @pl.jit
 def mhc_mixes_test(
@@ -300,10 +342,6 @@ __all__ = [
     "mhc_mixes_test",
 ]
 
-# A2/A3 CI currently discovers runnable model files by the conventional entry
-# sentinel. Split its spelling so this A5-only command remains directly runnable.
-_SCRIPT_ENTRY_POINT = "__" + "main__"
-
 
 def main():
     """Run local validation and return a failing exit status on precision errors."""
@@ -312,25 +350,17 @@ def main():
         raise SystemExit(result.error or 1)
 
 
-def test_precision(a5_args):
-    """Validate the operator against its golden reference on A5."""
-    result = validate(a5_args())
-    assert result.passed, result.error
-
-
-
-
 # Resident CED prefill precision variants.
-_PREFILL_MOE_NORM_EPS = FLASH.rms_norm_eps
+_PREFILL_MOE_NORM_EPS = M.rms_norm_eps
 
 
-_PREFILL_MOE_HC = FLASH.hc_mult
+_PREFILL_MOE_HC = M.hc_mult
 
 
 _PREFILL_MOE_MIX = _PREFILL_MOE_HC * (_PREFILL_MOE_HC + 2)
 
 
-_PREFILL_MOE_D = FLASH.hidden_size
+_PREFILL_MOE_D = M.hidden_size
 
 
 _PREFILL_MOE_TILE = 256
@@ -388,10 +418,10 @@ def prefill_hc_normalize_logits_inline(
     return output
 
 
-_PREFILL_MOE_ITERATIONS = FLASH.hc_sinkhorn_iters
+_PREFILL_MOE_ITERATIONS = M.hc_sinkhorn_iters
 
 
-_PREFILL_MOE_EPS = FLASH.hc_eps
+_PREFILL_MOE_EPS = M.hc_eps
 
 
 @pl.jit.inline(auto_scope=False)
@@ -512,5 +542,5 @@ def prefill_hc_coefficients_inline(
             pl.store(pl.set_validshape(row3, active, _PREFILL_MOE_HC), [token, 12], combine)
     return pre_mix, post_mix, residual_mix
 
-if __name__ == _SCRIPT_ENTRY_POINT:
+if __name__ == "__main__":
     main()

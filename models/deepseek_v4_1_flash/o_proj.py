@@ -10,18 +10,20 @@
 
 import pypto.language as pl
 
-from models.deepseek_v4_1_flash.attention_ops import K_TILE, M_TILE, N_TILE, make_mx_projection, make_rope
-from models.deepseek_v4_1_flash.config import (
-    D,
-    HEAD_DIM,
-    LOCAL_H,
-    LOCAL_O_GROUPS,
-    LOCAL_O_WIDTH,
-    O_GROUP_IN,
-    O_LORA,
-    ROPE_DIM,
-    T_DYN,
-)
+from attention_ops import K_TILE, M_TILE, N_TILE, make_mx_projection, make_rope
+from config import FLASH as M, T_DYN, TP_SIZE
+
+
+
+# model config
+LOCAL_H = M.num_attention_heads // TP_SIZE
+LOCAL_O_GROUPS = M.o_groups // TP_SIZE
+LOCAL_O_WIDTH = M.o_groups // TP_SIZE * M.o_lora_rank
+D = M.hidden_size
+HEAD_DIM = M.head_dim
+ROPE_DIM = M.qk_rope_head_dim
+O_LORA = M.o_lora_rank
+O_GROUP_IN = M.num_attention_heads * M.head_dim // M.o_groups
 
 
 _PREFILL_WORKERS = 64

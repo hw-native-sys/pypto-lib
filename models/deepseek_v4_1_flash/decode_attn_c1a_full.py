@@ -8,63 +8,62 @@
 # -----------------------------------------------------------------------------------------------------------
 """Continuous-batch decode C1A full attention."""
 
-import sys
-from pathlib import Path
-
-if __package__ in (None, ""):
-    sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
-
-# ci: no-sim
 import pypto.language as pl
 
-from models.deepseek_v4_1_flash.sparse_attention import attend_selected, gather_packed
+from sparse_attention import attend_selected, gather_packed
 import pypto.language.distributed as pld
 import torch
 
 from golden import TensorSpec, run
-from models.deepseek_v4_1_flash.attention_common import AttentionGoldenResult, quantized_cache_compare
-from models.deepseek_v4_1_flash.attention_ops import (
+from attention_common import AttentionGoldenResult, quantized_cache_compare
+from attention_ops import (
     make_bf16_projection_with_deps,
     make_norm_with_deps,
     make_rope_with_deps,
 )
-from models.deepseek_v4_1_flash.config import (
+from config import (
     AttentionMode,
+    COMPRESSED_CACHE_GROUP,
+    FLASH as M,
+    DECODE_MAX_TOKENS,
+    INDEX_CACHE_GROUP,
+    WINDOW_CACHE_GROUP,
     B_DYN,
     CMP_BLOCKS_DYN,
     CMP_POSITIONS_DYN,
-    COMPRESSED_CACHE_GROUP,
-    D,
-    FLASH,
-    DECODE_MAX_TOKENS,
-    HEAD_DIM,
     INDEX_BLOCKS_DYN,
-    INDEX_CACHE_GROUP,
-    INDEX_DIM,
-    INDEX_H,
-    INDEX_TOPK,
-    LOCAL_H,
-    LOCAL_O_GROUPS,
-    LOCAL_O_WIDTH,
     ORI_BLOCKS_DYN,
-    O_GROUP_IN,
-    O_LORA,
-    Q_LORA,
-    ROPE_DIM,
     TABLE_DYN,
-    TP_SIZE,
     T_DYN,
-    WINDOW_CACHE_GROUP,
+    TP_SIZE,
 )
-from models.deepseek_v4_1_flash.attention_tp import OUTPUT_T_DYN
-from models.deepseek_v4_1_flash.hierarchical_sparse_indexer import hierarchical_sparse_indexer
-from models.deepseek_v4_1_flash.o_proj import (
+
+
+
+from attention_tp import OUTPUT_T_DYN
+from hierarchical_sparse_indexer import hierarchical_sparse_indexer
+from o_proj import (
     grouped_output_with_deps,
     make_o_proj_with_deps as build_o_proj_with_deps,
 )
-from models.deepseek_v4_1_flash.qkv_proj_rope import (
+from qkv_proj_rope import (
     make_qkv_proj_rope_with_deps as build_qkv_proj_rope_with_deps,
 )
+
+
+# model config
+LOCAL_H = M.num_attention_heads // TP_SIZE
+LOCAL_O_GROUPS = M.o_groups // TP_SIZE
+LOCAL_O_WIDTH = M.o_groups // TP_SIZE * M.o_lora_rank
+D = M.hidden_size
+HEAD_DIM = M.head_dim
+ROPE_DIM = M.qk_rope_head_dim
+Q_LORA = M.q_lora_rank
+O_LORA = M.o_lora_rank
+O_GROUP_IN = M.num_attention_heads * M.head_dim // M.o_groups
+INDEX_H = M.index_n_heads
+INDEX_DIM = M.index_head_dim
+INDEX_TOPK = M.index_topk
 
 # Model configuration.
 SOFTMAX_SCALE = HEAD_DIM**-0.5
@@ -543,7 +542,7 @@ def make_fp4_publish(width, group, scale_dtype, cache_dim):
 
 def _reference_linear(x, weight, packed_scale):
     """Group-32 FP32 accumulation with the released activation rounding rule."""
-    from models.deepseek_v4_1_flash.quantization import decode_e8m0, unpack_mx_b_scale
+    from quantization import decode_e8m0, unpack_mx_b_scale
 
     groups = x.float().unflatten(-1, (-1, 32))
     scale = torch.exp2(torch.ceil(torch.log2(groups.abs().amax(-1).clamp_min(1e-4) / 448.0)))
@@ -579,7 +578,7 @@ FP4_MIDPOINT_CODES = {0.25: 0, 0.75: 2, 1.25: 2, 1.75: 4, 2.5: 4, 3.5: 6, 5.0: 6
 
 def check_fp4_boundaries():
     """CPU check of the E2M1 midpoint rule; returns the failure count."""
-    from models.deepseek_v4_1_flash.quantization import FP4_VALUES, quantize_mxfp4_cache
+    from quantization import FP4_VALUES, quantize_mxfp4_cache
 
     magnitudes = [sign * value for value in FP4_MIDPOINT_CODES for sign in (1.0, -1.0)]
     rows = torch.zeros(len(magnitudes), 32, dtype=torch.bfloat16)
@@ -605,7 +604,7 @@ def check_fp4_boundaries():
 
 def _reference_fp4(value, group, scale_format):
     """Independent E2M1 round-half-to-even packing with format-specific scale floors."""
-    from models.deepseek_v4_1_flash.quantization import FP4_VALUES, encode_e8m0
+    from quantization import FP4_VALUES, encode_e8m0
 
     grouped = value.float().unflatten(-1, (-1, group))
     amax = grouped.abs().amax(-1)
@@ -677,8 +676,8 @@ def _reference_index_scores(a, qr, index_payload, index_scale, candidates):
     released indexer does, and every rounding point follows the device score kernel, so a
     device/reference disagreement is a real disagreement instead of an arithmetic ABI mismatch.
     """
-    from models.deepseek_v4_1_flash.golden import rope_interleave
-    from models.deepseek_v4_1_flash.quantization import dequantize_mxfp4_cache
+    from qkv_proj_rope import golden_rope_interleave as rope_interleave
+    from quantization import dequantize_mxfp4_cache
 
     x = a["x"]
     lengths = a["compressed_lens"]
@@ -718,12 +717,10 @@ def _reference_index_scores(a, qr, index_payload, index_scale, candidates):
 
 def official_reference_c1a(**args):
     """Released C1A math with caller-managed paged caches and replicated index heads."""
-    from models.deepseek_v4_1_flash.golden import (
-        rms_norm,
-        rope_interleave,
-        select_candidate_blocks,
-    )
-    from models.deepseek_v4_1_flash.quantization import (
+    from rmsnorm import golden_rms_norm_reference as rms_norm
+    from qkv_proj_rope import golden_rope_interleave as rope_interleave
+    from hierarchical_sparse_indexer import select_candidate_blocks
+    from quantization import (
         encode_e8m0, dequantize_mxfp4_cache, dequantize_mxfp8_cache,
     )
 
@@ -993,7 +990,7 @@ score_reindex = make_index_scores(True)
 # Model page geometry and bounded on-chip page cache.
 _TOPK_PAGE = 128
 _TOPK_PAIR_WIDTH = 2 * INDEX_TOPK
-_TOPK_CACHED_PAGES = (FLASH.max_position_embeddings + 127) // 128
+_TOPK_CACHED_PAGES = (M.max_position_embeddings + 127) // 128
 # Tiling and finite-score padding.
 _TOPK_LEAF_TILE = 2048
 _TOPK_SORT_FLOOR = -3.4028234663852886e38
@@ -1793,7 +1790,7 @@ def build_validation_values(mode, tokens, pages, seed=17, case="random"):
     import math
 
     TOKENS, PAGES, RANKS = tokens, pages, TP_SIZE
-    from models.deepseek_v4_1_flash.quantization import (
+    from quantization import (
         pack_mx_b_scale,
         quantize_mxfp8_cache,
         quantize_mxfp4_cache,
@@ -1980,7 +1977,7 @@ def topk_indices_compare(mode):
         del rtol, atol
         if torch.equal(actual, expected):
             return True, ""
-        from models.deepseek_v4_1_flash.golden import rms_norm
+        from rmsnorm import golden_rms_norm_reference as rms_norm
 
         names = (
             "x",
@@ -2060,7 +2057,7 @@ def run_c1a(mode, kernel_factory, golden_fn, argv=None):
         "--dp", type=int, default=1, choices=[1],
         help="one data-parallel group; the shared A5 entry command passes 1",
     )
-    parser.add_argument("-p", "--platform", type=str, default="a5", choices=["a5"])
+    parser.add_argument("-p", "--platform", type=str, default="a5", choices=["a5", "a5sim"])
     parser.add_argument(
         "-d", "--device", "--devices", type=str, default=None,
         help="comma-separated physical device IDs, one per rank; default: 0 through TP-1",
@@ -2177,11 +2174,6 @@ def validate(argv=None):
     return run_c1a("full", make_program, golden_decode_attn_c1a_full, argv=argv)
 
 
-# A2/A3 CI currently discovers runnable model files by the conventional entry
-# sentinel. Split its spelling so this A5-only command remains directly runnable.
-_SCRIPT_ENTRY_POINT = "__" + "main__"
-
-
 def main():
     """Run local validation and return a failing exit status on precision errors."""
     result = validate()
@@ -2189,14 +2181,5 @@ def main():
         raise SystemExit(result.error or 1)
 
 
-if "pytest" in sys.modules:
-    import pytest
-
-    @pytest.mark.parametrize("tp,dp", [(1, 1)])
-    def test_precision(tp, dp, a5_args):
-        """Validate the operator against its golden reference on A5."""
-        result = validate(a5_args(tp=tp, dp=dp))
-        assert result.passed, result.error
-
-if __name__ == _SCRIPT_ENTRY_POINT:
+if __name__ == "__main__":
     main()

@@ -247,13 +247,6 @@ jobs:
           for f in $(python .github/scripts/detect_changes.py --all --root models --platform a2a3); do
             run_case "$f" "$f"
           done
-          # Higher world sizes (ep4/ep8) are added manually as dedicated wraps
-          # below — run_case borrows the marker's 2 cards, so ep4/ep8 need their
-          # own --device-num (card pool must provide that many cards), e.g.:
-          #   task-submit --device "$DEVICE_ID" --device-num 4 --timeout 3600 --max-time 900 \
-          #     --run "cd $GITHUB_WORKSPACE/checkout && source activate.sh && \
-          #       PYTHONPATH=$GITHUB_WORKSPACE/checkout \
-          #       python models/deepseek_v4_flash_mtp/decode_moe.py -p a2a3 --ep 4 -d \$TASK_DEVICE"
           if [ ${#failed[@]} -ne 0 ]; then
             echo "Failed cases (${#failed[@]}):"
             printf '  - %s\n' "${failed[@]}"
@@ -288,8 +281,8 @@ jobs:
     runs-on: [self-hosted, linux, npu-a5]
     # The cases run one after another, each bounded by task-submit's own
     # --timeout 3600 queue wait + --max-time 900 run, on top of the build.
-    # The declared parallel cases can borrow up to 8 cards.
-    timeout-minutes: 240
+    # Each entry declares its device count with a CI marker.
+    timeout-minutes: 120
     defaults:
       run:
         working-directory: checkout
@@ -374,17 +367,29 @@ jobs:
           PYPTO_BENCH: '0'  # Correctness only; the dedicated performance job owns timing.
         run: |
           source activate.sh
-          if [ "${PYPTO_USE_UV:-false}" = "true" ]; then
-            uv pip install pytest
-          else
-            python -m pip install pytest
-          fi
           FILES=$(python .github/scripts/detect_changes.py --all --root models --platform a5)
           : > results.tsv
-          if [ -n "$FILES" ]; then
-            # Daily retains every declared TP/DP/EP combination, including
-            # TP2/TP4 cases excluded from the TP1 pull-request smoke gate.
-            python .github/scripts/run_a5_pytest.py --mode cli --results results.tsv $FILES
+          failed=()
+          for f in $FILES; do
+            echo "::group::$f"
+            ndev=$(grep -oP '#\s*ci:\s*devices=\K[0-9]+' "$f" | head -1 || true)
+            ndev=${ndev:-1}
+            devnum_flag=""
+            [ "$ndev" -gt 1 ] && devnum_flag="--device-num $ndev --ignore-whitelist"
+            if task-submit --device auto $devnum_flag --timeout 3600 --max-time 900 \
+              --run "cd $GITHUB_WORKSPACE/checkout && source activate.sh && PYTHONPATH=$GITHUB_WORKSPACE/checkout python $f -p a5 -d \$TASK_DEVICE"; then
+              status=pass
+            else
+              status=fail
+              failed+=("$f")
+              echo "::error file=${f}::FAIL"
+            fi
+            printf '%s\t%s\n' "$f" "$status" >> results.tsv
+            echo "::endgroup::"
+          done
+          if [ ${#failed[@]} -ne 0 ]; then
+            printf 'FAILED: %s\n' "${failed[@]}"
+            exit 1
           fi
 
       - name: Kill orphaned task-submit tasks
@@ -563,91 +568,8 @@ jobs:
                   print(no_artifact(missing) + " Those columns read all `-`.")
               print()
 
-          def a5_table(title, platforms):
-              """One table for A5 entries across device and simulator legs.
-
-              The legs key their cases differently: the a5 device job runs every
-              pytest node or CLI combination an entry declares and labels each
-              case accordingly, while a5sim runs the entry once with no extra arguments. Keying
-              the row on the entry itself puts them side by side; a cell that
-              stands for more than one case carries its pass count and names the
-              cases that failed, so nothing the split tables showed is lost.
-              """
-              data = {p: load(p) for p in platforms}
-              present = [p for p in platforms if data[p] is not None]
-              missing = [p for p in platforms if data[p] is None]
-              print(f"### {title}")
-              print()
-              if not present:
-                  print(no_artifact(missing))
-                  print()
-                  return
-              # platform -> entry -> {case arguments ("" when it has none): status}
-              cases = {p: {} for p in platforms}
-              for p in present:
-                  for label, status in data[p].items():
-                      entry, _, args = label.partition(" ")
-                      if "::" in entry:
-                          entry, _, node = entry.partition("::")
-                          args = node + (" " + args if args else "")
-                      cases[p].setdefault(entry, {})[args] = status
-
-              def cell(by_args):
-                  """One leg's verdict for one entry, against its whole matrix.
-
-                  The device sweep writes a row for every case the entry
-                  declares before it runs any of them, so a case left
-                  ``missing`` is one the sweep never reached, not one the entry
-                  does not have. The count is therefore out of the declared
-                  cases, and an entry the sweep only got part way through reads
-                  as incomplete rather than as a smaller entry passing in full.
-                  """
-                  if not by_args:
-                      return ICON["missing"]
-                  if list(by_args) == [""]:
-                      # No parallel arguments to distinguish, so there is
-                      # nothing for a count or a case list to add. Its own
-                      # icon, though: a case the sweep never reached reads
-                      # :warning:, never the :heavy_minus_sign: that means the
-                      # entry has no case on this leg in the first place.
-                      status = by_args[""]
-                      return ":warning:" if status == "missing" else ICON.get(status, "?")
-                  bad = sorted(a for a, s in by_args.items() if s == "fail")
-                  unrun = sorted(a for a, s in by_args.items() if s == "missing")
-                  icon = ICON["fail"] if bad else (":warning:" if unrun else ICON["pass"])
-                  text = f"{icon} {len(by_args) - len(bad) - len(unrun)}/{len(by_args)}"
-                  # Name the cases behind the count, except when the entry
-                  # ran none at all: there `0/6` already lists them.
-                  if len(bad) + len(unrun) == len(by_args) and not bad:
-                      return text
-                  notes = [f"{what}: " + ", ".join(f"`{a}`" for a in args)
-                           for what, args in (("failed", bad), ("not run", unrun)) if args]
-                  return text + (" — " + "; ".join(notes) if notes else "")
-
-              print("| Entry | " + " | ".join(platforms) + " |")
-              print("| " + " | ".join("---" for _ in range(1 + len(platforms))) + " |")
-              for entry in sorted({e for p in present for e in cases[p]}):
-                  row = [f"`{entry}`"] + [cell(cases[p].get(entry)) for p in platforms]
-                  print("| " + " | ".join(row) + " |")
-              print()
-              print("Passed: " + ", ".join(
-                  f"**{p}** {sum(1 for v in data[p].values() if v == 'pass')}"
-                  f"/{len(data[p])} cases" for p in present))
-              print()
-              print(
-                  ":heavy_minus_sign: means the entry has no case on that leg: "
-                  "device-only entries carry `# ci: no-sim`. A count is out "
-                  "of every pytest or CLI case the entry declares, so a sweep "
-                  "that ended early reads :warning: and names the cases it "
-                  "never reached."
-              )
-              if missing:
-                  print()
-                  print(no_artifact(missing) + " Those columns read all `-`.")
-              print()
-
           print("## Daily CI Model Test Results")
           print()
           table("a2a3 and a2a3sim", ["a2a3", "a2a3sim"])
-          a5_table("a5 and a5sim", ["a5", "a5sim"])
+          table("a5 and a5sim", ["a5", "a5sim"])
           EOF

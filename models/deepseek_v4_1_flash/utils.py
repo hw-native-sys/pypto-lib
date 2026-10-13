@@ -14,17 +14,81 @@ from typing import Any, Literal, Mapping, Sequence
 
 import torch
 
-from models.deepseek_v4_1_flash import config as C
-from models.deepseek_v4_1_flash.config import (
-    AttentionMode, BLOCK_SIZE, DeepSeekV41LayerConfig, FLASH, TP_SIZE,
+
+from config import (
+    FLASH as M,
+    AttentionMode,
+    BLOCK_SIZE,
+    DeepSeekV41LayerConfig,
+    TP_SIZE,
+    PREFILL_MAX_TOKENS,
+    STATE_CAPACITY,
 )
-from models.deepseek_v4_1_flash.golden import (
-    PrefillAttentionCaches, PrefillAttentionMetadata, hc_post, hc_pre,
-    prefill_attention_reference, prefill_engram_reference, prefill_hc_mixes,
-    prefill_moe_reference, prefill_publish_decoder_reference, prefill_rms_norm,
-    prefill_round_activation,
-)
-from models.deepseek_v4_1_flash.rope_tables import precompute_rope_tables
+
+
+
+from hc_post import golden_hc_post as hc_post
+from hc_pre import golden_hc_pre as hc_pre
+from attention_common import prefill_attention_reference
+from engram import prefill_engram_reference
+from hc_mixes import prefill_hc_mixes
+from moe import prefill_moe_reference
+from attention_common import prefill_publish_decoder_reference
+from rmsnorm import prefill_rms_norm
+from quantization import prefill_round_activation
+from rope_tables import precompute_rope_tables
+
+
+# model config
+D = M.hidden_size
+HEAD_DIM = M.head_dim
+HC_MULT = M.hc_mult
+INDEX_DIM = M.index_head_dim
+INDEX_TOPK = M.index_topk
+
+
+@dataclass(frozen=True)
+class PrefillAttentionMetadata:
+    rope_cos: torch.Tensor
+    rope_sin: torch.Tensor
+    window_slots: torch.Tensor
+    window_indices: torch.Tensor
+    request_ids: torch.Tensor | None = None
+    compressed_lens: torch.Tensor | None = None
+    index_block_table: torch.Tensor | None = None
+    compressed_slots: torch.Tensor | None = None
+    compressed_rope_cos: torch.Tensor | None = None
+    compressed_rope_sin: torch.Tensor | None = None
+    query_start_loc: torch.Tensor | None = None
+    position_ids: torch.Tensor | None = None
+    state_block_table: torch.Tensor | None = None
+    attention_extents: torch.Tensor | None = None
+
+
+@dataclass
+class PrefillAttentionCaches:
+    """Window/global/index cache rows use [blocks,128,dim], with no scales."""
+
+    window: torch.Tensor
+    compressed: torch.Tensor | None = None
+    index: torch.Tensor | None = None
+    state: torch.Tensor | None = None
+
+    def clone(self):
+        return PrefillAttentionCaches(
+            *(
+                value.clone() if value is not None else None
+                for value in (self.window, self.compressed, self.index, self.state)
+            )
+        )
+
+
+@dataclass
+class PrefillAttentionResult:
+    output: torch.Tensor
+    caches: PrefillAttentionCaches
+    topk_indices: torch.Tensor | None = None
+    candidate_mask: torch.Tensor | None = None
 
 
 @dataclass(frozen=True)
@@ -129,7 +193,7 @@ def window_metadata(
     positions: torch.Tensor,
     request_ids: torch.Tensor,
     block_table: torch.Tensor,
-    window: int = FLASH.sliding_window,
+    window: int = M.sliding_window,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """Build paged write slots plus causal indices for the visible sliding window."""
     slots = paged_slots(positions, request_ids, block_table)
@@ -162,10 +226,10 @@ def build_forward_metadata(
     if bool((kv_seq_lens < 0).any()):
         raise ValueError("kv_seq_lens must be non-negative")
     tables_by_ratio: dict[int, torch.Tensor] = {}
-    for source in FLASH.kv_source_layer_ids:
+    for source in M.kv_source_layer_ids:
         if source not in compressed_block_tables:
             raise ValueError(f"missing compressed block table for source layer {source}")
-        ratio = FLASH.compress_ratios[source]
+        ratio = M.compress_ratios[source]
         previous = tables_by_ratio.setdefault(ratio, compressed_block_tables[source])
         if not torch.equal(previous, compressed_block_tables[source]):
             raise ValueError(f"compression ratio {ratio} sources must share one compressed block table")
@@ -186,8 +250,8 @@ def build_forward_metadata(
     compressor_positions: dict[int, torch.Tensor] = {}
     compressed_rope_positions: dict[int, torch.Tensor] = {}
     new_kv_seq_lens = kv_seq_lens.to(torch.int64) + query_lens
-    for source in FLASH.kv_source_layer_ids:
-        ratio = FLASH.compress_ratios[source]
+    for source in M.kv_source_layer_ids:
+        ratio = M.compress_ratios[source]
         storage_rows = BLOCK_SIZE
         table = compressed_block_tables[source]
         if table.ndim != 2 or table.shape[0] != query_lens.numel():
@@ -275,8 +339,8 @@ class PrefillLayerPlan:
 
 def resolve_prefill_layer_plan(layer_id: int) -> PrefillLayerPlan:
     """Resolve CED semantics without selecting a device implementation."""
-    layer = FLASH.layer_config(layer_id)
-    encoder = layer_id < FLASH.num_hidden_layers // 2
+    layer = M.layer_config(layer_id)
+    encoder = layer_id < M.num_hidden_layers // 2
     modes = (AttentionMode.SWA, AttentionMode.FULL, AttentionMode.REUSE) if encoder else (
         AttentionMode.FULL, AttentionMode.REINDEX, AttentionMode.REUSE
     )
@@ -298,7 +362,7 @@ class PrefillState:
             raise ValueError("x_hc and pre_mix must have token-major or rank/token-major shapes")
         if self.x_hc.shape[:-1] != self.pre_mix.shape:
             raise ValueError("x_hc and pre_mix must share rank, token, and mHC dimensions")
-        if self.x_hc.shape[-2:] != (FLASH.hc_mult, FLASH.hidden_size):
+        if self.x_hc.shape[-2:] != (M.hc_mult, M.hidden_size):
             raise ValueError("x_hc does not have the configured mHC and hidden dimensions")
         if self.x_hc.dtype != torch.float32 or self.pre_mix.dtype != torch.float32:
             raise ValueError("mHC residual and delayed pre-mix transport buffers must be FP32")
@@ -340,7 +404,7 @@ def select_decoder_replay(
     metadata: ForwardMetadata,
     window_block_table: torch.Tensor,
     *,
-    window: int = FLASH.sliding_window,
+    window: int = M.sliding_window,
 ) -> DecoderReplay:
     """Select at most 128 final rows per request and truncate SWA to that replay."""
     starts = metadata.query_start_loc.to(torch.int64)
@@ -439,8 +503,8 @@ class PrefillContext:
             capacity = self.num_tokens
         if not isinstance(capacity, Integral) or isinstance(capacity, bool):
             raise ValueError("prefill capacity must be an integer")
-        if not self.num_tokens <= capacity <= C.PREFILL_MAX_TOKENS:
-            raise ValueError(f"fresh packed rows must fit capacity <= {C.PREFILL_MAX_TOKENS}")
+        if not self.num_tokens <= capacity <= PREFILL_MAX_TOKENS:
+            raise ValueError(f"fresh packed rows must fit capacity <= {PREFILL_MAX_TOKENS}")
         requests, maximum = len(self.lengths), max(self.lengths)
         pages = (maximum + 127) // 128
         # Index queries currently score every physical cache row. Bound the
@@ -457,15 +521,15 @@ class PrefillContext:
         self.capacity = int(capacity)
         self.window_table = torch.arange(requests * pages, dtype=torch.int32).reshape(requests, pages)
         self.global_tables = {}
-        for source in C.FLASH.kv_source_layer_ids:
-            pages = max(1, (maximum // C.FLASH.compress_ratios[source] + 127) // 128)
+        for source in M.kv_source_layer_ids:
+            pages = max(1, (maximum // M.compress_ratios[source] + 127) // 128)
             self.global_tables[source] = torch.arange(requests * pages, dtype=torch.int32).reshape(
                 requests, pages
             )
         self.state_tables = {
             source: torch.arange(requests, dtype=torch.int32).reshape(-1, 1)
-            for source in C.FLASH.kv_source_layer_ids
-            if source < C.FLASH.num_hidden_layers // 2
+            for source in M.kv_source_layer_ids
+            if source < M.num_hidden_layers // 2
         }
         starts = torch.tensor([0, *torch.tensor(self.lengths).cumsum(0).tolist()], dtype=torch.int32)
         self.metadata = build_forward_metadata(
@@ -482,19 +546,19 @@ class PrefillContext:
         self.rope = {compressed: precompute_rope_tables(maximum, compressed) for compressed in (False, True)}
         # Each extra physical page is an untouched sentinel.
         self.window = {
-            layer: torch.zeros(self.window_table.numel() + 1, 128, C.HEAD_DIM)
-            for layer in range(C.FLASH.num_hidden_layers)
+            layer: torch.zeros(self.window_table.numel() + 1, 128, HEAD_DIM)
+            for layer in range(M.num_hidden_layers)
         }
         self.global_cache = {
-            source: torch.zeros(table.numel() + 1, 128, C.HEAD_DIM)
+            source: torch.zeros(table.numel() + 1, 128, HEAD_DIM)
             for source, table in self.global_tables.items()
         }
         self.index_cache = {
-            source: torch.zeros(table.numel() + 1, 128, C.INDEX_DIM)
+            source: torch.zeros(table.numel() + 1, 128, INDEX_DIM)
             for source, table in self.global_tables.items()
         }
         self.state_cache = {
-            source: torch.zeros(requests + 1, C.STATE_CAPACITY, 2 * C.HEAD_DIM)
+            source: torch.zeros(requests + 1, STATE_CAPACITY, 2 * HEAD_DIM)
             for source in self.state_tables
         }
         self.last_topk: dict[int, torch.Tensor] = {}
@@ -518,8 +582,8 @@ class PrefillContext:
             sequences.append(value.long())
         input_ids = torch.cat(sequences)
         embedding = prefill_round_activation(self.checkpoint.tensor_rows("embed.weight", input_ids).float(), self.precision)
-        expanded = embedding.unsqueeze(1).repeat(1, C.HC_MULT, 1)
-        pre_mix = torch.zeros(self.num_tokens, C.HC_MULT, dtype=torch.float32)
+        expanded = embedding.unsqueeze(1).repeat(1, HC_MULT, 1)
+        pre_mix = torch.zeros(self.num_tokens, HC_MULT, dtype=torch.float32)
         pre_mix[:, 0] = 1
         return PrefillState(expanded, pre_mix)
 
@@ -539,7 +603,7 @@ class PrefillContext:
         requests = self.metadata.token_to_req_indices if encoder else self.replay.token_to_req_indices
         cosine, sine = self.rope[bool(ratio)]
         request_lengths = torch.tensor(self.lengths, dtype=torch.int32)[requests.long()]
-        global_widths = (request_lengths // ratio).clamp(max=C.INDEX_TOPK) if ratio else torch.zeros_like(request_lengths)
+        global_widths = (request_lengths // ratio).clamp(max=INDEX_TOPK) if ratio else torch.zeros_like(request_lengths)
         values = dict(
             rope_cos=cosine[positions.long()],
             rope_sin=sine[positions.long()],
@@ -548,7 +612,7 @@ class PrefillContext:
             request_ids=requests,
             query_start_loc=self.metadata.query_start_loc if encoder else self.replay.query_start_loc,
             position_ids=positions,
-            attention_extents=torch.stack((request_lengths.clamp(max=C.FLASH.sliding_window), global_widths), -1),
+            attention_extents=torch.stack((request_lengths.clamp(max=M.sliding_window), global_widths), -1),
         )
         previous_rows = torch.full_like(positions, -1, dtype=torch.int32)
         if ratio:
@@ -613,7 +677,7 @@ class PrefillContext:
 
     def publisher_inputs(self, *, weights=None, load_weights=True) -> PrefillPublisherInputs:
         """Layer20 global publication always sees every newly encoded prompt row."""
-        layer_id = C.FLASH.num_hidden_layers // 2
+        layer_id = M.num_hidden_layers // 2
         cosine, sine = self.rope[True]
         positions = self.metadata.position_ids.long()
         metadata = PrefillAttentionMetadata(
@@ -639,7 +703,7 @@ class PrefillContext:
         )
 
     def update_publisher(self, caches: PrefillAttentionCaches) -> None:
-        layer_id = C.FLASH.num_hidden_layers // 2
+        layer_id = M.num_hidden_layers // 2
         if caches.compressed is None or caches.index is None:
             raise ValueError("decoder publisher must return both global and index caches")
         self.global_cache[layer_id], self.index_cache[layer_id] = caches.compressed, caches.index
@@ -655,10 +719,10 @@ class PrefillContext:
 
     def attention(self, layer_id: int, x: torch.Tensor) -> torch.Tensor:
         """Run the independent CPU attention reference and advance its private state."""
-        if layer_id >= C.FLASH.num_hidden_layers // 2 and not self.decoder_published:
+        if layer_id >= M.num_hidden_layers // 2 and not self.decoder_published:
             raise ValueError("publish final encoder rows before decoder attention")
         values = self.layer_inputs(layer_id)
-        if x.shape != (values.num_tokens, C.D) or x.dtype != torch.float32:
+        if x.shape != (values.num_tokens, D) or x.dtype != torch.float32:
             raise ValueError("attention input must be normalized FP32 rows for this stage")
         result = prefill_attention_reference(
             x,
@@ -694,7 +758,7 @@ class PrefillContext:
         """CPU reference for global publication from the full final encoder state."""
         if PrefillState(x_hc, pre_mix).num_tokens != self.num_tokens:
             raise ValueError("decoder publication requires the full encoder state")
-        layer_id = C.FLASH.num_hidden_layers // 2
+        layer_id = M.num_hidden_layers // 2
         x = prefill_rms_norm(
             prefill_round_activation(hc_pre(x_hc, pre_mix), self.precision),
             self.checkpoint.tensor(f"layers.{layer_id}.attn_norm.weight").float(),
@@ -712,7 +776,7 @@ class PrefillContext:
         if state.x_hc.ndim != 3:
             raise ValueError("FP32 reference blocks consume unstacked token-major states")
         x_hc = state.x_hc
-        if layer_id in C.FLASH.engram_layer_ids:
+        if layer_id in M.engram_layer_ids:
             if hash_ids is None or hash_ids.shape[0] != state.num_tokens:
                 raise ValueError("Engram reference needs this layer's hash ids for every token")
             x_hc = prefill_engram_reference(

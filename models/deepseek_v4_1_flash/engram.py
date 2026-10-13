@@ -37,22 +37,22 @@ the full output locally.
 
 import math
 import sys
-from pathlib import Path
 
-if __package__ in (None, ""):
-    sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
-
-# ci: no-sim
 import pypto.language as pl
 import pypto.language.distributed as pld
 import torch
 
-from models.deepseek_v4_1_flash.config import D, FLASH, HC_MULT, T_DYN
+from config import FLASH as M, T_DYN
 
 
 
-N_HASH_COLS = (FLASH.engram_max_ngram_size - 1) * FLASH.engram_n_heads  # 24
-HEAD_DIM = FLASH.engram_head_dim  # 256
+# model config
+D = M.hidden_size
+HC_MULT = M.hc_mult
+
+
+N_HASH_COLS = (M.engram_max_ngram_size - 1) * M.engram_n_heads  # 24
+HEAD_DIM = M.engram_head_dim  # 256
 ENGRAM_K = N_HASH_COLS * HEAD_DIM  # 6144 flattened lookup width
 KV_OUT = (HC_MULT + 1) * D  # 5 * 5120 = 25600
 # Validation-sized table; the released layer-1 table (384006168 rows) does not fit
@@ -60,7 +60,7 @@ KV_OUT = (HC_MULT + 1) * D  # 5 * 5120 = 25600
 # much smaller row count. The kernel only reads gathered rows, so any size works.
 NUM_EMBEDDINGS = 1 << 20  # 1048576 rows (~512 MiB as BF16)
 CLAMP = 1e-6
-NORM_EPS = FLASH.rms_norm_eps
+NORM_EPS = M.rms_norm_eps
 D_INV = 1.0 / D
 DOT_SCALE = D**-0.5
 
@@ -68,6 +68,32 @@ T_TILE = 16
 K_TILE = 128
 N_TILE = 256
 D_TILE = 512
+
+
+from attention_ops import _prefill_project
+from quantization import prefill_round_activation
+
+
+def prefill_engram_gate_reference(x, kv, weight, *, eps=M.rms_norm_eps, token_mask=None, precision="fp32"):
+    """Released normalized signed-square-root Engram gate, entirely FP32."""
+    if x.dtype != torch.float32 or kv.dtype != torch.float32:
+        raise ValueError("FP32 Engram requires FP32 stream and projected values")
+    copies, width = x.shape[-2:]
+    key, value = kv.split((copies * width, width), dim=-1)
+    key = key.unflatten(-1, (copies, width))
+    rstd = torch.rsqrt(x.square().mean(-1) + eps) * torch.rsqrt(key.square().mean(-1) + eps)
+    dot = (x * weight * key).sum(-1) * rstd * width**-0.5
+    gate = torch.sigmoid(torch.copysign(dot.abs().clamp_min(1e-6).sqrt(), dot))
+    if token_mask is not None:
+        gate = gate.masked_fill(~token_mask.unsqueeze(-1), 0)
+    return prefill_round_activation(x + gate.unsqueeze(-1) * value.unsqueeze(-2), precision)
+
+
+def prefill_engram_reference(x, weights, *, eps=M.rms_norm_eps, token_mask=None, precision="fp32"):
+    """Project independently decoded original lookup rows and update the HC stream."""
+    lookup = prefill_round_activation(weights["lookup"], precision)
+    kv = _prefill_project(lookup, weights, "wkv", precision)
+    return prefill_engram_gate_reference(x, kv, weights["weight"], eps=eps, token_mask=token_mask, precision=precision)
 
 
 def _parse_tp_size() -> int:
@@ -240,8 +266,8 @@ def golden_engram(
 
     h = x.float()
     w = weight.float().unsqueeze(0)  # [1, HC_MULT, D]
-    rstd = torch.rsqrt(h.square().mean(-1, keepdim=True) + FLASH.rms_norm_eps) * torch.rsqrt(
-        key.square().mean(-1, keepdim=True) + FLASH.rms_norm_eps
+    rstd = torch.rsqrt(h.square().mean(-1, keepdim=True) + M.rms_norm_eps) * torch.rsqrt(
+        key.square().mean(-1, keepdim=True) + M.rms_norm_eps
     )
     dot = (h * w * key).sum(-1, keepdim=True) * rstd * (D**-0.5)  # [T, HC_MULT, 1]
     gate = torch.sigmoid(torch.copysign(dot.abs().clamp_min(CLAMP).sqrt(), dot))
@@ -677,9 +703,6 @@ __all__ = [
 ]
 
 
-_SCRIPT_ENTRY_POINT = "__" + "main__"
-
-
 def main():
     """Run local validation and return a failing exit status on precision errors."""
     result = validate()
@@ -687,19 +710,8 @@ def main():
         raise SystemExit(result.error or 1)
 
 
-if "pytest" in sys.modules:
-    import pytest
-
-    @pytest.mark.parametrize("tp", [1, 4])
-    def test_precision(tp, a5_args):
-        """Validate the operator against its golden reference on A5."""
-        result = validate(a5_args(tp=tp))
-        assert result.passed, result.error
-
-
-
 # Resident CED prefill precision variants.
-_PREFILL_AUX_NORM_EPS = FLASH.rms_norm_eps
+_PREFILL_AUX_NORM_EPS = M.rms_norm_eps
 
 
 _PREFILL_AUX_T = pl.dynamic("FP32_AUX_T")
@@ -744,5 +756,5 @@ def prefill_engram_gate_inline(
             result = pl.assemble(result, merged, [first, stream * D + column])
     return output
 
-if __name__ == _SCRIPT_ENTRY_POINT:
+if __name__ == "__main__":
     main()

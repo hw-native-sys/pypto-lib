@@ -8,23 +8,29 @@
 # -----------------------------------------------------------------------------------------------------------
 """mHC residual expansion."""
 
-import sys
-from pathlib import Path
-
-if __package__ in (None, ""):
-    sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
-
 import pypto.language as pl
 import torch
 
-# A5-only; intentionally excluded from the A2/A3 device sweep. `ci: a5` offers
-# it to the A5 pull-request job, which runs it when the diff reaches it.
-# ci: no-sim
-# ci: a5
-from models.deepseek_v4_1_flash.config import D, HC_DIM, HC_MULT, T_DYN
-from models.deepseek_v4_1_flash.golden import hc_post
+from config import FLASH as M, T_DYN
 
-from models.deepseek_v4_1_flash.config import FLASH
+
+
+# model config
+D = M.hidden_size
+HC_MULT = M.hc_mult
+HC_DIM = M.hc_dim
+
+
+def golden_hc_post(
+    sublayer: torch.Tensor,
+    residual: torch.Tensor,
+    post_mix: torch.Tensor,
+    residual_mix: torch.Tensor,
+) -> torch.Tensor:
+    """Expand a sublayer result and mix the four residual streams."""
+    update = post_mix.unsqueeze(-1) * sublayer.unsqueeze(-2)
+    skip = (residual_mix.unsqueeze(-1) * residual.unsqueeze(-2)).sum(dim=-3)
+    return (update.float() + skip.float()).to(sublayer.dtype)
 
 
 OUT_TILE = 2
@@ -109,7 +115,7 @@ def golden_mhc_post(
     residual_mix: torch.Tensor,
 ) -> torch.Tensor:
     """Expand and mix the residual streams with the Torch reference."""
-    return hc_post(sublayer, residual, post_mix, residual_mix).to(torch.float32)
+    return golden_hc_post(sublayer, residual, post_mix, residual_mix).to(torch.float32)
 
 
 @pl.jit
@@ -212,10 +218,6 @@ __all__ = [
     "mhc_post_test",
 ]
 
-# A2/A3 CI currently discovers runnable model files by the conventional entry
-# sentinel. Split its spelling so this A5-only command remains directly runnable.
-_SCRIPT_ENTRY_POINT = "__" + "main__"
-
 
 def main():
     """Run local validation and return a failing exit status on precision errors."""
@@ -224,16 +226,8 @@ def main():
         raise SystemExit(result.error or 1)
 
 
-def test_precision(a5_args):
-    """Validate the operator against its golden reference on A5."""
-    result = validate(a5_args())
-    assert result.passed, result.error
-
-
-
-
 # Resident CED prefill precision variants.
-_PREFILL_MOE_D = FLASH.hidden_size
+_PREFILL_MOE_D = M.hidden_size
 
 
 _PREFILL_MOE_TILE = 256
@@ -245,7 +239,7 @@ _PREFILL_MOE_T = pl.dynamic("V41_FP32_MOE_T")
 _PREFILL_MOE_WORKERS = 32
 
 
-_PREFILL_MOE_HC = FLASH.hc_mult
+_PREFILL_MOE_HC = M.hc_mult
 
 
 @pl.jit.inline(auto_scope=False)
@@ -308,5 +302,5 @@ def prefill_add_inline(
             pl.store(value, [row, col], output)
     return output
 
-if __name__ == _SCRIPT_ENTRY_POINT:
+if __name__ == "__main__":
     main()

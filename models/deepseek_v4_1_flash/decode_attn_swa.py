@@ -11,45 +11,49 @@
 import argparse
 import math
 import os
-import sys
-from pathlib import Path
 
-if __package__ in (None, ""):
-    sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
-
-# ci: no-sim
 import pypto.language as pl
 import pypto.language.distributed as pld
 import torch
 
 from golden import ScalarSpec, TensorSpec, run
-from models.deepseek_v4_1_flash import config as C
-from models.deepseek_v4_1_flash.metadata import window_metadata
-from models.deepseek_v4_1_flash.o_proj import o_proj
-from models.deepseek_v4_1_flash.qkv_proj_rope import qkv_proj_rope
-from models.deepseek_v4_1_flash.quantization import decode_e8m0, pack_mx_b_scale, unpack_mx_b_scale
-from models.deepseek_v4_1_flash.attention_tp import (
+
+from config import (
+    FLASH as M,
+    DECODE_MAX_TOKENS,
+    WINDOW_CACHE_GROUP,
+    ORI_BLOCKS_DYN,
+    T_DYN,
+    TP_SIZE,
+    MAX_BATCH_PER_DP,
+    PREFILL_MAX_TOKENS,
+)
+
+from config import EP_SIZE
+
+
+from utils import window_metadata
+from o_proj import o_proj
+from qkv_proj_rope import qkv_proj_rope
+from quantization import decode_e8m0, pack_mx_b_scale, unpack_mx_b_scale
+from attention_tp import (
     OUTPUT_T_DYN,
     decode_tp_output_all_reduce,
     decode_tp_output_reduce_scatter,
 )
-from models.deepseek_v4_1_flash.attention_common import AttentionGoldenResult, golden_swa_attention
-from models.deepseek_v4_1_flash.config import (
-    D,
-    DECODE_MAX_TOKENS,
-    HEAD_DIM,
-    LOCAL_H,
-    LOCAL_O_GROUPS,
-    LOCAL_O_WIDTH,
-    O_GROUP_IN,
-    O_LORA,
-    ORI_BLOCKS_DYN,
-    Q_LORA,
-    ROPE_DIM,
-    T_DYN,
-    TP_SIZE,
-    WINDOW_CACHE_GROUP,
-)
+from attention_common import AttentionGoldenResult, golden_swa_attention
+
+
+# model config
+LOCAL_H = M.num_attention_heads // TP_SIZE
+LOCAL_O_GROUPS = M.o_groups // TP_SIZE
+LOCAL_O_WIDTH = M.o_groups // TP_SIZE * M.o_lora_rank
+D = M.hidden_size
+HEAD_DIM = M.head_dim
+ROPE_DIM = M.qk_rope_head_dim
+Q_LORA = M.q_lora_rank
+O_LORA = M.o_lora_rank
+O_GROUP_IN = M.num_attention_heads * M.head_dim // M.o_groups
 
 
 SOFTMAX_SCALE = HEAD_DIM ** -0.5
@@ -184,7 +188,6 @@ def attend_window(
 
 if TP_SIZE not in (1, 2, 4):
     raise ValueError("Decode SWA currently supports TP1, TP2, and TP4; TP8 requires head-tile padding")
-
 
 
 def golden_decode_attn_swa(
@@ -333,7 +336,6 @@ decode_attn_swa_sharded = make_decode_attn_swa(decode_tp_output_reduce_scatter)
 __all__ = ["decode_attn_swa", "decode_attn_swa_sharded", "golden_decode_attn_swa"]
 
 
-
 def official_quantize(value):
     """Independent translation of official kernel.py act_quant_kernel, group size 32."""
     groups = value.float().unflatten(-1, (-1, 32))
@@ -445,10 +447,10 @@ def make_inputs(batch=32, seed=17, position=127):
     def weight(k, n):
         payload, scales = official_quantize(rand(n, k) / math.sqrt(k))
         return payload.T.contiguous(), pack_mx_b_scale(scales.T.contiguous()).view(torch.float8_e8m0fnu)
-    qa, qas = weight(C.D, C.Q_LORA)
-    qb, qbs = weight(C.Q_LORA, C.LOCAL_H * C.HEAD_DIM)
-    kv, kvs = weight(C.D, C.HEAD_DIM)
-    ob, obs = weight(C.LOCAL_O_WIDTH, C.D)
+    qa, qas = weight(D, Q_LORA)
+    qb, qbs = weight(Q_LORA, LOCAL_H * HEAD_DIM)
+    kv, kvs = weight(D, HEAD_DIM)
+    ob, obs = weight(LOCAL_O_WIDTH, D)
     positions = torch.full((batch,), position, dtype=torch.int64)
     if batch > 1:
         positions[:min(batch, 6)] = torch.tensor([0, 1, 63, 127, 128, 1048575])[:min(batch, 6)]
@@ -461,15 +463,14 @@ def make_inputs(batch=32, seed=17, position=127):
         length = min(pos + 1, 128)
         logical = torch.arange(pos - length + 1, pos + 1)
         indices[row, :length] = (physical[row] * 128 + logical.remainder(128)).to(torch.int32)
-    cache, cache_scale = official_quantize(rand(batch + 1, 128, 1, C.HEAD_DIM).to(torch.bfloat16))
-    values = (rand(batch, C.D).to(torch.bfloat16), qa, qas,
-              (rand(C.Q_LORA) * 0.1 + 1).to(torch.bfloat16), qb, qbs, kv, kvs,
-              (rand(C.HEAD_DIM) * 0.1 + 1).to(torch.bfloat16), rand(C.LOCAL_H) * 2,
-              (rand(C.LOCAL_O_GROUPS, C.O_LORA, C.O_GROUP_IN) / math.sqrt(C.O_GROUP_IN)).to(torch.bfloat16),
+    cache, cache_scale = official_quantize(rand(batch + 1, 128, 1, HEAD_DIM).to(torch.bfloat16))
+    values = (rand(batch, D).to(torch.bfloat16), qa, qas,
+              (rand(Q_LORA) * 0.1 + 1).to(torch.bfloat16), qb, qbs, kv, kvs,
+              (rand(HEAD_DIM) * 0.1 + 1).to(torch.bfloat16), rand(LOCAL_H) * 2,
+              (rand(LOCAL_O_GROUPS, O_LORA, O_GROUP_IN) / math.sqrt(O_GROUP_IN)).to(torch.bfloat16),
               ob, obs, angles.cos(), angles.sin(), slots, indices, cache,
               cache_scale.view(torch.float8_e8m0fnu))
     return dict(zip(INPUT_NAMES, values))
-
 
 
 def make_packed_inputs(tokens=257, requests=4, seed=17, case="mixed"):
@@ -527,7 +528,6 @@ def make_packed_inputs(tokens=257, requests=4, seed=17, case="mixed"):
     return values
 
 
-
 def compare_output(actual, expected, **kwargs):
     """FP8 budget: global L2 <= 1%, every row <= 2%, cosine >= 0.9999; exact zero rows."""
     a, e = actual.double(), expected.double()
@@ -554,16 +554,16 @@ def compare_scales(actual, expected, **kwargs):
 def compare_cache(actual, expected, *, actual_outputs, expected_outputs, inputs, **kwargs):
     slots = inputs["window_slots"].long()
     rows = slots[slots >= 0]
-    a = actual.view(torch.uint8).reshape(-1, C.HEAD_DIM)
+    a = actual.view(torch.uint8).reshape(-1, HEAD_DIM)
     e = expected.view(torch.uint8).reshape_as(a)
     untouched = torch.ones(a.shape[0], dtype=torch.bool)
     untouched[rows] = False
     if not torch.equal(a[untouched], e[untouched]):
         return False, "Unmapped cache payload bytes were modified"
-    af = actual.float().reshape(-1, C.HEAD_DIM)[rows]
-    ef = expected.float().reshape(-1, C.HEAD_DIM)[rows]
-    actual_scale = decode_e8m0(actual_outputs["window_cache_scale"]).reshape(-1, C.HEAD_DIM // 32)
-    expected_scale = decode_e8m0(expected_outputs["window_cache_scale"]).reshape(-1, C.HEAD_DIM // 32)
+    af = actual.float().reshape(-1, HEAD_DIM)[rows]
+    ef = expected.float().reshape(-1, HEAD_DIM)[rows]
+    actual_scale = decode_e8m0(actual_outputs["window_cache_scale"]).reshape(-1, HEAD_DIM // 32)
+    expected_scale = decode_e8m0(expected_outputs["window_cache_scale"]).reshape(-1, HEAD_DIM // 32)
     af *= actual_scale[rows].repeat_interleave(32, -1)
     ef *= expected_scale[rows].repeat_interleave(32, -1)
     rel = (af - ef).norm() / ef.norm().clamp_min(1e-12)
@@ -667,7 +667,7 @@ def make_program(operator, capacity, world_size, epochs):
 def build_specs(args, mode):
     """Build shape-only specs; replay and compile-only never generate random weights."""
     world_size = TP_SIZE * args.dp
-    packed = (mode == "prefill" or args.tokens > C.MAX_BATCH_PER_DP
+    packed = (mode == "prefill" or args.tokens > MAX_BATCH_PER_DP
               or args.requests != args.tokens or args.case in ("prefix", "shuffle"))
     if packed:
         lengths = [args.tokens // args.requests + (r < args.tokens % args.requests) for r in range(args.requests)]
@@ -786,12 +786,12 @@ def compare_distributed_cache(actual, expected, *, actual_outputs, expected_outp
 
 def run_swa(operator, mode, argv=None):
     """Run A5 validation for a production SWA operator."""
-    capacity = C.DECODE_MAX_TOKENS if mode == "decode" else C.PREFILL_MAX_TOKENS
+    capacity = DECODE_MAX_TOKENS if mode == "decode" else PREFILL_MAX_TOKENS
     parser = argparse.ArgumentParser(description=f"DeepSeek V4.1 {mode} SWA: A5 precision and timing")
-    parser.add_argument("-p", "--platform", default="a5", choices=["a5"])
+    parser.add_argument("-p", "--platform", default="a5", choices=["a5", "a5sim"])
     parser.add_argument("-d", "--device", default=None, help="comma-separated device IDs; default: 0 through TP*DP-1")
     parser.add_argument("--tp", type=int, default=TP_SIZE, choices=[1, 2, 4])
-    parser.add_argument("--ep", type=int, default=C.EP_SIZE, choices=[2, 4, 8])
+    parser.add_argument("--ep", type=int, default=EP_SIZE, choices=[2, 4, 8])
     parser.add_argument("--dp", type=int, default=1, choices=[1, 2])
     parser.add_argument("--tokens", "--batch", type=int, default=32 if mode == "decode" else 257)
     parser.add_argument("--requests", type=int, help="packed requests; default min(tokens, 32 decode / 4 prefill)")
@@ -847,11 +847,6 @@ def validate(argv=None):
     return run_swa(decode_attn_swa, "decode", argv=argv)
 
 
-# A2/A3 CI currently discovers runnable model files by the conventional entry
-# sentinel. Split its spelling so this A5-only command remains directly runnable.
-_SCRIPT_ENTRY_POINT = "__" + "main__"
-
-
 def main():
     """Run local validation and return a failing exit status on precision errors."""
     result = validate()
@@ -859,15 +854,5 @@ def main():
         raise SystemExit(result.error or 1)
 
 
-if "pytest" in sys.modules:
-    import pytest
-
-    @pytest.mark.parametrize("tp,dp", [(1, 1), (2, 2)])
-    def test_precision(tp, dp, a5_args):
-        """Validate the operator against its golden reference on A5."""
-        result = validate(a5_args(tp=tp, dp=dp))
-        assert result.passed, result.error
-
-
-if __name__ == _SCRIPT_ENTRY_POINT:
+if __name__ == "__main__":
     main()

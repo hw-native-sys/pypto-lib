@@ -37,19 +37,19 @@ TP1 bring-up uses ``MAX_LOGIT_ROWS=16`` so ``GROUP_LOGIT_ROWS`` stays a multiple
 """
 
 import sys
-from pathlib import Path
-
-if __package__ in (None, ""):
-    sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
 import pypto.language as pl
 import pypto.language.distributed as pld
 from pypto.ir import DistributedConfig
 
-# ci: no-sim
-# Import model dims only. config also parses --tp/--ep for attention/EP; lm_head
-# parallelism is parsed locally below (TP1/DP1 bring-up defaults).
-from models.deepseek_v4_1_flash.config import D, VOCAB
+# LM-head parallelism is parsed locally below (TP1/DP1 defaults).
+
+from config import FLASH as M
+
+
+# model config
+D = M.hidden_size
+VOCAB = M.vocab_size
 
 
 T_DYN = pl.dynamic("LM_HEAD_T_DYN")
@@ -659,8 +659,6 @@ def compare_sampled_ids(actual, _expected, *, actual_outputs, **_):
     )
 
 
-
-
 __all__ = [
     "DP_SIZE",
     "GROUP_LOGIT_ROWS",
@@ -686,11 +684,6 @@ __all__ = [
     "lm_head_with_sampling_test",
     "validate",
 ]
-
-
-# A2/A3 CI currently discovers runnable model files by the conventional entry
-# sentinel. Split its spelling so this A5-only command remains directly runnable.
-_SCRIPT_ENTRY_POINT = "__" + "main__"
 
 
 def validate(argv=None):
@@ -760,56 +753,7 @@ def main():
         raise SystemExit(1)
 
 
-def test_precision(a5_args):
-    """Validate LM head + greedy sampling against its golden on A5."""
-    result = validate(a5_args())
-    assert result.passed, result.error
-
-
-def test_empty_shard(a5_args):
-    """Empty logit rows (all -1 indices) stay zero and still sample consistently."""
-    result = validate(a5_args() + ["--num-tokens", "0"])
-    assert result.passed, result.error
-
-
-def test_repeat_forward(a5_args):
-    """Two retained-CommDomain forwards with done_epoch 1 then 2 (TP1 CI path)."""
-    from golden import run
-
-    device_args = a5_args()
-    # Reuse validate's device list; run the twice-host without import-time --repeat.
-    import argparse
-
-    parser = argparse.ArgumentParser()
-    parser.add_argument("-p", "--platform", type=str, default="a5")
-    parser.add_argument("-d", "--device", type=str, required=True)
-    parser.add_argument("--tp", type=int, default=TP_SIZE)
-    parser.add_argument("--dp", type=int, default=DP_SIZE)
-    known, _ = parser.parse_known_args(device_args)
-    device_ids = [int(d) for d in known.device.split(",")]
-    assert len(device_ids) >= WORLD_SIZE
-    result = run(
-        fn=l3_lm_head_twice,
-        specs=build_tensor_specs(TEST_TOKENS),
-        golden_fn=golden_lm_head,
-        compare_fn={
-            "logits": compare_logits,
-            "sampled_ids": compare_sampled_ids,
-        },
-        config=dict(
-            distributed_config=DistributedConfig(
-                device_ids=device_ids[:WORLD_SIZE],
-                num_sub_workers=0,
-            ),
-            platform=known.platform,
-        ),
-        rtol=1e-3,
-        atol=1e-3,
-    )
-    assert result.passed, result.error
-
-
-if __name__ == _SCRIPT_ENTRY_POINT:
+if __name__ == "__main__":
     main()
 
 

@@ -9,25 +9,213 @@
 """Shared V4.1 Attention projection, RMSNorm, and RoPE kernel factories."""
 
 import pypto.language as pl
+import torch
 
-from models.deepseek_v4_1_flash.config import LOCAL_H
-from models.deepseek_v4_1_flash.sparse_attention import attend_bf16
-
-from models.deepseek_v4_1_flash.config import D, FLASH, HEAD_DIM, ROPE_DIM, T_DYN
-
-from models.deepseek_v4_1_flash.config import INDEX_TOPK
-from models.deepseek_v4_1_flash.quantization import prefill_decode_fp8_inline
-from models.deepseek_v4_1_flash.quantization import prefill_quantize_fp8_inline
-from models.deepseek_v4_1_flash.quantization import prefill_round_bf16_inline
-from models.deepseek_v4_1_flash.quantization import prefill_round_inline
-from models.deepseek_v4_1_flash.rmsnorm import prefill_rmsnorm_inline
+from config import FLASH as M, T_DYN, TP_SIZE
+from sparse_attention import attend_bf16
 
 
-EPS = FLASH.rms_norm_eps
+
+from quantization import prefill_decode_fp8_inline
+from quantization import prefill_quantize_fp8_inline
+from quantization import prefill_round_bf16_inline
+from quantization import prefill_round_inline
+from rmsnorm import prefill_rmsnorm_inline
+
+
+# model config
+LOCAL_H = M.num_attention_heads // TP_SIZE
+D = M.hidden_size
+HEAD_DIM = M.head_dim
+ROPE_DIM = M.qk_rope_head_dim
+INDEX_TOPK = M.index_topk
+
+
+EPS = M.rms_norm_eps
 M_TILE = 16
 MX_M_TILE = 32
 N_TILE = 128
 K_TILE = 256
+
+
+from quantization import _prefill_operand
+from quantization import prefill_quantize_dequantize
+import torch.nn.functional as F
+
+
+def prefill_linear(x, weight, bias=None, *, precision="fp32", format="fp32"):
+    """Contract output-major weights with explicit released matrix roles.
+
+    Quantized roles use FP8 activations and sequential FP32 group-32 partials.
+    Decoded weights retain their exact power-of-two scales. Dense FP32 roles
+    (HC, router, ratio-two compressor and head) never narrow their outputs.
+    """
+    if format not in ("fp32", "bf16", "mxfp8", "mxfp4"):
+        raise ValueError("unknown checkpoint linear format")
+    if precision not in ("fp32", "official"):
+        raise ValueError("precision must be 'fp32' or 'official'")
+    if precision == "official" and format in ("mxfp8", "mxfp4"):
+        if bias is not None or x.shape[-1] % 32:
+            raise ValueError("official quantized linears require no bias and a group-32 width")
+        quantized = prefill_quantize_dequantize(x, "mxfp8")
+        output = x.new_zeros((*x.shape[:-1], weight.shape[0]), dtype=torch.float32)
+        for start in range(0, x.shape[-1], 32):
+            partial = F.linear(
+                _prefill_operand(quantized[..., start:start + 32]), _prefill_operand(weight[..., start:start + 32])
+            ).float()
+            output = output + partial
+        return output.bfloat16().float()
+    if precision == "official" and format == "bf16":
+        x, weight = x.bfloat16().float(), weight.bfloat16().float()
+    bias = None if bias is None else _prefill_operand(bias)
+    output = F.linear(_prefill_operand(x), _prefill_operand(weight), bias).float()
+    return output.bfloat16().float() if precision == "official" and format == "bf16" else output
+
+
+def prefill_matmul(left, right):
+    """Matrix/vector/batched contraction with FP32 operands and result."""
+    return torch.matmul(_prefill_operand(left), _prefill_operand(right)).float()
+
+
+def prefill_einsum(equation, *operands):
+    """Evaluate an explicit Einstein contraction with one final FP32 rounding."""
+    return torch.einsum(equation, *(_prefill_operand(value) for value in operands)).float()
+
+
+def prefill_publish(cache, values, slots):
+    """Publish only caller-owned physical rows, preserving all other bytes."""
+    if cache.dtype != torch.float32 or values.dtype != torch.float32:
+        raise ValueError("FP32 publication cannot narrow values or caches")
+    flat = cache.flatten(0, 1)
+    valid = slots >= 0
+    flat[slots[valid].long()] = values[valid].reshape_as(flat[slots[valid].long()])
+
+
+def _prefill_online_attention(query, window, window_indices, compressed, compressed_indices, sink, extents):
+    """Released online64 order, including holes and unrounded FP32 denominator."""
+    query = query.bfloat16().float()
+    output = torch.empty_like(query)
+    window = window.flatten(0, 1).bfloat16().float()
+    compressed = compressed.flatten(0, 1).bfloat16().float() if compressed is not None else None
+    for token in range(query.shape[0]):
+        window_width = int(extents[token, 0]) if extents is not None else window_indices.shape[1]
+        global_width = int(extents[token, 1]) if extents is not None else (
+            compressed_indices.shape[1] if compressed_indices is not None else 0
+        )
+        indices = [window_indices[token, :window_width]]
+        caches = [window]
+        if global_width:
+            indices.append(compressed_indices[token, :global_width])
+            caches.append(compressed)
+        masks = [rows >= 0 for rows in indices]
+        keys = torch.cat([
+            torch.where(mask[:, None], cache[rows.clamp_min(0).long()], 0)
+            for rows, mask, cache in zip(indices, masks, caches, strict=True)
+        ])
+        valid = torch.cat(masks)
+        padding = -keys.shape[0] % 64
+        keys = F.pad(keys, (0, 0, 0, padding))
+        valid = F.pad(valid, (0, padding), value=False)
+        maximum = query.new_full((query.shape[1],), -1e30)
+        denominator = torch.zeros_like(maximum)
+        accumulator = torch.zeros_like(query[token])
+        for start in range(0, keys.shape[0], 64):
+            block = keys[start:start + 64]
+            mask = valid[start:start + 64]
+            scores = prefill_matmul(query[token], block.T) * query.shape[-1] ** -0.5
+            scores = scores.masked_fill(~mask[None, :], -torch.inf)
+            updated_maximum = torch.maximum(maximum, scores.amax(-1))
+            alpha = torch.exp(maximum - updated_maximum)
+            probability = torch.exp(scores - updated_maximum[:, None])
+            denominator = denominator * alpha + probability.sum(-1)
+            accumulator = accumulator * alpha[:, None] + prefill_matmul(probability.bfloat16().float(), block)
+            maximum = updated_maximum
+        denominator = denominator + torch.exp(sink - maximum)
+        output[token] = (accumulator / denominator[:, None]).bfloat16().float()
+    return output
+
+
+def prefill_sparse_attention_reference(
+    query, window, window_indices, compressed, compressed_indices, sink, *, precision="fp32", extents=None
+):
+    """Independent global FP32 or released online64 mixed-precision attention."""
+    if precision == "official":
+        return _prefill_online_attention(query, window, window_indices, compressed, compressed_indices, sink, extents)
+    if query.dtype != torch.float32:
+        raise ValueError("FP32 attention requires FP32 queries")
+    output = torch.empty_like(query)
+    window_rows = window.flatten(0, 1)
+    global_rows = compressed.flatten(0, 1) if compressed is not None else None
+    for token in range(query.shape[0]):
+        rows = window_indices[token]
+        selected = [window_rows[rows[rows >= 0].long()]]
+        if global_rows is not None and compressed_indices is not None:
+            rows = compressed_indices[token]
+            selected.append(global_rows[rows[rows >= 0].long()])
+        keys = torch.cat(selected)
+        scores = prefill_matmul(query[token], keys.T) * query.shape[-1] ** -0.5
+        probability = torch.cat((scores, sink[:, None]), dim=-1).softmax(dim=-1)[:, :-1]
+        output[token] = prefill_matmul(probability, keys)
+    return output
+
+
+def _prefill_project(x, weights, name, precision):
+    format = weights["formats"][name] if precision == "official" else "fp32"
+    return prefill_linear(x, weights[name], precision=precision, format=format)
+
+
+def golden_paged_sparse_attention_stats(
+    q: torch.Tensor,
+    cache: torch.Tensor,
+    indices: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Return token-major online-softmax statistics from physical paged rows."""
+    flat_cache = cache.flatten(0, 1).squeeze(-2)
+    safe = indices.clamp_min(0).to(torch.long)
+    selected = flat_cache[safe]
+    logits = torch.einsum("thd,tkd->thk", q.float(), selected.float()) * q.shape[-1] ** -0.5
+    logits = logits.masked_fill(indices.unsqueeze(-2) < 0, -torch.inf)
+    maximum = logits.amax(dim=-1)
+    finite_maximum = maximum.masked_fill(~torch.isfinite(maximum), 0.0)
+    exponentials = torch.exp(logits - finite_maximum.unsqueeze(-1))
+    exponentials = exponentials.masked_fill(~torch.isfinite(logits), 0.0)
+    denominator = exponentials.sum(dim=-1)
+    numerator = torch.einsum("thk,tkd->thd", exponentials, selected.float())
+    return maximum, denominator, numerator
+
+
+def golden_paged_sparse_attention(
+    q: torch.Tensor,
+    window_cache: torch.Tensor,
+    window_indices: torch.Tensor,
+    compressed_cache: torch.Tensor,
+    compressed_indices: torch.Tensor,
+    sink: torch.Tensor,
+) -> torch.Tensor:
+    """Merge token-major paged window and compressed attention with one sink."""
+    parts = (
+        golden_paged_sparse_attention_stats(q, window_cache, window_indices),
+        golden_paged_sparse_attention_stats(q, compressed_cache, compressed_indices),
+    )
+    return golden_merge_attention_stats(parts, sink).to(q.dtype)
+
+
+def golden_merge_attention_stats(
+    parts: tuple[tuple[torch.Tensor, torch.Tensor, torch.Tensor], ...],
+    sink: torch.Tensor,
+) -> torch.Tensor:
+    """Merge sparse sources with one attention sink in a common softmax denominator."""
+    maxima = [part[0] for part in parts]
+    sink_value = sink.float().view(*([1] * (maxima[0].ndim - 1)), -1)
+    global_maximum = torch.maximum(torch.stack(maxima).amax(dim=0), sink_value)
+    denominator = torch.exp(sink_value - global_maximum)
+    numerator = torch.zeros_like(parts[0][2])
+    for maximum, local_sum, local_numerator in parts:
+        scale = torch.exp(maximum - global_maximum)
+        scale = scale.masked_fill(~torch.isfinite(maximum), 0.0)
+        denominator = denominator + local_sum * scale
+        numerator = numerator + local_numerator * scale.unsqueeze(-1)
+    return numerator / denominator.unsqueeze(-1)
 
 
 def make_mx_projection(width, output_width, output_dtype=pl.BF16, *, name_hint="attention_mx_projection"):
@@ -926,7 +1114,7 @@ def prefill_packed_linear_inline(
     return output
 
 
-_PREFILL_COMPUTE_NORM_EPS = FLASH.rms_norm_eps
+_PREFILL_COMPUTE_NORM_EPS = M.rms_norm_eps
 
 
 @pl.jit.inline(auto_scope=False)

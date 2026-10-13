@@ -8,22 +8,28 @@
 # -----------------------------------------------------------------------------------------------------------
 """Final HC stream collapse for DeepSeek-V4.1 Flash (thin wrapper over mhc_pre)."""
 
-import sys
-from pathlib import Path
-
-if __package__ in (None, ""):
-    sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
-
 import pypto.language as pl
 import torch
 
-# A5-only; intentionally excluded from the A2/A3 device sweep. `ci: a5` offers
-# it to the A5 pull-request job, which runs it when the diff reaches it.
-# ci: no-sim
-# ci: a5
-from models.deepseek_v4_1_flash.config import D, HC_MULT, T_DYN
-from models.deepseek_v4_1_flash.golden import hc_head as golden_hc_head_ref
-from models.deepseek_v4_1_flash.hc_pre import build_mhc_pre_tensor_specs, mhc_pre
+from config import FLASH as M, T_DYN
+
+
+
+from hc_pre import build_mhc_pre_tensor_specs, mhc_pre
+from hc_pre import golden_hc_pre
+
+
+# model config
+D = M.hidden_size
+HC_MULT = M.hc_mult
+
+
+def golden_hc_head(
+    x_hc: torch.Tensor,
+    pre_mix: torch.Tensor,
+) -> torch.Tensor:
+    """Collapse the final HC streams with the last layer's delayed pre-mix."""
+    return golden_hc_pre(x_hc, pre_mix).to(torch.bfloat16)
 
 
 @pl.jit.inline
@@ -34,11 +40,6 @@ def hc_head(
 ):
     """Collapse the final HC streams with the delayed pre-mix via mhc_pre."""
     return mhc_pre(x_hc, pre_mix, output)
-
-
-def golden_hc_head(x_hc: torch.Tensor, pre_mix: torch.Tensor) -> torch.Tensor:
-    """Torch reference for final HC collapse (aliases golden.hc_head / mhc_pre)."""
-    return golden_hc_head_ref(x_hc, pre_mix)
 
 
 @pl.jit
@@ -115,11 +116,6 @@ __all__ = [
 ]
 
 
-# A2/A3 CI currently discovers runnable model files by the conventional entry
-# sentinel. Split its spelling so this A5-only command remains directly runnable.
-_SCRIPT_ENTRY_POINT = "__" + "main__"
-
-
 def main():
     """Run local validation and return a failing exit status on precision errors."""
     result = validate()
@@ -127,11 +123,5 @@ def main():
         raise SystemExit(result.error or 1)
 
 
-def test_precision(a5_args):
-    """Validate the operator against its golden reference on A5."""
-    result = validate(a5_args())
-    assert result.passed, result.error
-
-
-if __name__ == _SCRIPT_ENTRY_POINT:
+if __name__ == "__main__":
     main()

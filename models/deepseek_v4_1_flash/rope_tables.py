@@ -13,13 +13,18 @@ import math
 import torch
 import pypto.language as pl
 
-from models.deepseek_v4_1_flash.config import FLASH, ROPE_DIM, T_DYN, DeepSeekV41Config
+from config import FLASH as M, DeepSeekV41Config, T_DYN
+
+
+
+# model config
+ROPE_DIM = M.qk_rope_head_dim
 
 
 def precompute_rope_tables(
     sequence_length: int,
     compressed_attention: bool,
-    config: DeepSeekV41Config = FLASH,
+    config: DeepSeekV41Config = M,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Return FP32 cosine and sine tables for adjacent-pair rotary embedding."""
     if sequence_length <= 0:

@@ -10,48 +10,57 @@
 
 import pypto.language as pl
 
-from models.deepseek_v4_1_flash.sparse_attention import attend_packed
+from sparse_attention import attend_packed
 
-from models.deepseek_v4_1_flash.config import (
-    CMP_BLOCKS_DYN,
+from config import (
     COMPRESSED_CACHE_GROUP,
-    D,
-    HEAD_DIM,
-    INDEX_BLOCKS_DYN,
     INDEX_CACHE_GROUP,
-    INDEX_DIM,
-    INDEX_TOPK,
-    LOCAL_H,
-    LOCAL_O_GROUPS,
-    LOCAL_O_WIDTH,
-    O_GROUP_IN,
-    O_LORA,
-    ORI_BLOCKS_DYN,
-    Q_LORA,
-    ROPE_DIM,
-    T_DYN,
     WINDOW_CACHE_GROUP,
+    FLASH as M,
+    CMP_BLOCKS_DYN,
+    INDEX_BLOCKS_DYN,
+    ORI_BLOCKS_DYN,
+    T_DYN,
+    TP_SIZE,
 )
-from models.deepseek_v4_1_flash.o_proj import prefill_o_proj
-from models.deepseek_v4_1_flash.qkv_proj_rope import kv_proj_rope, q_proj_rope
 
-from models.deepseek_v4_1_flash.attention_ops import prefill_linear_policy_inline
-from models.deepseek_v4_1_flash.attention_ops import prefill_norm_inline
-from models.deepseek_v4_1_flash.attention_ops import prefill_packed_linear_inline
-from models.deepseek_v4_1_flash.attention_ops import prefill_rope_inline
-from models.deepseek_v4_1_flash.attention_ops import prefill_sparse_attention_inline
-from models.deepseek_v4_1_flash.attention_ops import prefill_sparse_attention_official_inline
-from models.deepseek_v4_1_flash.compressor import prefill_pool_pairs_inline
-from models.deepseek_v4_1_flash.config import H
-from models.deepseek_v4_1_flash.config import INDEX_H
-from models.deepseek_v4_1_flash.config import O_GROUPS
-from models.deepseek_v4_1_flash.hierarchical_sparse_indexer import prefill_index_scores_inline
-from models.deepseek_v4_1_flash.hierarchical_sparse_indexer import prefill_index_scores_official_inline
-from models.deepseek_v4_1_flash.hierarchical_sparse_indexer import prefill_index_topk_inline
-from models.deepseek_v4_1_flash.quantization import prefill_quantize_fp8_inline
-from models.deepseek_v4_1_flash.quantization import prefill_quantize_index_fp4_inline
-from models.deepseek_v4_1_flash.quantization import prefill_quantize_kv_fp4_inline
-from models.deepseek_v4_1_flash.quantization import prefill_round_inline
+
+
+from o_proj import prefill_o_proj
+from qkv_proj_rope import kv_proj_rope, q_proj_rope
+
+from attention_ops import prefill_linear_policy_inline
+from attention_ops import prefill_norm_inline
+from attention_ops import prefill_packed_linear_inline
+from attention_ops import prefill_rope_inline
+from attention_ops import prefill_sparse_attention_inline
+from attention_ops import prefill_sparse_attention_official_inline
+from compressor import prefill_pool_pairs_inline
+
+from hierarchical_sparse_indexer import prefill_index_scores_inline
+from hierarchical_sparse_indexer import prefill_index_scores_official_inline
+from hierarchical_sparse_indexer import prefill_index_topk_inline
+from quantization import prefill_quantize_fp8_inline
+from quantization import prefill_quantize_index_fp4_inline
+from quantization import prefill_quantize_kv_fp4_inline
+from quantization import prefill_round_inline
+
+
+# model config
+LOCAL_H = M.num_attention_heads // TP_SIZE
+LOCAL_O_GROUPS = M.o_groups // TP_SIZE
+LOCAL_O_WIDTH = M.o_groups // TP_SIZE * M.o_lora_rank
+D = M.hidden_size
+H = M.num_attention_heads
+HEAD_DIM = M.head_dim
+ROPE_DIM = M.qk_rope_head_dim
+Q_LORA = M.q_lora_rank
+O_LORA = M.o_lora_rank
+O_GROUPS = M.o_groups
+O_GROUP_IN = M.num_attention_heads * M.head_dim // M.o_groups
+INDEX_H = M.index_n_heads
+INDEX_DIM = M.index_head_dim
+INDEX_TOPK = M.index_topk
 
 M_TILE = 16
 N_TILE = 128

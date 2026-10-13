@@ -10,16 +10,12 @@
 
 # ci: no-sim
 
-import sys
 from pathlib import Path
-
-if __package__ in (None, ""):
-    sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
 import pypto.language as pl
 
-from models.deepseek_v4_1_flash.config import (
-    CMP_BLOCKS_DYN, HEAD_DIM, INDEX_TOPK, LOCAL_H, ORI_BLOCKS_DYN, T_DYN, TP_SIZE,
+from config import (
+    FLASH as M, CMP_BLOCKS_DYN, ORI_BLOCKS_DYN, T_DYN, TP_SIZE,
 )
 
 # Dynamic shape variables.
@@ -29,6 +25,9 @@ BF16_PAGES_W = pl.dynamic("SPARSE_BF16_PAGES_W")
 BF16_PAGES_C = pl.dynamic("SPARSE_BF16_PAGES_C")
 
 # Model config.
+HEAD_DIM = M.head_dim
+INDEX_TOPK = M.index_topk
+LOCAL_H = M.num_attention_heads // TP_SIZE
 SELECTED_KEYS = 128 + INDEX_TOPK
 SCALE = HEAD_DIM**-0.5
 FP4_FP16_BASE = 0x3800
@@ -490,7 +489,7 @@ def main():
     import torch
 
     from golden import TensorSpec, run
-    from models.deepseek_v4_1_flash.quantization import (
+    from quantization import (
         dequantize_mxfp4_cache, dequantize_mxfp8_cache,
         quantize_mxfp4_cache, quantize_mxfp8_cache,
     )

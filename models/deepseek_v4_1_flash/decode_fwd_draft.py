@@ -6,40 +6,53 @@
 # INCLUDING BUT NOT LIMITED TO NON-INFRINGEMENT, MERCHANTABILITY, OR FITNESS FOR A PARTICULAR PURPOSE.
 # See LICENSE in the root of the software repository for the full text of the License.
 # -----------------------------------------------------------------------------------------------------------
+# ci: devices=2
 # ci: no-sim
 """DeepSeek-V4.1-Flash 40-layer decode backbone."""
 
 import argparse
 import inspect
-import sys
-from pathlib import Path
-
-if __package__ in (None, ""):
-    sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
-
-# The model config reads --tp at import time; leave other V4.1 entry points at their own defaults.
-if __name__ == "__main__" and not any(arg == "--tp" or arg.startswith("--tp=") for arg in sys.argv[1:]):
-    sys.argv.append("--tp=1")
 
 import pypto.language as pl
 import pypto.language.distributed as pld
 import torch
 
-from models.deepseek_v4_1_flash import config as C
-from models.deepseek_v4_1_flash.decode_c1a_full import decode_c1a_full_sharded
-from models.deepseek_v4_1_flash.decode_c1a_reindex import decode_c1a_reindex_sharded
-from models.deepseek_v4_1_flash.decode_c1a_reuse import decode_c1a_reuse_sharded
-from models.deepseek_v4_1_flash.decode_c2a_full import decode_c2a_full_sharded
-from models.deepseek_v4_1_flash.decode_c2a_reuse import decode_c2a_reuse_sharded
-from models.deepseek_v4_1_flash.decode_swa import decode_swa_sharded
-from models.deepseek_v4_1_flash.expert_routed import (
+
+from config import (
+    FLASH as M,
+    B_DYN,
+    LOCAL_T_DYN,
+    Q_START_DYN,
+    ROUTE_T_DYN,
+    TABLE_DYN,
+    T_DYN,
+    BLOCK_SIZE,
+    COMPRESSED_CACHE_GROUP,
+    DECODE_MAX_TOKENS,
+    INDEX_CACHE_GROUP,
+    STATE_CAPACITY,
+    WINDOW_CACHE_GROUP,
+)
+
+from config import MOE_TOKENS
+from compressor import STATE_WIDTH
+from config import TP_SIZE
+
+
+from decode_c1a_full import decode_c1a_full_sharded
+from decode_c1a_reindex import decode_c1a_reindex_sharded
+from decode_c1a_reuse import decode_c1a_reuse_sharded
+from decode_c2a_full import decode_c2a_full_sharded
+from decode_c2a_reuse import decode_c2a_reuse_sharded
+from decode_swa import decode_swa_sharded
+from expert_routed import (
     MX_PACKED_LANE_COLS,
     MX_W1_PACKED_ROWS,
     MX_W2_PACKED_ROWS,
     MX_W3_PACKED_ROWS,
 )
-from models.deepseek_v4_1_flash.ep_transport import SIGNAL_PAD
-from models.deepseek_v4_1_flash.moe import (
+from moe import SIGNAL_PAD
+from moe import (
     AUX_WIDTH,
     EP_SIZE,
     N_LOCAL_EXPERTS,
@@ -49,47 +62,41 @@ from models.deepseek_v4_1_flash.moe import (
 )
 
 
-N_LAYERS = C.FLASH.num_hidden_layers
+# model config
+LOCAL_H = M.num_attention_heads // TP_SIZE
+LOCAL_O_GROUPS = M.o_groups // TP_SIZE
+LOCAL_O_WIDTH = M.o_groups // TP_SIZE * M.o_lora_rank
+D = M.hidden_size
+HEAD_DIM = M.head_dim
+ROPE_DIM = M.qk_rope_head_dim
+Q_LORA = M.q_lora_rank
+O_LORA = M.o_lora_rank
+O_GROUP_IN = M.num_attention_heads * M.head_dim // M.o_groups
+HC_MULT = M.hc_mult
+HC_DIM = M.hc_dim
+MIX_HC = M.mix_hc
+INDEX_H = M.index_n_heads
+INDEX_DIM = M.index_head_dim
+INDEX_TOPK = M.index_topk
+N_EXPERTS = M.n_routed_experts
+TOPK = M.num_experts_per_tok
+MOE_INTER = M.moe_intermediate_size
+MX_GROUP = M.weight_block_size[0]
+
+
+N_LAYERS = M.num_hidden_layers
 C2A_SOURCE_COUNT = 3
 KV_SOURCE_COUNT = 4
 INDEX_SOURCE_COUNT = 8
 
-BLOCK_SIZE = C.BLOCK_SIZE
-B_DYN = C.B_DYN
-COMPRESSED_CACHE_GROUP = C.COMPRESSED_CACHE_GROUP
-D = C.D
-DECODE_MAX_TOKENS = C.DECODE_MAX_TOKENS
-HC_DIM = C.HC_DIM
-HC_MULT = C.HC_MULT
-HEAD_DIM = C.HEAD_DIM
-INDEX_CACHE_GROUP = C.INDEX_CACHE_GROUP
-INDEX_DIM = C.INDEX_DIM
-INDEX_H = C.INDEX_H
-INDEX_TOPK = C.INDEX_TOPK
-LOCAL_H = C.LOCAL_H
-LOCAL_O_GROUPS = C.LOCAL_O_GROUPS
-LOCAL_O_WIDTH = C.LOCAL_O_WIDTH
-LOCAL_T_DYN = C.LOCAL_T_DYN
-MIX_HC = C.MIX_HC
-MOE_INTER = C.MOE_INTER
-MOE_TOKENS = C.MOE_TOKENS
-MX_GROUP = C.MX_GROUP
-N_EXPERTS = C.N_EXPERTS
-O_GROUP_IN = C.O_GROUP_IN
-O_LORA = C.O_LORA
-Q_LORA = C.Q_LORA
-Q_START_DYN = C.Q_START_DYN
-ROPE_DIM = C.ROPE_DIM
-ROUTE_T_DYN = C.ROUTE_T_DYN
-STATE_CAPACITY = C.STATE_CAPACITY
-STATE_WIDTH = C.STATE_WIDTH
-TABLE_DYN = C.TABLE_DYN
-TOPK = C.TOPK
-TP_SIZE = C.TP_SIZE
-T_DYN = C.T_DYN
-WINDOW_CACHE_GROUP = C.WINDOW_CACHE_GROUP
+BLOCK_SIZE = BLOCK_SIZE
+COMPRESSED_CACHE_GROUP = COMPRESSED_CACHE_GROUP
+DECODE_MAX_TOKENS = DECODE_MAX_TOKENS
+INDEX_CACHE_GROUP = INDEX_CACHE_GROUP
+STATE_CAPACITY = STATE_CAPACITY
+WINDOW_CACHE_GROUP = WINDOW_CACHE_GROUP
 
-BACKBONE_SCHEDULE = tuple(C.FLASH.layer_config(layer_id) for layer_id in range(N_LAYERS))
+BACKBONE_SCHEDULE = tuple(M.layer_config(layer_id) for layer_id in range(N_LAYERS))
 FIXTURE_BATCH = 12
 FIXTURE_SEQUENCE = 6
 FIXTURE_TOKENS = FIXTURE_BATCH * FIXTURE_SEQUENCE
@@ -97,11 +104,11 @@ FIXTURE_TOKENS = FIXTURE_BATCH * FIXTURE_SEQUENCE
 
 def cache_source_ordinals(layer_id: int) -> tuple[int | None, int | None, int | None]:
     """Return packed KV, index, and C2A-state source ordinals for one layer."""
-    layer = C.FLASH.layer_config(layer_id)
+    layer = M.layer_config(layer_id)
     if layer.compression_ratio == 0:
         return None, None, None
-    kv_sources = C.FLASH.kv_source_layer_ids
-    index_sources = C.FLASH.index_source_layer_ids
+    kv_sources = M.kv_source_layer_ids
+    index_sources = M.index_source_layer_ids
     kv_ordinal = kv_sources.index(layer.kv_source_layer_id)
     index_ordinal = index_sources.index(layer.index_source_layer_id)
     state_ordinal = kv_ordinal if layer.compression_ratio == 2 else None
@@ -4705,11 +4712,11 @@ def _fixture_extent(dim):
 
 
 def build_tensor_specs():
-    """Build the TP1/EP8 twelve-request decode smoke fixture."""
+    """Build the TP1/EP2 twelve-request decode smoke fixture."""
     from golden import ScalarSpec, TensorSpec
 
-    if (TP_SIZE, EP_SIZE) != (1, 8):
-        raise ValueError("decode_fwd fixture requires --tp 1 --ep 8")
+    if TP_SIZE != 1:
+        raise ValueError("decode_fwd fixture requires --tp 1")
 
     signature = inspect.signature(l3_decode_fwd._func)
     specs = []
@@ -4750,14 +4757,14 @@ def build_tensor_specs():
 
 
 def validate(argv=None):
-    """Run both decode stages on eight A5 cards without a forward golden."""
+    """Run both decode stages on the configured A5 EP group without a forward golden."""
     from golden import run
     from pypto.ir import DistributedConfig
 
     parser = argparse.ArgumentParser()
     parser.add_argument("-p", "--platform", default="a5", choices=["a5"])
     parser.add_argument("--tp", type=int, default=TP_SIZE, choices=[1])
-    parser.add_argument("--ep", type=int, default=EP_SIZE, choices=[8])
+    parser.add_argument("--ep", type=int, default=EP_SIZE, choices=[2, 4, 8])
     parser.add_argument("-d", "--device", default=",".join(str(rank) for rank in range(EP_SIZE)))
     parser.add_argument("--compile-only", action="store_true")
     parser.add_argument("--dump-passes", action="store_true")
@@ -4766,8 +4773,8 @@ def validate(argv=None):
     args = parser.parse_args(argv)
     if args.tp != TP_SIZE or args.ep != EP_SIZE:
         parser.error("--tp/--ep are import-time configuration; pass them on the Python command line")
-    if (args.tp, args.ep) != (1, 8):
-        parser.error("the decode_fwd smoke fixture requires --tp 1 --ep 8")
+    if args.tp != 1:
+        parser.error("the decode_fwd smoke fixture requires --tp 1")
     devices = [int(device) for device in args.device.split(",") if device]
     if len(devices) != EP_SIZE:
         parser.error(f"need exactly {EP_SIZE} devices, got {devices}")

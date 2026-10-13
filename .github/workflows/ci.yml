@@ -332,7 +332,7 @@ jobs:
             # comma-separated for N>1) and is passed straight to -d. Higher
             # world sizes (ep4/ep8) are exercised as explicit --device-num 4/8
             # steps in daily_ci.yml.
-            ndev=$(grep -oP '#\s*ci:\s*devices=\K[0-9]+' "$f" | head -1)
+            ndev=$(grep -oP '#\s*ci:\s*devices=\K[0-9]+' "$f" | head -1 || true)
             ndev=${ndev:-1}
             devnum_flag=""
             [ "$ndev" -gt 1 ] && devnum_flag="--device-num $ndev"
@@ -363,11 +363,11 @@ jobs:
 
   a5:
     needs: detect-changes
-    # Directory-selected A5 coverage; V4.1 uses TP1 and at most two cards.
-    # Daily model-tests-a5 retains the complete TP2/TP4 CLI combination sweep.
+    # Directory-selected A5 coverage through standalone script entry points.
     if: needs.detect-changes.outputs.a5_files != ''
     runs-on: [self-hosted, linux, npu-a5]
-    # Queue up to two cases concurrently, with room for one task-submit worst case
+    # Standalone scripts run sequentially, with room for one task-submit
+    # worst case
     # (--timeout 3600 queue wait + --max-time 900 run) on top.
     timeout-minutes: 180
     defaults:
@@ -411,12 +411,28 @@ jobs:
           A5_CI_ENTRIES: ${{ needs.detect-changes.outputs.a5_files }}
         run: |
           source activate.sh
-          if [ "${PYPTO_USE_UV:-false}" = "true" ]; then
-            uv pip install pytest
-          else
-            python -m pip install pytest
+          FILES="$A5_CI_ENTRIES"
+          failed=()
+          for f in $FILES; do
+            echo "::group::$f"
+            ndev=$(grep -oP '#\s*ci:\s*devices=\K[0-9]+' "$f" | head -1 || true)
+            ndev=${ndev:-1}
+            devnum_flag=""
+            [ "$ndev" -gt 1 ] && devnum_flag="--device-num $ndev --ignore-whitelist"
+            if task-submit --device auto $devnum_flag --timeout 3600 --max-time 900 \
+              --run "cd $GITHUB_WORKSPACE/checkout && source activate.sh && PYTHONPATH=$GITHUB_WORKSPACE/checkout python $f -p a5 -d \$TASK_DEVICE"; then
+              status=pass
+            else
+              status=fail
+              failed+=("$f")
+              echo "::error file=${f}::FAIL"
+            fi
+            echo "::endgroup::"
+          done
+          if [ ${#failed[@]} -ne 0 ]; then
+            printf 'FAILED: %s\n' "${failed[@]}"
+            exit 1
           fi
-          python .github/scripts/run_a5_pytest.py --tp1-only --max-cards 2 --jobs 2 $A5_CI_ENTRIES
 
       - name: Upload A5 failure diagnostics
         if: failure()

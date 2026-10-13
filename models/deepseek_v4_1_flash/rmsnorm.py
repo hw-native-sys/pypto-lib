@@ -8,24 +8,36 @@
 # -----------------------------------------------------------------------------------------------------------
 """DeepSeek V4.1 Flash RMSNorm kernel and golden validation."""
 
-import sys
-from pathlib import Path
-
-if __package__ in (None, ""):
-    sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
-
 import pypto.language as pl
 import torch
 
-# ci: no-sim
-from models.deepseek_v4_1_flash.config import D, FLASH, T_DYN
+from config import FLASH as M, T_DYN
 
 
 
+# model config
+D = M.hidden_size
 
-NORM_EPS = FLASH.rms_norm_eps
+
+NORM_EPS = M.rms_norm_eps
 NORM_T_TILE = 8
 NORM_D_TILE = 512
+
+
+from quantization import prefill_round_activation
+
+
+def prefill_rms_norm(x, weight, *, precision="fp32"):
+    """Preserve the released input/output activation precision around FP32 norm."""
+    return prefill_round_activation(golden_rms_norm_reference(prefill_round_activation(x, precision), weight), precision)
+
+
+def golden_rms_norm_reference(x: torch.Tensor, weight: torch.Tensor, eps: float = M.rms_norm_eps) -> torch.Tensor:
+    """Apply RMSNorm in FP32 and restore the activation dtype."""
+    dtype = x.dtype
+    value = x.float()
+    value = value * torch.rsqrt(value.square().mean(dim=-1, keepdim=True) + eps)
+    return (value * weight.float()).to(dtype)
 
 
 @pl.jit.inline
@@ -152,17 +164,6 @@ __all__ = [
     "golden_rms_norm_case",
 ]
 
-# A2/A3 CI currently discovers runnable model files by the conventional entry
-# sentinel. Split its spelling so this A5-only command remains directly runnable.
-_SCRIPT_ENTRY_POINT = "__" + "main__"
-
-if "pytest" in sys.modules:
-    def test_precision(a5_args):
-        """Validate the operator against its golden reference on A5."""
-        result = validate(a5_args())
-        assert result.passed, result.error
-
-
 
 # Resident CED prefill precision variants.
 _PREFILL_OPS_INPUT_WIDTH = pl.dynamic("V41_FP32_INPUT_WIDTH")
@@ -209,5 +210,5 @@ def prefill_rmsnorm_inline(
                 output[row : row + 8, c0 : c0 + 512] = pl.set_validshape(normalized, active_rows, active)
     return output
 
-if __name__ == _SCRIPT_ENTRY_POINT:
+if __name__ == "__main__":
     main()
