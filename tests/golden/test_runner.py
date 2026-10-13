@@ -1935,32 +1935,38 @@ class TestReloadFromDir:
         setattr(module, attr, type(attr, (), {"from_dir": from_dir}))
         return module
 
-    def test_l2_build_reconstructs_single_chip_handle(self, tmp_path):
-        """No distributed_meta.json: CompiledProgram.from_dir, given the platform."""
+    @pytest.mark.parametrize("platform", ["a2a3", "a2a3sim", "a5", "a5sim"])
+    def test_l2_build_reconstructs_single_chip_handle(self, tmp_path, platform):
+        """No distributed_meta.json: CompiledProgram.from_dir, given both target axes."""
         sentinel = object()
         from_dir = MagicMock(return_value=sentinel)
-        cfg = _run_config(platform="a2a3")
+        cfg = _run_config(platform=platform)
         with patch.dict(
             sys.modules, {"pypto.ir": self._fake_ir(from_dir, "CompiledProgram")}
         ):
             assert _reload_from_dir(tmp_path, cfg) is sentinel
         from_dir.assert_called_once()
-        assert from_dir.call_args.kwargs["platform"] == "a2a3"
+        assert "platform" not in from_dir.call_args.kwargs
+        assert from_dir.call_args.kwargs["backend_type"] == cfg.backend_type
+        assert from_dir.call_args.kwargs["execution_mode"] == cfg.execution_mode
 
-    def test_l3_build_reconstructs_with_run_overrides(self, tmp_path):
+    @pytest.mark.parametrize("platform", ["a2a3", "a2a3sim", "a5", "a5sim"])
+    def test_l3_build_reconstructs_with_run_overrides(self, tmp_path, platform):
         """distributed_meta.json present: DistributedCompiledProgram.from_dir,
-        threading the run's platform + distributed_config as overrides."""
+        threading the run's target axes and distributed_config as overrides."""
         (tmp_path / "distributed_meta.json").write_text("{}")
         sentinel = object()
         from_dir = MagicMock(return_value=sentinel)
-        cfg = _run_config(platform="a2a3", distributed_config="DC")
+        cfg = _run_config(platform=platform, distributed_config="DC")
         with patch.dict(
             sys.modules,
             {"pypto.ir": self._fake_ir(from_dir, "DistributedCompiledProgram")},
         ):
             assert _reload_from_dir(tmp_path, cfg) is sentinel
         from_dir.assert_called_once()
-        assert from_dir.call_args.kwargs["platform"] == "a2a3"
+        assert "platform" not in from_dir.call_args.kwargs
+        assert from_dir.call_args.kwargs["backend_type"] == cfg.backend_type
+        assert from_dir.call_args.kwargs["execution_mode"] == cfg.execution_mode
         assert from_dir.call_args.kwargs["distributed_config"] == "DC"
 
 
@@ -2787,6 +2793,20 @@ class TestBenchReports:
         assert "device_wall" not in out
         assert "rank 10: eff_us min=50.0 median=50.5 mean=50.5 max=51.0" in out
         assert "slot 1 (decode_orch): eff_us" in out
+
+
+@pytest.mark.parametrize("platform", ["a2a3", "a2a3sim", "a5", "a5sim"])
+def test_explicit_target_config_matches_legacy_platform(platform):
+    from pypto.backend import BackendType
+    from pypto.runtime import ExecutionMode
+
+    explicit = _normalize_config({
+        "backend_type": BackendType.Ascend950 if platform.startswith("a5") else BackendType.Ascend910B,
+        "execution_mode": ExecutionMode.SIM if platform.endswith("sim") else ExecutionMode.ONBOARD,
+    })
+    legacy = _normalize_config({"platform": platform})
+    assert explicit.platform == legacy.platform
+    assert explicit.compile_kwargs() == legacy.compile_kwargs()
 
 
 if __name__ == "__main__":
