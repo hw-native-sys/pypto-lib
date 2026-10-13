@@ -243,14 +243,16 @@ interface without talking to each other.
 A file has **no script-entry guard until its golden is real**. The a2a3 daily CI
 selects a case purely by grepping for that guard, so adding one to a file whose
 golden still raises would put an unimplementable operator into the sweep. Today
-`config.py`, `golden.py`, `quantization.py`, `metadata.py`, `mhc.py` and all five
-stream-B MLA files carry real references, and eight of them run as CI cases:
+`config.py`, `golden.py`, `quantization.py`, `metadata.py`, `mhc.py`, `rmsnorm.py`
+and all five stream-B MLA files carry real references, and nine of them run as
+CI cases:
 
 ```bash
-source .venv/bin/activate-pypto
+source .venv/bin/activate
 python models/glm5_3_flash/golden.py              # [GOLDEN] PASS norms / swiglu / moe_gate
 python models/glm5_3_flash/quantization.py        # [GOLDEN] PASS quantization
 python models/glm5_3_flash/mhc.py                 # [GOLDEN] PASS mhc
+python models/glm5_3_flash/rmsnorm.py             # [GOLDEN] PASS rmsnorm plain / quant / add
 python models/glm5_3_flash/mla_prolog.py          # [GOLDEN] PASS mla_prolog + prolog/absorb
 python models/glm5_3_flash/mla_cache.py           # [GOLDEN] PASS mla_cache + device scatter
 python models/glm5_3_flash/mla_epilog.py          # [GOLDEN] PASS mla_epilog + both paths
@@ -452,6 +454,7 @@ RoPE machinery, and add the KDA family and the kpool indexer.
 | `quantization.py` | Complete. Per-channel and per-token INT8 with the repo's exact rounding, the dynamic W8A8 linear, and the fused dequant-SwiGLU-requant epilogue |
 | `metadata.py` | Complete. Packed-batch lowering, the three distinct slot mappings (latent, per-token indexer state, pooled state), TP token ownership, and the indexer's pool and tail derivation |
 | `_golden_smoke.py` | Complete. Deterministic CPU fixtures behind every golden that exists |
+| `rmsnorm.py` | Plain BF16 RMSNorm, INT8-emitting per-token RMSNorm, and fused residual-add RMSNorm. Each has a colocated Torch golden and JIT validation entry; the CLI runs all three cases. Passes `a2a3sim` and a2a3 |
 | `mla_prolog.py` | Goldens, the prolog body (three `b_trans` matmuls and two rms-norm scopes, no split-K yet), the per-token `absorb_query` body, and a device test entry per case. `absorb_output` is weight-time and belongs to the loader. Passes `a2a3sim` and a2a3 |
 | `mla_cache.py` | Golden, kernel body (`pl.spmd` scatter, one block per row), device test entry and specs. Passes `a2a3sim` and a2a3 |
 | `mla_epilog.py` | Goldens, both kernel bodies (row-parallel `b_trans` projection over D, FP32 partial sum for the TP16 all-reduce) and a device test entry per path. Passes `a2a3sim` and a2a3 |
