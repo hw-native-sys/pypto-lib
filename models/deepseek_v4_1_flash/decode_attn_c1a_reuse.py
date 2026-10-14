@@ -72,10 +72,10 @@ def make_decode_attn_c1a_reuse(output_reduce=None):
         window_slots: pl.Tensor[[T_DYN], pl.INT64],
         window_indices: pl.Tensor[[T_DYN, 128], pl.INT32],
         window_cache: pl.Tensor[[ORI_BLOCKS_DYN, 128, 1, HEAD_DIM], pl.FP8E4M3FN],
-        window_cache_scale: pl.Tensor[[ORI_BLOCKS_DYN, 128, 1, HEAD_DIM // WINDOW_CACHE_GROUP], pl.FP8E8M0],
+        window_cache_scale: pl.Tensor[[ORI_BLOCKS_DYN, 128, 1, HEAD_DIM // WINDOW_CACHE_GROUP], pl.BF16],
         compressed_cache: pl.Tensor[[CMP_BLOCKS_DYN, 128, 1, HEAD_DIM // 2], pl.UINT8],
         compressed_cache_scale: pl.Tensor[
-            [CMP_BLOCKS_DYN, 128, 1, HEAD_DIM // COMPRESSED_CACHE_GROUP], pl.FP8E4M3FN
+            [CMP_BLOCKS_DYN, 128, 1, HEAD_DIM // COMPRESSED_CACHE_GROUP], pl.BF16
         ],
         compressed_indices: pl.Tensor[[T_DYN, INDEX_TOPK], pl.INT32],
         output_window: pld.DistributedTensor[[DECODE_MAX_TOKENS, D], pl.FP32],
@@ -130,11 +130,11 @@ def decode_attn_c1a_reuse_test(
     window_indices: pl.Tensor[[T_DYN, 128], pl.INT32],
     window_cache: pl.InOut[pl.Tensor[[ORI_BLOCKS_DYN, 128, 1, HEAD_DIM], pl.FP8E4M3FN]],
     window_cache_scale: pl.InOut[
-        pl.Tensor[[ORI_BLOCKS_DYN, 128, 1, HEAD_DIM // WINDOW_CACHE_GROUP], pl.FP8E8M0]
+        pl.Tensor[[ORI_BLOCKS_DYN, 128, 1, HEAD_DIM // WINDOW_CACHE_GROUP], pl.BF16]
     ],
     compressed_cache: pl.InOut[pl.Tensor[[CMP_BLOCKS_DYN, 128, 1, HEAD_DIM // 2], pl.UINT8]],
     compressed_cache_scale: pl.InOut[
-        pl.Tensor[[CMP_BLOCKS_DYN, 128, 1, HEAD_DIM // COMPRESSED_CACHE_GROUP], pl.FP8E4M3FN]
+        pl.Tensor[[CMP_BLOCKS_DYN, 128, 1, HEAD_DIM // COMPRESSED_CACHE_GROUP], pl.BF16]
     ],
     compressed_indices: pl.Tensor[[T_DYN, INDEX_TOPK], pl.INT32],
     output_window: pld.DistributedTensor[[DECODE_MAX_TOKENS, D], pl.FP32],
@@ -183,11 +183,11 @@ def make_program(tokens, pages, epochs=1):
         window_indices: pl.Tensor[[TP_SIZE, TOKENS, 128], pl.INT32],
         window_cache: pl.InOut[pl.Tensor[[TP_SIZE, PAGES, 128, 1, HEAD_DIM], pl.FP8E4M3FN]],
         window_cache_scale: pl.InOut[
-            pl.Tensor[[TP_SIZE, PAGES, 128, 1, HEAD_DIM // WINDOW_CACHE_GROUP], pl.FP8E8M0]
+            pl.Tensor[[TP_SIZE, PAGES, 128, 1, HEAD_DIM // WINDOW_CACHE_GROUP], pl.BF16]
         ],
         compressed_cache: pl.InOut[pl.Tensor[[TP_SIZE, PAGES, 128, 1, HEAD_DIM // 2], pl.UINT8]],
         compressed_cache_scale: pl.InOut[
-            pl.Tensor[[TP_SIZE, PAGES, 128, 1, HEAD_DIM // COMPRESSED_CACHE_GROUP], pl.FP8E4M3FN]
+            pl.Tensor[[TP_SIZE, PAGES, 128, 1, HEAD_DIM // COMPRESSED_CACHE_GROUP], pl.BF16]
         ],
         compressed_indices: pl.Tensor[[TP_SIZE, TOKENS, INDEX_TOPK], pl.INT32],
         output: pl.Out[pl.Tensor[[TP_SIZE, TOKENS, D], pl.BF16]],

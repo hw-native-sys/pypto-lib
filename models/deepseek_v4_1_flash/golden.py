@@ -560,7 +560,7 @@ def prefill_quantize_dequantize(x, kind):
     value = x.bfloat16().float().unflatten(-1, (-1, group_size))
     maximum = value.abs().amax(-1, keepdim=True)
     if kind == "kv_fp4":
-        scale = (maximum.clamp_min(6 * 2.0**-9) / 6).to(torch.float8_e4m3fn).float()
+        scale = (maximum.clamp_min(6 * 2.0**-9) / 6).to(torch.bfloat16).float()
     else:
         floor, inverse = (1e-4, 1 / 448) if kind == "mxfp8" else (6 * 2.0**-126, 1 / 6)
         fraction, exponent = torch.frexp(maximum.clamp_min(floor) * inverse)

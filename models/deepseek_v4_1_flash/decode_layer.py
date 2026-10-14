@@ -174,7 +174,7 @@ def decode_layer(
     window_cache_scale: pl.InOut[
         pl.Tensor[
             [C.ORI_BLOCKS_DYN, 128, 1, C.HEAD_DIM // C.WINDOW_CACHE_GROUP],
-            pl.FP8E8M0,
+            pl.BF16,
         ]
     ],
     compressed_cache: pl.InOut[
@@ -183,7 +183,7 @@ def decode_layer(
     compressed_cache_scale: pl.InOut[
         pl.Tensor[
             [C.CMP_BLOCKS_DYN, 128, 1, C.HEAD_DIM // C.COMPRESSED_CACHE_GROUP],
-            pl.FP8E4M3FN,
+            pl.BF16,
         ]
     ],
     request_ids: pl.Tensor[[C.T_DYN], pl.INT32],
@@ -426,7 +426,7 @@ def l3_decode_layer(
     window_cache_scale: pl.InOut[
         pl.Tensor[
             [EP_SIZE, C.ORI_BLOCKS_DYN, 128, 1, C.HEAD_DIM // C.WINDOW_CACHE_GROUP],
-            pl.FP8E8M0,
+            pl.BF16,
         ]
     ],
     compressed_cache: pl.InOut[
@@ -435,7 +435,7 @@ def l3_decode_layer(
     compressed_cache_scale: pl.InOut[
         pl.Tensor[
             [EP_SIZE, C.CMP_BLOCKS_DYN, 128, 1, C.HEAD_DIM // C.COMPRESSED_CACHE_GROUP],
-            pl.FP8E4M3FN,
+            pl.BF16,
         ]
     ],
     request_ids: pl.Tensor[[EP_SIZE, C.T_DYN], pl.INT32],

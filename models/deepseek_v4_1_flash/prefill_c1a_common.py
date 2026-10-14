@@ -62,7 +62,7 @@ def publish_window(
     kv: pl.Tensor[[T_DYN, HEAD_DIM], pl.BF16],
     slots: pl.Tensor[[T_DYN], pl.INT64],
     cache: pl.Tensor[[ORI_BLOCKS_DYN, 128, 1, HEAD_DIM], pl.FP8E4M3FN],
-    scales: pl.Tensor[[ORI_BLOCKS_DYN, 128, 1, HEAD_DIM // 32], pl.FP8E8M0],
+    scales: pl.Tensor[[ORI_BLOCKS_DYN, 128, 1, HEAD_DIM // 32], pl.BF16],
     num_tokens: pl.Scalar[pl.INT32],
     cache_ready: pl.Scalar[pl.TASK_ID],
 ):
@@ -79,18 +79,10 @@ def publish_window(
             source = pl.set_validshape(pl.fillpad(source, pad_value=pl.PadValue.zero), 1, HEAD_DIM * 2)
             value = pl.reshape(pl.cast(source, pl.FP32), [HEAD_DIM // 16, 32])
             amax = pl.maximum(pl.row_max(pl.abs(value)), 1e-4)
-            raw = pl.mul(amax, 1.0 / 448.0)
-            bits = pl.reinterpret_view(raw, pl.INT32)
-            exponent = pl.shrs(pl.add(bits, 8388607), 23)
-            scale = pl.reinterpret_view(pl.shls(exponent, 23), pl.FP32)
-            payload = pl.cast(pl.row_expand_div(value, scale), pl.FP8E4M3FN, mode="rint")
+            scale = pl.cast(pl.mul(amax, 1.0 / 448.0), pl.BF16, mode="rint")
+            payload = pl.cast(pl.row_expand_div(value, pl.cast(scale, pl.FP32)), pl.FP8E4M3FN, mode="rint")
             flat[slot:slot + 1, :] = pl.set_validshape(pl.reshape(payload, [1, HEAD_DIM * 2]), 1, HEAD_DIM)
-            signed_exponent = pl.sub(exponent, pl.mul(pl.shrs(exponent, 7), 256))
-            codes = pl.cast(signed_exponent, pl.INT8)
-            encoded = pl.reinterpret_view(pl.reinterpret_view(codes, pl.UINT8), pl.FP8E8M0)
-            encoded_row = pl.reshape(encoded, [1, HEAD_DIM // 16])
-            encoded_valid = pl.set_validshape(encoded_row, 1, HEAD_DIM // 32)
-            scale_flat[slot:slot + 1, :] = encoded_valid
+            scale_flat[slot:slot + 1, :] = pl.set_validshape(pl.reshape(scale, [1, HEAD_DIM // 16]), 1, HEAD_DIM // 32)
     return cache, scales
 
 SOFTMAX_SCALE = HEAD_DIM**-0.5
@@ -103,7 +95,7 @@ def publish_compressed_cache(
     cache: pl.Tensor[[CMP_BLOCKS_DYN, 128, 1, HEAD_DIM // 2], pl.UINT8],
     scales: pl.Tensor[
         [CMP_BLOCKS_DYN, 128, 1, HEAD_DIM // COMPRESSED_CACHE_GROUP],
-        pl.FP8E4M3FN,
+        pl.BF16,
     ],
     num_tokens: pl.Scalar[pl.INT32],
 ):
@@ -120,11 +112,8 @@ def publish_compressed_cache(
             grouped = pl.reshape(source, [HEAD_DIM // COMPRESSED_CACHE_GROUP, COMPRESSED_CACHE_GROUP])
             maximum_tmp = pl.create_tile([HEAD_DIM // COMPRESSED_CACHE_GROUP, 128], dtype=pl.FP32)
             maximum = pl.row_max(pl.abs(grouped), tmp_tile=maximum_tmp)
-            raw_scale = pl.minimum(
-                pl.maximum(pl.mul(maximum, 1.0 / 6.0), 2.0**-9),
-                448.0,
-            )
-            stored_scale = pl.cast(raw_scale, pl.FP8E4M3FN, mode="rint")
+            raw_scale = pl.maximum(pl.mul(maximum, 1.0 / 6.0), 2.0**-9)
+            stored_scale = pl.cast(raw_scale, pl.BF16, mode="rint")
             scale = pl.cast(stored_scale, pl.FP32)
             normalized = pl.row_expand_div(grouped, scale)
             normalized = pl.reshape(normalized, [1, HEAD_DIM])
@@ -261,12 +250,12 @@ def attend_sparse_cache(
     query: pl.Tensor[[T_DYN, LOCAL_H * HEAD_DIM], pl.BF16],
     window_indices: pl.Tensor[[T_DYN, 128], pl.INT32],
     window_cache: pl.Tensor[[ORI_BLOCKS_DYN, 128, 1, HEAD_DIM], pl.FP8E4M3FN],
-    window_scale: pl.Tensor[[ORI_BLOCKS_DYN, 128, 1, HEAD_DIM // 32], pl.FP8E8M0],
+    window_scale: pl.Tensor[[ORI_BLOCKS_DYN, 128, 1, HEAD_DIM // 32], pl.BF16],
     compressed_indices: pl.Tensor[[T_DYN, INDEX_TOPK], pl.INT32],
     compressed_cache: pl.Tensor[[CMP_BLOCKS_DYN, 128, 1, HEAD_DIM // 2], pl.UINT8],
     compressed_scale: pl.Tensor[
         [CMP_BLOCKS_DYN, 128, 1, HEAD_DIM // COMPRESSED_CACHE_GROUP],
-        pl.FP8E4M3FN,
+        pl.BF16,
     ],
     sink: pl.Tensor[[LOCAL_H], pl.FP32],
     output: pl.Tensor[[T_DYN, LOCAL_H * HEAD_DIM], pl.BF16],
@@ -313,11 +302,7 @@ def attend_sparse_cache(
                         [row, 0],
                         valid_shape=[1, HEAD_DIM // 32],
                     )
-                    raw_codes = pl.reinterpret_view(scale_row, pl.UINT8)
-                    signed_codes = pl.cast(pl.reinterpret_view(raw_codes, pl.INT8), pl.INT32)
-                    codes = pl.ands(signed_codes, 255)
-                    scale_bits = pl.maximum(pl.shls(codes, 23), 4194304)
-                    scale_value = pl.reinterpret_view(scale_bits, pl.FP32)
+                    scale_value = pl.cast(scale_row, pl.FP32)
                     scale = pl.reshape(scale_value[:, :HEAD_DIM // 32], [HEAD_DIM // 32, 1])
                     decoded = pl.cast(pl.row_expand_mul(payload, scale), pl.BF16, mode="rint")
                     kv[lane:lane + 1, :] = pl.reshape(decoded, [1, HEAD_DIM])
@@ -471,12 +456,12 @@ def prefill_c1a_partial(
     window_cache: pl.Tensor[[ORI_BLOCKS_DYN, 128, 1, HEAD_DIM], pl.FP8E4M3FN],
     window_cache_scale: pl.Tensor[
         [ORI_BLOCKS_DYN, 128, 1, HEAD_DIM // WINDOW_CACHE_GROUP],
-        pl.FP8E8M0,
+        pl.BF16,
     ],
     compressed_cache: pl.Tensor[[CMP_BLOCKS_DYN, 128, 1, HEAD_DIM // 2], pl.UINT8],
     compressed_cache_scale: pl.Tensor[
         [CMP_BLOCKS_DYN, 128, 1, HEAD_DIM // COMPRESSED_CACHE_GROUP],
-        pl.FP8E4M3FN,
+        pl.BF16,
     ],
     compressed_indices: pl.Tensor[[T_DYN, INDEX_TOPK], pl.INT32],
     output: pl.Tensor[[T_DYN, D], pl.FP32],

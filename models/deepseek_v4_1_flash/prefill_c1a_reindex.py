@@ -91,11 +91,11 @@ def prefill_c1a_reindex(
     window_indices: pl.Tensor[[C.T_DYN, 128], pl.INT32],
     window_cache: pl.Tensor[[C.ORI_BLOCKS_DYN, 128, 1, C.HEAD_DIM], pl.FP8E4M3FN],
     window_cache_scale: pl.Tensor[
-        [C.ORI_BLOCKS_DYN, 128, 1, C.HEAD_DIM // C.WINDOW_CACHE_GROUP], pl.FP8E8M0
+        [C.ORI_BLOCKS_DYN, 128, 1, C.HEAD_DIM // C.WINDOW_CACHE_GROUP], pl.BF16
     ],
     compressed_cache: pl.Tensor[[C.CMP_BLOCKS_DYN, 128, 1, C.HEAD_DIM // 2], pl.UINT8],
     compressed_cache_scale: pl.Tensor[
-        [C.CMP_BLOCKS_DYN, 128, 1, C.HEAD_DIM // C.COMPRESSED_CACHE_GROUP], pl.FP8E4M3FN
+        [C.CMP_BLOCKS_DYN, 128, 1, C.HEAD_DIM // C.COMPRESSED_CACHE_GROUP], pl.BF16
     ],
     request_ids: pl.Tensor[[C.T_DYN], pl.INT32],
     compressed_lens: pl.Tensor[[C.T_DYN], pl.INT32],
@@ -193,11 +193,11 @@ def prefill_c1a_reindex_test(
     window_indices: pl.Tensor[[C.T_DYN, 128], pl.INT32],
     window_cache: pl.InOut[pl.Tensor[[C.ORI_BLOCKS_DYN, 128, 1, C.HEAD_DIM], pl.FP8E4M3FN]],
     window_cache_scale: pl.InOut[
-        pl.Tensor[[C.ORI_BLOCKS_DYN, 128, 1, C.HEAD_DIM // C.WINDOW_CACHE_GROUP], pl.FP8E8M0]
+        pl.Tensor[[C.ORI_BLOCKS_DYN, 128, 1, C.HEAD_DIM // C.WINDOW_CACHE_GROUP], pl.BF16]
     ],
     compressed_cache: pl.Tensor[[C.CMP_BLOCKS_DYN, 128, 1, C.HEAD_DIM // 2], pl.UINT8],
     compressed_cache_scale: pl.Tensor[
-        [C.CMP_BLOCKS_DYN, 128, 1, C.HEAD_DIM // C.COMPRESSED_CACHE_GROUP], pl.FP8E4M3FN
+        [C.CMP_BLOCKS_DYN, 128, 1, C.HEAD_DIM // C.COMPRESSED_CACHE_GROUP], pl.BF16
     ],
     request_ids: pl.Tensor[[C.T_DYN], pl.INT32],
     compressed_lens: pl.Tensor[[C.T_DYN], pl.INT32],
@@ -268,13 +268,13 @@ def l3_prefill_c1a_reindex_test(
         pl.Tensor[[C.TP_SIZE, C.ORI_BLOCKS_DYN, 128, 1, C.HEAD_DIM], pl.FP8E4M3FN]
     ],
     window_cache_scale: pl.InOut[
-        pl.Tensor[[C.TP_SIZE, C.ORI_BLOCKS_DYN, 128, 1, C.HEAD_DIM // C.WINDOW_CACHE_GROUP], pl.FP8E8M0]
+        pl.Tensor[[C.TP_SIZE, C.ORI_BLOCKS_DYN, 128, 1, C.HEAD_DIM // C.WINDOW_CACHE_GROUP], pl.BF16]
     ],
     compressed_cache: pl.Tensor[
         [C.TP_SIZE, C.CMP_BLOCKS_DYN, 128, 1, C.HEAD_DIM // 2], pl.UINT8
     ],
     compressed_cache_scale: pl.Tensor[
-        [C.TP_SIZE, C.CMP_BLOCKS_DYN, 128, 1, C.HEAD_DIM // C.COMPRESSED_CACHE_GROUP], pl.FP8E4M3FN
+        [C.TP_SIZE, C.CMP_BLOCKS_DYN, 128, 1, C.HEAD_DIM // C.COMPRESSED_CACHE_GROUP], pl.BF16
     ],
     request_ids: pl.Tensor[[C.TP_SIZE, C.T_DYN], pl.INT32],
     compressed_lens: pl.Tensor[[C.TP_SIZE, C.T_DYN], pl.INT32],

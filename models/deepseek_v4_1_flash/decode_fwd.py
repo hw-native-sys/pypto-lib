@@ -135,11 +135,11 @@ def _decode_encoder(
     window_indices: pl.Tensor[[T_DYN, BLOCK_SIZE], pl.INT32],
     window_cache_pool: pl.InOut[pl.Tensor[[FWD_ORI_BLOCKS_DYN, BLOCK_SIZE, 1, HEAD_DIM], pl.FP8E4M3FN]],
     window_cache_scale_pool: pl.InOut[
-        pl.Tensor[[FWD_ORI_BLOCKS_DYN, BLOCK_SIZE, 1, HEAD_DIM // WINDOW_CACHE_GROUP], pl.FP8E8M0]
+        pl.Tensor[[FWD_ORI_BLOCKS_DYN, BLOCK_SIZE, 1, HEAD_DIM // WINDOW_CACHE_GROUP], pl.BF16]
     ],
     compressed_cache_pool: pl.InOut[pl.Tensor[[FWD_CMP_BLOCKS_DYN, BLOCK_SIZE, 1, HEAD_DIM // 2], pl.UINT8]],
     compressed_cache_scale_pool: pl.InOut[
-        pl.Tensor[[FWD_CMP_BLOCKS_DYN, BLOCK_SIZE, 1, HEAD_DIM // COMPRESSED_CACHE_GROUP], pl.FP8E4M3FN]
+        pl.Tensor[[FWD_CMP_BLOCKS_DYN, BLOCK_SIZE, 1, HEAD_DIM // COMPRESSED_CACHE_GROUP], pl.BF16]
     ],
     request_ids: pl.Tensor[[T_DYN], pl.INT32],
     token_to_req_indices: pl.Tensor[[T_DYN], pl.INT32],
@@ -2104,11 +2104,11 @@ def _decode_decoder(
     window_indices: pl.Tensor[[T_DYN, BLOCK_SIZE], pl.INT32],
     window_cache_pool: pl.InOut[pl.Tensor[[FWD_ORI_BLOCKS_DYN, BLOCK_SIZE, 1, HEAD_DIM], pl.FP8E4M3FN]],
     window_cache_scale_pool: pl.InOut[
-        pl.Tensor[[FWD_ORI_BLOCKS_DYN, BLOCK_SIZE, 1, HEAD_DIM // WINDOW_CACHE_GROUP], pl.FP8E8M0]
+        pl.Tensor[[FWD_ORI_BLOCKS_DYN, BLOCK_SIZE, 1, HEAD_DIM // WINDOW_CACHE_GROUP], pl.BF16]
     ],
     compressed_cache_pool: pl.InOut[pl.Tensor[[FWD_CMP_BLOCKS_DYN, BLOCK_SIZE, 1, HEAD_DIM // 2], pl.UINT8]],
     compressed_cache_scale_pool: pl.InOut[
-        pl.Tensor[[FWD_CMP_BLOCKS_DYN, BLOCK_SIZE, 1, HEAD_DIM // COMPRESSED_CACHE_GROUP], pl.FP8E4M3FN]
+        pl.Tensor[[FWD_CMP_BLOCKS_DYN, BLOCK_SIZE, 1, HEAD_DIM // COMPRESSED_CACHE_GROUP], pl.BF16]
     ],
     request_ids: pl.Tensor[[T_DYN], pl.INT32],
     token_to_req_indices: pl.Tensor[[T_DYN], pl.INT32],
@@ -4082,11 +4082,11 @@ def _decode_fwd(
     window_indices: pl.Tensor[[T_DYN, BLOCK_SIZE], pl.INT32],
     window_cache_pool: pl.InOut[pl.Tensor[[FWD_ORI_BLOCKS_DYN, BLOCK_SIZE, 1, HEAD_DIM], pl.FP8E4M3FN]],
     window_cache_scale_pool: pl.InOut[
-        pl.Tensor[[FWD_ORI_BLOCKS_DYN, BLOCK_SIZE, 1, HEAD_DIM // WINDOW_CACHE_GROUP], pl.FP8E8M0]
+        pl.Tensor[[FWD_ORI_BLOCKS_DYN, BLOCK_SIZE, 1, HEAD_DIM // WINDOW_CACHE_GROUP], pl.BF16]
     ],
     compressed_cache_pool: pl.InOut[pl.Tensor[[FWD_CMP_BLOCKS_DYN, BLOCK_SIZE, 1, HEAD_DIM // 2], pl.UINT8]],
     compressed_cache_scale_pool: pl.InOut[
-        pl.Tensor[[FWD_CMP_BLOCKS_DYN, BLOCK_SIZE, 1, HEAD_DIM // COMPRESSED_CACHE_GROUP], pl.FP8E4M3FN]
+        pl.Tensor[[FWD_CMP_BLOCKS_DYN, BLOCK_SIZE, 1, HEAD_DIM // COMPRESSED_CACHE_GROUP], pl.BF16]
     ],
     request_ids: pl.Tensor[[T_DYN], pl.INT32],
     token_to_req_indices: pl.Tensor[[T_DYN], pl.INT32],
@@ -4365,14 +4365,14 @@ def l3_decode_fwd(
         pl.Tensor[[EP_SIZE, FWD_ORI_BLOCKS_DYN, BLOCK_SIZE, 1, HEAD_DIM], pl.FP8E4M3FN]
     ],
     window_cache_scale_pool: pl.InOut[
-        pl.Tensor[[EP_SIZE, FWD_ORI_BLOCKS_DYN, BLOCK_SIZE, 1, HEAD_DIM // WINDOW_CACHE_GROUP], pl.FP8E8M0]
+        pl.Tensor[[EP_SIZE, FWD_ORI_BLOCKS_DYN, BLOCK_SIZE, 1, HEAD_DIM // WINDOW_CACHE_GROUP], pl.BF16]
     ],
     compressed_cache_pool: pl.InOut[
         pl.Tensor[[EP_SIZE, FWD_CMP_BLOCKS_DYN, BLOCK_SIZE, 1, HEAD_DIM // 2], pl.UINT8]
     ],
     compressed_cache_scale_pool: pl.InOut[
         pl.Tensor[
-            [EP_SIZE, FWD_CMP_BLOCKS_DYN, BLOCK_SIZE, 1, HEAD_DIM // COMPRESSED_CACHE_GROUP], pl.FP8E4M3FN
+            [EP_SIZE, FWD_CMP_BLOCKS_DYN, BLOCK_SIZE, 1, HEAD_DIM // COMPRESSED_CACHE_GROUP], pl.BF16
         ]
     ],
     request_ids: pl.Tensor[[EP_SIZE, T_DYN], pl.INT32],

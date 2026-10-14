@@ -89,7 +89,7 @@ def decode_swa(
     window_slots: pl.Tensor[[C.T_DYN], pl.INT64],
     window_indices: pl.Tensor[[C.T_DYN, 128], pl.INT32],
     window_cache: pl.Tensor[[C.ORI_BLOCKS_DYN, 128, 1, C.HEAD_DIM], pl.FP8E4M3FN],
-    window_cache_scale: pl.Tensor[[C.ORI_BLOCKS_DYN, 128, 1, C.HEAD_DIM // C.WINDOW_CACHE_GROUP], pl.FP8E8M0],
+    window_cache_scale: pl.Tensor[[C.ORI_BLOCKS_DYN, 128, 1, C.HEAD_DIM // C.WINDOW_CACHE_GROUP], pl.BF16],
     attention_output: pl.Tensor[[C.T_DYN, C.D], pl.BF16],
     attention_hidden: pl.Tensor[[C.T_DYN, C.HC_MULT, C.D], pl.FP32],
     attention_pre_mix: pl.Tensor[[C.T_DYN, C.HC_MULT], pl.FP32],
@@ -174,7 +174,7 @@ def decode_swa_sharded(
     window_slots: pl.Tensor[[C.T_DYN], pl.INT64],
     window_indices: pl.Tensor[[C.T_DYN, 128], pl.INT32],
     window_cache: pl.Tensor[[C.ORI_BLOCKS_DYN, 128, 1, C.HEAD_DIM], pl.FP8E4M3FN],
-    window_cache_scale: pl.Tensor[[C.ORI_BLOCKS_DYN, 128, 1, C.HEAD_DIM // C.WINDOW_CACHE_GROUP], pl.FP8E8M0],
+    window_cache_scale: pl.Tensor[[C.ORI_BLOCKS_DYN, 128, 1, C.HEAD_DIM // C.WINDOW_CACHE_GROUP], pl.BF16],
     attention_output: pl.Tensor[[OUTPUT_T_DYN, C.D], pl.BF16],
     attention_hidden: pl.Tensor[[OUTPUT_T_DYN, C.HC_MULT, C.D], pl.FP32],
     attention_pre_mix: pl.Tensor[[OUTPUT_T_DYN, C.HC_MULT], pl.FP32],
@@ -270,7 +270,7 @@ def decode_swa_rank(
     window_indices: pl.Tensor[[C.T_DYN, 128], pl.INT32],
     window_cache: pl.InOut[pl.Tensor[[C.ORI_BLOCKS_DYN, 128, 1, C.HEAD_DIM], pl.FP8E4M3FN]],
     window_cache_scale: pl.InOut[
-        pl.Tensor[[C.ORI_BLOCKS_DYN, 128, 1, C.HEAD_DIM // C.WINDOW_CACHE_GROUP], pl.FP8E8M0]
+        pl.Tensor[[C.ORI_BLOCKS_DYN, 128, 1, C.HEAD_DIM // C.WINDOW_CACHE_GROUP], pl.BF16]
     ],
     attention_output: pl.InOut[pl.Tensor[[C.T_DYN, C.D], pl.BF16]],
     attention_hidden: pl.Out[pl.Tensor[[C.T_DYN, C.HC_MULT, C.D], pl.FP32]],
@@ -344,7 +344,7 @@ def decode_swa_rank_sharded(
     window_indices: pl.Tensor[[C.T_DYN, 128], pl.INT32],
     window_cache: pl.InOut[pl.Tensor[[C.ORI_BLOCKS_DYN, 128, 1, C.HEAD_DIM], pl.FP8E4M3FN]],
     window_cache_scale: pl.InOut[
-        pl.Tensor[[C.ORI_BLOCKS_DYN, 128, 1, C.HEAD_DIM // C.WINDOW_CACHE_GROUP], pl.FP8E8M0]
+        pl.Tensor[[C.ORI_BLOCKS_DYN, 128, 1, C.HEAD_DIM // C.WINDOW_CACHE_GROUP], pl.BF16]
     ],
     attention_output: pl.InOut[pl.Tensor[[OUTPUT_T_DYN, C.D], pl.BF16]],
     attention_hidden: pl.Out[pl.Tensor[[OUTPUT_T_DYN, C.HC_MULT, C.D], pl.FP32]],

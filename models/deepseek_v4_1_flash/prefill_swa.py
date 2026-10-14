@@ -82,7 +82,7 @@ def prefill_swa(
     window_slots: pl.Tensor[[T_DYN], pl.INT64],
     window_indices: pl.Tensor[[T_DYN, 128], pl.INT32],
     window_cache: pl.Tensor[[ORI_BLOCKS_DYN, 128, 1, HEAD_DIM], pl.FP8E4M3FN],
-    window_cache_scale: pl.Tensor[[ORI_BLOCKS_DYN, 128, 1, HEAD_DIM // WINDOW_CACHE_GROUP], pl.FP8E8M0],
+    window_cache_scale: pl.Tensor[[ORI_BLOCKS_DYN, 128, 1, HEAD_DIM // WINDOW_CACHE_GROUP], pl.BF16],
     input_window: pld.DistributedTensor[[PREFILL_MAX_TOKENS, D], pl.BF16],
     input_arrived: pld.DistributedTensor[[TP_SIZE, 1], pl.INT32],
     output_window: pld.DistributedTensor[[PREFILL_MAX_TOKENS, D], pl.FP32],
@@ -242,7 +242,7 @@ def make_hc_program(capacity, world_size, epochs):
         window_slots: pl.Tensor[[T_DYN], pl.INT64],
         window_indices: pl.Tensor[[T_DYN, 128], pl.INT32],
         window_cache: pl.InOut[pl.Tensor[[ORI_BLOCKS_DYN, 128, 1, HEAD_DIM], pl.FP8E4M3FN]],
-        window_cache_scale: pl.InOut[pl.Tensor[[ORI_BLOCKS_DYN, 128, 1, HEAD_DIM // WINDOW_CACHE_GROUP], pl.FP8E8M0]],
+        window_cache_scale: pl.InOut[pl.Tensor[[ORI_BLOCKS_DYN, 128, 1, HEAD_DIM // WINDOW_CACHE_GROUP], pl.BF16]],
         output: pl.Out[pl.Tensor[[SP_T_DYN, HC_MULT, D], pl.FP32]],
         next_pre_mix: pl.Out[pl.Tensor[[SP_T_DYN, HC_MULT], pl.FP32]],
         hidden: pl.Out[pl.Tensor[[T_DYN, D], pl.BF16]],
@@ -296,7 +296,7 @@ def make_hc_program(capacity, world_size, epochs):
         window_slots: pl.Tensor[[world_size, T_DYN], pl.INT64],
         window_indices: pl.Tensor[[world_size, T_DYN, 128], pl.INT32],
         window_cache: pl.InOut[pl.Tensor[[world_size, ORI_BLOCKS_DYN, 128, 1, HEAD_DIM], pl.FP8E4M3FN]],
-        window_cache_scale: pl.InOut[pl.Tensor[[world_size, ORI_BLOCKS_DYN, 128, 1, HEAD_DIM // WINDOW_CACHE_GROUP], pl.FP8E8M0]],
+        window_cache_scale: pl.InOut[pl.Tensor[[world_size, ORI_BLOCKS_DYN, 128, 1, HEAD_DIM // WINDOW_CACHE_GROUP], pl.BF16]],
         output: pl.Out[pl.Tensor[[world_size, SP_T_DYN, HC_MULT, D], pl.FP32]],
         next_pre_mix: pl.Out[pl.Tensor[[world_size, SP_T_DYN, HC_MULT], pl.FP32]],
         hidden: pl.Out[pl.Tensor[[world_size, T_DYN, D], pl.BF16]],
@@ -367,7 +367,7 @@ def build_hc_specs(args):
     bf, fp, mx = torch.bfloat16, torch.float8_e4m3fn, torch.float8_e8m0fnu
     dtypes = (torch.float32, torch.float32, torch.float32, torch.float32, torch.float32, bf,
               fp, mx, bf, fp, mx, fp, mx, bf, torch.float32, bf, fp, mx,
-              torch.float32, torch.float32, torch.int64, torch.int32, fp, mx)
+              torch.float32, torch.float32, torch.int64, torch.int32, fp, bf)
     values = {}
 
     def initialize(name):

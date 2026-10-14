@@ -63,7 +63,7 @@ def publish_window(
     kv: pl.Tensor[[T_DYN, HEAD_DIM], pl.BF16],
     slots: pl.Tensor[[T_DYN], pl.INT64],
     cache: pl.Tensor[[ORI_BLOCKS_DYN, 128, 1, HEAD_DIM], pl.FP8E4M3FN],
-    scales: pl.Tensor[[ORI_BLOCKS_DYN, 128, 1, HEAD_DIM // 32], pl.FP8E8M0],
+    scales: pl.Tensor[[ORI_BLOCKS_DYN, 128, 1, HEAD_DIM // 32], pl.BF16],
     num_tokens: pl.Scalar[pl.INT32],
     cache_ready: pl.Scalar[pl.TASK_ID],
 ):
@@ -80,16 +80,10 @@ def publish_window(
             source = pl.set_validshape(pl.fillpad(source, pad_value=pl.PadValue.zero), 1, HEAD_DIM * 2)
             value = pl.reshape(pl.cast(source, pl.FP32), [HEAD_DIM // 16, 32])
             amax = pl.maximum(pl.row_max(pl.abs(value)), 1e-4)
-            raw = pl.mul(amax, 1.0 / 448.0)
-            bits = pl.reinterpret_view(raw, pl.INT32)
-            exponent = pl.shrs(pl.add(bits, 8388607), 23)
-            scale = pl.reinterpret_view(pl.shls(exponent, 23), pl.FP32)
-            payload = pl.cast(pl.row_expand_div(value, scale), pl.FP8E4M3FN, mode="rint")
+            scale = pl.cast(pl.mul(amax, 1.0 / 448.0), pl.BF16, mode="rint")
+            payload = pl.cast(pl.row_expand_div(value, pl.cast(scale, pl.FP32)), pl.FP8E4M3FN, mode="rint")
             flat[slot:slot + 1, :] = pl.set_validshape(pl.reshape(payload, [1, HEAD_DIM * 2]), 1, HEAD_DIM)
-            signed_exponent = pl.sub(exponent, pl.mul(pl.shrs(exponent, 7), 256))
-            codes = pl.cast(signed_exponent, pl.INT8)
-            encoded = pl.reinterpret_view(pl.reinterpret_view(codes, pl.UINT8), pl.FP8E8M0)
-            scale_flat[slot:slot + 1, :] = pl.set_validshape(pl.reshape(encoded, [1, HEAD_DIM // 16]),
+            scale_flat[slot:slot + 1, :] = pl.set_validshape(pl.reshape(scale, [1, HEAD_DIM // 16]),
                                                          1, HEAD_DIM // 32)
     return cache, scales
 
@@ -97,7 +91,7 @@ def publish_window(
 @pl.jit.inline
 def gather_window(
     cache: pl.Tensor[[ORI_BLOCKS_DYN, 128, 1, HEAD_DIM], pl.FP8E4M3FN],
-    scales: pl.Tensor[[ORI_BLOCKS_DYN, 128, 1, HEAD_DIM // 32], pl.FP8E8M0],
+    scales: pl.Tensor[[ORI_BLOCKS_DYN, 128, 1, HEAD_DIM // 32], pl.BF16],
     indices: pl.Tensor[[T_DYN, 128], pl.INT32],
     selected: pl.Tensor[[T_DYN, 128, HEAD_DIM], pl.BF16],
     num_tokens: pl.Scalar[pl.INT32],
@@ -118,12 +112,8 @@ def gather_window(
             if row_i32 >= 0:
                 row = pl.cast(row_i32, pl.INDEX)
                 value = pl.reshape(pl.cast(flat[row:row + 1, :], pl.FP32), [HEAD_DIM // 32, 32])
-                scale_row = pl.slice(scale_flat, [1, 32], [row, 0], valid_shape=[1, HEAD_DIM // 32])
-                raw_codes = pl.reinterpret_view(scale_row, pl.UINT8)
-                signed_codes = pl.cast(pl.reinterpret_view(raw_codes, pl.INT8), pl.INT32)
-                codes = pl.ands(signed_codes, 255)
-                scale_values = pl.reinterpret_view(pl.maximum(pl.shls(codes, 23), 4194304), pl.FP32)
-                scale = pl.reshape(scale_values[:, :HEAD_DIM // 32], [HEAD_DIM // 32, 1])
+                scale_row = pl.slice(scale_flat, [1, HEAD_DIM // 32], [row, 0])
+                scale = pl.reshape(pl.cast(scale_row, pl.FP32), [HEAD_DIM // 32, 1])
                 decoded = pl.cast(pl.row_expand_mul(value, scale), pl.BF16, mode="rint")
                 gathered[dst:dst + 1, :] = pl.reshape(decoded, [1, HEAD_DIM])
             else:
@@ -251,7 +241,7 @@ def decode_swa_partial(
     window_slots: pl.Tensor[[T_DYN], pl.INT64],
     window_indices: pl.Tensor[[T_DYN, 128], pl.INT32],
     window_cache: pl.Tensor[[ORI_BLOCKS_DYN, 128, 1, HEAD_DIM], pl.FP8E4M3FN],
-    window_cache_scale: pl.Tensor[[ORI_BLOCKS_DYN, 128, 1, HEAD_DIM // WINDOW_CACHE_GROUP], pl.FP8E8M0],
+    window_cache_scale: pl.Tensor[[ORI_BLOCKS_DYN, 128, 1, HEAD_DIM // WINDOW_CACHE_GROUP], pl.BF16],
     output: pl.Tensor[[T_DYN, D], pl.FP32],
     num_tokens: pl.Scalar[pl.INT32],
     cache_ready: pl.Scalar[pl.TASK_ID],
@@ -298,7 +288,7 @@ def make_decode_attn_swa(output_reduce=None):
         window_slots: pl.Tensor[[T_DYN], pl.INT64],
         window_indices: pl.Tensor[[T_DYN, 128], pl.INT32],
         window_cache: pl.Tensor[[ORI_BLOCKS_DYN, 128, 1, HEAD_DIM], pl.FP8E4M3FN],
-        window_cache_scale: pl.Tensor[[ORI_BLOCKS_DYN, 128, 1, HEAD_DIM // WINDOW_CACHE_GROUP], pl.FP8E8M0],
+        window_cache_scale: pl.Tensor[[ORI_BLOCKS_DYN, 128, 1, HEAD_DIM // WINDOW_CACHE_GROUP], pl.BF16],
         output_window: pld.DistributedTensor[[DECODE_MAX_TOKENS, D], pl.FP32],
         output_arrived: pld.DistributedTensor[[TP_SIZE, 1], pl.INT32],
         output: pl.Tensor[[OUTPUT_T_DYN, D], pl.BF16],
@@ -344,6 +334,15 @@ def official_quantize(value):
     return payload, (exponent + 127).to(torch.uint8)
 
 
+def official_quantize_cache(value):
+    """Window-cache MXFP8 publish: E4M3 payload and group-32 BF16 scale (amax / 448)."""
+    groups = value.float().unflatten(-1, (-1, 32))
+    maximum = groups.abs().amax(-1).clamp_min(1e-4)
+    scale = (maximum * (1.0 / 448.0)).to(torch.bfloat16)
+    payload = (groups / scale.float()[..., None]).clamp(-448, 448).to(torch.float8_e4m3fn).flatten(-2)
+    return payload, scale
+
+
 def official_linear(x, weight, packed_scale, fp32=False):
     """Match official FP8 GEMM's group-32 product, A scale, B scale, FP32 sum."""
     payload, codes = official_quantize(x)
@@ -385,7 +384,7 @@ def official_reference(tensors):
     group_in = t["wo_a"].shape[-1]
     def norm(x, weight):
         value = x.float()
-        return (value * torch.rsqrt(value.square().mean(-1, keepdim=True) + 1e-20)
+        return (value * torch.rsqrt(value.square().mean(-1, keepdim=True) + C.FLASH.rms_norm_eps)
                 * weight.float()).to(torch.bfloat16)
 
     qr = norm(official_linear(t["x"], t["wq_a"], t["wq_a_scale"]), t["q_norm_weight"])
@@ -393,14 +392,14 @@ def official_reference(tensors):
     q = official_rope(q, t["rope_cos"], t["rope_sin"])
     kv = norm(official_linear(t["x"], t["wkv"], t["wkv_scale"]), t["kv_norm_weight"])
     kv = official_rope(kv, t["rope_cos"], t["rope_sin"])
-    payload, scales = official_quantize(kv)
+    payload, scales = official_quantize_cache(kv)
     cache = t["window_cache"].clone()
     cache_scale = t["window_cache_scale"].clone()
     slots = t["window_slots"].long()
     valid_slots = slots >= 0
     cache.view(torch.uint8).reshape(-1, head_dim)[slots[valid_slots]] = payload.view(torch.uint8)[valid_slots]
-    cache_scale.view(torch.uint8).reshape(-1, head_dim // 32)[slots[valid_slots]] = scales[valid_slots]
-    values = cache.float() * decode_e8m0(cache_scale).repeat_interleave(32, -1)
+    cache_scale.reshape(-1, head_dim // 32)[slots[valid_slots]] = scales[valid_slots]
+    values = cache.float() * cache_scale.float().repeat_interleave(32, -1)
     idx = t["window_indices"].long()
     selected = values.reshape(-1, head_dim)[idx.clamp_min(0)].to(torch.bfloat16)
     selected = selected.masked_fill((idx < 0)[..., None], 0)
@@ -461,13 +460,13 @@ def make_inputs(batch=32, seed=17, position=127):
         length = min(pos + 1, 128)
         logical = torch.arange(pos - length + 1, pos + 1)
         indices[row, :length] = (physical[row] * 128 + logical.remainder(128)).to(torch.int32)
-    cache, cache_scale = official_quantize(rand(batch + 1, 128, 1, C.HEAD_DIM).to(torch.bfloat16))
+    cache, cache_scale = official_quantize_cache(rand(batch + 1, 128, 1, C.HEAD_DIM).to(torch.bfloat16))
     values = (rand(batch, C.D).to(torch.bfloat16), qa, qas,
               (rand(C.Q_LORA) * 0.1 + 1).to(torch.bfloat16), qb, qbs, kv, kvs,
               (rand(C.HEAD_DIM) * 0.1 + 1).to(torch.bfloat16), rand(C.LOCAL_H) * 2,
               (rand(C.LOCAL_O_GROUPS, C.O_LORA, C.O_GROUP_IN) / math.sqrt(C.O_GROUP_IN)).to(torch.bfloat16),
               ob, obs, angles.cos(), angles.sin(), slots, indices, cache,
-              cache_scale.view(torch.float8_e8m0fnu))
+              cache_scale)
     return dict(zip(INPUT_NAMES, values))
 
 
@@ -506,11 +505,11 @@ def make_packed_inputs(tokens=257, requests=4, seed=17, case="mixed"):
         assert indices[row, :len(expected)].tolist() == expected
         assert (indices[row, len(expected):] == -1).all()
     angles = positions.float()[:, None] * (10000.0 ** (-torch.arange(0, 64, 2).float() / 64))
-    cache, scales = official_quantize(torch.randn(len(mappings) + 1, 128, 1, 512, generator=gen).bfloat16())
+    cache, scales = official_quantize_cache(torch.randn(len(mappings) + 1, 128, 1, 512, generator=gen).bfloat16())
     values.update(x=torch.randn(tokens, 5120, generator=gen).bfloat16(),
                   rope_cos=angles.cos(), rope_sin=angles.sin(),
                   window_slots=slots, window_indices=indices,
-                  window_cache=cache, window_cache_scale=scales.view(torch.float8_e8m0fnu))
+                  window_cache=cache, window_cache_scale=scales)
     if case == "shuffle":
         order = torch.randperm(tokens, generator=gen)
         for name in ("x", "rope_cos", "rope_sin", "window_slots", "window_indices"):
@@ -548,7 +547,7 @@ def compare_output(actual, expected, **kwargs):
 
 def compare_scales(actual, expected, **kwargs):
     equal = torch.equal(actual.view(torch.uint8), expected.view(torch.uint8))
-    return equal, "E8M0 scale bytes differ"
+    return equal, "window scale bytes differ"
 
 
 def compare_cache(actual, expected, *, actual_outputs, expected_outputs, inputs, **kwargs):
@@ -562,8 +561,8 @@ def compare_cache(actual, expected, *, actual_outputs, expected_outputs, inputs,
         return False, "Unmapped cache payload bytes were modified"
     af = actual.float().reshape(-1, C.HEAD_DIM)[rows]
     ef = expected.float().reshape(-1, C.HEAD_DIM)[rows]
-    actual_scale = decode_e8m0(actual_outputs["window_cache_scale"]).reshape(-1, C.HEAD_DIM // 32)
-    expected_scale = decode_e8m0(expected_outputs["window_cache_scale"]).reshape(-1, C.HEAD_DIM // 32)
+    actual_scale = actual_outputs["window_cache_scale"].float().reshape(-1, C.HEAD_DIM // 32)
+    expected_scale = expected_outputs["window_cache_scale"].float().reshape(-1, C.HEAD_DIM // 32)
     af *= actual_scale[rows].repeat_interleave(32, -1)
     ef *= expected_scale[rows].repeat_interleave(32, -1)
     rel = (af - ef).norm() / ef.norm().clamp_min(1e-12)
@@ -594,7 +593,7 @@ def make_program(operator, capacity, world_size, epochs):
         window_slots: pl.Tensor[[T_DYN], pl.INT64],
         window_indices: pl.Tensor[[T_DYN, 128], pl.INT32],
         window_cache: pl.InOut[pl.Tensor[[ORI_BLOCKS_DYN, 128, 1, HEAD_DIM], pl.FP8E4M3FN]],
-        window_cache_scale: pl.InOut[pl.Tensor[[ORI_BLOCKS_DYN, 128, 1, HEAD_DIM // WINDOW_CACHE_GROUP], pl.FP8E8M0]],
+        window_cache_scale: pl.InOut[pl.Tensor[[ORI_BLOCKS_DYN, 128, 1, HEAD_DIM // WINDOW_CACHE_GROUP], pl.BF16]],
         output: pl.Out[pl.Tensor[[T_DYN, D], pl.BF16]],
         output_window: pld.DistributedTensor[[capacity, D], pl.FP32],
         output_arrived: pld.DistributedTensor[[TP_SIZE, 1], pl.INT32],
@@ -634,7 +633,7 @@ def make_program(operator, capacity, world_size, epochs):
         window_slots: pl.Tensor[[world_size, T_DYN], pl.INT64],
         window_indices: pl.Tensor[[world_size, T_DYN, 128], pl.INT32],
         window_cache: pl.InOut[pl.Tensor[[world_size, ORI_BLOCKS_DYN, 128, 1, HEAD_DIM], pl.FP8E4M3FN]],
-        window_cache_scale: pl.InOut[pl.Tensor[[world_size, ORI_BLOCKS_DYN, 128, 1, HEAD_DIM // WINDOW_CACHE_GROUP], pl.FP8E8M0]],
+        window_cache_scale: pl.InOut[pl.Tensor[[world_size, ORI_BLOCKS_DYN, 128, 1, HEAD_DIM // WINDOW_CACHE_GROUP], pl.BF16]],
         output: pl.Out[pl.Tensor[[world_size, T_DYN, D], pl.BF16]],
         num_tokens: pl.Scalar[pl.INT32],
         attention_epoch: pl.Scalar[pl.INT32],
@@ -688,7 +687,7 @@ def build_specs(args, mode):
     )
     bf, fp, mx = torch.bfloat16, torch.float8_e4m3fn, torch.float8_e8m0fnu
     dtypes = (bf, fp, mx, bf, fp, mx, fp, mx, bf, torch.float32, bf, fp, mx,
-              torch.float32, torch.float32, torch.int64, torch.int32, fp, mx)
+              torch.float32, torch.float32, torch.int64, torch.int32, fp, bf)
     values = {}
 
     def initialize(name):

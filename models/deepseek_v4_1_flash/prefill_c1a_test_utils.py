@@ -172,12 +172,11 @@ def make_fixture_values(token_count: int, case_name: str) -> dict[str, torch.Ten
 
     window_value = torch.randn(cache_blocks, CASE_PAGE, 1, C.HEAD_DIM).mul_(0.05)
     window_cache, window_cache_scale = quantize_mxfp8_cache(window_value)
-    window_cache_scale = window_cache_scale.view(torch.float8_e8m0fnu)
     compressed_value = torch.randn(cache_blocks, CASE_PAGE, 1, C.HEAD_DIM).mul_(0.05)
     compressed_cache, compressed_cache_scale = quantize_mxfp4_cache(
         compressed_value,
         group_size=C.COMPRESSED_CACHE_GROUP,
-        scale_format="e4m3",
+        scale_format="bf16",
     )
     index_value = torch.randn(cache_blocks, CASE_PAGE, 1, C.INDEX_DIM).mul_(0.05)
     index_cache, index_cache_scale = quantize_mxfp4_cache(
@@ -576,7 +575,7 @@ def _selected_output_reference(
         window = dequantize_mxfp8_cache(tensor("window_cache"), tensor("window_cache_scale"))
         compressed = dequantize_mxfp4_cache(
             tensor("compressed_cache"), tensor("compressed_cache_scale"),
-            group_size=C.COMPRESSED_CACHE_GROUP, scale_format="e4m3",
+            group_size=C.COMPRESSED_CACHE_GROUP, scale_format="bf16",
         )
         attended = golden_prefill_c1a_attention(
             query, window.to(query.dtype), tensor("window_indices")[:active],

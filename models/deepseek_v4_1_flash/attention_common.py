@@ -301,7 +301,7 @@ def golden_compressed_attention(
     compressed_payload = compressed_cache
     updated_compressed_scale = compressed_cache_scale
     quantized_compressed = dequantize_mxfp4_cache(
-        compressed_cache, compressed_cache_scale, group_size=16, scale_format="e4m3"
+        compressed_cache, compressed_cache_scale, group_size=16, scale_format="bf16"
     ).to(query.dtype)
     index_payload = index_cache
     updated_index_scale = index_cache_scale
@@ -350,13 +350,13 @@ def golden_compressed_attention(
             compressed_cache_scale,
             rotated_latent,
             publish_slots,
-            lambda value: quantize_mxfp4_cache(value, group_size=16, scale_format="e4m3"),
+            lambda value: quantize_mxfp4_cache(value, group_size=16, scale_format="bf16"),
         )
         quantized_compressed = dequantize_mxfp4_cache(
             compressed_payload,
             updated_compressed_scale,
             group_size=16,
-            scale_format="e4m3",
+            scale_format="bf16",
         ).to(query.dtype)
         if index_wk is None or index_norm_weight is None:
             raise ValueError("full mode requires index-key weights")

@@ -71,13 +71,13 @@ from models.deepseek_v4_1_flash.decode_attn_c2a_full import (
     official_linear,
     official_norm,
     official_quantize,
+    official_quantize_cache,
     official_reference_c2a,
     official_rope,
 )
 from models.deepseek_v4_1_flash.decode_attn_swa import publish_window
 from models.deepseek_v4_1_flash.o_proj import o_proj
 from models.deepseek_v4_1_flash.qkv_proj_rope import qkv_proj_rope
-from models.deepseek_v4_1_flash.quantization import decode_e8m0
 
 
 def make_c2a_reuse_partial(qkv_operator=qkv_proj_rope, output_operator=o_proj, attention_operator=attend_sparse):
@@ -102,9 +102,9 @@ def make_c2a_reuse_partial(qkv_operator=qkv_proj_rope, output_operator=o_proj, a
         window_slots: pl.Tensor[[T_DYN], pl.INT64],
         window_indices: pl.Tensor[[T_DYN, 128], pl.INT32],
         window_cache: pl.Tensor[[ORI_BLOCKS_DYN, 128, 1, HEAD_DIM], pl.FP8E4M3FN],
-        window_cache_scale: pl.Tensor[[ORI_BLOCKS_DYN, 128, 1, HEAD_DIM // 32], pl.FP8E8M0],
+        window_cache_scale: pl.Tensor[[ORI_BLOCKS_DYN, 128, 1, HEAD_DIM // 32], pl.BF16],
         compressed_cache: pl.Tensor[[CMP_BLOCKS_DYN, 128, 1, CMP_PACKED], pl.UINT8],
-        compressed_cache_scale: pl.Tensor[[CMP_BLOCKS_DYN, 128, 1, CMP_SCALES], pl.FP8E4M3FN],
+        compressed_cache_scale: pl.Tensor[[CMP_BLOCKS_DYN, 128, 1, CMP_SCALES], pl.BF16],
         compressed_indices: pl.Tensor[[T_DYN, INDEX_TOPK], pl.INT32],
         partial: pl.Tensor[[T_DYN, D], pl.FP32],
         num_tokens: pl.Scalar[pl.INT32],
@@ -184,18 +184,18 @@ def official_reference_c2a_reuse(inputs: dict, *, fp32_output=False) -> dict:
 
     window_cache = t["window_cache"].clone()
     window_cache_scale = t["window_cache_scale"].clone()
-    window_payload, window_codes = official_quantize(kv)
+    window_payload, window_scales = official_quantize_cache(kv)
     window_slots = t["window_slots"].long()
     window_valid = window_slots >= 0
     window_rows = window_slots[window_valid]
     _write_rows(window_cache, window_rows, window_payload[window_valid], head_dim)
-    _write_rows(window_cache_scale, window_rows, window_codes[window_valid], head_dim // MX_GROUP)
+    window_cache_scale.reshape(-1, head_dim // MX_GROUP)[window_rows] = window_scales[window_valid]
 
     window_values = (
-        window_cache.float() * decode_e8m0(window_cache_scale).repeat_interleave(MX_GROUP, -1)
+        window_cache.float() * window_cache_scale.float().repeat_interleave(MX_GROUP, -1)
     ).reshape(-1, head_dim)
     compressed_values = _flat_cache_rows(
-        t["compressed_cache"], t["compressed_cache_scale"], CMP_GROUP, "e4m3"
+        t["compressed_cache"], t["compressed_cache_scale"], CMP_GROUP, "bf16"
     )
     window_indices = t["window_indices"].long()
     compressed_indices = t["compressed_indices"].long()
@@ -366,10 +366,10 @@ def make_decode_attn_c2a_reuse(output_reduce=None):
         window_slots: pl.Tensor[[C.T_DYN], pl.INT64],
         window_indices: pl.Tensor[[C.T_DYN, 128], pl.INT32],
         window_cache: pl.Tensor[[C.ORI_BLOCKS_DYN, 128, 1, C.HEAD_DIM], pl.FP8E4M3FN],
-        window_cache_scale: pl.Tensor[[C.ORI_BLOCKS_DYN, 128, 1, C.HEAD_DIM // C.WINDOW_CACHE_GROUP], pl.FP8E8M0],
+        window_cache_scale: pl.Tensor[[C.ORI_BLOCKS_DYN, 128, 1, C.HEAD_DIM // C.WINDOW_CACHE_GROUP], pl.BF16],
         compressed_cache: pl.Tensor[[C.CMP_BLOCKS_DYN, 128, 1, C.HEAD_DIM // 2], pl.UINT8],
         compressed_cache_scale: pl.Tensor[
-            [C.CMP_BLOCKS_DYN, 128, 1, C.HEAD_DIM // C.COMPRESSED_CACHE_GROUP], pl.FP8E4M3FN
+            [C.CMP_BLOCKS_DYN, 128, 1, C.HEAD_DIM // C.COMPRESSED_CACHE_GROUP], pl.BF16
         ],
         compressed_indices: pl.Tensor[[C.T_DYN, C.INDEX_TOPK], pl.INT32],
         output_window: pld.DistributedTensor[[C.DECODE_MAX_TOKENS, C.D], pl.FP32],
@@ -470,9 +470,9 @@ def make_program(operator, capacity, world_size, epochs):
         window_slots: pl.Tensor[[C.T_DYN], pl.INT64],
         window_indices: pl.Tensor[[C.T_DYN, 128], pl.INT32],
         window_cache: pl.InOut[pl.Tensor[[C.ORI_BLOCKS_DYN, 128, 1, C.HEAD_DIM], pl.FP8E4M3FN]],
-        window_cache_scale: pl.InOut[pl.Tensor[[C.ORI_BLOCKS_DYN, 128, 1, C.HEAD_DIM // C.WINDOW_CACHE_GROUP], pl.FP8E8M0]],
+        window_cache_scale: pl.InOut[pl.Tensor[[C.ORI_BLOCKS_DYN, 128, 1, C.HEAD_DIM // C.WINDOW_CACHE_GROUP], pl.BF16]],
         compressed_cache: pl.Tensor[[C.CMP_BLOCKS_DYN, 128, 1, CMP_PACKED], pl.UINT8],
-        compressed_cache_scale: pl.Tensor[[C.CMP_BLOCKS_DYN, 128, 1, CMP_SCALES], pl.FP8E4M3FN],
+        compressed_cache_scale: pl.Tensor[[C.CMP_BLOCKS_DYN, 128, 1, CMP_SCALES], pl.BF16],
         compressed_indices: pl.Tensor[[C.T_DYN, C.INDEX_TOPK], pl.INT32],
         output: pl.InOut[pl.Tensor[[C.T_DYN, C.D], pl.BF16]],
         output_window: pld.DistributedTensor[[capacity, C.D], pl.FP32],
@@ -516,9 +516,9 @@ def make_program(operator, capacity, world_size, epochs):
         window_slots: pl.Tensor[[world_size, C.T_DYN], pl.INT64],
         window_indices: pl.Tensor[[world_size, C.T_DYN, 128], pl.INT32],
         window_cache: pl.InOut[pl.Tensor[[world_size, C.ORI_BLOCKS_DYN, 128, 1, C.HEAD_DIM], pl.FP8E4M3FN]],
-        window_cache_scale: pl.InOut[pl.Tensor[[world_size, C.ORI_BLOCKS_DYN, 128, 1, C.HEAD_DIM // C.WINDOW_CACHE_GROUP], pl.FP8E8M0]],
+        window_cache_scale: pl.InOut[pl.Tensor[[world_size, C.ORI_BLOCKS_DYN, 128, 1, C.HEAD_DIM // C.WINDOW_CACHE_GROUP], pl.BF16]],
         compressed_cache: pl.Tensor[[world_size, C.CMP_BLOCKS_DYN, 128, 1, CMP_PACKED], pl.UINT8],
-        compressed_cache_scale: pl.Tensor[[world_size, C.CMP_BLOCKS_DYN, 128, 1, CMP_SCALES], pl.FP8E4M3FN],
+        compressed_cache_scale: pl.Tensor[[world_size, C.CMP_BLOCKS_DYN, 128, 1, CMP_SCALES], pl.BF16],
         compressed_indices: pl.Tensor[[world_size, C.T_DYN, C.INDEX_TOPK], pl.INT32],
         output: pl.InOut[pl.Tensor[[world_size, C.T_DYN, C.D], pl.BF16]],
         num_tokens: pl.Scalar[pl.INT32],
@@ -577,14 +577,15 @@ def compare_owned_cache(name, initial_cache):
         source = initial_cache[name].contiguous().view(torch.uint8)
         written = actual.contiguous().view(torch.uint8)
         width = actual.shape[-1]
+        byte_width = width * actual.element_size()
         for rank in range(actual.shape[0]):
             rows = slots[rank].long()
             rows = rows[rows >= 0]
             untouched = torch.ones(actual[rank].numel() // width, dtype=torch.bool)
             untouched[rows] = False
             if not torch.equal(
-                written[rank].reshape(-1, width)[untouched],
-                source[rank].reshape(-1, width)[untouched],
+                written[rank].reshape(-1, byte_width)[untouched],
+                source[rank].reshape(-1, byte_width)[untouched],
             ):
                 return False, f"{name}: unmapped bytes differ from the input on rank {rank}"
         return shared_compare(actual, expected, inputs={**inputs, "window_slots": slots}, **kwargs)
@@ -620,9 +621,9 @@ def input_metadata(tokens, requests, active, case, mode):
         ("window_slots", [tokens], torch.int64),
         ("window_indices", [tokens, C.FLASH.sliding_window], torch.int32),
         ("window_cache", [window_pages, C.BLOCK_SIZE, 1, HEAD_DIM], fp),
-        ("window_cache_scale", [window_pages, C.BLOCK_SIZE, 1, HEAD_DIM // C.WINDOW_CACHE_GROUP], mx),
+        ("window_cache_scale", [window_pages, C.BLOCK_SIZE, 1, HEAD_DIM // C.WINDOW_CACHE_GROUP], bf),
         ("compressed_cache", [compressed_pages, C.BLOCK_SIZE, 1, CMP_PACKED], torch.uint8),
-        ("compressed_cache_scale", [compressed_pages, C.BLOCK_SIZE, 1, CMP_SCALES], fp),
+        ("compressed_cache_scale", [compressed_pages, C.BLOCK_SIZE, 1, CMP_SCALES], bf),
         ("compressed_indices", [tokens, INDEX_TOPK], torch.int32),
     )
 

@@ -57,7 +57,7 @@ def prefill_publish_window(
     kv: pl.Tensor[[T_DYN, HEAD_DIM], pl.BF16],
     slots: pl.Tensor[[T_DYN], pl.INT64],
     cache: pl.Tensor[[ORI_BLOCKS_DYN, 128, 1, HEAD_DIM], pl.FP8E4M3FN],
-    scales: pl.Tensor[[ORI_BLOCKS_DYN, 128, 1, HEAD_DIM // 32], pl.FP8E8M0],
+    scales: pl.Tensor[[ORI_BLOCKS_DYN, 128, 1, HEAD_DIM // 32], pl.BF16],
     num_tokens: pl.Scalar[pl.INT32],
     cache_ready: pl.Scalar[pl.TASK_ID],
 ):
@@ -75,24 +75,17 @@ def prefill_publish_window(
                 source = pl.set_validshape(pl.fillpad(source, pad_value=pl.PadValue.zero), 1, HEAD_DIM * 2)
                 value = pl.reshape(pl.cast(source, pl.FP32), [HEAD_DIM // 16, 32])
                 amax = pl.maximum(pl.row_max(pl.abs(value)), 1e-4)
-                raw = pl.mul(amax, 1.0 / 448.0)
-                bits = pl.reinterpret_view(raw, pl.INT32)
-                exponent = pl.shrs(pl.add(bits, 8388607), 23)
-                scale = pl.reinterpret_view(pl.shls(exponent, 23), pl.FP32)
-                payload = pl.cast(pl.row_expand_div(value, scale), pl.FP8E4M3FN, mode="rint")
+                scale = pl.cast(pl.mul(amax, 1.0 / 448.0), pl.BF16, mode="rint")
+                payload = pl.cast(pl.row_expand_div(value, pl.cast(scale, pl.FP32)), pl.FP8E4M3FN, mode="rint")
                 flat[slot:slot + 1, :] = pl.set_validshape(pl.reshape(payload, [1, HEAD_DIM * 2]), 1, HEAD_DIM)
-                signed_exponent = pl.sub(exponent, pl.mul(pl.shrs(exponent, 7), 256))
-                codes = pl.cast(signed_exponent, pl.INT8)
-                encoded = pl.reinterpret_view(pl.reinterpret_view(codes, pl.UINT8), pl.FP8E8M0)
-                encoded_row = pl.reshape(encoded, [1, HEAD_DIM // 16])
-                scale_flat[slot:slot + 1, :] = pl.set_validshape(encoded_row, 1, HEAD_DIM // 32)
+                scale_flat[slot:slot + 1, :] = pl.set_validshape(pl.reshape(scale, [1, HEAD_DIM // 16]), 1, HEAD_DIM // 32)
     return publish_tid
 
 
 @pl.jit.inline
 def prefill_gather_window(
     cache: pl.Tensor[[ORI_BLOCKS_DYN, 128, 1, HEAD_DIM], pl.FP8E4M3FN],
-    scales: pl.Tensor[[ORI_BLOCKS_DYN, 128, 1, HEAD_DIM // 32], pl.FP8E8M0],
+    scales: pl.Tensor[[ORI_BLOCKS_DYN, 128, 1, HEAD_DIM // 32], pl.BF16],
     indices: pl.Tensor[[T_DYN, 128], pl.INT32],
     selected: pl.Tensor[[T_DYN, 128, HEAD_DIM], pl.BF16],
     num_tokens: pl.Scalar[pl.INT32],
@@ -115,10 +108,7 @@ def prefill_gather_window(
                     row = pl.cast(row_i32, pl.INDEX)
                     value = pl.reshape(pl.cast(flat[row:row + 1, :], pl.FP32), [HEAD_DIM // 32, 32])
                     scale_row = pl.slice(scale_flat, [1, 32], [row, 0], valid_shape=[1, HEAD_DIM // 32])
-                    raw_codes = pl.reinterpret_view(scale_row, pl.UINT8)
-                    signed_codes = pl.cast(pl.reinterpret_view(raw_codes, pl.INT8), pl.INT32)
-                    codes = pl.ands(signed_codes, 255)
-                    scale_values = pl.reinterpret_view(pl.maximum(pl.shls(codes, 23), 4194304), pl.FP32)
+                    scale_values = pl.cast(scale_row, pl.FP32)
                     scale = pl.reshape(scale_values[:, :HEAD_DIM // 32], [HEAD_DIM // 32, 1])
                     decoded = pl.cast(pl.row_expand_mul(value, scale), pl.BF16, mode="rint")
                     gathered[dst:dst + 1, :] = pl.reshape(decoded, [1, HEAD_DIM])
@@ -232,7 +222,7 @@ def prefill_attn_swa_partial(
     window_slots: pl.Tensor[[T_DYN], pl.INT64],
     window_indices: pl.Tensor[[T_DYN, 128], pl.INT32],
     window_cache: pl.Tensor[[ORI_BLOCKS_DYN, 128, 1, HEAD_DIM], pl.FP8E4M3FN],
-    window_cache_scale: pl.Tensor[[ORI_BLOCKS_DYN, 128, 1, HEAD_DIM // WINDOW_CACHE_GROUP], pl.FP8E8M0],
+    window_cache_scale: pl.Tensor[[ORI_BLOCKS_DYN, 128, 1, HEAD_DIM // WINDOW_CACHE_GROUP], pl.BF16],
     output_arrived: pld.DistributedTensor[[TP_SIZE, 1], pl.INT32],
     partial: pl.Tensor[[T_DYN, D], pl.FP32],
     num_tokens: pl.Scalar[pl.INT32],
@@ -312,7 +302,7 @@ def prefill_attn_swa(
     window_slots: pl.Tensor[[T_DYN], pl.INT64],
     window_indices: pl.Tensor[[T_DYN, 128], pl.INT32],
     window_cache: pl.Tensor[[ORI_BLOCKS_DYN, 128, 1, HEAD_DIM], pl.FP8E4M3FN],
-    window_cache_scale: pl.Tensor[[ORI_BLOCKS_DYN, 128, 1, HEAD_DIM // WINDOW_CACHE_GROUP], pl.FP8E8M0],
+    window_cache_scale: pl.Tensor[[ORI_BLOCKS_DYN, 128, 1, HEAD_DIM // WINDOW_CACHE_GROUP], pl.BF16],
     output_window: pld.DistributedTensor[[PREFILL_MAX_TOKENS, D], pl.FP32],
     output_arrived: pld.DistributedTensor[[TP_SIZE, 1], pl.INT32],
     output: pl.Tensor[[T_DYN, D], pl.BF16],

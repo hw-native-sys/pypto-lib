@@ -38,7 +38,7 @@ def _attention_values() -> dict[str, torch.Tensor | None]:
     index_wq_b, index_wq_b_scale = _mxfp8_weight(64, 64)
     window_cache, window_cache_scale = quantize_mxfp8_cache(torch.zeros(1, 128, 1, 64))
     compressed_cache, compressed_cache_scale = quantize_mxfp4_cache(
-        torch.randn(1, 128, 1, 64), group_size=16, scale_format="e4m3"
+        torch.randn(1, 128, 1, 64), group_size=16, scale_format="bf16"
     )
     index_cache, index_cache_scale = quantize_mxfp4_cache(
         torch.randn(1, 128, 1, 32), group_size=32, scale_format="e8m0"
@@ -109,7 +109,7 @@ def run_attention_golden(golden_fn: Callable[..., object], ratio: int, mode: str
         raise RuntimeError(f"attention golden produced {result.output.dtype}, expected torch.bfloat16")
     if (
         result.window_cache.dtype is not torch.float8_e4m3fn
-        or result.window_cache_scale.dtype is not torch.uint8
+        or result.window_cache_scale.dtype is not torch.bfloat16
     ):
         raise RuntimeError("attention golden did not preserve the MXFP8 window-cache ABI")
     if ratio:
@@ -117,9 +117,9 @@ def run_attention_golden(golden_fn: Callable[..., object], ratio: int, mode: str
             raise RuntimeError("attention golden did not preserve the packed MXFP4 compressed-cache ABI")
         if (
             result.compressed_cache_scale is None
-            or result.compressed_cache_scale.dtype is not torch.float8_e4m3fn
+            or result.compressed_cache_scale.dtype is not torch.bfloat16
         ):
-            raise RuntimeError("attention golden did not preserve the E4M3 compressed-cache scale ABI")
+            raise RuntimeError("attention golden did not preserve the BF16 compressed-cache scale ABI")
     if mode in ("full", "reindex"):
         if result.index_cache is None or result.index_cache.dtype is not torch.uint8:
             raise RuntimeError("attention golden did not preserve the packed MXFP4 index-cache ABI")

@@ -59,10 +59,10 @@ def prefill_c2a_reuse_sp(
     window_slots: pl.Tensor[[C.T_DYN], pl.INT64],
     window_indices: pl.Tensor[[C.T_DYN, 128], pl.INT32],
     window_cache: pl.Tensor[[C.ORI_BLOCKS_DYN, 128, 1, C.HEAD_DIM], pl.FP8E4M3FN],
-    window_cache_scale: pl.Tensor[[C.ORI_BLOCKS_DYN, 128, 1, C.HEAD_DIM // C.WINDOW_CACHE_GROUP], pl.FP8E8M0],
+    window_cache_scale: pl.Tensor[[C.ORI_BLOCKS_DYN, 128, 1, C.HEAD_DIM // C.WINDOW_CACHE_GROUP], pl.BF16],
     compressed_cache: pl.Tensor[[C.CMP_BLOCKS_DYN, 128, 1, C.HEAD_DIM // 2], pl.UINT8],
     compressed_cache_scale: pl.Tensor[
-        [C.CMP_BLOCKS_DYN, 128, 1, C.HEAD_DIM // C.COMPRESSED_CACHE_GROUP], pl.FP8E4M3FN
+        [C.CMP_BLOCKS_DYN, 128, 1, C.HEAD_DIM // C.COMPRESSED_CACHE_GROUP], pl.BF16
     ],
     compressed_indices: pl.Tensor[[C.T_DYN, C.INDEX_TOPK], pl.INT32],
     input_window: pld.DistributedTensor[[C.PREFILL_MAX_TOKENS, C.D], pl.BF16],
@@ -136,10 +136,10 @@ def prefill_c2a_reuse(
     window_slots: pl.Tensor[[C.T_DYN], pl.INT64],
     window_indices: pl.Tensor[[C.T_DYN, 128], pl.INT32],
     window_cache: pl.Tensor[[C.ORI_BLOCKS_DYN, 128, 1, C.HEAD_DIM], pl.FP8E4M3FN],
-    window_cache_scale: pl.Tensor[[C.ORI_BLOCKS_DYN, 128, 1, C.HEAD_DIM // C.WINDOW_CACHE_GROUP], pl.FP8E8M0],
+    window_cache_scale: pl.Tensor[[C.ORI_BLOCKS_DYN, 128, 1, C.HEAD_DIM // C.WINDOW_CACHE_GROUP], pl.BF16],
     compressed_cache: pl.Tensor[[C.CMP_BLOCKS_DYN, 128, 1, C.HEAD_DIM // 2], pl.UINT8],
     compressed_cache_scale: pl.Tensor[
-        [C.CMP_BLOCKS_DYN, 128, 1, C.HEAD_DIM // C.COMPRESSED_CACHE_GROUP], pl.FP8E4M3FN
+        [C.CMP_BLOCKS_DYN, 128, 1, C.HEAD_DIM // C.COMPRESSED_CACHE_GROUP], pl.BF16
     ],
     compressed_indices: pl.Tensor[[C.T_DYN, C.INDEX_TOPK], pl.INT32],
     output_window: pld.DistributedTensor[[C.PREFILL_MAX_TOKENS, C.D], pl.FP32],
@@ -201,10 +201,10 @@ def make_hc_program(capacity, world_size, epochs):
         window_indices: pl.Tensor[[C.T_DYN, 128], pl.INT32],
         window_cache: pl.InOut[pl.Tensor[[C.ORI_BLOCKS_DYN, 128, 1, C.HEAD_DIM], pl.FP8E4M3FN]],
         window_cache_scale: pl.InOut[
-            pl.Tensor[[C.ORI_BLOCKS_DYN, 128, 1, C.HEAD_DIM // C.WINDOW_CACHE_GROUP], pl.FP8E8M0]
+            pl.Tensor[[C.ORI_BLOCKS_DYN, 128, 1, C.HEAD_DIM // C.WINDOW_CACHE_GROUP], pl.BF16]
         ],
         compressed_cache: pl.Tensor[[C.CMP_BLOCKS_DYN, 128, 1, CMP_PACKED], pl.UINT8],
-        compressed_cache_scale: pl.Tensor[[C.CMP_BLOCKS_DYN, 128, 1, CMP_SCALES], pl.FP8E4M3FN],
+        compressed_cache_scale: pl.Tensor[[C.CMP_BLOCKS_DYN, 128, 1, CMP_SCALES], pl.BF16],
         compressed_indices: pl.Tensor[[C.T_DYN, C.INDEX_TOPK], pl.INT32],
         attn_input: pl.Out[pl.Tensor[[C.T_DYN, C.D], pl.BF16]],
         attn_output: pl.Out[pl.Tensor[[SP_T_DYN, C.D], pl.BF16]],
@@ -262,10 +262,10 @@ def make_hc_program(capacity, world_size, epochs):
         window_indices: pl.Tensor[[world_size, C.T_DYN, 128], pl.INT32],
         window_cache: pl.InOut[pl.Tensor[[world_size, C.ORI_BLOCKS_DYN, 128, 1, C.HEAD_DIM], pl.FP8E4M3FN]],
         window_cache_scale: pl.InOut[
-            pl.Tensor[[world_size, C.ORI_BLOCKS_DYN, 128, 1, C.HEAD_DIM // C.WINDOW_CACHE_GROUP], pl.FP8E8M0]
+            pl.Tensor[[world_size, C.ORI_BLOCKS_DYN, 128, 1, C.HEAD_DIM // C.WINDOW_CACHE_GROUP], pl.BF16]
         ],
         compressed_cache: pl.Tensor[[world_size, C.CMP_BLOCKS_DYN, 128, 1, CMP_PACKED], pl.UINT8],
-        compressed_cache_scale: pl.Tensor[[world_size, C.CMP_BLOCKS_DYN, 128, 1, CMP_SCALES], pl.FP8E4M3FN],
+        compressed_cache_scale: pl.Tensor[[world_size, C.CMP_BLOCKS_DYN, 128, 1, CMP_SCALES], pl.BF16],
         compressed_indices: pl.Tensor[[world_size, C.T_DYN, C.INDEX_TOPK], pl.INT32],
         attn_input: pl.Out[pl.Tensor[[world_size, C.T_DYN, C.D], pl.BF16]],
         attn_output: pl.Out[pl.Tensor[[world_size, SP_T_DYN, C.D], pl.BF16]],
