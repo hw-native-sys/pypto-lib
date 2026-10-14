@@ -873,6 +873,7 @@ def _torch_dtype(dtype):
         pl.FP32: torch.float32,
         pl.FP8E4M3FN: torch.float8_e4m3fn,
         pl.FP8E8M0: torch.float8_e8m0fnu,
+        pl.INT16: torch.int16,
         pl.INT32: torch.int32,
         pl.INT64: torch.int64,
         pl.UINT8: torch.uint8,
@@ -1125,6 +1126,32 @@ def _compare_moe_from_actual_attention(counts):
             actual_outputs=actual_outputs,
             inputs={"num_tokens": inputs["moe_num_tokens"]},
             **kwargs,
+        )
+
+    return compare
+
+
+def _compare_next_pre_mix_from_actual_attention(counts):
+    """Check mHC coefficients independently of accepted Attention error."""
+    from golden import ratio_allclose
+    from hc_mixes import golden_mhc_mixes
+
+    compare_mixes = _compare_active_rows_per_rank(
+        ratio_allclose(atol=2.5e-5, rtol=5e-3, max_error_ratio=0.03), counts,
+    )
+
+    def compare(actual, expected, *, actual_outputs, inputs, **kwargs):
+        conditioned = torch.zeros_like(expected)
+        for rank, active in enumerate(counts.tolist()):
+            if active:
+                pre, _, _ = golden_mhc_mixes(
+                    actual_outputs["attention_hidden"][rank, :active],
+                    inputs["hc_ffn_fn"][rank], inputs["hc_ffn_scale"][rank],
+                    inputs["hc_ffn_base"][rank],
+                )
+                conditioned[rank, :active] = pre
+        return compare_mixes(
+            actual, conditioned, actual_outputs=actual_outputs, inputs=inputs, **kwargs,
         )
 
     return compare
@@ -1401,10 +1428,7 @@ if __name__ == "__main__":
             ),
             "attention_pre_mix": ratio_allclose(atol=1e-4, rtol=1e-4),
             "gathered": ratio_allclose(atol=2 ** -6, rtol=2 ** -6),
-            "next_pre_mix": _compare_active_rows_per_rank(
-                ratio_allclose(atol=2.5e-5, rtol=5e-3, max_error_ratio=0.03),
-                counts,
-            ),
+            "next_pre_mix": _compare_next_pre_mix_from_actual_attention(counts),
             "x_mixed": _compare_active_rows_per_rank(
                 ratio_reldiff(diff_thd=0.01, pct_thd=0.05),
                 counts,

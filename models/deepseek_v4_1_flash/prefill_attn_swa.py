@@ -13,12 +13,27 @@ import pypto.language as pl
 import pypto.language.distributed as pld
 import torch
 
-from utils import AttentionGoldenResult
-from sparse_attention import golden_swa_attention
-from o_proj import prefill_tp_output_all_reduce
-from config import PREFILL_MAX_TOKENS, WINDOW_CACHE_GROUP, FLASH as M, ORI_BLOCKS_DYN, T_DYN, TP_SIZE
+from utils import AttentionGoldenResult, run_swa_validation
+from o_proj import make_prefill_tp_output_all_reduce
+from config import (
+    WINDOW_CACHE_GROUP,
+    FLASH as M,
+    ORI_BLOCKS_DYN,
+    T_DYN,
+    TP_SIZE,
+)
 
-from qkv_proj_rope import M_TILE
+from sparse_attention import (
+    SWA_RUN_DESCRIPTOR_WIDTH as RUN_DESCRIPTOR_WIDTH,
+    SWA_RUN_PARTS as RUN_PARTS,
+    analyze_index_runs,
+    attend_shared_cache,
+    decode_shared_cache_after_publish,
+    build_swa_leaf_specs,
+    golden_swa_attention,
+    golden_swa_leaf,
+    make_swa_program,
+)
 from o_proj import prefill_o_proj
 from qkv_proj_rope import (
     prefill_kv_proj_rope,
@@ -43,6 +58,11 @@ O_GROUP_IN = M.num_attention_heads * M.head_dim // M.o_groups
 QUERY_TILE = 128
 WORKER_TILE = 64
 
+# Communication capacity.
+PREFILL_MAX_TOKENS = 8192
+
+prefill_tp_output_all_reduce = make_prefill_tp_output_all_reduce(PREFILL_MAX_TOKENS)
+
 
 @pl.jit.inline
 def prefill_publish_window(
@@ -64,135 +84,23 @@ def prefill_publish_window(
             if slot_i64 >= 0:
                 slot = pl.cast(slot_i64, pl.INDEX)
                 source = pl.slice(kv, [1, HEAD_DIM * 2], [t, 0], valid_shape=[1, HEAD_DIM])
-                source = pl.set_validshape(pl.fillpad(source, pad_value=pl.PadValue.zero), 1, HEAD_DIM * 2)
-                value = pl.reshape(pl.cast(source, pl.FP32), [HEAD_DIM // 16, 32])
-                amax = pl.maximum(pl.row_max(pl.abs(value)), 1e-4)
-                scale = pl.cast(pl.mul(amax, 1.0 / 448.0), pl.BF16, mode="rint")
-                payload = pl.cast(pl.row_expand_div(value, pl.cast(scale, pl.FP32)), pl.FP8E4M3FN, mode="rint")
-                flat[slot:slot + 1, :] = pl.set_validshape(pl.reshape(payload, [1, HEAD_DIM * 2]), 1, HEAD_DIM)
-                scale_flat[slot:slot + 1, :] = pl.set_validshape(pl.reshape(scale, [1, HEAD_DIM // 16]), 1, HEAD_DIM // 32)
+                source_padded = pl.fillpad(source, pad_value=pl.PadValue.zero)
+                source = pl.set_validshape(source_padded, 1, HEAD_DIM * 2)
+                source_fp32 = pl.cast(source, pl.FP32)
+                value = pl.reshape(source_fp32, [HEAD_DIM // 16, 32])
+                absolute = pl.abs(value)
+                row_maximum = pl.row_max(absolute)
+                amax = pl.maximum(row_maximum, 1e-4)
+                raw_scale = pl.mul(amax, 1.0 / 448.0)
+                scale = pl.cast(raw_scale, pl.BF16, mode="rint")
+                scale_fp32 = pl.cast(scale, pl.FP32)
+                normalized = pl.row_expand_div(value, scale_fp32)
+                payload = pl.cast(normalized, pl.FP8E4M3FN, mode="rint")
+                payload_row = pl.reshape(payload, [1, HEAD_DIM * 2])
+                flat[slot:slot + 1, :] = pl.set_validshape(payload_row, 1, HEAD_DIM)
+                scale_row = pl.reshape(scale, [1, HEAD_DIM // 16])
+                scale_flat[slot:slot + 1, :] = pl.set_validshape(scale_row, 1, HEAD_DIM // 32)
     return publish_tid
-
-
-@pl.jit.inline
-def prefill_gather_window(
-    cache: pl.Tensor[[ORI_BLOCKS_DYN, 128, 1, HEAD_DIM], pl.FP8E4M3FN],
-    scales: pl.Tensor[[ORI_BLOCKS_DYN, 128, 1, HEAD_DIM // 32], pl.BF16],
-    indices: pl.Tensor[[T_DYN, 128], pl.INT32],
-    selected: pl.Tensor[[T_DYN, 128, HEAD_DIM], pl.BF16],
-    num_tokens: pl.Scalar[pl.INT32],
-):
-    blocks = pl.tensor.dim(cache, 0)
-    cache_rows = blocks * 128
-    flat = pl.reshape(cache, [cache_rows, HEAD_DIM])
-    scale_flat = pl.reshape(scales, [cache_rows, HEAD_DIM // 32])
-    tokens = pl.tensor.dim(selected, 0)
-    selected_rows = tokens * 128
-    gathered = pl.reshape(selected, [selected_rows, HEAD_DIM])
-    with pl.spmd(WORKER_TILE, name_hint="prefill_swa_cache_gather") as gather_tid:
-        worker = pl.tile.get_block_idx()
-        for block in pl.range(worker, num_tokens * 8, WORKER_TILE):
-            t = block // 8
-            for i in pl.range(block % 8 * 16, block % 8 * 16 + 16):
-                row_i32 = pl.read(indices, [t, i])
-                dst = t * 128 + i
-                if row_i32 >= 0:
-                    row = pl.cast(row_i32, pl.INDEX)
-                    value = pl.reshape(pl.cast(flat[row:row + 1, :], pl.FP32), [HEAD_DIM // 32, 32])
-                    scale_row = pl.slice(scale_flat, [1, 32], [row, 0], valid_shape=[1, HEAD_DIM // 32])
-                    scale_values = pl.cast(scale_row, pl.FP32)
-                    scale = pl.reshape(scale_values[:, :HEAD_DIM // 32], [HEAD_DIM // 32, 1])
-                    decoded = pl.cast(pl.row_expand_mul(value, scale), pl.BF16, mode="rint")
-                    gathered[dst:dst + 1, :] = pl.reshape(decoded, [1, HEAD_DIM])
-                else:
-                    gathered[dst:dst + 1, :] = pl.full([1, HEAD_DIM], dtype=pl.BF16, value=0.0)
-    return gather_tid
-
-
-SOFTMAX_SCALE = HEAD_DIM ** -0.5
-
-
-@pl.jit.inline
-def prefill_attend_window(
-    query: pl.Tensor[[T_DYN, LOCAL_H * HEAD_DIM], pl.BF16],
-    selected: pl.Tensor[[T_DYN, 128, HEAD_DIM], pl.BF16],
-    indices: pl.Tensor[[T_DYN, 128], pl.INT32],
-    sink: pl.Tensor[[LOCAL_H], pl.FP32],
-    output: pl.Tensor[[T_DYN, LOCAL_H * HEAD_DIM], pl.BF16],
-    num_tokens: pl.Scalar[pl.INT32],
-):
-    tokens = pl.tensor.dim(query, 0)
-    head_rows = tokens * LOCAL_H
-    cache_rows = tokens * 128
-    qflat = pl.reshape(query, [head_rows, HEAD_DIM])
-    kflat = pl.reshape(selected, [cache_rows, HEAD_DIM])
-    oflat = pl.reshape(output, [head_rows, HEAD_DIM])
-    for worker in pl.spmd(32, name_hint="prefill_swa_online_attention"):
-        for block in pl.range(worker, num_tokens * (LOCAL_H // M_TILE), 32):
-            t = block // (LOCAL_H // M_TILE)
-            h = block % (LOCAL_H // M_TILE) * M_TILE
-            q0 = t * LOCAL_H + h
-            maximum = pl.full([1, M_TILE], dtype=pl.FP32, value=-1e30)
-            denominator = pl.full([1, M_TILE], dtype=pl.FP32, value=0.0)
-            numerator = pl.full([M_TILE, HEAD_DIM], dtype=pl.FP32, value=0.0)
-            for part in pl.range(2):
-                k0 = t * 128 + part * 64
-                q = qflat[q0:q0 + M_TILE, :]
-                kv = kflat[k0:k0 + 64, :]
-                scores = pl.matmul(q, kv, b_trans=True)
-                scores = pl.mul(scores, SOFTMAX_SCALE)
-                idx = pl.cast(indices[t:t + 1, part * 64:part * 64 + 64], pl.FP32)
-                valid = pl.minimum(pl.maximum(pl.add(idx, 1.0), 0.0), 1.0)
-                bias = pl.mul(pl.sub(valid, 1.0), 1e30)
-                scores = pl.col_expand_add(scores, bias)
-                next_max = pl.maximum(maximum, pl.reshape(pl.row_max(scores), [1, M_TILE]))
-                correction = pl.exp(pl.sub(maximum, next_max))
-                shifted_scores = pl.row_expand_sub(scores, pl.reshape(next_max, [M_TILE, 1]))
-                probabilities = pl.col_expand_mul(pl.exp(shifted_scores), valid)
-                corrected_denominator = pl.mul(denominator, correction)
-                probability_sum = pl.reshape(pl.row_sum(probabilities), [1, M_TILE])
-                denominator = pl.add(corrected_denominator, probability_sum)
-                weights = pl.cast(probabilities, pl.BF16, mode="rint")
-                weighted = pl.matmul(weights, kv)
-                numerator = pl.add(pl.row_expand_mul(numerator, pl.reshape(correction, [M_TILE, 1])), weighted)
-                maximum = next_max
-            sinks = pl.reshape(sink[h:h + M_TILE], [1, M_TILE])
-            final_max = pl.maximum(maximum, sinks)
-            correction = pl.exp(pl.sub(maximum, final_max))
-            denominator = pl.add(pl.mul(denominator, correction), pl.exp(pl.sub(sinks, final_max)))
-            normalized_correction = pl.div(correction, denominator, high_precision=True)
-            result = pl.row_expand_mul(numerator, pl.reshape(normalized_correction, [M_TILE, 1]))
-            oflat[q0:q0 + M_TILE, :] = pl.cast(result, pl.BF16, mode="rint")
-    return output
-
-
-def golden_prefill_attn_swa(
-    x: torch.Tensor,
-    wq_a: torch.Tensor,
-    wq_a_scale: torch.Tensor,
-    q_norm_weight: torch.Tensor,
-    wq_b: torch.Tensor,
-    wq_b_scale: torch.Tensor,
-    wkv: torch.Tensor,
-    wkv_scale: torch.Tensor,
-    kv_norm_weight: torch.Tensor,
-    attn_sink: torch.Tensor,
-    wo_a: torch.Tensor,
-    wo_b: torch.Tensor,
-    wo_b_scale: torch.Tensor,
-    rope_cos: torch.Tensor,
-    rope_sin: torch.Tensor,
-    window_slots: torch.Tensor,
-    window_indices: torch.Tensor,
-    window_cache: torch.Tensor,
-    window_cache_scale: torch.Tensor,
-) -> AttentionGoldenResult:
-    return golden_swa_attention(
-        x, wq_a, wq_a_scale, q_norm_weight, wq_b, wq_b_scale,
-        wkv, wkv_scale, kv_norm_weight, attn_sink,
-        wo_a, wo_b, wo_b_scale, rope_cos, rope_sin,
-        window_slots, window_indices, window_cache, window_cache_scale,
-    )
 
 
 @pl.jit.inline(auto_scope=False)
@@ -234,10 +142,15 @@ def prefill_attn_swa_partial(
         for row in pl.range(worker, num_tokens, WORKER_TILE):
             kv_projection[row : row + 1, :] = pl.full([1, HEAD_DIM], dtype=pl.BF16, value=0.0)
     kv = pl.create_tensor([tokens, HEAD_DIM], dtype=pl.BF16)
-    prefill_kv_proj_rope(
-        x, wkv, wkv_scale, kv_norm_weight, rope_cos, rope_sin, kv_projection, kv, num_tokens
-    )
+    prefill_kv_proj_rope(x, wkv, wkv_scale, kv_norm_weight, rope_cos, rope_sin, kv_projection, kv, num_tokens)
     chunk_done = prefill_publish_window(kv, window_slots, window_cache, window_cache_scale, num_tokens, cache_ready)
+    cache_blocks = pl.tensor.dim(window_cache, 0)
+    cache_rows = cache_blocks * 128
+    decoded_cache = pl.create_tensor([cache_blocks, 128, 1, HEAD_DIM], dtype=pl.BF16)
+    zero_row = pl.create_tensor([32, HEAD_DIM], dtype=pl.BF16)
+    # Decode once for the entire packed prompt. The explicit publication
+    # dependency protects the hoisted reader independently of query staging.
+    decoded_ready = decode_shared_cache_after_publish(window_cache, window_cache_scale, decoded_cache, zero_row, chunk_done)
 
     chunk_x = pl.create_tensor([QUERY_TILE, D], dtype=pl.BF16)
     chunk_cos = pl.create_tensor([QUERY_TILE, ROPE_DIM // 2], dtype=pl.FP32)
@@ -245,7 +158,7 @@ def prefill_attn_swa_partial(
     chunk_indices = pl.create_tensor([QUERY_TILE, 128], dtype=pl.INT32)
     qr = pl.create_tensor([QUERY_TILE, Q_LORA], dtype=pl.BF16)
     q = pl.create_tensor([QUERY_TILE, LOCAL_H * HEAD_DIM], dtype=pl.BF16)
-    selected = pl.create_tensor([QUERY_TILE, 128, HEAD_DIM], dtype=pl.BF16)
+    descriptors = pl.create_tensor([QUERY_TILE, RUN_PARTS, RUN_DESCRIPTOR_WIDTH], dtype=pl.INT32)
     attended = pl.create_tensor([QUERY_TILE, LOCAL_H * HEAD_DIM], dtype=pl.BF16)
     chunk_partial = pl.create_tensor([QUERY_TILE, D], dtype=pl.FP32)
 
@@ -263,8 +176,12 @@ def prefill_attn_swa_partial(
                 chunk_indices[row:row + 1, :] = window_indices[source_row:source_row + 1, :]
         prefill_q_proj_qr(chunk_x, wq_a, wq_a_scale, q_norm_weight, qr, active)
         prefill_q_proj_rope(qr, wq_b, wq_b_scale, chunk_cos, chunk_sin, q, active)
-        prefill_gather_window(window_cache, window_cache_scale, chunk_indices, selected, active)
-        prefill_attend_window(q, selected, chunk_indices, attn_sink, attended, active)
+        index_ready = analyze_index_runs(chunk_indices, descriptors, active, cache_rows)
+        attend_shared_cache(
+            q, decoded_cache, zero_row,
+            descriptors, chunk_indices, attn_sink,
+            attended, active, decoded_ready, index_ready,
+        )
         prefill_o_proj(attended, wo_a, wo_b, wo_b_scale, chunk_cos, chunk_sin, chunk_partial, active)
         with pl.spmd(WORKER_TILE, name_hint="prefill_swa_collect") as collect_tid:
             worker = pl.tile.get_block_idx()
@@ -275,45 +192,98 @@ def prefill_attn_swa_partial(
     return partial
 
 
-@pl.jit.inline(auto_scope=False)
-def prefill_attn_swa(
-    x: pl.Tensor[[T_DYN, D], pl.BF16],
-    wq_a: pl.Tensor[[D, Q_LORA], pl.FP8E4M3FN],
-    wq_a_scale: pl.Tensor[[D // 32, Q_LORA], pl.FP8E8M0, pl.MX_B_NN],
-    q_norm_weight: pl.Tensor[[Q_LORA], pl.BF16],
-    wq_b: pl.Tensor[[Q_LORA, LOCAL_H * HEAD_DIM], pl.FP8E4M3FN],
-    wq_b_scale: pl.Tensor[[Q_LORA // 32, LOCAL_H * HEAD_DIM], pl.FP8E8M0, pl.MX_B_NN],
-    wkv: pl.Tensor[[D, HEAD_DIM], pl.FP8E4M3FN],
-    wkv_scale: pl.Tensor[[D // 32, HEAD_DIM], pl.FP8E8M0, pl.MX_B_NN],
-    kv_norm_weight: pl.Tensor[[HEAD_DIM], pl.BF16],
-    attn_sink: pl.Tensor[[LOCAL_H], pl.FP32],
-    wo_a: pl.Tensor[[LOCAL_O_GROUPS, O_LORA, O_GROUP_IN], pl.BF16],
-    wo_b: pl.Tensor[[LOCAL_O_WIDTH, D], pl.FP8E4M3FN],
-    wo_b_scale: pl.Tensor[[LOCAL_O_WIDTH // 32, D], pl.FP8E8M0, pl.MX_B_NN],
-    rope_cos: pl.Tensor[[T_DYN, ROPE_DIM // 2], pl.FP32],
-    rope_sin: pl.Tensor[[T_DYN, ROPE_DIM // 2], pl.FP32],
-    window_slots: pl.Tensor[[T_DYN], pl.INT64],
-    window_indices: pl.Tensor[[T_DYN, 128], pl.INT32],
-    window_cache: pl.Tensor[[ORI_BLOCKS_DYN, 128, 1, HEAD_DIM], pl.FP8E4M3FN],
-    window_cache_scale: pl.Tensor[[ORI_BLOCKS_DYN, 128, 1, HEAD_DIM // WINDOW_CACHE_GROUP], pl.BF16],
-    output_window: pld.DistributedTensor[[PREFILL_MAX_TOKENS, D], pl.FP32],
-    output_arrived: pld.DistributedTensor[[TP_SIZE, 1], pl.INT32],
-    output: pl.Tensor[[T_DYN, D], pl.BF16],
-    group_base: pl.Scalar[pl.INT32],
-    tp_rank: pl.Scalar[pl.INT32],
-    num_tokens: pl.Scalar[pl.INT32],
-    attention_epoch: pl.Scalar[pl.INT32],
-):
-    """Return replicated SWA output for the standalone attention interface."""
-    tokens = pl.tensor.dim(x, 0)
-    partial = pl.create_tensor([tokens, D], dtype=pl.FP32)
-    prefill_attn_swa_partial(
+def make_prefill_attn_swa(capacity=PREFILL_MAX_TOKENS, reducer=prefill_tp_output_all_reduce):
+    """Build head-TP attention around an output transport capacity."""
+    @pl.jit.inline(auto_scope=False)
+    def prefill_attn_swa(
+        x: pl.Tensor[[T_DYN, D], pl.BF16],
+        wq_a: pl.Tensor[[D, Q_LORA], pl.FP8E4M3FN],
+        wq_a_scale: pl.Tensor[[D // 32, Q_LORA], pl.FP8E8M0, pl.MX_B_NN],
+        q_norm_weight: pl.Tensor[[Q_LORA], pl.BF16],
+        wq_b: pl.Tensor[[Q_LORA, LOCAL_H * HEAD_DIM], pl.FP8E4M3FN],
+        wq_b_scale: pl.Tensor[[Q_LORA // 32, LOCAL_H * HEAD_DIM], pl.FP8E8M0, pl.MX_B_NN],
+        wkv: pl.Tensor[[D, HEAD_DIM], pl.FP8E4M3FN],
+        wkv_scale: pl.Tensor[[D // 32, HEAD_DIM], pl.FP8E8M0, pl.MX_B_NN],
+        kv_norm_weight: pl.Tensor[[HEAD_DIM], pl.BF16],
+        attn_sink: pl.Tensor[[LOCAL_H], pl.FP32],
+        wo_a: pl.Tensor[[LOCAL_O_GROUPS, O_LORA, O_GROUP_IN], pl.BF16],
+        wo_b: pl.Tensor[[LOCAL_O_WIDTH, D], pl.FP8E4M3FN],
+        wo_b_scale: pl.Tensor[[LOCAL_O_WIDTH // 32, D], pl.FP8E8M0, pl.MX_B_NN],
+        rope_cos: pl.Tensor[[T_DYN, ROPE_DIM // 2], pl.FP32],
+        rope_sin: pl.Tensor[[T_DYN, ROPE_DIM // 2], pl.FP32],
+        window_slots: pl.Tensor[[T_DYN], pl.INT64],
+        window_indices: pl.Tensor[[T_DYN, 128], pl.INT32],
+        window_cache: pl.Tensor[[ORI_BLOCKS_DYN, 128, 1, HEAD_DIM], pl.FP8E4M3FN],
+        window_cache_scale: pl.Tensor[[ORI_BLOCKS_DYN, 128, 1, HEAD_DIM // WINDOW_CACHE_GROUP], pl.BF16],
+        output_window: pld.DistributedTensor[[capacity, D], pl.FP32],
+        output_arrived: pld.DistributedTensor[[TP_SIZE, 1], pl.INT32],
+        output: pl.Tensor[[T_DYN, D], pl.BF16],
+        group_base: pl.Scalar[pl.INT32],
+        tp_rank: pl.Scalar[pl.INT32],
+        num_tokens: pl.Scalar[pl.INT32],
+        attention_epoch: pl.Scalar[pl.INT32],
+    ):
+        """Return replicated SWA output for the standalone attention interface."""
+        tokens = pl.tensor.dim(x, 0)
+        partial = pl.create_tensor([tokens, D], dtype=pl.FP32)
+        prefill_attn_swa_partial(
+            x,
+            wq_a, wq_a_scale, q_norm_weight, wq_b, wq_b_scale,
+            wkv, wkv_scale, kv_norm_weight, attn_sink,
+            wo_a, wo_b, wo_b_scale,
+            rope_cos, rope_sin,
+            window_slots, window_indices, window_cache, window_cache_scale,
+            output_arrived, partial, num_tokens, attention_epoch,
+        )
+        reducer(partial, output_window, output_arrived, output, group_base, tp_rank, num_tokens, attention_epoch)
+        return output
+
+    return prefill_attn_swa
+
+
+prefill_attn_swa = make_prefill_attn_swa()
+
+
+def golden_prefill_attn_swa(
+    x: torch.Tensor,
+    wq_a: torch.Tensor,
+    wq_a_scale: torch.Tensor,
+    q_norm_weight: torch.Tensor,
+    wq_b: torch.Tensor,
+    wq_b_scale: torch.Tensor,
+    wkv: torch.Tensor,
+    wkv_scale: torch.Tensor,
+    kv_norm_weight: torch.Tensor,
+    attn_sink: torch.Tensor,
+    wo_a: torch.Tensor,
+    wo_b: torch.Tensor,
+    wo_b_scale: torch.Tensor,
+    rope_cos: torch.Tensor,
+    rope_sin: torch.Tensor,
+    window_slots: torch.Tensor,
+    window_indices: torch.Tensor,
+    window_cache: torch.Tensor,
+    window_cache_scale: torch.Tensor,
+) -> AttentionGoldenResult:
+    return golden_swa_attention(
         x, wq_a, wq_a_scale, q_norm_weight, wq_b, wq_b_scale,
-        wkv, wkv_scale, kv_norm_weight, attn_sink, wo_a, wo_b, wo_b_scale,
-        rope_cos, rope_sin, window_slots, window_indices, window_cache, window_cache_scale,
-        output_arrived, partial, num_tokens, attention_epoch,
+        wkv, wkv_scale, kv_norm_weight, attn_sink,
+        wo_a, wo_b, wo_b_scale, rope_cos, rope_sin,
+        window_slots, window_indices, window_cache, window_cache_scale,
     )
-    prefill_tp_output_all_reduce(
-        partial, output_window, output_arrived, output, group_base, tp_rank, num_tokens, attention_epoch,
+
+
+__all__ = [
+    "golden_prefill_attn_swa", "prefill_attn_swa", "prefill_attn_swa_partial", "make_prefill_attn_swa",
+]
+
+
+if __name__ == "__main__":
+    result = run_swa_validation(
+        prefill_attn_swa, 'prefill', None,
+        capacity=PREFILL_MAX_TOKENS, default_tokens=257, default_requests=4,
+        cases=('mixed', 'prefix', 'shuffle', 'masked', 'zero', 'sink'),
+        program_builder=make_swa_program, spec_builder=build_swa_leaf_specs, golden_fn=golden_swa_leaf,
     )
-    return output
+    if not result.passed:
+        raise SystemExit(result.error or 1)

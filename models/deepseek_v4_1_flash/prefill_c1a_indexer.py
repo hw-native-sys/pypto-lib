@@ -266,13 +266,12 @@ def make_paged_indexer(use_candidates=False, direct_topk=False, max_logits_bytes
                             [INDEX_SCORE_TILE, 32],
                             valid_shape=[INDEX_SCORE_TILE, INDEX_DIM // INDEX_CACHE_GROUP],
                         )
-                        scale_rows = pl.tile.set_validshape(
-                            pl.tile.fillpad(scale_rows, pad_value=pl.PadValue.zero),
-                            INDEX_SCORE_TILE,
-                            32,
-                        )
-                        raw_codes = pl.reinterpret_view(scale_rows, pl.UINT8)
-                        signed_codes = pl.cast(pl.reinterpret_view(raw_codes, pl.INT8), pl.INT32)
+                        # Pad the encoded bytes before decoding the E8M0 scales.
+                        signed_scale_codes_reinterpret_view = pl.reinterpret_view(scale_rows, pl.UINT8)
+                        signed_scale_codes = pl.reinterpret_view(signed_scale_codes_reinterpret_view, pl.INT8)
+                        signed_scale_codes_fillpad = pl.tile.fillpad(signed_scale_codes, pad_value=pl.PadValue.zero)
+                        signed_scale_codes = pl.tile.set_validshape(signed_scale_codes_fillpad, INDEX_SCORE_TILE, 32)
+                        signed_codes = pl.cast(signed_scale_codes, pl.INT32)
                         codes = pl.ands(signed_codes, 255)
                         scale_bits = pl.maximum(pl.shls(codes, 23), 4194304)
                         scale_values = pl.reinterpret_view(scale_bits, pl.FP32)

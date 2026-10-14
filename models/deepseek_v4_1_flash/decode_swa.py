@@ -29,14 +29,14 @@ from config import (
 
 
 import decode_attn_swa as swa
+from sparse_attention import SWA_INPUT_NAMES, build_swa_leaf_specs, golden_swa_leaf
 from golden import ratio_allclose
 
 # PyPTO resolves inline calls and JIT-body constants only from direct names.
 from config import LOCAL_T_DYN
-from decode_cp_allgather import decode_tp_input_all_gather
+from decode_cp_allgather import decode_tp_input_all_gather, slab_owner
 from decode_attn_swa import decode_attn_swa, decode_attn_swa_sharded
 from hc_pre import attention_pre
-from decode_cp_allgather import slab_owner
 from hc_post import mhc_post
 
 
@@ -58,7 +58,7 @@ MX_GROUP = M.weight_block_size[0]
 KIND = "SWA"
 REPRESENTATIVE_LAYER_ID = 0
 KERNEL_READY = True
-LEAF_NAMES = tuple(name for name in swa.INPUT_NAMES if name != "x")
+LEAF_NAMES = tuple(name for name in SWA_INPUT_NAMES if name != "x")
 ATTENTION_SPEC_NAMES = (
     *_decode_utils.BOUNDARY_PREFIX_NAMES,
     *LEAF_NAMES,
@@ -626,14 +626,13 @@ def _make_program_sharded(world_size, epochs, specs):
 
 def build_specs(args, initial_state=None):
     del initial_state
-    return _decode_utils.assemble_specs(args, swa.build_specs(args, "decode"), ATTENTION_SPEC_NAMES)
+    return _decode_utils.assemble_specs(args, build_swa_leaf_specs(args, "decode"), ATTENTION_SPEC_NAMES)
 
 
 def build_specs_sharded(args):
     """Specs with per-rank token slabs plus the Attention-input gather scratch."""
-    return _decode_utils.assemble_specs(
-        args, swa.build_specs(args, "decode"), SHARDED_ATTENTION_SPEC_NAMES, sharded=True
-    )
+    value_build_swa_specs = build_swa_leaf_specs(args, 'decode')
+    return _decode_utils.assemble_specs(args, value_build_swa_specs, SHARDED_ATTENTION_SPEC_NAMES, sharded=True)
 
 
 def make_golden(epochs):
@@ -641,7 +640,7 @@ def make_golden(epochs):
         for _ in range(epochs):
             normalized, post, residual = _decode_hc_pre.golden_attention_pre(tensors)
             leaf = dict(tensors, x=normalized, output=tensors["attention_output"])
-            swa.golden_swa(leaf)
+            golden_swa_leaf(leaf)
             _decode_hc_post.golden_attention_post(tensors, post, residual)
 
     return golden_half
@@ -652,7 +651,7 @@ def make_golden_sharded(epochs):
         for _ in range(epochs):
             gathered, post, residual = _decode_hc_pre.golden_attention_pre_sharded(tensors)
             leaf = dict(tensors, x=gathered, output=tensors["attention_output"])
-            swa.golden_swa(leaf, sharded=True)
+            golden_swa_leaf(leaf, sharded=True)
             _decode_hc_post.golden_attention_post(tensors, post, residual)
 
     return golden_half

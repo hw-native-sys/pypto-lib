@@ -39,6 +39,7 @@ from hc_mixes import golden_mhc_mixes, mhc_mixes
 from hc_post import golden_mhc_post, mhc_post
 from hc_pre import golden_mhc_pre, mhc_pre
 from rmsnorm import golden_rms_norm
+from sparse_attention import golden_index_scores
 import prefill_attn_c1a as attn
 from prefill_attn_c1a import (
     FULL_INPUT_NAMES,
@@ -322,7 +323,7 @@ def make_c1a_sp_compare(mode, initial_state, world_size, tokens):
 
     def selected_topk_compare(actual, expected, *, inputs, actual_outputs, expected_outputs, **kwargs):
         """Apply the tied-cutoff Top-K contract to every DP group's active rows."""
-        check = topk_indices_compare(mode)
+        check = topk_indices_compare(mode, golden_index_scores)
         values = {**initial_state, **inputs, "x": actual_outputs["attn_input"]}
         for base in range(0, actual.shape[0], TP_SIZE):
             active = int(inputs["num_tokens"][base, 0])
@@ -830,7 +831,7 @@ if __name__ == "__main__":
             "attn_out": ratio_allclose(atol=1e-2, rtol=1.0 / 128),
             "output": ratio_allclose(atol=1e-2, rtol=1.0 / 128),
             **cache_compare(len(devices), fixture_token_count(args.tokens, args.case)),
-            "topk_indices": wrap_attention_compare(topk_indices_compare("full")),
+            "topk_indices": wrap_attention_compare(topk_indices_compare("full", golden_index_scores)),
         },
     )
     if not result.passed:

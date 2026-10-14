@@ -127,7 +127,8 @@ def make_prefill_attention():
     the decoder consumes its bounded replay rows. Imports stay inside this
     factory because the C1A leaves themselves use this module's cache kernels.
     """
-    from prefill_attn_swa import prefill_attn_swa
+    from prefill_attn_swa import make_prefill_attn_swa
+    from o_proj import make_prefill_tp_output_all_reduce
     from prefill_attn_c2a import prefill_attn_c2a_full, prefill_attn_c2a_reuse
     from prefill_attn_c1a import (
         make_prefill_attn_c1a_reindex,
@@ -136,6 +137,9 @@ def make_prefill_attention():
     )
     from prefill_c1a_indexer import make_paged_indexer
 
+    prefill_attn_swa = make_prefill_attn_swa(
+        capacity=PREFILL_MAX_TOKENS, reducer=make_prefill_tp_output_all_reduce(PREFILL_MAX_TOKENS),
+    )
     initial_index = make_prefill_attn_c1a_reindex(make_paged_indexer(use_candidates=False))
 
     @pl.jit.inline(auto_scope=False)

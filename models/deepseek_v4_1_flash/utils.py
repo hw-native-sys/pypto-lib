@@ -8,11 +8,14 @@
 # -----------------------------------------------------------------------------------------------------------
 """Metadata lowering and shared validation helpers for prefill and decode."""
 
+import argparse
 import inspect
 from collections.abc import Callable
 from dataclasses import dataclass, replace
+import functools
 import json
 import math
+import os
 from numbers import Integral
 from pathlib import Path
 import struct
@@ -24,8 +27,8 @@ import torch
 
 
 import config as C
-from config import BLOCK_SIZE, FLASH as M, TP_SIZE
-from golden import ScalarSpec, TensorSpec, ratio_allclose
+from config import BLOCK_SIZE, EP_SIZE, FLASH as M, MAX_BATCH_PER_DP, TP_SIZE
+from golden import ScalarSpec, TensorSpec, mapped_pool_ratio_allclose, ratio_allclose, run
 from rope_tables import precompute_rope_tables
 
 
@@ -297,19 +300,6 @@ def apply_distributed_golden(mode: str, golden_fn: Callable, tensors: dict[str, 
             else:
                 tensors['topk_indices'][rank, :active_tokens].copy_(result.topk_indices)
 
-def _golden_index_scores(mode: str, rank: int, cache_outputs: dict[str, torch.Tensor], inputs: dict[str, torch.Tensor]) -> torch.Tensor:
-    import torch
-    from config import INDEX_CACHE_GROUP
-    from hierarchical_sparse_indexer import golden_paged_indexer as paged_indexer
-    from qkv_proj_rope import golden_qkv_proj_rope as qkv_proj_rope
-    from quant import dequantize_mxfp4_cache
-    index_payload = cache_outputs['index_cache'] if mode == 'full' else inputs['index_cache']
-    index_scale = cache_outputs['index_cache_scale'] if mode == 'full' else inputs['index_cache_scale']
-    index_value = dequantize_mxfp4_cache(index_payload[rank], index_scale[rank], group_size=INDEX_CACHE_GROUP, scale_format='e8m0').to(torch.bfloat16)
-    _, _, query_latent = qkv_proj_rope(inputs['x'][rank], inputs['wq_a'][rank], inputs['wq_a_scale'][rank], inputs['q_norm_weight'][rank], inputs['wq_b'][rank], inputs['wq_b_scale'][rank], inputs['wkv'][rank], inputs['wkv_scale'][rank], inputs['kv_norm_weight'][rank], inputs['rope_cos'][rank], inputs['rope_sin'][rank])
-    candidates = inputs['candidate_mask'][rank] if mode == 'reindex' else None
-    scores, _ = paged_indexer(inputs['x'][rank], query_latent, inputs['request_ids'][rank], index_value, inputs['index_block_table'][rank], inputs['compressed_lens'][rank], inputs['index_wq_b'][rank], inputs['index_wq_b_scale'][rank], inputs['index_weights_proj'][rank], inputs['rope_cos'][rank], inputs['rope_sin'][rank], candidates=candidates, topk=INDEX_TOPK)
-    return scores
 
 def _physical_to_logical(inputs: dict[str, torch.Tensor], rank: int, token: int) -> dict[int, int]:
     import torch
@@ -320,7 +310,7 @@ def _physical_to_logical(inputs: dict[str, torch.Tensor], rank: int, token: int)
     physical = table[logical // CASE_PAGE].to(torch.int64) * CASE_PAGE + logical % CASE_PAGE
     return {int(row): index for index, row in enumerate(physical.tolist())}
 
-def topk_indices_compare(mode: str) -> Callable:
+def topk_indices_compare(mode: str, score_fn: Callable) -> Callable:
     """Accept device/CPU substitutions only at a numerically tied top-k cutoff."""
     import torch
 
@@ -363,7 +353,7 @@ def topk_indices_compare(mode: str) -> Callable:
                 extra = sorted(actual_set - expected_set)
                 if scores is None:
                     score_outputs = actual_outputs if mode == 'full' else expected_outputs
-                    scores = _golden_index_scores(mode, rank, score_outputs, inputs)
+                    scores = score_fn(mode, rank, score_outputs, inputs)
                 missing_logical = torch.tensor([physical_to_logical[row] for row in missing], dtype=torch.int64)
                 extra_logical = torch.tensor([physical_to_logical[row] for row in extra], dtype=torch.int64)
                 missing_scores = torch.sort(scores[token, missing_logical], descending=True).values
@@ -1510,3 +1500,113 @@ def gather_decode_batch(shards: tuple[DecodeTokenShard, ...] | list[DecodeTokenS
     if hidden.shape[0] != num_tokens or not bool(valid_mask.all()):
         raise RuntimeError("sequence-parallel gather did not restore every active token")
     return DecodeTokenShard(hidden, token_ids, position_ids, valid_mask)
+
+
+def swa_window_cache_compare(
+    world_size, tokens, payload_atol=0.0, payload_rtol=0.0, payload_error_ratio=0.0,
+    scale_rtol=0.0, scale_error_ratio=0.0,
+):
+    """Compare the mapped window rows and require every other row to stay unchanged."""
+    options = dict(
+        mapping_shape=(world_size, tokens),
+        block_size=128,
+        leading_rank_axis=True,
+    )
+    return {
+        "window_cache": mapped_pool_ratio_allclose(
+            "window_slots", pool_name="window cache",
+            atol=payload_atol, rtol=payload_rtol, max_error_ratio=payload_error_ratio, **options
+        ),
+        "window_cache_scale": mapped_pool_ratio_allclose(
+            "window_slots", pool_name="window cache scale",
+            atol=0.0, rtol=scale_rtol, max_error_ratio=scale_error_ratio, **options
+        ),
+    }
+
+
+def run_swa_validation(
+    operator, mode, argv=None, *, capacity, default_tokens, default_requests, cases, program_builder,
+    spec_builder, golden_fn,
+):
+    """Run A5 validation for a production SWA operator."""
+    parser = argparse.ArgumentParser(description=f"DeepSeek V4.1 {mode} SWA: A5 precision and timing")
+    parser.add_argument("-p", "--platform", default="a5", choices=["a5", "a5sim"])
+    parser.add_argument("-d", "--device", default=None, help="comma-separated device IDs; default: 0 through TP*DP-1")
+    parser.add_argument("--tp", type=int, default=TP_SIZE, choices=[1, 2, 4])
+    parser.add_argument("--ep", type=int, default=EP_SIZE, choices=[2, 4, 8])
+    parser.add_argument("--dp", type=int, default=1, choices=[1, 2])
+    parser.add_argument("--tokens", "--batch", type=int, default=default_tokens)
+    parser.add_argument("--requests", type=int, help=f"packed requests; default min(tokens, {default_requests})")
+    parser.add_argument("--case", default=cases[0], choices=cases)
+    parser.add_argument("--seed", type=int, default=17)
+    parser.add_argument("--epochs", type=int, default=1, help="operator calls per dispatch; timing includes all epochs")
+    parser.add_argument("--compile-only", action="store_true")
+    parser.add_argument("--save-data", action="store_true", help="save validated inputs and golden outputs for replay")
+    parser.add_argument("--golden-data", help="replay a compatible data directory containing in/ and out/")
+    parser.add_argument("--enable-chip-swimlane", type=int, default=0, choices=range(5))
+    parser.add_argument("--enable-dep-gen", action="store_true")
+    args = parser.parse_args(argv)
+    if args.tp != TP_SIZE:
+        parser.error(f"--tp {args.tp} does not match import-time TP_SIZE {TP_SIZE}")
+    from pypto.ir import DistributedConfig
+
+    args.bench = os.environ.get("PYPTO_BENCH", "0") == "1"
+    args.requests = args.requests if args.requests is not None else min(args.tokens, default_requests)
+    try:
+        devices = list(range(TP_SIZE * args.dp)) if args.device is None else [int(d) for d in args.device.split(",")]
+    except ValueError:
+        parser.error("device IDs must be comma-separated integers")
+    if len(devices) != TP_SIZE * args.dp or len(set(devices)) != len(devices) or min(devices) < 0:
+        parser.error("device IDs must be distinct nonnegative integers, with count TP * DP")
+    if not 1 <= args.tokens <= capacity or not 1 <= args.requests <= min(MAX_BATCH_PER_DP, args.tokens):
+        parser.error(f"tokens must be in [1, {capacity}]; requests in [1, min({MAX_BATCH_PER_DP}, tokens)]")
+    if not 1 <= args.epochs <= 1000:
+        parser.error("epochs must be in [1, 1000]")
+    if args.bench and args.enable_chip_swimlane:
+        parser.error("benchmark epoch stepping and multi-pass chip swimlane must be run separately")
+    torch.set_num_threads(8)
+    print(
+        f"[SWA] mode={mode} tokens={args.tokens} requests={args.requests} TP={TP_SIZE} DP={args.dp} "
+        f"case={args.case} seed={args.seed} epochs/dispatch={args.epochs} devices={devices}",
+    )
+    if args.bench:
+        print(
+            "[SWA] Resident device timing excludes compilation, input generation and CPU golden; "
+            "each dispatch advances the communication epoch. Timing includes all epochs/dispatch.",
+        )
+    validation_program = program_builder(operator, capacity, len(devices), args.epochs)
+    validation_specs = spec_builder(args, mode)
+    validation_distribution = DistributedConfig(device_ids=devices, num_sub_workers=0)
+    validation_config = dict(
+        platform=args.platform, distributed_config=validation_distribution,
+        enable_chip_swimlane=args.enable_chip_swimlane, enable_dep_gen=args.enable_dep_gen,
+    )
+    output_compare = ratio_allclose(atol=1e-2, rtol=1.0 / 128)
+    if args.case in ("masked", "zero", "sink"):
+        output_compare = ratio_allclose(atol=0.0, rtol=0.0, max_error_ratio=0.0)
+    validation_comparisons = {
+        "output": output_compare,
+        # Projection/RMSNorm BF16 rounding can cross an FP8 boundary. Bound
+        # every mapped payload by 2**-9 + abs(expected)/8 and scales by 2%;
+        # untouched values remain exact, with no out-of-bound allowance.
+        **swa_window_cache_compare(
+            len(devices), args.tokens, payload_atol=2 ** -9,
+            payload_rtol=2 ** -3, scale_rtol=0.02,
+        ),
+    }
+    result = run(
+        fn=validation_program,
+        specs=validation_specs,
+        golden_fn=functools.partial(golden_fn, mode=mode),
+        compile_only=args.compile_only,
+        save_data=args.save_data,
+        golden_data=args.golden_data,
+        config=validation_config,
+        compare_fn=validation_comparisons,
+    )
+    print(f"[SWA] work_dir={result.work_dir}")
+    if args.compile_only and result.passed:
+        print("[SWA] Compilation passed; device accuracy was NOT validated.")
+    elif args.save_data and result.passed:
+        print(f"[SWA] Validated snapshot: {result.work_dir}/data")
+    return result

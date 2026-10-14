@@ -36,6 +36,7 @@ from hc_mixes import golden_mhc_mixes, mhc_mixes
 from hc_post import golden_mhc_post, mhc_post
 from hc_pre import golden_mhc_pre, mhc_pre
 from rmsnorm import golden_rms_norm
+from sparse_attention import golden_index_scores
 from prefill_attn_c1a import (
     REINDEX_INPUT_NAMES,
     cache_compare,
@@ -477,7 +478,7 @@ if __name__ == "__main__":
             "attn_out": ratio_allclose(atol=1e-2, rtol=1.0 / 128),
             "output": ratio_allclose(atol=1e-2, rtol=1.0 / 128),
             **cache_compare(len(devices), fixture_token_count(args.tokens, args.case), ("window_cache", "window_cache_scale")),
-            "topk_indices": wrap_attention_compare(topk_indices_compare("reindex")),
+            "topk_indices": wrap_attention_compare(topk_indices_compare("reindex", golden_index_scores)),
         },
     )
     if not result.passed:

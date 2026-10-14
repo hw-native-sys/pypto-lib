@@ -59,6 +59,7 @@ from utils import (
     topk_indices_compare,
 )
 from sparse_attention import (
+    golden_index_scores,
     golden_prefill_c1a_attention,
 )
 
@@ -1135,7 +1136,7 @@ if __name__ == "__main__":
         compare_fn={
             "output": ratio_allclose(atol=1e-2, rtol=1.0 / 128),
             **cache_compare(len(device_ids), fixture_token_count(args.tokens, args.case)),
-            "topk_indices": topk_indices_compare("full"),
+            "topk_indices": topk_indices_compare("full", golden_index_scores),
         },
     )
     if not result.passed:

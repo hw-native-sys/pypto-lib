@@ -44,7 +44,10 @@ from config import EP_SIZE
 
 
 from utils import AttentionGoldenResult
-from sparse_attention import golden_compressed_attention
+from sparse_attention import (
+    PACKED_KEY_TILE as ATTEND_TILE, PACKED_QUERY_TILE as QUERY_TILE, SELECTED_KEYS as SPARSE_WIDTH,
+    gather_packed_chunk, golden_compressed_attention, make_attend_selected_chunk,
+)
 from config import LOCAL_T_DYN
 from o_proj import (
     decode_tp_output_all_reduce,
@@ -60,7 +63,7 @@ from qkv_proj_rope import (
     make_mx_projection,
     make_rope,
 )
-from decode_attn_swa import SOFTMAX_SCALE, publish_window
+from decode_attn_swa import publish_window
 from o_proj import _make_o_proj, _project_ob, grouped_output, o_proj
 from qkv_proj_rope import golden_rope_tail, kv_proj_rope, q_proj_qr, qkv_proj_rope
 from utils import paged_slots, window_metadata
@@ -105,10 +108,6 @@ E8M0_FLOOR_BITS = 4194304
 
 # Sparse attention geometry: one sliding window block plus four compressed blocks.
 WINDOW = M.sliding_window
-SPARSE_WIDTH = WINDOW + INDEX_TOPK
-ATTEND_TILE = 64
-SPARSE_PARTS = SPARSE_WIDTH // ATTEND_TILE
-QUERY_TILE = 32
 
 # Indexer selection. Candidates are scored one leaf at a time and folded into a
 # running Top-K, which keeps the sort width independent of the context length.
@@ -567,181 +566,7 @@ def index_select(
     return select_tid
 
 
-@pl.jit.inline
-def gather_sparse(
-    window_cache: pl.Tensor[[ORI_BLOCKS_DYN, 128, 1, HEAD_DIM], pl.FP8E4M3FN],
-    window_scales: pl.Tensor[[ORI_BLOCKS_DYN, 128, 1, HEAD_DIM // 32], pl.BF16],
-    window_indices: pl.Tensor[[T_DYN, 128], pl.INT32],
-    compressed_cache: pl.Tensor[[CMP_BLOCKS_DYN, 128, 1, CMP_PACKED], pl.UINT8],
-    compressed_scales: pl.Tensor[[CMP_BLOCKS_DYN, 128, 1, CMP_SCALES], pl.BF16],
-    topk_indices: pl.Tensor[[T_DYN, INDEX_TOPK], pl.INT32],
-    selected: pl.Tensor[[QUERY_TILE, SPARSE_WIDTH, HEAD_DIM], pl.BF16],
-    combined: pl.Tensor[[QUERY_TILE, SPARSE_WIDTH], pl.INT32],
-    chunk_start: pl.Scalar[pl.INT32],
-    active: pl.Scalar[pl.INT32],
-    chunk_done: pl.Scalar[pl.TASK_ID],
-):
-    """Gather and dequantize sliding-window FP8 and compressed FP4 KV rows."""
-    workers = 16
-    if active >= 16:
-        workers = 4
-    elif active >= 8:
-        workers = 8
-
-    with pl.spmd(active, name_hint="c2a_sparse_plan", deps=[chunk_done]) as plan_tid:
-        r = pl.tile.get_block_idx()
-        t = chunk_start + r
-        combined[r : r + 1, 0:WINDOW] = window_indices[t : t + 1, :]
-        combined[r : r + 1, WINDOW:SPARSE_WIDTH] = topk_indices[t : t + 1, :]
-
-    window_rows = pl.tensor.dim(window_cache, 0) * 128
-    window_flat = pl.reshape(window_cache, [window_rows, HEAD_DIM])
-    window_scale_flat = pl.reshape(window_scales, [window_rows, HEAD_DIM // 32])
-    compressed_rows = pl.tensor.dim(compressed_cache, 0) * 128
-    compressed_flat = pl.reshape(compressed_cache, [compressed_rows, CMP_PACKED])
-    compressed_scale_flat = pl.reshape(compressed_scales, [compressed_rows, CMP_SCALES])
-    gathered = pl.reshape(selected, [QUERY_TILE * SPARSE_WIDTH, HEAD_DIM])
-    with pl.spmd(active * workers, name_hint="c2a_sparse_gather", deps=[plan_tid]) as gather_tid:
-        block = pl.tile.get_block_idx()
-        r = block // workers
-        lane = block % workers
-        t = chunk_start + r
-        window_start = lane * (WINDOW // workers)
-        window_end = window_start + WINDOW // workers
-        for i in pl.range(window_start, window_end):
-            window_index = pl.read(window_indices, [t, i])
-            window_dst = r * SPARSE_WIDTH + i
-            if window_index >= 0:
-                window_row = pl.cast(window_index, pl.INDEX)
-                window_values = pl.cast(window_flat[window_row : window_row + 1, :], pl.FP32)
-                window_values = pl.reshape(window_values, [HEAD_DIM // 32, 32])
-                scale_raw = pl.slice(window_scale_flat, [1, 32], [window_row, 0], valid_shape=[1, HEAD_DIM // 32])
-                window_scale = pl.cast(scale_raw, pl.FP32)
-                window_scale = pl.reshape(window_scale[:, : HEAD_DIM // 32], [HEAD_DIM // 32, 1])
-                window_decoded = pl.row_expand_mul(window_values, window_scale)
-                window_decoded = pl.cast(window_decoded, pl.BF16, mode="rint")
-                gathered[window_dst : window_dst + 1, :] = pl.reshape(window_decoded, [1, HEAD_DIM])
-            else:
-                gathered[window_dst : window_dst + 1, :] = pl.full([1, HEAD_DIM], dtype=pl.BF16, value=0.0)
-
-        compressed_start = lane * (INDEX_TOPK // workers)
-        compressed_end = compressed_start + INDEX_TOPK // workers
-        for i in pl.pipeline(compressed_start, compressed_end, stage=2):
-            compressed_index = pl.read(topk_indices, [t, i])
-            compressed_dst = r * SPARSE_WIDTH + WINDOW + i
-            if compressed_index >= 0:
-                compressed_row = pl.cast(compressed_index, pl.INDEX)
-                packed = compressed_flat[compressed_row : compressed_row + 1, :]
-                wide = pl.reinterpret_view(pl.cast(packed, pl.UINT16), pl.INT16)
-                low = pl.ands(wide, 15)
-                high = pl.ands(pl.shrs(wide, 4), 15)
-
-                # E2M1 magnitudes: 0, 0.5, 1, 1.5, 2, 3, 4, 6.
-                low_magnitude = pl.cast(pl.ands(low, 7), pl.FP32)
-                low_base = pl.mul(low_magnitude, 0.5)
-                low_excess4 = pl.maximum(pl.sub(low_magnitude, 4.0), 0.0)
-                low_excess6 = pl.maximum(pl.sub(low_magnitude, 6.0), 0.0)
-                low_value = pl.add(low_base, pl.mul(low_excess4, 0.5))
-                low_value = pl.add(low_value, low_excess6)
-                low_sign = pl.cast(pl.shrs(low, 3), pl.FP32)
-                low_sign = pl.add(pl.mul(low_sign, -2.0), 1.0)
-                low_value = pl.mul(low_value, low_sign)
-
-                high_magnitude = pl.cast(pl.ands(high, 7), pl.FP32)
-                high_base = pl.mul(high_magnitude, 0.5)
-                high_excess4 = pl.maximum(pl.sub(high_magnitude, 4.0), 0.0)
-                high_excess6 = pl.maximum(pl.sub(high_magnitude, 6.0), 0.0)
-                high_value = pl.add(high_base, pl.mul(high_excess4, 0.5))
-                high_value = pl.add(high_value, high_excess6)
-                high_sign = pl.cast(pl.shrs(high, 3), pl.FP32)
-                high_sign = pl.add(pl.mul(high_sign, -2.0), 1.0)
-                high_value = pl.mul(high_value, high_sign)
-
-                low_lanes = pl.full([1, HEAD_DIM], dtype=pl.FP32, value=0.0)
-                high_lanes = pl.full([1, HEAD_DIM], dtype=pl.FP32, value=0.0)
-                low_lanes = pl.tensor.scatter(low_value, mask_pattern=pl.tile.MaskPattern.P0101, dst=low_lanes)
-                high_lanes = pl.tensor.scatter(high_value, mask_pattern=pl.tile.MaskPattern.P1010, dst=high_lanes)
-                low_bits = pl.reinterpret_view(low_lanes, pl.INT32)
-                high_bits = pl.reinterpret_view(high_lanes, pl.INT32)
-                interleaved = pl.reinterpret_view(pl.or_(low_bits, high_bits), pl.FP32)
-                interleaved = pl.reshape(interleaved, [CMP_SCALES, 16])
-                factors = pl.cast(compressed_scale_flat[compressed_row : compressed_row + 1, :], pl.FP32)
-                factors = pl.reshape(factors, [CMP_SCALES, 1])
-                compressed_decoded = pl.row_expand_mul(interleaved, factors)
-                compressed_decoded = pl.cast(compressed_decoded, pl.BF16, mode="rint")
-                gathered[compressed_dst : compressed_dst + 1, :] = pl.reshape(compressed_decoded, [1, HEAD_DIM])
-            else:
-                gathered[compressed_dst : compressed_dst + 1, :] = pl.full([1, HEAD_DIM], dtype=pl.BF16, value=0.0)
-    return gather_tid
-
-
-def make_attend_sparse(*, vector_query=False):
-    """Optionally route the query through Vector to guard A5 mixed-task startup."""
-    @pl.jit.inline
-    def attend_sparse(
-        query: pl.Tensor[[T_DYN, LOCAL_H * HEAD_DIM], pl.BF16],
-        selected: pl.Tensor[[QUERY_TILE, SPARSE_WIDTH, HEAD_DIM], pl.BF16],
-        combined: pl.Tensor[[QUERY_TILE, SPARSE_WIDTH], pl.INT32],
-        sink: pl.Tensor[[LOCAL_H], pl.FP32],
-        output: pl.Tensor[[T_DYN, LOCAL_H * HEAD_DIM], pl.BF16],
-        chunk_start: pl.Scalar[pl.INT32],
-        active: pl.Scalar[pl.INT32],
-        gather_ready: pl.Scalar[pl.TASK_ID],
-    ):
-        """Attend one chunk over the window and compressed rows under a single sink."""
-        tokens = pl.tensor.dim(query, 0)
-        head_rows = tokens * LOCAL_H
-        query_flat = pl.reshape(query, [head_rows, HEAD_DIM])
-        output_flat = pl.reshape(output, [head_rows, HEAD_DIM])
-        key_flat = pl.reshape(selected, [QUERY_TILE * SPARSE_WIDTH, HEAD_DIM])
-        with pl.spmd(
-            active * (LOCAL_H // M_TILE), name_hint="c2a_sparse_attention", deps=[gather_ready]
-        ) as attend_tid:
-            block = pl.tile.get_block_idx()
-            r = block // (LOCAL_H // M_TILE)
-            h = block % (LOCAL_H // M_TILE) * M_TILE
-            q0 = (chunk_start + r) * LOCAL_H + h
-            maximum = pl.full([1, M_TILE], dtype=pl.FP32, value=-1e30)
-            denominator = pl.full([1, M_TILE], dtype=pl.FP32, value=0.0)
-            numerator = pl.full([M_TILE, HEAD_DIM], dtype=pl.FP32, value=0.0)
-            # Keep the query tile live across all sparse KV parts.  It is identical
-            # for the ten 64-row parts, so the mixed kernel can reuse one Cube tile.
-            q = query_flat[q0 : q0 + M_TILE, :]
-            if vector_query:
-                # An exact BF16 roundtrip requires Vector startup before the first score push.
-                q = pl.cast(pl.cast(q, pl.FP32), pl.BF16, mode="rint")
-            for part in pl.range(SPARSE_PARTS):
-                k0 = r * SPARSE_WIDTH + part * ATTEND_TILE
-                kv = key_flat[k0 : k0 + ATTEND_TILE, :]
-                scores = pl.mul(pl.matmul(q, kv, b_trans=True), SOFTMAX_SCALE)
-                idx = pl.cast(combined[r : r + 1, part * ATTEND_TILE : part * ATTEND_TILE + ATTEND_TILE], pl.FP32)
-                valid = pl.minimum(pl.maximum(pl.add(idx, 1.0), 0.0), 1.0)
-                scores = pl.col_expand_add(scores, pl.mul(pl.sub(valid, 1.0), 1e30))
-                next_max = pl.maximum(maximum, pl.reshape(pl.row_max(scores), [1, M_TILE]))
-                correction = pl.exp(pl.sub(maximum, next_max))
-                probabilities = pl.col_expand_mul(
-                    pl.exp(pl.row_expand_sub(scores, pl.reshape(next_max, [M_TILE, 1]))), valid
-                )
-                denominator = pl.add(
-                    pl.mul(denominator, correction), pl.reshape(pl.row_sum(probabilities), [1, M_TILE])
-                )
-                weighted = pl.matmul(pl.cast(probabilities, pl.BF16, mode="rint"), kv)
-                numerator = pl.add(
-                    pl.row_expand_mul(numerator, pl.reshape(correction, [M_TILE, 1])), weighted
-                )
-                maximum = next_max
-            sinks = pl.reshape(sink[h : h + M_TILE], [1, M_TILE])
-            final_max = pl.maximum(maximum, sinks)
-            correction = pl.exp(pl.sub(maximum, final_max))
-            denominator = pl.add(pl.mul(denominator, correction), pl.exp(pl.sub(sinks, final_max)))
-            result = pl.row_expand_mul(numerator, pl.reshape(pl.div(correction, denominator), [M_TILE, 1]))
-            output_flat[q0 : q0 + M_TILE, :] = pl.cast(result, pl.BF16, mode="rint")
-        return attend_tid
-
-    return attend_sparse
-
-
-attend_sparse = make_attend_sparse()
+attend_sparse = make_attend_selected_chunk()
 project_index_q = make_mx_projection(Q_LORA, INDEX_H * INDEX_DIM)
 rotate_compressed = make_rope(1)
 rotate_index_key = make_wide_rope(1, INDEX_DIM)
@@ -905,7 +730,7 @@ def make_c2a_full_partial(
         chunk_done = pl.system.task_dummy(deps=[select_tid, state_tid])
         for start in pl.range(0, num_tokens, QUERY_TILE):
             active = pl.min(QUERY_TILE, num_tokens - start)
-            gather_tid = gather_sparse(
+            gather_tid = gather_packed_chunk(
                 window_cache, window_cache_scale, window_indices, compressed_cache,
                 compressed_cache_scale, topk_indices, selected, combined, start, active, chunk_done,
             )
@@ -1964,7 +1789,7 @@ def make_c2a_reuse_partial(qkv_operator=qkv_proj_rope, output_operator=o_proj, a
         chunk_done = cache_ready
         for start in pl.range(0, num_tokens, QUERY_TILE):
             active = pl.min(QUERY_TILE, num_tokens - start)
-            gather_tid = gather_sparse(
+            gather_tid = gather_packed_chunk(
                 window_cache, window_cache_scale, window_indices, compressed_cache,
                 compressed_cache_scale, compressed_indices, selected, combined, start, active,
                 chunk_done,

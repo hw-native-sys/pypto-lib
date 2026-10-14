@@ -198,6 +198,8 @@ jobs:
         shell: bash
         env:
           PYTHONPATH: ${{ github.workspace }}/checkout
+          # Match tile-memory capacities to the requested simulator target.
+          PTO_CPU_SIM_ARCH: ${{ matrix.platform == 'a5sim' && 'a5' || 'a2a3' }}
         run: |
           source activate.sh
           set +e

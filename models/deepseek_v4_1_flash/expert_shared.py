@@ -295,80 +295,85 @@ def expert_shared(
             [SH_M_TILE, MOE_INTER // MX_GROUP],
             layout=pl.MX_A_ZZ,
         )
-        # Synchronize Cube/Vector startup (pypto#2829).
-        for db_idx in pl.spmd(D // D_OUT_TILE, name_hint="sh_w2_mm", sync_start=True):
-            d0 = db_idx * D_OUT_TILE
-            hs0 = pl.load(h_tile_mx, [0, 0], [SH_M_TILE, MX_W2_RIGHT_K_TILE])
-            hs_scale0 = pl.load(
-                h_tile_scale_mx,
-                [0, 0],
-                [SH_M_TILE, MX_W2_RIGHT_K_SCALE_GROUPS],
-            )
-            sw2_0 = pl.load(shared_w2, [0, d0], [MX_W2_RIGHT_K_TILE, D_OUT_TILE])
-            sw2_scale0 = pl.load(
-                w2_scale_mx,
-                [0, d0],
-                [MX_W2_RIGHT_K_SCALE_GROUPS, D_OUT_TILE],
-            )
-            y_acc = pl.matmul_mx(hs0, hs_scale0, sw2_0, sw2_scale0)
-            for kb in pl.range(1, MX_W2_K_TILE // MX_W2_RIGHT_K_TILE):
-                k_local = kb * MX_W2_RIGHT_K_TILE
-                hs_part = pl.load(h_tile_mx, [0, k_local], [SH_M_TILE, MX_W2_RIGHT_K_TILE])
-                hs_scale_part = pl.load(
-                    h_tile_scale_mx,
-                    [0, k_local // MX_GROUP],
-                    [SH_M_TILE, MX_W2_RIGHT_K_SCALE_GROUPS],
-                )
-                sw2_part = pl.load(
-                    shared_w2,
-                    [k_local, d0],
-                    [MX_W2_RIGHT_K_TILE, D_OUT_TILE],
-                )
-                sw2_scale_part = pl.load(
-                    w2_scale_mx,
-                    [k_local // MX_GROUP, d0],
-                    [MX_W2_RIGHT_K_SCALE_GROUPS, D_OUT_TILE],
-                )
-                y_acc = pl.matmul_mx_acc(
-                    y_acc,
-                    hs_part,
-                    hs_scale_part,
-                    sw2_part,
-                    sw2_scale_part,
-                )
-            for k0 in pl.pipeline(MX_W2_K_TILE, MOE_INTER, MX_W2_K_TILE, stage=2):
-                for kb in pl.range(MX_W2_K_TILE // MX_W2_RIGHT_K_TILE):
-                    k_local = kb * MX_W2_RIGHT_K_TILE
-                    hs_part = pl.load(
-                        h_tile_mx,
-                        [0, k0 + k_local],
-                        [SH_M_TILE, MX_W2_RIGHT_K_TILE],
-                    )
-                    hs_scale_part = pl.load(
+        # Synchronize Cube/Vector startup (pypto#2829) within available clusters.
+        workers = pl.min(D // D_OUT_TILE, pl.system.available_cluster_count())
+        for worker in pl.spmd(workers, name_hint="sh_w2_mm", sync_start=True):
+            block_num = pl.tile.get_block_num()
+            for wave in pl.range((D // D_OUT_TILE + block_num - 1) // block_num):
+                db_idx = wave * block_num + worker
+                if db_idx < D // D_OUT_TILE:
+                    d0 = db_idx * D_OUT_TILE
+                    hs0 = pl.load(h_tile_mx, [0, 0], [SH_M_TILE, MX_W2_RIGHT_K_TILE])
+                    hs_scale0 = pl.load(
                         h_tile_scale_mx,
-                        [0, (k0 + k_local) // MX_GROUP],
+                        [0, 0],
                         [SH_M_TILE, MX_W2_RIGHT_K_SCALE_GROUPS],
                     )
-                    sw2_part = pl.load(
-                        shared_w2,
-                        [k0 + k_local, d0],
-                        [MX_W2_RIGHT_K_TILE, D_OUT_TILE],
-                    )
-                    sw2_scale_part = pl.load(
+                    sw2_0 = pl.load(shared_w2, [0, d0], [MX_W2_RIGHT_K_TILE, D_OUT_TILE])
+                    sw2_scale0 = pl.load(
                         w2_scale_mx,
-                        [(k0 + k_local) // MX_GROUP, d0],
+                        [0, d0],
                         [MX_W2_RIGHT_K_SCALE_GROUPS, D_OUT_TILE],
                     )
-                    y_acc = pl.matmul_mx_acc(
-                        y_acc,
-                        hs_part,
-                        hs_scale_part,
-                        sw2_part,
-                        sw2_scale_part,
-                    )
-            y_bf16 = pl.cast(y_acc, target_type=pl.BF16, mode="rint")
-            y_valid = pl.set_validshape(y_bf16, SH_VALID_M, D_OUT_TILE)
-            sh = pl.store(y_valid, [ts0, d0], sh)
+                    y_acc = pl.matmul_mx(hs0, hs_scale0, sw2_0, sw2_scale0)
+                    for kb in pl.range(1, MX_W2_K_TILE // MX_W2_RIGHT_K_TILE):
+                        k_local = kb * MX_W2_RIGHT_K_TILE
+                        hs_part = pl.load(h_tile_mx, [0, k_local], [SH_M_TILE, MX_W2_RIGHT_K_TILE])
+                        hs_scale_part = pl.load(
+                            h_tile_scale_mx,
+                            [0, k_local // MX_GROUP],
+                            [SH_M_TILE, MX_W2_RIGHT_K_SCALE_GROUPS],
+                        )
+                        sw2_part = pl.load(
+                            shared_w2,
+                            [k_local, d0],
+                            [MX_W2_RIGHT_K_TILE, D_OUT_TILE],
+                        )
+                        sw2_scale_part = pl.load(
+                            w2_scale_mx,
+                            [k_local // MX_GROUP, d0],
+                            [MX_W2_RIGHT_K_SCALE_GROUPS, D_OUT_TILE],
+                        )
+                        y_acc = pl.matmul_mx_acc(
+                            y_acc,
+                            hs_part,
+                            hs_scale_part,
+                            sw2_part,
+                            sw2_scale_part,
+                        )
+                    for k0 in pl.pipeline(MX_W2_K_TILE, MOE_INTER, MX_W2_K_TILE, stage=2):
+                        for kb in pl.range(MX_W2_K_TILE // MX_W2_RIGHT_K_TILE):
+                            k_local = kb * MX_W2_RIGHT_K_TILE
+                            hs_part = pl.load(
+                                h_tile_mx,
+                                [0, k0 + k_local],
+                                [SH_M_TILE, MX_W2_RIGHT_K_TILE],
+                            )
+                            hs_scale_part = pl.load(
+                                h_tile_scale_mx,
+                                [0, (k0 + k_local) // MX_GROUP],
+                                [SH_M_TILE, MX_W2_RIGHT_K_SCALE_GROUPS],
+                            )
+                            sw2_part = pl.load(
+                                shared_w2,
+                                [k0 + k_local, d0],
+                                [MX_W2_RIGHT_K_TILE, D_OUT_TILE],
+                            )
+                            sw2_scale_part = pl.load(
+                                w2_scale_mx,
+                                [(k0 + k_local) // MX_GROUP, d0],
+                                [MX_W2_RIGHT_K_SCALE_GROUPS, D_OUT_TILE],
+                            )
+                            y_acc = pl.matmul_mx_acc(
+                                y_acc,
+                                hs_part,
+                                hs_scale_part,
+                                sw2_part,
+                                sw2_scale_part,
+                            )
+                    y_bf16 = pl.cast(y_acc, target_type=pl.BF16, mode="rint")
+                    y_valid = pl.set_validshape(y_bf16, SH_VALID_M, D_OUT_TILE)
+                    sh = pl.store(y_valid, [ts0, d0], sh)
 
     return sh
 
