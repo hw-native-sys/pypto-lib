@@ -11,7 +11,7 @@
 import pypto.language as pl
 import pypto.language.distributed as pld
 
-from config import DECODE_MAX_TOKENS, FLASH as M, T_DYN, TP_SIZE
+from config import DECODE_INPUT_MAX_TOKENS, FLASH as M, T_DYN, TP_SIZE
 
 
 # Model config.
@@ -21,7 +21,7 @@ D = M.hidden_size
 @pl.jit.inline(auto_scope=False)
 def decode_tp_input_all_gather(
     local_input: pl.Tensor,
-    input_window: pld.DistributedTensor[[DECODE_MAX_TOKENS, D], pl.BF16],
+    input_window: pld.DistributedTensor[[DECODE_INPUT_MAX_TOKENS, D], pl.BF16],
     input_arrived: pld.DistributedTensor[[TP_SIZE, 1], pl.INT32],
     gathered: pl.Tensor[[T_DYN, D], pl.BF16],
     group_base: pl.Scalar[pl.INT32],

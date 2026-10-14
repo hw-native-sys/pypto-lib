@@ -1383,15 +1383,17 @@ def owner_rows(actual, rank: int, active: int, *, tp_size: int | None = None) ->
 def make_boundary_specs(args, sharded=False):
     """Create replicated mHC inputs, visible boundaries, and runtime scalars.
 
-    With ``sharded`` the per-token boundaries keep only the rank's own slab of
-    the active range (a contiguous split of ``tokens // tp`` rows) and the
-    gather scratch that receives the full-range Attention input is added.
+    With ``sharded`` the per-token boundaries keep the rank's physical slab.
+    ``local_tokens`` supplies a padded slab extent when present; otherwise it
+    is ``ceil(tokens / tp)``. The gather scratch keeps the full Attention extent.
     """
     # Keep one uniform physical slab per rank.  The last rank(s) may contain
     # padding when the active token count is not divisible by TP; the runtime
     # scalar ``num_tokens`` and the collectives' first/count calculation keep
     # those rows out of the gather and reduce-scatter.
-    local = (args.tokens + args.tp - 1) // args.tp if sharded else args.tokens
+    local = args.tokens
+    if sharded:
+        local = getattr(args, "local_tokens", (args.tokens + args.tp - 1) // args.tp)
     generator = torch.Generator().manual_seed(args.seed + 1000)
     specs = []
     shapes = {
@@ -1720,6 +1722,8 @@ def validate_args(parser, args, *, allow_inactive=False):
     args.active_tokens = args.tokens if args.active_tokens is None else args.active_tokens
     if not 1 <= args.active_tokens <= args.tokens or not 1 <= args.requests <= args.active_tokens:
         parser.error("require 1 <= requests <= active tokens <= tokens")
+    if args.requests > MAX_BATCH_PER_DP:
+        parser.error(f"requests must not exceed {MAX_BATCH_PER_DP}")
     if not allow_inactive and args.active_tokens != args.tokens:
         # The reference of this mode publishes every capacity row (caches, state,
         # output), so an inactive suffix cannot be compared yet. Refusing the shape

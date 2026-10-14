@@ -19,6 +19,7 @@ import pypto.language.distributed as pld
 
 from config import (
     COMPRESSED_CACHE_GROUP,
+    DECODE_INPUT_MAX_TOKENS,
     DECODE_MAX_TOKENS,
     WINDOW_CACHE_GROUP,
     FLASH as M,
@@ -213,7 +214,7 @@ def decode_c1a_reuse_sharded(
     ],
     compressed_indices: pl.Tensor[[T_DYN, INDEX_TOPK], pl.INT32],
     gathered: pl.Tensor[[T_DYN, D], pl.BF16],
-    input_window: pld.DistributedTensor[[DECODE_MAX_TOKENS, D], pl.BF16],
+    input_window: pld.DistributedTensor[[DECODE_INPUT_MAX_TOKENS, D], pl.BF16],
     input_arrived: pld.DistributedTensor[[TP_SIZE, 1], pl.INT32],
     output_window: pld.DistributedTensor[[DECODE_MAX_TOKENS, D], pl.FP32],
     output_arrived: pld.DistributedTensor[[TP_SIZE, 1], pl.INT32],
@@ -339,7 +340,7 @@ def decode_c1a_reuse_sharded_test(
     ],
     compressed_indices: pl.Tensor[[T_DYN, INDEX_TOPK], pl.INT32],
     gathered: pl.InOut[pl.Tensor[[T_DYN, D], pl.BF16]],
-    input_window: pld.DistributedTensor[[DECODE_MAX_TOKENS, D], pl.BF16],
+    input_window: pld.DistributedTensor[[DECODE_INPUT_MAX_TOKENS, D], pl.BF16],
     input_arrived: pld.DistributedTensor[[TP_SIZE, 1], pl.INT32],
     output_window: pld.DistributedTensor[[DECODE_MAX_TOKENS, D], pl.FP32],
     output_arrived: pld.DistributedTensor[[TP_SIZE, 1], pl.INT32],
@@ -487,7 +488,7 @@ def _make_program_sharded(tokens, pages, epochs=1):
     ):
         transport = pld.alloc_window_buffer([DECODE_MAX_TOKENS, D], dtype=pl.FP32)
         signals = pld.alloc_window_buffer([TP_SIZE, 1], dtype=pl.INT32)
-        input_transport = pld.alloc_window_buffer([DECODE_MAX_TOKENS, D], dtype=pl.BF16)
+        input_transport = pld.alloc_window_buffer([DECODE_INPUT_MAX_TOKENS, D], dtype=pl.BF16)
         input_signals = pld.alloc_window_buffer([TP_SIZE, 1], dtype=pl.INT32)
         for epoch in pl.range(1, EPOCHS + 1):
             for rank in pl.unroll(TP_SIZE):
@@ -500,7 +501,7 @@ def _make_program_sharded(tokens, pages, epochs=1):
                 ] = wq_b_scale[rank]
                 wkv_scale_r: pl.Tensor[[D // 32, HEAD_DIM], pl.FP8E8M0, pl.MX_B_NN] = wkv_scale[rank]
                 wo_b_scale_r: pl.Tensor[[LOCAL_O_WIDTH // 32, D], pl.FP8E8M0, pl.MX_B_NN] = wo_b_scale[rank]
-                input_window = pld.window(input_transport, [DECODE_MAX_TOKENS, D], dtype=pl.BF16)
+                input_window = pld.window(input_transport, [DECODE_INPUT_MAX_TOKENS, D], dtype=pl.BF16)
                 input_arrived = pld.window(input_signals, [TP_SIZE, 1], dtype=pl.INT32)
                 decode_c1a_reuse_sharded_test(
                     x_hc[rank], pre_mix[rank], hc_attn_fn[rank], hc_attn_scale[rank],

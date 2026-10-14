@@ -437,7 +437,7 @@ INPUT_NAMES = (
 )
 
 
-def make_inputs(batch=32, seed=17, position=127):
+def make_inputs(batch=MAX_BATCH_PER_DP, seed=17, position=127):
     """Distinct request pages, ragged visibility, nontrivial scales and rotary phases."""
     gen = torch.Generator().manual_seed(seed)
     def rand(*shape):
@@ -472,8 +472,8 @@ def make_inputs(batch=32, seed=17, position=127):
 
 
 def make_packed_inputs(tokens=257, requests=4, seed=17, case="mixed", start_pos=None):
-    if not 1 <= requests <= min(32, tokens):
-        raise ValueError("requests must be in [1, min(32, tokens)]")
+    if not 1 <= requests <= min(MAX_BATCH_PER_DP, tokens):
+        raise ValueError(f"requests must be in [1, min({MAX_BATCH_PER_DP}, tokens)]")
     values = make_inputs(1, seed=seed)
     gen = torch.Generator().manual_seed(seed + 1000)
     lengths = torch.full((requests,), tokens // requests, dtype=torch.int64)
@@ -795,8 +795,8 @@ def run_swa(operator, mode, argv=None):
     parser.add_argument("--tp", type=int, default=TP_SIZE, choices=[1, 2, 4])
     parser.add_argument("--ep", type=int, default=EP_SIZE, choices=[2, 4, 8])
     parser.add_argument("--dp", type=int, default=1, choices=[1, 2])
-    parser.add_argument("--tokens", "--batch", type=int, default=32 if mode == "decode" else 257)
-    parser.add_argument("--requests", type=int, help="packed requests; default min(tokens, 32 decode / 4 prefill)")
+    parser.add_argument("--tokens", "--batch", type=int, default=MAX_BATCH_PER_DP if mode == "decode" else 257)
+    parser.add_argument("--requests", type=int, help=f"packed requests; default min(tokens, {MAX_BATCH_PER_DP} decode / 4 prefill)")
     parser.add_argument("--case", default="mixed", choices=["mixed", "prefix", "shuffle", "masked", "zero", "sink"])
     parser.add_argument("--seed", type=int, default=17)
     parser.add_argument("--epochs", type=int, default=1, help="operator calls per dispatch; timing includes all epochs")
@@ -811,15 +811,15 @@ def run_swa(operator, mode, argv=None):
     from pypto.ir import DistributedConfig
 
     args.bench = os.environ.get("PYPTO_BENCH", "0") == "1"
-    args.requests = args.requests if args.requests is not None else min(args.tokens, 32 if mode == "decode" else 4)
+    args.requests = args.requests if args.requests is not None else min(args.tokens, MAX_BATCH_PER_DP if mode == "decode" else 4)
     try:
         devices = list(range(TP_SIZE * args.dp)) if args.device is None else [int(d) for d in args.device.split(",")]
     except ValueError:
         parser.error("device IDs must be comma-separated integers")
     if len(devices) != TP_SIZE * args.dp or len(set(devices)) != len(devices) or min(devices) < 0:
         parser.error("device IDs must be distinct nonnegative integers, with count TP * DP")
-    if not 1 <= args.tokens <= capacity or not 1 <= args.requests <= min(32, args.tokens):
-        parser.error(f"tokens must be in [1, {capacity}]; requests in [1, min(32, tokens)]")
+    if not 1 <= args.tokens <= capacity or not 1 <= args.requests <= min(MAX_BATCH_PER_DP, args.tokens):
+        parser.error(f"tokens must be in [1, {capacity}]; requests in [1, min({MAX_BATCH_PER_DP}, tokens)]")
     if not 1 <= args.epochs <= 1000:
         parser.error("epochs must be in [1, 1000]")
     if args.bench and args.enable_chip_swimlane:

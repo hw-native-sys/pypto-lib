@@ -16,7 +16,7 @@ import pypto.language.distributed as pld
 import torch
 
 from sparse_attention import golden_swa_attention
-from config import PREFILL_MAX_TOKENS, WINDOW_CACHE_GROUP, FLASH as M, ORI_BLOCKS_DYN, T_DYN, TP_SIZE
+from config import MAX_BATCH_PER_DP, PREFILL_MAX_TOKENS, WINDOW_CACHE_GROUP, FLASH as M, ORI_BLOCKS_DYN, T_DYN, TP_SIZE
 
 from hc_mixes import golden_mhc_mixes
 from hc_post import golden_mhc_post
@@ -915,8 +915,8 @@ def run_prefill_swa(argv=None):
         parser.error("device IDs must be comma-separated integers")
     if len(devices) != TP_SIZE * args.dp or len(set(devices)) != len(devices) or min(devices) < 0:
         parser.error("device IDs must be distinct nonnegative integers, with count TP * DP")
-    if not 1 <= args.tokens <= PREFILL_MAX_TOKENS or not 1 <= args.requests <= min(32, args.tokens):
-        parser.error(f"tokens must be in [1, {PREFILL_MAX_TOKENS}]; requests in [1, min(32, tokens)]")
+    if not 1 <= args.tokens <= PREFILL_MAX_TOKENS or not 1 <= args.requests <= min(MAX_BATCH_PER_DP, args.tokens):
+        parser.error(f"tokens must be in [1, {PREFILL_MAX_TOKENS}]; requests in [1, min({MAX_BATCH_PER_DP}, tokens)]")
     if args.dp_tokens is not None:
         try:
             args.dp_tokens = tuple(int(n) for n in args.dp_tokens.split(","))

@@ -28,6 +28,7 @@ import pypto.language.distributed as pld
 
 from config import (
     FLASH as M,
+    DECODE_INPUT_MAX_TOKENS,
     DECODE_MAX_TOKENS,
     AttentionMode,
     COMPRESSED_CACHE_GROUP,
@@ -298,7 +299,7 @@ def decode_layer(
     next_pre_mix: pl.Out[pl.Tensor[[LOCAL_T_DYN, HC_MULT], pl.FP32]],
     x_mixed: pl.Out[pl.Tensor[[LOCAL_T_DYN, D], pl.BF16]],
     x_next: pl.Out[pl.Tensor[[LOCAL_T_DYN, HC_MULT, D], pl.FP32]],
-    attention_input_window: pld.DistributedTensor[[DECODE_MAX_TOKENS, D], pl.BF16],
+    attention_input_window: pld.DistributedTensor[[DECODE_INPUT_MAX_TOKENS, D], pl.BF16],
     attention_input_arrived: pld.DistributedTensor[[TP_SIZE, 1], pl.INT32],
     attention_output_window: pld.DistributedTensor[[DECODE_MAX_TOKENS, D], pl.FP32],
     attention_output_arrived: pld.DistributedTensor[[TP_SIZE, 1], pl.INT32],
@@ -552,7 +553,7 @@ def l3_decode_layer(
     index_block_table.bind_dynamic(2, TABLE_DYN)
     state_cache.bind_dynamic(1, STATE_BLOCKS_DYN)
     candidate_mask.bind_dynamic(2, CMP_POSITIONS_DYN)
-    attention_input_buffer = pld.alloc_window_buffer([DECODE_MAX_TOKENS, D], dtype=pl.BF16)
+    attention_input_buffer = pld.alloc_window_buffer([DECODE_INPUT_MAX_TOKENS, D], dtype=pl.BF16)
     attention_input_signal_buffer = pld.alloc_window_buffer([TP_SIZE, 1], dtype=pl.INT32)
     attention_output_buffer = pld.alloc_window_buffer([DECODE_MAX_TOKENS, D], dtype=pl.FP32)
     attention_output_signal_buffer = pld.alloc_window_buffer([TP_SIZE, 1], dtype=pl.INT32)
@@ -570,7 +571,7 @@ def l3_decode_layer(
         [EP_SIZE, N_LOCAL_EXPERTS, SIGNAL_PAD], dtype=pl.INT32
     )
     for rank in pl.range(pld.world_size()):
-        attention_input_window = pld.window(attention_input_buffer, [DECODE_MAX_TOKENS, D], dtype=pl.BF16)
+        attention_input_window = pld.window(attention_input_buffer, [DECODE_INPUT_MAX_TOKENS, D], dtype=pl.BF16)
         attention_input_arrived = pld.window(attention_input_signal_buffer, [TP_SIZE, 1], dtype=pl.INT32)
         attention_output_window = pld.window(attention_output_buffer, [DECODE_MAX_TOKENS, D], dtype=pl.FP32)
         attention_output_arrived = pld.window(attention_output_signal_buffer, [TP_SIZE, 1], dtype=pl.INT32)
@@ -910,10 +911,11 @@ def build_tensor_specs(layer_id=0, seed=0):
     import decode_swa
     from moe import build_tensor_specs as build_moe_specs
 
-    global_tokens = MOE_TOKENS * TP_SIZE
+    global_tokens = DECODE_MAX_TOKENS
     args = SimpleNamespace(
         tokens=global_tokens,
         active_tokens=global_tokens,
+        local_tokens=MOE_TOKENS,
         requests=min(global_tokens, 8),
         tp=TP_SIZE,
         dp=EP_SIZE // TP_SIZE,
@@ -958,7 +960,7 @@ def build_tensor_specs(layer_id=0, seed=0):
         "norm_weight": "ffn_norm_weight",
         "num_tokens": "moe_num_tokens",
     }
-    for spec in build_moe_specs(MOE_TOKENS):
+    for spec in build_moe_specs(_fixture_moe_counts()):
         if not isinstance(spec, TensorSpec) or spec.name in {"x_hc", "pre_mix"}:
             continue
         name = moe_aliases.get(spec.name, spec.name)
@@ -1033,6 +1035,14 @@ def build_tensor_specs(layer_id=0, seed=0):
     return specs
 
 
+def _fixture_moe_counts():
+    """Count valid decode rows in each rank's padded physical slab."""
+    return torch.tensor(
+        [max(0, min(MOE_TOKENS, DECODE_MAX_TOKENS - (rank % TP_SIZE) * MOE_TOKENS)) for rank in range(EP_SIZE)],
+        dtype=torch.int32,
+    )
+
+
 def golden_l3_decode_layer(tensors):
     """Run the sequence-parallel Attention golden, then the distributed MoE golden."""
     import decode_swa
@@ -1071,6 +1081,8 @@ def _compare_active_rows_per_rank(compare, counts):
     """Apply a composed-layer precision budget independently to every EP rank."""
     def compare_active(actual, expected, **kwargs):
         for rank, active in enumerate(counts.tolist()):
+            if active == 0:
+                continue
             passed, detail = compare(
                 actual[rank : rank + 1, :active],
                 expected[rank : rank + 1, :active],
@@ -1344,7 +1356,7 @@ def validate(argv=None):
     if len(devices) != EP_SIZE:
         parser.error(f"need exactly {EP_SIZE} devices, got {devices}")
     specs = build_tensor_specs(args.layer_id, args.seed)
-    counts = torch.full((EP_SIZE,), MOE_TOKENS, dtype=torch.int32)
+    counts = _fixture_moe_counts()
     return run(
         fn=l3_decode_layer,
         specs=specs,
@@ -1383,10 +1395,9 @@ def validate(argv=None):
             ),
             "attention_pre_mix": ratio_allclose(atol=1e-4, rtol=1e-4),
             "gathered": _decode_utils.compare_attention_gather,
-            "next_pre_mix": ratio_allclose(
-                atol=2.5e-5,
-                rtol=5e-3,
-                max_error_ratio=0.03,
+            "next_pre_mix": _compare_active_rows_per_rank(
+                ratio_allclose(atol=2.5e-5, rtol=5e-3, max_error_ratio=0.03),
+                counts,
             ),
             "x_mixed": _compare_active_rows_per_rank(
                 ratio_reldiff(diff_thd=0.01, pct_thd=0.05),

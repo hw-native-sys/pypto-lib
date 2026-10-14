@@ -6,12 +6,17 @@
 # INCLUDING BUT NOT LIMITED TO NON-INFRINGEMENT, MERCHANTABILITY, OR FITNESS FOR A PARTICULAR PURPOSE.
 # See LICENSE in the root of the software repository for the full text of the License.
 # -----------------------------------------------------------------------------------------------------------
-# ci: devices=2
+# ci: devices=4
 # ci: no-sim
 """DeepSeek-V4.1-Flash 40-layer decode backbone."""
 
 import argparse
 import inspect
+import sys
+
+if __name__ == "__main__":
+    if not any(arg == "--ep" or arg.startswith("--ep=") for arg in sys.argv[1:]):
+        sys.argv.append("--ep=4")
 
 import pypto.language as pl
 import pypto.language.distributed as pld
@@ -28,6 +33,7 @@ from config import (
     T_DYN,
     BLOCK_SIZE,
     COMPRESSED_CACHE_GROUP,
+    DECODE_INPUT_MAX_TOKENS,
     DECODE_MAX_TOKENS,
     INDEX_CACHE_GROUP,
     STATE_CAPACITY,
@@ -184,7 +190,7 @@ def _decode_encoder(
     shared_w1: pl.Tensor[[N_LAYERS, D, MOE_INTER], pl.FP8E4M3FN],
     shared_w2: pl.Tensor[[N_LAYERS, MOE_INTER, D], pl.FP8E4M3FN],
     shared_w3: pl.Tensor[[N_LAYERS, D, MOE_INTER], pl.FP8E4M3FN],
-    attention_input_window: pld.DistributedTensor[[DECODE_MAX_TOKENS, D], pl.BF16],
+    attention_input_window: pld.DistributedTensor[[DECODE_INPUT_MAX_TOKENS, D], pl.BF16],
     attention_input_arrived: pld.DistributedTensor[[TP_SIZE, 1], pl.INT32],
     attention_output_window: pld.DistributedTensor[[DECODE_MAX_TOKENS, D], pl.FP32],
     attention_output_arrived: pld.DistributedTensor[[TP_SIZE, 1], pl.INT32],
@@ -2153,7 +2159,7 @@ def _decode_decoder(
     shared_w1: pl.Tensor[[N_LAYERS, D, MOE_INTER], pl.FP8E4M3FN],
     shared_w2: pl.Tensor[[N_LAYERS, MOE_INTER, D], pl.FP8E4M3FN],
     shared_w3: pl.Tensor[[N_LAYERS, D, MOE_INTER], pl.FP8E4M3FN],
-    attention_input_window: pld.DistributedTensor[[DECODE_MAX_TOKENS, D], pl.BF16],
+    attention_input_window: pld.DistributedTensor[[DECODE_INPUT_MAX_TOKENS, D], pl.BF16],
     attention_input_arrived: pld.DistributedTensor[[TP_SIZE, 1], pl.INT32],
     attention_output_window: pld.DistributedTensor[[DECODE_MAX_TOKENS, D], pl.FP32],
     attention_output_arrived: pld.DistributedTensor[[TP_SIZE, 1], pl.INT32],
@@ -4131,7 +4137,7 @@ def _decode_fwd(
     shared_w1: pl.Tensor[[N_LAYERS, D, MOE_INTER], pl.FP8E4M3FN],
     shared_w2: pl.Tensor[[N_LAYERS, MOE_INTER, D], pl.FP8E4M3FN],
     shared_w3: pl.Tensor[[N_LAYERS, D, MOE_INTER], pl.FP8E4M3FN],
-    attention_input_window: pld.DistributedTensor[[DECODE_MAX_TOKENS, D], pl.BF16],
+    attention_input_window: pld.DistributedTensor[[DECODE_INPUT_MAX_TOKENS, D], pl.BF16],
     attention_input_arrived: pld.DistributedTensor[[TP_SIZE, 1], pl.INT32],
     attention_output_window: pld.DistributedTensor[[DECODE_MAX_TOKENS, D], pl.FP32],
     attention_output_arrived: pld.DistributedTensor[[TP_SIZE, 1], pl.INT32],
@@ -4459,7 +4465,7 @@ def l3_decode_fwd(
     state_cache_pool.bind_dynamic(1, FWD_STATE_BLOCKS_DYN)
     index_block_table.bind_dynamic(1, B_DYN)
     index_block_table.bind_dynamic(2, TABLE_DYN)
-    attention_input_buffer = pld.alloc_window_buffer([DECODE_MAX_TOKENS, D], dtype=pl.BF16)
+    attention_input_buffer = pld.alloc_window_buffer([DECODE_INPUT_MAX_TOKENS, D], dtype=pl.BF16)
     attention_input_signal_buffer = pld.alloc_window_buffer([TP_SIZE, 1], dtype=pl.INT32)
     attention_output_buffer = pld.alloc_window_buffer([DECODE_MAX_TOKENS, D], dtype=pl.FP32)
     attention_output_signal_buffer = pld.alloc_window_buffer([TP_SIZE, 1], dtype=pl.INT32)
@@ -4477,7 +4483,7 @@ def l3_decode_fwd(
         [EP_SIZE, N_LOCAL_EXPERTS, SIGNAL_PAD], dtype=pl.INT32
     )
     for rank in pl.range(pld.world_size()):
-        attention_input_window = pld.window(attention_input_buffer, [DECODE_MAX_TOKENS, D], dtype=pl.BF16)
+        attention_input_window = pld.window(attention_input_buffer, [DECODE_INPUT_MAX_TOKENS, D], dtype=pl.BF16)
         attention_input_arrived = pld.window(attention_input_signal_buffer, [TP_SIZE, 1], dtype=pl.INT32)
         attention_output_window = pld.window(attention_output_buffer, [DECODE_MAX_TOKENS, D], dtype=pl.FP32)
         attention_output_arrived = pld.window(attention_output_signal_buffer, [TP_SIZE, 1], dtype=pl.INT32)
@@ -4712,7 +4718,7 @@ def _fixture_extent(dim):
 
 
 def build_tensor_specs():
-    """Build the TP1/EP2 twelve-request decode smoke fixture."""
+    """Build the TP1 twelve-request decode smoke fixture."""
     from golden import ScalarSpec, TensorSpec
 
     if TP_SIZE != 1:
@@ -4764,7 +4770,7 @@ def validate(argv=None):
     parser = argparse.ArgumentParser()
     parser.add_argument("-p", "--platform", default="a5", choices=["a5"])
     parser.add_argument("--tp", type=int, default=TP_SIZE, choices=[1])
-    parser.add_argument("--ep", type=int, default=EP_SIZE, choices=[2, 4, 8])
+    parser.add_argument("--ep", type=int, default=EP_SIZE, choices=[4, 8])
     parser.add_argument("-d", "--device", default=",".join(str(rank) for rank in range(EP_SIZE)))
     parser.add_argument("--compile-only", action="store_true")
     parser.add_argument("--dump-passes", action="store_true")
@@ -4787,7 +4793,7 @@ def validate(argv=None):
             dump_passes=args.dump_passes,
             enable_scope_stats=args.enable_scope_stats,
             log_level=args.log_level,
-            ring_heap=4 * 1024**3,
+            ring_heap=(2 * 1024**3, 2 * 1024**3, 1024**3, 512 * 1024**2),
             ring_dep_pool=131072,
             distributed_config=DistributedConfig(
                 device_ids=devices,

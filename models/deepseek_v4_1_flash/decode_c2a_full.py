@@ -17,6 +17,7 @@ import pypto.language.distributed as pld
 
 from config import (
     FLASH as M,
+    DECODE_INPUT_MAX_TOKENS,
     DECODE_MAX_TOKENS,
     TP_SIZE,
     T_DYN,
@@ -285,7 +286,7 @@ def decode_c2a_full_sharded(
     attention_hidden: pl.Tensor[[LOCAL_T_DYN, HC_MULT, D], pl.FP32],
     attention_pre_mix: pl.Tensor[[LOCAL_T_DYN, HC_MULT], pl.FP32],
     gathered: pl.Tensor[[T_DYN, D], pl.BF16],
-    input_window: pld.DistributedTensor[[DECODE_MAX_TOKENS, D], pl.BF16],
+    input_window: pld.DistributedTensor[[DECODE_INPUT_MAX_TOKENS, D], pl.BF16],
     input_arrived: pld.DistributedTensor[[TP_SIZE, 1], pl.INT32],
     output_window: pld.DistributedTensor[[DECODE_MAX_TOKENS, D], pl.FP32],
     output_arrived: pld.DistributedTensor[[TP_SIZE, 1], pl.INT32],
@@ -557,7 +558,7 @@ def decode_c2a_full_rank_sharded(
     attention_hidden: pl.Out[pl.Tensor[[LOCAL_T_DYN, HC_MULT, D], pl.FP32]],
     attention_pre_mix: pl.Out[pl.Tensor[[LOCAL_T_DYN, HC_MULT], pl.FP32]],
     gathered: pl.Tensor[[T_DYN, D], pl.BF16],
-    input_window: pld.DistributedTensor[[DECODE_MAX_TOKENS, D], pl.BF16],
+    input_window: pld.DistributedTensor[[DECODE_INPUT_MAX_TOKENS, D], pl.BF16],
     input_arrived: pld.DistributedTensor[[TP_SIZE, 1], pl.INT32],
     output_window: pld.DistributedTensor[[DECODE_MAX_TOKENS, D], pl.FP32],
     output_arrived: pld.DistributedTensor[[TP_SIZE, 1], pl.INT32],
@@ -904,13 +905,13 @@ def _make_program_sharded(world_size, epochs, specs):
     ):
         data_buffer = pld.alloc_window_buffer([DECODE_MAX_TOKENS, D], dtype=pl.FP32)
         arrived_buffer = pld.alloc_window_buffer([TP_SIZE, 1], dtype=pl.INT32)
-        input_transport = pld.alloc_window_buffer([DECODE_MAX_TOKENS, D], dtype=pl.BF16)
+        input_transport = pld.alloc_window_buffer([DECODE_INPUT_MAX_TOKENS, D], dtype=pl.BF16)
         input_signals = pld.alloc_window_buffer([TP_SIZE, 1], dtype=pl.INT32)
         for step in pl.range(epochs):
             for rank in pl.range(world_size):
                 data = pld.window(data_buffer, [DECODE_MAX_TOKENS, D], dtype=pl.FP32)
                 arrived = pld.window(arrived_buffer, [TP_SIZE, 1], dtype=pl.INT32)
-                input_window = pld.window(input_transport, [DECODE_MAX_TOKENS, D], dtype=pl.BF16)
+                input_window = pld.window(input_transport, [DECODE_INPUT_MAX_TOKENS, D], dtype=pl.BF16)
                 input_arrived = pld.window(input_signals, [TP_SIZE, 1], dtype=pl.INT32)
                 # The rank takes these scales as MX_B_NN; a bare slice is ND, so annotate it.
                 wq_a_scale_r: pl.Tensor[[D // 32, Q_LORA], pl.FP8E8M0, pl.MX_B_NN] = wq_a_scale[rank]
