@@ -78,7 +78,8 @@ jobs:
           echo "run_deepseek_serving_tests=false" >> "$GITHUB_OUTPUT"
           echo "run_dspark_serving_tests=false" >> "$GITHUB_OUTPUT"
           select_all=false
-          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+          if [ "${{ github.event_name }}" = "push" ] ||
+             [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
             select_all=true
           elif [ "${{ github.event_name }}" = "pull_request" ]; then
             DIFF_RANGE="${{ github.event.pull_request.base.sha }}...${{ github.event.pull_request.head.sha }}"
@@ -104,7 +105,11 @@ jobs:
           # selection additionally honors file-level exclusions such as no-sim.
           SIM_PLATFORMS=()
           for platform in a2a3 a2a3sim a5 a5sim; do
-            if [ "$select_all" = "true" ]; then
+            # Main pushes run the full examples suite on A2/A3 and both
+            # simulators; A5 device coverage stays in PR and daily CI.
+            if [ "${{ github.event_name }}" = "push" ] && [ "$platform" = "a5" ]; then
+              FILES=""
+            elif [ "$select_all" = "true" ]; then
               FILES=$(python .github/scripts/detect_changes.py --all --root examples --platform "$platform")
             else
               FILES=$(printf '%s\n' "$CHANGED_FILES" | python .github/scripts/detect_changes.py --platform "$platform")
