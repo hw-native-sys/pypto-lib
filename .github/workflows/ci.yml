@@ -54,8 +54,9 @@ jobs:
   detect-changes:
     runs-on: ubuntu-latest
     outputs:
-      has_changes: ${{ steps.check.outputs.has_changes }}
+      sim_matrix: ${{ steps.check.outputs.sim_matrix }}
       files: ${{ steps.check.outputs.files }}
+      a2a3sim_files: ${{ steps.check.outputs.a2a3sim_files }}
       a5sim_files: ${{ steps.check.outputs.a5sim_files }}
       run_qwen_serving_tests: ${{ steps.check.outputs.run_qwen_serving_tests }}
       run_deepseek_serving_tests: ${{ steps.check.outputs.run_deepseek_serving_tests }}
@@ -76,16 +77,10 @@ jobs:
           echo "run_qwen_serving_tests=false" >> "$GITHUB_OUTPUT"
           echo "run_deepseek_serving_tests=false" >> "$GITHUB_OUTPUT"
           echo "run_dspark_serving_tests=false" >> "$GITHUB_OUTPUT"
-          echo "a5_files=$(python .github/scripts/detect_changes.py --all --root examples --platform a5)" >> "$GITHUB_OUTPUT"
-
+          select_all=false
           if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
-            echo "has_changes=true" >> "$GITHUB_OUTPUT"
-            echo "files=" >> "$GITHUB_OUTPUT"
-            echo "Manual runs retain the full smoke suite."
-            exit 0
-          fi
-
-          if [ "${{ github.event_name }}" = "pull_request" ]; then
+            select_all=true
+          elif [ "${{ github.event_name }}" = "pull_request" ]; then
             DIFF_RANGE="${{ github.event.pull_request.base.sha }}...${{ github.event.pull_request.head.sha }}"
           else
             BEFORE="${{ github.event.before }}"
@@ -93,44 +88,39 @@ jobs:
                [ "$BEFORE" = "0000000000000000000000000000000000000000" ] ||
                ! git cat-file -e "$BEFORE^{commit}" 2>/dev/null ||
                ! git merge-base --is-ancestor "$BEFORE" "${{ github.sha }}"; then
-              echo "has_changes=true" >> "$GITHUB_OUTPUT"
-              echo "files=" >> "$GITHUB_OUTPUT"
-              echo "Push base is unavailable; retaining the full smoke suite."
-              exit 0
+              select_all=true
+            else
+              DIFF_RANGE="$BEFORE..${{ github.sha }}"
             fi
-            DIFF_RANGE="$BEFORE..${{ github.sha }}"
           fi
 
-          CHANGED_FILES=$(git diff --name-only "$DIFF_RANGE")
-          # Map the raw diff to the runnable scripts CI must exercise:
-          #  - a changed models/ source file selects every runnable file that
-          #    (transitively) imports it, not just the file itself;
-          #  - runtime-affecting changes outside models/ select all examples;
-          #  - documentation-only paths select no simulator or device work.
-          # See .github/scripts/detect_changes.py for the rules.
-          FILES=$(printf '%s\n' "$CHANGED_FILES" | python .github/scripts/detect_changes.py --platform a2a3)
-          SIM_FILES=$(printf '%s\n' "$CHANGED_FILES" | python .github/scripts/detect_changes.py --platform a5sim)
-          if [ "${{ github.event_name }}" = "pull_request" ]; then
-            if [ -n "$FILES$SIM_FILES" ]; then
-              echo "has_changes=true" >> "$GITHUB_OUTPUT"
+          CHANGED_FILES=""
+          if [ "$select_all" = "false" ]; then
+            CHANGED_FILES=$(git diff --name-only "$DIFF_RANGE")
+
+          fi
+
+          # Device and simulator entries share platform ownership; simulator
+          # selection additionally honors file-level exclusions such as no-sim.
+          SIM_PLATFORMS=()
+          for platform in a2a3 a2a3sim a5 a5sim; do
+            if [ "$select_all" = "true" ]; then
+              FILES=$(python .github/scripts/detect_changes.py --all --root examples --platform "$platform")
             else
-              echo "has_changes=false" >> "$GITHUB_OUTPUT"
+              FILES=$(printf '%s\n' "$CHANGED_FILES" | python .github/scripts/detect_changes.py --platform "$platform")
             fi
-          else
-            # Main pushes retain the historical full examples smoke for every
-            # runtime-affecting change, including model paths intentionally
-            # excluded from the PR runner matrix.
-            RUNTIME_IMPACT=$(
-              printf '%s\n' "$CHANGED_FILES" |
-                python .github/scripts/detect_changes.py --runtime-impact
-            )
-            echo "has_changes=$RUNTIME_IMPACT" >> "$GITHUB_OUTPUT"
-          fi
-          if [ "${RUNTIME_IMPACT:-}" = "false" ]; then
-            echo "a5_files=" >> "$GITHUB_OUTPUT"
-          fi
-          echo "files=$FILES" >> "$GITHUB_OUTPUT"
-          echo "a5sim_files=$SIM_FILES" >> "$GITHUB_OUTPUT"
+            if [ "$platform" = "a2a3" ]; then
+              echo "files=$FILES" >> "$GITHUB_OUTPUT"
+            else
+              echo "${platform}_files=$FILES" >> "$GITHUB_OUTPUT"
+            fi
+            if [[ "$platform" = *sim ]] && [ -n "$FILES" ]; then
+              SIM_PLATFORMS+=("$platform")
+            fi
+            echo "Selected $platform files: $FILES"
+          done
+          SIM_MATRIX=$(python -c 'import json, sys; print(json.dumps(sys.argv[1:]))' "${SIM_PLATFORMS[@]}")
+          echo "sim_matrix=$SIM_MATRIX" >> "$GITHUB_OUTPUT"
 
           # Serving e2e jobs are model-specific and expensive. CI-infra edits
           # (.github/**) must not trigger them.
@@ -146,20 +136,10 @@ jobs:
              printf '%s\n' "$CHANGED_FILES" | grep -qE '^models/deepseek_v4_flash_dspark/'; then
             echo "run_dspark_serving_tests=true" >> "$GITHUB_OUTPUT"
           fi
-          # Select A5 device entries from the same directory ownership rules.
-          if [ "${{ github.event_name }}" = "pull_request" ]; then
-            A5_FILES=$(
-              printf '%s\n' "$CHANGED_FILES" |
-                python .github/scripts/detect_changes.py --a5-entries
-            )
-            echo "a5_files=$A5_FILES" >> "$GITHUB_OUTPUT"
-            echo "Selected A5 entries: $A5_FILES"
-          fi
-          echo "Selected files: $FILES"
 
   sim:
     needs: detect-changes
-    if: needs.detect-changes.outputs.has_changes == 'true'
+    if: needs.detect-changes.outputs.sim_matrix != '[]'
     # Simulator job: no device needed, so it runs on the CPU runner — but on the
     # host, through the same setup-ci-job composite as the a2a3 device job (same
     # user, same bundle venv + activate.sh, same ci-cache). needs-device:false is
@@ -169,7 +149,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        platform: [a2a3sim, a5sim]
+        platform: ${{ fromJSON(needs.detect-changes.outputs.sim_matrix) }}
     defaults:
       run:
         working-directory: checkout
@@ -214,15 +194,7 @@ jobs:
         run: |
           source activate.sh
           set +e
-          if [ "${{ github.event_name }}" = "pull_request" ]; then
-            FILES="${{ needs.detect-changes.outputs.files }}"
-          else
-            FILES=$(python .github/scripts/detect_changes.py --all --root examples --platform ${{ matrix.platform }})
-          fi
-          if [ "${{ github.event_name }}" = "pull_request" ] && [ "${{ matrix.platform }}" = "a5sim" ]; then
-            FILES="${{ needs.detect-changes.outputs.a5sim_files }}"
-          fi
-          FILES=$(printf '%s\n' $FILES | python .github/scripts/detect_changes.py --filter --platform ${{ matrix.platform }})
+          FILES="${{ needs.detect-changes.outputs[format('{0}_files', matrix.platform)] }}"
           if [ -z "$FILES" ]; then
             echo "No runnable changed files; nothing to test."
             exit 0
@@ -255,7 +227,7 @@ jobs:
 
   a2a3:
     needs: detect-changes
-    if: needs.detect-changes.outputs.has_changes == 'true'
+    if: needs.detect-changes.outputs.files != ''
     # Runs directly on the host like pypto's dist-system-tests — multi-card
     # kernels use HCCL, which needs a host-only env (set_env.sh, HCCL plugin
     # paths); under docker the chip child silent-crashes in comm_init. It holds
@@ -314,11 +286,7 @@ jobs:
         run: |
           source activate.sh
           set +e
-          if [ "${{ github.event_name }}" = "pull_request" ]; then
-            FILES="${{ needs.detect-changes.outputs.files }}"
-          else
-            FILES=$(python .github/scripts/detect_changes.py --all --root examples --platform a2a3)
-          fi
+          FILES="${{ needs.detect-changes.outputs.files }}"
           if [ -z "$FILES" ]; then
             echo "No runnable changed files; nothing to test."
             exit 0

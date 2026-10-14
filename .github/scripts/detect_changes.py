@@ -14,14 +14,13 @@ which runnable scripts CI should execute. A "runnable" file is one that has a
 
 Selection rules
 ---------------
-1. A changed file under ``models/`` pulls in not just itself but every file
+1. A changed file under ``models/`` or ``examples/`` pulls in itself and every file
    that (transitively) imports it. Model kernels are split across many sibling
    modules (``config``, ``rmsnorm``, ``qkv_proj_rope`` …) and a leaf change can
    break any downstream kernel, so we walk the reverse-import graph and run
-   every runnable dependent. Only ``models/`` needs this: any ``examples/``
-   change is already covered by rule 2's full-suite run.
-2. Any runtime-affecting change **outside** ``models/`` selects *all* runnable
-   ``examples/`` files as a smoke test. Documentation and documentation-only
+   every runnable dependent. The same import graph covers example helpers.
+2. Any runtime-affecting change **outside** ``models/`` and ``examples/``
+   selects *all* runnable ``examples/`` files as a smoke test. Documentation and documentation-only
    control files are explicitly exempt because they cannot change generated
    kernels or runtime behavior. Unknown paths remain runtime-affecting so the
    safe default is still the full smoke suite.
@@ -58,6 +57,7 @@ from collections import defaultdict
 
 # Directories whose .py files participate in the bare-name sibling-import graph.
 SOURCE_ROOTS = ("examples", "models")
+SOURCE_PREFIXES = tuple(root + "/" for root in SOURCE_ROOTS)
 
 PLATFORM_CONFIG = Path(__file__).resolve().parents[1] / "ci_platforms.json"
 
@@ -253,15 +253,15 @@ def has_runtime_impact(changed):
 def select_runnable(changed, platform="a2a3"):
     """Select affected entries, then filter by directory platform ownership."""
     changed = [path for path in changed if path]
-    seeds = [path for path in changed if path.startswith("models/")
+    seeds = [path for path in changed if path.startswith(SOURCE_PREFIXES)
              and path.endswith(".py") and not path.endswith("_draft.py")
              and os.path.isfile(path)]
     selected = closure(seeds, build_reverse_graph())
     for path in changed:
-        if path.startswith("models/") and path.endswith("/conftest.py"):
+        if path.startswith(SOURCE_PREFIXES) and path.endswith("/conftest.py"):
             selected.update(f for f in _iter_source_files()
                             if f.startswith(os.path.dirname(path) + "/"))
-    if any(not path.startswith("models/") and not _is_non_runtime_path(path) for path in changed):
+    if any(not path.startswith(SOURCE_PREFIXES) and not _is_non_runtime_path(path) for path in changed):
         selected.update(f for f in _iter_source_files() if f.startswith("examples/"))
     return sorted(f for f in selected if os.path.isfile(f) and _has_main(f)
                   and supports_platform(f, platform))
