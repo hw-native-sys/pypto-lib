@@ -79,8 +79,10 @@ def prefill_c1a_publish_window(
     return cache, scales
 
 
-def make_mx_projection(width, output_width, output_dtype=pl.BF16, *, name_hint="attention_mx_projection"):
+def make_mx_projection(width, output_width, output_dtype=pl.BF16, *, name_hint="attention_mx_projection", n_tile=N_TILE):
     """Specialize an MXFP8 projection without expanding weights in HBM."""
+    if n_tile <= 0 or n_tile % 16 or output_width % n_tile:
+        raise ValueError("MXFP8 output tile must be a positive multiple of 16 that divides output_width")
     fp32_output = output_dtype == pl.FP32
 
     @pl.jit.inline
@@ -93,8 +95,8 @@ def make_mx_projection(width, output_width, output_dtype=pl.BF16, *, name_hint="
     ):
         for mt in pl.parallel((num_tokens + MX_M_TILE - 1) // MX_M_TILE):
             t0 = mt * MX_M_TILE
-            for block in pl.spmd(output_width // N_TILE, name_hint=name_hint):
-                n0 = block * N_TILE
+            for block in pl.spmd(output_width // n_tile, name_hint=name_hint):
+                n0 = block * n_tile
                 rows = pl.min(MX_M_TILE, num_tokens - t0)
                 first = pl.load(x, [t0, 0], [MX_M_TILE, K_TILE], valid_shape=[rows, K_TILE])
                 first = pl.set_validshape(pl.fillpad(first, pad_value=pl.PadValue.zero), MX_M_TILE, K_TILE)
@@ -117,8 +119,8 @@ def make_mx_projection(width, output_width, output_dtype=pl.BF16, *, name_hint="
                 )
                 a0 = firstq_payload
                 sa0 = pl.reinterpret_view(firstq_packed, pl.FP8E8M0)
-                b0 = pl.load(weight, [0, n0], [K_TILE, N_TILE])
-                sb0 = pl.load(scale, [0, n0], [K_TILE // 32, N_TILE])
+                b0 = pl.load(weight, [0, n0], [K_TILE, n_tile])
+                sb0 = pl.load(scale, [0, n0], [K_TILE // 32, n_tile])
                 acc = pl.matmul_mx(a0, sa0, b0, sb0)
                 for kb in pl.range(1, width // K_TILE):
                     k0 = kb * K_TILE
@@ -147,14 +149,14 @@ def make_mx_projection(width, output_width, output_dtype=pl.BF16, *, name_hint="
                     )
                     a = nextq_payload
                     sa = pl.reinterpret_view(nextq_packed, pl.FP8E8M0)
-                    b = pl.load(weight, [k0, n0], [K_TILE, N_TILE])
-                    sb = pl.load(scale, [k0 // 32, n0], [K_TILE // 32, N_TILE])
+                    b = pl.load(weight, [k0, n0], [K_TILE, n_tile])
+                    sb = pl.load(scale, [k0 // 32, n0], [K_TILE // 32, n_tile])
                     acc = pl.matmul_mx_acc(acc, a, sa, b, sb)
                 if fp32_output:
-                    output = pl.store(pl.set_validshape(pl.mul(acc, 1.0), rows, N_TILE), [t0, n0], output)
+                    output = pl.store(pl.set_validshape(pl.mul(acc, 1.0), rows, n_tile), [t0, n0], output)
                 else:
                     value = pl.cast(acc, target_type=pl.BF16, mode="rint")
-                    output = pl.store(pl.set_validshape(value, rows, N_TILE), [t0, n0], output)
+                    output = pl.store(pl.set_validshape(value, rows, n_tile), [t0, n0], output)
         return output
 
     return project

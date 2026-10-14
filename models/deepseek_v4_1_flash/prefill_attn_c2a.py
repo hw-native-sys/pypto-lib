@@ -47,7 +47,9 @@ from qkv_proj_rope import (
     make_rope,
 )
 from o_proj import prefill_o_proj
-from qkv_proj_rope import prefill_q_proj_qr, prefill_q_proj_rope, kv_proj_rope
+from qkv_proj_rope import (
+    prefill_q_proj_qr, prefill_q_proj_rope, kv_proj_rope, _make_q_proj_rope, _prefill_rotate_q,
+)
 from compressor import compressor_ratio2
 from qkv_proj_rope import make_mx_projection
 
@@ -72,57 +74,43 @@ PREFILL_COMPRESSOR_K_CHUNK = D // PREFILL_COMPRESSOR_SEGMENTS
 PREFILL_C2A_FULL_RING_HEAP = (2 * 1024 * 1024 * 1024,) * 4
 
 
-@pl.jit.inline(auto_scope=False)
-def prefill_c2a_qkv(
-    x: pl.Tensor[[T_DYN, D], pl.BF16],
-    wq_a: pl.Tensor[[D, Q_LORA], pl.FP8E4M3FN],
-    wq_a_scale: pl.Tensor[[D // 32, Q_LORA], pl.FP8E8M0, pl.MX_B_NN],
-    q_norm_weight: pl.Tensor[[Q_LORA], pl.BF16],
-    wq_b: pl.Tensor[[Q_LORA, LOCAL_H * HEAD_DIM], pl.FP8E4M3FN],
-    wq_b_scale: pl.Tensor[[Q_LORA // 32, LOCAL_H * HEAD_DIM], pl.FP8E8M0, pl.MX_B_NN],
-    wkv: pl.Tensor[[D, HEAD_DIM], pl.FP8E4M3FN],
-    wkv_scale: pl.Tensor[[D // 32, HEAD_DIM], pl.FP8E8M0, pl.MX_B_NN],
-    kv_norm_weight: pl.Tensor[[HEAD_DIM], pl.BF16],
-    rope_cos: pl.Tensor[[T_DYN, ROPE_DIM // 2], pl.FP32],
-    rope_sin: pl.Tensor[[T_DYN, ROPE_DIM // 2], pl.FP32],
-    query_latent: pl.Tensor[[T_DYN, Q_LORA], pl.BF16],
-    query: pl.Tensor[[T_DYN, LOCAL_H * HEAD_DIM], pl.BF16],
-    window_kv: pl.Tensor[[T_DYN, HEAD_DIM], pl.BF16],
-    num_tokens: pl.Scalar[pl.INT32],
-):
-    """Use group-32 Q-A accumulation and bounded prefill head-RoPE workers."""
-    prefill_q_proj_qr(x, wq_a, wq_a_scale, q_norm_weight, query_latent, num_tokens)
-    prefill_q_proj_rope(query_latent, wq_b, wq_b_scale, rope_cos, rope_sin, query, num_tokens)
-    kv_proj_rope(x, wkv, wkv_scale, kv_norm_weight, rope_cos, rope_sin, window_kv, num_tokens)
-    return query_latent, query, window_kv
+def make_prefill_c2a_qkv(query_projection_operator):
+    """Bind the query expansion while retaining the prefill Q-A schedule."""
+    @pl.jit.inline(auto_scope=False)
+    def prefill_c2a_qkv(
+        x: pl.Tensor[[T_DYN, D], pl.BF16],
+        wq_a: pl.Tensor[[D, Q_LORA], pl.FP8E4M3FN],
+        wq_a_scale: pl.Tensor[[D // 32, Q_LORA], pl.FP8E8M0, pl.MX_B_NN],
+        q_norm_weight: pl.Tensor[[Q_LORA], pl.BF16],
+        wq_b: pl.Tensor[[Q_LORA, LOCAL_H * HEAD_DIM], pl.FP8E4M3FN],
+        wq_b_scale: pl.Tensor[[Q_LORA // 32, LOCAL_H * HEAD_DIM], pl.FP8E8M0, pl.MX_B_NN],
+        wkv: pl.Tensor[[D, HEAD_DIM], pl.FP8E4M3FN],
+        wkv_scale: pl.Tensor[[D // 32, HEAD_DIM], pl.FP8E8M0, pl.MX_B_NN],
+        kv_norm_weight: pl.Tensor[[HEAD_DIM], pl.BF16],
+        rope_cos: pl.Tensor[[T_DYN, ROPE_DIM // 2], pl.FP32],
+        rope_sin: pl.Tensor[[T_DYN, ROPE_DIM // 2], pl.FP32],
+        query_latent: pl.Tensor[[T_DYN, Q_LORA], pl.BF16],
+        query: pl.Tensor[[T_DYN, LOCAL_H * HEAD_DIM], pl.BF16],
+        window_kv: pl.Tensor[[T_DYN, HEAD_DIM], pl.BF16],
+        num_tokens: pl.Scalar[pl.INT32],
+    ):
+        """Use group-32 Q-A accumulation and bounded prefill head-RoPE workers."""
+        prefill_q_proj_qr(x, wq_a, wq_a_scale, q_norm_weight, query_latent, num_tokens)
+        query_projection_operator(query_latent, wq_b, wq_b_scale, rope_cos, rope_sin, query, num_tokens)
+        kv_proj_rope(x, wkv, wkv_scale, kv_norm_weight, rope_cos, rope_sin, window_kv, num_tokens)
+        return query_latent, query, window_kv
+
+    return prefill_c2a_qkv
 
 
-@pl.jit.inline
-def prefill_c2a_permute_index_query(
-    x: pl.Tensor[[T_DYN, INDEX_H * INDEX_DIM], pl.BF16],
-    output: pl.Tensor[[T_DYN, INDEX_H * INDEX_DIM], pl.BF16],
-    num_tokens: pl.Scalar[pl.INT32],
-):
-    """Split each index-query head into even and odd lanes.
-
-    Packed E2M1 keys decode into even and odd lanes rather than interleaved
-    order. A dot product is invariant under a shared permutation, so the query
-    is permuted once per token instead of re-interleaving every gathered key.
-    """
-    half = INDEX_DIM // 2
-    blocks = num_tokens * INDEX_H
-    workers = pl.min(blocks, 64)
-    for worker in pl.spmd(workers, name_hint="prefill_c2a_index_query_permute"):
-        for block in pl.range(worker, blocks, workers):
-            t = block // INDEX_H
-            h = block % INDEX_H
-            base = h * INDEX_DIM
-            row = pl.cast(x[t : t + 1, base : base + INDEX_DIM], pl.FP32)
-            even = pl.gather(row, mask_pattern=pl.tile.MaskPattern.P0101)
-            odd = pl.gather(row, mask_pattern=pl.tile.MaskPattern.P1010)
-            output[t : t + 1, base : base + half] = pl.cast(even, pl.BF16, mode="rint")
-            output[t : t + 1, base + half : base + INDEX_DIM] = pl.cast(odd, pl.BF16, mode="rint")
-    return output
+prefill_c2a_qkv = make_prefill_c2a_qkv(prefill_q_proj_rope)
+# Keep the wider query expansion scoped to C2A full attention.
+_prefill_c2a_project_qb = make_mx_projection(
+    Q_LORA, LOCAL_H * HEAD_DIM, n_tile=256, name_hint="c2a_q_b"
+)
+prefill_c2a_full_qkv = make_prefill_c2a_qkv(
+    _make_q_proj_rope(_prefill_c2a_project_qb, _prefill_rotate_q)
+)
 
 
 CMP_SCALES = HEAD_DIM // 16
@@ -163,10 +151,11 @@ MASK_BIAS = 1.0e30
 
 COMPRESSOR_K_TILE = 64
 
-def make_wide_rope(heads, width, inverse=False):
+def make_wide_rope(heads, width, inverse=False, *, max_workers=None, permute=False):
     """Specialize interleaved RoPE over the trailing ROPE_DIM lanes of each head."""
     sign = -1.0 if inverse else 1.0
     nope = width - ROPE_DIM
+    worker_limit = 2**31 - 1 if max_workers is None else max_workers
 
     @pl.jit.inline
     def rotate(
@@ -176,25 +165,40 @@ def make_wide_rope(heads, width, inverse=False):
         output: pl.Tensor[[T_DYN, heads * width], pl.BF16],
         num_tokens: pl.Scalar[pl.INT32],
     ):
-        for block in pl.spmd(num_tokens * heads, name_hint="c2a_rope"):
-            t = block // heads
-            h = block % heads
-            base = h * width
-            output[t : t + 1, base : base + nope] = x[t : t + 1, base : base + nope]
-            tail = pl.cast(x[t : t + 1, base + nope : base + width], pl.FP32)
-            even = pl.gather(tail, mask_pattern=pl.tile.MaskPattern.P0101)
-            odd = pl.gather(tail, mask_pattern=pl.tile.MaskPattern.P1010)
-            c = cos[t : t + 1, :]
-            s = pl.mul(sin[t : t + 1, :], sign)
-            re = pl.sub(pl.mul(even, c), pl.mul(odd, s))
-            im = pl.add(pl.mul(even, s), pl.mul(odd, c))
-            rotated = pl.full([1, ROPE_DIM], dtype=pl.FP32, value=0.0)
-            rotated = pl.tensor.scatter(re, mask_pattern=pl.tile.MaskPattern.P0101, dst=rotated)
-            rotated = pl.tensor.scatter(im, mask_pattern=pl.tile.MaskPattern.P1010, dst=rotated)
-            output[t : t + 1, base + nope : base + width] = pl.cast(rotated, pl.BF16, mode="rint")
+        blocks = num_tokens * heads
+        workers = pl.min(blocks, worker_limit)
+        for worker in pl.spmd(workers, name_hint="c2a_rope"):
+            for block in pl.range(worker, blocks, workers):
+                t = block // heads
+                h = block % heads
+                base = h * width
+                if not permute:
+                    output[t : t + 1, base : base + nope] = x[t : t + 1, base : base + nope]
+                tail = pl.cast(x[t : t + 1, base + nope : base + width], pl.FP32)
+                even = pl.gather(tail, mask_pattern=pl.tile.MaskPattern.P0101)
+                odd = pl.gather(tail, mask_pattern=pl.tile.MaskPattern.P1010)
+                c = cos[t : t + 1, :]
+                s = pl.mul(sin[t : t + 1, :], sign)
+                re = pl.sub(pl.mul(even, c), pl.mul(odd, s))
+                im = pl.add(pl.mul(even, s), pl.mul(odd, c))
+                rotated = pl.full([1, ROPE_DIM], dtype=pl.FP32, value=0.0)
+                rotated = pl.tensor.scatter(re, mask_pattern=pl.tile.MaskPattern.P0101, dst=rotated)
+                rotated = pl.tensor.scatter(im, mask_pattern=pl.tile.MaskPattern.P1010, dst=rotated)
+                rotated_bf16 = pl.cast(rotated, pl.BF16, mode="rint")
+                if permute:
+                    # Preserve the RoPE BF16 rounding before the lossless lane permutation.
+                    source = pl.concat(x[t : t + 1, base : base + nope], rotated_bf16)
+                    source_fp32 = pl.cast(source, pl.FP32)
+                    even_lanes = pl.gather(source_fp32, mask_pattern=pl.tile.MaskPattern.P0101)
+                    odd_lanes = pl.gather(source_fp32, mask_pattern=pl.tile.MaskPattern.P1010)
+                    output[t : t + 1, base : base + width // 2] = pl.cast(even_lanes, pl.BF16, mode="rint")
+                    output[t : t + 1, base + width // 2 : base + width] = pl.cast(odd_lanes, pl.BF16, mode="rint")
+                else:
+                    output[t : t + 1, base + nope : base + width] = rotated_bf16
         return output
 
     return rotate
+
 
 @pl.jit.inline
 def publish_compressed(
@@ -696,7 +700,7 @@ rotate_index_key = make_wide_rope(1, INDEX_DIM)
 
 def make_c2a_full_partial(
     qkv_operator, output_operator,
-    index_rope, index_permute,
+    index_transform,
     compressor_operator,
     index_key_operator, index_weights_operator,
     attention_operator,
@@ -788,10 +792,8 @@ def make_c2a_full_partial(
 
         index_query_raw = pl.create_tensor([tokens, INDEX_H * INDEX_DIM], dtype=pl.BF16)
         project_index_q(qr, index_wq_b, index_wq_b_scale, index_query_raw, num_tokens)
-        index_query_rotated = pl.create_tensor([tokens, INDEX_H * INDEX_DIM], dtype=pl.BF16)
-        index_rope(index_query_raw, rope_cos, rope_sin, index_query_rotated, num_tokens)
         index_query = pl.create_tensor([tokens, INDEX_H * INDEX_DIM], dtype=pl.BF16)
-        index_permute(index_query_rotated, index_query, num_tokens)
+        index_transform(index_query_raw, rope_cos, rope_sin, index_query, num_tokens)
         index_weight = pl.create_tensor([tokens, INDEX_H], dtype=pl.BF16)
         index_weights_operator(x, index_weights_proj, index_weight, num_tokens)
         leaf_scores = pl.create_tensor([tokens, LEAF], dtype=pl.FP32)
@@ -909,18 +911,21 @@ def prefill_compressor_projection(
     tail_weight = pl.create_tensor([D, HEAD_DIM], dtype=pl.BF16)
     high_product = pl.create_tensor([PREFILL_COMPRESSOR_SEGMENTS * tokens, HEAD_DIM], dtype=pl.FP32)
     residual_product = pl.create_tensor([PREFILL_COMPRESSOR_SEGMENTS * tokens, HEAD_DIM], dtype=pl.FP32)
-    with pl.spmd(D // COMPRESSOR_K_TILE * (HEAD_DIM // N_TILE), name_hint="prefill_compressor_split") as split_tid:
-        block = pl.tile.get_block_idx()
-        k0 = block // (HEAD_DIM // N_TILE) * COMPRESSOR_K_TILE
-        n0 = block % (HEAD_DIM // N_TILE) * N_TILE
-        value = weight[k0 : k0 + COMPRESSOR_K_TILE, n0 : n0 + N_TILE]
-        high = pl.cast(value, pl.BF16, mode="rint")
-        residual = pl.sub(value, pl.cast(high, pl.FP32))
-        low = pl.cast(residual, pl.BF16, mode="rint")
-        tail = pl.cast(pl.sub(residual, pl.cast(low, pl.FP32)), pl.BF16, mode="rint")
-        high_weight[k0 : k0 + COMPRESSOR_K_TILE, n0 : n0 + N_TILE] = high
-        low_weight[k0 : k0 + COMPRESSOR_K_TILE, n0 : n0 + N_TILE] = low
-        tail_weight[k0 : k0 + COMPRESSOR_K_TILE, n0 : n0 + N_TILE] = tail
+    split_blocks = D // COMPRESSOR_K_TILE * (HEAD_DIM // N_TILE)
+    split_workers = pl.min(split_blocks, 64)
+    with pl.spmd(split_workers, name_hint="prefill_compressor_split") as split_tid:
+        worker = pl.tile.get_block_idx()
+        for block in pl.range(worker, split_blocks, split_workers):
+            k0 = block // (HEAD_DIM // N_TILE) * COMPRESSOR_K_TILE
+            n0 = block % (HEAD_DIM // N_TILE) * N_TILE
+            value = weight[k0 : k0 + COMPRESSOR_K_TILE, n0 : n0 + N_TILE]
+            high = pl.cast(value, pl.BF16, mode="rint")
+            residual = pl.sub(value, pl.cast(high, pl.FP32))
+            low = pl.cast(residual, pl.BF16, mode="rint")
+            tail = pl.cast(pl.sub(residual, pl.cast(low, pl.FP32)), pl.BF16, mode="rint")
+            high_weight[k0 : k0 + COMPRESSOR_K_TILE, n0 : n0 + N_TILE] = high
+            low_weight[k0 : k0 + COMPRESSOR_K_TILE, n0 : n0 + N_TILE] = low
+            tail_weight[k0 : k0 + COMPRESSOR_K_TILE, n0 : n0 + N_TILE] = tail
     output_blocks = (num_tokens + M_TILE - 1) // M_TILE * (HEAD_DIM // N_TILE)
     blocks = output_blocks * PREFILL_COMPRESSOR_SEGMENTS
     # The synchronous mixed cohort must fit the target A5 core count.
@@ -1036,10 +1041,12 @@ def prefill_indexer_weights(
 
 
 prefill_attend_sparse = make_attend_sparse(vector_query=True)
-_prefill_index_rope = make_rope(INDEX_H, head_dim=INDEX_DIM, max_workers=64)
+c2a_index_query = make_wide_rope(INDEX_H, INDEX_DIM, max_workers=64, permute=True)
 c2a_full_partial = make_c2a_full_partial(
-    prefill_c2a_qkv, prefill_o_proj, _prefill_index_rope, prefill_c2a_permute_index_query,
-    prefill_compressor_project, prefill_index_key_project, prefill_indexer_weights, prefill_attend_sparse,
+    qkv_operator=prefill_c2a_full_qkv, output_operator=prefill_o_proj,
+    index_transform=c2a_index_query, compressor_operator=prefill_compressor_project,
+    index_key_operator=prefill_index_key_project, index_weights_operator=prefill_indexer_weights,
+    attention_operator=prefill_attend_sparse,
 )
 
 
