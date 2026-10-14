@@ -36,7 +36,7 @@ from turboquant_kv import (
 # ---------------------------------------------------------------------------
 # Dynamic dims (prefill-specific)
 # ---------------------------------------------------------------------------
-USER_BATCH_DYN = D.user_batch
+USER_BATCH_DYN = D.batch
 BLOCK_TABLE_FLAT_DYN = D.block_table_flat
 LAYER_DYN = D.layer
 LAYER_HIDDEN_ROWS_DYN = D.layer_hidden_rows
@@ -45,7 +45,7 @@ PREFILL_TOKENS_DYN = pl.dynamic("PREFILL_TOKENS_DYN")
 QUANT_CACHE_ROWS_DYN = pl.dynamic("QUANT_CACHE_ROWS_DYN")
 LAYER_ROT_ROWS_DYN = pl.dynamic("LAYER_ROT_ROWS_DYN")
 
-BATCH = M.batch
+BATCH = M.batch_pad
 NUM_HEADS = M.num_heads
 NUM_KV_HEADS = M.num_kv_heads
 HEAD_DIM = M.head_dim
@@ -703,10 +703,12 @@ def prefill_fwd_tq(
             ),
             [0, 0],
         )
+    # Layer outputs outlive each loop iteration; retain two backing buffers.
+    next_hidden = pl.create_tensor([prefill_tokens, HIDDEN], dtype=pl.BF16)
+    spare_hidden = pl.create_tensor([prefill_tokens, HIDDEN], dtype=pl.BF16)
     for layer_idx in pl.range(num_layers_actual):
         rot_base = layer_idx * HEAD_DIM
         rot_slice = pl.slice(rot_matrices, [HEAD_DIM, HEAD_DIM], [rot_base, 0])
-        next_hidden = pl.create_tensor([prefill_tokens, HIDDEN], dtype=pl.BF16)
         hidden_states = prefill_layer_tq(
             hidden_states,
             seq_lens,
@@ -734,6 +736,9 @@ def prefill_fwd_tq(
             next_hidden,
             layer_idx,
         )
+
+        next_hidden = spare_hidden
+        spare_hidden = hidden_states
 
     final_hidden = pl.create_tensor([BATCH, HIDDEN], dtype=pl.BF16)
     for b0 in pl.parallel(0, BATCH, BATCH_TILE):

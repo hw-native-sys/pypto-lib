@@ -37,14 +37,14 @@ from config import (
 # pyright: reportUndefinedVariable=false
 
 
-USER_BATCH_DYN = D.user_batch
+USER_BATCH_DYN = D.batch
 BLOCK_TABLE_FLAT_DYN = D.block_table_flat
 ROPE_SEQ_DYN = D.rope_seq
 LAYER_DYN = D.layer
 LAYER_HIDDEN_ROWS_DYN = D.layer_hidden_rows
 LAYER_INTER_ROWS_DYN = D.layer_inter_rows
 
-BATCH = M.batch
+BATCH = M.batch_pad
 MAX_SEQ = M.max_seq
 NUM_HEADS = M.num_heads
 NUM_KV_HEADS = M.num_kv_heads
