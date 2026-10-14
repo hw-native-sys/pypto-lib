@@ -12,6 +12,7 @@ examples/        Self-contained kernels for learning the DSL
 models/          End-to-end LLM kernels, one flat directory per model build
   qwen3_14b/                   Qwen3-14B prefill + decode, BF16, serving contract
   deepseek_v4_flash_mtp/       DeepSeek V4-Flash, INT8 W8A8, MTP=1, serving contract
+  deepseek_v4_pro/             DeepSeek V4-Pro, native MXFP8/MXFP4, A5
   (other directories are kernel harnesses — see the model pages)
 golden/          Test harness — compile, run on device, validate against torch
 tests/           Lint checks and golden-fn unit tests
