@@ -10,11 +10,12 @@
 
 import math
 
-from prefill_attn_c1a_reuse import (
+from prefill_attn_c1a import (
     REUSE_INPUT_NAMES,
     golden_prefill_c1a_reuse as golden_prefill_attn_c1a_reuse,
     prefill_c1a_reuse as prefill_attn_c1a_reuse,
 )
+
 import pypto.language as pl
 import pypto.language.distributed as pld
 import torch
@@ -31,13 +32,13 @@ from config import (
     WINDOW_CACHE_GROUP,
 )
 
-from attention_common import quantized_cache_compare
+from quant import quantized_cache_compare
 from hc_mixes import golden_mhc_mixes, mhc_mixes
 from hc_post import golden_mhc_post
 from hc_post import mhc_post
 from hc_pre import golden_mhc_pre, mhc_pre
-from rmsnorm import golden_rms_norm_reference as golden_rms_norm
-from prefill_c1a_test_utils import (
+from rmsnorm import golden_rms_norm
+from utils import (
     CACHE_MAX_RELATIVE_L2,
     CASE_DEFAULT,
     CASE_MAX_TOKENS,
@@ -45,13 +46,12 @@ from prefill_c1a_test_utils import (
     apply_distributed_golden,
     attn_input_compare,
     attention_output_compare,
-    golden_c1a_attention_input,
     golden_prefill_tp_attention,
     hc_hidden_compare,
     hc_output_compare,
     make_fixture_values,
 )
-from rmsnorm import rms_norm
+from rmsnorm import rms_norm_tiled
 
 
 # model config
@@ -67,6 +67,8 @@ O_GROUP_IN = M.num_attention_heads * M.head_dim // M.o_groups
 HC_MULT = M.hc_mult
 HC_DIM = M.hc_dim
 MIX_HC = M.mix_hc
+INDEX_H = M.index_n_heads
+INDEX_DIM = M.index_head_dim
 INDEX_TOPK = M.index_topk
 
 PREFILL_MAX_TOKENS = PREFILL_MAX_TOKENS
@@ -120,7 +122,9 @@ def prefill_c1a_reuse(
     residual_mix = pl.create_tensor([tokens, HC_MULT, HC_MULT], dtype=pl.FP32)
     mhc_mixes(x_hc, hc_attn_fn, hc_attn_scale, hc_attn_base, next_pre_mix, post_mix, residual_mix)
     mhc_pre(x_hc, pre_mix, hidden)
-    rms_norm(hidden, attn_norm_weight, attn_input)
+    norm_tokens = pl.tensor.dim(hidden, 0)
+    for norm_block in pl.spmd((norm_tokens + 7) // 8, name_hint="rms_norm"):
+        rms_norm_tiled(hidden, attn_norm_weight, attn_input, norm_block, norm_tokens)
     prefill_attn_c1a_reuse(
         attn_input, wq_a, wq_a_scale, q_norm_weight, wq_b, wq_b_scale, wkv, wkv_scale,
         kv_norm_weight, attn_sink, wo_a, wo_b, wo_b_scale, rope_cos, rope_sin,
@@ -330,7 +334,7 @@ def golden_prefill_c1a_reuse_case(tensors):
         tensors["hc_attn_scale"][0], tensors["hc_attn_base"][0],
     )
     hidden = golden_mhc_pre(tensors["x_hc"][0], tensors["pre_mix"][0])
-    attn_input = golden_c1a_attention_input(hidden, tensors["attn_norm_weight"][0])
+    attn_input = golden_rms_norm(hidden.to(torch.bfloat16), tensors["attn_norm_weight"][0])
     active = int(tensors["num_tokens"])
     output = tensors["output"]
     tensors["x"] = attn_input.unsqueeze(0).expand(TP_SIZE, -1, -1)
@@ -345,7 +349,6 @@ def golden_prefill_c1a_reuse_case(tensors):
     tensors["output"][:] = hc_output.unsqueeze(0)
 
 
-__all__ = ["golden_prefill_c1a_reuse", "prefill_c1a_reuse"]
 
 
 def validate(argv=None):
@@ -355,9 +358,9 @@ def validate(argv=None):
 
     parser = argparse.ArgumentParser(description="DeepSeek V4.1 prefill C1A reuse with mHC validation")
     parser.add_argument("-p", "--platform", default="a5", choices=("a5", "a5sim"))
-    parser.add_argument("-d", "--device", default=",".join(str(rank) for rank in range(TP_SIZE)))
+    parser.add_argument("-d", "--device", default=None)
     parser.add_argument("--tp", type=int, default=TP_SIZE, choices=(1, 2, 4))
-    parser.add_argument("--dp", type=int, default=1, choices=(1,))
+    parser.add_argument("--dp", type=int, default=1, choices=(1, 2))
     parser.add_argument("--tokens", type=int, default=32)
     parser.add_argument("--active-tokens", type=int)
     parser.add_argument("--case", default=CASE_DEFAULT, choices=CASE_NAMES)
@@ -367,9 +370,19 @@ def validate(argv=None):
     parser.add_argument("--dump-passes", action="store_true")
     parser.add_argument("--runtime-dir")
     parser.add_argument("--enable-chip-swimlane", type=int, nargs="?", const=1, default=0, choices=range(5))
+    parser.add_argument("--wiring", choices=("replicated", "sharded"), default="replicated")
+    parser.add_argument("--epochs", type=int, default=1)
+    parser.add_argument("--dp-tokens")
     args = parser.parse_args(argv)
     if args.tp != TP_SIZE:
         parser.error(f"--tp was parsed as TP{TP_SIZE}, got --tp {args.tp}")
+    if args.device is None:
+        args.device = ",".join(str(rank) for rank in range(TP_SIZE * args.dp))
+    if args.wiring == "sharded":
+        from prefill_c1a_full import validate_c1a_sp
+        return validate_c1a_sp("reuse", args)
+    if args.dp != 1:
+        parser.error("replicated wiring requires --dp 1")
     if args.case == "causal" and not 1 <= args.tokens <= CASE_MAX_TOKENS:
         parser.error(f"--tokens must be in [1, {CASE_MAX_TOKENS}]")
     if args.active_tokens is not None and not 0 <= args.active_tokens <= args.tokens:
@@ -414,16 +427,6 @@ def main():
     if not result.passed:
         raise SystemExit(result.error or 1)
 
-
-__all__ = [
-    "build_hc_tensor_specs",
-    "golden_prefill_c1a_reuse",
-    "golden_prefill_c1a_reuse_hc",
-    "l3_prefill_c1a_reuse_test",
-    "prefill_c1a_reuse",
-    "prefill_c1a_reuse_test",
-    "prefill_attn_c1a_reuse",
-]
 
 if __name__ == "__main__":
     main()

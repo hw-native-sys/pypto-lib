@@ -8,6 +8,10 @@
 # -----------------------------------------------------------------------------------------------------------
 """SWA decode Attention half-layer composition entry."""
 
+import hc_post as _decode_hc_post
+import hc_pre as _decode_hc_pre
+import utils as _decode_utils
+
 import pypto.language as pl
 import pypto.language.distributed as pld
 
@@ -24,12 +28,13 @@ from config import (
 
 
 import decode_attn_swa as swa
-import decode_common as common
 
 # PyPTO resolves inline calls and JIT-body constants only from direct names.
-from attention_tp import OUTPUT_T_DYN, decode_tp_input_all_gather
+from config import LOCAL_T_DYN
+from decode_cp_allgather import decode_tp_input_all_gather
 from decode_attn_swa import decode_attn_swa, decode_attn_swa_sharded
-from decode_common import attention_pre, slab_owner
+from hc_pre import attention_pre
+from decode_cp_allgather import slab_owner
 from hc_post import mhc_post
 
 
@@ -50,21 +55,20 @@ MX_GROUP = M.weight_block_size[0]
 
 KIND = "SWA"
 REPRESENTATIVE_LAYER_ID = 0
-ATTENTION_GOLDEN = swa.golden_decode_attn_swa
 KERNEL_READY = True
 LEAF_NAMES = tuple(name for name in swa.INPUT_NAMES if name != "x")
 ATTENTION_SPEC_NAMES = (
-    *common.BOUNDARY_PREFIX_NAMES,
+    *_decode_utils.BOUNDARY_PREFIX_NAMES,
     *LEAF_NAMES,
-    *common.BOUNDARY_OUTPUT_NAMES,
-    *common.SCALAR_NAMES,
+    *_decode_utils.BOUNDARY_OUTPUT_NAMES,
+    *_decode_utils.SCALAR_NAMES,
 )
 SHARDED_ATTENTION_SPEC_NAMES = (
-    *common.BOUNDARY_PREFIX_NAMES,
+    *_decode_utils.BOUNDARY_PREFIX_NAMES,
     *LEAF_NAMES,
-    *common.BOUNDARY_OUTPUT_NAMES,
+    *_decode_utils.BOUNDARY_OUTPUT_NAMES,
     "gathered",
-    *common.SCALAR_NAMES,
+    *_decode_utils.SCALAR_NAMES,
 )
 
 
@@ -162,8 +166,8 @@ def decode_swa(
 
 @pl.jit.inline(auto_scope=False)
 def decode_swa_sharded(
-    x_hc: pl.Tensor[[OUTPUT_T_DYN, HC_MULT, D], pl.FP32],
-    incoming_pre_mix: pl.Tensor[[OUTPUT_T_DYN, HC_MULT], pl.FP32],
+    x_hc: pl.Tensor[[LOCAL_T_DYN, HC_MULT, D], pl.FP32],
+    incoming_pre_mix: pl.Tensor[[LOCAL_T_DYN, HC_MULT], pl.FP32],
     hc_attn_fn: pl.Tensor[[MIX_HC, HC_DIM], pl.FP32],
     hc_attn_scale: pl.Tensor[[3], pl.FP32],
     hc_attn_base: pl.Tensor[[MIX_HC], pl.FP32],
@@ -186,9 +190,9 @@ def decode_swa_sharded(
     window_indices: pl.Tensor[[T_DYN, 128], pl.INT32],
     window_cache: pl.Tensor[[ORI_BLOCKS_DYN, 128, 1, HEAD_DIM], pl.FP8E4M3FN],
     window_cache_scale: pl.Tensor[[ORI_BLOCKS_DYN, 128, 1, HEAD_DIM // WINDOW_CACHE_GROUP], pl.FP8E8M0],
-    attention_output: pl.Tensor[[OUTPUT_T_DYN, D], pl.BF16],
-    attention_hidden: pl.Tensor[[OUTPUT_T_DYN, HC_MULT, D], pl.FP32],
-    attention_pre_mix: pl.Tensor[[OUTPUT_T_DYN, HC_MULT], pl.FP32],
+    attention_output: pl.Tensor[[LOCAL_T_DYN, D], pl.BF16],
+    attention_hidden: pl.Tensor[[LOCAL_T_DYN, HC_MULT, D], pl.FP32],
+    attention_pre_mix: pl.Tensor[[LOCAL_T_DYN, HC_MULT], pl.FP32],
     gathered: pl.Tensor[[T_DYN, D], pl.BF16],
     input_window: pld.DistributedTensor[[DECODE_MAX_TOKENS, D], pl.BF16],
     input_arrived: pld.DistributedTensor[[TP_SIZE, 1], pl.INT32],
@@ -331,8 +335,8 @@ def decode_swa_rank(
 
 @pl.jit
 def decode_swa_rank_sharded(
-    x_hc: pl.Tensor[[OUTPUT_T_DYN, HC_MULT, D], pl.FP32],
-    incoming_pre_mix: pl.Tensor[[OUTPUT_T_DYN, HC_MULT], pl.FP32],
+    x_hc: pl.Tensor[[LOCAL_T_DYN, HC_MULT, D], pl.FP32],
+    incoming_pre_mix: pl.Tensor[[LOCAL_T_DYN, HC_MULT], pl.FP32],
     hc_attn_fn: pl.Tensor[[MIX_HC, HC_DIM], pl.FP32],
     hc_attn_scale: pl.Tensor[[3], pl.FP32],
     hc_attn_base: pl.Tensor[[MIX_HC], pl.FP32],
@@ -357,9 +361,9 @@ def decode_swa_rank_sharded(
     window_cache_scale: pl.InOut[
         pl.Tensor[[ORI_BLOCKS_DYN, 128, 1, HEAD_DIM // WINDOW_CACHE_GROUP], pl.FP8E8M0]
     ],
-    attention_output: pl.InOut[pl.Tensor[[OUTPUT_T_DYN, D], pl.BF16]],
-    attention_hidden: pl.Out[pl.Tensor[[OUTPUT_T_DYN, HC_MULT, D], pl.FP32]],
-    attention_pre_mix: pl.Out[pl.Tensor[[OUTPUT_T_DYN, HC_MULT], pl.FP32]],
+    attention_output: pl.InOut[pl.Tensor[[LOCAL_T_DYN, D], pl.BF16]],
+    attention_hidden: pl.Out[pl.Tensor[[LOCAL_T_DYN, HC_MULT, D], pl.FP32]],
+    attention_pre_mix: pl.Out[pl.Tensor[[LOCAL_T_DYN, HC_MULT], pl.FP32]],
     gathered: pl.Tensor[[T_DYN, D], pl.BF16],
     input_window: pld.DistributedTensor[[DECODE_MAX_TOKENS, D], pl.BF16],
     input_arrived: pld.DistributedTensor[[TP_SIZE, 1], pl.INT32],
@@ -412,7 +416,7 @@ def decode_swa_rank_sharded(
 def _make_program(world_size, epochs, specs):
     if not 1 <= epochs <= 1000:
         raise ValueError("epochs must be in [1, 1000]")
-    tensor_specs = common.check_program_specs(world_size, specs, ATTENTION_SPEC_NAMES)
+    tensor_specs = _decode_utils.check_program_specs(world_size, specs, ATTENTION_SPEC_NAMES)
 
     @pl.jit.host
     def attention_group(
@@ -516,7 +520,7 @@ def make_program(world_size, epochs, specs, sharded=False):
 def _make_program_sharded(world_size, epochs, specs):
     if not 1 <= epochs <= 1000:
         raise ValueError("epochs must be in [1, 1000]")
-    tensor_specs = common.check_program_specs(world_size, specs, SHARDED_ATTENTION_SPEC_NAMES)
+    tensor_specs = _decode_utils.check_program_specs(world_size, specs, SHARDED_ATTENTION_SPEC_NAMES)
 
     @pl.jit.host
     def attention_group(
@@ -620,12 +624,12 @@ def _make_program_sharded(world_size, epochs, specs):
 
 def build_specs(args, initial_state=None):
     del initial_state
-    return common.assemble_specs(args, swa.build_specs(args, "decode"), ATTENTION_SPEC_NAMES)
+    return _decode_utils.assemble_specs(args, swa.build_specs(args, "decode"), ATTENTION_SPEC_NAMES)
 
 
 def build_specs_sharded(args):
     """Specs with per-rank token slabs plus the Attention-input gather scratch."""
-    return common.assemble_specs(
+    return _decode_utils.assemble_specs(
         args, swa.build_specs(args, "decode"), SHARDED_ATTENTION_SPEC_NAMES, sharded=True
     )
 
@@ -633,10 +637,10 @@ def build_specs_sharded(args):
 def make_golden(epochs):
     def golden_half(tensors):
         for _ in range(epochs):
-            normalized, post, residual = common.golden_attention_pre(tensors)
+            normalized, post, residual = _decode_hc_pre.golden_attention_pre(tensors)
             leaf = dict(tensors, x=normalized, output=tensors["attention_output"])
             swa.golden_swa(leaf)
-            common.golden_attention_post(tensors, post, residual)
+            _decode_hc_post.golden_attention_post(tensors, post, residual)
 
     return golden_half
 
@@ -644,17 +648,17 @@ def make_golden(epochs):
 def make_golden_sharded(epochs):
     def golden_half(tensors):
         for _ in range(epochs):
-            gathered, post, residual = common.golden_attention_pre_sharded(tensors)
+            gathered, post, residual = _decode_hc_pre.golden_attention_pre_sharded(tensors)
             leaf = dict(tensors, x=gathered, output=tensors["attention_output"])
             swa.golden_swa(leaf, sharded=True)
-            common.golden_attention_post(tensors, post, residual)
+            _decode_hc_post.golden_attention_post(tensors, post, residual)
 
     return golden_half
 
 
 def comparisons(initial_state=None):
     del initial_state
-    compare = common.make_boundary_comparisons(swa.compare_output)
+    compare = _decode_utils.make_boundary_comparisons(swa.compare_output)
     compare.update(
         {
             "attention_output": swa.compare_reduced,
@@ -667,14 +671,14 @@ def comparisons(initial_state=None):
 
 def comparisons_sharded(initial_state=None):
     del initial_state
-    compare = common.make_boundary_comparisons(swa.compare_output, sharded=True)
+    compare = _decode_utils.make_boundary_comparisons(swa.compare_output, sharded=True)
     compare.update(
         {
             # The ReduceScatter publishes a fully materialized slab: the rows this
             # rank does not own are zeros, and the check asserts that instead of
             # letting stale values sit next to the owned rows.
-            "attention_output": common.make_compare_sharded_rows(swa.compare_output),
-            "gathered": common.compare_attention_gather,
+            "attention_output": _decode_utils.make_compare_sharded_rows(swa.compare_output),
+            "gathered": _decode_utils.compare_attention_gather,
             "window_cache": swa.compare_distributed_cache,
             "window_cache_scale": swa.compare_scales,
         }
@@ -684,23 +688,23 @@ def comparisons_sharded(initial_state=None):
 
 def validate(argv=None):
     """Validate every wiring ``--wiring`` selects on A5."""
-    parser = common.make_parser(
+    parser = _decode_utils.make_parser(
         "DeepSeek V4.1 SWA decode Attention composition",
         REPRESENTATIVE_LAYER_ID,
         32,
         ("mixed", "shuffle", "prefix"),
     )
     args = parser.parse_args(argv)
-    devices = common.validate_args(parser, args)
+    devices = _decode_utils.validate_args(parser, args)
     reason = skip_reason(args.layer_id)
     if reason:
         parser.error(reason)
-    wirings = common.selected_wirings(args.wiring)
+    wirings = _decode_utils.selected_wirings(args.wiring)
     results = []
-    if common.WIRING_REPLICATED in wirings:
+    if _decode_utils.WIRING_REPLICATED in wirings:
         specs = build_specs(args)
         results.append(
-            common.run_attention(
+            _decode_utils.run_attention(
                 args,
                 make_program(args.tp, args.epochs, specs),
                 specs,
@@ -710,12 +714,12 @@ def validate(argv=None):
                 devices,
             )
         )
-    if common.WIRING_SHARDED in wirings:
+    if _decode_utils.WIRING_SHARDED in wirings:
         # The sequence-parallel wiring: layer-head AllGather, ReduceScatter output.
-        common.validate_sp_tokens(parser, args)
+        _decode_utils.validate_sp_tokens(parser, args)
         sharded = build_specs_sharded(args)
         results.append(
-            common.run_attention(
+            _decode_utils.run_attention(
                 args,
                 make_program(args.tp, args.epochs, sharded, sharded=True),
                 sharded,
@@ -725,7 +729,7 @@ def validate(argv=None):
                 devices,
             )
         )
-    return common.combine_validation(results)
+    return _decode_utils.combine_validation(results)
 
 
 def main():

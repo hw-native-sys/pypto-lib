@@ -44,19 +44,27 @@ from compressor import STATE_WIDTH
 from config import EP_SIZE
 
 
-from attention_common import AttentionGoldenResult, golden_compressed_attention
-from attention_tp import (
-    OUTPUT_T_DYN,
+from utils import AttentionGoldenResult
+from sparse_attention import golden_compressed_attention
+from config import LOCAL_T_DYN
+from o_proj import (
     decode_tp_output_all_reduce,
     decode_tp_output_reduce_scatter,
 )
 from compressor import compressor_ratio2
-from attention_ops import EPS, K_TILE, M_TILE, N_TILE, make_mx_projection, make_rope
+from rmsnorm import EPS
+from qkv_proj_rope import (
+    K_TILE,
+    M_TILE,
+    N_TILE,
+    make_mx_projection,
+    make_rope,
+)
 from decode_attn_swa import SOFTMAX_SCALE, publish_window
 from o_proj import o_proj
 from qkv_proj_rope import qkv_proj_rope
 from utils import paged_slots, window_metadata
-from quantization import (
+from quant import (
     decode_e8m0,
     dequantize_mxfp4_cache,
     dequantize_mxfp8_cache,
@@ -1031,7 +1039,7 @@ def make_decode_attn_c2a_full(output_reduce=None):
         topk_indices: pl.Tensor[[T_DYN, INDEX_TOPK], pl.INT32],
         output_window: pld.DistributedTensor[[DECODE_MAX_TOKENS, D], pl.FP32],
         output_arrived: pld.DistributedTensor[[TP_SIZE, 1], pl.INT32],
-        output: pl.Tensor[[OUTPUT_T_DYN, D], pl.BF16],
+        output: pl.Tensor[[LOCAL_T_DYN, D], pl.BF16],
         group_base: pl.Scalar[pl.INT32],
         tp_rank: pl.Scalar[pl.INT32],
         num_tokens: pl.Scalar[pl.INT32],
@@ -1072,15 +1080,12 @@ decode_attn_c2a_full = make_decode_attn_c2a_full()
 decode_attn_c2a_full_sharded = make_decode_attn_c2a_full(decode_tp_output_reduce_scatter)
 
 
-__all__ = ["golden_decode_attn_c2a_full", "decode_attn_c2a_full", "decode_attn_c2a_full_sharded", "c2a_full_partial"]
-
-
 # Independent CPU reference, transcribed from the official implementation.
 # Transcription of DeepSeek-V4.1-Flash inference/model.py and inference/kernel.py at revision
 # dba1be0a40aa45a94ad051997016db3960a90277 (Compressor, Indexer, Attention, sparse_attn); not an
 # execution of the CUDA kernels.  Takes the tensors of golden_decode_attn_c2a_full.
 #
-# Like attention_common.golden_compressed_attention, only rows named by a non-negative slot are
+# Like sparse_attention.golden_compressed_attention, only rows named by a non-negative slot are
 # rewritten, so untouched cache bytes stay bit-identical and can be checked.  This matters because
 # MXFP4 re-quantization is not byte-idempotent: an E8M0 group whose largest nibble is 3 re-derives a
 # scale one binade lower, moving the bytes while the decoded values stay put.
@@ -1092,19 +1097,19 @@ __all__ = ["golden_decode_attn_c2a_full", "decode_attn_c2a_full", "decode_attn_c
 #
 # Arithmetic ABI: BF16_GEMM and PV_DTYPE pin the two places where CPU torch and the A5 Cube
 # disagree.  Both default to what the device and decode_swa.official_reference do, and both differ
-# from attention_common -- together they are the entire measured gap against it.
+# from the shared reference -- together they are the entire measured gap against it.
 
 E8M0 = getattr(torch, "float8_e8m0fnu", torch.uint8)
 
 # Reduction precision of the BF16 GEMMs (index key, indexer head weights, grouped wo_a).
 # "fp32" is what the A5 kernels do (grouped_output accumulates with pl.matmul_acc into a
 # pl.FP32 tile and casts once) and what decode_swa.official_reference does; "torch" reproduces
-# attention_common's plain BF16 torch.matmul/einsum, whose CPU reduction over a 4096-wide axis
+# the shared reference's plain BF16 torch.matmul/einsum, whose CPU reduction over a 4096-wide axis
 # is ~2.7x coarser than a single BF16 rounding.  A/B only.
 BF16_GEMM = "fp32"
 
 # Dtype the online softmax feeds to the PV GEMM.  The device casts probabilities with
-# pl.cast(..., pl.BF16, mode="rint") before pl.matmul; attention_common merges in FP32.  A/B only.
+# pl.cast(..., pl.BF16, mode="rint") before pl.matmul; the shared reference merges in FP32.  A/B only.
 PV_DTYPE = torch.bfloat16
 
 RATIO = 2
@@ -2145,6 +2150,508 @@ def run_c2a(operator, mode, argv=None, *, ring_heap=None):
     if args.save_data and result.work_dir:
         print(f"[C2A] Validated snapshot: {result.work_dir}/data")
     return result
+
+
+def make_c2a_reuse_partial(qkv_operator=qkv_proj_rope, output_operator=o_proj, attention_operator=attend_sparse):
+    """Bind preprocessing and projection schedules while preserving the shared C2A core."""
+    @pl.jit.inline(auto_scope=False)
+    def c2a_reuse_partial(
+        x: pl.Tensor[[T_DYN, D], pl.BF16],
+        wq_a: pl.Tensor[[D, Q_LORA], pl.FP8E4M3FN],
+        wq_a_scale: pl.Tensor[[D // 32, Q_LORA], pl.FP8E8M0, pl.MX_B_NN],
+        q_norm_weight: pl.Tensor[[Q_LORA], pl.BF16],
+        wq_b: pl.Tensor[[Q_LORA, LOCAL_H * HEAD_DIM], pl.FP8E4M3FN],
+        wq_b_scale: pl.Tensor[[Q_LORA // 32, LOCAL_H * HEAD_DIM], pl.FP8E8M0, pl.MX_B_NN],
+        wkv: pl.Tensor[[D, HEAD_DIM], pl.FP8E4M3FN],
+        wkv_scale: pl.Tensor[[D // 32, HEAD_DIM], pl.FP8E8M0, pl.MX_B_NN],
+        kv_norm_weight: pl.Tensor[[HEAD_DIM], pl.BF16],
+        attn_sink: pl.Tensor[[LOCAL_H], pl.FP32],
+        wo_a: pl.Tensor[[LOCAL_O_GROUPS, O_LORA, O_GROUP_IN], pl.BF16],
+        wo_b: pl.Tensor[[LOCAL_O_WIDTH, D], pl.FP8E4M3FN],
+        wo_b_scale: pl.Tensor[[LOCAL_O_WIDTH // 32, D], pl.FP8E8M0, pl.MX_B_NN],
+        rope_cos: pl.Tensor[[T_DYN, ROPE_DIM // 2], pl.FP32],
+        rope_sin: pl.Tensor[[T_DYN, ROPE_DIM // 2], pl.FP32],
+        window_slots: pl.Tensor[[T_DYN], pl.INT64],
+        window_indices: pl.Tensor[[T_DYN, 128], pl.INT32],
+        window_cache: pl.Tensor[[ORI_BLOCKS_DYN, 128, 1, HEAD_DIM], pl.FP8E4M3FN],
+        window_cache_scale: pl.Tensor[[ORI_BLOCKS_DYN, 128, 1, HEAD_DIM // 32], pl.FP8E8M0],
+        compressed_cache: pl.Tensor[[CMP_BLOCKS_DYN, 128, 1, CMP_PACKED], pl.UINT8],
+        compressed_cache_scale: pl.Tensor[[CMP_BLOCKS_DYN, 128, 1, CMP_SCALES], pl.FP8E4M3FN],
+        compressed_indices: pl.Tensor[[T_DYN, INDEX_TOPK], pl.INT32],
+        partial: pl.Tensor[[T_DYN, D], pl.FP32],
+        num_tokens: pl.Scalar[pl.INT32],
+        cache_ready: pl.Scalar[pl.TASK_ID],
+    ):
+        """Write the FP32 local output for a layer that reuses a published selection.
+
+        Reuse owns only the sliding-window cache. The compressed pool and the Top-K row
+        list both belong to this ratio's source layer and are read without being written,
+        so there is no compressor, no index-key publication and no indexer here.
+        """
+        tokens = pl.tensor.dim(x, 0)
+
+        qr = pl.create_tensor([tokens, Q_LORA], dtype=pl.BF16)
+        query = pl.create_tensor([tokens, LOCAL_H * HEAD_DIM], dtype=pl.BF16)
+        window_kv = pl.create_tensor([tokens, HEAD_DIM], dtype=pl.BF16)
+        qkv_operator(
+            x, wq_a, wq_a_scale, q_norm_weight, wq_b, wq_b_scale, wkv, wkv_scale,
+            kv_norm_weight, rope_cos, rope_sin, qr, query, window_kv, num_tokens,
+        )
+        publish_window(window_kv, window_slots, window_cache, window_cache_scale, num_tokens, cache_ready)
+
+        attended = pl.create_tensor([tokens, LOCAL_H * HEAD_DIM], dtype=pl.BF16)
+        selected = pl.create_tensor([QUERY_TILE, SPARSE_WIDTH, HEAD_DIM], dtype=pl.BF16)
+        combined = pl.create_tensor([QUERY_TILE, SPARSE_WIDTH], dtype=pl.INT32)
+        chunk_done = cache_ready
+        for start in pl.range(0, num_tokens, QUERY_TILE):
+            active = pl.min(QUERY_TILE, num_tokens - start)
+            gather_tid = gather_sparse(
+                window_cache, window_cache_scale, window_indices, compressed_cache,
+                compressed_cache_scale, compressed_indices, selected, combined, start, active,
+                chunk_done,
+            )
+            chunk_done = attention_operator(
+                query, selected, combined, attn_sink, attended, start, active, gather_tid
+            )
+
+        output_operator(attended, wo_a, wo_b, wo_b_scale, rope_cos, rope_sin, partial, num_tokens)
+        return chunk_done
+
+    return c2a_reuse_partial
+
+
+c2a_reuse_partial = make_c2a_reuse_partial()
+
+
+REUSE_INPUT_NAMES = (
+    "x", "wq_a", "wq_a_scale", "q_norm_weight", "wq_b", "wq_b_scale", "wkv", "wkv_scale",
+    "kv_norm_weight", "attn_sink", "wo_a", "wo_b", "wo_b_scale", "rope_cos", "rope_sin",
+    "window_slots", "window_indices", "window_cache", "window_cache_scale", "compressed_cache",
+    "compressed_cache_scale", "compressed_indices",
+)
+REUSE_MUTABLE_NAMES = ("window_cache", "window_cache_scale")
+REUSE_SHARDED_NAMES = ("wq_b", "wq_b_scale", "attn_sink", "wo_a", "wo_b", "wo_b_scale")
+
+
+def official_reference_c2a_reuse(inputs: dict, *, fp32_output=False) -> dict:
+    """Ratio-2 reuse attention; publishes only the addressed sliding-window rows.
+
+    Same transcription as the full-mode reference, with the compressor, the index-key
+    publication and the indexer removed: the selection arrives as an input and the
+    compressed pool is read-only.
+    """
+    t = inputs
+    x = t["x"]
+    tokens = x.shape[0]
+    head_dim = t["window_cache"].shape[-1]
+    local_heads = t["attn_sink"].numel()
+    groups, _, group_in = t["wo_a"].shape
+
+    qr = official_norm(official_linear(x, t["wq_a"], t["wq_a_scale"]), t["q_norm_weight"])
+    q = official_linear(qr, t["wq_b"], t["wq_b_scale"]).unflatten(-1, (local_heads, head_dim))
+    q = official_rope(q, t["rope_cos"], t["rope_sin"])
+    kv = official_norm(official_linear(x, t["wkv"], t["wkv_scale"]), t["kv_norm_weight"])
+    kv = official_rope(kv, t["rope_cos"], t["rope_sin"])
+
+    window_cache = t["window_cache"].clone()
+    window_cache_scale = t["window_cache_scale"].clone()
+    window_payload, window_codes = official_quantize(kv)
+    window_slots = t["window_slots"].long()
+    window_valid = window_slots >= 0
+    window_rows = window_slots[window_valid]
+    # Boolean indexing of Float8 on CPU requires an exact FP32 roundtrip.
+    visible_payload = window_payload.float()[window_valid].to(window_payload.dtype)
+    _write_rows(window_cache, window_rows, visible_payload, head_dim)
+    _write_rows(window_cache_scale, window_rows, window_codes[window_valid], head_dim // MX_GROUP)
+
+    window_values = (
+        window_cache.float() * decode_e8m0(window_cache_scale).repeat_interleave(MX_GROUP, -1)
+    ).reshape(-1, head_dim)
+    compressed_values = _flat_cache_rows(
+        t["compressed_cache"], t["compressed_cache_scale"], CMP_GROUP, "e4m3"
+    )
+    window_indices = t["window_indices"].long()
+    compressed_indices = t["compressed_indices"].long()
+    gathered = torch.cat(
+        (
+            window_values[window_indices.clamp_min(0).reshape(-1)].reshape(tokens, -1, head_dim),
+            compressed_values[compressed_indices.clamp_min(0).reshape(-1)].reshape(
+                tokens, -1, head_dim
+            ),
+        ),
+        dim=1,
+    ).to(torch.bfloat16)
+    visible = torch.cat((window_indices >= 0, compressed_indices >= 0), dim=1)
+    gathered = gathered.masked_fill(~visible[..., None], 0)
+
+    maximum = torch.full((tokens, local_heads), -1e30)
+    denominator = torch.zeros_like(maximum)
+    numerator = torch.zeros(tokens, local_heads, head_dim, dtype=torch.float32)
+    for start in range(0, gathered.shape[1], ATTEND_TILE):
+        values = gathered[:, start : start + ATTEND_TILE].float()
+        logits = torch.einsum("thd,tkd->thk", q.float(), values) * head_dim**-0.5
+        logits = logits.masked_fill(~visible[:, None, start : start + ATTEND_TILE], -torch.inf)
+        new_maximum = torch.maximum(maximum, logits.amax(-1))
+        correction = (maximum - new_maximum).exp()
+        probabilities = (logits - new_maximum[..., None]).exp()
+        denominator = denominator * correction + probabilities.sum(-1)
+        numerator = numerator * correction[..., None] + torch.einsum(
+            "thk,tkd->thd", probabilities.to(PV_DTYPE).float(), values
+        )
+        maximum = new_maximum
+    final_maximum = torch.maximum(maximum, t["attn_sink"].float()[None])
+    correction = (maximum - final_maximum).exp()
+    denominator = denominator * correction + (t["attn_sink"].float()[None] - final_maximum).exp()
+    attended = (numerator * (correction / denominator)[..., None]).to(torch.bfloat16)
+
+    attended = official_rope(attended, t["rope_cos"], t["rope_sin"], inverse=True)
+    grouped = attended.reshape(tokens, groups, group_in)
+    projected = _bf16_grouped(grouped, t["wo_a"])
+    output = official_linear(projected.flatten(1), t["wo_b"], t["wo_b_scale"], fp32=fp32_output)
+
+    return {
+        "output": output,
+        "window_cache": window_cache,
+        "window_cache_scale": window_cache_scale,
+    }
+
+
+def make_c2a_reuse_inputs(tokens=32, requests=6, seed=17, case="mixed", mode="decode", start_pos=None):
+    """Inputs for a reuse layer, taken from what a full layer actually published.
+
+    The compressed pool and the Top-K row list come from running the full-mode
+    reference on the same batch, so the fixture exercises the real Full-to-Reuse
+    hand-off rather than a synthetic selection.
+    """
+    source = make_c2a_inputs(tokens=tokens, requests=requests, seed=seed, case=case, mode=mode, start_pos=start_pos)
+    published = official_reference_c2a(source)
+    values = {name: source[name] for name in REUSE_INPUT_NAMES if name != "compressed_indices"}
+    values["compressed_cache"] = published["compressed_cache"]
+    values["compressed_cache_scale"] = published["compressed_cache_scale"]
+    values["compressed_indices"] = published["topk_indices"]
+    reachable = int((published["topk_indices"] >= 0).sum())
+    print(
+        f"[FIXTURE] c2a reuse tokens={tokens} requests={requests} mode={mode} case={case} "
+        f"selected_rows={reachable} source_published_rows="
+        f"{int((source['compressed_slots'] >= 0).sum())}"
+    )
+    return values
+
+
+# Preserve the original public reference; device validation uses the main-aligned reference above.
+def golden_decode_attn_c2a_reuse(
+    x: "torch.Tensor",
+    wq_a: "torch.Tensor",
+    wq_a_scale: "torch.Tensor",
+    q_norm_weight: "torch.Tensor",
+    wq_b: "torch.Tensor",
+    wq_b_scale: "torch.Tensor",
+    wkv: "torch.Tensor",
+    wkv_scale: "torch.Tensor",
+    kv_norm_weight: "torch.Tensor",
+    attn_sink: "torch.Tensor",
+    wo_a: "torch.Tensor",
+    wo_b: "torch.Tensor",
+    wo_b_scale: "torch.Tensor",
+    rope_cos: "torch.Tensor",
+    rope_sin: "torch.Tensor",
+    window_slots: "torch.Tensor",
+    window_indices: "torch.Tensor",
+    window_cache: "torch.Tensor",
+    window_cache_scale: "torch.Tensor",
+    compressed_cache: "torch.Tensor",
+    compressed_cache_scale: "torch.Tensor",
+    compressed_indices: "torch.Tensor",
+) -> "AttentionGoldenResult":
+    """Evaluate C2A decode reuse against published compressed cache rows."""
+    from sparse_attention import golden_compressed_attention
+    from config import AttentionMode
+
+    return golden_compressed_attention(
+        mode=AttentionMode.REUSE,
+        ratio=2,
+        x=x,
+        wq_a=wq_a,
+        wq_a_scale=wq_a_scale,
+        q_norm_weight=q_norm_weight,
+        wq_b=wq_b,
+        wq_b_scale=wq_b_scale,
+        wkv=wkv,
+        wkv_scale=wkv_scale,
+        kv_norm_weight=kv_norm_weight,
+        attn_sink=attn_sink,
+        wo_a=wo_a,
+        wo_b=wo_b,
+        wo_b_scale=wo_b_scale,
+        rope_cos=rope_cos,
+        rope_sin=rope_sin,
+        window_slots=window_slots,
+        window_indices=window_indices,
+        window_cache=window_cache,
+        window_cache_scale=window_cache_scale,
+        compressed_cache=compressed_cache,
+        compressed_cache_scale=compressed_cache_scale,
+        compressed_indices=compressed_indices,
+        compressor_wkv=None,
+        compressor_wgate=None,
+        compressor_norm_weight=None,
+        state_block_table=None,
+        state_cache=None,
+        compressed_slots=None,
+        position_ids=None,
+        compressed_lens=None,
+        compressed_rope_cos=None,
+        compressed_rope_sin=None,
+        index_wk=None,
+        index_norm_weight=None,
+        index_wq_b=None,
+        index_wq_b_scale=None,
+        index_weights_proj=None,
+        index_cache=None,
+        index_cache_scale=None,
+        index_block_table=None,
+        request_ids=None,
+        candidate_mask=None,
+    )
+
+
+def make_decode_attn_c2a_reuse(output_reduce=None):
+    """Build the decode_attn_c2a_reuse leaf around one output collective."""
+    reducer = output_reduce or decode_tp_output_all_reduce
+
+    @pl.jit.inline(auto_scope=False)
+    def decode_attn_c2a_reuse(
+        x: pl.Tensor[[T_DYN, D], pl.BF16],
+        wq_a: pl.Tensor[[D, Q_LORA], pl.FP8E4M3FN],
+        wq_a_scale: pl.Tensor[[D // 32, Q_LORA], pl.FP8E8M0, pl.MX_B_NN],
+        q_norm_weight: pl.Tensor[[Q_LORA], pl.BF16],
+        wq_b: pl.Tensor[[Q_LORA, LOCAL_H * HEAD_DIM], pl.FP8E4M3FN],
+        wq_b_scale: pl.Tensor[[Q_LORA // 32, LOCAL_H * HEAD_DIM], pl.FP8E8M0, pl.MX_B_NN],
+        wkv: pl.Tensor[[D, HEAD_DIM], pl.FP8E4M3FN],
+        wkv_scale: pl.Tensor[[D // 32, HEAD_DIM], pl.FP8E8M0, pl.MX_B_NN],
+        kv_norm_weight: pl.Tensor[[HEAD_DIM], pl.BF16],
+        attn_sink: pl.Tensor[[LOCAL_H], pl.FP32],
+        wo_a: pl.Tensor[[LOCAL_O_GROUPS, O_LORA, O_GROUP_IN], pl.BF16],
+        wo_b: pl.Tensor[[LOCAL_O_WIDTH, D], pl.FP8E4M3FN],
+        wo_b_scale: pl.Tensor[[LOCAL_O_WIDTH // 32, D], pl.FP8E8M0, pl.MX_B_NN],
+        rope_cos: pl.Tensor[[T_DYN, ROPE_DIM // 2], pl.FP32],
+        rope_sin: pl.Tensor[[T_DYN, ROPE_DIM // 2], pl.FP32],
+        window_slots: pl.Tensor[[T_DYN], pl.INT64],
+        window_indices: pl.Tensor[[T_DYN, 128], pl.INT32],
+        window_cache: pl.Tensor[[ORI_BLOCKS_DYN, 128, 1, HEAD_DIM], pl.FP8E4M3FN],
+        window_cache_scale: pl.Tensor[[ORI_BLOCKS_DYN, 128, 1, HEAD_DIM // WINDOW_CACHE_GROUP], pl.FP8E8M0],
+        compressed_cache: pl.Tensor[[CMP_BLOCKS_DYN, 128, 1, HEAD_DIM // 2], pl.UINT8],
+        compressed_cache_scale: pl.Tensor[
+            [CMP_BLOCKS_DYN, 128, 1, HEAD_DIM // COMPRESSED_CACHE_GROUP], pl.FP8E4M3FN
+        ],
+        compressed_indices: pl.Tensor[[T_DYN, INDEX_TOPK], pl.INT32],
+        output_window: pld.DistributedTensor[[DECODE_MAX_TOKENS, D], pl.FP32],
+        output_arrived: pld.DistributedTensor[[TP_SIZE, 1], pl.INT32],
+        output: pl.Tensor[[LOCAL_T_DYN, D], pl.BF16],
+        group_base: pl.Scalar[pl.INT32],
+        tp_rank: pl.Scalar[pl.INT32],
+        num_tokens: pl.Scalar[pl.INT32],
+        attention_epoch: pl.Scalar[pl.INT32],
+    ):
+        """Write BF16 TP output using zero-initialized windows and consecutive 1-based epochs."""
+        # A later epoch must not overwrite cache or transport storage still being read.
+        with pl.at(
+            level=pl.Level.CORE_GROUP, name_hint="c2a_reuse_previous_epoch", allow_early_resolve=False
+        ) as cache_ready:
+            for peer in pl.range(TP_SIZE):
+                pld.system.wait(
+                    output_arrived, offsets=[peer, 0], expected=(attention_epoch - 1) * 2,
+                    cmp=pld.WaitCmp.Ge,
+                )
+        tokens = pl.tensor.dim(x, 0)
+        partial = pl.create_tensor([tokens, D], dtype=pl.FP32)
+        c2a_reuse_partial(
+            x, wq_a, wq_a_scale, q_norm_weight, wq_b, wq_b_scale, wkv, wkv_scale, kv_norm_weight,
+            attn_sink, wo_a, wo_b, wo_b_scale, rope_cos, rope_sin, window_slots, window_indices,
+            window_cache, window_cache_scale, compressed_cache, compressed_cache_scale,
+            compressed_indices, partial, num_tokens, cache_ready,
+        )
+        reducer(
+            partial, output_window, output_arrived, output, group_base, tp_rank, num_tokens,
+            attention_epoch,
+        )
+        return output
+
+    return decode_attn_c2a_reuse
+
+
+decode_attn_c2a_reuse = make_decode_attn_c2a_reuse()
+decode_attn_c2a_reuse_sharded = make_decode_attn_c2a_reuse(decode_tp_output_reduce_scatter)
+
+
+def golden_c2a_reuse(tensors, sharded=False):
+    """Use main's FP32 WoA/BF16 PV reference on the active prefix of each TP group."""
+    active = int(tensors["num_tokens"])
+    world_size = tensors["x"].shape[0]
+    for base in range(0, world_size, TP_SIZE):
+        partials = []
+        for rank in range(base, base + TP_SIZE):
+            inputs = {name: tensors[name][rank] for name in REUSE_INPUT_NAMES}
+            inputs = {
+                name: value[:active] if name in TOKEN_INPUT_NAMES else value
+                for name, value in inputs.items()
+            }
+            result = official_reference_c2a_reuse(inputs)
+            partials.append(result["output"].float())
+            for name in REUSE_MUTABLE_NAMES:
+                tensors[name][rank].copy_(result[name])
+        reduced = sum(partials).bfloat16()
+        if sharded:
+            # Ownership follows the fixed physical slab, so the active count only
+            # masks its suffix and T < TP keeps the AllGather row mapping.
+            width = tensors["output"].shape[1]
+            for offset in range(TP_SIZE):
+                first = min(offset * width, active)
+                count = max(0, min(width, active - first))
+                tensors["output"][base + offset].zero_()
+                if count:
+                    tensors["output"][base + offset][:count].copy_(reduced[first : first + count])
+        else:
+            tensors["output"][base:base + TP_SIZE, :active].copy_(
+                reduced.unsqueeze(0).expand(TP_SIZE, -1, -1)
+            )
+
+
+TOKEN_INPUT_NAMES = (
+    "x", "rope_cos", "rope_sin", "window_slots", "window_indices", "compressed_indices",
+)
+
+
+def compare_active_output(actual, expected, *, inputs, **kwargs):
+    """Apply main's output budget and require the inactive output tail unchanged."""
+    active = int(inputs["num_tokens"])
+    if not torch.equal(actual[active:], expected[active:]):
+        return False, "inactive output rows were modified"
+    return compare_output(actual[:active], expected[:active], **kwargs)
+
+
+def compare_owned_cache(name, initial_cache):
+    """Check numerical publication and preserve unmapped bytes from the input cache."""
+    shared_compare = compare_per_rank(compare_cache(name), "window_slots")
+
+    def compare(actual, expected, *, inputs, **kwargs):
+        """Validate every rank against its original cache and the CPU reference."""
+        active = int(inputs["num_tokens"])
+        slots = inputs["window_slots"][:, :active]
+        source = initial_cache[name].contiguous().view(torch.uint8)
+        written = actual.contiguous().view(torch.uint8)
+        width = actual.shape[-1]
+        for rank in range(actual.shape[0]):
+            rows = slots[rank].long()
+            rows = rows[rows >= 0]
+            untouched = torch.ones(actual[rank].numel() // width, dtype=torch.bool)
+            untouched[rows] = False
+            if not torch.equal(
+                written[rank].reshape(-1, width)[untouched],
+                source[rank].reshape(-1, width)[untouched],
+            ):
+                return False, f"{name}: unmapped bytes differ from the input on rank {rank}"
+        return shared_compare(actual, expected, inputs={**inputs, "window_slots": slots}, **kwargs)
+
+    return compare
+
+
+def input_metadata(tokens, requests, active, case, mode, start_pos=None):
+    """Describe C2A validation tensor shapes without constructing random tensors."""
+    bf, fp, mx = torch.bfloat16, torch.float8_e4m3fn, torch.float8_e8m0fnu
+    if mode not in ("decode", "prefill"):
+        raise ValueError(f"mode must be 'decode' or 'prefill', got {mode!r}")
+    lengths, prefixes = _plan(active, requests, case, mode, start_pos)
+    maximum = max(prefix + length - 1 for prefix, length in zip(prefixes, lengths))
+    window_pages = requests * (maximum // BLOCK_SIZE + 1) + 1
+    compressed_pages = requests * max(4, (maximum // RATIO) // BLOCK_SIZE + 1) + 1
+    return (
+        ("x", [tokens, D], bf),
+        ("wq_a", [D, Q_LORA], fp),
+        ("wq_a_scale", [D // 32, Q_LORA], mx),
+        ("q_norm_weight", [Q_LORA], bf),
+        ("wq_b", [Q_LORA, LOCAL_H * HEAD_DIM], fp),
+        ("wq_b_scale", [Q_LORA // 32, LOCAL_H * HEAD_DIM], mx),
+        ("wkv", [D, HEAD_DIM], fp),
+        ("wkv_scale", [D // 32, HEAD_DIM], mx),
+        ("kv_norm_weight", [HEAD_DIM], bf),
+        ("attn_sink", [LOCAL_H], torch.float32),
+        ("wo_a", [LOCAL_O_GROUPS, O_LORA, O_GROUP_IN], bf),
+        ("wo_b", [LOCAL_O_WIDTH, D], fp),
+        ("wo_b_scale", [LOCAL_O_WIDTH // 32, D], mx),
+        ("rope_cos", [tokens, ROPE_DIM // 2], torch.float32),
+        ("rope_sin", [tokens, ROPE_DIM // 2], torch.float32),
+        ("window_slots", [tokens], torch.int64),
+        ("window_indices", [tokens, M.sliding_window], torch.int32),
+        ("window_cache", [window_pages, BLOCK_SIZE, 1, HEAD_DIM], fp),
+        ("window_cache_scale", [window_pages, BLOCK_SIZE, 1, HEAD_DIM // WINDOW_CACHE_GROUP], mx),
+        ("compressed_cache", [compressed_pages, BLOCK_SIZE, 1, CMP_PACKED], torch.uint8),
+        ("compressed_cache_scale", [compressed_pages, BLOCK_SIZE, 1, CMP_SCALES], fp),
+        ("compressed_indices", [tokens, INDEX_TOPK], torch.int32),
+    )
+
+def build_reuse_specs(args, mode, initial_cache):
+    """Describe shapes lazily and populate full-to-reuse fixtures only for device runs."""
+    metadata = input_metadata(args.tokens, args.requests, args.active_tokens, args.case, mode, getattr(args, "start_pos", None))
+    world_size = TP_SIZE * args.dp
+    ranks = {}
+
+    def initialize(name):
+        """Create deterministic rank inputs once and retain immutable cache snapshots."""
+        if not ranks:
+            for rank in range(world_size):
+                values = make_c2a_reuse_inputs(
+                    tokens=args.active_tokens, requests=args.requests,
+                    seed=args.seed + rank, case=args.case, mode=mode, start_pos=getattr(args, "start_pos", None),
+                )
+                if args.active_tokens < args.tokens:
+                    for key in TOKEN_INPUT_NAMES:
+                        value = values[key]
+                        shape = (args.tokens, *value.shape[1:])
+                        # Invalid suffix indices must never be dereferenced by the kernel.
+                        fill = 2147483647 if key.endswith(("indices", "slots")) else 13
+                        padded = torch.full(shape, fill, dtype=value.dtype)
+                        padded[:args.active_tokens] = value
+                        values[key] = padded
+                # Fail before device execution if the shared fixture and specs diverge.
+                for key, shape, dtype in metadata:
+                    value = values[key]
+                    if list(value.shape) != shape or value.dtype != dtype:
+                        raise ValueError(
+                            f"{key}: fixture {list(value.shape)}/{value.dtype} does not match "
+                            f"spec {shape}/{dtype}"
+                        )
+                ranks[rank] = values
+            for rank in range(world_size):
+                leader = ranks[rank // TP_SIZE * TP_SIZE]
+                for key in REUSE_INPUT_NAMES:
+                    if key not in REUSE_SHARDED_NAMES:
+                        ranks[rank][key] = leader[key]
+        column = [ranks[rank][name] for rank in range(world_size)]
+        if column[0].dtype in (torch.float8_e4m3fn, torch.float8_e8m0fnu):
+            stacked = torch.stack([value.view(torch.uint8) for value in column]).view(column[0].dtype)
+        else:
+            stacked = torch.stack(column)
+        if name in REUSE_MUTABLE_NAMES:
+            initial_cache[name] = stacked.clone()
+        return stacked
+
+    specs = [
+        TensorSpec(name, [world_size, *shape], dtype,
+                   init_value=lambda name=name: initialize(name), resident="stacked")
+        for name, shape, dtype in metadata
+    ]
+    specs.append(TensorSpec(
+        "output", [world_size, args.tokens, D], torch.bfloat16,
+        init_value=lambda: torch.full((world_size, args.tokens, D), 13.0, dtype=torch.bfloat16),
+        resident="stacked",
+    ))
+    specs.append(ScalarSpec("num_tokens", torch.int32, args.active_tokens))
+    specs.append(ScalarSpec(
+        "attention_epoch", torch.int32, 1, compile_runtime=True,
+        benchmark_step=args.epochs if args.bench else None,
+    ))
+    return specs
 
 
 def validate(argv=None):

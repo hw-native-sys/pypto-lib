@@ -8,6 +8,8 @@
 # -----------------------------------------------------------------------------------------------------------
 """Checkpoint layouts and the released group-32 MX activation quantization."""
 
+from collections.abc import Callable
+
 import math
 
 import torch
@@ -31,57 +33,6 @@ FP4_E4M3_CODES = torch.tensor(
      0x80, 0xB0, 0xB8, 0xBC, 0xC0, 0xC4, 0xC8, 0xCC],
     dtype=torch.int16,
 )
-
-
-def _prefill_operand(value):
-    """Round an operand to model-state precision before widening accumulation."""
-    if not isinstance(value, torch.Tensor) or not value.is_floating_point():
-        raise TypeError("FP32 contraction operands must be real floating-point tensors")
-    return value.to(torch.float32).to(torch.float64)
-
-
-def prefill_round_activation(x, precision="fp32"):
-    """Store BF16 values in FP32 transport buffers only in official mode."""
-    if precision not in ("fp32", "official"):
-        raise ValueError("precision must be 'fp32' or 'official'")
-    return x.bfloat16().float() if precision == "official" else x
-
-
-def prefill_quantize_dequantize(x, kind):
-    """Independent released FP8/FP4 roundtrip, including BF16 boundaries.
-
-    FP4 ties select the even code by distance, independently of the device's
-    midpoint comparisons. Power-of-two scales use frexp, not device bit logic.
-    """
-    if kind not in ("mxfp8", "index_fp4", "kv_fp4"):
-        raise ValueError("unknown activation/cache quantization kind")
-    group_size = 16 if kind == "kv_fp4" else 32
-    if x.shape[-1] % group_size:
-        raise ValueError("quantized width must be a multiple of its group size")
-    value = x.bfloat16().float().unflatten(-1, (-1, group_size))
-    maximum = value.abs().amax(-1, keepdim=True)
-    if kind == "kv_fp4":
-        scale = (maximum.clamp_min(6 * 2.0**-9) / 6).to(torch.float8_e4m3fn).float()
-    else:
-        floor, inverse = (1e-4, 1 / 448) if kind == "mxfp8" else (6 * 2.0**-126, 1 / 6)
-        fraction, exponent = torch.frexp(maximum.clamp_min(floor) * inverse)
-        scale = torch.ldexp(torch.ones_like(fraction), exponent - (fraction == 0.5).int())
-    normalized = value / scale
-    if kind == "mxfp8":
-        quantized = normalized.clamp(-448, 448).to(torch.float8_e4m3fn).float()
-    else:
-        magnitude = normalized.abs().clamp(max=6)
-        levels = magnitude.new_tensor([0, 0.5, 1, 1.5, 2, 3, 4, 6])
-        best = torch.zeros_like(magnitude, dtype=torch.long)
-        distance = magnitude
-        # Even codes precede odd codes, so equal distances implement RN-even.
-        for code in (2, 4, 6, 1, 3, 5, 7):
-            candidate = (magnitude - levels[code]).abs()
-            closer = candidate < distance
-            best = torch.where(closer, code, best)
-            distance = torch.where(closer, candidate, distance)
-        quantized = torch.copysign(levels[best], normalized)
-    return (quantized * scale).flatten(-2).bfloat16().float()
 
 
 def build_mxfp4_pair_lut() -> torch.Tensor:
@@ -241,48 +192,6 @@ def quantize_mxfp4_weight(weight: torch.Tensor) -> tuple[torch.Tensor, torch.Ten
     return payload, encode_e8m0(scale)
 
 
-def prepare_routed_weight_for_device(
-    packed_weight_fp4: torch.Tensor,
-    scale_e8m0: torch.Tensor,
-) -> tuple[torch.Tensor, torch.Tensor]:
-    """Convert checkpoint routed FP4 weights into the A5 NPU MXFP8 RHS ABI.
-
-    The input comes from a packed MXFP4 checkpoint with logical shape
-    ``[..., out, in]``, while ``pl.matmul_mx`` requires an ``[..., in, out]`` RHS.
-
-    The PyPTO high-level API does not support ``FP8 activation x FP4 RHS``, so the
-    FP4 decode, logical transpose, MX_B_NN scale reordering and FP8 quantisation
-    all happen at checkpoint/weight-load time. This only prepares persistent device
-    weights on the host; it is not a production kernel path that expands the full
-    weight to FP32.
-
-    Returns:
-        ``device_weight``: ``[..., in, out]`` FP8E4M3FN weights;
-        ``device_scale``: ``[..., in/32, out]`` E8M0 scales in MX_B_NN physical order.
-    """
-    logical_out_in = dequantize_mxfp4(packed_weight_fp4, scale_e8m0)
-    if logical_out_in.shape[-1] % MX_GROUP:
-        raise ValueError("routed FP4 input dimension must be divisible by MX group size")
-
-    logical_in_out = logical_out_in.transpose(-2, -1).contiguous()
-    k_dim, n_dim = logical_in_out.shape[-2:]
-    if k_dim % MX_GROUP or n_dim % 16:
-        raise ValueError("MX_B_NN requires K divisible by 32 and N divisible by 16")
-
-    grouped = logical_in_out.float().reshape(*logical_in_out.shape[:-2], k_dim // MX_GROUP, MX_GROUP, n_dim)
-    amax = grouped.abs().amax(dim=-2)
-    exponent = torch.ceil(torch.log2((amax / 448.0).clamp_min(2.0 ** -127))).clamp(-127, 128)
-    scale_value = torch.exp2(exponent)
-    quantized = (grouped / scale_value.unsqueeze(-2)).clamp(-448.0, 448.0)
-    quantized = quantized.to(torch.float8_e4m3fn).reshape(*logical_in_out.shape[:-2], k_dim, n_dim)
-    scale_codes = encode_e8m0(scale_value)
-    packed_scale = pack_mx_b_scale(scale_codes)
-    e8m0 = getattr(torch, "float8_e8m0fnu", None)
-    if e8m0 is not None:
-        packed_scale = packed_scale.contiguous().view(e8m0)
-    return quantized, packed_scale
-
-
 def quantize_mxfp8_cache(value: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
     """Quantize the last dimension to E4M3 payload and group-32 E8M0 scales."""
     if value.shape[-1] % MX_GROUP:
@@ -356,12 +265,6 @@ def _quantize_mxfp8_activation(x: torch.Tensor) -> tuple[torch.Tensor, torch.Ten
     scale = torch.exp2(torch.ceil(torch.log2(amax / 448.0)))
     quantized = (grouped / scale.unsqueeze(-1)).clamp(-448.0, 448.0).to(torch.float8_e4m3fn)
     return quantized, scale
-
-
-def quantize_mxfp8_activation(x: torch.Tensor) -> torch.Tensor:
-    """Round one activation scale per row and group of 32, then dequantize to FP32."""
-    quantized, scale = _quantize_mxfp8_activation(x)
-    return (quantized.float() * scale.unsqueeze(-1)).reshape_as(x).float()
 
 
 def mxfp8_linear(
@@ -485,3 +388,109 @@ def matmul_mx_golden_v41(a, a_scale, b, b_scale):
     a_f = a.float() * _e8m0_to_fp32(a_codes).repeat_interleave(MX_GROUP, -1)
     b_f = b.float() * _e8m0_to_fp32(b_codes).repeat_interleave(MX_GROUP, -2)
     return torch.matmul(a_f.to(torch.float32), b_f.to(torch.float32))
+
+
+def _copy_cache_rows(destination: torch.Tensor, source: torch.Tensor, rows: torch.Tensor) -> None:
+    destination_rows = destination.flatten(0, 1).view(torch.uint8)
+    source_rows = source.contiguous().view(torch.uint8).reshape_as(destination_rows[rows])
+    destination_rows[rows] = source_rows
+
+
+def _publish_quantized_cache(
+    payload: torch.Tensor,
+    scale: torch.Tensor,
+    values: torch.Tensor,
+    slots: torch.Tensor,
+    quantize: Callable[[torch.Tensor], tuple[torch.Tensor, torch.Tensor]],
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Quantize and replace only mapped rows in a packed cache pair."""
+    updated_payload = payload.clone()
+    updated_scale = scale.clone()
+    valid = slots >= 0
+    rows = slots[valid].to(torch.int64)
+    if rows.numel():
+        row_payload, row_scale = quantize(values[valid])
+        _copy_cache_rows(updated_payload, row_payload, rows)
+        _copy_cache_rows(updated_scale, row_scale, rows)
+    return updated_payload, updated_scale
+
+
+def quantized_cache_compare(
+    payload_name: str,
+    scale_name: str,
+    mapping_name: str,
+    max_relative_l2: float,
+    group_size: int | None = None,
+    scale_format: str | None = None,
+) -> Callable:
+    """Validate mapped cache values and exact storage ownership elsewhere."""
+
+    def compare(
+        _actual: torch.Tensor,
+        _expected: torch.Tensor,
+        *,
+        actual_outputs: dict[str, torch.Tensor],
+        expected_outputs: dict[str, torch.Tensor],
+        inputs: dict[str, torch.Tensor],
+        rtol: float,
+        atol: float,
+    ) -> tuple[bool, str]:
+        del rtol, atol
+        if group_size is None:
+            actual_value = dequantize_mxfp8_cache(
+                actual_outputs[payload_name],
+                actual_outputs[scale_name],
+            )
+            expected_value = dequantize_mxfp8_cache(
+                expected_outputs[payload_name],
+                expected_outputs[scale_name],
+            )
+        else:
+            actual_value = dequantize_mxfp4_cache(
+                actual_outputs[payload_name],
+                actual_outputs[scale_name],
+                group_size=group_size,
+                scale_format=scale_format,
+            )
+            expected_value = dequantize_mxfp4_cache(
+                expected_outputs[payload_name],
+                expected_outputs[scale_name],
+                group_size=group_size,
+                scale_format=scale_format,
+            )
+        physical_rows = actual_value.shape[1] * actual_value.shape[2]
+        actual_rows = actual_value.flatten(1, 2)
+        expected_rows = expected_value.flatten(1, 2)
+        active_actual = []
+        active_expected = []
+        for rank in range(actual_value.shape[0]):
+            active = torch.unique(inputs[mapping_name][rank].flatten().to(torch.int64), sorted=True)
+            active = active[active >= 0]
+            if active.numel() and int(active[-1]) >= physical_rows:
+                return False, f"    {mapping_name} row {int(active[-1])} exceeds {physical_rows}"
+            active_actual.append(actual_rows[rank, active])
+            active_expected.append(expected_rows[rank, active])
+            inactive = torch.ones(physical_rows, dtype=torch.bool)
+            inactive[active] = False
+            for name in (payload_name, scale_name):
+                actual_storage = actual_outputs[name][rank].contiguous().view(torch.uint8).reshape(physical_rows, -1)
+                expected_storage = expected_outputs[name][rank].contiguous().view(torch.uint8).reshape(
+                    physical_rows,
+                    -1,
+                )
+                if not torch.equal(actual_storage[inactive], expected_storage[inactive]):
+                    return False, f"    {name} modified inactive {mapping_name} rows"
+
+        actual_active = torch.cat(active_actual).float()
+        expected_active = torch.cat(active_expected).float()
+        if not torch.isfinite(actual_active).all() or not torch.isfinite(expected_active).all():
+            return False, f"    active {mapping_name} rows contain non-finite values"
+        relative_l2 = (actual_active - expected_active).norm() / expected_active.norm().clamp_min(1e-12)
+        print(f"[PRECISION] {payload_name} active_value_rel_l2={relative_l2.item():.6g}")
+        return (
+            bool(relative_l2 <= max_relative_l2),
+            f"    active {mapping_name} rows must stay within {max_relative_l2:.0%} relative L2",
+        )
+
+    compare.__name__ = f"dequantized_{payload_name}"
+    return compare

@@ -10,7 +10,7 @@
 
 import pypto.language as pl
 
-from attention_ops import (
+from qkv_proj_rope import (
     make_bf16_projection_with_deps,
     make_rope_with_deps,
 )

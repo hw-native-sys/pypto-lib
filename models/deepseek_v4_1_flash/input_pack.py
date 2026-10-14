@@ -163,17 +163,6 @@ def validate(argv=None):
     return result
 
 
-__all__ = [
-    "DEFAULT_TOKENS",
-    "TEST_VOCAB_SIZE",
-    "build_tensor_specs",
-    "golden_pack_x_hc",
-    "pack_x_hc",
-    "pack_x_hc_test",
-    "validate",
-]
-
-
 def main():
     """Run local validation and return a failing exit status on errors."""
     result = validate()

@@ -13,12 +13,12 @@ import pypto.language as pl
 import pypto.language.distributed as pld
 import torch
 
-from attention_common import AttentionGoldenResult, golden_swa_attention
-from attention_tp import prefill_tp_output_all_reduce
+from utils import AttentionGoldenResult
+from sparse_attention import golden_swa_attention
+from o_proj import prefill_tp_output_all_reduce
 from config import PREFILL_MAX_TOKENS, WINDOW_CACHE_GROUP, FLASH as M, ORI_BLOCKS_DYN, T_DYN, TP_SIZE
 
-from attention_ops import M_TILE
-from decode_attn_swa import SOFTMAX_SCALE
+from qkv_proj_rope import M_TILE
 from o_proj import prefill_o_proj
 from qkv_proj_rope import (
     prefill_kv_proj_rope,
@@ -117,6 +117,9 @@ def prefill_gather_window(
                 else:
                     gathered[dst:dst + 1, :] = pl.full([1, HEAD_DIM], dtype=pl.BF16, value=0.0)
     return gather_tid
+
+
+SOFTMAX_SCALE = HEAD_DIM ** -0.5
 
 
 @pl.jit.inline
@@ -324,24 +327,3 @@ def prefill_attn_swa(
         partial, output_window, output_arrived, output, group_base, tp_rank, num_tokens, attention_epoch,
     )
     return output
-
-
-__all__ = ["golden_prefill_attn_swa", "prefill_attn_swa", "prefill_attn_swa_partial"]
-
-
-def validate(argv=None):
-    """Validate the Prefill SWA leaf operator on A5."""
-    from decode_attn_swa import run_swa
-
-    return run_swa(prefill_attn_swa, "prefill", argv=argv)
-
-
-def main():
-    """Run local validation and return a failing exit status on precision errors."""
-    result = validate()
-    if not result.passed:
-        raise SystemExit(result.error or 1)
-
-
-if __name__ == "__main__":
-    main()

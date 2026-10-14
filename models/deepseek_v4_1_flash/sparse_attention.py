@@ -8,6 +8,28 @@
 # -----------------------------------------------------------------------------------------------------------
 """PyPTO sparse MLA with packed-cache dequantization and sink-aware Cube attention."""
 
+from collections.abc import Callable
+
+import torch
+
+from config import AttentionMode
+from compressor import golden_compressor_ratio1 as compressor_ratio1
+from compressor import golden_compressor_ratio2_paged as compressor_ratio2_paged
+from hierarchical_sparse_indexer import golden_index_key as index_key
+from hierarchical_sparse_indexer import golden_paged_indexer as paged_indexer
+from hierarchical_sparse_indexer import select_candidate_blocks
+from qkv_proj_rope import golden_qkv_proj_rope as qkv_proj_rope
+from qkv_proj_rope import golden_rope_interleave as rope_interleave
+from o_proj import _project_output
+from quant import (
+    _publish_quantized_cache,
+    dequantize_mxfp4_cache,
+    dequantize_mxfp8_cache,
+    quantize_mxfp4_cache,
+    quantize_mxfp8_cache,
+)
+from utils import AttentionGoldenResult
+
 # ci: no-sim
 
 from pathlib import Path
@@ -42,6 +64,102 @@ KEY_TILE = 128
 GATHER_KEY_TILE = 32
 TOKEN_TILE = 512
 WORKERS = 32
+
+
+M_TILE = 16
+
+ATTENTION_TILE = 32
+
+def golden_prefill_c1a_attention(query: torch.Tensor, window_cache: torch.Tensor, window_indices: torch.Tensor, compressed_cache: torch.Tensor, compressed_indices: torch.Tensor, sink: torch.Tensor) -> torch.Tensor:
+    """Mirror C1A tiled online softmax, BF16 PV, and its FP32 first-vector patch."""
+    import torch
+    output = torch.empty_like(query)
+    width = query.shape[-1]
+    for token in range(query.shape[0]):
+        q = query[token].float()
+        maximum = q.new_full((q.shape[0],), -1e+30)
+        denominator = q.new_zeros(q.shape[0])
+        numerator = torch.zeros_like(q)
+        for cache, indices in ((window_cache, window_indices), (compressed_cache, compressed_indices)):
+            flat_cache = cache.flatten(0, 1).squeeze(-2)
+            for begin in range(0, indices.shape[-1], ATTENTION_TILE):
+                rows = indices[token, begin:begin + ATTENTION_TILE].long()
+                valid = rows >= 0
+                if not bool(valid.any()):
+                    continue
+                kv = flat_cache[rows.clamp_min(0)].clone()
+                kv[~valid] = 0
+                scores = torch.matmul(q, kv.float().T) * width ** (-0.5)
+                scores = scores + (valid.float() - 1).unsqueeze(0) * 1e+30
+                next_maximum = torch.maximum(maximum, scores.amax(dim=-1))
+                correction = torch.exp(maximum - next_maximum)
+                probability = torch.exp(scores - next_maximum.unsqueeze(-1)) * valid.unsqueeze(0)
+                denominator = denominator * correction + probability.sum(dim=-1)
+                weighted = torch.matmul(probability.to(torch.bfloat16).float(), kv.float())
+                weighted[::M_TILE, :16] = (probability[::M_TILE].unsqueeze(-1) * kv[:, :16].float().unsqueeze(0)).sum(dim=1)
+                numerator = numerator * correction.unsqueeze(-1) + weighted
+                maximum = next_maximum
+        final_maximum = torch.maximum(maximum, sink.float())
+        correction = torch.exp(maximum - final_maximum)
+        denominator = denominator * correction + torch.exp(sink.float() - final_maximum)
+        output[token] = (numerator * (correction / denominator).unsqueeze(-1)).to(query.dtype)
+    return output
+
+def golden_paged_sparse_attention_stats(
+    q: torch.Tensor,
+    cache: torch.Tensor,
+    indices: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Return token-major online-softmax statistics from physical paged rows."""
+    flat_cache = cache.flatten(0, 1).squeeze(-2)
+    safe = indices.clamp_min(0).to(torch.long)
+    selected = flat_cache[safe]
+    logits = torch.einsum("thd,tkd->thk", q.float(), selected.float()) * q.shape[-1] ** -0.5
+    logits = logits.masked_fill(indices.unsqueeze(-2) < 0, -torch.inf)
+    maximum = logits.amax(dim=-1)
+    finite_maximum = maximum.masked_fill(~torch.isfinite(maximum), 0.0)
+    exponentials = torch.exp(logits - finite_maximum.unsqueeze(-1))
+    exponentials = exponentials.masked_fill(~torch.isfinite(logits), 0.0)
+    denominator = exponentials.sum(dim=-1)
+    numerator = torch.einsum("thk,tkd->thd", exponentials, selected.float())
+    return maximum, denominator, numerator
+
+
+
+def golden_paged_sparse_attention(
+    q: torch.Tensor,
+    window_cache: torch.Tensor,
+    window_indices: torch.Tensor,
+    compressed_cache: torch.Tensor,
+    compressed_indices: torch.Tensor,
+    sink: torch.Tensor,
+) -> torch.Tensor:
+    """Merge token-major paged window and compressed attention with one sink."""
+    parts = (
+        golden_paged_sparse_attention_stats(q, window_cache, window_indices),
+        golden_paged_sparse_attention_stats(q, compressed_cache, compressed_indices),
+    )
+    return golden_merge_attention_stats(parts, sink).to(q.dtype)
+
+
+
+def golden_merge_attention_stats(
+    parts: tuple[tuple[torch.Tensor, torch.Tensor, torch.Tensor], ...],
+    sink: torch.Tensor,
+) -> torch.Tensor:
+    """Merge sparse sources with one attention sink in a common softmax denominator."""
+    maxima = [part[0] for part in parts]
+    sink_value = sink.float().view(*([1] * (maxima[0].ndim - 1)), -1)
+    global_maximum = torch.maximum(torch.stack(maxima).amax(dim=0), sink_value)
+    denominator = torch.exp(sink_value - global_maximum)
+    numerator = torch.zeros_like(parts[0][2])
+    for maximum, local_sum, local_numerator in parts:
+        scale = torch.exp(maximum - global_maximum)
+        scale = scale.masked_fill(~torch.isfinite(maximum), 0.0)
+        denominator = denominator + local_sum * scale
+        numerator = numerator + local_numerator * scale.unsqueeze(-1)
+    return numerator / denominator.unsqueeze(-1)
+
 
 
 @pl.jit.inline(auto_scope=False)
@@ -489,7 +607,7 @@ def main():
     import torch
 
     from golden import TensorSpec, run
-    from quantization import (
+    from quant import (
         dequantize_mxfp4_cache, dequantize_mxfp8_cache,
         quantize_mxfp4_cache, quantize_mxfp8_cache,
     )
@@ -597,6 +715,270 @@ def main():
         status = "COMPILE_ONLY" if args.compile_only else "DEVICE_VALIDATED"
         print(status, mode, result.work_dir)
     return records
+
+
+
+def golden_swa_attention(
+    x: torch.Tensor,
+    wq_a: torch.Tensor,
+    wq_a_scale: torch.Tensor | None,
+    q_norm_weight: torch.Tensor,
+    wq_b: torch.Tensor,
+    wq_b_scale: torch.Tensor | None,
+    wkv: torch.Tensor,
+    wkv_scale: torch.Tensor | None,
+    kv_norm_weight: torch.Tensor,
+    attn_sink: torch.Tensor,
+    wo_a: torch.Tensor,
+    wo_b: torch.Tensor,
+    wo_b_scale: torch.Tensor | None,
+    rope_cos: torch.Tensor,
+    rope_sin: torch.Tensor,
+    window_slots: torch.Tensor,
+    window_indices: torch.Tensor,
+    window_cache: torch.Tensor,
+    window_cache_scale: torch.Tensor,
+) -> AttentionGoldenResult:
+    """Evaluate SWA and publish the current token KV rows."""
+    query, window_kv, _ = qkv_proj_rope(
+        x,
+        wq_a,
+        wq_a_scale,
+        q_norm_weight,
+        wq_b,
+        wq_b_scale,
+        wkv,
+        wkv_scale,
+        kv_norm_weight,
+        rope_cos,
+        rope_sin,
+    )
+    window_payload, updated_window_scale = _publish_quantized_cache(
+        window_cache,
+        window_cache_scale,
+        window_kv,
+        window_slots,
+        quantize_mxfp8_cache,
+    )
+    quantized_window = dequantize_mxfp8_cache(window_payload, updated_window_scale).to(query.dtype)
+    window_stats = golden_paged_sparse_attention_stats(query, quantized_window, window_indices)
+    attended = golden_merge_attention_stats((window_stats,), attn_sink).to(query.dtype)
+    output = _project_output(attended, rope_cos, rope_sin, wo_a, wo_b, wo_b_scale)
+    return AttentionGoldenResult(
+        output, window_payload, updated_window_scale, None, None, None, None, None, None, None
+    )
+
+
+
+def golden_compressed_attention(
+    mode: AttentionMode,
+    ratio: int,
+    x: torch.Tensor,
+    wq_a: torch.Tensor,
+    wq_a_scale: torch.Tensor | None,
+    q_norm_weight: torch.Tensor,
+    wq_b: torch.Tensor,
+    wq_b_scale: torch.Tensor | None,
+    wkv: torch.Tensor,
+    wkv_scale: torch.Tensor | None,
+    kv_norm_weight: torch.Tensor,
+    attn_sink: torch.Tensor,
+    wo_a: torch.Tensor,
+    wo_b: torch.Tensor,
+    wo_b_scale: torch.Tensor | None,
+    rope_cos: torch.Tensor,
+    rope_sin: torch.Tensor,
+    window_slots: torch.Tensor,
+    window_indices: torch.Tensor,
+    window_cache: torch.Tensor,
+    window_cache_scale: torch.Tensor,
+    compressed_cache: torch.Tensor,
+    compressed_cache_scale: torch.Tensor,
+    compressed_indices: torch.Tensor | None,
+    compressor_wkv: torch.Tensor | None,
+    compressor_wgate: torch.Tensor | None,
+    compressor_norm_weight: torch.Tensor | None,
+    state_block_table: torch.Tensor | None,
+    state_cache: torch.Tensor | None,
+    compressed_slots: torch.Tensor | None,
+    position_ids: torch.Tensor | None,
+    compressed_lens: torch.Tensor | None,
+    compressed_rope_cos: torch.Tensor | None,
+    compressed_rope_sin: torch.Tensor | None,
+    index_wk: torch.Tensor | None,
+    index_norm_weight: torch.Tensor | None,
+    index_wq_b: torch.Tensor | None,
+    index_wq_b_scale: torch.Tensor | None,
+    index_weights_proj: torch.Tensor | None,
+    index_cache: torch.Tensor | None,
+    index_cache_scale: torch.Tensor | None,
+    index_block_table: torch.Tensor | None,
+    request_ids: torch.Tensor | None,
+    candidate_mask: torch.Tensor | None,
+    attention_fn: Callable | None = None,
+    output_dtype: torch.dtype | None = None,
+    query_start_loc: torch.Tensor | None = None,
+) -> AttentionGoldenResult:
+    """Evaluate C2A/C1A full, reindex, or reuse with paged cache state."""
+    query, window_kv, query_latent = qkv_proj_rope(
+        x,
+        wq_a,
+        wq_a_scale,
+        q_norm_weight,
+        wq_b,
+        wq_b_scale,
+        wkv,
+        wkv_scale,
+        kv_norm_weight,
+        rope_cos,
+        rope_sin,
+    )
+    window_payload, updated_window_scale = _publish_quantized_cache(
+        window_cache,
+        window_cache_scale,
+        window_kv,
+        window_slots,
+        quantize_mxfp8_cache,
+    )
+    quantized_window = dequantize_mxfp8_cache(window_payload, updated_window_scale).to(query.dtype)
+    compressed_payload = compressed_cache
+    updated_compressed_scale = compressed_cache_scale
+    quantized_compressed = dequantize_mxfp4_cache(
+        compressed_cache, compressed_cache_scale, group_size=16, scale_format="e4m3"
+    ).to(query.dtype)
+    index_payload = index_cache
+    updated_index_scale = index_cache_scale
+    quantized_index = None
+    if index_cache is not None and index_cache_scale is not None:
+        quantized_index = dequantize_mxfp4_cache(
+            index_cache, index_cache_scale, group_size=32, scale_format="e8m0"
+        ).to(query.dtype)
+    updated_state = None if state_cache is None else state_cache.clone()
+    topk_indices = compressed_indices
+    candidates = candidate_mask
+
+    if mode is AttentionMode.FULL:
+        if compressor_wkv is None or compressor_norm_weight is None or compressed_slots is None:
+            raise ValueError("full mode requires compressor weights and compressed slots")
+        if compressed_rope_cos is None or compressed_rope_sin is None or quantized_index is None:
+            raise ValueError("full mode requires compressed RoPE rows and an index cache")
+        if ratio == 1:
+            latent = compressor_ratio1(x, compressor_wkv, compressor_norm_weight)
+            publish_mask = compressed_slots >= 0
+        elif ratio == 2:
+            if compressor_wgate is None or state_block_table is None or updated_state is None:
+                raise ValueError("ratio-2 full mode requires gate weights and recurrent state")
+            if position_ids is None or query_start_loc is None or request_ids is None:
+                raise ValueError("ratio-2 full mode requires positions, query starts and token-to-request indices")
+            latent, publish_mask = compressor_ratio2_paged(
+                x,
+                query_start_loc,
+                position_ids,
+                request_ids,
+                state_block_table,
+                updated_state,
+                compressor_wkv,
+                compressor_wgate,
+                compressor_norm_weight,
+            )
+        else:
+            raise ValueError(f"unsupported compression ratio {ratio}")
+        latent_tail = rope_interleave(
+            latent[..., -compressed_rope_cos.shape[-1] * 2 :], compressed_rope_cos, compressed_rope_sin
+        )
+        rotated_latent = torch.cat((latent[..., : -compressed_rope_cos.shape[-1] * 2], latent_tail), dim=-1)
+        publish_slots = compressed_slots.masked_fill(~publish_mask, -1)
+        compressed_payload, updated_compressed_scale = _publish_quantized_cache(
+            compressed_cache,
+            compressed_cache_scale,
+            rotated_latent,
+            publish_slots,
+            lambda value: quantize_mxfp4_cache(value, group_size=16, scale_format="e4m3"),
+        )
+        quantized_compressed = dequantize_mxfp4_cache(
+            compressed_payload,
+            updated_compressed_scale,
+            group_size=16,
+            scale_format="e4m3",
+        ).to(query.dtype)
+        if index_wk is None or index_norm_weight is None:
+            raise ValueError("full mode requires index-key weights")
+        keys = index_key(
+            latent,
+            index_wk,
+            index_norm_weight,
+            compressed_rope_cos,
+            compressed_rope_sin,
+        )
+        index_payload, updated_index_scale = _publish_quantized_cache(
+            index_cache,
+            index_cache_scale,
+            keys,
+            publish_slots,
+            lambda value: quantize_mxfp4_cache(value, group_size=32, scale_format="e8m0"),
+        )
+        quantized_index = dequantize_mxfp4_cache(
+            index_payload,
+            updated_index_scale,
+            group_size=32,
+            scale_format="e8m0",
+        ).to(query.dtype)
+
+    if mode in (AttentionMode.FULL, AttentionMode.REINDEX):
+        if index_wq_b is None or index_weights_proj is None:
+            raise ValueError("indexing modes require query and score weights")
+        if (
+            quantized_index is None
+            or index_block_table is None
+            or request_ids is None
+            or compressed_lens is None
+        ):
+            raise ValueError("indexing modes require cache addressing and causal compressed lengths")
+        scores, topk_indices = paged_indexer(
+            x,
+            query_latent,
+            request_ids,
+            quantized_index,
+            index_block_table,
+            compressed_lens,
+            index_wq_b,
+            index_wq_b_scale,
+            index_weights_proj,
+            rope_cos,
+            rope_sin,
+            candidates=candidate_mask,
+            topk=M.index_topk,
+        )
+        if ratio == 1 and mode is AttentionMode.FULL:
+            candidates = select_candidate_blocks(
+                scores,
+                compressed_lens,
+                M.candidate_topk_blocks,
+                M.candidate_block_size,
+            )
+    if topk_indices is None:
+        raise ValueError("reuse mode requires published compressed Top-K indices")
+
+    attend = attention_fn or golden_paged_sparse_attention
+    attended = attend(
+        query, quantized_window, window_indices, quantized_compressed, topk_indices, attn_sink
+    )
+    output = _project_output(
+        attended, rope_cos, rope_sin, wo_a, wo_b, wo_b_scale, output_dtype=output_dtype
+    )
+    return AttentionGoldenResult(
+        output,
+        window_payload,
+        updated_window_scale,
+        compressed_payload,
+        updated_compressed_scale,
+        index_payload,
+        updated_index_scale,
+        updated_state,
+        topk_indices,
+        candidates,
+    )
+
 
 
 if __name__ == "__main__":

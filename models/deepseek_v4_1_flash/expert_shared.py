@@ -59,23 +59,7 @@ assert MX_K_TILE % MX_RIGHT_K_TILE == 0
 assert MX_K_TILE % MX_W2_RIGHT_K_TILE == 0
 
 
-from attention_ops import prefill_linear
-from quantization import prefill_round_activation
 import torch.nn.functional as F
-
-PREFILL_LIMIT = M.swiglu_limit
-
-def prefill_expert_reference(x, matrices, route_weights=None, *, precision="fp32", formats=None):
-    """Apply routing weights before the released BF16 hidden boundary and W2."""
-    w1, w3, w2 = matrices
-    formats = formats or ("fp32",) * 3
-    gate = prefill_linear(x, w1, precision=precision, format=formats[0]).clamp(max=PREFILL_LIMIT)
-    up = prefill_linear(x, w3, precision=precision, format=formats[1]).clamp(-PREFILL_LIMIT, PREFILL_LIMIT)
-    hidden = F.silu(gate) * up
-    if route_weights is not None:
-        hidden = hidden * route_weights[:, None]
-    hidden = prefill_round_activation(hidden, precision)
-    return prefill_linear(hidden, w2, precision=precision, format=formats[2])
 
 
 @pl.jit.inline
@@ -411,9 +395,8 @@ def expert_shared_test(
 def golden_expert_shared(tensors):
     """Reference for MXFP8 W1/W3, SwiGLU requantization, and MXFP8 W2."""
     import torch
-    import torch.nn.functional as F
 
-    from quantization import decode_e8m0_codes_v41 as decode_e8m0_codes, host_quant_mxfp8_v41 as host_quant_mxfp8, matmul_mx_golden_v41 as matmul_mx_golden
+    from quant import decode_e8m0_codes_v41 as decode_e8m0_codes, host_quant_mxfp8_v41 as host_quant_mxfp8, matmul_mx_golden_v41 as matmul_mx_golden
 
     x_fp8 = tensors["x_local"][:T]
     x_scale = decode_e8m0_codes(
@@ -441,14 +424,14 @@ def golden_expert_shared(tensors):
 def build_tensor_specs():
     import torch
     from golden.spec import TensorSpec
-    from quantization import gen_mxfp8_weight_kn_v41 as gen_mxfp8_weight_kn_device, host_quant_mxfp8_v41 as host_mxfp8_activation
+    from quant import gen_mxfp8_weight_kn_v41 as gen_mxfp8_weight_kn_device, host_quant_mxfp8_v41 as host_mxfp8_activation
 
     x_local_bf16 = torch.randn(T_PAD, D, dtype=torch.bfloat16)
     if T < T_PAD:
         x_local_bf16[T:, :] = 0
     x_local_fp8, x_local_scale_codes = host_mxfp8_activation(x_local_bf16, return_e8m0=True)
     # matmul_mx expects the physical MX_A_ZZ scale order.
-    from quantization import pack_mx_a_scale
+    from quant import pack_mx_a_scale
     x_local_scale_codes = pack_mx_a_scale(x_local_scale_codes)
     fp8_e8m0 = getattr(torch, "float8_e8m0fnu", torch.uint8)
     x_local_scale = x_local_scale_codes.contiguous().view(fp8_e8m0)

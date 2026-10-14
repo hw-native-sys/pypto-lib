@@ -104,40 +104,38 @@ TOPK = M.num_experts_per_tok
 MOE_INTER = M.moe_intermediate_size
 
 
-from attention_tp import prefill_tp_output_all_reduce  # noqa: E402
-from decode_attn_c2a_full import (  # noqa: E402
-    CMP_PACKED,
-    CMP_SCALES,
-    compare_cache,
-    compare_output,
-    compare_per_rank,
-    compare_replicated,
-)
-from decode_attn_c2a_reuse import REUSE_MUTABLE_NAMES  # noqa: E402
+from o_proj import prefill_tp_output_all_reduce  # noqa: E402
 from gate import golden_gate_reference as gate
 from hc_mixes import golden_mhc_mixes as hc_mixes
 from hc_post import golden_hc_post as hc_post
 from hc_pre import golden_hc_pre as hc_pre
-from rmsnorm import golden_rms_norm_reference as rms_norm
+from rmsnorm import golden_rms_norm
 from hc_mixes import mhc_mixes  # noqa: E402
 from hc_post import mhc_post  # noqa: E402
 from hc_pre import mhc_pre  # noqa: E402
 from prefill_c2a_full import (  # noqa: E402
     ATTENTION_STATE,
+    CMP_PACKED,
+    CMP_SCALES,
     HC_INPUT_NAMES,
     MODES,
+    REUSE_MUTABLE_NAMES,
     ROW_BUDGET,
     StagedAttentionReference,
     _report as report_stage,
+    compare_cache,
     compare_group_leaders,
+    compare_output,
+    compare_per_rank,
+    compare_replicated,
     golden_attention_input,
     make_attention_inputs,
     make_hc_inputs,
     reference_attention,
 )
 from prefill_c2a_reuse import prefill_c2a_reuse  # noqa: E402
-from quantization import build_mxfp4_pair_lut  # noqa: E402
-from rmsnorm import rms_norm as npu_rms_norm  # noqa: E402
+from quant import build_mxfp4_pair_lut  # noqa: E402
+from rmsnorm import rms_norm_tiled  # noqa: E402
 from moe import (  # noqa: E402
     AUX_WIDTH,
     EP_SIZE,
@@ -331,7 +329,9 @@ def prefill_moe_sublayer(
     local_ffn_normed = pl.create_tensor([TOKENS, D], dtype=pl.BF16)
     local_ffn_owned = pl.create_tensor([TOKENS, D], dtype=pl.BF16)
     _compact_local_tokens(ffn_input, local_ffn_input, num_tokens, tp_rank)
-    npu_rms_norm(local_ffn_input, ffn_norm_weight, local_ffn_normed)
+    norm_tokens = pl.tensor.dim(local_ffn_input, 0)
+    for norm_block in pl.spmd((norm_tokens + 7) // 8, name_hint="rms_norm"):
+        rms_norm_tiled(local_ffn_input, ffn_norm_weight, local_ffn_normed, norm_block, norm_tokens)
     local_num_tokens = _local_token_count(num_tokens, tp_rank)
     with pl.scope():
         local_ffn_ready = moe_core(
@@ -416,7 +416,7 @@ def make_ffn_hc_inputs(seed):
 def make_moe_replicated_inputs(seed):
     """Gate and shared-expert weights at the deployment magnitudes, identical on every rank."""
     from moe import _route_bias
-    from quantization import gen_mxfp8_weight_kn_v41
+    from quant import gen_mxfp8_weight_kn_v41
 
     gen = torch.Generator().manual_seed(seed)
     shared_std = {"w1": 1.71e-2, "w2": 1.68e-2, "w3": 1.70e-2}
@@ -663,8 +663,8 @@ def routing_flips(inputs, rank, actual_input, expected_input):
     norm_weight = inputs["ffn_norm_weight"][rank]
     gate_weight = inputs["gate_weight"][rank]
     correction_bias = inputs["correction_bias"][rank]
-    _, actual_indices = gate(rms_norm(actual_input, norm_weight), gate_weight, correction_bias)
-    _, expected_indices = gate(rms_norm(expected_input, norm_weight), gate_weight, correction_bias)
+    _, actual_indices = gate(golden_rms_norm(actual_input, norm_weight), gate_weight, correction_bias)
+    _, expected_indices = gate(golden_rms_norm(expected_input, norm_weight), gate_weight, correction_bias)
     flipped = (actual_indices.sort(dim=-1).values != expected_indices.sort(dim=-1).values).any(dim=-1)
     return int(flipped.sum().item()), flipped.numel()
 
@@ -1246,16 +1246,6 @@ def main():
     result = validate()
     if not result.passed:
         raise SystemExit(result.error or 1)
-
-
-__all__ = [
-    "moe_hc_pre",
-    "prefill_ffn_restore",
-    "prefill_moe_sublayer",
-    "run_prefill_layer",
-    "validate",
-    "widen_to_fp32",
-]
 
 
 if __name__ == "__main__":

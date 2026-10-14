@@ -39,34 +39,6 @@ LINEAR_OK = 4
 LINEAR_K_PER_SPLIT = HC_DIM // LINEAR_OK
 
 
-from attention_ops import prefill_linear
-
-PREFILL_EPS = M.hc_eps
-PREFILL_HC = M.hc_mult
-PREFILL_ITERATIONS = M.hc_sinkhorn_iters
-
-def prefill_hc_mixes(x, function, scale, base, *, norm_eps=None):
-    """Project HC logits in FP64, retaining FP32 RMS and coefficient math."""
-    flat = x.flatten(-2).float()
-    epsilon = M.rms_norm_eps if norm_eps is None else norm_eps
-    inverse_rms = torch.rsqrt(flat.square().mean(dim=-1, keepdim=True) + epsilon)
-    logits = prefill_linear(flat, function) * inverse_rms
-    return prefill_hc_coefficients_reference(logits, scale.float(), base.float())
-
-
-def prefill_hc_coefficients_reference(logits, scale, base):
-    """Independent Torch sigmoid and Sinkhorn coefficient transform."""
-    pre = torch.sigmoid(logits[..., :PREFILL_HC] * scale[0] + base[:PREFILL_HC]) + PREFILL_EPS
-    post = 2 * torch.sigmoid(logits[..., PREFILL_HC:2 * PREFILL_HC] * scale[1] + base[PREFILL_HC:2 * PREFILL_HC])
-    residual = (logits[..., 2 * PREFILL_HC:] * scale[2] + base[2 * PREFILL_HC:]).unflatten(-1, (PREFILL_HC, PREFILL_HC))
-    residual = residual.softmax(-1) + PREFILL_EPS
-    residual = residual / (residual.sum(-2, keepdim=True) + PREFILL_EPS)
-    for _ in range(PREFILL_ITERATIONS - 1):
-        residual = residual / (residual.sum(-1, keepdim=True) + PREFILL_EPS)
-        residual = residual / (residual.sum(-2, keepdim=True) + PREFILL_EPS)
-    return pre, post, residual
-
-
 def golden_mhc_mixes(
     x_hc: torch.Tensor,
     function: torch.Tensor,
@@ -331,15 +303,6 @@ def validate(argv=None):
         compile_only=args.compile_only,
     )
     return result
-
-
-__all__ = [
-    "build_mhc_mixes_tensor_specs",
-    "golden_mhc_mixes",
-    "golden_mhc_mixes_case",
-    "mhc_mixes",
-    "mhc_mixes_test",
-]
 
 
 def main():

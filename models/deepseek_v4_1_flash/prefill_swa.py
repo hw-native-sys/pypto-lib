@@ -15,28 +15,31 @@ import pypto.language as pl
 import pypto.language.distributed as pld
 import torch
 
-from attention_common import golden_swa_attention
+from sparse_attention import golden_swa_attention
 from config import PREFILL_MAX_TOKENS, WINDOW_CACHE_GROUP, FLASH as M, ORI_BLOCKS_DYN, T_DYN, TP_SIZE
 
 from hc_mixes import golden_mhc_mixes
 from hc_post import golden_mhc_post
 from hc_pre import golden_mhc_pre
-from decode_common import attention_pre
-from rmsnorm import golden_rms_norm_reference as golden_rms_norm
+from hc_pre import attention_pre
+from rmsnorm import golden_rms_norm
 from prefill_attn_swa import prefill_attn_swa_partial
-from attention_sp import (
+from config import (
     SP_T_DYN,
-    prefill_sp_input_allgather,
-    prefill_sp_output_reduce_scatter,
-    prefill_sp_post,
-    PREFILL_ATTN_RING_HEAP,
 )
+from prefill_cp_allgather import prefill_sp_input_allgather
+from o_proj import prefill_sp_output_reduce_scatter
+from hc_post import prefill_sp_post
+from quant import decode_e8m0, pack_mx_b_scale, unpack_mx_b_scale
+from utils import window_metadata
 
 
 # model config
 LOCAL_H = M.num_attention_heads // TP_SIZE
 LOCAL_O_GROUPS = M.o_groups // TP_SIZE
 LOCAL_O_WIDTH = M.o_groups // TP_SIZE * M.o_lora_rank
+PREFILL_ATTN_RING_HEAP = (1024 * 1024 * 1024,) * 4
+
 D = M.hidden_size
 HEAD_DIM = M.head_dim
 ROPE_DIM = M.qk_rope_head_dim
@@ -329,10 +332,250 @@ def make_hc_program(capacity, world_size, epochs):
     return swa_group
 
 
+def official_quantize(value):
+    """Independent translation of official kernel.py act_quant_kernel, group size 32."""
+    groups = value.float().unflatten(-1, (-1, 32))
+    maximum = groups.abs().amax(-1).clamp_min(1e-4)
+    exponent = torch.ceil(torch.log2(maximum * (1.0 / 448.0)))
+    scale = torch.pow(2.0, exponent)
+    payload = (groups / scale[..., None]).clamp(-448, 448).to(torch.float8_e4m3fn).flatten(-2)
+    return payload, (exponent + 127).to(torch.uint8)
+
+def official_linear(x, weight, packed_scale, fp32=False):
+    """Match official FP8 GEMM's group-32 product, A scale, B scale, FP32 sum."""
+    payload, codes = official_quantize(x)
+    activation, weights = payload.float(), weight.float()
+    scale_a = decode_e8m0(codes)
+    scale_b = decode_e8m0(unpack_mx_b_scale(packed_scale))
+    result = torch.zeros(x.shape[0], weight.shape[1], dtype=torch.float32)
+    for group in range(weight.shape[0] // 32):
+        start = group * 32
+        product = activation[:, start:start + 32] @ weights[start:start + 32]
+        scaled = product * scale_a[:, group:group + 1]
+        scaled = scaled * scale_b[group:group + 1]
+        result = result + scaled
+    return result if fp32 else result.bfloat16()
+
+def official_rope(x, cos, sin, inverse=False):
+    rope_dim = cos.shape[-1] * 2
+    value = x.float().clone()
+    c = cos.reshape(x.shape[0], *([1] * (x.ndim - 2)), -1)
+    s = sin.reshape_as(c) * (-1 if inverse else 1)
+    tail = value[..., -rope_dim:].unflatten(-1, (rope_dim // 2, 2))
+    real, imag = tail[..., 0].clone(), tail[..., 1].clone()
+    tail[..., 0] = real * c - imag * s
+    tail[..., 1] = real * s + imag * c
+    return value.to(torch.bfloat16)
+
+def official_reference(tensors):
+    """CPU transcription of group-32 FP8 GEMM and block-64 online attention.
+
+    DeepSeek-V4.1-Flash inference/kernel.py and model.py, revision
+    dba1be0a40aa45a94ad051997016db3960a90277; not execution of the CUDA kernels.
+    """
+    t = tensors
+    head_dim = t["window_cache"].shape[-1]
+    local_heads = t["attn_sink"].numel()
+    groups = t["wo_a"].shape[0]
+    group_in = t["wo_a"].shape[-1]
+    def norm(x, weight):
+        value = x.float()
+        return (value * torch.rsqrt(value.square().mean(-1, keepdim=True) + 1e-20)
+                * weight.float()).to(torch.bfloat16)
+
+    qr = norm(official_linear(t["x"], t["wq_a"], t["wq_a_scale"]), t["q_norm_weight"])
+    q = official_linear(qr, t["wq_b"], t["wq_b_scale"]).unflatten(-1, (local_heads, head_dim))
+    q = official_rope(q, t["rope_cos"], t["rope_sin"])
+    kv = norm(official_linear(t["x"], t["wkv"], t["wkv_scale"]), t["kv_norm_weight"])
+    kv = official_rope(kv, t["rope_cos"], t["rope_sin"])
+    payload, scales = official_quantize(kv)
+    cache = t["window_cache"].clone()
+    cache_scale = t["window_cache_scale"].clone()
+    slots = t["window_slots"].long()
+    valid_slots = slots >= 0
+    cache.view(torch.uint8).reshape(-1, head_dim)[slots[valid_slots]] = payload.view(torch.uint8)[valid_slots]
+    cache_scale.view(torch.uint8).reshape(-1, head_dim // 32)[slots[valid_slots]] = scales[valid_slots]
+    values = cache.float() * decode_e8m0(cache_scale).repeat_interleave(32, -1)
+    idx = t["window_indices"].long()
+    selected = values.reshape(-1, head_dim)[idx.clamp_min(0)].to(torch.bfloat16)
+    selected = selected.masked_fill((idx < 0)[..., None], 0)
+    maximum = torch.full(q.shape[:2], -1e30)
+    denominator = torch.zeros_like(maximum)
+    numerator = torch.zeros_like(q, dtype=torch.float32)
+    for start in range(0, idx.shape[-1], 64):
+        keys = selected[:, start:start + 64].float()
+        logits = torch.einsum("thd,tkd->thk", q.float(), keys) * head_dim ** -0.5
+        valid = idx[:, start:start + 64] >= 0
+        logits = logits.masked_fill(~valid[:, None], -torch.inf)
+        new_maximum = torch.maximum(maximum, logits.amax(-1))
+        correction = (maximum - new_maximum).exp()
+        probabilities = (logits - new_maximum[..., None]).exp()
+        denominator = denominator * correction + probabilities.sum(-1)
+        numerator = numerator * correction[..., None] + torch.einsum(
+            "thk,tkd->thd", probabilities.to(torch.bfloat16).float(), keys)
+        maximum = new_maximum
+    final_max = torch.maximum(maximum, t["attn_sink"][None])
+    correction = (maximum - final_max).exp()
+    denominator = denominator * correction + (t["attn_sink"][None] - final_max).exp()
+    attended = (numerator * (correction / denominator)[..., None]).to(torch.bfloat16)
+    attended = official_rope(attended, t["rope_cos"], t["rope_sin"], inverse=True)
+    grouped = attended.reshape(-1, groups, group_in)
+    latent = torch.einsum("tgd,grd->tgr", grouped.float(), t["wo_a"].float()).to(torch.bfloat16)
+    output = official_linear(latent.flatten(1), t["wo_b"], t["wo_b_scale"], fp32=True)
+    return output, cache, cache_scale
+
+INPUT_NAMES = (
+    "x", "wq_a", "wq_a_scale", "q_norm_weight", "wq_b", "wq_b_scale", "wkv", "wkv_scale",
+    "kv_norm_weight", "attn_sink", "wo_a", "wo_b", "wo_b_scale", "rope_cos", "rope_sin",
+    "window_slots", "window_indices", "window_cache", "window_cache_scale",
+)
+
+def make_inputs(batch=32, seed=17, position=127):
+    """Distinct request pages, ragged visibility, nontrivial scales and rotary phases."""
+    gen = torch.Generator().manual_seed(seed)
+    def rand(*shape):
+        return torch.randn(*shape, generator=gen)
+    def weight(k, n):
+        payload, scales = official_quantize(rand(n, k) / math.sqrt(k))
+        return payload.T.contiguous(), pack_mx_b_scale(scales.T.contiguous()).view(torch.float8_e8m0fnu)
+    qa, qas = weight(D, Q_LORA)
+    qb, qbs = weight(Q_LORA, LOCAL_H * HEAD_DIM)
+    kv, kvs = weight(D, HEAD_DIM)
+    ob, obs = weight(LOCAL_O_WIDTH, D)
+    positions = torch.full((batch,), position, dtype=torch.int64)
+    if batch > 1:
+        positions[:min(batch, 6)] = torch.tensor([0, 1, 63, 127, 128, 1048575])[:min(batch, 6)]
+    freq = 10000.0 ** (-torch.arange(0, 64, 2).float() / 64)
+    angles = positions.float()[:, None] * freq
+    physical = torch.randperm(batch + 1, generator=gen)[:batch]
+    slots = physical.long() * 128 + positions.remainder(128)
+    indices = torch.full((batch, 128), -1, dtype=torch.int32)
+    for row, pos in enumerate(positions.tolist()):
+        length = min(pos + 1, 128)
+        logical = torch.arange(pos - length + 1, pos + 1)
+        indices[row, :length] = (physical[row] * 128 + logical.remainder(128)).to(torch.int32)
+    cache, cache_scale = official_quantize(rand(batch + 1, 128, 1, HEAD_DIM).to(torch.bfloat16))
+    values = (rand(batch, D).to(torch.bfloat16), qa, qas,
+              (rand(Q_LORA) * 0.1 + 1).to(torch.bfloat16), qb, qbs, kv, kvs,
+              (rand(HEAD_DIM) * 0.1 + 1).to(torch.bfloat16), rand(LOCAL_H) * 2,
+              (rand(LOCAL_O_GROUPS, O_LORA, O_GROUP_IN) / math.sqrt(O_GROUP_IN)).to(torch.bfloat16),
+              ob, obs, angles.cos(), angles.sin(), slots, indices, cache,
+              cache_scale.view(torch.float8_e8m0fnu))
+    return dict(zip(INPUT_NAMES, values))
+
+def make_packed_inputs(tokens=257, requests=4, seed=17, case="mixed", start_pos=None):
+    if not 1 <= requests <= min(32, tokens):
+        raise ValueError("requests must be in [1, min(32, tokens)]")
+    values = make_inputs(1, seed=seed)
+    gen = torch.Generator().manual_seed(seed + 1000)
+    lengths = torch.full((requests,), tokens // requests, dtype=torch.int64)
+    lengths[:tokens % requests] += 1
+    if requests > 1 and lengths[-1] > 16:
+        lengths[0] += 7
+        lengths[-1] -= 7
+    prefixes = torch.zeros(requests, dtype=torch.int64)
+    if case == "prefix":
+        prefixes = torch.tensor([127, 128, 511, 1048000] * 8)[:requests]
+    if start_pos is not None:
+        prefixes = torch.tensor(start_pos, dtype=torch.int64)
+    ids = torch.repeat_interleave(torch.arange(requests), lengths)
+    positions = torch.cat([torch.arange(int(p), int(p + n)) for p, n in zip(prefixes, lengths)])
+    logical_capacity = int((prefixes + lengths + 129).max()) // 128 + 1
+    table = torch.full((requests, logical_capacity), -1, dtype=torch.int32)
+    mappings = []
+    for request, (prefix, length) in enumerate(zip(prefixes.tolist(), lengths.tolist())):
+        start = max(0, prefix - 127) // 128
+        end = (prefix + length + 128) // 128
+        mappings.extend((request, block) for block in range(start, end + 1))
+    pages = torch.randperm(len(mappings) + 1, generator=gen)[:len(mappings)]
+    for (request, block), page in zip(mappings, pages):
+        table[request, block] = page
+    slots, indices, lens = window_metadata(positions, ids, table)
+    assert slots.unique().numel() == tokens
+    # Verify physical metadata independently, without relying on the helper's mask.
+    for row, (request, position) in enumerate(zip(ids.tolist(), positions.tolist())):
+        history = list(range(max(0, position - 127), position + 1))
+        expected = [int(table[request, p // 128]) * 128 + p % 128 for p in history]
+        assert indices[row, :len(expected)].tolist() == expected
+        assert (indices[row, len(expected):] == -1).all()
+    angles = positions.float()[:, None] * (10000.0 ** (-torch.arange(0, 64, 2).float() / 64))
+    cache, scales = official_quantize(torch.randn(len(mappings) + 1, 128, 1, 512, generator=gen).bfloat16())
+    values.update(x=torch.randn(tokens, 5120, generator=gen).bfloat16(),
+                  rope_cos=angles.cos(), rope_sin=angles.sin(),
+                  window_slots=slots, window_indices=indices,
+                  window_cache=cache, window_cache_scale=scales.view(torch.float8_e8m0fnu))
+    if case == "shuffle":
+        order = torch.randperm(tokens, generator=gen)
+        for name in ("x", "rope_cos", "rope_sin", "window_slots", "window_indices"):
+            values[name] = values[name][order].contiguous()
+    if case == "masked":
+        values["window_slots"].fill_(-1)
+        values["window_indices"].fill_(-1)
+    if case == "zero":
+        values["x"].zero_()
+        values["window_cache"].view(torch.uint8).zero_()
+    if case == "sink":
+        values["attn_sink"].fill_(1000)
+    print(f"[FIXTURE] tokens={tokens} requests={requests} lengths={lengths.tolist()} prefixes={prefixes.tolist()}")
+    return values
+
+def compare_output(actual, expected, **kwargs):
+    """FP8 budget: global L2 <= 1%, every row <= 2%, cosine >= 0.9999; exact zero rows."""
+    a, e = actual.double(), expected.double()
+    error = (a - e).norm() / e.norm().clamp_min(1e-12)
+    cosine = torch.nn.functional.cosine_similarity(a.flatten(), e.flatten(), dim=0).clamp(-1, 1)
+    row_error = (a - e).norm(dim=-1) / e.norm(dim=-1).clamp_min(1e-12)
+    zero_rows = e.norm(dim=-1) == 0
+    zero_exact = bool((a.norm(dim=-1)[zero_rows] == 0).all())
+    if bool((e == 0).all()):
+        cosine = torch.tensor(1.0 if zero_exact else 0.0)
+    max_abs = (a - e).abs().max()
+    print(f"[PRECISION] output rel_l2={error.item():.8g} cosine={cosine.item():.8g} "
+          f"max_abs={max_abs.item():.8g} max_row_rel_l2={row_error.max().item():.8g} zero_rows_exact={zero_exact}")
+    passed = torch.isfinite(a).all() and error <= 0.01 and row_error.max() <= 0.02
+    passed = passed and cosine >= 0.9999 and zero_exact
+    return bool(passed), f"rel_l2={error.item():.8g}"
+
+def compare_scales(actual, expected, **kwargs):
+    equal = torch.equal(actual.view(torch.uint8), expected.view(torch.uint8))
+    return equal, "E8M0 scale bytes differ"
+
+def compare_cache(actual, expected, *, actual_outputs, expected_outputs, inputs, **kwargs):
+    slots = inputs["window_slots"].long()
+    rows = slots[slots >= 0]
+    a = actual.view(torch.uint8).reshape(-1, HEAD_DIM)
+    e = expected.view(torch.uint8).reshape_as(a)
+    untouched = torch.ones(a.shape[0], dtype=torch.bool)
+    untouched[rows] = False
+    if not torch.equal(a[untouched], e[untouched]):
+        return False, "Unmapped cache payload bytes were modified"
+    af = actual.float().reshape(-1, HEAD_DIM)[rows]
+    ef = expected.float().reshape(-1, HEAD_DIM)[rows]
+    actual_scale = decode_e8m0(actual_outputs["window_cache_scale"]).reshape(-1, HEAD_DIM // 32)
+    expected_scale = decode_e8m0(expected_outputs["window_cache_scale"]).reshape(-1, HEAD_DIM // 32)
+    af *= actual_scale[rows].repeat_interleave(32, -1)
+    ef *= expected_scale[rows].repeat_interleave(32, -1)
+    rel = (af - ef).norm() / ef.norm().clamp_min(1e-12)
+    mismatch = (a[rows] != e[rows]).float().mean().item() if rows.numel() else 0.0
+    print(f"[PRECISION] cache rel_l2={rel.item():.8g} byte_mismatch_fraction={mismatch:.8g} untouched_exact=True")
+    return bool(torch.isfinite(af).all() and rel <= 0.01), f"cache rel_l2={rel.item():.8g}"
+
+def compare_distributed_cache(actual, expected, *, actual_outputs, expected_outputs, inputs, **kwargs):
+    passed = True
+    for rank in range(actual.shape[0]):
+        valid, detail = compare_cache(actual[rank], expected[rank],
+            actual_outputs={"window_cache_scale": actual_outputs["window_cache_scale"][rank]},
+            expected_outputs={"window_cache_scale": expected_outputs["window_cache_scale"][rank]},
+            inputs={"window_slots": inputs["window_slots"][rank]})
+        passed &= valid
+        if not valid:
+            print(f"[PRECISION] rank={rank}: {detail}")
+    return passed, "Every rank must preserve unmapped cache bytes and pass updated-cache precision"
+
+
 def build_hc_specs(args):
     """Stacked TP/DP specs with HC streams in and HC streams out."""
     from golden import ScalarSpec, TensorSpec
-    from decode_attn_swa import make_inputs, make_packed_inputs
 
     world_size = TP_SIZE * args.dp
     packed = True
@@ -426,7 +669,6 @@ def build_hc_specs(args):
 
 def reference_attention(tensors, hidden, base):
     """One TP group's SWA on ``hidden``: the FP32 TP sum in BF16 and each rank's (cache, scale)."""
-    from decode_attn_swa import official_reference
 
     partials, caches = [], []
     active = int(tensors["num_tokens"][base, 0]) if "num_tokens" in tensors else hidden.shape[0]
@@ -509,7 +751,6 @@ def make_staged_compare(
 ):
     """Stage-wise comparators: mHC pre vs golden, SWA teacher-forced, hc_post replayed."""
     from golden import ratio_allclose
-    from decode_attn_swa import compare_distributed_cache, compare_output, compare_scales
 
     bf16_close = ratio_allclose(atol=1e-4, rtol=1.0 / 128)
     forced = {}
@@ -709,13 +950,6 @@ def run_prefill_swa(argv=None):
     if args.compile_only and result.passed:
         print("[SWA+HC] Compilation passed; device accuracy was NOT validated.")
     return result
-
-
-__all__ = [
-    "golden_prefill_swa",
-    "prefill_swa",
-    "run_prefill_swa",
-]
 
 
 def validate(argv=None):

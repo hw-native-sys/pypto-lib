@@ -10,11 +10,13 @@
 # ci: no-sim
 """DeepSeek-V4.1 decode Block composition and CPU reference."""
 
+import utils as _decode_utils
+
 import argparse
 import inspect
 from dataclasses import dataclass
 from collections.abc import Callable
-from quantization import pack_mx_b_scale, quantize_mxfp4_cache, quantize_mxfp4_weight, quantize_mxfp8_cache
+from quant import pack_mx_b_scale, quantize_mxfp4_cache, quantize_mxfp4_weight, quantize_mxfp8_cache
 from enum import IntEnum
 from typing import Any, Mapping
 
@@ -53,15 +55,14 @@ from config import (
 from compressor import STATE_WIDTH
 
 
-from attention_common import AttentionGoldenResult
-from attention_tp import OUTPUT_T_DYN
-from decode_attn_c1a_full import (
+from utils import AttentionGoldenResult
+from config import LOCAL_T_DYN
+from decode_attn_c1a import (
     golden_decode_attn_c1a_full,
     golden_decode_attn_c1a_reindex,
     golden_decode_attn_c1a_reuse,
 )
-from decode_attn_c2a_full import golden_decode_attn_c2a_full
-from decode_attn_c2a_reuse import golden_decode_attn_c2a_reuse
+from decode_attn_c2a import golden_decode_attn_c2a_full, golden_decode_attn_c2a_reuse
 from decode_attn_swa import golden_decode_attn_swa
 from decode_c1a_full import decode_c1a_full_sharded
 from decode_c1a_reindex import decode_c1a_reindex_sharded
@@ -70,7 +71,7 @@ from decode_c2a_full import decode_c2a_full_sharded
 from decode_c2a_reuse import decode_c2a_reuse_sharded
 from decode_swa import decode_swa_sharded
 from gate import golden_gate_reference as gate
-from rmsnorm import golden_rms_norm_reference as rms_norm
+from rmsnorm import golden_rms_norm
 from hc_mixes import golden_mhc_mixes
 from hc_post import golden_mhc_post
 from hc_pre import golden_mhc_pre
@@ -89,7 +90,7 @@ from moe import (
     ROUTE_WIDTH,
     moe,
 )
-from quantization import (
+from quant import (
     dequantize_mxfp4,
     dequantize_mxfp8,
     unpack_mx_b_scale,
@@ -175,8 +176,8 @@ def decode_layer_kind(layer_id: int) -> DecodeLayerKind:
 
 @pl.jit
 def decode_layer(
-    x_hc: pl.Tensor[[OUTPUT_T_DYN, HC_MULT, D], pl.FP32],
-    incoming_pre_mix: pl.Tensor[[OUTPUT_T_DYN, HC_MULT], pl.FP32],
+    x_hc: pl.Tensor[[LOCAL_T_DYN, HC_MULT, D], pl.FP32],
+    incoming_pre_mix: pl.Tensor[[LOCAL_T_DYN, HC_MULT], pl.FP32],
     hc_attn_fn: pl.Tensor[[MIX_HC, HC_DIM], pl.FP32],
     hc_attn_scale: pl.Tensor[[3], pl.FP32],
     hc_attn_base: pl.Tensor[[MIX_HC], pl.FP32],
@@ -259,9 +260,9 @@ def decode_layer(
         pl.Tensor[[T_DYN, CMP_POSITIONS_DYN], pl.UINT8]
     ],
     compressed_indices: pl.Tensor[[T_DYN, INDEX_TOPK], pl.INT32],
-    attention_output: pl.Out[pl.Tensor[[OUTPUT_T_DYN, D], pl.BF16]],
-    attention_hidden: pl.Out[pl.Tensor[[OUTPUT_T_DYN, HC_MULT, D], pl.FP32]],
-    attention_pre_mix: pl.Out[pl.Tensor[[OUTPUT_T_DYN, HC_MULT], pl.FP32]],
+    attention_output: pl.Out[pl.Tensor[[LOCAL_T_DYN, D], pl.BF16]],
+    attention_hidden: pl.Out[pl.Tensor[[LOCAL_T_DYN, HC_MULT, D], pl.FP32]],
+    attention_pre_mix: pl.Out[pl.Tensor[[LOCAL_T_DYN, HC_MULT], pl.FP32]],
     gathered: pl.Out[pl.Tensor[[T_DYN, D], pl.BF16]],
     hc_ffn_fn: pl.Tensor[[MIX_HC, HC_DIM], pl.FP32],
     hc_ffn_scale: pl.Tensor[[3], pl.FP32],
@@ -294,9 +295,9 @@ def decode_layer(
     shared_w2_scale: pl.Tensor[[MOE_INTER // MX_GROUP, D], pl.FP8E8M0, pl.MX_B_NN],
     shared_w3: pl.Tensor[[D, MOE_INTER], pl.FP8E4M3FN],
     shared_w3_scale: pl.Tensor[[D // MX_GROUP, MOE_INTER], pl.FP8E8M0, pl.MX_B_NN],
-    next_pre_mix: pl.Out[pl.Tensor[[OUTPUT_T_DYN, HC_MULT], pl.FP32]],
-    x_mixed: pl.Out[pl.Tensor[[OUTPUT_T_DYN, D], pl.BF16]],
-    x_next: pl.Out[pl.Tensor[[OUTPUT_T_DYN, HC_MULT, D], pl.FP32]],
+    next_pre_mix: pl.Out[pl.Tensor[[LOCAL_T_DYN, HC_MULT], pl.FP32]],
+    x_mixed: pl.Out[pl.Tensor[[LOCAL_T_DYN, D], pl.BF16]],
+    x_next: pl.Out[pl.Tensor[[LOCAL_T_DYN, HC_MULT, D], pl.FP32]],
     attention_input_window: pld.DistributedTensor[[DECODE_MAX_TOKENS, D], pl.BF16],
     attention_input_arrived: pld.DistributedTensor[[TP_SIZE, 1], pl.INT32],
     attention_output_window: pld.DistributedTensor[[DECODE_MAX_TOKENS, D], pl.FP32],
@@ -322,17 +323,17 @@ def decode_layer(
     moe_epoch: pl.Scalar[pl.INT32],
 ):
     """Run one scheduled Attention sublayer followed by the EP MoE sublayer."""
-    x_hc.bind_dynamic(0, OUTPUT_T_DYN)
-    incoming_pre_mix.bind_dynamic(0, OUTPUT_T_DYN)
+    x_hc.bind_dynamic(0, LOCAL_T_DYN)
+    incoming_pre_mix.bind_dynamic(0, LOCAL_T_DYN)
     window_cache.bind_dynamic(0, ORI_BLOCKS_DYN)
     compressed_cache.bind_dynamic(0, CMP_BLOCKS_DYN)
     index_cache.bind_dynamic(0, INDEX_BLOCKS_DYN)
     index_block_table.bind_dynamic(0, B_DYN)
     index_block_table.bind_dynamic(1, TABLE_DYN)
     candidate_mask.bind_dynamic(1, CMP_POSITIONS_DYN)
-    next_pre_mix.bind_dynamic(0, OUTPUT_T_DYN)
-    x_mixed.bind_dynamic(0, OUTPUT_T_DYN)
-    x_next.bind_dynamic(0, OUTPUT_T_DYN)
+    next_pre_mix.bind_dynamic(0, LOCAL_T_DYN)
+    x_mixed.bind_dynamic(0, LOCAL_T_DYN)
+    x_next.bind_dynamic(0, LOCAL_T_DYN)
     group_base = rank // TP_SIZE * TP_SIZE
     tp_rank = rank % TP_SIZE
 
@@ -431,8 +432,8 @@ def decode_layer(
 
 @pl.jit.host
 def l3_decode_layer(
-    x_hc: pl.Tensor[[EP_SIZE, OUTPUT_T_DYN, HC_MULT, D], pl.FP32],
-    incoming_pre_mix: pl.Tensor[[EP_SIZE, OUTPUT_T_DYN, HC_MULT], pl.FP32],
+    x_hc: pl.Tensor[[EP_SIZE, LOCAL_T_DYN, HC_MULT, D], pl.FP32],
+    incoming_pre_mix: pl.Tensor[[EP_SIZE, LOCAL_T_DYN, HC_MULT], pl.FP32],
     hc_attn_fn: pl.Tensor[[EP_SIZE, MIX_HC, HC_DIM], pl.FP32],
     hc_attn_scale: pl.Tensor[[EP_SIZE, 3], pl.FP32],
     hc_attn_base: pl.Tensor[[EP_SIZE, MIX_HC], pl.FP32],
@@ -507,12 +508,12 @@ def l3_decode_layer(
         pl.Tensor[[EP_SIZE, T_DYN, CMP_POSITIONS_DYN], pl.UINT8]
     ],
     compressed_indices: pl.Tensor[[EP_SIZE, T_DYN, INDEX_TOPK], pl.INT32],
-    attention_output: pl.Out[pl.Tensor[[EP_SIZE, OUTPUT_T_DYN, D], pl.BF16]],
+    attention_output: pl.Out[pl.Tensor[[EP_SIZE, LOCAL_T_DYN, D], pl.BF16]],
     attention_hidden: pl.Out[
-        pl.Tensor[[EP_SIZE, OUTPUT_T_DYN, HC_MULT, D], pl.FP32]
+        pl.Tensor[[EP_SIZE, LOCAL_T_DYN, HC_MULT, D], pl.FP32]
     ],
     attention_pre_mix: pl.Out[
-        pl.Tensor[[EP_SIZE, OUTPUT_T_DYN, HC_MULT], pl.FP32]
+        pl.Tensor[[EP_SIZE, LOCAL_T_DYN, HC_MULT], pl.FP32]
     ],
     gathered: pl.Out[pl.Tensor[[EP_SIZE, T_DYN, D], pl.BF16]],
     hc_ffn_fn: pl.Tensor[[EP_SIZE, MIX_HC, HC_DIM], pl.FP32],
@@ -534,9 +535,9 @@ def l3_decode_layer(
     shared_w2_scale: pl.Tensor[[EP_SIZE, MOE_INTER // MX_GROUP, D], pl.FP8E8M0],
     shared_w3: pl.Tensor[[EP_SIZE, D, MOE_INTER], pl.FP8E4M3FN],
     shared_w3_scale: pl.Tensor[[EP_SIZE, D // MX_GROUP, MOE_INTER], pl.FP8E8M0],
-    next_pre_mix: pl.Out[pl.Tensor[[EP_SIZE, OUTPUT_T_DYN, HC_MULT], pl.FP32]],
-    x_mixed: pl.Out[pl.Tensor[[EP_SIZE, OUTPUT_T_DYN, D], pl.BF16]],
-    x_next: pl.Out[pl.Tensor[[EP_SIZE, OUTPUT_T_DYN, HC_MULT, D], pl.FP32]],
+    next_pre_mix: pl.Out[pl.Tensor[[EP_SIZE, LOCAL_T_DYN, HC_MULT], pl.FP32]],
+    x_mixed: pl.Out[pl.Tensor[[EP_SIZE, LOCAL_T_DYN, D], pl.BF16]],
+    x_next: pl.Out[pl.Tensor[[EP_SIZE, LOCAL_T_DYN, HC_MULT, D], pl.FP32]],
     moe_num_tokens: pl.Tensor[[EP_SIZE], pl.INT32],
     layer_id: pl.Scalar[pl.INT32],
     attention_num_tokens: pl.Scalar[pl.INT32],
@@ -710,11 +711,6 @@ ATTENTION_GOLDENS = {
 }
 
 
-def decode_layer_attention_inputs(layer_id: int) -> tuple[str, ...]:
-    """Return the exact golden inputs consumed by the resolved attention mode."""
-    return tuple(inspect.signature(ATTENTION_GOLDENS[decode_layer_kind(layer_id)]).parameters)
-
-
 def _select_inputs(function, values: Mapping[str, Any], overrides: Mapping[str, Any]) -> dict[str, Any]:
     selected = {}
     for name, parameter in inspect.signature(function).parameters.items():
@@ -779,7 +775,7 @@ def golden_decode_moe(
 ) -> torch.Tensor:
     """Evaluate one rank's dense MoE math without the EP transport harness."""
     shape = x.shape
-    normalized = rms_norm(x.reshape(-1, shape[-1]), norm_weight)
+    normalized = golden_rms_norm(x.reshape(-1, shape[-1]), norm_weight)
     active_tokens = normalized.shape[0] if num_tokens is None else num_tokens
     if not 0 <= active_tokens <= normalized.shape[0]:
         raise ValueError("num_tokens must fit the local decode capacity")
@@ -844,7 +840,7 @@ def golden_decode_layer(
     attention_golden = ATTENTION_GOLDENS[decode_layer_kind(layer_id)]
     attn_pre, attn_post, attn_residual = golden_mhc_mixes(x_hc, hc_attn_fn, hc_attn_scale, hc_attn_base)
     attention_input = golden_mhc_pre(x_hc, incoming_pre_mix)
-    normalized_attention = rms_norm(attention_input, attn_norm_weight)
+    normalized_attention = golden_rms_norm(attention_input, attn_norm_weight)
     attention_kwargs = _select_inputs(attention_golden, attention_inputs, {"x": normalized_attention})
     attention = attention_golden(**attention_kwargs)
     attention_hidden = golden_mhc_post(attention.output, x_hc, attn_post, attn_residual)
@@ -1272,11 +1268,7 @@ def run_two_layer_decode_chain(golden_fn: Callable[..., object], *, tp_size: int
     order or padding mistake fails here instead of cancelling out in an identity
     round trip.
     """
-    from decode_sp_integration import (
-        gather_decode_batch,
-        sequence_parallel_bounds,
-        shard_decode_batch,
-    )
+    from utils import gather_decode_batch, sequence_parallel_bounds, shard_decode_batch
 
     first_inputs = make_decode_layer_golden_inputs(0)
     first = golden_fn(**first_inputs)
@@ -1324,7 +1316,7 @@ def run_two_layer_decode_chain(golden_fn: Callable[..., object], *, tp_size: int
 def validate(argv=None):
     """Compile, run, and compare one complete decode Block on A5."""
     from golden import ratio_allclose, ratio_reldiff, run
-    import decode_attn_swa, decode_common
+    import decode_attn_swa
     from pypto.ir import DistributedConfig
 
     parser = argparse.ArgumentParser()
@@ -1372,15 +1364,15 @@ def validate(argv=None):
         compare_fn={
             "window_cache": decode_attn_swa.compare_distributed_cache,
             "window_cache_scale": decode_attn_swa.compare_scales,
-            "compressed_cache": decode_common.compare_unchanged("compressed_cache"),
-            "compressed_cache_scale": decode_common.compare_unchanged(
+            "compressed_cache": _decode_utils.compare_unchanged("compressed_cache"),
+            "compressed_cache_scale": _decode_utils.compare_unchanged(
                 "compressed_cache_scale"
             ),
-            "index_cache": decode_common.compare_unchanged("index_cache"),
-            "index_cache_scale": decode_common.compare_unchanged("index_cache_scale"),
-            "state_cache": decode_common.compare_unchanged("state_cache"),
-            "topk_indices": decode_common.compare_unchanged("topk_indices"),
-            "candidate_mask": decode_common.compare_unchanged("candidate_mask"),
+            "index_cache": _decode_utils.compare_unchanged("index_cache"),
+            "index_cache_scale": _decode_utils.compare_unchanged("index_cache_scale"),
+            "state_cache": _decode_utils.compare_unchanged("state_cache"),
+            "topk_indices": _decode_utils.compare_unchanged("topk_indices"),
+            "candidate_mask": _decode_utils.compare_unchanged("candidate_mask"),
             "attention_output": _compare_active_rows_per_rank(
                 decode_attn_swa.compare_output,
                 counts,
@@ -1390,7 +1382,7 @@ def validate(argv=None):
                 counts,
             ),
             "attention_pre_mix": ratio_allclose(atol=1e-4, rtol=1e-4),
-            "gathered": decode_common.compare_attention_gather,
+            "gathered": _decode_utils.compare_attention_gather,
             "next_pre_mix": ratio_allclose(
                 atol=2.5e-5,
                 rtol=5e-3,
@@ -1409,22 +1401,6 @@ def main():
     result = validate()
     if result is not None and not result.passed:
         raise SystemExit(result.error or 1)
-
-
-__all__ = [
-    "DecodeLayerGoldenResult",
-    "DecodeLayerKind",
-    "REPRESENTATIVE_LAYER_IDS",
-    "ATTENTION_GOLDENS",
-    "decode_layer",
-    "decode_layer_kind",
-    "l3_decode_layer",
-    "build_tensor_specs",
-    "golden_l3_decode_layer",
-    "decode_layer_attention_inputs",
-    "golden_decode_moe",
-    "golden_decode_layer",
-]
 
 
 if __name__ == "__main__":

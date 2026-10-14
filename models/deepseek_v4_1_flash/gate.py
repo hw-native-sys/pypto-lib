@@ -17,7 +17,7 @@ from config import FLASH as M
 from config import MOE_TOKENS
 
 
-from rmsnorm import rms_norm
+from rmsnorm import rms_norm_tiled
 
 
 FP32_NEG_INF = -3.4028234663852886e38
@@ -88,17 +88,6 @@ else:
             mask_pattern=pl.tile.MaskPattern.P1010,
             output_dtype=pl.INT32,
         )
-
-
-PREFILL_ROUTE_SCALE = M.routed_scaling_factor
-PREFILL_TOPK = M.num_experts_per_tok
-
-def prefill_gate_reference(logits, bias):
-    """Independent Torch router math; correction bias affects selection only."""
-    scores = F.softplus(logits.float()).sqrt()
-    indices = torch.argsort(-(scores + bias.float()), dim=-1, stable=True)[..., :PREFILL_TOPK]
-    selected = scores.gather(-1, indices)
-    return indices, selected / (selected.sum(-1, keepdim=True) + 1e-20) * PREFILL_ROUTE_SCALE
 
 
 def golden_gate_reference(
@@ -287,7 +276,9 @@ def gate(
 ):
     """Keep the standalone gate ABI while making FFN RMSNorm explicit."""
     x_normed = pl.create_tensor([T, D], dtype=pl.BF16)
-    rms_norm(x_mixed, norm_w, x_normed)
+    norm_tokens = pl.tensor.dim(x_mixed, 0)
+    for norm_block in pl.spmd((norm_tokens + 7) // 8, name_hint="rms_norm"):
+        rms_norm_tiled(x_mixed, norm_w, x_normed, norm_block, norm_tokens)
     return gate_normalized(
         x_normed, gate_w, gate_bias, num_tokens,
         x_norm_mx, x_norm_scale, indices, weights,
@@ -322,9 +313,9 @@ def _golden_gate_scores(tensors):
     """Recompute the host router scores from the immutable gate inputs."""
     import torch
 
-    from rmsnorm import golden_rms_norm
+    from rmsnorm import golden_rms_norm_tiled
 
-    x_norm = golden_rms_norm(tensors["x_mixed"], tensors["norm_w"]).cpu().float().view(T, D)
+    x_norm = golden_rms_norm_tiled(tensors["x_mixed"], tensors["norm_w"]).cpu().float().view(T, D)
 
     gate_w = tensors["gate_w"].cpu().float()
     gate_bias = tensors["gate_bias"].cpu().float()
@@ -340,7 +331,7 @@ def _golden_gate_core(tensors, x_norm, scores, biased):
 
     num_tokens = max(0, min(T, int(tensors.get("num_tokens", T))))
 
-    from quantization import host_quant_mxfp8_v41, pack_mx_a_scale
+    from quant import host_quant_mxfp8_v41, pack_mx_a_scale
 
     def host_mxfp8_activation(value):
         # The released activation quantizer rounds E8M0 scales upward.
@@ -712,12 +703,6 @@ def build_tensor_specs(layer_id=0, num_tokens=T):
     ]
 
 
-def gate_active_rows(num_tokens):
-    """Active token count rounded up to the gate M-tile, capped at T."""
-    active_count = max(0, min(T, int(num_tokens)))
-    return min(T, ((active_count + GATE_M_TILE - 1) // GATE_M_TILE) * GATE_M_TILE)
-
-
 def mxfp8_activation_value_compare(actual, expected, *, actual_outputs, expected_outputs, **_kwargs):
     """Compare MXFP8 activations by dequantised value, not by non-unique bytes.
 
@@ -727,7 +712,7 @@ def mxfp8_activation_value_compare(actual, expected, *, actual_outputs, expected
     """
     import torch
 
-    from quantization import _e8m0_to_fp32, unpack_mx_a_scale
+    from quant import _e8m0_to_fp32, unpack_mx_a_scale
 
     def decode(outputs, payload_name):
         payload = outputs[payload_name].cpu().float()
@@ -760,24 +745,6 @@ def mxfp8_activation_value_compare(actual, expected, *, actual_outputs, expected
     return False, (
         f"    dequantized MXFP8 mismatch: {count}/{diff.numel()} points, "
         f"max_abs_diff={max_diff:.6g}; {details}"
-    )
-
-
-def fp8_bits_equal(actual, expected, **_kwargs):
-    """Compare FP8 payloads by code because torch allclose lacks E8M0 support."""
-    import torch
-
-    actual_bits = actual.contiguous().view(torch.uint8)
-    expected_bits = expected.contiguous().view(torch.uint8)
-    mismatch = actual_bits != expected_bits
-    if not mismatch.any().item():
-        return True, ""
-    mismatch_count = int(mismatch.sum().item())
-    first = int(mismatch.flatten().nonzero(as_tuple=False)[0].item())
-    return False, (
-        f"    FP8 code mismatch: {mismatch_count}/{actual.numel()}; "
-        f"first at flat index {first}: actual=0x{int(actual_bits.flatten()[first]):02x}, "
-        f"expected=0x{int(expected_bits.flatten()[first]):02x}"
     )
 
 

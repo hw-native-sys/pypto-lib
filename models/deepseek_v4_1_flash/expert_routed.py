@@ -10,6 +10,8 @@
 
 Only the routed-expert path lives here. The shared expert was split out
 into ``expert_shared.py``; both kernels are composed in ``moe.py``.
+
+Run this file directly to validate the routed compute and scatter on one device.
 """
 
 import pypto.language as pl
@@ -610,7 +612,7 @@ def golden_expert_routed(tensors):
     import torch
     import torch.nn.functional as F
 
-    from quantization import (
+    from quant import (
         decode_e8m0_codes_v41 as decode_e8m0_codes,
         host_quant_swiglu_mxfp8_v41 as host_quant_swiglu_mxfp8,
         matmul_mx_golden_v41 as matmul_mx_golden,
@@ -692,7 +694,7 @@ def gen_routed_mxfp4_weights(n_experts, dequant_std, seed_base=0):
     """Generate checkpoint-style packed MXFP4 routed weights and scales."""
     import torch
 
-    from quantization import (
+    from quant import (
         pack_mx_b_scale,
         pack_mxfp4_weight_tiles,
         quantize_mxfp4_weight,
@@ -748,10 +750,131 @@ def gen_routed_mxfp4_weights(n_experts, dequant_std, seed_base=0):
     )
 
 
+# ---------------------------------------------------------------------------
+# Single-device validation harness
+# ---------------------------------------------------------------------------
+
+# One device plays the whole local expert slice: every computed row is scattered
+# back into its own window, so the route mapping and the scatter are exercised
+# without a peer rank.
+WORLD_SIZE = 1
+TOPK = M.num_experts_per_tok
+ROUTE_ROWS = B * S * TOPK
+
+
+@pl.jit(auto_scope=False)
+def expert_routed_test(
+    recv_x: pl.Tensor[[N_LOCAL_EXPERTS, RECV_MAX, D], pl.FP8E4M3FN],
+    recv_mx_scale: pl.Tensor[[1, N_LOCAL_EXPERTS * RECV_MAX * K_SCALE], pl.FP8E8M0],
+    recv_weights: pl.Tensor[[N_LOCAL_EXPERTS, RECV_MAX], pl.FP32],
+    recv_expert_count: pl.Tensor[[N_LOCAL_EXPERTS, 1], pl.INT32],
+    routed_w1_packed: pl.Tensor[
+        [N_LOCAL_EXPERTS, MX_W1_PACKED_ROWS, MX_PACKED_LANE_COLS],
+        pl.UINT8,
+    ],
+    routed_w1_scale: pl.Tensor[[N_LOCAL_EXPERTS * K_SCALE, MOE_INTER], pl.FP8E8M0, pl.MX_B_NN],
+    routed_w3_packed: pl.Tensor[
+        [N_LOCAL_EXPERTS, MX_W3_PACKED_ROWS, MX_PACKED_LANE_COLS],
+        pl.UINT8,
+    ],
+    routed_w3_scale: pl.Tensor[[N_LOCAL_EXPERTS * K_SCALE, MOE_INTER], pl.FP8E8M0, pl.MX_B_NN],
+    routed_w2_packed: pl.Tensor[
+        [N_LOCAL_EXPERTS, MX_W2_PACKED_ROWS, MX_PACKED_LANE_COLS],
+        pl.UINT8,
+    ],
+    routed_w2_scale: pl.Tensor[[N_LOCAL_EXPERTS * H_SCALE, D], pl.FP8E8M0, pl.MX_B_NN],
+    mxfp4_pair_lut: pl.Tensor[[2, 256], pl.INT16],
+    recv_route: pl.Tensor[[N_LOCAL_EXPERTS, RECV_MAX], pl.INT32],
+    recv_meta: pl.Tensor[[EP_WORLD_SIZE, N_LOCAL_EXPERTS], pl.INT32],
+    routed_y: pl.Out[pl.Tensor[[ROUTE_ROWS, D], pl.BF16]],
+    routed_output: pld.DistributedTensor[[ROUTE_T_DYN, D], pl.BF16],
+):
+    input_ready = pl.system.task_dummy(deps=[])
+    scatter_done = expert_routed_scatter(
+        recv_x, recv_mx_scale, recv_weights, recv_expert_count,
+        routed_w1_packed, routed_w1_scale,
+        routed_w3_packed, routed_w3_scale,
+        routed_w2_packed, routed_w2_scale,
+        mxfp4_pair_lut, recv_route, recv_meta,
+        routed_output, input_ready,
+    )
+    with pl.spmd(ROUTE_ROWS, name_hint="routed_output_copy", deps=[scatter_done]):
+        row = pl.tile.get_block_idx()
+        value = pl.load(routed_output, [row, 0], [1, D])
+        routed_y = pl.store(value, [row, 0], routed_y)
+    return routed_y
+
+
+@pl.jit.host
+def l3_expert_routed(
+    recv_x: pl.Tensor[[WORLD_SIZE, N_LOCAL_EXPERTS, RECV_MAX, D], pl.FP8E4M3FN],
+    recv_mx_scale: pl.Tensor[[WORLD_SIZE, 1, N_LOCAL_EXPERTS * RECV_MAX * K_SCALE], pl.FP8E8M0],
+    recv_weights: pl.Tensor[[WORLD_SIZE, N_LOCAL_EXPERTS, RECV_MAX], pl.FP32],
+    recv_expert_count: pl.Tensor[[WORLD_SIZE, N_LOCAL_EXPERTS, 1], pl.INT32],
+    routed_w1_packed: pl.Tensor[
+        [WORLD_SIZE, N_LOCAL_EXPERTS, MX_W1_PACKED_ROWS, MX_PACKED_LANE_COLS],
+        pl.UINT8,
+    ],
+    routed_w1_scale: pl.Tensor[[WORLD_SIZE, N_LOCAL_EXPERTS * K_SCALE, MOE_INTER], pl.FP8E8M0],
+    routed_w3_packed: pl.Tensor[
+        [WORLD_SIZE, N_LOCAL_EXPERTS, MX_W3_PACKED_ROWS, MX_PACKED_LANE_COLS],
+        pl.UINT8,
+    ],
+    routed_w3_scale: pl.Tensor[[WORLD_SIZE, N_LOCAL_EXPERTS * K_SCALE, MOE_INTER], pl.FP8E8M0],
+    routed_w2_packed: pl.Tensor[
+        [WORLD_SIZE, N_LOCAL_EXPERTS, MX_W2_PACKED_ROWS, MX_PACKED_LANE_COLS],
+        pl.UINT8,
+    ],
+    routed_w2_scale: pl.Tensor[[WORLD_SIZE, N_LOCAL_EXPERTS * H_SCALE, D], pl.FP8E8M0],
+    mxfp4_pair_lut: pl.Tensor[[WORLD_SIZE, 2, 256], pl.INT16],
+    recv_route: pl.Tensor[[WORLD_SIZE, N_LOCAL_EXPERTS, RECV_MAX], pl.INT32],
+    recv_meta: pl.Tensor[[WORLD_SIZE, EP_WORLD_SIZE, N_LOCAL_EXPERTS], pl.INT32],
+    routed_y: pl.Out[pl.Tensor[[WORLD_SIZE, ROUTE_ROWS, D], pl.BF16]],
+):
+    routed_output_buf = pld.alloc_window_buffer([ROUTE_ROWS, D], dtype=pl.BF16)
+    for r in pl.range(pld.world_size()):
+        routed_output = pld.window(routed_output_buf, [ROUTE_ROWS, D], dtype=pl.BF16)
+        # The rank takes these scales as MX_B_NN; a bare slice is ND, so annotate it.
+        routed_w1_scale_r: pl.Tensor[
+            [N_LOCAL_EXPERTS * K_SCALE, MOE_INTER], pl.FP8E8M0, pl.MX_B_NN
+        ] = routed_w1_scale[r]
+        routed_w3_scale_r: pl.Tensor[
+            [N_LOCAL_EXPERTS * K_SCALE, MOE_INTER], pl.FP8E8M0, pl.MX_B_NN
+        ] = routed_w3_scale[r]
+        routed_w2_scale_r: pl.Tensor[
+            [N_LOCAL_EXPERTS * H_SCALE, D], pl.FP8E8M0, pl.MX_B_NN
+        ] = routed_w2_scale[r]
+        expert_routed_test(
+            recv_x[r], recv_mx_scale[r], recv_weights[r], recv_expert_count[r],
+            routed_w1_packed[r], routed_w1_scale_r,
+            routed_w3_packed[r], routed_w3_scale_r,
+            routed_w2_packed[r], routed_w2_scale_r,
+            mxfp4_pair_lut[r], recv_route[r], recv_meta[r],
+            routed_y[r], routed_output, device=r,
+        )
+
+
+def golden_expert_routed_scatter(tensors):
+    """Place each expert's golden rows at the window row named by ``recv_route``."""
+    import torch
+
+    rank_tensors = {name: value[0] for name, value in tensors.items() if name != "routed_y"}
+    rank_tensors["recv_y"] = torch.zeros(N_LOCAL_EXPERTS, RECV_MAX, D, dtype=torch.bfloat16)
+    golden_expert_routed(rank_tensors)
+
+    counts = rank_tensors["recv_expert_count"].reshape(-1)
+    routed = torch.zeros(ROUTE_ROWS, D, dtype=torch.bfloat16)
+    for e in range(N_LOCAL_EXPERTS):
+        n_rows = int(counts[e].item())
+        routes = rank_tensors["recv_route"][e, :n_rows].to(torch.int64)
+        routed[routes] = rank_tensors["recv_y"][e, :n_rows]
+    tensors["routed_y"][0] = routed
+
+
 def build_tensor_specs():
     import torch
     from golden.spec import TensorSpec
-    from quantization import (
+    from quant import (
         build_mxfp4_pair_lut, host_quant_mxfp8_v41 as host_quant_mxfp8,
         pack_mx_a_scale as pack_a_scale,
     )
@@ -810,118 +933,164 @@ def build_tensor_specs():
     )
     mxfp4_pair_lut = build_mxfp4_pair_lut()
 
+    # Every active compact row gets a distinct destination row in the window.
+    destinations = torch.randperm(total).to(torch.int32)
+    recv_route_pre = torch.zeros(N_LOCAL_EXPERTS, RECV_MAX, dtype=torch.int32)
+    offset = 0
+    for e in range(N_LOCAL_EXPERTS):
+        n = int(counts[e].item())
+        recv_route_pre[e, :n] = destinations[offset : offset + n]
+        offset += n
+    # Every row comes from this rank, so each other source rank contributes none.
+    recv_meta_pre = torch.zeros(EP_WORLD_SIZE, N_LOCAL_EXPERTS, dtype=torch.int32)
+    recv_meta_pre[0] = counts
+
     fp8 = torch.float8_e4m3fn
     fp8_e8m0 = torch.float8_e8m0fnu
 
-    return [
-        TensorSpec("recv_x", [N_LOCAL_EXPERTS, RECV_MAX, D], fp8, init_value=init_recv_x),
+    specs = [
+        TensorSpec(
+            "recv_x",
+            [WORLD_SIZE, N_LOCAL_EXPERTS, RECV_MAX, D],
+            fp8,
+            init_value=lambda: init_recv_x().unsqueeze(0),
+        ),
         TensorSpec(
             "recv_mx_scale",
-            [1, N_LOCAL_EXPERTS * RECV_MAX * K_SCALE],
+            [WORLD_SIZE, 1, N_LOCAL_EXPERTS * RECV_MAX * K_SCALE],
             fp8_e8m0,
-            init_value=lambda: init_recv_mx_scale().reshape(1, -1),
+            init_value=lambda: init_recv_mx_scale().reshape(1, 1, -1),
         ),
-        TensorSpec("recv_weights", [N_LOCAL_EXPERTS, RECV_MAX], torch.float32, init_value=init_recv_weights),
-        TensorSpec("recv_expert_count", [N_LOCAL_EXPERTS, 1], torch.int32, init_value=init_recv_expert_count),
+        TensorSpec(
+            "recv_weights",
+            [WORLD_SIZE, N_LOCAL_EXPERTS, RECV_MAX],
+            torch.float32,
+            init_value=lambda: init_recv_weights().unsqueeze(0),
+        ),
+        TensorSpec(
+            "recv_expert_count",
+            [WORLD_SIZE, N_LOCAL_EXPERTS, 1],
+            torch.int32,
+            init_value=lambda: init_recv_expert_count().unsqueeze(0),
+        ),
         TensorSpec(
             "routed_w1_packed",
-            [N_LOCAL_EXPERTS, MX_W1_PACKED_ROWS, MX_PACKED_LANE_COLS],
+            [WORLD_SIZE, N_LOCAL_EXPERTS, MX_W1_PACKED_ROWS, MX_PACKED_LANE_COLS],
             torch.uint8,
-            init_value=lambda: rw1_packed,
+            init_value=lambda: rw1_packed.unsqueeze(0),
         ),
-        TensorSpec("routed_w1_scale", [N_LOCAL_EXPERTS * K_SCALE, MOE_INTER], fp8_e8m0, init_value=lambda: rw1_scale),
+        TensorSpec(
+            "routed_w1_scale",
+            [WORLD_SIZE, N_LOCAL_EXPERTS * K_SCALE, MOE_INTER],
+            fp8_e8m0,
+            init_value=lambda: rw1_scale.unsqueeze(0),
+        ),
         TensorSpec(
             "routed_w3_packed",
-            [N_LOCAL_EXPERTS, MX_W3_PACKED_ROWS, MX_PACKED_LANE_COLS],
+            [WORLD_SIZE, N_LOCAL_EXPERTS, MX_W3_PACKED_ROWS, MX_PACKED_LANE_COLS],
             torch.uint8,
-            init_value=lambda: rw3_packed,
+            init_value=lambda: rw3_packed.unsqueeze(0),
         ),
-        TensorSpec("routed_w3_scale", [N_LOCAL_EXPERTS * K_SCALE, MOE_INTER], fp8_e8m0, init_value=lambda: rw3_scale),
+        TensorSpec(
+            "routed_w3_scale",
+            [WORLD_SIZE, N_LOCAL_EXPERTS * K_SCALE, MOE_INTER],
+            fp8_e8m0,
+            init_value=lambda: rw3_scale.unsqueeze(0),
+        ),
         TensorSpec(
             "routed_w2_packed",
-            [N_LOCAL_EXPERTS, MX_W2_PACKED_ROWS, MX_PACKED_LANE_COLS],
+            [WORLD_SIZE, N_LOCAL_EXPERTS, MX_W2_PACKED_ROWS, MX_PACKED_LANE_COLS],
             torch.uint8,
-            init_value=lambda: rw2_packed,
+            init_value=lambda: rw2_packed.unsqueeze(0),
         ),
-        TensorSpec("routed_w2_scale", [N_LOCAL_EXPERTS * H_SCALE, D], fp8_e8m0, init_value=lambda: rw2_scale),
+        TensorSpec(
+            "routed_w2_scale",
+            [WORLD_SIZE, N_LOCAL_EXPERTS * H_SCALE, D],
+            fp8_e8m0,
+            init_value=lambda: rw2_scale.unsqueeze(0),
+        ),
         TensorSpec(
             "mxfp4_pair_lut",
-            [2, 256],
+            [WORLD_SIZE, 2, 256],
             torch.int16,
-            init_value=lambda: mxfp4_pair_lut,
+            init_value=lambda: mxfp4_pair_lut.unsqueeze(0),
         ),
-        TensorSpec("recv_y", [N_LOCAL_EXPERTS, RECV_MAX, D], torch.bfloat16),
+        TensorSpec(
+            "recv_route",
+            [WORLD_SIZE, N_LOCAL_EXPERTS, RECV_MAX],
+            torch.int32,
+            init_value=lambda: recv_route_pre.unsqueeze(0),
+        ),
+        TensorSpec(
+            "recv_meta",
+            [WORLD_SIZE, EP_WORLD_SIZE, N_LOCAL_EXPERTS],
+            torch.int32,
+            init_value=lambda: recv_meta_pre.unsqueeze(0),
+        ),
+        TensorSpec("routed_y", [WORLD_SIZE, ROUTE_ROWS, D], torch.bfloat16),
     ]
+    for spec in specs:
+        spec.resident = "stacked"
+    return specs
 
 
-def active_recv_ratio_reldiff(*, diff_thd, pct_thd):
-    """Validate compact expert rows without borrowing padding capacity.
+def validate(argv=None):
+    """Validate the routed-expert compute and scatter on one device."""
+    import argparse
 
-    ``recv_y`` has a static ``RECV_MAX`` extent for every local expert, but
-    only the prefix described by ``recv_expert_count`` is computed. Numerical
-    tolerance applies to those active rows only; every inactive row must stay
-    bitwise equal to golden so stale or out-of-range writes cannot be hidden by
-    the much larger padded buffer.
-    """
-    import torch
+    from golden import ratio_reldiff, run
+    from pypto.ir import DistributedConfig
 
-    from golden.validation import ratio_reldiff
+    parser = argparse.ArgumentParser()
+    parser.add_argument("-p", "--platform", type=str, default="a5",
+                        choices=["a2a3", "a2a3sim", "a5", "a5sim"])
+    parser.add_argument("-d", "--device", type=int, default=0)
+    parser.add_argument("--compile-only", action="store_true", default=False)
+    parser.add_argument("--runtime-dir", type=str, default=None)
+    parser.add_argument("--enable-chip-swimlane", type=int, nargs="?", const=1, default=0, choices=range(5))
+    parser.add_argument("--dump-passes", action="store_true", default=False)
+    parser.add_argument("--save-data", action="store_true", default=False)
+    parser.add_argument("--golden-data", type=str, default=None)
+    args = parser.parse_args(argv)
 
-    active_compare = ratio_reldiff(diff_thd=diff_thd, pct_thd=pct_thd)
-
-    def compare(actual, expected, **kwargs):
-        if actual.shape != expected.shape:
-            return False, (
-                f"    output shape mismatch: actual={tuple(actual.shape)} "
-                f"expected={tuple(expected.shape)}"
-            )
-        if actual.ndim != 3:
-            return False, f"    recv_y must have rank 3, got {tuple(actual.shape)}"
-
-        counts = kwargs.get("inputs", {}).get("recv_expert_count")
-        if counts is None:
-            return False, "    compare_fn misconfigured: missing input 'recv_expert_count'"
-        counts = counts.cpu().to(torch.int64).reshape(-1)
-        expert_count, recv_max, _ = actual.shape
-        if counts.numel() != expert_count:
-            return False, (
-                f"    recv_expert_count has {counts.numel()} values, "
-                f"expected {expert_count}"
-            )
-        invalid = (counts < 0) | (counts > recv_max)
-        if invalid.any().item():
-            expert = int(invalid.nonzero(as_tuple=False)[0].item())
-            return False, (
-                f"    recv_expert_count[{expert}]={int(counts[expert].item())} "
-                f"is outside [0, {recv_max}]"
-            )
-
-        rows = torch.arange(recv_max, dtype=torch.int64).reshape(1, -1)
-        active = rows < counts.reshape(-1, 1)
-        inactive = ~active
-
-        actual_f = actual.float()
-        expected_f = expected.float()
-        for label, values in (("actual", actual_f), ("expected", expected_f)):
-            invalid_values = ~torch.isfinite(values)
-            if invalid_values.any().item():
-                return False, (
-                    f"    illegal values in {label}: "
-                    f"count={int(invalid_values.sum().item())}"
-                )
-
-        if inactive.any().item() and not torch.equal(actual[inactive], expected[inactive]):
-            changed = int((actual[inactive] != expected[inactive]).sum().item())
-            return False, f"    inactive recv_y rows changed: changed_values={changed}"
-
-        if not active.any().item():
-            return True, ""
-        ok, detail = active_compare(actual[active], expected[active], **kwargs)
-        if ok:
-            return True, ""
-        return False, f"    active recv_y rows:\n{detail}"
-
-    compare.__name__ = (
-        f"active_recv_ratio_reldiff(diff_thd={diff_thd}, pct_thd={pct_thd})"
+    return run(
+        fn=l3_expert_routed,
+        specs=build_tensor_specs(),
+        golden_fn=golden_expert_routed_scatter,
+        golden_data=args.golden_data,
+        save_data=args.save_data,
+        compile_only=args.compile_only,
+        runtime_dir=args.runtime_dir,
+        config=dict(
+            dump_passes=args.dump_passes,
+            distributed_config=DistributedConfig(
+                device_ids=[args.device],
+                num_sub_workers=0,
+            ),
+            platform=args.platform,
+            enable_chip_swimlane=args.enable_chip_swimlane,
+            # Routed MX expert keeps all local experts and large activation
+            # tiles live in one invocation; the default 256 MiB ring heap can
+            # deadlock before the kernel starts on a5.
+            ring_heap=1_073_741_824,
+        ),
+        rtol=1e-3,
+        atol=1e-3,
+        compare_fn={
+            # BF16 routed rows, ~1 ULP. Gen weights reproduce real(L21): 0.016% vs 0.015% of points > 1e-3.
+            "routed_y": ratio_reldiff(diff_thd=2e-3, pct_thd=0.01),
+        },
     )
-    return compare
+
+
+def main():
+    """Run local validation and return a failing exit status on precision errors."""
+    result = validate()
+    if not result.passed:
+        if result.error:
+            print(result.error)
+        raise SystemExit(1)
+
+
+if __name__ == "__main__":
+    main()

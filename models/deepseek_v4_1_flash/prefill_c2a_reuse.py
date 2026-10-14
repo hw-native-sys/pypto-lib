@@ -24,12 +24,12 @@ from config import (
     WINDOW_CACHE_GROUP,
 )
 
-from attention_sp import (
-    SP_T_DYN, prefill_sp_input_allgather, prefill_sp_output_reduce_scatter, prefill_sp_post,
-)
-from decode_attn_c2a_full import CMP_PACKED, CMP_SCALES
-from prefill_c2a_full import attention_hc_pre, run_prefill_c2a
-from prefill_attn_c2a_reuse import (
+from config import SP_T_DYN
+from prefill_cp_allgather import prefill_sp_input_allgather
+from o_proj import prefill_sp_output_reduce_scatter
+from hc_post import prefill_sp_post
+from prefill_c2a_full import CMP_PACKED, CMP_SCALES, attention_hc_pre, run_prefill_c2a
+from prefill_attn_c2a import (
     prefill_attn_c2a_reuse, prefill_attn_c2a_reuse_partial,
 )
 from hc_post import mhc_post
@@ -327,9 +327,6 @@ def make_hc_program(capacity, world_size, epochs):
 def validate(argv=None):
     """Validate packed prefill C2A Reuse wired through mHC on A5."""
     return run_prefill_c2a(make_hc_program, "reuse", argv=argv)
-
-
-__all__ = ["prefill_c2a_reuse", "prefill_c2a_reuse_sp"]
 
 
 def main():

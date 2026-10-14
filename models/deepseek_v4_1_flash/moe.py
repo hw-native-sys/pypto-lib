@@ -55,13 +55,7 @@ from expert_routed import (
 from hc_mixes import golden_mhc_mixes, mhc_mixes
 from hc_pre import golden_mhc_pre, mhc_pre
 from hc_post import golden_mhc_post, mhc_post_after
-from rmsnorm import golden_rms_norm, rms_norm
-
-
-from attention_ops import prefill_linear
-from expert_shared import prefill_expert_reference
-from gate import prefill_gate_reference
-from quantization import prefill_round_activation
+from rmsnorm import golden_rms_norm_tiled, rms_norm_tiled
 
 
 # EP transport layout
@@ -499,31 +493,6 @@ def combine_scattered(
     return _reduce_tid
 
 
-def prefill_moe_reference(x, checkpoint, layer_id, *, precision="fp32"):
-    """Independent unsharded MoE with FP32 expert accumulation in both modes."""
-    stem = f"layers.{layer_id}.ffn."
-    logits = prefill_linear(x, checkpoint.tensor(stem + "gate.weight"))
-    indices, weights = prefill_gate_reference(logits, checkpoint.tensor(stem + "gate.bias"))
-    output = torch.zeros_like(x)
-    for expert in sorted(indices.unique().tolist()):
-        rows, slots = torch.where(indices == expert)
-        formats = None if precision == "fp32" else tuple(
-            checkpoint.linear_format(stem + f"experts.{expert}." + name) for name in ("w1", "w3", "w2")
-        )
-        value = prefill_expert_reference(
-            x[rows], checkpoint.expert(layer_id, expert), weights[rows, slots],
-            precision=precision, formats=formats,
-        )
-        output.index_add_(0, rows, value)
-    formats = None if precision == "fp32" else tuple(
-        checkpoint.linear_format(stem + "shared_experts." + name) for name in ("w1", "w3", "w2")
-    )
-    output = output + prefill_expert_reference(
-        x, checkpoint.shared_expert(layer_id), precision=precision, formats=formats
-    )
-    return {"output": prefill_round_activation(output, precision), "indices": indices, "weights": weights}
-
-
 def _gen_routed_mx_weights_fixture(n_experts, dequant_std, seed_base=0):
     """Generate the packed FP4 device ABI used by the routed kernel."""
     from expert_routed import (
@@ -745,7 +714,9 @@ def moe(
         next_pre_mix, post_mix, residual_mix,
     )
     mhc_pre(x_hc, pre_mix, x_mixed)
-    rms_norm(x_mixed, norm_weight, ffn_input)
+    norm_tokens = pl.tensor.dim(x_mixed, 0)
+    for norm_block in pl.spmd((norm_tokens + 7) // 8, name_hint="rms_norm"):
+        rms_norm_tiled(x_mixed, norm_weight, ffn_input, norm_block, norm_tokens)
 
     # Keep the transport windows and routed result alive through combine.
     with pl.scope():
@@ -1066,7 +1037,7 @@ def _build_moe_tensor_specs(num_tokens: int = MOE_TOKENS):
     from expert_routed import (
         ROUTED_DEQUANT_STD,
     )
-    from quantization import (
+    from quant import (
         build_mxfp4_pair_lut,
         gen_mxfp8_weight_kn_v41,
     )
@@ -1246,7 +1217,7 @@ def _golden_moe_core(tensors):
     from gate import golden_gate_normalized_core
     from expert_shared import golden_expert_shared
     from expert_routed import golden_expert_routed
-    from quantization import pack_mx_a_scale, unpack_mx_a_scale
+    from quant import pack_mx_a_scale, unpack_mx_a_scale
 
     counts = _normalise_num_tokens(tensors.get("num_tokens", MOE_TOKENS))
     fp8 = _fp8_dtype()
@@ -1269,7 +1240,7 @@ def _golden_moe_core(tensors):
         indices = torch.zeros(MOE_TOKENS, TOPK, dtype=torch.int32)
         weights = torch.zeros(MOE_TOKENS, TOPK, dtype=torch.float32)
         golden_gate_normalized_core({
-            "x_normed": golden_rms_norm(
+            "x_normed": golden_rms_norm_tiled(
                 tensors["x"][src], tensors["norm_weight"][src]
             ),
             "gate_w": tensors["gate_weight"][src],
@@ -1521,11 +1492,6 @@ def _local_mhc_compare(num_tokens):
 
     compare.__name__ = f"local_mhc_compare(num_tokens={counts.tolist()})"
     return compare
-
-
-__all__ = [
-    "golden_moe", "build_tensor_specs", "moe", "moe_test", "l3_moe",
-]
 
 
 def validate(argv=None):

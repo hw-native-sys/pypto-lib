@@ -6,13 +6,26 @@
 # INCLUDING BUT NOT LIMITED TO NON-INFRINGEMENT, MERCHANTABILITY, OR FITNESS FOR A PARTICULAR PURPOSE.
 # See LICENSE in the root of the software repository for the full text of the License.
 # -----------------------------------------------------------------------------------------------------------
-"""Shared V4.1 inverse RoPE and grouped output projection stages."""
+"""V4.1 inverse RoPE, grouped output projections, and TP output reductions."""
+
+import torch
+
+from qkv_proj_rope import golden_rope_interleave as rope_interleave
+from quant import mxfp8_linear
 
 import pypto.language as pl
+import pypto.language.distributed as pld
 
-from attention_ops import K_TILE, M_TILE, N_TILE, make_mx_projection, make_rope
-from config import FLASH as M, T_DYN, TP_SIZE
-
+from qkv_proj_rope import (
+    K_TILE,
+    M_TILE,
+    N_TILE,
+    make_mx_projection,
+    make_rope,
+)
+from config import (
+    DECODE_MAX_TOKENS, PREFILL_MAX_TOKENS, FLASH as M, LOCAL_T_DYN, SP_T_DYN, T_DYN, TP_SIZE,
+)
 
 
 # model config
@@ -26,6 +39,7 @@ O_LORA = M.o_lora_rank
 O_GROUP_IN = M.num_attention_heads * M.head_dim // M.o_groups
 
 
+D_TILE = 512
 _PREFILL_WORKERS = 64
 
 
@@ -194,11 +208,218 @@ o_proj = _make_o_proj(_rotate_output, grouped_output, _project_ob)
 prefill_o_proj = _make_o_proj(_prefill_rotate_output, prefill_grouped_output, _project_ob)
 
 
-__all__ = [
-    "grouped_output",
-    "grouped_output_with_deps",
-    "make_o_proj_with_deps",
-    "o_proj",
-    "prefill_grouped_output",
-    "prefill_o_proj",
-]
+def _project_output(
+    attended: torch.Tensor,
+    cos: torch.Tensor,
+    sin: torch.Tensor,
+    wo_a: torch.Tensor,
+    wo_b: torch.Tensor,
+    wo_b_scale: torch.Tensor | None,
+    *,
+    output_dtype: torch.dtype | None = None,
+) -> torch.Tensor:
+    rope_dim = cos.shape[-1] * 2
+    tail = rope_interleave(attended[..., -rope_dim:], cos, sin, inverse=True)
+    attended = torch.cat((attended[..., :-rope_dim], tail), dim=-1)
+    groups = wo_a.shape[0]
+    grouped = attended.flatten(-2).unflatten(-1, (groups, -1))
+    latent = torch.einsum("tgd,grd->tgr", grouped.float(), wo_a.float()).to(attended.dtype)
+    return mxfp8_linear(latent.flatten(-2), wo_b, wo_b_scale, output_dtype=output_dtype)
+
+
+@pl.jit.inline(auto_scope=False)
+def prefill_sp_output_reduce_scatter(
+    partial: pl.Tensor[[T_DYN, D], pl.FP32],
+    output_window: pld.DistributedTensor[[PREFILL_MAX_TOKENS, D], pl.FP32],
+    output_arrived: pld.DistributedTensor[[TP_SIZE, 1], pl.INT32],
+    output: pl.Tensor[[SP_T_DYN, D], pl.BF16],
+    group_base: pl.Scalar[pl.INT32],
+    tp_rank: pl.Scalar[pl.INT32],
+    num_tokens: pl.Scalar[pl.INT32],
+    attention_epoch: pl.Scalar[pl.INT32],
+):
+    """Sum FP32 head-TP contributions for this rank's token rows, then cast once."""
+    local_tokens = pl.tensor.dim(output, 0)
+    with pl.at(level=pl.Level.CORE_GROUP, name_hint="sp_reduce_reuse", allow_early_resolve=False) as reuse_tid:
+        for peer in pl.range(TP_SIZE):
+            pld.system.wait(output_arrived, offsets=[peer, 0], expected=(attention_epoch - 1) * 2,
+                            cmp=pld.WaitCmp.Ge)
+    with pl.at(level=pl.Level.CORE_GROUP, name_hint="sp_reduce_publish", deps=[reuse_tid]) as publish_tid:
+        if num_tokens > 0:
+            pld.tensor.put(
+                dst=output_window, peer=group_base + tp_rank, src=partial,
+                dst_offsets=[0, 0], src_offsets=[0, 0], shape=[num_tokens, D],
+                chunk_rows=1, chunk_cols=D_TILE, pipeline=True,
+            )
+        for peer in pl.range(TP_SIZE):
+            pld.system.notify(output_arrived, peer=group_base + peer, offsets=[tp_rank, 0],
+                              value=1, op=pld.NotifyOp.AtomicAdd)
+    with pl.at(level=pl.Level.CORE_GROUP, name_hint="sp_reduce_wait", deps=[publish_tid],
+               allow_early_resolve=False) as wait_tid:
+        for peer in pl.range(TP_SIZE):
+            pld.system.wait(output_arrived, offsets=[peer, 0], expected=attention_epoch * 2 - 1,
+                            cmp=pld.WaitCmp.Ge)
+    with pl.spmd(64, name_hint="sp_reduce_scatter", deps=[wait_tid]) as reduce_tid:
+        worker = pl.tile.get_block_idx()
+        for tile in pl.range(worker, local_tokens * (D // D_TILE), 64):
+            local_row = tile // (D // D_TILE)
+            col = tile % (D // D_TILE) * D_TILE
+            row = tp_rank * local_tokens + local_row
+            acc = pl.tile.full([1, D_TILE], dtype=pl.FP32, value=0.0)
+            if row < num_tokens:
+                for peer in pl.range(TP_SIZE):
+                    value = pld.tile.remote_load(output_window, peer=group_base + peer,
+                                                 offsets=[row, col], shape=[1, D_TILE])
+                    acc = pl.add(acc, value)
+            result = pl.cast(acc, pl.BF16, mode="rint")
+            output = pl.store(result, [local_row, col], output)
+    with pl.at(level=pl.Level.CORE_GROUP, name_hint="sp_reduce_release", deps=[reduce_tid]) as release_tid:
+        for peer in pl.range(TP_SIZE):
+            pld.system.notify(output_arrived, peer=group_base + peer, offsets=[tp_rank, 0],
+                              value=1, op=pld.NotifyOp.AtomicAdd)
+    with pl.at(level=pl.Level.CORE_GROUP, name_hint="sp_reduce_consumed", deps=[release_tid],
+               allow_early_resolve=False):
+        for peer in pl.range(TP_SIZE):
+            pld.system.wait(output_arrived, offsets=[peer, 0], expected=attention_epoch * 2,
+                            cmp=pld.WaitCmp.Ge)
+    return output
+
+
+@pl.jit.inline(auto_scope=False)
+def prefill_tp_output_all_reduce(
+    output_partial: pl.Tensor[[T_DYN, D], pl.FP32],
+    output_window: pld.DistributedTensor[[PREFILL_MAX_TOKENS, D], pl.FP32],
+    output_arrived: pld.DistributedTensor[[TP_SIZE, 1], pl.INT32],
+    output: pl.Tensor[[T_DYN, D], pl.BF16],
+    group_base: pl.Scalar[pl.INT32],
+    tp_rank: pl.Scalar[pl.INT32],
+    num_tokens: pl.Scalar[pl.INT32],
+    attention_epoch: pl.Scalar[pl.INT32],
+):
+    with pl.at(level=pl.Level.CORE_GROUP, name_hint="prefill_tp_reuse", allow_early_resolve=False) as reuse_tid:
+        for peer in pl.range(TP_SIZE):
+            previous_epoch = (attention_epoch - 1) * 2
+            pld.system.wait(output_arrived, offsets=[peer, 0], expected=previous_epoch, cmp=pld.WaitCmp.Ge)
+    with pl.spmd(64, name_hint="prefill_tp_publish", deps=[reuse_tid]) as publish_tid:
+        worker = pl.tile.get_block_idx()
+        for tile in pl.range(worker, num_tokens * (D // 512), 64):
+            row = tile // (D // 512)
+            col = tile % (D // 512) * 512
+            value = pl.load(output_partial, [row, col], [1, 512])
+            pld.tile.remote_store(value, output_window, peer=group_base + tp_rank, offsets=[row, col])
+    with pl.at(level=pl.Level.CORE_GROUP, name_hint="prefill_tp_ready", deps=[publish_tid]) as ready_tid:
+        for peer in pl.range(TP_SIZE):
+            pld.system.notify(
+                output_arrived, peer=group_base + peer, offsets=[tp_rank, 0], value=1, op=pld.NotifyOp.AtomicAdd,
+            )
+    with pl.at(level=pl.Level.CORE_GROUP, name_hint="prefill_tp_wait", deps=[ready_tid],
+               allow_early_resolve=False) as wait_tid:
+        for peer in pl.range(TP_SIZE):
+            ready_epoch = attention_epoch * 2 - 1
+            pld.system.wait(output_arrived, offsets=[peer, 0], expected=ready_epoch, cmp=pld.WaitCmp.Ge)
+    with pl.spmd(64, name_hint="prefill_tp_reduce", deps=[wait_tid]) as reduce_tid:
+        worker = pl.tile.get_block_idx()
+        for tile in pl.range(worker, num_tokens * (D // 512), 64):
+            row = tile // (D // 512)
+            col = tile % (D // 512) * 512
+            acc = pl.tile.full([1, 512], dtype=pl.FP32, value=0.0)
+            for peer in pl.range(TP_SIZE):
+                value = pld.tile.remote_load(output_window, peer=group_base + peer, offsets=[row, col], shape=[1, 512])
+                acc = pl.add(acc, value)
+            output = pl.store(pl.cast(acc, pl.BF16, mode="rint"), [row, col], output)
+    with pl.at(level=pl.Level.CORE_GROUP, name_hint="prefill_tp_release", deps=[reduce_tid]) as release_tid:
+        for peer in pl.range(TP_SIZE):
+            pld.system.notify(
+                output_arrived, peer=group_base + peer, offsets=[tp_rank, 0], value=1, op=pld.NotifyOp.AtomicAdd,
+            )
+    with pl.at(level=pl.Level.CORE_GROUP, name_hint="prefill_tp_consumed", deps=[release_tid],
+               allow_early_resolve=False):
+        for peer in pl.range(TP_SIZE):
+            pld.system.wait(output_arrived, offsets=[peer, 0], expected=attention_epoch * 2, cmp=pld.WaitCmp.Ge)
+    return output
+
+
+def make_decode_tp_output_reduce(scatter=False):
+    """Build the decode attention-output collective.
+
+    ``scatter=False`` keeps the historical all-reduce result (every rank holds
+    the full token range). ``scatter=True`` is the sequence-parallel boundary:
+    every rank still contributes its own partial, but only the contiguous token
+    rows this rank owns are written, which is the ReduceScatter(SUM) result and
+    never a scaled copy of an all-reduce.
+
+    Ownership follows the rank's *physical slab* (``ceil(tokens / tp)``) rather
+    than the active row count, so ``T < TP`` and a partially filled batch keep
+    the same row mapping the Attention-input AllGather publishes.  Rows outside
+    the active range are written as zeros: the slab is always fully materialized.
+    """
+
+    @pl.jit.inline(auto_scope=False)
+    def decode_tp_output_reduce(
+        output_partial: pl.Tensor[[T_DYN, D], pl.FP32],
+        output_window: pld.DistributedTensor[[DECODE_MAX_TOKENS, D], pl.FP32],
+        output_arrived: pld.DistributedTensor[[TP_SIZE, 1], pl.INT32],
+        output: pl.Tensor[[LOCAL_T_DYN, D], pl.BF16],
+        group_base: pl.Scalar[pl.INT32],
+        tp_rank: pl.Scalar[pl.INT32],
+        num_tokens: pl.Scalar[pl.INT32],
+        attention_epoch: pl.Scalar[pl.INT32],
+    ):
+        first = pl.cast(0, pl.INT32)
+        count = pl.cast(num_tokens, pl.INT32)
+        if scatter:
+            # The output tensor is the fixed physical slab.  Ownership must use
+            # that capacity, not active ``num_tokens``; otherwise T<TP and
+            # inactive suffixes shift rows between ranks.
+            width = pl.tensor.dim(output, 0)
+            first = pl.cast(pl.min(tp_rank * width, num_tokens), pl.INT32)
+            count = pl.cast(pl.max(0, pl.min(width, num_tokens - first)), pl.INT32)
+        with pl.at(level=pl.Level.CORE_GROUP, name_hint="decode_tp_reuse", allow_early_resolve=False) as reuse_tid:
+            for peer in pl.range(TP_SIZE):
+                pld.system.wait(output_arrived, offsets=[peer, 0], expected=(attention_epoch - 1) * 2,
+                                cmp=pld.WaitCmp.Ge)
+        with pl.at(level=pl.Level.CORE_GROUP, name_hint="decode_tp_publish", deps=[reuse_tid]) as publish_tid:
+            pld.tensor.put(dst=output_window, peer=group_base + tp_rank, src=output_partial,
+                           dst_offsets=[0, 0], src_offsets=[0, 0], shape=[num_tokens, D],
+                           chunk_rows=1, chunk_cols=512, pipeline=True)
+            for peer in pl.range(TP_SIZE):
+                pld.system.notify(output_arrived, peer=group_base + peer, offsets=[tp_rank, 0],
+                                  value=1, op=pld.NotifyOp.AtomicAdd)
+        with pl.at(level=pl.Level.CORE_GROUP, name_hint="decode_tp_reduce", deps=[publish_tid],
+                   allow_early_resolve=False) as reduce_tid:
+            for peer in pl.range(TP_SIZE):
+                pld.system.wait(output_arrived, offsets=[peer, 0], expected=attention_epoch * 2 - 1,
+                                cmp=pld.WaitCmp.Ge)
+            for t in pl.range(first, first + count):
+                for col in pl.range(0, D, 512):
+                    acc = pl.tile.full([1, 512], dtype=pl.FP32, value=0.0)
+                    for peer in pl.range(TP_SIZE):
+                        value = pld.tile.remote_load(output_window, peer=group_base + peer,
+                                                     offsets=[t, col], shape=[1, 512])
+                        acc = pl.add(acc, value)
+                    output = pl.store(pl.cast(acc, pl.BF16, mode="rint"), [t - first, col], output)
+            if scatter:
+                # The physical slab is fully materialized.  Rows outside this
+                # rank's active range (an empty owner, or the padded tail of the
+                # last owner) are written as zeros, so no stale window or sentinel
+                # value is ever handed to the next stage.
+                for t in pl.range(count, pl.tensor.dim(output, 0)):
+                    for col in pl.range(0, D, 512):
+                        output = pl.store(
+                            pl.tile.full([1, 512], dtype=pl.BF16, value=0.0), [t, col], output
+                        )
+            for peer in pl.range(TP_SIZE):
+                pld.system.notify(output_arrived, peer=group_base + peer, offsets=[tp_rank, 0],
+                                  value=1, op=pld.NotifyOp.AtomicAdd)
+        with pl.at(level=pl.Level.CORE_GROUP, name_hint="decode_tp_consumed", deps=[reduce_tid],
+                   allow_early_resolve=False):
+            for peer in pl.range(TP_SIZE):
+                pld.system.wait(output_arrived, offsets=[peer, 0], expected=attention_epoch * 2,
+                                cmp=pld.WaitCmp.Ge)
+        return output
+
+    return decode_tp_output_reduce
+
+
+decode_tp_output_all_reduce = make_decode_tp_output_reduce()
+decode_tp_output_reduce_scatter = make_decode_tp_output_reduce(scatter=True)

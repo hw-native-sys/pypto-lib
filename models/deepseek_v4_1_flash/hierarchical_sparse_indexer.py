@@ -14,17 +14,18 @@ import pypto.language as pl
 import torch
 import torch.nn.functional as F
 
-from config import FLASH as M, CMP_POSITIONS_DYN, T_DYN
+from config import (
+    FLASH as M,
+    CMP_POSITIONS_DYN,
+    T_DYN,
+    INDEX_CACHE_GROUP,
+    INDEX_BLOCKS_DYN,
+)
 
 
 from qkv_proj_rope import golden_rope_interleave
-from quantization import mxfp8_linear
-from rmsnorm import golden_rms_norm_reference
-
-
-# model config
-INDEX_H = M.index_n_heads
-INDEX_TOPK = M.index_topk
+from quant import mxfp8_linear
+from rmsnorm import golden_rms_norm
 
 
 CANDIDATE_BLOCK_SIZE = M.candidate_block_size
@@ -38,82 +39,97 @@ CANDIDATE_MAX_LEAVES = (CANDIDATE_MAX_BLOCKS + CANDIDATE_LEAF - 1) // CANDIDATE_
 INDEX_SCORE_POSITIONS_DYN = pl.dynamic("V41_INDEX_SCORE_POSITIONS_DYN")
 
 
-from attention_ops import prefill_einsum
-from attention_ops import prefill_linear
-from attention_ops import prefill_matmul
-from qkv_proj_rope import prefill_rotate
-from quantization import prefill_quantize_dequantize
-from quantization import prefill_round_activation
+HEAD_DIM = M.head_dim
+
+INDEX_DIM = M.index_head_dim
 
 
-def _prefill_paged_indexer(
-    x: torch.Tensor,
-    qr: torch.Tensor,
-    request_ids: torch.Tensor,
-    index_cache: torch.Tensor,
-    block_table: torch.Tensor,
-    compressed_lens: torch.Tensor,
-    wq_b: torch.Tensor,
-    weights_proj: torch.Tensor,
-    cos: torch.Tensor,
-    sin: torch.Tensor,
-    candidates: torch.Tensor | None = None,
-    topk: int = M.index_topk,
-    *,
-    precision="fp32",
-    formats=None,
-) -> tuple[torch.Tensor, torch.Tensor]:
-    """Score request-local paged index keys and return scores plus physical rows."""
-    if compressed_lens.ndim != 1 or compressed_lens.shape[0] != x.shape[0]:
-        raise ValueError("compressed_lens must contain one causal length per query token")
-    max_len = int(compressed_lens.max().item()) if compressed_lens.numel() else 0
-    scores = x.new_full((x.shape[0], max_len), -torch.inf, dtype=torch.float32)
-    physical = torch.full((x.shape[0], topk), -1, dtype=torch.int32, device=x.device)
-    if max_len == 0:
-        return scores, physical
-
-    positions = torch.arange(max_len, device=x.device)
-    request_rows = request_ids.to(torch.long).unsqueeze(-1)
-    blocks = torch.div(positions, 128, rounding_mode="floor")
-    offsets = positions.remainder(128)
-    physical_rows = block_table[request_rows, blocks] * 128 + offsets
-    flat_keys = index_cache.flatten(0, 1).squeeze(-2)
-    keys = flat_keys[physical_rows.to(torch.long)]
-
-    index_dim = index_cache.shape[-1]
-    index_heads = weights_proj.shape[-1]
-    if precision == "official":
-        formats = formats or {}
-        q = prefill_linear(qr, wq_b.T, precision=precision, format=formats["index_wq_b"])
-        q = q.unflatten(-1, (index_heads, index_dim))
-        q = prefill_quantize_dequantize(prefill_rotate(q, cos, sin, precision=precision), "index_fp4")
-        weights = prefill_linear(x, weights_proj.T, precision=precision, format=formats["index_weights_proj"])
-        weights = prefill_round_activation(weights * (index_dim**-0.5 * index_heads**-0.5), precision)
-        dots = prefill_round_activation(prefill_einsum("thd,tkd->thk", q, keys), precision)
-        weighted = prefill_round_activation(dots.relu() * weights.unsqueeze(-1), precision)
-        scores = prefill_round_activation(weighted.sum(dim=-2), precision)
-    else:
-        q = prefill_matmul(qr, wq_b).unflatten(-1, (index_heads, index_dim))
-        rd = cos.shape[-1] * 2
-        q = torch.cat((q[..., :-rd], golden_rope_interleave(q[..., -rd:], cos, sin)), dim=-1)
-        weights = prefill_matmul(x.float(), weights_proj.float()).to(x.dtype)
-        weights = (weights.float() * (index_dim**-0.5 * index_heads**-0.5)).to(x.dtype)
-        dots = prefill_einsum("thd,tkd->thk", q.float(), keys.float()).to(q.dtype)
-        weighted = (dots.float().relu() * weights.float().unsqueeze(-1)).to(q.dtype)
-        scores = weighted.float().sum(dim=-2).to(q.dtype).float()
-    valid_positions = positions.unsqueeze(0) < compressed_lens.to(torch.long).unsqueeze(-1)
-    scores = scores.masked_fill(~valid_positions, -torch.inf)
-    if candidates is not None:
-        scores = scores.masked_fill(~candidates[..., :max_len].to(torch.bool), -torch.inf)
-
-    count = min(topk, max_len)
-    logical = scores.topk(count, dim=-1, sorted=False).indices.sort(dim=-1).values
-    selected_scores = scores.gather(-1, logical)
-    selected_rows = physical_rows.gather(-1, logical)
-    for token in range(x.shape[0]):
-        valid_rows = selected_rows[token, torch.isfinite(selected_scores[token])].to(torch.int32)
-        physical[token, : valid_rows.numel()] = valid_rows
-    return scores, physical
+@pl.jit.inline
+def publish_index_cache(
+    value: pl.Tensor[[T_DYN, INDEX_DIM], pl.BF16],
+    slots: pl.Tensor[[T_DYN], pl.INT64],
+    cache: pl.Tensor[[INDEX_BLOCKS_DYN, 128, 1, INDEX_DIM // 2], pl.UINT8],
+    scales: pl.Tensor[
+        [INDEX_BLOCKS_DYN, 128, 1, INDEX_DIM // INDEX_CACHE_GROUP],
+        pl.FP8E8M0,
+    ],
+    num_tokens: pl.Scalar[pl.INT32],
+):
+    """Publish index-key rows as group-32 MXFP4 with E8M0 scales."""
+    cache_rows = pl.tensor.dim(cache, 0) * 128
+    cache_flat = pl.reshape(cache, [cache_rows, INDEX_DIM // 2])
+    scale_flat = pl.reshape(scales, [cache_rows, INDEX_DIM // INDEX_CACHE_GROUP])
+    with pl.spmd(num_tokens, name_hint="c1a_index_publish") as publish_tid:
+        token = pl.tile.get_block_idx()
+        slot_i64 = pl.read(slots, [token])
+        if slot_i64 >= 0:
+            slot = pl.cast(slot_i64, pl.INDEX)
+            source = pl.cast(pl.load(value, [token, 0], [1, INDEX_DIM]), pl.FP32)
+            source_groups = pl.reshape(source, [INDEX_DIM // INDEX_CACHE_GROUP, INDEX_CACHE_GROUP])
+            grouped = pl.tile.full([8, INDEX_CACHE_GROUP], dtype=pl.FP32, value=0.0)
+            grouped[:INDEX_DIM // INDEX_CACHE_GROUP, :] = source_groups
+            maximum_tmp = pl.create_tile([8, 128], dtype=pl.FP32)
+            maximum = pl.row_max(pl.abs(grouped), tmp_tile=maximum_tmp)
+            raw_scale = pl.maximum(pl.mul(maximum, 1.0 / 6.0), 2.0**-127)
+            bits = pl.reinterpret_view(raw_scale, pl.INT32)
+            exponent = pl.shrs(pl.add(bits, 8388607), 23)
+            scale = pl.reinterpret_view(pl.shls(exponent, 23), pl.FP32)
+            normalized = pl.reshape(pl.row_expand_div(grouped, scale), [1, 8 * INDEX_CACHE_GROUP])
+            padded = pl.tile.full([1, HEAD_DIM], dtype=pl.FP32, value=0.0)
+            padded[:, :8 * INDEX_CACHE_GROUP] = normalized
+            magnitude = pl.minimum(pl.abs(padded), 6.0)
+            lower = pl.cast(
+                pl.add(pl.mul(pl.minimum(magnitude, 2.0), 2.0), 0.4999),
+                pl.INT32,
+                mode="trunc",
+            )
+            middle = pl.cast(
+                pl.add(pl.minimum(pl.maximum(pl.sub(magnitude, 2.0), 0.0), 2.0), 0.4999),
+                pl.INT32,
+                mode="trunc",
+            )
+            upper = pl.cast(
+                pl.add(pl.mul(pl.maximum(pl.sub(magnitude, 4.0), 0.0), 0.5), 0.4999),
+                pl.INT32,
+                mode="trunc",
+            )
+            payload_codes = pl.add(pl.add(lower, middle), upper)
+            bits = pl.reinterpret_view(padded, pl.INT32)
+            sign = pl.ands(pl.shrs(bits, 31), 1)
+            payload_codes = pl.add(payload_codes, pl.mul(sign, 8))
+            pair_ids = pl.tile.arange(0, [1, HEAD_DIM // 2], dtype=pl.INT32)
+            low_indices = pl.mul(pair_ids, 2)
+            high_indices = pl.add(low_indices, 1)
+            low_tmp = pl.create_tile([1, HEAD_DIM // 2], dtype=pl.INT32)
+            high_tmp = pl.create_tile([1, HEAD_DIM // 2], dtype=pl.INT32)
+            low = pl.tile.gather(payload_codes, low_indices, low_tmp)
+            high = pl.tile.gather(payload_codes, high_indices, high_tmp)
+            packed = pl.reshape(
+                pl.cast(pl.add(low, pl.shls(high, 4)), pl.UINT8),
+                [1, HEAD_DIM // 2],
+            )
+            payload_bytes = pl.tile.slice(packed, [1, INDEX_DIM // 2], [0, 0])
+            pl.store(payload_bytes, [slot, 0], cache_flat)
+            exponent_row = pl.reshape(exponent, [1, 8])
+            exponent_padded = pl.tile.full([1, 32], dtype=pl.INT32, value=0)
+            exponent_padded[:, :8] = exponent_row
+            signed_exponent = pl.sub(
+                exponent_padded,
+                pl.mul(pl.shrs(exponent_padded, 7), 256),
+            )
+            codes = pl.reinterpret_view(pl.cast(signed_exponent, pl.INT8), pl.UINT8)
+            encoded = pl.reinterpret_view(codes, pl.FP8E8M0)
+            encoded = pl.tile.set_validshape(
+                encoded,
+                1,
+                INDEX_DIM // INDEX_CACHE_GROUP,
+            )
+            pl.store(
+                encoded,
+                [slot, 0],
+                scale_flat,
+            )
+    return publish_tid
 
 
 def golden_index_key(
@@ -125,7 +141,7 @@ def golden_index_key(
 ) -> torch.Tensor:
     """Project an unrotated compressor latent into a rotated index key."""
     projected = torch.matmul(latent.float(), wk.float()).to(latent.dtype)
-    key = golden_rms_norm_reference(projected, norm_weight)
+    key = golden_rms_norm(projected, norm_weight)
     rd = cos.shape[-1] * 2
     return torch.cat((key[..., :-rd], golden_rope_interleave(key[..., -rd:], cos, sin)), dim=-1)
 
@@ -437,9 +453,6 @@ def hierarchical_sparse_indexer(
     """Select candidate blocks from scores with optional trailing row padding."""
     _hierarchical_sparse_indexer(index_scores, compressed_lens, candidate_mask)
     return candidate_mask
-
-
-__all__ = ["golden_hierarchical_sparse_indexer", "hierarchical_sparse_indexer"]
 
 
 def run_hierarchical_indexer_golden(golden_fn: Callable[..., torch.Tensor]) -> None:

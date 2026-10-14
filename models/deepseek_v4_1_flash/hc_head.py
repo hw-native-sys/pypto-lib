@@ -14,7 +14,6 @@ import torch
 from config import FLASH as M, T_DYN
 
 
-
 from hc_pre import build_mhc_pre_tensor_specs, mhc_pre
 from hc_pre import golden_hc_pre
 
@@ -104,16 +103,6 @@ def validate(argv=None):
         compile_only=args.compile_only,
     )
     return result
-
-
-__all__ = [
-    "build_hc_head_tensor_specs",
-    "golden_hc_head",
-    "golden_hc_head_case",
-    "hc_head",
-    "hc_head_test",
-    "validate",
-]
 
 
 def main():

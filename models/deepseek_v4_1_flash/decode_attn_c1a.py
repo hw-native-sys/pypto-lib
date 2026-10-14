@@ -15,12 +15,13 @@ import pypto.language.distributed as pld
 import torch
 
 from golden import TensorSpec, run
-from attention_common import AttentionGoldenResult, quantized_cache_compare
-from attention_ops import (
+from utils import AttentionGoldenResult
+from quant import quantized_cache_compare
+from qkv_proj_rope import (
     make_bf16_projection_with_deps,
-    make_norm_with_deps,
     make_rope_with_deps,
 )
+from rmsnorm import rms_norm
 from config import (
     AttentionMode,
     COMPRESSED_CACHE_GROUP,
@@ -39,8 +40,7 @@ from config import (
 )
 
 
-
-from attention_tp import OUTPUT_T_DYN
+from config import LOCAL_T_DYN
 from hierarchical_sparse_indexer import hierarchical_sparse_indexer
 from decode_indexer import (
     make_indexer_prepare,
@@ -71,14 +71,10 @@ INDEX_DIM = M.index_head_dim
 INDEX_TOPK = M.index_topk
 
 # Model configuration.
-SOFTMAX_SCALE = HEAD_DIM**-0.5
 ATTEND_TILE = 64
-ATTEND_TILES = (128 + INDEX_TOPK) // ATTEND_TILE
 
 # Tiling.
-M_TILE = min(16, LOCAL_H)
 N_TILE = 128
-K_TILE = 256
 
 # Paged state one rank owns.
 CACHE_STATE_NAMES = (
@@ -226,13 +222,11 @@ project_qa = make_mx_projection_with_deps(D, Q_LORA)
 project_qb = make_mx_projection_with_deps(Q_LORA, LOCAL_H * HEAD_DIM)
 project_kv = make_mx_projection_with_deps(D, HEAD_DIM)
 project_ob = make_mx_projection_with_deps(LOCAL_O_WIDTH, D, pl.FP32)
-normalize_q = make_norm_with_deps(Q_LORA, name_hint="c1a_q_rmsnorm")
-normalize_kv = make_norm_with_deps(HEAD_DIM, name_hint="c1a_kv_rmsnorm")
 rotate_q = make_rope_with_deps(LOCAL_H, name_hint="c1a_q_rope")
 rotate_kv = make_rope_with_deps(1, name_hint="c1a_kv_rope")
 rotate_output = make_rope_with_deps(LOCAL_H, inverse=True, name_hint="c1a_o_rope")
 qkv_proj_rope_with_deps = build_qkv_proj_rope_with_deps(
-    project_qa, normalize_q, project_qb, rotate_q, project_kv, normalize_kv, rotate_kv
+    project_qa, project_qb, rotate_q, project_kv, rotate_kv
 )
 o_proj_with_deps = build_o_proj_with_deps(
     rotate_output, grouped_output_with_deps, project_ob
@@ -272,7 +266,7 @@ def make_c1a_reduce(scatter=False):
         partial: pl.Tensor[[T_DYN, D], pl.FP32],
         output_window: pld.DistributedTensor[[DECODE_MAX_TOKENS, D], pl.FP32],
         output_arrived: pld.DistributedTensor[[TP_SIZE, 1], pl.INT32],
-        output: pl.Tensor[[OUTPUT_T_DYN, D], pl.BF16],
+        output: pl.Tensor[[LOCAL_T_DYN, D], pl.BF16],
         group_base: pl.Scalar[pl.INT32],
         tp_rank: pl.Scalar[pl.INT32],
         num_tokens: pl.Scalar[pl.INT32],
@@ -283,7 +277,7 @@ def make_c1a_reduce(scatter=False):
         count = pl.cast(num_tokens, pl.INT32)
         if scatter:
             # Ownership uses the fixed physical slab, not the active row count.
-            # Mirrors decode_common.slab_owner / decode_sp_integration's
+            # Mirrors decode_cp_allgather.slab_owner / utils'
             # sequence_parallel_bounds; keep the three in step.
             width = pl.tensor.dim(output, 0)
             first = pl.cast(pl.min(tp_rank * width, num_tokens), pl.INT32)
@@ -414,7 +408,7 @@ def make_c1a_finish(output_reduce=None):
         sin: pl.Tensor[[T_DYN, ROPE_DIM // 2], pl.FP32],
         output_window: pld.DistributedTensor[[DECODE_MAX_TOKENS, D], pl.FP32],
         output_arrived: pld.DistributedTensor[[TP_SIZE, 1], pl.INT32],
-        output: pl.Tensor[[OUTPUT_T_DYN, D], pl.BF16],
+        output: pl.Tensor[[LOCAL_T_DYN, D], pl.BF16],
         group_base: pl.Scalar[pl.INT32],
         tp_rank: pl.Scalar[pl.INT32],
         num_tokens: pl.Scalar[pl.INT32],
@@ -547,7 +541,7 @@ def make_fp4_publish(width, group, scale_dtype, cache_dim):
 
 def _reference_linear(x, weight, packed_scale):
     """Group-32 FP32 accumulation with the released activation rounding rule."""
-    from quantization import decode_e8m0, unpack_mx_b_scale
+    from quant import decode_e8m0, unpack_mx_b_scale
 
     groups = x.float().unflatten(-1, (-1, 32))
     scale = torch.exp2(torch.ceil(torch.log2(groups.abs().amax(-1).clamp_min(1e-4) / 448.0)))
@@ -583,7 +577,7 @@ FP4_MIDPOINT_CODES = {0.25: 0, 0.75: 2, 1.25: 2, 1.75: 4, 2.5: 4, 3.5: 6, 5.0: 6
 
 def check_fp4_boundaries():
     """CPU check of the E2M1 midpoint rule; returns the failure count."""
-    from quantization import FP4_VALUES, quantize_mxfp4_cache
+    from quant import FP4_VALUES, quantize_mxfp4_cache
 
     magnitudes = [sign * value for value in FP4_MIDPOINT_CODES for sign in (1.0, -1.0)]
     rows = torch.zeros(len(magnitudes), 32, dtype=torch.bfloat16)
@@ -609,7 +603,7 @@ def check_fp4_boundaries():
 
 def _reference_fp4(value, group, scale_format):
     """Independent E2M1 round-half-to-even packing with format-specific scale floors."""
-    from quantization import FP4_VALUES, encode_e8m0
+    from quant import FP4_VALUES, encode_e8m0
 
     grouped = value.float().unflatten(-1, (-1, group))
     amax = grouped.abs().amax(-1)
@@ -682,7 +676,7 @@ def _reference_index_scores(a, qr, index_payload, index_scale, candidates):
     device/reference disagreement is a real disagreement instead of an arithmetic ABI mismatch.
     """
     from qkv_proj_rope import golden_rope_interleave as rope_interleave
-    from quantization import dequantize_mxfp4_cache
+    from quant import dequantize_mxfp4_cache
 
     x = a["x"]
     lengths = a["compressed_lens"]
@@ -727,16 +721,16 @@ def _reference_index_scores(a, qr, index_payload, index_scale, candidates):
 
 def official_reference_c1a(**args):
     """Released C1A math with caller-managed paged caches and replicated index heads."""
-    from rmsnorm import golden_rms_norm_reference as rms_norm
+    from rmsnorm import golden_rms_norm
     from qkv_proj_rope import golden_rope_interleave as rope_interleave
     from hierarchical_sparse_indexer import select_candidate_blocks
-    from quantization import (
+    from quant import (
         encode_e8m0, dequantize_mxfp4_cache, dequantize_mxfp8_cache,
     )
 
     a = args
     x = a["x"]
-    qr = rms_norm(_reference_linear(x, a["wq_a"], a["wq_a_scale"]), a["q_norm_weight"])
+    qr = golden_rms_norm(_reference_linear(x, a["wq_a"], a["wq_a_scale"]), a["q_norm_weight"])
     rd = a["rope_cos"].shape[-1] * 2
 
     def rotate(value, cos, sin, inverse=False):
@@ -746,7 +740,7 @@ def official_reference_c1a(**args):
 
     q = _reference_linear(qr, a["wq_b"], a["wq_b_scale"]).unflatten(-1, (-1, head_dim))
     q = rotate(q, a["rope_cos"], a["rope_sin"])
-    kv = rms_norm(_reference_linear(x, a["wkv"], a["wkv_scale"]), a["kv_norm_weight"])
+    kv = golden_rms_norm(_reference_linear(x, a["wkv"], a["wkv_scale"]), a["kv_norm_weight"])
     kv = rotate(kv, a["rope_cos"], a["rope_sin"])
     window = a["window_cache"].clone()
     window_scale = a["window_cache_scale"].view(torch.uint8).clone()
@@ -763,8 +757,8 @@ def official_reference_c1a(**args):
     index_scale = None if a["index_cache_scale"] is None else a["index_cache_scale"].view(torch.uint8).clone()
     mode = a["mode"]
     if mode == AttentionMode.FULL:
-        latent = rms_norm(_bf16_gemm(x, a["compressor_wkv"]), a["compressor_norm_weight"])
-        key = rms_norm(_bf16_gemm(latent, a["index_wk"]), a["index_norm_weight"])
+        latent = golden_rms_norm(_bf16_gemm(x, a["compressor_wkv"]), a["compressor_norm_weight"])
+        key = golden_rms_norm(_bf16_gemm(latent, a["index_wk"]), a["index_norm_weight"])
         key = rotate(key, a["compressed_rope_cos"], a["compressed_rope_sin"])
         kp, ks, _ = _reference_fp4(key, 32, "e8m0")
         rotated = rotate(latent, a["compressed_rope_cos"], a["compressed_rope_sin"])
@@ -976,12 +970,10 @@ def golden_decode_attn_c1a_reindex(
 project_compressor = make_bf16_projection_with_deps(
     D, HEAD_DIM, name_hint="c1a_compressor_projection"
 )
-normalize_compressor = make_norm_with_deps(HEAD_DIM, name_hint="c1a_compressor_rmsnorm")
 rotate_compressor = make_rope_with_deps(1, name_hint="c1a_compressor_rope")
 project_index_key = make_bf16_projection_with_deps(
     HEAD_DIM, INDEX_DIM, name_hint="c1a_index_key_projection"
 )
-normalize_index_key = make_norm_with_deps(INDEX_DIM, name_hint="c1a_index_key_rmsnorm")
 rotate_index_key = make_rope_with_deps(
     1, head_dim=INDEX_DIM, name_hint="c1a_index_key_rope"
 )
@@ -1124,7 +1116,7 @@ def make_decode_attn_c1a_full(output_reduce=None):
         candidate_mask: pl.Tensor[[T_DYN, CMP_POSITIONS_DYN], pl.UINT8],
         output_window: pld.DistributedTensor[[DECODE_MAX_TOKENS, D], pl.FP32],
         output_arrived: pld.DistributedTensor[[TP_SIZE, 1], pl.INT32],
-        output: pl.Tensor[[OUTPUT_T_DYN, D], pl.BF16],
+        output: pl.Tensor[[LOCAL_T_DYN, D], pl.BF16],
         group_base: pl.Scalar[pl.INT32],
         tp_rank: pl.Scalar[pl.INT32],
         num_tokens: pl.Scalar[pl.INT32],
@@ -1139,11 +1131,17 @@ def make_decode_attn_c1a_full(output_reduce=None):
         projected = pl.create_tensor([tokens, HEAD_DIM], dtype=pl.BF16)
         pc_tid = project_compressor(x, compressor_wkv, projected, num_tokens, cache_ready)
         latent = pl.create_tensor([tokens, HEAD_DIM], dtype=pl.BF16)
-        nc_tid = normalize_compressor(projected, compressor_norm_weight, latent, num_tokens, pc_tid)
+        norm_blocks = (num_tokens + 7) // 8
+        with pl.spmd(norm_blocks, name_hint="c1a_compressor_rmsnorm", deps=[pc_tid]) as nc_tid:
+            norm_worker = pl.tile.get_block_idx()
+            rms_norm(projected, compressor_norm_weight, latent, norm_worker, num_tokens, width=HEAD_DIM)
         projected_key = pl.create_tensor([tokens, INDEX_DIM], dtype=pl.BF16)
         pk_tid = project_index_key(latent, index_wk, projected_key, num_tokens, nc_tid)
         normalized_key = pl.create_tensor([tokens, INDEX_DIM], dtype=pl.BF16)
-        nk_tid = normalize_index_key(projected_key, index_norm_weight, normalized_key, num_tokens, pk_tid)
+        norm_blocks = (num_tokens + 7) // 8
+        with pl.spmd(norm_blocks, name_hint="c1a_index_key_rmsnorm", deps=[pk_tid]) as nk_tid:
+            norm_worker = pl.tile.get_block_idx()
+            rms_norm(projected_key, index_norm_weight, normalized_key, norm_worker, num_tokens, width=INDEX_DIM)
         index_key = pl.create_tensor([tokens, INDEX_DIM], dtype=pl.BF16)
         ik_tid = rotate_index_key(
             normalized_key, compressed_rope_cos, compressed_rope_sin, index_key, num_tokens, nk_tid,
@@ -1184,23 +1182,6 @@ def make_decode_attn_c1a_full(output_reduce=None):
 
 decode_attn_c1a_full = make_decode_attn_c1a_full()
 decode_attn_c1a_full_sharded = make_decode_attn_c1a_full(c1a_finish_sharded)
-
-
-__all__ = [
-    "golden_decode_attn_c1a_full",
-    "golden_decode_attn_c1a_reindex",
-    "golden_decode_attn_c1a_reuse",
-    "decode_attn_c1a_full",
-    "decode_attn_c1a_full_sharded",
-    "c1a_previous_epoch",
-    "c1a_prepare",
-    "c1a_index",
-    "select_index_topk",
-    "c1a_finish",
-    "c1a_finish_sharded",
-    "c1a_reduce_scatter",
-    "run_c1a",
-]
 
 
 @pl.jit
@@ -1367,7 +1348,7 @@ def build_validation_values(mode, tokens, pages, seed=17, case="random"):
     import math
 
     TOKENS, PAGES, RANKS = tokens, pages, TP_SIZE
-    from quantization import (
+    from quant import (
         pack_mx_b_scale,
         quantize_mxfp8_cache,
         quantize_mxfp4_cache,
@@ -1554,7 +1535,7 @@ def topk_indices_compare(mode):
         del rtol, atol
         if torch.equal(actual, expected):
             return True, ""
-        from rmsnorm import golden_rms_norm_reference as rms_norm
+        from rmsnorm import golden_rms_norm
 
         names = (
             "x",
@@ -1578,7 +1559,7 @@ def topk_indices_compare(mode):
             a = {name: (score_outputs if name in score_outputs else inputs)[name][rank] for name in names}
             a["index_cache"] = score_outputs["index_cache"][rank]
             a["index_cache_scale"] = score_outputs["index_cache_scale"][rank]
-            qr = rms_norm(_reference_linear(a["x"], a["wq_a"], a["wq_a_scale"]), a["q_norm_weight"])
+            qr = golden_rms_norm(_reference_linear(a["x"], a["wq_a"], a["wq_a_scale"]), a["q_norm_weight"])
             scores, physical = _reference_index_scores(
                 a, qr, a["index_cache"].view(torch.uint8), a["index_cache_scale"], a["candidate_mask"]
             )

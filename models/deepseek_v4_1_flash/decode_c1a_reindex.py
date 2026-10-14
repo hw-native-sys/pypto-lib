@@ -8,7 +8,7 @@
 # -----------------------------------------------------------------------------------------------------------
 """Continuous-batch decode C1A reindex attention wired through mHC.
 
-The attention operator stays in ``decode_attn_c1a_reindex.py``; the shared mHC wiring and
+The attention operator stays in ``decode_attn_c1a.py``; the shared mHC wiring and
 validation harness live in ``decode_c1a_full.py``. Like the full entry, this one
 consumes the staggered ``pre_mix`` the previous sub-layer produced and hands its own
 computed ``pre_mix`` to the next sub-layer.
@@ -35,14 +35,21 @@ from config import (
 
 
 
-from attention_tp import OUTPUT_T_DYN, decode_tp_input_all_gather
+from config import LOCAL_T_DYN
+from decode_cp_allgather import decode_tp_input_all_gather
 from decode_c1a_full import golden_c1a_hc_case, validate_c1a_wirings
-from decode_common import mhc_pre_norm, slab_owner
-from decode_attn_c1a_reindex import (
-    decode_attn_c1a_reindex,
-    decode_attn_c1a_reindex_sharded,
+from hc_pre import mhc_pre_norm
+from decode_cp_allgather import slab_owner
+from decode_attn_c1a import (
+    c1a_finish,
+    c1a_finish_sharded,
+    c1a_index,
+    c1a_prepare,
+    c1a_previous_epoch,
     golden_decode_attn_c1a_reindex,
+    select_index_topk,
 )
+from decode_indexer import score_reindex
 from hc_mixes import mhc_mixes
 from hc_post import mhc_post
 
@@ -63,6 +70,85 @@ MIX_HC = M.mix_hc
 INDEX_H = M.index_n_heads
 INDEX_DIM = M.index_head_dim
 INDEX_TOPK = M.index_topk
+
+
+def make_decode_attn_c1a_reindex(output_reduce=None):
+    """Build the decode_attn_c1a_reindex leaf around one output collective."""
+    reducer = output_reduce or c1a_finish
+
+    @pl.jit.inline(auto_scope=False)
+    def decode_attn_c1a_reindex(
+        x: pl.Tensor[[T_DYN, D], pl.BF16],
+        wq_a: pl.Tensor[[D, Q_LORA], pl.FP8E4M3FN],
+        wq_a_scale: pl.Tensor[[D // 32, Q_LORA], pl.FP8E8M0, pl.MX_B_NN],
+        q_norm_weight: pl.Tensor[[Q_LORA], pl.BF16],
+        wq_b: pl.Tensor[[Q_LORA, LOCAL_H * HEAD_DIM], pl.FP8E4M3FN],
+        wq_b_scale: pl.Tensor[[Q_LORA // 32, LOCAL_H * HEAD_DIM], pl.FP8E8M0, pl.MX_B_NN],
+        wkv: pl.Tensor[[D, HEAD_DIM], pl.FP8E4M3FN],
+        wkv_scale: pl.Tensor[[D // 32, HEAD_DIM], pl.FP8E8M0, pl.MX_B_NN],
+        kv_norm_weight: pl.Tensor[[HEAD_DIM], pl.BF16],
+        attn_sink: pl.Tensor[[LOCAL_H], pl.FP32],
+        wo_a: pl.Tensor[[LOCAL_O_GROUPS, O_LORA, O_GROUP_IN], pl.BF16],
+        wo_b: pl.Tensor[[LOCAL_O_WIDTH, D], pl.FP8E4M3FN],
+        wo_b_scale: pl.Tensor[[LOCAL_O_WIDTH // 32, D], pl.FP8E8M0, pl.MX_B_NN],
+        rope_cos: pl.Tensor[[T_DYN, ROPE_DIM // 2], pl.FP32],
+        rope_sin: pl.Tensor[[T_DYN, ROPE_DIM // 2], pl.FP32],
+        window_slots: pl.Tensor[[T_DYN], pl.INT64],
+        window_indices: pl.Tensor[[T_DYN, 128], pl.INT32],
+        window_cache: pl.Tensor[[ORI_BLOCKS_DYN, 128, 1, HEAD_DIM], pl.FP8E4M3FN],
+        window_cache_scale: pl.Tensor[[ORI_BLOCKS_DYN, 128, 1, HEAD_DIM // WINDOW_CACHE_GROUP], pl.FP8E8M0],
+        compressed_cache: pl.Tensor[[CMP_BLOCKS_DYN, 128, 1, HEAD_DIM // 2], pl.UINT8],
+        compressed_cache_scale: pl.Tensor[
+            [CMP_BLOCKS_DYN, 128, 1, HEAD_DIM // COMPRESSED_CACHE_GROUP], pl.FP8E4M3FN
+        ],
+        request_ids: pl.Tensor[[T_DYN], pl.INT32],
+        compressed_lens: pl.Tensor[[T_DYN], pl.INT32],
+        index_cache: pl.Tensor[[INDEX_BLOCKS_DYN, 128, 1, INDEX_DIM // 2], pl.UINT8],
+        index_cache_scale: pl.Tensor[[INDEX_BLOCKS_DYN, 128, 1, INDEX_DIM // INDEX_CACHE_GROUP], pl.FP8E8M0],
+        index_block_table: pl.Tensor[[B_DYN, TABLE_DYN], pl.INT32],
+        candidate_mask: pl.Tensor[[T_DYN, CMP_POSITIONS_DYN], pl.UINT8],
+        index_wq_b: pl.Tensor[[Q_LORA, INDEX_H * INDEX_DIM], pl.FP8E4M3FN],
+        index_wq_b_scale: pl.Tensor[[Q_LORA // 32, INDEX_H * INDEX_DIM], pl.FP8E8M0, pl.MX_B_NN],
+        index_weights_proj: pl.Tensor[[D, INDEX_H], pl.BF16],
+        topk_indices: pl.Tensor[[T_DYN, INDEX_TOPK], pl.INT32],
+        output_window: pld.DistributedTensor[[DECODE_MAX_TOKENS, D], pl.FP32],
+        output_arrived: pld.DistributedTensor[[TP_SIZE, 1], pl.INT32],
+        output: pl.Tensor[[LOCAL_T_DYN, D], pl.BF16],
+        group_base: pl.Scalar[pl.INT32],
+        tp_rank: pl.Scalar[pl.INT32],
+        num_tokens: pl.Scalar[pl.INT32],
+        attention_epoch: pl.Scalar[pl.INT32],
+    ):
+        cache_ready = c1a_previous_epoch(output_arrived, attention_epoch)
+        (qr, query, qr_tid, q_tid) = c1a_prepare(
+            x, wq_a, wq_a_scale, q_norm_weight, wq_b, wq_b_scale, wkv, wkv_scale, kv_norm_weight, rope_cos,
+            rope_sin, window_slots, window_cache, window_cache_scale, num_tokens, cache_ready,
+        )
+        width = pl.tensor.dim(candidate_mask, 1)
+        (index_query, index_query_scale, index_weights, scores, query_tid, weights_tid) = c1a_index(
+            x, qr, index_wq_b, index_wq_b_scale, index_weights_proj, rope_cos, rope_sin,
+            num_tokens, width, cache_ready, qr_tid,
+        )
+        scores_tid = score_reindex(
+            index_query, index_query_scale, index_weights, index_cache, index_cache_scale,
+            index_block_table, request_ids, compressed_lens, candidate_mask,
+            scores, num_tokens, cache_ready, query_tid, weights_tid,
+        )
+        topk_tid = select_index_topk(
+            scores, index_block_table, request_ids, topk_indices, num_tokens, scores_tid,
+        )
+        reducer(
+            query, window_cache, window_cache_scale, compressed_cache, compressed_cache_scale, window_indices,
+            topk_indices, attn_sink, wo_a, wo_b, wo_b_scale, rope_cos, rope_sin, output_window, output_arrived,
+            output, group_base, tp_rank, num_tokens, attention_epoch, q_tid, topk_tid,
+        )
+        return output, topk_indices
+
+    return decode_attn_c1a_reindex
+
+
+decode_attn_c1a_reindex = make_decode_attn_c1a_reindex()
+decode_attn_c1a_reindex_sharded = make_decode_attn_c1a_reindex(c1a_finish_sharded)
 
 
 @pl.jit.inline(auto_scope=False)
@@ -139,8 +225,8 @@ def decode_c1a_reindex(
 
 @pl.jit.inline(auto_scope=False)
 def decode_c1a_reindex_sharded(
-    x_hc: pl.Tensor[[OUTPUT_T_DYN, HC_MULT, D], pl.FP32],
-    pre_mix: pl.Tensor[[OUTPUT_T_DYN, HC_MULT], pl.FP32],
+    x_hc: pl.Tensor[[LOCAL_T_DYN, HC_MULT, D], pl.FP32],
+    pre_mix: pl.Tensor[[LOCAL_T_DYN, HC_MULT], pl.FP32],
     hc_attn_fn: pl.Tensor[[MIX_HC, HC_DIM], pl.FP32],
     hc_attn_scale: pl.Tensor[[3], pl.FP32],
     hc_attn_base: pl.Tensor[[MIX_HC], pl.FP32],
@@ -182,8 +268,8 @@ def decode_c1a_reindex_sharded(
     input_arrived: pld.DistributedTensor[[TP_SIZE, 1], pl.INT32],
     output_window: pld.DistributedTensor[[DECODE_MAX_TOKENS, D], pl.FP32],
     output_arrived: pld.DistributedTensor[[TP_SIZE, 1], pl.INT32],
-    output: pl.Tensor[[OUTPUT_T_DYN, HC_MULT, D], pl.FP32],
-    next_pre_mix: pl.Tensor[[OUTPUT_T_DYN, HC_MULT], pl.FP32],
+    output: pl.Tensor[[LOCAL_T_DYN, HC_MULT, D], pl.FP32],
+    next_pre_mix: pl.Tensor[[LOCAL_T_DYN, HC_MULT], pl.FP32],
     group_base: pl.Scalar[pl.INT32],
     tp_rank: pl.Scalar[pl.INT32],
     num_tokens: pl.Scalar[pl.INT32],
@@ -291,8 +377,8 @@ def decode_c1a_reindex_test(
 
 @pl.jit
 def decode_c1a_reindex_sharded_test(
-    x_hc: pl.Tensor[[OUTPUT_T_DYN, HC_MULT, D], pl.FP32],
-    pre_mix: pl.Tensor[[OUTPUT_T_DYN, HC_MULT], pl.FP32],
+    x_hc: pl.Tensor[[LOCAL_T_DYN, HC_MULT, D], pl.FP32],
+    pre_mix: pl.Tensor[[LOCAL_T_DYN, HC_MULT], pl.FP32],
     hc_attn_fn: pl.Tensor[[MIX_HC, HC_DIM], pl.FP32],
     hc_attn_scale: pl.Tensor[[3], pl.FP32],
     hc_attn_base: pl.Tensor[[MIX_HC], pl.FP32],
@@ -338,14 +424,14 @@ def decode_c1a_reindex_sharded_test(
     input_arrived: pld.DistributedTensor[[TP_SIZE, 1], pl.INT32],
     output_window: pld.DistributedTensor[[DECODE_MAX_TOKENS, D], pl.FP32],
     output_arrived: pld.DistributedTensor[[TP_SIZE, 1], pl.INT32],
-    output: pl.Out[pl.Tensor[[OUTPUT_T_DYN, HC_MULT, D], pl.FP32]],
-    next_pre_mix: pl.Out[pl.Tensor[[OUTPUT_T_DYN, HC_MULT], pl.FP32]],
+    output: pl.Out[pl.Tensor[[LOCAL_T_DYN, HC_MULT, D], pl.FP32]],
+    next_pre_mix: pl.Out[pl.Tensor[[LOCAL_T_DYN, HC_MULT], pl.FP32]],
     group_base: pl.Scalar[pl.INT32],
     tp_rank: pl.Scalar[pl.INT32],
     num_tokens: pl.Scalar[pl.INT32],
     attention_epoch: pl.Scalar[pl.INT32],
 ):
-    x_hc.bind_dynamic(0, OUTPUT_T_DYN)
+    x_hc.bind_dynamic(0, LOCAL_T_DYN)
     gathered.bind_dynamic(0, T_DYN)
     window_cache.bind_dynamic(0, ORI_BLOCKS_DYN)
     compressed_cache.bind_dynamic(0, CMP_BLOCKS_DYN)

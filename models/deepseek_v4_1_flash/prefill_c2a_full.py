@@ -52,54 +52,36 @@ from config import (
 from compressor import STATE_WIDTH
 
 
-from attention_sp import (
-    PREFILL_ATTN_RING_HEAP, SP_T_DYN, prefill_sp_input_allgather, prefill_sp_output_reduce_scatter, prefill_sp_post,
+from config import (
+    SP_T_DYN,
 )
-from decode_attn_c2a_full import (
-    CACHE_SLOTS,
-    CMP_PACKED,
-    CMP_SCALES,
-    IDX_PACKED,
-    IDX_SCALES,
-    INPUT_NAMES,
-    STATE_METADATA,
-    FULL_ROPE_NAMES,
-    PROGRAM_INPUT_NAMES,
-    MUTABLE_NAMES,
-    SHARDED_NAMES,
-    compare_cache,
-    compare_output,
-    compare_per_rank,
-    compare_state,
-    compare_topk,
-    make_c2a_inputs,
-    official_reference_c2a,
-)
-from decode_attn_c2a_reuse import (
-    REUSE_INPUT_NAMES,
-    REUSE_MUTABLE_NAMES,
-    REUSE_SHARDED_NAMES,
-    make_c2a_reuse_inputs,
-    official_reference_c2a_reuse,
-)
+from prefill_cp_allgather import prefill_sp_input_allgather
+from o_proj import prefill_sp_output_reduce_scatter
+from hc_post import prefill_sp_post
 from hc_mixes import golden_mhc_mixes as hc_mixes
 from hc_post import golden_hc_post as hc_post
 from hc_pre import golden_hc_pre as hc_pre
-from rmsnorm import golden_rms_norm_reference as golden_rms_norm
+from rmsnorm import golden_rms_norm
 from hc_mixes import mhc_mixes
 from hc_pre import mhc_pre
-from prefill_attn_c2a_full import (
+from prefill_attn_c2a import (
     PREFILL_C2A_FULL_RING_HEAP, prefill_attn_c2a_full, prefill_attn_c2a_full_partial,
 )
 from hc_post import mhc_post
 from rope_tables import ROPE_ROWS_DYN, materialize_rope_rows
-from rmsnorm import rms_norm
+from rmsnorm import rms_norm_tiled
+from config import BLOCK_SIZE
+from quant import decode_e8m0, dequantize_mxfp4_cache, dequantize_mxfp8_cache, pack_mx_b_scale, quantize_mxfp4_cache, unpack_mx_b_scale
+from rope_tables import precompute_rope_tables
+from utils import paged_slots, window_metadata
 
 
 # model config
 LOCAL_H = M.num_attention_heads // TP_SIZE
 LOCAL_O_GROUPS = M.o_groups // TP_SIZE
 LOCAL_O_WIDTH = M.o_groups // TP_SIZE * M.o_lora_rank
+PREFILL_ATTN_RING_HEAP = (1024 * 1024 * 1024,) * 4
+
 D = M.hidden_size
 HEAD_DIM = M.head_dim
 ROPE_DIM = M.qk_rope_head_dim
@@ -132,7 +114,9 @@ def attention_hc_pre(
     mhc_mixes(x_hc, hc_attn_fn, hc_attn_scale, hc_attn_base, next_pre_mix, post_mix, residual_mix)
     collapsed = pl.create_tensor([tokens, D], dtype=pl.BF16)
     mhc_pre(x_hc, pre_mix, collapsed)
-    rms_norm(collapsed, attn_norm_weight, x)
+    norm_tokens = pl.tensor.dim(collapsed, 0)
+    for norm_block in pl.spmd((norm_tokens + 7) // 8, name_hint="rms_norm"):
+        rms_norm_tiled(collapsed, attn_norm_weight, x, norm_block, norm_tokens)
     return x
 
 
@@ -350,6 +334,790 @@ def golden_attention_input(
 
 
 HC_INPUT_NAMES = ("x_hc", "pre_mix", "hc_attn_fn", "hc_attn_scale", "hc_attn_base", "attn_norm_weight")
+MX_GROUP = M.weight_block_size[0]
+
+CMP_SCALES = HEAD_DIM // 16
+
+IDX_SCALES = INDEX_DIM // 32
+
+CMP_PACKED = HEAD_DIM // 2
+
+IDX_PACKED = INDEX_DIM // 2
+
+WINDOW = M.sliding_window
+
+ATTEND_TILE = 64
+
+E8M0 = getattr(torch, "float8_e8m0fnu", torch.uint8)
+
+BF16_GEMM = "fp32"
+
+PV_DTYPE = torch.bfloat16
+
+RATIO = 2
+
+TOPK = M.index_topk
+
+CMP_GROUP = COMPRESSED_CACHE_GROUP
+
+IDX_GROUP = INDEX_CACHE_GROUP
+
+def official_quantize(value):
+    """Independent translation of official kernel.py act_quant_kernel, group size 32."""
+    groups = value.float().unflatten(-1, (-1, MX_GROUP))
+    maximum = groups.abs().amax(-1).clamp_min(1e-4)
+    exponent = torch.ceil(torch.log2(maximum * (1.0 / 448.0)))
+    scale = torch.pow(2.0, exponent)
+    payload = (groups / scale[..., None]).clamp(-448, 448).to(torch.float8_e4m3fn).flatten(-2)
+    return payload, (exponent + 127).to(torch.uint8)
+
+def official_linear(x, weight, packed_scale, fp32=False):
+    """Match official FP8 GEMM's group-32 product, A scale, B scale, FP32 sum."""
+    payload, codes = official_quantize(x)
+    activation, weights = payload.float(), weight.float()
+    scale_a = decode_e8m0(codes)
+    scale_b = decode_e8m0(unpack_mx_b_scale(packed_scale))
+    result = torch.zeros(x.shape[0], weight.shape[1], dtype=torch.float32)
+    for group in range(weight.shape[0] // MX_GROUP):
+        start = group * MX_GROUP
+        product = activation[:, start : start + MX_GROUP] @ weights[start : start + MX_GROUP]
+        scaled = product * scale_a[:, group : group + 1]
+        scaled = scaled * scale_b[group : group + 1]
+        result = result + scaled
+    return result if fp32 else result.bfloat16()
+
+def official_rope(x, cos, sin, inverse=False):
+    """Rotate the trailing 2*cos.shape[-1] lanes as adjacent (real, imag) pairs."""
+    rope_dim = cos.shape[-1] * 2
+    value = x.float().clone()
+    c = cos.reshape(x.shape[0], *([1] * (x.ndim - 2)), -1)
+    s = sin.reshape_as(c) * (-1 if inverse else 1)
+    tail = value[..., -rope_dim:].unflatten(-1, (rope_dim // 2, 2))
+    real, imag = tail[..., 0].clone(), tail[..., 1].clone()
+    tail[..., 0] = real * c - imag * s
+    tail[..., 1] = real * s + imag * c
+    return value.to(torch.bfloat16)
+
+def official_norm(x, weight):
+    """RMSNorm in FP32 with the checkpoint 1e-20 epsilon, restored to BF16."""
+    value = x.float()
+    value = value * torch.rsqrt(value.square().mean(-1, keepdim=True) + 1e-20)
+    return (value * weight.float()).to(torch.bfloat16)
+
+def _bf16_matmul(a, b):
+    """BF16 GEMM with the device's FP32 accumulator (see BF16_GEMM)."""
+    if BF16_GEMM == "torch":
+        return torch.matmul(a, b)
+    return (a.float() @ b.float()).to(torch.bfloat16)
+
+def _bf16_grouped(grouped, weight):
+    """Grouped low-rank output GEMM: pl.matmul_acc into FP32, one BF16 cast."""
+    if BF16_GEMM == "torch":
+        return torch.einsum("tgd,grd->tgr", grouped, weight)
+    return torch.einsum("tgd,grd->tgr", grouped.float(), weight.float()).to(torch.bfloat16)
+
+def _write_rows(cache, rows, payload, width):
+    """Rewrite only ``rows`` of a paged cache, leaving every other byte alone."""
+    cache.view(torch.uint8).reshape(-1, width)[rows] = payload.contiguous().view(torch.uint8).reshape(-1, width)
+
+def _flat_cache_rows(payload, scale, group_size, scale_format):
+    """Packed E2M1 paged cache -> flattened FP32 physical rows."""
+    return dequantize_mxfp4_cache(payload, scale, group_size, scale_format).flatten(0, -2)
+
+def official_reference_c2a(inputs: dict, *, fp32_output=False) -> dict:
+    """Ratio-2 compressed sparse attention; publishes only the addressed cache rows.
+
+    Returns the per-rank partial output (before TP reduction) plus every mutated state: the
+    three paged caches with scales, the compressor state, and the physical Top-K rows.
+    """
+    t = inputs
+    x = t["x"]
+    tokens = x.shape[0]
+    head_dim = t["window_cache"].shape[-1]
+    local_heads = t["attn_sink"].numel()
+    index_dim = t["index_norm_weight"].numel()
+    index_heads = t["index_weights_proj"].shape[-1]
+    groups, _, group_in = t["wo_a"].shape
+
+    # a. Query/KV projection and rotary embedding.
+    qr = official_norm(official_linear(x, t["wq_a"], t["wq_a_scale"]), t["q_norm_weight"])
+    q = official_linear(qr, t["wq_b"], t["wq_b_scale"]).unflatten(-1, (local_heads, head_dim))
+    q = official_rope(q, t["rope_cos"], t["rope_sin"])
+    kv = official_norm(official_linear(x, t["wkv"], t["wkv_scale"]), t["kv_norm_weight"])
+    kv = official_rope(kv, t["rope_cos"], t["rope_sin"])
+
+    # b. Sliding-window cache: MXFP8, group 32, E8M0 scales; addressed rows only.
+    window_cache = t["window_cache"].clone()
+    window_cache_scale = t["window_cache_scale"].clone()
+    window_payload, window_codes = official_quantize(kv)
+    window_slots = t["window_slots"].long()
+    window_valid = window_slots >= 0
+    window_rows = window_slots[window_valid]
+    # Boolean indexing of Float8 on CPU requires an exact FP32 roundtrip.
+    visible_payload = window_payload.float()[window_valid].to(window_payload.dtype)
+    _write_rows(window_cache, window_rows, visible_payload, head_dim)
+    _write_rows(window_cache_scale, window_rows, window_codes[window_valid], head_dim // MX_GROUP)
+
+    # c. Ratio-2 compressor: per-channel two-way softmax over the pair, pooled row rounded to
+    #    BF16 before RMSNorm, published exactly when position_ids % 2 == 1. Ring rows
+    #    contain the KV projection followed by the gate score.
+    state_cache = t["state_cache"].clone()
+    pending_kv = x.float() @ t["compressor_wkv"].float()
+    pending_score = x.float() @ t["compressor_wgate"].float()
+    position_ids = t["position_ids"].long()
+    latent = torch.zeros(tokens, head_dim, dtype=torch.bfloat16)
+    publish = torch.zeros(tokens, dtype=torch.bool)
+    capacity = state_cache.shape[1]
+    valid_tokens = min(tokens, int(t["query_start_loc"][-1]))
+    for token in range(valid_tokens):
+        request = int(t["token_to_req_indices"][token])
+        if not 0 <= request < t["state_block_table"].shape[0]:
+            continue
+        block = int(t["state_block_table"][request, 0])
+        if not 0 <= block < state_cache.shape[0]:
+            continue
+        position = int(position_ids[token])
+        if position < 0:
+            continue
+        if position % RATIO:
+            previous = state_cache[block, (position - 1) % capacity]
+            pair_kv = torch.stack((previous[:head_dim], pending_kv[token]))
+            pair_score = torch.stack((previous[head_dim:], pending_score[token]))
+            pooled = (pair_kv * pair_score.softmax(dim=0)).sum(dim=0)
+            latent[token] = official_norm(pooled.to(torch.bfloat16), t["compressor_norm_weight"])
+            publish[token] = True
+        state_cache[block, position % capacity, :head_dim] = pending_kv[token]
+        state_cache[block, position % capacity, head_dim:] = pending_score[token]
+
+    # d. Compressed KV: rotate the latent tail, then packed FP4 with group-16 E4M3 scales.
+    compressed_cache = t["compressed_cache"].clone()
+    compressed_cache_scale = t["compressed_cache_scale"].clone()
+    rotated = official_rope(latent, t["compressed_rope_cos"], t["compressed_rope_sin"])
+    compressed_slots = t["compressed_slots"].long()
+    compressed_valid = (compressed_slots >= 0) & publish
+    compressed_rows = compressed_slots[compressed_valid]
+    if compressed_rows.numel():
+        payload, scale = quantize_mxfp4_cache(rotated[compressed_valid], CMP_GROUP, "e4m3")
+        _write_rows(compressed_cache, compressed_rows, payload, head_dim // 2)
+        _write_rows(compressed_cache_scale, compressed_rows, scale, head_dim // CMP_GROUP)
+
+    # e. Index keys come from the UNROTATED latent; packed FP4, group 32, E8M0, same slots.
+    index_cache = t["index_cache"].clone()
+    index_cache_scale = t["index_cache_scale"].clone()
+    index_key = official_norm(_bf16_matmul(latent, t["index_wk"]), t["index_norm_weight"])
+    index_key = official_rope(index_key, t["compressed_rope_cos"], t["compressed_rope_sin"])
+    if compressed_rows.numel():
+        payload, scale = quantize_mxfp4_cache(index_key[compressed_valid], IDX_GROUP, "e8m0")
+        _write_rows(index_cache, compressed_rows, payload, index_dim // 2)
+        _write_rows(index_cache_scale, compressed_rows, scale, index_dim // IDX_GROUP)
+
+    index_values = _flat_cache_rows(index_cache, index_cache_scale, IDX_GROUP, "e8m0")
+
+    # f. Indexer: score every causal compressed position against the freshly written keys.
+    index_q = official_linear(qr, t["index_wq_b"], t["index_wq_b_scale"]).unflatten(
+        -1, (index_heads, index_dim)
+    )
+    index_q = official_rope(index_q, t["rope_cos"], t["rope_sin"])
+    head_weights = _bf16_matmul(x, t["index_weights_proj"])
+    head_weights = head_weights * index_dim**-0.5 * index_heads**-0.5
+    lens = t["compressed_lens"].long()
+    max_len = int(lens.max()) if lens.numel() else 0
+    topk_indices = torch.full((tokens, TOPK), -1, dtype=torch.int32)
+    if max_len:
+        positions = torch.arange(max_len)
+        blocks = torch.div(positions, BLOCK_SIZE, rounding_mode="floor")
+        offsets = positions.remainder(BLOCK_SIZE)
+        pages = t["index_block_table"][t["token_to_req_indices"].long().unsqueeze(-1), blocks]
+        physical_rows = pages.to(torch.int64) * BLOCK_SIZE + offsets
+        keys = index_values[physical_rows.reshape(-1)].reshape(tokens, max_len, index_dim)
+        scores = torch.einsum("thd,tkd->thk", index_q.float(), keys.float()).relu()
+        scores = (scores * head_weights.float().unsqueeze(-1)).sum(dim=-2)
+        scores = scores.masked_fill(positions.unsqueeze(0) >= lens.unsqueeze(-1), -torch.inf)
+        count = min(TOPK, max_len)
+        logical = scores.topk(count, dim=-1, sorted=False).indices.sort(dim=-1).values
+        selected_scores = scores.gather(-1, logical)
+        selected_rows = physical_rows.gather(-1, logical)
+        rows = torch.where(torch.isfinite(selected_scores), selected_rows, -1)
+        for token in range(tokens):
+            if int(lens[token]) > TOPK:
+                # The scored device path orders winners by physical cache row.
+                rows[token] = rows[token].sort().values
+        topk_indices[:, :count] = rows.to(torch.int32)
+
+    # g. Sparse attention: one online softmax over window rows plus selected compressed rows.
+    window_values = (
+        window_cache.float() * decode_e8m0(window_cache_scale).repeat_interleave(MX_GROUP, -1)
+    ).reshape(-1, head_dim)
+    compressed_values = _flat_cache_rows(compressed_cache, compressed_cache_scale, CMP_GROUP, "e4m3")
+    window_indices = t["window_indices"].long()
+    gathered = torch.cat(
+        (
+            window_values[window_indices.clamp_min(0).reshape(-1)].reshape(tokens, -1, head_dim),
+            compressed_values[topk_indices.long().clamp_min(0).reshape(-1)].reshape(tokens, -1, head_dim),
+        ),
+        dim=1,
+    ).to(torch.bfloat16)
+    visible = torch.cat((window_indices >= 0, topk_indices >= 0), dim=1)
+    gathered = gathered.masked_fill(~visible[..., None], 0)
+
+    maximum = torch.full((tokens, local_heads), -1e30)
+    denominator = torch.zeros_like(maximum)
+    numerator = torch.zeros(tokens, local_heads, head_dim, dtype=torch.float32)
+    for start in range(0, gathered.shape[1], ATTEND_TILE):
+        values = gathered[:, start : start + ATTEND_TILE].float()
+        logits = torch.einsum("thd,tkd->thk", q.float(), values) * head_dim**-0.5
+        logits = logits.masked_fill(~visible[:, None, start : start + ATTEND_TILE], -torch.inf)
+        new_maximum = torch.maximum(maximum, logits.amax(-1))
+        correction = (maximum - new_maximum).exp()
+        probabilities = (logits - new_maximum[..., None]).exp()
+        denominator = denominator * correction + probabilities.sum(-1)
+        numerator = numerator * correction[..., None] + torch.einsum(
+            "thk,tkd->thd", probabilities.to(PV_DTYPE).float(), values
+        )
+        maximum = new_maximum
+    final_maximum = torch.maximum(maximum, t["attn_sink"].float()[None])
+    correction = (maximum - final_maximum).exp()
+    denominator = denominator * correction + (t["attn_sink"].float()[None] - final_maximum).exp()
+    attended = (numerator * (correction / denominator)[..., None]).to(torch.bfloat16)
+
+    # h. Inverse RoPE, grouped low-rank output projection, per-rank partial.
+    attended = official_rope(attended, t["rope_cos"], t["rope_sin"], inverse=True)
+    grouped = attended.reshape(tokens, groups, group_in)
+    projected = _bf16_grouped(grouped, t["wo_a"])
+    output = official_linear(projected.flatten(1), t["wo_b"], t["wo_b_scale"], fp32=fp32_output)
+
+    return {
+        "output": output,
+        "window_cache": window_cache,
+        "window_cache_scale": window_cache_scale,
+        "compressed_cache": compressed_cache,
+        "compressed_cache_scale": compressed_cache_scale,
+        "index_cache": index_cache,
+        "index_cache_scale": index_cache_scale,
+        "state_cache": state_cache,
+        "topk_indices": topk_indices,
+    }
+
+INPUT_NAMES = (
+    "x", "wq_a", "wq_a_scale", "q_norm_weight", "wq_b", "wq_b_scale", "wkv", "wkv_scale",
+    "kv_norm_weight", "attn_sink", "wo_a", "wo_b", "wo_b_scale", "rope_cos", "rope_sin",
+    "window_slots", "window_indices", "window_cache", "window_cache_scale",
+    "compressed_cache", "compressed_cache_scale", "token_to_req_indices", "compressed_lens",
+    "index_cache", "index_cache_scale", "index_block_table", "position_ids",
+    "compressed_rope_cos", "compressed_rope_sin", "compressor_wkv", "compressor_wgate",
+    "query_start_loc", "state_block_table", "state_cache", "compressor_norm_weight", "compressed_slots",
+    "index_wk", "index_norm_weight", "index_wq_b", "index_wq_b_scale", "index_weights_proj",
+)
+
+FULL_ROPE_NAMES = {
+    "rope_cos": "freqs_cos", "rope_sin": "freqs_sin",
+    "compressed_rope_cos": "compressed_freqs_cos",
+    "compressed_rope_sin": "compressed_freqs_sin",
+}
+
+PROGRAM_INPUT_NAMES = tuple(
+    entry
+    for name in INPUT_NAMES
+    for entry in (("compressed_rope_positions", name) if name == "compressor_wkv"
+                  else (FULL_ROPE_NAMES.get(name, name),))
+)
+
+_PREFIXES = {
+    ("mixed", "decode"): (1, 63, 128, 255, 0, 511, 129, 256),
+    ("mixed", "prefill"): (0, 1, 64, 128, 0, 255, 2, 127),
+    ("long", "decode"): (1024, 1027, 1290, 63, 1535, 128, 2048, 255),
+    ("long", "prefill"): (1024, 1027, 1291, 62, 1534, 129, 2049, 254),
+}
+
+def _weight(gen, k, n):
+    """MXFP8 input-major weight with Cube-ordered MX_B_NN scales."""
+    payload, codes = official_quantize(torch.randn(n, k, generator=gen) / math.sqrt(k))
+    return payload.T.contiguous(), pack_mx_b_scale(codes.T.contiguous()).view(E8M0)
+
+def _plan(tokens, requests, case, mode, start_pos=None):
+    """Ragged query lengths and per-request KV prefixes."""
+    lengths = [tokens // requests + (index < tokens % requests) for index in range(requests)]
+    if mode == "prefill" and requests > 1 and lengths[-1] > 4:
+        lengths[0] += 3
+        lengths[-1] -= 3
+    pattern = _PREFIXES[(case if case == "long" else "mixed", mode)]
+    prefixes = [pattern[index % len(pattern)] for index in range(requests)]
+    if start_pos is not None:
+        prefixes = list(start_pos)
+    return lengths, prefixes
+
+def make_c2a_inputs(tokens=24, requests=6, seed=17, case="mixed", mode="decode", full_rope_tables=False, start_pos=None):
+    """Deterministic inputs for ``golden_prefill_attn_c2a_full``.
+
+    case: "mixed" keeps contexts short so every causal position is selected, "long" pushes
+    part of the batch past index_topk so the scored Top-K path runs, "masked" clears every
+    slot and index, "zero" zeroes activations and all three cache payloads.  mode: "decode"
+    (few rows per request, long prefixes) or "prefill" (ragged multi-token requests).
+    """
+    if mode not in ("decode", "prefill"):
+        raise ValueError(f"mode must be 'decode' or 'prefill', got {mode!r}")
+    if case not in ("mixed", "long", "masked", "zero"):
+        raise ValueError(f"unsupported case {case!r}")
+    if not 1 <= requests <= min(MAX_BATCH_PER_DP, tokens):
+        raise ValueError(f"requests must be in [1, min({MAX_BATCH_PER_DP}, tokens)]")
+    gen = torch.Generator().manual_seed(seed)
+
+    lengths, prefixes = _plan(tokens, requests, case, mode, start_pos)
+    token_to_req_indices = torch.repeat_interleave(torch.arange(requests), torch.tensor(lengths))
+    positions = torch.cat(
+        [torch.arange(prefix, prefix + length) for prefix, length in zip(prefixes, lengths)]
+    )
+    maximum = int(positions.max())
+    window_columns = maximum // BLOCK_SIZE + 1
+    compressed_columns = max(4, (maximum // RATIO) // BLOCK_SIZE + 1)
+
+    # One spare page per cache is never mapped: a control row for untouched-byte checks.
+    window_pages = requests * window_columns + 1
+    compressed_pages = requests * compressed_columns + 1
+    def table(pages, columns):
+        rows = torch.randperm(pages, generator=gen)[: requests * columns]
+        return rows.reshape(requests, columns).to(torch.int32)
+
+    window_table = table(window_pages, window_columns)
+    index_block_table = table(compressed_pages, compressed_columns)
+
+    window_slots, window_indices, _ = window_metadata(positions, token_to_req_indices, window_table)
+    compressed_slots = paged_slots(positions, token_to_req_indices, index_block_table, BLOCK_SIZE, RATIO, True)
+    compressed_lens = torch.div(positions + 1, RATIO, rounding_mode="floor").to(torch.int32)
+
+    # Re-derive every piece of addressing independently of the metadata helpers.
+    assert window_slots.unique().numel() == tokens
+    for row, (request, position) in enumerate(zip(token_to_req_indices.tolist(), positions.tolist())):
+        expected_slot = int(window_table[request, position // BLOCK_SIZE]) * BLOCK_SIZE
+        assert int(window_slots[row]) == expected_slot + position % BLOCK_SIZE
+        history = list(range(max(0, position - WINDOW + 1), position + 1))
+        expected = [
+            int(window_table[request, p // BLOCK_SIZE]) * BLOCK_SIZE + p % BLOCK_SIZE
+            for p in history
+        ]
+        assert window_indices[row, : len(expected)].tolist() == expected
+        assert bool((window_indices[row, len(expected) :] == -1).all())
+        logical = position // RATIO
+        published = (position + 1) % RATIO == 0
+        expected_compressed = (
+            int(index_block_table[request, logical // BLOCK_SIZE]) * BLOCK_SIZE
+            + logical % BLOCK_SIZE
+            if published
+            else -1
+        )
+        assert int(compressed_slots[row]) == expected_compressed
+        assert int(compressed_lens[row]) == (position + 1) // RATIO
+    published_slots = compressed_slots[compressed_slots >= 0]
+    assert published_slots.unique().numel() == published_slots.numel()
+
+    # Fixture initialization only: production callers retain these full tables.
+    table_rows = int(positions.max()) + 1
+    freqs_cos, freqs_sin = precompute_rope_tables(table_rows, compressed_attention=False)
+    compressed_freqs_cos, compressed_freqs_sin = precompute_rope_tables(table_rows, compressed_attention=True)
+    rope_cos, rope_sin = freqs_cos[positions], freqs_sin[positions]
+    complete = (positions + 1).remainder(RATIO) == 0
+    pair_start = torch.where(complete, positions + 1 - RATIO, torch.full_like(positions, -1))
+    compressed_rope_cos = compressed_freqs_cos[pair_start.clamp_min(0)].masked_fill(~complete[:, None], 1.0)
+    compressed_rope_sin = compressed_freqs_sin[pair_start.clamp_min(0)].masked_fill(~complete[:, None], 0.0)
+
+    wq_a, wq_a_scale = _weight(gen, D, Q_LORA)
+    wq_b, wq_b_scale = _weight(gen, Q_LORA, LOCAL_H * HEAD_DIM)
+    wkv, wkv_scale = _weight(gen, D, HEAD_DIM)
+    wo_b, wo_b_scale = _weight(gen, LOCAL_O_WIDTH, D)
+    index_wq_b, index_wq_b_scale = _weight(gen, Q_LORA, INDEX_H * INDEX_DIM)
+
+    compressor_wkv = torch.randn(D, HEAD_DIM, generator=gen) / math.sqrt(D)
+    compressor_wgate = torch.randn(D, HEAD_DIM, generator=gen) / math.sqrt(D)
+    wo_a_values = torch.randn(LOCAL_O_GROUPS, O_LORA, O_GROUP_IN, generator=gen)
+    # Seed each request's predecessor projections in its physical ring block.
+    pending = torch.randn(MAX_BATCH_PER_DP, D, generator=gen).bfloat16().float()
+    state_cache = torch.zeros(MAX_BATCH_PER_DP + 1, STATE_CAPACITY, STATE_WIDTH)
+    state_block_table = torch.arange(requests - 1, -1, -1, dtype=torch.int32).unsqueeze(1) + 1
+    for request, prefix in enumerate(prefixes):
+        if prefix:
+            block = int(state_block_table[request, 0])
+            slot = (prefix - 1) % STATE_CAPACITY
+            state_cache[block, slot, :HEAD_DIM] = pending[request] @ compressor_wkv
+            state_cache[block, slot, HEAD_DIM:] = pending[request] @ compressor_wgate
+    query_start_loc = torch.tensor([0, *torch.tensor(lengths).cumsum(0).tolist()], dtype=torch.int32)
+
+    window_cache, window_cache_codes = official_quantize(
+        torch.randn(window_pages, BLOCK_SIZE, 1, HEAD_DIM, generator=gen).bfloat16()
+    )
+    compressed_cache, compressed_cache_scale = quantize_mxfp4_cache(
+        torch.randn(compressed_pages, BLOCK_SIZE, 1, HEAD_DIM, generator=gen).bfloat16(),
+        CMP_GROUP,
+        "e4m3",
+    )
+    index_cache, index_cache_codes = quantize_mxfp4_cache(
+        torch.randn(compressed_pages, BLOCK_SIZE, 1, INDEX_DIM, generator=gen).bfloat16(),
+        IDX_GROUP,
+        "e8m0",
+    )
+
+    values = {
+        "x": torch.randn(tokens, D, generator=gen).bfloat16(),
+        "wq_a": wq_a,
+        "wq_a_scale": wq_a_scale,
+        "q_norm_weight": (torch.randn(Q_LORA, generator=gen) * 0.1 + 1).bfloat16(),
+        "wq_b": wq_b,
+        "wq_b_scale": wq_b_scale,
+        "wkv": wkv,
+        "wkv_scale": wkv_scale,
+        "kv_norm_weight": (torch.randn(HEAD_DIM, generator=gen) * 0.1 + 1).bfloat16(),
+        "attn_sink": torch.randn(LOCAL_H, generator=gen) * 2,
+        "wo_a": (wo_a_values / math.sqrt(O_GROUP_IN)).bfloat16(),
+        "wo_b": wo_b,
+        "wo_b_scale": wo_b_scale,
+        "rope_cos": rope_cos,
+        "rope_sin": rope_sin,
+        "window_slots": window_slots,
+        "window_indices": window_indices,
+        "window_cache": window_cache,
+        "window_cache_scale": window_cache_codes.view(E8M0),
+        "compressed_cache": compressed_cache,
+        "compressed_cache_scale": compressed_cache_scale,
+        "token_to_req_indices": token_to_req_indices.to(torch.int32),
+        "compressed_lens": compressed_lens,
+        "index_cache": index_cache,
+        "index_cache_scale": index_cache_codes.view(E8M0),
+        "index_block_table": index_block_table,
+        "position_ids": positions.to(torch.int32),
+        "compressed_rope_cos": compressed_rope_cos,
+        "compressed_rope_sin": compressed_rope_sin,
+        "compressor_wkv": compressor_wkv,
+        "compressor_wgate": compressor_wgate,
+        "query_start_loc": query_start_loc,
+        "state_block_table": state_block_table,
+        "state_cache": state_cache,
+        "compressor_norm_weight": (torch.randn(HEAD_DIM, generator=gen) * 0.1 + 1).bfloat16(),
+        "compressed_slots": compressed_slots,
+        "index_wk": (torch.randn(HEAD_DIM, INDEX_DIM, generator=gen) / math.sqrt(HEAD_DIM)).bfloat16(),
+        "index_norm_weight": (torch.randn(INDEX_DIM, generator=gen) * 0.1 + 1).bfloat16(),
+        "index_wq_b": index_wq_b,
+        "index_wq_b_scale": index_wq_b_scale,
+        "index_weights_proj": (torch.randn(D, INDEX_H, generator=gen) / math.sqrt(D)).bfloat16(),
+    }
+
+    if case == "masked":
+        values["window_slots"] = torch.full_like(window_slots, -1)
+        values["window_indices"] = torch.full_like(window_indices, -1)
+        values["compressed_slots"] = torch.full_like(compressed_slots, -1)
+        values["compressed_lens"] = torch.zeros_like(compressed_lens)
+        values["state_block_table"] = torch.full_like(state_block_table, -1)
+    if case == "zero":
+        values["x"] = torch.zeros_like(values["x"])
+        values["window_cache"] = torch.zeros_like(window_cache.view(torch.uint8)).view(window_cache.dtype)
+        values["compressed_cache"] = torch.zeros_like(compressed_cache)
+        values["index_cache"] = torch.zeros_like(index_cache)
+        values["state_cache"] = torch.zeros_like(state_cache)
+
+    print(
+        f"[FIXTURE] c2a tokens={tokens} requests={requests} mode={mode} case={case} "
+        f"lengths={lengths} prefixes={prefixes} "
+        f"max_compressed_len={int(values['compressed_lens'].max())} "
+        f"window_pages={window_pages} compressed_pages={compressed_pages} "
+        f"index_block_table={tuple(index_block_table.shape)}"
+    )
+    if full_rope_tables:
+        values.update(
+            freqs_cos=freqs_cos, freqs_sin=freqs_sin,
+            compressed_freqs_cos=compressed_freqs_cos, compressed_freqs_sin=compressed_freqs_sin,
+            compressed_rope_positions=pair_start.to(torch.int32),
+        )
+        return {name: values[name] for name in PROGRAM_INPUT_NAMES}
+    return {name: values[name] for name in INPUT_NAMES}
+
+MUTABLE_NAMES = (
+    "window_cache",
+    "window_cache_scale",
+    "compressed_cache",
+    "compressed_cache_scale",
+    "index_cache",
+    "index_cache_scale",
+    "state_cache",
+)
+
+SHARDED_NAMES = ("wq_b", "wq_b_scale", "attn_sink", "wo_a", "wo_b", "wo_b_scale")
+
+CACHE_SLOTS = {
+    "window_cache": "window_slots",
+    "window_cache_scale": "window_slots",
+    "compressed_cache": "compressed_slots",
+    "compressed_cache_scale": "compressed_slots",
+    "index_cache": "compressed_slots",
+    "index_cache_scale": "compressed_slots",
+}
+
+CACHE_PAYLOADS = {
+    "window_cache": ("window_cache_scale", None, None),
+    "compressed_cache": ("compressed_cache_scale", 16, "e4m3"),
+    "index_cache": ("index_cache_scale", 32, "e8m0"),
+}
+
+def compare_output(actual, expected, **kwargs):
+    """FP8 budget: global L2 <= 1%, every row <= 2%, cosine >= 0.9999; exact zero rows."""
+    # Accumulate metrics in FP64: long FP32 vectors can yield cosine > 1.
+    actual, expected = actual.double(), expected.double()
+    error = (actual - expected).norm() / expected.norm().clamp_min(1e-12)
+    rows = (actual - expected).norm(dim=-1) / expected.norm(dim=-1).clamp_min(1e-12)
+    cosine = torch.nn.functional.cosine_similarity(actual.flatten(), expected.flatten(), dim=0)
+    empty = expected.norm(dim=-1) == 0
+    zero_exact = bool((actual[empty] == 0).all()) if bool(empty.any()) else True
+    passed = bool(torch.isfinite(actual).all()) and error <= 0.01 and rows.max() <= 0.02
+    passed = passed and (bool(cosine >= 0.9999) or bool(expected.norm() == 0)) and zero_exact
+    print(
+        f"[PRECISION] output rel_l2={error.item():.6g} cosine={cosine.item():.8f} "
+        f"max_abs={(actual - expected).abs().max().item():.6g} "
+        f"max_row_rel_l2={rows.max().item():.6g} zero_rows_exact={zero_exact}"
+    )
+    return passed, "FP8 budget: global L2 <= 1%, every row <= 2%, cosine >= 0.9999"
+
+STATE_METADATA = ("state_block_table", "query_start_loc", "position_ids", "token_to_req_indices")
+
+def compare_state(actual, expected, *, inputs=None, **kwargs):
+    """Compare updated projections and require untouched ring slots to remain byte-identical."""
+    if inputs and all(key in inputs for key in STATE_METADATA):
+        touched = torch.zeros(actual.shape[:2], dtype=torch.bool)
+        starts = inputs["query_start_loc"]
+        for request in range(inputs["state_block_table"].shape[0]):
+            block = int(inputs["state_block_table"][request, 0])
+            start, end = int(starts[request]), int(starts[request + 1])
+            if 0 <= block < actual.shape[0]:
+                for token in range(max(start, end - actual.shape[1]), end):
+                    position = int(inputs["position_ids"][token])
+                    if position >= 0 and int(inputs["token_to_req_indices"][token]) == request:
+                        touched[block, position % actual.shape[1]] = True
+        if not torch.equal(actual[~touched].view(torch.uint8), expected[~touched].view(torch.uint8)):
+            return False, "untouched ring slots changed"
+
+    error = (actual.float() - expected.float()).norm() / expected.float().norm().clamp_min(1e-12)
+    largest = (actual.float() - expected.float()).abs().max()
+    print(f"[PRECISION] state_cache rel_l2={error.item():.6g} max_abs={largest.item():.6g}")
+    return bool(error <= 0.005), "recurrent state must stay within 0.5% relative L2"
+
+def compare_cache(name):
+    """Cache ownership is a byte contract; published payload codes are compared as values.
+
+    The E2M1 grid carries eight magnitudes, so a one-ULP difference in a published
+    row can land on a table midpoint and move a code one step. The device fuses the
+    rotary multiply-add that torch rounds twice, which is enough to do that. Which
+    rows may change at all stays byte exact.
+    """
+
+    def compare(actual, expected, *, inputs, actual_outputs, expected_outputs, **kwargs):
+        width = actual.shape[-1]
+        rows = inputs[CACHE_SLOTS[name]].reshape(-1).long()
+        rows = rows[rows >= 0]
+        written = actual.view(torch.uint8).reshape(-1, width)
+        reference = expected.view(torch.uint8).reshape(-1, width)
+        untouched = torch.ones(written.shape[0], dtype=torch.bool)
+        untouched[rows] = False
+        if not torch.equal(written[untouched], reference[untouched]):
+            return False, f"{name}: unmapped cache bytes were modified"
+        codes = int((written[rows] != reference[rows]).sum()) if rows.numel() else 0
+        total = int(written[rows].numel()) if rows.numel() else 0
+        if name not in CACHE_PAYLOADS or not rows.numel():
+            print(
+                f"[PRECISION] {name} published_rows={rows.numel()} "
+                f"byte_mismatch={codes}/{total} untouched_exact=True"
+            )
+            return codes == 0, f"{name}: published rows must be byte identical"
+        scale_name, group, scale_format = CACHE_PAYLOADS[name]
+        if group is None:
+            written_values = dequantize_mxfp8_cache(actual, actual_outputs[scale_name])
+            reference_values = dequantize_mxfp8_cache(expected, expected_outputs[scale_name])
+        else:
+            written_values = dequantize_mxfp4_cache(
+                actual, actual_outputs[scale_name], group, scale_format
+            )
+            reference_values = dequantize_mxfp4_cache(
+                expected, expected_outputs[scale_name], group, scale_format
+            )
+        written_values = written_values.reshape(-1, written_values.shape[-1])[rows].float()
+        reference_values = reference_values.reshape(-1, reference_values.shape[-1])[rows].float()
+        error = (written_values - reference_values).norm()
+        error = error / reference_values.norm().clamp_min(1e-12)
+        print(
+            f"[PRECISION] {name} published_rows={rows.numel()} byte_mismatch={codes}/{total} "
+            f"value_rel_l2={error.item():.6g} untouched_exact=True"
+        )
+        return bool(error <= 0.01), f"{name}: published rows must stay within 1% relative L2"
+
+    return compare
+
+def compare_topk(actual, expected, **kwargs):
+    """Top-K is a set of physical rows; near ties at the boundary may flip."""
+    passed = True
+    overlaps = []
+    for row in range(actual.shape[0]):
+        entries = [int(value) for value in actual[row].tolist() if value >= 0]
+        selected = set(entries)
+        reference = {int(value) for value in expected[row].tolist() if value >= 0}
+        overlaps.append(len(selected & reference) / len(reference) if reference else 1.0)
+        if len(entries) != len(selected) or len(selected) != len(reference):
+            passed = False
+    worst = min(overlaps) if overlaps else 1.0
+    mean = sum(overlaps) / len(overlaps) if overlaps else 1.0
+    print(f"[PRECISION] topk_indices worst_overlap={worst:.6f} mean_overlap={mean:.6f}")
+    return bool(passed and worst >= 0.98), "selected compressed rows must match the reference set"
+
+def compare_replicated(compare):
+    """Check the TP-group leader and require every replica to stay byte identical."""
+
+    def compare_group(actual, expected, **kwargs):
+        passed = True
+        for base in range(0, actual.shape[0], TP_SIZE):
+            valid, _ = compare(actual[base], expected[base], **kwargs)
+            passed &= valid
+            passed &= all(
+                torch.equal(actual[base], actual[rank]) for rank in range(base + 1, base + TP_SIZE)
+            )
+        return passed, "each DP group must pass and every TP replica must be byte identical"
+
+    return compare_group
+
+def compare_per_rank(compare, slots=None):
+    """Apply a per-rank comparison to every rank, slicing that rank's own metadata."""
+
+    def compare_group(actual, expected, *, inputs=None, actual_outputs=None, expected_outputs=None, **kwargs):
+        """Compare each rank with its own cache and addressing metadata."""
+        passed = True
+        for rank in range(actual.shape[0]):
+            rank_inputs = {} if inputs is None else inputs
+            if inputs is not None and slots:
+                names = (slots,) if isinstance(slots, str) else slots
+                rank_inputs = {name: inputs[name][rank] for name in names}
+            rank_actual = {} if actual_outputs is None else {k: v[rank] for k, v in actual_outputs.items()}
+            rank_expected = {} if expected_outputs is None else {k: v[rank] for k, v in expected_outputs.items()}
+            valid, _ = compare(
+                actual[rank],
+                expected[rank],
+                inputs=rank_inputs,
+                actual_outputs=rank_actual,
+                expected_outputs=rank_expected,
+                **kwargs,
+            )
+            passed &= valid
+        return passed, "every rank must pass"
+
+    return compare_group
+
+REUSE_INPUT_NAMES = (
+    "x", "wq_a", "wq_a_scale", "q_norm_weight", "wq_b", "wq_b_scale", "wkv", "wkv_scale",
+    "kv_norm_weight", "attn_sink", "wo_a", "wo_b", "wo_b_scale", "rope_cos", "rope_sin",
+    "window_slots", "window_indices", "window_cache", "window_cache_scale", "compressed_cache",
+    "compressed_cache_scale", "compressed_indices",
+)
+
+REUSE_MUTABLE_NAMES = ("window_cache", "window_cache_scale")
+
+REUSE_SHARDED_NAMES = ("wq_b", "wq_b_scale", "attn_sink", "wo_a", "wo_b", "wo_b_scale")
+
+def official_reference_c2a_reuse(inputs: dict, *, fp32_output=False) -> dict:
+    """Ratio-2 reuse attention; publishes only the addressed sliding-window rows.
+
+    Same transcription as the full-mode reference, with the compressor, the index-key
+    publication and the indexer removed: the selection arrives as an input and the
+    compressed pool is read-only.
+    """
+    t = inputs
+    x = t["x"]
+    tokens = x.shape[0]
+    head_dim = t["window_cache"].shape[-1]
+    local_heads = t["attn_sink"].numel()
+    groups, _, group_in = t["wo_a"].shape
+
+    qr = official_norm(official_linear(x, t["wq_a"], t["wq_a_scale"]), t["q_norm_weight"])
+    q = official_linear(qr, t["wq_b"], t["wq_b_scale"]).unflatten(-1, (local_heads, head_dim))
+    q = official_rope(q, t["rope_cos"], t["rope_sin"])
+    kv = official_norm(official_linear(x, t["wkv"], t["wkv_scale"]), t["kv_norm_weight"])
+    kv = official_rope(kv, t["rope_cos"], t["rope_sin"])
+
+    window_cache = t["window_cache"].clone()
+    window_cache_scale = t["window_cache_scale"].clone()
+    window_payload, window_codes = official_quantize(kv)
+    window_slots = t["window_slots"].long()
+    window_valid = window_slots >= 0
+    window_rows = window_slots[window_valid]
+    # Boolean indexing of Float8 on CPU requires an exact FP32 roundtrip.
+    visible_payload = window_payload.float()[window_valid].to(window_payload.dtype)
+    _write_rows(window_cache, window_rows, visible_payload, head_dim)
+    _write_rows(window_cache_scale, window_rows, window_codes[window_valid], head_dim // MX_GROUP)
+
+    window_values = (
+        window_cache.float() * decode_e8m0(window_cache_scale).repeat_interleave(MX_GROUP, -1)
+    ).reshape(-1, head_dim)
+    compressed_values = _flat_cache_rows(
+        t["compressed_cache"], t["compressed_cache_scale"], CMP_GROUP, "e4m3"
+    )
+    window_indices = t["window_indices"].long()
+    compressed_indices = t["compressed_indices"].long()
+    gathered = torch.cat(
+        (
+            window_values[window_indices.clamp_min(0).reshape(-1)].reshape(tokens, -1, head_dim),
+            compressed_values[compressed_indices.clamp_min(0).reshape(-1)].reshape(
+                tokens, -1, head_dim
+            ),
+        ),
+        dim=1,
+    ).to(torch.bfloat16)
+    visible = torch.cat((window_indices >= 0, compressed_indices >= 0), dim=1)
+    gathered = gathered.masked_fill(~visible[..., None], 0)
+
+    maximum = torch.full((tokens, local_heads), -1e30)
+    denominator = torch.zeros_like(maximum)
+    numerator = torch.zeros(tokens, local_heads, head_dim, dtype=torch.float32)
+    for start in range(0, gathered.shape[1], ATTEND_TILE):
+        values = gathered[:, start : start + ATTEND_TILE].float()
+        logits = torch.einsum("thd,tkd->thk", q.float(), values) * head_dim**-0.5
+        logits = logits.masked_fill(~visible[:, None, start : start + ATTEND_TILE], -torch.inf)
+        new_maximum = torch.maximum(maximum, logits.amax(-1))
+        correction = (maximum - new_maximum).exp()
+        probabilities = (logits - new_maximum[..., None]).exp()
+        denominator = denominator * correction + probabilities.sum(-1)
+        numerator = numerator * correction[..., None] + torch.einsum(
+            "thk,tkd->thd", probabilities.to(PV_DTYPE).float(), values
+        )
+        maximum = new_maximum
+    final_maximum = torch.maximum(maximum, t["attn_sink"].float()[None])
+    correction = (maximum - final_maximum).exp()
+    denominator = denominator * correction + (t["attn_sink"].float()[None] - final_maximum).exp()
+    attended = (numerator * (correction / denominator)[..., None]).to(torch.bfloat16)
+
+    attended = official_rope(attended, t["rope_cos"], t["rope_sin"], inverse=True)
+    grouped = attended.reshape(tokens, groups, group_in)
+    projected = _bf16_grouped(grouped, t["wo_a"])
+    output = official_linear(projected.flatten(1), t["wo_b"], t["wo_b_scale"], fp32=fp32_output)
+
+    return {
+        "output": output,
+        "window_cache": window_cache,
+        "window_cache_scale": window_cache_scale,
+    }
+
+def make_c2a_reuse_inputs(tokens=32, requests=6, seed=17, case="mixed", mode="decode", start_pos=None):
+    """Inputs for a reuse layer, taken from what a full layer actually published.
+
+    The compressed pool and the Top-K row list come from running the full-mode
+    reference on the same batch, so the fixture exercises the real Full-to-Reuse
+    hand-off rather than a synthetic selection.
+    """
+    source = make_c2a_inputs(tokens=tokens, requests=requests, seed=seed, case=case, mode=mode, start_pos=start_pos)
+    published = official_reference_c2a(source)
+    values = {name: source[name] for name in REUSE_INPUT_NAMES if name != "compressed_indices"}
+    values["compressed_cache"] = published["compressed_cache"]
+    values["compressed_cache_scale"] = published["compressed_cache_scale"]
+    values["compressed_indices"] = published["topk_indices"]
+    reachable = int((published["topk_indices"] >= 0).sum())
+    print(
+        f"[FIXTURE] c2a reuse tokens={tokens} requests={requests} mode={mode} case={case} "
+        f"selected_rows={reachable} source_published_rows="
+        f"{int((source['compressed_slots'] >= 0).sum())}"
+    )
+    return values
+
+
 MODES = {
     "full": (INPUT_NAMES, MUTABLE_NAMES, SHARDED_NAMES, official_reference_c2a),
     "reuse": (REUSE_INPUT_NAMES, REUSE_MUTABLE_NAMES, REUSE_SHARDED_NAMES, official_reference_c2a_reuse),
@@ -1031,14 +1799,6 @@ def run_prefill_c2a(make_program, mode, argv=None):
 def validate(argv=None):
     """Validate packed prefill C2A Full wired through mHC on A5."""
     return run_prefill_c2a(make_hc_program, "full", argv=argv)
-
-
-__all__ = [
-    "attention_hc_pre",
-    "golden_attention_input",
-    "prefill_c2a_full",
-    "run_prefill_c2a",
-]
 
 
 def main():

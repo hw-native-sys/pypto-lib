@@ -6,7 +6,7 @@
 # INCLUDING BUT NOT LIMITED TO NON-INFRINGEMENT, MERCHANTABILITY, OR FITNESS FOR A PARTICULAR PURPOSE.
 # See LICENSE in the root of the software repository for the full text of the License.
 # -----------------------------------------------------------------------------------------------------------
-# ci: devices=1
+# ci: devices=2
 """DeepSeek-V4.1 Flash LM head projection with DP-owned hidden and TP vocab shards.
 
 Hidden states must already have passed the final RMSNorm.
@@ -42,7 +42,7 @@ import pypto.language as pl
 import pypto.language.distributed as pld
 from pypto.ir import DistributedConfig
 
-# LM-head parallelism is parsed locally below (TP1/DP1 defaults).
+# LM-head parallelism is parsed locally below (TP2/DP1 defaults).
 
 from config import FLASH as M
 
@@ -55,10 +55,10 @@ VOCAB = M.vocab_size
 T_DYN = pl.dynamic("LM_HEAD_T_DYN")
 
 # Parallelism. Static in the frontend, so both worlds are parsed off argv here.
-# Allow TP1/DP1 like MTP; default TP1 for Flash bring-up.
+# Allow TP1/DP1 like MTP; default to TP2/DP1.
 _TP_CHOICES = (1, 2, 4, 8)
 _DP_CHOICES = (1, 2, 4, 8)
-_TP_DEFAULT = 1
+_TP_DEFAULT = 2
 
 
 def _parse_int_argv(name, default=None):
@@ -319,28 +319,6 @@ def lm_head(
     return logits
 
 
-@pl.jit
-def lm_head_test(
-    hidden_states: pl.Tensor[[T_DYN, D], pl.BF16],
-    lm_head_weight: pl.Tensor[[VOCAB_PER_TP, D], pl.BF16],
-    logit_row_indices: pl.Tensor[[MAX_LOGIT_ROWS], pl.INT32],
-    logits: pl.Out[pl.Tensor[[MAX_LOGIT_ROWS, VOCAB], pl.FP32]],
-    hidden_window: pld.DistributedTensor[[GROUP_LOGIT_ROWS, D], pl.BF16],
-    hidden_done: pld.DistributedTensor[[TP_SIZE, 1], pl.INT32],
-    logits_window: pld.DistributedTensor[[MAX_LOGIT_ROWS, VOCAB], pl.FP32],
-    logits_done: pld.DistributedTensor[[TP_SIZE, 1], pl.INT32],
-    group_base: pl.Scalar[pl.INT32],
-    tp_rank: pl.Scalar[pl.INT32],
-    done_epoch: pl.Scalar[pl.INT32],
-) -> pl.Tensor[[MAX_LOGIT_ROWS, VOCAB], pl.FP32]:
-    lm_head(
-        hidden_states, lm_head_weight, logit_row_indices, logits,
-        hidden_window, hidden_done, logits_window, logits_done,
-        group_base, tp_rank, done_epoch,
-    )
-    return logits
-
-
 @pl.jit.inline
 def greedy_sample(
     logits: pl.Tensor[[MAX_LOGIT_ROWS, VOCAB], pl.FP32],
@@ -511,36 +489,6 @@ def l3_lm_head(
             )
 
 
-@pl.jit.host
-def l3_lm_head_twice(
-    hidden_states: pl.Tensor[[WORLD_SIZE, TEST_TOKENS, D], pl.BF16],
-    lm_head_weight: pl.Tensor[[WORLD_SIZE, VOCAB_PER_TP, D], pl.BF16],
-    logits: pl.Out[pl.Tensor[[WORLD_SIZE, MAX_LOGIT_ROWS, VOCAB], pl.FP32]],
-    sampled_ids: pl.Out[
-        pl.Tensor[[WORLD_SIZE, MAX_LOGIT_ROWS, SAMPLED_IDS_PAD], pl.INT32]
-    ],
-    logit_row_indices: pl.Tensor[[WORLD_SIZE, MAX_LOGIT_ROWS], pl.INT32],
-):
-    """Two retained-CommDomain forwards (done_epoch 1 then 2) for CI consecutive-call coverage."""
-    hidden_window_buf = pld.alloc_window_buffer(GROUP_LOGIT_ROWS * D * 2)
-    logits_window_buf = pld.alloc_window_buffer(MAX_LOGIT_ROWS * VOCAB * 4)
-    hidden_done_buf = pld.alloc_window_buffer(TP_SIZE * 4)
-    logits_done_buf = pld.alloc_window_buffer(TP_SIZE * 4)
-
-    for epoch_idx in pl.range(2):
-        for r in pl.range(pld.world_size()):
-            hidden_window = pld.window(hidden_window_buf, [GROUP_LOGIT_ROWS, D], dtype=pl.BF16)
-            hidden_done = pld.window(hidden_done_buf, [TP_SIZE, 1], dtype=pl.INT32)
-            logits_window = pld.window(logits_window_buf, [MAX_LOGIT_ROWS, VOCAB], dtype=pl.FP32)
-            logits_done = pld.window(logits_done_buf, [TP_SIZE, 1], dtype=pl.INT32)
-            lm_head_with_sampling_test(
-                hidden_states[r], lm_head_weight[r], logit_row_indices[r], logits[r],
-                sampled_ids[r],
-                hidden_window, hidden_done, logits_window, logits_done,
-                r // TP_SIZE * TP_SIZE, r % TP_SIZE, epoch_idx + 1, device=r,
-            )
-
-
 def golden_lm_head(tensors):
     import torch
 
@@ -659,33 +607,6 @@ def compare_sampled_ids(actual, _expected, *, actual_outputs, **_):
     )
 
 
-__all__ = [
-    "DP_SIZE",
-    "GROUP_LOGIT_ROWS",
-    "MAX_LOGIT_ROWS",
-    "REPEAT",
-    "SAMPLED_IDS_PAD",
-    "TEST_TOKENS",
-    "TP_SIZE",
-    "VOCAB",
-    "VOCAB_PER_TP",
-    "WORLD_SIZE",
-    "build_tensor_specs",
-    "compare_logits",
-    "compare_sampled_ids",
-    "golden_lm_head",
-    "golden_lm_head_all_ranks",
-    "greedy_sample",
-    "l3_lm_head",
-    "l3_lm_head_twice",
-    "lm_head",
-    "lm_head_test",
-    "lm_head_with_sampling",
-    "lm_head_with_sampling_test",
-    "validate",
-]
-
-
 def validate(argv=None):
     """Validate TP-sharded LM head + greedy sampling on A5."""
     import argparse
@@ -755,31 +676,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-
-
-def golden_lm_head_all_ranks(tensors, *, n_ranks):
-    """LM-head replay generalized to ``n_ranks`` owners.
-
-    Mirrors ``lm_head.golden_lm_head`` but iterates the caller's EP world instead
-    of the standalone fixture's WORLD_SIZE (which defaults to 1 and would
-    fill only the first TP group's rows when EP > TP). Card ``r`` holds vocab
-    shard ``r % TP_SIZE``, so concatenating the first TP_SIZE shards in index
-    order reproduces the global vocabulary every owner assembles.
-    """
-    import torch
-
-    hidden = tensors["hidden_out"].float()
-    weight = tensors["lm_head_weight"].float()
-    full_weight = torch.cat([weight[tp] for tp in range(TP_SIZE)], dim=0)
-    logits = tensors["logits"]
-    max_rows = logits.shape[1]
-    for owner_rank in range(n_ranks):
-        selected = torch.zeros((max_rows, D), dtype=torch.float32)
-        for row in range(max_rows):
-            source_row = int(tensors["logit_row_indices"][owner_rank, row])
-            if source_row >= 0:
-                source_row = min(source_row, hidden.shape[1] - 1)
-                selected[row].copy_(hidden[owner_rank, source_row])
-        logits[owner_rank, :, :] = torch.matmul(selected, full_weight.t())
-    tensors["sampled_ids"].zero_()
-    tensors["sampled_ids"][:, :, 0] = torch.argmax(logits, dim=-1).to(torch.int32)

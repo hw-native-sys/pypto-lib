@@ -261,6 +261,7 @@ INDEX_CACHE_GROUP = 32
 # Shared symbolic dimensions
 T_DYN = pl.dynamic("V41_T_DYN")
 LOCAL_T_DYN = pl.dynamic("V41_LOCAL_T_DYN")
+SP_T_DYN = pl.dynamic("V41_SP_T_DYN")
 ROUTE_T_DYN = pl.dynamic("V41_ROUTE_T_DYN")
 B_DYN = pl.dynamic("V41_B_DYN")
 STATE_BLOCKS_DYN = pl.dynamic("V41_STATE_BLOCKS_DYN")

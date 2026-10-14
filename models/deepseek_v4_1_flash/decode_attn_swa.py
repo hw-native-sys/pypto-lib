@@ -35,13 +35,14 @@ from config import EP_SIZE
 from utils import window_metadata
 from o_proj import o_proj
 from qkv_proj_rope import qkv_proj_rope
-from quantization import decode_e8m0, pack_mx_b_scale, unpack_mx_b_scale
-from attention_tp import (
-    OUTPUT_T_DYN,
+from quant import decode_e8m0, pack_mx_b_scale, unpack_mx_b_scale
+from config import LOCAL_T_DYN
+from o_proj import (
     decode_tp_output_all_reduce,
     decode_tp_output_reduce_scatter,
 )
-from attention_common import AttentionGoldenResult, golden_swa_attention
+from utils import AttentionGoldenResult
+from sparse_attention import golden_swa_attention
 
 
 # model config
@@ -304,7 +305,7 @@ def make_decode_attn_swa(output_reduce=None):
         window_cache_scale: pl.Tensor[[ORI_BLOCKS_DYN, 128, 1, HEAD_DIM // WINDOW_CACHE_GROUP], pl.FP8E8M0],
         output_window: pld.DistributedTensor[[DECODE_MAX_TOKENS, D], pl.FP32],
         output_arrived: pld.DistributedTensor[[TP_SIZE, 1], pl.INT32],
-        output: pl.Tensor[[OUTPUT_T_DYN, D], pl.BF16],
+        output: pl.Tensor[[LOCAL_T_DYN, D], pl.BF16],
         group_base: pl.Scalar[pl.INT32],
         tp_rank: pl.Scalar[pl.INT32],
         num_tokens: pl.Scalar[pl.INT32],
@@ -331,9 +332,6 @@ def make_decode_attn_swa(output_reduce=None):
 
 decode_attn_swa = make_decode_attn_swa()
 decode_attn_swa_sharded = make_decode_attn_swa(decode_tp_output_reduce_scatter)
-
-
-__all__ = ["decode_attn_swa", "decode_attn_swa_sharded", "golden_decode_attn_swa"]
 
 
 def official_quantize(value):

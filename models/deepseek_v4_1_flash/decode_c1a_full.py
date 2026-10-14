@@ -8,7 +8,7 @@
 # -----------------------------------------------------------------------------------------------------------
 """Continuous-batch decode C1A full attention wired through mHC.
 
-The attention operator stays in ``decode_attn_c1a_full.py``; this entry consumes the staggered
+The attention operator stays in ``decode_attn_c1a.py``; this entry consumes the staggered
 ``pre_mix`` the previous sub-layer produced (identity one-hot at the very first site),
 computes this site's coefficients with ``mhc_mixes``, collapses with ``mhc_pre``, runs the
 operator, and expands the residual with ``mhc_post``. ``post_mix`` and ``residual_mix``
@@ -17,6 +17,8 @@ module also hosts the shared HC fixture, goldens, and validation harness the rei
 reuse entries reuse.
 """
 
+import utils as _decode_utils
+
 import inspect
 
 import pypto.language as pl
@@ -24,11 +26,12 @@ import pypto.language.distributed as pld
 import torch
 
 from golden import TensorSpec, run
-from attention_common import quantized_cache_compare
+from quant import quantized_cache_compare
 from rope_tables import precompute_rope_tables
-import decode_common as common
-from decode_common import mhc_pre_norm, slab_owner
-from attention_tp import OUTPUT_T_DYN, decode_tp_input_all_gather
+from hc_pre import mhc_pre_norm
+from decode_cp_allgather import slab_owner
+from config import LOCAL_T_DYN
+from decode_cp_allgather import decode_tp_input_all_gather
 from config import (
     COMPRESSED_CACHE_GROUP,
     DECODE_MAX_TOKENS,
@@ -46,8 +49,7 @@ from config import (
 )
 
 
-
-from decode_attn_c1a_full import (
+from decode_attn_c1a import (
     CACHE_MAX_RELATIVE_L2,
     CACHE_STATE_NAMES,
     MXFP4_CACHE_MAX_RELATIVE_L2,
@@ -65,7 +67,7 @@ from decode_attn_c1a_full import (
 from hc_mixes import golden_mhc_mixes, mhc_mixes
 from hc_post import golden_mhc_post, mhc_post
 from hc_pre import golden_mhc_pre
-from rmsnorm import golden_rms_norm_reference as golden_rms_norm
+from rmsnorm import golden_rms_norm
 
 
 # model config
@@ -168,8 +170,8 @@ def decode_c1a_full(
 
 @pl.jit.inline(auto_scope=False)
 def decode_c1a_full_sharded(
-    x_hc: pl.Tensor[[OUTPUT_T_DYN, HC_MULT, D], pl.FP32],
-    pre_mix: pl.Tensor[[OUTPUT_T_DYN, HC_MULT], pl.FP32],
+    x_hc: pl.Tensor[[LOCAL_T_DYN, HC_MULT, D], pl.FP32],
+    pre_mix: pl.Tensor[[LOCAL_T_DYN, HC_MULT], pl.FP32],
     hc_attn_fn: pl.Tensor[[MIX_HC, HC_DIM], pl.FP32],
     hc_attn_scale: pl.Tensor[[3], pl.FP32],
     hc_attn_base: pl.Tensor[[MIX_HC], pl.FP32],
@@ -218,8 +220,8 @@ def decode_c1a_full_sharded(
     input_arrived: pld.DistributedTensor[[TP_SIZE, 1], pl.INT32],
     output_window: pld.DistributedTensor[[DECODE_MAX_TOKENS, D], pl.FP32],
     output_arrived: pld.DistributedTensor[[TP_SIZE, 1], pl.INT32],
-    output: pl.Tensor[[OUTPUT_T_DYN, HC_MULT, D], pl.FP32],
-    next_pre_mix: pl.Tensor[[OUTPUT_T_DYN, HC_MULT], pl.FP32],
+    output: pl.Tensor[[LOCAL_T_DYN, HC_MULT, D], pl.FP32],
+    next_pre_mix: pl.Tensor[[LOCAL_T_DYN, HC_MULT], pl.FP32],
     group_base: pl.Scalar[pl.INT32],
     tp_rank: pl.Scalar[pl.INT32],
     num_tokens: pl.Scalar[pl.INT32],
@@ -337,8 +339,8 @@ def decode_c1a_full_test(
 
 @pl.jit
 def decode_c1a_full_sharded_test(
-    x_hc: pl.Tensor[[OUTPUT_T_DYN, HC_MULT, D], pl.FP32],
-    pre_mix: pl.Tensor[[OUTPUT_T_DYN, HC_MULT], pl.FP32],
+    x_hc: pl.Tensor[[LOCAL_T_DYN, HC_MULT, D], pl.FP32],
+    pre_mix: pl.Tensor[[LOCAL_T_DYN, HC_MULT], pl.FP32],
     hc_attn_fn: pl.Tensor[[MIX_HC, HC_DIM], pl.FP32],
     hc_attn_scale: pl.Tensor[[3], pl.FP32],
     hc_attn_base: pl.Tensor[[MIX_HC], pl.FP32],
@@ -391,14 +393,14 @@ def decode_c1a_full_sharded_test(
     input_arrived: pld.DistributedTensor[[TP_SIZE, 1], pl.INT32],
     output_window: pld.DistributedTensor[[DECODE_MAX_TOKENS, D], pl.FP32],
     output_arrived: pld.DistributedTensor[[TP_SIZE, 1], pl.INT32],
-    output: pl.Out[pl.Tensor[[OUTPUT_T_DYN, HC_MULT, D], pl.FP32]],
-    next_pre_mix: pl.Out[pl.Tensor[[OUTPUT_T_DYN, HC_MULT], pl.FP32]],
+    output: pl.Out[pl.Tensor[[LOCAL_T_DYN, HC_MULT, D], pl.FP32]],
+    next_pre_mix: pl.Out[pl.Tensor[[LOCAL_T_DYN, HC_MULT], pl.FP32]],
     group_base: pl.Scalar[pl.INT32],
     tp_rank: pl.Scalar[pl.INT32],
     num_tokens: pl.Scalar[pl.INT32],
     attention_epoch: pl.Scalar[pl.INT32],
 ):
-    x_hc.bind_dynamic(0, OUTPUT_T_DYN)
+    x_hc.bind_dynamic(0, LOCAL_T_DYN)
     window_cache.bind_dynamic(0, ORI_BLOCKS_DYN)
     compressed_cache.bind_dynamic(0, CMP_BLOCKS_DYN)
     index_cache.bind_dynamic(0, INDEX_BLOCKS_DYN)
@@ -419,19 +421,6 @@ def decode_c1a_full_sharded_test(
         group_base, tp_rank, num_tokens,
         attention_epoch,
     )
-
-
-__all__ = [
-    "build_hc_validation_values",
-    "decode_c1a_full",
-    "decode_c1a_full_sharded",
-    "golden_c1a_hc_case",
-    "golden_decode_c1a_full_case",
-    "make_wiring_program",
-    "parse_c1a_hc_args",
-    "run_c1a_hc",
-    "validate_c1a_wirings",
-]
 
 
 def _make_program(tokens, pages, epochs=1):
@@ -916,14 +905,14 @@ def parse_c1a_hc_args(mode, argv=None):
     parser.add_argument("--enable-chip-swimlane", type=int, nargs="?", const=1, default=0, choices=range(5))
     parser.add_argument("--check-fp4", action="store_true", default=False,
                         help="run the CPU E2M1 midpoint check and exit")
-    common.add_wiring_argument(parser)
-    common.add_start_pos_argument(parser)
+    _decode_utils.add_wiring_argument(parser)
+    _decode_utils.add_start_pos_argument(parser)
     args = parser.parse_args(argv)
     if args.check_fp4:
         raise SystemExit(check_fp4_boundaries())
-    common.resolve_start_pos(parser, args)
-    if common.WIRING_SHARDED in common.selected_wirings(args.wiring):
-        common.validate_sp_tokens(parser, args)
+    _decode_utils.resolve_start_pos(parser, args)
+    if _decode_utils.WIRING_SHARDED in _decode_utils.selected_wirings(args.wiring):
+        _decode_utils.validate_sp_tokens(parser, args)
     if args.tp != TP_SIZE:
         parser.error(f"--tp {args.tp} does not match the TP_SIZE {TP_SIZE} the operator was built for")
     try:
@@ -944,7 +933,7 @@ def make_wiring_program(factory, wiring):
     the wiring to the caller's own factory so a wrapper cannot substitute another
     mode's host.
     """
-    if wiring == common.WIRING_SHARDED:
+    if wiring == _decode_utils.WIRING_SHARDED:
         return lambda tokens, pages, epochs: factory(tokens, pages, epochs, sharded=True)
     return factory
 
@@ -952,7 +941,7 @@ def make_wiring_program(factory, wiring):
 def validate_c1a_wirings(mode, factory, golden_case, argv=None):
     """Validate every wiring ``--wiring`` selects and combine the results."""
     args, devices = parse_c1a_hc_args(mode, argv)
-    return common.combine_validation(
+    return _decode_utils.combine_validation(
         [
             run_c1a_hc(
                 mode,
@@ -960,9 +949,9 @@ def validate_c1a_wirings(mode, factory, golden_case, argv=None):
                 golden_case,
                 args=args,
                 devices=devices,
-                sharded=wiring == common.WIRING_SHARDED,
+                sharded=wiring == _decode_utils.WIRING_SHARDED,
             )
-            for wiring in common.selected_wirings(args.wiring)
+            for wiring in _decode_utils.selected_wirings(args.wiring)
         ]
     )
 
@@ -971,7 +960,7 @@ def run_c1a_hc(mode, kernel_factory, golden_case, *, args, devices, sharded=Fals
     """Run A5 validation for one mHC-wired C1A operator and one wiring."""
     from pypto.ir import DistributedConfig
 
-    wiring = common.WIRING_SHARDED if sharded else common.WIRING_REPLICATED
+    wiring = _decode_utils.WIRING_SHARDED if sharded else _decode_utils.WIRING_REPLICATED
     host = kernel_factory(args.tokens, args.pages, args.epochs)
     values = build_hc_validation_values(mode, args.tokens, args.pages, args.seed, args.case, sharded, args.start_pos)
     # Clone per call: the harness builds the golden scratch from these same specs, and a
@@ -997,7 +986,7 @@ def run_c1a_hc(mode, kernel_factory, golden_case, *, args, devices, sharded=Fals
         # The C1A specs are tensors only, so the comparator cannot read the batch
         # size off the harness: it takes the entry's own token count.
         "output": (
-            common.compare_owner_rows(output_hc_compare, name="HC output", active=args.tokens)
+            _decode_utils.compare_owner_rows(output_hc_compare, name="HC output", active=args.tokens)
             if sharded
             else output_hc_compare
         ),
@@ -1027,8 +1016,8 @@ def run_c1a_hc(mode, kernel_factory, golden_case, *, args, devices, sharded=Fals
         golden_fn=golden_fn,
         compile_only=args.compile_only,
         save_data=args.save_data,
-        golden_data=common.wiring_replay_dir(args.golden_data, wiring),
-        runtime_dir=common.wiring_replay_dir(args.runtime_dir, wiring),
+        golden_data=_decode_utils.wiring_replay_dir(args.golden_data, wiring),
+        runtime_dir=_decode_utils.wiring_replay_dir(args.runtime_dir, wiring),
         config=dict(
             platform=args.platform,
             dump_passes=args.dump_passes,

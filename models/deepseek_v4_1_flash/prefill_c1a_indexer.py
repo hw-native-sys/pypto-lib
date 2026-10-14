@@ -13,9 +13,11 @@ import pypto.language as pl
 from config import INDEX_CACHE_GROUP, FLASH as M, INDEX_BLOCKS_DYN, T_DYN
 
 
-
-from attention_ops import (
-    M_TILE, make_bf16_projection_staged, make_mx_projection, make_rope,
+from qkv_proj_rope import (
+    M_TILE,
+    make_bf16_projection_staged,
+    make_mx_projection,
+    make_rope,
 )
 from hierarchical_sparse_indexer import _hierarchical_sparse_indexer
 
@@ -559,5 +561,3 @@ def make_paged_indexer(use_candidates=False, direct_topk=False, max_logits_bytes
         return completion[0]
 
     return paged_indexer
-
-__all__ = ["TOPK_LEAF", "make_paged_indexer"]

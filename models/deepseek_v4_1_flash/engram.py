@@ -69,32 +69,6 @@ N_TILE = 256
 D_TILE = 512
 
 
-from attention_ops import _prefill_project
-from quantization import prefill_round_activation
-
-
-def prefill_engram_gate_reference(x, kv, weight, *, eps=M.rms_norm_eps, token_mask=None, precision="fp32"):
-    """Released normalized signed-square-root Engram gate, entirely FP32."""
-    if x.dtype != torch.float32 or kv.dtype != torch.float32:
-        raise ValueError("FP32 Engram requires FP32 stream and projected values")
-    copies, width = x.shape[-2:]
-    key, value = kv.split((copies * width, width), dim=-1)
-    key = key.unflatten(-1, (copies, width))
-    rstd = torch.rsqrt(x.square().mean(-1) + eps) * torch.rsqrt(key.square().mean(-1) + eps)
-    dot = (x * weight * key).sum(-1) * rstd * width**-0.5
-    gate = torch.sigmoid(torch.copysign(dot.abs().clamp_min(1e-6).sqrt(), dot))
-    if token_mask is not None:
-        gate = gate.masked_fill(~token_mask.unsqueeze(-1), 0)
-    return prefill_round_activation(x + gate.unsqueeze(-1) * value.unsqueeze(-2), precision)
-
-
-def prefill_engram_reference(x, weights, *, eps=M.rms_norm_eps, token_mask=None, precision="fp32"):
-    """Project independently decoded original lookup rows and update the HC stream."""
-    lookup = prefill_round_activation(weights["lookup"], precision)
-    kv = _prefill_project(lookup, weights, "wkv", precision)
-    return prefill_engram_gate_reference(x, kv, weights["weight"], eps=eps, token_mask=token_mask, precision=precision)
-
-
 def _parse_tp_size() -> int:
     """Read ``--tp`` from the command line (default 1 = single-rank)."""
     for index, argument in enumerate(sys.argv):
@@ -685,21 +659,6 @@ def validate(argv=None):
             compile_only=args.compile_only,
         )
     return result
-
-
-__all__ = [
-    "build_engram_tensor_specs",
-    "build_engram_tp_tensor_specs",
-    "engram",
-    "engram_gate",
-    "engram_test",
-    "engram_tp",
-    "engram_tp_group",
-    "engram_tp_rank",
-    "golden_engram",
-    "golden_engram_case",
-    "golden_engram_tp_case",
-]
 
 
 def main():

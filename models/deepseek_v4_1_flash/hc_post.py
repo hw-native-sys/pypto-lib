@@ -8,10 +8,13 @@
 # -----------------------------------------------------------------------------------------------------------
 """mHC residual expansion."""
 
+from utils import owner_rows
+from config import TP_SIZE
+
 import pypto.language as pl
 import torch
 
-from config import FLASH as M, T_DYN
+from config import FLASH as M, SP_T_DYN, T_DYN
 
 
 # model config
@@ -209,20 +212,77 @@ def validate(argv=None):
     return result
 
 
-__all__ = [
-    "build_mhc_post_tensor_specs",
-    "golden_mhc_post",
-    "golden_mhc_post_case",
-    "mhc_post",
-    "mhc_post_test",
-]
-
-
 def main():
     """Run local validation and return a failing exit status on precision errors."""
     result = validate()
     if not result.passed:
         raise SystemExit(result.error or 1)
+
+
+@pl.jit.inline
+def prefill_sp_post(
+    sublayer: pl.Tensor[[SP_T_DYN, D], pl.BF16],
+    residual: pl.Tensor[[SP_T_DYN, HC_MULT, D], pl.FP32],
+    post_mix: pl.Tensor[[SP_T_DYN, HC_MULT], pl.FP32],
+    residual_mix: pl.Tensor[[SP_T_DYN, HC_MULT, HC_MULT], pl.FP32],
+    output: pl.Tensor[[SP_T_DYN, HC_MULT, D], pl.FP32],
+    next_pre_mix: pl.Tensor[[SP_T_DYN, HC_MULT], pl.FP32],
+    tp_rank: pl.Scalar[pl.INT32],
+    num_tokens: pl.Scalar[pl.INT32],
+):
+    """Run local mHC-post, writing active values and zero padding in one producer.
+
+    A later pure-output clear is not an ordering edge for the post task. Each
+    residual element is instead written exactly once, with mhc_post's FP32
+    accumulation order and single BF16 rounding boundary.
+    """
+    tokens = pl.tensor.dim(residual, 0)
+    residual_flat = pl.reshape(residual, [tokens, HC_MULT * D])
+    mix_flat = pl.reshape(residual_mix, [tokens, HC_MULT * HC_MULT])
+    output_flat = pl.reshape(output, [tokens, HC_MULT * D])
+    for block in pl.spmd(tokens * HC_MULT, name_hint="sp_mhc_post"):
+        row = block // HC_MULT
+        out_h = block % HC_MULT
+        for col in pl.pipeline(0, D, 256, stage=2):
+            value = pl.full([1, 256], dtype=pl.FP32, value=0.0)
+            if tp_rank * tokens + row < num_tokens:
+                hidden = pl.cast(sublayer[row:row + 1, col:col + 256], pl.FP32)
+                value = pl.mul(hidden, pl.read(post_mix, [row, out_h]))
+                for in_h in pl.unroll(HC_MULT):
+                    lane = residual_flat[row:row + 1, in_h * D + col:in_h * D + col + 256]
+                    value = pl.add(value, pl.mul(lane, pl.read(mix_flat, [row, in_h * HC_MULT + out_h])))
+            output_flat[row:row + 1, out_h * D + col:out_h * D + col + 256] = pl.cast(
+                pl.cast(value, pl.BF16, mode="rint"), pl.FP32,
+            )
+    for row in pl.spmd(tokens, name_hint="sp_mix_zero_padding"):
+        if tp_rank * tokens + row >= num_tokens:
+            zero_mix = pl.full([1, 8], dtype=pl.FP32, value=0.0)
+            next_pre_mix[row:row + 1, :] = pl.set_validshape(zero_mix, 1, HC_MULT)
+    return output, next_pre_mix
+
+
+def golden_attention_post(tensors, post, residual):
+    """Populate the common post-Attention mHC boundary."""
+    active = int(tensors["num_tokens"])
+    sharded = "gathered" in tensors
+    for rank in range(tensors["x_hc"].shape[0]):
+        if sharded:
+            _first, count, _width = owner_rows(tensors["attention_output"], rank, active, tp_size=TP_SIZE)
+            tensors["attention_hidden"][rank].zero_()
+            tensors["attention_output"][rank][count:].zero_()
+            if count:
+                tensors["attention_hidden"][rank][:count].copy_(
+                    golden_mhc_post(
+                        tensors["attention_output"][rank][:count],
+                        tensors["x_hc"][rank][:count], post[rank][:count], residual[rank][:count]
+                    )
+                )
+        else:
+            tensors["attention_hidden"][rank].copy_(
+                golden_mhc_post(
+                    tensors["attention_output"][rank], tensors["x_hc"][rank], post[rank], residual[rank]
+                )
+            )
 
 
 if __name__ == "__main__":
