@@ -18,6 +18,7 @@ from golden import TensorSpec, run
 from attention_common import AttentionGoldenResult, quantized_cache_compare
 from attention_ops import (
     make_bf16_projection_with_deps,
+    make_mx_projection_with_deps as build_mx_projection_with_deps,
     make_norm_with_deps,
     make_rope_with_deps,
 )
@@ -99,68 +100,9 @@ OUTPUT_RTOL = 1e-2
 OUTPUT_MAX_ERROR_RATIO = 0.01
 
 
-def make_mx_projection_with_deps(width, output_width, output_dtype=pl.BF16):
-    """Accumulate scale-corrected group-32 products without whole-weight expansion."""
-    fp32_output = output_dtype == pl.FP32
-
-    @pl.jit.inline
-    def project(
-        x: pl.Tensor[[T_DYN, width], pl.BF16],
-        weight: pl.Tensor[[width, output_width], pl.FP8E4M3FN],
-        scale: pl.Tensor[[width // 32, output_width], pl.FP8E8M0, pl.MX_B_NN],
-        output: pl.Tensor[[T_DYN, output_width], output_dtype],
-        num_tokens: pl.Scalar[pl.INT32],
-        ready: pl.Scalar[pl.TASK_ID],
-    ):
-        scale_storage = pl.tensor.view(scale, [output_width // 16, width // 2], layout=pl.ND)
-        # A device-only scratch buffer has no tensor-map edge of its own, so the
-        # consumer must be handed the producer TaskId explicitly; a task with no
-        # dependency edge is ready at submit and may overlap its producer.
-        with pl.spmd(32, name_hint="c1a_mx_projection", deps=[ready]) as project_tid:
-            worker = pl.tile.get_block_idx()
-            for task in pl.range(worker, (num_tokens + 15) // 16 * (output_width // N_TILE), 32):
-                t0 = task // (output_width // N_TILE) * 16
-                n0 = task % (output_width // N_TILE) * N_TILE
-                rows = pl.min(16, num_tokens - t0)
-                acc = pl.tile.full([16, N_TILE], dtype=pl.FP32, value=0.0)
-                for kb in pl.range(width // 64):
-                    raw = pl.load(scale_storage, [n0 // 16, kb * 32], [N_TILE // 16, 32])
-                    raw_u8 = pl.reinterpret_view(raw, pl.UINT8)
-                    codes = pl.ands(pl.cast(pl.reinterpret_view(raw_u8, pl.INT8), pl.INT32), 255)
-                    scale_pair = pl.reinterpret_view(pl.maximum(pl.shls(codes, 23), 4194304), pl.FP32)
-                    for half in pl.unroll(2):
-                        k0 = (kb * 2 + half) * 32
-                        if half == 0:
-                            selected_scale = pl.tile.gather_mask(
-                                scale_pair, mask_pattern=pl.tile.MaskPattern.P0101
-                            )
-                        else:
-                            selected_scale = pl.tile.gather_mask(
-                                scale_pair, mask_pattern=pl.tile.MaskPattern.P1010
-                            )
-                        sb = pl.reshape(selected_scale, [1, N_TILE])
-                        source = pl.load(x, [t0, k0], [16, 32], valid_shape=[rows, 32])
-                        source = pl.set_validshape(pl.fillpad(source, pad_value=pl.PadValue.zero), 16, 32)
-                        values = pl.cast(source, pl.FP32)
-                        temporary = pl.tile.create([16, 32], dtype=pl.FP32)
-                        maximum = pl.maximum(pl.row_max(pl.abs(values), tmp_tile=temporary), 1e-4)
-                        bits = pl.reinterpret_view(pl.mul(maximum, 1.0 / 448.0), pl.INT32)
-                        exponent = pl.shrs(pl.add(bits, 8388607), 23)
-                        sa = pl.reinterpret_view(pl.shls(exponent, 23), pl.FP32)
-                        payload = pl.cast(pl.row_expand_div(values, sa), pl.FP8E4M3FN, mode="rint")
-                        a = pl.cast(payload, pl.BF16)
-                        b = pl.cast(pl.load(weight, [k0, n0], [32, N_TILE]), pl.BF16)
-                        dot = pl.matmul(a, b)
-                        part = pl.col_expand_mul(pl.row_expand_mul(dot, sa), sb)
-                        acc = pl.add(acc, part)
-                if fp32_output:
-                    pl.store(pl.set_validshape(acc, rows, N_TILE), [t0, n0], output)
-                else:
-                    result = pl.cast(acc, pl.BF16, mode="rint")
-                    pl.store(pl.set_validshape(result, rows, N_TILE), [t0, n0], output)
-        return project_tid
-
-    return project
+def make_mx_projection_with_deps(width, output_width, output_dtype=pl.BF16, *, n_tile=128):
+    options = {"n_tile": n_tile, "name_hint": "c1a_mx_projection"}
+    return build_mx_projection_with_deps(width, output_width, output_dtype, **options)
 
 
 @pl.jit.inline
@@ -218,14 +160,14 @@ def attend_combined(
 
 
 project_qa = make_mx_projection_with_deps(D, Q_LORA)
-project_qb = make_mx_projection_with_deps(Q_LORA, LOCAL_H * HEAD_DIM)
+project_qb = make_mx_projection_with_deps(Q_LORA, LOCAL_H * HEAD_DIM, n_tile=256)
 project_kv = make_mx_projection_with_deps(D, HEAD_DIM)
-project_ob = make_mx_projection_with_deps(LOCAL_O_WIDTH, D, pl.FP32)
+project_ob = make_mx_projection_with_deps(LOCAL_O_WIDTH, D, pl.FP32, n_tile=256)
 normalize_q = make_norm_with_deps(Q_LORA, name_hint="c1a_q_rmsnorm")
 normalize_kv = make_norm_with_deps(HEAD_DIM, name_hint="c1a_kv_rmsnorm")
-rotate_q = make_rope_with_deps(LOCAL_H, name_hint="c1a_q_rope")
+rotate_q = make_rope_with_deps(LOCAL_H, max_workers=64, name_hint="c1a_q_rope")
 rotate_kv = make_rope_with_deps(1, name_hint="c1a_kv_rope")
-rotate_output = make_rope_with_deps(LOCAL_H, inverse=True, name_hint="c1a_o_rope")
+rotate_output = make_rope_with_deps(LOCAL_H, inverse=True, max_workers=64, name_hint="c1a_o_rope")
 qkv_proj_rope_with_deps = build_qkv_proj_rope_with_deps(
     project_qa, normalize_q, project_qb, rotate_q, project_kv, normalize_kv, rotate_kv
 )
@@ -274,59 +216,77 @@ def make_c1a_reduce(scatter=False):
         attention_epoch: pl.Scalar[pl.INT32],
         partial_ready: pl.Scalar[pl.TASK_ID],
     ):
-        first = pl.cast(0, pl.INT32)
-        count = pl.cast(num_tokens, pl.INT32)
-        if scatter:
-            # Ownership uses the fixed physical slab, not the active row count.
-            # Mirrors decode_common.slab_owner / decode_sp_integration's
-            # sequence_parallel_bounds; keep the three in step.
-            width = pl.tensor.dim(output, 0)
-            first = pl.cast(pl.min(tp_rank * width, num_tokens), pl.INT32)
-            count = pl.cast(pl.max(0, pl.min(width, num_tokens - first)), pl.INT32)
-        with pl.spmd(32, name_hint="c1a_tp_publish", deps=[partial_ready]) as published:
-            worker = pl.tile.get_block_idx()
-            for tile in pl.range(worker, num_tokens * (D // 512), 32):
-                row = tile // (D // 512)
-                col = tile % (D // 512) * 512
-                value = pl.load(partial, [row, col], [1, 512])
-                pld.tile.remote_store(value, output_window, peer=group_base + tp_rank, offsets=[row, col])
-        with pl.at(level=pl.Level.CORE_GROUP, name_hint="c1a_tp_ready", deps=[published]) as notified:
-            for peer in pl.range(TP_SIZE):
-                pld.system.notify(output_arrived, peer=group_base + peer, offsets=[tp_rank, 0],
-                                  value=1, op=pld.NotifyOp.AtomicAdd)
-        with pl.at(level=pl.Level.CORE_GROUP, name_hint="c1a_tp_wait", deps=[notified],
-                   allow_early_resolve=False) as arrived:
-            for peer in pl.range(TP_SIZE):
-                pld.system.wait(output_arrived, offsets=[peer, 0], expected=attention_epoch * 2 - 1,
-                                cmp=pld.WaitCmp.Ge)
-        with pl.spmd(32, name_hint="c1a_tp_reduce", deps=[arrived]) as reduced:
-            worker = pl.tile.get_block_idx()
-            for tile in pl.range(worker, count * (D // 512), 32):
-                row = tile // (D // 512)
-                col = tile % (D // 512) * 512
-                acc = pl.tile.full([1, 512], dtype=pl.FP32, value=0.0)
-                for peer in pl.range(TP_SIZE):
-                    peer_value = pld.tile.remote_load(
-                        output_window, peer=group_base + peer, offsets=[first + row, col], shape=[1, 512]
-                    )
-                    acc = pl.add(acc, peer_value)
-                pl.store(pl.cast(acc, pl.BF16, mode="rint"), [row, col], output)
-            if scatter:
-                # Empty owners and the last slab's padded tail are zeros, never
-                # a stale window or sentinel value.
-                for tile in pl.range(worker, (pl.tensor.dim(output, 0) - count) * (D // 512), 32):
-                    row = count + tile // (D // 512)
+        if TP_SIZE == 1:
+            rows = pl.tensor.dim(output, 0)
+            with pl.spmd(32, name_hint="c1a_tp1_output", deps=[partial_ready]) as local_tid:
+                worker = pl.tile.get_block_idx()
+                for tile in pl.range(worker, rows * (D // 512), 32):
+                    row = tile // (D // 512)
                     col = tile % (D // 512) * 512
-                    pl.store(pl.tile.full([1, 512], dtype=pl.BF16, value=0.0), [row, col], output)
-        with pl.at(level=pl.Level.CORE_GROUP, name_hint="c1a_tp_release", deps=[reduced]) as released:
-            for peer in pl.range(TP_SIZE):
-                pld.system.notify(output_arrived, peer=group_base + peer, offsets=[tp_rank, 0],
-                                  value=1, op=pld.NotifyOp.AtomicAdd)
-        with pl.at(level=pl.Level.CORE_GROUP, name_hint="c1a_tp_consumed", deps=[released],
-                   allow_early_resolve=False):
-            for peer in pl.range(TP_SIZE):
-                pld.system.wait(output_arrived, offsets=[peer, 0], expected=attention_epoch * 2,
-                                cmp=pld.WaitCmp.Ge)
+                    if row < num_tokens:
+                        value = pl.load(partial, [row, col], [1, 512])
+                        pl.store(pl.cast(value, pl.BF16, mode="rint"), [row, col], output)
+                    else:
+                        pl.store(pl.tile.full([1, 512], dtype=pl.BF16, value=0.0), [row, col], output)
+            with pl.at(level=pl.Level.CORE_GROUP, name_hint="c1a_tp1_release", deps=[local_tid],
+                       allow_early_resolve=False):
+                pld.system.notify(output_arrived, peer=group_base + tp_rank, offsets=[0, 0],
+                                  value=2, op=pld.NotifyOp.AtomicAdd)
+                pld.system.wait(output_arrived, offsets=[0, 0], expected=attention_epoch * 2, cmp=pld.WaitCmp.Ge)
+        else:
+            first = pl.cast(0, pl.INT32)
+            count = pl.cast(num_tokens, pl.INT32)
+            if scatter:
+                # Ownership uses the fixed physical slab, not the active row count.
+                # Mirrors decode_common.slab_owner / decode_sp_integration's
+                # sequence_parallel_bounds; keep the three in step.
+                width = pl.tensor.dim(output, 0)
+                first = pl.cast(pl.min(tp_rank * width, num_tokens), pl.INT32)
+                count = pl.cast(pl.max(0, pl.min(width, num_tokens - first)), pl.INT32)
+            with pl.spmd(32, name_hint="c1a_tp_publish", deps=[partial_ready]) as published:
+                worker = pl.tile.get_block_idx()
+                for tile in pl.range(worker, num_tokens * (D // 512), 32):
+                    row = tile // (D // 512)
+                    col = tile % (D // 512) * 512
+                    value = pl.load(partial, [row, col], [1, 512])
+                    pld.tile.remote_store(value, output_window, peer=group_base + tp_rank, offsets=[row, col])
+            with pl.at(level=pl.Level.CORE_GROUP, name_hint="c1a_tp_ready", deps=[published]) as notified:
+                for peer in pl.range(TP_SIZE):
+                    pld.system.notify(output_arrived, peer=group_base + peer, offsets=[tp_rank, 0],
+                                      value=1, op=pld.NotifyOp.AtomicAdd)
+            with pl.at(level=pl.Level.CORE_GROUP, name_hint="c1a_tp_wait", deps=[notified],
+                       allow_early_resolve=False) as arrived:
+                for peer in pl.range(TP_SIZE):
+                    pld.system.wait(output_arrived, offsets=[peer, 0], expected=attention_epoch * 2 - 1,
+                                    cmp=pld.WaitCmp.Ge)
+            with pl.spmd(32, name_hint="c1a_tp_reduce", deps=[arrived]) as reduced:
+                worker = pl.tile.get_block_idx()
+                for tile in pl.range(worker, count * (D // 512), 32):
+                    row = tile // (D // 512)
+                    col = tile % (D // 512) * 512
+                    acc = pl.tile.full([1, 512], dtype=pl.FP32, value=0.0)
+                    for peer in pl.range(TP_SIZE):
+                        peer_value = pld.tile.remote_load(
+                            output_window, peer=group_base + peer, offsets=[first + row, col], shape=[1, 512]
+                        )
+                        acc = pl.add(acc, peer_value)
+                    pl.store(pl.cast(acc, pl.BF16, mode="rint"), [row, col], output)
+                if scatter:
+                    # Empty owners and the last slab's padded tail are zeros, never
+                    # a stale window or sentinel value.
+                    for tile in pl.range(worker, (pl.tensor.dim(output, 0) - count) * (D // 512), 32):
+                        row = count + tile // (D // 512)
+                        col = tile % (D // 512) * 512
+                        pl.store(pl.tile.full([1, 512], dtype=pl.BF16, value=0.0), [row, col], output)
+            with pl.at(level=pl.Level.CORE_GROUP, name_hint="c1a_tp_release", deps=[reduced]) as released:
+                for peer in pl.range(TP_SIZE):
+                    pld.system.notify(output_arrived, peer=group_base + peer, offsets=[tp_rank, 0],
+                                      value=1, op=pld.NotifyOp.AtomicAdd)
+            with pl.at(level=pl.Level.CORE_GROUP, name_hint="c1a_tp_consumed", deps=[released],
+                       allow_early_resolve=False):
+                for peer in pl.range(TP_SIZE):
+                    pld.system.wait(output_arrived, offsets=[peer, 0], expected=attention_epoch * 2,
+                                    cmp=pld.WaitCmp.Ge)
         return output
 
     return c1a_reduce
@@ -804,7 +764,7 @@ project_index_weights = make_bf16_projection_with_deps(
     D, INDEX_H, name_hint="c1a_index_weights_projection"
 )
 rotate_index_query = make_rope_with_deps(
-    INDEX_H, head_dim=INDEX_DIM, name_hint="c1a_index_query_rope"
+    INDEX_H, head_dim=INDEX_DIM, max_workers=64, name_hint="c1a_index_query_rope"
 )
 
 
