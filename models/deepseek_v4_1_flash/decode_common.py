@@ -19,7 +19,7 @@ import torch
 
 from golden import ScalarSpec, TensorSpec, ratio_allclose, run
 
-from config import FLASH as M, TP_SIZE, DECODE_MAX_TOKENS
+from config import FLASH as M, TP_SIZE, DECODE_MAX_TOKENS, MAX_BATCH_PER_DP
 
 
 
@@ -520,6 +520,38 @@ def wiring_replay_dir(base: str | None, wiring: str) -> str | None:
     return str(Path(base) / wiring)
 
 
+def add_start_pos_argument(parser):
+    """Add one absolute decode start position per request."""
+    parser.add_argument(
+        "--start-pos", type=str, default=None,
+        help="absolute decode start positions; a comma-separated list sets batch to its length",
+    )
+
+
+def resolve_start_pos(parser, args):
+    """Resolve the single-token request batch before validating shape arguments."""
+    if args.start_pos is None:
+        return
+    try:
+        positions = [int(value.strip()) for value in args.start_pos.split(",")]
+    except ValueError:
+        parser.error("--start-pos must contain comma-separated integers")
+    if not 1 <= len(positions) <= min(MAX_BATCH_PER_DP, DECODE_MAX_TOKENS):
+        parser.error("--start-pos batch exceeds the decode request capacity")
+    if any(position < 0 or position >= M.max_position_embeddings for position in positions):
+        parser.error(f"--start-pos values must be in [0, {M.max_position_embeddings})")
+    if args.case not in ("random", "mixed"):
+        parser.error("--start-pos requires the default random/mixed case")
+    args.start_pos = positions
+    args.tokens = args.requests = len(positions)
+    if hasattr(args, "active_tokens"):
+        if args.active_tokens is not None and args.active_tokens != args.tokens:
+            parser.error("--start-pos requires every request to be active")
+        args.active_tokens = args.tokens
+    if hasattr(args, "pages"):
+        args.pages = sum((position + 128) // 128 for position in positions)
+
+
 def make_parser(description, default_layer_id, default_tokens, cases, default_seed=17):
     parser = argparse.ArgumentParser(description=description)
     parser.add_argument("--stage", choices=("attention", "block"), default="attention")
@@ -537,10 +569,12 @@ def make_parser(description, default_layer_id, default_tokens, cases, default_se
     parser.add_argument("--compile-only", action="store_true")
     parser.add_argument("--save-data", action="store_true")
     add_wiring_argument(parser)
+    add_start_pos_argument(parser)
     return parser
 
 
 def validate_args(parser, args, *, allow_inactive=False):
+    resolve_start_pos(parser, args)
     if args.cpu_golden:
         parser.error("Block CPU goldens are provided by decode_layer.py")
     if args.stage == "block":

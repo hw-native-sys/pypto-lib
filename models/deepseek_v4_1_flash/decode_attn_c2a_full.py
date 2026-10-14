@@ -1288,6 +1288,10 @@ def official_reference_c2a(inputs: dict, *, fp32_output=False) -> dict:
         selected_scores = scores.gather(-1, logical)
         selected_rows = physical_rows.gather(-1, logical)
         rows = torch.where(torch.isfinite(selected_scores), selected_rows, -1)
+        for token in range(tokens):
+            if int(lens[token]) > TOPK:
+                # The scored device path orders winners by physical cache row.
+                rows[token] = rows[token].sort().values
         topk_indices[:, :count] = rows.to(torch.int32)
 
     # g. Sparse attention: one online softmax over window rows plus selected compressed rows.
@@ -1381,7 +1385,7 @@ def _weight(gen, k, n):
     payload, codes = official_quantize(torch.randn(n, k, generator=gen) / math.sqrt(k))
     return payload.T.contiguous(), pack_mx_b_scale(codes.T.contiguous()).view(E8M0)
 
-def _plan(tokens, requests, case, mode):
+def _plan(tokens, requests, case, mode, start_pos=None):
     """Ragged query lengths and per-request KV prefixes."""
     lengths = [tokens // requests + (index < tokens % requests) for index in range(requests)]
     if mode == "prefill" and requests > 1 and lengths[-1] > 4:
@@ -1389,9 +1393,11 @@ def _plan(tokens, requests, case, mode):
         lengths[-1] -= 3
     pattern = _PREFIXES[(case if case == "long" else "mixed", mode)]
     prefixes = [pattern[index % len(pattern)] for index in range(requests)]
+    if start_pos is not None:
+        prefixes = list(start_pos)
     return lengths, prefixes
 
-def make_c2a_inputs(tokens=24, requests=6, seed=17, case="mixed", mode="decode", full_rope_tables=False):
+def make_c2a_inputs(tokens=24, requests=6, seed=17, case="mixed", mode="decode", full_rope_tables=False, start_pos=None):
     """Deterministic inputs for ``golden_decode_attn_c2a_full``.
 
     case: "mixed" keeps contexts short so every causal position is selected, "long" pushes
@@ -1407,7 +1413,7 @@ def make_c2a_inputs(tokens=24, requests=6, seed=17, case="mixed", mode="decode",
         raise ValueError(f"requests must be in [1, min({MAX_BATCH_PER_DP}, tokens)]")
     gen = torch.Generator().manual_seed(seed)
 
-    lengths, prefixes = _plan(tokens, requests, case, mode)
+    lengths, prefixes = _plan(tokens, requests, case, mode, start_pos)
     token_to_req_indices = torch.repeat_interleave(torch.arange(requests), torch.tensor(lengths))
     positions = torch.cat(
         [torch.arange(prefix, prefix + length) for prefix, length in zip(prefixes, lengths)]
@@ -2010,7 +2016,7 @@ def build_specs(args, mode, full_rope_tables=True):
                     requests=args.requests,
                     seed=args.seed + rank,
                     case=args.case,
-                    mode=mode, full_rope_tables=full_rope_tables,
+                    mode=mode, full_rope_tables=full_rope_tables, start_pos=getattr(args, "start_pos", None),
                 )
             # Every rank of a TP group sees the same tokens, metadata and caches.
             for rank in range(world_size):
@@ -2025,7 +2031,7 @@ def build_specs(args, mode, full_rope_tables=True):
         return torch.stack(column)
 
     shapes = make_c2a_inputs(
-        tokens=args.tokens, requests=args.requests, seed=args.seed, case=args.case, mode=mode, full_rope_tables=full_rope_tables
+        tokens=args.tokens, requests=args.requests, seed=args.seed, case=args.case, mode=mode, full_rope_tables=full_rope_tables, start_pos=getattr(args, "start_pos", None)
     )
     specs = [
         TensorSpec(

@@ -44,11 +44,16 @@ def write_json(path, value):
     Path(path).write_text(json.dumps(value, indent=2, allow_nan=False) + "\n", encoding="utf-8")
 
 
-def load_manifest():
+def load_manifest(platform=None):
     manifest = read_json(MANIFEST)
     ids = [case["case_id"] for case in manifest["cases"]]
     if len(set(ids)) != len(ids):
         raise ValueError("duplicate case_id in the manifest")
+    if platform is not None:
+        manifest["cases"] = [case for case in manifest["cases"]
+                             if case.get("platform", manifest["platform"]) == platform]
+        if not manifest["cases"]:
+            raise ValueError(f"no performance cases for platform {platform}")
     return manifest
 
 
@@ -104,8 +109,10 @@ def run_case(args):
     golden.run = make_capture(golden.run, args.output, selected)
     entry = ROOT / case["entrypoint"]
     sys.path.insert(0, str(entry.parent))
-    sys.argv = [str(entry), "-p", "a2a3", "-d", ",".join(map(str, selected)), *case["arguments"],
-                "--enable-chip-swimlane", "0"]
+    platform = case.get("platform", manifest["platform"])
+    sys.argv = [str(entry), "-p", platform, "-d", ",".join(map(str, selected)), *case["arguments"]]
+    if platform == "a2a3":
+        sys.argv += ["--enable-chip-swimlane", "0"]
     runpy.run_path(str(entry), run_name="__main__")
     if not args.output.is_file():
         raise ValueError("model produced no benchmark result")
@@ -171,8 +178,8 @@ def render_report(manifest, results):
     return "\n".join(lines) + "\n"
 
 
-def run_ci(output):
-    manifest = load_manifest()
+def run_ci(output, platform="a2a3"):
+    manifest = load_manifest(platform)
     sampling = manifest["sampling"]
     work, published = output / "work", output / "published"
     work.mkdir(parents=True)
@@ -185,17 +192,26 @@ def run_ci(output):
         case_dir = work / case_id
         case_dir.mkdir()
         print(f"[perf] {case_id}: running on {case['device_count']} device(s)", flush=True)
-        with (case_dir / "run.log").open("w") as log:
-            rc = subprocess.run(submit_command(case, case_dir, sampling), env=env,
-                                stdout=log, stderr=subprocess.STDOUT, check=False).returncode
+        print(f"::group::{case_id}", flush=True)
         try:
+            with (case_dir / "run.log").open("w", encoding="utf-8") as log, \
+                 subprocess.Popen(submit_command(case, case_dir, sampling), env=env,
+                                   stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                                   text=True, encoding="utf-8", errors="replace", bufsize=1) as proc:
+                for line in proc.stdout:
+                    sys.stdout.write(line)
+                    log.write(line)
+                sys.stdout.flush()
+            rc = proc.returncode
             if rc != 0:
                 raise ValueError(f"task-submit exited {rc}")
             results[case_id] = effective_us(read_json(case_dir / "raw-result.json"), case, sampling)
             print(f"[perf] {case_id}: {results[case_id]:.2f} us", flush=True)
-        except (OSError, ValueError, KeyError, TypeError) as error:
+        except (OSError, UnicodeError, ValueError, KeyError, TypeError) as error:
             results[case_id] = "FAIL"
             print(f"[perf] {case_id}: FAIL ({error}); see {case_id}/run.log in the artifact", flush=True)
+        finally:
+            print("::endgroup::", flush=True)
         # Publish logs and raw results only, never build trees.
         (published / case_id).mkdir()
         for name in ("run.log", "raw-result.json"):
@@ -209,13 +225,14 @@ def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
     commands = parser.add_subparsers(dest="mode", required=True)
     ci = commands.add_parser("ci", help="Run every case through task-submit and write report.md")
+    ci.add_argument("--platform", choices=("a2a3", "a5"), default="a2a3")
     ci.add_argument("--output-dir", required=True, type=Path)
     capture = commands.add_parser("case", help="Capture one model inside its task-submit allocation")
     capture.add_argument("--case", required=True)
     capture.add_argument("--output", required=True, type=Path)
     args = parser.parse_args(argv)
     if args.mode == "ci":
-        return run_ci(args.output_dir.resolve())
+        return run_ci(args.output_dir.resolve(), args.platform)
     return run_case(args)
 
 

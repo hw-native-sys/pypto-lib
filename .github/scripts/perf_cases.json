@@ -2,7 +2,7 @@
   "platform": "a2a3",
   "sampling": {
     "rounds": 100,
-    "warmup": 500
+    "warmup": 10
   },
   "cases": [
     {
@@ -234,6 +234,90 @@
         "1",
         "--start-pos",
         "131072,131072,131072,131072,131072,131072,131072,131072,131072,131072,131072,131072,131072,131072,131072,131072"
+      ]
+    },
+    {
+      "case_id": "dsv4.1-flash-decode-swa-b12-8k",
+      "entrypoint": "models/deepseek_v4_1_flash/decode_swa.py",
+      "platform": "a5",
+      "device_count": 1,
+      "arguments": [
+        "--tp",
+        "1",
+        "--start-pos",
+        "8192,8192,8192,8192,8192,8192,8192,8192,8192,8192,8192,8192",
+        "--wiring",
+        "replicated"
+      ]
+    },
+    {
+      "case_id": "dsv4.1-flash-decode-c1a-full-b12-8k",
+      "entrypoint": "models/deepseek_v4_1_flash/decode_c1a_full.py",
+      "platform": "a5",
+      "device_count": 1,
+      "arguments": [
+        "--tp",
+        "1",
+        "--start-pos",
+        "8192,8192,8192,8192,8192,8192,8192,8192,8192,8192,8192,8192",
+        "--wiring",
+        "replicated"
+      ]
+    },
+    {
+      "case_id": "dsv4.1-flash-decode-c1a-reindex-b12-8k",
+      "entrypoint": "models/deepseek_v4_1_flash/decode_c1a_reindex.py",
+      "platform": "a5",
+      "device_count": 1,
+      "arguments": [
+        "--tp",
+        "1",
+        "--start-pos",
+        "8192,8192,8192,8192,8192,8192,8192,8192,8192,8192,8192,8192",
+        "--wiring",
+        "replicated"
+      ]
+    },
+    {
+      "case_id": "dsv4.1-flash-decode-c1a-reuse-b12-8k",
+      "entrypoint": "models/deepseek_v4_1_flash/decode_c1a_reuse.py",
+      "platform": "a5",
+      "device_count": 1,
+      "arguments": [
+        "--tp",
+        "1",
+        "--start-pos",
+        "8192,8192,8192,8192,8192,8192,8192,8192,8192,8192,8192,8192",
+        "--wiring",
+        "replicated"
+      ]
+    },
+    {
+      "case_id": "dsv4.1-flash-decode-c2a-full-b12-8k",
+      "entrypoint": "models/deepseek_v4_1_flash/decode_c2a_full.py",
+      "platform": "a5",
+      "device_count": 1,
+      "arguments": [
+        "--tp",
+        "1",
+        "--start-pos",
+        "8192,8192,8192,8192,8192,8192,8192,8192,8192,8192,8192,8192",
+        "--wiring",
+        "replicated"
+      ]
+    },
+    {
+      "case_id": "dsv4.1-flash-decode-c2a-reuse-b12-8k",
+      "entrypoint": "models/deepseek_v4_1_flash/decode_c2a_reuse.py",
+      "platform": "a5",
+      "device_count": 1,
+      "arguments": [
+        "--tp",
+        "1",
+        "--start-pos",
+        "8192,8192,8192,8192,8192,8192,8192,8192,8192,8192,8192,8192",
+        "--wiring",
+        "replicated"
       ]
     }
   ]

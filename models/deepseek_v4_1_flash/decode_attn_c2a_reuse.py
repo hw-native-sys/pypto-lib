@@ -252,14 +252,14 @@ def official_reference_c2a_reuse(inputs: dict, *, fp32_output=False) -> dict:
     }
 
 
-def make_c2a_reuse_inputs(tokens=32, requests=6, seed=17, case="mixed", mode="decode"):
+def make_c2a_reuse_inputs(tokens=32, requests=6, seed=17, case="mixed", mode="decode", start_pos=None):
     """Inputs for a reuse layer, taken from what a full layer actually published.
 
     The compressed pool and the Top-K row list come from running the full-mode
     reference on the same batch, so the fixture exercises the real Full-to-Reuse
     hand-off rather than a synthetic selection.
     """
-    source = make_c2a_inputs(tokens=tokens, requests=requests, seed=seed, case=case, mode=mode)
+    source = make_c2a_inputs(tokens=tokens, requests=requests, seed=seed, case=case, mode=mode, start_pos=start_pos)
     published = official_reference_c2a(source)
     values = {name: source[name] for name in REUSE_INPUT_NAMES if name != "compressed_indices"}
     values["compressed_cache"] = published["compressed_cache"]
@@ -601,12 +601,12 @@ def compare_owned_cache(name, initial_cache):
     return compare
 
 
-def input_metadata(tokens, requests, active, case, mode):
+def input_metadata(tokens, requests, active, case, mode, start_pos=None):
     """Describe C2A validation tensor shapes without constructing random tensors."""
     bf, fp, mx = torch.bfloat16, torch.float8_e4m3fn, torch.float8_e8m0fnu
     if mode not in ("decode", "prefill"):
         raise ValueError(f"mode must be 'decode' or 'prefill', got {mode!r}")
-    lengths, prefixes = _plan(active, requests, case, mode)
+    lengths, prefixes = _plan(active, requests, case, mode, start_pos)
     maximum = max(prefix + length - 1 for prefix, length in zip(prefixes, lengths))
     window_pages = requests * (maximum // BLOCK_SIZE + 1) + 1
     compressed_pages = requests * max(4, (maximum // RATIO) // BLOCK_SIZE + 1) + 1
@@ -637,7 +637,7 @@ def input_metadata(tokens, requests, active, case, mode):
 
 def build_specs(args, mode, initial_cache):
     """Describe shapes lazily and populate full-to-reuse fixtures only for device runs."""
-    metadata = input_metadata(args.tokens, args.requests, args.active_tokens, args.case, mode)
+    metadata = input_metadata(args.tokens, args.requests, args.active_tokens, args.case, mode, getattr(args, "start_pos", None))
     world_size = TP_SIZE * args.dp
     ranks = {}
 
@@ -647,7 +647,7 @@ def build_specs(args, mode, initial_cache):
             for rank in range(world_size):
                 values = make_c2a_reuse_inputs(
                     tokens=args.active_tokens, requests=args.requests,
-                    seed=args.seed + rank, case=args.case, mode=mode,
+                    seed=args.seed + rank, case=args.case, mode=mode, start_pos=getattr(args, "start_pos", None),
                 )
                 if args.active_tokens < args.tokens:
                     for key in TOKEN_INPUT_NAMES:

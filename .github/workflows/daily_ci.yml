@@ -6,7 +6,7 @@ on:
   workflow_dispatch:
     inputs:
       performance_only:
-        description: Run only the MTP and DSpark operator performance suite
+        description: Run only the operator performance suites (a2a3 and a5)
         type: boolean
         default: false
 
@@ -417,12 +417,22 @@ jobs:
           path: checkout/results.tsv
 
   operator-performance:
-    name: MTP and DSpark operator performance (a2a3)
-    runs-on: [self-hosted, linux, npu, a3]
-    # Twenty serial task-submit cases, each bounded by --timeout 3600.
+    name: Operator performance (${{ matrix.platform }})
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - platform: a2a3
+            runner: [self-hosted, linux, npu, a3]
+            torch-version: 'torch==2.6.0'
+          - platform: a5
+            runner: [self-hosted, linux, npu-a5]
+            torch-version: 'torch==2.10.0'
+    runs-on: ${{ matrix.runner }}
+    # Each platform runs its own serial task-submit cases.
     timeout-minutes: 300
     concurrency:
-      group: operator-performance-a2a3
+      group: operator-performance-${{ matrix.platform }}
       cancel-in-progress: false
     defaults:
       run:
@@ -447,17 +457,18 @@ jobs:
         with:
           checkout-path: operator-checkout
           needs-device: 'true'
-          build-namespace: operator-performance-a2a3
-          pip-cache-name: pip-operator-performance
+          build-namespace: operator-performance-${{ matrix.platform }}
+          pip-cache-name: pip-operator-performance-${{ matrix.platform }}
           toolchain: bundle
+          torch-version: ${{ matrix.torch-version }}
 
       - name: Run operator performance cases
         id: perf
         env:
-          PERF_DIR: ${{ runner.temp }}/operator-perf-${{ github.run_id }}-${{ github.run_attempt }}
+          PERF_DIR: ${{ runner.temp }}/operator-perf-${{ matrix.platform }}-${{ github.run_id }}-${{ github.run_attempt }}
         run: |
           source activate.sh
-          python .github/scripts/ci_perf.py ci --output-dir "$PERF_DIR"
+          python .github/scripts/ci_perf.py ci --platform "${{ matrix.platform }}" --output-dir "$PERF_DIR"
 
       - name: Kill orphaned task-submit tasks
         if: always()
@@ -468,7 +479,7 @@ jobs:
       - name: Publish performance summary
         if: ${{ always() && steps.perf.outcome != 'skipped' }}
         env:
-          PERF_DIR: ${{ runner.temp }}/operator-perf-${{ github.run_id }}-${{ github.run_attempt }}
+          PERF_DIR: ${{ runner.temp }}/operator-perf-${{ matrix.platform }}-${{ github.run_id }}-${{ github.run_attempt }}
         run: |
           report="$PERF_DIR/published/report.md"
           if [ -f "$report" ]; then
@@ -482,14 +493,14 @@ jobs:
         if: ${{ always() && steps.perf.outcome != 'skipped' }}
         uses: ./.github/actions/upload-results
         with:
-          name: operator-perf-${{ github.run_attempt }}
-          path: ${{ runner.temp }}/operator-perf-${{ github.run_id }}-${{ github.run_attempt }}/published
+          name: operator-perf-${{ matrix.platform }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/operator-perf-${{ matrix.platform }}-${{ github.run_id }}-${{ github.run_attempt }}/published
           if-no-files-found: error
 
       - name: Remove private operator builds after uploading evidence
         if: ${{ always() && steps.upload.outcome == 'success' }}
         env:
-          PERF_DIR: ${{ runner.temp }}/operator-perf-${{ github.run_id }}-${{ github.run_attempt }}
+          PERF_DIR: ${{ runner.temp }}/operator-perf-${{ matrix.platform }}-${{ github.run_id }}-${{ github.run_attempt }}
         run: rm -rf -- "$PERF_DIR/work"
 
   summary:

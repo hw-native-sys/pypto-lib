@@ -409,7 +409,7 @@ def _make_program(tokens, pages, epochs=1):
         index_cache_scale: pl.InOut[
             pl.Tensor[[TP_SIZE, PAGES, 128, 1, INDEX_DIM // INDEX_CACHE_GROUP], pl.FP8E8M0]
         ],
-        index_block_table: pl.Tensor[[TP_SIZE, 1, PAGES], pl.INT32],
+        index_block_table: pl.Tensor[[TP_SIZE, TOKENS, PAGES], pl.INT32],
         candidate_mask: pl.InOut[pl.Tensor[[TP_SIZE, TOKENS, PAGES * 128], pl.UINT8]],
         index_wq_b: pl.Tensor[[TP_SIZE, Q_LORA, INDEX_H * INDEX_DIM], pl.FP8E4M3FN],
         index_wq_b_scale: pl.Tensor[[TP_SIZE, Q_LORA // 32, INDEX_H * INDEX_DIM], pl.FP8E8M0],
@@ -503,7 +503,7 @@ def _make_program_sharded(tokens, pages, epochs=1):
         index_cache_scale: pl.InOut[
             pl.Tensor[[TP_SIZE, PAGES, 128, 1, INDEX_DIM // INDEX_CACHE_GROUP], pl.FP8E8M0]
         ],
-        index_block_table: pl.Tensor[[TP_SIZE, 1, PAGES], pl.INT32],
+        index_block_table: pl.Tensor[[TP_SIZE, TOKENS, PAGES], pl.INT32],
         candidate_mask: pl.InOut[pl.Tensor[[TP_SIZE, TOKENS, PAGES * 128], pl.UINT8]],
         index_wq_b: pl.Tensor[[TP_SIZE, Q_LORA, INDEX_H * INDEX_DIM], pl.FP8E4M3FN],
         index_wq_b_scale: pl.Tensor[[TP_SIZE, Q_LORA // 32, INDEX_H * INDEX_DIM], pl.FP8E8M0],

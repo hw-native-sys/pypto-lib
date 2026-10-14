@@ -782,7 +782,11 @@ def official_reference_c1a(**args):
             topk[t, :chosen.numel()] = physical[t, chosen].int()
         if mode == AttentionMode.FULL:
             if width:
-                candidates = select_candidate_blocks(scores, lengths)
+                # Candidate masks publish the entire newest partial block.
+                padded_scores = torch.nn.functional.pad(
+                    scores, (0, -width % M.candidate_block_size), value=-torch.inf
+                )
+                candidates = select_candidate_blocks(padded_scores, lengths)
             else:
                 candidates = torch.zeros_like(scores, dtype=torch.bool)
     window_value = dequantize_mxfp8_cache(window, window_scale).to(x.dtype)

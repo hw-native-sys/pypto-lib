@@ -473,7 +473,7 @@ def make_inputs(batch=32, seed=17, position=127):
     return dict(zip(INPUT_NAMES, values))
 
 
-def make_packed_inputs(tokens=257, requests=4, seed=17, case="mixed"):
+def make_packed_inputs(tokens=257, requests=4, seed=17, case="mixed", start_pos=None):
     if not 1 <= requests <= min(32, tokens):
         raise ValueError("requests must be in [1, min(32, tokens)]")
     values = make_inputs(1, seed=seed)
@@ -486,6 +486,8 @@ def make_packed_inputs(tokens=257, requests=4, seed=17, case="mixed"):
     prefixes = torch.zeros(requests, dtype=torch.int64)
     if case == "prefix":
         prefixes = torch.tensor([127, 128, 511, 1048000] * 8)[:requests]
+    if start_pos is not None:
+        prefixes = torch.tensor(start_pos, dtype=torch.int64)
     ids = torch.repeat_interleave(torch.arange(requests), lengths)
     positions = torch.cat([torch.arange(int(p), int(p + n)) for p, n in zip(prefixes, lengths)])
     logical_capacity = int((prefixes + lengths + 129).max()) // 128 + 1
@@ -667,7 +669,7 @@ def make_program(operator, capacity, world_size, epochs):
 def build_specs(args, mode):
     """Build shape-only specs; replay and compile-only never generate random weights."""
     world_size = TP_SIZE * args.dp
-    packed = (mode == "prefill" or args.tokens > MAX_BATCH_PER_DP
+    packed = (getattr(args, "start_pos", None) is not None or mode == "prefill" or args.tokens > MAX_BATCH_PER_DP
               or args.requests != args.tokens or args.case in ("prefix", "shuffle"))
     if packed:
         lengths = [args.tokens // args.requests + (r < args.tokens % args.requests) for r in range(args.requests)]
@@ -675,6 +677,8 @@ def build_specs(args, mode):
             lengths[0] += 7
             lengths[-1] -= 7
         prefixes = ([127, 128, 511, 1048000] * 8)[:args.requests] if args.case == "prefix" else [0] * args.requests
+        if getattr(args, "start_pos", None) is not None:
+            prefixes = args.start_pos
         pages = 1 + sum((p + n + 128) // 128 - max(0, p - 127) // 128 + 1 for p, n in zip(prefixes, lengths))
     else:
         pages = args.tokens + 1
@@ -697,7 +701,7 @@ def build_specs(args, mode):
             for rank in range(world_size):
                 seed = args.seed + rank
                 if packed:
-                    value = make_packed_inputs(args.tokens, args.requests, seed, args.case)
+                    value = make_packed_inputs(args.tokens, args.requests, seed, args.case, getattr(args, "start_pos", None))
                 else:
                     value = make_inputs(args.tokens, seed)
                 if not packed:

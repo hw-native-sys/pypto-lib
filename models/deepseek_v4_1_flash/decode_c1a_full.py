@@ -25,6 +25,7 @@ import torch
 
 from golden import TensorSpec, run
 from attention_common import quantized_cache_compare
+from rope_tables import precompute_rope_tables
 import decode_common as common
 from decode_common import mhc_pre_norm, slab_owner
 from attention_tp import OUTPUT_T_DYN, decode_tp_input_all_gather
@@ -477,7 +478,7 @@ def _make_program(tokens, pages, epochs=1):
         index_cache_scale: pl.InOut[
             pl.Tensor[[TP_SIZE, PAGES, 128, 1, INDEX_DIM // INDEX_CACHE_GROUP], pl.FP8E8M0]
         ],
-        index_block_table: pl.Tensor[[TP_SIZE, 1, PAGES], pl.INT32],
+        index_block_table: pl.Tensor[[TP_SIZE, TOKENS, PAGES], pl.INT32],
         compressed_rope_cos: pl.Tensor[[TP_SIZE, TOKENS, ROPE_DIM // 2], pl.FP32],
         compressed_rope_sin: pl.Tensor[[TP_SIZE, TOKENS, ROPE_DIM // 2], pl.FP32],
         compressor_wkv: pl.Tensor[[TP_SIZE, D, HEAD_DIM], pl.BF16],
@@ -580,7 +581,7 @@ def _make_program_sharded(tokens, pages, epochs=1):
         index_cache_scale: pl.InOut[
             pl.Tensor[[TP_SIZE, PAGES, 128, 1, INDEX_DIM // INDEX_CACHE_GROUP], pl.FP8E8M0]
         ],
-        index_block_table: pl.Tensor[[TP_SIZE, 1, PAGES], pl.INT32],
+        index_block_table: pl.Tensor[[TP_SIZE, TOKENS, PAGES], pl.INT32],
         compressed_rope_cos: pl.Tensor[[TP_SIZE, TOKENS, ROPE_DIM // 2], pl.FP32],
         compressed_rope_sin: pl.Tensor[[TP_SIZE, TOKENS, ROPE_DIM // 2], pl.FP32],
         compressor_wkv: pl.Tensor[[TP_SIZE, D, HEAD_DIM], pl.BF16],
@@ -635,7 +636,46 @@ def _make_program_sharded(tokens, pages, epochs=1):
     return host
 
 
-def build_hc_validation_values(mode, tokens, pages, seed=17, case="random", sharded=False):
+def configure_c1a_requests(values, mode, start_pos):
+    """Configure independent single-token requests and their physical cache rows."""
+    ranks, tokens = values["request_ids"].shape
+    pages = values["index_block_table"].shape[-1]
+    if start_pos is None:
+        values["index_block_table"] = values["index_block_table"].expand(ranks, tokens, pages).contiguous()
+        return
+    lengths = torch.tensor(start_pos, dtype=torch.int32) + 1
+    page_counts = (lengths + 127) // 128
+    offsets = torch.cat((torch.zeros(1, dtype=torch.int32), page_counts.cumsum(0)[:-1]))
+    table = torch.zeros(tokens, pages, dtype=torch.int32)
+    for request, (offset, count) in enumerate(zip(offsets.tolist(), page_counts.tolist())):
+        table[request, :count] = torch.arange(offset, offset + count, dtype=torch.int32)
+    values["index_block_table"] = table.unsqueeze(0).expand(ranks, -1, -1).contiguous()
+    values["request_ids"] = torch.arange(tokens, dtype=torch.int32).repeat(ranks, 1)
+    values["compressed_lens"] = lengths.repeat(ranks, 1)
+    positions = torch.tensor(start_pos, dtype=torch.int64)
+    slots = offsets.long() * 128 + positions
+    values["window_slots"] = slots.repeat(ranks, 1)
+    values["window_indices"].fill_(-1)
+    values["compressed_indices"].fill_(-1)
+    values["candidate_mask"].zero_()
+    for request, (offset, position) in enumerate(zip(offsets.tolist(), positions.tolist())):
+        history = torch.arange(max(0, position - 127), position + 1, dtype=torch.int32)
+        values["window_indices"][:, request, :history.numel()] = offset * 128 + history
+        count = min(position + 1, INDEX_TOPK)
+        values["compressed_indices"][:, request, :count] = offset * 128 + torch.arange(count)
+        values["candidate_mask"][:, request, :position + 1] = 1
+    frequencies = 10000.0 ** (-torch.arange(0, ROPE_DIM, 2).float() / ROPE_DIM)
+    angles = positions.float()[:, None] * frequencies
+    values["rope_cos"] = angles.cos().unsqueeze(0).repeat(ranks, 1, 1)
+    values["rope_sin"] = angles.sin().unsqueeze(0).repeat(ranks, 1, 1)
+    if mode == "full":
+        values["compressed_slots"] = slots.repeat(ranks, 1)
+        compressed_cos, compressed_sin = precompute_rope_tables(int(positions.max()) + 1, compressed_attention=True)
+        values["compressed_rope_cos"] = compressed_cos[positions].unsqueeze(0).repeat(ranks, 1, 1)
+        values["compressed_rope_sin"] = compressed_sin[positions].unsqueeze(0).repeat(ranks, 1, 1)
+
+
+def build_hc_validation_values(mode, tokens, pages, seed=17, case="random", sharded=False, start_pos=None):
     """Attention fixture plus the HC stream and mixing parameters.
 
     With ``sharded`` each rank holds its own contiguous slab of the batch's token
@@ -645,6 +685,7 @@ def build_hc_validation_values(mode, tokens, pages, seed=17, case="random", shar
     import math
 
     values = build_validation_values(mode, tokens, pages, seed, case)
+    configure_c1a_requests(values, mode, start_pos)
     del values["x"]
     generator = torch.Generator().manual_seed(seed)
     local_tokens = (tokens + TP_SIZE - 1) // TP_SIZE if sharded else tokens
@@ -876,9 +917,11 @@ def parse_c1a_hc_args(mode, argv=None):
     parser.add_argument("--check-fp4", action="store_true", default=False,
                         help="run the CPU E2M1 midpoint check and exit")
     common.add_wiring_argument(parser)
+    common.add_start_pos_argument(parser)
     args = parser.parse_args(argv)
     if args.check_fp4:
         raise SystemExit(check_fp4_boundaries())
+    common.resolve_start_pos(parser, args)
     if common.WIRING_SHARDED in common.selected_wirings(args.wiring):
         common.validate_sp_tokens(parser, args)
     if args.tp != TP_SIZE:
@@ -930,7 +973,7 @@ def run_c1a_hc(mode, kernel_factory, golden_case, *, args, devices, sharded=Fals
 
     wiring = common.WIRING_SHARDED if sharded else common.WIRING_REPLICATED
     host = kernel_factory(args.tokens, args.pages, args.epochs)
-    values = build_hc_validation_values(mode, args.tokens, args.pages, args.seed, args.case, sharded)
+    values = build_hc_validation_values(mode, args.tokens, args.pages, args.seed, args.case, sharded, args.start_pos)
     # Clone per call: the harness builds the golden scratch from these same specs, and a
     # tensor init_value whose dtype already matches comes back as itself.
     specs = [
