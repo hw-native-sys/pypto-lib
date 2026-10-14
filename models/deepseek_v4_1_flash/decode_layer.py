@@ -209,7 +209,7 @@ def decode_layer(
     window_cache_scale: pl.InOut[
         pl.Tensor[
             [ORI_BLOCKS_DYN, 128, 1, HEAD_DIM // WINDOW_CACHE_GROUP],
-            pl.FP8E8M0,
+            pl.BF16,
         ]
     ],
     compressed_cache: pl.InOut[
@@ -218,7 +218,7 @@ def decode_layer(
     compressed_cache_scale: pl.InOut[
         pl.Tensor[
             [CMP_BLOCKS_DYN, 128, 1, HEAD_DIM // COMPRESSED_CACHE_GROUP],
-            pl.FP8E4M3FN,
+            pl.BF16,
         ]
     ],
     request_ids: pl.Tensor[[T_DYN], pl.INT32],
@@ -461,7 +461,7 @@ def l3_decode_layer(
     window_cache_scale: pl.InOut[
         pl.Tensor[
             [EP_SIZE, ORI_BLOCKS_DYN, 128, 1, HEAD_DIM // WINDOW_CACHE_GROUP],
-            pl.FP8E8M0,
+            pl.BF16,
         ]
     ],
     compressed_cache: pl.InOut[
@@ -470,7 +470,7 @@ def l3_decode_layer(
     compressed_cache_scale: pl.InOut[
         pl.Tensor[
             [EP_SIZE, CMP_BLOCKS_DYN, 128, 1, HEAD_DIM // COMPRESSED_CACHE_GROUP],
-            pl.FP8E4M3FN,
+            pl.BF16,
         ]
     ],
     request_ids: pl.Tensor[[EP_SIZE, T_DYN], pl.INT32],
@@ -1150,7 +1150,7 @@ def _attention_values() -> dict[str, torch.Tensor | None]:
     index_wq_b, index_wq_b_scale = _mxfp8_weight(64, 64)
     window_cache, window_cache_scale = quantize_mxfp8_cache(torch.zeros(1, 128, 1, 64))
     compressed_cache, compressed_cache_scale = quantize_mxfp4_cache(
-        torch.randn(1, 128, 1, 64), group_size=16, scale_format="e4m3"
+        torch.randn(1, 128, 1, 64), group_size=16, scale_format="bf16"
     )
     index_cache, index_cache_scale = quantize_mxfp4_cache(
         torch.randn(1, 128, 1, 32), group_size=32, scale_format="e8m0"

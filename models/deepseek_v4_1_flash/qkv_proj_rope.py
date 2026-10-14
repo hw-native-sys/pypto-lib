@@ -47,7 +47,7 @@ def prefill_c1a_publish_window(
     kv: pl.Tensor[[T_DYN, HEAD_DIM], pl.BF16],
     slots: pl.Tensor[[T_DYN], pl.INT64],
     cache: pl.Tensor[[ORI_BLOCKS_DYN, 128, 1, HEAD_DIM], pl.FP8E4M3FN],
-    scales: pl.Tensor[[ORI_BLOCKS_DYN, 128, 1, HEAD_DIM // 32], pl.FP8E8M0],
+    scales: pl.Tensor[[ORI_BLOCKS_DYN, 128, 1, HEAD_DIM // 32], pl.BF16],
     num_tokens: pl.Scalar[pl.INT32],
     cache_ready: pl.Scalar[pl.TASK_ID],
 ):
@@ -64,18 +64,10 @@ def prefill_c1a_publish_window(
             source = pl.set_validshape(pl.fillpad(source, pad_value=pl.PadValue.zero), 1, HEAD_DIM * 2)
             value = pl.reshape(pl.cast(source, pl.FP32), [HEAD_DIM // 16, 32])
             amax = pl.maximum(pl.row_max(pl.abs(value)), 1e-4)
-            raw = pl.mul(amax, 1.0 / 448.0)
-            bits = pl.reinterpret_view(raw, pl.INT32)
-            exponent = pl.shrs(pl.add(bits, 8388607), 23)
-            scale = pl.reinterpret_view(pl.shls(exponent, 23), pl.FP32)
-            payload = pl.cast(pl.row_expand_div(value, scale), pl.FP8E4M3FN, mode="rint")
+            scale = pl.cast(pl.mul(amax, 1.0 / 448.0), pl.BF16, mode="rint")
+            payload = pl.cast(pl.row_expand_div(value, pl.cast(scale, pl.FP32)), pl.FP8E4M3FN, mode="rint")
             flat[slot:slot + 1, :] = pl.set_validshape(pl.reshape(payload, [1, HEAD_DIM * 2]), 1, HEAD_DIM)
-            signed_exponent = pl.sub(exponent, pl.mul(pl.shrs(exponent, 7), 256))
-            codes = pl.cast(signed_exponent, pl.INT8)
-            encoded = pl.reinterpret_view(pl.reinterpret_view(codes, pl.UINT8), pl.FP8E8M0)
-            encoded_row = pl.reshape(encoded, [1, HEAD_DIM // 16])
-            encoded_valid = pl.set_validshape(encoded_row, 1, HEAD_DIM // 32)
-            scale_flat[slot:slot + 1, :] = encoded_valid
+            scale_flat[slot:slot + 1, :] = pl.set_validshape(pl.reshape(scale, [1, HEAD_DIM // 16]), 1, HEAD_DIM // 32)
     return cache, scales
 
 

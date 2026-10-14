@@ -145,12 +145,12 @@ def prefill_c1a_partial(
     window_cache: pl.Tensor[[ORI_BLOCKS_DYN, 128, 1, HEAD_DIM], pl.FP8E4M3FN],
     window_cache_scale: pl.Tensor[
         [ORI_BLOCKS_DYN, 128, 1, HEAD_DIM // WINDOW_CACHE_GROUP],
-        pl.FP8E8M0,
+        pl.BF16,
     ],
     compressed_cache: pl.Tensor[[CMP_BLOCKS_DYN, 128, 1, HEAD_DIM // 2], pl.UINT8],
     compressed_cache_scale: pl.Tensor[
         [CMP_BLOCKS_DYN, 128, 1, HEAD_DIM // COMPRESSED_CACHE_GROUP],
-        pl.FP8E4M3FN,
+        pl.BF16,
     ],
     compressed_indices: pl.Tensor[[T_DYN, INDEX_TOPK], pl.INT32],
     output: pl.Tensor[[T_DYN, D], pl.FP32],
@@ -214,7 +214,7 @@ def make_prefill_publish_decoder():
         compressed_slots: pl.Tensor[[T_DYN], pl.INT64],
         compressed_cache: pl.Tensor[[CMP_BLOCKS_DYN, 128, 1, HEAD_DIM // 2], pl.UINT8],
         compressed_cache_scale: pl.Tensor[
-            [CMP_BLOCKS_DYN, 128, 1, HEAD_DIM // COMPRESSED_CACHE_GROUP], pl.FP8E4M3FN
+            [CMP_BLOCKS_DYN, 128, 1, HEAD_DIM // COMPRESSED_CACHE_GROUP], pl.BF16
         ],
         index_cache: pl.Tensor[[INDEX_BLOCKS_DYN, 128, 1, INDEX_DIM // 2], pl.UINT8],
         index_cache_scale: pl.Tensor[
@@ -366,10 +366,10 @@ def make_prefill_attn_c1a_full(indexer, reducer=prefill_tp_output_all_reduce, ou
         window_slots: pl.Tensor[[T_DYN], pl.INT64],
         window_indices: pl.Tensor[[T_DYN, 128], pl.INT32],
         window_cache: pl.Tensor[[ORI_BLOCKS_DYN, 128, 1, HEAD_DIM], pl.FP8E4M3FN],
-        window_cache_scale: pl.Tensor[[ORI_BLOCKS_DYN, 128, 1, HEAD_DIM // WINDOW_CACHE_GROUP], pl.FP8E8M0],
+        window_cache_scale: pl.Tensor[[ORI_BLOCKS_DYN, 128, 1, HEAD_DIM // WINDOW_CACHE_GROUP], pl.BF16],
         compressed_cache: pl.Tensor[[CMP_BLOCKS_DYN, 128, 1, HEAD_DIM // 2], pl.UINT8],
         compressed_cache_scale: pl.Tensor[
-            [CMP_BLOCKS_DYN, 128, 1, HEAD_DIM // COMPRESSED_CACHE_GROUP], pl.FP8E4M3FN
+            [CMP_BLOCKS_DYN, 128, 1, HEAD_DIM // COMPRESSED_CACHE_GROUP], pl.BF16
         ],
         request_ids: pl.Tensor[[T_DYN], pl.INT32],
         compressed_lens: pl.Tensor[[T_DYN], pl.INT32],
@@ -604,10 +604,10 @@ def make_prefill_attn_c1a_reuse(reducer=prefill_tp_output_all_reduce, output_tok
         window_slots: pl.Tensor[[T_DYN], pl.INT64],
         window_indices: pl.Tensor[[T_DYN, 128], pl.INT32],
         window_cache: pl.Tensor[[ORI_BLOCKS_DYN, 128, 1, HEAD_DIM], pl.FP8E4M3FN],
-        window_cache_scale: pl.Tensor[[ORI_BLOCKS_DYN, 128, 1, HEAD_DIM // WINDOW_CACHE_GROUP], pl.FP8E8M0],
+        window_cache_scale: pl.Tensor[[ORI_BLOCKS_DYN, 128, 1, HEAD_DIM // WINDOW_CACHE_GROUP], pl.BF16],
         compressed_cache: pl.Tensor[[CMP_BLOCKS_DYN, 128, 1, HEAD_DIM // 2], pl.UINT8],
         compressed_cache_scale: pl.Tensor[
-            [CMP_BLOCKS_DYN, 128, 1, HEAD_DIM // COMPRESSED_CACHE_GROUP], pl.FP8E4M3FN
+            [CMP_BLOCKS_DYN, 128, 1, HEAD_DIM // COMPRESSED_CACHE_GROUP], pl.BF16
         ],
         compressed_indices: pl.Tensor[[T_DYN, INDEX_TOPK], pl.INT32],
         output_window: pld.DistributedTensor[[PREFILL_MAX_TOKENS, D], pl.FP32],
@@ -770,10 +770,10 @@ def make_prefill_attn_c1a_reindex(indexer, reducer=prefill_tp_output_all_reduce,
         window_slots: pl.Tensor[[T_DYN], pl.INT64],
         window_indices: pl.Tensor[[T_DYN, 128], pl.INT32],
         window_cache: pl.Tensor[[ORI_BLOCKS_DYN, 128, 1, HEAD_DIM], pl.FP8E4M3FN],
-        window_cache_scale: pl.Tensor[[ORI_BLOCKS_DYN, 128, 1, HEAD_DIM // WINDOW_CACHE_GROUP], pl.FP8E8M0],
+        window_cache_scale: pl.Tensor[[ORI_BLOCKS_DYN, 128, 1, HEAD_DIM // WINDOW_CACHE_GROUP], pl.BF16],
         compressed_cache: pl.Tensor[[CMP_BLOCKS_DYN, 128, 1, HEAD_DIM // 2], pl.UINT8],
         compressed_cache_scale: pl.Tensor[
-            [CMP_BLOCKS_DYN, 128, 1, HEAD_DIM // COMPRESSED_CACHE_GROUP], pl.FP8E4M3FN
+            [CMP_BLOCKS_DYN, 128, 1, HEAD_DIM // COMPRESSED_CACHE_GROUP], pl.BF16
         ],
         request_ids: pl.Tensor[[T_DYN], pl.INT32],
         compressed_lens: pl.Tensor[[T_DYN], pl.INT32],
@@ -883,7 +883,7 @@ def prefill_attn_c1a_full_test(
     window_indices: pl.Tensor[[T_DYN, 128], pl.INT32],
     window_cache: pl.InOut[pl.Tensor[[ORI_BLOCKS_DYN, 128, 1, HEAD_DIM], pl.FP8E4M3FN]],
     window_cache_scale: pl.InOut[
-        pl.Tensor[[ORI_BLOCKS_DYN, 128, 1, HEAD_DIM // WINDOW_CACHE_GROUP], pl.FP8E8M0]
+        pl.Tensor[[ORI_BLOCKS_DYN, 128, 1, HEAD_DIM // WINDOW_CACHE_GROUP], pl.BF16]
     ],
     compressed_cache: pl.InOut[
         pl.Tensor[[CMP_BLOCKS_DYN, 128, 1, HEAD_DIM // 2], pl.UINT8]
@@ -891,7 +891,7 @@ def prefill_attn_c1a_full_test(
     compressed_cache_scale: pl.InOut[
         pl.Tensor[
             [CMP_BLOCKS_DYN, 128, 1, HEAD_DIM // COMPRESSED_CACHE_GROUP],
-            pl.FP8E4M3FN,
+            pl.BF16,
         ]
     ],
     request_ids: pl.Tensor[[T_DYN], pl.INT32],
@@ -972,7 +972,7 @@ def l3_prefill_attn_c1a_full_test(
     window_cache_scale: pl.InOut[
         pl.Tensor[
             [TP_SIZE, ORI_BLOCKS_DYN, 128, 1, HEAD_DIM // WINDOW_CACHE_GROUP],
-            pl.FP8E8M0,
+            pl.BF16,
         ]
     ],
     compressed_cache: pl.InOut[
@@ -981,7 +981,7 @@ def l3_prefill_attn_c1a_full_test(
     compressed_cache_scale: pl.InOut[
         pl.Tensor[
             [TP_SIZE, CMP_BLOCKS_DYN, 128, 1, HEAD_DIM // COMPRESSED_CACHE_GROUP],
-            pl.FP8E4M3FN,
+            pl.BF16,
         ]
     ],
     request_ids: pl.Tensor[[TP_SIZE, T_DYN], pl.INT32],
@@ -1109,7 +1109,7 @@ def validate(argv=None):
         "compressed_slots",
         MXFP4_CACHE_MAX_RELATIVE_L2,
         group_size=COMPRESSED_CACHE_GROUP,
-        scale_format="e4m3",
+        scale_format="bf16",
     )
     index_cache_compare = quantized_cache_compare(
         "index_cache",

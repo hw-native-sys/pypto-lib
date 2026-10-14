@@ -193,27 +193,26 @@ def quantize_mxfp4_weight(weight: torch.Tensor) -> tuple[torch.Tensor, torch.Ten
 
 
 def quantize_mxfp8_cache(value: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
-    """Quantize the last dimension to E4M3 payload and group-32 E8M0 scales."""
+    """Quantize the last dimension to E4M3 payload and group-32 BF16 scales."""
     if value.shape[-1] % MX_GROUP:
         raise ValueError("MXFP8 cache width must be divisible by 32")
     grouped = value.float().unflatten(-1, (-1, MX_GROUP))
-    amax = grouped.abs().amax(dim=-1)
-    exponent = torch.ceil(torch.log2((amax / 448.0).clamp_min(2.0**-127)))
-    scale = torch.exp2(exponent.clamp(-127, 128))
-    payload = (grouped / scale.unsqueeze(-1)).clamp(-448.0, 448.0)
-    return payload.flatten(-2).to(torch.float8_e4m3fn), encode_e8m0(scale)
+    amax = grouped.abs().amax(dim=-1).clamp_min(1e-4)
+    scale = (amax / 448.0).to(torch.bfloat16)
+    payload = (grouped / scale.float().unsqueeze(-1)).clamp(-448.0, 448.0)
+    return payload.flatten(-2).to(torch.float8_e4m3fn), scale
 
 
-def dequantize_mxfp8_cache(payload: torch.Tensor, scale_e8m0: torch.Tensor) -> torch.Tensor:
+def dequantize_mxfp8_cache(payload: torch.Tensor, scale_bf16: torch.Tensor) -> torch.Tensor:
     """Decode an MXFP8 cache tensor whose groups lie on the last dimension."""
-    scales = decode_e8m0(scale_e8m0).repeat_interleave(MX_GROUP, dim=-1)
+    scales = scale_bf16.float().repeat_interleave(MX_GROUP, dim=-1)
     return payload.float() * scales
 
 
 def quantize_mxfp4_cache(
     value: torch.Tensor, group_size: int, scale_format: str
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    """Quantize the last dimension to packed E2M1 with E4M3 or E8M0 scales."""
+    """Quantize the last dimension to packed E2M1 with E4M3, E8M0 or BF16 scales."""
     if value.shape[-1] % group_size:
         raise ValueError(f"MXFP4 cache width must be divisible by {group_size}")
     grouped = value.float().unflatten(-1, (-1, group_size))
@@ -225,6 +224,9 @@ def quantize_mxfp4_cache(
         stored_scale = encode_e8m0(scale_value)
     elif scale_format == "e4m3":
         stored_scale = raw_scale.clamp(max=448.0).to(torch.float8_e4m3fn)
+        scale_value = stored_scale.float()
+    elif scale_format == "bf16":
+        stored_scale = raw_scale.to(torch.bfloat16)
         scale_value = stored_scale.float()
     else:
         raise ValueError(f"unsupported MXFP4 cache scale format {scale_format!r}")
@@ -242,7 +244,7 @@ def dequantize_mxfp4_cache(
     """Decode a packed E2M1 cache tensor with last-dimension MX groups."""
     if scale_format == "e8m0":
         scale_value = decode_e8m0(scale)
-    elif scale_format == "e4m3":
+    elif scale_format in ("e4m3", "bf16"):
         scale_value = scale.float()
     else:
         raise ValueError(f"unsupported MXFP4 cache scale format {scale_format!r}")

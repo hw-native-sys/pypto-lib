@@ -43,11 +43,11 @@ def publish_compressed_cache(
     cache: pl.Tensor[[CMP_BLOCKS_DYN, 128, 1, HEAD_DIM // 2], pl.UINT8],
     scales: pl.Tensor[
         [CMP_BLOCKS_DYN, 128, 1, HEAD_DIM // COMPRESSED_CACHE_GROUP],
-        pl.FP8E4M3FN,
+        pl.BF16,
     ],
     num_tokens: pl.Scalar[pl.INT32],
 ):
-    """Publish ratio-1 KV rows as group-16 MXFP4 with E4M3 scales."""
+    """Publish ratio-1 KV rows as group-16 MXFP4 with BF16 scales."""
     cache_rows = pl.tensor.dim(cache, 0) * 128
     cache_flat = pl.reshape(cache, [cache_rows, HEAD_DIM // 2])
     scale_flat = pl.reshape(scales, [cache_rows, HEAD_DIM // COMPRESSED_CACHE_GROUP])
@@ -60,11 +60,8 @@ def publish_compressed_cache(
             grouped = pl.reshape(source, [HEAD_DIM // COMPRESSED_CACHE_GROUP, COMPRESSED_CACHE_GROUP])
             maximum_tmp = pl.create_tile([HEAD_DIM // COMPRESSED_CACHE_GROUP, 128], dtype=pl.FP32)
             maximum = pl.row_max(pl.abs(grouped), tmp_tile=maximum_tmp)
-            raw_scale = pl.minimum(
-                pl.maximum(pl.mul(maximum, 1.0 / 6.0), 2.0**-9),
-                448.0,
-            )
-            stored_scale = pl.cast(raw_scale, pl.FP8E4M3FN, mode="rint")
+            raw_scale = pl.maximum(pl.mul(maximum, 1.0 / 6.0), 2.0**-9)
+            stored_scale = pl.cast(raw_scale, pl.BF16, mode="rint")
             scale = pl.cast(stored_scale, pl.FP32)
             normalized = pl.row_expand_div(grouped, scale)
             normalized = pl.reshape(normalized, [1, HEAD_DIM])

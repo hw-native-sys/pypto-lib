@@ -199,9 +199,8 @@ def make_fixture_values(token_count: int, case_name: str) -> dict[str, torch.Ten
     index_wq_b, index_wq_b_scale = _ranked_fp8_weight(Q_LORA, INDEX_H * INDEX_DIM, shared=True)
     window_value = torch.randn(cache_blocks, CASE_PAGE, 1, HEAD_DIM).mul_(0.05)
     window_cache, window_cache_scale = quantize_mxfp8_cache(window_value)
-    window_cache_scale = window_cache_scale.view(torch.float8_e8m0fnu)
     compressed_value = torch.randn(cache_blocks, CASE_PAGE, 1, HEAD_DIM).mul_(0.05)
-    compressed_cache, compressed_cache_scale = quantize_mxfp4_cache(compressed_value, group_size=COMPRESSED_CACHE_GROUP, scale_format='e4m3')
+    compressed_cache, compressed_cache_scale = quantize_mxfp4_cache(compressed_value, group_size=COMPRESSED_CACHE_GROUP, scale_format='bf16')
     index_value = torch.randn(cache_blocks, CASE_PAGE, 1, INDEX_DIM).mul_(0.05)
     index_cache, index_cache_scale = quantize_mxfp4_cache(index_value, group_size=INDEX_CACHE_GROUP, scale_format='e8m0')
     index_cache_scale = index_cache_scale.view(torch.float8_e8m0fnu)
@@ -409,7 +408,7 @@ def _selected_output_reference(inputs: dict[str, torch.Tensor], expected_outputs
             return source[name][rank]
         query, _, _ = qkv_proj_rope(tensor('x')[:active], tensor('wq_a'), tensor('wq_a_scale'), tensor('q_norm_weight'), tensor('wq_b'), tensor('wq_b_scale'), tensor('wkv'), tensor('wkv_scale'), tensor('kv_norm_weight'), tensor('rope_cos')[:active], tensor('rope_sin')[:active])
         window = dequantize_mxfp8_cache(tensor('window_cache'), tensor('window_cache_scale'))
-        compressed = dequantize_mxfp4_cache(tensor('compressed_cache'), tensor('compressed_cache_scale'), group_size=COMPRESSED_CACHE_GROUP, scale_format='e4m3')
+        compressed = dequantize_mxfp4_cache(tensor('compressed_cache'), tensor('compressed_cache_scale'), group_size=COMPRESSED_CACHE_GROUP, scale_format='bf16')
         attended = golden_prefill_c1a_attention(query, window.to(query.dtype), tensor('window_indices')[:active], compressed.to(query.dtype), selected[rank], tensor('attn_sink'))
         partials.append(_project_output(attended, tensor('rope_cos')[:active], tensor('rope_sin')[:active], tensor('wo_a'), tensor('wo_b'), tensor('wo_b_scale'), output_dtype=torch.float32))
     return _reduce_tp_partials(partials).unsqueeze(0).expand(selected.shape[0], -1, -1)
@@ -1304,12 +1303,12 @@ def prepare_resident_inputs(
         "state_block_table": state_table,
         "window_cache": torch.zeros((*window_shape, M.head_dim), dtype=torch.uint8).view(torch.float8_e4m3fn),
         "window_scales": torch.full(
-            (*window_shape, M.head_dim // C.WINDOW_CACHE_GROUP), 127, dtype=torch.uint8
-        ).view(torch.float8_e8m0fnu),
+            (*window_shape, M.head_dim // C.WINDOW_CACHE_GROUP), 1.0, dtype=torch.bfloat16
+        ),
         "compressed_cache": torch.zeros((*source_shape, M.head_dim // 2), dtype=torch.uint8),
         "compressed_scales": torch.full(
-            (*source_shape, M.head_dim // C.COMPRESSED_CACHE_GROUP), 0x38, dtype=torch.uint8
-        ).view(torch.float8_e4m3fn),
+            (*source_shape, M.head_dim // C.COMPRESSED_CACHE_GROUP), 1.0, dtype=torch.bfloat16
+        ),
         "index_cache": torch.zeros((*source_shape, M.index_head_dim // 2), dtype=torch.uint8),
         "index_scales": torch.full(
             (*source_shape, M.index_head_dim // C.INDEX_CACHE_GROUP), 127, dtype=torch.uint8
