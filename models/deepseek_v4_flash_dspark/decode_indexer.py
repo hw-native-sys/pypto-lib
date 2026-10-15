@@ -413,35 +413,20 @@ def indexer_score_topk_stream(
                     if step >= 2:
                         pl.system.sync_wait(SCORE_CONSUMED_EVENT, pipe=pl.PipeType.MTE2, core_type=pl.KernelType.AIC)
                     transfer_row = (worker * 2 + step % 2) * STREAM_QUERY_TILE
-                    # Keep the two Key slots live independently of Score L1.
-                    # Stage QK(i) before reducing Score(i-1).
-                    key_pool = pl.tile.create([2 * STREAM_PANEL_TILE, IDX_HEAD_DIM], pl.INT8, target_memory=pl.Mem.Mat)
-                    previous_score = pl.tile.create([STREAM_QUERY_TILE * IDX_N_HEADS, STREAM_PANEL_TILE], pl.FP16, target_memory=pl.Mem.Mat)
-                    for page in pl.unroll(STREAM_PANEL_TILE // BLOCK_SIZE):
-                        logical = pl.min(begin + step * STREAM_TILE + page * BLOCK_SIZE, (visible - 1) // BLOCK_SIZE * BLOCK_SIZE)
-                        block = pl.cast(pl.read(idx_block_table_flat, [batch * IDX_MAX_BLOCKS + logical // BLOCK_SIZE]), pl.INDEX)
-                        key_pool = pl.tile.gather_row(key_pool, kv_cache_i8_flat, [page * BLOCK_SIZE, 0], [block * BLOCK_SIZE, 0], [BLOCK_SIZE, IDX_HEAD_DIM])
-                    for panel in pl.unroll(STREAM_TILE // STREAM_PANEL_TILE):
-                        key = pl.tile.extract(pl.tile.transpose_view(key_pool), 0, panel % 2 * STREAM_PANEL_TILE, [IDX_HEAD_DIM, STREAM_PANEL_TILE], target_memory=pl.Mem.Right)
-                        if panel + 1 < STREAM_TILE // STREAM_PANEL_TILE:
-                            for page in pl.unroll(STREAM_PANEL_TILE // BLOCK_SIZE):
-                                logical = pl.min(begin + step * STREAM_TILE + (panel + 1) * STREAM_PANEL_TILE + page * BLOCK_SIZE, (visible - 1) // BLOCK_SIZE * BLOCK_SIZE)
-                                block = pl.cast(pl.read(idx_block_table_flat, [batch * IDX_MAX_BLOCKS + logical // BLOCK_SIZE]), pl.INDEX)
-                                key_pool = pl.tile.gather_row(key_pool, kv_cache_i8_flat, [(panel + 1) % 2 * STREAM_PANEL_TILE + page * BLOCK_SIZE, 0], [block * BLOCK_SIZE, 0], [BLOCK_SIZE, IDX_HEAD_DIM])
-                        current_score = pl.tile.create([STREAM_QUERY_TILE * IDX_N_HEADS, STREAM_PANEL_TILE], pl.FP16, target_memory=pl.Mem.Mat)
-                        if panel > 0:
-                            previous_right = pl.tile.move(previous_score, target_memory=pl.Mem.Right)
-                            qk = pl.tile.matmul(query_left, key)
-                            reduced = pl.tile.matmul(coef_left, previous_right)
-                            current_score = pl.tile.assemble(current_score, qk, [0, 0], pre_quant=SCORE_FIXPIPE_SCALE, pre_relu=True)
-                            pl.tile.store(pl.tile.set_validshape(reduced, STREAM_QUERY_TILE, STREAM_PANEL_TILE), [transfer_row, (panel - 1) * STREAM_PANEL_TILE], transfer)
-                        else:
-                            qk = pl.tile.matmul(query_left, key)
-                            current_score = pl.tile.assemble(current_score, qk, [0, 0], pre_quant=SCORE_FIXPIPE_SCALE, pre_relu=True)
-                        previous_score = current_score
-                    last_right = pl.tile.move(previous_score, target_memory=pl.Mem.Right)
-                    last_reduced = pl.tile.matmul(coef_left, last_right)
-                    pl.tile.store(pl.tile.set_validshape(last_reduced, STREAM_QUERY_TILE, STREAM_PANEL_TILE), [transfer_row, STREAM_TILE - STREAM_PANEL_TILE], transfer)
+                    # Pipeline panel-local Key and Score tiles with two stages.
+                    for panel in pl.pipeline(STREAM_TILE // STREAM_PANEL_TILE, stage=2):
+                        key_panel = pl.tile.create([STREAM_PANEL_TILE, IDX_HEAD_DIM], pl.INT8, target_memory=pl.Mem.Mat)
+                        for page in pl.unroll(STREAM_PANEL_TILE // BLOCK_SIZE):
+                            logical = pl.min(begin + step * STREAM_TILE + panel * STREAM_PANEL_TILE + page * BLOCK_SIZE, (visible - 1) // BLOCK_SIZE * BLOCK_SIZE)
+                            block = pl.cast(pl.read(idx_block_table_flat, [batch * IDX_MAX_BLOCKS + logical // BLOCK_SIZE]), pl.INDEX)
+                            key_panel = pl.tile.gather_row(key_panel, kv_cache_i8_flat, [page * BLOCK_SIZE, 0], [block * BLOCK_SIZE, 0], [BLOCK_SIZE, IDX_HEAD_DIM])
+                        key = pl.tile.move(pl.tile.transpose_view(key_panel), target_memory=pl.Mem.Right)
+                        qk = pl.tile.matmul(query_left, key)
+                        score = pl.tile.create([STREAM_QUERY_TILE * IDX_N_HEADS, STREAM_PANEL_TILE], pl.FP16, target_memory=pl.Mem.Mat)
+                        score = pl.tile.assemble(score, qk, [0, 0], pre_quant=SCORE_FIXPIPE_SCALE, pre_relu=True)
+                        score_right = pl.tile.move(score, target_memory=pl.Mem.Right)
+                        reduced = pl.tile.matmul(coef_left, score_right)
+                        pl.tile.store(pl.tile.set_validshape(reduced, STREAM_QUERY_TILE, STREAM_PANEL_TILE), [transfer_row, panel * STREAM_PANEL_TILE], transfer)
                     pl.system.sync_set(SCORE_READY_EVENT, pipe=pl.PipeType.FIX, ffts_mode=2, core_type=pl.KernelType.AIC)
                 for drain in pl.range(pl.min(steps, 2)):
                     pl.system.sync_wait(SCORE_CONSUMED_EVENT, pipe=pl.PipeType.MTE2, core_type=pl.KernelType.AIC)
