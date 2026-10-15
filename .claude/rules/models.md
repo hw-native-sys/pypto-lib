@@ -89,3 +89,19 @@ New or modified code must follow the
 [`fmt-coding-style` workflow](../skills/fmt-coding-style/SKILL.md), including
 golden and validation code. Do not broaden a routine change into whole-file
 formatting unless requested or required by the active workflow.
+
+## Default validation
+
+Use the existing [golden harness](../../docs/run-and-validate/golden-harness.md)
+for executable operator files. A default invocation should, where applicable,
+validate a bounded set of meaningful scenarios covering relevant shapes,
+branches, and boundaries on the selected platform and devices. Validate each
+case and make the invocation fail if any case fails.
+
+Support performance configurations through explicit options, rather than as
+validation defaults. Large benchmark shapes and repeated timing sweeps must
+not replace the default correctness suite. Keep case selection and defaults
+in the owning executable file, not in model configuration.
+
+When implementing or optimizing models, avoid changing `tests/` unless the
+model change specifically requires it.
