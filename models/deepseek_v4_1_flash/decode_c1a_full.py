@@ -37,6 +37,7 @@ from config import (
     DECODE_INPUT_MAX_TOKENS,
     DECODE_MAX_TOKENS,
     INDEX_CACHE_GROUP,
+    MAX_BATCH_PER_DP,
     WINDOW_CACHE_GROUP,
     FLASH as M,
     B_DYN,
@@ -424,10 +425,11 @@ def decode_c1a_full_sharded_test(
     )
 
 
-def _make_program(tokens, pages, epochs=1):
+def _make_program(tokens, pages, requests, epochs=1):
     """Build a distributed host using static packed-FP4 storage dimensions."""
     TOKENS = tokens
     PAGES = pages
+    REQUESTS = requests
     EPOCHS = epochs
 
     @pl.jit.host
@@ -468,7 +470,7 @@ def _make_program(tokens, pages, epochs=1):
         index_cache_scale: pl.InOut[
             pl.Tensor[[TP_SIZE, PAGES, 128, 1, INDEX_DIM // INDEX_CACHE_GROUP], pl.FP8E8M0]
         ],
-        index_block_table: pl.Tensor[[TP_SIZE, TOKENS, PAGES], pl.INT32],
+        index_block_table: pl.Tensor[[TP_SIZE, REQUESTS, PAGES], pl.INT32],
         compressed_rope_cos: pl.Tensor[[TP_SIZE, TOKENS, ROPE_DIM // 2], pl.FP32],
         compressed_rope_sin: pl.Tensor[[TP_SIZE, TOKENS, ROPE_DIM // 2], pl.FP32],
         compressor_wkv: pl.Tensor[[TP_SIZE, D, HEAD_DIM], pl.BF16],
@@ -519,17 +521,18 @@ def _make_program(tokens, pages, epochs=1):
     return host
 
 
-def make_program(tokens, pages, epochs=1, sharded=False):
+def make_program(tokens, pages, requests=1, epochs=1, sharded=False):
     """Build a distributed host; ``sharded`` selects the sequence-parallel wiring."""
     if sharded:
-        return _make_program_sharded(tokens, pages, epochs)
-    return _make_program(tokens, pages, epochs)
+        return _make_program_sharded(tokens, pages, requests, epochs)
+    return _make_program(tokens, pages, requests, epochs)
 
 
-def _make_program_sharded(tokens, pages, epochs=1):
+def _make_program_sharded(tokens, pages, requests, epochs=1):
     """Build the sequence-parallel host: ranks own token slabs, gather for Attention."""
     TOKENS = tokens
     PAGES = pages
+    REQUESTS = requests
     EPOCHS = epochs
     LOCAL_TOKENS = (TOKENS + TP_SIZE - 1) // TP_SIZE
 
@@ -571,7 +574,7 @@ def _make_program_sharded(tokens, pages, epochs=1):
         index_cache_scale: pl.InOut[
             pl.Tensor[[TP_SIZE, PAGES, 128, 1, INDEX_DIM // INDEX_CACHE_GROUP], pl.FP8E8M0]
         ],
-        index_block_table: pl.Tensor[[TP_SIZE, TOKENS, PAGES], pl.INT32],
+        index_block_table: pl.Tensor[[TP_SIZE, REQUESTS, PAGES], pl.INT32],
         compressed_rope_cos: pl.Tensor[[TP_SIZE, TOKENS, ROPE_DIM // 2], pl.FP32],
         compressed_rope_sin: pl.Tensor[[TP_SIZE, TOKENS, ROPE_DIM // 2], pl.FP32],
         compressor_wkv: pl.Tensor[[TP_SIZE, D, HEAD_DIM], pl.BF16],
@@ -631,7 +634,6 @@ def configure_c1a_requests(values, mode, start_pos):
     ranks, tokens = values["request_ids"].shape
     pages = values["index_block_table"].shape[-1]
     if start_pos is None:
-        values["index_block_table"] = values["index_block_table"].expand(ranks, tokens, pages).contiguous()
         return
     lengths = torch.tensor(start_pos, dtype=torch.int32) + 1
     page_counts = (lengths + 127) // 128
@@ -665,7 +667,7 @@ def configure_c1a_requests(values, mode, start_pos):
         values["compressed_rope_sin"] = compressed_sin[positions].unsqueeze(0).repeat(ranks, 1, 1)
 
 
-def build_hc_validation_values(mode, tokens, pages, seed=17, case="random", sharded=False, start_pos=None):
+def build_hc_validation_values(mode, tokens, pages, requests=1, seed=17, case="random", sharded=False, start_pos=None):
     """Attention fixture plus the HC stream and mixing parameters.
 
     With ``sharded`` each rank holds its own contiguous slab of the batch's token
@@ -674,7 +676,7 @@ def build_hc_validation_values(mode, tokens, pages, seed=17, case="random", shar
     """
     import math
 
-    values = build_validation_values(mode, tokens, pages, seed, case)
+    values = build_validation_values(mode, tokens, pages, requests, seed, case)
     configure_c1a_requests(values, mode, start_pos)
     del values["x"]
     generator = torch.Generator().manual_seed(seed)
@@ -895,6 +897,7 @@ def parse_c1a_hc_args(mode, argv=None):
     )
     parser.add_argument("--tokens", type=int, default=1)
     parser.add_argument("--pages", type=int, default=8)
+    parser.add_argument("--requests", type=int, default=1)
     parser.add_argument("--epochs", type=int, default=1)
     parser.add_argument("--seed", type=int, default=17)
     parser.add_argument("--case", choices=["random", "ragged", "masked", "sink"], default="random")
@@ -924,6 +927,8 @@ def parse_c1a_hc_args(mode, argv=None):
         parser.error(f"device IDs must be {TP_SIZE} distinct nonnegative integers, one per rank")
     if not 1 <= args.tokens <= min(DECODE_MAX_TOKENS, args.pages * 128) or args.pages < 1 or args.epochs < 1:
         parser.error(f"require 1 <= tokens <= min({DECODE_MAX_TOKENS}, pages * 128), pages >= 1, epochs >= 1")
+    if not 1 <= args.requests <= min(MAX_BATCH_PER_DP, args.tokens):
+        parser.error(f"require 1 <= requests <= min({MAX_BATCH_PER_DP}, tokens {args.tokens})")
     return args, devices
 
 
@@ -935,7 +940,7 @@ def make_wiring_program(factory, wiring):
     mode's host.
     """
     if wiring == _decode_utils.WIRING_SHARDED:
-        return lambda tokens, pages, epochs: factory(tokens, pages, epochs, sharded=True)
+        return lambda tokens, pages, requests, epochs: factory(tokens, pages, requests, epochs, sharded=True)
     return factory
 
 
@@ -962,8 +967,8 @@ def run_c1a_hc(mode, kernel_factory, golden_case, *, args, devices, sharded=Fals
     from pypto.ir import DistributedConfig
 
     wiring = _decode_utils.WIRING_SHARDED if sharded else _decode_utils.WIRING_REPLICATED
-    host = kernel_factory(args.tokens, args.pages, args.epochs)
-    values = build_hc_validation_values(mode, args.tokens, args.pages, args.seed, args.case, sharded, args.start_pos)
+    host = kernel_factory(args.tokens, args.pages, args.requests, args.epochs)
+    values = build_hc_validation_values(mode, args.tokens, args.pages, args.requests, args.seed, args.case, sharded, args.start_pos)
     # Clone per call: the harness builds the golden scratch from these same specs, and a
     # tensor init_value whose dtype already matches comes back as itself.
     specs = [

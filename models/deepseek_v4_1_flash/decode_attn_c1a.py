@@ -28,6 +28,7 @@ from config import (
     FLASH as M,
     DECODE_MAX_TOKENS,
     INDEX_CACHE_GROUP,
+    MAX_BATCH_PER_DP,
     WINDOW_CACHE_GROUP,
     B_DYN,
     CMP_BLOCKS_DYN,
@@ -222,9 +223,9 @@ project_qa = make_mx_projection_with_deps(D, Q_LORA)
 project_qb = make_mx_projection_with_deps(Q_LORA, LOCAL_H * HEAD_DIM)
 project_kv = make_mx_projection_with_deps(D, HEAD_DIM)
 project_ob = make_mx_projection_with_deps(LOCAL_O_WIDTH, D, pl.FP32)
-rotate_q = make_rope_with_deps(LOCAL_H, name_hint="c1a_q_rope")
+rotate_q = make_rope_with_deps(LOCAL_H, max_workers=64, name_hint="c1a_q_rope")
 rotate_kv = make_rope_with_deps(1, name_hint="c1a_kv_rope")
-rotate_output = make_rope_with_deps(LOCAL_H, inverse=True, name_hint="c1a_o_rope")
+rotate_output = make_rope_with_deps(LOCAL_H, inverse=True, max_workers=64, name_hint="c1a_o_rope")
 qkv_proj_rope_with_deps = build_qkv_proj_rope_with_deps(
     project_qa, project_qb, rotate_q, project_kv, rotate_kv
 )
@@ -1256,10 +1257,11 @@ def decode_attn_c1a_full_test(
     )
 
 
-def make_program(tokens, pages, epochs=1):
+def make_program(tokens, pages, requests=1, epochs=1):
     """Build a distributed host using static packed-FP4 storage dimensions."""
     TOKENS = tokens
     PAGES = pages
+    REQUESTS = requests
     EPOCHS = epochs
 
     @pl.jit.host
@@ -1295,7 +1297,7 @@ def make_program(tokens, pages, epochs=1):
         index_cache_scale: pl.InOut[
             pl.Tensor[[TP_SIZE, PAGES, 128, 1, INDEX_DIM // INDEX_CACHE_GROUP], pl.FP8E8M0]
         ],
-        index_block_table: pl.Tensor[[TP_SIZE, 1, PAGES], pl.INT32],
+        index_block_table: pl.Tensor[[TP_SIZE, REQUESTS, PAGES], pl.INT32],
         compressed_rope_cos: pl.Tensor[[TP_SIZE, TOKENS, ROPE_DIM // 2], pl.FP32],
         compressed_rope_sin: pl.Tensor[[TP_SIZE, TOKENS, ROPE_DIM // 2], pl.FP32],
         compressor_wkv: pl.Tensor[[TP_SIZE, D, HEAD_DIM], pl.BF16],
@@ -1343,11 +1345,11 @@ def make_program(tokens, pages, epochs=1):
     return host
 
 
-def build_validation_values(mode, tokens, pages, seed=17, case="random"):
+def build_validation_values(mode, tokens, pages, requests=1, seed=17, case="random"):
     """Deterministic synthetic tensors at released model dimensions."""
     import math
 
-    TOKENS, PAGES, RANKS = tokens, pages, TP_SIZE
+    TOKENS, PAGES, RANKS, REQUESTS = tokens, pages, TP_SIZE, requests
     from quant import (
         pack_mx_b_scale,
         quantize_mxfp8_cache,
@@ -1355,6 +1357,13 @@ def build_validation_values(mode, tokens, pages, seed=17, case="random"):
     )
 
     torch.manual_seed(seed)
+    # Balanced token-to-request split. Every request carries the same page
+    # permutation, so the page-addressable caches stay conflict-free while the
+    # operator still routes TOKENS tokens through REQUESTS table rows.
+    lengths = [TOKENS // REQUESTS + (1 if index < TOKENS % REQUESTS else 0) for index in range(REQUESTS)]
+    token_to_req = torch.repeat_interleave(
+        torch.arange(REQUESTS), torch.tensor(lengths)
+    ).to(torch.int32)
     values = {}
     shapes = {
         "wq_a": (D, Q_LORA),
@@ -1402,12 +1411,12 @@ def build_validation_values(mode, tokens, pages, seed=17, case="random"):
     # above turns the cutoff into a magnitude gap instead of a dense band. Signed weights would
     # let a quiet row outrank a loud one and put the cut back on a knife edge.
     values["index_weights_proj"] = (torch.rand(RANKS, D, INDEX_H) / math.sqrt(D)).to(torch.bfloat16)
-    values["request_ids"] = torch.zeros(RANKS, TOKENS, dtype=torch.int32)
+    values["request_ids"] = token_to_req.unsqueeze(0).expand(RANKS, -1).contiguous()
     values["compressed_lens"] = torch.tensor(
         [PAGES * 128 - t for t in range(TOKENS)], dtype=torch.int32
     ).repeat(RANKS, 1)
     values["index_block_table"] = (
-        torch.randperm(PAGES).int().view(1, 1, PAGES).expand(RANKS, -1, -1).contiguous()
+        torch.randperm(PAGES).int().view(1, 1, PAGES).expand(RANKS, REQUESTS, -1).contiguous()
     )
     # Index keys carry a page-level magnitude ladder: the first half of the pages dominates the
     # second half by 2^10. The candidate window then ends in a magnitude gap instead of a dense
@@ -1622,6 +1631,7 @@ def run_c1a(mode, kernel_factory, golden_fn, argv=None):
     )
     parser.add_argument("--tokens", type=int, default=1)
     parser.add_argument("--pages", type=int, default=8)
+    parser.add_argument("--requests", type=int, default=1)
     parser.add_argument("--epochs", type=int, default=1)
     parser.add_argument("--seed", type=int, default=17)
     parser.add_argument("--case", choices=["random", "ragged", "masked", "sink"], default="random")
@@ -1646,8 +1656,10 @@ def run_c1a(mode, kernel_factory, golden_fn, argv=None):
         parser.error(f"device IDs must be {TP_SIZE} distinct nonnegative integers, one per rank")
     if not 1 <= args.tokens <= min(DECODE_MAX_TOKENS, args.pages * 128) or args.pages < 1 or args.epochs < 1:
         parser.error(f"require 1 <= tokens <= min({DECODE_MAX_TOKENS}, pages * 128), pages >= 1, epochs >= 1")
-    host = kernel_factory(args.tokens, args.pages, args.epochs)
-    values = build_validation_values(mode, args.tokens, args.pages, args.seed, args.case)
+    if not 1 <= args.requests <= min(MAX_BATCH_PER_DP, args.tokens):
+        parser.error(f"require 1 <= requests <= min({MAX_BATCH_PER_DP}, tokens {args.tokens})")
+    host = kernel_factory(args.tokens, args.pages, args.requests, args.epochs)
+    values = build_validation_values(mode, args.tokens, args.pages, args.requests, args.seed, args.case)
     # Clone per call: the harness builds the golden scratch from these same specs, and a
     # tensor init_value whose dtype already matches comes back as itself.
     specs = [

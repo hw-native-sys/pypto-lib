@@ -366,7 +366,7 @@ def decode_c1a_reuse_sharded_test(
     )
 
 
-def _make_program(tokens, pages, epochs=1):
+def _make_program(tokens, pages, requests, epochs=1):
     """Build a distributed host using static packed-FP4 storage dimensions."""
     TOKENS = tokens
     PAGES = pages
@@ -435,14 +435,14 @@ def _make_program(tokens, pages, epochs=1):
     return host
 
 
-def make_program(tokens, pages, epochs=1, sharded=False):
+def make_program(tokens, pages, requests=1, epochs=1, sharded=False):
     """Build a distributed host; ``sharded`` selects the sequence-parallel wiring."""
     if sharded:
-        return _make_program_sharded(tokens, pages, epochs)
-    return _make_program(tokens, pages, epochs)
+        return _make_program_sharded(tokens, pages, requests, epochs)
+    return _make_program(tokens, pages, requests, epochs)
 
 
-def _make_program_sharded(tokens, pages, epochs=1):
+def _make_program_sharded(tokens, pages, requests, epochs=1):
     """Build a distributed host using static packed-FP4 storage dimensions."""
     TOKENS = tokens
     LOCAL_TOKENS = (TOKENS + TP_SIZE - 1) // TP_SIZE
