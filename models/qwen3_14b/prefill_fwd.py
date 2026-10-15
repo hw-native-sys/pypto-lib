@@ -1458,8 +1458,7 @@ def prefill_layer(
                         done_value = pl.slice(acc_chunk, [1, 8], [0, 0])
                         window_done_row = pl.assemble(window_done_row, done_value, [0, 0])
                     out_bf = pl.cast(acc_chunk, target_type=pl.BF16)
-                    valid_shape = [valid_tt, DOWN_RESID_CHUNK]
-                    out_valid = pl.slice(out_bf, [MLP_M_TILE, DOWN_RESID_CHUNK], [0, 0], valid_shape=valid_shape)
+                    out_valid = pl.slice(out_bf, [MLP_M_TILE, DOWN_RESID_CHUNK], [0, 0], valid_shape=[valid_tt, DOWN_RESID_CHUNK])
                     out = pl.assemble(out, out_valid, [m0, h0])
             # This carry array lives outside the dynamic layer/window loops.
             # Keep its backing storage stable: assigning through ``arr[idx]``
