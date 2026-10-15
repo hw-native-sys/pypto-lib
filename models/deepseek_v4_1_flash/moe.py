@@ -1031,6 +1031,8 @@ def _route_bias() -> torch.Tensor:
 
 
 def _build_moe_tensor_specs(num_tokens: int = MOE_TOKENS):
+    from functools import cache
+
     import torch
 
     from golden.spec import ScalarSpec, TensorSpec
@@ -1058,40 +1060,31 @@ def _build_moe_tensor_specs(num_tokens: int = MOE_TOKENS):
     routed_w3_shape = routed_w1_shape
     routed_w3_scale_shape = routed_w1_scale_shape
 
-    # Real routed shards at deployment magnitudes: checkpoint MXFP4
-    # [expert, out, in] weights follow the packed device ABI, and every rank
-    # draws its own seed.
-    routed_w1_list, routed_w1_scale_list = [], []
-    routed_w3_list, routed_w3_scale_list = [], []
-    routed_w2_list, routed_w2_scale_list = [], []
-    for rank in range(EP_SIZE):
-        rw1, rw1_s, rw3, rw3_s, rw2, rw2_s = _gen_routed_mx_weights_fixture(
-            N_LOCAL_EXPERTS, ROUTED_DEQUANT_STD, seed_base=rank * N_LOCAL_EXPERTS * 3
-        )
-        routed_w1_list.append(rw1)
-        routed_w1_scale_list.append(rw1_s)
-        routed_w3_list.append(rw3)
-        routed_w3_scale_list.append(rw3_s)
-        routed_w2_list.append(rw2)
-        routed_w2_scale_list.append(rw2_s)
-    routed_w1 = torch.stack(routed_w1_list)
-    mxfp4_pair_lut = build_mxfp4_pair_lut().unsqueeze(0).expand(EP_SIZE, -1, -1).contiguous()
-    routed_w1_scale = torch.stack(routed_w1_scale_list)
-    routed_w3 = torch.stack(routed_w3_list)
-    routed_w3_scale = torch.stack(routed_w3_scale_list)
-    routed_w2 = torch.stack(routed_w2_list)
-    routed_w2_scale = torch.stack(routed_w2_scale_list)
+    # Initialize packed weights and matching scales together on first use.
+    # Compile-only reads the specs without calling these per-fixture caches.
+    @cache
+    def routed_weights():
+        # Tuple order: w1, w1_scale, w3, w3_scale, w2, w2_scale.
+        shards = [
+            _gen_routed_mx_weights_fixture(
+                N_LOCAL_EXPERTS, ROUTED_DEQUANT_STD, seed_base=rank * N_LOCAL_EXPERTS * 3,
+            )
+            for rank in range(EP_SIZE)
+        ]
+        return tuple(torch.stack([shard[index] for shard in shards]) for index in range(6))
 
-    shared_std = {"w1": 1.71e-2, "w2": 1.68e-2, "w3": 1.70e-2}
-    sw1, sw1_s = gen_mxfp8_weight_kn_v41(MOE_INTER, D, shared_std["w1"], chan_cv=0.50, seed=101)
-    sw3, sw3_s = gen_mxfp8_weight_kn_v41(MOE_INTER, D, shared_std["w3"], chan_cv=0.50, seed=102)
-    sw2, sw2_s = gen_mxfp8_weight_kn_v41(D, MOE_INTER, shared_std["w2"], chan_cv=0.33, seed=103)
-    shared_w1 = sw1.unsqueeze(0).expand(EP_SIZE, -1, -1).contiguous()
-    shared_w1_scale = sw1_s.unsqueeze(0).expand(EP_SIZE, -1, -1).contiguous()
-    shared_w3 = sw3.unsqueeze(0).expand(EP_SIZE, -1, -1).contiguous()
-    shared_w3_scale = sw3_s.unsqueeze(0).expand(EP_SIZE, -1, -1).contiguous()
-    shared_w2 = sw2.unsqueeze(0).expand(EP_SIZE, -1, -1).contiguous()
-    shared_w2_scale = sw2_s.unsqueeze(0).expand(EP_SIZE, -1, -1).contiguous()
+    @cache
+    def shared_weights():
+        shared_std = {"w1": 1.71e-2, "w2": 1.68e-2, "w3": 1.70e-2}
+        sw1, sw1_s = gen_mxfp8_weight_kn_v41(MOE_INTER, D, shared_std["w1"], chan_cv=0.50, seed=101)
+        sw3, sw3_s = gen_mxfp8_weight_kn_v41(MOE_INTER, D, shared_std["w3"], chan_cv=0.50, seed=102)
+        sw2, sw2_s = gen_mxfp8_weight_kn_v41(D, MOE_INTER, shared_std["w2"], chan_cv=0.33, seed=103)
+        return tuple(
+            weight.unsqueeze(0).expand(EP_SIZE, -1, -1).contiguous()
+            for weight in (sw1, sw1_s, sw3, sw3_s, sw2, sw2_s)
+        )
+
+    mxfp4_pair_lut = build_mxfp4_pair_lut().unsqueeze(0).expand(EP_SIZE, -1, -1).contiguous()
 
     fp8 = _fp8_dtype()
     e8m0 = _e8m0_dtype()
@@ -1100,22 +1093,22 @@ def _build_moe_tensor_specs(num_tokens: int = MOE_TOKENS):
         TensorSpec("norm_weight", [EP_SIZE, D], torch.bfloat16, init_value=lambda: norm_weight),
         TensorSpec("gate_weight", [EP_SIZE, N_EXPERTS, D], torch.float32, init_value=lambda: gate_weight),
         TensorSpec("correction_bias", [EP_SIZE, N_EXPERTS], torch.float32, init_value=lambda: correction_bias),
-        TensorSpec("routed_w1", list(routed_w1_shape), torch.uint8, init_value=lambda: routed_w1),
-        TensorSpec("routed_w1_scale", list(routed_w1_scale_shape), e8m0, init_value=lambda: routed_w1_scale),
-        TensorSpec("routed_w2", list(routed_w2_shape), torch.uint8, init_value=lambda: routed_w2),
-        TensorSpec("routed_w2_scale", list(routed_w2_scale_shape), e8m0, init_value=lambda: routed_w2_scale),
-        TensorSpec("routed_w3", list(routed_w3_shape), torch.uint8, init_value=lambda: routed_w3),
-        TensorSpec("routed_w3_scale", list(routed_w3_scale_shape), e8m0, init_value=lambda: routed_w3_scale),
+        TensorSpec("routed_w1", list(routed_w1_shape), torch.uint8, init_value=lambda: routed_weights()[0]),
+        TensorSpec("routed_w1_scale", list(routed_w1_scale_shape), e8m0, init_value=lambda: routed_weights()[1]),
+        TensorSpec("routed_w2", list(routed_w2_shape), torch.uint8, init_value=lambda: routed_weights()[4]),
+        TensorSpec("routed_w2_scale", list(routed_w2_scale_shape), e8m0, init_value=lambda: routed_weights()[5]),
+        TensorSpec("routed_w3", list(routed_w3_shape), torch.uint8, init_value=lambda: routed_weights()[2]),
+        TensorSpec("routed_w3_scale", list(routed_w3_scale_shape), e8m0, init_value=lambda: routed_weights()[3]),
         TensorSpec(
             "mxfp4_pair_lut", [EP_SIZE, 2, 256], torch.int16,
             init_value=lambda: mxfp4_pair_lut,
         ),
-        TensorSpec("shared_w1", [EP_SIZE, D, MOE_INTER], fp8, init_value=lambda: shared_w1),
-        TensorSpec("shared_w1_scale", [EP_SIZE, D // MX_GROUP, MOE_INTER], e8m0, init_value=lambda: shared_w1_scale),
-        TensorSpec("shared_w2", [EP_SIZE, MOE_INTER, D], fp8, init_value=lambda: shared_w2),
-        TensorSpec("shared_w2_scale", [EP_SIZE, MOE_INTER // MX_GROUP, D], e8m0, init_value=lambda: shared_w2_scale),
-        TensorSpec("shared_w3", [EP_SIZE, D, MOE_INTER], fp8, init_value=lambda: shared_w3),
-        TensorSpec("shared_w3_scale", [EP_SIZE, D // MX_GROUP, MOE_INTER], e8m0, init_value=lambda: shared_w3_scale),
+        TensorSpec("shared_w1", [EP_SIZE, D, MOE_INTER], fp8, init_value=lambda: shared_weights()[0]),
+        TensorSpec("shared_w1_scale", [EP_SIZE, D // MX_GROUP, MOE_INTER], e8m0, init_value=lambda: shared_weights()[1]),
+        TensorSpec("shared_w2", [EP_SIZE, MOE_INTER, D], fp8, init_value=lambda: shared_weights()[4]),
+        TensorSpec("shared_w2_scale", [EP_SIZE, MOE_INTER // MX_GROUP, D], e8m0, init_value=lambda: shared_weights()[5]),
+        TensorSpec("shared_w3", [EP_SIZE, D, MOE_INTER], fp8, init_value=lambda: shared_weights()[2]),
+        TensorSpec("shared_w3_scale", [EP_SIZE, D // MX_GROUP, MOE_INTER], e8m0, init_value=lambda: shared_weights()[3]),
         TensorSpec("output", [EP_SIZE, MOE_TOKENS, D], torch.bfloat16),
         TensorSpec("num_tokens", [EP_SIZE], torch.int32,
                    init_value=lambda: counts),

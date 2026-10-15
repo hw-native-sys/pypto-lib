@@ -37,6 +37,16 @@ TensorSpec(
 Random input is therefore explicit: use `init_value=torch.randn` or another
 random factory. `init_value=None` does not generate random values.
 
+Keep expensive data generation inside the initializer. For example,
+`init_value=lambda: quantize_weights()` defers quantization until input
+creation, while computing `weights = quantize_weights()` before constructing
+the spec still pays that cost during a compile-only run. When several specs
+share generated weights and scales, cache their common factory within one
+fixture construction. Separate fixtures must keep independent tensor storage.
+Preserve explicit random generators and seeds when deferring initialization.
+The DeepSeek V4.1 MoE and standalone routed-expert fixtures use this pattern
+for packed expert weights; the decode-layer fixture inherits the MoE initializers.
+
 A spec does not declare a direction. The harness reads each parameter's
 `In` / `Out` / `InOut` from the compiled artifact and stamps it onto the spec
 before any tensor is allocated, so the kernel signature is the single source of

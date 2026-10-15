@@ -872,6 +872,8 @@ def golden_expert_routed_scatter(tensors):
 
 
 def build_tensor_specs():
+    from functools import cache
+
     import torch
     from golden.spec import TensorSpec
     from quant import (
@@ -928,9 +930,12 @@ def build_tensor_specs():
     def init_recv_weights():
         return recv_weights_pre
 
-    rw1_packed, rw1_scale, rw3_packed, rw3_scale, rw2_packed, rw2_scale = gen_routed_mxfp4_weights(
-        N_LOCAL_EXPERTS, ROUTED_DEQUANT_STD, seed_base=10
-    )
+    # Share each generated weight with its scale, scoped to this fixture.
+    # Compile-only never initializes this cache.
+    @cache
+    def routed_weights():
+        return gen_routed_mxfp4_weights(N_LOCAL_EXPERTS, ROUTED_DEQUANT_STD, seed_base=10)
+
     mxfp4_pair_lut = build_mxfp4_pair_lut()
 
     # Every active compact row gets a distinct destination row in the window.
@@ -977,37 +982,37 @@ def build_tensor_specs():
             "routed_w1_packed",
             [WORLD_SIZE, N_LOCAL_EXPERTS, MX_W1_PACKED_ROWS, MX_PACKED_LANE_COLS],
             torch.uint8,
-            init_value=lambda: rw1_packed.unsqueeze(0),
+            init_value=lambda: routed_weights()[0].unsqueeze(0),
         ),
         TensorSpec(
             "routed_w1_scale",
             [WORLD_SIZE, N_LOCAL_EXPERTS * K_SCALE, MOE_INTER],
             fp8_e8m0,
-            init_value=lambda: rw1_scale.unsqueeze(0),
+            init_value=lambda: routed_weights()[1].unsqueeze(0),
         ),
         TensorSpec(
             "routed_w3_packed",
             [WORLD_SIZE, N_LOCAL_EXPERTS, MX_W3_PACKED_ROWS, MX_PACKED_LANE_COLS],
             torch.uint8,
-            init_value=lambda: rw3_packed.unsqueeze(0),
+            init_value=lambda: routed_weights()[2].unsqueeze(0),
         ),
         TensorSpec(
             "routed_w3_scale",
             [WORLD_SIZE, N_LOCAL_EXPERTS * K_SCALE, MOE_INTER],
             fp8_e8m0,
-            init_value=lambda: rw3_scale.unsqueeze(0),
+            init_value=lambda: routed_weights()[3].unsqueeze(0),
         ),
         TensorSpec(
             "routed_w2_packed",
             [WORLD_SIZE, N_LOCAL_EXPERTS, MX_W2_PACKED_ROWS, MX_PACKED_LANE_COLS],
             torch.uint8,
-            init_value=lambda: rw2_packed.unsqueeze(0),
+            init_value=lambda: routed_weights()[4].unsqueeze(0),
         ),
         TensorSpec(
             "routed_w2_scale",
             [WORLD_SIZE, N_LOCAL_EXPERTS * H_SCALE, D],
             fp8_e8m0,
-            init_value=lambda: rw2_scale.unsqueeze(0),
+            init_value=lambda: routed_weights()[5].unsqueeze(0),
         ),
         TensorSpec(
             "mxfp4_pair_lut",

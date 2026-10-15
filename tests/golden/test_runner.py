@@ -589,6 +589,17 @@ class TestNoValidation:
 class TestCompileOnly:
     """``compile_only=True`` short-circuits after compile."""
 
+    def test_compile_only_does_not_initialize_tensor_data(self, three_kinds_specs, build_dir):
+        initializer = MagicMock(side_effect=AssertionError("compile-only initialized tensor data"))
+        for spec in three_kinds_specs:
+            spec.init_value = initializer
+
+        with patch("pypto.ir.compile", return_value=_FakeCompiled(build_dir)):
+            result = run(fn=object(), specs=three_kinds_specs, compile_only=True)
+
+        assert result.passed
+        initializer.assert_not_called()
+
     def test_compile_only_skips_runtime_and_validation(
         self, three_kinds_specs, build_dir,
     ):
