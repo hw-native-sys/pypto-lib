@@ -985,7 +985,7 @@ def qkv_proj_rope(
                 )
     for qbg_idx in pl.spmd((Q_LORA // QR_N_TILE) * QR_OK, name_hint="qr_proj_matmul", allow_early_resolve=True):
         # Weight reads bypass L2.
-        pl.set_cache_policy(wq_a, pl.CachePolicy.BYPASS)
+        pl.set_l2_hint(wq_a, load=pl.LoadL2Hint.NotAllocClean)
         q_a_col0 = (qbg_idx // QR_OK) * QR_N_TILE
         qr_k_base = (qbg_idx % QR_OK) * QR_K_SLICE
         for tc in pl.range(t_matmul // QR_M_TILE):
@@ -1042,7 +1042,7 @@ def qkv_proj_rope(
     q_proj_i32 = pl.create_tensor([t_matmul, H * HEAD_DIM], dtype=pl.INT32)
     # One output-column fragment per task.
     for qproj_n_idx in pl.spmd((H * HEAD_DIM) // QPROJ_MM_N_TILE, name_hint="qproj_matmul"):
-        pl.set_cache_policy(wq_b, pl.CachePolicy.BYPASS)
+        pl.set_l2_hint(wq_b, load=pl.LoadL2Hint.NotAllocClean)
         w_col0 = qproj_n_idx * QPROJ_MM_N_TILE
         for tc in pl.range(t_matmul // QPROJ_M_TILE):
             t0 = tc * QPROJ_M_TILE
@@ -1123,7 +1123,7 @@ def qkv_proj_rope(
     # critical path, so it resolves one hop after rms_norm and lets qr_proj_matmul
     # take the cores first.
     with pl.spmd((HEAD_DIM // KV_N_TILE) * KV_OK, name_hint="kv_proj_matmul", deps=[late_dep]) as _kv_tid:
-        pl.set_cache_policy(wkv, pl.CachePolicy.BYPASS)
+        pl.set_l2_hint(wkv, load=pl.LoadL2Hint.NotAllocClean)
         kbg = pl.tile.get_block_idx()
         kv_col0 = (kbg // KV_OK) * KV_N_TILE
         kv_k_base = (kbg % KV_OK) * KV_K_SLICE

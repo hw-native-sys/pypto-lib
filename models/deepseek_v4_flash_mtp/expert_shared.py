@@ -75,7 +75,7 @@ def _expert_shared(
         # gate (w1) cube matmul -> INT32 GM accumulator.
         for nb_idx in pl.spmd(MOE_INTER // MM_INTER_TILE, name_hint="sh_gate_mm", allow_early_resolve=True):
             # Weight reads bypass L2.
-            pl.set_cache_policy(shared_w1, pl.CachePolicy.BYPASS)
+            pl.set_l2_hint(shared_w1, load=pl.LoadL2Hint.NotAllocClean)
             n0 = nb_idx * MM_INTER_TILE
             gate_acc = pl.create_tensor([SH_M_TILE, MM_INTER_TILE], dtype=pl.INT32)
             for k0 in pl.pipeline(0, D, K_TILE, stage=2):
@@ -86,7 +86,7 @@ def _expert_shared(
 
         # up (w3) cube matmul -> INT32 GM accumulator.
         for nb_idx in pl.spmd(MOE_INTER // MM_INTER_TILE, name_hint="sh_up_mm", allow_early_resolve=True):
-            pl.set_cache_policy(shared_w3, pl.CachePolicy.BYPASS)
+            pl.set_l2_hint(shared_w3, load=pl.LoadL2Hint.NotAllocClean)
             n0 = nb_idx * MM_INTER_TILE
             up_acc = pl.create_tensor([SH_M_TILE, MM_INTER_TILE], dtype=pl.INT32)
             for k0 in pl.pipeline(0, D, K_TILE, stage=2):
@@ -164,7 +164,7 @@ def _expert_shared(
         # w2 (down) cube matmul -> INT32 GM accumulator.
         y_i32 = pl.create_tensor([SH_M_TILE, D], dtype=pl.INT32)
         for db_idx in pl.spmd(D // D_OUT_TILE, name_hint="sh_w2_mm"):
-            pl.set_cache_policy(shared_w2, pl.CachePolicy.BYPASS)
+            pl.set_l2_hint(shared_w2, load=pl.LoadL2Hint.NotAllocClean)
             d0 = db_idx * D_OUT_TILE
             y_acc = pl.create_tensor([SH_M_TILE, D_OUT_TILE], dtype=pl.INT32)
             for k0 in pl.pipeline(0, MOE_INTER, INTER_K, stage=2):

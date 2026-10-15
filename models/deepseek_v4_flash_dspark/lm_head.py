@@ -215,7 +215,7 @@ def lm_head(
         optimizations=[pl.cross_core_slot(slot_num=2)],
     ) as _push_tid:
         # Weight reads bypass L2.
-        pl.set_cache_policy(lm_head_weight, pl.CachePolicy.BYPASS)
+        pl.set_l2_hint(lm_head_weight, load=pl.LoadL2Hint.NotAllocClean)
         lm_core = pl.tile.get_block_idx()
         vocab_base = tp_rank * VOCAB_PER_TP
         for mm_ob in pl.range(lm_core, VOCAB_FULL_TILES, FUSED_LM_HEAD_CORES):

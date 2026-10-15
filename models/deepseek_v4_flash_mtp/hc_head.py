@@ -84,7 +84,7 @@ def _hc_head(
             deps=[linear_seed_tid],
         ) as _linear_tid:
             # Weight reads bypass L2.
-            pl.set_cache_policy(hc_head_fn, pl.CachePolicy.BYPASS)
+            pl.set_l2_hint(hc_head_fn, load=pl.LoadL2Hint.NotAllocClean)
             task = pl.tile.get_block_idx()
             t0 = (task // LINEAR_OK) * LINEAR_T_TILE
             k_base = (task % LINEAR_OK) * (HC_DIM // LINEAR_OK)
@@ -109,7 +109,7 @@ def _hc_head(
             name_hint="hc_head_linear_tail",
             deps=[linear_seed_tid],
         ) as _linear_tail_tid:
-            pl.set_cache_policy(hc_head_fn, pl.CachePolicy.BYPASS)
+            pl.set_l2_hint(hc_head_fn, load=pl.LoadL2Hint.NotAllocClean)
             tail_task = pl.tile.get_block_idx()
             k_base = tail_task * (HC_DIM // LINEAR_OK)
             tail_rows = t_dim - linear_full_rows

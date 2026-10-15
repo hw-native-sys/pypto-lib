@@ -199,7 +199,7 @@ def compute_base_logits(
         deps=[final_norm_tid],
     ) as base_logits_tid:
         # Weight reads bypass L2.
-        pl.set_cache_policy(lm_head_weight, pl.CachePolicy.BYPASS)
+        pl.set_l2_hint(lm_head_weight, load=pl.LoadL2Hint.NotAllocClean)
         task = pl.tile.get_block_idx()
         row_block = task // vocab_blocks
         # A true modulo (not `task - row_block * vocab_blocks`) so the NZ
@@ -308,7 +308,7 @@ def greedy_markov_step(
         deps=[markov_embedding_tid],
     ) as confidence_tid:
         # Weight reads bypass L2.
-        pl.set_cache_policy(confidence_head_weight, pl.CachePolicy.BYPASS)
+        pl.set_l2_hint(confidence_head_weight, load=pl.LoadL2Hint.NotAllocClean)
         confidence_block = pl.tile.get_block_idx()
         request_base = confidence_block * CONFIDENCE_PAD
         valid_rows = pl.min(CONFIDENCE_PAD, batch - request_base)

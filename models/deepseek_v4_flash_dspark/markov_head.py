@@ -45,7 +45,7 @@ def markov_head(
         allow_early_resolve=True,
     ) as embedding_tid:
         # Weight reads bypass L2.
-        pl.set_cache_policy(markov_w1, pl.CachePolicy.BYPASS)
+        pl.set_l2_hint(markov_w1, load=pl.LoadL2Hint.NotAllocClean)
         token_idx = pl.tile.get_block_idx()
         token_id = pl.read(token_ids, [token_idx])
         token_row = pl.cast(token_id, target_type=pl.INDEX)
@@ -61,7 +61,7 @@ def markov_head(
         deps=[embedding_tid],
     ) as logits_tid:
         # Weight reads bypass L2.
-        pl.set_cache_policy(markov_w2, pl.CachePolicy.BYPASS)
+        pl.set_l2_hint(markov_w2, load=pl.LoadL2Hint.NotAllocClean)
         block = pl.tile.get_block_idx()
         for work_idx in pl.range(block, work_items, SPMD_BLOCKS):
             t0 = (work_idx // (vocab_dim // VOCAB_TILE)) * T_TILE

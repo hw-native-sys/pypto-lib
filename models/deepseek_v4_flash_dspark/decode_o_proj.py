@@ -741,7 +741,7 @@ def o_proj_reduce_scatter(
 
             with pl.spmd(own_a_rows * (O_LORA // O_A_N_TILE), name_hint="tp_o_a") as pa_tid:
                 # Weight reads bypass L2.
-                pl.set_cache_policy(wo_a, pl.CachePolicy.BYPASS)
+                pl.set_l2_hint(wo_a, load=pl.LoadL2Hint.NotAllocClean)
                 pa_unit = pl.tile.get_block_idx()
                 pa_rb = pa_unit // (O_LORA // O_A_N_TILE)
                 pa_nb = pa_unit % (O_LORA // O_A_N_TILE)
@@ -795,7 +795,7 @@ def o_proj_reduce_scatter(
 
             with pl.spmd(own_b_rows * (D // O_B_D_TILE), name_hint="tp_o_b", deps=[q_tid]):
                 # Weight reads bypass L2.
-                pl.set_cache_policy(wo_b, pl.CachePolicy.BYPASS)
+                pl.set_l2_hint(wo_b, load=pl.LoadL2Hint.NotAllocClean)
                 pb_unit = pl.tile.get_block_idx()
                 pb_tb = pb_unit // (D // O_B_D_TILE)
                 pb_db = pb_unit % (D // O_B_D_TILE)
