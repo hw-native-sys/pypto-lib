@@ -1450,14 +1450,16 @@ def prefill_layer(
                 deps=[down_chain[i] for i in range(MLP_PROJ_BANDS)],
             ) as cast_tid:
                 cast_core = pl.tile.get_block_idx()
-                for hb in pl.range(cast_core, down_n_blocks, DOWN_RESID_SPMD_BLOCKS):
-                    h0 = hb * K_CHUNK
-                    acc_chunk = pl.slice(mlp_out_acc_tile, [MLP_M_TILE, K_CHUNK], [0, h0])
+                # FP32 input and BF16 output need disjoint UB storage (48 KiB at 64 columns).
+                for hb in pl.range(cast_core, HIDDEN // DOWN_RESID_CHUNK, DOWN_RESID_SPMD_BLOCKS):
+                    h0 = hb * DOWN_RESID_CHUNK
+                    acc_chunk = pl.slice(mlp_out_acc_tile, [MLP_M_TILE, DOWN_RESID_CHUNK], [0, h0])
                     if hb == 0:
                         done_value = pl.slice(acc_chunk, [1, 8], [0, 0])
                         window_done_row = pl.assemble(window_done_row, done_value, [0, 0])
                     out_bf = pl.cast(acc_chunk, target_type=pl.BF16)
-                    out_valid = pl.slice(out_bf, [MLP_M_TILE, K_CHUNK], [0, 0], valid_shape=[valid_tt, K_CHUNK])
+                    valid_shape = [valid_tt, DOWN_RESID_CHUNK]
+                    out_valid = pl.slice(out_bf, [MLP_M_TILE, DOWN_RESID_CHUNK], [0, 0], valid_shape=valid_shape)
                     out = pl.assemble(out, out_valid, [m0, h0])
             # This carry array lives outside the dynamic layer/window loops.
             # Keep its backing storage stable: assigning through ``arr[idx]``
