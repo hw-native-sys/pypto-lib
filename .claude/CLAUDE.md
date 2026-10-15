@@ -1,83 +1,90 @@
-# PyPTO-Lib Developer Guidelines
+# PyPTO-Lib Agent Instructions
 
-## Project Overview
+PyPTO-Lib provides PyPTO kernels and end-to-end LLM models for Ascend NPUs,
+plus the `golden/` harness for compilation, execution, and Torch validation.
+This file is the shared project entry point; `AGENTS.md` adapts it for Codex.
 
-PyPTO-Lib hosts **PyPTO** kernels and end-to-end LLM models for Ascend NPUs
-(910B/C, 950), plus the golden-validation harness (`golden/`) that tests them.
+## Working agreements
 
-## Repository Layout
+- Keep changes scoped to the requested kernel, model, test, or documentation
+  area. Prefer existing project patterns when they agree with current rules.
+- Keep public documentation and examples aligned when behavior changes.
+- Keep agent constraints in `.claude/rules/`, task execution workflows in
+  `.claude/skills/`, and public technical guidance in `docs/`. Link to the
+  owning source instead of maintaining duplicate instructions or technical
+  explanations.
+- Do not commit generated artifacts from `build_output/`.
+- Treat credentials, local paths with usernames, and machine-specific state
+  as off-limits unless the user explicitly asks for them. Do not include
+  private information in code or documentation.
+- Write code comments and documentation in English unless the user explicitly
+  requests otherwise. Follow the [language policy](rules/language-policy.md).
+- For review-only tasks, inspect and report findings without modifying files
+  unless the user also requests fixes. Apply referenced workflows as review
+  criteria rather than executing their editing steps.
 
-- `examples/{beginner,intermediate,advanced}/` — self-contained kernels for learning the DSL
-- `models/<family>_<version>[_<quant>]/` — end-to-end LLM kernels, one flat
-  directory per model build (`qwen3_14b`, `deepseek_v4_flash_mtp`, …)
-- `golden/` — test harness: compile, run on device, validate against torch
-- `tests/` — lint checks and golden-fn unit tests
-- `docs/` — canonical public setup, validation, examples, models, debugging, and tuning guidance
-- `build_output/` — generated compilation artifacts (gitignored)
+## Read before the relevant task
 
-Files ending in `_draft.py` are works-in-progress and excluded from CI.
+Read the applicable guidance before editing or executing the task. Follow a
+matching skill in `.claude/skills/` when the task has a documented workflow;
+the table below lists common entry points, not an exhaustive skill catalog.
 
-## Key Documentation
+| Task | Required guidance and workflow |
+| --- | --- |
+| Model implementation, optimization, or review | [Model rules](rules/models.md) |
+| Writing or modifying kernels | [L2 programming](../docs/pypto-coding/l2-programming.md), relevant sibling pages in [PyPTO coding](../docs/pypto-coding/index.md), and [formatting workflow](skills/fmt-coding-style/SKILL.md) |
+| Environment setup | [Setup skill](skills/setup-env/SKILL.md) and [installation guide](../docs/get-started/installation.md) |
+| Running a model | [Model case selection](skills/run-model-cases/SKILL.md) |
+| Harness or validation changes | [Golden harness](../docs/run-and-validate/golden-harness.md) and [compile/runtime workflow](../docs/run-and-validate/compile-runtime-workflow.md) |
+| Performance measurement or tuning | [Benchmarking rules](rules/benchmarking.md) and [performance guide](../docs/debug-and-tune/performance-tuning.md); use the matching profiling or tuning skill |
+| Cube tile tuning | [Cube tile tuning skill](skills/cube-tile-tuning/SKILL.md) |
+| In-core profiling | [In-core profiling skill](skills/incore-profiling/SKILL.md) |
+| Precision debugging | [Precision guide](../docs/debug-and-tune/precision-tuning.md); use [precision bisect](skills/bisect-precision/SKILL.md) for a reproducible revision regression |
+| Compile/runtime failures or suspected upstream bugs | [Problem handling rules](rules/problem-handling.md) and [debugging guide](../docs/debug-and-tune/debugging.md) |
+| Commit, PR, review fixes, or issue creation | [Commit](skills/git-commit/SKILL.md), [PR](skills/github-pr/SKILL.md), [PR fixes](skills/fix-pr/SKILL.md), or [issue](skills/create-issue/SKILL.md) workflow |
 
-- `README.md` — project intro, quick start, dependencies
-- `docs/get-started/installation.md` — environment setup and the PyPTO-owned toolchain pin chain
-- `docs/run-and-validate/golden-harness.md` — Golden Harness specs, execution, validation, and results
-- `docs/run-and-validate/save-and-replay.md` — frozen input/golden capture and replay
-- `docs/pypto-coding/` — **canonical** coding style, four pages: `l2-programming.md` (the two kernel forms, `pl.Out`/`pl.InOut`, `pl.at` scopes and `optimizations`, mixed cube+vector, dynamic B/S shapes), `operations.md` (vector / cube / mte / scalar ops), `loops.md` (`pl.range`/`pl.unroll`/`pl.parallel`/`pl.pipeline`/`pl.spmd`), `naming-and-comments.md`
-- `docs/run-and-validate/compile-runtime-workflow.md` — what `python <kernel>.py -p <platform>` does end-to-end (compile passes/codegen → input gen → golden → runtime → validate)
-- `docs/debug-and-tune/debugging.md` — debugging playbook: pypto/ptoas errors, `golden_data` replay, `runtime_dir` reuse, runtime-hang device logs, args-dump / dep-gen
-- `docs/debug-and-tune/performance-tuning.md` — L2 (inter-kernel) and L1/L0 (intra-kernel) tuning: swimlanes, PMU, buffer-occupancy / perf-hint reports
-- `docs/debug-and-tune/cce-incore-profiling.md` — on-device multi-core phase timestamps for fused CCE extern kernels: per-core capture, barrier diagnostics, and exact L2-reconciled partitions
-- `docs/debug-and-tune/precision-tuning.md` — keeping a kernel numerically faithful: `pl.cast` rounding modes vs torch, dtype alignment, fp32 intermediates / no double-cast, quant schemes, the `error_distribution` threshold sweep, and real-weight testing
-- `docs/pypto-coding/l3-programming.md` — multi-card (L3) kernels: the `@pl.jit.host` driver, HCCL window buffers and `pld.DistributedTensor`, cross-rank `put`/`remote_store`/`remote_load`, and the notify/wait + epoch protocols
-- `docs/pypto-coding/cce-extern-kernel.md` — writing hand-written mixed (cube+vector) CCE kernels behind `pl.jit.extern`: the persistent-kernel runtime model, the tensors-first/scalars-last arg-packing trap, UB/`TPipe`, `SyncAll<false>` cross-core barriers, GM scalar coherency, and the on-device narrowing methodology
+For routine kernel changes, apply the formatting rules to new or modified
+code. Run a whole-file style pass only when requested or explicitly required
+by the active workflow; avoid unrelated formatting changes.
 
-## External Dependencies
+Never silently work around a suspected upstream bug: follow the problem
+handling rules to record it and handle blocking failures. For performance
+work, optimize device wall time first; core busy time explains the result.
+Follow the benchmarking rules for replay, sampling, and distributed metrics.
 
-| Repo | Role |
-|------|------|
-| **pypto** | Tile-based programming framework — multi-level IR + codegen |
-| **simpler** | PTO runtime — task graph build/execute on AICPU + AICore (submodule of pypto) |
-| **ptoas** | LLVM/MLIR PTO Bytecode assembler/optimizer |
-| **pto-isa** | PTO Tile Library — virtual tile-ISA implementations |
+## Repository map
+
+- `examples/{beginner,intermediate,advanced}/`: self-contained DSL examples.
+- `models/<family>_<version>[_<quant>]/`: one directory per model build;
+  see [model documentation](../docs/models/index.md) for each implementation.
+- `golden/`: compile/run/validate harness against Torch references.
+- `tests/`: unit tests, model interface contracts, and existing lint checks.
+- `docs/`: canonical public technical guidance.
+- `.claude/rules/`: agent constraints; `.claude/skills/`: task workflows.
+- `build_output/`: generated compilation artifacts and execution output.
+
+Files ending in `_draft.py` are works in progress and excluded from CI.
+
+## Toolchain and execution
 
 The selected PyPTO checkout is the version source of truth: its `runtime/`
 gitlink pins simpler, `toolchain/versions.env` pins PTOAS, and
-`runtime/pto_isa.pin` pins PTO ISA. See
-[`docs/get-started/installation.md`](../docs/get-started/installation.md).
-
-## Environment Setup
-
-Read [`docs/get-started/installation.md`](../docs/get-started/installation.md)
-for the public procedure. Use the `/setup-env` skill to inspect and execute
-that procedure on the current machine.
-
-## Common Commands
-
-```bash
-# Run an example on the simulator
-python examples/beginner/hello_world.py -p a2a3sim
-
-# Run a model on real NPU device 0
-python models/qwen3_14b/decode_fwd.py -p a2a3 -d 0
-```
+`runtime/pto_isa.pin` pins PTO ISA. Follow the installation guide and setup
+skill when preparing the environment.
 
 Platform and device arguments are entry-specific. Inspect the selected
-script's `--help` and the platform table in `docs/get-started/first-kernel.md`.
+script's `--help` and the [platform guide](../docs/get-started/first-kernel.md)
+before running it. Common commands from the repository root:
 
-## Important Rules
+```bash
+python examples/beginner/hello_world.py -p a2a3sim
+python models/qwen3_14b/decode_fwd.py -p a2a3 -d 0
+python -m pytest tests/golden -v
+python tests/lint/check_headers.py
+python tests/lint/check_english_only.py
+ruff check .
+```
 
-1. **Read `docs/pypto-coding/l2-programming.md` first** before writing or modifying any kernel — it and its sibling pages are the authoritative coding-style reference.
-2. **`docs/run-and-validate/compile-runtime-workflow.md`** explains the harness flow end-to-end; **`docs/debug-and-tune/debugging.md`** is the debugging playbook (compile/runtime/validation failures, hangs, precision) and **`docs/debug-and-tune/performance-tuning.md`** the tuning guide.
-3. **Treat `docs/` as the technical source of truth.** Consult
-   `.claude/skills/` for task-specific execution, safety, and reporting, and
-   keep skills linked to the canonical public guide rather than copying it.
-4. **No private information** (usernames, absolute paths with usernames, etc.) in code or docs.
-5. **All code comments and documentation in English** unless the user explicitly requests otherwise.
-6. **Never silently work around a suspected compiler bug.** When the DSL looks
-   correct but the program fails to compile or produces wrong results, log it —
-   see [`.claude/rules/problem-handling.md`](rules/problem-handling.md).
-7. **Optimize wall time first, and measure it once.** Core busy time is the
-   second priority; reuse a frozen golden and a single timed process instead of
-   re-running a script for samples; strip rank start skew from distributed
-   results — see [`.claude/rules/benchmarking.md`](rules/benchmarking.md).
+Choose validation appropriate to the changed area; this command list is not
+an instruction to run every check for every task. Report what was validated
+and any checks that were not run.
