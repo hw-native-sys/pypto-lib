@@ -435,7 +435,6 @@ def _fwd_moe_tail(
     moe_comb_ffn: pl.InOut[pl.Tensor[[CP_LOCAL_ROWS, HC_MULT * HC_MULT], pl.FP32]],
     moe_ffn_out: pl.InOut[pl.Tensor[[CP_LOCAL_ROWS, D], pl.BF16]],
     moe_dense_scale: pl.InOut[pl.Tensor[[CP_MOE_TOTAL_CAP, PREFILL_MOE_EXPERT_SCALE_PAD], pl.FP32]],
-    moe_returned_y: pl.InOut[pl.Tensor[[CP_MOE_ROUTES_PER_SRC, D], pl.BF16]],
     count_target: pld.DistributedTensor[[N_RANKS, N_LOCAL], pl.INT32],
     count_signal: pld.DistributedTensor[[N_RANKS, 1], pl.INT32],
     prefill_moe_x_target: pld.DistributedTensor[[CP_MOE_TOTAL_CAP, D], pl.INT8],
@@ -473,7 +472,6 @@ def _fwd_moe_tail(
         x_next_work,
         moe_x_mixed, moe_post_ffn, moe_comb_ffn, moe_ffn_out,
         moe_dense_x, moe_dense_scale,
-        moe_returned_y,
         count_target, count_signal,
         prefill_moe_x_target, prefill_moe_x_signal,
         prefill_moe_scale_target,
@@ -1014,7 +1012,6 @@ def prefill_fwd(
     moe_comb_ffn = pl.create_tensor([CP_LOCAL_ROWS, HC_MULT * HC_MULT], dtype=pl.FP32)
     moe_ffn_out = pl.create_tensor([CP_LOCAL_ROWS, D], dtype=pl.BF16)
     moe_dense_scale = pl.create_tensor([CP_MOE_TOTAL_CAP, PREFILL_MOE_EXPERT_SCALE_PAD], dtype=pl.FP32)
-    moe_returned_y = pl.create_tensor([CP_MOE_ROUTES_PER_SRC, D], dtype=pl.BF16)
 
     swa_cos_profile: pl.Tensor[[1, MAX_SEQ_LEN, ROPE_HEAD_DIM], pl.BF16] = pl.slice(
         freqs_cos, [1, MAX_SEQ_LEN, ROPE_HEAD_DIM], [0, 0, 0]
@@ -1410,7 +1407,6 @@ def prefill_fwd(
                 moe_comb_ffn,
                 moe_ffn_out,
                 moe_dense_scale,
-                moe_returned_y,
                 count_target,
                 count_signal,
                 prefill_moe_x_target,
