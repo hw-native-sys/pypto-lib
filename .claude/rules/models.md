@@ -41,20 +41,53 @@ Decode and prefill files must not depend on each other. Put small shared
 operators in independent child operator files and shared host helpers in
 utilities. Do not hide dependency cycles with deferred imports.
 
-## Reuse and replacement
+## Discovery, reuse, and replacement
 
-Before adding compute code, inspect existing implementations and their callers
-within the current model. Layer and forward entries should compose existing
-operators instead of copying their compute logic. When fusion or performance
-specialization requires a separate implementation, explain the differences
-and validation evidence in the change report. This does not require merging
-decode and prefill implementations with different shape or performance needs.
+Before adding compute or support code, search the repository for existing
+capabilities; absence from the current conversation context is not evidence
+that an implementation is missing. Search by behavior as well as names, then
+inspect definitions and callers in the current model, shared utilities and
+harness, and relevant sibling models.
+Include kernels, goldens, quantization, comparisons, metadata, fixtures, and
+CLI or validation helpers in this search.
+
+Prefer direct reuse, then a minimal extension of the owning implementation;
+extract shared code for real consumers when needed. Check candidate contracts
+before deciding they cannot be reused. Respect dependency direction and avoid
+coupling independent model directories to reuse a helper.
+Layer and forward entries should compose existing operators. Separate
+implementations need concrete semantic, dependency, or measured performance
+reasons and validation evidence in the change report. Different decode and
+prefill requirements can justify separate implementations.
+
+New files, public entry points, and wrappers require a concrete consumer or
+contract that existing owners and entries cannot reasonably support. Do not
+create a parallel composition or validation interface solely to demonstrate
+a capability.
 
 When replacing or migrating an implementation, update affected callers and
 remove obsolete implementations, parameters, exports, validation entries, and
 documentation in the same change. Retain old interfaces or forwarding wrappers
 only for an explicit compatibility requirement. A staged migration must identify
 the remaining consumers and the conditions for completing the migration.
+
+## Computation and integration
+
+Preserve the requested computation and implementation constraints, including
+dtype and scale encoding, layout, quantization and rounding boundaries,
+sharding, and persistent-state ownership. Inspect affected operator, layer,
+and forward callers, including drafts; check changed interfaces at their call
+sites as well as through standalone validation.
+
+Keep references independent of the device results they validate and aligned
+with the intended numerical contract. Stage checks using actual intermediate
+inputs do not establish full-chain correctness. Do not relax acceptance gates
+solely to make a changed implementation pass.
+
+For stateful or tiled changes, check publication and consumer ordering,
+scratch reuse, repeated invocations, empty groups, partial tiles, and workspace
+bounds at the promised shapes. Account for inferred and explicit dependencies
+and actual communication-window lifetimes before changing ordering or epochs.
 
 ## Coding style
 
@@ -79,16 +112,24 @@ validation defaults. Large benchmark shapes and repeated timing sweeps must
 not replace the default correctness suite. Keep case selection and defaults
 in the owning executable file, not in model configuration.
 
-When implementing or optimizing models, avoid changing `tests/` unless the
-model change specifically requires it.
+Exercise the actual supported CLI or callable entry and a relevant affected
+consumer; importing a module or testing another invocation mode is not enough.
+Tie validation evidence to the delivered source and final scope. After rebases
+or scope changes, rerun affected checks and distinguish retained evidence from
+checks not rerun or capabilities removed.
+
+Keep documentation, tests, and benchmarks scoped to necessary contract changes
+or meaningful regressions. Prefer extending existing validation entry points;
+keep one-off experiment evidence in PRs or artifacts. Avoid changing `tests/`
+unless the model change specifically requires it.
 
 ## Agent checklist
 
-Before editing, inspect the affected operator's imports and callers and choose
-its owning file according to these rules. Before finishing an implementation
-change, check both kernel and golden dependency directions, ensure changed
-code follows the formatting rules, check for duplicated compute and obsolete code left by replacements,
-and verify the relevant standalone or composition entry. Report which
-default scenarios were exercised and any validation not run.
-For review-only tasks, use this checklist to assess the change and report
-findings; do not perform edits or cleanup.
+Before editing, inspect repository capabilities, imports and callers, and
+choose the owning file and implementation constraints. Before finishing,
+check kernel and golden dependency directions (including function-local
+imports), formatting, duplicated compute or helpers, obsolete code, and
+affected entries. Briefly report reuse decisions, reasons for necessary new
+implementations or infrastructure, the source revision and default scenarios
+validated, and checks not run. For review-only tasks, assess and report
+without edits or cleanup.
