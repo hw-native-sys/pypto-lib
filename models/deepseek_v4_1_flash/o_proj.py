@@ -208,6 +208,11 @@ o_proj = _make_o_proj(_rotate_output, grouped_output, _project_ob)
 prefill_o_proj = _make_o_proj(_prefill_rotate_output, prefill_grouped_output, _project_ob)
 
 
+def golden_grouped_output(grouped: torch.Tensor, wo_a: torch.Tensor) -> torch.Tensor:
+    """Grouped low-rank output GEMM: FP32 accumulation, one BF16 cast."""
+    return torch.einsum("tgd,grd->tgr", grouped.float(), wo_a.float()).to(torch.bfloat16)
+
+
 def _project_output(
     attended: torch.Tensor,
     cos: torch.Tensor,

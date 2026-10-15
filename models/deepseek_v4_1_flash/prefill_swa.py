@@ -28,9 +28,10 @@ from config import (
     SP_T_DYN,
 )
 from prefill_cp_allgather import prefill_sp_input_allgather
-from o_proj import prefill_sp_output_reduce_scatter
+from o_proj import golden_grouped_output, prefill_sp_output_reduce_scatter
 from hc_post import prefill_sp_post
-from quant import decode_e8m0, pack_mx_b_scale, unpack_mx_b_scale
+from qkv_proj_rope import golden_rope_tail
+from quant import golden_mxfp8_linear, golden_mxfp8_quantize, pack_mx_b_scale, quantize_mxfp8_cache
 from utils import window_metadata
 
 
@@ -332,51 +333,7 @@ def make_hc_program(capacity, world_size, epochs):
     return swa_group
 
 
-def official_quantize(value):
-    """Independent translation of official kernel.py act_quant_kernel, group size 32."""
-    groups = value.float().unflatten(-1, (-1, 32))
-    maximum = groups.abs().amax(-1).clamp_min(1e-4)
-    exponent = torch.ceil(torch.log2(maximum * (1.0 / 448.0)))
-    scale = torch.pow(2.0, exponent)
-    payload = (groups / scale[..., None]).clamp(-448, 448).to(torch.float8_e4m3fn).flatten(-2)
-    return payload, (exponent + 127).to(torch.uint8)
-
-
-def official_quantize_cache(value):
-    """Window-cache MXFP8 publish: E4M3 payload and group-32 BF16 scale (amax / 448)."""
-    groups = value.float().unflatten(-1, (-1, 32))
-    maximum = groups.abs().amax(-1).clamp_min(1e-4)
-    scale = (maximum * (1.0 / 448.0)).to(torch.bfloat16)
-    payload = (groups / scale.float()[..., None]).clamp(-448, 448).to(torch.float8_e4m3fn).flatten(-2)
-    return payload, scale
-
-def official_linear(x, weight, packed_scale, fp32=False):
-    """Match official FP8 GEMM's group-32 product, A scale, B scale, FP32 sum."""
-    payload, codes = official_quantize(x)
-    activation, weights = payload.float(), weight.float()
-    scale_a = decode_e8m0(codes)
-    scale_b = decode_e8m0(unpack_mx_b_scale(packed_scale))
-    result = torch.zeros(x.shape[0], weight.shape[1], dtype=torch.float32)
-    for group in range(weight.shape[0] // 32):
-        start = group * 32
-        product = activation[:, start:start + 32] @ weights[start:start + 32]
-        scaled = product * scale_a[:, group:group + 1]
-        scaled = scaled * scale_b[group:group + 1]
-        result = result + scaled
-    return result if fp32 else result.bfloat16()
-
-def official_rope(x, cos, sin, inverse=False):
-    rope_dim = cos.shape[-1] * 2
-    value = x.float().clone()
-    c = cos.reshape(x.shape[0], *([1] * (x.ndim - 2)), -1)
-    s = sin.reshape_as(c) * (-1 if inverse else 1)
-    tail = value[..., -rope_dim:].unflatten(-1, (rope_dim // 2, 2))
-    real, imag = tail[..., 0].clone(), tail[..., 1].clone()
-    tail[..., 0] = real * c - imag * s
-    tail[..., 1] = real * s + imag * c
-    return value.to(torch.bfloat16)
-
-def official_reference(tensors):
+def golden_reference(tensors):
     """CPU transcription of group-32 FP8 GEMM and block-64 online attention.
 
     DeepSeek-V4.1-Flash inference/kernel.py and model.py, revision
@@ -387,17 +344,12 @@ def official_reference(tensors):
     local_heads = t["attn_sink"].numel()
     groups = t["wo_a"].shape[0]
     group_in = t["wo_a"].shape[-1]
-    def norm(x, weight):
-        value = x.float()
-        return (value * torch.rsqrt(value.square().mean(-1, keepdim=True) + M.rms_norm_eps)
-                * weight.float()).to(torch.bfloat16)
-
-    qr = norm(official_linear(t["x"], t["wq_a"], t["wq_a_scale"]), t["q_norm_weight"])
-    q = official_linear(qr, t["wq_b"], t["wq_b_scale"]).unflatten(-1, (local_heads, head_dim))
-    q = official_rope(q, t["rope_cos"], t["rope_sin"])
-    kv = norm(official_linear(t["x"], t["wkv"], t["wkv_scale"]), t["kv_norm_weight"])
-    kv = official_rope(kv, t["rope_cos"], t["rope_sin"])
-    payload, scales = official_quantize_cache(kv)
+    qr = golden_rms_norm(golden_mxfp8_linear(t["x"], t["wq_a"], t["wq_a_scale"]), t["q_norm_weight"])
+    q = golden_mxfp8_linear(qr, t["wq_b"], t["wq_b_scale"]).unflatten(-1, (local_heads, head_dim))
+    q = golden_rope_tail(q, t["rope_cos"], t["rope_sin"])
+    kv = golden_rms_norm(golden_mxfp8_linear(t["x"], t["wkv"], t["wkv_scale"]), t["kv_norm_weight"])
+    kv = golden_rope_tail(kv, t["rope_cos"], t["rope_sin"])
+    payload, scales = quantize_mxfp8_cache(kv)
     cache = t["window_cache"].clone()
     cache_scale = t["window_cache_scale"].clone()
     slots = t["window_slots"].long()
@@ -427,10 +379,10 @@ def official_reference(tensors):
     correction = (maximum - final_max).exp()
     denominator = denominator * correction + (t["attn_sink"][None] - final_max).exp()
     attended = (numerator * (correction / denominator)[..., None]).to(torch.bfloat16)
-    attended = official_rope(attended, t["rope_cos"], t["rope_sin"], inverse=True)
+    attended = golden_rope_tail(attended, t["rope_cos"], t["rope_sin"], inverse=True)
     grouped = attended.reshape(-1, groups, group_in)
-    latent = torch.einsum("tgd,grd->tgr", grouped.float(), t["wo_a"].float()).to(torch.bfloat16)
-    output = official_linear(latent.flatten(1), t["wo_b"], t["wo_b_scale"], fp32=True)
+    latent = golden_grouped_output(grouped, t["wo_a"])
+    output = golden_mxfp8_linear(latent.flatten(1), t["wo_b"], t["wo_b_scale"], fp32=True)
     return output, cache, cache_scale
 
 INPUT_NAMES = (
@@ -445,7 +397,7 @@ def make_inputs(batch=32, seed=17, position=127):
     def rand(*shape):
         return torch.randn(*shape, generator=gen)
     def weight(k, n):
-        payload, scales = official_quantize(rand(n, k) / math.sqrt(k))
+        payload, scales = golden_mxfp8_quantize(rand(n, k) / math.sqrt(k))
         return payload.T.contiguous(), pack_mx_b_scale(scales.T.contiguous()).view(torch.float8_e8m0fnu)
     qa, qas = weight(D, Q_LORA)
     qb, qbs = weight(Q_LORA, LOCAL_H * HEAD_DIM)
@@ -463,7 +415,7 @@ def make_inputs(batch=32, seed=17, position=127):
         length = min(pos + 1, 128)
         logical = torch.arange(pos - length + 1, pos + 1)
         indices[row, :length] = (physical[row] * 128 + logical.remainder(128)).to(torch.int32)
-    cache, cache_scale = official_quantize_cache(rand(batch + 1, 128, 1, HEAD_DIM).to(torch.bfloat16))
+    cache, cache_scale = quantize_mxfp8_cache(rand(batch + 1, 128, 1, HEAD_DIM).to(torch.bfloat16))
     values = (rand(batch, D).to(torch.bfloat16), qa, qas,
               (rand(Q_LORA) * 0.1 + 1).to(torch.bfloat16), qb, qbs, kv, kvs,
               (rand(HEAD_DIM) * 0.1 + 1).to(torch.bfloat16), rand(LOCAL_H) * 2,
@@ -508,7 +460,7 @@ def make_packed_inputs(tokens=257, requests=4, seed=17, case="mixed", start_pos=
         assert indices[row, :len(expected)].tolist() == expected
         assert (indices[row, len(expected):] == -1).all()
     angles = positions.float()[:, None] * (10000.0 ** (-torch.arange(0, 64, 2).float() / 64))
-    cache, scales = official_quantize_cache(torch.randn(len(mappings) + 1, 128, 1, 512, generator=gen).bfloat16())
+    cache, scales = quantize_mxfp8_cache(torch.randn(len(mappings) + 1, 128, 1, 512, generator=gen).bfloat16())
     values.update(x=torch.randn(tokens, 5120, generator=gen).bfloat16(),
                   rope_cos=angles.cos(), rope_sin=angles.sin(),
                   window_slots=slots, window_indices=indices,
@@ -528,70 +480,24 @@ def make_packed_inputs(tokens=257, requests=4, seed=17, case="mixed", start_pos=
     print(f"[FIXTURE] tokens={tokens} requests={requests} lengths={lengths.tolist()} prefixes={prefixes.tolist()}")
     return values
 
-def compare_output(actual, expected, **kwargs):
-    """FP8 budget: global L2 <= 1%, every row <= 2%, cosine >= 0.9999; exact zero rows."""
-    a, e = actual.double(), expected.double()
-    error = (a - e).norm() / e.norm().clamp_min(1e-12)
-    cosine = torch.nn.functional.cosine_similarity(a.flatten(), e.flatten(), dim=0).clamp(-1, 1)
-    row_error = (a - e).norm(dim=-1) / e.norm(dim=-1).clamp_min(1e-12)
-    zero_rows = e.norm(dim=-1) == 0
-    zero_exact = bool((a.norm(dim=-1)[zero_rows] == 0).all())
-    if bool((e == 0).all()):
-        cosine = torch.tensor(1.0 if zero_exact else 0.0)
-    max_abs = (a - e).abs().max()
-    print(f"[PRECISION] output rel_l2={error.item():.8g} cosine={cosine.item():.8g} "
-          f"max_abs={max_abs.item():.8g} max_row_rel_l2={row_error.max().item():.8g} zero_rows_exact={zero_exact}")
-    passed = torch.isfinite(a).all() and error <= 0.01 and row_error.max() <= 0.02
-    passed = passed and cosine >= 0.9999 and zero_exact
-    return bool(passed), f"rel_l2={error.item():.8g}"
+def window_cache_compare(world_size, tokens):
+    """Compare the mapped window rows and require every other row to stay unchanged."""
+    from golden import mapped_pool_ratio_allclose
 
-def compare_scales(actual, expected, **kwargs):
-    """BF16 window scale: allow a couple of ULP of MX-GEMM accumulation imprecision.
-
-    The scale is a derived BF16 quantity (amax / 448); the device's hardware MX
-    GEMM and the torch golden can differ by a ULP or two on rare rows, so a
-    byte-exact check trips on that. Compare in float with a tight 2% ceiling,
-    which still catches a wrong scale formula (off by a constant factor or more).
-    """
-    a = actual.float()
-    e = expected.float()
-    rel = (a - e).abs() / e.abs().clamp_min(1e-12)
-    max_rel = rel.max().item() if rel.numel() else 0.0
-    byte_exact = bool(torch.equal(actual.view(torch.uint8), expected.view(torch.uint8)))
-    print(f"[PRECISION] window scale max_rel={max_rel:.8g} byte_exact={byte_exact}")
-    return max_rel <= 0.02, f"window scale max_rel={max_rel:.8g}"
-
-def compare_cache(actual, expected, *, actual_outputs, expected_outputs, inputs, **kwargs):
-    slots = inputs["window_slots"].long()
-    rows = slots[slots >= 0]
-    a = actual.view(torch.uint8).reshape(-1, HEAD_DIM)
-    e = expected.view(torch.uint8).reshape_as(a)
-    untouched = torch.ones(a.shape[0], dtype=torch.bool)
-    untouched[rows] = False
-    if not torch.equal(a[untouched], e[untouched]):
-        return False, "Unmapped cache payload bytes were modified"
-    af = actual.float().reshape(-1, HEAD_DIM)[rows]
-    ef = expected.float().reshape(-1, HEAD_DIM)[rows]
-    actual_scale = actual_outputs["window_cache_scale"].float().reshape(-1, HEAD_DIM // 32)
-    expected_scale = expected_outputs["window_cache_scale"].float().reshape(-1, HEAD_DIM // 32)
-    af *= actual_scale[rows].repeat_interleave(32, -1)
-    ef *= expected_scale[rows].repeat_interleave(32, -1)
-    rel = (af - ef).norm() / ef.norm().clamp_min(1e-12)
-    mismatch = (a[rows] != e[rows]).float().mean().item() if rows.numel() else 0.0
-    print(f"[PRECISION] cache rel_l2={rel.item():.8g} byte_mismatch_fraction={mismatch:.8g} untouched_exact=True")
-    return bool(torch.isfinite(af).all() and rel <= 0.01), f"cache rel_l2={rel.item():.8g}"
-
-def compare_distributed_cache(actual, expected, *, actual_outputs, expected_outputs, inputs, **kwargs):
-    passed = True
-    for rank in range(actual.shape[0]):
-        valid, detail = compare_cache(actual[rank], expected[rank],
-            actual_outputs={"window_cache_scale": actual_outputs["window_cache_scale"][rank]},
-            expected_outputs={"window_cache_scale": expected_outputs["window_cache_scale"][rank]},
-            inputs={"window_slots": inputs["window_slots"][rank]})
-        passed &= valid
-        if not valid:
-            print(f"[PRECISION] rank={rank}: {detail}")
-    return passed, "Every rank must preserve unmapped cache bytes and pass updated-cache precision"
+    options = dict(
+        mapping_shape=(world_size, tokens),
+        block_size=128,
+        leading_rank_axis=True,
+        atol=0.0,
+        rtol=0.0,
+        max_error_ratio=0.0,
+    )
+    return {
+        "window_cache": mapped_pool_ratio_allclose("window_slots", pool_name="window cache", **options),
+        "window_cache_scale": mapped_pool_ratio_allclose(
+            "window_slots", pool_name="window cache scale", **options
+        ),
+    }
 
 
 def build_hc_specs(args):
@@ -703,7 +609,7 @@ def reference_attention(tensors, hidden, base):
         partial = torch.zeros_like(hidden, dtype=torch.float32)
         cache, scale = inputs["window_cache"].clone(), inputs["window_cache_scale"].clone()
         if active:
-            active_partial, cache, scale = official_reference(inputs)
+            active_partial, cache, scale = golden_reference(inputs)
             partial[:active].copy_(active_partial)
         partials.append(partial)
         caches.append((cache, scale))
@@ -745,155 +651,12 @@ def golden_prefill_swa_case(tensors):
         tensors["output"][group].copy_(token_shards(output, local_tokens))
 
 
-# The device collapses the HC streams in another FP32 order than torch and flips isolated BF16
-# ULPs of ``hidden``; the MXFP8 attention can turn one such ULP into a percent-level move of a
-# token row. So every stage is held to its own budget on its own device input: ``hidden``
-# against the golden, the attention re-run on the device's ``hidden`` (teacher forcing), and
-# hc_post replayed on the device's ``attn_out``. A token row moving by one BF16 ULP everywhere
-# is a real error that ratio_allclose's outlier allowance would still admit, hence ROW_BUDGET.
-ROW_BUDGET = 2.0**-8
-OUTPUT_ATOL = 1e-2
-OUTPUT_RTOL = 1e-2
-OUTPUT_MAX_ERROR_RATIO = 0.01
-
-
-def report(name, actual, expected):
-    """Print one stage's global and worst token-row rel L2; returns both."""
-    diff = actual.double() - expected.double()
-    reference = expected.double()
-    rel_l2 = (diff.norm() / reference.norm().clamp_min(1e-12)).item()
-    rows = diff.flatten(1).norm(dim=-1) / reference.flatten(1).norm(dim=-1).clamp_min(1e-12)
-    print(f"[PRECISION] {name} rel_l2={rel_l2:.8g} max_row_rel_l2={rows.max().item():.8g}")
-    return rel_l2, rows.max().item()
-
-
-def make_staged_compare(
-    *, output_atol=OUTPUT_ATOL, output_rtol=OUTPUT_RTOL, output_max_error_ratio=OUTPUT_MAX_ERROR_RATIO,
-):
-    """Stage-wise comparators: mHC pre vs golden, SWA teacher-forced, hc_post replayed."""
-    from golden import ratio_allclose
-
-    bf16_close = ratio_allclose(atol=1e-4, rtol=1.0 / 128)
-    forced = {}
-
-    def teacher_forced(inputs, actual_outputs, expected_outputs):
-        """The SWA reference on the device's own ``hidden``, computed once per validation."""
-        if not forced:
-            # The golden caches already hold this call's rows, which the reference rewrites from
-            # the device's hidden before reading them; every other row is the initial cache.
-            tensors = {**inputs, "window_cache": expected_outputs["window_cache"],
-                       "window_cache_scale": expected_outputs["window_cache_scale"]}
-            hidden = actual_outputs["hidden"]
-            for name in ("attn_out", "window_cache", "window_cache_scale"):
-                forced[name] = torch.empty_like(actual_outputs[name])
-            for base in range(0, hidden.shape[0], TP_SIZE):
-                reduced, caches = reference_attention(tensors, hidden[base], base)
-                forced["attn_out"][base:base + TP_SIZE].copy_(token_shards(reduced, inputs["x_hc"].shape[1]))
-                for rank, (cache, scale) in enumerate(caches, base):
-                    forced["window_cache"][rank].copy_(cache)
-                    forced["window_cache_scale"][rank].copy_(scale)
-        return forced
-
-    def staged(name, check):
-        """Compare one attention stage against its teacher-forced reference."""
-        def compare(actual, expected, *, inputs, actual_outputs, expected_outputs, **kwargs):
-            """Supply device-input reference outputs to the stage comparator."""
-            reference = teacher_forced(inputs, actual_outputs, expected_outputs)
-            return check(actual, reference[name], inputs=inputs, actual_outputs=actual_outputs,
-                         expected_outputs=reference, **kwargs)
-        return compare
-
-    def replicated(actual, base):
-        """Check identical gathered inputs within one TP group."""
-        return all(torch.equal(actual[base], actual[rank]) for rank in range(base + 1, base + TP_SIZE))
-
-    def compare_hidden(actual, expected, **kwargs):
-        """Check mHC-pre precision and gathered-input equality across TP ranks."""
-        passed = True
-        for base in range(0, actual.shape[0], TP_SIZE):
-            _, worst_row = report("hidden", actual[base], expected[base])
-            passed &= bf16_close(actual[base], expected[base], **kwargs)[0] and worst_row <= ROW_BUDGET
-            passed &= replicated(actual, base)
-        return passed, f"hc_pre + input norm budget, every token row <= {ROW_BUDGET:.3g} rel L2, TP replicas identical"
-
-    def compare_attn_out(actual, expected, **kwargs):
-        """Report end-to-end errors and check attention on its device input."""
-        for rank in range(actual.shape[0]):
-            report("attn_out(end-to-end, not gated)", actual[rank], expected[rank])
-        def check_shards(actual, reference, **unused):
-            """Apply the attention precision budget to every token shard."""
-            passed = all(compare_output(actual[rank], reference[rank])[0] for rank in range(actual.shape[0]))
-            return passed, "Every token shard must pass attention precision"
-        return staged("attn_out", check_shards)(actual, expected, **kwargs)
-
-    def compare_hc_output(actual, expected, *, inputs, actual_outputs, **kwargs):
-        """Check local mHC-post replay, inactive rows, and end-to-end accuracy."""
-        passed = True
-        for base in range(actual.shape[0]):
-            x_hc = inputs["x_hc"][base]
-            _, post_mix, residual_mix = golden_mhc_mixes(
-                x_hc, inputs["hc_attn_fn"][base], inputs["hc_attn_scale"][base], inputs["hc_attn_base"][base],
-            )
-            replay = golden_mhc_post(actual_outputs["attn_out"][base], x_hc, post_mix, residual_mix)
-            local_active = x_hc.shape[0]
-            if "num_tokens" in inputs:
-                active = int(inputs["num_tokens"][base, 0])
-                local_active = max(0, min(x_hc.shape[0], active - base % TP_SIZE * x_hc.shape[0]))
-                replay[local_active:] = 0
-            _, worst_row = report("output(hc_post replay)", actual[base], replay)
-            close, _ = bf16_close(actual[base], replay, inputs=inputs, actual_outputs=actual_outputs, **kwargs)
-            passed &= close and worst_row <= ROW_BUDGET
-            report("output(end-to-end, diagnostic)", actual[base], expected[base])
-            budget = ratio_allclose(
-                atol=output_atol, rtol=output_rtol, max_error_ratio=output_max_error_ratio,
-                valid_rows=local_active, zero_tail=True,
-            )
-            within_budget, detail = budget(
-                actual[base], expected[base], inputs=inputs, actual_outputs=actual_outputs, **kwargs,
-            )
-            actual_valid = actual[base, :local_active].float()
-            expected_valid = expected[base, :local_active].float()
-            tolerance = output_atol + output_rtol * expected_valid.abs()
-            bad = int(((actual_valid - expected_valid).abs() > tolerance).sum())
-            count = actual_valid.numel()
-            print(f"[PRECISION] output rank={base} outliers={bad}/{count} "
-                  f"({bad / max(1, count):.6%}) allowed={output_max_error_ratio:.6%} "
-                  f"atol={output_atol:g} rtol={output_rtol:g}")
-            if not within_budget:
-                print(detail)
-            passed &= within_budget
-        return passed, "hc_post replay budget and per-shard end-to-end tolerance/outlier budget; zero padding"
-
-    def compare_next_pre_mix(actual, expected, *, inputs, **kwargs):
-        """Check outgoing staggered coefficients and exact inactive rows."""
-        passed = True
-        for rank in range(actual.shape[0]):
-            rows = actual.shape[1]
-            active = int(inputs["num_tokens"][rank, 0])
-            valid = max(0, min(rows, active - rank % TP_SIZE * rows))
-            compare = ratio_allclose(atol=2.5e-5, rtol=5e-3, valid_rows=valid, zero_tail=True)
-            valid_result, detail = compare(actual[rank], expected[rank], inputs=inputs, **kwargs)
-            if not valid_result:
-                print(detail)
-            passed &= valid_result
-        return passed, "next pre-mix coefficients within budget; zero inactive rows"
-
-    return {
-        "next_pre_mix": compare_next_pre_mix,
-        "hidden": compare_hidden,
-        "attn_out": compare_attn_out,
-        "window_cache": staged("window_cache", compare_distributed_cache),
-        "window_cache_scale": staged("window_cache_scale", compare_scales),
-        "output": compare_hc_output,
-    }
-
-
 def run_prefill_swa(argv=None):
     """Run A5 validation for packed prefill SWA wired through mHC."""
     import argparse
     import os
 
-    from golden import run
+    from golden import ratio_allclose, run
     from pypto.ir import DistributedConfig
 
     parser = argparse.ArgumentParser(description="DeepSeek V4.1 prefill SWA + mHC: A5 precision and timing")
@@ -910,22 +673,12 @@ def run_prefill_swa(argv=None):
     parser.add_argument("--fixture", choices=["checkpoint", "random"], default="checkpoint",
                         help="checkpoint mHC scale/base with synthetic weights, or random stress parameters")
     parser.add_argument("--epochs", type=int, default=1, help="operator calls per dispatch; timing includes all epochs")
-    parser.add_argument("--output-atol", type=float, default=OUTPUT_ATOL)
-    parser.add_argument("--output-rtol", type=float, default=OUTPUT_RTOL)
-    parser.add_argument("--output-max-error-ratio", type=float, default=OUTPUT_MAX_ERROR_RATIO,
-                        help="allowed fraction of active output elements outside tolerance, in [0, 1]")
     parser.add_argument("--compile-only", action="store_true")
     parser.add_argument("--save-data", action="store_true")
     parser.add_argument("--golden-data", help="replay a compatible data directory containing in/ and out/")
     parser.add_argument("--enable-chip-swimlane", type=int, default=0, choices=range(5))
     parser.add_argument("--enable-dep-gen", action="store_true")
     args = parser.parse_args(argv)
-    if not math.isfinite(args.output_atol) or args.output_atol < 0:
-        parser.error("output-atol must be finite and nonnegative")
-    if not math.isfinite(args.output_rtol) or args.output_rtol < 0:
-        parser.error("output-rtol must be finite and nonnegative")
-    if not math.isfinite(args.output_max_error_ratio) or not 0 <= args.output_max_error_ratio <= 1:
-        parser.error("output-max-error-ratio must be a finite fraction in [0, 1]")
     args.bench = os.environ.get("PYPTO_BENCH", "0") == "1"
     args.requests = args.requests if args.requests is not None else min(args.tokens, 4)
     if args.epochs < 1:
@@ -962,10 +715,17 @@ def run_prefill_swa(argv=None):
             enable_dep_gen=args.enable_dep_gen,
             ring_heap=PREFILL_ATTN_RING_HEAP,
         ),
-        compare_fn=make_staged_compare(
-            output_atol=args.output_atol, output_rtol=args.output_rtol,
-            output_max_error_ratio=args.output_max_error_ratio,
-        ),
+        compare_fn={
+            "next_pre_mix": ratio_allclose(atol=2.5e-5, rtol=5e-3),
+            "hidden": ratio_allclose(atol=1e-4, rtol=1.0 / 128),
+            # Zero, masked and sink outputs are exactly zero, so any residue is a failure.
+            "attn_out": (
+                ratio_allclose(atol=0.0, rtol=0.0, max_error_ratio=0.0)
+                if args.case in ("masked", "zero", "sink") else ratio_allclose(atol=1e-2, rtol=1.0 / 128)
+            ),
+            "output": ratio_allclose(atol=1e-2, rtol=1.0 / 128),
+            **window_cache_compare(len(devices), args.tokens),
+        },
     )
     print(f"[SWA+HC] work_dir={result.work_dir}")
     if args.compile_only and result.passed:

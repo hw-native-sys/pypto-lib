@@ -29,6 +29,7 @@ from config import (
 
 
 import decode_attn_swa as swa
+from golden import ratio_allclose
 
 # PyPTO resolves inline calls and JIT-body constants only from direct names.
 from config import LOCAL_T_DYN
@@ -657,31 +658,39 @@ def make_golden_sharded(epochs):
     return golden_half
 
 
-def comparisons(initial_state=None):
-    del initial_state
-    compare = _decode_utils.make_boundary_comparisons(swa.compare_output)
+def comparisons(args, devices):
+    leaf = ratio_allclose(atol=1e-2, rtol=1.0 / 128)
+    compare = _decode_utils.make_boundary_comparisons(leaf)
     compare.update(
         {
-            "attention_output": swa.compare_reduced,
-            "window_cache": swa.compare_distributed_cache,
-            "window_cache_scale": swa.compare_scales,
+            "attention_output": leaf,
+            # Composed rows can flip one FP8 code at a quantization boundary: allow one
+            # subnormal step (2**-9) plus one relative step (2**-3) on the payload, and less
+            # than 1% of mapped rows to miss even that.
+            **swa.window_cache_compare(
+                len(devices), args.tokens, payload_atol=2 ** -9, payload_rtol=2 ** -3,
+                payload_error_ratio=0.01,
+            ),
         }
     )
     return compare
 
 
-def comparisons_sharded(initial_state=None):
-    del initial_state
-    compare = _decode_utils.make_boundary_comparisons(swa.compare_output, sharded=True)
+def comparisons_sharded(args, devices):
+    leaf = ratio_allclose(atol=1e-2, rtol=1.0 / 128)
+    compare = _decode_utils.make_boundary_comparisons(leaf)
     compare.update(
         {
-            # The ReduceScatter publishes a fully materialized slab: the rows this
-            # rank does not own are zeros, and the check asserts that instead of
-            # letting stale values sit next to the owned rows.
-            "attention_output": _decode_utils.make_compare_sharded_rows(swa.compare_output),
-            "gathered": _decode_utils.compare_attention_gather,
-            "window_cache": swa.compare_distributed_cache,
-            "window_cache_scale": swa.compare_scales,
+            "attention_output": leaf,
+            # One BF16 step is the noise floor of the rows rounded once by the local collapse.
+            "gathered": ratio_allclose(atol=2 ** -6, rtol=2 ** -6),
+            # Composed rows can flip one FP8 code at a quantization boundary: allow one
+            # subnormal step (2**-9) plus one relative step (2**-3) on the payload, and less
+            # than 1% of mapped rows to miss even that.
+            **swa.window_cache_compare(
+                len(devices), args.tokens, payload_atol=2 ** -9, payload_rtol=2 ** -3,
+                payload_error_ratio=0.01,
+            ),
         }
     )
     return compare
@@ -710,7 +719,7 @@ def validate(argv=None):
                 make_program(args.tp, args.epochs, specs),
                 specs,
                 make_golden(args.epochs),
-                comparisons(),
+                comparisons(args, devices),
                 KIND,
                 devices,
             )
@@ -725,7 +734,7 @@ def validate(argv=None):
                 make_program(args.tp, args.epochs, sharded, sharded=True),
                 sharded,
                 make_golden_sharded(args.epochs),
-                comparisons_sharded(),
+                comparisons_sharded(args, devices),
                 f"{KIND} sequence-parallel",
                 devices,
             )

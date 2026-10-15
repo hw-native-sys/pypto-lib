@@ -374,6 +374,18 @@ def golden_rope_interleave(
     return rotated.flatten(-2).to(x.dtype)
 
 
+def golden_rope_tail(
+    x: torch.Tensor,
+    cos: torch.Tensor,
+    sin: torch.Tensor,
+    inverse: bool = False,
+) -> torch.Tensor:
+    """Rotate the trailing 2*cos.shape[-1] lanes as adjacent (real, imag) pairs."""
+    rope_dim = cos.shape[-1] * 2
+    rotated = golden_rope_interleave(x[..., -rope_dim:], cos, sin, inverse)
+    return torch.cat((x[..., :-rope_dim], rotated), dim=-1)
+
+
 def golden_qkv_proj_rope(
     x: torch.Tensor,
     wq_a: torch.Tensor,
@@ -393,9 +405,8 @@ def golden_qkv_proj_rope(
     num_heads = wq_b.shape[-1] // head_dim
     q = mxfp8_linear(qr, wq_b, wq_b_scale).unflatten(-1, (num_heads, head_dim))
     kv = golden_rms_norm(mxfp8_linear(x, wkv, wkv_scale), kv_norm_weight)
-    rd = cos.shape[-1] * 2
-    q = torch.cat((q[..., :-rd], golden_rope_interleave(q[..., -rd:], cos, sin)), dim=-1)
-    kv = torch.cat((kv[..., :-rd], golden_rope_interleave(kv[..., -rd:], cos, sin)), dim=-1)
+    q = golden_rope_tail(q, cos, sin)
+    kv = golden_rope_tail(kv, cos, sin)
     return q, kv, qr
 
 

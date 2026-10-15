@@ -623,7 +623,7 @@ def _mapped_pool_compare(
         mapped_expected = expected_rows[written_rows]
         for label, rows in (("actual", mapped_actual), ("expected", mapped_expected)):
             if torch.is_floating_point(rows):
-                nonfinite = ~torch.isfinite(rows)
+                nonfinite = ~torch.isfinite(rows.to(torch.float32))
                 if nonfinite.any().item():
                     return False, (
                         f"    {label} mapped rows in {pool_name} from '{mapping_name}' "

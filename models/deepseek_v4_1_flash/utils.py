@@ -97,18 +97,6 @@ CASE_PAGE = 128
 
 CASE_NAMES = (CASE_DEFAULT, 'causal', 'mixed', 'long')
 
-OUTPUT_RMS_ATOL = 1e-06
-
-OUTPUT_RMS_RTOL = 0.01
-
-OUTPUT_PEAK_ATOL = 1e-05
-
-OUTPUT_PEAK_RMS_RATIO = 0.05
-
-CACHE_MAX_RELATIVE_L2 = 0.01
-
-MXFP4_CACHE_MAX_RELATIVE_L2 = 0.04
-
 TOPK_SCORE_ATOL = 5e-05
 
 TOPK_SCORE_RTOL = 0.015
@@ -183,6 +171,10 @@ def _case_metadata(token_count: int, case_name: str) -> tuple[torch.Tensor, ...]
         compressed_indices[token, :compressed_count] = physical[:compressed_count].to(torch.int32)
         candidate_mask[token, :visible] = 1
     return (request_ids, compressed_lens, block_table, slots.to(torch.int64), window_indices, compressed_indices, candidate_mask)
+
+def fixture_token_count(token_count: int, case_name: str) -> int:
+    """Return the token rows a case fixture provides; only the causal case follows ``token_count``."""
+    return int(_case_metadata(token_count, case_name)[0].numel())
 
 def make_fixture_values(token_count: int, case_name: str) -> dict[str, torch.Tensor]:
     import torch
@@ -389,133 +381,6 @@ def topk_indices_compare(mode: str) -> Callable:
                 return (False, f'    rank {rank} token {token} top-k cutoff differs: missing score {float(missing_scores[worst]):.8g}, replacement score {float(extra_scores[worst]):.8g}, tolerance {float(tolerance[worst]):.8g}')
         return (True, '')
     compare.__name__ = 'numerical_cutoff_topk_compare'
-    return compare
-
-def _selected_output_reference(inputs: dict[str, torch.Tensor], expected_outputs: dict[str, torch.Tensor], selected: torch.Tensor) -> torch.Tensor:
-    """Evaluate validated selections against reference cache values and original weights."""
-    import torch
-    from config import COMPRESSED_CACHE_GROUP
-    from o_proj import _project_output
-    from qkv_proj_rope import golden_qkv_proj_rope as qkv_proj_rope
-    from quant import dequantize_mxfp4_cache, dequantize_mxfp8_cache
-    from sparse_attention import golden_prefill_c1a_attention
-    active = selected.shape[1]
-    partials = []
-    for rank in range(selected.shape[0]):
-
-        def tensor(name: str) -> torch.Tensor:
-            source = expected_outputs if name in expected_outputs else inputs
-            return source[name][rank]
-        query, _, _ = qkv_proj_rope(tensor('x')[:active], tensor('wq_a'), tensor('wq_a_scale'), tensor('q_norm_weight'), tensor('wq_b'), tensor('wq_b_scale'), tensor('wkv'), tensor('wkv_scale'), tensor('kv_norm_weight'), tensor('rope_cos')[:active], tensor('rope_sin')[:active])
-        window = dequantize_mxfp8_cache(tensor('window_cache'), tensor('window_cache_scale'))
-        compressed = dequantize_mxfp4_cache(tensor('compressed_cache'), tensor('compressed_cache_scale'), group_size=COMPRESSED_CACHE_GROUP, scale_format='bf16')
-        attended = golden_prefill_c1a_attention(query, window.to(query.dtype), tensor('window_indices')[:active], compressed.to(query.dtype), selected[rank], tensor('attn_sink'))
-        partials.append(_project_output(attended, tensor('rope_cos')[:active], tensor('rope_sin')[:active], tensor('wo_a'), tensor('wo_b'), tensor('wo_b_scale'), output_dtype=torch.float32))
-    return _reduce_tp_partials(partials).unsqueeze(0).expand(selected.shape[0], -1, -1)
-
-def _compare_attention_rows(actual: torch.Tensor, expected: torch.Tensor) -> tuple[bool, str]:
-    """Bound RMS and peak errors separately for every rank/token row."""
-    import torch
-    if actual.shape != expected.shape or actual.dtype != expected.dtype or actual.numel() == 0:
-        return (False, '    output shapes and dtypes must match and contain at least one row')
-    actual = actual.double()
-    expected = expected.double()
-    if not bool(torch.isfinite(actual).all() and torch.isfinite(expected).all()):
-        return (False, '    output and reference must be finite')
-    error = actual - expected
-    reference_rms = expected.square().mean(dim=-1).sqrt()
-    error_rms = error.square().mean(dim=-1).sqrt()
-    error_peak = error.abs().amax(dim=-1)
-    rms_limit = OUTPUT_RMS_ATOL + OUTPUT_RMS_RTOL * reference_rms
-    peak_limit = OUTPUT_PEAK_ATOL + OUTPUT_PEAK_RMS_RATIO * reference_rms
-    bad = (error_rms > rms_limit) | (error_peak > peak_limit)
-    denominator = reference_rms.clamp_min(OUTPUT_RMS_ATOL)
-    print(f'[PRECISION] output max_row_rel_l2={float((error_rms / denominator).max()):.8g} max_peak_over_rms={float((error_peak / denominator).max()):.8g} bad_rows={int(bad.sum())}/{bad.numel()}')
-    if not bool(bad.any()):
-        return (True, '')
-    index = tuple((int(value) for value in torch.nonzero(bad, as_tuple=False)[0]))
-    return (False, f'    rank/token {index}: error RMS {float(error_rms[index]):.8g} exceeds limit {float(rms_limit[index]):.8g} or peak {float(error_peak[index]):.8g} exceeds limit {float(peak_limit[index]):.8g}; reference RMS={float(reference_rms[index]):.8g}')
-
-def attention_output_compare(mode: str) -> Callable:
-    """Validate selection quality before comparing the selected output with strict row bounds."""
-    import torch
-    if mode not in ('full', 'reindex', 'reuse'):
-        raise ValueError(f'unsupported C1A attention mode: {mode}')
-
-    def compare(actual: torch.Tensor, expected: torch.Tensor, *, actual_outputs: dict[str, torch.Tensor], expected_outputs: dict[str, torch.Tensor], inputs: dict[str, torch.Tensor], rtol: float, atol: float) -> tuple[bool, str]:
-        active = min(int(inputs.get('num_tokens', actual.shape[1])), actual.shape[1])
-        reference = expected
-        if mode != 'reuse':
-            selected = actual_outputs['topk_indices']
-            nominal = expected_outputs['topk_indices']
-            valid, detail = topk_indices_compare(mode)(selected, nominal, actual_outputs=actual_outputs, expected_outputs=expected_outputs, inputs=inputs, rtol=rtol, atol=atol)
-            if not valid:
-                return (False, f'    output reference rejected invalid Top-K: {detail.strip()}')
-            if not torch.equal(selected[:, :active], nominal[:, :active]):
-                reference = _selected_output_reference(inputs, expected_outputs, selected[:, :active])
-        return _compare_attention_rows(actual[:, :active], reference[:, :active])
-    compare.__name__ = 'c1a_output_row_rms_and_peak'
-    return compare
-
-HC_ROW_BUDGET = 2.0 ** (-8)
-
-def _report_hc_stage(name: str, actual: torch.Tensor, expected: torch.Tensor) -> tuple[float, float]:
-    """Report global and worst token-row relative L2 for one HC stage."""
-    diff = actual.double() - expected.double()
-    reference = expected.double()
-    rel_l2 = (diff.norm() / reference.norm().clamp_min(1e-12)).item()
-    rows = diff.flatten(1).norm(dim=-1) / reference.flatten(1).norm(dim=-1).clamp_min(1e-12)
-    worst_row = rows.max().item()
-    print(f'[PRECISION] {name} rel_l2={rel_l2:.8g} max_row_rel_l2={worst_row:.8g}')
-    return (rel_l2, worst_row)
-
-def _tp_replicated(actual: torch.Tensor) -> bool:
-    import torch
-    from config import TP_SIZE
-    return all((torch.equal(actual[0], actual[rank]) for rank in range(1, TP_SIZE)))
-
-def hc_hidden_compare() -> Callable:
-    """Validate mHC collapse precision per token row and TP replication."""
-    import torch
-    from golden import ratio_allclose
-    close = ratio_allclose(atol=0.0001, rtol=1.0 / 128)
-
-    def compare(actual: torch.Tensor, expected: torch.Tensor, **kwargs) -> tuple[bool, str]:
-        _, worst_row = _report_hc_stage('hidden', actual[0], expected[0])
-        elementwise, _ = close(actual[0], expected[0], **kwargs)
-        passed = elementwise and worst_row <= HC_ROW_BUDGET and _tp_replicated(actual)
-        return (passed, f'hc_pre every token row <= {HC_ROW_BUDGET:.3g} rel L2; TP replicas identical')
-    return compare
-
-def attn_input_compare() -> Callable:
-    """Validate the post-collapse attention RMSNorm boundary per token row."""
-    import torch
-    from golden import ratio_allclose
-    close = ratio_allclose(atol=0.0001, rtol=1.0 / 128)
-
-    def compare(actual: torch.Tensor, expected: torch.Tensor, **kwargs) -> tuple[bool, str]:
-        _, worst_row = _report_hc_stage('attn_input', actual[0], expected[0])
-        elementwise, _ = close(actual[0], expected[0], **kwargs)
-        passed = elementwise and worst_row <= HC_ROW_BUDGET and _tp_replicated(actual)
-        return (passed, f'attention RMSNorm every token row <= {HC_ROW_BUDGET:.3g} rel L2; TP replicas identical')
-    return compare
-
-def hc_output_compare() -> Callable:
-    """Replay mHC post on device attention output and bound full-chain relative L2."""
-    import torch
-    from golden import ratio_allclose
-    from hc_mixes import golden_mhc_mixes
-    from hc_post import golden_mhc_post
-    close = ratio_allclose(atol=0.0001, rtol=1.0 / 128)
-
-    def compare(actual: torch.Tensor, expected: torch.Tensor, *, inputs: dict[str, torch.Tensor], actual_outputs: dict[str, torch.Tensor], **kwargs) -> tuple[bool, str]:
-        _, post_mix, residual_mix = golden_mhc_mixes(inputs['x_hc'][0], inputs['hc_attn_fn'][0], inputs['hc_attn_scale'][0], inputs['hc_attn_base'][0])
-        replay = golden_mhc_post(actual_outputs['attn_out'][0], inputs['x_hc'][0], post_mix, residual_mix)
-        _, worst_row = _report_hc_stage('output(hc_post replay)', actual[0], replay)
-        elementwise, _ = close(actual[0], replay, inputs=inputs, actual_outputs=actual_outputs, **kwargs)
-        end_to_end, _ = _report_hc_stage('output(end-to-end)', actual[0], expected[0])
-        passed = elementwise and worst_row <= HC_ROW_BUDGET and (end_to_end <= 0.01) and _tp_replicated(actual)
-        return (passed, 'hc_post replay within row budget; end-to-end rel L2 <= 1%; TP replicas identical')
     return compare
 
 
@@ -1488,130 +1353,31 @@ def check_program_specs(world_size, specs, spec_names):
     )
 
 
-def compare_unchanged(name):
-    """Compare non-owner storage byte-for-byte, including CPU FP8 scales."""
+def wrap_attention_compare(compare):
+    """Present HC workspace names through the attention-only comparator ABI."""
 
-    def compare(actual, expected, **kwargs):
-        return torch.equal(actual.view(torch.uint8), expected.view(torch.uint8)), (
-            f"{name}: non-owner state must stay exact"
+    def compare_hc(actual, expected, *, inputs, actual_outputs, expected_outputs, **kwargs):
+        attention_inputs = {**inputs, "x": expected_outputs["attn_input"]}
+        attention_actual = {**actual_outputs, "output": actual_outputs["attn_out"]}
+        attention_expected = {**expected_outputs, "output": expected_outputs["attn_out"]}
+        return compare(
+            actual,
+            expected,
+            inputs=attention_inputs,
+            actual_outputs=attention_actual,
+            expected_outputs=attention_expected,
+            **kwargs,
         )
 
-    return compare
+    return compare_hc
 
 
-def make_compare_attention_hidden(compare_output):
-    """Build the common active/inactive mHC output comparison around a leaf comparator."""
-
-    def compare_attention_hidden(actual, expected, *, inputs, **kwargs):
-        active = int(inputs["num_tokens"])
-        for rank in range(actual.shape[0]):
-            passed, detail = compare_output(actual[rank, :active], expected[rank, :active], **kwargs)
-            if not passed:
-                return False, f"rank {rank}: {detail}"
-            if active < actual.shape[1]:
-                passed, detail = compare_output(actual[rank, active:], expected[rank, active:], **kwargs)
-                if not passed:
-                    return False, f"rank {rank} inactive mHC suffix: {detail}"
-        return True, "active mHC precision and independent inactive suffix checks passed"
-
-    return compare_attention_hidden
-
-
-def active_rows_from_golden(expected):
-    """Infer the batch's active token count from an ownership-padded golden.
-
-    ``expected`` is one ``[ranks, slab, ...]`` tensor whose inactive slab rows
-    the golden leaves at zero, so the last non-zero row of the last owning rank
-    names the batch size.  It is the fallback for entries that do not hand the
-    batch size to the comparator: the C1A compositions build their specs from
-    tensors only, so the harness exposes no ``num_tokens`` scalar for them.
-    Reading the count out of the reference is exact wherever the padding
-    contract holds, and a batch's own rows are real data rather than all-zero
-    placeholders.
-    """
-    width = expected.shape[1]
-    rows = expected.reshape(expected.shape[0], width, -1)
-    owned = (rows.abs().sum(dim=-1) > 0).sum(dim=-1)
-    active = 0
-    for rank, count in enumerate(owned.tolist()):
-        if count:
-            active = max(active, rank * width + min(count, width))
-    return active
-
-
-def compare_owner_rows(compare_output, *, name="per-rank", require_zero_padding=False, active=None):
-    """Compare only the rows each rank owns inside its physical slab.
-
-    The single implementation behind every sequence-parallel comparator: the
-    ownership rule comes from :func:`owner_rows`, so a slab width, padding or
-    rank-order change is fixed in one place.  The batch size comes from
-    ``active`` when the caller knows it, else from the ``num_tokens`` scalar the
-    harness exposes, else from the golden through :func:`active_rows_from_golden`
-    -- never from the tensor's capacity, which overstates ownership whenever a
-    slab ends partially filled.  ``require_zero_padding`` adds the
-    materialization contract of a ReduceScatter output, whose inactive rows the
-    kernel writes as zeros.
-    """
-
-    def compare(actual, expected, **kwargs):
-        inputs = kwargs.get("inputs")
-        num_tokens = active
-        if num_tokens is None and inputs is not None:
-            num_tokens = inputs.get("num_tokens")
-        if num_tokens is None:
-            num_tokens = active_rows_from_golden(expected)
-        num_tokens = int(num_tokens)
-        for rank in range(actual.shape[0]):
-            _first, count, width = owner_rows(actual, rank, num_tokens, tp_size=TP_SIZE)
-            if require_zero_padding and count < width and not bool((actual[rank][count:] == 0).all()):
-                return False, f"rank {rank}: inactive {name} rows must be zero, not stale data"
-            if count == 0:
-                continue
-            passed, detail = compare_output(actual[rank][:count], expected[rank][:count], **kwargs)
-            if not passed:
-                return False, f"rank {rank}: {detail}"
-        return True, f"every rank's own {name} rows pass"
-
-    return compare
-
-
-def make_compare_attention_hidden_sharded(compare_output):
-    """Compare every rank's local mHC rows under the leaf's own budget."""
-    return compare_owner_rows(compare_output, name="mHC")
-
-
-def make_compare_sharded_rows(compare_output):
-    """Compare a per-rank ReduceScatter output and assert its inactive rows are zero."""
-    return compare_owner_rows(compare_output, name="ReduceScatter", require_zero_padding=True)
-
-
-def make_boundary_comparisons(compare_output, sharded=False):
+def make_boundary_comparisons(compare_output):
     """Build comparisons shared by every mHC-Attention composition boundary."""
     return {
-        "attention_hidden": (
-            make_compare_attention_hidden_sharded(compare_output)
-            if sharded
-            else make_compare_attention_hidden(compare_output)
-        ),
+        "attention_hidden": compare_output,
         "attention_pre_mix": ratio_allclose(atol=1e-4, rtol=1e-4),
     }
-
-
-def compare_attention_gather(actual, expected, **kwargs):
-    """BF16 budget for the gathered Attention input.
-
-    The rows were already rounded once in BF16 by the local collapse and
-    RMSNorm, so a one-step BF16 disagreement is the expected noise floor; the
-    comparator still catches a mis-mapped row or a wrong gather order.
-    """
-    a, e = actual.float(), expected.float()
-    error = (a - e).norm() / e.norm().clamp_min(1e-12)
-    print(
-        f"[PRECISION] gathered rel_l2={error.item():.6g} "
-        f"max_abs={(a - e).abs().max().item():.6g}"
-    )
-    budget = ratio_allclose(atol=2 ** -6, rtol=2 ** -6)
-    return budget(actual, expected, **kwargs)
 
 
 WIRING_REPLICATED = "replicated"

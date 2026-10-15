@@ -32,23 +32,19 @@ from config import (
     WINDOW_CACHE_GROUP,
 )
 
-from quant import quantized_cache_compare
 from hc_mixes import golden_mhc_mixes, mhc_mixes
 from hc_post import golden_mhc_post
 from hc_post import mhc_post
 from hc_pre import golden_mhc_pre, mhc_pre
+from prefill_attn_c1a import cache_compare
 from rmsnorm import golden_rms_norm
 from utils import (
-    CACHE_MAX_RELATIVE_L2,
     CASE_DEFAULT,
     CASE_MAX_TOKENS,
     CASE_NAMES,
     apply_distributed_golden,
-    attn_input_compare,
-    attention_output_compare,
+    fixture_token_count,
     golden_prefill_tp_attention,
-    hc_hidden_compare,
-    hc_output_compare,
     make_fixture_values,
 )
 from rmsnorm import rms_norm_tiled
@@ -390,9 +386,6 @@ def validate(argv=None):
     devices = [int(device) for device in args.device.split(",")]
     if len(devices) != TP_SIZE:
         parser.error(f"need exactly {TP_SIZE} devices, got {devices}")
-    window_cache_compare = quantized_cache_compare(
-        "window_cache", "window_cache_scale", "window_slots", CACHE_MAX_RELATIVE_L2,
-    )
     result = run(
         fn=l3_prefill_c1a_reuse_test,
         specs=build_hc_tensor_specs(args.tokens, args.case, args.active_tokens),
@@ -410,12 +403,11 @@ def validate(argv=None):
         },
         compare_fn={
             "next_pre_mix": ratio_allclose(atol=2.5e-5, rtol=5e-3),
-            "hidden": hc_hidden_compare(),
-            "attn_input": attn_input_compare(),
-            "attn_out": attention_output_compare("reuse"),
-            "output": hc_output_compare(),
-            "window_cache": window_cache_compare,
-            "window_cache_scale": window_cache_compare,
+            "hidden": ratio_allclose(atol=1e-4, rtol=1.0 / 128),
+            "attn_input": ratio_allclose(atol=1e-4, rtol=1.0 / 128),
+            "attn_out": ratio_allclose(atol=1e-2, rtol=1.0 / 128),
+            "output": ratio_allclose(atol=1e-2, rtol=1.0 / 128),
+            **cache_compare(len(devices), fixture_token_count(args.tokens, args.case), ("window_cache", "window_cache_scale")),
         },
     )
     return result

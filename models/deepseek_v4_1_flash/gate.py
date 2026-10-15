@@ -388,6 +388,56 @@ def golden_gate_normalized_core(tensors):
     _golden_gate_core(tensors, x_norm, scores, biased)
 
 
+def build_tensor_specs(layer_id=0, num_tokens=T):
+    import torch
+    from golden import ScalarSpec, TensorSpec
+
+    def init_x_mixed():
+        return torch.randn(T, D)
+
+    def init_norm_w():
+        return torch.ones(D)
+
+    def init_gate_w():
+        return torch.randn(N_EXPERTS, D) / D ** 0.5
+
+    def init_gate_bias():
+        return torch.randn(N_EXPERTS) * 0.1
+
+    # PyTorch CPU has incomplete float8 support for zeros/fill; initialise through
+    # a uint8 carrier and view it as FP8 so the harness does not fail before NPU
+    # compilation.
+    def init_fp8(shape):
+        return torch.zeros(shape, dtype=torch.uint8).view(torch.float8_e4m3fn)
+
+    def init_e8m0(shape):
+        e8m0 = getattr(torch, "float8_e8m0fnu", None)
+        if e8m0 is None:
+            return torch.zeros(shape, dtype=torch.uint8)
+        return torch.zeros(shape, dtype=torch.uint8).view(e8m0)
+
+    def init_tid2eid():
+        return torch.randint(0, N_EXPERTS, (VOCAB, TOPK), dtype=torch.int32)
+
+    def init_input_ids():
+        return torch.randint(0, VOCAB, (T,), dtype=torch.int64)
+
+    return [
+        TensorSpec("x_mixed", [T, D], torch.bfloat16, init_value=init_x_mixed),
+        TensorSpec("norm_w", [D], torch.bfloat16, init_value=init_norm_w),
+        TensorSpec("gate_w", [N_EXPERTS, D], torch.float32, init_value=init_gate_w),
+        TensorSpec("gate_bias", [N_EXPERTS], torch.float32, init_value=init_gate_bias),
+        ScalarSpec("layer_id", torch.int32, layer_id),
+        ScalarSpec("num_tokens", torch.int32, num_tokens),
+        TensorSpec("tid2eid", [VOCAB, TOPK], torch.int32, init_value=init_tid2eid),
+        TensorSpec("input_ids", [T], torch.int64, init_value=init_input_ids),
+        TensorSpec("x_norm_mx", [T_PAD, D], torch.float8_e4m3fn, init_value=lambda: init_fp8((T_PAD, D))),
+        TensorSpec("x_norm_scale", [1, T_PAD * MX_SCALE_GROUPS], getattr(torch, "float8_e8m0fnu", torch.uint8), init_value=lambda: init_e8m0((1, T_PAD * MX_SCALE_GROUPS))),
+        TensorSpec("indices", [T, TOPK], torch.int32),
+        TensorSpec("weights", [T, TOPK], torch.float32),
+    ]
+
+
 def gate_indices_compare(
     layer_id,
     num_tokens,
@@ -396,7 +446,15 @@ def gate_indices_compare(
     score_rtol=2e-5,
     max_show=10,
 ):
-    """Validate router ids against exact hash routes or bounded score routes."""
+    """Validate router ids against exact hash routes or bounded score routes.
+
+    ``topk_pair_compare`` cannot stand in for this: it adjudicates an index
+    swap by checking whether the paired *weights* field stays locally
+    monotonic, but selection is driven by the biased score
+    (``scores + gate_bias``), not by the unbiased ``weights`` the device
+    reports. Only the host-recomputed biased score tells us whether a swapped
+    pair is a genuine tie at the top-k cutoff.
+    """
     import torch
 
     active_tokens = max(0, min(T, int(num_tokens)))
@@ -543,167 +601,7 @@ def gate_indices_compare(
     return cmp
 
 
-def gate_weights_compare(
-    num_tokens,
-    *,
-    # Cube FP32 reduction accumulates in a different order from CPU GEMM; the
-    # budgets below match the score comparator and stay well below the routing
-    # score spacing.
-    score_atol=2e-4,
-    score_rtol=5e-5,
-    weight_math_atol=2e-4,
-    weight_sum_atol=2e-5,
-    max_show=10,
-):
-    """Validate weights against unbiased CPU scores at the device-selected ids."""
-    import torch
-
-    active_tokens = max(0, min(T, int(num_tokens)))
-
-    def cmp(
-        actual,
-        expected,
-        *,
-        actual_outputs,
-        expected_outputs,
-        inputs,
-        rtol,
-        atol,
-    ):
-        del expected_outputs, rtol, atol
-        actual = actual.cpu().to(torch.float32)
-        if actual.shape != expected.shape:
-            return False, (
-                f"    weight shape mismatch: {tuple(actual.shape)} vs "
-                f"{tuple(expected.shape)}"
-            )
-        if "indices" not in actual_outputs:
-            return False, "    compare_fn misconfigured: actual indices output is missing"
-
-        inactive = actual[active_tokens:]
-        inactive_nonzero = int(inactive.count_nonzero().item())
-        if inactive_nonzero:
-            return False, (
-                f"    inactive weight tail contains {inactive_nonzero} nonzero values"
-            )
-        actual = actual[:active_tokens]
-        if actual.numel() == 0:
-            return True, ""
-        if not torch.isfinite(actual).all().item():
-            return False, "    device router weights contain NaN or Inf"
-        if (actual <= 0).any().item():
-            return False, "    active device router weights must be positive"
-        weight_sum = actual.sum(dim=-1)
-        sum_bad = (weight_sum - ROUTE_SCALE).abs() > weight_sum_atol
-        if sum_bad.any().item():
-            rows = sum_bad.nonzero(as_tuple=False).flatten()
-            lines = [
-                f"    router weight sum differs from ROUTE_SCALE={ROUTE_SCALE} "
-                f"in {rows.numel()} row(s), atol={weight_sum_atol}"
-            ]
-            for row in rows[:max_show].tolist():
-                lines.append(f"      row {row}: sum={float(weight_sum[row]):.8g}")
-            return False, "\n".join(lines)
-
-        indices = actual_outputs["indices"].cpu()[:active_tokens].to(torch.int64)
-        if indices.shape != actual.shape:
-            return False, (
-                f"    index/weight shape mismatch: indices={tuple(indices.shape)} "
-                f"weights={tuple(actual.shape)}"
-            )
-        invalid = (indices < 0) | (indices >= N_EXPERTS)
-        if invalid.any().item():
-            return False, "    cannot validate weights: device route contains invalid ids"
-        sorted_ids = torch.sort(indices, dim=-1).values
-        if (sorted_ids[:, 1:] == sorted_ids[:, :-1]).any().item():
-            return False, "    cannot validate weights: device route contains duplicate ids"
-
-        _, _, scores, _ = _golden_gate_scores(inputs)
-        selected_scores = torch.gather(scores[:active_tokens], dim=-1, index=indices)
-        selected_error = score_atol + score_rtol * selected_scores.abs()
-        score_sum = selected_scores.sum(dim=-1, keepdim=True)
-        error_sum = selected_error.sum(dim=-1, keepdim=True)
-        if (score_sum <= error_sum).any().item():
-            return False, "    router score uncertainty is larger than selected score sum"
-        reference = selected_scores / score_sum
-        reference = reference * ROUTE_SCALE
-        tolerance = ROUTE_SCALE * (
-            score_sum * selected_error + selected_scores * error_sum
-        ) / (score_sum * (score_sum - error_sum))
-        tolerance = tolerance + weight_math_atol
-        close = (actual - reference).abs() <= tolerance
-        if close.all().item():
-            return True, ""
-
-        bad = (~close).nonzero(as_tuple=False)
-        lines = [
-            f"    weights do not match unbiased CPU scores at device-selected ids: "
-            f"{bad.shape[0]}/{actual.numel()} mismatch(es)"
-        ]
-        for row, pos in bad[:max_show].tolist():
-            lines.append(
-                f"      [{row},{pos}] id={int(indices[row, pos])} "
-                f"actual={float(actual[row, pos]):.8g} "
-                f"expected_for_id={float(reference[row, pos]):.8g} "
-                f"tol={float(tolerance[row, pos]):.8g}"
-            )
-        return False, "\n".join(lines)
-
-    cmp.__name__ = "gate_weights_compare"
-    return cmp
-
-
-def build_tensor_specs(layer_id=0, num_tokens=T):
-    import torch
-    from golden import ScalarSpec, TensorSpec
-
-    def init_x_mixed():
-        return torch.randn(T, D)
-
-    def init_norm_w():
-        return torch.ones(D)
-
-    def init_gate_w():
-        return torch.randn(N_EXPERTS, D) / D ** 0.5
-
-    def init_gate_bias():
-        return torch.randn(N_EXPERTS) * 0.1
-
-    # PyTorch CPU has incomplete float8 support for zeros/fill; initialise through
-    # a uint8 carrier and view it as FP8 so the harness does not fail before NPU
-    # compilation.
-    def init_fp8(shape):
-        return torch.zeros(shape, dtype=torch.uint8).view(torch.float8_e4m3fn)
-
-    def init_e8m0(shape):
-        e8m0 = getattr(torch, "float8_e8m0fnu", None)
-        if e8m0 is None:
-            return torch.zeros(shape, dtype=torch.uint8)
-        return torch.zeros(shape, dtype=torch.uint8).view(e8m0)
-
-    def init_tid2eid():
-        return torch.randint(0, N_EXPERTS, (VOCAB, TOPK), dtype=torch.int32)
-
-    def init_input_ids():
-        return torch.randint(0, VOCAB, (T,), dtype=torch.int64)
-
-    return [
-        TensorSpec("x_mixed", [T, D], torch.bfloat16, init_value=init_x_mixed),
-        TensorSpec("norm_w", [D], torch.bfloat16, init_value=init_norm_w),
-        TensorSpec("gate_w", [N_EXPERTS, D], torch.float32, init_value=init_gate_w),
-        TensorSpec("gate_bias", [N_EXPERTS], torch.float32, init_value=init_gate_bias),
-        ScalarSpec("layer_id", torch.int32, layer_id),
-        ScalarSpec("num_tokens", torch.int32, num_tokens),
-        TensorSpec("tid2eid", [VOCAB, TOPK], torch.int32, init_value=init_tid2eid),
-        TensorSpec("input_ids", [T], torch.int64, init_value=init_input_ids),
-        TensorSpec("x_norm_mx", [T_PAD, D], torch.float8_e4m3fn, init_value=lambda: init_fp8((T_PAD, D))),
-        TensorSpec("x_norm_scale", [1, T_PAD * MX_SCALE_GROUPS], getattr(torch, "float8_e8m0fnu", torch.uint8), init_value=lambda: init_e8m0((1, T_PAD * MX_SCALE_GROUPS))),
-        TensorSpec("indices", [T, TOPK], torch.int32),
-        TensorSpec("weights", [T, TOPK], torch.float32),
-    ]
-
-
-def mxfp8_activation_value_compare(actual, expected, *, actual_outputs, expected_outputs, **_kwargs):
+def mxfp8_activation_value_compare(actual, expected, *, actual_outputs, expected_outputs, **kwargs):
     """Compare MXFP8 activations by dequantised value, not by non-unique bytes.
 
     quant_mx may scale the payload and the E8M0 scale by the same power of two
@@ -723,28 +621,11 @@ def mxfp8_activation_value_compare(actual, expected, *, actual_outputs, expected
 
     actual_value = decode(actual_outputs, "x_norm_mx")
     expected_value = decode(expected_outputs, "x_norm_mx")
-    diff = (actual_value - expected_value).abs()
-    # The dequantised bf16/fp8 budget is tighter than the gate's main output: it
-    # only absorbs equivalent scale representations and does not relax the real
-    # numerical error.
-    tolerance = 2e-3 + 2e-3 * expected_value.abs()
-    bad = diff > tolerance
-    if not torch.isfinite(actual_value).all() or not torch.isfinite(expected_value).all():
-        return False, "    dequantized MXFP8 activation contains NaN/Inf"
-    count = int(bad.sum().item())
-    if count == 0:
-        return True, ""
-    bad_idx = torch.where(bad.flatten())[0][:8]
-    actual_flat = actual_value.flatten()
-    expected_flat = expected_value.flatten()
-    details = "; ".join(
-        f"[{int(i)}] actual={float(actual_flat[i]):.6g} expected={float(expected_flat[i]):.6g}"
-        for i in bad_idx
-    )
-    max_diff = float(diff.max().item())
-    return False, (
-        f"    dequantized MXFP8 mismatch: {count}/{diff.numel()} points, "
-        f"max_abs_diff={max_diff:.6g}; {details}"
+    from golden import ratio_allclose
+
+    check = ratio_allclose(atol=2e-3, rtol=2e-3, max_error_ratio=0.0, max_show=8)
+    return check(
+        actual_value, expected_value, actual_outputs=actual_outputs, expected_outputs=expected_outputs, **kwargs,
     )
 
 
@@ -784,7 +665,6 @@ if __name__ == "__main__":
             # must not be compared bitwise on its own.
             "x_norm_scale": mxfp8_activation_value_compare,
             "indices": gate_indices_compare(args.layer_id, args.num_tokens),
-            "weights": gate_weights_compare(args.num_tokens),
         },
     )
     if not result.passed:

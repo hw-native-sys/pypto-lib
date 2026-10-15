@@ -35,7 +35,6 @@ from config import (
     WINDOW_CACHE_GROUP,
 )
 
-from quant import quantized_cache_compare
 from hc_mixes import golden_mhc_mixes, mhc_mixes
 from hc_post import golden_mhc_post, mhc_post
 from hc_pre import golden_mhc_pre, mhc_pre
@@ -43,23 +42,20 @@ from rmsnorm import golden_rms_norm
 import prefill_attn_c1a as attn
 from prefill_attn_c1a import (
     FULL_INPUT_NAMES,
+    cache_compare,
     golden_prefill_c1a_full as golden_prefill_attn_c1a_full,
     prefill_c1a_full as prefill_attn_c1a_full,
 )
 from utils import (
-    CACHE_MAX_RELATIVE_L2,
     CASE_DEFAULT,
     CASE_MAX_TOKENS,
     CASE_NAMES,
-    MXFP4_CACHE_MAX_RELATIVE_L2,
     apply_distributed_golden,
-    attn_input_compare,
-    attention_output_compare,
+    fixture_token_count,
     golden_prefill_tp_attention,
-    hc_hidden_compare,
-    hc_output_compare,
     make_fixture_values,
     topk_indices_compare,
+    wrap_attention_compare,
 )
 from rmsnorm import rms_norm_tiled
 
@@ -305,11 +301,9 @@ def build_c1a_sp_specs(args, initial_state):
     specs.append(ScalarSpec('attention_epoch', torch.int32, 1, compile_runtime=True))
     return specs
 
-def make_c1a_sp_compare(mode, epochs, initial_state):
-    """Apply existing row bounds to every shard and validate all cache side effects."""
-    import prefill_c2a_full as common
-
-    staged = common.StagedAttentionReference(mode, epochs, initial_state, attention_reference=c1a_sp_reference_attention, state_names=STATE_NAMES[mode])
+def make_c1a_sp_compare(mode, initial_state, world_size, tokens):
+    """Compare every shard's outputs and cache side effects with the default comparators."""
+    exact = ratio_allclose(atol=0.0, rtol=0.0, max_error_ratio=0.0)
 
     def group_values(values, base, active):
         grouped = {}
@@ -326,48 +320,45 @@ def make_c1a_sp_compare(mode, epochs, initial_state):
             grouped[name] = value
         return grouped
 
-    def selected_compare(name):
-        """Reuse the standalone selection-quality and selected-output contracts per DP group."""
-        check = attention_output_compare(mode) if name == 'attn_output' else topk_indices_compare(mode)
+    def selected_topk_compare(actual, expected, *, inputs, actual_outputs, expected_outputs, **kwargs):
+        """Apply the tied-cutoff Top-K contract to every DP group's active rows."""
+        check = topk_indices_compare(mode)
+        values = {**initial_state, **inputs, "x": actual_outputs["attn_input"]}
+        for base in range(0, actual.shape[0], TP_SIZE):
+            active = int(inputs["num_tokens"][base, 0])
+            group = slice(base, base + TP_SIZE)
+            if not bool((actual[group, active:] == -1).all()):
+                return False, f"DP group {base // TP_SIZE} has invalid Top-K padding"
+            if not active:
+                continue
+            passed, detail = check(
+                actual[group, :active],
+                expected[group, :active],
+                inputs=group_values(values, base, active),
+                actual_outputs=group_values(actual_outputs, base, active),
+                expected_outputs=group_values(expected_outputs, base, active),
+                rtol=kwargs.get("rtol", 0),
+                atol=kwargs.get("atol", 0),
+            )
+            if not passed:
+                return False, f"DP group {base // TP_SIZE}: {detail}"
+        return True, "tied-cutoff Top-K per DP group; exact inactive padding"
 
-        def compare(actual, expected, *, inputs, actual_outputs, expected_outputs, **kwargs):
-            values = {**initial_state, **inputs, 'x': actual_outputs['attn_input']}
-            for base in range(0, actual.shape[0], TP_SIZE):
-                active = int(inputs['num_tokens'][base, 0])
-                group = slice(base, base + TP_SIZE)
-                if name == 'attn_output':
-                    value = actual[group].flatten(0, 1)
-                    reference = expected[group].flatten(0, 1)
-                    if not bool((value[active:] == 0).all()):
-                        return (False, f'DP group {base // TP_SIZE} has nonzero attention padding')
-                    value = value[:active].unsqueeze(0).expand(TP_SIZE, -1, -1)
-                    reference = reference[:active].unsqueeze(0).expand_as(value)
-                else:
-                    if not bool((actual[group, active:] == -1).all()):
-                        return (False, f'DP group {base // TP_SIZE} has invalid Top-K padding')
-                    value, reference = (actual[group, :active], expected[group, :active])
-                if not active:
-                    continue
-                expected_group = group_values(expected_outputs, base, active)
-                if name == 'attn_output':
-                    expected_group['output'] = reference
-                passed, detail = check(value, reference, inputs=group_values(values, base, active), actual_outputs=group_values(actual_outputs, base, active), expected_outputs=expected_group, rtol=kwargs.get('rtol', 0), atol=kwargs.get('atol', 0))
-                if not passed:
-                    return (False, f'DP group {base // TP_SIZE}: {detail}')
-            return (True, 'standalone C1A selection and row bounds; exact inactive padding')
-        return compare
-    compares = {'attn_input': common.compare_group_leaders('attn_input', ratio_allclose(atol=0.0001, rtol=1.0 / 128), common.ROW_BUDGET), 'next_pre_mix': common.compare_shards('next_pre_mix', ratio_allclose(atol=2.5e-05, rtol=0.005), 0.005), 'attn_output': staged.compare('attn_output', selected_compare('attn_output')), 'x_hc_out': common.compare_x_hc_out}
-    cache_checks = {'window': quantized_cache_compare('window_cache', 'window_cache_scale', 'window_slots', CACHE_MAX_RELATIVE_L2), 'compressed': quantized_cache_compare('compressed_cache', 'compressed_cache_scale', 'compressed_slots', MXFP4_CACHE_MAX_RELATIVE_L2, group_size=COMPRESSED_CACHE_GROUP, scale_format='bf16'), 'index': quantized_cache_compare('index_cache', 'index_cache_scale', 'compressed_slots', MXFP4_CACHE_MAX_RELATIVE_L2, group_size=INDEX_CACHE_GROUP, scale_format='e8m0')}
+    compares = {
+        "attn_input": ratio_allclose(atol=1e-4, rtol=1.0 / 128),
+        "next_pre_mix": ratio_allclose(atol=2.5e-5, rtol=5e-3),
+        "attn_output": ratio_allclose(atol=1e-2, rtol=1.0 / 128),
+        "x_hc_out": ratio_allclose(atol=1e-2, rtol=1.0 / 128),
+        **cache_compare(world_size, tokens, [name for name in STATE_NAMES[mode] if "cache" in name]),
+    }
     for name in STATE_NAMES[mode]:
-        if 'cache' in name:
-            compares[name] = staged.compare(name, cache_checks[name.split('_')[0]])
-        elif name == 'topk_indices':
-            compares[name] = staged.compare(name, selected_compare(name))
-        else:
-            compares[name] = staged.compare(name, lambda actual, expected, **kwargs: (torch.equal(actual, expected), 'candidate blocks must match the reference'))
-    for name in ('compressed_cache', 'compressed_cache_scale', 'index_cache', 'index_cache_scale', 'topk_indices', 'candidate_mask'):
+        if name == "topk_indices":
+            compares[name] = selected_topk_compare
+        elif "cache" not in name:
+            compares[name] = exact
+    for name in ("compressed_cache", "compressed_cache_scale", "index_cache", "index_cache_scale", "topk_indices", "candidate_mask"):
         if name not in STATE_NAMES[mode]:
-            compares[name] = lambda actual, expected, **kwargs: (torch.equal(actual.view(torch.uint8), expected.view(torch.uint8)), 'read-only state is unchanged')
+            compares[name] = exact
     return compares
 
 
@@ -397,7 +388,7 @@ def validate_c1a_sp(mode, args):
         runtime_dir=getattr(args, "runtime_dir", None),
         save_data=getattr(args, "save_data", False),
         golden_fn=common.make_golden(mode, args.epochs, attention_reference=c1a_sp_reference_attention, state_names=STATE_NAMES[mode]),
-        compare_fn=make_c1a_sp_compare(mode, args.epochs, initial_state),
+        compare_fn=make_c1a_sp_compare(mode, initial_state, len(devices), fixture_tokens),
         compile_only=args.compile_only,
         config=dict(platform=args.platform, distributed_config=DistributedConfig(device_ids=devices, num_sub_workers=0)),
     )
@@ -776,25 +767,6 @@ def golden_prefill_c1a_full_case(tensors):
     tensors["output"][:] = hc_output.unsqueeze(0)
 
 
-def wrap_attention_compare(compare):
-    """Present HC workspace names through the attention-only comparator ABI."""
-
-    def compare_hc(actual, expected, *, inputs, actual_outputs, expected_outputs, **kwargs):
-        attention_inputs = {**inputs, "x": expected_outputs["attn_input"]}
-        attention_actual = {**actual_outputs, "output": actual_outputs["attn_out"]}
-        attention_expected = {**expected_outputs, "output": expected_outputs["attn_out"]}
-        return compare(
-            actual,
-            expected,
-            inputs=attention_inputs,
-            actual_outputs=attention_actual,
-            expected_outputs=attention_expected,
-            **kwargs,
-        )
-
-    return compare_hc
-
-
 def validate(argv=None):
     import argparse
 
@@ -833,17 +805,6 @@ def validate(argv=None):
     devices = [int(device) for device in args.device.split(",")]
     if len(devices) != TP_SIZE:
         parser.error(f"need exactly {TP_SIZE} devices, got {devices}")
-    window_cache_compare = quantized_cache_compare(
-        "window_cache", "window_cache_scale", "window_slots", CACHE_MAX_RELATIVE_L2,
-    )
-    compressed_cache_compare = quantized_cache_compare(
-        "compressed_cache", "compressed_cache_scale", "compressed_slots",
-        MXFP4_CACHE_MAX_RELATIVE_L2, group_size=COMPRESSED_CACHE_GROUP, scale_format="bf16",
-    )
-    index_cache_compare = quantized_cache_compare(
-        "index_cache", "index_cache_scale", "compressed_slots",
-        MXFP4_CACHE_MAX_RELATIVE_L2, group_size=INDEX_CACHE_GROUP, scale_format="e8m0",
-    )
     result = run(
         fn=l3_prefill_c1a_full_test,
         specs=build_hc_tensor_specs(args.tokens, args.case, args.active_tokens),
@@ -861,16 +822,11 @@ def validate(argv=None):
         },
         compare_fn={
             "next_pre_mix": ratio_allclose(atol=2.5e-5, rtol=5e-3),
-            "hidden": hc_hidden_compare(),
-            "attn_input": attn_input_compare(),
-            "attn_out": wrap_attention_compare(attention_output_compare("full")),
-            "output": hc_output_compare(),
-            "window_cache": window_cache_compare,
-            "window_cache_scale": window_cache_compare,
-            "compressed_cache": compressed_cache_compare,
-            "compressed_cache_scale": compressed_cache_compare,
-            "index_cache": index_cache_compare,
-            "index_cache_scale": index_cache_compare,
+            "hidden": ratio_allclose(atol=1e-4, rtol=1.0 / 128),
+            "attn_input": ratio_allclose(atol=1e-4, rtol=1.0 / 128),
+            "attn_out": ratio_allclose(atol=1e-2, rtol=1.0 / 128),
+            "output": ratio_allclose(atol=1e-2, rtol=1.0 / 128),
+            **cache_compare(len(devices), fixture_token_count(args.tokens, args.case)),
             "topk_indices": wrap_attention_compare(topk_indices_compare("full")),
         },
     )

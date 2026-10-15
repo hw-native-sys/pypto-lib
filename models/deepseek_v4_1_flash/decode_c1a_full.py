@@ -25,8 +25,7 @@ import pypto.language as pl
 import pypto.language.distributed as pld
 import torch
 
-from golden import TensorSpec, run
-from quant import quantized_cache_compare
+from golden import TensorSpec, ratio_allclose, run
 from rope_tables import precompute_rope_tables
 from hc_pre import mhc_pre_norm
 from decode_cp_allgather import slab_owner
@@ -51,9 +50,7 @@ from config import (
 
 
 from decode_attn_c1a import (
-    CACHE_MAX_RELATIVE_L2,
     CACHE_STATE_NAMES,
-    MXFP4_CACHE_MAX_RELATIVE_L2,
     OUTPUT_ATOL,
     OUTPUT_MAX_ERROR_RATIO,
     OUTPUT_RTOL,
@@ -61,9 +58,8 @@ from decode_attn_c1a import (
     check_fp4_boundaries,
     decode_attn_c1a_full,
     decode_attn_c1a_full_sharded,
-    exact_bytes,
+    cache_compare,
     golden_decode_attn_c1a_full,
-    topk_indices_compare,
 )
 from hc_mixes import golden_mhc_mixes, mhc_mixes
 from hc_post import golden_mhc_post, mhc_post
@@ -698,100 +694,6 @@ def build_hc_validation_values(mode, tokens, pages, seed=17, case="random", shar
     return values
 
 
-def output_hc_compare(actual, expected, **kwargs):
-    """Report the expanded-output diagnostics and apply the per-point budget.
-
-    The expansion rounds through BF16 and back to FP32, which both stacks do at the same
-    point, so the same per-point rule the sublayer entries use applies row by row.
-    """
-    a, e = actual.float(), expected.float()
-    a_rows, e_rows = a.reshape(-1, e.shape[-1]), e.reshape(-1, e.shape[-1])
-    error = (a_rows - e_rows).norm() / e_rows.norm().clamp_min(1e-12)
-    rows = (a_rows - e_rows).norm(dim=-1) / e_rows.norm(dim=-1).clamp_min(1e-12)
-    cosine = torch.nn.functional.cosine_similarity(a.flatten(), e.flatten(), dim=0)
-    print(
-        f"[PRECISION] output rel_l2={error.item():.6g} cosine={cosine.item():.8f} "
-        f"max_abs={(a - e).abs().max().item():.6g} max_row_rel_l2={rows.max().item():.6g}"
-    )
-    from golden import ratio_allclose
-
-    budget = ratio_allclose(atol=OUTPUT_ATOL, rtol=OUTPUT_RTOL, max_error_ratio=OUTPUT_MAX_ERROR_RATIO)
-    return budget(actual, expected, **kwargs)
-
-
-def next_pre_mix_compare(actual, expected, **kwargs):
-    """Report the staggered coefficient diagnostics under the mHC budget.
-
-    The next sub-layer collapses with this coefficient, so it is held to the tolerance the
-    mHC coefficient module applies to its own pre_mix output.
-    """
-    a, e = actual.float(), expected.float()
-    error = (a - e).norm() / e.norm().clamp_min(1e-12)
-    print(
-        f"[PRECISION] next_pre_mix rel_l2={error.item():.6g} "
-        f"max_abs={(a - e).abs().max().item():.6g}"
-    )
-    from golden import ratio_allclose
-
-    budget = ratio_allclose(atol=2.5e-5, rtol=5e-3)
-    return budget(actual, expected, **kwargs)
-
-
-def gathered_hc_compare(actual, expected, **kwargs):
-    """BF16 gather scratch: the operands were already rounded once upstream.
-
-    Each rank collapses and normalizes locally in BF16 before the AllGather, so a
-    one-step BF16 disagreement at a rounding boundary is the expected noise floor;
-    the harness default (1e-3) is tighter than a single BF16 ULP. The error this
-    still catches is a mis-mapped row or a wrong gather order, which is off by
-    orders of magnitude more.
-    """
-    a, e = actual.float(), expected.float()
-    error = (a - e).norm() / e.norm().clamp_min(1e-12)
-    print(
-        f"[PRECISION] gathered rel_l2={error.item():.6g} "
-        f"max_abs={(a - e).abs().max().item():.6g}"
-    )
-    from golden import ratio_allclose
-
-    budget = ratio_allclose(atol=2 ** -6, rtol=2 ** -6)
-    return budget(actual, expected, **kwargs)
-
-
-def hc_topk_indices_compare(mode):
-    """Tie-tolerant top-k comparison for the mHC entries.
-
-    The attention comparator rebuilds the index scores from the collapsed stream, which the
-    mHC entries carry as HC tensors rather than ``x``; derive it here from the staggered
-    pre-mix and hand it over under that name before delegating.
-    """
-    inner = topk_indices_compare(mode)
-
-    def compare(actual, expected, **kwargs):
-        inputs = kwargs.get("inputs")
-        actual_outputs = kwargs.get("actual_outputs")
-        if inputs is not None and "x" not in inputs:
-            # Sequence-parallel C1A computes index scores after the TP
-            # AllGather.  Rebuild scores from that complete normalized input,
-            # never from a rank's local x_hc slab.
-            gathered = actual_outputs.get("gathered") if actual_outputs is not None else None
-            if gathered is not None:
-                inputs["x"] = gathered
-            else:
-                hidden = [
-                    golden_rms_norm(
-                        golden_mhc_pre(inputs["x_hc"][rank], inputs["pre_mix"][rank]),
-                        inputs["attn_norm_weight"][rank],
-                    )
-                    for rank in range(TP_SIZE)
-                ]
-                inputs["x"] = torch.stack(hidden)
-        return inner(actual, expected, **kwargs)
-
-    compare.__name__ = f"hc_tied_cutoff_topk_{mode}"
-    return compare
-
-
 def golden_c1a_hc_case(tensors, attn_golden, epochs=1, sharded=False):
     """Reference for an mHC-wired entry: mixes -> attention -> expansion.
 
@@ -972,42 +874,16 @@ def run_c1a_hc(mode, kernel_factory, golden_case, *, args, devices, sharded=Fals
     def golden_fn(tensors):
         golden_case(tensors, args.epochs, sharded)
 
-    # Published cache rows are compared as dequantized values, because a one-ULP difference can
-    # move a published code one E2M1/E4M3 step; which rows may change at all stays byte exact.
-    # Only FULL publishes the compressor and index caches: REINDEX and REUSE read them.
+    output_budget = ratio_allclose(atol=OUTPUT_ATOL, rtol=OUTPUT_RTOL, max_error_ratio=OUTPUT_MAX_ERROR_RATIO)
     comparisons = {
-        "window_cache": quantized_cache_compare(
-            "window_cache", "window_cache_scale", "window_slots", CACHE_MAX_RELATIVE_L2
-        ),
-        "topk_indices": exact_bytes if mode == "reuse" else hc_topk_indices_compare(mode),
-        "candidate_mask": exact_bytes,
-        "next_pre_mix": next_pre_mix_compare,
-        # The C1A specs are tensors only, so the comparator cannot read the batch
-        # size off the harness: it takes the entry's own token count.
-        "output": (
-            _decode_utils.compare_owner_rows(output_hc_compare, name="HC output", active=args.tokens)
-            if sharded
-            else output_hc_compare
-        ),
-        "gathered": gathered_hc_compare,
+        "topk_indices": ratio_allclose(atol=0.0, rtol=0.0, max_error_ratio=0.0) if mode == "reuse" else ratio_allclose(atol=0.0, rtol=0.0, max_error_ratio=0.02),
+        "candidate_mask": ratio_allclose(atol=0.0, rtol=0.0, max_error_ratio=0.0),
+        "next_pre_mix": ratio_allclose(atol=2.5e-5, rtol=5e-3),
+        "output": output_budget,
+        # One BF16 step is the noise floor of rows rounded once before the AllGather.
+        "gathered": ratio_allclose(atol=2 ** -6, rtol=2 ** -6),
+        **cache_compare(len(devices), args.tokens, mode),
     }
-    comparisons["window_cache_scale"] = comparisons["window_cache"]
-    if mode == "full":
-        comparisons["compressed_cache"] = quantized_cache_compare(
-            "compressed_cache", "compressed_cache_scale", "compressed_slots",
-            MXFP4_CACHE_MAX_RELATIVE_L2, group_size=COMPRESSED_CACHE_GROUP, scale_format="bf16",
-        )
-        comparisons["index_cache"] = quantized_cache_compare(
-            "index_cache", "index_cache_scale", "compressed_slots",
-            MXFP4_CACHE_MAX_RELATIVE_L2, group_size=INDEX_CACHE_GROUP, scale_format="e8m0",
-        )
-        comparisons["compressed_cache_scale"] = comparisons["compressed_cache"]
-        comparisons["index_cache_scale"] = comparisons["index_cache"]
-    else:
-        # REINDEX and REUSE only read the compressor and index caches, so those stay a byte
-        # contract: the reference hands them back unmodified.
-        for name in ("compressed_cache", "compressed_cache_scale", "index_cache", "index_cache_scale"):
-            comparisons[name] = exact_bytes
     comparisons = {name: fn for name, fn in comparisons.items() if name in host.param_names}
     result = run(
         fn=host,

@@ -32,29 +32,26 @@ from config import (
     WINDOW_CACHE_GROUP,
 )
 
-from quant import quantized_cache_compare
 from hc_mixes import golden_mhc_mixes, mhc_mixes
 from hc_post import golden_mhc_post, mhc_post
 from hc_pre import golden_mhc_pre, mhc_pre
 from rmsnorm import golden_rms_norm
 from prefill_attn_c1a import (
     REINDEX_INPUT_NAMES,
+    cache_compare,
     golden_prefill_c1a_reindex as golden_prefill_attn_c1a_reindex,
     prefill_c1a_reindex as prefill_attn_c1a_reindex,
 )
 from utils import (
-    CACHE_MAX_RELATIVE_L2,
     CASE_DEFAULT,
     CASE_MAX_TOKENS,
     CASE_NAMES,
     apply_distributed_golden,
-    attn_input_compare,
-    attention_output_compare,
+    fixture_token_count,
     golden_prefill_tp_attention,
-    hc_hidden_compare,
-    hc_output_compare,
     make_fixture_values,
     topk_indices_compare,
+    wrap_attention_compare,
 )
 from rmsnorm import rms_norm_tiled
 
@@ -416,25 +413,6 @@ def golden_prefill_c1a_reindex_case(tensors):
     tensors["output"][:] = hc_output.unsqueeze(0)
 
 
-def wrap_attention_compare(compare):
-    """Present HC workspace names through the attention-only comparator ABI."""
-
-    def compare_hc(actual, expected, *, inputs, actual_outputs, expected_outputs, **kwargs):
-        attention_inputs = {**inputs, "x": expected_outputs["attn_input"]}
-        attention_actual = {**actual_outputs, "output": actual_outputs["attn_out"]}
-        attention_expected = {**expected_outputs, "output": expected_outputs["attn_out"]}
-        return compare(
-            actual,
-            expected,
-            inputs=attention_inputs,
-            actual_outputs=attention_actual,
-            expected_outputs=attention_expected,
-            **kwargs,
-        )
-
-    return compare_hc
-
-
 def validate(argv=None):
     import argparse
 
@@ -474,9 +452,6 @@ def validate(argv=None):
     devices = [int(device) for device in args.device.split(",")]
     if len(devices) != TP_SIZE:
         parser.error(f"need exactly {TP_SIZE} devices, got {devices}")
-    window_cache_compare = quantized_cache_compare(
-        "window_cache", "window_cache_scale", "window_slots", CACHE_MAX_RELATIVE_L2,
-    )
     result = run(
         fn=l3_prefill_c1a_reindex_test,
         specs=build_hc_tensor_specs(args.tokens, args.case, args.active_tokens),
@@ -494,12 +469,11 @@ def validate(argv=None):
         },
         compare_fn={
             "next_pre_mix": ratio_allclose(atol=2.5e-5, rtol=5e-3),
-            "hidden": hc_hidden_compare(),
-            "attn_input": attn_input_compare(),
-            "attn_out": wrap_attention_compare(attention_output_compare("reindex")),
-            "output": hc_output_compare(),
-            "window_cache": window_cache_compare,
-            "window_cache_scale": window_cache_compare,
+            "hidden": ratio_allclose(atol=1e-4, rtol=1.0 / 128),
+            "attn_input": ratio_allclose(atol=1e-4, rtol=1.0 / 128),
+            "attn_out": ratio_allclose(atol=1e-2, rtol=1.0 / 128),
+            "output": ratio_allclose(atol=1e-2, rtol=1.0 / 128),
+            **cache_compare(len(devices), fixture_token_count(args.tokens, args.case), ("window_cache", "window_cache_scale")),
             "topk_indices": wrap_attention_compare(topk_indices_compare("reindex")),
         },
     )

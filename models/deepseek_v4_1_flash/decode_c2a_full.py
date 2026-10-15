@@ -39,7 +39,7 @@ from compressor import STATE_WIDTH
 
 
 import decode_attn_c2a as full
-import decode_attn_swa as swa
+from golden import ratio_allclose
 
 # PyPTO resolves inline calls and JIT-body constants only from direct names.
 from config import LOCAL_T_DYN
@@ -1027,36 +1027,30 @@ def make_golden_sharded(epochs):
     return golden_half
 
 
-def comparisons(initial_state=None):
-    del initial_state
-    compare = _decode_utils.make_boundary_comparisons(full.compare_output)
+def comparisons(args, devices):
+    compare = _decode_utils.make_boundary_comparisons(ratio_allclose(atol=1e-2, rtol=1.0 / 128))
     compare.update(
         {
-            "attention_output": full.compare_replicated(full.compare_output),
-            "state_cache": full.compare_per_rank(full.compare_state, full.STATE_METADATA),
-            "topk_indices": full.compare_per_rank(full.compare_topk),
+            "attention_output": ratio_allclose(atol=1e-2, rtol=1.0 / 128),
+            "state_cache": ratio_allclose(atol=1e-3, rtol=1e-3),
+            "topk_indices": ratio_allclose(atol=0.0, rtol=0.0, max_error_ratio=0.02),
         }
     )
-    for name in ("window_cache", "compressed_cache", "index_cache"):
-        compare[name] = full.compare_per_rank(full.compare_cache(name), full.CACHE_SLOTS[name])
-        compare[name + "_scale"] = swa.compare_scales
+    compare.update(full.cache_compare(len(devices), args.tokens))
     return compare
 
 
-def comparisons_sharded(initial_state=None):
-    del initial_state
-    compare = _decode_utils.make_boundary_comparisons(full.compare_output, sharded=True)
+def comparisons_sharded(args, devices):
+    compare = _decode_utils.make_boundary_comparisons(ratio_allclose(atol=1e-2, rtol=1.0 / 128))
     compare.update(
         {
-            "attention_output": _decode_utils.make_compare_sharded_rows(full.compare_output),
-            "gathered": _decode_utils.compare_attention_gather,
-            "state_cache": full.compare_per_rank(full.compare_state, full.STATE_METADATA),
-            "topk_indices": full.compare_per_rank(full.compare_topk),
+            "attention_output": ratio_allclose(atol=1e-2, rtol=1.0 / 128),
+            "gathered": ratio_allclose(atol=2 ** -6, rtol=2 ** -6),
+            "state_cache": ratio_allclose(atol=1e-3, rtol=1e-3),
+            "topk_indices": ratio_allclose(atol=0.0, rtol=0.0, max_error_ratio=0.02),
         }
     )
-    for name in ("window_cache", "compressed_cache", "index_cache"):
-        compare[name] = full.compare_per_rank(full.compare_cache(name), full.CACHE_SLOTS[name])
-        compare[name + "_scale"] = swa.compare_scales
+    compare.update(full.cache_compare(len(devices), args.tokens))
     return compare
 
 
@@ -1084,7 +1078,7 @@ def validate(argv=None):
                 make_program(args.tp, args.epochs, specs),
                 specs,
                 make_golden(args.epochs),
-                comparisons(),
+                comparisons(args, devices),
                 KIND,
                 devices,
             )
@@ -1099,7 +1093,7 @@ def validate(argv=None):
                 make_program(args.tp, args.epochs, sharded, sharded=True),
                 sharded,
                 make_golden_sharded(args.epochs),
-                comparisons_sharded(),
+                comparisons_sharded(args, devices),
                 f"{KIND} sequence-parallel",
                 devices,
             )

@@ -290,6 +290,40 @@ def mxfp8_linear(
     return partials.sum(dim=-2).to(output_dtype or x.dtype)
 
 
+def golden_bf16_gemm(lhs: torch.Tensor, rhs: torch.Tensor) -> torch.Tensor:
+    """BF16 GEMM with the A5 Cube's arithmetic: FP32 products, FP32 accumulator, one BF16 cast.
+
+    Torch's own BF16 GEMM rounds through its blocking; one ULP of difference is enough to move a
+    published E2M1/E8M0 row one code step, or to reorder a near-tied indexer cutoff.
+    """
+    return (lhs.float() @ rhs.float()).to(torch.bfloat16)
+
+
+def golden_mxfp8_quantize(value):
+    """Independent translation of official kernel.py act_quant_kernel, group size 32."""
+    groups = value.float().unflatten(-1, (-1, MX_GROUP))
+    maximum = groups.abs().amax(-1).clamp_min(1e-4)
+    exponent = torch.ceil(torch.log2(maximum * (1.0 / 448.0)))
+    scale = torch.pow(2.0, exponent)
+    payload = (groups / scale[..., None]).clamp(-448, 448).to(torch.float8_e4m3fn).flatten(-2)
+    return payload, (exponent + 127).to(torch.uint8)
+
+
+def golden_mxfp8_linear(x, weight, packed_scale, fp32=False):
+    """Match official FP8 GEMM's group-32 product, A scale, B scale, FP32 sum."""
+    payload, codes = golden_mxfp8_quantize(x)
+    activation, weights = payload.float(), weight.float()
+    scale_a = decode_e8m0(codes)
+    scale_b = decode_e8m0(unpack_mx_b_scale(packed_scale))
+    result = torch.zeros(x.shape[0], weight.shape[1], dtype=torch.float32)
+    for group in range(weight.shape[0] // MX_GROUP):
+        start = group * MX_GROUP
+        product = activation[:, start : start + MX_GROUP] @ weights[start : start + MX_GROUP]
+        scaled = product * scale_a[:, group : group + 1]
+        scaled = scaled * scale_b[group : group + 1]
+        result = result + scaled
+    return result if fp32 else result.bfloat16()
+
 # E8M0 has no native dtype in some PyTorch versions, so it is always carried as uint8.
 FP8_E4M3_MAX = 448.0
 
@@ -417,82 +451,3 @@ def _publish_quantized_cache(
     return updated_payload, updated_scale
 
 
-def quantized_cache_compare(
-    payload_name: str,
-    scale_name: str,
-    mapping_name: str,
-    max_relative_l2: float,
-    group_size: int | None = None,
-    scale_format: str | None = None,
-) -> Callable:
-    """Validate mapped cache values and exact storage ownership elsewhere."""
-
-    def compare(
-        _actual: torch.Tensor,
-        _expected: torch.Tensor,
-        *,
-        actual_outputs: dict[str, torch.Tensor],
-        expected_outputs: dict[str, torch.Tensor],
-        inputs: dict[str, torch.Tensor],
-        rtol: float,
-        atol: float,
-    ) -> tuple[bool, str]:
-        del rtol, atol
-        if group_size is None:
-            actual_value = dequantize_mxfp8_cache(
-                actual_outputs[payload_name],
-                actual_outputs[scale_name],
-            )
-            expected_value = dequantize_mxfp8_cache(
-                expected_outputs[payload_name],
-                expected_outputs[scale_name],
-            )
-        else:
-            actual_value = dequantize_mxfp4_cache(
-                actual_outputs[payload_name],
-                actual_outputs[scale_name],
-                group_size=group_size,
-                scale_format=scale_format,
-            )
-            expected_value = dequantize_mxfp4_cache(
-                expected_outputs[payload_name],
-                expected_outputs[scale_name],
-                group_size=group_size,
-                scale_format=scale_format,
-            )
-        physical_rows = actual_value.shape[1] * actual_value.shape[2]
-        actual_rows = actual_value.flatten(1, 2)
-        expected_rows = expected_value.flatten(1, 2)
-        active_actual = []
-        active_expected = []
-        for rank in range(actual_value.shape[0]):
-            active = torch.unique(inputs[mapping_name][rank].flatten().to(torch.int64), sorted=True)
-            active = active[active >= 0]
-            if active.numel() and int(active[-1]) >= physical_rows:
-                return False, f"    {mapping_name} row {int(active[-1])} exceeds {physical_rows}"
-            active_actual.append(actual_rows[rank, active])
-            active_expected.append(expected_rows[rank, active])
-            inactive = torch.ones(physical_rows, dtype=torch.bool)
-            inactive[active] = False
-            for name in (payload_name, scale_name):
-                actual_storage = actual_outputs[name][rank].contiguous().view(torch.uint8).reshape(physical_rows, -1)
-                expected_storage = expected_outputs[name][rank].contiguous().view(torch.uint8).reshape(
-                    physical_rows,
-                    -1,
-                )
-                if not torch.equal(actual_storage[inactive], expected_storage[inactive]):
-                    return False, f"    {name} modified inactive {mapping_name} rows"
-
-        actual_active = torch.cat(active_actual).float()
-        expected_active = torch.cat(active_expected).float()
-        if not torch.isfinite(actual_active).all() or not torch.isfinite(expected_active).all():
-            return False, f"    active {mapping_name} rows contain non-finite values"
-        relative_l2 = (actual_active - expected_active).norm() / expected_active.norm().clamp_min(1e-12)
-        print(f"[PRECISION] {payload_name} active_value_rel_l2={relative_l2.item():.6g}")
-        return (
-            bool(relative_l2 <= max_relative_l2),
-            f"    active {mapping_name} rows must stay within {max_relative_l2:.0%} relative L2",
-        )
-
-    compare.__name__ = f"dequantized_{payload_name}"
-    return compare

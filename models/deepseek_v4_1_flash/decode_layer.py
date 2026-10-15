@@ -10,7 +10,6 @@
 # ci: no-sim
 """DeepSeek-V4.1 decode Block composition and CPU reference."""
 
-import utils as _decode_utils
 
 import argparse
 import inspect
@@ -1357,6 +1356,7 @@ def validate(argv=None):
         parser.error(f"need exactly {EP_SIZE} devices, got {devices}")
     specs = build_tensor_specs(args.layer_id, args.seed)
     counts = _fixture_moe_counts()
+    exact = ratio_allclose(atol=0.0, rtol=0.0, max_error_ratio=0.0)
     return run(
         fn=l3_decode_layer,
         specs=specs,
@@ -1374,27 +1374,34 @@ def validate(argv=None):
             ring_heap=1073741824,
         ),
         compare_fn={
-            "window_cache": decode_attn_swa.compare_distributed_cache,
-            "window_cache_scale": decode_attn_swa.compare_scales,
-            "compressed_cache": _decode_utils.compare_unchanged("compressed_cache"),
-            "compressed_cache_scale": _decode_utils.compare_unchanged(
-                "compressed_cache_scale"
+            # Composed upstream rows can flip one FP8 code at a quantization boundary: allow
+            # one subnormal step (2**-9) plus one relative step (2**-3) on the payload, and
+            # less than 1% of mapped rows to miss even that (observed: 1/73728). The scale is
+            # a derived BF16 quantity (amax / 448): device and CPU can differ by a ULP, so
+            # allow a 2% relative ceiling there too (observed: 2/2304, max rel ~0.9%).
+            # window_slots is sized by the attention token capacity (DECODE_MAX_TOKENS), not
+            # the padded MoE dispatch capacity (MOE_TOKENS).
+            **decode_attn_swa.window_cache_compare(
+                EP_SIZE, DECODE_MAX_TOKENS, payload_atol=2 ** -9, payload_rtol=2 ** -3,
+                payload_error_ratio=0.01, scale_rtol=0.02, scale_error_ratio=0.01,
             ),
-            "index_cache": _decode_utils.compare_unchanged("index_cache"),
-            "index_cache_scale": _decode_utils.compare_unchanged("index_cache_scale"),
-            "state_cache": _decode_utils.compare_unchanged("state_cache"),
-            "topk_indices": _decode_utils.compare_unchanged("topk_indices"),
-            "candidate_mask": _decode_utils.compare_unchanged("candidate_mask"),
+            "compressed_cache": exact,
+            "compressed_cache_scale": exact,
+            "index_cache": exact,
+            "index_cache_scale": exact,
+            "state_cache": exact,
+            "topk_indices": exact,
+            "candidate_mask": exact,
             "attention_output": _compare_active_rows_per_rank(
-                decode_attn_swa.compare_output,
+                ratio_allclose(atol=1e-2, rtol=1.0 / 128),
                 counts,
             ),
             "attention_hidden": _compare_active_rows_per_rank(
-                decode_attn_swa.compare_output,
+                ratio_allclose(atol=1e-2, rtol=1.0 / 128),
                 counts,
             ),
             "attention_pre_mix": ratio_allclose(atol=1e-4, rtol=1e-4),
-            "gathered": _decode_utils.compare_attention_gather,
+            "gathered": ratio_allclose(atol=2 ** -6, rtol=2 ** -6),
             "next_pre_mix": _compare_active_rows_per_rank(
                 ratio_allclose(atol=2.5e-5, rtol=5e-3, max_error_ratio=0.03),
                 counts,

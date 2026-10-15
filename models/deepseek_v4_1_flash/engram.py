@@ -575,21 +575,6 @@ def golden_engram_tp_case(tensors):
     tensors["out"][:] = out.unsqueeze(0).expand_as(tensors["out"])
 
 
-def _precision_compare(name, compare):
-    """Report achieved precision before applying the tensor's acceptance budget."""
-
-    def compare_and_report(actual, expected, **kwargs):
-        actual_f = actual.double()
-        expected_f = expected.double()
-        diff = actual_f - expected_f
-        rel_l2 = diff.norm() / expected_f.norm().clamp_min(1e-12)
-        max_abs = diff.abs().max()
-        print(f"[PRECISION] {name} rel_l2={rel_l2.item():.8g} max_abs={max_abs.item():.8g}")
-        return compare(actual, expected, **kwargs)
-
-    return compare_and_report
-
-
 def validate(argv=None):
     """Validate the Engram block on A5 (or its simulator), single-rank or TP."""
     import argparse
@@ -635,7 +620,7 @@ def validate(argv=None):
             },
             rtol=1e-3,
             atol=1e-3,
-            compare_fn={"out": _precision_compare("out", ratio_allclose(atol=1e-3, rtol=1e-2))},
+            compare_fn={"out": ratio_allclose(atol=1e-3, rtol=1e-2)},
             compile_only=args.compile_only,
         )
     else:
@@ -655,7 +640,7 @@ def validate(argv=None):
             },
             rtol=1e-3,
             atol=1e-3,
-            compare_fn={"out": _precision_compare("out", ratio_allclose(atol=1e-3, rtol=1e-2))},
+            compare_fn={"out": ratio_allclose(atol=1e-3, rtol=1e-2)},
             compile_only=args.compile_only,
         )
     return result

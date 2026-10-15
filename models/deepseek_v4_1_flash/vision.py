@@ -22,9 +22,6 @@ import torch
 import torch.nn.functional as F
 from torch.nn.attention import SDPBackend, sdpa_kernel
 
-# ci: a5
-# ci: no-sim
-
 # Dynamic shape variables.
 ROWS = pl.dynamic("V41_VISION_ROWS")
 INPUT = pl.dynamic("V41_VISION_INPUT")

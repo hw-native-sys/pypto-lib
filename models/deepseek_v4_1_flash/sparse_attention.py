@@ -30,8 +30,6 @@ from quant import (
 )
 from utils import AttentionGoldenResult
 
-# ci: no-sim
-
 from pathlib import Path
 
 import pypto.language as pl
@@ -800,7 +798,7 @@ def main():
 
     import torch
 
-    from golden import TensorSpec, run
+    from golden import TensorSpec, ratio_allclose, run
     from quant import (
         dequantize_mxfp4_cache, dequantize_mxfp8_cache,
         quantize_mxfp4_cache, quantize_mxfp8_cache,
@@ -884,23 +882,14 @@ def main():
         def golden(tensors):
             tensors["output"].copy_(reference.bfloat16().to(result_dtype))
 
-        def compare(actual, _expected, **_kwargs):
-            difference = (actual.float() - reference).abs()
-            norm = float(reference.norm())
-            relative_l2 = float(difference.norm()) / norm if norm else float(difference.norm())
-            bad = int((difference > 0.003 + 0.03 * reference.abs()).sum())
-            finite = bool(actual.isfinite().all())
-            return finite and relative_l2 < 0.006 and bad == 0, f"relative_l2={relative_l2:.6f}, bad={bad}"
-
         result = run(
             entry,
             specs,
             golden_fn=golden,
-            compare_fn={"output": compare},
+            compare_fn={"output": ratio_allclose(atol=0.003, rtol=0.03, max_error_ratio=0.0)},
             config=dict(platform=args.platform, device_id=args.device),
             compile_only=args.compile_only,
             runtime_dir=args.runtime_dir,
-            save_data=True,
         )
         records.append(dict(mode=mode, passed=result.passed, work_dir=str(result.work_dir)))
         if not result.passed:

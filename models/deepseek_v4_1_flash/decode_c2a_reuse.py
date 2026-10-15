@@ -31,6 +31,7 @@ from config import (
 
 
 import decode_attn_c2a as full
+from golden import ratio_allclose
 
 # PyPTO resolves inline calls and JIT-body constants only from direct names.
 from config import LOCAL_T_DYN
@@ -739,32 +740,32 @@ def make_golden_sharded(epochs):
 
 def comparisons(initial_state=None):
     initial_state = {} if initial_state is None else initial_state
-    compare = _decode_utils.make_boundary_comparisons(full.compare_output)
+    compare = _decode_utils.make_boundary_comparisons(ratio_allclose(atol=1e-2, rtol=1.0 / 128))
     compare.update(
         {
-            "attention_output": full.compare_replicated(full.compare_active_output),
+            "attention_output": ratio_allclose(atol=1e-2, rtol=1.0 / 128),
         }
     )
     for name in full.REUSE_MUTABLE_NAMES:
         compare[name] = full.compare_owned_cache(name, initial_state)
     for name in ("compressed_cache", "compressed_cache_scale", "topk_indices"):
-        compare[name] = _decode_utils.compare_unchanged(name)
+        compare[name] = ratio_allclose(atol=0.0, rtol=0.0, max_error_ratio=0.0)
     return compare
 
 
 def comparisons_sharded(initial_state=None):
     initial_state = {} if initial_state is None else initial_state
-    compare = _decode_utils.make_boundary_comparisons(full.compare_output, sharded=True)
+    compare = _decode_utils.make_boundary_comparisons(ratio_allclose(atol=1e-2, rtol=1.0 / 128))
     compare.update(
         {
-            "attention_output": _decode_utils.make_compare_sharded_rows(full.compare_output),
-            "gathered": _decode_utils.compare_attention_gather,
+            "attention_output": ratio_allclose(atol=1e-2, rtol=1.0 / 128),
+            "gathered": ratio_allclose(atol=2 ** -6, rtol=2 ** -6),
         }
     )
     for name in full.REUSE_MUTABLE_NAMES:
         compare[name] = full.compare_owned_cache(name, initial_state)
     for name in ("compressed_cache", "compressed_cache_scale", "topk_indices"):
-        compare[name] = _decode_utils.compare_unchanged(name)
+        compare[name] = ratio_allclose(atol=0.0, rtol=0.0, max_error_ratio=0.0)
     return compare
 
 

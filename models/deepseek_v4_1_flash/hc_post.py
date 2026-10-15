@@ -171,21 +171,6 @@ def golden_mhc_post_case(tensors):
     )
 
 
-def _precision_compare(name, compare):
-    """Report achieved precision before applying the tensor's acceptance budget."""
-
-    def compare_and_report(actual, expected, **kwargs):
-        actual_f = actual.double()
-        expected_f = expected.double()
-        diff = actual_f - expected_f
-        rel_l2 = diff.norm() / expected_f.norm().clamp_min(1e-12)
-        max_abs = diff.abs().max()
-        print(f"[PRECISION] {name} rel_l2={rel_l2.item():.8g} max_abs={max_abs.item():.8g}")
-        return compare(actual, expected, **kwargs)
-
-    return compare_and_report
-
-
 def validate(argv=None):
     """Validate mHC residual expansion on A5."""
     import argparse
@@ -206,7 +191,7 @@ def validate(argv=None):
         config={"platform": args.platform, "device_id": args.device},
         rtol=1e-3,
         atol=1e-3,
-        compare_fn={"output": _precision_compare("output", ratio_allclose(atol=1e-4, rtol=1.0 / 128))},
+        compare_fn={"output": ratio_allclose(atol=1e-4, rtol=1.0 / 128)},
         compile_only=args.compile_only,
     )
     return result

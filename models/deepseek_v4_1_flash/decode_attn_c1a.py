@@ -14,16 +14,18 @@ from sparse_attention import attend_selected, gather_packed
 import pypto.language.distributed as pld
 import torch
 
-from golden import TensorSpec, run
+from golden import TensorSpec, mapped_pool_ratio_allclose, ratio_allclose, run
 from utils import AttentionGoldenResult
-from quant import quantized_cache_compare
+from quant import golden_bf16_gemm, golden_mxfp8_linear
 from qkv_proj_rope import (
+    golden_rope_tail,
     make_bf16_projection_with_deps,
     make_rope_with_deps,
 )
 from rmsnorm import rms_norm
 from config import (
     AttentionMode,
+    BLOCK_SIZE,
     COMPRESSED_CACHE_GROUP,
     FLASH as M,
     DECODE_MAX_TOKENS,
@@ -49,6 +51,7 @@ from decode_indexer import (
     select_index_topk,
 )
 from o_proj import (
+    golden_grouped_output,
     grouped_output_with_deps,
     make_o_proj_with_deps as build_o_proj_with_deps,
 )
@@ -89,13 +92,7 @@ CACHE_STATE_NAMES = (
     "candidate_mask",
 )
 
-# Validation budgets, matching the sibling C1A entries. A published cache row is compared as
-# dequantized values because a one-ULP difference can move a code one E2M1/E4M3 step; which rows
-# may change at all stays byte exact.
-CACHE_MAX_RELATIVE_L2 = 0.01
-MXFP4_CACHE_MAX_RELATIVE_L2 = 0.04
-TOPK_SCORE_ATOL = 5e-5
-TOPK_SCORE_RTOL = 1.5e-2
+# Validation budgets, matching the sibling C1A entries.
 OUTPUT_ATOL = 1e-2
 OUTPUT_RTOL = 1e-2
 OUTPUT_MAX_ERROR_RATIO = 0.01
@@ -620,37 +617,6 @@ def _make_fp4_publish_e8m0(width, group, cache_dim):
     return publish
 
 
-def _reference_linear(x, weight, packed_scale):
-    """Group-32 FP32 accumulation with the released activation rounding rule."""
-    from quant import decode_e8m0, unpack_mx_b_scale
-
-    groups = x.float().unflatten(-1, (-1, 32))
-    scale = torch.exp2(torch.ceil(torch.log2(groups.abs().amax(-1).clamp_min(1e-4) / 448.0)))
-    quantized = (groups / scale.unsqueeze(-1)).to(torch.float8_e4m3fn).float()
-    weight_scale = decode_e8m0(unpack_mx_b_scale(packed_scale))
-    acc = torch.zeros(*x.shape[:-1], weight.shape[-1], dtype=torch.float32)
-    for group in range(x.shape[-1] // 32):
-        dot = torch.matmul(quantized[..., group, :], weight[group * 32:(group + 1) * 32].float())
-        acc += dot * scale[..., group:group + 1] * weight_scale[group]
-    return acc.to(x.dtype)
-
-
-def _bf16_gemm(lhs, rhs):
-    """BF16 GEMM with the A5 Cube's arithmetic: FP32 products, FP32 accumulator, one BF16 cast.
-
-    The sibling operators pin this ABI explicitly (``decode_c2a_full.BF16_GEMM = "fp32"``)
-    because torch's BF16 GEMM rounds through its own blocking. One ULP of difference is
-    enough to move a published E2M1/E8M0 row one code step, or to reorder a near-tied
-    indexer cutoff, on one stack but not on another.
-    """
-    return (lhs.float() @ rhs.float()).to(torch.bfloat16)
-
-
-def _bf16_grouped(grouped, weight):
-    """Grouped low-rank GEMM with the same ABI: FP32 accumulation, one BF16 cast."""
-    return torch.einsum("tgd,grd->tgr", grouped.float(), weight.float()).to(torch.bfloat16)
-
-
 # E2M1 exact midpoints and the magnitude code the A5 publish kernels emit for
 # them: even codes win the tie, so 3.5 selects +4 and 2.5 selects +2.
 FP4_MIDPOINT_CODES = {0.25: 0, 0.75: 2, 1.25: 2, 1.75: 4, 2.5: 4, 3.5: 6, 5.0: 6}
@@ -765,7 +731,7 @@ def _reference_index_scores(a, qr, index_payload, index_scale, candidates):
     if candidates is not None:
         width = candidates.shape[-1]
     heads = a["index_weights_proj"].shape[-1]
-    iq = _reference_linear(qr, a["index_wq_b"], a["index_wq_b_scale"])
+    iq = golden_mxfp8_linear(qr, a["index_wq_b"], a["index_wq_b_scale"])
     if iq.shape[-1] % heads:
         raise RuntimeError(f"index query width {iq.shape[-1]} is not divisible by {heads} heads")
     dim = iq.shape[-1] // heads
@@ -775,7 +741,7 @@ def _reference_index_scores(a, qr, index_payload, index_scale, candidates):
     _, _, iq = _reference_fp4(iq, 32, "e8m0")
     keys = dequantize_mxfp4_cache(index_payload, index_scale, 32, "e8m0").to(x.dtype).flatten(0, 1)[:, 0]
     # The device scales the projected head weight in FP32 and rounds it once to BF16.
-    weight = _bf16_gemm(x, a["index_weights_proj"]).float() * (dim * heads) ** -0.5
+    weight = golden_bf16_gemm(x, a["index_weights_proj"]).float() * (dim * heads) ** -0.5
     weight = weight.to(torch.bfloat16).float()
     scores = torch.full((x.shape[0], width), -torch.inf)
     physical = torch.full((x.shape[0], width), -1, dtype=torch.int64)
@@ -791,7 +757,7 @@ def _reference_index_scores(a, qr, index_payload, index_scale, candidates):
             continue
         # Device order: BF16-cast the dot, ReLU in FP32, multiply by the rounded weight,
         # BF16-cast the product, sum in FP32, BF16-cast the total.
-        dots = _bf16_gemm(iq[t], keys[rows.long()].T)
+        dots = golden_bf16_gemm(iq[t], keys[rows.long()].T)
         product = dots.float().relu() * weight[t, :, None]
         values = product.to(torch.bfloat16).float().sum(0).to(torch.bfloat16).float()
         if candidates is not None:
@@ -800,10 +766,9 @@ def _reference_index_scores(a, qr, index_payload, index_scale, candidates):
     return scores, physical
 
 
-def official_reference_c1a(**args):
+def golden_reference_c1a(**args):
     """Released C1A math with caller-managed paged caches and replicated index heads."""
     from rmsnorm import golden_rms_norm
-    from qkv_proj_rope import golden_rope_interleave as rope_interleave
     from hierarchical_sparse_indexer import select_candidate_blocks
     from quant import (
         dequantize_mxfp4_cache, dequantize_mxfp8_cache,
@@ -811,18 +776,13 @@ def official_reference_c1a(**args):
 
     a = args
     x = a["x"]
-    qr = golden_rms_norm(_reference_linear(x, a["wq_a"], a["wq_a_scale"]), a["q_norm_weight"])
-    rd = a["rope_cos"].shape[-1] * 2
-
-    def rotate(value, cos, sin, inverse=False):
-        return torch.cat((value[..., :-rd], rope_interleave(value[..., -rd:], cos, sin, inverse)), -1)
-
+    qr = golden_rms_norm(golden_mxfp8_linear(x, a["wq_a"], a["wq_a_scale"]), a["q_norm_weight"])
     head_dim = a["wkv"].shape[-1]
 
-    q = _reference_linear(qr, a["wq_b"], a["wq_b_scale"]).unflatten(-1, (-1, head_dim))
-    q = rotate(q, a["rope_cos"], a["rope_sin"])
-    kv = golden_rms_norm(_reference_linear(x, a["wkv"], a["wkv_scale"]), a["kv_norm_weight"])
-    kv = rotate(kv, a["rope_cos"], a["rope_sin"])
+    q = golden_mxfp8_linear(qr, a["wq_b"], a["wq_b_scale"]).unflatten(-1, (-1, head_dim))
+    q = golden_rope_tail(q, a["rope_cos"], a["rope_sin"])
+    kv = golden_rms_norm(golden_mxfp8_linear(x, a["wkv"], a["wkv_scale"]), a["kv_norm_weight"])
+    kv = golden_rope_tail(kv, a["rope_cos"], a["rope_sin"])
     window = a["window_cache"].clone()
     window_scale = a["window_cache_scale"].clone()
     grouped = kv.float().unflatten(-1, (-1, 32))
@@ -838,11 +798,11 @@ def official_reference_c1a(**args):
     index_scale = None if a["index_cache_scale"] is None else a["index_cache_scale"].view(torch.uint8).clone()
     mode = a["mode"]
     if mode == AttentionMode.FULL:
-        latent = golden_rms_norm(_bf16_gemm(x, a["compressor_wkv"]), a["compressor_norm_weight"])
-        key = golden_rms_norm(_bf16_gemm(latent, a["index_wk"]), a["index_norm_weight"])
-        key = rotate(key, a["compressed_rope_cos"], a["compressed_rope_sin"])
+        latent = golden_rms_norm(golden_bf16_gemm(x, a["compressor_wkv"]), a["compressor_norm_weight"])
+        key = golden_rms_norm(golden_bf16_gemm(latent, a["index_wk"]), a["index_norm_weight"])
+        key = golden_rope_tail(key, a["compressed_rope_cos"], a["compressed_rope_sin"])
         kp, ks, _ = _reference_fp4(key, 32, "e8m0")
-        rotated = rotate(latent, a["compressed_rope_cos"], a["compressed_rope_sin"])
+        rotated = golden_rope_tail(latent, a["compressed_rope_cos"], a["compressed_rope_sin"])
         cp, cs, _ = _reference_fp4(rotated, 16, "bf16")
         valid = a["compressed_slots"] >= 0
         slots = a["compressed_slots"][valid].long()
@@ -879,11 +839,11 @@ def official_reference_c1a(**args):
     attended = _reference_sparse_attention(
         q, window_value, a["window_indices"], compressed_value, topk, a["attn_sink"]
     )
-    attended = rotate(attended, a["rope_cos"], a["rope_sin"], True)
+    attended = golden_rope_tail(attended, a["rope_cos"], a["rope_sin"], True)
     grouped = attended.flatten(-2).unflatten(-1, (a["wo_a"].shape[0], -1))
     # The device writes the grouped projection as BF16 after one FP32 accumulation.
-    latent = _bf16_grouped(grouped, a["wo_a"])
-    output = _reference_linear(latent.flatten(-2), a["wo_b"], a["wo_b_scale"])
+    latent = golden_grouped_output(grouped, a["wo_a"])
+    output = golden_mxfp8_linear(latent.flatten(-2), a["wo_b"], a["wo_b_scale"])
     return AttentionGoldenResult(output, window, window_scale, compressed, compressed_scale,
                                  index, index_scale, None, topk, candidates)
 
@@ -919,7 +879,7 @@ def golden_decode_attn_c1a_reuse(
     compressed_indices: torch.Tensor,
 ) -> AttentionGoldenResult:
     """Evaluate C1A decode reuse against the source layer caches."""
-    return official_reference_c1a(
+    return golden_reference_c1a(
         mode=AttentionMode.REUSE,
         ratio=1,
         x=x,
@@ -1000,7 +960,7 @@ def golden_decode_attn_c1a_reindex(
     index_weights_proj: torch.Tensor,
 ) -> AttentionGoldenResult:
     """Evaluate C1A decode reindex with the source candidate mask."""
-    return official_reference_c1a(
+    return golden_reference_c1a(
         mode=AttentionMode.REINDEX,
         ratio=1,
         x=x,
@@ -1101,7 +1061,7 @@ def golden_decode_attn_c1a_full(
     index_weights_proj: torch.Tensor,
 ) -> AttentionGoldenResult:
     """Evaluate C1A decode projection, cache publication and sparse attention."""
-    return official_reference_c1a(
+    return golden_reference_c1a(
         mode=AttentionMode.FULL,
         ratio=1,
         x=x,
@@ -1570,118 +1530,38 @@ def build_validation_values(mode, tokens, pages, seed=17, case="random"):
     return values
 
 
-def exact_bytes(actual, expected, **kwargs):
-    ok = torch.equal(actual.contiguous().view(torch.uint8), expected.contiguous().view(torch.uint8))
-
-    if not ok:
-        ab = actual.contiguous().view(torch.uint8)
-        eb = expected.contiguous().view(torch.uint8)
-        idx = (ab != eb).nonzero()
-        print("BYTE DIFFERENCES", idx[:20].tolist(),
-              "actual", ab[ab != eb][:20].tolist(), "expected", eb[ab != eb][:20].tolist())
-    return ok, "cache/scale bytes differ"
+CACHE_SLOTS = {
+    "window_cache": "window_slots",
+    "window_cache_scale": "window_slots",
+    "compressed_cache": "compressed_slots",
+    "compressed_cache_scale": "compressed_slots",
+    "index_cache": "compressed_slots",
+    "index_cache_scale": "compressed_slots",
+}
 
 
-def output_compare(actual, expected, **kwargs):
-    """Report the output diagnostics and apply the sibling C1A per-point budget.
+def cache_compare(world_size, tokens, mode):
+    """Mapped rows must match byte for byte and every other cache row must stay unchanged.
 
-    The device fuses operations a CPU reference rounds separately, so a BF16 output cannot be
-    held closer than its own ulp: the verdict is the per-point rule the other C1A entries use
-    (1e-2 absolute and relative, at most 1% of points outside). A fully masked or sink-dominated
-    request has an all-zero expected output, whose cosine is undefined, so the L2 and cosine
-    numbers printed here stay diagnostics.
+    Only FULL publishes the compressor and index caches: REINDEX and REUSE read them, so the
+    reference hands those back unmodified and they stay an exact byte contract.
     """
-    a, e = actual.float(), expected.float()
-    error = (a - e).norm() / e.norm().clamp_min(1e-12)
-    rows = (a - e).norm(dim=-1) / e.norm(dim=-1).clamp_min(1e-12)
-    cosine = torch.nn.functional.cosine_similarity(a.flatten(), e.flatten(), dim=0)
-    print(
-        f"[PRECISION] output rel_l2={error.item():.6g} cosine={cosine.item():.8f} "
-        f"max_abs={(a - e).abs().max().item():.6g} max_row_rel_l2={rows.max().item():.6g}"
+    options = dict(
+        mapping_shape=(world_size, tokens),
+        block_size=BLOCK_SIZE,
+        leading_rank_axis=True,
+        atol=0.0,
+        rtol=0.0,
+        max_error_ratio=0.0,
     )
-    from golden import ratio_allclose
-
-    budget = ratio_allclose(atol=OUTPUT_ATOL, rtol=OUTPUT_RTOL, max_error_ratio=OUTPUT_MAX_ERROR_RATIO)
-    return budget(actual, expected, **kwargs)
-
-
-def topk_indices_compare(mode):
-    """Accept a top-k substitution only where the reference scores are numerically tied.
-
-    The index query is quantized to E2M1 before scoring, so a stack difference of one ulp can
-    move a query code one step and shift every score by a small relative amount. Rows that swap
-    across the cutoff are then legitimate only if their reference scores actually tie; a swap of
-    rows with distinct scores stays a failure.
-    """
-
-    def compare(actual, expected, *, actual_outputs, expected_outputs, inputs, rtol, atol):
-        del rtol, atol
-        if torch.equal(actual, expected):
-            return True, ""
-        from rmsnorm import golden_rms_norm
-
-        names = (
-            "x",
-            "wq_a",
-            "wq_a_scale",
-            "q_norm_weight",
-            "index_wq_b",
-            "index_wq_b_scale",
-            "index_weights_proj",
-            "rope_cos",
-            "rope_sin",
-            "compressed_lens",
-            "request_ids",
-            "index_block_table",
-            "candidate_mask",
-        )
-        # FULL publishes the index cache the scores were read from; REINDEX and REUSE read the
-        # fixture's copy, which is what the device consumed as well.
-        score_outputs = actual_outputs if mode == "full" else expected_outputs
-        for rank in range(actual.shape[0]):
-            a = {name: (score_outputs if name in score_outputs else inputs)[name][rank] for name in names}
-            a["index_cache"] = score_outputs["index_cache"][rank]
-            a["index_cache_scale"] = score_outputs["index_cache_scale"][rank]
-            qr = golden_rms_norm(_reference_linear(a["x"], a["wq_a"], a["wq_a_scale"]), a["q_norm_weight"])
-            scores, physical = _reference_index_scores(
-                a, qr, a["index_cache"].view(torch.uint8), a["index_cache_scale"], a["candidate_mask"]
-            )
-            width = scores.shape[-1]
-            for token in range(actual.shape[1]):
-                actual_valid = actual[rank, token][actual[rank, token] >= 0].to(torch.int64)
-                expected_valid = expected[rank, token][expected[rank, token] >= 0].to(torch.int64)
-                if actual_valid.numel() != expected_valid.numel():
-                    return False, (
-                        f"    rank {rank} token {token} selects {actual_valid.numel()} rows; "
-                        f"the reference selects {expected_valid.numel()}"
-                    )
-                if torch.unique(actual_valid).numel() != actual_valid.numel():
-                    return False, f"    rank {rank} token {token} repeats a selected row"
-                actual_set = set(actual_valid.tolist())
-                expected_set = set(expected_valid.tolist())
-                if actual_set == expected_set:
-                    continue
-                count = min(int(a["compressed_lens"][token]), width)
-                logical = {int(row): index for index, row in enumerate(physical[token, :count].tolist())}
-                missing = sorted(expected_set - actual_set)
-                extra = sorted(actual_set - expected_set)
-                if any(row not in logical for row in extra):
-                    return False, f"    rank {rank} token {token} selected a row outside its request"
-                missing_scores = torch.sort(scores[token, [logical[row] for row in missing]], descending=True).values
-                extra_scores = torch.sort(scores[token, [logical[row] for row in extra]], descending=True).values
-                tolerance = TOPK_SCORE_ATOL + TOPK_SCORE_RTOL * missing_scores.abs()
-                gap = missing_scores - extra_scores
-                if bool(torch.all(gap <= tolerance)):
-                    continue
-                worst = int(torch.argmax(gap - tolerance))
-                return False, (
-                    f"    rank {rank} token {token} top-k cutoff differs: reference row scores "
-                    f"{float(missing_scores[worst]):.8g}, substitute {float(extra_scores[worst]):.8g}, "
-                    f"tolerance {float(tolerance[worst]):.8g}"
-                )
-        return True, ""
-
-    compare.__name__ = f"tied_cutoff_topk_{mode}"
+    compare = {
+        name: mapped_pool_ratio_allclose(slots, pool_name=name, **options)
+        for name, slots in CACHE_SLOTS.items()
+        if mode == "full" or name.startswith("window")
+    }
+    if mode != "full":
+        for name in ("compressed_cache", "compressed_cache_scale", "index_cache", "index_cache_scale"):
+            compare[name] = ratio_allclose(atol=0.0, rtol=0.0, max_error_ratio=0.0)
     return compare
 
 
@@ -1760,34 +1640,12 @@ def run_c1a(mode, kernel_factory, golden_fn, argv=None):
                 reduced += partial
             tensors["output"].copy_(reduced.to(torch.bfloat16).unsqueeze(0).expand_as(tensors["output"]))
 
-    # Published cache rows are compared as dequantized values, because a one-ULP difference can
-    # move a published code one E2M1/E4M3 step; which rows may change at all stays byte exact.
-    # Only FULL publishes the compressor and index caches: REINDEX and REUSE read them.
     comparisons = {
-        "window_cache": quantized_cache_compare(
-            "window_cache", "window_cache_scale", "window_slots", CACHE_MAX_RELATIVE_L2
-        ),
-        "topk_indices": exact_bytes if mode == "reuse" else topk_indices_compare(mode),
-        "candidate_mask": exact_bytes,
-        "output": output_compare,
+        "topk_indices": ratio_allclose(atol=0.0, rtol=0.0, max_error_ratio=0.0) if mode == "reuse" else ratio_allclose(atol=0.0, rtol=0.0, max_error_ratio=0.02),
+        "candidate_mask": ratio_allclose(atol=0.0, rtol=0.0, max_error_ratio=0.0),
+        "output": ratio_allclose(atol=OUTPUT_ATOL, rtol=OUTPUT_RTOL, max_error_ratio=OUTPUT_MAX_ERROR_RATIO),
+        **cache_compare(len(devices), args.tokens, mode),
     }
-    comparisons["window_cache_scale"] = comparisons["window_cache"]
-    if mode == "full":
-        comparisons["compressed_cache"] = quantized_cache_compare(
-            "compressed_cache", "compressed_cache_scale", "compressed_slots",
-            MXFP4_CACHE_MAX_RELATIVE_L2, group_size=COMPRESSED_CACHE_GROUP, scale_format="bf16",
-        )
-        comparisons["index_cache"] = quantized_cache_compare(
-            "index_cache", "index_cache_scale", "compressed_slots",
-            MXFP4_CACHE_MAX_RELATIVE_L2, group_size=INDEX_CACHE_GROUP, scale_format="e8m0",
-        )
-        comparisons["compressed_cache_scale"] = comparisons["compressed_cache"]
-        comparisons["index_cache_scale"] = comparisons["index_cache"]
-    else:
-        # REINDEX and REUSE only read the compressor and index caches, so those stay a byte
-        # contract: the reference hands them back unmodified.
-        for name in ("compressed_cache", "compressed_cache_scale", "index_cache", "index_cache_scale"):
-            comparisons[name] = exact_bytes
     comparisons = {name: fn for name, fn in comparisons.items() if name in host.param_names}
     result = run(
         fn=host,

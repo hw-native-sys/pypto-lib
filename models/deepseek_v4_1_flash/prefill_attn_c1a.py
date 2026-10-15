@@ -14,6 +14,7 @@ import torch
 
 
 from config import (
+    BLOCK_SIZE,
     FLASH as M,
     AttentionMode,
     T_DYN,
@@ -44,18 +45,16 @@ from qkv_proj_rope import q_proj_qr
 from prefill_c1a_indexer import make_paged_indexer
 from utils import AttentionGoldenResult
 from sparse_attention import golden_compressed_attention
-from quant import quantized_cache_compare
+from golden import mapped_pool_ratio_allclose, ratio_allclose
 from o_proj import prefill_tp_output_all_reduce
 from utils import (
     CASE_DEFAULT,
     CASE_MAX_TOKENS,
     CASE_NAMES,
     CASE_TOKENS,
-    CACHE_MAX_RELATIVE_L2,
     COMMON_INPUT_NAMES,
-    MXFP4_CACHE_MAX_RELATIVE_L2,
     apply_distributed_golden,
-    attention_output_compare,
+    fixture_token_count,
     make_tensor_specs,
     topk_indices_compare,
 )
@@ -1068,6 +1067,32 @@ golden_prefill_c1a_reuse = golden_prefill_attn_c1a_reuse
 prefill_c1a_reuse = prefill_attn_c1a_reuse
 
 
+CACHE_SLOTS = {
+    "window_cache": "window_slots",
+    "window_cache_scale": "window_slots",
+    "compressed_cache": "compressed_slots",
+    "compressed_cache_scale": "compressed_slots",
+    "index_cache": "compressed_slots",
+    "index_cache_scale": "compressed_slots",
+}
+
+
+def cache_compare(world_size, tokens, names=None):
+    """Mapped rows must match byte for byte and every other cache row must stay unchanged."""
+    options = dict(
+        mapping_shape=(world_size, tokens),
+        block_size=BLOCK_SIZE,
+        leading_rank_axis=True,
+        atol=0.0,
+        rtol=0.0,
+        max_error_ratio=0.0,
+    )
+    return {
+        name: mapped_pool_ratio_allclose(CACHE_SLOTS[name], pool_name=name, **options)
+        for name in (CACHE_SLOTS if names is None else names)
+    }
+
+
 def validate(argv=None):
     import argparse
 
@@ -1097,28 +1122,7 @@ def validate(argv=None):
     if len(device_ids) != TP_SIZE:
         parser.error(f"need exactly {TP_SIZE} devices, got {device_ids}")
 
-    window_cache_compare = quantized_cache_compare(
-        "window_cache",
-        "window_cache_scale",
-        "window_slots",
-        CACHE_MAX_RELATIVE_L2,
-    )
-    compressed_cache_compare = quantized_cache_compare(
-        "compressed_cache",
-        "compressed_cache_scale",
-        "compressed_slots",
-        MXFP4_CACHE_MAX_RELATIVE_L2,
-        group_size=COMPRESSED_CACHE_GROUP,
-        scale_format="bf16",
-    )
-    index_cache_compare = quantized_cache_compare(
-        "index_cache",
-        "index_cache_scale",
-        "compressed_slots",
-        MXFP4_CACHE_MAX_RELATIVE_L2,
-        group_size=INDEX_CACHE_GROUP,
-        scale_format="e8m0",
-    )
+
     result = run(
         fn=l3_prefill_attn_c1a_full_test,
         specs=build_tensor_specs(args.tokens, args.case),
@@ -1134,13 +1138,8 @@ def validate(argv=None):
             "enable_chip_swimlane": args.enable_chip_swimlane,
         },
         compare_fn={
-            "output": attention_output_compare("full"),
-            "window_cache": window_cache_compare,
-            "window_cache_scale": window_cache_compare,
-            "compressed_cache": compressed_cache_compare,
-            "compressed_cache_scale": compressed_cache_compare,
-            "index_cache": index_cache_compare,
-            "index_cache_scale": index_cache_compare,
+            "output": ratio_allclose(atol=1e-2, rtol=1.0 / 128),
+            **cache_compare(len(device_ids), fixture_token_count(args.tokens, args.case)),
             "topk_indices": topk_indices_compare("full"),
         },
     )

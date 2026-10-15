@@ -83,6 +83,50 @@ class TestMappedPoolRatioAllclose:
         assert "mapped rows" in detail
         assert "non-finite" in detail
 
+    def test_accepts_fp8_pool(self):
+        expected = torch.zeros(2, 2, 2, dtype=torch.float32).to(torch.float8_e4m3fn)
+        actual = expected.clone()
+        comparator = mapped_pool_ratio_allclose(
+            "mapping",
+            mapping_shape=(1,),
+            block_size=2,
+            atol=0.0,
+            rtol=0.0,
+            max_error_ratio=0.0,
+        )
+
+        ok, detail = self._call(
+            comparator,
+            actual,
+            expected,
+            torch.tensor([0], dtype=torch.int64),
+        )
+
+        assert ok, detail
+
+    def test_rejects_nonfinite_fp8_mapped_rows(self):
+        expected = torch.zeros(2, 2, 2, dtype=torch.float32).to(torch.float8_e4m3fn)
+        actual = expected.clone()
+        actual.view(torch.uint8)[0, 0, 0] = 0x7F
+        comparator = mapped_pool_ratio_allclose(
+            "mapping",
+            mapping_shape=(1,),
+            block_size=2,
+            atol=0.0,
+            rtol=0.0,
+            max_error_ratio=0.0,
+        )
+
+        ok, detail = self._call(
+            comparator,
+            actual,
+            expected,
+            torch.tensor([0], dtype=torch.int64),
+        )
+
+        assert not ok
+        assert "non-finite" in detail
+
     def test_rejects_rank_local_unmapped_write(self):
         expected = torch.zeros(2, 2, 2, 1, dtype=torch.float32)
         actual = expected.clone()

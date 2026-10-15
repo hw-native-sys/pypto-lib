@@ -569,27 +569,6 @@ def build_tensor_specs(num_tokens=TEST_TOKENS):
     ]
 
 
-def compare_logits(actual, expected, **_):
-    import torch
-
-    close = torch.isclose(actual, expected, rtol=1e-3, atol=1e-3)
-    if bool(close.all()):
-        return True, ""
-    lines = []
-    for owner in range(actual.shape[0]):
-        for shard in range(TP_SIZE):
-            start = shard * VOCAB_PER_TP
-            end = start + VOCAB_PER_TP
-            shard_actual = actual[owner, :, start:end]
-            shard_close = close[owner, :, start:end]
-            lines.append(
-                f"    owner={owner} shard={shard}: "
-                f"bad={int((~shard_close).sum())}/{MAX_LOGIT_ROWS * VOCAB_PER_TP} "
-                f"zeros={int((shard_actual == 0).sum())}"
-            )
-    return False, "\n".join(lines)
-
-
 def compare_sampled_ids(actual, _expected, *, actual_outputs, **_):
     import torch
 
@@ -611,7 +590,7 @@ def validate(argv=None):
     """Validate TP-sharded LM head + greedy sampling on A5."""
     import argparse
 
-    from golden import run
+    from golden import ratio_allclose, run
 
     parser = argparse.ArgumentParser()
     parser.add_argument("-p", "--platform", type=str, default="a5",
@@ -646,7 +625,7 @@ def validate(argv=None):
         specs=build_tensor_specs(args.num_tokens),
         golden_fn=golden_lm_head,
         compare_fn={
-            "logits": compare_logits,
+            "logits": ratio_allclose(atol=1e-3, rtol=1e-3, max_error_ratio=0.0),
             "sampled_ids": compare_sampled_ids,
         },
         compile_only=args.compile_only,
