@@ -50,6 +50,11 @@ semantic, dependency, or measured performance need; explain why existing
 capabilities cannot meet it. Do not couple independent model directories just
 to reuse a helper.
 
+Reuse `golden` comparators for numerical checks. Custom comparators should
+add only validation semantics that existing comparators cannot express,
+delegating supported checks to them. Do not retain comparator wrappers
+solely for diagnostic output or temporary debugging checks.
+
 Layer and forward entries must compose existing operators instead of copying
 their compute logic. Fusion or different decode and prefill requirements may
 justify separate implementations under the same requirement above.
