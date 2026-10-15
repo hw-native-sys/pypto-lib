@@ -41,6 +41,7 @@ from config import (
 
 
 from config import LOCAL_T_DYN
+from rope_tables import precompute_rope_tables
 from hierarchical_sparse_indexer import hierarchical_sparse_indexer
 from decode_indexer import (
     make_indexer_prepare,
@@ -1375,8 +1376,10 @@ def build_validation_values(mode, tokens, pages, seed=17, case="random"):
     values["wo_a"] = (torch.randn(RANKS, LOCAL_O_GROUPS, O_LORA, O_GROUP_IN) / math.sqrt(O_GROUP_IN)).to(
         torch.bfloat16
     )
-    angles = torch.randn(1, TOKENS, ROPE_DIM // 2).expand(RANKS, -1, -1).contiguous()
-    values["rope_cos"], values["rope_sin"] = angles.cos(), angles.sin()
+    positions = torch.arange(PAGES * 128 - 1, PAGES * 128 - TOKENS - 1, -1)
+    freqs_cos, freqs_sin = precompute_rope_tables(PAGES * 128, compressed_attention=True)
+    values["rope_cos"] = freqs_cos[positions].unsqueeze(0).expand(RANKS, -1, -1).contiguous()
+    values["rope_sin"] = freqs_sin[positions].unsqueeze(0).expand(RANKS, -1, -1).contiguous()
     values["window_slots"] = (
         torch.arange(TOKENS, dtype=torch.int64).unsqueeze(0).expand(RANKS, -1).contiguous()
     )

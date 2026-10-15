@@ -29,7 +29,6 @@ from config import (
     LOCAL_T_DYN,
     Q_START_DYN,
     ROUTE_T_DYN,
-    TABLE_DYN,
     T_DYN,
     BLOCK_SIZE,
     COMPRESSED_CACHE_GROUP,
@@ -51,6 +50,8 @@ from decode_c1a_reuse import decode_c1a_reuse_sharded
 from decode_c2a_full import decode_c2a_full_sharded
 from decode_c2a_reuse import decode_c2a_reuse_sharded
 from decode_swa import decode_swa_sharded
+from rope_tables import precompute_rope_tables
+from utils import build_forward_metadata
 from expert_routed import (
     MX_PACKED_LANE_COLS,
     MX_W1_PACKED_ROWS,
@@ -125,6 +126,8 @@ FWD_ORI_BLOCKS_DYN = pl.dynamic("V41_FWD_ORI_BLOCKS_DYN")
 FWD_CMP_BLOCKS_DYN = pl.dynamic("V41_FWD_CMP_BLOCKS_DYN")
 FWD_INDEX_BLOCKS_DYN = pl.dynamic("V41_FWD_INDEX_BLOCKS_DYN")
 FWD_STATE_BLOCKS_DYN = pl.dynamic("V41_FWD_STATE_BLOCKS_DYN")
+FWD_C2A_TABLE_DYN = pl.dynamic("V41_FWD_C2A_TABLE_DYN")
+FWD_C1A_TABLE_DYN = pl.dynamic("V41_FWD_C1A_TABLE_DYN")
 
 
 def _decode_encoder(
@@ -142,8 +145,10 @@ def _decode_encoder(
     attn_sink: pl.Tensor[[N_LAYERS * LOCAL_H], pl.FP32],
     wo_a: pl.Tensor[[N_LAYERS * LOCAL_O_GROUPS, O_LORA, O_GROUP_IN], pl.BF16],
     wo_b: pl.Tensor[[N_LAYERS, LOCAL_O_WIDTH, D], pl.FP8E4M3FN],
-    rope_cos: pl.Tensor[[T_DYN, ROPE_DIM // 2], pl.FP32],
-    rope_sin: pl.Tensor[[T_DYN, ROPE_DIM // 2], pl.FP32],
+    base_rope_cos: pl.Tensor[[T_DYN, ROPE_DIM // 2], pl.FP32],
+    base_rope_sin: pl.Tensor[[T_DYN, ROPE_DIM // 2], pl.FP32],
+    compressed_token_rope_cos: pl.Tensor[[T_DYN, ROPE_DIM // 2], pl.FP32],
+    compressed_token_rope_sin: pl.Tensor[[T_DYN, ROPE_DIM // 2], pl.FP32],
     window_slots: pl.Tensor[[T_DYN], pl.INT64],
     window_indices: pl.Tensor[[T_DYN, BLOCK_SIZE], pl.INT32],
     window_cache_pool: pl.InOut[pl.Tensor[[FWD_ORI_BLOCKS_DYN, BLOCK_SIZE, 1, HEAD_DIM], pl.FP8E4M3FN]],
@@ -157,14 +162,14 @@ def _decode_encoder(
     request_ids: pl.Tensor[[T_DYN], pl.INT32],
     token_to_req_indices: pl.Tensor[[T_DYN], pl.INT32],
     position_ids: pl.Tensor[[T_DYN], pl.INT32],
-    compressed_lens: pl.Tensor[[T_DYN], pl.INT32],
+    c2a_compressed_lens: pl.Tensor[[T_DYN], pl.INT32],
     index_cache_pool: pl.InOut[pl.Tensor[[FWD_INDEX_BLOCKS_DYN, BLOCK_SIZE, 1, INDEX_DIM // 2], pl.UINT8]],
     index_cache_scale_pool: pl.InOut[
         pl.Tensor[[FWD_INDEX_BLOCKS_DYN, BLOCK_SIZE, 1, INDEX_DIM // INDEX_CACHE_GROUP], pl.FP8E8M0]
     ],
-    index_block_table: pl.Tensor[[B_DYN, TABLE_DYN], pl.INT32],
-    compressed_rope_cos: pl.Tensor[[T_DYN, ROPE_DIM // 2], pl.FP32],
-    compressed_rope_sin: pl.Tensor[[T_DYN, ROPE_DIM // 2], pl.FP32],
+    c2a_index_block_table: pl.Tensor[[B_DYN, FWD_C2A_TABLE_DYN], pl.INT32],
+    c2a_rope_cos: pl.Tensor[[T_DYN, ROPE_DIM // 2], pl.FP32],
+    c2a_rope_sin: pl.Tensor[[T_DYN, ROPE_DIM // 2], pl.FP32],
     c2a_compressor_wkv: pl.Tensor[[C2A_SOURCE_COUNT, D, HEAD_DIM], pl.FP32],
     c2a_compressor_wgate: pl.Tensor[[C2A_SOURCE_COUNT, D, HEAD_DIM], pl.FP32],
     c1a_compressor_wkv: pl.Tensor[[D, HEAD_DIM], pl.BF16],
@@ -172,7 +177,7 @@ def _decode_encoder(
     state_block_table: pl.Tensor[[B_DYN, 1], pl.INT32],
     state_cache_pool: pl.InOut[pl.Tensor[[FWD_STATE_BLOCKS_DYN, STATE_CAPACITY, STATE_WIDTH], pl.FP32]],
     compressor_norm_weight: pl.Tensor[[KV_SOURCE_COUNT * HEAD_DIM], pl.BF16],
-    compressed_slots: pl.Tensor[[T_DYN], pl.INT64],
+    c2a_compressed_slots: pl.Tensor[[T_DYN], pl.INT64],
     index_wk: pl.Tensor[[INDEX_SOURCE_COUNT * HEAD_DIM, INDEX_DIM], pl.BF16],
     index_norm_weight: pl.Tensor[[INDEX_SOURCE_COUNT * INDEX_DIM], pl.BF16],
     index_wq_b: pl.Tensor[[INDEX_SOURCE_COUNT, Q_LORA, INDEX_H * INDEX_DIM], pl.FP8E4M3FN],
@@ -224,19 +229,25 @@ def _decode_encoder(
 ):
     x_hc.bind_dynamic(0, LOCAL_T_DYN)
     pre_mix.bind_dynamic(0, LOCAL_T_DYN)
-    rope_cos.bind_dynamic(0, T_DYN)
-    rope_sin.bind_dynamic(0, T_DYN)
+    base_rope_cos.bind_dynamic(0, T_DYN)
+    base_rope_sin.bind_dynamic(0, T_DYN)
+    compressed_token_rope_cos.bind_dynamic(0, T_DYN)
+    compressed_token_rope_sin.bind_dynamic(0, T_DYN)
+    c2a_rope_cos.bind_dynamic(0, T_DYN)
+    c2a_rope_sin.bind_dynamic(0, T_DYN)
     window_cache_pool.bind_dynamic(0, FWD_ORI_BLOCKS_DYN)
     window_cache_scale_pool.bind_dynamic(0, FWD_ORI_BLOCKS_DYN)
     compressed_cache_pool.bind_dynamic(0, FWD_CMP_BLOCKS_DYN)
     compressed_cache_scale_pool.bind_dynamic(0, FWD_CMP_BLOCKS_DYN)
     index_cache_pool.bind_dynamic(0, FWD_INDEX_BLOCKS_DYN)
     index_cache_scale_pool.bind_dynamic(0, FWD_INDEX_BLOCKS_DYN)
-    index_block_table.bind_dynamic(0, B_DYN)
-    index_block_table.bind_dynamic(1, TABLE_DYN)
+    c2a_compressed_lens.bind_dynamic(0, T_DYN)
+    c2a_compressed_slots.bind_dynamic(0, T_DYN)
+    c2a_index_block_table.bind_dynamic(0, B_DYN)
+    c2a_index_block_table.bind_dynamic(1, FWD_C2A_TABLE_DYN)
     state_cache_pool.bind_dynamic(0, FWD_STATE_BLOCKS_DYN)
     tokens = pl.tensor.dim(x_hc, 0)
-    global_tokens = pl.tensor.dim(rope_cos, 0)
+    global_tokens = pl.tensor.dim(base_rope_cos, 0)
     window_blocks_per_layer = pl.tensor.dim(window_cache_pool, 0) // N_LAYERS
     compressed_blocks_per_source = pl.tensor.dim(compressed_cache_pool, 0) // KV_SOURCE_COUNT
     index_blocks_per_source = pl.tensor.dim(index_cache_pool, 0) // INDEX_SOURCE_COUNT
@@ -313,8 +324,8 @@ def _decode_encoder(
         fwd_swa_layer_2_wo_a_layer_l0,
         fwd_swa_layer_2_wo_b_layer_l0,
         fwd_swa_layer_2_wo_b_scale_layer_l0,
-        rope_cos,
-        rope_sin,
+        base_rope_cos,
+        base_rope_sin,
         window_slots,
         window_indices,
         fwd_attention_layer_1_window_cache_l0,
@@ -504,8 +515,8 @@ def _decode_encoder(
         fwd_swa_layer_10_wo_a_layer_l1,
         fwd_swa_layer_10_wo_b_layer_l1,
         fwd_swa_layer_10_wo_b_scale_layer_l1,
-        rope_cos,
-        rope_sin,
+        base_rope_cos,
+        base_rope_sin,
         window_slots,
         window_indices,
         fwd_attention_layer_9_window_cache_l1,
@@ -768,8 +779,8 @@ def _decode_encoder(
             fwd_c2a_full_layer_3_wo_a_layer_l2,
             fwd_c2a_full_layer_3_wo_b_layer_l2,
             fwd_c2a_full_layer_3_wo_b_scale_layer_l2,
-            rope_cos,
-            rope_sin,
+            compressed_token_rope_cos,
+            compressed_token_rope_sin,
             window_slots,
             window_indices,
             fwd_attention_layer_1_window_cache_l2,
@@ -777,20 +788,20 @@ def _decode_encoder(
             fwd_attention_layer_1_compressed_cache_l2,
             fwd_attention_layer_1_compressed_cache_scale_l2,
             token_to_req_indices,
-            compressed_lens,
+            c2a_compressed_lens,
             fwd_attention_layer_1_index_cache_l2,
             fwd_attention_layer_1_index_cache_scale_l2,
-            index_block_table,
+            c2a_index_block_table,
             position_ids,
-            compressed_rope_cos,
-            compressed_rope_sin,
+            c2a_rope_cos,
+            c2a_rope_sin,
             fwd_attention_layer_1_c2a_compressor_wkv_source_l2,
             fwd_attention_layer_1_c2a_compressor_wgate_source_l2,
             query_start_loc,
             state_block_table,
             fwd_attention_layer_1_state_cache_l2,
             fwd_attention_layer_1_compressor_norm_source_l2,
-            compressed_slots,
+            c2a_compressed_slots,
             fwd_attention_layer_1_index_wk_source_l2,
             fwd_attention_layer_1_index_norm_source_l2,
             fwd_attention_layer_1_index_wq_b_source_l2,
@@ -1021,8 +1032,8 @@ def _decode_encoder(
             fwd_c2a_reuse_layer_12_wo_a_layer_l3,
             fwd_c2a_reuse_layer_12_wo_b_layer_l3,
             fwd_c2a_reuse_layer_12_wo_b_scale_layer_l3,
-            rope_cos,
-            rope_sin,
+            compressed_token_rope_cos,
+            compressed_token_rope_sin,
             window_slots,
             window_indices,
             fwd_attention_layer_9_window_cache_l3,
@@ -1254,8 +1265,8 @@ def _decode_encoder(
             fwd_c2a_reuse_layer_4_wo_a_layer_l4,
             fwd_c2a_reuse_layer_4_wo_b_layer_l4,
             fwd_c2a_reuse_layer_4_wo_b_scale_layer_l4,
-            rope_cos,
-            rope_sin,
+            compressed_token_rope_cos,
+            compressed_token_rope_sin,
             window_slots,
             window_indices,
             fwd_attention_layer_1_window_cache_l4,
@@ -1487,8 +1498,8 @@ def _decode_encoder(
             fwd_c2a_reuse_layer_12_wo_a_layer_l5,
             fwd_c2a_reuse_layer_12_wo_b_layer_l5,
             fwd_c2a_reuse_layer_12_wo_b_scale_layer_l5,
-            rope_cos,
-            rope_sin,
+            compressed_token_rope_cos,
+            compressed_token_rope_sin,
             window_slots,
             window_indices,
             fwd_attention_layer_9_window_cache_l5,
@@ -1720,8 +1731,8 @@ def _decode_encoder(
             fwd_c2a_reuse_layer_4_wo_a_layer_l6,
             fwd_c2a_reuse_layer_4_wo_b_layer_l6,
             fwd_c2a_reuse_layer_4_wo_b_scale_layer_l6,
-            rope_cos,
-            rope_sin,
+            compressed_token_rope_cos,
+            compressed_token_rope_sin,
             window_slots,
             window_indices,
             fwd_attention_layer_1_window_cache_l6,
@@ -1953,8 +1964,8 @@ def _decode_encoder(
             fwd_c2a_reuse_layer_12_wo_a_layer_l7,
             fwd_c2a_reuse_layer_12_wo_b_layer_l7,
             fwd_c2a_reuse_layer_12_wo_b_scale_layer_l7,
-            rope_cos,
-            rope_sin,
+            compressed_token_rope_cos,
+            compressed_token_rope_sin,
             window_slots,
             window_indices,
             fwd_attention_layer_9_window_cache_l7,
@@ -2111,8 +2122,10 @@ def _decode_decoder(
     attn_sink: pl.Tensor[[N_LAYERS * LOCAL_H], pl.FP32],
     wo_a: pl.Tensor[[N_LAYERS * LOCAL_O_GROUPS, O_LORA, O_GROUP_IN], pl.BF16],
     wo_b: pl.Tensor[[N_LAYERS, LOCAL_O_WIDTH, D], pl.FP8E4M3FN],
-    rope_cos: pl.Tensor[[T_DYN, ROPE_DIM // 2], pl.FP32],
-    rope_sin: pl.Tensor[[T_DYN, ROPE_DIM // 2], pl.FP32],
+    base_rope_cos: pl.Tensor[[T_DYN, ROPE_DIM // 2], pl.FP32],
+    base_rope_sin: pl.Tensor[[T_DYN, ROPE_DIM // 2], pl.FP32],
+    compressed_token_rope_cos: pl.Tensor[[T_DYN, ROPE_DIM // 2], pl.FP32],
+    compressed_token_rope_sin: pl.Tensor[[T_DYN, ROPE_DIM // 2], pl.FP32],
     window_slots: pl.Tensor[[T_DYN], pl.INT64],
     window_indices: pl.Tensor[[T_DYN, BLOCK_SIZE], pl.INT32],
     window_cache_pool: pl.InOut[pl.Tensor[[FWD_ORI_BLOCKS_DYN, BLOCK_SIZE, 1, HEAD_DIM], pl.FP8E4M3FN]],
@@ -2126,14 +2139,14 @@ def _decode_decoder(
     request_ids: pl.Tensor[[T_DYN], pl.INT32],
     token_to_req_indices: pl.Tensor[[T_DYN], pl.INT32],
     position_ids: pl.Tensor[[T_DYN], pl.INT32],
-    compressed_lens: pl.Tensor[[T_DYN], pl.INT32],
+    c1a_compressed_lens: pl.Tensor[[T_DYN], pl.INT32],
     index_cache_pool: pl.InOut[pl.Tensor[[FWD_INDEX_BLOCKS_DYN, BLOCK_SIZE, 1, INDEX_DIM // 2], pl.UINT8]],
     index_cache_scale_pool: pl.InOut[
         pl.Tensor[[FWD_INDEX_BLOCKS_DYN, BLOCK_SIZE, 1, INDEX_DIM // INDEX_CACHE_GROUP], pl.FP8E8M0]
     ],
-    index_block_table: pl.Tensor[[B_DYN, TABLE_DYN], pl.INT32],
-    compressed_rope_cos: pl.Tensor[[T_DYN, ROPE_DIM // 2], pl.FP32],
-    compressed_rope_sin: pl.Tensor[[T_DYN, ROPE_DIM // 2], pl.FP32],
+    c1a_index_block_table: pl.Tensor[[B_DYN, FWD_C1A_TABLE_DYN], pl.INT32],
+    c2a_rope_cos: pl.Tensor[[T_DYN, ROPE_DIM // 2], pl.FP32],
+    c2a_rope_sin: pl.Tensor[[T_DYN, ROPE_DIM // 2], pl.FP32],
     c2a_compressor_wkv: pl.Tensor[[C2A_SOURCE_COUNT, D, HEAD_DIM], pl.FP32],
     c2a_compressor_wgate: pl.Tensor[[C2A_SOURCE_COUNT, D, HEAD_DIM], pl.FP32],
     c1a_compressor_wkv: pl.Tensor[[D, HEAD_DIM], pl.BF16],
@@ -2141,7 +2154,7 @@ def _decode_decoder(
     state_block_table: pl.Tensor[[B_DYN, 1], pl.INT32],
     state_cache_pool: pl.InOut[pl.Tensor[[FWD_STATE_BLOCKS_DYN, STATE_CAPACITY, STATE_WIDTH], pl.FP32]],
     compressor_norm_weight: pl.Tensor[[KV_SOURCE_COUNT * HEAD_DIM], pl.BF16],
-    compressed_slots: pl.Tensor[[T_DYN], pl.INT64],
+    c1a_compressed_slots: pl.Tensor[[T_DYN], pl.INT64],
     index_wk: pl.Tensor[[INDEX_SOURCE_COUNT * HEAD_DIM, INDEX_DIM], pl.BF16],
     index_norm_weight: pl.Tensor[[INDEX_SOURCE_COUNT * INDEX_DIM], pl.BF16],
     index_wq_b: pl.Tensor[[INDEX_SOURCE_COUNT, Q_LORA, INDEX_H * INDEX_DIM], pl.FP8E4M3FN],
@@ -2193,19 +2206,25 @@ def _decode_decoder(
 ):
     x_hc.bind_dynamic(0, LOCAL_T_DYN)
     pre_mix.bind_dynamic(0, LOCAL_T_DYN)
-    rope_cos.bind_dynamic(0, T_DYN)
-    rope_sin.bind_dynamic(0, T_DYN)
+    base_rope_cos.bind_dynamic(0, T_DYN)
+    base_rope_sin.bind_dynamic(0, T_DYN)
+    compressed_token_rope_cos.bind_dynamic(0, T_DYN)
+    compressed_token_rope_sin.bind_dynamic(0, T_DYN)
+    c2a_rope_cos.bind_dynamic(0, T_DYN)
+    c2a_rope_sin.bind_dynamic(0, T_DYN)
     window_cache_pool.bind_dynamic(0, FWD_ORI_BLOCKS_DYN)
     window_cache_scale_pool.bind_dynamic(0, FWD_ORI_BLOCKS_DYN)
     compressed_cache_pool.bind_dynamic(0, FWD_CMP_BLOCKS_DYN)
     compressed_cache_scale_pool.bind_dynamic(0, FWD_CMP_BLOCKS_DYN)
     index_cache_pool.bind_dynamic(0, FWD_INDEX_BLOCKS_DYN)
     index_cache_scale_pool.bind_dynamic(0, FWD_INDEX_BLOCKS_DYN)
-    index_block_table.bind_dynamic(0, B_DYN)
-    index_block_table.bind_dynamic(1, TABLE_DYN)
+    c1a_compressed_lens.bind_dynamic(0, T_DYN)
+    c1a_compressed_slots.bind_dynamic(0, T_DYN)
+    c1a_index_block_table.bind_dynamic(0, B_DYN)
+    c1a_index_block_table.bind_dynamic(1, FWD_C1A_TABLE_DYN)
     state_cache_pool.bind_dynamic(0, FWD_STATE_BLOCKS_DYN)
     tokens = pl.tensor.dim(x_hc, 0)
-    global_tokens = pl.tensor.dim(rope_cos, 0)
+    global_tokens = pl.tensor.dim(base_rope_cos, 0)
     window_blocks_per_layer = pl.tensor.dim(window_cache_pool, 0) // N_LAYERS
     compressed_blocks_per_source = pl.tensor.dim(compressed_cache_pool, 0) // KV_SOURCE_COUNT
     index_blocks_per_source = pl.tensor.dim(index_cache_pool, 0) // INDEX_SOURCE_COUNT
@@ -2329,8 +2348,8 @@ def _decode_decoder(
         fwd_c1a_full_layer_5_wo_a_layer_l20,
         fwd_c1a_full_layer_5_wo_b_layer_l20,
         fwd_c1a_full_layer_5_wo_b_scale_layer_l20,
-        rope_cos,
-        rope_sin,
+        compressed_token_rope_cos,
+        compressed_token_rope_sin,
         window_slots,
         window_indices,
         fwd_attention_layer_1_window_cache_l20,
@@ -2338,15 +2357,15 @@ def _decode_decoder(
         fwd_attention_layer_1_compressed_cache_l20,
         fwd_attention_layer_1_compressed_cache_scale_l20,
         request_ids,
-        compressed_lens,
+        c1a_compressed_lens,
         fwd_attention_layer_1_index_cache_l20,
         fwd_attention_layer_1_index_cache_scale_l20,
-        index_block_table,
-        compressed_rope_cos,
-        compressed_rope_sin,
+        c1a_index_block_table,
+        compressed_token_rope_cos,
+        compressed_token_rope_sin,
         c1a_compressor_wkv,
         fwd_attention_layer_1_compressor_norm_source_l20,
-        compressed_slots,
+        c1a_compressed_slots,
         fwd_attention_layer_1_index_wk_source_l20,
         fwd_attention_layer_1_index_norm_source_l20,
         fwd_attention_layer_1_index_wq_b_source_l20,
@@ -2553,8 +2572,8 @@ def _decode_decoder(
         fwd_c1a_reuse_layer_15_wo_a_layer_l21,
         fwd_c1a_reuse_layer_15_wo_b_layer_l21,
         fwd_c1a_reuse_layer_15_wo_b_scale_layer_l21,
-        rope_cos,
-        rope_sin,
+        compressed_token_rope_cos,
+        compressed_token_rope_sin,
         window_slots,
         window_indices,
         fwd_attention_layer_9_window_cache_l21,
@@ -2759,8 +2778,8 @@ def _decode_decoder(
         fwd_c1a_reuse_layer_7_wo_a_layer_l22,
         fwd_c1a_reuse_layer_7_wo_b_layer_l22,
         fwd_c1a_reuse_layer_7_wo_b_scale_layer_l22,
-        rope_cos,
-        rope_sin,
+        compressed_token_rope_cos,
+        compressed_token_rope_sin,
         window_slots,
         window_indices,
         fwd_attention_layer_1_window_cache_l22,
@@ -2967,8 +2986,8 @@ def _decode_decoder(
         fwd_c1a_reuse_layer_15_wo_a_layer_l23,
         fwd_c1a_reuse_layer_15_wo_b_layer_l23,
         fwd_c1a_reuse_layer_15_wo_b_scale_layer_l23,
-        rope_cos,
-        rope_sin,
+        compressed_token_rope_cos,
+        compressed_token_rope_sin,
         window_slots,
         window_indices,
         fwd_attention_layer_9_window_cache_l23,
@@ -3220,8 +3239,8 @@ def _decode_decoder(
             fwd_c1a_reindex_layer_6_wo_a_layer_l24,
             fwd_c1a_reindex_layer_6_wo_b_layer_l24,
             fwd_c1a_reindex_layer_6_wo_b_scale_layer_l24,
-            rope_cos,
-            rope_sin,
+            compressed_token_rope_cos,
+            compressed_token_rope_sin,
             window_slots,
             window_indices,
             fwd_attention_layer_1_window_cache_l24,
@@ -3229,10 +3248,10 @@ def _decode_decoder(
             fwd_attention_layer_1_compressed_cache_l24,
             fwd_attention_layer_1_compressed_cache_scale_l24,
             request_ids,
-            compressed_lens,
+            c1a_compressed_lens,
             fwd_attention_layer_1_index_cache_l24,
             fwd_attention_layer_1_index_cache_scale_l24,
-            index_block_table,
+            c1a_index_block_table,
             candidate_mask,
             fwd_attention_layer_1_index_wq_b_source_l24,
             fwd_attention_layer_1_index_wq_b_scale_source_l24,
@@ -3463,8 +3482,8 @@ def _decode_decoder(
             fwd_c1a_reuse_layer_15_wo_a_layer_l25,
             fwd_c1a_reuse_layer_15_wo_b_layer_l25,
             fwd_c1a_reuse_layer_15_wo_b_scale_layer_l25,
-            rope_cos,
-            rope_sin,
+            compressed_token_rope_cos,
+            compressed_token_rope_sin,
             window_slots,
             window_indices,
             fwd_attention_layer_9_window_cache_l25,
@@ -3697,8 +3716,8 @@ def _decode_decoder(
             fwd_c1a_reuse_layer_7_wo_a_layer_l26,
             fwd_c1a_reuse_layer_7_wo_b_layer_l26,
             fwd_c1a_reuse_layer_7_wo_b_scale_layer_l26,
-            rope_cos,
-            rope_sin,
+            compressed_token_rope_cos,
+            compressed_token_rope_sin,
             window_slots,
             window_indices,
             fwd_attention_layer_1_window_cache_l26,
@@ -3931,8 +3950,8 @@ def _decode_decoder(
             fwd_c1a_reuse_layer_15_wo_a_layer_l27,
             fwd_c1a_reuse_layer_15_wo_b_layer_l27,
             fwd_c1a_reuse_layer_15_wo_b_scale_layer_l27,
-            rope_cos,
-            rope_sin,
+            compressed_token_rope_cos,
+            compressed_token_rope_sin,
             window_slots,
             window_indices,
             fwd_attention_layer_9_window_cache_l27,
@@ -4089,8 +4108,10 @@ def _decode_fwd(
     attn_sink: pl.Tensor[[N_LAYERS * LOCAL_H], pl.FP32],
     wo_a: pl.Tensor[[N_LAYERS * LOCAL_O_GROUPS, O_LORA, O_GROUP_IN], pl.BF16],
     wo_b: pl.Tensor[[N_LAYERS, LOCAL_O_WIDTH, D], pl.FP8E4M3FN],
-    rope_cos: pl.Tensor[[T_DYN, ROPE_DIM // 2], pl.FP32],
-    rope_sin: pl.Tensor[[T_DYN, ROPE_DIM // 2], pl.FP32],
+    base_rope_cos: pl.Tensor[[T_DYN, ROPE_DIM // 2], pl.FP32],
+    base_rope_sin: pl.Tensor[[T_DYN, ROPE_DIM // 2], pl.FP32],
+    compressed_token_rope_cos: pl.Tensor[[T_DYN, ROPE_DIM // 2], pl.FP32],
+    compressed_token_rope_sin: pl.Tensor[[T_DYN, ROPE_DIM // 2], pl.FP32],
     window_slots: pl.Tensor[[T_DYN], pl.INT64],
     window_indices: pl.Tensor[[T_DYN, BLOCK_SIZE], pl.INT32],
     window_cache_pool: pl.InOut[pl.Tensor[[FWD_ORI_BLOCKS_DYN, BLOCK_SIZE, 1, HEAD_DIM], pl.FP8E4M3FN]],
@@ -4104,14 +4125,16 @@ def _decode_fwd(
     request_ids: pl.Tensor[[T_DYN], pl.INT32],
     token_to_req_indices: pl.Tensor[[T_DYN], pl.INT32],
     position_ids: pl.Tensor[[T_DYN], pl.INT32],
-    compressed_lens: pl.Tensor[[T_DYN], pl.INT32],
+    c2a_compressed_lens: pl.Tensor[[T_DYN], pl.INT32],
+    c1a_compressed_lens: pl.Tensor[[T_DYN], pl.INT32],
     index_cache_pool: pl.InOut[pl.Tensor[[FWD_INDEX_BLOCKS_DYN, BLOCK_SIZE, 1, INDEX_DIM // 2], pl.UINT8]],
     index_cache_scale_pool: pl.InOut[
         pl.Tensor[[FWD_INDEX_BLOCKS_DYN, BLOCK_SIZE, 1, INDEX_DIM // INDEX_CACHE_GROUP], pl.FP8E8M0]
     ],
-    index_block_table: pl.Tensor[[B_DYN, TABLE_DYN], pl.INT32],
-    compressed_rope_cos: pl.Tensor[[T_DYN, ROPE_DIM // 2], pl.FP32],
-    compressed_rope_sin: pl.Tensor[[T_DYN, ROPE_DIM // 2], pl.FP32],
+    c2a_index_block_table: pl.Tensor[[B_DYN, FWD_C2A_TABLE_DYN], pl.INT32],
+    c1a_index_block_table: pl.Tensor[[B_DYN, FWD_C1A_TABLE_DYN], pl.INT32],
+    c2a_rope_cos: pl.Tensor[[T_DYN, ROPE_DIM // 2], pl.FP32],
+    c2a_rope_sin: pl.Tensor[[T_DYN, ROPE_DIM // 2], pl.FP32],
     c2a_compressor_wkv: pl.Tensor[[C2A_SOURCE_COUNT, D, HEAD_DIM], pl.FP32],
     c2a_compressor_wgate: pl.Tensor[[C2A_SOURCE_COUNT, D, HEAD_DIM], pl.FP32],
     c1a_compressor_wkv: pl.Tensor[[D, HEAD_DIM], pl.BF16],
@@ -4119,7 +4142,8 @@ def _decode_fwd(
     state_block_table: pl.Tensor[[B_DYN, 1], pl.INT32],
     state_cache_pool: pl.InOut[pl.Tensor[[FWD_STATE_BLOCKS_DYN, STATE_CAPACITY, STATE_WIDTH], pl.FP32]],
     compressor_norm_weight: pl.Tensor[[KV_SOURCE_COUNT * HEAD_DIM], pl.BF16],
-    compressed_slots: pl.Tensor[[T_DYN], pl.INT64],
+    c2a_compressed_slots: pl.Tensor[[T_DYN], pl.INT64],
+    c1a_compressed_slots: pl.Tensor[[T_DYN], pl.INT64],
     index_wk: pl.Tensor[[INDEX_SOURCE_COUNT * HEAD_DIM, INDEX_DIM], pl.BF16],
     index_norm_weight: pl.Tensor[[INDEX_SOURCE_COUNT * INDEX_DIM], pl.BF16],
     index_wq_b: pl.Tensor[[INDEX_SOURCE_COUNT, Q_LORA, INDEX_H * INDEX_DIM], pl.FP8E4M3FN],
@@ -4184,8 +4208,10 @@ def _decode_fwd(
         attn_sink,
         wo_a,
         wo_b,
-        rope_cos,
-        rope_sin,
+        base_rope_cos,
+        base_rope_sin,
+        compressed_token_rope_cos,
+        compressed_token_rope_sin,
         window_slots,
         window_indices,
         window_cache_pool,
@@ -4195,12 +4221,12 @@ def _decode_fwd(
         request_ids,
         token_to_req_indices,
         position_ids,
-        compressed_lens,
+        c2a_compressed_lens,
         index_cache_pool,
         index_cache_scale_pool,
-        index_block_table,
-        compressed_rope_cos,
-        compressed_rope_sin,
+        c2a_index_block_table,
+        c2a_rope_cos,
+        c2a_rope_sin,
         c2a_compressor_wkv,
         c2a_compressor_wgate,
         c1a_compressor_wkv,
@@ -4208,7 +4234,7 @@ def _decode_fwd(
         state_block_table,
         state_cache_pool,
         compressor_norm_weight,
-        compressed_slots,
+        c2a_compressed_slots,
         index_wk,
         index_norm_weight,
         index_wq_b,
@@ -4269,8 +4295,10 @@ def _decode_fwd(
         attn_sink,
         wo_a,
         wo_b,
-        rope_cos,
-        rope_sin,
+        base_rope_cos,
+        base_rope_sin,
+        compressed_token_rope_cos,
+        compressed_token_rope_sin,
         window_slots,
         window_indices,
         window_cache_pool,
@@ -4280,12 +4308,12 @@ def _decode_fwd(
         request_ids,
         token_to_req_indices,
         position_ids,
-        compressed_lens,
+        c1a_compressed_lens,
         index_cache_pool,
         index_cache_scale_pool,
-        index_block_table,
-        compressed_rope_cos,
-        compressed_rope_sin,
+        c1a_index_block_table,
+        c2a_rope_cos,
+        c2a_rope_sin,
         c2a_compressor_wkv,
         c2a_compressor_wgate,
         c1a_compressor_wkv,
@@ -4293,7 +4321,7 @@ def _decode_fwd(
         state_block_table,
         state_cache_pool,
         compressor_norm_weight,
-        compressed_slots,
+        c1a_compressed_slots,
         index_wk,
         index_norm_weight,
         index_wq_b,
@@ -4370,8 +4398,10 @@ def l3_decode_fwd(
     wo_a: pl.Tensor[[EP_SIZE, N_LAYERS * LOCAL_O_GROUPS, O_LORA, O_GROUP_IN], pl.BF16],
     wo_b: pl.Tensor[[EP_SIZE, N_LAYERS, LOCAL_O_WIDTH, D], pl.FP8E4M3FN],
     wo_b_scale: pl.Tensor[[EP_SIZE, N_LAYERS * (LOCAL_O_WIDTH // MX_GROUP), D], pl.FP8E8M0],
-    rope_cos: pl.Tensor[[EP_SIZE, T_DYN, ROPE_DIM // 2], pl.FP32],
-    rope_sin: pl.Tensor[[EP_SIZE, T_DYN, ROPE_DIM // 2], pl.FP32],
+    base_rope_cos: pl.Tensor[[EP_SIZE, T_DYN, ROPE_DIM // 2], pl.FP32],
+    base_rope_sin: pl.Tensor[[EP_SIZE, T_DYN, ROPE_DIM // 2], pl.FP32],
+    compressed_token_rope_cos: pl.Tensor[[EP_SIZE, T_DYN, ROPE_DIM // 2], pl.FP32],
+    compressed_token_rope_sin: pl.Tensor[[EP_SIZE, T_DYN, ROPE_DIM // 2], pl.FP32],
     window_slots: pl.Tensor[[EP_SIZE, T_DYN], pl.INT64],
     window_indices: pl.Tensor[[EP_SIZE, T_DYN, BLOCK_SIZE], pl.INT32],
     window_cache_pool: pl.InOut[
@@ -4391,16 +4421,18 @@ def l3_decode_fwd(
     request_ids: pl.Tensor[[EP_SIZE, T_DYN], pl.INT32],
     token_to_req_indices: pl.Tensor[[EP_SIZE, T_DYN], pl.INT32],
     position_ids: pl.Tensor[[EP_SIZE, T_DYN], pl.INT32],
-    compressed_lens: pl.Tensor[[EP_SIZE, T_DYN], pl.INT32],
+    c2a_compressed_lens: pl.Tensor[[EP_SIZE, T_DYN], pl.INT32],
+    c1a_compressed_lens: pl.Tensor[[EP_SIZE, T_DYN], pl.INT32],
     index_cache_pool: pl.InOut[
         pl.Tensor[[EP_SIZE, FWD_INDEX_BLOCKS_DYN, BLOCK_SIZE, 1, INDEX_DIM // 2], pl.UINT8]
     ],
     index_cache_scale_pool: pl.InOut[
         pl.Tensor[[EP_SIZE, FWD_INDEX_BLOCKS_DYN, BLOCK_SIZE, 1, INDEX_DIM // INDEX_CACHE_GROUP], pl.FP8E8M0]
     ],
-    index_block_table: pl.Tensor[[EP_SIZE, B_DYN, TABLE_DYN], pl.INT32],
-    compressed_rope_cos: pl.Tensor[[EP_SIZE, T_DYN, ROPE_DIM // 2], pl.FP32],
-    compressed_rope_sin: pl.Tensor[[EP_SIZE, T_DYN, ROPE_DIM // 2], pl.FP32],
+    c2a_index_block_table: pl.Tensor[[EP_SIZE, B_DYN, FWD_C2A_TABLE_DYN], pl.INT32],
+    c1a_index_block_table: pl.Tensor[[EP_SIZE, B_DYN, FWD_C1A_TABLE_DYN], pl.INT32],
+    c2a_rope_cos: pl.Tensor[[EP_SIZE, T_DYN, ROPE_DIM // 2], pl.FP32],
+    c2a_rope_sin: pl.Tensor[[EP_SIZE, T_DYN, ROPE_DIM // 2], pl.FP32],
     c2a_compressor_wkv: pl.Tensor[[EP_SIZE, C2A_SOURCE_COUNT, D, HEAD_DIM], pl.FP32],
     c2a_compressor_wgate: pl.Tensor[[EP_SIZE, C2A_SOURCE_COUNT, D, HEAD_DIM], pl.FP32],
     c1a_compressor_wkv: pl.Tensor[[EP_SIZE, D, HEAD_DIM], pl.BF16],
@@ -4410,7 +4442,8 @@ def l3_decode_fwd(
         pl.Tensor[[EP_SIZE, FWD_STATE_BLOCKS_DYN, STATE_CAPACITY, STATE_WIDTH], pl.FP32]
     ],
     compressor_norm_weight: pl.Tensor[[EP_SIZE, KV_SOURCE_COUNT * HEAD_DIM], pl.BF16],
-    compressed_slots: pl.Tensor[[EP_SIZE, T_DYN], pl.INT64],
+    c2a_compressed_slots: pl.Tensor[[EP_SIZE, T_DYN], pl.INT64],
+    c1a_compressed_slots: pl.Tensor[[EP_SIZE, T_DYN], pl.INT64],
     index_wk: pl.Tensor[[EP_SIZE, INDEX_SOURCE_COUNT * HEAD_DIM, INDEX_DIM], pl.BF16],
     index_norm_weight: pl.Tensor[[EP_SIZE, INDEX_SOURCE_COUNT * INDEX_DIM], pl.BF16],
     index_wq_b: pl.Tensor[[EP_SIZE, INDEX_SOURCE_COUNT, Q_LORA, INDEX_H * INDEX_DIM], pl.FP8E4M3FN],
@@ -4452,10 +4485,30 @@ def l3_decode_fwd(
     moe_num_tokens: pl.Tensor[[EP_SIZE], pl.INT32],
     attention_num_tokens: pl.Scalar[pl.INT32],
 ):
+    """Run SWA with base rows and C2A/C1A with compressed-profile token rows.
+
+    All rows use absolute original-token positions. C2A publication rows use
+    p-1 for completed pairs and identity rotation otherwise. C1A publication
+    uses compressed_token_rope_cos/sin at p, including its index key.
+
+    The c2a_* and c1a_* metadata address separate compression families. At
+    position p, their visible lengths include the current publication and
+    equal (p+1)//2 and p+1. Incomplete C2A pairs use write slot -1.
+    Page ids and slots are relative to each source's slice of the packed
+    cache pools, with BLOCK_SIZE compressed rows per page. Sources within
+    one family share a page mapping; the two families may use different
+    page ids and table widths. Index and main KV caches share that mapping.
+    build_forward_metadata lowers request positions and allocator tables
+    into these lengths and slots. It does not allocate physical pages.
+    """
     x_hc.bind_dynamic(1, LOCAL_T_DYN)
     pre_mix.bind_dynamic(1, LOCAL_T_DYN)
-    rope_cos.bind_dynamic(1, T_DYN)
-    rope_sin.bind_dynamic(1, T_DYN)
+    base_rope_cos.bind_dynamic(1, T_DYN)
+    base_rope_sin.bind_dynamic(1, T_DYN)
+    compressed_token_rope_cos.bind_dynamic(1, T_DYN)
+    compressed_token_rope_sin.bind_dynamic(1, T_DYN)
+    c2a_rope_cos.bind_dynamic(1, T_DYN)
+    c2a_rope_sin.bind_dynamic(1, T_DYN)
     window_cache_pool.bind_dynamic(1, FWD_ORI_BLOCKS_DYN)
     window_cache_scale_pool.bind_dynamic(1, FWD_ORI_BLOCKS_DYN)
     compressed_cache_pool.bind_dynamic(1, FWD_CMP_BLOCKS_DYN)
@@ -4463,8 +4516,14 @@ def l3_decode_fwd(
     index_cache_pool.bind_dynamic(1, FWD_INDEX_BLOCKS_DYN)
     index_cache_scale_pool.bind_dynamic(1, FWD_INDEX_BLOCKS_DYN)
     state_cache_pool.bind_dynamic(1, FWD_STATE_BLOCKS_DYN)
-    index_block_table.bind_dynamic(1, B_DYN)
-    index_block_table.bind_dynamic(2, TABLE_DYN)
+    c2a_compressed_lens.bind_dynamic(1, T_DYN)
+    c2a_compressed_slots.bind_dynamic(1, T_DYN)
+    c1a_compressed_lens.bind_dynamic(1, T_DYN)
+    c1a_compressed_slots.bind_dynamic(1, T_DYN)
+    c2a_index_block_table.bind_dynamic(1, B_DYN)
+    c2a_index_block_table.bind_dynamic(2, FWD_C2A_TABLE_DYN)
+    c1a_index_block_table.bind_dynamic(1, B_DYN)
+    c1a_index_block_table.bind_dynamic(2, FWD_C1A_TABLE_DYN)
     attention_input_buffer = pld.alloc_window_buffer([DECODE_INPUT_MAX_TOKENS, D], dtype=pl.BF16)
     attention_input_signal_buffer = pld.alloc_window_buffer([TP_SIZE, 1], dtype=pl.INT32)
     attention_output_buffer = pld.alloc_window_buffer([DECODE_MAX_TOKENS, D], dtype=pl.FP32)
@@ -4523,8 +4582,10 @@ def l3_decode_fwd(
             attn_sink[rank],
             wo_a[rank],
             wo_b[rank],
-            rope_cos[rank],
-            rope_sin[rank],
+            base_rope_cos[rank],
+            base_rope_sin[rank],
+            compressed_token_rope_cos[rank],
+            compressed_token_rope_sin[rank],
             window_slots[rank],
             window_indices[rank],
             window_cache_pool[rank],
@@ -4534,12 +4595,12 @@ def l3_decode_fwd(
             request_ids[rank],
             token_to_req_indices[rank],
             position_ids[rank],
-            compressed_lens[rank],
+            c2a_compressed_lens[rank],
             index_cache_pool[rank],
             index_cache_scale_pool[rank],
-            index_block_table[rank],
-            compressed_rope_cos[rank],
-            compressed_rope_sin[rank],
+            c2a_index_block_table[rank],
+            c2a_rope_cos[rank],
+            c2a_rope_sin[rank],
             c2a_compressor_wkv[rank],
             c2a_compressor_wgate[rank],
             c1a_compressor_wkv[rank],
@@ -4547,7 +4608,7 @@ def l3_decode_fwd(
             state_block_table[rank],
             state_cache_pool[rank],
             compressor_norm_weight[rank],
-            compressed_slots[rank],
+            c2a_compressed_slots[rank],
             index_wk[rank],
             index_norm_weight[rank],
             index_wq_b[rank],
@@ -4609,8 +4670,10 @@ def l3_decode_fwd(
             attn_sink[rank],
             wo_a[rank],
             wo_b[rank],
-            rope_cos[rank],
-            rope_sin[rank],
+            base_rope_cos[rank],
+            base_rope_sin[rank],
+            compressed_token_rope_cos[rank],
+            compressed_token_rope_sin[rank],
             window_slots[rank],
             window_indices[rank],
             window_cache_pool[rank],
@@ -4620,12 +4683,12 @@ def l3_decode_fwd(
             request_ids[rank],
             token_to_req_indices[rank],
             position_ids[rank],
-            compressed_lens[rank],
+            c1a_compressed_lens[rank],
             index_cache_pool[rank],
             index_cache_scale_pool[rank],
-            index_block_table[rank],
-            compressed_rope_cos[rank],
-            compressed_rope_sin[rank],
+            c1a_index_block_table[rank],
+            c2a_rope_cos[rank],
+            c2a_rope_sin[rank],
             c2a_compressor_wkv[rank],
             c2a_compressor_wgate[rank],
             c1a_compressor_wkv[rank],
@@ -4633,7 +4696,7 @@ def l3_decode_fwd(
             state_block_table[rank],
             state_cache_pool[rank],
             compressor_norm_weight[rank],
-            compressed_slots[rank],
+            c1a_compressed_slots[rank],
             index_wk[rank],
             index_norm_weight[rank],
             index_wq_b[rank],
@@ -4704,12 +4767,13 @@ def _fixture_extent(dim):
         "LOCAL_T_DYN": MOE_TOKENS,
         "Q_START_DYN": FIXTURE_BATCH + 1,
         "T_DYN": FIXTURE_TOKENS,
-        "FWD_ORI_BLOCKS_DYN": N_LAYERS,
-        "FWD_CMP_BLOCKS_DYN": KV_SOURCE_COUNT,
-        "FWD_INDEX_BLOCKS_DYN": INDEX_SOURCE_COUNT,
+        "FWD_ORI_BLOCKS_DYN": N_LAYERS * FIXTURE_BATCH,
+        "FWD_CMP_BLOCKS_DYN": KV_SOURCE_COUNT * FIXTURE_BATCH,
+        "FWD_INDEX_BLOCKS_DYN": INDEX_SOURCE_COUNT * FIXTURE_BATCH,
         "FWD_STATE_BLOCKS_DYN": C2A_SOURCE_COUNT * FIXTURE_BATCH,
+        "FWD_C2A_TABLE_DYN": 1,
+        "FWD_C1A_TABLE_DYN": 2,
         "B_DYN": FIXTURE_BATCH,
-        "TABLE_DYN": 1,
     }
     for marker, extent in extents.items():
         if marker in name:
@@ -4729,6 +4793,31 @@ def build_tensor_specs():
     request_ids = torch.arange(FIXTURE_BATCH, dtype=torch.int32).repeat_interleave(FIXTURE_SEQUENCE)
     position_ids = torch.arange(FIXTURE_SEQUENCE, dtype=torch.int32).repeat(FIXTURE_BATCH)
     query_starts = torch.arange(0, FIXTURE_TOKENS + 1, FIXTURE_SEQUENCE, dtype=torch.int32)
+    base_cos, base_sin = precompute_rope_tables(FIXTURE_SEQUENCE, compressed_attention=False)
+    token_cos, token_sin = precompute_rope_tables(FIXTURE_SEQUENCE, compressed_attention=True)
+    complete = (position_ids + 1).remainder(2) == 0
+    pair_start = (position_ids - 1).clamp_min(0)
+    rope_rows = {
+        "base_rope_cos": base_cos[position_ids], "base_rope_sin": base_sin[position_ids],
+        "compressed_token_rope_cos": token_cos[position_ids], "compressed_token_rope_sin": token_sin[position_ids],
+        "c2a_rope_cos": token_cos[pair_start].masked_fill(~complete[:, None], 1.0),
+        "c2a_rope_sin": token_sin[pair_start].masked_fill(~complete[:, None], 0.0),
+    }
+    window_table = torch.arange(FIXTURE_BATCH, dtype=torch.int32).reshape(FIXTURE_BATCH, 1)
+    c2a_table = window_table.flip(0)
+    c1a_table = torch.cat((window_table, torch.full_like(window_table, -1)), dim=1)
+    compressed_tables = {
+        source: c2a_table if M.compress_ratios[source] == 2 else c1a_table for source in M.kv_source_layer_ids
+    }
+    state_tables = {source: window_table for source in M.kv_source_layer_ids if M.compress_ratios[source] == 2}
+    prefix_lens = torch.zeros(FIXTURE_BATCH, dtype=torch.int32)
+    metadata = build_forward_metadata(query_starts, prefix_lens, window_table, compressed_tables, state_tables)
+    metadata_rows = {"window_slots": metadata.window_slots, "window_indices": metadata.window_indices}
+    for family, ratio in (("c2a", 2), ("c1a", 1)):
+        source = next(source for source in M.kv_source_layer_ids if M.compress_ratios[source] == ratio)
+        metadata_rows[family + "_compressed_lens"] = metadata.compressed_lens[source]
+        metadata_rows[family + "_compressed_slots"] = metadata.compressed_slots[source]
+        metadata_rows[family + "_index_block_table"] = compressed_tables[source]
     for name in l3_decode_fwd.param_names:
         if name == "attention_num_tokens":
             specs.append(
@@ -4748,6 +4837,11 @@ def build_tensor_specs():
             init_value = request_ids.repeat(EP_SIZE, 1)
         elif name == "position_ids":
             init_value = position_ids.repeat(EP_SIZE, 1)
+        elif name in rope_rows:
+            init_value = rope_rows[name].unsqueeze(0).repeat(EP_SIZE, 1, 1)
+        elif name in metadata_rows:
+            row = metadata_rows[name]
+            init_value = row.unsqueeze(0).repeat(EP_SIZE, *([1] * row.ndim))
         elif name == "query_start_loc":
             init_value = query_starts.repeat(EP_SIZE, 1)
         elif name == "state_block_table":

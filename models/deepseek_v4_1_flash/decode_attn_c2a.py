@@ -1501,8 +1501,8 @@ def make_c2a_inputs(tokens=24, requests=6, seed=17, case="mixed", mode="decode",
 
     # Fixture initialization only: production callers retain these full tables.
     table_rows = int(positions.max()) + 1
-    freqs_cos, freqs_sin = precompute_rope_tables(table_rows, compressed_attention=False)
-    compressed_freqs_cos, compressed_freqs_sin = precompute_rope_tables(table_rows, compressed_attention=True)
+    freqs_cos, freqs_sin = precompute_rope_tables(table_rows, compressed_attention=True)
+    compressed_freqs_cos, compressed_freqs_sin = freqs_cos, freqs_sin
     rope_cos, rope_sin = freqs_cos[positions], freqs_sin[positions]
     complete = (positions + 1).remainder(RATIO) == 0
     pair_start = torch.where(complete, positions + 1 - RATIO, torch.full_like(positions, -1))

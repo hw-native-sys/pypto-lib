@@ -654,15 +654,13 @@ def configure_c1a_requests(values, mode, start_pos):
         count = min(position + 1, INDEX_TOPK)
         values["compressed_indices"][:, request, :count] = offset * 128 + torch.arange(count)
         values["candidate_mask"][:, request, :position + 1] = 1
-    frequencies = 10000.0 ** (-torch.arange(0, ROPE_DIM, 2).float() / ROPE_DIM)
-    angles = positions.float()[:, None] * frequencies
-    values["rope_cos"] = angles.cos().unsqueeze(0).repeat(ranks, 1, 1)
-    values["rope_sin"] = angles.sin().unsqueeze(0).repeat(ranks, 1, 1)
+    freqs_cos, freqs_sin = precompute_rope_tables(int(positions.max()) + 1, compressed_attention=True)
+    values["rope_cos"] = freqs_cos[positions].unsqueeze(0).repeat(ranks, 1, 1)
+    values["rope_sin"] = freqs_sin[positions].unsqueeze(0).repeat(ranks, 1, 1)
     if mode == "full":
         values["compressed_slots"] = slots.repeat(ranks, 1)
-        compressed_cos, compressed_sin = precompute_rope_tables(int(positions.max()) + 1, compressed_attention=True)
-        values["compressed_rope_cos"] = compressed_cos[positions].unsqueeze(0).repeat(ranks, 1, 1)
-        values["compressed_rope_sin"] = compressed_sin[positions].unsqueeze(0).repeat(ranks, 1, 1)
+        values["compressed_rope_cos"] = values["rope_cos"].clone()
+        values["compressed_rope_sin"] = values["rope_sin"].clone()
 
 
 def build_hc_validation_values(mode, tokens, pages, seed=17, case="random", sharded=False, start_pos=None):

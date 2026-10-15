@@ -191,6 +191,8 @@ jobs:
           build-namespace: ${{ matrix.platform }}
           pip-cache-name: pip-sim
           toolchain: bundle
+          # A5 simulation uses the MXFP8 scale dtype torch.float8_e8m0fnu.
+          torch-version: ${{ matrix.platform == 'a5sim' && 'torch==2.10.0' || 'torch==2.6.0' }}
 
       - name: Run ${{ matrix.platform }} tests
         shell: bash
