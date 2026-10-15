@@ -52,6 +52,8 @@ class Qwen3Config:
     num_layers: int
 
     sampled_ids_pad: int
+    topk_select_k: int
+    sampling_control_fields: int
 
     # Shared numeric/model invariants.
     eps: float
@@ -112,6 +114,8 @@ QWEN3_14B = Qwen3Config(
     real_vocab=151936,
     num_layers=40,
     sampled_ids_pad=8,
+    topk_select_k=32,
+    sampling_control_fields=2,
     eps=1e-6,
     q_head_batch=5,
     q_head_pad=16,
