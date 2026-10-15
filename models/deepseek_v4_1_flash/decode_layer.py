@@ -45,7 +45,7 @@ from config import (
     INDEX_BLOCKS_DYN,
     B_DYN,
     TABLE_DYN,
-    CMP_POSITIONS_DYN,
+    INDEX_POOL_BLOCKS_DYN,
     STATE_BLOCKS_DYN,
     T_DYN,
     Q_START_DYN,
@@ -255,9 +255,8 @@ def l2_decode_layer(
     ],
     index_weights_proj: pl.Tensor[[D, INDEX_H], pl.BF16],
     topk_indices: pl.InOut[pl.Tensor[[T_DYN, INDEX_TOPK], pl.INT32]],
-    candidate_mask: pl.InOut[
-        pl.Tensor[[T_DYN, CMP_POSITIONS_DYN], pl.UINT8]
-    ],
+    pool_block_ids: pl.InOut[pl.Tensor[[T_DYN, INDEX_POOL_BLOCKS_DYN], pl.INT32]],
+    pool_block_counts: pl.InOut[pl.Tensor[[T_DYN], pl.INT32]],
     compressed_indices: pl.Tensor[[T_DYN, INDEX_TOPK], pl.INT32],
     attention_output: pl.Out[pl.Tensor[[LOCAL_T_DYN, D], pl.BF16]],
     attention_hidden: pl.Out[pl.Tensor[[LOCAL_T_DYN, HC_MULT, D], pl.FP32]],
@@ -329,7 +328,7 @@ def l2_decode_layer(
     index_cache.bind_dynamic(0, INDEX_BLOCKS_DYN)
     index_block_table.bind_dynamic(0, B_DYN)
     index_block_table.bind_dynamic(1, TABLE_DYN)
-    candidate_mask.bind_dynamic(1, CMP_POSITIONS_DYN)
+    pool_block_ids.bind_dynamic(1, INDEX_POOL_BLOCKS_DYN)
     next_pre_mix.bind_dynamic(0, LOCAL_T_DYN)
     x_mixed.bind_dynamic(0, LOCAL_T_DYN)
     x_next.bind_dynamic(0, LOCAL_T_DYN)
@@ -388,7 +387,7 @@ def l2_decode_layer(
             compressed_rope_cos, compressed_rope_sin, c1a_compressor_wkv,
             compressor_norm_weight, compressed_slots, index_wk, index_norm_weight,
             index_wq_b, index_wq_b_scale, index_weights_proj, topk_indices,
-            candidate_mask, gathered, attention_input_window, attention_input_arrived,
+            pool_block_ids, pool_block_counts, gathered, attention_input_window, attention_input_arrived,
             attention_output_window, attention_output_arrived, attention_hidden,
             attention_pre_mix, group_base, tp_rank, attention_num_tokens, attention_epoch,
         )
@@ -400,7 +399,7 @@ def l2_decode_layer(
             rope_cos, rope_sin, window_slots, window_indices, window_cache,
             window_cache_scale, compressed_cache, compressed_cache_scale, request_ids,
             compressed_lens, index_cache, index_cache_scale, index_block_table,
-            candidate_mask, index_wq_b, index_wq_b_scale, index_weights_proj,
+            pool_block_ids, pool_block_counts, index_wq_b, index_wq_b_scale, index_weights_proj,
             topk_indices, gathered, attention_input_window, attention_input_arrived,
             attention_output_window, attention_output_arrived, attention_hidden,
             attention_pre_mix, group_base, tp_rank, attention_num_tokens, attention_epoch,
@@ -503,9 +502,10 @@ def l3_decode_layer(
     index_wq_b_scale: pl.Tensor[[EP_SIZE, Q_LORA // MX_GROUP, INDEX_H * INDEX_DIM], pl.FP8E8M0],
     index_weights_proj: pl.Tensor[[EP_SIZE, D, INDEX_H], pl.BF16],
     topk_indices: pl.InOut[pl.Tensor[[EP_SIZE, T_DYN, INDEX_TOPK], pl.INT32]],
-    candidate_mask: pl.InOut[
-        pl.Tensor[[EP_SIZE, T_DYN, CMP_POSITIONS_DYN], pl.UINT8]
+    pool_block_ids: pl.InOut[
+        pl.Tensor[[EP_SIZE, T_DYN, INDEX_POOL_BLOCKS_DYN], pl.INT32]
     ],
+    pool_block_counts: pl.InOut[pl.Tensor[[EP_SIZE, T_DYN], pl.INT32]],
     compressed_indices: pl.Tensor[[EP_SIZE, T_DYN, INDEX_TOPK], pl.INT32],
     attention_output: pl.Out[pl.Tensor[[EP_SIZE, LOCAL_T_DYN, D], pl.BF16]],
     attention_hidden: pl.Out[
@@ -550,7 +550,7 @@ def l3_decode_layer(
     index_block_table.bind_dynamic(1, B_DYN)
     index_block_table.bind_dynamic(2, TABLE_DYN)
     state_cache.bind_dynamic(1, STATE_BLOCKS_DYN)
-    candidate_mask.bind_dynamic(2, CMP_POSITIONS_DYN)
+    pool_block_ids.bind_dynamic(2, INDEX_POOL_BLOCKS_DYN)
     attention_input_buffer = pld.alloc_window_buffer([DECODE_INPUT_MAX_TOKENS, D], dtype=pl.BF16)
     attention_input_signal_buffer = pld.alloc_window_buffer([TP_SIZE, 1], dtype=pl.INT32)
     attention_output_buffer = pld.alloc_window_buffer([DECODE_MAX_TOKENS, D], dtype=pl.FP32)
@@ -651,7 +651,8 @@ def l3_decode_layer(
             index_wq_b_scale_rank,
             index_weights_proj[rank],
             topk_indices[rank],
-            candidate_mask[rank],
+            pool_block_ids[rank],
+            pool_block_counts[rank],
             compressed_indices[rank],
             attention_output[rank],
             attention_hidden[rank],
@@ -890,6 +891,9 @@ def _fixture_extent(dim, global_tokens):
         return global_tokens
     if "Q_START_DYN" in name:
         return 2
+    if "INDEX_POOL_BLOCKS_DYN" in name:
+        # Minimum aligned pool extent for the SWA fixture.
+        return 32
     return 1
 
 
@@ -1211,7 +1215,8 @@ def _attention_values() -> dict[str, torch.Tensor | None]:
         "index_cache": index_cache,
         "index_cache_scale": index_cache_scale,
         "index_block_table": torch.tensor([[0]], dtype=torch.int32),
-        "candidate_mask": torch.ones(2, 2, dtype=torch.bool),
+        "pool_block_ids": torch.tensor([[-1] * 32, [0] + [-1] * 31], dtype=torch.int32),
+        "pool_block_counts": torch.tensor([0, 1], dtype=torch.int32),
         "compressor_wkv": torch.randn(64, 64),
         "compressor_wgate": torch.randn(64, 64),
         "query_start_loc": torch.tensor([0, 2], dtype=torch.int32),
@@ -1397,7 +1402,8 @@ if __name__ == "__main__":
             "index_cache_scale": exact,
             "state_cache": exact,
             "topk_indices": exact,
-            "candidate_mask": exact,
+            "pool_block_ids": exact,
+            "pool_block_counts": exact,
             "attention_output": _compare_active_rows_per_rank(
                 ratio_allclose(atol=1e-2, rtol=1.0 / 128),
                 counts,

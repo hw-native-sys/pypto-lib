@@ -14,11 +14,8 @@ import torch
 import torch.nn.functional as F
 
 from config import (
-    FLASH as M,
-    CMP_POSITIONS_DYN,
-    T_DYN,
-    INDEX_CACHE_GROUP,
-    INDEX_BLOCKS_DYN,
+    FLASH as M, CMP_POSITIONS_DYN, INDEX_POOL_BLOCKS_DYN, T_DYN,
+    INDEX_CACHE_GROUP, INDEX_BLOCKS_DYN,
 )
 
 
@@ -31,10 +28,10 @@ CANDIDATE_BLOCK_SIZE = M.candidate_block_size
 CANDIDATE_TOPK_BLOCKS = M.candidate_topk_blocks
 CANDIDATE_PAIR_WIDTH = 2 * CANDIDATE_TOPK_BLOCKS
 CANDIDATE_SCORE_TILE = 1024
-CANDIDATE_LEAF = 8192
-CANDIDATE_SHORT_LEAF = 2048
+CANDIDATE_LEAF_TILE = 8192
+CANDIDATE_SHORT_LEAF_TILE = 2048
 CANDIDATE_MAX_BLOCKS = M.max_position_embeddings // CANDIDATE_BLOCK_SIZE
-CANDIDATE_MAX_LEAVES = (CANDIDATE_MAX_BLOCKS + CANDIDATE_LEAF - 1) // CANDIDATE_LEAF
+CANDIDATE_MAX_LEAVES = (CANDIDATE_MAX_BLOCKS + CANDIDATE_LEAF_TILE - 1) // CANDIDATE_LEAF_TILE
 INDEX_SCORE_POSITIONS_DYN = pl.dynamic("V41_INDEX_SCORE_POSITIONS_DYN")
 
 
@@ -222,6 +219,65 @@ def select_candidate_blocks(
     return keep.repeat_interleave(block_size, dim=-1)[..., :width]
 
 
+def index_pool_block_capacity(score_width: int) -> int:
+    """Return the aligned compact-pool capacity for one Decode score row."""
+    if score_width < 0:
+        raise ValueError(f"score_width must be nonnegative, got {score_width}")
+    blocks = max(1, (score_width + CANDIDATE_BLOCK_SIZE - 1) // CANDIDATE_BLOCK_SIZE)
+    aligned = (blocks + 31) // 32 * 32
+    return min(CANDIDATE_TOPK_BLOCKS, aligned)
+
+
+def golden_select_candidate_block_pool(
+    logits: torch.Tensor,
+    compressed_lens: torch.Tensor | int,
+    topk_blocks: int = M.candidate_topk_blocks,
+    block_size: int = M.candidate_block_size,
+    *,
+    num_tokens: int | None = None,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Return sorted logical block IDs and counts with a causal tail and fixed selected prefix."""
+    if logits.ndim != 2:
+        raise ValueError(f"logits must be rank-2, got shape {tuple(logits.shape)}")
+    if block_size != CANDIDATE_BLOCK_SIZE:
+        raise ValueError(f"block_size must be {CANDIDATE_BLOCK_SIZE}, got {block_size}")
+    if topk_blocks != CANDIDATE_TOPK_BLOCKS:
+        raise ValueError(f"topk_blocks must be {CANDIDATE_TOPK_BLOCKS}, got {topk_blocks}")
+
+    tokens, width = logits.shape
+    # Inactive tensor rows publish canonical empty pool state.
+    active_tokens = tokens if num_tokens is None else max(0, min(tokens, int(num_tokens)))
+    capacity = index_pool_block_capacity(width)
+    ids = torch.full((tokens, capacity), -1, dtype=torch.int32, device=logits.device)
+    counts = torch.zeros((tokens,), dtype=torch.int32, device=logits.device)
+    if width == 0:
+        return ids, counts
+
+    lengths = torch.as_tensor(compressed_lens, device=logits.device, dtype=torch.int64)
+    if lengths.ndim == 0:
+        lengths = lengths.expand(tokens)
+    if lengths.ndim != 1 or lengths.numel() != tokens:
+        raise ValueError("compressed_lens must provide one causal length per score row")
+
+    padded = F.pad(logits, (0, -width % block_size), value=-torch.inf)
+    block_scores = padded.unflatten(-1, (-1, block_size)).amax(dim=-1)
+    for token in range(active_tokens):
+        visible = max(0, min(int(lengths[token]), width))
+        visible_blocks = (visible + block_size - 1) // block_size
+        if visible_blocks == 0:
+            continue
+        selected_count = min(visible_blocks, topk_blocks, capacity)
+        # Rank invalid block maxima at the device sort floor.
+        scores = block_scores[token, :visible_blocks].clone().clamp_min(-1e30)
+        # Include the newest causal block independently of its score.
+        scores[visible_blocks - 1] = 1e30
+        # Resolve equal block maxima by stable logical order.
+        selected = torch.argsort(scores, descending=True, stable=True)[:selected_count].to(torch.int32)
+        ids[token, :selected_count] = selected.sort().values
+        counts[token] = selected_count
+    return ids, counts
+
+
 def golden_hierarchical_sparse_indexer(
     index_scores: torch.Tensor,
     compressed_lens: torch.Tensor,
@@ -273,20 +329,12 @@ def _sort_candidate_leaf(
     valid_count: pl.Scalar[pl.INDEX],
     output_slot: pl.Scalar[pl.INDEX],
 ):
-    raw = pl.load(
-        scores,
-        [token, block_begin],
-        [1, CANDIDATE_LEAF],
-        valid_shape=[1, valid_count],
-    )
+    raw = pl.load(scores, [token, block_begin], [1, CANDIDATE_LEAF_TILE], valid_shape=[1, valid_count])
     padded = pl.tile.fillpad(raw, pad_value=pl.PadValue.min)
-    floor = pl.tile.full([1, CANDIDATE_LEAF], dtype=pl.FP32, value=-1e30)
+    floor = pl.tile.full([1, CANDIDATE_LEAF_TILE], dtype=pl.FP32, value=-1e30)
     values = pl.maximum(padded, floor)
     block_begin_i32 = pl.cast(block_begin, pl.INT32)
-    indices = pl.add(
-        pl.tile.arange(0, [1, CANDIDATE_LEAF], dtype=pl.INT32),
-        block_begin_i32,
-    )
+    indices = pl.add(pl.tile.arange(0, [1, CANDIDATE_LEAF_TILE], dtype=pl.INT32), block_begin_i32)
     pairs = pl.tile.sort32(values, pl.reinterpret_view(indices, pl.UINT32))
     pairs = pl.tile.mrgsort(pairs, block_len=64)
     pairs = pl.tile.mrgsort(pairs, block_len=256)
@@ -304,15 +352,10 @@ def _sort_candidate_short_leaf(
     valid_count: pl.Scalar[pl.INDEX],
     output_slot: pl.Scalar[pl.INDEX],
 ):
-    raw = pl.load(
-        scores,
-        [token, 0],
-        [1, CANDIDATE_SHORT_LEAF],
-        valid_shape=[1, valid_count],
-    )
+    raw = pl.load(scores, [token, 0], [1, CANDIDATE_SHORT_LEAF_TILE], valid_shape=[1, valid_count])
     values = pl.tile.fillpad(raw, pad_value=pl.PadValue.min)
     values = pl.maximum(values, -1e30)
-    indices = pl.tile.arange(0, [1, CANDIDATE_SHORT_LEAF], dtype=pl.INT32)
+    indices = pl.tile.arange(0, [1, CANDIDATE_SHORT_LEAF_TILE], dtype=pl.INT32)
     pairs = pl.tile.sort32(values, pl.reinterpret_view(indices, pl.UINT32))
     pairs = pl.tile.mrgsort(pairs, block_len=64)
     pairs = pl.tile.mrgsort(pairs, block_len=256)
@@ -331,7 +374,7 @@ def _hierarchical_sparse_indexer(
     tokens = pl.tensor.dim(index_scores, 0)
     positions = pl.tensor.dim(candidate_mask, 1)
     block_count = (positions + CANDIDATE_BLOCK_SIZE - 1) // CANDIDATE_BLOCK_SIZE
-    padded_block_count = (block_count + CANDIDATE_LEAF - 1) // CANDIDATE_LEAF * CANDIDATE_LEAF
+    padded_block_count = (block_count + CANDIDATE_LEAF_TILE - 1) // CANDIDATE_LEAF_TILE * CANDIDATE_LEAF_TILE
     mask_tiles = (positions + 127) // 128
     padded_positions = mask_tiles * 128
     block_scores = pl.create_tensor([tokens, padded_block_count], dtype=pl.FP32)
@@ -344,10 +387,7 @@ def _hierarchical_sparse_indexer(
         block_begin = score_tile * CANDIDATE_SCORE_TILE
         position_begin = block_begin * CANDIDATE_BLOCK_SIZE
         valid_blocks = pl.min(CANDIDATE_SCORE_TILE, block_count - block_begin)
-        valid_positions = pl.min(
-            CANDIDATE_SCORE_TILE * CANDIDATE_BLOCK_SIZE,
-            positions - position_begin,
-        )
+        valid_positions = pl.min(CANDIDATE_SCORE_TILE * CANDIDATE_BLOCK_SIZE, positions - position_begin)
         raw = pl.load(
             index_scores,
             [token, position_begin],
@@ -356,10 +396,7 @@ def _hierarchical_sparse_indexer(
         )
         padded = pl.tile.fillpad(raw, pad_value=pl.PadValue.min)
         grouped = pl.reshape(padded, [CANDIDATE_SCORE_TILE, CANDIDATE_BLOCK_SIZE])
-        reduce_tmp = pl.create_tile(
-            [CANDIDATE_SCORE_TILE, CANDIDATE_BLOCK_SIZE],
-            dtype=pl.FP32,
-        )
+        reduce_tmp = pl.create_tile([CANDIDATE_SCORE_TILE, CANDIDATE_BLOCK_SIZE], dtype=pl.FP32)
         maxima = pl.reshape(pl.row_max(grouped, tmp_tile=reduce_tmp), [1, CANDIDATE_SCORE_TILE])
         visible = pl.read(compressed_lens, [token])
         if visible > 0:
@@ -378,32 +415,22 @@ def _hierarchical_sparse_indexer(
         empty = pl.cast(empty_i32, pl.UINT8)
         pl.store(empty, [token, position], aligned_mask)
 
-    arena = pl.create_tensor(
-        [tokens * CANDIDATE_MAX_LEAVES, CANDIDATE_PAIR_WIDTH],
-        dtype=pl.FP32,
-    )
+    arena = pl.create_tensor([tokens * CANDIDATE_MAX_LEAVES, CANDIDATE_PAIR_WIDTH], dtype=pl.FP32)
     with pl.spmd(tokens, name_hint="c1a_candidate_topk", deps=[score_tid, clear_tid]) as topk_tid:
         token = pl.tile.get_block_idx()
         visible = pl.read(compressed_lens, [token])
         visible_blocks = (visible + CANDIDATE_BLOCK_SIZE - 1) // CANDIDATE_BLOCK_SIZE
         arena_base = token * CANDIDATE_MAX_LEAVES
         count = 0
-        if visible_blocks > 0 and visible_blocks <= CANDIDATE_SHORT_LEAF:
+        if visible_blocks > 0 and visible_blocks <= CANDIDATE_SHORT_LEAF_TILE:
             _sort_candidate_short_leaf(block_scores, arena, token, visible_blocks, arena_base)
             count = 1
         elif visible_blocks > 0:
-            leaf_count = (visible_blocks + CANDIDATE_LEAF - 1) // CANDIDATE_LEAF
+            leaf_count = (visible_blocks + CANDIDATE_LEAF_TILE - 1) // CANDIDATE_LEAF_TILE
             for leaf in pl.range(leaf_count):
-                block_begin = leaf * CANDIDATE_LEAF
-                valid_count = pl.min(CANDIDATE_LEAF, visible_blocks - block_begin)
-                _sort_candidate_leaf(
-                    block_scores,
-                    arena,
-                    token,
-                    block_begin,
-                    valid_count,
-                    arena_base + leaf,
-                )
+                block_begin = leaf * CANDIDATE_LEAF_TILE
+                valid_count = pl.min(CANDIDATE_LEAF_TILE, visible_blocks - block_begin)
+                _sort_candidate_leaf(block_scores, arena, token, block_begin, valid_count, arena_base + leaf)
             count = leaf_count
         if count > 1:
             count = _merge_candidate_level(arena, arena_base, count)
@@ -416,11 +443,7 @@ def _hierarchical_sparse_indexer(
 
         if visible_blocks > 0:
             root = pl.load(arena, [arena_base, 0], [1, CANDIDATE_PAIR_WIDTH])
-            selected = pl.tile.gather_mask(
-                root,
-                mask_pattern=pl.tile.MaskPattern.P1010,
-                output_dtype=pl.INT32,
-            )
+            selected = pl.tile.gather_mask(root, mask_pattern=pl.tile.MaskPattern.P1010, output_dtype=pl.INT32)
             selected_count = pl.min(visible_blocks, CANDIDATE_TOPK_BLOCKS)
             for selected_lane in pl.range(selected_count):
                 selected_block = pl.tile.read(selected, [0, selected_lane])
@@ -441,6 +464,120 @@ def _hierarchical_sparse_indexer(
         mask = pl.tile.set_validshape(mask, 1, valid)
         pl.store(mask, [token, position], candidate_mask)
     return publish_tid
+
+
+@pl.jit.inline(auto_scope=False)
+def select_candidate_block_pool(
+    index_scores: pl.Tensor[[T_DYN, INDEX_SCORE_POSITIONS_DYN], pl.FP32],
+    compressed_lens: pl.Tensor[[T_DYN], pl.INT32],
+    pool_block_ids: pl.Tensor[[T_DYN, INDEX_POOL_BLOCKS_DYN], pl.INT32],
+    pool_block_counts: pl.Tensor[[T_DYN], pl.INT32],
+    num_tokens: pl.Scalar[pl.INT32],
+    scores_ready: pl.Scalar[pl.TASK_ID],
+):
+    """Publish aligned sorted logical block IDs and counts for Decode Reindex."""
+    tokens = pl.tensor.dim(index_scores, 0)
+    positions = pl.tensor.dim(index_scores, 1)
+    capacity = pl.tensor.dim(pool_block_ids, 1)
+    block_count = (positions + CANDIDATE_BLOCK_SIZE - 1) // CANDIDATE_BLOCK_SIZE
+    padded_block_count = (block_count + CANDIDATE_LEAF_TILE - 1) // CANDIDATE_LEAF_TILE * CANDIDATE_LEAF_TILE
+    score_tiles = (block_count + CANDIDATE_SCORE_TILE - 1) // CANDIDATE_SCORE_TILE
+    block_scores = pl.create_tensor([tokens, padded_block_count], dtype=pl.FP32)
+    active_tokens = pl.cast(num_tokens, pl.INDEX)
+    if active_tokens < 0:
+        active_tokens = pl.cast(0, pl.INDEX)
+    if active_tokens > tokens:
+        active_tokens = pl.cast(tokens, pl.INDEX)
+    # Dispatch one guarded work item for an empty batch.
+    score_task_tokens = pl.max(active_tokens, pl.cast(1, pl.INDEX))
+    score_task_tiles = pl.max(score_tiles, pl.cast(1, pl.INDEX))
+
+    with pl.spmd(
+        score_task_tokens * score_task_tiles,
+        name_hint="c1a_pool_block_scores",
+        deps=[scores_ready],
+    ) as score_tid:
+        work = pl.tile.get_block_idx()
+        token = work // score_task_tiles
+        score_tile = work % score_task_tiles
+        if token < active_tokens and score_tile < score_tiles:
+            block_begin = score_tile * CANDIDATE_SCORE_TILE
+            position_begin = block_begin * CANDIDATE_BLOCK_SIZE
+            valid_blocks = pl.min(CANDIDATE_SCORE_TILE, block_count - block_begin)
+            valid_positions = pl.min(CANDIDATE_SCORE_TILE * CANDIDATE_BLOCK_SIZE, positions - position_begin)
+            raw = pl.load(
+                index_scores,
+                [token, position_begin],
+                [1, CANDIDATE_SCORE_TILE * CANDIDATE_BLOCK_SIZE],
+                valid_shape=[1, valid_positions],
+            )
+            padded = pl.tile.fillpad(raw, pad_value=pl.PadValue.min)
+            grouped = pl.reshape(padded, [CANDIDATE_SCORE_TILE, CANDIDATE_BLOCK_SIZE])
+            reduce_tmp = pl.create_tile([CANDIDATE_SCORE_TILE, CANDIDATE_BLOCK_SIZE], dtype=pl.FP32)
+            maxima = pl.reshape(pl.row_max(grouped, tmp_tile=reduce_tmp), [1, CANDIDATE_SCORE_TILE])
+            visible = pl.min(pl.max(pl.read(compressed_lens, [token]), 0), positions)
+            if visible > 0:
+                last_block = (visible - 1) // CANDIDATE_BLOCK_SIZE
+                if last_block >= block_begin and last_block < block_begin + valid_blocks:
+                    pl.tile.write(maxima, [0, last_block - block_begin], 1e30)
+            maxima = pl.tile.set_validshape(maxima, 1, valid_blocks)
+            pl.store(maxima, [token, block_begin], block_scores)
+
+    arena = pl.create_tensor([tokens * CANDIDATE_MAX_LEAVES, CANDIDATE_PAIR_WIDTH], dtype=pl.FP32)
+    with pl.spmd(tokens, name_hint="c1a_pool_block_select", deps=[score_tid]) as pool_tid:
+        token = pl.tile.get_block_idx()
+        sorted_ids = pl.tile.full([1, CANDIDATE_TOPK_BLOCKS], dtype=pl.INT32, value=-1)
+        if token < active_tokens:
+            visible = pl.min(pl.max(pl.read(compressed_lens, [token]), 0), positions)
+            visible_blocks = (visible + CANDIDATE_BLOCK_SIZE - 1) // CANDIDATE_BLOCK_SIZE
+            arena_base = token * CANDIDATE_MAX_LEAVES
+            count = 0
+            if visible_blocks > 0 and visible_blocks <= CANDIDATE_SHORT_LEAF_TILE:
+                _sort_candidate_short_leaf(block_scores, arena, token, visible_blocks, arena_base)
+                count = 1
+            elif visible_blocks > 0:
+                leaf_count = (visible_blocks + CANDIDATE_LEAF_TILE - 1) // CANDIDATE_LEAF_TILE
+                for leaf in pl.range(leaf_count):
+                    block_begin = leaf * CANDIDATE_LEAF_TILE
+                    valid_count = pl.min(CANDIDATE_LEAF_TILE, visible_blocks - block_begin)
+                    _sort_candidate_leaf(block_scores, arena, token, block_begin, valid_count, arena_base + leaf)
+                count = leaf_count
+            if count > 1:
+                count = _merge_candidate_level(arena, arena_base, count)
+            if count > 1:
+                count = _merge_candidate_level(arena, arena_base, count)
+            if count > 1:
+                count = _merge_candidate_level(arena, arena_base, count)
+            if count > 1:
+                count = _merge_candidate_level(arena, arena_base, count)
+
+            selected_count = pl.min(pl.min(visible_blocks, CANDIDATE_TOPK_BLOCKS), capacity)
+            ordered_scores = pl.tile.full([1, CANDIDATE_TOPK_BLOCKS], dtype=pl.FP32, value=-1e30)
+            ordered_indices = pl.tile.full([1, CANDIDATE_TOPK_BLOCKS], dtype=pl.INT32, value=-1)
+            if selected_count > 0:
+                root = pl.load(arena, [arena_base, 0], [1, CANDIDATE_PAIR_WIDTH])
+                selected = pl.tile.gather_mask(root, mask_pattern=pl.tile.MaskPattern.P1010, output_dtype=pl.INT32)
+                for lane in pl.range(selected_count):
+                    block_id = pl.tile.read(selected, [0, lane])
+                    pl.tile.write(ordered_scores, [0, lane], -pl.cast(block_id, pl.FP32))
+                    pl.tile.write(ordered_indices, [0, lane], block_id)
+            ordered = pl.tile.sort32(ordered_scores, pl.reinterpret_view(ordered_indices, pl.UINT32))
+            ordered = pl.tile.mrgsort(ordered, block_len=64)
+            ordered = pl.tile.mrgsort(ordered, block_len=256)
+            ordered = pl.tile.mrgsort(ordered, block_len=1024)
+            sorted_ids = pl.tile.gather_mask(ordered, mask_pattern=pl.tile.MaskPattern.P1010, output_dtype=pl.INT32)
+        # Publish the sorted prefix and -1 padding as one aligned pool row.
+        pl.store(pl.tile.set_validshape(sorted_ids, 1, capacity), [token, 0], pool_block_ids)
+    # Publish cache-line-sharing counts from one worker after the ID rows.
+    with pl.at(level=pl.Level.CORE_GROUP, name_hint="c1a_pool_count_publish", deps=[pool_tid]) as counts_tid:
+        for publish_token in pl.range(tokens):
+            published_count = pl.cast(0, pl.INT32)
+            if publish_token < active_tokens:
+                publish_visible = pl.min(pl.max(pl.read(compressed_lens, [publish_token]), 0), positions)
+                publish_blocks = (publish_visible + CANDIDATE_BLOCK_SIZE - 1) // CANDIDATE_BLOCK_SIZE
+                published_count = pl.cast(pl.min(pl.min(publish_blocks, CANDIDATE_TOPK_BLOCKS), capacity), pl.INT32)
+            pl.write(pool_block_counts, [publish_token], published_count)
+    return counts_tid
 
 
 @pl.jit.inline(auto_scope=False)

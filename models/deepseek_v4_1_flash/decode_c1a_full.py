@@ -32,8 +32,8 @@ from config import (
     FLASH as M,
     B_DYN,
     CMP_BLOCKS_DYN,
-    CMP_POSITIONS_DYN,
     INDEX_BLOCKS_DYN,
+    INDEX_POOL_BLOCKS_DYN,
     ORI_BLOCKS_DYN,
     TABLE_DYN,
     T_DYN,
@@ -123,7 +123,8 @@ def decode_c1a_full(
     index_wq_b_scale: pl.Tensor[[Q_LORA // 32, INDEX_H * INDEX_DIM], pl.FP8E8M0, pl.MX_B_NN],
     index_weights_proj: pl.Tensor[[D, INDEX_H], pl.BF16],
     topk_indices: pl.Tensor[[T_DYN, INDEX_TOPK], pl.INT32],
-    candidate_mask: pl.Tensor[[T_DYN, CMP_POSITIONS_DYN], pl.UINT8],
+    pool_block_ids: pl.Tensor[[T_DYN, INDEX_POOL_BLOCKS_DYN], pl.INT32],
+    pool_block_counts: pl.Tensor[[T_DYN], pl.INT32],
     output_window: pld.DistributedTensor[[DECODE_MAX_TOKENS, D], pl.FP32],
     output_arrived: pld.DistributedTensor[[TP_SIZE, 1], pl.INT32],
     output: pl.Tensor[[T_DYN, HC_MULT, D], pl.FP32],
@@ -150,8 +151,8 @@ def decode_c1a_full(
         window_cache_scale, compressed_cache, compressed_cache_scale, request_ids, compressed_lens,
         index_cache, index_cache_scale, index_block_table, compressed_rope_cos, compressed_rope_sin,
         compressor_wkv, compressor_norm_weight, compressed_slots, index_wk, index_norm_weight, index_wq_b,
-        index_wq_b_scale, index_weights_proj, topk_indices, candidate_mask, output_window, output_arrived,
-        attn_out, group_base, tp_rank, num_tokens, attention_epoch,
+        index_wq_b_scale, index_weights_proj, topk_indices, pool_block_ids, pool_block_counts,
+        output_window, output_arrived, attn_out, group_base, tp_rank, num_tokens, attention_epoch,
     )
     mhc_post(attn_out, x_hc, post_mix, residual_mix, output)
     return output
@@ -203,7 +204,8 @@ def decode_c1a_full_sharded(
     index_wq_b_scale: pl.Tensor[[Q_LORA // 32, INDEX_H * INDEX_DIM], pl.FP8E8M0, pl.MX_B_NN],
     index_weights_proj: pl.Tensor[[D, INDEX_H], pl.BF16],
     topk_indices: pl.Tensor[[T_DYN, INDEX_TOPK], pl.INT32],
-    candidate_mask: pl.Tensor[[T_DYN, CMP_POSITIONS_DYN], pl.UINT8],
+    pool_block_ids: pl.Tensor[[T_DYN, INDEX_POOL_BLOCKS_DYN], pl.INT32],
+    pool_block_counts: pl.Tensor[[T_DYN], pl.INT32],
     gathered: pl.Tensor[[T_DYN, D], pl.BF16],
     input_window: pld.DistributedTensor[[DECODE_INPUT_MAX_TOKENS, D], pl.BF16],
     input_arrived: pld.DistributedTensor[[TP_SIZE, 1], pl.INT32],
@@ -238,8 +240,8 @@ def decode_c1a_full_sharded(
         window_cache_scale, compressed_cache, compressed_cache_scale, request_ids, compressed_lens,
         index_cache, index_cache_scale, index_block_table, compressed_rope_cos, compressed_rope_sin,
         compressor_wkv, compressor_norm_weight, compressed_slots, index_wk, index_norm_weight, index_wq_b,
-        index_wq_b_scale, index_weights_proj, topk_indices, candidate_mask, output_window, output_arrived,
-        attn_out, group_base, tp_rank, num_tokens, attention_epoch,
+        index_wq_b_scale, index_weights_proj, topk_indices, pool_block_ids, pool_block_counts,
+        output_window, output_arrived, attn_out, group_base, tp_rank, num_tokens, attention_epoch,
     )
     mhc_post(attn_out, x_hc, post_mix, residual_mix, output)
     return output
@@ -295,7 +297,8 @@ def l2_decode_c1a_full(
     index_wq_b_scale: pl.Tensor[[Q_LORA // 32, INDEX_H * INDEX_DIM], pl.FP8E8M0, pl.MX_B_NN],
     index_weights_proj: pl.Tensor[[D, INDEX_H], pl.BF16],
     topk_indices: pl.Out[pl.Tensor[[T_DYN, INDEX_TOPK], pl.INT32]],
-    candidate_mask: pl.Out[pl.Tensor[[T_DYN, CMP_POSITIONS_DYN], pl.UINT8]],
+    pool_block_ids: pl.Out[pl.Tensor[[T_DYN, INDEX_POOL_BLOCKS_DYN], pl.INT32]],
+    pool_block_counts: pl.Out[pl.Tensor[[T_DYN], pl.INT32]],
     output_window: pld.DistributedTensor[[DECODE_MAX_TOKENS, D], pl.FP32],
     output_arrived: pld.DistributedTensor[[TP_SIZE, 1], pl.INT32],
     output: pl.Out[pl.Tensor[[T_DYN, HC_MULT, D], pl.FP32]],
@@ -311,7 +314,7 @@ def l2_decode_c1a_full(
     index_cache.bind_dynamic(0, INDEX_BLOCKS_DYN)
     index_block_table.bind_dynamic(0, B_DYN)
     index_block_table.bind_dynamic(1, TABLE_DYN)
-    candidate_mask.bind_dynamic(1, CMP_POSITIONS_DYN)
+    pool_block_ids.bind_dynamic(1, INDEX_POOL_BLOCKS_DYN)
     return decode_c1a_full(
         x_hc, pre_mix, hc_attn_fn, hc_attn_scale, hc_attn_base, attn_norm_weight, wq_a, wq_a_scale,
         q_norm_weight,
@@ -320,9 +323,9 @@ def l2_decode_c1a_full(
         window_indices, window_cache, window_cache_scale, compressed_cache, compressed_cache_scale,
         request_ids, compressed_lens, index_cache, index_cache_scale, index_block_table, compressed_rope_cos,
         compressed_rope_sin, compressor_wkv, compressor_norm_weight, compressed_slots, index_wk,
-        index_norm_weight, index_wq_b, index_wq_b_scale, index_weights_proj, topk_indices, candidate_mask,
-        output_window, output_arrived, output, next_pre_mix, group_base, tp_rank, num_tokens,
-        attention_epoch,
+        index_norm_weight, index_wq_b, index_wq_b_scale, index_weights_proj, topk_indices,
+        pool_block_ids, pool_block_counts, output_window, output_arrived, output, next_pre_mix,
+        group_base, tp_rank, num_tokens, attention_epoch,
     )
 
 
@@ -376,7 +379,8 @@ def l2_decode_c1a_full_sharded(
     index_wq_b_scale: pl.Tensor[[Q_LORA // 32, INDEX_H * INDEX_DIM], pl.FP8E8M0, pl.MX_B_NN],
     index_weights_proj: pl.Tensor[[D, INDEX_H], pl.BF16],
     topk_indices: pl.Out[pl.Tensor[[T_DYN, INDEX_TOPK], pl.INT32]],
-    candidate_mask: pl.Out[pl.Tensor[[T_DYN, CMP_POSITIONS_DYN], pl.UINT8]],
+    pool_block_ids: pl.Out[pl.Tensor[[T_DYN, INDEX_POOL_BLOCKS_DYN], pl.INT32]],
+    pool_block_counts: pl.Out[pl.Tensor[[T_DYN], pl.INT32]],
     gathered: pl.InOut[pl.Tensor[[T_DYN, D], pl.BF16]],
     input_window: pld.DistributedTensor[[DECODE_INPUT_MAX_TOKENS, D], pl.BF16],
     input_arrived: pld.DistributedTensor[[TP_SIZE, 1], pl.INT32],
@@ -395,7 +399,7 @@ def l2_decode_c1a_full_sharded(
     index_cache.bind_dynamic(0, INDEX_BLOCKS_DYN)
     index_block_table.bind_dynamic(0, B_DYN)
     index_block_table.bind_dynamic(1, TABLE_DYN)
-    candidate_mask.bind_dynamic(1, CMP_POSITIONS_DYN)
+    pool_block_ids.bind_dynamic(1, INDEX_POOL_BLOCKS_DYN)
     gathered.bind_dynamic(0, T_DYN)
     return decode_c1a_full_sharded(
         x_hc, pre_mix, hc_attn_fn, hc_attn_scale, hc_attn_base, attn_norm_weight, wq_a, wq_a_scale,
@@ -405,10 +409,9 @@ def l2_decode_c1a_full_sharded(
         window_indices, window_cache, window_cache_scale, compressed_cache, compressed_cache_scale,
         request_ids, compressed_lens, index_cache, index_cache_scale, index_block_table, compressed_rope_cos,
         compressed_rope_sin, compressor_wkv, compressor_norm_weight, compressed_slots, index_wk,
-        index_norm_weight, index_wq_b, index_wq_b_scale, index_weights_proj, topk_indices, candidate_mask,
-        gathered, input_window, input_arrived, output_window, output_arrived, output, next_pre_mix,
-        group_base, tp_rank, num_tokens,
-        attention_epoch,
+        index_norm_weight, index_wq_b, index_wq_b_scale, index_weights_proj, topk_indices,
+        pool_block_ids, pool_block_counts, gathered, input_window, input_arrived, output_window,
+        output_arrived, output, next_pre_mix, group_base, tp_rank, num_tokens, attention_epoch,
     )
 
 
@@ -462,7 +465,8 @@ def l3_decode_c1a_full(
     index_wq_b_scale: pl.Tensor[[TP_SIZE, Q_LORA // 32, INDEX_H * INDEX_DIM], pl.FP8E8M0],
     index_weights_proj: pl.Tensor[[TP_SIZE, D, INDEX_H], pl.BF16],
     topk_indices: pl.Out[pl.Tensor[[TP_SIZE, T_DYN, INDEX_TOPK], pl.INT32]],
-    candidate_mask: pl.Out[pl.Tensor[[TP_SIZE, T_DYN, CMP_POSITIONS_DYN], pl.UINT8]],
+    pool_block_ids: pl.Out[pl.Tensor[[TP_SIZE, T_DYN, INDEX_POOL_BLOCKS_DYN], pl.INT32]],
+    pool_block_counts: pl.Out[pl.Tensor[[TP_SIZE, T_DYN], pl.INT32]],
     output: pl.Out[pl.Tensor[[TP_SIZE, T_DYN, HC_MULT, D], pl.FP32]],
     next_pre_mix: pl.Out[pl.Tensor[[TP_SIZE, T_DYN, HC_MULT], pl.FP32]],
     num_tokens: pl.Scalar[pl.INT32],
@@ -475,7 +479,7 @@ def l3_decode_c1a_full(
     index_cache.bind_dynamic(1, INDEX_BLOCKS_DYN)
     index_block_table.bind_dynamic(1, B_DYN)
     index_block_table.bind_dynamic(2, TABLE_DYN)
-    candidate_mask.bind_dynamic(2, CMP_POSITIONS_DYN)
+    pool_block_ids.bind_dynamic(2, INDEX_POOL_BLOCKS_DYN)
     transport = pld.alloc_window_buffer([DECODE_MAX_TOKENS, D], dtype=pl.FP32)
     signals = pld.alloc_window_buffer([TP_SIZE, 1], dtype=pl.INT32)
     for rank in pl.unroll(TP_SIZE):
@@ -502,7 +506,7 @@ def l3_decode_c1a_full(
             index_cache_scale[rank], index_block_table[rank], compressed_rope_cos[rank],
             compressed_rope_sin[rank], compressor_wkv[rank], compressor_norm_weight[rank],
             compressed_slots[rank], index_wk[rank], index_norm_weight[rank], index_wq_b[rank],
-            index_wq_b_scale_r, index_weights_proj[rank], topk_indices[rank], candidate_mask[rank],
+            index_wq_b_scale_r, index_weights_proj[rank], topk_indices[rank], pool_block_ids[rank], pool_block_counts[rank],
             output_window, output_arrived, output[rank], next_pre_mix[rank], 0, rank, num_tokens,
             attention_epoch, device=rank,
         )
@@ -558,7 +562,8 @@ def l3_decode_c1a_full_sharded(
     index_wq_b_scale: pl.Tensor[[TP_SIZE, Q_LORA // 32, INDEX_H * INDEX_DIM], pl.FP8E8M0],
     index_weights_proj: pl.Tensor[[TP_SIZE, D, INDEX_H], pl.BF16],
     topk_indices: pl.Out[pl.Tensor[[TP_SIZE, T_DYN, INDEX_TOPK], pl.INT32]],
-    candidate_mask: pl.Out[pl.Tensor[[TP_SIZE, T_DYN, CMP_POSITIONS_DYN], pl.UINT8]],
+    pool_block_ids: pl.Out[pl.Tensor[[TP_SIZE, T_DYN, INDEX_POOL_BLOCKS_DYN], pl.INT32]],
+    pool_block_counts: pl.Out[pl.Tensor[[TP_SIZE, T_DYN], pl.INT32]],
     output: pl.Out[pl.Tensor[[TP_SIZE, LOCAL_T_DYN, HC_MULT, D], pl.FP32]],
     next_pre_mix: pl.Out[pl.Tensor[[TP_SIZE, LOCAL_T_DYN, HC_MULT], pl.FP32]],
     gathered: pl.Out[pl.Tensor[[TP_SIZE, T_DYN, D], pl.BF16]],
@@ -572,7 +577,7 @@ def l3_decode_c1a_full_sharded(
     index_cache.bind_dynamic(1, INDEX_BLOCKS_DYN)
     index_block_table.bind_dynamic(1, B_DYN)
     index_block_table.bind_dynamic(2, TABLE_DYN)
-    candidate_mask.bind_dynamic(2, CMP_POSITIONS_DYN)
+    pool_block_ids.bind_dynamic(2, INDEX_POOL_BLOCKS_DYN)
     transport = pld.alloc_window_buffer([DECODE_MAX_TOKENS, D], dtype=pl.FP32)
     signals = pld.alloc_window_buffer([TP_SIZE, 1], dtype=pl.INT32)
     input_transport = pld.alloc_window_buffer([DECODE_INPUT_MAX_TOKENS, D], dtype=pl.BF16)
@@ -603,7 +608,7 @@ def l3_decode_c1a_full_sharded(
             index_cache_scale[rank], index_block_table[rank], compressed_rope_cos[rank],
             compressed_rope_sin[rank], compressor_wkv[rank], compressor_norm_weight[rank],
             compressed_slots[rank], index_wk[rank], index_norm_weight[rank], index_wq_b[rank],
-            index_wq_b_scale_r, index_weights_proj[rank], topk_indices[rank], candidate_mask[rank],
+            index_wq_b_scale_r, index_weights_proj[rank], topk_indices[rank], pool_block_ids[rank], pool_block_counts[rank],
             gathered[rank], input_window, input_arrived, output_window, output_arrived,
             output[rank], next_pre_mix[rank], 0, rank, num_tokens, attention_epoch, device=rank,
         )
@@ -629,13 +634,27 @@ def configure_c1a_requests(values, mode, start_pos):
     values["window_slots"] = slots.repeat(ranks, 1)
     values["window_indices"].fill_(-1)
     values["compressed_indices"].fill_(-1)
-    values["candidate_mask"].zero_()
+    values["pool_block_ids"].fill_(-1)
+    values["pool_block_counts"].zero_()
     for request, (offset, position) in enumerate(zip(offsets.tolist(), positions.tolist())):
         history = torch.arange(max(0, position - 127), position + 1, dtype=torch.int32)
         values["window_indices"][:, request, :history.numel()] = offset * 128 + history
         count = min(position + 1, INDEX_TOPK)
         values["compressed_indices"][:, request, :count] = offset * 128 + torch.arange(count)
-        values["candidate_mask"][:, request, :position + 1] = 1
+        visible_blocks = (position + 1 + M.candidate_block_size - 1) // M.candidate_block_size
+        pool_count = min(visible_blocks, values["pool_block_ids"].shape[-1])
+        if pool_count:
+            if pool_count == visible_blocks:
+                chosen = torch.arange(pool_count, dtype=torch.int32)
+            else:
+                chosen = torch.cat(
+                    (
+                        torch.arange(pool_count - 1, dtype=torch.int32),
+                        torch.tensor([visible_blocks - 1], dtype=torch.int32),
+                    )
+                )
+            values["pool_block_ids"][:, request, :pool_count] = chosen
+            values["pool_block_counts"][:, request] = pool_count
     freqs_cos, freqs_sin = precompute_rope_tables(int(positions.max()) + 1, compressed_attention=True)
     values["rope_cos"] = freqs_cos[positions].unsqueeze(0).repeat(ranks, 1, 1)
     values["rope_sin"] = freqs_sin[positions].unsqueeze(0).repeat(ranks, 1, 1)
@@ -698,12 +717,7 @@ def golden_c1a_hc_case(tensors, attn_golden, sharded=False):
             value = getattr(result, name, None)
             if value is not None and name in tensors:
                 destination = tensors[name][rank]
-                if name == "candidate_mask":
-                    value = value.clone()
-                    destination.zero_()
-                    destination[:, : value.shape[1]].copy_(value.to(destination.dtype))
-                else:
-                    destination.view(torch.uint8).copy_(value.contiguous().view(torch.uint8))
+                destination.view(torch.uint8).copy_(value.contiguous().view(torch.uint8))
 
     partials = []
     mixes = []
@@ -850,7 +864,8 @@ if __name__ == "__main__":
         output_budget = ratio_allclose(atol=OUTPUT_ATOL, rtol=OUTPUT_RTOL, max_error_ratio=OUTPUT_MAX_ERROR_RATIO)
         comparisons = {
             "topk_indices": ratio_allclose(atol=0.0, rtol=0.0, max_error_ratio=0.02),
-            "candidate_mask": ratio_allclose(atol=0.0, rtol=0.0, max_error_ratio=0.0),
+            "pool_block_ids": ratio_allclose(atol=0.0, rtol=0.0, max_error_ratio=0.0),
+            "pool_block_counts": ratio_allclose(atol=0.0, rtol=0.0, max_error_ratio=0.0),
             "next_pre_mix": ratio_allclose(atol=2.5e-5, rtol=5e-3),
             "output": output_budget,
             # BF16 rounding tolerance for gathered rows.

@@ -89,6 +89,8 @@ MIX_HC = M.mix_hc
 INDEX_H = M.index_n_heads
 INDEX_DIM = M.index_head_dim
 INDEX_TOPK = M.index_topk
+CANDIDATE_BLOCK_SIZE = M.candidate_block_size
+CANDIDATE_TOPK_BLOCKS = M.candidate_topk_blocks
 N_EXPERTS = EP_SIZE * N_LOCAL_EXPERTS
 TOPK = M.num_experts_per_tok
 MOE_INTER = M.moe_intermediate_size
@@ -2238,9 +2240,11 @@ def _decode_decoder(
     attention_pre_mix = pl.create_tensor([tokens, HC_MULT], dtype=pl.FP32)
     gathered = pl.create_tensor([global_tokens, D], dtype=pl.BF16)
     topk_indices = pl.create_tensor([global_tokens, INDEX_TOPK], dtype=pl.INT32)
-    candidate_mask = pl.create_tensor(
-        [global_tokens, compressed_blocks_per_source * BLOCK_SIZE], dtype=pl.UINT8
-    )
+    # Sorted eight-token blocks shared by the four Decode Reindex layers.
+    pool_blocks_raw = pl.tensor.dim(c1a_index_block_table, 1) * (BLOCK_SIZE // CANDIDATE_BLOCK_SIZE)
+    pool_block_capacity = pl.min(CANDIDATE_TOPK_BLOCKS, pl.max(32, (pool_blocks_raw + 31) // 32 * 32))
+    pool_block_ids = pl.create_tensor([global_tokens, pool_block_capacity], dtype=pl.INT32)
+    pool_block_counts = pl.create_tensor([global_tokens], dtype=pl.INT32)
     x_mixed = pl.create_tensor([tokens, D], dtype=pl.BF16)
     local_moe_tokens = pl.read(moe_num_tokens, [rank])
     fwd_attention_layer_1_window_cache_l20 = pl.slice(
@@ -2376,7 +2380,8 @@ def _decode_decoder(
         fwd_attention_layer_1_index_wq_b_scale_source_l20,
         fwd_attention_layer_1_index_weights_proj_source_l20,
         topk_indices,
-        candidate_mask,
+        pool_block_ids,
+        pool_block_counts,
         gathered,
         attention_input_window,
         attention_input_arrived,
@@ -3256,7 +3261,8 @@ def _decode_decoder(
             fwd_attention_layer_1_index_cache_l24,
             fwd_attention_layer_1_index_cache_scale_l24,
             c1a_index_block_table,
-            candidate_mask,
+            pool_block_ids,
+            pool_block_counts,
             fwd_attention_layer_1_index_wq_b_source_l24,
             fwd_attention_layer_1_index_wq_b_scale_source_l24,
             fwd_attention_layer_1_index_weights_proj_source_l24,
