@@ -619,8 +619,9 @@ def _mapped_pool_compare(
         if not written_rows.any().item():
             return True, ""
 
-        mapped_actual = actual_rows[written_rows]
-        mapped_expected = expected_rows[written_rows]
+        # CPU advanced indexing does not support FP8; gather the storage bytes.
+        mapped_actual = actual_rows.contiguous().view(torch.uint8)[written_rows].view(actual_rows.dtype)
+        mapped_expected = expected_rows.contiguous().view(torch.uint8)[written_rows].view(expected_rows.dtype)
         for label, rows in (("actual", mapped_actual), ("expected", mapped_expected)):
             if torch.is_floating_point(rows):
                 nonfinite = ~torch.isfinite(rows.to(torch.float32))

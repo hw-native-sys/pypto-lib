@@ -127,6 +127,46 @@ class TestMappedPoolRatioAllclose:
         assert not ok
         assert "non-finite" in detail
 
+    @pytest.mark.parametrize("factory", [mapped_pool_ratio_allclose, mapped_pool_ratio_reldiff])
+    @pytest.mark.parametrize("leading_rank_axis", [False, True])
+    @pytest.mark.parametrize("changed_row", [None, 0, 1])
+    def test_fp8_noncontiguous_pool_preserves_mapped_and_unmapped_checks(
+        self, factory, leading_rank_axis, changed_row,
+    ):
+        shape = (2, 2, 2, 8) if leading_rank_axis else (2, 2, 8)
+        expected_values = torch.ones(shape)
+        actual_values = expected_values.clone()
+        if changed_row is not None:
+            index = (1, 0, changed_row, 0) if leading_rank_axis else (0, changed_row, 0)
+            actual_values[index] = 2.0
+        expected = expected_values.to(torch.float8_e4m3fn)[..., ::2]
+        actual = actual_values.to(torch.float8_e4m3fn)[..., ::2]
+        assert not expected.is_contiguous()
+        mapping = torch.tensor([[0], [0]] if leading_rank_axis else [0], dtype=torch.int64)
+        options = dict(
+            mapping_shape=tuple(mapping.shape), block_size=2, leading_rank_axis=leading_rank_axis,
+        )
+        if factory is mapped_pool_ratio_allclose:
+            comparator = factory("mapping", **options, atol=0.0, rtol=0.0, max_error_ratio=0.0)
+        else:
+            comparator = factory("mapping", **options, diff_thd=0.01, pct_thd=0.0)
+
+        ok, detail = self._call(comparator, actual, expected, mapping)
+
+        if changed_row is None:
+            assert ok, detail
+        elif changed_row == 0:
+            assert not ok
+            assert "mapped rows in pool" in detail
+            compared_values = 8 if leading_rank_axis else 4
+            assert f"error_count=1/{compared_values}" in detail
+        else:
+            assert not ok
+            assert "unmapped physical pool row changed" in detail
+            assert "row=1" in detail
+            if leading_rank_axis:
+                assert "rank=1" in detail
+
     def test_rejects_rank_local_unmapped_write(self):
         expected = torch.zeros(2, 2, 2, 1, dtype=torch.float32)
         actual = expected.clone()
