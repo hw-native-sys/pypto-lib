@@ -1498,10 +1498,10 @@ def select_pool_index_topk(
 
 
 project_index_weights = make_bf16_projection_with_deps(
-    D, INDEX_H, name_hint="c1a_index_weights_projection"
+    D, INDEX_H, workers=8, name_hint="c1a_index_weights_projection"
 )
 rotate_index_query = make_rope_with_deps(
-    INDEX_H, head_dim=INDEX_DIM, name_hint="c1a_index_query_rope"
+    INDEX_H, head_dim=INDEX_DIM, max_workers=64, name_hint="c1a_index_query_rope"
 )
 
 

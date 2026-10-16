@@ -147,6 +147,35 @@ def grouped_output_with_deps(
     return grouped_tid
 
 
+def make_grouped_output_with_deps(*, max_workers=None):
+    """Specialize dependency-aware grouped output with a bounded worker pool."""
+    if max_workers is None:
+        return grouped_output_with_deps
+    if max_workers < 1:
+        raise ValueError("max_workers must be positive")
+    worker_limit = max_workers
+
+    @pl.jit.inline
+    def capped_grouped_output_with_deps(
+        x: pl.Tensor[[T_DYN, LOCAL_H * HEAD_DIM], pl.BF16],
+        weight: pl.Tensor[[LOCAL_O_GROUPS, O_LORA, O_GROUP_IN], pl.BF16],
+        output: pl.Tensor[[T_DYN, LOCAL_O_WIDTH], pl.BF16],
+        num_tokens: pl.Scalar[pl.INT32],
+        ready: pl.Scalar[pl.TASK_ID],
+    ):
+        """Apply grouped Wo-A after an explicit producer dependency."""
+        block_count = (num_tokens + M_TILE - 1) // M_TILE * (LOCAL_O_WIDTH // N_TILE)
+        worker_count = pl.min(block_count, worker_limit)
+        with pl.spmd(worker_count, name_hint="c1a_grouped_output", deps=[ready]) as grouped_tid:
+            worker = pl.tile.get_block_idx()
+            for block in pl.range(worker, block_count, worker_count):
+                _grouped_output_block(x, weight, output, block, num_tokens)
+        return grouped_tid
+
+    return capped_grouped_output_with_deps
+
+
+
 def _make_o_proj(rotate, grouped, project):
     @pl.jit.inline(auto_scope=False)
     def o_proj(

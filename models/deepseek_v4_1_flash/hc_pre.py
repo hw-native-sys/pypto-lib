@@ -34,33 +34,45 @@ def golden_hc_pre(x: torch.Tensor, pre_mix: torch.Tensor) -> torch.Tensor:
     return (x.float() * pre_mix.float().unsqueeze(-1)).sum(dim=-2).to(x.dtype)
 
 
-@pl.jit.inline
-def mhc_pre(
-    x_hc: pl.Tensor,
-    pre_mix: pl.Tensor,
-    output: pl.Tensor,
-):
-    t_dim = pl.tensor.dim(x_hc, 0)
-    x_flat = pl.reshape(x_hc, [t_dim, HC_DIM])
-    for t in pl.spmd(t_dim, name_hint="mhc_pre", allow_early_resolve=True):
-        pre0 = pl.read(pre_mix, [t, 0])
-        pre1 = pl.read(pre_mix, [t, 1])
-        pre2 = pl.read(pre_mix, [t, 2])
-        pre3 = pl.read(pre_mix, [t, 3])
-        for d0 in pl.pipeline(0, D, D_TILE, stage=2):
-            x0 = pl.load(x_flat, [t, d0], [1, D_TILE])
-            x1 = pl.load(x_flat, [t, D + d0], [1, D_TILE])
-            x2 = pl.load(x_flat, [t, 2 * D + d0], [1, D_TILE])
-            x3 = pl.load(x_flat, [t, 3 * D + d0], [1, D_TILE])
-            y0 = pl.mul(x0, pre0)
-            y1 = pl.mul(x1, pre1)
-            y2 = pl.mul(x2, pre2)
-            y3 = pl.mul(x3, pre3)
-            y_tile = pl.add(pl.add(y0, y1), pl.add(y2, y3))
-            y_bf16 = pl.cast(y_tile, target_type=pl.BF16, mode="rint")
-            pl.store(y_bf16, [t, d0], output)
-    return output
+def _make_mhc_pre(*, max_workers=None):
+    """Specialize worker scheduling with a bounded worker pool."""
+    if max_workers is not None and max_workers < 1:
+        raise ValueError("max_workers must be positive")
+    worker_limit = 2147483647 if max_workers is None else max_workers
 
+    @pl.jit.inline
+    def mhc_pre(
+        x_hc: pl.Tensor,
+        pre_mix: pl.Tensor,
+        output: pl.Tensor,
+    ):
+        t_dim = pl.tensor.dim(x_hc, 0)
+        x_flat = pl.reshape(x_hc, [t_dim, HC_DIM])
+        worker_count = pl.min(t_dim, worker_limit)
+        for worker in pl.spmd(worker_count, name_hint="mhc_pre", allow_early_resolve=True):
+            for t in pl.range(worker, t_dim, worker_count):
+                pre0 = pl.read(pre_mix, [t, 0])
+                pre1 = pl.read(pre_mix, [t, 1])
+                pre2 = pl.read(pre_mix, [t, 2])
+                pre3 = pl.read(pre_mix, [t, 3])
+                for d0 in pl.pipeline(0, D, D_TILE, stage=2):
+                    x0 = pl.load(x_flat, [t, d0], [1, D_TILE])
+                    x1 = pl.load(x_flat, [t, D + d0], [1, D_TILE])
+                    x2 = pl.load(x_flat, [t, 2 * D + d0], [1, D_TILE])
+                    x3 = pl.load(x_flat, [t, 3 * D + d0], [1, D_TILE])
+                    y0 = pl.mul(x0, pre0)
+                    y1 = pl.mul(x1, pre1)
+                    y2 = pl.mul(x2, pre2)
+                    y3 = pl.mul(x3, pre3)
+                    y_tile = pl.add(pl.add(y0, y1), pl.add(y2, y3))
+                    y_bf16 = pl.cast(y_tile, target_type=pl.BF16, mode="rint")
+                    pl.store(y_bf16, [t, d0], output)
+        return output
+
+    return mhc_pre
+
+
+mhc_pre = _make_mhc_pre()
 
 @pl.jit.inline
 def attention_hc_pre(
@@ -129,47 +141,71 @@ def golden_mhc_pre_case(tensors):
     tensors["output"][:] = golden_mhc_pre(tensors["x_hc"], tensors["pre_mix"])
 
 
-@pl.jit.inline
-def zero_bf16_padding(x: pl.Tensor, valid_rows: pl.Scalar[pl.INT32]):
-    """Clear physical rows that belong to an empty or partial TP slab.
+def _make_zero_bf16_padding(*, max_workers=None):
+    """Specialize worker scheduling with a bounded worker pool."""
+    if max_workers is not None and max_workers < 1:
+        raise ValueError("max_workers must be positive")
+    worker_limit = 2147483647 if max_workers is None else max_workers
 
-    A TP rank with no logical token still publishes one fixed-capacity slab so
-    every rank executes the same distributed window protocol.  Clearing the
-    unused rows makes that padding deterministic and prevents an empty owner
-    from publishing uninitialized data.
-    """
-    tokens = pl.tensor.dim(x, 0)
-    if tokens > 0:
-        for row in pl.spmd(tokens, name_hint="decode_sp_zero_padding"):
-            if row >= valid_rows:
-                x[row : row + 1, 0:D] = pl.full([1, D], dtype=pl.BF16, value=0.0)
+    @pl.jit.inline
+    def zero_bf16_padding(x: pl.Tensor, valid_rows: pl.Scalar[pl.INT32]):
+        """Clear physical rows that belong to an empty or partial TP slab.
+
+        A TP rank with no logical token still publishes one fixed-capacity slab so
+        every rank executes the same distributed window protocol.  Clearing the
+        unused rows makes that padding deterministic and prevents an empty owner
+        from publishing uninitialized data.
+        """
+        tokens = pl.tensor.dim(x, 0)
+        if tokens > 0:
+            worker_count = pl.min(tokens, worker_limit)
+            for worker in pl.spmd(worker_count, name_hint="decode_sp_zero_padding"):
+                for row in pl.range(worker, tokens, worker_count):
+                    if row >= valid_rows:
+                        x[row : row + 1, 0:D] = pl.full([1, D], dtype=pl.BF16, value=0.0)
+
+    return zero_bf16_padding
 
 
-@pl.jit.inline
-def mhc_pre_norm(
-    x_hc: pl.Tensor,
-    incoming_pre_mix: pl.Tensor,
-    attn_norm_weight: pl.Tensor,
-    attention_input: pl.Tensor,
-    normalized_attention: pl.Tensor,
-    owned_rows: pl.Scalar[pl.INT32],
-):
-    """Collapse the mHC streams and normalize the rows this call owns.
+zero_bf16_padding = _make_zero_bf16_padding()
 
-    The block runs between ``mhc_pre`` and the Attention operator, and it is the
-    single implementation behind both the spec-driven boundary
-    (:func:`attention_pre`) and the C1A compositions, which keep their mixes in
-    the caller.  ``owned_rows`` is the caller's row count, never a global one:
-    the replicated wiring passes the active batch size, the sequence-parallel
-    wiring passes the rank's local count from ``decode_cp_allgather.slab_owner``.  It only masks
-    the slab suffix, which is zeroed here so a published slab never carries a
-    stale value in its padding rows.
-    """
-    mhc_pre(x_hc, incoming_pre_mix, attention_input)
-    norm_tokens = pl.tensor.dim(attention_input, 0)
-    for norm_block in pl.spmd((norm_tokens + 7) // 8, name_hint="rms_norm"):
-        rms_norm_tiled(attention_input, attn_norm_weight, normalized_attention, norm_block, norm_tokens)
-    zero_bf16_padding(normalized_attention, pl.min(owned_rows, pl.tensor.dim(normalized_attention, 0)))
+
+def make_mhc_pre_norm(*, max_workers=None):
+    """Specialize mHC stream collapse and padding workers."""
+    collapse = _make_mhc_pre(max_workers=max_workers)
+    clear_padding = _make_zero_bf16_padding(max_workers=max_workers)
+
+    @pl.jit.inline
+    def mhc_pre_norm(
+        x_hc: pl.Tensor,
+        incoming_pre_mix: pl.Tensor,
+        attn_norm_weight: pl.Tensor,
+        attention_input: pl.Tensor,
+        normalized_attention: pl.Tensor,
+        owned_rows: pl.Scalar[pl.INT32],
+    ):
+        """Collapse the mHC streams and normalize the rows this call owns.
+
+        The block runs between ``mhc_pre`` and the Attention operator, and it is the
+        single implementation behind both the spec-driven boundary
+        (:func:`attention_pre`) and the C1A compositions, which keep their mixes in
+        the caller.  ``owned_rows`` is the caller's row count, never a global one:
+        the replicated wiring passes the active batch size, the sequence-parallel
+        wiring passes the rank's local count from ``decode_cp_allgather.slab_owner``.  It only masks
+        the slab suffix, which is zeroed here so a published slab never carries a
+        stale value in its padding rows.
+        """
+        collapse(x_hc, incoming_pre_mix, attention_input)
+        norm_tokens = pl.tensor.dim(attention_input, 0)
+        for norm_block in pl.spmd((norm_tokens + 7) // 8, name_hint="rms_norm"):
+            rms_norm_tiled(attention_input, attn_norm_weight, normalized_attention, norm_block, norm_tokens)
+        clear_padding(normalized_attention, pl.min(owned_rows, pl.tensor.dim(normalized_attention, 0)))
+
+    return mhc_pre_norm
+
+
+mhc_pre_norm = make_mhc_pre_norm()
+c1a_mhc_pre_norm = make_mhc_pre_norm(max_workers=32)
 
 
 @pl.jit.inline(auto_scope=False)
