@@ -71,11 +71,80 @@ def prefill_c1a_publish_window(
     return cache, scales
 
 
+def _make_mx_projection_block(width, output_width, output_dtype, n_tile):
+    """Compute one scaled FP8/MX projection tile."""
+    fp32_output = output_dtype == pl.FP32
+
+    @pl.jit.inline
+    def project_block(
+        x: pl.Tensor[[T_DYN, width], pl.BF16],
+        weight: pl.Tensor[[width, output_width], pl.FP8E4M3FN],
+        scale: pl.Tensor[[width // 32, output_width], pl.FP8E8M0, pl.MX_B_NN],
+        output: pl.Tensor[[T_DYN, output_width], output_dtype],
+        num_tokens: pl.Scalar[pl.INT32],
+        mt: pl.Scalar[pl.INDEX],
+        block: pl.Scalar[pl.INDEX],
+    ):
+        t0 = mt * MX_M_TILE
+        n0 = block * n_tile
+        rows = pl.min(MX_M_TILE, num_tokens - t0)
+        first = pl.load(x, [t0, 0], [MX_M_TILE, K_TILE], valid_shape=[rows, K_TILE])
+        first = pl.set_validshape(pl.fillpad(first, pad_value=pl.PadValue.zero), MX_M_TILE, K_TILE)
+        firstq_values = pl.reshape(pl.cast(first, pl.FP32), [MX_M_TILE * (K_TILE // 32), 32])
+        firstq_reduce_tmp = pl.create_tile([MX_M_TILE * (K_TILE // 32), 32], dtype=pl.FP32)
+        firstq_maximum = pl.maximum(pl.row_max(pl.abs(firstq_values), tmp_tile=firstq_reduce_tmp), 1e-4)
+        firstq_bits = pl.reinterpret_view(pl.mul(firstq_maximum, 1.0 / 448.0), pl.INT32)
+        firstq_exponent = pl.shrs(pl.add(firstq_bits, 8388607), 23)
+        firstq_scale = pl.reinterpret_view(pl.shls(firstq_exponent, 23), pl.FP32)
+        firstq_quantized = pl.cast(pl.row_expand_div(firstq_values, firstq_scale), pl.FP8E4M3FN, mode="rint")
+        firstq_payload = pl.reshape(firstq_quantized, [MX_M_TILE, K_TILE])
+        firstq_signed_exponent = pl.sub(firstq_exponent, pl.mul(pl.shrs(firstq_exponent, 7), 256))
+        firstq_codes = pl.reinterpret_view(pl.cast(firstq_signed_exponent, pl.INT8), pl.UINT8)
+        firstq_flat = pl.reshape(firstq_codes, [1, MX_M_TILE * (K_TILE // 32)])
+        firstq_tmp = pl.create_tile([1, 96], dtype=pl.UINT8)
+        firstq_packed = pl.tmov_x2zz(firstq_flat, firstq_tmp, group_axis=1, dst_rows=MX_M_TILE, dst_cols=8)
+        a0 = firstq_payload
+        sa0 = pl.reinterpret_view(firstq_packed, pl.FP8E8M0)
+        b0 = pl.load(weight, [0, n0], [K_TILE, n_tile])
+        sb0 = pl.load(scale, [0, n0], [K_TILE // 32, n_tile])
+        acc = pl.matmul_mx(a0, sa0, b0, sb0)
+        for kb in pl.range(1, width // K_TILE):
+            k0 = kb * K_TILE
+            values = pl.load(x, [t0, k0], [MX_M_TILE, K_TILE], valid_shape=[rows, K_TILE])
+            values = pl.set_validshape(pl.fillpad(values, pad_value=pl.PadValue.zero), MX_M_TILE, K_TILE)
+            nextq_values = pl.reshape(pl.cast(values, pl.FP32), [MX_M_TILE * (K_TILE // 32), 32])
+            nextq_reduce_tmp = pl.create_tile([MX_M_TILE * (K_TILE // 32), 32], dtype=pl.FP32)
+            nextq_maximum = pl.maximum(pl.row_max(pl.abs(nextq_values), tmp_tile=nextq_reduce_tmp), 1e-4)
+            nextq_bits = pl.reinterpret_view(pl.mul(nextq_maximum, 1.0 / 448.0), pl.INT32)
+            nextq_exponent = pl.shrs(pl.add(nextq_bits, 8388607), 23)
+            nextq_scale = pl.reinterpret_view(pl.shls(nextq_exponent, 23), pl.FP32)
+            nextq_quantized = pl.cast(pl.row_expand_div(nextq_values, nextq_scale), pl.FP8E4M3FN, mode="rint")
+            nextq_payload = pl.reshape(nextq_quantized, [MX_M_TILE, K_TILE])
+            nextq_signed_exponent = pl.sub(nextq_exponent, pl.mul(pl.shrs(nextq_exponent, 7), 256))
+            nextq_codes = pl.reinterpret_view(pl.cast(nextq_signed_exponent, pl.INT8), pl.UINT8)
+            nextq_flat = pl.reshape(nextq_codes, [1, MX_M_TILE * (K_TILE // 32)])
+            nextq_tmp = pl.create_tile([1, 96], dtype=pl.UINT8)
+            nextq_packed = pl.tmov_x2zz(nextq_flat, nextq_tmp, group_axis=1, dst_rows=MX_M_TILE, dst_cols=8)
+            a = nextq_payload
+            sa = pl.reinterpret_view(nextq_packed, pl.FP8E8M0)
+            b = pl.load(weight, [k0, n0], [K_TILE, n_tile])
+            sb = pl.load(scale, [k0 // 32, n0], [K_TILE // 32, n_tile])
+            acc = pl.matmul_mx_acc(acc, a, sa, b, sb)
+        if fp32_output:
+            output = pl.store(pl.set_validshape(pl.mul(acc, 1.0), rows, n_tile), [t0, n0], output)
+        else:
+            value = pl.cast(acc, target_type=pl.BF16, mode="rint")
+            output = pl.store(pl.set_validshape(value, rows, n_tile), [t0, n0], output)
+        return output
+
+    return project_block
+
+
 def make_mx_projection(width, output_width, output_dtype=pl.BF16, *, name_hint="attention_mx_projection", n_tile=N_TILE):
     """Specialize an MXFP8 projection without expanding weights in HBM."""
     if n_tile <= 0 or n_tile % 16 or output_width % n_tile:
         raise ValueError("MXFP8 output tile must be a positive multiple of 16 that divides output_width")
-    fp32_output = output_dtype == pl.FP32
+    project_block = _make_mx_projection_block(width, output_width, output_dtype, n_tile)
 
     @pl.jit.inline
     def project(
@@ -86,70 +155,36 @@ def make_mx_projection(width, output_width, output_dtype=pl.BF16, *, name_hint="
         num_tokens: pl.Scalar[pl.INT32],
     ):
         for mt in pl.parallel((num_tokens + MX_M_TILE - 1) // MX_M_TILE):
-            t0 = mt * MX_M_TILE
             for block in pl.spmd(output_width // n_tile, name_hint=name_hint):
-                n0 = block * n_tile
-                rows = pl.min(MX_M_TILE, num_tokens - t0)
-                first = pl.load(x, [t0, 0], [MX_M_TILE, K_TILE], valid_shape=[rows, K_TILE])
-                first = pl.set_validshape(pl.fillpad(first, pad_value=pl.PadValue.zero), MX_M_TILE, K_TILE)
-                firstq_values = pl.reshape(pl.cast(first, pl.FP32), [MX_M_TILE * (K_TILE // 32), 32])
-                firstq_reduce_tmp = pl.create_tile([MX_M_TILE * (K_TILE // 32), 32], dtype=pl.FP32)
-                firstq_maximum = pl.maximum(pl.row_max(pl.abs(firstq_values), tmp_tile=firstq_reduce_tmp), 1e-4)
-                firstq_bits = pl.reinterpret_view(pl.mul(firstq_maximum, 1.0 / 448.0), pl.INT32)
-                firstq_exponent = pl.shrs(pl.add(firstq_bits, 8388607), 23)
-                firstq_scale = pl.reinterpret_view(pl.shls(firstq_exponent, 23), pl.FP32)
-                firstq_quantized = pl.cast(
-                    pl.row_expand_div(firstq_values, firstq_scale), pl.FP8E4M3FN, mode="rint"
-                )
-                firstq_payload = pl.reshape(firstq_quantized, [MX_M_TILE, K_TILE])
-                firstq_signed_exponent = pl.sub(firstq_exponent, pl.mul(pl.shrs(firstq_exponent, 7), 256))
-                firstq_codes = pl.reinterpret_view(pl.cast(firstq_signed_exponent, pl.INT8), pl.UINT8)
-                firstq_flat = pl.reshape(firstq_codes, [1, MX_M_TILE * (K_TILE // 32)])
-                firstq_tmp = pl.create_tile([1, 96], dtype=pl.UINT8)
-                firstq_packed = pl.tmov_x2zz(
-                    firstq_flat, firstq_tmp, group_axis=1, dst_rows=MX_M_TILE, dst_cols=8
-                )
-                a0 = firstq_payload
-                sa0 = pl.reinterpret_view(firstq_packed, pl.FP8E8M0)
-                b0 = pl.load(weight, [0, n0], [K_TILE, n_tile])
-                sb0 = pl.load(scale, [0, n0], [K_TILE // 32, n_tile])
-                acc = pl.matmul_mx(a0, sa0, b0, sb0)
-                for kb in pl.range(1, width // K_TILE):
-                    k0 = kb * K_TILE
-                    values = pl.load(x, [t0, k0], [MX_M_TILE, K_TILE], valid_shape=[rows, K_TILE])
-                    values = pl.set_validshape(pl.fillpad(values, pad_value=pl.PadValue.zero), MX_M_TILE, K_TILE)
-                    nextq_values = pl.reshape(pl.cast(values, pl.FP32), [MX_M_TILE * (K_TILE // 32), 32])
-                    nextq_reduce_tmp = pl.create_tile([MX_M_TILE * (K_TILE // 32), 32], dtype=pl.FP32)
-                    nextq_maximum = pl.maximum(
-                        pl.row_max(pl.abs(nextq_values), tmp_tile=nextq_reduce_tmp), 1e-4
-                    )
-                    nextq_bits = pl.reinterpret_view(pl.mul(nextq_maximum, 1.0 / 448.0), pl.INT32)
-                    nextq_exponent = pl.shrs(pl.add(nextq_bits, 8388607), 23)
-                    nextq_scale = pl.reinterpret_view(pl.shls(nextq_exponent, 23), pl.FP32)
-                    nextq_quantized = pl.cast(
-                        pl.row_expand_div(nextq_values, nextq_scale), pl.FP8E4M3FN, mode="rint"
-                    )
-                    nextq_payload = pl.reshape(nextq_quantized, [MX_M_TILE, K_TILE])
-                    nextq_signed_exponent = pl.sub(
-                        nextq_exponent, pl.mul(pl.shrs(nextq_exponent, 7), 256)
-                    )
-                    nextq_codes = pl.reinterpret_view(pl.cast(nextq_signed_exponent, pl.INT8), pl.UINT8)
-                    nextq_flat = pl.reshape(nextq_codes, [1, MX_M_TILE * (K_TILE // 32)])
-                    nextq_tmp = pl.create_tile([1, 96], dtype=pl.UINT8)
-                    nextq_packed = pl.tmov_x2zz(
-                        nextq_flat, nextq_tmp, group_axis=1, dst_rows=MX_M_TILE, dst_cols=8
-                    )
-                    a = nextq_payload
-                    sa = pl.reinterpret_view(nextq_packed, pl.FP8E8M0)
-                    b = pl.load(weight, [k0, n0], [K_TILE, n_tile])
-                    sb = pl.load(scale, [k0 // 32, n0], [K_TILE // 32, n_tile])
-                    acc = pl.matmul_mx_acc(acc, a, sa, b, sb)
-                if fp32_output:
-                    output = pl.store(pl.set_validshape(pl.mul(acc, 1.0), rows, n_tile), [t0, n0], output)
-                else:
-                    value = pl.cast(acc, target_type=pl.BF16, mode="rint")
-                    output = pl.store(pl.set_validshape(value, rows, n_tile), [t0, n0], output)
+                output = project_block(x, weight, scale, output, num_tokens, mt, block)
         return output
+
+    return project
+
+
+def make_mx_projection_ready(
+    width, output_width, output_dtype=pl.BF16, *, name_hint="attention_mx_projection", n_tile=N_TILE,
+):
+    """Specialize an MXFP8 projection with an explicit completion TaskId."""
+    if n_tile <= 0 or n_tile % 16 or output_width % n_tile:
+        raise ValueError("MXFP8 output tile must be a positive multiple of 16 that divides output_width")
+    project_block = _make_mx_projection_block(width, output_width, output_dtype, n_tile)
+
+    @pl.jit.inline
+    def project(
+        x: pl.Tensor[[T_DYN, width], pl.BF16],
+        weight: pl.Tensor[[width, output_width], pl.FP8E4M3FN],
+        scale: pl.Tensor[[width // 32, output_width], pl.FP8E8M0, pl.MX_B_NN],
+        output: pl.Tensor[[T_DYN, output_width], output_dtype],
+        num_tokens: pl.Scalar[pl.INT32],
+        ready: pl.Scalar[pl.TASK_ID],
+    ):
+        # Dispatch all query tiles with one completion TaskId.
+        with pl.spmd(output_width // n_tile, name_hint=name_hint, deps=[ready]) as projection_tid:
+            block = pl.tile.get_block_idx()
+            for mt in pl.range((num_tokens + MX_M_TILE - 1) // MX_M_TILE):
+                project_block(x, weight, scale, output, num_tokens, mt, block)
+        return projection_tid
 
     return project
 
@@ -656,3 +691,63 @@ def kv_proj_rope(
 
 prefill_q_proj_qr = _make_q_proj_qr(_project_qa, _PREFILL_WORKERS, "prefill_attention_q_norm")
 prefill_q_proj_rope = _make_q_proj_rope(_project_qb, _prefill_rotate_q)
+
+
+def make_mx_projection_with_deps(width, output_width, output_dtype=pl.BF16):
+    """Accumulate scale-corrected group-32 products without whole-weight expansion."""
+    fp32_output = output_dtype == pl.FP32
+
+    @pl.jit.inline
+    def project(
+        x: pl.Tensor[[T_DYN, width], pl.BF16],
+        weight: pl.Tensor[[width, output_width], pl.FP8E4M3FN],
+        scale: pl.Tensor[[width // 32, output_width], pl.FP8E8M0, pl.MX_B_NN],
+        output: pl.Tensor[[T_DYN, output_width], output_dtype],
+        num_tokens: pl.Scalar[pl.INT32],
+        ready: pl.Scalar[pl.TASK_ID],
+    ):
+        scale_storage = pl.tensor.view(scale, [output_width // 16, width // 2], layout=pl.ND)
+        # A device-only scratch buffer has no tensor-map edge of its own, so the
+        # consumer must be handed the producer TaskId explicitly; a task with no
+        # dependency edge is ready at submit and may overlap its producer.
+        with pl.spmd(32, name_hint="c1a_mx_projection", deps=[ready]) as project_tid:
+            worker = pl.tile.get_block_idx()
+            for task in pl.range(worker, (num_tokens + 15) // 16 * (output_width // N_TILE), 32):
+                t0 = task // (output_width // N_TILE) * 16
+                n0 = task % (output_width // N_TILE) * N_TILE
+                rows = pl.min(16, num_tokens - t0)
+                acc = pl.tile.full([16, N_TILE], dtype=pl.FP32, value=0.0)
+                for kb in pl.range(width // 64):
+                    raw = pl.load(scale_storage, [n0 // 16, kb * 32], [N_TILE // 16, 32])
+                    raw_u8 = pl.reinterpret_view(raw, pl.UINT8)
+                    codes = pl.ands(pl.cast(pl.reinterpret_view(raw_u8, pl.INT8), pl.INT32), 255)
+                    scale_pair = pl.reinterpret_view(pl.maximum(pl.shls(codes, 23), 4194304), pl.FP32)
+                    for half in pl.unroll(2):
+                        k0 = (kb * 2 + half) * 32
+                        if half == 0:
+                            selected_scale = pl.tile.gather_mask(scale_pair, mask_pattern=pl.tile.MaskPattern.P0101)
+                        else:
+                            selected_scale = pl.tile.gather_mask(scale_pair, mask_pattern=pl.tile.MaskPattern.P1010)
+                        sb = pl.reshape(selected_scale, [1, N_TILE])
+                        source = pl.load(x, [t0, k0], [16, 32], valid_shape=[rows, 32])
+                        source = pl.set_validshape(pl.fillpad(source, pad_value=pl.PadValue.zero), 16, 32)
+                        values = pl.cast(source, pl.FP32)
+                        temporary = pl.tile.create([16, 32], dtype=pl.FP32)
+                        maximum = pl.maximum(pl.row_max(pl.abs(values), tmp_tile=temporary), 1e-4)
+                        bits = pl.reinterpret_view(pl.mul(maximum, 1.0 / 448.0), pl.INT32)
+                        exponent = pl.shrs(pl.add(bits, 8388607), 23)
+                        sa = pl.reinterpret_view(pl.shls(exponent, 23), pl.FP32)
+                        payload = pl.cast(pl.row_expand_div(values, sa), pl.FP8E4M3FN, mode="rint")
+                        a = pl.cast(payload, pl.BF16)
+                        b = pl.cast(pl.load(weight, [k0, n0], [32, N_TILE]), pl.BF16)
+                        dot = pl.matmul(a, b)
+                        part = pl.col_expand_mul(pl.row_expand_mul(dot, sa), sb)
+                        acc = pl.add(acc, part)
+                if fp32_output:
+                    pl.store(pl.set_validshape(acc, rows, N_TILE), [t0, n0], output)
+                else:
+                    result = pl.cast(acc, pl.BF16, mode="rint")
+                    pl.store(pl.set_validshape(result, rows, N_TILE), [t0, n0], output)
+        return project_tid
+
+    return project

@@ -11,7 +11,7 @@
 import pypto.language as pl
 import torch
 
-from config import FLASH as M
+from config import FLASH as M, T_DYN
 
 
 # model config
@@ -101,3 +101,26 @@ def golden_rms_norm(x: torch.Tensor, weight: torch.Tensor, eps: float = M.rms_no
     value = x.float()
     value = value * torch.rsqrt(value.square().mean(dim=-1, keepdim=True) + eps)
     return (value * weight.float()).to(dtype)
+
+
+def make_norm_with_deps(width, *, max_workers=None, name_hint="attention_rmsnorm"):
+    """Specialize whole-row RMSNorm with an explicit producer dependency."""
+    worker_limit = 2**31 - 1 if max_workers is None else max_workers
+
+    @pl.jit.inline
+    def normalize(
+        x: pl.Tensor[[T_DYN, width], pl.BF16],
+        weight: pl.Tensor[[width], pl.BF16],
+        output: pl.Tensor[[T_DYN, width], pl.BF16],
+        num_tokens: pl.Scalar[pl.INT32],
+        ready: pl.Scalar[pl.TASK_ID],
+    ):
+        blocks = (num_tokens + 7) // 8
+        workers = pl.min(blocks, worker_limit)
+        with pl.spmd(workers, name_hint=name_hint, deps=[ready]) as norm_tid:
+            worker = pl.tile.get_block_idx()
+            for block in pl.range(worker, blocks, workers):
+                rms_norm(x, weight, output, block, num_tokens, width=width)
+        return norm_tid
+
+    return normalize

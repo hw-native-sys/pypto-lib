@@ -1250,7 +1250,9 @@ class AttentionGoldenResult:
     index_cache_scale: torch.Tensor | None
     state_cache: torch.Tensor | None
     topk_indices: torch.Tensor | None
-    candidate_mask: torch.Tensor | None
+    candidate_mask: torch.Tensor | None = None
+    pool_block_ids: torch.Tensor | None = None
+    pool_block_counts: torch.Tensor | None = None
 
 
 BOUNDARY_PREFIX_NAMES = (

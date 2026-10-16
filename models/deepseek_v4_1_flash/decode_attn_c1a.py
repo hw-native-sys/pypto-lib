@@ -21,6 +21,7 @@ from quant import golden_bf16_gemm, golden_mxfp8_linear
 from qkv_proj_rope import (
     golden_rope_tail,
     make_bf16_projection_with_deps,
+    make_mx_projection_with_deps,
     make_rope_with_deps,
 )
 from rmsnorm import rms_norm
@@ -35,9 +36,9 @@ from config import (
     WINDOW_CACHE_GROUP,
     B_DYN,
     CMP_BLOCKS_DYN,
-    CMP_POSITIONS_DYN,
     INDEX_BLOCKS_DYN,
     ORI_BLOCKS_DYN,
+    INDEX_POOL_BLOCKS_DYN,
     TABLE_DYN,
     T_DYN,
     TP_SIZE,
@@ -46,9 +47,11 @@ from config import (
 
 from config import LOCAL_T_DYN
 from rope_tables import precompute_rope_tables
-from hierarchical_sparse_indexer import hierarchical_sparse_indexer
+from hierarchical_sparse_indexer import (
+    golden_select_candidate_block_pool, index_pool_block_capacity, select_candidate_block_pool,
+)
 from decode_indexer import (
-    make_indexer_prepare,
+    make_indexer_prepare, make_fp4_publish,
     score_full,
     select_index_topk,
 )
@@ -91,77 +94,14 @@ CACHE_STATE_NAMES = (
     "index_cache",
     "index_cache_scale",
     "topk_indices",
-    "candidate_mask",
+    "pool_block_ids",
+    "pool_block_counts",
 )
 
 # Validation budgets, matching the sibling C1A entries.
 OUTPUT_ATOL = 1e-2
 OUTPUT_RTOL = 1e-2
 OUTPUT_MAX_ERROR_RATIO = 0.01
-
-
-def make_mx_projection_with_deps(width, output_width, output_dtype=pl.BF16):
-    """Accumulate scale-corrected group-32 products without whole-weight expansion."""
-    fp32_output = output_dtype == pl.FP32
-
-    @pl.jit.inline
-    def project(
-        x: pl.Tensor[[T_DYN, width], pl.BF16],
-        weight: pl.Tensor[[width, output_width], pl.FP8E4M3FN],
-        scale: pl.Tensor[[width // 32, output_width], pl.FP8E8M0, pl.MX_B_NN],
-        output: pl.Tensor[[T_DYN, output_width], output_dtype],
-        num_tokens: pl.Scalar[pl.INT32],
-        ready: pl.Scalar[pl.TASK_ID],
-    ):
-        scale_storage = pl.tensor.view(scale, [output_width // 16, width // 2], layout=pl.ND)
-        # A device-only scratch buffer has no tensor-map edge of its own, so the
-        # consumer must be handed the producer TaskId explicitly; a task with no
-        # dependency edge is ready at submit and may overlap its producer.
-        with pl.spmd(32, name_hint="c1a_mx_projection", deps=[ready]) as project_tid:
-            worker = pl.tile.get_block_idx()
-            for task in pl.range(worker, (num_tokens + 15) // 16 * (output_width // N_TILE), 32):
-                t0 = task // (output_width // N_TILE) * 16
-                n0 = task % (output_width // N_TILE) * N_TILE
-                rows = pl.min(16, num_tokens - t0)
-                acc = pl.tile.full([16, N_TILE], dtype=pl.FP32, value=0.0)
-                for kb in pl.range(width // 64):
-                    raw = pl.load(scale_storage, [n0 // 16, kb * 32], [N_TILE // 16, 32])
-                    raw_u8 = pl.reinterpret_view(raw, pl.UINT8)
-                    codes = pl.ands(pl.cast(pl.reinterpret_view(raw_u8, pl.INT8), pl.INT32), 255)
-                    scale_pair = pl.reinterpret_view(pl.maximum(pl.shls(codes, 23), 4194304), pl.FP32)
-                    for half in pl.unroll(2):
-                        k0 = (kb * 2 + half) * 32
-                        if half == 0:
-                            selected_scale = pl.tile.gather_mask(
-                                scale_pair, mask_pattern=pl.tile.MaskPattern.P0101
-                            )
-                        else:
-                            selected_scale = pl.tile.gather_mask(
-                                scale_pair, mask_pattern=pl.tile.MaskPattern.P1010
-                            )
-                        sb = pl.reshape(selected_scale, [1, N_TILE])
-                        source = pl.load(x, [t0, k0], [16, 32], valid_shape=[rows, 32])
-                        source = pl.set_validshape(pl.fillpad(source, pad_value=pl.PadValue.zero), 16, 32)
-                        values = pl.cast(source, pl.FP32)
-                        temporary = pl.tile.create([16, 32], dtype=pl.FP32)
-                        maximum = pl.maximum(pl.row_max(pl.abs(values), tmp_tile=temporary), 1e-4)
-                        bits = pl.reinterpret_view(pl.mul(maximum, 1.0 / 448.0), pl.INT32)
-                        exponent = pl.shrs(pl.add(bits, 8388607), 23)
-                        sa = pl.reinterpret_view(pl.shls(exponent, 23), pl.FP32)
-                        payload = pl.cast(pl.row_expand_div(values, sa), pl.FP8E4M3FN, mode="rint")
-                        a = pl.cast(payload, pl.BF16)
-                        b = pl.cast(pl.load(weight, [k0, n0], [32, N_TILE]), pl.BF16)
-                        dot = pl.matmul(a, b)
-                        part = pl.col_expand_mul(pl.row_expand_mul(dot, sa), sb)
-                        acc = pl.add(acc, part)
-                if fp32_output:
-                    pl.store(pl.set_validshape(acc, rows, N_TILE), [t0, n0], output)
-                else:
-                    result = pl.cast(acc, pl.BF16, mode="rint")
-                    pl.store(pl.set_validshape(result, rows, N_TILE), [t0, n0], output)
-        return project_tid
-
-    return project
 
 
 @pl.jit.inline
@@ -441,185 +381,6 @@ c1a_finish = make_c1a_finish()
 c1a_finish_sharded = make_c1a_finish(c1a_reduce_scatter)
 
 
-def make_fp4_publish(width, group, scale_dtype, cache_dim):
-    """Build an FP4 cache-publish kernel for one scale dtype.
-
-    The BF16 (compressed) and E8M0 (index) encodings store different scale
-    dtypes, so the two variants must be separate traced functions: PyPTO traces
-    both arms of a Python ``if`` on a closure value and rejects the resulting
-    dtype-divergent assignment.  This factory only dispatches between them.
-    """
-    if scale_dtype == pl.FP8E8M0:
-        return _make_fp4_publish_e8m0(width, group, cache_dim)
-    return _make_fp4_publish_bf16(width, group, cache_dim)
-
-
-def _make_fp4_publish_bf16(width, group, cache_dim):
-    padded_width = max(width, 32 * group)
-
-    @pl.jit.inline(auto_scope=False)
-    def publish(
-        source: pl.Tensor[[T_DYN, width], pl.BF16],
-        slots: pl.Tensor[[T_DYN], pl.INT64],
-        cache: pl.Tensor[[cache_dim, 128, 1, width // 2], pl.UINT8],
-        scales: pl.Tensor[[cache_dim, 128, 1, width // group], pl.BF16],
-        num_tokens: pl.Scalar[pl.INT32],
-        cache_ready: pl.Scalar[pl.TASK_ID],
-        kv_ready: pl.Scalar[pl.TASK_ID],
-    ):
-        cache_rows = pl.tensor.dim(cache, 0) * 128
-        flat = pl.reshape(cache, [cache_rows, width // 2])
-        flat_scale = pl.reshape(scales, [cache_rows, width // group])
-        # Scale rows may share a cache line, so one worker publishes them in order.
-        with pl.at(
-            level=pl.Level.CORE_GROUP, name_hint="c1a_publish_fp4", deps=[cache_ready, kv_ready]
-        ) as published:
-            for t in pl.range(num_tokens):
-                slot = pl.read(slots, [t])
-                if slot >= 0:
-                    physical = pl.cast(slot, pl.INDEX)
-                    raw = pl.load(source, [t, 0], [1, padded_width], valid_shape=[1, width])
-                    raw = pl.set_validshape(pl.fillpad(raw, pad_value=pl.PadValue.zero), 1, padded_width)
-                    values = pl.reshape(pl.cast(raw, pl.FP32), [padded_width // group, group])
-                    temporary = pl.tile.create([padded_width // group, group], dtype=pl.FP32)
-                    amax = pl.row_max(pl.abs(values), tmp_tile=temporary)
-                    factors_raw = pl.maximum(pl.mul(amax, 1.0 / 6.0), 0.001953125)
-                    stored_scale = pl.cast(factors_raw, pl.BF16, mode="rint")
-                    factors = pl.cast(stored_scale, pl.FP32)
-                    normalized = pl.minimum(pl.maximum(pl.row_expand_div(values, factors), -6.0), 6.0)
-                    magnitude = pl.abs(normalized)
-                    rounded = pl.tile.full([padded_width // group, group], dtype=pl.FP32, value=0.0)
-                    select_tmp = pl.tile.create([1, 16], dtype=pl.UINT32)
-                    predicate = pl.tile.cmps(magnitude, 0.25, cmp_type=4)
-                    level = pl.tile.full([padded_width // group, group], dtype=pl.FP32, value=0.5)
-                    rounded = pl.tile.sel(predicate, level, rounded, select_tmp)
-                    predicate = pl.tile.cmps(magnitude, 0.75, cmp_type=5)
-                    level = pl.tile.full([padded_width // group, group], dtype=pl.FP32, value=1.0)
-                    rounded = pl.tile.sel(predicate, level, rounded, select_tmp)
-                    predicate = pl.tile.cmps(magnitude, 1.25, cmp_type=4)
-                    level = pl.tile.full([padded_width // group, group], dtype=pl.FP32, value=1.5)
-                    rounded = pl.tile.sel(predicate, level, rounded, select_tmp)
-                    predicate = pl.tile.cmps(magnitude, 1.75, cmp_type=5)
-                    level = pl.tile.full([padded_width // group, group], dtype=pl.FP32, value=2.0)
-                    rounded = pl.tile.sel(predicate, level, rounded, select_tmp)
-                    predicate = pl.tile.cmps(magnitude, 2.5, cmp_type=4)
-                    level = pl.tile.full([padded_width // group, group], dtype=pl.FP32, value=3.0)
-                    rounded = pl.tile.sel(predicate, level, rounded, select_tmp)
-                    predicate = pl.tile.cmps(magnitude, 3.5, cmp_type=5)
-                    level = pl.tile.full([padded_width // group, group], dtype=pl.FP32, value=4.0)
-                    rounded = pl.tile.sel(predicate, level, rounded, select_tmp)
-                    predicate = pl.tile.cmps(magnitude, 5.0, cmp_type=4)
-                    level = pl.tile.full([padded_width // group, group], dtype=pl.FP32, value=6.0)
-                    rounded = pl.tile.sel(predicate, level, rounded, select_tmp)
-                    # Convert the exact RNE levels to E2M1 codes, then pack adjacent lanes.
-                    codes = pl.add(pl.minimum(pl.mul(rounded, 2.0), 4.0),
-                                   pl.minimum(pl.maximum(pl.sub(rounded, 2.0), 0.0), 3.0))
-                    sign = pl.ands(pl.shrs(pl.reinterpret_view(normalized, pl.INT32), 28), 8)
-                    codes = pl.reshape(pl.or_(pl.cast(codes, pl.INT32), sign), [1, padded_width])
-                    low = pl.tile.gather_mask(
-                        codes, mask_pattern=pl.tile.MaskPattern.P0101, output_dtype=pl.INT32
-                    )
-                    high = pl.tile.gather_mask(
-                        codes, mask_pattern=pl.tile.MaskPattern.P1010, output_dtype=pl.INT32
-                    )
-                    packed = pl.add(low, pl.mul(high, 16))
-                    signed_bytes = pl.sub(packed, pl.mul(pl.shrs(packed, 7), 256))
-                    payload_bytes = pl.reinterpret_view(pl.cast(signed_bytes, pl.INT8), pl.UINT8)
-                    payload = pl.set_validshape(payload_bytes, 1, width // 2)
-                    encoded = pl.set_validshape(pl.reshape(stored_scale, [1, padded_width // group]),
-                                                1, width // group)
-                    pl.store(payload, [physical, 0], flat)
-                    pl.store(encoded, [physical, 0], flat_scale)
-        return published
-
-    return publish
-
-
-def _make_fp4_publish_e8m0(width, group, cache_dim):
-    padded_width = max(width, 32 * group)
-
-    @pl.jit.inline(auto_scope=False)
-    def publish(
-        source: pl.Tensor[[T_DYN, width], pl.BF16],
-        slots: pl.Tensor[[T_DYN], pl.INT64],
-        cache: pl.Tensor[[cache_dim, 128, 1, width // 2], pl.UINT8],
-        scales: pl.Tensor[[cache_dim, 128, 1, width // group], pl.FP8E8M0],
-        num_tokens: pl.Scalar[pl.INT32],
-        cache_ready: pl.Scalar[pl.TASK_ID],
-        kv_ready: pl.Scalar[pl.TASK_ID],
-    ):
-        cache_rows = pl.tensor.dim(cache, 0) * 128
-        flat = pl.reshape(cache, [cache_rows, width // 2])
-        flat_scale = pl.reshape(scales, [cache_rows, width // group])
-        # Scale rows may share a cache line, so one worker publishes them in order.
-        with pl.at(
-            level=pl.Level.CORE_GROUP, name_hint="c1a_publish_fp4", deps=[cache_ready, kv_ready]
-        ) as published:
-            for t in pl.range(num_tokens):
-                slot = pl.read(slots, [t])
-                if slot >= 0:
-                    physical = pl.cast(slot, pl.INDEX)
-                    raw = pl.load(source, [t, 0], [1, padded_width], valid_shape=[1, width])
-                    raw = pl.set_validshape(pl.fillpad(raw, pad_value=pl.PadValue.zero), 1, padded_width)
-                    values = pl.reshape(pl.cast(raw, pl.FP32), [padded_width // group, group])
-                    temporary = pl.tile.create([padded_width // group, group], dtype=pl.FP32)
-                    amax = pl.row_max(pl.abs(values), tmp_tile=temporary)
-                    bounded = pl.maximum(amax, 7.052966104933725e-38)
-                    bits = pl.reinterpret_view(pl.mul(bounded, 1.0 / 6.0), pl.INT32)
-                    exponent = pl.shrs(pl.add(bits, 8388607), 23)
-                    factors = pl.reinterpret_view(pl.shls(exponent, 23), pl.FP32)
-                    # Raw codes span 0..255; folding to a signed byte would saturate.
-                    stored_codes = exponent
-                    normalized = pl.minimum(pl.maximum(pl.row_expand_div(values, factors), -6.0), 6.0)
-                    magnitude = pl.abs(normalized)
-                    rounded = pl.tile.full([padded_width // group, group], dtype=pl.FP32, value=0.0)
-                    select_tmp = pl.tile.create([1, 16], dtype=pl.UINT32)
-                    predicate = pl.tile.cmps(magnitude, 0.25, cmp_type=4)
-                    level = pl.tile.full([padded_width // group, group], dtype=pl.FP32, value=0.5)
-                    rounded = pl.tile.sel(predicate, level, rounded, select_tmp)
-                    predicate = pl.tile.cmps(magnitude, 0.75, cmp_type=5)
-                    level = pl.tile.full([padded_width // group, group], dtype=pl.FP32, value=1.0)
-                    rounded = pl.tile.sel(predicate, level, rounded, select_tmp)
-                    predicate = pl.tile.cmps(magnitude, 1.25, cmp_type=4)
-                    level = pl.tile.full([padded_width // group, group], dtype=pl.FP32, value=1.5)
-                    rounded = pl.tile.sel(predicate, level, rounded, select_tmp)
-                    predicate = pl.tile.cmps(magnitude, 1.75, cmp_type=5)
-                    level = pl.tile.full([padded_width // group, group], dtype=pl.FP32, value=2.0)
-                    rounded = pl.tile.sel(predicate, level, rounded, select_tmp)
-                    predicate = pl.tile.cmps(magnitude, 2.5, cmp_type=4)
-                    level = pl.tile.full([padded_width // group, group], dtype=pl.FP32, value=3.0)
-                    rounded = pl.tile.sel(predicate, level, rounded, select_tmp)
-                    predicate = pl.tile.cmps(magnitude, 3.5, cmp_type=5)
-                    level = pl.tile.full([padded_width // group, group], dtype=pl.FP32, value=4.0)
-                    rounded = pl.tile.sel(predicate, level, rounded, select_tmp)
-                    predicate = pl.tile.cmps(magnitude, 5.0, cmp_type=4)
-                    level = pl.tile.full([padded_width // group, group], dtype=pl.FP32, value=6.0)
-                    rounded = pl.tile.sel(predicate, level, rounded, select_tmp)
-                    # Convert the exact RNE levels to E2M1 codes, then pack adjacent lanes.
-                    codes = pl.add(pl.minimum(pl.mul(rounded, 2.0), 4.0),
-                                   pl.minimum(pl.maximum(pl.sub(rounded, 2.0), 0.0), 3.0))
-                    sign = pl.ands(pl.shrs(pl.reinterpret_view(normalized, pl.INT32), 28), 8)
-                    codes = pl.reshape(pl.or_(pl.cast(codes, pl.INT32), sign), [1, padded_width])
-                    low = pl.tile.gather_mask(
-                        codes, mask_pattern=pl.tile.MaskPattern.P0101, output_dtype=pl.INT32
-                    )
-                    high = pl.tile.gather_mask(
-                        codes, mask_pattern=pl.tile.MaskPattern.P1010, output_dtype=pl.INT32
-                    )
-                    packed = pl.add(low, pl.mul(high, 16))
-                    signed_bytes = pl.sub(packed, pl.mul(pl.shrs(packed, 7), 256))
-                    payload_bytes = pl.reinterpret_view(pl.cast(signed_bytes, pl.INT8), pl.UINT8)
-                    payload = pl.set_validshape(payload_bytes, 1, width // 2)
-                    encoded_codes = pl.reinterpret_view(pl.cast(stored_codes, pl.UINT8), pl.FP8E8M0)
-                    encoded = pl.set_validshape(pl.reshape(encoded_codes, [1, padded_width // group]),
-                                                1, width // group)
-                    pl.store(payload, [physical, 0], flat)
-                    pl.store(encoded, [physical, 0], flat_scale)
-        return published
-
-    return publish
-
-
 # E2M1 exact midpoints and the magnitude code the A5 publish kernels emit for
 # them: even codes win the tie, so 3.5 selects +4 and 2.5 selects +2.
 FP4_MIDPOINT_CODES = {0.25: 0, 0.75: 2, 1.25: 2, 1.75: 4, 2.5: 4, 3.5: 6, 5.0: 6}
@@ -717,22 +478,16 @@ def _reference_sparse_attention(q, window_value, window_indices, compressed_valu
 
 
 # Independent CPU reference; only rows named by a non-negative slot are rewritten.
-def _reference_index_scores(a, qr, index_payload, index_scale, candidates):
-    """Rebuild the per-token index scores and the physical row behind every logical column.
-
-    The golden selection and the top-k comparator share this so a cutoff substitution can be
-    checked against the score gap that produced it. The query is quantized exactly as the
-    released indexer does, and every rounding point follows the device score kernel, so a
-    device/reference disagreement is a real disagreement instead of an arithmetic ABI mismatch.
-    """
+def _reference_index_scores(a, qr, index_payload, index_scale):
+    """Rebuild the per-token index scores and the physical row behind every logical column."""
     from qkv_proj_rope import golden_rope_interleave as rope_interleave
     from quant import dequantize_mxfp4_cache
 
     x = a["x"]
     lengths = a["compressed_lens"]
-    width = max(0, int(lengths.max())) if lengths.numel() else 0
-    if candidates is not None:
-        width = candidates.shape[-1]
+    # Full scores every table position.  Decode Reindex materializes a compact
+    # score row from this exact dense reference after selecting its block pool.
+    width = a["index_block_table"].shape[-1] * 128
     heads = a["index_weights_proj"].shape[-1]
     iq = golden_mxfp8_linear(qr, a["index_wq_b"], a["index_wq_b_scale"])
     if iq.shape[-1] % heads:
@@ -763,16 +518,35 @@ def _reference_index_scores(a, qr, index_payload, index_scale, candidates):
         dots = golden_bf16_gemm(iq[t], keys[rows.long()].T)
         product = dots.float().relu() * weight[t, :, None]
         values = product.to(torch.bfloat16).float().sum(0).to(torch.bfloat16).float()
-        if candidates is not None:
-            values = values.masked_fill(candidates[t, valid_pos] == 0, -torch.inf)
         scores[t, valid_pos] = values
     return scores, physical
+
+
+def _reference_pool_index_scores(scores, physical, pool_block_ids, pool_block_counts):
+    """Pack dense logical scores into the Reindex block-pool score layout."""
+    tokens, dense_width = scores.shape
+    capacity = pool_block_ids.shape[-1]
+    compact_width = capacity * M.candidate_block_size
+    compact_scores = torch.full((tokens, compact_width), -torch.inf, dtype=scores.dtype)
+    compact_physical = torch.full((tokens, compact_width), -1, dtype=physical.dtype)
+    for token in range(tokens):
+        count = max(0, min(int(pool_block_counts[token]), capacity))
+        for slot in range(count):
+            block = int(pool_block_ids[token, slot])
+            logical_begin = block * M.candidate_block_size
+            if block < 0 or logical_begin >= dense_width:
+                continue
+            logical_end = min(logical_begin + M.candidate_block_size, dense_width)
+            compact_begin = slot * M.candidate_block_size
+            compact_end = compact_begin + (logical_end - logical_begin)
+            compact_scores[token, compact_begin:compact_end] = scores[token, logical_begin:logical_end]
+            compact_physical[token, compact_begin:compact_end] = physical[token, logical_begin:logical_end]
+    return compact_scores, compact_physical
 
 
 def golden_reference_c1a(**args):
     """Released C1A math with caller-managed paged caches and replicated index heads."""
     from rmsnorm import golden_rms_norm
-    from hierarchical_sparse_indexer import select_candidate_blocks
     from quant import (
         dequantize_mxfp4_cache, dequantize_mxfp8_cache,
     )
@@ -813,30 +587,28 @@ def golden_reference_c1a(**args):
         compressed_scale.view(torch.uint8).flatten(0, 1)[slots, 0] = cs.view(torch.uint8)[valid]
         index.flatten(0, 1)[slots, 0] = kp[valid]
         index_scale.flatten(0, 1)[slots, 0] = ks[valid]
-    candidates = a["candidate_mask"]
+    pool_block_ids = a.get("pool_block_ids")
+    pool_block_counts = a.get("pool_block_counts")
     topk = a["compressed_indices"]
     if mode != AttentionMode.REUSE:
         lengths = a["compressed_lens"]
-        width = int(lengths.max()) if lengths.numel() else 0
-        if candidates is not None:
-            width = candidates.shape[-1]
-        scores, physical = _reference_index_scores(a, qr, index, index_scale, candidates)
+        scores, physical = _reference_index_scores(a, qr, index, index_scale)
+        if mode == AttentionMode.REINDEX:
+            if pool_block_ids is None or pool_block_counts is None:
+                raise ValueError("C1A Reindex requires compact block-pool metadata")
+            scores, physical = _reference_pool_index_scores(scores, physical, pool_block_ids, pool_block_counts)
         topk = torch.full((x.shape[0], INDEX_TOPK), -1, dtype=torch.int32)
         for t in range(x.shape[0]):
-            count = min(int(lengths[t]), width)
+            if mode == AttentionMode.REINDEX:
+                count = min(int(pool_block_counts[t]) * M.candidate_block_size, scores.shape[-1])
+            else:
+                count = min(int(lengths[t]), scores.shape[-1])
             # Stable tie order makes ties reproducible without requiring Torch's topk implementation order.
             chosen = torch.argsort(scores[t, :count], descending=True, stable=True)[:INDEX_TOPK]
             chosen = chosen[torch.isfinite(scores[t, chosen])].sort().values
             topk[t, :chosen.numel()] = physical[t, chosen].int()
         if mode == AttentionMode.FULL:
-            if width:
-                # Candidate masks publish the entire newest partial block.
-                padded_scores = torch.nn.functional.pad(
-                    scores, (0, -width % M.candidate_block_size), value=-torch.inf
-                )
-                candidates = select_candidate_blocks(padded_scores, lengths)
-            else:
-                candidates = torch.zeros_like(scores, dtype=torch.bool)
+            pool_block_ids, pool_block_counts = golden_select_candidate_block_pool(scores, lengths)
     window_value = dequantize_mxfp8_cache(window, window_scale).to(x.dtype)
     compressed_value = dequantize_mxfp4_cache(compressed, compressed_scale, 16, "bf16").to(x.dtype)
     attended = _reference_sparse_attention(
@@ -847,8 +619,10 @@ def golden_reference_c1a(**args):
     # The device writes the grouped projection as BF16 after one FP32 accumulation.
     latent = golden_grouped_output(grouped, a["wo_a"], a["wo_a_scale"])
     output = golden_mxfp8_linear(latent.flatten(-2), a["wo_b"], a["wo_b_scale"])
-    return AttentionGoldenResult(output, window, window_scale, compressed, compressed_scale,
-                                 index, index_scale, None, topk, candidates)
+    return AttentionGoldenResult(
+        output, window, window_scale, compressed, compressed_scale, index, index_scale, None, topk,
+        pool_block_ids=pool_block_ids, pool_block_counts=pool_block_counts,
+    )
 
 
 # Bind the shared C1A MX projection into the independent indexer preparation.
@@ -927,7 +701,8 @@ def golden_decode_attn_c1a_reuse(
         index_cache_scale=None,
         index_block_table=None,
         request_ids=None,
-        candidate_mask=None,
+        pool_block_ids=None,
+        pool_block_counts=None,
     )
 
 
@@ -959,12 +734,13 @@ def golden_decode_attn_c1a_reindex(
     index_cache: torch.Tensor,
     index_cache_scale: torch.Tensor,
     index_block_table: torch.Tensor,
-    candidate_mask: torch.Tensor,
+    pool_block_ids: torch.Tensor,
+    pool_block_counts: torch.Tensor,
     index_wq_b: torch.Tensor,
     index_wq_b_scale: torch.Tensor,
     index_weights_proj: torch.Tensor,
 ) -> AttentionGoldenResult:
-    """Evaluate C1A decode reindex with the source candidate mask."""
+    """Evaluate C1A Decode Reindex using the immutable Full block pool."""
     return golden_reference_c1a(
         mode=AttentionMode.REINDEX,
         ratio=1,
@@ -1009,7 +785,8 @@ def golden_decode_attn_c1a_reindex(
         index_cache_scale=index_cache_scale,
         index_block_table=index_block_table,
         request_ids=request_ids,
-        candidate_mask=candidate_mask,
+        pool_block_ids=pool_block_ids,
+        pool_block_counts=pool_block_counts,
     )
 
 
@@ -1111,7 +888,8 @@ def golden_decode_attn_c1a_full(
         index_cache_scale=index_cache_scale,
         index_block_table=index_block_table,
         request_ids=request_ids,
-        candidate_mask=None,
+        pool_block_ids=None,
+        pool_block_counts=None,
     )
 
 
@@ -1161,7 +939,8 @@ def make_decode_attn_c1a_full(output_reduce=None):
         index_wq_b_scale: pl.Tensor[[Q_LORA // 32, INDEX_H * INDEX_DIM], pl.FP8E8M0, pl.MX_B_NN],
         index_weights_proj: pl.Tensor[[D, INDEX_H], pl.BF16],
         topk_indices: pl.Tensor[[T_DYN, INDEX_TOPK], pl.INT32],
-        candidate_mask: pl.Tensor[[T_DYN, CMP_POSITIONS_DYN], pl.UINT8],
+        pool_block_ids: pl.Tensor[[T_DYN, INDEX_POOL_BLOCKS_DYN], pl.INT32],
+        pool_block_counts: pl.Tensor[[T_DYN], pl.INT32],
         output_window: pld.DistributedTensor[[DECODE_MAX_TOKENS, D], pl.FP32],
         output_arrived: pld.DistributedTensor[[TP_SIZE, 1], pl.INT32],
         output: pl.Tensor[[LOCAL_T_DYN, D], pl.BF16],
@@ -1198,32 +977,32 @@ def make_decode_attn_c1a_full(output_reduce=None):
             index_key, compressed_slots, index_cache, index_cache_scale, num_tokens, cache_ready, ik_tid,
         )
         rotated = pl.create_tensor([tokens, HEAD_DIM], dtype=pl.BF16)
-        rc_tid = rotate_compressor(
-            latent, compressed_rope_cos, compressed_rope_sin, rotated, num_tokens, nc_tid,
-        )
+        rc_tid = rotate_compressor(latent, compressed_rope_cos, compressed_rope_sin, rotated, num_tokens, nc_tid)
         publish_compressed(
             rotated, compressed_slots, compressed_cache, compressed_cache_scale, num_tokens, cache_ready, rc_tid,
         )
-        width = pl.tensor.dim(candidate_mask, 1)
+        # Full score width follows the logical page-table capacity.
+        score_width = pl.tensor.dim(index_block_table, 1) * 128
         (index_query, index_query_scale, index_weights, scores, query_tid, weights_tid) = c1a_index(
             x, qr, index_wq_b, index_wq_b_scale, index_weights_proj, rope_cos, rope_sin,
-            num_tokens, width, cache_ready, qr_tid,
+            num_tokens, score_width, cache_ready, qr_tid,
         )
         scores_tid = score_full(
             index_query, index_query_scale, index_weights, index_cache, index_cache_scale,
-            index_block_table, request_ids, compressed_lens, candidate_mask,
+            index_block_table, request_ids, compressed_lens,
             scores, num_tokens, index_ready, query_tid, weights_tid,
         )
-        topk_tid = select_index_topk(
-            scores, index_block_table, request_ids, topk_indices, num_tokens, scores_tid,
+        topk_tid = select_index_topk(scores, index_block_table, request_ids, topk_indices, num_tokens, scores_tid)
+        pool_tid = select_candidate_block_pool(
+            scores, compressed_lens, pool_block_ids, pool_block_counts, num_tokens, scores_tid,
         )
-        hierarchical_sparse_indexer(scores, compressed_lens, candidate_mask)
+        selection_ready = pl.system.task_dummy(deps=[topk_tid, pool_tid])
         reducer(
             query, window_cache, window_cache_scale, compressed_cache, compressed_cache_scale, window_indices,
             topk_indices, attn_sink, wo_a, wo_a_scale, wo_b, wo_b_scale, rope_cos, rope_sin, output_window, output_arrived,
-            output, group_base, tp_rank, num_tokens, attention_epoch, q_tid, topk_tid,
+            output, group_base, tp_rank, num_tokens, attention_epoch, q_tid, selection_ready,
         )
-        return output, topk_indices, candidate_mask
+        return output, topk_indices, pool_block_ids, pool_block_counts
 
     return decode_attn_c1a_full
 
@@ -1263,9 +1042,7 @@ def l2_decode_attn_c1a(
     request_ids: pl.Tensor[[T_DYN], pl.INT32],
     compressed_lens: pl.Tensor[[T_DYN], pl.INT32],
     index_cache: pl.InOut[pl.Tensor[[INDEX_BLOCKS_DYN, 128, 1, INDEX_DIM // 2], pl.UINT8]],
-    index_cache_scale: pl.InOut[
-        pl.Tensor[[INDEX_BLOCKS_DYN, 128, 1, INDEX_DIM // INDEX_CACHE_GROUP], pl.FP8E8M0]
-    ],
+    index_cache_scale: pl.InOut[pl.Tensor[[INDEX_BLOCKS_DYN, 128, 1, INDEX_DIM // INDEX_CACHE_GROUP], pl.FP8E8M0]],
     index_block_table: pl.Tensor[[B_DYN, TABLE_DYN], pl.INT32],
     compressed_rope_cos: pl.Tensor[[T_DYN, ROPE_DIM // 2], pl.FP32],
     compressed_rope_sin: pl.Tensor[[T_DYN, ROPE_DIM // 2], pl.FP32],
@@ -1278,7 +1055,8 @@ def l2_decode_attn_c1a(
     index_wq_b_scale: pl.Tensor[[Q_LORA // 32, INDEX_H * INDEX_DIM], pl.FP8E8M0, pl.MX_B_NN],
     index_weights_proj: pl.Tensor[[D, INDEX_H], pl.BF16],
     topk_indices: pl.Out[pl.Tensor[[T_DYN, INDEX_TOPK], pl.INT32]],
-    candidate_mask: pl.Out[pl.Tensor[[T_DYN, CMP_POSITIONS_DYN], pl.UINT8]],
+    pool_block_ids: pl.Out[pl.Tensor[[T_DYN, INDEX_POOL_BLOCKS_DYN], pl.INT32]],
+    pool_block_counts: pl.Out[pl.Tensor[[T_DYN], pl.INT32]],
     output_window: pld.DistributedTensor[[DECODE_MAX_TOKENS, D], pl.FP32],
     output_arrived: pld.DistributedTensor[[TP_SIZE, 1], pl.INT32],
     output: pl.Out[pl.Tensor[[T_DYN, D], pl.BF16]],
@@ -1293,14 +1071,15 @@ def l2_decode_attn_c1a(
     index_cache.bind_dynamic(0, INDEX_BLOCKS_DYN)
     index_block_table.bind_dynamic(0, B_DYN)
     index_block_table.bind_dynamic(1, TABLE_DYN)
-    candidate_mask.bind_dynamic(1, CMP_POSITIONS_DYN)
+    pool_block_ids.bind_dynamic(1, INDEX_POOL_BLOCKS_DYN)
     return decode_attn_c1a_full(
         x, wq_a, wq_a_scale, q_norm_weight, wq_b, wq_b_scale, wkv, wkv_scale, kv_norm_weight, attn_sink,
         wo_a, wo_a_scale, wo_b, wo_b_scale, rope_cos, rope_sin, window_slots, window_indices, window_cache,
         window_cache_scale, compressed_cache, compressed_cache_scale, request_ids, compressed_lens,
         index_cache, index_cache_scale, index_block_table, compressed_rope_cos, compressed_rope_sin,
         compressor_wkv, compressor_norm_weight, compressed_slots, index_wk, index_norm_weight, index_wq_b,
-        index_wq_b_scale, index_weights_proj, topk_indices, candidate_mask, output_window, output_arrived,
+        index_wq_b_scale, index_weights_proj, topk_indices, pool_block_ids, pool_block_counts,
+        output_window, output_arrived,
         output, group_base, tp_rank, num_tokens, attention_epoch,
     )
 
@@ -1345,7 +1124,8 @@ def l3_decode_attn_c1a(
     index_wq_b_scale: pl.Tensor[[TP_SIZE, Q_LORA // 32, INDEX_H * INDEX_DIM], pl.FP8E8M0],
     index_weights_proj: pl.Tensor[[TP_SIZE, D, INDEX_H], pl.BF16],
     topk_indices: pl.Out[pl.Tensor[[TP_SIZE, T_DYN, INDEX_TOPK], pl.INT32]],
-    candidate_mask: pl.Out[pl.Tensor[[TP_SIZE, T_DYN, CMP_POSITIONS_DYN], pl.UINT8]],
+    pool_block_ids: pl.Out[pl.Tensor[[TP_SIZE, T_DYN, INDEX_POOL_BLOCKS_DYN], pl.INT32]],
+    pool_block_counts: pl.Out[pl.Tensor[[TP_SIZE, T_DYN], pl.INT32]],
     output: pl.Out[pl.Tensor[[TP_SIZE, T_DYN, D], pl.BF16]],
     num_tokens: pl.Scalar[pl.INT32],
     attention_epoch: pl.Scalar[pl.INT32],
@@ -1357,7 +1137,7 @@ def l3_decode_attn_c1a(
     index_cache.bind_dynamic(1, INDEX_BLOCKS_DYN)
     index_block_table.bind_dynamic(1, B_DYN)
     index_block_table.bind_dynamic(2, TABLE_DYN)
-    candidate_mask.bind_dynamic(2, CMP_POSITIONS_DYN)
+    pool_block_ids.bind_dynamic(2, INDEX_POOL_BLOCKS_DYN)
     transport = pld.alloc_window_buffer([DECODE_MAX_TOKENS, D], dtype=pl.FP32)
     signals = pld.alloc_window_buffer([TP_SIZE, 1], dtype=pl.INT32)
     for rank in pl.unroll(TP_SIZE):
@@ -1383,7 +1163,7 @@ def l3_decode_attn_c1a(
             index_block_table[rank], compressed_rope_cos[rank], compressed_rope_sin[rank],
             compressor_wkv[rank], compressor_norm_weight[rank], compressed_slots[rank],
             index_wk[rank], index_norm_weight[rank], index_wq_b[rank], index_wq_b_scale_r,
-            index_weights_proj[rank], topk_indices[rank], candidate_mask[rank], output_window,
+            index_weights_proj[rank], topk_indices[rank], pool_block_ids[rank], pool_block_counts[rank], output_window,
             output_arrived, output[rank], 0, rank, num_tokens, attention_epoch, device=rank,
         )
 
@@ -1440,9 +1220,7 @@ def build_validation_values(mode, tokens, pages, requests=1, seed=17, case="rand
     )
     values["compressed_indices"] = torch.full((RANKS, TOKENS, INDEX_TOPK), -1, dtype=torch.int32)
     values["compressed_indices"][:, :, :128] = torch.arange(128, dtype=torch.int32)
-    wc, ws = quantize_mxfp8_cache(
-        torch.randn(1, PAGES, 128, 1, HEAD_DIM).expand(RANKS, -1, -1, -1, -1).contiguous()
-    )
+    wc, ws = quantize_mxfp8_cache(torch.randn(1, PAGES, 128, 1, HEAD_DIM).expand(RANKS, -1, -1, -1, -1).contiguous())
     cc, cs = quantize_mxfp4_cache(
         torch.randn(1, PAGES, 128, 1, HEAD_DIM).expand(RANKS, -1, -1, -1, -1).contiguous(), 16, "bf16"
     )
@@ -1478,19 +1256,12 @@ def build_validation_values(mode, tokens, pages, requests=1, seed=17, case="rand
         ics.view(torch.float8_e8m0fnu),
     )
     values["topk_indices"] = torch.zeros(RANKS, TOKENS, INDEX_TOPK, dtype=torch.int32)
-    logical_quiet = quiet_page[values["index_block_table"][:, 0]].repeat_interleave(128, dim=1)
-    visible = ~logical_quiet | (torch.arange(PAGES * 128) % 32 == 0).unsqueeze(0)
-    values["candidate_mask"] = (
-        visible.to(torch.uint8).unsqueeze(1).expand(RANKS, TOKENS, -1).contiguous()
-    )
     if mode == "full":
         values["compressed_rope_cos"] = values["rope_cos"].clone()
         values["compressed_rope_sin"] = values["rope_sin"].clone()
         values["compressor_wkv"] = (torch.randn(RANKS, D, HEAD_DIM) / math.sqrt(D)).to(torch.bfloat16)
         values["compressor_norm_weight"] = torch.ones(RANKS, HEAD_DIM, dtype=torch.bfloat16)
-        values["index_wk"] = (torch.randn(RANKS, HEAD_DIM, INDEX_DIM) / math.sqrt(HEAD_DIM)).to(
-            torch.bfloat16
-        )
+        values["index_wk"] = (torch.randn(RANKS, HEAD_DIM, INDEX_DIM) / math.sqrt(HEAD_DIM)).to(torch.bfloat16)
         # The published index key lands in the quiet half of the ladder: the loud half already
         # fills INDEX_TOPK slots exactly, so a key competing at the cut would make the last slot
         # depend on a ulp. RMSNorm cancels any scale on the projection, so the norm weight sets
@@ -1533,12 +1304,36 @@ def build_validation_values(mode, tokens, pages, requests=1, seed=17, case="rand
     elif case == "masked":
         values["window_indices"].fill_(-1)
         values["compressed_indices"].fill_(-1)
-        values["candidate_mask"].zero_()
         values["compressed_lens"].zero_()
         if mode == "full":
             values["compressed_slots"].fill_(-1)
     elif case == "sink":
         values["attn_sink"].fill_(10000)
+
+    # Build sorted complete-block fixtures with the newest causal block.
+    pool_capacity = index_pool_block_capacity(PAGES * 128)
+    pool_ids = torch.full((RANKS, TOKENS, pool_capacity), -1, dtype=torch.int32)
+    pool_counts = torch.zeros((RANKS, TOKENS), dtype=torch.int32)
+    for rank in range(RANKS):
+        for token in range(TOKENS):
+            visible = max(0, min(int(values["compressed_lens"][rank, token]), PAGES * 128))
+            block_count = (visible + M.candidate_block_size - 1) // M.candidate_block_size
+            selected = min(block_count, pool_capacity)
+            if selected == 0:
+                continue
+            if selected == block_count:
+                chosen = torch.arange(selected, dtype=torch.int32)
+            else:
+                chosen = torch.cat(
+                    (
+                        torch.arange(selected - 1, dtype=torch.int32),
+                        torch.tensor([block_count - 1], dtype=torch.int32),
+                    )
+                )
+            pool_ids[rank, token, :selected] = chosen
+            pool_counts[rank, token] = selected
+    values["pool_block_ids"] = pool_ids
+    values["pool_block_counts"] = pool_counts
     return values
 
 
@@ -1643,12 +1438,7 @@ if __name__ == "__main__":
                 value = getattr(result, name, None)
                 if value is not None and name in tensors:
                     destination = tensors[name][rank]
-                    if name == "candidate_mask":
-                        value = value.clone()
-                        destination.zero_()
-                        destination[:, : value.shape[1]].copy_(value.to(destination.dtype))
-                    else:
-                        destination.view(torch.uint8).copy_(value.contiguous().view(torch.uint8))
+                    destination.view(torch.uint8).copy_(value.contiguous().view(torch.uint8))
         reduced = torch.zeros_like(partials[0])
         for partial in partials:
             reduced += partial
@@ -1656,7 +1446,8 @@ if __name__ == "__main__":
 
     comparisons = {
         "topk_indices": ratio_allclose(atol=0.0, rtol=0.0, max_error_ratio=0.02),
-        "candidate_mask": ratio_allclose(atol=0.0, rtol=0.0, max_error_ratio=0.0),
+        "pool_block_ids": ratio_allclose(atol=0.0, rtol=0.0, max_error_ratio=0.0),
+        "pool_block_counts": ratio_allclose(atol=0.0, rtol=0.0, max_error_ratio=0.0),
         "output": ratio_allclose(atol=OUTPUT_ATOL, rtol=OUTPUT_RTOL, max_error_ratio=OUTPUT_MAX_ERROR_RATIO),
         **cache_compare(len(devices), args.tokens, "full"),
     }
