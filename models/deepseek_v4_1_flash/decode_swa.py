@@ -117,7 +117,11 @@ def decode_swa(
         q, window_cache, window_cache_scale, window_indices, attn_sink, attended, num_tokens,
     )
     partial = pl.create_tensor([tokens, D], dtype=pl.FP32)
-    o_proj(attended, wo_a, wo_a_scale, wo_b, wo_b_scale, rope_cos, rope_sin, partial, num_tokens)
+    o_proj(
+        attended, wo_a, wo_a_scale, wo_b,
+        wo_b_scale, rope_cos, rope_sin,
+        partial, num_tokens, grouped_max_workers=4096,
+    )
     output_rows = pl.tensor.dim(attention_output, 0)
     for row in pl.spmd(output_rows, name_hint="swa_output_cast"):
         for col in pl.range(0, D, 512):

@@ -85,14 +85,15 @@ def grouped_output(
     scale: pl.Tensor[[LOCAL_O_GROUPS, O_GROUP_IN // 32, O_LORA], pl.FP8E8M0],
     output: pl.Tensor[[T_DYN, LOCAL_O_WIDTH], pl.BF16],
     num_tokens: pl.Scalar[pl.INT32],
+    max_workers: pl.constexpr = GROUPED_WORKER_TILE,
 ):
     tokens = pl.tensor.dim(x, 0)
     accumulated = pl.create_tensor([tokens, LOCAL_O_WIDTH], dtype=pl.FP32)
     blocks = (num_tokens + M_TILE - 1) // M_TILE * (LOCAL_O_WIDTH // N_TILE)
-    workers = pl.max(pl.min(blocks, GROUPED_WORKER_TILE), 1)
+    workers = pl.max(pl.min(blocks, max_workers), 1)
     cube_tids = pl.array.create(LOCAL_O_GROUPS * (O_LORA // N_TILE), pl.TASK_ID)
     group_blocks = (num_tokens + M_TILE - 1) // M_TILE
-    group_workers = pl.max(pl.min(group_blocks, GROUPED_WORKER_TILE), 1)
+    group_workers = pl.max(pl.min(group_blocks, max_workers), 1)
     for group in pl.parallel(LOCAL_O_GROUPS):
         weight_group = pl.reshape(weight[group:group + 1, :, :], [O_GROUP_IN, O_LORA])
         scale_mx: pl.Tensor[[O_GROUP_IN // 32, O_LORA], pl.FP8E8M0, pl.MX_B_NN] = pl.reshape(
@@ -102,7 +103,7 @@ def grouped_output(
             local_n = nb * N_TILE
             with pl.spmd(group_workers, name_hint="attention_grouped_o_a_cube") as cube_tid:
                 worker = pl.tile.get_block_idx()
-                for block in pl.range(worker, group_blocks, GROUPED_WORKER_TILE):
+                for block in pl.range(worker, group_blocks, max_workers):
                     t0 = block * M_TILE
                     output_n = group * O_LORA + local_n
                     rows = pl.min(M_TILE, num_tokens - t0)
@@ -159,7 +160,7 @@ def grouped_output(
             cube_tids[group * (O_LORA // N_TILE) + nb] = cube_tid
     with pl.spmd(workers, name_hint="attention_grouped_o_a_cast", deps=[cube_tids]):
         worker = pl.tile.get_block_idx()
-        for block in pl.range(worker, blocks, GROUPED_WORKER_TILE):
+        for block in pl.range(worker, blocks, max_workers):
             t0 = block // (LOCAL_O_WIDTH // N_TILE) * M_TILE
             n0 = block % (LOCAL_O_WIDTH // N_TILE) * N_TILE
             rows = pl.min(M_TILE, num_tokens - t0)
@@ -179,13 +180,16 @@ def o_proj(
     rope_sin: pl.Tensor[[T_DYN, ROPE_DIM // 2], pl.FP32],
     output: pl.Tensor[[T_DYN, D], pl.FP32],
     num_tokens: pl.Scalar[pl.INT32],
+    grouped_max_workers: pl.constexpr = GROUPED_WORKER_TILE,
 ):
     """Project attention output with native MXFP8 GEMM."""
     tokens = pl.tensor.dim(attended, 0)
     unrotated = pl.create_tensor([tokens, LOCAL_H * HEAD_DIM], dtype=pl.BF16)
     _rotate_output(attended, rope_cos, rope_sin, unrotated, num_tokens, 64, "attention_o_rope")
     latent = pl.create_tensor([tokens, LOCAL_O_WIDTH], dtype=pl.BF16)
-    grouped_output(unrotated, wo_a, wo_a_scale, latent, num_tokens)
+    grouped_output(
+        unrotated, wo_a, wo_a_scale, latent, num_tokens, max_workers=grouped_max_workers,
+    )
     mxfp8_gemm(
         latent, wo_b, wo_b_scale, output, num_tokens,
         width=LOCAL_O_WIDTH, output_width=D, fp32_output=True,

@@ -121,7 +121,11 @@ def prefill_c2a_reuse_attention(
             query, selected, combined, attn_sink, attended, start, active, gather_tid
         )
 
-    o_proj(attended, wo_a, wo_a_scale, wo_b, wo_b_scale, rope_cos, rope_sin, partial, num_tokens)
+    o_proj(
+        attended, wo_a, wo_a_scale, wo_b,
+        wo_b_scale, rope_cos, rope_sin,
+        partial, num_tokens, grouped_max_workers=4096,
+    )
     return partial
 
 

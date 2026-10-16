@@ -1421,7 +1421,7 @@ def project_index_weights(
     result, completed = bf16_gemm_staged(
         source, weight, output, num_tokens, ready,
         width=D, output_width=INDEX_H, n_tile=INDEX_WEIGHT_N_TILE, k_tile=INDEX_PROJ_K_TILE,
-        workers=32, name_hint='c1a_index_weights_projection',
+        workers=8, name_hint='c1a_index_weights_projection',
     )
     return completed
 
@@ -1436,7 +1436,7 @@ def rotate_index_query(
     ready: pl.Scalar[pl.TASK_ID],
 ):
     blocks = num_tokens * INDEX_H
-    workers = pl.min(blocks, 2147483647)
+    workers = pl.min(blocks, 64)
     with pl.spmd(workers, name_hint='c1a_index_query_rope', deps=[ready]) as rope_tid:
         worker = pl.tile.get_block_idx()
         for block in pl.range(worker, blocks, workers):
@@ -1907,7 +1907,7 @@ def c1a_project_index_key(
     result, completed = bf16_gemm_staged(
         source, weight, output, num_tokens, ready,
         width=HEAD_DIM, output_width=INDEX_DIM, n_tile=INDEX_PROJ_N_TILE, k_tile=INDEX_PROJ_K_TILE,
-        workers=32, name_hint='c1a_index_key_projection',
+        workers=8, name_hint='c1a_index_key_projection',
     )
     return completed
 

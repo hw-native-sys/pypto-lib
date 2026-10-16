@@ -542,7 +542,7 @@ def decode_c1a_compressor_project(
     result, completed = bf16_gemm_staged(
         source, weight, output, num_tokens, ready,
         width=D, output_width=HEAD_DIM, n_tile=COMPRESSOR_PROJ_N_TILE, k_tile=COMPRESSOR_PROJ_K_TILE,
-        workers=32, name_hint='c1a_compressor_projection',
+        workers=8, name_hint='c1a_compressor_projection',
     )
     return completed
 

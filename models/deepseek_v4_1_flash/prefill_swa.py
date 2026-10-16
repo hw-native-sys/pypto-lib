@@ -138,7 +138,11 @@ def prefill_swa_attention(
             descriptors, chunk_indices, attn_sink,
             attended, active, decoded_ready, index_ready,
         )
-        o_proj(attended, wo_a, wo_a_scale, wo_b, wo_b_scale, chunk_cos, chunk_sin, chunk_partial, active)
+        o_proj(
+            attended, wo_a, wo_a_scale, wo_b,
+            wo_b_scale, chunk_cos, chunk_sin,
+            chunk_partial, active, grouped_max_workers=4096,
+        )
         with pl.spmd(WORKER_TILE, name_hint="prefill_swa_collect") as collect_tid:
             worker = pl.tile.get_block_idx()
             for row in pl.range(worker, active, WORKER_TILE):
