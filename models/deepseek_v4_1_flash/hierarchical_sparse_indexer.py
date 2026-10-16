@@ -492,82 +492,89 @@ def select_candidate_block_pool(
     score_task_tokens = pl.max(active_tokens, pl.cast(1, pl.INDEX))
     score_task_tiles = pl.max(score_tiles, pl.cast(1, pl.INDEX))
 
-    with pl.spmd(
-        score_task_tokens * score_task_tiles,
-        name_hint="c1a_pool_block_scores",
-        deps=[scores_ready],
-    ) as score_tid:
-        work = pl.tile.get_block_idx()
-        token = work // score_task_tiles
-        score_tile = work % score_task_tiles
-        if token < active_tokens and score_tile < score_tiles:
-            block_begin = score_tile * CANDIDATE_SCORE_TILE
-            position_begin = block_begin * CANDIDATE_BLOCK_SIZE
-            valid_blocks = pl.min(CANDIDATE_SCORE_TILE, block_count - block_begin)
-            valid_positions = pl.min(CANDIDATE_SCORE_TILE * CANDIDATE_BLOCK_SIZE, positions - position_begin)
-            raw = pl.load(
-                index_scores,
-                [token, position_begin],
-                [1, CANDIDATE_SCORE_TILE * CANDIDATE_BLOCK_SIZE],
-                valid_shape=[1, valid_positions],
-            )
-            padded = pl.tile.fillpad(raw, pad_value=pl.PadValue.min)
-            grouped = pl.reshape(padded, [CANDIDATE_SCORE_TILE, CANDIDATE_BLOCK_SIZE])
-            reduce_tmp = pl.create_tile([CANDIDATE_SCORE_TILE, CANDIDATE_BLOCK_SIZE], dtype=pl.FP32)
-            maxima = pl.reshape(pl.row_max(grouped, tmp_tile=reduce_tmp), [1, CANDIDATE_SCORE_TILE])
-            visible = pl.min(pl.max(pl.read(compressed_lens, [token]), 0), positions)
-            if visible > 0:
-                last_block = (visible - 1) // CANDIDATE_BLOCK_SIZE
-                if last_block >= block_begin and last_block < block_begin + valid_blocks:
-                    pl.tile.write(maxima, [0, last_block - block_begin], 1e30)
-            maxima = pl.tile.set_validshape(maxima, 1, valid_blocks)
-            pl.store(maxima, [token, block_begin], block_scores)
+    score_work = score_task_tokens * score_task_tiles
+    score_workers = pl.min(score_work, 32)
+    with pl.spmd(score_workers, name_hint="c1a_pool_block_scores", deps=[scores_ready]) as score_tid:
+        score_worker = pl.tile.get_block_idx()
+        for score_task in pl.range(score_worker, score_work, score_workers):
+            score_token = score_task // score_task_tiles
+            score_tile = score_task % score_task_tiles
+            if score_token < active_tokens and score_tile < score_tiles:
+                score_beg = score_tile * CANDIDATE_SCORE_TILE
+                score_pos = score_beg * CANDIDATE_BLOCK_SIZE
+                score_blocks = pl.min(CANDIDATE_SCORE_TILE, block_count - score_beg)
+                score_valid = pl.min(CANDIDATE_SCORE_TILE * CANDIDATE_BLOCK_SIZE, positions - score_pos)
+                score_raw = pl.load(
+                    index_scores,
+                    [score_token, score_pos],
+                    [1, CANDIDATE_SCORE_TILE * CANDIDATE_BLOCK_SIZE],
+                    valid_shape=[1, score_valid],
+                )
+                score_padded = pl.tile.fillpad(score_raw, pad_value=pl.PadValue.min)
+                score_grouped = pl.reshape(score_padded, [CANDIDATE_SCORE_TILE, CANDIDATE_BLOCK_SIZE])
+                score_tmp = pl.create_tile([CANDIDATE_SCORE_TILE, CANDIDATE_BLOCK_SIZE], dtype=pl.FP32)
+                score_maxima = pl.reshape(pl.row_max(score_grouped, tmp_tile=score_tmp), [1, CANDIDATE_SCORE_TILE])
+                score_visible = pl.min(pl.max(pl.read(compressed_lens, [score_token]), 0), positions)
+                if score_visible > 0:
+                    score_last = (score_visible - 1) // CANDIDATE_BLOCK_SIZE
+                    if score_last >= score_beg and score_last < score_beg + score_blocks:
+                        pl.tile.write(score_maxima, [0, score_last - score_beg], 1e30)
+                score_maxima = pl.tile.set_validshape(score_maxima, 1, score_blocks)
+                pl.store(score_maxima, [score_token, score_beg], block_scores)
 
     arena = pl.create_tensor([tokens * CANDIDATE_MAX_LEAVES, CANDIDATE_PAIR_WIDTH], dtype=pl.FP32)
-    with pl.spmd(tokens, name_hint="c1a_pool_block_select", deps=[score_tid]) as pool_tid:
-        token = pl.tile.get_block_idx()
-        sorted_ids = pl.tile.full([1, CANDIDATE_TOPK_BLOCKS], dtype=pl.INT32, value=-1)
-        if token < active_tokens:
-            visible = pl.min(pl.max(pl.read(compressed_lens, [token]), 0), positions)
-            visible_blocks = (visible + CANDIDATE_BLOCK_SIZE - 1) // CANDIDATE_BLOCK_SIZE
-            arena_base = token * CANDIDATE_MAX_LEAVES
-            count = 0
-            if visible_blocks > 0 and visible_blocks <= CANDIDATE_SHORT_LEAF_TILE:
-                _sort_candidate_short_leaf(block_scores, arena, token, visible_blocks, arena_base)
-                count = 1
-            elif visible_blocks > 0:
-                leaf_count = (visible_blocks + CANDIDATE_LEAF_TILE - 1) // CANDIDATE_LEAF_TILE
-                for leaf in pl.range(leaf_count):
-                    block_begin = leaf * CANDIDATE_LEAF_TILE
-                    valid_count = pl.min(CANDIDATE_LEAF_TILE, visible_blocks - block_begin)
-                    _sort_candidate_leaf(block_scores, arena, token, block_begin, valid_count, arena_base + leaf)
-                count = leaf_count
-            if count > 1:
-                count = _merge_candidate_level(arena, arena_base, count)
-            if count > 1:
-                count = _merge_candidate_level(arena, arena_base, count)
-            if count > 1:
-                count = _merge_candidate_level(arena, arena_base, count)
-            if count > 1:
-                count = _merge_candidate_level(arena, arena_base, count)
+    pool_workers = pl.min(tokens, 32)
+    with pl.spmd(pool_workers, name_hint="c1a_pool_block_select", deps=[score_tid]) as pool_tid:
+        pool_worker = pl.tile.get_block_idx()
+        for pool_token in pl.range(pool_worker, tokens, pool_workers):
+            pool_ids = pl.tile.full([1, CANDIDATE_TOPK_BLOCKS], dtype=pl.INT32, value=-1)
+            if pool_token < active_tokens:
+                pool_visible = pl.min(pl.max(pl.read(compressed_lens, [pool_token]), 0), positions)
+                pool_blocks = (pool_visible + CANDIDATE_BLOCK_SIZE - 1) // CANDIDATE_BLOCK_SIZE
+                pool_base = pool_token * CANDIDATE_MAX_LEAVES
+                pool_count = 0
+                if pool_blocks > 0 and pool_blocks <= CANDIDATE_SHORT_LEAF_TILE:
+                    _sort_candidate_short_leaf(block_scores, arena, pool_token, pool_blocks, pool_base)
+                    pool_count = 1
+                elif pool_blocks > 0:
+                    pool_leaves = (pool_blocks + CANDIDATE_LEAF_TILE - 1) // CANDIDATE_LEAF_TILE
+                    for pool_leaf in pl.range(pool_leaves):
+                        pool_beg = pool_leaf * CANDIDATE_LEAF_TILE
+                        pool_valid = pl.min(CANDIDATE_LEAF_TILE, pool_blocks - pool_beg)
+                        _sort_candidate_leaf(
+                            block_scores, arena, pool_token, pool_beg, pool_valid, pool_base + pool_leaf,
+                        )
+                    pool_count = pool_leaves
+                if pool_count > 1:
+                    pool_count = _merge_candidate_level(arena, pool_base, pool_count)
+                if pool_count > 1:
+                    pool_count = _merge_candidate_level(arena, pool_base, pool_count)
+                if pool_count > 1:
+                    pool_count = _merge_candidate_level(arena, pool_base, pool_count)
+                if pool_count > 1:
+                    pool_count = _merge_candidate_level(arena, pool_base, pool_count)
 
-            selected_count = pl.min(pl.min(visible_blocks, CANDIDATE_TOPK_BLOCKS), capacity)
-            ordered_scores = pl.tile.full([1, CANDIDATE_TOPK_BLOCKS], dtype=pl.FP32, value=-1e30)
-            ordered_indices = pl.tile.full([1, CANDIDATE_TOPK_BLOCKS], dtype=pl.INT32, value=-1)
-            if selected_count > 0:
-                root = pl.load(arena, [arena_base, 0], [1, CANDIDATE_PAIR_WIDTH])
-                selected = pl.tile.gather_mask(root, mask_pattern=pl.tile.MaskPattern.P1010, output_dtype=pl.INT32)
-                for lane in pl.range(selected_count):
-                    block_id = pl.tile.read(selected, [0, lane])
-                    pl.tile.write(ordered_scores, [0, lane], -pl.cast(block_id, pl.FP32))
-                    pl.tile.write(ordered_indices, [0, lane], block_id)
-            ordered = pl.tile.sort32(ordered_scores, pl.reinterpret_view(ordered_indices, pl.UINT32))
-            ordered = pl.tile.mrgsort(ordered, block_len=64)
-            ordered = pl.tile.mrgsort(ordered, block_len=256)
-            ordered = pl.tile.mrgsort(ordered, block_len=1024)
-            sorted_ids = pl.tile.gather_mask(ordered, mask_pattern=pl.tile.MaskPattern.P1010, output_dtype=pl.INT32)
-        # Publish the sorted prefix and -1 padding as one aligned pool row.
-        pl.store(pl.tile.set_validshape(sorted_ids, 1, capacity), [token, 0], pool_block_ids)
+                pool_selected_n = pl.min(pl.min(pool_blocks, CANDIDATE_TOPK_BLOCKS), capacity)
+                pool_sort_scores = pl.tile.full([1, CANDIDATE_TOPK_BLOCKS], dtype=pl.FP32, value=-1e30)
+                pool_sort_ids = pl.tile.full([1, CANDIDATE_TOPK_BLOCKS], dtype=pl.INT32, value=-1)
+                if pool_selected_n > 0:
+                    pool_root = pl.load(arena, [pool_base, 0], [1, CANDIDATE_PAIR_WIDTH])
+                    pool_chosen = pl.tile.gather_mask(
+                        pool_root, mask_pattern=pl.tile.MaskPattern.P1010, output_dtype=pl.INT32,
+                    )
+                    for pool_lane in pl.range(pool_selected_n):
+                        pool_block = pl.tile.read(pool_chosen, [0, pool_lane])
+                        pl.tile.write(pool_sort_scores, [0, pool_lane], -pl.cast(pool_block, pl.FP32))
+                        pl.tile.write(pool_sort_ids, [0, pool_lane], pool_block)
+                pool_ordered = pl.tile.sort32(pool_sort_scores, pl.reinterpret_view(pool_sort_ids, pl.UINT32))
+                pool_ordered = pl.tile.mrgsort(pool_ordered, block_len=64)
+                pool_ordered = pl.tile.mrgsort(pool_ordered, block_len=256)
+                pool_ordered = pl.tile.mrgsort(pool_ordered, block_len=1024)
+                pool_ids = pl.tile.gather_mask(
+                    pool_ordered, mask_pattern=pl.tile.MaskPattern.P1010, output_dtype=pl.INT32,
+                )
+            # Publish the sorted prefix and -1 padding as one aligned pool row.
+            pl.store(pl.tile.set_validshape(pool_ids, 1, capacity), [pool_token, 0], pool_block_ids)
     # Publish cache-line-sharing counts from one worker after the ID rows.
     with pl.at(level=pl.Level.CORE_GROUP, name_hint="c1a_pool_count_publish", deps=[pool_tid]) as counts_tid:
         for publish_token in pl.range(tokens):

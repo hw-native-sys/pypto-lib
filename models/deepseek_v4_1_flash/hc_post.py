@@ -41,6 +41,39 @@ D_TILES = D // D_TILE
 
 
 @pl.jit.inline
+def _mhc_post_block(
+    sublayer: pl.Tensor,
+    residual_flat: pl.Tensor,
+    post_mix: pl.Tensor,
+    residual_mix_flat: pl.Tensor,
+    output_flat: pl.Tensor,
+    block: pl.Scalar[pl.INT32],
+):
+    pair_block = block // D_TILES
+    t = pair_block // (HC_MULT // OUT_TILE)
+    out_base = (pair_block % (HC_MULT // OUT_TILE)) * OUT_TILE
+    d0 = (block % D_TILES) * D_TILE
+    x_tile = pl.cast(sublayer[t : t + 1, d0 : d0 + D_TILE], target_type=pl.FP32)
+    residual0 = residual_flat[t : t + 1, d0 : d0 + D_TILE]
+    residual1 = residual_flat[t : t + 1, D + d0 : D + d0 + D_TILE]
+    residual2 = residual_flat[t : t + 1, 2 * D + d0 : 2 * D + d0 + D_TILE]
+    residual3 = residual_flat[t : t + 1, 3 * D + d0 : 3 * D + d0 + D_TILE]
+    for out_offset in pl.unroll(OUT_TILE):
+        out_h = out_base + out_offset
+        value = pl.mul(x_tile, pl.read(post_mix, [t, out_h]))
+        value = pl.add(value, pl.mul(residual0, pl.read(residual_mix_flat, [t, out_h])))
+        value = pl.add(value, pl.mul(residual1, pl.read(residual_mix_flat, [t, HC_MULT + out_h])))
+        value = pl.add(value, pl.mul(residual2, pl.read(residual_mix_flat, [t, 2 * HC_MULT + out_h])))
+        value = pl.add(value, pl.mul(residual3, pl.read(residual_mix_flat, [t, 3 * HC_MULT + out_h])))
+        output_flat[t : t + 1, out_h * D + d0 : out_h * D + d0 + D_TILE] = pl.cast(
+            pl.cast(value, target_type=pl.BF16, mode="rint"),
+            target_type=pl.FP32,
+        )
+    return output_flat
+
+
+
+@pl.jit.inline
 def mhc_post(
     sublayer: pl.Tensor,
     residual: pl.Tensor,
@@ -53,28 +86,43 @@ def mhc_post(
     residual_mix_flat = pl.reshape(residual_mix, [t_dim, HC_MULT * HC_MULT])
     output_flat = pl.reshape(output, [t_dim, HC_DIM])
     for block in pl.spmd(t_dim * (HC_MULT // OUT_TILE) * D_TILES, name_hint="mhc_post"):
-        pair_block = block // D_TILES
-        t = pair_block // (HC_MULT // OUT_TILE)
-        out_base = (pair_block % (HC_MULT // OUT_TILE)) * OUT_TILE
-        d0 = (block % D_TILES) * D_TILE
-        x_tile = pl.cast(sublayer[t : t + 1, d0 : d0 + D_TILE], target_type=pl.FP32)
-        residual0 = residual_flat[t : t + 1, d0 : d0 + D_TILE]
-        residual1 = residual_flat[t : t + 1, D + d0 : D + d0 + D_TILE]
-        residual2 = residual_flat[t : t + 1, 2 * D + d0 : 2 * D + d0 + D_TILE]
-        residual3 = residual_flat[t : t + 1, 3 * D + d0 : 3 * D + d0 + D_TILE]
-        for out_offset in pl.unroll(OUT_TILE):
-            out_h = out_base + out_offset
-            value = pl.mul(x_tile, pl.read(post_mix, [t, out_h]))
-            value = pl.add(value, pl.mul(residual0, pl.read(residual_mix_flat, [t, out_h])))
-            value = pl.add(value, pl.mul(residual1, pl.read(residual_mix_flat, [t, HC_MULT + out_h])))
-            value = pl.add(value, pl.mul(residual2, pl.read(residual_mix_flat, [t, 2 * HC_MULT + out_h])))
-            value = pl.add(value, pl.mul(residual3, pl.read(residual_mix_flat, [t, 3 * HC_MULT + out_h])))
-            output_flat[t : t + 1, out_h * D + d0 : out_h * D + d0 + D_TILE] = pl.cast(
-                pl.cast(value, target_type=pl.BF16, mode="rint"),
-                target_type=pl.FP32,
-            )
+        _mhc_post_block(sublayer, residual_flat, post_mix, residual_mix_flat, output_flat, block)
     return output
 
+
+
+def make_mhc_post(*, max_workers=None):
+    """Specialize residual expansion with a bounded worker pool."""
+    if max_workers is None:
+        return mhc_post
+    if max_workers < 1:
+        raise ValueError("max_workers must be positive")
+    worker_limit = max_workers
+
+    @pl.jit.inline
+    def capped_mhc_post(
+        sublayer: pl.Tensor,
+        residual: pl.Tensor,
+        post_mix: pl.Tensor,
+        residual_mix: pl.Tensor,
+        output: pl.Tensor,
+    ):
+        t_dim = pl.tensor.dim(sublayer, 0)
+        residual_flat = pl.reshape(residual, [t_dim, HC_DIM])
+        residual_mix_flat = pl.reshape(residual_mix, [t_dim, HC_MULT * HC_MULT])
+        output_flat = pl.reshape(output, [t_dim, HC_DIM])
+        block_count = t_dim * (HC_MULT // OUT_TILE) * D_TILES
+        worker_count = pl.min(block_count, worker_limit)
+        for worker in pl.spmd(worker_count, name_hint="mhc_post"):
+            for block in pl.range(worker, block_count, worker_count):
+                _mhc_post_block(sublayer, residual_flat, post_mix, residual_mix_flat, output_flat, block)
+        return output
+
+    return capped_mhc_post
+
+
+
+c1a_mhc_post = make_mhc_post(max_workers=64)
 
 @pl.jit.inline
 def mhc_post_after(

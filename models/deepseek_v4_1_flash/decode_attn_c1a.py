@@ -56,7 +56,7 @@ from decode_indexer import (
 )
 from o_proj import (
     golden_grouped_output,
-    grouped_output_with_deps,
+    make_grouped_output_with_deps,
     make_o_proj_with_deps as build_o_proj_with_deps,
 )
 from qkv_proj_rope import (
@@ -162,7 +162,7 @@ qkv_proj_rope_with_deps = build_qkv_proj_rope_with_deps(
     project_qa, project_qb, rotate_q, project_kv, rotate_kv
 )
 o_proj_with_deps = build_o_proj_with_deps(
-    rotate_output, grouped_output_with_deps, project_ob
+    rotate_output, make_grouped_output_with_deps(max_workers=64), project_ob
 )
 
 
@@ -787,11 +787,11 @@ def golden_decode_attn_c1a_reindex(
 
 
 project_compressor = make_bf16_projection_with_deps(
-    D, HEAD_DIM, name_hint="c1a_compressor_projection"
+    D, HEAD_DIM, workers=8, name_hint="c1a_compressor_projection"
 )
 rotate_compressor = make_rope_with_deps(1, name_hint="c1a_compressor_rope")
 project_index_key = make_bf16_projection_with_deps(
-    HEAD_DIM, INDEX_DIM, name_hint="c1a_index_key_projection"
+    HEAD_DIM, INDEX_DIM, workers=8, name_hint="c1a_index_key_projection"
 )
 rotate_index_key = make_rope_with_deps(
     1, head_dim=INDEX_DIM, name_hint="c1a_index_key_rope"

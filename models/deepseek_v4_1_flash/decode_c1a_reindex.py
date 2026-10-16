@@ -37,7 +37,7 @@ from decode_attn_c1a import OUTPUT_ATOL, OUTPUT_RTOL, OUTPUT_MAX_ERROR_RATIO, ch
 from decode_attn_c1a import cache_compare
 from golden import ScalarSpec, TensorSpec, ratio_allclose, run
 import utils as _decode_utils
-from hc_pre import mhc_pre_norm
+from hc_pre import c1a_mhc_pre_norm as mhc_pre_norm
 from decode_cp_allgather import slab_owner
 from decode_attn_c1a import (
     c1a_finish,
@@ -48,8 +48,8 @@ from decode_attn_c1a import (
     golden_decode_attn_c1a_reindex,
 )
 from decode_indexer import score_reindex, select_pool_index_topk
-from hc_mixes import mhc_mixes
-from hc_post import mhc_post
+from hc_mixes import c1a_mhc_mixes as mhc_mixes
+from hc_post import c1a_mhc_post as mhc_post
 
 
 # model config

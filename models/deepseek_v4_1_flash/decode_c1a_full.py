@@ -18,7 +18,7 @@ import torch
 
 from golden import ScalarSpec, TensorSpec, ratio_allclose, run
 from rope_tables import precompute_rope_tables
-from hc_pre import mhc_pre_norm
+from hc_pre import c1a_mhc_pre_norm as mhc_pre_norm
 from decode_cp_allgather import slab_owner
 from config import LOCAL_T_DYN
 from decode_cp_allgather import decode_tp_input_all_gather
@@ -53,8 +53,8 @@ from decode_attn_c1a import (
     cache_compare,
     golden_decode_attn_c1a_full,
 )
-from hc_mixes import golden_mhc_mixes, mhc_mixes
-from hc_post import golden_mhc_post, mhc_post
+from hc_mixes import golden_mhc_mixes, c1a_mhc_mixes as mhc_mixes
+from hc_post import golden_mhc_post, c1a_mhc_post as mhc_post
 from hc_pre import golden_mhc_pre
 from rmsnorm import golden_rms_norm
 
