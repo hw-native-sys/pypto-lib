@@ -1066,26 +1066,13 @@ class ResidentPrefillWeights:
         return self.checkpoint.tensor_rows("embed.weight", token_ids).to(torch.bfloat16)
 
 
-def prepare_resident_inputs(
-    checkpoint: PrefillCheckpoint,
-    weights: ResidentPrefillWeights,
-    token_ids: torch.Tensor | Sequence[int],
-    capacity: int,
-) -> dict[str, torch.Tensor]:
-    """Prepare one EP4/EP8 rank's prompt and causal replay with Engram disabled."""
-    ids = torch.as_tensor(token_ids, device="cpu")
-    if ids.ndim != 1 or ids.dtype not in (torch.int32, torch.int64):
-        raise ValueError("token_ids must be a one-dimensional integer sequence")
-    if not isinstance(capacity, Integral) or isinstance(capacity, bool) or capacity % 16:
-        raise ValueError("prefill capacity must be an integer multiple of 16")
-    count = ids.numel()
-    if not 1 <= count <= capacity <= C.PREFILL_MAX_TOKENS:
-        raise ValueError("a nonempty prompt must fit the configured prefill capacity")
-    if bool(((ids < 0) | (ids >= M.vocab_size)).any()):
-        raise ValueError("token id is outside the checkpoint vocabulary")
-    ids = ids.long()
-    embedding = weights.lookup_rows(ids)
-
+def prepare_prefill_inputs(embedding: torch.Tensor, capacity: int) -> dict[str, torch.Tensor]:
+    """Prepare one rank's prompt and causal replay with Engram disabled."""
+    if embedding.ndim != 2 or embedding.shape[1] != M.hidden_size:
+        raise ValueError("embedding must have shape [prompt tokens, hidden size]")
+    count = embedding.shape[0]
+    if capacity % 16 or not 1 <= count <= capacity <= C.PREFILL_MAX_TOKENS:
+        raise ValueError("a nonempty prompt must fit a prefill capacity aligned to 16")
     data_pages = (capacity + C.BLOCK_SIZE - 1) // C.BLOCK_SIZE
     pages = data_pages + 1
     table = torch.arange(data_pages, dtype=torch.int32).reshape(1, -1)
@@ -1176,6 +1163,30 @@ def prepare_resident_inputs(
         "state_cache": torch.zeros((len(state_tables), 2, C.STATE_CAPACITY, (2 * M.head_dim)), dtype=torch.float32),
         "logit_rows": logit_rows,
     }
+    return values
+
+
+def prepare_resident_inputs(
+    checkpoint: PrefillCheckpoint,
+    weights: ResidentPrefillWeights,
+    token_ids: torch.Tensor | Sequence[int],
+    capacity: int,
+) -> dict[str, torch.Tensor]:
+    """Prepare checkpoint embeddings, weights and causal replay for one prefill rank."""
+    ids = torch.as_tensor(token_ids, device="cpu")
+    if ids.ndim != 1 or ids.dtype not in (torch.int32, torch.int64):
+        raise ValueError("token_ids must be a one-dimensional integer sequence")
+    if not isinstance(capacity, Integral) or isinstance(capacity, bool) or capacity % 16:
+        raise ValueError("prefill capacity must be an integer multiple of 16")
+    count = ids.numel()
+    if not 1 <= count <= capacity <= C.PREFILL_MAX_TOKENS:
+        raise ValueError("a nonempty prompt must fit the configured prefill capacity")
+    if bool(((ids < 0) | (ids >= M.vocab_size)).any()):
+        raise ValueError("token id is outside the checkpoint vocabulary")
+    ids = ids.long()
+    embedding = weights.lookup_rows(ids)
+
+    values = prepare_prefill_inputs(embedding, capacity)
     if not hasattr(weights, "_output_weights"):
         head = checkpoint.tensor("head.weight")
         if head.dtype != torch.bfloat16 or tuple(head.shape) != (M.vocab_size, M.hidden_size):
@@ -1187,6 +1198,64 @@ def prepare_resident_inputs(
     values.update(weights._output_weights)
     values.update(weights.offset_tensors)
     return values
+
+
+def run_forward_smoke(fn, specs, *, config, compile_only=False, replicated=()):
+    """Compile a forward smoke case and upload each rank's inputs in bounded chunks."""
+    from golden import run
+    from pypto.ir import ParamDirection
+    from pypto.ir.distributed_compiled_program import DistributedCompiledProgram
+    from pypto.runtime import RunConfig, StackedDeviceTensor
+
+    result = run(fn=fn, specs=specs, config=config, compile_only=True)
+    if not result.passed or compile_only:
+        return result
+    cfg = RunConfig(**{name: value for name, value in config.items() if name != "log_level"})
+    compiled = DistributedCompiledProgram.from_dir(result.work_dir, platform=cfg.platform)
+    parameters = compiled._get_metadata()[0]
+    ranks = len(cfg.distributed_config.device_ids)
+    chunk_bytes = 64 * 1024**2
+    host_inputs = {spec.name: spec.create_tensor().share_memory_() for spec in specs if spec.name in replicated}
+    with compiled.prepare(cfg, persistent=False, inherited_host_tensors=list(host_inputs.values())) as runtime:
+        arguments = []
+        for spec, parameter in zip(specs, parameters, strict=True):
+            if isinstance(spec, ScalarSpec):
+                arguments.append(spec.to_python())
+                continue
+            if spec.name in host_inputs:
+                arguments.append(host_inputs[spec.name])
+                continue
+            shape = spec.shape[1:]
+            if spec.shape[0] != ranks:
+                raise ValueError(f"{spec.name} needs a leading rank axis of size {ranks}")
+            shards = []
+            for rank in range(ranks):
+                handle = runtime.alloc_tensor(shape, spec.dtype, worker_id=rank)
+                shards.append(handle)
+                if parameter.direction == ParamDirection.Out:
+                    continue
+                if isinstance(spec.init_value, torch.Tensor):
+                    if list(spec.init_value.shape) != spec.shape:
+                        raise ValueError(f"{spec.name} initialization must match its tensor spec")
+                    value = spec.init_value[rank].contiguous()
+                else:
+                    fill = 0 if spec.init_value is None else spec.init_value
+                    element_bytes = torch.empty((), dtype=spec.dtype).element_size()
+                    elements = min(math.prod(shape), chunk_bytes // element_bytes)
+                    if spec.dtype == torch.float8_e8m0fnu:
+                        code = torch.tensor(float(fill)).to(spec.dtype).view(torch.uint8).item()
+                        value = torch.full((elements,), code, dtype=torch.uint8).view(spec.dtype)
+                    else:
+                        value = torch.full((elements,), fill, dtype=spec.dtype)
+                for offset in range(0, handle.nbytes, chunk_bytes):
+                    size = min(chunk_bytes, handle.nbytes - offset)
+                    source_offset = offset if isinstance(spec.init_value, torch.Tensor) else 0
+                    source = value.data_ptr() + source_offset
+                    runtime.copy_to(handle.data_ptr, source, size, dst_offset=offset, worker_id=rank)
+            arguments.append(StackedDeviceTensor(shards, tuple(spec.shape), tuple(range(ranks))))
+        runtime(*arguments, config=cfg)
+    print("[FWD] Execution passed; numerical accuracy was not validated.", flush=True)
+    return result
 
 
 @dataclass(frozen=True)

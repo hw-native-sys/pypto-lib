@@ -42,9 +42,9 @@ import pypto.language as pl
 import pypto.language.distributed as pld
 from pypto.ir import DistributedConfig
 
-# LM-head parallelism is parsed locally below (TP2/DP1 defaults).
+# Standalone LM-head validation defaults to TP2/DP1.
 
-from config import FLASH as M
+from config import FLASH as M, TP_SIZE as CONFIG_TP_SIZE
 
 
 # model config
@@ -55,10 +55,10 @@ VOCAB = M.vocab_size
 T_DYN = pl.dynamic("LM_HEAD_T_DYN")
 
 # Parallelism. Static in the frontend, so both worlds are parsed off argv here.
-# Allow TP1/DP1 like MTP; default to TP2/DP1.
+# Imported kernels inherit TP from the composing program.
 _TP_CHOICES = (1, 2, 4, 8)
 _DP_CHOICES = (1, 2, 4, 8)
-_TP_DEFAULT = 2
+_TP_DEFAULT = 2 if __name__ == "__main__" else CONFIG_TP_SIZE
 
 
 def _parse_int_argv(name, default=None):

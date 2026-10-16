@@ -6,21 +6,25 @@
 # INCLUDING BUT NOT LIMITED TO NON-INFRINGEMENT, MERCHANTABILITY, OR FITNESS FOR A PARTICULAR PURPOSE.
 # See LICENSE in the root of the software repository for the full text of the License.
 # -----------------------------------------------------------------------------------------------------------
-# ci: devices=4
+# ci: devices=2
 # ci: no-sim
-"""DeepSeek-V4.1-Flash 40-layer decode backbone."""
+"""DeepSeek-V4.1-Flash 40-layer decode backbone with a TP1/EP2, 128-expert CI smoke case."""
 
 import argparse
 import inspect
-import sys
-
-if __name__ == "__main__":
-    if not any(arg == "--ep" or arg.startswith("--ep=") for arg in sys.argv[1:]):
-        sys.argv.append("--ep=4")
 
 import pypto.language as pl
 import pypto.language.distributed as pld
 import torch
+
+import config as C
+
+_shape_parser = argparse.ArgumentParser(add_help=False)
+_shape_parser.add_argument("--experts-per-rank", type=int, default=64)
+_shape_options = _shape_parser.parse_known_args()[0]
+if _shape_options.experts_per_rank <= 0 or C.EP_SIZE * _shape_options.experts_per_rank % 16:
+    _shape_parser.error("--experts-per-rank must be positive and give a total expert count aligned to 16")
+C.N_LOCAL_EXPERTS = _shape_options.experts_per_rank
 
 
 from config import (
@@ -85,7 +89,7 @@ MIX_HC = M.mix_hc
 INDEX_H = M.index_n_heads
 INDEX_DIM = M.index_head_dim
 INDEX_TOPK = M.index_topk
-N_EXPERTS = M.n_routed_experts
+N_EXPERTS = EP_SIZE * N_LOCAL_EXPERTS
 TOPK = M.num_experts_per_tok
 MOE_INTER = M.moe_intermediate_size
 MX_GROUP = M.weight_block_size[0]
@@ -4784,6 +4788,8 @@ def _fixture_extent(dim):
 def build_tensor_specs():
     """Build the TP1 twelve-request decode smoke fixture."""
     from golden import ScalarSpec, TensorSpec
+    from moe import _route_bias
+    from quant import build_mxfp4_pair_lut
 
     if TP_SIZE != 1:
         raise ValueError("decode_fwd fixture requires --tp 1")
@@ -4852,35 +4858,43 @@ def build_tensor_specs():
             )
         elif name == "moe_num_tokens":
             init_value = torch.full((EP_SIZE,), FIXTURE_TOKENS, dtype=torch.int32)
+        elif name == "correction_bias":
+            init_value = _route_bias().repeat(EP_SIZE, N_LAYERS)
+        elif name == "mxfp4_pair_lut":
+            init_value = build_mxfp4_pair_lut().repeat(EP_SIZE, 1, 1)
+        elif name.endswith("_scale"):
+            init_value = 1.0
         specs.append(TensorSpec(name, shape, dtype, init_value=init_value))
     return specs
 
 
 if __name__ == "__main__":
-    from golden import run
+    from utils import run_forward_smoke
     from pypto.ir import DistributedConfig
 
     parser = argparse.ArgumentParser()
     parser.add_argument("-p", "--platform", default="a5", choices=["a5"])
     parser.add_argument("--tp", type=int, default=TP_SIZE, choices=[1])
-    parser.add_argument("--ep", type=int, default=EP_SIZE, choices=[4, 8])
+    parser.add_argument("--ep", type=int, default=EP_SIZE, choices=[2, 4, 8])
+    parser.add_argument("--experts-per-rank", type=int, default=N_LOCAL_EXPERTS, help="routed experts on each EP rank")
     parser.add_argument("-d", "--device", default=",".join(str(rank) for rank in range(EP_SIZE)))
     parser.add_argument("--compile-only", action="store_true")
     parser.add_argument("--dump-passes", action="store_true")
     parser.add_argument("--enable-scope-stats", action="store_true")
     parser.add_argument("--log-level", default=None)
     args = parser.parse_args()
-    if args.tp != TP_SIZE or args.ep != EP_SIZE:
-        parser.error("--tp/--ep are import-time configuration; pass them on the Python command line")
+    if (args.tp, args.ep, args.experts_per_rank) != (TP_SIZE, EP_SIZE, N_LOCAL_EXPERTS):
+        parser.error("--tp/--ep/--experts-per-rank are import-time configuration; pass them on the Python command line")
     if args.tp != 1:
         parser.error("the decode_fwd smoke fixture requires --tp 1")
     devices = [int(device) for device in args.device.split(",") if device]
-    if len(devices) != EP_SIZE:
-        parser.error(f"need exactly {EP_SIZE} devices, got {devices}")
-    result = run(
+    if len(devices) != EP_SIZE or len(set(devices)) != EP_SIZE:
+        parser.error(f"need exactly {EP_SIZE} distinct devices, got {devices}")
+    result = run_forward_smoke(
         fn=l3_decode_fwd,
         specs=build_tensor_specs(),
         compile_only=args.compile_only,
+        replicated=("moe_num_tokens",),
         config=dict(
             platform=args.platform,
             dump_passes=args.dump_passes,

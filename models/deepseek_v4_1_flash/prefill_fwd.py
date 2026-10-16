@@ -6,10 +6,13 @@
 # INCLUDING BUT NOT LIMITED TO NON-INFRINGEMENT, MERCHANTABILITY, OR FITNESS FOR A PARTICULAR PURPOSE.
 # See LICENSE in the root of the software repository for the full text of the License.
 # -----------------------------------------------------------------------------------------------------------
+# ci: devices=2
+# ci: no-sim
 """Compose native V4.1 operators into one resident CED prefill per A5 rank.
 
-Use TP1 with EP4/DP4 (default) or EP8/DP8. Each rank owns one prompt and
-384 / EP routed experts; attention weights are replicated. Original MXFP8/MXFP4
+CI uses TP1/EP2/DP2 with 128 experts. Checkpoint generation uses 384 experts
+with EP4/DP4 (default) or EP8/DP8. Each rank owns one prompt and a shard of
+routed experts; attention weights are replicated. Original MXFP8/MXFP4
 weights remain resident. Generation recomputes both CED stages per new token.
 Engram is disabled, including host hashes, table lookup and weight preparation.
 """
@@ -26,12 +29,6 @@ import time
 if __package__ in (None, ""):
     sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
-# Config reads parallel sizes at import time; other model entries keep their defaults.
-if __name__ == "__main__":
-    for _flag, _default in (("--tp", 1), ("--ep", 4)):
-        if not any(arg == _flag or arg.startswith(f"{_flag}=") for arg in sys.argv[1:]):
-            sys.argv.append(f"{_flag}={_default}")
-
 # Sibling operators share the same configuration module for script and -m entry points.
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
@@ -42,6 +39,26 @@ from pypto.runtime import RunConfig, StackedDeviceTensor
 import torch
 
 import config as C
+
+_shape_parser = argparse.ArgumentParser(add_help=False)
+_shape_parser.add_argument("--checkpoint")
+_shape_parser.add_argument("--ep", type=int, choices=[2, 4, 8])
+_shape_parser.add_argument("--experts-per-rank", type=int)
+_shape_parser.add_argument("--capacity", type=int, default=128)
+_shape_parser.add_argument("--dp", type=int)
+_shape_options = _shape_parser.parse_known_args()[0]
+C.EP_SIZE = _shape_options.ep or (4 if _shape_options.checkpoint else 2)
+_default_experts = C.FLASH.n_routed_experts // C.EP_SIZE if _shape_options.checkpoint else 64
+C.N_LOCAL_EXPERTS = _default_experts if _shape_options.experts_per_rank is None else _shape_options.experts_per_rank
+if C.N_LOCAL_EXPERTS <= 0 or C.EP_SIZE * C.N_LOCAL_EXPERTS % 16:
+    _shape_parser.error("--experts-per-rank must be positive and give a total expert count aligned to 16")
+CAPACITY = _shape_options.capacity
+if C.TP_SIZE != 1 or _shape_options.dp not in (None, C.EP_SIZE):
+    _shape_parser.error("prefill requires TP1 with DP equal to EP")
+if not 16 <= CAPACITY <= C.PREFILL_MAX_TOKENS or CAPACITY % 16:
+    _shape_parser.error("--capacity must be between 16 and 4096 and a multiple of 16")
+C.set_moe_tokens(CAPACITY)
+
 from config import (
     FLASH as M,
     COMPRESSED_CACHE_GROUP,
@@ -61,18 +78,6 @@ from config import (
     TABLE_DYN,
 )
 
-# Native MoE uses a static, padded row capacity shared by every EP peer.
-_shape_parser = argparse.ArgumentParser(add_help=False)
-_shape_parser.add_argument("--capacity", type=int, default=128)
-_shape_parser.add_argument("--dp", type=int, default=C.EP_SIZE)
-_shape_options = _shape_parser.parse_known_args()[0]
-CAPACITY = _shape_options.capacity
-if C.TP_SIZE != 1 or C.EP_SIZE not in (4, 8) or _shape_options.dp != C.EP_SIZE:
-    raise ValueError("prefill requires TP1 with EP4/DP4 or EP8/DP8")
-if not 16 <= CAPACITY <= C.PREFILL_MAX_TOKENS or CAPACITY % 16:
-    raise ValueError("--capacity must be between 16 and 4096 and a multiple of 16")
-C.set_moe_tokens(CAPACITY)
-
 from hc_head import hc_head
 from hc_mixes import mhc_mixes
 from hc_post import mhc_post
@@ -80,7 +85,7 @@ from hc_pre import mhc_pre, zero_bf16_padding
 from input_pack import gather_rows, pack_x_hc
 from lm_head import greedy_sample, lm_head
 from utils import (
-    PrefillCheckpoint, ResidentPrefillWeights, prepare_resident_inputs,
+    PrefillCheckpoint, ResidentPrefillWeights, prepare_prefill_inputs, prepare_resident_inputs,
 )
 from moe import AUX_WIDTH, ROUTE_WIDTH, moe
 from compressor import STATE_WIDTH
@@ -105,7 +110,7 @@ LOCAL_O_GROUPS = M.o_groups // C.TP_SIZE
 LOCAL_O_WIDTH = LOCAL_O_GROUPS * M.o_lora_rank
 MIX_HC = M.mix_hc
 MOE_INTER = M.moe_intermediate_size
-N_EXPERTS = M.n_routed_experts
+N_EXPERTS = RANKS * LOCAL_EXPERTS
 O_GROUP_IN = M.num_attention_heads * M.head_dim // M.o_groups
 O_LORA = M.o_lora_rank
 Q_LORA = M.q_lora_rank
@@ -902,45 +907,157 @@ def generate(checkpoint, compiled, device_ids, prompts, max_new_tokens):
     }
 
 
-if __name__ == "__main__":
-    from pypto.ir.distributed_compiled_program import DistributedCompiledProgram
+def build_tensor_specs():
+    """Build a checkpoint-free, 40-layer CED prefill smoke fixture."""
+    from golden import TensorSpec
+    from moe import _route_bias
 
-    parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--checkpoint", type=Path, required=True)
-    parser.add_argument("--runtime-dir", type=Path, required=True, help="previously compiled L3 artifact")
-    parser.add_argument("--devices", default=os.environ.get("TASK_DEVICE"))
-    parser.add_argument("--tp", type=int, default=C.TP_SIZE, choices=[1])
-    parser.add_argument("--ep", type=int, default=RANKS, choices=[4, 8])
-    parser.add_argument("--dp", type=int, default=RANKS, choices=[4, 8])
-    parser.add_argument("--capacity", type=int, default=CAPACITY)
-    parser.add_argument("--prompt", action="append", help="one prompt per rank; provide exactly --ep prompts")
-    parser.add_argument("--max-new-tokens", type=int, default=16)
-    parser.add_argument("--report", type=Path)
-    options = parser.parse_args()
-    if (options.tp, options.ep, options.dp) != (C.TP_SIZE, RANKS, RANKS):
-        raise ValueError("parallel sizes must match compilation: TP1 with EP4/DP4 or EP8/DP8")
-    if options.capacity != CAPACITY or not 16 <= CAPACITY <= C.PREFILL_MAX_TOKENS or CAPACITY % 16:
-        raise ValueError("--capacity must match compilation and be a positive multiple of 16")
-    device_ids = [int(value) for value in (options.devices or "").split(",") if value]
-    if len(device_ids) != RANKS or len(set(device_ids)) != RANKS:
-        raise ValueError(f"provide {RANKS} distinct task-allocated A5 devices")
-    default_prompts = [
-        "What is 2 + 3? Reply with just the number.",
-        "What is the capital of France? Reply with just the city name.",
-        "Translate 'hello' into Chinese. Reply with only the translation.",
-        "Continue the sequence with three numbers: 1, 2, 3,",
-    ]
-    prompts = options.prompt or default_prompts * (RANKS // len(default_prompts))
-    if len(prompts) != RANKS or options.max_new_tokens <= 0:
-        raise ValueError(f"provide {RANKS} prompts and a positive --max-new-tokens")
-    torch.set_num_threads(8)
-    checkpoint = PrefillCheckpoint(options.checkpoint)
-    compiled = DistributedCompiledProgram.from_dir(
-        options.runtime_dir, platform="a5",
-        distributed_config=DistributedConfig(device_ids=device_ids, num_sub_workers=0),
+    fp8_sizes = (
+        D * Q_LORA, Q_LORA * LOCAL_H * HEAD_DIM, D * HEAD_DIM, LOCAL_O_WIDTH * D,
+        Q_LORA * INDEX_H * INDEX_DIM, D * MOE_INTER, D * MOE_INTER, MOE_INTER * D,
     )
-    report = generate(checkpoint, compiled, device_ids, prompts, options.max_new_tokens)
-    if options.report:
-        options.report.parent.mkdir(parents=True, exist_ok=True)
-        options.report.write_text(json.dumps(report, indent=2, ensure_ascii=False) + "\n")
-    print("CED_GENERATION_COMPLETE", json.dumps(report, ensure_ascii=False), flush=True)
+    bf16_sizes = (
+        D, D, Q_LORA, HEAD_DIM, LOCAL_O_GROUPS * O_LORA * O_GROUP_IN,
+        D * HEAD_DIM, HEAD_DIM, HEAD_DIM * INDEX_DIM, INDEX_DIM, D * INDEX_H,
+    )
+    dense_sizes = (
+        MIX_HC * HC_DIM, 3, MIX_HC, MIX_HC * HC_DIM, 3, MIX_HC,
+        LOCAL_H, N_EXPERTS * D, N_EXPERTS, D * HEAD_DIM, D * HEAD_DIM,
+    )
+
+    def offsets(sizes, start=0, alignment=128):
+        rows = []
+        for layer in range(M.num_hidden_layers):
+            row = []
+            for size in sizes:
+                start = (start + alignment - 1) // alignment * alignment
+                row.append(start)
+                start += size
+            rows.append(row)
+        return torch.tensor(rows, dtype=torch.int64), start
+
+    fp8_offsets, fp8_values = offsets(fp8_sizes)
+    fp8_scale_offsets, scale_values = offsets(tuple(size // 32 for size in fp8_sizes))
+    bf16_offsets, bf16_values = offsets(bf16_sizes, alignment=1)
+    dense_offsets, dense_values = offsets(dense_sizes)
+    expert_sizes = (LOCAL_EXPERTS * D * MOE_INTER // 2,) * 3
+    expert_offsets, fp4_values = offsets(expert_sizes)
+    expert_scale_sizes = (LOCAL_EXPERTS * D * MOE_INTER // 32,) * 3
+    expert_scale_offsets, scale_values = offsets(expert_scale_sizes, start=scale_values)
+    layouts = {
+        "bank8": ([RANKS, fp8_values // 128, 128], torch.float8_e4m3fn, 0.0),
+        "bank4": ([RANKS, fp4_values // 128, 128], torch.uint8, 0),
+        "scales8": ([RANKS, scale_values // 128, 128], torch.float8_e8m0fnu, 1.0),
+        "bf16": ([RANKS, bf16_values], torch.bfloat16, 0.0),
+        "head": ([RANKS, VOCAB, D], torch.bfloat16, None),
+        "logits": ([RANKS, 16, VOCAB], torch.float32, None),
+        "sampled_ids": ([RANKS, 16, 8], torch.int32, None),
+    }
+    values = prepare_prefill_inputs(torch.zeros((CAPACITY, D), dtype=torch.bfloat16), CAPACITY)
+    values.update({
+        "fp8_offsets": fp8_offsets, "fp8_scale_offsets": fp8_scale_offsets,
+        "bf16_offsets": bf16_offsets, "dense_offsets": dense_offsets,
+        "expert_offsets": expert_offsets, "expert_scale_offsets": expert_scale_offsets,
+        "mxfp4_pair_lut": build_mxfp4_pair_lut(), "final_norm": torch.ones(D, dtype=torch.bfloat16),
+    })
+    dense = torch.zeros((RANKS, dense_values), dtype=torch.float32)
+    for layer in range(M.num_hidden_layers):
+        bias_offset = int(dense_offsets[layer, 8])
+        dense[:, bias_offset : bias_offset + N_EXPERTS] = _route_bias()
+    specs = []
+    for name in PREFILL_TENSORS:
+        if name in layouts:
+            shape, dtype, value = layouts[name]
+        elif name == "dense":
+            shape, dtype, value = list(dense.shape), dense.dtype, dense
+        else:
+            tensor = values[name]
+            value = tensor.unsqueeze(0).repeat(RANKS, *([1] * tensor.ndim))
+            shape, dtype = list(value.shape), value.dtype
+        specs.append(TensorSpec(name, shape, dtype, init_value=value))
+    return specs
+
+
+if __name__ == "__main__":
+    if _shape_options.checkpoint:
+        from pypto.ir.distributed_compiled_program import DistributedCompiledProgram
+
+        parser = argparse.ArgumentParser(description=__doc__)
+        parser.add_argument("--checkpoint", type=Path, required=True)
+        parser.add_argument("--runtime-dir", type=Path, required=True, help="previously compiled L3 artifact")
+        parser.add_argument("--devices", default=os.environ.get("TASK_DEVICE"))
+        parser.add_argument("--tp", type=int, default=C.TP_SIZE, choices=[1])
+        parser.add_argument("--ep", type=int, default=RANKS, choices=[4, 8])
+        parser.add_argument("--dp", type=int, default=RANKS, choices=[4, 8])
+        parser.add_argument("--experts-per-rank", type=int, default=LOCAL_EXPERTS)
+        parser.add_argument("--capacity", type=int, default=CAPACITY)
+        parser.add_argument("--prompt", action="append", help="one prompt per rank; provide exactly --ep prompts")
+        parser.add_argument("--max-new-tokens", type=int, default=16)
+        parser.add_argument("--report", type=Path)
+        options = parser.parse_args()
+        if options.experts_per_rank * options.ep != M.n_routed_experts or N_EXPERTS != M.n_routed_experts:
+            parser.error("checkpoint generation requires all 384 routed experts")
+        if (options.tp, options.ep, options.dp) != (C.TP_SIZE, RANKS, RANKS):
+            raise ValueError("parallel sizes must match compilation: TP1 with EP4/DP4 or EP8/DP8")
+        if options.capacity != CAPACITY or not 16 <= CAPACITY <= C.PREFILL_MAX_TOKENS or CAPACITY % 16:
+            raise ValueError("--capacity must match compilation and be a positive multiple of 16")
+        device_ids = [int(value) for value in (options.devices or "").split(",") if value]
+        if len(device_ids) != RANKS or len(set(device_ids)) != RANKS:
+            raise ValueError(f"provide {RANKS} distinct task-allocated A5 devices")
+        default_prompts = [
+            "What is 2 + 3? Reply with just the number.",
+            "What is the capital of France? Reply with just the city name.",
+            "Translate 'hello' into Chinese. Reply with only the translation.",
+            "Continue the sequence with three numbers: 1, 2, 3,",
+        ]
+        prompts = options.prompt or default_prompts * (RANKS // len(default_prompts))
+        if len(prompts) != RANKS or options.max_new_tokens <= 0:
+            raise ValueError(f"provide {RANKS} prompts and a positive --max-new-tokens")
+        torch.set_num_threads(8)
+        checkpoint = PrefillCheckpoint(options.checkpoint)
+        compiled = DistributedCompiledProgram.from_dir(
+            options.runtime_dir, platform="a5",
+            distributed_config=DistributedConfig(device_ids=device_ids, num_sub_workers=0),
+        )
+        report = generate(checkpoint, compiled, device_ids, prompts, options.max_new_tokens)
+        if options.report:
+            options.report.parent.mkdir(parents=True, exist_ok=True)
+            options.report.write_text(json.dumps(report, indent=2, ensure_ascii=False) + "\n")
+        print("CED_GENERATION_COMPLETE", json.dumps(report, ensure_ascii=False), flush=True)
+    else:
+        from utils import run_forward_smoke
+
+        parser = argparse.ArgumentParser(description=__doc__)
+        parser.add_argument("-p", "--platform", default="a5", choices=["a5"])
+        parser.add_argument("--tp", type=int, default=C.TP_SIZE, choices=[1])
+        parser.add_argument("--ep", type=int, default=RANKS, choices=[2, 4, 8])
+        parser.add_argument("--dp", type=int, default=RANKS, choices=[2, 4, 8])
+        parser.add_argument("--experts-per-rank", type=int, default=LOCAL_EXPERTS, help="routed experts on each EP rank")
+        parser.add_argument("--capacity", type=int, default=CAPACITY)
+        parser.add_argument("-d", "--device", default=",".join(str(rank) for rank in range(RANKS)))
+        parser.add_argument("--compile-only", action="store_true")
+        parser.add_argument("--dump-passes", action="store_true")
+        parser.add_argument("--enable-scope-stats", action="store_true")
+        parser.add_argument("--log-level", default=None)
+        args = parser.parse_args()
+        if (args.tp, args.ep, args.dp, args.experts_per_rank, args.capacity) != (1, RANKS, RANKS, LOCAL_EXPERTS, CAPACITY):
+            parser.error("parallel sizes, expert count and capacity must match the import-time configuration")
+        devices = [int(device) for device in args.device.split(",") if device]
+        if len(devices) != RANKS or len(set(devices)) != RANKS:
+            parser.error(f"need exactly {RANKS} distinct devices, got {devices}")
+        result = run_forward_smoke(
+            fn=l3_prefill_fwd,
+            specs=build_tensor_specs(),
+            compile_only=args.compile_only,
+            config=dict(
+                platform=args.platform,
+                dump_passes=args.dump_passes,
+                enable_scope_stats=args.enable_scope_stats,
+                log_level=args.log_level,
+                ring_heap=(2 * 1024**3,) * 4,
+                ring_dep_pool=131072,
+                distributed_config=DistributedConfig(device_ids=devices, num_sub_workers=0),
+            ),
+        )
+        if not result.passed:
+            raise SystemExit(result.error or 1)

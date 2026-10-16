@@ -14,7 +14,7 @@ import torch.nn.functional as F
 
 from config import FLASH as M
 
-from config import MOE_TOKENS
+from config import MOE_TOKENS, EP_SIZE, N_LOCAL_EXPERTS
 
 
 from rmsnorm import rms_norm_tiled
@@ -26,7 +26,7 @@ FP32_NEG_INF = -3.4028234663852886e38
 # model config
 T = MOE_TOKENS
 D = M.hidden_size
-N_EXPERTS = M.n_routed_experts
+N_EXPERTS = EP_SIZE * N_LOCAL_EXPERTS
 TOPK = M.num_experts_per_tok
 ROUTE_SCALE = M.routed_scaling_factor
 VOCAB = M.vocab_size

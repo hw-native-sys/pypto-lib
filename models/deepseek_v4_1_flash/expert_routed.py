@@ -20,7 +20,7 @@ import pypto.language.distributed as pld
 from config import FLASH as M
 
 from config import EP_SIZE as EP_WORLD_SIZE, MOE_RECV_MAX as RECV_MAX
-from config import ROUTE_T_DYN
+from config import ROUTE_T_DYN, N_LOCAL_EXPERTS
 
 
 DECODE_BATCH = 8
@@ -34,9 +34,6 @@ T = B * S
 D = M.hidden_size
 MOE_INTER = M.moe_intermediate_size
 SWIGLU_LIMIT = M.swiglu_limit
-
-# EP layout / recv buffers (single-card view: kernel only sees the local shard)
-N_LOCAL_EXPERTS = M.n_routed_experts // EP_WORLD_SIZE
 
 # Across-layer-mean dequant std (typical layer) of the real routed experts.
 ROUTED_DEQUANT_STD = {"w1": 2.47e-2, "w2": 2.44e-2, "w3": 2.46e-2}
