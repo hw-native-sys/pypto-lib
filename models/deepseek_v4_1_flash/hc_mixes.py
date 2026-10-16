@@ -200,7 +200,7 @@ def mhc_mixes(
 
 
 @pl.jit
-def mhc_mixes_test(
+def l2_hc_mixes(
     x_hc: pl.Tensor[[T_DYN, HC_MULT, D], pl.FP32],
     function: pl.Tensor[[MIX_HC, HC_DIM], pl.FP32],
     scale: pl.Tensor[[3], pl.FP32],
@@ -271,7 +271,7 @@ if __name__ == "__main__":
     parser.add_argument("--compile-only", action="store_true")
     args = parser.parse_args()
     result = run(
-        fn=mhc_mixes_test,
+        fn=l2_hc_mixes,
         specs=build_mhc_mixes_tensor_specs(args.batch, args.sequence),
         golden_fn=golden_mhc_mixes_case,
         config={"platform": args.platform, "device_id": args.device},

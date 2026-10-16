@@ -248,7 +248,7 @@ def golden_engram(
 
 
 @pl.jit
-def engram_test(
+def l2_engram(
     hash_ids: pl.Tensor[[T_DYN, N_HASH_COLS], pl.INT32],
     engram_table: pl.Tensor[[NUM_EMBEDDINGS, HEAD_DIM], pl.BF16],
     wkv_weight: pl.Tensor[[ENGRAM_K, KV_OUT], pl.BF16],
@@ -408,7 +408,7 @@ def engram_tp(
 
 
 @pl.jit
-def engram_tp_rank(
+def l2_engram_tp(
     hash_ids: pl.Tensor[[T_DYN, N_HASH_COLS], pl.INT32],
     engram_table: pl.Tensor[[ROWS_PER_RANK, HEAD_DIM], pl.BF16],
     wkv_weight: pl.Tensor[[ENGRAM_K, KV_OUT], pl.BF16],
@@ -431,7 +431,7 @@ def engram_tp_rank(
 
 
 @pl.jit.host
-def engram_tp_group(
+def l3_engram(
     hash_ids: pl.Tensor[[TP_SIZE, T_DYN, N_HASH_COLS], pl.INT32],
     engram_table: pl.Tensor[[TP_SIZE, ROWS_PER_RANK, HEAD_DIM], pl.BF16],
     wkv_weight: pl.Tensor[[TP_SIZE, ENGRAM_K, KV_OUT], pl.BF16],
@@ -449,7 +449,7 @@ def engram_tp_group(
     for rank in pl.range(pld.world_size()):
         lookup_window = pld.window(lookup_window_buf, [TP_MAX_TOKENS, ENGRAM_K], dtype=pl.BF16)
         signal = pld.window(signal_buf, [TP_SIZE, 1], dtype=pl.INT32)
-        engram_tp_rank(
+        l2_engram_tp(
             hash_ids[rank],
             engram_table[rank],
             wkv_weight[rank],
@@ -609,7 +609,7 @@ if __name__ == "__main__":
 
     if TP_SIZE == 1:
         result = run(
-            fn=engram_test,
+            fn=l2_engram,
             specs=build_engram_tensor_specs(args.batch, args.sequence),
             golden_fn=golden_engram_case,
             config={
@@ -626,7 +626,7 @@ if __name__ == "__main__":
         from pypto.ir import DistributedConfig
 
         result = run(
-            fn=engram_tp_group,
+            fn=l3_engram,
             specs=build_engram_tp_tensor_specs(args.batch, args.sequence),
             golden_fn=golden_engram_tp_case,
             config={

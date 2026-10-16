@@ -425,7 +425,7 @@ def lm_head_with_sampling(
 
 
 @pl.jit
-def lm_head_with_sampling_test(
+def l2_lm_head(
     hidden_states: pl.Tensor[[T_DYN, D], pl.BF16],
     lm_head_weight: pl.Tensor[[VOCAB_PER_TP, D], pl.BF16],
     logit_row_indices: pl.Tensor[[MAX_LOGIT_ROWS], pl.INT32],
@@ -481,7 +481,7 @@ def l3_lm_head(
             hidden_done = pld.window(hidden_done_buf, [TP_SIZE, 1], dtype=pl.INT32)
             logits_window = pld.window(logits_window_buf, [MAX_LOGIT_ROWS, VOCAB], dtype=pl.FP32)
             logits_done = pld.window(logits_done_buf, [TP_SIZE, 1], dtype=pl.INT32)
-            lm_head_with_sampling_test(
+            l2_lm_head(
                 hidden_states[r], lm_head_weight[r], logit_row_indices[r], logits[r],
                 sampled_ids[r],
                 hidden_window, hidden_done, logits_window, logits_done,

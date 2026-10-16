@@ -42,7 +42,7 @@ def hc_head(
 
 
 @pl.jit
-def hc_head_test(
+def l2_hc_head(
     x_hc: pl.Tensor[[T_DYN, HC_MULT, D], pl.FP32],
     pre_mix: pl.Tensor[[T_DYN, HC_MULT], pl.FP32],
     output: pl.Out[pl.Tensor[[T_DYN, D], pl.BF16]],
@@ -77,7 +77,7 @@ if __name__ == "__main__":
     parser.add_argument("--compile-only", action="store_true")
     args = parser.parse_args()
     result = run(
-        fn=hc_head_test,
+        fn=l2_hc_head,
         specs=build_hc_head_tensor_specs(args.batch, args.sequence),
         golden_fn=golden_hc_head_case,
         config={"platform": args.platform, "device_id": args.device},

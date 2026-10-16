@@ -509,198 +509,6 @@ rotate_compressed = make_rope(1)
 
 rotate_index_key = make_wide_rope(1, INDEX_DIM)
 
-def make_c2a_full_partial(
-    qkv_operator, output_operator,
-    index_transform,
-    compressor_operator,
-    index_key_operator, index_weights_operator,
-    attention_operator,
-):
-    """Bind preprocessing and projection schedules while preserving the shared C2A core."""
-    @pl.jit.inline(auto_scope=False)
-    def c2a_full_partial(
-        x: pl.Tensor[[T_DYN, D], pl.BF16],
-        wq_a: pl.Tensor[[D, Q_LORA], pl.FP8E4M3FN],
-        wq_a_scale: pl.Tensor[[D // 32, Q_LORA], pl.FP8E8M0, pl.MX_B_NN],
-        q_norm_weight: pl.Tensor[[Q_LORA], pl.BF16],
-        wq_b: pl.Tensor[[Q_LORA, LOCAL_H * HEAD_DIM], pl.FP8E4M3FN],
-        wq_b_scale: pl.Tensor[[Q_LORA // 32, LOCAL_H * HEAD_DIM], pl.FP8E8M0, pl.MX_B_NN],
-        wkv: pl.Tensor[[D, HEAD_DIM], pl.FP8E4M3FN],
-        wkv_scale: pl.Tensor[[D // 32, HEAD_DIM], pl.FP8E8M0, pl.MX_B_NN],
-        kv_norm_weight: pl.Tensor[[HEAD_DIM], pl.BF16],
-        attn_sink: pl.Tensor[[LOCAL_H], pl.FP32],
-        wo_a: pl.Tensor[[LOCAL_O_GROUPS, O_LORA, O_GROUP_IN], pl.BF16],
-        wo_b: pl.Tensor[[LOCAL_O_WIDTH, D], pl.FP8E4M3FN],
-        wo_b_scale: pl.Tensor[[LOCAL_O_WIDTH // 32, D], pl.FP8E8M0, pl.MX_B_NN],
-        rope_cos: pl.Tensor[[T_DYN, ROPE_DIM // 2], pl.FP32],
-        rope_sin: pl.Tensor[[T_DYN, ROPE_DIM // 2], pl.FP32],
-        window_slots: pl.Tensor[[T_DYN], pl.INT64],
-        window_indices: pl.Tensor[[T_DYN, 128], pl.INT32],
-        window_cache: pl.Tensor[[ORI_BLOCKS_DYN, 128, 1, HEAD_DIM], pl.FP8E4M3FN],
-        window_cache_scale: pl.Tensor[[ORI_BLOCKS_DYN, 128, 1, HEAD_DIM // 32], pl.BF16],
-        compressed_cache: pl.Tensor[[CMP_BLOCKS_DYN, 128, 1, CMP_PACKED], pl.UINT8],
-        compressed_cache_scale: pl.Tensor[[CMP_BLOCKS_DYN, 128, 1, CMP_SCALES], pl.BF16],
-        token_to_req_indices: pl.Tensor[[T_DYN], pl.INT32],
-        compressed_lens: pl.Tensor[[T_DYN], pl.INT32],
-        index_cache: pl.Tensor[[INDEX_BLOCKS_DYN, 128, 1, IDX_PACKED], pl.UINT8],
-        index_cache_scale: pl.Tensor[[INDEX_BLOCKS_DYN, 128, 1, IDX_SCALES], pl.FP8E8M0],
-        index_block_table: pl.Tensor[[B_DYN, TABLE_DYN], pl.INT32],
-        position_ids: pl.Tensor[[T_DYN], pl.INT32],
-        compressed_rope_cos: pl.Tensor[[T_DYN, ROPE_DIM // 2], pl.FP32],
-        compressed_rope_sin: pl.Tensor[[T_DYN, ROPE_DIM // 2], pl.FP32],
-        compressor_wkv: pl.Tensor[[D, HEAD_DIM], pl.FP32],
-        compressor_wgate: pl.Tensor[[D, HEAD_DIM], pl.FP32],
-        query_start_loc: pl.Tensor[[Q_START_DYN], pl.INT32],
-        state_block_table: pl.Tensor[[B_DYN, 1], pl.INT32],
-        state_cache: pl.Tensor[[STATE_BLOCKS_DYN, STATE_CAPACITY, STATE_WIDTH], pl.FP32],
-        compressor_norm_weight: pl.Tensor[[HEAD_DIM], pl.BF16],
-        compressed_slots: pl.Tensor[[T_DYN], pl.INT64],
-        index_wk: pl.Tensor[[HEAD_DIM, INDEX_DIM], pl.BF16],
-        index_norm_weight: pl.Tensor[[INDEX_DIM], pl.BF16],
-        index_wq_b: pl.Tensor[[Q_LORA, INDEX_H * INDEX_DIM], pl.FP8E4M3FN],
-        index_wq_b_scale: pl.Tensor[[Q_LORA // 32, INDEX_H * INDEX_DIM], pl.FP8E8M0, pl.MX_B_NN],
-        index_weights_proj: pl.Tensor[[D, INDEX_H], pl.BF16],
-        topk_indices: pl.Tensor[[T_DYN, INDEX_TOPK], pl.INT32],
-        partial: pl.Tensor[[T_DYN, D], pl.FP32],
-        num_tokens: pl.Scalar[pl.INT32],
-        cache_ready: pl.Scalar[pl.TASK_ID],
-    ):
-        """Write the FP32 local output and publish this layer's compressed and index caches."""
-        tokens = pl.tensor.dim(x, 0)
-
-        qr = pl.create_tensor([tokens, Q_LORA], dtype=pl.BF16)
-        query = pl.create_tensor([tokens, LOCAL_H * HEAD_DIM], dtype=pl.BF16)
-        window_kv = pl.create_tensor([tokens, HEAD_DIM], dtype=pl.BF16)
-        qkv_operator(
-            x, wq_a, wq_a_scale, q_norm_weight, wq_b, wq_b_scale, wkv, wkv_scale,
-            kv_norm_weight, rope_cos, rope_sin, qr, query, window_kv, num_tokens,
-        )
-        publish_window(window_kv, window_slots, window_cache, window_cache_scale, num_tokens, cache_ready)
-
-        compressor_kv = pl.create_tensor([tokens, HEAD_DIM], dtype=pl.FP32)
-        compressor_score = pl.create_tensor([tokens, HEAD_DIM], dtype=pl.FP32)
-        compressor_operator(x, compressor_wkv, compressor_wgate, compressor_kv, compressor_score, num_tokens)
-        latent = pl.create_tensor([tokens, HEAD_DIM], dtype=pl.BF16)
-        pool_tid, state_tid = compressor_ratio2(
-            compressor_kv, compressor_score, query_start_loc, position_ids, token_to_req_indices,
-            state_block_table, state_cache, compressor_norm_weight, latent, num_tokens, cache_ready,
-        )
-
-        # Index keys come from the unrotated latent; the compressed cache stores the rotated one.
-        index_key = pl.create_tensor([tokens, INDEX_DIM], dtype=pl.BF16)
-        index_key_operator(latent, index_wk, index_norm_weight, index_key, num_tokens, pool_tid)
-        rotated_key = pl.create_tensor([tokens, INDEX_DIM], dtype=pl.BF16)
-        rotate_index_key(index_key, compressed_rope_cos, compressed_rope_sin, rotated_key, num_tokens)
-        index_publish_tid = publish_index_key(
-            rotated_key, compressed_slots, index_cache, index_cache_scale, num_tokens, cache_ready
-        )
-        rotated_latent = pl.create_tensor([tokens, HEAD_DIM], dtype=pl.BF16)
-        rotate_compressed(latent, compressed_rope_cos, compressed_rope_sin, rotated_latent, num_tokens)
-        publish_compressed(
-            rotated_latent, compressed_slots, compressed_cache, compressed_cache_scale,
-            num_tokens, cache_ready,
-        )
-
-        index_query_raw = pl.create_tensor([tokens, INDEX_H * INDEX_DIM], dtype=pl.BF16)
-        project_index_q(qr, index_wq_b, index_wq_b_scale, index_query_raw, num_tokens)
-        index_query = pl.create_tensor([tokens, INDEX_H * INDEX_DIM], dtype=pl.BF16)
-        index_transform(index_query_raw, rope_cos, rope_sin, index_query, num_tokens)
-        index_weight = pl.create_tensor([tokens, INDEX_H], dtype=pl.BF16)
-        index_weights_operator(x, index_weights_proj, index_weight, num_tokens)
-        leaf_scores = pl.create_tensor([tokens, LEAF], dtype=pl.FP32)
-        leaf_rows = pl.create_tensor([tokens, LEAF], dtype=pl.INT32)
-        select_tid = index_select(
-            index_query, index_weight, index_cache, index_cache_scale, index_block_table,
-            token_to_req_indices, compressed_lens, leaf_scores, leaf_rows, topk_indices,
-            num_tokens, index_publish_tid,
-        )
-
-        attended = pl.create_tensor([tokens, LOCAL_H * HEAD_DIM], dtype=pl.BF16)
-        selected = pl.create_tensor([QUERY_TILE, SPARSE_WIDTH, HEAD_DIM], dtype=pl.BF16)
-        combined = pl.create_tensor([QUERY_TILE, SPARSE_WIDTH], dtype=pl.INT32)
-        chunk_done = pl.system.task_dummy(deps=[select_tid, state_tid])
-        for start in pl.range(0, num_tokens, QUERY_TILE):
-            active = pl.min(QUERY_TILE, num_tokens - start)
-            gather_tid = gather_packed_chunk(
-                window_cache, window_cache_scale, window_indices, compressed_cache,
-                compressed_cache_scale, topk_indices, selected, combined, start, active, chunk_done,
-            )
-            chunk_done = attention_operator(
-                query, selected, combined, attn_sink, attended, start, active, gather_tid
-            )
-
-        output_operator(attended, wo_a, wo_b, wo_b_scale, rope_cos, rope_sin, partial, num_tokens)
-        return chunk_done
-
-    return c2a_full_partial
-
-def make_c2a_reuse_partial(qkv_operator, output_operator, attention_operator):
-    """Bind preprocessing and projection schedules while preserving the shared C2A core."""
-    @pl.jit.inline(auto_scope=False)
-    def c2a_reuse_partial(
-        x: pl.Tensor[[T_DYN, D], pl.BF16],
-        wq_a: pl.Tensor[[D, Q_LORA], pl.FP8E4M3FN],
-        wq_a_scale: pl.Tensor[[D // 32, Q_LORA], pl.FP8E8M0, pl.MX_B_NN],
-        q_norm_weight: pl.Tensor[[Q_LORA], pl.BF16],
-        wq_b: pl.Tensor[[Q_LORA, LOCAL_H * HEAD_DIM], pl.FP8E4M3FN],
-        wq_b_scale: pl.Tensor[[Q_LORA // 32, LOCAL_H * HEAD_DIM], pl.FP8E8M0, pl.MX_B_NN],
-        wkv: pl.Tensor[[D, HEAD_DIM], pl.FP8E4M3FN],
-        wkv_scale: pl.Tensor[[D // 32, HEAD_DIM], pl.FP8E8M0, pl.MX_B_NN],
-        kv_norm_weight: pl.Tensor[[HEAD_DIM], pl.BF16],
-        attn_sink: pl.Tensor[[LOCAL_H], pl.FP32],
-        wo_a: pl.Tensor[[LOCAL_O_GROUPS, O_LORA, O_GROUP_IN], pl.BF16],
-        wo_b: pl.Tensor[[LOCAL_O_WIDTH, D], pl.FP8E4M3FN],
-        wo_b_scale: pl.Tensor[[LOCAL_O_WIDTH // 32, D], pl.FP8E8M0, pl.MX_B_NN],
-        rope_cos: pl.Tensor[[T_DYN, ROPE_DIM // 2], pl.FP32],
-        rope_sin: pl.Tensor[[T_DYN, ROPE_DIM // 2], pl.FP32],
-        window_slots: pl.Tensor[[T_DYN], pl.INT64],
-        window_indices: pl.Tensor[[T_DYN, 128], pl.INT32],
-        window_cache: pl.Tensor[[ORI_BLOCKS_DYN, 128, 1, HEAD_DIM], pl.FP8E4M3FN],
-        window_cache_scale: pl.Tensor[[ORI_BLOCKS_DYN, 128, 1, HEAD_DIM // 32], pl.BF16],
-        compressed_cache: pl.Tensor[[CMP_BLOCKS_DYN, 128, 1, CMP_PACKED], pl.UINT8],
-        compressed_cache_scale: pl.Tensor[[CMP_BLOCKS_DYN, 128, 1, CMP_SCALES], pl.BF16],
-        compressed_indices: pl.Tensor[[T_DYN, INDEX_TOPK], pl.INT32],
-        partial: pl.Tensor[[T_DYN, D], pl.FP32],
-        num_tokens: pl.Scalar[pl.INT32],
-        cache_ready: pl.Scalar[pl.TASK_ID],
-    ):
-        """Write the FP32 local output for a layer that reuses a published selection.
-
-        Reuse owns only the sliding-window cache. The compressed pool and the Top-K row
-        list both belong to this ratio's source layer and are read without being written,
-        so there is no compressor, no index-key publication and no indexer here.
-        """
-        tokens = pl.tensor.dim(x, 0)
-
-        qr = pl.create_tensor([tokens, Q_LORA], dtype=pl.BF16)
-        query = pl.create_tensor([tokens, LOCAL_H * HEAD_DIM], dtype=pl.BF16)
-        window_kv = pl.create_tensor([tokens, HEAD_DIM], dtype=pl.BF16)
-        qkv_operator(
-            x, wq_a, wq_a_scale, q_norm_weight, wq_b, wq_b_scale, wkv, wkv_scale,
-            kv_norm_weight, rope_cos, rope_sin, qr, query, window_kv, num_tokens,
-        )
-        publish_window(window_kv, window_slots, window_cache, window_cache_scale, num_tokens, cache_ready)
-
-        attended = pl.create_tensor([tokens, LOCAL_H * HEAD_DIM], dtype=pl.BF16)
-        selected = pl.create_tensor([QUERY_TILE, SPARSE_WIDTH, HEAD_DIM], dtype=pl.BF16)
-        combined = pl.create_tensor([QUERY_TILE, SPARSE_WIDTH], dtype=pl.INT32)
-        chunk_done = cache_ready
-        for start in pl.range(0, num_tokens, QUERY_TILE):
-            active = pl.min(QUERY_TILE, num_tokens - start)
-            gather_tid = gather_packed_chunk(
-                window_cache, window_cache_scale, window_indices, compressed_cache,
-                compressed_cache_scale, compressed_indices, selected, combined, start, active,
-                chunk_done,
-            )
-            chunk_done = attention_operator(
-                query, selected, combined, attn_sink, attended, start, active, gather_tid
-            )
-
-        output_operator(attended, wo_a, wo_b, wo_b_scale, rope_cos, rope_sin, partial, num_tokens)
-        return chunk_done
-
-    return c2a_reuse_partial
-
 
 @pl.jit.inline
 def prefill_compressor_projection(
@@ -853,12 +661,121 @@ def prefill_indexer_weights(
 
 prefill_attend_sparse = make_attend_selected_chunk(vector_query=True)
 c2a_index_query = make_wide_rope(INDEX_H, INDEX_DIM, max_workers=64, permute=True)
-c2a_full_partial = make_c2a_full_partial(
-    qkv_operator=prefill_c2a_full_qkv, output_operator=prefill_o_proj,
-    index_transform=c2a_index_query, compressor_operator=prefill_compressor_project,
-    index_key_operator=prefill_index_key_project, index_weights_operator=prefill_indexer_weights,
-    attention_operator=prefill_attend_sparse,
-)
+
+@pl.jit.inline(auto_scope=False)
+def c2a_full_partial(
+    x: pl.Tensor[[T_DYN, D], pl.BF16],
+    wq_a: pl.Tensor[[D, Q_LORA], pl.FP8E4M3FN],
+    wq_a_scale: pl.Tensor[[D // 32, Q_LORA], pl.FP8E8M0, pl.MX_B_NN],
+    q_norm_weight: pl.Tensor[[Q_LORA], pl.BF16],
+    wq_b: pl.Tensor[[Q_LORA, LOCAL_H * HEAD_DIM], pl.FP8E4M3FN],
+    wq_b_scale: pl.Tensor[[Q_LORA // 32, LOCAL_H * HEAD_DIM], pl.FP8E8M0, pl.MX_B_NN],
+    wkv: pl.Tensor[[D, HEAD_DIM], pl.FP8E4M3FN],
+    wkv_scale: pl.Tensor[[D // 32, HEAD_DIM], pl.FP8E8M0, pl.MX_B_NN],
+    kv_norm_weight: pl.Tensor[[HEAD_DIM], pl.BF16],
+    attn_sink: pl.Tensor[[LOCAL_H], pl.FP32],
+    wo_a: pl.Tensor[[LOCAL_O_GROUPS, O_LORA, O_GROUP_IN], pl.BF16],
+    wo_b: pl.Tensor[[LOCAL_O_WIDTH, D], pl.FP8E4M3FN],
+    wo_b_scale: pl.Tensor[[LOCAL_O_WIDTH // 32, D], pl.FP8E8M0, pl.MX_B_NN],
+    rope_cos: pl.Tensor[[T_DYN, ROPE_DIM // 2], pl.FP32],
+    rope_sin: pl.Tensor[[T_DYN, ROPE_DIM // 2], pl.FP32],
+    window_slots: pl.Tensor[[T_DYN], pl.INT64],
+    window_indices: pl.Tensor[[T_DYN, 128], pl.INT32],
+    window_cache: pl.Tensor[[ORI_BLOCKS_DYN, 128, 1, HEAD_DIM], pl.FP8E4M3FN],
+    window_cache_scale: pl.Tensor[[ORI_BLOCKS_DYN, 128, 1, HEAD_DIM // 32], pl.BF16],
+    compressed_cache: pl.Tensor[[CMP_BLOCKS_DYN, 128, 1, CMP_PACKED], pl.UINT8],
+    compressed_cache_scale: pl.Tensor[[CMP_BLOCKS_DYN, 128, 1, CMP_SCALES], pl.BF16],
+    token_to_req_indices: pl.Tensor[[T_DYN], pl.INT32],
+    compressed_lens: pl.Tensor[[T_DYN], pl.INT32],
+    index_cache: pl.Tensor[[INDEX_BLOCKS_DYN, 128, 1, IDX_PACKED], pl.UINT8],
+    index_cache_scale: pl.Tensor[[INDEX_BLOCKS_DYN, 128, 1, IDX_SCALES], pl.FP8E8M0],
+    index_block_table: pl.Tensor[[B_DYN, TABLE_DYN], pl.INT32],
+    position_ids: pl.Tensor[[T_DYN], pl.INT32],
+    compressed_rope_cos: pl.Tensor[[T_DYN, ROPE_DIM // 2], pl.FP32],
+    compressed_rope_sin: pl.Tensor[[T_DYN, ROPE_DIM // 2], pl.FP32],
+    compressor_wkv: pl.Tensor[[D, HEAD_DIM], pl.FP32],
+    compressor_wgate: pl.Tensor[[D, HEAD_DIM], pl.FP32],
+    query_start_loc: pl.Tensor[[Q_START_DYN], pl.INT32],
+    state_block_table: pl.Tensor[[B_DYN, 1], pl.INT32],
+    state_cache: pl.Tensor[[STATE_BLOCKS_DYN, STATE_CAPACITY, STATE_WIDTH], pl.FP32],
+    compressor_norm_weight: pl.Tensor[[HEAD_DIM], pl.BF16],
+    compressed_slots: pl.Tensor[[T_DYN], pl.INT64],
+    index_wk: pl.Tensor[[HEAD_DIM, INDEX_DIM], pl.BF16],
+    index_norm_weight: pl.Tensor[[INDEX_DIM], pl.BF16],
+    index_wq_b: pl.Tensor[[Q_LORA, INDEX_H * INDEX_DIM], pl.FP8E4M3FN],
+    index_wq_b_scale: pl.Tensor[[Q_LORA // 32, INDEX_H * INDEX_DIM], pl.FP8E8M0, pl.MX_B_NN],
+    index_weights_proj: pl.Tensor[[D, INDEX_H], pl.BF16],
+    topk_indices: pl.Tensor[[T_DYN, INDEX_TOPK], pl.INT32],
+    partial: pl.Tensor[[T_DYN, D], pl.FP32],
+    num_tokens: pl.Scalar[pl.INT32],
+    cache_ready: pl.Scalar[pl.TASK_ID],
+):
+    """Write the FP32 local output and publish this layer's compressed and index caches."""
+    tokens = pl.tensor.dim(x, 0)
+
+    qr = pl.create_tensor([tokens, Q_LORA], dtype=pl.BF16)
+    query = pl.create_tensor([tokens, LOCAL_H * HEAD_DIM], dtype=pl.BF16)
+    window_kv = pl.create_tensor([tokens, HEAD_DIM], dtype=pl.BF16)
+    prefill_c2a_full_qkv(
+        x, wq_a, wq_a_scale, q_norm_weight, wq_b, wq_b_scale, wkv, wkv_scale,
+        kv_norm_weight, rope_cos, rope_sin, qr, query, window_kv, num_tokens,
+    )
+    publish_window(window_kv, window_slots, window_cache, window_cache_scale, num_tokens, cache_ready)
+
+    compressor_kv = pl.create_tensor([tokens, HEAD_DIM], dtype=pl.FP32)
+    compressor_score = pl.create_tensor([tokens, HEAD_DIM], dtype=pl.FP32)
+    prefill_compressor_project(x, compressor_wkv, compressor_wgate, compressor_kv, compressor_score, num_tokens)
+    latent = pl.create_tensor([tokens, HEAD_DIM], dtype=pl.BF16)
+    pool_tid, state_tid = compressor_ratio2(
+        compressor_kv, compressor_score, query_start_loc, position_ids, token_to_req_indices,
+        state_block_table, state_cache, compressor_norm_weight, latent, num_tokens, cache_ready,
+    )
+
+    # Index keys come from the unrotated latent; the compressed cache stores the rotated one.
+    index_key = pl.create_tensor([tokens, INDEX_DIM], dtype=pl.BF16)
+    prefill_index_key_project(latent, index_wk, index_norm_weight, index_key, num_tokens, pool_tid)
+    rotated_key = pl.create_tensor([tokens, INDEX_DIM], dtype=pl.BF16)
+    rotate_index_key(index_key, compressed_rope_cos, compressed_rope_sin, rotated_key, num_tokens)
+    index_publish_tid = publish_index_key(
+        rotated_key, compressed_slots, index_cache, index_cache_scale, num_tokens, cache_ready
+    )
+    rotated_latent = pl.create_tensor([tokens, HEAD_DIM], dtype=pl.BF16)
+    rotate_compressed(latent, compressed_rope_cos, compressed_rope_sin, rotated_latent, num_tokens)
+    publish_compressed(
+        rotated_latent, compressed_slots, compressed_cache, compressed_cache_scale,
+        num_tokens, cache_ready,
+    )
+
+    index_query_raw = pl.create_tensor([tokens, INDEX_H * INDEX_DIM], dtype=pl.BF16)
+    project_index_q(qr, index_wq_b, index_wq_b_scale, index_query_raw, num_tokens)
+    index_query = pl.create_tensor([tokens, INDEX_H * INDEX_DIM], dtype=pl.BF16)
+    c2a_index_query(index_query_raw, rope_cos, rope_sin, index_query, num_tokens)
+    index_weight = pl.create_tensor([tokens, INDEX_H], dtype=pl.BF16)
+    prefill_indexer_weights(x, index_weights_proj, index_weight, num_tokens)
+    leaf_scores = pl.create_tensor([tokens, LEAF], dtype=pl.FP32)
+    leaf_rows = pl.create_tensor([tokens, LEAF], dtype=pl.INT32)
+    select_tid = index_select(
+        index_query, index_weight, index_cache, index_cache_scale, index_block_table,
+        token_to_req_indices, compressed_lens, leaf_scores, leaf_rows, topk_indices,
+        num_tokens, index_publish_tid,
+    )
+
+    attended = pl.create_tensor([tokens, LOCAL_H * HEAD_DIM], dtype=pl.BF16)
+    selected = pl.create_tensor([QUERY_TILE, SPARSE_WIDTH, HEAD_DIM], dtype=pl.BF16)
+    combined = pl.create_tensor([QUERY_TILE, SPARSE_WIDTH], dtype=pl.INT32)
+    chunk_done = pl.system.task_dummy(deps=[select_tid, state_tid])
+    for start in pl.range(0, num_tokens, QUERY_TILE):
+        active = pl.min(QUERY_TILE, num_tokens - start)
+        gather_tid = gather_packed_chunk(
+            window_cache, window_cache_scale, window_indices, compressed_cache,
+            compressed_cache_scale, topk_indices, selected, combined, start, active, chunk_done,
+        )
+        chunk_done = prefill_attend_sparse(
+            query, selected, combined, attn_sink, attended, start, active, gather_tid
+        )
+
+    prefill_o_proj(attended, wo_a, wo_b, wo_b_scale, rope_cos, rope_sin, partial, num_tokens)
+    return chunk_done
 
 
 def golden_prefill_attn_c2a_full(
@@ -1108,7 +1025,68 @@ def prefill_attn_c2a_full(
     return output
 
 
-c2a_reuse_partial = make_c2a_reuse_partial(prefill_c2a_qkv, prefill_o_proj, prefill_attend_sparse)
+@pl.jit.inline(auto_scope=False)
+def c2a_reuse_partial(
+    x: pl.Tensor[[T_DYN, D], pl.BF16],
+    wq_a: pl.Tensor[[D, Q_LORA], pl.FP8E4M3FN],
+    wq_a_scale: pl.Tensor[[D // 32, Q_LORA], pl.FP8E8M0, pl.MX_B_NN],
+    q_norm_weight: pl.Tensor[[Q_LORA], pl.BF16],
+    wq_b: pl.Tensor[[Q_LORA, LOCAL_H * HEAD_DIM], pl.FP8E4M3FN],
+    wq_b_scale: pl.Tensor[[Q_LORA // 32, LOCAL_H * HEAD_DIM], pl.FP8E8M0, pl.MX_B_NN],
+    wkv: pl.Tensor[[D, HEAD_DIM], pl.FP8E4M3FN],
+    wkv_scale: pl.Tensor[[D // 32, HEAD_DIM], pl.FP8E8M0, pl.MX_B_NN],
+    kv_norm_weight: pl.Tensor[[HEAD_DIM], pl.BF16],
+    attn_sink: pl.Tensor[[LOCAL_H], pl.FP32],
+    wo_a: pl.Tensor[[LOCAL_O_GROUPS, O_LORA, O_GROUP_IN], pl.BF16],
+    wo_b: pl.Tensor[[LOCAL_O_WIDTH, D], pl.FP8E4M3FN],
+    wo_b_scale: pl.Tensor[[LOCAL_O_WIDTH // 32, D], pl.FP8E8M0, pl.MX_B_NN],
+    rope_cos: pl.Tensor[[T_DYN, ROPE_DIM // 2], pl.FP32],
+    rope_sin: pl.Tensor[[T_DYN, ROPE_DIM // 2], pl.FP32],
+    window_slots: pl.Tensor[[T_DYN], pl.INT64],
+    window_indices: pl.Tensor[[T_DYN, 128], pl.INT32],
+    window_cache: pl.Tensor[[ORI_BLOCKS_DYN, 128, 1, HEAD_DIM], pl.FP8E4M3FN],
+    window_cache_scale: pl.Tensor[[ORI_BLOCKS_DYN, 128, 1, HEAD_DIM // 32], pl.BF16],
+    compressed_cache: pl.Tensor[[CMP_BLOCKS_DYN, 128, 1, CMP_PACKED], pl.UINT8],
+    compressed_cache_scale: pl.Tensor[[CMP_BLOCKS_DYN, 128, 1, CMP_SCALES], pl.BF16],
+    compressed_indices: pl.Tensor[[T_DYN, INDEX_TOPK], pl.INT32],
+    partial: pl.Tensor[[T_DYN, D], pl.FP32],
+    num_tokens: pl.Scalar[pl.INT32],
+    cache_ready: pl.Scalar[pl.TASK_ID],
+):
+    """Write the FP32 local output for a layer that reuses a published selection.
+
+    Reuse owns only the sliding-window cache. The compressed pool and the Top-K row
+    list both belong to this ratio's source layer and are read without being written,
+    so there is no compressor, no index-key publication and no indexer here.
+    """
+    tokens = pl.tensor.dim(x, 0)
+
+    qr = pl.create_tensor([tokens, Q_LORA], dtype=pl.BF16)
+    query = pl.create_tensor([tokens, LOCAL_H * HEAD_DIM], dtype=pl.BF16)
+    window_kv = pl.create_tensor([tokens, HEAD_DIM], dtype=pl.BF16)
+    prefill_c2a_qkv(
+        x, wq_a, wq_a_scale, q_norm_weight, wq_b, wq_b_scale, wkv, wkv_scale,
+        kv_norm_weight, rope_cos, rope_sin, qr, query, window_kv, num_tokens,
+    )
+    publish_window(window_kv, window_slots, window_cache, window_cache_scale, num_tokens, cache_ready)
+
+    attended = pl.create_tensor([tokens, LOCAL_H * HEAD_DIM], dtype=pl.BF16)
+    selected = pl.create_tensor([QUERY_TILE, SPARSE_WIDTH, HEAD_DIM], dtype=pl.BF16)
+    combined = pl.create_tensor([QUERY_TILE, SPARSE_WIDTH], dtype=pl.INT32)
+    chunk_done = cache_ready
+    for start in pl.range(0, num_tokens, QUERY_TILE):
+        active = pl.min(QUERY_TILE, num_tokens - start)
+        gather_tid = gather_packed_chunk(
+            window_cache, window_cache_scale, window_indices, compressed_cache,
+            compressed_cache_scale, compressed_indices, selected, combined, start, active,
+            chunk_done,
+        )
+        chunk_done = prefill_attend_sparse(
+            query, selected, combined, attn_sink, attended, start, active, gather_tid
+        )
+
+    prefill_o_proj(attended, wo_a, wo_b, wo_b_scale, rope_cos, rope_sin, partial, num_tokens)
+    return chunk_done
 
 
 def golden_prefill_attn_c2a_reuse(

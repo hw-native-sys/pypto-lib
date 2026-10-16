@@ -379,7 +379,7 @@ def expert_shared(
 
 
 @pl.jit
-def expert_shared_test(
+def l2_expert_shared(
     x_local: pl.Tensor[[T_PAD, D], pl.FP8E4M3FN],
     x_local_scale: pl.Tensor[[1, T_PAD * (D // MX_GROUP)], pl.FP8E8M0],
     shared_w1: pl.Tensor[[D, MOE_INTER], pl.FP8E4M3FN],
@@ -481,7 +481,7 @@ if __name__ == "__main__":
     args = parser.parse_args()
 
     result = run(
-        fn=expert_shared_test,
+        fn=l2_expert_shared,
         specs=build_tensor_specs(),
         golden_fn=golden_expert_shared,
         golden_data=args.golden_data,

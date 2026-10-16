@@ -14,7 +14,7 @@ from sparse_attention import attend_selected, gather_packed
 import pypto.language.distributed as pld
 import torch
 
-from golden import TensorSpec, mapped_pool_ratio_allclose, ratio_allclose, run
+from golden import ScalarSpec, TensorSpec, mapped_pool_ratio_allclose, ratio_allclose, run
 from utils import AttentionGoldenResult
 from quant import golden_bf16_gemm, golden_mxfp8_linear
 from qkv_proj_rope import (
@@ -1227,7 +1227,7 @@ decode_attn_c1a_full_sharded = make_decode_attn_c1a_full(c1a_finish_sharded)
 
 
 @pl.jit
-def decode_attn_c1a_full_test(
+def l2_decode_attn_c1a(
     x: pl.Tensor[[T_DYN, D], pl.BF16],
     wq_a: pl.Tensor[[D, Q_LORA], pl.FP8E4M3FN],
     wq_a_scale: pl.Tensor[[D // 32, Q_LORA], pl.FP8E8M0, pl.MX_B_NN],
@@ -1298,92 +1298,87 @@ def decode_attn_c1a_full_test(
     )
 
 
-def make_program(tokens, pages, requests=1, epochs=1):
-    """Build a distributed host using static packed-FP4 storage dimensions."""
-    TOKENS = tokens
-    PAGES = pages
-    REQUESTS = requests
-    EPOCHS = epochs
+@pl.jit.host
+def l3_decode_attn_c1a(
+    x: pl.Tensor[[TP_SIZE, T_DYN, D], pl.BF16],
+    wq_a: pl.Tensor[[TP_SIZE, D, Q_LORA], pl.FP8E4M3FN],
+    wq_a_scale: pl.Tensor[[TP_SIZE, D // 32, Q_LORA], pl.FP8E8M0],
+    q_norm_weight: pl.Tensor[[TP_SIZE, Q_LORA], pl.BF16],
+    wq_b: pl.Tensor[[TP_SIZE, Q_LORA, LOCAL_H * HEAD_DIM], pl.FP8E4M3FN],
+    wq_b_scale: pl.Tensor[[TP_SIZE, Q_LORA // 32, LOCAL_H * HEAD_DIM], pl.FP8E8M0],
+    wkv: pl.Tensor[[TP_SIZE, D, HEAD_DIM], pl.FP8E4M3FN],
+    wkv_scale: pl.Tensor[[TP_SIZE, D // 32, HEAD_DIM], pl.FP8E8M0],
+    kv_norm_weight: pl.Tensor[[TP_SIZE, HEAD_DIM], pl.BF16],
+    attn_sink: pl.Tensor[[TP_SIZE, LOCAL_H], pl.FP32],
+    wo_a: pl.Tensor[[TP_SIZE, LOCAL_O_GROUPS, O_LORA, O_GROUP_IN], pl.BF16],
+    wo_b: pl.Tensor[[TP_SIZE, LOCAL_O_WIDTH, D], pl.FP8E4M3FN],
+    wo_b_scale: pl.Tensor[[TP_SIZE, LOCAL_O_WIDTH // 32, D], pl.FP8E8M0],
+    rope_cos: pl.Tensor[[TP_SIZE, T_DYN, ROPE_DIM // 2], pl.FP32],
+    rope_sin: pl.Tensor[[TP_SIZE, T_DYN, ROPE_DIM // 2], pl.FP32],
+    window_slots: pl.Tensor[[TP_SIZE, T_DYN], pl.INT64],
+    window_indices: pl.Tensor[[TP_SIZE, T_DYN, 128], pl.INT32],
+    window_cache: pl.InOut[pl.Tensor[[TP_SIZE, ORI_BLOCKS_DYN, 128, 1, HEAD_DIM], pl.FP8E4M3FN]],
+    window_cache_scale: pl.InOut[pl.Tensor[[TP_SIZE, ORI_BLOCKS_DYN, 128, 1, HEAD_DIM // WINDOW_CACHE_GROUP], pl.BF16]],
+    compressed_cache: pl.InOut[pl.Tensor[[TP_SIZE, CMP_BLOCKS_DYN, 128, 1, HEAD_DIM // 2], pl.UINT8]],
+    compressed_cache_scale: pl.InOut[pl.Tensor[[TP_SIZE, CMP_BLOCKS_DYN, 128, 1, HEAD_DIM // COMPRESSED_CACHE_GROUP], pl.BF16]],
+    request_ids: pl.Tensor[[TP_SIZE, T_DYN], pl.INT32],
+    compressed_lens: pl.Tensor[[TP_SIZE, T_DYN], pl.INT32],
+    index_cache: pl.InOut[pl.Tensor[[TP_SIZE, INDEX_BLOCKS_DYN, 128, 1, INDEX_DIM // 2], pl.UINT8]],
+    index_cache_scale: pl.InOut[pl.Tensor[[TP_SIZE, INDEX_BLOCKS_DYN, 128, 1, INDEX_DIM // INDEX_CACHE_GROUP], pl.FP8E8M0]],
+    index_block_table: pl.Tensor[[TP_SIZE, B_DYN, TABLE_DYN], pl.INT32],
+    compressed_rope_cos: pl.Tensor[[TP_SIZE, T_DYN, ROPE_DIM // 2], pl.FP32],
+    compressed_rope_sin: pl.Tensor[[TP_SIZE, T_DYN, ROPE_DIM // 2], pl.FP32],
+    compressor_wkv: pl.Tensor[[TP_SIZE, D, HEAD_DIM], pl.BF16],
+    compressor_norm_weight: pl.Tensor[[TP_SIZE, HEAD_DIM], pl.BF16],
+    compressed_slots: pl.Tensor[[TP_SIZE, T_DYN], pl.INT64],
+    index_wk: pl.Tensor[[TP_SIZE, HEAD_DIM, INDEX_DIM], pl.BF16],
+    index_norm_weight: pl.Tensor[[TP_SIZE, INDEX_DIM], pl.BF16],
+    index_wq_b: pl.Tensor[[TP_SIZE, Q_LORA, INDEX_H * INDEX_DIM], pl.FP8E4M3FN],
+    index_wq_b_scale: pl.Tensor[[TP_SIZE, Q_LORA // 32, INDEX_H * INDEX_DIM], pl.FP8E8M0],
+    index_weights_proj: pl.Tensor[[TP_SIZE, D, INDEX_H], pl.BF16],
+    topk_indices: pl.Out[pl.Tensor[[TP_SIZE, T_DYN, INDEX_TOPK], pl.INT32]],
+    candidate_mask: pl.Out[pl.Tensor[[TP_SIZE, T_DYN, CMP_POSITIONS_DYN], pl.UINT8]],
+    output: pl.Out[pl.Tensor[[TP_SIZE, T_DYN, D], pl.BF16]],
+    num_tokens: pl.Scalar[pl.INT32],
+    attention_epoch: pl.Scalar[pl.INT32],
+):
+    x.bind_dynamic(1, T_DYN)
+    rope_cos.bind_dynamic(1, T_DYN)
+    window_cache.bind_dynamic(1, ORI_BLOCKS_DYN)
+    compressed_cache.bind_dynamic(1, CMP_BLOCKS_DYN)
+    index_cache.bind_dynamic(1, INDEX_BLOCKS_DYN)
+    index_block_table.bind_dynamic(1, B_DYN)
+    index_block_table.bind_dynamic(2, TABLE_DYN)
+    candidate_mask.bind_dynamic(2, CMP_POSITIONS_DYN)
+    transport = pld.alloc_window_buffer([DECODE_MAX_TOKENS, D], dtype=pl.FP32)
+    signals = pld.alloc_window_buffer([TP_SIZE, 1], dtype=pl.INT32)
+    for rank in pl.unroll(TP_SIZE):
+        output_window = pld.window(transport, [DECODE_MAX_TOKENS, D], dtype=pl.FP32)
+        output_arrived = pld.window(signals, [TP_SIZE, 1], dtype=pl.INT32)
+        # The rank takes these scales as MX_B_NN; a bare slice is ND, so annotate it.
+        wq_a_scale_r: pl.Tensor[[D // 32, Q_LORA], pl.FP8E8M0, pl.MX_B_NN] = wq_a_scale[rank]
+        wq_b_scale_r: pl.Tensor[
+            [Q_LORA // 32, LOCAL_H * HEAD_DIM], pl.FP8E8M0, pl.MX_B_NN
+        ] = wq_b_scale[rank]
+        wkv_scale_r: pl.Tensor[[D // 32, HEAD_DIM], pl.FP8E8M0, pl.MX_B_NN] = wkv_scale[rank]
+        wo_b_scale_r: pl.Tensor[[LOCAL_O_WIDTH // 32, D], pl.FP8E8M0, pl.MX_B_NN] = wo_b_scale[rank]
+        index_wq_b_scale_r: pl.Tensor[
+            [Q_LORA // 32, INDEX_H * INDEX_DIM], pl.FP8E8M0, pl.MX_B_NN
+        ] = index_wq_b_scale[rank]
+        l2_decode_attn_c1a(
+            x[rank], wq_a[rank], wq_a_scale_r, q_norm_weight[rank], wq_b[rank], wq_b_scale_r,
+            wkv[rank], wkv_scale_r, kv_norm_weight[rank], attn_sink[rank], wo_a[rank],
+            wo_b[rank], wo_b_scale_r, rope_cos[rank], rope_sin[rank], window_slots[rank],
+            window_indices[rank], window_cache[rank], window_cache_scale[rank],
+            compressed_cache[rank], compressed_cache_scale[rank], request_ids[rank],
+            compressed_lens[rank], index_cache[rank], index_cache_scale[rank],
+            index_block_table[rank], compressed_rope_cos[rank], compressed_rope_sin[rank],
+            compressor_wkv[rank], compressor_norm_weight[rank], compressed_slots[rank],
+            index_wk[rank], index_norm_weight[rank], index_wq_b[rank], index_wq_b_scale_r,
+            index_weights_proj[rank], topk_indices[rank], candidate_mask[rank], output_window,
+            output_arrived, output[rank], 0, rank, num_tokens, attention_epoch, device=rank,
+        )
 
-    @pl.jit.host
-    def host(
-        x: pl.Tensor[[TP_SIZE, TOKENS, D], pl.BF16],
-        wq_a: pl.Tensor[[TP_SIZE, D, Q_LORA], pl.FP8E4M3FN],
-        wq_a_scale: pl.Tensor[[TP_SIZE, D // 32, Q_LORA], pl.FP8E8M0],
-        q_norm_weight: pl.Tensor[[TP_SIZE, Q_LORA], pl.BF16],
-        wq_b: pl.Tensor[[TP_SIZE, Q_LORA, LOCAL_H * HEAD_DIM], pl.FP8E4M3FN],
-        wq_b_scale: pl.Tensor[[TP_SIZE, Q_LORA // 32, LOCAL_H * HEAD_DIM], pl.FP8E8M0],
-        wkv: pl.Tensor[[TP_SIZE, D, HEAD_DIM], pl.FP8E4M3FN],
-        wkv_scale: pl.Tensor[[TP_SIZE, D // 32, HEAD_DIM], pl.FP8E8M0],
-        kv_norm_weight: pl.Tensor[[TP_SIZE, HEAD_DIM], pl.BF16],
-        attn_sink: pl.Tensor[[TP_SIZE, LOCAL_H], pl.FP32],
-        wo_a: pl.Tensor[[TP_SIZE, LOCAL_O_GROUPS, O_LORA, O_GROUP_IN], pl.BF16],
-        wo_b: pl.Tensor[[TP_SIZE, LOCAL_O_WIDTH, D], pl.FP8E4M3FN],
-        wo_b_scale: pl.Tensor[[TP_SIZE, LOCAL_O_WIDTH // 32, D], pl.FP8E8M0],
-        rope_cos: pl.Tensor[[TP_SIZE, TOKENS, ROPE_DIM // 2], pl.FP32],
-        rope_sin: pl.Tensor[[TP_SIZE, TOKENS, ROPE_DIM // 2], pl.FP32],
-        window_slots: pl.Tensor[[TP_SIZE, TOKENS], pl.INT64],
-        window_indices: pl.Tensor[[TP_SIZE, TOKENS, 128], pl.INT32],
-        window_cache: pl.InOut[pl.Tensor[[TP_SIZE, PAGES, 128, 1, HEAD_DIM], pl.FP8E4M3FN]],
-        window_cache_scale: pl.InOut[
-            pl.Tensor[[TP_SIZE, PAGES, 128, 1, HEAD_DIM // WINDOW_CACHE_GROUP], pl.BF16]
-        ],
-        compressed_cache: pl.InOut[pl.Tensor[[TP_SIZE, PAGES, 128, 1, HEAD_DIM // 2], pl.UINT8]],
-        compressed_cache_scale: pl.InOut[
-            pl.Tensor[[TP_SIZE, PAGES, 128, 1, HEAD_DIM // COMPRESSED_CACHE_GROUP], pl.BF16]
-        ],
-        request_ids: pl.Tensor[[TP_SIZE, TOKENS], pl.INT32],
-        compressed_lens: pl.Tensor[[TP_SIZE, TOKENS], pl.INT32],
-        index_cache: pl.InOut[pl.Tensor[[TP_SIZE, PAGES, 128, 1, INDEX_DIM // 2], pl.UINT8]],
-        index_cache_scale: pl.InOut[
-            pl.Tensor[[TP_SIZE, PAGES, 128, 1, INDEX_DIM // INDEX_CACHE_GROUP], pl.FP8E8M0]
-        ],
-        index_block_table: pl.Tensor[[TP_SIZE, REQUESTS, PAGES], pl.INT32],
-        compressed_rope_cos: pl.Tensor[[TP_SIZE, TOKENS, ROPE_DIM // 2], pl.FP32],
-        compressed_rope_sin: pl.Tensor[[TP_SIZE, TOKENS, ROPE_DIM // 2], pl.FP32],
-        compressor_wkv: pl.Tensor[[TP_SIZE, D, HEAD_DIM], pl.BF16],
-        compressor_norm_weight: pl.Tensor[[TP_SIZE, HEAD_DIM], pl.BF16],
-        compressed_slots: pl.Tensor[[TP_SIZE, TOKENS], pl.INT64],
-        index_wk: pl.Tensor[[TP_SIZE, HEAD_DIM, INDEX_DIM], pl.BF16],
-        index_norm_weight: pl.Tensor[[TP_SIZE, INDEX_DIM], pl.BF16],
-        index_wq_b: pl.Tensor[[TP_SIZE, Q_LORA, INDEX_H * INDEX_DIM], pl.FP8E4M3FN],
-        index_wq_b_scale: pl.Tensor[[TP_SIZE, Q_LORA // 32, INDEX_H * INDEX_DIM], pl.FP8E8M0],
-        index_weights_proj: pl.Tensor[[TP_SIZE, D, INDEX_H], pl.BF16],
-        topk_indices: pl.Out[pl.Tensor[[TP_SIZE, TOKENS, INDEX_TOPK], pl.INT32]],
-        candidate_mask: pl.Out[pl.Tensor[[TP_SIZE, TOKENS, PAGES * 128], pl.UINT8]],
-        output: pl.Out[pl.Tensor[[TP_SIZE, TOKENS, D], pl.BF16]],
-    ):
-        transport = pld.alloc_window_buffer([DECODE_MAX_TOKENS, D], dtype=pl.FP32)
-        signals = pld.alloc_window_buffer([TP_SIZE, 1], dtype=pl.INT32)
-        for epoch in pl.range(1, EPOCHS + 1):
-            for rank in pl.unroll(TP_SIZE):
-                output_window = pld.window(transport, [DECODE_MAX_TOKENS, D], dtype=pl.FP32)
-                output_arrived = pld.window(signals, [TP_SIZE, 1], dtype=pl.INT32)
-                # The rank takes these scales as MX_B_NN; a bare slice is ND, so annotate it.
-                wq_a_scale_r: pl.Tensor[[D // 32, Q_LORA], pl.FP8E8M0, pl.MX_B_NN] = wq_a_scale[rank]
-                wq_b_scale_r: pl.Tensor[
-                    [Q_LORA // 32, LOCAL_H * HEAD_DIM], pl.FP8E8M0, pl.MX_B_NN
-                ] = wq_b_scale[rank]
-                wkv_scale_r: pl.Tensor[[D // 32, HEAD_DIM], pl.FP8E8M0, pl.MX_B_NN] = wkv_scale[rank]
-                wo_b_scale_r: pl.Tensor[[LOCAL_O_WIDTH // 32, D], pl.FP8E8M0, pl.MX_B_NN] = wo_b_scale[rank]
-                index_wq_b_scale_r: pl.Tensor[
-                    [Q_LORA // 32, INDEX_H * INDEX_DIM], pl.FP8E8M0, pl.MX_B_NN
-                ] = index_wq_b_scale[rank]
-                decode_attn_c1a_full_test(
-                    x[rank], wq_a[rank], wq_a_scale_r, q_norm_weight[rank], wq_b[rank], wq_b_scale_r,
-                    wkv[rank], wkv_scale_r, kv_norm_weight[rank], attn_sink[rank], wo_a[rank],
-                    wo_b[rank], wo_b_scale_r, rope_cos[rank], rope_sin[rank], window_slots[rank],
-                    window_indices[rank], window_cache[rank], window_cache_scale[rank],
-                    compressed_cache[rank], compressed_cache_scale[rank], request_ids[rank],
-                    compressed_lens[rank], index_cache[rank], index_cache_scale[rank],
-                    index_block_table[rank], compressed_rope_cos[rank], compressed_rope_sin[rank],
-                    compressor_wkv[rank], compressor_norm_weight[rank], compressed_slots[rank],
-                    index_wk[rank], index_norm_weight[rank], index_wq_b[rank], index_wq_b_scale_r,
-                    index_weights_proj[rank], topk_indices[rank], candidate_mask[rank], output_window,
-                    output_arrived, output[rank], 0, rank, TOKENS, epoch, device=rank,
-                )
-
-    return host
 
 
 def build_validation_values(mode, tokens, pages, requests=1, seed=17, case="random"):
@@ -1594,7 +1589,6 @@ if __name__ == "__main__":
     parser.add_argument("--tokens", type=int, default=1)
     parser.add_argument("--pages", type=int, default=8)
     parser.add_argument("--requests", type=int, default=1)
-    parser.add_argument("--epochs", type=int, default=1)
     parser.add_argument("--seed", type=int, default=17)
     parser.add_argument("--case", choices=["random", "ragged", "masked", "sink"], default="random")
     parser.add_argument("--compile-only", action="store_true", default=False)
@@ -1616,39 +1610,41 @@ if __name__ == "__main__":
         parser.error("device IDs must be comma-separated integers")
     if len(devices) != TP_SIZE or len(set(devices)) != len(devices) or min(devices) < 0:
         parser.error(f"device IDs must be {TP_SIZE} distinct nonnegative integers, one per rank")
-    if not 1 <= args.tokens <= min(DECODE_MAX_TOKENS, args.pages * 128) or args.pages < 1 or args.epochs < 1:
-        parser.error(f"require 1 <= tokens <= min({DECODE_MAX_TOKENS}, pages * 128), pages >= 1, epochs >= 1")
+    if not 1 <= args.tokens <= min(DECODE_MAX_TOKENS, args.pages * 128) or args.pages < 1:
+        parser.error(f"require 1 <= tokens <= min({DECODE_MAX_TOKENS}, pages * 128), pages >= 1")
     if not 1 <= args.requests <= min(MAX_BATCH_PER_DP, args.tokens):
         parser.error(f"require 1 <= requests <= min({MAX_BATCH_PER_DP}, tokens {args.tokens})")
-    host = make_program(args.tokens, args.pages, args.requests, args.epochs)
+    host = l3_decode_attn_c1a
     values = build_validation_values("full", args.tokens, args.pages, args.requests, args.seed, args.case)
     # Independent initial storage for each harness allocation.
     specs = [
         TensorSpec(n, list(values[n].shape), values[n].dtype, init_value=lambda n=n: values[n].clone())
-        for n in host.param_names
+        for n in host.param_names if n not in ("num_tokens", "attention_epoch")
     ]
 
+    specs.append(ScalarSpec("num_tokens", torch.int32, args.tokens))
+    specs.append(ScalarSpec("attention_epoch", torch.int32, 1, compile_runtime=True))
+
     def golden_c1a(tensors):
-        for _ in range(args.epochs):
-            partials = []
-            for rank in range(TP_SIZE):
-                kwargs = {n: tensors[n][rank] for n in inspect.signature(golden_decode_attn_c1a_full).parameters}
-                result = golden_decode_attn_c1a_full(**kwargs)
-                partials.append(result.output.float())
-                for name in CACHE_STATE_NAMES:
-                    value = getattr(result, name, None)
-                    if value is not None and name in tensors:
-                        destination = tensors[name][rank]
-                        if name == "candidate_mask":
-                            value = value.clone()
-                            destination.zero_()
-                            destination[:, : value.shape[1]].copy_(value.to(destination.dtype))
-                        else:
-                            destination.view(torch.uint8).copy_(value.contiguous().view(torch.uint8))
-            reduced = torch.zeros_like(partials[0])
-            for partial in partials:
-                reduced += partial
-            tensors["output"].copy_(reduced.to(torch.bfloat16).unsqueeze(0).expand_as(tensors["output"]))
+        partials = []
+        for rank in range(TP_SIZE):
+            kwargs = {n: tensors[n][rank] for n in inspect.signature(golden_decode_attn_c1a_full).parameters}
+            result = golden_decode_attn_c1a_full(**kwargs)
+            partials.append(result.output.float())
+            for name in CACHE_STATE_NAMES:
+                value = getattr(result, name, None)
+                if value is not None and name in tensors:
+                    destination = tensors[name][rank]
+                    if name == "candidate_mask":
+                        value = value.clone()
+                        destination.zero_()
+                        destination[:, : value.shape[1]].copy_(value.to(destination.dtype))
+                    else:
+                        destination.view(torch.uint8).copy_(value.contiguous().view(torch.uint8))
+        reduced = torch.zeros_like(partials[0])
+        for partial in partials:
+            reduced += partial
+        tensors["output"].copy_(reduced.to(torch.bfloat16).unsqueeze(0).expand_as(tensors["output"]))
 
     comparisons = {
         "topk_indices": ratio_allclose(atol=0.0, rtol=0.0, max_error_ratio=0.02),

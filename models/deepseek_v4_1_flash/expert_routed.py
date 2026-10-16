@@ -760,7 +760,7 @@ ROUTE_ROWS = B * S * TOPK
 
 
 @pl.jit(auto_scope=False)
-def expert_routed_test(
+def l2_expert_routed(
     recv_x: pl.Tensor[[N_LOCAL_EXPERTS, RECV_MAX, D], pl.FP8E4M3FN],
     recv_mx_scale: pl.Tensor[[1, N_LOCAL_EXPERTS * RECV_MAX * K_SCALE], pl.FP8E8M0],
     recv_weights: pl.Tensor[[N_LOCAL_EXPERTS, RECV_MAX], pl.FP32],
@@ -841,7 +841,7 @@ def l3_expert_routed(
         routed_w2_scale_r: pl.Tensor[
             [N_LOCAL_EXPERTS * H_SCALE, D], pl.FP8E8M0, pl.MX_B_NN
         ] = routed_w2_scale[r]
-        expert_routed_test(
+        l2_expert_routed(
             recv_x[r], recv_mx_scale[r], recv_weights[r], recv_expert_count[r],
             routed_w1_packed[r], routed_w1_scale_r,
             routed_w3_packed[r], routed_w3_scale_r,

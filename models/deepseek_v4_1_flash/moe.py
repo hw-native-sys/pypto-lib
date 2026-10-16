@@ -745,7 +745,7 @@ def moe(
 
 
 @pl.jit
-def moe_test(
+def l2_moe(
     x_hc: pl.Tensor[[LOCAL_T_DYN, HC_MULT, D], pl.FP32],
     pre_mix: pl.Tensor[[LOCAL_T_DYN, HC_MULT], pl.FP32],
     hc_ffn_fn: pl.Tensor[[MIX_HC, HC_DIM], pl.FP32],
@@ -969,7 +969,7 @@ def l3_moe(
         shared_w1_scale_r: pl.Tensor[[D // MX_GROUP, MOE_INTER], pl.FP8E8M0, pl.MX_B_NN] = shared_w1_scale[r]
         shared_w2_scale_r: pl.Tensor[[MOE_INTER // MX_GROUP, D], pl.FP8E8M0, pl.MX_B_NN] = shared_w2_scale[r]
         shared_w3_scale_r: pl.Tensor[[D // MX_GROUP, MOE_INTER], pl.FP8E8M0, pl.MX_B_NN] = shared_w3_scale[r]
-        moe_test(
+        l2_moe(
             x_hc[r], pre_mix[r], hc_ffn_fn[r], hc_ffn_scale[r], hc_ffn_base[r],
             norm_weight[r], gate_weight[r], correction_bias[r],
             routed_w1[r], routed_w1_scale_r, routed_w2[r], routed_w2_scale_r,

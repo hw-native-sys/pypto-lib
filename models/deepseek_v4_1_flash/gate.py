@@ -286,7 +286,7 @@ def gate(
 
 
 @pl.jit
-def gate_test(
+def l2_gate(
     x_mixed: pl.Tensor[[T, D], pl.BF16],
     norm_w: pl.Tensor[[D], pl.BF16],
     gate_w: pl.Tensor[[N_EXPERTS, D], pl.FP32],
@@ -646,7 +646,7 @@ if __name__ == "__main__":
     torch.manual_seed(args.seed)
 
     result = run(
-        fn=gate_test,
+        fn=l2_gate,
         specs=build_tensor_specs(layer_id=args.layer_id, num_tokens=args.num_tokens),
         golden_fn=golden_gate_core,
         config=dict(

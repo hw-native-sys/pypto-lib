@@ -181,11 +181,6 @@ def has_platform_cli(path):
         tree = ast.parse(_read(path))
     except SyntaxError:
         return False
-    return _has_platform_argument(tree)
-
-
-def _has_platform_argument(tree):
-    """Find a platform option in a module or delegated runner function."""
     return any(
         isinstance(node, ast.Call)
         and isinstance(node.func, ast.Attribute)
@@ -195,37 +190,10 @@ def _has_platform_argument(tree):
     )
 
 
-def _delegates_platform_cli(path):
-    """Recognize script calls to sibling runners that own platform parsing."""
-    try:
-        tree = ast.parse(_read(path))
-    except SyntaxError:
-        return False
-    guards = [node for node in tree.body if isinstance(node, ast.If)
-              and ast.unparse(node.test) == "__name__ == '__main__'"]
-    calls = {node.func.id for guard in guards for node in ast.walk(guard)
-             if isinstance(node, ast.Call) and isinstance(node.func, ast.Name)}
-    for node in tree.body:
-        if not isinstance(node, ast.ImportFrom) or not node.module or node.level:
-            continue
-        sibling = Path(path).parent / (node.module + ".py")
-        names = {alias.name for alias in node.names if (alias.asname or alias.name) in calls}
-        if not names or not sibling.is_file():
-            continue
-        try:
-            delegated = ast.parse(_read(str(sibling)))
-        except SyntaxError:
-            continue
-        if any(isinstance(fn, ast.FunctionDef) and fn.name in names and _has_platform_argument(fn)
-               for fn in delegated.body):
-            return True
-    return False
-
-
 def _has_main(path):
     source = _read(path)
     script_guard = "__main__" in source or "if __name__ == _SCRIPT_ENTRY_POINT:" in source
-    return script_guard and (has_platform_cli(path) or _delegates_platform_cli(path) or bool(
+    return script_guard and (has_platform_cli(path) or bool(
         re.search(r"^def validate\(", source, re.MULTILINE)
     ))
 

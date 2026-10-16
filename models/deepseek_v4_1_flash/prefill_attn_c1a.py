@@ -64,6 +64,7 @@ from sparse_attention import (
 )
 
 
+
 # model config
 LOCAL_H = M.num_attention_heads // TP_SIZE
 LOCAL_O_GROUPS = M.o_groups // TP_SIZE
@@ -189,66 +190,57 @@ def prefill_c1a_partial(
     return output
 
 
-def make_prefill_publish_decoder():
-    """Reuse the C1A source stages over the complete encoder output."""
-    from prefill_attn_c1a import (
-        project_compressed,
-        project_index_key,
-        rotate_compressed,
-        rotate_index_key,
+
+@pl.jit.inline(auto_scope=False)
+def prefill_publish_decoder(
+    x: pl.Tensor[[T_DYN, D], pl.BF16],
+    compressor_wkv: pl.Tensor[[D, HEAD_DIM], pl.BF16],
+    compressor_norm_weight: pl.Tensor[[HEAD_DIM], pl.BF16],
+    index_wk: pl.Tensor[[HEAD_DIM, INDEX_DIM], pl.BF16],
+    index_norm_weight: pl.Tensor[[INDEX_DIM], pl.BF16],
+    compressed_rope_cos: pl.Tensor[[T_DYN, ROPE_DIM // 2], pl.FP32],
+    compressed_rope_sin: pl.Tensor[[T_DYN, ROPE_DIM // 2], pl.FP32],
+    compressed_slots: pl.Tensor[[T_DYN], pl.INT64],
+    compressed_cache: pl.Tensor[[CMP_BLOCKS_DYN, 128, 1, HEAD_DIM // 2], pl.UINT8],
+    compressed_cache_scale: pl.Tensor[
+        [CMP_BLOCKS_DYN, 128, 1, HEAD_DIM // COMPRESSED_CACHE_GROUP], pl.BF16
+    ],
+    index_cache: pl.Tensor[[INDEX_BLOCKS_DYN, 128, 1, INDEX_DIM // 2], pl.UINT8],
+    index_cache_scale: pl.Tensor[
+        [INDEX_BLOCKS_DYN, 128, 1, INDEX_DIM // INDEX_CACHE_GROUP], pl.FP8E8M0
+    ],
+    num_tokens: pl.Scalar[pl.INT32],
+):
+    tokens = pl.tensor.dim(x, 0)
+    compressed_projection = pl.create_tensor([tokens, HEAD_DIM], dtype=pl.BF16)
+    project_compressed(x, compressor_wkv, compressed_projection, num_tokens)
+    compressed_latent = pl.create_tensor([tokens, HEAD_DIM], dtype=pl.BF16)
+    norm_blocks = (num_tokens + 7) // 8
+    for norm_worker in pl.spmd(norm_blocks, name_hint="attention_rmsnorm"):
+        rms_norm(compressed_projection, compressor_norm_weight, compressed_latent, norm_worker, num_tokens, width=HEAD_DIM)
+    compressed_rotated = pl.create_tensor([tokens, HEAD_DIM], dtype=pl.BF16)
+    rotate_compressed(
+        compressed_latent, compressed_rope_cos, compressed_rope_sin, compressed_rotated, num_tokens,
     )
+    compressed_ready = publish_compressed_cache(
+        compressed_rotated, compressed_slots, compressed_cache, compressed_cache_scale, num_tokens,
+    )
+    index_projection = pl.create_tensor([tokens, INDEX_DIM], dtype=pl.BF16)
+    project_index_key(compressed_latent, index_wk, index_projection, num_tokens)
+    index_normalized = pl.create_tensor([tokens, INDEX_DIM], dtype=pl.BF16)
+    norm_blocks = (num_tokens + 7) // 8
+    for norm_worker in pl.spmd(norm_blocks, name_hint="attention_rmsnorm"):
+        rms_norm(index_projection, index_norm_weight, index_normalized, norm_worker, num_tokens, width=INDEX_DIM)
+    index_rotated = pl.create_tensor([tokens, INDEX_DIM], dtype=pl.BF16)
+    rotate_index_key(
+        index_normalized, compressed_rope_cos, compressed_rope_sin, index_rotated, num_tokens,
+    )
+    index_ready = publish_index_cache(
+        index_rotated, compressed_slots, index_cache, index_cache_scale, num_tokens,
+    )
+    ready = pl.system.task_dummy(deps=[compressed_ready, index_ready])
+    return ready
 
-    @pl.jit.inline(auto_scope=False)
-    def prefill_publish_decoder(
-        x: pl.Tensor[[T_DYN, D], pl.BF16],
-        compressor_wkv: pl.Tensor[[D, HEAD_DIM], pl.BF16],
-        compressor_norm_weight: pl.Tensor[[HEAD_DIM], pl.BF16],
-        index_wk: pl.Tensor[[HEAD_DIM, INDEX_DIM], pl.BF16],
-        index_norm_weight: pl.Tensor[[INDEX_DIM], pl.BF16],
-        compressed_rope_cos: pl.Tensor[[T_DYN, ROPE_DIM // 2], pl.FP32],
-        compressed_rope_sin: pl.Tensor[[T_DYN, ROPE_DIM // 2], pl.FP32],
-        compressed_slots: pl.Tensor[[T_DYN], pl.INT64],
-        compressed_cache: pl.Tensor[[CMP_BLOCKS_DYN, 128, 1, HEAD_DIM // 2], pl.UINT8],
-        compressed_cache_scale: pl.Tensor[
-            [CMP_BLOCKS_DYN, 128, 1, HEAD_DIM // COMPRESSED_CACHE_GROUP], pl.BF16
-        ],
-        index_cache: pl.Tensor[[INDEX_BLOCKS_DYN, 128, 1, INDEX_DIM // 2], pl.UINT8],
-        index_cache_scale: pl.Tensor[
-            [INDEX_BLOCKS_DYN, 128, 1, INDEX_DIM // INDEX_CACHE_GROUP], pl.FP8E8M0
-        ],
-        num_tokens: pl.Scalar[pl.INT32],
-    ):
-        tokens = pl.tensor.dim(x, 0)
-        compressed_projection = pl.create_tensor([tokens, HEAD_DIM], dtype=pl.BF16)
-        project_compressed(x, compressor_wkv, compressed_projection, num_tokens)
-        compressed_latent = pl.create_tensor([tokens, HEAD_DIM], dtype=pl.BF16)
-        norm_blocks = (num_tokens + 7) // 8
-        for norm_worker in pl.spmd(norm_blocks, name_hint="attention_rmsnorm"):
-            rms_norm(compressed_projection, compressor_norm_weight, compressed_latent, norm_worker, num_tokens, width=HEAD_DIM)
-        compressed_rotated = pl.create_tensor([tokens, HEAD_DIM], dtype=pl.BF16)
-        rotate_compressed(
-            compressed_latent, compressed_rope_cos, compressed_rope_sin, compressed_rotated, num_tokens,
-        )
-        compressed_ready = publish_compressed_cache(
-            compressed_rotated, compressed_slots, compressed_cache, compressed_cache_scale, num_tokens,
-        )
-        index_projection = pl.create_tensor([tokens, INDEX_DIM], dtype=pl.BF16)
-        project_index_key(compressed_latent, index_wk, index_projection, num_tokens)
-        index_normalized = pl.create_tensor([tokens, INDEX_DIM], dtype=pl.BF16)
-        norm_blocks = (num_tokens + 7) // 8
-        for norm_worker in pl.spmd(norm_blocks, name_hint="attention_rmsnorm"):
-            rms_norm(index_projection, index_norm_weight, index_normalized, norm_worker, num_tokens, width=INDEX_DIM)
-        index_rotated = pl.create_tensor([tokens, INDEX_DIM], dtype=pl.BF16)
-        rotate_index_key(
-            index_normalized, compressed_rope_cos, compressed_rope_sin, index_rotated, num_tokens,
-        )
-        index_ready = publish_index_cache(
-            index_rotated, compressed_slots, index_cache, index_cache_scale, num_tokens,
-        )
-        ready = pl.system.task_dummy(deps=[compressed_ready, index_ready])
-        return ready
-
-    return prefill_publish_decoder
 
 
 def golden_prefill_attn_c1a_full(
@@ -858,7 +850,7 @@ prefill_attn_c1a_reindex = make_prefill_attn_c1a_reindex(reindex_paged_indexer)
 
 
 @pl.jit
-def prefill_attn_c1a_full_test(
+def l2_prefill_attn_c1a(
     x: pl.Tensor[[T_DYN, D], pl.BF16],
     wq_a: pl.Tensor[[D, Q_LORA], pl.FP8E4M3FN],
     wq_a_scale: pl.Tensor[[D // 32, Q_LORA], pl.FP8E8M0, pl.MX_B_NN],
@@ -937,7 +929,7 @@ def prefill_attn_c1a_full_test(
 
 
 @pl.jit.host
-def l3_prefill_attn_c1a_full_test(
+def l3_prefill_attn_c1a(
     x: pl.Tensor[[TP_SIZE, T_DYN, D], pl.BF16],
     wq_a: pl.Tensor[[TP_SIZE, D, Q_LORA], pl.FP8E4M3FN],
     wq_a_scale: pl.Tensor[[TP_SIZE, D // 32, Q_LORA], pl.FP8E8M0],
@@ -1024,7 +1016,7 @@ def l3_prefill_attn_c1a_full_test(
         index_wq_b_scale_r: pl.Tensor[
             [Q_LORA // 32, INDEX_H * INDEX_DIM], pl.FP8E8M0, pl.MX_B_NN
         ] = index_wq_b_scale[rank]
-        prefill_attn_c1a_full_test(
+        l2_prefill_attn_c1a(
             x[rank], wq_a[rank], wq_a_scale_r, q_norm_weight[rank],
             wq_b[rank], wq_b_scale_r, wkv[rank], wkv_scale_r,
             kv_norm_weight[rank], attn_sink[rank], wo_a[rank], wo_b[rank],
@@ -1120,7 +1112,7 @@ if __name__ == "__main__":
 
 
     result = run(
-        fn=l3_prefill_attn_c1a_full_test,
+        fn=l3_prefill_attn_c1a,
         specs=build_tensor_specs(args.tokens, args.case),
         golden_fn=golden_prefill_attn_c1a_full_case,
         golden_data=args.golden_data,

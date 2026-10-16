@@ -89,7 +89,7 @@ def pack_x_hc(
 
 
 @pl.jit
-def pack_x_hc_test(
+def l2_input_pack(
     input_ids: pl.Tensor[[TOKEN_DYN], pl.INT64],
     embed_weight: pl.Tensor[[VOCAB_DYN, D], pl.BF16],
     x_hc: pl.Out[pl.Tensor[[TOKEN_DYN, HC_MULT, D], pl.FP32]],
@@ -148,7 +148,7 @@ if __name__ == "__main__":
     args = parser.parse_args()
 
     result = run(
-        fn=pack_x_hc_test,
+        fn=l2_input_pack,
         specs=build_tensor_specs(args.tokens, args.vocab),
         golden_fn=golden_pack_x_hc,
         compile_only=args.compile_only,

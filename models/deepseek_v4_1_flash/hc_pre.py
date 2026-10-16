@@ -62,13 +62,37 @@ def mhc_pre(
     return output
 
 
+@pl.jit.inline
+def attention_hc_pre(
+    x_hc: pl.Tensor[[T_DYN, HC_MULT, D], pl.FP32],
+    pre_mix: pl.Tensor[[T_DYN, HC_MULT], pl.FP32],
+    hc_attn_fn: pl.Tensor[[MIX_HC, HC_DIM], pl.FP32],
+    hc_attn_scale: pl.Tensor[[3], pl.FP32],
+    hc_attn_base: pl.Tensor[[MIX_HC], pl.FP32],
+    attn_norm_weight: pl.Tensor[[D], pl.BF16],
+    next_pre_mix: pl.Tensor[[T_DYN, HC_MULT], pl.FP32],
+    post_mix: pl.Tensor[[T_DYN, HC_MULT], pl.FP32],
+    residual_mix: pl.Tensor[[T_DYN, HC_MULT, HC_MULT], pl.FP32],
+    x: pl.Tensor[[T_DYN, D], pl.BF16],
+):
+    """Derive this sublayer's mixes, then collapse with the delayed pre-mix and normalize."""
+    tokens = pl.tensor.dim(x_hc, 0)
+    mhc_mixes(x_hc, hc_attn_fn, hc_attn_scale, hc_attn_base, next_pre_mix, post_mix, residual_mix)
+    collapsed = pl.create_tensor([tokens, D], dtype=pl.BF16)
+    mhc_pre(x_hc, pre_mix, collapsed)
+    norm_tokens = pl.tensor.dim(collapsed, 0)
+    for norm_block in pl.spmd((norm_tokens + 7) // 8, name_hint="rms_norm"):
+        rms_norm_tiled(collapsed, attn_norm_weight, x, norm_block, norm_tokens)
+    return x
+
+
 def golden_mhc_pre(x_hc: torch.Tensor, pre_mix: torch.Tensor) -> torch.Tensor:
     """Collapse the HC streams with the Torch reference."""
     return golden_hc_pre(x_hc, pre_mix).to(torch.bfloat16)
 
 
 @pl.jit
-def mhc_pre_test(
+def l2_hc_pre(
     x_hc: pl.Tensor[[T_DYN, HC_MULT, D], pl.FP32],
     pre_mix: pl.Tensor[[T_DYN, HC_MULT], pl.FP32],
     output: pl.Out[pl.Tensor[[T_DYN, D], pl.BF16]],
@@ -251,7 +275,7 @@ if __name__ == "__main__":
     parser.add_argument("--compile-only", action="store_true")
     args = parser.parse_args()
     result = run(
-        fn=mhc_pre_test,
+        fn=l2_hc_pre,
         specs=build_mhc_pre_tensor_specs(args.batch, args.sequence),
         golden_fn=golden_mhc_pre_case,
         config={"platform": args.platform, "device_id": args.device},

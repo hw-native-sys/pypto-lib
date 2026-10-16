@@ -14,7 +14,6 @@
 import argparse
 import inspect
 from dataclasses import dataclass
-from collections.abc import Callable
 from quant import pack_mx_b_scale, quantize_mxfp4_cache, quantize_mxfp4_weight, quantize_mxfp8_cache
 from enum import IntEnum
 from typing import Any, Mapping
@@ -175,7 +174,7 @@ def decode_layer_kind(layer_id: int) -> DecodeLayerKind:
 
 
 @pl.jit
-def decode_layer(
+def l2_decode_layer(
     x_hc: pl.Tensor[[LOCAL_T_DYN, HC_MULT, D], pl.FP32],
     incoming_pre_mix: pl.Tensor[[LOCAL_T_DYN, HC_MULT], pl.FP32],
     hc_attn_fn: pl.Tensor[[MIX_HC, HC_DIM], pl.FP32],
@@ -602,7 +601,7 @@ def l3_decode_layer(
         shared_w1_scale_rank: pl.Tensor[[D // MX_GROUP, MOE_INTER], pl.FP8E8M0, pl.MX_B_NN] = shared_w1_scale[rank]
         shared_w2_scale_rank: pl.Tensor[[MOE_INTER // MX_GROUP, D], pl.FP8E8M0, pl.MX_B_NN] = shared_w2_scale[rank]
         shared_w3_scale_rank: pl.Tensor[[D // MX_GROUP, MOE_INTER], pl.FP8E8M0, pl.MX_B_NN] = shared_w3_scale[rank]
-        decode_layer(
+        l2_decode_layer(
             x_hc[rank],
             incoming_pre_mix[rank],
             hc_attn_fn[rank],
@@ -1067,7 +1066,7 @@ def golden_l3_decode_layer(tensors):
         group["gathered"] = tensors["gathered"][group_base : group_base + TP_SIZE]
         group["num_tokens"] = global_tokens
         group["attention_epoch"] = int(tensors["attention_epoch"])
-        decode_swa.make_golden_sharded(1)(group)
+        decode_swa.golden_decode_swa_sharded(group)
 
     moe_tensors = dict(tensors)
     moe_tensors["x_hc"] = attention_hidden
@@ -1281,76 +1280,6 @@ def make_decode_layer_golden_inputs(layer_id: int) -> dict:
     }
 
 
-def run_decode_layer_goldens(golden_fn: Callable[..., object], layer_ids) -> None:
-    """Execute the six scheduled decode Block goldens."""
-    for layer_id in layer_ids:
-        result = golden_fn(**make_decode_layer_golden_inputs(layer_id))
-        if result.output.dtype is not torch.float32:
-            raise RuntimeError(f"layer {layer_id} produced {result.output.dtype}, expected torch.float32")
-        if not bool(torch.isfinite(result.output).all()):
-            raise RuntimeError(f"layer {layer_id} produced non-finite output")
-        print(
-            f"[GOLDEN] PASS decode_layer layer={layer_id} "
-            f"output={tuple(result.output.shape)} next_pre_mix={tuple(result.next_pre_mix.shape)}"
-        )
-
-
-def run_two_layer_decode_chain(golden_fn: Callable[..., object], *, tp_size: int = 4) -> None:
-    """Run two consecutive Block goldens across the sequence-parallel boundary.
-
-    This CPU check exercises the contract owned by Decode: the first layer's
-    residual output and its delayed mHC pre-mix are split into owner slabs, are
-    handed to the second layer through the same gather the collectives perform,
-    and have to come back unchanged.  Slabs are compared against
-    ``sequence_parallel_bounds``, the ownership rule the kernels use, so a rank
-    order or padding mistake fails here instead of cancelling out in an identity
-    round trip.
-    """
-    from utils import gather_decode_batch, sequence_parallel_bounds, shard_decode_batch
-
-    first_inputs = make_decode_layer_golden_inputs(0)
-    first = golden_fn(**first_inputs)
-    tokens = first.output.shape[0]
-    token_ids = torch.arange(1000, 1000 + tokens, dtype=torch.int64)
-    position_ids = torch.arange(7, 7 + tokens, dtype=torch.int32)
-
-    hidden_slabs = shard_decode_batch(first.output, token_ids, position_ids, tp_size=tp_size)
-    pre_mix_slabs = shard_decode_batch(first.next_pre_mix, token_ids, position_ids, tp_size=tp_size)
-    for rank, (hidden_slab, pre_mix_slab) in enumerate(zip(hidden_slabs, pre_mix_slabs)):
-        first_row, count, width = sequence_parallel_bounds(tokens, tp_size, rank)
-        if hidden_slab.hidden.shape[0] != width or pre_mix_slab.hidden.shape[0] != width:
-            raise RuntimeError(f"rank {rank} slab width does not match the ownership rule")
-        if not torch.equal(hidden_slab.hidden[:count], first.output[first_row : first_row + count]):
-            raise RuntimeError(f"rank {rank} owns the wrong residual rows")
-        if not torch.equal(pre_mix_slab.hidden[:count], first.next_pre_mix[first_row : first_row + count]):
-            raise RuntimeError(f"rank {rank} owns the wrong delayed mHC rows")
-        if count < width and not bool((hidden_slab.hidden[count:] == 0).all()):
-            raise RuntimeError(f"rank {rank} leaves non-zero residual padding")
-
-    gathered = gather_decode_batch(hidden_slabs, tokens)
-    gathered_pre_mix = gather_decode_batch(pre_mix_slabs, tokens)
-    if not torch.equal(gathered.hidden, first.output) or not torch.equal(
-        gathered_pre_mix.hidden, first.next_pre_mix
-    ):
-        raise RuntimeError("the Attention boundary changed the residual stream or the delayed mHC rows")
-
-    # The second layer consumes what the boundary published, not the pristine
-    # global tensor.
-    second_inputs = make_decode_layer_golden_inputs(2)
-    second_inputs["x_hc"] = gathered.hidden
-    second_inputs["incoming_pre_mix"] = gathered_pre_mix.hidden
-    second = golden_fn(**second_inputs)
-
-    if second.output.shape != first.output.shape or second.next_pre_mix.shape != first.next_pre_mix.shape:
-        raise RuntimeError("consecutive Decode layers changed the residual boundary shape")
-    if not bool(torch.isfinite(second.output).all()):
-        raise RuntimeError("the second Decode layer produced non-finite hidden state")
-    print(
-        f"[GOLDEN] PASS decode_layer chain layers=(0,2) TP={tp_size} "
-        f"output={tuple(second.output.shape)} tokens={tokens}"
-    )
-
-
 if __name__ == "__main__":
     from golden import ratio_allclose, ratio_reldiff, run
     import decode_attn_swa
@@ -1372,8 +1301,59 @@ if __name__ == "__main__":
     parser.add_argument("--cpu-golden", action="store_true")
     args = parser.parse_args()
     if args.cpu_golden:
-        run_decode_layer_goldens(golden_decode_layer, REPRESENTATIVE_LAYER_IDS.values())
-        run_two_layer_decode_chain(golden_decode_layer)
+        for layer_id in REPRESENTATIVE_LAYER_IDS.values():
+            result = golden_decode_layer(**make_decode_layer_golden_inputs(layer_id))
+            if result.output.dtype is not torch.float32:
+                raise RuntimeError(f"layer {layer_id} produced {result.output.dtype}, expected torch.float32")
+            if not bool(torch.isfinite(result.output).all()):
+                raise RuntimeError(f"layer {layer_id} produced non-finite output")
+            print(
+                f"[GOLDEN] PASS decode_layer layer={layer_id} "
+                f"output={tuple(result.output.shape)} next_pre_mix={tuple(result.next_pre_mix.shape)}"
+            )
+        from utils import gather_decode_batch, sequence_parallel_bounds, shard_decode_batch
+
+        first_inputs = make_decode_layer_golden_inputs(0)
+        first = golden_decode_layer(**first_inputs)
+        tokens = first.output.shape[0]
+        token_ids = torch.arange(1000, 1000 + tokens, dtype=torch.int64)
+        position_ids = torch.arange(7, 7 + tokens, dtype=torch.int32)
+
+        hidden_slabs = shard_decode_batch(first.output, token_ids, position_ids, tp_size=4)
+        pre_mix_slabs = shard_decode_batch(first.next_pre_mix, token_ids, position_ids, tp_size=4)
+        for rank, (hidden_slab, pre_mix_slab) in enumerate(zip(hidden_slabs, pre_mix_slabs)):
+            first_row, count, width = sequence_parallel_bounds(tokens, 4, rank)
+            if hidden_slab.hidden.shape[0] != width or pre_mix_slab.hidden.shape[0] != width:
+                raise RuntimeError(f"rank {rank} slab width does not match the ownership rule")
+            if not torch.equal(hidden_slab.hidden[:count], first.output[first_row : first_row + count]):
+                raise RuntimeError(f"rank {rank} owns the wrong residual rows")
+            if not torch.equal(pre_mix_slab.hidden[:count], first.next_pre_mix[first_row : first_row + count]):
+                raise RuntimeError(f"rank {rank} owns the wrong delayed mHC rows")
+            if count < width and not bool((hidden_slab.hidden[count:] == 0).all()):
+                raise RuntimeError(f"rank {rank} leaves non-zero residual padding")
+
+        gathered = gather_decode_batch(hidden_slabs, tokens)
+        gathered_pre_mix = gather_decode_batch(pre_mix_slabs, tokens)
+        if not torch.equal(gathered.hidden, first.output) or not torch.equal(
+            gathered_pre_mix.hidden, first.next_pre_mix
+        ):
+            raise RuntimeError("the Attention boundary changed the residual stream or the delayed mHC rows")
+
+        # The second layer consumes what the boundary published, not the pristine
+        # global tensor.
+        second_inputs = make_decode_layer_golden_inputs(2)
+        second_inputs["x_hc"] = gathered.hidden
+        second_inputs["incoming_pre_mix"] = gathered_pre_mix.hidden
+        second = golden_decode_layer(**second_inputs)
+
+        if second.output.shape != first.output.shape or second.next_pre_mix.shape != first.next_pre_mix.shape:
+            raise RuntimeError("consecutive Decode layers changed the residual boundary shape")
+        if not bool(torch.isfinite(second.output).all()):
+            raise RuntimeError("the second Decode layer produced non-finite hidden state")
+        print(
+            f"[GOLDEN] PASS decode_layer chain layers=(0,2) TP=4 "
+            f"output={tuple(second.output.shape)} tokens={tokens}"
+        )
         raise SystemExit(0)
     if args.tp != TP_SIZE or args.ep != EP_SIZE:
         parser.error("--tp/--ep are import-time configuration; pass them on the Python command line")

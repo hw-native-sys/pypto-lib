@@ -514,31 +514,6 @@ def _make_q_proj_rope(project, rotate):
     return q_proj_rope
 
 
-def _make_kv_proj_rope(project, rotate):
-    @pl.jit.inline(auto_scope=False)
-    def kv_proj_rope(
-        x: pl.Tensor[[T_DYN, D], pl.BF16],
-        wkv: pl.Tensor[[D, HEAD_DIM], pl.FP8E4M3FN],
-        wkv_scale: pl.Tensor[[D // 32, HEAD_DIM], pl.FP8E8M0, pl.MX_B_NN],
-        kv_norm_weight: pl.Tensor[[HEAD_DIM], pl.BF16],
-        rope_cos: pl.Tensor[[T_DYN, ROPE_DIM // 2], pl.FP32],
-        rope_sin: pl.Tensor[[T_DYN, ROPE_DIM // 2], pl.FP32],
-        window_kv: pl.Tensor[[T_DYN, HEAD_DIM], pl.BF16],
-        num_tokens: pl.Scalar[pl.INT32],
-    ):
-        tokens = pl.tensor.dim(x, 0)
-        projected = pl.create_tensor([tokens, HEAD_DIM], dtype=pl.BF16)
-        project(x, wkv, wkv_scale, projected, num_tokens)
-        normalized = pl.create_tensor([tokens, HEAD_DIM], dtype=pl.BF16)
-        norm_blocks = (num_tokens + 7) // 8
-        for norm_worker in pl.spmd(norm_blocks, name_hint="attention_kv_norm"):
-            rms_norm(projected, kv_norm_weight, normalized, norm_worker, num_tokens, width=HEAD_DIM)
-        rotate(normalized, rope_cos, rope_sin, window_kv, num_tokens)
-        return window_kv
-
-    return kv_proj_rope
-
-
 @pl.jit.inline(auto_scope=False)
 def prefill_kv_proj_rope(
     x: pl.Tensor[[T_DYN, D], pl.BF16],
@@ -654,6 +629,27 @@ _prefill_rotate_kv = make_rope(
 
 q_proj_qr = _make_q_proj_qr(_project_qa, 2**31 - 1, "attention_q_norm")
 q_proj_rope = _make_q_proj_rope(_project_qb, _rotate_q)
-kv_proj_rope = _make_kv_proj_rope(_project_kv, _rotate_kv)
+
+@pl.jit.inline(auto_scope=False)
+def kv_proj_rope(
+    x: pl.Tensor[[T_DYN, D], pl.BF16],
+    wkv: pl.Tensor[[D, HEAD_DIM], pl.FP8E4M3FN],
+    wkv_scale: pl.Tensor[[D // 32, HEAD_DIM], pl.FP8E8M0, pl.MX_B_NN],
+    kv_norm_weight: pl.Tensor[[HEAD_DIM], pl.BF16],
+    rope_cos: pl.Tensor[[T_DYN, ROPE_DIM // 2], pl.FP32],
+    rope_sin: pl.Tensor[[T_DYN, ROPE_DIM // 2], pl.FP32],
+    window_kv: pl.Tensor[[T_DYN, HEAD_DIM], pl.BF16],
+    num_tokens: pl.Scalar[pl.INT32],
+):
+    tokens = pl.tensor.dim(x, 0)
+    projected = pl.create_tensor([tokens, HEAD_DIM], dtype=pl.BF16)
+    _project_kv(x, wkv, wkv_scale, projected, num_tokens)
+    normalized = pl.create_tensor([tokens, HEAD_DIM], dtype=pl.BF16)
+    norm_blocks = (num_tokens + 7) // 8
+    for norm_worker in pl.spmd(norm_blocks, name_hint="attention_kv_norm"):
+        rms_norm(projected, kv_norm_weight, normalized, norm_worker, num_tokens, width=HEAD_DIM)
+    _rotate_kv(normalized, rope_cos, rope_sin, window_kv, num_tokens)
+    return window_kv
+
 prefill_q_proj_qr = _make_q_proj_qr(_prefill_project_qa, _PREFILL_WORKERS, "prefill_attention_q_norm")
 prefill_q_proj_rope = _make_q_proj_rope(_project_qb, _prefill_rotate_q)

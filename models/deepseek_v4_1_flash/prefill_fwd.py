@@ -89,7 +89,16 @@ from utils import (
 )
 from moe import AUX_WIDTH, ROUTE_WIDTH, moe
 from compressor import STATE_WIDTH
-from prefill_attn_c1a import make_prefill_publish_decoder
+from prefill_attn_c1a import prefill_publish_decoder
+from prefill_attn_swa import make_prefill_attn_swa
+from o_proj import make_prefill_tp_output_all_reduce
+from prefill_attn_c2a import prefill_attn_c2a_full, prefill_attn_c2a_reuse
+from prefill_attn_c1a import (
+    make_prefill_attn_c1a_reindex,
+    prefill_attn_c1a_reindex,
+    prefill_attn_c1a_reuse,
+)
+from prefill_c1a_indexer import make_paged_indexer
 from quant import build_mxfp4_pair_lut
 from rmsnorm import rms_norm_tiled
 
@@ -124,159 +133,139 @@ B32 = pl.dynamic("PREFILL_FP32_VALUES")
 ROPE_DIM = M.qk_rope_head_dim
 
 
-def make_prefill_attention():
-    """Compose existing attention leaves for the resident CED graph.
 
-    Modes are SWA, C2A full/reuse, and C1A initial-index/reindex/reuse (0–5).
-    The C1A source cache is published separately over all encoder rows before
-    the decoder consumes its bounded replay rows. Imports stay inside this
-    factory because the C1A leaves themselves use this module's cache kernels.
-    """
-    from prefill_attn_swa import make_prefill_attn_swa
-    from o_proj import make_prefill_tp_output_all_reduce
-    from prefill_attn_c2a import prefill_attn_c2a_full, prefill_attn_c2a_reuse
-    from prefill_attn_c1a import (
-        make_prefill_attn_c1a_reindex,
-        prefill_attn_c1a_reindex,
-        prefill_attn_c1a_reuse,
-    )
-    from prefill_c1a_indexer import make_paged_indexer
-
-    prefill_attn_swa = make_prefill_attn_swa(
-        capacity=PREFILL_MAX_TOKENS, reducer=make_prefill_tp_output_all_reduce(PREFILL_MAX_TOKENS),
-    )
-    initial_index = make_prefill_attn_c1a_reindex(make_paged_indexer(use_candidates=False))
-
-    @pl.jit.inline(auto_scope=False)
-    def prefill_attention(
-        x: pl.Tensor[[T_DYN, D], pl.BF16],
-        wq_a: pl.Tensor[[D, Q_LORA], pl.FP8E4M3FN],
-        wq_a_scale: pl.Tensor[[D // 32, Q_LORA], pl.FP8E8M0, pl.MX_B_NN],
-        q_norm_weight: pl.Tensor[[Q_LORA], pl.BF16],
-        wq_b: pl.Tensor[[Q_LORA, LOCAL_H * HEAD_DIM], pl.FP8E4M3FN],
-        wq_b_scale: pl.Tensor[[Q_LORA // 32, LOCAL_H * HEAD_DIM], pl.FP8E8M0, pl.MX_B_NN],
-        wkv: pl.Tensor[[D, HEAD_DIM], pl.FP8E4M3FN],
-        wkv_scale: pl.Tensor[[D // 32, HEAD_DIM], pl.FP8E8M0, pl.MX_B_NN],
-        kv_norm_weight: pl.Tensor[[HEAD_DIM], pl.BF16],
-        attn_sink: pl.Tensor[[LOCAL_H], pl.FP32],
-        wo_a: pl.Tensor[[LOCAL_O_GROUPS, O_LORA, O_GROUP_IN], pl.BF16],
-        wo_b: pl.Tensor[[LOCAL_O_WIDTH, D], pl.FP8E4M3FN],
-        wo_b_scale: pl.Tensor[[LOCAL_O_WIDTH // 32, D], pl.FP8E8M0, pl.MX_B_NN],
-        rope_cos: pl.Tensor[[T_DYN, ROPE_DIM // 2], pl.FP32],
-        rope_sin: pl.Tensor[[T_DYN, ROPE_DIM // 2], pl.FP32],
-        window_slots: pl.Tensor[[T_DYN], pl.INT64],
-        window_indices: pl.Tensor[[T_DYN, 128], pl.INT32],
-        window_cache: pl.Tensor[[ORI_BLOCKS_DYN, 128, 1, HEAD_DIM], pl.FP8E4M3FN],
-        window_cache_scale: pl.Tensor[[ORI_BLOCKS_DYN, 128, 1, HEAD_DIM // WINDOW_CACHE_GROUP], pl.BF16],
-        compressed_cache: pl.Tensor[[CMP_BLOCKS_DYN, 128, 1, HEAD_DIM // 2], pl.UINT8],
-        compressed_cache_scale: pl.Tensor[
-            [CMP_BLOCKS_DYN, 128, 1, HEAD_DIM // COMPRESSED_CACHE_GROUP], pl.BF16
-        ],
-        token_to_req_indices: pl.Tensor[[T_DYN], pl.INT32],
-        compressed_lens: pl.Tensor[[T_DYN], pl.INT32],
-        index_cache: pl.Tensor[[INDEX_BLOCKS_DYN, 128, 1, INDEX_DIM // 2], pl.UINT8],
-        index_cache_scale: pl.Tensor[
-            [INDEX_BLOCKS_DYN, 128, 1, INDEX_DIM // INDEX_CACHE_GROUP], pl.FP8E8M0
-        ],
-        index_block_table: pl.Tensor[[B_DYN, TABLE_DYN], pl.INT32],
-        position_ids: pl.Tensor[[T_DYN], pl.INT32],
-        compressed_rope_cos: pl.Tensor[[T_DYN, ROPE_DIM // 2], pl.FP32],
-        compressed_rope_sin: pl.Tensor[[T_DYN, ROPE_DIM // 2], pl.FP32],
-        compressor_wkv: pl.Tensor[[D, HEAD_DIM], pl.FP32],
-        compressor_wgate: pl.Tensor[[D, HEAD_DIM], pl.FP32],
-        query_start_loc: pl.Tensor[[Q_START_DYN], pl.INT32],
-        state_block_table: pl.Tensor[[B_DYN, 1], pl.INT32],
-        state_cache: pl.Tensor[[STATE_BLOCKS_DYN, STATE_CAPACITY, STATE_WIDTH], pl.FP32],
-        compressor_norm_weight: pl.Tensor[[HEAD_DIM], pl.BF16],
-        compressed_slots: pl.Tensor[[T_DYN], pl.INT64],
-        index_wk: pl.Tensor[[HEAD_DIM, INDEX_DIM], pl.BF16],
-        index_norm_weight: pl.Tensor[[INDEX_DIM], pl.BF16],
-        index_wq_b: pl.Tensor[[Q_LORA, INDEX_H * INDEX_DIM], pl.FP8E4M3FN],
-        index_wq_b_scale: pl.Tensor[[Q_LORA // 32, INDEX_H * INDEX_DIM], pl.FP8E8M0, pl.MX_B_NN],
-        index_weights_proj: pl.Tensor[[D, INDEX_H], pl.BF16],
-        candidate_mask: pl.Tensor[[T_DYN, CMP_POSITIONS_DYN], pl.UINT8],
-        topk_indices: pl.Tensor[[T_DYN, INDEX_TOPK], pl.INT32],
-        output_window: pld.DistributedTensor[[PREFILL_MAX_TOKENS, D], pl.FP32],
-        output_arrived: pld.DistributedTensor[[TP_SIZE, 1], pl.INT32],
-        output: pl.Tensor[[T_DYN, D], pl.BF16],
-        group_base: pl.Scalar[pl.INT32],
-        tp_rank: pl.Scalar[pl.INT32],
-        num_tokens: pl.Scalar[pl.INT32],
-        attention_epoch: pl.Scalar[pl.INT32],
-        mode: pl.Scalar[pl.INT32],
-    ):
-        if mode == 0:
-            prefill_attn_swa(
-                x, wq_a, wq_a_scale, q_norm_weight, wq_b,
-                wq_b_scale, wkv, wkv_scale, kv_norm_weight, attn_sink,
-                wo_a, wo_b, wo_b_scale, rope_cos, rope_sin,
-                window_slots, window_indices, window_cache, window_cache_scale, output_window,
-                output_arrived, output, group_base, tp_rank, num_tokens,
-                attention_epoch,
-            )
-        elif mode == 1:
-            prefill_attn_c2a_full(
-                x, wq_a, wq_a_scale, q_norm_weight, wq_b,
-                wq_b_scale, wkv, wkv_scale, kv_norm_weight, attn_sink,
-                wo_a, wo_b, wo_b_scale, rope_cos, rope_sin,
-                window_slots, window_indices, window_cache, window_cache_scale, compressed_cache,
-                compressed_cache_scale, token_to_req_indices, compressed_lens, index_cache, index_cache_scale,
-                index_block_table, position_ids, compressed_rope_cos, compressed_rope_sin, compressor_wkv,
-                compressor_wgate, query_start_loc, state_block_table, state_cache, compressor_norm_weight,
-                compressed_slots, index_wk, index_norm_weight, index_wq_b, index_wq_b_scale,
-                index_weights_proj, topk_indices, output_window, output_arrived, output,
-                group_base, tp_rank, num_tokens, attention_epoch,
-            )
-        elif mode == 2:
-            prefill_attn_c2a_reuse(
-                x, wq_a, wq_a_scale, q_norm_weight, wq_b,
-                wq_b_scale, wkv, wkv_scale, kv_norm_weight, attn_sink,
-                wo_a, wo_b, wo_b_scale, rope_cos, rope_sin,
-                window_slots, window_indices, window_cache, window_cache_scale, compressed_cache,
-                compressed_cache_scale, topk_indices, output_window, output_arrived, output,
-                group_base, tp_rank, num_tokens, attention_epoch,
-            )
-        elif mode == 3:
-            initial_index(
-                x, wq_a, wq_a_scale, q_norm_weight, wq_b,
-                wq_b_scale, wkv, wkv_scale, kv_norm_weight, attn_sink,
-                wo_a, wo_b, wo_b_scale, rope_cos, rope_sin,
-                window_slots, window_indices, window_cache, window_cache_scale, compressed_cache,
-                compressed_cache_scale, token_to_req_indices, compressed_lens, index_cache, index_cache_scale,
-                index_block_table, candidate_mask, index_wq_b, index_wq_b_scale, index_weights_proj,
-                topk_indices, output_window, output_arrived, output, group_base,
-                tp_rank, num_tokens, attention_epoch,
-            )
-        elif mode == 4:
-            prefill_attn_c1a_reindex(
-                x, wq_a, wq_a_scale, q_norm_weight, wq_b,
-                wq_b_scale, wkv, wkv_scale, kv_norm_weight, attn_sink,
-                wo_a, wo_b, wo_b_scale, rope_cos, rope_sin,
-                window_slots, window_indices, window_cache, window_cache_scale, compressed_cache,
-                compressed_cache_scale, token_to_req_indices, compressed_lens, index_cache, index_cache_scale,
-                index_block_table, candidate_mask, index_wq_b, index_wq_b_scale, index_weights_proj,
-                topk_indices, output_window, output_arrived, output, group_base,
-                tp_rank, num_tokens, attention_epoch,
-            )
-        elif mode == 5:
-            prefill_attn_c1a_reuse(
-                x, wq_a, wq_a_scale, q_norm_weight, wq_b,
-                wq_b_scale, wkv, wkv_scale, kv_norm_weight, attn_sink,
-                wo_a, wo_b, wo_b_scale, rope_cos, rope_sin,
-                window_slots, window_indices, window_cache, window_cache_scale, compressed_cache,
-                compressed_cache_scale, topk_indices, output_window, output_arrived, output,
-                group_base, tp_rank, num_tokens, attention_epoch,
-            )
-        return output
-
-    return prefill_attention
+prefill_attn_swa = make_prefill_attn_swa(
+    capacity=PREFILL_MAX_TOKENS, reducer=make_prefill_tp_output_all_reduce(PREFILL_MAX_TOKENS),
+)
+initial_index = make_prefill_attn_c1a_reindex(make_paged_indexer(use_candidates=False))
 
 
-attention = make_prefill_attention()
-publish_decoder = make_prefill_publish_decoder()
+@pl.jit.inline(auto_scope=False)
+def prefill_attention(
+    x: pl.Tensor[[T_DYN, D], pl.BF16],
+    wq_a: pl.Tensor[[D, Q_LORA], pl.FP8E4M3FN],
+    wq_a_scale: pl.Tensor[[D // 32, Q_LORA], pl.FP8E8M0, pl.MX_B_NN],
+    q_norm_weight: pl.Tensor[[Q_LORA], pl.BF16],
+    wq_b: pl.Tensor[[Q_LORA, LOCAL_H * HEAD_DIM], pl.FP8E4M3FN],
+    wq_b_scale: pl.Tensor[[Q_LORA // 32, LOCAL_H * HEAD_DIM], pl.FP8E8M0, pl.MX_B_NN],
+    wkv: pl.Tensor[[D, HEAD_DIM], pl.FP8E4M3FN],
+    wkv_scale: pl.Tensor[[D // 32, HEAD_DIM], pl.FP8E8M0, pl.MX_B_NN],
+    kv_norm_weight: pl.Tensor[[HEAD_DIM], pl.BF16],
+    attn_sink: pl.Tensor[[LOCAL_H], pl.FP32],
+    wo_a: pl.Tensor[[LOCAL_O_GROUPS, O_LORA, O_GROUP_IN], pl.BF16],
+    wo_b: pl.Tensor[[LOCAL_O_WIDTH, D], pl.FP8E4M3FN],
+    wo_b_scale: pl.Tensor[[LOCAL_O_WIDTH // 32, D], pl.FP8E8M0, pl.MX_B_NN],
+    rope_cos: pl.Tensor[[T_DYN, ROPE_DIM // 2], pl.FP32],
+    rope_sin: pl.Tensor[[T_DYN, ROPE_DIM // 2], pl.FP32],
+    window_slots: pl.Tensor[[T_DYN], pl.INT64],
+    window_indices: pl.Tensor[[T_DYN, 128], pl.INT32],
+    window_cache: pl.Tensor[[ORI_BLOCKS_DYN, 128, 1, HEAD_DIM], pl.FP8E4M3FN],
+    window_cache_scale: pl.Tensor[[ORI_BLOCKS_DYN, 128, 1, HEAD_DIM // WINDOW_CACHE_GROUP], pl.BF16],
+    compressed_cache: pl.Tensor[[CMP_BLOCKS_DYN, 128, 1, HEAD_DIM // 2], pl.UINT8],
+    compressed_cache_scale: pl.Tensor[
+        [CMP_BLOCKS_DYN, 128, 1, HEAD_DIM // COMPRESSED_CACHE_GROUP], pl.BF16
+    ],
+    token_to_req_indices: pl.Tensor[[T_DYN], pl.INT32],
+    compressed_lens: pl.Tensor[[T_DYN], pl.INT32],
+    index_cache: pl.Tensor[[INDEX_BLOCKS_DYN, 128, 1, INDEX_DIM // 2], pl.UINT8],
+    index_cache_scale: pl.Tensor[
+        [INDEX_BLOCKS_DYN, 128, 1, INDEX_DIM // INDEX_CACHE_GROUP], pl.FP8E8M0
+    ],
+    index_block_table: pl.Tensor[[B_DYN, TABLE_DYN], pl.INT32],
+    position_ids: pl.Tensor[[T_DYN], pl.INT32],
+    compressed_rope_cos: pl.Tensor[[T_DYN, ROPE_DIM // 2], pl.FP32],
+    compressed_rope_sin: pl.Tensor[[T_DYN, ROPE_DIM // 2], pl.FP32],
+    compressor_wkv: pl.Tensor[[D, HEAD_DIM], pl.FP32],
+    compressor_wgate: pl.Tensor[[D, HEAD_DIM], pl.FP32],
+    query_start_loc: pl.Tensor[[Q_START_DYN], pl.INT32],
+    state_block_table: pl.Tensor[[B_DYN, 1], pl.INT32],
+    state_cache: pl.Tensor[[STATE_BLOCKS_DYN, STATE_CAPACITY, STATE_WIDTH], pl.FP32],
+    compressor_norm_weight: pl.Tensor[[HEAD_DIM], pl.BF16],
+    compressed_slots: pl.Tensor[[T_DYN], pl.INT64],
+    index_wk: pl.Tensor[[HEAD_DIM, INDEX_DIM], pl.BF16],
+    index_norm_weight: pl.Tensor[[INDEX_DIM], pl.BF16],
+    index_wq_b: pl.Tensor[[Q_LORA, INDEX_H * INDEX_DIM], pl.FP8E4M3FN],
+    index_wq_b_scale: pl.Tensor[[Q_LORA // 32, INDEX_H * INDEX_DIM], pl.FP8E8M0, pl.MX_B_NN],
+    index_weights_proj: pl.Tensor[[D, INDEX_H], pl.BF16],
+    candidate_mask: pl.Tensor[[T_DYN, CMP_POSITIONS_DYN], pl.UINT8],
+    topk_indices: pl.Tensor[[T_DYN, INDEX_TOPK], pl.INT32],
+    output_window: pld.DistributedTensor[[PREFILL_MAX_TOKENS, D], pl.FP32],
+    output_arrived: pld.DistributedTensor[[TP_SIZE, 1], pl.INT32],
+    output: pl.Tensor[[T_DYN, D], pl.BF16],
+    group_base: pl.Scalar[pl.INT32],
+    tp_rank: pl.Scalar[pl.INT32],
+    num_tokens: pl.Scalar[pl.INT32],
+    attention_epoch: pl.Scalar[pl.INT32],
+    mode: pl.Scalar[pl.INT32],
+):
+    if mode == 0:
+        prefill_attn_swa(
+            x, wq_a, wq_a_scale, q_norm_weight, wq_b,
+            wq_b_scale, wkv, wkv_scale, kv_norm_weight, attn_sink,
+            wo_a, wo_b, wo_b_scale, rope_cos, rope_sin,
+            window_slots, window_indices, window_cache, window_cache_scale, output_window,
+            output_arrived, output, group_base, tp_rank, num_tokens,
+            attention_epoch,
+        )
+    elif mode == 1:
+        prefill_attn_c2a_full(
+            x, wq_a, wq_a_scale, q_norm_weight, wq_b,
+            wq_b_scale, wkv, wkv_scale, kv_norm_weight, attn_sink,
+            wo_a, wo_b, wo_b_scale, rope_cos, rope_sin,
+            window_slots, window_indices, window_cache, window_cache_scale, compressed_cache,
+            compressed_cache_scale, token_to_req_indices, compressed_lens, index_cache, index_cache_scale,
+            index_block_table, position_ids, compressed_rope_cos, compressed_rope_sin, compressor_wkv,
+            compressor_wgate, query_start_loc, state_block_table, state_cache, compressor_norm_weight,
+            compressed_slots, index_wk, index_norm_weight, index_wq_b, index_wq_b_scale,
+            index_weights_proj, topk_indices, output_window, output_arrived, output,
+            group_base, tp_rank, num_tokens, attention_epoch,
+        )
+    elif mode == 2:
+        prefill_attn_c2a_reuse(
+            x, wq_a, wq_a_scale, q_norm_weight, wq_b,
+            wq_b_scale, wkv, wkv_scale, kv_norm_weight, attn_sink,
+            wo_a, wo_b, wo_b_scale, rope_cos, rope_sin,
+            window_slots, window_indices, window_cache, window_cache_scale, compressed_cache,
+            compressed_cache_scale, topk_indices, output_window, output_arrived, output,
+            group_base, tp_rank, num_tokens, attention_epoch,
+        )
+    elif mode == 3:
+        initial_index(
+            x, wq_a, wq_a_scale, q_norm_weight, wq_b,
+            wq_b_scale, wkv, wkv_scale, kv_norm_weight, attn_sink,
+            wo_a, wo_b, wo_b_scale, rope_cos, rope_sin,
+            window_slots, window_indices, window_cache, window_cache_scale, compressed_cache,
+            compressed_cache_scale, token_to_req_indices, compressed_lens, index_cache, index_cache_scale,
+            index_block_table, candidate_mask, index_wq_b, index_wq_b_scale, index_weights_proj,
+            topk_indices, output_window, output_arrived, output, group_base,
+            tp_rank, num_tokens, attention_epoch,
+        )
+    elif mode == 4:
+        prefill_attn_c1a_reindex(
+            x, wq_a, wq_a_scale, q_norm_weight, wq_b,
+            wq_b_scale, wkv, wkv_scale, kv_norm_weight, attn_sink,
+            wo_a, wo_b, wo_b_scale, rope_cos, rope_sin,
+            window_slots, window_indices, window_cache, window_cache_scale, compressed_cache,
+            compressed_cache_scale, token_to_req_indices, compressed_lens, index_cache, index_cache_scale,
+            index_block_table, candidate_mask, index_wq_b, index_wq_b_scale, index_weights_proj,
+            topk_indices, output_window, output_arrived, output, group_base,
+            tp_rank, num_tokens, attention_epoch,
+        )
+    elif mode == 5:
+        prefill_attn_c1a_reuse(
+            x, wq_a, wq_a_scale, q_norm_weight, wq_b,
+            wq_b_scale, wkv, wkv_scale, kv_norm_weight, attn_sink,
+            wo_a, wo_b, wo_b_scale, rope_cos, rope_sin,
+            window_slots, window_indices, window_cache, window_cache_scale, compressed_cache,
+            compressed_cache_scale, topk_indices, output_window, output_arrived, output,
+            group_base, tp_rank, num_tokens, attention_epoch,
+        )
+    return output
+
+
 
 @pl.jit(auto_scope=False)
-def prefill_fwd(
+def l2_prefill_fwd(
     embedding: pl.Tensor[[CAPACITY, D], pl.BF16],
     embedding_ids: pl.Tensor[[CAPACITY], pl.INT64],
     initial_pre: pl.Tensor[[CAPACITY, HC_MULT], pl.FP32],
@@ -510,7 +499,7 @@ def prefill_fwd(
                 norm_tokens = pl.tensor.dim(encoder_collapsed, 0)
                 for norm_block in pl.spmd((norm_tokens + 7) // 8, name_hint="rms_norm"):
                     rms_norm_tiled(encoder_collapsed, attn_norm, encoder_normalized, norm_block, norm_tokens)
-                publisher_ready = publish_decoder(
+                publisher_ready = prefill_publish_decoder(
                     encoder_normalized, publisher_wkv, compressor_norm, index_wk, index_norm,
                     publisher_cos, publisher_sin, publisher_slots,
                     compressed_cache[3], compressed_scales[3], index_cache[3], index_scales[3],
@@ -550,7 +539,7 @@ def prefill_fwd(
                 if (layer - 2) % 6 == 0:
                     mode = 1
             state_slot = pl.min(cache_slot, 2)
-            attention(
+            prefill_attention(
                 normalized, wq_a, wq_a_scale, q_norm, wq_b, wq_b_scale, wkv, wkv_scale, kv_norm,
                 attn_sink, wo_a, wo_b, wo_b_scale, rope_cos[rope_slot], rope_sin[rope_slot],
                 window_slots[stage], window_indices[stage], window_cache[layer], window_scales[layer],
@@ -666,7 +655,7 @@ def l3_prefill_fwd(
         head_hidden_done = pld.window(head_hidden_done_buffer, [TP_SIZE, 1], dtype=pl.INT32)
         head_logits = pld.window(head_logits_buffer, [16, VOCAB], dtype=pl.FP32)
         head_logits_done = pld.window(head_logits_done_buffer, [TP_SIZE, 1], dtype=pl.INT32)
-        prefill_fwd(
+        l2_prefill_fwd(
             embedding[rank],
             embedding_ids[rank],
             initial_pre[rank],
@@ -1029,7 +1018,10 @@ if __name__ == "__main__":
             options.report.write_text(json.dumps(report, indent=2, ensure_ascii=False) + "\n")
         print("CED_GENERATION_COMPLETE", json.dumps(report, ensure_ascii=False), flush=True)
     else:
-        from utils import run_forward_smoke
+        from utils import upload_forward_inputs
+        from golden import run
+        from pypto.ir.distributed_compiled_program import DistributedCompiledProgram
+        from pypto.runtime import RunConfig
 
         parser = argparse.ArgumentParser(description=__doc__)
         parser.add_argument("-p", "--platform", default="a5", choices=["a5"])
@@ -1049,19 +1041,29 @@ if __name__ == "__main__":
         devices = [int(device) for device in args.device.split(",") if device]
         if len(devices) != RANKS or len(set(devices)) != RANKS:
             parser.error(f"need exactly {RANKS} distinct devices, got {devices}")
-        result = run_forward_smoke(
-            fn=l3_prefill_fwd,
-            specs=build_tensor_specs(),
-            compile_only=args.compile_only,
-            config=dict(
-                platform=args.platform,
-                dump_passes=args.dump_passes,
-                enable_scope_stats=args.enable_scope_stats,
-                log_level=args.log_level,
-                ring_heap=(2 * 1024**3,) * 4,
-                ring_dep_pool=131072,
-                distributed_config=DistributedConfig(device_ids=devices, num_sub_workers=0),
-            ),
+        specs = build_tensor_specs()
+        config = dict(
+            platform=args.platform,
+            dump_passes=args.dump_passes,
+            enable_scope_stats=args.enable_scope_stats,
+            log_level=args.log_level,
+            ring_heap=(2 * 1024**3,) * 4,
+            ring_dep_pool=131072,
+            distributed_config=DistributedConfig(device_ids=devices, num_sub_workers=0),
         )
+        result = run(
+            fn=l3_prefill_fwd,
+            specs=specs,
+            config=config,
+            compile_only=True,
+        )
+        if result.passed and not args.compile_only:
+            cfg = RunConfig(**{name: value for name, value in config.items() if name != "log_level"})
+            compiled = DistributedCompiledProgram.from_dir(result.work_dir, platform=cfg.platform)
+            host_inputs = {}
+            with compiled.prepare(cfg, persistent=False, inherited_host_tensors=list(host_inputs.values())) as runtime:
+                arguments = upload_forward_inputs(runtime, specs, compiled._get_metadata()[0], len(devices), host_inputs)
+                runtime(*arguments, config=cfg)
+            print("[FWD] Execution passed; numerical accuracy was not validated.", flush=True)
         if not result.passed:
             raise SystemExit(result.error or 1)

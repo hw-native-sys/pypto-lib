@@ -8,7 +8,6 @@
 # -----------------------------------------------------------------------------------------------------------
 """First-level candidate-block selection for the decoder hierarchical sparse indexer."""
 
-from collections.abc import Callable
 
 import pypto.language as pl
 import torch
@@ -455,14 +454,10 @@ def hierarchical_sparse_indexer(
     return candidate_mask
 
 
-def run_hierarchical_indexer_golden(golden_fn: Callable[..., torch.Tensor]) -> None:
+if __name__ == "__main__":
     width = 2050 * 8
     scores = -torch.arange(width, dtype=torch.float32).reshape(1, width)
-    candidate_mask = golden_fn(scores, torch.tensor([width]))
+    candidate_mask = golden_hierarchical_sparse_indexer(scores, torch.tensor([width]))
     if not bool(candidate_mask[..., -8:].all()) or int(candidate_mask.sum()) > 2048 * 8:
         raise RuntimeError("candidate selector did not pin the newest partial block")
-    print(f"[GOLDEN] PASS {golden_fn.__name__} output={tuple(candidate_mask.shape)}")
-
-
-if __name__ == "__main__":
-    run_hierarchical_indexer_golden(golden_hierarchical_sparse_indexer)
+    print(f"[GOLDEN] PASS {golden_hierarchical_sparse_indexer.__name__} output={tuple(candidate_mask.shape)}")

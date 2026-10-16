@@ -40,10 +40,9 @@ from utils import AttentionGoldenResult, window_metadata
 from pathlib import Path
 
 import pypto.language as pl
-import pypto.language.distributed as pld
 
 from config import (
-    FLASH as M, CMP_BLOCKS_DYN, INDEX_CACHE_GROUP, MAX_BATCH_PER_DP, ORI_BLOCKS_DYN, T_DYN, TP_SIZE, WINDOW_CACHE_GROUP,
+    FLASH as M, CMP_BLOCKS_DYN, INDEX_CACHE_GROUP, MAX_BATCH_PER_DP, ORI_BLOCKS_DYN, T_DYN, TP_SIZE,
 )
 
 # Dynamic shape variables.
@@ -781,7 +780,7 @@ def swa_attention_packed(
 
 
 @pl.jit(auto_scope=False)
-def swa_attention_test(
+def l2_sparse_attention_swa(
     query: pl.Tensor[[T_DYN, LOCAL_H * HEAD_DIM], pl.BF16],
     cache: pl.Tensor[[ORI_BLOCKS_DYN, 128, 1, HEAD_DIM], pl.FP8E4M3FN],
     scales: pl.Tensor[[ORI_BLOCKS_DYN, 128, 1, SWA_GROUPS], pl.BF16],
@@ -795,7 +794,7 @@ def swa_attention_test(
 
 
 @pl.jit(auto_scope=False)
-def swa_attention_packed_test(
+def l2_sparse_attention_swa_packed(
     query: pl.Tensor[[T_DYN, LOCAL_H * HEAD_DIM], pl.BF16],
     cache: pl.Tensor[[ORI_BLOCKS_DYN, 128, 1, SWA_PACKED_ROW_BYTES], pl.UINT8],
     indices: pl.Tensor[[T_DYN, SWA_WINDOW], pl.INT32],
@@ -805,96 +804,6 @@ def swa_attention_packed_test(
 ):
     output = swa_attention_packed(query, cache, indices, sink, output, num_tokens)
     return output
-
-
-def make_swa_program(operator, capacity, world_size, epochs):
-    """Dispatch TP-sharded SWA with persistent communication epochs."""
-    @pl.jit
-    def swa_rank(
-        x: pl.Tensor[[T_DYN, D], pl.BF16],
-        wq_a: pl.Tensor[[D, Q_LORA], pl.FP8E4M3FN],
-        wq_a_scale: pl.Tensor[[D // 32, Q_LORA], pl.FP8E8M0, pl.MX_B_NN],
-        q_norm_weight: pl.Tensor[[Q_LORA], pl.BF16],
-        wq_b: pl.Tensor[[Q_LORA, LOCAL_H * HEAD_DIM], pl.FP8E4M3FN],
-        wq_b_scale: pl.Tensor[[Q_LORA // 32, LOCAL_H * HEAD_DIM], pl.FP8E8M0, pl.MX_B_NN],
-        wkv: pl.Tensor[[D, HEAD_DIM], pl.FP8E4M3FN],
-        wkv_scale: pl.Tensor[[D // 32, HEAD_DIM], pl.FP8E8M0, pl.MX_B_NN],
-        kv_norm_weight: pl.Tensor[[HEAD_DIM], pl.BF16],
-        attn_sink: pl.Tensor[[LOCAL_H], pl.FP32],
-        wo_a: pl.Tensor[[LOCAL_O_GROUPS, O_LORA, O_GROUP_IN], pl.BF16],
-        wo_b: pl.Tensor[[LOCAL_O_WIDTH, D], pl.FP8E4M3FN],
-        wo_b_scale: pl.Tensor[[LOCAL_O_WIDTH // 32, D], pl.FP8E8M0, pl.MX_B_NN],
-        rope_cos: pl.Tensor[[T_DYN, ROPE_DIM // 2], pl.FP32],
-        rope_sin: pl.Tensor[[T_DYN, ROPE_DIM // 2], pl.FP32],
-        window_slots: pl.Tensor[[T_DYN], pl.INT64],
-        window_indices: pl.Tensor[[T_DYN, 128], pl.INT32],
-        window_cache: pl.InOut[pl.Tensor[[ORI_BLOCKS_DYN, 128, 1, HEAD_DIM], pl.FP8E4M3FN]],
-        window_cache_scale: pl.InOut[pl.Tensor[[ORI_BLOCKS_DYN, 128, 1, HEAD_DIM // WINDOW_CACHE_GROUP], pl.BF16]],
-        output: pl.Out[pl.Tensor[[T_DYN, D], pl.BF16]],
-        output_window: pld.DistributedTensor[[capacity, D], pl.FP32],
-        output_arrived: pld.DistributedTensor[[TP_SIZE, 1], pl.INT32],
-        rank: pl.Scalar[pl.INT32],
-        num_tokens: pl.Scalar[pl.INT32],
-        attention_epoch: pl.Scalar[pl.INT32],
-    ):
-        x.bind_dynamic(0, T_DYN)
-        window_cache.bind_dynamic(0, ORI_BLOCKS_DYN)
-        for step in pl.range(epochs):
-            operator(
-                x, wq_a, wq_a_scale, q_norm_weight, wq_b, wq_b_scale,
-                wkv, wkv_scale, kv_norm_weight, attn_sink, wo_a, wo_b, wo_b_scale,
-                rope_cos, rope_sin, window_slots, window_indices, window_cache, window_cache_scale,
-                output_window, output_arrived, output,
-                rank // TP_SIZE * TP_SIZE, rank % TP_SIZE, num_tokens, attention_epoch + step,
-            )
-        return output, window_cache, window_cache_scale
-
-    @pl.jit.host
-    def swa_group(
-        x: pl.Tensor[[world_size, T_DYN, D], pl.BF16],
-        wq_a: pl.Tensor[[world_size, D, Q_LORA], pl.FP8E4M3FN],
-        wq_a_scale: pl.Tensor[[world_size, D // 32, Q_LORA], pl.FP8E8M0],
-        q_norm_weight: pl.Tensor[[world_size, Q_LORA], pl.BF16],
-        wq_b: pl.Tensor[[world_size, Q_LORA, LOCAL_H * HEAD_DIM], pl.FP8E4M3FN],
-        wq_b_scale: pl.Tensor[[world_size, Q_LORA // 32, LOCAL_H * HEAD_DIM], pl.FP8E8M0],
-        wkv: pl.Tensor[[world_size, D, HEAD_DIM], pl.FP8E4M3FN],
-        wkv_scale: pl.Tensor[[world_size, D // 32, HEAD_DIM], pl.FP8E8M0],
-        kv_norm_weight: pl.Tensor[[world_size, HEAD_DIM], pl.BF16],
-        attn_sink: pl.Tensor[[world_size, LOCAL_H], pl.FP32],
-        wo_a: pl.Tensor[[world_size, LOCAL_O_GROUPS, O_LORA, O_GROUP_IN], pl.BF16],
-        wo_b: pl.Tensor[[world_size, LOCAL_O_WIDTH, D], pl.FP8E4M3FN],
-        wo_b_scale: pl.Tensor[[world_size, LOCAL_O_WIDTH // 32, D], pl.FP8E8M0],
-        rope_cos: pl.Tensor[[world_size, T_DYN, ROPE_DIM // 2], pl.FP32],
-        rope_sin: pl.Tensor[[world_size, T_DYN, ROPE_DIM // 2], pl.FP32],
-        window_slots: pl.Tensor[[world_size, T_DYN], pl.INT64],
-        window_indices: pl.Tensor[[world_size, T_DYN, 128], pl.INT32],
-        window_cache: pl.InOut[pl.Tensor[[world_size, ORI_BLOCKS_DYN, 128, 1, HEAD_DIM], pl.FP8E4M3FN]],
-        window_cache_scale: pl.InOut[pl.Tensor[[world_size, ORI_BLOCKS_DYN, 128, 1, HEAD_DIM // WINDOW_CACHE_GROUP], pl.BF16]],
-        output: pl.Out[pl.Tensor[[world_size, T_DYN, D], pl.BF16]],
-        num_tokens: pl.Scalar[pl.INT32],
-        attention_epoch: pl.Scalar[pl.INT32],
-    ):
-        x.bind_dynamic(1, T_DYN)
-        window_cache.bind_dynamic(1, ORI_BLOCKS_DYN)
-        data_buf = pld.alloc_window_buffer([capacity, D], dtype=pl.FP32)
-        signal_buf = pld.alloc_window_buffer([TP_SIZE, 1], dtype=pl.INT32)
-        for rank in pl.range(pld.world_size()):
-            data = pld.window(data_buf, [capacity, D], dtype=pl.FP32)
-            signal = pld.window(signal_buf, [TP_SIZE, 1], dtype=pl.INT32)
-            # The rank takes these scales as MX_B_NN; a bare slice is ND, so annotate it.
-            wq_a_scale_r: pl.Tensor[[D // 32, Q_LORA], pl.FP8E8M0, pl.MX_B_NN] = wq_a_scale[rank]
-            wq_b_scale_r: pl.Tensor[[Q_LORA // 32, LOCAL_H * HEAD_DIM], pl.FP8E8M0, pl.MX_B_NN] = wq_b_scale[rank]
-            wkv_scale_r: pl.Tensor[[D // 32, HEAD_DIM], pl.FP8E8M0, pl.MX_B_NN] = wkv_scale[rank]
-            wo_b_scale_r: pl.Tensor[[LOCAL_O_WIDTH // 32, D], pl.FP8E8M0, pl.MX_B_NN] = wo_b_scale[rank]
-            swa_rank(
-                x[rank], wq_a[rank], wq_a_scale_r, q_norm_weight[rank], wq_b[rank], wq_b_scale_r,
-                wkv[rank], wkv_scale_r, kv_norm_weight[rank], attn_sink[rank],
-                wo_a[rank], wo_b[rank], wo_b_scale_r, rope_cos[rank], rope_sin[rank],
-                window_slots[rank], window_indices[rank], window_cache[rank], window_cache_scale[rank],
-                output[rank], data, signal, rank, num_tokens, attention_epoch, device=rank,
-            )
-
-    return swa_group
 
 
 
@@ -1149,7 +1058,7 @@ def build_swa_leaf_specs(args, mode):
         TensorSpec(name, [world_size, *shape], dtype, init_value=lambda n=name: initialize(n), resident="stacked")
         for name, shape, dtype in zip(SWA_INPUT_NAMES, shapes, dtypes)
     ]
-    swa_benchmark_step = args.epochs if args.bench else None
+    swa_benchmark_step = 1 if args.bench else None
     specs += [
         TensorSpec("output", [world_size, args.tokens, D], bf, resident="stacked"),
         ScalarSpec("num_tokens", torch.int32, args.tokens),
@@ -2047,7 +1956,7 @@ def attend_bf16(
 
 
 @pl.jit(auto_scope=False)
-def sparse_mla(
+def l2_sparse_attention(
     query: pl.Tensor[[T_DYN, LOCAL_H * HEAD_DIM], pl.BF16],
     window_indices: pl.Tensor[[T_DYN, 128], pl.INT32],
     window: pl.Tensor[[ORI_BLOCKS_DYN, 128, 1, HEAD_DIM], pl.FP8E4M3FN],
@@ -2067,7 +1976,7 @@ def sparse_mla(
 
 
 @pl.jit(auto_scope=False)
-def sparse_mla_bf16(
+def l2_sparse_attention_bf16(
     query: pl.Tensor[[T_DYN, LOCAL_H, HEAD_DIM], pl.FP32],
     window: pl.Tensor[[ORI_BLOCKS_DYN, 128, HEAD_DIM], pl.FP32],
     window_indices: pl.Tensor[[T_DYN, 128], pl.INT32],
@@ -2191,7 +2100,7 @@ def validate_swa_core(args):
         layouts = (False, True)
     records = []
     for packed in layouts:
-        entry = swa_attention_packed_test if packed else swa_attention_test
+        entry = l2_sparse_attention_swa_packed if packed else l2_sparse_attention_swa
         mode = "swa-packed" if packed else "swa"
         for case in cases:
             inputs, reference = make_swa_case(case, packed)
@@ -2558,14 +2467,14 @@ if __name__ == "__main__":
                               compressed_indices=compressed_indices, compressed=cp, compressed_scale=cs, sink=sink)
                 reference = expected.flatten(1)
                 result_dtype = torch.bfloat16
-                entry = sparse_mla
+                entry = l2_sparse_attention
             else:
                 inputs = dict(query=query.float(), window=window.float().reshape(-1, 128, HEAD_DIM),
                               window_indices=window_indices, compressed=compressed.float().reshape(-1, 128, HEAD_DIM),
                               compressed_indices=compressed_indices, sink=sink, extents=extents)
                 reference = expected
                 result_dtype = torch.float32
-                entry = sparse_mla_bf16
+                entry = l2_sparse_attention_bf16
             specs = [TensorSpec(name, list(value.shape), value.dtype, init_value=value) for name, value in inputs.items()]
             specs.append(TensorSpec("output", list(reference.shape), result_dtype))
 

@@ -56,6 +56,13 @@ from utils import (
 )
 from rmsnorm import rms_norm_tiled
 
+from prefill_cp_allgather import prefill_sp_input_allgather
+from o_proj import prefill_sp_output_reduce_scatter
+from hc_post import prefill_sp_post
+from hc_pre import attention_hc_pre
+import prefill_attn_c1a as attn
+from config import SP_T_DYN
+
 
 # model config
 LOCAL_H = M.num_attention_heads // TP_SIZE
@@ -79,6 +86,235 @@ PREFILL_MAX_TOKENS = PREFILL_MAX_TOKENS
 PREFILL_ATTN_RING_HEAP = (1024 * 1024 * 1024,) * 4
 
 golden_prefill_c1a_reindex = golden_prefill_attn_c1a_reindex
+
+
+RANKS_DYN = pl.dynamic("RANKS_DYN")
+prefill_attn_c1a_reindex_sharded = attn.make_prefill_attn_c1a_reindex(attn.reindex_paged_indexer, prefill_sp_output_reduce_scatter, SP_T_DYN)
+
+
+@pl.jit
+def l2_prefill_c1a_reindex_sharded(
+    x_hc: pl.Tensor[[SP_T_DYN, HC_MULT, D], pl.FP32],
+    pre_mix: pl.Tensor[[SP_T_DYN, HC_MULT], pl.FP32],
+    hc_attn_fn: pl.Tensor[[MIX_HC, HC_DIM], pl.FP32],
+    hc_attn_scale: pl.Tensor[[3], pl.FP32],
+    hc_attn_base: pl.Tensor[[MIX_HC], pl.FP32],
+    attn_norm_weight: pl.Tensor[[D], pl.BF16],
+    wq_a: pl.Tensor[[D, Q_LORA], pl.FP8E4M3FN],
+    wq_a_scale: pl.Tensor[[D // 32, Q_LORA], pl.FP8E8M0, pl.MX_B_NN],
+    q_norm_weight: pl.Tensor[[Q_LORA], pl.BF16],
+    wq_b: pl.Tensor[[Q_LORA, LOCAL_H * HEAD_DIM], pl.FP8E4M3FN],
+    wq_b_scale: pl.Tensor[[Q_LORA // 32, LOCAL_H * HEAD_DIM], pl.FP8E8M0, pl.MX_B_NN],
+    wkv: pl.Tensor[[D, HEAD_DIM], pl.FP8E4M3FN],
+    wkv_scale: pl.Tensor[[D // 32, HEAD_DIM], pl.FP8E8M0, pl.MX_B_NN],
+    kv_norm_weight: pl.Tensor[[HEAD_DIM], pl.BF16],
+    attn_sink: pl.Tensor[[LOCAL_H], pl.FP32],
+    wo_a: pl.Tensor[[LOCAL_O_GROUPS, O_LORA, O_GROUP_IN], pl.BF16],
+    wo_b: pl.Tensor[[LOCAL_O_WIDTH, D], pl.FP8E4M3FN],
+    wo_b_scale: pl.Tensor[[LOCAL_O_WIDTH // 32, D], pl.FP8E8M0, pl.MX_B_NN],
+    rope_cos: pl.Tensor[[T_DYN, ROPE_DIM // 2], pl.FP32],
+    rope_sin: pl.Tensor[[T_DYN, ROPE_DIM // 2], pl.FP32],
+    window_slots: pl.Tensor[[T_DYN], pl.INT64],
+    window_indices: pl.Tensor[[T_DYN, 128], pl.INT32],
+    window_cache: pl.InOut[pl.Tensor[[ORI_BLOCKS_DYN, 128, 1, HEAD_DIM], pl.FP8E4M3FN]],
+    window_cache_scale: pl.InOut[pl.Tensor[[ORI_BLOCKS_DYN, 128, 1, HEAD_DIM // WINDOW_CACHE_GROUP], pl.BF16]],
+    compressed_cache: pl.InOut[pl.Tensor[[CMP_BLOCKS_DYN, 128, 1, HEAD_DIM // 2], pl.UINT8]],
+    compressed_cache_scale: pl.InOut[pl.Tensor[[CMP_BLOCKS_DYN, 128, 1, HEAD_DIM // COMPRESSED_CACHE_GROUP], pl.BF16]],
+    request_ids: pl.Tensor[[T_DYN], pl.INT32],
+    compressed_lens: pl.Tensor[[T_DYN], pl.INT32],
+    index_cache: pl.InOut[pl.Tensor[[INDEX_BLOCKS_DYN, 128, 1, INDEX_DIM // 2], pl.UINT8]],
+    index_cache_scale: pl.InOut[pl.Tensor[[INDEX_BLOCKS_DYN, 128, 1, INDEX_DIM // INDEX_CACHE_GROUP], pl.FP8E8M0]],
+    index_block_table: pl.Tensor[[B_DYN, TABLE_DYN], pl.INT32],
+    compressed_rope_cos: pl.Tensor[[T_DYN, ROPE_DIM // 2], pl.FP32],
+    compressed_rope_sin: pl.Tensor[[T_DYN, ROPE_DIM // 2], pl.FP32],
+    compressor_wkv: pl.Tensor[[D, HEAD_DIM], pl.BF16],
+    compressor_norm_weight: pl.Tensor[[HEAD_DIM], pl.BF16],
+    compressed_slots: pl.Tensor[[T_DYN], pl.INT64],
+    index_wk: pl.Tensor[[HEAD_DIM, INDEX_DIM], pl.BF16],
+    index_norm_weight: pl.Tensor[[INDEX_DIM], pl.BF16],
+    index_wq_b: pl.Tensor[[Q_LORA, INDEX_H * INDEX_DIM], pl.FP8E4M3FN],
+    index_wq_b_scale: pl.Tensor[[Q_LORA // 32, INDEX_H * INDEX_DIM], pl.FP8E8M0, pl.MX_B_NN],
+    index_weights_proj: pl.Tensor[[D, INDEX_H], pl.BF16],
+    topk_indices: pl.InOut[pl.Tensor[[T_DYN, INDEX_TOPK], pl.INT32]],
+    candidate_mask: pl.InOut[pl.Tensor[[T_DYN, CMP_POSITIONS_DYN], pl.UINT8]],
+    compressed_indices: pl.Tensor[[T_DYN, INDEX_TOPK], pl.INT32],
+    attn_input: pl.Out[pl.Tensor[[T_DYN, D], pl.BF16]],
+    attn_output: pl.Out[pl.Tensor[[SP_T_DYN, D], pl.BF16]],
+    next_pre_mix: pl.Out[pl.Tensor[[SP_T_DYN, HC_MULT], pl.FP32]],
+    x_hc_out: pl.Out[pl.Tensor[[SP_T_DYN, HC_MULT, D], pl.FP32]],
+    input_window: pld.DistributedTensor[[PREFILL_MAX_TOKENS, D], pl.BF16],
+    input_arrived: pld.DistributedTensor[[TP_SIZE, 1], pl.INT32],
+    output_window: pld.DistributedTensor[[PREFILL_MAX_TOKENS, D], pl.FP32],
+    output_arrived: pld.DistributedTensor[[TP_SIZE, 1], pl.INT32],
+    num_tokens: pl.Tensor[[1], pl.INT32],
+    rank: pl.Scalar[pl.INT32],
+    attention_epoch: pl.Scalar[pl.INT32],
+):
+    x_hc.bind_dynamic(0, SP_T_DYN)
+    pre_mix.bind_dynamic(0, SP_T_DYN)
+    rope_cos.bind_dynamic(0, T_DYN)
+    rope_sin.bind_dynamic(0, T_DYN)
+    window_slots.bind_dynamic(0, T_DYN)
+    window_indices.bind_dynamic(0, T_DYN)
+    window_cache.bind_dynamic(0, ORI_BLOCKS_DYN)
+    window_cache_scale.bind_dynamic(0, ORI_BLOCKS_DYN)
+    compressed_cache.bind_dynamic(0, CMP_BLOCKS_DYN)
+    compressed_cache_scale.bind_dynamic(0, CMP_BLOCKS_DYN)
+    request_ids.bind_dynamic(0, T_DYN)
+    compressed_lens.bind_dynamic(0, T_DYN)
+    index_cache.bind_dynamic(0, INDEX_BLOCKS_DYN)
+    index_cache_scale.bind_dynamic(0, INDEX_BLOCKS_DYN)
+    index_block_table.bind_dynamic(0, B_DYN)
+    index_block_table.bind_dynamic(1, TABLE_DYN)
+    compressed_rope_cos.bind_dynamic(0, T_DYN)
+    compressed_rope_sin.bind_dynamic(0, T_DYN)
+    compressed_slots.bind_dynamic(0, T_DYN)
+    topk_indices.bind_dynamic(0, T_DYN)
+    candidate_mask.bind_dynamic(0, T_DYN)
+    candidate_mask.bind_dynamic(1, CMP_POSITIONS_DYN)
+    compressed_indices.bind_dynamic(0, T_DYN)
+    attn_input.bind_dynamic(0, T_DYN)
+    attn_output.bind_dynamic(0, SP_T_DYN)
+    next_pre_mix.bind_dynamic(0, SP_T_DYN)
+    x_hc_out.bind_dynamic(0, SP_T_DYN)
+    active = pl.read(num_tokens, [0])
+    tokens = pl.tensor.dim(x_hc, 0)
+    group_tokens = pl.tensor.dim(attn_input, 0)
+    post_mix = pl.create_tensor([tokens, HC_MULT], dtype=pl.FP32)
+    residual_mix = pl.create_tensor([tokens, HC_MULT, HC_MULT], dtype=pl.FP32)
+    local_hidden = pl.create_tensor([tokens, D], dtype=pl.BF16)
+    attention_hc_pre(
+        x_hc, pre_mix, hc_attn_fn, hc_attn_scale, hc_attn_base, attn_norm_weight, next_pre_mix, post_mix,
+        residual_mix, local_hidden,
+    )
+    prefill_sp_input_allgather(
+        local_hidden, input_window, input_arrived, attn_input, rank // TP_SIZE * TP_SIZE, rank % TP_SIZE,
+        active, attention_epoch,
+    )
+    for row in pl.spmd(group_tokens, name_hint='c1a_sp_inactive_topk'):
+        if row >= active:
+            topk_indices[row:row + 1, :] = pl.full([1, INDEX_TOPK], dtype=pl.INT32, value=-1)
+    prefill_attn_c1a_reindex_sharded(
+        attn_input, wq_a, wq_a_scale, q_norm_weight, wq_b, wq_b_scale, wkv, wkv_scale, kv_norm_weight,
+        attn_sink, wo_a, wo_b, wo_b_scale, rope_cos, rope_sin, window_slots, window_indices, window_cache,
+        window_cache_scale, compressed_cache, compressed_cache_scale, request_ids, compressed_lens,
+        index_cache, index_cache_scale, index_block_table, candidate_mask, index_wq_b, index_wq_b_scale,
+        index_weights_proj, topk_indices, output_window, output_arrived, attn_output,
+        rank // TP_SIZE * TP_SIZE, rank % TP_SIZE, active, attention_epoch,
+    )
+    prefill_sp_post(attn_output, x_hc, post_mix, residual_mix, x_hc_out, next_pre_mix, rank % TP_SIZE, active)
+    return x_hc_out
+
+
+@pl.jit.host
+def l3_prefill_c1a_reindex_sharded(
+    x_hc: pl.Tensor[[RANKS_DYN, SP_T_DYN, HC_MULT, D], pl.FP32],
+    pre_mix: pl.Tensor[[RANKS_DYN, SP_T_DYN, HC_MULT], pl.FP32],
+    hc_attn_fn: pl.Tensor[[RANKS_DYN, MIX_HC, HC_DIM], pl.FP32],
+    hc_attn_scale: pl.Tensor[[RANKS_DYN, 3], pl.FP32],
+    hc_attn_base: pl.Tensor[[RANKS_DYN, MIX_HC], pl.FP32],
+    attn_norm_weight: pl.Tensor[[RANKS_DYN, D], pl.BF16],
+    wq_a: pl.Tensor[[RANKS_DYN, D, Q_LORA], pl.FP8E4M3FN],
+    wq_a_scale: pl.Tensor[[RANKS_DYN, D // 32, Q_LORA], pl.FP8E8M0],
+    q_norm_weight: pl.Tensor[[RANKS_DYN, Q_LORA], pl.BF16],
+    wq_b: pl.Tensor[[RANKS_DYN, Q_LORA, LOCAL_H * HEAD_DIM], pl.FP8E4M3FN],
+    wq_b_scale: pl.Tensor[[RANKS_DYN, Q_LORA // 32, LOCAL_H * HEAD_DIM], pl.FP8E8M0],
+    wkv: pl.Tensor[[RANKS_DYN, D, HEAD_DIM], pl.FP8E4M3FN],
+    wkv_scale: pl.Tensor[[RANKS_DYN, D // 32, HEAD_DIM], pl.FP8E8M0],
+    kv_norm_weight: pl.Tensor[[RANKS_DYN, HEAD_DIM], pl.BF16],
+    attn_sink: pl.Tensor[[RANKS_DYN, LOCAL_H], pl.FP32],
+    wo_a: pl.Tensor[[RANKS_DYN, LOCAL_O_GROUPS, O_LORA, O_GROUP_IN], pl.BF16],
+    wo_b: pl.Tensor[[RANKS_DYN, LOCAL_O_WIDTH, D], pl.FP8E4M3FN],
+    wo_b_scale: pl.Tensor[[RANKS_DYN, LOCAL_O_WIDTH // 32, D], pl.FP8E8M0],
+    rope_cos: pl.Tensor[[RANKS_DYN, T_DYN, ROPE_DIM // 2], pl.FP32],
+    rope_sin: pl.Tensor[[RANKS_DYN, T_DYN, ROPE_DIM // 2], pl.FP32],
+    window_slots: pl.Tensor[[RANKS_DYN, T_DYN], pl.INT64],
+    window_indices: pl.Tensor[[RANKS_DYN, T_DYN, 128], pl.INT32],
+    window_cache: pl.InOut[pl.Tensor[[RANKS_DYN, ORI_BLOCKS_DYN, 128, 1, HEAD_DIM], pl.FP8E4M3FN]],
+    window_cache_scale: pl.InOut[pl.Tensor[[RANKS_DYN, ORI_BLOCKS_DYN, 128, 1, HEAD_DIM // WINDOW_CACHE_GROUP], pl.BF16]],
+    compressed_cache: pl.InOut[pl.Tensor[[RANKS_DYN, CMP_BLOCKS_DYN, 128, 1, HEAD_DIM // 2], pl.UINT8]],
+    compressed_cache_scale: pl.InOut[pl.Tensor[[RANKS_DYN, CMP_BLOCKS_DYN, 128, 1, HEAD_DIM // COMPRESSED_CACHE_GROUP], pl.BF16]],
+    request_ids: pl.Tensor[[RANKS_DYN, T_DYN], pl.INT32],
+    compressed_lens: pl.Tensor[[RANKS_DYN, T_DYN], pl.INT32],
+    index_cache: pl.InOut[pl.Tensor[[RANKS_DYN, INDEX_BLOCKS_DYN, 128, 1, INDEX_DIM // 2], pl.UINT8]],
+    index_cache_scale: pl.InOut[pl.Tensor[[RANKS_DYN, INDEX_BLOCKS_DYN, 128, 1, INDEX_DIM // INDEX_CACHE_GROUP], pl.FP8E8M0]],
+    index_block_table: pl.Tensor[[RANKS_DYN, B_DYN, TABLE_DYN], pl.INT32],
+    compressed_rope_cos: pl.Tensor[[RANKS_DYN, T_DYN, ROPE_DIM // 2], pl.FP32],
+    compressed_rope_sin: pl.Tensor[[RANKS_DYN, T_DYN, ROPE_DIM // 2], pl.FP32],
+    compressor_wkv: pl.Tensor[[RANKS_DYN, D, HEAD_DIM], pl.BF16],
+    compressor_norm_weight: pl.Tensor[[RANKS_DYN, HEAD_DIM], pl.BF16],
+    compressed_slots: pl.Tensor[[RANKS_DYN, T_DYN], pl.INT64],
+    index_wk: pl.Tensor[[RANKS_DYN, HEAD_DIM, INDEX_DIM], pl.BF16],
+    index_norm_weight: pl.Tensor[[RANKS_DYN, INDEX_DIM], pl.BF16],
+    index_wq_b: pl.Tensor[[RANKS_DYN, Q_LORA, INDEX_H * INDEX_DIM], pl.FP8E4M3FN],
+    index_wq_b_scale: pl.Tensor[[RANKS_DYN, Q_LORA // 32, INDEX_H * INDEX_DIM], pl.FP8E8M0],
+    index_weights_proj: pl.Tensor[[RANKS_DYN, D, INDEX_H], pl.BF16],
+    topk_indices: pl.InOut[pl.Tensor[[RANKS_DYN, T_DYN, INDEX_TOPK], pl.INT32]],
+    candidate_mask: pl.InOut[pl.Tensor[[RANKS_DYN, T_DYN, CMP_POSITIONS_DYN], pl.UINT8]],
+    compressed_indices: pl.Tensor[[RANKS_DYN, T_DYN, INDEX_TOPK], pl.INT32],
+    attn_input: pl.Out[pl.Tensor[[RANKS_DYN, T_DYN, D], pl.BF16]],
+    attn_output: pl.Out[pl.Tensor[[RANKS_DYN, SP_T_DYN, D], pl.BF16]],
+    next_pre_mix: pl.Out[pl.Tensor[[RANKS_DYN, SP_T_DYN, HC_MULT], pl.FP32]],
+    x_hc_out: pl.Out[pl.Tensor[[RANKS_DYN, SP_T_DYN, HC_MULT, D], pl.FP32]],
+    num_tokens: pl.Tensor[[RANKS_DYN, 1], pl.INT32],
+    attention_epoch: pl.Scalar[pl.INT32],
+):
+    x_hc.bind_dynamic(0, RANKS_DYN)
+    x_hc.bind_dynamic(1, SP_T_DYN)
+    pre_mix.bind_dynamic(1, SP_T_DYN)
+    rope_cos.bind_dynamic(1, T_DYN)
+    rope_sin.bind_dynamic(1, T_DYN)
+    window_slots.bind_dynamic(1, T_DYN)
+    window_indices.bind_dynamic(1, T_DYN)
+    window_cache.bind_dynamic(1, ORI_BLOCKS_DYN)
+    window_cache_scale.bind_dynamic(1, ORI_BLOCKS_DYN)
+    compressed_cache.bind_dynamic(1, CMP_BLOCKS_DYN)
+    compressed_cache_scale.bind_dynamic(1, CMP_BLOCKS_DYN)
+    request_ids.bind_dynamic(1, T_DYN)
+    compressed_lens.bind_dynamic(1, T_DYN)
+    index_cache.bind_dynamic(1, INDEX_BLOCKS_DYN)
+    index_cache_scale.bind_dynamic(1, INDEX_BLOCKS_DYN)
+    index_block_table.bind_dynamic(1, B_DYN)
+    index_block_table.bind_dynamic(2, TABLE_DYN)
+    compressed_rope_cos.bind_dynamic(1, T_DYN)
+    compressed_rope_sin.bind_dynamic(1, T_DYN)
+    compressed_slots.bind_dynamic(1, T_DYN)
+    topk_indices.bind_dynamic(1, T_DYN)
+    candidate_mask.bind_dynamic(1, T_DYN)
+    candidate_mask.bind_dynamic(2, CMP_POSITIONS_DYN)
+    compressed_indices.bind_dynamic(1, T_DYN)
+    attn_input.bind_dynamic(1, T_DYN)
+    attn_output.bind_dynamic(1, SP_T_DYN)
+    next_pre_mix.bind_dynamic(1, SP_T_DYN)
+    x_hc_out.bind_dynamic(1, SP_T_DYN)
+    input_buffer = pld.alloc_window_buffer([PREFILL_MAX_TOKENS, D], dtype=pl.BF16)
+    input_signal_buffer = pld.alloc_window_buffer([TP_SIZE, 1], dtype=pl.INT32)
+    output_buffer = pld.alloc_window_buffer([PREFILL_MAX_TOKENS, D], dtype=pl.FP32)
+    output_signal_buffer = pld.alloc_window_buffer([TP_SIZE, 1], dtype=pl.INT32)
+    for rank in pl.range(pld.world_size()):
+        input_window = pld.window(input_buffer, [PREFILL_MAX_TOKENS, D], dtype=pl.BF16)
+        input_arrived = pld.window(input_signal_buffer, [TP_SIZE, 1], dtype=pl.INT32)
+        output_window = pld.window(output_buffer, [PREFILL_MAX_TOKENS, D], dtype=pl.FP32)
+        output_arrived = pld.window(output_signal_buffer, [TP_SIZE, 1], dtype=pl.INT32)
+        wq_a_scale_r: pl.Tensor[[D // 32, Q_LORA], pl.FP8E8M0, pl.MX_B_NN] = wq_a_scale[rank]
+        wq_b_scale_r: pl.Tensor[[Q_LORA // 32, LOCAL_H * HEAD_DIM], pl.FP8E8M0, pl.MX_B_NN] = wq_b_scale[rank]
+        wkv_scale_r: pl.Tensor[[D // 32, HEAD_DIM], pl.FP8E8M0, pl.MX_B_NN] = wkv_scale[rank]
+        wo_b_scale_r: pl.Tensor[[LOCAL_O_WIDTH // 32, D], pl.FP8E8M0, pl.MX_B_NN] = wo_b_scale[rank]
+        index_wq_b_scale_r: pl.Tensor[[Q_LORA // 32, INDEX_H * INDEX_DIM], pl.FP8E8M0, pl.MX_B_NN] = index_wq_b_scale[rank]
+        l2_prefill_c1a_reindex_sharded(
+            x_hc[rank], pre_mix[rank], hc_attn_fn[rank], hc_attn_scale[rank], hc_attn_base[rank],
+            attn_norm_weight[rank], wq_a[rank], wq_a_scale_r, q_norm_weight[rank], wq_b[rank], wq_b_scale_r,
+            wkv[rank], wkv_scale_r, kv_norm_weight[rank], attn_sink[rank], wo_a[rank], wo_b[rank],
+            wo_b_scale_r, rope_cos[rank], rope_sin[rank], window_slots[rank], window_indices[rank],
+            window_cache[rank], window_cache_scale[rank], compressed_cache[rank], compressed_cache_scale[rank],
+            request_ids[rank], compressed_lens[rank], index_cache[rank], index_cache_scale[rank],
+            index_block_table[rank], compressed_rope_cos[rank], compressed_rope_sin[rank],
+            compressor_wkv[rank], compressor_norm_weight[rank], compressed_slots[rank], index_wk[rank],
+            index_norm_weight[rank], index_wq_b[rank], index_wq_b_scale_r, index_weights_proj[rank],
+            topk_indices[rank], candidate_mask[rank], compressed_indices[rank], attn_input[rank],
+            attn_output[rank], next_pre_mix[rank], x_hc_out[rank], input_window, input_arrived, output_window,
+            output_arrived, num_tokens[rank], rank, attention_epoch, device=rank,
+        )
 
 
 @pl.jit.inline(auto_scope=False)
@@ -186,7 +422,7 @@ def golden_prefill_c1a_reindex_hc(
 
 
 @pl.jit
-def prefill_c1a_reindex_test(
+def l2_prefill_c1a_reindex(
     x_hc: pl.Tensor[[T_DYN, HC_MULT, D], pl.FP32],
     pre_mix: pl.Tensor[[T_DYN, HC_MULT], pl.FP32],
     hc_attn_fn: pl.Tensor[[MIX_HC, HC_DIM], pl.FP32],
@@ -259,7 +495,7 @@ def prefill_c1a_reindex_test(
 
 
 @pl.jit.host
-def l3_prefill_c1a_reindex_test(
+def l3_prefill_c1a_reindex(
     x_hc: pl.Tensor[[TP_SIZE, T_DYN, HC_MULT, D], pl.FP32],
     pre_mix: pl.Tensor[[TP_SIZE, T_DYN, HC_MULT], pl.FP32],
     hc_attn_fn: pl.Tensor[[TP_SIZE, MIX_HC, HC_DIM], pl.FP32],
@@ -331,7 +567,7 @@ def l3_prefill_c1a_reindex_test(
         index_wq_b_scale_r: pl.Tensor[
             [Q_LORA // 32, INDEX_H * INDEX_DIM], pl.FP8E8M0, pl.MX_B_NN
         ] = index_wq_b_scale[rank]
-        prefill_c1a_reindex_test(
+        l2_prefill_c1a_reindex(
             x_hc[rank], pre_mix[rank], hc_attn_fn[rank], hc_attn_scale[rank], hc_attn_base[rank],
             attn_norm_weight[rank],
             wq_a[rank], wq_a_scale_r, q_norm_weight[rank], wq_b[rank], wq_b_scale_r,
@@ -423,6 +659,7 @@ if __name__ == "__main__":
     parser.add_argument("-p", "--platform", default="a5", choices=("a5", "a5sim"))
     parser.add_argument("-d", "--device", default=None)
     parser.add_argument("--tp", type=int, default=TP_SIZE, choices=(1, 2, 4))
+    parser.add_argument("--seed", type=int, default=17)
     parser.add_argument("--dp", type=int, default=1, choices=(1, 2))
     parser.add_argument("--tokens", type=int, default=32)
     parser.add_argument("--active-tokens", type=int)
@@ -434,7 +671,6 @@ if __name__ == "__main__":
     parser.add_argument("--runtime-dir")
     parser.add_argument("--enable-chip-swimlane", type=int, nargs="?", const=1, default=0, choices=range(5))
     parser.add_argument("--wiring", choices=("replicated", "sharded"), default="replicated")
-    parser.add_argument("--epochs", type=int, default=1)
     parser.add_argument("--dp-tokens")
     args = parser.parse_args()
     if args.tp != TP_SIZE:
@@ -443,7 +679,7 @@ if __name__ == "__main__":
         args.device = ",".join(str(rank) for rank in range(TP_SIZE * args.dp))
     if args.wiring == "sharded":
         from prefill_c1a_full import validate_c1a_sp
-        result = validate_c1a_sp("reindex", args)
+        result = validate_c1a_sp("reindex", args, l3_prefill_c1a_reindex_sharded)
         if not result.passed:
             raise SystemExit(result.error or 1)
         raise SystemExit(0)
@@ -457,7 +693,7 @@ if __name__ == "__main__":
     if len(devices) != TP_SIZE:
         parser.error(f"need exactly {TP_SIZE} devices, got {devices}")
     result = run(
-        fn=l3_prefill_c1a_reindex_test,
+        fn=l3_prefill_c1a_reindex,
         specs=build_hc_tensor_specs(args.tokens, args.case, args.active_tokens),
         golden_fn=golden_prefill_c1a_reindex_case,
         golden_data=args.golden_data,

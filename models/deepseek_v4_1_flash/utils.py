@@ -8,27 +8,22 @@
 # -----------------------------------------------------------------------------------------------------------
 """Metadata lowering and shared validation helpers for prefill and decode."""
 
-import argparse
 import inspect
 from collections.abc import Callable
 from dataclasses import dataclass, replace
-import functools
 import json
 import math
-import os
 from numbers import Integral
 from pathlib import Path
 import struct
-from types import SimpleNamespace
 from typing import Any, Mapping, Sequence
 
-import pypto.language as pl
 import torch
 
 
 import config as C
-from config import BLOCK_SIZE, EP_SIZE, FLASH as M, MAX_BATCH_PER_DP, TP_SIZE
-from golden import ScalarSpec, TensorSpec, mapped_pool_ratio_allclose, ratio_allclose, run
+from config import BLOCK_SIZE, FLASH as M, TP_SIZE
+from golden import ScalarSpec, TensorSpec, mapped_pool_ratio_allclose, ratio_allclose
 from rope_tables import precompute_rope_tables
 
 
@@ -1190,62 +1185,49 @@ def prepare_resident_inputs(
     return values
 
 
-def run_forward_smoke(fn, specs, *, config, compile_only=False, replicated=()):
-    """Compile a forward smoke case and upload each rank's inputs in bounded chunks."""
-    from golden import run
+def upload_forward_inputs(runtime, specs, parameters, ranks, host_inputs):
+    """Allocate rank-local inputs and upload storage in bounded chunks."""
     from pypto.ir import ParamDirection
-    from pypto.ir.distributed_compiled_program import DistributedCompiledProgram
-    from pypto.runtime import RunConfig, StackedDeviceTensor
+    from pypto.runtime import StackedDeviceTensor
 
-    result = run(fn=fn, specs=specs, config=config, compile_only=True)
-    if not result.passed or compile_only:
-        return result
-    cfg = RunConfig(**{name: value for name, value in config.items() if name != "log_level"})
-    compiled = DistributedCompiledProgram.from_dir(result.work_dir, platform=cfg.platform)
-    parameters = compiled._get_metadata()[0]
-    ranks = len(cfg.distributed_config.device_ids)
     chunk_bytes = 64 * 1024**2
-    host_inputs = {spec.name: spec.create_tensor().share_memory_() for spec in specs if spec.name in replicated}
-    with compiled.prepare(cfg, persistent=False, inherited_host_tensors=list(host_inputs.values())) as runtime:
-        arguments = []
-        for spec, parameter in zip(specs, parameters, strict=True):
-            if isinstance(spec, ScalarSpec):
-                arguments.append(spec.to_python())
+    arguments = []
+    for spec, parameter in zip(specs, parameters, strict=True):
+        if isinstance(spec, ScalarSpec):
+            arguments.append(spec.to_python())
+            continue
+        if spec.name in host_inputs:
+            arguments.append(host_inputs[spec.name])
+            continue
+        shape = spec.shape[1:]
+        if spec.shape[0] != ranks:
+            raise ValueError(f"{spec.name} needs a leading rank axis of size {ranks}")
+        shards = []
+        for rank in range(ranks):
+            handle = runtime.alloc_tensor(shape, spec.dtype, worker_id=rank)
+            shards.append(handle)
+            if parameter.direction == ParamDirection.Out:
                 continue
-            if spec.name in host_inputs:
-                arguments.append(host_inputs[spec.name])
-                continue
-            shape = spec.shape[1:]
-            if spec.shape[0] != ranks:
-                raise ValueError(f"{spec.name} needs a leading rank axis of size {ranks}")
-            shards = []
-            for rank in range(ranks):
-                handle = runtime.alloc_tensor(shape, spec.dtype, worker_id=rank)
-                shards.append(handle)
-                if parameter.direction == ParamDirection.Out:
-                    continue
-                if isinstance(spec.init_value, torch.Tensor):
-                    if list(spec.init_value.shape) != spec.shape:
-                        raise ValueError(f"{spec.name} initialization must match its tensor spec")
-                    value = spec.init_value[rank].contiguous()
+            if isinstance(spec.init_value, torch.Tensor):
+                if list(spec.init_value.shape) != spec.shape:
+                    raise ValueError(f"{spec.name} initialization must match its tensor spec")
+                value = spec.init_value[rank].contiguous()
+            else:
+                fill = 0 if spec.init_value is None else spec.init_value
+                element_bytes = torch.empty((), dtype=spec.dtype).element_size()
+                elements = min(math.prod(shape), chunk_bytes // element_bytes)
+                if spec.dtype == torch.float8_e8m0fnu:
+                    code = torch.tensor(float(fill)).to(spec.dtype).view(torch.uint8).item()
+                    value = torch.full((elements,), code, dtype=torch.uint8).view(spec.dtype)
                 else:
-                    fill = 0 if spec.init_value is None else spec.init_value
-                    element_bytes = torch.empty((), dtype=spec.dtype).element_size()
-                    elements = min(math.prod(shape), chunk_bytes // element_bytes)
-                    if spec.dtype == torch.float8_e8m0fnu:
-                        code = torch.tensor(float(fill)).to(spec.dtype).view(torch.uint8).item()
-                        value = torch.full((elements,), code, dtype=torch.uint8).view(spec.dtype)
-                    else:
-                        value = torch.full((elements,), fill, dtype=spec.dtype)
-                for offset in range(0, handle.nbytes, chunk_bytes):
-                    size = min(chunk_bytes, handle.nbytes - offset)
-                    source_offset = offset if isinstance(spec.init_value, torch.Tensor) else 0
-                    source = value.data_ptr() + source_offset
-                    runtime.copy_to(handle.data_ptr, source, size, dst_offset=offset, worker_id=rank)
-            arguments.append(StackedDeviceTensor(shards, tuple(spec.shape), tuple(range(ranks))))
-        runtime(*arguments, config=cfg)
-    print("[FWD] Execution passed; numerical accuracy was not validated.", flush=True)
-    return result
+                    value = torch.full((elements,), fill, dtype=spec.dtype)
+            for offset in range(0, handle.nbytes, chunk_bytes):
+                size = min(chunk_bytes, handle.nbytes - offset)
+                source_offset = offset if isinstance(spec.init_value, torch.Tensor) else 0
+                source = value.data_ptr() + source_offset
+                runtime.copy_to(handle.data_ptr, source, size, dst_offset=offset, worker_id=rank)
+        arguments.append(StackedDeviceTensor(shards, tuple(spec.shape), tuple(range(ranks))))
+    return arguments
 
 
 @dataclass(frozen=True)
@@ -1363,7 +1345,7 @@ def make_boundary_specs(args, sharded=False):
             torch.int32,
             1,
             compile_runtime=True,
-            benchmark_step=args.epochs if args.bench else None,
+            benchmark_step=1 if args.bench else None,
         )
     )
     return specs
@@ -1384,27 +1366,6 @@ def assemble_specs(args, leaf_specs, spec_names, aliases=None, sharded=False):
     if missing:
         raise ValueError(f"missing Attention specs: {missing}")
     return [by_name[name] for name in spec_names]
-
-
-def check_program_specs(world_size, specs, spec_names):
-    """Validate host ordering and return tensor shapes/dtypes keyed by name."""
-    if world_size != TP_SIZE:
-        raise ValueError("Attention world size must match TP_SIZE")
-    if tuple(spec.name for spec in specs) != tuple(spec_names):
-        raise ValueError("Attention specs must match the host parameter names and order")
-    dtypes = {
-        torch.bfloat16: pl.BF16,
-        torch.float32: pl.FP32,
-        torch.float8_e4m3fn: pl.FP8E4M3FN,
-        torch.float8_e8m0fnu: pl.FP8E8M0,
-        torch.int32: pl.INT32,
-        torch.int64: pl.INT64,
-        torch.uint8: pl.UINT8,
-    }
-    tensors = [spec for spec in specs if isinstance(spec, TensorSpec)]
-    return SimpleNamespace(
-        **{spec.name: SimpleNamespace(shape=spec.shape, dtype=dtypes[spec.dtype]) for spec in tensors}
-    )
 
 
 def wrap_attention_compare(compare):
@@ -1591,91 +1552,3 @@ def swa_window_cache_compare(
             atol=0.0, rtol=scale_rtol, max_error_ratio=scale_error_ratio, **options
         ),
     }
-
-
-def run_swa_validation(
-    operator, mode, argv=None, *, capacity, default_tokens, default_requests, cases, program_builder,
-    spec_builder, golden_fn,
-):
-    """Run A5 validation for a production SWA operator."""
-    parser = argparse.ArgumentParser(description=f"DeepSeek V4.1 {mode} SWA: A5 precision and timing")
-    parser.add_argument("-p", "--platform", default="a5", choices=["a5", "a5sim"])
-    parser.add_argument("-d", "--device", default=None, help="comma-separated device IDs; default: 0 through TP*DP-1")
-    parser.add_argument("--tp", type=int, default=TP_SIZE, choices=[1, 2, 4])
-    parser.add_argument("--ep", type=int, default=EP_SIZE, choices=[2, 4, 8])
-    parser.add_argument("--dp", type=int, default=1, choices=[1, 2])
-    parser.add_argument("--tokens", "--batch", type=int, default=default_tokens)
-    parser.add_argument("--requests", type=int, help=f"packed requests; default min(tokens, {default_requests})")
-    parser.add_argument("--case", default=cases[0], choices=cases)
-    parser.add_argument("--seed", type=int, default=17)
-    parser.add_argument("--epochs", type=int, default=1, help="operator calls per dispatch; timing includes all epochs")
-    parser.add_argument("--compile-only", action="store_true")
-    parser.add_argument("--save-data", action="store_true", help="save validated inputs and golden outputs for replay")
-    parser.add_argument("--golden-data", help="replay a compatible data directory containing in/ and out/")
-    parser.add_argument("--enable-chip-swimlane", type=int, default=0, choices=range(5))
-    parser.add_argument("--enable-dep-gen", action="store_true")
-    args = parser.parse_args(argv)
-    if args.tp != TP_SIZE:
-        parser.error(f"--tp {args.tp} does not match import-time TP_SIZE {TP_SIZE}")
-    from pypto.ir import DistributedConfig
-
-    args.bench = os.environ.get("PYPTO_BENCH", "0") == "1"
-    args.requests = args.requests if args.requests is not None else min(args.tokens, default_requests)
-    try:
-        devices = list(range(TP_SIZE * args.dp)) if args.device is None else [int(d) for d in args.device.split(",")]
-    except ValueError:
-        parser.error("device IDs must be comma-separated integers")
-    if len(devices) != TP_SIZE * args.dp or len(set(devices)) != len(devices) or min(devices) < 0:
-        parser.error("device IDs must be distinct nonnegative integers, with count TP * DP")
-    if not 1 <= args.tokens <= capacity or not 1 <= args.requests <= min(MAX_BATCH_PER_DP, args.tokens):
-        parser.error(f"tokens must be in [1, {capacity}]; requests in [1, min({MAX_BATCH_PER_DP}, tokens)]")
-    if not 1 <= args.epochs <= 1000:
-        parser.error("epochs must be in [1, 1000]")
-    if args.bench and args.enable_chip_swimlane:
-        parser.error("benchmark epoch stepping and multi-pass chip swimlane must be run separately")
-    torch.set_num_threads(8)
-    print(
-        f"[SWA] mode={mode} tokens={args.tokens} requests={args.requests} TP={TP_SIZE} DP={args.dp} "
-        f"case={args.case} seed={args.seed} epochs/dispatch={args.epochs} devices={devices}",
-    )
-    if args.bench:
-        print(
-            "[SWA] Resident device timing excludes compilation, input generation and CPU golden; "
-            "each dispatch advances the communication epoch. Timing includes all epochs/dispatch.",
-        )
-    validation_program = program_builder(operator, capacity, len(devices), args.epochs)
-    validation_specs = spec_builder(args, mode)
-    validation_distribution = DistributedConfig(device_ids=devices, num_sub_workers=0)
-    validation_config = dict(
-        platform=args.platform, distributed_config=validation_distribution,
-        enable_chip_swimlane=args.enable_chip_swimlane, enable_dep_gen=args.enable_dep_gen,
-    )
-    output_compare = ratio_allclose(atol=1e-2, rtol=1.0 / 128)
-    if args.case in ("masked", "zero", "sink"):
-        output_compare = ratio_allclose(atol=0.0, rtol=0.0, max_error_ratio=0.0)
-    validation_comparisons = {
-        "output": output_compare,
-        # Projection/RMSNorm BF16 rounding can cross an FP8 boundary. Bound
-        # every mapped payload by 2**-9 + abs(expected)/8 and scales by 2%;
-        # untouched values remain exact, with no out-of-bound allowance.
-        **swa_window_cache_compare(
-            len(devices), args.tokens, payload_atol=2 ** -9,
-            payload_rtol=2 ** -3, scale_rtol=0.02,
-        ),
-    }
-    result = run(
-        fn=validation_program,
-        specs=validation_specs,
-        golden_fn=functools.partial(golden_fn, mode=mode),
-        compile_only=args.compile_only,
-        save_data=args.save_data,
-        golden_data=args.golden_data,
-        config=validation_config,
-        compare_fn=validation_comparisons,
-    )
-    print(f"[SWA] work_dir={result.work_dir}")
-    if args.compile_only and result.passed:
-        print("[SWA] Compilation passed; device accuracy was NOT validated.")
-    elif args.save_data and result.passed:
-        print(f"[SWA] Validated snapshot: {result.work_dir}/data")
-    return result

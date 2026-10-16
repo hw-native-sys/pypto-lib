@@ -121,7 +121,7 @@ def golden_mhc_post(
 
 
 @pl.jit
-def mhc_post_test(
+def l2_hc_post(
     sublayer: pl.Tensor[[T_DYN, D], pl.BF16],
     residual: pl.Tensor[[T_DYN, HC_MULT, D], pl.FP32],
     post_mix: pl.Tensor[[T_DYN, HC_MULT], pl.FP32],
@@ -250,7 +250,7 @@ if __name__ == "__main__":
     parser.add_argument("--compile-only", action="store_true")
     args = parser.parse_args()
     result = run(
-        fn=mhc_post_test,
+        fn=l2_hc_post,
         specs=build_mhc_post_tensor_specs(args.batch, args.sequence),
         golden_fn=golden_mhc_post_case,
         config={"platform": args.platform, "device_id": args.device},

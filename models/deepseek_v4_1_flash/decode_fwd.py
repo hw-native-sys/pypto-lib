@@ -4869,7 +4869,10 @@ def build_tensor_specs():
 
 
 if __name__ == "__main__":
-    from utils import run_forward_smoke
+    from utils import upload_forward_inputs
+    from golden import run
+    from pypto.ir.distributed_compiled_program import DistributedCompiledProgram
+    from pypto.runtime import RunConfig
     from pypto.ir import DistributedConfig
 
     parser = argparse.ArgumentParser()
@@ -4890,23 +4893,33 @@ if __name__ == "__main__":
     devices = [int(device) for device in args.device.split(",") if device]
     if len(devices) != EP_SIZE or len(set(devices)) != EP_SIZE:
         parser.error(f"need exactly {EP_SIZE} distinct devices, got {devices}")
-    result = run_forward_smoke(
-        fn=l3_decode_fwd,
-        specs=build_tensor_specs(),
-        compile_only=args.compile_only,
-        replicated=("moe_num_tokens",),
-        config=dict(
-            platform=args.platform,
-            dump_passes=args.dump_passes,
-            enable_scope_stats=args.enable_scope_stats,
-            log_level=args.log_level,
-            ring_heap=(2 * 1024**3, 2 * 1024**3, 1024**3, 512 * 1024**2),
-            ring_dep_pool=131072,
-            distributed_config=DistributedConfig(
-                device_ids=devices,
-                num_sub_workers=0,
-            ),
+    specs = build_tensor_specs()
+    config = dict(
+        platform=args.platform,
+        dump_passes=args.dump_passes,
+        enable_scope_stats=args.enable_scope_stats,
+        log_level=args.log_level,
+        ring_heap=(2 * 1024**3, 2 * 1024**3, 1024**3, 512 * 1024**2),
+        ring_dep_pool=131072,
+        distributed_config=DistributedConfig(
+            device_ids=devices,
+            num_sub_workers=0,
         ),
     )
+    result = run(
+        fn=l3_decode_fwd,
+        specs=specs,
+        config=config,
+        compile_only=True,
+    )
+    if result.passed and not args.compile_only:
+        cfg = RunConfig(**{name: value for name, value in config.items() if name != "log_level"})
+        compiled = DistributedCompiledProgram.from_dir(result.work_dir, platform=cfg.platform)
+        replicated = ('moe_num_tokens',)
+        host_inputs = {spec.name: spec.create_tensor().share_memory_() for spec in specs if spec.name in replicated}
+        with compiled.prepare(cfg, persistent=False, inherited_host_tensors=list(host_inputs.values())) as runtime:
+            arguments = upload_forward_inputs(runtime, specs, compiled._get_metadata()[0], len(devices), host_inputs)
+            runtime(*arguments, config=cfg)
+        print("[FWD] Execution passed; numerical accuracy was not validated.", flush=True)
     if not result.passed:
         raise SystemExit(result.error or 1)

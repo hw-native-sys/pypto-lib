@@ -490,7 +490,7 @@ def make_vision_program(cfg=VisionConfig()):
     half = d // cfg.heads // 2
 
     @pl.jit
-    def vision(
+    def l2_vision(
         patches: pl.Tensor[[ROWS, patch], pl.BF16],
         patch_w: pl.Tensor[[patch, d], pl.BF16],
         patch_b: pl.Tensor[[d], pl.BF16],
@@ -527,7 +527,7 @@ def make_vision_program(cfg=VisionConfig()):
         )
         aligner(features, align1_w, align1_b, align2_w, align2_b, embeddings, n_h, n_w)
         return features, embeddings
-    return vision
+    return l2_vision
 
 
 WEIGHT_NAMES = ("patch_w", "patch_b", "norm1_w", "qkv_w", "qkv_b", "out_w", "out_b",
