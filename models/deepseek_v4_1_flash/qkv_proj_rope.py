@@ -39,7 +39,7 @@ K_TILE = 256
 
 
 _PREFILL_WORKERS = 64
-_PREFILL_PROJECTION_K_TILE = 32
+_QA_K_TILE = 32
 
 
 @pl.jit.inline
@@ -446,28 +446,32 @@ def golden_qkv_proj_rope(
 
 
 @pl.jit.inline
-def _prefill_project_qa(
+def _project_qa(
     x: pl.Tensor[[T_DYN, D], pl.BF16],
     weight: pl.Tensor[[D, Q_LORA], pl.FP8E4M3FN],
     scale: pl.Tensor[[D // 32, Q_LORA], pl.FP8E8M0, pl.MX_B_NN],
     output: pl.Tensor[[T_DYN, Q_LORA], pl.BF16],
     num_tokens: pl.Scalar[pl.INT32],
 ):
-    """Preserve the scale-corrected group-32 Prefill SWA Q projection."""
+    """Use the reference group-32 FP32 sum before the BF16 Q-A boundary.
+
+    Native MX accumulation can cross a BF16 midpoint, and the following Q-B
+    and output FP8 quantizers can amplify that single-ULP difference.
+    """
     scale_storage = pl.tensor.view(scale, [Q_LORA // 16, D // 2], layout=pl.ND)
     for mt in pl.parallel((num_tokens + MX_M_TILE - 1) // MX_M_TILE):
         t0 = mt * MX_M_TILE
-        for block in pl.spmd(Q_LORA // N_TILE, name_hint="prefill_attention_q_a"):
+        for block in pl.spmd(Q_LORA // N_TILE, name_hint="attention_q_a_group32"):
             n0 = block * N_TILE
             rows = pl.min(MX_M_TILE, num_tokens - t0)
             acc = pl.tile.full([MX_M_TILE, N_TILE], dtype=pl.FP32, value=0.0)
-            for kb in pl.range(D // (2 * _PREFILL_PROJECTION_K_TILE)):
+            for kb in pl.range(D // (2 * _QA_K_TILE)):
                 raw = pl.load(scale_storage, [n0 // 16, kb * 32], [N_TILE // 16, 32])
                 raw_u8 = pl.reinterpret_view(raw, pl.UINT8)
                 codes = pl.ands(pl.cast(pl.reinterpret_view(raw_u8, pl.INT8), pl.INT32), 255)
                 scale_pair = pl.reinterpret_view(pl.maximum(pl.shls(codes, 23), 4194304), pl.FP32)
                 for half in pl.unroll(2):
-                    k0 = (kb * 2 + half) * _PREFILL_PROJECTION_K_TILE
+                    k0 = (kb * 2 + half) * _QA_K_TILE
                     if half == 0:
                         gathered_scale = pl.tile.gather_mask(
                             scale_pair, mask_pattern=pl.tile.MaskPattern.P0101
@@ -480,16 +484,16 @@ def _prefill_project_qa(
                     source = pl.load(
                         x,
                         [t0, k0],
-                        [MX_M_TILE, _PREFILL_PROJECTION_K_TILE],
-                        valid_shape=[rows, _PREFILL_PROJECTION_K_TILE],
+                        [MX_M_TILE, _QA_K_TILE],
+                        valid_shape=[rows, _QA_K_TILE],
                     )
                     source = pl.set_validshape(
                         pl.fillpad(source, pad_value=pl.PadValue.zero),
                         MX_M_TILE,
-                        _PREFILL_PROJECTION_K_TILE,
+                        _QA_K_TILE,
                     )
                     value = pl.cast(source, pl.FP32)
-                    reduce_tmp = pl.create_tile([MX_M_TILE, _PREFILL_PROJECTION_K_TILE], dtype=pl.FP32)
+                    reduce_tmp = pl.create_tile([MX_M_TILE, _QA_K_TILE], dtype=pl.FP32)
                     maximum = pl.maximum(pl.row_max(pl.abs(value), tmp_tile=reduce_tmp), 1e-4)
                     bits = pl.reinterpret_view(pl.mul(maximum, 1.0 / 448.0), pl.INT32)
                     exponent = pl.shrs(pl.add(bits, 8388607), 23)
@@ -497,7 +501,7 @@ def _prefill_project_qa(
                     payload = pl.cast(pl.row_expand_div(value, sa), pl.FP8E4M3FN, mode="rint")
                     a = pl.cast(payload, pl.BF16)
                     b = pl.cast(
-                        pl.load(weight, [k0, n0], [_PREFILL_PROJECTION_K_TILE, N_TILE]), pl.BF16
+                        pl.load(weight, [k0, n0], [_QA_K_TILE, N_TILE]), pl.BF16
                     )
                     part = pl.col_expand_mul(pl.row_expand_mul(pl.matmul(a, b), sa), sb)
                     acc = pl.add(acc, part)
@@ -649,7 +653,6 @@ def make_qkv_proj_rope_with_deps(
     return qkv_proj_rope_with_deps
 
 
-_project_qa = make_mx_projection(D, Q_LORA, name_hint="attention_q_a")
 _project_qb = make_mx_projection(Q_LORA, LOCAL_H * HEAD_DIM, name_hint="attention_q_b")
 _project_kv = make_mx_projection(D, HEAD_DIM, name_hint="attention_kv")
 _rotate_q = make_rope(LOCAL_H, name_hint="attention_q_rope")
@@ -686,7 +689,7 @@ def kv_proj_rope(
     _rotate_kv(normalized, rope_cos, rope_sin, window_kv, num_tokens)
     return window_kv
 
-prefill_q_proj_qr = _make_q_proj_qr(_prefill_project_qa, _PREFILL_WORKERS, "prefill_attention_q_norm")
+prefill_q_proj_qr = _make_q_proj_qr(_project_qa, _PREFILL_WORKERS, "prefill_attention_q_norm")
 prefill_q_proj_rope = _make_q_proj_rope(_project_qb, _prefill_rotate_q)
 
 

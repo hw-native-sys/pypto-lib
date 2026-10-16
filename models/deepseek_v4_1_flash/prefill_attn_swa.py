@@ -121,7 +121,8 @@ def prefill_attn_swa_partial(
     wkv_scale: pl.Tensor[[D // 32, HEAD_DIM], pl.FP8E8M0, pl.MX_B_NN],
     kv_norm_weight: pl.Tensor[[HEAD_DIM], pl.BF16],
     attn_sink: pl.Tensor[[LOCAL_H], pl.FP32],
-    wo_a: pl.Tensor[[LOCAL_O_GROUPS, O_LORA, O_GROUP_IN], pl.BF16],
+    wo_a: pl.Tensor[[LOCAL_O_GROUPS, O_GROUP_IN, O_LORA], pl.FP8E4M3FN],
+    wo_a_scale: pl.Tensor[[LOCAL_O_GROUPS, O_GROUP_IN // 32, O_LORA], pl.FP8E8M0],
     wo_b: pl.Tensor[[LOCAL_O_WIDTH, D], pl.FP8E4M3FN],
     wo_b_scale: pl.Tensor[[LOCAL_O_WIDTH // 32, D], pl.FP8E8M0, pl.MX_B_NN],
     rope_cos: pl.Tensor[[T_DYN, ROPE_DIM // 2], pl.FP32],
@@ -188,7 +189,7 @@ def prefill_attn_swa_partial(
             descriptors, chunk_indices, attn_sink,
             attended, active, decoded_ready, index_ready,
         )
-        prefill_o_proj(attended, wo_a, wo_b, wo_b_scale, chunk_cos, chunk_sin, chunk_partial, active)
+        prefill_o_proj(attended, wo_a, wo_a_scale, wo_b, wo_b_scale, chunk_cos, chunk_sin, chunk_partial, active)
         with pl.spmd(WORKER_TILE, name_hint="prefill_swa_collect") as collect_tid:
             worker = pl.tile.get_block_idx()
             for row in pl.range(worker, active, WORKER_TILE):
@@ -212,7 +213,8 @@ def make_prefill_attn_swa(capacity=PREFILL_MAX_TOKENS, reducer=prefill_tp_output
         wkv_scale: pl.Tensor[[D // 32, HEAD_DIM], pl.FP8E8M0, pl.MX_B_NN],
         kv_norm_weight: pl.Tensor[[HEAD_DIM], pl.BF16],
         attn_sink: pl.Tensor[[LOCAL_H], pl.FP32],
-        wo_a: pl.Tensor[[LOCAL_O_GROUPS, O_LORA, O_GROUP_IN], pl.BF16],
+        wo_a: pl.Tensor[[LOCAL_O_GROUPS, O_GROUP_IN, O_LORA], pl.FP8E4M3FN],
+        wo_a_scale: pl.Tensor[[LOCAL_O_GROUPS, O_GROUP_IN // 32, O_LORA], pl.FP8E8M0],
         wo_b: pl.Tensor[[LOCAL_O_WIDTH, D], pl.FP8E4M3FN],
         wo_b_scale: pl.Tensor[[LOCAL_O_WIDTH // 32, D], pl.FP8E8M0, pl.MX_B_NN],
         rope_cos: pl.Tensor[[T_DYN, ROPE_DIM // 2], pl.FP32],
@@ -236,7 +238,7 @@ def make_prefill_attn_swa(capacity=PREFILL_MAX_TOKENS, reducer=prefill_tp_output
             x,
             wq_a, wq_a_scale, q_norm_weight, wq_b, wq_b_scale,
             wkv, wkv_scale, kv_norm_weight, attn_sink,
-            wo_a, wo_b, wo_b_scale,
+            wo_a, wo_a_scale, wo_b, wo_b_scale,
             rope_cos, rope_sin,
             window_slots, window_indices, window_cache, window_cache_scale,
             output_arrived, partial, num_tokens, attention_epoch,
@@ -262,6 +264,7 @@ def golden_prefill_attn_swa(
     kv_norm_weight: torch.Tensor,
     attn_sink: torch.Tensor,
     wo_a: torch.Tensor,
+    wo_a_scale: torch.Tensor,
     wo_b: torch.Tensor,
     wo_b_scale: torch.Tensor,
     rope_cos: torch.Tensor,
@@ -274,7 +277,7 @@ def golden_prefill_attn_swa(
     return golden_swa_attention(
         x, wq_a, wq_a_scale, q_norm_weight, wq_b, wq_b_scale,
         wkv, wkv_scale, kv_norm_weight, attn_sink,
-        wo_a, wo_b, wo_b_scale, rope_cos, rope_sin,
+        wo_a, wo_a_scale, wo_b, wo_b_scale, rope_cos, rope_sin,
         window_slots, window_indices, window_cache, window_cache_scale,
     )
 
@@ -299,7 +302,8 @@ def l2_prefill_attn_swa(
     wkv_scale: pl.Tensor[[D // 32, HEAD_DIM], pl.FP8E8M0, pl.MX_B_NN],
     kv_norm_weight: pl.Tensor[[HEAD_DIM], pl.BF16],
     attn_sink: pl.Tensor[[LOCAL_H], pl.FP32],
-    wo_a: pl.Tensor[[LOCAL_O_GROUPS, O_LORA, O_GROUP_IN], pl.BF16],
+    wo_a: pl.Tensor[[LOCAL_O_GROUPS, O_GROUP_IN, O_LORA], pl.FP8E4M3FN],
+    wo_a_scale: pl.Tensor[[LOCAL_O_GROUPS, O_GROUP_IN // 32, O_LORA], pl.FP8E8M0],
     wo_b: pl.Tensor[[LOCAL_O_WIDTH, D], pl.FP8E4M3FN],
     wo_b_scale: pl.Tensor[[LOCAL_O_WIDTH // 32, D], pl.FP8E8M0, pl.MX_B_NN],
     rope_cos: pl.Tensor[[T_DYN, ROPE_DIM // 2], pl.FP32],
@@ -319,7 +323,7 @@ def l2_prefill_attn_swa(
     window_cache.bind_dynamic(0, ORI_BLOCKS_DYN)
     prefill_attn_swa(
         x, wq_a, wq_a_scale, q_norm_weight, wq_b, wq_b_scale,
-        wkv, wkv_scale, kv_norm_weight, attn_sink, wo_a, wo_b, wo_b_scale,
+        wkv, wkv_scale, kv_norm_weight, attn_sink, wo_a, wo_a_scale, wo_b, wo_b_scale,
         rope_cos, rope_sin, window_slots, window_indices, window_cache, window_cache_scale,
         output_window, output_arrived, output,
         rank // TP_SIZE * TP_SIZE, rank % TP_SIZE, num_tokens, attention_epoch,
@@ -339,7 +343,8 @@ def l3_prefill_attn_swa(
     wkv_scale: pl.Tensor[[RANKS_DYN, D // 32, HEAD_DIM], pl.FP8E8M0],
     kv_norm_weight: pl.Tensor[[RANKS_DYN, HEAD_DIM], pl.BF16],
     attn_sink: pl.Tensor[[RANKS_DYN, LOCAL_H], pl.FP32],
-    wo_a: pl.Tensor[[RANKS_DYN, LOCAL_O_GROUPS, O_LORA, O_GROUP_IN], pl.BF16],
+    wo_a: pl.Tensor[[RANKS_DYN, LOCAL_O_GROUPS, O_GROUP_IN, O_LORA], pl.FP8E4M3FN],
+    wo_a_scale: pl.Tensor[[RANKS_DYN, LOCAL_O_GROUPS, O_GROUP_IN // 32, O_LORA], pl.FP8E8M0],
     wo_b: pl.Tensor[[RANKS_DYN, LOCAL_O_WIDTH, D], pl.FP8E4M3FN],
     wo_b_scale: pl.Tensor[[RANKS_DYN, LOCAL_O_WIDTH // 32, D], pl.FP8E8M0],
     rope_cos: pl.Tensor[[RANKS_DYN, T_DYN, ROPE_DIM // 2], pl.FP32],
@@ -371,7 +376,7 @@ def l3_prefill_attn_swa(
         l2_prefill_attn_swa(
             x[rank], wq_a[rank], wq_a_scale_r, q_norm_weight[rank], wq_b[rank], wq_b_scale_r,
             wkv[rank], wkv_scale_r, kv_norm_weight[rank], attn_sink[rank],
-            wo_a[rank], wo_b[rank], wo_b_scale_r, rope_cos[rank], rope_sin[rank],
+            wo_a[rank], wo_a_scale[rank], wo_b[rank], wo_b_scale_r, rope_cos[rank], rope_sin[rank],
             window_slots[rank], window_indices[rank], window_cache[rank], window_cache_scale[rank],
             output[rank], data, signal, rank, num_tokens, attention_epoch, device=rank,
         )

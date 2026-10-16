@@ -194,7 +194,8 @@ def l2_decode_layer(
     wkv_scale: pl.Tensor[[D // MX_GROUP, HEAD_DIM], pl.FP8E8M0, pl.MX_B_NN],
     kv_norm_weight: pl.Tensor[[HEAD_DIM], pl.BF16],
     attn_sink: pl.Tensor[[LOCAL_H], pl.FP32],
-    wo_a: pl.Tensor[[LOCAL_O_GROUPS, O_LORA, O_GROUP_IN], pl.BF16],
+    wo_a: pl.Tensor[[LOCAL_O_GROUPS, O_GROUP_IN, O_LORA], pl.FP8E4M3FN],
+    wo_a_scale: pl.Tensor[[LOCAL_O_GROUPS, O_GROUP_IN // 32, O_LORA], pl.FP8E8M0],
     wo_b: pl.Tensor[[LOCAL_O_WIDTH, D], pl.FP8E4M3FN],
     wo_b_scale: pl.Tensor[[LOCAL_O_WIDTH // MX_GROUP, D], pl.FP8E8M0, pl.MX_B_NN],
     rope_cos: pl.Tensor[[T_DYN, ROPE_DIM // 2], pl.FP32],
@@ -339,7 +340,7 @@ def l2_decode_layer(
         decode_swa_sharded(
             x_hc, incoming_pre_mix, hc_attn_fn, hc_attn_scale, hc_attn_base,
             attn_norm_weight, wq_a, wq_a_scale, q_norm_weight, wq_b, wq_b_scale,
-            wkv, wkv_scale, kv_norm_weight, attn_sink, wo_a, wo_b, wo_b_scale,
+            wkv, wkv_scale, kv_norm_weight, attn_sink, wo_a, wo_a_scale, wo_b, wo_b_scale,
             rope_cos, rope_sin, window_slots, window_indices, window_cache,
             window_cache_scale, attention_output, attention_hidden, attention_pre_mix,
             gathered, attention_input_window, attention_input_arrived,
@@ -351,7 +352,7 @@ def l2_decode_layer(
             decode_c2a_full_sharded(
                 x_hc, incoming_pre_mix, hc_attn_fn, hc_attn_scale, hc_attn_base,
                 attn_norm_weight, wq_a, wq_a_scale, q_norm_weight, wq_b, wq_b_scale,
-                wkv, wkv_scale, kv_norm_weight, attn_sink, wo_a, wo_b, wo_b_scale,
+                wkv, wkv_scale, kv_norm_weight, attn_sink, wo_a, wo_a_scale, wo_b, wo_b_scale,
                 rope_cos, rope_sin, window_slots, window_indices, window_cache,
                 window_cache_scale, compressed_cache, compressed_cache_scale,
                 token_to_req_indices, compressed_lens, index_cache, index_cache_scale,
@@ -368,7 +369,7 @@ def l2_decode_layer(
             decode_c2a_reuse_sharded(
                 x_hc, incoming_pre_mix, hc_attn_fn, hc_attn_scale, hc_attn_base,
                 attn_norm_weight, wq_a, wq_a_scale, q_norm_weight, wq_b, wq_b_scale,
-                wkv, wkv_scale, kv_norm_weight, attn_sink, wo_a, wo_b, wo_b_scale,
+                wkv, wkv_scale, kv_norm_weight, attn_sink, wo_a, wo_a_scale, wo_b, wo_b_scale,
                 rope_cos, rope_sin, window_slots, window_indices, window_cache,
                 window_cache_scale, compressed_cache, compressed_cache_scale,
                 topk_indices, attention_output, attention_hidden, attention_pre_mix,
@@ -380,7 +381,7 @@ def l2_decode_layer(
         decode_c1a_full_sharded(
             x_hc, incoming_pre_mix, hc_attn_fn, hc_attn_scale, hc_attn_base,
             attn_norm_weight, wq_a, wq_a_scale, q_norm_weight, wq_b, wq_b_scale,
-            wkv, wkv_scale, kv_norm_weight, attn_sink, wo_a, wo_b, wo_b_scale,
+            wkv, wkv_scale, kv_norm_weight, attn_sink, wo_a, wo_a_scale, wo_b, wo_b_scale,
             rope_cos, rope_sin, window_slots, window_indices, window_cache,
             window_cache_scale, compressed_cache, compressed_cache_scale, request_ids,
             compressed_lens, index_cache, index_cache_scale, index_block_table,
@@ -395,7 +396,7 @@ def l2_decode_layer(
         decode_c1a_reindex_sharded(
             x_hc, incoming_pre_mix, hc_attn_fn, hc_attn_scale, hc_attn_base,
             attn_norm_weight, wq_a, wq_a_scale, q_norm_weight, wq_b, wq_b_scale,
-            wkv, wkv_scale, kv_norm_weight, attn_sink, wo_a, wo_b, wo_b_scale,
+            wkv, wkv_scale, kv_norm_weight, attn_sink, wo_a, wo_a_scale, wo_b, wo_b_scale,
             rope_cos, rope_sin, window_slots, window_indices, window_cache,
             window_cache_scale, compressed_cache, compressed_cache_scale, request_ids,
             compressed_lens, index_cache, index_cache_scale, index_block_table,
@@ -408,7 +409,7 @@ def l2_decode_layer(
         decode_c1a_reuse_sharded(
             x_hc, incoming_pre_mix, hc_attn_fn, hc_attn_scale, hc_attn_base,
             attn_norm_weight, wq_a, wq_a_scale, q_norm_weight, wq_b, wq_b_scale,
-            wkv, wkv_scale, kv_norm_weight, attn_sink, wo_a, wo_b, wo_b_scale,
+            wkv, wkv_scale, kv_norm_weight, attn_sink, wo_a, wo_a_scale, wo_b, wo_b_scale,
             rope_cos, rope_sin, window_slots, window_indices, window_cache,
             window_cache_scale, compressed_cache, compressed_cache_scale,
             compressed_indices, gathered, attention_input_window, attention_input_arrived,
@@ -445,7 +446,8 @@ def l3_decode_layer(
     wkv_scale: pl.Tensor[[EP_SIZE, D // MX_GROUP, HEAD_DIM], pl.FP8E8M0],
     kv_norm_weight: pl.Tensor[[EP_SIZE, HEAD_DIM], pl.BF16],
     attn_sink: pl.Tensor[[EP_SIZE, LOCAL_H], pl.FP32],
-    wo_a: pl.Tensor[[EP_SIZE, LOCAL_O_GROUPS, O_LORA, O_GROUP_IN], pl.BF16],
+    wo_a: pl.Tensor[[EP_SIZE, LOCAL_O_GROUPS, O_GROUP_IN, O_LORA], pl.FP8E4M3FN],
+    wo_a_scale: pl.Tensor[[EP_SIZE, LOCAL_O_GROUPS, O_GROUP_IN // 32, O_LORA], pl.FP8E8M0],
     wo_b: pl.Tensor[[EP_SIZE, LOCAL_O_WIDTH, D], pl.FP8E4M3FN],
     wo_b_scale: pl.Tensor[[EP_SIZE, LOCAL_O_WIDTH // MX_GROUP, D], pl.FP8E8M0],
     rope_cos: pl.Tensor[[EP_SIZE, T_DYN, ROPE_DIM // 2], pl.FP32],
@@ -618,6 +620,7 @@ def l3_decode_layer(
             kv_norm_weight[rank],
             attn_sink[rank],
             wo_a[rank],
+            wo_a_scale[rank],
             wo_b[rank],
             wo_b_scale_rank,
             rope_cos[rank],
@@ -1184,6 +1187,8 @@ def _attention_values() -> dict[str, torch.Tensor | None]:
     index_cache, index_cache_scale = quantize_mxfp4_cache(
         torch.randn(1, 128, 1, 32), group_size=32, scale_format="e8m0"
     )
+    from quant import quantize_grouped_mxfp8_weight
+    wo_a, wo_a_scale = quantize_grouped_mxfp8_weight(torch.randn(2, 32, 64))
     return {
         "x": torch.randn(2, 64, dtype=torch.bfloat16),
         "wq_a": wq_a,
@@ -1195,7 +1200,8 @@ def _attention_values() -> dict[str, torch.Tensor | None]:
         "wkv_scale": wkv_scale,
         "kv_norm_weight": torch.ones(64, dtype=torch.bfloat16),
         "attn_sink": torch.randn(2),
-        "wo_a": torch.randn(2, 32, 64, dtype=torch.bfloat16),
+        "wo_a": wo_a,
+        "wo_a_scale": wo_a_scale,
         "wo_b": wo_b,
         "wo_b_scale": wo_b_scale,
         "rope_cos": torch.ones(2, 1),

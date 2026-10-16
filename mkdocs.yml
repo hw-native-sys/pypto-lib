@@ -98,6 +98,7 @@ nav:
       - DeepSeek V4.1-Flash:
           - Model overview: models/deepseek_v4_1_flash/index.md
           - Vision encoder and visual aligner: models/deepseek_v4_1_flash/vision.md
+          - Wo-A MXFP8 interface: models/deepseek_v4_1_flash/wo_a_mxfp8.md
       - GLM-5.3-Flash: models/glm5_3_flash/index.md
   - Debug and Tune:
       - Overview: debug-and-tune/index.md
