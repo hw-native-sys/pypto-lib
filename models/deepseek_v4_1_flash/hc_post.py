@@ -216,23 +216,15 @@ def prefill_sp_post(
 def golden_attention_post(tensors, post, residual):
     """Populate the common post-Attention mHC boundary."""
     active = int(tensors["num_tokens"])
-    sharded = "gathered" in tensors
     for rank in range(tensors["x_hc"].shape[0]):
-        if sharded:
-            _first, count, _width = owner_rows(tensors["attention_output"], rank, active, tp_size=TP_SIZE)
-            tensors["attention_hidden"][rank].zero_()
-            tensors["attention_output"][rank][count:].zero_()
-            if count:
-                tensors["attention_hidden"][rank][:count].copy_(
-                    golden_mhc_post(
-                        tensors["attention_output"][rank][:count],
-                        tensors["x_hc"][rank][:count], post[rank][:count], residual[rank][:count]
-                    )
-                )
-        else:
-            tensors["attention_hidden"][rank].copy_(
+        _first, count, _width = owner_rows(tensors["attention_output"], rank, active, tp_size=TP_SIZE)
+        tensors["attention_hidden"][rank].zero_()
+        tensors["attention_output"][rank][count:].zero_()
+        if count:
+            tensors["attention_hidden"][rank][:count].copy_(
                 golden_mhc_post(
-                    tensors["attention_output"][rank], tensors["x_hc"][rank], post[rank], residual[rank]
+                    tensors["attention_output"][rank][:count],
+                    tensors["x_hc"][rank][:count], post[rank][:count], residual[rank][:count]
                 )
             )
 

@@ -194,28 +194,6 @@ def attention_pre(
     return post_mix, residual_mix
 
 
-def golden_attention_pre(tensors):
-    """Build normalized Attention inputs and return the mHC post state."""
-    world = tensors["x_hc"].shape[0]
-    active = int(tensors["num_tokens"])
-    normalized, post, residual = [], [], []
-    for rank in range(world):
-        pre, post_mix, residual_mix = golden_mhc_mixes(
-            tensors["x_hc"][rank],
-            tensors["hc_attn_fn"][rank],
-            tensors["hc_attn_scale"][rank],
-            tensors["hc_attn_base"][rank],
-        )
-        tensors["attention_pre_mix"][rank].copy_(pre)
-        collapsed = golden_mhc_pre(tensors["x_hc"][rank], tensors["incoming_pre_mix"][rank])
-        normalized_rank = torch.full_like(collapsed, 13.0)
-        normalized_rank[:active].copy_(golden_rms_norm(collapsed[:active], tensors["attn_norm_weight"][rank]))
-        normalized.append(normalized_rank)
-        post.append(post_mix)
-        residual.append(residual_mix)
-    return torch.stack(normalized), post, residual
-
-
 def golden_attention_pre_sharded(tensors):
     """Build the local mHC/norm state and the gathered full-range input.
 

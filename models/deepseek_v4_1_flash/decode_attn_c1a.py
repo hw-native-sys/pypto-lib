@@ -179,93 +179,68 @@ def c1a_previous_epoch(
     return ready
 
 
-def make_c1a_reduce(scatter=False):
-    """Build the C1A output collective.
-
-    ``scatter=False`` keeps the historical all-reduce result: every rank holds
-    every token row. ``scatter=True`` publishes the same partials but only sums
-    and stores the contiguous token rows this rank owns, which is the
-    ReduceScatter(SUM) sequence-parallel boundary. The scatter form never sums
-    the replicated rows, so the result is not scaled by the TP degree.
-
-    Row ownership follows the rank's physical slab (``ceil(tokens / tp)``), the
-    same mapping the Attention-input AllGather publishes, so ``T < TP`` and a
-    partially filled batch keep consistent row indices.  Rows outside the active
-    range are written as zeros: the slab is always fully materialized.
-    """
-
-    @pl.jit.inline(auto_scope=False)
-    def c1a_reduce(
-        partial: pl.Tensor[[T_DYN, D], pl.FP32],
-        output_window: pld.DistributedTensor[[DECODE_MAX_TOKENS, D], pl.FP32],
-        output_arrived: pld.DistributedTensor[[TP_SIZE, 1], pl.INT32],
-        output: pl.Tensor[[LOCAL_T_DYN, D], pl.BF16],
-        group_base: pl.Scalar[pl.INT32],
-        tp_rank: pl.Scalar[pl.INT32],
-        num_tokens: pl.Scalar[pl.INT32],
-        attention_epoch: pl.Scalar[pl.INT32],
-        partial_ready: pl.Scalar[pl.TASK_ID],
-    ):
-        first = pl.cast(0, pl.INT32)
-        count = pl.cast(num_tokens, pl.INT32)
-        if scatter:
-            # Ownership uses the fixed physical slab, not the active row count.
-            # Mirrors decode_cp_allgather.slab_owner / utils'
-            # sequence_parallel_bounds; keep the three in step.
-            width = pl.tensor.dim(output, 0)
-            first = pl.cast(pl.min(tp_rank * width, num_tokens), pl.INT32)
-            count = pl.cast(pl.max(0, pl.min(width, num_tokens - first)), pl.INT32)
-        with pl.spmd(32, name_hint="c1a_tp_publish", deps=[partial_ready]) as published:
-            worker = pl.tile.get_block_idx()
-            for tile in pl.range(worker, num_tokens * (D // 512), 32):
-                row = tile // (D // 512)
-                col = tile % (D // 512) * 512
-                value = pl.load(partial, [row, col], [1, 512])
-                pld.tile.remote_store(value, output_window, peer=group_base + tp_rank, offsets=[row, col])
-        with pl.at(level=pl.Level.CORE_GROUP, name_hint="c1a_tp_ready", deps=[published]) as notified:
+@pl.jit.inline(auto_scope=False)
+def c1a_reduce_scatter(
+    partial: pl.Tensor[[T_DYN, D], pl.FP32],
+    output_window: pld.DistributedTensor[[DECODE_MAX_TOKENS, D], pl.FP32],
+    output_arrived: pld.DistributedTensor[[TP_SIZE, 1], pl.INT32],
+    output: pl.Tensor[[LOCAL_T_DYN, D], pl.BF16],
+    group_base: pl.Scalar[pl.INT32],
+    tp_rank: pl.Scalar[pl.INT32],
+    num_tokens: pl.Scalar[pl.INT32],
+    attention_epoch: pl.Scalar[pl.INT32],
+    partial_ready: pl.Scalar[pl.TASK_ID],
+):
+    # Ownership uses the fixed physical slab, not the active row count.
+    # Mirrors decode_cp_allgather.slab_owner / utils'
+    # sequence_parallel_bounds; keep the three in step.
+    width = pl.tensor.dim(output, 0)
+    first = pl.cast(pl.min(tp_rank * width, num_tokens), pl.INT32)
+    count = pl.cast(pl.max(0, pl.min(width, num_tokens - first)), pl.INT32)
+    with pl.spmd(32, name_hint="c1a_tp_publish", deps=[partial_ready]) as published:
+        worker = pl.tile.get_block_idx()
+        for tile in pl.range(worker, num_tokens * (D // 512), 32):
+            row = tile // (D // 512)
+            col = tile % (D // 512) * 512
+            value = pl.load(partial, [row, col], [1, 512])
+            pld.tile.remote_store(value, output_window, peer=group_base + tp_rank, offsets=[row, col])
+    with pl.at(level=pl.Level.CORE_GROUP, name_hint="c1a_tp_ready", deps=[published]) as notified:
+        for peer in pl.range(TP_SIZE):
+            pld.system.notify(output_arrived, peer=group_base + peer, offsets=[tp_rank, 0],
+                              value=1, op=pld.NotifyOp.AtomicAdd)
+    with pl.at(level=pl.Level.CORE_GROUP, name_hint="c1a_tp_wait", deps=[notified],
+               allow_early_resolve=False) as arrived:
+        for peer in pl.range(TP_SIZE):
+            pld.system.wait(output_arrived, offsets=[peer, 0], expected=attention_epoch * 2 - 1,
+                            cmp=pld.WaitCmp.Ge)
+    with pl.spmd(32, name_hint="c1a_tp_reduce", deps=[arrived]) as reduced:
+        worker = pl.tile.get_block_idx()
+        for tile in pl.range(worker, count * (D // 512), 32):
+            row = tile // (D // 512)
+            col = tile % (D // 512) * 512
+            acc = pl.tile.full([1, 512], dtype=pl.FP32, value=0.0)
             for peer in pl.range(TP_SIZE):
-                pld.system.notify(output_arrived, peer=group_base + peer, offsets=[tp_rank, 0],
-                                  value=1, op=pld.NotifyOp.AtomicAdd)
-        with pl.at(level=pl.Level.CORE_GROUP, name_hint="c1a_tp_wait", deps=[notified],
-                   allow_early_resolve=False) as arrived:
-            for peer in pl.range(TP_SIZE):
-                pld.system.wait(output_arrived, offsets=[peer, 0], expected=attention_epoch * 2 - 1,
-                                cmp=pld.WaitCmp.Ge)
-        with pl.spmd(32, name_hint="c1a_tp_reduce", deps=[arrived]) as reduced:
-            worker = pl.tile.get_block_idx()
-            for tile in pl.range(worker, count * (D // 512), 32):
-                row = tile // (D // 512)
-                col = tile % (D // 512) * 512
-                acc = pl.tile.full([1, 512], dtype=pl.FP32, value=0.0)
-                for peer in pl.range(TP_SIZE):
-                    peer_value = pld.tile.remote_load(
-                        output_window, peer=group_base + peer, offsets=[first + row, col], shape=[1, 512]
-                    )
-                    acc = pl.add(acc, peer_value)
-                pl.store(pl.cast(acc, pl.BF16, mode="rint"), [row, col], output)
-            if scatter:
-                # Empty owners and the last slab's padded tail are zeros, never
-                # a stale window or sentinel value.
-                for tile in pl.range(worker, (pl.tensor.dim(output, 0) - count) * (D // 512), 32):
-                    row = count + tile // (D // 512)
-                    col = tile % (D // 512) * 512
-                    pl.store(pl.tile.full([1, 512], dtype=pl.BF16, value=0.0), [row, col], output)
-        with pl.at(level=pl.Level.CORE_GROUP, name_hint="c1a_tp_release", deps=[reduced]) as released:
-            for peer in pl.range(TP_SIZE):
-                pld.system.notify(output_arrived, peer=group_base + peer, offsets=[tp_rank, 0],
-                                  value=1, op=pld.NotifyOp.AtomicAdd)
-        with pl.at(level=pl.Level.CORE_GROUP, name_hint="c1a_tp_consumed", deps=[released],
-                   allow_early_resolve=False):
-            for peer in pl.range(TP_SIZE):
-                pld.system.wait(output_arrived, offsets=[peer, 0], expected=attention_epoch * 2,
-                                cmp=pld.WaitCmp.Ge)
-        return output
-
-    return c1a_reduce
-
-
-c1a_reduce = make_c1a_reduce()
-c1a_reduce_scatter = make_c1a_reduce(scatter=True)
+                peer_value = pld.tile.remote_load(
+                    output_window, peer=group_base + peer, offsets=[first + row, col], shape=[1, 512]
+                )
+                acc = pl.add(acc, peer_value)
+            pl.store(pl.cast(acc, pl.BF16, mode="rint"), [row, col], output)
+        # Empty owners and the last slab's padded tail are zeros, never
+        # a stale window or sentinel value.
+        for tile in pl.range(worker, (pl.tensor.dim(output, 0) - count) * (D // 512), 32):
+            row = count + tile // (D // 512)
+            col = tile % (D // 512) * 512
+            pl.store(pl.tile.full([1, 512], dtype=pl.BF16, value=0.0), [row, col], output)
+    with pl.at(level=pl.Level.CORE_GROUP, name_hint="c1a_tp_release", deps=[reduced]) as released:
+        for peer in pl.range(TP_SIZE):
+            pld.system.notify(output_arrived, peer=group_base + peer, offsets=[tp_rank, 0],
+                              value=1, op=pld.NotifyOp.AtomicAdd)
+    with pl.at(level=pl.Level.CORE_GROUP, name_hint="c1a_tp_consumed", deps=[released],
+               allow_early_resolve=False):
+        for peer in pl.range(TP_SIZE):
+            pld.system.wait(output_arrived, offsets=[peer, 0], expected=attention_epoch * 2,
+                            cmp=pld.WaitCmp.Ge)
+    return output
 
 
 @pl.jit.inline(auto_scope=False)
@@ -320,63 +295,53 @@ def gather_combined(
     )
 
 
-def make_c1a_finish(output_reduce=None):
-    """Build the C1A finish stage around one output collective."""
-    reducer = output_reduce or c1a_reduce
-
-    @pl.jit.inline(auto_scope=False)
-    def c1a_finish(
-        query: pl.Tensor[[T_DYN, LOCAL_H * HEAD_DIM], pl.BF16],
-        window_cache: pl.Tensor[[ORI_BLOCKS_DYN, 128, 1, HEAD_DIM], pl.FP8E4M3FN],
-        window_scale: pl.Tensor[[ORI_BLOCKS_DYN, 128, 1, HEAD_DIM // 32], pl.BF16],
-        compressed_cache: pl.Tensor[[CMP_BLOCKS_DYN, 128, 1, HEAD_DIM // 2], pl.UINT8],
-        compressed_scale: pl.Tensor[[CMP_BLOCKS_DYN, 128, 1, HEAD_DIM // 16], pl.BF16],
-        window_indices: pl.Tensor[[T_DYN, 128], pl.INT32],
-        compressed_indices: pl.Tensor[[T_DYN, INDEX_TOPK], pl.INT32],
-        sink: pl.Tensor[[LOCAL_H], pl.FP32],
-        wo_a: pl.Tensor[[LOCAL_O_GROUPS, O_LORA, O_GROUP_IN], pl.BF16],
-        wo_b: pl.Tensor[[LOCAL_O_WIDTH, D], pl.FP8E4M3FN],
-        wo_b_scale: pl.Tensor[[LOCAL_O_WIDTH // 32, D], pl.FP8E8M0, pl.MX_B_NN],
-        cos: pl.Tensor[[T_DYN, ROPE_DIM // 2], pl.FP32],
-        sin: pl.Tensor[[T_DYN, ROPE_DIM // 2], pl.FP32],
-        output_window: pld.DistributedTensor[[DECODE_MAX_TOKENS, D], pl.FP32],
-        output_arrived: pld.DistributedTensor[[TP_SIZE, 1], pl.INT32],
-        output: pl.Tensor[[LOCAL_T_DYN, D], pl.BF16],
-        group_base: pl.Scalar[pl.INT32],
-        tp_rank: pl.Scalar[pl.INT32],
-        num_tokens: pl.Scalar[pl.INT32],
-        attention_epoch: pl.Scalar[pl.INT32],
-        q_ready: pl.Scalar[pl.TASK_ID],
-        topk_ready: pl.Scalar[pl.TASK_ID],
-    ):
-        tokens = pl.tensor.dim(query, 0)
-        selected = pl.create_tensor([tokens, 640, HEAD_DIM], dtype=pl.BF16)
-        indices = pl.create_tensor([tokens, 640], dtype=pl.INT32)
-        _selected_ret, _indices_ret, gather_tid = gather_combined(
-            window_cache, window_scale, compressed_cache, compressed_scale,
-            window_indices, compressed_indices,
-            selected, indices,
-            num_tokens, topk_ready,
-        )
-        attended = pl.create_tensor([tokens, LOCAL_H * HEAD_DIM], dtype=pl.BF16)
-        attend_tid = attend_combined(
-            query, selected, indices, sink, attended, num_tokens, gather_tid, q_ready,
-        )
-        partial = pl.create_tensor([tokens, D], dtype=pl.FP32)
-        ob_tid = o_proj_with_deps(
-            attended, wo_a, wo_b, wo_b_scale, cos, sin, partial, num_tokens, attend_tid
-        )
-        reducer(
-            partial, output_window, output_arrived, output, group_base, tp_rank, num_tokens, attention_epoch,
-            ob_tid,
-        )
-        return output
-
-    return c1a_finish
-
-
-c1a_finish = make_c1a_finish()
-c1a_finish_sharded = make_c1a_finish(c1a_reduce_scatter)
+@pl.jit.inline(auto_scope=False)
+def c1a_finish_sharded(
+    query: pl.Tensor[[T_DYN, LOCAL_H * HEAD_DIM], pl.BF16],
+    window_cache: pl.Tensor[[ORI_BLOCKS_DYN, 128, 1, HEAD_DIM], pl.FP8E4M3FN],
+    window_scale: pl.Tensor[[ORI_BLOCKS_DYN, 128, 1, HEAD_DIM // 32], pl.BF16],
+    compressed_cache: pl.Tensor[[CMP_BLOCKS_DYN, 128, 1, HEAD_DIM // 2], pl.UINT8],
+    compressed_scale: pl.Tensor[[CMP_BLOCKS_DYN, 128, 1, HEAD_DIM // 16], pl.BF16],
+    window_indices: pl.Tensor[[T_DYN, 128], pl.INT32],
+    compressed_indices: pl.Tensor[[T_DYN, INDEX_TOPK], pl.INT32],
+    sink: pl.Tensor[[LOCAL_H], pl.FP32],
+    wo_a: pl.Tensor[[LOCAL_O_GROUPS, O_LORA, O_GROUP_IN], pl.BF16],
+    wo_b: pl.Tensor[[LOCAL_O_WIDTH, D], pl.FP8E4M3FN],
+    wo_b_scale: pl.Tensor[[LOCAL_O_WIDTH // 32, D], pl.FP8E8M0, pl.MX_B_NN],
+    cos: pl.Tensor[[T_DYN, ROPE_DIM // 2], pl.FP32],
+    sin: pl.Tensor[[T_DYN, ROPE_DIM // 2], pl.FP32],
+    output_window: pld.DistributedTensor[[DECODE_MAX_TOKENS, D], pl.FP32],
+    output_arrived: pld.DistributedTensor[[TP_SIZE, 1], pl.INT32],
+    output: pl.Tensor[[LOCAL_T_DYN, D], pl.BF16],
+    group_base: pl.Scalar[pl.INT32],
+    tp_rank: pl.Scalar[pl.INT32],
+    num_tokens: pl.Scalar[pl.INT32],
+    attention_epoch: pl.Scalar[pl.INT32],
+    q_ready: pl.Scalar[pl.TASK_ID],
+    topk_ready: pl.Scalar[pl.TASK_ID],
+):
+    tokens = pl.tensor.dim(query, 0)
+    selected = pl.create_tensor([tokens, 640, HEAD_DIM], dtype=pl.BF16)
+    indices = pl.create_tensor([tokens, 640], dtype=pl.INT32)
+    _selected_ret, _indices_ret, gather_tid = gather_combined(
+        window_cache, window_scale, compressed_cache, compressed_scale,
+        window_indices, compressed_indices,
+        selected, indices,
+        num_tokens, topk_ready,
+    )
+    attended = pl.create_tensor([tokens, LOCAL_H * HEAD_DIM], dtype=pl.BF16)
+    attend_tid = attend_combined(
+        query, selected, indices, sink, attended, num_tokens, gather_tid, q_ready,
+    )
+    partial = pl.create_tensor([tokens, D], dtype=pl.FP32)
+    ob_tid = o_proj_with_deps(
+        attended, wo_a, wo_b, wo_b_scale, cos, sin, partial, num_tokens, attend_tid
+    )
+    c1a_reduce_scatter(
+        partial, output_window, output_arrived, output, group_base, tp_rank, num_tokens, attention_epoch,
+        ob_tid,
+    )
+    return output
 
 
 # E2M1 exact midpoints and the magnitude code the A5 publish kernels emit for
@@ -888,121 +853,111 @@ def golden_decode_attn_c1a_full(
     )
 
 
-def make_decode_attn_c1a_full(output_reduce=None):
-    """Build the C1A full Attention leaf around one output collective."""
-    reducer = output_reduce or c1a_finish
-
-    @pl.jit.inline(auto_scope=False)
-    def decode_attn_c1a_full(
-        x: pl.Tensor[[T_DYN, D], pl.BF16],
-        wq_a: pl.Tensor[[D, Q_LORA], pl.FP8E4M3FN],
-        wq_a_scale: pl.Tensor[[D // 32, Q_LORA], pl.FP8E8M0, pl.MX_B_NN],
-        q_norm_weight: pl.Tensor[[Q_LORA], pl.BF16],
-        wq_b: pl.Tensor[[Q_LORA, LOCAL_H * HEAD_DIM], pl.FP8E4M3FN],
-        wq_b_scale: pl.Tensor[[Q_LORA // 32, LOCAL_H * HEAD_DIM], pl.FP8E8M0, pl.MX_B_NN],
-        wkv: pl.Tensor[[D, HEAD_DIM], pl.FP8E4M3FN],
-        wkv_scale: pl.Tensor[[D // 32, HEAD_DIM], pl.FP8E8M0, pl.MX_B_NN],
-        kv_norm_weight: pl.Tensor[[HEAD_DIM], pl.BF16],
-        attn_sink: pl.Tensor[[LOCAL_H], pl.FP32],
-        wo_a: pl.Tensor[[LOCAL_O_GROUPS, O_LORA, O_GROUP_IN], pl.BF16],
-        wo_b: pl.Tensor[[LOCAL_O_WIDTH, D], pl.FP8E4M3FN],
-        wo_b_scale: pl.Tensor[[LOCAL_O_WIDTH // 32, D], pl.FP8E8M0, pl.MX_B_NN],
-        rope_cos: pl.Tensor[[T_DYN, ROPE_DIM // 2], pl.FP32],
-        rope_sin: pl.Tensor[[T_DYN, ROPE_DIM // 2], pl.FP32],
-        window_slots: pl.Tensor[[T_DYN], pl.INT64],
-        window_indices: pl.Tensor[[T_DYN, 128], pl.INT32],
-        window_cache: pl.Tensor[[ORI_BLOCKS_DYN, 128, 1, HEAD_DIM], pl.FP8E4M3FN],
-        window_cache_scale: pl.Tensor[[ORI_BLOCKS_DYN, 128, 1, HEAD_DIM // WINDOW_CACHE_GROUP], pl.BF16],
-        compressed_cache: pl.Tensor[[CMP_BLOCKS_DYN, 128, 1, HEAD_DIM // 2], pl.UINT8],
-        compressed_cache_scale: pl.Tensor[
-            [CMP_BLOCKS_DYN, 128, 1, HEAD_DIM // COMPRESSED_CACHE_GROUP], pl.BF16
-        ],
-        request_ids: pl.Tensor[[T_DYN], pl.INT32],
-        compressed_lens: pl.Tensor[[T_DYN], pl.INT32],
-        index_cache: pl.Tensor[[INDEX_BLOCKS_DYN, 128, 1, INDEX_DIM // 2], pl.UINT8],
-        index_cache_scale: pl.Tensor[[INDEX_BLOCKS_DYN, 128, 1, INDEX_DIM // INDEX_CACHE_GROUP], pl.FP8E8M0],
-        index_block_table: pl.Tensor[[B_DYN, TABLE_DYN], pl.INT32],
-        compressed_rope_cos: pl.Tensor[[T_DYN, ROPE_DIM // 2], pl.FP32],
-        compressed_rope_sin: pl.Tensor[[T_DYN, ROPE_DIM // 2], pl.FP32],
-        compressor_wkv: pl.Tensor[[D, HEAD_DIM], pl.BF16],
-        compressor_norm_weight: pl.Tensor[[HEAD_DIM], pl.BF16],
-        compressed_slots: pl.Tensor[[T_DYN], pl.INT64],
-        index_wk: pl.Tensor[[HEAD_DIM, INDEX_DIM], pl.BF16],
-        index_norm_weight: pl.Tensor[[INDEX_DIM], pl.BF16],
-        index_wq_b: pl.Tensor[[Q_LORA, INDEX_H * INDEX_DIM], pl.FP8E4M3FN],
-        index_wq_b_scale: pl.Tensor[[Q_LORA // 32, INDEX_H * INDEX_DIM], pl.FP8E8M0, pl.MX_B_NN],
-        index_weights_proj: pl.Tensor[[D, INDEX_H], pl.BF16],
-        topk_indices: pl.Tensor[[T_DYN, INDEX_TOPK], pl.INT32],
-        pool_block_ids: pl.Tensor[[T_DYN, INDEX_POOL_BLOCKS_DYN], pl.INT32],
-        pool_block_counts: pl.Tensor[[T_DYN], pl.INT32],
-        output_window: pld.DistributedTensor[[DECODE_MAX_TOKENS, D], pl.FP32],
-        output_arrived: pld.DistributedTensor[[TP_SIZE, 1], pl.INT32],
-        output: pl.Tensor[[LOCAL_T_DYN, D], pl.BF16],
-        group_base: pl.Scalar[pl.INT32],
-        tp_rank: pl.Scalar[pl.INT32],
-        num_tokens: pl.Scalar[pl.INT32],
-        attention_epoch: pl.Scalar[pl.INT32],
-    ):
-        cache_ready = c1a_previous_epoch(output_arrived, attention_epoch)
-        (qr, query, qr_tid, q_tid) = c1a_prepare(
-            x, wq_a, wq_a_scale, q_norm_weight, wq_b, wq_b_scale, wkv, wkv_scale, kv_norm_weight, rope_cos,
-            rope_sin, window_slots, window_cache, window_cache_scale, num_tokens, cache_ready,
-        )
-        tokens = pl.tensor.dim(x, 0)
-        projected = pl.create_tensor([tokens, HEAD_DIM], dtype=pl.BF16)
-        pc_tid = project_compressor(x, compressor_wkv, projected, num_tokens, cache_ready)
-        latent = pl.create_tensor([tokens, HEAD_DIM], dtype=pl.BF16)
-        norm_blocks = (num_tokens + 7) // 8
-        with pl.spmd(norm_blocks, name_hint="c1a_compressor_rmsnorm", deps=[pc_tid]) as nc_tid:
-            norm_worker = pl.tile.get_block_idx()
-            rms_norm(projected, compressor_norm_weight, latent, norm_worker, num_tokens, width=HEAD_DIM)
-        projected_key = pl.create_tensor([tokens, INDEX_DIM], dtype=pl.BF16)
-        pk_tid = project_index_key(latent, index_wk, projected_key, num_tokens, nc_tid)
-        normalized_key = pl.create_tensor([tokens, INDEX_DIM], dtype=pl.BF16)
-        norm_blocks = (num_tokens + 7) // 8
-        with pl.spmd(norm_blocks, name_hint="c1a_index_key_rmsnorm", deps=[pk_tid]) as nk_tid:
-            norm_worker = pl.tile.get_block_idx()
-            rms_norm(projected_key, index_norm_weight, normalized_key, norm_worker, num_tokens, width=INDEX_DIM)
-        index_key = pl.create_tensor([tokens, INDEX_DIM], dtype=pl.BF16)
-        ik_tid = rotate_index_key(
-            normalized_key, compressed_rope_cos, compressed_rope_sin, index_key, num_tokens, nk_tid,
-        )
-        index_ready = publish_index(
-            index_key, compressed_slots, index_cache, index_cache_scale, num_tokens, cache_ready, ik_tid,
-        )
-        rotated = pl.create_tensor([tokens, HEAD_DIM], dtype=pl.BF16)
-        rc_tid = rotate_compressor(latent, compressed_rope_cos, compressed_rope_sin, rotated, num_tokens, nc_tid)
-        publish_compressed(
-            rotated, compressed_slots, compressed_cache, compressed_cache_scale, num_tokens, cache_ready, rc_tid,
-        )
-        # Full score width follows the logical page-table capacity.
-        score_width = pl.tensor.dim(index_block_table, 1) * 128
-        (index_query, index_query_scale, index_weights, scores, query_tid, weights_tid) = c1a_index(
-            x, qr, index_wq_b, index_wq_b_scale, index_weights_proj, rope_cos, rope_sin,
-            num_tokens, score_width, cache_ready, qr_tid,
-        )
-        scores_tid = score_full(
-            index_query, index_query_scale, index_weights, index_cache, index_cache_scale,
-            index_block_table, request_ids, compressed_lens,
-            scores, num_tokens, index_ready, query_tid, weights_tid,
-        )
-        topk_tid = select_index_topk(scores, index_block_table, request_ids, topk_indices, num_tokens, scores_tid)
-        pool_tid = select_candidate_block_pool(
-            scores, compressed_lens, pool_block_ids, pool_block_counts, num_tokens, scores_tid,
-        )
-        selection_ready = pl.system.task_dummy(deps=[topk_tid, pool_tid])
-        reducer(
-            query, window_cache, window_cache_scale, compressed_cache, compressed_cache_scale, window_indices,
-            topk_indices, attn_sink, wo_a, wo_b, wo_b_scale, rope_cos, rope_sin, output_window, output_arrived,
-            output, group_base, tp_rank, num_tokens, attention_epoch, q_tid, selection_ready,
-        )
-        return output, topk_indices, pool_block_ids, pool_block_counts
-
-    return decode_attn_c1a_full
-
-
-decode_attn_c1a_full = make_decode_attn_c1a_full()
-decode_attn_c1a_full_sharded = make_decode_attn_c1a_full(c1a_finish_sharded)
+@pl.jit.inline(auto_scope=False)
+def decode_attn_c1a_full_sharded(
+    x: pl.Tensor[[T_DYN, D], pl.BF16],
+    wq_a: pl.Tensor[[D, Q_LORA], pl.FP8E4M3FN],
+    wq_a_scale: pl.Tensor[[D // 32, Q_LORA], pl.FP8E8M0, pl.MX_B_NN],
+    q_norm_weight: pl.Tensor[[Q_LORA], pl.BF16],
+    wq_b: pl.Tensor[[Q_LORA, LOCAL_H * HEAD_DIM], pl.FP8E4M3FN],
+    wq_b_scale: pl.Tensor[[Q_LORA // 32, LOCAL_H * HEAD_DIM], pl.FP8E8M0, pl.MX_B_NN],
+    wkv: pl.Tensor[[D, HEAD_DIM], pl.FP8E4M3FN],
+    wkv_scale: pl.Tensor[[D // 32, HEAD_DIM], pl.FP8E8M0, pl.MX_B_NN],
+    kv_norm_weight: pl.Tensor[[HEAD_DIM], pl.BF16],
+    attn_sink: pl.Tensor[[LOCAL_H], pl.FP32],
+    wo_a: pl.Tensor[[LOCAL_O_GROUPS, O_LORA, O_GROUP_IN], pl.BF16],
+    wo_b: pl.Tensor[[LOCAL_O_WIDTH, D], pl.FP8E4M3FN],
+    wo_b_scale: pl.Tensor[[LOCAL_O_WIDTH // 32, D], pl.FP8E8M0, pl.MX_B_NN],
+    rope_cos: pl.Tensor[[T_DYN, ROPE_DIM // 2], pl.FP32],
+    rope_sin: pl.Tensor[[T_DYN, ROPE_DIM // 2], pl.FP32],
+    window_slots: pl.Tensor[[T_DYN], pl.INT64],
+    window_indices: pl.Tensor[[T_DYN, 128], pl.INT32],
+    window_cache: pl.Tensor[[ORI_BLOCKS_DYN, 128, 1, HEAD_DIM], pl.FP8E4M3FN],
+    window_cache_scale: pl.Tensor[[ORI_BLOCKS_DYN, 128, 1, HEAD_DIM // WINDOW_CACHE_GROUP], pl.BF16],
+    compressed_cache: pl.Tensor[[CMP_BLOCKS_DYN, 128, 1, HEAD_DIM // 2], pl.UINT8],
+    compressed_cache_scale: pl.Tensor[
+        [CMP_BLOCKS_DYN, 128, 1, HEAD_DIM // COMPRESSED_CACHE_GROUP], pl.BF16
+    ],
+    request_ids: pl.Tensor[[T_DYN], pl.INT32],
+    compressed_lens: pl.Tensor[[T_DYN], pl.INT32],
+    index_cache: pl.Tensor[[INDEX_BLOCKS_DYN, 128, 1, INDEX_DIM // 2], pl.UINT8],
+    index_cache_scale: pl.Tensor[[INDEX_BLOCKS_DYN, 128, 1, INDEX_DIM // INDEX_CACHE_GROUP], pl.FP8E8M0],
+    index_block_table: pl.Tensor[[B_DYN, TABLE_DYN], pl.INT32],
+    compressed_rope_cos: pl.Tensor[[T_DYN, ROPE_DIM // 2], pl.FP32],
+    compressed_rope_sin: pl.Tensor[[T_DYN, ROPE_DIM // 2], pl.FP32],
+    compressor_wkv: pl.Tensor[[D, HEAD_DIM], pl.BF16],
+    compressor_norm_weight: pl.Tensor[[HEAD_DIM], pl.BF16],
+    compressed_slots: pl.Tensor[[T_DYN], pl.INT64],
+    index_wk: pl.Tensor[[HEAD_DIM, INDEX_DIM], pl.BF16],
+    index_norm_weight: pl.Tensor[[INDEX_DIM], pl.BF16],
+    index_wq_b: pl.Tensor[[Q_LORA, INDEX_H * INDEX_DIM], pl.FP8E4M3FN],
+    index_wq_b_scale: pl.Tensor[[Q_LORA // 32, INDEX_H * INDEX_DIM], pl.FP8E8M0, pl.MX_B_NN],
+    index_weights_proj: pl.Tensor[[D, INDEX_H], pl.BF16],
+    topk_indices: pl.Tensor[[T_DYN, INDEX_TOPK], pl.INT32],
+    pool_block_ids: pl.Tensor[[T_DYN, INDEX_POOL_BLOCKS_DYN], pl.INT32],
+    pool_block_counts: pl.Tensor[[T_DYN], pl.INT32],
+    output_window: pld.DistributedTensor[[DECODE_MAX_TOKENS, D], pl.FP32],
+    output_arrived: pld.DistributedTensor[[TP_SIZE, 1], pl.INT32],
+    output: pl.Tensor[[LOCAL_T_DYN, D], pl.BF16],
+    group_base: pl.Scalar[pl.INT32],
+    tp_rank: pl.Scalar[pl.INT32],
+    num_tokens: pl.Scalar[pl.INT32],
+    attention_epoch: pl.Scalar[pl.INT32],
+):
+    cache_ready = c1a_previous_epoch(output_arrived, attention_epoch)
+    (qr, query, qr_tid, q_tid) = c1a_prepare(
+        x, wq_a, wq_a_scale, q_norm_weight, wq_b, wq_b_scale, wkv, wkv_scale, kv_norm_weight, rope_cos,
+        rope_sin, window_slots, window_cache, window_cache_scale, num_tokens, cache_ready,
+    )
+    tokens = pl.tensor.dim(x, 0)
+    projected = pl.create_tensor([tokens, HEAD_DIM], dtype=pl.BF16)
+    pc_tid = project_compressor(x, compressor_wkv, projected, num_tokens, cache_ready)
+    latent = pl.create_tensor([tokens, HEAD_DIM], dtype=pl.BF16)
+    norm_blocks = (num_tokens + 7) // 8
+    with pl.spmd(norm_blocks, name_hint="c1a_compressor_rmsnorm", deps=[pc_tid]) as nc_tid:
+        norm_worker = pl.tile.get_block_idx()
+        rms_norm(projected, compressor_norm_weight, latent, norm_worker, num_tokens, width=HEAD_DIM)
+    projected_key = pl.create_tensor([tokens, INDEX_DIM], dtype=pl.BF16)
+    pk_tid = project_index_key(latent, index_wk, projected_key, num_tokens, nc_tid)
+    normalized_key = pl.create_tensor([tokens, INDEX_DIM], dtype=pl.BF16)
+    norm_blocks = (num_tokens + 7) // 8
+    with pl.spmd(norm_blocks, name_hint="c1a_index_key_rmsnorm", deps=[pk_tid]) as nk_tid:
+        norm_worker = pl.tile.get_block_idx()
+        rms_norm(projected_key, index_norm_weight, normalized_key, norm_worker, num_tokens, width=INDEX_DIM)
+    index_key = pl.create_tensor([tokens, INDEX_DIM], dtype=pl.BF16)
+    ik_tid = rotate_index_key(
+        normalized_key, compressed_rope_cos, compressed_rope_sin, index_key, num_tokens, nk_tid,
+    )
+    index_ready = publish_index(
+        index_key, compressed_slots, index_cache, index_cache_scale, num_tokens, cache_ready, ik_tid,
+    )
+    rotated = pl.create_tensor([tokens, HEAD_DIM], dtype=pl.BF16)
+    rc_tid = rotate_compressor(latent, compressed_rope_cos, compressed_rope_sin, rotated, num_tokens, nc_tid)
+    publish_compressed(
+        rotated, compressed_slots, compressed_cache, compressed_cache_scale, num_tokens, cache_ready, rc_tid,
+    )
+    # Full score width follows the logical page-table capacity.
+    score_width = pl.tensor.dim(index_block_table, 1) * 128
+    (index_query, index_query_scale, index_weights, scores, query_tid, weights_tid) = c1a_index(
+        x, qr, index_wq_b, index_wq_b_scale, index_weights_proj, rope_cos, rope_sin,
+        num_tokens, score_width, cache_ready, qr_tid,
+    )
+    scores_tid = score_full(
+        index_query, index_query_scale, index_weights, index_cache, index_cache_scale,
+        index_block_table, request_ids, compressed_lens,
+        scores, num_tokens, index_ready, query_tid, weights_tid,
+    )
+    topk_tid = select_index_topk(scores, index_block_table, request_ids, topk_indices, num_tokens, scores_tid)
+    pool_tid = select_candidate_block_pool(
+        scores, compressed_lens, pool_block_ids, pool_block_counts, num_tokens, scores_tid,
+    )
+    selection_ready = pl.system.task_dummy(deps=[topk_tid, pool_tid])
+    c1a_finish_sharded(
+        query, window_cache, window_cache_scale, compressed_cache, compressed_cache_scale, window_indices,
+        topk_indices, attn_sink, wo_a, wo_b, wo_b_scale, rope_cos, rope_sin, output_window, output_arrived,
+        output, group_base, tp_rank, num_tokens, attention_epoch, q_tid, selection_ready,
+    )
+    return output, topk_indices, pool_block_ids, pool_block_counts
 
 
 @pl.jit
@@ -1052,20 +1007,21 @@ def l2_decode_attn_c1a(
     pool_block_counts: pl.Out[pl.Tensor[[T_DYN], pl.INT32]],
     output_window: pld.DistributedTensor[[DECODE_MAX_TOKENS, D], pl.FP32],
     output_arrived: pld.DistributedTensor[[TP_SIZE, 1], pl.INT32],
-    output: pl.Out[pl.Tensor[[T_DYN, D], pl.BF16]],
+    output: pl.Out[pl.Tensor[[LOCAL_T_DYN, D], pl.BF16]],
     group_base: pl.Scalar[pl.INT32],
     tp_rank: pl.Scalar[pl.INT32],
     num_tokens: pl.Scalar[pl.INT32],
     attention_epoch: pl.Scalar[pl.INT32],
 ):
     x.bind_dynamic(0, T_DYN)
+    output.bind_dynamic(0, LOCAL_T_DYN)
     window_cache.bind_dynamic(0, ORI_BLOCKS_DYN)
     compressed_cache.bind_dynamic(0, CMP_BLOCKS_DYN)
     index_cache.bind_dynamic(0, INDEX_BLOCKS_DYN)
     index_block_table.bind_dynamic(0, B_DYN)
     index_block_table.bind_dynamic(1, TABLE_DYN)
     pool_block_ids.bind_dynamic(1, INDEX_POOL_BLOCKS_DYN)
-    return decode_attn_c1a_full(
+    return decode_attn_c1a_full_sharded(
         x, wq_a, wq_a_scale, q_norm_weight, wq_b, wq_b_scale, wkv, wkv_scale, kv_norm_weight, attn_sink,
         wo_a, wo_b, wo_b_scale, rope_cos, rope_sin, window_slots, window_indices, window_cache,
         window_cache_scale, compressed_cache, compressed_cache_scale, request_ids, compressed_lens,
@@ -1118,11 +1074,12 @@ def l3_decode_attn_c1a(
     topk_indices: pl.Out[pl.Tensor[[TP_SIZE, T_DYN, INDEX_TOPK], pl.INT32]],
     pool_block_ids: pl.Out[pl.Tensor[[TP_SIZE, T_DYN, INDEX_POOL_BLOCKS_DYN], pl.INT32]],
     pool_block_counts: pl.Out[pl.Tensor[[TP_SIZE, T_DYN], pl.INT32]],
-    output: pl.Out[pl.Tensor[[TP_SIZE, T_DYN, D], pl.BF16]],
+    output: pl.Out[pl.Tensor[[TP_SIZE, LOCAL_T_DYN, D], pl.BF16]],
     num_tokens: pl.Scalar[pl.INT32],
     attention_epoch: pl.Scalar[pl.INT32],
 ):
     x.bind_dynamic(1, T_DYN)
+    output.bind_dynamic(1, LOCAL_T_DYN)
     rope_cos.bind_dynamic(1, T_DYN)
     window_cache.bind_dynamic(1, ORI_BLOCKS_DYN)
     compressed_cache.bind_dynamic(1, CMP_BLOCKS_DYN)
@@ -1158,7 +1115,6 @@ def l3_decode_attn_c1a(
             index_weights_proj[rank], topk_indices[rank], pool_block_ids[rank], pool_block_counts[rank], output_window,
             output_arrived, output[rank], 0, rank, num_tokens, attention_epoch, device=rank,
         )
-
 
 
 def build_validation_values(mode, tokens, pages, requests=1, seed=17, case="random"):
@@ -1411,6 +1367,8 @@ if __name__ == "__main__":
         parser.error(f"require 1 <= requests <= min({MAX_BATCH_PER_DP}, tokens {args.tokens})")
     host = l3_decode_attn_c1a
     values = build_validation_values("full", args.tokens, args.pages, args.requests, args.seed, args.case)
+    local_tokens = (args.tokens + TP_SIZE - 1) // TP_SIZE
+    values["output"] = torch.zeros(TP_SIZE, local_tokens, D, dtype=torch.bfloat16)
     # Independent initial storage for each harness allocation.
     specs = [
         TensorSpec(n, list(values[n].shape), values[n].dtype, init_value=lambda n=n: values[n].clone())
@@ -1434,7 +1392,14 @@ if __name__ == "__main__":
         reduced = torch.zeros_like(partials[0])
         for partial in partials:
             reduced += partial
-        tensors["output"].copy_(reduced.to(torch.bfloat16).unsqueeze(0).expand_as(tensors["output"]))
+        reduced_bf16 = reduced.to(torch.bfloat16)
+        width = tensors["output"].shape[1]
+        for rank in range(TP_SIZE):
+            first = min(rank * width, args.tokens)
+            count = max(0, min(width, args.tokens - first))
+            tensors["output"][rank].zero_()
+            if count:
+                tensors["output"][rank][:count].copy_(reduced_bf16[first : first + count])
 
     comparisons = {
         "topk_indices": ratio_allclose(atol=0.0, rtol=0.0, max_error_ratio=0.02),

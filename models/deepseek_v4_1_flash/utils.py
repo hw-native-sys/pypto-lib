@@ -1282,20 +1282,13 @@ def owner_rows(actual, rank: int, active: int, *, tp_size: int | None = None) ->
     return first, count, width
 
 
-def make_boundary_specs(args, sharded=False):
-    """Create replicated mHC inputs, visible boundaries, and runtime scalars.
-
-    With ``sharded`` the per-token boundaries keep the rank's physical slab.
-    ``local_tokens`` supplies a padded slab extent when present; otherwise it
-    is ``ceil(tokens / tp)``. The gather scratch keeps the full Attention extent.
-    """
+def make_boundary_specs(args):
+    """Create local mHC token slabs, full attention gather storage, and runtime scalars."""
     # Keep one uniform physical slab per rank.  The last rank(s) may contain
     # padding when the active token count is not divisible by TP; the runtime
     # scalar ``num_tokens`` and the collectives' first/count calculation keep
     # those rows out of the gather and reduce-scatter.
-    local = args.tokens
-    if sharded:
-        local = getattr(args, "local_tokens", (args.tokens + args.tp - 1) // args.tp)
+    local = getattr(args, "local_tokens", (args.tokens + args.tp - 1) // args.tp)
     generator = torch.Generator().manual_seed(args.seed + 1000)
     specs = []
     shapes = {
@@ -1314,7 +1307,7 @@ def make_boundary_specs(args, sharded=False):
             value = torch.ones(shape, dtype=torch.bfloat16)
         elif name == "incoming_pre_mix":
             value = torch.softmax(value, dim=-1)
-        if sharded and name in ("x_hc", "incoming_pre_mix"):
+        if name in ("x_hc", "incoming_pre_mix"):
             # Sequence-parallel ranks own different slices of the batch, so the token
             # inputs must differ per rank: with replicated values a gather or
             # ReduceScatter that mis-orders the slabs would still compare equal.
@@ -1333,13 +1326,12 @@ def make_boundary_specs(args, sharded=False):
     ):
         sentinel = 13.0 if name == "attention_output" else 0.0
         specs.append(TensorSpec(name, [args.tp, *shape], dtype, init_value=sentinel, resident="stacked"))
-    if sharded:
-        specs.append(
-            TensorSpec(
-                "gathered", [args.tp, args.tokens, D], torch.bfloat16,
-                init_value=13.0, resident="stacked",
-            )
+    specs.append(
+        TensorSpec(
+            "gathered", [args.tp, args.tokens, D], torch.bfloat16,
+            init_value=13.0, resident="stacked",
         )
+    )
     specs.append(ScalarSpec("num_tokens", torch.int32, args.active_tokens))
     specs.append(
         ScalarSpec(
@@ -1353,7 +1345,7 @@ def make_boundary_specs(args, sharded=False):
     return specs
 
 
-def assemble_specs(args, leaf_specs, spec_names, aliases=None, sharded=False):
+def assemble_specs(args, leaf_specs, spec_names, aliases=None):
     """Combine one leaf's exact specs with the stable half-layer boundary specs."""
     aliases = aliases or {}
     specs = []
@@ -1362,7 +1354,7 @@ def assemble_specs(args, leaf_specs, spec_names, aliases=None, sharded=False):
         if name in ("x", "output", *SCALAR_NAMES):
             continue
         specs.append(spec if name == spec.name else replace(spec, name=name))
-    specs.extend(make_boundary_specs(args, sharded))
+    specs.extend(make_boundary_specs(args))
     by_name = {spec.name: spec for spec in specs}
     missing = [name for name in spec_names if name not in by_name]
     if missing:
@@ -1395,20 +1387,6 @@ def make_boundary_comparisons(compare_output):
         "attention_hidden": compare_output,
         "attention_pre_mix": ratio_allclose(atol=1e-4, rtol=1e-4),
     }
-
-
-def wiring_replay_dir(base: str | None, wiring: str) -> str | None:
-    """Namespace a replay directory per wiring.
-
-    The wiring name is the subdirectory, so ``--golden-data``/``--runtime-dir``
-    can never hand one ABI the artifacts of the other: wiring ``W`` always reads
-    ``<base>/W``, whether one wiring or both run in this invocation.
-    """
-    if base is None:
-        return None
-    if wiring not in ("replicated", "sharded"):
-        raise ValueError(f"a replay directory needs a concrete wiring, got {wiring!r}")
-    return str(Path(base) / wiring)
 
 
 @dataclass(frozen=True)

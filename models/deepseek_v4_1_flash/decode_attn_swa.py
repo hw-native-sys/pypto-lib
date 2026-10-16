@@ -29,7 +29,6 @@ from o_proj import o_proj
 from qkv_proj_rope import qkv_proj_rope
 from config import LOCAL_T_DYN
 from o_proj import (
-    decode_tp_output_all_reduce,
     decode_tp_output_reduce_scatter,
 )
 from utils import AttentionGoldenResult, swa_window_cache_compare as window_cache_compare
@@ -150,66 +149,56 @@ def decode_swa_partial(
     return cache_consumed
 
 
-def make_decode_attn_swa(output_reduce=None):
-    """Build the decode_attn_swa leaf around one output collective."""
-    reducer = output_reduce or decode_tp_output_all_reduce
-
-    @pl.jit.inline(auto_scope=False)
-    def decode_attn_swa(
-        x: pl.Tensor[[T_DYN, D], pl.BF16],
-        wq_a: pl.Tensor[[D, Q_LORA], pl.FP8E4M3FN],
-        wq_a_scale: pl.Tensor[[D // 32, Q_LORA], pl.FP8E8M0, pl.MX_B_NN],
-        q_norm_weight: pl.Tensor[[Q_LORA], pl.BF16],
-        wq_b: pl.Tensor[[Q_LORA, LOCAL_H * HEAD_DIM], pl.FP8E4M3FN],
-        wq_b_scale: pl.Tensor[[Q_LORA // 32, LOCAL_H * HEAD_DIM], pl.FP8E8M0, pl.MX_B_NN],
-        wkv: pl.Tensor[[D, HEAD_DIM], pl.FP8E4M3FN],
-        wkv_scale: pl.Tensor[[D // 32, HEAD_DIM], pl.FP8E8M0, pl.MX_B_NN],
-        kv_norm_weight: pl.Tensor[[HEAD_DIM], pl.BF16],
-        attn_sink: pl.Tensor[[LOCAL_H], pl.FP32],
-        wo_a: pl.Tensor[[LOCAL_O_GROUPS, O_LORA, O_GROUP_IN], pl.BF16],
-        wo_b: pl.Tensor[[LOCAL_O_WIDTH, D], pl.FP8E4M3FN],
-        wo_b_scale: pl.Tensor[[LOCAL_O_WIDTH // 32, D], pl.FP8E8M0, pl.MX_B_NN],
-        rope_cos: pl.Tensor[[T_DYN, ROPE_DIM // 2], pl.FP32],
-        rope_sin: pl.Tensor[[T_DYN, ROPE_DIM // 2], pl.FP32],
-        window_slots: pl.Tensor[[T_DYN], pl.INT64],
-        window_indices: pl.Tensor[[T_DYN, 128], pl.INT32],
-        window_cache: pl.Tensor[[ORI_BLOCKS_DYN, 128, 1, HEAD_DIM], pl.FP8E4M3FN],
-        window_cache_scale: pl.Tensor[[ORI_BLOCKS_DYN, 128, 1, HEAD_DIM // WINDOW_CACHE_GROUP], pl.BF16],
-        output_window: pld.DistributedTensor[[DECODE_MAX_TOKENS, D], pl.FP32],
-        output_arrived: pld.DistributedTensor[[TP_SIZE, 1], pl.INT32],
-        output: pl.Tensor[[LOCAL_T_DYN, D], pl.BF16],
-        group_base: pl.Scalar[pl.INT32],
-        tp_rank: pl.Scalar[pl.INT32],
-        num_tokens: pl.Scalar[pl.INT32],
-        attention_epoch: pl.Scalar[pl.INT32],
-    ):
-        """Write BF16 TP output using zero-initialized windows and consecutive 1-based epochs."""
-        # A later epoch must not overwrite cache or transport storage still being read.
-        with pl.at(level=pl.Level.CORE_GROUP, name_hint="swa_previous_epoch", allow_early_resolve=False) as cache_ready:
-            for peer in pl.range(TP_SIZE):
-                pld.system.wait(
-                    output_arrived,
-                    offsets=[peer, 0], expected=(attention_epoch - 1) * 2, cmp=pld.WaitCmp.Ge,
-                )
-        tokens = pl.tensor.dim(x, 0)
-        partial = pl.create_tensor([tokens, D], dtype=pl.FP32)
-        decode_swa_partial(
-            x,
-            wq_a, wq_a_scale, q_norm_weight, wq_b, wq_b_scale,
-            wkv, wkv_scale, kv_norm_weight, attn_sink,
-            wo_a, wo_b, wo_b_scale,
-            rope_cos, rope_sin,
-            window_slots, window_indices, window_cache, window_cache_scale,
-            partial, num_tokens, cache_ready,
-        )
-        reducer(partial, output_window, output_arrived, output, group_base, tp_rank, num_tokens, attention_epoch)
-        return output
-
-    return decode_attn_swa
-
-
-decode_attn_swa = make_decode_attn_swa()
-decode_attn_swa_sharded = make_decode_attn_swa(decode_tp_output_reduce_scatter)
+@pl.jit.inline(auto_scope=False)
+def decode_attn_swa_sharded(
+    x: pl.Tensor[[T_DYN, D], pl.BF16],
+    wq_a: pl.Tensor[[D, Q_LORA], pl.FP8E4M3FN],
+    wq_a_scale: pl.Tensor[[D // 32, Q_LORA], pl.FP8E8M0, pl.MX_B_NN],
+    q_norm_weight: pl.Tensor[[Q_LORA], pl.BF16],
+    wq_b: pl.Tensor[[Q_LORA, LOCAL_H * HEAD_DIM], pl.FP8E4M3FN],
+    wq_b_scale: pl.Tensor[[Q_LORA // 32, LOCAL_H * HEAD_DIM], pl.FP8E8M0, pl.MX_B_NN],
+    wkv: pl.Tensor[[D, HEAD_DIM], pl.FP8E4M3FN],
+    wkv_scale: pl.Tensor[[D // 32, HEAD_DIM], pl.FP8E8M0, pl.MX_B_NN],
+    kv_norm_weight: pl.Tensor[[HEAD_DIM], pl.BF16],
+    attn_sink: pl.Tensor[[LOCAL_H], pl.FP32],
+    wo_a: pl.Tensor[[LOCAL_O_GROUPS, O_LORA, O_GROUP_IN], pl.BF16],
+    wo_b: pl.Tensor[[LOCAL_O_WIDTH, D], pl.FP8E4M3FN],
+    wo_b_scale: pl.Tensor[[LOCAL_O_WIDTH // 32, D], pl.FP8E8M0, pl.MX_B_NN],
+    rope_cos: pl.Tensor[[T_DYN, ROPE_DIM // 2], pl.FP32],
+    rope_sin: pl.Tensor[[T_DYN, ROPE_DIM // 2], pl.FP32],
+    window_slots: pl.Tensor[[T_DYN], pl.INT64],
+    window_indices: pl.Tensor[[T_DYN, 128], pl.INT32],
+    window_cache: pl.Tensor[[ORI_BLOCKS_DYN, 128, 1, HEAD_DIM], pl.FP8E4M3FN],
+    window_cache_scale: pl.Tensor[[ORI_BLOCKS_DYN, 128, 1, HEAD_DIM // WINDOW_CACHE_GROUP], pl.BF16],
+    output_window: pld.DistributedTensor[[DECODE_MAX_TOKENS, D], pl.FP32],
+    output_arrived: pld.DistributedTensor[[TP_SIZE, 1], pl.INT32],
+    output: pl.Tensor[[LOCAL_T_DYN, D], pl.BF16],
+    group_base: pl.Scalar[pl.INT32],
+    tp_rank: pl.Scalar[pl.INT32],
+    num_tokens: pl.Scalar[pl.INT32],
+    attention_epoch: pl.Scalar[pl.INT32],
+):
+    """Write BF16 TP output using zero-initialized windows and consecutive 1-based epochs."""
+    # A later epoch must not overwrite cache or transport storage still being read.
+    with pl.at(level=pl.Level.CORE_GROUP, name_hint="swa_previous_epoch", allow_early_resolve=False) as cache_ready:
+        for peer in pl.range(TP_SIZE):
+            pld.system.wait(
+                output_arrived,
+                offsets=[peer, 0], expected=(attention_epoch - 1) * 2, cmp=pld.WaitCmp.Ge,
+            )
+    tokens = pl.tensor.dim(x, 0)
+    partial = pl.create_tensor([tokens, D], dtype=pl.FP32)
+    decode_swa_partial(
+        x,
+        wq_a, wq_a_scale, q_norm_weight, wq_b, wq_b_scale,
+        wkv, wkv_scale, kv_norm_weight, attn_sink,
+        wo_a, wo_b, wo_b_scale,
+        rope_cos, rope_sin,
+        window_slots, window_indices, window_cache, window_cache_scale,
+        partial, num_tokens, cache_ready,
+    )
+    decode_tp_output_reduce_scatter(partial, output_window, output_arrived, output, group_base, tp_rank, num_tokens, attention_epoch)
+    return output
 
 
 def golden_decode_attn_swa(
@@ -242,7 +231,7 @@ def golden_decode_attn_swa(
     )
 
 
-__all__ = ["decode_attn_swa", "decode_attn_swa_sharded", "golden_decode_attn_swa", "window_cache_compare"]
+__all__ = ["decode_attn_swa_sharded", "golden_decode_attn_swa", "window_cache_compare"]
 
 
 RANKS_DYN = pl.dynamic("RANKS_DYN")
@@ -269,7 +258,7 @@ def l2_decode_attn_swa(
     window_indices: pl.Tensor[[T_DYN, 128], pl.INT32],
     window_cache: pl.InOut[pl.Tensor[[ORI_BLOCKS_DYN, 128, 1, HEAD_DIM], pl.FP8E4M3FN]],
     window_cache_scale: pl.InOut[pl.Tensor[[ORI_BLOCKS_DYN, 128, 1, HEAD_DIM // WINDOW_CACHE_GROUP], pl.BF16]],
-    output: pl.Out[pl.Tensor[[T_DYN, D], pl.BF16]],
+    output: pl.Out[pl.Tensor[[LOCAL_T_DYN, D], pl.BF16]],
     output_window: pld.DistributedTensor[[DECODE_MAX_TOKENS, D], pl.FP32],
     output_arrived: pld.DistributedTensor[[TP_SIZE, 1], pl.INT32],
     rank: pl.Scalar[pl.INT32],
@@ -277,8 +266,9 @@ def l2_decode_attn_swa(
     attention_epoch: pl.Scalar[pl.INT32],
 ):
     x.bind_dynamic(0, T_DYN)
+    output.bind_dynamic(0, LOCAL_T_DYN)
     window_cache.bind_dynamic(0, ORI_BLOCKS_DYN)
-    decode_attn_swa(
+    decode_attn_swa_sharded(
         x, wq_a, wq_a_scale, q_norm_weight, wq_b, wq_b_scale,
         wkv, wkv_scale, kv_norm_weight, attn_sink, wo_a, wo_b, wo_b_scale,
         rope_cos, rope_sin, window_slots, window_indices, window_cache, window_cache_scale,
@@ -309,13 +299,14 @@ def l3_decode_attn_swa(
     window_indices: pl.Tensor[[RANKS_DYN, T_DYN, 128], pl.INT32],
     window_cache: pl.InOut[pl.Tensor[[RANKS_DYN, ORI_BLOCKS_DYN, 128, 1, HEAD_DIM], pl.FP8E4M3FN]],
     window_cache_scale: pl.InOut[pl.Tensor[[RANKS_DYN, ORI_BLOCKS_DYN, 128, 1, HEAD_DIM // WINDOW_CACHE_GROUP], pl.BF16]],
-    output: pl.Out[pl.Tensor[[RANKS_DYN, T_DYN, D], pl.BF16]],
+    output: pl.Out[pl.Tensor[[RANKS_DYN, LOCAL_T_DYN, D], pl.BF16]],
     num_tokens: pl.Scalar[pl.INT32],
     attention_epoch: pl.Scalar[pl.INT32],
 ):
     rope_cos.bind_dynamic(1, T_DYN)
     x.bind_dynamic(0, RANKS_DYN)
     x.bind_dynamic(1, T_DYN)
+    output.bind_dynamic(1, LOCAL_T_DYN)
     window_cache.bind_dynamic(1, ORI_BLOCKS_DYN)
     data_buf = pld.alloc_window_buffer([DECODE_MAX_TOKENS, D], dtype=pl.FP32)
     signal_buf = pld.alloc_window_buffer([TP_SIZE, 1], dtype=pl.INT32)
@@ -406,7 +397,7 @@ if __name__ == "__main__":
     result = run(
         fn=validation_program,
         specs=validation_specs,
-        golden_fn=functools.partial(golden_swa_leaf, mode=mode),
+        golden_fn=functools.partial(golden_swa_leaf, sharded=True, mode=mode),
         compile_only=args.compile_only,
         save_data=args.save_data,
         golden_data=args.golden_data,

@@ -1059,8 +1059,9 @@ def build_swa_leaf_specs(args, mode):
         for name, shape, dtype in zip(SWA_INPUT_NAMES, shapes, dtypes)
     ]
     swa_benchmark_step = 1 if args.bench else None
+    output_tokens = (args.tokens + TP_SIZE - 1) // TP_SIZE if mode == "decode" else args.tokens
     specs += [
-        TensorSpec("output", [world_size, args.tokens, D], bf, resident="stacked"),
+        TensorSpec("output", [world_size, output_tokens, D], bf, resident="stacked"),
         ScalarSpec("num_tokens", torch.int32, args.tokens),
         ScalarSpec("attention_epoch", torch.int32, 1, compile_runtime=True, benchmark_step=swa_benchmark_step),
     ]
