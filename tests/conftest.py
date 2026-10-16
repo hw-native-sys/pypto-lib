@@ -200,7 +200,6 @@ def _install_pypto_stubs() -> None:
     ):
         setattr(language, name, object())
     language.RUNTIME = object()
-    language.constexpr = object()
     language.dynamic = lambda name: name
     language.jit = _identity_jit
 
