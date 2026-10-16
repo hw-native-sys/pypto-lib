@@ -16,6 +16,7 @@ import torch
 
 from golden import ScalarSpec, TensorSpec, mapped_pool_ratio_allclose, ratio_allclose, run
 from utils import AttentionGoldenResult
+from quant import quantize_grouped_mxfp8_weight
 from quant import golden_bf16_gemm, golden_mxfp8_linear
 from qkv_proj_rope import (
     golden_rope_tail,
@@ -394,7 +395,8 @@ def make_c1a_finish(output_reduce=None):
         window_indices: pl.Tensor[[T_DYN, 128], pl.INT32],
         compressed_indices: pl.Tensor[[T_DYN, INDEX_TOPK], pl.INT32],
         sink: pl.Tensor[[LOCAL_H], pl.FP32],
-        wo_a: pl.Tensor[[LOCAL_O_GROUPS, O_LORA, O_GROUP_IN], pl.BF16],
+        wo_a: pl.Tensor[[LOCAL_O_GROUPS, O_GROUP_IN, O_LORA], pl.FP8E4M3FN],
+        wo_a_scale: pl.Tensor[[LOCAL_O_GROUPS, O_GROUP_IN // 32, O_LORA], pl.FP8E8M0],
         wo_b: pl.Tensor[[LOCAL_O_WIDTH, D], pl.FP8E4M3FN],
         wo_b_scale: pl.Tensor[[LOCAL_O_WIDTH // 32, D], pl.FP8E8M0, pl.MX_B_NN],
         cos: pl.Tensor[[T_DYN, ROPE_DIM // 2], pl.FP32],
@@ -424,7 +426,7 @@ def make_c1a_finish(output_reduce=None):
         )
         partial = pl.create_tensor([tokens, D], dtype=pl.FP32)
         ob_tid = o_proj_with_deps(
-            attended, wo_a, wo_b, wo_b_scale, cos, sin, partial, num_tokens, attend_tid
+            attended, wo_a, wo_a_scale, wo_b, wo_b_scale, cos, sin, partial, num_tokens, attend_tid
         )
         reducer(
             partial, output_window, output_arrived, output, group_base, tp_rank, num_tokens, attention_epoch,
@@ -846,7 +848,7 @@ def golden_reference_c1a(**args):
     attended = golden_rope_tail(attended, a["rope_cos"], a["rope_sin"], True)
     grouped = attended.flatten(-2).unflatten(-1, (a["wo_a"].shape[0], -1))
     # The device writes the grouped projection as BF16 after one FP32 accumulation.
-    latent = golden_grouped_output(grouped, a["wo_a"])
+    latent = golden_grouped_output(grouped, a["wo_a"], a["wo_a_scale"])
     output = golden_mxfp8_linear(latent.flatten(-2), a["wo_b"], a["wo_b_scale"])
     return AttentionGoldenResult(output, window, window_scale, compressed, compressed_scale,
                                  index, index_scale, None, topk, candidates)
@@ -870,6 +872,7 @@ def golden_decode_attn_c1a_reuse(
     kv_norm_weight: torch.Tensor,
     attn_sink: torch.Tensor,
     wo_a: torch.Tensor,
+    wo_a_scale: torch.Tensor,
     wo_b: torch.Tensor,
     wo_b_scale: torch.Tensor,
     rope_cos: torch.Tensor,
@@ -896,7 +899,7 @@ def golden_decode_attn_c1a_reuse(
         wkv_scale=wkv_scale,
         kv_norm_weight=kv_norm_weight,
         attn_sink=attn_sink,
-        wo_a=wo_a,
+        wo_a=wo_a, wo_a_scale=wo_a_scale,
         wo_b=wo_b,
         wo_b_scale=wo_b_scale,
         rope_cos=rope_cos,
@@ -943,6 +946,7 @@ def golden_decode_attn_c1a_reindex(
     kv_norm_weight: torch.Tensor,
     attn_sink: torch.Tensor,
     wo_a: torch.Tensor,
+    wo_a_scale: torch.Tensor,
     wo_b: torch.Tensor,
     wo_b_scale: torch.Tensor,
     rope_cos: torch.Tensor,
@@ -977,7 +981,7 @@ def golden_decode_attn_c1a_reindex(
         wkv_scale=wkv_scale,
         kv_norm_weight=kv_norm_weight,
         attn_sink=attn_sink,
-        wo_a=wo_a,
+        wo_a=wo_a, wo_a_scale=wo_a_scale,
         wo_b=wo_b,
         wo_b_scale=wo_b_scale,
         rope_cos=rope_cos,
@@ -1038,6 +1042,7 @@ def golden_decode_attn_c1a_full(
     kv_norm_weight: torch.Tensor,
     attn_sink: torch.Tensor,
     wo_a: torch.Tensor,
+    wo_a_scale: torch.Tensor,
     wo_b: torch.Tensor,
     wo_b_scale: torch.Tensor,
     rope_cos: torch.Tensor,
@@ -1078,7 +1083,7 @@ def golden_decode_attn_c1a_full(
         wkv_scale=wkv_scale,
         kv_norm_weight=kv_norm_weight,
         attn_sink=attn_sink,
-        wo_a=wo_a,
+        wo_a=wo_a, wo_a_scale=wo_a_scale,
         wo_b=wo_b,
         wo_b_scale=wo_b_scale,
         rope_cos=rope_cos,
@@ -1129,7 +1134,8 @@ def make_decode_attn_c1a_full(output_reduce=None):
         wkv_scale: pl.Tensor[[D // 32, HEAD_DIM], pl.FP8E8M0, pl.MX_B_NN],
         kv_norm_weight: pl.Tensor[[HEAD_DIM], pl.BF16],
         attn_sink: pl.Tensor[[LOCAL_H], pl.FP32],
-        wo_a: pl.Tensor[[LOCAL_O_GROUPS, O_LORA, O_GROUP_IN], pl.BF16],
+        wo_a: pl.Tensor[[LOCAL_O_GROUPS, O_GROUP_IN, O_LORA], pl.FP8E4M3FN],
+        wo_a_scale: pl.Tensor[[LOCAL_O_GROUPS, O_GROUP_IN // 32, O_LORA], pl.FP8E8M0],
         wo_b: pl.Tensor[[LOCAL_O_WIDTH, D], pl.FP8E4M3FN],
         wo_b_scale: pl.Tensor[[LOCAL_O_WIDTH // 32, D], pl.FP8E8M0, pl.MX_B_NN],
         rope_cos: pl.Tensor[[T_DYN, ROPE_DIM // 2], pl.FP32],
@@ -1217,7 +1223,7 @@ def make_decode_attn_c1a_full(output_reduce=None):
         hierarchical_sparse_indexer(scores, compressed_lens, candidate_mask)
         reducer(
             query, window_cache, window_cache_scale, compressed_cache, compressed_cache_scale, window_indices,
-            topk_indices, attn_sink, wo_a, wo_b, wo_b_scale, rope_cos, rope_sin, output_window, output_arrived,
+            topk_indices, attn_sink, wo_a, wo_a_scale, wo_b, wo_b_scale, rope_cos, rope_sin, output_window, output_arrived,
             output, group_base, tp_rank, num_tokens, attention_epoch, q_tid, topk_tid,
         )
         return output, topk_indices, candidate_mask
@@ -1241,7 +1247,8 @@ def l2_decode_attn_c1a(
     wkv_scale: pl.Tensor[[D // 32, HEAD_DIM], pl.FP8E8M0, pl.MX_B_NN],
     kv_norm_weight: pl.Tensor[[HEAD_DIM], pl.BF16],
     attn_sink: pl.Tensor[[LOCAL_H], pl.FP32],
-    wo_a: pl.Tensor[[LOCAL_O_GROUPS, O_LORA, O_GROUP_IN], pl.BF16],
+    wo_a: pl.Tensor[[LOCAL_O_GROUPS, O_GROUP_IN, O_LORA], pl.FP8E4M3FN],
+    wo_a_scale: pl.Tensor[[LOCAL_O_GROUPS, O_GROUP_IN // 32, O_LORA], pl.FP8E8M0],
     wo_b: pl.Tensor[[LOCAL_O_WIDTH, D], pl.FP8E4M3FN],
     wo_b_scale: pl.Tensor[[LOCAL_O_WIDTH // 32, D], pl.FP8E8M0, pl.MX_B_NN],
     rope_cos: pl.Tensor[[T_DYN, ROPE_DIM // 2], pl.FP32],
@@ -1292,7 +1299,7 @@ def l2_decode_attn_c1a(
     candidate_mask.bind_dynamic(1, CMP_POSITIONS_DYN)
     return decode_attn_c1a_full(
         x, wq_a, wq_a_scale, q_norm_weight, wq_b, wq_b_scale, wkv, wkv_scale, kv_norm_weight, attn_sink,
-        wo_a, wo_b, wo_b_scale, rope_cos, rope_sin, window_slots, window_indices, window_cache,
+        wo_a, wo_a_scale, wo_b, wo_b_scale, rope_cos, rope_sin, window_slots, window_indices, window_cache,
         window_cache_scale, compressed_cache, compressed_cache_scale, request_ids, compressed_lens,
         index_cache, index_cache_scale, index_block_table, compressed_rope_cos, compressed_rope_sin,
         compressor_wkv, compressor_norm_weight, compressed_slots, index_wk, index_norm_weight, index_wq_b,
@@ -1313,7 +1320,8 @@ def l3_decode_attn_c1a(
     wkv_scale: pl.Tensor[[TP_SIZE, D // 32, HEAD_DIM], pl.FP8E8M0],
     kv_norm_weight: pl.Tensor[[TP_SIZE, HEAD_DIM], pl.BF16],
     attn_sink: pl.Tensor[[TP_SIZE, LOCAL_H], pl.FP32],
-    wo_a: pl.Tensor[[TP_SIZE, LOCAL_O_GROUPS, O_LORA, O_GROUP_IN], pl.BF16],
+    wo_a: pl.Tensor[[TP_SIZE, LOCAL_O_GROUPS, O_GROUP_IN, O_LORA], pl.FP8E4M3FN],
+    wo_a_scale: pl.Tensor[[TP_SIZE, LOCAL_O_GROUPS, O_GROUP_IN // 32, O_LORA], pl.FP8E8M0],
     wo_b: pl.Tensor[[TP_SIZE, LOCAL_O_WIDTH, D], pl.FP8E4M3FN],
     wo_b_scale: pl.Tensor[[TP_SIZE, LOCAL_O_WIDTH // 32, D], pl.FP8E8M0],
     rope_cos: pl.Tensor[[TP_SIZE, T_DYN, ROPE_DIM // 2], pl.FP32],
@@ -1370,7 +1378,7 @@ def l3_decode_attn_c1a(
         ] = index_wq_b_scale[rank]
         l2_decode_attn_c1a(
             x[rank], wq_a[rank], wq_a_scale_r, q_norm_weight[rank], wq_b[rank], wq_b_scale_r,
-            wkv[rank], wkv_scale_r, kv_norm_weight[rank], attn_sink[rank], wo_a[rank],
+            wkv[rank], wkv_scale_r, kv_norm_weight[rank], attn_sink[rank], wo_a[rank], wo_a_scale[rank],
             wo_b[rank], wo_b_scale_r, rope_cos[rank], rope_sin[rank], window_slots[rank],
             window_indices[rank], window_cache[rank], window_cache_scale[rank],
             compressed_cache[rank], compressed_cache_scale[rank], request_ids[rank],
@@ -1420,8 +1428,8 @@ def build_validation_values(mode, tokens, pages, requests=1, seed=17, case="rand
     values["q_norm_weight"] = torch.ones(RANKS, Q_LORA, dtype=torch.bfloat16)
     values["kv_norm_weight"] = torch.ones(RANKS, HEAD_DIM, dtype=torch.bfloat16)
     values["attn_sink"] = torch.randn(RANKS, LOCAL_H)
-    values["wo_a"] = (torch.randn(RANKS, LOCAL_O_GROUPS, O_LORA, O_GROUP_IN) / math.sqrt(O_GROUP_IN)).to(
-        torch.bfloat16
+    values["wo_a"], values["wo_a_scale"] = quantize_grouped_mxfp8_weight(
+        torch.randn(RANKS, LOCAL_O_GROUPS, O_LORA, O_GROUP_IN) / math.sqrt(O_GROUP_IN)
     )
     positions = torch.arange(PAGES * 128 - 1, PAGES * 128 - TOKENS - 1, -1)
     freqs_cos, freqs_sin = precompute_rope_tables(PAGES * 128, compressed_attention=True)

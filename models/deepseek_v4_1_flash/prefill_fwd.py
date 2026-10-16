@@ -152,7 +152,8 @@ def prefill_attention(
     wkv_scale: pl.Tensor[[D // 32, HEAD_DIM], pl.FP8E8M0, pl.MX_B_NN],
     kv_norm_weight: pl.Tensor[[HEAD_DIM], pl.BF16],
     attn_sink: pl.Tensor[[LOCAL_H], pl.FP32],
-    wo_a: pl.Tensor[[LOCAL_O_GROUPS, O_LORA, O_GROUP_IN], pl.BF16],
+    wo_a: pl.Tensor[[LOCAL_O_GROUPS, O_GROUP_IN, O_LORA], pl.FP8E4M3FN],
+    wo_a_scale: pl.Tensor[[LOCAL_O_GROUPS, O_GROUP_IN // 32, O_LORA], pl.FP8E8M0],
     wo_b: pl.Tensor[[LOCAL_O_WIDTH, D], pl.FP8E4M3FN],
     wo_b_scale: pl.Tensor[[LOCAL_O_WIDTH // 32, D], pl.FP8E8M0, pl.MX_B_NN],
     rope_cos: pl.Tensor[[T_DYN, ROPE_DIM // 2], pl.FP32],
@@ -202,7 +203,7 @@ def prefill_attention(
         prefill_attn_swa(
             x, wq_a, wq_a_scale, q_norm_weight, wq_b,
             wq_b_scale, wkv, wkv_scale, kv_norm_weight, attn_sink,
-            wo_a, wo_b, wo_b_scale, rope_cos, rope_sin,
+            wo_a, wo_a_scale, wo_b, wo_b_scale, rope_cos, rope_sin,
             window_slots, window_indices, window_cache, window_cache_scale, output_window,
             output_arrived, output, group_base, tp_rank, num_tokens,
             attention_epoch,
@@ -211,7 +212,7 @@ def prefill_attention(
         prefill_attn_c2a_full(
             x, wq_a, wq_a_scale, q_norm_weight, wq_b,
             wq_b_scale, wkv, wkv_scale, kv_norm_weight, attn_sink,
-            wo_a, wo_b, wo_b_scale, rope_cos, rope_sin,
+            wo_a, wo_a_scale, wo_b, wo_b_scale, rope_cos, rope_sin,
             window_slots, window_indices, window_cache, window_cache_scale, compressed_cache,
             compressed_cache_scale, token_to_req_indices, compressed_lens, index_cache, index_cache_scale,
             index_block_table, position_ids, compressed_rope_cos, compressed_rope_sin, compressor_wkv,
@@ -224,7 +225,7 @@ def prefill_attention(
         prefill_attn_c2a_reuse(
             x, wq_a, wq_a_scale, q_norm_weight, wq_b,
             wq_b_scale, wkv, wkv_scale, kv_norm_weight, attn_sink,
-            wo_a, wo_b, wo_b_scale, rope_cos, rope_sin,
+            wo_a, wo_a_scale, wo_b, wo_b_scale, rope_cos, rope_sin,
             window_slots, window_indices, window_cache, window_cache_scale, compressed_cache,
             compressed_cache_scale, topk_indices, output_window, output_arrived, output,
             group_base, tp_rank, num_tokens, attention_epoch,
@@ -233,7 +234,7 @@ def prefill_attention(
         initial_index(
             x, wq_a, wq_a_scale, q_norm_weight, wq_b,
             wq_b_scale, wkv, wkv_scale, kv_norm_weight, attn_sink,
-            wo_a, wo_b, wo_b_scale, rope_cos, rope_sin,
+            wo_a, wo_a_scale, wo_b, wo_b_scale, rope_cos, rope_sin,
             window_slots, window_indices, window_cache, window_cache_scale, compressed_cache,
             compressed_cache_scale, token_to_req_indices, compressed_lens, index_cache, index_cache_scale,
             index_block_table, candidate_mask, index_wq_b, index_wq_b_scale, index_weights_proj,
@@ -244,7 +245,7 @@ def prefill_attention(
         prefill_attn_c1a_reindex(
             x, wq_a, wq_a_scale, q_norm_weight, wq_b,
             wq_b_scale, wkv, wkv_scale, kv_norm_weight, attn_sink,
-            wo_a, wo_b, wo_b_scale, rope_cos, rope_sin,
+            wo_a, wo_a_scale, wo_b, wo_b_scale, rope_cos, rope_sin,
             window_slots, window_indices, window_cache, window_cache_scale, compressed_cache,
             compressed_cache_scale, token_to_req_indices, compressed_lens, index_cache, index_cache_scale,
             index_block_table, candidate_mask, index_wq_b, index_wq_b_scale, index_weights_proj,
@@ -255,7 +256,7 @@ def prefill_attention(
         prefill_attn_c1a_reuse(
             x, wq_a, wq_a_scale, q_norm_weight, wq_b,
             wq_b_scale, wkv, wkv_scale, kv_norm_weight, attn_sink,
-            wo_a, wo_b, wo_b_scale, rope_cos, rope_sin,
+            wo_a, wo_a_scale, wo_b, wo_b_scale, rope_cos, rope_sin,
             window_slots, window_indices, window_cache, window_cache_scale, compressed_cache,
             compressed_cache_scale, topk_indices, output_window, output_arrived, output,
             group_base, tp_rank, num_tokens, attention_epoch,
@@ -275,9 +276,9 @@ def l2_prefill_fwd(
     scales8: pl.Tensor[[S8, 128], pl.FP8E8M0],
     bf16: pl.Tensor[[B16], pl.BF16],
     dense: pl.Tensor[[B32], pl.FP32],
-    fp8_offsets: pl.Tensor[[40, 8], pl.INT64],
-    fp8_scale_offsets: pl.Tensor[[40, 8], pl.INT64],
-    bf16_offsets: pl.Tensor[[40, 10], pl.INT64],
+    fp8_offsets: pl.Tensor[[40, 9], pl.INT64],
+    fp8_scale_offsets: pl.Tensor[[40, 9], pl.INT64],
+    bf16_offsets: pl.Tensor[[40, 9], pl.INT64],
     dense_offsets: pl.Tensor[[40, 11], pl.INT64],
     expert_offsets: pl.Tensor[[40, 3], pl.INT64],
     expert_scale_offsets: pl.Tensor[[40, 3], pl.INT64],
@@ -419,22 +420,25 @@ def l2_prefill_fwd(
         kv_norm_offset = pl.cast(pl.max(pl.read(bf16_offsets, [layer, 3]), 0), pl.INDEX)
         kv_norm_storage = pl.slice(bf16, [HEAD_DIM], [kv_norm_offset])
         kv_norm = pl.reshape(kv_norm_storage, [HEAD_DIM])
-        wo_a_offset = pl.cast(pl.max(pl.read(bf16_offsets, [layer, 4]), 0), pl.INDEX)
-        wo_a_storage = pl.slice(bf16, [LOCAL_O_GROUPS * O_LORA * O_GROUP_IN], [wo_a_offset])
-        wo_a = pl.reshape(wo_a_storage, [LOCAL_O_GROUPS, O_LORA, O_GROUP_IN])
-        publisher_wkv_offset = pl.cast(pl.max(pl.read(bf16_offsets, [layer, 5]), 0), pl.INDEX)
+        wo_a_offset = pl.cast(pl.max(pl.read(fp8_offsets, [layer, 8]), 0), pl.INDEX)
+        wo_a_storage = pl.slice(bank8, [(LOCAL_O_GROUPS * O_GROUP_IN * O_LORA) // 128, 128], [wo_a_offset // 128, 0])
+        wo_a = pl.reshape(wo_a_storage, [LOCAL_O_GROUPS, O_GROUP_IN, O_LORA])
+        wo_a_scale_offset = pl.cast(pl.max(pl.read(fp8_scale_offsets, [layer, 8]), 0), pl.INDEX)
+        wo_a_scale_storage = pl.slice(scales8, [(LOCAL_O_GROUPS * (O_GROUP_IN // 32) * O_LORA) // 128, 128], [wo_a_scale_offset // 128, 0])
+        wo_a_scale = pl.reshape(wo_a_scale_storage, [LOCAL_O_GROUPS, O_GROUP_IN // 32, O_LORA])
+        publisher_wkv_offset = pl.cast(pl.max(pl.read(bf16_offsets, [layer, 4]), 0), pl.INDEX)
         publisher_wkv_storage = pl.slice(bf16, [D * HEAD_DIM], [publisher_wkv_offset])
         publisher_wkv = pl.reshape(publisher_wkv_storage, [D, HEAD_DIM])
-        compressor_norm_offset = pl.cast(pl.max(pl.read(bf16_offsets, [layer, 6]), 0), pl.INDEX)
+        compressor_norm_offset = pl.cast(pl.max(pl.read(bf16_offsets, [layer, 5]), 0), pl.INDEX)
         compressor_norm_storage = pl.slice(bf16, [HEAD_DIM], [compressor_norm_offset])
         compressor_norm = pl.reshape(compressor_norm_storage, [HEAD_DIM])
-        index_wk_offset = pl.cast(pl.max(pl.read(bf16_offsets, [layer, 7]), 0), pl.INDEX)
+        index_wk_offset = pl.cast(pl.max(pl.read(bf16_offsets, [layer, 6]), 0), pl.INDEX)
         index_wk_storage = pl.slice(bf16, [HEAD_DIM * INDEX_DIM], [index_wk_offset])
         index_wk = pl.reshape(index_wk_storage, [HEAD_DIM, INDEX_DIM])
-        index_norm_offset = pl.cast(pl.max(pl.read(bf16_offsets, [layer, 8]), 0), pl.INDEX)
+        index_norm_offset = pl.cast(pl.max(pl.read(bf16_offsets, [layer, 7]), 0), pl.INDEX)
         index_norm_storage = pl.slice(bf16, [INDEX_DIM], [index_norm_offset])
         index_norm = pl.reshape(index_norm_storage, [INDEX_DIM])
-        index_weights_offset = pl.cast(pl.max(pl.read(bf16_offsets, [layer, 9]), 0), pl.INDEX)
+        index_weights_offset = pl.cast(pl.max(pl.read(bf16_offsets, [layer, 8]), 0), pl.INDEX)
         index_weights_storage = pl.slice(bf16, [D * INDEX_H], [index_weights_offset])
         index_weights = pl.reshape(index_weights_storage, [D, INDEX_H])
         attn_fn_offset = pl.cast(pl.max(pl.read(dense_offsets, [layer, 0]), 0), pl.INDEX)
@@ -541,7 +545,7 @@ def l2_prefill_fwd(
             state_slot = pl.min(cache_slot, 2)
             prefill_attention(
                 normalized, wq_a, wq_a_scale, q_norm, wq_b, wq_b_scale, wkv, wkv_scale, kv_norm,
-                attn_sink, wo_a, wo_b, wo_b_scale, rope_cos[rope_slot], rope_sin[rope_slot],
+                attn_sink, wo_a, wo_a_scale, wo_b, wo_b_scale, rope_cos[rope_slot], rope_sin[rope_slot],
                 window_slots[stage], window_indices[stage], window_cache[layer], window_scales[layer],
                 compressed_cache[cache_slot], compressed_scales[cache_slot], token_requests[stage],
                 compressed_lens[stage], index_cache[cache_slot], index_scales[cache_slot],
@@ -585,9 +589,9 @@ def l3_prefill_fwd(
     scales8: pl.Tensor[[RANKS, S8, 128], pl.FP8E8M0],
     bf16: pl.Tensor[[RANKS, B16], pl.BF16],
     dense: pl.Tensor[[RANKS, B32], pl.FP32],
-    fp8_offsets: pl.Tensor[[RANKS, 40, 8], pl.INT64],
-    fp8_scale_offsets: pl.Tensor[[RANKS, 40, 8], pl.INT64],
-    bf16_offsets: pl.Tensor[[RANKS, 40, 10], pl.INT64],
+    fp8_offsets: pl.Tensor[[RANKS, 40, 9], pl.INT64],
+    fp8_scale_offsets: pl.Tensor[[RANKS, 40, 9], pl.INT64],
+    bf16_offsets: pl.Tensor[[RANKS, 40, 9], pl.INT64],
     dense_offsets: pl.Tensor[[RANKS, 40, 11], pl.INT64],
     expert_offsets: pl.Tensor[[RANKS, 40, 3], pl.INT64],
     expert_scale_offsets: pl.Tensor[[RANKS, 40, 3], pl.INT64],
@@ -908,9 +912,10 @@ def build_tensor_specs():
     fp8_sizes = (
         D * Q_LORA, Q_LORA * LOCAL_H * HEAD_DIM, D * HEAD_DIM, LOCAL_O_WIDTH * D,
         Q_LORA * INDEX_H * INDEX_DIM, D * MOE_INTER, D * MOE_INTER, MOE_INTER * D,
+        LOCAL_O_GROUPS * O_GROUP_IN * O_LORA,
     )
     bf16_sizes = (
-        D, D, Q_LORA, HEAD_DIM, LOCAL_O_GROUPS * O_LORA * O_GROUP_IN,
+        D, D, Q_LORA, HEAD_DIM,
         D * HEAD_DIM, HEAD_DIM, HEAD_DIM * INDEX_DIM, INDEX_DIM, D * INDEX_H,
     )
     dense_sizes = (

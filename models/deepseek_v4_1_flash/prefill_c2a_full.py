@@ -78,6 +78,7 @@ from quant import (
     pack_mx_b_scale,
     quantize_mxfp4_cache,
     quantize_mxfp8_cache,
+    quantize_grouped_mxfp8_weight,
 )
 from rope_tables import precompute_rope_tables
 from utils import paged_slots, window_metadata
@@ -120,7 +121,8 @@ def prefill_c2a_full_sp(
     wkv_scale: pl.Tensor[[D // 32, HEAD_DIM], pl.FP8E8M0, pl.MX_B_NN],
     kv_norm_weight: pl.Tensor[[HEAD_DIM], pl.BF16],
     attn_sink: pl.Tensor[[LOCAL_H], pl.FP32],
-    wo_a: pl.Tensor[[LOCAL_O_GROUPS, O_LORA, O_GROUP_IN], pl.BF16],
+    wo_a: pl.Tensor[[LOCAL_O_GROUPS, O_GROUP_IN, O_LORA], pl.FP8E4M3FN],
+    wo_a_scale: pl.Tensor[[LOCAL_O_GROUPS, O_GROUP_IN // 32, O_LORA], pl.FP8E8M0],
     wo_b: pl.Tensor[[LOCAL_O_WIDTH, D], pl.FP8E4M3FN],
     wo_b_scale: pl.Tensor[[LOCAL_O_WIDTH // 32, D], pl.FP8E8M0, pl.MX_B_NN],
     rope_cos: pl.Tensor[[T_DYN, ROPE_DIM // 2], pl.FP32],
@@ -196,7 +198,7 @@ def prefill_c2a_full_sp(
     if num_tokens > 0:
         prefill_attn_c2a_full_partial(
             attn_input, wq_a, wq_a_scale, q_norm_weight, wq_b, wq_b_scale, wkv, wkv_scale, kv_norm_weight,
-            attn_sink, wo_a, wo_b, wo_b_scale, rope_cos, rope_sin, window_slots, window_indices,
+            attn_sink, wo_a, wo_a_scale, wo_b, wo_b_scale, rope_cos, rope_sin, window_slots, window_indices,
             window_cache, window_cache_scale, compressed_cache, compressed_cache_scale, token_to_req_indices,
             compressed_lens, index_cache, index_cache_scale, index_block_table, position_ids,
             compressed_rope_cos, compressed_rope_sin, compressor_wkv, compressor_wgate,
@@ -232,7 +234,8 @@ def prefill_c2a_full(
     wkv_scale: pl.Tensor[[D // 32, HEAD_DIM], pl.FP8E8M0, pl.MX_B_NN],
     kv_norm_weight: pl.Tensor[[HEAD_DIM], pl.BF16],
     attn_sink: pl.Tensor[[LOCAL_H], pl.FP32],
-    wo_a: pl.Tensor[[LOCAL_O_GROUPS, O_LORA, O_GROUP_IN], pl.BF16],
+    wo_a: pl.Tensor[[LOCAL_O_GROUPS, O_GROUP_IN, O_LORA], pl.FP8E4M3FN],
+    wo_a_scale: pl.Tensor[[LOCAL_O_GROUPS, O_GROUP_IN // 32, O_LORA], pl.FP8E8M0],
     wo_b: pl.Tensor[[LOCAL_O_WIDTH, D], pl.FP8E4M3FN],
     wo_b_scale: pl.Tensor[[LOCAL_O_WIDTH // 32, D], pl.FP8E8M0, pl.MX_B_NN],
     rope_cos: pl.Tensor[[T_DYN, ROPE_DIM // 2], pl.FP32],
@@ -294,7 +297,7 @@ def prefill_c2a_full(
     )
     prefill_attn_c2a_full(
         attn_input, wq_a, wq_a_scale, q_norm_weight, wq_b, wq_b_scale, wkv, wkv_scale, kv_norm_weight,
-        attn_sink, wo_a, wo_b, wo_b_scale, rope_cos, rope_sin, window_slots, window_indices,
+        attn_sink, wo_a, wo_a_scale, wo_b, wo_b_scale, rope_cos, rope_sin, window_slots, window_indices,
         window_cache, window_cache_scale, compressed_cache, compressed_cache_scale, token_to_req_indices,
         compressed_lens, index_cache, index_cache_scale, index_block_table, position_ids,
         compressed_rope_cos, compressed_rope_sin, compressor_wkv, compressor_wgate,
@@ -362,7 +365,7 @@ def golden_reference_c2a(inputs: dict, *, fp32_output=False) -> dict:
     local_heads = t["attn_sink"].numel()
     index_dim = t["index_norm_weight"].numel()
     index_heads = t["index_weights_proj"].shape[-1]
-    groups, _, group_in = t["wo_a"].shape
+    groups, group_in, _ = t["wo_a"].shape
 
     # a. Query/KV projection and rotary embedding.
     qr = golden_rms_norm(golden_mxfp8_linear(x, t["wq_a"], t["wq_a_scale"]), t["q_norm_weight"])
@@ -508,7 +511,7 @@ def golden_reference_c2a(inputs: dict, *, fp32_output=False) -> dict:
     # h. Inverse RoPE, grouped low-rank output projection, per-rank partial.
     attended = golden_rope_tail(attended, t["rope_cos"], t["rope_sin"], inverse=True)
     grouped = attended.reshape(tokens, groups, group_in)
-    projected = golden_grouped_output(grouped, t["wo_a"])
+    projected = golden_grouped_output(grouped, t["wo_a"], t["wo_a_scale"])
     output = golden_mxfp8_linear(projected.flatten(1), t["wo_b"], t["wo_b_scale"], fp32=fp32_output)
 
     return {
@@ -525,7 +528,7 @@ def golden_reference_c2a(inputs: dict, *, fp32_output=False) -> dict:
 
 INPUT_NAMES = (
     "x", "wq_a", "wq_a_scale", "q_norm_weight", "wq_b", "wq_b_scale", "wkv", "wkv_scale",
-    "kv_norm_weight", "attn_sink", "wo_a", "wo_b", "wo_b_scale", "rope_cos", "rope_sin",
+    "kv_norm_weight", "attn_sink", "wo_a", "wo_a_scale", "wo_b", "wo_b_scale", "rope_cos", "rope_sin",
     "window_slots", "window_indices", "window_cache", "window_cache_scale",
     "compressed_cache", "compressed_cache_scale", "token_to_req_indices", "compressed_lens",
     "index_cache", "index_cache_scale", "index_block_table", "position_ids",
@@ -654,6 +657,7 @@ def make_c2a_inputs(tokens=24, requests=6, seed=17, case="mixed", mode="decode",
     compressor_wkv = torch.randn(D, HEAD_DIM, generator=gen) / math.sqrt(D)
     compressor_wgate = torch.randn(D, HEAD_DIM, generator=gen) / math.sqrt(D)
     wo_a_values = torch.randn(LOCAL_O_GROUPS, O_LORA, O_GROUP_IN, generator=gen)
+    wo_a, wo_a_scale = quantize_grouped_mxfp8_weight((wo_a_values / math.sqrt(O_GROUP_IN)).bfloat16())
     # Seed each request's predecessor projections in its physical ring block.
     pending = torch.randn(MAX_BATCH_PER_DP, D, generator=gen).bfloat16().float()
     state_cache = torch.zeros(MAX_BATCH_PER_DP + 1, STATE_CAPACITY, STATE_WIDTH)
@@ -691,7 +695,8 @@ def make_c2a_inputs(tokens=24, requests=6, seed=17, case="mixed", mode="decode",
         "wkv_scale": wkv_scale,
         "kv_norm_weight": (torch.randn(HEAD_DIM, generator=gen) * 0.1 + 1).bfloat16(),
         "attn_sink": torch.randn(LOCAL_H, generator=gen) * 2,
-        "wo_a": (wo_a_values / math.sqrt(O_GROUP_IN)).bfloat16(),
+        "wo_a": wo_a,
+        "wo_a_scale": wo_a_scale,
         "wo_b": wo_b,
         "wo_b_scale": wo_b_scale,
         "rope_cos": rope_cos,
@@ -763,7 +768,7 @@ MUTABLE_NAMES = (
     "state_cache",
 )
 
-SHARDED_NAMES = ("wq_b", "wq_b_scale", "attn_sink", "wo_a", "wo_b", "wo_b_scale")
+SHARDED_NAMES = ("wq_b", "wq_b_scale", "attn_sink", "wo_a", "wo_a_scale", "wo_b", "wo_b_scale")
 
 CACHE_SLOTS = {
     "window_cache": "window_slots",
@@ -812,14 +817,14 @@ CACHE_PAYLOADS = {
 
 REUSE_INPUT_NAMES = (
     "x", "wq_a", "wq_a_scale", "q_norm_weight", "wq_b", "wq_b_scale", "wkv", "wkv_scale",
-    "kv_norm_weight", "attn_sink", "wo_a", "wo_b", "wo_b_scale", "rope_cos", "rope_sin",
+    "kv_norm_weight", "attn_sink", "wo_a", "wo_a_scale", "wo_b", "wo_b_scale", "rope_cos", "rope_sin",
     "window_slots", "window_indices", "window_cache", "window_cache_scale", "compressed_cache",
     "compressed_cache_scale", "compressed_indices",
 )
 
 REUSE_MUTABLE_NAMES = ("window_cache", "window_cache_scale")
 
-REUSE_SHARDED_NAMES = ("wq_b", "wq_b_scale", "attn_sink", "wo_a", "wo_b", "wo_b_scale")
+REUSE_SHARDED_NAMES = ("wq_b", "wq_b_scale", "attn_sink", "wo_a", "wo_a_scale", "wo_b", "wo_b_scale")
 
 def golden_reference_c2a_reuse(inputs: dict, *, fp32_output=False) -> dict:
     """Ratio-2 reuse attention; publishes only the addressed sliding-window rows.
@@ -833,7 +838,7 @@ def golden_reference_c2a_reuse(inputs: dict, *, fp32_output=False) -> dict:
     tokens = x.shape[0]
     head_dim = t["window_cache"].shape[-1]
     local_heads = t["attn_sink"].numel()
-    groups, _, group_in = t["wo_a"].shape
+    groups, group_in, _ = t["wo_a"].shape
 
     qr = golden_rms_norm(golden_mxfp8_linear(x, t["wq_a"], t["wq_a_scale"]), t["q_norm_weight"])
     q = golden_mxfp8_linear(qr, t["wq_b"], t["wq_b_scale"]).unflatten(-1, (local_heads, head_dim))
@@ -894,7 +899,7 @@ def golden_reference_c2a_reuse(inputs: dict, *, fp32_output=False) -> dict:
 
     attended = golden_rope_tail(attended, t["rope_cos"], t["rope_sin"], inverse=True)
     grouped = attended.reshape(tokens, groups, group_in)
-    projected = golden_grouped_output(grouped, t["wo_a"])
+    projected = golden_grouped_output(grouped, t["wo_a"], t["wo_a_scale"])
     output = golden_mxfp8_linear(projected.flatten(1), t["wo_b"], t["wo_b_scale"], fp32=fp32_output)
 
     return {
@@ -1160,7 +1165,8 @@ def l2_prefill_c2a_full(
     wkv_scale: pl.Tensor[[D // 32, HEAD_DIM], pl.FP8E8M0, pl.MX_B_NN],
     kv_norm_weight: pl.Tensor[[HEAD_DIM], pl.BF16],
     attn_sink: pl.Tensor[[LOCAL_H], pl.FP32],
-    wo_a: pl.Tensor[[LOCAL_O_GROUPS, O_LORA, O_GROUP_IN], pl.BF16],
+    wo_a: pl.Tensor[[LOCAL_O_GROUPS, O_GROUP_IN, O_LORA], pl.FP8E4M3FN],
+    wo_a_scale: pl.Tensor[[LOCAL_O_GROUPS, O_GROUP_IN // 32, O_LORA], pl.FP8E8M0],
     wo_b: pl.Tensor[[LOCAL_O_WIDTH, D], pl.FP8E4M3FN],
     wo_b_scale: pl.Tensor[[LOCAL_O_WIDTH // 32, D], pl.FP8E8M0, pl.MX_B_NN],
     freqs_cos: pl.Tensor[[ROPE_ROWS_DYN, ROPE_DIM // 2], pl.FP32],
@@ -1233,7 +1239,7 @@ def l2_prefill_c2a_full(
     prefill_c2a_full_sp(
         x_hc, pre_mix, hc_attn_fn, hc_attn_scale, hc_attn_base, attn_norm_weight,
         wq_a, wq_a_scale, q_norm_weight, wq_b, wq_b_scale, wkv, wkv_scale,
-        kv_norm_weight, attn_sink, wo_a, wo_b, wo_b_scale, rope_cos, rope_sin,
+        kv_norm_weight, attn_sink, wo_a, wo_a_scale, wo_b, wo_b_scale, rope_cos, rope_sin,
         window_slots, window_indices, window_cache, window_cache_scale,
         compressed_cache, compressed_cache_scale, token_to_req_indices, compressed_lens,
         index_cache, index_cache_scale, index_block_table, position_ids,
@@ -1267,7 +1273,8 @@ def l3_prefill_c2a_full(
     wkv_scale: pl.Tensor[[RANKS_DYN, D // 32, HEAD_DIM], pl.FP8E8M0],
     kv_norm_weight: pl.Tensor[[RANKS_DYN, HEAD_DIM], pl.BF16],
     attn_sink: pl.Tensor[[RANKS_DYN, LOCAL_H], pl.FP32],
-    wo_a: pl.Tensor[[RANKS_DYN, LOCAL_O_GROUPS, O_LORA, O_GROUP_IN], pl.BF16],
+    wo_a: pl.Tensor[[RANKS_DYN, LOCAL_O_GROUPS, O_GROUP_IN, O_LORA], pl.FP8E4M3FN],
+    wo_a_scale: pl.Tensor[[RANKS_DYN, LOCAL_O_GROUPS, O_GROUP_IN // 32, O_LORA], pl.FP8E8M0],
     wo_b: pl.Tensor[[RANKS_DYN, LOCAL_O_WIDTH, D], pl.FP8E4M3FN],
     wo_b_scale: pl.Tensor[[RANKS_DYN, LOCAL_O_WIDTH // 32, D], pl.FP8E8M0],
     freqs_cos: pl.Tensor[[RANKS_DYN, ROPE_ROWS_DYN, ROPE_DIM // 2], pl.FP32],
@@ -1345,7 +1352,7 @@ def l3_prefill_c2a_full(
             x_hc[rank], pre_mix[rank], hc_attn_fn[rank], hc_attn_scale[rank], hc_attn_base[rank],
             attn_norm_weight[rank], wq_a[rank], wq_a_scale_r, q_norm_weight[rank], wq_b[rank],
             wq_b_scale_r, wkv[rank], wkv_scale_r, kv_norm_weight[rank],
-            attn_sink[rank], wo_a[rank], wo_b[rank], wo_b_scale_r, freqs_cos[rank],
+            attn_sink[rank], wo_a[rank], wo_a_scale[rank], wo_b[rank], wo_b_scale_r, freqs_cos[rank],
             freqs_sin[rank], window_slots[rank], window_indices[rank], window_cache[rank],
             window_cache_scale[rank], compressed_cache[rank], compressed_cache_scale[rank],
             token_to_req_indices[rank], compressed_lens[rank], index_cache[rank],

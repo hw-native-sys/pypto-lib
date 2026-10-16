@@ -147,7 +147,8 @@ def _decode_encoder(
     wkv: pl.Tensor[[N_LAYERS, D, HEAD_DIM], pl.FP8E4M3FN],
     kv_norm_weight: pl.Tensor[[N_LAYERS * HEAD_DIM], pl.BF16],
     attn_sink: pl.Tensor[[N_LAYERS * LOCAL_H], pl.FP32],
-    wo_a: pl.Tensor[[N_LAYERS * LOCAL_O_GROUPS, O_LORA, O_GROUP_IN], pl.BF16],
+    wo_a: pl.Tensor[[N_LAYERS * LOCAL_O_GROUPS, O_GROUP_IN, O_LORA], pl.FP8E4M3FN],
+    wo_a_scale: pl.Tensor[[N_LAYERS * LOCAL_O_GROUPS, O_GROUP_IN // 32, O_LORA], pl.FP8E8M0],
     wo_b: pl.Tensor[[N_LAYERS, LOCAL_O_WIDTH, D], pl.FP8E4M3FN],
     base_rope_cos: pl.Tensor[[T_DYN, ROPE_DIM // 2], pl.FP32],
     base_rope_sin: pl.Tensor[[T_DYN, ROPE_DIM // 2], pl.FP32],
@@ -301,8 +302,11 @@ def _decode_encoder(
     fwd_swa_layer_2_sink_layer_l0: pl.Tensor[[LOCAL_H], pl.FP32] = pl.slice(
         attn_sink, [LOCAL_H], [0 * LOCAL_H]
     )
-    fwd_swa_layer_2_wo_a_layer_l0: pl.Tensor[[LOCAL_O_GROUPS, O_LORA, O_GROUP_IN], pl.BF16] = pl.slice(
-        wo_a, [LOCAL_O_GROUPS, O_LORA, O_GROUP_IN], [0 * LOCAL_O_GROUPS, 0, 0]
+    fwd_swa_layer_2_wo_a_layer_l0: pl.Tensor[[LOCAL_O_GROUPS, O_GROUP_IN, O_LORA], pl.FP8E4M3FN] = pl.slice(
+        wo_a, [LOCAL_O_GROUPS, O_GROUP_IN, O_LORA], [0 * LOCAL_O_GROUPS, 0, 0]
+    )
+    fwd_swa_layer_2_wo_a_scale_layer_l0: pl.Tensor[[LOCAL_O_GROUPS, O_GROUP_IN // 32, O_LORA], pl.FP8E8M0] = pl.slice(
+        wo_a_scale, [LOCAL_O_GROUPS, O_GROUP_IN // 32, O_LORA], [0 * LOCAL_O_GROUPS, 0, 0]
     )
     fwd_swa_layer_2_wo_b_layer_l0: pl.Tensor[[LOCAL_O_WIDTH, D], pl.FP8E4M3FN] = wo_b[0]
     fwd_swa_layer_2_wo_b_scale_layer_l0: pl.Tensor[[LOCAL_O_WIDTH // MX_GROUP, D], pl.FP8E8M0, pl.MX_B_NN] = (
@@ -325,7 +329,7 @@ def _decode_encoder(
         fwd_swa_layer_2_wkv_scale_layer_l0,
         fwd_swa_layer_2_kv_norm_layer_l0,
         fwd_swa_layer_2_sink_layer_l0,
-        fwd_swa_layer_2_wo_a_layer_l0,
+        fwd_swa_layer_2_wo_a_layer_l0, fwd_swa_layer_2_wo_a_scale_layer_l0,
         fwd_swa_layer_2_wo_b_layer_l0,
         fwd_swa_layer_2_wo_b_scale_layer_l0,
         base_rope_cos,
@@ -492,8 +496,11 @@ def _decode_encoder(
     fwd_swa_layer_10_sink_layer_l1: pl.Tensor[[LOCAL_H], pl.FP32] = pl.slice(
         attn_sink, [LOCAL_H], [1 * LOCAL_H]
     )
-    fwd_swa_layer_10_wo_a_layer_l1: pl.Tensor[[LOCAL_O_GROUPS, O_LORA, O_GROUP_IN], pl.BF16] = pl.slice(
-        wo_a, [LOCAL_O_GROUPS, O_LORA, O_GROUP_IN], [1 * LOCAL_O_GROUPS, 0, 0]
+    fwd_swa_layer_10_wo_a_layer_l1: pl.Tensor[[LOCAL_O_GROUPS, O_GROUP_IN, O_LORA], pl.FP8E4M3FN] = pl.slice(
+        wo_a, [LOCAL_O_GROUPS, O_GROUP_IN, O_LORA], [1 * LOCAL_O_GROUPS, 0, 0]
+    )
+    fwd_swa_layer_10_wo_a_scale_layer_l1: pl.Tensor[[LOCAL_O_GROUPS, O_GROUP_IN // 32, O_LORA], pl.FP8E8M0] = pl.slice(
+        wo_a_scale, [LOCAL_O_GROUPS, O_GROUP_IN // 32, O_LORA], [1 * LOCAL_O_GROUPS, 0, 0]
     )
     fwd_swa_layer_10_wo_b_layer_l1: pl.Tensor[[LOCAL_O_WIDTH, D], pl.FP8E4M3FN] = wo_b[1]
     fwd_swa_layer_10_wo_b_scale_layer_l1: pl.Tensor[
@@ -516,7 +523,7 @@ def _decode_encoder(
         fwd_swa_layer_10_wkv_scale_layer_l1,
         fwd_swa_layer_10_kv_norm_layer_l1,
         fwd_swa_layer_10_sink_layer_l1,
-        fwd_swa_layer_10_wo_a_layer_l1,
+        fwd_swa_layer_10_wo_a_layer_l1, fwd_swa_layer_10_wo_a_scale_layer_l1,
         fwd_swa_layer_10_wo_b_layer_l1,
         fwd_swa_layer_10_wo_b_scale_layer_l1,
         base_rope_cos,
@@ -750,9 +757,8 @@ def _decode_encoder(
         fwd_c2a_full_layer_3_sink_layer_l2: pl.Tensor[[LOCAL_H], pl.FP32] = pl.slice(
             attn_sink, [LOCAL_H], [(c2a_block * 6 + 2) * LOCAL_H]
         )
-        fwd_c2a_full_layer_3_wo_a_layer_l2: pl.Tensor[[LOCAL_O_GROUPS, O_LORA, O_GROUP_IN], pl.BF16] = (
-            pl.slice(wo_a, [LOCAL_O_GROUPS, O_LORA, O_GROUP_IN], [(c2a_block * 6 + 2) * LOCAL_O_GROUPS, 0, 0])
-        )
+        fwd_c2a_full_layer_3_wo_a_layer_l2: pl.Tensor[[LOCAL_O_GROUPS, O_GROUP_IN, O_LORA], pl.FP8E4M3FN] = pl.slice(wo_a, [LOCAL_O_GROUPS, O_GROUP_IN, O_LORA], [(c2a_block * 6 + 2) * LOCAL_O_GROUPS, 0, 0])
+        fwd_c2a_full_layer_3_wo_a_scale_layer_l2: pl.Tensor[[LOCAL_O_GROUPS, O_GROUP_IN // 32, O_LORA], pl.FP8E8M0] = pl.slice(wo_a_scale, [LOCAL_O_GROUPS, O_GROUP_IN // 32, O_LORA], [(c2a_block * 6 + 2) * LOCAL_O_GROUPS, 0, 0])
         fwd_c2a_full_layer_3_wo_b_layer_l2: pl.Tensor[[LOCAL_O_WIDTH, D], pl.FP8E4M3FN] = wo_b[
             c2a_block * 6 + 2
         ]
@@ -780,7 +786,7 @@ def _decode_encoder(
             fwd_c2a_full_layer_3_wkv_scale_layer_l2,
             fwd_c2a_full_layer_3_kv_norm_layer_l2,
             fwd_c2a_full_layer_3_sink_layer_l2,
-            fwd_c2a_full_layer_3_wo_a_layer_l2,
+            fwd_c2a_full_layer_3_wo_a_layer_l2, fwd_c2a_full_layer_3_wo_a_scale_layer_l2,
             fwd_c2a_full_layer_3_wo_b_layer_l2,
             fwd_c2a_full_layer_3_wo_b_scale_layer_l2,
             compressed_token_rope_cos,
@@ -1003,9 +1009,8 @@ def _decode_encoder(
         fwd_c2a_reuse_layer_12_sink_layer_l3: pl.Tensor[[LOCAL_H], pl.FP32] = pl.slice(
             attn_sink, [LOCAL_H], [(c2a_block * 6 + 3) * LOCAL_H]
         )
-        fwd_c2a_reuse_layer_12_wo_a_layer_l3: pl.Tensor[[LOCAL_O_GROUPS, O_LORA, O_GROUP_IN], pl.BF16] = (
-            pl.slice(wo_a, [LOCAL_O_GROUPS, O_LORA, O_GROUP_IN], [(c2a_block * 6 + 3) * LOCAL_O_GROUPS, 0, 0])
-        )
+        fwd_c2a_reuse_layer_12_wo_a_layer_l3: pl.Tensor[[LOCAL_O_GROUPS, O_GROUP_IN, O_LORA], pl.FP8E4M3FN] = pl.slice(wo_a, [LOCAL_O_GROUPS, O_GROUP_IN, O_LORA], [(c2a_block * 6 + 3) * LOCAL_O_GROUPS, 0, 0])
+        fwd_c2a_reuse_layer_12_wo_a_scale_layer_l3: pl.Tensor[[LOCAL_O_GROUPS, O_GROUP_IN // 32, O_LORA], pl.FP8E8M0] = pl.slice(wo_a_scale, [LOCAL_O_GROUPS, O_GROUP_IN // 32, O_LORA], [(c2a_block * 6 + 3) * LOCAL_O_GROUPS, 0, 0])
         fwd_c2a_reuse_layer_12_wo_b_layer_l3: pl.Tensor[[LOCAL_O_WIDTH, D], pl.FP8E4M3FN] = wo_b[
             c2a_block * 6 + 3
         ]
@@ -1033,7 +1038,7 @@ def _decode_encoder(
             fwd_c2a_reuse_layer_12_wkv_scale_layer_l3,
             fwd_c2a_reuse_layer_12_kv_norm_layer_l3,
             fwd_c2a_reuse_layer_12_sink_layer_l3,
-            fwd_c2a_reuse_layer_12_wo_a_layer_l3,
+            fwd_c2a_reuse_layer_12_wo_a_layer_l3, fwd_c2a_reuse_layer_12_wo_a_scale_layer_l3,
             fwd_c2a_reuse_layer_12_wo_b_layer_l3,
             fwd_c2a_reuse_layer_12_wo_b_scale_layer_l3,
             compressed_token_rope_cos,
@@ -1236,9 +1241,8 @@ def _decode_encoder(
         fwd_c2a_reuse_layer_4_sink_layer_l4: pl.Tensor[[LOCAL_H], pl.FP32] = pl.slice(
             attn_sink, [LOCAL_H], [(c2a_block * 6 + 4) * LOCAL_H]
         )
-        fwd_c2a_reuse_layer_4_wo_a_layer_l4: pl.Tensor[[LOCAL_O_GROUPS, O_LORA, O_GROUP_IN], pl.BF16] = (
-            pl.slice(wo_a, [LOCAL_O_GROUPS, O_LORA, O_GROUP_IN], [(c2a_block * 6 + 4) * LOCAL_O_GROUPS, 0, 0])
-        )
+        fwd_c2a_reuse_layer_4_wo_a_layer_l4: pl.Tensor[[LOCAL_O_GROUPS, O_GROUP_IN, O_LORA], pl.FP8E4M3FN] = pl.slice(wo_a, [LOCAL_O_GROUPS, O_GROUP_IN, O_LORA], [(c2a_block * 6 + 4) * LOCAL_O_GROUPS, 0, 0])
+        fwd_c2a_reuse_layer_4_wo_a_scale_layer_l4: pl.Tensor[[LOCAL_O_GROUPS, O_GROUP_IN // 32, O_LORA], pl.FP8E8M0] = pl.slice(wo_a_scale, [LOCAL_O_GROUPS, O_GROUP_IN // 32, O_LORA], [(c2a_block * 6 + 4) * LOCAL_O_GROUPS, 0, 0])
         fwd_c2a_reuse_layer_4_wo_b_layer_l4: pl.Tensor[[LOCAL_O_WIDTH, D], pl.FP8E4M3FN] = wo_b[
             c2a_block * 6 + 4
         ]
@@ -1266,7 +1270,7 @@ def _decode_encoder(
             fwd_c2a_reuse_layer_4_wkv_scale_layer_l4,
             fwd_c2a_reuse_layer_4_kv_norm_layer_l4,
             fwd_c2a_reuse_layer_4_sink_layer_l4,
-            fwd_c2a_reuse_layer_4_wo_a_layer_l4,
+            fwd_c2a_reuse_layer_4_wo_a_layer_l4, fwd_c2a_reuse_layer_4_wo_a_scale_layer_l4,
             fwd_c2a_reuse_layer_4_wo_b_layer_l4,
             fwd_c2a_reuse_layer_4_wo_b_scale_layer_l4,
             compressed_token_rope_cos,
@@ -1469,9 +1473,8 @@ def _decode_encoder(
         fwd_c2a_reuse_layer_12_sink_layer_l5: pl.Tensor[[LOCAL_H], pl.FP32] = pl.slice(
             attn_sink, [LOCAL_H], [(c2a_block * 6 + 5) * LOCAL_H]
         )
-        fwd_c2a_reuse_layer_12_wo_a_layer_l5: pl.Tensor[[LOCAL_O_GROUPS, O_LORA, O_GROUP_IN], pl.BF16] = (
-            pl.slice(wo_a, [LOCAL_O_GROUPS, O_LORA, O_GROUP_IN], [(c2a_block * 6 + 5) * LOCAL_O_GROUPS, 0, 0])
-        )
+        fwd_c2a_reuse_layer_12_wo_a_layer_l5: pl.Tensor[[LOCAL_O_GROUPS, O_GROUP_IN, O_LORA], pl.FP8E4M3FN] = pl.slice(wo_a, [LOCAL_O_GROUPS, O_GROUP_IN, O_LORA], [(c2a_block * 6 + 5) * LOCAL_O_GROUPS, 0, 0])
+        fwd_c2a_reuse_layer_12_wo_a_scale_layer_l5: pl.Tensor[[LOCAL_O_GROUPS, O_GROUP_IN // 32, O_LORA], pl.FP8E8M0] = pl.slice(wo_a_scale, [LOCAL_O_GROUPS, O_GROUP_IN // 32, O_LORA], [(c2a_block * 6 + 5) * LOCAL_O_GROUPS, 0, 0])
         fwd_c2a_reuse_layer_12_wo_b_layer_l5: pl.Tensor[[LOCAL_O_WIDTH, D], pl.FP8E4M3FN] = wo_b[
             c2a_block * 6 + 5
         ]
@@ -1499,7 +1502,7 @@ def _decode_encoder(
             fwd_c2a_reuse_layer_12_wkv_scale_layer_l5,
             fwd_c2a_reuse_layer_12_kv_norm_layer_l5,
             fwd_c2a_reuse_layer_12_sink_layer_l5,
-            fwd_c2a_reuse_layer_12_wo_a_layer_l5,
+            fwd_c2a_reuse_layer_12_wo_a_layer_l5, fwd_c2a_reuse_layer_12_wo_a_scale_layer_l5,
             fwd_c2a_reuse_layer_12_wo_b_layer_l5,
             fwd_c2a_reuse_layer_12_wo_b_scale_layer_l5,
             compressed_token_rope_cos,
@@ -1702,9 +1705,8 @@ def _decode_encoder(
         fwd_c2a_reuse_layer_4_sink_layer_l6: pl.Tensor[[LOCAL_H], pl.FP32] = pl.slice(
             attn_sink, [LOCAL_H], [(c2a_block * 6 + 6) * LOCAL_H]
         )
-        fwd_c2a_reuse_layer_4_wo_a_layer_l6: pl.Tensor[[LOCAL_O_GROUPS, O_LORA, O_GROUP_IN], pl.BF16] = (
-            pl.slice(wo_a, [LOCAL_O_GROUPS, O_LORA, O_GROUP_IN], [(c2a_block * 6 + 6) * LOCAL_O_GROUPS, 0, 0])
-        )
+        fwd_c2a_reuse_layer_4_wo_a_layer_l6: pl.Tensor[[LOCAL_O_GROUPS, O_GROUP_IN, O_LORA], pl.FP8E4M3FN] = pl.slice(wo_a, [LOCAL_O_GROUPS, O_GROUP_IN, O_LORA], [(c2a_block * 6 + 6) * LOCAL_O_GROUPS, 0, 0])
+        fwd_c2a_reuse_layer_4_wo_a_scale_layer_l6: pl.Tensor[[LOCAL_O_GROUPS, O_GROUP_IN // 32, O_LORA], pl.FP8E8M0] = pl.slice(wo_a_scale, [LOCAL_O_GROUPS, O_GROUP_IN // 32, O_LORA], [(c2a_block * 6 + 6) * LOCAL_O_GROUPS, 0, 0])
         fwd_c2a_reuse_layer_4_wo_b_layer_l6: pl.Tensor[[LOCAL_O_WIDTH, D], pl.FP8E4M3FN] = wo_b[
             c2a_block * 6 + 6
         ]
@@ -1732,7 +1734,7 @@ def _decode_encoder(
             fwd_c2a_reuse_layer_4_wkv_scale_layer_l6,
             fwd_c2a_reuse_layer_4_kv_norm_layer_l6,
             fwd_c2a_reuse_layer_4_sink_layer_l6,
-            fwd_c2a_reuse_layer_4_wo_a_layer_l6,
+            fwd_c2a_reuse_layer_4_wo_a_layer_l6, fwd_c2a_reuse_layer_4_wo_a_scale_layer_l6,
             fwd_c2a_reuse_layer_4_wo_b_layer_l6,
             fwd_c2a_reuse_layer_4_wo_b_scale_layer_l6,
             compressed_token_rope_cos,
@@ -1935,9 +1937,8 @@ def _decode_encoder(
         fwd_c2a_reuse_layer_12_sink_layer_l7: pl.Tensor[[LOCAL_H], pl.FP32] = pl.slice(
             attn_sink, [LOCAL_H], [(c2a_block * 6 + 7) * LOCAL_H]
         )
-        fwd_c2a_reuse_layer_12_wo_a_layer_l7: pl.Tensor[[LOCAL_O_GROUPS, O_LORA, O_GROUP_IN], pl.BF16] = (
-            pl.slice(wo_a, [LOCAL_O_GROUPS, O_LORA, O_GROUP_IN], [(c2a_block * 6 + 7) * LOCAL_O_GROUPS, 0, 0])
-        )
+        fwd_c2a_reuse_layer_12_wo_a_layer_l7: pl.Tensor[[LOCAL_O_GROUPS, O_GROUP_IN, O_LORA], pl.FP8E4M3FN] = pl.slice(wo_a, [LOCAL_O_GROUPS, O_GROUP_IN, O_LORA], [(c2a_block * 6 + 7) * LOCAL_O_GROUPS, 0, 0])
+        fwd_c2a_reuse_layer_12_wo_a_scale_layer_l7: pl.Tensor[[LOCAL_O_GROUPS, O_GROUP_IN // 32, O_LORA], pl.FP8E8M0] = pl.slice(wo_a_scale, [LOCAL_O_GROUPS, O_GROUP_IN // 32, O_LORA], [(c2a_block * 6 + 7) * LOCAL_O_GROUPS, 0, 0])
         fwd_c2a_reuse_layer_12_wo_b_layer_l7: pl.Tensor[[LOCAL_O_WIDTH, D], pl.FP8E4M3FN] = wo_b[
             c2a_block * 6 + 7
         ]
@@ -1965,7 +1966,7 @@ def _decode_encoder(
             fwd_c2a_reuse_layer_12_wkv_scale_layer_l7,
             fwd_c2a_reuse_layer_12_kv_norm_layer_l7,
             fwd_c2a_reuse_layer_12_sink_layer_l7,
-            fwd_c2a_reuse_layer_12_wo_a_layer_l7,
+            fwd_c2a_reuse_layer_12_wo_a_layer_l7, fwd_c2a_reuse_layer_12_wo_a_scale_layer_l7,
             fwd_c2a_reuse_layer_12_wo_b_layer_l7,
             fwd_c2a_reuse_layer_12_wo_b_scale_layer_l7,
             compressed_token_rope_cos,
@@ -2124,7 +2125,8 @@ def _decode_decoder(
     wkv: pl.Tensor[[N_LAYERS, D, HEAD_DIM], pl.FP8E4M3FN],
     kv_norm_weight: pl.Tensor[[N_LAYERS * HEAD_DIM], pl.BF16],
     attn_sink: pl.Tensor[[N_LAYERS * LOCAL_H], pl.FP32],
-    wo_a: pl.Tensor[[N_LAYERS * LOCAL_O_GROUPS, O_LORA, O_GROUP_IN], pl.BF16],
+    wo_a: pl.Tensor[[N_LAYERS * LOCAL_O_GROUPS, O_GROUP_IN, O_LORA], pl.FP8E4M3FN],
+    wo_a_scale: pl.Tensor[[N_LAYERS * LOCAL_O_GROUPS, O_GROUP_IN // 32, O_LORA], pl.FP8E8M0],
     wo_b: pl.Tensor[[N_LAYERS, LOCAL_O_WIDTH, D], pl.FP8E4M3FN],
     base_rope_cos: pl.Tensor[[T_DYN, ROPE_DIM // 2], pl.FP32],
     base_rope_sin: pl.Tensor[[T_DYN, ROPE_DIM // 2], pl.FP32],
@@ -2326,8 +2328,11 @@ def _decode_decoder(
     fwd_c1a_full_layer_5_sink_layer_l20: pl.Tensor[[LOCAL_H], pl.FP32] = pl.slice(
         attn_sink, [LOCAL_H], [20 * LOCAL_H]
     )
-    fwd_c1a_full_layer_5_wo_a_layer_l20: pl.Tensor[[LOCAL_O_GROUPS, O_LORA, O_GROUP_IN], pl.BF16] = pl.slice(
-        wo_a, [LOCAL_O_GROUPS, O_LORA, O_GROUP_IN], [20 * LOCAL_O_GROUPS, 0, 0]
+    fwd_c1a_full_layer_5_wo_a_layer_l20: pl.Tensor[[LOCAL_O_GROUPS, O_GROUP_IN, O_LORA], pl.FP8E4M3FN] = pl.slice(
+        wo_a, [LOCAL_O_GROUPS, O_GROUP_IN, O_LORA], [20 * LOCAL_O_GROUPS, 0, 0]
+    )
+    fwd_c1a_full_layer_5_wo_a_scale_layer_l20: pl.Tensor[[LOCAL_O_GROUPS, O_GROUP_IN // 32, O_LORA], pl.FP8E8M0] = pl.slice(
+        wo_a_scale, [LOCAL_O_GROUPS, O_GROUP_IN // 32, O_LORA], [20 * LOCAL_O_GROUPS, 0, 0]
     )
     fwd_c1a_full_layer_5_wo_b_layer_l20: pl.Tensor[[LOCAL_O_WIDTH, D], pl.FP8E4M3FN] = wo_b[20]
     fwd_c1a_full_layer_5_wo_b_scale_layer_l20: pl.Tensor[
@@ -2349,7 +2354,7 @@ def _decode_decoder(
         fwd_c1a_full_layer_5_wkv_scale_layer_l20,
         fwd_c1a_full_layer_5_kv_norm_layer_l20,
         fwd_c1a_full_layer_5_sink_layer_l20,
-        fwd_c1a_full_layer_5_wo_a_layer_l20,
+        fwd_c1a_full_layer_5_wo_a_layer_l20, fwd_c1a_full_layer_5_wo_a_scale_layer_l20,
         fwd_c1a_full_layer_5_wo_b_layer_l20,
         fwd_c1a_full_layer_5_wo_b_scale_layer_l20,
         compressed_token_rope_cos,
@@ -2550,9 +2555,8 @@ def _decode_decoder(
     fwd_c1a_reuse_layer_15_sink_layer_l21: pl.Tensor[[LOCAL_H], pl.FP32] = pl.slice(
         attn_sink, [LOCAL_H], [21 * LOCAL_H]
     )
-    fwd_c1a_reuse_layer_15_wo_a_layer_l21: pl.Tensor[[LOCAL_O_GROUPS, O_LORA, O_GROUP_IN], pl.BF16] = (
-        pl.slice(wo_a, [LOCAL_O_GROUPS, O_LORA, O_GROUP_IN], [21 * LOCAL_O_GROUPS, 0, 0])
-    )
+    fwd_c1a_reuse_layer_15_wo_a_layer_l21: pl.Tensor[[LOCAL_O_GROUPS, O_GROUP_IN, O_LORA], pl.FP8E4M3FN] = pl.slice(wo_a, [LOCAL_O_GROUPS, O_GROUP_IN, O_LORA], [21 * LOCAL_O_GROUPS, 0, 0])
+    fwd_c1a_reuse_layer_15_wo_a_scale_layer_l21: pl.Tensor[[LOCAL_O_GROUPS, O_GROUP_IN // 32, O_LORA], pl.FP8E8M0] = pl.slice(wo_a_scale, [LOCAL_O_GROUPS, O_GROUP_IN // 32, O_LORA], [21 * LOCAL_O_GROUPS, 0, 0])
     fwd_c1a_reuse_layer_15_wo_b_layer_l21: pl.Tensor[[LOCAL_O_WIDTH, D], pl.FP8E4M3FN] = wo_b[21]
     fwd_c1a_reuse_layer_15_wo_b_scale_layer_l21: pl.Tensor[
         [LOCAL_O_WIDTH // MX_GROUP, D], pl.FP8E8M0, pl.MX_B_NN
@@ -2573,7 +2577,7 @@ def _decode_decoder(
         fwd_c1a_reuse_layer_15_wkv_scale_layer_l21,
         fwd_c1a_reuse_layer_15_kv_norm_layer_l21,
         fwd_c1a_reuse_layer_15_sink_layer_l21,
-        fwd_c1a_reuse_layer_15_wo_a_layer_l21,
+        fwd_c1a_reuse_layer_15_wo_a_layer_l21, fwd_c1a_reuse_layer_15_wo_a_scale_layer_l21,
         fwd_c1a_reuse_layer_15_wo_b_layer_l21,
         fwd_c1a_reuse_layer_15_wo_b_scale_layer_l21,
         compressed_token_rope_cos,
@@ -2756,8 +2760,11 @@ def _decode_decoder(
     fwd_c1a_reuse_layer_7_sink_layer_l22: pl.Tensor[[LOCAL_H], pl.FP32] = pl.slice(
         attn_sink, [LOCAL_H], [22 * LOCAL_H]
     )
-    fwd_c1a_reuse_layer_7_wo_a_layer_l22: pl.Tensor[[LOCAL_O_GROUPS, O_LORA, O_GROUP_IN], pl.BF16] = pl.slice(
-        wo_a, [LOCAL_O_GROUPS, O_LORA, O_GROUP_IN], [22 * LOCAL_O_GROUPS, 0, 0]
+    fwd_c1a_reuse_layer_7_wo_a_layer_l22: pl.Tensor[[LOCAL_O_GROUPS, O_GROUP_IN, O_LORA], pl.FP8E4M3FN] = pl.slice(
+        wo_a, [LOCAL_O_GROUPS, O_GROUP_IN, O_LORA], [22 * LOCAL_O_GROUPS, 0, 0]
+    )
+    fwd_c1a_reuse_layer_7_wo_a_scale_layer_l22: pl.Tensor[[LOCAL_O_GROUPS, O_GROUP_IN // 32, O_LORA], pl.FP8E8M0] = pl.slice(
+        wo_a_scale, [LOCAL_O_GROUPS, O_GROUP_IN // 32, O_LORA], [22 * LOCAL_O_GROUPS, 0, 0]
     )
     fwd_c1a_reuse_layer_7_wo_b_layer_l22: pl.Tensor[[LOCAL_O_WIDTH, D], pl.FP8E4M3FN] = wo_b[22]
     fwd_c1a_reuse_layer_7_wo_b_scale_layer_l22: pl.Tensor[
@@ -2779,7 +2786,7 @@ def _decode_decoder(
         fwd_c1a_reuse_layer_7_wkv_scale_layer_l22,
         fwd_c1a_reuse_layer_7_kv_norm_layer_l22,
         fwd_c1a_reuse_layer_7_sink_layer_l22,
-        fwd_c1a_reuse_layer_7_wo_a_layer_l22,
+        fwd_c1a_reuse_layer_7_wo_a_layer_l22, fwd_c1a_reuse_layer_7_wo_a_scale_layer_l22,
         fwd_c1a_reuse_layer_7_wo_b_layer_l22,
         fwd_c1a_reuse_layer_7_wo_b_scale_layer_l22,
         compressed_token_rope_cos,
@@ -2964,9 +2971,8 @@ def _decode_decoder(
     fwd_c1a_reuse_layer_15_sink_layer_l23: pl.Tensor[[LOCAL_H], pl.FP32] = pl.slice(
         attn_sink, [LOCAL_H], [23 * LOCAL_H]
     )
-    fwd_c1a_reuse_layer_15_wo_a_layer_l23: pl.Tensor[[LOCAL_O_GROUPS, O_LORA, O_GROUP_IN], pl.BF16] = (
-        pl.slice(wo_a, [LOCAL_O_GROUPS, O_LORA, O_GROUP_IN], [23 * LOCAL_O_GROUPS, 0, 0])
-    )
+    fwd_c1a_reuse_layer_15_wo_a_layer_l23: pl.Tensor[[LOCAL_O_GROUPS, O_GROUP_IN, O_LORA], pl.FP8E4M3FN] = pl.slice(wo_a, [LOCAL_O_GROUPS, O_GROUP_IN, O_LORA], [23 * LOCAL_O_GROUPS, 0, 0])
+    fwd_c1a_reuse_layer_15_wo_a_scale_layer_l23: pl.Tensor[[LOCAL_O_GROUPS, O_GROUP_IN // 32, O_LORA], pl.FP8E8M0] = pl.slice(wo_a_scale, [LOCAL_O_GROUPS, O_GROUP_IN // 32, O_LORA], [23 * LOCAL_O_GROUPS, 0, 0])
     fwd_c1a_reuse_layer_15_wo_b_layer_l23: pl.Tensor[[LOCAL_O_WIDTH, D], pl.FP8E4M3FN] = wo_b[23]
     fwd_c1a_reuse_layer_15_wo_b_scale_layer_l23: pl.Tensor[
         [LOCAL_O_WIDTH // MX_GROUP, D], pl.FP8E8M0, pl.MX_B_NN
@@ -2987,7 +2993,7 @@ def _decode_decoder(
         fwd_c1a_reuse_layer_15_wkv_scale_layer_l23,
         fwd_c1a_reuse_layer_15_kv_norm_layer_l23,
         fwd_c1a_reuse_layer_15_sink_layer_l23,
-        fwd_c1a_reuse_layer_15_wo_a_layer_l23,
+        fwd_c1a_reuse_layer_15_wo_a_layer_l23, fwd_c1a_reuse_layer_15_wo_a_scale_layer_l23,
         fwd_c1a_reuse_layer_15_wo_b_layer_l23,
         fwd_c1a_reuse_layer_15_wo_b_scale_layer_l23,
         compressed_token_rope_cos,
@@ -3209,11 +3215,12 @@ def _decode_decoder(
         fwd_c1a_reindex_layer_6_sink_layer_l24: pl.Tensor[[LOCAL_H], pl.FP32] = pl.slice(
             attn_sink, [LOCAL_H], [(c1a_block * 4 + 24) * LOCAL_H]
         )
-        fwd_c1a_reindex_layer_6_wo_a_layer_l24: pl.Tensor[[LOCAL_O_GROUPS, O_LORA, O_GROUP_IN], pl.BF16] = (
-            pl.slice(
-                wo_a, [LOCAL_O_GROUPS, O_LORA, O_GROUP_IN], [(c1a_block * 4 + 24) * LOCAL_O_GROUPS, 0, 0]
+        fwd_c1a_reindex_layer_6_wo_a_layer_l24: pl.Tensor[[LOCAL_O_GROUPS, O_GROUP_IN, O_LORA], pl.FP8E4M3FN] = pl.slice(
+                wo_a, [LOCAL_O_GROUPS, O_GROUP_IN, O_LORA], [(c1a_block * 4 + 24) * LOCAL_O_GROUPS, 0, 0]
             )
-        )
+        fwd_c1a_reindex_layer_6_wo_a_scale_layer_l24: pl.Tensor[[LOCAL_O_GROUPS, O_GROUP_IN // 32, O_LORA], pl.FP8E8M0] = pl.slice(
+                wo_a_scale, [LOCAL_O_GROUPS, O_GROUP_IN // 32, O_LORA], [(c1a_block * 4 + 24) * LOCAL_O_GROUPS, 0, 0]
+            )
         fwd_c1a_reindex_layer_6_wo_b_layer_l24: pl.Tensor[[LOCAL_O_WIDTH, D], pl.FP8E4M3FN] = wo_b[
             c1a_block * 4 + 24
         ]
@@ -3240,7 +3247,7 @@ def _decode_decoder(
             fwd_c1a_reindex_layer_6_wkv_scale_layer_l24,
             fwd_c1a_reindex_layer_6_kv_norm_layer_l24,
             fwd_c1a_reindex_layer_6_sink_layer_l24,
-            fwd_c1a_reindex_layer_6_wo_a_layer_l24,
+            fwd_c1a_reindex_layer_6_wo_a_layer_l24, fwd_c1a_reindex_layer_6_wo_a_scale_layer_l24,
             fwd_c1a_reindex_layer_6_wo_b_layer_l24,
             fwd_c1a_reindex_layer_6_wo_b_scale_layer_l24,
             compressed_token_rope_cos,
@@ -3452,11 +3459,12 @@ def _decode_decoder(
         fwd_c1a_reuse_layer_15_sink_layer_l25: pl.Tensor[[LOCAL_H], pl.FP32] = pl.slice(
             attn_sink, [LOCAL_H], [(c1a_block * 4 + 25) * LOCAL_H]
         )
-        fwd_c1a_reuse_layer_15_wo_a_layer_l25: pl.Tensor[[LOCAL_O_GROUPS, O_LORA, O_GROUP_IN], pl.BF16] = (
-            pl.slice(
-                wo_a, [LOCAL_O_GROUPS, O_LORA, O_GROUP_IN], [(c1a_block * 4 + 25) * LOCAL_O_GROUPS, 0, 0]
+        fwd_c1a_reuse_layer_15_wo_a_layer_l25: pl.Tensor[[LOCAL_O_GROUPS, O_GROUP_IN, O_LORA], pl.FP8E4M3FN] = pl.slice(
+                wo_a, [LOCAL_O_GROUPS, O_GROUP_IN, O_LORA], [(c1a_block * 4 + 25) * LOCAL_O_GROUPS, 0, 0]
             )
-        )
+        fwd_c1a_reuse_layer_15_wo_a_scale_layer_l25: pl.Tensor[[LOCAL_O_GROUPS, O_GROUP_IN // 32, O_LORA], pl.FP8E8M0] = pl.slice(
+                wo_a_scale, [LOCAL_O_GROUPS, O_GROUP_IN // 32, O_LORA], [(c1a_block * 4 + 25) * LOCAL_O_GROUPS, 0, 0]
+            )
         fwd_c1a_reuse_layer_15_wo_b_layer_l25: pl.Tensor[[LOCAL_O_WIDTH, D], pl.FP8E4M3FN] = wo_b[
             c1a_block * 4 + 25
         ]
@@ -3483,7 +3491,7 @@ def _decode_decoder(
             fwd_c1a_reuse_layer_15_wkv_scale_layer_l25,
             fwd_c1a_reuse_layer_15_kv_norm_layer_l25,
             fwd_c1a_reuse_layer_15_sink_layer_l25,
-            fwd_c1a_reuse_layer_15_wo_a_layer_l25,
+            fwd_c1a_reuse_layer_15_wo_a_layer_l25, fwd_c1a_reuse_layer_15_wo_a_scale_layer_l25,
             fwd_c1a_reuse_layer_15_wo_b_layer_l25,
             fwd_c1a_reuse_layer_15_wo_b_scale_layer_l25,
             compressed_token_rope_cos,
@@ -3686,11 +3694,12 @@ def _decode_decoder(
         fwd_c1a_reuse_layer_7_sink_layer_l26: pl.Tensor[[LOCAL_H], pl.FP32] = pl.slice(
             attn_sink, [LOCAL_H], [(c1a_block * 4 + 26) * LOCAL_H]
         )
-        fwd_c1a_reuse_layer_7_wo_a_layer_l26: pl.Tensor[[LOCAL_O_GROUPS, O_LORA, O_GROUP_IN], pl.BF16] = (
-            pl.slice(
-                wo_a, [LOCAL_O_GROUPS, O_LORA, O_GROUP_IN], [(c1a_block * 4 + 26) * LOCAL_O_GROUPS, 0, 0]
+        fwd_c1a_reuse_layer_7_wo_a_layer_l26: pl.Tensor[[LOCAL_O_GROUPS, O_GROUP_IN, O_LORA], pl.FP8E4M3FN] = pl.slice(
+                wo_a, [LOCAL_O_GROUPS, O_GROUP_IN, O_LORA], [(c1a_block * 4 + 26) * LOCAL_O_GROUPS, 0, 0]
             )
-        )
+        fwd_c1a_reuse_layer_7_wo_a_scale_layer_l26: pl.Tensor[[LOCAL_O_GROUPS, O_GROUP_IN // 32, O_LORA], pl.FP8E8M0] = pl.slice(
+                wo_a_scale, [LOCAL_O_GROUPS, O_GROUP_IN // 32, O_LORA], [(c1a_block * 4 + 26) * LOCAL_O_GROUPS, 0, 0]
+            )
         fwd_c1a_reuse_layer_7_wo_b_layer_l26: pl.Tensor[[LOCAL_O_WIDTH, D], pl.FP8E4M3FN] = wo_b[
             c1a_block * 4 + 26
         ]
@@ -3717,7 +3726,7 @@ def _decode_decoder(
             fwd_c1a_reuse_layer_7_wkv_scale_layer_l26,
             fwd_c1a_reuse_layer_7_kv_norm_layer_l26,
             fwd_c1a_reuse_layer_7_sink_layer_l26,
-            fwd_c1a_reuse_layer_7_wo_a_layer_l26,
+            fwd_c1a_reuse_layer_7_wo_a_layer_l26, fwd_c1a_reuse_layer_7_wo_a_scale_layer_l26,
             fwd_c1a_reuse_layer_7_wo_b_layer_l26,
             fwd_c1a_reuse_layer_7_wo_b_scale_layer_l26,
             compressed_token_rope_cos,
@@ -3920,11 +3929,12 @@ def _decode_decoder(
         fwd_c1a_reuse_layer_15_sink_layer_l27: pl.Tensor[[LOCAL_H], pl.FP32] = pl.slice(
             attn_sink, [LOCAL_H], [(c1a_block * 4 + 27) * LOCAL_H]
         )
-        fwd_c1a_reuse_layer_15_wo_a_layer_l27: pl.Tensor[[LOCAL_O_GROUPS, O_LORA, O_GROUP_IN], pl.BF16] = (
-            pl.slice(
-                wo_a, [LOCAL_O_GROUPS, O_LORA, O_GROUP_IN], [(c1a_block * 4 + 27) * LOCAL_O_GROUPS, 0, 0]
+        fwd_c1a_reuse_layer_15_wo_a_layer_l27: pl.Tensor[[LOCAL_O_GROUPS, O_GROUP_IN, O_LORA], pl.FP8E4M3FN] = pl.slice(
+                wo_a, [LOCAL_O_GROUPS, O_GROUP_IN, O_LORA], [(c1a_block * 4 + 27) * LOCAL_O_GROUPS, 0, 0]
             )
-        )
+        fwd_c1a_reuse_layer_15_wo_a_scale_layer_l27: pl.Tensor[[LOCAL_O_GROUPS, O_GROUP_IN // 32, O_LORA], pl.FP8E8M0] = pl.slice(
+                wo_a_scale, [LOCAL_O_GROUPS, O_GROUP_IN // 32, O_LORA], [(c1a_block * 4 + 27) * LOCAL_O_GROUPS, 0, 0]
+            )
         fwd_c1a_reuse_layer_15_wo_b_layer_l27: pl.Tensor[[LOCAL_O_WIDTH, D], pl.FP8E4M3FN] = wo_b[
             c1a_block * 4 + 27
         ]
@@ -3951,7 +3961,7 @@ def _decode_decoder(
             fwd_c1a_reuse_layer_15_wkv_scale_layer_l27,
             fwd_c1a_reuse_layer_15_kv_norm_layer_l27,
             fwd_c1a_reuse_layer_15_sink_layer_l27,
-            fwd_c1a_reuse_layer_15_wo_a_layer_l27,
+            fwd_c1a_reuse_layer_15_wo_a_layer_l27, fwd_c1a_reuse_layer_15_wo_a_scale_layer_l27,
             fwd_c1a_reuse_layer_15_wo_b_layer_l27,
             fwd_c1a_reuse_layer_15_wo_b_scale_layer_l27,
             compressed_token_rope_cos,
@@ -4110,7 +4120,8 @@ def _decode_fwd(
     wkv: pl.Tensor[[N_LAYERS, D, HEAD_DIM], pl.FP8E4M3FN],
     kv_norm_weight: pl.Tensor[[N_LAYERS * HEAD_DIM], pl.BF16],
     attn_sink: pl.Tensor[[N_LAYERS * LOCAL_H], pl.FP32],
-    wo_a: pl.Tensor[[N_LAYERS * LOCAL_O_GROUPS, O_LORA, O_GROUP_IN], pl.BF16],
+    wo_a: pl.Tensor[[N_LAYERS * LOCAL_O_GROUPS, O_GROUP_IN, O_LORA], pl.FP8E4M3FN],
+    wo_a_scale: pl.Tensor[[N_LAYERS * LOCAL_O_GROUPS, O_GROUP_IN // 32, O_LORA], pl.FP8E8M0],
     wo_b: pl.Tensor[[N_LAYERS, LOCAL_O_WIDTH, D], pl.FP8E4M3FN],
     base_rope_cos: pl.Tensor[[T_DYN, ROPE_DIM // 2], pl.FP32],
     base_rope_sin: pl.Tensor[[T_DYN, ROPE_DIM // 2], pl.FP32],
@@ -4210,7 +4221,7 @@ def _decode_fwd(
         wkv,
         kv_norm_weight,
         attn_sink,
-        wo_a,
+        wo_a, wo_a_scale,
         wo_b,
         base_rope_cos,
         base_rope_sin,
@@ -4297,7 +4308,7 @@ def _decode_fwd(
         wkv,
         kv_norm_weight,
         attn_sink,
-        wo_a,
+        wo_a, wo_a_scale,
         wo_b,
         base_rope_cos,
         base_rope_sin,
@@ -4399,7 +4410,8 @@ def l3_decode_fwd(
     wkv_scale: pl.Tensor[[EP_SIZE, N_LAYERS * (D // MX_GROUP), HEAD_DIM], pl.FP8E8M0],
     kv_norm_weight: pl.Tensor[[EP_SIZE, N_LAYERS * HEAD_DIM], pl.BF16],
     attn_sink: pl.Tensor[[EP_SIZE, N_LAYERS * LOCAL_H], pl.FP32],
-    wo_a: pl.Tensor[[EP_SIZE, N_LAYERS * LOCAL_O_GROUPS, O_LORA, O_GROUP_IN], pl.BF16],
+    wo_a: pl.Tensor[[EP_SIZE, N_LAYERS * LOCAL_O_GROUPS, O_GROUP_IN, O_LORA], pl.FP8E4M3FN],
+    wo_a_scale: pl.Tensor[[EP_SIZE, N_LAYERS * LOCAL_O_GROUPS, O_GROUP_IN // 32, O_LORA], pl.FP8E8M0],
     wo_b: pl.Tensor[[EP_SIZE, N_LAYERS, LOCAL_O_WIDTH, D], pl.FP8E4M3FN],
     wo_b_scale: pl.Tensor[[EP_SIZE, N_LAYERS * (LOCAL_O_WIDTH // MX_GROUP), D], pl.FP8E8M0],
     base_rope_cos: pl.Tensor[[EP_SIZE, T_DYN, ROPE_DIM // 2], pl.FP32],
@@ -4584,7 +4596,7 @@ def l3_decode_fwd(
             wkv[rank],
             kv_norm_weight[rank],
             attn_sink[rank],
-            wo_a[rank],
+            wo_a[rank], wo_a_scale[rank],
             wo_b[rank],
             base_rope_cos[rank],
             base_rope_sin[rank],
@@ -4672,7 +4684,7 @@ def l3_decode_fwd(
             wkv[rank],
             kv_norm_weight[rank],
             attn_sink[rank],
-            wo_a[rank],
+            wo_a[rank], wo_a_scale[rank],
             wo_b[rank],
             base_rope_cos[rank],
             base_rope_sin[rank],
