@@ -22,7 +22,7 @@ from attention_state import (
 )
 from decode_layer import delta_decode_into
 from delta_state import HEAD_DIM, QKV, VALUE_HEADS, VALUE_WIDTH
-from ops import HIDDEN, MLP_WIDTH, linear_into, mlp_into, residual_into, rmsnorm_into
+from ops import HIDDEN, MLP_WIDTH, residual_into, rmsnorm_into, swiglu_into
 
 NUM_LAYERS = 64
 DELTA_LAYERS = 48
@@ -31,6 +31,47 @@ TOKENS_PAD = 16
 MAX_SEQUENCE = 128
 VOCAB = 248320
 CHANNEL_TILE = 128
+@pl.jit.inline
+def attention_linear_into(
+    x: pl.Tensor,
+    weight: pl.Tensor,
+    out: pl.Tensor,
+):
+    inner = pl.tensor.dim(x, 1)
+    columns = pl.tensor.dim(weight, 0)
+    for block in pl.spmd(columns // CHANNEL_TILE, name_hint="full_attention_linear"):
+        column = block * CHANNEL_TILE
+        acc = pl.create_tensor([TOKENS_PAD, CHANNEL_TILE], dtype=pl.FP32)
+        for kb in pl.range(inner // 256):
+            k0 = kb * 256
+            lhs = x[:, k0 : k0 + 256]
+            rhs = weight[column : column + CHANNEL_TILE, k0 : k0 + 256]
+            acc = pl.matmul_acc(acc, lhs, rhs, b_trans=True, init_cond=(kb == 0))
+        out[:, column : column + CHANNEL_TILE] = pl.cast(acc, target_type=pl.BF16, mode="rint")
+    return out
+
+
+@pl.jit.inline
+def attention_mlp_into(
+    x: pl.Tensor[[TOKENS_PAD, HIDDEN], pl.BF16],
+    norm_weight: pl.Tensor[[1, HIDDEN], pl.BF16],
+    gate_weight: pl.Tensor[[MLP_WIDTH, HIDDEN], pl.BF16],
+    up_weight: pl.Tensor[[MLP_WIDTH, HIDDEN], pl.BF16],
+    down_weight: pl.Tensor[[HIDDEN, MLP_WIDTH], pl.BF16],
+    out: pl.Tensor[[TOKENS_PAD, HIDDEN], pl.BF16],
+):
+    normalized = pl.create_tensor([TOKENS_PAD, HIDDEN], dtype=pl.BF16)
+    gate = pl.create_tensor([TOKENS_PAD, MLP_WIDTH], dtype=pl.BF16)
+    up = pl.create_tensor([TOKENS_PAD, MLP_WIDTH], dtype=pl.BF16)
+    product = pl.create_tensor([TOKENS_PAD, MLP_WIDTH], dtype=pl.BF16)
+    projected = pl.create_tensor([TOKENS_PAD, HIDDEN], dtype=pl.BF16)
+    rmsnorm_into(x, norm_weight, 1.0 / HIDDEN, normalized)
+    attention_linear_into(normalized, gate_weight, gate)
+    attention_linear_into(normalized, up_weight, up)
+    swiglu_into(gate, up, product)
+    attention_linear_into(product, down_weight, projected)
+    residual_into(x, projected, out)
+    return out
 
 
 @pl.jit.inline
@@ -128,17 +169,17 @@ def attention_step_full(
     residual = pl.create_tensor([TOKENS_PAD, HIDDEN], dtype=pl.BF16)
 
     rmsnorm_into(x, input_norm, 1.0 / HIDDEN, normalized)
-    linear_into(normalized, q_weight, q_gate)
-    linear_into(normalized, k_weight, projected_key)
-    linear_into(normalized, v_weight, projected_value)
+    attention_linear_into(normalized, q_weight, q_gate)
+    attention_linear_into(normalized, k_weight, projected_key)
+    attention_linear_into(normalized, v_weight, projected_value)
     norm_rope_query_into(q_gate, q_norm, cos, sin, query, gate)
     norm_rope_key_into(projected_key, k_norm, cos, sin, new_key)
     append_kv_full(previous_key, new_key, position, key_cache)
     append_kv_full(previous_value, projected_value, position, value_cache)
     attention_context_full(query, gate, key_cache, value_cache, position, context)
-    linear_into(context, o_weight, mixed)
+    attention_linear_into(context, o_weight, mixed)
     residual_into(x, mixed, residual)
-    mlp_into(residual, post_norm, mlp_gate, mlp_up, mlp_down, hidden)
+    attention_mlp_into(residual, post_norm, mlp_gate, mlp_up, mlp_down, hidden)
     return hidden, key_cache, value_cache
 
 
@@ -175,58 +216,25 @@ def network_token_step(
     value_states: pl.Tensor[[ATTN_LAYERS, MAX_SEQUENCE, KV_WIDTH], pl.BF16],
     hidden_out: pl.Tensor[[TOKENS_PAD, HIDDEN], pl.BF16],
 ):
-    embedded = pl.create_tensor([TOKENS_PAD, HIDDEN], dtype=pl.BF16)
+    activations = pl.create_tensor([(NUM_LAYERS + 1) * TOKENS_PAD, HIDDEN], dtype=pl.BF16)
     for block in pl.spmd(HIDDEN // CHANNEL_TILE, name_hint="full_token_embedding"):
         col = block * CHANNEL_TILE
         token_id = pl.cast(pl.tensor.read(token_ids, [position]), target_type=pl.INDEX)
-        embedded[0:1, col : col + CHANNEL_TILE] = embedding[
+        activations[0:1, col : col + CHANNEL_TILE] = embedding[
             token_id : token_id + 1, col : col + CHANNEL_TILE
         ]
-        embedded[1:TOKENS_PAD, col : col + CHANNEL_TILE] = pl.full(
+        activations[1:TOKENS_PAD, col : col + CHANNEL_TILE] = pl.full(
             [TOKENS_PAD - 1, CHANNEL_TILE], dtype=pl.BF16, value=0.0
         )
 
-    cos = cos_table[position : position + TOKENS_PAD, :]
-    sin = sin_table[position : position + TOKENS_PAD, :]
-    for layer, (hidden,) in pl.range(NUM_LAYERS, init_values=(embedded,)):
-        next_hidden = pl.create_tensor([TOKENS_PAD, HIDDEN], dtype=pl.BF16)
-        if layer % 4 == 3:
-            attn_index = layer // 4
-            next_key = pl.create_tensor([MAX_SEQUENCE, KV_WIDTH], dtype=pl.BF16)
-            next_value = pl.create_tensor([MAX_SEQUENCE, KV_WIDTH], dtype=pl.BF16)
-            attention_step_full(
-                hidden,
-                input_norms[layer],
-                attn_qs[attn_index],
-                attn_ks[attn_index],
-                attn_vs[attn_index],
-                attn_q_norms[attn_index],
-                attn_k_norms[attn_index],
-                attn_outs[attn_index],
-                cos,
-                sin,
-                post_norms[layer],
-                mlp_gates[layer],
-                mlp_ups[layer],
-                mlp_downs[layer],
-                key_states[attn_index],
-                value_states[attn_index],
-                position,
-                next_hidden,
-                next_key,
-                next_value,
-            )
-            for block in pl.spmd(MAX_SEQUENCE * (KV_WIDTH // CHANNEL_TILE), name_hint="full_commit_kv"):
-                row = block // (KV_WIDTH // CHANNEL_TILE)
-                col = (block % (KV_WIDTH // CHANNEL_TILE)) * CHANNEL_TILE
-                key_states[attn_index, row : row + 1, col : col + CHANNEL_TILE] = next_key[
-                    row : row + 1, col : col + CHANNEL_TILE
-                ]
-                value_states[attn_index, row : row + 1, col : col + CHANNEL_TILE] = next_value[
-                    row : row + 1, col : col + CHANNEL_TILE
-                ]
-        else:
-            delta_index = layer - layer // 4
+    cos = pl.slice(cos_table, [TOKENS_PAD, ROTARY_DIM], [position, 0])
+    sin = pl.slice(sin_table, [TOKENS_PAD, ROTARY_DIM], [position, 0])
+    for group in pl.range(ATTN_LAYERS):
+        for phase in pl.range(3):
+            layer = group * 4 + phase
+            delta_index = group * 3 + phase
+            hidden = pl.slice(activations, [TOKENS_PAD, HIDDEN], [layer * TOKENS_PAD, 0])
+            next_hidden = pl.create_tensor([TOKENS_PAD, HIDDEN], dtype=pl.BF16)
             next_conv = pl.create_tensor([TOKENS_PAD, QKV], dtype=pl.BF16)
             next_recurrent = pl.create_tensor([VALUE_HEADS, HEAD_DIM, HEAD_DIM], dtype=pl.FP32)
             delta_decode_into(
@@ -256,11 +264,61 @@ def network_token_step(
                 conv_states[delta_index, :, col : col + CHANNEL_TILE] = next_conv[:, col : col + CHANNEL_TILE]
             for head in pl.spmd(VALUE_HEADS, name_hint="full_commit_recurrent"):
                 recurrent_states[delta_index, head, :, :] = next_recurrent[head, :, :]
-        hidden = next_hidden
 
+            for block in pl.spmd(HIDDEN // CHANNEL_TILE, name_hint="full_commit_delta_hidden"):
+                col = block * CHANNEL_TILE
+                next_row = (layer + 1) * TOKENS_PAD
+                activations[next_row : next_row + TOKENS_PAD, col : col + CHANNEL_TILE] = next_hidden[
+                    :, col : col + CHANNEL_TILE
+                ]
+
+        layer = group * 4 + 3
+        hidden = pl.slice(activations, [TOKENS_PAD, HIDDEN], [layer * TOKENS_PAD, 0])
+        next_hidden = pl.create_tensor([TOKENS_PAD, HIDDEN], dtype=pl.BF16)
+        next_key = pl.create_tensor([MAX_SEQUENCE, KV_WIDTH], dtype=pl.BF16)
+        next_value = pl.create_tensor([MAX_SEQUENCE, KV_WIDTH], dtype=pl.BF16)
+        attention_step_full(
+            hidden,
+            input_norms[layer],
+            attn_qs[group],
+            attn_ks[group],
+            attn_vs[group],
+            attn_q_norms[group],
+            attn_k_norms[group],
+            attn_outs[group],
+            cos,
+            sin,
+            post_norms[layer],
+            mlp_gates[layer],
+            mlp_ups[layer],
+            mlp_downs[layer],
+            key_states[group],
+            value_states[group],
+            position,
+            next_hidden,
+            next_key,
+            next_value,
+        )
+        for block in pl.spmd(MAX_SEQUENCE * (KV_WIDTH // CHANNEL_TILE), name_hint="full_commit_kv"):
+            row = block // (KV_WIDTH // CHANNEL_TILE)
+            col = (block % (KV_WIDTH // CHANNEL_TILE)) * CHANNEL_TILE
+            key_states[group, row : row + 1, col : col + CHANNEL_TILE] = next_key[
+                row : row + 1, col : col + CHANNEL_TILE
+            ]
+            value_states[group, row : row + 1, col : col + CHANNEL_TILE] = next_value[
+                row : row + 1, col : col + CHANNEL_TILE
+            ]
+        for block in pl.spmd(HIDDEN // CHANNEL_TILE, name_hint="full_commit_attention_hidden"):
+            col = block * CHANNEL_TILE
+            next_row = (layer + 1) * TOKENS_PAD
+            activations[next_row : next_row + TOKENS_PAD, col : col + CHANNEL_TILE] = next_hidden[
+                :, col : col + CHANNEL_TILE
+            ]
+
+    last_hidden = pl.slice(activations, [TOKENS_PAD, HIDDEN], [NUM_LAYERS * TOKENS_PAD, 0])
     for block in pl.spmd(HIDDEN // CHANNEL_TILE, name_hint="full_last_hidden"):
         col = block * CHANNEL_TILE
-        hidden_out[:, col : col + CHANNEL_TILE] = hidden[:, col : col + CHANNEL_TILE]
+        hidden_out[:, col : col + CHANNEL_TILE] = last_hidden[:, col : col + CHANNEL_TILE]
     return hidden_out
 
 

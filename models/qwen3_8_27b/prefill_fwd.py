@@ -67,19 +67,14 @@ def prefill_fwd(
     value_states: pl.InOut[pl.Tensor[[ATTN_LAYERS, MAX_SEQUENCE, KV_WIDTH], pl.BF16]],
     logits: pl.Out[pl.Tensor[[1, VOCAB], pl.FP32]],
 ):
-    initial = pl.create_tensor([TOKENS_PAD, HIDDEN], dtype=pl.BF16)
-    for block in pl.spmd(HIDDEN // 128, name_hint="full_prefill_initial"):
-        col = block * 128
-        initial[:, col : col + 128] = pl.full([TOKENS_PAD, 128], dtype=pl.BF16, value=0.0)
-    for position, (last,) in pl.range(token_count, init_values=(initial,)):
-        step_hidden = pl.create_tensor([TOKENS_PAD, HIDDEN], dtype=pl.BF16)
+    last = pl.create_tensor([TOKENS_PAD, HIDDEN], dtype=pl.BF16)
+    for position in pl.range(token_count):
         network_token_step(
             token_ids, position, embedding, input_norms, post_norms, mlp_gates, mlp_ups, mlp_downs,
             delta_qkvs, delta_convs, delta_as, delta_bs, delta_zs, delta_a_logs, delta_dt_biases,
             delta_norms, delta_outs, attn_qs, attn_ks, attn_vs, attn_q_norms, attn_k_norms,
             attn_outs, cos_table, sin_table, conv_states, recurrent_states, key_states,
-            value_states, step_hidden,
+            value_states, last,
         )
-        last = step_hidden
     final_logits(last, final_norm, lm_head, logits)
     return conv_states, recurrent_states, key_states, value_states, logits

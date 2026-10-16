@@ -24,9 +24,9 @@ PADDED_TOKENS = 16
 
 @pl.jit.inline
 def linear_into(
-    x: pl.Tensor[[PADDED_TOKENS, K_DYN], pl.BF16],
-    weight: pl.Tensor[[N_DYN, K_DYN], pl.BF16],
-    out: pl.Tensor[[PADDED_TOKENS, N_DYN], pl.BF16],
+    x: pl.Tensor,
+    weight: pl.Tensor,
+    out: pl.Tensor,
 ):
     rows = pl.tensor.dim(x, 0)
     inner = pl.tensor.dim(x, 1)
