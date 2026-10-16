@@ -13,7 +13,7 @@
 CI uses TP1/EP2/DP2 with 128 experts. Checkpoint generation uses 384 experts
 with EP4/DP4 (default) or EP8/DP8. Each rank owns one prompt and a shard of
 routed experts; attention weights are replicated. Original MXFP8/MXFP4
-weights remain resident. Generation recomputes both CED stages per new token.
+weights remain resident. Calls append current rows to caller-owned native caches.
 Engram is disabled, including host hashes, table lookup and weight preparation.
 """
 
@@ -48,16 +48,18 @@ _shape_parser.add_argument("--capacity", type=int, default=128)
 _shape_parser.add_argument("--dp", type=int)
 _shape_options = _shape_parser.parse_known_args()[0]
 C.EP_SIZE = _shape_options.ep or (4 if _shape_options.checkpoint else 2)
-_default_experts = C.FLASH.n_routed_experts // C.EP_SIZE if _shape_options.checkpoint else 64
+_default_experts = C.FLASH.n_routed_experts // C.EP_SIZE if C.EP_SIZE in (4, 8) else 64
 C.N_LOCAL_EXPERTS = _default_experts if _shape_options.experts_per_rank is None else _shape_options.experts_per_rank
 if C.N_LOCAL_EXPERTS <= 0 or C.EP_SIZE * C.N_LOCAL_EXPERTS % 16:
     _shape_parser.error("--experts-per-rank must be positive and give a total expert count aligned to 16")
+_MAX_CHUNK_TOKENS = 4096
 CAPACITY = _shape_options.capacity
 if C.TP_SIZE != 1 or _shape_options.dp not in (None, C.EP_SIZE):
     _shape_parser.error("prefill requires TP1 with DP equal to EP")
-if not 16 <= CAPACITY <= C.PREFILL_MAX_TOKENS or CAPACITY % 16:
+if not 16 <= CAPACITY <= _MAX_CHUNK_TOKENS or CAPACITY % 16:
     _shape_parser.error("--capacity must be between 16 and 4096 and a multiple of 16")
-C.set_moe_tokens(CAPACITY)
+# Keep MoE scratch bounded independently of the current-row capacity.
+C.set_moe_tokens(min(CAPACITY, C.MOE_TOKENS))
 
 from config import (
     FLASH as M,
@@ -76,6 +78,8 @@ from config import (
     STATE_BLOCKS_DYN,
     STATE_CAPACITY,
     TABLE_DYN,
+    MOE_TOKENS,
+    ROUTE_T_DYN,
 )
 
 from hc_head import hc_head
@@ -87,7 +91,7 @@ from lm_head import greedy_sample, lm_head
 from utils import (
     PrefillCheckpoint, ResidentPrefillWeights, prepare_prefill_inputs, prepare_resident_inputs,
 )
-from moe import AUX_WIDTH, ROUTE_WIDTH, moe
+from moe import AUX_WIDTH, ROUTE_WIDTH, SIGNAL_PAD, moe
 from compressor import STATE_WIDTH
 from prefill_attn_c1a import prefill_publish_decoder
 from prefill_attn_swa import make_prefill_attn_swa
@@ -100,13 +104,14 @@ from prefill_attn_c1a import (
 )
 from prefill_c1a_indexer import make_paged_indexer
 from quant import build_mxfp4_pair_lut
-from rmsnorm import rms_norm_tiled
+from rmsnorm import rms_norm_tiled, rms_norm_tiled_compensated
+from expert_routed import MX_PACKED_LANE_COLS, MX_W1_PACKED_ROWS, MX_W2_PACKED_ROWS, MX_W3_PACKED_ROWS
 
 RANKS = C.EP_SIZE
 D = M.hidden_size
 HC_MULT = M.hc_mult
 VOCAB = M.vocab_size
-PAGES = (CAPACITY + 127) // 128 + 1
+PAGES = pl.dynamic("V41_PREFILL_HISTORY_PAGES")
 LOCAL_EXPERTS = C.N_LOCAL_EXPERTS
 RECV_MAX = C.MOE_RECV_MAX
 HC_DIM = M.hc_dim
@@ -264,6 +269,142 @@ def prefill_attention(
 
 
 
+@pl.jit.inline(auto_scope=False)
+def _prefill_moe(
+    x_hc: pl.Tensor[[T_DYN, HC_MULT, D], pl.FP32],
+    pre_mix: pl.Tensor[[T_DYN, HC_MULT], pl.FP32],
+    hc_ffn_fn: pl.Tensor[[MIX_HC, HC_DIM], pl.FP32],
+    hc_ffn_scale: pl.Tensor[[3], pl.FP32],
+    hc_ffn_base: pl.Tensor[[MIX_HC], pl.FP32],
+    norm_weight: pl.Tensor[[D], pl.BF16],
+    gate_weight: pl.Tensor[[N_EXPERTS, D], pl.FP32],
+    correction_bias: pl.Tensor[[N_EXPERTS], pl.FP32],
+    routed_w1: pl.Tensor[[LOCAL_EXPERTS, MX_W1_PACKED_ROWS, MX_PACKED_LANE_COLS], pl.UINT8],
+    routed_w1_scale: pl.Tensor[
+        [LOCAL_EXPERTS * (D // 32), MOE_INTER],
+        pl.FP8E8M0,
+        pl.MX_B_NN,
+    ],
+    routed_w2: pl.Tensor[[LOCAL_EXPERTS, MX_W2_PACKED_ROWS, MX_PACKED_LANE_COLS], pl.UINT8],
+    routed_w2_scale: pl.Tensor[
+        [LOCAL_EXPERTS * (MOE_INTER // 32), D],
+        pl.FP8E8M0,
+        pl.MX_B_NN,
+    ],
+    routed_w3: pl.Tensor[[LOCAL_EXPERTS, MX_W3_PACKED_ROWS, MX_PACKED_LANE_COLS], pl.UINT8],
+    routed_w3_scale: pl.Tensor[
+        [LOCAL_EXPERTS * (D // 32), MOE_INTER],
+        pl.FP8E8M0,
+        pl.MX_B_NN,
+    ],
+    mxfp4_pair_lut: pl.Tensor[[2, 256], pl.INT16],
+    shared_w1: pl.Tensor[[D, MOE_INTER], pl.FP8E4M3FN],
+    shared_w1_scale: pl.Tensor[
+        [D // 32, MOE_INTER], pl.FP8E8M0, pl.MX_B_NN
+    ],
+    shared_w2: pl.Tensor[[MOE_INTER, D], pl.FP8E4M3FN],
+    shared_w2_scale: pl.Tensor[
+        [MOE_INTER // 32, D], pl.FP8E8M0, pl.MX_B_NN
+    ],
+    shared_w3: pl.Tensor[[D, MOE_INTER], pl.FP8E4M3FN],
+    shared_w3_scale: pl.Tensor[
+        [D // 32, MOE_INTER], pl.FP8E8M0, pl.MX_B_NN
+    ],
+    next_pre_mix: pl.Tensor[[T_DYN, HC_MULT], pl.FP32],
+    x_mixed: pl.Tensor[[T_DYN, D], pl.BF16],
+    x_next: pl.Tensor[[T_DYN, HC_MULT, D], pl.FP32],
+    recv_meta: pld.DistributedTensor[[RANKS, LOCAL_EXPERTS], pl.INT32],
+    recv_x: pld.DistributedTensor[[LOCAL_EXPERTS * RECV_MAX, D], pl.INT8],
+    recv_scale: pld.DistributedTensor[
+        [LOCAL_EXPERTS * RECV_MAX, D // 32], pl.UINT8
+    ],
+    recv_weights: pld.DistributedTensor[
+        [LOCAL_EXPERTS * RECV_MAX, AUX_WIDTH], pl.FP32
+    ],
+    recv_routes: pld.DistributedTensor[
+        [LOCAL_EXPERTS * RECV_MAX, ROUTE_WIDTH], pl.INT32
+    ],
+    arrived: pld.DistributedTensor[[RANKS, SIGNAL_PAD], pl.INT32],
+    data_arrived: pld.DistributedTensor[
+        [RANKS, LOCAL_EXPERTS, SIGNAL_PAD], pl.INT32
+    ],
+    routed_output: pld.DistributedTensor[[ROUTE_T_DYN, D], pl.BF16],
+    combine_arrived: pld.DistributedTensor[
+        [RANKS, LOCAL_EXPERTS, SIGNAL_PAD], pl.INT32
+    ],
+    slab_hidden: pl.Tensor[[2 * MOE_TOKENS, HC_MULT, D], pl.FP32],
+    slab_pre: pl.Tensor[[2 * MOE_TOKENS, HC_MULT], pl.FP32],
+    slab_mixed: pl.Tensor[[MOE_TOKENS, D], pl.BF16],
+    slab_rows: pl.Tensor[[MOE_TOKENS], pl.INT32],
+    reuse_ready: pl.Scalar[pl.TASK_ID],
+    num_tokens: pl.Scalar[pl.INT32],
+    ep_rank: pl.Scalar[pl.INT32],
+    moe_epoch: pl.Scalar[pl.INT32],
+):
+    """Run bounded MoE slabs and return completion of every scratch reader."""
+    capacity = pl.tensor.dim(x_hc, 0)
+    source_hidden = pl.reshape(x_hc, [capacity, HC_DIM])
+    round_completion = pl.array.create(1, pl.TASK_ID)
+    round_completion[0] = reuse_ready
+    rounds = (CAPACITY + MOE_TOKENS - 1) // MOE_TOKENS
+    for round_id in pl.range(rounds):
+        begin = round_id * MOE_TOKENS
+        rows = pl.min(MOE_TOKENS, capacity - begin)
+        # Keep caller-owned destinations outside the slab allocation scope.
+        hidden_destination = pl.slice(x_next, [rows, HC_MULT, D], [begin, 0, 0])
+        mixed_destination = pl.slice(x_mixed, [rows, D], [begin, 0])
+        pre_destination = pl.slice(next_pre_mix, [rows, HC_MULT], [begin, 0])
+        # Carry completion explicitly before overwriting shared scratch.
+        row_ids = pl.slice(slab_rows, [MOE_TOKENS], [0])
+        round_hidden = pl.slice(slab_hidden, [MOE_TOKENS, HC_MULT, D], [0, 0, 0])
+        round_output = pl.slice(slab_hidden, [MOE_TOKENS, HC_MULT, D], [MOE_TOKENS, 0, 0])
+        round_pre = pl.slice(slab_pre, [MOE_TOKENS, HC_MULT], [0, 0])
+        round_next = pl.slice(slab_pre, [MOE_TOKENS, HC_MULT], [MOE_TOKENS, 0])
+        round_mixed = pl.slice(slab_mixed, [MOE_TOKENS, D], [0, 0])
+        with pl.scope():
+            active = pl.max(0, pl.min(MOE_TOKENS, num_tokens - begin))
+            with pl.spmd(1, name_hint="prefill_moe_rows", deps=[round_completion[0]]) as rows_ready:
+                writer = pl.tile.get_block_idx()
+                for row in pl.range(writer, MOE_TOKENS):
+                    source_row = pl.cast(-1, pl.INT32)
+                    if row < active:
+                        source_row = pl.cast(begin + row, pl.INT32)
+                    pl.write(row_ids, [row], source_row)
+            packed_hidden = pl.reshape(round_hidden, [MOE_TOKENS, HC_DIM])
+            gather_rows(source_hidden, row_ids, packed_hidden, rows_ready)
+            gather_rows(pre_mix, row_ids, round_pre, rows_ready)
+            epoch = (moe_epoch - 1) * rounds + round_id + 1
+            moe(
+                round_hidden, round_pre, hc_ffn_fn, hc_ffn_scale, hc_ffn_base, norm_weight,
+                gate_weight, correction_bias,
+                routed_w1, routed_w1_scale, routed_w2, routed_w2_scale, routed_w3, routed_w3_scale,
+                mxfp4_pair_lut,
+                shared_w1, shared_w1_scale, shared_w2, shared_w2_scale, shared_w3, shared_w3_scale,
+                round_next, round_mixed, round_output,
+                recv_meta, recv_x, recv_scale, recv_weights, recv_routes, arrived, data_arrived,
+                routed_output, combine_arrived, active, ep_rank, epoch,
+            )
+            with pl.spmd(32, name_hint="prefill_moe_results") as hidden_copied:
+                worker = pl.tile.get_block_idx()
+                for row in pl.range(worker, MOE_TOKENS, 32):
+                    if begin + row < capacity:
+                        for lane in pl.range(HC_MULT):
+                            for column in pl.range(0, D, 512):
+                                hidden = round_output[row:row + 1, lane:lane + 1, column:column + 512]
+                                hidden_destination[row:row + 1, lane:lane + 1, column:column + 512] = hidden
+                        mixed = round_mixed[row:row + 1, :]
+                        mixed_destination[row:row + 1, :] = mixed
+            with pl.spmd(1, name_hint="prefill_moe_pre_mix") as pre_copied:
+                writer = pl.tile.get_block_idx()
+                for row in pl.range(writer, MOE_TOKENS):
+                    if begin + row < capacity:
+                        for lane in pl.range(HC_MULT):
+                            value = pl.read(round_next, [row, lane])
+                            pl.write(pre_destination, [row, lane], value)
+            round_completion[0] = pl.system.task_dummy(deps=[hidden_copied, pre_copied])
+    return round_completion[0]
+
+
 @pl.jit(auto_scope=False)
 def l2_prefill_fwd(
     embedding: pl.Tensor[[CAPACITY, D], pl.BF16],
@@ -297,19 +438,21 @@ def l2_prefill_fwd(
     publisher_slots: pl.Tensor[[CAPACITY], pl.INT64],
     token_requests: pl.Tensor[[2, CAPACITY], pl.INT32],
     compressed_lens: pl.Tensor[[2, CAPACITY], pl.INT32],
-    query_starts: pl.Tensor[[2, 2], pl.INT32],
-    index_block_tables: pl.Tensor[[2, 1, PAGES], pl.INT32],
-    state_block_table: pl.Tensor[[1, 1], pl.INT32],
+    query_starts: pl.Tensor[[2, Q_START_DYN], pl.INT32],
+    index_block_tables: pl.Tensor[[2, B_DYN, PAGES], pl.INT32],
+    state_block_table: pl.Tensor[[B_DYN, 1], pl.INT32],
     window_cache: pl.InOut[pl.Tensor[[40, PAGES, 128, 1, 512], pl.FP8E4M3FN]],
     window_scales: pl.InOut[pl.Tensor[[40, PAGES, 128, 1, 16], pl.BF16]],
     compressed_cache: pl.InOut[pl.Tensor[[4, PAGES, 128, 1, 256], pl.UINT8]],
     compressed_scales: pl.InOut[pl.Tensor[[4, PAGES, 128, 1, 32], pl.BF16]],
     index_cache: pl.InOut[pl.Tensor[[4, PAGES, 128, 1, 64], pl.UINT8]],
     index_scales: pl.InOut[pl.Tensor[[4, PAGES, 128, 1, 4], pl.FP8E8M0]],
-    state_cache: pl.InOut[pl.Tensor[[3, 2, C.STATE_CAPACITY, STATE_WIDTH], pl.FP32]],
+    state_cache: pl.InOut[pl.Tensor[[3, STATE_BLOCKS_DYN, C.STATE_CAPACITY, STATE_WIDTH], pl.FP32]],
     final_norm: pl.Tensor[[D], pl.BF16],
     head: pl.Tensor[[VOCAB, D], pl.BF16],
     logit_rows: pl.Tensor[[16], pl.INT32],
+    x_hc_out: pl.Out[pl.Tensor[[CAPACITY, HC_MULT, D], pl.FP32]],
+    pre_mix_out: pl.Out[pl.Tensor[[CAPACITY, HC_MULT], pl.FP32]],
     logits: pl.Out[pl.Tensor[[16, VOCAB], pl.FP32]],
     sampled_ids: pl.Out[pl.Tensor[[16, 8], pl.INT32]],
     recv_meta: pld.DistributedTensor[[RANKS, LOCAL_EXPERTS], pl.INT32],
@@ -319,7 +462,7 @@ def l2_prefill_fwd(
     recv_routes: pld.DistributedTensor[[LOCAL_EXPERTS * RECV_MAX, ROUTE_WIDTH], pl.INT32],
     arrived: pld.DistributedTensor[[RANKS, 128], pl.INT32],
     data_arrived: pld.DistributedTensor[[RANKS, LOCAL_EXPERTS, 128], pl.INT32],
-    routed_output: pld.DistributedTensor[[CAPACITY * TOPK, D], pl.BF16],
+    routed_output: pld.DistributedTensor[[MOE_TOKENS * TOPK, D], pl.BF16],
     combine_arrived: pld.DistributedTensor[[RANKS, LOCAL_EXPERTS, 128], pl.INT32],
     attention_window: pld.DistributedTensor[[C.PREFILL_MAX_TOKENS, D], pl.FP32],
     attention_arrived: pld.DistributedTensor[[C.TP_SIZE, 1], pl.INT32],
@@ -330,6 +473,10 @@ def l2_prefill_fwd(
     rank: pl.Scalar[pl.INT32],
 ):
     """Run both CED stages and the head with fresh, zeroed communication windows."""
+    compressed_cache.bind_dynamic(1, PAGES)
+    state_cache.bind_dynamic(1, STATE_BLOCKS_DYN)
+    state_block_table.bind_dynamic(0, B_DYN)
+    query_starts.bind_dynamic(1, Q_START_DYN)
     bank8.bind_dynamic(0, B8)
     bank4.bind_dynamic(0, B4)
     scales8.bind_dynamic(0, S8)
@@ -339,15 +486,21 @@ def l2_prefill_fwd(
     pre_pair = pl.create_tensor([4 * CAPACITY, HC_MULT], dtype=pl.FP32)
     initial_hidden = pl.slice(hidden_pair, [CAPACITY, HC_MULT, D], [0, 0, 0])
     initial_mix = pl.slice(pre_pair, [CAPACITY, HC_MULT], [0, 0])
+    gather_ready = pl.system.task_dummy(deps=[])
     pack_x_hc(embedding_ids, embedding, initial_hidden)
-    gather_rows(initial_pre, identity_rows, initial_mix)
+    gather_rows(initial_pre, identity_rows, initial_mix, gather_ready)
     topk_indices = pl.create_tensor([CAPACITY, INDEX_TOPK], dtype=pl.INT32)
-    candidate_mask = pl.create_tensor([CAPACITY, PAGES * 128], dtype=pl.UINT8)
-    # Only stage handoff buffers outlive an attention scope. Keep MoE at its
-    # existing nesting depth so each expert's scratch can be reclaimed.
+    candidate_mask = pl.create_tensor([CAPACITY, pl.tensor.dim(compressed_cache, 1) * 128], dtype=pl.UINT8)
+    # Keep stage handoff buffers outside attention scopes and reuse bounded
+    # MoE slabs across all layers and rounds.
     attn_hidden = pl.create_tensor([CAPACITY, HC_MULT, D], dtype=pl.FP32)
     attn_pre = pl.create_tensor([CAPACITY, HC_MULT], dtype=pl.FP32)
     ffn_mixed = pl.create_tensor([CAPACITY, D], dtype=pl.BF16)
+    slab_hidden = pl.create_tensor([2 * MOE_TOKENS, HC_MULT, D], dtype=pl.FP32)
+    slab_pre = pl.create_tensor([2 * MOE_TOKENS, HC_MULT], dtype=pl.FP32)
+    slab_mixed = pl.create_tensor([MOE_TOKENS, D], dtype=pl.BF16)
+    slab_rows = pl.create_tensor([MOE_TOKENS], dtype=pl.INT32)
+    moe_ready = pl.system.task_dummy(deps=[])
     for layer in pl.range(40):
         stage = layer // 20
         active = pl.read(counts, [stage])
@@ -507,8 +660,8 @@ def l2_prefill_fwd(
                 )
                 gathered_hidden = pl.reshape(hidden, [CAPACITY, HC_DIM])
                 source_hidden = pl.reshape(encoder_hidden, [CAPACITY, HC_DIM])
-                gather_rows(source_hidden, replay_rows, gathered_hidden)
-                gather_rows(encoder_pre, replay_rows, delayed_pre)
+                gather_rows(source_hidden, replay_rows, gathered_hidden, publisher_ready)
+                gather_rows(encoder_pre, replay_rows, delayed_pre, publisher_ready)
         with pl.scope():
             attn_post = pl.create_tensor([CAPACITY, HC_MULT], dtype=pl.FP32)
             attn_residual = pl.create_tensor([CAPACITY, HC_MULT, HC_MULT], dtype=pl.FP32)
@@ -552,22 +705,27 @@ def l2_prefill_fwd(
                 attn_output, rank, 0, active, layer + 1, mode,
             )
             mhc_post(attn_output, hidden, attn_post, attn_residual, attn_hidden)
-        moe(
+        moe_ready = _prefill_moe(
             attn_hidden, attn_pre, ffn_fn, ffn_scale, ffn_base, ffn_norm, gate_weight, gate_bias,
             routed_w1, routed_w1_scale, routed_w2, routed_w2_scale, routed_w3, routed_w3_scale,
             mxfp4_pair_lut, shared_w1, shared_w1_scale, shared_w2, shared_w2_scale,
             shared_w3, shared_w3_scale, next_pre, ffn_mixed, next_hidden,
             recv_meta, recv_x, recv_scale, recv_weights, recv_routes, arrived, data_arrived,
-            routed_output, combine_arrived, active, rank, layer + 1,
+            routed_output, combine_arrived, slab_hidden, slab_pre, slab_mixed, slab_rows,
+            moe_ready, active, rank, layer + 1,
         )
     final_hidden = pl.slice(hidden_pair, [CAPACITY, HC_MULT, D], [2 * CAPACITY, 0, 0])
     final_pre = pl.slice(pre_pair, [CAPACITY, HC_MULT], [2 * CAPACITY, 0])
+    source_hidden = pl.reshape(final_hidden, [CAPACITY, HC_DIM])
+    output_hidden = pl.reshape(x_hc_out, [CAPACITY, HC_DIM])
+    gather_rows(source_hidden, identity_rows, output_hidden, gather_ready)
+    gather_rows(final_pre, identity_rows, pre_mix_out, gather_ready)
     collapsed_head = pl.create_tensor([CAPACITY, D], dtype=pl.BF16)
     normalized_head = pl.create_tensor([CAPACITY, D], dtype=pl.BF16)
     hc_head(final_hidden, final_pre, collapsed_head)
     norm_tokens = pl.tensor.dim(collapsed_head, 0)
     for norm_block in pl.spmd((norm_tokens + 7) // 8, name_hint="rms_norm"):
-        rms_norm_tiled(collapsed_head, final_norm, normalized_head, norm_block, norm_tokens)
+        rms_norm_tiled_compensated(collapsed_head, final_norm, normalized_head, norm_block, norm_tokens)
     lm_head(normalized_head, head, logit_rows, logits, head_hidden, head_hidden_done,
             head_logits, head_logits_done, rank, 0, 1)
     greedy_sample(logits, sampled_ids)
@@ -607,23 +765,62 @@ def l3_prefill_fwd(
     publisher_slots: pl.Tensor[[RANKS, CAPACITY], pl.INT64],
     token_requests: pl.Tensor[[RANKS, 2, CAPACITY], pl.INT32],
     compressed_lens: pl.Tensor[[RANKS, 2, CAPACITY], pl.INT32],
-    query_starts: pl.Tensor[[RANKS, 2, 2], pl.INT32],
-    index_block_tables: pl.Tensor[[RANKS, 2, 1, PAGES], pl.INT32],
-    state_block_table: pl.Tensor[[RANKS, 1, 1], pl.INT32],
+    query_starts: pl.Tensor[[RANKS, 2, Q_START_DYN], pl.INT32],
+    index_block_tables: pl.Tensor[[RANKS, 2, B_DYN, PAGES], pl.INT32],
+    state_block_table: pl.Tensor[[RANKS, B_DYN, 1], pl.INT32],
     window_cache: pl.InOut[pl.Tensor[[RANKS, 40, PAGES, 128, 1, 512], pl.FP8E4M3FN]],
     window_scales: pl.InOut[pl.Tensor[[RANKS, 40, PAGES, 128, 1, 16], pl.BF16]],
     compressed_cache: pl.InOut[pl.Tensor[[RANKS, 4, PAGES, 128, 1, 256], pl.UINT8]],
     compressed_scales: pl.InOut[pl.Tensor[[RANKS, 4, PAGES, 128, 1, 32], pl.BF16]],
     index_cache: pl.InOut[pl.Tensor[[RANKS, 4, PAGES, 128, 1, 64], pl.UINT8]],
     index_scales: pl.InOut[pl.Tensor[[RANKS, 4, PAGES, 128, 1, 4], pl.FP8E8M0]],
-    state_cache: pl.InOut[pl.Tensor[[RANKS, 3, 2, C.STATE_CAPACITY, STATE_WIDTH], pl.FP32]],
+    state_cache: pl.InOut[pl.Tensor[[RANKS, 3, STATE_BLOCKS_DYN, C.STATE_CAPACITY, STATE_WIDTH], pl.FP32]],
     final_norm: pl.Tensor[[RANKS, D], pl.BF16],
     head: pl.Tensor[[RANKS, VOCAB, D], pl.BF16],
     logit_rows: pl.Tensor[[RANKS, 16], pl.INT32],
+    x_hc_out: pl.Out[pl.Tensor[[RANKS, CAPACITY, HC_MULT, D], pl.FP32]],
+    pre_mix_out: pl.Out[pl.Tensor[[RANKS, CAPACITY, HC_MULT], pl.FP32]],
     logits: pl.Out[pl.Tensor[[RANKS, 16, VOCAB], pl.FP32]],
     sampled_ids: pl.Out[pl.Tensor[[RANKS, 16, 8], pl.INT32]],
 ):
-    """Allocate fresh native communication windows and launch one L2 per rank."""
+    """Append one TP1/DP4/EP4 or TP1/DP8/EP8 chunk and return its final state/logits.
+
+    CAPACITY bounds current rows to at most 4096; the dynamic page extent
+    independently sizes retained history. For full causal continuation replay
+    all current rows:
+    counts[:, 0] == counts[:, 1], replay_rows and identity_rows are current-row
+    identities, padded with -1. Positions, lengths and physical slots are
+    absolute within the request. Both stages' window indices include committed
+    history; the compressed families have independent local page tables.
+
+    embedding holds caller-gathered BF16 rows; embedding_ids indexes that
+    rank-local slab, not the model vocabulary. initial_pre is the current
+    rows' delayed mix (identity for new tokens). Stage axes are encoder,
+    decoder; index_block_tables instead has family order C2A, C1A. Token RoPE
+    profiles are encoder base, encoder compressed, decoder compressed.
+    compressed_cos/sin rotates completed C2A pairs at their group-first
+    position; publisher_cos/sin rotates C1A keys at their token position.
+    compressed_slots publishes C2A rows and publisher_slots publishes C1A.
+    logit_rows indexes the decoder replay slab; -1 disables that output row.
+
+    Preserve all seven InOut cache tensors across chunks and decode. Their
+    source/page layout aliases decode pools through utils.decode_cache_views.
+    Residual/pre-mix outputs describe these rows after layer 39. New tokens
+    start from their own embedding and identity pre-mix; historical mHC state
+    is represented by the committed KV/index/compressor caches.
+
+    Zero-count ranks participate in EP communication without publishing cache
+    rows. Wait for runtime completion before advancing lengths, launching a
+    dependent call or reusing buffers. Communication windows are fresh per
+    invocation (prepare with persistent=False). After request completion, the
+    caller releases its pages and resets its request slot in all C2A sources before
+    assigning them to another request; failed calls require cache restoration
+    or reset before retry. Engram, vision and DSpark have no inputs here.
+    """
+    compressed_cache.bind_dynamic(2, PAGES)
+    state_cache.bind_dynamic(2, STATE_BLOCKS_DYN)
+    state_block_table.bind_dynamic(1, B_DYN)
+    query_starts.bind_dynamic(2, Q_START_DYN)
     recv_meta_buffer = pld.alloc_window_buffer([RANKS, LOCAL_EXPERTS], dtype=pl.INT32)
     recv_x_buffer = pld.alloc_window_buffer([LOCAL_EXPERTS * RECV_MAX, D], dtype=pl.INT8)
     recv_scale_buffer = pld.alloc_window_buffer([LOCAL_EXPERTS * RECV_MAX, D // 32], dtype=pl.UINT8)
@@ -631,7 +828,7 @@ def l3_prefill_fwd(
     recv_routes_buffer = pld.alloc_window_buffer([LOCAL_EXPERTS * RECV_MAX, ROUTE_WIDTH], dtype=pl.INT32)
     arrived_buffer = pld.alloc_window_buffer([RANKS, 128], dtype=pl.INT32)
     data_arrived_buffer = pld.alloc_window_buffer([RANKS, LOCAL_EXPERTS, 128], dtype=pl.INT32)
-    routed_output_buffer = pld.alloc_window_buffer([CAPACITY * TOPK, D], dtype=pl.BF16)
+    routed_output_buffer = pld.alloc_window_buffer([MOE_TOKENS * TOPK, D], dtype=pl.BF16)
     combine_arrived_buffer = pld.alloc_window_buffer([RANKS, LOCAL_EXPERTS, 128], dtype=pl.INT32)
     attention_window_buffer = pld.alloc_window_buffer([PREFILL_MAX_TOKENS, D], dtype=pl.FP32)
     attention_arrived_buffer = pld.alloc_window_buffer([TP_SIZE, 1], dtype=pl.INT32)
@@ -647,7 +844,7 @@ def l3_prefill_fwd(
         recv_routes = pld.window(recv_routes_buffer, [LOCAL_EXPERTS * RECV_MAX, ROUTE_WIDTH], dtype=pl.INT32)
         arrived = pld.window(arrived_buffer, [RANKS, 128], dtype=pl.INT32)
         data_arrived = pld.window(data_arrived_buffer, [RANKS, LOCAL_EXPERTS, 128], dtype=pl.INT32)
-        routed_output = pld.window(routed_output_buffer, [CAPACITY * TOPK, D], dtype=pl.BF16)
+        routed_output = pld.window(routed_output_buffer, [MOE_TOKENS * TOPK, D], dtype=pl.BF16)
         combine_arrived = pld.window(combine_arrived_buffer, [RANKS, LOCAL_EXPERTS, 128], dtype=pl.INT32)
         attention_window = pld.window(attention_window_buffer, [PREFILL_MAX_TOKENS, D], dtype=pl.FP32)
         attention_arrived = pld.window(attention_arrived_buffer, [TP_SIZE, 1], dtype=pl.INT32)
@@ -700,6 +897,7 @@ def l3_prefill_fwd(
             final_norm[rank],
             head[rank],
             logit_rows[rank],
+            x_hc_out[rank], pre_mix_out[rank],
             logits[rank],
             sampled_ids[rank],
             recv_meta,
@@ -766,16 +964,19 @@ PREFILL_TENSORS = (
     "final_norm",
     "head",
     "logit_rows",
+    "x_hc_out", "pre_mix_out",
     "logits",
     "sampled_ids",
 )
 
 
-def generate(checkpoint, compiled, device_ids, prompts, max_new_tokens):
+def generate(checkpoint, compiled, device_ids, prompts, max_new_tokens, *, chunk_size=None):
     """Generate one independent continuation per rank using resident checkpoint weights.
 
-    Each forward gets fresh caches and communication windows. Weights and tensor
-    allocations survive across forwards; no CPU network reference is evaluated.
+    Prefill and subsequent one-token calls retain native device caches. Only
+    current-token metadata is uploaded; completed history is never recomputed.
+    This example uses the prefill composition for one-token continuation too;
+    l3_decode_fwd can consume the same cache storage through decode_cache_views.
     """
     from tokenizers import Tokenizer
 
@@ -802,8 +1003,12 @@ def generate(checkpoint, compiled, device_ids, prompts, max_new_tokens):
         ).ids
         for prompt in prompts
     ]
-    if any(len(sequence) + max_new_tokens > CAPACITY for sequence in sequences):
-        raise ValueError("prompt plus generation exceeds --capacity; compile a larger capacity")
+    chunk_size = CAPACITY if chunk_size is None else chunk_size
+    if not 1 <= chunk_size <= CAPACITY:
+        raise ValueError("chunk_size must fit CAPACITY and be at most 4096")
+    max_seq_len = max(map(len, sequences)) + max_new_tokens
+    if max_seq_len > M.max_position_embeddings:
+        raise ValueError("prompt plus generation exceeds the model position bound")
     tokenizer_config = json.loads((checkpoint.root / "tokenizer_config.json").read_text())
     eos = tokenizer_config["eos_token"]
     eos_id = tokenizer.token_to_id(eos["content"] if isinstance(eos, dict) else eos)
@@ -811,23 +1016,34 @@ def generate(checkpoint, compiled, device_ids, prompts, max_new_tokens):
         raise ValueError("checkpoint EOS token is missing from its tokenizer")
     weights = ResidentPrefillWeights(checkpoint, ep_size=RANKS)
     config = RunConfig(
-        platform="a5", ring_heap=(2 * 1024**3,) * 4,
+        platform="a5", ring_heap=2 * 1024**3,
         distributed_config=DistributedConfig(device_ids=device_ids, num_sub_workers=0),
     )
     outputs = {
+        "x_hc_out": ((CAPACITY, HC_MULT, D), torch.float32),
+        "pre_mix_out": ((CAPACITY, HC_MULT), torch.float32),
         "logits": ((16, VOCAB), torch.float32),
         "sampled_ids": ((16, 8), torch.int32),
     }
     constants = {*weights.tensor_layouts, *weights.offset_tensors, "head", "final_norm", "mxfp4_pair_lut"}
+    cache_names = {
+        "window_cache", "window_scales", "compressed_cache", "compressed_scales",
+        "index_cache", "index_scales", "state_cache",
+    }
+    constants.update(cache_names)
     generated = [[] for _ in prompts]
     finished = [False] * RANKS
     print("CED_RESIDENT_BYTES_PER_RANK", weights.bytes_per_rank, flush=True)
     start = time.monotonic()
-    # Fresh CommDomains start epoch 1 for every complete prefix evaluation.
+    # Fresh communication windows start epoch 1; native cache allocations persist.
     with compiled.prepare(config, persistent=False) as runtime:
         per_rank = [{} for _ in device_ids]
+        host_cache = []
         for rank, tensors in enumerate(per_rank):
-            inputs = prepare_resident_inputs(checkpoint, weights, sequences[rank], CAPACITY)
+            inputs = prepare_resident_inputs(
+                checkpoint, weights, sequences[rank][:chunk_size], CAPACITY, max_seq_len=max_seq_len,
+            )
+            host_cache.append({name: inputs[name] for name in cache_names})
             inputs["mxfp4_pair_lut"] = build_mxfp4_pair_lut()
             for name in PREFILL_TENSORS:
                 if name in weights.tensor_layouts:
@@ -854,34 +1070,54 @@ def generate(checkpoint, compiled, device_ids, prompts, max_new_tokens):
         }
         logits = torch.empty((RANKS, 16, VOCAB), dtype=torch.float32)
         sampled_ids = torch.empty((RANKS, 16, 8), dtype=torch.int32)
-        for step in range(max_new_tokens):
-            if step:
-                for rank, tensors in enumerate(per_rank):
-                    inputs = prepare_resident_inputs(checkpoint, weights, sequences[rank], CAPACITY)
-                    for name, value in inputs.items():
-                        if name not in constants:
-                            runtime.copy_to(
-                                tensors[name].data_ptr, value.data_ptr(), value.numel() * value.element_size(),
-                                worker_id=rank,
-                            )
-            tick = time.monotonic()
-            print("CED_DEVICE_START", step, flush=True)
+        committed = [0] * RANKS
+        last_logits = torch.empty((RANKS, VOCAB), dtype=torch.float32)
+        last_ids = [0] * RANKS
+
+        def run_rows(rows):
+            for rank, (tensors, token_ids) in enumerate(zip(per_rank, rows)):
+                inputs = prepare_resident_inputs(
+                    checkpoint, weights, token_ids, CAPACITY,
+                    start_pos=committed[rank], max_seq_len=max_seq_len, cache_state=host_cache[rank],
+                )
+                for name, value in inputs.items():
+                    if name not in constants:
+                        runtime.copy_to(
+                            tensors[name].data_ptr, value.data_ptr(), value.numel() * value.element_size(),
+                            worker_id=rank,
+                        )
             runtime(*[stacked[name] for name in PREFILL_TENSORS], config=config)
             runtime.copy_stacked_from(stacked["logits"], logits)
             runtime.copy_stacked_from(stacked["sampled_ids"], sampled_ids)
-            if not bool(torch.isfinite(logits[:, 0]).all()):
-                raise FloatingPointError(f"nonfinite last-token logits at step {step}")
-            for rank in range(RANKS):
+            for rank, token_ids in enumerate(rows):
+                if not token_ids:
+                    continue
+                if not bool(torch.isfinite(logits[rank, 0]).all()):
+                    raise FloatingPointError(f"nonfinite logits on rank {rank}")
                 token = int(sampled_ids[rank, 0, 0])
                 if token != int(logits[rank, 0].argmax()):
                     raise AssertionError("device greedy sampling disagrees with copied logits")
+                last_logits[rank].copy_(logits[rank, 0])
+                last_ids[rank] = token
+                committed[rank] += len(token_ids)
+
+        while any(committed[rank] < len(sequence) for rank, sequence in enumerate(sequences)):
+            rows = [sequence[committed[rank]:committed[rank] + chunk_size]
+                    for rank, sequence in enumerate(sequences)]
+            run_rows(rows)
+            print("PREFILL_CHUNK_COMPLETE", committed, flush=True)
+        for step in range(max_new_tokens):
+            tick = time.monotonic()
+            if step:
+                run_rows([[tokens[-1]] if not finished[rank] else []
+                          for rank, tokens in enumerate(generated)])
+            for rank, token in enumerate(last_ids):
                 if not finished[rank]:
                     generated[rank].append(token)
-                    sequences[rank].append(token)
                     finished[rank] = token == eos_id
             print("CED_GENERATION_STEP", json.dumps({
                 "step": step, "seconds": time.monotonic() - tick,
-                "token_ids": sampled_ids[:, 0, 0].tolist(),
+                "token_ids": last_ids,
                 "text": [tokenizer.decode(tokens, skip_special_tokens=False) for tokens in generated],
             }, ensure_ascii=False), flush=True)
             if all(finished):
@@ -889,7 +1125,8 @@ def generate(checkpoint, compiled, device_ids, prompts, max_new_tokens):
     return {
         "platform": "a5", "tp": 1, "ep": RANKS, "dp": RANKS,
         "precision": "official_bf16_mxfp8_mxfp4", "checkpoint": str(checkpoint.root),
-        "capacity": CAPACITY, "full_prefix_recomputation": True, "engram_enabled": False,
+        "capacity": CAPACITY, "chunk_size": chunk_size, "history_capacity": max_seq_len,
+        "full_prefix_recomputation": False, "engram_enabled": False,
         "layers_per_forward": 40, "l2_invocations_per_rank_per_forward": 1,
         "seconds": time.monotonic() - start,
         "cases": [
@@ -943,6 +1180,8 @@ def build_tensor_specs():
         "scales8": ([RANKS, scale_values // 128, 128], torch.float8_e8m0fnu, 1.0),
         "bf16": ([RANKS, bf16_values], torch.bfloat16, 0.0),
         "head": ([RANKS, VOCAB, D], torch.bfloat16, None),
+        "x_hc_out": ([RANKS, CAPACITY, HC_MULT, D], torch.float32, None),
+        "pre_mix_out": ([RANKS, CAPACITY, HC_MULT], torch.float32, None),
         "logits": ([RANKS, 16, VOCAB], torch.float32, None),
         "sampled_ids": ([RANKS, 16, 8], torch.int32, None),
     }
@@ -986,13 +1225,14 @@ if __name__ == "__main__":
         parser.add_argument("--capacity", type=int, default=CAPACITY)
         parser.add_argument("--prompt", action="append", help="one prompt per rank; provide exactly --ep prompts")
         parser.add_argument("--max-new-tokens", type=int, default=16)
+        parser.add_argument("--chunk-size", type=int, default=CAPACITY)
         parser.add_argument("--report", type=Path)
         options = parser.parse_args()
         if options.experts_per_rank * options.ep != M.n_routed_experts or N_EXPERTS != M.n_routed_experts:
             parser.error("checkpoint generation requires all 384 routed experts")
         if (options.tp, options.ep, options.dp) != (C.TP_SIZE, RANKS, RANKS):
             raise ValueError("parallel sizes must match compilation: TP1 with EP4/DP4 or EP8/DP8")
-        if options.capacity != CAPACITY or not 16 <= CAPACITY <= C.PREFILL_MAX_TOKENS or CAPACITY % 16:
+        if options.capacity != CAPACITY or not 16 <= CAPACITY <= _MAX_CHUNK_TOKENS or CAPACITY % 16:
             raise ValueError("--capacity must match compilation and be a positive multiple of 16")
         device_ids = [int(value) for value in (options.devices or "").split(",") if value]
         if len(device_ids) != RANKS or len(set(device_ids)) != RANKS:
@@ -1012,7 +1252,9 @@ if __name__ == "__main__":
             options.runtime_dir, platform="a5",
             distributed_config=DistributedConfig(device_ids=device_ids, num_sub_workers=0),
         )
-        report = generate(checkpoint, compiled, device_ids, prompts, options.max_new_tokens)
+        report = generate(
+            checkpoint, compiled, device_ids, prompts, options.max_new_tokens, chunk_size=options.chunk_size,
+        )
         if options.report:
             options.report.parent.mkdir(parents=True, exist_ok=True)
             options.report.write_text(json.dumps(report, indent=2, ensure_ascii=False) + "\n")

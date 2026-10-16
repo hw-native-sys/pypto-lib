@@ -159,10 +159,15 @@ def dequantize_mxfp4(packed_weight: torch.Tensor, scale_e8m0: torch.Tensor) -> t
     return values * scales
 
 
-def _nearest_fp4_indices(values: torch.Tensor) -> torch.Tensor:
+def _nearest_fp4_indices(values: torch.Tensor, *, round_to_even: bool = False) -> torch.Tensor:
     table = FP4_VALUES[:8].to(values.device)
     magnitude = values.abs().unsqueeze(-1)
-    index = (magnitude - table).abs().argmin(dim=-1).to(torch.uint8)
+    if round_to_even:
+        order = torch.tensor([0, 2, 4, 6, 1, 3, 5, 7], device=values.device)
+        selected = (magnitude - table[order]).abs().argmin(dim=-1)
+        index = order[selected].to(torch.uint8)
+    else:
+        index = (magnitude - table).abs().argmin(dim=-1).to(torch.uint8)
     return index | (torch.signbit(values).to(torch.uint8) << 3)
 
 
@@ -210,14 +215,15 @@ def dequantize_mxfp8_cache(payload: torch.Tensor, scale_bf16: torch.Tensor) -> t
 
 
 def quantize_mxfp4_cache(
-    value: torch.Tensor, group_size: int, scale_format: str
+    value: torch.Tensor, group_size: int, scale_format: str, *, round_to_even: bool = False
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Quantize the last dimension to packed E2M1 with E4M3, E8M0 or BF16 scales."""
     if value.shape[-1] % group_size:
         raise ValueError(f"MXFP4 cache width must be divisible by {group_size}")
     grouped = value.float().unflatten(-1, (-1, group_size))
     amax = grouped.abs().amax(dim=-1)
-    raw_scale = (amax / 6.0).clamp_min(2.0**-9)
+    floor = 2.0**-126 if round_to_even and scale_format == "e8m0" else 2.0**-9
+    raw_scale = (amax / 6.0).clamp_min(floor)
     if scale_format == "e8m0":
         exponent = torch.ceil(torch.log2(raw_scale)).clamp(-127, 128)
         scale_value = torch.exp2(exponent)
@@ -231,7 +237,7 @@ def quantize_mxfp4_cache(
     else:
         raise ValueError(f"unsupported MXFP4 cache scale format {scale_format!r}")
     normalized = (grouped / scale_value.unsqueeze(-1)).clamp(-6.0, 6.0)
-    payload = _pack_fp4(_nearest_fp4_indices(normalized).flatten(-2))
+    payload = _pack_fp4(_nearest_fp4_indices(normalized, round_to_even=round_to_even).flatten(-2))
     return payload, stored_scale
 
 

@@ -45,6 +45,8 @@ from pypto.ir import DistributedConfig
 # Standalone LM-head validation defaults to TP2/DP1.
 
 from config import FLASH as M, TP_SIZE as CONFIG_TP_SIZE
+from hc_head import hc_head, golden_hc_head
+from rmsnorm import rms_norm_tiled_compensated, golden_rms_norm_tiled
 
 
 # model config
@@ -53,6 +55,7 @@ VOCAB = M.vocab_size
 
 
 T_DYN = pl.dynamic("LM_HEAD_T_DYN")
+HC_MULT = M.hc_mult
 
 # Parallelism. Static in the frontend, so both worlds are parsed off argv here.
 # Imported kernels inherit TP from the composing program.
@@ -457,6 +460,77 @@ def l2_lm_head(
 
 
 @pl.jit.host
+def l3_final_output(
+    x_hc: pl.Tensor[[WORLD_SIZE, T_DYN, HC_MULT, D], pl.FP32],
+    pre_mix: pl.Tensor[[WORLD_SIZE, T_DYN, HC_MULT], pl.FP32],
+    final_norm_weight: pl.Tensor[[WORLD_SIZE, D], pl.BF16],
+    lm_head_weight: pl.Tensor[[WORLD_SIZE, VOCAB_PER_TP, D], pl.BF16],
+    logit_row_indices: pl.Tensor[[WORLD_SIZE, MAX_LOGIT_ROWS], pl.INT32],
+    logits: pl.Out[pl.Tensor[[WORLD_SIZE, MAX_LOGIT_ROWS, VOCAB], pl.FP32]],
+    sampled_ids: pl.Out[pl.Tensor[[WORLD_SIZE, MAX_LOGIT_ROWS, SAMPLED_IDS_PAD], pl.INT32]],
+):
+    """Collapse final-layer residual/pre-mix, normalize, project and sample.
+
+    Consume the native FP32 state returned by prefill or decode without
+    reinitializing it from embeddings. Each row index is rank-local; -1
+    produces zero logits and is ignored by the caller, including idle ranks.
+    This entry only reads layer state and never mutates caches. Wait for the
+    backbone to complete before dispatch and for this call before reading
+    logits or reusing state. Communication windows are fresh per invocation
+    (prepare with persistent=False). TP1/DP8 uses eight full head replicas.
+    """
+    x_hc.bind_dynamic(1, T_DYN)
+    hidden_buffer = pld.alloc_window_buffer([GROUP_LOGIT_ROWS, D], dtype=pl.BF16)
+    hidden_done_buffer = pld.alloc_window_buffer([TP_SIZE, 1], dtype=pl.INT32)
+    logits_buffer = pld.alloc_window_buffer([MAX_LOGIT_ROWS, VOCAB], dtype=pl.FP32)
+    logits_done_buffer = pld.alloc_window_buffer([TP_SIZE, 1], dtype=pl.INT32)
+    for epoch_idx in pl.range(REPEAT):
+        for rank in pl.range(pld.world_size()):
+            hidden_window = pld.window(hidden_buffer, [GROUP_LOGIT_ROWS, D], dtype=pl.BF16)
+            hidden_done = pld.window(hidden_done_buffer, [TP_SIZE, 1], dtype=pl.INT32)
+            logits_window = pld.window(logits_buffer, [MAX_LOGIT_ROWS, VOCAB], dtype=pl.FP32)
+            logits_done = pld.window(logits_done_buffer, [TP_SIZE, 1], dtype=pl.INT32)
+            final_output(
+                x_hc[rank], pre_mix[rank], final_norm_weight[rank], lm_head_weight[rank],
+                logit_row_indices[rank], logits[rank], sampled_ids[rank],
+                hidden_window, hidden_done, logits_window, logits_done,
+                rank // TP_SIZE * TP_SIZE, rank % TP_SIZE, epoch_idx + 1, device=rank,
+            )
+
+
+@pl.jit
+def final_output(
+    x_hc: pl.Tensor[[T_DYN, HC_MULT, D], pl.FP32],
+    pre_mix: pl.Tensor[[T_DYN, HC_MULT], pl.FP32],
+    final_norm_weight: pl.Tensor[[D], pl.BF16],
+    lm_head_weight: pl.Tensor[[VOCAB_PER_TP, D], pl.BF16],
+    logit_row_indices: pl.Tensor[[MAX_LOGIT_ROWS], pl.INT32],
+    logits: pl.Out[pl.Tensor[[MAX_LOGIT_ROWS, VOCAB], pl.FP32]],
+    sampled_ids: pl.Out[pl.Tensor[[MAX_LOGIT_ROWS, SAMPLED_IDS_PAD], pl.INT32]],
+    hidden_window: pld.DistributedTensor[[GROUP_LOGIT_ROWS, D], pl.BF16],
+    hidden_done: pld.DistributedTensor[[TP_SIZE, 1], pl.INT32],
+    logits_window: pld.DistributedTensor[[MAX_LOGIT_ROWS, VOCAB], pl.FP32],
+    logits_done: pld.DistributedTensor[[TP_SIZE, 1], pl.INT32],
+    group_base: pl.Scalar[pl.INT32],
+    tp_rank: pl.Scalar[pl.INT32],
+    done_epoch: pl.Scalar[pl.INT32],
+):
+    """Compose final HC, Norm and LM head from the current layer state."""
+    x_hc.bind_dynamic(0, T_DYN)
+    rows = pl.tensor.dim(x_hc, 0)
+    collapsed = pl.create_tensor([rows, D], dtype=pl.BF16)
+    hc_head(x_hc, pre_mix, collapsed)
+    normalized = pl.create_tensor([rows, D], dtype=pl.BF16)
+    for norm_block in pl.spmd((rows + 7) // 8, name_hint="final_rms_norm"):
+        rms_norm_tiled_compensated(collapsed, final_norm_weight, normalized, norm_block, rows)
+    lm_head_with_sampling(
+        normalized, lm_head_weight, logit_row_indices, logits, sampled_ids,
+        hidden_window, hidden_done, logits_window, logits_done, group_base, tp_rank, done_epoch,
+    )
+    return logits, sampled_ids
+
+
+@pl.jit.host
 def l3_lm_head(
     hidden_states: pl.Tensor[[WORLD_SIZE, TEST_TOKENS, D], pl.BF16],
     lm_head_weight: pl.Tensor[[WORLD_SIZE, VOCAB_PER_TP, D], pl.BF16],
@@ -515,7 +589,19 @@ def golden_lm_head(tensors):
         ).to(torch.int32)
 
 
-def build_tensor_specs(num_tokens=TEST_TOKENS):
+def golden_final_output(tensors):
+    """Evaluate HC collapse, BF16 Norm and head projection independently on CPU."""
+    import torch
+
+    hidden = []
+    for rank in range(WORLD_SIZE):
+        collapsed = golden_hc_head(tensors["x_hc"][rank], tensors["pre_mix"][rank])
+        normalized = golden_rms_norm_tiled(collapsed, tensors["final_norm_weight"][rank])
+        hidden.append(normalized.to(torch.bfloat16))
+    golden_lm_head({**tensors, "hidden_states": torch.stack(hidden)})
+
+
+def build_tensor_specs(num_tokens=TEST_TOKENS, *, final=False):
     import torch
     from golden import TensorSpec
 
@@ -531,9 +617,11 @@ def build_tensor_specs(num_tokens=TEST_TOKENS):
     def init_logit_row_indices():
         indices = torch.full((WORLD_SIZE, MAX_LOGIT_ROWS), -1, dtype=torch.int32)
         indices[:, :active] = torch.arange(active, dtype=torch.int32)
+        if final and DP_SIZE > 1:
+            indices[-TP_SIZE:] = -1
         return indices
 
-    return [
+    specs = [
         TensorSpec(
             "hidden_states",
             [WORLD_SIZE, TEST_TOKENS, D],
@@ -567,6 +655,14 @@ def build_tensor_specs(num_tokens=TEST_TOKENS):
             init_value=init_logit_row_indices,
         ),
     ]
+    if final:
+        specs = [
+            TensorSpec("x_hc", [WORLD_SIZE, TEST_TOKENS, HC_MULT, D], torch.float32, init_value=torch.randn),
+            TensorSpec("pre_mix", [WORLD_SIZE, TEST_TOKENS, HC_MULT], torch.float32, init_value=torch.rand),
+            TensorSpec("final_norm_weight", [WORLD_SIZE, D], torch.bfloat16, init_value=torch.ones),
+            specs[1], specs[4], specs[2], specs[3],
+        ]
+    return specs
 
 
 def compare_sampled_ids(actual, _expected, *, actual_outputs, **_):
@@ -607,6 +703,7 @@ if __name__ == "__main__":
                         help=f"comma-separated device ids; need at least {WORLD_SIZE}")
     parser.add_argument("--enable-chip-swimlane", type=int, nargs="?", const=1, default=0, choices=range(5))
     parser.add_argument("--compile-only", action="store_true", default=False)
+    parser.add_argument("--final-output", action="store_true", help="include final HC collapse and Norm")
     parser.add_argument("--runtime-dir", type=str, default=None)
     parser.add_argument("--dump-passes", action="store_true", default=False)
     args = parser.parse_args()
@@ -620,9 +717,9 @@ if __name__ == "__main__":
     assert 0 <= args.num_tokens <= TEST_TOKENS
 
     result = run(
-        fn=l3_lm_head,
-        specs=build_tensor_specs(args.num_tokens),
-        golden_fn=golden_lm_head,
+        fn=l3_final_output if args.final_output else l3_lm_head,
+        specs=build_tensor_specs(args.num_tokens, final=args.final_output),
+        golden_fn=golden_final_output if args.final_output else golden_lm_head,
         compare_fn={
             "logits": ratio_allclose(atol=1e-3, rtol=1e-3, max_error_ratio=0.0),
             "sampled_ids": compare_sampled_ids,

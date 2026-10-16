@@ -11,7 +11,7 @@
 import torch
 
 from qkv_proj_rope import golden_rope_interleave as rope_interleave
-from quant import mxfp8_linear
+from quant import golden_mxfp8_linear, mxfp8_linear
 
 import pypto.language as pl
 import pypto.language.distributed as pld
@@ -42,93 +42,69 @@ O_GROUP_IN = M.num_attention_heads * M.head_dim // M.o_groups
 
 D_TILE = 512
 _PREFILL_WORKERS = 64
+_PREFILL_GROUPED_WORKERS = 4096
 
 
-@pl.jit.inline
-def _grouped_output_block(
+@pl.jit.inline(auto_scope=False)
+def _staged_grouped_output(
     x: pl.Tensor[[T_DYN, LOCAL_H * HEAD_DIM], pl.BF16],
     weight: pl.Tensor[[LOCAL_O_GROUPS, O_LORA, O_GROUP_IN], pl.BF16],
     output: pl.Tensor[[T_DYN, LOCAL_O_WIDTH], pl.BF16],
-    block: pl.Scalar[pl.INT32],
     num_tokens: pl.Scalar[pl.INT32],
+    ready: pl.Scalar[pl.TASK_ID],
 ):
-    t0 = block // (LOCAL_O_WIDTH // N_TILE) * M_TILE
-    n0 = block % (LOCAL_O_WIDTH // N_TILE) * N_TILE
-    group = n0 // O_LORA
-    local_n = n0 % O_LORA
-    rows = pl.min(M_TILE, num_tokens - t0)
-    acc = pl.create_tensor([M_TILE, N_TILE], dtype=pl.FP32)
-    for kb in pl.range(O_GROUP_IN // K_TILE):
-        k0 = kb * K_TILE
-        a = pl.slice(
-            x,
-            [M_TILE, K_TILE],
-            [t0, group * O_GROUP_IN + k0],
-            valid_shape=[rows, K_TILE],
-        )
-        w = pl.reshape(
-            weight[group : group + 1, local_n : local_n + N_TILE, k0 : k0 + K_TILE],
-            [N_TILE, K_TILE],
-        )
-        acc = pl.matmul_acc(acc, a, w, b_trans=True, init_cond=(kb == 0))
-    value = pl.cast(acc, pl.BF16, mode="rint")
-    output[t0 : t0 + M_TILE, n0 : n0 + N_TILE] = pl.set_validshape(value, rows, N_TILE)
-    return output
+    tokens = pl.tensor.dim(x, 0)
+    accumulated = pl.create_tensor([tokens, LOCAL_O_WIDTH], dtype=pl.FP32)
+    blocks = (num_tokens + M_TILE - 1) // M_TILE * (LOCAL_O_WIDTH // N_TILE)
+    workers = pl.max(pl.min(blocks, _PREFILL_GROUPED_WORKERS), 1)
+    entry_deps = pl.array.create(1, pl.TASK_ID)
+    entry_deps[0] = ready
+    with pl.spmd(workers, name_hint="attention_grouped_o_a_cube", deps=[entry_deps[0]]) as cube_tid:
+        worker = pl.tile.get_block_idx()
+        for block in pl.range(worker, blocks, _PREFILL_GROUPED_WORKERS):
+            t0 = block // (LOCAL_O_WIDTH // N_TILE) * M_TILE
+            n0 = block % (LOCAL_O_WIDTH // N_TILE) * N_TILE
+            group = n0 // O_LORA
+            local_n = n0 % O_LORA
+            rows = pl.min(M_TILE, num_tokens - t0)
+            acc = pl.create_tensor([M_TILE, N_TILE], dtype=pl.FP32)
+            for kb in pl.range(O_GROUP_IN // K_TILE):
+                k0 = kb * K_TILE
+                a = pl.slice(x, [M_TILE, K_TILE], [t0, group * O_GROUP_IN + k0], valid_shape=[rows, K_TILE])
+                a = pl.cast(pl.cast(a, pl.FP32), pl.BF16, mode="rint")
+                w = pl.reshape(weight[group:group + 1, local_n:local_n + N_TILE, k0:k0 + K_TILE], [N_TILE, K_TILE])
+                acc = pl.matmul_acc(acc, a, w, b_trans=True, init_cond=(kb == 0))
+            value = pl.set_validshape(pl.mul(acc, 1.0), rows, N_TILE)
+            accumulated[t0:t0 + M_TILE, n0:n0 + N_TILE] = value
+    with pl.spmd(workers, name_hint="attention_grouped_o_a_cast", deps=[cube_tid]) as cast_tid:
+        worker = pl.tile.get_block_idx()
+        for block in pl.range(worker, blocks, _PREFILL_GROUPED_WORKERS):
+            t0 = block // (LOCAL_O_WIDTH // N_TILE) * M_TILE
+            n0 = block % (LOCAL_O_WIDTH // N_TILE) * N_TILE
+            rows = pl.min(M_TILE, num_tokens - t0)
+            value = pl.slice(accumulated, [M_TILE, N_TILE], [t0, n0], valid_shape=[rows, N_TILE])
+            output[t0:t0 + M_TILE, n0:n0 + N_TILE] = pl.cast(value, pl.BF16, mode="rint")
+    return output, cast_tid
 
 
-@pl.jit.inline
+@pl.jit.inline(auto_scope=False)
 def grouped_output(
     x: pl.Tensor[[T_DYN, LOCAL_H * HEAD_DIM], pl.BF16],
     weight: pl.Tensor[[LOCAL_O_GROUPS, O_LORA, O_GROUP_IN], pl.BF16],
     output: pl.Tensor[[T_DYN, LOCAL_O_WIDTH], pl.BF16],
     num_tokens: pl.Scalar[pl.INT32],
 ):
-    """Apply grouped Wo-A with FP32 accumulation and a BF16 boundary."""
-    for block in pl.spmd(
-        (num_tokens + M_TILE - 1) // M_TILE * (LOCAL_O_WIDTH // N_TILE),
-        name_hint="attention_grouped_o_a",
-    ):
-        _grouped_output_block(x, weight, output, block, num_tokens)
-    return output
+    """Apply grouped Wo-A with Vector startup and the shared BF16 RNE boundary."""
+    ready = pl.system.task_dummy(deps=[])
+    result, completed = _staged_grouped_output(x, weight, output, num_tokens, ready)
+    return result
 
 
-@pl.jit.inline
-def prefill_grouped_output(
-    x: pl.Tensor[[T_DYN, LOCAL_H * HEAD_DIM], pl.BF16],
-    weight: pl.Tensor[[LOCAL_O_GROUPS, O_LORA, O_GROUP_IN], pl.BF16],
-    output: pl.Tensor[[T_DYN, LOCAL_O_WIDTH], pl.BF16],
-    num_tokens: pl.Scalar[pl.INT32],
-):
-    """Stage Wo-A values with Vector startup and FP32 Vector stores before narrowing."""
-    tokens = pl.tensor.dim(x, 0)
-    accumulated = pl.create_tensor([tokens, LOCAL_O_WIDTH], dtype=pl.FP32)
-    blocks = (num_tokens + M_TILE - 1) // M_TILE * (LOCAL_O_WIDTH // N_TILE)
-    with pl.spmd(blocks, name_hint="prefill_grouped_o_a_cube") as cube_tid:
-        block = pl.tile.get_block_idx()
-        t0 = block // (LOCAL_O_WIDTH // N_TILE) * M_TILE
-        n0 = block % (LOCAL_O_WIDTH // N_TILE) * N_TILE
-        group = n0 // O_LORA
-        local_n = n0 % O_LORA
-        rows = pl.min(M_TILE, num_tokens - t0)
-        acc = pl.create_tensor([M_TILE, N_TILE], dtype=pl.FP32)
-        for kb in pl.range(O_GROUP_IN // K_TILE):
-            k0 = kb * K_TILE
-            a = pl.slice(x, [M_TILE, K_TILE], [t0, group * O_GROUP_IN + k0], valid_shape=[rows, K_TILE])
-            a = pl.cast(pl.cast(a, pl.FP32), pl.BF16, mode="rint")
-            w = pl.reshape(weight[group : group + 1, local_n : local_n + N_TILE, k0 : k0 + K_TILE], [N_TILE, K_TILE])
-            acc = pl.matmul_acc(acc, a, w, b_trans=True, init_cond=(kb == 0))
-        accumulated[t0 : t0 + M_TILE, n0 : n0 + N_TILE] = pl.set_validshape(pl.mul(acc, 1.0), rows, N_TILE)
-    with pl.spmd(blocks, name_hint="prefill_grouped_o_a_cast", deps=[cube_tid]):
-        block = pl.tile.get_block_idx()
-        t0 = block // (LOCAL_O_WIDTH // N_TILE) * M_TILE
-        n0 = block % (LOCAL_O_WIDTH // N_TILE) * N_TILE
-        rows = pl.min(M_TILE, num_tokens - t0)
-        value = pl.slice(accumulated, [M_TILE, N_TILE], [t0, n0], valid_shape=[rows, N_TILE])
-        output[t0 : t0 + M_TILE, n0 : n0 + N_TILE] = pl.cast(value, pl.BF16, mode="rint")
-    return output
+# Both existing entry families consume the same grouped projection.
+prefill_grouped_output = grouped_output
 
 
-@pl.jit.inline
+@pl.jit.inline(auto_scope=False)
 def grouped_output_with_deps(
     x: pl.Tensor[[T_DYN, LOCAL_H * HEAD_DIM], pl.BF16],
     weight: pl.Tensor[[LOCAL_O_GROUPS, O_LORA, O_GROUP_IN], pl.BF16],
@@ -136,15 +112,9 @@ def grouped_output_with_deps(
     num_tokens: pl.Scalar[pl.INT32],
     ready: pl.Scalar[pl.TASK_ID],
 ):
-    """Apply grouped Wo-A after an explicit producer dependency."""
-    with pl.spmd(
-        (num_tokens + M_TILE - 1) // M_TILE * (LOCAL_O_WIDTH // N_TILE),
-        name_hint="c1a_grouped_output",
-        deps=[ready],
-    ) as grouped_tid:
-        block = pl.tile.get_block_idx()
-        _grouped_output_block(x, weight, output, block, num_tokens)
-    return grouped_tid
+    """Return completion of grouped Wo-A after its explicit producer."""
+    result, completed = _staged_grouped_output(x, weight, output, num_tokens, ready)
+    return completed
 
 
 def _make_o_proj(rotate, grouped, project):
@@ -223,6 +193,7 @@ def _project_output(
     wo_b_scale: torch.Tensor | None,
     *,
     output_dtype: torch.dtype | None = None,
+    sequential_projection: bool = False,
 ) -> torch.Tensor:
     rope_dim = cos.shape[-1] * 2
     tail = rope_interleave(attended[..., -rope_dim:], cos, sin, inverse=True)
@@ -230,6 +201,8 @@ def _project_output(
     groups = wo_a.shape[0]
     grouped = attended.flatten(-2).unflatten(-1, (groups, -1))
     latent = torch.einsum("tgd,grd->tgr", grouped.float(), wo_a.float()).to(attended.dtype)
+    if sequential_projection and wo_b_scale is not None:
+        return golden_mxfp8_linear(latent.flatten(-2), wo_b, wo_b_scale, fp32=output_dtype == torch.float32)
     return mxfp8_linear(latent.flatten(-2), wo_b, wo_b_scale, output_dtype=output_dtype)
 
 

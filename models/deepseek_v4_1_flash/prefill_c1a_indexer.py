@@ -16,10 +16,14 @@ from config import INDEX_CACHE_GROUP, FLASH as M, INDEX_BLOCKS_DYN, T_DYN
 from qkv_proj_rope import (
     M_TILE,
     make_bf16_projection_staged,
-    make_mx_projection,
+    make_group32_mx_projection,
     make_rope,
 )
-from hierarchical_sparse_indexer import _hierarchical_sparse_indexer
+from hierarchical_sparse_indexer import (
+    _hierarchical_sparse_indexer,
+    make_index_query_quantizer,
+    materialize_index_topk,
+)
 
 
 # model config
@@ -34,6 +38,7 @@ INDEX_TOPK = M.index_topk
 INDEX_SCORE_SCALE = INDEX_DIM ** -0.5 * INDEX_H ** -0.5
 INDEX_PAGE = 128
 INDEX_SCORE_TILE = 64
+INDEX_QUERY_TILE = 128
 INDEX_MAX_LOGITS_BYTES = 512 * 1024 * 1024
 INDEX_PACKED_ELEMENTS = INDEX_SCORE_TILE * INDEX_DIM // 2
 TOPK_LEAF = 8192
@@ -43,8 +48,12 @@ TOPK_GROUP_LEAVES = 2
 TOPK_GROUPS_PER_TOKEN = (TOPK_MAX_LEAVES + TOPK_GROUP_LEAVES - 1) // TOPK_GROUP_LEAVES
 
 
-project_index_query = make_mx_projection(Q_LORA, INDEX_H * INDEX_DIM)
-rotate_index_query = make_rope(INDEX_H, head_dim=INDEX_DIM, rope_dim=ROPE_DIM)
+quantize_index_query = make_index_query_quantizer(dequantize=True)
+
+project_index_query = make_group32_mx_projection(Q_LORA, INDEX_H * INDEX_DIM)
+rotate_index_query = make_rope(
+    INDEX_H, head_dim=INDEX_DIM, rope_dim=ROPE_DIM, max_workers=64, name_hint="prefill_c1a_index_rope"
+)
 
 
 _project_index_weights = make_bf16_projection_staged(D, INDEX_H)
@@ -182,6 +191,9 @@ def make_paged_indexer(use_candidates=False, direct_topk=False, max_logits_bytes
             index_query,
             num_tokens,
         )
+        rounded_query = pl.create_tensor([tokens, INDEX_H * INDEX_DIM], dtype=pl.BF16)
+        query_scales = pl.create_tensor([tokens, INDEX_H * 4], dtype=pl.FP8E8M0)
+        query_ready = quantize_index_query(index_query, rounded_query, query_scales, num_tokens, cache_ready)
         index_weights = pl.create_tensor([tokens, INDEX_H], dtype=pl.BF16)
         weights_tid = project_index_weights(x, index_weights_proj, index_weights, num_tokens)
 
@@ -191,158 +203,161 @@ def make_paged_indexer(use_candidates=False, direct_topk=False, max_logits_bytes
             cache_rows = pl.tensor.dim(index_cache, 0) * 128
             cache_flat = pl.reshape(index_cache, [cache_rows, INDEX_DIM // 2])
             scale_flat = pl.reshape(index_cache_scale, [cache_rows, INDEX_DIM // INDEX_CACHE_GROUP])
-            query_flat = pl.reshape(index_query, [tokens * INDEX_H, INDEX_DIM])
+            query_flat = pl.reshape(rounded_query, [tokens * INDEX_H, INDEX_DIM])
             pages = (positions + INDEX_SCORE_TILE - 1) // INDEX_SCORE_TILE
             # Read packed keys and score in one task, without a decoded-key GM arena.
-            with pl.spmd(num_tokens * pages, name_hint="c1a_index_score",
-                         deps=[score_completion[0], weights_tid]) as score_tid:
-                block = pl.tile.get_block_idx()
-                token = block // pages
-                page = block % pages
-                logical_begin = page * INDEX_SCORE_TILE
-                empty_score = pl.tile.full([1, INDEX_SCORE_TILE], dtype=pl.FP32, value=-1e30)
-                pl.store(empty_score, [token, logical_begin], scores)
-                visible = pl.read(compressed_lens, [token])
-                if logical_begin < visible:
-                    request = pl.read(request_ids, [token])
-                    logical_page = logical_begin // INDEX_PAGE
-                    physical_block_i32 = pl.read(index_block_table, [request, logical_page])
-                    if physical_block_i32 >= 0:
-                        physical_block = pl.cast(physical_block_i32, pl.INDEX)
-                        physical_row = physical_block * INDEX_PAGE + logical_begin % INDEX_PAGE
-                        payload_bytes = pl.load(
-                            cache_flat,
-                            [physical_row, 0],
-                            [INDEX_SCORE_TILE, INDEX_DIM // 2],
-                        )
-                        payload_signed = pl.reinterpret_view(payload_bytes, pl.INT8)
-                        payload_i32 = pl.ands(pl.cast(payload_signed, pl.INT32), 255)
-                        low = pl.ands(payload_i32, 15)
-                        high = pl.ands(pl.shrs(payload_i32, 4), 15)
-                        low = pl.reshape(low, [1, INDEX_PACKED_ELEMENTS])
-                        high = pl.reshape(high, [1, INDEX_PACKED_ELEMENTS])
-                        combined_codes = pl.concat(low, high)
-                        output_ids = pl.tile.arange(
-                            0,
-                            [1, INDEX_SCORE_TILE * INDEX_DIM],
-                            dtype=pl.INT32,
-                        )
-                        pair_ids = pl.shrs(output_ids, 1)
-                        parity = pl.ands(output_ids, 1)
-                        code_indices = pl.add(pair_ids, pl.mul(parity, INDEX_PACKED_ELEMENTS))
-                        code_tmp = pl.create_tile([1, INDEX_SCORE_TILE * INDEX_DIM], dtype=pl.INT32)
-                        payload_codes = pl.tile.gather(combined_codes, code_indices, code_tmp)
-                        payload_codes = pl.reshape(
-                            payload_codes,
-                            [INDEX_SCORE_TILE, INDEX_DIM],
-                        )
-                        magnitude_codes = pl.ands(payload_codes, 7)
-                        magnitude = pl.mul(pl.cast(magnitude_codes, pl.FP32), 0.5)
-                        extra = pl.minimum(pl.maximum(pl.sub(magnitude_codes, 4), 0), 1)
-                        magnitude = pl.add(
-                            magnitude,
-                            pl.mul(pl.cast(extra, pl.FP32), 0.5),
-                        )
-                        extra = pl.minimum(pl.maximum(pl.sub(magnitude_codes, 5), 0), 1)
-                        magnitude = pl.add(
-                            magnitude,
-                            pl.mul(pl.cast(extra, pl.FP32), 0.5),
-                        )
-                        extra = pl.minimum(pl.maximum(pl.sub(magnitude_codes, 6), 0), 1)
-                        magnitude = pl.add(
-                            magnitude,
-                            pl.mul(pl.cast(extra, pl.FP32), 1.5),
-                        )
-                        sign = pl.cast(pl.ands(pl.shrs(payload_codes, 3), 1), pl.FP32)
-                        sign_value = pl.add(pl.mul(sign, -2.0), 1.0)
-                        decoded_payload = pl.mul(magnitude, sign_value)
-                        payload_fp32 = pl.reshape(
-                            decoded_payload,
-                            [INDEX_SCORE_TILE * (INDEX_DIM // INDEX_CACHE_GROUP), INDEX_CACHE_GROUP],
-                        )
-                        scale_rows = pl.load(
-                            scale_flat,
-                            [physical_row, 0],
-                            [INDEX_SCORE_TILE, 32],
-                            valid_shape=[INDEX_SCORE_TILE, INDEX_DIM // INDEX_CACHE_GROUP],
-                        )
-                        # Pad the encoded bytes before decoding the E8M0 scales.
-                        signed_scale_codes_reinterpret_view = pl.reinterpret_view(scale_rows, pl.UINT8)
-                        signed_scale_codes = pl.reinterpret_view(signed_scale_codes_reinterpret_view, pl.INT8)
-                        signed_scale_codes_fillpad = pl.tile.fillpad(signed_scale_codes, pad_value=pl.PadValue.zero)
-                        signed_scale_codes = pl.tile.set_validshape(signed_scale_codes_fillpad, INDEX_SCORE_TILE, 32)
-                        signed_codes = pl.cast(signed_scale_codes, pl.INT32)
-                        codes = pl.ands(signed_codes, 255)
-                        scale_bits = pl.maximum(pl.shls(codes, 23), 4194304)
-                        scale_values = pl.reinterpret_view(scale_bits, pl.FP32)
-                        scale_flattened = pl.reshape(scale_values, [1, INDEX_SCORE_TILE * 32])
-                        group_ids = pl.tile.arange(
-                            0,
-                            [1, INDEX_SCORE_TILE * (INDEX_DIM // INDEX_CACHE_GROUP)],
-                            dtype=pl.INT32,
-                        )
-                        group_rows = pl.cast(
-                            pl.div(pl.cast(group_ids, pl.FP32), INDEX_DIM // INDEX_CACHE_GROUP),
-                            pl.INT32,
-                            mode="trunc",
-                        )
-                        group_columns = pl.sub(
-                            group_ids,
-                            pl.mul(group_rows, INDEX_DIM // INDEX_CACHE_GROUP),
-                        )
-                        scale_indices = pl.add(
-                            pl.mul(group_rows, 32),
-                            group_columns,
-                        )
-                        gather_tmp = pl.create_tile([1, INDEX_SCORE_TILE * 4], dtype=pl.INT32)
-                        scale_vector = pl.tile.gather(scale_flattened, scale_indices, gather_tmp)
-                        payload_transposed = pl.tile.transpose(payload_fp32, 0, 1)
-                        scaled_transposed = pl.col_expand_mul(payload_transposed, scale_vector)
-                        key_fp32 = pl.tile.transpose(scaled_transposed, 0, 1)
-                        keys = pl.cast(pl.reshape(key_fp32, [INDEX_SCORE_TILE, INDEX_DIM]), pl.BF16, mode="rint")
-                        query_row = token * INDEX_H
-                        query = pl.load(
-                            query_flat, [query_row, 0], [INDEX_H, INDEX_DIM],
-                            target_memory=pl.MemorySpace.Vec,
-                        )
-                        # Materialize ND layout before the A5 vector-to-cube NZ transfer.
-                        keys_transposed = pl.tile.transpose(keys, 0, 1)
-                        dot = pl.matmul(query, keys_transposed, out_dtype=pl.FP32)
-                        head_scores = pl.cast(dot, pl.BF16, mode="rint")
-                        head_scores = pl.maximum(pl.cast(head_scores, pl.FP32), 0.0)
-                        weights = pl.reshape(
-                            pl.load(index_weights, [token, 0], [1, INDEX_H]),
-                            [INDEX_H, 1],
-                        )
-                        weighted = pl.row_expand_mul(head_scores, pl.cast(weights, pl.FP32))
-                        weighted = pl.cast(weighted, pl.BF16, mode="rint")
-                        reduced = pl.col_sum(pl.cast(weighted, pl.FP32))
-                        rounded_score = pl.cast(reduced, pl.BF16, mode="rint")
-                        computed_score = pl.reshape(pl.cast(rounded_score, pl.FP32), [1, INDEX_SCORE_TILE])
-                        if use_candidates:
-                            candidate_u8 = pl.load(
-                                candidate_mask,
-                                [token, logical_begin],
-                                [1, INDEX_SCORE_TILE],
+            score_blocks = num_tokens * pages
+            score_workers = pl.min(score_blocks, 64)
+            with pl.spmd(score_workers, name_hint="c1a_index_score",
+                         deps=[score_completion[0], weights_tid, query_ready], allow_early_resolve=False) as score_tid:
+                worker = pl.tile.get_block_idx()
+                for block in pl.range(worker, score_blocks, score_workers):
+                    token = block // pages
+                    page = block % pages
+                    logical_begin = page * INDEX_SCORE_TILE
+                    empty_score = pl.tile.full([1, INDEX_SCORE_TILE], dtype=pl.FP32, value=-1e30)
+                    pl.store(empty_score, [token, logical_begin], scores)
+                    visible = pl.read(compressed_lens, [token])
+                    if logical_begin < visible:
+                        request = pl.read(request_ids, [token])
+                        logical_page = logical_begin // INDEX_PAGE
+                        physical_block_i32 = pl.read(index_block_table, [request, logical_page])
+                        if physical_block_i32 >= 0:
+                            physical_block = pl.cast(physical_block_i32, pl.INDEX)
+                            physical_row = physical_block * INDEX_PAGE + logical_begin % INDEX_PAGE
+                            payload_bytes = pl.load(
+                                cache_flat,
+                                [physical_row, 0],
+                                [INDEX_SCORE_TILE, INDEX_DIM // 2],
                             )
-                            candidate_i8 = pl.reinterpret_view(candidate_u8, pl.INT8)
-                            candidate = pl.cast(pl.cast(candidate_i8, pl.INT32), pl.FP32)
-                            filtered_score = pl.add(
-                                computed_score,
-                                pl.mul(pl.sub(candidate, 1.0), 1e30),
+                            payload_signed = pl.reinterpret_view(payload_bytes, pl.INT8)
+                            payload_i32 = pl.ands(pl.cast(payload_signed, pl.INT32), 255)
+                            low = pl.ands(payload_i32, 15)
+                            high = pl.ands(pl.shrs(payload_i32, 4), 15)
+                            low = pl.reshape(low, [1, INDEX_PACKED_ELEMENTS])
+                            high = pl.reshape(high, [1, INDEX_PACKED_ELEMENTS])
+                            combined_codes = pl.concat(low, high)
+                            output_ids = pl.tile.arange(
+                                0,
+                                [1, INDEX_SCORE_TILE * INDEX_DIM],
+                                dtype=pl.INT32,
                             )
-                        else:
-                            filtered_score = computed_score
-                        valid_count = pl.min(INDEX_SCORE_TILE, visible - logical_begin)
-                        valid_score = pl.fillpad(
-                            pl.set_validshape(filtered_score, 1, valid_count),
-                            pad_value=pl.PadValue.min,
-                        )
-                        stored_score = pl.maximum(
-                            valid_score,
-                            pl.tile.full([1, INDEX_SCORE_TILE], dtype=pl.FP32, value=-1e30),
-                        )
-                        pl.store(stored_score, [token, logical_begin], scores)
+                            pair_ids = pl.shrs(output_ids, 1)
+                            parity = pl.ands(output_ids, 1)
+                            code_indices = pl.add(pair_ids, pl.mul(parity, INDEX_PACKED_ELEMENTS))
+                            code_tmp = pl.create_tile([1, INDEX_SCORE_TILE * INDEX_DIM], dtype=pl.INT32)
+                            payload_codes = pl.tile.gather(combined_codes, code_indices, code_tmp)
+                            payload_codes = pl.reshape(
+                                payload_codes,
+                                [INDEX_SCORE_TILE, INDEX_DIM],
+                            )
+                            magnitude_codes = pl.ands(payload_codes, 7)
+                            magnitude = pl.mul(pl.cast(magnitude_codes, pl.FP32), 0.5)
+                            extra = pl.minimum(pl.maximum(pl.sub(magnitude_codes, 4), 0), 1)
+                            magnitude = pl.add(
+                                magnitude,
+                                pl.mul(pl.cast(extra, pl.FP32), 0.5),
+                            )
+                            extra = pl.minimum(pl.maximum(pl.sub(magnitude_codes, 5), 0), 1)
+                            magnitude = pl.add(
+                                magnitude,
+                                pl.mul(pl.cast(extra, pl.FP32), 0.5),
+                            )
+                            extra = pl.minimum(pl.maximum(pl.sub(magnitude_codes, 6), 0), 1)
+                            magnitude = pl.add(
+                                magnitude,
+                                pl.mul(pl.cast(extra, pl.FP32), 1.5),
+                            )
+                            sign = pl.cast(pl.ands(pl.shrs(payload_codes, 3), 1), pl.FP32)
+                            sign_value = pl.add(pl.mul(sign, -2.0), 1.0)
+                            decoded_payload = pl.mul(magnitude, sign_value)
+                            payload_fp32 = pl.reshape(
+                                decoded_payload,
+                                [INDEX_SCORE_TILE * (INDEX_DIM // INDEX_CACHE_GROUP), INDEX_CACHE_GROUP],
+                            )
+                            scale_rows = pl.load(
+                                scale_flat,
+                                [physical_row, 0],
+                                [INDEX_SCORE_TILE, 32],
+                                valid_shape=[INDEX_SCORE_TILE, INDEX_DIM // INDEX_CACHE_GROUP],
+                            )
+                            # Pad the encoded bytes before decoding the E8M0 scales.
+                            signed_scale_codes_reinterpret_view = pl.reinterpret_view(scale_rows, pl.UINT8)
+                            signed_scale_codes = pl.reinterpret_view(signed_scale_codes_reinterpret_view, pl.INT8)
+                            signed_scale_codes_fillpad = pl.tile.fillpad(signed_scale_codes, pad_value=pl.PadValue.zero)
+                            signed_scale_codes = pl.tile.set_validshape(signed_scale_codes_fillpad, INDEX_SCORE_TILE, 32)
+                            signed_codes = pl.cast(signed_scale_codes, pl.INT32)
+                            codes = pl.ands(signed_codes, 255)
+                            scale_bits = pl.maximum(pl.shls(codes, 23), 4194304)
+                            scale_values = pl.reinterpret_view(scale_bits, pl.FP32)
+                            scale_flattened = pl.reshape(scale_values, [1, INDEX_SCORE_TILE * 32])
+                            group_ids = pl.tile.arange(
+                                0,
+                                [1, INDEX_SCORE_TILE * (INDEX_DIM // INDEX_CACHE_GROUP)],
+                                dtype=pl.INT32,
+                            )
+                            group_rows = pl.cast(
+                                pl.div(pl.cast(group_ids, pl.FP32), INDEX_DIM // INDEX_CACHE_GROUP),
+                                pl.INT32,
+                                mode="trunc",
+                            )
+                            group_columns = pl.sub(
+                                group_ids,
+                                pl.mul(group_rows, INDEX_DIM // INDEX_CACHE_GROUP),
+                            )
+                            scale_indices = pl.add(
+                                pl.mul(group_rows, 32),
+                                group_columns,
+                            )
+                            gather_tmp = pl.create_tile([1, INDEX_SCORE_TILE * 4], dtype=pl.INT32)
+                            scale_vector = pl.tile.gather(scale_flattened, scale_indices, gather_tmp)
+                            payload_transposed = pl.tile.transpose(payload_fp32, 0, 1)
+                            scaled_transposed = pl.col_expand_mul(payload_transposed, scale_vector)
+                            key_fp32 = pl.tile.transpose(scaled_transposed, 0, 1)
+                            keys = pl.cast(pl.reshape(key_fp32, [INDEX_SCORE_TILE, INDEX_DIM]), pl.BF16, mode="rint")
+                            query_row = token * INDEX_H
+                            query = pl.load(
+                                query_flat, [query_row, 0], [INDEX_H, INDEX_DIM],
+                                target_memory=pl.MemorySpace.Vec,
+                            )
+                            # Materialize ND layout before the A5 vector-to-cube NZ transfer.
+                            keys_transposed = pl.tile.transpose(keys, 0, 1)
+                            dot = pl.matmul(query, keys_transposed, out_dtype=pl.FP32)
+                            head_scores = pl.cast(dot, pl.BF16, mode="rint")
+                            head_scores = pl.maximum(pl.cast(head_scores, pl.FP32), 0.0)
+                            weights = pl.reshape(
+                                pl.load(index_weights, [token, 0], [1, INDEX_H]),
+                                [INDEX_H, 1],
+                            )
+                            weighted = pl.row_expand_mul(head_scores, pl.cast(weights, pl.FP32))
+                            weighted = pl.cast(weighted, pl.BF16, mode="rint")
+                            reduced = pl.col_sum(pl.cast(weighted, pl.FP32))
+                            rounded_score = pl.cast(reduced, pl.BF16, mode="rint")
+                            computed_score = pl.reshape(pl.cast(rounded_score, pl.FP32), [1, INDEX_SCORE_TILE])
+                            if use_candidates:
+                                candidate_u8 = pl.load(
+                                    candidate_mask,
+                                    [token, logical_begin],
+                                    [1, INDEX_SCORE_TILE],
+                                )
+                                candidate_i8 = pl.reinterpret_view(candidate_u8, pl.INT8)
+                                candidate = pl.cast(pl.cast(candidate_i8, pl.INT32), pl.FP32)
+                                filtered_score = pl.add(
+                                    computed_score,
+                                    pl.mul(pl.sub(candidate, 1.0), 1e30),
+                                )
+                            else:
+                                filtered_score = computed_score
+                            valid_count = pl.min(INDEX_SCORE_TILE, visible - logical_begin)
+                            valid_score = pl.fillpad(
+                                pl.set_validshape(filtered_score, 1, valid_count),
+                                pad_value=pl.PadValue.min,
+                            )
+                            stored_score = pl.maximum(
+                                valid_score,
+                                pl.tile.full([1, INDEX_SCORE_TILE], dtype=pl.FP32, value=-1e30),
+                            )
+                            pl.store(stored_score, [token, logical_begin], scores)
             score_completion[0] = score_tid
 
         if direct_topk:
@@ -430,6 +445,7 @@ def make_paged_indexer(use_candidates=False, direct_topk=False, max_logits_bytes
                 merge_visible_i32 = pl.read(compressed_lens, [token])
                 merge_visible = pl.cast(pl.min(merge_visible_i32, positions), pl.INDEX)
                 if merge_visible <= INDEX_TOPK:
+                    short_indices = pl.tile.full([1, INDEX_TOPK], dtype=pl.INT32, value=-1)
                     for lane in pl.range(INDEX_TOPK):
                         physical_row_i32 = pl.cast(-1, pl.INT32)
                         if lane < merge_visible:
@@ -440,7 +456,8 @@ def make_paged_indexer(use_candidates=False, direct_topk=False, max_logits_bytes
                                 direct_block * INDEX_PAGE + direct_offset,
                                 pl.INT32,
                             )
-                        pl.write(topk_indices, [token, lane], physical_row_i32)
+                        pl.tile.write(short_indices, [0, lane], physical_row_i32)
+                    pl.store(short_indices, [token, 0], topk_indices)
                 else:
                     leaf_count = (merge_visible + TOPK_LEAF - 1) // TOPK_LEAF
                     count = (leaf_count + TOPK_GROUP_LEAVES - 1) // TOPK_GROUP_LEAVES
@@ -459,39 +476,19 @@ def make_paged_indexer(use_candidates=False, direct_topk=False, max_logits_bytes
                         count = _merge_topk_level(pair_arena, arena_base, count)
                     root = pl.load(pair_arena, [arena_base, 0], [1, TOPK_PAIR_WIDTH])
                     root_scores = pl.tile.gather_mask(root, mask_pattern=pl.tile.MaskPattern.P0101)
-                    root_indices = pl.tile.gather_mask(
-                        root,
-                        mask_pattern=pl.tile.MaskPattern.P1010,
-                        output_dtype=pl.INT32,
+                    cutoff = pl.tile.read(root_scores, [0, INDEX_TOPK - 1])
+                    root_ones = pl.tile.full([1, INDEX_TOPK], dtype=pl.FP32, value=1.0)
+                    above_flags = pl.tile.select(pl.tile.cmps(root_scores, cutoff, cmp_type=4), root_ones, 0.0)
+                    sums64 = pl.col_sum(pl.reshape(above_flags, [8, 64]))
+                    sums8 = pl.col_sum(pl.reshape(sums64, [8, 8]))
+                    above = pl.cast(0, pl.INDEX)
+                    for lane in pl.unroll(8):
+                        partial = pl.cast(pl.tile.read(sums8, [0, lane]), pl.INT32)
+                        above = above + pl.cast(partial, pl.INDEX)
+                    materialize_index_topk(
+                        scores, index_block_table, request_ids, topk_indices,
+                        token, merge_visible, cutoff, INDEX_TOPK - above,
                     )
-                    order_scores = pl.tile.full([1, INDEX_TOPK], dtype=pl.FP32, value=-1e30)
-                    order_indices = pl.tile.full([1, INDEX_TOPK], dtype=pl.INT32, value=-1)
-                    for lane in pl.range(INDEX_TOPK):
-                        score = pl.tile.read(root_scores, [0, lane])
-                        if score > -1e29:
-                            logical = pl.tile.read(root_indices, [0, lane])
-                            pl.tile.write(order_scores, [0, lane], -pl.cast(logical, pl.FP32))
-                            pl.tile.write(order_indices, [0, lane], logical)
-                    ordered = pl.tile.sort32(order_scores, pl.reinterpret_view(order_indices, pl.UINT32))
-                    ordered = pl.tile.mrgsort(ordered, block_len=64)
-                    ordered = pl.tile.mrgsort(ordered, block_len=256)
-                    logical_indices = pl.tile.gather_mask(
-                        ordered,
-                        mask_pattern=pl.tile.MaskPattern.P1010,
-                        output_dtype=pl.INT32,
-                    )
-                    for lane in pl.range(INDEX_TOPK):
-                        logical = pl.tile.read(logical_indices, [0, lane])
-                        physical_row_i32 = pl.cast(-1, pl.INT32)
-                        if logical >= 0:
-                            sorted_page = logical // INDEX_PAGE
-                            sorted_offset = logical % INDEX_PAGE
-                            sorted_block = pl.read(index_block_table, [request, sorted_page])
-                            physical_row_i32 = pl.cast(
-                                sorted_block * INDEX_PAGE + sorted_offset,
-                                pl.INT32,
-                            )
-                        pl.write(topk_indices, [token, lane], physical_row_i32)
 
             score_completion[0] = merge_tid
         return score_completion[0]
@@ -529,7 +526,8 @@ def make_paged_indexer(use_candidates=False, direct_topk=False, max_logits_bytes
         completion[0] = cache_ready
         if num_tokens > 0:
             active_tokens = pl.cast(num_tokens, pl.INDEX)
-            chunk_tokens = pl.min(active_tokens, pl.max(1, max_logits_bytes // (score_width * 4)))
+            budget_rows = pl.max(1, max_logits_bytes // (score_width * 4))
+            chunk_tokens = pl.min(active_tokens, pl.min(INDEX_QUERY_TILE, budget_rows))
             scores = pl.create_tensor([chunk_tokens, score_width], dtype=pl.FP32)
             for begin in pl.range(0, active_tokens, chunk_tokens):
                 with pl.scope():

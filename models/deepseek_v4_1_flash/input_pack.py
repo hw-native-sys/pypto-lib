@@ -36,11 +36,13 @@ def gather_rows(
     source: pl.Tensor[[SOURCE_ROWS, ROW_WIDTH], pl.FP32],
     row_ids: pl.Tensor[[TOKEN_DYN], pl.INT32],
     output: pl.Tensor[[TOKEN_DYN, ROW_WIDTH], pl.FP32],
+    source_ready: pl.Scalar[pl.TASK_ID],
 ):
-    """Gather complete rows, zeroing negative IDs used for inactive padding."""
+    """Gather rows after source_ready; negative IDs produce zero padding."""
     rows = pl.tensor.dim(output, 0)
     width = pl.tensor.dim(output, 1)
-    for worker in pl.spmd(SPMD_BLOCKS, name_hint="gather_rows"):
+    with pl.spmd(SPMD_BLOCKS, name_hint="gather_rows", deps=[source_ready]):
+        worker = pl.tile.get_block_idx()
         for row in pl.range(worker, rows, SPMD_BLOCKS):
             source_row = pl.cast(pl.read(row_ids, [row]), pl.INDEX)
             for col in pl.range(0, width, HIDDEN_TILE):

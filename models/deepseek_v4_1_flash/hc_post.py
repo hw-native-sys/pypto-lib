@@ -38,6 +38,8 @@ def golden_hc_post(
 OUT_TILE = 2
 D_TILE = 2560
 D_TILES = D // D_TILE
+# Runtime launch counts use a signed 16-bit field; stride over larger grids.
+POST_SPMD_BLOCKS = 4096
 
 
 @pl.jit.inline
@@ -52,27 +54,30 @@ def mhc_post(
     residual_flat = pl.reshape(residual, [t_dim, HC_DIM])
     residual_mix_flat = pl.reshape(residual_mix, [t_dim, HC_MULT * HC_MULT])
     output_flat = pl.reshape(output, [t_dim, HC_DIM])
-    for block in pl.spmd(t_dim * (HC_MULT // OUT_TILE) * D_TILES, name_hint="mhc_post"):
-        pair_block = block // D_TILES
-        t = pair_block // (HC_MULT // OUT_TILE)
-        out_base = (pair_block % (HC_MULT // OUT_TILE)) * OUT_TILE
-        d0 = (block % D_TILES) * D_TILE
-        x_tile = pl.cast(sublayer[t : t + 1, d0 : d0 + D_TILE], target_type=pl.FP32)
-        residual0 = residual_flat[t : t + 1, d0 : d0 + D_TILE]
-        residual1 = residual_flat[t : t + 1, D + d0 : D + d0 + D_TILE]
-        residual2 = residual_flat[t : t + 1, 2 * D + d0 : 2 * D + d0 + D_TILE]
-        residual3 = residual_flat[t : t + 1, 3 * D + d0 : 3 * D + d0 + D_TILE]
-        for out_offset in pl.unroll(OUT_TILE):
-            out_h = out_base + out_offset
-            value = pl.mul(x_tile, pl.read(post_mix, [t, out_h]))
-            value = pl.add(value, pl.mul(residual0, pl.read(residual_mix_flat, [t, out_h])))
-            value = pl.add(value, pl.mul(residual1, pl.read(residual_mix_flat, [t, HC_MULT + out_h])))
-            value = pl.add(value, pl.mul(residual2, pl.read(residual_mix_flat, [t, 2 * HC_MULT + out_h])))
-            value = pl.add(value, pl.mul(residual3, pl.read(residual_mix_flat, [t, 3 * HC_MULT + out_h])))
-            output_flat[t : t + 1, out_h * D + d0 : out_h * D + d0 + D_TILE] = pl.cast(
-                pl.cast(value, target_type=pl.BF16, mode="rint"),
-                target_type=pl.FP32,
-            )
+    total_work = t_dim * (HC_MULT // OUT_TILE) * D_TILES
+    workers = pl.min(total_work, POST_SPMD_BLOCKS)
+    for worker in pl.spmd(workers, name_hint="mhc_post"):
+        for block in pl.range(worker, total_work, POST_SPMD_BLOCKS):
+            pair_block = block // D_TILES
+            t = pair_block // (HC_MULT // OUT_TILE)
+            out_base = (pair_block % (HC_MULT // OUT_TILE)) * OUT_TILE
+            d0 = (block % D_TILES) * D_TILE
+            x_tile = pl.cast(sublayer[t : t + 1, d0 : d0 + D_TILE], target_type=pl.FP32)
+            residual0 = residual_flat[t : t + 1, d0 : d0 + D_TILE]
+            residual1 = residual_flat[t : t + 1, D + d0 : D + d0 + D_TILE]
+            residual2 = residual_flat[t : t + 1, 2 * D + d0 : 2 * D + d0 + D_TILE]
+            residual3 = residual_flat[t : t + 1, 3 * D + d0 : 3 * D + d0 + D_TILE]
+            for out_offset in pl.unroll(OUT_TILE):
+                out_h = out_base + out_offset
+                value = pl.mul(x_tile, pl.read(post_mix, [t, out_h]))
+                value = pl.add(value, pl.mul(residual0, pl.read(residual_mix_flat, [t, out_h])))
+                value = pl.add(value, pl.mul(residual1, pl.read(residual_mix_flat, [t, HC_MULT + out_h])))
+                value = pl.add(value, pl.mul(residual2, pl.read(residual_mix_flat, [t, 2 * HC_MULT + out_h])))
+                value = pl.add(value, pl.mul(residual3, pl.read(residual_mix_flat, [t, 3 * HC_MULT + out_h])))
+                output_flat[t : t + 1, out_h * D + d0 : out_h * D + d0 + D_TILE] = pl.cast(
+                    pl.cast(value, target_type=pl.BF16, mode="rint"),
+                    target_type=pl.FP32,
+                )
     return output
 
 
@@ -91,23 +96,26 @@ def mhc_post_after(
     residual_flat = pl.reshape(residual, [t_dim, HC_DIM])
     residual_mix_flat = pl.reshape(residual_mix, [t_dim, HC_MULT * HC_MULT])
     output_flat = pl.reshape(output, [t_dim, HC_DIM])
-    with pl.spmd(t_dim * HC_MULT, name_hint="mhc_post", deps=[sublayer_ready, mixes_ready]):
-        block = pl.tile.get_block_idx()
-        t = block // HC_MULT
-        out_h = block % HC_MULT
-        for d0 in pl.pipeline(0, D, 256, stage=2):
-            x_tile = pl.cast(sublayer[t : t + 1, d0 : d0 + 256], target_type=pl.FP32)
-            value = pl.mul(x_tile, pl.read(post_mix, [t, out_h]))
-            for in_h in pl.unroll(HC_MULT):
-                residual_tile = residual_flat[t : t + 1, in_h * D + d0 : in_h * D + d0 + 256]
-                value = pl.add(
-                    value,
-                    pl.mul(residual_tile, pl.read(residual_mix_flat, [t, in_h * HC_MULT + out_h])),
+    total_work = t_dim * HC_MULT
+    workers = pl.min(total_work, POST_SPMD_BLOCKS)
+    with pl.spmd(workers, name_hint="mhc_post", deps=[sublayer_ready, mixes_ready]):
+        worker = pl.tile.get_block_idx()
+        for block in pl.range(worker, total_work, POST_SPMD_BLOCKS):
+            t = block // HC_MULT
+            out_h = block % HC_MULT
+            for d0 in pl.pipeline(0, D, 256, stage=2):
+                x_tile = pl.cast(sublayer[t : t + 1, d0 : d0 + 256], target_type=pl.FP32)
+                value = pl.mul(x_tile, pl.read(post_mix, [t, out_h]))
+                for in_h in pl.unroll(HC_MULT):
+                    residual_tile = residual_flat[t : t + 1, in_h * D + d0 : in_h * D + d0 + 256]
+                    value = pl.add(
+                        value,
+                        pl.mul(residual_tile, pl.read(residual_mix_flat, [t, in_h * HC_MULT + out_h])),
+                    )
+                output_flat[t : t + 1, out_h * D + d0 : out_h * D + d0 + 256] = pl.cast(
+                    pl.cast(value, target_type=pl.BF16, mode="rint"),
+                    target_type=pl.FP32,
                 )
-            output_flat[t : t + 1, out_h * D + d0 : out_h * D + d0 + 256] = pl.cast(
-                pl.cast(value, target_type=pl.BF16, mode="rint"),
-                target_type=pl.FP32,
-            )
     return output
 
 def golden_mhc_post(

@@ -20,7 +20,8 @@ import torch
 import config as C
 
 _shape_parser = argparse.ArgumentParser(add_help=False)
-_shape_parser.add_argument("--experts-per-rank", type=int, default=64)
+_default_experts = C.FLASH.n_routed_experts // C.EP_SIZE if C.EP_SIZE in (4, 8) else 64
+_shape_parser.add_argument("--experts-per-rank", type=int, default=_default_experts)
 _shape_options = _shape_parser.parse_known_args()[0]
 if _shape_options.experts_per_rank <= 0 or C.EP_SIZE * _shape_options.experts_per_rank % 16:
     _shape_parser.error("--experts-per-rank must be positive and give a total expert count aligned to 16")
@@ -121,9 +122,8 @@ def cache_source_ordinals(layer_id: int) -> tuple[int | None, int | None, int | 
     if layer.compression_ratio == 0:
         return None, None, None
     kv_sources = M.kv_source_layer_ids
-    index_sources = M.index_source_layer_ids
     kv_ordinal = kv_sources.index(layer.kv_source_layer_id)
-    index_ordinal = index_sources.index(layer.index_source_layer_id)
+    index_ordinal = kv_ordinal
     state_ordinal = kv_ordinal if layer.compression_ratio == 2 else None
     return kv_ordinal, index_ordinal, state_ordinal
 
@@ -219,7 +219,7 @@ def _decode_encoder(
         [EP_SIZE, N_LOCAL_EXPERTS, SIGNAL_PAD], pl.INT32
     ],
     moe_num_tokens: pl.Tensor[[EP_SIZE], pl.INT32],
-    attention_num_tokens: pl.Scalar[pl.INT32],
+    attention_num_tokens: pl.Tensor[[EP_SIZE], pl.INT32],
     rank: pl.Scalar[pl.INT32],
     wq_a_scale: pl.Tensor[[N_LAYERS * (D // MX_GROUP), Q_LORA], pl.FP8E8M0],
     wq_b_scale: pl.Tensor[[N_LAYERS * (Q_LORA // MX_GROUP), LOCAL_H * HEAD_DIM], pl.FP8E8M0],
@@ -233,6 +233,7 @@ def _decode_encoder(
     shared_w2_scale: pl.Tensor[[N_LAYERS * (MOE_INTER // MX_GROUP), D], pl.FP8E8M0],
     shared_w3_scale: pl.Tensor[[N_LAYERS * (D // MX_GROUP), MOE_INTER], pl.FP8E8M0],
 ):
+    attention_count = pl.read(attention_num_tokens, [rank])
     x_hc.bind_dynamic(0, LOCAL_T_DYN)
     pre_mix.bind_dynamic(0, LOCAL_T_DYN)
     base_rope_cos.bind_dynamic(0, T_DYN)
@@ -256,7 +257,7 @@ def _decode_encoder(
     global_tokens = pl.tensor.dim(base_rope_cos, 0)
     window_blocks_per_layer = pl.tensor.dim(window_cache_pool, 0) // N_LAYERS
     compressed_blocks_per_source = pl.tensor.dim(compressed_cache_pool, 0) // KV_SOURCE_COUNT
-    index_blocks_per_source = pl.tensor.dim(index_cache_pool, 0) // INDEX_SOURCE_COUNT
+    index_blocks_per_source = pl.tensor.dim(index_cache_pool, 0) // KV_SOURCE_COUNT
     state_blocks_per_source = pl.tensor.dim(state_cache_pool, 0) // C2A_SOURCE_COUNT
     x_pong = pl.create_tensor([tokens, HC_MULT, D], dtype=pl.FP32)
     pre_mix_pong = pl.create_tensor([tokens, HC_MULT], dtype=pl.FP32)
@@ -345,7 +346,7 @@ def _decode_encoder(
         attention_output_window,
         attention_output_arrived,
         rank,
-        attention_num_tokens,
+        attention_count,
         0 + 1,
     )
     fwd_moe_layer_8_routed_base_l0 = 0 * N_LOCAL_EXPERTS
@@ -536,7 +537,7 @@ def _decode_encoder(
         attention_output_window,
         attention_output_arrived,
         rank,
-        attention_num_tokens,
+        attention_count,
         1 + 1,
     )
     fwd_moe_layer_16_routed_base_l1 = 1 * N_LOCAL_EXPERTS
@@ -823,7 +824,7 @@ def _decode_encoder(
             attention_output_window,
             attention_output_arrived,
             rank,
-            attention_num_tokens,
+            attention_count,
             c2a_block * 6 + 2 + 1,
         )
         fwd_moe_layer_8_routed_base_l2 = (c2a_block * 6 + 2) * N_LOCAL_EXPERTS
@@ -1056,7 +1057,7 @@ def _decode_encoder(
             attention_output_window,
             attention_output_arrived,
             rank,
-            attention_num_tokens,
+            attention_count,
             c2a_block * 6 + 3 + 1,
         )
         fwd_moe_layer_16_routed_base_l3 = (c2a_block * 6 + 3) * N_LOCAL_EXPERTS
@@ -1289,7 +1290,7 @@ def _decode_encoder(
             attention_output_window,
             attention_output_arrived,
             rank,
-            attention_num_tokens,
+            attention_count,
             c2a_block * 6 + 4 + 1,
         )
         fwd_moe_layer_8_routed_base_l4 = (c2a_block * 6 + 4) * N_LOCAL_EXPERTS
@@ -1522,7 +1523,7 @@ def _decode_encoder(
             attention_output_window,
             attention_output_arrived,
             rank,
-            attention_num_tokens,
+            attention_count,
             c2a_block * 6 + 5 + 1,
         )
         fwd_moe_layer_16_routed_base_l5 = (c2a_block * 6 + 5) * N_LOCAL_EXPERTS
@@ -1755,7 +1756,7 @@ def _decode_encoder(
             attention_output_window,
             attention_output_arrived,
             rank,
-            attention_num_tokens,
+            attention_count,
             c2a_block * 6 + 6 + 1,
         )
         fwd_moe_layer_8_routed_base_l6 = (c2a_block * 6 + 6) * N_LOCAL_EXPERTS
@@ -1988,7 +1989,7 @@ def _decode_encoder(
             attention_output_window,
             attention_output_arrived,
             rank,
-            attention_num_tokens,
+            attention_count,
             c2a_block * 6 + 7 + 1,
         )
         fwd_moe_layer_16_routed_base_l7 = (c2a_block * 6 + 7) * N_LOCAL_EXPERTS
@@ -2196,7 +2197,7 @@ def _decode_decoder(
         [EP_SIZE, N_LOCAL_EXPERTS, SIGNAL_PAD], pl.INT32
     ],
     moe_num_tokens: pl.Tensor[[EP_SIZE], pl.INT32],
-    attention_num_tokens: pl.Scalar[pl.INT32],
+    attention_num_tokens: pl.Tensor[[EP_SIZE], pl.INT32],
     rank: pl.Scalar[pl.INT32],
     wq_a_scale: pl.Tensor[[N_LAYERS * (D // MX_GROUP), Q_LORA], pl.FP8E8M0],
     wq_b_scale: pl.Tensor[[N_LAYERS * (Q_LORA // MX_GROUP), LOCAL_H * HEAD_DIM], pl.FP8E8M0],
@@ -2210,6 +2211,7 @@ def _decode_decoder(
     shared_w2_scale: pl.Tensor[[N_LAYERS * (MOE_INTER // MX_GROUP), D], pl.FP8E8M0],
     shared_w3_scale: pl.Tensor[[N_LAYERS * (D // MX_GROUP), MOE_INTER], pl.FP8E8M0],
 ):
+    attention_count = pl.read(attention_num_tokens, [rank])
     x_hc.bind_dynamic(0, LOCAL_T_DYN)
     pre_mix.bind_dynamic(0, LOCAL_T_DYN)
     base_rope_cos.bind_dynamic(0, T_DYN)
@@ -2233,7 +2235,7 @@ def _decode_decoder(
     global_tokens = pl.tensor.dim(base_rope_cos, 0)
     window_blocks_per_layer = pl.tensor.dim(window_cache_pool, 0) // N_LAYERS
     compressed_blocks_per_source = pl.tensor.dim(compressed_cache_pool, 0) // KV_SOURCE_COUNT
-    index_blocks_per_source = pl.tensor.dim(index_cache_pool, 0) // INDEX_SOURCE_COUNT
+    index_blocks_per_source = pl.tensor.dim(index_cache_pool, 0) // KV_SOURCE_COUNT
     x_pong = pl.create_tensor([tokens, HC_MULT, D], dtype=pl.FP32)
     pre_mix_pong = pl.create_tensor([tokens, HC_MULT], dtype=pl.FP32)
     attention_hidden = pl.create_tensor([tokens, HC_MULT, D], dtype=pl.FP32)
@@ -2391,7 +2393,7 @@ def _decode_decoder(
         attention_pre_mix,
         rank // TP_SIZE * TP_SIZE,
         rank % TP_SIZE,
-        attention_num_tokens,
+        attention_count,
         20 + 1,
     )
     fwd_moe_layer_8_routed_base_l20 = 20 * N_LOCAL_EXPERTS
@@ -2599,7 +2601,7 @@ def _decode_decoder(
         attention_pre_mix,
         rank // TP_SIZE * TP_SIZE,
         rank % TP_SIZE,
-        attention_num_tokens,
+        attention_count,
         21 + 1,
     )
     fwd_moe_layer_16_routed_base_l21 = 21 * N_LOCAL_EXPERTS
@@ -2805,7 +2807,7 @@ def _decode_decoder(
         attention_pre_mix,
         rank // TP_SIZE * TP_SIZE,
         rank % TP_SIZE,
-        attention_num_tokens,
+        attention_count,
         22 + 1,
     )
     fwd_moe_layer_8_routed_base_l22 = 22 * N_LOCAL_EXPERTS
@@ -3013,7 +3015,7 @@ def _decode_decoder(
         attention_pre_mix,
         rank // TP_SIZE * TP_SIZE,
         rank % TP_SIZE,
-        attention_num_tokens,
+        attention_count,
         23 + 1,
     )
     fwd_moe_layer_16_routed_base_l23 = 23 * N_LOCAL_EXPERTS
@@ -3151,12 +3153,12 @@ def _decode_decoder(
         fwd_attention_layer_1_index_cache_l24 = pl.slice(
             index_cache_pool,
             [index_blocks_per_source, BLOCK_SIZE, 1, INDEX_DIM // 2],
-            [fwd_attention_layer_1_index_source_id_l24 * index_blocks_per_source, 0, 0, 0],
+            [fwd_attention_layer_1_source_id_l24 * index_blocks_per_source, 0, 0, 0],
         )
         fwd_attention_layer_1_index_cache_scale_l24 = pl.slice(
             index_cache_scale_pool,
             [index_blocks_per_source, BLOCK_SIZE, 1, INDEX_DIM // INDEX_CACHE_GROUP],
-            [fwd_attention_layer_1_index_source_id_l24 * index_blocks_per_source, 0, 0, 0],
+            [fwd_attention_layer_1_source_id_l24 * index_blocks_per_source, 0, 0, 0],
         )
         fwd_attention_layer_1_index_wq_b_scale_source_l24: pl.Tensor[
             [Q_LORA // MX_GROUP, INDEX_H * INDEX_DIM], pl.FP8E8M0, pl.MX_B_NN
@@ -3276,7 +3278,7 @@ def _decode_decoder(
             attention_pre_mix,
             rank // TP_SIZE * TP_SIZE,
             rank % TP_SIZE,
-            attention_num_tokens,
+            attention_count,
             c1a_block * 4 + 24 + 1,
         )
         fwd_moe_layer_8_routed_base_l24 = (c1a_block * 4 + 24) * N_LOCAL_EXPERTS
@@ -3510,7 +3512,7 @@ def _decode_decoder(
             attention_pre_mix,
             rank // TP_SIZE * TP_SIZE,
             rank % TP_SIZE,
-            attention_num_tokens,
+            attention_count,
             c1a_block * 4 + 25 + 1,
         )
         fwd_moe_layer_16_routed_base_l25 = (c1a_block * 4 + 25) * N_LOCAL_EXPERTS
@@ -3744,7 +3746,7 @@ def _decode_decoder(
             attention_pre_mix,
             rank // TP_SIZE * TP_SIZE,
             rank % TP_SIZE,
-            attention_num_tokens,
+            attention_count,
             c1a_block * 4 + 26 + 1,
         )
         fwd_moe_layer_8_routed_base_l26 = (c1a_block * 4 + 26) * N_LOCAL_EXPERTS
@@ -3978,7 +3980,7 @@ def _decode_decoder(
             attention_pre_mix,
             rank // TP_SIZE * TP_SIZE,
             rank % TP_SIZE,
-            attention_num_tokens,
+            attention_count,
             c1a_block * 4 + 27 + 1,
         )
         fwd_moe_layer_16_routed_base_l27 = (c1a_block * 4 + 27) * N_LOCAL_EXPERTS
@@ -4189,7 +4191,7 @@ def _decode_fwd(
         [EP_SIZE, N_LOCAL_EXPERTS, SIGNAL_PAD], pl.INT32
     ],
     moe_num_tokens: pl.Tensor[[EP_SIZE], pl.INT32],
-    attention_num_tokens: pl.Scalar[pl.INT32],
+    attention_num_tokens: pl.Tensor[[EP_SIZE], pl.INT32],
     rank: pl.Scalar[pl.INT32],
     wq_a_scale: pl.Tensor[[N_LAYERS * (D // MX_GROUP), Q_LORA], pl.FP8E8M0],
     wq_b_scale: pl.Tensor[[N_LAYERS * (Q_LORA // MX_GROUP), LOCAL_H * HEAD_DIM], pl.FP8E8M0],
@@ -4493,7 +4495,7 @@ def l3_decode_fwd(
     shared_w3: pl.Tensor[[EP_SIZE, N_LAYERS, D, MOE_INTER], pl.FP8E4M3FN],
     shared_w3_scale: pl.Tensor[[EP_SIZE, N_LAYERS * (D // MX_GROUP), MOE_INTER], pl.FP8E8M0],
     moe_num_tokens: pl.Tensor[[EP_SIZE], pl.INT32],
-    attention_num_tokens: pl.Scalar[pl.INT32],
+    attention_num_tokens: pl.Tensor[[EP_SIZE], pl.INT32],
 ):
     """Run SWA with base rows and C2A/C1A with compressed-profile token rows.
 
@@ -4510,6 +4512,25 @@ def l3_decode_fwd(
     page ids and table widths. Index and main KV caches share that mapping.
     build_forward_metadata lowers request positions and allocator tables
     into these lengths and slots. It does not allocate physical pages.
+
+    Window pools contain 40 equal layer slices. Compressed and index-key pools
+    contain four M.kv_source_layer_ids slices; index-query weights retain eight
+    M.index_source_layer_ids slices. C1A Reindex reads layer-20 keys. C2A state
+    has three source slices, each with caller-owned request slots. Native
+    prefill caches alias these pools through utils.decode_cache_views.
+
+    attention_num_tokens is per rank; TP peers supply equal group counts.
+    TP1 uses padded 80-row local x_hc/pre_mix slabs, with up to 72 active rows.
+    Idle ranks use zero counts, -1 publication slots and empty query ranges;
+    they still participate in EP collectives. Each new token starts from its
+    embedding and identity pre-mix, then finishes after layer 39. Pass that
+    state to lm_head.l3_final_output for final HC/Norm, logits and greedy IDs.
+
+    Retain cache allocations and page ownership until runtime completion, then
+    commit lengths before the next call. Use fresh communication windows
+    (persistent=False). Reset a reused request slot in all C2A sources after
+    its users complete. Restore or reset mutated state before retrying failed
+    calls. Engram, vision and DSpark require no inputs here.
     """
     x_hc.bind_dynamic(1, LOCAL_T_DYN)
     pre_mix.bind_dynamic(1, LOCAL_T_DYN)
@@ -4779,7 +4800,7 @@ def _fixture_extent(dim):
         "T_DYN": FIXTURE_TOKENS,
         "FWD_ORI_BLOCKS_DYN": N_LAYERS * FIXTURE_BATCH,
         "FWD_CMP_BLOCKS_DYN": KV_SOURCE_COUNT * FIXTURE_BATCH,
-        "FWD_INDEX_BLOCKS_DYN": INDEX_SOURCE_COUNT * FIXTURE_BATCH,
+        "FWD_INDEX_BLOCKS_DYN": KV_SOURCE_COUNT * FIXTURE_BATCH,
         "FWD_STATE_BLOCKS_DYN": C2A_SOURCE_COUNT * FIXTURE_BATCH,
         "FWD_C2A_TABLE_DYN": 1,
         "FWD_C1A_TABLE_DYN": 2,
@@ -4793,7 +4814,7 @@ def _fixture_extent(dim):
 
 def build_tensor_specs():
     """Build the TP1 twelve-request decode smoke fixture."""
-    from golden import ScalarSpec, TensorSpec
+    from golden import TensorSpec
     from moe import _route_bias
     from quant import build_mxfp4_pair_lut
 
@@ -4831,16 +4852,6 @@ def build_tensor_specs():
         metadata_rows[family + "_compressed_slots"] = metadata.compressed_slots[source]
         metadata_rows[family + "_index_block_table"] = compressed_tables[source]
     for name in l3_decode_fwd.param_names:
-        if name == "attention_num_tokens":
-            specs.append(
-                ScalarSpec(
-                    name,
-                    torch.int32,
-                    FIXTURE_TOKENS,
-                    compile_runtime=True,
-                )
-            )
-            continue
         annotation = signature.parameters[name].annotation
         shape = [_fixture_extent(dim) for dim in annotation.shape]
         dtype = _torch_dtype(annotation.dtype)
@@ -4862,8 +4873,8 @@ def build_tensor_specs():
                 .reshape(1, FIXTURE_BATCH, 1)
                 .repeat(EP_SIZE, 1, 1)
             )
-        elif name == "moe_num_tokens":
-            init_value = torch.full((EP_SIZE,), FIXTURE_TOKENS, dtype=torch.int32)
+        elif name in ("moe_num_tokens", "attention_num_tokens"):
+            init_value = torch.full(shape, FIXTURE_TOKENS, dtype=torch.int32)
         elif name == "correction_bias":
             init_value = _route_bias().repeat(EP_SIZE, N_LAYERS)
         elif name == "mxfp4_pair_lut":
@@ -4921,7 +4932,7 @@ if __name__ == "__main__":
     if result.passed and not args.compile_only:
         cfg = RunConfig(**{name: value for name, value in config.items() if name != "log_level"})
         compiled = DistributedCompiledProgram.from_dir(result.work_dir, platform=cfg.platform)
-        replicated = ('moe_num_tokens',)
+        replicated = ('moe_num_tokens', 'attention_num_tokens')
         host_inputs = {spec.name: spec.create_tensor().share_memory_() for spec in specs if spec.name in replicated}
         with compiled.prepare(cfg, persistent=False, inherited_host_tensors=list(host_inputs.values())) as runtime:
             arguments = upload_forward_inputs(runtime, specs, compiled._get_metadata()[0], len(devices), host_inputs)

@@ -24,23 +24,32 @@ NORM_D_TILE = 512
 
 
 @pl.jit.inline
-def rms_norm_tiled(
+def _rms_norm_tiled(
     x: pl.Tensor,
     norm_w: pl.Tensor[[D], pl.BF16],
     x_normed: pl.Tensor,
     block: pl.Scalar[pl.INT32],
     num_tokens: pl.Scalar[pl.INT32],
+    compensated: pl.constexpr,
 ):
-    """Normalize one eight-row block using 512-column accumulation."""
+    """Normalize eight rows with optional compensated 512-column accumulation."""
     t0 = block * NORM_T_TILE
     valid_rows = pl.min(NORM_T_TILE, num_tokens - t0)
     sq_sum = pl.full([1, NORM_T_TILE], dtype=pl.FP32, value=0.0)
+    compensation = pl.full([1, NORM_T_TILE], dtype=pl.FP32, value=0.0)
     for kb in pl.pipeline(D // NORM_D_TILE, stage=2):
         k0 = kb * NORM_D_TILE
         source = pl.slice(x, [NORM_T_TILE, NORM_D_TILE], [t0, k0], valid_shape=[valid_rows, NORM_D_TILE])
         source = pl.set_validshape(pl.fillpad(source, pad_value=pl.PadValue.zero), NORM_T_TILE, NORM_D_TILE)
         value = pl.cast(source, target_type=pl.FP32)
-        sq_sum = pl.add(sq_sum, pl.reshape(pl.row_sum(pl.mul(value, value)), [1, NORM_T_TILE]))
+        partial = pl.reshape(pl.row_sum(pl.mul(value, value)), [1, NORM_T_TILE])
+        if compensated:
+            delta = pl.sub(partial, compensation)
+            next_sum = pl.add(sq_sum, delta)
+            compensation = pl.sub(pl.sub(next_sum, sq_sum), delta)
+            sq_sum = next_sum
+        else:
+            sq_sum = pl.add(sq_sum, partial)
     inv_rms = pl.reshape(
         pl.rsqrt(pl.add(pl.mul(sq_sum, 1.0 / D), EPS), high_precision=True), [NORM_T_TILE, 1]
     )
@@ -55,6 +64,30 @@ def rms_norm_tiled(
             pl.cast(normalized, target_type=pl.BF16, mode="rint"), valid_rows, NORM_D_TILE
         )
     return x_normed
+
+
+@pl.jit.inline(auto_scope=False)
+def rms_norm_tiled(
+    x: pl.Tensor,
+    norm_w: pl.Tensor[[D], pl.BF16],
+    x_normed: pl.Tensor,
+    block: pl.Scalar[pl.INT32],
+    num_tokens: pl.Scalar[pl.INT32],
+):
+    """Normalize eight rows using 512-column FP32 accumulation."""
+    return _rms_norm_tiled(x, norm_w, x_normed, block, num_tokens, compensated=False)
+
+
+@pl.jit.inline(auto_scope=False)
+def rms_norm_tiled_compensated(
+    x: pl.Tensor,
+    norm_w: pl.Tensor[[D], pl.BF16],
+    x_normed: pl.Tensor,
+    block: pl.Scalar[pl.INT32],
+    num_tokens: pl.Scalar[pl.INT32],
+):
+    """Normalize final projection inputs with compensated FP32 chunk sums."""
+    return _rms_norm_tiled(x, norm_w, x_normed, block, num_tokens, compensated=True)
 
 
 @pl.jit.inline
@@ -85,7 +118,7 @@ def rms_norm(
 
 
 def golden_rms_norm_tiled(x: torch.Tensor, norm_w: torch.Tensor) -> torch.Tensor:
-    """Apply RMSNorm with the kernel's FP32 chunk accumulation order."""
+    """Apply RMSNorm with FP32 reference accumulation over 512-column chunks."""
     value = x.float()
     sq_sum = torch.zeros(value.shape[0], 1, dtype=torch.float32)
     for d0 in range(0, D, NORM_D_TILE):

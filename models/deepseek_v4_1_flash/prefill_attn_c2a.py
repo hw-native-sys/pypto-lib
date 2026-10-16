@@ -33,7 +33,7 @@ from config import (
     WINDOW_CACHE_GROUP,
 )
 
-from compressor import STATE_WIDTH
+from compressor import STATE_WIDTH, project_ratio2, project_ratio2_weights
 
 
 from utils import AttentionGoldenResult
@@ -45,7 +45,6 @@ from o_proj import prefill_tp_output_all_reduce
 from rmsnorm import EPS
 from qkv_proj_rope import (
     M_TILE,
-    N_TILE,
     make_bf16_projection_staged,
     make_rope,
 )
@@ -72,8 +71,6 @@ INDEX_DIM = M.index_head_dim
 INDEX_TOPK = M.index_topk
 
 
-PREFILL_COMPRESSOR_SEGMENTS = 16
-PREFILL_COMPRESSOR_K_CHUNK = D // PREFILL_COMPRESSOR_SEGMENTS
 PREFILL_C2A_FULL_RING_HEAP = (2 * 1024 * 1024 * 1024,) * 4
 
 
@@ -143,7 +140,6 @@ SORT_FLOOR = -3.0e38
 
 MASK_BIAS = 1.0e30
 
-COMPRESSOR_K_TILE = 64
 
 def make_wide_rope(heads, width, inverse=False, *, max_workers=None, permute=False):
     """Specialize interleaved RoPE over the trailing ROPE_DIM lanes of each head."""
@@ -510,103 +506,8 @@ rotate_compressed = make_rope(1)
 rotate_index_key = make_wide_rope(1, INDEX_DIM)
 
 
-@pl.jit.inline
-def prefill_compressor_projection(
-    x: pl.Tensor[[T_DYN, D], pl.BF16],
-    weight: pl.Tensor[[D, HEAD_DIM], pl.FP32],
-    output: pl.Tensor[[T_DYN, HEAD_DIM], pl.FP32],
-    num_tokens: pl.Scalar[pl.INT32],
-):
-    """Retain FP32 weight residuals through high and residual accumulators.
-
-    Three BF16 weight terms preserve FP32 weights. Bound each Cube reduction
-    to one K chunk, then compensate the Vector sum of the staged GM products
-    to reduce accumulation error near pooled BF16 rounding boundaries.
-    Mixed producers use Vector startup and FP32 Vector stores.
-    """
-    tokens = pl.tensor.dim(x, 0)
-    high_weight = pl.create_tensor([D, HEAD_DIM], dtype=pl.BF16)
-    low_weight = pl.create_tensor([D, HEAD_DIM], dtype=pl.BF16)
-    tail_weight = pl.create_tensor([D, HEAD_DIM], dtype=pl.BF16)
-    high_product = pl.create_tensor([PREFILL_COMPRESSOR_SEGMENTS * tokens, HEAD_DIM], dtype=pl.FP32)
-    residual_product = pl.create_tensor([PREFILL_COMPRESSOR_SEGMENTS * tokens, HEAD_DIM], dtype=pl.FP32)
-    split_blocks = D // COMPRESSOR_K_TILE * (HEAD_DIM // N_TILE)
-    split_workers = pl.min(split_blocks, 64)
-    with pl.spmd(split_workers, name_hint="prefill_compressor_split") as split_tid:
-        worker = pl.tile.get_block_idx()
-        for block in pl.range(worker, split_blocks, split_workers):
-            k0 = block // (HEAD_DIM // N_TILE) * COMPRESSOR_K_TILE
-            n0 = block % (HEAD_DIM // N_TILE) * N_TILE
-            value = weight[k0 : k0 + COMPRESSOR_K_TILE, n0 : n0 + N_TILE]
-            high = pl.cast(value, pl.BF16, mode="rint")
-            residual = pl.sub(value, pl.cast(high, pl.FP32))
-            low = pl.cast(residual, pl.BF16, mode="rint")
-            tail = pl.cast(pl.sub(residual, pl.cast(low, pl.FP32)), pl.BF16, mode="rint")
-            high_weight[k0 : k0 + COMPRESSOR_K_TILE, n0 : n0 + N_TILE] = high
-            low_weight[k0 : k0 + COMPRESSOR_K_TILE, n0 : n0 + N_TILE] = low
-            tail_weight[k0 : k0 + COMPRESSOR_K_TILE, n0 : n0 + N_TILE] = tail
-    output_blocks = (num_tokens + M_TILE - 1) // M_TILE * (HEAD_DIM // N_TILE)
-    blocks = output_blocks * PREFILL_COMPRESSOR_SEGMENTS
-    # Synchronous workers must fit both the physical and simulator core count.
-    workers = pl.min(blocks, pl.min(16, pl.system.available_cluster_count()))
-    with pl.spmd(workers, name_hint="prefill_compressor_cube", deps=[split_tid], sync_start=True) as cube_tid:
-        worker = pl.tile.get_block_idx()
-        for block in pl.range(worker, blocks, workers):
-            segment = block % PREFILL_COMPRESSOR_SEGMENTS
-            tile_block = block // PREFILL_COMPRESSOR_SEGMENTS
-            t0 = tile_block // (HEAD_DIM // N_TILE) * M_TILE
-            n0 = tile_block % (HEAD_DIM // N_TILE) * N_TILE
-            rows = pl.min(M_TILE, num_tokens - t0)
-            high_acc = pl.create_tensor([M_TILE, N_TILE], dtype=pl.FP32)
-            residual_acc = pl.create_tensor([M_TILE, N_TILE], dtype=pl.FP32)
-            for k0 in pl.range(segment * PREFILL_COMPRESSOR_K_CHUNK, (segment + 1) * PREFILL_COMPRESSOR_K_CHUNK, COMPRESSOR_K_TILE):
-                a = pl.slice(x, [M_TILE, COMPRESSOR_K_TILE], [t0, k0], valid_shape=[rows, COMPRESSOR_K_TILE])
-                a = pl.cast(pl.cast(a, pl.FP32), pl.BF16, mode="rint")
-                high = high_weight[k0 : k0 + COMPRESSOR_K_TILE, n0 : n0 + N_TILE]
-                low = low_weight[k0 : k0 + COMPRESSOR_K_TILE, n0 : n0 + N_TILE]
-                tail = tail_weight[k0 : k0 + COMPRESSOR_K_TILE, n0 : n0 + N_TILE]
-                high_acc = pl.matmul_acc(high_acc, a, high, init_cond=(k0 == segment * PREFILL_COMPRESSOR_K_CHUNK))
-                residual_acc = pl.matmul_acc(residual_acc, a, low, init_cond=(k0 == segment * PREFILL_COMPRESSOR_K_CHUNK))
-                residual_acc = pl.matmul_acc(residual_acc, a, tail)
-            high_product[segment * tokens + t0 : segment * tokens + t0 + M_TILE, n0 : n0 + N_TILE] = pl.set_validshape(pl.mul(high_acc, 1.0), rows, N_TILE)
-            residual_product[segment * tokens + t0 : segment * tokens + t0 + M_TILE, n0 : n0 + N_TILE] = pl.set_validshape(pl.mul(residual_acc, 1.0), rows, N_TILE)
-    with pl.spmd(pl.min(output_blocks, 16), name_hint="prefill_compressor_sum", deps=[cube_tid]):
-        worker = pl.tile.get_block_idx()
-        for block in pl.range(worker, output_blocks, pl.min(output_blocks, 16)):
-            t0 = block // (HEAD_DIM // N_TILE) * M_TILE
-            n0 = block % (HEAD_DIM // N_TILE) * N_TILE
-            rows = pl.min(M_TILE, num_tokens - t0)
-            high_sum = pl.full([M_TILE, N_TILE], dtype=pl.FP32, value=0.0)
-            low_sum = pl.full([M_TILE, N_TILE], dtype=pl.FP32, value=0.0)
-            high_error = pl.full([M_TILE, N_TILE], dtype=pl.FP32, value=0.0)
-            low_error = pl.full([M_TILE, N_TILE], dtype=pl.FP32, value=0.0)
-            for segment in pl.range(PREFILL_COMPRESSOR_SEGMENTS):
-                high_part = pl.slice(high_product, [M_TILE, N_TILE], [segment * tokens + t0, n0], valid_shape=[rows, N_TILE])
-                low_part = pl.slice(residual_product, [M_TILE, N_TILE], [segment * tokens + t0, n0], valid_shape=[rows, N_TILE])
-                high_delta = pl.sub(high_part, high_error)
-                high_next = pl.add(high_sum, high_delta)
-                high_error = pl.sub(pl.sub(high_next, high_sum), high_delta)
-                high_sum = high_next
-                low_delta = pl.sub(low_part, low_error)
-                low_next = pl.add(low_sum, low_delta)
-                low_error = pl.sub(pl.sub(low_next, low_sum), low_delta)
-                low_sum = low_next
-            output[t0 : t0 + M_TILE, n0 : n0 + N_TILE] = pl.set_validshape(pl.add(high_sum, low_sum), rows, N_TILE)
-    return output
-
-
-@pl.jit.inline
-def prefill_compressor_project(
-    x: pl.Tensor[[T_DYN, D], pl.BF16],
-    wkv: pl.Tensor[[D, HEAD_DIM], pl.FP32],
-    wgate: pl.Tensor[[D, HEAD_DIM], pl.FP32],
-    kv_out: pl.Tensor[[T_DYN, HEAD_DIM], pl.FP32],
-    score_out: pl.Tensor[[T_DYN, HEAD_DIM], pl.FP32],
-    num_tokens: pl.Scalar[pl.INT32],
-):
-    prefill_compressor_projection(x, wkv, kv_out, num_tokens)
-    prefill_compressor_projection(x, wgate, score_out, num_tokens)
-    return kv_out, score_out
+prefill_compressor_projection = project_ratio2_weights
+prefill_compressor_project = project_ratio2
 
 
 _prefill_index_key_projection = make_bf16_projection_staged(HEAD_DIM, INDEX_DIM)

@@ -38,7 +38,7 @@ from config import (
     WINDOW_CACHE_GROUP,
 )
 
-from compressor import STATE_WIDTH
+from compressor import STATE_WIDTH, project_ratio2
 from config import EP_SIZE
 
 
@@ -56,7 +56,7 @@ from o_proj import (
 from compressor import compressor_ratio2
 from rmsnorm import golden_rms_norm
 from qkv_proj_rope import (
-    M_TILE, N_TILE, make_mx_projection_ready, make_mx_projection_with_deps,
+    make_mx_projection_ready, make_mx_projection_with_deps,
     make_rope, make_rope_with_deps, make_qkv_proj_rope_with_deps, qkv_proj_rope,
 )
 from decode_indexer import (
@@ -110,69 +110,9 @@ E8M0_FLOOR_BITS = 4194304
 WINDOW = M.sliding_window
 
 # Compressor projection tiling.
-COMPRESSOR_K_TILE = 64
-COMPRESSOR_GEMM_K_TILE = 256
 
 
-@pl.jit.inline
-def compressor_project(
-    x: pl.Tensor[[T_DYN, D], pl.BF16],
-    wkv: pl.Tensor[[D, HEAD_DIM], pl.FP32],
-    wgate: pl.Tensor[[D, HEAD_DIM], pl.FP32],
-    kv_out: pl.Tensor[[T_DYN, HEAD_DIM], pl.FP32],
-    score_out: pl.Tensor[[T_DYN, HEAD_DIM], pl.FP32],
-    num_tokens: pl.Scalar[pl.INT32],
-):
-    """Stage three BF16 weight terms with separate high and residual accumulators."""
-    high_weight = pl.create_tensor([2 * D, HEAD_DIM], dtype=pl.BF16)
-    low_weight = pl.create_tensor([2 * D, HEAD_DIM], dtype=pl.BF16)
-    tail_weight = pl.create_tensor([2 * D, HEAD_DIM], dtype=pl.BF16)
-    split_blocks = D // COMPRESSOR_K_TILE * (HEAD_DIM // N_TILE)
-    with pl.spmd(16, name_hint="c2a_compressor_split") as split_tid:
-        worker = pl.tile.get_block_idx()
-        for block in pl.range(worker, split_blocks, 16):
-            k0 = block // (HEAD_DIM // N_TILE) * COMPRESSOR_K_TILE
-            n0 = block % (HEAD_DIM // N_TILE) * N_TILE
-            for stream in pl.unroll(2):
-                if stream == 0:
-                    weight = wkv[k0 : k0 + COMPRESSOR_K_TILE, n0 : n0 + N_TILE]
-                else:
-                    weight = wgate[k0 : k0 + COMPRESSOR_K_TILE, n0 : n0 + N_TILE]
-                high = pl.cast(weight, pl.BF16, mode="rint")
-                residual = pl.sub(weight, pl.cast(high, pl.FP32))
-                low = pl.cast(residual, pl.BF16, mode="rint")
-                tail = pl.cast(pl.sub(residual, pl.cast(low, pl.FP32)), pl.BF16, mode="rint")
-                row = stream * D + k0
-                high_weight[row : row + COMPRESSOR_K_TILE, n0 : n0 + N_TILE] = high
-                low_weight[row : row + COMPRESSOR_K_TILE, n0 : n0 + N_TILE] = low
-                tail_weight[row : row + COMPRESSOR_K_TILE, n0 : n0 + N_TILE] = tail
-    output_blocks = (num_tokens + M_TILE - 1) // M_TILE * (HEAD_DIM // N_TILE)
-    with pl.spmd(output_blocks * 2, name_hint="c2a_compressor_cube", deps=[split_tid]):
-        block = pl.tile.get_block_idx()
-        tile = block // 2
-        stream = block % 2
-        t0 = tile // (HEAD_DIM // N_TILE) * M_TILE
-        n0 = tile % (HEAD_DIM // N_TILE) * N_TILE
-        rows = pl.min(M_TILE, num_tokens - t0)
-        high_acc = pl.create_tensor([M_TILE, N_TILE], dtype=pl.FP32)
-        residual_acc = pl.create_tensor([M_TILE, N_TILE], dtype=pl.FP32)
-        for kb in pl.range(D // COMPRESSOR_GEMM_K_TILE):
-            k0 = kb * COMPRESSOR_GEMM_K_TILE
-            row = stream * D + k0
-            a = pl.slice(x, [M_TILE, COMPRESSOR_GEMM_K_TILE], [t0, k0], valid_shape=[rows, COMPRESSOR_GEMM_K_TILE])
-            a = pl.cast(pl.cast(a, pl.FP32), pl.BF16, mode="rint")
-            gemm_high = high_weight[row : row + COMPRESSOR_GEMM_K_TILE, n0 : n0 + N_TILE]
-            gemm_low = low_weight[row : row + COMPRESSOR_GEMM_K_TILE, n0 : n0 + N_TILE]
-            gemm_tail = tail_weight[row : row + COMPRESSOR_GEMM_K_TILE, n0 : n0 + N_TILE]
-            high_acc = pl.matmul_acc(high_acc, a, gemm_high, init_cond=(kb == 0))
-            residual_acc = pl.matmul_acc(residual_acc, a, gemm_low, init_cond=(kb == 0))
-            residual_acc = pl.matmul_acc(residual_acc, a, gemm_tail)
-        result = pl.set_validshape(pl.add(high_acc, residual_acc), rows, N_TILE)
-        if stream == 0:
-            kv_out[t0 : t0 + M_TILE, n0 : n0 + N_TILE] = result
-        else:
-            score_out[t0 : t0 + M_TILE, n0 : n0 + N_TILE] = result
-    return kv_out, score_out
+compressor_project = project_ratio2
 
 
 @pl.jit.inline
@@ -232,7 +172,7 @@ def publish_compressed(
     return publish_tid
 
 
-attend_sparse = make_attend_selected_chunk()
+attend_sparse = make_attend_selected_chunk(vector_query=True)
 
 # C2A Q/KV projection with explicit producer completion.
 C2A_QB_N_TILE = 256

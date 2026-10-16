@@ -185,43 +185,45 @@ def gate_normalized(
             biased_scores_buf[:, N_EXPERTS:SCORE_PAD] = biased_pad
 
     route_scores_buf = pl.create_tensor([T_PAD, SCORE_PAD], dtype=pl.FP32)
-    for gb_idx in pl.spmd(
-        task_gate_tiles * (N_EXPERTS // GATE_N_TILE),
-        name_hint="gate",
-    ):
-        tg = gb_idx // (N_EXPERTS // GATE_N_TILE)
-        nb = gb_idx % (N_EXPERTS // GATE_N_TILE)
-        t1 = tg * GATE_M_TILE
-        n0 = nb * GATE_N_TILE
-        gate_logits_tile = pl.create_tensor([GATE_M_TILE, GATE_N_TILE], dtype=pl.FP32)
-        for kb in pl.pipeline(0, D // GATE_D_TILE, stage=2):
-            gd_kd = kb * GATE_D_TILE
-            gd_x = xg_buf[t1 : t1 + GATE_M_TILE, gd_kd : gd_kd + GATE_D_TILE]
-            gd_w = gate_w[n0 : n0 + GATE_N_TILE, gd_kd : gd_kd + GATE_D_TILE]
-            if gd_kd == 0:
-                gate_logits_tile = pl.matmul(gd_x, gd_w, out_dtype=pl.FP32, b_trans=True)
-            else:
-                gate_logits_tile = pl.matmul_acc(gate_logits_tile, gd_x, gd_w, b_trans=True)
-        gp_relu = pl.maximum(gate_logits_tile, 0.0)
-        gp_abs = pl.abs(gate_logits_tile)
-        gp_neg_abs = pl.neg(gp_abs)
-        gp_exp_abs = pl.exp(gp_neg_abs)
-        gp_exp_plus = pl.add(gp_exp_abs, 1.0)
-        gp_softplus_tail = pl.log(gp_exp_plus)
-        gp_softplus_log = pl.add(gp_relu, gp_softplus_tail)
-        gp_neg_logits = pl.neg(gate_logits_tile)
-        gp_neg_shift = pl.sub(gp_neg_logits, 10.0)
-        gp_neg_mask_floor = pl.maximum(gp_neg_shift, 0.0)
-        gp_neg_floor_mask = pl.minimum(gp_neg_mask_floor, 1.0)
-        gp_logits_floor = pl.minimum(gate_logits_tile, 0.0)
-        gp_neg_exp = pl.exp(gp_logits_floor)
-        gp_neg_floor = pl.mul(gp_neg_floor_mask, gp_neg_exp)
-        gp_softplus = pl.maximum(gp_softplus_log, gp_neg_floor)
-        gp_score = pl.sqrt(gp_softplus)
-        route_scores_buf[t1 : t1 + GATE_M_TILE, n0 : n0 + GATE_N_TILE] = gp_score
-        gp_bias_row = pl.reshape(gate_bias[n0 : n0 + GATE_N_TILE], [1, GATE_N_TILE])
-        gp_biased = pl.col_expand_add(gp_score, gp_bias_row)
-        biased_scores_buf[t1 : t1 + GATE_M_TILE, n0 : n0 + GATE_N_TILE] = gp_biased
+    # Reserve both engines before any local Cube-to-Vector transfer.
+    # Bound synchronous cohorts to the target A5 core count.
+    gate_tasks = task_gate_tiles * (N_EXPERTS // GATE_N_TILE)
+    gate_workers = pl.min(gate_tasks, 16)
+    for gate_worker in pl.spmd(gate_workers, name_hint="gate", sync_start=True):
+        for gb_idx in pl.range(gate_worker, gate_tasks, gate_workers):
+            tg = gb_idx // (N_EXPERTS // GATE_N_TILE)
+            nb = gb_idx % (N_EXPERTS // GATE_N_TILE)
+            t1 = tg * GATE_M_TILE
+            n0 = nb * GATE_N_TILE
+            gate_logits_tile = pl.create_tensor([GATE_M_TILE, GATE_N_TILE], dtype=pl.FP32)
+            for kb in pl.pipeline(0, D // GATE_D_TILE, stage=2):
+                gd_kd = kb * GATE_D_TILE
+                gd_x = xg_buf[t1 : t1 + GATE_M_TILE, gd_kd : gd_kd + GATE_D_TILE]
+                gd_w = gate_w[n0 : n0 + GATE_N_TILE, gd_kd : gd_kd + GATE_D_TILE]
+                if gd_kd == 0:
+                    gate_logits_tile = pl.matmul(gd_x, gd_w, out_dtype=pl.FP32, b_trans=True)
+                else:
+                    gate_logits_tile = pl.matmul_acc(gate_logits_tile, gd_x, gd_w, b_trans=True)
+            gp_relu = pl.maximum(gate_logits_tile, 0.0)
+            gp_abs = pl.abs(gate_logits_tile)
+            gp_neg_abs = pl.neg(gp_abs)
+            gp_exp_abs = pl.exp(gp_neg_abs)
+            gp_exp_plus = pl.add(gp_exp_abs, 1.0)
+            gp_softplus_tail = pl.log(gp_exp_plus)
+            gp_softplus_log = pl.add(gp_relu, gp_softplus_tail)
+            gp_neg_logits = pl.neg(gate_logits_tile)
+            gp_neg_shift = pl.sub(gp_neg_logits, 10.0)
+            gp_neg_mask_floor = pl.maximum(gp_neg_shift, 0.0)
+            gp_neg_floor_mask = pl.minimum(gp_neg_mask_floor, 1.0)
+            gp_logits_floor = pl.minimum(gate_logits_tile, 0.0)
+            gp_neg_exp = pl.exp(gp_logits_floor)
+            gp_neg_floor = pl.mul(gp_neg_floor_mask, gp_neg_exp)
+            gp_softplus = pl.maximum(gp_softplus_log, gp_neg_floor)
+            gp_score = pl.sqrt(gp_softplus)
+            route_scores_buf[t1 : t1 + GATE_M_TILE, n0 : n0 + GATE_N_TILE] = gp_score
+            gp_bias_row = pl.reshape(gate_bias[n0 : n0 + GATE_N_TILE], [1, GATE_N_TILE])
+            gp_biased = pl.col_expand_add(gp_score, gp_bias_row)
+            biased_scores_buf[t1 : t1 + GATE_M_TILE, n0 : n0 + GATE_N_TILE] = gp_biased
 
     # V4.1 uses score-only top-k: the V4 hash-route loop is dropped so that PTOAS
     # does not emit an invalid function for a route_hash path that does no work.

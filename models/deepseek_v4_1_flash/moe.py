@@ -193,7 +193,7 @@ def dispatch(
             if dst != my_rank:
                 pld.system.notify(
                     target=arrived, peer=dst, offsets=[my_rank, 0],
-                    value=1, op=pld.NotifyOp.AtomicAdd,
+                    value=moe_epoch, op=pld.NotifyOp.Set,
                 )
 
     with pl.at(level=pl.Level.CORE_GROUP, name_hint="dispatch_meta_wait") as _meta_wait_tid:
@@ -618,7 +618,7 @@ def _moe_core(
             if peer != ep_rank:
                 pld.system.notify(
                     target=combine_arrived, peer=peer, offsets=[ep_rank, 1, 0],
-                    value=1, op=pld.NotifyOp.AtomicAdd,
+                    value=moe_epoch, op=pld.NotifyOp.Set,
                 )
     with pl.at(level=pl.Level.CORE_GROUP, name_hint="moe_round_released", deps=[released]) as round_ready:
         for peer in pl.range(EP_SIZE):
@@ -1570,10 +1570,9 @@ if __name__ == "__main__":
             platform=args.platform,
             enable_dep_gen=args.enable_dep_gen,
             enable_chip_swimlane=args.enable_chip_swimlane,
-            # The complete mHC+MoE block keeps dispatch buffers, FP8 routed
-            # staging, shared matmul, and distributed windows live together.
-            # The packed routed path exceeded the previous 1 GiB ring on A5.
-            ring_heap=1073741824,
+            # Real EP8 routing spans more than 1 GiB in the routed-expert
+            # scope; keep the validation heap aligned with resident prefill.
+            ring_heap=2 * 1024**3,
             log_level=args.log_level,
         ),
         rtol=1e-3,

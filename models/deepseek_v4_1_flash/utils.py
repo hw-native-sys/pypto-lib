@@ -87,7 +87,7 @@ CASE_DEFAULT = 'multi_1k'
 
 CASE_TOKENS = 64
 
-CASE_MAX_TOKENS = 128
+CASE_MAX_TOKENS = C.PREFILL_MAX_TOKENS
 
 CASE_PAGE = 128
 
@@ -256,7 +256,8 @@ def golden_prefill_tp_attention(attention_fn: Callable, hidden: torch.Tensor, at
 def apply_distributed_golden(mode: str, golden_fn: Callable, tensors: dict[str, torch.Tensor], active_tokens: int | None=None) -> None:
     import torch
     from config import FLASH as M, TP_SIZE
-    parameter_names = tuple(inspect.signature(golden_fn).parameters)
+    parameter_names = tuple(name for name, parameter in inspect.signature(golden_fn).parameters.items()
+                            if parameter.default is inspect.Parameter.empty)
     token_input_names = {'x', 'rope_cos', 'rope_sin', 'window_slots', 'window_indices', 'request_ids', 'compressed_lens', 'compressed_rope_cos', 'compressed_rope_sin', 'compressed_slots', 'candidate_mask', 'compressed_indices'}
     results = []
     for rank in range(TP_SIZE):
@@ -460,8 +461,15 @@ def build_forward_metadata(
     window_block_table: torch.Tensor,
     compressed_block_tables: Mapping[int, torch.Tensor],
     state_block_tables: Mapping[int, torch.Tensor],
+    *,
+    tp_shard_capacity: int | None = None,
 ) -> ForwardMetadata:
-    """Lower engine inputs for packed prefill or one-token-per-request decode."""
+    """Lower packed request metadata and optional contiguous sequence-parallel ownership.
+
+    Omit tp_shard_capacity for the historical interleaved-owner ABI. For sequence-parallel
+    execution, pass its physical local residual capacity, including padding and
+    ranks with no active rows. Ownership must not depend on the active count.
+    """
     if query_start_loc.ndim != 1 or kv_seq_lens.ndim != 1:
         raise ValueError("query_start_loc and kv_seq_lens must be one-dimensional")
     if query_start_loc.numel() != kv_seq_lens.numel() + 1:
@@ -480,6 +488,17 @@ def build_forward_metadata(
         if not torch.equal(previous, compressed_block_tables[source]):
             raise ValueError(f"compression ratio {ratio} sources must share one compressed block table")
     request_ids = request_ids_from_starts(query_start_loc)
+    token_rows = torch.arange(request_ids.numel(), device=request_ids.device, dtype=torch.int32)
+    if tp_shard_capacity is None:
+        token_owners = token_rows.remainder(TP_SIZE)
+    else:
+        if isinstance(tp_shard_capacity, bool) or not isinstance(tp_shard_capacity, Integral):
+            raise ValueError("tp_shard_capacity must be a positive integer")
+        if not 1 <= tp_shard_capacity <= (C.PREFILL_MAX_TOKENS + TP_SIZE - 1) // TP_SIZE:
+            raise ValueError("tp_shard_capacity is outside the prefill bound")
+        if request_ids.numel() > TP_SIZE * tp_shard_capacity:
+            raise ValueError("scheduled rows exceed the physical TP shard capacity")
+        token_owners = torch.div(token_rows, tp_shard_capacity, rounding_mode="floor")
     logit_rows = torch.where(query_lens > 0, query_start_loc[1:].to(torch.int64) - 1, -1).to(torch.int32)
     local_offsets = torch.arange(request_ids.numel(), device=request_ids.device)
     local_offsets -= query_start_loc[request_ids.to(torch.long)].to(local_offsets.dtype)
@@ -547,9 +566,7 @@ def build_forward_metadata(
         query_lens=query_lens.to(torch.int32),
         logit_row_indices=logit_rows,
         token_to_req_indices=request_ids,
-        moe_token_owners=torch.arange(
-            request_ids.numel(), device=request_ids.device, dtype=torch.int32
-        ).remainder(TP_SIZE),
+        moe_token_owners=token_owners,
         position_ids=positions.to(torch.int32),
         kv_seq_lens=kv_seq_lens.to(torch.int32),
         new_kv_seq_lens=new_kv_seq_lens.to(torch.int32),
@@ -597,49 +614,63 @@ def select_decoder_replay(
     metadata: ForwardMetadata,
     window_block_table: torch.Tensor,
     *,
-    window: int = M.sliding_window,
+    window: int | None = M.sliding_window,
 ) -> DecoderReplay:
-    """Select at most 128 final rows per request and truncate SWA to that replay."""
+    """Select encoder rows for decoder replay.
+
+    ``window=None`` keeps every current row and its full causal history. Use
+    this mode for chunk continuation and prefill-to-decode cache handoff.
+    A finite window retains the fresh-prompt, truncated-tail CED calculation;
+    that mode has different window history and cannot resume cached prefixes.
+    """
     starts = metadata.query_start_loc.to(torch.int64)
-    if window <= 0 or starts.ndim != 1 or starts.numel() < 2 or int(starts[0]) != 0:
+    if window is not None and window <= 0:
+        raise ValueError("replay window must be positive or None")
+    if starts.ndim != 1 or starts.numel() < 2 or int(starts[0]) != 0:
         raise ValueError("positive window and packed query starts are required")
     lengths = starts[1:] - starts[:-1]
     if bool((lengths < 0).any()):
         raise ValueError("query_start_loc must be nondecreasing")
     if metadata.position_ids.numel() != int(starts[-1]) or metadata.token_to_req_indices.numel() != int(starts[-1]):
         raise ValueError("encoder metadata does not cover the packed query rows")
-    if metadata.kv_seq_lens.numel() != lengths.numel() or bool((metadata.kv_seq_lens != 0).any()):
+    if metadata.kv_seq_lens.numel() != lengths.numel():
+        raise ValueError("encoder history must contain one length per request")
+    if window is not None and bool((metadata.kv_seq_lens != 0).any()):
         raise ValueError("fresh decoder prefill does not accept cached prefixes")
     if window_block_table.ndim != 2 or window_block_table.shape[0] != lengths.numel():
         raise ValueError("window block table must have one row per request")
     selected, positions, requests = [], [], []
-    replay_lengths = torch.minimum(lengths, torch.full_like(lengths, window))
-    replay_starts = lengths - replay_lengths
+    replay_lengths = lengths if window is None else torch.minimum(lengths, torch.full_like(lengths, window))
+    replay_starts = metadata.kv_seq_lens.to(torch.int64) + lengths - replay_lengths
     for request, length in enumerate(lengths.tolist()):
         first, last = int(starts[request]), int(starts[request + 1])
-        expected = torch.arange(length, device=starts.device)
+        prefix = int(metadata.kv_seq_lens[request])
+        expected = torch.arange(prefix, prefix + length, device=starts.device)
         if not torch.equal(metadata.position_ids[first:last].to(torch.int64), expected):
             raise ValueError(f"request {request} has noncontiguous encoder positions")
         if not bool((metadata.token_to_req_indices[first:last] == request).all()):
             raise ValueError(f"request {request} has incorrect encoder request indices")
         count = int(replay_lengths[request])
         selected.append(torch.arange(last - count, last, device=starts.device))
-        positions.append(torch.arange(length - count, length, device=starts.device))
+        positions.append(torch.arange(prefix + length - count, prefix + length, device=starts.device))
         requests.append(torch.full((count,), request, dtype=torch.int32, device=starts.device))
     source_rows = torch.cat(selected).long()
     position_ids = torch.cat(positions).int()
     request_ids = torch.cat(requests)
     query_lens = replay_lengths.int()
     query_start_loc = torch.cat((torch.zeros(1, dtype=torch.int32, device=starts.device), query_lens.cumsum(0)))
-    window_lens = position_ids - replay_starts[request_ids.long()] + 1
-    offsets = torch.arange(window, device=starts.device)
-    visible = position_ids[:, None] - window_lens[:, None] + 1 + offsets
-    valid = offsets[None] < window_lens[:, None]
-    window_indices = torch.full_like(visible, -1, dtype=torch.int32)
-    window_indices[valid] = paged_slots(
-        visible[valid], request_ids[:, None].expand_as(visible)[valid], window_block_table
-    ).int()
-    slots = paged_slots(position_ids, request_ids, window_block_table)
+    if window is None:
+        slots, window_indices, window_lens = window_metadata(position_ids, request_ids, window_block_table)
+    else:
+        window_lens = position_ids - replay_starts[request_ids.long()] + 1
+        offsets = torch.arange(window, device=starts.device)
+        visible = position_ids[:, None] - window_lens[:, None] + 1 + offsets
+        valid = offsets[None] < window_lens[:, None]
+        window_indices = torch.full_like(visible, -1, dtype=torch.int32)
+        window_indices[valid] = paged_slots(
+            visible[valid], request_ids[:, None].expand_as(visible)[valid], window_block_table
+        ).int()
+        slots = paged_slots(position_ids, request_ids, window_block_table)
     return DecoderReplay(
         source_rows, query_start_loc, query_lens, replay_starts.int(), position_ids,
         request_ids, position_ids + 1, slots, window_indices, window_lens.int(),
@@ -653,6 +684,153 @@ _DTYPES = {
     "F8_E8M0": torch.float8_e8m0fnu,
     "I8": torch.int8,
 }
+
+
+def decode_cache_views(cache_state: Mapping[str, torch.Tensor]) -> dict[str, torch.Tensor]:
+    """Alias native prefill storage as the decode forward's flat source pools.
+
+    Preserve an optional leading rank axis. Window sources are layers 0..39;
+    compressed and index-key sources are ``M.kv_source_layer_ids`` (four),
+    while C2A state sources are its first three entries. Page IDs in metadata
+    stay local to one source. No payload or scale conversion occurs.
+
+    The caller retains the backing allocations and their request/page owners
+    until every consumer completes. Wait for the prefill call before using
+    these views, and wait for decode before reusing inputs or releasing pages.
+    ``x_hc/pre_mix`` describe the current token's progress through layers;
+    each new decode token starts from its own embedding and identity pre-mix,
+    rather than the preceding token's final-layer residual.
+    """
+    aliases = {
+        "window_cache_pool": "window_cache",
+        "window_cache_scale_pool": "window_scales",
+        "compressed_cache_pool": "compressed_cache",
+        "compressed_cache_scale_pool": "compressed_scales",
+        "index_cache_pool": "index_cache",
+        "index_cache_scale_pool": "index_scales",
+    }
+    values = {}
+    for destination, name in aliases.items():
+        value = cache_state[name]
+        if value.ndim not in (5, 6) or not value.is_contiguous():
+            raise ValueError(f"{name} must preserve the contiguous native source/page layout")
+        sources = M.num_hidden_layers if name.startswith("window") else len(M.kv_source_layer_ids)
+        if value.shape[-5] != sources or tuple(value.shape[-3:-1]) != (BLOCK_SIZE, 1):
+            raise ValueError(f"{name} has an incompatible source or page geometry")
+        expected_dtype = {
+            "window_cache": torch.float8_e4m3fn, "window_scales": torch.bfloat16,
+            "compressed_cache": torch.uint8, "compressed_scales": torch.bfloat16,
+            "index_cache": torch.uint8, "index_scales": torch.float8_e8m0fnu,
+        }[name]
+        if value.dtype != expected_dtype:
+            raise ValueError(f"{name} must retain its native payload or scale dtype")
+        expected_width = {
+            "window_cache": M.head_dim, "window_scales": M.head_dim // C.WINDOW_CACHE_GROUP,
+            "compressed_cache": M.head_dim // 2,
+            "compressed_scales": M.head_dim // C.COMPRESSED_CACHE_GROUP,
+            "index_cache": M.index_head_dim // 2, "index_scales": M.index_head_dim // C.INDEX_CACHE_GROUP,
+        }[name]
+        if value.shape[-1] != expected_width:
+            raise ValueError(f"{name} has an incompatible native row width")
+        reference = cache_state["window_cache"]
+        if value.shape[:-5] != reference.shape[:-5] or value.shape[-4] != reference.shape[-4]:
+            raise ValueError("all prefill cache pools must preserve the same rank and page extents")
+        values[destination] = value.flatten(-5, -4)
+    state = cache_state["state_cache"]
+    if state.ndim not in (4, 5) or not state.is_contiguous():
+        raise ValueError("state_cache must preserve its contiguous source/request layout")
+    if state.shape[-4] != 3 or state.shape[-3] < 1 or tuple(state.shape[-2:]) != (C.STATE_CAPACITY, 2 * M.head_dim):
+        raise ValueError("state_cache has an incompatible C2A source or state geometry")
+    if state.shape[:-4] != cache_state["window_cache"].shape[:-5]:
+        raise ValueError("state_cache must preserve the cache pools' rank extent")
+    if state.dtype != torch.float32:
+        raise ValueError("state_cache must retain FP32 compressor state")
+    values["state_cache_pool"] = state.flatten(-4, -3)
+    return values
+
+
+def decode_forward_metadata(
+    metadata: ForwardMetadata,
+    compressed_block_tables: Mapping[int, torch.Tensor],
+    *,
+    max_seq_len: int | None = None,
+) -> dict[str, torch.Tensor]:
+    """Pack one TP1 rank's independent C2A/C1A metadata for ``l3_decode_fwd``.
+
+    Keep the decode entry's named C2A/C1A arguments and independent table
+    widths. Base and compressed token RoPE use absolute token positions;
+    C2A publication RoPE uses the first position of a completed pair.
+    Stack returned tensors over ranks, including zero-count idle ranks.
+    TP1 uses the padded 80-row slab for metadata and x_hc/pre_mix, with at
+    most 72 active rows. Padding is distinct from the per-rank active count.
+    Page allocation, request ownership and advancing committed sequence
+    lengths after completion remain the caller's responsibility.
+    """
+    sources = tuple(next(source for source in M.kv_source_layer_ids if M.compress_ratios[source] == ratio)
+                    for ratio in (2, 1))
+    tables = [compressed_block_tables[source] for source in sources]
+    if tables[0].shape[0] != tables[1].shape[0]:
+        raise ValueError("both compressed families must describe the same request slots")
+    count = metadata.position_ids.numel()
+    if TP_SIZE != 1:
+        raise ValueError("decode_forward_metadata packs TP1 rank-local rows")
+    row_capacity = C.DECODE_INPUT_MAX_TOKENS
+    if count > C.DECODE_MAX_TOKENS:
+        raise ValueError("decode active rows exceed the per-rank bound")
+    table_rows = int(metadata.position_ids.max()) + 1 if count else 1
+    if max_seq_len is not None:
+        if isinstance(max_seq_len, bool) or not isinstance(max_seq_len, Integral):
+            raise ValueError("max_seq_len must be a positive integer")
+        if not table_rows <= max_seq_len <= M.max_position_embeddings:
+            raise ValueError("max_seq_len must cover the active absolute positions")
+        table_rows = max_seq_len
+    base = precompute_rope_tables(table_rows, False)
+    compressed = precompute_rope_tables(table_rows, True)
+    token_rows = metadata.position_ids.long()
+    pair_rows = metadata.compressed_rope_position_ids[sources[0]].long()
+    values = {
+        "base_rope_cos": base[0][token_rows],
+        "base_rope_sin": base[1][token_rows],
+        "compressed_token_rope_cos": compressed[0][token_rows],
+        "compressed_token_rope_sin": compressed[1][token_rows],
+        "window_slots": metadata.window_slots,
+        "window_indices": metadata.window_indices,
+        "request_ids": metadata.token_to_req_indices,
+        "token_to_req_indices": metadata.token_to_req_indices,
+        "position_ids": metadata.position_ids,
+        "c2a_rope_cos": compressed[0][pair_rows.clamp_min(0)],
+        "c2a_rope_sin": compressed[1][pair_rows.clamp_min(0)],
+        "query_start_loc": metadata.query_start_loc,
+        "state_block_table": metadata.state_block_tables[sources[0]],
+        "attention_num_tokens": torch.tensor(count, dtype=torch.int32),
+        "moe_num_tokens": torch.tensor(count, dtype=torch.int32),
+    }
+    for family, source, table in zip(("c2a", "c1a"), sources, tables):
+        values[family + "_compressed_lens"] = metadata.compressed_lens[source]
+        values[family + "_compressed_slots"] = metadata.compressed_slots[source]
+        values[family + "_index_block_table"] = table
+    for source in M.kv_source_layer_ids:
+        family = 0 if M.compress_ratios[source] == 2 else 1
+        if not torch.equal(compressed_block_tables[source], tables[family]):
+            raise ValueError("sources in one family must share local physical page IDs")
+        if M.compress_ratios[source] == 2:
+            if not torch.equal(metadata.state_block_tables[source], values["state_block_table"]):
+                raise ValueError("C2A sources must share request slots within their separate state pools")
+    for name in ("base_rope_cos", "base_rope_sin", "compressed_token_rope_cos",
+                 "compressed_token_rope_sin", "c2a_rope_cos", "c2a_rope_sin",
+                 "c2a_compressed_lens", "c1a_compressed_lens",
+                 "c2a_compressed_slots", "c1a_compressed_slots"):
+        value = values[name]
+        fill = 1 if name.endswith("cos") else -1 if name.endswith("slots") else 0
+        padded = torch.full((row_capacity, *value.shape[1:]), fill, dtype=value.dtype)
+        padded[:count] = value
+        values[name] = padded
+    for name in ("window_slots", "window_indices", "request_ids", "token_to_req_indices", "position_ids"):
+        value = values[name]
+        padded = torch.full((row_capacity, *value.shape[1:]), -1, dtype=value.dtype)
+        padded[:count] = value
+        values[name] = padded
+    return values
 
 
 def decode_checkpoint_linear(weight: torch.Tensor, scale: torch.Tensor | None = None) -> torch.Tensor:
@@ -1051,14 +1229,41 @@ class ResidentPrefillWeights:
         return self.checkpoint.tensor_rows("embed.weight", token_ids).to(torch.bfloat16)
 
 
-def prepare_prefill_inputs(embedding: torch.Tensor, capacity: int) -> dict[str, torch.Tensor]:
-    """Prepare one rank's prompt and causal replay with Engram disabled."""
+def prepare_prefill_inputs(
+    embedding: torch.Tensor,
+    capacity: int,
+    *,
+    start_pos: int = 0,
+    max_seq_len: int | None = None,
+    cache_state: Mapping[str, torch.Tensor] | None = None,
+) -> dict[str, torch.Tensor]:
+    """Prepare one TP1 rank's next embedding chunk with Engram disabled.
+
+    ``capacity`` bounds current rows, independently of ``max_seq_len``, which
+    sizes the retained history. Pass the previous call's cache tensors after
+    its completion and advance ``start_pos`` by its valid count. An empty
+    sequence has zero work and preserves every cache byte. This convenience
+    helper owns one request at physical slot zero per DP rank; serving may
+    supply its own paged metadata directly to the forward entry instead.
+    """
     if embedding.ndim != 2 or embedding.shape[1] != M.hidden_size:
-        raise ValueError("embedding must have shape [prompt tokens, hidden size]")
+        raise ValueError("embedding must have shape [current tokens, hidden size]")
+    if not isinstance(capacity, Integral) or isinstance(capacity, bool) or capacity < 16 or capacity % 16:
+        raise ValueError("prefill capacity must be an integer multiple of 16")
     count = embedding.shape[0]
-    if capacity % 16 or not 1 <= count <= capacity <= C.PREFILL_MAX_TOKENS:
-        raise ValueError("a nonempty prompt must fit a prefill capacity aligned to 16")
-    data_pages = (capacity + C.BLOCK_SIZE - 1) // C.BLOCK_SIZE
+    if not 0 <= count <= capacity <= C.PREFILL_MAX_TOKENS:
+        raise ValueError("current rows must fit the configured prefill capacity")
+    if isinstance(start_pos, bool) or not isinstance(start_pos, Integral) or start_pos < 0:
+        raise ValueError("start_pos must be a non-negative integer")
+    max_seq_len = capacity if max_seq_len is None else max_seq_len
+    if isinstance(max_seq_len, bool) or not isinstance(max_seq_len, Integral):
+        raise ValueError("max_seq_len must be a positive integer")
+    if not 1 <= max_seq_len <= M.max_position_embeddings or start_pos + count > max_seq_len:
+        raise ValueError("current rows exceed the retained history capacity")
+    if start_pos and cache_state is None:
+        raise ValueError("continuation requires the preceding call's retained cache state")
+
+    data_pages = (max_seq_len + C.BLOCK_SIZE - 1) // C.BLOCK_SIZE
     pages = data_pages + 1
     table = torch.arange(data_pages, dtype=torch.int32).reshape(1, -1)
     compressed_tables = {source: table for source in M.kv_source_layer_ids}
@@ -1070,17 +1275,18 @@ def prepare_prefill_inputs(embedding: torch.Tensor, capacity: int) -> dict[str, 
     }
     encoder = build_forward_metadata(
         torch.tensor([0, count], dtype=torch.int32),
-        torch.zeros(1, dtype=torch.int32),
+        torch.tensor([start_pos], dtype=torch.int32),
         table,
         compressed_tables,
         state_tables,
     )
-    decoder = select_decoder_replay(encoder, table)
+    decoder = select_decoder_replay(encoder, table, window=None)
     decoder_count = decoder.source_rows.numel()
     c2_source = next(source for source in M.kv_source_layer_ids if M.compress_ratios[source] == 2)
     publisher_source = M.num_hidden_layers // 2
-    plain_cos, plain_sin = precompute_rope_tables(count, False)
-    compressed_cos, compressed_sin = precompute_rope_tables(count, True)
+    rope_count = max_seq_len
+    plain_cos, plain_sin = precompute_rope_tables(rope_count, False)
+    compressed_cos, compressed_sin = precompute_rope_tables(rope_count, True)
 
     def pad(value, fill=0):
         result = torch.full((capacity, *value.shape[1:]), fill, dtype=value.dtype)
@@ -1110,6 +1316,19 @@ def prepare_prefill_inputs(embedding: torch.Tensor, capacity: int) -> dict[str, 
     logit_rows[0] = decoder_count - 1
     window_shape = (M.num_hidden_layers, pages, C.BLOCK_SIZE, 1)
     source_shape = (len(M.kv_source_layer_ids), pages, C.BLOCK_SIZE, 1)
+
+    def native_cache(name, shape, dtype, fill=0):
+        if cache_state is not None:
+            value = cache_state[name]
+            if value.device.type != "cpu" or value.dtype != dtype:
+                raise ValueError(f"retained {name} must be a CPU tensor with the native cache dtype")
+            if tuple(value.shape) != shape or not value.is_contiguous():
+                raise ValueError(f"retained {name} must preserve the history layout and capacity")
+            return value
+        if dtype in (torch.float32, torch.bfloat16):
+            return torch.full(shape, float(fill), dtype=dtype)
+        return torch.full(shape, fill, dtype=torch.uint8).view(dtype)
+
     values = {
         "embedding": pad(embedding),
         "embedding_ids": torch.arange(capacity, dtype=torch.int64),
@@ -1133,19 +1352,21 @@ def prepare_prefill_inputs(embedding: torch.Tensor, capacity: int) -> dict[str, 
         "query_starts": torch.stack((encoder.query_start_loc, decoder.query_start_loc.int())),
         "index_block_tables": index_tables,
         "state_block_table": state_table,
-        "window_cache": torch.zeros((*window_shape, M.head_dim), dtype=torch.uint8).view(torch.float8_e4m3fn),
-        "window_scales": torch.full(
-            (*window_shape, M.head_dim // C.WINDOW_CACHE_GROUP), 1.0, dtype=torch.bfloat16
+        "window_cache": native_cache("window_cache", (*window_shape, M.head_dim), torch.float8_e4m3fn),
+        "window_scales": native_cache(
+            "window_scales", (*window_shape, M.head_dim // C.WINDOW_CACHE_GROUP), torch.bfloat16, 1.0,
         ),
-        "compressed_cache": torch.zeros((*source_shape, M.head_dim // 2), dtype=torch.uint8),
-        "compressed_scales": torch.full(
-            (*source_shape, M.head_dim // C.COMPRESSED_CACHE_GROUP), 1.0, dtype=torch.bfloat16
+        "compressed_cache": native_cache("compressed_cache", (*source_shape, M.head_dim // 2), torch.uint8),
+        "compressed_scales": native_cache(
+            "compressed_scales", (*source_shape, M.head_dim // C.COMPRESSED_CACHE_GROUP), torch.bfloat16, 1.0,
         ),
-        "index_cache": torch.zeros((*source_shape, M.index_head_dim // 2), dtype=torch.uint8),
-        "index_scales": torch.full(
-            (*source_shape, M.index_head_dim // C.INDEX_CACHE_GROUP), 127, dtype=torch.uint8
-        ).view(torch.float8_e8m0fnu),
-        "state_cache": torch.zeros((len(state_tables), 2, C.STATE_CAPACITY, (2 * M.head_dim)), dtype=torch.float32),
+        "index_cache": native_cache("index_cache", (*source_shape, M.index_head_dim // 2), torch.uint8),
+        "index_scales": native_cache(
+            "index_scales", (*source_shape, M.index_head_dim // C.INDEX_CACHE_GROUP), torch.float8_e8m0fnu, 127,
+        ),
+        "state_cache": native_cache(
+            "state_cache", (len(state_tables), 2, C.STATE_CAPACITY, 2 * M.head_dim), torch.float32,
+        ),
         "logit_rows": logit_rows,
     }
     return values
@@ -1156,22 +1377,28 @@ def prepare_resident_inputs(
     weights: ResidentPrefillWeights,
     token_ids: torch.Tensor | Sequence[int],
     capacity: int,
+    *,
+    start_pos: int = 0,
+    max_seq_len: int | None = None,
+    cache_state: Mapping[str, torch.Tensor] | None = None,
 ) -> dict[str, torch.Tensor]:
     """Prepare checkpoint embeddings, weights and causal replay for one prefill rank."""
     ids = torch.as_tensor(token_ids, device="cpu")
-    if ids.ndim != 1 or ids.dtype not in (torch.int32, torch.int64):
+    if ids.ndim != 1 or ids.numel() and ids.dtype not in (torch.int32, torch.int64):
         raise ValueError("token_ids must be a one-dimensional integer sequence")
     if not isinstance(capacity, Integral) or isinstance(capacity, bool) or capacity % 16:
         raise ValueError("prefill capacity must be an integer multiple of 16")
     count = ids.numel()
-    if not 1 <= count <= capacity <= C.PREFILL_MAX_TOKENS:
-        raise ValueError("a nonempty prompt must fit the configured prefill capacity")
+    if not 0 <= count <= capacity <= C.PREFILL_MAX_TOKENS:
+        raise ValueError("current rows must fit the configured prefill capacity")
     if bool(((ids < 0) | (ids >= M.vocab_size)).any()):
         raise ValueError("token id is outside the checkpoint vocabulary")
     ids = ids.long()
     embedding = weights.lookup_rows(ids)
 
-    values = prepare_prefill_inputs(embedding, capacity)
+    values = prepare_prefill_inputs(
+        embedding, capacity, start_pos=start_pos, max_seq_len=max_seq_len, cache_state=cache_state,
+    )
     if not hasattr(weights, "_output_weights"):
         head = checkpoint.tensor("head.weight")
         if head.dtype != torch.bfloat16 or tuple(head.shape) != (M.vocab_size, M.hidden_size):

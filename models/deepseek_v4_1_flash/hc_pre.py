@@ -30,8 +30,11 @@ D_TILE = 2560
 
 
 def golden_hc_pre(x: torch.Tensor, pre_mix: torch.Tensor) -> torch.Tensor:
-    """Collapse four Hyper-Connection streams into one sublayer input."""
-    return (x.float() * pre_mix.float().unsqueeze(-1)).sum(dim=-2).to(x.dtype)
+    """Collapse four HC streams with the kernel's pairwise FP32 reduction."""
+    products = x.float() * pre_mix.float().unsqueeze(-1)
+    first_pair = products[..., 0, :] + products[..., 1, :]
+    second_pair = products[..., 2, :] + products[..., 3, :]
+    return (first_pair + second_pair).to(x.dtype)
 
 
 @pl.jit.inline

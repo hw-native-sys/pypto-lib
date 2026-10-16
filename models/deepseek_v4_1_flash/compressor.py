@@ -36,6 +36,121 @@ HEAD_DIM = M.head_dim
 EPS = M.rms_norm_eps
 
 
+D = M.hidden_size
+M_TILE = 16
+N_TILE = 128
+COMPRESSOR_K_TILE = 64
+COMPRESSOR_QUERY_TILE = 128
+COMPRESSOR_SEGMENTS = 16
+COMPRESSOR_K_CHUNK = D // COMPRESSOR_SEGMENTS
+
+
+@pl.jit.inline
+def project_ratio2_weights(
+    x: pl.Tensor[[T_DYN, D], pl.BF16],
+    weight: pl.Tensor[[D, HEAD_DIM], pl.FP32],
+    output: pl.Tensor[[T_DYN, HEAD_DIM], pl.FP32],
+    num_tokens: pl.Scalar[pl.INT32],
+):
+    """Retain FP32 weight residuals through high and residual accumulators.
+
+    Three BF16 weight terms preserve FP32 weights. Bound each Cube reduction
+    to one K chunk, then compensate the Vector sum of the staged GM products
+    to reduce accumulation error near pooled BF16 rounding boundaries.
+    Mixed producers use Vector startup and FP32 Vector stores.
+    """
+    high_weight = pl.create_tensor([D, HEAD_DIM], dtype=pl.BF16)
+    low_weight = pl.create_tensor([D, HEAD_DIM], dtype=pl.BF16)
+    tail_weight = pl.create_tensor([D, HEAD_DIM], dtype=pl.BF16)
+    split_blocks = D // COMPRESSOR_K_TILE * (HEAD_DIM // N_TILE)
+    split_workers = pl.min(split_blocks, 64)
+    with pl.spmd(split_workers, name_hint="c2a_compressor_split") as split_tid:
+        split_worker = pl.tile.get_block_idx()
+        for split_block in pl.range(split_worker, split_blocks, split_workers):
+            split_k0 = split_block // (HEAD_DIM // N_TILE) * COMPRESSOR_K_TILE
+            split_n0 = split_block % (HEAD_DIM // N_TILE) * N_TILE
+            value = weight[split_k0 : split_k0 + COMPRESSOR_K_TILE, split_n0 : split_n0 + N_TILE]
+            high = pl.cast(value, pl.BF16, mode="rint")
+            residual = pl.sub(value, pl.cast(high, pl.FP32))
+            low = pl.cast(residual, pl.BF16, mode="rint")
+            tail = pl.cast(pl.sub(residual, pl.cast(low, pl.FP32)), pl.BF16, mode="rint")
+            high_weight[split_k0 : split_k0 + COMPRESSOR_K_TILE, split_n0 : split_n0 + N_TILE] = high
+            low_weight[split_k0 : split_k0 + COMPRESSOR_K_TILE, split_n0 : split_n0 + N_TILE] = low
+            tail_weight[split_k0 : split_k0 + COMPRESSOR_K_TILE, split_n0 : split_n0 + N_TILE] = tail
+    completion = pl.array.create(1, pl.TASK_ID)
+    completion[0] = split_tid
+    if num_tokens > 0:
+        chunk_rows = pl.min(pl.cast(num_tokens, pl.INDEX), COMPRESSOR_QUERY_TILE)
+        high_product = pl.create_tensor([COMPRESSOR_SEGMENTS * chunk_rows, HEAD_DIM], dtype=pl.FP32)
+        residual_product = pl.create_tensor([COMPRESSOR_SEGMENTS * chunk_rows, HEAD_DIM], dtype=pl.FP32)
+        for begin in pl.range(0, num_tokens, chunk_rows):
+            chunk_active = pl.min(chunk_rows, num_tokens - begin)
+            output_blocks = (chunk_active + M_TILE - 1) // M_TILE * (HEAD_DIM // N_TILE)
+            blocks = output_blocks * COMPRESSOR_SEGMENTS
+            # The synchronous mixed cohort must fit the target A5 core count.
+            workers = pl.min(blocks, 16)
+            with pl.spmd(workers, name_hint="c2a_compressor_cube", deps=[completion[0]], sync_start=True) as cube_tid:
+                cube_worker = pl.tile.get_block_idx()
+                for cube_block in pl.range(cube_worker, blocks, workers):
+                    cube_segment = cube_block % COMPRESSOR_SEGMENTS
+                    cube_tile_block = cube_block // COMPRESSOR_SEGMENTS
+                    cube_t0 = cube_tile_block // (HEAD_DIM // N_TILE) * M_TILE
+                    cube_n0 = cube_tile_block % (HEAD_DIM // N_TILE) * N_TILE
+                    cube_rows = pl.min(M_TILE, chunk_active - cube_t0)
+                    high_acc = pl.create_tensor([M_TILE, N_TILE], dtype=pl.FP32)
+                    residual_acc = pl.create_tensor([M_TILE, N_TILE], dtype=pl.FP32)
+                    for cube_k0 in pl.range(cube_segment * COMPRESSOR_K_CHUNK, (cube_segment + 1) * COMPRESSOR_K_CHUNK, COMPRESSOR_K_TILE):
+                        a = pl.slice(x, [M_TILE, COMPRESSOR_K_TILE], [begin + cube_t0, cube_k0], valid_shape=[cube_rows, COMPRESSOR_K_TILE])
+                        a = pl.cast(pl.cast(a, pl.FP32), pl.BF16, mode="rint")
+                        high = high_weight[cube_k0 : cube_k0 + COMPRESSOR_K_TILE, cube_n0 : cube_n0 + N_TILE]
+                        low = low_weight[cube_k0 : cube_k0 + COMPRESSOR_K_TILE, cube_n0 : cube_n0 + N_TILE]
+                        tail = tail_weight[cube_k0 : cube_k0 + COMPRESSOR_K_TILE, cube_n0 : cube_n0 + N_TILE]
+                        high_acc = pl.matmul_acc(high_acc, a, high, init_cond=(cube_k0 == cube_segment * COMPRESSOR_K_CHUNK))
+                        residual_acc = pl.matmul_acc(residual_acc, a, low, init_cond=(cube_k0 == cube_segment * COMPRESSOR_K_CHUNK))
+                        residual_acc = pl.matmul_acc(residual_acc, a, tail)
+                    high_product[cube_segment * chunk_rows + cube_t0 : cube_segment * chunk_rows + cube_t0 + M_TILE, cube_n0 : cube_n0 + N_TILE] = pl.set_validshape(pl.mul(high_acc, 1.0), cube_rows, N_TILE)
+                    residual_product[cube_segment * chunk_rows + cube_t0 : cube_segment * chunk_rows + cube_t0 + M_TILE, cube_n0 : cube_n0 + N_TILE] = pl.set_validshape(pl.mul(residual_acc, 1.0), cube_rows, N_TILE)
+            with pl.spmd(pl.min(output_blocks, 16), name_hint="c2a_compressor_sum", deps=[cube_tid]) as sum_tid:
+                sum_worker = pl.tile.get_block_idx()
+                for sum_block in pl.range(sum_worker, output_blocks, pl.min(output_blocks, 16)):
+                    sum_t0 = sum_block // (HEAD_DIM // N_TILE) * M_TILE
+                    sum_n0 = sum_block % (HEAD_DIM // N_TILE) * N_TILE
+                    sum_rows = pl.min(M_TILE, chunk_active - sum_t0)
+                    high_sum = pl.full([M_TILE, N_TILE], dtype=pl.FP32, value=0.0)
+                    low_sum = pl.full([M_TILE, N_TILE], dtype=pl.FP32, value=0.0)
+                    high_error = pl.full([M_TILE, N_TILE], dtype=pl.FP32, value=0.0)
+                    low_error = pl.full([M_TILE, N_TILE], dtype=pl.FP32, value=0.0)
+                    for sum_segment in pl.range(COMPRESSOR_SEGMENTS):
+                        high_part = pl.slice(high_product, [M_TILE, N_TILE], [sum_segment * chunk_rows + sum_t0, sum_n0], valid_shape=[sum_rows, N_TILE])
+                        low_part = pl.slice(residual_product, [M_TILE, N_TILE], [sum_segment * chunk_rows + sum_t0, sum_n0], valid_shape=[sum_rows, N_TILE])
+                        high_delta = pl.sub(high_part, high_error)
+                        high_next = pl.add(high_sum, high_delta)
+                        high_error = pl.sub(pl.sub(high_next, high_sum), high_delta)
+                        high_sum = high_next
+                        low_delta = pl.sub(low_part, low_error)
+                        low_next = pl.add(low_sum, low_delta)
+                        low_error = pl.sub(pl.sub(low_next, low_sum), low_delta)
+                        low_sum = low_next
+                    output[begin + sum_t0 : begin + sum_t0 + M_TILE, sum_n0 : sum_n0 + N_TILE] = pl.set_validshape(pl.add(high_sum, low_sum), sum_rows, N_TILE)
+            completion[0] = sum_tid
+    return output
+
+
+@pl.jit.inline
+def project_ratio2(
+    x: pl.Tensor[[T_DYN, D], pl.BF16],
+    wkv: pl.Tensor[[D, HEAD_DIM], pl.FP32],
+    wgate: pl.Tensor[[D, HEAD_DIM], pl.FP32],
+    kv_out: pl.Tensor[[T_DYN, HEAD_DIM], pl.FP32],
+    score_out: pl.Tensor[[T_DYN, HEAD_DIM], pl.FP32],
+    num_tokens: pl.Scalar[pl.INT32],
+):
+    project_ratio2_weights(x, wkv, kv_out, num_tokens)
+    project_ratio2_weights(x, wgate, score_out, num_tokens)
+    return kv_out, score_out
+
+
+
 @pl.jit.inline
 def publish_compressed_cache(
     value: pl.Tensor[[T_DYN, HEAD_DIM], pl.BF16],
@@ -66,25 +181,25 @@ def publish_compressed_cache(
             normalized = pl.row_expand_div(grouped, scale)
             normalized = pl.reshape(normalized, [1, HEAD_DIM])
             magnitude = pl.minimum(pl.abs(normalized), 6.0)
-            lower = pl.cast(
-                pl.add(pl.mul(pl.minimum(magnitude, 2.0), 2.0), 0.4999),
-                pl.INT32,
-                mode="trunc",
-            )
-            middle = pl.cast(
-                pl.add(pl.minimum(pl.maximum(pl.sub(magnitude, 2.0), 0.0), 2.0), 0.4999),
-                pl.INT32,
-                mode="trunc",
-            )
-            upper = pl.cast(
-                pl.add(pl.mul(pl.maximum(pl.sub(magnitude, 4.0), 0.0), 0.5), 0.4999),
-                pl.INT32,
-                mode="trunc",
-            )
-            payload_codes = pl.add(pl.add(lower, middle), upper)
-            bits = pl.reinterpret_view(normalized, pl.INT32)
-            sign = pl.ands(pl.shrs(bits, 31), 1)
-            payload_codes = pl.add(payload_codes, pl.mul(sign, 8))
+            delta0 = pl.reinterpret_view(pl.sub(magnitude, 0.25), pl.INT32)
+            delta1 = pl.reinterpret_view(pl.sub(magnitude, 0.75), pl.INT32)
+            delta2 = pl.reinterpret_view(pl.sub(magnitude, 1.25), pl.INT32)
+            delta3 = pl.reinterpret_view(pl.sub(magnitude, 1.75), pl.INT32)
+            delta4 = pl.reinterpret_view(pl.sub(magnitude, 2.5), pl.INT32)
+            delta5 = pl.reinterpret_view(pl.sub(magnitude, 3.5), pl.INT32)
+            delta6 = pl.reinterpret_view(pl.sub(magnitude, 5.0), pl.INT32)
+            step0 = pl.shrs(pl.sub(delta0, 1), 31)
+            step1 = pl.shrs(delta1, 31)
+            step2 = pl.shrs(pl.sub(delta2, 1), 31)
+            step3 = pl.shrs(delta3, 31)
+            step4 = pl.shrs(pl.sub(delta4, 1), 31)
+            step5 = pl.shrs(delta5, 31)
+            step6 = pl.shrs(pl.sub(delta6, 1), 31)
+            lower = pl.add(pl.add(step0, step1), pl.add(step2, step3))
+            upper = pl.add(pl.add(step4, step5), pl.add(step6, 7))
+            unsigned = pl.add(lower, upper)
+            sign = pl.ands(pl.shrs(pl.reinterpret_view(normalized, pl.INT32), 28), 8)
+            payload_codes = pl.or_(unsigned, sign)
             pair_ids = pl.tile.arange(0, [1, HEAD_DIM // 2], dtype=pl.INT32)
             low_indices = pl.mul(pair_ids, 2)
             high_indices = pl.add(low_indices, 1)
