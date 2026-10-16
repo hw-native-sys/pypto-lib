@@ -806,11 +806,14 @@ def golden_reference_c1a(**args):
         rotated = golden_rope_tail(latent, a["compressed_rope_cos"], a["compressed_rope_sin"])
         cp, cs, _ = _reference_fp4(rotated, 16, "bf16")
         valid = a["compressed_slots"] >= 0
-        slots = a["compressed_slots"][valid].long()
-        compressed.flatten(0, 1)[slots, 0] = cp[valid]
-        compressed_scale.view(torch.uint8).flatten(0, 1)[slots, 0] = cs.view(torch.uint8)[valid]
-        index.flatten(0, 1)[slots, 0] = kp[valid]
-        index_scale.flatten(0, 1)[slots, 0] = ks[valid]
+        # Repeated slots follow the device publisher's last-token-wins order.
+        # Advanced indexing with duplicate destinations has no defined write order.
+        for token in valid.nonzero().flatten().tolist():
+            slot = int(a["compressed_slots"][token])
+            compressed.flatten(0, 1)[slot, 0] = cp[token]
+            compressed_scale.view(torch.uint8).flatten(0, 1)[slot, 0] = cs.view(torch.uint8)[token]
+            index.flatten(0, 1)[slot, 0] = kp[token]
+            index_scale.flatten(0, 1)[slot, 0] = ks[token]
     candidates = a["candidate_mask"]
     topk = a["compressed_indices"]
     if mode != AttentionMode.REUSE:
