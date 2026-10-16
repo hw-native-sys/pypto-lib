@@ -20,6 +20,7 @@ from quant import golden_bf16_gemm, golden_mxfp8_linear
 from qkv_proj_rope import (
     golden_rope_tail,
     make_bf16_projection_with_deps,
+    make_mx_projection_with_deps as make_native_mx_projection_with_deps,
     make_rope_with_deps,
 )
 from rmsnorm import rms_norm
@@ -212,7 +213,7 @@ def attend_combined(
 
 
 project_qa = make_mx_projection_with_deps(D, Q_LORA)
-project_qb = make_mx_projection_with_deps(Q_LORA, LOCAL_H * HEAD_DIM)
+project_qb = make_native_mx_projection_with_deps(Q_LORA, LOCAL_H * HEAD_DIM, name_hint="c1a_qb_native_mx")
 project_kv = make_mx_projection_with_deps(D, HEAD_DIM)
 project_ob = make_mx_projection_with_deps(LOCAL_O_WIDTH, D, pl.FP32)
 rotate_q = make_rope_with_deps(LOCAL_H, max_workers=64, name_hint="c1a_q_rope")
